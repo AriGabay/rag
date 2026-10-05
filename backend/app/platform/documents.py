@@ -144,7 +144,7 @@ def upload(
     doc_uuid = parse_uuid(document_id) if document_id else None
     if doc_uuid is None:
         if not group_id:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "יש לבחור קבוצת מסמכים")
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "יש לבחור קבוצת מסמכים")
         group_uuid = parse_uuid(group_id)
         with tenant_tx(ctx) as conn:
             if not _can_use_group(conn, ctx, group_uuid):

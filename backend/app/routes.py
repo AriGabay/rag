@@ -7,6 +7,7 @@ from fastapi import FastAPI
 _ROUTERS = [
     "app.platform.auth",
     "app.platform.documents",
+    "app.appraisal.review",
 ]
 
 
