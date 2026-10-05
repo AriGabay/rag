@@ -16,14 +16,14 @@ from decimal import Decimal
 
 from app.appraisal.normalize import (
     normalize_place,
-    property_type_code,
-    vat_basis_code,
     parse_area,
     parse_area_type,
     parse_block_parcel,
     parse_date,
     parse_decimal,
     parse_money,
+    property_type_code,
+    vat_basis_code,
 )
 from app.extraction.normalize_text import base_normalize
 
