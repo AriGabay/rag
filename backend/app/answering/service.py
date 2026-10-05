@@ -92,7 +92,7 @@ def clarification(conn: Connection, key: str, c: QueryConditions, question: str,
 def _source_json(rows: list[dict]) -> list[dict]:
     out = []
     for i, r in enumerate(rows, start=1):
-        page = r.get("page_no")
+        page = r.get("page_no") if r.get("mime_type", "application/pdf") == "application/pdf" else None
         out.append({
             "evidence_id": f"E{i}", "document_id": str(r["document_id"]), "version_id": str(r["version_id"]),
             "title": r["title"], "page_list": [page] if page else [], "section": r.get("section"),
@@ -224,7 +224,7 @@ def run_question(conn: Connection, ctx: TenantContext, inp: AskInput, previous: 
             answer = {"kind": "abstain", "provider": "template", "demo": False, "sources": [], "coverage": cov,
                       "text": f"אין במאגר המשרד רשומות עבור \"{parsed.unknown_place}\". לא חושב מספר.",
                       "limitations": ["המערכת עונה רק על סמך מסמכי המשרד ואינה משלימה מידע ממקורות אחרים."]}
-            return Outcome(answer, parsed.conditions, parsed.conditions.intent, parsed.route)
+            return Outcome(answer, None, parsed.conditions.intent, parsed.route)  # never cached
         c, conflict_key = _merge_filters(parsed, inp.filters)
         route = parsed.route
         if conflict_key:

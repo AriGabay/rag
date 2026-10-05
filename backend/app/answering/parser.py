@@ -10,12 +10,14 @@ import re
 from dataclasses import dataclass, field
 
 from app.answering.conditions import QueryConditions
+from app.answering.places import KNOWN_CITIES
 from app.extraction.normalize_text import base_normalize, prefix_variants
 
 _YEAR = re.compile(r"(?<!\d)(19[5-9]\d|20\d{2})(?!\d)")
 _RANGE = re.compile(r"(?<!\d)(19[5-9]\d|20\d{2})\s*(?:-|–|עד|ל-?|ול-?)\s*(19[5-9]\d|20\d{2})(?!\d)")
 _FOLLOWUP = re.compile(r"^\s*(ו?מה\s+(לגבי|עם|ב)|ו?ב-?\s*(19|20)\d{2}|ואם|ו?באותם תנאים|ו?אותו דבר)")
 _NEIGHBORHOOD_PHRASE = re.compile(r"(?:ב|ל|מ)?שכונת\s+((?:[א-ת״׳\"'-]+\s?){1,3})")
+_CITY_PHRASE = re.compile(r"(?:ב|ל|מ)?עיר\s+((?:[א-ת״׳\"'-]+\s?){1,3})")
 
 TRANSACTION_WORDS = ("עסקה", "עסקאות", "עסקת", "נמכר", "נמכרה", "נמכרו", "מכירה", "מכירות", "מחירי עסקאות")
 VALUE_WORDS = ("שווי", "שומה", "שומות", "הוערך", "הוערכו", "הערכת")
@@ -64,7 +66,8 @@ def _contains_phrase(tokens: list[str], phrase: str) -> bool:
     words = phrase.split()
     for i in range(len(tokens) - len(words) + 1):
         first = tokens[i]
-        if first != words[0] and words[0] not in prefix_variants(first):
+        short_prefix = len(first) > 1 and first[0] in "בלמהושכ" and first[1:] == words[0]
+        if first != words[0] and not short_prefix and words[0] not in prefix_variants(first):
             continue
         if tokens[i + 1:i + len(words)] == words[1:]:
             return True
@@ -153,11 +156,18 @@ def parse_question(question: str, gaz: Gazetteer, previous: QueryConditions | No
     year_from, year_to = _years(text)
 
     unknown = None
+    if city is None:
+        unknown = next((c for c in sorted(KNOWN_CITIES, key=len, reverse=True)
+                        if c not in gaz.cities and _contains_phrase(tokens, c)), None)
+        m_city = _CITY_PHRASE.search(text)
+        if unknown is None and m_city:
+            unknown = re.sub(r"\s+(ב|ל|מ)?(-?\d{4}|שנת|שכונת).*$", "", m_city.group(1).strip(" ?.!,")).strip() or None
     m = _NEIGHBORHOOD_PHRASE.search(text)
-    if m and hood is None:
+    if m and hood is None and unknown is None:
         unknown = m.group(1).strip(" ?.!,")
         unknown = re.sub(r"\s+(ב-?|בשנת|לשנת|ל-?)?\s*\d{4}.*$", "", unknown).strip()
-        unknown = re.sub(r"\s+(ב|ל|מ)(שנת|-).*$", "", unknown).strip() or None
+        unknown = re.sub(r"\s+(ב|ל|מ)(שנת|-).*$", "", unknown).strip()
+        unknown = re.sub(r"\s+[בלמ]$", "", unknown).strip() or None  # "ב 2024" after hyphen splitting
 
     if previous is not None and _FOLLOWUP.search(question):
         update: dict = {}

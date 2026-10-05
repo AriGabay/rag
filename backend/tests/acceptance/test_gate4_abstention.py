@@ -21,8 +21,6 @@ def _no_number(answer: dict) -> None:
     ("כמה עסקאות היו בשכונת רמת החייל ב-2021?", {"data_kind": "transaction_price", "date_field": "transaction_date"}),
 ], ids=["unknown-neighborhood", "unknown-neighborhood-count"])
 def test_unknown_place_abstains(world, question, answers):
-    # note: these abstentions get cached under the remaining conditions (see the cache xfail below),
-    # so later tests in this module use other years
     a = ask_flow(world.client(ADMIN_A), question, answers).answer
     assert a["kind"] == "abstain", a["kind"]
     _no_number(a)
@@ -64,10 +62,6 @@ def test_office_b_unknown_neighborhood_of_office_a_abstains(world):
     _no_number(a)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: a city the office has no data for is silently dropped by the rules parser "
-    "(app/answering/parser.py:_place / parse_question only flags unknown 'שכונת X' phrases), so the "
-    "question is answered for every city in the office: 'בחיפה' returns Ramat Gan figures."))
 def test_unknown_city_abstains(world):
     a = ask_flow(world.client(ADMIN_A), "מה מחיר העסקאות למ״ר בחיפה ב-2023 לפי תאריך עסקה?",
                  {"area_type": "net", "property_type": "apartment", "vat_basis": "included"}).answer
@@ -75,30 +69,17 @@ def test_unknown_city_abstains(world):
     _no_number(a)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: office B asking about גבעתיים (a city only office A has) gets office B's Harozim numbers: the "
-    "unknown city is dropped (app/answering/parser.py) and the answer shows 2 records without the city."))
 def test_office_b_city_it_does_not_have_abstains(world):
     a = ask_flow(world.client(ADMIN_B), "מחיר למ״ר בעסקאות בגבעתיים שנחתמו ב-2024").answer
     assert a["kind"] in ("abstain", "clarification")
     _no_number(a)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: a content question with no basis in the documents is answered from unrelated passages. "
-    "hybrid_search (app/platform/search.py:60) has no relevance floor (the semantic list always returns "
-    "neighbours) and MockLLM.answer (app/providers/llm.py:78) accepts an overlap on stop words such as "
-    "'על', so the answer quotes an irrelevant sentence instead of abstaining."))
 def test_content_question_without_basis_abstains(world):
     a = ask_flow(world.client(ADMIN_A), "מה נכתב על בריכת שחייה על הגג?").answer
     assert a["kind"] == "abstain" or any("אין בסיס" in lim for lim in a.get("limitations", []))
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: an unknown-place abstention is cached under the remaining conditions (the unknown place is not part "
-    "of the key): app/answering/service.py run_question returns parsed.conditions with the abstention and "
-    "app/answering/api.py ask() caches every 'abstain'. A later question with the same conditions and no "
-    "place then gets 'אין במאגר המשרד רשומות עבור \"פלורנטין\"' instead of its numbers."))
 def test_unknown_place_abstention_does_not_poison_the_cache(world):
     client = world.client(ADMIN_B)
     first = ask_flow(client, "מה מחיר העסקאות למ״ר בשכונת פלורנטין ב-2023 לפי תאריך עסקה?").answer
@@ -108,10 +89,6 @@ def test_unknown_place_abstention_does_not_poison_the_cache(world):
     assert plain["kind"] == "numeric" and plain["numeric"]["record_count"] == 1  # DB1-T02
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: a clarification answer sent when no clarification is pending is treated as an empty question: "
-    "app/answering/service.py run_question falls through to parse_question('') and app/answering/content.py "
-    "answers it from whatever passages hybrid search returns. Expected a 409/422 or a re-asked question."))
 def test_clarification_without_pending_question_is_not_answered_from_random_passages(world):
     client = world.client(ADMIN_A)
     conversation = client.post("/api/conversations").json()["id"]

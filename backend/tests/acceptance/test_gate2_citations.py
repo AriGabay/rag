@@ -60,7 +60,7 @@ def test_numeric_sources_open_the_right_page_and_contain_the_price(world, case):
         assert r.headers["content-type"].startswith(DOCX if is_docx else "application/pdf")
         token = price_token(rec["id"])
         if is_docx:
-            # DOCX has no physical pages (page claims are covered by the xfail test below);
+            # DOCX has no physical pages (see test_docx_sources_do_not_claim_pdf_pages);
             # the cited row, or the header text for the report's own value, must hold the price
             if s["row"] is not None:
                 assert any(token in c for c in stored_table_cells(world, _office(case.user), s["version_id"], s["row"]))
@@ -79,9 +79,7 @@ def test_numeric_sources_open_the_right_page_and_contain_the_price(world, case):
             assert any(token in c for c in cells), (rec["id"], cells)
 
 
-# the D5 price phrase is retrieved non-deterministically (see gate 7's lexical-ranking xfail)
-CONTENT_FACTS = [f for f in truth()["content_facts"] if docs()[f["document"]]["office"] == "A"
-                 and "1.25" not in f["phrase"]]
+CONTENT_FACTS = [f for f in truth()["content_facts"] if docs()[f["document"]]["office"] == "A"]
 
 
 @pytest.mark.parametrize("fact", CONTENT_FACTS, ids=lambda f: f"{f['document']}:{f['phrase'][:18]}")
@@ -110,10 +108,6 @@ def test_content_sources_cite_the_page_holding_the_phrase(world, fact):
             assert squash(fact["phrase"]) in page_text
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: a DOCX header record (D11 appraised value) is cited as page 1 with '#page=1' although DOCX has no "
-    "physical pages (plan assumption: DOCX sources cite heading/paragraph). app/answering/service.py:_source_json "
-    "uses occurrences.page_no regardless of the version's mime type."))
 def test_docx_sources_do_not_claim_pdf_pages(world):
     from tests.acceptance.support import CASES_BY_ID
 

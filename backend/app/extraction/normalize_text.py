@@ -24,6 +24,15 @@ _HEB_WORD = re.compile(r"[א-ת][א-ת״׳]*")
 _PREFIXES = "והבלמשכ"
 _TWO_LETTER_PREFIXES = ("וה", "וב", "ול", "ומ", "וש", "שה", "מה", "בה", "לה", "כש", "שב", "של", "שמ")
 _SPACE = re.compile(r"\s+")
+_HYPHEN_NUM = re.compile(r"(?<=[\u05D0-\u05EA])-(?=\d)")
+# Question words and particles that carry no retrieval signal.
+STOPWORDS = frozenset(
+    "מה מי איך למה מדוע האם על של את עם זה זו זאת אלה כל או גם אם כי לא יש אין הוא היא הם הן היה היו "
+    "בין עד כמה איזה איזו אילו לגבי נכתב נאמר כתוב אני אנחנו יותר פחות כמו רק עוד אותו אותה שם פה "
+    "ומה ועל ושל ואת וגם ואם במה בזה לזה מזה כך כן בכ כ- "
+    # meta words about the repository itself ("what is written in the documents about ...")
+    "מסמך מסמכים במסמך במסמכים בשומות שומות המסמכים במאגר מאגר נכתבו נכתבה הוזכר הוזכרו מופיע".split()
+)
 
 
 def base_normalize(text: str) -> str:
@@ -33,6 +42,8 @@ def base_normalize(text: str) -> str:
     text = _GERSHAYIM.sub("״", text)
     text = _GERESH.sub("׳", text)
     text = text.replace("₪", " ₪ ")
+    # "ב-2024", "בכ-1.25": a Hebrew prefix glued to a number by a hyphen would index as "-1.25"
+    text = _HYPHEN_NUM.sub(" ", text)
     prev = None
     while prev != text:
         prev = text
@@ -63,9 +74,10 @@ def query_tokens(query: str) -> list[str]:
     """Tokens for an OR-style tsquery: base tokens plus prefix-stripped variants."""
     base = base_normalize(query)
     tokens: list[str] = []
-    for raw in re.findall(r"[\w״׳./-]+", base):
-        tok = raw.strip("./-")
-        if len(tok) < 2 and not tok.isdigit():
+    for raw in re.findall(r"[\w״׳./]+", base):
+        tok = raw.strip("./-׳״")
+        letters = sum(ch.isalpha() for ch in tok)
+        if tok in STOPWORDS or (letters < 2 and not any(ch.isdigit() for ch in tok)):
             continue
         tokens.append(tok)
         if _HEB_WORD.fullmatch(tok):

@@ -73,7 +73,8 @@ def answer_content(conn: Connection, ctx: TenantContext, question: str, c, route
     query = question
     if c is not None and (c.neighborhood or c.city) and numeric is not None:
         query = f"{question} {c.neighborhood or ''} {c.city or ''}"
-    hits = hybrid_search(conn, query, EVIDENCE_LIMIT)
+    # Evidence needs at least one lexical or fuzzy term match; a purely semantic neighbour is not a basis.
+    hits = [h for h in hybrid_search(conn, query, EVIDENCE_LIMIT * 2) if h["lexical_support"]][:EVIDENCE_LIMIT]
     base = numeric.answer if numeric is not None else None
     start = len(base["sources"]) + 1 if base else 1
     evidence = _evidence(hits, start)

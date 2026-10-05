@@ -101,9 +101,9 @@ def test_content_path_sends_only_authorized_evidence(world, capture, user, phras
     assert {s["document_id"] for s in a.get("sources", [])} <= visible
 
 
-# D2 needs Hebrew OCR; the D5 price phrase is ranked non-deterministically (see the lexical xfail below)
+# D2 needs Hebrew OCR (covered inside the image)
 RELEVANCE_FACTS = [f for f in truth()["content_facts"]
-                   if docs()[f["document"]]["office"] == "A" and f["document"] != "D2" and "1.25" not in f["phrase"]]
+                   if docs()[f["document"]]["office"] == "A" and f["document"] != "D2"]
 
 
 @pytest.mark.parametrize("fact", RELEVANCE_FACTS,
@@ -119,12 +119,6 @@ def test_content_path_evidence_is_relevant(world, capture, fact):
                for e in evidence), [e["title"] for e in evidence]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: lexical ranking is swamped by stop words and one-letter tokens. app/extraction/normalize_text.py:"
-    "query_tokens keeps 'מה', 'על', 'נאמר' and turns 'מ׳' into 'מ'; app/platform/search.py:_lexical ORs them and "
-    "ranks by ts_rank_cd, so the chunk that holds the exact phrase 'בכ-1.25 מ׳ ₪' (D5) ranks ~13th lexically "
-    "and is often missing from the 6 evidence passages (depends on HNSW order). Fix: drop stop words and "
-    "1-char tokens, rank by distinct matched terms / phrase match first, and add a relevance floor."))
 def test_exact_phrase_ranks_first_lexically(world):
     from app.extraction.normalize_text import query_tokens
     from app.platform.search import _lexical

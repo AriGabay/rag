@@ -114,7 +114,10 @@ def refresh_version_status(conn: Connection, version_id: UUID) -> str:
             " (SELECT pages_incomplete FROM document_versions WHERE id = :v) AS pages_incomplete,"
             " (SELECT count(*) FROM dedup_candidates c WHERE c.status = 'open' AND (c.transaction_a IN"
             "   (SELECT transaction_id FROM occurrences WHERE version_id = :v) OR c.transaction_b IN"
-            "   (SELECT transaction_id FROM occurrences WHERE version_id = :v))) AS open_candidates"
+            "   (SELECT transaction_id FROM occurrences WHERE version_id = :v))"
+            "   AND (SELECT bool_and(EXISTS (SELECT 1 FROM occurrences o JOIN document_versions cv ON cv.id = o.version_id"
+            "        AND cv.is_current WHERE o.transaction_id = t)) FROM unnest(ARRAY[c.transaction_a, c.transaction_b]) t)"
+            " ) AS open_candidates"
             " FROM occurrences WHERE version_id = :v"
         ),
         {"v": version_id},
@@ -147,13 +150,7 @@ def publish_version(conn: Connection, version_id: UUID, document_id: UUID, extra
         [{"index": t.table_index, **t.structure} for t in tables],
         {p.page_no for p in pages if p.method == "ocr"},
     )
-    for idx, rec in enumerate(drafts):
-        val = validate(rec)
-        facts = facts_of(rec, val.computed_ppsqm, val.calc_definition)
-        txn_id, _ = attach_transaction(conn, facts)
-        insert_occurrence(conn, version_id, document_id, idx, rec, txn_id, extraction_version)
-        find_uncertain(conn, txn_id, facts, version_id)
-
+    # Retire earlier versions first, so look-alike checks only compare against current documents.
     conn.execute(
         text(
             "UPDATE document_versions SET is_current = false, status = 'superseded'"
@@ -161,6 +158,13 @@ def publish_version(conn: Connection, version_id: UUID, document_id: UUID, extra
         ),
         {"d": document_id, "v": version_id},
     )
+    for idx, rec in enumerate(drafts):
+        val = validate(rec)
+        facts = facts_of(rec, val.computed_ppsqm, val.calc_definition)
+        txn_id, _ = attach_transaction(conn, facts)
+        insert_occurrence(conn, version_id, document_id, idx, rec, txn_id, extraction_version)
+        find_uncertain(conn, txn_id, facts, version_id)
+
     conn.execute(
         text("UPDATE document_versions SET is_current = true, processed_at = now(), status_reason = NULL WHERE id = :v"),
         {"v": version_id},

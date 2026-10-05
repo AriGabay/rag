@@ -118,14 +118,6 @@ def test_unverified_records_are_excluded_and_reported(world):
     assert with_unverified.count == exp.count + 1  # the record would change the answer
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: uploading D1v2 as a new version of D1 opens a dedup candidate between D1v1-T03 (1,790,000, now "
-    "superseded) and D1v2-T03 (1,820,000). app/appraisal/publish.py:publish_version calls find_uncertain "
-    "(app/appraisal/dedup.py:find_uncertain, filter 'v.is_current OR v.id = :v') before the previous version "
-    "is marked superseded, so the old version still counts as current. The review queue then shows a "
-    "'duplicate' that is really a version replacement and D1 stays needs_review. Fix: supersede the previous "
-    "versions before the record loop (or exclude o.document_id = :document_id of other versions), and drop "
-    "open candidates whose transactions only have occurrences in superseded versions."))
 def test_new_version_is_not_reported_as_an_uncertain_duplicate(world):
     items = world.client(ADMIN_A).get("/api/review/queue").json()["items"]
     for item in [i for i in items if i["kind"] == "dedup"]:

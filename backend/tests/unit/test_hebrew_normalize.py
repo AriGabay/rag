@@ -10,7 +10,7 @@ def test_gershayim_variants_unify():
 
 
 def test_thousands_separators_removed_but_decimals_kept():
-    assert base_normalize("1,250,000 ₪ ו-3.5 חדרים") == "1250000 ₪ ו-3.5 חדרים"
+    assert base_normalize("1,250,000 ₪ ו-3.5 חדרים") == "1250000 ₪ ו 3.5 חדרים"
 
 
 def test_niqqud_stripped():

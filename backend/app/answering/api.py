@@ -119,6 +119,9 @@ def ask(body: AskBody, ctx: TenantContext = Depends(get_ctx)) -> dict:
         conv = _conversation(conn, ctx, body.conversation_id, body.question)
         previous = QueryConditions.model_validate(conv.confirmed_conditions) if conv.confirmed_conditions else None
         pending = conv.pending_clarification if body.clarification else None
+        if body.clarification and not (body.question and body.question.strip()) and (
+                not pending or pending.get("key") != body.clarification.get("key")):
+            raise HTTPException(status.HTTP_409_CONFLICT, "אין שאלת הבהרה פתוחה בשיחה זו. כתבו שאלה חדשה")
         def lookup(conds: QueryConditions, question: str):
             cached = conn.execute(text("SELECT payload FROM answer_cache WHERE cache_key = :k"),
                                   {"k": cache_key(conn, ctx, conds, question, conds.intent)}).scalar()

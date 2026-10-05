@@ -133,8 +133,10 @@ def queue(document_id: str | None = None, ctx: TenantContext = Depends(get_ctx))
         ).all()
         cands = conn.execute(
             text("SELECT c.* FROM dedup_candidates c WHERE c.status = 'open'"
-                 " AND EXISTS (SELECT 1 FROM transactions t WHERE t.id = c.transaction_a)"
-                 " AND EXISTS (SELECT 1 FROM transactions t WHERE t.id = c.transaction_b) ORDER BY c.created_at")
+                 " AND EXISTS (SELECT 1 FROM occurrences o JOIN document_versions v ON v.id = o.version_id"
+                 "   AND v.is_current WHERE o.transaction_id = c.transaction_a)"
+                 " AND EXISTS (SELECT 1 FROM occurrences o JOIN document_versions v ON v.id = o.version_id"
+                 "   AND v.is_current WHERE o.transaction_id = c.transaction_b) ORDER BY c.created_at")
         ).all()
         visible_cands = [c for c in cands if _fully_visible(ctx, [c.transaction_a, c.transaction_b])]
         items = [
