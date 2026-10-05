@@ -1,9 +1,8 @@
-"""Smoke check that the app module imports and exposes the health route."""
+"""Smoke check that the app module imports and exposes its core routes."""
 
 from app.main import create_app
 
 
-def test_app_exposes_health_route():
-    paths = {route.path for route in create_app().routes}
-    assert "/api/health" in paths
-    assert "/api/auth/login" in paths
+def test_app_exposes_core_routes():
+    paths = set(create_app().openapi()["paths"])
+    assert {"/api/health", "/api/auth/login", "/api/documents"} <= paths
