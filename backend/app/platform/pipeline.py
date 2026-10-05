@@ -23,8 +23,8 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from app.config import get_settings
-from app.db import TenantContext, tenant_tx
-from app.extraction.base import ExtractionError, ExtractionResult
+from app.db import TenantContext, system_ctx, tenant_tx  # noqa: F401 - system_ctx re-exported
+from app.extraction.base import ExtractionResult, check_deadline
 from app.extraction.normalize_text import normalize_for_search
 
 logger = logging.getLogger(__name__)
@@ -39,15 +39,6 @@ class VersionInfo:
     storage_key: str
     mime_type: str
     cloned_from: UUID | None
-
-
-class JobDeadline(ExtractionError):
-    def __init__(self) -> None:
-        super().__init__("חריגה מזמן העיבוד המותר למסמך", permanent=True)
-
-
-def system_ctx(office_id: UUID) -> TenantContext:
-    return TenantContext(office_id=office_id, user_id=None, role="system")
 
 
 def start_processing(ctx: TenantContext, version_id: UUID) -> VersionInfo | None:
@@ -181,7 +172,7 @@ def extract_stage(ctx: TenantContext, info: VersionInfo, deadline: float) -> Non
 # --- stage 2 ---------------------------------------------------------------------------------------
 
 def embed_stage(ctx: TenantContext, info: VersionInfo, deadline: float) -> None:
-    from app.providers.embeddings import get_embedding_provider
+    from app.providers.embeddings import get_embedding_provider, to_pgvector
 
     provider = get_embedding_provider()
     while True:
@@ -195,14 +186,13 @@ def embed_stage(ctx: TenantContext, info: VersionInfo, deadline: float) -> None:
             ).all()
         if not rows:
             return
-        if time.monotonic() > deadline:
-            raise JobDeadline()
+        check_deadline(deadline)
         vectors = provider.embed_passages([r.text for r in rows])
         with tenant_tx(ctx) as conn:
             for r, vec in zip(rows, vectors, strict=True):
                 conn.execute(
                     text("UPDATE chunks SET embedding = CAST(:e AS vector), embedding_model = :m WHERE id = :id"),
-                    {"e": "[" + ",".join(f"{x:.6f}" for x in vec) + "]", "m": provider.model_id, "id": r.id},
+                    {"e": to_pgvector(vec), "m": provider.model_id, "id": r.id},
                 )
 
 

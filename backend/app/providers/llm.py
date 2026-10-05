@@ -12,6 +12,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Protocol
 
 from app.config import get_settings
@@ -139,4 +140,10 @@ def cloud_configured() -> bool:
 
 def get_cloud_provider() -> LLMProvider:
     s = get_settings()
-    return AnthropicLLM(s.anthropic_api_key, s.anthropic_model)
+    return _cloud_provider(s.anthropic_api_key, s.anthropic_model)
+
+
+@lru_cache(maxsize=4)
+def _cloud_provider(api_key: str, model: str) -> LLMProvider:
+    """One client (and HTTP connection pool) per key/model, reused across requests."""
+    return AnthropicLLM(api_key, model)

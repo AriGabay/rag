@@ -18,6 +18,11 @@ from app.config import get_settings
 from app.extraction.normalize_text import normalize_for_search
 
 
+def to_pgvector(vec: list[float]) -> str:
+    """pgvector text literal; used for both indexing and querying so the two never disagree."""
+    return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
+
+
 class EmbeddingProvider(Protocol):
     model_id: str
     dim: int
@@ -36,9 +41,9 @@ class HashEmbedding:
 
     def _vec(self, text: str) -> list[float]:
         vec = [0.0] * self.dim
-        norm = normalize_for_search(text)
-        feats = norm.split()
-        for word in norm.split():
+        words = normalize_for_search(text).split()
+        feats = list(words)
+        for word in words:
             padded = f" {word} "
             feats.extend(padded[i:i + 3] for i in range(len(padded) - 2))
         for f in feats:

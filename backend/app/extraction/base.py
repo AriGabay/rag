@@ -3,8 +3,11 @@ OCR adapter can replace the default extractor."""
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
+
+MSG_DEADLINE = "חריגה מזמן העיבוד המותר למסמך"
 
 
 class ExtractionError(Exception):
@@ -15,6 +18,12 @@ class ExtractionError(Exception):
         super().__init__(reason)
         self.reason = reason
         self.permanent = permanent
+
+
+def check_deadline(deadline: float) -> None:
+    """Fail the job permanently once its wall-clock budget is spent."""
+    if time.monotonic() > deadline:
+        raise ExtractionError(MSG_DEADLINE, True)
 
 
 @dataclass

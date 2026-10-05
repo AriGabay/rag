@@ -15,9 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sqlalchemy import create_engine, text  # noqa: E402
 
 from app.config import get_settings  # noqa: E402
-from app.db import tenant_tx  # noqa: E402
+from app.db import bump_data_version, system_ctx, tenant_tx  # noqa: E402
 from app.extraction.normalize_text import normalize_for_search  # noqa: E402
-from app.platform.pipeline import system_ctx  # noqa: E402
 
 
 def main() -> None:
@@ -32,7 +31,7 @@ def main() -> None:
             for r in rows:
                 conn.execute(text("UPDATE chunks SET normalized_text = :n WHERE id = :i"),
                              {"n": normalize_for_search(r.text), "i": r.id})
-            conn.execute(text("UPDATE office_data_versions SET version = version + 1"))
+            bump_data_version(conn)
             total += len(rows)
     print(f"re-normalized {total} chunks in {len(office_ids)} offices")
 

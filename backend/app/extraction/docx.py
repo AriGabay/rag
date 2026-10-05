@@ -8,9 +8,8 @@ import io
 import zipfile
 
 from app.config import Settings
-from app.extraction.base import ExtractionError, ExtractionResult, PageResult
+from app.extraction.base import ExtractionError, ExtractionResult, PageResult, check_deadline
 from app.extraction.chunking import chunk_document, is_heading
-from app.extraction.pdf import check_deadline
 from app.extraction.tables import RawTable, assemble_tables, clean_cell
 
 MSG_CORRUPT = "הקובץ פגום או שאינו DOCX תקין"
@@ -38,8 +37,6 @@ def extract_docx(data: bytes, deadline: float, settings: Settings) -> Extraction
         from docx.text.paragraph import Paragraph
 
         document = docx.Document(io.BytesIO(data))
-    except ExtractionError:
-        raise
     except Exception:  # noqa: BLE001
         raise ExtractionError(MSG_CORRUPT, True) from None
 

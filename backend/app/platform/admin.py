@@ -14,6 +14,7 @@ from app.audit import audit
 from app.config import get_settings
 from app.db import TenantContext, bump_data_version, tenant_tx
 from app.deps import NOT_FOUND, parse_uuid, require_admin
+from app.platform.documents import latest_status_counts
 from app.security import hash_password
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -171,10 +172,7 @@ def put_office_settings(body: SettingsBody, ctx: TenantContext = Depends(require
 @router.get("/coverage")
 def coverage_summary(ctx: TenantContext = Depends(require_admin)) -> dict:
     with tenant_tx(ctx) as conn:
-        by_status = dict(conn.execute(text(
-            "SELECT status, count(*) FROM (SELECT DISTINCT ON (v.document_id) v.status FROM document_versions v"
-            " JOIN documents d ON d.id = v.document_id AND d.deleted_at IS NULL"
-            " ORDER BY v.document_id, v.version_no DESC) x GROUP BY status")).all())
+        by_status = latest_status_counts(conn)
         rec = conn.execute(text(
             "SELECT count(*) AS total,"
             " count(*) FILTER (WHERE o.verification_status IN ('human_verified', 'corrected')) AS verified,"

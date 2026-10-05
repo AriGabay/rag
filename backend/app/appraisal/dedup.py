@@ -95,24 +95,23 @@ def add_candidate(conn: Connection, a: UUID, b: UUID, reason: str) -> None:
     )
 
 
-def attach_transaction(conn: Connection, f: TxnFacts) -> tuple[UUID, bool]:
-    """Return (transaction_id, merged_with_existing)."""
+def attach_transaction(conn: Connection, f: TxnFacts) -> UUID:
+    """Return the transaction this record belongs to (existing on a certain match, else new)."""
     key = match_key(f)
     if key:
         existing = conn.execute(text("SELECT id FROM transactions WHERE match_key = :k"), {"k": key}).scalar_one_or_none()
         if existing:
             types = _property_types(conn, existing)
             if not f.property_type or not types or f.property_type in types:
-                return existing, True
+                return existing
             new_id = _insert_transaction(conn, f, None)
             add_candidate(conn, existing, new_id, "התאמה במיקום, תאריך, מחיר ושטח אך סוג נכס שונה")
-            return new_id, False
+            return new_id
         new_id = _insert_transaction(conn, f, key)
         if new_id is None:  # lost a race despite the lock: take the winner
             new_id = conn.execute(text("SELECT id FROM transactions WHERE match_key = :k"), {"k": key}).scalar_one()
-            return new_id, True
-        return new_id, False
-    return _insert_transaction(conn, f, None), False
+        return new_id
+    return _insert_transaction(conn, f, None)
 
 
 def find_uncertain(conn: Connection, txn_id: UUID, f: TxnFacts, version_id: UUID) -> int:

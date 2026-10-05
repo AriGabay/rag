@@ -32,13 +32,13 @@ def get_ctx(request: Request) -> TenantContext:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, NOT_AUTHENTICATED)
     base = TenantContext(office_id=row.office_id, user_id=row.user_id, role=row.role)
     with tenant_tx(base) as conn:
-        groups = tuple(
-            conn.execute(text("SELECT group_id FROM user_groups WHERE user_id = :u ORDER BY group_id"),
-                         {"u": row.user_id}).scalars()
-        )
-        can_upload = conn.execute(text("SELECT can_upload FROM users WHERE id = :u"), {"u": row.user_id}).scalar_one()
+        user = conn.execute(
+            text("SELECT u.can_upload, ARRAY(SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = u.id"
+                 " ORDER BY ug.group_id) AS groups FROM users u WHERE u.id = :u"),
+            {"u": row.user_id},
+        ).one()
     return TenantContext(office_id=row.office_id, user_id=row.user_id, role=row.role,
-                         group_ids=groups, can_upload=bool(can_upload) or row.role == "admin")
+                         group_ids=tuple(user.groups), can_upload=bool(user.can_upload) or row.role == "admin")
 
 
 def require_admin(ctx: TenantContext = Depends(get_ctx)) -> TenantContext:

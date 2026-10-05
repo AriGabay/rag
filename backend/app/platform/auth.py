@@ -88,7 +88,7 @@ def logout(request: Request, response: Response) -> dict:
 def me(ctx: TenantContext = Depends(get_ctx)) -> dict:
     with tenant_tx(ctx) as conn:
         user = conn.execute(
-            text("SELECT id, email, full_name, role, can_upload FROM users WHERE id = :u"), {"u": ctx.user_id}
+            text("SELECT id, email, full_name, role FROM users WHERE id = :u"), {"u": ctx.user_id}
         ).one()
         office = conn.execute(text("SELECT id, name FROM offices")).one()
         groups = conn.execute(
@@ -101,7 +101,7 @@ def me(ctx: TenantContext = Depends(get_ctx)) -> dict:
         ).all()
     return {
         "user": {"id": str(user.id), "email": user.email, "full_name": user.full_name, "role": user.role,
-                 "can_upload": bool(user.can_upload) or user.role == "admin"},
+                 "can_upload": ctx.can_upload},
         "office": {"id": str(office.id), "name": office.name},
         "groups": [{"id": str(g.id), "name": g.name} for g in groups],
         "demo_mode": get_settings().demo_mode,

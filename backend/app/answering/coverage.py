@@ -2,22 +2,15 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection
 
 from app.answering.conditions import QueryConditions
 from app.appraisal.query import AWAITING, VERIFIED, eligible_ids
+from app.platform.documents import latest_status_counts
 
 
 def coverage(conn: Connection, c: QueryConditions | None = None) -> dict:
-    counts = dict(
-        conn.execute(
-            text(
-                "SELECT status, count(*) FROM (SELECT DISTINCT ON (v.document_id) v.status FROM document_versions v"
-                " JOIN documents d ON d.id = v.document_id AND d.deleted_at IS NULL"
-                " ORDER BY v.document_id, v.version_no DESC) latest GROUP BY status"
-            )
-        ).all()
-    )
+    counts = latest_status_counts(conn)
     pending = counts.get("pending", 0) + counts.get("processing", 0)
     failed = counts.get("failed", 0)
     needs_review = counts.get("needs_review", 0)

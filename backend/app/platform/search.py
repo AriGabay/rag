@@ -15,7 +15,7 @@ from sqlalchemy import Connection, text
 from app.db import TenantContext, tenant_tx
 from app.deps import get_ctx
 from app.extraction.normalize_text import base_normalize, query_tokens
-from app.providers.embeddings import get_embedding_provider
+from app.providers.embeddings import get_embedding_provider, to_pgvector
 
 router = APIRouter(prefix="/api/search", tags=["search"])
 
@@ -68,7 +68,7 @@ def _semantic(conn: Connection, query: str) -> list:
     return list(conn.execute(
         text(f"SELECT c.id{_SCOPE} WHERE c.embedding_model = :m AND c.embedding IS NOT NULL"
              " ORDER BY c.embedding <=> CAST(:v AS vector) LIMIT :n"),
-        {"m": provider.model_id, "v": "[" + ",".join(f"{x:.6f}" for x in vec) + "]", "n": CANDIDATES},
+        {"m": provider.model_id, "v": to_pgvector(vec), "n": CANDIDATES},
     ).scalars())
 
 

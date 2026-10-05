@@ -60,9 +60,11 @@ def run_one(worker_id: str) -> bool:
     keeper = _LeaseKeeper(job.office_id, job.job_id, worker_id)
     keeper.start()
     try:
-        pipeline.process_version(job.office_id, job.version_id)
+        try:
+            pipeline.process_version(job.office_id, job.version_id)
+        finally:
+            keeper.stop_event.set()  # always stop renewing before recording the outcome
     except ExtractionError as exc:
-        keeper.stop_event.set()
         with tenant_tx(ctx) as conn:
             terminal = fail_job(conn, job.job_id, exc.reason, exc.permanent, job.attempts, job.max_attempts)
         if terminal:
@@ -71,7 +73,6 @@ def run_one(worker_id: str) -> bool:
             pipeline.mark_retry(ctx, job.version_id)
         logger.info("job %s extraction error (permanent=%s)", job.job_id, exc.permanent)
     except Exception as exc:  # noqa: BLE001
-        keeper.stop_event.set()
         logger.error("job %s failed: %s", job.job_id, type(exc).__name__)
         logger.debug("%s", traceback.format_exc())
         with tenant_tx(ctx) as conn:
@@ -81,7 +82,6 @@ def run_one(worker_id: str) -> bool:
         else:
             pipeline.mark_retry(ctx, job.version_id)
     else:
-        keeper.stop_event.set()
         with tenant_tx(ctx) as conn:
             finish_job(conn, job.job_id)
     return True

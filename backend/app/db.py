@@ -41,6 +41,11 @@ class TenantContext:
         return self.role in ("admin", "system")
 
 
+def system_ctx(office_id: UUID) -> TenantContext:
+    """Context for server-side work in one office (worker jobs, authorized maintenance)."""
+    return TenantContext(office_id=office_id, user_id=None, role="system")
+
+
 @lru_cache
 def get_engine() -> Engine:
     settings = get_settings()

@@ -6,6 +6,7 @@ import hashlib
 import io
 import zipfile
 from pathlib import PurePath
+from types import SimpleNamespace
 from urllib.parse import quote
 from uuid import UUID
 
@@ -30,6 +31,19 @@ MSG_EMPTY = "הקובץ ריק"
 MSG_ZIP = "קובץ DOCX פגום או חורג ממגבלות הגודל"
 MSG_BATCH = "ניתן להעלות עד {n} קבצים בבת אחת"
 MSG_DUP = "הקובץ כבר הועלה למאגר"
+
+
+def source_file_url(document_id, version_id, page: int | None = None) -> str:
+    """Authenticated source link; the browser's PDF viewer opens it at ``#page=N``."""
+    return f"/api/documents/{document_id}/versions/{version_id}/file" + (f"#page={page}" if page else "")
+
+
+def latest_status_counts(conn: Connection) -> dict[str, int]:
+    """Count non-deleted documents by the status of their latest version."""
+    return dict(conn.execute(text(
+        "SELECT status, count(*) FROM (SELECT DISTINCT ON (v.document_id) v.status FROM document_versions v"
+        " JOIN documents d ON d.id = v.document_id AND d.deleted_at IS NULL"
+        " ORDER BY v.document_id, v.version_no DESC) latest GROUP BY status")).all())
 
 
 def _sniff(filename: str, data: bytes) -> str | None:
@@ -178,27 +192,28 @@ def _version_json(row) -> dict:
 
 def _list_documents(conn: Connection, ctx: TenantContext, q: str | None, status_filter: str | None,
                     document_id: UUID | None = None) -> list[dict]:
+    """One query: documents with their latest version (LATERAL), filtered in SQL."""
+    latest_cols = ", ".join(f"lv.{c.split('.')[1]} AS lv_{c.split('.')[1]}" for c in _VERSION_COLS.split(", "))
     rows = conn.execute(
         text(
             "SELECT d.id, d.title, d.created_at, d.deleted_at, g.id AS group_id, g.name AS group_name,"
-            " (SELECT count(*) FROM document_versions v WHERE v.document_id = d.id) AS versions_count"
+            " (SELECT count(*) FROM document_versions vc WHERE vc.document_id = d.id) AS versions_count,"
+            f" {latest_cols}"
             " FROM documents d JOIN document_groups g ON g.id = d.group_id"
+            f" LEFT JOIN LATERAL (SELECT {_VERSION_COLS} FROM document_versions v WHERE v.document_id = d.id"
+            "   ORDER BY v.version_no DESC LIMIT 1) lv ON true"
             " WHERE (:admin OR d.deleted_at IS NULL)"
             " AND (CAST(:q AS text) IS NULL OR d.title ILIKE '%' || CAST(:q AS text) || '%')"
             " AND (CAST(:doc AS uuid) IS NULL OR d.id = CAST(:doc AS uuid))"
+            " AND (CAST(:st AS text) IS NULL OR lv.status = CAST(:st AS text))"
             " ORDER BY d.created_at DESC"
         ),
-        {"admin": ctx.is_admin, "q": q or None, "doc": document_id},
+        {"admin": ctx.is_admin, "q": q or None, "doc": document_id, "st": status_filter or None},
     ).all()
     out = []
     for r in rows:
-        ver = conn.execute(
-            text(f"SELECT {_VERSION_COLS} FROM document_versions v WHERE v.document_id = :d"
-                 " ORDER BY v.version_no DESC LIMIT 1"),
-            {"d": r.id},
-        ).first()
-        if status_filter and (ver is None or ver.status != status_filter):
-            continue
+        m = r._mapping
+        ver = SimpleNamespace(**{k[3:]: v for k, v in m.items() if k.startswith("lv_")}) if m["lv_id"] else None
         out.append({
             "id": str(r.id), "title": r.title, "group": {"id": str(r.group_id), "name": r.group_name},
             "deleted": r.deleted_at is not None, "created_at": r.created_at.isoformat(),
