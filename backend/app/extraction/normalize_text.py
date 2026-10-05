@@ -18,7 +18,7 @@ import unicodedata
 
 _NIQQUD = re.compile(r"[֑-ׇ]")
 _GERSHAYIM = re.compile(r"(?<=[א-ת])[\"“”״](?=[א-ת])")
-_GERESH = re.compile(r"(?<=[א-ת])['`’‘׳](?=\s|$|[^א-ת])")
+_GERESH = re.compile(r"(?<=[\u05D0-\u05EA])['`’‘]")
 _THOUSANDS = re.compile(r"(?<=\d)[,٬](?=\d{3}(?!\d))")
 _HEB_WORD = re.compile(r"[א-ת][א-ת״׳]*")
 _PREFIXES = "והבלמשכ"
