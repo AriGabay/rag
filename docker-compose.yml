@@ -1,0 +1,79 @@
+# Local stack for the appraisal knowledge engine MVP.
+# All data lives in named volumes (pgdata, filedata), never in container layers.
+name: appraisal-rag
+
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql+psycopg://rag_app:${RAG_APP_PASSWORD:?set in .env}@db:5432/rag
+  OWNER_DATABASE_URL: postgresql+psycopg://rag_owner:${RAG_OWNER_PASSWORD:?set in .env}@db:5432/rag
+  FILE_STORAGE_ROOT: /data/files
+  SESSION_SECRET: ${SESSION_SECRET:?set in .env}
+  DEMO_MODE: ${DEMO_MODE:-true}
+  EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-5-5}
+  HF_HUB_OFFLINE: "1"
+
+services:
+  db:
+    image: pgvector/pgvector:0.8.7-pg17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set in .env}
+      POSTGRES_DB: postgres
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.utf8"
+      RAG_OWNER_PASSWORD: ${RAG_OWNER_PASSWORD}
+      RAG_APP_PASSWORD: ${RAG_APP_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rag"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    build: ./backend
+    image: appraisal-rag-backend
+    command: ["alembic", "upgrade", "head"]
+    environment: *backend-env
+    depends_on:
+      db:
+        condition: service_healthy
+
+  backend:
+    image: appraisal-rag-backend
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment: *backend-env
+    volumes:
+      - filedata:/data/files
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    image: appraisal-rag-backend
+    command: ["python", "-m", "app.worker"]
+    environment: *backend-env
+    volumes:
+      - filedata:/data/files
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  frontend:
+    build: ./frontend
+    environment:
+      BACKEND_URL: http://backend:8000
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  filedata:
