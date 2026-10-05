@@ -97,6 +97,9 @@ def _save(conn: Connection, ctx: TenantContext, conv_id: UUID, question: str, ou
     confirmed = outcome.conditions.model_dump() if (
         outcome.conditions and answer["kind"] in ("numeric", "combined", "abstain") and outcome.conditions.data_kind
     ) else None
+    if question.strip():
+        conn.execute(text("UPDATE conversations SET title = :t WHERE id = :c AND title = 'שיחה חדשה'"),
+                     {"t": question.strip()[:80], "c": conv_id})
     conn.execute(
         text("UPDATE conversations SET pending_clarification = CAST(:p AS jsonb),"
              " confirmed_conditions = COALESCE(CAST(:cc AS jsonb), confirmed_conditions), updated_at = now()"

@@ -9,7 +9,7 @@ from pathlib import PurePath
 from urllib.parse import quote
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import Connection, text
 
 from app.audit import audit
@@ -208,7 +208,8 @@ def _list_documents(conn: Connection, ctx: TenantContext, q: str | None, status_
 
 
 @router.get("")
-def list_documents(q: str | None = None, status_filter: str | None = None, ctx: TenantContext = Depends(get_ctx)):
+def list_documents(q: str | None = None, status_filter: str | None = Query(None, alias="status"),
+                   ctx: TenantContext = Depends(get_ctx)):
     with tenant_tx(ctx) as conn:
         return {"documents": _list_documents(conn, ctx, q, status_filter)}
 

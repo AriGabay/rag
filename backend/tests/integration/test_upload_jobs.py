@@ -223,3 +223,14 @@ def test_file_endpoint_is_scoped(client, office):
     assert client.get(url).status_code == 404
     assert client.get("/api/documents/not-a-uuid/versions/x/file").status_code == 404
     _ = TenantContext  # imported for type reference
+
+
+def test_status_filter_uses_status_parameter(client, office):
+    a, _ = office
+    login(client, "admin-a@example.test")
+    ok = upload(client, [("ok.pdf", tiny_pdf("ok-f"))], group_id=a.default_group_id).json()["results"][0]
+    bad = upload(client, [("bad.pdf", tiny_pdf("bad-f"))], group_id=a.default_group_id).json()["results"][0]
+    with tenant_tx(a.ctx()) as conn:
+        conn.execute(text("UPDATE document_versions SET status = 'failed' WHERE id = :v"), {"v": bad["version_id"]})
+    docs = client.get("/api/documents", params={"status": "failed"}).json()["documents"]
+    assert [d["id"] for d in docs] == [bad["document_id"]] and ok["document_id"] not in str(docs)

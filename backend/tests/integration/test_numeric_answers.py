@@ -180,3 +180,11 @@ def test_history_marks_stale_and_hides_deleted_sources(client, office):
     client.delete(f"/api/documents/{doc}")
     msg = client.get(f"/api/conversations/{cid}").json()["messages"][0]
     assert msg["hidden"] is True and msg["answer"] is None
+
+
+def test_new_conversation_takes_title_from_first_question(client, office):
+    login(client, "admin-a@example.test")
+    cid = client.post("/api/conversations").json()["id"]
+    ask(client, "מחיר למ״ר בעסקאות שנחתמו ב-2024 בחרוזים", conversation_id=cid)
+    titles = {c["id"]: c["title"] for c in client.get("/api/conversations").json()["conversations"]}
+    assert titles[cid] == "מחיר למ״ר בעסקאות שנחתמו ב-2024 בחרוזים"
