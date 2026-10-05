@@ -1,0 +1,53 @@
+# CI: backend lint + tests against Postgres/pgvector as the non-bypassing runtime role,
+# frontend typecheck/lint/build. No private documents, no paid API calls (cloud provider unset).
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    services:
+      db:
+        image: pgvector/pgvector:0.8.7-pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.utf8"
+          RAG_OWNER_PASSWORD: change-me-owner
+          RAG_APP_PASSWORD: change-me-app
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 3s --health-timeout 3s --health-retries 30
+    env:
+      EMBEDDING_PROVIDER: hash
+      ANTHROPIC_API_KEY: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create roles and databases (same script the Compose stack runs)
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client tesseract-ocr tesseract-ocr-heb
+          PGPASSWORD=postgres POSTGRES_USER=postgres RAG_OWNER_PASSWORD=change-me-owner RAG_APP_PASSWORD=change-me-app \
+            PGHOST=localhost PGPORT=5433 bash infra/postgres/init/01-roles.sh
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.6"
+      - name: Lint
+        working-directory: backend
+        run: uv run ruff check .
+      - name: Tests
+        working-directory: backend
+        run: uv run pytest -q -p no:warnings
+
+  frontend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - working-directory: frontend
+        run: npm ci && npm run typecheck && npm run lint && npm run build
