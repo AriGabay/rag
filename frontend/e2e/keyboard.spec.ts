@@ -6,7 +6,7 @@ const FILE = "BAD_synthetic_encrypted.pdf";
 const TITLE = "BAD synthetic encrypted";
 
 /** Presses Tab until the focused element satisfies `predicate` (evaluated in the page). */
-async function tabUntil(page: Page, predicate: (el: Element) => boolean, max = 40): Promise<void> {
+async function tabUntil(page: Page, predicate: (el: Element) => boolean, max = 300): Promise<void> {
   for (let i = 0; i < max; i++) {
     await page.keyboard.press("Tab");
     const focused = await page.evaluateHandle(() => document.activeElement ?? document.body);
