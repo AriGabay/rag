@@ -22,6 +22,7 @@ router = APIRouter(prefix="/api/search", tags=["search"])
 RRF_K = 60
 # Exact terms (prices, block/parcel, names) matter most in appraisal documents: lexical counts double.
 RRF_WEIGHTS = (2.0, 1.0, 1.0)  # lexical, trigram, semantic
+LEXICAL_GUARANTEE = 2
 CANDIDATES = 40
 _SCOPE = (
     " FROM chunks c JOIN document_versions v ON v.id = c.version_id AND v.is_current"
@@ -82,6 +83,11 @@ def hybrid_search(conn: Connection, query: str, limit: int = 8) -> list[dict]:
         for rank, chunk_id in enumerate(ranking):
             scores[chunk_id] = scores.get(chunk_id, 0.0) + weight / (RRF_K + rank + 1)
     top = sorted(scores, key=lambda cid: -scores[cid])[:limit]
+    # The best exact-term matches always get a slot: semantic neighbours must not crowd them out.
+    for pos, chunk_id in enumerate(lexical[:LEXICAL_GUARANTEE]):
+        if chunk_id not in top:
+            top.insert(min(pos, len(top)), chunk_id)
+    top = top[:limit]
     if not top:
         return []
     rows = {r.id: r for r in conn.execute(
