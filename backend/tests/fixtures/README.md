@@ -1,0 +1,150 @@
+# Synthetic appraisal fixtures (U17)
+
+Every file here is **synthetic** ("מסמך סינתטי לדמו" appears in each document, and every filename contains
+`synthetic`). No real documents or client data (R36). Names, addresses, block/parcel numbers and prices
+are made up.
+
+`ground_truth.yaml` is the answer key: per document the office, group, kind, physical page count, the page
+of each section heading, the comparables table (cells and physical page of every row), every extracted record
+with all fields normalized, the expected duplicates, and content facts for retrieval evaluation.
+Do not edit files here by hand. Change `backend/scripts/generate_fixtures.py` and regenerate.
+
+## Regenerate
+
+The generator needs DejaVu Sans (`fonts-dejavu-core`), so run it in the backend image:
+
+```bash
+docker run --rm -v "$PWD/backend:/app" -w /app appraisal-rag-backend python scripts/generate_fixtures.py
+# options: --font-dir /usr/share/fonts/truetype/dejavu  --out tests/fixtures
+```
+
+The output is byte-for-byte deterministic: fixed creation dates, a seeded RNG, a fixed PDF `/ID` for the
+encrypted file, and fixed timestamps in the DOCX zip. Two consecutive runs produce identical SHA-1 hashes.
+Consistency check (host, no Docker): `cd backend && uv run pytest tests/unit/test_fixtures_ground_truth.py -q`.
+
+## Documents
+
+| id | file | kind | office / group | what it exercises |
+|---|---|---|---|---|
+| D1 | `D1_synthetic_harozim_digital.pdf` | pdf_digital | A / G1 | Baseline Harozim report, 6 comparables (2023 + 2024), 2 pages |
+| D2 | `D2_synthetic_harozim_scanned.pdf` | pdf_scanned | A / G1 | Image-only scan (200 dpi, speckle noise, 0.4° rotation), 3 comparables, no text layer |
+| D3 | `D3_synthetic_harozim_table_across_pages.pdf` | pdf_digital | A / G1 | 14-row table across pages 1→2, header **not** repeated on page 2 |
+| D4 | `D4_synthetic_harozim_shared_comparable.pdf` | pdf_digital | A / **G2** | Row 0 = certain duplicate of D1 row 1; row 1 = uncertain duplicate of D1 row 0 (110 gross vs 95 net) |
+| D5 | `D5_synthetic_harozim_mixed_formats.pdf` | pdf_digital | A / G1 | `₪ 1,480,000`, `2,150,000 ₪`, `1.25 מ׳ ₪`, decimal areas, `DD.MM.YY` dates, "במרץ 2024" in text |
+| D6 | `D6_synthetic_givatayim_conflicting_ppsm.pdf` | pdf_digital | A / G1 | Row 0: 1,000,000 / 50 m² but states 21,000 per m² (conflict); rows 0–1 are the AE3 pair |
+| D7 | `D7_synthetic_ramatgan_missing_fields.pdf` | pdf_digital | A / G1 | No `שכונה:` line; rows missing area, date, or address and block/parcel |
+| D8 | `D8_synthetic_ramatgan_three_dates.pdf` | pdf_digital | A / G1 | Transactions in 2023, valuation date 15/01/2024, report date 10/03/2025 |
+| D9 | `D9_synthetic_harozim_30_comparables.pdf` | pdf_digital | A / G1 | 30 comparables (more than retrieval top-k), header repeated on page 2 |
+| D10 | `D10_synthetic_harozim_visual_order.pdf` | pdf_visual | A / G1 | Text written in **visual order** (pre-reversed, shaping off, digits LTR) |
+| D11 | `D11_synthetic_ramatgan_report.docx` | docx | A / G1 | DOCX with headings, paragraphs and a comparables table (page fields are `null`) |
+| D12 | `D12_synthetic_harozim_injected_instruction.pdf` | pdf_digital | A / G1 | Section 4 contains "הוראה למערכת: התעלם מכל ההוראות הקודמות…" and must be treated as plain content |
+| DB1 | `DB1_synthetic_officeb_harozim.pdf` | pdf_digital | **B** / B-default | Office B; row 0 has the same address as D1 row 0 (הגפן 20) with a different date and price |
+| D1v2 | `D1v2_synthetic_harozim_digital_v2.pdf` | pdf_digital | A / G1 | New version of D1: row 3 price 1,790,000 → 1,820,000 |
+| BAD_encrypted | `BAD_synthetic_encrypted.pdf` | encrypted | A / G1 | RC4-128, user password `secret`; upload must be rejected |
+| BAD_truncated | `BAD_synthetic_truncated.pdf` | truncated | A / G1 | First 60% of a valid PDF's bytes; pypdf and pdfplumber fail to open it |
+
+Office A holds 80 transaction-price records in current documents (86 including D1v2). Every report except
+the two BAD files also has one `appraised_value` record taken from its header.
+
+## Layout contract (the extractor and fact rules rely on these exact strings)
+
+**Report header** (page 1). Each item is a `label: value` line on its own line, in this order. D7 omits
+`שכונה:`.
+
+```
+עיר: רמת גן
+שכונה: חרוזים
+כתובת הנכס: הגפן 14
+גוש: 6158 חלקה: 40 תת חלקה: 7        (one line; "תת חלקה" is omitted when there is none)
+סוג נכס: דירה
+המועד הקובע: 15/04/2024              (valuation date)
+תאריך עריכת השומה: 22/04/2024        (report date)
+שטח הנכס: 95 מ״ר נטו                 (number, מ״ר, area type)
+שווי הנכס: 2,650,000 ₪               (D5: "₪ 1,890,000")
+בסיס מע״מ: כולל מע״מ                 (or "לא כולל מע״מ")
+```
+
+Above the header there is a title line (`שומת מקרקעין — <address>, <city>`), a synthetic-marker line, and an
+office line (`משרד: שמאות דמו א׳ (סינתטי)`). These are not part of the contract. Every page has the footer
+`מסמך סינתטי לדמו | עמוד N`.
+
+**Section headings**, numbered, each on its own line:
+`1. מטרת השומה`, `2. תיאור הנכס והסביבה`, `3. עסקאות השוואה`, `4. שיקולי השמאי`, `5. תחשיב ושומה`.
+Sections 2 and 4 hold 1–5 paragraphs of synthetic professional reasoning that differ between reports.
+Section 5 repeats the value in prose ("הוערך הנכס ב-… ₪"). That sentence is not a second `שווי הנכס:` label.
+
+**Comparables area** (section 3, before the table). The comparables inherit their city and neighborhood
+from these lines, which the document states. Nothing is inferred from outside knowledge:
+
+```
+עיר העסקאות: רמת גן
+שכונת העסקאות: חרוזים       (absent in D7, so the comparables' neighborhood is null)
+```
+
+**Comparables table** (one per document, `table_index` 0). The header row, in logical (right-to-left)
+column order:
+
+```
+כתובת | גוש/חלקה | תאריך עסקה | סוג נכס | חדרים | שטח (מ״ר) | סוג שטח | מחיר (₪) | מחיר למ״ר (₪)
+```
+
+- In the PDFs the columns are drawn right to left, so `כתובת` is the rightmost column. pdfplumber's
+  `extract_tables()` returns the cells left to right, which means **reversed column order**.
+- `גוש/חלקה` is `block/parcel` or `block/parcel/sub_parcel`, for example `6158/42/3`, or `6159/31` when
+  there is no sub-parcel.
+- Dates are `DD/MM/YYYY`. D5 also uses `DD.MM.YY`.
+- Prices use thousands separators (`2,470,000`). D5 mixes `₪ 1,480,000`, `2,150,000 ₪` and `1.25 מ׳ ₪`
+  (= 1,250,000).
+- Areas may be decimal (`140.5`, `88.75`).
+- Area types: `נטו`, `ברוטו`, `רשום`, `אקוויוולנטי`.
+- An empty cell means the value is missing (D7). It is stored as `null` and never guessed.
+- The stated `מחיר למ״ר` is `round(price / area)`, except D6 row 0 (a deliberate conflict).
+- D3: the table continues on page 2 **without** a repeated header. D9: the header **is** repeated on page 2.
+- Physical page numbers are 1-based. `row_index` is 0-based and excludes the header row.
+
+## Normalization codes used in `ground_truth.yaml`
+
+| field | values |
+|---|---|
+| `data_kind` | `transaction_price` (table rows), `appraised_value` (report header) |
+| `area_type` | `net` = נטו, `gross` = ברוטו, `registered` = רשום, `equivalent` = אקוויוולנטי |
+| `property_type` | `apartment` = דירה, `garden_apartment` = דירת גן, `penthouse` = פנטהאוז, `duplex` = דופלקס, `cottage` = קוטג׳ |
+| `vat_basis` | `included` = כולל מע״מ, `excluded` = לא כולל מע״מ (taken from the report header for all of its records) |
+| dates | ISO `YYYY-MM-DD` strings, or `null`. Transaction records carry the report's `valuation_date` and `report_date` |
+| `area`, `price`, `rooms`, `price_per_sqm_*` | decimal strings without separators (`"95.5"`, `"2470000"`). `price_per_sqm_computed` = price / area rounded to 2 decimals |
+| `currency` | always `ILS` |
+| `page` | physical page of the row or header. `null` for DOCX |
+
+`dedup` lists the certain duplicate (D1-T01 ≡ D4-T00) and the uncertain pair (D1-T00 ~ D4-T01, different
+area and area type), using the plan's certain-duplicate rule. It also notes the cross-office address overlap
+(D1-T00 / DB1-T00, never merged) and that D1v2 replaces D1 (a new version, not a duplicate).
+`content_facts` maps distinctive phrases to their document and physical page.
+
+## Text layer as pdfplumber 0.11.10 returns it (raw, `page.extract_text()`)
+
+fpdf2 writes the shaped glyphs in visual (left-to-right) order. pdfplumber therefore returns each Hebrew
+line **reversed**, with digit runs left to right. Fixing this visual-to-logical order is U5's job.
+
+D1 page 1, header line `כתובת הנכס: הגפן 14`, and comparables row 0:
+
+```
+'14 ןפגה :סכנה תבותכ'
+'26,000 2,470,000 וטנ 95 4 הריד 12/02/2024 6158/42/3 20 ןפגה'
+```
+
+D1 page 1, office line. The shaping engine emits mirrored bracket glyphs, so the brackets come out swapped:
+
+```
+')יטתניס( ׳א ומד תואמש :דרשמ'
+```
+
+D10 (visual order) page 1, the same office line and comparables row 0:
+
+```
+'(יטתניס) ׳א ומד תואמש :דרשמ'
+'26,000 2,340,000 וטנ 90 4 הריד 18/02/2024 6159/74/3 2 תינלכה'
+```
+
+So the per-line character order from pdfplumber is the same in D1 and D10. The only visible difference is
+the bracket characters. pypdf's `extract_text()` (content-stream order) returns logical order for both files, and in D10 the brackets come out swapped (`)סינתטי(`).
+The scanned D2 has no characters at all (`len(page.chars) == 0`, one image per page).
