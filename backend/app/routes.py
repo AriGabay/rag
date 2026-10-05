@@ -8,6 +8,9 @@ _ROUTERS = [
     "app.platform.auth",
     "app.platform.documents",
     "app.appraisal.review",
+    "app.platform.search",
+    "app.answering.api",
+    "app.platform.admin",
 ]
 
 
