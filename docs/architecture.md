@@ -32,7 +32,7 @@ flowchart TB
 | הזדהות | session בצד השרת (טבלת `sessions`, hash של token). המשרד והמשתמש נגזרים רק מה-session; `office_id` שהלקוח שולח מתעלמים ממנו. |
 | טרנזקציה | כל בקשה וכל משימת worker פותחות טרנזקציה וקובעות `app.office_id`, `app.user_id`, `app.role` עם `set_config(..., true)`. ההגדרה מתה עם הטרנזקציה, ולכן חיבור ממאגר החיבורים לא נושא הקשר לבקשה אחרת. |
 | RLS | `FORCE ROW LEVEL SECURITY` על כל טבלה. מדיניות `office_id = app_office()`; כשה-GUC חסר — אין שורות. בטבלת `documents` גם הרשאת קבוצה; טבלאות התוכן מגיעות ל-`documents` דרך תת-שאילתה שעוברת RLS. |
-| תפקידים | `rag_owner` — בעלים ו-migrations. `rag_app` — runtime, ‏NOBYPASSRLS, לא בעלים. `rag_lookup` — ‏NOLOGIN BYPASSRLS, הבעלים היחיד של ארבע פונקציות SECURITY DEFINER צרות: כניסה לפי דוא״ל, פענוח session, תפיסת משימה, חיפוש hash בתוך המשרד. |
+| תפקידים | `rag_owner` — בעלים ו-migrations. `rag_app` — runtime, ‏NOBYPASSRLS, לא בעלים. `rag_lookup` — ‏NOLOGIN BYPASSRLS, הבעלים היחיד של פונקציות SECURITY DEFINER צרות: ארבע ב-runtime (כניסה לפי דוא״ל, פענוח session, תפיסת משימה, חיפוש hash בתוך המשרד) ושתיים לתפעול שרק `rag_owner` רשאי להריץ (הקמת משרד, רשימת משרדים לתחזוקה). ראו `docs/solutions/database-issues/force-rls-security-definer-lookups-need-bypassrls-owner.md`. |
 | קוד | פעולות כתיבה שנוגעות בעסקה שאוחדה מכמה קבוצות רצות בהקשר `system` רק אחרי בדיקת הרשאה של המשתמש. |
 
 ## מודל הנתונים
