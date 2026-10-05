@@ -169,3 +169,11 @@ def test_concurrent_publishes_share_one_transaction(offices):
     [t.join() for t in threads]
     assert errors == []
     assert len(q(a, "SELECT DISTINCT transaction_id FROM occurrences WHERE address = 'הרואה 5'")) == 1
+
+
+def test_subject_record_keeps_block_and_parcel(offices):
+    a, _ = offices
+    doc, ver = add_version(a, a.default_group_id, [], "7" * 64)
+    publish(a, doc, ver)
+    subject = q(a, "SELECT block, parcel, sub_parcel FROM occurrences WHERE data_kind = 'appraised_value'")[0]
+    assert (subject.block, subject.parcel, subject.sub_parcel) == ("6158", "42", "7")

@@ -112,7 +112,8 @@ def parse_header(pages: list[tuple[int, str]], labels: dict[str, str] | None = N
                 raw_value = line.split(":", 1)[1].strip() if ":" in line else m.group("value")
                 found[key] = FieldValue(raw_value, None, {"page": page_no, "label": label})
     for key, fv in found.items():
-        fv.value = _normalize_field(key, fv.original)
+        if key != "block_parcel":  # already parsed into (block, parcel, sub_parcel)
+            fv.value = _normalize_field(key, fv.original)
     if "area" in found:
         _, area_type = parse_area(found["area"].original)
         if area_type:
