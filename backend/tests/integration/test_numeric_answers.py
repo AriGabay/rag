@@ -188,3 +188,22 @@ def test_new_conversation_takes_title_from_first_question(client, office):
     ask(client, "מחיר למ״ר בעסקאות שנחתמו ב-2024 בחרוזים", conversation_id=cid)
     titles = {c["id"]: c["title"] for c in client.get("/api/conversations").json()["conversations"]}
     assert titles[cid] == "מחיר למ״ר בעסקאות שנחתמו ב-2024 בחרוזים"
+
+
+def test_follow_up_year_conflicting_with_filter_asks(client, office):
+    login(client, "admin-a@example.test")
+    r = ask(client, "מחיר למ״ר בעסקאות שנחתמו ב-2024 בחרוזים", filters={"year_from": 2024})
+    assert r["answer"]["kind"] == "numeric"
+    r2 = ask(client, "ומה לגבי 2023?", conversation_id=r["conversation_id"], filters={"year_from": 2024})
+    clar = r2["answer"]["clarification"]
+    assert r2["answer"]["kind"] == "clarification" and clar["key"] == "filter_conflict"
+    assert {o["value"] for o in clar["options"]} == {"year_from:2023", "year_from:2024"}
+    r3 = ask(client, conversation_id=r["conversation_id"], clarification={"key": "filter_conflict", "value": "year_from:2023"})
+    assert r3["answer"]["numeric"]["record_count"] == 1
+
+
+def test_impossible_filter_range_is_a_clarification_not_an_error(client, office):
+    login(client, "admin-a@example.test")
+    r = client.post("/api/ask", json={"question": "מחיר למ״ר בעסקאות לפי תאריך עסקה בחרוזים",
+                                      "filters": {"year_from": 2025, "year_to": 2023}})
+    assert r.status_code == 200 and r.json()["answer"]["kind"] == "clarification"

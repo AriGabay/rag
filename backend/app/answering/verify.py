@@ -11,9 +11,12 @@ _NUMBER = re.compile(r"(?<![\w])\d[\d,]*(?:\.\d+)?")
 _FORBIDDEN = re.compile(r"(https?://|www\.|!\[|\]\(|<[a-zA-Z/])")
 
 
+_ORDINAL = re.compile(r"^\s*\d{1,2}[.)]\s", re.M)
+
+
 def _numbers(text: str) -> set[str]:
     out = set()
-    for raw in _NUMBER.findall(_CITE.sub(" ", text)):
+    for raw in _NUMBER.findall(_ORDINAL.sub(" ", _CITE.sub(" ", text))):
         token = raw.rstrip(".,").replace(",", "")
         try:
             value = Decimal(token)
@@ -46,7 +49,7 @@ def verify_answer(text: str, used_ids: list[str], allowed_ids: set[str], numbers
         problems.append("no_citations")
     if cited - allowed_ids:
         problems.append("unknown_citation")
-    unsupported = {n for n in _numbers(text) if n not in numbers and len(n.replace(".", "")) > 1}
+    unsupported = {n for n in _numbers(text) if n not in numbers}
     if unsupported:
         problems.append("unsupported_number")
     return problems

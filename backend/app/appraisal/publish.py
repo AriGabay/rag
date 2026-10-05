@@ -15,7 +15,7 @@ from sqlalchemy import Connection, text
 
 from app.appraisal.dedup import TxnFacts, attach_transaction, delete_orphans, find_uncertain, lock_office
 from app.appraisal.extract import RecordDraft, as_date, as_decimal, extract_records
-from app.appraisal.validate import validate
+from app.appraisal.validate import Validation, validate
 from app.db import bump_data_version
 
 OCC_FIELDS = (
@@ -50,9 +50,24 @@ def facts_of(rec: RecordDraft, computed: Decimal | None, definition: str | None)
     )
 
 
+def insert_computed_fact(conn: Connection, document_id: UUID, occ_id: UUID, definition: str | None,
+                         computed: Decimal | None, version_id: UUID, extraction_version: str) -> None:
+    """Computed price/sqm with lineage to the price and area it came from (R13)."""
+    if computed is None:
+        return
+    conn.execute(
+        text(
+            "INSERT INTO fact_values (office_id, document_id, occurrence_id, field, original_text,"
+            " normalized_value, source_path, extraction_version, status)"
+            " VALUES (app_office(), :doc, :occ, 'price_per_sqm_computed', :o, :n, CAST(:sp AS jsonb), :ev, 'computed')"
+        ),
+        {"doc": document_id, "occ": occ_id, "o": definition, "n": str(computed),
+         "sp": json.dumps({"lineage": ["price", "area"], "version_id": str(version_id)}), "ev": extraction_version},
+    )
+
+
 def insert_occurrence(conn: Connection, version_id: UUID, document_id: UUID, record_index: int, rec: RecordDraft,
-                      txn_id: UUID, extraction_version: str) -> UUID:
-    val = validate(rec)
+                      val: Validation, txn_id: UUID, extraction_version: str) -> UUID:
     params = {name: rec.get(name) for name in OCC_FIELDS}
     occ_id = conn.execute(
         text(
@@ -83,16 +98,8 @@ def insert_occurrence(conn: Connection, version_id: UUID, document_id: UUID, rec
             {"doc": document_id, "occ": occ_id, "f": name, "o": fv.original, "n": _json_value(fv.value),
              "sp": json.dumps(fv.source | {"version_id": str(version_id)}, ensure_ascii=False), "ev": extraction_version},
         )
-    if val.computed_ppsqm is not None:
-        conn.execute(
-            text(
-                "INSERT INTO fact_values (office_id, document_id, occurrence_id, field, original_text,"
-                " normalized_value, source_path, extraction_version, status)"
-                " VALUES (app_office(), :doc, :occ, 'price_per_sqm_computed', :o, :n, CAST(:sp AS jsonb), :ev, 'computed')"
-            ),
-            {"doc": document_id, "occ": occ_id, "o": val.calc_definition, "n": str(val.computed_ppsqm),
-             "sp": json.dumps({"lineage": ["price", "area"], "version_id": str(version_id)}), "ev": extraction_version},
-        )
+    insert_computed_fact(conn, document_id, occ_id, val.calc_definition, val.computed_ppsqm, version_id,
+                         extraction_version)
     return occ_id
 
 
@@ -137,6 +144,17 @@ def refresh_version_status(conn: Connection, version_id: UUID) -> str:
 def publish_version(conn: Connection, version_id: UUID, document_id: UUID, extraction_version: str) -> str:
     lock_office(conn)
     clear_version_facts(conn, version_id)
+    version_no = conn.execute(text("SELECT version_no FROM document_versions WHERE id = :v"),
+                              {"v": version_id}).scalar_one()
+    newer = conn.execute(
+        text("SELECT 1 FROM document_versions WHERE document_id = :d AND version_no > :n"
+             " AND status IN ('ready', 'needs_review')"),
+        {"d": document_id, "n": version_no},
+    ).first()
+    if newer:  # a later version already published: this one finished late and must not replace it
+        conn.execute(text("UPDATE document_versions SET status = 'superseded', is_current = false,"
+                          " processed_at = now() WHERE id = :v"), {"v": version_id})
+        return "superseded"
 
     pages = conn.execute(
         text("SELECT page_no, text, method FROM pages WHERE version_id = :v ORDER BY page_no"), {"v": version_id}
@@ -154,15 +172,15 @@ def publish_version(conn: Connection, version_id: UUID, document_id: UUID, extra
     conn.execute(
         text(
             "UPDATE document_versions SET is_current = false, status = 'superseded'"
-            " WHERE document_id = :d AND id <> :v AND is_current"
+            " WHERE document_id = :d AND id <> :v AND is_current AND version_no < :n"
         ),
-        {"d": document_id, "v": version_id},
+        {"d": document_id, "v": version_id, "n": version_no},
     )
     for idx, rec in enumerate(drafts):
         val = validate(rec)
         facts = facts_of(rec, val.computed_ppsqm, val.calc_definition)
-        txn_id, _ = attach_transaction(conn, facts)
-        insert_occurrence(conn, version_id, document_id, idx, rec, txn_id, extraction_version)
+        txn_id = attach_transaction(conn, facts)
+        insert_occurrence(conn, version_id, document_id, idx, rec, val, txn_id, extraction_version)
         find_uncertain(conn, txn_id, facts, version_id)
 
     conn.execute(

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import io
 import logging
-import time
 from dataclasses import dataclass
 
 import pdfplumber
@@ -17,7 +16,7 @@ import pypdfium2 as pdfium
 
 from app.config import Settings
 from app.extraction import ocr
-from app.extraction.base import ExtractionError, ExtractionResult, PageResult
+from app.extraction.base import ExtractionError, ExtractionResult, PageResult, check_deadline
 from app.extraction.chunking import chunk_document, is_heading
 from app.extraction.hebrew import QUALITY_THRESHOLD, fix_text_lines, page_is_visual, quality_score
 from app.extraction.tables import RawTable, assemble_tables, logical_row
@@ -27,7 +26,6 @@ log = logging.getLogger(__name__)
 MSG_ENCRYPTED = "הקובץ מוגן בסיסמה ולא ניתן לעבד אותו"
 MSG_CORRUPT = "הקובץ פגום או שאינו PDF תקין"
 MSG_TOO_MANY_PAGES = "המסמך ארוך מהמותר: {n} עמודים (המקסימום הוא {limit} עמודים)"
-MSG_DEADLINE = "חריגה מזמן העיבוד המותר למסמך"
 WARN_NO_OCR = "זיהוי טקסט (OCR) אינו זמין בשרת; עמודים ללא שכבת טקסט תקינה סומנו כלא מעובדים"
 WARN_PLUMBER = "שכבת הטקסט של הקובץ לא נקראה; כל העמודים עברו זיהוי טקסט (OCR)"
 WARN_PAGE_FAILED = "עמוד {page}: לא ניתן היה לחלץ טקסט באיכות מספקת"
@@ -44,11 +42,6 @@ class _PageOut:
     page: PageResult
     lines: list[_Line]
     tables: list[RawTable]
-
-
-def check_deadline(deadline: float) -> None:
-    if time.monotonic() > deadline:
-        raise ExtractionError(MSG_DEADLINE, True)
 
 
 def open_pdf(data: bytes, max_pages: int) -> pdfium.PdfDocument:
@@ -119,7 +112,12 @@ def _process_page(doc, plumber, index: int, settings: Settings, warnings: list[s
             warnings.append(WARN_NO_OCR)
         return _PageOut(PageResult(page_no, text, "failed", quality, False), [], [])
 
-    ocr_lines, ocr_tables = _ocr_page(doc, index, settings)
+    try:
+        ocr_lines, ocr_tables = _ocr_page(doc, index, settings)
+    except RuntimeError:  # pytesseract raises RuntimeError on its per-call timeout
+        log.warning("OCR timed out on page %s", page_no)
+        warnings.append(WARN_PAGE_FAILED.format(page=page_no))
+        return _PageOut(PageResult(page_no, text, "failed", quality, False), [], [])
     ocr_text = "\n".join(ln.text for ln in ocr_lines)
     ocr_quality = quality_score(ocr_text)
     if ocr_quality >= QUALITY_THRESHOLD:

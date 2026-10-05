@@ -21,6 +21,7 @@ from app.providers.embeddings import get_embedding_provider
 
 router = APIRouter(prefix="/api", tags=["chat"])
 CACHEABLE = ("numeric", "content", "combined", "abstain")
+NEW_CONVERSATION_TITLE = "שיחה חדשה"
 
 
 class AskBody(BaseModel):
@@ -53,15 +54,16 @@ def cache_key(conn: Connection, ctx: TenantContext, outcome_conditions: QueryCon
 
 
 def _sources_still_authorized(conn: Connection, answer: dict) -> bool:
-    for s in answer.get("sources", []):
-        ok = conn.execute(
-            text("SELECT 1 FROM document_versions v JOIN documents d ON d.id = v.document_id"
-                 " WHERE v.id = :v AND d.id = :d AND d.deleted_at IS NULL AND v.is_current"),
-            {"v": s["version_id"], "d": s["document_id"]},
-        ).first()
-        if ok is None:
-            return False
-    return True
+    """Every cited version must still be current, undeleted and visible to this user (one query)."""
+    pairs = {(s["document_id"], s["version_id"]) for s in answer.get("sources", [])}
+    if not pairs:
+        return True
+    visible = conn.execute(
+        text("SELECT count(*) FROM document_versions v JOIN documents d ON d.id = v.document_id"
+             " WHERE v.id = ANY(CAST(:vs AS uuid[])) AND d.deleted_at IS NULL AND v.is_current"),
+        {"vs": [v for _, v in pairs]},
+    ).scalar_one()
+    return visible == len({v for _, v in pairs})
 
 
 def _conversation(conn: Connection, ctx: TenantContext, conversation_id: str | None, title: str | None):
@@ -73,7 +75,7 @@ def _conversation(conn: Connection, ctx: TenantContext, conversation_id: str | N
         return row
     return conn.execute(
         text("INSERT INTO conversations (office_id, user_id, title) VALUES (app_office(), :u, :t) RETURNING *"),
-        {"u": ctx.user_id, "t": (title or "שיחה חדשה")[:80]},
+        {"u": ctx.user_id, "t": (title or NEW_CONVERSATION_TITLE)[:80]},
     ).one()
 
 
@@ -98,8 +100,8 @@ def _save(conn: Connection, ctx: TenantContext, conv_id: UUID, question: str, ou
         outcome.conditions and answer["kind"] in ("numeric", "combined", "abstain") and outcome.conditions.data_kind
     ) else None
     if question.strip():
-        conn.execute(text("UPDATE conversations SET title = :t WHERE id = :c AND title = 'שיחה חדשה'"),
-                     {"t": question.strip()[:80], "c": conv_id})
+        conn.execute(text("UPDATE conversations SET title = :t WHERE id = :c AND title = :placeholder"),
+                     {"t": question.strip()[:80], "c": conv_id, "placeholder": NEW_CONVERSATION_TITLE})
     conn.execute(
         text("UPDATE conversations SET pending_clarification = CAST(:p AS jsonb),"
              " confirmed_conditions = COALESCE(CAST(:cc AS jsonb), confirmed_conditions), updated_at = now()"
@@ -132,9 +134,8 @@ def ask(body: AskBody, ctx: TenantContext = Depends(get_ctx)) -> dict:
         outcome = run_question(conn, ctx, AskInput(body.question, body.filters, body.clarification), previous,
                                pending, cache=lookup)
         question_text = body.question or (pending or {}).get("original_question", "")
-        has_mixed_clarification = outcome.answer["kind"] == "clarification"
-        if (outcome.answer["kind"] in CACHEABLE and outcome.conditions is not None and not outcome.answer.get("cached")
-                and not has_mixed_clarification):
+        if (outcome.answer["kind"] in CACHEABLE and outcome.conditions is not None and outcome.cacheable
+                and not outcome.answer.get("cached")):
             key = cache_key(conn, ctx, outcome.conditions, question_text, outcome.conditions.intent)
             conn.execute(
                 text("INSERT INTO answer_cache (office_id, cache_key, payload) VALUES (app_office(), :k,"
@@ -169,13 +170,16 @@ def get_conversation(conversation_id: str, ctx: TenantContext = Depends(get_ctx)
         dv, sh = current_data_version(conn), scope_hash(ctx)
         rows = conn.execute(text("SELECT * FROM questions WHERE conversation_id = :c ORDER BY created_at"),
                             {"c": conv.id}).all()
+        visible_counts = dict(conn.execute(
+            text("SELECT s.question_id, count(*) FROM answer_sources s JOIN documents d ON d.id = s.document_id"
+                 " WHERE s.question_id = ANY(:ids) AND d.deleted_at IS NULL GROUP BY s.question_id"),
+            {"ids": [q.id for q in rows]},
+        ).all()) if rows else {}
         messages = []
         for q in rows:
             answer = q.answer or {}
             expected = len(answer.get("sources", []))
-            visible = conn.execute(
-                text("SELECT count(*) FROM answer_sources s JOIN documents d ON d.id = s.document_id"
-                     " WHERE s.question_id = :q AND d.deleted_at IS NULL"), {"q": q.id}).scalar_one()
+            visible = visible_counts.get(q.id, 0)
             hidden = visible < expected
             messages.append({
                 "question_id": str(q.id), "question": q.question_text,

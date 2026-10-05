@@ -27,3 +27,12 @@ def test_links_and_markup_fail():
 
 def test_answer_without_citations_fails():
     assert "no_citations" in verify_answer("זו תשובה בלי מקור.", [], {"E1"}, NUMS)
+
+
+def test_single_digit_invented_number_fails():
+    assert "unsupported_number" in verify_answer("ההפחתה הייתה 9% [E1].", ["E1"], {"E1"}, NUMS)
+
+
+def test_list_ordinals_are_not_numbers():
+    assert verify_answer("1. העסקה נמכרה ב-2,470,000 ₪ [E1].\n2. הוחלה הפחתה של 10% [E2].", ["E1", "E2"],
+                         {"E1", "E2"}, NUMS) == []

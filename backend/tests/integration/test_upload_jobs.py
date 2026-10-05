@@ -234,3 +234,18 @@ def test_status_filter_uses_status_parameter(client, office):
         conn.execute(text("UPDATE document_versions SET status = 'failed' WHERE id = :v"), {"v": bad["version_id"]})
     docs = client.get("/api/documents", params={"status": "failed"}).json()["documents"]
     assert [d["id"] for d in docs] == [bad["document_id"]] and ok["document_id"] not in str(docs)
+
+
+def test_exhausted_job_with_dead_worker_fails_instead_of_looping(client, office):
+    a, _ = office
+    login(client, "admin-a@example.test")
+    res = upload(client, [("poison.pdf", tiny_pdf("poison"))], group_id=a.default_group_id).json()["results"][0]
+    assert worker.claim("w-dies") is not None
+    with tenant_tx(a.ctx()) as conn:  # the worker was killed on its last allowed attempt
+        conn.execute(text("UPDATE jobs SET attempts = max_attempts, lease_until = now() - interval '1 second'"))
+    assert worker.claim("w-next") is None
+    with tenant_tx(a.ctx()) as conn:
+        assert conn.execute(text("SELECT status FROM jobs")).scalar() == "failed"
+        version = conn.execute(text("SELECT status, status_reason FROM document_versions WHERE id = :v"),
+                               {"v": res["version_id"]}).one()
+    assert version.status == "failed" and "מחדש" in version.status_reason

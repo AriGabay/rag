@@ -7,10 +7,9 @@ combined    -> calculation first, then explanations retrieved under the same pla
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
-from uuid import UUID
 
+from pydantic import ValidationError
 from sqlalchemy import Connection, text
 
 from app.answering.conditions import (
@@ -26,6 +25,7 @@ from app.answering.parser import Gazetteer, ParseResult, missing_conditions, par
 from app.answering.templates import abstain_text, numeric_text
 from app.appraisal.query import compute_stats, conflicts, distinct_values, sources_for, uncertain_duplicates
 from app.db import TenantContext
+from app.platform.documents import source_file_url
 
 CLARIFY_QUESTIONS = {
     "data_kind": "לאיזה נתון הכוונה?",
@@ -47,6 +47,7 @@ class Outcome:
     parse_route: str | None
     pending: dict | None = None
     source_rows: list[dict] = field(default_factory=list)
+    cacheable: bool = True  # False when a transient failure degraded the answer
 
 
 def load_gazetteer(conn: Connection) -> Gazetteer:
@@ -78,7 +79,11 @@ def clarification_options(conn: Connection, key: str, c: QueryConditions) -> lis
 
 
 def clarification(conn: Connection, key: str, c: QueryConditions, question: str, route: str) -> Outcome:
-    options = clarification_options(conn, key, c)
+    return clarification_outcome(key, clarification_options(conn, key, c), c, question, route)
+
+
+def clarification_outcome(key: str, options: list[dict], c: QueryConditions, question: str, route: str) -> Outcome:
+    """The clarification answer and the pending state the next turn resumes from."""
     answer = {
         "kind": "clarification", "text": CLARIFY_QUESTIONS[key], "provider": "template", "demo": False,
         "clarification": {"key": key, "question": CLARIFY_QUESTIONS[key], "options": options},
@@ -97,7 +102,7 @@ def _source_json(rows: list[dict]) -> list[dict]:
             "evidence_id": f"E{i}", "document_id": str(r["document_id"]), "version_id": str(r["version_id"]),
             "title": r["title"], "page_list": [page] if page else [], "section": r.get("section"),
             "row": r.get("row_index"), "snippet": r.get("text_span") or r.get("snippet"),
-            "url": f"/api/documents/{r['document_id']}/versions/{r['version_id']}/file" + (f"#page={page}" if page else ""),
+            "url": source_file_url(r["document_id"], r["version_id"], page),
         })
     return out
 
@@ -136,7 +141,8 @@ def _d(value):
 
 
 def _merge_filters(parsed: ParseResult, filters: dict | None) -> tuple[QueryConditions, str | None]:
-    """Filters fill conditions the question left open; a contradiction returns the conflicting key."""
+    """Filters fill conditions the question left open. A filter that contradicts a value the user
+    stated in this turn (not one inherited from earlier turns) returns that key for clarification."""
     c = parsed.conditions
     if not filters:
         return c, None
@@ -146,11 +152,14 @@ def _merge_filters(parsed: ParseResult, filters: dict | None) -> tuple[QueryCond
         if value in (None, ""):
             continue
         current = getattr(c, key)
-        if current is not None and current != value and parsed.route != "followup":
+        stated_now = parsed.route != "followup" or key in parsed.explicit
+        if current is not None and current != value and stated_now:
             return c, key
         update[key] = value
-    merged = QueryConditions.model_validate(c.model_dump() | update)
-    return merged, None
+    try:
+        return QueryConditions.model_validate(c.model_dump() | update), None
+    except ValidationError:  # e.g. a filter year range that ends before it starts
+        return c, next(iter(update))
 
 
 def cloud_parser(conn: Connection):
@@ -196,7 +205,7 @@ def run_question(conn: Connection, ctx: TenantContext, inp: AskInput, previous: 
                  pending: dict | None, cache=None) -> Outcome:
     """``cache(conditions, question)`` returns a still-valid cached answer or None (checked before any
     SQL computation or model call)."""
-    from app.answering.content import answer_content  # U10
+    from app.answering.content import answer_content  # imported here: content builds service.Outcome
 
     if inp.clarification and pending and inp.clarification.get("key") == pending["key"]:
         key, value = pending["key"], inp.clarification.get("value")
@@ -230,13 +239,7 @@ def run_question(conn: Connection, ctx: TenantContext, inp: AskInput, previous: 
         if conflict_key:
             options = [{"value": f"{conflict_key}:{getattr(c, conflict_key)}", "label": f"לפי השאלה: {getattr(c, conflict_key)}"},
                        {"value": f"{conflict_key}:{inp.filters[conflict_key]}", "label": f"לפי הסינון: {inp.filters[conflict_key]}"}]
-            answer = {"kind": "clarification", "text": CLARIFY_QUESTIONS["filter_conflict"], "provider": "template",
-                      "demo": False, "sources": [], "coverage": None, "limitations": [],
-                      "clarification": {"key": "filter_conflict", "question": CLARIFY_QUESTIONS["filter_conflict"],
-                                        "options": options}}
-            pend = {"key": "filter_conflict", "question": CLARIFY_QUESTIONS["filter_conflict"], "options": options,
-                    "conditions": c.model_dump(), "original_question": question, "route": route}
-            return Outcome(answer, c, c.intent, route, pending=pend)
+            return clarification_outcome("filter_conflict", options, c, question, route)
 
     missing = missing_conditions(c)
     if missing:
@@ -252,11 +255,3 @@ def run_question(conn: Connection, ctx: TenantContext, inp: AskInput, previous: 
         return answer_content(conn, ctx, question, c, route, numeric=numeric)
     return numeric
 
-
-def timed(fn, *args):
-    start = time.perf_counter()
-    result = fn(*args)
-    return result, int((time.perf_counter() - start) * 1000)
-
-
-__all__ = ["AskInput", "Outcome", "run_question", "timed", "load_gazetteer", "UUID"]

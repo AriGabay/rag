@@ -24,6 +24,7 @@ from functools import lru_cache
 
 from PIL import Image, ImageDraw, ImageFilter
 
+from app.config import get_settings
 from app.extraction.chunking import is_heading
 from app.extraction.hebrew import strip_bidi_controls
 from app.extraction.tables import is_header_row, snap_header
@@ -197,7 +198,8 @@ def _clean_word(text: str) -> str:
 def _words(img: Image.Image, languages: str, psm: int = 6) -> list[dict]:
     import pytesseract
 
-    d = pytesseract.image_to_data(img, lang=languages, config=f"--psm {psm}", output_type=pytesseract.Output.DICT)
+    d = pytesseract.image_to_data(img, lang=languages, config=f"--psm {psm}", output_type=pytesseract.Output.DICT,
+                                  timeout=get_settings().ocr_timeout_seconds)
     out = []
     for i, raw in enumerate(d["text"]):
         text = _clean_word(raw or "")
@@ -216,7 +218,8 @@ def _single_line(img: Image.Image, languages: str) -> str:
 
     pad = Image.new("L", (img.size[0] + 60, img.size[1] + 60), 255)
     pad.paste(img, (30, 30))
-    return strip_bidi_controls(pytesseract.image_to_string(pad, lang=languages, config="--psm 7")).strip()
+    text = pytesseract.image_to_string(pad, lang=languages, config="--psm 7", timeout=get_settings().ocr_timeout_seconds)
+    return strip_bidi_controls(text).strip()
 
 
 def _lines_from_words(words: list[dict]) -> list[OcrLine]:

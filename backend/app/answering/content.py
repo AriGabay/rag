@@ -11,6 +11,7 @@ from app.answering.coverage import coverage
 from app.answering.verify import allowed_numbers, verify_answer
 from app.config import get_settings
 from app.db import TenantContext
+from app.platform.documents import source_file_url
 from app.platform.search import hybrid_search
 from app.providers.llm import LLMProvider, MockLLM, cloud_configured, get_cloud_provider
 
@@ -54,7 +55,7 @@ def _evidence(hits: list[dict], start: int) -> list[dict]:
             "evidence_id": f"E{i}", "document_id": str(h["document_id"]), "version_id": str(h["version_id"]),
             "title": h["title"], "page_list": h["page_list"], "section": h["section"], "row": None,
             "snippet": h["snippet"], "text": h["text"], "chunk_id": str(h["chunk_id"]),
-            "url": f"/api/documents/{h['document_id']}/versions/{h['version_id']}/file" + (f"#page={page}" if page else ""),
+            "url": source_file_url(h["document_id"], h["version_id"], page),
         })
     return out
 
@@ -94,6 +95,7 @@ def answer_content(conn: Connection, ctx: TenantContext, question: str, c, route
     provider, provider_label = select_provider(conn)
     calc = base["numeric"] if base else None
     text_out, kind_provider, demo = None, "extractive", False
+    provider_failed = False
     if provider is not None:
         started = time.perf_counter()
         try:
@@ -114,6 +116,7 @@ def answer_content(conn: Connection, ctx: TenantContext, question: str, c, route
             logger.warning("provider %s failed", provider.name)
             log_usage(conn, provider, "answer", None, False)
             limitations.append("ספק המודל לא היה זמין; מוצגים הקטעים הרלוונטיים.")
+            provider_failed = True
     if text_out is None:
         text_out = _extractive(evidence)
     if provider_label == "extractive":
@@ -131,4 +134,5 @@ def answer_content(conn: Connection, ctx: TenantContext, question: str, c, route
     rows = (numeric.source_rows if numeric else []) + [
         {"document_id": e["document_id"], "version_id": e["version_id"], "chunk_id": e["chunk_id"],
          "page_list": e["page_list"]} for e in evidence]
-    return Outcome(answer, c, c.intent if c else "explanation", route, source_rows=rows)
+    return Outcome(answer, c, c.intent if c else "explanation", route, source_rows=rows,
+                   cacheable=not provider_failed)

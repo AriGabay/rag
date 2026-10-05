@@ -328,3 +328,19 @@ def test_scanned_page_without_ocr_is_failed_not_decoded(monkeypatch):
     assert result.pages[0].method == "failed" and not result.pages[0].ok
     assert result.pages_incomplete == 1
     assert result.warnings
+
+
+def test_ocr_timeout_fails_the_page_not_the_job(monkeypatch):
+    from app.extraction import ocr, pdf
+    from app.extraction.default import DefaultExtractor
+
+    monkeypatch.setattr(ocr, "ocr_available", lambda langs: True)
+
+    def hang(*args, **kwargs):
+        raise RuntimeError("Tesseract process timeout")
+
+    monkeypatch.setattr(pdf, "_ocr_page", hang)
+    data = (FIXTURES / "D2_synthetic_harozim_scanned.pdf").read_bytes()
+    result = DefaultExtractor().extract(data, "application/pdf", time.monotonic() + 60)
+    assert all(p.method == "failed" and not p.ok for p in result.pages)
+    assert result.pages_incomplete == len(result.pages)

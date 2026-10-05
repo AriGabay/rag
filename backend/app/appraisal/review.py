@@ -15,14 +15,21 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import Connection, text
 
-from app.appraisal.dedup import TxnFacts, attach_transaction, delete_orphans, find_uncertain, lock_office
+from app.appraisal.dedup import (
+    TxnFacts,
+    add_candidate,
+    attach_transaction,
+    delete_orphans,
+    find_uncertain,
+    lock_office,
+)
 from app.appraisal.normalize import normalize_place, parse_area_type, parse_date, parse_decimal, parse_money
-from app.appraisal.publish import refresh_version_status
-from app.appraisal.validate import CONFLICT_TOLERANCE, CRITICAL, compute_price_per_sqm
+from app.appraisal.publish import insert_computed_fact, refresh_version_status
+from app.appraisal.validate import price_checks
 from app.audit import audit
-from app.db import TenantContext, bump_data_version, tenant_tx
+from app.db import TenantContext, bump_data_version, system_ctx, tenant_tx
 from app.deps import FORBIDDEN, NOT_FOUND, get_ctx, parse_uuid
-from app.platform.pipeline import system_ctx
+from app.platform.documents import source_file_url
 
 router = APIRouter(prefix="/api/review", tags=["review"])
 
@@ -112,7 +119,7 @@ def _txn_summary(conn: Connection, txn_id: UUID) -> dict:
         "price": _s(t.price), "area": _s(t.area), "area_type": t.area_type, "transaction_date": _s(t.transaction_date),
         "sources": [{"document_id": str(o.document_id), "version_id": str(o.version_id), "title": o.title,
                      "page_list": [o.page_no] if o.page_no else [], "row": o.row_index,
-                     "url": f"/api/documents/{o.document_id}/versions/{o.version_id}/file#page={o.page_no or 1}"}
+                     "url": source_file_url(o.document_id, o.version_id, o.page_no or 1)}
                     for o in occs],
     }
 
@@ -179,7 +186,7 @@ def _detail(conn: Connection, occ_id: UUID) -> dict:
         "conflict_flag": o.conflict_flag, "missing_critical": list(o.missing_critical), "ocr": o.ocr,
         "review_note": o.review_note, "fields": fields, "computed_price_per_sqm": _s(o.price_per_sqm_computed),
         "stated_price_per_sqm": _s(o.price_per_sqm_stated), "calc_definition": calc.original_text if calc else None,
-        "file_url": f"/api/documents/{o.document_id}/versions/{o.version_id}/file#page={o.page_no or 1}",
+        "file_url": source_file_url(o.document_id, o.version_id, o.page_no or 1),
     }
 
 
@@ -270,11 +277,8 @@ def parse_correction(field: str, value: str):
 def reattach(conn: Connection, occ_id: UUID) -> None:
     """Recompute derived values and transaction identity of one occurrence after a correction."""
     o = conn.execute(text("SELECT * FROM occurrences WHERE id = :o"), {"o": occ_id}).one()
-    computed = compute_price_per_sqm(o.price, o.area)
-    conflict = bool(o.price_per_sqm_stated is not None and computed and
-                    abs(o.price_per_sqm_stated - computed) / computed > CONFLICT_TOLERANCE)
-    missing = [f for f in CRITICAL.get(o.data_kind, ()) if getattr(o, f) is None]
-    definition = f"price / area = {o.price} / {o.area}" if computed is not None else None
+    checks = price_checks(o.data_kind, o.price, o.area, o.price_per_sqm_stated, lambda f: getattr(o, f))
+    computed, definition, conflict, missing = checks.computed, checks.definition, checks.conflict, checks.missing
     facts = TxnFacts(o.data_kind, o.block, o.parcel, o.sub_parcel, o.address, o.property_type, o.transaction_date,
                      o.valuation_date, o.report_date, o.price, o.area, o.area_type, computed, definition)
     lock_office(conn)
@@ -283,7 +287,7 @@ def reattach(conn: Connection, occ_id: UUID) -> None:
                           {"t": old_txn, "o": occ_id}).scalar_one()
     if others == 0:
         conn.execute(text("UPDATE transactions SET match_key = NULL WHERE id = :t"), {"t": old_txn})
-    txn_id, _ = attach_transaction(conn, facts)
+    txn_id = attach_transaction(conn, facts)
     conn.execute(
         text("UPDATE occurrences SET transaction_id = :t, price_per_sqm_computed = :c, conflict_flag = :cf,"
              " missing_critical = :m WHERE id = :o"),
@@ -291,15 +295,7 @@ def reattach(conn: Connection, occ_id: UUID) -> None:
     )
     conn.execute(text("DELETE FROM fact_values WHERE occurrence_id = :o AND field = 'price_per_sqm_computed'"),
                  {"o": occ_id})
-    if computed is not None:
-        conn.execute(
-            text("INSERT INTO fact_values (office_id, document_id, occurrence_id, field, original_text,"
-                 " normalized_value, source_path, extraction_version, status) VALUES (app_office(), :d, :o,"
-                 " 'price_per_sqm_computed', :def, :v, CAST(:sp AS jsonb), :ev, 'computed')"),
-            {"d": o.document_id, "o": occ_id, "def": definition, "v": str(computed),
-             "sp": json.dumps({"lineage": ["price", "area"], "version_id": str(o.version_id)}),
-             "ev": o.extraction_version},
-        )
+    insert_computed_fact(conn, o.document_id, occ_id, definition, computed, o.version_id, o.extraction_version)
     delete_orphans(conn)
     find_uncertain(conn, txn_id, facts, o.version_id)
 
@@ -370,8 +366,15 @@ def merge(candidate_id: str, ctx: TenantContext = Depends(get_ctx)) -> dict:
                           " WHERE id = :c"), {"u": ctx.user_id, "c": c.id})
         conn.execute(text("UPDATE occurrences SET transaction_id = :a WHERE transaction_id = :b"),
                      {"a": c.transaction_a, "b": c.transaction_b})
-        conn.execute(text("UPDATE dedup_candidates SET transaction_a = :a WHERE transaction_a = :b AND status = 'open'"),
-                     {"a": c.transaction_a, "b": c.transaction_b})
+        # B's other open look-alikes now concern A: re-point each pair (sorted, ON CONFLICT DO NOTHING).
+        others = conn.execute(
+            text("SELECT CASE WHEN transaction_a = :b THEN transaction_b ELSE transaction_a END AS other, reason"
+                 " FROM dedup_candidates WHERE status = 'open' AND id <> :c AND (transaction_a = :b OR transaction_b = :b)"),
+            {"b": c.transaction_b, "c": c.id},
+        ).all()
+        for row in others:
+            if row.other != c.transaction_a:
+                add_candidate(conn, c.transaction_a, row.other, row.reason)
         conn.execute(text("DELETE FROM dedup_candidates WHERE transaction_b = :b OR transaction_a = :b"),
                      {"b": c.transaction_b})
         delete_orphans(conn)

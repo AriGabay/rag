@@ -56,6 +56,7 @@ class ParseResult:
     missing: list[str]
     route: str  # rules | followup | model
     unknown_place: str | None = None
+    explicit: frozenset[str] = frozenset()  # keys a follow-up turn stated itself
 
 
 def _tokens(text: str) -> list[str]:
@@ -182,7 +183,7 @@ def parse_question(question: str, gaz: Gazetteer, previous: QueryConditions | No
             update["area_type"] = area
         if update:
             conds = previous.model_copy(update=update)
-            return ParseResult(conds, missing_conditions(conds), "followup", unknown)
+            return ParseResult(conds, missing_conditions(conds), "followup", unknown, frozenset(update))
 
     is_followup = bool(_FOLLOWUP.search(question))
     conds = QueryConditions(

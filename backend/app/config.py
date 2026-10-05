@@ -36,6 +36,7 @@ class Settings(BaseSettings):
 
     ocr_languages: str = "heb+eng"
     ocr_dpi: int = 300
+    ocr_timeout_seconds: int = 60  # per Tesseract call; a hung call fails the page instead of the whole job
 
 
 @lru_cache

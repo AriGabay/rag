@@ -137,3 +137,20 @@ def test_group_scope_on_merged_records(client, db):
     r = client.post(f"/api/review/records/{shared}/correct", json={"field": "area", "value": "96", "note": "x"})
     assert r.status_code == 403
     assert client.get(f"/api/review/records/{shared}").status_code == 404
+
+
+def test_merge_keeps_other_look_alikes_pointed_at_the_survivor(client, db):
+    a = make_office(db, "משרד א", "admin-a@example.test")
+    base = ["הרואה 5", "6158/40", "10/01/2024", "דירה", "4", "95", "נטו", "2,375,000", ""]
+    variants = [base, base[:5] + ["110", "ברוטו"] + base[7:], base[:5] + ["120", "רשום"] + base[7:]]
+    for i, row in enumerate(variants, start=1):
+        d, v = add_version(a, a.default_group_id, [row], str(i) * 64)
+        publish(a, d, v)
+    login(client, "admin-a@example.test")
+    cands = [i for i in client.get("/api/review/queue").json()["items"] if i["kind"] == "dedup"]
+    assert len(cands) == 3  # A-B, A-C, B-C
+    assert client.post(f"/api/review/dedup/{cands[0]['id']}/merge").json() == {"ok": True}
+    left = [i for i in client.get("/api/review/queue").json()["items"] if i["kind"] == "dedup"]
+    assert len(left) == 1  # the third transaction is still compared with the merged one
+    with tenant_tx(a.system) as conn:
+        assert conn.execute(text("SELECT count(DISTINCT transaction_id) FROM occurrences WHERE address = 'הרואה 5'")).scalar() == 2

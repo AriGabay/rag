@@ -138,3 +138,18 @@ def test_model_parse_route_when_rules_cannot_parse(client, office, monkeypatch):
     assert r["answer"]["kind"] == "numeric"
     with tenant_tx(office.system) as conn:
         assert conn.execute(text("SELECT parse_route FROM questions")).scalar() == "model"
+
+
+def test_provider_outage_answer_is_not_cached(client, office, monkeypatch):
+    class Down(StubCloud):
+        def answer(self, question, evidence, calculation):
+            raise RuntimeError("timeout")
+
+    enable_cloud(office, monkeypatch, Down("", []))
+    login(client, "admin-a@example.test")
+    q = "מה היו שיקולי השמאי לגבי היטל השבחה?"
+    first = ask(client, q)["answer"]
+    assert first["provider"] == "extractive" and any("לא היה זמין" in x for x in first["limitations"])
+    assert ask(client, q)["answer"].get("cached") is None
+    with tenant_tx(office.system) as conn:
+        assert conn.execute(text("SELECT count(*) FROM provider_usage WHERE NOT ok")).scalar() == 2

@@ -177,3 +177,21 @@ def test_subject_record_keeps_block_and_parcel(offices):
     publish(a, doc, ver)
     subject = q(a, "SELECT block, parcel, sub_parcel FROM occurrences WHERE data_kind = 'appraised_value'")[0]
     assert (subject.block, subject.parcel, subject.sub_parcel) == ("6158", "42", "7")
+
+
+def test_older_version_finishing_late_never_replaces_the_newer_one(offices):
+    a, _ = offices
+    doc, v1 = add_version(a, a.default_group_id, [ROW_SHARED], "1" * 64)
+    with tenant_tx(a.system) as conn:
+        v2 = conn.execute(text(
+            "INSERT INTO document_versions (office_id, document_id, version_no, sha256, filename, mime_type,"
+            " size_bytes, storage_key, status) SELECT office_id, document_id, 2, :s, 'v2.pdf', mime_type, 1, 'k',"
+            " 'processing' FROM document_versions WHERE id = :v RETURNING id"), {"s": "2" * 64, "v": v1}).scalar_one()
+        for t, cols in (("pages", "page_no, text, method, quality, ok"),
+                        ("extracted_tables", "table_index, page_start, page_end, structure")):
+            conn.execute(text(f"INSERT INTO {t} (office_id, document_id, version_id, {cols}) SELECT office_id,"
+                              f" document_id, :n, {cols} FROM {t} WHERE version_id = :v"), {"n": v2, "v": v1})
+    assert publish(a, doc, v2) in ("ready", "needs_review")
+    assert publish(a, doc, v1) == "superseded"  # v1's retry finished after v2 was published
+    rows = {r.id: r for r in q(a, "SELECT id, status, is_current FROM document_versions WHERE document_id = :d", d=doc)}
+    assert rows[v2].is_current and not rows[v1].is_current and rows[v1].status == "superseded"
