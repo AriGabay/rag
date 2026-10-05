@@ -99,3 +99,32 @@ def normalize_place(raw: str | None) -> str | None:
 
 def quantize_money(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"))
+
+
+PROPERTY_TYPES = {
+    "דירת גן": "garden_apartment", "פנטהאוז": "penthouse", "פנטהאוס": "penthouse", "דופלקס": "duplex",
+    "קוטג׳": "cottage", "קוטג'": "cottage", "בית פרטי": "house", "דירה": "apartment", "משרד": "office",
+    "חנות": "retail", "מגרש": "land",
+}
+
+
+def property_type_code(raw: str | None) -> str | None:
+    """Map Hebrew property types to stable codes; unknown types keep their normalized text."""
+    value = normalize_place(raw)
+    if value is None:
+        return None
+    for word, code in PROPERTY_TYPES.items():  # longer phrases first by dict order
+        if word in value:
+            return code
+    return value
+
+
+def vat_basis_code(raw: str | None) -> str | None:
+    value = normalize_place(raw)
+    if value is None:
+        return None
+    if "לא כולל" in value:
+        return "excluded"
+    if "כולל" in value:
+        return "included"
+    return value

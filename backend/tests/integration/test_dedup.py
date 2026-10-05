@@ -16,7 +16,7 @@ HEADERS = ["כתובת", "גוש/חלקה", "תאריך עסקה", "סוג נכ�
 HEADER_TEXT = (
     "שומת מקרקעין - מסמך סינתטי לדמו\nעיר: רמת גן\nשכונה: חרוזים\nכתובת הנכס: הרואה 10\n"
     "גוש: 6158 חלקה: 42 תת חלקה: 7\nהמועד הקובע: 15/03/2024\nתאריך עריכת השומה: 01/04/2024\n"
-    "שטח הנכס: 95 מ״ר נטו\nשווי הנכס: 2,500,000 ₪\n"
+    "שטח הנכס: 95 מ״ר נטו\nשווי הנכס: 2,500,000 ₪\n3. עסקאות השוואה\nעיר העסקאות: רמת גן\nשכונת העסקאות: חרוזים\n"
 )
 ROW_SHARED = ["הרואה 5", "6158/40", "10/01/2024", "דירה", "4", "95", "נטו", "2,375,000", "25,000"]
 
@@ -73,8 +73,11 @@ def test_records_get_provenance_lineage_and_flags(offices):
     lineage = q(a, "SELECT original_text, source_path FROM fact_values WHERE occurrence_id = :o"
                    " AND field = 'price_per_sqm_computed'", o=ok.id)[0]
     assert lineage.source_path["lineage"] == ["price", "area"] and "2375000" in lineage.original_text
-    inherited = q(a, "SELECT source_path FROM fact_values WHERE occurrence_id = :o AND field = 'neighborhood'", o=ok.id)
+    stated = q(a, "SELECT source_path FROM fact_values WHERE occurrence_id = :o AND field = 'neighborhood'", o=ok.id)
+    assert stated[0].source_path["label"] == "שכונת העסקאות"
+    inherited = q(a, "SELECT source_path FROM fact_values WHERE occurrence_id = :o AND field = 'valuation_date'", o=ok.id)
     assert inherited[0].source_path["inherited_from"] == "report_header"
+    assert ok.property_type == "apartment"
     subject = q(a, "SELECT * FROM occurrences WHERE data_kind = 'appraised_value'")[0]
     assert str(subject.price) == "2500000.00" and subject.area_type == "net" and subject.page_no == 1
 
@@ -129,7 +132,7 @@ def test_merged_transaction_shows_only_visible_occurrence_and_fields(offices):
     a, _ = offices
     g1, g2 = make_group(a, "G1"), make_group(a, "G2")
     emp = make_user(a, "g1@example.test", [g1])
-    no_neighborhood = HEADER_TEXT.replace("שכונה: חרוזים\n", "")
+    no_neighborhood = HEADER_TEXT.replace("שכונה: חרוזים\n", "").replace("שכונת העסקאות: חרוזים\n", "")
     d1, v1 = add_version(a, g1, [ROW_SHARED], "1" * 64, header=no_neighborhood)
     d2, v2 = add_version(a, g2, [ROW_SHARED], "2" * 64)
     publish(a, d1, v1)

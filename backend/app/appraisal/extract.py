@@ -16,6 +16,8 @@ from decimal import Decimal
 
 from app.appraisal.normalize import (
     normalize_place,
+    property_type_code,
+    vat_basis_code,
     parse_area,
     parse_area_type,
     parse_block_parcel,
@@ -35,6 +37,11 @@ HEADER_LABELS: dict[str, str] = {
     "שטח הנכס": "area",
     "שווי הנכס": "price",
     "בסיס מע״מ": "vat_basis",
+}
+# Comparables-section labels: the document states the city/neighborhood of its comparables.
+SECTION_LABELS: dict[str, str] = {
+    "עיר העסקאות": "city",
+    "שכונת העסקאות": "neighborhood",
 }
 # Ordered: more specific header phrases first.
 COLUMN_VOCAB: list[tuple[str, str]] = [
@@ -84,13 +91,14 @@ class ReportHeader:
 _LABEL_LINE = re.compile(r"^\s*(?P<label>[^:]{2,30}?)\s*:\s*(?P<value>.+?)\s*$")
 
 
-def parse_header(pages: list[tuple[int, str]]) -> ReportHeader:
+def parse_header(pages: list[tuple[int, str]], labels: dict[str, str] | None = None) -> ReportHeader:
     """Find "label: value" lines anywhere in the report (first occurrence wins)."""
+    labels = HEADER_LABELS if labels is None else labels
     found: dict[str, FieldValue] = {}
     for page_no, page_text in pages:
         for line in page_text.splitlines():
             line_n = base_normalize(line)
-            if "גוש" in line_n and "חלקה" in line_n and "block_parcel" not in found:
+            if labels is HEADER_LABELS and "גוש" in line_n and "חלקה" in line_n and "block_parcel" not in found:
                 block, parcel, sub = parse_block_parcel(line_n)
                 if block:
                     found["block_parcel"] = FieldValue(line.strip(), (block, parcel, sub), {"page": page_no})
@@ -99,7 +107,7 @@ def parse_header(pages: list[tuple[int, str]]) -> ReportHeader:
             if not m:
                 continue
             label = m.group("label").strip()
-            key = HEADER_LABELS.get(label)
+            key = labels.get(label)
             if key and key not in found:
                 raw_value = line.split(":", 1)[1].strip() if ":" in line else m.group("value")
                 found[key] = FieldValue(raw_value, None, {"page": page_no, "label": label})
@@ -117,7 +125,11 @@ def _normalize_field(key: str, raw):
         return raw
     if raw is None:
         return None
-    if key in ("city", "neighborhood", "address", "property_type", "vat_basis"):
+    if key == "property_type":
+        return property_type_code(raw)
+    if key == "vat_basis":
+        return vat_basis_code(raw)
+    if key in ("city", "neighborhood", "address"):
         return normalize_place(raw)
     if key in ("valuation_date", "report_date", "transaction_date"):
         return parse_date(raw)
@@ -150,9 +162,15 @@ def is_comparables_table(mapping: dict[int, str]) -> bool:
     return "price" in keys and bool(keys & {"address", "block_parcel"})
 
 
-def _header_context(header: ReportHeader, names: list[str]) -> dict[str, FieldValue]:
-    ctx = {}
-    for name in names:
+def _comparables_context(header: ReportHeader, section: ReportHeader) -> dict[str, FieldValue]:
+    """City/neighborhood come only from the comparables section's own labels (never guessed from the
+    subject property); report dates and VAT basis come from the report header and are marked so."""
+    ctx: dict[str, FieldValue] = {}
+    for name in ("city", "neighborhood"):
+        fv = section.fields.get(name)
+        if fv and fv.value is not None:
+            ctx[name] = fv
+    for name in ("valuation_date", "report_date", "vat_basis"):
         fv = header.fields.get(name)
         if fv and fv.value is not None:
             ctx[name] = FieldValue(fv.original, fv.value, dict(fv.source) | {"inherited_from": "report_header"})
@@ -176,7 +194,7 @@ def extract_records(pages: list[tuple[int, str]], tables: list[dict], ocr_pages:
             _set_block_parcel(rec, header.fields["block_parcel"])
         records.append(rec)
 
-    context = _header_context(header, ["city", "neighborhood", "valuation_date", "report_date", "vat_basis"])
+    context = _comparables_context(header, parse_header(pages, SECTION_LABELS))
     for table in tables:
         mapping = map_columns(table["headers"])
         if not is_comparables_table(mapping):
