@@ -6,8 +6,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy \
     PATH=/opt/venv/bin:$PATH HF_HOME=/opt/hf
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-heb fonts-dejavu-core \
+# Docker Desktop builders may lack an IPv6 route: make getaddrinfo prefer IPv4.
+RUN echo "precedence ::ffff:0:0/96 100" >> /etc/gai.conf \
+ && sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+ && apt-get -o Acquire::Retries=5 update \
+ && apt-get -o Acquire::Retries=5 install -y --no-install-recommends tesseract-ocr tesseract-ocr-heb fonts-dejavu-core \
  && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv==0.11.6
