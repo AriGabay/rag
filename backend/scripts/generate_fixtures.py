@@ -1157,6 +1157,7 @@ class Layout:
         self.paragraphs: list[tuple[str, int | None, int | None]] = []
         self.header_page: int | None = None
         self.table: dict[str, Any] | None = None
+        self.gtables: list[int | None] = []  # held-out documents: physical page of each table
 
 
 def make_pdf_class():
@@ -1689,6 +1690,1159 @@ def dedup_section(docs: dict[str, dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------------------- held-out general corpus (U12, KTD16)
+#
+# Appraisal-like documents about attributes the application code never names (safe room, balconies,
+# parking, storage, ceiling height, building age, elevator, planning, building rights, renovation,
+# permits). They go to their own group and `tests/fixtures/general/`. They deliberately produce NO
+# records: the header has no "שווי הנכס:" label (the value is stated in prose only) and no table has a
+# price column, so the existing record counts, dedup pairs and the 77-item evaluation stay unchanged.
+# Their true values live in the `general_facts` section of ground_truth.yaml.
+
+GENERAL_DIR = "general"
+GENERAL_GROUP = {"code": "G3", "name": "ידע כללי"}
+GENERAL_ATTRIBUTES = {
+    "safe_room_area": {"label_he": "שטח ממ״ד", "unit": "m2"},
+    "safe_room_present": {"label_he": "קיום ממ״ד", "unit": None},
+    "balcony_count": {"label_he": "מספר מרפסות", "unit": "count"},
+    "balcony_area": {"label_he": "שטח מרפסות (סך הכול)", "unit": "m2"},
+    "parking_spaces": {"label_he": "מספר חניות", "unit": "count"},
+    "storage_area": {"label_he": "שטח מחסן", "unit": "m2"},
+    "storage_present": {"label_he": "קיום מחסן", "unit": None},
+    "ceiling_height": {"label_he": "גובה תקרה", "unit": "m"},
+    "year_built": {"label_he": "שנת בנייה", "unit": "year"},
+    "floors_in_building": {"label_he": "מספר קומות בבניין", "unit": "count"},
+    "elevator_count": {"label_he": "מספר מעליות", "unit": "count"},
+    "elevator_present": {"label_he": "קיום מעלית", "unit": None},
+    "zoning": {"label_he": "ייעוד המגרש", "unit": None},
+    "planning_status": {"label_he": "מצב תכנוני", "unit": None},
+    "unused_rights": {"label_he": "יתרת זכויות בנייה", "unit": None},
+    "renovation": {"label_he": "שיפוץ", "unit": None},
+    "building_permit": {"label_he": "היתר בנייה", "unit": None},
+    "yard_area": {"label_he": "שטח חצר", "unit": "m2"},
+    "adjustment_rate": {"label_he": "שיעור התאמה", "unit": "percent"},
+}
+# Terms scanned in the EXISTING fixtures so answers over all documents know what they already say.
+EXISTING_MENTION_TERMS = {
+    "safe_room": ("ממ״ד", "מרחב מוגן"),
+    "balcony": ("מרפסת", "מרפסות"),
+    "parking": ("חניה", "חנייה", "חניות"),
+    "storage": ("מחסן",),
+    "ceiling_height": ("תקרה",),
+    "year_built": ("נבנה", "שנות ה"),
+    "elevator": ("מעלית", "מעליות"),
+    "building_permit": ("היתר",),
+    "renovation": ("שיפוץ", "משופצת", "שופצה"),
+    "zoning": ("ייעוד",),
+    "unused_rights": ("זכויות בנייה",),
+}
+
+
+@dataclass
+class GFact:
+    attribute: str
+    value: Any
+    quote: str  # verbatim text of the paragraph (or the exact table cell) that states the value
+    unit: str | None = None
+    entity: str = "subject"  # subject (the appraised unit) | building | plot
+    normalized: dict[str, Any] | None = None  # canonical value when the document uses another unit
+    cell: tuple[int, int] | None = None  # (row, column) for table facts
+    note: str | None = None
+
+
+@dataclass
+class GPara:
+    text: str
+    facts: list[GFact] = field(default_factory=list)
+
+
+@dataclass
+class GTable:
+    title: str
+    headers: list[str]
+    widths: list[int]
+    rows: list[list[str]]
+    facts: list[GFact] = field(default_factory=list)
+
+
+@dataclass
+class GeneralDoc:
+    id: str
+    filename: str
+    kind: str  # pdf_digital | docx
+    title_place: str
+    city: str
+    neighborhood: str
+    address: str
+    block: int
+    parcel: int
+    sub_parcel: int | None
+    ptype: str
+    area: Decimal
+    valuation_date: date
+    report_date: date
+    purpose: str
+    value: Decimal
+    sections: list[tuple[str, list[GPara | GTable]]]
+    subject_key: str
+    environment: list[str] = field(default_factory=list)  # narrative only: pushes later facts to page 2
+    visit: str | None = None  # adds an information-sources section (narrative only)
+    version_of: str | None = None
+    notes: str | None = None
+
+    def header_lines(self) -> list[str]:
+        gp = f"גוש: {self.block} חלקה: {self.parcel}"
+        if self.sub_parcel is not None:
+            gp += f" תת חלקה: {self.sub_parcel}"
+        return [
+            f"עיר: {self.city}",
+            f"שכונה: {self.neighborhood}",
+            f"כתובת הנכס: {self.address}",
+            gp,
+            f"סוג נכס: {PROPERTY_TYPES[self.ptype]}",
+            f"המועד הקובע: {fmt_date(self.valuation_date)}",
+            f"תאריך עריכת השומה: {fmt_date(self.report_date)}",
+            f"שטח הנכס: {dstr(self.area)} מ״ר נטו",
+        ]
+
+    def all_sections(self) -> list[tuple[str, list[GPara | GTable]]]:
+        intro = GPara(
+            f"חוות דעת זו נערכה לבקשת הלקוח לצורך {self.purpose}, על בסיס ביקור בנכס ועיון במסמכים. "
+            f"{SYNTHETIC_MARKER}: כל השמות, הכתובות והמספרים בדויים."
+        )
+        summary = [
+            GPara(
+                "לאור כל האמור לעיל, שווי השוק של הזכויות בנכס נאמד בסך של "
+                f"{fmt_int(self.value)} ₪, נכון למועד הקובע."
+            ),
+            GPara(f"השמאית: רונית לוי (שם בדוי), שמאית מקרקעין. {SYNTHETIC_MARKER} — אין להסתמך עליו."),
+        ]
+        environment = [("תיאור הסביבה", [GPara(t) for t in self.environment])] if self.environment else []
+        if self.visit:
+            environment.append((
+                "מקורות המידע",
+                [
+                    GPara(f"ביקור בנכס נערך בתאריך {self.visit}."),
+                    GPara("נסח רישום מקרקעין שהופק מלשכת רישום המקרקעין, ובו פרטי הבעלות וההערות הרשומות על הנכס."),
+                    GPara("תשריט הבית המשותף ותקנון הבית המשותף, ככל שנמצאו ברשומות."),
+                    GPara("מידע תכנוני שנאסף מאתר הוועדה המקומית לתכנון ולבנייה ומשיחה עם עובדי הוועדה."),
+                    GPara("סקירה כללית של שוק הדירות באזור, על בסיס מאגרי מידע ציבוריים."),
+                ],
+            ))
+        return [("מטרת חוות הדעת", [intro]), *environment, *self.sections, ("סיכום", summary)]
+
+
+def build_general_docs() -> list[GeneralDoc]:
+    def doc(**kw: Any) -> GeneralDoc:
+        return GeneralDoc(kind=kw.pop("kind", "pdf_digital"), ptype=kw.pop("ptype", "apartment"), **kw)
+
+    h1 = doc(
+        id="H1",
+        filename="H1_synthetic_ramatgan_irusim.pdf",
+        title_place="האירוסים 12, רמת גן",
+        city="רמת גן",
+        neighborhood="מרום נווה",
+        address="האירוסים 12",
+        block=6210,
+        parcel=31,
+        sub_parcel=14,
+        area=dec(104),
+        valuation_date=date(2023, 2, 14),
+        report_date=date(2023, 2, 20),
+        purpose="מימון בנקאי",
+        value=dec(3450000),
+        subject_key="רמת גן|6210/31/14",
+        visit="10/02/2023 בנוכחות בעלי הדירה",
+        environment=[
+            "שכונת מרום נווה ממוקמת בחלקה הצפוני-מזרחי של רמת גן, וגובלת בפארק הלאומי ובשטחי ספורט פתוחים. השכונה מאופיינת בבנייה רוויה מגוונת, בחלקה חדשה, ובמבני ציבור רבים.",
+            "ברחוב האירוסים ובסביבתו פועלים גני ילדים, בית ספר יסודי ומרכז קהילתי. בטווח הליכה נמצא מרכז מסחרי שכונתי ובו סופרמרקט, בית מרקחת ובתי קפה.",
+            "הנגישות לצירי התנועה הראשיים טובה, וקווי אוטובוס רבים עוברים ברחובות הסמוכים ומקשרים את השכונה למרכז העיר ולתל אביב.",
+            "השכונה נחשבת מבוקשת בשל השקט והקרבה לשטחים הירוקים, ומספר הדירות החדשות המוצעות בה למכירה קטן.",
+            "בסביבה הקרובה לא אותרו שימושים מטרדיים, ורמת התחזוקה של המרחב הציבורי טובה.",
+        ],
+        notes="Ramat Gan, new building. Safe room stated in a sentence (12 m²); building data in a key/value table.",
+        sections=[
+            (
+                "תיאור הנכס והבניין",
+                [
+                    GPara(
+                        "הנכס הנישום הוא דירת 4.5 חדרים בקומה השישית בבניין מגורים בן תשע קומות ברחוב האירוסים, "
+                        "בשכונת מרום נווה ברמת גן. הדירה כוללת סלון, מטבח פתוח, שלושה חדרי שינה וממ״ד בשטח 12 מ״ר.",
+                        [GFact("safe_room_area", "12", "ממ״ד בשטח 12 מ״ר", unit="m2")],
+                    ),
+                    GPara(
+                        "לדירה מרפסת סלון אחת בשטח 14 מ״ר הפונה לנוף פתוח. לדירה צמודות שתי חניות תת-קרקעיות "
+                        "ומחסן בשטח 5 מ״ר בקומת המרתף.",
+                        [
+                            GFact("balcony_count", 1, "מרפסת סלון אחת בשטח 14 מ״ר", unit="count"),
+                            GFact("balcony_area", "14", "מרפסת סלון אחת בשטח 14 מ״ר", unit="m2"),
+                            GFact("parking_spaces", 2, "שתי חניות תת-קרקעיות", unit="count"),
+                            GFact("storage_area", "5", "מחסן בשטח 5 מ״ר", unit="m2"),
+                        ],
+                    ),
+                    GPara(
+                        "גובה התקרה בדירה 2.75 מ׳. הדירה במצב חדש ולא בוצעו בה שינויים מאז האכלוס.",
+                        [
+                            GFact("ceiling_height", "2.75", "גובה התקרה בדירה 2.75 מ׳", unit="m"),
+                            GFact("renovation", "none", "לא בוצעו בה שינויים מאז האכלוס",
+                                  note="explicitly not renovated since occupancy"),
+                        ],
+                    ),
+                    GTable(
+                        "נתוני הבניין",
+                        ["נתון", "ערך"],
+                        [70, 110],
+                        [
+                            ["שנת סיום הבנייה", "2017"],
+                            ["מספר קומות", "9"],
+                            ["מספר מעליות", "2 (אחת מהן מעלית שבת)"],
+                            ["חניון", "תת-קרקעי, שתי קומות"],
+                        ],
+                        [
+                            GFact("year_built", 2017, "2017", unit="year", entity="building", cell=(0, 1)),
+                            GFact("floors_in_building", 9, "9", unit="count", entity="building", cell=(1, 1)),
+                            GFact("elevator_count", 2, "2 (אחת מהן מעלית שבת)", unit="count", entity="building",
+                                  cell=(2, 1)),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "מצב תכנוני וזכויות",
+                [
+                    GPara(
+                        "על המגרש חלה תכנית רג/מק/2510 (בדויה), וייעוד המגרש הוא מגורים ג׳. לפי בדיקת השמאית, "
+                        "הזכויות במגרש מומשו במלואן ואין יתרה לניצול.",
+                        [
+                            GFact("zoning", "מגורים ג׳", "וייעוד המגרש הוא מגורים ג׳", entity="plot"),
+                            GFact("unused_rights", "none", "הזכויות במגרש מומשו במלואן", entity="plot",
+                                  note="explicitly no unused rights"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "שיקולי השמאית",
+                [
+                    GPara(
+                        "בקביעת השווי הובאו בחשבון גודל הדירה, הקומה הגבוהה, הנוף הפתוח, הצמדת שתי החניות "
+                        "וגיל הבניין הצעיר."
+                    )
+                ],
+            ),
+        ],
+    )
+
+    h2 = doc(
+        id="H2",
+        filename="H2_synthetic_ramatgan_hamaagal.pdf",
+        title_place="המעגל 7, רמת גן",
+        city="רמת גן",
+        neighborhood="תל בנימין",
+        address="המעגל 7",
+        block=6215,
+        parcel=8,
+        sub_parcel=22,
+        area=dec(92),
+        valuation_date=date(2023, 5, 3),
+        report_date=date(2023, 5, 10),
+        purpose="מכירת הנכס",
+        value=dec(2780000),
+        subject_key="רמת גן|6215/8/22",
+        notes="Ramat Gan. Unit data table with the column 'שטח ממ״ד (מ״ר)' (9.5); permit number; unused rights "
+        "of about 60 m²; no ceiling height.",
+        sections=[
+            (
+                "תיאור הנכס והבניין",
+                [
+                    GPara(
+                        "דירת 4 חדרים בקומה השלישית בבניין בן שש קומות ברחוב המעגל בשכונת תל בנימין ברמת גן. "
+                        "נתוני היחידה מרוכזים בטבלה שלהלן."
+                    ),
+                    GTable(
+                        "נתוני היחידה",
+                        ["קומה", "חדרים", "שטח דירה (מ״ר)", "שטח ממ״ד (מ״ר)", "מספר מרפסות", "שטח מרפסות (מ״ר)",
+                         "חניות", "מחסן"],
+                        [16, 16, 26, 26, 24, 28, 18, 26],
+                        [["3", "4", "92", "9.5", "2", "11", "1", "אין"]],
+                        [
+                            GFact("safe_room_area", "9.5", "9.5", unit="m2", cell=(0, 3)),
+                            GFact("balcony_count", 2, "2", unit="count", cell=(0, 4)),
+                            GFact("balcony_area", "11", "11", unit="m2", cell=(0, 5)),
+                            GFact("parking_spaces", 1, "1", unit="count", cell=(0, 6)),
+                            GFact("storage_present", False, "אין", cell=(0, 7)),
+                        ],
+                    ),
+                    GPara(
+                        "הבניין הוקם על פי היתר בנייה מס׳ 2013-0417 (בדוי) ואוכלס בשנת 2015. בבניין פועלת מעלית "
+                        "אחת ולובי כניסה מרווח.",
+                        [
+                            GFact("building_permit", "היתר בנייה מס׳ 2013-0417", "היתר בנייה מס׳ 2013-0417",
+                                  entity="building"),
+                            GFact("year_built", 2015, "ואוכלס בשנת 2015", unit="year", entity="building",
+                                  note="year of occupancy; the permit dates from 2013"),
+                            GFact("elevator_count", 1, "בבניין פועלת מעלית אחת", unit="count", entity="building"),
+                        ],
+                    ),
+                    GPara(
+                        "בשנת 2022 שופץ המטבח והוחלפו הארונות והמשטחים; יתר חלקי הדירה במצבם המקורי.",
+                        [GFact("renovation", "2022: kitchen", "בשנת 2022 שופץ המטבח", note="partial: kitchen only")],
+                    ),
+                ],
+            ),
+            (
+                "מצב תכנוני וזכויות",
+                [
+                    GPara(
+                        "המגרש מצוי בייעוד מגורים ב׳ לפי תכנית רג/340 (בדויה). לפי בדיקת השמאית קיימת במגרש יתרה "
+                        "של כ-60 מ״ר שטח עיקרי שטרם מומשה, והיא שייכת לכלל בעלי הדירות בבניין.",
+                        [
+                            GFact("zoning", "מגורים ב׳", "המגרש מצוי בייעוד מגורים ב׳", entity="plot"),
+                            GFact("unused_rights", "60 m2 main area", "60 מ״ר שטח עיקרי שטרם מומשה",
+                                  entity="plot", normalized={"value": "60", "unit": "m2"},
+                                  note="belongs to all owners in the building"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "שיקולי השמאית",
+                [
+                    GPara(
+                        "השמאית התחשבה בכך שהיתרה שייכת לכלל בעלי הדירות, ולכן ייחסה לה תרומה מוגבלת בלבד "
+                        "לשווי הדירה."
+                    )
+                ],
+            ),
+        ],
+    )
+
+    h3 = doc(
+        id="H3",
+        filename="H3_synthetic_ramatgan_arlozorov.pdf",
+        title_place="ארלוזורוב 88, רמת גן",
+        city="רמת גן",
+        neighborhood="שיכון ותיקים",
+        address="ארלוזורוב 88",
+        block=6218,
+        parcel=12,
+        sub_parcel=5,
+        area=dec(81),
+        valuation_date=date(2023, 7, 19),
+        report_date=date(2023, 7, 25),
+        purpose="פירוק שותפות",
+        value=dec(2640000),
+        subject_key="רמת גן|6218/12/5",
+        visit="17/07/2023 בנוכחות בעלי הדירה",
+        environment=[
+            "שכונת שיכון ותיקים היא שכונת מגורים ותיקה במזרח רמת גן, שעוברת בשנים האחרונות תהליך הדרגתי של בנייה חדשה לצד המבנים המקוריים.",
+            "בשכונה פזורים גנים ציבוריים קטנים, ובקרבת הנכס פועלים בית ספר תיכון, מתנ״ס ובית כנסת. רחוב ארלוזורוב משמש ציר מסחרי מקומי עם חנויות ובתי עסק קטנים.",
+            "התחבורה הציבורית בסביבה זמינה, וקווי אוטובוס מקשרים את השכונה לבני ברק, לגבעתיים ולמרכז רמת גן.",
+            "האוכלוסייה בשכונה מגוונת, והביקוש לדירות בינוניות בה יציב לאורך זמן.",
+            "בסמיכות לנכס לא אותרו מפגעים סביבתיים חריגים, ורמת התחזוקה של המרחב הציבורי סבירה.",
+        ],
+        notes="Ramat Gan. Safe room given as inner dimensions in cm (300 x 350 = 10.5 m²), spelled out "
+        "'מרחב מוגן דירתי'; no parking; storage not stated.",
+        sections=[
+            (
+                "תיאור הנכס והבניין",
+                [
+                    GPara(
+                        "דירת 3.5 חדרים בקומה הרביעית בבניין בן שבע קומות ברחוב ארלוזורוב, בשכונת שיכון ותיקים "
+                        "ברמת גן. הבניין הושלם בשנת 2004, ובו מעלית אחת.",
+                        [
+                            GFact("year_built", 2004, "הבניין הושלם בשנת 2004", unit="year", entity="building"),
+                            GFact("floors_in_building", 7, "בבניין בן שבע קומות", unit="count", entity="building"),
+                            GFact("elevator_count", 1, "ובו מעלית אחת", unit="count", entity="building"),
+                        ],
+                    ),
+                    GPara(
+                        "בדירה מרחב מוגן דירתי במידות פנים של 300 על 350 ס״מ, המשמש כחדר עבודה.",
+                        [
+                            GFact("safe_room_area", "300x350", "מרחב מוגן דירתי במידות פנים של 300 על 350 ס״מ",
+                                  unit="cm", normalized={"value": "10.5", "unit": "m2"},
+                                  note="inner dimensions; 3.00 m x 3.50 m = 10.5 m²"),
+                        ],
+                    ),
+                    GPara(
+                        "לדירה שתי מרפסות: מרפסת פתוחה בשטח 8 מ״ר ומרפסת שירות בשטח 3 מ״ר. גובה תקרה של 2.60 מטר.",
+                        [
+                            GFact("balcony_count", 2, "לדירה שתי מרפסות", unit="count"),
+                            GFact("balcony_area", "11", "מרפסת פתוחה בשטח 8 מ״ר ומרפסת שירות בשטח 3 מ״ר",
+                                  unit="m2", note="8 + 3"),
+                            GFact("ceiling_height", "2.6", "גובה תקרה של 2.60 מטר", unit="m"),
+                        ],
+                    ),
+                    GPara(
+                        "לדירה אין חניה צמודה, והחניה באזור היא בכחול-לבן ברחוב.",
+                        [GFact("parking_spaces", 0, "לדירה אין חניה צמודה", unit="count")],
+                    ),
+                    GPara(
+                        "הדירה שופצה ברמה גבוהה בשנת 2020, כולל החלפת ריצוף וחלונות.",
+                        [GFact("renovation", "2020: full", "הדירה שופצה ברמה גבוהה בשנת 2020")],
+                    ),
+                ],
+            ),
+            (
+                "מצב תכנוני וזכויות",
+                [
+                    GPara(
+                        "לפי בדיקה במערכת המידע התכנוני של הוועדה המקומית, ייעוד המגרש הוא מגורים ב׳ ולא נמצאו "
+                        "תכניות בהליך החלות עליו.",
+                        [
+                            GFact("zoning", "מגורים ב׳", "ייעוד המגרש הוא מגורים ב׳", entity="plot"),
+                            GFact("planning_status", "no pending plans", "ולא נמצאו תכניות בהליך החלות עליו",
+                                  entity="plot"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "שיקולי השמאית",
+                [
+                    GPara(
+                        "המרחב המוגן והשדרוג שבוצע בדירה מוסיפים לסחירותה ביחס לדירות דומות בבניין שלא שודרגו."
+                    )
+                ],
+            ),
+        ],
+    )
+
+    h8 = doc(
+        id="H8",
+        filename="H8_synthetic_ramatgan_hayarden.pdf",
+        title_place="הירדן 30, רמת גן",
+        city="רמת גן",
+        neighborhood="רמת עמידר",
+        address="הירדן 30",
+        block=6222,
+        parcel=40,
+        sub_parcel=1,
+        ptype="garden_apartment",
+        area=dec(95),
+        valuation_date=date(2022, 11, 8),
+        report_date=date(2022, 11, 15),
+        purpose="מכירת הנכס",
+        value=dec(3020000),
+        subject_key="רמת גן|6222/40/1",
+        notes="Ramat Gan garden apartment, 1972 building without elevator. Permit for an added room (2019). "
+        "States no safe room, balcony, parking, storage or ceiling height (absent data).",
+        sections=[
+            (
+                "תיאור הנכס והבניין",
+                [
+                    GPara(
+                        "דירת גן בת 4 חדרים בקומת הקרקע של בניין בן ארבע קומות ברחוב הירדן, בשכונת רמת עמידר "
+                        "ברמת גן. הבניין נבנה בשנת 1972 ואינו כולל מעלית.",
+                        [
+                            GFact("year_built", 1972, "הבניין נבנה בשנת 1972", unit="year", entity="building"),
+                            GFact("floors_in_building", 4, "בניין בן ארבע קומות", unit="count", entity="building"),
+                            GFact("elevator_present", False, "ואינו כולל מעלית", entity="building"),
+                        ],
+                    ),
+                    GPara(
+                        "לדירה צמודה חצר בשטח 85 מ״ר. בשנת 2019 ניתן היתר בנייה לתוספת חדר בשטח 22 מ״ר בתחום החצר, "
+                        "והתוספת בוצעה בהתאם להיתר.",
+                        [
+                            GFact("yard_area", "85", "חצר בשטח 85 מ״ר", unit="m2"),
+                            GFact("building_permit", "2019: added room of 22 m2",
+                                  "בשנת 2019 ניתן היתר בנייה לתוספת חדר בשטח 22 מ״ר"),
+                        ],
+                    ),
+                    GTable(
+                        "פירוט שטחים",
+                        ["חלל", "שטח (מ״ר)", "הערה"],
+                        [50, 40, 90],
+                        [
+                            ["דירה", "73", "שטח עיקרי מקורי"],
+                            ["חדר נוסף", "22", "נבנה לפי היתר משנת 2019"],
+                            ["חצר", "85", "בהצמדה בלעדית"],
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "מצב תכנוני וזכויות",
+                [
+                    GPara(
+                        "על המגרש חלה תכנית רג/מק/4020 (בדויה) המאפשרת תוספת של שתי קומות לבניין. זכויות אלה "
+                        "טרם נוצלו, ומימושן מחייב הסכמה של בעלי הדירות.",
+                        [
+                            GFact("unused_rights", "2 additional floors", "המאפשרת תוספת של שתי קומות לבניין",
+                                  entity="plot", normalized={"value": "2", "unit": "floor"},
+                                  note="the paragraph adds: זכויות אלה טרם נוצלו"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "שיקולי השמאית",
+                [
+                    GPara(
+                        "החצר הגדולה והחדר הנוסף שנבנה כדין מהווים יתרון משמעותי; מנגד, גיל הבניין ומצבו מצדיקים "
+                        "התאמה כלפי מטה."
+                    )
+                ],
+            ),
+        ],
+    )
+
+    def h4(v2: bool) -> GeneralDoc:
+        if v2:
+            status = GPara(
+                "תכנית גב/600 (בדויה), המאפשרת תוספת קומה אחת לבניין, אושרה למתן תוקף במאי 2023.",
+                [
+                    GFact("planning_status", "approved (May 2023)", "אושרה למתן תוקף במאי 2023", entity="plot"),
+                    GFact("unused_rights", "1 additional floor", "המאפשרת תוספת קומה אחת לבניין", entity="plot",
+                          normalized={"value": "1", "unit": "floor"}),
+                ],
+            )
+            reasoning = GPara(
+                "לאחר אישור התכנית, הובאה בחשבון התאמה בשיעור 10% בגין פוטנציאל התוספת. גרסה זו מחליפה את גרסת "
+                "חוות הדעת מחודש מרץ 2023.",
+                [GFact("adjustment_rate", "10", "התאמה בשיעור 10%", unit="percent")],
+            )
+        else:
+            status = GPara(
+                "תכנית גב/600 (בדויה), המאפשרת תוספת קומה אחת לבניין, נמצאת בשלב הפקדה וטרם אושרה.",
+                [
+                    GFact("planning_status", "deposited, not yet approved", "נמצאת בשלב הפקדה וטרם אושרה",
+                          entity="plot"),
+                    GFact("unused_rights", "1 additional floor", "המאפשרת תוספת קומה אחת לבניין", entity="plot",
+                          normalized={"value": "1", "unit": "floor"}),
+                ],
+            )
+            reasoning = GPara(
+                "בשל אי הוודאות לגבי אישור התכנית, הובאה בחשבון התאמה בשיעור 6% בלבד בגין פוטנציאל התוספת.",
+                [GFact("adjustment_rate", "6", "התאמה בשיעור 6%", unit="percent")],
+            )
+        return doc(
+            id="H4v2" if v2 else "H4",
+            filename="H4v2_synthetic_givatayim_shenkin_v2.pdf" if v2 else "H4_synthetic_givatayim_shenkin.pdf",
+            title_place="שינקין 18, גבעתיים",
+            city="גבעתיים",
+            neighborhood="גבעת רמב״ם",
+            address="שינקין 18",
+            block=6230,
+            parcel=44,
+            sub_parcel=3,
+            area=dec(120),
+            valuation_date=date(2023, 6, 1) if v2 else date(2023, 3, 1),
+            report_date=date(2023, 6, 8) if v2 else date(2023, 3, 12),
+            purpose="מימון בנקאי",
+            value=dec(4050000) if v2 else dec(3900000),
+            subject_key="גבעתיים|6230/44/3",
+            visit="26/02/2023 בנוכחות הלווים",
+            environment=[
+                "שכונת גבעת רמב״ם ממוקמת בצפון גבעתיים, בסמוך לגבול עם רמת גן, ומאופיינת בבנייה רוויה ובמגוון מוסדות ציבור.",
+                "רחוב שינקין בגבעתיים הוא רחוב מגורים שקט יחסית, הסמוך לרחוב ויצמן ולמרכז המסחרי של העיר.",
+                "בקרבת הנכס פועלים בית ספר יסודי, גני ילדים, ספרייה עירונית ומרכז קהילתי, והגישה לתחבורה ציבורית טובה.",
+                "השכונה מבוקשת בקרב משפחות בשל איכות מוסדות החינוך בה.",
+                "לא נמצאו בסביבה הקרובה שימושים מטרדיים.",
+            ],
+            version_of="H4" if v2 else None,
+            notes=(
+                "Second version of H4: planning status deposited -> approved, adjustment rate 6% -> 10%, value "
+                "3,900,000 -> 4,050,000, new dates. Everything else is identical."
+                if v2
+                else "Givatayim. Safe room written with ASCII quotes (ממ\"ד ... מ\"ר); two balconies; first version."
+            ),
+            sections=[
+                (
+                    "תיאור הנכס והבניין",
+                    [
+                        GPara(
+                            "דירת 5 חדרים בקומה השנייה בבניין בן חמש קומות ברחוב שינקין בשכונת גבעת רמב״ם "
+                            "בגבעתיים. הבניין נבנה בשנת 2012 ובו מעלית.",
+                            [
+                                GFact("year_built", 2012, "הבניין נבנה בשנת 2012", unit="year", entity="building"),
+                                GFact("floors_in_building", 5, "בבניין בן חמש קומות", unit="count",
+                                      entity="building"),
+                                GFact("elevator_present", True, "ובו מעלית", entity="building"),
+                            ],
+                        ),
+                        GPara(
+                            'בדירה ממ"ד בשטח של כ-11 מ"ר.',
+                            [GFact("safe_room_area", "11", 'ממ"ד בשטח של כ-11 מ"ר', unit="m2",
+                                   note="ASCII double quotes instead of gershayim; 'about 11'")],
+                        ),
+                        GPara(
+                            "בדירה שתי מרפסות: מרפסת סלון בשטח 12 מ״ר ומרפסת חדר שינה בשטח 6 מ״ר.",
+                            [
+                                GFact("balcony_count", 2, "בדירה שתי מרפסות", unit="count"),
+                                GFact("balcony_area", "18", "מרפסת סלון בשטח 12 מ״ר ומרפסת חדר שינה בשטח 6 מ״ר",
+                                      unit="m2", note="12 + 6"),
+                            ],
+                        ),
+                        GPara(
+                            "לדירה צמודים מקום חניה אחד בחניון הבניין ומחסן בשטח 7 מ״ר.",
+                            [
+                                GFact("parking_spaces", 1, "מקום חניה אחד בחניון הבניין", unit="count"),
+                                GFact("storage_area", "7", "מחסן בשטח 7 מ״ר", unit="m2"),
+                            ],
+                        ),
+                    ],
+                ),
+                ("מצב תכנוני וזכויות", [status]),
+                ("שיקולי השמאית", [reasoning]),
+            ],
+        )
+
+    h5 = doc(
+        id="H5",
+        filename="H5_synthetic_givatayim_hamaavak.pdf",
+        title_place="המאבק 25, גבעתיים",
+        city="גבעתיים",
+        neighborhood="גבעת קוזלובסקי",
+        address="המאבק 25",
+        block=6233,
+        parcel=7,
+        sub_parcel=11,
+        area=dec(68),
+        valuation_date=date(2022, 6, 20),
+        report_date=date(2022, 6, 27),
+        purpose="התנגדות לשומת מס רכישה",
+        value=dec(2350000),
+        subject_key="גבעתיים|6233/7/11",
+        visit="16/06/2022 בנוכחות אחת היורשות",
+        environment=[
+            "שכונת גבעת קוזלובסקי שוכנת בחלקה הדרומי של גבעתיים, על מדרון מתון הצופה לכיוון תל אביב.",
+            "הבנייה בשכונה ותיקה ברובה: מבנים בני שלוש עד ארבע קומות, ולצדם מספר מבנים חדשים שהוקמו במקום מבנים שנהרסו.",
+            "בקרבת הנכס פועלים בתי ספר, גני ילדים ומרכז מסחרי קטן, ובמרחק הליכה קצר נמצא רחוב כצנלסון, הציר המסחרי המרכזי של העיר.",
+            "הרחוב שקט יחסית ומשמש בעיקר את תושביו, ואינו משמש ציר לתנועה עוברת.",
+            "גבעתיים מאופיינת בצפיפות בנייה גבוהה ובביקוש עקבי לדירות מגורים, בשל קרבתה למרכז תל אביב.",
+        ],
+        notes="Givatayim, 1968 building. States that there is NO safe room; balcony enclosed without a permit; "
+        "ceiling height, year built, parking and storage in a key/value table.",
+        sections=[
+            (
+                "תיאור הנכס והבניין",
+                [
+                    GPara(
+                        "דירת 3 חדרים בקומה השנייה מתוך ארבע בבניין ותיק ברחוב המאבק בגבעתיים. בבניין הותקנה "
+                        "מעלית בשנת 2019 ביוזמת הדיירים.",
+                        [GFact("elevator_present", True, "בבניין הותקנה מעלית בשנת 2019", entity="building",
+                               note="installed in 2019")],
+                    ),
+                    GPara(
+                        "אין בדירה ממ״ד, והמקלט המשותף נמצא בקומת הקרקע של הבניין.",
+                        [GFact("safe_room_present", False, "אין בדירה ממ״ד")],
+                    ),
+                    GPara(
+                        "לדירה מרפסת חזית בשטח 7 מ״ר, שנסגרה בתריסים ללא היתר בנייה.",
+                        [
+                            GFact("balcony_count", 1, "מרפסת חזית בשטח 7 מ״ר", unit="count"),
+                            GFact("balcony_area", "7", "מרפסת חזית בשטח 7 מ״ר", unit="m2"),
+                            GFact("building_permit", "balcony enclosed without a permit",
+                                  "שנסגרה בתריסים ללא היתר בנייה"),
+                        ],
+                    ),
+                    GPara(
+                        "בשנת 2018 בוצע שיפוץ חלקי של חדר הרחצה.",
+                        [GFact("renovation", "2018: bathroom", "בשנת 2018 בוצע שיפוץ חלקי של חדר הרחצה",
+                               note="partial")],
+                    ),
+                    GTable(
+                        "מאפייני הנכס",
+                        ["מאפיין", "פירוט"],
+                        [80, 100],
+                        [
+                            ["קומה", "2 מתוך 4"],
+                            ["גובה תקרה", "2.80 מ׳"],
+                            ["שנת בנייה", "1968"],
+                            ["חניה", "אין"],
+                            ["מחסן", "אין"],
+                        ],
+                        [
+                            GFact("floors_in_building", 4, "2 מתוך 4", unit="count", entity="building", cell=(0, 1)),
+                            GFact("ceiling_height", "2.8", "2.80 מ׳", unit="m", cell=(1, 1)),
+                            GFact("year_built", 1968, "1968", unit="year", entity="building", cell=(2, 1)),
+                            GFact("parking_spaces", 0, "אין", unit="count", cell=(3, 1)),
+                            GFact("storage_present", False, "אין", cell=(4, 1)),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "מצב תכנוני וזכויות",
+                [
+                    GPara(
+                        "ייעוד המגרש לפי התכנית החלה הוא מגורים א׳. השמאית לא בדקה את היתכנות הרחבת הדירה.",
+                        [GFact("zoning", "מגורים א׳", "ייעוד המגרש לפי התכנית החלה הוא מגורים א׳", entity="plot")],
+                    ),
+                ],
+            ),
+            (
+                "שיקולי השמאית",
+                [
+                    GPara(
+                        "סגירת המרפסת ללא היתר עלולה לחייב הריסה או הסדרה, ולכן הובאה בחשבון הפחתה בגין הסיכון."
+                    )
+                ],
+            ),
+        ],
+    )
+
+    h6 = doc(
+        id="H6",
+        filename="H6_synthetic_telaviv_benyehuda.pdf",
+        title_place="בן יהודה 140, תל אביב-יפו",
+        city="תל אביב-יפו",
+        neighborhood="הצפון הישן",
+        address="בן יהודה 140",
+        block=6960,
+        parcel=52,
+        sub_parcel=8,
+        area=dec(70),
+        valuation_date=date(2022, 9, 5),
+        report_date=date(2022, 9, 12),
+        purpose="מכירת הנכס",
+        value=dec(3100000),
+        subject_key="תל אביב-יפו|6960/52/8",
+        environment=[
+            "הצפון הישן של תל אביב הוא אזור מגורים מבוקש, הסמוך לחוף הים, לנמל תל אביב ולפארק הירקון.",
+            "הבנייה באזור כוללת בעיקר מבני מגורים בני שלוש עד חמש קומות על עמודים, לצד מבנים חדשים ומבנים שעברו הרחבה.",
+            "רחוב בן יהודה הוא רחוב עירוני סואן עם חזית מסחרית רציפה של חנויות, בתי קפה ומסעדות, ובו קווי אוטובוס רבים.",
+            "בקרבת הנכס פועלים בתי ספר, גני ילדים, קופות חולים ומוסדות תרבות, ותשתיות האזור מפותחות.",
+            "הביקוש לדירות באזור גבוה מצד זוגות צעירים ומשקיעים, והיצע הדירות להשכרה בו רב.",
+        ],
+        notes="Tel Aviv, first appraisal of בן יהודה 140. Says the building was built in 1958 (H7 says 1962: "
+        "conflict). No elevator; no safe room stated.",
+        sections=[
+            (
+                "תיאור הנכס והבניין",
+                [
+                    GPara(
+                        "דירת 3 חדרים בקומה השלישית בבניין בן ארבע קומות ללא מעלית, ברחוב בן יהודה בצפון הישן של "
+                        "תל אביב. לפי תיק הבניין, הבניין נבנה בשנת 1958.",
+                        [
+                            GFact("year_built", 1958, "הבניין נבנה בשנת 1958", unit="year", entity="building"),
+                            GFact("floors_in_building", 4, "בבניין בן ארבע קומות ללא מעלית", unit="count",
+                                  entity="building"),
+                            GFact("elevator_present", False, "בבניין בן ארבע קומות ללא מעלית", entity="building"),
+                        ],
+                    ),
+                    GPara(
+                        "גובה התקרה בדירה 3.05 מ׳, כמקובל בבנייה של התקופה. לדירה מרפסת רחוב בשטח 6 מ״ר.",
+                        [
+                            GFact("ceiling_height", "3.05", "גובה התקרה בדירה 3.05 מ׳", unit="m"),
+                            GFact("balcony_count", 1, "מרפסת רחוב בשטח 6 מ״ר", unit="count"),
+                            GFact("balcony_area", "6", "מרפסת רחוב בשטח 6 מ״ר", unit="m2"),
+                        ],
+                    ),
+                    GPara(
+                        "לדירה אין מקום חניה. בקומת הקרקע צמוד לדירה מחסן בשטח 4 מ״ר.",
+                        [
+                            GFact("parking_spaces", 0, "לדירה אין מקום חניה", unit="count"),
+                            GFact("storage_area", "4", "מחסן בשטח 4 מ״ר", unit="m2"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "מצב תכנוני וזכויות",
+                [
+                    GPara(
+                        "על המגרש חלה תכנית תא/3616א (בדויה לצורך הדמו) המאפשרת תוספת של 2.5 קומות לבניין, "
+                        "וזכויות אלה טרם מומשו.",
+                        [GFact("unused_rights", "2.5 additional floors", "תוספת של 2.5 קומות לבניין",
+                               entity="plot", normalized={"value": "2.5", "unit": "floor"})],
+                    ),
+                ],
+            ),
+            (
+                "שיקולי השמאית",
+                [
+                    GPara(
+                        "המיקום המבוקש בצפון הישן ופוטנציאל התוספת מאזנים את גיל הבניין ואת הצורך בהשקעה בדירה."
+                    )
+                ],
+            ),
+        ],
+    )
+
+    h7 = doc(
+        id="H7",
+        filename="H7_synthetic_telaviv_benyehuda_2023.docx",
+        kind="docx",
+        title_place="בן יהודה 140, תל אביב-יפו",
+        city="תל אביב-יפו",
+        neighborhood="הצפון הישן",
+        address="בן יהודה 140",
+        block=6960,
+        parcel=52,
+        sub_parcel=8,
+        area=dec(70),
+        valuation_date=date(2023, 11, 2),
+        report_date=date(2023, 11, 9),
+        purpose="מימון בנקאי",
+        value=dec(3350000),
+        subject_key="תל אביב-יפו|6960/52/8",
+        notes="DOCX (page fields are null). Second appraisal of the same subject as H6; its building table says "
+        "1962 (conflicts with H6's 1958). Renovated in 2023; no ceiling height, parking, storage or elevator.",
+        sections=[
+            (
+                "תיאור הנכס והבניין",
+                [
+                    GPara(
+                        "חוות הדעת נערכת לדירה ברחוב בן יהודה 140 בתל אביב, שנישומה בעבר על ידי המשרד בספטמבר "
+                        "2022. נתוני הבניין מרוכזים בטבלה שלהלן."
+                    ),
+                    GTable(
+                        "נתוני הבניין",
+                        ["נתון", "ערך"],
+                        [70, 110],
+                        [["שנת בנייה", "1962"], ["מספר קומות", "4"], ["קומת הדירה", "3"]],
+                        [
+                            GFact("year_built", 1962, "1962", unit="year", entity="building", cell=(0, 1)),
+                            GFact("floors_in_building", 4, "4", unit="count", entity="building", cell=(1, 1)),
+                        ],
+                    ),
+                    GPara(
+                        "מאז חוות הדעת הקודמת שופצה הדירה בשנת 2023: הוחלפו מערכות החשמל והאינסטלציה ושודרג חדר "
+                        "הרחצה.",
+                        [GFact("renovation", "2023: electrical, plumbing, bathroom", "שופצה הדירה בשנת 2023")],
+                    ),
+                    GPara(
+                        "לדירה מרפסת רחוב בשטח 6 מ״ר.",
+                        [
+                            GFact("balcony_count", 1, "מרפסת רחוב בשטח 6 מ״ר", unit="count"),
+                            GFact("balcony_area", "6", "מרפסת רחוב בשטח 6 מ״ר", unit="m2"),
+                        ],
+                    ),
+                ],
+            ),
+            ("מצב תכנוני וזכויות", [GPara("לא חל שינוי במצב התכנוני מאז חוות הדעת הקודמת.")]),
+            (
+                "שיקולי השמאית",
+                [GPara("השדרוג שבוצע ב-2023 מצדיק התאמה כלפי מעלה ביחס לחוות הדעת הקודמת.")],
+            ),
+        ],
+    )
+    return [h1, h2, h3, h8, h4(False), h5, h6, h7, h4(True)]
+
+
+class GeneralPdfRenderer(PdfRenderer):
+    """Renders a held-out document: free section titles and tables with their own columns."""
+
+    def __init__(self, font_dir: Path) -> None:
+        super().__init__(font_dir, visual=False)
+
+    def gheading(self, title: str, number: int) -> None:
+        pdf = self.pdf
+        if pdf.get_y() + 30 > pdf.page_break_trigger:
+            pdf.add_page()
+        pdf.ln(2)
+        self._line(title, size=12.5, bold=True, h=8)
+        self.layout.sections.append({"number": number, "title": title, "page": pdf.page_no()})
+
+    def _grow(self, cells: list[str], widths: list[int], bold: bool = False) -> None:
+        pdf = self.pdf
+        y = pdf.get_y()
+        x_right = pdf.w - pdf.r_margin
+        for text, width in zip(cells, widths, strict=True):
+            x_right -= width
+            pdf.set_xy(x_right, y)
+            self._cell_text_fit(text, width, bold)
+            pdf.cell(width, self.ROW_H, text, border=1, align="C", fill=bold)
+        pdf.set_xy(pdf.l_margin, y + self.ROW_H)
+
+    def gtable(self, table: GTable) -> None:
+        pdf = self.pdf
+        assert sum(table.widths) == 180, table.title
+        pdf.set_fill_color(225, 225, 225)
+        if pdf.get_y() + self.LINE_H + (len(table.rows) + 1) * self.ROW_H + 4 > pdf.page_break_trigger:
+            pdf.add_page()  # a held-out table never splits, so every cell has one page
+        self._line(table.title, bold=True)
+        page = pdf.page_no()
+        self._grow(table.headers, table.widths, bold=True)
+        for row in table.rows:
+            self._grow(row, table.widths)
+        assert pdf.page_no() == page, table.title
+        pdf.ln(3)
+        self.layout.gtables.append(page)
+
+    def render_general(self, doc: GeneralDoc) -> bytes:
+        pdf = self.pdf
+        pdf.add_page()
+        self._line(f"שומת מקרקעין — {doc.title_place}", size=15, bold=True, h=9)
+        self._line(f"{SYNTHETIC_MARKER} — כל הנתונים בדויים", size=10, bold=True)
+        self._line("משרד: שמאות דמו א׳ (סינתטי)", size=9.5)
+        pdf.ln(2)
+        self.layout.header_page = pdf.page_no()
+        for line in doc.header_lines():
+            self._line(line)
+        for number, (title, blocks) in enumerate(doc.all_sections(), start=1):
+            self.gheading(f"{number}. {title}", number)
+            for block in blocks:
+                if isinstance(block, GTable):
+                    self.gtable(block)
+                else:
+                    self.paragraph(block.text)
+        self.layout.page_count = pdf.page_no()
+        return bytes(pdf.output())
+
+
+def render_general_docx(doc: GeneralDoc) -> tuple[bytes, Layout]:
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+
+    layout = Layout()
+    document = Document()
+    cp = document.core_properties
+    cp.title = f"{SYNTHETIC_MARKER} - שומת מקרקעין"
+    cp.author = "synthetic fixture generator"
+    cp.last_modified_by = "synthetic fixture generator"
+    cp.created = FIXED_TS.replace(tzinfo=None)
+    cp.modified = FIXED_TS.replace(tzinfo=None)
+    cp.revision = 1
+
+    def para(text: str) -> None:
+        p = document.add_paragraph(text)
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        _rtl_paragraph(p)
+
+    def heading(text: str, level: int) -> None:
+        p = document.add_heading(text, level=level)
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        _rtl_paragraph(p)
+
+    heading(f"שומת מקרקעין — {doc.title_place}", 0)
+    para(f"{SYNTHETIC_MARKER} — כל הנתונים בדויים")
+    para("משרד: שמאות דמו א׳ (סינתטי)")
+    for line in doc.header_lines():
+        para(line)
+    for number, (title, blocks) in enumerate(doc.all_sections(), start=1):
+        heading(f"{number}. {title}", 1)
+        layout.sections.append({"number": number, "title": f"{number}. {title}", "page": None})
+        for block in blocks:
+            if isinstance(block, GPara):
+                para(block.text)
+                layout.paragraphs.append((block.text, None, None))
+                continue
+            para(block.title)
+            table = document.add_table(rows=1 + len(block.rows), cols=len(block.headers))
+            table.style = "Table Grid"
+            table._tbl.tblPr.append(OxmlElement("w:bidiVisual"))
+            for r, cells in enumerate([block.headers, *block.rows]):
+                for c, text in enumerate(cells):
+                    cell = table.cell(r, c)
+                    cell.text = text
+                    for p in cell.paragraphs:
+                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        _rtl_paragraph(p)
+                        if r == 0:
+                            for run in p.runs:
+                                run.bold = True
+            layout.gtables.append(None)
+    buf = io.BytesIO()
+    document.save(buf)
+    return normalize_zip(buf.getvalue()), layout
+
+
+def _general_facts_of(doc: GeneralDoc, layout: Layout) -> list[dict[str, Any]]:
+    """Every fact with its physical page, located by its verbatim quote (text) or cell (table)."""
+    out: list[dict[str, Any]] = []
+    paragraphs = [(t, s, e) for t, s, e in layout.paragraphs]
+    tables = [b for _, blocks in doc.all_sections() for b in blocks if isinstance(b, GTable)]
+    gpages = layout.gtables
+    assert len(tables) == len(gpages), doc.id
+    for _, blocks in doc.all_sections():
+        for block in blocks:
+            for fact in block.facts:
+                entry: dict[str, Any] = {
+                    "id": f"{doc.id}-F{len(out) + 1:02d}",
+                    "document": doc.id,
+                    "attribute": fact.attribute,
+                    "entity": fact.entity,
+                    "value": fact.value,
+                    "unit": fact.unit,
+                }
+                if fact.normalized:
+                    entry["normalized"] = dict(fact.normalized)
+                if isinstance(block, GTable):
+                    assert fact.cell is not None, (doc.id, fact.attribute)
+                    r, c = fact.cell
+                    assert block.rows[r][c] == fact.quote, (doc.id, fact.attribute, block.rows[r][c])
+                    t_index = tables.index(block)
+                    entry |= {
+                        "page": gpages[t_index],
+                        "quote": fact.quote,
+                        "source": {"kind": "table", "table_index": t_index, "row_index": r,
+                                   "column": block.headers[c], "row_label": block.rows[r][0]},
+                    }
+                else:
+                    hits = [(s, e) for t, s, e in paragraphs if fact.quote in t]
+                    assert len(hits) == 1 and fact.quote in block.text, (doc.id, fact.quote, hits)
+                    assert hits[0][0] == hits[0][1], (doc.id, fact.quote)
+                    entry |= {"page": hits[0][0], "quote": fact.quote, "source": {"kind": "text"}}
+                if fact.note:
+                    entry["note"] = fact.note
+                out.append(entry)
+    return out
+
+
+def _existing_mentions(reports: list[Report], layouts: dict[str, Layout]) -> list[dict[str, Any]]:
+    """Where the original fixtures already touch the held-out topics (full sentences, physical pages)."""
+    out = []
+    for rep in reports:
+        if rep.kind in ("encrypted", "truncated"):
+            continue
+        for text, start, _end in layouts[rep.id].paragraphs:
+            for sentence in [s.strip() for s in text.replace("; ", ". ").split(". ") if s.strip()]:
+                for topic, terms in EXISTING_MENTION_TERMS.items():
+                    found = [t for t in terms if t in sentence]
+                    if not found:
+                        continue
+                    item = {"document": rep.id, "topic": topic, "term": found[0], "page": start,
+                            "sentence": sentence.rstrip(".")}
+                    if found[0] == "היתר" and "בין היתר" in sentence:
+                        item["false_friend"] = "'בין היתר' means 'among other things', not a building permit"
+                    out.append(item)
+    return out
+
+
+def general_section(
+    docs: list[GeneralDoc], entries: dict[str, dict[str, Any]], facts: list[dict[str, Any]],
+    mentions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    replaced = {d.version_of for d in docs if d.version_of}
+    current = [d.id for d in docs if d.id not in replaced]
+    stated = {(f["document"], f["attribute"]) for f in facts}
+    not_stated = {
+        attr: [d.id for d in docs if (d.id, attr) not in stated] for attr in GENERAL_ATTRIBUTES
+    }
+
+    def fact(doc_id: str, attribute: str) -> dict[str, Any]:
+        found = [f for f in facts if f["document"] == doc_id and f["attribute"] == attribute]
+        assert len(found) == 1, (doc_id, attribute, found)
+        return found[0]
+
+    def side(doc_id: str, attribute: str) -> dict[str, Any]:
+        f = fact(doc_id, attribute)
+        return {"document": doc_id, "value": f["value"], "page": f["page"], "quote": f["quote"]}
+
+    old, new = "H4", "H4v2"
+    changed = []
+    for attribute in ("planning_status", "adjustment_rate"):
+        a, b = fact(old, attribute), fact(new, attribute)
+        assert a["value"] != b["value"], attribute
+        changed.append({"attribute": attribute, "old": side(old, attribute), "new": side(new, attribute)})
+    for attribute in GENERAL_ATTRIBUTES:
+        if attribute in ("planning_status", "adjustment_rate"):
+            continue
+        a = [f["value"] for f in facts if f["document"] == old and f["attribute"] == attribute]
+        b = [f["value"] for f in facts if f["document"] == new and f["attribute"] == attribute]
+        assert a == b, (attribute, a, b)  # nothing else differs between the versions
+    by_id = {d.id: d for d in docs}
+    return {
+        "about": f"{SYNTHETIC_MARKER}. Held-out corpus (U12, KTD16): appraisal-like documents about attributes the "
+        "application code never names. Files live in tests/fixtures/general/. The documents produce no records "
+        "(no 'שווי הנכס:' header label, no price column), so `documents`, `dedup` and the 77-item evaluation "
+        "are unaffected. Values are as the document states them; `normalized` gives the canonical unit when the "
+        "document uses another one. `*_present` facts record explicit statements only (a stated area or count "
+        "implies presence); `not_stated` lists, per attribute, the documents with no fact for it. Generated by "
+        "scripts/generate_fixtures.py - do not edit by hand.",
+        "directory": GENERAL_DIR,
+        "group": {
+            "code": GENERAL_GROUP["code"],
+            "name": GENERAL_GROUP["name"],
+            "office": "A",
+            "visible_to": ["admin-a@demo.test", "dana@demo.test"],
+            "hidden_from": ["yossi@demo.test", "admin-b@demo.test"],
+        },
+        "attributes": GENERAL_ATTRIBUTES,
+        "documents": list(entries.values()),
+        "current_documents": current,
+        "facts": facts,
+        "not_stated": not_stated,
+        "conflicts": [
+            {
+                "subject_key": by_id["H6"].subject_key,
+                "address": "בן יהודה 140, תל אביב-יפו",
+                "attribute": "year_built",
+                "statements": [side("H6", "year_built"), side("H7", "year_built")],
+                "note": "two appraisals of the same unit disagree; an answer must show both, never pick one silently",
+            }
+        ],
+        "versions": [
+            {
+                "document": new,
+                "replaces": old,
+                "changed": changed,
+                "value_in_text": {"old": str(by_id[old].value), "new": str(by_id[new].value)},
+                "dates": {
+                    "old": {"valuation_date": by_id[old].valuation_date.isoformat(),
+                            "report_date": by_id[old].report_date.isoformat()},
+                    "new": {"valuation_date": by_id[new].valuation_date.isoformat(),
+                            "report_date": by_id[new].report_date.isoformat()},
+                },
+                "unchanged": "every other attribute and sentence",
+            }
+        ],
+        "same_subject": [
+            {"subject_key": by_id["H6"].subject_key, "documents": ["H6", "H7"],
+             "note": "the same unit appraised twice (2022 and 2023); different documents, not versions"},
+            {"subject_key": by_id["H4"].subject_key, "documents": ["H4", "H4v2"],
+             "note": "two versions of one document; only H4v2 is current"},
+        ],
+        "existing_mentions": mentions,
+    }
+
+
+def write_general(out: Path, font_dir: Path, reports: list[Report], layouts: dict[str, Layout]) -> dict[str, Any]:
+    gdir = out / GENERAL_DIR
+    gdir.mkdir(parents=True, exist_ok=True)
+    docs = build_general_docs()
+    entries: dict[str, dict[str, Any]] = {}
+    facts: list[dict[str, Any]] = []
+    for gdoc in docs:
+        assert "synthetic" in gdoc.filename
+        if gdoc.kind == "docx":
+            data, layout = render_general_docx(gdoc)
+        else:
+            renderer = GeneralPdfRenderer(font_dir)
+            data = renderer.render_general(gdoc)
+            layout = renderer.layout
+        (gdir / gdoc.filename).write_bytes(data)
+        gtables = [b for _, blocks in gdoc.all_sections() for b in blocks if isinstance(b, GTable)]
+        for table in gtables:  # no price column: the rules extractor never sees a comparables table
+            assert not any("מחיר" in h or "שווי" in h for h in table.headers), table.headers
+        entries[gdoc.id] = {
+            "id": gdoc.id,
+            "filename": gdoc.filename,
+            "office": "A",
+            "group": GENERAL_GROUP["code"],
+            "kind": gdoc.kind,
+            "version_of": gdoc.version_of,
+            "notes": gdoc.notes,
+            "city": gdoc.city,
+            "neighborhood": gdoc.neighborhood,
+            "address": gdoc.address,
+            "block": gdoc.block,
+            "parcel": gdoc.parcel,
+            "sub_parcel": gdoc.sub_parcel,
+            "subject_key": gdoc.subject_key,
+            "property_type": gdoc.ptype,
+            "valuation_date": gdoc.valuation_date.isoformat(),
+            "report_date": gdoc.report_date.isoformat(),
+            "value_in_text": str(gdoc.value),
+            "page_count": layout.page_count,
+            "header_page": layout.header_page,
+            "sections": [{"number": s["number"], "title": s["title"], "page": s["page"]} for s in layout.sections],
+            "tables": [
+                {"index": i, "title": t.title, "page": p, "headers": FlowList(t.headers),
+                 "rows": [FlowList(r) for r in t.rows]}
+                for i, (t, p) in enumerate(zip(gtables, layout.gtables, strict=True))
+            ],
+            "records": [],
+        }
+        facts.extend(_general_facts_of(gdoc, layout))
+        print(f"wrote {GENERAL_DIR}/{gdoc.filename} ({len(data):,} bytes, pages={layout.page_count})")
+    return general_section(docs, entries, facts, _existing_mentions(reports, layouts))
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -1703,7 +2857,9 @@ def main() -> None:
 
     docs: dict[str, dict[str, Any]] = {}
     facts: list[dict[str, Any]] = []
-    for rep in build_reports():
+    reports = build_reports()
+    layouts: dict[str, Layout] = {}
+    for rep in reports:
         assert "synthetic" in rep.filename
         if rep.kind == "docx":
             data, layout = render_docx(rep)
@@ -1723,6 +2879,7 @@ def main() -> None:
             )
         (out / rep.filename).write_bytes(data)
         docs[rep.id] = doc_entry(rep, layout)
+        layouts[rep.id] = layout
         facts.extend(find_fact_pages(rep, layout))
         print(f"wrote {rep.filename} ({len(data):,} bytes, pages={layout.page_count})")
 
@@ -1733,6 +2890,7 @@ def main() -> None:
         "documents": list(docs.values()),
         "dedup": dedup_section(docs),
         "content_facts": facts,
+        "general_facts": write_general(out, font_dir, reports, layouts),
     }
     text = yaml.safe_dump(truth, allow_unicode=True, sort_keys=False, width=1000)
     (out / "ground_truth.yaml").write_text(text, encoding="utf-8")

@@ -179,3 +179,221 @@ def test_content_facts_point_at_known_documents():
             assert fact["page"] is None
         else:
             assert 1 <= fact["page"] <= doc["page_count"]
+
+
+# --- held-out general corpus (U12, KTD16): tests/fixtures/general/ and the `general_facts` section ----------
+
+GENERAL = TRUTH["general_facts"]
+GENERAL_DIR = FIXTURES / GENERAL["directory"]
+GENERAL_DOCS = {d["id"]: d for d in GENERAL["documents"]}
+GENERAL_FACTS = GENERAL["facts"]
+
+
+def _general_extract(doc_id: str):
+    import time
+
+    from app.extraction.default import DefaultExtractor
+
+    doc = GENERAL_DOCS[doc_id]
+    mime = (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        if doc["kind"] == "docx"
+        else "application/pdf"
+    )
+    return DefaultExtractor().extract((GENERAL_DIR / doc["filename"]).read_bytes(), mime, time.monotonic() + 600)
+
+
+def _squash(text: str) -> str:
+    from app.extraction.normalize_text import base_normalize
+
+    return base_normalize(text or "")
+
+
+def test_general_files_exist_are_synthetic_and_listed():
+    listed = {d["filename"] for d in GENERAL["documents"]}
+    on_disk = {p.name for p in GENERAL_DIR.iterdir() if p.suffix in {".pdf", ".docx"}}
+    assert on_disk == listed
+    assert all("synthetic" in name for name in listed)
+    assert {d["office"] for d in GENERAL["documents"]} == {"A"}
+    assert {d["group"] for d in GENERAL["documents"]} == {GENERAL["group"]["code"]}
+    assert not set(GENERAL_DOCS) & set(DOCS), "held-out documents never join the record answer key"
+
+
+def test_general_section_leaves_existing_answer_key_unchanged():
+    current_a = [r for d, r in RECORDS if d["office"] == "A" and d["version_of"] is None]
+    assert sum(r["data_kind"] == "transaction_price" for r in current_a) == 80
+    assert sum(r["data_kind"] == "transaction_price" for d, r in RECORDS if d["office"] == "A") == 86
+    assert all(d["records"] == [] for d in GENERAL["documents"])
+    phrases = {f["phrase"] for f in TRUTH["content_facts"]}
+    general_text = " ".join(f["quote"] for f in GENERAL_FACTS)
+    assert not [p for p in phrases if p in general_text]
+
+
+@pytest.mark.parametrize("doc", GENERAL["documents"], ids=lambda d: d["id"])
+def test_general_document_yields_no_records_and_states_its_facts(doc):
+    """The rules extractor finds no appraised value and no comparables table (so no occurrences, no
+    gazetteer or metadata change), and every fact's quote is on its stated physical page."""
+    from app.appraisal.extract import extract_records
+
+    result = _general_extract(doc["id"])
+    assert result.page_count == doc["page_count"]
+    pages = [(p.page_no, p.text) for p in result.pages]
+    assert MARKER in _squash(" ".join(t for _, t in pages))
+    tables = [{"index": t.index, "headers": t.headers, "rows": [{"page": r.page, "cells": r.cells} for r in t.rows],
+               "ocr": t.ocr} for t in result.tables]
+    assert extract_records(pages, tables, set()) == []
+    by_page = {n: _squash(t) for n, t in pages}
+    every = _squash(" ".join(t for _, t in pages))
+    for fact in [f for f in GENERAL_FACTS if f["document"] == doc["id"]]:
+        if fact["source"]["kind"] == "text":
+            text = every if fact["page"] is None else by_page[fact["page"]]
+            assert _squash(fact["quote"]) in text, fact
+        else:
+            want = doc["tables"][fact["source"]["table_index"]]
+            heads = [_squash(h) for h in want["headers"]]
+            got = [(t, 0) for t in result.tables if [_squash(h) for h in t.headers] == heads]
+            # a two-column key/value table may come back headerless, its header row read as row 0
+            got += [(t, 1) for t in result.tables if not t.headers and t.rows
+                    and [_squash(c) for c in t.rows[0].cells] == heads]
+            assert len(got) == 1, (fact, [t.headers for t in result.tables])
+            table, offset = got[0]
+            row = table.rows[fact["source"]["row_index"] + offset]
+            assert row.page == fact["page"]
+            assert _squash(fact["quote"]) == _squash(row.cells[want["headers"].index(fact["source"]["column"])])
+
+
+def test_general_version_pair_differs_only_in_the_changed_assumptions():
+    version = GENERAL["versions"][0]
+    assert GENERAL_DOCS[version["document"]]["version_of"] == version["replaces"]
+    assert {c["attribute"] for c in version["changed"]} == {"planning_status", "adjustment_rate"}
+    old = {(f["attribute"], str(f["value"])) for f in GENERAL_FACTS if f["document"] == version["replaces"]}
+    new = {(f["attribute"], str(f["value"])) for f in GENERAL_FACTS if f["document"] == version["document"]}
+    assert {a for a, _ in old ^ new} == {"planning_status", "adjustment_rate"}
+    assert version["replaces"] not in GENERAL["current_documents"]
+
+
+def test_general_conflict_and_same_subject():
+    conflict = GENERAL["conflicts"][0]
+    a, b = conflict["statements"]
+    assert a["value"] != b["value"]
+    da, db = GENERAL_DOCS[a["document"]], GENERAL_DOCS[b["document"]]
+    assert (da["block"], da["parcel"], da["sub_parcel"]) == (db["block"], db["parcel"], db["sub_parcel"])
+    assert da["subject_key"] == db["subject_key"] == conflict["subject_key"]
+    assert da["version_of"] is None and db["version_of"] is None  # two appraisals, not two versions
+
+
+def test_general_not_stated_is_the_complement_of_the_facts():
+    for attribute, missing in GENERAL["not_stated"].items():
+        stating = {f["document"] for f in GENERAL_FACTS if f["attribute"] == attribute}
+        assert set(missing) == set(GENERAL_DOCS) - stating, attribute
+    # a datum absent from some documents, for every main attribute of the corpus
+    for attribute in ("safe_room_area", "balcony_area", "parking_spaces", "ceiling_height", "elevator_count",
+                      "zoning", "renovation", "building_permit"):
+        assert GENERAL["not_stated"][attribute], attribute
+
+
+def test_general_cities_cover_ramat_gan_givatayim_and_tel_aviv():
+    assert {d["city"] for d in GENERAL["documents"]} == {"רמת גן", "גבעתיים", "תל אביב-יפו"}
+    assert any(d["kind"] == "docx" for d in GENERAL["documents"])
+
+
+# --- eval/questions_general.yaml: every expected value derives from general_facts -------------------------
+
+QUESTIONS_GENERAL = yaml.safe_load(
+    (Path(__file__).resolve().parents[2] / "eval" / "questions_general.yaml").read_text(encoding="utf-8")
+)["items"]
+GENERAL_FACT_BY_ID = {f["id"]: f for f in GENERAL_FACTS}
+TURNS = [(item, turn) for item in QUESTIONS_GENERAL for turn in item["turns"]]
+
+
+def _number(fact) -> Decimal | None:
+    """The fact's numeric value in its canonical unit; a year for dated text values; None for "none"."""
+    import re
+
+    value = (fact.get("normalized") or {}).get("value", fact["value"])
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return Decimal(str(value))
+    match = re.match(r"^(\d{4})(?::|$)", str(value)) or re.match(r"^(\d+(?:\.\d+)?)$", str(value))
+    return Decimal(match.group(1)) if match else None
+
+
+def _in_scope(doc_id: str, scope) -> bool:
+    return scope == "all" or all(GENERAL_DOCS[doc_id][key] == want for key, want in scope.items())
+
+
+def test_general_question_set_shape():
+    ids = [item["id"] for item in QUESTIONS_GENERAL]
+    assert len(ids) == len(set(ids)) and len(ids) >= 40
+    categories = {item["category"] for item in QUESTIONS_GENERAL}
+    assert categories >= {"explicit_text_fact", "table_datum", "locate", "explanation", "comparison", "version_diff",
+                          "conflict", "computation", "unextracted_datum", "missing_info", "follow_up",
+                          "clarification", "new_topic"}
+    asked = {turn["ask"] for _, turn in TURNS}
+    for verbatim in ("מה גודל ממ״ד ממוצע ברמת גן?", "ומה לגבי השנה הקודמת?",
+                     "עכשיו בנושא אחר: אילו שומות מזכירות היתר בנייה?", "התכוונתי לעסקאות",
+                     "אילו הנחות השתנו בין הגרסאות?"):
+        assert verbatim in asked, verbatim  # AE1-AE6 (AE2 is AE1 asked with cloud use off)
+    assert any(item.get("cloud") == "off" for item in QUESTIONS_GENERAL)
+    for _, turn in TURNS:
+        expect = turn["expect"]
+        assert expect["outcome"] in {"answer", "computation", "abstain", "clarification", "comparison"}
+        if expect["outcome"] == "abstain":
+            assert expect.get("abstention_kind") or expect.get("abstention_kind_any_of"), turn["ask"]
+        if expect["outcome"] == "clarification":
+            assert expect.get("clarify_key"), turn["ask"]
+
+
+@pytest.mark.parametrize("item_turn", TURNS, ids=lambda it: f"{it[0]['id']}:{it[1]['ask'][:24]}")
+def test_general_question_expectations_derive_from_general_facts(item_turn):
+    item, turn = item_turn
+    expect = turn["expect"]
+    sources = expect.get("sources") or {}
+    for ref in (sources.get("all_of") or []) + (sources.get("also_valid") or []):
+        doc = GENERAL_DOCS.get(ref["doc"]) or DOCS[ref["doc"]]
+        assert ref["page"] is None if doc["page_count"] is None else 1 <= ref["page"] <= doc["page_count"], ref
+    refs = list(expect.get("values") or []) + [{"fact": f} for side in expect.get("sides") or [] for f in side["facts"]]
+    for ref in refs:
+        fact = GENERAL_FACT_BY_ID[ref["fact"]]
+        if "value" in ref:
+            assert str(ref["value"]) == str(fact["value"]), ref
+        if "page" in ref:
+            assert ref["page"] == fact["page"], ref
+        cited = {(s["doc"], s["page"]) for s in (sources.get("all_of") or []) + (sources.get("also_valid") or [])}
+        if sources and expect["outcome"] != "computation":
+            assert (fact["document"], fact["page"]) in cited, (ref, cited)
+    for side in expect.get("sides") or []:
+        assert all(GENERAL_FACT_BY_ID[f]["document"] == side["doc"] for f in side["facts"]), side
+    if "changed" in expect:
+        assert set(expect["changed"]) == {c["attribute"] for c in GENERAL["versions"][0]["changed"]}
+
+    result = expect.get("result")
+    if not result:
+        return
+    import operator
+
+    facts = [GENERAL_FACT_BY_ID[f] for f in result["facts"]]
+    attribute, scope = result["attribute"], result["scope"]
+    assert {f["attribute"] for f in facts} == {attribute}
+    current = [d for d in GENERAL["current_documents"] if _in_scope(d, scope)]
+    stating = {f["document"] for f in GENERAL_FACTS if f["attribute"] == attribute}
+    # exhaustive over the documents in scope (never top-k), never a superseded version
+    assert sorted(f["document"] for f in facts) == sorted(d for d in current if d in stating)
+    assert result["n"] == len(facts) == expect["coverage"]["values_found"]
+    coverage = expect["coverage"]
+    missing = {d for d in current if d not in stating}
+    assert set(coverage.get("not_stated_includes", [])) | set(coverage.get("stated_absent", [])) == missing
+    numbers = [_number(f) for f in facts]
+    metric = result["metric"]
+    if metric == "mean":
+        mean = sum(numbers) / len(numbers)
+        assert mean.quantize(Decimal("0.01"), rounding="ROUND_HALF_UP") == Decimal(result["value"])
+    elif metric == "min":
+        assert min(numbers) == Decimal(result["value"])
+    elif metric == "count":
+        op, bound = result["where"].replace("year ", "").split()[:2]
+        test = {">": operator.gt, "<": operator.lt, ">=": operator.ge}[op]
+        assert sum(1 for n in numbers if n is not None and test(n, Decimal(bound))) == int(result["value"])
+    else:
+        assert metric == "values"

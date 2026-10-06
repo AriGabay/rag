@@ -9,7 +9,8 @@ through the public API exactly like a user would (upload -> worker -> review app
 Records are approved only when every key field equals the synthetic ground truth, so the demo
 also shows which extractions a human would still need to check. Each office also gets the
 structured attribute registry entries (KTD7), written with the owner role inside that office's
-context. All data is synthetic.
+context. The held-out corpus (U12, KTD16; tests/fixtures/general/) goes into its own office A group,
+visible to admin-a and dana but not yossi; it produces no records. All data is synthetic.
 """
 
 from __future__ import annotations
@@ -138,6 +139,48 @@ def upload_all(clients: dict[str, httpx.Client], group_ids: dict[str, dict[str, 
     wait_for_processing(clients)
 
 
+def seed_general_corpus(admin: httpx.Client, general: dict) -> None:
+    """Held-out documents in their own group (`general_facts` in ground_truth.yaml). Idempotent: the group,
+    the members and the uploads are each created only when missing."""
+    spec = general["group"]
+    groups = {g["name"]: g for g in admin.get("/api/admin/groups").json()["groups"]}
+    if spec["name"] in groups:
+        group_id = groups[spec["name"]]["id"]
+    else:
+        r = admin.post("/api/admin/groups", json={"name": spec["name"]})
+        r.raise_for_status()
+        group_id = r.json()["id"]
+    for user in admin.get("/api/admin/users").json()["users"]:
+        if user["email"] in spec["visible_to"] and user["role"] != "admin" and group_id not in user["group_ids"]:
+            admin.patch(f"/api/admin/users/{user['id']}",
+                        json={"group_ids": [*user["group_ids"], group_id]}).raise_for_status()
+            log(f"{user['email']} added to group {spec['name']}")
+    if groups.get(spec["name"], {}).get("document_count"):
+        log("held-out documents already uploaded; skipping")
+        return
+    folder = FIXTURES / general["directory"]
+    by_id: dict[str, str] = {}
+    for doc in [d for d in general["documents"] if not d.get("version_of")]:
+        path = folder / doc["filename"]
+        r = admin.post("/api/documents", data={"group_id": group_id},
+                       files=[("files", (path.name, path.read_bytes(), "application/octet-stream"))])
+        r.raise_for_status()
+        res = r.json()["results"][0]
+        log(f"upload {doc['id']}: {res['status']} {res.get('reason', '')}")
+        if res.get("document_id"):
+            by_id[doc["id"]] = res["document_id"]
+    wait_for_processing({"A": admin})
+    for doc in [d for d in general["documents"] if d.get("version_of")]:
+        target = by_id.get(doc["version_of"])
+        if not target:
+            continue
+        path = folder / doc["filename"]
+        r = admin.post("/api/documents", data={"document_id": target},
+                       files=[("files", (path.name, path.read_bytes(), "application/octet-stream"))])
+        log(f"upload {doc['id']} as new version of {doc['version_of']}: {r.json()['results'][0]['status']}")
+    wait_for_processing({"A": admin})
+
+
 def wait_for_processing(clients: dict[str, httpx.Client], timeout: float = 900) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -198,6 +241,7 @@ def main() -> None:
         upload_all(clients, group_ids, docs)
     else:
         log("documents already uploaded; skipping uploads")
+    seed_general_corpus(clients["A"], truth["general_facts"])
     for key, c in clients.items():
         approved, left = approve_matching(c, docs)
         log(f"office {key}: approved {approved} records matching ground truth; {left} items left for review")
