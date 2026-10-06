@@ -68,6 +68,7 @@ from app.answering.attributes import (
     canonical_unit_for,
     distinctive_words,
     is_measure_word,
+    other_attribute_names,
     text_words,
     words_share,
 )
@@ -75,7 +76,7 @@ from app.answering.attributes import (
     GENERIC_MEASURE_WORDS as GENERIC_MEASURE_WORDS,  # re-exported: part of the validation contract
 )
 from app.answering.attributes import match_norm as _match_norm
-from app.answering.metadata import MetadataFilters, apply_filters, version_metadata
+from app.answering.metadata import MetadataFilters, apply_filters, report_header, version_metadata
 from app.config import get_settings
 from app.db import TenantContext, tenant_tx
 from app.extraction.normalize_text import base_normalize
@@ -98,6 +99,11 @@ PARTIAL_PASSAGES = 12
 EXTRACT_MAX_OUTPUT_TOKENS = 2000
 # Provider failures worth retrying in a job; every other status fails the job terminally.
 TRANSIENT = frozenset({CallStatus.TIMEOUT, CallStatus.RATE_LIMITED, CallStatus.ERROR})
+EXTRACT_RETRY_COOLDOWN_SECONDS = 120  # another failure is not retried by the next turn sooner than this
+# Failures that belong to the document's content: the same call gives the same answer. A provider-wide failure
+# (key, quota, model, timeout) is retried after the cooldown, once the provider works again.
+DOCUMENT_FAILURES = frozenset({CallStatus.REFUSAL.value, CallStatus.INVALID.value, CallStatus.INCOMPLETE.value,
+                               CallStatus.UNSUPPORTED.value})
 _Q2 = Decimal("0.01")
 _QUOTE_EDGES = " \t\n.,:;…“”„"
 
@@ -215,17 +221,26 @@ class VersionContent:
 
 
 def _safe(value: str) -> str:
-    """Document text cannot open or close prompt tags."""
-    return (value or "").replace("<", "‹").replace(">", "›")
+    """Document text cannot open or close prompt tags (``llm.prompt_text``)."""
+    return llm.prompt_text(value or "")
 
 
 def _subject_key(conn: Connection, version_id: UUID) -> str | None:
-    """Entity key of the report's subject property: block/parcel, else the normalized address."""
+    """Entity key of the report's subject property: block/parcel, else the normalized address. A narrative
+    report without records is keyed by its own header: its block/parcel line, else its city and address (an
+    address alone may repeat in another city). Two reports on one property then count once (KTD8 step 6)."""
     r = conn.execute(text(
         "SELECT block, parcel, sub_parcel, address FROM occurrences WHERE version_id = :v"
         " AND data_kind = 'appraised_value' AND verification_status <> 'rejected' ORDER BY record_index, id LIMIT 1"),
         {"v": version_id}).one_or_none()
     if r is None:
+        header = report_header(conn, version_id)
+        bp = header.get("block_parcel")
+        if isinstance(bp, tuple) and len(bp) == 3 and bp[0] and bp[1]:
+            return f"bp:{bp[0].strip()}/{bp[1].strip()}/{(bp[2] or '-').strip()}"
+        city, address = header.get("city"), header.get("address")
+        if isinstance(city, str) and city and isinstance(address, str) and address:
+            return f"addr:{base_normalize(city)}|{base_normalize(address)}"
         return None
     if r.block and r.parcel:
         return f"bp:{r.block.strip()}/{r.parcel.strip()}/{(r.sub_parcel or '-').strip()}"
@@ -302,8 +317,8 @@ def read_version(conn: Connection, attribute: AttributeDef, version_id: UUID, bu
                 if open_table is not None:
                     parts.append("</table>")
                 columns = " | ".join(h for h in headers if h)
-                parts.append(f'<table id="T{c.table_index + 1}" section="{_safe(structure.get("section") or "")}"'
-                             f' columns="{_safe(columns)}"' + (' layout="key-value"' if kv else "") + ">")
+                parts.append(f'<table id="T{c.table_index + 1}" section="{llm.prompt_attr(structure.get("section") or "")}"'
+                             f' columns="{llm.prompt_attr(columns)}"' + (' layout="key-value"' if kv else "") + ">")
                 open_table = c.table_index
             row_handle = f"T{c.table_index + 1}R{c.row_index + 1}"
             row_page = row.get("page") or page
@@ -372,11 +387,16 @@ class Accepted:
     assumed: bool
     synonym: bool = False  # named by a term that shares no distinctive word with the attribute's names
     several: bool = False  # the quote states more than one value in the value's dimension
+    # the server could not tie the value to the attribute, the subject or the cited place on its own: the
+    # quote was found only outside the cited source, a count's own noun names something else, or a zero
+    # word is qualified ("אין X נוספת"). Such a value goes to review, never straight into a figure.
+    uncertain: bool = False
 
 
 # Separators the model may drop or change when it copies a "label: value" line or a table row; the words and
 # numbers of a quote must still appear in order. A hyphen inside a number range ("2-3") is kept.
 _SEPARATORS = re.compile(r"[:|;–—]|(?<!\d)-|-(?!\d)")
+_ROW_HANDLE = re.compile(r"^(T\d+R\d+)(?:C\d+)?$")
 
 
 def _quotes(src: Source, nq: str) -> bool:
@@ -388,24 +408,53 @@ def _quote_form(value: str) -> str:
     return " ".join(_SEPARATORS.sub(" ", _match_norm(value)).split())
 
 
-def validate_mention(m: Mention, content: VersionContent, attribute: AttributeDef) -> Accepted | str:
-    """The accepted mention, or the reason it was rejected."""
+def _in_row(source: Source, row: str) -> bool:
+    return source.handle == row or (source.handle.startswith(row) and source.handle[len(row)] == "C")
+
+
+def resolve_source(cited: str, content: VersionContent, nq: str) -> tuple[Source, bool] | str:
+    """The source a quote is cited to, and whether it was placed by the quote alone (``uncertain``).
+
+    The cited source must hold the quote. When it does not, only its own neighbourhood may: the cells of the
+    table row the model cited (it may cite the row ``T1R3`` or a sibling cell), or the same stored chunk. A
+    quote found only elsewhere in the document is not moved there: the same words in another place (a
+    comparable's row) may describe another property. Only an unknown handle (not issued at all) falls back to
+    the one place that holds the quote, and that value goes to review."""
+    handle = cited.strip().upper()
+    src = content.sources.get(handle)
+    if src is not None and _quotes(src, nq):
+        return src, False
+    holders = [s for s in content.sources.values() if _quotes(s, nq)]
+    row = _ROW_HANDLE.match(handle)
+    near = [s for s in holders if (row and _in_row(s, row.group(1))) or (src is not None and s.chunk_id == src.chunk_id)]
+    if len(near) == 1:
+        return near[0], False
+    if len(near) > 1:
+        return "ambiguous_source"
+    if src is None and row is None:
+        cells = [s for s in holders if s.col is not None]
+        chosen = cells if len(cells) == 1 else holders
+        if len(chosen) == 1:
+            return chosen[0], True
+    return "unknown_handle" if src is None else "quote_not_found"
+
+
+def validate_mention(m: Mention, content: VersionContent, attribute: AttributeDef,
+                     others: Sequence[Sequence[str]] = ()) -> Accepted | str:
+    """The accepted mention, or the reason it was rejected.
+
+    ``others`` are the names of the office's other attributes (``attributes.other_attribute_names``): a value
+    whose naming term or cell label names one of them, and not this attribute, belongs to that attribute."""
     quote = m.quote.strip(_QUOTE_EDGES)
     nq = _quote_form(quote)
     if not nq:
         return "empty_quote"
-    src = content.sources.get(m.source.strip().upper())
-    if src is None or not _quotes(src, nq):
-        # The model sometimes cites a row (T1R3) or a neighbouring handle. The quote still decides: when
-        # exactly one issued source holds it verbatim (a table cell before the chunk repeating its row),
-        # that source is the citation; otherwise the mention is rejected as before.
-        holders = [s for s in content.sources.values() if _quotes(s, nq)]
-        cells = [s for s in holders if s.handle.startswith("T")]
-        chosen = cells if len(cells) == 1 else holders
-        if len(chosen) != 1:
-            return "unknown_handle" if src is None else "quote_not_found"
-        src = chosen[0]
-    naming = _naming(m.attribute_term, quote, src, attribute)
+    placed = resolve_source(m.source, content, nq)
+    if isinstance(placed, str):
+        return placed
+    src, uncertain = placed
+    names = _name_words(attribute)
+    naming = _naming(m.attribute_term, quote, src, attribute, others)
     # a measure-word term ("בשטח") may still name the value through the attribute's own words right before it
     deferred = naming == "generic_term" and attribute.value_type == "numeric"
     if isinstance(naming, str) and not deferred:
@@ -415,20 +464,23 @@ def validate_mention(m: Mention, content: VersionContent, attribute: AttributeDe
         if not _match_norm(value) or _match_norm(value) not in nq:
             return "value_not_in_quote"
         return Accepted(m.entity_role, m.entity_descriptor, value, m.unit_text, quote, src, None, None, None,
-                        False, naming)
+                        False, naming, uncertain=uncertain)
     dimension = attribute.unit_dimension
-    names = _name_words(attribute)
     q = units.parse_mention_quantity(quote, m.value_text, dimension)
     named = _named_values(quote, dimension)
+    own = _own_value(named, q.value, names) if q is not None else None
     if deferred:
         if q is None or not any(n.value == q.value and _binds(n.label, "", names, last=_NEAR_WORDS) for n in named):
             return "generic_term"
         naming = False
+    elif naming is True and own is not None and (_binds(own.label, "", names, last=_NEAR_WORDS)
+                                                 or words_share(own.noun, names, roots=True)):
+        naming = False  # the quote's own words name the value, whatever words the model chose as its term
     if dimension == "area" and (q is None or q.unit is None or q.unit.dimension == "length"):
         dims = units.area_from_dimensions(quote, m.value_text)  # W×H lengths: an area by assumption
         if dims is not None:
             return Accepted(m.entity_role, m.entity_descriptor, m.value_text, m.unit_text, quote, src, dims.value,
-                            units.SQM.code, dims.value, True, naming)
+                            units.SQM.code, dims.value, True, naming, uncertain=uncertain)
     if q is None:
         return "value_not_in_quote"
     unit = q.unit
@@ -437,20 +489,31 @@ def validate_mention(m: Mention, content: VersionContent, attribute: AttributeDe
         unit = src.header_unit  # a bare number in a cell is measured in its column's (or row label's) unit
     if unit is None:  # "label (unit): value" in running text names the unit the same way
         unit = next((n.unit for n in named if n.value == q.value and n.unit is not None), None)
+    if dimension == "count" and own is not None:
+        unit = own.unit if own.unit is not None else (None if unit is q.unit else unit)
+        verdict = _count_binding(own, unit, src, names)
+        if verdict == "reject":
+            return "counted_other"
+        uncertain = uncertain or verdict == "uncertain"
     try:
         conv = units.convert(q.value, unit, attribute.unit_dimension)
     except units.DimensionMismatch:
         return "unit_dimension"
-    several = unit is not None and _several(named, q.value, unit, src, m.attribute_term, names, dimension)
+    several = _several(named, q.value, unit, src, m.attribute_term, names, dimension)
     return Accepted(m.entity_role, m.entity_descriptor, m.value_text, m.unit_text, quote, src, q.value,
-                    unit.code if unit else None, conv.value, conv.assumed, naming, several)
+                    unit.code if unit else None, conv.value, conv.assumed, naming, several, uncertain)
 
 
 # A value's own label: the words before it in its segment (cells joined by "|", items by ";", lines) and
-# clause, back to the previous number. "label: value" and "label (unit): value" segments name one value each.
+# clause, back to the previous value (its number and the unit word written after it). "label: value" and
+# "label (unit): value" segments name one value each. A count's own noun is the word(s) written right after
+# its number ("2 X"), or the counted-noun unit written before it ("בקומה 3").
 _SEGMENTS = re.compile(r"[|;\n]")
 _CLAUSES = re.compile(r",\s|\.\s|\.$")
 _NEAR_WORDS = 4  # a measure-word term binds to the attribute's own word only this close before the value
+_NOUN_WORDS = 2
+_PREPOSITION_PREFIX = ("ב", "ל")
+_FIRST_WORD = re.compile(r"\s*[^\W\d_][\w״׳]*")
 
 
 @dataclass(frozen=True)
@@ -458,6 +521,9 @@ class _Named:
     value: Decimal
     unit: units.Unit | None  # written after (or before) the number, else in a "label (unit):" label
     label: str
+    noun: tuple[str, ...] = ()  # the words right after the number (after its unit word), or a counted-noun unit
+    after: tuple[str, ...] = ()  # every word after the number (and its unit word) to the end of the clause
+    zero_word: bool = False
 
 
 def _named_values(quote: str, dimension: str | None) -> list[_Named]:
@@ -470,9 +536,54 @@ def _named_values(quote: str, dimension: str | None) -> list[_Named]:
             for q in sorted(found, key=lambda x: x.start):
                 label = clause[prev:q.start]
                 unit = q.unit or (units.parse_unit(label) if label.rstrip().endswith(":") else None)
-                out.append(_Named(q.value, unit, label))
-                prev = q.end
+                tail_from = q.unit_end if q.unit_end is not None else q.end
+                after = tuple(text_words(clause[tail_from:]))
+                if q.unit is not None and q.unit.code in units.COUNTED_NOUN_CODES:
+                    noun = tuple(text_words(clause[q.end:tail_from])) if q.unit_end is not None else \
+                        tuple(text_words(label)[-1:])
+                else:
+                    noun = after[:_NOUN_WORDS]
+                out.append(_Named(q.value, unit, label, noun, after, q.zero_word))
+                prev = tail_from
+                if dimension == "count" and q.unit_end is None and noun and (w := _FIRST_WORD.match(clause, q.end)):
+                    prev = w.end()  # "2 X בקומה 3": the next value's label starts after this one's noun
     return out
+
+
+def _own_value(named: list[_Named], value: Decimal, names: list[str]) -> _Named | None:
+    """The quote's value the mention reports: among equal numbers, the one its own noun or label names."""
+    same = [n for n in named if n.value == value]
+    return next((n for n in same if words_share(list(n.noun), names, roots=True)
+                 or _binds(n.label, "", names, last=_NEAR_WORDS)), same[0] if same else None)
+
+
+def _count_binding(own: _Named, unit: units.Unit | None, src: Source, names: list[str]) -> str:
+    """Whether a count's own words count the attribute: ``ok``, ``uncertain`` (review) or ``reject``.
+
+    A number counts the noun written with it: "בקומה 3" counts floors and "3 חדרים" rooms, so neither is a count
+    of anything else. A zero word must govern a word of the attribute ("אין X"); qualified, it is not a
+    plain zero ("אין X נוספת", "אין X בבניין הסמוך") and goes to review."""
+    labeled = _binds(own.label, "", names, last=_NEAR_WORDS) or (
+        src.col is not None and bool(src.label) and words_share(distinctive_words(src.label), names, roots=True))
+    if unit is not None and unit.code in units.COUNTED_NOUN_CODES:
+        nouns = list(own.noun) or list(units.COUNTED_NOUN_WORDS.get(unit.code, ()))
+        return "ok" if words_share(nouns, names, roots=True) else "reject"
+    if own.zero_word:
+        words = list(own.after)
+        if words and words[0].startswith(_PREPOSITION_PREFIX) and len(words) > 1 and not words_share(
+                words[:1], names, roots=True):
+            words = words[1:]  # "אין בדירה X"
+        if not words:
+            return "ok" if labeled else "uncertain"  # a cell or "label: אין": named by its label only
+        if not words_share(words[:1], names, roots=True):
+            return "reject"  # "אין צורך ב...", "אין מידע", "אין X" of another noun
+        rest = words[1:]
+        plain = all(words_share([w], names, roots=True) or (w.startswith(_PREPOSITION_PREFIX) and i == len(rest) - 1)
+                    for i, w in enumerate(rest))
+        return "ok" if plain else "uncertain"
+    if own.noun and not words_share(list(own.noun), names, roots=True) and not labeled:
+        return "uncertain"  # "3 X" where X is not a word of the attribute and nothing else names the value
+    return "ok"
 
 
 def _binds(label: str, term: str, names: list[str], *, last: int | None = None) -> bool:
@@ -486,19 +597,29 @@ def _binds(label: str, term: str, names: list[str], *, last: int | None = None) 
     return bool(nt and distinctive_words(nt) and nt in _match_norm(label))
 
 
-def _several(named: list[_Named], value: Decimal, unit: units.Unit, src: Source, term: str, names: list[str],
-             dimension: str | None) -> bool:
+def _several(named: list[_Named], value: Decimal, unit: units.Unit | None, src: Source, term: str,
+             names: list[str], dimension: str | None) -> bool:
     """Whether the quote states several values of the value's dimension with nothing that singles this one
-    out. A value is singled out when it is the only one whose own label names the attribute (a table row
-    rendered as text: "קומה: 3 | שטח X (מ״ר): 92 | שטח Y (מ״ר): 9.5"), or when it is a table cell whose
-    header or row label names the attribute and whose own text holds one value."""
-    same = [n for n in named if n.unit is not None and n.unit.dimension == unit.dimension]
+    out. A value is singled out when it is the only one whose own label (or, for a count, its own noun) names
+    the attribute (a table row rendered as text: "קומה: 3 | שטח X (מ״ר): 92 | שטח Y (מ״ר): 9.5"), or when it
+    is a table cell whose header or row label names the attribute and whose own text holds one value. A
+    unitless number is a value of a dimension that is written without a unit (a count, a year)."""
+    if unit is not None:
+        same = [n for n in named if n.unit is not None and n.unit.dimension == unit.dimension]
+    elif dimension in units.UNITLESS_OK:
+        same = [n for n in named if n.unit is None or n.unit.dimension == dimension]
+    else:
+        return False
     if len(same) <= 1:
         return False
     if src.col is not None and src.label and words_share(distinctive_words(src.label), names, roots=True) and \
             len(_named_values(src.text, dimension)) <= 1:
         return False
-    bound = [n for n in same if _binds(n.label, term, names)]
+    if dimension == "count":  # a count is named by its own noun; a label names only a value without one
+        bound = [n for n in same if words_share(list(n.noun), names, roots=True)
+                 or (not n.noun and _binds(n.label, term, names))]
+    else:
+        bound = [n for n in same if _binds(n.label, term, names)]
     return not (len(bound) == 1 and bound[0].value == value)
 
 
@@ -506,26 +627,47 @@ def _name_words(attribute: AttributeDef) -> list[str]:
     return [w for name in [attribute.label, *attribute.aliases] for w in distinctive_words(name)]
 
 
-def _naming(term: str, quote: str, src: Source, attribute: AttributeDef) -> bool | str:
+def _found_in(term: str, where: str) -> bool:
+    """The naming term occurs in ``where``: verbatim, or each of its words in some form of the same word
+    (plural for singular, with or without a prefix), in order of appearance or not."""
+    if term in where:
+        return True
+    tw, ww = text_words(term), text_words(where)
+    return bool(tw) and all(words_share([w], ww) for w in tw)
+
+
+def _naming(term: str, quote: str, src: Source, attribute: AttributeDef,
+            others: Sequence[Sequence[str]] = ()) -> bool | str:
     """Whether the mention names the attribute. Returns the rejection reason, or ``synonym``: False when the
     term, or the cited cell's own label (column header and row label), shares a distinctive word with the
     attribute's names (the same word in another form, or a word of the same root: a verb and its noun);
     True when it is another phrasing (a value named that way goes to review, never straight into a figure).
-    The cell label names a value structurally; a quote's other words name it only as the value's own label
-    (``validate_mention``)."""
+    A term or cell label whose distinctive words all name another attribute of the office, and not this one,
+    rejects the value (``other_attribute``): its words say what the value is. The cell label names a value structurally; a
+    quote's other words name it only as the value's own label (``validate_mention``)."""
     nt = _quote_form(term.strip(_QUOTE_EDGES))
     where = _quote_form(quote) + " " + _quote_form(src.context or "")
-    if not nt or nt not in where:
+    if not nt or not _found_in(nt, where):
         return "attribute_term_not_found"
     term_words = distinctive_words(nt)
     names = [attribute.label, *attribute.aliases]
     name_words = _name_words(attribute)
-    if src.label and words_share(distinctive_words(src.label), name_words, roots=True):
+    label_words = distinctive_words(src.label) if src.label else []
+    if label_words and words_share(label_words, name_words, roots=True):
         return False
     if not term_words:
         generic_names = [name for name in names if not distinctive_words(name)]
         return False if any(_match_norm(n) in where for n in generic_names) else "generic_term"
-    return not words_share(term_words, name_words, roots=True)
+    if words_share(term_words, name_words, roots=True):
+        return False
+    if any(_covered(term_words, o) or _covered(label_words, o) for o in others):
+        return "other_attribute"
+    return True
+
+
+def _covered(words: list[str], names: Sequence[str]) -> bool:
+    """Every word is a form of a word of ``names``: the words name that attribute and nothing more."""
+    return bool(words) and all(words_share([w], list(names)) for w in words)
 
 
 def _value_key(a: Accepted):
@@ -540,8 +682,8 @@ def fact_rows(accepted: list[Accepted], content: VersionContent) -> list[dict]:
     for a in subject:
         by_value.setdefault(_value_key(a), []).append(a)
     for group in by_value.values():
-        rep = next((a for a in group if not a.assumed), group[0])
-        clear = len(by_value) == 1 and not (rep.assumed or rep.synonym or rep.several)
+        rep = min(group, key=lambda a: (a.assumed, a.uncertain, a.synonym, a.several))
+        clear = len(by_value) == 1 and not (rep.assumed or rep.synonym or rep.several or rep.uncertain)
         rows.append(_row(rep, "subject", content.subject_key or f"doc:{content.document_id}",
                          "auto_validated" if clear else "needs_review"))
     seen = set()
@@ -587,23 +729,45 @@ def _version_live(conn: Connection, version_id: UUID) -> bool:
         " WHERE v.id = :v AND v.is_current"), {"v": version_id}).first() is not None
 
 
+def _settled_failure(detail: dict | None, age_seconds: float | None) -> bool:
+    """A failed read that is not tried again now: the provider refused or returned unusable output for this
+    document (a repeat call gives the same answer, so it stays failed, and counted as not extracted, until the
+    extraction version changes), or another failure younger than the retry cooldown."""
+    status = (detail or {}).get("status")
+    if status in DOCUMENT_FAILURES:
+        return True
+    return age_seconds is not None and age_seconds < EXTRACT_RETRY_COOLDOWN_SECONDS
+
+
 def ensure_pending(conn: Connection, versions: Sequence[VersionRef], attribute: AttributeDef, budget: int) -> list[UUID]:
-    """Versions that need a read for this attribute; their ledger entries become ``pending``
-    (failed and stale partial_scan entries are reset). Fresh entries are reused as they are."""
+    """Versions that need a read for this attribute; their ledger entries become ``pending``. Fresh entries are
+    reused as they are; a stale partial_scan is read again; a failed entry is read again only after a transient
+    failure and its cooldown (``_settled_failure``)."""
     ext = extraction_version(attribute)
     ids = [v.version_id for v in versions]
     states = {r.version_id: r for r in conn.execute(text(
-        "SELECT version_id, state, char_budget FROM fact_extraction_ledger WHERE attribute_id = :a"
-        " AND extraction_version = :e AND version_id = ANY(:ids)"), {"a": attribute.id, "e": ext, "ids": ids}).all()}
-    need = [v for v in versions if not (v.version_id in states and _fresh(
-        states[v.version_id].state, states[v.version_id].char_budget, budget))]
-    for v in need:
+        "SELECT version_id, state, char_budget, detail, extract(epoch FROM now() - updated_at) AS age"
+        " FROM fact_extraction_ledger WHERE attribute_id = :a AND extraction_version = :e"
+        " AND version_id = ANY(:ids)"), {"a": attribute.id, "e": ext, "ids": ids}).all()}
+
+    def settled(v: VersionRef) -> bool:
+        r = states.get(v.version_id)
+        if r is None:
+            return False
+        if r.state == "failed":
+            return _settled_failure(r.detail, float(r.age) if r.age is not None else None)
+        return _fresh(r.state, r.char_budget, budget)
+
+    need = [v for v in versions if not settled(v)]
+    reset = [v for v in need if states.get(v.version_id) is None or states[v.version_id].state != "pending"]
+    if reset:
         conn.execute(text(
             "INSERT INTO fact_extraction_ledger (office_id, document_id, version_id, attribute_id, extraction_version,"
-            " state) VALUES (app_office(), :d, :v, :a, :e, 'pending') ON CONFLICT (version_id, attribute_id,"
-            " extraction_version) DO UPDATE SET state = 'pending', updated_at = now()"
-            " WHERE fact_extraction_ledger.state <> 'pending'"),
-            {"d": v.document_id, "v": v.version_id, "a": attribute.id, "e": ext})
+            " state) SELECT app_office(), d, v, :a, :e, 'pending' FROM unnest(CAST(:docs AS uuid[]),"
+            " CAST(:vers AS uuid[])) AS t(d, v) ON CONFLICT (version_id, attribute_id, extraction_version)"
+            " DO UPDATE SET state = 'pending', updated_at = now() WHERE fact_extraction_ledger.state <> 'pending'"),
+            {"a": attribute.id, "e": ext, "docs": [v.document_id for v in reset],
+             "vers": [v.version_id for v in reset]})
     return [v.version_id for v in need]
 
 
@@ -672,14 +836,15 @@ def extract_version(tx: TxFactory, ctx: TenantContext, attribute: AttributeDef, 
         if guard is not None and (reason := guard(conn)):
             return VersionOutcome(version_id, None, skipped=reason)
         content = read_version(conn, attribute, version_id, budget)
+        others = other_attribute_names(conn, attribute)
     if content is None:
         return VersionOutcome(version_id, None, skipped="version_unavailable")
     if deadline is not None and time.monotonic() >= deadline:
         return VersionOutcome(version_id, None, skipped="deadline")
     instructions, prompt = build_prompt(attribute, content)
     try:
-        result = provider.structured(Purpose.EXTRACT, instructions, prompt, ExtractionOutput,
-                                     max_output_tokens=EXTRACT_MAX_OUTPUT_TOKENS)
+        result = llm.call_structured(provider, Purpose.EXTRACT, instructions, prompt, ExtractionOutput,
+                                     deadline=deadline, max_output_tokens=EXTRACT_MAX_OUTPUT_TOKENS)
     except Exception as exc:  # noqa: BLE001 - a provider crash is a failed extraction, never a crashed turn
         logger.warning("extraction call for version %s failed: %s", version_id, type(exc).__name__)
         result = StructuredResult(CallStatus.ERROR, detail=type(exc).__name__)
@@ -692,7 +857,7 @@ def extract_version(tx: TxFactory, ctx: TenantContext, attribute: AttributeDef, 
     accepted: list[Accepted] = []
     reasons: list[str] = []
     for m in result.parsed.mentions:
-        verdict = validate_mention(m, content, attribute)
+        verdict = validate_mention(m, content, attribute, others)
         if isinstance(verdict, str):
             reasons.append(verdict)
             logger.info("extraction mention rejected: %s (version %s, attribute %s, source %s)",
@@ -788,6 +953,7 @@ class FactComputation:
     deadline_reached: bool = False
     value_filter: dict | None = None
     value_type: str = "numeric"
+    audit: dict = field(default_factory=dict)
 
 
 def _check_operation(operation: str) -> None:
@@ -863,18 +1029,50 @@ def _source(f, titles: dict[UUID, str], tier: str, textual: bool = False) -> dic
             "status": f.status, "tier": tier}
 
 
+def _version_states(ledger_state: str | None) -> str:
+    if ledger_state in ("pending", "failed", None):
+        return "not_yet_extracted"
+    if ledger_state == "partial_scan":
+        return "partial_scan"
+    return "not_stated"  # not_stated, or found with no usable subject value and nothing awaiting review
+
+
+def completeness(cov: dict, observations: int, operation: str) -> str:
+    """Whether a figure can stand for the document set (``complete``), only for the observations found
+    (``subset``: stated over those observations, with the gaps named), or not at all (``insufficient``).
+
+    Gaps are documents whose value is unknown or held back: not yet read (pending, failed, read only partly),
+    values awaiting review or in conflict, and documents whose metadata could not be checked against the
+    filters. A document that does not state the datum is not a gap. No figure is given when nothing was
+    observed, for a sum with any gap (a sum over part of the documents is not their sum), or when more documents
+    are unread than values were found (the figure would describe the reading so far, not the documents)."""
+    unread = cov.get("not_yet_extracted", 0) + cov.get("partial_scan", 0)
+    gaps = unread + cov.get("awaiting_review", 0) + cov.get("unknown_metadata", 0)
+    if gaps == 0:
+        return "complete"
+    if observations == 0 or operation == "sum" or unread > observations:
+        return "insufficient"
+    return "subset"
+
+
 def compute_facts(conn: Connection, attribute: AttributeDef, filters: MetadataFilters | None, operation: str, *,
                   dset: DocumentSet | None = None, trusted_only: bool = False,
                   value_filter: ValueFilter | None = None,
                   document_ids: Sequence[UUID] | None = None) -> FactComputation:
     """Read-only computation over stored facts and ledger states under the connection's RLS (no extraction).
 
-    Facts are deduplicated per entity key; an entity whose visible values differ is flagged in
-    ``conflicts`` and goes to review, unless its reviewed values agree. ``trusted_only`` drops the
-    preliminary figure (used when extraction is unavailable). ``document_ids`` restricts the document set
-    (a question about one property computes over its documents only, never across the repository);
-    ``value_filter`` keeps the entities whose value passes it. A text attribute's values are compared and
-    counted as normalized text."""
+    Subject facts are grouped by entity key (the report's subject property), so a property appraised in two
+    documents is one observation: equal values count once (the second version is a ``duplicate``), differing
+    values are a conflict that goes to review. A reviewer's decision outlives a new extraction version:
+    verified and corrected facts of earlier versions still count, and a value a reviewer rejected is not
+    counted again when a new extraction finds it. ``trusted_only`` (extraction unavailable) uses reviewed
+    values only and counts unreviewed ones as awaiting review. ``document_ids`` restricts the document set (a
+    question about one property computes over its documents only); ``value_filter`` keeps the entities whose
+    value passes it. A text attribute's values are compared and counted as normalized text.
+
+    ``audit`` lists every version in scope with its state (used, duplicate, conflict, filtered_out,
+    awaiting_review, not_stated, partial_scan, not_yet_extracted) and value; ``completeness`` says whether
+    the figure may stand for the document set (see ``completeness``)."""
     _check_operation(operation)
     textual = attribute.value_type != "numeric"
     if textual and operation not in TEXT_OPERATIONS:
@@ -884,76 +1082,122 @@ def compute_facts(conn: Connection, attribute: AttributeDef, filters: MetadataFi
     ext = extraction_version(attribute)
     ids = dset.version_ids
     titles = {v.version_id: v.title for v in dset.versions}
+    doc_of = {v.version_id: v.document_id for v in dset.versions}
     ledger = conn.execute(text(
         "SELECT version_id, state, detail FROM fact_extraction_ledger WHERE attribute_id = :a"
         " AND extraction_version = :e AND version_id = ANY(:ids)"), {"a": attribute.id, "e": ext, "ids": ids}).all()
+    ledger_state = {r.version_id: r.state for r in ledger}
     states = Counter(r.state for r in ledger)
     states["pending"] += len(ids) - len(ledger)
     rows = conn.execute(text(
         "SELECT id, document_id, version_id, entity_role, entity_key, canonical_value, value_text, unit, quote,"
-        " source_path, status FROM facts WHERE attribute_id = :a AND extraction_version = :e"
-        " AND version_id = ANY(:ids) ORDER BY created_at, id"), {"a": attribute.id, "e": ext, "ids": ids}).all()
+        " source_path, status, extraction_version FROM facts WHERE attribute_id = :a AND version_id = ANY(:ids)"
+        " AND (extraction_version = :e OR status IN ('verified', 'corrected', 'rejected'))"
+        " ORDER BY created_at, id"), {"a": attribute.id, "e": ext, "ids": ids}).all()
 
     def value_of(f):
         return (_match_norm(f.value_text or "") or None) if textual else f.canonical_value
 
-    awaiting = sum(1 for f in rows if f.status == "needs_review")
+    refused = {(f.version_id, value_of(f)) for f in rows if f.status == "rejected"}
+    current = [f for f in rows if f.extraction_version == ext or f.status in TRUSTED]
+    usable_status = TRUSTED if trusted_only else (*TRUSTED, "auto_validated")
+    subject = [f for f in current if f.entity_role == "subject" and value_of(f) is not None
+               and f.status != "rejected" and not (f.status not in TRUSTED and (f.version_id, value_of(f)) in refused)]
+    usable = [f for f in subject if f.status in usable_status]
+    held = {f.version_id for f in subject if f.status not in usable_status and f.status != "rejected"}
     entities: dict[str, list] = {}
-    for f in rows:
-        if f.entity_role == "subject" and f.status in (*TRUSTED, "auto_validated") and value_of(f) is not None:
-            entities.setdefault(f.entity_key or f"doc:{f.document_id}", []).append(f)
+    for f in usable:
+        entities.setdefault(f.entity_key or f"doc:{f.document_id}", []).append(f)
+
     main_vals: list = []
     prelim_vals: list = []
     sources: list[dict] = []
     conflicts: list[dict] = []
+    version_state: dict[UUID, tuple[str, object, str | None, str | None]] = {}
     used_unreviewed = False
+    duplicates = 0
     for key, group in entities.items():
+        trusted = [f for f in group if f.status in TRUSTED]
+        basis = trusted or group
+        values = {value_of(f) for f in basis}
         if len({value_of(f) for f in group}) > 1:
-            conflicts.append({"entity_key": key, "values": [
+            conflicts.append({"entity_key": key, "included": len(values) == 1, "values": [
                 {"value": f.value_text if textual else f.canonical_value, "document_id": f.document_id,
                  "version_id": f.version_id, "title": titles.get(f.version_id),
                  "page": (f.source_path or {}).get("page"), "quote": f.quote, "status": f.status} for f in group]})
-        trusted = [f for f in group if f.status in TRUSTED]
+        if len(values) > 1:
+            for f in group:
+                version_state.setdefault(f.version_id, ("conflict", value_of(f), None, key))
+            continue
+        value = value_of(basis[0])
+        tier = "verified" if trusted else "preliminary"
+        first = basis[0]
+        if not trusted:
+            used_unreviewed = True  # evaluated, even when the filter leaves it out
+        if keep is not None and not keep(value):
+            for f in group:
+                version_state.setdefault(f.version_id, ("filtered_out", value, tier, key))
+            continue
         if trusted:
-            if len({value_of(f) for f in trusted}) == 1:
-                value = value_of(trusted[0])
-                if keep is None or keep(value):
-                    main_vals.append(value)
-                    prelim_vals.append(value)
-                    sources.append(_source(trusted[0], titles, "verified", textual))
+            main_vals.append(value)
+        prelim_vals.append(value)
+        sources.append(_source(first, titles, tier, textual))
+        version_state[first.version_id] = ("used", value, tier, key)
+        for f in group:
+            if f.version_id in version_state:
+                continue
+            if value_of(f) != value:  # an unreviewed value a reviewed one overrides
+                version_state[f.version_id] = ("conflict", value_of(f), None, key)
             else:
-                awaiting += 1
-        elif not trusted_only:
-            if len({value_of(f) for f in group}) == 1:
-                used_unreviewed = True  # evaluated, even when the filter leaves it out
-                value = value_of(group[0])
-                if keep is None or keep(value):
-                    prelim_vals.append(value)
-                    sources.append(_source(group[0], titles, "preliminary", textual))
-            else:
-                awaiting += 1
+                version_state[f.version_id] = ("duplicate", value, tier, key)
+                duplicates += 1
+
+    documents = []
+    for vid in ids:
+        if vid in version_state:
+            state, value, tier, key = version_state[vid]
+        else:
+            state, value, tier, key = ("awaiting_review" if vid in held else _version_states(ledger_state.get(vid)),
+                                       None, None, None)
+        documents.append({"document_id": str(doc_of.get(vid)), "version_id": str(vid), "title": titles.get(vid),
+                          "state": state, "value": None if value is None else str(value), "tier": tier,
+                          "entity_key": key})
+    by_state = Counter(d["state"] for d in documents)
     coverage = {
-        "in_scope": len(ids), **{s: states.get(s, 0) for s in LEDGER_STATES},
-        "not_yet_extracted": states.get("pending", 0) + states.get("failed", 0),
-        "awaiting_review": awaiting,
+        "in_scope": len(ids),
+        **{s: states.get(s, 0) for s in LEDGER_STATES},
+        "found": sum(by_state[s] for s in ("used", "duplicate", "conflict", "filtered_out")),
+        "not_stated": by_state["not_stated"],
+        "partial_scan": by_state["partial_scan"],
+        "not_yet_extracted": by_state["not_yet_extracted"],
+        "awaiting_review": by_state["awaiting_review"] + sum(1 for c in conflicts if not c["included"]),
         "rejected": sum(1 for f in rows if f.status == "rejected"),
         "mentions_rejected": sum(int((r.detail or {}).get("rejected") or 0) for r in ledger),
         "unknown_metadata": len(dset.unknown_metadata),
         "conflicts": len(conflicts),
+        "duplicates": duplicates,
     }
     pending_jobs = len(jobs.active_extract_jobs(conn, attribute.id, ext, ids))
     facts_version = conn.execute(text("SELECT facts_version FROM attribute_definitions WHERE id = :a"),
                                  {"a": attribute.id}).scalar()
     partial = coverage["not_yet_extracted"] > 0
     figure = text_figure if textual else aggregate
+    main = figure(main_vals, operation)
+    preliminary = figure(prelim_vals, operation) if used_unreviewed else None
+    shown = preliminary if preliminary is not None else main
+    audit = {"attribute": attribute.label, "operation": operation,
+             "unit": None if textual else attribute.canonical_unit or canonical_unit_for(attribute.unit_dimension),
+             "completeness": completeness(coverage, by_state["used"] + by_state["filtered_out"], operation),
+             "in_scope": len(ids),
+             "unknown_metadata": len(dset.unknown_metadata), "observations": shown.n, "duplicates_merged": duplicates,
+             "value_filter": value_filter.describe() if value_filter else None, "documents": documents}
     return FactComputation(
         attribute_id=attribute.id, attribute_label=attribute.label,
-        unit=None if textual else attribute.canonical_unit or canonical_unit_for(attribute.unit_dimension),
-        operation=operation, extraction_version=ext, main=figure(main_vals, operation),
-        preliminary=figure(prelim_vals, operation) if used_unreviewed else None,
+        unit=audit["unit"], operation=operation, extraction_version=ext, main=main, preliminary=preliminary,
         coverage=coverage, sources=sources, conflicts=conflicts, pending_jobs=pending_jobs, partial=partial,
         cacheable=not partial, facts_version=facts_version,
-        value_filter=value_filter.describe() if value_filter else None, value_type=attribute.value_type)
+        value_filter=value_filter.describe() if value_filter else None, value_type=attribute.value_type,
+        audit=audit)
 
 
 def coverage_text(cov: dict) -> str:

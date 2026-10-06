@@ -50,6 +50,8 @@ class Quantity:
     unit: Unit | None
     start: int  # span of the number in the normalized text
     end: int
+    unit_end: int | None = None  # end of the unit word when it is written after the number
+    zero_word: bool = False  # "אין" / "ללא": a stated absence read as zero
 
 
 @dataclass(frozen=True)
@@ -114,6 +116,11 @@ for _n, _words in _ONES.items():
             for _ten in ("עשר", "עשרה"):
                 NUMBER_WORDS[f"{_w} {_ten}"] = 10 + _n
 ZERO_WORDS = frozenset({"אין", "ללא"})
+# Units that are counted nouns: a count of floors, rooms or dwellings is a count of that noun only, never of
+# whatever else the attribute counts ("2 X בקומה 3": the 3 counts floors, not X).
+COUNTED_NOUN_CODES = frozenset({"floor", "room", "dwelling_unit"})
+COUNTED_NOUN_WORDS: dict[str, tuple[str, ...]] = {
+    code: tuple(w for w, u in _SURFACES.items() if u.code == code) for code in COUNTED_NOUN_CODES}
 
 
 def _norm(text: str) -> str:
@@ -124,14 +131,20 @@ def _ends_word(text: str, end: int) -> bool:
     return end >= len(text) or not _WORDY.match(text[end])
 
 
-def _unit_after(text: str, end: int) -> Unit | None:
+def _unit_after_span(text: str, end: int) -> tuple[Unit, int] | None:
+    """The unit written right after ``end`` and where its word ends."""
     rest = text[end:]
     stripped = rest.lstrip()
     offset = end + len(rest) - len(stripped)
     for surface in _ORDERED:
         if stripped.startswith(surface) and (surface == "%" or _ends_word(text, offset + len(surface))):
-            return _SURFACES[surface]
+            return _SURFACES[surface], offset + len(surface)
     return None
+
+
+def _unit_after(text: str, end: int) -> Unit | None:
+    found = _unit_after_span(text, end)
+    return found[0] if found else None
 
 
 def _unit_before(text: str, start: int) -> Unit | None:
@@ -156,8 +169,9 @@ def find_quantities(text: str) -> list[Quantity]:
             value = Decimal(m.group(0))
         except InvalidOperation:  # pragma: no cover - the pattern only matches decimals
             continue
-        unit = _unit_after(norm, m.end()) or _unit_before(norm, m.start())
-        out.append(Quantity(value, unit, m.start(), m.end()))
+        after = _unit_after_span(norm, m.end())
+        unit = after[0] if after else _unit_before(norm, m.start())
+        out.append(Quantity(value, unit, m.start(), m.end(), after[1] if after else None))
     return out
 
 
@@ -214,8 +228,10 @@ def find_word_quantities(text: str, *, with_zero: bool = True) -> list[Quantity]
             continue
         value, used = found
         start, end = tokens[i].start(), tokens[i + used - 1].end()
-        unit = _unit_after(norm, end) or _unit_before(norm, start)
-        out.append(Quantity(Decimal(value), unit, start, end))
+        after = _unit_after_span(norm, end)
+        unit = after[0] if after else _unit_before(norm, start)
+        zero = value == 0 and any(v in ZERO_WORDS for v in _bare_variants(tokens[i].group(0)))
+        out.append(Quantity(Decimal(value), unit, start, end, after[1] if after else None, zero))
         i += used
     return out
 

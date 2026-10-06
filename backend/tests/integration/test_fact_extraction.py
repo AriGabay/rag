@@ -6,6 +6,7 @@ import hashlib
 import logging
 import re
 import time
+from collections import Counter
 from decimal import Decimal
 
 import pytest
@@ -163,9 +164,13 @@ def test_ae7_nine_versions_mixed_outcomes(office, limits):
 
     comp = compute(office.ctx(), attr)
     cov = comp.coverage
-    assert (cov["in_scope"], cov["found"], cov["not_stated"], cov["partial_scan"]) == (9, 5, 2, 0)
+    # "found" counts documents with a usable value; "דוח 5" (bare meters, an assumption) awaits review
+    assert (cov["in_scope"], cov["found"], cov["not_stated"], cov["partial_scan"]) == (9, 4, 2, 0)
     assert (cov["pending"], cov["failed"], cov["not_yet_extracted"]) == (2, 0, 2)
     assert cov["awaiting_review"] == 1 and cov["unknown_metadata"] == 0
+    states = Counter(d["state"] for d in comp.audit["documents"])
+    assert states == {"used": 4, "awaiting_review": 1, "not_stated": 2, "not_yet_extracted": 2}
+    assert comp.audit["completeness"] == "subset"  # 3 gaps against 4 observations
     assert (comp.main.value, comp.main.n, comp.main.values) == (Decimal("12.00"), 2, [Decimal("10"), Decimal("14")])
     assert comp.preliminary is not None
     assert (comp.preliminary.value, comp.preliminary.n) == (Decimal("11.00"), 4)
@@ -421,11 +426,31 @@ def test_provider_error_in_job_leaves_version_ready_and_later_turn_requeues(offi
     failed = compute(office.ctx(), attr)
     assert (failed.coverage["failed"], failed.coverage["not_yet_extracted"]) == (1, 1)
 
+    # within the retry cooldown the next turn does not send the document again
+    soon = extract(office.ctx(), attr, ScriptedProvider())
+    assert soon.pending_jobs == 0 and ledger(office, attr) == {"דוח": "failed"}
+
+    monkeypatch.setattr(facts, "EXTRACT_RETRY_COOLDOWN_SECONDS", 0)
     again = extract(office.ctx(), attr, ScriptedProvider())
     assert again.pending_jobs == 1 and ledger(office, attr) == {"דוח": "pending"}
     with tenant_tx(office.system) as conn:
         job = conn.execute(text("SELECT status, attempts FROM jobs")).one()
     assert (job.status, job.attempts) == ("queued", 0)
+
+
+def test_a_document_specific_failure_is_not_sent_again_on_every_turn(office, limits, monkeypatch):
+    """A refusal or unusable output for one document gives the same answer again: the next turns do not repeat
+    the call; the document stays counted as not extracted."""
+    limits(sync=3)
+    monkeypatch.setattr(facts, "EXTRACT_RETRY_COOLDOWN_SECONDS", 0)
+    attr = make_attr(office)
+    add_doc(office, office.default_group_id, "דוח", ["ממ״ד בשטח 12 מ״ר"])
+    refusing = ScriptedProvider().on(Purpose.EXTRACT, CallStatus.REFUSAL, repeat=True)
+    first = extract(office.ctx(), attr, refusing)
+    assert len(extract_calls(refusing)) == 1 and ledger(office, attr) == {"דוח": "failed"}
+    second = extract(office.ctx(), attr, refusing)
+    assert len(extract_calls(refusing)) == 1
+    assert first.coverage["not_yet_extracted"] == second.coverage["not_yet_extracted"] == 1
 
 
 def test_deadline_stops_new_calls_and_queues_the_rest(office):
@@ -608,18 +633,30 @@ def test_plural_or_singular_of_the_attribute_name_is_the_same_name(office):
 
 
 def test_counts_written_as_words_and_none_as_zero(office):
-    """GQ31 / GQ36: "שתי חניות", "מקום חניה אחד", "אין חניה" are 2, 1 and 0."""
+    """GQ31 / GQ36: "שתי חניות", "מקום חניה אחד", "אין חניה" are 2, 1 and 0. A zero word qualified by a word the
+    attribute does not name ("אין חניה צמודה" for "מספר מקומות חניה": no *attached* parking) is not a plain zero:
+    it is kept for review, out of the figure."""
     attr = make_attr(office, "מספר מקומות חניה", "count")
     p = ScriptedProvider()
     for title, sentence, quote, value, term in (
             ("א", "לדירה שתי חניות תת-קרקעיות.", "שתי חניות תת-קרקעיות", "2", "חניות"),
             ("ב", "לדירה מקום חניה אחד בחניון הבניין.", "מקום חניה אחד בחניון הבניין", "אחד", "מקום חניה"),
-            ("ג", "לדירה אין חניה צמודה.", "לדירה אין חניה צמודה", "0", "חניה")):
+            ("ג", "לדירה אין חניה.", "לדירה אין חניה", "0", "חניה"),
+            ("ד", "לדירה אין חניה צמודה.", "לדירה אין חניה צמודה", "0", "חניה")):
         add_doc(office, office.default_group_id, title, [sentence])
         script(p, title, mention(quote, value, unit=None, term=term))
     comp = extract(office.ctx(), attr, p, operation="values")
     assert comp.preliminary.values == [Decimal("0"), Decimal("1"), Decimal("2")]
     assert comp.coverage["mentions_rejected"] == 0
+    assert comp.coverage["awaiting_review"] == 1  # "ד": the qualified zero
+
+    attached = make_attr(office, "מספר מקומות חניה צמודים לדירה", "count")
+    p2 = ScriptedProvider()
+    script(p2, "ד", mention("לדירה אין חניה צמודה", "0", unit=None, term="חניה"))
+    for title in ("א", "ב", "ג"):
+        script(p2, title)
+    comp = extract(office.ctx(), attached, p2, operation="values")
+    assert Decimal("0") in comp.preliminary.values  # the attribute names the qualifier: a plain zero
 
 
 def test_inner_dimensions_give_an_area_for_review(office):
@@ -630,7 +667,9 @@ def test_inner_dimensions_give_an_area_for_review(office):
     script(p, "דוח", mention("ממ״ד במידות פנים של 300 על 350 ס״מ", "300 על 350", unit="ס״מ", term="ממ״ד"))
     comp = extract(office.ctx(), attr, p)
     assert comp.preliminary is None and comp.main.n == 0
-    assert comp.coverage["found"] == 1 and comp.coverage["awaiting_review"] == 1
+    assert comp.coverage["found"] == 0 and comp.coverage["awaiting_review"] == 1
+    assert [d["state"] for d in comp.audit["documents"]] == ["awaiting_review"]
+    assert comp.audit["completeness"] == "insufficient"
     (row,) = facts_rows(office, attr)
     assert (row.canonical_value, row.status, row.source_path["assumed_unit"]) == (Decimal("10.5"), "needs_review", True)
 
@@ -865,3 +904,43 @@ def test_a_mention_citing_a_row_instead_of_its_cell_is_resolved_by_its_quote(off
     add_doc(office, office.default_group_id, "דוח ב", ["גובה תקרה: 2.80 מ׳"])
     script(p2, "דוח ב", mention("גובה תקרה 3.10 מ׳", "3.10", source="T9R9", unit="מ׳", term="גובה תקרה"))
     assert extract(office.ctx(), height, p2).coverage["mentions_rejected"] >= 1
+
+
+def resolve_in(office, description, dimension="area", **kw):
+    with tenant_tx(office.ctx()) as conn:
+        return resolve_attribute(conn, handle=None, description=description, unit_dimension=dimension, **kw)
+
+
+def test_a_rephrased_question_reuses_extracted_facts_without_reading_again(office):
+    """Item 3: once a datum is extracted and validated, another phrasing of the same attribute (another form of
+    its words) reaches the same definition and computes from the stored facts: no model call."""
+    first = resolve_in(office, "שטח המחסן")
+    p = ScriptedProvider()
+    for title, v in (("א", "6"), ("ב", "9")):
+        add_doc(office, office.default_group_id, title, [f"לדירה מחסן בשטח {v} מ״ר."])
+        script(p, title, mention(f"מחסן בשטח {v} מ״ר", v, term="מחסן"))
+    before = extract(office.ctx(), first, p)
+    assert len(extract_calls(p)) == 2 and before.preliminary.value == Decimal("7.50")
+
+    again = resolve_in(office, "שטח המחסנים")
+    assert again.id == first.id and not again.created
+    silent = ScriptedProvider()
+    after = extract(office.ctx(), again, silent)
+    assert extract_calls(silent) == [] and after.preliminary.value == Decimal("7.50")
+    assert after.audit["completeness"] == "complete"
+
+
+def test_naming_the_dimension_later_replaces_unreviewed_facts_instead_of_adding_to_them(office):
+    with tenant_tx(office.ctx()) as conn:
+        loose = resolve_attribute(conn, handle=None, description="נפח המיכל", unit_dimension=None)
+    p = ScriptedProvider()
+    add_doc(office, office.default_group_id, "א", ["נפח המיכל 3 מ״ק."])
+    script(p, "א", mention("נפח המיכל 3 מ״ק", "3", unit="מ״ק", term="נפח המיכל"))
+    extract(office.ctx(), loose, p)
+    assert len(facts_rows(office, loose)) == 1
+    with tenant_tx(office.ctx()) as conn:
+        dimensioned = resolve_attribute(conn, handle=None, description="נפח המיכל", unit_dimension="volume")
+    assert dimensioned.id == loose.id and dimensioned.unit_dimension == "volume"
+    assert facts_rows(office, loose) == []  # the re-read replaces them
+    comp = extract(office.ctx(), dimensioned, p)
+    assert len(facts_rows(office, loose)) == 1 and comp.preliminary.value == Decimal("3.00")

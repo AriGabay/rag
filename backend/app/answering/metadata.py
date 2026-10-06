@@ -139,6 +139,11 @@ def _page_headers(conn: Connection, version_ids: Sequence[UUID]) -> dict[UUID, d
     return {vid: {k: fv.value for k, fv in parse_header(p).fields.items()} for vid, p in pages.items()}
 
 
+def report_header(conn: Connection, version_id: UUID) -> dict:
+    """The "label: value" header fields of one version's first pages (block_parcel is a tuple)."""
+    return _page_headers(conn, [version_id]).get(version_id) or {}
+
+
 def header_places(conn: Connection) -> set[tuple[str | None, str]]:
     """(city, neighborhood) pairs and (None, city) entries named by the headers of current, visible
     narrative reports (versions without records), so the gazetteer knows places those reports cover."""
