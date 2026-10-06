@@ -427,7 +427,9 @@ def normalize_model_plan(plan: TurnPlan, state: ConversationState | None = None,
     - An attribute ordered or aggregated as a number is numeric, whatever type the model gave it.
     - A computation always carries a computation step.
     - A change to a pending clarification is accepted only as described in ``_relation``.
-    - A place condition the question does not name is dropped (``_grounded_places``)."""
+    - A place condition the question does not name is dropped (``_grounded_places``).
+    - A referent clarification on a new, self-contained question with nothing to execute (no step, entity,
+      attribute or comparison) is answered by searching the question as asked."""
     meta = plan.turn_relation in ("meta_why", "meta_sources")
     plan = _grounded_places(plan, question)
     relation = _relation(plan, state)
@@ -445,6 +447,13 @@ def normalize_model_plan(plan: TurnPlan, state: ConversationState | None = None,
         task = state.task_type  # "ומה לגבי X?" after a computation: the same computation, one condition changed
         computes = True
     clarification = plan.clarification
+    if (clarification is not None and clarification.key == "referent" and question and relation == "new_question"
+            and not steps and not plan.search_queries and not named and not plan.entities):
+        # "Which appraisal mentions X?" asked back as "which appraisal do you mean?": a new, self-contained
+        # question with nothing to compare is searched as asked; the answer shows what the documents hold
+        steps = [Step(tool="search", attribute_handle=None, source_handles=[])]
+        plan = plan.model_copy(update={"search_queries": [question]})
+        clarification, task = None, "answer"
     executable = bool(steps or plan.search_queries or named)
     if clarification is not None or task == "clarify":
         keep = not executable or (clarification is not None and (

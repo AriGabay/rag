@@ -401,3 +401,21 @@ def test_a_change_with_nothing_pending_that_states_a_condition_is_a_follow_up():
     p = normalize_model_plan(_model_plan(task_type="compute", turn_relation="change_clarification",
                                          conditions={"city": "תל אביב-יפו"}), state, "ובתל אביב?")
     assert p.turn_relation == "follow_up"
+
+
+def test_a_self_contained_new_question_is_searched_instead_of_asked_back():
+    """Existing set T10, round 8: "באיזו שומה הנכס נבדק מבחוץ בלבד?" was asked back as "which appraisal do you
+    mean?" with nothing to execute. A new question with nothing to compare is searched as asked."""
+    from app.answering.plan import normalize_model_plan
+
+    q = "באיזו שומה הנכס נבדק מבחוץ בלבד?"
+    p = normalize_model_plan(_model_plan(task_type="clarify", clarification="referent"), None, q)
+    assert p.clarification is None and p.task_type == "answer"
+    assert [s.tool for s in p.steps] == ["search"] and p.search_queries == [q]
+    # a follow-up with nothing to refer to, and a comparison without sides, still ask
+    follow = normalize_model_plan(_model_plan(task_type="clarify", clarification="referent",
+                                              turn_relation="follow_up"), None, "ומה לגבי זה?")
+    assert follow.clarification is not None
+    compare = normalize_model_plan(_model_plan(task_type="clarify", clarification="referent", tools=["compare"]),
+                                   None, "השווה בין השומות")
+    assert compare.clarification is not None
