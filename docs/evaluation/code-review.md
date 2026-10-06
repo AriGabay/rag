@@ -110,3 +110,32 @@ The diagnosis also found defect classes that this PR does **not** fix. They are 
 - **S10. Units.** The column-header unit overrides "למ״ר לחודש" in the row label, and there is no rent-period dimension.
 - **S12. Abstention kind.** A scoped search with no supported passage says `not_found` instead of `not_stated`.
 - **S13. Values in thousands.** "X אלף ₪ למ״ר" parses as currency, not as currency per area.
+
+## Final review (changes since `05df270`)
+
+Three independent reviewers (correctness, adversarial, tests/reliability/security) reviewed the whole round's diff before the PR. Each finding was checked with a read-only probe. All of these are fixed, each with a counter-test:
+
+| finding | fix |
+|---|---|
+| A correctly named city was dropped by the grounding rule: defective spelling ("תקוה"), a hyphen ("רמת-גן"), an abbreviation ("ת״א"); found by all three reviewers | Place matching unifies spelling and hyphens and knows two-letter abbreviations |
+| One document counted as two properties when a reviewed fact of an older extraction version carried another entity key | Within one version, the reviewed fact's key wins |
+| A read cut by the turn deadline was recorded as `failed` and never queued | It is skipped as `deadline` and queued |
+| The dimension upgrade deleted facts and demoted reviewed ones under the user's permissions, with no history | It moves the definition to its own extraction version office-wide and deletes nothing |
+| Any number in a document title was exempt from layer 1 | Only the server's version suffix is |
+| The naming term matched scattered words ("שטח המגרש עליו בנויה הדירה 500" for "שטח הדירה") | The term must appear as a phrase, with at most one word between its words |
+| The quote-label override promoted a value the model itself named as another noun ("לדירה צמוד X בשטח 6") | The model's nearer noun keeps it in review. A qualifier right after the attribute's noun does not count |
+| Ordinals counted ("בקומה 3", "חדר 2"); counted nouns of the same unit were rejected ("12 יח״ד" for "יחידות דיור") | Ordinals are rejected or held for review; nouns of the same unit count |
+| Zero words with a place or a register ("ברחוב אין X", "אין X בטאבו") were plain zeros | Only a possessor ("לדירה אין X") may qualify a plain zero; anything else goes to review |
+| `other_attribute` rejected across dimensions | Only an attribute of the same type and a compatible dimension can claim a value |
+| "שווי למ״ר" merged with "שווי" | A rate ("ל" + unit) is a qualifier of identity |
+| "לא, X" chose the opposite option; one-digit numbers were dropped | Negation is scoped by punctuation; digits count |
+| A place reply to a place clarification was read as a new question; choosing a source started a comparison nobody asked for | The clarification's own fields are excluded; a referent answer resumes a comparison only for a comparison |
+| Continuations and pointing words ("ומתי?", "מה השטח שלה?") were searched as new questions | Wider continuation forms; a question that points back is never searched as self-contained |
+| Locate counted "אין צורך ב-X", "X לא תקינה" as absence of X; "X - לא" was missed | A negation may reach only over an existence word; after the term it must end the clause or deny existence; " - " is no break |
+| Strong partial locate matches listed documents matching one common word | At least two matched topic words, twice as many as the absent ones |
+| Attribute labels and aliases (user text) were not neutralized in the extraction prompt | Neutralized |
+
+**Left open, documented:**
+
+- A document whose extraction fails for its content (refusal, invalid or truncated output) stays "not yet extracted" until the extraction version changes. Nothing lets an admin retry it.
+- The absence-claim fallback detector (used only when the model does not fill the field) can read "לא נמצאו X בדוח" as an absence claim.

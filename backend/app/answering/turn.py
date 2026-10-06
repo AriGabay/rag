@@ -109,6 +109,7 @@ from app.answering.templates import (
 from app.appraisal.query import compute_records, sources_for, uncertain_duplicates
 from app.config import get_settings
 from app.db import TenantContext, current_data_version, tenant_tx
+from app.extraction.normalize_text import base_normalize, prefix_variants
 from app.platform.documents import source_file_url
 from app.platform.search import SearchScope, locate_evidence, search_evidence
 from app.providers.embeddings import get_embedding_provider
@@ -992,7 +993,11 @@ def _locate(run: _Run) -> dict:
     run.step("locate", {"queries": queries, "filters": filters.__dict__ if filters else None,
                         "documents": [str(x) for x in scope.document_ids] if scope else None},
              {"evidence": len(evidence), "documents": len(docs)}, f"{len(docs)} מסמכים")
-    absent = list(getattr(out, "absent_terms", None) or [])
+    # only the user's own words can be "absent": a word the interpreter's rephrasing added ("מיליון" for "מ׳")
+    # that occurs in no document says nothing about the question
+    words = [w.strip(".,:;?!\"'") for w in base_normalize(run.question).split()]
+    asked = {f for w in words if w for f in (w, *prefix_variants(w))}
+    absent = [t for t in (getattr(out, "absent_terms", None) or []) if t in asked]
     absent_note = f"המילים {', '.join('«' + t + '»' for t in absent)} לא נמצאו באף מסמך בתחום." if absent else ""
     if not evidence:
         kind = no_evidence_kind(run.ctx)
@@ -1007,12 +1012,12 @@ def _locate(run: _Run) -> dict:
         # strong: the words found carry the question (at least two, twice as many as the words found nowhere);
         # a qualifier found nowhere next to one common word ("X מוצף") lists nothing
         strong = [(d, found) for d, found in docs if set(d.missing_terms) <= set(absent)
-                  and len(d.matched_terms) >= max(2, 2 * len(absent))]
+                  and _topic_matches(d) >= max(2, 2 * len(absent))]
         if strong:
             docs = strong
             evidence = [e for _, found in strong for e in found]
     if absent and not any(d.full_support for d, _ in docs) and not any(
-            set(d.missing_terms) <= set(absent) and len(d.matched_terms) >= max(2, 2 * len(absent))
+            set(d.missing_terms) <= set(absent) and _topic_matches(d) >= max(2, 2 * len(absent))
             for d, _ in docs):
         kind = no_evidence_kind(run.ctx)
         lines = [ABSTENTION_TEXT[kind], absent_note, "מסמכים שבהם נמצאו רק חלק ממילות השאלה:"]
@@ -1034,6 +1039,11 @@ def _locate(run: _Run) -> dict:
     return {"kind": "content", "text": "\n".join(lines), "provider": "template", "demo": False,
             "sources": source_json(evidence), "coverage": cov, "numeric": None, "claims": [],
             "abstention_kind": None, "limitations": limitations}
+
+
+def _topic_matches(d) -> int:
+    """Matched words that can carry a topic: a number (a house number, a plan number) only places it."""
+    return sum(1 for w in d.matched_terms if not any(ch.isdigit() for ch in w))
 
 
 def _compare_sides(run: _Run, step: Step) -> list[CompareSide]:

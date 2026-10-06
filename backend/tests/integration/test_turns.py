@@ -945,3 +945,33 @@ def test_a_document_lacking_only_a_word_found_nowhere_is_listed_with_that_caveat
     ans = post(client, "באיזו שומה מוזכר חיזוק במסגרת תמ״א 38?")["answer"]
     assert ans["kind"] == "content" and "דוח 999" in ans["text"]
     assert any("«תמ״א»" in x for x in ans["limitations"])
+
+
+def test_a_word_only_the_rephrasing_added_never_blocks_the_document_the_user_asked_for(client, db, monkeypatch):
+    """Existing set T07, final run: the interpreter's variants added words found in no document; the document
+    holding every word the user wrote must still be listed."""
+    a = make_office(db, "משרד א", "admin-a@example.test")
+    add_chunks(a, a.default_group_id, ["השווי נקבע בסכום של כ-1.25 מ׳ ₪ לפי גישת ההשוואה."], "b" * 64)
+    add_chunks(a, a.default_group_id, ["הדירה ממוקמת בקומה שלישית ופונה לחזית."], "d" * 64)
+    add_chunks(a, a.default_group_id, ["בבניין ארבע קומות ומעלית אחת."], "e" * 64)
+    p = ScriptedProvider().on(Purpose.INTERPRET, plan(
+        task_type="locate", search_queries=["סכום כ-1.25 מיליון שקלים"],
+        steps=[{"tool": "locate", "attribute_handle": None, "source_handles": []}]))
+    enable_cloud(a, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    ans = post(client, "באיזה מסמך מופיע סכום של כ-1.25 מ׳ ₪?")["answer"]
+    assert ans["kind"] == "content" and "דוח bbb" in ans["text"]
+
+
+def test_an_address_alone_does_not_list_a_document_for_a_topic_found_nowhere(client, db, monkeypatch):
+    """Final run, GQ43: "what is written about X at Y 18" with X in no document: the document at that address
+    is a near source at most, never the answer."""
+    a = make_office(db, "משרד א", "admin-a@example.test")
+    add_chunks(a, a.default_group_id, ["הנכס ברחוב הדקלים 18 הוא דירת 4 חדרים."], "c" * 64)
+    p = ScriptedProvider().on(Purpose.INTERPRET, plan(
+        task_type="locate", search_queries=["סאונה הדקלים 18"],
+        steps=[{"tool": "locate", "attribute_handle": None, "source_handles": []}]))
+    enable_cloud(a, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    ans = post(client, "מה נכתב על סאונה בהדקלים 18?")["answer"]
+    assert ans["kind"] == "abstain"
