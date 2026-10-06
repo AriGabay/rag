@@ -157,12 +157,25 @@ export const api = {
   me: () => request<MeResponse>("/api/auth/me"),
 
   // Documents
-  upload: (files: File[], groupId: string, documentId?: string) => {
-    const fd = new FormData();
-    for (const f of files) fd.append("files", f, f.name);
-    fd.append("group_id", groupId);
-    if (documentId) fd.append("document_id", documentId);
-    return request<{ results: UploadResult[] }>("/api/documents", { method: "POST", body: fd });
+  // One request per file: a request never carries more than one file (the /api proxy buffers each request
+  // body up to `proxyClientMaxBodySize`), and one file's failure never loses the others' results.
+  upload: async (files: File[], groupId: string, documentId?: string) => {
+    const results: UploadResult[] = [];
+    for (const f of files) {
+      const fd = new FormData();
+      fd.append("files", f, f.name);
+      fd.append("group_id", groupId);
+      if (documentId) fd.append("document_id", documentId);
+      try {
+        const res = await request<{ results: UploadResult[] }>("/api/documents", { method: "POST", body: fd });
+        results.push(...res.results);
+      } catch (err) {
+        if (files.length === 1) throw err;
+        const reason = err instanceof Error ? err.message : "שגיאה בהעלאה";
+        results.push({ filename: f.name, status: "rejected", reason });
+      }
+    }
+    return { results };
   },
   documents: (q?: string, status?: string) =>
     request<{ documents: DocumentSummary[] }>(`/api/documents${qs({ q, status })}`),

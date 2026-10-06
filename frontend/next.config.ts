@@ -14,6 +14,10 @@ const nextConfig: NextConfig = {
     // The /api rewrite proxy times out after 30 s by default (next/dist/server/lib/router-utils/proxy-request.js);
     // a chat turn may run up to TURN_DEADLINE_SECONDS (45 s), so the proxy must wait longer than that.
     proxyTimeout: 120_000,
+    // The proxy buffers a request body only up to this size (default 10 MB) and silently cuts the rest, which
+    // broke uploads larger than 10 MB. One file per request (lib/api.ts) up to the backend's MAX_UPLOAD_MB (50)
+    // plus multipart overhead.
+    proxyClientMaxBodySize: "55mb",
   },
   async redirects() {
     return [{ source: "/", destination: "/chat", permanent: false }];
