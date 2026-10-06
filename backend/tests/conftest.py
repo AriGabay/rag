@@ -28,7 +28,8 @@ from app.db import reset_engine  # noqa: E402
 _TABLES = (
     "answer_cache, answer_sources, questions, conversations, dedup_candidates, fact_values, occurrences, "
     "transactions, provider_usage, audit_events, jobs, chunks, extracted_tables, pages, document_versions, "
-    "documents, sessions, user_groups, document_groups, users, office_data_versions, office_settings, offices"
+    "documents, sessions, user_groups, document_groups, users, office_data_versions, office_settings, offices, "
+    "attribute_definitions, facts, fact_extraction_ledger"
 )
 
 
@@ -43,18 +44,23 @@ def _db_available() -> bool:
         return False
 
 
-@pytest.fixture(scope="session")
-def owner_engine():
-    if not _db_available():
-        pytest.skip("Postgres test database not reachable (start: docker compose up -d db)")
+def alembic_config():
+    """Alembic config bound to the test database (owner role)."""
     from alembic.config import Config
-
-    from alembic import command
 
     cfg = Config(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
     cfg.set_main_option("script_location", os.path.join(os.path.dirname(__file__), "..", "alembic"))
     cfg.attributes["url"] = get_settings().owner_database_url
-    command.upgrade(cfg, "head")
+    return cfg
+
+
+@pytest.fixture(scope="session")
+def owner_engine():
+    if not _db_available():
+        pytest.skip("Postgres test database not reachable (start: docker compose up -d db)")
+    from alembic import command
+
+    command.upgrade(alembic_config(), "head")
     engine = create_engine(get_settings().owner_database_url)
     yield engine
     engine.dispose()

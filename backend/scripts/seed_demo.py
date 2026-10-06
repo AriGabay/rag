@@ -7,7 +7,9 @@ through the public API exactly like a user would (upload -> worker -> review app
     # or from the host: BACKEND_URL=http://localhost:8000 OWNER_DATABASE_URL=... uv run python scripts/seed_demo.py
 
 Records are approved only when every key field equals the synthetic ground truth, so the demo
-also shows which extractions a human would still need to check. All data is synthetic.
+also shows which extractions a human would still need to check. Each office also gets the
+structured attribute registry entries (KTD7), written with the owner role inside that office's
+context. All data is synthetic.
 """
 
 from __future__ import annotations
@@ -40,6 +42,21 @@ EMPLOYEES = [
     {"email": "yossi@demo.test", "full_name": "יוסי (עובד, קבוצה 2)", "groups": ["G2"], "can_upload": False},
 ]
 CHECK_FIELDS = ("price", "area", "area_type", "transaction_date", "valuation_date")
+# Structured attributes map to whitelisted record columns (see the CHECK in migration 0004).
+STRUCTURED_ATTRIBUTES = [
+    {"key": "price_per_sqm", "label_he": "מחיר למ״ר",
+     "aliases": ["מחיר למטר", "מחיר למ\"ר", "מחיר למטר רבוע", "מחיר למטר מרובע", "שווי למ״ר"],
+     "unit_dimension": "currency_per_area", "canonical_unit": "ILS/sqm", "column": "transactions.price_per_sqm"},
+    {"key": "price", "label_he": "מחיר",
+     "aliases": ["מחיר עסקה", "מחיר מכירה", "סכום העסקה", "תמורה"],
+     "unit_dimension": "currency", "canonical_unit": "ILS", "column": "transactions.price"},
+    {"key": "area", "label_he": "שטח",
+     "aliases": ["שטח דירה", "שטח הנכס", "שטח במ״ר", "גודל הדירה"],
+     "unit_dimension": "area", "canonical_unit": "sqm", "column": "transactions.area"},
+    {"key": "rooms", "label_he": "מספר חדרים",
+     "aliases": ["חדרים", "מס׳ חדרים", "כמות חדרים"],
+     "unit_dimension": "count", "canonical_unit": "room", "column": "occurrences.rooms"},
+]
 
 
 def log(msg: str) -> None:
@@ -53,9 +70,13 @@ def client_for(email: str) -> httpx.Client:
     return c
 
 
-def bootstrap_offices() -> None:
+def owner_engine():
     owner_url = os.environ.get("OWNER_DATABASE_URL")
-    engine = create_engine(owner_url) if owner_url else None
+    return create_engine(owner_url) if owner_url else None
+
+
+def bootstrap_offices() -> None:
+    engine = owner_engine()
     for key, office in OFFICES.items():
         probe = httpx.post(f"{BACKEND}/api/auth/login", json={"email": office["admin"], "password": PASSWORD})
         if probe.status_code == 200:
@@ -68,6 +89,25 @@ def bootstrap_offices() -> None:
                          {"n": office["name"], "e": office["admin"], "fn": f"מנהל/ת {office['name']}",
                           "h": hash_password(PASSWORD)})
         log(f"office {key} created")
+
+
+def seed_structured_attributes(clients: dict[str, httpx.Client]) -> None:
+    """Idempotent: existing definitions (same office and key) are left untouched."""
+    engine = owner_engine()
+    if engine is None:
+        raise SystemExit("OWNER_DATABASE_URL is required to seed the attribute registry")
+    for key, c in clients.items():
+        office_id = c.get("/api/auth/me").json()["office"]["id"]
+        with engine.begin() as conn:  # the owner is bound by FORCE RLS too: act inside the office context
+            conn.execute(text("SELECT set_config('app.office_id', :o, true)"), {"o": office_id})
+            added = sum(conn.execute(
+                text("INSERT INTO attribute_definitions (office_id, key, label_he, aliases, value_type, unit_dimension,"
+                     " canonical_unit, source, structured_column, status) VALUES (app_office(), :k, :l, :a, 'numeric',"
+                     " :d, :u, 'structured', :c, 'active') ON CONFLICT (office_id, key) DO NOTHING"),
+                {"k": a["key"], "l": a["label_he"], "a": a["aliases"], "d": a["unit_dimension"],
+                 "u": a["canonical_unit"], "c": a["column"]},
+            ).rowcount for a in STRUCTURED_ATTRIBUTES)
+        log(f"office {key}: {added} structured attributes added")
 
 
 def ensure_groups_and_users(admin: httpx.Client) -> dict[str, str]:
@@ -164,6 +204,7 @@ def main() -> None:
     docs = truth["documents"]
     bootstrap_offices()
     clients = {k: client_for(o["admin"]) for k, o in OFFICES.items()}
+    seed_structured_attributes(clients)
     group_ids = {"A": ensure_groups_and_users(clients["A"])}
     group_ids["A"]["default"] = group_ids["A"]["G1"]
     group_ids["B"] = {"default": clients["B"].get("/api/admin/groups").json()["groups"][0]["id"]}
