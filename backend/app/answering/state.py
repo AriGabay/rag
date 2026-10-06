@@ -84,6 +84,8 @@ class PendingClarification(BaseModel):
     metric: Metric | None = None
     unit: str | None = None
     value_filter: ValueFilterSpec | None = None
+    source_handles: list[str] = Field(default_factory=list)  # a comparison's sides already known (referent)
+    search_queries: list[str] = Field(default_factory=list)  # the interrupted task's queries (resumed as they were)
 
     def proposal(self) -> ProposedClarification:
         return ProposedClarification(key=self.key, question=self.question, options=self.options)
@@ -212,6 +214,10 @@ def _referent_problem(plan: TurnPlan, state: ConversationState,
     return None
 
 
+def _compare_sides(plan: TurnPlan) -> list[str]:
+    return next((list(dict.fromkeys(s.source_handles)) for s in plan.steps if s.tool == "compare"), [])
+
+
 def apply_turn(state: ConversationState, plan: TurnPlan, *,
                question: str | None = None) -> tuple[ConversationState, TurnEffects]:
     """Apply a validated plan to the state the turn started from (pure; KTD12)."""
@@ -271,7 +277,8 @@ def apply_turn(state: ConversationState, plan: TurnPlan, *,
                                                                   else question),
             task_type=None if plan.task_type == "clarify" else plan.task_type, topic=ctx.topic,
             entities=ctx.entities, conditions=conditions, attribute=ctx.attribute, metric=ctx.metric, unit=ctx.unit,
-            value_filter=ctx.value_filter)
+            value_filter=ctx.value_filter, source_handles=_compare_sides(plan) if clarification.key == "referent"
+            else [], search_queries=list(plan.search_queries))
         ctx.task_type = "clarify"
     elif relation == "change_clarification" and pending is not None:
         pending = pending.model_copy(update={"topic": ctx.topic, "entities": ctx.entities, "conditions": conditions,

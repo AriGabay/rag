@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 from app.answering.attributes import distinctive_words
 from app.answering.conditions import AreaType, DataKind, DateField
 from app.answering.parser import Gazetteer
+from app.extraction.normalize_text import base_normalize, prefix_variants
 
 if TYPE_CHECKING:
     from app.answering.state import ConversationState
@@ -329,7 +330,7 @@ def _relation(plan: TurnPlan, state: ConversationState | None) -> str:
     """A change to the pending clarification must keep that task's attribute and metric and change a
     condition ("ובגבעתיים?"); anything else is a new question, and the clarification stays open (R20). A
     "change" with nothing pending that names another attribute or topic than the conversation is a topic
-    change."""
+    change; one that only states a condition of the conversation's question is a follow-up."""
     relation = plan.turn_relation
     if relation != "change_clarification":
         return relation
@@ -342,6 +343,8 @@ def _relation(plan: TurnPlan, state: ConversationState | None) -> str:
                                and not _same_ref(plan.attribute, state.attribute))
                               or (plan.topic and state.topic and plan.topic != state.topic)):
         return "topic_change"
+    if state is not None and (state.attribute is not None or state.task_type) and _states_condition(plan):
+        return "follow_up"  # "ובתל אביב?" with nothing pending: the same question, one condition changed
     return "new_question"
 
 
@@ -368,7 +371,39 @@ def _names_clearly(plan: TurnPlan) -> bool:
     return bool(distinctive_words(ref.description)) if ref.description else True
 
 
-def normalize_model_plan(plan: TurnPlan, state: ConversationState | None = None) -> TurnPlan:
+def _mentioned(place: str, question: str) -> bool:
+    """Whether the question names the place (or the part of a hyphenated name before the hyphen, "תל אביב" for
+    "תל אביב-יפו"), with or without a prefix letter."""
+    tokens = [t.strip(".,:;?!()\"'") for t in base_normalize(question).split()]
+    names = {base_normalize(place), base_normalize(place.split("-")[0])}
+    for name in names:
+        words = name.split()
+        if not words:
+            continue
+        for i in range(len(tokens) - len(words) + 1):
+            first = tokens[i]
+            if (first == words[0] or words[0] in prefix_variants(first)
+                    or (len(first) > 1 and first[0] in "בלמהושכ" and first[1:] == words[0])) and \
+                    tokens[i + 1:i + len(words)] == words[1:]:
+                return True
+    return False
+
+
+def _grounded_places(plan: TurnPlan, question: str | None) -> TurnPlan:
+    """A place condition comes only from the turn's own words. The model may copy the conversation's city into
+    a new question or a topic change, or add a city the question never names (a street it places in a city):
+    such a place is dropped. A follow-up keeps the conversation's places through the state, not the plan."""
+    if not question or plan.turn_relation in ("meta_why", "meta_sources", "answer_to_clarification"):
+        return plan
+    c = plan.conditions
+    drop = {k: None for k in ("city", "neighborhood") if getattr(c, k) and not _mentioned(getattr(c, k), question)}
+    if not drop:
+        return plan
+    return plan.model_copy(update={"conditions": c.model_copy(update=drop)})
+
+
+def normalize_model_plan(plan: TurnPlan, state: ConversationState | None = None,
+                         question: str | None = None) -> TurnPlan:
     """The server's reading of a validated model plan: the model proposes, the server decides. Every rule
     reads the plan's structure (task, attribute, metric, filter, steps), never its words.
 
@@ -385,8 +420,10 @@ def normalize_model_plan(plan: TurnPlan, state: ConversationState | None = None)
     - A follow-up that names no other attribute repeats the conversation's computation.
     - An attribute ordered or aggregated as a number is numeric, whatever type the model gave it.
     - A computation always carries a computation step.
-    - A change to a pending clarification is accepted only as described in ``_relation``."""
+    - A change to a pending clarification is accepted only as described in ``_relation``.
+    - A place condition the question does not name is dropped (``_grounded_places``)."""
     meta = plan.turn_relation in ("meta_why", "meta_sources")
+    plan = _grounded_places(plan, question)
     relation = _relation(plan, state)
     plan = _numeric_when_ordered(plan)
     steps = [s for s in plan.steps if meta or s.tool not in META_TOOLS]

@@ -344,3 +344,51 @@ def test_attribute_clarification_on_a_clearly_named_attribute_is_dropped():
     unnamed = normalize_model_plan(_model_plan(task_type="clarify", clarification="attribute", metric="mean",
                                                tools=["search"]))
     assert unnamed.task_type == "clarify" and unnamed.clarification.key == "attribute"
+
+
+# --- context: places come from the turn's own words; condition-only "changes" are follow-ups -------------------
+
+@pytest.mark.parametrize(("question", "kept"), [
+    ("בכמה שומות בוצע שיפוץ משנת 2020?", False),  # GQ40: a city the question never names
+    ("מה נכתב על הנכס ברחוב שינקין 18?", False),  # GQ43: a street the model placed in a city
+    ("ובגבעתיים?", True),
+    ("מה הממוצע בגבעתיים", True),
+])
+def test_a_place_the_question_does_not_name_is_dropped(question, kept):
+    from app.answering.plan import normalize_model_plan
+
+    p = normalize_model_plan(_model_plan(task_type="compute", attribute="גודל החלל", metric="mean",
+                                         conditions={"city": "גבעתיים"}), None, question)
+    assert (p.conditions.city == "גבעתיים") is kept
+
+
+def test_a_hyphenated_place_named_by_its_first_part_is_kept():
+    from app.answering.plan import normalize_model_plan
+
+    p = normalize_model_plan(_model_plan(task_type="compute", attribute="גודל החלל", metric="mean",
+                                         conditions={"city": "תל אביב-יפו"}), None, "והממוצע בתל אביב?")
+    assert p.conditions.city == "תל אביב-יפו"
+
+
+def test_a_topic_change_does_not_keep_the_conversations_city_copied_by_the_model():
+    """GQ49.2 (AE4): after "עכשיו בנושא אחר", a city the model copied from the old state is not a condition."""
+    from app.answering.plan import normalize_model_plan
+    from app.answering.state import ConversationState, StateConditions
+
+    state = ConversationState(task_type="compute", conditions=StateConditions(city="גבעתיים"), version=3)
+    p = normalize_model_plan(_model_plan(task_type="locate", turn_relation="topic_change", tools=["locate"],
+                                         conditions={"city": "גבעתיים"}),
+                             state, "עכשיו בנושא אחר: באילו שומות מוזכר היתר?")
+    assert p.conditions.city is None
+
+
+def test_a_change_with_nothing_pending_that_states_a_condition_is_a_follow_up():
+    """GQ48.3: "ובתל אביב?" labeled change_clarification with nothing pending keeps the question's context."""
+    from app.answering.plan import AttributeRef, normalize_model_plan
+    from app.answering.state import ConversationState
+
+    state = ConversationState(task_type="compute", metric="mean", version=3,
+                              attribute=AttributeRef(handle="A9", description=None, unit_dimension="length"))
+    p = normalize_model_plan(_model_plan(task_type="compute", turn_relation="change_clarification",
+                                         conditions={"city": "תל אביב-יפו"}), state, "ובתל אביב?")
+    assert p.turn_relation == "follow_up"

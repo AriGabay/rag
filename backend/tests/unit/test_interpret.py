@@ -82,7 +82,8 @@ def test_free_text_clarification_answer_in_limited_mode_by_label_overlap():
     state = pending_state()
     assert match_clarification_reply("התכוונתי לעסקאות", state.pending) == "transaction_price"
     assert match_clarification_reply("שווי בשומות", state.pending) == "appraised_value"
-    assert match_clarification_reply("לא עסקאות", state.pending) is None
+    # between two options, rejecting one names the other ("not transactions" = the appraised values)
+    assert match_clarification_reply("לא עסקאות", state.pending) == "appraised_value"
     assert match_clarification_reply("מה מחיר העסקאות בגבעתיים ב-2023?", state.pending) is None
     result = run("התכוונתי לעסקאות", state)
     assert result.mode == "rules" and result.plan.turn_relation == "answer_to_clarification"
@@ -315,3 +316,76 @@ def test_answer_plan_resumes_the_interrupted_task():
     plan = answer_plan(pending, "transaction_price")
     assert plan.turn_relation == "answer_to_clarification" and plan.clarification_answer == "transaction_price"
     assert [s.tool for s in plan.steps] == ["compute_records"]
+
+
+
+# --- counter-examples to "a short text is a reply" (code review, user item 7) ---------------------------------
+
+@pytest.mark.parametrize("text", ["כמה עסקאות היו?", "עסקאות או שומות", "אין עסקאות", "מה עם שומות?"])
+def test_short_questions_and_alternatives_are_not_replies(text):
+    assert match_clarification_reply(text, pending_state().pending) is None
+
+
+@pytest.mark.parametrize(("text", "value"), [
+    ("עסקאות ולא שומות", "transaction_price"),
+    ("התכוונתי למחירי העסקאות בפועל ולא לשווי שנקבע בשומות", "transaction_price"),
+    ("שומות", "appraised_value"),
+    ("התכוונתי לשומות", "appraised_value"),
+    ("בשומות", "appraised_value"),
+])
+def test_long_or_negated_replies_naming_an_option_are_replies(text, value):
+    assert match_clarification_reply(text, pending_state().pending) == value
+
+
+def test_a_negated_option_label_matches_only_a_negated_reply():
+    from app.answering.state import ClarifyOption, PendingClarification
+    p = PendingClarification(key="vat_basis", question="כולל מע״מ?", options=[
+        ClarifyOption(value="incl", label="כולל מע״מ"), ClarifyOption(value="excl", label="לא כולל מע״מ")])
+    assert match_clarification_reply("לא כולל", p) == "excl"
+    assert match_clarification_reply("כולל", p) == "incl"
+
+
+# --- the model path: a turn read as a reply is checked by its structure, not its length -------------------------
+
+def _reply_plan(**kw):
+    from app.answering.plan import TurnPlan
+    return TurnPlan.build(task_type="compute", turn_relation="answer_to_clarification", **kw)
+
+
+def test_a_long_reply_that_names_the_option_is_a_reply():
+    from app.answering.interpret import reply_is_new_question
+    p = pending_state().pending
+    plan = _reply_plan(clarification_answer="appraised_value")
+    assert not reply_is_new_question(plan, p, "התכוונתי לשווי שנקבע בשומות ולא למחירי העסקאות בפועל, תודה")
+
+
+def test_a_short_question_with_its_own_condition_is_a_new_question():
+    from app.answering.interpret import reply_is_new_question
+    p = pending_state().pending
+    plan = _reply_plan(clarification_answer="transaction_price", conditions={"city": "חולון"})
+    assert reply_is_new_question(plan, p, "עסקאות בחולון?")
+
+
+def test_a_short_question_naming_no_option_is_a_new_question():
+    from app.answering.interpret import reply_is_new_question
+    p = pending_state().pending
+    assert reply_is_new_question(_reply_plan(clarification_answer="transaction_price"), p, "כמה דירות יש?")
+
+
+def test_a_reply_that_names_new_entities_is_a_new_question():
+    from app.answering.interpret import reply_is_new_question
+    p = pending_state().pending
+    plan = _reply_plan(clarification_answer="transaction_price", entities=["רחוב הרצל 5"])
+    assert reply_is_new_question(plan, p, "עסקאות ברחוב הרצל 5")
+
+
+def test_choosing_a_source_resumes_the_comparison_with_both_sides():
+    """Code review #6: the referent answer used to drop the chosen source, so the comparison never resumed."""
+    from app.answering.interpret import answer_plan
+    from app.answering.state import ClarifyOption, PendingClarification
+
+    p = PendingClarification(key="referent", question="עם איזה מקור להשוות?", task_type="compare",
+                             options=[ClarifyOption(value="S2", label="מקור S2")], source_handles=["S1"])
+    plan = answer_plan(p, "S2")
+    assert plan.task_type == "compare" and plan.steps[0].tool == "compare"
+    assert plan.steps[0].source_handles == ["S1", "S2"]
