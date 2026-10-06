@@ -11,6 +11,14 @@ schema in; the parsed object, a status from a fixed taxonomy, usage and latency 
 
 A cloud provider is used only when the office admin enabled cloud use AND the server holds the selected
 provider's key. Keys come from settings only, and no status, detail or log line ever carries a key.
+
+A call may carry an absolute ``deadline`` (``time.monotonic()``): its timeout is then cut to what remains,
+the SDK does not retry it (a retry would double the time), and with less than ``DEADLINE_FLOOR_SECONDS``
+left no request is sent and the result is ``timeout``. Calls without a deadline (worker jobs) keep the
+per-purpose timeout and the client's retries.
+
+Document text placed in a prompt goes through ``prompt_text`` (inside a tag) or ``prompt_attr`` (inside a
+quoted tag attribute): no document can open, close or forge a prompt tag.
 """
 
 from __future__ import annotations
@@ -41,6 +49,20 @@ SYSTEM_POLICY = (
 PARSE_POLICY = ("המר שאלה בעברית על נתוני שמאות לתנאי סינון לפי הסכמה בלבד. "
                 "אל תמציא ערכים שאינם בשאלה; השאר null כשהשאלה אינה מציינת. אל תבצע את השאלה.")
 DEFAULT_MAX_OUTPUT_TOKENS = 1500
+DEADLINE_FLOOR_SECONDS = 1.0  # below this much time left before a deadline, no model call is started
+
+
+def prompt_text(value: object) -> str:
+    """Document-derived text for the inside of a prompt tag: angle brackets become the look-alike quotes ‹ ›,
+    so no text can close an ``<evidence>`` or ``<claim>`` block or open a new one (CWE-77). Verbatim checks run
+    on the original text (``attributes.match_norm`` reads ‹ › back as < >)."""
+    return str(value if value is not None else "").replace("<", "‹").replace(">", "›")
+
+
+def prompt_attr(value: object) -> str:
+    """Document-derived text for a double-quoted prompt tag attribute: as ``prompt_text``, and a double quote
+    becomes gershayim (״), so the value cannot end the attribute early."""
+    return prompt_text(value).replace('"', "״")
 
 
 class Purpose(StrEnum):
@@ -114,7 +136,7 @@ class LLMProvider(Protocol):
     demo: bool
 
     def structured(self, purpose: Purpose, instructions: str, input: str, schema: type[BaseModel], *,
-                   max_output_tokens: int | None = None) -> StructuredResult: ...
+                   max_output_tokens: int | None = None, deadline: float | None = None) -> StructuredResult: ...
 
     def answer(self, question: str, evidence: list[dict], calculation: dict | None) -> LLMResult: ...
 
@@ -122,8 +144,8 @@ class LLMProvider(Protocol):
 
 
 def build_user_prompt(question: str, evidence: list[dict], calculation: dict | None) -> str:
-    blocks = [f'<evidence id="{e["evidence_id"]}" document="{e["title"]}" pages="{e.get("page_list")}">\n'
-              f'{e["text"]}\n</evidence>' for e in evidence]
+    blocks = [f'<evidence id="{e["evidence_id"]}" document="{prompt_attr(e["title"])}"'
+              f' pages="{e.get("page_list")}">\n{prompt_text(e["text"])}\n</evidence>' for e in evidence]
     calc = json.dumps(calculation, ensure_ascii=False) if calculation else "אין"
     return (
         f"שאלת המשתמש:\n{question}\n\nתוצאות חישוב מאומתות (מחושבות במערכת, יש להשתמש בהן כפי שהן):\n{calc}\n\n"
@@ -133,6 +155,37 @@ def build_user_prompt(question: str, evidence: list[dict], calculation: dict | N
 
 def timeout_for(purpose: Purpose) -> float:
     return float(getattr(get_settings(), f"llm_timeout_{Purpose(purpose).value}_seconds"))
+
+
+def deadline_left(deadline: float | None) -> float | None:
+    """Seconds left before ``deadline`` (``time.monotonic()``); None when the call has no deadline."""
+    return None if deadline is None else deadline - time.monotonic()
+
+
+def client_options(purpose: Purpose, deadline: float | None) -> dict[str, Any] | None:
+    """SDK ``with_options`` for one call: the purpose's timeout; with a deadline, the timeout cut to what
+    remains and no SDK retry. None when less than ``DEADLINE_FLOOR_SECONDS`` remains (no call is made)."""
+    timeout = timeout_for(purpose)
+    left = deadline_left(deadline)
+    if left is None:
+        return {"timeout": timeout}
+    if left < DEADLINE_FLOOR_SECONDS:
+        return None
+    return {"timeout": min(timeout, left), "max_retries": 0}
+
+
+def call_structured(provider: LLMProvider, purpose: Purpose, instructions: str, input: str,
+                    schema: type[BaseModel], *, deadline: float | None = None, **kwargs: Any) -> StructuredResult:
+    """``provider.structured`` under an optional turn ``deadline``: past the floor no call is made and the
+    result is ``timeout``; otherwise the deadline is passed on (and only then, so a provider without
+    deadline support still serves calls that carry none)."""
+    if deadline is not None:
+        left = deadline_left(deadline)
+        if left is not None and left < DEADLINE_FLOOR_SECONDS:
+            logger.warning("provider %s %s call skipped: turn deadline reached", provider.name, purpose)
+            return StructuredResult(CallStatus.TIMEOUT, latency_ms=0, detail="deadline")
+        kwargs["deadline"] = deadline
+    return provider.structured(purpose, instructions, input, schema, **kwargs)
 
 
 def _elapsed_ms(started: float) -> int:
@@ -147,7 +200,7 @@ class BaseProvider:
     demo = False
 
     def structured(self, purpose: Purpose, instructions: str, input: str, schema: type[BaseModel], *,
-                   max_output_tokens: int | None = None) -> StructuredResult:
+                   max_output_tokens: int | None = None, deadline: float | None = None) -> StructuredResult:
         raise NotImplementedError
 
     def answer(self, question: str, evidence: list[dict], calculation: dict | None) -> LLMResult:
@@ -171,7 +224,7 @@ class MockLLM:
     demo = True
 
     def structured(self, purpose: Purpose, instructions: str, input: str, schema: type[BaseModel], *,
-                   max_output_tokens: int | None = None) -> StructuredResult:
+                   max_output_tokens: int | None = None, deadline: float | None = None) -> StructuredResult:
         return StructuredResult(CallStatus.UNSUPPORTED, detail="demo mock answers only through answer()")
 
     def answer(self, question: str, evidence: list[dict], calculation: dict | None) -> LLMResult:
@@ -239,7 +292,7 @@ class OpenAIProvider(BaseProvider):
         self.reasoning_effort = reasoning_effort
 
     def structured(self, purpose: Purpose, instructions: str, input: str, schema: type[BaseModel], *,
-                   max_output_tokens: int | None = None) -> StructuredResult:
+                   max_output_tokens: int | None = None, deadline: float | None = None) -> StructuredResult:
         import openai
 
         kwargs: dict[str, Any] = {
@@ -249,8 +302,11 @@ class OpenAIProvider(BaseProvider):
         if self.reasoning_effort:
             kwargs["reasoning"] = {"effort": self.reasoning_effort}
         started = time.perf_counter()
+        options = client_options(purpose, deadline)
+        if options is None:
+            return self._failed(purpose, CallStatus.TIMEOUT, "deadline", started)
         try:
-            raw = self.client.with_options(timeout=timeout_for(purpose)).responses.with_raw_response.parse(**kwargs)
+            raw = self.client.with_options(**options).responses.with_raw_response.parse(**kwargs)
         except openai.OpenAIError as exc:
             return self._failed(purpose, _openai_error_status(exc), type(exc).__name__, started)
         # The body is read first: a truncated or refused output must not be reported as merely invalid.
@@ -315,21 +371,26 @@ class AnthropicLLM(BaseProvider):
         self.client = client
         self.model = model
 
-    def _create(self, purpose: Purpose, system: str, user: str, schema: dict, max_tokens: int):
-        return self.client.with_options(timeout=timeout_for(purpose)).messages.create(
+    def _create(self, purpose: Purpose, system: str, user: str, schema: dict, max_tokens: int,
+                options: dict[str, Any] | None = None):
+        return self.client.with_options(**(options or client_options(purpose, None))).messages.create(
             model=self.model, max_tokens=max_tokens, system=system,
             messages=[{"role": "user", "content": user}],
             output_config={"format": {"type": "json_schema", "schema": schema}},
         )
 
     def structured(self, purpose: Purpose, instructions: str, input: str, schema: type[BaseModel], *,
-                   max_output_tokens: int | None = None) -> StructuredResult:
+                   max_output_tokens: int | None = None, deadline: float | None = None) -> StructuredResult:
         import anthropic
 
         started = time.perf_counter()
+        options = client_options(purpose, deadline)
+        if options is None:
+            logger.warning("provider %s %s call skipped: turn deadline reached", self.name, purpose)
+            return StructuredResult(CallStatus.TIMEOUT, latency_ms=_elapsed_ms(started), detail="deadline")
         try:
             resp = self._create(purpose, instructions, input, schema.model_json_schema(),
-                                max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS)
+                                max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS, options)
         except anthropic.AnthropicError as exc:
             status = _anthropic_error_status(exc)
             logger.warning("provider %s %s call failed: %s (%s)", self.name, purpose, status, type(exc).__name__)

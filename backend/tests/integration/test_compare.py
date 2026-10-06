@@ -189,3 +189,62 @@ def test_a_side_whose_claim_verification_dropped_is_quoted_with_its_version(offi
     assert [c["evidence_ids"] for c in a["claims"]] == [["E2"], ["E1"]]
     assert "דוח eee, גרסה 1: ציטוט מהמסמך: „שיעור ההתאמה לגודל הוא 5%.” [E1]" in a["text"]
     assert any("דוח eee, גרסה 1" in lim and "כלשונו" in lim for lim in a["limitations"]) and out.cacheable
+
+
+def test_claims_naming_their_version_label_are_kept(office, monkeypatch):
+    """GQ24: "בגרסה 1 ... 5%" repeats the server's label "דוח eee, גרסה 1"; its "1" is a reference, not a figure."""
+    doc, old_v = add_chunks(office, office.default_group_id, ["שיעור ההתאמה לגודל הוא 5%."], "e" * 64)
+    new_v = _add_version(office, doc, ["שיעור ההתאמה לגודל הוא 7%."])
+    p = ScriptedProvider().on(Purpose.ANSWER, compare_answer(
+        claim("בגרסה 1 שיעור ההתאמה לגודל הוא 5%", ["E1"]), claim("בגרסה 2 שיעור ההתאמה לגודל הוא 7%", ["E2"]),
+        conflicts=[("שיעור ההתאמה לגודל", (0, 1))])).on(Purpose.VERIFY, verdicts(2))
+    cloud(office, monkeypatch, p)
+    a = run(office.ctx(), [CompareSide(version_id=old_v), CompareSide(version_id=new_v)]).answer
+    assert a["dropped_claims"] == 0 and a["compare"]["incomplete"] is False and len(a["compare"]["conflicts"]) == 1
+    assert "דוח eee, גרסה 1: בגרסה 1 שיעור ההתאמה לגודל הוא 5% [E1]" in a["text"]
+
+
+def test_a_side_with_no_datum_is_missing_not_a_conflict(office, monkeypatch):
+    """GQ20 (AE6): the second document states no value; the model says so (``asserts_absence``) and lists a
+    conflict. The comparison is incomplete with that side named, and nothing is shown as a difference."""
+    d1, _ = add_chunks(office, office.default_group_id, ["שיעור ההיוון שנקבע בשומה הוא 5%."], "a" * 64)
+    d2, _ = add_chunks(office, office.default_group_id, ["שיעור ההיוון לא נבחן בשומה זו."], "b" * 64)
+    p = ScriptedProvider().on(Purpose.ANSWER, compare_answer(
+        claim("שיעור ההיוון הוא 5%", ["E1"]),
+        {**claim("בדוח bbb לא נמסר שיעור ההיוון", ["E2"]), "asserts_absence": True},
+        conflicts=[("שיעור ההיוון", (0, 1))])).on(Purpose.VERIFY, verdicts(1))
+    cloud(office, monkeypatch, p)
+    out = run(office.ctx(), [CompareSide(document_id=d1), CompareSide(document_id=d2)], ["שיעור ההיוון"])
+    a = out.answer
+    assert a["compare"]["incomplete"] is True and a["compare"]["missing_sides"] == ["דוח bbb"]
+    assert a["compare"]["conflicts"] == [] and "הבדל" not in a["text"]
+    assert [c["evidence_ids"] for c in a["claims"]] == [["E1"]] and not out.cacheable
+
+
+def test_every_claim_dropped_keeps_the_comparison_incomplete(office, monkeypatch):
+    """GQ20 r4: with no verified claim left the comparison is incomplete and names every side."""
+    doc, old_v = add_chunks(office, office.default_group_id, ["שיעור ההתאמה לגודל הוא 5%."], "e" * 64)
+    new_v = _add_version(office, doc, ["שיעור ההתאמה לגודל הוא 7%."])
+    p = ScriptedProvider().on(Purpose.ANSWER, compare_answer(
+        claim("שיעור ההתאמה לגודל הוא 6%", ["E1"]), claim("שיעור ההתאמה לגודל הוא 8%", ["E2"])))
+    cloud(office, monkeypatch, p)
+    out = run(office.ctx(), [CompareSide(version_id=old_v), CompareSide(version_id=new_v)])
+    a = out.answer
+    assert a["provider"] == "extractive" and a["compare"]["incomplete"] is True and not out.cacheable
+    assert a["compare"]["missing_sides"] == ["דוח eee, גרסה 1", "דוח eee, גרסה 2"]
+
+
+def test_past_the_turn_deadline_the_comparison_makes_no_model_call(office, monkeypatch):
+    import time
+
+    doc, old_v = add_chunks(office, office.default_group_id, ["שיעור ההתאמה לגודל הוא 5%."], "e" * 64)
+    new_v = _add_version(office, doc, ["שיעור ההתאמה לגודל הוא 7%."])
+    p = ScriptedProvider().on(Purpose.ANSWER, compare_answer(claim("שיעור ההתאמה לגודל הוא 5%", ["E1"])))
+    cloud(office, monkeypatch, p)
+    with tenant_tx(office.ctx()) as conn:
+        gathered = gather_sides(conn, QUESTION, [CompareSide(version_id=old_v), CompareSide(version_id=new_v)],
+                                queries=QUERIES)
+        provider, state = select_provider(conn)
+    out = compose_comparison(gathered, provider, state, deadline=time.monotonic())
+    assert p.calls == [] and out.answer["provider"] == "extractive" and not out.cacheable
+    assert [(u.purpose, str(u.status)) for u in out.usage] == [(Purpose.ANSWER, "timeout")]
