@@ -47,8 +47,8 @@ def office(db):
 def enable_cloud(office, monkeypatch, stub):
     with tenant_tx(office.ctx()) as conn:
         conn.execute(text("UPDATE office_settings SET cloud_llm_enabled = true"))
-    monkeypatch.setattr("app.answering.content.cloud_configured", lambda: True)
-    monkeypatch.setattr("app.answering.content.get_cloud_provider", lambda: stub)
+    monkeypatch.setattr("app.answering.content.selected_provider_configured", lambda: True)
+    monkeypatch.setattr("app.answering.content.get_selected_provider", lambda: stub)
 
 
 def test_demo_mock_answer_is_labeled_and_cited(client, office):
@@ -61,8 +61,8 @@ def test_demo_mock_answer_is_labeled_and_cited(client, office):
 
 def test_cloud_not_called_when_office_setting_off(client, office, monkeypatch):
     stub = StubCloud("x [E1]", ["E1"])
-    monkeypatch.setattr("app.answering.content.cloud_configured", lambda: True)
-    monkeypatch.setattr("app.answering.content.get_cloud_provider", lambda: stub)
+    monkeypatch.setattr("app.answering.content.selected_provider_configured", lambda: True)
+    monkeypatch.setattr("app.answering.content.get_selected_provider", lambda: stub)
     login(client, "admin-a@example.test")
     ask(client, "מה היו שיקולי השמאי לגבי היטל השבחה?")
     assert stub.calls == []

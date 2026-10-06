@@ -9,6 +9,11 @@ x-backend-env: &backend-env
   SESSION_SECRET: ${SESSION_SECRET:?set in .env}
   DEMO_MODE: ${DEMO_MODE:-true}
   EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+  # Provider values pass through unchanged; empty means "use the settings default" (no model default here).
+  LLM_PROVIDER: ${LLM_PROVIDER:-}
+  OPENAI_KEY: ${OPENAI_KEY:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENAI_MODEL: ${OPENAI_MODEL:-}
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-5-5}
   HF_HUB_OFFLINE: "1"

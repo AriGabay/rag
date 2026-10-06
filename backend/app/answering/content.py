@@ -13,7 +13,7 @@ from app.config import get_settings
 from app.db import TenantContext
 from app.platform.documents import source_file_url
 from app.platform.search import hybrid_search
-from app.providers.llm import LLMProvider, MockLLM, cloud_configured, get_cloud_provider
+from app.providers.llm import LLMProvider, MockLLM, get_selected_provider, selected_provider_configured
 
 logger = logging.getLogger(__name__)
 EVIDENCE_LIMIT = 6
@@ -22,7 +22,7 @@ EVIDENCE_LIMIT = 6
 def effective_provider(conn: Connection) -> str:
     """cloud | enabled_no_key | demo_mock | extractive (admin screen shows the same value)."""
     enabled = conn.execute(text("SELECT cloud_llm_enabled FROM office_settings")).scalar_one_or_none()
-    if enabled and cloud_configured():
+    if enabled and selected_provider_configured():
         return "cloud"
     if enabled:
         return "enabled_no_key"
@@ -32,7 +32,7 @@ def effective_provider(conn: Connection) -> str:
 def select_provider(conn: Connection) -> tuple[LLMProvider | None, str]:
     eff = effective_provider(conn)
     if eff == "cloud":
-        return get_cloud_provider(), eff
+        return get_selected_provider(), eff
     if eff in ("demo_mock", "enabled_no_key") and get_settings().demo_mode:
         return MockLLM(), "demo_mock"
     return None, "extractive"

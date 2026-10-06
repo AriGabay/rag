@@ -60,8 +60,8 @@ def capture(monkeypatch):
         raise AssertionError("cloud provider must not be constructed")
 
     monkeypatch.setattr(MockLLM, "answer", spy)
-    monkeypatch.setattr("app.providers.llm.get_cloud_provider", no_cloud)
-    monkeypatch.setattr("app.answering.content.get_cloud_provider", no_cloud)
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", no_cloud)
+    monkeypatch.setattr("app.answering.content.get_selected_provider", no_cloud)
     return calls
 
 
@@ -148,9 +148,9 @@ class StubCloud:
 @pytest.fixture
 def cloud(world, monkeypatch):
     stub = StubCloud()
-    monkeypatch.setattr("app.answering.content.cloud_configured", lambda: True)
-    monkeypatch.setattr("app.answering.content.get_cloud_provider", lambda: stub)
-    monkeypatch.setattr("app.providers.llm.get_cloud_provider", lambda: stub)
+    monkeypatch.setattr("app.answering.content.selected_provider_configured", lambda: True)
+    monkeypatch.setattr("app.answering.content.get_selected_provider", lambda: stub)
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: stub)
     admin = world.client(ADMIN_A)
     r = admin.put("/api/admin/settings", json={"cloud_llm_enabled": True, "acknowledge": True})
     assert r.status_code == 200, r.text
