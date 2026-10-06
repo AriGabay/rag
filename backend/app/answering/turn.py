@@ -57,7 +57,15 @@ from app.answering.interpret import (
 )
 from app.answering.metadata import MetadataFilters
 from app.answering.parser import Gazetteer, missing_conditions
-from app.answering.plan import MAX_STEPS, ClarifyOption, ConditionDelta, ProposedClarification, Step, TurnPlan
+from app.answering.plan import (
+    MAX_STEPS,
+    ClarifyOption,
+    ConditionDelta,
+    ProposedClarification,
+    Step,
+    TurnPlan,
+    normalize_model_plan,
+)
 from app.answering.plan import validate_plan as _validate_plan
 from app.answering.service import (
     CLARIFY_QUESTIONS,
@@ -830,6 +838,10 @@ def _default_steps(plan: TurnPlan) -> list[Step]:
 def _execute_steps(run: _Run, steps: list[Step]) -> dict | None:
     """At most four steps; the first computation runs first so a search can explain it (combined)."""
     steps = sorted(steps[:MAX_STEPS], key=lambda s: s.tool not in COMPUTE_TOOLS)
+    tools = {s.tool for s in steps}
+    if {"search", "locate"} <= tools:  # one presentation: a document list only when documents were asked for
+        drop = "search" if run.plan.task_type == "locate" else "locate"
+        steps = [s for s in steps if s.tool != drop]
     base: Part | None = None
     answer: dict | None = None
     computed = searched = False
@@ -1032,6 +1044,8 @@ def execute_turn(ctx: TenantContext, it: Interpreted, L: Loaded, question_id: UU
         answer = _finish(it.answer, L, it, [], None, [], False)
         return TurnResult(answer, None, None, [], {}, None, route, None, conflict_pending=it.conflict)
 
+    if it.mode == "model" and it.plan is not None:
+        it.plan = normalize_model_plan(it.plan)
     plan, start = _expand_versions(ctx, it.plan, L.state)
     new_state, effects = apply_turn(start, plan, question=it.question if it.mode not in ("button", "edit") else None)
     cleared = list(effects.cleared)

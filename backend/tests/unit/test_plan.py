@@ -109,3 +109,72 @@ def test_clarification_answer_must_be_a_pending_option():
     raw = plan_dict(turn_relation="answer_to_clarification", clarification_answer="transaction_price")
     assert check(raw, pending_options=["transaction_price", "appraised_value"]).ok
     assert not check(raw, pending_options=["appraised_value"]).ok
+
+
+# --- server policy over model plans -------------------------------------------------------------------------
+
+def _model_plan(**kw):
+    from app.answering.plan import AttributeRef, ClarifyOption, ProposedClarification, Step, TurnPlan
+
+    clar = kw.pop("clarification", None)
+    if clar:
+        clar = ProposedClarification(key=clar, question="?", options=[ClarifyOption(value="a", label="א"),
+                                                                       ClarifyOption(value="b", label="ב")])
+    attr = kw.pop("attribute", None)
+    attr = AttributeRef(handle=None, description=attr, unit_dimension="area") if attr else None
+    steps = [Step(tool=t, attribute_handle=None, source_handles=[]) for t in kw.pop("tools", [])]
+    return TurnPlan.build(clarification=clar, attribute=attr, steps=steps, **kw)
+
+
+def test_scope_clarification_is_dropped_and_the_computation_runs():
+    from app.answering.plan import normalize_model_plan
+
+    p = normalize_model_plan(_model_plan(task_type="clarify", clarification="scope", attribute="גודל החלל",
+                                         metric="mean", tools=["search"]))
+    assert p.clarification is None and p.task_type == "compute"
+    assert [s.tool for s in p.steps][0] == "extract_and_compute"
+
+
+def test_referent_clarification_is_kept():
+    from app.answering.plan import normalize_model_plan
+
+    p = normalize_model_plan(_model_plan(task_type="clarify", clarification="referent", tools=["compare"]))
+    assert p.task_type == "clarify" and p.clarification.key == "referent"
+
+
+def test_monetary_clarification_from_the_model_is_left_to_the_computation():
+    from app.answering.plan import normalize_model_plan
+
+    p = normalize_model_plan(_model_plan(task_type="clarify", clarification="data_kind", attribute="מחיר",
+                                         metric="mean", tools=["compute_records"]))
+    assert p.clarification is None and p.task_type == "compute"
+
+
+def test_abstain_with_a_named_attribute_becomes_an_answer_or_a_computation():
+    from app.answering.plan import normalize_model_plan
+
+    assert normalize_model_plan(_model_plan(task_type="abstain", attribute="גובה החלל")).task_type == "answer"
+    computed = normalize_model_plan(_model_plan(task_type="abstain", attribute="גובה החלל", metric="mean"))
+    assert computed.task_type == "compute" and computed.steps[0].tool == "extract_and_compute"
+
+
+def test_abstain_without_anything_named_stays():
+    from app.answering.plan import normalize_model_plan
+
+    assert normalize_model_plan(_model_plan(task_type="abstain")).task_type == "abstain"
+
+
+def test_meta_tools_are_stripped_from_new_questions_only():
+    from app.answering.plan import normalize_model_plan
+
+    p = normalize_model_plan(_model_plan(task_type="answer", tools=["search", "show_sources", "explain_previous"]))
+    assert [s.tool for s in p.steps] == ["search"]
+    m = normalize_model_plan(_model_plan(task_type="answer", turn_relation="meta_sources", tools=["show_sources"]))
+    assert [s.tool for s in m.steps] == ["show_sources"]
+
+
+def test_unexecutable_clarification_is_kept():
+    from app.answering.plan import normalize_model_plan
+
+    p = normalize_model_plan(_model_plan(task_type="clarify", clarification="scope"))
+    assert p.task_type == "clarify" and p.clarification is not None

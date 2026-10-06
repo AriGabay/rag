@@ -25,17 +25,24 @@ from app.extraction.normalize_text import base_normalize, prefix_variants
 STRUCTURED_ATTRIBUTES = [
     {"key": "price_per_sqm", "label_he": "מחיר למ״ר",
      "aliases": ["מחיר למטר", "מחיר למ\"ר", "מחיר למטר רבוע", "מחיר למטר מרובע", "שווי למ״ר"],
-     "unit_dimension": "currency_per_area", "canonical_unit": "ILS/sqm", "column": "transactions.price_per_sqm"},
+     "unit_dimension": "currency_per_area", "canonical_unit": "ILS/sqm", "column": "transactions.price_per_sqm",
+     "description": "מחיר או שווי למ״ר של נכס שלם, מרשומות העסקאות והשומות המאומתות"},
     {"key": "price", "label_he": "מחיר",
      "aliases": ["מחיר עסקה", "מחיר מכירה", "סכום העסקה", "תמורה"],
-     "unit_dimension": "currency", "canonical_unit": "ILS", "column": "transactions.price"},
+     "unit_dimension": "currency", "canonical_unit": "ILS", "column": "transactions.price",
+     "description": "מחיר העסקה או השווי של נכס שלם, מרשומות העסקאות והשומות המאומתות"},
     {"key": "area", "label_he": "שטח",
      "aliases": ["שטח דירה", "שטח הנכס", "שטח במ״ר", "גודל הדירה"],
-     "unit_dimension": "area", "canonical_unit": "sqm", "column": "transactions.area"},
+     "unit_dimension": "area", "canonical_unit": "sqm", "column": "transactions.area",
+     "description": "שטח הנכס כולו ברשומות העסקאות והשומות; לא שטח של רכיב או חלל בתוך הנכס"},
     {"key": "rooms", "label_he": "מספר חדרים",
      "aliases": ["חדרים", "מס׳ חדרים", "כמות חדרים"],
-     "unit_dimension": "count", "canonical_unit": "room", "column": "occurrences.rooms"},
+     "unit_dimension": "count", "canonical_unit": "room", "column": "occurrences.rooms",
+     "description": "מספר החדרים של נכס שלם ברשומות העסקאות והשומות"},
 ]
+# What a structured entry covers, shown to the interpreter so it does not stretch a whole-property column
+# over a part of the property.
+_STRUCTURED_DESCRIPTIONS = {a["key"]: a["description"] for a in STRUCTURED_ATTRIBUTES}
 # Unit dimension -> canonical unit that extracted values are converted to.
 CANONICAL_UNITS = {
     "area": "sqm",
@@ -122,7 +129,8 @@ def _rows(conn: Connection) -> list:
 def _handle_dict(handle: str, r) -> dict:
     return {"handle": handle, "id": r.id, "key": r.key, "label": r.label_he, "aliases": list(r.aliases or []),
             "unit_dimension": r.unit_dimension, "canonical_unit": r.canonical_unit, "source": r.source,
-            "value_type": r.value_type, "status": r.status}
+            "value_type": r.value_type, "status": r.status,
+            "description": _STRUCTURED_DESCRIPTIONS.get(r.key) if r.source == "structured" else None}
 
 
 def list_attribute_handles(conn: Connection) -> list[dict]:

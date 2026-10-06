@@ -224,3 +224,48 @@ def validate_plan(raw: TurnPlan | dict, *, gazetteer: Gazetteer, attributes: Ite
     if (city, hood) != (c.city, c.neighborhood):
         plan = plan.model_copy(update={"conditions": c.model_copy(update={"city": city, "neighborhood": hood})})
     return PlanCheck(plan)
+
+
+# --- server policy over model plans (R3, R20, KTD1) -------------------------------------------------------
+
+META_TOOLS = ("explain_previous", "show_sources")
+COMPUTE_STEP_TOOLS = ("compute_records", "extract_and_compute")
+# Clarifications the server cannot otherwise settle: which documents or which attribute the user means.
+# Monetary keys (data kind, date field, bases) are asked by the computation itself, and only when the
+# authorized records actually differ on them; any other key ("scope", "place" ...) is answered with
+# stated coverage instead of a question.
+MODEL_CLARIFY_KEYS = ("referent", "attribute")
+
+
+def normalize_model_plan(plan: TurnPlan) -> TurnPlan:
+    """The server's reading of a validated model plan: the model proposes, the server decides.
+
+    - Meta tools run only on meta turns ("למה?", "תראה לי את המקור").
+    - A proposed clarification is kept only for an unclear referent, or an attribute the plan does not
+      name; otherwise the turn proceeds with what the plan already supports.
+    - "abstain" with a named attribute becomes an answer, or a computation when a metric is asked:
+      whether the repository holds the datum is checked by the tools, not guessed by the model.
+    - A computation always carries a computation step."""
+    meta = plan.turn_relation in ("meta_why", "meta_sources")
+    steps = [s for s in plan.steps if meta or s.tool not in META_TOOLS]
+    named = plan.attribute is not None and bool(plan.attribute.handle or plan.attribute.description)
+    computes = named and plan.metric != "none"
+    task = plan.task_type
+    clarification = plan.clarification
+    executable = bool(steps or plan.search_queries or named)
+    if clarification is not None or task == "clarify":
+        keep = not executable or (clarification is not None and (
+            clarification.key == "referent" or (clarification.key == "attribute" and not named)))
+        if not keep:
+            clarification = None
+            if task == "clarify":
+                task = ("compute" if computes else
+                        "compare" if any(s.tool == "compare" for s in steps) else "answer")
+    if task == "abstain" and named:
+        task = "compute" if computes else "answer"
+    if task in ("compute", "compute_explain") and computes and not any(s.tool in COMPUTE_STEP_TOOLS for s in steps):
+        steps = [Step(tool="extract_and_compute", attribute_handle=plan.attribute.handle, source_handles=[]),
+                 *steps][:MAX_STEPS]
+    if task in ("compute", "compute_explain") and not computes and not steps:
+        task = "answer"
+    return plan.model_copy(update={"task_type": task, "steps": steps, "clarification": clarification})
