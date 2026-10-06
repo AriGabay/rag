@@ -42,6 +42,19 @@
 #   conflict         true: both conflicting statements are shown with their sources; neither is silently chosen.
 #   forbid           other_group | other_office: no cited source may come from documents outside the user's scope.
 #   no_price_clarification  true: no transaction-price / appraised-value clarification may be raised.
+#   settled          (computation turns) what a correct system reports under the settled extraction decisions
+#                    (KTD8 steps 4-5, KTD9, R15) when that differs from what the documents state: `result`,
+#                    `values` and `coverage` inside it replace the ones above for scoring, and
+#                    `coverage.awaiting_review` names the documents that must be reported as awaiting review
+#                    (never used, never "not stated"). `result.facts` / `coverage` outside it keep the document
+#                    truth, recomputed by tests/unit/test_fixtures_ground_truth.py. `basis` cites the decision.
+#
+# Scorer details (eval/general.py; every change since the first runs is listed with its requirement in
+# docs/evaluation/scorer-changes.md): numbers are whole tokens or Hebrew number words and must sit next to
+# the attribute's own words, not another attribute's; boolean / "none" values need the right polarity; a locate
+# answer (no claims) states a value in its cited snippet; `also_valid` pages count for the page of a value; with
+# an `audit` block in the answer, coverage is checked per document; a meta turn (show_sources) is scored on
+# re-showing the previous turn's sources. Since questions_holdout_v2.yaml exists, this file is the REGRESSION set.
 
 items:
   # --- explicit text facts -------------------------------------------------------------------------------
@@ -416,6 +429,13 @@ items:
                    facts: [H1-F01, H2-F01, H3-F04]}
           values: [{fact: H1-F01, page: 1}, {fact: H2-F01, page: 1}, {fact: H3-F04, page: 1}]
           coverage: {values_found: 3, not_stated_includes: [H8], mentioned_without_value: [D2]}
+          settled:
+            basis: "KTD8 step 5 (a conversion with assumptions is needs_review), KTD9 and R15 (facts needing review are
+              excluded and counted): H3 gives only inner dimensions in cm (300 על 350 ס״מ), so its 10.5 m2 waits for
+              review - reported as awaiting review, never used and never 'not stated'"
+            result: {value: "10.75", n: 2, facts: [H1-F01, H2-F01]}
+            values: [{fact: H1-F01, page: 1}, {fact: H2-F01, page: 1}]
+            coverage: {values_found: 2, awaiting_review: [H3]}
   - id: GQ29
     category: computation
     held_out: true
@@ -431,6 +451,13 @@ items:
           result: {scope: {city: גבעתיים}, attribute: balcony_area, metric: mean, value: "12.50", unit: m2, n: 2, facts: [H4v2-F06, H5-F04]}
           values: [{fact: H4v2-F06, page: 1}, {fact: H5-F04, page: 1}]
           coverage: {values_found: 2}
+          settled:
+            basis: "KTD8 step 5 (several values for the subject in one version are needs_review) and step 4 (the value
+              is parsed from the quote; the server never adds values): H4v2 states two balcony areas (12 and 6 מ״ר) in
+              one sentence, so it waits for review - reported as awaiting review, never used and never 'not stated'"
+            result: {value: "7.00", n: 1, facts: [H5-F04]}
+            values: [{fact: H5-F04, page: 1}]
+            coverage: {values_found: 1, awaiting_review: [H4v2]}
   - id: GQ30
     category: computation
     held_out: true
@@ -504,6 +531,13 @@ items:
                    facts: [H1-F08, H2-F07, H3-F01, H8-F01]}
           values: [{fact: H1-F08, page: 2}, {fact: H2-F07, page: 1}]
           coverage: {values_found: 4}
+          settled:
+            basis: "KTD8 step 5 and R15 (an uncertain value goes to review): H2 states only the year of occupancy
+              (ואוכלס בשנת 2015); reading it as the build year is an assumption, so it waits for review - reported as
+              awaiting review, never used and never 'not stated'"
+            result: {value: "1", n: 3, facts: [H1-F08, H3-F01, H8-F01]}
+            values: [{fact: H1-F08, page: 2}]
+            coverage: {values_found: 3, awaiting_review: [H2]}
   - id: GQ35
     category: computation
     held_out: true
@@ -519,6 +553,12 @@ items:
                    facts: [H1-F01, H2-F01, H3-F04]}
           values: [{fact: H2-F01, page: 1}, {fact: H3-F04, page: 1}]
           coverage: {values_found: 3, not_stated_includes: [H8]}
+          settled:
+            basis: "as GQ28 (KTD8 step 5, KTD9, R15): H3's area is an assumed conversion from inner dimensions in cm, so
+              it waits for review; 1 of the 2 observed values (H2 9.5 m2) is below 11 m2"
+            result: {value: "1", n: 2, facts: [H1-F01, H2-F01]}
+            values: [{fact: H2-F01, page: 1}]
+            coverage: {values_found: 2, awaiting_review: [H3]}
   - id: GQ36
     category: computation
     held_out: true
@@ -532,6 +572,13 @@ items:
           result: {scope: {city: גבעתיים}, attribute: balcony_count, metric: mean, value: "1.50", unit: count, n: 2, facts: [H4v2-F05, H5-F03]}
           values: [{fact: H4v2-F05, page: 1}, {fact: H5-F03, page: 1}]
           coverage: {values_found: 2}
+          settled:
+            basis: "KTD8 step 4 (code parses the value from the quote): H5 names its one balcony only by a singular noun
+              (מרפסת חזית בשטח 7 מ״ר) with no number or number word, so H5 does not state the count - reported as not
+              stated, never used"
+            result: {value: "2.00", n: 1, facts: [H4v2-F05]}
+            values: [{fact: H4v2-F05, page: 1}]
+            coverage: {values_found: 1, not_stated_includes: [H5]}
 
   # --- attributes nobody extracted yet ------------------------------------------------------------------
   - id: GQ37
@@ -732,6 +779,11 @@ items:
           result: {scope: {city: גבעתיים}, attribute: balcony_area, metric: values, n: 2, facts: [H4v2-F06, H5-F04]}
           values: [{fact: H4v2-F06, page: 1}, {fact: H5-F04, page: 1}]
           coverage: {values_found: 2}
+          settled:
+            basis: "as GQ29 (KTD8 steps 4-5): H4v2's two balcony areas in one sentence wait for review"
+            result: {n: 1, facts: [H5-F04]}
+            values: [{fact: H5-F04, page: 1}]
+            coverage: {values_found: 1, awaiting_review: [H4v2]}
       - ask: "עכשיו בנושא אחר: אילו שומות מזכירות היתר בנייה?"
         expect:
           relation: topic_change
@@ -835,7 +887,9 @@ items:
           task_type: answer
           outcome: answer
           cleared: [attribute]
-          sources: {all_of: [{doc: H3, page: 2}]}
+          note: H3 page 1 is the report header that names the appraised property (address); citing it beside the
+            zoning sentence is valid (scorer-changes.md S6)
+          sources: {all_of: [{doc: H3, page: 2}], also_valid: [{doc: H3, page: 1}]}
           values: [{fact: H3-F10, value: "מגורים ב׳"}]
   - id: GQ56
     category: new_topic

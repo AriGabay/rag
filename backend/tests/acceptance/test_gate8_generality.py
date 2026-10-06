@@ -65,32 +65,26 @@ GATE_FACETS = ("flow", "task_type", "relation", "tool", "state", "no_price_clari
 # Items that fail even with a perfect (oracle) extractor and a correct plan: gaps of the system or of the
 # question file, each also seen in the real-model sample (docs/evaluation/real-model-sample.md, "Failure
 # analysis"). Letters: (a) interpretation/routing, (c) extraction/validation, (d) composition, (e) expectation.
-# Strict: once a gap is fixed the item passes, the xfail turns into a failure and the entry must go.
-_TOOL_CLARIFICATION = ("(e) the clarification is raised by the tool, so the plan's task type stays "
-                       "{task}; the file expects 'clarify' (a turn the server turns into a question before any "
-                       "tool runs is recorded as 'clarify'; GQ47 expects the planned task for the same kind of turn)")
+# Each entry names the facets the gap covers ("facet" for every turn, "2.facet" for turn 2 only); every other
+# facet of the item stays enforced. Strict per facet: once a named facet passes, the xfail turns into a failure and
+# that facet (or the entry) must go.
+# Removed (docs/evaluation/scorer-changes.md): GQ51/GQ52 (a clarification raised by the computation tool is the
+# expected clarification, S4) and GQ28/GQ35/GQ36/GQ29/GQ49/GQ34 (the answer key now asserts the settled
+# per-document state, S9: H3 / H4v2 / H2 awaiting review, H5 not stating a count).
 _REVIEW_TIER = ("(c) the server routes these values to review (several values in one version, a synonym or "
                 "plural naming term, an inferred unit), so no reviewed or preliminary figure exists")
 _REJECTED = "(c) server validation rejects a stated value: {why}"
-_SUM_IN_QUOTE = ("(c)/(e) H4 states two balcony areas in one quote (12 and 6 מ״ר) and the answer key takes their sum "
-                 "(18) per apartment; the server never adds values inside a quote, so that version goes to review "
-                 "and only H5's value is observed")
 _OTHER_VERB = ("(c) {docs} name the year by another verb, not a form or root of the attribute's words; another "
                "phrasing goes to review, so {n} values are observed")
-KNOWN_GAPS: dict[str, str] = {
-    "GQ51": _TOOL_CLARIFICATION.format(task="compute"),
-    "GQ52": _TOOL_CLARIFICATION.format(task="compute"),
-    "GQ28": _REJECTED.format(why="inner dimensions in cm (300 על 350 ס״מ) give an assumed area that goes to review"),
-    "GQ35": _REJECTED.format(why="H3's inner dimensions in cm go to review, so 2 of the 3 values are observed"),
-    "GQ40": _REJECTED.format(why="a renovation is an event, not a quantity: 'no changes' (H1) has no year and "
-                                 "another stated year is not accepted, so 3 of the 5 values are observed"),
-    "GQ36": _REJECTED.format(why="H5 states its one balcony only by a singular noun (מרפסת חזית בשטח 7 מ״ר); "
-                                 "no number or number word is quoted, so 1 of the 2 values is observed"),
-    **{i: _SUM_IN_QUOTE for i in ("GQ29", "GQ49")},
-    "GQ33": _OTHER_VERB.format(docs="H2 (ואוכלס בשנת 2015) and H3 (הבניין הושלם בשנת 2004)", n="6 of the 8"),
-    "GQ34": _OTHER_VERB.format(docs="H2 (ואוכלס בשנת 2015)", n="3 of the 4"),
-    "GQ39": _REVIEW_TIER,
-    "GQ37": ("(a)/(d) without cloud use the question is planned as an answer (search) and the passages come "
+KNOWN_GAPS: dict[str, tuple[tuple[str, ...], str]] = {
+    "GQ40": (("result", "coverage"),
+             _REJECTED.format(why="a renovation is an event, not a quantity: 'no changes' (H1) has no year and "
+                                  "another stated year is not accepted, so 3 of the 5 values are observed")),
+    "GQ33": (("result", "coverage"),
+             _OTHER_VERB.format(docs="H2 (ואוכלס בשנת 2015) and H3 (הבניין הושלם בשנת 2004)", n="6 of the 8")),
+    "GQ39": (("result", "coverage"), _REVIEW_TIER),
+    "GQ37": (("task_type", "outcome", "abstention_kind"),
+             "(a)/(d) without cloud use the question is planned as an answer (search) and the passages come "
              "with no abstention_kind; the file expects compute + not_extracted_or_verified"),
 }
 # Not strict: the recorded follow-up plan names S# handles issued in the live conversation; replayed here they
@@ -354,6 +348,16 @@ def gworld(owner_engine):
     w.close()
 
 
+def _gate_reasons(results: list[dict]) -> list[tuple[int, str, str]]:
+    """(turn, facet, reason) of every failed gate facet."""
+    return [(r["turn"], reason.split(":", 1)[0], reason) for r in results for reason in r["reasons"]
+            if reason.split(":", 1)[0] in GATE_FACETS]
+
+
+def _in_gap(turn: int, facet: str, named: tuple[str, ...]) -> bool:
+    return facet in named or f"{turn}.{facet}" in named
+
+
 def _gate_failures(results: list[dict]) -> list[str]:
     out = []
     for r in results:
@@ -370,10 +374,15 @@ def _check(results: list[dict], item_id: str) -> None:
     failures = _gate_failures(results)
     if item_id in UNSTABLE and failures:
         pytest.xfail(UNSTABLE[item_id] + " | " + "; ".join(failures)[:400])
-    if item_id in KNOWN_GAPS:
-        if failures:
-            pytest.xfail(KNOWN_GAPS[item_id] + " | " + "; ".join(failures)[:400])
-        pytest.fail(f"{item_id} passes now: remove it from KNOWN_GAPS")
+    if item_id in KNOWN_GAPS:  # strict, and only for the named facets: every other facet stays enforced
+        named, why = KNOWN_GAPS[item_id]
+        reasons = _gate_reasons(results)
+        outside = [f"{item_id}.{t} {reason}" for t, facet, reason in reasons if not _in_gap(t, facet, named)]
+        assert not outside, "\n".join(outside + [f for f in failures if " -> task " in f])
+        fixed = [n for n in named if not any(_in_gap(t, facet, (n,)) for t, facet, _ in reasons)]
+        if fixed:
+            pytest.fail(f"{item_id}: the known-gap facets {fixed} pass now: remove them from KNOWN_GAPS")
+        pytest.xfail(why + " | " + "; ".join(failures)[:400])
     assert not failures, "\n".join(failures)
 
 
