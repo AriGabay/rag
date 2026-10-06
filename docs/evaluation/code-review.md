@@ -82,3 +82,31 @@ Pinned by `test_plan.py::test_a_place_the_question_does_not_name_is_dropped`, `�
 | — | residual | Two appraisals of one property at different dates are one entity. A time-dependent value (a price) that differs between them is a conflict sent to review, not two observations | KTD8 keys entities by property, not by date |
 | — | residual | `year_from` is sometimes used by the model in place of a value condition on a year attribute (GQ40, 2 of 3 replays) | The prompt states the rule. The server has no structural signal to tell them apart |
 | — | residual | Property type, area basis, data kind and VAT basis cannot filter a computation over extracted facts | The answer now says so in a limitation, instead of silently showing the condition chip (GQ38) |
+
+## After the round-7 diagnosis
+
+The diagnosis of the round-7 runs ([failure-analysis-r7.md](failure-analysis-r7.md)) contradicted parts of this write-up, and the browser and existing-set reruns found more. The fixes below rest on evidence from the v1 regression set, the existing 77-turn set or the browser run. The held-out v2 set was not used for any fix.
+
+| defect | evidence | fix |
+|---|---|---|
+| One un-negated or quoted query variant listed every document stating the opposite. Fix #32 above was incomplete | GQ50 (v1): 7 documents listed for "no elevator", all of which have one | A question about absence keeps only its negated variants. Phrase quotes are dropped (`ede9ca4`). The test fails on the old code |
+| Min/max left out a conflicted property that would be the extreme | GQ33 (v1): "oldest 1968" while the conflicted property is 1958/1962 | The extreme is withheld and both values are shown (`f0f4c76`) |
+| A question that shares one word with an option was read as the clarification's answer | browser run 1 | Every content word must name the option |
+| A clarify plan with no question fell to limited mode | browser run 1, real-model replay 2/3 | The server asks its own short question |
+| A word misread in a scanned report turned a correct locate into an abstention | existing set T04 | A document lacking only the words found nowhere is listed, with the caveat |
+| A self-contained new question was asked back as "which appraisal?" | existing set T10 | It is searched as asked, unless worded as a continuation ("ומה לגבי…") |
+| Answers cached by older server logic were served after a deploy | the final run measured 9 cache hits | `TEMPLATE_VERSION` is in the cache key and was bumped to `t2` |
+
+The diagnosis also found defect classes that this PR does **not** fix. They are the main blockers to professional use, and each causes wrong or missing answers on the v2 set:
+
+- **S1. Percent against ratio.** An attribute whose unit dimension is `ratio` never accepts "%". The interpreter chose `ratio` for cap rate, depreciation and occupancy.
+- **S3. A document named by its year.** A claim that names its document by the year in its title ("במסמך 2023") fails layer 1.
+- **S4. Number words outside counts.** "שישה מטרים" and "עשר שנים" are not read.
+- **S5. Boolean facts.** They are stored as raw text, so every `= true/false` filter counts 0.
+- **S6. Attribute handles.** The handle the model chose is not checked against the model's own description of the attribute.
+- **S7. Turn relation mapping.** Relations are compared by free-text topic, so "ובפתח תקווה?" becomes a topic change. The GQ48.3 fix above does not cover it.
+- **S8. A document list asked as values.** "Which documents…" with metric `values` becomes a computation.
+- **S9. One address in two cities.** The same street address in two cities is answered for both instead of asking which.
+- **S10. Units.** The column-header unit overrides "למ״ר לחודש" in the row label, and there is no rent-period dimension.
+- **S12. Abstention kind.** A scoped search with no supported passage says `not_found` instead of `not_stated`.
+- **S13. Values in thousands.** "X אלף ₪ למ״ר" parses as currency, not as currency per area.

@@ -2,7 +2,116 @@
 
 Consolidated report for the plan `docs/plans/2026-10-06-0856-feat-general-question-engine-plan.md` (R27–R29). Detailed results: [eval-results.md](eval-results.md) (existing 77-turn set), [real-model-sample.md](real-model-sample.md) (held-out set with the real model, with a per-item failure analysis), [example-conversations.md](example-conversations.md) (real transcripts), [browser-tests.md](browser-tests.md), [load-test.md](load-test.md), [extraction-experiment.md](extraction-experiment.md). All data is synthetic.
 
-## Bottom line
+## Round 7 (2026-10-06): diagnosis, review fixes, regression and held-out v2
+
+This round followed the user's instructions for this stage:
+
+- classify every failure by stage, with evidence;
+- fix the scorer only where it was wrong;
+- separate extraction from answering;
+- audit every computation;
+- review clarification, negation, topic change and attribute canonicalization;
+- turn the 54 v1 items into a regression set and add a new held-out set v2;
+- re-run the browser tests with the real model.
+
+The detail lives in these files:
+
+- [failure-analysis.md](failure-analysis.md): round 6, 28 turns.
+- [code-review.md](code-review.md): what was fixed, what remains, and the counter-tests.
+- [scorer-changes.md](scorer-changes.md): every scorer and answer-key change, with its justification.
+- [failure-analysis-r7.md](failure-analysis-r7.md): round 7, both sets, with per-computation audits.
+- [browser-tests.md](browser-tests.md).
+
+### Results by kind of evidence
+
+**Software tests (deterministic; no model).** Backend: 1408 passed, 4 skipped, 4 xfailed. Gate 8 runs recorded plans with an oracle extractor: 60 passed, 4 registered gaps. Each registered gap names its facet and fails as soon as it is fixed. Frontend typecheck and lint are clean.
+
+**Previous capabilities: the existing 77-turn set.** 76/77 on the final head; it was 77/77 before this round.
+
+- The one failure, A02, is a data collision, not an engine change: the v2 seed added a document set in "רמת החייל", the neighborhood A02 relies on as unknown.
+- During the round, T04 and T10 regressed. Both were fixed, and each fix has a test that fails on the old code.
+
+**Browser (Playwright, real stack, real model in office A).** Final run on the final head: **29 passed, 0 failed, 2 skipped**. Each earlier run's failure was a real defect, fixed with a counter-test (see [browser-tests.md](browser-tests.md)). The two skips:
+
+- the limited-mode spec needs limited mode, and this stack runs demo mode when cloud use is off;
+- the facts-review spec now acts only in office B, which has nothing to review.
+
+**Model and extraction quality (OpenAI `gpt-5.4-mini`, one run per row; not deterministic).**
+
+| set | role | items passed | held-out items | turns | notes |
+|---|---|---|---|---|---|
+| v1 `questions_general.yaml`, round 6, old scorer | — | 35/60 | 31/54 (57.4%) | 41/69 | before this round |
+| v1 round 6, re-scored offline with the new scorer | — | 41/60 | 36/54 (66.7%) | 49/69 | the scorer change alone; no item became a pass through a loosened rule ([scorer-changes.md](scorer-changes.md)) |
+| v1, round 7 (`580eb29`) | **regression** | 46/60 | 40/54 (74.1%) | 55/69 | after the review fixes |
+| v1, round 8 | regression | 46/60 | 41/54 (75.9%) | 55/69 | after the GQ50 / GQ33 fixes |
+| v1, round 9 | regression | 52/60 | 47/54 (87.0%) | 61/69 | **9 answers served from cache**, so this row is not a clean measurement |
+| **v1, final head, no cache** | **regression** | **48/60** | **42/54 (77.8%)** | **56/69** | AE1, AE3, AE5 and AE6 (GQ20, GQ23) pass. AE4 (GQ49) and AE6 GQ22 failed this run: GQ49.2 on a task label, GQ22 on the changed assumption. Both passed in round 8. AE2 is not runnable with cloud on |
+| **v2 `questions_holdout_v2.yaml`**, run 1 (`580eb29`) | **held-out** | 32/65 | **29/62 (46.8%)** | 34/75 | new documents, topics and phrasings, with answers fixed before any run; never used for a fix |
+
+The regression set moves by about ±3 items between runs of the same code (rounds 8 and final). The movement comes from the model's plan labels and its wording, and the failure analysis locates the stage each time.
+
+**The v2 result is the honest measure of generality, and it is weak.** The analysis in [failure-analysis-r7.md](failure-analysis-r7.md) splits the v2 failures as follows:
+
+- 15 turns are interpretation problems: the wrong task label, the wrong attribute handle, or two properties at one address treated as one.
+- 12 are extraction problems: percent against ratio, number words outside counts, a unit taken from the column header over the row label, and value roles.
+- 4 are verification: a claim that names its document by a year is rejected.
+- 4 are conversation context: relation mapping.
+- 2 are retrieval, 2 are the scorer, 1 is computation (boolean typing), and 1 is harness timing.
+
+**The arithmetic was correct in every audited computation in both sets.** The wrong figures come from which facts were extracted or accepted, and from scope rules. They do not come from the computation code.
+
+### Wrong answers found this round (not merely partial)
+
+- **v1, round 7: GQ50** listed seven documents for "no elevator", and every one states there is one. Cause: an un-negated query variant. **Fixed** (`ede9ca4`) and pinned by a test that fails on the old code.
+- **v1, round 7: GQ33** named 1968 as the oldest building while a property held back for conflicting values (1958 / 1962) is older. **Fixed** (`f0f4c76`): an unreviewed conflict that could be the extreme now withholds the minimum and shows both values.
+- **v2 (not fixed, to keep v2 clean; the general defect classes are listed in [failure-analysis-r7.md](failure-analysis-r7.md)):**
+
+  | item | what the answer said | truth | cause |
+  |---|---|---|---|
+  | HV32 | mean monthly rent 31,322.40 | 55,490 | a rent per m² taken as a monthly rent: the column header unit overrode the row label |
+  | HV34 | narrowest road 12 m, marked complete | 6 m | a value written in words was not read |
+  | HV38 | 0 properties below full occupancy | 2 | boolean facts are never typed |
+  | HV41 | 0 properties with a warning note | 2 | boolean facts are never typed |
+  | HV57.2 | a maintenance figure for another city's building | — | turn relation mapped wrongly |
+  | HV55.1 | a rent per m² listed as a monthly rent | — | same cause as HV32 |
+  | HV64 | documents listed for "no easements" that have one | — | a quoted variant lost its negation; the GQ50 fix covers this class |
+  | HV65 | documents listed for "no vacancy deduction" that have one | — | same class as HV64 |
+
+- **False "not stated" coverage lines in v2.** Cap rate, depreciation, construction cost and occupancy were reported as not stated in all 28 documents, because every value was rejected on the percent/ratio dimension.
+
+### What this round changed
+
+- **Meaning, not only text** (user item 6):
+  - a quote is moved only within its cited row or chunk;
+  - a count counts its own noun;
+  - a zero word must govern the attribute;
+  - a value named by another registered attribute is rejected.
+- **Extraction separated from answering** (item 3): one definition per meaning across phrasings, with a test that a rephrased question makes no model call. Reviewed facts survive re-extraction. Document-specific failures are not re-sent.
+- **Computation audit and completeness** (items 4–5): every computation answer carries a per-document audit, and the figure is stated as complete, as a subset of explicitly counted observations, or not at all.
+- **Clarifications** (item 7):
+  - the word-count rule is replaced by structural checks, with counter-tests;
+  - negation is scoped to its clause;
+  - choosing a source resumes the comparison;
+  - places must be named by the turn itself.
+- **Review findings** fixed across the API, reliability, security and frontend. See [code-review.md](code-review.md).
+
+### Not ready for professional use
+
+The regression set is at 77.8% on a fresh run, and on the held-out v2 set, 46.8% of items pass every scored facet. Eight v2 answers state something wrong. Several of the causes are general extraction defects that will recur on new topics:
+
+- percent and ratio;
+- number words outside counts;
+- boolean typing;
+- units from table headers;
+- period units.
+
+The engine must not be used for professional answers until these are fixed and a fresh held-out set (v3) confirms it.
+
+### Data note: a test changed office A
+
+The browser spec `facts-review.spec.ts` fell back to office A when office B had nothing to review, and approved one fact per run. Two wrong facts in office A ("אחוזי תכסית": K1 "92%" and K3v2 "5%", both role `other`) are now `verified`. The spec is fixed so it acts in office B only. The two facts should go back to `needs_review` in the review screen (or by SQL) before the next evaluation run.
+
+## Round 6 bottom line (kept for history)
 
 - **Previous capabilities: kept.** The existing evaluation scores 77/77 against the live stack with office A in cloud mode. No expected answer was changed. Acceptance gates 1–7 stay green.
 - **The engine reaches held-out topics through one path.** No topic word occurs in `backend/app` (guard test). Every held-out question is interpreted into a validated plan and runs the same tools. No held-out item hit a price clarification except GQ53, a generic "average size" question.
