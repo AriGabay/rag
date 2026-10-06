@@ -27,6 +27,7 @@ from sqlalchemy import create_engine, text
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from app.answering.attributes import STRUCTURED_ATTRIBUTES  # noqa: E402  (single source of truth, KTD7)
 from app.security import hash_password  # noqa: E402
 
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -42,21 +43,6 @@ EMPLOYEES = [
     {"email": "yossi@demo.test", "full_name": "יוסי (עובד, קבוצה 2)", "groups": ["G2"], "can_upload": False},
 ]
 CHECK_FIELDS = ("price", "area", "area_type", "transaction_date", "valuation_date")
-# Structured attributes map to whitelisted record columns (see the CHECK in migration 0004).
-STRUCTURED_ATTRIBUTES = [
-    {"key": "price_per_sqm", "label_he": "מחיר למ״ר",
-     "aliases": ["מחיר למטר", "מחיר למ\"ר", "מחיר למטר רבוע", "מחיר למטר מרובע", "שווי למ״ר"],
-     "unit_dimension": "currency_per_area", "canonical_unit": "ILS/sqm", "column": "transactions.price_per_sqm"},
-    {"key": "price", "label_he": "מחיר",
-     "aliases": ["מחיר עסקה", "מחיר מכירה", "סכום העסקה", "תמורה"],
-     "unit_dimension": "currency", "canonical_unit": "ILS", "column": "transactions.price"},
-    {"key": "area", "label_he": "שטח",
-     "aliases": ["שטח דירה", "שטח הנכס", "שטח במ״ר", "גודל הדירה"],
-     "unit_dimension": "area", "canonical_unit": "sqm", "column": "transactions.area"},
-    {"key": "rooms", "label_he": "מספר חדרים",
-     "aliases": ["חדרים", "מס׳ חדרים", "כמות חדרים"],
-     "unit_dimension": "count", "canonical_unit": "room", "column": "occurrences.rooms"},
-]
 
 
 def log(msg: str) -> None:
