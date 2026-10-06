@@ -60,7 +60,7 @@ VALUE_TYPES = ("numeric", "text", "boolean", "date")
 # x2: a value must be named as the attribute (attribute_term). x3: table cells carry their row label, counts
 # as words, W×H dimensions, text values. x4: a value bound to its own label among several, terms of the same
 # root, stated absence as zero; earlier ledger states are read again.
-EXTRACTION_PROMPT_VERSION = "x5"
+EXTRACTION_PROMPT_VERSION = "x6"
 _WORD = re.compile(r"[\w״׳]+")
 _FILLER = frozenset({"של"})  # "שטח של הדירה" names the same attribute as "שטח הדירה"
 _COLUMNS = ("id, key, label_he, aliases, value_type, unit_dimension, canonical_unit, source, structured_column,"
