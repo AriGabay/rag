@@ -345,3 +345,72 @@ export interface AdminCoverage {
   open_dedup_candidates: number;
   review_queue_count: number;
 }
+
+// ---------- Facts review (U11) ----------
+
+export type FactStatus = "auto_validated" | "needs_review" | "verified" | "corrected" | "rejected";
+
+export interface FactUnitOption {
+  /** Unit code sent back on correction; "" means a plain number without a unit. */
+  code: string;
+  label: string;
+}
+
+export interface FactAttribute {
+  id: string;
+  label: string;
+  value_type: string;
+  unit_dimension: string | null;
+  canonical_unit: string | null;
+  canonical_unit_label: string | null;
+  /** Units of the attribute's dimension only (empty for non-numeric attributes). */
+  unit_options: FactUnitOption[];
+  facts_version: number;
+}
+
+/** One fact as a row: the value in the attribute's canonical unit, the verbatim quote and the page link. */
+export interface FactBrief {
+  id: string;
+  status: FactStatus;
+  value: string | null;
+  unit: string | null;
+  unit_label: string | null;
+  original: { value_text: string | null; unit: string | null; unit_label: string | null };
+  quote: string;
+  page: number | null;
+  url: string;
+  document: { id: string; title: string };
+  version_id: string;
+}
+
+export interface FactHistoryEntry {
+  action: "approve" | "reject" | "correct";
+  status: FactStatus;
+  at: string;
+  by: string;
+  value_numeric?: string | null;
+  canonical_value?: string | null;
+  unit?: string | null;
+}
+
+export interface ReviewFact extends FactBrief {
+  entity_role: string;
+  entity_descriptor: string | null;
+  review_note: string | null;
+  reviewed_at: string | null;
+  previous: FactHistoryEntry[];
+  /** Differing values for the same entity in documents the reviewer can see (computed at read time). */
+  conflicts: FactBrief[];
+}
+
+export interface FactDetail extends ReviewFact {
+  attribute: FactAttribute;
+  facts_version: number;
+}
+
+export interface FactReviewGroup {
+  attribute: FactAttribute;
+  documents: { document: { id: string; title: string }; version_id: string; facts: ReviewFact[] }[];
+}
+
+// ---------- end Facts review ----------

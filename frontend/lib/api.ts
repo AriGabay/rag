@@ -18,6 +18,8 @@ import type {
   SearchResult,
   UploadResult,
 } from "./types";
+// Facts review (U11)
+import type { FactDetail, FactReviewGroup } from "./types";
 
 export const UNSENT_QUESTION_KEY = "rag.unsentQuestion";
 export const LOGIN_NEXT_KEY = "rag.loginNext";
@@ -211,3 +213,24 @@ export const api = {
   testProvider: () => request<AdminSettings>("/api/admin/provider/test", { method: "POST" }),
   coverage: () => request<AdminCoverage>("/api/admin/coverage"),
 };
+
+// ---------- Facts review (U11) ----------
+
+export const factsApi = {
+  list: () => request<{ attributes: FactReviewGroup[] }>("/api/review/facts"),
+  get: (id: string) => request<FactDetail>(`/api/review/facts/${encodeURIComponent(id)}`),
+  approve: (id: string, note?: string) =>
+    request<FactDetail>(`/api/review/facts/${encodeURIComponent(id)}/approve`, {
+      method: "POST",
+      body: note ? { note } : {},
+    }),
+  reject: (id: string, note: string) =>
+    request<FactDetail>(`/api/review/facts/${encodeURIComponent(id)}/reject`, { method: "POST", body: { note } }),
+  correct: (id: string, value: string, unit: string, note?: string) =>
+    request<FactDetail>(`/api/review/facts/${encodeURIComponent(id)}/correct`, {
+      method: "POST",
+      body: note ? { value, unit, note } : { value, unit },
+    }),
+};
+
+// ---------- end Facts review ----------
