@@ -484,3 +484,90 @@ def test_locate_treats_query_variants_as_alternatives(office):
     with tenant_tx(a.ctx()) as conn:
         out = locate_evidence(conn, ["מעלית בבניין לא קיימת", "ללא מעלית", "אין מעלית בבניין"])
     assert {d.document_id for d in out.documents} == {d1, d2}
+
+
+def _locate_out(ctx, queries, **kw):
+    from app.platform.search import locate_evidence
+
+    with tenant_tx(ctx) as conn:
+        return locate_evidence(conn, queries, **kw)
+
+
+def test_locate_keeps_every_fully_supported_document_despite_a_phrase_bonus(office):
+    """GQ50: the document whose words stood next to each other scored 1.25, two others that fully said "no
+    elevator" scored 1.0, and the relative threshold (0.9 x 1.25) dropped them."""
+    a, *_ = office
+    adjacent, _ = _doc(a, [("בדירה אין מעלית בבניין ישן.", [1])])
+    far, _ = _doc(a, [("הדירה בקומה השלישית בבניין בן ארבע קומות ללא מעלית.", [1])])
+    other_sentence, _ = _doc(a, [("הדירה בקומה שנייה. הבניין ישן, ללא מעלית.", [2])])
+    has_it, _ = _doc(a, [("לבניין יש מעלית ואין חניה.", [1])])
+    for queries in (["אין מעלית בבניין"], ["אין מעלית בבניין", "ללא מעלית בבניין"]):
+        out = _locate_out(a.ctx(), queries)
+        assert {d.document_id for d in out.documents} == {adjacent, far, other_sentence}, queries
+        assert all(d.full_support for d in out.documents) and out.documents[0].document_id == adjacent
+        assert out.absent_terms == []
+
+
+def test_locate_negation_must_govern_the_topic_term(office):
+    """Testing review P2: a negation of another term in the same sentence is not "no elevator"."""
+    a, *_ = office
+    no_parking, _ = _doc(a, [("לבניין יש מעלית ואין חניה.", [1])])
+    but, _ = _doc(a, [("אין חניה, אך הבניין כולל מעלית.", [1])])
+    without, _ = _doc(a, [("בבניין ללא מעלית.", [1])])
+    not_incl, _ = _doc(a, [("הבניין אינו כולל מעלית.", [1])])
+    out = _locate_out(a.ctx(), ["באילו שומות אין מעלית"])
+    assert {d.document_id for d in out.documents} == {without, not_incl}
+    assert {no_parking, but}.isdisjoint({d.document_id for d in out.documents})
+
+
+def test_locate_question_word_found_nowhere_lists_nothing(office):
+    """GQ43: "pool" occurs in no document, so "building" alone made a passage complete and an unrelated
+    document was listed as relevant. Nothing is listed, and the absent word is reported."""
+    from app.platform.search import SearchScope
+
+    a, *_ = office
+    docs = [_doc(a, [(f"שומת מקרקעין — הדקלים {i}. תיאור הנכס והבניין: דירה בבניין בן {i + 3} קומות.", [1])])[0]
+              for i in range(4)]
+    _doc(a, [("עסקאות השוואה באזור.", [1])])
+    out = _locate_out(a.ctx(), ["באילו שומות יש בריכה בבניין"])
+    assert out.documents == [] and out.absent_terms == ["בריכה"]
+    scoped = _locate_out(a.ctx(), ["הדקלים 1 בריכה בניין", "בריכה ברחוב הדקלים 1", "הדקלים 1 יש בריכה"],
+                         scope=SearchScope(document_ids=(docs[1],)))
+    assert scoped.documents == [] and "בריכה" in scoped.absent_terms
+
+
+def test_locate_absent_word_in_one_variant_does_not_block_another(office):
+    """Counter-test: variants are alternatives. A word only one rephrasing adds, found nowhere, does not hide
+    the documents another variant fully supports."""
+    a, *_ = office
+    sukkah, _ = _doc(a, [("לדירה מרפסת סוכה פתוחה.", [1])])
+    _doc(a, [("הדירה בקומה שנייה.", [1])])
+    out = _locate_out(a.ctx(), ["באילו שומות יש סוכה מפוארת", "מרפסת סוכה"])
+    assert [d.document_id for d in out.documents] == [sukkah] and out.documents[0].full_support
+    assert out.absent_terms == []
+
+
+def test_locate_absent_word_keeps_partial_documents_with_a_distinctive_word(office):
+    """Counter-test: a document naming a word that tells documents apart is still listed (partially), and
+    the word found nowhere is reported for the caller."""
+    a, *_ = office
+    strong, _ = _doc(a, [("חוות הדעת מתייחסת לפיצול הדירה לשתי יחידות.", [1])])
+    for i in range(3):
+        _doc(a, [(f"הדירה בקומה {i + 1}.", [1])])
+    out = _locate_out(a.ctx(), ["איפה מוזכר פיצול של נכס מסחרי?"])
+    assert [d.document_id for d in out.documents] == [strong] and not out.documents[0].full_support
+    assert set(out.absent_terms) == {"נכס", "מסחרי"}
+
+
+def test_locate_document_keeps_the_passages_of_every_supporting_variant(office):
+    """GQ57 (regression from d405ae2): only the best variant's passages were kept, so the page-1 passage that
+    another variant fully supported was lost."""
+    a, *_ = office
+    doc, _ = _doc(a, [("המרפסת הפונה לחזית נסגרה בתריסים ללא היתר בנייה.", [1]),
+                      ("סגירת המרפסת ללא היתר עלולה לחייב הריסה.", [2])])
+    _doc(a, [("הדירה בקומה שנייה.", [1])])
+    out = _locate_out(a.ctx(), ["מרפסת נסגרה בלי היתר", "סגירת מרפסת ללא היתר"])
+    [found] = out.documents
+    assert found.document_id == doc and found.full_support and found.pages == [1, 2]
+    texts = [p["text"] for p in found.passages]
+    assert texts[0].startswith("סגירת") and any("נסגרה" in t for t in texts)

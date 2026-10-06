@@ -111,3 +111,27 @@ def query_tokens(query: str) -> list[str]:
             tokens.extend(_word_variants(tok))
     seen: set[str] = set()
     return [t for t in tokens if not (t in seen or seen.add(t))]
+
+
+# --- negation (one vocabulary for search, interpretation and composition) ---------------------------
+
+# Negation and absence words. "אל" is also the preposition "to" ("פונה אל הרחוב"): it is listed (the
+# prohibitive "don't") but marked ambiguous, so callers that read running text can leave it out.
+NEGATION_WORDS = frozenset(
+    "לא אין אינו אינה אינם אינן איננו איננה ללא בלי מבלי אל היעדר העדר בהיעדר בהעדר".split()
+)
+AMBIGUOUS_NEGATIONS = frozenset({"אל"})
+# Prefixes a negation takes ("ואין", "שלא", "כשאין", "וללא"). Not ב/ל/מ/כ alone: "מלא" (full) and
+# "כלא" (prison) are not negations.
+_NEGATION_PREFIXES = ("וכש", "וש", "כש", "ו", "ש")
+
+
+def is_negation(word: str, *, ambiguous: bool = True) -> bool:
+    """Whether a normalized word is a negation, bare or after a conjunction/relative prefix ("ואין",
+    "שלא"). With ``ambiguous=False`` words that are also prepositions ("אל") never count; an ambiguous
+    word counts only bare ("שאל" is "asked", "ואל" is "and to")."""
+    def listed(w: str, bare: bool) -> bool:
+        return w in NEGATION_WORDS and (w not in AMBIGUOUS_NEGATIONS or (ambiguous and bare))
+
+    return listed(word, True) or any(
+        word.startswith(p) and listed(word[len(p):], False) for p in _NEGATION_PREFIXES)

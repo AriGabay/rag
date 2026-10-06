@@ -20,15 +20,17 @@ page 1 full of address words.
 
 ``locate_documents`` ranks documents rather than passages for "which documents mention X" questions:
 every distinctive topic term of the question, in one passage, beats some of them; a negation in the
-question ("אין", "ללא") is a term the passage must carry next to the topic; words present in every
-document weigh almost nothing; only documents close to the best are kept."""
+question ("אין", "ללא") is a term the passage must carry governing the topic ("ללא X", not "יש X ואין Y");
+words present in every document weigh almost nothing. Every fully supported document is kept; partial
+matches are kept only close to the best, and never when a question word occurs in no document in scope
+unless they name a word that tells documents apart (``LocateOutcome.absent_terms`` lists such words)."""
 
 from __future__ import annotations
 
 import math
 import re
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from uuid import UUID
 
@@ -40,9 +42,11 @@ from app.answering.places import KNOWN_CITIES
 from app.db import TenantContext, tenant_tx
 from app.deps import get_ctx
 from app.extraction.normalize_text import (
+    NEGATION_WORDS,
     STOPWORDS,
     base_normalize,
     inflection_variants,
+    is_negation,
     prefix_variants,
     query_tokens,
 )
@@ -87,38 +91,34 @@ class _Sql:
                   " JOIN documents d ON d.id = c.document_id AND d.deleted_at IS NULL")
 
 
-def _scope_sql(scope: SearchScope | None, allowed_versions: list[UUID] | None = None) -> _Sql:
-    sql = _Sql()
+def _scope_conditions(scope: SearchScope | None, version_col: str, document_col: str) -> tuple[list[str], dict]:
+    """WHERE conditions and parameters of ``scope`` for a query that joins ``document_versions v``: current
+    versions only, unless the caller names version ids and asks for older ones (``include_noncurrent``)."""
     conds: list[str] = []
+    params: dict = {}
     if scope and scope.version_ids:
-        sql.params["scope_v"] = list(scope.version_ids)
-        conds.append("c.version_id = ANY(:scope_v)")
+        params["scope_v"] = list(scope.version_ids)
+        conds.append(f"{version_col} = ANY(:scope_v)")
         conds.append("(v.is_current OR v.id = ANY(:scope_v))" if scope.include_noncurrent else "v.is_current")
     else:
         conds.append("v.is_current")
     if scope and scope.document_ids:
-        sql.params["scope_d"] = list(scope.document_ids)
-        conds.append("c.document_id = ANY(:scope_d)")
+        params["scope_d"] = list(scope.document_ids)
+        conds.append(f"{document_col} = ANY(:scope_d)")
+    return conds, params
+
+
+def _scope_sql(scope: SearchScope | None, allowed_versions: list[UUID] | None = None) -> _Sql:
+    conds, params = _scope_conditions(scope, "c.version_id", "c.document_id")
     if allowed_versions is not None:
-        sql.params["scope_allowed"] = allowed_versions
+        params["scope_allowed"] = allowed_versions
         conds.append("c.version_id = ANY(:scope_allowed)")
-    sql.where = " AND ".join(conds)
-    return sql
-
-
-def _versions_in_scope(conn: Connection, scope: SearchScope | None) -> list[UUID]:
-    return [v for v, _ in _scoped_versions(conn, scope)]
+    return _Sql(where=" AND ".join(conds), params=params)
 
 
 def _scoped_versions(conn: Connection, scope: SearchScope | None) -> list[tuple[UUID, UUID]]:
     """(version id, document id) of the visible versions in ``scope``."""
-    conds, params = ["v.is_current"], {}
-    if scope and scope.version_ids:
-        params["v"] = list(scope.version_ids)
-        conds = ["v.id = ANY(:v)", "(v.is_current OR v.id = ANY(:v))" if scope.include_noncurrent else "v.is_current"]
-    if scope and scope.document_ids:
-        params["d"] = list(scope.document_ids)
-        conds.append("v.document_id = ANY(:d)")
+    conds, params = _scope_conditions(scope, "v.id", "v.document_id")
     return [(r.id, r.document_id) for r in conn.execute(
         text("SELECT v.id, v.document_id FROM document_versions v"
              " JOIN documents d ON d.id = v.document_id AND d.deleted_at IS NULL"
@@ -343,22 +343,34 @@ def hybrid_search(conn: Connection, query: str, limit: int = 8, *, scope: Search
 LOCATE_LIMIT = 12
 LOCATE_CANDIDATES = 600
 PASSAGES_PER_DOCUMENT = 3
-RELATIVE_THRESHOLD = 0.9  # keep documents scoring at least this share of the best
+RELATIVE_THRESHOLD = 0.9  # partial documents: keep those scoring at least this share of the best
 COMPLETE_SHARE = 0.9  # a passage carrying this share of the topic weight supports the whole topic
-PHRASE_WEIGHT = 0.25  # bonus for adjacent question words found next to each other
+PHRASE_WEIGHT = 0.25  # bonus for adjacent question words found next to each other (ranks, never excludes)
 PHRASE_WINDOW = 2
-NEGATION_WINDOW = 3
+# Words between a negation and the term it governs: at most this many, and at most one content word
+# ("אינו כולל X", "אין בו X").
+NEGATION_GAP = 2
+# A word found in at most this share of the documents in scope tells them apart; one in more of them
+# ("בניין", or an address every passage of a one-document scope names) does not.
+DISTINCTIVE_DF_SHARE = 0.5
 # Question-form words of "which documents mention ..." questions: never topic terms.
 LOCATE_META = frozenset(
     "מוזכר מוזכרת מוזכרים מוזכרות מזכיר מזכירה מזכירים מזכירות מצוין מצוינת מצוינים מצוינות צוין צוינה "
-    "כתובה כתובים איפה היכן באיזו באיזה באילו אלו שומה השומה בשומה שומת".split()
+    "כתובה כתובים מופיע מופיעה מופיעים מופיעות איפה היכן באיזו באיזה באילו אלו שומה השומה בשומה שומת "
+    # emphasis and hedging words a question adds ("...בכלל?")
+    "בכלל כלשהו כלשהי כלשהם כלשהן בדיוק ממש אכן בפרט למשל".split()
 )
-# Negation and absence words: a question that negates needs a passage that negates.
-NEGATIONS = frozenset("אין ללא בלי לא אינו אינה אינם אינן היעדר העדר".split())
+# Words that end the reach of a negation: a coordinator opens a new clause, "יש" affirms.
+COORDINATORS = frozenset("אך אבל או אולם ואילו אלא".split())
+AFFIRMATIVES = frozenset({"יש", "שיש", "ויש"})
+# Negations that are prepositions or nouns ("without", "absence of"): they negate only what follows them.
+PREPOSED_NEGATIONS = frozenset("ללא בלי מבלי היעדר העדר בהיעדר בהעדר".split())
 # Words that ask about table structure; a table-row passage satisfies them.
 TABLE_WORDS = frozenset("טבלה טבלת טבלאות עמודה עמודת עמודות טור טורים".split())
 _WORD_RE = re.compile(r"[\w״׳./]+")
 _HEB = re.compile(r"[א-ת][א-ת״׳]*")
+# Between two words: a comma, semicolon, dash, parenthesis or table cell border closes a clause.
+_CLAUSE_BREAK = re.compile(r"[,;|()\[\]—–]|\s-\s")
 
 
 @dataclass
@@ -371,6 +383,7 @@ class _Group:
     df: int = 0
     weight: float = 0.0
     kind: str = "term"  # term | negation | table
+    governs: tuple[str, ...] = ()  # negation: the question terms it governs ("בלי X" -> "X")
 
 
 @dataclass
@@ -391,13 +404,17 @@ class LocateOutcome:
     documents: list[RankedDocument]
     topic_terms: list[str]
     filter_report: FilterReport | None = None
+    # Question words that occur in no document in scope. When set, no document is fully supported: the
+    # caller can say these words were not found (and abstain when ``documents`` is empty).
+    absent_terms: list[str] = field(default_factory=list)
 
 
 def _negation(word: str) -> bool:
-    return word in NEGATIONS or any(
-        word[k:] in NEGATIONS and all(ch in "והבלמשכ" for ch in word[:k]) for k in (1, 2))
+    # "אל" is also the preposition "to": in running text it is never read as a negation.
+    return is_negation(word, ambiguous=False)
 
 
+@lru_cache(maxsize=8192)
 def _word_forms(word: str) -> frozenset[str]:
     """The forms the index holds for a passage word: itself, prefix-stripped and singular forms."""
     if not _HEB.fullmatch(word):
@@ -406,33 +423,81 @@ def _word_forms(word: str) -> frozenset[str]:
     return frozenset(out + [v for w in out for v in inflection_variants(w)])
 
 
-def _words(text_: str, places: Sequence[str] = ()) -> list[tuple[str, int]]:
-    """(word, sentence number) of normalized text without its place names; a word ending with a period
-    closes its sentence."""
-    out, sentence = [], 0
+def _words(text_: str, places: Sequence[str] = ()) -> list[tuple[str, int, int]]:
+    """(word, sentence number, clause number) of normalized text without its place names; a word ending
+    with a period closes its sentence, and a sentence end or ``_CLAUSE_BREAK`` closes a clause."""
+    out: list[tuple[str, int, int]] = []
+    sentence = clause = prev_end = 0
     norm = _strip_places(base_normalize(text_), places) if places else base_normalize(text_)
     for m in _WORD_RE.finditer(norm):
+        if out and _CLAUSE_BREAK.search(norm, prev_end, m.start()):
+            clause += 1
         raw = m.group(0)
         word = raw.strip("./-׳״")
         if word:
-            out.append((word, sentence))
+            out.append((word, sentence, clause))
+        prev_end = m.end()
         follows = norm[m.end():m.end() + 1]
         if (raw.endswith(".") and not re.fullmatch(r"[\d.]+", raw)) or (follows and follows in "!?;"):
             sentence += 1
+            clause += 1
     return out
+
+
+def _light(word: str) -> bool:
+    """A function word: a stopword, or a preposition/pronoun of at most two letters ("בו", "את")."""
+    return word in STOPWORDS or sum(ch.isalpha() for ch in word) <= 2
+
+
+def _blocks(word: str) -> bool:
+    """A word a negation does not reach across: a coordinator, a ו-prefixed word opening a new conjunct
+    ("ואין", "וגם"), or the affirmative "יש"."""
+    return word in COORDINATORS or word in AFFIRMATIVES or (word.startswith("ו") and len(word) >= 3)
+
+
+def _governs(words: list[tuple[str, int, int]], i: int, j: int) -> bool:
+    """Whether the negation at ``i`` governs the word at ``j``, in the same clause:
+
+    - before it, with at most ``NEGATION_GAP`` words between, at most one of them a content word, and no
+      coordinator or affirmative ("ללא X", "אינו כולל X", "אין בו X"; not "אין Y ויש X");
+    - or directly after it, bare (no ו/ש prefix) and not a preposition ("ללא", "בלי"), as a label and its
+      value ("X: אין", "X לא קיימת"), when no "יש" affirms the word earlier in the clause (not "יש X ואין
+      Y", not "X שלא הוחלפה", not "X ללא Y")."""
+    clause = words[j][2]
+    if words[i][2] != clause:
+        return False
+    if i < j:
+        gap = [w for w, *_ in words[i + 1:j]]
+        return (len(gap) <= NEGATION_GAP and sum(not _light(w) for w in gap) <= 1
+                and not any(_blocks(w) for w in gap))
+    return (i == j + 1 and words[i][0] in NEGATION_WORDS and words[i][0] not in PREPOSED_NEGATIONS
+            and not any(w in AFFIRMATIVES for w, _, c in words[:j] if c == clause))
+
+
+def _negated_words(words: list[tuple[str, int, int]], i: int) -> tuple[str, ...]:
+    """The words a question's negation at ``i`` negates: the first content word it governs after it ("בלי
+    X"), and the content word it directly follows as a predicate ("X לא קיים")."""
+    def content(j: int) -> bool:
+        return not _light(words[j][0]) and words[j][0] not in LOCATE_META and _governs(words, i, j)
+
+    after = next((words[j][0] for j in range(i + 1, len(words)) if content(j)), None)
+    before = words[i - 1][0] if i and content(i - 1) else None
+    return tuple(w for w in (after, before) if w)
 
 
 def _question_groups(query: str, place_terms: Iterable[str]) -> list[_Group]:
     groups: list[_Group] = []
-    words = [w for w, _ in _words(query, (*place_terms, *KNOWN_CITIES))]
+    located = _words(query, (*place_terms, *KNOWN_CITIES))
+    words = [w for w, *_ in located]
     for pos, word in enumerate(words):
         if _negation(word):
             if not any(g.kind == "negation" for g in groups):
-                groups.append(_Group(word, pos, kind="negation"))
+                groups.append(_Group(word, pos, kind="negation", governs=_negated_words(located, pos)))
         elif word in TABLE_WORDS or any(v in TABLE_WORDS for v in prefix_variants(word)):
             if not any(g.kind == "table" for g in groups):
                 groups.append(_Group(word, pos, kind="table"))
-        elif (word not in STOPWORDS and word not in LOCATE_META and not _YEAR.fullmatch(word)
+        elif (word not in STOPWORDS and word not in LOCATE_META
+              and not any(v in LOCATE_META for v in prefix_variants(word)) and not _YEAR.fullmatch(word)
               and (sum(ch.isalpha() for ch in word) >= 2 or any(ch.isdigit() for ch in word))
               and not any(g.word == word for g in groups)):
             groups.append(_Group(word, pos))
@@ -496,31 +561,47 @@ class _Passage:
     row: object
     supported: list[_Group]
     score: float
-    complete: bool
+    complete: bool  # carries the whole topic
+    cohesive: bool = False  # carries the whole topic within one sentence
 
 
 def _score_passage(row, present: list[_Group], pairs: list[tuple[_Group, _Group]], total: float,
-                   places: tuple[str, ...]) -> _Passage:
+                   places: tuple[str, ...], completable: bool = True) -> _Passage:
     words = _words(row.text, places)  # a word inside a place name ("גן" of "רמת גן") is not the topic
-    forms = [_word_forms(w) for w, _ in words]
+    forms = [_word_forms(w) for w, *_ in words]
     at = {id(g): [i for i, f in enumerate(forms) if f & g.forms] for g in present if g.kind == "term"}
     supported = [g for g in present if g.kind == "term" and at[id(g)]]
+    # The sentences each supported group occurs in (a table group holds for the whole passage).
+    where = {id(g): {words[i][1] for i in at[id(g)]} for g in supported}
     table = next((g for g in present if g.kind == "table"), None)
     if table is not None and (row.kind == "table_row" or any(f & TABLE_WORDS for f in forms)):
         supported.append(table)
+        where[id(table)] = {s for _, s, _ in words}
     negation = next((g for g in present if g.kind == "negation"), None)
     if negation is not None:
-        # The negation must sit next to a distinctive term (weight at least the mean), not a common word.
-        mean = sum(g.weight for g in present if g.kind == "term") / max(1, sum(g.kind == "term" for g in present))
-        topic_at = [i for g in supported if g.kind == "term" and g.weight >= mean - 1e-9 for i in at[id(g)]]
-        if any(_negation(w) and any(abs(i - j) <= NEGATION_WINDOW and words[j][1] == s for j in topic_at)
-               for i, (w, s) in enumerate(words)):
+        # The negation must govern the term the question negates ("בלי X": X), or, when the
+        # question's negation governs no term, a distinctive one (weight at least the mean), never a common
+        # word or a neighbouring clause's subject ("יש X ואין Y" does not negate X).
+        if any(g.kind == "term" and g.word in negation.governs for g in present):
+            targets = [g for g in supported if g.kind == "term" and g.word in negation.governs]
+        else:
+            mean = sum(g.weight for g in present if g.kind == "term") / max(1, sum(g.kind == "term" for g in present))
+            targets = [g for g in supported if g.kind == "term" and g.weight >= mean - 1e-9]
+        topic_at = [i for g in targets for i in at[id(g)]]
+        governed = {words[j][1] for i, (w, *_) in enumerate(words) if _negation(w)
+                    for j in topic_at if _governs(words, i, j)}
+        if governed:
             supported.append(negation)
+            where[id(negation)] = governed
     share = sum(g.weight for g in supported) / total if total else 0.0
     near = sum(1 for a, b in pairs if any(abs(i - j) <= PHRASE_WINDOW for i in at.get(id(a), [])
                                           for j in at.get(id(b), [])))
     score = share + (PHRASE_WEIGHT * near / len(pairs) if pairs else 0.0)
-    return _Passage(row, supported, score, share >= COMPLETE_SHARE - 1e-9)
+    complete = completable and share >= COMPLETE_SHARE - 1e-9
+    cohesive = complete and any(
+        sum(g.weight for g in supported if s in where[id(g)]) / total >= COMPLETE_SHARE - 1e-9
+        for s in {s for _, s, _ in words})
+    return _Passage(row, supported, score, complete, cohesive)
 
 
 def locate_evidence(conn: Connection, queries: Sequence[str], *, scope: SearchScope | None = None,
@@ -530,7 +611,9 @@ def locate_evidence(conn: Connection, queries: Sequence[str], *, scope: SearchSc
 
     Query variants are alternatives: a document fully supported by any one variant qualifies, so a word
     only one rephrasing adds ("...לא קיימת") cannot push out documents another variant names exactly.
-    When no variant is fully supported anywhere, the variants are pooled as one question."""
+    Each variant is judged alone (terms are never pooled across fully supported variants); a document
+    keeps the passages of every variant that fully supports it. When no variant is fully supported
+    anywhere, the variants are pooled as one question."""
     queries = [q for q in queries if q and q.strip()][:MAX_QUERIES]
     place_terms = list(place_terms)
     if len(queries) > 1:
@@ -538,15 +621,34 @@ def locate_evidence(conn: Connection, queries: Sequence[str], *, scope: SearchSc
                     for q in queries]
         full = [o for o in outcomes if any(d.full_support for d in o.documents)]
         if full:
-            merged: dict = {}
-            for o in full:
-                for d in o.documents:
-                    if d.full_support and (d.document_id not in merged or d.score > merged[d.document_id].score):
-                        merged[d.document_id] = d
-            docs = sorted(merged.values(), key=lambda d: (-d.score, str(d.title)))
             names = list(dict.fromkeys(w for o in full for w in o.topic_terms))
-            return LocateOutcome(docs[:limit], names, full[0].filter_report)
+            return LocateOutcome(_merge_variants(full)[:limit], names, full[0].filter_report)
     return _locate(conn, queries, scope=scope, filters=filters, place_terms=place_terms, limit=limit)
+
+
+def _merge_variants(outcomes: list[LocateOutcome]) -> list[RankedDocument]:
+    """Every version some variant fully supports, scored by its best variant, with the union of the
+    passages of all variants that fully support it (deduplicated, best first)."""
+    found: dict[UUID, list[RankedDocument]] = {}
+    for o in outcomes:
+        for d in o.documents:
+            if d.full_support:
+                found.setdefault(d.version_id, []).append(d)
+    docs: list[RankedDocument] = []
+    for variants in found.values():
+        best = max(variants, key=lambda d: d.score)  # the earliest variant on a tie
+        variants = [best, *(d for d in variants if d is not best)]
+        passages: dict = {}
+        for d in variants:
+            for p in d.passages:
+                if p["chunk_id"] not in passages or p["score"] > passages[p["chunk_id"]]["score"]:
+                    passages[p["chunk_id"]] = p
+        ranked = sorted(passages.values(), key=lambda p: -p["score"])
+        matched = list(dict.fromkeys(w for d in variants for w in d.matched_terms))
+        docs.append(replace(best, matched_terms=matched,
+                            missing_terms=[w for w in best.missing_terms if w not in matched],
+                            pages=sorted({pg for p in ranked for pg in p["page_list"]}), passages=ranked))
+    return sorted(docs, key=lambda d: (-d.score, str(d.title), str(d.version_id)))
 
 
 def _locate(conn: Connection, queries: Sequence[str], *, scope: SearchScope | None,
@@ -556,16 +658,21 @@ def _locate(conn: Connection, queries: Sequence[str], *, scope: SearchScope | No
     groups: list[_Group] = []
     for q in queries:
         for g in _question_groups(q, place_terms):
-            if not any(o.kind == g.kind and (g.kind != "term" or o.word == g.word) for o in groups):
+            same = next((o for o in groups if o.kind == g.kind and (g.kind != "term" or o.word == g.word)), None)
+            if same is None:
                 groups.append(g)
+            elif g.kind == "negation":  # pooled variants: the negation governs what any of them negates
+                same.governs = tuple(dict.fromkeys((*same.governs, *g.governs)))
     names = [g.word for g in groups]
     if sql is None or not any(g.kind == "term" for g in groups):
         return LocateOutcome([], names, report)
-    _weigh(conn, groups, sql)
+    n = _weigh(conn, groups, sql)
+    # A question word no document in scope contains: no passage can carry the whole question.
+    unfound = [g.word for g in groups if g.kind == "term" and not g.df]
     present = [g for g in groups if g.df or (g.kind == "negation" and g.weight)]
     terms = [g for g in present if g.kind == "term"]
     if not terms:
-        return LocateOutcome([], names, report)
+        return LocateOutcome([], names, report, unfound)
     total = sum(g.weight for g in present)
     first = queries[0]
     order = [g for g in _question_groups(first, place_terms) if g.kind == "term"]
@@ -583,24 +690,38 @@ def _locate(conn: Connection, queries: Sequence[str], *, scope: SearchScope | No
     places = (*place_terms, *KNOWN_CITIES)
     by_version: dict = {}
     for r in rows:
-        p = _score_passage(r, present, pairs, total, places)
+        p = _score_passage(r, present, pairs, total, places, completable=not unfound)
         if p.supported:
             by_version.setdefault(r.version_id, []).append(p)
+    if unfound:
+        # Only passages naming a word that tells documents apart can be about the question; one that
+        # shares only words most documents in scope carry ("בניין", the scope's own address) is not.
+        by_version = {v: kept for v, ps in by_version.items()
+                      if (kept := [p for p in ps if any(g.kind == "term" and g.df <= DISTINCTIVE_DF_SHARE * n
+                                                        for g in p.supported)])}
     if not by_version:
-        return LocateOutcome([], names, report)
+        return LocateOutcome([], names, report, unfound)
     best = {v: max(ps, key=lambda p: p.score) for v, ps in by_version.items()}
-    pool = {v: b for v, b in best.items() if any(p.complete for p in by_version[v])}
-    if pool:  # a complete passage exists somewhere: documents with only part of the topic do not count
-        best = {v: max((p for p in by_version[v] if p.complete), key=lambda p: p.score) for v in pool}
+    # Tiers, best first: the whole topic in one sentence, in one passage, part of it. Only documents of
+    # the best tier present count (the phrase bonus ranks within a tier, never across).
+    for tier in (lambda p: p.cohesive, lambda p: p.complete):
+        if any(tier(p) for ps in by_version.values() for p in ps):
+            best = {v: max((p for p in ps if tier(p)), key=lambda p: p.score)
+                    for v, ps in by_version.items() if any(tier(p) for p in ps)}
+            break
     top = max(b.score for b in best.values())
     absent = [g.word for g in groups if g not in present]
     tokens = sorted({f for g in terms for f in g.forms})
     out: list[RankedDocument] = []
     for v, b in sorted(best.items(), key=lambda kv: (-kv[1].score, str(kv[1].row.title), str(kv[0]))):
-        if b.score < RELATIVE_THRESHOLD * top:
+        # The threshold trims partial matches only: a fully supported document is never dropped because
+        # another one's words happen to stand next to each other (the phrase bonus ranks, never excludes).
+        if not b.complete and b.score < RELATIVE_THRESHOLD * top:
             continue
-        chosen = sorted((p for p in by_version[v] if p.score >= RELATIVE_THRESHOLD * b.score),
-                        key=lambda p: (-p.score, p.row.chunk_index))[:PASSAGES_PER_DOCUMENT]
+        # Complete passages first (within one sentence first), then partial ones close to the document's best.
+        chosen = sorted((p for p in by_version[v] if p.complete or p.score >= RELATIVE_THRESHOLD * b.score),
+                        key=lambda p: (not p.cohesive, not p.complete, -p.score, p.row.chunk_index)
+                        )[:PASSAGES_PER_DOCUMENT]
         pages = sorted({pg for p in chosen for pg in (p.row.page_list or [])})
         matched = [g.word for g in present if g in b.supported]
         out.append(RankedDocument(
@@ -608,7 +729,7 @@ def _locate(conn: Connection, queries: Sequence[str], *, scope: SearchScope | No
             full_support=b.complete and not absent, matched_terms=matched,
             missing_terms=[g.word for g in groups if g.word not in matched],
             pages=pages, passages=[_hit(p.row, p.score, True, tokens) for p in chosen]))
-    return LocateOutcome(out[:limit], names, report)
+    return LocateOutcome(out[:limit], names, report, unfound)
 
 
 def locate_documents(conn: Connection, queries: Sequence[str], *, scope: SearchScope | None = None,
