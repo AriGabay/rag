@@ -146,11 +146,21 @@ def upgrade_extraction_version(conn: Connection) -> int:
         {"pv": EXTRACTION_PROMPT_VERSION}).rowcount
 
 
-def list_attribute_handles(conn: Connection) -> list[dict]:
-    """The office's definitions as interpreter handles A1..An (structured entries ensured first)."""
+def list_attribute_handles(conn: Connection, *, useful_only: bool = False) -> list[dict]:
+    """The office's definitions as interpreter handles A1..An (structured entries ensured first).
+
+    ``useful_only`` (what the interpreter sees) keeps structured and active definitions and the proposed
+    ones that already hold a usable fact: a definition left behind by a loose phrasing would otherwise
+    attract later questions. A hidden definition is still matched by its exact label."""
     ensure_structured_attributes(conn)
     upgrade_extraction_version(conn)
-    return [_handle_dict(f"A{i}", r) for i, r in enumerate(_rows(conn), start=1)]
+    rows = _rows(conn)
+    if useful_only:
+        useful = set(conn.execute(text(
+            "SELECT DISTINCT attribute_id FROM facts WHERE status IN ('auto_validated', 'verified', 'corrected')"
+        )).scalars())
+        rows = [r for r in rows if r.source == "structured" or r.status == "active" or r.id in useful]
+    return [_handle_dict(f"A{i}", r) for i, r in enumerate(rows, start=1)]
 
 
 def handle_map(handles: list[dict]) -> dict[str, UUID]:
@@ -179,6 +189,40 @@ def _to_def(r, created: bool = False) -> AttributeDef:
     )
 
 
+# Words the interpreter may use for a measurement dimension, mapped to ``CANONICAL_UNITS`` keys.
+_DIMENSION_SYNONYMS = {
+    "area": "area", "size": "area", "surface": "area",
+    "length": "length", "height": "length", "width": "length", "depth": "length", "distance": "length",
+    "volume": "volume",
+    "count": "count", "quantity": "count", "number": "count", "amount": "count",
+    "currency": "currency", "money": "currency", "price": "currency", "value": "currency",
+    "currency_per_area": "currency_per_area", "price_per_area": "currency_per_area",
+    "percent": "percent", "percentage": "percent", "ratio": "ratio",
+    "year": "year", "date": "year", "duration": "duration", "time": "duration",
+}
+
+
+def normalize_dimension(dimension: str | None) -> str | None:
+    """A known measurement dimension, or None (unknown words never become a dimension)."""
+    if not dimension:
+        return None
+    return _DIMENSION_SYNONYMS.get(dimension.strip().lower())
+
+
+def _with_dimension(conn: Connection, r, dimension: str | None):
+    """An extracted numeric definition created without a dimension takes the one a later request
+    names: values measured in that dimension stop being "unit assumed", and its documents are read
+    again so their facts are converted."""
+    if (dimension is None or r.source != "extracted" or r.value_type != "numeric" or r.unit_dimension
+            is not None):
+        return r
+    conn.execute(text("UPDATE attribute_definitions SET unit_dimension = :d, canonical_unit = :u,"
+                      " facts_version = facts_version + 1 WHERE id = :a"),
+                 {"d": dimension, "u": canonical_unit_for(dimension), "a": r.id})
+    conn.execute(text("UPDATE fact_extraction_ledger SET state = 'pending' WHERE attribute_id = :a"), {"a": r.id})
+    return conn.execute(text(f"SELECT {_COLUMNS} FROM attribute_definitions WHERE id = :a"), {"a": r.id}).one()
+
+
 def resolve_attribute(
     conn: Connection,
     *,
@@ -203,6 +247,7 @@ def resolve_attribute(
     def fits(r) -> bool:
         return value_type is None or r.value_type == value_type or r.source == "structured"
 
+    unit_dimension = normalize_dimension(unit_dimension)
     ensure_structured_attributes(conn)
     rows = _rows(conn)
     if handle:
@@ -211,7 +256,7 @@ def resolve_attribute(
         for r in rows:
             if r.id == target:
                 if fits(r):
-                    return _to_def(r)
+                    return _to_def(_with_dimension(conn, r, unit_dimension))
                 description = r.label_he  # the same attribute, asked as another type
     description = (description or "").strip()
     if not _tokens(description):
@@ -219,7 +264,7 @@ def resolve_attribute(
     # structured entries first, then the oldest definition
     for r in sorted(rows, key=lambda r: r.source != "structured"):
         if fits(r) and any(labels_match(description, name) for name in [r.label_he, *(r.aliases or [])]):
-            return _to_def(r)
+            return _to_def(_with_dimension(conn, r, unit_dimension))
     value_type = value_type or "numeric"
     if value_type != "numeric":
         unit_dimension = None

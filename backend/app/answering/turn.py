@@ -312,7 +312,7 @@ def load(conn: Connection, conv) -> Loaded:
     legacy = conv.pending_clarification or {}
     return Loaded(
         conversation_id=conv.id, state=state, state_version=conv.state_version, gazetteer=load_gazetteer(conn),
-        attributes=list_attribute_handles(conn), provider=provider, pstate=pstate,
+        attributes=list_attribute_handles(conn, useful_only=True), provider=provider, pstate=pstate,
         conflict_pending=legacy if legacy.get("key") == FILTER_CONFLICT else None,
         previous={"question": prev.question_text, "turn_plan": prev.plan["turn_plan"]} if prev else None,
         data_version=current_data_version(conn),

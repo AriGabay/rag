@@ -26,7 +26,7 @@ from app.answering.state import ConversationState, PendingClarification
 from app.extraction.normalize_text import STOPWORDS, base_normalize, prefix_variants
 from app.providers.llm import CallStatus, LLMProvider, Purpose
 
-PROMPT_VERSION = "interpret-v4"
+PROMPT_VERSION = "interpret-v5"
 MAX_PROMPT_PLACES = 300
 
 INTERPRET_INSTRUCTIONS = (
@@ -72,7 +72,9 @@ INTERPRET_INSTRUCTIONS = (
     "כספי בשאלה שאינה כספית.\n"
     "attribute: מזהה התכונה מהרשימה רק כשהיא אותה תכונה בדיוק; שטח, מידה או כמות של רכיב או חלל בתוך הנכס "
     "הם תכונה אחרת משטח הנכס כולו, וגם מספר הפריטים ושטחם הן שתי תכונות שונות. אחרת handle=null ותיאור "
-    "התכונה בעברית כפי שנאמרה. בשאלת המשך שאינה מזכירה תכונה חדשה כתוב null. metric: none כשאין חישוב.\n"
+    "התכונה בעברית כפי שנאמרה. בשאלת המשך שאינה מזכירה תכונה חדשה כתוב null. metric: none כשאין חישוב. "
+    "unit_dimension של תכונה מספרית הוא תמיד אחד מאלה: area, length, volume, count, currency, "
+    "currency_per_area, percent, ratio, year, duration.\n"
     "search_queries: עד שלוש שאילתות חיפוש עצמאיות בעברית, מובנות בלי השיחה. steps: עד ארבעה צעדים. "
     "clarification: רק כשלא ברור לאיזה מסמך, נכס או תכונה הכוונה. אל תשאל על היקף או על סוג המסמכים: "
     "עבוד על כל המסמכים המורשים, והמערכת תציג את הכיסוי. כשאפשר לענות עם הסתייגות ברורה, אל תשאל.\n"

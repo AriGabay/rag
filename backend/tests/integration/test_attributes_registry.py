@@ -157,3 +157,30 @@ def test_text_value_type_is_honored_and_never_reuses_a_numeric_definition(office
     assert resolve(a, "מחיר", unit_dimension=None, value_type="text").source == "structured"
     with pytest.raises(ValueError):
         resolve(a, "צבע החזית", unit_dimension=None, value_type="color")
+
+
+def test_a_definition_created_without_a_dimension_takes_one_named_later(db):
+    """Found with the real model: a definition created with no dimension made every value "unit assumed"
+    (all went to review). A later request naming the dimension upgrades it and re-reads its documents."""
+    from app.answering.attributes import normalize_dimension
+
+    a = make_office(db, "משרד א", "a@example.test")
+    with tenant_tx(a.ctx()) as conn:
+        first = resolve_attribute(conn, handle=None, description="גובה החלל", unit_dimension=None)
+        assert first.unit_dimension is None
+        again = resolve_attribute(conn, handle=None, description="גובה החלל", unit_dimension="height")
+    assert again.id == first.id and again.unit_dimension == "length" and again.canonical_unit == "m"
+    assert again.facts_version == first.facts_version + 1
+    assert normalize_dimension("Quantity") == "count" and normalize_dimension("משהו") is None
+
+
+def test_the_interpreter_sees_only_definitions_that_proved_useful(db):
+    from app.answering.attributes import list_attribute_handles
+
+    a = make_office(db, "משרד א", "a@example.test")
+    with tenant_tx(a.ctx()) as conn:
+        resolve_attribute(conn, handle=None, description="ניסוח רופף שלא הניב דבר", unit_dimension="area")
+        everything = {h["label"] for h in list_attribute_handles(conn)}
+        shown = {h["label"] for h in list_attribute_handles(conn, useful_only=True)}
+    assert "ניסוח רופף שלא הניב דבר" in everything and "ניסוח רופף שלא הניב דבר" not in shown
+    assert {"שטח", "מחיר", "מחיר למ״ר", "מספר חדרים"} <= shown
