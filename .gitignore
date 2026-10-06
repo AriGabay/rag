@@ -1,0 +1,20 @@
+# secrets and local data
+.env
+*.env.local
+data/
+real_documents/
+backups/
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+# node
+node_modules/
+.next/
+frontend/test-results/
+frontend/playwright-report/
+# os
+.DS_Store

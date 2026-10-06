@@ -1,0 +1,111 @@
+"""Document processing worker: claims jobs from the Postgres queue and runs the pipeline.
+
+Run with ``python -m app.worker``. Several workers may run; ``jobs_claim`` uses
+FOR UPDATE SKIP LOCKED so a job is never processed twice concurrently, and an expired lease
+lets another worker resume a crashed job."""
+
+from __future__ import annotations
+
+import logging
+import os
+import signal
+import socket
+import threading
+import time
+import traceback
+from uuid import UUID
+
+from sqlalchemy import text
+
+from app.config import get_settings
+from app.db import anonymous_tx, tenant_tx
+from app.extraction.base import ExtractionError
+from app.platform import pipeline
+from app.platform.jobs import fail_job, finish_job, renew_lease
+
+logger = logging.getLogger("app.worker")
+
+FAILED_REASON = "העיבוד נכשל ({attempts} ניסיונות). ניתן להעלות את הקובץ מחדש"
+
+
+class _LeaseKeeper(threading.Thread):
+    def __init__(self, office_id: UUID, job_id: UUID, worker_id: str):
+        super().__init__(daemon=True)
+        self.office_id, self.job_id, self.worker_id = office_id, job_id, worker_id
+        self.stop_event = threading.Event()
+
+    def run(self) -> None:
+        interval = max(5, get_settings().job_lease_seconds // 3)
+        while not self.stop_event.wait(interval):
+            try:
+                with tenant_tx(pipeline.system_ctx(self.office_id)) as conn:
+                    renew_lease(conn, self.job_id, self.worker_id)
+            except Exception:  # noqa: BLE001
+                logger.warning("lease renewal failed for job %s", self.job_id)
+
+
+def claim(worker_id: str):
+    with anonymous_tx() as conn:
+        return conn.execute(
+            text("SELECT * FROM jobs_claim(:w, :s)"), {"w": worker_id, "s": get_settings().job_lease_seconds}
+        ).first()
+
+
+def run_one(worker_id: str) -> bool:
+    """Claim and process one job. Returns False when the queue was empty."""
+    job = claim(worker_id)
+    if job is None:
+        return False
+    ctx = pipeline.system_ctx(job.office_id)
+    keeper = _LeaseKeeper(job.office_id, job.job_id, worker_id)
+    keeper.start()
+    try:
+        try:
+            pipeline.process_version(job.office_id, job.version_id)
+        finally:
+            keeper.stop_event.set()  # always stop renewing before recording the outcome
+    except ExtractionError as exc:
+        with tenant_tx(ctx) as conn:
+            terminal = fail_job(conn, job.job_id, exc.reason, exc.permanent, job.attempts, job.max_attempts)
+        if terminal:
+            pipeline.mark_failed(ctx, job.version_id, exc.reason)
+        else:
+            pipeline.mark_retry(ctx, job.version_id)
+        logger.info("job %s extraction error (permanent=%s)", job.job_id, exc.permanent)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("job %s failed: %s", job.job_id, type(exc).__name__)
+        logger.debug("%s", traceback.format_exc())
+        with tenant_tx(ctx) as conn:
+            terminal = fail_job(conn, job.job_id, type(exc).__name__, False, job.attempts, job.max_attempts)
+        if terminal:
+            pipeline.mark_failed(ctx, job.version_id, FAILED_REASON.format(attempts=job.attempts))
+        else:
+            pipeline.mark_retry(ctx, job.version_id)
+    else:
+        with tenant_tx(ctx) as conn:
+            finish_job(conn, job.job_id)
+    return True
+
+
+def main() -> None:
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    worker_id = f"{socket.gethostname()}:{os.getpid()}"
+    stopping = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stopping.set())
+    signal.signal(signal.SIGINT, lambda *_: stopping.set())
+    if get_settings().embedding_provider == "local":
+        from app.providers.embeddings import get_embedding_provider
+
+        get_embedding_provider().warmup()
+    logger.info("worker %s started", worker_id)
+    while not stopping.is_set():
+        try:
+            if not run_one(worker_id):
+                stopping.wait(1.0)
+        except Exception:  # noqa: BLE001
+            logger.exception("worker loop error")
+            time.sleep(2)
+
+
+if __name__ == "__main__":
+    main()
