@@ -163,6 +163,14 @@ def test_plural_question_finds_singular_passage(office):
     assert hits and hits[0]["document_id"] == doc and hits[0]["lexical_support"]
 
 
+def test_construct_plural_question_finds_definite_plural_passage(office):
+    # "שיקולי" (construct of "שיקולים") finds "השיקולים"; the passage shares no other word with the question.
+    a, *_ = office
+    doc, _ = add_chunks(a, a.default_group_id, ["השיקולים שנבחנו כללו את מצב התחזוקה של הבניין."], "7" * 64)
+    hits = _search(a.ctx(), ["מה היו שיקולי הוועדה?"]).hits
+    assert hits and hits[0]["document_id"] == doc and hits[0]["lexical_support"]
+
+
 def test_shared_place_name_alone_is_not_evidence(office):
     a, *_ = office
     place_doc, _ = add_chunks(a, a.default_group_id, ["הנכס ממוקם ברמת גן, ברחוב ביאליק."], "5" * 64)

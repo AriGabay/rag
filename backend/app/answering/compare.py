@@ -6,6 +6,10 @@ Evidence is retrieved per side under the user's RLS, and every side needs at lea
 otherwise the result says the comparison is incomplete and names the side that lacks evidence, never
 comparing one-sidedly. Statements are labeled by document or version, and conflicts on the same datum are
 reported with the sources of both sides.
+
+The tool runs in three phases so no transaction is open across model calls (R26, KTD13): ``gather_sides``
+reads under the caller's ``tenant_tx``, ``compose_comparison`` makes the answer and judge calls with no
+connection, and the caller logs ``CompareOutcome.usage`` in a final short transaction.
 """
 
 from __future__ import annotations
@@ -16,12 +20,12 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
-from app.answering.compose import answer_fields, compose_answer, source_json
-from app.answering.content import evidence_from_hits, log_usage, select_provider
+from app.answering.compose import Usage, answer_fields, compose_answer, source_json
+from app.answering.content import evidence_from_hits
 from app.answering.coverage import coverage
-from app.db import TenantContext
 from app.platform.search import SearchScope, search_evidence
-from app.providers.status import Mode
+from app.providers.llm import LLMProvider
+from app.providers.status import Mode, ProviderState
 
 PER_SIDE_LIMIT = 4
 
@@ -50,6 +54,7 @@ class CompareOutcome:
     answer: dict
     source_rows: list[dict] = field(default_factory=list)
     cacheable: bool = True
+    usage: list[Usage] = field(default_factory=list)  # model calls made, logged by the caller afterwards
 
 
 def _resolve(conn: Connection, side: CompareSide) -> _Resolved | None:
@@ -74,15 +79,30 @@ def _label(r: _Resolved, side: CompareSide, sides: list[_Resolved | None]) -> st
     return f"{r.title}, גרסה {r.version_no}" if (r.explicit_version or same_title) else r.title
 
 
-def compare_sides(conn: Connection, ctx: TenantContext, question: str, sides: Sequence[CompareSide], *,
-                  queries: Sequence[str] = ()) -> CompareOutcome:
-    """Compare two or more sides over evidence retrieved for each. ``queries`` are the search queries
-    (the question when empty)."""
+@dataclass
+class CompareGathered:
+    """What the gather phase read for a comparison: labeled evidence per side and the coverage."""
+
+    question: str
+    evidence: list[dict]
+    side_info: list[dict]
+    missing: list[str]
+    coverage: dict
+
+    @property
+    def source_rows(self) -> list[dict]:
+        return [{"document_id": e["document_id"], "version_id": e["version_id"], "chunk_id": e["chunk_id"],
+                 "page_list": e["page_list"]} for e in self.evidence]
+
+
+def gather_sides(conn: Connection, question: str, sides: Sequence[CompareSide], *,
+                 queries: Sequence[str] = ()) -> CompareGathered:
+    """The gather phase: resolve each side and retrieve its evidence under the user's RLS (database reads
+    only, no model call). ``queries`` are the search queries (the question when empty)."""
     if len(sides) < 2:
         raise ValueError("a comparison needs at least two sides")
     resolved = [_resolve(conn, s) for s in sides]
     queries = [q for q in queries if q and q.strip()] or [question]
-    provider, state = select_provider(conn)
     evidence: list[dict] = []
     missing: list[str] = []
     side_info = []
@@ -106,29 +126,31 @@ def compare_sides(conn: Connection, ctx: TenantContext, question: str, sides: Se
                           "evidence_count": len(found)})
         if not found:
             missing.append(r.label)
+    return CompareGathered(question, evidence, side_info, missing, coverage(conn, None))
 
-    cov = coverage(conn, None)
-    rows = [{"document_id": e["document_id"], "version_id": e["version_id"], "chunk_id": e["chunk_id"],
-             "page_list": e["page_list"]} for e in evidence]
-    if missing:
-        body = (f"ההשוואה אינה שלמה: לא נמצאו ראיות רלוונטיות עבור {', '.join(missing)}"
+
+def compose_comparison(g: CompareGathered, provider: LLMProvider | None, state: ProviderState) -> CompareOutcome:
+    """The compose phase: the answer and judge calls, with no database connection (R26). Every side needs
+    evidence; otherwise the comparison is incomplete and no model is called. The caller logs ``usage``."""
+    if g.missing:
+        body = (f"ההשוואה אינה שלמה: לא נמצאו ראיות רלוונטיות עבור {', '.join(g.missing)}"
                 " במסמכים שאתם מורשים לראות. לא מוצגת השוואה חד-צדדית.")
         answer = {"kind": "abstain", "text": body, "provider": "template", "demo": False,
-                  "sources": source_json(evidence), "coverage": cov, "numeric": None,
+                  "sources": source_json(g.evidence), "coverage": g.coverage, "numeric": None,
                   "limitations": ["השוואה דורשת לפחות קטע ראיה אחד מכל צד."],
                   "claims": [], "abstention_kind": "not_found", "dropped_claims": 0, "mode": state.mode.value,
-                  "compare": {"sides": side_info, "incomplete": True, "missing_sides": missing, "conflicts": []}}
-        return CompareOutcome(answer, rows, cacheable=False)
+                  "compare": {"sides": g.side_info, "incomplete": True, "missing_sides": g.missing,
+                              "conflicts": []}}
+        return CompareOutcome(answer, g.source_rows, cacheable=False)
 
-    comp = compose_answer(provider, question, evidence, compare=True)
-    for u in comp.usage:
-        log_usage(conn, provider, u.purpose, u.result, u.ok, u.status)
+    comp = compose_answer(provider, g.question, g.evidence, compare=True)
     limitations = list(comp.limitations)
     if mode_note := state.limitation():
         limitations.append(mode_note)
     answer = {"kind": "content", "text": comp.text, "provider": comp.provider, "demo": comp.demo,
-              "sources": source_json(evidence), "coverage": cov, "limitations": limitations, "numeric": None,
-              **answer_fields(comp, state.mode.value),
-              "compare": {"sides": side_info, "incomplete": False, "missing_sides": [],
+              "sources": source_json(g.evidence), "coverage": g.coverage, "limitations": limitations,
+              "numeric": None, **answer_fields(comp, state.mode.value),
+              "compare": {"sides": g.side_info, "incomplete": False, "missing_sides": [],
                           "conflicts": comp.conflicts}}
-    return CompareOutcome(answer, rows, cacheable=comp.cacheable and state.mode != Mode.ERROR)
+    return CompareOutcome(answer, g.source_rows, cacheable=comp.cacheable and state.mode != Mode.ERROR,
+                          usage=comp.usage)

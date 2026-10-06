@@ -30,7 +30,7 @@ from sqlalchemy import Connection, text
 
 from app.answering import facts
 from app.answering.attributes import AttributeDef, handle_map, list_attribute_handles, resolve_attribute
-from app.answering.compare import CompareSide, compare_sides
+from app.answering.compare import CompareSide, compose_comparison, gather_sides
 from app.answering.compose import (
     ABSTENTION_TEXT,
     CLAIMS_POLICY,
@@ -44,14 +44,14 @@ from app.answering.compose import (
     sources_still_authorized,
 )
 from app.answering.conditions import DATE_FIELD_LABELS, QueryConditions
-from app.answering.content import evidence_from_hits, log_usage, select_provider
+from app.answering.content import EVIDENCE_LIMIT, evidence_from_hits, log_usage, log_usages, select_provider
 from app.answering.coverage import coverage
 from app.answering.interpret import (
     INTERPRET_INSTRUCTIONS,
     LIMITED_MODE_NOTE,
     PROMPT_VERSION,
     RECORD_CLARIFY_KEYS,
-    _answer_plan,
+    answer_plan,
     build_interpret_input,
     interpret,
 )
@@ -109,7 +109,6 @@ MONETARY_DIMENSIONS = ("currency", "currency_per_area")
 DEFAULT_ATTRIBUTE_LABEL = "מחיר למ״ר"
 CACHEABLE_KINDS = ("numeric", "content", "combined", "abstain")
 PER_TURN_FIELDS = ("interpretation_note", "cleared", "cached")
-EVIDENCE_LIMIT = 6
 DEADLINE_MARGIN_SECONDS = 3.0
 # Answers and judge prompts are part of the cache key: a prompt change never serves an old answer.
 ANSWER_PROMPT_VERSION = PROMPT_VERSION + ":" + hashlib.sha256(
@@ -314,7 +313,7 @@ def _button(req: TurnRequest, L: Loaded) -> Interpreted:
     if value not in {o.value for o in pending.options}:  # re-ask in the same context
         return Interpreted(TurnPlan.build(task_type=pending.task_type or "compute",
                                           turn_relation="change_clarification"), "button", question)
-    return Interpreted(_answer_plan(pending, value), "button", question)
+    return Interpreted(answer_plan(pending, value), "button", question)
 
 
 def _edit(L: Loaded) -> Interpreted:
@@ -389,7 +388,7 @@ def interpret_turn(ctx: TenantContext, req: TurnRequest, L: Loaded) -> Interpret
         result = interpret(question, L.state, L.gazetteer, L.attributes, L.cloud_provider)
         if result.status is not None:
             with tenant_tx(ctx) as conn:
-                log_usage(conn, L.cloud_provider, Purpose.INTERPRET.value, None, result.ok, result.status)
+                log_usage(conn, L.cloud_provider, Purpose.INTERPRET.value, result, result.ok, result.status)
         limitation = result.limitation
         if result.mode == "limited" and L.pstate.mode == Mode.ERROR:
             limitation = L.pstate.limitation()
@@ -675,8 +674,7 @@ def _search(run: _Run, base: Part | None) -> dict:
     statuses = [str(u.status) for u in comp.usage]
     if comp.usage:
         with tenant_tx(run.ctx) as conn:
-            for u in comp.usage:
-                log_usage(conn, provider, u.purpose, u.result, u.ok, u.status)
+            log_usages(conn, provider, comp.usage)
     run.statuses += statuses
     run.cacheable = run.cacheable and comp.cacheable
     run.step("search", args, {"evidence": len(evidence), "claims": len(comp.claims), "provider": comp.provider},
@@ -734,15 +732,24 @@ def _compare(run: _Run, step: Step) -> dict | None:
         others = [h for h in run.state.sources if h not in step.source_handles]
         run.ask("referent", REFERENT_COMPARE_SECOND, [{"value": h, "label": f"מקור {h}"} for h in others])
         return None
-    # compare_sides composes inside the caller's connection (U8's interface); this short transaction holds
-    # only the per-side searches and the comparison's answer and judge calls.
+    # Gather per-side evidence in a short transaction, compose (answer and judge calls) with no connection,
+    # then log the calls in a final short transaction (R26, KTD13).
     with tenant_tx(run.ctx) as conn:
-        out = compare_sides(conn, run.ctx, run.question, sides, queries=run.plan.search_queries)
+        gathered = gather_sides(conn, run.question, sides, queries=run.plan.search_queries)
+    provider = run.L.provider
+    if provider is not None and not gathered.missing and time.monotonic() >= run.deadline:
+        provider, run.partial = None, True
+    out = compose_comparison(gathered, provider, run.L.pstate)
+    if out.usage:
+        with tenant_tx(run.ctx) as conn:
+            log_usages(conn, provider, out.usage)
+    statuses = [str(u.status) for u in out.usage]
+    run.statuses += statuses
     run.cacheable = run.cacheable and out.cacheable
     info = out.answer.get("compare", {})
     run.step("compare", {"sides": [str(s.version_id or s.document_id) for s in sides]},
              {"incomplete": info.get("incomplete"), "sides": [s["evidence_count"] for s in info.get("sides", [])]},
-             "השוואה בין " + " ו-".join(s["label"] for s in info.get("sides", [])))
+             "השוואה בין " + " ו-".join(s["label"] for s in info.get("sides", [])), statuses)
     return out.answer
 
 

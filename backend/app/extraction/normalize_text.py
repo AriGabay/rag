@@ -10,7 +10,8 @@ two. We normalize in the application, identically for indexed text and queries:
 - for Hebrew words starting with a one-letter prefix (ו ה ב ל מ ש כ) add the stripped form as
   an extra token, so both 'ברמת' and 'רמת' are searchable
 - light inflection (KTD10): plural and construct suffixes add singular-form tokens on both sides
-  ('דירות' -> 'דירה', 'חדרים' -> 'חדר'). A morphological rule, not topic vocabulary.
+  ('דירות' -> 'דירה', 'חדרים' -> 'חדר', construct 'שיקולי' -> 'שיקולים', 'שיקול'). A morphological rule,
+  not topic vocabulary. Changing these rules changes indexed text: run ``scripts/reindex_text.py``.
 """
 
 from __future__ import annotations
@@ -64,7 +65,8 @@ def prefix_variants(word: str) -> list[str]:
 
 
 def inflection_variants(word: str) -> list[str]:
-    """Singular forms for plural/construct suffixes: -ות -> -ת/-ה, -ים -> stem, construct -ת -> -ה.
+    """Singular forms for plural/construct suffixes: -ות -> -ת/-ה, -ים -> stem, construct -ת -> -ה, and
+    construct plural -י -> -ים and stem ('שיקולי' -> 'שיקולים', 'שיקול', the same stem '-ים' yields).
     Only when at least three stem letters remain, so short words are never truncated."""
     variants: list[str] = []
     if len(word) >= 5 and word.endswith("ות"):
@@ -73,6 +75,8 @@ def inflection_variants(word: str) -> list[str]:
         variants.append(word[:-2])
     elif len(word) >= 4 and word.endswith("ת"):
         variants.append(word[:-1] + "ה")
+    elif len(word) >= 4 and word.endswith("י"):
+        variants += [word[:-1] + "ים", word[:-1]]
     return variants
 
 

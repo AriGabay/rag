@@ -17,8 +17,8 @@ from app.answering.attributes import bump_facts_version, resolve_attribute
 from app.answering.interpret import LIMITED_MODE_NOTE
 from app.answering.plan import TurnPlan
 from app.config import get_settings
-from app.db import tenant_tx
-from app.providers.llm import CallStatus, MockLLM, Purpose
+from app.db import get_engine, tenant_tx
+from app.providers.llm import CallStatus, MockLLM, Purpose, StructuredResult
 from app.providers.status import FAILURE_REASONS, selected_provider_and_model
 from tests.conftest import login
 from tests.factories import make_group, make_office, make_user
@@ -570,3 +570,55 @@ def test_compare_uses_the_conversation_referent_and_reads_both_versions(client, 
     labels = {s["label"] for s in a2["compare"]["sides"]}
     assert any("גרסה 1" in x for x in labels) and any("גרסה 2" in x for x in labels)
     assert a2.get("cached") is None
+
+
+# --- R26 / KTD13: no connection held across model calls; interpreter usage -----------------------------
+
+def probed(response, seen: list[int]):
+    """A scripted response that records how many pooled connections are checked out when it is called."""
+    def call(instructions, input):
+        seen.append(get_engine().pool.checkedout())
+        return response(instructions, input) if callable(response) else response
+    return call
+
+
+def test_compare_turn_holds_no_connection_while_the_provider_is_called(client, db, monkeypatch):
+    a = make_office(db, "משרד א", "admin-a@example.test")
+    doc, old_v = add_chunks(a, a.default_group_id, ["שיעור ההתאמה לגודל הוא 5%."], "e" * 64)
+    _add_version(a, doc, ["שיעור ההתאמה לגודל הוא 7%."])
+    seen: list[int] = []
+    p = ScriptedProvider()
+    p.on(Purpose.INTERPRET, probed(plan(task_type="answer", search_queries=["שיעור ההתאמה לגודל"],
+                                        steps=[SEARCH]), seen))
+    p.on(Purpose.ANSWER, probed(claims(("שיעור ההתאמה לגודל הוא 7%", ["E1"])), seen))
+    p.on(Purpose.VERIFY, probed(verdicts(1), seen))
+    p.on(Purpose.INTERPRET, probed(plan(task_type="compare", turn_relation="follow_up",
+                                        search_queries=["שיעור ההתאמה לגודל"],
+                                        steps=[{"tool": "compare", "attribute_handle": None,
+                                                "source_handles": ["S1"]}]), seen))
+    p.on(Purpose.ANSWER, probed({**claims(("שיעור ההתאמה לגודל הוא 5%", ["E1"]),
+                                          ("שיעור ההתאמה לגודל הוא 7%", ["E2"])), "conflicts": []}, seen))
+    p.on(Purpose.VERIFY, probed(verdicts(2), seen))
+    enable_cloud(a, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    first = post(client, "מה שיעור ההתאמה לגודל?")
+    a2 = post(client, "אילו הנחות השתנו בין הגרסאות?", first["conversation_id"])["answer"]
+    assert a2["compare"]["incomplete"] is False and a2["provider"] == "cloud"
+    assert len(seen) == 6 and seen == [0] * 6  # interpret, answer and judge of both turns: no open connection
+    assert [u[0] for u in usage(a)].count("answer") == 2 and [u[0] for u in usage(a)].count("verify") == 2
+
+
+def test_interpreter_usage_row_has_tokens_and_latency(client, content, monkeypatch):
+    def interpreted(instructions, input):
+        parsed = TurnPlan.model_validate(search_plan(instructions, input))
+        return StructuredResult(CallStatus.OK, parsed, input_tokens=321, output_tokens=45, latency_ms=67)
+
+    p = ScriptedProvider().on(Purpose.INTERPRET, interpreted).on(Purpose.ANSWER, claims((SUPPORTED, ["E1"])))
+    p.on(Purpose.VERIFY, verdicts(1))
+    enable_cloud(content, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    post(client, CONTENT_Q)
+    with tenant_tx(content.system) as conn:
+        row = conn.execute(text("SELECT input_tokens, output_tokens, latency_ms, ok, status FROM provider_usage"
+                                " WHERE purpose = 'interpret'")).one()
+    assert tuple(row) == (321, 45, 67, True, "ok")

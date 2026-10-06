@@ -83,3 +83,22 @@ def test_block_parcel_and_prices_are_topic_terms():
 
     toks = topic_tokens("עסקה בגוש 6158/42 ב-2,470,000 ₪ בשנת 2021")
     assert "6158/42" in toks and "2470000" in toks and "2021" not in toks
+
+
+def test_construct_plural_adds_plural_and_stem():
+    # "שיקולי" is the construct form of "שיקולים": both the plural and the stem are added.
+    assert set(inflection_variants("שיקולי")) == {"שיקולים", "שיקול"}
+    assert {"שיקולים", "שיקול"} <= set(query_tokens("מה היו שיקולי השמאי?"))
+
+
+def test_construct_query_matches_definite_plural_passage():
+    # Index and query sides share a token, so "שיקולי" finds "השיקולים" (and the reverse).
+    indexed = set(normalize_for_search("אלה השיקולים שנבחנו").split())
+    assert indexed & set(query_tokens("שיקולי השמאי")) - {"השמאי", "שמאי"}
+    assert set(normalize_for_search("שיקולי השמאי").split()) & set(query_tokens("השיקולים"))
+
+
+def test_construct_rule_keeps_the_three_letter_stem_guard():
+    assert inflection_variants("שלי") == []
+    assert inflection_variants("כדי") == []
+    assert set(inflection_variants("מחירי")) == {"מחירים", "מחיר"}

@@ -1,27 +1,16 @@
-"""The search-and-answer tool (U10, U8; KTD11): content and combined answers composed from verified claims.
+"""Shared pieces of the answering tools (U8, U9; KTD11): the provider of the office's mode, evidence built
+from authorized search hits, and the ``provider_usage`` log of every model call with its status.
 
-Evidence comes from authorized search only; the answer is composed by ``compose`` (claims, two verification
-layers, extractive fallback) through the provider of the office's mode, and every model call is logged
-to ``provider_usage`` with its status."""
+The search, locate and compare tools themselves run in ``turn`` (and ``compare``)."""
 
 from __future__ import annotations
 
-import logging
+from collections.abc import Iterable
 
 from sqlalchemy import Connection, text
 
-from app.answering.compose import (
-    ABSTENTION_TEXT,
-    answer_fields,
-    compose_answer,
-    computed_from_numeric,
-    no_evidence_kind,
-    source_json,
-)
-from app.answering.coverage import coverage
-from app.db import TenantContext
+from app.answering.compose import Usage
 from app.platform.documents import source_file_url
-from app.platform.search import hybrid_search
 from app.providers.llm import (
     CallStatus,
     LLMProvider,
@@ -31,8 +20,7 @@ from app.providers.llm import (
 )
 from app.providers.status import Mode, ProviderState, office_provider_state
 
-logger = logging.getLogger(__name__)
-EVIDENCE_LIMIT = 6
+EVIDENCE_LIMIT = 6  # admitted passages per content answer
 
 
 def select_provider(conn: Connection) -> tuple[LLMProvider | None, ProviderState]:
@@ -59,6 +47,12 @@ def log_usage(conn: Connection, provider: LLMProvider, purpose: str, result, ok:
     )
 
 
+def log_usages(conn: Connection, provider: LLMProvider, usage: Iterable[Usage]) -> None:
+    """The ``provider_usage`` rows of a composed answer's calls (answer and judge)."""
+    for u in usage:
+        log_usage(conn, provider, u.purpose, u.result, u.ok, u.status)
+
+
 def evidence_from_hits(hits: list[dict], start: int) -> list[dict]:
     out = []
     for i, h in enumerate(hits, start=start):
@@ -70,56 +64,3 @@ def evidence_from_hits(hits: list[dict], start: int) -> list[dict]:
             "url": source_file_url(h["document_id"], h["version_id"], page),
         })
     return out
-
-
-def answer_content(conn: Connection, ctx: TenantContext, question: str, c, route: str, numeric=None):
-    from app.answering.service import Outcome
-
-    query = question
-    if c is not None and (c.neighborhood or c.city) and numeric is not None:
-        query = f"{question} {c.neighborhood or ''} {c.city or ''}"
-    # Evidence needs at least one lexical or fuzzy term match; a purely semantic neighbour is not a basis.
-    hits = [h for h in hybrid_search(conn, query, EVIDENCE_LIMIT * 2) if h["lexical_support"]][:EVIDENCE_LIMIT]
-    base = numeric.answer if numeric is not None else None
-    base_sources = base["sources"] if base else []
-    evidence = evidence_from_hits(hits, len(base_sources) + 1)
-    cov = base["coverage"] if base else coverage(conn, None)
-    limitations = list(base["limitations"]) if base else []
-    provider, state = select_provider(conn)
-
-    if not evidence:
-        if base:
-            base["kind"] = "combined"
-            base["limitations"] = limitations + ["לא נמצאו קטעי הסבר רלוונטיים במסמכים המורשים."]
-            return numeric
-        kind = no_evidence_kind(ctx)
-        answer = {"kind": "abstain", "provider": "template", "demo": False, "sources": [], "coverage": cov,
-                  "text": ABSTENTION_TEXT[kind], "numeric": None,
-                  "limitations": ["החיפוש בוצע רק במסמכי המשרד שעובדו ושאתם מורשים לראות."],
-                  "claims": [], "abstention_kind": kind, "dropped_claims": 0, "mode": state.mode.value}
-        return Outcome(answer, c, c.intent if c else "explanation", route)
-
-    computed = computed_from_numeric(base["numeric"], [s["evidence_id"] for s in base_sources]) if base else []
-    comp = compose_answer(provider, question, evidence, computed=computed,
-                          cited_extra={s["evidence_id"]: s.get("snippet") or "" for s in base_sources})
-    for u in comp.usage:
-        log_usage(conn, provider, u.purpose, u.result, u.ok, u.status)
-    limitations += comp.limitations
-    if mode_note := state.limitation():
-        limitations.append(mode_note)
-
-    sources = base_sources + source_json(evidence)
-    fields = answer_fields(comp, state.mode.value)
-    if base:
-        answer = dict(base)
-        answer.update({"kind": "combined", "text": base["text"] + "\n\n" + comp.text, "provider": comp.provider
-                       if comp.provider != "extractive" else "template", "demo": comp.demo, "sources": sources,
-                       "limitations": limitations, **fields})
-    else:
-        answer = {"kind": "content", "text": comp.text, "provider": comp.provider, "demo": comp.demo,
-                  "sources": sources, "coverage": cov, "limitations": limitations, "numeric": None, **fields}
-    rows = (numeric.source_rows if numeric else []) + [
-        {"document_id": e["document_id"], "version_id": e["version_id"], "chunk_id": e["chunk_id"],
-         "page_list": e["page_list"]} for e in evidence]
-    return Outcome(answer, c, c.intent if c else "explanation", route, source_rows=rows,
-                   cacheable=comp.cacheable and state.mode != Mode.ERROR)

@@ -8,8 +8,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 from sqlalchemy import Connection, text
 
 from app.answering.conditions import (
@@ -39,19 +37,6 @@ CLARIFY_QUESTIONS = {
 RECORD_KIND_LABELS = {"transaction_price": "עסקאות (נתוני השוואה)", "appraised_value": "הנכסים הנישומים בשומות"}
 MIXED_KEYS = ("area_type", "property_type", "vat_basis")
 _MIXED_LABELS = {"area_type": AREA_TYPE_LABELS, "property_type": PROPERTY_TYPE_LABELS, "vat_basis": VAT_LABELS}
-
-
-@dataclass
-class Outcome:
-    """A tool answer with the conditions it used (kept for ``content.answer_content``)."""
-
-    answer: dict
-    conditions: QueryConditions | None
-    intent: str | None
-    parse_route: str | None
-    pending: dict | None = None
-    source_rows: list[dict] = field(default_factory=list)
-    cacheable: bool = True  # False when a transient failure degraded the answer
 
 
 def load_gazetteer(conn: Connection) -> Gazetteer:

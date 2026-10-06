@@ -1,10 +1,12 @@
-"""The two-sided compare tool (U8; R10, R11, AE6, KTD10) and source re-authorization for compared versions."""
+"""The two-sided compare tool (U8; R10, R11, R26, AE6, KTD10) and source re-authorization for compared
+versions."""
 
 import pytest
 from sqlalchemy import text
 
-from app.answering.compare import CompareSide, compare_sides
+from app.answering.compare import CompareSide, compose_comparison, gather_sides
 from app.answering.compose import sources_still_authorized
+from app.answering.content import log_usages, select_provider
 from app.db import TenantContext, tenant_tx
 from app.providers.llm import Purpose
 from tests.factories import make_group, make_office, make_user
@@ -43,8 +45,19 @@ def cloud(office, monkeypatch, provider):
 
 
 def run(ctx, sides, queries=QUERIES):
+    """The tool's three phases as the orchestrator runs them: gather, compose with no connection, log."""
     with tenant_tx(ctx) as conn:
-        return compare_sides(conn, ctx, QUESTION, sides, queries=queries)
+        gathered = gather_sides(conn, QUESTION, sides, queries=queries)
+        provider, state = select_provider(conn)
+    out = compose_comparison(gathered, provider, state)
+    with tenant_tx(ctx) as conn:
+        log_usages(conn, provider, out.usage)
+    return out
+
+
+def usage(office):
+    with tenant_tx(office.system) as conn:
+        return [tuple(r) for r in conn.execute(text("SELECT purpose, ok, status FROM provider_usage ORDER BY id"))]
 
 
 def test_two_versions_with_a_changed_rate_are_cited_and_labeled_by_version(office, monkeypatch):
@@ -124,3 +137,25 @@ def test_hidden_side_is_incomplete_without_revealing_it(office, monkeypatch):
     assert a["compare"]["incomplete"] is True and p.calls == []
     assert "דוח ddd" not in a["text"] and "9%" not in a["text"]
     assert all(s["document_id"] == str(mine) for s in a["sources"])
+
+
+def test_gather_reads_evidence_without_a_model_call_and_compose_reports_its_usage(office, monkeypatch):
+    doc, old_v = add_chunks(office, office.default_group_id, ["שיעור ההתאמה לגודל הוא 5%."], "e" * 64)
+    new_v = _add_version(office, doc, ["שיעור ההתאמה לגודל הוא 7%."])
+    p = ScriptedProvider().on(Purpose.ANSWER, compare_answer(
+        claim("שיעור ההתאמה לגודל הוא 5%", ["E1"]), claim("שיעור ההתאמה לגודל הוא 7%", ["E2"]))
+    ).on(Purpose.VERIFY, verdicts(2))
+    cloud(office, monkeypatch, p)
+    with tenant_tx(office.ctx()) as conn:
+        gathered = gather_sides(conn, QUESTION, [CompareSide(version_id=old_v), CompareSide(version_id=new_v)],
+                                queries=QUERIES)
+        provider, state = select_provider(conn)
+    assert p.calls == [] and not gathered.missing
+    assert [s["evidence_count"] for s in gathered.side_info] == [1, 1]
+    out = compose_comparison(gathered, provider, state)
+    assert [(u.purpose, u.ok) for u in out.usage] == [(Purpose.ANSWER, True), (Purpose.VERIFY, True)]
+    assert usage(office) == []  # composing writes nothing; the caller logs afterwards
+    with tenant_tx(office.ctx()) as conn:
+        log_usages(conn, provider, out.usage)
+    assert usage(office) == [("answer", True, "ok"), ("verify", True, "ok")]
+    assert {r["version_id"] for r in out.source_rows} == {str(old_v), str(new_v)}

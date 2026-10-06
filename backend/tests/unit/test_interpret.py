@@ -10,6 +10,7 @@ import yaml
 
 from app.answering.interpret import (
     INTERPRET_INSTRUCTIONS,
+    answer_plan,
     build_interpret_input,
     interpret,
     interpret_with_model,
@@ -24,7 +25,7 @@ from app.answering.state import (
     StateConditions,
     apply_turn,
 )
-from app.providers.llm import CallStatus, Purpose
+from app.providers.llm import CallStatus, Purpose, StructuredResult
 from tests.support.scripted_provider import ScriptedProvider
 
 GAZ = Gazetteer(cities=["רמת גן", "גבעתיים"],
@@ -263,3 +264,27 @@ def test_rules_and_limited_plans_for_every_eval_question_pass_validation():
             assert check.ok, (item["id"], turn["ask"], check.errors)
             assert result.plan.clarification is None
             state, _ = apply_turn(state, check.plan, question=turn["ask"])
+
+
+# --- usage of the interpreter call --------------------------------------------------------------------
+
+def test_interpretation_carries_the_calls_tokens_and_latency():
+    plan = TurnPlan.build(search_queries=["שיפוץ"], steps=[{"tool": "search", "attribute_handle": None,
+                                                           "source_handles": []}])
+    provider = ScriptedProvider().on(Purpose.INTERPRET, StructuredResult(
+        CallStatus.OK, plan, input_tokens=120, output_tokens=30, latency_ms=900))
+    result = run("מה נכתב על השיפוץ?", ConversationState(), provider)
+    assert result.mode == "model" and (result.input_tokens, result.output_tokens, result.latency_ms) == (120, 30, 900)
+    provider = ScriptedProvider().on(Purpose.INTERPRET, StructuredResult(CallStatus.TIMEOUT, latency_ms=4000))
+    result = run("מה נכתב על השיפוץ?", ConversationState(), provider)
+    assert result.mode == "limited" and result.status == CallStatus.TIMEOUT and result.latency_ms == 4000
+    rules = run("מחיר למ״ר בעסקאות שנחתמו ב-2024 בחרוזים", ConversationState(), None)
+    assert (rules.input_tokens, rules.output_tokens, rules.latency_ms) == (None, None, None)
+
+
+def test_answer_plan_resumes_the_interrupted_task():
+    pending = PendingClarification(key="data_kind", question="לאיזה נתון הכוונה?",
+                                   options=DATA_KIND_OPTIONS, original_question="מחיר למ״ר בחרוזים")
+    plan = answer_plan(pending, "transaction_price")
+    assert plan.turn_relation == "answer_to_clarification" and plan.clarification_answer == "transaction_price"
+    assert [s.tool for s in plan.steps] == ["compute_records"]

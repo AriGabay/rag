@@ -78,6 +78,10 @@ class Interpretation:
     unknown_place: str | None = None
     parsed: ParseResult | None = None
     limitation: str | None = None
+    # usage of the model call, when one was made (logged to ``provider_usage`` by the caller)
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    latency_ms: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -125,8 +129,9 @@ def match_clarification_reply(reply: str, pending: PendingClarification) -> str 
     return scores[0][1]
 
 
-def _answer_plan(pending: PendingClarification, value: str) -> TurnPlan:
-    """Resume the task the clarification interrupted; ``apply_turn`` restores its context."""
+def answer_plan(pending: PendingClarification, value: str) -> TurnPlan:
+    """The plan of a turn that answers ``pending`` with option ``value`` (a button or a matched free-text
+    reply): it resumes the task the clarification interrupted, and ``apply_turn`` restores its context."""
     task = pending.task_type or ("compute" if pending.key in RECORD_CLARIFY_KEYS else "answer")
     query = [pending.original_question] if pending.original_question else []
     if task == "compute" or (task == "compute_explain" and not query):
@@ -220,13 +225,15 @@ def interpret_with_model(provider: LLMProvider, question: str, state: Conversati
     """One structured interpretation call, validated on the server; a typed failure otherwise."""
     result = provider.structured(Purpose.INTERPRET, INTERPRET_INSTRUCTIONS,
                                  build_interpret_input(question, state, gazetteer, attributes), TurnPlan)
+    usage = {"input_tokens": result.input_tokens, "output_tokens": result.output_tokens,
+             "latency_ms": result.latency_ms}
     if not result.ok:
-        return Interpretation("model", None, result.status)
+        return Interpretation("model", None, result.status, **usage)
     check = validate_plan(result.parsed, gazetteer=gazetteer, attributes=attributes, source_handles=state.sources,
                           pending_options=[o.value for o in state.pending.options] if state.pending else None)
     if not check.ok:
-        return Interpretation("model", None, CallStatus.INVALID, check.errors)
-    return Interpretation("model", check.plan, CallStatus.OK, unknown_place=check.unknown_place)
+        return Interpretation("model", None, CallStatus.INVALID, check.errors, **usage)
+    return Interpretation("model", check.plan, CallStatus.OK, unknown_place=check.unknown_place, **usage)
 
 
 def interpret(question: str, state: ConversationState, gazetteer: Gazetteer, attributes: list[dict],
@@ -235,7 +242,7 @@ def interpret(question: str, state: ConversationState, gazetteer: Gazetteer, att
     if state.pending is not None:
         value = match_clarification_reply(question, state.pending)
         if value is not None:
-            return Interpretation("rules", _answer_plan(state.pending, value))
+            return Interpretation("rules", answer_plan(state.pending, value))
     relation = _meta_relation(question)
     if relation is not None:
         tool = "explain_previous" if relation == "meta_why" else "show_sources"
@@ -246,12 +253,14 @@ def interpret(question: str, state: ConversationState, gazetteer: Gazetteer, att
     if parsed.fast_path:
         return Interpretation("rules", rules_plan(parsed, state, question), unknown_place=parsed.unknown_place,
                               parsed=parsed)
-    status, errors, note = None, [], LIMITED_MODE_NOTE
+    limited = Interpretation("limited", limited_plan(question, parsed), unknown_place=parsed.unknown_place,
+                             parsed=parsed, limitation=LIMITED_MODE_NOTE)
     if provider is not None:
         modeled = interpret_with_model(provider, question, state, gazetteer, attributes)
         if modeled.ok:
             modeled.parsed = parsed
             return modeled
-        status, errors, note = modeled.status, modeled.errors, MODEL_FAILED_NOTE
-    return Interpretation("limited", limited_plan(question, parsed), status, errors,
-                          unknown_place=parsed.unknown_place, parsed=parsed, limitation=note)
+        limited.status, limited.errors, limited.limitation = modeled.status, modeled.errors, MODEL_FAILED_NOTE
+        limited.input_tokens, limited.output_tokens = modeled.input_tokens, modeled.output_tokens
+        limited.latency_ms = modeled.latency_ms
+    return limited
