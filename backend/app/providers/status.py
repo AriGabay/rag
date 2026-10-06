@@ -6,7 +6,10 @@ Mode, derived per office from the cloud setting, the server key and the last con
 - ``error``: enabled and the last test failed, or enabled with no key (``missing_key``). Turns run limited
   with a limitation naming the failure, never the demo mock.
 - ``demo``: disabled and ``DEMO_MODE`` (the clearly labeled mock answers).
-- ``limited``: disabled and not demo (answers are assembled from the sources themselves).
+- ``limited``: disabled and not demo (answers are assembled from the sources themselves); also when the
+  office's acknowledgement names another provider than the selected one (``reacknowledge_required``): the
+  consent an admin gave for one provider never sends office content to another, demo mode or not, until an
+  admin acknowledges the selected provider again.
 
 The connection test sends a fixed synthetic Hebrew prompt (no office content) through the structured call
 and checks the parsed echo; with no key it returns ``missing_key`` without any network call.
@@ -29,6 +32,7 @@ from app.providers.llm import CallStatus, LLMProvider, Purpose, StructuredResult
 logger = logging.getLogger(__name__)
 
 MISSING_KEY = "missing_key"
+REACKNOWLEDGE = "reacknowledge_required"  # consent was given for another provider than the selected one
 PROVIDER_NAMES = {"openai": "OpenAI", "anthropic": "Anthropic (Claude)"}
 RETENTION_NOTES = {
     "openai": "הבקשות נשלחות ל-OpenAI ללא שמירת תגובות (store=false), אך OpenAI עשויה לשמור יומני ניטור"
@@ -92,6 +96,9 @@ class ProviderState:
 
     def limitation(self) -> str | None:
         """The Hebrew limitation a turn shows in this mode (None in cloud and demo mode)."""
+        if self.status == REACKNOWLEDGE:
+            return (f"שליחת קטעים לספק מודל ענן אושרה במשרד עבור ספק אחר, ולא עבור {self.provider_name}"
+                    " שנבחר כעת; נדרש אישור מחדש של מנהל המשרד. התשובה מורכבת מקטעי המקור עצמם.")
         if self.mode == Mode.ERROR:
             reason = FAILURE_REASONS.get(self.status or "", FAILURE_REASONS[CallStatus.ERROR])
             return (f"שימוש במודל ענן מופעל במשרד, אך {reason} ({self.provider_name}); "
@@ -109,12 +116,24 @@ def selected_provider_and_model() -> tuple[str, str]:
     return "openai", s.openai_model
 
 
+def consent_matches(consent_provider: str | None, provider: str) -> bool:
+    """Whether the office's acknowledgement covers the selected provider. ``put_office_settings`` records the
+    selected provider with every acknowledgement; an office acknowledged before the provider changed (e.g.
+    ``anthropic`` while OpenAI is selected) must acknowledge again. A row enabled outside that route, with no
+    provider recorded, predates provider tracking and is read as consent for the selected provider."""
+    return consent_provider is None or consent_provider == provider
+
+
 def derive_mode(*, enabled: bool, key_present: bool, last_test: LastTest | None, demo_mode: bool,
-                provider: str, model: str) -> tuple[Mode, str | None, bool]:
-    """(mode, failure status, untested). A test of another provider or model, or a ``missing_key`` result
-    from before a key was added, does not describe the current configuration and counts as not run."""
+                provider: str, model: str, consent_provider: str | None = None) -> tuple[Mode, str | None, bool]:
+    """(mode, status, untested). A test of another provider or model, or a ``missing_key`` result from before
+    a key was added, does not describe the current configuration and counts as not run. Consent given for
+    another provider is ``limited`` with status ``reacknowledge_required`` (never the demo mock: the office did
+    opt in to cloud use, and its admin must see why it is not used)."""
     if not enabled:
         return (Mode.DEMO if demo_mode else Mode.LIMITED), None, False
+    if not consent_matches(consent_provider, provider):
+        return Mode.LIMITED, REACKNOWLEDGE, False
     if not key_present:
         return Mode.ERROR, MISSING_KEY, False
     current = last_test if (last_test is not None and last_test.provider == provider
@@ -127,7 +146,7 @@ def derive_mode(*, enabled: bool, key_present: bool, last_test: LastTest | None,
 def office_provider_state(conn: Connection, *, key_present: bool | None = None) -> ProviderState:
     """The office's provider state. ``key_present`` may be passed by a caller that resolves it itself."""
     row = conn.execute(text(
-        "SELECT cloud_llm_enabled, provider_test_provider, provider_test_model, provider_test_ok,"
+        "SELECT cloud_llm_enabled, cloud_provider, provider_test_provider, provider_test_model, provider_test_ok,"
         " provider_test_status, provider_tested_at FROM office_settings")).one_or_none()
     enabled = bool(row and row.cloud_llm_enabled)
     last = (LastTest(row.provider_test_provider, row.provider_test_model, bool(row.provider_test_ok),
@@ -137,7 +156,8 @@ def office_provider_state(conn: Connection, *, key_present: bool | None = None) 
         key_present = llm.selected_provider_configured()
     provider, model = selected_provider_and_model()
     mode, status, untested = derive_mode(enabled=enabled, key_present=key_present, last_test=last,
-                                         demo_mode=get_settings().demo_mode, provider=provider, model=model)
+                                         demo_mode=get_settings().demo_mode, provider=provider, model=model,
+                                         consent_provider=row.cloud_provider if row is not None else None)
     return ProviderState(mode, enabled, provider, model, key_present, status, untested, last)
 
 

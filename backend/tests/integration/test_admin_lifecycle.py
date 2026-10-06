@@ -260,3 +260,42 @@ def test_other_office_test_result_is_invisible(client, office, fake_key):
     with tenant_tx(office.ctx()) as conn:
         rows = conn.execute(text("SELECT provider_test_status FROM office_settings")).all()
     assert rows == [(None,)]
+
+
+def test_consent_given_for_another_provider_is_limited_until_reacknowledged(client, office, fake_key, monkeypatch):
+    """An office acknowledged while Anthropic was the provider sends nothing to OpenAI until an admin
+    acknowledges again; then it answers in cloud mode (demo mode on or off: never the mock)."""
+    add_chunks(office, office.default_group_id,
+               ["4. שיקולי השמאי: בשכונת חרוזים השמאי המכריע קבע הפחתה של 10% בשל היטל השבחה."], "1" * 64)
+    monkeypatch.setattr("app.answering.content.get_selected_provider", lambda: fake_key)
+    with tenant_tx(office.ctx()) as conn:
+        conn.execute(text("UPDATE office_settings SET cloud_llm_enabled = true, cloud_provider = 'anthropic',"
+                          " acknowledged_at = now()"))
+    login(client, "admin-a@example.test")
+    s = client.get("/api/admin/settings").json()
+    assert s["cloud_llm_enabled"] is True and s["provider"] == "openai"
+    assert s["mode"] == "limited" and s["mode_status"] == "reacknowledge_required"
+    a = ask(client, CONTENT_Q)["answer"]
+    assert a["mode"] == "limited" and a["provider"] != "mock" and a["demo"] is False
+    assert fake_key.calls == []
+    with tenant_tx(office.system) as conn:
+        assert conn.execute(text("SELECT count(*) FROM provider_usage")).scalar() == 0
+
+    on = enable(client)  # the admin acknowledges the selected provider
+    assert on["mode"] == "cloud" and on["mode_status"] is None
+    with tenant_tx(office.system) as conn:
+        assert conn.execute(text("SELECT cloud_provider FROM office_settings")).scalar() == "openai"
+    a = ask(client, CONTENT_Q)["answer"]
+    assert a["mode"] == "cloud" and fake_key.calls  # the selected provider is now used
+
+
+def test_consent_follows_the_provider_selected_when_acknowledging(client, office, fake_key, monkeypatch):
+    login(client, "admin-a@example.test")
+    assert enable(client)["mode"] == "cloud"
+    monkeypatch.setattr(get_settings(), "llm_provider", "anthropic")  # the deployment switches provider
+    monkeypatch.setattr(get_settings(), "anthropic_api_key", SecretStr(FAKE_KEY))
+    s = client.get("/api/admin/settings").json()
+    assert s["provider"] == "anthropic" and s["mode"] == "limited" and s["mode_status"] == "reacknowledge_required"
+    assert enable(client)["mode"] == "cloud"
+    with tenant_tx(office.system) as conn:
+        assert conn.execute(text("SELECT cloud_provider FROM office_settings")).scalar() == "anthropic"
