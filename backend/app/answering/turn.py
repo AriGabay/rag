@@ -111,7 +111,14 @@ from app.db import TenantContext, current_data_version, tenant_tx
 from app.platform.documents import source_file_url
 from app.platform.search import SearchScope, locate_evidence, search_evidence
 from app.providers.embeddings import get_embedding_provider
-from app.providers.llm import SYSTEM_POLICY, CallStatus, LLMProvider, Purpose
+from app.providers.llm import (
+    SYSTEM_POLICY,
+    CallStatus,
+    LLMProvider,
+    Purpose,
+    StructuredResult,
+    call_structured,
+)
 from app.providers.status import FAILURE_REASONS, Mode, ProviderState
 
 FILTER_CONFLICT = "filter_conflict"
@@ -153,6 +160,8 @@ _FACT_LABELS = dict(OPERATION_LABELS, count="מספר הערכים")
 FILTER_LABEL = "תנאי על הערך"
 FILTER_OPS_HE = {"<": "קטן מ-", "<=": "עד ", ">": "גדול מ-", ">=": "לפחות ", "=": "שווה ל-", "!=": "שונה מ-"}
 MAX_COMPARE_SIDES = 3
+# Conditions of the structured records (prices, areas) that document metadata cannot filter on.
+RECORD_ONLY_CONDITIONS = ("property_type", "area_type", "data_kind", "vat_basis")
 LIST_SOURCES_MAX = 12  # a values or filtered answer lists the documents behind each value up to this many
 TWO_SIDED_MAX_DOCUMENTS = 3  # one entity named by this many documents: each document's statement is shown
 _DIGIT = re.compile(r"\d")
@@ -273,6 +282,7 @@ class _Run:
     facts_versions: dict[str, int] = field(default_factory=dict)
     limitations: list[str] = field(default_factory=list)
     clarification: ProposedClarification | None = None
+    known_sides: list[str] = field(default_factory=list)  # a comparison's sides already chosen (referent)
     cacheable: bool = True
     partial: bool = False  # the turn deadline cut a step short
     incomplete: bool = False  # versions in scope are not yet extracted (async jobs, cap)
@@ -334,7 +344,7 @@ def check_request(req: TurnRequest, L: Loaded) -> None:
         elif L.state.pending is None or L.state.pending.key != key:
             raise TurnError(409, NO_PENDING)
         return
-    if not (_edits(req.filters) or req.remove) or L.previous is None:
+    if not (_edits(req.filters) or req.remove) or (L.previous is None and L.state.pending is None):
         raise TurnError(422, NEED_QUESTION)
 
 
@@ -376,7 +386,12 @@ def _button(req: TurnRequest, L: Loaded) -> Interpreted:
 
 
 def _edit(L: Loaded) -> Interpreted:
-    """Chip edits with no new question: re-run the last answered task with the edited conditions."""
+    """Chip edits with no new question: re-run the last answered task with the edited conditions. Before any
+    answer (only a clarification was asked), the edit changes the open clarification's context and re-asks it."""
+    if L.previous is None and L.state.pending is not None:
+        pending = L.state.pending
+        plan = TurnPlan.build(task_type=pending.task_type or "answer", turn_relation="change_clarification")
+        return Interpreted(plan, "edit", pending.original_question or "")
     prev = TurnPlan.model_validate(L.previous["turn_plan"])
     task = prev.task_type if prev.task_type not in ("clarify", "abstain") else "answer"
     plan = TurnPlan.build(task_type=task, turn_relation="follow_up", metric=prev.metric, unit=prev.unit,
@@ -449,7 +464,7 @@ def interpret_turn(ctx: TenantContext, req: TurnRequest, L: Loaded) -> Interpret
             with tenant_tx(ctx) as conn:
                 log_usage(conn, L.cloud_provider, Purpose.INTERPRET.value, result, result.ok, result.status)
         limitation = result.limitation
-        if result.mode == "limited" and L.pstate.mode == Mode.ERROR:
+        if result.mode == "limited" and (L.pstate.mode == Mode.ERROR or L.pstate.status is not None):
             limitation = L.pstate.limitation()
         plan = result.plan
         if (plan is not None and result.mode == "model" and plan.clarification is not None and plan.steps
@@ -723,11 +738,20 @@ def _facts(run: _Run, attr: AttributeDef) -> Part | None:
     if comp.extraction_unavailable and comp.main.n == 0 and (total is None or total.main.n == 0):
         # computing a new attribute needs the cloud model or reviewed data: show relevant passages (AE2)
         run.search_fallback = True
-        run.limitations.append(LIMITED_MODE_NOTE if run.L.pstate.mode != Mode.ERROR else run.L.pstate.limitation())
+        run.limitations.append(run.L.pstate.limitation() if run.L.pstate.mode == Mode.ERROR
+                               or run.L.pstate.status is not None else LIMITED_MODE_NOTE)
         return None
     with tenant_tx(run.ctx) as conn:
         general = coverage(conn, None)
-    return _fact_part(comp, run.state.query_conditions(), general, total, run.state.value_filter)
+    part = _fact_part(comp, run.state.query_conditions(), general, total, run.state.value_filter)
+    unapplied = [CONTEXT_LABELS.get(k, k) for k in RECORD_ONLY_CONDITIONS
+                 if getattr(run.state.conditions, k, None) is not None]
+    if unapplied and not run.scoped:
+        # a condition the extracted-facts path cannot filter on is said, never silently dropped (GQ38)
+        part.answer["limitations"].append(
+            f"התנאים {', '.join(unapplied)} אינם משמשים לסינון בחישוב על נתונים שחולצו מהמסמכים; החישוב כולל את "
+            "כל המסמכים שבתחום לפי עיר, שכונה ושנים בלבד.")
+    return part
 
 
 def _filter_text(spec: ValueFilterSpec | dict | None, unit: str | None) -> str:
@@ -770,32 +794,49 @@ def _fact_part(comp, c: QueryConditions, general: dict, total=None, spec: ValueF
     pre_n = total.preliminary.n if counted and total.preliminary is not None else (
         comp.preliminary.n if comp.preliminary is not None else 0)
 
+    cov = comp.coverage
+    audit = comp.audit or {}
+    full = audit.get("completeness", "complete")
+    base = total if total is not None else comp
+    observed = bool(base.main.n or base.preliminary is not None)
+    gaps = _gap_text(cov)
+    # A figure stands for the document set only when nothing in it is unknown; otherwise it is stated over the
+    # observations found (named as such), or not at all when the gaps leave it without meaning (R14, R15).
+    insufficient = observed and full == "insufficient"
+    over = "" if full == "complete" else " בלבד"
+
     def basis(n: int) -> str:
-        return f" (מתוך {n} תצפיות{', ' + places if places else ''})" if counted else \
-            f" (מבוסס על {n} תצפיות{', ' + places if places else ''})"
+        where = f", {places}" if places else ""
+        if counted:
+            return f" (מתוך {n} תצפיות{over}{where})"
+        return f" (מבוסס על {n} תצפיות{over}{where})"
 
     lines, computed = [], []
-    if main_n:
+    if not insufficient and main_n:
         shown = _tier_text(comp.main, op, unit, textual)
         lines.append(f"{what} לפי ערכים שאומתו: {shown}{basis(main_n)}.")
         computed.append(ComputedValue("C1", f"{what} (ערכים שאומתו)", shown, by_tier["verified"]))
-    if comp.preliminary is not None and pre_n:
+    if not insufficient and comp.preliminary is not None and pre_n:
         shown = _tier_text(comp.preliminary, op, unit, textual)
         lines.append(f"נתון ראשוני, כולל ערכים שחולצו אוטומטית וטרם נבדקו בידי אדם: {what} {shown}{basis(pre_n)}.")
         computed.append(ComputedValue(f"C{len(computed) + 1}", f"{what} (נתון ראשוני)", shown,
                                       by_tier["verified"] + by_tier["preliminary"]))
-    cov = comp.coverage
-    base = total if total is not None else comp
-    observed = bool(base.main.n or base.preliminary is not None)
     kind = None
     if not observed:
         kind = ("not_extracted_or_verified" if cov["not_yet_extracted"] or cov["awaiting_review"]
-                else "not_found" if cov["in_scope"] == 0 else "not_stated")
+                or cov["partial_scan"] else "not_found" if cov["in_scope"] == 0 else "not_stated")
         lines.append(ABSTENTION_TEXT[kind])
+    elif insufficient:
+        kind = "not_extracted_or_verified"
+        lines.append(f"לא ניתן לחשב {what} שמייצג את המסמכים שבתחום: {gaps}. "
+                     f"להלן הערכים שנמצאו עד כה, ללא חישוב כולל.")
     elif not counted and not (comp.main.n or pre_n):  # values were observed, none meets the condition
         lines = [f"אף ערך של {comp.attribute_label} אינו עומד בתנאי {condition}."]
-    listed = sources if (op in ("values", "min", "max") or counted) and len(sources) <= LIST_SOURCES_MAX else []
-    if op in ("min", "max"):
+    if insufficient or op in ("values", "min", "max") or counted:
+        listed = sources if len(sources) <= LIST_SOURCES_MAX else []
+    else:
+        listed = []
+    if op in ("min", "max") and not insufficient:
         best = comp.main if comp.main.n else comp.preliminary
         listed = [x for x in listed if best is not None and x["value"] is not None and best.value is not None
                   and Decimal(x["value"]) == Decimal(str(best.value))]
@@ -804,27 +845,44 @@ def _fact_part(comp, c: QueryConditions, general: dict, total=None, spec: ValueF
         lines.append(f"• {x['title']}: {value} [{x['evidence_id']}]")
     lines.append(facts.coverage_text(cov))
     limitations = [FACT_SCOPE_NOTE]
-    if comp.partial:
+    if full == "subset" and observed:
+        limitations.append(f"התוצאה מחושבת רק על התצפיות שנמצאו ואינה מייצגת את כל המסמכים שבתחום: {gaps}.")
+    elif comp.partial:
         limitations.append("חלק מהמסמכים שבתחום טרם חולצו, ולכן התוצאה חלקית.")
     if comp.pending_jobs:
         limitations.append(f"{comp.pending_jobs} מסמכים ממתינים לחילוץ ברקע; שאלו שוב מאוחר יותר.")
-    if comp.conflicts:
+    if any(not c.get("included") for c in comp.conflicts):
         limitations.append("נמצאו ערכים סותרים לאותו נכס במסמכים שונים; הם הועברו לבדיקה ולא נכללו.")
-    figure = comp.main if main_n else None
+    if any(c.get("included") for c in comp.conflicts):
+        limitations.append("לאותו נכס נמצאו ערכים שונים במסמכים שונים; נכלל הערך שאושר בידי אדם, והשאר הועברו "
+                           "לבדיקה.")
+    figure = comp.main if main_n and not insufficient else None
     numeric = {"conditions": c.describe(), "attribute": comp.attribute_label, "operation": op, "unit": unit,
-               "value": _str(figure.value) if figure else None, "record_count": main_n,
+               "value": _str(figure.value) if figure else None, "record_count": main_n if figure else 0,
                "values": _tier_values(figure, textual) if figure else None,
-               "value_filter": comp.value_filter, "value_type": comp.value_type}
-    pre = comp.preliminary
+               "value_filter": comp.value_filter, "value_type": comp.value_type, "completeness": full}
+    pre = comp.preliminary if not insufficient else None
+    shown_numeric = observed and not insufficient
     answer = {
-        "kind": "numeric" if observed else "abstain", "text": "\n".join(lines), "provider": "template",
-        "demo": False, "numeric": numeric if observed else None, "sources": sources,
+        "kind": "numeric" if shown_numeric else "abstain", "text": "\n".join(lines), "provider": "template",
+        "demo": False, "numeric": numeric if shown_numeric else None, "sources": sources,
         "coverage": general | {"facts": cov}, "limitations": limitations, "abstention_kind": kind,
         "preliminary": {"value": _str(pre.value), "record_count": pre_n,
                         "values": _tier_values(pre, textual)} if pre else None,
-        "pending_extraction": cov["not_yet_extracted"],
+        "pending_extraction": cov["not_yet_extracted"], "audit": audit,
     }
     return Part(answer, computed)
+
+
+def _gap_text(cov: dict) -> str:
+    """The documents in scope whose value is unknown, in words ("" when there are none)."""
+    parts = []
+    for key, label in (("not_yet_extracted", "{n} מסמכים טרם חולצו"), ("partial_scan", "{n} מסמכים נקראו חלקית"),
+                       ("awaiting_review", "{n} ערכים ממתינים לבדיקה"),
+                       ("unknown_metadata", "{n} מסמכים ללא נתוני סינון")):
+        if cov.get(key):
+            parts.append(label.format(n=cov[key]))
+    return "; ".join(parts)
 
 
 def _search_queries(run: _Run, combined: bool) -> tuple[list[str], list[str], MetadataFilters | None]:
@@ -884,6 +942,7 @@ def _search(run: _Run, base: Part | None) -> dict:
     if provider is not None and time.monotonic() >= run.deadline:
         provider, run.partial = None, True
     comp = compose_answer(provider, run.question, evidence, computed=base.computed if base else [],
+                          deadline=run.deadline,
                           cited_extra={s["evidence_id"]: s.get("snippet") or "" for s in base_sources},
                           two_sided=_two_sided(run), no_evidence_kind=kind)
     statuses = [str(u.status) for u in comp.usage]
@@ -925,10 +984,22 @@ def _locate(run: _Run) -> dict:
     run.step("locate", {"queries": queries, "filters": filters.__dict__ if filters else None,
                         "documents": [str(x) for x in scope.document_ids] if scope else None},
              {"evidence": len(evidence), "documents": len(docs)}, f"{len(docs)} מסמכים")
+    absent = list(getattr(out, "absent_terms", None) or [])
+    absent_note = f"המילים {', '.join('«' + t + '»' for t in absent)} לא נמצאו באף מסמך בתחום." if absent else ""
     if not evidence:
         kind = no_evidence_kind(run.ctx)
         return {"kind": "abstain", "provider": "template", "demo": False, "sources": [], "coverage": cov,
-                "text": ABSTENTION_TEXT[kind], "numeric": None, "claims": [], "abstention_kind": kind,
+                "text": ABSTENTION_TEXT[kind] + (f" {absent_note}" if absent_note else ""), "numeric": None,
+                "claims": [], "abstention_kind": kind,
+                "limitations": ["החיפוש בוצע רק במסמכי המשרד שעובדו ושאתם מורשים לראות."]}
+    if absent and not any(d.full_support for d, _ in docs):
+        # The topic word occurs in no document: the partial matches are near sources, never the answer (R22).
+        kind = no_evidence_kind(run.ctx)
+        lines = [ABSTENTION_TEXT[kind], absent_note, "מסמכים שבהם נמצאו רק חלק ממילות השאלה:"]
+        for d, found in docs:
+            lines.append(f"• {d.title} " + " ".join("[" + e["evidence_id"] + "]" for e in found))
+        return {"kind": "abstain", "provider": "template", "demo": False, "sources": source_json(evidence),
+                "coverage": cov, "text": "\n".join(lines), "numeric": None, "claims": [], "abstention_kind": kind,
                 "limitations": ["החיפוש בוצע רק במסמכי המשרד שעובדו ושאתם מורשים לראות."]}
     lines = ["המסמכים שבהם נמצאו קטעים רלוונטיים:"]
     for d, found in docs:
@@ -938,6 +1009,8 @@ def _locate(run: _Run) -> dict:
     limitations = ["רשימת המסמכים מבוססת על חיפוש בתוכן המסמכים המורשים."]
     if any(not d.full_support for d, _ in docs):
         limitations.append("בחלק מהמסמכים נמצאו רק חלק ממילות השאלה.")
+    if absent_note:
+        limitations.append(absent_note)
     return {"kind": "content", "text": "\n".join(lines), "provider": "template", "demo": False,
             "sources": source_json(evidence), "coverage": cov, "numeric": None, "claims": [],
             "abstention_kind": None, "limitations": limitations}
@@ -966,6 +1039,7 @@ def _compare(run: _Run, step: Step) -> dict | None:
     sides = _compare_sides(run, step)
     if len(sides) < 2:
         others = [h for h in run.state.sources if h not in step.source_handles]
+        run.known_sides = list(dict.fromkeys(step.source_handles))
         if sides or step.source_handles:
             run.ask("referent", REFERENT_COMPARE_SECOND, [{"value": h, "label": f"מקור {h}"} for h in others])
         else:
@@ -978,7 +1052,7 @@ def _compare(run: _Run, step: Step) -> dict | None:
     provider = run.L.provider
     if provider is not None and not gathered.missing and time.monotonic() >= run.deadline:
         provider, run.partial = None, True
-    out = compose_comparison(gathered, provider, run.L.pstate)
+    out = compose_comparison(gathered, provider, run.L.pstate, deadline=run.deadline)
     if out.usage:
         with tenant_tx(run.ctx) as conn:
             log_usages(conn, provider, out.usage)
@@ -1129,8 +1203,11 @@ def _replan(run: _Run) -> TurnPlan | None:
     payload = json.loads(build_interpret_input(run.question, run.state, run.L.gazetteer, run.L.attributes))
     payload["previous_steps"] = summaries
     payload["replan_note"] = "הצעדים הקודמים לא החזירו תוצאה. הצע ניסוח חיפוש או צעדים אחרים."
-    result = provider.structured(Purpose.INTERPRET, INTERPRET_INSTRUCTIONS, json.dumps(payload, ensure_ascii=False),
-                                 TurnPlan)
+    try:
+        result = call_structured(provider, Purpose.INTERPRET, INTERPRET_INSTRUCTIONS,
+                                 json.dumps(payload, ensure_ascii=False), TurnPlan, deadline=run.deadline)
+    except Exception as exc:  # noqa: BLE001 - a failed replan keeps the answer already computed
+        result = StructuredResult(CallStatus.ERROR, detail=type(exc).__name__)
     with tenant_tx(run.ctx) as conn:
         log_usage(conn, provider, Purpose.INTERPRET.value, result, result.ok)
     run.statuses.append(str(result.status))
@@ -1210,6 +1287,9 @@ def _str(value) -> str | None:
 
 def _with_unit(value, unit: str | None) -> str:
     label = UNIT_LABELS.get(unit or "", "")
+    if unit == "year":  # a calendar year is never written with a thousands separator
+        year = Decimal(str(value))
+        return str(int(year)) if year == year.to_integral_value() else str(year)
     shown = number(Decimal(str(value)) if not isinstance(value, int) else value)
     return f"{shown} {label}" if label else shown
 
@@ -1294,7 +1374,7 @@ def execute_turn(ctx: TenantContext, it: Interpreted, L: Loaded, question_id: UU
         return TurnResult(answer, None, None, [], {}, None, route, None, conflict_pending=it.conflict)
 
     if it.mode == "model" and it.plan is not None:
-        it.plan = normalize_model_plan(it.plan, L.state)
+        it.plan = normalize_model_plan(it.plan, L.state, it.question)
         if it.plan.turn_relation == "follow_up" and not _has_context(L.state):
             it.plan = it.plan.model_copy(update={"task_type": "clarify", "steps": [], "clarification": (
                 ProposedClarification(key="referent", question=FOLLOW_UP_WITHOUT_CONTEXT, options=[]))})
@@ -1339,7 +1419,9 @@ def execute_turn(ctx: TenantContext, it: Interpreted, L: Loaded, question_id: UU
                 key=clarification.key, question=clarification.question, options=clarification.options,
                 original_question=it.question, task_type=plan.task_type, topic=state.topic,
                 entities=state.entities, conditions=state.conditions, attribute=state.attribute,
-                metric=state.metric, unit=state.unit, value_filter=state.value_filter)})
+                metric=state.metric, unit=state.unit, value_filter=state.value_filter,
+                source_handles=run.known_sides if clarification.key == "referent" else [],
+                search_queries=list(plan.search_queries))})
         answer = clarification_answer(clarification.key, clarification.question,
                                       [o.model_dump() for o in clarification.options])
         run.state = state

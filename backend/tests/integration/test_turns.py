@@ -477,6 +477,20 @@ def test_chip_edit_and_removal_rerun_the_last_task(client, records):
     assert conversation(client, cid)["context"]["years"] is None
 
 
+def test_removing_a_chip_before_any_answer_changes_the_open_clarification(client, records):
+    """Code review #29: with only a clarification asked, removing a chip answered 422 "write a question". It
+    now changes the clarification's context and asks it again."""
+    login(client, "admin-a@example.test")
+    cid = post(client, "מה מחיר למ״ר בחרוזים ב-2024?")["conversation_id"]
+    assert conversation(client, cid)["pending_clarification"]["key"] == "data_kind"
+    again = post(client, conversation_id=cid, remove=["years"])["answer"]
+    assert again["kind"] == "clarification" and again["clarification"]["key"] == "data_kind"
+    conv = conversation(client, cid)
+    assert conv["pending_clarification"]["key"] == "data_kind" and conv["context"]["years"] is None
+    done = post(client, conversation_id=cid, clarification={"key": "data_kind", "value": "transaction_price"})
+    assert conversation(client, done["conversation_id"])["context"]["years"] is None
+
+
 def test_other_user_cannot_open_or_continue_a_conversation(client, records):
     make_user(records, "y@example.test", [records.default_group_id])
     login(client, "admin-a@example.test")
@@ -881,3 +895,36 @@ def test_address_that_names_no_document_is_a_limitation_not_an_unknown_place(cli
     assert a["kind"] == "content" and a["abstention_kind"] is None
     assert turn.UNMATCHED_NOTE.format(entity="רחוב הזית 7") in a["limitations"]
     assert turn.UNSCOPED_NOTE in a["limitations"]
+
+
+def test_choosing_the_second_source_resumes_the_comparison(client, db, monkeypatch):
+    """Code review #6: a comparison with one known side asks for the second; choosing it (a button) must run the
+    comparison of both sides, not ask again."""
+    a = make_office(db, "משרד א", "admin-a@example.test")
+    one, _ = add_chunks(a, a.default_group_id, ["שיעור ההתאמה לגודל בשומה הראשונה הוא 5%."], "1" * 64)
+    two, _ = add_chunks(a, a.default_group_id, ["שיעור ההתאמה לגודל בשומה השנייה הוא 7%."], "2" * 64)
+    p = ScriptedProvider()
+    p.on(Purpose.INTERPRET, plan(task_type="answer", search_queries=["שיעור ההתאמה לגודל"], steps=[SEARCH]))
+    p.on(Purpose.ANSWER, claims(("שיעור ההתאמה לגודל בשומה הראשונה הוא 5%", ["E1"]),
+                                ("שיעור ההתאמה לגודל בשומה השנייה הוא 7%", ["E2"])))
+    p.on(Purpose.VERIFY, verdicts(2))
+    p.on(Purpose.INTERPRET, plan(task_type="compare", turn_relation="follow_up",
+                                 search_queries=["שיעור ההתאמה לגודל"],
+                                 steps=[{"tool": "compare", "attribute_handle": None, "source_handles": ["S1"]}]))
+    p.on(Purpose.ANSWER, {**claims(("שיעור ההתאמה לגודל בשומה הראשונה הוא 5%", ["E1"]),
+                                   ("שיעור ההתאמה לגודל בשומה השנייה הוא 7%", ["E2"])),
+                          "conflicts": [{"datum": "שיעור ההתאמה לגודל", "claims": [0, 1]}]})
+    p.on(Purpose.VERIFY, verdicts(2))
+    enable_cloud(a, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    first = post(client, "מה שיעור ההתאמה לגודל?")
+    cid = first["conversation_id"]
+    asked = post(client, "השווה את זה למקור אחר", cid)["answer"]
+    assert asked["kind"] == "clarification" and asked["clarification"]["key"] == "referent"
+    option = asked["clarification"]["options"][0]["value"]
+    done = post(client, None, cid, clarification={"key": "referent", "value": option})["answer"]
+    assert done["kind"] != "clarification", done.get("text")
+    # both documents are the comparison's sides, each with its own evidence (which side the scripted claims
+    # land on depends on the order the first answer cited them)
+    assert {x["document_id"] for x in done["compare"]["sides"]} == {str(one), str(two)}
+    assert all(x["evidence_count"] >= 1 for x in done["compare"]["sides"])

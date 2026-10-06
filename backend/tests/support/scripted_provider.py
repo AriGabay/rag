@@ -50,7 +50,7 @@ class ScriptedProvider(BaseProvider):
         return self
 
     def structured(self, purpose: Purpose, instructions: str, input: str, schema: type[BaseModel], *,
-                   max_output_tokens: int | None = None) -> StructuredResult:
+                   max_output_tokens: int | None = None, deadline: float | None = None) -> StructuredResult:
         purpose = Purpose(purpose)
         entry = next((e for e in self._entries if e.purpose == purpose and not (e.used and not e.repeat)
                       and (e.match is None or e.match in input)), None)
