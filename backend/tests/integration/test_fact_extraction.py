@@ -68,9 +68,15 @@ def make_attr(office, label=ATTR, dimension="area"):
         return resolve_attribute(conn, handle=None, description=label, unit_dimension=dimension)
 
 
-def mention(quote, value, source="C1", role="subject", unit="מ״ר", descriptor=None):
+def default_term(quote: str) -> str:
+    """The quote's words other than the number and its unit: what the model reports as the naming term."""
+    words = [w for w in quote.split() if not re.search(r"\d", w) and w not in ("מ״ר", "ס״מ", "מטר", "מ׳", "מ'", "%")]
+    return " ".join(words)
+
+
+def mention(quote, value, source="C1", role="subject", unit="מ״ר", descriptor=None, term=None):
     return {"entity_role": role, "entity_descriptor": descriptor, "value_text": value, "unit_text": unit,
-            "quote": quote, "source": source}
+            "quote": quote, "source": source, "attribute_term": default_term(quote) if term is None else term}
 
 
 def script(provider, title, *mentions):
@@ -238,7 +244,7 @@ def test_table_cell_takes_the_unit_from_its_column_header(office):
     table = TableResult(0, ["כתובת", "שטח ממ״ד (מ״ר)"], [None, None], [TableRow(2, ["ביאליק 3", "9"])], 2, 2,
                         section="נתוני הנכס")
     add_doc(office, office.default_group_id, "דוח", ["פתיח"], tables=[table])
-    script(p, "דוח", mention("9", "9", source="T1R1C2", unit=None))
+    script(p, "דוח", mention("9", "9", source="T1R1C2", unit=None, term="שטח ממ״ד"))
     comp = extract(office.ctx(), attr, p)
     assert comp.preliminary.values == [Decimal("9")]
     assert comp.sources[0]["page"] == 2 and comp.sources[0]["chunk_id"]
@@ -435,12 +441,12 @@ def test_long_document_outside_retrieved_passages_is_partial_scan(office, limits
     limits(budget=2000)
     attr = make_attr(office, "שטח מחסן")
     filler = [f"פסקה {i}: המחסן הצמוד לדירה משמש לאחסון כללי, ללא נתוני שטח מפורטים בסעיף זה." for i in range(40)]
-    datum = "בקומת המרתף נמדד החלל הצמוד בגודל 6 מ״ר."
+    datum = "בקומת המרתף נמדד המחסן הצמוד בגודל 6 מ״ר."
     add_doc(office, office.default_group_id, "ארוך", [*filler[:20], datum, *filler[20:]])
 
     def respond(_instructions, prompt):
         found = datum in prompt
-        return {"mentions": [mention("בגודל 6 מ״ר", "6", source="C1")] if found else []}
+        return {"mentions": [mention("המחסן הצמוד בגודל 6 מ״ר", "6", source="C1")] if found else []}
 
     p = ScriptedProvider().on(Purpose.EXTRACT, respond, repeat=True)
     comp = extract(office.ctx(), attr, p)
@@ -452,7 +458,7 @@ def test_long_document_outside_retrieved_passages_is_partial_scan(office, limits
     # a larger budget re-reads the partially scanned version in full
     limits(budget=100_000)
     p2 = ScriptedProvider().on(Purpose.EXTRACT, lambda i, prompt: {"mentions": [
-        mention("בגודל 6 מ״ר", "6", source=handle_of(prompt, datum))]}, repeat=True)
+        mention("המחסן הצמוד בגודל 6 מ״ר", "6", source=handle_of(prompt, datum))]}, repeat=True)
     again = extract(office.ctx(), attr, p2)
     assert len(extract_calls(p2)) == 1 and ledger(office, attr) == {"ארוך": "found"}
     assert again.preliminary.values == [Decimal("6")]
@@ -501,3 +507,33 @@ def test_unknown_filter_metadata_is_counted_not_included(office):
     assert len(extract_calls(p)) == 1
     assert comp.coverage["in_scope"] == 1 and comp.coverage["unknown_metadata"] == 1
     assert comp.preliminary.values == [Decimal("12")]
+
+
+def test_a_number_not_named_as_the_attribute_is_never_its_value(office):
+    """Found with the real model: whole-apartment areas were reported as the safe-room area. A mention must be
+    named as the attribute in its own quote or column header; a generic term ("שטח") ties nothing."""
+    attr = make_attr(office)
+    p = ScriptedProvider()
+    add_doc(office, office.default_group_id, "דוח", ["דירה בת 4 חדרים, שטח 94 מ״ר נטו, בקומה שנייה."])
+    script(p, "דוח", mention("שטח 94 מ״ר נטו", "94", term="שטח"))
+    comp = extract(office.ctx(), attr, p)
+    assert comp.preliminary is None and not (comp.main and comp.main.values)
+    assert comp.coverage["mentions_rejected"] == 1 and ledger(office, attr) == {"דוח": "not_stated"}
+
+
+def test_a_term_that_does_not_appear_in_the_quote_is_rejected(office):
+    attr = make_attr(office)
+    p = ScriptedProvider()
+    add_doc(office, office.default_group_id, "דוח", ["שטח הדירה 94 מ״ר."])
+    script(p, "דוח", mention("שטח הדירה 94 מ״ר", "94", term="שטח ממ״ד"))
+    comp = extract(office.ctx(), attr, p)
+    assert comp.coverage["mentions_rejected"] == 1
+
+
+def test_another_phrasing_of_the_attribute_goes_to_review_not_to_the_figure(office):
+    attr = make_attr(office)
+    p = ScriptedProvider()
+    add_doc(office, office.default_group_id, "דוח", ["בדירה מרחב מוגן דירתי בשטח 11 מ״ר."])
+    script(p, "דוח", mention("מרחב מוגן דירתי בשטח 11 מ״ר", "11", term="מרחב מוגן דירתי"))
+    comp = extract(office.ctx(), attr, p)
+    assert comp.preliminary is None and comp.coverage["awaiting_review"] == 1

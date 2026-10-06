@@ -60,8 +60,6 @@ def test_valid_plan_passes():
     (plan_dict(steps=[{"tool": "search", "attribute_handle": None, "source_handles": []}] * (MAX_STEPS + 1),
                search_queries=["x"]), "too_many_steps"),
     (plan_dict(search_queries=["א", "ב", "ג", "ד"]), "too_many_queries"),
-    (plan_dict(steps=[{"tool": "search", "attribute_handle": None, "source_handles": []}], search_queries=[]),
-     "missing_query"),
     (plan_dict(search_queries=["מחיר; DROP TABLE documents"]), "sql_like"),
     (plan_dict(search_queries=["SELECT * FROM transactions"]), "sql_like"),
     (plan_dict(entities=["3f2b1c9e-8a7d-4e6f-9b0a-1c2d3e4f5a6b"]), "uuid_like"),
@@ -178,3 +176,25 @@ def test_unexecutable_clarification_is_kept():
 
     p = normalize_model_plan(_model_plan(task_type="clarify", clarification="scope"))
     assert p.task_type == "clarify" and p.clarification is not None
+
+
+def test_search_step_without_queries_is_accepted_and_searches_the_question():
+    """The orchestrator falls back to the question itself; an empty query list is not a reason to reject."""
+    result = check(plan_dict(steps=[{"tool": "search", "attribute_handle": None, "source_handles": []}],
+                             search_queries=[]))
+    assert result.ok
+
+
+def test_unknown_attribute_handles_are_dropped_not_used():
+    result = check(plan_dict(attribute={"handle": "A9", "description": "גודל החלל", "unit_dimension": "area"},
+                             steps=[{"tool": "extract_and_compute", "attribute_handle": "A9", "source_handles": []}],
+                             search_queries=["x"]))
+    assert result.ok
+    assert result.plan.attribute.handle is None and result.plan.attribute.description == "גודל החלל"
+    assert result.plan.steps[0].attribute_handle is None
+
+
+def test_clarify_without_a_question_but_with_work_to_do_becomes_that_work():
+    result = check(plan_dict(task_type="clarify", metric="mean", search_queries=["x"],
+                             attribute={"handle": None, "description": "גודל החלל", "unit_dimension": "area"}))
+    assert result.ok and result.plan.task_type == "compute" and result.plan.clarification is None

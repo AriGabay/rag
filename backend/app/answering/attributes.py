@@ -57,7 +57,7 @@ CANONICAL_UNITS = {
     "duration": "month",
 }
 VALUE_TYPES = ("numeric", "text", "boolean", "date")
-EXTRACTION_PROMPT_VERSION = "x1"
+EXTRACTION_PROMPT_VERSION = "x2"  # x2: a value must be named as the attribute (attribute_term)
 _WORD = re.compile(r"[\w״׳]+")
 _FILLER = frozenset({"של"})  # "שטח של הדירה" names the same attribute as "שטח הדירה"
 _COLUMNS = ("id, key, label_he, aliases, value_type, unit_dimension, canonical_unit, source, structured_column,"
@@ -133,9 +133,19 @@ def _handle_dict(handle: str, r) -> dict:
             "description": _STRUCTURED_DESCRIPTIONS.get(r.key) if r.source == "structured" else None}
 
 
+def upgrade_extraction_version(conn: Connection) -> int:
+    """Move extracted definitions to the current extraction prompt: facts of an older prompt are no longer
+    used, the ledger re-reads those documents, and answers keyed on the old facts version go stale."""
+    return conn.execute(
+        text("UPDATE attribute_definitions SET extraction_prompt_version = :pv, facts_version = facts_version + 1"
+             " WHERE source = 'extracted' AND extraction_prompt_version IS DISTINCT FROM :pv"),
+        {"pv": EXTRACTION_PROMPT_VERSION}).rowcount
+
+
 def list_attribute_handles(conn: Connection) -> list[dict]:
     """The office's definitions as interpreter handles A1..An (structured entries ensured first)."""
     ensure_structured_attributes(conn)
+    upgrade_extraction_version(conn)
     return [_handle_dict(f"A{i}", r) for i, r in enumerate(_rows(conn), start=1)]
 
 

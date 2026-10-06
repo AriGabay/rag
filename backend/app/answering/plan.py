@@ -188,16 +188,15 @@ def validate_plan(raw: TurnPlan | dict, *, gazetteer: Gazetteer, attributes: Ite
         errors.append("too_many_steps")
     if len(plan.search_queries) > MAX_QUERIES:
         errors.append("too_many_queries")
-    if any(s.tool == "search" for s in plan.steps) and not any(q.strip() for q in plan.search_queries):
-        errors.append("missing_query")
     strings = list(_strings(plan.model_dump()))
     if any(_SQL.search(s) for s in strings):
         errors.append("sql_like")
     if any(_UUID.search(s) for s in strings):
         errors.append("uuid_like")
     attr_handles = {a["handle"] for a in attributes}
-    used_attrs = {s.attribute_handle for s in plan.steps} | {plan.attribute.handle if plan.attribute else None}
-    if used_attrs - {None} - attr_handles:
+    # A handle the server never issued is dropped, never used: the description still names the attribute.
+    plan = _drop_unknown_attribute_handles(plan, attr_handles)
+    if plan.attribute is not None and not (plan.attribute.handle or plan.attribute.description):
         errors.append("unknown_attribute_handle")
     if {h for s in plan.steps for h in s.source_handles} - set(source_handles):
         errors.append("unknown_source_handle")
@@ -207,7 +206,11 @@ def validate_plan(raw: TurnPlan | dict, *, gazetteer: Gazetteer, attributes: Ite
     if not _years_ok(plan.conditions):
         errors.append("invalid_years")
     if plan.task_type == "clarify" and (plan.clarification is None or not plan.clarification.question.strip()):
-        errors.append("clarify_without_question")
+        if plan.steps or plan.search_queries or plan.attribute is not None:
+            plan = plan.model_copy(update={"task_type": "compute" if plan.metric != "none" and plan.attribute
+                                           else "answer", "clarification": None})
+        else:
+            errors.append("clarify_without_question")
     if errors:
         return PlanCheck(None, errors)
 
@@ -224,6 +227,15 @@ def validate_plan(raw: TurnPlan | dict, *, gazetteer: Gazetteer, attributes: Ite
     if (city, hood) != (c.city, c.neighborhood):
         plan = plan.model_copy(update={"conditions": c.model_copy(update={"city": city, "neighborhood": hood})})
     return PlanCheck(plan)
+
+
+def _drop_unknown_attribute_handles(plan: TurnPlan, known: set[str]) -> TurnPlan:
+    steps = [s if s.attribute_handle is None or s.attribute_handle in known
+             else s.model_copy(update={"attribute_handle": None}) for s in plan.steps]
+    attribute = plan.attribute
+    if attribute is not None and attribute.handle is not None and attribute.handle not in known:
+        attribute = attribute.model_copy(update={"handle": None})
+    return plan.model_copy(update={"steps": steps, "attribute": attribute})
 
 
 # --- server policy over model plans (R3, R20, KTD1) -------------------------------------------------------

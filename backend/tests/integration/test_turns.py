@@ -622,3 +622,17 @@ def test_interpreter_usage_row_has_tokens_and_latency(client, content, monkeypat
         row = conn.execute(text("SELECT input_tokens, output_tokens, latency_ms, ok, status FROM provider_usage"
                                 " WHERE purpose = 'interpret'")).one()
     assert tuple(row) == (321, 45, 67, True, "ok")
+
+
+def test_follow_up_without_any_context_asks_what_it_refers_to(client, records, monkeypatch):
+    """R18: "ומה לגבי 2023?" opening a conversation has nothing to follow. Whatever the interpreter planned,
+    the server asks a short referent clarification instead of guessing a topic or a price."""
+    p = ScriptedProvider().on(Purpose.INTERPRET, plan(task_type="answer", turn_relation="follow_up",
+                                                      conditions={"year_from": 2023, "year_to": 2023},
+                                                      steps=[SEARCH]), repeat=True)
+    enable_cloud(records, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    a = post(client, "ומה לגבי 2023?")["answer"]
+    assert a["kind"] == "clarification"
+    assert a["clarification"]["key"] == "referent" and "שאלת ההמשך" in a["clarification"]["question"]
+    assert [c.purpose for c in p.calls] == [Purpose.INTERPRET]  # nothing was searched or computed

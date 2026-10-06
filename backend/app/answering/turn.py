@@ -824,6 +824,16 @@ def _unknown_place(run: _Run) -> dict:
             "limitations": ["המערכת עונה רק על סמך מסמכי המשרד ואינה משלימה מידע ממקורות אחרים."]}
 
 
+FOLLOW_UP_WITHOUT_CONTEXT = "לאיזה נושא מתייחסת שאלת ההמשך? בשיחה זו אין עדיין שאלה קודמת; כתבו את השאלה המלאה."
+
+
+def _has_context(state) -> bool:
+    """A follow-up needs something to follow: an earlier task, topic, attribute or stated condition."""
+    c = state.conditions
+    return bool(state.task_type or state.topic or state.attribute or state.recent_questions
+                or any(getattr(c, k, None) is not None for k in type(c).model_fields))
+
+
 def _default_steps(plan: TurnPlan) -> list[Step]:
     if plan.steps:
         return list(plan.steps)
@@ -1046,6 +1056,9 @@ def execute_turn(ctx: TenantContext, it: Interpreted, L: Loaded, question_id: UU
 
     if it.mode == "model" and it.plan is not None:
         it.plan = normalize_model_plan(it.plan)
+        if it.plan.turn_relation == "follow_up" and not _has_context(L.state):
+            it.plan = it.plan.model_copy(update={"task_type": "clarify", "steps": [], "clarification": (
+                ProposedClarification(key="referent", question=FOLLOW_UP_WITHOUT_CONTEXT, options=[]))})
     plan, start = _expand_versions(ctx, it.plan, L.state)
     new_state, effects = apply_turn(start, plan, question=it.question if it.mode not in ("button", "edit") else None)
     cleared = list(effects.cleared)
