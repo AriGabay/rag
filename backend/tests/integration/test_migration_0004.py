@@ -73,7 +73,7 @@ def test_worker_fails_extract_facts_job_without_touching_the_version(office):
     assert worker.run_one("w") is False  # terminal: never re-claimed
     with tenant_tx(a.ctx()) as conn:
         job = conn.execute(text("SELECT status, last_error FROM jobs")).one()
-        assert (job.status, job.last_error) == ("failed", "extract_facts handler not implemented")
+        assert (job.status, job.last_error) == ("failed", "cloud_unavailable")
         assert conn.execute(text("SELECT status FROM document_versions WHERE id = :v"), {"v": ver}).scalar() == "ready"
 
 

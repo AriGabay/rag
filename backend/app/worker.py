@@ -18,6 +18,8 @@ from uuid import UUID
 
 from sqlalchemy import text
 
+from app.answering import facts
+from app.answering.attributes import bump_facts_version
 from app.config import get_settings
 from app.db import TenantContext, anonymous_tx, tenant_tx
 from app.extraction.base import ExtractionError
@@ -27,7 +29,6 @@ from app.platform.jobs import fail_job, finish_job, renew_lease
 logger = logging.getLogger("app.worker")
 
 FAILED_REASON = "העיבוד נכשל ({attempts} ניסיונות). ניתן להעלות את הקובץ מחדש"
-EXTRACT_NOT_IMPLEMENTED = "extract_facts handler not implemented"
 
 
 class _LeaseKeeper(threading.Thread):
@@ -53,11 +54,35 @@ def claim(worker_id: str):
         ).first()
 
 
-def handle_extract_facts(ctx: TenantContext, job) -> None:
-    """Placeholder until on-demand extraction lands: fail the job terminally. A failed extraction
-    job never changes ``document_versions.status``."""
+def handle_extract_facts(ctx: TenantContext, job, worker_id: str) -> None:
+    """One attribute from one version (KTD8), under the office context. A skip (cloud off, missing key,
+    version deleted or superseded) makes no provider call and fails the job terminally; a provider error
+    writes ledger state ``failed`` and calls only ``fail_job``. A failed extraction job never changes
+    ``document_versions.status``. A job that wrote facts bumps that attribute's ``facts_version``."""
+    payload = job.payload or {}
+    keeper = _LeaseKeeper(job.office_id, job.job_id, worker_id)
+    keeper.start()
+    try:
+        try:
+            result = facts.run_extraction_job(ctx, job.version_id, payload)
+        finally:
+            keeper.stop_event.set()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("extract job %s failed: %s", job.job_id, type(exc).__name__)
+        logger.debug("%s", traceback.format_exc())
+        facts.mark_job_failed(ctx, job.version_id, payload, type(exc).__name__)
+        with tenant_tx(ctx) as conn:
+            fail_job(conn, job.job_id, type(exc).__name__, False, job.attempts, job.max_attempts)
+        return
     with tenant_tx(ctx) as conn:
-        fail_job(conn, job.job_id, EXTRACT_NOT_IMPLEMENTED, True, job.attempts, job.max_attempts)
+        if result.outcome == "done":
+            finish_job(conn, job.job_id)
+            if result.wrote and result.attribute_id is not None:
+                bump_facts_version(conn, result.attribute_id)
+        else:
+            fail_job(conn, job.job_id, result.reason or result.outcome, result.permanent, job.attempts,
+                     job.max_attempts)
+    logger.info("extract job %s: %s (%s)", job.job_id, result.outcome, result.reason)
 
 
 def run_one(worker_id: str) -> bool:
@@ -67,7 +92,7 @@ def run_one(worker_id: str) -> bool:
         return False
     ctx = pipeline.system_ctx(job.office_id)
     if job.kind == "extract_facts":
-        handle_extract_facts(ctx, job)
+        handle_extract_facts(ctx, job, worker_id)
         return True
     keeper = _LeaseKeeper(job.office_id, job.job_id, worker_id)
     keeper.start()
