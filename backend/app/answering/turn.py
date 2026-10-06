@@ -828,8 +828,15 @@ def _fact_part(comp, c: QueryConditions, general: dict, total=None, spec: ValueF
         lines.append(ABSTENTION_TEXT[kind])
     elif insufficient:
         kind = "not_extracted_or_verified"
-        lines.append(f"לא ניתן לחשב {what} שמייצג את המסמכים שבתחום: {gaps}. "
+        held = [x for x in comp.conflicts if not x.get("included")]
+        reason = gaps or ("לנכס אחד או יותר נמצאו ערכים סותרים שעשויים לקבוע את התוצאה" if held else "")
+        lines.append(f"לא ניתן לחשב {what} שמייצג את המסמכים שבתחום: {reason}. "
                      f"להלן הערכים שנמצאו עד כה, ללא חישוב כולל.")
+        for conflict in held[:LIST_SOURCES_MAX]:
+            shown_values = " / ".join(
+                f"{_with_unit(v['value'], unit) if isinstance(v['value'], Decimal) else v['value']}"
+                f" ({v.get('title') or ''})" for v in conflict["values"])
+            lines.append(f"• ערכים סותרים לאותו נכס: {shown_values}")
     elif not counted and not (comp.main.n or pre_n):  # values were observed, none meets the condition
         lines = [f"אף ערך של {comp.attribute_label} אינו עומד בתנאי {condition}."]
     if insufficient or op in ("values", "min", "max") or counted:
@@ -851,9 +858,9 @@ def _fact_part(comp, c: QueryConditions, general: dict, total=None, spec: ValueF
         limitations.append("חלק מהמסמכים שבתחום טרם חולצו, ולכן התוצאה חלקית.")
     if comp.pending_jobs:
         limitations.append(f"{comp.pending_jobs} מסמכים ממתינים לחילוץ ברקע; שאלו שוב מאוחר יותר.")
-    if any(not c.get("included") for c in comp.conflicts):
+    if any(not x.get("included") for x in comp.conflicts):
         limitations.append("נמצאו ערכים סותרים לאותו נכס במסמכים שונים; הם הועברו לבדיקה ולא נכללו.")
-    if any(c.get("included") for c in comp.conflicts):
+    if any(x.get("included") for x in comp.conflicts):
         limitations.append("לאותו נכס נמצאו ערכים שונים במסמכים שונים; נכלל הערך שאושר בידי אדם, והשאר הועברו "
                            "לבדיקה.")
     figure = comp.main if main_n and not insufficient else None

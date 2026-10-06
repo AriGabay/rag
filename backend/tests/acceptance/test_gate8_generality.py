@@ -80,8 +80,10 @@ KNOWN_GAPS: dict[str, tuple[tuple[str, ...], str]] = {
     "GQ40": (("result", "coverage"),
              _REJECTED.format(why="a renovation is an event, not a quantity: 'no changes' (H1) has no year and "
                                   "another stated year is not accepted, so 3 of the 5 values are observed")),
-    "GQ33": (("result", "coverage"),
-             _OTHER_VERB.format(docs="H2 (ואוכלס בשנת 2015) and H3 (הבניין הושלם בשנת 2004)", n="6 of the 8")),
+    "GQ33": (("outcome",),
+             _OTHER_VERB.format(docs="H2 (ואוכלס בשנת 2015) and H3 (הבניין הושלם בשנת 2004)", n="6 of the 8")
+             + "; and H6/H7 (one property, block/parcel 6960/52) disagree (1958 / 1962): an unreviewed conflict "
+             "that could be the minimum withholds the minimum (both values are shown), while the key expects 1958"),
     "GQ39": (("result", "coverage"), _REVIEW_TIER),
     "GQ37": (("task_type", "outcome", "abstention_kind"),
              "(a)/(d) without cloud use the question is planned as an answer (search) and the passages come "

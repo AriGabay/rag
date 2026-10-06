@@ -1055,6 +1055,26 @@ def completeness(cov: dict, observations: int, operation: str) -> str:
     return "subset"
 
 
+def _conflict_decides(conflicts: list[dict], fig: Figure, operation: str) -> bool:
+    """Whether an entity left out for conflicting values could be the minimum or maximum: one of its values lies
+    beyond the extreme of the values used. The extreme is then unknown until the conflict is reviewed."""
+    if operation not in ("min", "max", "range"):
+        return False
+    for c in conflicts:
+        if c.get("included"):
+            continue
+        values = [v["value"] for v in c["values"] if isinstance(v.get("value"), Decimal)]
+        if not values:
+            continue
+        if fig.n == 0:
+            return True
+        if operation in ("min", "range") and fig.minimum is not None and min(values) < fig.minimum:
+            return True
+        if operation in ("max", "range") and fig.maximum is not None and max(values) > fig.maximum:
+            return True
+    return False
+
+
 def compute_facts(conn: Connection, attribute: AttributeDef, filters: MetadataFilters | None, operation: str, *,
                   dset: DocumentSet | None = None, trusted_only: bool = False,
                   value_filter: ValueFilter | None = None,
@@ -1185,9 +1205,12 @@ def compute_facts(conn: Connection, attribute: AttributeDef, filters: MetadataFi
     main = figure(main_vals, operation)
     preliminary = figure(prelim_vals, operation) if used_unreviewed else None
     shown = preliminary if preliminary is not None else main
+    full = completeness(coverage, by_state["used"] + by_state["filtered_out"], operation)
+    if not textual and _conflict_decides(conflicts, shown, operation):
+        full = "insufficient"  # a property held back by a conflict would be the extreme itself (GQ33)
     audit = {"attribute": attribute.label, "operation": operation,
              "unit": None if textual else attribute.canonical_unit or canonical_unit_for(attribute.unit_dimension),
-             "completeness": completeness(coverage, by_state["used"] + by_state["filtered_out"], operation),
+             "completeness": full,
              "in_scope": len(ids),
              "unknown_metadata": len(dset.unknown_metadata), "observations": shown.n, "duplicates_merged": duplicates,
              "value_filter": value_filter.describe() if value_filter else None, "documents": documents}

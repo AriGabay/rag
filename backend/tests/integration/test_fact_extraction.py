@@ -298,6 +298,23 @@ def test_same_subject_counts_once_and_differing_values_are_flagged(office):
         assert set(conn.execute(text("SELECT status FROM facts")).scalars()) == {"auto_validated"}
 
 
+def test_a_conflict_that_could_be_the_extreme_withholds_the_minimum(office):
+    """Round 7, GQ33: two reports on one property disagree (1958 / 1962); the next oldest is 1968. Leaving the
+    conflicted property out named 1968 as the oldest. The minimum is withheld until the conflict is reviewed,
+    and a conflict that cannot change it does not withhold it."""
+    attr = make_attr(office, "שנת הבנייה", "year")
+    p = ScriptedProvider()
+    for title, (block, value) in {"א1": ("6960/52", "1958"), "א2": ("6960/52", "1962"),
+                                  "ב": ("6233/7", "1968"), "ג": ("6210/31", "2017")}.items():
+        doc, ver = add_doc(office, office.default_group_id, title, [f"הבניין נבנה בשנת {value}."])
+        subject_at(office, doc, ver, *block.split("/"))
+        script(p, title, mention(f"נבנה בשנת {value}", value, unit=None, term="נבנה בשנת"))
+    oldest = extract(office.ctx(), attr, p, operation="min")
+    assert oldest.audit["completeness"] == "insufficient"
+    newest = compute(office.ctx(), attr, operation="max")
+    assert newest.audit["completeness"] != "insufficient" and newest.preliminary.value == Decimal("2017")
+
+
 def test_conflict_from_a_hidden_group_is_invisible_to_the_employee(office):
     g1, g2 = make_group(office, "G1"), make_group(office, "G2")
     emp = make_user(office, "emp@example.test", [g1])
