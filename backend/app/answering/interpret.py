@@ -333,8 +333,9 @@ def reply_is_new_question(plan: TurnPlan, pending: PendingClarification, questio
     """Whether a turn the model read as an answer to ``pending`` is a question of its own, by its structure and
     not by its length. It is when the plan brings what the clarification did not ask about: another attribute
     (unless the clarification asked for one), entities or places of its own, or another computation; or when
-    the text is a question (a question word, "X או Y") that names none of the chosen option's words. A reply
-    that names the chosen option ("התכוונתי לשווי שנקבע בשומות, לא למחירי העסקאות") is a reply at any length."""
+    the text is a question (a question word, "X או Y") whose content words are not all words of the chosen
+    option ("אילו שומות מזכירות X?" shares only "שומות" with the option "שווי שנקבע בשומות"). A reply that names
+    the chosen option ("התכוונתי לשווי שנקבע בשומות, לא למחירי העסקאות") is a reply at any length."""
     if pending.key != "attribute" and plan.attribute is not None and (
             pending.attribute is None or not _same_attribute_ref(plan.attribute, pending.attribute)):
         return True
@@ -347,12 +348,18 @@ def reply_is_new_question(plan: TurnPlan, pending: PendingClarification, questio
         return True
     if plan.metric not in ("none", None) and pending.metric not in (None, "none") and plan.metric != pending.metric:
         return True
+    if plan.task_type == "locate" and pending.task_type != "locate":
+        return True
     chosen = next((o for o in pending.options if o.value == plan.clarification_answer), None)
     words = _words(question)
-    names_option = chosen is not None and any(
-        _same_word(w, x) for w, _ in _polar(words) for x, _ in _polar(_words(f"{chosen.label} {chosen.value}")))
+    option_words = [x for x, _ in _polar(_words(f"{chosen.label} {chosen.value.replace('_', ' ')}"))] if chosen \
+        else []
+    content = [w for w, neg in _polar(words) if not neg]
+    # every content word names the chosen option: a word the option shares with an unrelated question (the
+    # repository's own nouns, "שומות") does not make that question a reply
+    names_only_option = bool(content) and all(any(_same_word(w, x) for x in option_words) for w in content)
     asks = any(w.strip("?") in _QUESTION_WORDS for w in words)
-    return asks and not names_option
+    return asks and not names_only_option
 
 
 def _same_attribute_ref(a, b) -> bool:

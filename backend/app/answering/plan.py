@@ -247,7 +247,12 @@ def validate_plan(raw: TurnPlan | dict, *, gazetteer: Gazetteer, attributes: Ite
             plan = plan.model_copy(update={"task_type": "compute" if plan.metric != "none" and plan.attribute
                                            else "answer", "clarification": None})
         else:
-            errors.append("clarify_without_question")
+            # nothing to execute and no question: the model found the request unclear without saying how; the
+            # server asks its own short referent question instead of discarding the plan to limited mode
+            key = plan.clarification.key if plan.clarification is not None else "referent"
+            plan = plan.model_copy(update={"clarification": ProposedClarification(
+                key=key, question=REFERENT_UNCLEAR, options=list(plan.clarification.options)
+                if plan.clarification is not None else [])})
     if errors:
         return PlanCheck(None, errors)
 
@@ -348,6 +353,7 @@ def _relation(plan: TurnPlan, state: ConversationState | None) -> str:
     return "new_question"
 
 
+REFERENT_UNCLEAR = "לא ברור לי למה הפנייה מתייחסת. אפשר לכתוב את השאלה המלאה, עם הנושא, המסמך או הנכס?"
 ORDERING_OPS = ("<", "<=", ">", ">=")
 ARITHMETIC_METRICS = ("sum", "mean", "weighted_mean", "median", "min", "max", "range")
 

@@ -389,3 +389,13 @@ def test_choosing_a_source_resumes_the_comparison_with_both_sides():
     plan = answer_plan(p, "S2")
     assert plan.task_type == "compare" and plan.steps[0].tool == "compare"
     assert plan.steps[0].source_handles == ["S1", "S2"]
+
+
+def test_a_question_sharing_only_a_repository_word_with_the_option_is_a_new_question():
+    """Found by the browser run: "אילו שומות מזכירות היתר בנייה?" while the data-kind clarification was open was
+    taken as the answer "שווי שנקבע בשומות", because "שומות" is also a word of that option."""
+    from app.answering.interpret import reply_is_new_question
+    p = pending_state().pending
+    plan = _reply_plan(clarification_answer="appraised_value")
+    assert reply_is_new_question(plan, p, "אילו שומות מזכירות היתר בנייה?")
+    assert not reply_is_new_question(plan, p, "שווי בשומות?")

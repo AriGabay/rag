@@ -63,12 +63,21 @@ def test_valid_plan_passes():
     (plan_dict(attribute={"handle": "A9", "description": None, "unit_dimension": None,
                           "value_type": None}), "unknown_attribute_handle"),
     (plan_dict(conditions={"year_from": 2024, "year_to": 2022}), "invalid_years"),
-    (plan_dict(task_type="clarify"), "clarify_without_question"),
 ])
 def test_invalid_plans_are_rejected(raw, error):
     result = check(raw)
     assert not result.ok and result.plan is None
     assert error in result.errors
+
+
+def test_an_unclear_request_with_nothing_to_execute_gets_the_servers_question():
+    """Found by the browser run: "ומה לגבי 2023?" in a new conversation was planned (2 of 3 replays) as clarify with
+    no question and nothing to execute. It was rejected and fell to limited mode; the server now asks."""
+    from app.answering.plan import REFERENT_UNCLEAR
+
+    result = check(plan_dict(task_type="clarify", turn_relation="follow_up"))
+    assert result.ok and result.plan.task_type == "clarify"
+    assert result.plan.clarification.key == "referent" and result.plan.clarification.question == REFERENT_UNCLEAR
 
 
 def test_safe_details_are_repaired_instead_of_rejected():
