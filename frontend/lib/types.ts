@@ -416,7 +416,9 @@ export type ProviderStatus =
   | "refusal"
   | "incomplete"
   | "invalid"
-  | "error";
+  | "error"
+  /** Cloud use was acknowledged for another provider than the selected one: nothing is sent until re-acknowledged. */
+  | "reacknowledge_required";
 
 export interface ProviderTest {
   provider: string | null;

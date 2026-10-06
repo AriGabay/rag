@@ -98,6 +98,8 @@ export const PROVIDER_STATUS_LABEL: Record<ProviderStatus, string> = {
   incomplete: "תשובת הספק נקטעה לפני סיומה",
   invalid: "תשובת הספק לא תאמה את המבנה הנדרש",
   error: "תקלה כללית בפנייה לספק",
+  reacknowledge_required:
+    "השימוש בענן אושר בעבר עבור ספק אחר. לא יישלח דבר לספק הנוכחי עד לאישור מחדש (הפעלת שימוש בענן ואישור).",
 };
 
 export function providerStatusLabel(status: string | null | undefined): string {

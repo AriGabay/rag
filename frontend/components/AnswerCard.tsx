@@ -489,6 +489,8 @@ interface AnswerCardProps {
   answer: Answer;
   clarificationState?: ClarificationState;
   busy?: boolean;
+  /** Disables the clarification buttons only (e.g. while the conversation's open clarification is unknown). */
+  choicesDisabled?: boolean;
   onChoose?: (key: string, value: string, label: string) => void;
   /** Re-sends the question as a new turn and replaces this answer (offered for partial answers). */
   onRefresh?: () => void;
@@ -501,7 +503,15 @@ interface AnswerCardProps {
  * When the claims are the whole answer (a content answer), they take the direct-answer place instead of being
  * repeated as text.
  */
-export function AnswerCard({ answer, clarificationState = "done", busy = false, onChoose, onRefresh, ref }: AnswerCardProps) {
+export function AnswerCard({
+  answer,
+  clarificationState = "done",
+  busy = false,
+  choicesDisabled = false,
+  onChoose,
+  onRefresh,
+  ref,
+}: AnswerCardProps) {
   const clar = answer.kind === "clarification" ? answer.clarification : null;
   const abstain = answer.kind === "abstain";
   const numeric = !abstain && (answer.kind === "numeric" || answer.kind === "combined") ? (answer.numeric ?? null) : null;
@@ -549,7 +559,7 @@ export function AnswerCard({ answer, clarificationState = "done", busy = false, 
         <ClarificationBlock
           clarification={clar}
           state={clarificationState}
-          disabled={busy}
+          disabled={busy || choicesDisabled}
           onChoose={(value, label) => onChoose?.(clar.key, value, label)}
         />
       ) : (

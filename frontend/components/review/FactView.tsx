@@ -2,7 +2,7 @@
 
 import { useId, useState } from "react";
 import { B, ErrorAlert, Notice } from "@/components/ui";
-import { ApiError, errorMessage, factsApi, safeApiUrl } from "@/lib/api";
+import { ApiError, errorMessage, factsApi, safeApiUrl, type FactPrecondition } from "@/lib/api";
 import { formatDecimal } from "@/lib/format";
 import { useApi } from "@/lib/useApi";
 import type { FactAttribute, FactBrief, FactDetail, FactReviewGroup, FactStatus, ReviewFact } from "@/lib/types";
@@ -27,6 +27,7 @@ const NUMBER_RE = /^(\d{1,3}(,\d{3})+(\.\d+)?|\d+(\.\d+)?)$/;
 const MSG_NUMBER = "יש להזין מספר תקין (לדוגמה 12 או 12.5).";
 const MSG_UNIT = "יש לבחור יחידה.";
 const MSG_REJECT_NOTE = "חובה לרשום את סיבת הדחייה.";
+const MSG_STALE = "הערך השתנה בינתיים; הרשימה נטענה מחדש.";
 
 function valueText(f: FactBrief): string {
   const v = formatDecimal(f.value);
@@ -169,6 +170,8 @@ function CorrectForm({
   );
 }
 
+type ChangedKind = "ok" | "warn";
+
 function FactRow({
   fact,
   attribute,
@@ -176,7 +179,7 @@ function FactRow({
 }: {
   fact: ReviewFact;
   attribute: FactAttribute;
-  onChanged: (message: string) => void;
+  onChanged: (message: string, kind?: ChangedKind) => void;
 }) {
   const uid = useId();
   const [busy, setBusy] = useState(false);
@@ -186,7 +189,13 @@ function FactRow({
   const [rejectError, setRejectError] = useState<string | null>(null);
   const canCorrect = attribute.value_type === "numeric" && attribute.unit_options.length > 0;
 
-  /** Runs an action; a 422 is returned as an inline message for the open form, anything else is shown above. */
+  // Every action carries the status and value this row shows: a fact someone else reviewed meanwhile is a 409.
+  const pre: FactPrecondition = { expected_status: fact.status, expected_value: fact.value };
+
+  /**
+   * Runs an action; a 422 is returned as an inline message for the open form, a 409 (the fact changed since the
+   * list was loaded) reloads the list with a notice above it, anything else is shown above the row.
+   */
   async function act(fn: () => Promise<FactDetail>, success: string): Promise<string | null> {
     setBusy(true);
     setError(null);
@@ -196,6 +205,11 @@ function FactRow({
       return null;
     } catch (err) {
       if (err instanceof ApiError && err.status === 422) return err.message;
+      if (err instanceof ApiError && err.status === 409) {
+        setMode("idle");
+        onChanged(MSG_STALE, "warn");
+        return null;
+      }
       setError(errorMessage(err));
       return null;
     } finally {
@@ -209,7 +223,7 @@ function FactRow({
       setRejectError(MSG_REJECT_NOTE);
       return;
     }
-    setRejectError(await act(() => factsApi.reject(fact.id, note), "הערך נדחה."));
+    setRejectError(await act(() => factsApi.reject(fact.id, note, pre), "הערך נדחה."));
   }
 
   const label = `${attribute.label}: ${valueText(fact)} — ${fact.document.title}`;
@@ -243,7 +257,7 @@ function FactRow({
             type="button"
             className="btn btn-primary"
             disabled={busy}
-            onClick={() => void act(() => factsApi.approve(fact.id), "הערך אושר.")}
+            onClick={() => void act(() => factsApi.approve(fact.id, pre), "הערך אושר.")}
           >
             אישור
           </button>
@@ -264,7 +278,7 @@ function FactRow({
           busy={busy}
           onCancel={() => setMode("idle")}
           onSubmit={(value, unit, note) =>
-            act(() => factsApi.correct(fact.id, value, unit, note || undefined), "התיקון נשמר.")
+            act(() => factsApi.correct(fact.id, value, unit, pre, note || undefined), "התיקון נשמר.")
           }
         />
       )}
@@ -301,7 +315,13 @@ function FactRow({
   );
 }
 
-function AttributeGroup({ group, onChanged }: { group: FactReviewGroup; onChanged: (message: string) => void }) {
+function AttributeGroup({
+  group,
+  onChanged,
+}: {
+  group: FactReviewGroup;
+  onChanged: (message: string, kind?: ChangedKind) => void;
+}) {
   const uid = useId();
   const count = group.documents.reduce((n, d) => n + d.facts.length, 0);
   return (
@@ -329,17 +349,18 @@ function AttributeGroup({ group, onChanged }: { group: FactReviewGroup; onChange
 /** The "extracted facts" review tab: grouped by attribute, then document, needs_review first (server order). */
 export function FactsReview() {
   const facts = useApi(factsApi.list);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ text: string; kind: ChangedKind } | null>(null);
   const groups = facts.data?.attributes ?? null;
 
-  function changed(message: string) {
-    setNotice(message);
+  /** After an action (or a stale-list 409) the list is reloaded, so every row shows the server's current state. */
+  function changed(text: string, kind: ChangedKind = "ok") {
+    setNotice({ text, kind });
     facts.reload();
   }
 
   return (
     <div className="stack">
-      {notice && <Notice kind="ok">{notice}</Notice>}
+      {notice && <Notice kind={notice.kind}>{notice.text}</Notice>}
       <ErrorAlert message={facts.error} onRetry={facts.reload} />
       {groups === null && !facts.error && <p className="muted">טוען...</p>}
       {groups && groups.length === 0 && <p className="muted">אין עובדות שממתינות לבדיקה</p>}

@@ -8,6 +8,8 @@ shown, not even as a flag.
 
 Every change appends the prior state to the row's ``previous`` history, bumps only that attribute's
 ``facts_version`` (so cached answers built on the old facts are not reused) and writes an audit event.
+A change may carry the status (and value) the reviewer saw; when the locked row no longer matches, it is
+a 409 and nothing changes, so an action taken on a stale list never overwrites someone else's review.
 """
 
 from __future__ import annotations
@@ -50,6 +52,7 @@ MSG_NOTE = "יש לתעד את סיבת הדחייה"
 MSG_NUMBER = "יש להזין מספר תקין (לדוגמה 12 או 12.5)"
 MSG_UNIT = "יש לבחור יחידה המתאימה למאפיין זה"
 MSG_NOT_NUMERIC = "ניתן לתקן כאן רק ערכים מספריים"
+MSG_STALE = "הערך השתנה בינתיים; טענו את הרשימה מחדש"
 
 _SELECT = (
     "SELECT f.id, f.document_id, f.version_id, f.attribute_id, f.entity_role, f.entity_key, f.entity_descriptor,"
@@ -63,11 +66,20 @@ _SELECT = (
 )
 
 
-class NoteBody(BaseModel):
+class Precondition(BaseModel):
+    """What the reviewer saw when acting (optional, for backwards compatibility). When given, the change is
+    applied only if the locked row still matches; otherwise 409 ``MSG_STALE`` and nothing changes. An explicit
+    ``expected_value: null`` expects a fact without a value; an absent field is not checked."""
+
+    expected_status: str | None = None
+    expected_value: str | None = None
+
+
+class NoteBody(Precondition):
     note: str | None = None
 
 
-class CorrectBody(BaseModel):
+class CorrectBody(Precondition):
     value: str
     unit: str = ""
     note: str | None = None
@@ -196,14 +208,36 @@ def _history(r, action: str, ctx: TenantContext, **extra) -> str:
     return json.dumps([entry], ensure_ascii=False, default=str)
 
 
-def _change(fact_id: str, ctx: TenantContext, action: str, apply) -> dict:
-    """Load the fact under the reviewer's RLS (404 when invisible), apply the change, bump the attribute's
-    ``facts_version`` and audit, all in one transaction."""
+def _same_value(current: str | None, expected: str | None) -> bool:
+    """The listed value equals the expected one; numbers compare by value ("12" == "12.0")."""
+    if current is None or expected is None:
+        return current is None and expected is None
+    try:
+        return Decimal(current) == Decimal(expected.strip())
+    except InvalidOperation:
+        return current.strip() == expected.strip()
+
+
+def _check(r, pre: Precondition | None) -> None:
+    """409 when the locked row no longer matches what the reviewer acted on (a stale list)."""
+    if pre is None:
+        return
+    if pre.expected_status is not None and r.status != pre.expected_status:
+        raise HTTPException(status.HTTP_409_CONFLICT, MSG_STALE)
+    if "expected_value" in pre.model_fields_set and not _same_value(_value(r), pre.expected_value):
+        raise HTTPException(status.HTTP_409_CONFLICT, MSG_STALE)
+
+
+def _change(fact_id: str, ctx: TenantContext, action: str, apply, pre: Precondition | None = None) -> dict:
+    """Load and lock the fact under the reviewer's RLS (404 when invisible), check the reviewer's precondition
+    (409 when stale), apply the change, bump the attribute's ``facts_version`` and audit, all in one
+    transaction."""
     fid = parse_uuid(fact_id)
     with tenant_tx(ctx) as conn:
         r = _load(conn, fid, lock=True)
         if r is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
+        _check(r, pre)
         details = apply(conn, r) or {}
         bump_facts_version(conn, r.attribute_id)
         audit(conn, action, ctx.user_id, "fact", fid, attribute_id=r.attribute_id, **details)
@@ -211,7 +245,8 @@ def _change(fact_id: str, ctx: TenantContext, action: str, apply) -> dict:
         return _detail(conn, fid)
 
 
-def _set_status(fact_id: str, new_status: str, note: str | None, ctx: TenantContext, action: str) -> dict:
+def _set_status(fact_id: str, new_status: str, note: str | None, ctx: TenantContext, action: str,
+                pre: Precondition | None) -> dict:
     def apply(conn: Connection, r) -> dict:
         conn.execute(
             text("UPDATE facts SET status = :s, reviewed_by = :u, reviewed_at = now(),"
@@ -220,13 +255,13 @@ def _set_status(fact_id: str, new_status: str, note: str | None, ctx: TenantCont
             {"s": new_status, "u": ctx.user_id, "n": note, "p": _history(r, action.removeprefix("fact_"), ctx),
              "f": r.id})
         return {"note": bool(note)}
-    return _change(fact_id, ctx, action, apply)
+    return _change(fact_id, ctx, action, apply, pre)
 
 
 @router.post("/{fact_id}/approve")
 def approve(fact_id: str, body: NoteBody | None = None, ctx: TenantContext = Depends(get_ctx)) -> dict:
     note = (body.note or "").strip() if body else ""
-    return _set_status(fact_id, "verified", note or None, ctx, "fact_approve")
+    return _set_status(fact_id, "verified", note or None, ctx, "fact_approve", body)
 
 
 @router.post("/{fact_id}/reject")
@@ -234,7 +269,7 @@ def reject(fact_id: str, body: NoteBody, ctx: TenantContext = Depends(get_ctx)) 
     note = (body.note or "").strip()
     if not note:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, MSG_NOTE)
-    return _set_status(fact_id, "rejected", note, ctx, "fact_reject")
+    return _set_status(fact_id, "rejected", note, ctx, "fact_reject", body)
 
 
 def parse_value(raw: str) -> Decimal:
@@ -280,4 +315,4 @@ def correct(fact_id: str, body: CorrectBody, ctx: TenantContext = Depends(get_ct
             {"v": number, "vt": body.value.strip(), "unit": unit, "c": canonical, "u": ctx.user_id, "n": note,
              "p": prior, "f": r.id})
         return {"unit": unit, "note": bool(note)}
-    return _change(fact_id, ctx, "fact_correct", apply)
+    return _change(fact_id, ctx, "fact_correct", apply, body)

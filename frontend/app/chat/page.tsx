@@ -9,6 +9,7 @@ import {
   api,
   ApiError,
   errorMessage,
+  isAbortError,
   newTurnId,
   UNSENT_QUESTION_KEY,
 } from "@/lib/api";
@@ -46,6 +47,15 @@ const TEXT_KEYS = ["city", "neighborhood", "data_kind", "date_field"] as const;
 const SLOW_TURN_MS = 10_000;
 // A 409 the user can retry with the same turn id (the server marked that turn failed).
 const STATE_CONFLICT_PREFIX = "השיחה עודכנה";
+const CONTEXT_STALE =
+  "התשובה התקבלה, אך מצב השיחה לא נטען מחדש. אפשרויות ההבהרה מושבתות עד שהמצב ייטען.";
+
+interface TurnOptions {
+  /** Replace this entry's answer in place (refresh) instead of appending. */
+  replaceKey?: string;
+  /** The request carries the filter panel's edits (a typed question or "apply filters"). */
+  sendsFilters?: boolean;
+}
 
 /** The filter panel mirrors the server context; only what the user changes is sent, as condition edits. */
 function filtersFromContext(c: ConversationContext | null | undefined): Filters {
@@ -78,6 +88,21 @@ function filterEdits(cur: Filters, base: Filters): Pick<AskRequest, "filters" | 
     ...(Object.keys(filters).length > 0 ? { filters } : {}),
     ...(remove.length > 0 ? { remove } : {}),
   };
+}
+
+/**
+ * The filter panel after a turn: the server's new context, except fields the user edited and did not send — typed
+ * while the turn ran (they differ from the snapshot taken when it started), or already dirty but not part of the
+ * turn (a clarification button, a chip removal) — which stay as typed and are sent with the next turn.
+ */
+function keepUnsent(cur: Filters, sentFrom: Filters, sentBase: Filters, sendsFilters: boolean, next: Filters): Filters {
+  const out = { ...next };
+  for (const k of Object.keys(next) as (keyof Filters)[]) {
+    const editedMeanwhile = cur[k] !== sentFrom[k];
+    const unsentEdit = !sendsFilters && sentFrom[k] !== sentBase[k];
+    if (editedMeanwhile || unsentEdit) out[k] = cur[k];
+  }
+  return out;
 }
 
 function yearError(v: string): string | null {
@@ -144,9 +169,33 @@ export default function ChatPage() {
   const [askError, setAskError] = useState<{ message: string; retry?: () => void } | null>(null);
   const [focusId, setFocusId] = useState<string | null>(null);
   const answerRefs = useRef(new Map<string, HTMLElement>());
+  const questionRef = useRef<HTMLTextAreaElement>(null);
+
+  // Opening, creating and restoring a conversation (and reloading its context) bump this token before they await;
+  // a result whose token is no longer current belongs to a superseded navigation and is dropped.
+  const navSeq = useRef(0);
+  const [navigating, setNavigating] = useState(false);
+  // One controller per running turn; all are aborted on unmount, which also stops the 409 polling.
+  const turnAborts = useRef(new Set<AbortController>());
+  // The context could not be reloaded after a turn: the open clarification shown may already be resolved, so its
+  // buttons stay disabled until the context loads again.
+  const [contextError, setContextError] = useState<string | null>(null);
+  const contextStale = contextError !== null;
+  const locked = busy || loadingConv || navigating;
+
+  useEffect(() => {
+    const controllers = turnAborts.current;
+    return () => {
+      for (const c of controllers) c.abort();
+      controllers.clear();
+    };
+  }, []);
 
   useEffect(() => {
     if (!focusId) return;
+    // A draft typed while the answer was coming keeps the focus; the live region still announces the answer.
+    const q = questionRef.current;
+    if (q && document.activeElement === q && q.value.trim() !== "") return;
     answerRefs.current.get(focusId)?.focus();
   }, [focusId, entries]);
 
@@ -155,13 +204,17 @@ export default function ChatPage() {
     writeSession(ACTIVE_CONVERSATION_KEY, id);
   }, []);
 
-  /** Server state → context chips, the open clarification and the filter panel. */
-  const applyContext = useCallback((d: ConversationDetail) => {
+  /**
+   * Server state → context chips, the open clarification and the filter panel. `merge` decides which of the
+   * panel's current values survive (default: the panel is reset to the server context).
+   */
+  const applyContext = useCallback((d: ConversationDetail, merge?: (cur: Filters, next: Filters) => Filters) => {
     setChips(d.context?.chips ?? []);
     setPending(d.pending_clarification ?? null);
     const base = filtersFromContext(d.context);
     setBaseFilters(base);
-    setFilters(base);
+    setFilters((cur) => (merge ? merge(cur, base) : base));
+    setContextError(null);
   }, []);
 
   const showConversation = useCallback(
@@ -176,19 +229,21 @@ export default function ChatPage() {
   useEffect(() => {
     if (!restoreId) return;
     let cancelled = false;
+    const seq = ++navSeq.current;
+    const current = () => !cancelled && seq === navSeq.current;
     api
       .conversation(restoreId)
       .then(
         (d) => {
-          if (!cancelled) showConversation(d);
+          if (current()) showConversation(d);
         },
         () => {
           // Gone, or another user's: start fresh without an error.
-          if (!cancelled) writeSession(ACTIVE_CONVERSATION_KEY, null);
+          if (current()) writeSession(ACTIVE_CONVERSATION_KEY, null);
         },
       )
       .finally(() => {
-        if (!cancelled) setLoadingConv(false);
+        if (current()) setLoadingConv(false);
       });
     return () => {
       cancelled = true;
@@ -196,32 +251,64 @@ export default function ChatPage() {
   }, [restoreId, showConversation]);
 
   async function openConversation(id: string) {
+    if (locked) return;
+    const seq = ++navSeq.current;
+    setNavigating(true);
     setLoadingConv(true);
     setConvError(null);
     setAskError(null);
     try {
-      showConversation(await api.conversation(id));
+      const d = await api.conversation(id);
+      if (seq === navSeq.current) showConversation(d);
     } catch (err) {
-      setConvError(errorMessage(err));
+      if (seq === navSeq.current) setConvError(errorMessage(err));
     } finally {
-      setLoadingConv(false);
+      if (seq === navSeq.current) {
+        setLoadingConv(false);
+        setNavigating(false);
+      }
     }
   }
 
   async function newConversation() {
+    if (locked) return;
+    const seq = ++navSeq.current;
+    setNavigating(true);
     setConvError(null);
     setAskError(null);
     try {
       const { id } = await api.newConversation();
+      if (seq !== navSeq.current) return;
       selectConversation(id);
       setEntries([]);
       setPending(null);
       setChips([]);
       setBaseFilters(EMPTY_FILTERS);
       setFilters(EMPTY_FILTERS);
+      setContextError(null);
       loadConversations();
     } catch (err) {
-      setConvError(errorMessage(err));
+      if (seq === navSeq.current) setConvError(errorMessage(err));
+    } finally {
+      if (seq === navSeq.current) setNavigating(false);
+    }
+  }
+
+  /** Reloads the active conversation's context after a failed reload; unsent filter edits are kept. */
+  async function reloadContext() {
+    if (locked || !activeId) return;
+    const id = activeId;
+    const from = filters;
+    const base = baseFilters;
+    const seq = ++navSeq.current;
+    setNavigating(true);
+    try {
+      const d = await api.conversation(id);
+      if (seq === navSeq.current) applyContext(d, (cur, next) => keepUnsent(cur, from, base, false, next));
+    } catch (err) {
+      if (seq === navSeq.current && !(err instanceof ApiError && err.status === 401)) setContextError(CONTEXT_STALE);
+    } finally {
+      if (seq === navSeq.current) setNavigating(false);
     }
   }
 
@@ -230,21 +317,31 @@ export default function ChatPage() {
    * finished comes back unchanged instead of being applied twice. `replaceKey` replaces that entry's answer in
    * place (refresh); otherwise the answer is appended, or replaces the entry with the same question id.
    */
-  async function runTurn(req: AskRequest, display: string, replaceKey?: string) {
+  async function runTurn(req: AskRequest, display: string, opts: TurnOptions = {}) {
+    const { replaceKey, sendsFilters = false } = opts;
     const body: AskRequest = {
       ...req,
       conversation_id: req.conversation_id ?? activeId ?? undefined,
       turn_id: req.turn_id ?? newTurnId(),
     };
+    // What the filter panel held when the turn started: edits made after this are the user's, not the turn's.
+    const sentFrom = filters;
+    const sentBase = baseFilters;
+    const seq = navSeq.current;
+    const ctrl = new AbortController();
+    turnAborts.current.add(ctrl);
     setBusy(true);
     setAskError(null);
     const timer = window.setTimeout(() => setSlow(true), SLOW_TURN_MS);
     if (body.question && !replaceKey) writeSession(UNSENT_QUESTION_KEY, body.question);
     try {
-      const res = await api.askTurn(body);
+      const res = await api.askTurn(body, ctrl.signal);
       writeSession(UNSENT_QUESTION_KEY, null);
       setRestored(false);
-      if (body.question && !replaceKey) setInput("");
+      // Clear the composer only if it still holds the question sent; a draft typed meanwhile is kept.
+      const sent = body.question;
+      if (sent && !replaceKey) setInput((cur) => (cur.trim() === sent ? "" : cur));
+      if (seq !== navSeq.current) return; // another conversation was opened meanwhile; the turn is stored
       selectConversation(res.conversation_id);
       const key = replaceKey ?? res.question_id;
       const entry: Entry = {
@@ -267,21 +364,30 @@ export default function ChatPage() {
       if (res.answer.kind === "clarification" && res.answer.clarification) setPending(res.answer.clarification);
       else if (body.clarification) setPending(null);
       setFocusId(key);
-      // The server decides what the turn did to the context and to an open clarification.
+      // The server decides what the turn did to the context and to an open clarification. If that cannot be
+      // read, the clarification shown may already be resolved: its buttons are disabled until a reload succeeds.
       try {
-        applyContext(await api.conversation(res.conversation_id));
-      } catch {
-        // Keep the optimistic view; the next turn or reopen resyncs.
+        const d = await api.conversation(res.conversation_id, ctrl.signal);
+        if (seq === navSeq.current) {
+          applyContext(d, (cur, next) => keepUnsent(cur, sentFrom, sentBase, sendsFilters, next));
+        }
+      } catch (err) {
+        if (isAbortError(err) || (err instanceof ApiError && err.status === 401)) return;
+        if (seq === navSeq.current) setContextError(CONTEXT_STALE);
       }
       loadConversations();
     } catch (err) {
+      if (isAbortError(err)) return; // the page was left; nothing to show
       if (err instanceof ApiError && err.status === 401) return; // redirecting to /login; question kept
-      const retry = canRetry(err) ? () => void runTurn(body, display, replaceKey) : undefined;
+      const retry = canRetry(err) ? () => void runTurn(body, display, opts) : undefined;
       setAskError({ message: errorMessage(err), retry });
     } finally {
+      turnAborts.current.delete(ctrl);
       window.clearTimeout(timer);
-      setSlow(false);
-      setBusy(false);
+      if (!ctrl.signal.aborted) {
+        setSlow(false);
+        setBusy(false);
+      }
     }
   }
 
@@ -293,34 +399,39 @@ export default function ChatPage() {
   function onSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const q = input.trim();
-    if (!q || busy) return;
+    if (!q || locked) return;
     if (yearsInvalid) {
       setFiltersOpen(true);
       return;
     }
     // Typed text while a clarification is open is sent as is: the server tells an answer to it from a new
     // question, and keeps the clarification open for the latter.
-    void runTurn({ question: q, ...edits }, q);
+    void runTurn({ question: q, ...edits }, q, { sendsFilters: true });
   }
 
   function onApplyFilters() {
-    if (busy || !filtersDirty || yearsInvalid) return;
-    void runTurn({ ...edits }, "עדכון הסינון");
+    if (locked || !filtersDirty || yearsInvalid) return;
+    void runTurn({ ...edits }, "עדכון הסינון", { sendsFilters: true });
   }
 
   function onChoose(key: string, value: string, label: string) {
-    if (busy) return;
+    if (locked || contextStale) return;
     void runTurn({ clarification: { key, value } }, `בחירה: ${label}`);
   }
 
   function onRemoveChip(chip: ContextChip) {
-    if (busy) return;
+    if (locked) return;
     void runTurn({ remove: [chip.key] }, `הסרת תנאי: ${chip.label}: ${chip.value}`);
   }
 
   function onRefresh(m: Entry) {
-    if (busy) return;
-    void runTurn({ question: m.sent ?? m.question }, m.question, m.key);
+    if (locked) return;
+    void runTurn({ question: m.sent ?? m.question }, m.question, { replaceKey: m.key });
+  }
+
+  function onAskAgain(m: Entry) {
+    if (locked) return;
+    void runTurn({ question: m.sent ?? m.question }, m.question);
   }
 
   let pendingIdx = -1;
@@ -340,7 +451,7 @@ export default function ChatPage() {
   return (
     <div className="chat-layout">
       <aside className="card stack" aria-label="שיחות">
-        <button type="button" className="btn btn-primary" onClick={newConversation} disabled={busy}>
+        <button type="button" className="btn btn-primary" onClick={() => void newConversation()} disabled={locked}>
           שיחה חדשה
         </button>
         <ErrorAlert message={listError} onRetry={loadConversations} />
@@ -351,7 +462,7 @@ export default function ChatPage() {
               <button
                 type="button"
                 aria-current={c.id === activeId ? "true" : undefined}
-                disabled={busy}
+                disabled={locked}
                 onClick={() => void openConversation(c.id)}
                 style={{ overflowWrap: "anywhere" }}
               >
@@ -394,8 +505,8 @@ export default function ChatPage() {
                     <button
                       type="button"
                       className="btn"
-                      disabled={busy}
-                      onClick={() => void runTurn({ question: m.sent ?? m.question }, m.question)}
+                      disabled={locked}
+                      onClick={() => onAskAgain(m)}
                     >
                       שאל שוב
                     </button>
@@ -409,7 +520,8 @@ export default function ChatPage() {
                     }}
                     answer={m.answer}
                     clarificationState={clarState(idx)}
-                    busy={busy}
+                    busy={locked}
+                    choicesDisabled={contextStale}
                     onChoose={onChoose}
                     onRefresh={() => onRefresh(m)}
                   />
@@ -426,7 +538,8 @@ export default function ChatPage() {
           )}
         </div>
 
-        {askError && <ErrorAlert message={askError.message} onRetry={askError.retry} />}
+        {askError && <ErrorAlert message={askError.message} onRetry={locked ? undefined : askError.retry} />}
+        <ErrorAlert message={contextError} onRetry={locked ? undefined : () => void reloadContext()} />
 
         {pinned && (
           <section className="answer-card" aria-label="שאלת הבהרה פתוחה">
@@ -434,13 +547,13 @@ export default function ChatPage() {
             <ClarificationBlock
               clarification={pinned}
               state="active"
-              disabled={busy}
+              disabled={locked || contextStale}
               onChoose={(value, label) => onChoose(pinned.key, value, label)}
             />
           </section>
         )}
 
-        <ContextStrip chips={chips} disabled={busy} onRemove={onRemoveChip} />
+        <ContextStrip chips={chips} disabled={locked} onRemove={onRemoveChip} />
 
         <form className="card composer" onSubmit={onSubmit} aria-label="שליחת שאלה">
           <label htmlFor="question" className="visually-hidden">
@@ -455,6 +568,7 @@ export default function ChatPage() {
           )}
           <textarea
             id="question"
+            ref={questionRef}
             className="input"
             value={input}
             onChange={(e) => setInput(e.target.value)}
@@ -467,7 +581,7 @@ export default function ChatPage() {
             }}
           />
           <div className="row">
-            <button type="submit" className="btn btn-primary" disabled={busy || !input.trim()}>
+            <button type="submit" className="btn btn-primary" disabled={locked || !input.trim()}>
               {busy ? "חושב..." : "שליחה"}
             </button>
             <button
@@ -567,7 +681,7 @@ export default function ChatPage() {
                 <button
                   type="button"
                   className="btn"
-                  disabled={busy || !filtersDirty || yearsInvalid || !hasAnswer}
+                  disabled={locked || !filtersDirty || yearsInvalid || !hasAnswer}
                   onClick={onApplyFilters}
                 >
                   החלת הסינון

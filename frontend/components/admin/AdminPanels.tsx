@@ -164,7 +164,7 @@ export function ProviderPanel() {
               >
                 {modeLabel}
               </span>
-              {settings.mode === "error" && settings.mode_status && (
+              {(settings.mode === "error" || settings.mode_status === "reacknowledge_required") && settings.mode_status && (
                 <div className="small">{providerStatusLabel(settings.mode_status)}</div>
               )}
               {settings.mode === "cloud" && settings.untested && (

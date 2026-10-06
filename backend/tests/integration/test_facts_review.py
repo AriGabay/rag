@@ -297,3 +297,68 @@ def test_equal_values_for_the_same_entity_are_not_a_conflict(client, office):
     add_fact(office, attr, office.default_group_id, "דוח ב", "12.0", "verified", entity_key=BP)
     login(client, "admin-a@example.test")
     assert listed(client)[str(a)]["conflicts"] == []
+
+
+# --- stale-list preconditions -------------------------------------------------------------------------
+
+def test_stale_approve_after_reject_is_409_and_changes_nothing(client, office):
+    attr = make_attr(office)
+    fid, _, _ = add_fact(office, attr, office.default_group_id, "דוח א", "12", "needs_review")
+    login(client, "admin-a@example.test")
+    seen = listed(client)[str(fid)]
+    pre = {"expected_status": seen["status"], "expected_value": seen["value"]}
+    # another reviewer rejects it after this list was loaded
+    r = client.post(f"/api/review/facts/{fid}/reject", json={"note": "נכס אחר", **pre})
+    assert r.status_code == 200, r.text
+    v1 = facts_version(office, attr)
+
+    stale = client.post(f"/api/review/facts/{fid}/approve", json={"expected_status": seen["status"]})
+    assert stale.status_code == 409 and stale.json()["detail"] == "הערך השתנה בינתיים; טענו את הרשימה מחדש"
+    row = fact_row(office, fid)
+    assert row.status == "rejected" and row.review_note == "נכס אחר" and len(row.previous) == 1
+    assert facts_version(office, attr) == v1
+    assert audit_actions(office) == ["fact_reject"]
+
+
+def test_stale_correct_after_another_correct_is_409_and_keeps_the_first_correction(client, office):
+    attr = make_attr(office)
+    fid, _, _ = add_fact(office, attr, office.default_group_id, "דוח א", "12", "needs_review")
+    login(client, "admin-a@example.test")
+    seen = listed(client)[str(fid)]
+    pre = {"expected_status": seen["status"], "expected_value": seen["value"]}
+    first = client.post(f"/api/review/facts/{fid}/correct", json={"value": "14", "unit": "sqm", **pre})
+    assert first.status_code == 200, first.text
+    v1 = facts_version(office, attr)
+
+    stale = client.post(f"/api/review/facts/{fid}/correct", json={"value": "15", "unit": "sqm", **pre})
+    assert stale.status_code == 409 and "השתנה" in stale.json()["detail"]
+    # the value alone is checked too: the status matches, the value moved on
+    by_value = client.post(f"/api/review/facts/{fid}/correct",
+                           json={"value": "15", "unit": "sqm", "expected_status": "corrected", "expected_value": "12"})
+    assert by_value.status_code == 409
+    row = fact_row(office, fid)
+    assert row.status == "corrected" and row.canonical_value == Decimal("14") and len(row.previous) == 1
+    assert facts_version(office, attr) == v1
+    assert audit_actions(office) == ["fact_correct"]
+
+
+def test_matching_precondition_is_applied(client, office):
+    attr = make_attr(office)
+    approve_id, _, _ = add_fact(office, attr, office.default_group_id, "דוח א", "12", "auto_validated")
+    correct_id, _, _ = add_fact(office, attr, office.default_group_id, "דוח ב", "9", "needs_review")
+    reject_id, _, _ = add_fact(office, attr, office.default_group_id, "דוח ג", "7", "needs_review")
+    login(client, "admin-a@example.test")
+    seen = listed(client)
+
+    def pre(fid):
+        return {"expected_status": seen[str(fid)]["status"], "expected_value": seen[str(fid)]["value"]}
+
+    r = client.post(f"/api/review/facts/{approve_id}/approve", json={"expected_status": "auto_validated"})
+    assert r.status_code == 200 and r.json()["status"] == "verified", r.text
+    # a number compares by value: "9.0" matches the listed "9"
+    r = client.post(f"/api/review/facts/{correct_id}/correct",
+                    json={"value": "10", "unit": "sqm", "expected_status": "needs_review", "expected_value": "9.0"})
+    assert r.status_code == 200 and r.json()["value"] == "10", r.text
+    r = client.post(f"/api/review/facts/{reject_id}/reject", json={"note": "טעות", **pre(reject_id)})
+    assert r.status_code == 200 and r.json()["status"] == "rejected", r.text
+    assert audit_actions(office) == ["fact_approve", "fact_correct", "fact_reject"]

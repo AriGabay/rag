@@ -19,7 +19,7 @@ import type {
   UploadResult,
 } from "./types";
 // Facts review (U11)
-import type { FactDetail, FactReviewGroup } from "./types";
+import type { FactDetail, FactReviewGroup, FactStatus } from "./types";
 
 export const UNSENT_QUESTION_KEY = "rag.unsentQuestion";
 export const ACTIVE_CONVERSATION_KEY = "rag.activeConversation";
@@ -45,6 +45,13 @@ interface RequestOptions {
   body?: unknown;
   /** When true a 401 is thrown to the caller instead of redirecting to /login. */
   skipAuthRedirect?: boolean;
+  /** Aborts the request; the caller then sees the signal's reason (an `AbortError`), never an ApiError. */
+  signal?: AbortSignal;
+}
+
+/** True for the error an aborted request or poll throws (see `isAbortError` callers: ignore it silently). */
+export function isAbortError(err: unknown): boolean {
+  return (err instanceof DOMException || err instanceof Error) && err.name === "AbortError";
 }
 
 export function redirectToLogin(): void {
@@ -88,6 +95,7 @@ export async function request<T>(path: string, opts: RequestOptions = {}): Promi
     headers: { Accept: "application/json" },
     cache: "no-store",
   };
+  if (opts.signal) init.signal = opts.signal;
   if (opts.body instanceof FormData) {
     init.body = opts.body;
   } else if (opts.body !== undefined) {
@@ -98,7 +106,8 @@ export async function request<T>(path: string, opts: RequestOptions = {}): Promi
   let res: Response;
   try {
     res = await fetch(path, init);
-  } catch {
+  } catch (err) {
+    if (opts.signal?.aborted) throw opts.signal.reason ?? err;
     throw new ApiError(0, NETWORK_ERROR);
   }
 
@@ -186,10 +195,14 @@ export const api = {
   // Chat
   conversations: () => request<{ conversations: ConversationListItem[] }>("/api/conversations"),
   newConversation: () => request<{ id: string }>("/api/conversations", { method: "POST" }),
-  conversation: (id: string) => request<ConversationDetail>(`/api/conversations/${encodeURIComponent(id)}`),
+  conversation: (id: string, signal?: AbortSignal) =>
+    request<ConversationDetail>(`/api/conversations/${encodeURIComponent(id)}`, { signal }),
   ask: (body: AskRequest) => request<AskResponse>("/api/ask", { method: "POST", body }),
-  /** Posts a turn; while the server still processes the same `turn_id` (409) it polls until the result is stored. */
-  askTurn: (body: AskRequest) => askTurn(body),
+  /**
+   * Posts a turn; while the server still processes the same `turn_id` (409) it polls until the result is stored.
+   * Aborting `signal` stops the request and the polling (the promise rejects with an `AbortError`).
+   */
+  askTurn: (body: AskRequest, signal?: AbortSignal) => askTurn(body, signal),
 
   // Admin
   users: () => request<{ users: AdminUser[] }>("/api/admin/users"),
@@ -243,35 +256,70 @@ export function isTurnInProgress(err: unknown): boolean {
  * Re-posting the same body (same `turn_id`) is the poll the contract defines: a finished turn returns its stored
  * result unchanged, a running one answers 409 again, and a failed one runs again on its reservation.
  */
-async function askTurn(body: AskRequest): Promise<AskResponse> {
+async function askTurn(body: AskRequest, signal?: AbortSignal): Promise<AskResponse> {
   const started = Date.now();
   for (;;) {
+    signal?.throwIfAborted();
     try {
-      return await request<AskResponse>("/api/ask", { method: "POST", body });
+      return await request<AskResponse>("/api/ask", { method: "POST", body, signal });
     } catch (err) {
       if (!isTurnInProgress(err)) throw err;
       if (Date.now() - started > POLL_LIMIT_MS) throw new ApiError(0, TURN_TIMEOUT);
-      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+      await sleep(POLL_INTERVAL_MS, signal);
     }
   }
 }
 
+/** Waits `ms`; rejects with the signal's reason as soon as it aborts. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const onAbort = () => {
+      window.clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 // ---------- Facts review (U11) ----------
+
+/**
+ * What the reviewer saw when acting. The server applies the change only if the row still matches; otherwise it
+ * answers 409 (`FACT_CHANGED`) and changes nothing, so an action on a stale list never overwrites another review.
+ */
+export interface FactPrecondition {
+  expected_status: FactStatus;
+  expected_value?: string | null;
+}
+
+/** The server's 409 detail when a fact changed since the list was loaded. */
+export const FACT_CHANGED = "הערך השתנה בינתיים; טענו את הרשימה מחדש";
 
 export const factsApi = {
   list: () => request<{ attributes: FactReviewGroup[] }>("/api/review/facts"),
   get: (id: string) => request<FactDetail>(`/api/review/facts/${encodeURIComponent(id)}`),
-  approve: (id: string, note?: string) =>
+  approve: (id: string, pre: FactPrecondition, note?: string) =>
     request<FactDetail>(`/api/review/facts/${encodeURIComponent(id)}/approve`, {
       method: "POST",
-      body: note ? { note } : {},
+      body: note ? { note, ...pre } : { ...pre },
     }),
-  reject: (id: string, note: string) =>
-    request<FactDetail>(`/api/review/facts/${encodeURIComponent(id)}/reject`, { method: "POST", body: { note } }),
-  correct: (id: string, value: string, unit: string, note?: string) =>
+  reject: (id: string, note: string, pre: FactPrecondition) =>
+    request<FactDetail>(`/api/review/facts/${encodeURIComponent(id)}/reject`, {
+      method: "POST",
+      body: { note, ...pre },
+    }),
+  correct: (id: string, value: string, unit: string, pre: FactPrecondition, note?: string) =>
     request<FactDetail>(`/api/review/facts/${encodeURIComponent(id)}/correct`, {
       method: "POST",
-      body: note ? { value, unit, note } : { value, unit },
+      body: note ? { value, unit, note, ...pre } : { value, unit, ...pre },
     }),
 };
 
