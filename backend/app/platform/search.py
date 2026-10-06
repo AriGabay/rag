@@ -620,24 +620,30 @@ def _score_passage(row, present: list[_Group], pairs: list[tuple[_Group, _Group]
 
 def locate_evidence(conn: Connection, queries: Sequence[str], *, scope: SearchScope | None = None,
                     filters: MetadataFilters | None = None, place_terms: Iterable[str] = (),
-                    limit: int = LOCATE_LIMIT) -> LocateOutcome:
+                    limit: int = LOCATE_LIMIT, question: str | None = None) -> LocateOutcome:
     """The documents that mention the question's topic, best first, with their supporting passages.
 
-    A question about what is absent keeps only its negated variants: an un-negated rephrasing would list every
-    document stating the opposite. Quotation marks around a phrase are dropped first (a quoted variant kept its
-    negation word glued to the quote). Query variants are alternatives: a document fully supported by any one
-    variant qualifies, so a word
-    only one rephrasing adds ("...לא קיימת") cannot push out documents another variant names exactly.
+    The user's own question (``question``) decides the polarity: a question about what is absent keeps only its
+    negated variants (an un-negated rephrasing would list every document stating the opposite), a question
+    about what is present drops negated ones. Quotation marks around a phrase are dropped first (a quoted
+    variant kept its negation word glued to the quote). Query variants are alternatives: a document fully
+    supported by any one variant qualifies, so a word only one rephrasing adds ("...לא קיימת") cannot push out
+    documents another variant names exactly.
     Each variant is judged alone (terms are never pooled across fully supported variants); a document
     keeps the passages of every variant that fully supports it. When no variant is fully supported
     anywhere, the variants are pooled as one question."""
     queries = [_unquoted(q) for q in queries if q and q.strip()][:MAX_QUERIES]
     place_terms = list(place_terms)
     negated = [q for q in queries if any(g.kind == "negation" for g in _question_groups(q, place_terms))]
-    if negated:
-        # A question about what is absent: a variant without the negation asks about what is present and would
-        # admit every document that states it ("X" next to "אין X"). Only the negated variants count.
-        queries = negated
+    # The user's own question decides the polarity: a question about what is absent keeps only the negated
+    # variants (an un-negated one would admit every document stating the opposite: "X" next to "אין X"), and a
+    # question about what is present drops a negated variant the rephrasing added ("ללא X" for "X").
+    asked_negated = (any(g.kind == "negation" for g in _question_groups(question, place_terms))
+                     if question else bool(negated))
+    if asked_negated:
+        queries = negated or ([question] if question else queries)
+    elif negated:
+        queries = [q for q in queries if q not in negated] or ([question] if question else queries)
     if len(queries) > 1:
         outcomes = [_locate(conn, [q], scope=scope, filters=filters, place_terms=place_terms, limit=limit)
                     for q in queries]

@@ -585,3 +585,18 @@ def test_an_unnegated_or_quoted_variant_cannot_list_documents_stating_the_opposi
         out = locate_evidence(conn, ["אין מעלית בבניין", "\"בניין ללא מעלית\"", "מעלית"])
     titles = [d.title for d in out.documents if d.full_support]
     assert titles == ["דוח 888"]
+
+
+def test_a_negated_variant_added_to_a_question_about_presence_is_dropped(setup):
+    """Final run (GQ12): for "which appraisals mention X", the rephrasing added "ללא X"; keeping only negated
+    variants listed only the document without X. The user's question decides the polarity."""
+    from app.platform.search import locate_evidence
+
+    a = setup[0]
+    add_chunks(a, a.default_group_id, ["בבניין יש מעלית חדשה ומרווחת."], "7" * 64)
+    add_chunks(a, a.default_group_id, ["הבניין בן ארבע קומות ללא מעלית."], "8" * 64)
+    with tenant_tx(a.ctx()) as conn:
+        positive = locate_evidence(conn, ["מעלית", "יש מעלית", "ללא מעלית"], question="אילו שומות מזכירות מעלית?")
+        negative = locate_evidence(conn, ["מעלית", "אין מעלית"], question="באילו שומות אין מעלית?")
+    assert "דוח 777" in [d.title for d in positive.documents if d.full_support]
+    assert [d.title for d in negative.documents if d.full_support] == ["דוח 888"]

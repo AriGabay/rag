@@ -982,7 +982,7 @@ def _locate(run: _Run) -> dict:
     queries, places, filters = _search_queries(run, False)
     scope = run.scope.search() if run.scoped else None
     with tenant_tx(run.ctx) as conn:
-        out = locate_evidence(conn, queries, scope=scope, filters=filters, place_terms=places)
+        out = locate_evidence(conn, queries, scope=scope, filters=filters, place_terms=places, question=run.question)
         cov = coverage(conn, None)
     evidence: list[dict] = []
     docs = []
