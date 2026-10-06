@@ -15,6 +15,7 @@ class Flow:
     transcript: list[dict] = field(default_factory=list)  # every answer, in order
     clarifications: list[str] = field(default_factory=list)  # keys the system asked about
     latencies_ms: list[float] = field(default_factory=list)
+    question_ids: list[str] = field(default_factory=list)  # one per request, in order
     error: str | None = None
 
     @property
@@ -32,20 +33,25 @@ def post_ask(client, body: dict) -> tuple[dict, float]:
 
 
 def ask_flow(client, question: str, answers: dict | None = None, conversation_id: str | None = None,
-             filters: dict | None = None, max_turns: int = 8, replies: dict | None = None) -> Flow:
+             filters: dict | None = None, max_turns: int = 8, replies: dict | None = None,
+             turn_id: str | None = None) -> Flow:
     """Ask ``question`` and answer the clarifications the system raises: with a button from ``answers``
     (key -> option value), or in free text from ``replies`` (key -> typed text, R20), which wins.
 
     Stops at the first clarification whose key is in neither (the final answer is then that
-    clarification), or whose wanted button value is not among the offered options."""
+    clarification), or whose wanted button value is not among the offered options. ``turn_id`` makes the
+    first request idempotent (resubmitting the same body returns the stored turn)."""
     answers, replies = answers or {}, replies or {}
     body = {"question": question, "conversation_id": conversation_id}
     if filters:
         body["filters"] = filters
+    if turn_id:
+        body["turn_id"] = turn_id
     data, ms = post_ask(client, body)
     flow = Flow(answer=data.get("answer", data), conversation_id=data.get("conversation_id", conversation_id or ""))
     flow.transcript.append(flow.answer)
     flow.latencies_ms.append(ms)
+    flow.question_ids.append(data.get("question_id") or "")
     for _ in range(max_turns):
         a = flow.answer
         if a.get("kind") != "clarification":
@@ -57,6 +63,7 @@ def ask_flow(client, question: str, answers: dict | None = None, conversation_id
             flow.answer = data.get("answer", data)
             flow.transcript.append(flow.answer)
             flow.latencies_ms.append(ms)
+            flow.question_ids.append(data.get("question_id") or "")
             continue
         if key not in answers:
             break
@@ -69,4 +76,5 @@ def ask_flow(client, question: str, answers: dict | None = None, conversation_id
         flow.answer = data.get("answer", data)
         flow.transcript.append(flow.answer)
         flow.latencies_ms.append(ms)
+        flow.question_ids.append(data.get("question_id") or "")
     return flow

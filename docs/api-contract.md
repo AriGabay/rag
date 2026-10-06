@@ -50,6 +50,24 @@ Money, areas, and prices per sqm are serialized as **strings** (exact decimals).
 
 Field names: `data_kind, city, neighborhood, address, block, parcel, sub_parcel, property_type, rooms, transaction_date, valuation_date, report_date, area, area_type, price, currency, vat_basis, price_per_sqm_stated`.
 
+### Facts review (extracted attributes, KTD9, R16)
+
+Facts are values of attributes nobody anticipated (for example a safe-room area), extracted on demand with a verbatim quote. Whoever can see a fact's document may review it; every read and write runs under the reviewer's RLS, so a fact in a document outside the reviewer's groups is a 404, and a conflicting value in such a document is never shown, not even as a flag. Only facts of current, undeleted versions at the attribute's current extraction version are listed.
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/review/facts` | `{attributes: [{attribute: Attribute, documents: [{document: {id, title}, version_id, facts: [Fact]}]}]}`: facts with status `needs_review` or `auto_validated`, grouped by attribute then document, `needs_review` first |
+| GET | `/api/review/facts/{fact_id}` | `Fact` plus `attribute: Attribute` and `facts_version` |
+| POST | `/api/review/facts/{fact_id}/approve` | `{note?}` → status `verified`; returns the detail |
+| POST | `/api/review/facts/{fact_id}/reject` | `{note}` (required; 422 `"יש לתעד את סיבת הדחייה"`) → status `rejected` |
+| POST | `/api/review/facts/{fact_id}/correct` | `{value, unit, note?}` → status `corrected`. `value` is a non-negative number (thousands separators allowed; otherwise 422 `"יש להזין מספר תקין (לדוגמה 12 או 12.5)"`); `unit` is one of the attribute's `unit_options[].code` (`""` = no unit where allowed; otherwise 422 `"יש לבחור יחידה המתאימה למאפיין זה"`); a non-numeric attribute cannot be corrected here (422 `"ניתן לתקן כאן רק ערכים מספריים"`) |
+
+`Attribute`: `{id, label, value_type: "numeric"|"text"|..., unit_dimension, canonical_unit, canonical_unit_label, unit_options: [{code, label}], facts_version}`.
+
+`Fact`: `{id, status: "needs_review"|"auto_validated"|"verified"|"corrected"|"rejected", value, unit, unit_label, original: {value_text, unit, unit_label}, quote, page, url, document: {id, title}, version_id, entity_role: "subject"|"comparable"|"other", entity_descriptor, review_note, reviewed_at, previous: [history entries], conflicts: [brief Fact]}`. `value` is in the canonical unit; `original` is what the document says; `url` opens the source page (`#page=N`).
+
+Every change appends the prior state to `previous`, bumps only that attribute's `facts_version` (answers built on the old facts become stale, see `Message.stale`) and writes an audit event (`fact_approve`, `fact_reject`, `fact_correct`). Trust tiers in answers: `verified` and `corrected` facts make the main figure; `auto_validated` facts are added only to the separately labeled preliminary figure; `needs_review` facts are excluded and counted in `coverage.facts.awaiting_review`.
+
 ## Chat
 
 | Method | Path | Notes |

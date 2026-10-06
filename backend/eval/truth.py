@@ -31,10 +31,11 @@ DEDUP_KINDS = ("transaction_price", "asking_price", "adjusted_comparable")
 MIXED_KEYS = ("area_type", "property_type", "vat_basis")  # the order the product asks about them
 SEED_CHECK_FIELDS = ("price", "area", "area_type", "transaction_date", "valuation_date")
 
-# demo users (scripts/seed_demo.py): office and visible document groups (None = admin, all groups)
+# demo users (scripts/seed_demo.py): office and visible document groups (None = admin, all groups).
+# G3 is the held-out group "ידע כללי" (ground_truth.yaml general_facts.group): dana sees it, yossi does not.
 USERS = {
     "admin-a@demo.test": ("A", None),
-    "dana@demo.test": ("A", frozenset({"G1"})),
+    "dana@demo.test": ("A", frozenset({"G1", "G3"})),
     "yossi@demo.test": ("A", frozenset({"G2"})),
     "admin-b@demo.test": ("B", None),
 }
