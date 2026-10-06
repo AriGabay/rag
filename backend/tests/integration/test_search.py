@@ -470,3 +470,17 @@ def test_locate_respects_scope_and_groups(office):
     emp_ctx = TenantContext(a.office_id, emp, "employee")
     assert {d.document_id for d in _locate(emp_ctx, ["התנגדות"])} == {one, two}
     assert _locate(a.ctx(), ["מילה שאינה קיימת בשום מקום"]) == []
+
+
+def test_locate_treats_query_variants_as_alternatives(office):
+    """Found with the real model: a rephrasing that added a word no document uses ("לא קיימת") pooled into
+    the question and pushed out documents another variant named exactly."""
+    from app.platform.search import locate_evidence
+
+    a, *_ = office
+    d1, _ = add_chunks(a, a.default_group_id, ["בבניין אין מעלית ויש מדרגות בלבד."], "e1" * 32)
+    d2, _ = add_chunks(a, a.default_group_id, ["הבניין ללא מעלית."], "e2" * 32)
+    add_chunks(a, a.default_group_id, ["בבניין מעלית חדשה."], "e3" * 32)
+    with tenant_tx(a.ctx()) as conn:
+        out = locate_evidence(conn, ["מעלית בבניין לא קיימת", "ללא מעלית", "אין מעלית בבניין"])
+    assert {d.document_id for d in out.documents} == {d1, d2}

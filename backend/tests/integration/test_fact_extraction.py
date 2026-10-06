@@ -203,7 +203,7 @@ def test_quote_not_in_cited_chunk_is_rejected_and_logged(office, caplog):
     p = ScriptedProvider()
     add_doc(office, office.default_group_id, "דוח", ["ממ״ד בשטח 12 מ״ר", "מחסן בשטח 15 מ״ר"])
     script(p, "דוח", mention("ממ״ד בשטח 15 מ״ר", "15", source="C1"),   # quote not in C1
-           mention("מחסן בשטח 15 מ״ר", "15", source="C9"))             # handle never issued
+           mention("ממ״ד בשטח 17 מ״ר", "17", source="C9"))             # handle never issued, quote nowhere
     with caplog.at_level(logging.INFO, logger="app.answering.facts"):
         comp = extract(office.ctx(), attr, p)
     assert ledger(office, attr) == {"דוח": "not_stated"}
@@ -846,4 +846,22 @@ def test_a_quote_that_drops_the_label_separator_still_matches(office):
     p2 = ScriptedProvider()
     add_doc(office, office.default_group_id, "דוח ב", ["גובה תקרה: 2.80 מ׳"])
     script(p2, "דוח ב", mention("גובה תקרה 3.10 מ׳", "3.10", unit="מ׳", term="גובה תקרה"))
+    assert extract(office.ctx(), height, p2).coverage["mentions_rejected"] >= 1
+
+
+def test_a_mention_citing_a_row_instead_of_its_cell_is_resolved_by_its_quote(office):
+    """Found with the real model: it cited the row id (T1R1) of a key/value table instead of the cell, and a
+    correct value was rejected. The quote, held verbatim by exactly one source, names the citation."""
+    height = make_attr(office, "גובה תקרה", "length")
+    p = ScriptedProvider()
+    table = TableResult(0, ["מאפיין", "פירוט"], [None, None], [TableRow(2, ["גובה תקרה", "2.80 מ׳"])], 2, 2,
+                        section="תיאור הנכס")
+    add_doc(office, office.default_group_id, "דוח", ["פתיח"], tables=[table])
+    script(p, "דוח", mention("גובה תקרה 2.80 מ׳", "2.80", source="T1R1", unit="מ׳", term="גובה תקרה"))
+    comp = extract(office.ctx(), height, p, operation="values")
+    assert comp.preliminary.values == [Decimal("2.8")] and comp.sources[0]["page"] == 2
+    # a handle that names nothing and a quote no source holds stays rejected
+    p2 = ScriptedProvider()
+    add_doc(office, office.default_group_id, "דוח ב", ["גובה תקרה: 2.80 מ׳"])
+    script(p2, "דוח ב", mention("גובה תקרה 3.10 מ׳", "3.10", source="T9R9", unit="מ׳", term="גובה תקרה"))
     assert extract(office.ctx(), height, p2).coverage["mentions_rejected"] >= 1

@@ -526,8 +526,31 @@ def _score_passage(row, present: list[_Group], pairs: list[tuple[_Group, _Group]
 def locate_evidence(conn: Connection, queries: Sequence[str], *, scope: SearchScope | None = None,
                     filters: MetadataFilters | None = None, place_terms: Iterable[str] = (),
                     limit: int = LOCATE_LIMIT) -> LocateOutcome:
-    """The documents that mention the question's topic, best first, with their supporting passages."""
+    """The documents that mention the question's topic, best first, with their supporting passages.
+
+    Query variants are alternatives: a document fully supported by any one variant qualifies, so a word
+    only one rephrasing adds ("...לא קיימת") cannot push out documents another variant names exactly.
+    When no variant is fully supported anywhere, the variants are pooled as one question."""
     queries = [q for q in queries if q and q.strip()][:MAX_QUERIES]
+    place_terms = list(place_terms)
+    if len(queries) > 1:
+        outcomes = [_locate(conn, [q], scope=scope, filters=filters, place_terms=place_terms, limit=limit)
+                    for q in queries]
+        full = [o for o in outcomes if any(d.full_support for d in o.documents)]
+        if full:
+            merged: dict = {}
+            for o in full:
+                for d in o.documents:
+                    if d.full_support and (d.document_id not in merged or d.score > merged[d.document_id].score):
+                        merged[d.document_id] = d
+            docs = sorted(merged.values(), key=lambda d: (-d.score, str(d.title)))
+            names = list(dict.fromkeys(w for o in full for w in o.topic_terms))
+            return LocateOutcome(docs[:limit], names, full[0].filter_report)
+    return _locate(conn, queries, scope=scope, filters=filters, place_terms=place_terms, limit=limit)
+
+
+def _locate(conn: Connection, queries: Sequence[str], *, scope: SearchScope | None,
+            filters: MetadataFilters | None, place_terms: Iterable[str], limit: int) -> LocateOutcome:
     place_terms = list(place_terms)
     sql, report, _ = _prepare(conn, scope, filters)
     groups: list[_Group] = []

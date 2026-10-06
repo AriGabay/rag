@@ -107,6 +107,20 @@ def test_unrelated_question_keeps_the_pending_clarification(scripted):
     assert new.pending == state.pending and effects.resolved is None
 
 
+def test_a_self_contained_question_the_model_reads_as_a_reply_stays_a_new_question():
+    """Found with the real model: "מה שטח המחסן בדירה ברחוב האירוסים 12?" asked while a data-kind
+    clarification was open came back as an answer to it, and the clarification was lost."""
+    provider = ScriptedProvider().on(Purpose.INTERPRET, TurnPlan.build(
+        task_type="answer", turn_relation="answer_to_clarification", clarification_answer="transaction_price",
+        search_queries=["שטח המחסן"], steps=[{"tool": "search", "attribute_handle": None, "source_handles": []}]))
+    state = pending_state()
+    question = "מה שטח המחסן בדירה ברחוב האירוסים 12?"
+    result = interpret_with_model(provider, question, state, GAZ, ATTRS)
+    assert result.plan.turn_relation == "new_question" and result.plan.clarification_answer is None
+    new, effects = apply_turn(state, result.plan, question=question)
+    assert new.pending == state.pending and effects.resolved is None
+
+
 # --- AE1: a non-monetary average never becomes a price question --------------------------------------
 
 def test_safe_room_average_in_limited_mode_searches_content_without_price_clarification():

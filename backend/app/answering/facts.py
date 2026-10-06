@@ -379,6 +379,10 @@ class Accepted:
 _SEPARATORS = re.compile(r"[:|;–—]|(?<!\d)-|-(?!\d)")
 
 
+def _quotes(src: Source, nq: str) -> bool:
+    return nq in _quote_form(src.text) or bool(src.context and nq in _quote_form(src.context))
+
+
 def _quote_form(value: str) -> str:
     """``_match_norm`` without separator punctuation: what a verbatim quote is compared on."""
     return " ".join(_SEPARATORS.sub(" ", _match_norm(value)).split())
@@ -386,15 +390,21 @@ def _quote_form(value: str) -> str:
 
 def validate_mention(m: Mention, content: VersionContent, attribute: AttributeDef) -> Accepted | str:
     """The accepted mention, or the reason it was rejected."""
-    src = content.sources.get(m.source.strip().upper())
-    if src is None:
-        return "unknown_handle"
     quote = m.quote.strip(_QUOTE_EDGES)
     nq = _quote_form(quote)
     if not nq:
         return "empty_quote"
-    if nq not in _quote_form(src.text) and not (src.context and nq in _quote_form(src.context)):
-        return "quote_not_found"
+    src = content.sources.get(m.source.strip().upper())
+    if src is None or not _quotes(src, nq):
+        # The model sometimes cites a row (T1R3) or a neighbouring handle. The quote still decides: when
+        # exactly one issued source holds it verbatim (a table cell before the chunk repeating its row),
+        # that source is the citation; otherwise the mention is rejected as before.
+        holders = [s for s in content.sources.values() if _quotes(s, nq)]
+        cells = [s for s in holders if s.handle.startswith("T")]
+        chosen = cells if len(cells) == 1 else holders
+        if len(chosen) != 1:
+            return "unknown_handle" if src is None else "quote_not_found"
+        src = chosen[0]
     naming = _naming(m.attribute_term, quote, src, attribute)
     # a measure-word term ("בשטח") may still name the value through the attribute's own words right before it
     deferred = naming == "generic_term" and attribute.value_type == "numeric"
