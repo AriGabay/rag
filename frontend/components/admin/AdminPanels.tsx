@@ -6,8 +6,14 @@ import { useSession } from "@/components/AppShell";
 import { B, Dialog, ErrorAlert, Notice } from "@/components/ui";
 import { api, errorMessage } from "@/lib/api";
 import { useApi } from "@/lib/useApi";
-import { EFFECTIVE_PROVIDER_LABEL, formatTimestamp, versionStatusLabel } from "@/lib/format";
-import type { AdminGroup, AdminUser, Role } from "@/lib/types";
+import {
+  PROVIDER_MODE_BADGE,
+  PROVIDER_MODE_LABEL,
+  formatTimestamp,
+  providerStatusLabel,
+  versionStatusLabel,
+} from "@/lib/format";
+import type { AdminGroup, AdminSettings, AdminUser, Role } from "@/lib/types";
 
 const MIN_PASSWORD = 8;
 
@@ -74,7 +80,10 @@ export function CoveragePanel() {
 // ---------------- Provider settings ----------------
 
 export function ProviderPanel() {
-  const { data: settings, error: loadError, reload } = useApi(api.settings);
+  const { data: loaded, error: loadError, reload } = useApi(api.settings);
+  // The connection test returns the refreshed settings; they win until the next reload.
+  const [tested, setTested] = useState<AdminSettings | null>(null);
+  const settings = tested ?? loaded;
   // null = no local change; the checkbox shows the saved value.
   const [draftChoice, setDraftChoice] = useState<boolean | null>(null);
   const draft = draftChoice ?? settings?.cloud_llm_enabled ?? false;
@@ -83,6 +92,12 @@ export function ProviderPanel() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [ack, setAck] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [testing, setTesting] = useState(false);
+
+  function refresh() {
+    setTested(null);
+    reload();
+  }
 
   async function save(enabled: boolean, acknowledge: boolean) {
     setBusy(true);
@@ -94,11 +109,24 @@ export function ProviderPanel() {
       setAck(false);
       setNotice("ההגדרה נשמרה.");
       setDraftChoice(null);
-      reload();
+      refresh();
     } catch (err) {
       setError(errorMessage(err));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function runTest() {
+    setTesting(true);
+    setError(null);
+    setNotice(null);
+    try {
+      setTested(await api.testProvider());
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setTesting(false);
     }
   }
 
@@ -113,11 +141,13 @@ export function ProviderPanel() {
 
   const providerName = settings?.provider_name || "ספק הענן";
   const providerText = settings?.model ? `${providerName} (${settings.model})` : providerName;
+  const last = settings?.last_test ?? null;
+  const modeLabel = settings ? PROVIDER_MODE_LABEL[settings.mode] ?? settings.mode : "";
 
   return (
     <section className="card stack" aria-labelledby="prov-title">
       <h2 id="prov-title">מודל שפה בענן</h2>
-      <ErrorAlert message={loadError} onRetry={reload} />
+      <ErrorAlert message={loadError} onRetry={refresh} />
       <ErrorAlert message={error} />
       {notice && <Notice kind="ok">{notice}</Notice>}
       {!settings && !loadError && <p className="muted">טוען...</p>}
@@ -126,19 +156,70 @@ export function ProviderPanel() {
           <dl className="kv">
             <dt>מצב בפועל</dt>
             <dd>
-              <span className="badge badge-info" role="status" aria-label={`ספק בפועל: ${EFFECTIVE_PROVIDER_LABEL[settings.effective_provider] ?? settings.effective_provider}`}>
-                {EFFECTIVE_PROVIDER_LABEL[settings.effective_provider] ?? settings.effective_provider}
+              <span
+                className={`badge ${PROVIDER_MODE_BADGE[settings.mode] ?? "badge-info"}`}
+                role="status"
+                aria-label={`מצב ספק: ${modeLabel}`}
+                data-mode={settings.mode}
+              >
+                {modeLabel}
               </span>
+              {settings.mode === "error" && settings.mode_status && (
+                <div className="small">{providerStatusLabel(settings.mode_status)}</div>
+              )}
+              {settings.mode === "cloud" && settings.untested && (
+                <div className="small muted">טרם בוצעה בדיקת חיבור מוצלחת לספק ולמודל הנוכחיים.</div>
+              )}
             </dd>
             <dt>ספק</dt>
             <dd>
-              <bdi>{providerText}</bdi>
+              <bdi>{providerName}</bdi>
+            </dd>
+            <dt>מודל</dt>
+            <dd>
+              <bdi>{settings.model}</bdi>
+            </dd>
+            <dt>מפתח בשרת</dt>
+            <dd>
+              {settings.key_present ? (
+                <span className="badge badge-ok">מפתח נמצא</span>
+              ) : (
+                <span className="badge badge-warn">לא נמצא מפתח</span>
+              )}
+            </dd>
+            <dt>בדיקת חיבור אחרונה</dt>
+            <dd data-testid="provider-last-test">
+              {last ? (
+                <>
+                  <span className={`badge ${last.ok ? "badge-ok" : "badge-danger"}`}>{last.ok ? "הצליחה" : "נכשלה"}</span>{" "}
+                  {providerStatusLabel(last.status)}
+                  <div className="small muted">
+                    <B>{formatTimestamp(last.tested_at)}</B>
+                    {last.model && (
+                      <>
+                        {" · "}
+                        <bdi>{last.model}</bdi>
+                      </>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <span className="muted">טרם בוצעה</span>
+              )}
             </dd>
             <dt>אושר לאחרונה</dt>
             <dd>
               <B>{formatTimestamp(settings.acknowledged_at)}</B>
             </dd>
           </dl>
+          <div className="row">
+            <button type="button" className="btn" disabled={testing} onClick={() => void runTest()}>
+              {testing ? "בודק..." : "בדיקת חיבור"}
+            </button>
+          </div>
+          <p className="small muted">
+            בדיקת החיבור שולחת לספק הודעת בדיקה קבועה בלבד, ללא תוכן ממסמכי המשרד, ולכן אפשר להריץ אותה גם כשהשימוש בענן כבוי.
+          </p>
           <label className="checkbox">
             <input type="checkbox" checked={draft} onChange={(e) => setDraftChoice(e.target.checked)} />
             הפעלת מודל ענן לניסוח תשובות
@@ -161,6 +242,7 @@ export function ProviderPanel() {
             בהפעלת האפשרות, קטעים רלוונטיים מתוך מסמכי המשרד יישלחו אל <strong><bdi>{providerText}</bdi></strong> כדי
             לנסח תשובות לשאלות. חישובי המספרים עצמם ממשיכים להתבצע במערכת.
           </p>
+          {settings?.retention_note && <p className="small">{settings.retention_note}</p>}
           <label className="checkbox">
             <input type="checkbox" checked={ack} onChange={(e) => setAck(e.target.checked)} />
             קראתי ואני מאשר/ת שליחת קטעי מסמכים אל {providerName}

@@ -97,6 +97,18 @@ Field names: `data_kind, city, neighborhood, address, block, parcel, sub_parcel,
 | PATCH | `/api/admin/users/{id}` | any of `{role, can_upload, is_active, group_ids, password}`; deactivation revokes sessions |
 | GET | `/api/admin/groups` | `{groups: [{id, name, document_count}]}` |
 | POST | `/api/admin/groups` | `{name}` |
-| GET | `/api/admin/settings` | `{cloud_llm_enabled, provider_name, model, effective_provider: "cloud"\|"enabled_no_key"\|"demo_mock"\|"extractive", acknowledged_at}` |
-| PUT | `/api/admin/settings` | `{cloud_llm_enabled, acknowledge: true}`; enabling without `acknowledge: true` → 422 |
+| GET | `/api/admin/settings` | `{cloud_llm_enabled, provider: "openai"\|"anthropic", provider_name: "OpenAI"\|"Anthropic (Claude)", model, key_present, mode, mode_status, untested, last_test: {provider, model, ok, status, tested_at} \| null, retention_note, acknowledged_at}` (see below) |
+| PUT | `/api/admin/settings` | `{cloud_llm_enabled, acknowledge: true}`; enabling without `acknowledge: true` → 422; every change bumps `settings_version`; returns the settings object |
+| POST | `/api/admin/provider/test` | no body; runs the connection test and returns the settings object with the new `last_test`; employee → 403 |
+
+Provider status (R8, KTD5; derived in `backend/app/providers/status.py`, the only place that decides which provider answers):
+
+- `key_present` is a boolean only. The key, or any prefix of it, never appears in a response, log line or audit event.
+- `mode`:
+  - `cloud`: cloud use enabled, key present, and the last connection test passed or has not run for the current provider and model (`untested: true`).
+  - `error`: enabled and the last test failed, or enabled with no key. `mode_status` names the failure (`missing_key` or the test status). Questions are then answered from the sources only, with a limitation naming the failure; never with the demo mock.
+  - `demo`: disabled and `DEMO_MODE` on: answers come from the clearly labeled mock (`provider: "mock"`, `demo: true`).
+  - `limited`: disabled and not demo: answers are assembled from the sources only.
+- Connection test: one structured call (purpose `test`) through the selected provider with a fixed synthetic Hebrew prompt (no office content), checking the parsed echo. It is therefore allowed while cloud use is off. With no key it records `missing_key` without any network call. `status` is one of `ok`, `missing_key`, `auth`, `model_unavailable`, `timeout`, `rate_limited`, `quota`, `refusal`, `incomplete`, `invalid`, `error`. The result is stored per office in `office_settings` (`provider_test_*`, `provider_tested_at`), audited as `provider_test`, and a result that changes the mode bumps `settings_version` so no answer cached under the old mode is served.
+- `retention_note`: the selected provider's data-retention note shown with the acknowledgement (OpenAI: `store=false`, yet abuse-monitoring logs may be kept up to 30 days unless the organization has Zero Data Retention).
 | GET | `/api/admin/coverage` | `{documents_by_status: {status: count}, records: {total, verified, awaiting_verification, needs_review}, open_dedup_candidates, review_queue_count}` |

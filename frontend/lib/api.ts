@@ -208,5 +208,6 @@ export const api = {
       method: "PUT",
       body: { cloud_llm_enabled: cloudEnabled, acknowledge },
     }),
+  testProvider: () => request<AdminSettings>("/api/admin/provider/test", { method: "POST" }),
   coverage: () => request<AdminCoverage>("/api/admin/coverage"),
 };

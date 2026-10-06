@@ -1,7 +1,7 @@
 // Display formatting. Decimal strings are formatted directly (Intl accepts exact numeric strings),
 // so no float arithmetic touches money or area. Nothing here aggregates values.
 
-import type { EffectiveProvider, Provider, VersionStatus } from "./types";
+import type { Provider, ProviderMode, ProviderStatus, VersionStatus } from "./types";
 
 const DECIMAL_RE = /^[-+]?\d+(\.\d+)?$/;
 
@@ -66,17 +66,44 @@ export function versionStatusLabel(status: string | null | undefined): string {
 
 export const PROVIDER_LABEL: Record<Provider, string> = {
   template: "תבנית",
-  mock: "מודל מדומה",
+  mock: "מודל מדומה (דמו)",
   cloud: "מודל ענן",
   extractive: "חילוץ מהמקורות",
 };
 
-export const EFFECTIVE_PROVIDER_LABEL: Record<EffectiveProvider, string> = {
+export const PROVIDER_MODE_LABEL: Record<ProviderMode, string> = {
   cloud: "מודל ענן פעיל",
-  enabled_no_key: "מופעל, אך לא הוגדר מפתח בשרת — המערכת עונה ללא מודל ענן",
-  demo_mock: "מצב דמו: מודל מדומה בלבד",
-  extractive: "תשובות מחולצות מהמקורות בלבד (ללא מודל ענן)",
+  error: "תקלה בספק המודל — התשובות מורכבות מקטעי המקור בלבד",
+  demo: "מצב דמו: מודל מדומה בלבד, לא מודל אמיתי",
+  limited: "מצב מוגבל: תשובות מקטעי המקור בלבד (ללא מודל ענן)",
 };
+
+export const PROVIDER_MODE_BADGE: Record<ProviderMode, string> = {
+  cloud: "badge-ok",
+  error: "badge-danger",
+  demo: "badge-demo",
+  limited: "badge-info",
+};
+
+/** Hebrew explanation per connection-test status; each status has its own message. */
+export const PROVIDER_STATUS_LABEL: Record<ProviderStatus, string> = {
+  ok: "החיבור תקין: הספק החזיר תשובה מובנית תקינה",
+  missing_key: "לא נמצא בשרת מפתח עבור הספק שנבחר — לא נשלחה בקשה",
+  auth: "הספק דחה את המפתח (שגיאת הרשאה)",
+  model_unavailable: "המודל שנבחר אינו זמין עבור המפתח",
+  timeout: "הספק לא הגיב בזמן",
+  rate_limited: "חריגה ממגבלת קצב הבקשות של הספק",
+  quota: "מכסת השימוש אצל הספק נוצלה",
+  refusal: "הספק סירב לבקשת הבדיקה",
+  incomplete: "תשובת הספק נקטעה לפני סיומה",
+  invalid: "תשובת הספק לא תאמה את המבנה הנדרש",
+  error: "תקלה כללית בפנייה לספק",
+};
+
+export function providerStatusLabel(status: string | null | undefined): string {
+  if (!status) return "—";
+  return PROVIDER_STATUS_LABEL[status as ProviderStatus] ?? status;
+}
 
 export const DATA_KIND_OPTIONS: { value: string; label: string }[] = [
   { value: "transaction_price", label: "מחירי עסקאות" },

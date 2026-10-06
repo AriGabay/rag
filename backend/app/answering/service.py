@@ -163,11 +163,12 @@ def _merge_filters(parsed: ParseResult, filters: dict | None) -> tuple[QueryCond
 
 
 def cloud_parser(conn: Connection):
-    """The cloud provider, only when the office enabled it and a key exists (never the mock)."""
-    from app.answering.content import effective_provider
-    from app.providers.llm import get_cloud_provider
+    """The selected cloud provider, only in ``cloud`` mode (``providers.status``); never the demo mock."""
+    from app.answering.content import select_provider
+    from app.providers.status import Mode
 
-    return get_cloud_provider() if effective_provider(conn) == "cloud" else None
+    provider, state = select_provider(conn)
+    return provider if state.mode == Mode.CLOUD else None
 
 
 def _needs_model(parsed: ParseResult) -> bool:

@@ -9,33 +9,25 @@ from sqlalchemy import Connection, text
 
 from app.answering.coverage import coverage
 from app.answering.verify import allowed_numbers, verify_answer
-from app.config import get_settings
 from app.db import TenantContext
 from app.platform.documents import source_file_url
 from app.platform.search import hybrid_search
 from app.providers.llm import LLMProvider, MockLLM, get_selected_provider, selected_provider_configured
+from app.providers.status import Mode, ProviderState, office_provider_state
 
 logger = logging.getLogger(__name__)
 EVIDENCE_LIMIT = 6
 
 
-def effective_provider(conn: Connection) -> str:
-    """cloud | enabled_no_key | demo_mock | extractive (admin screen shows the same value)."""
-    enabled = conn.execute(text("SELECT cloud_llm_enabled FROM office_settings")).scalar_one_or_none()
-    if enabled and selected_provider_configured():
-        return "cloud"
-    if enabled:
-        return "enabled_no_key"
-    return "demo_mock" if get_settings().demo_mode else "extractive"
-
-
-def select_provider(conn: Connection) -> tuple[LLMProvider | None, str]:
-    eff = effective_provider(conn)
-    if eff == "cloud":
-        return get_selected_provider(), eff
-    if eff in ("demo_mock", "enabled_no_key") and get_settings().demo_mode:
-        return MockLLM(), "demo_mock"
-    return None, "extractive"
+def select_provider(conn: Connection) -> tuple[LLMProvider | None, ProviderState]:
+    """The provider for this office's mode (``providers.status``): the selected cloud provider in ``cloud``
+    mode, the labeled demo mock in ``demo`` mode, and none (sources only) in ``limited`` and ``error``."""
+    state = office_provider_state(conn, key_present=selected_provider_configured())
+    if state.mode == Mode.CLOUD:
+        return get_selected_provider(), state
+    if state.mode == Mode.DEMO:
+        return MockLLM(), state
+    return None, state
 
 
 def log_usage(conn: Connection, provider: LLMProvider, purpose: str, result, ok: bool) -> None:
@@ -92,7 +84,7 @@ def answer_content(conn: Connection, ctx: TenantContext, question: str, c, route
                   "limitations": ["החיפוש בוצע רק במסמכי המשרד שעובדו ושאתם מורשים לראות."]}
         return Outcome(answer, c, c.intent if c else "explanation", route)
 
-    provider, provider_label = select_provider(conn)
+    provider, state = select_provider(conn)
     calc = base["numeric"] if base else None
     text_out, kind_provider, demo = None, "extractive", False
     provider_failed = False
@@ -119,8 +111,8 @@ def answer_content(conn: Connection, ctx: TenantContext, question: str, c, route
             provider_failed = True
     if text_out is None:
         text_out = _extractive(evidence)
-    if provider_label == "extractive":
-        limitations.append("שליחת קטעים לספק מודל ענן כבויה במשרד; התשובה מורכבת מקטעי המקור עצמם.")
+    if mode_note := state.limitation():
+        limitations.append(mode_note)
 
     sources = (base["sources"] if base else []) + [{k: v for k, v in e.items() if k != "text"} for e in evidence]
     if base:
@@ -135,4 +127,4 @@ def answer_content(conn: Connection, ctx: TenantContext, question: str, c, route
         {"document_id": e["document_id"], "version_id": e["version_id"], "chunk_id": e["chunk_id"],
          "page_list": e["page_list"]} for e in evidence]
     return Outcome(answer, c, c.intent if c else "explanation", route, source_rows=rows,
-                   cacheable=not provider_failed)
+                   cacheable=not provider_failed and state.mode != Mode.ERROR)

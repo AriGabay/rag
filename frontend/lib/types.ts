@@ -297,13 +297,45 @@ export interface AdminGroup {
   document_count: number;
 }
 
-export type EffectiveProvider = "cloud" | "enabled_no_key" | "demo_mock" | "extractive";
+/** Derived per office by the backend (providers/status.py): which provider actually answers. */
+export type ProviderMode = "cloud" | "error" | "demo" | "limited";
+
+/** Connection-test and call statuses; `missing_key` means no request was sent. */
+export type ProviderStatus =
+  | "ok"
+  | "missing_key"
+  | "auth"
+  | "model_unavailable"
+  | "timeout"
+  | "rate_limited"
+  | "quota"
+  | "refusal"
+  | "incomplete"
+  | "invalid"
+  | "error";
+
+export interface ProviderTest {
+  provider: string | null;
+  model: string | null;
+  ok: boolean;
+  status: ProviderStatus;
+  tested_at: string | null;
+}
 
 export interface AdminSettings {
   cloud_llm_enabled: boolean;
-  provider_name: string | null;
-  model: string | null;
-  effective_provider: EffectiveProvider;
+  provider: "openai" | "anthropic";
+  provider_name: string;
+  model: string;
+  /** Whether the server holds a key for the selected provider. The key itself never leaves the server. */
+  key_present: boolean;
+  mode: ProviderMode;
+  /** The failure behind `error` mode, else null. */
+  mode_status: ProviderStatus | null;
+  /** Cloud mode without a passing connection test for the current provider and model. */
+  untested: boolean;
+  last_test: ProviderTest | null;
+  retention_note: string | null;
   acknowledged_at: string | null;
 }
 

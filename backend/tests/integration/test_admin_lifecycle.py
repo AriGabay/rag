@@ -1,13 +1,18 @@
-"""Versions, deletion, user/group admin, provider setting, coverage (U12)."""
+"""Versions, deletion, user/group admin, provider setting and status, coverage (U12, U2)."""
 
 import pytest
+from pydantic import SecretStr
 from sqlalchemy import text
 
+from app.config import get_settings
 from app.db import tenant_tx
+from app.providers.llm import CallStatus, Purpose
 from tests.conftest import login
 from tests.factories import make_group, make_office, make_user
 from tests.integration.test_dedup import add_version, publish
 from tests.integration.test_numeric_answers import AE3, approve_all, ask
+from tests.integration.test_search import add_chunks
+from tests.support.scripted_provider import ScriptedProvider
 
 pytestmark = pytest.mark.db
 Q = "מחיר למ״ר בעסקאות שנחתמו ב-2024 בחרוזים"
@@ -102,10 +107,10 @@ def test_user_lifecycle_and_deactivation_revokes_sessions(client, office):
 def test_cloud_setting_requires_acknowledgment(client, office):
     login(client, "admin-a@example.test")
     s = client.get("/api/admin/settings").json()
-    assert s["cloud_llm_enabled"] is False and s["effective_provider"] == "demo_mock"
+    assert s["cloud_llm_enabled"] is False and s["mode"] == "demo"
     assert client.put("/api/admin/settings", json={"cloud_llm_enabled": True}).status_code == 422
     on = client.put("/api/admin/settings", json={"cloud_llm_enabled": True, "acknowledge": True}).json()
-    assert on["cloud_llm_enabled"] and on["effective_provider"] == "enabled_no_key" and on["acknowledged_at"]
+    assert on["cloud_llm_enabled"] and on["mode"] == "error" and on["acknowledged_at"]
     off = client.put("/api/admin/settings", json={"cloud_llm_enabled": False, "acknowledge": False})
     assert off.status_code == 200 and off.json()["cloud_llm_enabled"] is False
     with tenant_tx(office.system) as conn:
@@ -119,3 +124,139 @@ def test_coverage_summary(client, office):
     c = client.get("/api/admin/coverage").json()
     assert c["records"]["total"] == 3 and c["records"]["verified"] == 0
     assert c["documents_by_status"] == {"ready": 1}
+
+
+# ---------------- Provider status and connection test (U2, R8, KTD5) ----------------
+
+# Never a real key: the "." keeps it out of the secrets scan pattern, and nothing here reaches the network.
+FAKE_KEY = "sk-test-FAKE.not-a-real-key-0123456789"
+CONTENT_Q = "מה היו שיקולי השמאי לגבי היטל השבחה?"
+
+
+@pytest.fixture
+def no_key(monkeypatch):
+    s = get_settings()
+    monkeypatch.setattr(s, "llm_provider", "openai")
+    monkeypatch.setattr(s, "openai_api_key", SecretStr(""))
+    monkeypatch.setattr(s, "anthropic_api_key", SecretStr(""))
+
+    def no_network():
+        raise AssertionError("no provider may be constructed without a key")
+
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", no_network)
+
+
+@pytest.fixture
+def fake_key(monkeypatch):
+    s = get_settings()
+    monkeypatch.setattr(s, "llm_provider", "openai")
+    monkeypatch.setattr(s, "openai_api_key", SecretStr(FAKE_KEY))
+    scripted = ScriptedProvider()
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: scripted)
+    return scripted
+
+
+def echo(instructions, input):
+    return {"echo": input}
+
+
+def enable(client):
+    r = client.put("/api/admin/settings", json={"cloud_llm_enabled": True, "acknowledge": True})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def assert_no_key(response):
+    assert FAKE_KEY not in response.text and "FAKE" not in response.text
+
+
+def test_no_key_status_and_test_without_network(client, office, no_key):
+    login(client, "admin-a@example.test")
+    s = client.get("/api/admin/settings").json()
+    assert s["key_present"] is False and s["mode"] == "demo" and s["provider_name"] == "OpenAI"
+    assert s["model"] == get_settings().openai_model and s["last_test"] is None
+    r = client.post("/api/admin/provider/test")
+    assert r.status_code == 200, r.text
+    t = r.json()["last_test"]
+    assert t["ok"] is False and t["status"] == "missing_key" and t["tested_at"]
+    assert t["provider"] == "openai" and t["model"] == get_settings().openai_model
+    assert r.json()["mode"] == "demo"  # allowed while cloud use is off; no office content is sent
+    with tenant_tx(office.system) as conn:
+        assert conn.execute(text("SELECT count(*) FROM audit_events WHERE action = 'provider_test'")).scalar() == 1
+        assert conn.execute(text("SELECT count(*) FROM provider_usage")).scalar() == 0
+
+
+def test_limited_mode_without_demo(client, office, no_key, monkeypatch):
+    monkeypatch.setattr(get_settings(), "demo_mode", False)
+    login(client, "admin-a@example.test")
+    assert client.get("/api/admin/settings").json()["mode"] == "limited"
+
+
+def test_enabled_without_key_is_error_and_answers_limited_never_demo(client, office, no_key):
+    add_chunks(office, office.default_group_id,
+               ["4. שיקולי השמאי: בשכונת חרוזים השמאי המכריע קבע הפחתה של 10% בשל היטל השבחה."], "1" * 64)
+    login(client, "admin-a@example.test")
+    on = enable(client)
+    assert on["mode"] == "error" and on["mode_status"] == "missing_key" and on["key_present"] is False
+    a = ask(client, CONTENT_Q)["answer"]
+    assert a["provider"] != "mock" and a["demo"] is False and "לפי מסמכי המשרד" not in a["text"]
+    assert any("מפתח" in lim and "OpenAI" in lim for lim in a["limitations"]), a["limitations"]
+    assert ask(client, CONTENT_Q)["answer"].get("cached") is None  # an error-mode answer is not cached
+
+
+def test_auth_failure_is_persisted_shown_and_never_leaks_the_key(client, office, fake_key):
+    fake_key.on(Purpose.TEST, CallStatus.AUTH)
+    login(client, "admin-a@example.test")
+    enable(client)
+    r = client.post("/api/admin/provider/test")
+    assert r.status_code == 200 and r.json()["mode"] == "error" and r.json()["mode_status"] == "auth"
+    assert_no_key(r)
+    assert fake_key.calls and fake_key.calls[0].purpose == Purpose.TEST
+    assert all(word not in fake_key.calls[0].input for word in ("חרוזים", "שמאי"))  # synthetic prompt only
+    s = client.get("/api/admin/settings")
+    assert s.json()["last_test"]["status"] == "auth" and s.json()["last_test"]["ok"] is False
+    assert s.json()["key_present"] is True
+    assert_no_key(s)
+    with tenant_tx(office.system) as conn:
+        assert conn.execute(text("SELECT provider_test_status FROM office_settings")).scalar() == "auth"
+        details = conn.execute(text("SELECT details::text FROM audit_events WHERE action = 'provider_test'")).scalar()
+        assert "auth" in details and FAKE_KEY not in details
+        assert conn.execute(text("SELECT ok FROM provider_usage WHERE purpose = 'test'")).scalar() is False
+
+
+def test_ok_test_gives_cloud_mode_with_time(client, office, fake_key):
+    fake_key.on(Purpose.TEST, echo)
+    login(client, "admin-a@example.test")
+    on = enable(client)
+    assert on["mode"] == "cloud" and on["untested"] is True and on["last_test"] is None
+    r = client.post("/api/admin/provider/test")
+    s = r.json()
+    assert s["mode"] == "cloud" and s["untested"] is False and s["mode_status"] is None
+    assert s["last_test"]["ok"] is True and s["last_test"]["status"] == "ok" and s["last_test"]["tested_at"]
+    assert_no_key(r)
+
+
+def test_wrong_echo_is_invalid(client, office, fake_key):
+    fake_key.on(Purpose.TEST, {"echo": "משהו אחר"})
+    login(client, "admin-a@example.test")
+    r = client.post("/api/admin/provider/test").json()
+    assert r["last_test"]["status"] == "invalid" and r["mode"] == "demo"
+
+
+def test_employee_cannot_run_provider_test(client, office, fake_key):
+    make_user(office, "e@example.test", [])
+    login(client, "e@example.test")
+    assert client.post("/api/admin/provider/test").status_code == 403
+    assert fake_key.calls == []
+
+
+def test_other_office_test_result_is_invisible(client, office, fake_key):
+    fake_key.on(Purpose.TEST, CallStatus.AUTH)
+    login(client, "admin-b@example.test")
+    assert client.post("/api/admin/provider/test").json()["last_test"]["status"] == "auth"
+    client.post("/api/auth/logout")
+    login(client, "admin-a@example.test")
+    assert client.get("/api/admin/settings").json()["last_test"] is None
+    with tenant_tx(office.ctx()) as conn:
+        rows = conn.execute(text("SELECT provider_test_status FROM office_settings")).all()
+    assert rows == [(None,)]

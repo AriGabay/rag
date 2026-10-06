@@ -1,4 +1,4 @@
-"""Office administration: users, groups, cloud-provider setting, coverage (U12, R31, R34)."""
+"""Office administration: users, groups, cloud-provider setting and status, coverage (U12, U2, R8, R31, R34)."""
 
 from __future__ import annotations
 
@@ -9,12 +9,18 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 from sqlalchemy.exc import IntegrityError
 
-from app.answering.content import effective_provider
+from app.answering.content import log_usage
 from app.audit import audit
-from app.config import get_settings
 from app.db import TenantContext, bump_data_version, tenant_tx
 from app.deps import NOT_FOUND, parse_uuid, require_admin
 from app.platform.documents import latest_status_counts
+from app.providers.status import (
+    RETENTION_NOTES,
+    office_provider_state,
+    record_test,
+    run_connection_test,
+    selected_provider_and_model,
+)
 from app.security import hash_password
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -140,11 +146,19 @@ def create_group(body: NewGroup, ctx: TenantContext = Depends(require_admin)) ->
 
 
 def _settings_json(conn: Connection) -> dict:
-    row = conn.execute(text("SELECT * FROM office_settings")).one()
-    s = get_settings()
-    return {"cloud_llm_enabled": row.cloud_llm_enabled, "provider_name": "Anthropic (Claude)", "model": s.anthropic_model,
-            "effective_provider": effective_provider(conn),
-            "acknowledged_at": row.acknowledged_at.isoformat() if row.acknowledged_at else None}
+    """Provider, model, key presence (never the key or any part of it), last test and derived mode (KTD5)."""
+    row = conn.execute(text("SELECT cloud_llm_enabled, acknowledged_at FROM office_settings")).one()
+    state = office_provider_state(conn)
+    last = state.last_test
+    return {
+        "cloud_llm_enabled": row.cloud_llm_enabled, "provider": state.provider, "provider_name": state.provider_name,
+        "model": state.model, "key_present": state.key_present, "mode": state.mode.value,
+        "mode_status": state.status, "untested": state.untested,
+        "last_test": {"provider": last.provider, "model": last.model, "ok": last.ok, "status": last.status,
+                      "tested_at": last.tested_at.isoformat() if last.tested_at else None} if last else None,
+        "retention_note": RETENTION_NOTES.get(state.provider),
+        "acknowledged_at": row.acknowledged_at.isoformat() if row.acknowledged_at else None,
+    }
 
 
 @router.get("/settings")
@@ -157,15 +171,36 @@ def get_office_settings(ctx: TenantContext = Depends(require_admin)) -> dict:
 def put_office_settings(body: SettingsBody, ctx: TenantContext = Depends(require_admin)) -> dict:
     if body.cloud_llm_enabled and not body.acknowledge:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, MSG_ACK)
+    provider, _ = selected_provider_and_model()
     with tenant_tx(ctx) as conn:
         conn.execute(
             text("UPDATE office_settings SET cloud_llm_enabled = :e, cloud_provider = :p,"
                  " acknowledged_by = CASE WHEN :e THEN :u ELSE acknowledged_by END,"
                  " acknowledged_at = CASE WHEN :e THEN now() ELSE acknowledged_at END,"
                  " settings_version = settings_version + 1"),
-            {"e": body.cloud_llm_enabled, "p": "anthropic" if body.cloud_llm_enabled else None, "u": ctx.user_id},
+            {"e": body.cloud_llm_enabled, "p": provider if body.cloud_llm_enabled else None, "u": ctx.user_id},
         )
-        audit(conn, "provider_setting", ctx.user_id, "office_settings", ctx.office_id, enabled=body.cloud_llm_enabled)
+        audit(conn, "provider_setting", ctx.user_id, "office_settings", ctx.office_id, enabled=body.cloud_llm_enabled,
+              provider=provider)
+        return _settings_json(conn)
+
+
+@router.post("/provider/test")
+def test_provider(ctx: TenantContext = Depends(require_admin)) -> dict:
+    """Connection test (KTD5): a synthetic prompt with no office content, so it runs even while cloud use is off.
+    The call runs outside any transaction; a result that changes the mode bumps ``settings_version`` so no
+    answer cached under the previous mode is served."""
+    with tenant_tx(ctx) as conn:
+        before = office_provider_state(conn).mode
+    outcome = run_connection_test()
+    with tenant_tx(ctx) as conn:
+        record_test(conn, outcome)
+        if outcome.client is not None:
+            log_usage(conn, outcome.client, "test", outcome.result, outcome.ok)
+        if office_provider_state(conn).mode != before:
+            conn.execute(text("UPDATE office_settings SET settings_version = settings_version + 1"))
+        audit(conn, "provider_test", ctx.user_id, "office_settings", ctx.office_id, provider=outcome.provider,
+              model=outcome.model, status=outcome.status)
         return _settings_json(conn)
 
 
