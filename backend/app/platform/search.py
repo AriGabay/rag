@@ -350,6 +350,10 @@ PHRASE_WINDOW = 2
 # Words between a negation and the term it governs: at most this many, and at most one content word
 # ("אינו כולל X", "אין בו X").
 NEGATION_GAP = 2
+# Words that say a thing is there (grammar, not topic): the only content word a negation may reach across.
+EXISTENCE_WORDS = frozenset({"כולל", "כוללת", "כוללים", "כוללות", "קיים", "קיימת", "קיימים", "קיימות", "מצויד",
+                             "מצוידת", "מצוידים", "נמצא", "נמצאת", "נמצאה", "נמצאו", "נמצאים", "נמצאות",
+                             "בנמצא", "מצוי", "מצויה", "מצויים", "מותקן", "מותקנת", "הותקן", "הותקנה"})
 # A word found in at most this share of the documents in scope tells them apart; one in more of them
 # ("בניין", or an address every passage of a one-document scope names) does not.
 DISTINCTIVE_DF_SHARE = 0.5
@@ -370,7 +374,7 @@ TABLE_WORDS = frozenset("טבלה טבלת טבלאות עמודה עמודת ע
 _WORD_RE = re.compile(r"[\w״׳./]+")
 _HEB = re.compile(r"[א-ת][א-ת״׳]*")
 # Between two words: a comma, semicolon, dash, parenthesis or table cell border closes a clause.
-_CLAUSE_BREAK = re.compile(r"[,;|()\[\]—–]|\s-\s")
+_CLAUSE_BREAK = re.compile(r"[,;|()\[\]—–]")  # " - " joins a label and its value ("X - לא"); it is no break
 
 
 @dataclass
@@ -455,6 +459,11 @@ def _blocks(word: str) -> bool:
     return word in COORDINATORS or word in AFFIRMATIVES or (word.startswith("ו") and len(word) >= 3)
 
 
+def _bare(word: str) -> str:
+    """The word without a one-letter ו/ש prefix ("וכולל" -> "כולל")."""
+    return word[1:] if len(word) > 3 and word[0] in "וש" and word[1:] in EXISTENCE_WORDS else word
+
+
 def _governs(words: list[tuple[str, int, int]], i: int, j: int) -> bool:
     """Whether the negation at ``i`` governs the word at ``j``, in the same clause:
 
@@ -468,9 +477,14 @@ def _governs(words: list[tuple[str, int, int]], i: int, j: int) -> bool:
         return False
     if i < j:
         gap = [w for w, *_ in words[i + 1:j]]
-        return (len(gap) <= NEGATION_GAP and sum(not _light(w) for w in gap) <= 1
+        # the one content word allowed between them must say "has / includes" ("אינו כולל X"); any other noun is
+        # what is negated ("אין צורך ב-X", "אין בעיה עם X" state that X exists)
+        return (len(gap) <= NEGATION_GAP and all(_light(w) or _bare(w) in EXISTENCE_WORDS for w in gap)
                 and not any(_blocks(w) for w in gap))
+    after = [w for w, _, c in words[i + 1:] if c == clause]
+    # "X: אין", "X לא קיימת": the negation ends the clause or denies existence; "X לא תקינה" says X exists
     return (i == j + 1 and words[i][0] in NEGATION_WORDS and words[i][0] not in PREPOSED_NEGATIONS
+            and (not after or _bare(after[0]) in EXISTENCE_WORDS)
             and not any(w in AFFIRMATIVES for w, _, c in words[:j] if c == clause))
 
 

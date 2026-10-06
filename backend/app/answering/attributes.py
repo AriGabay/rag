@@ -19,6 +19,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from app.answering import units
 from app.extraction.normalize_text import base_normalize, inflection_variants, prefix_variants
 
 # Structured attributes map to whitelisted record columns (the CHECK in migration 0004 and
@@ -213,7 +214,10 @@ def _identity(name: str) -> tuple[frozenset[str], frozenset[str], list[str]]:
         forms = word_forms(w)
         measures.update(_MEASURE_CLASS[f] for f in forms if f in _MEASURE_CLASS)
         qualifiers.update(f for f in forms if f in _QUALIFIERS)
-    return frozenset(measures), frozenset(qualifiers), distinctive_words(name)
+        if w.startswith("ל") and len(w) > 2 and (per := units.parse_unit(w[1:])) is not None:
+            qualifiers.add(f"per:{per.dimension}")  # "למ״ר", "לחודש": a rate is not its total
+    return frozenset(measures), frozenset(qualifiers), [w for w in distinctive_words(name) if not (
+        w.startswith("ל") and len(w) > 2 and units.parse_unit(w[1:]) is not None)]
 
 
 def same_attribute(a: str, dim_a: str | None, b: str, dim_b: str | None) -> bool:
@@ -243,8 +247,13 @@ def other_attribute_names(conn: Connection, attribute: AttributeDef) -> list[lis
     word with this one (another phrasing, a duplicate) are left out, so they never reject its values."""
     own = [w for n in [attribute.label, *attribute.aliases] for w in distinctive_words(n)]
     out: list[list[str]] = []
-    for r in conn.execute(text("SELECT id, label_he, aliases FROM attribute_definitions WHERE id <> :a"),
-                          {"a": attribute.id}).all():
+    for r in conn.execute(text("SELECT id, label_he, aliases, value_type, unit_dimension FROM attribute_definitions"
+                               " WHERE id <> :a"), {"a": attribute.id}).all():
+        # only an attribute that could hold this value: the same value type, and a unit dimension that is the
+        # same or unknown (a count never claims an area)
+        if r.value_type != attribute.value_type or (
+                r.unit_dimension and attribute.unit_dimension and r.unit_dimension != attribute.unit_dimension):
+            continue
         words = [w for n in [r.label_he, *(r.aliases or [])] for w in distinctive_words(n)]
         if words and not words_share(words, own, roots=True):
             out.append(words)
@@ -294,7 +303,8 @@ def upgrade_extraction_version(conn: Connection) -> int:
     used, the ledger re-reads those documents, and answers keyed on the old facts version go stale."""
     return conn.execute(
         text("UPDATE attribute_definitions SET extraction_prompt_version = :pv, facts_version = facts_version + 1"
-             " WHERE source = 'extracted' AND extraction_prompt_version IS DISTINCT FROM :pv"),
+             " WHERE source = 'extracted'"
+             " AND split_part(coalesce(extraction_prompt_version, ''), '+', 1) IS DISTINCT FROM :pv"),
         {"pv": EXTRACTION_PROMPT_VERSION}).rowcount
 
 
@@ -372,25 +382,18 @@ def normalize_dimension(dimension: str | None) -> str | None:
 
 def _with_dimension(conn: Connection, r, dimension: str | None):
     """An extracted numeric definition created without a dimension takes the one a later request
-    names: values measured in that dimension stop being "unit assumed", and its documents are read
-    again so their facts are converted."""
+    names. It moves to its own extraction version ("x7+area"), for the whole office at once: every document is
+    read again under the new version, facts of the dimensionless reads stop counting (they are kept, with their
+    history, never deleted), and cached answers keyed on the old facts version go stale. A reviewer's earlier
+    decision still counts (``facts.compute_facts``)."""
     if (dimension is None or r.source != "extracted" or r.value_type != "numeric" or r.unit_dimension
             is not None):
         return r
     conn.execute(text("UPDATE attribute_definitions SET unit_dimension = :d, canonical_unit = :u,"
-                      " facts_version = facts_version + 1 WHERE id = :a"),
-                 {"d": dimension, "u": canonical_unit_for(dimension), "a": r.id})
-    # Unreviewed facts were converted without the dimension: the re-read replaces them (it would otherwise add
-    # a second fact per mention). A reviewer's value stays, back in review: its canonical value predates the unit.
-    conn.execute(text("DELETE FROM facts WHERE attribute_id = :a AND status IN ('auto_validated', 'needs_review')"),
-                 {"a": r.id})
-    conn.execute(text("UPDATE facts SET status = 'needs_review', review_note = coalesce(review_note || ' | ', '')"
-                      " || 'יחידת המאפיין נקבעה לאחר האישור; יש לאשר מחדש' WHERE attribute_id = :a"
-                      " AND status IN ('verified', 'corrected')"), {"a": r.id})
-    conn.execute(text("UPDATE fact_extraction_ledger SET state = 'pending' WHERE attribute_id = :a"), {"a": r.id})
+                      " extraction_prompt_version = :pv, facts_version = facts_version + 1 WHERE id = :a"),
+                 {"d": dimension, "u": canonical_unit_for(dimension), "a": r.id,
+                  "pv": f"{EXTRACTION_PROMPT_VERSION}+{dimension}"})
     return conn.execute(text(f"SELECT {_COLUMNS} FROM attribute_definitions WHERE id = :a"), {"a": r.id}).one()
-
-
 
 
 def _names(r) -> list[str]:

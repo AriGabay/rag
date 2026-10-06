@@ -430,3 +430,35 @@ def test_a_continuation_in_an_empty_conversation_is_never_searched_as_a_new_ques
     assert not continuation_form("באיזו שומה הנכס נבדק מבחוץ בלבד?")
     p = normalize_model_plan(_model_plan(task_type="clarify", clarification="referent"), None, "ומה לגבי 2023?")
     assert p.clarification is not None and p.task_type == "clarify"
+
+
+@pytest.mark.parametrize(("place", "question"), [
+    ("פתח תקווה", "מה השווי בפתח תקוה?"),
+    ("תל אביב-יפו", 'מה הממוצע בת"א?'),
+    ("תל אביב-יפו", "ובתל-אביב?"),
+    ("רמת גן", "ברמת-גן?"),
+])
+def test_a_place_named_in_another_spelling_or_abbreviation_is_kept(place, question):
+    """Final review: the grounding rule dropped a city the user did name, in defective spelling, with a hyphen or
+    as its abbreviation, and the computation then ran over every city."""
+    from app.answering.plan import normalize_model_plan
+
+    p = normalize_model_plan(_model_plan(task_type="compute", attribute="גודל החלל", metric="mean",
+                                         conditions={"city": place}), None, question)
+    assert p.conditions.city == place
+
+
+@pytest.mark.parametrize("question", ["ומתי?", "והממוצע?", "ו-2023?", "ושל השכונה?", "מה השטח שלה?",
+                                      "כמה זה למ״ר?", "מה כתוב שם?"])
+def test_continuations_and_pointing_back_are_never_searched_as_new_questions(question):
+    """Final review: the self-contained rule searched these as new questions and lost the clarification."""
+    from app.answering.plan import normalize_model_plan
+
+    p = normalize_model_plan(_model_plan(task_type="clarify", clarification="referent"), None, question)
+    assert p.clarification is not None
+
+
+@pytest.mark.parametrize("question", ["ובכן, מה השטח?", "ועדת התכנון אישרה?"])
+def test_words_that_only_start_with_vav_are_not_continuations(question):
+    from app.answering.plan import continuation_form
+    assert not continuation_form(question)

@@ -227,20 +227,19 @@ def _safe(value: str) -> str:
 
 def _subject_key(conn: Connection, version_id: UUID) -> str | None:
     """Entity key of the report's subject property: block/parcel, else the normalized address. A narrative
-    report without records is keyed by its own header: its block/parcel line, else its city and address (an
-    address alone may repeat in another city). Two reports on one property then count once (KTD8 step 6)."""
+    report without records is keyed by its own header's block/parcel/sub-parcel line, only when the sub-parcel is
+    given (a parcel or a street address alone covers a whole building). Two reports on one property then count
+    once (KTD8 step 6)."""
     r = conn.execute(text(
         "SELECT block, parcel, sub_parcel, address FROM occurrences WHERE version_id = :v"
         " AND data_kind = 'appraised_value' AND verification_status <> 'rejected' ORDER BY record_index, id LIMIT 1"),
         {"v": version_id}).one_or_none()
     if r is None:
-        header = report_header(conn, version_id)
-        bp = header.get("block_parcel")
-        if isinstance(bp, tuple) and len(bp) == 3 and bp[0] and bp[1]:
-            return f"bp:{bp[0].strip()}/{bp[1].strip()}/{(bp[2] or '-').strip()}"
-        city, address = header.get("city"), header.get("address")
-        if isinstance(city, str) and city and isinstance(address, str) and address:
-            return f"addr:{base_normalize(city)}|{base_normalize(address)}"
+        # only a header naming the unit itself (block, parcel and sub-parcel): a parcel or a street address alone
+        # covers a whole building, and two apartments in it are two properties
+        bp = report_header(conn, version_id).get("block_parcel")
+        if isinstance(bp, tuple) and len(bp) == 3 and bp[0] and bp[1] and bp[2]:
+            return f"bp:{bp[0].strip()}/{bp[1].strip()}/{bp[2].strip()}"
         return None
     if r.block and r.parcel:
         return f"bp:{r.block.strip()}/{r.parcel.strip()}/{(r.sub_parcel or '-').strip()}"
@@ -358,9 +357,10 @@ def read_version(conn: Connection, attribute: AttributeDef, version_id: UUID, bu
 
 def build_prompt(attribute: AttributeDef, content: VersionContent) -> tuple[str, str]:
     """(instructions, input). Document text goes only into the input, inside the document tag."""
-    names = "، ".join(a for a in attribute.aliases if a != attribute.label)
+    # the label and aliases come from users' questions: they cannot open or close prompt tags either
+    names = "، ".join(llm.prompt_text(a) for a in attribute.aliases if a != attribute.label)
     unit = canonical_unit_for(attribute.unit_dimension) or "ללא"
-    header = f"המאפיין המבוקש: {attribute.label}" + (f" (שמות נוספים: {names})" if names else "")
+    header = f"המאפיין המבוקש: {llm.prompt_text(attribute.label)}" + (f" (שמות נוספים: {names})" if names else "")
     if attribute.value_type == "numeric":
         header += f". ממד היחידה: {attribute.unit_dimension or 'ללא'}; יחידה קנונית: {unit}.\n"
     else:
@@ -474,8 +474,13 @@ def validate_mention(m: Mention, content: VersionContent, attribute: AttributeDe
             return "generic_term"
         naming = False
     elif naming is True and own is not None and (_binds(own.label, "", names, last=_NEAR_WORDS)
-                                                 or words_share(own.noun, names, roots=True)):
+                                                 or words_share(_head_noun(own), names, roots=True)) \
+            and not _term_names_nearer(m.attribute_term, own, names):
         naming = False  # the quote's own words name the value, whatever words the model chose as its term
+    if naming is False and own is not None and not (src.label and words_share(distinctive_words(src.label), names,
+                                                                               roots=True)) \
+            and _term_names_nearer(m.attribute_term, own, names):
+        naming = True  # the model's word for the value names something nearer to it than the attribute's word
     if dimension == "area" and (q is None or q.unit is None or q.unit.dimension == "length"):
         dims = units.area_from_dimensions(quote, m.value_text)  # W×H lengths: an area by assumption
         if dims is not None:
@@ -491,7 +496,7 @@ def validate_mention(m: Mention, content: VersionContent, attribute: AttributeDe
         unit = next((n.unit for n in named if n.value == q.value and n.unit is not None), None)
     if dimension == "count" and own is not None:
         unit = own.unit if own.unit is not None else (None if unit is q.unit else unit)
-        verdict = _count_binding(own, unit, src, names)
+        verdict = _count_binding(own, unit, src, attribute)
         if verdict == "reject":
             return "counted_other"
         uncertain = uncertain or verdict == "uncertain"
@@ -524,6 +529,7 @@ class _Named:
     noun: tuple[str, ...] = ()  # the words right after the number (after its unit word), or a counted-noun unit
     after: tuple[str, ...] = ()  # every word after the number (and its unit word) to the end of the clause
     zero_word: bool = False
+    unit_before: bool = False  # the unit is a counted noun written before the number ("בקומה 3")
 
 
 def _named_values(quote: str, dimension: str | None) -> list[_Named]:
@@ -543,7 +549,8 @@ def _named_values(quote: str, dimension: str | None) -> list[_Named]:
                         tuple(text_words(label)[-1:])
                 else:
                     noun = after[:_NOUN_WORDS]
-                out.append(_Named(q.value, unit, label, noun, after, q.zero_word))
+                before = q.unit is not None and q.unit_end is None
+                out.append(_Named(q.value, unit, label, noun, after, q.zero_word, before))
                 prev = tail_from
                 if dimension == "count" and q.unit_end is None and noun and (w := _FIRST_WORD.match(clause, q.end)):
                     prev = w.end()  # "2 X בקומה 3": the next value's label starts after this one's noun
@@ -557,32 +564,84 @@ def _own_value(named: list[_Named], value: Decimal, names: list[str]) -> _Named 
                  or _binds(n.label, "", names, last=_NEAR_WORDS)), same[0] if same else None)
 
 
-def _count_binding(own: _Named, unit: units.Unit | None, src: Source, names: list[str]) -> str:
+def _head_noun(own: _Named) -> list[str]:
+    """The noun a number is written with ("3 X" -> ["X"]); a prepositional phrase after it ("5 בבניין") is
+    where it is, not what it counts."""
+    first = own.noun[0] if own.noun else None
+    return [first] if first and not (first.startswith(_PREPOSITION_PREFIX) and len(first) > 2) else []
+
+
+def _term_names_nearer(term: str, own: _Named, names: list[str]) -> bool:
+    """Whether the model's own naming term, a word that is not the attribute's, names the value from inside its
+    label ("לדירה צמוד X בשטח 6 מ״ר" with the term "X" for "שטח הדירה"): the value belongs to that word then,
+    and the attribute's word further back does not make it the attribute's value. A word right after an
+    attribute word only qualifies it ("Y חזית" for "Y"), and does not count."""
+    other = [w for w in distinctive_words(_quote_form(term.strip(_QUOTE_EDGES)))
+             if not words_share([w], names, roots=True)]
+    label = text_words(own.label) + list(own.noun)
+    named_at = [k for k, w in enumerate(label) if words_share([w], names, roots=True)]
+    for k, w in enumerate(label):
+        if named_at and k < named_at[-1]:
+            continue  # before the attribute's own word: its subject ("Y <verb> בשנת"), not a rival noun
+        prev = label[k - 1] if k else ""
+        # right after the attribute's own noun, a word qualifies it; after a prepositional phrase of the
+        # attribute ("בדירה X") it is another noun the value belongs to
+        qualifies = bool(prev) and words_share([prev], names, roots=True) and not (
+            prev.startswith(_PREPOSITION_PREFIX) and len(prev) > 3)
+        if words_share([w], other) and not qualifies:
+            return True
+    return False
+
+
+def _count_binding(own: _Named, unit: units.Unit | None, src: Source, attribute: AttributeDef) -> str:
     """Whether a count's own words count the attribute: ``ok``, ``uncertain`` (review) or ``reject``.
 
-    A number counts the noun written with it: "בקומה 3" counts floors and "3 חדרים" rooms, so neither is a count
-    of anything else. A zero word must govern a word of the attribute ("אין X"); qualified, it is not a
-    plain zero ("אין X נוספת", "אין X בבניין הסמוך") and goes to review."""
+    - A number counts the noun written with it: "3 חדרים" counts rooms, never anything else. A counted-noun unit
+      the attribute's names denote (the same unit: "דירות", "יח״ד" and "יחידות דיור" are one) counts it; a name
+      with more distinctive words than the noun ("מספר חדרי שינה" for "5 חדרים") is only uncertain.
+    - A counted noun written before the number ("בקומה 3", "חדר 2") is an ordinal: a position, never a count;
+      only "label: 3" names a count that way.
+    - A zero word must govern a word of the attribute ("אין X"). Its possessor may stand before it ("לדירה אין
+      X"); any other word in its clause ("ברחוב אין X", "אין X נוספת", "אין X בטאבו") qualifies it, and the zero
+      goes to review.
+    - Another content noun after the number ("3 X" where X is not the attribute) is uncertain, whatever the
+      label says."""
+    names = _name_words(attribute)
+    per_name = [distinctive_words(n) for n in [attribute.label, *attribute.aliases]]
+    name_codes = {u.code for n in [attribute.label, *attribute.aliases]
+                  if (u := units.parse_unit(n)) is not None and u.code in units.COUNTED_NOUN_CODES}
     labeled = _binds(own.label, "", names, last=_NEAR_WORDS) or (
         src.col is not None and bool(src.label) and words_share(distinctive_words(src.label), names, roots=True))
     if unit is not None and unit.code in units.COUNTED_NOUN_CODES:
+        if own.unit_before and not own.label.rstrip().endswith(":"):
+            return "reject"  # an ordinal: the 3rd floor, room 2, apartment 5
         nouns = list(own.noun) or list(units.COUNTED_NOUN_WORDS.get(unit.code, ()))
-        return "ok" if words_share(nouns, names, roots=True) else "reject"
+        if not (words_share(nouns, names, roots=True) or unit.code in name_codes):
+            return "reject"
+        near = nouns + text_words(own.label)[-_NEAR_WORDS:] + list(own.after)
+        covered = any(words and all(words_share([w], near, roots=True) or units.parse_unit(w) is not None
+                                    for w in words) for words in per_name)
+        return "ok" if covered else "uncertain"
     if own.zero_word:
+        # one possessor before it ("לדירה אין X") is the subject; any other word ("ברחוב אין X") places the X
+        before = [w for w in text_words(own.label) if not words_share([w], names, roots=True)]
+        if len(before) == 1 and before[0].startswith("ל") and len(before[0]) > 2:
+            before = []
         words = list(own.after)
-        if words and words[0].startswith(_PREPOSITION_PREFIX) and len(words) > 1 and not words_share(
-                words[:1], names, roots=True):
-            words = words[1:]  # "אין בדירה X"
         if not words:
+            if before and not own.label.rstrip().endswith(":"):
+                return "uncertain"
             return "ok" if labeled else "uncertain"  # a cell or "label: אין": named by its label only
+        if words[0].startswith(_PREPOSITION_PREFIX) and len(words) > 1 and not words_share(words[:1], names,
+                                                                                          roots=True):
+            words = words[1:]  # "אין בדירה X"
         if not words_share(words[:1], names, roots=True):
             return "reject"  # "אין צורך ב...", "אין מידע", "אין X" of another noun
-        rest = words[1:]
-        plain = all(words_share([w], names, roots=True) or (w.startswith(_PREPOSITION_PREFIX) and i == len(rest) - 1)
-                    for i, w in enumerate(rest))
-        return "ok" if plain else "uncertain"
-    if own.noun and not words_share(list(own.noun), names, roots=True) and not labeled:
-        return "uncertain"  # "3 X" where X is not a word of the attribute and nothing else names the value
+        rest = [w for w in words[1:] if not words_share([w], names, roots=True)]
+        return "uncertain" if (rest or before) else "ok"
+    head = _head_noun(own)
+    if head and not words_share(head, names, roots=True):
+        return "uncertain"  # "3 X" where X is not a word of the attribute
     return "ok"
 
 
@@ -628,12 +687,27 @@ def _name_words(attribute: AttributeDef) -> list[str]:
 
 
 def _found_in(term: str, where: str) -> bool:
-    """The naming term occurs in ``where``: verbatim, or each of its words in some form of the same word
-    (plural for singular, with or without a prefix), in order of appearance or not."""
+    """The naming term occurs in ``where``: verbatim, or as the same phrase with each word in another form of
+    itself (plural for singular, with or without a prefix), in order, with at most one other word between two of
+    its words ("שטח של ה-X"). Words scattered over the text ("שטח Y ... ה-X") do not name anything."""
     if term in where:
         return True
     tw, ww = text_words(term), text_words(where)
-    return bool(tw) and all(words_share([w], ww) for w in tw)
+    if not tw:
+        return False
+    for start in range(len(ww)):
+        if not words_share([tw[0]], [ww[start]]):
+            continue
+        pos, ok = start, True
+        for w in tw[1:]:
+            nxt = next((j for j in range(pos + 1, min(pos + 3, len(ww))) if words_share([w], [ww[j]])), None)
+            if nxt is None:
+                ok = False
+                break
+            pos = nxt
+        if ok:
+            return True
+    return False
 
 
 def _naming(term: str, quote: str, src: Source, attribute: AttributeDef,
@@ -849,6 +923,10 @@ def extract_version(tx: TxFactory, ctx: TenantContext, attribute: AttributeDef, 
         logger.warning("extraction call for version %s failed: %s", version_id, type(exc).__name__)
         result = StructuredResult(CallStatus.ERROR, detail=type(exc).__name__)
     key = (content.version_id, content.document_id)
+    if result.status == CallStatus.TIMEOUT and deadline is not None and (
+            result.detail == "deadline" or time.monotonic() >= deadline - llm.DEADLINE_FLOOR_SECONDS):
+        # the turn's deadline cut the call short: not a failure of the document; it is queued, not marked failed
+        return VersionOutcome(version_id, None, result.status.value, skipped="deadline")
     if not result.ok:
         with tx(ctx) as conn:
             written = _write(conn, attribute, key, "failed", [], {"status": result.status.value,
@@ -1125,9 +1203,16 @@ def compute_facts(conn: Connection, attribute: AttributeDef, filters: MetadataFi
                and f.status != "rejected" and not (f.status not in TRUSTED and (f.version_id, value_of(f)) in refused)]
     usable = [f for f in subject if f.status in usable_status]
     held = {f.version_id for f in subject if f.status not in usable_status and f.status != "rejected"}
+    # A reviewed fact of an earlier extraction version may carry another entity key than a new read of the same
+    # version (the subject key changed between versions): within one version, the reviewed fact's key wins, so
+    # one document never counts as two properties.
+    version_key: dict[UUID, str] = {}
+    for f in subject:
+        if f.status in TRUSTED:
+            version_key.setdefault(f.version_id, f.entity_key or f"doc:{f.document_id}")
     entities: dict[str, list] = {}
     for f in usable:
-        entities.setdefault(f.entity_key or f"doc:{f.document_id}", []).append(f)
+        entities.setdefault(version_key.get(f.version_id) or f.entity_key or f"doc:{f.document_id}", []).append(f)
 
     main_vals: list = []
     prelim_vals: list = []

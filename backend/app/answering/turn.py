@@ -1004,12 +1004,16 @@ def _locate(run: _Run) -> dict:
         # A document that lacks only the words found nowhere (a word misread in a scanned report, or spelled
         # otherwise) is listed, with the absent words named; weaker partial matches are near sources, never
         # the answer (R22).
-        strong = [(d, found) for d, found in docs if d.matched_terms and set(d.missing_terms) <= set(absent)]
+        # strong: the words found carry the question (at least two, twice as many as the words found nowhere);
+        # a qualifier found nowhere next to one common word ("X מוצף") lists nothing
+        strong = [(d, found) for d, found in docs if set(d.missing_terms) <= set(absent)
+                  and len(d.matched_terms) >= max(2, 2 * len(absent))]
         if strong:
             docs = strong
             evidence = [e for _, found in strong for e in found]
     if absent and not any(d.full_support for d, _ in docs) and not any(
-            d.matched_terms and set(d.missing_terms) <= set(absent) for d, _ in docs):
+            set(d.missing_terms) <= set(absent) and len(d.matched_terms) >= max(2, 2 * len(absent))
+            for d, _ in docs):
         kind = no_evidence_kind(run.ctx)
         lines = [ABSTENTION_TEXT[kind], absent_note, "מסמכים שבהם נמצאו רק חלק ממילות השאלה:"]
         for d, found in docs:

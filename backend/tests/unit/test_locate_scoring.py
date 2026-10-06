@@ -174,3 +174,15 @@ def test_scope_sql_current_only_unless_named_versions_ask_for_older():
     assert "(v.is_current OR v.id = ANY(:scope_v))" in older.where and "c.version_id = ANY(:scope_allowed)" in older.where
     d = uuid4()
     assert _scope_sql(SearchScope(document_ids=(d,))).where == "v.is_current AND c.document_id = ANY(:scope_d)"
+
+
+@pytest.mark.parametrize("passage", ["אין בעיה עם הסוכה", "אין תקלות בסוכה", "אין צורך בסוכה", "הסוכה לא תקינה",
+                                     "הסוכה אינה פועלת"])
+def test_a_negation_of_a_property_of_the_thing_is_not_its_absence(passage):
+    """Final review: each of these states that the thing exists; none may answer "where is there no X"."""
+    assert not _negated(passage)
+
+
+@pytest.mark.parametrize("passage", ["סוכה - לא", "סוכה: אין", "הסוכה אינה קיימת"])
+def test_a_label_and_its_negative_value_is_an_absence(passage):
+    assert _negated(passage)

@@ -115,7 +115,6 @@ def test_a_qualified_zero_goes_to_review(quote):
 
 def test_absence_of_another_room_is_not_zero_balconies():
     c = content(chunk("C1", "אין בדירה ממ״ד"))
-    assert validate_mention(mention("אין בדירה ממ״ד", "אין", "מרפסות"), c, BALCONIES) != "ok"
     assert isinstance(validate_mention(mention("אין בדירה ממ״ד", "אין", "מרפסות"), c, BALCONIES), str)
 
 
@@ -199,7 +198,8 @@ def test_quote_words_name_the_value_whatever_term_the_model_chose():
     a = validate_mention(mention("הבניין הושלם בשנת 2004", "2004", "הושלם בשנת"), c, year)
     b = validate_mention(mention("הבניין הושלם בשנת 2004", "2004", "הבניין הושלם בשנת"), c, year)
     assert not isinstance(a, str) and not isinstance(b, str)
-    assert status(a, c) == status(b, c)
+    # the quote's own words decide, not the model's choice of term: the same verdict both ways
+    assert status(a, c) == status(b, c) == "auto_validated"
 
 
 def test_several_unitless_counts_without_a_binding_go_to_review():
@@ -210,3 +210,89 @@ def test_several_unitless_counts_without_a_binding_go_to_review():
 
 def test_facts_module_reexports_the_validation_contract():
     assert facts.GENERIC_MEASURE_WORDS
+
+
+# --- final review counter-examples ----------------------------------------------------------------------------
+
+AREA = attr("שטח הדירה", "area")
+
+
+@pytest.mark.parametrize("quote", ["שטח המגרש עליו בנויה הדירה 500 מ״ר", "הדירה נמכרה; שטח החניה 12.5 מ״ר"])
+def test_scattered_term_words_name_nothing(quote):
+    c = content(chunk("C1", quote))
+    value = "500" if "500" in quote else "12.5"
+    ok = validate_mention(mention(quote, value, "שטח הדירה"), c, AREA)
+    assert isinstance(ok, str) or status(ok, c) == "needs_review"
+
+
+@pytest.mark.parametrize(("quote", "term"), [("לדירה צמוד מחסן בשטח 6 מ״ר", "מחסן"),
+                                             ("בדירה מרפסת בשטח 12 מ״ר", "מרפסת")])
+def test_the_models_nearer_term_keeps_a_value_from_becoming_the_attributes(quote, term):
+    c = content(chunk("C1", quote))
+    value = "6" if " 6 " in quote else "12"
+    ok = validate_mention(mention(quote, value, term), c, AREA)
+    assert isinstance(ok, str) or status(ok, c) == "needs_review"
+
+
+@pytest.mark.parametrize(("label", "quote", "value", "term"), [
+    ("מספר הקומות בבניין", "הדירה ממוקמת בקומה 3", "3", "בקומה"),
+    ("מספר החדרים", "חדר 2 משמש כמחסן", "2", "חדר"),
+    ("מספר יחידות הדיור בבניין", "הנכס הנישום הוא דירה 5 בבניין", "5", "דירה"),
+])
+def test_an_ordinal_is_not_a_count(label, quote, value, term):
+    """A position ("בקומה 3", "חדר 2", "דירה 5") never enters a count figure: rejected as an ordinal when the
+    noun is a counted-noun unit, else held for review."""
+    c = content(chunk("C1", quote))
+    ok = validate_mention(mention(quote, value, term), c, attr(label))
+    assert ok == "counted_other" or (not isinstance(ok, str) and status(ok, c) == "needs_review")
+
+
+@pytest.mark.parametrize("quote", ["בבניין 12 דירות", "בבניין 12 יח״ד"])
+def test_a_counted_noun_of_the_same_unit_counts_the_attribute(quote):
+    c = content(chunk("C1", quote))
+    ok = validate_mention(mention(quote, "12", quote.split()[-1]), c, attr("מספר יחידות הדיור"))
+    assert not isinstance(ok, str) and ok.canonical == 12
+
+
+def test_a_counted_noun_covering_only_part_of_the_name_is_uncertain():
+    c = content(chunk("C1", "דירת 5 חדרים"))
+    ok = validate_mention(mention("דירת 5 חדרים", "5", "חדרים"), c, attr("מספר חדרי שינה"))
+    assert not isinstance(ok, str) and status(ok, c) == "needs_review"
+
+
+@pytest.mark.parametrize("quote", ["ברחוב אין חניה", "בסביבה ללא חניה", "אין חניה בטאבו"])
+def test_a_zero_with_a_place_or_a_register_is_not_a_plain_zero(quote):
+    c = content(chunk("C1", quote))
+    ok = validate_mention(mention(quote, "אין" if "אין" in quote else "ללא", "חניה"), c, attr("מספר מקומות החניה"))
+    assert isinstance(ok, str) or status(ok, c) == "needs_review"
+
+
+def test_another_attribute_of_another_dimension_never_rejects_a_value():
+    c = content(chunk("C1", "שטח הדירה 95 מ״ר"))
+    ok = validate_mention(mention("שטח הדירה 95 מ״ר", "95", "שטח הדירה"), c, attr("שטח הנכס", "area"), [])
+    assert not isinstance(ok, str)
+
+
+# --- completeness: when a figure may stand for the document set -----------------------------------------------
+
+@pytest.mark.parametrize(("cov", "n", "op", "want"), [
+    ({}, 3, "mean", "complete"),
+    ({"not_stated": 5}, 3, "mean", "complete"),  # a document that does not state the datum is no gap
+    ({"awaiting_review": 1}, 2, "mean", "subset"),
+    ({"unknown_metadata": 1, "awaiting_review": 1}, 2, "mean", "subset"),
+    ({"not_yet_extracted": 3}, 2, "mean", "insufficient"),  # more documents unread than values found
+    ({"partial_scan": 1}, 0, "count", "insufficient"),
+    ({"awaiting_review": 1}, 4, "sum", "insufficient"),  # a sum over part of the documents is not their sum
+])
+def test_completeness(cov, n, op, want):
+    assert facts.completeness(cov, n, op) == want
+
+
+def test_a_conflict_beyond_the_extreme_decides_min_and_max_only():
+    from decimal import Decimal as D
+    fig = facts.aggregate([D(1968), D(2017)], "min")
+    held = [{"included": False, "values": [{"value": D(1958)}, {"value": D(1962)}]}]
+    assert facts._conflict_decides(held, fig, "min")
+    assert not facts._conflict_decides(held, facts.aggregate([D(1968), D(2017)], "max"), "max")
+    assert not facts._conflict_decides(held, fig, "mean")
+    assert not facts._conflict_decides([{**held[0], "included": True}], fig, "min")

@@ -378,10 +378,14 @@ def _names_clearly(plan: TurnPlan) -> bool:
 
 
 # A turn that opens with "ו" ("ומה לגבי 2023?", "ובתל אביב?") or a follow-up phrase continues an earlier question.
-# Only "ו" before a question word or a prefixed word ("ומה", "ובתל אביב", "ולגבי"), never a noun that happens to
-# start with ו ("ועדת ...").
-_CONTINUATION = re.compile(r"^\s*(ו(מה|מי|איך|למה|כמה|האם|אם|עם|גם|במה|ב\S+|ל\S+)(?=\s|\?|$)"
-                           r"|מה\s+(לגבי|עם)(?=\s)|באותם תנאים|אותו דבר)")
+# A continuation: "ו" before a question word, a prefixed word ("ובתל אביב", "ולגבי", "והממוצע", "ושל"), a number or
+# a hyphen ("ו-2023"), never "ובכן" or a noun that happens to start with ו ("ועדת ...").
+_CONTINUATION = re.compile(
+    r"^\s*(ו(מה|מי|איך|למה|כמה|האם|אם|עם|גם|מתי|איפה|היכן|איזה|איזו|אילו|מהו|מהי)(?=\s|\?|$)"
+    r"|ו(?!בכן)[הבלמשכ]\S+|ו\s*-?\s*\d|מה\s+(לגבי|עם)(?=\s)|גם\s+ב|באותם תנאים|אותו דבר)")
+# Words that point back to something said before: a question holding one is not self-contained.
+_ANAPHORA = frozenset({"זה", "זו", "זאת", "הזה", "הזאת", "הזו", "שם", "שלה", "שלו", "שלהם", "שלהן", "אותו",
+                       "אותה", "אותם", "אותן", "בו", "בה", "בהם"})
 
 
 def continuation_form(question: str) -> bool:
@@ -389,11 +393,28 @@ def continuation_form(question: str) -> bool:
     return bool(_CONTINUATION.search(base_normalize(question or "")))
 
 
+def _spelling(text: str) -> str:
+    """Text for matching a place name: hyphens as spaces, and a doubled ו or י as one (full and defective
+    spelling: "תקווה" ~ "תקוה")."""
+    out = base_normalize(text or "").replace("-", " ").replace("וו", "ו").replace("יי", "י")
+    return " ".join(out.split())
+
+
+def _initials(place: str) -> str | None:
+    """The common two-letter abbreviation of a two-word place ("תל אביב" -> "ת״א", "רמת גן" -> "ר״ג")."""
+    words = _spelling(place.split("-")[0] if "-" in place else place).split()
+    return f"{words[0][0]}״{words[1][0]}" if len(words) == 2 else None
+
+
 def _mentioned(place: str, question: str) -> bool:
-    """Whether the question names the place (or the part of a hyphenated name before the hyphen, "תל אביב" for
-    "תל אביב-יפו"), with or without a prefix letter."""
-    tokens = [t.strip(".,:;?!()\"'") for t in base_normalize(question).split()]
-    names = {base_normalize(place), base_normalize(place.split("-")[0])}
+    """Whether the question names the place: the whole name or the part before a hyphen ("תל אביב" for "תל
+    אביב-יפו"), in full or defective spelling, with or without a prefix letter or hyphen, or by its two-letter
+    abbreviation ("בת״א")."""
+    tokens = [t.strip(".,:;?!()\"'") for t in _spelling(question).split()]
+    names = {_spelling(place), _spelling(place.split("-")[0])}
+    short = _initials(place)
+    if short and any(t == short or (len(t) > len(short) and t[1:] == short) for t in tokens):
+        return True
     for name in names:
         words = name.split()
         if not words:
@@ -461,6 +482,8 @@ def normalize_model_plan(plan: TurnPlan, state: ConversationState | None = None,
     clarification = plan.clarification
     if (clarification is not None and clarification.key == "referent" and question and relation == "new_question"
             and not continuation_form(question)
+            and not _ANAPHORA.intersection(t.strip(".,:;?!\"'") for t in base_normalize(question).split())
+            and distinctive_words(question)
             and not steps and not plan.search_queries and not named and not plan.entities):
         # "Which appraisal mentions X?" asked back as "which appraisal do you mean?": a new, self-contained
         # question with nothing to compare is searched as asked; the answer shows what the documents hold

@@ -122,6 +122,9 @@ def number_anchor_words(text: str) -> set[str]:
     return {w for w, _ in _anchored(text)}
 
 
+VERSION_LABEL_WORD = "גרסה"  # the word compare._label puts before a version number
+
+
 def strip_label_numbers(text: str, labels: Iterable[str]) -> tuple[str, set[str]]:
     """``text`` (citations removed) with the numbers that repeat a server-issued evidence label blanked out,
     and those numbers. A number counts as the label's only under the same word as in a label: "בגרסה 2" for
@@ -129,7 +132,10 @@ def strip_label_numbers(text: str, labels: Iterable[str]) -> tuple[str, set[str]
     text = CITE.sub(" ", text)
     anchors: set[tuple[str, str]] = set()
     for label in labels:
-        anchors |= _anchored(label or "")
+        # only the version number the server appends ("<title>, גרסה 2"): a number in the document's own title
+        # ("שומת שווי 2500000") is the document's text, and a claim repeating it must cite it from a passage
+        tail = (label or "").rsplit(",", 1)[-1] if VERSION_LABEL_WORD in (label or "") else ""
+        anchors |= {(w, n) for w, n in _anchored(tail) if VERSION_LABEL_WORD in w}
     if not anchors:
         return text, set()
     out, removed, last = [], set(), 0

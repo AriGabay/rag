@@ -399,3 +399,30 @@ def test_a_question_sharing_only_a_repository_word_with_the_option_is_a_new_ques
     plan = _reply_plan(clarification_answer="appraised_value")
     assert reply_is_new_question(plan, p, "אילו שומות מזכירות היתר בנייה?")
     assert not reply_is_new_question(plan, p, "שווי בשומות?")
+
+
+@pytest.mark.parametrize(("text", "value"), [
+    ("לא, עסקאות", "transaction_price"),
+    ("לא. עסקאות", "transaction_price"),
+    ("לא, התכוונתי לעסקאות", "transaction_price"),
+])
+def test_a_leading_no_answers_the_question_and_negates_nothing_after_it(text, value):
+    """Final review: "לא, עסקאות" chose the opposite option, because the negation ran to the end of the reply."""
+    assert match_clarification_reply(text, pending_state().pending) == value
+
+
+def test_a_reply_giving_the_place_a_place_clarification_asks_for_is_a_reply():
+    from app.answering.interpret import reply_is_new_question
+    from app.answering.state import PendingClarification
+    p = PendingClarification(key="place", question="באיזו עיר?", task_type="compute")
+    plan = _reply_plan(clarification_answer=None, conditions={"city": "חולון"})
+    assert not reply_is_new_question(plan, p, "בחולון")
+
+
+def test_choosing_a_source_for_a_non_comparison_does_not_start_a_comparison():
+    from app.answering.interpret import answer_plan
+    from app.answering.state import ClarifyOption, PendingClarification
+    p = PendingClarification(key="referent", question="באיזו שומה מדובר?", task_type="answer",
+                             original_question="מה שטח המחסן?", options=[ClarifyOption(value="S2", label="מקור S2")])
+    plan = answer_plan(p, "S2")
+    assert plan.task_type == "answer" and not any(s.tool == "compare" for s in plan.steps)

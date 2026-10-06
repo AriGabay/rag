@@ -100,6 +100,8 @@ _REPLY_PARTICLES = frozenset("של את על עם גם רק אני זה זו ז�
 _QUESTION_WORDS = frozenset("מה מי איך למה מדוע האם כמה איזה איזו אילו מתי איפה היכן או".split())
 _ABSENCE_WORDS = ("אין",)  # "אין X" states that X is absent; it is not a choice between options
 _CLAUSE_STARTS = frozenset({"אלא", "אבל", "אך"})
+# The condition fields a clarification key asks for (a reply may state them without being a new question).
+_CLARIFY_FIELDS = {"place": {"city", "neighborhood"}, "referent": {"city", "neighborhood"}}
 _META_WHY = frozenset({"למה", "מדוע", "למה זה", "למה כך", "איך חישבת", "איך זה חושב", "איך חושב", "על סמך מה"})
 _META_SOURCES = frozenset({"תראה לי את המקור", "תראה לי את המקורות", "הראה לי את המקור", "הראה את המקורות",
                            "מה המקור", "מה המקורות", "מאיפה זה", "מאיפה המידע", "תן לי את המקור"})
@@ -156,8 +158,23 @@ def _polar(words: list[str]) -> list[tuple[str, bool]]:
             negated = False
             if w in _CLAUSE_STARTS:
                 continue
-        if len(w) > 1 and w not in _REPLY_PARTICLES and w not in _REPLY_FILLER:
+        if (len(w) > 1 or w.isdigit()) and w not in _REPLY_PARTICLES and w not in _REPLY_FILLER:
             out.append((w, negated))
+    return out
+
+
+_PUNCTUATION = re.compile(r"[,.;:!?–—]")
+
+
+def _polar_reply(reply: str) -> list[tuple[str, bool]]:
+    """``_polar`` per punctuated segment: a negation ends at the segment's end, and a segment that is only a
+    negation ("לא, X", "לא. X") answers the question asked, it negates nothing after it."""
+    out: list[tuple[str, bool]] = []
+    for segment in _PUNCTUATION.split(reply):
+        words = [w for w in _words(segment) if w]
+        if words and all(is_negation(w, ambiguous=False) or w in _REPLY_FILLER for w in words):
+            continue
+        out += _polar(words)
     return out
 
 
@@ -176,7 +193,7 @@ def match_clarification_reply(reply: str, pending: PendingClarification) -> str 
     if any(w.startswith(_ABSENCE_WORDS) and w in {*_ABSENCE_WORDS, *(p + a for p in "וש" for a in _ABSENCE_WORDS)}
            for w in words):
         return None
-    content = _polar(words)
+    content = _polar_reply(reply)
     if not content:
         return None
     marked = any(w in _REPLY_FILLER for w in words)
@@ -207,7 +224,8 @@ def answer_plan(pending: PendingClarification, value: str) -> TurnPlan:
     reply): it resumes the task the clarification interrupted, and ``apply_turn`` restores its context."""
     task = pending.task_type or ("compute" if pending.key in RECORD_CLARIFY_KEYS else "answer")
     query = [pending.original_question] if pending.original_question else []
-    if pending.key == "referent" and re.fullmatch(r"S\d+", value):
+    if pending.key == "referent" and re.fullmatch(r"S\d+", value) and (
+            pending.task_type == "compare" or pending.source_handles):
         query = list(pending.search_queries) or query
         # the chosen source completes the comparison the clarification interrupted
         sides = list(dict.fromkeys([*pending.source_handles, value]))
@@ -339,12 +357,13 @@ def reply_is_new_question(plan: TurnPlan, pending: PendingClarification, questio
     if pending.key != "attribute" and plan.attribute is not None and (
             pending.attribute is None or not _same_attribute_ref(plan.attribute, pending.attribute)):
         return True
-    if plan.entities and not set(plan.entities) <= set(pending.entities):
+    if pending.key != "referent" and plan.entities and not set(plan.entities) <= set(pending.entities):
         return True
+    # the conditions the clarification itself asks for may be given in the reply ("באיזו עיר?" -> "בחולון")
+    asked = _CLARIFY_FIELDS.get(pending.key, {pending.key})
     stated = {k for k in ("city", "neighborhood", "year_from", "year_to", "property_type")
-              if getattr(plan.conditions, k, None) is not None}
-    if stated - {pending.key} and any(getattr(plan.conditions, k) != getattr(pending.conditions, k, None)
-                                      for k in stated - {pending.key}):
+              if getattr(plan.conditions, k, None) is not None} - asked
+    if stated and any(getattr(plan.conditions, k) != getattr(pending.conditions, k, None) for k in stated):
         return True
     if plan.metric not in ("none", None) and pending.metric not in (None, "none") and plan.metric != pending.metric:
         return True

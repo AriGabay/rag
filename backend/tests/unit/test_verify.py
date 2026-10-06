@@ -206,3 +206,15 @@ def test_judge_past_the_deadline_makes_no_call_and_times_out():
     verdicts, result = judge_claims(p, _judge_items(), deadline=time.monotonic() + 0.2)
     assert verdicts is None and result.status == CallStatus.TIMEOUT and result.detail == "deadline"
     assert p.calls == []
+
+
+def test_a_number_in_a_document_title_is_not_exempt_from_layer_one():
+    """Final review: the label exemption covered any number in a side's title, so a claim could state a title's
+    number as a value no passage supports. Only the server's version suffix ("…, גרסה 2") is exempt."""
+    from app.answering.verify import check_claim, strip_label_numbers
+
+    assert check_claim("הנכס מוערך בשווי 2500000", ["E1"], [], "explicit",
+                       evidence={"E1": "הנכס מוערך לפי שיטת ההשוואה."}, computed_numbers=set(),
+                       labels={"E1": "שומת שווי 2500000"}) == ["unsupported_number"]
+    assert strip_label_numbers("בגרסה 2 השיעור עלה", ["שומה ברחוב X 18, גרסה 2"])[1] == {"2"}
+    assert strip_label_numbers("ברחוב X 18 השיעור עלה", ["שומה ברחוב X 18, גרסה 2"])[1] == set()

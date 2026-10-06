@@ -948,6 +948,9 @@ def test_a_rephrased_question_reuses_extracted_facts_without_reading_again(offic
 
 
 def test_naming_the_dimension_later_replaces_unreviewed_facts_instead_of_adding_to_them(office):
+    """The dimension upgrade moves the definition to its own extraction version for the whole office: the
+    document is read again, the dimensionless read stops counting (its fact is kept, not deleted), and one
+    observation remains."""
     with tenant_tx(office.ctx()) as conn:
         loose = resolve_attribute(conn, handle=None, description="נפח המיכל", unit_dimension=None)
     p = ScriptedProvider()
@@ -958,6 +961,9 @@ def test_naming_the_dimension_later_replaces_unreviewed_facts_instead_of_adding_
     with tenant_tx(office.ctx()) as conn:
         dimensioned = resolve_attribute(conn, handle=None, description="נפח המיכל", unit_dimension="volume")
     assert dimensioned.id == loose.id and dimensioned.unit_dimension == "volume"
-    assert facts_rows(office, loose) == []  # the re-read replaces them
+    assert dimensioned.extraction_prompt_version.endswith("+volume")
+    pending = compute(office.ctx(), dimensioned)
+    assert pending.coverage["not_yet_extracted"] == 1 and pending.preliminary is None  # the old read does not count
     comp = extract(office.ctx(), dimensioned, p)
-    assert len(facts_rows(office, loose)) == 1 and comp.preliminary.value == Decimal("3.00")
+    assert len(facts_rows(office, loose)) == 2  # nothing deleted
+    assert comp.preliminary.n == 1 and comp.preliminary.value == Decimal("3.00")
