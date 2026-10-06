@@ -63,6 +63,7 @@ class FilterReport:
     matched: list[UUID] = field(default_factory=list)
     excluded: list[UUID] = field(default_factory=list)
     unknown: dict[str, list[UUID]] = field(default_factory=dict)
+    by_text: list[UUID] = field(default_factory=list)  # matched by the place their own title or opening names
 
     @property
     def unknown_count(self) -> int:
@@ -204,3 +205,63 @@ def apply_filters(metadata: dict[UUID, VersionMetadata], filters: MetadataFilter
             report.matched.append(vid)
     return report
 
+
+
+# A report names its own property's place in its title or its opening lines (address, block and parcel).
+TEXT_PLACE_CHUNKS = 6
+
+
+def _place_forms(place: str) -> list[str]:
+    """The normalized place and, for a hyphenated name, the part before the hyphen ("תל אביב" of "תל אביב-יפו")."""
+    whole = base_normalize(place or "").strip()
+    return [x for x in dict.fromkeys([whole, whole.split("-")[0].strip()]) if x]
+
+
+def place_in_documents(conn: Connection, place: str) -> bool:
+    """Whether a visible current document names the place in its title or text (RLS decides which)."""
+    forms = _place_forms(place)
+    if not forms:
+        return False
+    return conn.execute(text(
+        "SELECT 1 FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
+        " WHERE d.deleted_at IS NULL AND (lower(d.title) LIKE ANY(:p) OR EXISTS (SELECT 1 FROM chunks c"
+        " WHERE c.version_id = v.id AND c.normalized_text LIKE ANY(:p))) LIMIT 1"),
+        {"p": [f"%{f}%" for f in forms]}).first() is not None
+
+
+def _text_names(conn: Connection, version_ids: Sequence[UUID], place: str) -> set[UUID]:
+    """The versions whose own title or opening chunks name the place."""
+    forms = _place_forms(place)
+    if not version_ids or not forms:
+        return set()
+    rows = conn.execute(text(
+        "SELECT v.id FROM document_versions v JOIN documents d ON d.id = v.document_id WHERE v.id = ANY(:ids)"
+        " AND (lower(d.title) LIKE ANY(:p) OR EXISTS (SELECT 1 FROM chunks c WHERE c.version_id = v.id"
+        " AND c.chunk_index < :n AND c.normalized_text LIKE ANY(:p)))"),
+        {"ids": list(version_ids), "p": [f"%{f}%" for f in forms], "n": TEXT_PLACE_CHUNKS}).all()
+    return {r.id for r in rows}
+
+
+def filter_versions(conn: Connection, version_ids: Sequence[UUID], filters: MetadataFilters) -> FilterReport:
+    """``apply_filters`` over the versions' metadata. A version with no place metadata at all (a narrative report
+    without records or "label: value" header lines) is placed by its own text: the requested place in its title
+    or its opening chunks, where a report names its property's address. Such versions are matched and listed in
+    ``by_text`` (the answer says so); a version whose text does not name it stays unknown, never excluded."""
+    report = apply_filters(version_metadata(conn, version_ids), filters)
+    pending: dict[UUID, set[str]] = {}
+    for name, ids in report.unknown.items():
+        for v in ids:
+            pending.setdefault(v, set()).add(name)
+    for name, wanted in (("city", filters.city), ("neighborhood", filters.neighborhood)):
+        ids = report.unknown.get(name) or []
+        if not wanted or not ids:
+            continue
+        named = _text_names(conn, ids, wanted)
+        report.unknown[name] = [v for v in ids if v not in named]
+        for v in named:
+            pending[v].discard(name)
+            if not pending[v]:
+                report.matched.append(v)
+                report.by_text.append(v)
+    report.unknown = {k: v for k, v in report.unknown.items() if v}
+    return report

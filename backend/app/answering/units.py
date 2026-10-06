@@ -331,3 +331,19 @@ def convert(value: Decimal, unit: Unit | None, dimension: str | None) -> Convers
     if dimension == "area" and unit.code == "m":
         return Conversion(value, canonical, assumed=True)
     raise DimensionMismatch(f"{unit.code} measures {unit.dimension}, not {dimension}")
+
+
+def per_area(unit: Unit) -> Unit | None:
+    """A currency unit as a rate per m² ("₪" under the label "שווי למ״ר"): same factor, per-area dimension."""
+    if unit.dimension != "currency":
+        return None
+    return Unit(f"{unit.code}/sqm", "currency_per_area", unit.factor, unit.before_ok)
+
+
+def names_per_area(words: list[str]) -> bool:
+    """Whether the words state a rate per area: "ל" + an area unit ("למ״ר", "למטר רבוע") or "/מ״ר"."""
+    for w in words:
+        for cand in (w[1:] if w.startswith("ל") else None, w.lstrip("/") if w.startswith("/") else None):
+            if cand and (u := parse_unit(cand)) is not None and u.dimension == "area":
+                return True
+    return False

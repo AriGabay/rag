@@ -433,6 +433,16 @@ def _dimension_fits(r, dimension: str | None) -> bool:
         {dimension, r.unit_dimension} <= _MONETARY_DIMENSIONS)
 
 
+def adopt_names(conn: Connection, attribute: AttributeDef, names: list[str]) -> AttributeDef:
+    """The definition with the given names added as aliases (a text twin of a structured attribute keeps the
+    names the structured one answers to)."""
+    r = conn.execute(text(f"SELECT {_COLUMNS} FROM attribute_definitions WHERE id = :a"), {"a": attribute.id}).one()
+    for name in names:
+        _add_alias(conn, r, name)
+        r = conn.execute(text(f"SELECT {_COLUMNS} FROM attribute_definitions WHERE id = :a"), {"a": attribute.id}).one()
+    return _to_def(r, created=attribute.created)
+
+
 def _add_alias(conn: Connection, r, name: str) -> None:
     """Record another phrasing of a definition, so it is matched exactly and shown to the interpreter."""
     if name and not any(labels_match(name, n) for n in _names(r)):
@@ -448,6 +458,7 @@ def resolve_attribute(
     unit_dimension: str | None,
     value_type: str | None = None,
     handles: dict[str, UUID] | None = None,
+    extracted_only: bool = False,
 ) -> AttributeDef:
     """The definition an attribute request denotes: the interpreter-chosen handle, else one whose name denotes
     the same attribute (``labels_match``, then ``same_attribute``: another form of the same words), else a new
@@ -457,6 +468,9 @@ def resolve_attribute(
 
     ``handles`` pins resolution to the mapping shown to the interpreter (see ``handle_map``); without
     it the current numbering is used. An unknown handle falls back to the description.
+
+    ``extracted_only`` skips the structured record definitions: the same datum read from the documents' text
+    (used when no structured record covers the question).
 
     ``value_type`` (one of ``VALUE_TYPES``) is what the caller needs; None accepts any existing type and
     creates numeric. A numeric request is never answered by a non-numeric definition, nor the reverse: the
@@ -481,7 +495,8 @@ def resolve_attribute(
         raise ValueError("an attribute needs a known handle or a description")
     # structured entries first, then the own type, then the oldest definition
     ranked = sorted(rows, key=lambda r: (r.source != "structured", value_type is not None and r.value_type != value_type))
-    candidates = [r for r in ranked if _type_fits(r, value_type) and _dimension_fits(r, unit_dimension)]
+    candidates = [r for r in ranked if _type_fits(r, value_type) and _dimension_fits(r, unit_dimension)
+                  and not (extracted_only and r.source == "structured")]
     for r in candidates:
         if any(labels_match(description, name) for name in _names(r)):
             return _to_def(_with_dimension(conn, r, unit_dimension))

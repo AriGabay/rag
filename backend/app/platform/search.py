@@ -37,7 +37,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import Connection, text
 
-from app.answering.metadata import FilterReport, MetadataFilters, apply_filters, version_metadata
+from app.answering.metadata import FilterReport, MetadataFilters, filter_versions
 from app.answering.places import KNOWN_CITIES
 from app.db import TenantContext, tenant_tx
 from app.deps import get_ctx
@@ -228,7 +228,7 @@ def _prepare(conn: Connection, scope: SearchScope | None, filters: MetadataFilte
     versions = _scoped_versions(conn, scope)
     report, allowed = None, None
     if filters is not None and filters.active:
-        report = apply_filters(version_metadata(conn, [v for v, _ in versions]), filters)
+        report = filter_versions(conn, [v for v, _ in versions], filters)
         allowed = report.matched
         if not allowed:
             return None, report, 0

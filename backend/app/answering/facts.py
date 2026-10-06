@@ -76,7 +76,7 @@ from app.answering.attributes import (
     GENERIC_MEASURE_WORDS as GENERIC_MEASURE_WORDS,  # re-exported: part of the validation contract
 )
 from app.answering.attributes import match_norm as _match_norm
-from app.answering.metadata import MetadataFilters, apply_filters, report_header, version_metadata
+from app.answering.metadata import MetadataFilters, filter_versions, report_header
 from app.config import get_settings
 from app.db import TenantContext, tenant_tx
 from app.extraction.normalize_text import base_normalize
@@ -159,6 +159,7 @@ class VersionRef:
 class DocumentSet:
     versions: list[VersionRef]
     unknown_metadata: list[UUID] = field(default_factory=list)
+    place_by_text: list[UUID] = field(default_factory=list)  # matched by the place their own text names
 
     @property
     def version_ids(self) -> list[UUID]:
@@ -178,11 +179,11 @@ def document_set(conn: Connection, filters: MetadataFilters | None,
     versions = [VersionRef(r.id, r.document_id, r.title) for r in rows]
     if filters is None or not filters.active:
         return DocumentSet(versions)
-    report = apply_filters(version_metadata(conn, [v.version_id for v in versions]), filters)
+    report = filter_versions(conn, [v.version_id for v in versions], filters)
     matched = set(report.matched)
     unknown = {v for ids in report.unknown.values() for v in ids}
     return DocumentSet([v for v in versions if v.version_id in matched],
-                       [v.version_id for v in versions if v.version_id in unknown])
+                       [v.version_id for v in versions if v.version_id in unknown], list(report.by_text))
 
 
 def extraction_version(attribute: AttributeDef) -> str:
@@ -494,6 +495,9 @@ def validate_mention(m: Mention, content: VersionContent, attribute: AttributeDe
         unit = src.header_unit  # a bare number in a cell is measured in its column's (or row label's) unit
     if unit is None:  # "label (unit): value" in running text names the unit the same way
         unit = next((n.unit for n in named if n.value == q.value and n.unit is not None), None)
+    if (dimension == "currency_per_area" and unit is not None and unit.dimension == "currency" and own is not None
+            and units.names_per_area(text_words(own.label)[-_NEAR_WORDS:] + list(own.after[:2]))):
+        unit = units.per_area(unit)  # "שווי למ״ר: 20,000 ₪": the label states the rate
     if dimension == "count" and own is not None:
         unit = own.unit if own.unit is not None else (None if unit is q.unit else unit)
         verdict = _count_binding(own, unit, src, attribute)
@@ -1279,6 +1283,7 @@ def compute_facts(conn: Connection, attribute: AttributeDef, filters: MetadataFi
         "rejected": sum(1 for f in rows if f.status == "rejected"),
         "mentions_rejected": sum(int((r.detail or {}).get("rejected") or 0) for r in ledger),
         "unknown_metadata": len(dset.unknown_metadata),
+        "place_by_text": len(dset.place_by_text),
         "conflicts": len(conflicts),
         "duplicates": duplicates,
     }

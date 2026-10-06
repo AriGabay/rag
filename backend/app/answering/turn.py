@@ -32,6 +32,7 @@ from sqlalchemy import Connection, text
 from app.answering import facts
 from app.answering.attributes import (
     AttributeDef,
+    adopt_names,
     canonical_unit_for,
     handle_map,
     list_attribute_handles,
@@ -64,8 +65,8 @@ from app.answering.interpret import (
     build_interpret_input,
     interpret,
 )
-from app.answering.metadata import MetadataFilters
-from app.answering.parser import Gazetteer, missing_conditions
+from app.answering.metadata import MetadataFilters, place_in_documents, place_matches
+from app.answering.parser import Gazetteer, missing_conditions, parse_question
 from app.answering.plan import (
     MAX_STEPS,
     ClarifyOption,
@@ -453,6 +454,21 @@ def _delta(delta: dict) -> ConditionDelta:
         raise TurnError(422, "ערך מסנן לא תקין") from None
 
 
+def _with_document_places(ctx: TenantContext, question: str, gaz: Gazetteer) -> Gazetteer:
+    """The gazetteer plus a place the question names that no record or header lists but an authorized document
+    does name in its title or text: a narrative report states its city in prose, so the place is known to the
+    repository and the question is answered from the documents instead of "no records for this place"."""
+    place = parse_question(question, gaz, None).unknown_place
+    if not place:
+        return gaz
+    with tenant_tx(ctx) as conn:
+        if not place_in_documents(conn, place):
+            return gaz
+    if re.search(r"(^|\s)ב?שכונת\s+" + re.escape(place), question):
+        return Gazetteer(cities=gaz.cities, neighborhoods=[*gaz.neighborhoods, (None, place)])
+    return Gazetteer(cities=sorted({*gaz.cities, place}), neighborhoods=gaz.neighborhoods)
+
+
 def interpret_turn(ctx: TenantContext, req: TurnRequest, L: Loaded) -> Interpreted:
     """The validated plan of this turn (no transaction is open while the model interprets)."""
     question = (req.question or "").strip()
@@ -461,6 +477,7 @@ def interpret_turn(ctx: TenantContext, req: TurnRequest, L: Loaded) -> Interpret
     elif not question:
         it = _edit(L)
     else:
+        L.gazetteer = _with_document_places(ctx, question, L.gazetteer)
         result = interpret(question, L.state, L.gazetteer, L.attributes, L.cloud_provider)
         if result.status is not None:
             with tenant_tx(ctx) as conn:
@@ -606,9 +623,40 @@ def _filters(run: _Run) -> MetadataFilters | None:
     return f if f.active else None
 
 
+NO_RECORDS_FROM_TEXT = ("במאגר אין רשומות מובנות (עסקאות או שווי) למקום הזה, ולכן הערכים חולצו מטקסט המסמכים, כל"
+                        " אחד עם ציטוט ועמוד, כפי שנכתבו בהם: מחיר עסקה ושווי שמאי מובחנים רק לפי הציטוט.")
+
+
+def _records_cover(ctx: TenantContext, c: QueryConditions) -> bool:
+    """Whether any visible structured record lies in the question's place (or any record at all without one)."""
+    with tenant_tx(ctx) as conn:
+        rows = conn.execute(text(
+            "SELECT DISTINCT o.city, o.neighborhood FROM occurrences o JOIN document_versions v ON v.id = o.version_id"
+            " AND v.is_current JOIN documents d ON d.id = o.document_id AND d.deleted_at IS NULL"
+            " WHERE o.verification_status <> 'rejected'")).all()
+    if not rows:
+        return False
+    if c.city and not any(r.city and place_matches(c.city, frozenset({base_normalize(r.city)})) for r in rows):
+        return False
+    if c.neighborhood and not any(r.neighborhood and place_matches(
+            c.neighborhood, frozenset({base_normalize(r.neighborhood)})) for r in rows):
+        return False
+    return True
+
+
 def _records(run: _Run, attr: AttributeDef) -> Part | None:
-    """A structured attribute over unique verified records (parametric SQL, no model call)."""
+    """A structured attribute over unique verified records (parametric SQL, no model call). When no record
+    covers the question's place (narrative reports produce none), the same datum is extracted from the
+    documents' text with quotes instead (``_facts``), and the answer says so."""
     c = run.state.query_conditions("calculation")
+    if not _records_cover(run.ctx, c):
+        with tenant_tx(run.ctx) as conn:
+            twin = resolve_attribute(conn, handle=None, description=attr.label, unit_dimension=attr.unit_dimension,
+                                     value_type="numeric", extracted_only=True)
+            twin = adopt_names(conn, twin, attr.aliases)
+        run.attribute = twin
+        run.limitations.append(NO_RECORDS_FROM_TEXT)
+        return _facts(run, twin)
     monetary = attr.unit_dimension in MONETARY_DIMENSIONS
     metric = run.state.metric or "mean"
     op = metric if metric != "none" else "mean"
@@ -854,6 +902,9 @@ def _fact_part(comp, c: QueryConditions, general: dict, total=None, spec: ValueF
         lines.append(f"• {x['title']}: {value} [{x['evidence_id']}]")
     lines.append(facts.coverage_text(cov))
     limitations = [FACT_SCOPE_NOTE]
+    if cov.get("place_by_text"):
+        limitations.append(f"{cov['place_by_text']} מסמכים שויכו למקום המבוקש לפי הכותרת או הפתיח שלהם, כי אין בהם"
+                           " נתוני מקום מובנים.")
     if full == "subset" and observed:
         limitations.append(f"התוצאה מחושבת רק על התצפיות שנמצאו ואינה מייצגת את כל המסמכים שבתחום: {gaps}.")
     elif comp.partial:

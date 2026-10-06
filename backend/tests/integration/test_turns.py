@@ -975,3 +975,28 @@ def test_an_address_alone_does_not_list_a_document_for_a_topic_found_nowhere(cli
     login(client, "admin-a@example.test")
     ans = post(client, "מה נכתב על סאונה בהדקלים 18?")["answer"]
     assert ans["kind"] == "abstain"
+
+
+# --- narrative reports with no structured records (real office files) ---------------------------------------------
+
+def test_a_price_question_over_narrative_reports_is_answered_from_their_text(client, db, monkeypatch):
+    """Real reports produced no records and named their city only in prose: "מה המחיר למ״ר ממוצע בעיר X" answered
+    "no records for X" without looking at the documents. The city is known because a document names it, the
+    documents are placed by their own titles, and the price per m² is extracted from their text with quotes."""
+    a = make_office(db, "משרד א", "admin-a@example.test")
+    add_doc(a, a.default_group_id, "שומה - הדקל 5 חולון", ["הנכס ממוקם בחולון.", "שווי למ״ר: 20000 ₪."])
+    add_doc(a, a.default_group_id, "שומה - הדקל 9 חולון", ["הנכס ממוקם בחולון.", "שווי למ״ר: 24000 ₪."])
+    add_doc(a, a.default_group_id, "שומה - הגפן 1 בת ים", ["הנכס ממוקם בבת ים.", "שווי למ״ר: 90000 ₪."])
+    p = ScriptedProvider()
+    for title, v in (("שומה - הדקל 5 חולון", "20000"), ("שומה - הדקל 9 חולון", "24000"),
+                     ("שומה - הגפן 1 בת ים", "90000")):
+        script(p, title, mention(f"שווי למ״ר: {v} ₪", v, source="C2", unit="₪", term="שווי למ״ר"))
+    enable_cloud(a, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    ans = post(client, "מה המחיר למ״ר ממוצע בחולון?")["answer"]
+    assert "אין במאגר המשרד רשומות" not in ans["text"]
+    assert ans["kind"] in ("numeric", "combined"), ans["text"]
+    pre = ans["preliminary"] or {}
+    assert pre.get("value") == "22000.00" and pre.get("record_count") == 2  # the other city's report is left out
+    assert any("חולצו מטקסט המסמכים" in x for x in ans["limitations"])
+    assert any("לפי הכותרת או הפתיח" in x for x in ans["limitations"])
