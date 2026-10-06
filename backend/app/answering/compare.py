@@ -4,7 +4,7 @@ The caller passes each side as an explicit handle: a version id (read even when 
 id (its current version). Resolving "the second appraisal" from the conversation is the orchestrator's job.
 Evidence is retrieved per side under the user's RLS, and every side needs at least one admitted passage;
 otherwise the result says the comparison is incomplete and names the side that lacks evidence, never
-comparing one-sidedly. Statements are labeled by document or version, and conflicts on the same datum are
+comparing one-sidedly; a side whose claims verification dropped is quoted from the passage the model used. Statements are labeled by document or version, and conflicts on the same datum are
 reported with the sources of both sides.
 
 The tool runs in three phases so no transaction is open across model calls (R26, KTD13): ``gather_sides``
@@ -131,9 +131,10 @@ def gather_sides(conn: Connection, question: str, sides: Sequence[CompareSide], 
 
 def compose_comparison(g: CompareGathered, provider: LLMProvider | None, state: ProviderState) -> CompareOutcome:
     """The compose phase: the answer and judge calls, with no database connection (R26). Every side needs
-    evidence; otherwise the comparison is incomplete and no model is called. When the verified claims cite
-    only some sides, the comparison is incomplete too and names the uncovered sides. The caller logs
-    ``usage``."""
+    evidence; otherwise the comparison is incomplete and no model is called. A side whose claims verification
+    dropped is shown by the passage the model answered from, quoted and labeled with its title or version; a
+    side the verified answer still does not cite makes the comparison incomplete, named in ``missing_sides``.
+    The caller logs ``usage``."""
     if g.missing:
         body = (f"ההשוואה אינה שלמה: לא נמצאו ראיות רלוונטיות עבור {', '.join(g.missing)}"
                 " במסמכים שאתם מורשים לראות. לא מוצגת השוואה חד-צדדית.")

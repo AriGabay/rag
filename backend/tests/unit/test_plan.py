@@ -327,3 +327,20 @@ def test_attribute_clarification_chosen_by_the_model_is_kept_over_a_generic_desc
     side = normalize_model_plan(_model_plan(task_type="compute", clarification="attribute", attribute="גודל החלל",
                                             metric="mean"))
     assert side.clarification is None and side.task_type == "compute"
+
+
+def test_attribute_clarification_on_a_clearly_named_attribute_is_dropped():
+    """GQ30: "the average ceiling height in all reports" names the attribute; the model's question about which
+    attribute is dropped and the computation runs. Measure words alone ("הגודל הממוצע") still ask."""
+    from app.answering.plan import normalize_model_plan
+
+    named = normalize_model_plan(_model_plan(task_type="clarify", clarification="attribute", attribute="גובה התקרה",
+                                             metric="mean"))
+    assert named.clarification is None and named.task_type == "compute"
+    assert named.steps[0].tool == "extract_and_compute"
+    generic = normalize_model_plan(_model_plan(task_type="clarify", clarification="attribute",
+                                               attribute="הגודל הממוצע", metric="mean"))
+    assert generic.task_type == "clarify" and generic.clarification.key == "attribute"
+    unnamed = normalize_model_plan(_model_plan(task_type="clarify", clarification="attribute", metric="mean",
+                                               tools=["search"]))
+    assert unnamed.task_type == "clarify" and unnamed.clarification.key == "attribute"

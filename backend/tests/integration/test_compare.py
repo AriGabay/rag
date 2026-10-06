@@ -162,7 +162,7 @@ def test_gather_reads_evidence_without_a_model_call_and_compose_reports_its_usag
 
 
 def test_verified_claims_from_one_side_only_give_an_incomplete_comparison(office, monkeypatch):
-    """Both sides had evidence, but only one side's claim survived: not presented as a full comparison."""
+    """Both sides had evidence, but the answer says nothing from one side: not presented as a full comparison."""
     doc, old_v = add_chunks(office, office.default_group_id, ["שיעור ההתאמה לגודל הוא 5%."], "e" * 64)
     new_v = _add_version(office, doc, ["שיעור ההתאמה לגודל הוא 7%."])
     p = ScriptedProvider().on(Purpose.ANSWER, compare_answer(
@@ -172,3 +172,20 @@ def test_verified_claims_from_one_side_only_give_an_incomplete_comparison(office
     a = out.answer
     assert a["compare"]["incomplete"] is True and a["compare"]["missing_sides"] == ["דוח eee, גרסה 1"]
     assert any("נמצאה ראיה רק מצד אחד" in lim for lim in a["limitations"]) and not out.cacheable
+
+
+def test_a_side_whose_claim_verification_dropped_is_quoted_with_its_version(office, monkeypatch):
+    """GQ24: the model answered from both versions, the old version's claim did not pass verification; the old
+    version is shown by the passage the model used, quoted and labeled with its version."""
+    doc, old_v = add_chunks(office, office.default_group_id, ["שיעור ההתאמה לגודל הוא 5%."], "e" * 64)
+    new_v = _add_version(office, doc, ["שיעור ההתאמה לגודל הוא 7%."])
+    p = ScriptedProvider().on(Purpose.ANSWER, compare_answer(
+        claim("שיעור ההתאמה לגודל הוא 6%", ["E1"]), claim("שיעור ההתאמה לגודל הוא 7%", ["E2"]))
+    ).on(Purpose.VERIFY, verdicts(1))
+    cloud(office, monkeypatch, p)
+    out = run(office.ctx(), [CompareSide(version_id=old_v), CompareSide(version_id=new_v)])
+    a = out.answer
+    assert a["compare"]["incomplete"] is False and a["compare"]["missing_sides"] == []
+    assert [c["evidence_ids"] for c in a["claims"]] == [["E2"], ["E1"]]
+    assert "דוח eee, גרסה 1: ציטוט מהמסמך: „שיעור ההתאמה לגודל הוא 5%.” [E1]" in a["text"]
+    assert any("דוח eee, גרסה 1" in lim and "כלשונו" in lim for lim in a["limitations"]) and out.cacheable

@@ -18,7 +18,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
-from app.extraction.normalize_text import base_normalize, prefix_variants
+from app.extraction.normalize_text import base_normalize, inflection_variants, prefix_variants
 
 # Structured attributes map to whitelisted record columns (the CHECK in migration 0004 and
 # STRUCTURED_COLUMNS in app.appraisal.query). Single source of truth; scripts/seed_demo.py imports it.
@@ -58,8 +58,9 @@ CANONICAL_UNITS = {
 }
 VALUE_TYPES = ("numeric", "text", "boolean", "date")
 # x2: a value must be named as the attribute (attribute_term). x3: table cells carry their row label, counts
-# as words, W×H dimensions, text values; earlier ledger states are read again.
-EXTRACTION_PROMPT_VERSION = "x3"
+# as words, W×H dimensions, text values. x4: a value bound to its own label among several, terms of the same
+# root, stated absence as zero; earlier ledger states are read again.
+EXTRACTION_PROMPT_VERSION = "x4"
 _WORD = re.compile(r"[\w״׳]+")
 _FILLER = frozenset({"של"})  # "שטח של הדירה" names the same attribute as "שטח הדירה"
 _COLUMNS = ("id, key, label_he, aliases, value_type, unit_dimension, canonical_unit, source, structured_column,"
@@ -99,6 +100,90 @@ def labels_match(a: str, b: str) -> bool:
     """Exact match after Hebrew normalization, word by word, allowing a stripped prefix or article."""
     ta, tb = _tokens(a), _tokens(b)
     return bool(ta) and len(ta) == len(tb) and all(_same_word(x, y) for x, y in zip(ta, tb, strict=True))
+
+
+# --- naming words: what a description, a naming term or a label says is measured ----------------------------
+
+def match_norm(value: str) -> str:
+    """Normalized text for verbatim comparisons (prompt-safe angle quotes read back as plain ones)."""
+    return " ".join(base_normalize((value or "").replace("‹", "<").replace("›", ">")).split())
+
+
+# Words that say what is measured, not what the measured thing is ("שטח", "גודל" ...). A naming term made only
+# of these does not tie a number to the attribute: "שטח 94 מ״ר" is not the area of every part of a property.
+GENERIC_MEASURE_WORDS = frozenset(match_norm(w) for w in (
+    "גודל", "שטח", "מספר", "כמות", "גובה", "אורך", "רוחב", "עומק", "נפח", "שנת", "שנה", "ממוצע", "סך", "סה״כ",
+    "ערך", "מידה", "מידות", "יחידה", "יחידות", "מ״ר", "במ״ר", "מטר", "של", "כולל", "נטו", "ברוטו", "רשום"))
+_LETTER_WORD = re.compile(r"[^\W\d_][\w״׳]*")  # punctuation ("(מ״ר):") and bare numbers are not words
+_ARTICLES = ("וה", "ה")
+
+
+def word_forms(word: str) -> set[str]:
+    """A word, its prefix-stripped variants, and the singular/plural forms of the word and of the word without
+    its article ("הכיתות" also names "כיתה"). Other stripped prefixes are not inflected: "מקומות" is not a
+    form of "קומה"."""
+    out = {word, *prefix_variants(word)}
+    for base in [word] + [word[len(a):] for a in _ARTICLES if word.startswith(a) and len(word) - len(a) >= 3]:
+        out.add(base)
+        out.update(inflection_variants(base))
+    return out
+
+
+def text_words(value: str) -> list[str]:
+    return _LETTER_WORD.findall(match_norm(value))
+
+
+def is_measure_word(word: str) -> bool:
+    return bool(word_forms(word) & GENERIC_MEASURE_WORDS)
+
+
+def distinctive_words(value: str) -> list[str]:
+    """The words of ``value`` that name what is measured: generic measure words excluded."""
+    return [w for w in text_words(value) if not is_measure_word(w)]
+
+
+# Root skeleton (a light Hebrew morphology rule, not vocabulary): up to two prefix letters stripped, the
+# vowel letters ו and י dropped, final letter forms unified; the first three consonants approximate the root.
+_ROOT_PREFIXES = "והבלמשכנ"
+_FINALS = str.maketrans("ךםןףץ", "כמנפצ")
+_NOT_LETTER = re.compile(r"[^א-ת]")
+
+
+def _root_variants(word: str) -> list[str | None]:
+    """Skeletons of the word with 0, 1 and 2 prefix letters stripped (None when shorter than three)."""
+    w = _NOT_LETTER.sub("", word).translate(_FINALS)
+    out: list[str | None] = []
+    for k in range(3):
+        if k and not (len(w) > k and w[k - 1] in _ROOT_PREFIXES):
+            break
+        skeleton = w[k:].replace("ו", "").replace("י", "")
+        out.append(skeleton[:3] if len(skeleton) >= 3 else None)
+    return out
+
+
+def share_root(a: str, b: str) -> bool:
+    """Two words of one root in other forms (a verb and its noun, a participle). Two unstripped skeletons that
+    begin with the same prefix letter match only when there is nothing left to compare after it: "המחיר" and
+    "המחלקה" share only their article. Limits: a word whose own first letters look like prefixes (or a root
+    with a weak letter) can meet an unrelated word of three equal consonants; used only to tell a naming
+    term of the attribute's own words from another phrasing, never to merge definitions."""
+    va, vb = _root_variants(a), _root_variants(b)
+    for i, x in enumerate(va):
+        for j, y in enumerate(vb):
+            if x is None or y is None or x != y:
+                continue
+            if i == j == 0 and len(va) > 1 and va[1] and len(vb) > 1 and vb[1]:
+                continue
+            return True
+    return False
+
+
+def words_share(a: list[str], b: list[str], *, roots: bool = False) -> bool:
+    """Whether a word of ``a`` and a word of ``b`` are forms of one word (or, with ``roots``, of one root)."""
+    fb = [word_forms(y) for y in b]
+    if any(word_forms(x) & f for x in a for f in fb):
+        return True
+    return roots and any(share_root(x, y) for x in a for y in b)
 
 
 def proposed_key(description: str, value_type: str = "numeric") -> str:
@@ -223,6 +308,31 @@ def _with_dimension(conn: Connection, r, dimension: str | None):
     return conn.execute(text(f"SELECT {_COLUMNS} FROM attribute_definitions WHERE id = :a"), {"a": r.id}).one()
 
 
+_MONETARY = frozenset({"currency", "currency_per_area"})
+
+
+def _names(r) -> list[str]:
+    return [r.label_he, *(r.aliases or [])]
+
+
+def _handle_fits_description(r, description: str | None, dimension: str | None, rows: list) -> bool:
+    """Whether an interpreter-chosen handle agrees with the plan's own description of the attribute.
+
+    It does not when the plan names a known dimension the definition does not measure ("the area of X" with
+    the handle of "the number of X"), or when the description shares no distinctive word (form or root) with
+    the definition's names and itself names another definition exactly. A handle whose names merely use other
+    words is the interpreter's semantic match (a synonym) and is kept (KTD7)."""
+    if dimension is not None and r.unit_dimension is not None and r.unit_dimension != dimension and not (
+            {dimension, r.unit_dimension} <= _MONETARY):  # "price" for a price per m² is a loose word, not a conflict
+        return False
+    asked = distinctive_words(description or "")
+    if not asked:
+        return True
+    if words_share(asked, [w for n in _names(r) for w in distinctive_words(n)], roots=True):
+        return True
+    return not any(o.id != r.id and any(labels_match(description or "", n) for n in _names(o)) for o in rows)
+
+
 def resolve_attribute(
     conn: Connection,
     *,
@@ -254,7 +364,7 @@ def resolve_attribute(
         mapping = handles if handles is not None else {f"A{i}": r.id for i, r in enumerate(rows, start=1)}
         target = mapping.get(handle.strip())
         for r in rows:
-            if r.id == target:
+            if r.id == target and _handle_fits_description(r, description, unit_dimension, rows):
                 if fits(r):
                     return _to_def(_with_dimension(conn, r, unit_dimension))
                 description = r.label_he  # the same attribute, asked as another type

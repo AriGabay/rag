@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
+from app.answering.attributes import distinctive_words
 from app.answering.conditions import AreaType, DataKind, DateField
 from app.answering.parser import Gazetteer
 
@@ -358,14 +359,23 @@ def _numeric_when_ordered(plan: TurnPlan) -> TurnPlan:
     return plan.model_copy(update={"attribute": ref.model_copy(update={"value_type": "numeric"})})
 
 
+def _names_clearly(plan: TurnPlan) -> bool:
+    """The plan names an attribute by a handle or by a description with a word that says what is measured;
+    a description of measure words only ("הגודל הממוצע") leaves the attribute open."""
+    ref = plan.attribute
+    if ref is None or not (ref.handle or ref.description):
+        return False
+    return bool(distinctive_words(ref.description)) if ref.description else True
+
+
 def normalize_model_plan(plan: TurnPlan, state: ConversationState | None = None) -> TurnPlan:
     """The server's reading of a validated model plan: the model proposes, the server decides. Every rule
     reads the plan's structure (task, attribute, metric, filter, steps), never its words.
 
     - Meta tools run only on meta turns ("למה?", "תראה לי את המקור").
-    - A proposed clarification is kept only for an unclear referent, or an unclear attribute (one the plan
-      does not name, or a clarify task the model chose over its generic description, e.g. "the average
-      size"); otherwise the turn proceeds with what the plan already supports.
+    - A proposed clarification is kept only for an unclear referent, or an unclear attribute: one the plan
+      does not name, or names only by measure words ("the average size"). A clearly named attribute
+      proceeds even when the model chose to ask. A turn with nothing to execute keeps its clarification.
     - "abstain" with a named attribute becomes an answer, or a computation when a metric is asked:
       whether the repository holds the datum is checked by the tools, not guessed by the model.
     - A named attribute with a metric, or with a condition on its value, is a computation even when the
@@ -395,8 +405,7 @@ def normalize_model_plan(plan: TurnPlan, state: ConversationState | None = None)
     executable = bool(steps or plan.search_queries or named)
     if clarification is not None or task == "clarify":
         keep = not executable or (clarification is not None and (
-            clarification.key == "referent" or (clarification.key == "attribute"
-                                                and (task == "clarify" or not named))))
+            clarification.key == "referent" or (clarification.key == "attribute" and not _names_clearly(plan))))
         if not keep:
             clarification = None
             if task == "clarify":

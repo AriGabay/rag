@@ -568,7 +568,10 @@ def _plan_attribute(run: _Run) -> AttributeDef | None:
         handle, description, dimension, value_type = st.handle, st.description, st.unit_dimension, st.value_type
     with tenant_tx(run.ctx) as conn:
         try:
-            attr = resolve_attribute(conn, handle=handle, description=description or DEFAULT_ATTRIBUTE_LABEL,
+            # the plan's own description checks the handle; the rules path's default applies only to a plan
+            # that names neither
+            attr = resolve_attribute(conn, handle=handle,
+                                     description=description or (None if handle else DEFAULT_ATTRIBUTE_LABEL),
                                      unit_dimension=dimension, value_type=value_type,
                                      handles=handle_map(run.L.attributes))
         except ValueError:

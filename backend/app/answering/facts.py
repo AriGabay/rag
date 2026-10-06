@@ -66,11 +66,19 @@ from app.answering.attributes import (
     AttributeDef,
     bump_facts_version,
     canonical_unit_for,
+    distinctive_words,
+    is_measure_word,
+    text_words,
+    words_share,
 )
+from app.answering.attributes import (
+    GENERIC_MEASURE_WORDS as GENERIC_MEASURE_WORDS,  # re-exported: part of the validation contract
+)
+from app.answering.attributes import match_norm as _match_norm
 from app.answering.metadata import MetadataFilters, apply_filters, version_metadata
 from app.config import get_settings
 from app.db import TenantContext, tenant_tx
-from app.extraction.normalize_text import base_normalize, inflection_variants, prefix_variants
+from app.extraction.normalize_text import base_normalize
 from app.platform import jobs
 from app.platform.search import SearchScope, search_evidence
 from app.providers import llm
@@ -98,7 +106,9 @@ EXTRACT_POLICY = (
     "לכל אזכור: entity_role הוא subject כשהערך מתאר את הנכס הנישום במסמך, comparable כשהוא מתאר נכס או עסקת השוואה, "
     "ו-other בכל מקרה אחר; entity_descriptor הוא כתובת או גוש/חלקה של הנכס כפי שנכתבו, או null; "
     "value_text הוא הערך כפי שנכתב: מספר (גם במילים), מידות כפי שנכתבו (למשל אורך על רוחב), "
-    "או הטקסט עצמו כשסוג הערך הוא טקסט; unit_text היא היחידה כפי שנכתבה, או null; "
+    "או הטקסט עצמו כשסוג הערך הוא טקסט; כשהמאפיין הוא ספירה והמסמך קובע במפורש שאין כזה (למשל 'אין' או 'ללא' "
+    "בתא של המאפיין או במשפט שמכנה אותו), זהו אזכור של הערך 0 ו-value_text הוא המילה כפי שנכתבה; "
+    "unit_text היא היחידה כפי שנכתבה, או null; "
     "quote הוא ציטוט מדויק וקצר מתוך הקטע או התא המצוטט, הכולל את הערך ואת היחידה; "
     "source הוא המזהה של הקטע (C#) או של התא בטבלה (T#R#C#) שממנו הציטוט; "
     "attribute_term הן המילים שמכנות את המאפיין עצמו, כפי שנכתבו בציטוט, בכותרת העמודה של התא "
@@ -364,10 +374,6 @@ class Accepted:
     several: bool = False  # the quote states more than one value in the value's dimension
 
 
-def _match_norm(value: str) -> str:
-    return " ".join(base_normalize((value or "").replace("‹", "<").replace("›", ">")).split())
-
-
 def validate_mention(m: Mention, content: VersionContent, attribute: AttributeDef) -> Accepted | str:
     """The accepted mention, or the reason it was rejected."""
     src = content.sources.get(m.source.strip().upper())
@@ -380,7 +386,9 @@ def validate_mention(m: Mention, content: VersionContent, attribute: AttributeDe
     if nq not in _match_norm(src.text) and not (src.context and nq in _match_norm(src.context)):
         return "quote_not_found"
     naming = _naming(m.attribute_term, quote, src, attribute)
-    if isinstance(naming, str):
+    # a measure-word term ("בשטח") may still name the value through the attribute's own words right before it
+    deferred = naming == "generic_term" and attribute.value_type == "numeric"
+    if isinstance(naming, str) and not deferred:
         return naming
     if attribute.value_type != "numeric":
         value = (m.value_text or "").strip(_QUOTE_EDGES)
@@ -389,7 +397,13 @@ def validate_mention(m: Mention, content: VersionContent, attribute: AttributeDe
         return Accepted(m.entity_role, m.entity_descriptor, value, m.unit_text, quote, src, None, None, None,
                         False, naming)
     dimension = attribute.unit_dimension
+    names = _name_words(attribute)
     q = units.parse_mention_quantity(quote, m.value_text, dimension)
+    named = _named_values(quote, dimension)
+    if deferred:
+        if q is None or not any(n.value == q.value and _binds(n.label, "", names, last=_NEAR_WORDS) for n in named):
+            return "generic_term"
+        naming = False
     if dimension == "area" and (q is None or q.unit is None or q.unit.dimension == "length"):
         dims = units.area_from_dimensions(quote, m.value_text)  # W×H lengths: an area by assumption
         if dims is not None:
@@ -401,67 +415,97 @@ def validate_mention(m: Mention, content: VersionContent, attribute: AttributeDe
     if unit is None and src.header_unit is not None and units.parse_mention_quantity(src.text, m.value_text,
                                                                                      dimension) is not None:
         unit = src.header_unit  # a bare number in a cell is measured in its column's (or row label's) unit
+    if unit is None:  # "label (unit): value" in running text names the unit the same way
+        unit = next((n.unit for n in named if n.value == q.value and n.unit is not None), None)
     try:
         conv = units.convert(q.value, unit, attribute.unit_dimension)
     except units.DimensionMismatch:
         return "unit_dimension"
-    several = unit is not None and sum(
-        1 for x in units.find_quantities(quote) if x.unit is not None and x.unit.dimension == unit.dimension) > 1
+    several = unit is not None and _several(named, q.value, unit, src, m.attribute_term, names, dimension)
     return Accepted(m.entity_role, m.entity_descriptor, m.value_text, m.unit_text, quote, src, q.value,
                     unit.code if unit else None, conv.value, conv.assumed, naming, several)
 
 
-# Words that say what is measured, not what the measured thing is ("שטח", "גודל" ...). A naming term made only
-# of these does not tie a number to the attribute: "שטח 94 מ״ר" is not the area of every part of a property.
-GENERIC_MEASURE_WORDS = frozenset(_match_norm(w) for w in (
-    "גודל", "שטח", "מספר", "כמות", "גובה", "אורך", "רוחב", "עומק", "נפח", "שנת", "שנה", "ממוצע", "סך", "סה״כ",
-    "ערך", "מידה", "מידות", "יחידה", "יחידות", "מ״ר", "במ״ר", "מטר", "של", "כולל", "נטו", "ברוטו", "רשום"))
+# A value's own label: the words before it in its segment (cells joined by "|", items by ";", lines) and
+# clause, back to the previous number. "label: value" and "label (unit): value" segments name one value each.
+_SEGMENTS = re.compile(r"[|;\n]")
+_CLAUSES = re.compile(r",\s|\.\s|\.$")
+_NEAR_WORDS = 4  # a measure-word term binds to the attribute's own word only this close before the value
 
 
-_ARTICLES = ("וה", "ה")
+@dataclass(frozen=True)
+class _Named:
+    value: Decimal
+    unit: units.Unit | None  # written after (or before) the number, else in a "label (unit):" label
+    label: str
 
 
-def _forms(word: str) -> set[str]:
-    """A word, its prefix-stripped variants, and the singular/plural forms of the word and of the word without
-    its article ("הכיתות" also names "כיתה"). Other stripped prefixes are not inflected: "מקומות" is not a
-    form of "קומה"."""
-    out = {word, *prefix_variants(word)}
-    for base in [word] + [word[len(a):] for a in _ARTICLES if word.startswith(a) and len(word) - len(a) >= 3]:
-        out.add(base)
-        out.update(inflection_variants(base))
+def _named_values(quote: str, dimension: str | None) -> list[_Named]:
+    out: list[_Named] = []
+    for segment in _SEGMENTS.split(quote or ""):
+        for clause in _CLAUSES.split(base_normalize(segment)):
+            found = units.find_quantities(clause) + (units.find_word_quantities(clause) if dimension == "count"
+                                                     else [])
+            prev = 0
+            for q in sorted(found, key=lambda x: x.start):
+                label = clause[prev:q.start]
+                unit = q.unit or (units.parse_unit(label) if label.rstrip().endswith(":") else None)
+                out.append(_Named(q.value, unit, label))
+                prev = q.end
     return out
 
 
-def _words(text: str) -> list[set[str]]:
-    return [_forms(w) for w in _match_norm(text).split()]
+def _binds(label: str, term: str, names: list[str], *, last: int | None = None) -> bool:
+    """Whether a value's label names the attribute: one of its distinctive words (form or root) is a word of
+    the attribute's names, or it contains the (distinctive) naming term."""
+    words = text_words(label)
+    words = [w for w in (words[-last:] if last else words) if not is_measure_word(w)]
+    if words_share(words, names, roots=True):
+        return True
+    nt = _match_norm(term.strip(_QUOTE_EDGES))
+    return bool(nt and distinctive_words(nt) and nt in _match_norm(label))
 
 
-def _distinctive(text: str) -> list[set[str]]:
-    return [v for v in _words(text) if not (v & GENERIC_MEASURE_WORDS)]
+def _several(named: list[_Named], value: Decimal, unit: units.Unit, src: Source, term: str, names: list[str],
+             dimension: str | None) -> bool:
+    """Whether the quote states several values of the value's dimension with nothing that singles this one
+    out. A value is singled out when it is the only one whose own label names the attribute (a table row
+    rendered as text: "קומה: 3 | שטח X (מ״ר): 92 | שטח Y (מ״ר): 9.5"), or when it is a table cell whose
+    header or row label names the attribute and whose own text holds one value."""
+    same = [n for n in named if n.unit is not None and n.unit.dimension == unit.dimension]
+    if len(same) <= 1:
+        return False
+    if src.col is not None and src.label and words_share(distinctive_words(src.label), names, roots=True) and \
+            len(_named_values(src.text, dimension)) <= 1:
+        return False
+    bound = [n for n in same if _binds(n.label, term, names)]
+    return not (len(bound) == 1 and bound[0].value == value)
 
 
-def _shares(words: list[set[str]], name_words: list[set[str]]) -> bool:
-    return any(t & n for t in words for n in name_words)
+def _name_words(attribute: AttributeDef) -> list[str]:
+    return [w for name in [attribute.label, *attribute.aliases] for w in distinctive_words(name)]
 
 
 def _naming(term: str, quote: str, src: Source, attribute: AttributeDef) -> bool | str:
     """Whether the mention names the attribute. Returns the rejection reason, or ``synonym``: False when the
     term, or the cited cell's own label (column header and row label), shares a distinctive word with the
-    attribute's names; True when it is another phrasing (a value named that way goes to review, never
-    straight into a figure). The cell label names a value structurally; a quote's other words never do."""
+    attribute's names (the same word in another form, or a word of the same root: a verb and its noun);
+    True when it is another phrasing (a value named that way goes to review, never straight into a figure).
+    The cell label names a value structurally; a quote's other words name it only as the value's own label
+    (``validate_mention``)."""
     nt = _match_norm(term.strip(_QUOTE_EDGES))
     where = _match_norm(quote) + " " + _match_norm(src.context or "")
     if not nt or nt not in where:
         return "attribute_term_not_found"
-    term_words = _distinctive(nt)
+    term_words = distinctive_words(nt)
     names = [attribute.label, *attribute.aliases]
-    name_words = [w for name in names for w in _distinctive(name)]
-    if src.label and _shares(_distinctive(src.label), name_words):
+    name_words = _name_words(attribute)
+    if src.label and words_share(distinctive_words(src.label), name_words, roots=True):
         return False
     if not term_words:
-        generic_names = [name for name in names if not _distinctive(name)]
+        generic_names = [name for name in names if not distinctive_words(name)]
         return False if any(_match_norm(n) in where for n in generic_names) else "generic_term"
-    return not _shares(term_words, name_words)
+    return not words_share(term_words, name_words, roots=True)
 
 
 def _value_key(a: Accepted):

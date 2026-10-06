@@ -4,7 +4,15 @@ from decimal import Decimal
 
 import pytest
 
-from app.answering.attributes import STRUCTURED_ATTRIBUTES, canonical_unit_for, labels_match, proposed_key
+from app.answering.attributes import (
+    STRUCTURED_ATTRIBUTES,
+    canonical_unit_for,
+    distinctive_words,
+    labels_match,
+    proposed_key,
+    share_root,
+    words_share,
+)
 from app.answering.conditions import QueryConditions
 from app.answering.templates import structured_text
 from app.appraisal.query import (
@@ -36,6 +44,36 @@ def test_prefix_and_article_normalization_matches(a, b):
 ])
 def test_different_labels_never_match(a, b):
     assert not labels_match(a, b)
+
+
+@pytest.mark.parametrize(("a", "b"), [
+    ("נבנה", "בנייה"),      # a verb and its noun
+    ("נבנה", "הבנייה"),     # with the article
+    ("שופץ", "שיפוץ"),
+    ("משופצת", "שיפוץ"),    # a participle
+    ("הושלם", "השלמת"),
+])
+def test_words_of_one_root_share_it(a, b):
+    assert share_root(a, b) and share_root(b, a)
+
+
+@pytest.mark.parametrize(("a", "b"), [
+    ("מחסן", "מחיר"),       # two letters in common are not a root
+    ("בנק", "בנייה"),
+    ("המחיר", "המחסן"),     # a shared article is not a shared root
+    ("במחיר", "במחסן"),
+    ("הבניין", "הבנייה"),   # building vs construction: other third letter once the article goes
+    ("גג", "גגות"),         # too short for a root comparison
+])
+def test_unrelated_words_do_not_share_a_root(a, b):
+    assert not share_root(a, b) and not share_root(b, a)
+
+
+def test_distinctive_words_ignore_punctuation_numbers_and_measure_words():
+    """GQ28: a column header "שטח (מ״ר)" is only measure words, not another name of the attribute."""
+    assert distinctive_words("שטח (מ״ר):") == []
+    assert distinctive_words("שטח הממ״ד (מ״ר): 9.5") == ["הממ״ד"]
+    assert words_share(["הממ״ד"], ["ממ״ד"]) and not words_share(["דירה"], ["ממ״ד"], roots=True)
 
 
 def test_proposed_key_is_stable_under_normalization():

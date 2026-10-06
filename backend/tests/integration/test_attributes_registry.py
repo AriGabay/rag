@@ -108,6 +108,32 @@ def test_article_variant_matches_and_similar_label_stays_separate(offices):
     assert count_defs(a, "source = 'extracted'") == 2
 
 
+def test_a_handle_of_another_dimension_is_ignored_for_the_description(offices):
+    """GQ29: asked "the balconies' area", the interpreter chose the handle of "the number of balconies": the
+    plan's own dimension contradicts the handle, so the description resolves (here to its exact definition)."""
+    a, _ = offices
+    count = resolve(a, "מספר המרפסות", unit_dimension="count")
+    area = resolve(a, "שטח המרפסות", unit_dimension="area")
+    shown = {h["id"]: h["handle"] for h in handles(a)}
+    got = resolve(a, "שטח המרפסות", handle=shown[count.id], unit_dimension="area")
+    assert (got.id, got.unit_dimension) == (area.id, "area")
+    assert resolve(a, "מספר המרפסות", handle=shown[count.id], unit_dimension="count").id == count.id
+    # "price" is a loose word for a price per m², not a conflict
+    ppsm = next(h for h in handles(a) if h["key"] == "price_per_sqm")
+    assert resolve(a, "מחיר ממוצע למטר", handle=ppsm["handle"], unit_dimension="price").key == "price_per_sqm"
+
+
+def test_a_handle_sharing_no_word_with_a_description_of_another_definition_is_ignored(offices):
+    a, _ = offices
+    storage = resolve(a, "שטח המחסן")
+    yard = resolve(a, "שטח החצר")
+    shown = {h["id"]: h["handle"] for h in handles(a)}
+    assert resolve(a, "שטח החצר", handle=shown[storage.id]).id == yard.id
+    # a synonym that shares no word but names no other definition stays the interpreter's match (KTD7)
+    assert resolve(a, "גודל מקום האחסון", handle=shown[storage.id]).id == storage.id
+    assert count_defs(a, "source = 'extracted'") == 2
+
+
 def test_unknown_handle_falls_back_to_description(offices):
     a, _ = offices
     attr = resolve(a, "שטח מרפסת", handle="A99")

@@ -1,5 +1,7 @@
 """Claims-first answer composition (KTD11, R22–R24): the server renders text from verified claims."""
 
+import re
+
 import pytest
 
 from app.answering.compose import (
@@ -330,12 +332,33 @@ CONFLICT_Q = "האם יש סתירה בין השומות לגבי שנת הבנ�
 
 
 def test_a_two_sided_answer_citing_one_document_is_incomplete():
-    """GQ26/GQ27: evidence from two documents, the answer cites one: not presented as complete."""
+    """GQ26/GQ27 (AE6): evidence from two documents, the answer says nothing from one: not presented as
+    complete."""
     p = scripted(answer(claim("הבניין נבנה בשנת 1962.", ["E2"])), verdicts("supported"))
     out = compose_answer(p, CONFLICT_Q, YEARS, two_sided=True)
     assert out.incomplete and not out.cacheable and out.uncovered == ["שומה בן יהודה 2022"]
     assert any("נמצאה ראיה רק מצד אחד" in lim and "שומה בן יהודה 2022" in lim for lim in out.limitations)
     assert "שתי השומות" in p.calls[0].instructions or "כל מסמך" in p.calls[0].instructions
+
+
+def test_a_side_whose_claim_failed_verification_is_quoted_from_its_passage():
+    """GQ24: the model answered from both sides, verification dropped one side's claim; that side is shown by
+    the passage the model used, quoted and labeled, so the answer shows both sides (R10)."""
+    p = scripted(answer(claim("הבניין נבנה בשנת 1958, לפני השיפוץ.", ["E1"]), claim("הבניין נבנה בשנת 1962.", ["E2"])),
+                 verdicts("unsupported", "supported"))
+    out = compose_answer(p, CONFLICT_Q, YEARS, two_sided=True)
+    assert not out.incomplete and out.cacheable and out.uncovered == [] and out.dropped == 1
+    assert out.claims[-1] == {"text": YEARS[0]["snippet"], "kind": "explicit", "evidence_ids": ["E1"]}
+    assert f"שומה בן יהודה 2022: ציטוט מהמסמך: „{YEARS[0]['snippet']}” [E1]" in out.text
+    assert any("שומה בן יהודה 2022" in lim and "כלשונו" in lim for lim in out.limitations)
+
+
+def test_a_two_sided_answer_with_evidence_from_one_document_is_incomplete():
+    one = [YEARS[1], ev(3, "שנת בנייה | 1962", title="שומה בן יהודה 2023")]
+    p = scripted(answer(claim("הבניין נבנה בשנת 1962.", ["E2"])), verdicts("supported"))
+    out = compose_answer(p, CONFLICT_Q, [{**e, "document_id": "d2"} for e in one], two_sided=True)
+    assert out.incomplete and not out.cacheable
+    assert any("נמצאה ראיה רק מצד אחד" in lim and "לא נמצאו ראיות ממסמך נוסף" in lim for lim in out.limitations)
 
 
 def test_a_two_sided_answer_citing_both_documents_is_complete():
@@ -360,6 +383,32 @@ def test_compare_answer_citing_one_side_is_incomplete():
                               ).on(Purpose.VERIFY, verdicts("supported"))
     out = compose_answer(p, "אילו הנחות השתנו?", sides, compare=True)
     assert out.incomplete and out.uncovered == ["גרסה 1"] and not out.cacheable
+
+
+def test_compare_answer_with_a_dropped_claim_quotes_that_side():
+    """GQ24: the old version's claim carried a number its passage does not state (layer 1 drops it); the old
+    version is shown by the passage the model cited, labeled with its version."""
+    sides = [ev(1, "הנכס בקומה שנייה.", label="גרסה 1"), ev(2, "שיעור ההתאמה לגודל הוא 7%.", label="גרסה 2"),
+             ev(3, "שיעור ההתאמה לגודל הוא 5%.", label="גרסה 1")]
+    p = ScriptedProvider().on(Purpose.ANSWER, {**answer(claim("שיעור ההתאמה לגודל הוא 4%", ["E3"]),
+                                                       claim("שיעור ההתאמה לגודל הוא 7%", ["E2"])), "conflicts": []}
+                              ).on(Purpose.VERIFY, verdicts("supported"))
+    out = compose_answer(p, "אילו הנחות השתנו?", sides, compare=True)
+    assert not out.incomplete and out.uncovered == [] and out.cacheable
+    assert [c["evidence_ids"] for c in out.claims] == [["E2"], ["E3"]]  # the passage the model used, not E1
+    assert out.text.splitlines()[-1] == "גרסה 1: ציטוט מהמסמך: „שיעור ההתאמה לגודל הוא 5%.” [E3]"
+
+
+def test_a_comparison_that_falls_back_to_the_passages_quotes_every_side():
+    """GQ24 (real run): every claim was dropped and the fallback listed four passages of one version only."""
+    sides = [ev(i, f"קטע {i} של גרסה 1.", label="גרסה 1") for i in (1, 2, 3, 4)] + [
+        ev(5, "שיעור ההתאמה 6%.", label="גרסה 2"), ev(6, "קטע נוסף.", label="גרסה 2")]
+    p = ScriptedProvider().on(Purpose.ANSWER, {**answer(claim("שיעור ההתאמה 9%", ["E5"])), "conflicts": []})
+    out = compose_answer(p, "האם שיעור ההתאמה השתנה?", sides, compare=True)
+    assert out.provider == "extractive"
+    assert re.findall(r"\[(E\d+)\]", out.text) == ["E1", "E5", "E2", "E6"]
+    plain = compose_answer(None, "q", sides)  # not a comparison: rank order as before
+    assert re.findall(r"\[(E\d+)\]", plain.text) == ["E1", "E2", "E3", "E4"]
 
 
 # --- Real model (opt-in) ----------------------------------------------------------------------------------

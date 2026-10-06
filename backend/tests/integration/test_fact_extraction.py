@@ -734,3 +734,100 @@ def test_a_quote_with_several_values_of_the_dimension_goes_to_review(office):
     script(p, "דוח", mention(sentence, "12", term="מרפסת סלון"))
     comp = extract(office.ctx(), attr, p)
     assert comp.preliminary is None and comp.coverage["awaiting_review"] == 1
+
+
+# --- improvement round 3 (real-model sample 3: GQ28, GQ29, GQ31, GQ33-36) ----------------------------------
+
+ROW = "קומה: 3 | שטח דירה (מ״ר): 92 | שטח ממ״ד (מ״ר): 9.5"
+
+
+def test_a_table_row_quote_singles_out_the_value_its_own_label_names(office):
+    """GQ28/GQ35: a table row rendered as text states several areas; the one whose own "label (unit):" names
+    the attribute is unambiguous, and its unit comes from that label."""
+    attr = make_attr(office)
+    p = ScriptedProvider()
+    add_doc(office, office.default_group_id, "דוח", [ROW])
+    script(p, "דוח", mention(ROW, "9.5", unit=None, term="שטח ממ״ד"))
+    comp = extract(office.ctx(), attr, p)
+    assert comp.preliminary is not None and comp.preliminary.values == [Decimal("9.5")]
+    assert facts_rows(office, attr)[0].status == "auto_validated"
+
+
+def test_a_value_its_own_label_does_not_name_stays_for_review(office):
+    """The same row, with the apartment's area reported as the attribute: the only value the row names as the
+    attribute is another one, so the quote is ambiguous for this value."""
+    attr = make_attr(office)
+    p = ScriptedProvider()
+    add_doc(office, office.default_group_id, "דוח", [ROW])
+    script(p, "דוח", mention(ROW, "92", unit=None, term="שטח ממ״ד"))
+    comp = extract(office.ctx(), attr, p)
+    assert comp.preliminary is None and comp.coverage["awaiting_review"] == 1
+    assert facts_rows(office, attr)[0].status == "needs_review"
+
+
+def test_a_cell_named_by_its_header_is_its_own_value_in_a_quoted_row(office):
+    """A cell of a measured column: its header names the attribute; a quote that also carries the row's other
+    area does not make it ambiguous."""
+    attr = make_attr(office)
+    p = ScriptedProvider()
+    table = TableResult(0, ["כתובת", "שטח דירה", "שטח ממ״ד"], [None, "מ״ר", "מ״ר"],
+                        [TableRow(1, ["המעגל 7", "92", "9.5"])], 1, 1, section="נתונים")
+    add_doc(office, office.default_group_id, "דוח", ["פתיח"], tables=[table])
+    script(p, "דוח", mention("שטח ממ״ד (מ״ר): 9.5", "9.5", source="T1R1C3", unit=None, term="שטח ממ״ד"))
+    comp = extract(office.ctx(), attr, p)
+    assert comp.preliminary is not None and comp.preliminary.values == [Decimal("9.5")]
+
+
+def test_a_column_header_of_measure_words_names_no_attribute(office):
+    """GQ28: comparables' "שטח (מ״ר)" cells were accepted for review as another phrasing of the attribute
+    (the parenthesis read as a word); a header of measure words only is no naming at all."""
+    attr = make_attr(office)
+    p = ScriptedProvider()
+    table = TableResult(0, ["כתובת", "שטח (מ״ר)"], [None, "מ״ר"], [TableRow(1, ["השקד 7", "82"])], 1, 1,
+                        section="עסקאות השוואה")
+    add_doc(office, office.default_group_id, "דוח", ["פתיח"], tables=[table])
+    script(p, "דוח", mention("שטח (מ״ר): 82", "82", source="T1R1C2", unit=None, role="comparable",
+                             term="שטח (מ״ר)"))
+    comp = extract(office.ctx(), attr, p)
+    assert comp.coverage["found"] == 0 and comp.coverage["awaiting_review"] == 0
+    assert comp.coverage["mentions_rejected"] == 1
+
+
+def test_a_naming_term_of_the_same_root_is_not_another_phrasing(office):
+    """GQ33/GQ34: "הבניין נבנה בשנת 1958" names "שנת הבנייה" in a verb form; a term with no shared root still
+    goes to review."""
+    attr = make_attr(office, "שנת הבנייה של הבניין", "year")
+    p = ScriptedProvider()
+    add_doc(office, office.default_group_id, "א", ["הבניין נבנה בשנת 1958."])
+    add_doc(office, office.default_group_id, "ב", ["הבניין אוכלס בשנת 1972."])
+    script(p, "א", mention("נבנה בשנת 1958", "1958", unit=None, term="נבנה בשנת"))
+    script(p, "ב", mention("אוכלס בשנת 1972", "1972", unit=None, term="אוכלס בשנת"))
+    comp = extract(office.ctx(), attr, p, operation="min")
+    assert comp.preliminary is not None and comp.preliminary.values == [Decimal("1958")]
+    assert comp.coverage["awaiting_review"] == 1
+
+
+def test_a_measure_word_term_binds_to_the_attribute_word_right_before_the_value(office):
+    """GQ29: "לדירה מרפסת חזית בשטח 7 מ״ר" with the term "בשטח" was rejected; the attribute's own word right
+    before the value names it. The same word in an earlier clause does not."""
+    attr = make_attr(office, "שטח המרפסות", "area")
+    p = ScriptedProvider()
+    add_doc(office, office.default_group_id, "א", ["לדירה מרפסת חזית בשטח 7 מ״ר."])
+    add_doc(office, office.default_group_id, "ב", ["לדירה מרפסת, שטח הדירה 94 מ״ר."])
+    script(p, "א", mention("לדירה מרפסת חזית בשטח 7 מ״ר", "7", term="בשטח"))
+    script(p, "ב", mention("לדירה מרפסת, שטח הדירה 94 מ״ר", "94", term="שטח"))
+    comp = extract(office.ctx(), attr, p)
+    assert comp.preliminary is not None and comp.preliminary.values == [Decimal("7")]
+    assert comp.coverage["mentions_rejected"] == 1
+
+
+def test_the_extraction_prompt_asks_for_a_stated_absence_as_zero(office):
+    """GQ31: "חניה | אין" was never reported; the instructions say a stated absence of a count is the value 0,
+    and the server reads it as zero from a key-value cell."""
+    assert "הערך 0" in facts.EXTRACT_POLICY
+    attr = make_attr(office, "מספר מקומות חניה", "count")
+    p = ScriptedProvider()
+    add_doc(office, office.default_group_id, "דוח", ["פתיח"], tables=[kv_table([["חניה", "אין"]])])
+    script(p, "דוח", mention("אין", "אין", source="T1R1C2", unit=None, term="חניה"))
+    comp = extract(office.ctx(), attr, p)
+    assert comp.preliminary is not None and comp.preliminary.values == [Decimal("0")]

@@ -72,6 +72,11 @@ _TOOL_CLARIFICATION = ("(e) the clarification is raised by the tool, so the plan
 _REVIEW_TIER = ("(c) the server routes these values to review (several values in one version, a synonym or "
                 "plural naming term, an inferred unit), so no reviewed or preliminary figure exists")
 _REJECTED = "(c) server validation rejects a stated value: {why}"
+_SUM_IN_QUOTE = ("(c)/(e) H4 states two balcony areas in one quote (12 and 6 מ״ר) and the answer key takes their sum "
+                 "(18) per apartment; the server never adds values inside a quote, so that version goes to review "
+                 "and only H5's value is observed")
+_OTHER_VERB = ("(c) {docs} name the year by another verb, not a form or root of the attribute's words; another "
+               "phrasing goes to review, so {n} values are observed")
 KNOWN_GAPS: dict[str, str] = {
     "GQ51": _TOOL_CLARIFICATION.format(task="compute"),
     "GQ52": _TOOL_CLARIFICATION.format(task="compute"),
@@ -79,8 +84,12 @@ KNOWN_GAPS: dict[str, str] = {
     "GQ35": _REJECTED.format(why="H3's inner dimensions in cm go to review, so 2 of the 3 values are observed"),
     "GQ40": _REJECTED.format(why="a renovation is an event, not a quantity: 'no changes' (H1) has no year and "
                                  "another stated year is not accepted, so 3 of the 5 values are observed"),
-    "GQ36": _REJECTED.format(why="counts written as words (שתי מרפסות) are not parsed as values"),
-    **{i: _REVIEW_TIER for i in ("GQ29", "GQ33", "GQ34", "GQ39", "GQ49")},
+    "GQ36": _REJECTED.format(why="H5 states its one balcony only by a singular noun (מרפסת חזית בשטח 7 מ״ר); "
+                                 "no number or number word is quoted, so 1 of the 2 values is observed"),
+    **{i: _SUM_IN_QUOTE for i in ("GQ29", "GQ49")},
+    "GQ33": _OTHER_VERB.format(docs="H2 (ואוכלס בשנת 2015) and H3 (הבניין הושלם בשנת 2004)", n="6 of the 8"),
+    "GQ34": _OTHER_VERB.format(docs="H2 (ואוכלס בשנת 2015)", n="3 of the 4"),
+    "GQ39": _REVIEW_TIER,
     "GQ37": ("(a)/(d) without cloud use the question is planned as an answer (search) and the passages come "
              "with no abstention_kind; the file expects compute + not_extracted_or_verified"),
 }
