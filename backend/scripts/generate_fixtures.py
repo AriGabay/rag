@@ -2843,6 +2843,992 @@ def write_general(out: Path, font_dir: Path, reports: list[Report], layouts: dic
     return general_section(docs, entries, facts, _existing_mentions(reports, layouts))
 
 
+# --------------------------------------------------------------------------- held-out general corpus v2 (U12)
+#
+# A second, separate held-out set written after the first improvement rounds, on topics none of the earlier
+# fixtures, questions or fixes covered: income-producing and land appraisals (rent, lease term, CPI
+# indexation, capitalization rate, vacancy allowance, occupancy), plot data (plot area, coverage, setback
+# lines, access road width), registry entries (warning notes, easements), condition (maintenance score,
+# energy rating, noise), and the cost approach (construction cost per m2, depreciation). Office A, group G4
+# "ידע כללי ב", directory tests/fixtures/holdout_v2/. Like the first held-out corpus the documents produce NO
+# records (no "שווי הנכס:" label, no table with a price or value column). The answer key is written to its
+# own file, tests/fixtures/holdout_v2_truth.yaml, so ground_truth.yaml and every existing fixture stay
+# byte-identical.
+
+HOLDOUT_V2_DIR = "holdout_v2"
+HOLDOUT_V2_TRUTH = "holdout_v2_truth.yaml"
+HOLDOUT_V2_GROUP = {"code": "G4", "name": "ידע כללי ב"}
+HOLDOUT_V2_ATTRIBUTES = {
+    "monthly_rent": {"label_he": "דמי שכירות חודשיים", "unit": "ILS/month"},
+    "rent_per_sqm": {"label_he": "דמי שכירות למ״ר לחודש", "unit": "ILS/m2/month"},
+    "lease_term": {"label_he": "תקופת השכירות", "unit": "year"},
+    "indexation": {"label_he": "הצמדה למדד המחירים לצרכן", "unit": None},
+    "leased": {"label_he": "הנכס מושכר", "unit": None},
+    "occupancy_rate": {"label_he": "שיעור תפוסה", "unit": "percent"},
+    "cap_rate": {"label_he": "שיעור היוון", "unit": "percent"},
+    "vacancy_allowance": {"label_he": "ניכוי בגין אובדן הכנסות", "unit": "percent"},
+    "plot_area": {"label_he": "שטח המגרש", "unit": "m2"},
+    "building_coverage": {"label_he": "תכסית", "unit": "percent"},
+    "setback_front": {"label_he": "קו בניין קדמי", "unit": "m"},
+    "setback_side": {"label_he": "קו בניין צדדי", "unit": "m"},
+    "setback_rear": {"label_he": "קו בניין אחורי", "unit": "m"},
+    "access_road_width": {"label_he": "רוחב דרך הגישה", "unit": "m"},
+    "warning_notes": {"label_he": "מספר הערות אזהרה רשומות", "unit": "count"},
+    "easement": {"label_he": "זיקת הנאה רשומה", "unit": None},
+    "maintenance_score": {"label_he": "ציון תחזוקה (1 עד 5)", "unit": "score"},
+    "energy_rating": {"label_he": "דירוג אנרגטי", "unit": None},
+    "noise_level": {"label_he": "מפלס רעש", "unit": "dB"},
+    "units_in_building": {"label_he": "מספר יחידות בבניין", "unit": "count"},
+    "construction_cost": {"label_he": "עלות בנייה למ״ר", "unit": "ILS/m2"},
+    "depreciation_rate": {"label_he": "שיעור פחת", "unit": "percent"},
+}
+# Terms scanned in every earlier fixture (D*, DB1, H*) so answers over all documents know what they say.
+V2_MENTION_PATTERNS = {
+    "maintenance": (r"תחזוק",),
+    "noise": (r"רעש",),
+    "nuisance": (r"מטרד",),
+    "plot": (r"מגרש",),
+    "indexation": (r"הצמדה", r"צמוד"),
+    "rent": (r"שכירות", r"שוכר", r"מושכר", r"השכר"),
+    "cap_rate": (r"היוון", r"הוונ", r"תשואה"),
+    "registry": (r"הערות", r"הערת", r"שעבוד", r"זיקת", r"זיקות"),
+    "depreciation": (r"(?<![א-ת])[והבלמש]?פחת(?![א-ת])", r"בלאי"),
+    "construction_cost": (r"(?<![א-ת])[והבלמש]?(?:עלות|עלויות)(?![א-ת])",),  # not "הבעלות" (ownership)
+    "occupancy": (r"תפוסה",),
+    "energy": (r"אנרגטי",),
+    "road_width": (r"רוחב", r"דרך גישה"),
+    "units": (r"יחידות דיור", r"יח״ד"),
+    "coverage": (r"תכסית",),
+    "setback": (r"קו בניין", r"קווי בניין"),
+}
+V2_FALSE_FRIENDS = {
+    "הצמדה בלעדית": "exclusive attachment of a yard to a unit, not CPI indexation",
+    "צמוד": "'attached' (a parking space or storage room attached to a unit), not CPI indexation",
+    "המרחב הציבורי": "maintenance of the public space around the property, not the property's maintenance score",
+    "מטרדיים": "a general statement that no nuisance uses were found, without a measured noise level",
+    "ההערות הרשומות": "the generic list of information sources (a registry extract), not a warning note",
+}
+
+
+@dataclass
+class V2Doc(GeneralDoc):
+    """A v2 held-out document: free property-type label, optional area line, own opening and summary."""
+
+    ptype_label: str = ""
+    area_line: str | None = None
+    client: str = ""
+    appraiser: str = "אורי כהן (שם בדוי)"
+
+    def header_lines(self) -> list[str]:
+        gp = f"גוש: {self.block} חלקה: {self.parcel}"
+        if self.sub_parcel is not None:
+            gp += f" תת חלקה: {self.sub_parcel}"
+        lines = [
+            f"עיר: {self.city}",
+            f"שכונה: {self.neighborhood}",
+            f"כתובת הנכס: {self.address}",
+            gp,
+            f"סוג נכס: {self.ptype_label}",
+            f"המועד הקובע: {fmt_date(self.valuation_date)}",
+            f"תאריך עריכת השומה: {fmt_date(self.report_date)}",
+        ]
+        if self.area_line:
+            lines.append(f"שטח הנכס: {self.area_line}")
+        return lines
+
+    def all_sections(self) -> list[tuple[str, list[GPara | GTable]]]:
+        intro = GPara(
+            f"חוות דעת זו נערכה לבקשת {self.client} לצורך {self.purpose}. "
+            f"{SYNTHETIC_MARKER}: השמות, החברות, הכתובות והמספרים בדויים."
+        )
+        summary = [
+            GPara(f"בהתחשב בכל האמור, שווי הזכויות בנכס הוערך ב-{fmt_int(self.value)} ₪ נכון למועד הקובע."),
+            GPara(f"השמאי: {self.appraiser}, שמאי מקרקעין. {SYNTHETIC_MARKER} — אין להסתמך עליו."),
+        ]
+        environment = [("הסביבה", [GPara(t) for t in self.environment])] if self.environment else []
+        return [("כללי", [intro]), *environment, *self.sections, ("סיכום", summary)]
+
+
+def build_holdout_v2_docs() -> list[V2Doc]:
+    def doc(**kw: Any) -> V2Doc:
+        return V2Doc(kind=kw.pop("kind", "pdf_digital"), **kw)
+
+    k1 = doc(
+        id="K1",
+        filename="K1_synthetic_telaviv_habarzel_office.pdf",
+        title_place="הברזל 31, תל אביב-יפו",
+        city="תל אביב-יפו",
+        neighborhood="רמת החייל",
+        address="הברזל 31",
+        block=6638,
+        parcel=112,
+        sub_parcel=9,
+        ptype="office",
+        ptype_label="משרדים",
+        area=dec(420),
+        area_line="420 מ״ר ברוטו",
+        valuation_date=date(2024, 5, 12),
+        report_date=date(2024, 5, 20),
+        client="חברת אחזקות דמו בע״מ (בדויה)",
+        purpose="בחינת שווי לצורך מימון",
+        value=dec(6590000),
+        subject_key="תל אביב-יפו|6638/112/9",
+        environment=[
+            "אזור התעסוקה רמת החייל ממוקם בצפון-מזרח תל אביב-יפו, ובו בנייני משרדים רבים של חברות טכנולוגיה, "
+            "מסעדות ושירותים עסקיים.",
+            "הנגישות לאזור טובה: דרך נמיר ונתיבי איילון סמוכים, וקווי אוטובוס רבים עוברים ברחובות הסמוכים.",
+            "הביקוש לשטחי משרדים באזור יציב, אך היצע השטחים הפנויים גדל בשנים האחרונות.",
+        ],
+        notes="Tel Aviv office floor, income approach. Lease 5 years, 85 per m2, CPI-linked; key/value table "
+        "(monthly rent 35,700, occupancy 92%, 36 office units, maintenance 4, energy B); cap rate 6.5%; no vacancy "
+        "allowance. States no plot data, road width, noise or registry entries.",
+        sections=[
+            (
+                "תיאור הנכס",
+                [
+                    GPara(
+                        "הנכס הנישום הוא קומת משרדים שלמה (קומה 11) בבניין משרדים בן 16 קומות ברחוב הברזל. "
+                        "הקומה מחולקת לחדרי עבודה, חדר ישיבות ומטבחון."
+                    ),
+                    GPara(
+                        "הקומה מושכרת לשוכר יחיד, חברת טכנולוגיה (בדויה), לתקופה של 5 שנים עם אופציה להארכה "
+                        "ב-5 שנים נוספות. דמי השכירות עומדים על 85 ₪ למ״ר לחודש וצמודים למדד המחירים לצרכן.",
+                        [
+                            GFact("leased", True, "הקומה מושכרת לשוכר יחיד"),
+                            GFact("lease_term", 5, "לתקופה של 5 שנים", unit="year",
+                                  note="plus an option for 5 more years"),
+                            GFact("rent_per_sqm", "85", "85 ₪ למ״ר לחודש", unit="ILS/m2/month"),
+                            GFact("indexation", True, "וצמודים למדד המחירים לצרכן"),
+                        ],
+                    ),
+                    GTable(
+                        "נתוני הבניין והשכירות",
+                        ["נתון", "ערך"],
+                        [100, 80],
+                        [
+                            ["דמי שכירות חודשיים לקומה (₪)", "35,700"],
+                            ["שיעור תפוסה בבניין", "92%"],
+                            ["מספר יחידות משרד בבניין", "36"],
+                            ["ציון תחזוקה (1 עד 5)", "4"],
+                            ["דירוג אנרגטי של הבניין", "B"],
+                        ],
+                        [
+                            GFact("monthly_rent", "35700", "35,700", unit="ILS/month", cell=(0, 1)),
+                            GFact("occupancy_rate", "92", "92%", unit="percent", entity="building", cell=(1, 1)),
+                            GFact("units_in_building", 36, "36", unit="count", entity="building", cell=(2, 1),
+                                  note="office units"),
+                            GFact("maintenance_score", 4, "4", unit="score", entity="building", cell=(3, 1)),
+                            GFact("energy_rating", "B", "B", entity="building", cell=(4, 1)),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "גישת השומה והנחות",
+                [
+                    GPara(
+                        "השומה נערכה בגישת היוון ההכנסות. ההכנסה השנתית מהקומה הוונה בשיעור היוון של 6.5%, "
+                        "המשקף את מיקום הבניין, את איכות השוכר ואת יתרת תקופת השכירות.",
+                        [GFact("cap_rate", "6.5", "בשיעור היוון של 6.5%", unit="percent")],
+                    ),
+                    GPara(
+                        "בשל התפוסה הגבוהה בבניין ואיכות השוכר לא הובא בחשבון ניכוי בגין אובדן הכנסות.",
+                        [GFact("vacancy_allowance", "0", "לא הובא בחשבון ניכוי בגין אובדן הכנסות", unit="percent",
+                               note="explicitly none")],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    k2 = doc(
+        id="K2",
+        filename="K2_synthetic_petahtikva_hasivim_offices.pdf",
+        title_place="הסיבים 40, פתח תקווה",
+        city="פתח תקווה",
+        neighborhood="קריית מטלון",
+        address="הסיבים 40",
+        block=6371,
+        parcel=84,
+        sub_parcel=None,
+        ptype="office",
+        ptype_label="בניין משרדים",
+        area=dec(2600),
+        area_line="2,600 מ״ר ברוטו",
+        valuation_date=date(2024, 2, 1),
+        report_date=date(2024, 2, 15),
+        client="בנק דמו בע״מ (בדוי)",
+        purpose="מימון בנקאי",
+        value=dec(24000000),
+        subject_key="פתח תקווה|6371/84",
+        notes="Petah Tikva office building. Plot 3,050 m2, coverage 40%, road 20 m, one warning note; income "
+        "table (occupancy 75%, 62 per m2, vacancy allowance 10%, maintenance 3, energy C); rent stated per YEAR "
+        "(1,450,800 = 120,900 a month); cap rate 7.25%. No lease term, indexation or units count.",
+        sections=[
+            (
+                "תיאור הנכס",
+                [
+                    GPara(
+                        "הנכס הנישום הוא בניין משרדים בן שש קומות מעל קומת קרקע מסחרית, על מגרש בשטח 3,050 מ״ר. "
+                        "הבניין תוכנן כבניין משרדים להשכרה ומנוהל על ידי חברת ניהול (בדויה).",
+                        [GFact("plot_area", "3050", "מגרש בשטח 3,050 מ״ר", unit="m2", entity="plot")],
+                    ),
+                    GPara(
+                        "הגישה לבניין היא מרחוב הסיבים, דרך עירונית ברוחב 20 מ׳ הכוללת מדרכות רחבות.",
+                        [GFact("access_road_width", "20", "ברוחב 20 מ׳", unit="m", entity="plot")],
+                    ),
+                    GPara(
+                        "התכסית הקיימת של הבניין היא 40% משטח המגרש.",
+                        [GFact("building_coverage", "40", "התכסית הקיימת של הבניין היא 40%", unit="percent",
+                               entity="plot", note="existing coverage")],
+                    ),
+                ],
+            ),
+            (
+                "מצב משפטי",
+                [
+                    GPara(
+                        "על פי נסח הרישום רשומה על החלקה הערת אזהרה אחת לטובת בנק דמו בע״מ (בדוי), בגין "
+                        "התחייבות לרישום משכנתה.",
+                        [GFact("warning_notes", 1, "רשומה על החלקה הערת אזהרה אחת", unit="count", entity="plot")],
+                    ),
+                ],
+            ),
+            (
+                "נתוני ההכנסה",
+                [
+                    GTable(
+                        "ריכוז נתוני ההכנסה",
+                        ["פרמטר", "ערך", "הערה"],
+                        [70, 40, 70],
+                        [
+                            ["שטח להשכרה (מ״ר ברוטו)", "2,600", "לפי תשריט הבניין"],
+                            ["שיעור תפוסה", "75%", "נכון למועד הביקור"],
+                            ["דמי שכירות למ״ר לחודש (₪)", "62", "ממוצע משוקלל"],
+                            ["ניכוי בגין אובדן הכנסות", "10%", "הנחת השמאי"],
+                            ["ציון תחזוקה (1 עד 5)", "3", "נדרשת החלפת מערכות מיזוג"],
+                            ["דירוג אנרגטי", "C", "לפי תעודה משנת 2021"],
+                        ],
+                        [
+                            GFact("occupancy_rate", "75", "75%", unit="percent", entity="building", cell=(1, 1)),
+                            GFact("rent_per_sqm", "62", "62", unit="ILS/m2/month", cell=(2, 1)),
+                            GFact("vacancy_allowance", "10", "10%", unit="percent", cell=(3, 1)),
+                            GFact("maintenance_score", 3, "3", unit="score", entity="building", cell=(4, 1)),
+                            GFact("energy_rating", "C", "C", entity="building", cell=(5, 1)),
+                        ],
+                    ),
+                    GPara(
+                        "ההכנסה השנתית בפועל מדמי השכירות בבניין מסתכמת ב-1,450,800 ₪ לשנה.",
+                        [GFact("monthly_rent", "1450800", "1,450,800 ₪ לשנה", unit="ILS/year",
+                               normalized={"value": "120900", "unit": "ILS/month"},
+                               note="stated per year for the whole building")],
+                    ),
+                ],
+            ),
+            (
+                "גישת השומה",
+                [
+                    GPara(
+                        "ההכנסה הפוטנציאלית, בניכוי אובדן הכנסות, הוונה בשיעור של 7.25%, בהתחשב בגיל הבניין "
+                        "ובמצב מערכותיו.",
+                        [GFact("cap_rate", "7.25", "הוונה בשיעור של 7.25%", unit="percent")],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    def k3(v2: bool) -> V2Doc:
+        if v2:
+            assumptions = GPara(
+                "לאחר שהשוכר הודיע על כוונתו לצמצם את פעילותו בסניף, הובא בחשבון ניכוי של 5% בגין אובדן "
+                "הכנסות, וההכנסה הוונה בשיעור של 7.25%. גרסה זו מחליפה את גרסת חוות הדעת מחודש יולי 2024.",
+                [
+                    GFact("vacancy_allowance", "5", "ניכוי של 5% בגין אובדן הכנסות", unit="percent"),
+                    GFact("cap_rate", "7.25", "הוונה בשיעור של 7.25%", unit="percent"),
+                ],
+            )
+        else:
+            assumptions = GPara(
+                "בהתחשב ביציבות השוכר וביתרת תקופת השכירות, לא הובא בחשבון ניכוי בגין אובדן הכנסות, "
+                "וההכנסה הוונה בשיעור של 6.75%.",
+                [
+                    GFact("vacancy_allowance", "0", "לא הובא בחשבון ניכוי בגין אובדן הכנסות", unit="percent",
+                          note="explicitly none"),
+                    GFact("cap_rate", "6.75", "הוונה בשיעור של 6.75%", unit="percent"),
+                ],
+            )
+        return doc(
+            id="K3v2" if v2 else "K3",
+            filename="K3v2_synthetic_herzliya_sokolov_retail_v2.pdf" if v2 else "K3_synthetic_herzliya_sokolov_retail.pdf",
+            title_place="סוקולוב 60, הרצליה",
+            city="הרצליה",
+            neighborhood="מרכז העיר",
+            address="סוקולוב 60",
+            block=6526,
+            parcel=210,
+            sub_parcel=4,
+            ptype="retail",
+            ptype_label="חנות",
+            area=dec(180),
+            area_line="180 מ״ר נטו",
+            valuation_date=date(2024, 9, 15) if v2 else date(2024, 7, 1),
+            report_date=date(2024, 9, 22) if v2 else date(2024, 7, 8),
+            client="בעלי הנכס",
+            purpose="בחינת שווי לקראת מכירה",
+            value=dec(4250000) if v2 else dec(4800000),
+            subject_key="הרצליה|6526/210/4",
+            environment=[
+                "רחוב סוקולוב הוא רחוב המסחר המרכזי של הרצליה, ולאורכו חנויות, בתי קפה וסניפי בנקים.",
+                "תנועת הולכי הרגל ברחוב ערה במיוחד בשעות הערב ובסופי השבוע.",
+            ],
+            version_of="K3" if v2 else None,
+            notes=(
+                "Second version of K3: tenant notice -> vacancy allowance 0% -> 5% and cap rate 6.75% -> 7.25%; new "
+                "value and dates. Everything else is identical."
+                if v2
+                else "Herzliya shop, first version. Lease term stated only in words (עשר שנים); monthly rent 27,000, "
+                "CPI-linked; no vacancy allowance, cap rate 6.75%."
+            ),
+            sections=[
+                (
+                    "תיאור הנכס",
+                    [
+                        GPara(
+                            "הנכס הנישום הוא חנות בקומת הקרקע בבניין מגורים ומסחר ברחוב סוקולוב, בחזית רחוב "
+                            "פעילה. לחנות חלון ראווה רחב לרחוב ומחסן סחורה פנימי."
+                        ),
+                        GPara(
+                            "החנות מושכרת לרשת אופנה (בדויה) לתקופה של עשר שנים, החל מינואר 2022. דמי השכירות "
+                            "החודשיים הם 27,000 ₪, והם צמודים למדד המחירים לצרכן.",
+                            [
+                                GFact("leased", True, "החנות מושכרת לרשת אופנה"),
+                                GFact("lease_term", 10, "לתקופה של עשר שנים", unit="year",
+                                      note="stated only in words"),
+                                GFact("monthly_rent", "27000", "דמי השכירות החודשיים הם 27,000 ₪", unit="ILS/month"),
+                                GFact("indexation", True, "והם צמודים למדד המחירים לצרכן"),
+                            ],
+                        ),
+                    ],
+                ),
+                ("הנחות השומה", [assumptions]),
+            ],
+        )
+
+    k4 = doc(
+        id="K4",
+        filename="K4_synthetic_ramatgan_bialik_retail.pdf",
+        title_place="ביאליק 70, רמת גן",
+        city="רמת גן",
+        neighborhood="מרכז העיר",
+        address="ביאליק 70",
+        block=6143,
+        parcel=377,
+        sub_parcel=2,
+        ptype="retail",
+        ptype_label="חנות",
+        area=dec(95),
+        area_line="95 מ״ר נטו",
+        valuation_date=date(2024, 3, 10),
+        report_date=date(2024, 3, 18),
+        client="שני הבעלים במשותף",
+        purpose="הסכם פירוק שיתוף בין בעלים",
+        value=dec(3750000),
+        subject_key="רמת גן|6143/377/2",
+        notes="Ramat Gan shop on a main road. Noise 68 dB; maintenance 4 of 5 in a sentence; lease table "
+        "(21,850 a month, 230 per m2, 3 years, occupancy 100%); rent NOT indexed; cap rate '7 אחוזים'. "
+        "No energy rating, plot data or registry entries.",
+        sections=[
+            (
+                "תיאור הנכס",
+                [
+                    GPara(
+                        "החנות ממוקמת בקומת הקרקע בחזית רחוב ביאליק, ציר תנועה ראשי. מדידה שנערכה בעת הביקור "
+                        "העלתה מפלס רעש של 68 דציבל בשעות היום בחזית החנות.",
+                        [GFact("noise_level", "68", "מפלס רעש של 68 דציבל", unit="dB")],
+                    ),
+                    GPara(
+                        "מצב התחזוקה של החנות טוב, והשמאי העניק לה ציון 4 מתוך 5.",
+                        [GFact("maintenance_score", 4, "ציון 4 מתוך 5", unit="score")],
+                    ),
+                ],
+            ),
+            (
+                "השכירות",
+                [
+                    GTable(
+                        "נתוני השכירות",
+                        ["פרמטר", "ערך"],
+                        [100, 80],
+                        [
+                            ["דמי שכירות חודשיים (₪)", "21,850"],
+                            ["דמי שכירות למ״ר לחודש (₪)", "230"],
+                            ["תקופת השכירות", "3 שנים"],
+                            ["שיעור תפוסה", "100%"],
+                        ],
+                        [
+                            GFact("monthly_rent", "21850", "21,850", unit="ILS/month", cell=(0, 1)),
+                            GFact("rent_per_sqm", "230", "230", unit="ILS/m2/month", cell=(1, 1)),
+                            GFact("lease_term", 3, "3 שנים", unit="year", cell=(2, 1)),
+                            GFact("occupancy_rate", "100", "100%", unit="percent", cell=(3, 1)),
+                        ],
+                    ),
+                    GPara(
+                        "דמי השכירות אינם צמודים למדד, ולכן הובאה בחשבון שחיקה ריאלית של ההכנסה לאורך תקופת "
+                        "השכירות.",
+                        [GFact("indexation", False, "דמי השכירות אינם צמודים למדד")],
+                    ),
+                ],
+            ),
+            (
+                "גישת השומה",
+                [
+                    GPara(
+                        "ההכנסה השנתית הוונה בשיעור של 7 אחוזים, בדומה לחנויות ברחובות מסחריים ראשיים בעיר.",
+                        [GFact("cap_rate", "7", "בשיעור של 7 אחוזים", unit="percent", note="written '7 אחוזים'")],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    k5 = doc(
+        id="K5",
+        filename="K5_synthetic_holon_haplada_industrial_2023.pdf",
+        title_place="הפלדה 12, חולון",
+        city="חולון",
+        neighborhood="אזור התעשייה",
+        address="הפלדה 12",
+        block=7140,
+        parcel=21,
+        sub_parcel=None,
+        ptype="industrial",
+        ptype_label="מבנה תעשייה",
+        area=dec(1500),
+        area_line="1,500 מ״ר ברוטו",
+        valuation_date=date(2023, 4, 20),
+        report_date=date(2023, 5, 2),
+        client="בעלי המפעל",
+        purpose="מימון בנקאי",
+        value=dec(9600000),
+        subject_key="חולון|7140/21",
+        environment=[
+            "אזור התעשייה של חולון משלב מבני תעשייה ותיקים לצד מבני מסחר ומשרדים חדשים יותר.",
+            "הגישה לאזור נוחה מכביש 4 ומדרך ההגנה, ותנועת המשאיות בו ערה בשעות היום.",
+        ],
+        notes="Holon industrial building in 2023, owner-occupied (NOT leased), cost approach. Table: plot "
+        "2,400 m2 (conflicts with K6's 2,450), coverage 60%, road 12 m, maintenance 3. Construction cost "
+        "4,200 per m2, depreciation 30%, easement in favour of the neighbouring parcel.",
+        sections=[
+            (
+                "תיאור הנכס",
+                [
+                    GPara(
+                        "הנכס הנישום הוא מבנה תעשייה דו-קומתי המשמש את בעליו כמפעל לייצור רהיטים. המבנה אינו "
+                        "מושכר, ולכן לא נערך לו תחשיב הכנסות.",
+                        [GFact("leased", False, "המבנה אינו מושכר", note="owner-occupied in 2023")],
+                    ),
+                    GTable(
+                        "נתוני המגרש והמבנה",
+                        ["נתון", "ערך"],
+                        [100, 80],
+                        [
+                            ["שטח המגרש (מ״ר)", "2,400"],
+                            ["תכסית קיימת", "60%"],
+                            ["רוחב דרך הגישה (מ׳)", "12"],
+                            ["ציון תחזוקה (1 עד 5)", "3"],
+                        ],
+                        [
+                            GFact("plot_area", "2400", "2,400", unit="m2", entity="plot", cell=(0, 1)),
+                            GFact("building_coverage", "60", "60%", unit="percent", entity="plot", cell=(1, 1),
+                                  note="existing coverage"),
+                            GFact("access_road_width", "12", "12", unit="m", entity="plot", cell=(2, 1)),
+                            GFact("maintenance_score", 3, "3", unit="score", entity="building", cell=(3, 1)),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "מצב משפטי",
+                [
+                    GPara(
+                        "בנסח הרישום רשומה זיקת הנאה למעבר כלי רכב לטובת חלקה 22 השכנה, לאורך הגבול המזרחי של "
+                        "המגרש.",
+                        [GFact("easement", True, "רשומה זיקת הנאה למעבר כלי רכב לטובת חלקה 22", entity="plot")],
+                    ),
+                ],
+            ),
+            (
+                "גישת העלות",
+                [
+                    GPara(
+                        "עלות הבנייה של מבנה חדש דומה הוערכה ב-4,200 ₪ למ״ר בנוי, כולל עבודות פיתוח.",
+                        [GFact("construction_cost", "4200", "4,200 ₪ למ״ר בנוי", unit="ILS/m2")],
+                    ),
+                    GPara(
+                        "בשל גיל המבנה ומצב מערכותיו הובא בחשבון פחת בשיעור 30% מעלות ההקמה.",
+                        [GFact("depreciation_rate", "30", "פחת בשיעור 30%", unit="percent")],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    k6 = doc(
+        id="K6",
+        filename="K6_synthetic_holon_haplada_industrial_2024.docx",
+        kind="docx",
+        title_place="הפלדה 12, חולון",
+        city="חולון",
+        neighborhood="אזור התעשייה",
+        address="הפלדה 12",
+        block=7140,
+        parcel=21,
+        sub_parcel=None,
+        ptype="industrial",
+        ptype_label="מבנה תעשייה",
+        area=dec(1500),
+        area_line="1,500 מ״ר ברוטו",
+        valuation_date=date(2024, 8, 5),
+        report_date=date(2024, 8, 14),
+        client="בעלי המבנה",
+        purpose="בחינת שווי לאחר השכרת המבנה",
+        value=dec(11150000),
+        subject_key="חולון|7140/21",
+        notes="DOCX (page fields are null). Second appraisal of K5's subject, now leased: plot table says 2,450 m2 "
+        "(conflict with K5's 2,400); rent 72,000 a month = 48 per m2, 7 years, CPI-linked, fully let; cap rate "
+        "7.75%. No maintenance score, road width, depreciation or registry entries.",
+        sections=[
+            (
+                "תיאור הנכס",
+                [
+                    GPara(
+                        "חוות הדעת נערכת למבנה התעשייה ברחוב הפלדה 12 בחולון, שנישום בעבר על ידי המשרד באפריל "
+                        "2023. מאז השומה הקודמת פינו הבעלים את המפעל והשכירו את המבנה."
+                    ),
+                    GTable(
+                        "נתוני המגרש",
+                        ["נתון", "ערך"],
+                        [100, 80],
+                        [["שטח המגרש לפי מדידה עדכנית (מ״ר)", "2,450"], ["שטח בנוי (מ״ר)", "1,500"]],
+                        [GFact("plot_area", "2450", "2,450", unit="m2", entity="plot", cell=(0, 1))],
+                    ),
+                ],
+            ),
+            (
+                "השכירות",
+                [
+                    GPara(
+                        "המבנה הושכר במלואו לחברת לוגיסטיקה (בדויה) לתקופה של 7 שנים. דמי השכירות החודשיים הם "
+                        "72,000 ₪, כלומר 48 ₪ למ״ר לחודש, והם צמודים למדד המחירים לצרכן.",
+                        [
+                            GFact("leased", True, "המבנה הושכר במלואו"),
+                            GFact("occupancy_rate", "100", "המבנה הושכר במלואו", unit="percent",
+                                  note="fully let, no number written"),
+                            GFact("lease_term", 7, "לתקופה של 7 שנים", unit="year"),
+                            GFact("monthly_rent", "72000", "דמי השכירות החודשיים הם 72,000 ₪", unit="ILS/month"),
+                            GFact("rent_per_sqm", "48", "48 ₪ למ״ר לחודש", unit="ILS/m2/month"),
+                            GFact("indexation", True, "והם צמודים למדד המחירים לצרכן"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "גישת השומה",
+                [
+                    GPara(
+                        "ההכנסה השנתית הוונה בשיעור של 7.75%, המשקף שוכר יחיד בחוזה ארוך.",
+                        [GFact("cap_rate", "7.75", "הוונה בשיעור של 7.75%", unit="percent")],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    k7 = doc(
+        id="K7",
+        filename="K7_synthetic_petahtikva_herzl_building.pdf",
+        title_place="הרצל 15, פתח תקווה",
+        city="פתח תקווה",
+        neighborhood="מרכז העיר",
+        address="הרצל 15",
+        block=6393,
+        parcel=155,
+        sub_parcel=None,
+        ptype="residential_building",
+        ptype_label="בניין מגורים",
+        area=dec(2350),
+        area_line="2,350 מ״ר ברוטו",
+        valuation_date=date(2024, 6, 3),
+        report_date=date(2024, 6, 10),
+        client="נציגות הבית המשותף",
+        purpose="קביעת סכום ביטוח למבנה",
+        value=dec(12780000),
+        subject_key="פתח תקווה|6393/155",
+        notes="Petah Tikva residential building at הרצל 15 (same address as K8 in Holon: the ambiguous referent). "
+        "24 dwelling units, plot 1,150 m2, coverage 35%, energy A, noise 55 dB, setbacks table (4/3/5), "
+        "maintenance 4, no warning notes, public-passage easement, construction cost 6,800 per m2, depreciation 20%.",
+        sections=[
+            (
+                "תיאור הבניין",
+                [
+                    GPara(
+                        "בניין מגורים בן שש קומות מעל קומת עמודים, ובו 24 יחידות דיור. הבניין בנוי על מגרש בשטח "
+                        "1,150 מ״ר, בתכסית של 35%.",
+                        [
+                            GFact("units_in_building", 24, "ובו 24 יחידות דיור", unit="count", entity="building"),
+                            GFact("plot_area", "1150", "מגרש בשטח 1,150 מ״ר", unit="m2", entity="plot"),
+                            GFact("building_coverage", "35", "בתכסית של 35%", unit="percent", entity="plot",
+                                  note="existing coverage"),
+                        ],
+                    ),
+                    GPara(
+                        "לבניין דירוג אנרגטי A לפי תעודה שהוצגה לשמאי. ציון התחזוקה הכולל שניתן לבניין הוא 4 "
+                        "מתוך 5.",
+                        [
+                            GFact("energy_rating", "A", "דירוג אנרגטי A", entity="building"),
+                            GFact("maintenance_score", 4, "ציון התחזוקה הכולל שניתן לבניין הוא 4", unit="score",
+                                  entity="building"),
+                        ],
+                    ),
+                    GPara(
+                        "הבניין פונה לרחוב שקט יחסית; מפלס הרעש שנמדד בחזית הוא 55 דציבל.",
+                        [GFact("noise_level", "55", "מפלס הרעש שנמדד בחזית הוא 55 דציבל", unit="dB")],
+                    ),
+                    GTable(
+                        "קווי בניין",
+                        ["כיוון", "מרחק מגבול המגרש (מ׳)"],
+                        [90, 90],
+                        [["קדמי", "4"], ["צדדי", "3"], ["אחורי", "5"]],
+                        [
+                            GFact("setback_front", "4", "4", unit="m", entity="plot", cell=(0, 1)),
+                            GFact("setback_side", "3", "3", unit="m", entity="plot", cell=(1, 1)),
+                            GFact("setback_rear", "5", "5", unit="m", entity="plot", cell=(2, 1)),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "מצב משפטי",
+                [
+                    GPara(
+                        "על פי נסח הרישום לא רשומות על החלקה הערות אזהרה. רשומה זיקת הנאה למעבר הציבור ברצועה "
+                        "ברוחב 2 מ׳ לאורך הגבול הצפוני של המגרש.",
+                        [
+                            GFact("warning_notes", 0, "לא רשומות על החלקה הערות אזהרה", unit="count", entity="plot",
+                                  note="explicitly none"),
+                            GFact("easement", True, "זיקת הנאה למעבר הציבור", entity="plot",
+                                  note="the 2 m is the width of the easement strip, not of an access road"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "גישת העלות",
+                [
+                    GPara(
+                        "עלות ההקמה של בניין חלופי בסטנדרט דומה הוערכה ב-6,800 ₪ למ״ר בנוי.",
+                        [GFact("construction_cost", "6800", "6,800 ₪ למ״ר בנוי", unit="ILS/m2")],
+                    ),
+                    GPara(
+                        "בהתחשב בגיל הבניין ובמצב תחזוקתו הובא בחשבון פחת מצטבר בשיעור 20%.",
+                        [GFact("depreciation_rate", "20", "פחת מצטבר בשיעור 20%", unit="percent")],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    k8 = doc(
+        id="K8",
+        filename="K8_synthetic_holon_herzl_land.pdf",
+        title_place="הרצל 15, חולון",
+        city="חולון",
+        neighborhood="קריית שרת",
+        address="הרצל 15",
+        block=7155,
+        parcel=40,
+        sub_parcel=None,
+        ptype="land",
+        ptype_label="קרקע פנויה",
+        area=dec(1800),
+        area_line=None,
+        valuation_date=date(2024, 1, 22),
+        report_date=date(2024, 1, 30),
+        client="חברת יזמות דמו בע״מ (בדויה)",
+        purpose="בחינת כדאיות לרכישה",
+        value=dec(8900000),
+        subject_key="חולון|7155/40",
+        environment=[
+            "שכונת קריית שרת ממוקמת בצפון חולון, ומאופיינת בבנייה רוויה ותיקה לצד פרויקטים חדשים.",
+            "בקרבת המגרש פועלים מרכז מסחרי שכונתי, בתי ספר ופארק עירוני.",
+        ],
+        notes="Holon vacant land at הרצל 15 (same address as K7 in Petah Tikva). Plot 1.8 dunam (= 1,800 m2); "
+        "access road width only in words (שישה מטרים); noise 72 dB; maximum permitted coverage 45%, setbacks "
+        "5 / 3 m; two warning notes; no easements; residual method with construction cost '7.2 אלף ₪' per m2.",
+        sections=[
+            (
+                "תיאור המגרש",
+                [
+                    GPara(
+                        "המגרש הנישום הוא קרקע פנויה בשטח 1.8 דונם, בצורת מלבן, ברחוב הרצל בחולון.",
+                        [GFact("plot_area", "1.8", "קרקע פנויה בשטח 1.8 דונם", unit="dunam", entity="plot",
+                               normalized={"value": "1800", "unit": "m2"})],
+                    ),
+                    GPara(
+                        "הגישה למגרש היא בדרך סלולה ברוחב שישה מטרים, המשותפת למגרש ולחלקה השכנה.",
+                        [GFact("access_road_width", 6, "בדרך סלולה ברוחב שישה מטרים", unit="m", entity="plot",
+                               note="stated only in words")],
+                    ),
+                    GPara(
+                        "המגרש סמוך לכביש מהיר; לפי סקר אקוסטי שצורף לתיק, מפלס הרעש בגבול המגרש מגיע ל-72 דציבל.",
+                        [GFact("noise_level", "72", "מפלס הרעש בגבול המגרש מגיע ל-72 דציבל", unit="dB")],
+                    ),
+                ],
+            ),
+            (
+                "הוראות הבנייה החלות על המגרש",
+                [
+                    GPara(
+                        "לפי ההוראות החלות על המגרש, התכסית המרבית המותרת היא 45%, וקו הבניין הקדמי הוא 5 מטרים. "
+                        "קווי הבניין הצדדיים הם 3 מטרים.",
+                        [
+                            GFact("building_coverage", "45", "התכסית המרבית המותרת היא 45%", unit="percent",
+                                  entity="plot", note="maximum permitted coverage, not an existing one"),
+                            GFact("setback_front", "5", "קו הבניין הקדמי הוא 5 מטרים", unit="m", entity="plot"),
+                            GFact("setback_side", "3", "קווי הבניין הצדדיים הם 3 מטרים", unit="m", entity="plot"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "מצב משפטי",
+                [
+                    GPara(
+                        "על פי נסח הרישום רשומות על המגרש שתי הערות אזהרה לטובת רוכשים (בדויים). לא רשומות על "
+                        "המגרש זיקות הנאה.",
+                        [
+                            GFact("warning_notes", 2, "שתי הערות אזהרה", unit="count", entity="plot"),
+                            GFact("easement", False, "לא רשומות על המגרש זיקות הנאה", entity="plot"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "גישת השומה",
+                [
+                    GPara(
+                        "השומה נערכה בשיטה השיורית. עלות הבנייה של הפרויקט המתוכנן הונחה בסך 7.2 אלף ₪ למ״ר בנוי.",
+                        [GFact("construction_cost", "7.2", "7.2 אלף ₪ למ״ר בנוי", unit="thousand ILS/m2",
+                               normalized={"value": "7200", "unit": "ILS/m2"})],
+                    ),
+                ],
+            ),
+        ],
+    )
+    return [k1, k2, k3(False), k4, k5, k6, k7, k8, k3(True)]
+
+
+def _v2_existing_mentions(paragraphs: list[tuple[str, str, int | None]]) -> list[dict[str, Any]]:
+    """Sentences of the earlier fixtures that touch the v2 topics, with any false-friend note."""
+    import re
+
+    out = []
+    for doc_id, text, page in paragraphs:
+        for sentence in [s.strip() for s in text.replace("; ", ". ").split(". ") if s.strip()]:
+            for topic, patterns in V2_MENTION_PATTERNS.items():
+                hit = next((m.group(0) for p in patterns if (m := re.search(p, sentence))), None)
+                if hit is None:
+                    continue
+                item = {"document": doc_id, "topic": topic, "term": hit, "page": page,
+                        "sentence": sentence.rstrip(".")}
+                friend = next((note for phrase, note in V2_FALSE_FRIENDS.items() if phrase in sentence), None)
+                if friend:
+                    item["false_friend"] = friend
+                out.append(item)
+    return out
+
+
+def _earlier_paragraphs(font_dir: Path, reports: list[Report], layouts: dict[str, Layout]):
+    """(document id, paragraph, physical page) of the original reports and the first held-out corpus; the
+    held-out documents are rendered again in memory (deterministic) and nothing is written."""
+    out = [(rep.id, t, s) for rep in reports if rep.kind not in ("encrypted", "truncated")
+           for t, s, _e in layouts[rep.id].paragraphs]
+    for gdoc in build_general_docs():
+        if gdoc.kind == "docx":
+            _, layout = render_general_docx(gdoc)
+        else:
+            renderer = GeneralPdfRenderer(font_dir)
+            renderer.render_general(gdoc)
+            layout = renderer.layout
+        out += [(gdoc.id, t, s) for t, s, _e in layout.paragraphs]
+    return out
+
+
+def holdout_v2_section(
+    docs: list[V2Doc], entries: dict[str, dict[str, Any]], facts: list[dict[str, Any]],
+    mentions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    replaced = {d.version_of for d in docs if d.version_of}
+    current = [d.id for d in docs if d.id not in replaced]
+    stated = {(f["document"], f["attribute"]) for f in facts}
+    not_stated = {attr: [d.id for d in docs if (d.id, attr) not in stated] for attr in HOLDOUT_V2_ATTRIBUTES}
+
+    def fact(doc_id: str, attribute: str) -> dict[str, Any]:
+        found = [f for f in facts if f["document"] == doc_id and f["attribute"] == attribute]
+        assert len(found) == 1, (doc_id, attribute, found)
+        return found[0]
+
+    def side(doc_id: str, attribute: str) -> dict[str, Any]:
+        f = fact(doc_id, attribute)
+        return {"document": doc_id, "fact": f["id"], "value": f["value"], "page": f["page"], "quote": f["quote"]}
+
+    old, new = "K3", "K3v2"
+    changed_attributes = ("vacancy_allowance", "cap_rate")
+    changed = []
+    for attribute in changed_attributes:
+        assert fact(old, attribute)["value"] != fact(new, attribute)["value"], attribute
+        changed.append({"attribute": attribute, "old": side(old, attribute), "new": side(new, attribute)})
+    for attribute in HOLDOUT_V2_ATTRIBUTES:
+        if attribute in changed_attributes:
+            continue
+        a = [f["value"] for f in facts if f["document"] == old and f["attribute"] == attribute]
+        b = [f["value"] for f in facts if f["document"] == new and f["attribute"] == attribute]
+        assert a == b, (attribute, a, b)  # nothing else differs between the versions
+    conflict = [side("K5", "plot_area"), side("K6", "plot_area")]
+    assert conflict[0]["value"] != conflict[1]["value"]
+    by_id = {d.id: d for d in docs}
+    assert by_id["K5"].subject_key == by_id["K6"].subject_key
+    assert by_id["K7"].address == by_id["K8"].address and by_id["K7"].city != by_id["K8"].city
+    return {
+        "about": f"{SYNTHETIC_MARKER}. Held-out corpus v2: appraisal-like documents on topics that none of the "
+        "earlier fixtures, question sets or fixes covered. Files live in tests/fixtures/holdout_v2/. The documents "
+        "produce no records (no 'שווי הנכס:' header label, no price or value column), so ground_truth.yaml, the "
+        "record counts and the 77-item evaluation are unaffected. Same schema as ground_truth.yaml "
+        "`general_facts`. Values are as the document states them; `normalized` gives the canonical unit when the "
+        "document uses another one. Boolean facts record explicit statements only; `not_stated` lists, per "
+        "attribute, the documents with no fact for it. Generated by scripts/generate_fixtures.py - do not edit by "
+        "hand.",
+        "directory": HOLDOUT_V2_DIR,
+        "group": {
+            "code": HOLDOUT_V2_GROUP["code"],
+            "name": HOLDOUT_V2_GROUP["name"],
+            "office": "A",
+            "visible_to": ["admin-a@demo.test", "dana@demo.test"],
+            "hidden_from": ["yossi@demo.test", "admin-b@demo.test"],
+        },
+        "attributes": HOLDOUT_V2_ATTRIBUTES,
+        "documents": list(entries.values()),
+        "current_documents": current,
+        "facts": facts,
+        "not_stated": not_stated,
+        "conflicts": [
+            {
+                "subject_key": by_id["K5"].subject_key,
+                "address": "הפלדה 12, חולון",
+                "attribute": "plot_area",
+                "statements": conflict,
+                "note": "two appraisals of the same property (2023 and 2024) state different plot areas; an answer "
+                "must show both, never pick one silently",
+            }
+        ],
+        "versions": [
+            {
+                "document": new,
+                "replaces": old,
+                "changed": changed,
+                "value_in_text": {"old": str(by_id[old].value), "new": str(by_id[new].value)},
+                "dates": {
+                    "old": {"valuation_date": by_id[old].valuation_date.isoformat(),
+                            "report_date": by_id[old].report_date.isoformat()},
+                    "new": {"valuation_date": by_id[new].valuation_date.isoformat(),
+                            "report_date": by_id[new].report_date.isoformat()},
+                },
+                "unchanged": "every other attribute and sentence",
+            }
+        ],
+        "same_subject": [
+            {"subject_key": by_id["K5"].subject_key, "documents": ["K5", "K6"],
+             "note": "the same industrial building appraised twice (2023 owner-occupied, 2024 leased); different "
+             "documents, not versions"},
+            {"subject_key": by_id["K3"].subject_key, "documents": ["K3", "K3v2"],
+             "note": "two versions of one document; only K3v2 is current"},
+        ],
+        "ambiguous_referents": [
+            {"phrase": "הרצל 15", "documents": ["K7", "K8"],
+             "note": "the same street address in two cities (פתח תקווה and חולון); both documents state plot area, "
+             "coverage, front setback, noise, warning notes and easements, with different values"},
+        ],
+        "stated_in_words": [
+            {"document": f["document"], "fact": f["id"], "attribute": f["attribute"], "value": f["value"],
+             "quote": f["quote"]}
+            for f in facts if f.get("note") == "stated only in words"
+        ],
+        "existing_mentions": mentions,
+    }
+
+
+def write_holdout_v2(out: Path, font_dir: Path, reports: list[Report], layouts: dict[str, Layout]) -> None:
+    vdir = out / HOLDOUT_V2_DIR
+    vdir.mkdir(parents=True, exist_ok=True)
+    docs = build_holdout_v2_docs()
+    entries: dict[str, dict[str, Any]] = {}
+    facts: list[dict[str, Any]] = []
+    for vdoc in docs:
+        assert "synthetic" in vdoc.filename
+        if vdoc.kind == "docx":
+            data, layout = render_general_docx(vdoc)
+        else:
+            renderer = GeneralPdfRenderer(font_dir)
+            data = renderer.render_general(vdoc)
+            layout = renderer.layout
+        (vdir / vdoc.filename).write_bytes(data)
+        vtables = [b for _, blocks in vdoc.all_sections() for b in blocks if isinstance(b, GTable)]
+        for table in vtables:  # no price or value column: the rules extractor never sees a comparables table
+            assert not any("מחיר" in h or "שווי" in h for h in table.headers), table.headers
+        for _, blocks in vdoc.all_sections():  # no "שווי הנכס:" label anywhere, so no appraised-value record
+            for block in blocks:
+                if isinstance(block, GPara):
+                    assert "שווי הנכס:" not in block.text, block.text
+        entries[vdoc.id] = {
+            "id": vdoc.id,
+            "filename": vdoc.filename,
+            "office": "A",
+            "group": HOLDOUT_V2_GROUP["code"],
+            "kind": vdoc.kind,
+            "version_of": vdoc.version_of,
+            "notes": vdoc.notes,
+            "city": vdoc.city,
+            "neighborhood": vdoc.neighborhood,
+            "address": vdoc.address,
+            "block": vdoc.block,
+            "parcel": vdoc.parcel,
+            "sub_parcel": vdoc.sub_parcel,
+            "subject_key": vdoc.subject_key,
+            "property_type": vdoc.ptype,
+            "property_type_he": vdoc.ptype_label,
+            "valuation_date": vdoc.valuation_date.isoformat(),
+            "report_date": vdoc.report_date.isoformat(),
+            "value_in_text": str(vdoc.value),
+            "page_count": layout.page_count,
+            "header_page": layout.header_page,
+            "sections": [{"number": s["number"], "title": s["title"], "page": s["page"]} for s in layout.sections],
+            "tables": [
+                {"index": i, "title": t.title, "page": p, "headers": FlowList(t.headers),
+                 "rows": [FlowList(r) for r in t.rows]}
+                for i, (t, p) in enumerate(zip(vtables, layout.gtables, strict=True))
+            ],
+            "records": [],
+        }
+        facts.extend(_general_facts_of(vdoc, layout))
+        print(f"wrote {HOLDOUT_V2_DIR}/{vdoc.filename} ({len(data):,} bytes, pages={layout.page_count})")
+    mentions = _v2_existing_mentions(_earlier_paragraphs(font_dir, reports, layouts))
+    section = holdout_v2_section(docs, entries, facts, mentions)
+    text = yaml.safe_dump(section, allow_unicode=True, sort_keys=False, width=1000)
+    (out / HOLDOUT_V2_TRUTH).write_text(text, encoding="utf-8")
+    print(f"wrote {HOLDOUT_V2_TRUTH} ({len(text):,} chars)")
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -2895,6 +3881,7 @@ def main() -> None:
     text = yaml.safe_dump(truth, allow_unicode=True, sort_keys=False, width=1000)
     (out / "ground_truth.yaml").write_text(text, encoding="utf-8")
     print(f"wrote ground_truth.yaml ({len(text):,} chars)")
+    write_holdout_v2(out, font_dir, reports, layouts)
 
 
 if __name__ == "__main__":

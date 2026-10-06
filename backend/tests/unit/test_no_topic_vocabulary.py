@@ -1,8 +1,8 @@
 """Held-out topic words never occur in application code (U12, KTD16, R2, R27).
 
 Routing and extraction must work for attributes nobody anticipated, so the held-out attribute and topic
-words of eval/questions_general.yaml may not appear anywhere in backend/app: not in code, prompts,
-comments or docstrings. Matching is on Hebrew words after unifying gershayim/geresh variants
+words of eval/questions_general.yaml and of the second, separate set eval/questions_holdout_v2.yaml may not
+appear anywhere in backend/app: not in code, prompts, comments or docstrings. Matching is on Hebrew words after unifying gershayim/geresh variants
 (ממ״ד = ממ"ד = ממ''ד) and stripping one- and two-letter prefixes (הממ״ד, במרפסת, ליתרת).
 The idiom "בין היתר" ("among other things") is not the word for a building permit, and the bare
 spelling ממד is only a question spelling: in code it is the ordinary word for "dimension".
@@ -14,11 +14,13 @@ import re
 import unicodedata
 from pathlib import Path
 
+import pytest
 import yaml
 
 BACKEND = Path(__file__).resolve().parents[2]
 APP = BACKEND / "app"
 QUESTIONS = BACKEND / "eval" / "questions_general.yaml"
+QUESTIONS_V2 = BACKEND / "eval" / "questions_holdout_v2.yaml"
 
 # The held-out attribute and topic terms of the general question set, with their usual inflections.
 HELD_OUT_TERMS: tuple[str, ...] = (
@@ -42,6 +44,20 @@ HELD_OUT_TERMS: tuple[str, ...] = (
     "שיפוץ", "שיפוצים", "שופץ", "שופצה", "משופצת",
     # an amenity no document has
     "בריכה", "בריכת",
+    # --- held-out set v2 (eval/questions_holdout_v2.yaml): never used for tuning ---
+    # rent, lease and indexation
+    "שכירות", "דמי שכירות", "שכר דירה", "שכ״ד", "שוכר", "שוכרים", "שוכרת", "השכרה", "השכרת", "מושכר",
+    "מושכרת", "מושכרים", "הושכר", "הושכרה", "צמודים למדד", "צמוד למדד", "הצמדה",
+    # income approach
+    "תשואה", "שיעור היוון", "היוון", "הוונה", "אובדן הכנסות", "תפוסה", "דמי ניהול",
+    # plot, coverage, setbacks, access
+    "שטח המגרש", "גודל המגרש", "תכסית", "קו בניין", "קווי בניין", "דרך גישה",
+    # registry entries
+    "זיקת הנאה", "זיקות הנאה", "הערת אזהרה", "הערות אזהרה",
+    # condition and environment
+    "תחזוקה", "דירוג אנרגטי", "אנרגטי", "רעש", "דציבל", "דציבלים",
+    # cost approach and the residual method
+    "פחת", "עלות בנייה", "עלות בניה", "עלות הקמה", "עלויות הקמה", "שיורית",
 )
 # Spellings questions may use that are ordinary words elsewhere ("ממד" = dimension): not scanned in code.
 QUESTION_ONLY_SPELLINGS: tuple[str, ...] = ("ממד",)
@@ -116,8 +132,9 @@ def test_held_out_words_do_not_occur_in_backend_app():
     assert hits == [], "held-out topic words in backend/app:\n" + "\n".join(hits)
 
 
-def test_question_set_declares_its_held_out_terms():
-    items = yaml.safe_load(QUESTIONS.read_text(encoding="utf-8"))["items"]
+@pytest.mark.parametrize("questions", [QUESTIONS, QUESTIONS_V2], ids=lambda p: p.name)
+def test_question_set_declares_its_held_out_terms(questions):
+    items = yaml.safe_load(questions.read_text(encoding="utf-8"))["items"]
     known = {" ".join(t) for t in _QUESTION_TERMS}
     held_out = [i for i in items if i.get("held_out")]
     assert len(items) >= 40

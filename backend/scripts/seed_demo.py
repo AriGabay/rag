@@ -10,7 +10,9 @@ Records are approved only when every key field equals the synthetic ground truth
 also shows which extractions a human would still need to check. Each office also gets the
 structured attribute registry entries (KTD7), written with the owner role inside that office's
 context. The held-out corpus (U12, KTD16; tests/fixtures/general/) goes into its own office A group,
-visible to admin-a and dana but not yossi; it produces no records. All data is synthetic.
+visible to admin-a and dana but not yossi; it produces no records. The second held-out corpus
+(tests/fixtures/holdout_v2/, answer key tests/fixtures/holdout_v2_truth.yaml) goes the same way into its own
+group "ידע כללי ב". All data is synthetic.
 """
 
 from __future__ import annotations
@@ -140,8 +142,9 @@ def upload_all(clients: dict[str, httpx.Client], group_ids: dict[str, dict[str, 
 
 
 def seed_general_corpus(admin: httpx.Client, general: dict) -> None:
-    """Held-out documents in their own group (`general_facts` in ground_truth.yaml). Idempotent: the group,
-    the members and the uploads are each created only when missing."""
+    """Held-out documents in their own group (`general_facts` in ground_truth.yaml, or the v2 answer key
+    holdout_v2_truth.yaml, which has the same shape). Idempotent: the group, the members and the uploads are
+    each created only when missing."""
     spec = general["group"]
     groups = {g["name"]: g for g in admin.get("/api/admin/groups").json()["groups"]}
     if spec["name"] in groups:
@@ -242,6 +245,8 @@ def main() -> None:
     else:
         log("documents already uploaded; skipping uploads")
     seed_general_corpus(clients["A"], truth["general_facts"])
+    holdout_v2 = yaml.safe_load((FIXTURES / "holdout_v2_truth.yaml").read_text(encoding="utf-8"))
+    seed_general_corpus(clients["A"], holdout_v2)
     for key, c in clients.items():
         approved, left = approve_matching(c, docs)
         log(f"office {key}: approved {approved} records matching ground truth; {left} items left for review")

@@ -189,3 +189,30 @@ Physical pages, quotes and table cells are checked against the extracted text by
 and asserts it yields no record. Note that the extractor reads the held-out tables whose headers are not
 comparables vocabulary (H1, H5, H7 key/value tables and H8) as headerless, with their header row as the
 first data row; only H2's table keeps its headers.
+
+## Held-out corpus v2 (`holdout_v2/`)
+
+A second, separate held-out corpus for `backend/eval/questions_holdout_v2.yaml`, written before any run of that set
+and never to be used for tuning. Its topics are new (rent, lease term, CPI indexation, capitalization rate,
+vacancy allowance, occupancy, plot area, coverage, setback lines, access road width, warning notes, easements,
+maintenance score, energy rating, noise, construction cost per m², depreciation) and their words are in the v2 block
+of `HELD_OUT_TERMS` (`tests/unit/test_no_topic_vocabulary.py`). Same command, same determinism, same synthetic
+marker. Office A, group **G4 "ידע כללי ב"**, visible to `admin-a` and `dana` but never to `yossi` or office B
+(`scripts/seed_demo.py` seeds it with the same idempotent `seed_general_corpus`).
+
+The answer key is a separate file, `holdout_v2_truth.yaml`, with the schema of `general_facts` plus
+`ambiguous_referents` and `stated_in_words`. Nothing is added to `ground_truth.yaml`: every earlier fixture file and
+`ground_truth.yaml` stay byte-identical, and the v2 documents produce no records (no `שווי הנכס:` label, no price or
+value column; `test_fixtures_ground_truth.py` runs the rules extractor on each and asserts `[]`).
+
+| id | file | kind | city | what it exercises |
+|---|---|---|---|---|
+| K1 | `holdout_v2/K1_synthetic_telaviv_habarzel_office.pdf` | pdf_digital | תל אביב-יפו | Office floor: lease 5 years, 85 ₪/m²/month, CPI-linked; key/value table (rent 35,700, occupancy 92%, 36 units, maintenance 4, energy B); cap rate 6.5%; no vacancy allowance |
+| K2 | `holdout_v2/K2_synthetic_petahtikva_hasivim_offices.pdf` | pdf_digital | פתח תקווה | Office building: plot 3,050 m², coverage 40%, road 20 m, one warning note; 3-column income table; rent stated **per year**; cap rate on page 2 |
+| K3 | `holdout_v2/K3_synthetic_herzliya_sokolov_retail.pdf` | pdf_digital | הרצליה | Shop, version 1: lease term only in words ("עשר שנים"), rent 27,000, CPI-linked, no vacancy allowance, cap rate 6.75% |
+| K3v2 | `holdout_v2/K3v2_synthetic_herzliya_sokolov_retail_v2.pdf` | pdf_digital | הרצליה | New version of K3: vacancy allowance 0 → 5% and cap rate 6.75 → 7.25% (stated assumption change); nothing else changes |
+| K4 | `holdout_v2/K4_synthetic_ramatgan_bialik_retail.pdf` | pdf_digital | רמת גן | Shop: noise 68 dB, maintenance "4 מתוך 5", lease table, rent **not** indexed, cap rate "7 אחוזים"; no energy rating |
+| K5 | `holdout_v2/K5_synthetic_holon_haplada_industrial_2023.pdf` | pdf_digital | חולון | Industrial building 2023, owner-occupied (not let): plot **2,400** m², coverage 60%, road 12 m, easement, cost 4,200 ₪/m², depreciation 30% |
+| K6 | `holdout_v2/K6_synthetic_holon_haplada_industrial_2024.docx` | docx | חולון | Same building 2024 (not a version): plot **2,450** m² (conflict with K5), let: 72,000 ₪/month, 48 ₪/m², 7 years, cap rate 7.75% |
+| K7 | `holdout_v2/K7_synthetic_petahtikva_herzl_building.pdf` | pdf_digital | פתח תקווה | Residential building at **הרצל 15**: 24 units, plot 1,150 m², coverage 35%, energy A, noise 55 dB, setbacks table, no warning notes, easement, cost 6,800, depreciation 20% |
+| K8 | `holdout_v2/K8_synthetic_holon_herzl_land.pdf` | pdf_digital | חולון | Vacant land at **הרצל 15** (ambiguous referent with K7): plot 1.8 dunam, road "שישה מטרים" (words only), noise 72 dB, permitted coverage 45%, two warning notes, no easements, cost "7.2 אלף ₪" per m² |
