@@ -211,13 +211,26 @@ def test_provider_failure_is_typed_and_falls_back_to_limited_mode():
     TurnPlan.build(task_type="compute", attribute={"handle": "A9", "description": None, "unit_dimension": None}),
     TurnPlan.build(search_queries=["SELECT * FROM documents"], steps=[{"tool": "search", "attribute_handle": None,
                                                                          "source_handles": []}]),
-    TurnPlan.build(steps=[{"tool": "show_sources", "attribute_handle": None, "source_handles": ["S4"]}]),
-    TurnPlan.build(steps=[COMPUTE] * 5),
 ])
 def test_invalid_model_plan_is_rejected_and_limited_mode_answers(bad):
     provider = ScriptedProvider().on(Purpose.INTERPRET, bad)
     result = run("מה נכתב על השיפוץ?", ConversationState(), provider)
     assert result.mode == "limited" and result.status == CallStatus.INVALID and result.errors
+
+
+@pytest.mark.parametrize("repairable", [
+    TurnPlan.build(steps=[{"tool": "show_sources", "attribute_handle": None, "source_handles": ["S4"]}]),
+    TurnPlan.build(steps=[COMPUTE] * 5),
+    TurnPlan.build(task_type="compare", steps=[{"tool": "compare", "attribute_handle": None,
+                                                "source_handles": ["S1", "S2"]}]),
+])
+def test_repairable_model_plan_is_used_not_sent_to_limited_mode(repairable):
+    """A handle the server never issued, or too many steps, is repaired (dropped, truncated): the model's plan
+    still runs instead of the limited path (the cause of a real-model 'invalid' plan)."""
+    provider = ScriptedProvider().on(Purpose.INTERPRET, repairable)
+    result = run("השווה בין שתי השומות", ConversationState(), provider)
+    assert result.mode == "model" and result.status == CallStatus.OK
+    assert all(not s.source_handles for s in result.plan.steps) and len(result.plan.steps) <= 4
 
 
 def test_model_plan_with_extra_field_is_invalid():

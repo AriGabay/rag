@@ -6,7 +6,7 @@
   "date": "2026-10-06 08:59 UTC",
   "commit": "8b5e629",
   "office": "office A of the seeded demo stack (synthetic documents only)",
-  "note": "'recorded' plans are the validated TurnPlan the real model returned for that question (before the server policy), copied from questions.plan. 'synthetic' plans are hand-written where the recorded plan did not follow the answer key's task; 'reason' says what the real model did. Plans that came from the rules fast path are not scripted (no model call). Extracted-attribute handles are replaced by their description when replayed (tests/acceptance/test_gate8_generality.py)."
+  "note": "'recorded' plans are the validated TurnPlan the real model returned for that question (before the server policy), copied from questions.plan. 'synthetic' plans are hand-written where the recorded plan did not follow the answer key's task; 'reason' says what the real model did. Plans that came from the rules fast path are not scripted (no model call). Extracted-attribute handles are replaced by their description when replayed (tests/acceptance/test_gate8_generality.py). Entries with 'recorded_with' were re-recorded after the TurnPlan gained value_filter and attribute.value_type (the earlier recorded or synthetic plan could not express a value condition); 'replaces' names the origin of the entry they replaced."
  },
  "plans": {
   "מה שטח הממ״ד בדירה ברחוב האירוסים 12 ברמת גן?": [
@@ -1950,12 +1950,11 @@
   ],
   "בכמה מהשומות ברמת גן הבניין נבנה אחרי 2010?": [
    {
-    "origin": "synthetic",
-    "reason": "real model reused the attribute 'הבניין הוותיק ביותר'",
+    "origin": "recorded",
     "plan": {
      "task_type": "compute",
      "turn_relation": "new_question",
-     "topic": null,
+     "topic": "שנת בניית הבניין",
      "entities": [],
      "conditions": {
       "city": "רמת גן",
@@ -1972,36 +1971,51 @@
      },
      "attribute": {
       "handle": null,
-      "description": "שנת בנייה",
-      "unit_dimension": "year"
+      "description": "שנת בניית הבניין",
+      "unit_dimension": null,
+      "value_type": "date"
      },
      "metric": "count",
      "unit": null,
-     "search_queries": [],
+     "search_queries": [
+      "שנת בניית הבניין רמת גן",
+      "נבנה אחרי 2010 רמת גן שומה",
+      "שנת בניית הבניין בשומות רמת גן"
+     ],
      "steps": [
       {
-       "tool": "extract_and_compute",
+       "tool": "search",
+       "attribute_handle": null,
+       "source_handles": []
+      },
+      {
+       "tool": "compute_records",
        "attribute_handle": null,
        "source_handles": []
       }
      ],
      "clarification": null,
-     "clarification_answer": null
+     "clarification_answer": null,
+     "value_filter": {
+      "op": ">",
+      "value": "2010"
+     }
     },
     "item": "GQ34",
     "turn": 1,
     "state_empty": true,
-    "answer_key_attribute": "year_built"
+    "answer_key_attribute": "year_built",
+    "recorded_with": "interpreter probe 2026-10-06: one interpret call, empty conversation state, office A registry and gazetteer of the live demo stack; prompt interpret-v4 before its last two sentences (event years, full dates) were added",
+    "replaces": "synthetic"
    }
   ],
   "באילו דירות ברמת גן יש ממ״דים קטנים מ-11 מ״ר?": [
    {
-    "origin": "synthetic",
-    "reason": "real model planned locate",
+    "origin": "recorded",
     "plan": {
      "task_type": "compute",
      "turn_relation": "new_question",
-     "topic": null,
+     "topic": "גודל ממ״ד בדירות ברמת גן",
      "entities": [],
      "conditions": {
       "city": "רמת גן",
@@ -2011,33 +2025,54 @@
       "relative_year_offset": null,
       "date_field": null,
       "data_kind": null,
-      "property_type": null,
+      "property_type": "apartment",
       "area_type": null,
       "vat_basis": null,
       "clear": []
      },
      "attribute": {
-      "handle": null,
+      "handle": "A5",
       "description": "גודל ממ״ד",
-      "unit_dimension": "area"
+      "unit_dimension": "area",
+      "value_type": "numeric"
      },
-     "metric": "count",
-     "unit": null,
-     "search_queries": [],
+     "metric": "values",
+     "unit": "מ״ר",
+     "search_queries": [
+      "דירות ברמת גן גודל ממ״ד",
+      "ממ״ד קטן מ-11 מ״ר ברמת גן",
+      "גודל ממ״ד דירה רמת גן"
+     ],
      "steps": [
       {
+       "tool": "search",
+       "attribute_handle": "A5",
+       "source_handles": []
+      },
+      {
+       "tool": "compute_records",
+       "attribute_handle": "A5",
+       "source_handles": []
+      },
+      {
        "tool": "extract_and_compute",
-       "attribute_handle": null,
+       "attribute_handle": "A5",
        "source_handles": []
       }
      ],
      "clarification": null,
-     "clarification_answer": null
+     "clarification_answer": null,
+     "value_filter": {
+      "op": "<",
+      "value": "11"
+     }
     },
     "item": "GQ35",
     "turn": 1,
     "state_empty": true,
-    "answer_key_attribute": "safe_room_area"
+    "answer_key_attribute": "safe_room_area",
+    "recorded_with": "interpreter probe 2026-10-06: one interpret call, empty conversation state, office A registry and gazetteer of the live demo stack; prompt interpret-v4 before its last two sentences (event years, full dates) were added",
+    "replaces": "synthetic"
    }
   ],
   "כמה מרפסות יש בממוצע לדירה בשומות מגבעתיים?": [
@@ -2147,12 +2182,11 @@
   ],
   "מה היקף יתרת זכויות הבנייה שטרם נוצלו בכל אחת מהשומות?": [
    {
-    "origin": "synthetic",
-    "reason": "real model planned locate",
+    "origin": "recorded",
     "plan": {
      "task_type": "compute",
      "turn_relation": "new_question",
-     "topic": null,
+     "topic": "היקף יתרת זכויות הבנייה שטרם נוצלו",
      "entities": [],
      "conditions": {
       "city": null,
@@ -2168,86 +2202,111 @@
       "clear": []
      },
      "attribute": {
-      "handle": null,
-      "description": "יתרת זכויות בנייה",
-      "unit_dimension": null
+      "handle": "A13",
+      "description": "היקף יתרת זכויות הבנייה שטרם נוצלו",
+      "unit_dimension": null,
+      "value_type": "text"
      },
      "metric": "values",
      "unit": null,
-     "search_queries": [],
+     "search_queries": [
+      "היקף יתרת זכויות הבנייה שטרם נוצלו",
+      "יתרת זכויות בנייה שלא נוצלו",
+      "זכויות בנייה שטרם נוצלו"
+     ],
      "steps": [
       {
+       "tool": "search",
+       "attribute_handle": "A13",
+       "source_handles": []
+      },
+      {
        "tool": "extract_and_compute",
-       "attribute_handle": null,
+       "attribute_handle": "A13",
+       "source_handles": []
+      },
+      {
+       "tool": "show_sources",
+       "attribute_handle": "A13",
        "source_handles": []
       }
      ],
      "clarification": null,
-     "clarification_answer": null
+     "clarification_answer": null,
+     "value_filter": null
     },
     "item": "GQ39",
     "turn": 1,
     "state_empty": true,
-    "answer_key_attribute": "unused_rights"
+    "answer_key_attribute": "unused_rights",
+    "recorded_with": "interpreter probe 2026-10-06: one interpret call, empty conversation state, office A registry and gazetteer of the live demo stack; prompt interpret-v4 before its last two sentences (event years, full dates) were added",
+    "replaces": "synthetic"
    }
   ],
   "בכמה מהשומות מצוין שיפוץ שבוצע בדירה משנת 2020 ואילך?": [
    {
     "origin": "recorded",
     "plan": {
-     "unit": "שומה",
-     "steps": [
-      {
-       "tool": "search",
-       "source_handles": [],
-       "attribute_handle": "A14"
-      },
-      {
-       "tool": "extract_and_compute",
-       "source_handles": [],
-       "attribute_handle": "A14"
-      },
-      {
-       "tool": "compute_records",
-       "source_handles": [],
-       "attribute_handle": "A14"
-      }
-     ],
-     "topic": "שיפוץ שבוצע בדירה בשומות",
-     "metric": "count",
+     "task_type": "compute",
+     "turn_relation": "new_question",
+     "topic": "שיפוץ שבוצע בדירה",
      "entities": [],
+     "conditions": {
+      "city": null,
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": "apartment",
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
      "attribute": {
       "handle": "A14",
       "description": "שיפוץ שבוצע בדירה",
-      "unit_dimension": null
+      "unit_dimension": null,
+      "value_type": "date"
      },
-     "task_type": "compute",
-     "conditions": {
-      "city": null,
-      "clear": [],
-      "year_to": null,
-      "area_type": null,
-      "data_kind": null,
-      "vat_basis": null,
-      "year_from": 2020,
-      "date_field": "report_date",
-      "neighborhood": null,
-      "property_type": "apartment",
-      "relative_year_offset": null
-     },
-     "clarification": null,
-     "turn_relation": "new_question",
+     "metric": "count",
+     "unit": null,
      "search_queries": [
-      "שיפוץ שבוצע בדירה משנת 2020 ואילך בשומות",
-      "שומות דירה שיפוץ בוצע בשנת 2020 ומעלה",
-      "שיפוץ בדירה דווח בשומה 2020 ואילך"
+      "שיפוץ שבוצע בדירה 2020 ואילך",
+      "שיפוץ בדירה משנת 2020",
+      "שיפוץ שבוצע בדירה"
      ],
-     "clarification_answer": null
+     "steps": [
+      {
+       "tool": "search",
+       "attribute_handle": "A14",
+       "source_handles": []
+      },
+      {
+       "tool": "compute_records",
+       "attribute_handle": "A14",
+       "source_handles": []
+      },
+      {
+       "tool": "show_sources",
+       "attribute_handle": "A14",
+       "source_handles": []
+      }
+     ],
+     "clarification": null,
+     "clarification_answer": null,
+     "value_filter": {
+      "op": ">=",
+      "value": "2020"
+     }
     },
     "item": "GQ40",
     "turn": 1,
     "state_empty": true,
-    "answer_key_attribute": "renovation"
+    "answer_key_attribute": "renovation",
+    "recorded_with": "interpreter probe 2026-10-06: one interpret call, empty conversation state, office A registry and gazetteer of the live demo stack; prompt interpret-v4",
+    "replaces": "recorded"
    }
   ],
   "מה גובה התקרה בדירה ברחוב המעגל 7?": [
@@ -2863,12 +2922,11 @@
   ],
   "השווה בין שתי השומות": [
    {
-    "origin": "synthetic",
-    "reason": "real model plan failed validation (limited path)",
+    "origin": "recorded",
     "plan": {
      "task_type": "clarify",
      "turn_relation": "new_question",
-     "topic": null,
+     "topic": "השוואה בין שתי שומות",
      "entities": [],
      "conditions": {
       "city": null,
@@ -2887,18 +2945,40 @@
      "metric": "none",
      "unit": null,
      "search_queries": [],
-     "steps": [],
+     "steps": [
+      {
+       "tool": "compare",
+       "attribute_handle": null,
+       "source_handles": []
+      }
+     ],
      "clarification": {
       "key": "referent",
-      "question": "אילו שומות להשוות?",
-      "options": []
+      "question": "לאילו שתי שומות התכוונת? אפשר לציין כתובות, גוש/חלקה, או שמות/מזהים של המסמכים.",
+      "options": [
+       {
+        "value": "כתובות",
+        "label": "שתי כתובות"
+       },
+       {
+        "value": "מסמכים",
+        "label": "שני מסמכים"
+       },
+       {
+        "value": "גוש_חלקה",
+        "label": "גוש/חלקה"
+       }
+      ]
      },
-     "clarification_answer": null
+     "clarification_answer": null,
+     "value_filter": null
     },
     "item": "GQ54",
     "turn": 1,
     "state_empty": true,
-    "answer_key_attribute": null
+    "answer_key_attribute": null,
+    "recorded_with": "interpreter probe 2026-10-06: one interpret call, empty conversation state, office A registry and gazetteer of the live demo stack; prompt interpret-v4 before its last two sentences (event years, full dates) were added",
+    "replaces": "synthetic"
    }
   ],
   "מה שטח הממ״ד בדירה ברחוב האירוסים 12?": [
@@ -3012,13 +3092,14 @@
   ],
   "אילו ייעודי קרקע מופיעים בשומות של רמת גן?": [
    {
-    "origin": "synthetic",
-    "reason": "real model planned locate",
+    "origin": "recorded",
     "plan": {
-     "task_type": "compute",
+     "task_type": "answer",
      "turn_relation": "new_question",
-     "topic": null,
-     "entities": [],
+     "topic": "ייעודי קרקע",
+     "entities": [
+      "רמת גן"
+     ],
      "conditions": {
       "city": "רמת גן",
       "neighborhood": null,
@@ -3033,27 +3114,45 @@
       "clear": []
      },
      "attribute": {
-      "handle": null,
-      "description": "ייעוד קרקע",
-      "unit_dimension": null
+      "handle": "A15",
+      "description": "ייעודי קרקע",
+      "unit_dimension": null,
+      "value_type": "text"
      },
      "metric": "values",
      "unit": null,
-     "search_queries": [],
+     "search_queries": [
+      "ייעודי קרקע בשומות רמת גן",
+      "שומות רמת גן ייעודי קרקע",
+      "רמת גן ייעודי קרקע"
+     ],
      "steps": [
       {
-       "tool": "extract_and_compute",
-       "attribute_handle": null,
+       "tool": "search",
+       "attribute_handle": "A15",
+       "source_handles": []
+      },
+      {
+       "tool": "locate",
+       "attribute_handle": "A15",
+       "source_handles": []
+      },
+      {
+       "tool": "show_sources",
+       "attribute_handle": "A15",
        "source_handles": []
       }
      ],
      "clarification": null,
-     "clarification_answer": null
+     "clarification_answer": null,
+     "value_filter": null
     },
     "item": "GQ56",
     "turn": 1,
     "state_empty": true,
-    "answer_key_attribute": "zoning"
+    "answer_key_attribute": "zoning",
+    "recorded_with": "interpreter probe 2026-10-06: one interpret call, empty conversation state, office A registry and gazetteer of the live demo stack; prompt interpret-v4 before its last two sentences (event years, full dates) were added",
+    "replaces": "synthetic"
    }
   ],
   "באיזו שומה נסגרה מרפסת בלי היתר?": [
@@ -3234,12 +3333,11 @@
   ],
   "באילו שומות מופיע גובה תקרה של יותר מ-2.70 מטר?": [
    {
-    "origin": "synthetic",
-    "reason": "real model planned locate",
+    "origin": "recorded",
     "plan": {
      "task_type": "compute",
      "turn_relation": "new_question",
-     "topic": null,
+     "topic": "גובה התקרה",
      "entities": [],
      "conditions": {
       "city": null,
@@ -3255,27 +3353,38 @@
       "clear": []
      },
      "attribute": {
-      "handle": null,
-      "description": "גובה תקרה",
-      "unit_dimension": "length"
+      "handle": "A10",
+      "description": "גובה התקרה",
+      "unit_dimension": null,
+      "value_type": "numeric"
      },
-     "metric": "count",
-     "unit": null,
-     "search_queries": [],
+     "metric": "values",
+     "unit": "מטר",
+     "search_queries": [
+      "גובה תקרה 2.70",
+      "גובה התקרה שומות",
+      "תקרה מעל 2.70 מטר"
+     ],
      "steps": [
       {
        "tool": "extract_and_compute",
-       "attribute_handle": null,
+       "attribute_handle": "A10",
        "source_handles": []
       }
      ],
      "clarification": null,
-     "clarification_answer": null
+     "clarification_answer": null,
+     "value_filter": {
+      "op": ">",
+      "value": "2.70"
+     }
     },
     "item": "GQ60",
     "turn": 1,
     "state_empty": true,
-    "answer_key_attribute": "ceiling_height"
+    "answer_key_attribute": "ceiling_height",
+    "recorded_with": "interpreter probe 2026-10-06: one interpret call, empty conversation state, office A registry and gazetteer of the live demo stack; prompt interpret-v4 before its last two sentences (event years, full dates) were added",
+    "replaces": "synthetic"
    }
   ],
   "מה ייעוד המגרש שעליו בנוי הבניין ברחוב האירוסים 12?": [

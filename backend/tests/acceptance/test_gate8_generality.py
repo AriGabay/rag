@@ -66,26 +66,21 @@ GATE_FACETS = ("flow", "task_type", "relation", "tool", "state", "no_price_clari
 # question file, each also seen in the real-model sample (docs/evaluation/real-model-sample.md, "Failure
 # analysis"). Letters: (a) interpretation/routing, (c) extraction/validation, (d) composition, (e) expectation.
 # Strict: once a gap is fixed the item passes, the xfail turns into a failure and the entry must go.
-_COMPARE_BY_NAME = ("(a) compare runs only on S# source handles already in the conversation; a new conversation "
-                    "that names the documents gets a referent clarification")
 _TOOL_CLARIFICATION = ("(e) the clarification is raised by the tool, so the plan's task type stays "
-                       "{task}; the file expects 'clarify'")
+                       "{task}; the file expects 'clarify' (a turn the server turns into a question before any "
+                       "tool runs is recorded as 'clarify'; GQ47 expects the planned task for the same kind of turn)")
 _REVIEW_TIER = ("(c) the server routes these values to review (several values in one version, a synonym or "
                 "plural naming term, an inferred unit), so no reviewed or preliminary figure exists")
 _REJECTED = "(c) server validation rejects a stated value: {why}"
 KNOWN_GAPS: dict[str, str] = {
-    **{i: _COMPARE_BY_NAME for i in ("GQ19", "GQ20", "GQ21", "GQ24", "GQ25", "GQ27")},
-    "GQ23": _TOOL_CLARIFICATION.format(task="compare"),
     "GQ51": _TOOL_CLARIFICATION.format(task="compute"),
     "GQ52": _TOOL_CLARIFICATION.format(task="compute"),
     "GQ28": _REJECTED.format(why="inner dimensions in cm (300 על 350 ס״מ) give an assumed area that goes to review"),
-    "GQ35": _REJECTED.format(why="dimensions in cm; also no predicate (< 11) in the plan, so count = n"),
-    "GQ60": _REJECTED.format(why="key/value table cell; also no predicate (> 2.70) in the plan, so count = n"),
-    "GQ40": _REJECTED.format(why="renovation years are not a quantity; no predicate (>= 2020) in the plan"),
+    "GQ35": _REJECTED.format(why="H3's inner dimensions in cm go to review, so 2 of the 3 values are observed"),
+    "GQ40": _REJECTED.format(why="a renovation is an event, not a quantity: 'no changes' (H1) has no year and "
+                                 "another stated year is not accepted, so 3 of the 5 values are observed"),
     "GQ36": _REJECTED.format(why="counts written as words (שתי מרפסות) are not parsed as values"),
-    "GQ56": _REJECTED.format(why="text attributes (zoning) are created as numeric, so no text value is accepted"),
     **{i: _REVIEW_TIER for i in ("GQ29", "GQ33", "GQ34", "GQ39", "GQ49")},
-    "GQ47": "(d) the no-matching-records abstention of the price path carries no abstention_kind",
     "GQ37": ("(a)/(d) without cloud use the question is planned as an answer (search) and the passages come "
              "with no abstention_kind; the file expects compute + not_extracted_or_verified"),
 }
@@ -147,7 +142,7 @@ class GeneralProvider(ScriptedProvider):
         return portable(entry["plan"])
 
     def _extract(self, instructions, input):
-        label = re.search(r"המאפיין המבוקש: (.+?)(?: \(שמות נוספים|\. ממד היחידה)", input).group(1)
+        label = re.search(r"המאפיין המבוקש: (.+?)(?: \(שמות נוספים|\. ממד היחידה|\. סוג הערך)", input).group(1)
         title = re.search(r'המסמך: "(.+?)"', input).group(1)
         attribute, doc = self.attribute_map.get(_norm(label)), self.titles.get(title)
         mentions = []

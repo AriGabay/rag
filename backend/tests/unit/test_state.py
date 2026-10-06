@@ -103,12 +103,45 @@ def test_new_question_starts_from_fresh_conditions():
 
 def test_compare_with_one_referenced_source_asks_which_second_appraisal():
     state = ConversationState(task_type="answer", sources={"S1": SourceRef(document_id="d1", version_id="v1", page=1)})
-    plan = TurnPlan.build(task_type="compare", turn_relation="follow_up", entities=["השומה השנייה"],
+    plan = TurnPlan.build(task_type="compare", turn_relation="follow_up",
                           steps=[{"tool": "compare", "attribute_handle": None, "source_handles": ["S1"]}])
     new, effects = apply_turn(state, plan, question="השווה את זה לשומה השנייה")
     assert effects.clarification is not None and effects.clarification.key == "referent"
     assert "שומה" in effects.clarification.question
     assert new.pending is not None and new.pending.key == "referent" and new.task_type == "clarify"
+
+
+def test_compare_with_named_entities_leaves_the_sides_to_the_orchestrator():
+    """Named addresses or titles may supply the sides (resolved to documents by the turn, which asks only when
+    they do not give two); with neither handles nor entities the referent is asked at once (R10)."""
+    named = TurnPlan.build(task_type="compare", entities=["רחוב הדקל 4"],
+                           steps=[{"tool": "compare", "attribute_handle": None, "source_handles": []}])
+    new, effects = apply_turn(ConversationState(), named, question="השווה בין גרסאות השומה ברחוב הדקל 4")
+    assert effects.clarification is None and new.entities == ["רחוב הדקל 4"]
+    bare = named.model_copy(update={"entities": []})
+    _, effects = apply_turn(ConversationState(), bare, question="השווה בין שתי השומות")
+    assert effects.clarification is not None and effects.clarification.key == "referent"
+    follow = TurnPlan.build(task_type="compare", turn_relation="follow_up",
+                            steps=[{"tool": "compare", "attribute_handle": None, "source_handles": []}])
+    _, effects = apply_turn(new, follow, question="מה השתנה בין הגרסאות?")
+    assert effects.clarification is None  # the entities of the conversation carry over to the follow-up
+
+
+def test_value_filter_follows_the_attribute():
+    from app.answering.plan import ValueFilterSpec
+
+    attr = {"handle": None, "description": "גובה החלל", "unit_dimension": "length"}
+    first = TurnPlan.build(task_type="compute", metric="count", attribute=attr,
+                           value_filter=ValueFilterSpec(op=">", value="2.7"))
+    state, _ = apply_turn(ConversationState(), first)
+    assert state.value_filter.op == ">" and state.prompt_view()["value_filter"] == {"op": ">", "value": "2.7"}
+    place = TurnPlan.build(task_type="compute", turn_relation="follow_up", conditions={"city": "גבעתיים"})
+    kept, _ = apply_turn(state, place)
+    assert kept.value_filter == state.value_filter
+    other = TurnPlan.build(task_type="compute", turn_relation="follow_up", metric="mean",
+                           attribute={**attr, "description": "שטח החלל"})
+    changed, effects = apply_turn(kept, other)
+    assert changed.value_filter is None and "value_filter" in effects.cleared
 
 
 def test_compare_with_two_sources_runs():
@@ -172,8 +205,8 @@ def test_state_keeps_only_the_last_three_questions_and_no_content():
         state, _ = apply_turn(state, TurnPlan.build(), question=q)
     assert state.recent_questions == ["ש2", "ש3", "ש4"]
     assert set(state.model_dump()) == {
-        "version", "task_type", "topic", "entities", "conditions", "attribute", "metric", "unit", "sources",
-        "pending", "recent_questions"}
+        "version", "task_type", "topic", "entities", "conditions", "attribute", "metric", "unit", "value_filter",
+        "sources", "pending", "recent_questions"}
     assert set(SourceRef.model_fields) == {"document_id", "version_id", "page"}
     assert "text" not in PendingClarification.model_fields
 

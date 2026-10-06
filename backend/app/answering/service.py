@@ -3,7 +3,8 @@
 - ``load_gazetteer``: the office's places, from verified-or-pending records and from report headers;
 - ``clarification_options`` / ``clarification_answer``: the clarifications that change a record result
   (data kind, date field, mixed area, property-type or VAT bases);
-- ``numeric_answer``: the price-per-m² answer over unique verified records (no model call).
+- ``numeric_answer``: the price-per-m² answer over unique verified records (no model call);
+- ``records_abstention_kind``: the abstention kind when no verified record matches.
 """
 
 from __future__ import annotations
@@ -102,6 +103,7 @@ def numeric_answer(conn: Connection, c: QueryConditions) -> tuple[dict, list[dic
     if stats.count == 0:
         answer = {"kind": "abstain", "text": abstain_text(c, cov["records_awaiting_verification"]),
                   "provider": "template", "demo": False, "numeric": None, "sources": [], "coverage": cov,
+                  "abstention_kind": records_abstention_kind(cov),
                   "limitations": ["לא קיים בסיס מספיק במאגר המשרד; לא הוצג מספר."]}
         return answer, []
     rows = sources_for(conn, stats.transaction_ids)
@@ -120,6 +122,11 @@ def numeric_answer(conn: Connection, c: QueryConditions) -> tuple[dict, list[dic
         "sources": source_json_rows(rows), "coverage": cov, "limitations": limitations,
     }
     return answer, rows
+
+
+def records_abstention_kind(cov: dict) -> str:
+    """No verified record matches: records awaiting verification would change that; otherwise none exist."""
+    return "not_extracted_or_verified" if cov.get("records_awaiting_verification") else "not_found"
 
 
 def mixed_basis(conn: Connection, c: QueryConditions) -> str | None:

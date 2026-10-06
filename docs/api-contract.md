@@ -95,6 +95,8 @@ Every change appends the prior state to `previous`, bumps only that attribute's 
 - **Clarifications** can be answered with a button (`clarification: {key, value}`) or in free text (`question`). Free text that answers the pending clarification resolves it (`answer.interpretation_note` says how it was read); an unrelated question is answered and the clarification stays open. A button with no matching pending clarification is **409**.
 - Two concurrent turns on one conversation: the later one is re-applied once to the fresh context; if the context changes again meanwhile it answers **409** `"השיחה עודכנה בבקשה אחרת באותו זמן. נסו לשאול שוב."`.
 - `"למה?"` and `"תראה לי את המקור"` answer from the previous answer's method and sources, re-authorized now (`answer.meta`), with no model call; they are never cached.
+- A typed message while a clarification is pending is read as a change to it only when it keeps that task's attribute and metric and changes a condition ("ובגבעתיים?"); a self-contained question is a new question, and the clarification stays open.
+- The stored turn (`questions.plan`) keeps `turn_plan`, the task the server ran after its policy (a turn the server answered with a clarification before any tool ran has task type `clarify`), and, for a model turn, `model_plan` as the model returned it.
 
 `context` (for the chips): `{attribute, metric, city, neighborhood, years: {from, to} | null, data_kind, date_field, chips: [{key, label, value}]}`. `pending_clarification`: `{key, question, options}` or null; both survive refresh and reopen.
 
@@ -140,9 +142,14 @@ Every change appends the prior state to `previous`, bumps only that attribute's 
 }
 ```
 
-- A price question keeps the `numeric` block above. Another computed attribute uses `numeric: {conditions, attribute, operation, value, unit, record_count, values}`; for an extracted attribute `record_count` and `value` cover reviewed values only, and `preliminary` (labeled separately) adds the values the server validated but no person reviewed. `coverage.facts` holds the extraction coverage counts.
+- A price question keeps the `numeric` block above. Another computed attribute uses `numeric: {conditions, attribute, operation, value, unit, record_count, values, value_filter, value_type}`; for an extracted attribute `record_count` and `value` cover reviewed values only, and `preliminary` (labeled separately) adds the values the server validated but no person reviewed. `coverage.facts` holds the extraction coverage counts.
+  - `value_type` is `numeric`, or `text` / `boolean` / `date` for an attribute stated in words (a designation, a status): its operation is `count` or `values`, and `values` lists the distinct normalized values (the text shows how many documents state each).
+  - `value_filter` (`{op: "<"|"<="|">"|">="|"="|"!=", value}` or null) is a condition on each case's value ("smaller than 11"). With `operation: "count"`, `value` is how many cases meet it and `record_count` is how many cases were observed (`"2"` of `3`); the text lists the matching documents. The condition also appears in `conditions` as `{"label": "תנאי על הערך", "value": "קטן מ-11 מ״ר"}`.
+  - A question that names an address, block/parcel or document title computes and searches over the documents that name it only (never a mean over other properties); `steps[].args.documents` in the stored turn lists them. When one address is the subject of several documents, each document's statement is shown and `limitations` says so; an address that names no visible document is stated in `limitations`.
 - Fact sources also carry `value` and `tier` (`verified | preliminary`); their `snippet` is the verbatim quote.
-- A comparison adds `compare: {sides: [{label, document_id, version_id, evidence_count}], incomplete, missing_sides, conflicts}`.
+- A comparison adds `compare: {sides: [{label, document_id, version_id, evidence_count}], incomplete, missing_sides, conflicts}`. Sides come from the conversation's sources or from the documents the question names; one named document with several versions compares its two latest versions (labeled by version). With neither, a `referent` clarification asks which documents to compare.
+- A document list (`locate`) shows only documents whose passages carry the question's topic, best first, with the pages of their supporting passages.
+- `abstention_kind` is set on every abstention, including the price path when no verified record matches (`not_found`, or `not_extracted_or_verified` when matching records await verification) and a combined answer whose computation found nothing.
 - `partial` is true when the turn deadline cut a step short or documents in scope are still being extracted; such answers are never cached. `cached` appears only on a cache hit (sources re-authorized, coverage recomputed). `cleared` lists the context items this turn cleared (a new question or topic change). `interpretation_note` is one line for the UI, or null.
 
 ## Admin (admin role only)

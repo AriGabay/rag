@@ -26,7 +26,7 @@ from app.answering.state import ConversationState, PendingClarification
 from app.extraction.normalize_text import STOPWORDS, base_normalize, prefix_variants
 from app.providers.llm import CallStatus, LLMProvider, Purpose
 
-PROMPT_VERSION = "interpret-v3"
+PROMPT_VERSION = "interpret-v4"
 MAX_PROMPT_PLACES = 300
 
 INTERPRET_INSTRUCTIONS = (
@@ -35,27 +35,44 @@ INTERPRET_INSTRUCTIONS = (
     "ומהחישובים של המערכת, לעולם לא ממך. "
     "השתמש רק בערכים שבסכמה ובמזהים שסופקו: מזהי תכונות (A#) מרשימת התכונות ומזהי מקורות (S#) ממצב השיחה. "
     "אל תכתוב SQL, שמות טבלאות או עמודות, ומזהים של מסמכים או רשומות.\n"
-    "task_type: locate רק כשהמשתמש מבקש אילו מסמכים או איפה מופיע דבר; answer לשאלה על ערך, עובדה או הסבר מתוכן המסמכים, גם כשהיא על נכס מסוים; compare להשוואה; compute לחישוב; "
-    "compute_explain לחישוב עם הסבר מתוכן; clarify כשחסר פרט שמשנה את התוצאה; abstain רק כשהשאלה אינה "
-    "עוסקת במסמכי המשרד (ידע כללי, אינטרנט, תחזית). לעולם אל תבחר abstain רק מפני שאינך יודע אם המידע "
-    "קיים במסמכים: המערכת בודקת, ומדווחת מה נמצא ומה חסר.\n"
+    "task_type: locate רק כשהמשתמש מבקש אילו מסמכים מזכירים דבר או איפה הוא כתוב, בלי חישוב ובלי תנאי על ערך; "
+    "answer לשאלה על ערך, עובדה או הסבר מתוכן המסמכים, גם כשהיא על נכס מסוים (בלי metric); compare להשוואה; "
+    "compute לחישוב על פני מסמכים; compute_explain רק כשמבקשים גם חישוב וגם הסבר או נימוק מהתוכן; clarify "
+    "כשחסר פרט שמשנה את התוצאה; abstain רק כשהשאלה אינה עוסקת במסמכי המשרד (ידע כללי, אינטרנט, תחזית). לעולם "
+    "אל תבחר abstain רק מפני שאינך יודע אם המידע קיים במסמכים: המערכת בודקת, ומדווחת מה נמצא ומה חסר.\n"
+    "חישוב (compute עם attribute ו-metric): ממוצע, סכום, טווח → mean, sum, range; 'הגבוה/הנמוך/הוותיק/החדש "
+    "ביותר' → max או min; 'מה הערכים של X בשומות' או 'X בכל אחת מהשומות' → values; 'בכמה שומות X עומד "
+    "בתנאי' → count עם value_filter; 'באילו שומות X מעל/מתחת לסף' → values עם value_filter. value_filter הוא "
+    "תנאי על ערך התכונה בכל מקרה: op (<, <=, >, >=, =, !=) ו-value — מספר ביחידה של התכונה בלי היחידה (למשל "
+    "'מעל 3 מטר' → op '>' value '3'), או טקסט עם = או != בלבד; בלי תנאי כתוב null. שנה שמתארת את הנתון "
+    "עצמו (מתי דבר נעשה או הוקם) היא value_filter על תכונה מספרית של השנה, לא year_from/year_to: אלה מסננים "
+    "רק לפי תאריך המסמך, העסקה או המועד הקובע.\n"
+    "attribute.value_type: numeric לכמות, מידה, מספר או שנה (גם שנה של אירוע); text לסיווג, סטטוס, מצב או "
+    "תיאור במילים (ספירה או רשימה של ערכים כאלה: count או values); boolean לשאלת קיום (כן/לא); date רק "
+    "לתאריך מלא (יום, חודש ושנה). "
+    "כשהשאלה מבקשת גודל, כמות או ממוצע בלי לומר של מה, שאל clarification מסוג attribute; אל תניח שזו התכונה "
+    "של הנכס כולו.\n"
+    "entities: הכתובות, מספרי גוש/חלקה או שמות המסמכים שהשאלה מזכירה, כפי שנכתבו (למשל 'רחוב הרצל 5'), "
+    "בלי עיר כפריט נפרד ובלי מילים כלליות כמו 'הדירה' או 'השומה'. השוואה בין נכסים או מסמכים שהשאלה מזכירה "
+    "בשמם או בכתובתם, בין גרסאות של מסמך, או שאלה אם יש סתירה בין מסמכים: compare עם ה-entities, גם בלי S#. "
+    "השוואה שאינה מזכירה מה להשוות ואין לה מקורות בשיחה: clarification מסוג referent.\n"
     "כלים (steps): search לחיפוש ולמענה מתוכן המסמכים; locate לרשימת המסמכים הרלוונטיים; compare להשוואה בין "
-    "מקורות (S#) או גרסאות; compute_records לחישוב על תכונה מובנית מרשימת התכונות (source=structured); "
-    "extract_and_compute לחישוב (ממוצע, סכום, טווח, ספירה וכו') על כל תכונה אחרת, כולל תכונה שאינה ברשימה: "
-    "המערכת תחלץ אותה מהמסמכים עם ציטוט ותחשב בעצמה; explain_previous ל'למה?'; show_sources לבקשת המקורות. "
+    "מקורות (S#), נכסים או גרסאות; compute_records לחישוב על תכונה מובנית מרשימת התכונות (source=structured); "
+    "extract_and_compute לחישוב על כל תכונה אחרת, כולל תכונה שאינה ברשימה: המערכת תחלץ אותה מהמסמכים עם "
+    "ציטוט ותחשב בעצמה; explain_previous ל'למה?'; show_sources לבקשת המקורות. "
     "בשאלת המשך חזור על המשימה והצעדים של התור הקודם (לפי מצב השיחה) ושנה רק את מה שנאמר.\n"
     "turn_relation: new_question לשאלה עצמאית; follow_up לשאלת המשך שמשנה רק את מה שנאמר בה; "
     "answer_to_clarification כשהפנייה עונה על ההבהרה הפתוחה, ואז clarification_answer הוא אחד מערכי האפשרויות "
-    "שלה; change_clarification כשהפנייה משנה את השאלה שעליה נשאלה ההבהרה; meta_why ל'למה?' על התשובה הקודמת; "
-    "meta_sources לבקשת המקורות של התשובה הקודמת; topic_change למעבר מפורש לנושא אחר. "
-    "שאלה שאינה קשורה להבהרה הפתוחה היא new_question.\n"
+    "שלה; change_clarification רק כשהפנייה משנה תנאי בשאלה שעליה נשאלה ההבהרה; meta_why ל'למה?' על התשובה "
+    "הקודמת; meta_sources לבקשת המקורות של התשובה הקודמת; topic_change למעבר מפורש לנושא אחר. "
+    "שאלה שלמה שאינה קשורה להבהרה הפתוחה היא new_question.\n"
     "conditions הוא שינוי בלבד: מלא רק מה שהפנייה אומרת במפורש והשאר null. מקום: רק מרשימת המקומות; מקום "
     "שאינו ברשימה כתוב כפי שנאמר. ביטוי שנה יחסי כמו 'השנה הקודמת' כתוב ב-relative_year_offset (למשל -1) "
     "ואל תחשב את השנה בעצמך. data_kind רק כשהשאלה עוסקת במחירים או בשווי; לעולם אל תבקש הבהרה על סוג נתון "
     "כספי בשאלה שאינה כספית.\n"
     "attribute: מזהה התכונה מהרשימה רק כשהיא אותה תכונה בדיוק; שטח, מידה או כמות של רכיב או חלל בתוך הנכס "
-    "הם תכונה אחרת משטח הנכס כולו. אחרת handle=null ותיאור התכונה בעברית כפי שנאמרה. "
-    "בשאלת המשך שאינה מזכירה תכונה חדשה כתוב null. metric: none כשאין חישוב.\n"
+    "הם תכונה אחרת משטח הנכס כולו, וגם מספר הפריטים ושטחם הן שתי תכונות שונות. אחרת handle=null ותיאור "
+    "התכונה בעברית כפי שנאמרה. בשאלת המשך שאינה מזכירה תכונה חדשה כתוב null. metric: none כשאין חישוב.\n"
     "search_queries: עד שלוש שאילתות חיפוש עצמאיות בעברית, מובנות בלי השיחה. steps: עד ארבעה צעדים. "
     "clarification: רק כשלא ברור לאיזה מסמך, נכס או תכונה הכוונה. אל תשאל על היקף או על סוג המסמכים: "
     "עבוד על כל המסמכים המורשים, והמערכת תציג את הכיסוי. כשאפשר לענות עם הסתייגות ברורה, אל תשאל.\n"
@@ -239,8 +256,10 @@ def interpret_with_model(provider: LLMProvider, question: str, state: Conversati
              "latency_ms": result.latency_ms}
     if not result.ok:
         return Interpretation("model", None, result.status, **usage)
+    pending = state.pending
     check = validate_plan(result.parsed, gazetteer=gazetteer, attributes=attributes, source_handles=state.sources,
-                          pending_options=[o.value for o in state.pending.options] if state.pending else None)
+                          pending_options=[o.value for o in pending.options] if pending else None,
+                          pending_labels={o.value: o.label for o in pending.options} if pending else None)
     if not check.ok:
         return Interpretation("model", None, CallStatus.INVALID, check.errors, **usage)
     return Interpretation("model", check.plan, CallStatus.OK, unknown_place=check.unknown_place, **usage)

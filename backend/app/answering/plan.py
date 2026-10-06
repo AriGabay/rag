@@ -16,12 +16,15 @@ from __future__ import annotations
 import re
 from collections.abc import Collection, Iterable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from app.answering.conditions import AreaType, DataKind, DateField
 from app.answering.parser import Gazetteer
+
+if TYPE_CHECKING:
+    from app.answering.state import ConversationState
 
 TaskType = Literal["locate", "answer", "compare", "compute", "compute_explain", "clarify", "abstain"]
 TurnRelation = Literal["new_question", "follow_up", "answer_to_clarification", "change_clarification",
@@ -36,6 +39,8 @@ ClearKey = Literal["city", "neighborhood", "years", "date_field", "data_kind", "
                    "vat_basis"]
 ClarifyKey = Literal["data_kind", "date_field", "area_type", "property_type", "vat_basis", "referent", "attribute",
                      "place", "scope"]
+ValueType = Literal["numeric", "text", "boolean", "date"]
+FilterOp = Literal["<", "<=", ">", ">=", "=", "!="]
 
 MAX_STEPS = 4
 MAX_QUERIES = 3
@@ -46,6 +51,13 @@ CONDITION_KEYS = ("city", "neighborhood", "year_from", "year_to", "date_field", 
 
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+def _with_absent(data: Any, *keys: str) -> Any:
+    """Plans and states stored before a nullable field existed read it as None (the schema stays strict)."""
+    if isinstance(data, dict) and any(k not in data for k in keys):
+        data = {**{k: None for k in keys}, **data}
+    return data
 
 
 class ConditionDelta(_Strict):
@@ -65,11 +77,26 @@ class ConditionDelta(_Strict):
 
 
 class AttributeRef(_Strict):
-    """The attribute the user asks about: a registry handle, or the Hebrew surface text when none fits."""
+    """The attribute the user asks about: a registry handle, or the Hebrew surface text when none fits.
+    ``value_type``: numeric (a quantity), text (a designation, a status, a description), boolean or date."""
 
     handle: str | None
     description: str | None
     unit_dimension: str | None
+    value_type: ValueType | None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _older(cls, data: Any) -> Any:
+        return _with_absent(data, "value_type")
+
+
+class ValueFilterSpec(_Strict):
+    """A condition on each case's value of the attribute ("smaller than 11", "= <a designation>"): a number in
+    the attribute's unit, or a text value compared with = or != only."""
+
+    op: FilterOp
+    value: str
 
 
 class Step(_Strict):
@@ -102,6 +129,12 @@ class TurnPlan(_Strict):
     steps: list[Step]
     clarification: ProposedClarification | None
     clarification_answer: str | None
+    value_filter: ValueFilterSpec | None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _older(cls, data: Any) -> Any:
+        return _with_absent(data, "value_filter")
 
     @classmethod
     def build(cls, **fields: Any) -> TurnPlan:
@@ -110,7 +143,7 @@ class TurnPlan(_Strict):
         base: dict[str, Any] = {
             "task_type": "answer", "turn_relation": "new_question", "topic": None, "entities": [],
             "attribute": None, "metric": "none", "unit": None, "search_queries": [], "steps": [],
-            "clarification": None, "clarification_answer": None,
+            "clarification": None, "clarification_answer": None, "value_filter": None,
         }
         return cls.model_validate(base | fields | {"conditions": conditions})
 
@@ -169,13 +202,23 @@ def _years_ok(c: ConditionDelta) -> bool:
 
 
 def validate_plan(raw: TurnPlan | dict, *, gazetteer: Gazetteer, attributes: Iterable[dict],
-                  source_handles: Iterable[str], pending_options: Collection[str] | None = None) -> PlanCheck:
+                  source_handles: Iterable[str], pending_options: Collection[str] | None = None,
+                  pending_labels: dict[str, str] | None = None) -> PlanCheck:
     """Server-side validation of a plan (KTD1 step 3, R4).
 
-    Rejects schema violations (unknown tools, extra fields), more than four steps or three queries, a search
-    step without a query, SQL- or UUID-looking strings, handles the server did not issue, a clarification
-    answer that is not a pending option, and inconsistent years. A place outside the office's gazetteer
-    does not reject the plan: it turns it into an unknown-place abstention.
+    Rejects schema violations (unknown tools, extra fields), SQL- or UUID-looking strings, a contradictory
+    year range and a clarification without a question. What is safe to repair is normalized instead, so a
+    usable plan never falls to the limited path over a detail (each repair only removes or narrows):
+
+    - handles the server did not issue (attribute or source) are dropped, never used;
+    - more than four steps keep the first four distinct ones, more than three queries the first three;
+    - a relative year next to an explicit year keeps the explicit year;
+    - a clarification answer that is not a pending option is read by its label, else dropped (the turn is
+      then a new question, and the pending clarification stays open);
+    - an empty value filter is dropped.
+
+    A place outside the office's gazetteer does not reject the plan: it turns it into an unknown-place
+    abstention, unless it is part of a named entity (a street of an address), where it is dropped.
     """
     try:
         plan = raw if isinstance(raw, TurnPlan) else TurnPlan.model_validate(raw)
@@ -184,10 +227,6 @@ def validate_plan(raw: TurnPlan | dict, *, gazetteer: Gazetteer, attributes: Ite
         return PlanCheck(None, ["schema"])
 
     errors: list[str] = []
-    if len(plan.steps) > MAX_STEPS:
-        errors.append("too_many_steps")
-    if len(plan.search_queries) > MAX_QUERIES:
-        errors.append("too_many_queries")
     strings = list(_strings(plan.model_dump()))
     if any(_SQL.search(s) for s in strings):
         errors.append("sql_like")
@@ -198,11 +237,7 @@ def validate_plan(raw: TurnPlan | dict, *, gazetteer: Gazetteer, attributes: Ite
     plan = _drop_unknown_attribute_handles(plan, attr_handles)
     if plan.attribute is not None and not (plan.attribute.handle or plan.attribute.description):
         errors.append("unknown_attribute_handle")
-    if {h for s in plan.steps for h in s.source_handles} - set(source_handles):
-        errors.append("unknown_source_handle")
-    if plan.clarification_answer is not None and (
-            pending_options is None or plan.clarification_answer not in pending_options):
-        errors.append("clarification_answer_not_an_option")
+    plan = _repair(plan, set(source_handles), pending_options, pending_labels or {})
     if not _years_ok(plan.conditions):
         errors.append("invalid_years")
     if plan.task_type == "clarify" and (plan.clarification is None or not plan.clarification.question.strip()):
@@ -221,12 +256,39 @@ def validate_plan(raw: TurnPlan | dict, *, gazetteer: Gazetteer, attributes: Ite
     hood = _known_place(c.neighborhood, hoods) if c.neighborhood else None
     unknown = (c.city if c.city and city is None else None) or (c.neighborhood if c.neighborhood and hood is None
                                                                  else None)
+    if unknown and any(unknown in e for e in plan.entities):
+        unknown = None  # a street of a named address read as a place: dropped below, the address scopes the turn
     if unknown:
         return PlanCheck(plan.model_copy(update={"task_type": "abstain", "steps": [], "clarification": None}),
                          [], unknown)
     if (city, hood) != (c.city, c.neighborhood):
         plan = plan.model_copy(update={"conditions": c.model_copy(update={"city": city, "neighborhood": hood})})
     return PlanCheck(plan)
+
+
+def _repair(plan: TurnPlan, sources: set[str], pending_options: Collection[str] | None,
+            pending_labels: dict[str, str]) -> TurnPlan:
+    """The safe normalizations of ``validate_plan``: each one removes or narrows, never adds."""
+    steps: list[Step] = []
+    for s in plan.steps:
+        s = s.model_copy(update={"source_handles": [h for h in dict.fromkeys(s.source_handles) if h in sources]})
+        if s not in steps:
+            steps.append(s)
+    update: dict[str, Any] = {"steps": steps[:MAX_STEPS], "search_queries": [
+        q for q in dict.fromkeys(plan.search_queries) if q and q.strip()][:MAX_QUERIES]}
+    c = plan.conditions
+    if c.relative_year_offset is not None and (c.year_from is not None or c.year_to is not None):
+        update["conditions"] = c.model_copy(update={"relative_year_offset": None})
+    answer = plan.clarification_answer
+    if answer is not None and (pending_options is None or answer not in pending_options):
+        by_label = {" ".join(label.split()): value for value, label in pending_labels.items()}
+        answer = by_label.get(" ".join(answer.split())) if pending_options is not None else None
+        update["clarification_answer"] = answer
+        if answer is None and plan.turn_relation == "answer_to_clarification":
+            update["turn_relation"] = "new_question"
+    if plan.value_filter is not None and not plan.value_filter.value.strip():
+        update["value_filter"] = None
+    return plan.model_copy(update=update)
 
 
 def _drop_unknown_attribute_handles(plan: TurnPlan, known: set[str]) -> TurnPlan:
@@ -249,25 +311,92 @@ COMPUTE_STEP_TOOLS = ("compute_records", "extract_and_compute")
 MODEL_CLARIFY_KEYS = ("referent", "attribute")
 
 
-def normalize_model_plan(plan: TurnPlan) -> TurnPlan:
-    """The server's reading of a validated model plan: the model proposes, the server decides.
+def _same_ref(a: AttributeRef | None, b: AttributeRef | None) -> bool:
+    if a is None or b is None:
+        return a is b
+    if a.handle or b.handle:
+        return a.handle == b.handle
+    return " ".join((a.description or "").split()) == " ".join((b.description or "").split())
+
+
+def _states_condition(plan: TurnPlan) -> bool:
+    c = plan.conditions
+    return bool(c.clear) or any(getattr(c, k) is not None for k in (*CONDITION_KEYS, "relative_year_offset"))
+
+
+def _relation(plan: TurnPlan, state: ConversationState | None) -> str:
+    """A change to the pending clarification must keep that task's attribute and metric and change a
+    condition ("ובגבעתיים?"); anything else is a new question, and the clarification stays open (R20). A
+    "change" with nothing pending that names another attribute or topic than the conversation is a topic
+    change."""
+    relation = plan.turn_relation
+    if relation != "change_clarification":
+        return relation
+    pending = state.pending if state is not None else None
+    if pending is not None:
+        same_task = (plan.attribute is None or _same_ref(plan.attribute, pending.attribute)) and \
+            plan.metric in ("none", pending.metric or "none")
+        return relation if same_task and _states_condition(plan) else "new_question"
+    if state is not None and ((plan.attribute is not None and state.attribute is not None
+                               and not _same_ref(plan.attribute, state.attribute))
+                              or (plan.topic and state.topic and plan.topic != state.topic)):
+        return "topic_change"
+    return "new_question"
+
+
+ORDERING_OPS = ("<", "<=", ">", ">=")
+ARITHMETIC_METRICS = ("sum", "mean", "weighted_mean", "median", "min", "max", "range")
+
+
+def _numeric_when_ordered(plan: TurnPlan) -> TurnPlan:
+    """An ordering condition ("after 2010", "below 11") or arithmetic needs numbers: an attribute typed as a
+    date, text or boolean is then computed as a number (a year compares as a number)."""
+    ref = plan.attribute
+    ordered = plan.value_filter is not None and plan.value_filter.op in ORDERING_OPS
+    if ref is None or ref.value_type in (None, "numeric") or not (ordered or plan.metric in ARITHMETIC_METRICS):
+        return plan
+    return plan.model_copy(update={"attribute": ref.model_copy(update={"value_type": "numeric"})})
+
+
+def normalize_model_plan(plan: TurnPlan, state: ConversationState | None = None) -> TurnPlan:
+    """The server's reading of a validated model plan: the model proposes, the server decides. Every rule
+    reads the plan's structure (task, attribute, metric, filter, steps), never its words.
 
     - Meta tools run only on meta turns ("למה?", "תראה לי את המקור").
-    - A proposed clarification is kept only for an unclear referent, or an attribute the plan does not
-      name; otherwise the turn proceeds with what the plan already supports.
+    - A proposed clarification is kept only for an unclear referent, or an unclear attribute (one the plan
+      does not name, or a clarify task the model chose over its generic description, e.g. "the average
+      size"); otherwise the turn proceeds with what the plan already supports.
     - "abstain" with a named attribute becomes an answer, or a computation when a metric is asked:
       whether the repository holds the datum is checked by the tools, not guessed by the model.
-    - A computation always carries a computation step."""
+    - A named attribute with a metric, or with a condition on its value, is a computation even when the
+      model planned an answer; a planned document list becomes one only with a condition or an aggregate
+      (not a bare "values"). A condition with no metric (or "values") counts the cases that meet it, and
+      the answer lists them.
+    - A follow-up that names no other attribute repeats the conversation's computation.
+    - An attribute ordered or aggregated as a number is numeric, whatever type the model gave it.
+    - A computation always carries a computation step.
+    - A change to a pending clarification is accepted only as described in ``_relation``."""
     meta = plan.turn_relation in ("meta_why", "meta_sources")
+    relation = _relation(plan, state)
+    plan = _numeric_when_ordered(plan)
     steps = [s for s in plan.steps if meta or s.tool not in META_TOOLS]
     named = plan.attribute is not None and bool(plan.attribute.handle or plan.attribute.description)
-    computes = named and plan.metric != "none"
+    metric = plan.metric
+    if plan.value_filter is not None and named and metric in ("none", "values"):
+        metric = "count"
+    computes = named and metric != "none"
     task = plan.task_type
+    if (relation == "follow_up" and state is not None and state.task_type in ("compute", "compute_explain")
+            and task in ("answer", "locate") and not any(s.tool == "compare" for s in steps)
+            and (plan.attribute is None or _same_ref(plan.attribute, state.attribute))):
+        task = state.task_type  # "ומה לגבי X?" after a computation: the same computation, one condition changed
+        computes = True
     clarification = plan.clarification
     executable = bool(steps or plan.search_queries or named)
     if clarification is not None or task == "clarify":
         keep = not executable or (clarification is not None and (
-            clarification.key == "referent" or (clarification.key == "attribute" and not named)))
+            clarification.key == "referent" or (clarification.key == "attribute"
+                                                and (task == "clarify" or not named))))
         if not keep:
             clarification = None
             if task == "clarify":
@@ -275,9 +404,17 @@ def normalize_model_plan(plan: TurnPlan) -> TurnPlan:
                         "compare" if any(s.tool == "compare" for s in steps) else "answer")
     if task == "abstain" and named:
         task = "compute" if computes else "answer"
+    # "which documents mention X" may come with metric "values": a document list unless a value is conditioned
+    # or aggregated; a question about a value with a metric is a computation
+    aggregated = plan.value_filter is not None or metric not in ("none", "values")
+    if computes and not meta and (task == "answer" or (task == "locate" and aggregated)):
+        task = "compute"
     if task in ("compute", "compute_explain") and computes and not any(s.tool in COMPUTE_STEP_TOOLS for s in steps):
-        steps = [Step(tool="extract_and_compute", attribute_handle=plan.attribute.handle, source_handles=[]),
-                 *steps][:MAX_STEPS]
+        handle = plan.attribute.handle if plan.attribute is not None else None
+        steps = [Step(tool="extract_and_compute", attribute_handle=handle, source_handles=[]), *steps][:MAX_STEPS]
     if task in ("compute", "compute_explain") and not computes and not steps:
         task = "answer"
-    return plan.model_copy(update={"task_type": task, "steps": steps, "clarification": clarification})
+    if task in ("compute", "compute_explain") and computes:
+        steps = [s for s in steps if s.tool != "locate"]  # a computation is not presented as a document list
+    return plan.model_copy(update={"task_type": task, "turn_relation": relation, "steps": steps, "metric": metric,
+                                   "clarification": clarification})

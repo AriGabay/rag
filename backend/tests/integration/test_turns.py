@@ -5,6 +5,7 @@ Every model path is scripted (``ScriptedProvider``); no real provider is called.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import uuid
 
@@ -14,6 +15,7 @@ from sqlalchemy import text
 
 from app.answering import turn
 from app.answering.attributes import bump_facts_version, resolve_attribute
+from app.answering.compose import TWO_SIDED_POLICY
 from app.answering.interpret import LIMITED_MODE_NOTE
 from app.answering.plan import TurnPlan
 from app.config import get_settings
@@ -636,3 +638,246 @@ def test_follow_up_without_any_context_asks_what_it_refers_to(client, records, m
     assert a["kind"] == "clarification"
     assert a["clarification"]["key"] == "referent" and "שאלת ההמשך" in a["clarification"]["question"]
     assert [c.purpose for c in p.calls] == [Purpose.INTERPRET]  # nothing was searched or computed
+
+
+# --- round 2: entity scope, compare by name, routing by plan structure, abstention kinds -------------------
+
+ADDRESSES = {"שומה 1": ("רחוב הדקל 4", "12"), "שומה 2": ("רחוב הגפן 9", "10"), "שומה 3": ("רחוב התאנה 2", "14")}
+
+
+def _first_evidence(text_):
+    return lambda instructions, input: claims((text_, re.findall(r'<evidence id="(E\d+)"', input)[:1]))
+
+
+def _evidence_ids(input) -> list[str]:
+    return re.findall(r'<evidence id="(E\d+)"', input)
+
+
+@pytest.fixture
+def addresses(db):
+    """Three appraisals in רמת גן, each naming its subject address in its header and stating the attribute."""
+    a = make_office(db, "משרד א", "admin-a@example.test")
+    a.docs = {}
+    for title, (address, value) in ADDRESSES.items():
+        a.docs[title], _ = add_doc(a, a.default_group_id, title,
+                                   [f"שומת דירה ב{address}, רמת גן.", f"בדירה ממ״ד בשטח {value} מ״ר."])
+    return a
+
+
+def _addresses_provider(interpret) -> ScriptedProvider:
+    p = ScriptedProvider().on(Purpose.INTERPRET, interpret, repeat=True)
+    for title, (_address, value) in ADDRESSES.items():
+        script(p, title, mention(f"ממ״ד בשטח {value} מ״ר", value, source="C2"))
+    return p
+
+
+def test_value_question_about_one_address_reads_and_computes_only_its_document(client, addresses, monkeypatch):
+    """GQ55: a single property's value is never a mean over several documents; the address scopes extraction
+    and search to its document (no city-wide computation)."""
+    p = _addresses_provider(plan(
+        task_type="answer", entities=["רחוב הדקל 4"],
+        attribute={"handle": None, "description": SAFE_ROOM, "unit_dimension": "area", "value_type": "numeric"},
+        search_queries=["שטח הממ״ד ברחוב הדקל 4"],
+        steps=[SEARCH, {"tool": "extract_and_compute", "attribute_handle": None, "source_handles": []}]))
+    p.on(Purpose.ANSWER, _first_evidence("בדירה ממ״ד בשטח 12 מ״ר")).on(Purpose.VERIFY, verdicts(1))
+    enable_cloud(addresses, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    a = post(client, "מה שטח הממ״ד בדירה ברחוב הדקל 4?")["answer"]
+    assert [c.purpose for c in p.calls].count(Purpose.EXTRACT) == 1 and '"שומה 1"' in next(
+        c.input for c in p.calls if c.purpose == Purpose.EXTRACT)
+    assert a["preliminary"]["values"] == ["12"] and a["preliminary"]["record_count"] == 1
+    assert a["numeric"]["operation"] == "values"  # one property: its value, not a mean
+    assert {s["document_id"] for s in a["sources"]} == {str(addresses.docs["שומה 1"])}
+    steps = scalar(addresses, "SELECT steps FROM questions")
+    assert steps[0]["args"]["documents"] == [str(addresses.docs["שומה 1"])]
+    assert steps[1]["args"]["documents"] == [str(addresses.docs["שומה 1"])] and steps[1]["args"]["filters"] is None
+
+
+def test_compare_by_address_names_its_sides_without_source_handles(client, addresses, monkeypatch):
+    """GQ19/GQ21: a new conversation that names two addresses compares their documents, no clarification."""
+    p = ScriptedProvider().on(Purpose.INTERPRET, plan(
+        task_type="compare", entities=["רחוב הדקל 4", "רחוב הגפן 9"], search_queries=["שטח ממ״ד"],
+        steps=[{"tool": "compare", "attribute_handle": None, "source_handles": []}]))
+    p.on(Purpose.ANSWER, lambda i, inp: {**claims(("ממ״ד בשטח 12 מ״ר", _evidence_ids(inp)[:1]),
+                                                  ("ממ״ד בשטח 10 מ״ר", _evidence_ids(inp)[-1:])), "conflicts": []})
+    p.on(Purpose.VERIFY, verdicts(2))
+    enable_cloud(addresses, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    a = post(client, "השווה את שטח הממ״ד בין הדירה ברחוב הדקל 4 לדירה ברחוב הגפן 9")["answer"]
+    assert a["kind"] == "content" and a.get("clarification") is None
+    assert [s["label"] for s in a["compare"]["sides"]] == ["שומה 1", "שומה 2"]
+    assert a["compare"]["incomplete"] is False
+    assert {s["document_id"] for s in a["sources"]} == {str(addresses.docs["שומה 1"]), str(addresses.docs["שומה 2"])}
+
+
+def test_compare_of_one_named_document_reads_its_two_latest_versions(client, db, monkeypatch):
+    """GQ24/GQ25: "between the versions of the appraisal at X" compares the old and the new version."""
+    a = make_office(db, "משרד א", "admin-a@example.test")
+    doc, old_v = add_chunks(a, a.default_group_id, ["שומת דירה ברחוב הדקל 4.", "שיעור ההתאמה לגודל הוא 5%."],
+                            "e" * 64)
+    new_v = _add_version(a, doc, ["שומת דירה ברחוב הדקל 4.", "שיעור ההתאמה לגודל הוא 7%."])
+    p = ScriptedProvider().on(Purpose.INTERPRET, plan(
+        task_type="compare", entities=["הדקל 4"], search_queries=["שיעור ההתאמה לגודל"],
+        steps=[{"tool": "compare", "attribute_handle": None, "source_handles": []}]))
+    p.on(Purpose.ANSWER, lambda i, inp: {**claims(("שיעור ההתאמה לגודל הוא 5%", _evidence_ids(inp)[:1]),
+                                                  ("שיעור ההתאמה לגודל הוא 7%", _evidence_ids(inp)[-1:])),
+                                         "conflicts": [{"datum": "שיעור ההתאמה", "claims": [0, 1]}]})
+    p.on(Purpose.VERIFY, verdicts(2))
+    enable_cloud(a, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    ans = post(client, "האם שיעור ההתאמה השתנה בין גרסאות השומה של הדקל 4?")["answer"]
+    assert ans.get("clarification") is None and ans["compare"]["incomplete"] is False
+    labels = [s["label"] for s in ans["compare"]["sides"]]
+    assert "גרסה 1" in labels[0] and "גרסה 2" in labels[1]
+    assert {s["version_id"] for s in ans["sources"]} == {str(old_v), str(new_v)}
+
+
+def test_compare_with_nothing_to_compare_asks_which_documents(client, addresses, monkeypatch):
+    """GQ54: the model invented source handles in a fresh conversation; the plan is repaired, not rejected,
+    and the turn asks which documents to compare (never a limited-mode search)."""
+    p = ScriptedProvider().on(Purpose.INTERPRET, plan(
+        task_type="compare", search_queries=["השוואה בין שתי השומות"],
+        steps=[{"tool": "compare", "attribute_handle": None, "source_handles": ["S1", "S2"]}]))
+    enable_cloud(addresses, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    a = post(client, "השווה בין שתי השומות")["answer"]
+    assert a["kind"] == "clarification" and a["clarification"]["key"] == "referent"
+    stored = scalar(addresses, "SELECT plan FROM questions")
+    assert stored["mode"] == "model" and stored["status"] == "ok" and stored["turn_plan"]["task_type"] == "clarify"
+    assert stored["model_plan"]["task_type"] == "compare"
+    assert [c.purpose for c in p.calls] == [Purpose.INTERPRET]
+
+
+def test_one_address_named_by_two_documents_shows_each_documents_statement(client, db, monkeypatch):
+    """GQ26/GQ03: the same property appraised twice: both documents are searched, the answer is asked to
+    state each document's value, and the limitation names both."""
+    a = make_office(db, "משרד א", "admin-a@example.test")
+    first, _ = add_doc(a, a.default_group_id, "שומה 2022", ["שומת דירה ברחוב הדקל 4, רמת גן.", "הבניין נבנה ב-1958."])
+    second, _ = add_doc(a, a.default_group_id, "שומה 2023", ["שומת דירה ברחוב הדקל 4, רמת גן.", "הבניין נבנה ב-1962."])
+    add_doc(a, a.default_group_id, "שומה אחרת", ["שומת דירה ברחוב הגפן 9, רמת גן.", "הבניין נבנה ב-1990."])
+    p = ScriptedProvider().on(Purpose.INTERPRET, plan(
+        task_type="answer", entities=["רחוב הדקל 4"], search_queries=["שנת הבנייה של הבניין"], steps=[SEARCH]))
+    p.on(Purpose.ANSWER, lambda i, inp: claims(("הבניין נבנה ב-1958", _evidence_ids(inp)[:1])))
+    p.on(Purpose.VERIFY, verdicts(1))
+    enable_cloud(a, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    ans = post(client, "באיזו שנה נבנה הבניין ברחוב הדקל 4?")["answer"]
+    answer_call = next(c for c in p.calls if c.purpose == Purpose.ANSWER)
+    assert TWO_SIDED_POLICY in answer_call.instructions
+    assert {s["document_id"] for s in ans["sources"]} <= {str(first), str(second)}
+    assert any(lim.startswith("השאלה מתאימה ל-2 מסמכים") for lim in ans["limitations"])
+
+
+def test_condition_on_the_value_counts_the_matching_cases_of_all_observed(client, addresses, monkeypatch):
+    """GQ35/GQ60: "which ... smaller than 13" planned as a document list is a filtered computation: how many of
+    the observed values meet the condition, and which documents."""
+    p = _addresses_provider(plan(
+        task_type="locate", search_queries=["ממ״ד קטן מ-13 מ״ר"],
+        attribute={"handle": None, "description": SAFE_ROOM, "unit_dimension": "area", "value_type": "numeric"},
+        value_filter={"op": "<", "value": "13"},
+        steps=[{"tool": "locate", "attribute_handle": None, "source_handles": []}]))
+    enable_cloud(addresses, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    a = post(client, "באילו דירות יש ממ״ד קטן מ-13 מ״ר?")["answer"]
+    assert a["kind"] == "numeric" and a["numeric"]["operation"] == "count"
+    assert a["preliminary"]["value"] == "2" and a["preliminary"]["record_count"] == 3
+    assert a["numeric"]["value_filter"] == {"op": "<", "value": "13"}
+    assert {s["title"] for s in a["sources"]} == {"שומה 1", "שומה 2"}
+    assert "• שומה 1" in a["text"] and "• שומה 2" in a["text"] and "שומה 3" not in a["text"]
+    assert f"{turn.FILTER_LABEL}: קטן מ-13 מ״ר" in a["method"]
+    assert {"label": turn.FILTER_LABEL, "value": "קטן מ-13 מ״ר"} in a["conditions"]
+    stored = scalar(addresses, "SELECT plan FROM questions")
+    assert stored["turn_plan"]["task_type"] == "compute" and stored["turn_plan"]["metric"] == "count"
+    assert stored["model_plan"]["task_type"] == "locate"
+
+
+def test_text_attribute_lists_its_distinct_values(client, db, monkeypatch):
+    """GQ56: a designation is a text attribute: its values are listed with how many documents state each."""
+    a = make_office(db, "משרד א", "admin-a@example.test")
+    p = ScriptedProvider().on(Purpose.INTERPRET, plan(
+        task_type="compute", metric="values",
+        attribute={"handle": None, "description": "סיווג המגרש", "unit_dimension": None, "value_type": "text"},
+        steps=[{"tool": "extract_and_compute", "attribute_handle": None, "source_handles": []}]), repeat=True)
+    for title, value in (("א", "מגורים ב׳"), ("ב", "מגורים ב׳"), ("ג", "מגורים ג׳")):
+        add_doc(a, a.default_group_id, title, [f"סיווג המגרש הוא {value}."])
+        script(p, title, mention(f"סיווג המגרש הוא {value}", value, source="C1", unit=None, term="סיווג המגרש"))
+    enable_cloud(a, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    ans = post(client, "אילו סיווגי מגרש מופיעים בשומות?")["answer"]
+    assert ans["kind"] == "numeric" and ans["numeric"]["value_type"] == "text"
+    assert ans["preliminary"]["values"] == ["מגורים ב׳", "מגורים ג׳"] and ans["preliminary"]["record_count"] == 3
+    assert "מגורים ב׳ (2)" in ans["text"]
+
+
+def test_locate_lists_only_documents_that_carry_the_whole_topic(client, db, monkeypatch):
+    """GQ12-GQ16: a document that shares one word of the topic is not listed when others carry all of it."""
+    a = make_office(db, "משרד א", "admin-a@example.test")
+    hit, _ = add_doc(a, a.default_group_id, "שומה עם אישור", ["התקבל אישור עירוני לתוספת קומה בשנת 2021."])
+    add_doc(a, a.default_group_id, "שומה אחרת", ["הבניין מקבל אישור אכלוס חלקי בלבד."])
+    add_doc(a, a.default_group_id, "שומה שלישית", ["תיאור הדירה והסביבה."])
+    p = ScriptedProvider().on(Purpose.INTERPRET, plan(
+        task_type="locate", search_queries=["אישור לתוספת קומה"],
+        steps=[{"tool": "locate", "attribute_handle": None, "source_handles": []}]))
+    enable_cloud(a, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    ans = post(client, "באילו שומות מוזכר אישור לתוספת קומה?")["answer"]
+    assert ans["kind"] == "content" and {s["document_id"] for s in ans["sources"]} == {str(hit)}
+    assert "שומה עם אישור" in ans["text"] and "שומה אחרת" not in ans["text"]
+
+
+def test_new_question_read_as_a_change_of_the_pending_clarification_keeps_it_open(client, records, monkeypatch):
+    """GQ52 (AE5): a self-contained question about another attribute while a clarification is pending is a
+    new question; the pending clarification stays open."""
+    add_chunks(records, records.default_group_id, CONTENT_TEXTS, "c" * 64)
+    p = ScriptedProvider().on(Purpose.INTERPRET, plan(
+        task_type="answer", turn_relation="change_clarification", search_queries=[CONTENT_Q],
+        attribute={"handle": None, "description": "היטל השבחה", "unit_dimension": None, "value_type": "text"},
+        steps=[SEARCH]))
+    p.on(Purpose.ANSWER, claims((SUPPORTED, ["E1"]))).on(Purpose.VERIFY, verdicts(1))
+    enable_cloud(records, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    r = post(client, "מה מחיר למ״ר בחרוזים?")
+    assert r["answer"]["clarification"]["key"] == "data_kind"
+    a = post(client, CONTENT_Q, r["conversation_id"])["answer"]
+    assert a["kind"] == "content" and "עדיין פתוחה" in a["interpretation_note"]
+    assert conversation(client, r["conversation_id"])["pending_clarification"]["key"] == "data_kind"
+    stored = scalar(records, "SELECT plan FROM questions WHERE question_text = :q", q=CONTENT_Q)
+    assert stored["turn_plan"]["turn_relation"] == "new_question"
+
+
+def test_no_matching_records_abstention_says_not_found(client, records):
+    """GQ47: the price path's no-records abstention carries its kind."""
+    login(client, "admin-a@example.test")
+    a = post(client, "מחיר למ״ר בעסקאות שנחתמו ב-2021 בחרוזים")["answer"]
+    assert a["kind"] == "abstain" and a["abstention_kind"] == "not_found" and a["numeric"] is None
+
+
+def test_combined_answer_keeps_the_computations_abstention_kind(client, safe_rooms, monkeypatch):
+    """GQ45: nothing extracted and the composed part fell back to passages: the answer is still an abstention
+    of the computation's kind, not an answer without one."""
+    p = ScriptedProvider().on(Purpose.INTERPRET, plan(
+        task_type="compute_explain", metric="mean", conditions={"city": "רמת גן"}, search_queries=["שטח ממ״ד"],
+        attribute={"handle": None, "description": SAFE_ROOM, "unit_dimension": "area", "value_type": "numeric"},
+        steps=[{"tool": "extract_and_compute", "attribute_handle": None, "source_handles": []}, SEARCH]))
+    for title in ("שומה אחת", "שומה שתיים", "שומה שלוש"):
+        script(p, title)
+    p.on(Purpose.ANSWER, _first_evidence("טענה שאינה נתמכת")).on(
+        Purpose.VERIFY, {"verdicts": [{"claim": 0, "verdict": "unsupported"}]})
+    enable_cloud(safe_rooms, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    a = post(client, SAFE_ROOM_Q)["answer"]
+    assert a["kind"] == "combined" and a["numeric"] is None and a["preliminary"] is None
+    assert a["abstention_kind"] == "not_stated"
+
+
+def test_address_that_names_no_document_is_a_limitation_not_an_unknown_place(client, addresses, monkeypatch):
+    """An address no visible document names: the search runs over every authorized document and says so."""
+    p = ScriptedProvider().on(Purpose.INTERPRET, plan(
+        task_type="answer", entities=["רחוב הזית 7"], search_queries=["שטח ממ״ד"], steps=[SEARCH]))
+    p.on(Purpose.ANSWER, _first_evidence("בדירה ממ״ד בשטח 12 מ״ר")).on(Purpose.VERIFY, verdicts(1))
+    enable_cloud(addresses, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    a = post(client, "מה שטח הממ״ד בדירה ברחוב הזית 7?")["answer"]
+    assert a["kind"] == "content" and a["abstention_kind"] is None
+    assert turn.UNMATCHED_NOTE.format(entity="רחוב הזית 7") in a["limitations"]
+    assert turn.UNSCOPED_NOTE in a["limitations"]

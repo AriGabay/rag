@@ -1,7 +1,7 @@
 """Typed conversation state and the pure function that applies a turn to it (KTD12, R17, R18, R20).
 
 The state holds only structure: task type, topic, entities (surface text), conditions, the attribute
-reference, metric and unit, referenced sources as ``S#`` handles (document, version, page), the pending
+reference, metric and unit, a condition on the attribute's value, referenced sources as ``S#`` handles (document, version, page), the pending
 clarification and the user's last three question texts. Answer text and document text never enter it, so
 a later prompt cannot carry content the user can no longer see; handles are re-authorized every turn.
 
@@ -28,6 +28,7 @@ from app.answering.plan import (
     ProposedClarification,
     TaskType,
     TurnPlan,
+    ValueFilterSpec,
     VatBasis,
 )
 
@@ -82,6 +83,7 @@ class PendingClarification(BaseModel):
     attribute: AttributeRef | None = None
     metric: Metric | None = None
     unit: str | None = None
+    value_filter: ValueFilterSpec | None = None
 
     def proposal(self) -> ProposedClarification:
         return ProposedClarification(key=self.key, question=self.question, options=self.options)
@@ -98,6 +100,7 @@ class ConversationState(BaseModel):
     attribute: AttributeRef | None = None
     metric: Metric | None = None
     unit: str | None = None
+    value_filter: ValueFilterSpec | None = None
     sources: dict[str, SourceRef] = Field(default_factory=dict)
     pending: PendingClarification | None = None
     recent_questions: list[str] = Field(default_factory=list)
@@ -116,7 +119,9 @@ class ConversationState(BaseModel):
             "task_type": self.task_type, "topic": self.topic, "entities": self.entities,
             "conditions": self.conditions.model_dump(exclude_none=True),
             "attribute": self.attribute.model_dump() if self.attribute else None,
-            "metric": self.metric, "unit": self.unit, "source_handles": sorted(self.sources, key=_handle_no),
+            "metric": self.metric, "unit": self.unit,
+            "value_filter": self.value_filter.model_dump() if self.value_filter else None,
+            "source_handles": sorted(self.sources, key=_handle_no),
         }
 
 
@@ -139,11 +144,12 @@ class _Context:
     attribute: AttributeRef | None
     metric: Metric | None
     unit: str | None
+    value_filter: ValueFilterSpec | None = None
 
     @classmethod
     def of(cls, src: ConversationState | PendingClarification) -> _Context:
         return cls(src.task_type, src.topic, list(src.entities), src.conditions.model_dump(), src.attribute,
-                   src.metric, src.unit)
+                   src.metric, src.unit, src.value_filter)
 
 
 def _handle_no(handle: str) -> int:
@@ -186,17 +192,22 @@ def _merge(conds: dict[str, Any], delta: ConditionDelta) -> bool:
     return resolved
 
 
-def _referent_problem(plan: TurnPlan, state: ConversationState) -> ProposedClarification | None:
-    """A compare step must identify both sides; otherwise ask instead of comparing one side (R10, R18)."""
+def _referent_problem(plan: TurnPlan, state: ConversationState,
+                      entities: list[str]) -> ProposedClarification | None:
+    """A compare step must identify both sides; otherwise ask instead of comparing one side (R10, R18). Named
+    entities (addresses, titles) may supply the sides: the orchestrator resolves them to documents and asks
+    only when they do not give two sides."""
     for step in plan.steps:
         if step.tool != "compare":
             continue
         sides = list(dict.fromkeys(step.source_handles))
+        if entities and len(sides) < 2:
+            continue
         if len(sides) == 1:
             others = [h for h in sorted(state.sources, key=_handle_no) if h not in sides]
             return ProposedClarification(key="referent", question=REFERENT_COMPARE_SECOND,
                                          options=[ClarifyOption(value=h, label=f"מקור {h}") for h in others])
-        if not sides and len(plan.entities) < 2:
+        if not sides:
             return ProposedClarification(key="referent", question=REFERENT_COMPARE_SIDES, options=[])
     return None
 
@@ -218,11 +229,11 @@ def apply_turn(state: ConversationState, plan: TurnPlan, *,
     else:
         ctx = _Context.of(state)
     before = dict(ctx.conditions)
-    before_attr, before_metric = ctx.attribute, ctx.metric
+    before_attr, before_metric, before_filter = ctx.attribute, ctx.metric, ctx.value_filter
 
     if relation in ("new_question", "topic_change"):
         topic_changed = relation == "topic_change" or bool(state.topic and plan.topic and state.topic != plan.topic)
-        ctx = _Context(None, None, [], {k: None for k in CONDITION_KEYS}, None, None, None)
+        ctx = _Context(None, None, [], {k: None for k in CONDITION_KEYS}, None, None, None, None)
     if relation in ("answer_to_clarification", "change_clarification") and pending is not None \
             and plan.clarification_answer is not None:
         if pending.key in CONDITION_KEYS:
@@ -236,7 +247,7 @@ def apply_turn(state: ConversationState, plan: TurnPlan, *,
     if attribute_changed and relation not in ("new_question", "topic_change"):
         for key in RECORD_BASIS_KEYS:
             ctx.conditions[key] = None
-        ctx.metric, ctx.unit = None, None
+        ctx.metric, ctx.unit, ctx.value_filter = None, None, None
     year_resolved = _merge(ctx.conditions, plan.conditions)
 
     ctx.task_type = plan.task_type
@@ -245,12 +256,13 @@ def apply_turn(state: ConversationState, plan: TurnPlan, *,
     ctx.attribute = plan.attribute if plan.attribute is not None else ctx.attribute
     ctx.metric = plan.metric if plan.metric != "none" else ctx.metric
     ctx.unit = plan.unit or ctx.unit
+    ctx.value_filter = plan.value_filter or ctx.value_filter
 
     clarification = plan.clarification
     if clarification is None and not year_resolved:
         clarification = ProposedClarification(key="referent", question=REFERENT_YEAR, options=[])
     if clarification is None:
-        clarification = _referent_problem(plan, state)
+        clarification = _referent_problem(plan, state, ctx.entities)
     conditions = StateConditions.model_validate(ctx.conditions)
     if clarification is not None:
         pending = PendingClarification(
@@ -258,11 +270,13 @@ def apply_turn(state: ConversationState, plan: TurnPlan, *,
             original_question=question if resolved is None else (state.pending.original_question if state.pending
                                                                   else question),
             task_type=None if plan.task_type == "clarify" else plan.task_type, topic=ctx.topic,
-            entities=ctx.entities, conditions=conditions, attribute=ctx.attribute, metric=ctx.metric, unit=ctx.unit)
+            entities=ctx.entities, conditions=conditions, attribute=ctx.attribute, metric=ctx.metric, unit=ctx.unit,
+            value_filter=ctx.value_filter)
         ctx.task_type = "clarify"
     elif relation == "change_clarification" and pending is not None:
         pending = pending.model_copy(update={"topic": ctx.topic, "entities": ctx.entities, "conditions": conditions,
-                                             "attribute": ctx.attribute, "metric": ctx.metric, "unit": ctx.unit})
+                                             "attribute": ctx.attribute, "metric": ctx.metric, "unit": ctx.unit,
+                                             "value_filter": ctx.value_filter})
         clarification = pending.proposal()  # re-ask in the changed context
         ctx.task_type = "clarify"
 
@@ -273,10 +287,12 @@ def apply_turn(state: ConversationState, plan: TurnPlan, *,
         cleared.append("attribute")
     if before_metric is not None and ctx.metric is None:
         cleared.append("metric")
+    if before_filter is not None and ctx.value_filter is None:
+        cleared.append("value_filter")
     new = ConversationState(
         version=state.version + 1, task_type=ctx.task_type, topic=ctx.topic, entities=ctx.entities,
         conditions=conditions, attribute=ctx.attribute, metric=ctx.metric, unit=ctx.unit,
-        sources=dict(state.sources), pending=pending, recent_questions=list(recent))
+        value_filter=ctx.value_filter, sources=dict(state.sources), pending=pending, recent_questions=list(recent))
     return new, TurnEffects(changed, tuple(cleared), clarification, resolved, topic_changed, state.version)
 
 
