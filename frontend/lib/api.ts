@@ -22,6 +22,7 @@ import type {
 import type { FactDetail, FactReviewGroup } from "./types";
 
 export const UNSENT_QUESTION_KEY = "rag.unsentQuestion";
+export const ACTIVE_CONVERSATION_KEY = "rag.activeConversation";
 export const LOGIN_NEXT_KEY = "rag.loginNext";
 
 export const GENERIC_ERROR = "אירעה שגיאה. נסו שוב.";
@@ -187,6 +188,8 @@ export const api = {
   newConversation: () => request<{ id: string }>("/api/conversations", { method: "POST" }),
   conversation: (id: string) => request<ConversationDetail>(`/api/conversations/${encodeURIComponent(id)}`),
   ask: (body: AskRequest) => request<AskResponse>("/api/ask", { method: "POST", body }),
+  /** Posts a turn; while the server still processes the same `turn_id` (409) it polls until the result is stored. */
+  askTurn: (body: AskRequest) => askTurn(body),
 
   // Admin
   users: () => request<{ users: AdminUser[] }>("/api/admin/users"),
@@ -213,6 +216,45 @@ export const api = {
   testProvider: () => request<AdminSettings>("/api/admin/provider/test", { method: "POST" }),
   coverage: () => request<AdminCoverage>("/api/admin/coverage"),
 };
+
+// ---------- Chat turns ----------
+
+/** The server's 409 detail for a turn that is still running (KTD13). */
+export const TURN_IN_PROGRESS = "השאלה עדיין בעיבוד";
+const POLL_INTERVAL_MS = 2_000;
+const POLL_LIMIT_MS = 150_000;
+const TURN_TIMEOUT = "המענה לשאלה מתעכב. נסו שוב בעוד רגע; השאלה לא תישלח פעמיים.";
+
+/** A v4 UUID; `crypto.randomUUID` exists only in secure contexts, so plain HTTP falls back to getRandomValues. */
+export function newTurnId(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+export function isTurnInProgress(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 409 && err.message === TURN_IN_PROGRESS;
+}
+
+/**
+ * Re-posting the same body (same `turn_id`) is the poll the contract defines: a finished turn returns its stored
+ * result unchanged, a running one answers 409 again, and a failed one runs again on its reservation.
+ */
+async function askTurn(body: AskRequest): Promise<AskResponse> {
+  const started = Date.now();
+  for (;;) {
+    try {
+      return await request<AskResponse>("/api/ask", { method: "POST", body });
+    } catch (err) {
+      if (!isTurnInProgress(err)) throw err;
+      if (Date.now() - started > POLL_LIMIT_MS) throw new ApiError(0, TURN_TIMEOUT);
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    }
+  }
+}
 
 // ---------- Facts review (U11) ----------
 

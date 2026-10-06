@@ -10,6 +10,11 @@ const nextConfig: NextConfig = {
   poweredByHeader: false,
   outputFileTracingRoot: projectRoot,
   turbopack: { root: projectRoot },
+  experimental: {
+    // The /api rewrite proxy times out after 30 s by default (next/dist/server/lib/router-utils/proxy-request.js);
+    // a chat turn may run up to TURN_DEADLINE_SECONDS (45 s), so the proxy must wait longer than that.
+    proxyTimeout: 120_000,
+  },
   async redirects() {
     return [{ source: "/", destination: "/chat", permanent: false }];
   },

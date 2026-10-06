@@ -1,7 +1,7 @@
 // Display formatting. Decimal strings are formatted directly (Intl accepts exact numeric strings),
 // so no float arithmetic touches money or area. Nothing here aggregates values.
 
-import type { Provider, ProviderMode, ProviderStatus, VersionStatus } from "./types";
+import type { AbstentionKind, ClaimKind, FactCoverage, Provider, ProviderMode, ProviderStatus, VersionStatus } from "./types";
 
 const DECIMAL_RE = /^[-+]?\d+(\.\d+)?$/;
 
@@ -146,3 +146,93 @@ export function verificationLabel(value: string | null | undefined): string {
 
 export const NUMERIC_FIELDS = new Set(["area", "price", "price_per_sqm_stated", "rooms"]);
 export const DATE_FIELDS = new Set(["transaction_date", "valuation_date", "report_date"]);
+
+// ---------- Chat answers ----------
+
+/** Short badge text for the mode an answer was produced in (the admin screen uses PROVIDER_MODE_LABEL). */
+export const ANSWER_MODE_LABEL: Record<ProviderMode, string> = {
+  cloud: "מודל ענן",
+  limited: "מצב מוגבל",
+  demo: "דמו",
+  error: "תקלה בספק המודל",
+};
+
+export const ANSWER_MODE_DESCRIPTION: Record<ProviderMode, string> = {
+  cloud: "התשובה הורכבה בעזרת מודל ענן ונבדקה מול המקורות",
+  limited: "מצב מוגבל: מודל הענן כבוי, והתשובה מבוססת על קטעי המקור בלבד",
+  demo: "תשובת דמו: מודל מדומה, לא מודל אמיתי",
+  error: "ספק המודל אינו זמין, והתשובה מבוססת על קטעי המקור בלבד",
+};
+
+export const CLAIM_KIND_LABEL: Record<ClaimKind, string> = {
+  explicit: "נאמר במסמך",
+  inferred: "הסקה",
+  computed: "חושב במערכת",
+};
+
+export const CLAIM_KIND_BADGE: Record<ClaimKind, string> = {
+  explicit: "badge-ok",
+  inferred: "badge-warn",
+  computed: "badge-info",
+};
+
+/** Each abstention kind has its own heading (R22). */
+export const ABSTENTION_HEADING: Record<AbstentionKind, string> = {
+  not_found: "לא נמצא מידע רלוונטי במסמכים",
+  not_stated: "המידע אינו נאמר במפורש במסמכים",
+  not_extracted_or_verified: "הנתון טרם חולץ או טרם אומת",
+  insufficient_permission_scope: "לא נמצא מידע במסמכים שבהרשאתכם",
+};
+
+export function abstentionHeading(kind: string | null | undefined): string {
+  return (kind && ABSTENTION_HEADING[kind as AbstentionKind]) || "לא ניתן לענות על סמך המסמכים";
+}
+
+/** Canonical unit codes of computed attributes (backend templates.UNIT_LABELS). */
+export const UNIT_LABEL: Record<string, string> = {
+  sqm: "מ״ר",
+  ILS: "₪",
+  "ILS/sqm": "₪ למ״ר",
+  room: "חדרים",
+  m: "מ׳",
+  m3: "מ״ק",
+  percent: "%",
+  month: "חודשים",
+};
+
+export const OPERATION_LABEL: Record<string, string> = {
+  count: "מספר הערכים",
+  sum: "סכום",
+  mean: "ממוצע",
+  weighted_mean: "ממוצע משוקלל",
+  median: "חציון",
+  min: "ערך מינימלי",
+  max: "ערך מקסימלי",
+  range: "טווח",
+  values: "ערכים",
+};
+
+/** A decimal string with its unit label ("12.5 מ״ר", "40 %"). Counts carry no unit. */
+export function formatQuantity(value: string | null | undefined, unit: string | null | undefined): string {
+  const n = formatDecimal(value);
+  if (n === "—") return n;
+  const label = unit ? (UNIT_LABEL[unit] ?? unit) : "";
+  return label ? `${n} ${label}` : n;
+}
+
+/** The extraction coverage counts on one line; zero counts other than scope and found are left out. */
+export function factCoverageLine(c: FactCoverage): string {
+  const parts = [`${c.in_scope} מסמכים בתחום`, `נמצא ערך ב-${c.found}`];
+  const optional: [number, string][] = [
+    [c.not_stated, `${c.not_stated} ללא הנתון`],
+    [c.partial_scan, `${c.partial_scan} נקרא חלקית`],
+    [c.not_yet_extracted, `${c.not_yet_extracted} טרם חולצו`],
+    [c.pending, `${c.pending} בחילוץ`],
+    [c.failed, `${c.failed} שחילוצם נכשל`],
+    [c.awaiting_review, `${c.awaiting_review} ערכים ממתינים לבדיקה`],
+    [c.conflicts, `${c.conflicts} ערכים סותרים`],
+    [c.unknown_metadata, `${c.unknown_metadata} ללא נתוני סינון`],
+  ];
+  for (const [n, text] of optional) if (n > 0) parts.push(text);
+  return parts.join(" · ");
+}

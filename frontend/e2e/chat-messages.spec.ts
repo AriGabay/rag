@@ -112,7 +112,9 @@ test.describe("chat messages (office A, read-only)", () => {
     await ask(page, FOLLOW_UP);
     const fresh = answerCards(page).last();
     await expect(fresh.getByText("ממוצע מחירי המ״ר")).toHaveCount(0);
-    await expect(fresh).toContainText("לאיזה נתון הכוונה?");
+    // Without context the follow-up is ambiguous: a short clarification, never a figure. The rules ask for the
+    // data kind (limited mode); in cloud mode the server asks what the follow-up refers to.
+    await expect(fresh).toContainText(/לאיזה נתון הכוונה\?|שאלת ההמשך/);
   });
 
   test("a conversation started with 'שיחה חדשה' is titled by its first question in the list", async ({ page }) => {

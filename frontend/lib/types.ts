@@ -102,6 +102,11 @@ export interface Source {
   row: number | null;
   snippet: string;
   url: string;
+  /** Fact sources: the value in the attribute's canonical unit and whether a person reviewed it. */
+  value?: string | null;
+  tier?: "verified" | "preliminary";
+  /** Compare sources: the side / version label (for example "גרסה 2"). */
+  label?: string | null;
 }
 
 export interface RecordSummary {
@@ -197,6 +202,7 @@ export interface Clarification {
   options: ClarificationOption[];
 }
 
+/** The price-per-sqm block of a price question. */
 export interface NumericResult {
   conditions: Condition[];
   record_count: number;
@@ -210,27 +216,107 @@ export interface NumericResult {
   conflicts: number;
 }
 
+/** Any other computed attribute; for an extracted attribute the figure covers reviewed values only. */
+export interface AttributeNumeric {
+  conditions: Condition[];
+  attribute: string;
+  operation: string;
+  value: DecimalString | null;
+  unit: string | null;
+  record_count: number;
+  minimum?: DecimalString | null;
+  maximum?: DecimalString | null;
+  /** Listed when there are five or fewer observations. */
+  values?: DecimalString[] | null;
+}
+
+/** Values the server validated mechanically but no person reviewed, shown as a separately labeled figure. */
+export interface Preliminary {
+  value: DecimalString | null;
+  record_count: number;
+  values: DecimalString[] | null;
+}
+
+/** Extraction coverage of an attribute over the documents in scope (R14). */
+export interface FactCoverage {
+  in_scope: number;
+  found: number;
+  not_stated: number;
+  partial_scan: number;
+  pending: number;
+  failed: number;
+  not_yet_extracted: number;
+  awaiting_review: number;
+  conflicts: number;
+  unknown_metadata: number;
+}
+
 export interface Coverage {
   text: string;
   docs_pending: number;
   docs_failed: number;
   docs_needs_review: number;
   records_awaiting_verification: number;
+  facts?: FactCoverage | null;
+}
+
+export type ClaimKind = "explicit" | "inferred" | "computed";
+
+export interface Claim {
+  text: string;
+  kind: ClaimKind;
+  evidence_ids: string[];
+}
+
+export type AbstentionKind = "not_found" | "not_stated" | "not_extracted_or_verified" | "insufficient_permission_scope";
+
+export interface CompareConflict {
+  datum: string;
+  sides: { label: string; text: string; evidence_ids: string[] }[];
+}
+
+export interface CompareInfo {
+  sides: { label: string; document_id: string; version_id: string; evidence_count: number }[];
+  incomplete: boolean;
+  missing_sides: string[];
+  conflicts: CompareConflict[];
+}
+
+/** One context item of the conversation state; `key` is what `remove` takes. */
+export interface ContextChip {
+  key: string;
+  label: string;
+  value: string;
 }
 
 export type AnswerKind = "numeric" | "clarification" | "content" | "combined" | "abstain";
 export type Provider = "template" | "mock" | "cloud" | "extractive";
 
+/** Keys after `limitations` are absent from answers stored before the general question engine. */
 export interface Answer {
   kind: AnswerKind;
   text: string;
   provider: Provider;
   demo: boolean;
   clarification?: Clarification | null;
-  numeric?: NumericResult | null;
+  numeric?: NumericResult | AttributeNumeric | null;
   sources: Source[];
   coverage?: Coverage | null;
   limitations: string[];
+  mode?: ProviderMode;
+  claims?: Claim[];
+  abstention_kind?: AbstentionKind | null;
+  dropped_claims?: number;
+  preliminary?: Preliminary | null;
+  method?: string | null;
+  conditions?: Condition[];
+  partial?: boolean;
+  pending_extraction?: number;
+  interpretation_note?: string | null;
+  cleared?: ContextChip[];
+  meta?: "explain_previous" | "show_sources" | null;
+  compare?: CompareInfo | null;
+  cached?: boolean;
 }
 
 export interface Message {
@@ -248,15 +334,28 @@ export interface ConversationListItem {
   updated_at: string;
 }
 
+/** The server-held conversation context (R17); `chips` drive the context strip. */
+export interface ConversationContext {
+  attribute: string | null;
+  metric: string | null;
+  city: string | null;
+  neighborhood: string | null;
+  years: { from: number | null; to: number | null } | null;
+  data_kind: string | null;
+  date_field: string | null;
+  chips: ContextChip[];
+}
+
 export interface ConversationDetail {
   id: string;
   title: string | null;
-  // Shape not pinned by the contract: accepted as a list of {label, value} or a key/value object.
-  confirmed_conditions: Condition[] | Record<string, unknown> | null;
+  confirmed_conditions: Condition[] | null;
   pending_clarification: Clarification | null;
+  context?: ConversationContext | null;
   messages: Message[];
 }
 
+/** Explicit condition edits, applied by the server as a delta to the conversation context. */
 export interface AskFilters {
   city?: string;
   neighborhood?: string;
@@ -268,14 +367,19 @@ export interface AskFilters {
 
 export interface AskRequest {
   conversation_id?: string;
+  /** One per user action, reused on retries so a turn never applies twice. */
+  turn_id?: string;
   question?: string;
   filters?: AskFilters;
+  /** Context chip keys to clear (`ContextChip.key`). */
+  remove?: string[];
   clarification?: { key: string; value: string };
 }
 
 export interface AskResponse {
   conversation_id: string;
   question_id: string;
+  turn_id?: string;
   answer: Answer;
 }
 
