@@ -419,3 +419,14 @@ def test_a_self_contained_new_question_is_searched_instead_of_asked_back():
     compare = normalize_model_plan(_model_plan(task_type="clarify", clarification="referent", tools=["compare"]),
                                    None, "השווה בין השומות")
     assert compare.clarification is not None
+
+
+def test_a_continuation_in_an_empty_conversation_is_never_searched_as_a_new_question():
+    """Browser run 10: "ומה לגבי 2023?" labeled new_question + referent in an empty conversation was searched over
+    the whole repository by the self-contained rule. A continuation keeps its clarification."""
+    from app.answering.plan import continuation_form, normalize_model_plan
+
+    assert continuation_form("ומה לגבי 2023?") and continuation_form("ובתל אביב?")
+    assert not continuation_form("באיזו שומה הנכס נבדק מבחוץ בלבד?")
+    p = normalize_model_plan(_model_plan(task_type="clarify", clarification="referent"), None, "ומה לגבי 2023?")
+    assert p.clarification is not None and p.task_type == "clarify"

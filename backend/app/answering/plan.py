@@ -377,6 +377,18 @@ def _names_clearly(plan: TurnPlan) -> bool:
     return bool(distinctive_words(ref.description)) if ref.description else True
 
 
+# A turn that opens with "ו" ("ומה לגבי 2023?", "ובתל אביב?") or a follow-up phrase continues an earlier question.
+# Only "ו" before a question word or a prefixed word ("ומה", "ובתל אביב", "ולגבי"), never a noun that happens to
+# start with ו ("ועדת ...").
+_CONTINUATION = re.compile(r"^\s*(ו(מה|מי|איך|למה|כמה|האם|אם|עם|גם|במה|ב\S+|ל\S+)(?=\s|\?|$)"
+                           r"|מה\s+(לגבי|עם)(?=\s)|באותם תנאים|אותו דבר)")
+
+
+def continuation_form(question: str) -> bool:
+    """Whether the turn is worded as a continuation of an earlier question, not as a question of its own."""
+    return bool(_CONTINUATION.search(base_normalize(question or "")))
+
+
 def _mentioned(place: str, question: str) -> bool:
     """Whether the question names the place (or the part of a hyphenated name before the hyphen, "תל אביב" for
     "תל אביב-יפו"), with or without a prefix letter."""
@@ -448,6 +460,7 @@ def normalize_model_plan(plan: TurnPlan, state: ConversationState | None = None,
         computes = True
     clarification = plan.clarification
     if (clarification is not None and clarification.key == "referent" and question and relation == "new_question"
+            and not continuation_form(question)
             and not steps and not plan.search_queries and not named and not plan.entities):
         # "Which appraisal mentions X?" asked back as "which appraisal do you mean?": a new, self-contained
         # question with nothing to compare is searched as asked; the answer shows what the documents hold

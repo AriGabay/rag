@@ -110,7 +110,9 @@ test.describe("general conversations (office A, read-only)", () => {
     await expectModeBadge(card1, mode);
     if (mode === "cloud") {
       // A computation over the documents in scope, with its coverage and method in the details.
-      expect(["numeric", "abstain"]).toContain(first.answer.kind);
+      // "combined" when the plan also searched for passages (a figure plus explanation, R1); the figure, its
+      // coverage and its observation count are checked below either way.
+      expect(["numeric", "combined", "abstain"]).toContain(first.answer.kind);
       expect(first.answer.coverage?.facts?.in_scope ?? 0).toBeGreaterThan(0);
       if (first.answer.kind === "abstain") expect(first.answer.abstention_kind).toBe("not_extracted_or_verified");
       else await expect(card1.getByText(/מבוסס על \d+ תצפיות/).first()).toBeVisible();

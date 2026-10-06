@@ -74,6 +74,7 @@ from app.answering.plan import (
     Step,
     TurnPlan,
     ValueFilterSpec,
+    continuation_form,
     normalize_model_plan,
 )
 from app.answering.plan import validate_plan as _validate_plan
@@ -1390,7 +1391,8 @@ def execute_turn(ctx: TenantContext, it: Interpreted, L: Loaded, question_id: UU
 
     if it.mode == "model" and it.plan is not None:
         it.plan = normalize_model_plan(it.plan, L.state, it.question)
-        if it.plan.turn_relation == "follow_up" and not _has_context(L.state):
+        if not _has_context(L.state) and (it.plan.turn_relation == "follow_up" or (
+                continuation_form(it.question) and it.plan.task_type == "clarify")):
             it.plan = it.plan.model_copy(update={"task_type": "clarify", "steps": [], "clarification": (
                 ProposedClarification(key="referent", question=FOLLOW_UP_WITHOUT_CONTEXT, options=[]))})
     plan, start = _expand_versions(ctx, it.plan, L.state)
