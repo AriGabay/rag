@@ -131,7 +131,9 @@ def gather_sides(conn: Connection, question: str, sides: Sequence[CompareSide], 
 
 def compose_comparison(g: CompareGathered, provider: LLMProvider | None, state: ProviderState) -> CompareOutcome:
     """The compose phase: the answer and judge calls, with no database connection (R26). Every side needs
-    evidence; otherwise the comparison is incomplete and no model is called. The caller logs ``usage``."""
+    evidence; otherwise the comparison is incomplete and no model is called. When the verified claims cite
+    only some sides, the comparison is incomplete too and names the uncovered sides. The caller logs
+    ``usage``."""
     if g.missing:
         body = (f"ההשוואה אינה שלמה: לא נמצאו ראיות רלוונטיות עבור {', '.join(g.missing)}"
                 " במסמכים שאתם מורשים לראות. לא מוצגת השוואה חד-צדדית.")
@@ -150,7 +152,7 @@ def compose_comparison(g: CompareGathered, provider: LLMProvider | None, state: 
     answer = {"kind": "content", "text": comp.text, "provider": comp.provider, "demo": comp.demo,
               "sources": source_json(g.evidence), "coverage": g.coverage, "limitations": limitations,
               "numeric": None, **answer_fields(comp, state.mode.value),
-              "compare": {"sides": g.side_info, "incomplete": False, "missing_sides": [],
+              "compare": {"sides": g.side_info, "incomplete": comp.incomplete, "missing_sides": comp.uncovered,
                           "conflicts": comp.conflicts}}
     return CompareOutcome(answer, g.source_rows, cacheable=comp.cacheable and state.mode != Mode.ERROR,
                           usage=comp.usage)

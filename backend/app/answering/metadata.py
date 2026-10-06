@@ -155,6 +155,11 @@ def header_places(conn: Connection) -> set[tuple[str | None, str]]:
     return places
 
 
+def place_matches(wanted: str, values: frozenset[str]) -> bool:
+    """Whether a named place is one of a version's places (public form, used by entity resolution)."""
+    return _place_matches(wanted, values)
+
+
 def _place_matches(wanted: str, values: frozenset[str]) -> bool:
     """Equal after normalization, or one names the other with a suffix ('תל אביב' ~ 'תל אביב-יפו')."""
     w = _place(wanted) or ""

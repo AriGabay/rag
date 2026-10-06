@@ -349,3 +349,124 @@ def test_records_less_report_takes_place_and_date_from_its_header(office):
         assert version_metadata(conn, [ver])[ver].dates["valuation_date"] == frozenset({date(2024, 3, 15)})
         places = header_places(conn)
     assert {(None, "רמת גן"), ("רמת גן", "הבורסה"), (None, "חיפה")} <= places
+
+
+# --- Retrieval round 2: small scopes keep every page, locate ranks documents ---------------------------
+
+def _doc(office, chunks, title="מסמך", group=None):
+    from tests.integration.test_entities import add_doc
+
+    return add_doc(office, group or office.default_group_id, chunks, title)
+
+
+def test_small_scope_keeps_the_best_passage_of_every_page(office):
+    """A narrow scope (the documents an address resolved to) returns each page's best supported passage,
+    even when the address words fill page 1 and global ranking would cut page 2."""
+    from app.platform.search import SearchScope
+
+    a, *_ = office
+    page1 = [(f"כתובת הנכס: הדקלים 7. סעיף {i}: הדירה ברחוב הדקלים 7 בקומה {i}.", [1]) for i in range(10)]
+    doc, _ = _doc(a, [*page1, ("סוג הקרקע לפי התכנית החלה: חקלאית.", [2])])
+    other, _ = _doc(a, [("סוג הקרקע: מגורים. הנכס ברחוב אחר.", [1])])
+    for i in range(12):  # the topic words are common in the office, the address words are rare
+        _doc(a, [(f"סוג הקרקע: מגורים {i}.", [1])])
+    out = _search(a.ctx(), ["מה סוג הקרקע ברחוב הדקלים 7?"], 4, scope=SearchScope(document_ids=(doc,)),
+                  place_terms=["רחוב הדקלים 7"])
+    assert all(h["document_id"] == doc for h in out.hits)
+    supported = [h for h in out.hits if h["lexical_support"]]
+    assert supported and supported[0]["page_list"] == [2] and "חקלאית" in supported[0]["text"]
+    assert other not in {h["document_id"] for h in out.hits}
+
+
+def test_small_scope_returns_each_documents_pages(office):
+    from app.platform.search import SearchScope
+
+    a, *_ = office
+    filler = [(f"הערה כללית {i} על הבניין ועל הסביבה.", [1]) for i in range(8)]
+    one, _ = _doc(a, [*filler, ("שיעור ההיוון שנקבע: 5%.", [2]), ("שיעור ההיוון אושר בוועדה.", [3])])
+    two, _ = _doc(a, [*filler, ("שיעור ההיוון שנקבע: 6%.", [2])])
+    hits = _search(a.ctx(), ["שיעור ההיוון"], 2, scope=SearchScope(document_ids=(one, two))).hits
+    pages = {(h["document_id"], h["page_list"][0]) for h in hits if h["lexical_support"]}
+    assert pages == {(one, 2), (one, 3), (two, 2)}
+
+
+def _locate(ctx, queries, **kw):
+    from app.platform.search import locate_documents
+
+    with tenant_tx(ctx) as conn:
+        return locate_documents(conn, queries, **kw)
+
+
+def test_locate_keeps_only_documents_with_full_topic_support(office):
+    a, *_ = office
+    exact, _ = _doc(a, [("רקע כללי.", [1]), ("ניתן אישור חריגה לתוספת הקומה.", [2])])
+    inflected, _ = _doc(a, [("האישור לחריגה התקבל בשנת 2019.", [1])])
+    approval_only, _ = _doc(a, [("אישור הוועדה המקומית לתוכנית.", [1])])
+    deviation_only, _ = _doc(a, [("קיימת חריגה מקו הבניין.", [1])])
+    far_apart, _ = _doc(a, [("אישור המשכנתא התקבל. בדירה נמצאה גם חריגה קלה בחלון.", [1])])
+    _doc(a, [("שומות קודמות בבניין.", [1])])
+    ranked = _locate(a.ctx(), ["באילו שומות מוזכר אישור חריגה?"])
+    assert {d.document_id for d in ranked} == {exact, inflected}
+    first = next(d for d in ranked if d.document_id == exact)
+    assert first.full_support and first.pages == [2]
+    assert first.passages and "אישור חריגה" in first.passages[0]["text"]
+    assert first.passages[0]["lexical_support"] and first.passages[0]["document_id"] == exact
+    assert {approval_only, deviation_only, far_apart}.isdisjoint({d.document_id for d in ranked})
+
+
+def test_locate_negation_question_finds_the_negated_passage(office):
+    a, *_ = office
+    none_word, _ = _doc(a, [("בבניין אין גינה משותפת.", [1])])
+    without, _ = _doc(a, [("דירה ללא גינה, בקומה שנייה.", [1])])
+    not_incl, _ = _doc(a, [("הבניין נבנה בשנת 1972 ואינו כולל גינה.", [1])])
+    has_it, _ = _doc(a, [("לבניין גינה מטופחת.", [1])])
+    other_sentence, _ = _doc(a, [("הגינה מטופחת ומוארת. אין חניה.", [1])])
+    for question in ("באילו שומות כתוב שאין גינה?", "איפה מצוין שאין גינה בכלל?"):
+        ranked = _locate(a.ctx(), [question])
+        assert {d.document_id for d in ranked} == {none_word, without, not_incl}, question
+        for d in ranked:
+            assert any(w in d.passages[0]["text"] for w in ("אין", "ללא", "אינו")), question
+    assert {has_it, other_sentence}.isdisjoint({d.document_id for d in _locate(a.ctx(), ["שאין גינה"])})
+
+
+def test_locate_partial_support_keeps_the_best_within_a_relative_threshold(office):
+    a, *_ = office
+    strong, _ = _doc(a, [("חוות הדעת מתייחסת לפיצול הדירה לשתי יחידות.", [1])])
+    weak, _ = _doc(a, [("הדירה בקומה שלישית.", [1])])
+    ranked = _locate(a.ctx(), ["איפה מוזכר פיצול של נכס מסחרי?"])
+    assert [d.document_id for d in ranked] == [strong]
+    assert not ranked[0].full_support and "פיצול" in ranked[0].matched_terms
+    assert weak not in {d.document_id for d in ranked}
+
+
+def test_locate_word_present_in_every_document_does_not_count(office):
+    a, *_ = office
+    docs = [_doc(a, [(f"הדירה בקומה {i}.", [1])])[0] for i in range(4)]
+    sukkah, _ = _doc(a, [("לדירה מרפסת סוכה פתוחה.", [1])])
+    ranked = _locate(a.ctx(), ["באילו דירות יש סוכה?"])
+    assert [d.document_id for d in ranked] == [sukkah]
+    assert set(docs).isdisjoint({d.document_id for d in ranked})
+
+
+def test_locate_table_question_prefers_a_table_row(office):
+    a, *_ = office
+    table, _ = _doc(a, [("נתוני היחידה", [1]), ("כתובת: הנרקיס 2 | שטח מרתף (מ״ר): 30", [1], "table_row")])
+    prose, _ = _doc(a, [("למרתף שטח של 30 מ״ר.", [1])])
+    ranked = _locate(a.ctx(), ["באיזו שומה יש טבלה עם עמודה של שטח מרתף?"])
+    assert [d.document_id for d in ranked] == [table]
+    assert ranked[0].passages[0]["kind"] == "table_row"
+    assert prose not in {d.document_id for d in ranked}
+
+
+def test_locate_respects_scope_and_groups(office):
+    from app.platform.search import SearchScope
+
+    a, hidden, emp = office
+    one, _ = _doc(a, [("הוגשה התנגדות לתוכנית.", [1])])
+    two, _ = _doc(a, [("הוגשה התנגדות נוספת.", [1])])
+    secret, _ = _doc(a, [("סודי: הוגשה התנגדות.", [1])], group=hidden)
+    assert {d.document_id for d in _locate(a.ctx(), ["התנגדות"])} == {one, two, secret}
+    assert [d.document_id for d in _locate(a.ctx(), ["התנגדות"], scope=SearchScope(document_ids=(two,)))] == [two]
+    emp_ctx = TenantContext(a.office_id, emp, "employee")
+    assert {d.document_id for d in _locate(emp_ctx, ["התנגדות"])} == {one, two}
+    assert _locate(a.ctx(), ["מילה שאינה קיימת בשום מקום"]) == []

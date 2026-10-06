@@ -1,6 +1,6 @@
 """Claim-level verification (KTD11, R23): layer 1 is deterministic per claim, layer 2 is one judge call."""
 
-from app.answering.verify import JudgeOutput, check_claim, judge_claims, numbers_in
+from app.answering.verify import JUDGE_POLICY, JudgeOutput, check_claim, judge_claims, judge_input, numbers_in
 from app.providers.llm import CallStatus, Purpose
 from tests.support.scripted_provider import ScriptedProvider
 
@@ -81,3 +81,51 @@ def test_judge_missing_verdict_counts_as_unsupported_and_failure_returns_none():
     assert verdicts == {0: "partial", 1: "unsupported"}
     verdicts, result = judge_claims(ScriptedProvider().on(Purpose.VERIFY, CallStatus.TIMEOUT), _judge_items())
     assert verdicts is None and result.status == CallStatus.TIMEOUT
+
+
+# --- Restating a cited span: number formats and the question's own subject (real-model sample, (d)) -------
+
+
+def test_number_formats_of_the_same_value_match():
+    ev = {"E1": "גובה תקרה | 2.80 מ׳. השטח 1,250 מ״ר. המועד הקובע: 14/02/2023. הותקנה ב2019 מעלית."}
+    for text in ("גובה התקרה 2.8 מ׳", "השטח 1250 מ״ר", "המועד הקובע הוא 14.2.2023", "המעלית הותקנה ב-2019"):
+        assert check_claim(text, ["E1"], [], "explicit", evidence=ev, computed_numbers=set()) == [], text
+
+
+def test_a_count_written_as_a_word_in_the_evidence_supports_its_digit():
+    ev = {"E1": "לדירה צמודות שתי חניות תת-קרקעיות."}
+    assert check_claim("לדירה 2 חניות צמודות", ["E1"], ["2"], "explicit", evidence=ev, computed_numbers=set()) == []
+    assert "unsupported_number" in check_claim("לדירה 3 חניות", ["E1"], ["3"], "explicit", evidence=ev,
+                                               computed_numbers=set())
+
+
+def test_the_question_subject_restated_in_a_claim_is_not_an_unsupported_number():
+    """GQ10: the claim names the address the user asked about; the cited table row holds only the year."""
+    ev = {"E1": "שנת בנייה | 1968"}
+    q = "מה שנת הבנייה של הבניין ברחוב המאבק 25 לפי טבלת מאפייני הנכס?"
+    text = "שנת הבנייה של הבניין ברחוב המאבק 25 היא 1968."
+    assert "unsupported_number" in check_claim(text, ["E1"], ["1968"], "explicit", evidence=ev,
+                                               computed_numbers=set())
+    assert check_claim(text, ["E1"], ["1968"], "explicit", evidence=ev, computed_numbers=set(), question=q) == []
+    # "בבן יהודה 140" restates "ברחוב בן יהודה 140" (a prefix letter differs)
+    assert check_claim("בדירה בבן יהודה 140 גובה התקרה 2.80 מ׳", ["E2"], ["2.80"], "explicit",
+                       evidence={"E2": "גובה תקרה 2.80 מ׳"}, computed_numbers=set(),
+                       question="מה גובה התקרה בדירה ברחוב בן יהודה 140?") == []
+
+
+def test_a_question_number_stated_as_the_claims_value_still_needs_evidence():
+    ev = {"E1": "הבניין נבנה בשנת 1962."}
+    q = "האם הבניין נבנה בשנת 1958?"
+    # the model declares 1958 as the claim's value: it is a fact, not the question's subject
+    assert "unsupported_number" in check_claim("הבניין נבנה בשנת 1958", ["E1"], ["1958"], "explicit",
+                                               evidence=ev, computed_numbers=set(), question=q)
+    # a question number under another word is not a restatement either
+    assert "unsupported_number" in check_claim("בבניין 1958 דירות", ["E1"], [], "explicit", evidence=ev,
+                                               computed_numbers=set(), question=q)
+
+
+def test_judge_input_names_each_spans_document():
+    items = [(0, "גובה התקרה 3.05 מ׳", [("E1", "גובה התקרה בדירה 3.05 מ׳")])]
+    out = judge_input(items, {"E1": "שומה בן יהודה 140, עמ׳ 1, 3. תיאור הנכס"})
+    assert 'source="שומה בן יהודה 140, עמ׳ 1, 3. תיאור הנכס"' in out and "3.05" in out
+    assert "partial" in JUDGE_POLICY and "2.80" in JUDGE_POLICY  # format equivalence and subject rules

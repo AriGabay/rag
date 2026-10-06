@@ -133,6 +133,47 @@ def test_unsupported_claim_is_dropped_and_stated(client, office, monkeypatch):
     assert any("הושמטה" in lim for lim in a["limitations"])
 
 
+def _evidence_id(input: str, needle: str) -> str:
+    return input.split(needle)[0].rsplit('<evidence id="', 1)[1].split('"')[0]
+
+
+YEAR_ROW = "מאפייני הנכס ברחוב המאבק: שנת בנייה | 1968"
+YEAR_Q = "מה שנת הבנייה של הבניין ברחוב המאבק 25?"
+
+
+def test_a_claim_restating_the_asked_address_is_kept(client, office, monkeypatch):
+    """Real-model sample GQ10: the claim names "המאבק 25" from the question; the row holds only the year."""
+    add_chunks(office, office.default_group_id, [YEAR_ROW], "3" * 64)
+
+    def answer(instructions, input):
+        return claims(("שנת הבנייה של הבניין ברחוב המאבק 25 היא 1968", [_evidence_id(input, YEAR_ROW)],
+                       "explicit"))
+
+    p = scripted(answer, verdicts("supported"))
+    enable_cloud(office, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    a = ask(client, YEAR_Q)["answer"]
+    assert a["provider"] == "cloud" and a["dropped_claims"] == 0
+    assert a["text"].startswith("שנת הבנייה של הבניין ברחוב המאבק 25 היא 1968 [E")
+    assert "source=" in p.calls[-1].input  # the judge sees where each span comes from
+
+
+def test_claims_stating_only_absence_abstain_as_not_stated(client, office, monkeypatch):
+    """Real-model sample GQ42: absence written as claims is an abstention with its kind."""
+    add_chunks(office, office.default_group_id, [YEAR_ROW], "3" * 64)
+
+    def answer(instructions, input):
+        return claims(("שטח הממ״ד בבניין ברחוב המאבק אינו מצוין במסמך", [_evidence_id(input, YEAR_ROW)],
+                       "explicit"), insufficient=True, missing="שטח הממ״ד")
+
+    p = scripted(answer)
+    enable_cloud(office, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    a = ask(client, "מה שטח הממ״ד בבניין ברחוב המאבק?")["answer"]
+    assert a["abstention_kind"] == "not_stated" and a["claims"] == [] and a["numeric"] is None
+    assert [c.purpose for c in p.calls] == [Purpose.INTERPRET, Purpose.ANSWER]
+
+
 def test_judge_timeout_quotes_evidence_and_logs_timeout(client, office, monkeypatch):
     enable_cloud(office, monkeypatch, scripted(claims((SUPPORTED, ["E1"], "explicit")), CallStatus.TIMEOUT))
     login(client, "admin-a@example.test")

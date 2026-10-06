@@ -94,3 +94,9 @@ def test_structured_text_range_and_count_and_many_values():
                                  uncertain=2)
     assert "מספר העסקאות" in body and "2" in body
     assert any("2 זוגות" in x for x in lims)
+
+
+def test_a_text_definition_has_its_own_key_and_the_numeric_key_is_unchanged():
+    assert proposed_key("ייעוד המגרש") == proposed_key("ייעוד המגרש", "numeric")
+    assert proposed_key("ייעוד המגרש", "text") != proposed_key("ייעוד המגרש")
+    assert proposed_key("ייעוד המגרש", "text") == proposed_key("ייעוד  המגרש", "text")

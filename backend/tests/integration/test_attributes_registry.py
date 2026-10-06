@@ -139,3 +139,21 @@ def test_other_office_registry_is_invisible(offices):
         assert b_attr.id not in {r["id"] for r in rank_candidates(conn, "שטח ממ״ד", limit=10)}
         assert bump_facts_version(conn, b_attr.id) is None
     assert resolve(b, "שטח ממ״ד").facts_version == 1
+
+
+def test_text_value_type_is_honored_and_never_reuses_a_numeric_definition(offices):
+    """Found with the real model: text attributes (zoning, planning status) were always numeric, so no text value
+    could be accepted. A caller that says text gets a text definition, even when a numeric one has the label."""
+    a, _ = offices
+    numeric = resolve(a, "ייעוד המגרש", unit_dimension=None)  # an earlier turn created it without a type
+    assert numeric.value_type == "numeric"
+    zoning = resolve(a, "ייעוד המגרש", unit_dimension="area", value_type="text")
+    assert zoning.created and zoning.value_type == "text" and zoning.id != numeric.id
+    assert (zoning.unit_dimension, zoning.canonical_unit) == (None, None)  # a text value has no unit
+    assert resolve(a, "ייעוד המגרש", unit_dimension=None, value_type="text").id == zoning.id
+    assert resolve(a, "ייעוד המגרש", unit_dimension=None).id == numeric.id  # no type asked: the oldest match
+    shown = next(h["handle"] for h in handles(a) if h["id"] == numeric.id)
+    assert resolve(a, None, handle=shown, unit_dimension=None, value_type="text").id == zoning.id
+    assert resolve(a, "מחיר", unit_dimension=None, value_type="text").source == "structured"
+    with pytest.raises(ValueError):
+        resolve(a, "צבע החזית", unit_dimension=None, value_type="color")

@@ -1,11 +1,16 @@
 """Claims-first answer composition (KTD11, R22–R24): the server renders text from verified claims."""
 
+import pytest
+
 from app.answering.compose import (
     ABSTENTION_TEXT,
     INFERRED_LABEL,
     ComposedAnswer,
     ComputedValue,
+    combined_abstention_kind,
     compose_answer,
+    dedupe_units,
+    is_absence_claim,
 )
 from app.answering.verify import JUDGE_POLICY
 from app.providers.llm import SYSTEM_POLICY, CallStatus, MockLLM, Purpose
@@ -203,9 +208,194 @@ def test_compare_claims_are_labeled_by_side_and_conflicts_cite_both():
     assert "שיעור ההתאמה לגודל" in out.text.split("\n")[-1] and "[E1]" in out.text.split("\n")[-1]
 
 
-def test_a_unit_the_model_repeats_after_a_computed_value_is_dropped():
-    from app.answering.compose import _repeated_unit
+def test_a_unit_written_twice_after_a_value_is_written_once():
+    assert dedupe_units("הממוצע הוא 12 מ״ר מ״ר.") == "הממוצע הוא 12 מ״ר."
+    assert dedupe_units("המחיר 25,000 ₪ ₪ למ״ר") == "המחיר 25,000 ₪ למ״ר"
+    assert dedupe_units("12 מ״ר בממוצע") == "12 מ״ר בממוצע"
+    # GQ55: the model's own spelling of the unit after a server value that already carries it
+    assert dedupe_units('שטח הממ״ד הוא 11.5 מ״ר מ"ר') == "שטח הממ״ד הוא 11.5 מ״ר"
+    assert dedupe_units("11.5 מ״ר מטר רבוע, 3.05 מ׳ מטר, 100 ₪ למ״ר ₪ למ״ר, 5% אחוז") == \
+        "11.5 מ״ר, 3.05 מ׳, 100 ₪ למ״ר, 5%"
+    assert dedupe_units("2 חדרים ומחסן 5 מ״ר. מ״ר הוא יחידת שטח") == "2 חדרים ומחסן 5 מ״ר. מ״ר הוא יחידת שטח"
 
-    assert _repeated_unit("הממוצע הוא 12 מ״ר מ״ר.", ["12 מ״ר"]) == "הממוצע הוא 12 מ״ר."
-    assert _repeated_unit("המחיר 25,000 ₪ ₪ למ״ר", ["25,000 ₪"]) == "המחיר 25,000 ₪ למ״ר"
-    assert _repeated_unit("12 מ״ר בממוצע", ["12 מ״ר"]) == "12 מ״ר בממוצע"
+
+def test_a_computed_claim_shows_the_server_unit_once():
+    """GQ55: "{C2} מ"ר" with C2 = "11.5 מ״ר" rendered "11.5 מ״ר מ״ר"."""
+    computed = [ComputedValue("C1", "ממוצע שטח הממ״ד (נתון ראשוני)", "11.5 מ״ר", ["E1"]),
+                ComputedValue("C2", "ממוצע מחיר למ״ר", "100 ₪ למ״ר", ["E1"])]
+    p = scripted(answer(claim('שטח הממ״ד הממוצע הוא {C1} מ"ר', [], kind="computed"),
+                        claim("המחיר הממוצע הוא {C2} ש״ח למ״ר", [], kind="computed"),
+                        claim("בממוצע {C1}מ״ר, לפי {C1}.", [], kind="computed")),
+                 verdicts("supported", "supported", "supported"))
+    out = compose_answer(p, "q", EVIDENCE, computed=computed)
+    assert out.text.split("\n") == ["שטח הממ״ד הממוצע הוא 11.5 מ״ר (חושב במערכת)",
+                                     "המחיר הממוצע הוא 100 ₪ למ״ר (חושב במערכת)",
+                                     "בממוצע 11.5 מ״ר, לפי 11.5 מ״ר. (חושב במערכת)"]
+    assert "מ״ר מ" not in out.claims[0]["text"]
+
+
+# --- Correct claims are kept (real-model sample, category d) ---------------------------------------------
+
+TABLE = [ev(1, "שנת בנייה | 1968", title="שומה המאבק 25"), ev(2, "שומת מקרקעין — המאבק 25, גבעתיים")]
+
+
+def test_a_claim_naming_the_asked_address_passes_layer_one():
+    """GQ10 as the real model answered it: the address comes from the question, the year from the row."""
+    p = scripted(answer(claim("שנת הבנייה של הבניין ברחוב המאבק 25 היא 1968.", ["E1"], numbers=["1968"])),
+                 verdicts("supported"))
+    out = compose_answer(p, "מה שנת הבנייה של הבניין ברחוב המאבק 25 לפי טבלת מאפייני הנכס?", TABLE)
+    assert out.text == "שנת הבנייה של הבניין ברחוב המאבק 25 היא 1968. [E1]" and out.dropped == 0
+    # the judge sees the span's document and place, not other evidence
+    judge = p.calls[1].input
+    assert 'source="שומה המאבק 25, עמ׳ 1"' in judge and TABLE[1]["text"] not in judge
+
+
+def test_a_wrong_value_is_still_dropped():
+    p = scripted(answer(claim("שנת הבנייה של הבניין ברחוב המאבק 25 היא 1972.", ["E1"], numbers=["1972"])))
+    out = compose_answer(p, "מה שנת הבנייה של הבניין ברחוב המאבק 25?", TABLE)
+    assert out.provider == "extractive" and out.dropped == 1 and not out.cacheable
+    assert [c.purpose for c in p.calls] == [Purpose.ANSWER]
+
+
+# --- Abstention kinds -------------------------------------------------------------------------------------
+
+YARDEN = [ev(1, "דירת גן בת 4 חדרים ברחוב הירדן. לדירה צמודה חצר בשטח 85 מ״ר.", title="שומה הירדן 30"),
+          ev(2, "הבניין נבנה בשנת 1972 ואינו כולל מעלית.", title="שומה הירדן 30")]
+
+
+def test_claims_that_only_state_absence_are_a_not_stated_abstention():
+    """GQ42 as the real model answered it: absence written as explicit claims, insufficient=true."""
+    p = scripted(answer(claim("אין בראיות מידע על שטח הממ״ד בדירה ברחוב הירדן 30.", ["E1", "E2"]),
+                        claim("המסמכים מתארים את הנכס כדירת גן, אך אינם מפרטים ממ״ד.", ["E1"]),
+                        insufficient=True, missing="מסמך שמפרט את שטח הממ״ד"))
+    out = compose_answer(p, "מה שטח הממ״ד בדירה ברחוב הירדן 30?", YARDEN)
+    assert out.abstention_kind == "not_stated" and out.claims == [] and out.cacheable
+    assert ABSTENTION_TEXT["not_stated"] in out.text
+    assert any("שטח הממ״ד" in lim for lim in out.limitations)
+    assert [c.purpose for c in p.calls] == [Purpose.ANSWER]  # nothing positive to judge
+
+
+def test_absence_claims_without_the_insufficient_flag_also_abstain():
+    p = scripted(answer(claim("שטח הממ״ד לא מצוין במסמך.", ["E1"]),
+                        claim("לא נמצא בשומה פירוט של הממ״ד.", ["E2"])))
+    out = compose_answer(p, "מה שטח הממ״ד?", YARDEN)
+    assert out.abstention_kind == "not_stated" and out.claims == []
+
+
+def test_a_document_stating_that_something_is_absent_is_an_answer():
+    """"אינו כולל מעלית" is what the document says: a positive fact, not an abstention."""
+    p = scripted(answer(claim("הבניין ברחוב הירדן 30 אינו כולל מעלית.", ["E2"])), verdicts("supported"))
+    out = compose_answer(p, "האם יש מעלית בבניין ברחוב הירדן 30?", YARDEN)
+    assert out.abstention_kind is None and out.text == "הבניין ברחוב הירדן 30 אינו כולל מעלית. [E2]"
+    assert is_absence_claim("אין מעלית בבניין") is False and is_absence_claim("אין בדירה ממ״ד") is False
+    assert is_absence_claim("המסמך אינו מציין את שטח הממ״ד") and is_absence_claim("אין במסמכים מידע על החניה")
+
+
+def test_an_absence_next_to_an_answer_becomes_a_limitation():
+    p = scripted(answer(claim("לדירה צמודה חצר בשטח 85 מ״ר.", ["E1"]), claim("שטח המחסן אינו מצוין במסמך.", ["E1"])),
+                 verdicts("supported"))
+    out = compose_answer(p, "מה שטח החצר והמחסן?", YARDEN)
+    assert out.abstention_kind is None and out.text == "לדירה צמודה חצר בשטח 85 מ״ר. [E1]"
+    assert any("שטח המחסן אינו מצוין במסמך" in lim for lim in out.limitations)
+    assert len(p.calls[1].input.split("<claim ")) == 2  # only the positive claim is judged
+
+
+def test_no_evidence_is_a_not_found_abstention():
+    out = compose_answer(scripted(answer()), "q", [])
+    assert out.abstention_kind == "not_found" and ABSTENTION_TEXT["not_found"] in out.text
+    out = compose_answer(None, "q", [], no_evidence_kind="insufficient_permission_scope")
+    assert out.abstention_kind == "insufficient_permission_scope"
+
+
+def test_combined_answer_carries_the_abstention_of_its_parts():
+    answered = compose_answer(scripted(answer(claim("לדירה צמודה חצר בשטח 85 מ״ר.", ["E1"])), verdicts("supported")),
+                              "q", YARDEN)
+    absent = compose_answer(scripted(answer(insufficient=True, missing="שטח הממ״ד")), "q", YARDEN)
+    no_figure = {"kind": "abstain", "numeric": None, "preliminary": None, "abstention_kind": "not_stated"}
+    figure = {"kind": "numeric", "numeric": {"value": "12"}, "abstention_kind": None}
+    assert combined_abstention_kind(no_figure, absent) == "not_stated"
+    assert combined_abstention_kind({**no_figure, "abstention_kind": None}, absent) == "not_stated"
+    assert combined_abstention_kind(no_figure, answered) is None  # the content part answers
+    assert combined_abstention_kind(figure, absent) is None  # the computation answers
+    rejected = compose_answer(scripted(answer(claim("ההפחתה נבעה מקרבה לפארק", ["E1"])), verdicts("unsupported")),
+                              "q", EVIDENCE)
+    assert combined_abstention_kind(no_figure, rejected) == "not_stated"
+
+
+# --- Conflict and comparison questions show every side ----------------------------------------------------
+
+YEARS = [ev(1, "לפי תיק הבניין, הבניין נבנה בשנת 1958.", title="שומה בן יהודה 2022"),
+         ev(2, "שנת בנייה | 1962", title="שומה בן יהודה 2023")]
+CONFLICT_Q = "האם יש סתירה בין השומות לגבי שנת הבנייה של הבניין בבן יהודה 140?"
+
+
+def test_a_two_sided_answer_citing_one_document_is_incomplete():
+    """GQ26/GQ27: evidence from two documents, the answer cites one: not presented as complete."""
+    p = scripted(answer(claim("הבניין נבנה בשנת 1962.", ["E2"])), verdicts("supported"))
+    out = compose_answer(p, CONFLICT_Q, YEARS, two_sided=True)
+    assert out.incomplete and not out.cacheable and out.uncovered == ["שומה בן יהודה 2022"]
+    assert any("נמצאה ראיה רק מצד אחד" in lim and "שומה בן יהודה 2022" in lim for lim in out.limitations)
+    assert "שתי השומות" in p.calls[0].instructions or "כל מסמך" in p.calls[0].instructions
+
+
+def test_a_two_sided_answer_citing_both_documents_is_complete():
+    p = scripted(answer(claim("בשומה אחת הבניין נבנה בשנת 1958.", ["E1"]), claim("בשומה השנייה: 1962.", ["E2"])),
+                 verdicts("supported", "supported"))
+    out = compose_answer(p, CONFLICT_Q, YEARS, two_sided=True)
+    assert not out.incomplete and out.cacheable and out.uncovered == []
+    assert not any("מצד אחד" in lim for lim in out.limitations)
+
+
+def test_without_the_flag_one_document_is_a_normal_answer():
+    p = scripted(answer(claim("הבניין נבנה בשנת 1962.", ["E2"])), verdicts("supported"))
+    out = compose_answer(p, "באיזו שנה נבנה הבניין?", YEARS)
+    assert not out.incomplete and out.cacheable
+    # every question is told to show all documents' values when they differ
+    assert "ערכים שונים" in p.calls[0].instructions
+
+
+def test_compare_answer_citing_one_side_is_incomplete():
+    sides = [ev(1, "שיעור ההתאמה לגודל הוא 5%.", label="גרסה 1"), ev(2, "שיעור ההתאמה לגודל הוא 7%.", label="גרסה 2")]
+    p = ScriptedProvider().on(Purpose.ANSWER, {**answer(claim("שיעור ההתאמה לגודל הוא 7%", ["E2"])), "conflicts": []}
+                              ).on(Purpose.VERIFY, verdicts("supported"))
+    out = compose_answer(p, "אילו הנחות השתנו?", sides, compare=True)
+    assert out.incomplete and out.uncovered == ["גרסה 1"] and not out.cacheable
+
+
+# --- Real model (opt-in) ----------------------------------------------------------------------------------
+
+
+@pytest.mark.real_model
+def test_real_judge_keeps_a_claim_naming_the_asked_address(monkeypatch):
+    """GQ10 from the real-model sample: the model's claim named the asked address and was dropped. The answer
+    call is scripted with that claim; the judge is the real model. Never prints the key."""
+    from pathlib import Path
+
+    from app.config import Settings
+    from app.providers.llm import OpenAIProvider
+
+    for name in ("OPENAI_KEY", "OPENAI_API_KEY", "OPENAI_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    s = Settings(_env_file=Path(__file__).resolve().parents[3] / ".env")
+    key = s.openai_api_key.get_secret_value()
+    if not key:
+        pytest.skip("no OpenAI key in the environment or the repo .env")
+    real = OpenAIProvider(key, s.openai_model, reasoning_effort=s.openai_reasoning_effort)
+    scripted_answer = scripted(answer(claim("שנת הבנייה של הבניין ברחוב המאבק 25 היא 1968.", ["E1"],
+                                            numbers=["1968"])))
+
+    class AnswerScriptedJudgeReal(ScriptedProvider):
+        def structured(self, purpose, instructions, input, schema, **kw):
+            if Purpose(purpose) == Purpose.ANSWER:
+                return scripted_answer.structured(purpose, instructions, input, schema, **kw)
+            return real.structured(purpose, instructions, input, schema, **kw)
+
+    evidence = [ev(1, "שנת בנייה | 1968", title="H5 synthetic givatayim hamaavak"),
+                ev(2, "שומת מקרקעין — המאבק 25, גבעתיים\nכתובת הנכס: המאבק 25",
+                   title="H5 synthetic givatayim hamaavak")]
+    evidence[0]["section"] = evidence[1]["section"] = "4. תיאור הנכס והבניין"
+    out = compose_answer(AnswerScriptedJudgeReal(), "מה שנת הבנייה של הבניין ברחוב המאבק 25 לפי טבלת מאפייני הנכס?",
+                         evidence)
+    print(f"real_model provider={out.provider} dropped={out.dropped} limitations={out.limitations}")
+    assert out.provider == "cloud" and out.dropped == 0, out.limitations
+    assert out.claims and "1968" in out.claims[0]["text"]

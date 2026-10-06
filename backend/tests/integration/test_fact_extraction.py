@@ -83,9 +83,9 @@ def script(provider, title, *mentions):
     provider.on(Purpose.EXTRACT, {"mentions": list(mentions)}, match=f'"{title}"', repeat=True)
 
 
-def extract(ctx, attr, provider, filters=None, operation="mean", deadline=None):
+def extract(ctx, attr, provider, filters=None, operation="mean", deadline=None, **kw):
     return facts.extract_and_compute(None, ctx, attr, filters, operation, provider=provider,
-                                     deadline=deadline or time.monotonic() + 60)
+                                     deadline=deadline or time.monotonic() + 60, **kw)
 
 
 def compute(ctx, attr, filters=None, operation="mean"):
@@ -535,5 +535,202 @@ def test_another_phrasing_of_the_attribute_goes_to_review_not_to_the_figure(offi
     p = ScriptedProvider()
     add_doc(office, office.default_group_id, "דוח", ["בדירה מרחב מוגן דירתי בשטח 11 מ״ר."])
     script(p, "דוח", mention("מרחב מוגן דירתי בשטח 11 מ״ר", "11", term="מרחב מוגן דירתי"))
+    comp = extract(office.ctx(), attr, p)
+    assert comp.preliminary is None and comp.coverage["awaiting_review"] == 1
+
+
+# --- improvement round after the real-model sample (category c: GQ02, 08, 28-32, 38, 48; GQ55) ------------
+
+def kv_table(rows, headers=("מאפיין", "פירוט"), page=1):
+    """A label|value table: the attribute is named only in the row's first cell."""
+    return TableResult(0, list(headers), [None, None], [TableRow(page, list(r)) for r in rows], page, page,
+                       section="מאפייני הנכס")
+
+
+def facts_rows(office, attr):
+    with tenant_tx(office.system) as conn:
+        return conn.execute(text("SELECT value_text, canonical_value, status, source_path FROM facts"
+                                 " WHERE attribute_id = :a ORDER BY created_at"), {"a": attr.id}).all()
+
+
+def test_key_value_table_cell_is_named_by_its_row_label(office):
+    """H5 / H1 / H7: "גובה תקרה | 2.80 מ׳" names the attribute only in the row label."""
+    height = make_attr(office, "גובה תקרה", "length")
+    p = ScriptedProvider()
+    add_doc(office, office.default_group_id, "דוח", ["פתיח"],
+            tables=[kv_table([["קומה", "2 מתוך 4"], ["גובה תקרה", "2.80 מ׳"], ["שנת בנייה", "1968"]])])
+    script(p, "דוח", mention("2.80 מ׳", "2.80", source="T1R2C2", unit="מ׳", term="גובה תקרה"))
+    comp = extract(office.ctx(), height, p)
+    (call,) = extract_calls(p)
+    assert "[T1R2C2] גובה תקרה: 2.80 מ׳" in call.input  # the row label is visible to the model
+    assert comp.preliminary is not None and comp.preliminary.values == [Decimal("2.8")]
+    assert facts_rows(office, height)[0].status == "auto_validated"
+
+
+def test_key_value_row_label_carries_the_unit_and_a_quote_may_include_the_label(office):
+    attr = make_attr(office, "שטח חצר", "area")
+    p = ScriptedProvider()
+    add_doc(office, office.default_group_id, "דוח", ["פתיח"],
+            tables=[kv_table([["שטח חצר (מ״ר)", "85"], ["קומה", "קרקע"]], headers=("נתון", "ערך"))])
+    script(p, "דוח", mention("שטח חצר (מ״ר): 85", "85", source="T1R1C2", unit=None, term="שטח חצר"))
+    comp = extract(office.ctx(), attr, p)
+    assert comp.preliminary is not None and comp.preliminary.values == [Decimal("85")]
+
+
+def test_row_label_of_another_attribute_still_names_nothing(office):
+    height = make_attr(office, "גובה תקרה", "length")
+    p = ScriptedProvider()
+    add_doc(office, office.default_group_id, "דוח", ["פתיח"],
+            tables=[kv_table([["אורך חזית", "12 מ׳"]])])
+    script(p, "דוח", mention("12 מ׳", "12", source="T1R1C2", unit="מ׳", term="גובה תקרה"))
+    comp = extract(office.ctx(), height, p)
+    assert comp.preliminary is None and comp.coverage["mentions_rejected"] == 1
+
+
+def test_attribute_named_in_the_cell_label_is_not_a_synonym(office):
+    """The model's term is another word of the cell's context, but the row label names the attribute itself."""
+    height = make_attr(office, "גובה תקרה", "length")
+    p = ScriptedProvider()
+    add_doc(office, office.default_group_id, "דוח", ["פתיח"], tables=[kv_table([["גובה תקרה", "2.80 מ׳"]])])
+    script(p, "דוח", mention("2.80 מ׳", "2.80", source="T1R1C2", unit="מ׳", term="פירוט"))
+    comp = extract(office.ctx(), height, p)
+    assert comp.preliminary is not None and comp.preliminary.values == [Decimal("2.8")]
+    assert comp.coverage["awaiting_review"] == 0
+
+
+def test_plural_or_singular_of_the_attribute_name_is_the_same_name(office):
+    attr = make_attr(office, "שטח המרפסות", "area")
+    p = ScriptedProvider()
+    add_doc(office, office.default_group_id, "דוח", ["מרפסת חזית בשטח 7 מ״ר."])
+    script(p, "דוח", mention("מרפסת חזית בשטח 7 מ״ר", "7", term="מרפסת חזית"))
+    comp = extract(office.ctx(), attr, p)
+    assert comp.preliminary is not None and comp.preliminary.values == [Decimal("7")]
+
+
+def test_counts_written_as_words_and_none_as_zero(office):
+    """GQ31 / GQ36: "שתי חניות", "מקום חניה אחד", "אין חניה" are 2, 1 and 0."""
+    attr = make_attr(office, "מספר מקומות חניה", "count")
+    p = ScriptedProvider()
+    for title, sentence, quote, value, term in (
+            ("א", "לדירה שתי חניות תת-קרקעיות.", "שתי חניות תת-קרקעיות", "2", "חניות"),
+            ("ב", "לדירה מקום חניה אחד בחניון הבניין.", "מקום חניה אחד בחניון הבניין", "אחד", "מקום חניה"),
+            ("ג", "לדירה אין חניה צמודה.", "לדירה אין חניה צמודה", "0", "חניה")):
+        add_doc(office, office.default_group_id, title, [sentence])
+        script(p, title, mention(quote, value, unit=None, term=term))
+    comp = extract(office.ctx(), attr, p, operation="values")
+    assert comp.preliminary.values == [Decimal("0"), Decimal("1"), Decimal("2")]
+    assert comp.coverage["mentions_rejected"] == 0
+
+
+def test_inner_dimensions_give_an_area_for_review(office):
+    """GQ28: "300 על 350 ס״מ" is an area only by assumption: computed (10.5) and sent to review, never in a figure."""
+    attr = make_attr(office)
+    p = ScriptedProvider()
+    add_doc(office, office.default_group_id, "דוח", ["בדירה ממ״ד במידות פנים של 300 על 350 ס״מ."])
+    script(p, "דוח", mention("ממ״ד במידות פנים של 300 על 350 ס״מ", "300 על 350", unit="ס״מ", term="ממ״ד"))
+    comp = extract(office.ctx(), attr, p)
+    assert comp.preliminary is None and comp.main.n == 0
+    assert comp.coverage["found"] == 1 and comp.coverage["awaiting_review"] == 1
+    (row,) = facts_rows(office, attr)
+    assert (row.canonical_value, row.status, row.source_path["assumed_unit"]) == (Decimal("10.5"), "needs_review", True)
+
+
+def zoning_world(office, p):
+    attr = None
+    with tenant_tx(office.ctx()) as conn:
+        attr = resolve_attribute(conn, handle=None, description="ייעוד המגרש", unit_dimension=None, value_type="text")
+    for title, sentence, quote, value in (
+            ("א", "ייעוד המגרש הוא מגורים ג׳.", "ייעוד המגרש הוא מגורים ג׳", "מגורים ג׳"),
+            ("ב", "המגרש מצוי בייעוד מגורים ב׳.", "המגרש מצוי בייעוד מגורים ב׳", "מגורים ב'"),
+            ("ג", "ייעוד המגרש הוא מגורים ב׳.", "ייעוד המגרש הוא מגורים ב׳", "מגורים ב׳"),
+            ("ד", "ייעוד המגרש הוא מגורים א׳.", "ייעוד המגרש הוא מגורים א׳", "מסחר")):  # value not in the quote
+        add_doc(office, office.default_group_id, title, [sentence])
+        script(p, title, mention(quote, value, unit=None, term="ייעוד" if title == "ב" else "ייעוד המגרש"))
+    return attr
+
+
+def test_text_attribute_lists_distinct_values_with_counts(office):
+    """GQ56 / GQ55 turn 2: a text attribute accepts text values and computes 'values' and 'count'."""
+    p = ScriptedProvider()
+    attr = zoning_world(office, p)
+    assert attr.value_type == "text"
+    comp = extract(office.ctx(), attr, p, operation="values")
+    assert comp.coverage["found"] == 3 and comp.coverage["mentions_rejected"] == 1
+    assert comp.preliminary.text_values == [{"value": "מגורים ב׳", "count": 2}, {"value": "מגורים ג׳", "count": 1}]
+    assert comp.preliminary.values is None and comp.preliminary.n == 3
+    assert {s["value"] for s in comp.sources} == {"מגורים ג׳", "מגורים ב'", "מגורים ב׳"}
+    count = compute(office.ctx(), attr, operation="count")
+    assert count.preliminary.value == 3
+    # an arithmetic operation on a text attribute lists the values instead
+    assert compute(office.ctx(), attr, operation="mean").operation == "values"
+
+
+def test_text_value_filter_counts_matching_entities(office):
+    p = ScriptedProvider()
+    attr = zoning_world(office, p)
+    extract(office.ctx(), attr, p)
+    with tenant_tx(office.ctx()) as conn:
+        comp = facts.compute_facts(conn, attr, None, "count", value_filter=facts.ValueFilter("=", "מגורים ב'"))
+        other = facts.compute_facts(conn, attr, None, "values", value_filter=facts.ValueFilter("!=", "מגורים ב׳"))
+        with pytest.raises(ValueError):
+            facts.compute_facts(conn, attr, None, "count", value_filter=facts.ValueFilter(">", "מגורים"))
+    assert comp.preliminary.value == 2 and len(comp.sources) == 2
+    assert other.preliminary.text_values == [{"value": "מגורים ג׳", "count": 1}]
+
+
+def test_numeric_value_filter_computes_over_the_matching_facts(office):
+    """GQ35 / GQ60 / GQ34: "which have X < 11", "how many have X > 2.70" compute over the matched facts."""
+    attr = make_attr(office)
+    p = ScriptedProvider()
+    for title, v in (("א", "9.5"), ("ב", "12"), ("ג", "10.5"), ("ד", "11")):
+        add_doc(office, office.default_group_id, title, [f"ממ״ד בשטח {v} מ״ר"])
+        script(p, title, mention(f"ממ״ד בשטח {v} מ״ר", v))
+    below = extract(office.ctx(), attr, p, operation="values", value_filter=facts.ValueFilter("<", Decimal("11")))
+    assert below.preliminary.values == [Decimal("9.5"), Decimal("10.5")]
+    assert {s["title"] for s in below.sources} == {"א", "ג"}
+    assert below.coverage["found"] == 4  # coverage still describes the whole document set
+    with tenant_tx(office.ctx()) as conn:
+        count = facts.compute_facts(conn, attr, None, "count", value_filter=facts.ValueFilter(">=", "11"))
+        mean = facts.compute_facts(conn, attr, None, "mean", value_filter=facts.ValueFilter("!=", Decimal("12")))
+        none = facts.compute_facts(conn, attr, None, "count", value_filter=facts.ValueFilter(">", Decimal("100")))
+        with pytest.raises(ValueError):
+            facts.compute_facts(conn, attr, None, "count", value_filter=facts.ValueFilter("~", Decimal("1")))
+        with pytest.raises(ValueError):
+            facts.compute_facts(conn, attr, None, "count", value_filter=facts.ValueFilter("<", "גדול"))
+    assert count.preliminary.value == 2
+    assert mean.preliminary.value == Decimal("10.33") and mean.preliminary.n == 3
+    assert none.preliminary.value == 0 and none.sources == []
+
+
+def test_scoped_question_about_one_property_never_averages_other_documents(office):
+    """GQ55: "the safe room at <address>" averaged two documents (12 and 11 -> 11.5). Scoped to the document
+    the address resolves to, the answer is that document's value and nothing else is read."""
+    attr = make_attr(office)
+    p = ScriptedProvider()
+    doc_a, _ = add_doc(office, office.default_group_id, "האירוסים", ["ממ״ד בשטח 12 מ״ר"])
+    add_doc(office, office.default_group_id, "שינקין", ["ממ״ד בשטח 11 מ״ר"])
+    script(p, "האירוסים", mention("ממ״ד בשטח 12 מ״ר", "12"))
+    script(p, "שינקין", mention("ממ״ד בשטח 11 מ״ר", "11"))
+    scoped = extract(office.ctx(), attr, p, document_ids=[doc_a])
+    assert len(extract_calls(p)) == 1 and '"האירוסים"' in extract_calls(p)[0].input
+    assert (scoped.preliminary.value, scoped.preliminary.n) == (Decimal("12.00"), 1)
+    assert scoped.coverage["in_scope"] == 1 and {s["title"] for s in scoped.sources} == {"האירוסים"}
+    unscoped = extract(office.ctx(), attr, p)
+    assert unscoped.preliminary.value == Decimal("11.50")  # the wrong-answer pattern, without a scope
+    with tenant_tx(office.ctx()) as conn:
+        again = facts.compute_facts(conn, attr, None, "mean", document_ids=[doc_a])
+        nothing = facts.compute_facts(conn, attr, None, "mean", document_ids=[])
+    assert again.preliminary.values == [Decimal("12")] and again.coverage["in_scope"] == 1
+    assert nothing.coverage["in_scope"] == 0 and nothing.preliminary is None
+
+
+def test_a_quote_with_several_values_of_the_dimension_goes_to_review(office):
+    """GQ29: "X בשטח 12 מ״ר ו-Y בשטח 6 מ״ר" for one attribute: which value (or their sum) is meant is a
+    reading, not a quote; the value goes to review even when the naming term matches."""
+    attr = make_attr(office, "שטח המרפסות", "area")
+    p = ScriptedProvider()
+    sentence = "מרפסת סלון בשטח 12 מ״ר ומרפסת חדר שינה בשטח 6 מ״ר"
+    add_doc(office, office.default_group_id, "דוח", [sentence + "."])
+    script(p, "דוח", mention(sentence, "12", term="מרפסת סלון"))
     comp = extract(office.ctx(), attr, p)
     assert comp.preliminary is None and comp.coverage["awaiting_review"] == 1

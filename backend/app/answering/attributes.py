@@ -57,7 +57,9 @@ CANONICAL_UNITS = {
     "duration": "month",
 }
 VALUE_TYPES = ("numeric", "text", "boolean", "date")
-EXTRACTION_PROMPT_VERSION = "x2"  # x2: a value must be named as the attribute (attribute_term)
+# x2: a value must be named as the attribute (attribute_term). x3: table cells carry their row label, counts
+# as words, W×H dimensions, text values; earlier ledger states are read again.
+EXTRACTION_PROMPT_VERSION = "x3"
 _WORD = re.compile(r"[\w״׳]+")
 _FILLER = frozenset({"של"})  # "שטח של הדירה" names the same attribute as "שטח הדירה"
 _COLUMNS = ("id, key, label_he, aliases, value_type, unit_dimension, canonical_unit, source, structured_column,"
@@ -99,9 +101,11 @@ def labels_match(a: str, b: str) -> bool:
     return bool(ta) and len(ta) == len(tb) and all(_same_word(x, y) for x, y in zip(ta, tb, strict=True))
 
 
-def proposed_key(description: str) -> str:
-    """Deterministic key for a proposed definition, so concurrent creators converge on one row."""
-    return "x_" + hashlib.sha256(" ".join(_tokens(description)).encode()).hexdigest()[:12]
+def proposed_key(description: str, value_type: str = "numeric") -> str:
+    """Deterministic key for a proposed definition, so concurrent creators converge on one row. A non-numeric
+    definition of the same label has its own key (it never reuses a numeric one's facts)."""
+    base = " ".join(_tokens(description)) + ("" if value_type == "numeric" else f"|{value_type}")
+    return "x_" + hashlib.sha256(base.encode()).hexdigest()[:12]
 
 
 def ensure_structured_attributes(conn: Connection) -> int:
@@ -181,13 +185,24 @@ def resolve_attribute(
     handle: str | None,
     description: str | None,
     unit_dimension: str | None,
-    value_type: str = "numeric",
+    value_type: str | None = None,
     handles: dict[str, UUID] | None = None,
 ) -> AttributeDef:
     """Interpreter-chosen handle, else exact normalized label/alias, else a new ``proposed`` definition.
 
     ``handles`` pins resolution to the mapping shown to the interpreter (see ``handle_map``); without
-    it the current numbering is used. An unknown handle falls back to the description."""
+    it the current numbering is used. An unknown handle falls back to the description.
+
+    ``value_type`` (one of ``VALUE_TYPES``) is what the caller needs; None accepts any existing type and
+    creates numeric. When given, an extracted definition of another type is never returned: the match
+    goes to a definition of that type with the same label, created when missing (a non-numeric one has
+    no unit). Structured definitions are numeric columns and are returned as they are."""
+    if value_type is not None and value_type not in VALUE_TYPES:
+        raise ValueError(f"unknown value type {value_type!r}")
+
+    def fits(r) -> bool:
+        return value_type is None or r.value_type == value_type or r.source == "structured"
+
     ensure_structured_attributes(conn)
     rows = _rows(conn)
     if handle:
@@ -195,17 +210,20 @@ def resolve_attribute(
         target = mapping.get(handle.strip())
         for r in rows:
             if r.id == target:
-                return _to_def(r)
+                if fits(r):
+                    return _to_def(r)
+                description = r.label_he  # the same attribute, asked as another type
     description = (description or "").strip()
     if not _tokens(description):
         raise ValueError("an attribute needs a known handle or a description")
     # structured entries first, then the oldest definition
     for r in sorted(rows, key=lambda r: r.source != "structured"):
-        if any(labels_match(description, name) for name in [r.label_he, *(r.aliases or [])]):
+        if fits(r) and any(labels_match(description, name) for name in [r.label_he, *(r.aliases or [])]):
             return _to_def(r)
-    if value_type not in VALUE_TYPES:
-        raise ValueError(f"unknown value type {value_type!r}")
-    key = proposed_key(description)
+    value_type = value_type or "numeric"
+    if value_type != "numeric":
+        unit_dimension = None
+    key = proposed_key(description, value_type)
     row = conn.execute(
         text("INSERT INTO attribute_definitions (office_id, key, label_he, aliases, value_type, unit_dimension,"
              " canonical_unit, source, extraction_prompt_version, status) VALUES (app_office(), :k, :l, :a, :vt,"

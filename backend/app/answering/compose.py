@@ -7,7 +7,10 @@ renders the answer text from the claims that pass both verification layers (``ve
 - computed claims name a computed result by handle (``{C1}``) and the server inserts its value, so the
   model never authors a computed number;
 - dropped claims are counted and stated; when nothing verified remains, or verification itself failed,
-  the answer quotes the evidence instead and is not cacheable.
+  the answer quotes the evidence instead and is not cacheable;
+- an answer that only says the evidence does not state the datum is a ``not_stated`` abstention, while a
+  document's own statement that something is absent ("אין גינה") is an ordinary claim;
+- a comparison or conflict question whose verified claims cite only one side is marked incomplete.
 
 Document text is data, never instruction: it reaches the model only inside evidence blocks, and nothing in
 it can change the calls made, the statuses or the sources.
@@ -25,8 +28,16 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Connection, text
 
-from app.answering.templates import money, number
-from app.answering.verify import CITE, check_claim, has_markup, judge_claims, numbers_in
+from app.answering.templates import UNIT_LABELS, money, number
+from app.answering.verify import (
+    CITE,
+    JUDGE_POLICY,
+    check_claim,
+    has_markup,
+    judge_claims,
+    numbers_in,
+    question_subject_numbers,
+)
 from app.db import TenantContext
 from app.providers.llm import SYSTEM_POLICY, CallStatus, LLMProvider, Purpose, StructuredResult
 
@@ -50,29 +61,83 @@ L_REJECTED = "תשובת המודל לא עברה את בדיקות האימות
 L_JUDGE_FAILED = "אימות התשובה מול הראיות לא הושלם, ולכן מוצגים הקטעים עצמם."
 L_INSUFFICIENT = "לפי הראיות שנמצאו אין בסיס מספיק לתשובה מלאה; מוצגים הקטעים הרלוונטיים."
 L_PARTIAL = "חלק מהטענות נתמכות רק בחלקן בראיות שצוטטו; מומלץ לעיין במקורות."
+L_ONE_SIDE = "נמצאה ראיה רק מצד אחד"
 
 CLAIMS_POLICY = (
     "החזר את התשובה כרשימת טענות קצרות. לכל טענה: text בלי קישורים ובלי עיצוב; evidence_ids — מזהי הראיות"
     " שהטענה נשענת עליהן; kind — explicit אם הדבר נאמר במפורש בראיה, inferred אם זו הסקה מהראיות, computed אם"
     " הטענה מציגה תוצאת חישוב של המערכת; numbers — המספרים שבטענה. בטענת computed אל תכתוב את המספר עצמו אלא את"
-    " מזהה החישוב בסוגריים מסולסלים, למשל {C1}. כל מספר בטענה אחרת חייב להופיע בראיה שהיא מצטטת."
-    " אם אין בראיות בסיס לתשובה, החזר insufficient=true ותאר ב-missing_info מה חסר."
+    " מזהה החישוב בסוגריים מסולסלים, למשל {C1}, בלי יחידה אחריו (היחידה כבר כלולה בתוצאה)."
+    " כל מספר בטענה אחרת חייב להופיע בראיה שהיא מצטטת; כתוב אותו כפי שהוא כתוב בראיה."
+    " אם ראיות ממסמכים שונים נותנות ערכים שונים לאותו נתון, הצג כל ערך בטענה נפרדת שמצטטת את המסמך שלו,"
+    " ואל תבחר ביניהם. אל תכתוב מזהי ראיות (E1) בתוך text; הם נרשמים ב-evidence_ids."
+    " אל תכתוב טענה שאומרת שמידע חסר או אינו מצוין בראיות: אם אין בראיות בסיס לתשובה, החזר insufficient=true"
+    " ותאר ב-missing_info מה חסר. אם המסמך עצמו קובע שמשהו אינו קיים (למשל \"אין גינה\"), זו טענה explicit"
+    " רגילה."
+)
+TWO_SIDED_POLICY = (
+    "השאלה עוסקת בהשוואה או בסתירה בין מסמכים: הצג את הנתון כפי שהוא מופיע בכל מסמך שיש לגביו ראיה, בטענה"
+    " נפרדת לכל מסמך שמצטטת רק אותו, גם אם הערכים זהים. אל תכריע לטובת מסמך אחד ואל תציג מסמך אחד בלבד"
+    " כשיש ראיות מכמה מסמכים."
 )
 COMPARE_POLICY = (
     "זוהי השוואה בין מקורות: המאפיין side של כל ראיה מציין לאיזה צד היא שייכת. כל טענה תצטט ראיות מצד אחד בלבד."
     " ב-conflicts ציין כל נתון שערכו שונה בין הצדדים: datum — שם הנתון, claims — מספרי הטענות (החל מ-0)"
     " שמציגות את ערכו בכל צד."
 )
+# Every prompt text that shapes a composed answer, for the prompt version of the answer cache key.
+COMPOSE_PROMPTS = CLAIMS_POLICY + COMPARE_POLICY + TWO_SIDED_POLICY + JUDGE_POLICY
 _PLACEHOLDER = re.compile(r"\{(C\d+)\}")
 
+# How a unit the server writes (``templates.UNIT_LABELS``) may be spelled again after it.
+_UNIT_TOKEN_FORMS = {
+    "מ״ר": ("מ״ר", 'מ"ר', "מ''ר", "מטר רבוע", "מטרים רבועים"),
+    "למ״ר": ("למ״ר", 'למ"ר', "למ''ר", "למטר רבוע"),
+    "₪": ("₪", "ש״ח", 'ש"ח', "ש''ח", "שקלים", "שקל"),
+    "מ׳": ("מ׳", "מ'", "מטר", "מטרים"),
+    "מ״ק": ("מ״ק", 'מ"ק', "מ''ק", "מטר מעוקב"),
+    "%": ("%", "אחוז", "אחוזים"),
+}
 
-def _repeated_unit(text: str, displays: list[str]) -> str:
-    """The server's value already carries its unit ("12 מ״ר"); drop the unit the model wrote after it."""
-    for display in displays:
-        parts = display.rsplit(" ", 1)
-        if len(parts) == 2 and not any(ch.isdigit() for ch in parts[1]):
-            text = re.sub(re.escape(display) + r"\s+" + re.escape(parts[1]) + r"(?!\w)", display, text)
+
+def _unit_forms(label: str) -> list[str]:
+    forms = [""]
+    for token in label.split():
+        forms = [f"{f} {t}".strip() for f in forms for t in _UNIT_TOKEN_FORMS.get(token, (token,))]
+    return sorted(set(forms), key=len, reverse=True)
+
+
+_REPEATED_UNIT = [
+    re.compile(rf"(\d[\d,.]*\s*{re.escape(label)})\s+(?:{'|'.join(map(re.escape, _unit_forms(label)))})"
+               r"(?![\w״׳\"'])")
+    for label in sorted(set(UNIT_LABELS.values()), key=len, reverse=True)
+]
+
+
+def dedupe_units(text: str) -> str:
+    """A value the server rendered with its unit ("11.5 מ״ר") keeps that unit once, however the model (or a
+    template) spelled it again right after: "11.5 מ״ר מ"ר" becomes "11.5 מ״ר"."""
+    for pattern in _REPEATED_UNIT:
+        text = pattern.sub(r"\1", text)
     return text
+
+
+# A claim that only says the evidence does not state something (an abstention written as a claim), as
+# opposed to a document's own statement that something is absent ("אין גינה", "אינו כולל גינה").
+_DOCS = r"ב?(?:ה)?(?:מסמכ|ראיות|ראיה|קטע|שומ|מקור|טקסט)\S*"
+_ABSENCE = re.compile(
+    r"(?<!\w)(?:לא|אינו|אינה|אינם|אינן)\s+(?:"
+    r"(?:ה)?(?:מצוינ|מצוין|צוינ|צוין|מפורט|פורט|מפרט|נאמר|מוזכר|הוזכר|מזכיר|מתייחס|התייחס|מציינ|מציין)\S*"
+    r"|(?:מופיע|הופיע|נמצא|נכתב|כתוב|נזכר)\S*(?:\s+\S+){0,3}?\s+" + _DOCS + r")"
+    r"|(?<!\w)אין\s+(?:" + _DOCS + r"\s+)?(?:כל\s+)?(?:מידע|נתון|נתונים|התייחסות|אזכור|פירוט|ציון)(?!\w)"
+    r"|(?<!\w)(?:לא\s+ניתן|אי\s+אפשר|אין\s+אפשרות)\s+(?:לקבוע|לדעת|לזהות|למצוא|להסיק)"
+)
+
+
+def is_absence_claim(text: str) -> bool:
+    """True for a claim that reports missing information ("שטח הגינה אינו מצוין במסמך"), not for a fact the
+    document states about an absence ("אין בדירה גינה")."""
+    return bool(_ABSENCE.search(text))
 
 
 class _Strict(BaseModel):
@@ -133,6 +198,8 @@ class Composition:
     abstention_kind: str | None = None
     usage: list[Usage] = field(default_factory=list)
     conflicts: list[dict] = field(default_factory=list)
+    incomplete: bool = False  # a two-sided question answered from one side (not cacheable)
+    uncovered: list[str] = field(default_factory=list)  # sides with evidence that no verified claim cites
 
 
 @dataclass
@@ -172,6 +239,15 @@ def no_evidence_kind(ctx: TenantContext) -> AbstentionKind:
     return "not_found" if ctx.is_admin else "insufficient_permission_scope"
 
 
+def combined_abstention_kind(base: dict, comp: Composition) -> str | None:
+    """The abstention kind of a combined answer (a computation ``base`` plus a composed content part): none
+    when either part answers (the computation has a figure, or the content part kept verified claims);
+    otherwise the computation's kind (it knows the coverage), else the content part's."""
+    if base.get("numeric") or base.get("preliminary") or comp.claims:
+        return None
+    return base.get("abstention_kind") or comp.abstention_kind
+
+
 def answer_input(question: str, evidence: list[dict], computed: Sequence[ComputedValue]) -> str:
     blocks = []
     for e in evidence:
@@ -194,9 +270,9 @@ def extractive_text(evidence: list[dict]) -> str:
 
 def _fallback(evidence: list[dict], limitations: list[str], *, cacheable: bool, usage: list[Usage],
               abstention_kind: str | None = None, dropped: int = 0) -> Composition:
-    body = extractive_text(evidence)
+    body = extractive_text(evidence) if evidence else ""
     if abstention_kind:
-        body = ABSTENTION_TEXT[abstention_kind] + "\n" + body
+        body = (ABSTENTION_TEXT[abstention_kind] + "\n" + body).strip()
     return Composition(body, [], limitations, "extractive", cacheable=cacheable, dropped=dropped,
                        abstention_kind=abstention_kind, usage=usage)
 
@@ -205,7 +281,8 @@ def _cites(ids: Sequence[str]) -> str:
     return " ".join(f"[{i}]" for i in ids)
 
 
-def _layer_one(c: Claim, texts: dict[str, str], values: dict[str, ComputedValue]) -> tuple[_Kept | None, list[str]]:
+def _layer_one(c: Claim, texts: dict[str, str], values: dict[str, ComputedValue],
+               question: str) -> tuple[_Kept | None, list[str]]:
     raw = c.text.strip()
     handles = _PLACEHOLDER.findall(raw)
     problems: list[str] = []
@@ -216,18 +293,22 @@ def _layer_one(c: Claim, texts: dict[str, str], values: dict[str, ComputedValue]
             problems.append("computed_without_result")
         if any(h not in values for h in handles):
             problems.append("unknown_computed")
-        own = {n for i in ids if i in texts for n in numbers_in(texts[i])}
-        if numbers_in(_PLACEHOLDER.sub(" ", raw)) - own:
+        own = {n for i in ids if i in texts for n in numbers_in(texts[i], words=True)}
+        bare = _PLACEHOLDER.sub(" ", raw)
+        if numbers_in(bare) - own - question_subject_numbers(bare, question, set()):
             problems.append("model_authored_number")  # computed numbers come from tool results only
         if problems:
             return None, problems
         computed_numbers = {values[h].display for h in handles}
-        raw = _PLACEHOLDER.sub(lambda m: values[m[1]].display, raw)
-        raw = _repeated_unit(raw, [values[h].display for h in handles])
+        # "{C1}מ״ר" as well as "{C1} מ״ר": the value carries its unit, the model's copy goes (dedupe_units)
+        raw = _PLACEHOLDER.sub(lambda m: values[m[1]].display + " ", raw)
+        raw = re.sub(r"[ \t]+([.,;:)!?])", r"\1", raw).strip()
     elif handles:
         return None, ["computed_value_in_noncomputed_claim"]
+    raw = dedupe_units(raw)
     declared = [] if c.kind == "computed" else c.numbers
-    problems = check_claim(raw, ids, declared, c.kind, evidence=texts, computed_numbers=computed_numbers)
+    problems = check_claim(raw, ids, declared, c.kind, evidence=texts, computed_numbers=computed_numbers,
+                           question=question)
     if problems:
         return None, problems
     spans = [(i, texts[i]) for i in ids]
@@ -269,8 +350,9 @@ def _conflicts(parsed: CompareAnswer, kept: dict[int, _Kept], labels: dict[str, 
 
 
 def _call_answer(provider: LLMProvider, question: str, evidence: list[dict], computed: Sequence[ComputedValue],
-                 compare: bool) -> StructuredResult:
-    instructions = SYSTEM_POLICY + "\n" + CLAIMS_POLICY + ("\n" + COMPARE_POLICY if compare else "")
+                 compare: bool, two_sided: bool) -> StructuredResult:
+    instructions = (SYSTEM_POLICY + "\n" + CLAIMS_POLICY + ("\n" + COMPARE_POLICY if compare else "")
+                    + ("\n" + TWO_SIDED_POLICY if two_sided or compare else ""))
     try:
         return provider.structured(Purpose.ANSWER, instructions, answer_input(question, evidence, computed),
                                    CompareAnswer if compare else ComposedAnswer)
@@ -300,12 +382,57 @@ def _verbatim(items: list[tuple[int, str, list[tuple[str, str]]]]) -> dict[int, 
             for n, t, spans in items}
 
 
+def _source_note(e: dict) -> str:
+    """Where a span comes from, for the judge: document title, pages and section."""
+    where = [e.get("title") or ""]
+    if e.get("page_list"):
+        where.append(f"עמ׳ {', '.join(map(str, e['page_list']))}")
+    if e.get("section"):
+        where.append(str(e["section"]))
+    return ", ".join(w for w in where if w)
+
+
+def _sides(evidence: list[dict]) -> dict[str, str]:
+    """Side key -> display name: the compare label, else the document."""
+    out: dict[str, str] = {}
+    for e in evidence:
+        key = e.get("label") or e.get("document_id") or e.get("title") or e["evidence_id"]
+        out.setdefault(str(key), e.get("label") or e.get("title") or e["evidence_id"])
+    return out
+
+
+def _side_check(evidence: list[dict], survivors: list[_Kept]) -> tuple[list[str], list[str]]:
+    """(cited side names, uncovered side names) of a two-sided answer: the sides with evidence that a verified
+    claim cites, and those that none does."""
+    side_of = {e["evidence_id"]: str(e.get("label") or e.get("document_id") or e.get("title") or e["evidence_id"])
+               for e in evidence}
+    sides = _sides(evidence)
+    cited = {side_of[i] for k in survivors for i in k.own if i in side_of}
+    return [n for key, n in sides.items() if key in cited], [n for key, n in sides.items() if key not in cited]
+
+
+def _abstain_stated(evidence: list[dict], missing: str, absent: list[str], *, usage: list[Usage],
+                    dropped: int, cacheable: bool) -> Composition:
+    """The documents were read and do not state the datum (``not_stated``): what is missing, and the passages."""
+    what = missing or " ".join(absent)
+    lims = [L_INSUFFICIENT] + ([f"מה חסר: {what}"] if what else [])
+    return _fallback(evidence, lims, cacheable=cacheable, usage=usage, abstention_kind="not_stated", dropped=dropped)
+
+
 def compose_answer(provider: LLMProvider | None, question: str, evidence: list[dict], *,
                    computed: Sequence[ComputedValue] = (), cited_extra: dict[str, str] | None = None,
-                   compare: bool = False) -> Composition:
+                   compare: bool = False, two_sided: bool = False,
+                   no_evidence_kind: AbstentionKind = "not_found") -> Composition:
     """Compose an answer over ``evidence`` (authorized, numbered E#). ``cited_extra`` maps further authorized
-    ids (e.g. a numeric answer's record sources) to their text. With no provider the evidence is quoted."""
-    if provider is None or not evidence:
+    ids (e.g. a numeric answer's record sources) to their text. With no provider the evidence is quoted; with
+    no evidence the answer abstains with ``no_evidence_kind``.
+
+    ``compare`` (sides labeled per evidence) and ``two_sided`` (a comparison or conflict question over plain
+    evidence) ask the model for every side's value; when the verified claims then cite only one side although
+    evidence from another was provided, the answer is marked ``incomplete`` and is not cacheable."""
+    if not evidence:
+        return _fallback([], [], cacheable=True, usage=[], abstention_kind=no_evidence_kind)
+    if provider is None:
         return _fallback(evidence, [], cacheable=True, usage=[])
     usage: list[Usage] = []
     if provider.demo:
@@ -314,7 +441,7 @@ def compose_answer(provider: LLMProvider | None, question: str, evidence: list[d
         if parsed is None:
             return _fallback(evidence, [L_UNAVAILABLE], cacheable=False, usage=usage)
     else:
-        r = _call_answer(provider, question, evidence, computed, compare)
+        r = _call_answer(provider, question, evidence, computed, compare, two_sided)
         usage.append(Usage(Purpose.ANSWER, r, r.ok, r.status))
         if not r.ok:
             return _fallback(evidence, [L_UNAVAILABLE], cacheable=False, usage=usage)
@@ -329,28 +456,32 @@ def compose_answer(provider: LLMProvider | None, question: str, evidence: list[d
     labels = {e["evidence_id"]: e["label"] for e in evidence if e.get("label")}
     values = {c.handle: c for c in computed}
     kept: list[_Kept] = []
+    absent: list[str] = []  # claims that only say the evidence does not state something
     for n, claim in enumerate(parsed.claims):
-        k, problems = _layer_one(claim, texts, values)
+        if claim.kind != "computed" and is_absence_claim(claim.text):
+            absent.append(" ".join(CITE.sub(" ", claim.text).split()))
+            continue
+        k, problems = _layer_one(claim, texts, values, question)
         if k is None:
             logger.info("claim %d failed layer 1: %s", n, problems)
             continue
         k.index = n
         kept.append(k)
-    dropped = len(parsed.claims) - len(kept)
+    dropped = len(parsed.claims) - len(kept) - len(absent)
     missing = (parsed.missing_info or "").strip()
+    stated_absent = parsed.insufficient or bool(absent)
     if not kept:
         if provider.demo:
             usage[0].ok = False
-        if parsed.insufficient:
-            lims = [L_INSUFFICIENT] + ([f"מה חסר: {missing}"] if missing else [])
-            return _fallback(evidence, lims, cacheable=True, usage=usage, abstention_kind="not_stated")
+        if stated_absent:
+            return _abstain_stated(evidence, missing, absent, usage=usage, dropped=dropped, cacheable=not dropped)
         return _fallback(evidence, [L_REJECTED], cacheable=False, usage=usage, dropped=dropped)
 
     items = [(n, k.text, k.spans) for n, k in enumerate(kept)]
     if provider.demo:
         verdicts = _verbatim(items)
     else:
-        verdicts, jr = judge_claims(provider, items)
+        verdicts, jr = judge_claims(provider, items, {e["evidence_id"]: _source_note(e) for e in evidence})
         usage.append(Usage(Purpose.VERIFY, jr, jr.ok, jr.status))
         if verdicts is None:
             return _fallback(evidence, [L_JUDGE_FAILED], cacheable=False, usage=usage)
@@ -359,6 +490,8 @@ def compose_answer(provider: LLMProvider | None, question: str, evidence: list[d
     if provider.demo:
         usage[0].ok = bool(survivors)
     if not survivors:
+        if stated_absent:
+            return _abstain_stated(evidence, missing, absent, usage=usage, dropped=dropped, cacheable=False)
         return _fallback(evidence, [L_REJECTED], cacheable=False, usage=usage, dropped=dropped)
 
     lines, claims = [], []
@@ -375,10 +508,21 @@ def compose_answer(provider: LLMProvider | None, question: str, evidence: list[d
                            f"{dropped} טענות הושמטו מהתשובה כי לא נמצאה להן תמיכה בראיות שצוטטו.")
     if "partial" in verdicts.values():
         limitations.append(L_PARTIAL)
-    if parsed.insufficient and missing:
-        limitations.append(f"התשובה חלקית. מה חסר: {missing}")
+    what = [missing] if parsed.insufficient and missing else []
+    if what or absent:
+        limitations.append("התשובה חלקית. מה חסר: " + " ".join(what + absent))
+    incomplete, uncovered = False, []
+    if compare or two_sided:
+        cited, uncovered = _side_check(evidence, survivors)
+        incomplete = bool(uncovered) if compare else len(cited) < 2
+        if incomplete:
+            others = (f"; הקטעים מ{', '.join(uncovered)} אינם נתמכים בתשובה" if uncovered
+                      else "; לא נמצאו ראיות ממסמך נוסף")
+            limitations.append(f"{L_ONE_SIDE} ({', '.join(cited)}){others}, ולכן ההשוואה אינה שלמה ואינה"
+                               " מכריעה בין המקורות.")
     return Composition("\n".join(lines), claims, limitations, "mock" if provider.demo else "cloud",
-                       demo=provider.demo, dropped=dropped, usage=usage, conflicts=conflicts)
+                       demo=provider.demo, cacheable=not incomplete, dropped=dropped, usage=usage,
+                       conflicts=conflicts, incomplete=incomplete, uncovered=uncovered if incomplete else [])
 
 
 def answer_fields(comp: Composition, mode: str) -> dict:

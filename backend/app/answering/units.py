@@ -9,6 +9,10 @@ within its dimension; anything else raises ``DimensionMismatch``, so a floor num
 
 Text is compared after ``base_normalize`` (gershayim/geresh unified, thousands separators dropped), so
 'מ"ר', "מ״ר" and "מ'ר" are the same unit.
+
+For a count, Hebrew number words one to twenty ("שתי", "שלושה", "שתים עשרה") are numbers too, and "אין" /
+"ללא" ("none") is zero. Two lengths written as W×H ("300 על 350 ס״מ") give an area only through
+``area_from_dimensions``, always as an assumption (the fact goes to review).
 """
 
 from __future__ import annotations
@@ -22,6 +26,8 @@ from app.extraction.normalize_text import base_normalize
 _PREFIX_LETTERS = "והבלמשכ"
 _NUMBER = re.compile(r"(?<![\d.])\d+(?:\.\d+)?(?![\d])")
 _WORDY = re.compile(r"[\w״׳²]")
+_TOKEN = re.compile(r"[^\W\d_][\w״׳]*")
+_PAIR_SEPARATORS = ("×", "x", "*", "על")
 # Dimensions whose values may be written without a unit (a count, a calendar year, a ratio).
 UNITLESS_OK = frozenset({"count", "year", "ratio"})
 
@@ -93,6 +99,22 @@ for _cur in _CURRENCY_WORDS:
             _SURFACES[f"{_cur}{_sep}{_area}"] = _u("ILS/sqm", "currency_per_area", 1)
 _ORDERED = sorted(_SURFACES, key=len, reverse=True)
 
+# Hebrew number words (masculine, feminine and construct forms). Standalone "שנים" is not listed: it is also
+# the plural of "year"; it counts only inside a compound ("שנים עשר").
+_ONES: dict[int, tuple[str, ...]] = {
+    1: ("אחד", "אחת"), 2: ("שניים", "שתיים", "שני", "שתי", "שתים"), 3: ("שלוש", "שלושה", "שלושת"),
+    4: ("ארבע", "ארבעה", "ארבעת"), 5: ("חמש", "חמישה", "חמשה", "חמשת"), 6: ("שש", "שישה", "ששה", "ששת"),
+    7: ("שבע", "שבעה", "שבעת"), 8: ("שמונה", "שמונת"), 9: ("תשע", "תשעה", "תשעת"),
+    10: ("עשר", "עשרה", "עשרת"),
+}
+NUMBER_WORDS: dict[str, int] = {w: n for n, words in _ONES.items() for w in words} | {"עשרים": 20}
+for _n, _words in _ONES.items():
+    if _n < 10:
+        for _w in (*_words, *(("שנים",) if _n == 2 else ())):
+            for _ten in ("עשר", "עשרה"):
+                NUMBER_WORDS[f"{_w} {_ten}"] = 10 + _n
+ZERO_WORDS = frozenset({"אין", "ללא"})
+
 
 def _norm(text: str) -> str:
     return base_normalize(text or "")
@@ -156,20 +178,120 @@ def parse_number(text: str) -> Decimal | None:
     return Decimal(m.group(0)) if m else None
 
 
+def _bare_variants(token: str) -> list[str]:
+    """The token, then the token without a one- or two-letter prefix ("ושתי" -> "שתי", "והשתיים" -> "שתיים")."""
+    out = [token]
+    for k in (1, 2):
+        if len(token) - k >= 2 and all(ch in _PREFIX_LETTERS for ch in token[:k]):
+            out.append(token[k:])
+    return out
+
+
+def _word_number(words: list[str], with_zero: bool) -> tuple[int, int] | None:
+    """(value, tokens used) of the number word starting ``words``: a two-word teen first, then one word."""
+    if len(words) >= 2:
+        for first in _bare_variants(words[0]):
+            n = NUMBER_WORDS.get(f"{first} {words[1]}")
+            if n is not None and n > 10:
+                return n, 2
+    for first in _bare_variants(words[0]):
+        if first in NUMBER_WORDS:
+            return NUMBER_WORDS[first], 1
+        if with_zero and first in ZERO_WORDS:
+            return 0, 1
+    return None
+
+
+def find_word_quantities(text: str, *, with_zero: bool = True) -> list[Quantity]:
+    """Counts written as Hebrew words (one to twenty; "אין"/"ללא" as zero when ``with_zero``)."""
+    norm = _norm(text)
+    tokens = list(_TOKEN.finditer(norm))
+    out, i = [], 0
+    while i < len(tokens):
+        found = _word_number([t.group(0) for t in tokens[i:i + 2]], with_zero)
+        if found is None:
+            i += 1
+            continue
+        value, used = found
+        start, end = tokens[i].start(), tokens[i + used - 1].end()
+        unit = _unit_after(norm, end) or _unit_before(norm, start)
+        out.append(Quantity(Decimal(value), unit, start, end))
+        i += used
+    return out
+
+
+def _value_of(value_text: str, dimension: str | None) -> Decimal | None:
+    wanted = parse_number(value_text)
+    if wanted is not None or dimension != "count":
+        return wanted
+    words = [t.group(0) for t in _TOKEN.finditer(_norm(value_text))]
+    found = _word_number(words, with_zero=True) if words else None
+    return Decimal(found[0]) if found is not None and found[1] == len(words) else None
+
+
 def parse_mention_quantity(quote: str, value_text: str, dimension: str | None = None) -> Quantity | None:
     """The quantity in ``quote`` whose number equals the number in ``value_text``; None when the quote
     does not contain that number. Among several equal numbers, one whose unit measures ``dimension``
-    wins, then one with any unit."""
-    wanted = parse_number(value_text)
+    wins, then one with any unit. For a ``count``, number words and "none" words count as numbers, both in
+    the quote and in ``value_text``."""
+    wanted = _value_of(value_text, dimension)
     if wanted is None:
         return None
-    matches = [q for q in find_quantities(quote) if q.value == wanted]
+    found = find_quantities(quote) + (find_word_quantities(quote) if dimension == "count" else [])
+    matches = [q for q in found if q.value == wanted]
     if not matches:
         return None
     for q in matches:
         if dimension and q.unit is not None and q.unit.dimension == dimension:
             return q
     return next((q for q in matches if q.unit is not None), matches[0])
+
+
+def _plain(value: Decimal) -> Decimal:
+    """``value`` without trailing zeros and without an exponent (10.5000 -> 10.5, 1E+1 -> 10)."""
+    value = value.normalize()
+    return value.quantize(Decimal(1)) if value.as_tuple().exponent > 0 else value
+
+
+def _after_unit_surface(text: str) -> str:
+    """``text`` (what follows a number) without the unit word it starts with."""
+    stripped = text.lstrip()
+    for surface in _ORDERED:
+        if stripped.startswith(surface):
+            return stripped[len(surface):]
+    return stripped
+
+
+def area_from_dimensions(quote: str, value_text: str) -> Conversion | None:
+    """An area from exactly one pair of explicit lengths written W×H in ``quote`` ("300 על 350 ס״מ",
+    "2.5 x 3 מ׳"), with the separator ×, x, * or על. Both lengths need a length unit (the second's unit
+    covers a bare first). The numbers of ``value_text`` must be the two lengths or the area itself.
+    Always ``assumed``: a room's inner dimensions are not necessarily its stated area. None otherwise."""
+    norm = _norm(quote)
+    found = find_quantities(norm)
+    pairs = []
+    for a, b in zip(found, found[1:], strict=False):
+        between = norm[a.end:b.start]
+        own_a = _unit_after(norm, a.end)
+        if own_a is not None:
+            between = _after_unit_surface(between)
+        if between.strip() not in _PAIR_SEPARATORS:
+            continue
+        own_b = _unit_after(norm, b.end)
+        unit_a = own_a or own_b
+        if unit_a is None or own_b is None or unit_a.dimension != "length" or own_b.dimension != "length":
+            return None  # two numbers joined like dimensions, but not as two lengths
+        pairs.append((a.value * unit_a.factor, b.value * own_b.factor, a.value, b.value))
+    if len(pairs) != 1:
+        return None
+    width, height, raw_a, raw_b = pairs[0]
+    area = _plain(width * height)
+    stated = [Decimal(m.group(0)) for m in _NUMBER.finditer(_norm(value_text))]
+    if not stated or any(v not in (raw_a, raw_b, area) for v in stated):
+        return None
+    from app.answering.attributes import canonical_unit_for
+
+    return Conversion(area, canonical_unit_for("area"), assumed=True)
 
 
 def convert(value: Decimal, unit: Unit | None, dimension: str | None) -> Conversion:
