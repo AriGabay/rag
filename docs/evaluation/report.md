@@ -23,7 +23,7 @@ Consolidated report for the plan `docs/plans/2026-10-06-0856-feat-general-questi
   - design choices stricter than the answer key: an area given only as inner dimensions (W×H) and two areas summed in one sentence go to human review instead of into a figure (settled: uncertain values go to review);
   - a clarification raised by a tool rather than by the plan is scored as the wrong task type (GQ51, GQ52, GQ54), although the user does see the right clarification;
   - version comparisons that cite the right documents but not the page holding the changed assumption.
-- **The scripted gate 8 is green only with registered gaps.** With recorded or corrected plans and a perfect (oracle) extractor, 35–36 of 60 items pass every non-wording facet. The other 24 are strict `xfail`s, each tied to a named system gap, and the cloud-off AE2 item is one more `xfail`.
+- **The scripted gate 8 is green only with registered gaps.** With recorded real-model plans and a perfect (oracle) extractor, 52 of 64 checks pass every non-wording facet (it started at 35–36). The other 12 are strict `xfail`s, each tied to a named system gap or answer-key mismatch; a gap that gets fixed turns its `xfail` into a failure, so the list cannot go stale.
 - **Two answers in the real sample were wrong and still passed verification** (GQ55, GQ61; see below). They are the most serious finding.
 
 ## What changed (summary)
