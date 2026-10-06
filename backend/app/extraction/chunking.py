@@ -3,7 +3,8 @@
 Text is split at numbered section headings (``3. עסקאות השוואה``); inside a section, lines are packed
 into chunks up to ``MAX_CHARS`` (short pieces merge). A chunk that crosses a page break stores the exact
 list of physical pages it covers. Page footers (``... | עמוד N``) are left out of chunk text. Each table
-row also becomes a ``table_row`` chunk rendered as ``header: value`` pairs, with the row's own page.
+row also becomes a ``table_row`` chunk rendered as ``header (unit): value`` pairs, with the row's own page
+and its table and row index.
 """
 
 from __future__ import annotations
@@ -61,8 +62,10 @@ def chunk_document(pages: list[tuple[int | None, str]], tables: list[TableResult
                    max_chars: int = MAX_CHARS) -> list[ChunkResult]:
     chunks: list[ChunkResult] = []
 
-    def emit(kind: str, page_list: list[int] | None, section: str | None, text: str) -> None:
-        chunks.append(ChunkResult(index=len(chunks), kind=kind, page_list=page_list, section=section, text=text))
+    def emit(kind: str, page_list: list[int] | None, section: str | None, text: str,
+             table_index: int | None = None, row_index: int | None = None) -> None:
+        chunks.append(ChunkResult(index=len(chunks), kind=kind, page_list=page_list, section=section, text=text,
+                                  table_index=table_index, row_index=row_index))
 
     for sec in _sections(pages):
         current: list[tuple[int | None, str]] = []
@@ -80,16 +83,20 @@ def chunk_document(pages: list[tuple[int | None, str]], tables: list[TableResult
             emit("text", _page_list(current), sec.title, "\n".join(t for _, t in current))
 
     for table in tables:
-        for row in table.rows:
-            if not any(c.strip() for c in row.cells):
-                continue
+        for row_index, row in table_rows(table.rows, lambda r: r.cells):
             emit("table_row", [row.page] if row.page is not None else None, table.section,
-                 render_row(table.headers, row.cells))
+                 render_row(table.headers, row.cells, table.units), table.index, row_index)
     return chunks
 
 
-def render_row(headers: list[str], cells: list[str]) -> str:
-    """Searchable rendering of one table row: ``header: value`` pairs (empty cells skipped)."""
+def table_rows(rows: list, cells_of) -> list[tuple[int, object]]:
+    """Rows that become chunks, with their index in the table (all-empty rows are skipped)."""
+    return [(i, r) for i, r in enumerate(rows) if any((c or "").strip() for c in cells_of(r))]
+
+
+def render_row(headers: list[str], cells: list[str], units: list[str | None] | None = None) -> str:
+    """Searchable rendering of one table row: ``header (unit): value`` pairs (empty cells skipped).
+    A unit already written in the header is not repeated."""
     if not headers:
         return " | ".join(c for c in cells if c)
     parts = []
@@ -97,5 +104,8 @@ def render_row(headers: list[str], cells: list[str]) -> str:
         if not cell:
             continue
         label = headers[i] if i < len(headers) and headers[i] else f"עמודה {i + 1}"
+        unit = units[i] if units and i < len(units) else None
+        if unit and f"({unit})" not in label:
+            label = f"{label} ({unit})"
         parts.append(f"{label}: {cell}")
     return " | ".join(parts)

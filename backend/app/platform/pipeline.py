@@ -97,8 +97,9 @@ def clone_outputs(conn: Connection, info: VersionInfo) -> int:
     conn.execute(
         text(
             "INSERT INTO chunks (office_id, document_id, version_id, chunk_index, kind, page_list, section, text,"
-            " normalized_text, embedding, embedding_model) SELECT office_id, :d, :v, chunk_index, kind, page_list,"
-            " section, text, normalized_text, embedding, embedding_model FROM chunks WHERE version_id = :s"
+            " normalized_text, embedding, embedding_model, table_index, row_index) SELECT office_id, :d, :v,"
+            " chunk_index, kind, page_list, section, text, normalized_text, embedding, embedding_model, table_index,"
+            " row_index FROM chunks WHERE version_id = :s"
         ),
         params,
     )
@@ -143,10 +144,11 @@ def persist_extraction(conn: Connection, info: VersionInfo, result: ExtractionRe
         conn.execute(
             text(
                 "INSERT INTO chunks (office_id, document_id, version_id, chunk_index, kind, page_list, section,"
-                " text, normalized_text) VALUES (app_office(), :d, :v, :i, :k, :pl, :s, :t, :n)"
+                " text, normalized_text, table_index, row_index) VALUES (app_office(), :d, :v, :i, :k, :pl, :s, :t, :n,"
+                " :ti, :ri)"
             ),
             {"d": info.document_id, "v": info.id, "i": c.index, "k": c.kind, "pl": c.page_list, "s": c.section,
-             "t": c.text, "n": normalize_for_search(c.text)},
+             "t": c.text, "n": normalize_for_search(c.text), "ti": c.table_index, "ri": c.row_index},
         )
     conn.execute(
         text("UPDATE document_versions SET page_count = :p, pages_incomplete = :i, extraction_version = :e"

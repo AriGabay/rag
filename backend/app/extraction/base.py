@@ -60,6 +60,8 @@ class ChunkResult:
     page_list: list[int] | None
     section: str | None
     text: str
+    table_index: int | None = None  # table_row chunks: the source table and row (KTD10)
+    row_index: int | None = None
 
 
 @dataclass

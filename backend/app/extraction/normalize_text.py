@@ -9,6 +9,8 @@ two. We normalize in the application, identically for indexed text and queries:
 - drop thousands separators inside numbers (1,250,000 -> 1250000)
 - for Hebrew words starting with a one-letter prefix (ו ה ב ל מ ש כ) add the stripped form as
   an extra token, so both 'ברמת' and 'רמת' are searchable
+- light inflection (KTD10): plural and construct suffixes add singular-form tokens on both sides
+  ('מרפסות' -> 'מרפסת', 'ממ״דים' -> 'ממ״ד'). A morphological rule, not topic vocabulary.
 """
 
 from __future__ import annotations
@@ -61,17 +63,38 @@ def prefix_variants(word: str) -> list[str]:
     return variants
 
 
+def inflection_variants(word: str) -> list[str]:
+    """Singular forms for plural/construct suffixes: -ות -> -ת/-ה, -ים -> stem, construct -ת -> -ה.
+    Only when at least three stem letters remain, so short words are never truncated."""
+    variants: list[str] = []
+    if len(word) >= 5 and word.endswith("ות"):
+        variants += [word[:-2] + "ת", word[:-2] + "ה"]
+    elif len(word) >= 5 and word.endswith("ים"):
+        variants.append(word[:-2])
+    elif len(word) >= 4 and word.endswith("ת"):
+        variants.append(word[:-1] + "ה")
+    return variants
+
+
+def _word_variants(word: str) -> list[str]:
+    """Prefix-stripped forms, and inflection variants of the word and of each stripped form."""
+    out = prefix_variants(word)
+    for w in [word, *out]:
+        out = out + inflection_variants(w)
+    return out
+
+
 def normalize_for_search(text: str) -> str:
-    """Normalized text plus prefix-stripped variants, for tsvector and trigram indexing."""
+    """Normalized text plus prefix-stripped and inflection variants, for tsvector and trigram indexing."""
     base = base_normalize(text)
     extra: list[str] = []
     for m in _HEB_WORD.finditer(base):
-        extra.extend(prefix_variants(m.group(0)))
+        extra.extend(_word_variants(m.group(0)))
     return base if not extra else f"{base} {' '.join(extra)}"
 
 
 def query_tokens(query: str) -> list[str]:
-    """Tokens for an OR-style tsquery: base tokens plus prefix-stripped variants."""
+    """Tokens for an OR-style tsquery: base tokens plus prefix-stripped and inflection variants."""
     base = base_normalize(query)
     tokens: list[str] = []
     for raw in re.findall(r"[\w״׳./]+", base):
@@ -81,6 +104,6 @@ def query_tokens(query: str) -> list[str]:
             continue
         tokens.append(tok)
         if _HEB_WORD.fullmatch(tok):
-            tokens.extend(prefix_variants(tok))
+            tokens.extend(_word_variants(tok))
     seen: set[str] = set()
     return [t for t in tokens if not (t in seen or seen.add(t))]
