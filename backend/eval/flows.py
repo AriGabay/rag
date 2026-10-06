@@ -32,12 +32,13 @@ def post_ask(client, body: dict) -> tuple[dict, float]:
 
 
 def ask_flow(client, question: str, answers: dict | None = None, conversation_id: str | None = None,
-             filters: dict | None = None, max_turns: int = 8) -> Flow:
-    """Ask ``question`` and answer the clarifications the system raises from ``answers``.
+             filters: dict | None = None, max_turns: int = 8, replies: dict | None = None) -> Flow:
+    """Ask ``question`` and answer the clarifications the system raises: with a button from ``answers``
+    (key -> option value), or in free text from ``replies`` (key -> typed text, R20), which wins.
 
-    Stops at the first clarification whose key is not in ``answers`` (the final answer is then
-    that clarification) or whose wanted value is not among the offered options."""
-    answers = answers or {}
+    Stops at the first clarification whose key is in neither (the final answer is then that
+    clarification), or whose wanted button value is not among the offered options."""
+    answers, replies = answers or {}, replies or {}
     body = {"question": question, "conversation_id": conversation_id}
     if filters:
         body["filters"] = filters
@@ -51,6 +52,12 @@ def ask_flow(client, question: str, answers: dict | None = None, conversation_id
             break
         key = a["clarification"]["key"]
         flow.clarifications.append(key)
+        if key in replies:
+            data, ms = post_ask(client, {"conversation_id": flow.conversation_id, "question": replies.pop(key)})
+            flow.answer = data.get("answer", data)
+            flow.transcript.append(flow.answer)
+            flow.latencies_ms.append(ms)
+            continue
         if key not in answers:
             break
         options = [o["value"] for o in a["clarification"]["options"]]

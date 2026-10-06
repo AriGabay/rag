@@ -1,75 +1,56 @@
-"""Conversations, /api/ask, exact answer cache, stale-answer marking (U8, U11, R27, R28, R39)."""
+"""Conversations and ``/api/ask``: turn reservation, the final transaction, stale marking (U9; KTD13, KTD14).
+
+``ask`` follows KTD13:
+
+1. A short transaction takes a per-turn advisory lock and reserves ``turn_id`` by inserting a ``pending``
+   question row (unique per conversation). A turn that is already done returns its stored result; one
+   still pending answers 409; a failed one runs again on the same row. The same transaction loads the
+   state and cache inputs (``turn.load``).
+2. Interpretation and tools run outside it (``turn.interpret_turn`` / ``turn.execute_turn``); each tool
+   opens its own short transaction under the user's context, and no model call runs inside one.
+3. A final transaction checks ``state_version`` and completes the row, its sources, the state and the
+   cache together. On a conflict the same plan is re-applied once to the fresh state (its relative years
+   were resolved against the starting state, so they never apply twice); a second conflict answers 409.
+   A failed turn marks its reservation ``failed`` so a retry can run.
+"""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
+import uuid
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
+from app.answering import turn
 from app.answering.conditions import QueryConditions
-from app.answering.coverage import coverage
-from app.answering.service import AskInput, Outcome, run_question
-from app.answering.templates import TEMPLATE_VERSION
+from app.answering.state import ConversationState
+from app.answering.turn import TurnError, TurnRequest, TurnResult, scope_hash
 from app.db import TenantContext, current_data_version, tenant_tx
 from app.deps import NOT_FOUND, get_ctx, parse_uuid
-from app.providers.embeddings import get_embedding_provider
 
 router = APIRouter(prefix="/api", tags=["chat"])
-CACHEABLE = ("numeric", "content", "combined", "abstain")
 NEW_CONVERSATION_TITLE = "שיחה חדשה"
+IN_PROGRESS = "השאלה עדיין בעיבוד"
 
 
 class AskBody(BaseModel):
     conversation_id: str | None = None
     question: str | None = Field(default=None, max_length=1000)
-    filters: dict | None = None
+    filters: dict | None = None  # explicit condition edits, applied as a delta to the conversation state
+    remove: list[str] | None = None  # context chips to clear (``context[].key``)
     clarification: dict | None = None
+    turn_id: str | None = None  # client-generated; the same id never applies twice
 
 
-def scope_hash(ctx: TenantContext) -> str:
-    scope = "admin" if ctx.is_admin else "employee:" + ",".join(sorted(str(g) for g in ctx.group_ids))
-    return hashlib.sha256(scope.encode()).hexdigest()[:32]
-
-
-def _settings_version(conn: Connection) -> int:
-    return conn.execute(text("SELECT settings_version FROM office_settings")).scalar_one()
-
-
-def cache_key(conn: Connection, ctx: TenantContext, outcome_conditions: QueryConditions | None, question: str,
-              intent: str | None) -> str:
-    """Office, permission scope, intent, normalized conditions, data version, calculation settings (R28)."""
-    payload = {
-        "office": str(ctx.office_id), "scope": scope_hash(ctx), "intent": intent,
-        "conditions": outcome_conditions.normalized_key() if outcome_conditions else None,
-        "question": None if intent == "calculation" else " ".join(question.split()),
-        "data_version": current_data_version(conn), "settings_version": _settings_version(conn),
-        "embedding": get_embedding_provider().model_id, "template": TEMPLATE_VERSION,
-    }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-
-
-def _sources_still_authorized(conn: Connection, answer: dict) -> bool:
-    """Every cited version must still be current, undeleted and visible to this user (one query)."""
-    pairs = {(s["document_id"], s["version_id"]) for s in answer.get("sources", [])}
-    if not pairs:
-        return True
-    visible = conn.execute(
-        text("SELECT count(*) FROM document_versions v JOIN documents d ON d.id = v.document_id"
-             " WHERE v.id = ANY(CAST(:vs AS uuid[])) AND d.deleted_at IS NULL AND v.is_current"),
-        {"vs": [v for _, v in pairs]},
-    ).scalar_one()
-    return visible == len({v for _, v in pairs})
-
-
-def _conversation(conn: Connection, ctx: TenantContext, conversation_id: str | None, title: str | None):
+def _conversation(conn: Connection, ctx: TenantContext, conversation_id: str | UUID | None, title: str | None):
     if conversation_id:
+        cid = conversation_id if isinstance(conversation_id, UUID) else parse_uuid(conversation_id)
         row = conn.execute(text("SELECT * FROM conversations WHERE id = :c AND user_id = :u"),
-                           {"c": parse_uuid(conversation_id), "u": ctx.user_id}).first()
+                           {"c": cid, "u": ctx.user_id}).first()
         if row is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
         return row
@@ -79,73 +60,129 @@ def _conversation(conn: Connection, ctx: TenantContext, conversation_id: str | N
     ).one()
 
 
-def _save(conn: Connection, ctx: TenantContext, conv_id: UUID, question: str, outcome: Outcome, latency: int) -> UUID:
-    answer = outcome.answer
-    qid = conn.execute(
-        text("INSERT INTO questions (office_id, conversation_id, user_id, question_text, intent, parse_route,"
-             " conditions, answer, answer_kind, data_version, scope_hash, latency_ms) VALUES (app_office(), :c, :u,"
-             " :q, :i, :r, CAST(:cond AS jsonb), CAST(:a AS jsonb), :k, :dv, :sh, :l) RETURNING id"),
-        {"c": conv_id, "u": ctx.user_id, "q": question, "i": outcome.intent, "r": outcome.parse_route,
-         "cond": json.dumps(outcome.conditions.model_dump() if outcome.conditions else None),
-         "a": json.dumps(answer, ensure_ascii=False, default=str), "k": answer["kind"],
-         "dv": current_data_version(conn), "sh": scope_hash(ctx), "l": latency},
-    ).scalar_one()
+def _turn_id(value: str | None) -> UUID:
+    if not value:
+        return uuid.uuid4()
+    try:
+        return UUID(value)
+    except ValueError:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "מזהה פנייה לא תקין") from None
+
+
+def _stored(row) -> dict:
+    return {"conversation_id": str(row.conversation_id), "question_id": str(row.id), "turn_id": str(row.turn_id),
+            "answer": row.answer}
+
+
+def _complete(conn: Connection, ctx: TenantContext, qid: UUID, r: TurnResult, L: turn.Loaded,
+              question: str, latency: int) -> bool:
+    """The final transaction: state (optimistic on ``state_version``), the reserved row, sources, cache."""
+    conv_id = L.conversation_id
+    conflict = json.dumps(r.conflict_pending, ensure_ascii=False) if r.conflict_pending else None
+    if r.state is not None:
+        updated = conn.execute(
+            text("UPDATE conversations SET state = CAST(:s AS jsonb), state_version = state_version + 1,"
+                 " pending_clarification = CAST(:p AS jsonb), updated_at = now()"
+                 " WHERE id = :c AND state_version = :v"),
+            {"s": r.state.model_dump_json(), "p": conflict, "c": conv_id, "v": L.state_version},
+        ).rowcount
+        if not updated:
+            return False
+    else:
+        conn.execute(text("UPDATE conversations SET pending_clarification = CAST(:p AS jsonb), updated_at = now()"
+                          " WHERE id = :c"), {"p": conflict, "c": conv_id})
+    answer = r.answer
+    conn.execute(
+        text("UPDATE questions SET status = 'done', question_text = :q, intent = :i, parse_route = :r,"
+             " conditions = CAST(:cond AS jsonb), answer = CAST(:a AS jsonb), answer_kind = :k, data_version = :dv,"
+             " scope_hash = :sh, latency_ms = :l, plan = CAST(:plan AS jsonb), steps = CAST(:steps AS jsonb),"
+             " facts_versions = CAST(:fv AS jsonb) WHERE id = :id"),
+        {"id": qid, "q": question, "i": r.intent, "r": r.route, "cond": json.dumps(r.conditions),
+         "a": json.dumps(answer, ensure_ascii=False, default=str), "k": answer["kind"], "dv": L.data_version,
+         "sh": scope_hash(ctx), "l": latency, "plan": json.dumps(r.plan_record, ensure_ascii=False, default=str),
+         "steps": json.dumps(r.steps, ensure_ascii=False, default=str), "fv": json.dumps(r.facts_versions)},
+    )
     for s in answer.get("sources", []):
         conn.execute(
             text("INSERT INTO answer_sources (office_id, question_id, document_id, version_id, page_list)"
                  " VALUES (app_office(), :q, :d, :v, :p)"),
             {"q": qid, "d": s["document_id"], "v": s["version_id"], "p": s.get("page_list") or None},
         )
-    confirmed = outcome.conditions.model_dump() if (
-        outcome.conditions and answer["kind"] in ("numeric", "combined", "abstain") and outcome.conditions.data_kind
-    ) else None
     if question.strip():
         conn.execute(text("UPDATE conversations SET title = :t WHERE id = :c AND title = :placeholder"),
                      {"t": question.strip()[:80], "c": conv_id, "placeholder": NEW_CONVERSATION_TITLE})
-    conn.execute(
-        text("UPDATE conversations SET pending_clarification = CAST(:p AS jsonb),"
-             " confirmed_conditions = COALESCE(CAST(:cc AS jsonb), confirmed_conditions), updated_at = now()"
-             " WHERE id = :c"),
-        {"p": json.dumps(outcome.pending, ensure_ascii=False) if outcome.pending else None,
-         "cc": json.dumps(confirmed) if confirmed else None, "c": conv_id},
-    )
-    return qid
+    if r.cache_key:
+        conn.execute(
+            text("INSERT INTO answer_cache (office_id, cache_key, payload) VALUES (app_office(), :k,"
+                 " CAST(:p AS jsonb)) ON CONFLICT (office_id, cache_key) DO UPDATE SET payload = EXCLUDED.payload,"
+                 " created_at = now()"),
+            {"k": r.cache_key, "p": json.dumps(r.cache_payload, ensure_ascii=False, default=str)},
+        )
+    return True
+
+
+def _fail(ctx: TenantContext, qid: UUID) -> None:
+    with tenant_tx(ctx) as conn:
+        conn.execute(text("UPDATE questions SET status = 'failed' WHERE id = :q AND status = 'pending'"), {"q": qid})
+
+
+def _run(ctx: TenantContext, req: TurnRequest, L: turn.Loaded, qid: UUID, started: float, perf: float) -> TurnResult:
+    it = turn.interpret_turn(ctx, req, L)
+    for attempt in (1, 2):
+        result = turn.execute_turn(ctx, it, L, qid, started)
+        with tenant_tx(ctx) as conn:
+            done = _complete(conn, ctx, qid, result, L, it.question, int((time.perf_counter() - perf) * 1000))
+        if done:
+            return result
+        if attempt == 2:
+            break
+        with tenant_tx(ctx) as conn:  # another turn changed the conversation: restart from the state load
+            L = turn.load(conn, conn.execute(text("SELECT * FROM conversations WHERE id = :c"),
+                                             {"c": L.conversation_id}).one())
+    raise TurnError(status.HTTP_409_CONFLICT, turn.STATE_CONFLICT)
 
 
 @router.post("/ask")
 def ask(body: AskBody, ctx: TenantContext = Depends(get_ctx)) -> dict:
-    if not (body.question and body.question.strip()) and not body.clarification:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "יש לכתוב שאלה")
-    started = time.perf_counter()
+    question = (body.question or "").strip()
+    if not question and not body.clarification and not body.filters and not body.remove:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, turn.NEED_QUESTION)
+    turn_id = _turn_id(body.turn_id)
+    started, perf = time.monotonic(), time.perf_counter()
+    req = TurnRequest(question or None, body.clarification, body.filters, list(body.remove or []))
     with tenant_tx(ctx) as conn:
-        conv = _conversation(conn, ctx, body.conversation_id, body.question)
-        previous = QueryConditions.model_validate(conv.confirmed_conditions) if conv.confirmed_conditions else None
-        pending = conv.pending_clarification if body.clarification else None
-        if body.clarification and not (body.question and body.question.strip()) and (
-                not pending or pending.get("key") != body.clarification.get("key")):
-            raise HTTPException(status.HTTP_409_CONFLICT, "אין שאלת הבהרה פתוחה בשיחה זו. כתבו שאלה חדשה")
-        def lookup(conds: QueryConditions, question: str):
-            cached = conn.execute(text("SELECT payload FROM answer_cache WHERE cache_key = :k"),
-                                  {"k": cache_key(conn, ctx, conds, question, conds.intent)}).scalar()
-            if cached and cached.get("kind") != "clarification" and _sources_still_authorized(conn, cached):
-                return cached | {"coverage": coverage(conn, conds), "cached": True}
-            return None
-
-        outcome = run_question(conn, ctx, AskInput(body.question, body.filters, body.clarification), previous,
-                               pending, cache=lookup)
-        question_text = body.question or (pending or {}).get("original_question", "")
-        if (outcome.answer["kind"] in CACHEABLE and outcome.conditions is not None and outcome.cacheable
-                and not outcome.answer.get("cached")):
-            key = cache_key(conn, ctx, outcome.conditions, question_text, outcome.conditions.intent)
-            conn.execute(
-                text("INSERT INTO answer_cache (office_id, cache_key, payload) VALUES (app_office(), :k,"
-                     " CAST(:p AS jsonb)) ON CONFLICT (office_id, cache_key) DO UPDATE SET payload = EXCLUDED.payload,"
-                     " created_at = now()"),
-                {"k": key, "p": json.dumps(outcome.answer, ensure_ascii=False, default=str)},
-            )
-        latency = int((time.perf_counter() - started) * 1000)
-        qid = _save(conn, ctx, conv.id, question_text, outcome, latency)
-    return {"conversation_id": str(conv.id), "question_id": str(qid), "answer": outcome.answer}
+        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": f"turn:{ctx.user_id}:{turn_id}"})
+        existing = conn.execute(text("SELECT * FROM questions WHERE turn_id = :t"), {"t": turn_id}).first()
+        if existing is not None and existing.status == "done":
+            return _stored(existing)
+        if existing is not None and existing.status == "pending":
+            raise HTTPException(status.HTTP_409_CONFLICT, IN_PROGRESS)
+        conv = _conversation(conn, ctx, existing.conversation_id if existing is not None else body.conversation_id,
+                             question)
+        L = turn.load(conn, conv)
+        try:
+            turn.check_request(req, L)
+        except TurnError as e:
+            raise HTTPException(e.status_code, e.detail) from None
+        if existing is not None:  # a failed turn runs again on its reservation
+            qid = existing.id
+            conn.execute(text("UPDATE questions SET status = 'pending', created_at = now() WHERE id = :q"), {"q": qid})
+        else:
+            qid = conn.execute(
+                text("INSERT INTO questions (office_id, conversation_id, user_id, question_text, turn_id, status)"
+                     " VALUES (app_office(), :c, :u, :q, :t, 'pending') RETURNING id"),
+                {"c": conv.id, "u": ctx.user_id, "q": question, "t": turn_id},
+            ).scalar_one()
+    try:
+        result = _run(ctx, req, L, qid, started, perf)
+    except TurnError as e:
+        _fail(ctx, qid)
+        raise HTTPException(e.status_code, e.detail) from None
+    except BaseException:
+        _fail(ctx, qid)
+        raise
+    return {"conversation_id": str(conv.id), "question_id": str(qid), "turn_id": str(turn_id),
+            "answer": result.answer}
 
 
 @router.get("/conversations")
@@ -163,32 +200,58 @@ def new_conversation(ctx: TenantContext = Depends(get_ctx)) -> dict:
     return {"id": str(conv.id)}
 
 
+def _stale(q, dv: int, sh: str, facts_now: dict[str, int]) -> bool:
+    """Data or permission scope changed, or a fact of an attribute this answer used was reviewed or added
+    (only that attribute's ``facts_version`` counts, KTD9)."""
+    if q.answer_kind == "clarification":
+        return False
+    used = q.facts_versions or {}
+    return q.data_version != dv or q.scope_hash != sh or any(facts_now.get(a) != v for a, v in used.items())
+
+
 @router.get("/conversations/{conversation_id}")
 def get_conversation(conversation_id: str, ctx: TenantContext = Depends(get_ctx)) -> dict:
     with tenant_tx(ctx) as conn:
         conv = _conversation(conn, ctx, conversation_id, None)
         dv, sh = current_data_version(conn), scope_hash(ctx)
-        rows = conn.execute(text("SELECT * FROM questions WHERE conversation_id = :c ORDER BY created_at"),
-                            {"c": conv.id}).all()
+        rows = conn.execute(text("SELECT * FROM questions WHERE conversation_id = :c AND status = 'done'"
+                                 " ORDER BY created_at"), {"c": conv.id}).all()
         visible_counts = dict(conn.execute(
             text("SELECT s.question_id, count(*) FROM answer_sources s JOIN documents d ON d.id = s.document_id"
                  " WHERE s.question_id = ANY(:ids) AND d.deleted_at IS NULL GROUP BY s.question_id"),
             {"ids": [q.id for q in rows]},
         ).all()) if rows else {}
+        facts_now = {str(r.id): r.facts_version for r in conn.execute(
+            text("SELECT id, facts_version FROM attribute_definitions")).all()} if any(
+            q.facts_versions for q in rows) else {}
         messages = []
         for q in rows:
             answer = q.answer or {}
-            expected = len(answer.get("sources", []))
-            visible = visible_counts.get(q.id, 0)
-            hidden = visible < expected
+            hidden = visible_counts.get(q.id, 0) < len(answer.get("sources", []))
             messages.append({
-                "question_id": str(q.id), "question": q.question_text,
-                "answer": None if hidden else answer,
-                "stale": (q.data_version != dv or q.scope_hash != sh) and q.answer_kind != "clarification",
-                "hidden": hidden, "created_at": q.created_at.isoformat(),
+                "question_id": str(q.id), "question": q.question_text, "answer": None if hidden else answer,
+                "stale": _stale(q, dv, sh, facts_now), "hidden": hidden, "created_at": q.created_at.isoformat(),
             })
-        confirmed = QueryConditions.model_validate(conv.confirmed_conditions).describe() if conv.confirmed_conditions else []
-        pending = conv.pending_clarification
-    return {"id": str(conv.id), "title": conv.title, "confirmed_conditions": confirmed,
-            "pending_clarification": {k: pending[k] for k in ("key", "question", "options")} if pending else None,
-            "messages": messages}
+    try:
+        state = ConversationState.model_validate(dict(conv.state or {}))
+    except ValueError:
+        state = ConversationState()
+    legacy = conv.pending_clarification or {}
+    if legacy.get("key") == turn.FILTER_CONFLICT:
+        pending = {k: legacy[k] for k in ("key", "question", "options")}
+    elif state.pending is not None:
+        pending = {"key": state.pending.key, "question": state.pending.question,
+                   "options": [o.model_dump() for o in state.pending.options]}
+    else:
+        pending = None
+    c = state.conditions
+    context = {
+        "attribute": state.attribute.description if state.attribute else None, "metric": state.metric,
+        "city": c.city, "neighborhood": c.neighborhood,
+        "years": {"from": c.year_from, "to": c.year_to} if c.year_from is not None else None,
+        "data_kind": c.data_kind, "date_field": c.date_field,
+        "chips": turn.context_items(state),
+    }
+    return {"id": str(conv.id), "title": conv.title,
+            "confirmed_conditions": QueryConditions.model_validate(c.model_dump()).describe(),
+            "pending_clarification": pending, "context": context, "messages": messages}

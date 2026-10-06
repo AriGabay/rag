@@ -1,9 +1,12 @@
 """Content and combined answers: provider gating, claims-first composition and verification (U10, U8)."""
 
+import json
+
 import pytest
 from sqlalchemy import text
 
 from alembic import command
+from app.answering.plan import TurnPlan
 from app.db import reset_engine, tenant_tx
 from app.providers.llm import CallStatus, Purpose
 from tests.conftest import alembic_config, login
@@ -23,6 +26,8 @@ TEXTS = [
 ]
 QUESTION = "מה היו שיקולי השמאי לגבי היטל השבחה?"
 SUPPORTED = "השמאי המכריע קבע הפחתה של 10% בשל היטל השבחה"
+SEARCH = {"tool": "search", "attribute_handle": None, "source_handles": []}
+COMBINED = "מה מחיר העסקאות למ״ר בחרוזים ב-2024 לפי תאריך עסקה ומה נכתב על היטל השבחה?"
 
 
 def claims(*items, insufficient=False, missing=None):
@@ -34,8 +39,14 @@ def verdicts(*v):
     return {"verdicts": [{"claim": i, "verdict": x} for i, x in enumerate(v)]}
 
 
+def search_plan(instructions, input):
+    """The interpreter's plan in cloud mode (U9): answer from content with the question as the query."""
+    question = json.loads(input)["question"]
+    return TurnPlan.build(task_type="answer", search_queries=[question], steps=[SEARCH])
+
+
 def scripted(answer=None, judge=None):
-    p = ScriptedProvider()
+    p = ScriptedProvider().on(Purpose.INTERPRET, search_plan, repeat=True)
     if answer is not None:
         p.on(Purpose.ANSWER, answer, repeat=True)
     if judge is not None:
@@ -92,9 +103,9 @@ def test_cloud_answer_is_composed_from_verified_claims(client, office, monkeypat
     assert a["provider"] == "cloud" and a["demo"] is False and a["mode"] == "cloud"
     assert a["text"] == f"{SUPPORTED} [E1]"
     assert a["claims"] == [{"text": SUPPORTED, "kind": "explicit", "evidence_ids": ["E1"]}]
-    assert [c.purpose for c in p.calls] == [Purpose.ANSWER, Purpose.VERIFY]
-    assert "משרד ב" not in p.calls[0].input and "25%" not in p.calls[0].input
-    assert usage(office) == [("answer", True, "ok"), ("verify", True, "ok")]
+    assert [c.purpose for c in p.calls] == [Purpose.INTERPRET, Purpose.ANSWER, Purpose.VERIFY]
+    assert "משרד ב" not in p.calls[1].input and "25%" not in p.calls[1].input
+    assert usage(office) == [("interpret", True, "ok"), ("answer", True, "ok"), ("verify", True, "ok")]
     assert ask(client, QUESTION)["answer"].get("cached") is True
 
 
@@ -150,10 +161,10 @@ def test_injected_instruction_does_not_alter_calls_or_statuses(client, office, m
     enable_cloud(office, monkeypatch, p)
     login(client, "admin-a@example.test")
     a = ask(client, "מה כתוב בהוראה למערכת?")["answer"]
-    assert [c.purpose for c in p.calls] == [Purpose.ANSWER, Purpose.VERIFY]
+    assert [c.purpose for c in p.calls] == [Purpose.INTERPRET, Purpose.ANSWER, Purpose.VERIFY]
     assert a["provider"] == "cloud" and a["mode"] == "cloud" and a["kind"] == "content"
     assert {s["document_id"] for s in a["sources"]} == {office.doc}
-    assert usage(office) == [("answer", True, "ok"), ("verify", True, "ok")]
+    assert usage(office) == [("interpret", True, "ok"), ("answer", True, "ok"), ("verify", True, "ok")]
 
 
 def test_no_relevant_evidence_abstains(client, db):
@@ -177,7 +188,7 @@ def test_combined_question_computes_first_then_explains(client, office):
     publish(office, doc, ver)
     approve_all(office)
     login(client, "admin-a@example.test")
-    a = ask(client, "מה מחיר העסקאות למ״ר בחרוזים ב-2024 לפי תאריך עסקה ומה השיקולים שהוזכרו?")["answer"]
+    a = ask(client, COMBINED)["answer"]
     assert a["kind"] == "combined" and a["numeric"]["record_count"] == 2
     assert a["numeric"]["mean_price_per_sqm"] == "25000.00"
     ids = [s["evidence_id"] for s in a["sources"]]
@@ -196,28 +207,30 @@ def test_combined_computed_claim_takes_the_server_value(client, office, monkeypa
 
     enable_cloud(office, monkeypatch, scripted(answer, verdicts("supported")))
     login(client, "admin-a@example.test")
-    a = ask(client, "מה מחיר העסקאות למ״ר בחרוזים ב-2024 לפי תאריך עסקה ומה השיקולים שהוזכרו?")["answer"]
+    a = ask(client, COMBINED)["answer"]
     assert a["kind"] == "combined" and a["provider"] == "cloud"
     assert a["text"].endswith("המחיר הממוצע למ״ר בחרוזים הוא 25,000 ₪ (חושב במערכת)")
     assert "26,000" not in a["text"] and a["dropped_claims"] == 1
     assert a["claims"][0]["kind"] == "computed"
 
 
-def test_model_parse_route_when_rules_cannot_parse(client, office, monkeypatch):
+def test_model_route_when_rules_cannot_parse(client, office, monkeypatch):
+    """A question the rules cannot fully explain goes to the model interpreter in cloud mode (KTD1, KTD2)."""
     doc, ver = add_version(office, office.default_group_id, AE3, "9" * 64)
     publish(office, doc, ver)
     approve_all(office)
-
-    class Parser(ScriptedProvider):
-        def parse_conditions(self, question, schema):
-            return {"intent": "calculation", "data_kind": "transaction_price", "date_field": "transaction_date",
-                    "year_from": 2024, "neighborhood": "חרוזים", "city": "רמת גן"}
-
-    enable_cloud(office, monkeypatch, Parser())
-    monkeypatch.setattr("app.answering.service.cloud_parser", lambda conn: Parser())
+    plan = TurnPlan.build(
+        task_type="compute", metric="mean",
+        conditions={"data_kind": "transaction_price", "date_field": "transaction_date", "year_from": 2024,
+                    "neighborhood": "חרוזים", "city": "רמת גן"},
+        attribute={"handle": None, "description": "מחיר למ״ר", "unit_dimension": "currency_per_area"},
+        steps=[{"tool": "compute_records", "attribute_handle": None, "source_handles": []}])
+    p = ScriptedProvider().on(Purpose.INTERPRET, plan)
+    enable_cloud(office, monkeypatch, p)
     login(client, "admin-a@example.test")
     r = ask(client, "תן לי בבקשה את הנתון הכספי הממוצע לשטח עבור השנה שעברה באזור שלנו")
-    assert r["answer"]["kind"] == "numeric"
+    assert r["answer"]["kind"] == "numeric" and r["answer"]["numeric"]["record_count"] == 2
+    assert [c.purpose for c in p.calls] == [Purpose.INTERPRET]
     with tenant_tx(office.system) as conn:
         assert conn.execute(text("SELECT parse_route FROM questions")).scalar() == "model"
 
@@ -228,7 +241,7 @@ def test_provider_outage_answer_is_not_cached(client, office, monkeypatch):
     first = ask(client, QUESTION)["answer"]
     assert first["provider"] == "extractive" and any("לא היה זמין" in x for x in first["limitations"])
     assert ask(client, QUESTION)["answer"].get("cached") is None
-    assert usage(office) == [("answer", False, "timeout")] * 2
+    assert usage(office) == [("interpret", True, "ok"), ("answer", False, "timeout")] * 2
 
 
 def test_migration_0005_round_trip(office):
