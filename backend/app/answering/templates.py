@@ -16,8 +16,8 @@ from app.appraisal.query import RecordResult, Stats
 
 # The answer logic and wording the server applies after the model: bump it whenever a server rule changes what an
 # answer says (completeness, validation, locate rules), so answers cached by earlier logic are not served after a
-# deploy. t2: per-document audit and completeness, meaning-bound fact validation, structured absence claims.
-TEMPLATE_VERSION = "t2"
+# deploy. t2: per-document audit and completeness, meaning-bound fact validation, structured absence claims. t3: final-review rules (ordinals, qualified zeros, rival nouns, place spelling, locate existence).
+TEMPLATE_VERSION = "t3"
 
 
 def money(value: Decimal | None) -> str:
