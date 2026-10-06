@@ -609,13 +609,21 @@ def locate_evidence(conn: Connection, queries: Sequence[str], *, scope: SearchSc
                     limit: int = LOCATE_LIMIT) -> LocateOutcome:
     """The documents that mention the question's topic, best first, with their supporting passages.
 
-    Query variants are alternatives: a document fully supported by any one variant qualifies, so a word
+    A question about what is absent keeps only its negated variants: an un-negated rephrasing would list every
+    document stating the opposite. Quotation marks around a phrase are dropped first (a quoted variant kept its
+    negation word glued to the quote). Query variants are alternatives: a document fully supported by any one
+    variant qualifies, so a word
     only one rephrasing adds ("...לא קיימת") cannot push out documents another variant names exactly.
     Each variant is judged alone (terms are never pooled across fully supported variants); a document
     keeps the passages of every variant that fully supports it. When no variant is fully supported
     anywhere, the variants are pooled as one question."""
-    queries = [q for q in queries if q and q.strip()][:MAX_QUERIES]
+    queries = [_unquoted(q) for q in queries if q and q.strip()][:MAX_QUERIES]
     place_terms = list(place_terms)
+    negated = [q for q in queries if any(g.kind == "negation" for g in _question_groups(q, place_terms))]
+    if negated:
+        # A question about what is absent: a variant without the negation asks about what is present and would
+        # admit every document that states it ("X" next to "אין X"). Only the negated variants count.
+        queries = negated
     if len(queries) > 1:
         outcomes = [_locate(conn, [q], scope=scope, filters=filters, place_terms=place_terms, limit=limit)
                     for q in queries]
@@ -624,6 +632,14 @@ def locate_evidence(conn: Connection, queries: Sequence[str], *, scope: SearchSc
             names = list(dict.fromkeys(w for o in full for w in o.topic_terms))
             return LocateOutcome(_merge_variants(full)[:limit], names, full[0].filter_report)
     return _locate(conn, queries, scope=scope, filters=filters, place_terms=place_terms, limit=limit)
+
+
+_PHRASE_QUOTES = re.compile(r'(^|\s)["“”„]+|["“”„]+(?=\s|$)')  # never ' : a geresh ends "ג'"
+
+
+def _unquoted(query: str) -> str:
+    """The query without quotation marks around its phrases (gershayim inside a word stay)."""
+    return " ".join(_PHRASE_QUOTES.sub(r"\1", query).split())
 
 
 def _merge_variants(outcomes: list[LocateOutcome]) -> list[RankedDocument]:

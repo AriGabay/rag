@@ -571,3 +571,17 @@ def test_locate_document_keeps_the_passages_of_every_supporting_variant(office):
     assert found.document_id == doc and found.full_support and found.pages == [1, 2]
     texts = [p["text"] for p in found.passages]
     assert texts[0].startswith("סגירת") and any("נסגרה" in t for t in texts)
+
+
+def test_an_unnegated_or_quoted_variant_cannot_list_documents_stating_the_opposite(setup):
+    """Round 7 (GQ50, HV64): the interpreter added a bare variant ("X") next to "אין X", and quoted another; the bare
+    one listed every document that has X. Only the negated variants count, and quotes do not hide the negation."""
+    from app.platform.search import locate_evidence
+
+    a = setup[0]
+    add_chunks(a, a.default_group_id, ["בבניין יש מעלית חדשה ומרווחת."], "7" * 64)
+    add_chunks(a, a.default_group_id, ["הבניין בן ארבע קומות ללא מעלית."], "8" * 64)
+    with tenant_tx(a.ctx()) as conn:
+        out = locate_evidence(conn, ["אין מעלית בבניין", "\"בניין ללא מעלית\"", "מעלית"])
+    titles = [d.title for d in out.documents if d.full_support]
+    assert titles == ["דוח 888"]
