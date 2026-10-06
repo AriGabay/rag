@@ -831,3 +831,19 @@ def test_the_extraction_prompt_asks_for_a_stated_absence_as_zero(office):
     script(p, "דוח", mention("אין", "אין", source="T1R1C2", unit=None, term="חניה"))
     comp = extract(office.ctx(), attr, p)
     assert comp.preliminary is not None and comp.preliminary.values == [Decimal("0")]
+
+
+def test_a_quote_that_drops_the_label_separator_still_matches(office):
+    """Found with the real model: it copied "גובה תקרה: 2.80 מ׳" without the colon, and the verbatim check
+    rejected a correct value. Separators are ignored; words and numbers must still match in order."""
+    height = make_attr(office, "גובה תקרה", "length")
+    p = ScriptedProvider()
+    add_doc(office, office.default_group_id, "דוח", ["גובה תקרה: 2.80 מ׳ | קומה: 2"])
+    script(p, "דוח", mention("גובה תקרה 2.80 מ׳", "2.80", unit="מ׳", term="גובה תקרה"))
+    comp = extract(office.ctx(), height, p, operation="values")
+    assert comp.preliminary.values == [Decimal("2.8")]
+    # an invented number is still rejected
+    p2 = ScriptedProvider()
+    add_doc(office, office.default_group_id, "דוח ב", ["גובה תקרה: 2.80 מ׳"])
+    script(p2, "דוח ב", mention("גובה תקרה 3.10 מ׳", "3.10", unit="מ׳", term="גובה תקרה"))
+    assert extract(office.ctx(), height, p2).coverage["mentions_rejected"] >= 1

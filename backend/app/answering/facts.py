@@ -374,16 +374,26 @@ class Accepted:
     several: bool = False  # the quote states more than one value in the value's dimension
 
 
+# Separators the model may drop or change when it copies a "label: value" line or a table row; the words and
+# numbers of a quote must still appear in order. A hyphen inside a number range ("2-3") is kept.
+_SEPARATORS = re.compile(r"[:|;–—]|(?<!\d)-|-(?!\d)")
+
+
+def _quote_form(value: str) -> str:
+    """``_match_norm`` without separator punctuation: what a verbatim quote is compared on."""
+    return " ".join(_SEPARATORS.sub(" ", _match_norm(value)).split())
+
+
 def validate_mention(m: Mention, content: VersionContent, attribute: AttributeDef) -> Accepted | str:
     """The accepted mention, or the reason it was rejected."""
     src = content.sources.get(m.source.strip().upper())
     if src is None:
         return "unknown_handle"
     quote = m.quote.strip(_QUOTE_EDGES)
-    nq = _match_norm(quote)
+    nq = _quote_form(quote)
     if not nq:
         return "empty_quote"
-    if nq not in _match_norm(src.text) and not (src.context and nq in _match_norm(src.context)):
+    if nq not in _quote_form(src.text) and not (src.context and nq in _quote_form(src.context)):
         return "quote_not_found"
     naming = _naming(m.attribute_term, quote, src, attribute)
     # a measure-word term ("בשטח") may still name the value through the attribute's own words right before it
@@ -493,8 +503,8 @@ def _naming(term: str, quote: str, src: Source, attribute: AttributeDef) -> bool
     True when it is another phrasing (a value named that way goes to review, never straight into a figure).
     The cell label names a value structurally; a quote's other words name it only as the value's own label
     (``validate_mention``)."""
-    nt = _match_norm(term.strip(_QUOTE_EDGES))
-    where = _match_norm(quote) + " " + _match_norm(src.context or "")
+    nt = _quote_form(term.strip(_QUOTE_EDGES))
+    where = _quote_form(quote) + " " + _quote_form(src.context or "")
     if not nt or nt not in where:
         return "attribute_term_not_found"
     term_words = distinctive_words(nt)
