@@ -10,7 +10,7 @@ two. We normalize in the application, identically for indexed text and queries:
 - for Hebrew words starting with a one-letter prefix (ו ה ב ל מ ש כ) add the stripped form as
   an extra token, so both 'ברמת' and 'רמת' are searchable
 - light inflection (KTD10): plural and construct suffixes add singular-form tokens on both sides
-  ('מרפסות' -> 'מרפסת', 'ממ״דים' -> 'ממ״ד'). A morphological rule, not topic vocabulary.
+  ('דירות' -> 'דירה', 'חדרים' -> 'חדר'). A morphological rule, not topic vocabulary.
 """
 
 from __future__ import annotations

@@ -4,8 +4,9 @@ A version's city and neighborhood come from the report header: occurrences whose
 fact was read from a header label or inherited from it, and the subject's appraised-value record. Only
 when the header is silent do the version's other current occurrences count. Dates come from the
 occurrences' date columns. Rejected occurrences never count, and reviewer corrections (stored on the
-occurrence) win over the extracted value. A missing value is "unknown": it never matches a filter and
-is reported separately, so the caller can say how many documents could not be checked.
+occurrence) win over the extracted value. A version with no records at all (a narrative report) falls
+back to its own "label: value" header lines on the first pages. A missing value is "unknown": it never
+matches a filter and is reported separately, so the caller can say how many documents could not be checked.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from app.extraction.normalize_text import base_normalize
+
+HEADER_PAGES = 2  # report headers sit on the first pages
 
 DATE_FIELDS = ("valuation_date", "report_date", "transaction_date")
 _HEADER_FACT = (
@@ -101,12 +104,55 @@ def version_metadata(conn: Connection, version_ids: Sequence[UUID]) -> dict[UUID
         for f in DATE_FIELDS:
             if getattr(r, f) is not None:
                 a[f].add(getattr(r, f))
+    silent = [v for v, a in acc.items() if not (a["city_h"] or a["city"] or a["hood_h"] or a["hood"]
+                                                   or any(a[f] for f in DATE_FIELDS))]
+    for vid, header in _page_headers(conn, silent).items():
+        a = acc[vid]
+        if (city := _place(header.get("city"))) is not None:
+            a["city_h"].add(city)
+        if (hood := _place(header.get("neighborhood"))) is not None:
+            a["hood_h"].add(hood)
+        for f in ("valuation_date", "report_date"):
+            if isinstance(header.get(f), date):
+                a[f].add(header[f])
     for vid, m in meta.items():
         a = acc[vid]
         m.cities = frozenset(a["city_h"] or a["city"])
         m.neighborhoods = frozenset(a["hood_h"] or a["hood"])
         m.dates = {f: frozenset(a[f]) for f in DATE_FIELDS}
     return meta
+
+
+def _page_headers(conn: Connection, version_ids: Sequence[UUID]) -> dict[UUID, dict]:
+    """Header fields ("עיר:", "שכונה:", "המועד הקובע:" ...) read from each version's first pages."""
+    from app.appraisal.extract import parse_header  # appraisal layer; imported lazily to keep search light
+
+    if not version_ids:
+        return {}
+    pages: dict[UUID, list[tuple[int, str]]] = {}
+    for r in conn.execute(
+        text("SELECT version_id, page_no, text FROM pages WHERE version_id = ANY(:ids) AND page_no <= :n"
+             " ORDER BY version_id, page_no"),
+        {"ids": list(version_ids), "n": HEADER_PAGES},
+    ).all():
+        pages.setdefault(r.version_id, []).append((r.page_no, r.text))
+    return {vid: {k: fv.value for k, fv in parse_header(p).fields.items()} for vid, p in pages.items()}
+
+
+def header_places(conn: Connection) -> set[tuple[str | None, str]]:
+    """(city, neighborhood) pairs and (None, city) entries named by the headers of current, visible
+    narrative reports (versions without records), so the gazetteer knows places those reports cover."""
+    ids = [r.id for r in conn.execute(text(
+        "SELECT v.id FROM document_versions v JOIN documents d ON d.id = v.document_id AND d.deleted_at IS NULL"
+        " WHERE v.is_current AND NOT EXISTS (SELECT 1 FROM occurrences o WHERE o.version_id = v.id)")).all()]
+    places: set[tuple[str | None, str]] = set()
+    for header in _page_headers(conn, ids).values():
+        city, hood = header.get("city"), header.get("neighborhood")
+        if isinstance(city, str) and city.strip():
+            places.add((None, city.strip()))
+        if isinstance(hood, str) and hood.strip():
+            places.add((city.strip() if isinstance(city, str) and city.strip() else None, hood.strip()))
+    return places
 
 
 def _place_matches(wanted: str, values: frozenset[str]) -> bool:

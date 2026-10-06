@@ -3,8 +3,8 @@
 The interpreter sees the office's definitions as short handles (A1, A2, ...) and makes the semantic
 match itself. The server merges only on an interpreter-chosen handle or on an exact label/alias match
 after Hebrew normalization (quotes, niqqud, one- and two-letter prefixes such as the article ה).
-Trigram similarity only ranks the candidates shown to the interpreter and never merges: "שטח מחסן"
-and "שטח ממ״ד" stay distinct. Without a match, a ``proposed`` extracted definition is created.
+Trigram similarity only ranks the candidates shown to the interpreter and never merges: "שטח מגרש"
+and "שטח בנוי" stay distinct. Without a match, a ``proposed`` extracted definition is created.
 
 Everything runs inside the caller's tenant transaction, so RLS limits it to the current office.
 """
@@ -52,7 +52,7 @@ CANONICAL_UNITS = {
 VALUE_TYPES = ("numeric", "text", "boolean", "date")
 EXTRACTION_PROMPT_VERSION = "x1"
 _WORD = re.compile(r"[\w״׳]+")
-_FILLER = frozenset({"של"})  # "שטח של הממ״ד" names the same attribute as "שטח הממ״ד"
+_FILLER = frozenset({"של"})  # "שטח של הדירה" names the same attribute as "שטח הדירה"
 _COLUMNS = ("id, key, label_he, aliases, value_type, unit_dimension, canonical_unit, source, structured_column,"
             " extraction_prompt_version, status, facts_version")
 

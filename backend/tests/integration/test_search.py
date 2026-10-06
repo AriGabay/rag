@@ -317,3 +317,27 @@ def test_reindex_updates_table_rows_idempotently(office):
     assert all(r.e for r in rows) and "מרפסת" in head.split()
     second = reindex.reindex_office(a.system)
     assert second == {"rows_rewritten": 0, "normalized": 0, "reembedded": 0, "versions_skipped": 0}
+
+
+def test_records_less_report_takes_place_and_date_from_its_header(office):
+    """A narrative report with no records still has a city, neighborhood and valuation date for
+    filters, read from its own "label: value" header lines; the gazetteer learns those places too."""
+    from datetime import date
+
+    from app.answering.metadata import MetadataFilters, header_places
+
+    a, *_ = office
+    header = "עיר: רמת גן\nשכונה: הבורסה\nהמועד הקובע: 15/03/2024"
+    doc, ver = add_chunks(a, a.default_group_id, [header, "תיאור הנכס: דירה בבניין משותף."], "c" * 64)
+    other, other_v = add_chunks(a, a.default_group_id, ["עיר: חיפה", "תיאור הנכס: דירה בבניין משותף."], "d" * 64)
+    out = _search(a.ctx(), ["דירה בבניין"], filters=MetadataFilters(city="רמת גן"))
+    assert out.filter_report.matched == [ver] and out.filter_report.excluded == [other_v]
+    out = _search(a.ctx(), ["דירה בבניין"],
+                  filters=MetadataFilters(neighborhood="הבורסה", year_from=2024, year_to=2024))
+    assert out.filter_report.matched == [ver]
+    with tenant_tx(a.ctx()) as conn:
+        from app.answering.metadata import version_metadata
+
+        assert version_metadata(conn, [ver])[ver].dates["valuation_date"] == frozenset({date(2024, 3, 15)})
+        places = header_places(conn)
+    assert {(None, "רמת גן"), ("רמת גן", "הבורסה"), (None, "חיפה")} <= places

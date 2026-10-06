@@ -5,7 +5,7 @@ the unit is the unit word written right after it (or, for currency signs and cou
 "קומה", right before it). Every unit belongs to one dimension (area, length, currency, ...) and has a
 factor to that dimension's canonical unit (``attributes.CANONICAL_UNITS``). A value converts only
 within its dimension; anything else raises ``DimensionMismatch``, so a floor number next to an area
-("בקומה 3, ממ״ד 12 מ״ר") can never become an area. All arithmetic is ``Decimal``.
+("בקומה 3, שטח 12 מ״ר") can never become an area. All arithmetic is ``Decimal``.
 
 Text is compared after ``base_normalize`` (gershayim/geresh unified, thousands separators dropped), so
 'מ"ר', "מ״ר" and "מ'ר" are the same unit.
@@ -81,8 +81,7 @@ _SURFACES: dict[str, Unit] = {
 }
 for _word, _code in (("קומה", "floor"), ("קומות", "floor"), ("יח׳", "dwelling_unit"), ("יח״ד", "dwelling_unit"),
                      ("יחידות", "dwelling_unit"), ("יחידות דיור", "dwelling_unit"), ("דירות", "dwelling_unit"),
-                     ("חדר", "room"), ("חדרים", "room"), ("חניה", "parking"), ("חניות", "parking"),
-                     ("מקומות חניה", "parking"), ("מעלית", "elevator"), ("מעליות", "elevator")):
+                     ("חדר", "room"), ("חדרים", "room")):
     _SURFACES[_word] = _u(_code, "count", 1, before_ok=True)
 for _cur in _CURRENCY_WORDS:
     for _mult, _code, _factor in (("אלף", "thousand_ILS", 1000), ("אלפי", "thousand_ILS", 1000),
@@ -176,7 +175,7 @@ def parse_mention_quantity(quote: str, value_text: str, dimension: str | None = 
 def convert(value: Decimal, unit: Unit | None, dimension: str | None) -> Conversion:
     """``value`` in ``unit`` converted to the canonical unit of ``dimension``.
 
-    Bare meters for an area ("ממ״ד של 12 מטר") are read as square meters with ``assumed=True``.
+    Bare meters for an area ("שטח של 12 מטר") are read as square meters with ``assumed=True``.
     An attribute without a dimension takes unitless numbers as they are and any unit as an assumption."""
     from app.answering.attributes import canonical_unit_for
 
