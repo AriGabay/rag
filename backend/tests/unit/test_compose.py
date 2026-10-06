@@ -201,3 +201,11 @@ def test_compare_claims_are_labeled_by_side_and_conflicts_cite_both():
         {"label": "גרסה 1", "text": "שיעור ההתאמה לגודל הוא 5%", "evidence_ids": ["E1"]},
         {"label": "גרסה 2", "text": "שיעור ההתאמה לגודל הוא 7%", "evidence_ids": ["E2"]}]}]
     assert "שיעור ההתאמה לגודל" in out.text.split("\n")[-1] and "[E1]" in out.text.split("\n")[-1]
+
+
+def test_a_unit_the_model_repeats_after_a_computed_value_is_dropped():
+    from app.answering.compose import _repeated_unit
+
+    assert _repeated_unit("הממוצע הוא 12 מ״ר מ״ר.", ["12 מ״ר"]) == "הממוצע הוא 12 מ״ר."
+    assert _repeated_unit("המחיר 25,000 ₪ ₪ למ״ר", ["25,000 ₪"]) == "המחיר 25,000 ₪ למ״ר"
+    assert _repeated_unit("12 מ״ר בממוצע", ["12 מ״ר"]) == "12 מ״ר בממוצע"

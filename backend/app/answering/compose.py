@@ -66,6 +66,15 @@ COMPARE_POLICY = (
 _PLACEHOLDER = re.compile(r"\{(C\d+)\}")
 
 
+def _repeated_unit(text: str, displays: list[str]) -> str:
+    """The server's value already carries its unit ("12 מ״ר"); drop the unit the model wrote after it."""
+    for display in displays:
+        parts = display.rsplit(" ", 1)
+        if len(parts) == 2 and not any(ch.isdigit() for ch in parts[1]):
+            text = re.sub(re.escape(display) + r"\s+" + re.escape(parts[1]) + r"(?!\w)", display, text)
+    return text
+
+
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -214,6 +223,7 @@ def _layer_one(c: Claim, texts: dict[str, str], values: dict[str, ComputedValue]
             return None, problems
         computed_numbers = {values[h].display for h in handles}
         raw = _PLACEHOLDER.sub(lambda m: values[m[1]].display, raw)
+        raw = _repeated_unit(raw, [values[h].display for h in handles])
     elif handles:
         return None, ["computed_value_in_noncomputed_claim"]
     declared = [] if c.kind == "computed" else c.numbers
