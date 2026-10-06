@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from uuid import UUID
 
@@ -59,8 +60,13 @@ CANONICAL_UNITS = {
 VALUE_TYPES = ("numeric", "text", "boolean", "date")
 # x2: a value must be named as the attribute (attribute_term). x3: table cells carry their row label, counts
 # as words, W×H dimensions, text values. x4: a value bound to its own label among several, terms of the same
-# root, stated absence as zero; earlier ledger states are read again.
-EXTRACTION_PROMPT_VERSION = "x6"
+# root, stated absence as zero; earlier ledger states are read again. x5/x6: quotes compared without separator
+# punctuation, the fixed dimension vocabulary. x7: validation binds a value to the neighbourhood of its cited
+# source, a count to its own noun and a zero word to the attribute, and rejects a value named by another
+# attribute; documents read under x6 are read again. Reviewed facts (verified, corrected, rejected) keep their
+# decision across versions (``facts.compute_facts``).
+EXTRACTION_PROMPT_VERSION = "x7"
+INTERPRETER_ATTRIBUTES_MAX = 60  # definitions shown to the interpreter on each turn (prompt size)
 _WORD = re.compile(r"[\w״׳]+")
 _FILLER = frozenset({"של"})  # "שטח של הדירה" names the same attribute as "שטח הדירה"
 _COLUMNS = ("id, key, label_he, aliases, value_type, unit_dimension, canonical_unit, source, structured_column,"
@@ -126,7 +132,8 @@ def word_forms(word: str) -> set[str]:
     for base in [word] + [word[len(a):] for a in _ARTICLES if word.startswith(a) and len(word) - len(a) >= 3]:
         out.add(base)
         out.update(inflection_variants(base))
-    return out
+    # a stem cut from a plural ends in a medial letter ("X-ים" -> stem): compare with final forms unified
+    return out | {w.translate(_FINALS) for w in out}
 
 
 def text_words(value: str) -> list[str]:
@@ -186,10 +193,70 @@ def words_share(a: list[str], b: list[str], *, roots: bool = False) -> bool:
     return roots and any(share_root(x, y) for x in a for y in b)
 
 
-def proposed_key(description: str, value_type: str = "numeric") -> str:
+# --- identity: one definition per meaning ------------------------------------------------------------------
+# Measure words say what is measured; two names with different measure words ("גובה X", "רוחב X") are different
+# attributes even with the same distinctive words, while "גודל X" and "שטח X" measure the same thing.
+_MEASURE_CLASS = {match_norm(w): c for w, c in (
+    ("גודל", "size"), ("שטח", "size"), ("מידה", "size"), ("מידות", "size"), ("גובה", "height"), ("אורך", "length"),
+    ("רוחב", "width"), ("עומק", "depth"), ("נפח", "volume"), ("מספר", "count"), ("כמות", "count"),
+    ("שנת", "year"), ("שנה", "year"), ("ערך", "value"))}
+# Measure words that qualify what is measured: "שטח X נטו" and "שטח X ברוטו" are different attributes.
+_QUALIFIERS = frozenset(match_norm(w) for w in ("נטו", "ברוטו", "כולל", "רשום"))
+_MONETARY_DIMENSIONS = frozenset({"currency", "currency_per_area"})
+
+
+def _identity(name: str) -> tuple[frozenset[str], frozenset[str], list[str]]:
+    """(measure classes, qualifiers, distinctive words) of an attribute name."""
+    measures: set[str] = set()
+    qualifiers: set[str] = set()
+    for w in text_words(name):
+        forms = word_forms(w)
+        measures.update(_MEASURE_CLASS[f] for f in forms if f in _MEASURE_CLASS)
+        qualifiers.update(f for f in forms if f in _QUALIFIERS)
+    return frozenset(measures), frozenset(qualifiers), distinctive_words(name)
+
+
+def same_attribute(a: str, dim_a: str | None, b: str, dim_b: str | None) -> bool:
+    """Whether two names with their dimensions denote one attribute: the same distinctive words up to form
+    (singular or plural, with or without a prefix or article: "שטח X" ~ "שטח ה-Xים"), the same measure
+    and qualifier words, and no conflicting dimension. Word order and filler do not matter. Another word, another
+    measure word, another qualifier or another unit dimension is another attribute: names are never merged by
+    root, by similarity, or by one name containing the other ("X" vs "X בבניין")."""
+    if dim_a and dim_b and dim_a != dim_b:
+        return False
+    ma, qa, da = _identity(a)
+    mb, qb, db = _identity(b)
+    if ma != mb or qa != qb or not da or len(da) != len(db):
+        return False
+    left = list(db)
+    for w in da:
+        match = next((x for x in left if word_forms(w) & word_forms(x)), None)
+        if match is None:
+            return False
+        left.remove(match)
+    return True
+
+
+def other_attribute_names(conn: Connection, attribute: AttributeDef) -> list[list[str]]:
+    """The distinctive name words of the office's other attributes whose names share none with this one's: a
+    value named by them belongs to another attribute (``facts.validate_mention``). Definitions that share a
+    word with this one (another phrasing, a duplicate) are left out, so they never reject its values."""
+    own = [w for n in [attribute.label, *attribute.aliases] for w in distinctive_words(n)]
+    out: list[list[str]] = []
+    for r in conn.execute(text("SELECT id, label_he, aliases FROM attribute_definitions WHERE id <> :a"),
+                          {"a": attribute.id}).all():
+        words = [w for n in [r.label_he, *(r.aliases or [])] for w in distinctive_words(n)]
+        if words and not words_share(words, own, roots=True):
+            out.append(words)
+    return out
+
+
+def proposed_key(description: str, value_type: str = "numeric", unit_dimension: str | None = None) -> str:
     """Deterministic key for a proposed definition, so concurrent creators converge on one row. A non-numeric
-    definition of the same label has its own key (it never reuses a numeric one's facts)."""
-    base = " ".join(_tokens(description)) + ("" if value_type == "numeric" else f"|{value_type}")
+    definition of the same label has its own key (it never reuses a numeric one's facts), and so does a numeric
+    one of another unit dimension."""
+    base = " ".join(_tokens(description)) + ("" if value_type == "numeric" else f"|{value_type}") + (
+        f"|{unit_dimension}" if unit_dimension and value_type == "numeric" else "")
     return "x_" + hashlib.sha256(base.encode()).hexdigest()[:12]
 
 
@@ -235,17 +302,26 @@ def list_attribute_handles(conn: Connection, *, useful_only: bool = False) -> li
     """The office's definitions as interpreter handles A1..An (structured entries ensured first).
 
     ``useful_only`` (what the interpreter sees) keeps structured and active definitions and the proposed
-    ones that already hold a usable fact: a definition left behind by a loose phrasing would otherwise
-    attract later questions. A hidden definition is still matched by its exact label."""
+    ones that were read at least once (they hold facts or ledger states) or hold a reviewed fact, the most
+    used first, up to ``INTERPRETER_ATTRIBUTES_MAX``: a definition nobody ever extracted is a phrasing nobody
+    confirmed. A definition the interpreter does not see is still found by name (``resolve_attribute``)."""
     ensure_structured_attributes(conn)
     upgrade_extraction_version(conn)
     rows = _rows(conn)
+    numbered = [(f"A{i}", r) for i, r in enumerate(rows, start=1)]
     if useful_only:
-        useful = set(conn.execute(text(
-            "SELECT DISTINCT attribute_id FROM facts WHERE status IN ('auto_validated', 'verified', 'corrected')"
-        )).scalars())
-        rows = [r for r in rows if r.source == "structured" or r.status == "active" or r.id in useful]
-    return [_handle_dict(f"A{i}", r) for i, r in enumerate(rows, start=1)]
+        use: Counter = Counter()
+        for r in conn.execute(text(
+            "SELECT attribute_id, count(*) AS n FROM fact_extraction_ledger GROUP BY attribute_id"
+            " UNION ALL SELECT attribute_id, count(*) FROM facts WHERE status IN ('verified', 'corrected')"
+            " GROUP BY attribute_id")).all():
+            use[r.attribute_id] += r.n
+        fixed = [(h, r) for h, r in numbered if r.source == "structured" or r.status == "active"]
+        read = sorted(((h, r) for h, r in numbered if (h, r) not in fixed and r.id in use),
+                      key=lambda hr: -use[hr[1].id])
+        keep = {r.id for _, r in fixed + read[:max(0, INTERPRETER_ATTRIBUTES_MAX - len(fixed))]}
+        numbered = [(h, r) for h, r in numbered if r.id in keep]
+    return [_handle_dict(h, r) for h, r in numbered]
 
 
 def handle_map(handles: list[dict]) -> dict[str, UUID]:
@@ -304,11 +380,17 @@ def _with_dimension(conn: Connection, r, dimension: str | None):
     conn.execute(text("UPDATE attribute_definitions SET unit_dimension = :d, canonical_unit = :u,"
                       " facts_version = facts_version + 1 WHERE id = :a"),
                  {"d": dimension, "u": canonical_unit_for(dimension), "a": r.id})
+    # Unreviewed facts were converted without the dimension: the re-read replaces them (it would otherwise add
+    # a second fact per mention). A reviewer's value stays, back in review: its canonical value predates the unit.
+    conn.execute(text("DELETE FROM facts WHERE attribute_id = :a AND status IN ('auto_validated', 'needs_review')"),
+                 {"a": r.id})
+    conn.execute(text("UPDATE facts SET status = 'needs_review', review_note = coalesce(review_note || ' | ', '')"
+                      " || 'יחידת המאפיין נקבעה לאחר האישור; יש לאשר מחדש' WHERE attribute_id = :a"
+                      " AND status IN ('verified', 'corrected')"), {"a": r.id})
     conn.execute(text("UPDATE fact_extraction_ledger SET state = 'pending' WHERE attribute_id = :a"), {"a": r.id})
     return conn.execute(text(f"SELECT {_COLUMNS} FROM attribute_definitions WHERE id = :a"), {"a": r.id}).one()
 
 
-_MONETARY = frozenset({"currency", "currency_per_area"})
 
 
 def _names(r) -> list[str]:
@@ -323,7 +405,7 @@ def _handle_fits_description(r, description: str | None, dimension: str | None, 
     the definition's names and itself names another definition exactly. A handle whose names merely use other
     words is the interpreter's semantic match (a synonym) and is kept (KTD7)."""
     if dimension is not None and r.unit_dimension is not None and r.unit_dimension != dimension and not (
-            {dimension, r.unit_dimension} <= _MONETARY):  # "price" for a price per m² is a loose word, not a conflict
+            {dimension, r.unit_dimension} <= _MONETARY_DIMENSIONS):  # "price" for a price per m² is a loose word
         return False
     asked = distinctive_words(description or "")
     if not asked:
@@ -331,6 +413,28 @@ def _handle_fits_description(r, description: str | None, dimension: str | None, 
     if words_share(asked, [w for n in _names(r) for w in distinctive_words(n)], roots=True):
         return True
     return not any(o.id != r.id and any(labels_match(description or "", n) for n in _names(o)) for o in rows)
+
+
+def _type_fits(r, value_type: str | None) -> bool:
+    """Whether a definition can answer a request for ``value_type``. Structured definitions are numeric columns
+    and answer anything asked of them. A numeric request needs numbers, and a numeric definition extracts only
+    numbers, so neither crosses to the other; a text, boolean or date request reuses a definition of any of
+    these three (they all keep the value as written)."""
+    if value_type is None or r.source == "structured" or r.value_type == value_type:
+        return True
+    return value_type != "numeric" and r.value_type != "numeric"
+
+
+def _dimension_fits(r, dimension: str | None) -> bool:
+    return dimension is None or r.unit_dimension is None or r.unit_dimension == dimension or (
+        {dimension, r.unit_dimension} <= _MONETARY_DIMENSIONS)
+
+
+def _add_alias(conn: Connection, r, name: str) -> None:
+    """Record another phrasing of a definition, so it is matched exactly and shown to the interpreter."""
+    if name and not any(labels_match(name, n) for n in _names(r)):
+        conn.execute(text("UPDATE attribute_definitions SET aliases = array_append(aliases, :n) WHERE id = :a"),
+                     {"n": name, "a": r.id})
 
 
 def resolve_attribute(
@@ -342,20 +446,21 @@ def resolve_attribute(
     value_type: str | None = None,
     handles: dict[str, UUID] | None = None,
 ) -> AttributeDef:
-    """Interpreter-chosen handle, else exact normalized label/alias, else a new ``proposed`` definition.
+    """The definition an attribute request denotes: the interpreter-chosen handle, else one whose name denotes
+    the same attribute (``labels_match``, then ``same_attribute``: another form of the same words), else a new
+    ``proposed`` definition. One meaning keeps one definition, so a rephrased question reuses the facts already
+    extracted and verified instead of reading the documents again; names that differ in a word, a measure
+    word, a qualifier or the unit dimension stay separate definitions.
 
     ``handles`` pins resolution to the mapping shown to the interpreter (see ``handle_map``); without
     it the current numbering is used. An unknown handle falls back to the description.
 
     ``value_type`` (one of ``VALUE_TYPES``) is what the caller needs; None accepts any existing type and
-    creates numeric. When given, an extracted definition of another type is never returned: the match
-    goes to a definition of that type with the same label, created when missing (a non-numeric one has
-    no unit). Structured definitions are numeric columns and are returned as they are."""
+    creates numeric. A numeric request is never answered by a non-numeric definition, nor the reverse: the
+    match goes to a definition of the same name of a fitting type, created when missing. A text, boolean or
+    date request reuses one of the same name of any of those types, its own type first (``_type_fits``)."""
     if value_type is not None and value_type not in VALUE_TYPES:
         raise ValueError(f"unknown value type {value_type!r}")
-
-    def fits(r) -> bool:
-        return value_type is None or r.value_type == value_type or r.source == "structured"
 
     unit_dimension = normalize_dimension(unit_dimension)
     ensure_structured_attributes(conn)
@@ -365,20 +470,27 @@ def resolve_attribute(
         target = mapping.get(handle.strip())
         for r in rows:
             if r.id == target and _handle_fits_description(r, description, unit_dimension, rows):
-                if fits(r):
+                if _type_fits(r, value_type):
                     return _to_def(_with_dimension(conn, r, unit_dimension))
                 description = r.label_he  # the same attribute, asked as another type
     description = (description or "").strip()
     if not _tokens(description):
         raise ValueError("an attribute needs a known handle or a description")
-    # structured entries first, then the oldest definition
-    for r in sorted(rows, key=lambda r: r.source != "structured"):
-        if fits(r) and any(labels_match(description, name) for name in [r.label_he, *(r.aliases or [])]):
+    # structured entries first, then the own type, then the oldest definition
+    ranked = sorted(rows, key=lambda r: (r.source != "structured", value_type is not None and r.value_type != value_type))
+    candidates = [r for r in ranked if _type_fits(r, value_type) and _dimension_fits(r, unit_dimension)]
+    for r in candidates:
+        if any(labels_match(description, name) for name in _names(r)):
+            return _to_def(_with_dimension(conn, r, unit_dimension))
+    for r in candidates:
+        if r.source != "structured" and any(same_attribute(description, unit_dimension, name, r.unit_dimension)
+                                            for name in _names(r)):
+            _add_alias(conn, r, description)
             return _to_def(_with_dimension(conn, r, unit_dimension))
     value_type = value_type or "numeric"
     if value_type != "numeric":
         unit_dimension = None
-    key = proposed_key(description, value_type)
+    key = proposed_key(description, value_type, unit_dimension)
     row = conn.execute(
         text("INSERT INTO attribute_definitions (office_id, key, label_he, aliases, value_type, unit_dimension,"
              " canonical_unit, source, extraction_prompt_version, status) VALUES (app_office(), :k, :l, :a, :vt,"

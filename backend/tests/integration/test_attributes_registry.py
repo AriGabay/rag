@@ -210,3 +210,62 @@ def test_the_interpreter_sees_only_definitions_that_proved_useful(db):
         shown = {h["label"] for h in list_attribute_handles(conn, useful_only=True)}
     assert "ניסוח רופף שלא הניב דבר" in everything and "ניסוח רופף שלא הניב דבר" not in shown
     assert {"שטח", "מחיר", "מחיר למ״ר", "מספר חדרים"} <= shown
+
+
+# --- stable identity: one definition per meaning (the user's item 3) -------------------------------------------
+
+def test_another_form_of_the_same_words_reuses_the_definition_and_records_the_phrasing(offices):
+    a, _ = offices
+    first = resolve(a, "שטח המרפסת")
+    again = resolve(a, "שטח המרפסות")
+    word_order = resolve(a, "המרפסות שטח")
+    assert first.created and not again.created and not word_order.created
+    assert again.id == first.id == word_order.id
+    assert count_defs(a, "source = 'extracted'") == 1
+    with tenant_tx(a.ctx()) as conn:
+        aliases = conn.execute(text("SELECT aliases FROM attribute_definitions WHERE id = :i"), {"i": first.id}).scalar()
+    assert "שטח המרפסות" in aliases  # matched exactly from now on, and shown to the interpreter
+
+
+@pytest.mark.parametrize(("one", "dim_one", "other", "dim_other"), [
+    ("גובה החלון", "length", "רוחב החלון", "length"),  # another measure word
+    ("שטח המחסן נטו", "area", "שטח המחסן ברוטו", "area"),  # another qualifier
+    ("שטח המחסן", "area", "מספר המחסנים", "count"),  # another dimension and measure word
+    ("מספר החניות", "count", "מספר החניות בבניין", "count"),  # another word
+    ("שטח החצר", "area", "שטח החצר המשותפת", "area"),
+])
+def test_names_that_differ_in_meaning_or_unit_never_merge(offices, one, dim_one, other, dim_other):
+    a, _ = offices
+    x = resolve(a, one, unit_dimension=dim_one)
+    y = resolve(a, other, unit_dimension=dim_other)
+    assert x.id != y.id and y.created
+
+
+def test_the_same_label_with_a_conflicting_dimension_is_another_attribute(offices):
+    """The exact-label path checked no dimension: "the area of X" then "the number of X" phrased with one label
+    must not read the area definition's facts as counts."""
+    a, _ = offices
+    area = resolve(a, "המחסן", unit_dimension="area")
+    count = resolve(a, "המחסן", unit_dimension="count")
+    assert area.id != count.id and area.unit_dimension == "area"
+
+
+def test_text_and_boolean_requests_share_one_definition_but_never_a_numeric_one(offices):
+    a, _ = offices
+    as_text = resolve(a, "שיפוץ הדירה", unit_dimension=None, value_type="text")
+    as_bool = resolve(a, "שיפוץ הדירה", unit_dimension=None, value_type="boolean")
+    as_number = resolve(a, "שיפוץ הדירה", unit_dimension="year", value_type="numeric")
+    assert as_bool.id == as_text.id and not as_bool.created
+    assert as_number.id != as_text.id and as_number.value_type == "numeric"
+
+
+def test_interpreter_handles_keep_their_numbers_and_show_the_value_type(offices):
+    a, _ = offices
+    resolve(a, "שטח המרפסת")
+    with tenant_tx(a.ctx()) as conn:
+        everything = list_attribute_handles(conn)
+        shown = list_attribute_handles(conn, useful_only=True)
+    assert {h["handle"] for h in shown} <= {h["handle"] for h in everything}
+    assert all("value_type" in h for h in shown)
+    by_id = {h["id"]: h["handle"] for h in everything}
+    assert all(by_id[h["id"]] == h["handle"] for h in shown)  # hiding a definition never renumbers the others
