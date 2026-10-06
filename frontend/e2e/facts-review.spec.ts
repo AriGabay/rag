@@ -2,9 +2,9 @@ import { expect, test, type APIRequestContext } from "@playwright/test";
 import { apiLogin, login, shot, USERS } from "./helpers";
 
 // U11 / R16: the "extracted facts" tab of the review screen. Facts exist only after an extraction ran on the
-// stack, so the test looks one up through the API first (office B before office A, so office A's demo state is
-// touched only when office B has nothing to review) and skips with a reason when the stack holds none.
-// Approving changes that fact's status for good.
+// stack, so the test looks one up through the API first and skips with a reason when there is none. Approving
+// changes that fact's status for good, so the test acts in office B only: office A holds the data the real-model
+// evaluation reads, and an approval there would turn an unreviewed (possibly wrong) value into a verified one.
 
 interface ListedFact {
   id: string;
@@ -44,13 +44,9 @@ test.describe("Facts review", () => {
     page,
     request,
   }) => {
-    let user: string = USERS.adminB;
-    let found = await firstReviewableFact(request, user);
-    if (!found) {
-      user = USERS.adminA;
-      found = await firstReviewableFact(request, user);
-    }
-    test.skip(!found, "no needs_review or auto_validated fact on the stack (no extraction has run)");
+    const user: string = USERS.adminB;
+    const found = await firstReviewableFact(request, user);
+    test.skip(!found, "no needs_review or auto_validated fact in office B (office A is never written by this test)");
     const { fact, attribute } = found!;
 
     await login(page, user);
