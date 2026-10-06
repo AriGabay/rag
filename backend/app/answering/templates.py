@@ -14,7 +14,10 @@ from app.answering.conditions import (
 )
 from app.appraisal.query import RecordResult, Stats
 
-TEMPLATE_VERSION = "t1"
+# The answer logic and wording the server applies after the model: bump it whenever a server rule changes what an
+# answer says (completeness, validation, locate rules), so answers cached by earlier logic are not served after a
+# deploy. t2: per-document audit and completeness, meaning-bound fact validation, structured absence claims.
+TEMPLATE_VERSION = "t2"
 
 
 def money(value: Decimal | None) -> str:
