@@ -24,17 +24,19 @@ The detail lives in these files:
 
 ### Results by kind of evidence
 
-**Software tests (deterministic; no model).** Backend: 1408 passed, 4 skipped, 4 xfailed. Gate 8 runs recorded plans with an oracle extractor: 60 passed, 4 registered gaps. Each registered gap names its facet and fails as soon as it is fixed. Frontend typecheck and lint are clean.
+**Software tests (deterministic; no model).** Backend: 1461 passed, 4 skipped, 4 xfailed. Gate 8 runs recorded plans with an oracle extractor: 60 passed, 4 registered gaps. Each gap names its facet and fails as soon as it is fixed. Frontend typecheck and lint are clean.
 
-**Previous capabilities: the existing 77-turn set.** 76/77 on the final head; it was 77/77 before this round.
+**Previous capabilities: the existing 77-turn set.** 75/77 on the final head. Before this round it was 77/77. Two items fail:
 
-- The one failure, A02, is a data collision, not an engine change: the v2 seed added a document set in "רמת החייל", the neighborhood A02 relies on as unknown.
-- During the round, T04 and T10 regressed. Both were fixed, and each fix has a test that fails on the old code.
+- **A02** is a data collision, not an engine change. The v2 seed added a document set in "רמת החייל", the neighborhood A02 relies on as unknown.
+- **T03** ("מה נכתב על מקדם קומה של 2%?"). The text answer is correct and cited. But the interpreter mapped the topic to the handle of the cap-rate attribute the v2 run had created (open defect S6: a handle is not checked against the model's own description). That attribute is `ratio` (S1), so the attached computation line wrongly says no document states it.
 
-**Browser (Playwright, real stack, real model in office A).** Final run on the final head: **29 passed, 0 failed, 2 skipped**. Each earlier run's failure was a real defect, fixed with a counter-test (see [browser-tests.md](browser-tests.md)). The two skips:
+During the round, T04, T07 and T10 regressed. All three were fixed, each with a test that fails on the old code.
 
-- the limited-mode spec needs limited mode, and this stack runs demo mode when cloud use is off;
-- the facts-review spec now acts only in office B, which has nothing to review.
+**Browser (Playwright, real stack, real model in office A).** Final run on the final head: **29 passed, 0 failed, 2 skipped**.
+
+- Every failure in the earlier full runs was a real defect, fixed with a counter-test (see [browser-tests.md](browser-tests.md)).
+- The two skips: the limited-mode spec needs limited mode, and this stack runs demo mode when cloud use is off; the facts-review spec now acts only in office B, which has nothing to review.
 
 **Model and extraction quality (OpenAI `gpt-5.4-mini`, one run per row; not deterministic).**
 
@@ -45,7 +47,8 @@ The detail lives in these files:
 | v1, round 7 (`580eb29`) | **regression** | 46/60 | 40/54 (74.1%) | 55/69 | after the review fixes |
 | v1, round 8 | regression | 46/60 | 41/54 (75.9%) | 55/69 | after the GQ50 / GQ33 fixes |
 | v1, round 9 | regression | 52/60 | 47/54 (87.0%) | 61/69 | **9 answers served from cache**, so this row is not a clean measurement |
-| **v1, final head, no cache** | **regression** | **48/60** | **42/54 (77.8%)** | **56/69** | AE1, AE3, AE5 and AE6 (GQ20, GQ23) pass. AE4 (GQ49) and AE6 GQ22 failed this run: GQ49.2 on a task label, GQ22 on the changed assumption. Both passed in round 8. AE2 is not runnable with cloud on |
+| v1, after the final review (two fresh runs) | regression | 50/60, 49/60 | 44/54 (81.5%), 44/54 (81.5%) | 58/69, 58/69 | before the last locate fix (GQ12) |
+| **v1, final head, no cache** | **regression** | **47/60** | **43/54 (79.6%)** | **56/69** | All runnable AE items pass: AE1, AE3, AE4, AE5, and AE6 with all three items. AE2 is not runnable with cloud on. The last four fresh runs gave 42–44 of 54 |
 | **v2 `questions_holdout_v2.yaml`**, run 1 (`580eb29`) | **held-out** | 32/65 | **29/62 (46.8%)** | 34/75 | new documents, topics and phrasings, with answers fixed before any run; never used for a fix |
 
 The regression set moves by about ±3 items between runs of the same code (rounds 8 and final). The movement comes from the model's plan labels and its wording, and the failure analysis locates the stage each time.
@@ -97,7 +100,7 @@ The regression set moves by about ±3 items between runs of the same code (round
 
 ### Not ready for professional use
 
-The regression set is at 77.8% on a fresh run, and on the held-out v2 set, 46.8% of items pass every scored facet. Eight v2 answers state something wrong. Several of the causes are general extraction defects that will recur on new topics:
+The regression set is at 78–82% on fresh runs, and on the held-out v2 set, 46.8% of items pass every scored facet. Eight v2 answers state something wrong. Several of the causes are general extraction defects that will recur on new topics:
 
 - percent and ratio;
 - number words outside counts;
