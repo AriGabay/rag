@@ -6,7 +6,23 @@ Consolidated report for the plan `docs/plans/2026-10-06-0856-feat-general-questi
 
 - **Previous capabilities: kept.** The existing evaluation scores 77/77 against the live stack with office A in cloud mode. No expected answer was changed. Acceptance gates 1–7 stay green.
 - **The engine reaches held-out topics through one path.** No topic word occurs in `backend/app` (guard test). Every held-out question is interpreted into a validated plan and runs the same tools. No held-out item hit a price clarification except GQ53, a generic "average size" question.
-- **Real-model quality gate: FAIL.** With `gpt-5.4-mini`, 8 of 54 held-out items (14.8%) pass the question file's rules; the plan's threshold is 80%. Every AE item that ran (AE1, AE3–AE6) fails at least one scored facet. This is a stop condition before the PR (plan U12 step 4).
+- **Real-model quality gate: FAIL.** With `gpt-5.4-mini`, 31 of 54 held-out items (57.4%) pass every scored facet of the question file; the plan's threshold is 80% (an assumption the plan made, not a user requirement). AE3 and AE6 (GQ23) pass; AE1, AE4, AE5 and two AE6 items fail at least one facet. The plan treats this as a stop condition before the PR.
+- **Progress across improvement rounds** (same question file, never edited after the first run; the model is not deterministic, so ±3 items is noise):
+
+  | round | change | held-out passing | computation items |
+  |---|---|---|---|
+  | 1 | first full engine | 8/54 (14.8%) | 0/10 |
+  | 2 | entity scope, precise locate, key/value tables, value filters, claim verification fixes, routing integration | 27/54 (50.0%) | 1/10 |
+  | 3 | dimensions from a fixed vocabulary, upgrade dimensionless definitions | 26/54 (48.1%) | 1/10 |
+  | 4 | bind values to their own labels, word roots, handle consistency | 26/54 (48.1%) | 0/10 |
+  | 5 | quotes compared without separator punctuation | 31/54 (57.4%) | 2/10 |
+  | 6 | cite by quote when the handle is wrong, locate variants as alternatives, clarifications kept on new questions | 31/54 (57.4%) | 3/10 |
+
+- **What still fails, by cause** (round 6; details per item in [real-model-sample.md](real-model-sample.md)):
+  - recall of single values in extraction: a value the document states is not extracted in every run (model variance), so averages use fewer observations than the answer key;
+  - design choices stricter than the answer key: an area given only as inner dimensions (W×H) and two areas summed in one sentence go to human review instead of into a figure (settled: uncertain values go to review);
+  - a clarification raised by a tool rather than by the plan is scored as the wrong task type (GQ51, GQ52, GQ54), although the user does see the right clarification;
+  - version comparisons that cite the right documents but not the page holding the changed assumption.
 - **The scripted gate 8 is green only with registered gaps.** With recorded or corrected plans and a perfect (oracle) extractor, 35–36 of 60 items pass every non-wording facet. The other 24 are strict `xfail`s, each tied to a named system gap, and the cloud-off AE2 item is one more `xfail`.
 - **Two answers in the real sample were wrong and still passed verification** (GQ55, GQ61; see below). They are the most serious finding.
 
@@ -21,7 +37,7 @@ Test names are real (`backend/tests/...`, `frontend/e2e/...`). "Real sample" ref
 | # | Check | Proven by | Status |
 |---|---|---|---|
 | 1 | ממ״ד not sent to price clarification | `unit/test_interpret.py::test_safe_room_average_goes_to_the_model_when_cloud_is_on`, `::test_safe_room_average_in_limited_mode_searches_content_without_price_clarification`; `integration/test_turns.py::test_safe_room_average_is_computed_from_extracted_facts_in_cloud_mode`, `::test_safe_room_question_without_cloud_lists_passages_and_never_asks_about_prices`; `general-conversations.spec.ts` "full conversation: ממ״ד → …" and "limited mode: the ממ״ד question …"; gate 8 GQ28/GQ45; real sample GQ28 | green for ממ״ד; **real sample GQ53** (a generic "average size") still reached the price clarification |
-| 2 | New topic reaches sources or a reasoned abstention | `acceptance/test_gate8_generality.py::test_general_item[*]` (60 items), `::test_a_held_out_attribute_needs_no_code_change`; `unit/test_no_topic_vocabulary.py`; abstention kinds in `integration/test_turns.py` and `unit/test_compose.py` | gate 8 green with 24 registered gaps; real sample 8/54 |
+| 2 | New topic reaches sources or a reasoned abstention | `acceptance/test_gate8_generality.py::test_general_item[*]` (60 items), `::test_a_held_out_attribute_needs_no_code_change`; `unit/test_no_topic_vocabulary.py`; abstention kinds in `integration/test_turns.py` and `unit/test_compose.py` | gate 8 green with 12 registered gaps; real sample 31/54 |
 | 3 | Follow-ups keep and change context | `unit/test_state.py::test_follow_up_changes_only_what_it_states`, `::test_previous_year_changes_only_the_year_and_is_idempotent`; `integration/test_turns.py::test_same_turn_posted_twice_applies_once`; `general-conversations.spec.ts` full conversation; gate 8 GQ47/GQ48/GQ49 | state correct in the real sample (GQ47, GQ48, GQ49 turn 2); the follow-up computations themselves fail (extraction) |
 | 4 | Comparison uses both sides | `integration/test_compare.py::test_two_versions_with_a_changed_rate_are_cited_and_labeled_by_version`, `::test_one_sided_evidence_gives_an_incomplete_comparison`; `integration/test_turns.py::test_compare_uses_the_conversation_referent_and_reads_both_versions` | green in tests; **real sample 0/8 comparison, version and conflict items**: compare needs `S#` handles from the conversation, and GQ22 compared the wrong documents |
 | 5 | Exhaustive computation, not top-k | `integration/test_fact_extraction.py::test_ae7_nine_versions_mixed_outcomes`, `::test_above_sync_limit_enqueues_and_worker_completes`; `acceptance/test_gate1_calculations.py`; eval category `numeric_over_top_k` | green |
@@ -49,7 +65,7 @@ Test names are real (`backend/tests/...`, `frontend/e2e/...`). "Real sample" ref
 | run | provider | items passing | held-out | AE items |
 |---|---|---|---|---|
 | gate 8 (`test_gate8_generality.py`) | scripted: recorded real-model plans (44) or hand-written ones (17), oracle extraction, stub composer | 35–36/60 on the non-wording facets, + 24 strict known gaps | 33–34/54 | AE1, AE3–AE6 registered as gaps; AE4 passes its state check |
-| real sample (`--set general --real-sample`) | OpenAI `gpt-5.4-mini`, live stack | 8/60 (GQ37 not run: needs cloud off) | **8/54 (14.8%)** | none passed |
+| real sample (`--set general --real-sample`), round 6 | OpenAI `gpt-5.4-mini`, live stack | 35/60 (GQ37 not run: needs cloud off) | **31/54 (57.4%)** | AE3, AE6 (GQ23) |
 
 The scripted run measures the system with interpretation and extraction taken out of the picture. The gap from 35 to 8 is the real model's share. It falls mostly on interpretation (15 routing errors besides the compare gap), on claim verification that drops correct answers (6), and on extraction, where stated values never pass server validation (17 items have an extraction cause).
 
