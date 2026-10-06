@@ -928,3 +928,20 @@ def test_choosing_the_second_source_resumes_the_comparison(client, db, monkeypat
     # land on depends on the order the first answer cited them)
     assert {x["document_id"] for x in done["compare"]["sides"]} == {str(one), str(two)}
     assert all(x["evidence_count"] >= 1 for x in done["compare"]["sides"])
+
+
+def test_a_document_lacking_only_a_word_found_nowhere_is_listed_with_that_caveat(client, db, monkeypatch):
+    """Round 8 (existing set T04): a word misread in a scanned report occurs in no document; the document that
+    holds every other word of the question is listed, and the answer names the word it could not find. A
+    document matching only some of the other words stays a near source (see the GQ43 case)."""
+    a = make_office(db, "משרד א", "admin-a@example.test")
+    add_chunks(a, a.default_group_id, ["תוכנן חיזוק המבנה במסגרת תכנית 38 לפני מספר שנים."], "9" * 64)
+    add_chunks(a, a.default_group_id, ["בדירה מטבח משופץ ומרפסת שמש."], "a" * 64)
+    p = ScriptedProvider().on(Purpose.INTERPRET, plan(
+        task_type="locate", search_queries=["חיזוק במסגרת תמ״א 38"],
+        steps=[{"tool": "locate", "attribute_handle": None, "source_handles": []}]))
+    enable_cloud(a, monkeypatch, p)
+    login(client, "admin-a@example.test")
+    ans = post(client, "באיזו שומה מוזכר חיזוק במסגרת תמ״א 38?")["answer"]
+    assert ans["kind"] == "content" and "דוח 999" in ans["text"]
+    assert any("«תמ״א»" in x for x in ans["limitations"])
