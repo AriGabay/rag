@@ -174,9 +174,22 @@ def upload(
     return {"results": results}
 
 
-_VERSION_COLS = (
+_PLAIN_COLS = (
     "v.id, v.version_no, v.filename, v.status, v.status_reason, v.page_count, v.pages_incomplete,"
-    " v.records_total, v.records_needing_review, v.is_current, v.created_at, v.processed_at, v.mime_type"
+    " v.records_total, v.records_needing_review, v.is_current, v.created_at, v.processed_at, v.mime_type,"
+    " v.ingestion"
+)
+# What was read of a version, counted where it is stored (see ``_reading``).
+_READING_COLS = (
+    "passages", "tables_count", "measurements_count", "measurements_state",
+)
+_VERSION_COLS = (
+    _PLAIN_COLS + ","
+    " (SELECT count(*) FROM chunks c WHERE c.version_id = v.id AND c.kind <> 'table_row') AS passages,"
+    " (SELECT count(*) FROM extracted_tables t WHERE t.version_id = v.id) AS tables_count,"
+    " (SELECT count(*) FROM measurements m WHERE m.version_id = v.id AND m.status <> 'rejected') AS measurements_count,"
+    " (SELECT r.state FROM measurement_runs r WHERE r.version_id = v.id ORDER BY r.updated_at DESC LIMIT 1)"
+    " AS measurements_state"
 )
 
 
@@ -187,13 +200,31 @@ def _version_json(row) -> dict:
         "records_total": row.records_total, "records_needing_review": row.records_needing_review,
         "is_current": row.is_current, "created_at": row.created_at.isoformat(),
         "processed_at": row.processed_at.isoformat() if row.processed_at else None, "mime_type": row.mime_type,
+        "reading": _reading(row),
+    }
+
+
+def _reading(row) -> dict:
+    """What was read of a version, kept apart: searchable passages, tables, stored measurements, structured
+    records, and pictures by status. ``partial`` when any picture or page was not read: zero structured records
+    is not zero searchable content, and a document is never shown as fully read while parts were not."""
+    ing = getattr(row, "ingestion", None) or {}
+    images = ing.get("images") or {}
+    return {
+        "passages": getattr(row, "passages", 0) or 0, "tables": getattr(row, "tables_count", 0) or 0,
+        "measurements": getattr(row, "measurements_count", 0) or 0,
+        "measurements_state": getattr(row, "measurements_state", None),
+        "images_total": sum(images.values()), "images": images, "unread": ing.get("unread") or [],
+        "partial": bool(ing.get("partial")) or bool(row.pages_incomplete),
+        "ingestion_version": ing.get("ingestion_version"),
     }
 
 
 def _list_documents(conn: Connection, ctx: TenantContext, q: str | None, status_filter: str | None,
                     document_id: UUID | None = None) -> list[dict]:
     """One query: documents with their latest version (LATERAL), filtered in SQL."""
-    latest_cols = ", ".join(f"lv.{c.split('.')[1]} AS lv_{c.split('.')[1]}" for c in _VERSION_COLS.split(", "))
+    names = [c.split(".")[1] for c in _PLAIN_COLS.split(", ")] + list(_READING_COLS)
+    latest_cols = ", ".join(f"lv.{n} AS lv_{n}" for n in names)
     rows = conn.execute(
         text(
             "SELECT d.id, d.title, d.created_at, d.deleted_at, g.id AS group_id, g.name AS group_name,"
@@ -289,3 +320,79 @@ def get_file(document_id: str, version_id: str, ctx: TenantContext = Depends(get
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+# --- source view: a version's blocks and its pictures ----------------------------------------------------------
+
+BLOCKS_MAX = 400
+_MEDIA_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "bmp": "image/bmp"}
+
+
+def _version_row(conn: Connection, doc_uuid: UUID, ver_uuid: UUID):
+    row = conn.execute(
+        text("SELECT v.id, v.storage_key, v.mime_type, v.filename, v.is_current, d.title FROM document_versions v"
+             " JOIN documents d ON d.id = v.document_id WHERE v.id = :v AND d.id = :d AND d.deleted_at IS NULL"),
+        {"v": ver_uuid, "d": doc_uuid},
+    ).first()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
+    return row
+
+
+@router.get("/{document_id}/versions/{version_id}/blocks")
+def get_blocks(document_id: str, version_id: str, start: int | None = Query(None, ge=0),
+               end: int | None = Query(None, ge=0), ctx: TenantContext = Depends(get_ctx)) -> dict:
+    """The version's blocks in reading order (a window when ``start``/``end`` are given), with each table's
+    structure: what the source viewer shows around a cited location."""
+    doc_uuid, ver_uuid = parse_uuid(document_id), parse_uuid(version_id)
+    with tenant_tx(ctx) as conn:
+        v = _version_row(conn, doc_uuid, ver_uuid)
+        params: dict = {"v": ver_uuid, "a": start if start is not None else 0,
+                        "b": end if end is not None else 1_000_000}
+        rows = conn.execute(text(
+            "SELECT block_index, kind, section, section_path, label, paragraph_no, page, media, source, status, note,"
+            " table_index, text FROM document_blocks WHERE version_id = :v AND block_index BETWEEN :a AND :b"
+            f" ORDER BY block_index LIMIT {BLOCKS_MAX}"), params).all()
+        tables = {r.table_index: r.structure for r in conn.execute(text(
+            "SELECT table_index, structure FROM extracted_tables WHERE version_id = :v"), {"v": ver_uuid})}
+        total = conn.execute(text("SELECT count(*) FROM document_blocks WHERE version_id = :v"),
+                             {"v": ver_uuid}).scalar_one()
+        audit(conn, "source_view", ctx.user_id, "document_version", ver_uuid)
+    blocks = []
+    for r in rows:
+        b = {"index": r.block_index, "kind": r.kind, "section": r.section, "section_path": list(r.section_path or []),
+             "paragraph_no": r.paragraph_no, "page": r.page, "media": r.media, "source": r.source, "status": r.status,
+             "note": r.note, "text": r.text}
+        if r.table_index is not None and r.table_index in tables:
+            st = tables[r.table_index] or {}
+            b["table"] = {k: st.get(k) for k in ("headers", "caption", "title", "notes", "source", "media")} | {
+                "rows": [x.get("cells") for x in st.get("rows") or []]}
+        if r.media and r.media.rsplit(".", 1)[-1].lower() in _MEDIA_TYPES:
+            b["media_url"] = f"/api/documents/{document_id}/versions/{version_id}/media/{quote(r.media)}"
+        blocks.append(b)
+    return {"document_id": document_id, "version_id": version_id, "title": v.title, "is_current": v.is_current,
+            "mime_type": v.mime_type, "total": total, "blocks": blocks,
+            "file_url": f"/api/documents/{document_id}/versions/{version_id}/file"}
+
+
+@router.get("/{document_id}/versions/{version_id}/media/{name}")
+def get_media(document_id: str, version_id: str, name: str, ctx: TenantContext = Depends(get_ctx)) -> Response:
+    """One raster picture from inside a DOCX, by the media name a block of this version names (nothing else in
+    the package is reachable)."""
+    doc_uuid, ver_uuid = parse_uuid(document_id), parse_uuid(version_id)
+    ext = name.rsplit(".", 1)[-1].lower()
+    if ext not in _MEDIA_TYPES or "/" in name or "\\" in name:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
+    with tenant_tx(ctx) as conn:
+        v = _version_row(conn, doc_uuid, ver_uuid)
+        known = conn.execute(text("SELECT 1 FROM document_blocks WHERE version_id = :v AND media = :m LIMIT 1"),
+                             {"v": ver_uuid, "m": name}).first()
+    if known is None or v.mime_type != DOCX_MIME:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
+    try:
+        with zipfile.ZipFile(io.BytesIO(get_storage().get(v.storage_key))) as zf:
+            data = zf.read(f"word/media/{name}")
+    except (KeyError, zipfile.BadZipFile):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND) from None
+    return Response(content=data, media_type=_MEDIA_TYPES[ext],
+                    headers={"Cache-Control": "private, max-age=600", "X-Content-Type-Options": "nosniff"})

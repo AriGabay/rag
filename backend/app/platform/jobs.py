@@ -122,3 +122,29 @@ def fail_job(conn: Connection, job_id: UUID, error: str, permanent: bool, attemp
         {"st": "failed" if terminal else "queued", "e": error[:500], "b": backoff, "j": job_id},
     )
     return terminal
+
+
+def _requeue(conn: Connection, version_id: UUID, kind: str, key: str, payload: dict) -> bool:
+    """Queue a job under ``key``; a finished or failed job with that key is reset to a fresh queued job, a queued
+    or running one is left alone. True when a job was queued."""
+    return conn.execute(
+        text(
+            "INSERT INTO jobs (office_id, version_id, kind, payload, idempotency_key, max_attempts)"
+            " VALUES (app_office(), :v, :kind, CAST(:p AS jsonb), :k, :m)"
+            " ON CONFLICT (idempotency_key) DO UPDATE SET status = 'queued', attempts = 0, run_after = now(),"
+            " locked_by = NULL, lease_until = NULL, last_error = NULL, payload = EXCLUDED.payload,"
+            " updated_at = now() WHERE jobs.status IN ('failed', 'done') RETURNING id"
+        ),
+        {"v": version_id, "kind": kind, "p": json.dumps(payload), "k": key, "m": get_settings().job_max_attempts},
+    ).first() is not None
+
+
+def enqueue_reindex(conn: Connection, version_id: UUID, ingestion_version: str) -> bool:
+    """Read a processed version again (blocks, pictures, chunks, embeddings) without touching its records."""
+    return _requeue(conn, version_id, "process", f"reindex:{version_id}:{ingestion_version}",
+                    {"mode": "reindex", "ingestion_version": ingestion_version})
+
+
+def enqueue_measurements(conn: Connection, version_id: UUID, extraction_version: str) -> bool:
+    return _requeue(conn, version_id, "extract_measurements", f"measure:{version_id}:{extraction_version}",
+                    {"extraction_version": extraction_version})

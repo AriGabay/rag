@@ -21,7 +21,7 @@ test.describe("Admin provider status", () => {
     await request.post("/api/auth/logout");
 
     await login(page, USERS.adminB);
-    await page.getByRole("navigation", { name: "ניווט ראשי" }).getByRole("link", { name: "ניהול" }).click();
+    await page.getByRole("complementary", { name: "היסטוריית שיחות" }).getByRole("link", { name: "ניהול" }).click();
     const panel = page.getByRole("region", { name: "מודל שפה בענן" });
     await expect(panel).toBeVisible();
 

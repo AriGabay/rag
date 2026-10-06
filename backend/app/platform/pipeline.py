@@ -23,13 +23,21 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from app.config import get_settings
-from app.db import TenantContext, system_ctx, tenant_tx  # noqa: F401 - system_ctx re-exported
-from app.extraction.base import ExtractionResult, check_deadline
+from app.db import (  # noqa: F401 - system_ctx re-exported
+    TenantContext,
+    bump_data_version,
+    system_ctx,
+    tenant_tx,
+)
+from app.extraction.base import Block, ExtractionResult, check_deadline
 from app.extraction.normalize_text import normalize_for_search
 
 logger = logging.getLogger(__name__)
 
 EXTRACTION_VERSION = "rules-v1"
+# Version of the document reading itself (blocks, pictures, chunk boundaries). A version processed under an
+# older one is reprocessed by ``reprocess_outdated``.
+INGESTION_VERSION = "docx-blocks-v3"
 
 
 @dataclass
@@ -64,7 +72,7 @@ def _delete_outputs(conn: Connection, version_id: UUID) -> None:
         text("DELETE FROM fact_values WHERE occurrence_id IN (SELECT id FROM occurrences WHERE version_id = :v)"),
         {"v": version_id},
     )
-    for table in ("occurrences", "chunks", "extracted_tables", "pages"):
+    for table in ("occurrences", "chunks", "extracted_tables", "pages", "document_blocks"):
         conn.execute(text(f"DELETE FROM {table} WHERE version_id = :v"), {"v": version_id})
 
 
@@ -97,9 +105,18 @@ def clone_outputs(conn: Connection, info: VersionInfo) -> int:
     conn.execute(
         text(
             "INSERT INTO chunks (office_id, document_id, version_id, chunk_index, kind, page_list, section, text,"
-            " normalized_text, embedding, embedding_model, table_index, row_index) SELECT office_id, :d, :v,"
-            " chunk_index, kind, page_list, section, text, normalized_text, embedding, embedding_model, table_index,"
-            " row_index FROM chunks WHERE version_id = :s"
+            " normalized_text, embedding, embedding_model, table_index, row_index, block_start, block_end)"
+            " SELECT office_id, :d, :v, chunk_index, kind, page_list, section, text, normalized_text, embedding,"
+            " embedding_model, table_index, row_index, block_start, block_end FROM chunks WHERE version_id = :s"
+        ),
+        params,
+    )
+    conn.execute(
+        text(
+            "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section, section_path,"
+            " label, paragraph_no, page, media, source, status, note, table_index, text) SELECT office_id, :d, :v,"
+            " block_index, kind, section, section_path, label, paragraph_no, page, media, source, status, note,"
+            " table_index, text FROM document_blocks WHERE version_id = :s"
         ),
         params,
     )
@@ -110,14 +127,46 @@ def clone_outputs(conn: Connection, info: VersionInfo) -> int:
         text("SELECT count(*) FROM pages WHERE version_id = :v AND NOT ok"), {"v": info.id}
     ).scalar_one()
     conn.execute(
-        text("UPDATE document_versions SET page_count = :p, pages_incomplete = :i WHERE id = :v"),
-        {"p": page_count, "i": pages_incomplete, "v": info.id},
+        text("UPDATE document_versions SET page_count = :p, pages_incomplete = :i, ingestion = (SELECT ingestion"
+             " FROM document_versions WHERE id = :s), extraction_version = (SELECT extraction_version FROM"
+             " document_versions WHERE id = :s) WHERE id = :v"),
+        {"p": page_count, "i": pages_incomplete, "v": info.id, "s": src},
     )
     return pages_incomplete
 
 
+def _blocks_of(result: ExtractionResult) -> list[Block]:
+    """The result's blocks; a PDF has none of its own, so each chunk is one block on its first page (tables are
+    their own blocks) and the chunk points at it."""
+    if result.blocks:
+        return result.blocks
+    blocks: list[Block] = []
+    for c in result.chunks:
+        if c.kind == "table_row":
+            continue
+        page = c.page_list[0] if c.page_list else None
+        blocks.append(Block(index=len(blocks), kind="paragraph", text=c.text, section=c.section,
+                            section_path=[c.section] if c.section else [], page=page))
+        c.block_start = c.block_end = blocks[-1].index
+    for t in result.tables:
+        blocks.append(Block(index=len(blocks), kind="table", text="\n".join(" | ".join(r.cells) for r in t.rows),
+                            section=t.section, section_path=[t.section] if t.section else [], page=t.page_start,
+                            source="ocr" if t.ocr else "text", table_index=t.index,
+                            status="read_uncertain" if t.ocr else "read"))
+        t.block_index = blocks[-1].index
+        for c in result.chunks:
+            if c.kind == "table_row" and c.table_index == t.index:
+                c.block_start = c.block_end = t.block_index
+    return blocks
+
+
 def persist_extraction(conn: Connection, info: VersionInfo, result: ExtractionResult) -> None:
     _delete_outputs(conn, info.id)
+    _insert_outputs(conn, info, result)
+
+
+def _insert_outputs(conn: Connection, info: VersionInfo, result: ExtractionResult) -> None:
+    blocks = _blocks_of(result)
     for p in result.pages:
         conn.execute(
             text(
@@ -127,10 +176,23 @@ def persist_extraction(conn: Connection, info: VersionInfo, result: ExtractionRe
             {"d": info.document_id, "v": info.id, "n": p.page_no, "t": p.text, "m": p.method,
              "q": round(p.quality, 4), "ok": p.ok},
         )
+    for b in blocks:
+        conn.execute(
+            text(
+                "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
+                " section_path, label, paragraph_no, page, media, source, status, note, table_index, text)"
+                " VALUES (app_office(), :d, :v, :i, :k, :s, :sp, :l, :pn, :pg, :m, :src, :st, :n, :ti, :t)"
+            ),
+            {"d": info.document_id, "v": info.id, "i": b.index, "k": b.kind, "s": b.section, "sp": b.section_path,
+             "l": b.label, "pn": b.paragraph_no, "pg": b.page, "m": b.media, "src": b.source, "st": b.status,
+             "n": b.note, "ti": b.table_index, "t": b.text},
+        )
     for t in result.tables:
         structure = {
             "headers": t.headers, "units": t.units, "ocr": t.ocr, "section": t.section,
             "rows": [{"page": r.page, "cells": r.cells} for r in t.rows],
+            "source": t.source, "media": t.media, "caption": t.caption, "title": t.title, "notes": t.notes,
+            "block_index": t.block_index,
         }
         conn.execute(
             text(
@@ -144,16 +206,19 @@ def persist_extraction(conn: Connection, info: VersionInfo, result: ExtractionRe
         conn.execute(
             text(
                 "INSERT INTO chunks (office_id, document_id, version_id, chunk_index, kind, page_list, section,"
-                " text, normalized_text, table_index, row_index) VALUES (app_office(), :d, :v, :i, :k, :pl, :s, :t, :n,"
-                " :ti, :ri)"
+                " text, normalized_text, table_index, row_index, block_start, block_end) VALUES (app_office(), :d,"
+                " :v, :i, :k, :pl, :s, :t, :n, :ti, :ri, :bs, :be)"
             ),
             {"d": info.document_id, "v": info.id, "i": c.index, "k": c.kind, "pl": c.page_list, "s": c.section,
-             "t": c.text, "n": normalize_for_search(c.text), "ti": c.table_index, "ri": c.row_index},
+             "t": c.text, "n": normalize_for_search(c.text), "ti": c.table_index, "ri": c.row_index,
+             "bs": c.block_start, "be": c.block_end},
         )
+    report = result.components | {"ingestion_version": INGESTION_VERSION, "chunks": len(result.chunks)}
     conn.execute(
-        text("UPDATE document_versions SET page_count = :p, pages_incomplete = :i, extraction_version = :e"
-             " WHERE id = :v"),
-        {"p": result.page_count, "i": result.pages_incomplete, "e": EXTRACTION_VERSION, "v": info.id},
+        text("UPDATE document_versions SET page_count = :p, pages_incomplete = :i, extraction_version = :e,"
+             " ingestion = CAST(:g AS jsonb) WHERE id = :v"),
+        {"p": result.page_count, "i": result.pages_incomplete, "e": EXTRACTION_VERSION, "v": info.id,
+         "g": json.dumps(report, ensure_ascii=False)},
     )
 
 
@@ -162,13 +227,34 @@ def extract_stage(ctx: TenantContext, info: VersionInfo, deadline: float) -> Non
         if info.cloned_from and _source_has_outputs(conn, info.cloned_from):
             clone_outputs(conn, info)
             return
-    from app.extraction.pipeline import get_extractor
     from app.platform.storage import get_storage
 
     data = get_storage().get(info.storage_key)
-    result = get_extractor().extract(data, info.mime_type, deadline)
+    result = _extract(data, info.mime_type, deadline, vision_reader(ctx))
     with tenant_tx(ctx) as conn:
         persist_extraction(conn, info, result)
+
+
+def _extract(data: bytes, mime_type: str, deadline: float, vision) -> ExtractionResult:
+    from app.extraction.pipeline import get_extractor
+
+    extractor = get_extractor()
+    if vision is None:  # extractors written before pictures were read by the vision model take no reader
+        return extractor.extract(data, mime_type, deadline)
+    return extractor.extract(data, mime_type, deadline, vision=vision)
+
+
+def vision_reader(ctx: TenantContext):
+    """The vision model reader for pictures, only when the office's provider mode is cloud (the same consent
+    that lets document text reach the model); None otherwise (pictures are read by OCR alone)."""
+    from app.extraction.vision import ModelVisionReader
+    from app.providers.status import Mode, office_provider_state
+
+    with tenant_tx(ctx) as conn:
+        state = office_provider_state(conn)
+    if state.mode != Mode.CLOUD:
+        return None
+    return ModelVisionReader(ctx.office_id)
 
 
 # --- stage 2 ---------------------------------------------------------------------------------------
@@ -235,4 +321,69 @@ def process_version(office_id: UUID, version_id: UUID) -> str | None:
         return None  # deleted, superseded, or already published: nothing to do
     extract_stage(ctx, info, deadline)
     embed_stage(ctx, info, deadline)
-    return publish_stage(ctx, info)
+    outcome = publish_stage(ctx, info)
+    if vision_reader(ctx) is not None:
+        from app.measurements.extract import EXTRACTION_VERSION as MEASURE_VERSION
+        from app.platform.jobs import enqueue_measurements
+
+        with tenant_tx(ctx) as conn:
+            enqueue_measurements(conn, info.id, MEASURE_VERSION)
+    return outcome
+
+
+# --- reindexing and measurements ----------------------------------------------------------------------------
+
+_DERIVED_TEXT_TABLES = ("chunks", "extracted_tables", "pages", "document_blocks")
+
+
+def reindex_version(office_id: UUID, version_id: UUID) -> str | None:
+    """Read a processed version again under the current reader: its blocks, pictures, tables, chunks and
+    embeddings are replaced; its records (and their reviews) are kept. Facts the earlier engine extracted from
+    the old chunks and never reviewed go (a reviewed fact stays); cached answers are dropped and the data version
+    moves, so no answer built on the old reading is served again. Measurements are then re-extracted when the
+    office allows the cloud model."""
+    from app.platform.jobs import enqueue_measurements
+    from app.platform.storage import get_storage
+
+    ctx = system_ctx(office_id)
+    deadline = time.monotonic() + get_settings().job_timeout_seconds
+    with tenant_tx(ctx) as conn:
+        row = conn.execute(text(
+            "SELECT v.id, v.document_id, v.storage_key, v.mime_type, v.cloned_from_version_id FROM document_versions v"
+            " JOIN documents d ON d.id = v.document_id AND d.deleted_at IS NULL WHERE v.id = :v"
+            " AND v.status IN ('ready', 'needs_review')"), {"v": version_id}).first()
+    if row is None:
+        return None
+    info = VersionInfo(row.id, row.document_id, row.storage_key, row.mime_type, None)
+    result = _extract(get_storage().get(info.storage_key), info.mime_type, deadline, vision_reader(ctx))
+    with tenant_tx(ctx) as conn:
+        for table in _DERIVED_TEXT_TABLES:
+            conn.execute(text(f"DELETE FROM {table} WHERE version_id = :v"), {"v": info.id})
+        records = conn.execute(text("SELECT count(*) FROM occurrences WHERE version_id = :v"), {"v": info.id}).scalar_one()
+        _insert_outputs(conn, info, result)
+        conn.execute(text("DELETE FROM facts WHERE version_id = :v AND status IN ('auto_validated', 'needs_review')"),
+                     {"v": info.id})
+        conn.execute(text("DELETE FROM fact_extraction_ledger WHERE version_id = :v"), {"v": info.id})
+        conn.execute(text("DELETE FROM answer_cache"))
+        bump_data_version(conn)
+        logger.info("reindexed version %s (%d records kept)", info.id, records)
+    embed_stage(ctx, info, deadline)
+    if vision_reader(ctx) is not None:
+        from app.measurements.extract import EXTRACTION_VERSION as MEASURE_VERSION
+
+        with tenant_tx(ctx) as conn:
+            enqueue_measurements(conn, info.id, MEASURE_VERSION)
+    return "reindexed"
+
+
+def run_measurements(office_id: UUID, version_id: UUID) -> str:
+    from app.measurements.extract import extract_version
+    from app.providers.llm import get_selected_provider
+
+    ctx = system_ctx(office_id)
+    if vision_reader(ctx) is None:  # same consent: the office's cloud mode
+        return "skipped"
+    result = extract_version(ctx, version_id, get_selected_provider())
+    with tenant_tx(ctx) as conn:
+        bump_data_version(conn)
+    return result.state

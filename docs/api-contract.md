@@ -23,11 +23,15 @@ Money, areas, and prices per sqm are serialized as **strings** (exact decimals).
 | GET | `/api/documents/{id}` | `DocumentSummary` plus `versions: [Version]` |
 | DELETE | `/api/documents/{id}` | logical delete, admin or uploader; `{ok: true}` |
 | GET | `/api/documents/{doc_id}/versions/{version_id}/file` | streams the original (`application/pdf` inline). Link to a page with `#page=N`. |
-| GET | `/api/search?q=&limit=` | hybrid content search: `{results: [{chunk_id, document_id, version_id, title, page_list, section, snippet, score}]}` |
+| GET | `/api/search?q=&limit=` | hybrid content search (the same search the chat tools use: abbreviation variants, a focused pass inside a document the query names, at most two rows per table): `{results: [{chunk_id, document_id, version_id, title, page_list, section, snippet, text, kind, score}]}` |
+| GET | `/api/documents/{doc_id}/versions/{version_id}/blocks?start=&end=` | the version's blocks in reading order (a window when given): `{title, is_current, mime_type, total, file_url, blocks: [{index, kind, section, section_path, paragraph_no, page, media, source, status, note, text, table?: {headers, caption, title, notes, source, media, rows}, media_url?}]}`. A DOCX block is located by section and paragraph; nothing invents pages. |
+| GET | `/api/documents/{doc_id}/versions/{version_id}/media/{name}` | one raster picture of a DOCX, only by a media name a block of that version names (PNG/JPEG/GIF/BMP; vector pictures are shown as the table read from them). |
 
 `DocumentSummary`: `{id, title, group: {id, name}, deleted, created_at, current_version: Version | null, versions_count}`
 
-`Version`: `{id, version_no, filename, status: "pending"|"processing"|"ready"|"needs_review"|"failed"|"superseded", status_reason, page_count, pages_incomplete, records_total, records_needing_review, is_current, created_at, processed_at, mime_type}`
+`Version`: `{id, version_no, filename, status: "pending"|"processing"|"ready"|"needs_review"|"failed"|"superseded", status_reason, page_count, pages_incomplete, records_total, records_needing_review, is_current, created_at, processed_at, mime_type, reading}`
+
+`reading` keeps apart what was read: `{passages, tables, measurements, measurements_state, images_total, images: {read, read_uncertain, no_text, decorative, unread}, unread: [{media, section, reason}], partial, ingestion_version}`. `partial` is true when any picture or page was not read; zero structured records never means zero searchable content.
 
 ## Review
 
@@ -70,7 +74,7 @@ Facts are values of attributes nobody anticipated (for example a safe-room area)
 
 Every change appends the prior state to `previous`, bumps only that attribute's `facts_version` (answers built on the old facts become stale, see `Message.stale`) and writes an audit event (`fact_approve`, `fact_reject`, `fact_correct`). Trust tiers in answers: `verified` and `corrected` facts make the main figure; `auto_validated` facts are added only to the separately labeled preliminary figure; `needs_review` facts are excluded and counted in `coverage.facts.awaiting_review`.
 
-## Chat
+## Chat (the earlier engine, `/api/ask`)
 
 | Method | Path | Notes |
 |---|---|---|
@@ -156,6 +160,33 @@ Every change appends the prior state to `previous`, bumps only that attribute's 
 - `abstention_kind` is set on every abstention, including the price path when no verified record matches (`not_found`, or `not_extracted_or_verified` when matching records await verification) and a combined answer whose computation found nothing.
 - `partial` is true when the turn deadline cut a step short or documents in scope are still being extracted; such answers are never cached. `cached` appears only on a cache hit (sources re-authorized, coverage recomputed). `cleared` lists the context items this turn cleared (a new question or topic change). `interpretation_note` is one line for the UI, or null.
 
+### Measurements review (quantities with their meaning)
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/review/measurements?document_id=&status=&kind=&q=&offset=` | `{items: [Measurement], total, counts, kinds, units, periods, vats}`; rejected ones only with `status=rejected` |
+| POST | `/api/review/measurements/{id}/verify` | `{expected_status, note?}` |
+| POST | `/api/review/measurements/{id}/correct` | `{expected_status, value_text?, unit?, period?, vat?, area_basis?, metric?, metric_kind?, note?}` |
+| POST | `/api/review/measurements/{id}/reject` | `{expected_status, note}` (note required) |
+
+`Measurement`: the metric and value as written (`metric`, `value_text`, `quote`, `section`, `block_index`, `table_index`) and their meaning, each with a Hebrew label: `metric_kind`, `value_form` (exact/approximate/range/minimum/maximum), `unit`, `period` (month/year/one_time/none/unknown), `vat` (included/excluded/unknown/not_applicable), `area_basis` as written, `subject`, `subject_role`, `value_role`; `status`, `issues`, `conflict` (a newer extraction that disagrees with a reviewed value), `previous`. A change whose `expected_status` no longer matches is a 409; every change moves the data version.
+
+## Conversational chat (`/api/chat`)
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/chat/conversations?q=&archived=&before=&limit=` | `{conversations: [{id, title, updated_at, created_at, archived, engine}], next}` (search covers titles and message text) |
+| POST | `/api/chat/conversations` | a new, empty conversation |
+| PATCH | `/api/chat/conversations/{id}` | `{title?, archived?}` |
+| DELETE | `/api/chat/conversations/{id}` | deletes the conversation and its messages |
+| GET | `/api/chat/conversations/{id}/messages?before=<message id>&limit=` | `{conversation, messages: [ChatMessage], has_more}`, oldest first |
+| POST | `/api/chat/conversations/{id}/messages` | `{content, client_id?}` → `{user, assistant}`; the assistant message starts `running`. The same `client_id` returns the same pair and starts nothing. 409 while an answer of this conversation is still working. |
+| GET | `/api/chat/messages/{id}` | one message (poll while `running`/`cancelling`) |
+| POST | `/api/chat/messages/{id}/cancel` | asks the server to stop; `cancelling` until the worker reaches its next check, then `cancelled` |
+| POST | `/api/chat/messages/{id}/retry` | replaces a finished/failed/cancelled answer with a new run |
+
+`ChatMessage`: `{id, role, content, status: "running"|"cancelling"|"cancelled"|"done"|"failed", error, progress: [{step, label}], answer, reply_to, client_id, created_at, stale, cancel_requested}`. `answer`: `{kind: "rag"|"search_only", status: "answered"|"partial"|"not_found"|"clarification", markdown, claims, clarification, missing, sources, measurements, computations, documents, verification: {judged, judge_status, problems}, searches, coverage}`. Citations in `markdown` are `[S#]` (passage), `[M#]` (measurement), `[C#]` (computation). An answer whose source was deleted or is no longer visible comes back `hidden`; one built before a data or permission change is `stale`.
+
 ## Admin (admin role only)
 
 | Method | Path | Notes |
@@ -168,6 +199,9 @@ Every change appends the prior state to `previous`, bumps only that attribute's 
 | GET | `/api/admin/settings` | `{cloud_llm_enabled, provider: "openai"\|"anthropic", provider_name: "OpenAI"\|"Anthropic (Claude)", model, key_present, mode, mode_status, untested, last_test: {provider, model, ok, status, tested_at} \| null, retention_note, acknowledged_at}` (see below) |
 | PUT | `/api/admin/settings` | `{cloud_llm_enabled, acknowledge: true}`; enabling without `acknowledge: true` → 422; enabling records the provider selected now as the one acknowledged (`office_settings.cloud_provider`; disabling clears it); every change bumps `settings_version`; returns the settings object |
 | POST | `/api/admin/provider/test` | no body; runs the connection test and returns the settings object with the new `last_test`; employee → 403 |
+| POST | `/api/admin/reprocess` | `{all?: false}` → `{queued, versions, ingestion_version}`: reads current documents again (blocks, pictures, chunks, embeddings); records and reviews are kept, cached answers dropped, the data version moves. Without `all`, only versions read by an older reader. |
+| POST | `/api/admin/measurements` | `{all?: false}` → `{queued, extraction_version}`: measurement extraction for current versions (cloud mode only) |
+| GET | `/api/admin/jobs` | `{jobs: [{kind, status, count}]}` |
 | GET | `/api/admin/coverage` | `{documents_by_status: {status: count}, records: {total, verified, awaiting_verification, needs_review}, open_dedup_candidates, review_queue_count}` |
 
 Provider status (R8, KTD5; derived in `backend/app/providers/status.py`, the only place that decides which provider answers):

@@ -35,6 +35,20 @@ export interface Version {
   created_at: string;
   processed_at: string | null;
   mime_type: string;
+  reading?: VersionReading;
+}
+
+/** What was read of a version, kept apart (searchable passages are not structured records). */
+export interface VersionReading {
+  passages: number;
+  tables: number;
+  measurements: number;
+  measurements_state: "pending" | "done" | "partial" | "failed" | null;
+  images_total: number;
+  images: Partial<Record<"read" | "read_uncertain" | "no_text" | "decorative" | "unread", number>>;
+  unread: { media: string | null; section: string | null; reason: string | null }[];
+  partial: boolean;
+  ingestion_version: string | null;
 }
 
 export interface DocumentSummary {

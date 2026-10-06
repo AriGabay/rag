@@ -220,3 +220,54 @@ def coverage_summary(ctx: TenantContext = Depends(require_admin)) -> dict:
             "records": {"total": rec.total, "verified": rec.verified, "awaiting_verification": rec.awaiting,
                         "needs_review": rec.review},
             "open_dedup_candidates": open_dedup, "review_queue_count": rec.awaiting + rec.review + open_dedup}
+
+
+# --- reprocessing ------------------------------------------------------------------------------------------
+
+class ReprocessBody(BaseModel):
+    all: bool = False  # False: only versions read by an older reader / not yet measured
+
+
+@router.post("/reprocess")
+def reprocess(body: ReprocessBody, ctx: TenantContext = Depends(require_admin)) -> dict:
+    """Queue a fresh reading of the office's current documents (blocks, pictures, chunks, embeddings; records and
+    reviewed decisions kept). Without ``all``, only versions read by an older reader."""
+    from app.platform.jobs import enqueue_reindex
+    from app.platform.pipeline import INGESTION_VERSION
+
+    with tenant_tx(ctx) as conn:
+        rows = conn.execute(text(
+            "SELECT v.id, v.ingestion->>'ingestion_version' AS iv FROM document_versions v JOIN documents d"
+            " ON d.id = v.document_id AND d.deleted_at IS NULL WHERE v.is_current AND v.status IN ('ready',"
+            " 'needs_review')")).all()
+        queued = [str(r.id) for r in rows if (body.all or r.iv != INGESTION_VERSION)
+                  and enqueue_reindex(conn, r.id, INGESTION_VERSION)]
+        audit(conn, "reprocess", ctx.user_id, "office", ctx.office_id)
+    return {"queued": len(queued), "versions": queued, "ingestion_version": INGESTION_VERSION}
+
+
+@router.post("/measurements")
+def extract_measurements(body: ReprocessBody, ctx: TenantContext = Depends(require_admin)) -> dict:
+    """Queue measurement extraction for current versions without a completed run of the current extraction
+    version (or all of them). Requires the office's cloud mode; the jobs are skipped otherwise."""
+    from app.measurements.extract import EXTRACTION_VERSION
+    from app.platform.jobs import enqueue_measurements
+
+    with tenant_tx(ctx) as conn:
+        rows = conn.execute(text(
+            "SELECT v.id, r.state FROM document_versions v JOIN documents d ON d.id = v.document_id AND d.deleted_at"
+            " IS NULL LEFT JOIN measurement_runs r ON r.version_id = v.id AND r.extraction_version = :e"
+            " WHERE v.is_current AND v.status IN ('ready', 'needs_review')"), {"e": EXTRACTION_VERSION}).all()
+        queued = [str(r.id) for r in rows if (body.all or r.state != "done")
+                  and enqueue_measurements(conn, r.id, EXTRACTION_VERSION)]
+    return {"queued": len(queued), "extraction_version": EXTRACTION_VERSION}
+
+
+@router.get("/jobs")
+def jobs_summary(ctx: TenantContext = Depends(require_admin)) -> dict:
+    with tenant_tx(ctx) as conn:
+        rows = conn.execute(text(
+            "SELECT kind, COALESCE(payload->>'mode', '') AS mode, status, count(*) AS n FROM jobs"
+            " GROUP BY 1, 2, 3 ORDER BY 1, 2, 3")).all()
+    return {"jobs": [{"kind": r.kind + (f":{r.mode}" if r.mode else ""), "status": r.status, "count": r.n}
+                     for r in rows]}

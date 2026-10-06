@@ -18,6 +18,7 @@ import type {
   SearchResult,
   UploadResult,
 } from "./types";
+import type { ChatConversation, ChatMessage, SourceBlocks } from "./chatTypes";
 // Facts review (U11)
 import type { FactDetail, FactReviewGroup, FactStatus } from "./types";
 
@@ -148,6 +149,37 @@ export function fileUrl(documentId: string, versionId: string, page?: number | n
   const base = `/api/documents/${encodeURIComponent(documentId)}/versions/${encodeURIComponent(versionId)}/file`;
   return page ? `${base}#page=${page}` : base;
 }
+
+export const chatApi = {
+  conversations: (opts: { q?: string; archived?: boolean; before?: string | null; limit?: number } = {}, signal?: AbortSignal) =>
+    request<{ conversations: ChatConversation[]; next: string | null }>(
+      `/api/chat/conversations${qs({ q: opts.q, archived: opts.archived ? "true" : undefined, before: opts.before, limit: opts.limit })}`,
+      { signal },
+    ),
+  create: () => request<ChatConversation>("/api/chat/conversations", { method: "POST" }),
+  patch: (id: string, body: { title?: string; archived?: boolean }) =>
+    request<ChatConversation>(`/api/chat/conversations/${encodeURIComponent(id)}`, { method: "PATCH", body }),
+  remove: (id: string) => request<{ ok: true }>(`/api/chat/conversations/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  messages: (id: string, before?: string | null, signal?: AbortSignal) =>
+    request<{ conversation: ChatConversation; messages: ChatMessage[]; has_more: boolean }>(
+      `/api/chat/conversations/${encodeURIComponent(id)}/messages${qs({ before })}`,
+      { signal },
+    ),
+  send: (id: string, content: string, clientId: string) =>
+    request<{ user: ChatMessage; assistant: ChatMessage | null }>(
+      `/api/chat/conversations/${encodeURIComponent(id)}/messages`,
+      { method: "POST", body: { content, client_id: clientId } },
+    ),
+  message: (id: string, signal?: AbortSignal) =>
+    request<ChatMessage>(`/api/chat/messages/${encodeURIComponent(id)}`, { signal }),
+  cancel: (id: string) => request<ChatMessage>(`/api/chat/messages/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
+  retry: (id: string) => request<ChatMessage>(`/api/chat/messages/${encodeURIComponent(id)}/retry`, { method: "POST" }),
+  blocks: (documentId: string, versionId: string, start?: number, end?: number, signal?: AbortSignal) =>
+    request<SourceBlocks>(
+      `/api/documents/${encodeURIComponent(documentId)}/versions/${encodeURIComponent(versionId)}/blocks${qs({ start, end })}`,
+      { signal },
+    ),
+};
 
 export const api = {
   // Auth

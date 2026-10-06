@@ -1,0 +1,153 @@
+// Types of the conversational chat API (/api/chat). Kept apart from the earlier /api/ask types.
+
+export interface ChatConversation {
+  id: string;
+  title: string;
+  updated_at: string;
+  created_at: string;
+  archived: boolean;
+  engine: "legacy" | "rag";
+}
+
+export interface ChatProgressStep {
+  step: string;
+  label: string;
+}
+
+export interface ChatSource {
+  id: string;
+  document_id: string;
+  version_id: string;
+  title: string;
+  section: string | null;
+  location: string;
+  kind: string;
+  text: string;
+  block_start: number | null;
+  block_end: number | null;
+  table_index: number | null;
+  page_list: number[] | null;
+  chunk_id: string | null;
+}
+
+export interface ChatMeasurement {
+  id: string;
+  measurement_id: string;
+  document_id: string;
+  version_id: string;
+  title: string;
+  metric: string;
+  metric_kind: string;
+  value_text: string;
+  unit: string | null;
+  period: string;
+  vat: string;
+  area_basis: string | null;
+  subject: string | null;
+  value_role: string;
+  status: string;
+  quote: string;
+  section: string | null;
+  block_index: number | null;
+  table_index: number | null;
+}
+
+export interface ChatComputation {
+  id: string;
+  operation: string;
+  result: string | null;
+  unit: string;
+  inputs: string[];
+  documents: number;
+  note: string;
+}
+
+export interface ChatClaim {
+  text: string;
+  source_ids: string[];
+  basis: "explicit" | "inference" | "computed";
+}
+
+export interface ChatVerification {
+  judged: boolean;
+  judge_status: string | null;
+  problems: { text: string; reason: string; severity: "error" | "partial" }[];
+}
+
+export interface ChatCoverage {
+  documents: number;
+  extracted: number;
+  partial_extraction: string[];
+  not_extracted: string[];
+  partially_read: string[];
+}
+
+export interface ChatAnswer {
+  kind: "rag" | "search_only";
+  status: "answered" | "partial" | "not_found" | "clarification";
+  markdown: string;
+  claims: ChatClaim[];
+  clarification: string | null;
+  missing: string | null;
+  sources: ChatSource[];
+  measurements: ChatMeasurement[];
+  computations: ChatComputation[];
+  documents: { document_id: string; title: string }[];
+  verification: ChatVerification | null;
+  searches: string[];
+  coverage: ChatCoverage[];
+  steps?: number;
+  hidden?: boolean;
+}
+
+export type ChatMessageStatus = "running" | "cancelling" | "cancelled" | "done" | "failed";
+
+export interface ChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  status: ChatMessageStatus;
+  error: string | null;
+  progress: ChatProgressStep[];
+  answer: ChatAnswer | null;
+  reply_to: string | null;
+  client_id: string | null;
+  created_at: string;
+  stale: boolean;
+  cancel_requested: boolean;
+}
+
+export interface SourceBlock {
+  index: number;
+  kind: "heading" | "paragraph" | "textbox" | "table" | "image";
+  section: string | null;
+  section_path: string[];
+  paragraph_no: number | null;
+  page: number | null;
+  media: string | null;
+  source: string;
+  status: string;
+  note: string | null;
+  text: string;
+  media_url?: string;
+  table?: {
+    headers: string[] | null;
+    caption: string | null;
+    title: string[] | null;
+    notes: string[] | null;
+    source: string | null;
+    media: string | null;
+    rows: string[][];
+  };
+}
+
+export interface SourceBlocks {
+  document_id: string;
+  version_id: string;
+  title: string;
+  is_current: boolean;
+  mime_type: string;
+  total: number;
+  blocks: SourceBlock[];
+  file_url: string;
+}

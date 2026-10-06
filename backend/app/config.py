@@ -44,6 +44,17 @@ class Settings(BaseSettings):
     llm_timeout_answer_seconds: float = 30
     llm_timeout_verify_seconds: float = 20
     llm_timeout_test_seconds: float = 20
+    llm_timeout_vision_seconds: float = 90
+    # The conversational answering loop: reasoning effort of its model steps, its step bound and wall clock.
+    chat_reasoning_effort: str = "low"
+    measure_reasoning_effort: str = "low"  # measurements: completeness over speed (a background job)
+    judge_reasoning_effort: str = "low"  # the answer verifier reads meaning, not only words
+    chat_max_steps: int = 8
+    chat_turn_seconds: int = 150
+    chat_workers: int = 6
+    chat_run_inline: bool = False  # tests: run a turn inside the request instead of a background thread
+    llm_timeout_agent_seconds: float = 60
+    llm_timeout_measure_seconds: float = 90
 
     # Turn limits (KTD8, KTD13).
     turn_deadline_seconds: int = 45

@@ -72,8 +72,8 @@ for (const action of ["approve", "correct"] as const) {
 
     await login(page, USERS.adminA);
     await page.goto("/review");
-    await page.getByRole("tab", { name: "עובדות שחולצו" }).click();
-    const panel = page.getByRole("tabpanel", { name: "עובדות שחולצו" });
+    await page.getByRole("tab", { name: "עובדות (מנוע קודם)" }).click();
+    const panel = page.getByRole("tabpanel", { name: "עובדות (מנוע קודם)" });
     const row = panel.getByRole("article").filter({ hasText: "שטח הממ״ד 12 מ״ר" });
     await expect(row).toBeVisible();
 

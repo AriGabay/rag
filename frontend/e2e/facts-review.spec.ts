@@ -51,8 +51,8 @@ test.describe("Facts review", () => {
 
     await login(page, user);
     await page.goto("/review");
-    await page.getByRole("tab", { name: "עובדות שחולצו" }).click();
-    const panel = page.getByRole("tabpanel", { name: "עובדות שחולצו" });
+    await page.getByRole("tab", { name: "עובדות (מנוע קודם)" }).click();
+    const panel = page.getByRole("tabpanel", { name: "עובדות (מנוע קודם)" });
     const docSection = panel.getByRole("region", { name: `${attribute.label} — ${fact.document.title}` });
     const row = docSection.getByRole("article").filter({ hasText: fact.quote }).first();
     await expect(row).toBeVisible();

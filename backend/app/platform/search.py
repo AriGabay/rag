@@ -330,6 +330,90 @@ def search_evidence(conn: Connection, queries: Sequence[str], limit: int = 8, *,
     return SearchOutcome(out, topic, report)
 
 
+ROWS_PER_TABLE = 2
+
+
+def diversify_rows(hits: list[dict], limit: int) -> list[dict]:
+    """Hits in rank order with at most ``ROWS_PER_TABLE`` row passages per table (a table passage, which holds
+    its rows, is always kept), so the rows of one long table do not crowd out every other passage."""
+    out: list[dict] = []
+    per_table: dict[tuple, int] = {}
+    for h in hits:
+        if h["kind"] == "table_row":
+            key = (h["version_id"], h.get("table_index"))
+            if per_table.get(key, 0) >= ROWS_PER_TABLE:
+                continue
+            per_table[key] = per_table.get(key, 0) + 1
+        out.append(h)
+        if len(out) >= limit:
+            break
+    return out
+
+
+_TITLE_WORD = re.compile(r"[\w״׳\"'-]+")
+
+
+def _title_words(title: str) -> set[str]:
+    words = set()
+    for raw in _TITLE_WORD.findall(base_normalize(title)):
+        w = raw.strip("-'״׳\"")
+        if len(w) >= 2 and w not in STOPWORDS:
+            words.add(w)
+            words.update(v for v in prefix_variants(w) if len(v) >= 2)
+    return words
+
+
+def documents_named(conn: Connection, query: str, scope: SearchScope | None = None) -> list[tuple[UUID, set[str]]]:
+    """Visible current documents the query names by their title: at least two of the title's words, one of them
+    a number ("הגפן 12", "הזית 7") or both distinctive (in no more than two titles). Returns (document id, the
+    query words that named it), best first; empty when the query names none or too many."""
+    docs = [(r.id, r.title) for r in conn.execute(text(
+        "SELECT d.id, d.title FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
+        " WHERE d.deleted_at IS NULL"))]
+    if scope and scope.document_ids:
+        docs = [(i, t) for i, t in docs if i in set(scope.document_ids)]
+    q_words = set()
+    for raw in _TITLE_WORD.findall(base_normalize(query)):
+        w = raw.strip("-'״׳\"")
+        if len(w) >= 2:
+            q_words.add(w)
+            q_words.update(prefix_variants(w))
+    words_of = {i: _title_words(t) for i, t in docs}
+    df: dict[str, int] = {}
+    for ws in words_of.values():
+        for w in ws:
+            df[w] = df.get(w, 0) + 1
+    named = []
+    for i, ws in words_of.items():
+        hit = q_words & ws
+        distinctive = {w for w in hit if df.get(w, 0) <= 2}
+        if len(hit) >= 2 and (any(w.isdigit() for w in hit) or len(distinctive) >= 2):
+            named.append((len(distinctive), len(hit), i, hit))
+    named.sort(key=lambda x: (-x[0], -x[1]))
+    if not named or len(named) > 2:
+        return []
+    return [(i, hit) for _, _, i, hit in named]
+
+
+def search_passages(conn: Connection, query: str, limit: int = 8, *, scope: SearchScope | None = None) -> list[dict]:
+    """The search the answering tools and the search screen share: the query and its abbreviation variants over
+    the scope, and — when the query names a document by its title — the same query inside that document, whose
+    passages lead (a document's name is in its title, not in its passages, so a global search ranks other
+    documents' passages that share the name's words above it). Rows of one table never crowd out the rest."""
+    from app.extraction.abbreviations import variants
+
+    queries = [query, *variants(query)]
+    hits = search_evidence(conn, queries, limit * 2, scope=scope).hits
+    named = documents_named(conn, query, scope)
+    if named:
+        inside = SearchScope(document_ids=tuple(i for i, _ in named))
+        focused = search_evidence(conn, queries, limit * 2, scope=inside).hits
+        seen = {h["chunk_id"] for h in focused}
+        hits = focused[: max(3, limit // 2) * 2] + [h for h in hits if h["chunk_id"] not in seen] + focused[
+            max(3, limit // 2) * 2:]
+    return diversify_rows(hits, limit)
+
+
 def hybrid_search(conn: Connection, query: str, limit: int = 8, *, scope: SearchScope | None = None,
                   filters: MetadataFilters | None = None, extra_queries: Sequence[str] = (),
                   place_terms: Iterable[str] = ()) -> list[dict]:
@@ -788,7 +872,8 @@ def snippet(chunk_text: str, tokens: list[str], width: int = 280) -> str:
 def search(q: str = Query(min_length=2, max_length=300), limit: int = Query(10, ge=1, le=30),
            ctx: TenantContext = Depends(get_ctx)) -> dict:
     with tenant_tx(ctx) as conn:
-        hits = hybrid_search(conn, q, limit)
+        hits = search_passages(conn, q, limit)
     return {"results": [{"chunk_id": str(h["chunk_id"]), "document_id": str(h["document_id"]),
                          "version_id": str(h["version_id"]), "title": h["title"], "page_list": h["page_list"],
-                         "section": h["section"], "snippet": h["snippet"], "score": h["score"]} for h in hits]}
+                         "section": h["section"], "snippet": h["snippet"], "text": h["text"], "kind": h["kind"],
+                         "score": h["score"]} for h in hits]}

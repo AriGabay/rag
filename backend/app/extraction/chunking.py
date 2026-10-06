@@ -109,3 +109,91 @@ def render_row(headers: list[str], cells: list[str], units: list[str | None] | N
             label = f"{label} ({unit})"
         parts.append(f"{label}: {cell}")
     return " | ".join(parts)
+
+
+# --- block-based chunking (DOCX) ---------------------------------------------------------------------------
+
+def _row_context(table: TableResult) -> str:
+    """What a row belongs to, prefixed to each row chunk: the table's title or the sentence introducing it."""
+    for candidate in [*table.title, table.caption or ""]:
+        candidate = " ".join(candidate.split()).rstrip(":：- –")
+        if candidate:
+            return candidate[:160]
+    return ""
+
+
+def _table_chunks(table: TableResult, section: str | None, max_chars: int) -> list[tuple[str, str, int | None]]:
+    """(kind, text, row index) chunks of one table: the whole table (split into row groups that repeat the
+    caption, title and header when it is long), then one chunk per row with its context and header pairs."""
+    intro = [x for x in [table.caption, *table.title] if x]
+    header = " | ".join(table.headers) if any(table.headers) else ""
+    head = "\n".join([*intro, header] if header else intro)
+    out: list[tuple[str, str, int | None]] = []
+    body: list[str] = []
+    size = len(head)
+    for r in table.rows:
+        line = " | ".join(r.cells)
+        if body and size + len(line) + 1 > max_chars:
+            out.append(("table", "\n".join([head, *body]).strip(), None))
+            body, size = [], len(head)
+        body.append(line)
+        size += len(line) + 1
+    tail = "\n".join(table.notes)
+    out.append(("table", "\n".join(x for x in [head, *body, tail] if x).strip(), None))
+    context = _row_context(table)
+    for row_index, row in table_rows(table.rows, lambda r: r.cells):
+        rendered = render_row(table.headers, row.cells, table.units)
+        out.append(("table_row", f"{context}: {rendered}" if context else rendered, row_index))
+    return out
+
+
+def chunk_blocks(blocks: list, tables: list[TableResult], max_chars: int = MAX_CHARS) -> list[ChunkResult]:
+    """Chunks over DOCX blocks: paragraphs packed per section (a continuation repeats the section heading),
+    every table (Word's own or read from a picture) as table chunks plus one chunk per row, and a picture's
+    own text as an ``image`` chunk with the sentence that introduces it. Each chunk records its block range."""
+    chunks: list[ChunkResult] = []
+    tables_of: dict[int, list[TableResult]] = {}
+    for t in tables:
+        if t.block_index is not None:
+            tables_of.setdefault(t.block_index, []).append(t)
+
+    def emit(kind: str, section: str | None, text: str, start: int, end: int, table_index: int | None = None,
+             row_index: int | None = None) -> None:
+        if text.strip():
+            chunks.append(ChunkResult(index=len(chunks), kind=kind, page_list=None, section=section, text=text,
+                                      table_index=table_index, row_index=row_index, block_start=start,
+                                      block_end=end))
+
+    current: list = []
+    size = 0
+
+    def flush() -> None:
+        nonlocal current, size
+        # a heading alone is no passage: the table or picture after it carries it as its section and caption
+        if current and any(b.kind != "heading" for b in current):
+            emit("text", current[0].section, "\n".join(b.text for b in current), current[0].index, current[-1].index)
+        current, size = [], 0
+
+    for b in blocks:
+        if b.kind in ("heading", "paragraph", "textbox"):
+            if b.kind == "heading" or (current and current[0].section != b.section):
+                flush()
+            if current and size + len(b.text) + 1 > max_chars:
+                heading = b.section
+                flush()
+                if heading:
+                    current = [type(b)(index=b.index, kind="heading", text=heading, section=b.section)]
+                    size = len(heading) + 1
+            current.append(b)
+            size += len(b.text) + 1
+            continue
+        flush()
+        for t in tables_of.get(b.index, []):
+            for kind, text, row_index in _table_chunks(t, b.section, max_chars):
+                emit(kind, b.section, text, b.index, b.index, t.index, row_index)
+        if b.kind == "image" and b.picture_text.strip():
+            intro = next((p.text for p in reversed(blocks[:b.index]) if p.kind in ("paragraph", "heading")
+                          and p.section == b.section), "")[:300]
+            emit("image", b.section, "\n".join(x for x in [intro, b.picture_text] if x), b.index, b.index)
+    flush()
+    return chunks

@@ -21,7 +21,8 @@ export async function login(page: Page, email: string, password = PASSWORD): Pro
   await page.getByLabel("דוא״ל").fill(email);
   await page.getByLabel("סיסמה").fill(password);
   await page.getByRole("button", { name: "כניסה" }).click();
-  await expect(page.getByRole("navigation", { name: "ניווט ראשי" })).toBeVisible();
+  // The app opens on the chat, which has its own sidebar instead of the header navigation.
+  await expect(page.getByRole("button", { name: "שיחה חדשה" }).first()).toBeVisible();
 }
 
 /** API-level session for test setup/cleanup only (same-origin through the Next proxy). */
@@ -54,62 +55,62 @@ export async function deleteOfficeBDocsByTitle(request: APIRequestContext, title
   await request.post("/api/auth/logout");
 }
 
-export function answerCards(page: Page): Locator {
-  return page.getByRole("article", { name: "תשובה" });
+/** The chat's message box and send button, and the assistant replies in the thread. */
+export function composer(page: Page): Locator {
+  return page.getByRole("textbox", { name: "הודעה" });
 }
 
-export async function ask(page: Page, question: string): Promise<void> {
-  const before = await answerCards(page).count();
-  const box = page.getByRole("textbox", { name: "שאלה" });
-  await box.fill(question);
-  await page.getByRole("button", { name: "שליחה" }).click();
-  await expect(answerCards(page)).toHaveCount(before + 1);
+export function assistantMessages(page: Page): Locator {
+  return page.locator(".msg-assistant");
 }
 
-/** Chooses an option of the active clarification and waits for the next answer card. */
-export async function chooseOption(page: Page, label: string | RegExp): Promise<void> {
-  const before = await answerCards(page).count();
-  await page.getByRole("group", { name: "אפשרויות הבהרה" }).getByRole("button", { name: label }).click();
-  await expect(answerCards(page)).toHaveCount(before + 1);
+/** Sends a message with Enter and waits until a new assistant reply is no longer working (answer, failure or
+ * cancellation). Returns the reply's locator. */
+export async function sendAndWait(page: Page, text: string, timeout = 240_000): Promise<Locator> {
+  const before = await assistantMessages(page).count();
+  await composer(page).fill(text);
+  await composer(page).press("Enter");
+  const reply = assistantMessages(page).nth(before);
+  await expect(reply).toBeVisible();
+  await expect(reply.locator(".status-line")).toHaveCount(0, { timeout });
+  return reply;
 }
 
-/**
- * Answers pending clarifications by clicking the first option (or a preferred one when offered) until the last
- * answer is not a clarification. Returns the labels of the clarification questions that were answered.
- */
-export async function resolveClarifications(page: Page, preferred: RegExp[] = [], max = 6): Promise<string[]> {
-  const asked: string[] = [];
-  for (let i = 0; i < max; i++) {
-    const group = page.getByRole("group", { name: "אפשרויות הבהרה" });
-    if ((await group.count()) === 0) return asked;
-    const card = answerCards(page).last();
-    asked.push((await card.locator("strong").first().innerText()).trim());
-    const buttons = group.getByRole("button");
-    let target = buttons.first();
-    for (const re of preferred) {
-      const hit = group.getByRole("button", { name: re });
-      if ((await hit.count()) > 0) {
-        target = hit.first();
-        break;
-      }
-    }
-    const before = await answerCards(page).count();
-    await target.click();
-    await expect(answerCards(page)).toHaveCount(before + 1);
+/** Turns cloud use on (true) or off for office B, as the office B admin. Only ever called for office B. */
+export async function setOfficeBCloud(request: APIRequestContext, enabled: boolean): Promise<void> {
+  await apiLogin(request, USERS.adminB);
+  const me = await (await request.get("/api/auth/me")).json();
+  expect(me.user.email, "settings change must run as the office B admin").toBe(USERS.adminB);
+  const res = await request.put("/api/admin/settings", { data: { cloud_llm_enabled: enabled, acknowledge: enabled } });
+  expect(res.ok(), `office B cloud ${enabled}: ${res.status()}`).toBeTruthy();
+  await request.post("/api/auth/logout");
+}
+
+/** Uploads a fixture to office B (as its admin) unless a live copy exists, and waits until it is processed. */
+export async function ensureOfficeBDocument(request: APIRequestContext, file: string, title: string): Promise<string> {
+  await apiLogin(request, USERS.adminB);
+  const list = async () =>
+    ((await (await request.get(`/api/documents?q=${encodeURIComponent(title)}`)).json()) as {
+      documents: (DocSummary & { current_version: { status: string } | null })[];
+    }).documents.filter((d) => d.title === title && !d.deleted);
+  let docs = await list();
+  if (docs.length === 0) {
+    const fs = await import("node:fs");
+    const groups = (await (await request.get("/api/admin/groups")).json()) as { groups: { id: string }[] };
+    const res = await request.post("/api/documents", {
+      multipart: {
+        files: { name: path.basename(file), mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", buffer: fs.readFileSync(file) },
+        group_id: groups.groups[0].id,
+      },
+    });
+    expect(res.ok(), `upload ${title}: ${res.status()}`).toBeTruthy();
   }
-  throw new Error(`still asking for clarification after ${max} choices: ${asked.join(" | ")}`);
-}
-
-/** Reads the "תנאים:" line of a numeric answer card as label → value. */
-export async function conditionsOf(card: Locator): Promise<Record<string, string>> {
-  const line = card.locator("div", { has: card.page().locator("strong", { hasText: "תנאים:" }) }).last();
-  const text = (await line.innerText()).replace(/^\s*תנאים:\s*/, "");
-  const out: Record<string, string> = {};
-  for (const part of text.split(" · ")) {
-    const idx = part.indexOf(":");
-    if (idx > 0) out[part.slice(0, idx).trim()] = part.slice(idx + 1).trim();
-  }
-  return out;
+  await expect
+    .poll(async () => (await list())[0]?.current_version?.status ?? "none", { timeout: 900_000, intervals: [3000] })
+    .toMatch(/^(ready|needs_review)$/);
+  docs = await list();
+  await request.post("/api/auth/logout");
+  return docs[0].id;
 }
 
 /**

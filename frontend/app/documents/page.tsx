@@ -37,6 +37,68 @@ function incompletePages(v: Version): React.ReactNode {
   );
 }
 
+const MEASURE_STATE: Record<string, string> = {
+  done: "חולצו",
+  partial: "חולצו חלקית",
+  failed: "החילוץ נכשל",
+  pending: "בתהליך",
+};
+
+/** What was read: searchable passages and tables, pictures by status, measurements and structured records — each
+ * counted on its own, so zero structured records never reads as "nothing searchable". */
+function ReadingCell({ v }: { v: Version | null }) {
+  const r = v?.reading;
+  if (!v || !r || v.status === "pending" || v.status === "processing") return <span className="muted">—</span>;
+  const img = r.images;
+  const details = [
+    `${img.read ?? 0} נקראו`,
+    img.read_uncertain ? `${img.read_uncertain} בקריאה לא ודאית` : null,
+    img.unread ? `${img.unread} לא נקראו` : null,
+    img.no_text ? `${img.no_text} ללא טקסט (תצלומים, תשריטים)` : null,
+  ].filter(Boolean);
+  return (
+    <div className="small">
+      <div>
+        {r.partial ? (
+          <span className="badge badge-warn" title={r.unread.map((u) => `${u.media ?? ""}: ${u.reason ?? ""}`).join("\n")}>
+            נקרא חלקית
+          </span>
+        ) : (
+          <span className="badge badge-ok">נקרא במלואו</span>
+        )}
+      </div>
+      <div>
+        <B>{r.passages}</B> קטעים · <B>{r.tables}</B> טבלאות
+      </div>
+      {r.images_total > 0 && (
+        <div className="muted">
+          תמונות ({r.images_total}): {details.join(", ")}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DataCell({ v }: { v: Version | null }) {
+  const r = v?.reading;
+  if (!v || !r) return <span className="muted">—</span>;
+  return (
+    <div className="small">
+      <div>
+        נתונים כמותיים: <B>{r.measurements}</B>
+        {r.measurements_state && r.measurements_state !== "done" && (
+          <span className="muted"> ({MEASURE_STATE[r.measurements_state] ?? r.measurements_state})</span>
+        )}
+        {!r.measurements_state && <span className="muted"> (טרם חולצו)</span>}
+      </div>
+      <div className="muted">
+        רשומות עסקאות: <B>{v.records_total ?? 0}</B>
+        {v.records_needing_review ? ` (${v.records_needing_review} לבדיקה)` : ""}
+      </div>
+    </div>
+  );
+}
+
 function StatusCell({ v }: { v: Version | null }) {
   if (!v) return <span className="muted">—</span>;
   return (
@@ -139,8 +201,8 @@ function DocumentPanel({
                   <th scope="col">קובץ</th>
                   <th scope="col">סטטוס</th>
                   <th scope="col">עמודים</th>
-                  <th scope="col">רשומות</th>
-                  <th scope="col">לבדיקה</th>
+                  <th scope="col">קריאה</th>
+                  <th scope="col">נתונים</th>
                   <th scope="col">הועלה</th>
                   <th scope="col">עובד</th>
                 </tr>
@@ -161,14 +223,14 @@ function DocumentPanel({
                       <StatusCell v={v} />
                     </td>
                     <td>
-                      <B>{v.page_count ?? "—"}</B>
+                      {v.page_count != null ? <B>{v.page_count}</B> : <span className="small muted">DOCX (ללא עמודים)</span>}
                       {incompletePages(v)}
                     </td>
                     <td>
-                      <B>{v.records_total ?? "—"}</B>
+                      <ReadingCell v={v} />
                     </td>
                     <td>
-                      <B>{v.records_needing_review ?? "—"}</B>
+                      <DataCell v={v} />
                     </td>
                     <td>
                       <B>{formatTimestamp(v.created_at)}</B>
@@ -291,9 +353,8 @@ function DocumentsTab({
                 <th scope="col">קבוצה</th>
                 <th scope="col">סטטוס</th>
                 <th scope="col">גרסה</th>
-                <th scope="col">עמודים</th>
-                <th scope="col">רשומות</th>
-                <th scope="col">לבדיקה</th>
+                <th scope="col">קריאה</th>
+                <th scope="col">נתונים</th>
                 <th scope="col">נוצר</th>
               </tr>
             </thead>
@@ -322,13 +383,10 @@ function DocumentsTab({
                       )}
                     </td>
                     <td>
-                      <B>{v?.page_count ?? "—"}</B>
+                      <ReadingCell v={v} />
                     </td>
                     <td>
-                      <B>{v?.records_total ?? "—"}</B>
-                    </td>
-                    <td>
-                      <B>{v?.records_needing_review ?? "—"}</B>
+                      <DataCell v={v} />
                     </td>
                     <td>
                       <B>{formatTimestamp(d.created_at)}</B>

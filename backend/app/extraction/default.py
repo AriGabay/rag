@@ -12,7 +12,7 @@ MSG_UNSUPPORTED = "סוג הקובץ אינו נתמך. ניתן לעבד PDF א
 
 
 class DefaultExtractor:
-    def extract(self, data: bytes, mime_type: str, deadline: float) -> ExtractionResult:
+    def extract(self, data: bytes, mime_type: str, deadline: float, vision=None) -> ExtractionResult:
         settings = get_settings()
         if mime_type == PDF_MIME:
             from app.extraction.pdf import extract_pdf
@@ -21,5 +21,5 @@ class DefaultExtractor:
         if mime_type == DOCX_MIME:
             from app.extraction.docx import extract_docx
 
-            return extract_docx(data, deadline, settings)
+            return extract_docx(data, deadline, settings, vision)
         raise ExtractionError(MSG_UNSUPPORTED, True)

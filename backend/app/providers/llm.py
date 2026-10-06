@@ -72,6 +72,9 @@ class Purpose(StrEnum):
     ANSWER = "answer"
     VERIFY = "verify"
     TEST = "test"
+    VISION = "vision"  # reading a picture embedded in a document (ingestion)
+    AGENT = "agent"  # one step of the conversational answering loop (tools or the final answer)
+    MEASURE = "measure"  # measurements with their meaning, from one document's passages
 
 
 class CallStatus(StrEnum):
@@ -96,6 +99,22 @@ class StructuredResult:
     output_tokens: int | None = None
     latency_ms: int | None = None
     detail: str | None = None  # short machine reason (error class, code); never a message body or key
+
+    @property
+    def ok(self) -> bool:
+        return self.status == CallStatus.OK
+
+
+@dataclass
+class AgentStep:
+    status: CallStatus
+    output: list  # the response's output items, passed back as input on the next step
+    calls: list  # function_call items
+    final: dict | None  # the parsed final answer when the model called no tool
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    latency_ms: int | None = None
+    detail: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -291,16 +310,18 @@ class OpenAIProvider(BaseProvider):
         self.model = model
         self.reasoning_effort = reasoning_effort
 
-    def structured(self, purpose: Purpose, instructions: str, input: str, schema: type[BaseModel], *,
-                   max_output_tokens: int | None = None, deadline: float | None = None) -> StructuredResult:
+    def structured(self, purpose: Purpose, instructions: str, input: str | list, schema: type[BaseModel], *,
+                   max_output_tokens: int | None = None, deadline: float | None = None,
+                   reasoning_effort: str | None = None) -> StructuredResult:
         import openai
 
         kwargs: dict[str, Any] = {
             "model": self.model, "instructions": instructions, "input": input, "text_format": schema,
             "max_output_tokens": max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS, "store": False,
         }
-        if self.reasoning_effort:
-            kwargs["reasoning"] = {"effort": self.reasoning_effort}
+        effort = reasoning_effort or self.reasoning_effort
+        if effort:
+            kwargs["reasoning"] = {"effort": effort}
         started = time.perf_counter()
         options = client_options(purpose, deadline)
         if options is None:
@@ -329,6 +350,68 @@ class OpenAIProvider(BaseProvider):
         if parsed is None:
             return self._failed(purpose, CallStatus.INVALID, "schema", started, **tokens)
         return StructuredResult(CallStatus.OK, parsed, latency_ms=_elapsed_ms(started), **tokens)
+
+    def structured_image(self, purpose: Purpose, instructions: str, prompt: str, image_png: bytes,
+                         schema: type[BaseModel], *, max_output_tokens: int | None = None,
+                         reasoning_effort: str | None = None) -> StructuredResult:
+        """``structured`` with one picture (PNG) next to the text prompt, at high detail."""
+        import base64
+
+        content = [{"type": "input_text", "text": prompt},
+                   {"type": "input_image", "detail": "high",
+                    "image_url": "data:image/png;base64," + base64.b64encode(image_png).decode()}]
+        return self.structured(purpose, instructions, [{"role": "user", "content": content}], schema,
+                               max_output_tokens=max_output_tokens, reasoning_effort=reasoning_effort)
+
+    def agent_step(self, instructions: str, items: list, tools: list[dict], final_schema: dict, *,
+                   reasoning_effort: str | None = None, max_output_tokens: int = 6000,
+                   timeout: float | None = None) -> AgentStep:
+        """One step of a tool-using loop: the model either calls tools or returns the final JSON answer (strict
+        ``final_schema``). Responses are not stored; reasoning items come back encrypted so the next step can
+        carry them."""
+        import openai
+
+        effort = reasoning_effort if reasoning_effort is not None else self.reasoning_effort
+        kwargs: dict[str, Any] = {
+            "model": self.model, "instructions": instructions, "input": items, "tools": tools, "store": False,
+            "max_output_tokens": max_output_tokens, "parallel_tool_calls": True,
+            "text": {"format": {"type": "json_schema", "name": "final_answer", "schema": final_schema,
+                                "strict": True}},
+        }
+        if effort and effort != "none":
+            kwargs["reasoning"] = {"effort": effort}
+            kwargs["include"] = ["reasoning.encrypted_content"]
+        elif effort == "none":
+            kwargs["reasoning"] = {"effort": "none"}
+        started = time.perf_counter()
+        try:
+            resp = self.client.with_options(timeout=timeout or timeout_for(Purpose.AGENT)).responses.create(**kwargs)
+        except openai.OpenAIError as exc:
+            status = _openai_error_status(exc)
+            logger.warning("provider %s agent step failed: %s (%s)", self.name, status, type(exc).__name__)
+            return AgentStep(status, [], [], None, latency_ms=_elapsed_ms(started), detail=type(exc).__name__)
+        usage = getattr(resp, "usage", None)
+        step = AgentStep(CallStatus.OK, list(resp.output or []), [], None,
+                         input_tokens=getattr(usage, "input_tokens", None),
+                         output_tokens=getattr(usage, "output_tokens", None), latency_ms=_elapsed_ms(started))
+        reason = getattr(getattr(resp, "incomplete_details", None), "reason", None)
+        for item in step.output:
+            kind = getattr(item, "type", None)
+            if kind == "function_call":
+                step.calls.append(item)
+            elif kind == "message":
+                for part in getattr(item, "content", None) or []:
+                    if getattr(part, "type", None) == "refusal":
+                        step.status = CallStatus.REFUSAL
+        if step.status == CallStatus.OK and resp.status == "incomplete":
+            step.status = CallStatus.REFUSAL if reason == "content_filter" else CallStatus.INCOMPLETE
+            step.detail = reason
+        if step.status == CallStatus.OK and not step.calls:
+            try:
+                step.final = json.loads(resp.output_text or "")
+            except ValueError:
+                step.status, step.detail = CallStatus.INVALID, "json"
+        return step
 
     def parse_conditions(self, question: str, schema: dict) -> dict | None:
         """Legacy parse path: the conditions schema is not strict-mode compatible, so it is non-strict."""
