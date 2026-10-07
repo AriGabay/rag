@@ -249,27 +249,34 @@ def rescore(spec: dict, stored: list[dict]) -> list[Result]:
     return out
 
 
-# list prices of the configured model (USD per million tokens); cached input is billed at the cached rate.
-# Assumed for reporting only: the application has no budget logic.
-PRICE_INPUT, PRICE_CACHED, PRICE_OUTPUT = 0.75, 0.075, 4.50
+def call_cost(u: dict) -> float | None:
+    """One call's estimated cost: as priced when it was logged, else from the price table by the call's model
+    and token buckets; None when the model is unknown or unpriced (never counted as free)."""
+    if "cost_usd" in u:
+        return u["cost_usd"]
+    from app.providers.llm import usage_cost
+
+    return usage_cost(u.get("model"), **{k: u.get(k) for k in ("input_tokens", "cached_input_tokens",
+                                                                  "cache_write_tokens", "output_tokens")})
 
 
 def usage_summary(results: list[Result]) -> list[str]:
-    """Cost and latency per answered turn: model calls, input / cached / output tokens, price, seconds."""
+    """Cost and latency per turn (failed and cancelled turns included: their calls were billed): model calls,
+    token buckets with the cache shares, and the cost per purpose and model at the price of each call's model."""
     turns = [t for r in results if r.kind == "answers" for t in r.data.get("turns", []) if t.get("usage")]
     if not turns:
         return []
+    calls = [u for t in turns for u in t["usage"]]
 
-    def per(fn) -> list[float]:
-        return [fn(t) for t in turns]
+    def tok(us, key) -> int:
+        return sum(u.get(key) or 0 for u in us)
 
-    def tok(t, key) -> int:
-        return sum(u.get(key) or 0 for u in t["usage"])
+    def cost(us) -> float:
+        return sum(c for u in us if (c := call_cost(u)) is not None)
 
-    def cost(t) -> float:
-        cached = tok(t, "cached_input_tokens")
-        return ((tok(t, "input_tokens") - cached) * PRICE_INPUT + cached * PRICE_CACHED
-                + tok(t, "output_tokens") * PRICE_OUTPUT) / 1e6
+    def share(us, key) -> str:
+        total = tok(us, "input_tokens")
+        return f"{tok(us, key) / total:.0%}" if total else "—"
 
     def mean(xs) -> float:
         return sum(xs) / len(xs)
@@ -278,24 +285,34 @@ def usage_summary(results: list[Result]) -> list[str]:
         xs = sorted(xs)
         return xs[min(len(xs) - 1, int(q * len(xs)))]
 
-    calls = per(lambda t: len(t["usage"]))
     by_purpose: dict[str, int] = {}
-    for t in turns:
-        for u in t["usage"]:
-            by_purpose[u.get("purpose") or "-"] = by_purpose.get(u.get("purpose") or "-", 0) + 1
-    secs = per(lambda t: t["seconds"])
-    unknown_cache = sum(1 for t in turns for u in t["usage"] if u.get("cached_input_tokens") is None)
-    return ["## usage", "",
-            f"- תורות: {len(turns)}; קריאות למודל לתור: ממוצע {mean(calls):.2f} ("
-            + ", ".join(f"{k} {v / len(turns):.2f}" for k, v in sorted(by_purpose.items())) + ")",
-            f"- טוקני קלט לתור: ממוצע {mean(per(lambda t: tok(t, 'input_tokens'))):,.0f}; מתוכם מ-cache: "
-            f"{mean(per(lambda t: tok(t, 'cached_input_tokens'))):,.0f}"
-            + (f" (ב-{unknown_cache} קריאות הספק לא דיווח)" if unknown_cache else ""),
-            f"- טוקני פלט לתור: ממוצע {mean(per(lambda t: tok(t, 'output_tokens'))):,.0f}",
-            f"- עלות לתור (מחירון {PRICE_INPUT}/{PRICE_CACHED}/{PRICE_OUTPUT}$ למיליון): ממוצע "
-            f"{mean(per(cost)):.4f}$, סה\"כ {sum(per(cost)):.3f}$",
-            f"- זמן לתור: חציון {pct(secs, 0.5)} שנ׳, p90 {pct(secs, 0.9)} שנ׳, מקסימום {max(secs)} שנ׳",
-            f"- עלות לשיחה שעברה: {cost_per_pass(results, sum(per(cost)))}", ""]
+    for u in calls:
+        by_purpose[u.get("purpose") or "-"] = by_purpose.get(u.get("purpose") or "-", 0) + 1
+    secs = [t["seconds"] for t in turns]
+    unknown_cache = sum(1 for u in calls if u.get("cached_input_tokens") is None)
+    unpriced = sum(1 for u in calls if call_cost(u) is None)
+    total = cost(calls)
+    lines = ["## usage", "",
+             f"- תורות: {len(turns)}; קריאות למודל לתור: ממוצע {len(calls) / len(turns):.2f} ("
+             + ", ".join(f"{k} {v / len(turns):.2f}" for k, v in sorted(by_purpose.items())) + ")",
+             f"- טוקני קלט לתור: ממוצע {mean([tok(t['usage'], 'input_tokens') for t in turns]):,.0f}; מתוכם נקראו "
+             f"מ-cache {share(calls, 'cached_input_tokens')}, נכתבו ל-cache {share(calls, 'cache_write_tokens')}"
+             + (f" (ב-{unknown_cache} קריאות הספק לא דיווח)" if unknown_cache else ""),
+             f"- טוקני פלט לתור: ממוצע {mean([tok(t['usage'], 'output_tokens') for t in turns]):,.0f}",
+             f"- עלות לתור (לפי מחירון המודל של כל קריאה): ממוצע {total / len(turns):.4f}$, סה\"כ {total:.3f}$"
+             + (f" — בלי {unpriced} קריאות שעלותן לא ידועה (מודל לא מתומחר או ללא דיווח טוקנים)" if unpriced else ""),
+             f"- זמן לתור: חציון {pct(secs, 0.5)} שנ׳, p90 {pct(secs, 0.9)} שנ׳, מקסימום {max(secs)} שנ׳",
+             f"- עלות לשיחה שעברה: {cost_per_pass(results, total)}", "",
+             "| מטרה | מודל | קריאות | קלט | מ-cache | כתיבה ל-cache | פלט | עלות | עלות לתור |",
+             "|---|---|---|---|---|---|---|---|---|"]
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for u in calls:
+        groups.setdefault((u.get("purpose") or "-", u.get("model") or "לא ידוע"), []).append(u)
+    for (purpose, model), us in sorted(groups.items()):
+        lines.append(f"| {purpose} | {model} | {len(us)} | {tok(us, 'input_tokens'):,} | "
+                     f"{share(us, 'cached_input_tokens')} | {share(us, 'cache_write_tokens')} | "
+                     f"{tok(us, 'output_tokens'):,} | {cost(us):.4f}$ | {cost(us) / len(turns):.5f}$ |")
+    return lines + [""]
 
 
 def cost_per_pass(results: list[Result], total: float) -> str:

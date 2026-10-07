@@ -120,6 +120,74 @@ def test_openai_agent_step_records_cached_input_tokens():
     assert step.ok and step.cached_input_tokens == 2048 and step.input_tokens == 11
 
 
+def test_openai_cache_write_tokens_and_model_are_recorded_on_every_result():
+    body = _response(_text('{"text": "שלום"}'))
+    body["usage"]["input_tokens_details"] = {"cached_tokens": 3, "cache_write_tokens": 5}
+    provider, _ = openai_provider(httpx2.Response(200, json=body))
+    r = call(provider)
+    assert (r.cached_input_tokens, r.cache_write_tokens, r.model) == (3, 5, "gpt-5.4-mini")
+    step = openai_provider(httpx2.Response(200, json=body))[0].agent_step(
+        "הוראות", [{"role": "user", "content": "שלום"}], [], Echo.model_json_schema())
+    assert (step.cached_input_tokens, step.cache_write_tokens, step.model) == (3, 5, "gpt-5.4-mini")
+    # a failed call still names the model it was sent to; its token buckets stay unknown
+    failed = call(openai_provider(httpx2.Response(429, json=_error("rate_limit_exceeded", "requests")))[0])
+    assert failed.status == CallStatus.RATE_LIMITED and failed.model == "gpt-5.4-mini"
+    assert failed.cache_write_tokens is None
+
+
+# --- Cost ---------------------------------------------------------------------------------------------
+
+
+def test_cost_prices_each_token_bucket_at_its_own_rate():
+    # gpt-6-luna per 1M: input 0.10, cached 0.01, cache write 0.125, output 0.50; ordinary input is what is
+    # neither read from nor written to the cache
+    cost = llm.usage_cost("gpt-6-luna", input_tokens=1000, cached_input_tokens=400, cache_write_tokens=100,
+                          output_tokens=50)
+    assert cost == pytest.approx((500 * 0.10 + 400 * 0.01 + 100 * 0.125 + 50 * 0.50) / 1e6)
+    # gpt-5.4-mini has no cache-write surcharge: a write is billed as ordinary input
+    mini = llm.usage_cost("gpt-5.4-mini", input_tokens=1000, cached_input_tokens=400, cache_write_tokens=100,
+                          output_tokens=50)
+    assert mini == pytest.approx((600 * 0.75 + 400 * 0.075 + 50 * 4.50) / 1e6)
+
+
+def test_long_prompts_are_priced_higher_for_the_whole_request():
+    at = llm.usage_cost("gpt-6-luna", input_tokens=272_000, cached_input_tokens=0, cache_write_tokens=0,
+                        output_tokens=1000)
+    assert at == pytest.approx((272_000 * 0.10 + 1000 * 0.50) / 1e6)
+    over = llm.usage_cost("gpt-6-luna", input_tokens=300_000, cached_input_tokens=100_000, cache_write_tokens=10_000,
+                          output_tokens=1000)
+    assert over == pytest.approx((190_000 * 0.20 + 100_000 * 0.02 + 10_000 * 0.25 + 1000 * 0.75) / 1e6)
+
+
+def test_unknown_model_or_unreported_tokens_cost_unknown_never_zero():
+    assert llm.usage_cost("some-unpriced-model", input_tokens=10, cached_input_tokens=0, cache_write_tokens=0,
+                          output_tokens=10) is None
+    assert llm.usage_cost(None, input_tokens=10, cached_input_tokens=0, cache_write_tokens=0, output_tokens=10) is None
+    assert llm.usage_cost("gpt-6-luna", input_tokens=None, cached_input_tokens=None, cache_write_tokens=None,
+                          output_tokens=None) is None
+    # a dated snapshot of a priced model is priced as that model; unreported cache buckets price as ordinary input
+    assert llm.usage_cost("gpt-6-luna-2026-09-30", input_tokens=1000, cached_input_tokens=None,
+                          cache_write_tokens=None, output_tokens=0) == pytest.approx(1000 * 0.10 / 1e6)
+
+
+def test_usage_entry_carries_model_cache_buckets_and_cost():
+    r = StructuredResult(CallStatus.OK, None, input_tokens=1000, output_tokens=50, latency_ms=12,
+                         cached_input_tokens=400, cache_write_tokens=100, model="gpt-6-luna")
+    u = llm.usage_entry("verify", r)
+    assert set(u) == set(llm.USAGE_FIELDS)
+    assert (u["purpose"], u["model"], u["cache_write_tokens"]) == ("verify", "gpt-6-luna", 100)
+    assert u["cost_usd"] == pytest.approx(91.5e-6)
+    # a result without its own model is entered under the provider's model
+    assert llm.usage_entry("agent", StructuredResult(CallStatus.TIMEOUT), model="gpt-6-luna")["model"] == "gpt-6-luna"
+    assert llm.usage_entry("agent", StructuredResult(CallStatus.TIMEOUT))["cost_usd"] is None
+
+
+def test_price_table_can_be_set_from_the_environment(monkeypatch):
+    monkeypatch.setenv("LLM_PRICES", json.dumps({"house-model": {"input": 1, "cached_input": 0.5, "output": 2}}))
+    s = Settings()
+    assert s.llm_prices["house-model"].cache_write is None and "gpt-6-luna" not in s.llm_prices
+
+
 def test_openai_refusal_item_maps_to_refusal():
     provider, _ = openai_provider(httpx2.Response(200, json=_response([{"type": "refusal", "refusal": "לא"}])))
     r = call(provider)

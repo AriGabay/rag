@@ -184,10 +184,12 @@ FINAL_SCHEMA = FinalAnswer.model_json_schema()
 
 
 class TurnCancelled(Exception):
-    pass
+    usage: list[dict] = []  # the model calls made before the stop (set by ``run_turn``)
 
 
 class ProviderFailure(Exception):
+    usage: list[dict] = []  # the model calls made before the failure (set by ``run_turn``)
+
     def __init__(self, status: str, detail: str | None = None):
         super().__init__(status)
         self.status, self.detail = status, detail
@@ -269,13 +271,25 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None) -> 
 
 def run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput,
              progress: Callable[[str, str], None], cancelled: Callable[[], bool]) -> TurnOutcome:
-    """Run one turn to a verified answer. Raises ``TurnCancelled`` or ``ProviderFailure``."""
+    """Run one turn to a verified answer. Raises ``TurnCancelled`` or ``ProviderFailure``.
+
+    The turn's usage records travel with it: on the outcome, and on any exception it raises (``usage``), so the
+    calls made before a stop, a failure or a crash are still logged and billed."""
+    usage: list[dict] = []
+    try:
+        return _run_turn(ctx, provider, inp, progress, cancelled, usage)
+    except Exception as exc:
+        exc.usage = usage
+        raise
+
+
+def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progress: Callable[[str, str], None],
+              cancelled: Callable[[], bool], usage: list[dict]) -> TurnOutcome:
     settings = get_settings()
     if not hasattr(provider, "agent_step"):
         raise ProviderFailure("unsupported", "provider has no tool loop")
     deadline = time.monotonic() + settings.chat_turn_seconds
     ws = T.Workspace(ctx=ctx, prior=dict(inp.prior_refs))
-    usage: list[dict] = []
     steps = 0
     attempt = 0  # 0: first answer, 1: repaired with tools, 2: rewritten from verified content only
     rounds: list[list[dict]] = []
@@ -311,7 +325,7 @@ def run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput,
         step = provider.agent_step(POLICY, items, [] if last else T.TOOLS, FINAL_SCHEMA,
                                    reasoning_effort=settings.chat_reasoning_effort,
                                    timeout=max(15.0, min(left, settings.llm_timeout_agent_seconds)))
-        usage.append(usage_entry("agent", step))
+        usage.append(usage_entry("agent", step, provider.model))
         if cancelled():
             raise TurnCancelled  # the call that was in flight is discarded
         if not step.ok:

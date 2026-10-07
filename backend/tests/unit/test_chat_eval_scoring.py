@@ -179,3 +179,20 @@ def test_a_count_from_a_cited_listing_covers_the_documents_it_lists():
                          "note": "x", "tables": []}}
     assert check(answer, {"required_documents": ["הדקל 14", "התמר 3"]}) == []
     assert check(answer, {"required_documents": ["הנחל 8"]}) == ["אין ציטוט מהמסמך 'הנחל 8'"]
+
+
+def test_usage_report_prices_each_call_by_its_model_and_purpose_with_cache_buckets():
+    from eval.chat_eval import Result, usage_summary
+
+    luna = {"model": "gpt-6-luna", "input_tokens": 1000, "cached_input_tokens": 400, "cache_write_tokens": 100,
+            "output_tokens": 50}
+    turns = [{"seconds": 3.0, "usage": [
+        luna | {"purpose": "agent", "cost_usd": 0.5},  # priced at log time: taken as recorded
+        luna | {"purpose": "verify"},  # stored before costs were recorded: priced from its model and buckets
+        {"purpose": "resolve", "model": "unpriced-model", "input_tokens": 10, "output_tokens": 1, "cost_usd": None},
+    ]}, {"seconds": 5.0, "status": "failed", "usage": [luna | {"purpose": "agent", "cost_usd": 0.25}]}]
+    text = "\n".join(usage_summary([Result("answers", "A", True, [], {"turns": turns})]))
+    assert "| agent | gpt-6-luna | 2 | 2,000 | 40% | 10% | 100 | 0.7500$ |" in text
+    assert "| verify | gpt-6-luna | 1 | 1,000 | 40% | 10% | 50 | 0.0001$ |" in text  # 91.5e-6
+    assert "| resolve | unpriced-model | 1 |" in text and "בלי 1 קריאות שעלותן לא ידועה" in text
+    assert "סה\"כ 0.750$" in text and "0.37" in text  # mean per turn over both turns, the failed one included

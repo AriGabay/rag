@@ -3,11 +3,36 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import SecretStr, field_validator, model_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_LLM_PROVIDER = "openai"
 DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
+
+
+class ModelPrice(BaseModel):
+    """A model's list price in USD per million tokens, for estimating the cost of logged calls (KTD2).
+
+    ``cache_write`` None: writing to the prompt cache costs nothing beyond ordinary input. Above
+    ``long_context_threshold`` input tokens the whole request is billed at the multiplied rates."""
+
+    input: float
+    cached_input: float
+    cache_write: float | None = None
+    output: float
+    long_context_threshold: int | None = None
+    long_context_input_multiplier: float = 1.0  # applies to input, cached input and cache-write rates
+    long_context_output_multiplier: float = 1.0
+
+
+# Verified against the provider's published prices (2026-10-08). A model absent from the table is priced as
+# unknown, never as free. Override wholesale with LLM_PRICES (JSON: {model: {input, cached_input, ...}}).
+DEFAULT_LLM_PRICES = {
+    "gpt-6-luna": ModelPrice(input=0.10, cached_input=0.01, cache_write=0.125, output=0.50,
+                             long_context_threshold=272_000, long_context_input_multiplier=2.0,
+                             long_context_output_multiplier=1.5),
+    "gpt-5.4-mini": ModelPrice(input=0.75, cached_input=0.075, output=4.50),
+}
 
 
 class Settings(BaseSettings):
@@ -36,6 +61,8 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr = SecretStr("")
     openai_model: str = DEFAULT_OPENAI_MODEL
     openai_reasoning_effort: str = "none"  # empty means: send no reasoning setting
+    # Price table for the cost of logged model calls; no budget logic reads it.
+    llm_prices: dict[str, ModelPrice] = Field(default_factory=lambda: dict(DEFAULT_LLM_PRICES))
 
     # Per-purpose model call timeouts, all below the turn deadline.
     llm_timeout_interpret_seconds: float = 20

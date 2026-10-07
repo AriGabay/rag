@@ -500,9 +500,11 @@ def extract_version(ctx: TenantContext, version_id: UUID, provider: LLMProvider)
     done = 0
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         results = [r for rs in pool.map(lambda b: _call(provider, b), batches(passages)) for r in rs]
+    with tenant_tx(ctx) as conn:  # its own transaction: a run that fails below was still billed for its calls
+        for _, out, result in results:
+            log_usage(conn, provider, Purpose.MEASURE.value, result, out is not None)
     with tenant_tx(ctx) as conn:
         for batch, out, result in results:
-            log_usage(conn, provider, Purpose.MEASURE.value, result, out is not None)
             if out is None:
                 if result.status != CallStatus.INCOMPLETE or len(batch) == 1:
                     failed += 1  # a split batch is accounted for by its halves

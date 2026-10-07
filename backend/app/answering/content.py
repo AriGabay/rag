@@ -17,6 +17,7 @@ from app.providers.llm import (
     MockLLM,
     get_selected_provider,
     selected_provider_configured,
+    usage_cost,
 )
 from app.providers.status import Mode, ProviderState, office_provider_state
 
@@ -36,14 +37,31 @@ def select_provider(conn: Connection) -> tuple[LLMProvider | None, ProviderState
 
 def log_usage(conn: Connection, provider: LLMProvider, purpose: str, result, ok: bool,
               status: CallStatus | str | None = None) -> None:
-    """One ``provider_usage`` row; ``status`` defaults to the result's own call status when it has one."""
+    """One ``provider_usage`` row: the model that served the call (the provider's when the result does not name
+    one), its token buckets, latency and estimated cost; ``status`` defaults to the result's own call status."""
     status = status if status is not None else getattr(result, "status", None)
+    model = getattr(result, "model", None) or provider.model
+    tokens = {k: getattr(result, k, None)
+              for k in ("input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens")}
+    _insert(conn, provider.name, model, str(purpose), tokens, getattr(result, "latency_ms", None), ok,
+            str(status) if status is not None else None, usage_cost(model, **tokens))
+
+
+def log_usage_entries(conn: Connection, provider: LLMProvider, entries: Iterable[dict]) -> None:
+    """The ``provider_usage`` rows of a chat turn's calls, from their ``usage_entry`` records (priced at entry)."""
+    for u in entries:
+        tokens = {k: u.get(k) for k in ("input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens")}
+        _insert(conn, provider.name, u.get("model") or provider.model, u["purpose"], tokens, u.get("latency_ms"),
+                u.get("status") == CallStatus.OK.value, u.get("status"), u.get("cost_usd"))
+
+
+def _insert(conn: Connection, provider: str, model: str | None, purpose: str, tokens: dict, latency_ms: int | None,
+            ok: bool, status: str | None, cost: float | None) -> None:
     conn.execute(
-        text("INSERT INTO provider_usage (office_id, provider, model, purpose, input_tokens, output_tokens,"
-             " latency_ms, ok, status) VALUES (app_office(), :p, :m, :pu, :i, :o, :l, :ok, :s)"),
-        {"p": provider.name, "m": provider.model, "pu": str(purpose), "i": getattr(result, "input_tokens", None),
-         "o": getattr(result, "output_tokens", None), "l": getattr(result, "latency_ms", None), "ok": ok,
-         "s": str(status) if status is not None else None},
+        text("INSERT INTO provider_usage (office_id, provider, model, purpose, input_tokens, cached_input_tokens,"
+             " cache_write_tokens, output_tokens, latency_ms, ok, status, cost_usd) VALUES (app_office(), :p, :m,"
+             " :pu, :input_tokens, :cached_input_tokens, :cache_write_tokens, :output_tokens, :l, :ok, :s, :c)"),
+        {"p": provider, "m": model, "pu": purpose, **tokens, "l": latency_ms, "ok": ok, "s": status, "c": cost},
     )
 
 

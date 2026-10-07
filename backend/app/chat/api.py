@@ -621,10 +621,10 @@ def _limited_answer(ctx: TenantContext, question: str, reason: str) -> dict:
 
 
 def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, user_message_id: UUID) -> None:
-    from app.answering.content import log_usage
     from app.providers.llm import get_selected_provider
     from app.providers.status import Mode, office_provider_state
 
+    provider = outcome = None
     try:
         with tenant_tx(ctx) as conn:
             row = conn.execute(text("SELECT status, EXTRACT(EPOCH FROM (now() - updated_at)) AS age FROM messages"
@@ -650,21 +650,25 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
         provider = get_selected_provider()
         outcome = engine.run_turn(ctx, provider, inp, lambda step, label: _progress(ctx, message_id, step, label),
                                   lambda: _cancel_requested(ctx, message_id))
+        _log_turn_usage(ctx, provider, outcome.usage)
         payload = _answer_payload(outcome)
-        with tenant_tx(ctx) as conn:
-            for u in outcome.usage:
-                log_usage(conn, provider, u["purpose"], _U(u), u["status"] == "ok", u["status"])
         _finish(ctx, message_id, "done", content=outcome.answer.answer_markdown, answer=payload, usage=outcome.usage,
                 model=provider.model, diagnostics=_diagnostics(outcome, payload))
-    except engine.TurnCancelled:
-        _finish(ctx, message_id, "cancelled", error="העיבוד נעצר לבקשתך.")
+    # every exit logs the calls the turn made: a cancelled, failed or broken turn was still billed for them
+    except engine.TurnCancelled as e:
+        usage = _log_turn_usage(ctx, provider, getattr(e, "usage", None))
+        _finish(ctx, message_id, "cancelled", error="העיבוד נעצר לבקשתך.", usage=usage, model=getattr(provider, "model", None))
     except engine.ProviderFailure as e:
+        usage = _log_turn_usage(ctx, provider, getattr(e, "usage", None))
         text_ = FAILURE_TEXT.get(e.status, "אירעה תקלה בספק המודל.")
-        _finish(ctx, message_id, "failed", error=f"{text_} אפשר לנסות שוב.")
-    except Exception:  # noqa: BLE001 - the message must end in a state the user can act on
+        _finish(ctx, message_id, "failed", error=f"{text_} אפשר לנסות שוב.", usage=usage, model=getattr(provider, "model", None))
+    except Exception as e:  # noqa: BLE001 - the message must end in a state the user can act on
         logger.exception("chat turn failed")
+        # a break after the turn returned comes after its calls were logged: they are only kept on the message
+        usage = outcome.usage if outcome is not None else _log_turn_usage(ctx, provider, getattr(e, "usage", None))
         try:
-            _finish(ctx, message_id, "failed", error="אירעה תקלה בעיבוד התשובה. אפשר לנסות שוב.")
+            _finish(ctx, message_id, "failed", error="אירעה תקלה בעיבוד התשובה. אפשר לנסות שוב.", usage=usage,
+                    model=getattr(provider, "model", None))
         except Exception:  # noqa: BLE001
             logger.exception("could not record the failed turn")
     else:
@@ -675,10 +679,19 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
             logger.exception("conversation summary failed")
 
 
-class _U:
-    def __init__(self, u: dict):
-        self.input_tokens, self.output_tokens, self.latency_ms = u.get("input_tokens"), u.get("output_tokens"), \
-            u.get("latency_ms")
+def _log_turn_usage(ctx: TenantContext, provider, usage: list[dict] | None) -> list[dict]:
+    """Log a turn's model calls in ``provider_usage`` (in their own transaction, so the record survives however
+    the turn ends) and return them for the message. Logging never decides how the turn ends."""
+    from app.answering.content import log_usage_entries
+
+    usage = list(usage or [])
+    if usage and provider is not None:
+        try:
+            with tenant_tx(ctx) as conn:
+                log_usage_entries(conn, provider, usage)
+        except Exception:  # noqa: BLE001
+            logger.exception("could not log the turn's model usage")
+    return usage
 
 
 SUMMARY_POLICY = ("סכם בעברית, בנאמנות ובקצרה (עד 12 שורות), את השיחה עד כה בין משתמש לעוזר במשרד שמאות: על אילו "
@@ -731,7 +744,8 @@ def _maybe_summarize(ctx: TenantContext, conversation_id: UUID, message_id: UUID
             + "\n".join(f"{'משתמש' if r.role == 'user' else 'עוזר'}: {prompt_text((r.content or '')[:1500])}"
                         for r in rows))
     r = provider.structured(Purpose.AGENT, SUMMARY_POLICY, body, _Summary, max_output_tokens=1200)
-    usage = usage_entry("summary", r)
+    usage = usage_entry("summary", r, provider.model)
+    _log_turn_usage(ctx, provider, [usage])
     with tenant_tx(ctx) as conn:
         # the summary's cost belongs to the turn that triggered it
         conn.execute(text("UPDATE messages SET usage = COALESCE(usage, '[]'::jsonb) || CAST(:u AS jsonb)"

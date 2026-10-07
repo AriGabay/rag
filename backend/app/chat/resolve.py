@@ -449,7 +449,7 @@ def resolve(provider: LLMProvider, focus: dict | None, history: list, message: s
     kwargs = {"reasoning_effort": get_settings().resolve_reasoning_effort} if hasattr(provider, "agent_step") else {}
     r = call_structured(provider, Purpose.AGENT, POLICY, _input(focus, history, message, documents, candidates),
                         ResolvedRequest, max_output_tokens=1500, deadline=deadline, **kwargs)
-    usage.append(usage_entry("resolve", r))
+    usage.append(usage_entry("resolve", r, provider.model))
     if r.status != CallStatus.OK or r.parsed is None:
         return None
     return validate(r.parsed, focus, message, authorized, titles, lookup, candidates,

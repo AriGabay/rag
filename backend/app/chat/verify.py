@@ -626,7 +626,7 @@ def judge(provider: LLMProvider, batch: _Batch, rendered: str, usage: list[dict]
     kwargs = {"reasoning_effort": get_settings().judge_reasoning_effort} if hasattr(provider, "agent_step") else {}
     r = call_structured(provider, Purpose.VERIFY, JUDGE_POLICY, rendered, JudgeOutput, deadline=deadline,
                         max_output_tokens=6000, **kwargs)
-    usage.append(usage_entry("verify", r))
+    usage.append(usage_entry("verify", r, provider.model))
     if r.status != CallStatus.OK:
         return {}, r.status.value
     wanted = {u.index for u in batch.units}

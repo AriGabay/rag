@@ -81,8 +81,8 @@ def test_answer_from_searched_passage_is_cited_and_verified(client, office, monk
     assert labels[:2] == ["queued", "understand"] and "search" in labels and "verify" in labels
     # the cost of the turn: token counts per model call, nothing of the content
     assert [u["purpose"] for u in m["usage"]] == ["agent", "agent", "verify"]
-    assert set(m["usage"][0]) == {"purpose", "status", "input_tokens", "cached_input_tokens", "output_tokens",
-                                  "latency_ms"}
+    assert set(m["usage"][0]) == {"purpose", "model", "status", "input_tokens", "cached_input_tokens",
+                                  "cache_write_tokens", "output_tokens", "latency_ms", "cost_usd"}
     # the model saw the passage as data inside a source tag, and only office A's
     out = agent.tool_outputs(1)[0]
     assert '<source id="S1"' in out and "9,500" in out and "7,000" not in out

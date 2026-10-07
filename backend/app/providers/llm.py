@@ -100,6 +100,8 @@ class StructuredResult:
     latency_ms: int | None = None
     detail: str | None = None  # short machine reason (error class, code); never a message body or key
     cached_input_tokens: int | None = None  # input tokens served from the provider's prompt cache, when reported
+    cache_write_tokens: int | None = None  # input tokens written to the provider's prompt cache, when reported
+    model: str | None = None  # the model the call was sent to
 
     @property
     def ok(self) -> bool:
@@ -117,20 +119,49 @@ class AgentStep:
     latency_ms: int | None = None
     detail: str | None = None
     cached_input_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    model: str | None = None
 
     @property
     def ok(self) -> bool:
         return self.status == CallStatus.OK
 
 
-USAGE_FIELDS = ("purpose", "status", "input_tokens", "cached_input_tokens", "output_tokens", "latency_ms")
+USAGE_FIELDS = ("purpose", "model", "status", "input_tokens", "cached_input_tokens", "cache_write_tokens",
+                "output_tokens", "latency_ms", "cost_usd")
+_SNAPSHOT = re.compile(r"-\d{4}-\d{2}-\d{2}$")  # a dated snapshot of a model: gpt-6-luna-2026-09-30
 
 
-def usage_entry(purpose: str, result: StructuredResult | AgentStep) -> dict:
-    """One model call's cost record: token counts and latency, no content."""
-    return {"purpose": purpose, "status": result.status.value, "input_tokens": result.input_tokens,
-            "cached_input_tokens": result.cached_input_tokens, "output_tokens": result.output_tokens,
-            "latency_ms": result.latency_ms}
+def usage_cost(model: str | None, *, input_tokens: int | None, cached_input_tokens: int | None,
+               cache_write_tokens: int | None, output_tokens: int | None) -> float | None:
+    """Estimated USD cost of one call from the settings' price table (KTD2): ordinary input (neither read from nor
+    written to the prompt cache), cached input, cache writes and output, each at its own rate, and the whole
+    request at the long-context rates above the model's threshold. None (unknown, never zero) for a model the
+    table does not price or a call whose input or output count was not reported. A cache bucket the provider
+    did not report is counted as ordinary input."""
+    prices = get_settings().llm_prices
+    price = prices.get(model or "") or prices.get(_SNAPSHOT.sub("", model or ""))
+    if price is None or input_tokens is None or output_tokens is None:
+        return None
+    cached, written = cached_input_tokens or 0, cache_write_tokens or 0
+    ordinary = max(0, input_tokens - cached - written)
+    long = price.long_context_threshold is not None and input_tokens > price.long_context_threshold
+    m_in = price.long_context_input_multiplier if long else 1.0
+    m_out = price.long_context_output_multiplier if long else 1.0
+    write = price.cache_write if price.cache_write is not None else price.input
+    return (m_in * (ordinary * price.input + cached * price.cached_input + written * write)
+            + m_out * output_tokens * price.output) / 1e6
+
+
+def usage_entry(purpose: str, result: StructuredResult | AgentStep, model: str | None = None) -> dict:
+    """One model call's cost record: the model, token buckets, latency and estimated cost; no content. ``model``
+    names the provider's model for a result that does not carry its own."""
+    model = getattr(result, "model", None) or model
+    tokens = {k: getattr(result, k, None)
+              for k in ("input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens")}
+    cost = usage_cost(model, **tokens)
+    return {"purpose": purpose, "model": model, "status": CallStatus(result.status).value, **tokens,
+            "latency_ms": result.latency_ms, "cost_usd": round(cost, 8) if cost is not None else None}
 
 
 class ProviderCallError(RuntimeError):
@@ -345,8 +376,10 @@ class OpenAIProvider(BaseProvider):
         # The body is read first: a truncated or refused output must not be reported as merely invalid.
         body = raw.http_response.json()
         usage = body.get("usage") or {}
+        details = usage.get("input_tokens_details") or {}
         tokens = {"input_tokens": usage.get("input_tokens"), "output_tokens": usage.get("output_tokens"),
-                  "cached_input_tokens": (usage.get("input_tokens_details") or {}).get("cached_tokens")}
+                  "cached_input_tokens": details.get("cached_tokens"),
+                  "cache_write_tokens": details.get("cache_write_tokens")}
         reason = (body.get("incomplete_details") or {}).get("reason")
         if _refused(body.get("output") or []) or reason == "content_filter":
             return self._failed(purpose, CallStatus.REFUSAL, reason, started, **tokens)
@@ -362,7 +395,7 @@ class OpenAIProvider(BaseProvider):
             return self._failed(purpose, _openai_error_status(exc), type(exc).__name__, started, **tokens)
         if parsed is None:
             return self._failed(purpose, CallStatus.INVALID, "schema", started, **tokens)
-        return StructuredResult(CallStatus.OK, parsed, latency_ms=_elapsed_ms(started), **tokens)
+        return StructuredResult(CallStatus.OK, parsed, latency_ms=_elapsed_ms(started), model=self.model, **tokens)
 
     def structured_image(self, purpose: Purpose, instructions: str, prompt: str, image_png: bytes,
                          schema: type[BaseModel], *, max_output_tokens: int | None = None,
@@ -402,13 +435,15 @@ class OpenAIProvider(BaseProvider):
         except openai.OpenAIError as exc:
             status = _openai_error_status(exc)
             logger.warning("provider %s agent step failed: %s (%s)", self.name, status, type(exc).__name__)
-            return AgentStep(status, [], [], None, latency_ms=_elapsed_ms(started), detail=type(exc).__name__)
+            return AgentStep(status, [], [], None, latency_ms=_elapsed_ms(started), detail=type(exc).__name__,
+                             model=self.model)
         usage = getattr(resp, "usage", None)
+        details = getattr(usage, "input_tokens_details", None)
         step = AgentStep(CallStatus.OK, list(resp.output or []), [], None,
                          input_tokens=getattr(usage, "input_tokens", None),
                          output_tokens=getattr(usage, "output_tokens", None), latency_ms=_elapsed_ms(started),
-                         cached_input_tokens=getattr(getattr(usage, "input_tokens_details", None), "cached_tokens",
-                                                     None))
+                         cached_input_tokens=getattr(details, "cached_tokens", None),
+                         cache_write_tokens=getattr(details, "cache_write_tokens", None), model=self.model)
         reason = getattr(getattr(resp, "incomplete_details", None), "reason", None)
         for item in step.output:
             kind = getattr(item, "type", None)
@@ -441,7 +476,8 @@ class OpenAIProvider(BaseProvider):
     def _failed(self, purpose: Purpose, status: CallStatus, detail: str | None, started: float,
                 **tokens) -> StructuredResult:
         logger.warning("provider %s %s call failed: %s (%s)", self.name, purpose, status, detail)
-        return StructuredResult(status, None, latency_ms=_elapsed_ms(started), detail=detail, **tokens)
+        return StructuredResult(status, None, latency_ms=_elapsed_ms(started), detail=detail, model=self.model,
+                                **tokens)
 
 
 def _anthropic_error_status(exc: Exception) -> CallStatus:
@@ -485,17 +521,19 @@ class AnthropicLLM(BaseProvider):
         options = client_options(purpose, deadline)
         if options is None:
             logger.warning("provider %s %s call skipped: turn deadline reached", self.name, purpose)
-            return StructuredResult(CallStatus.TIMEOUT, latency_ms=_elapsed_ms(started), detail="deadline")
+            return StructuredResult(CallStatus.TIMEOUT, latency_ms=_elapsed_ms(started), detail="deadline",
+                                    model=self.model)
         try:
             resp = self._create(purpose, instructions, input, schema.model_json_schema(),
                                 max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS, options)
         except anthropic.AnthropicError as exc:
             status = _anthropic_error_status(exc)
             logger.warning("provider %s %s call failed: %s (%s)", self.name, purpose, status, type(exc).__name__)
-            return StructuredResult(status, latency_ms=_elapsed_ms(started), detail=type(exc).__name__)
+            return StructuredResult(status, latency_ms=_elapsed_ms(started), detail=type(exc).__name__,
+                                    model=self.model)
         tokens = {"input_tokens": getattr(resp.usage, "input_tokens", None),
                   "output_tokens": getattr(resp.usage, "output_tokens", None),
-                  "latency_ms": _elapsed_ms(started)}
+                  "latency_ms": _elapsed_ms(started), "model": self.model}
         if resp.stop_reason == "refusal":
             return StructuredResult(CallStatus.REFUSAL, detail=resp.stop_reason, **tokens)
         if resp.stop_reason == "max_tokens":
