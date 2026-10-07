@@ -23,3 +23,11 @@ Group visibility follows a document into everything derived from it, so a record
 The datum and documents a conversation is about after its last answer: what a follow-up such as "and the total?" or "I meant the value" refers to.
 
 The focus is context, not a filter. When the user names another property, unit or document, the focus documents are dropped and the newly named documents — found only among those the user may see — replace them; when nothing or several documents match, the user is asked which one, never answered from the focus.
+
+## Documents
+
+### Reading status
+
+What the system actually read of a document, kept per block and summarised per document: each heading, paragraph, table and picture or page region is read, read with uncertainty (OCR, a visual reading OCR could not confirm, or text repaired from a broken font map), without text, or unread with a reason.
+
+A document with any meaningful unread region is *partly read*. That state is shown on the documents screen and given to the assistant, and an answer never treats a partly read source, or a section it read only in part, as evidence that a datum is absent.
