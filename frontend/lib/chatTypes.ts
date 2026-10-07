@@ -68,10 +68,14 @@ export interface ChatClaim {
   basis: "explicit" | "inference" | "computed";
 }
 
+/** What verification did, in counts; what it removed, and why, is diagnostics (not on this path). */
 export interface ChatVerification {
   judged: boolean;
   judge_status: string | null;
-  problems: { text: string; reason: string; severity: "error" | "partial" }[];
+  removed: number;
+  partial: number;
+  annotated: number;
+  request_mismatch?: boolean;
 }
 
 export interface ChatCoverage {
@@ -87,19 +91,34 @@ export interface LedgerDocument {
   title: string | null;
 }
 
+/** How deep the turn reached into a document: listed, a passage retrieved, a section or table read, its datum
+ * verified in the answer. */
+export type LedgerLevel = "not_reached" | "located" | "retrieved" | "read" | "verified";
+
+/** A table the answer cites: its rows, and how many of them the answer presents a value of. */
+export interface LedgerTable {
+  title: string;
+  location: string;
+  rows: number;
+  presented: number;
+}
+
 /** What the answer covered, computed by the server from what the turn's tools did. */
 export interface ChatLedger {
   scope_kind: "focused" | "set";
   scope_query: string;
   cited: LedgerDocument[];
   matching?: LedgerDocument[];
-  checked?: LedgerDocument[];
+  levels?: Record<string, LedgerLevel>;
+  read?: LedgerDocument[];
+  retrieved_only?: LedgerDocument[];
   with_data?: LedgerDocument[];
   not_checked?: LedgerDocument[];
   unused?: LedgerDocument[];
   partially_read?: LedgerDocument[];
   omitted?: (LedgerDocument & { what: string; why: string })[];
   also_matching?: LedgerDocument[];
+  tables?: LedgerTable[];
   complete: boolean;
   note?: string;
 }
@@ -119,6 +138,12 @@ export interface ChatAnswer {
   searches: string[];
   coverage: ChatCoverage[];
   ledger?: ChatLedger | null;
+  /** Each datum the question asked for, with the status the turn's actions support. */
+  requested?: {
+    label: string;
+    status: "found" | "not_found_search" | "source_partial" | "section_checked_absent";
+    section: string | null;
+  }[];
   steps?: number;
   hidden?: boolean;
 }

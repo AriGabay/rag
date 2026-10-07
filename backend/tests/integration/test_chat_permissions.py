@@ -9,6 +9,8 @@ text below is unique to the revoked document, so its absence is checked literall
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from sqlalchemy import text
 
@@ -262,3 +264,107 @@ def test_a_failing_summary_never_turns_a_finished_answer_into_a_failure(client, 
     cid, agent = _conversation(client, setup, monkeypatch, 2)
     rows = client.get(f"/api/chat/conversations/{cid}/messages").json()["messages"]
     assert [r["status"] for r in rows if r["role"] == "assistant"] == ["done", "done"]
+
+
+# --- diagnostics: what verification removed is not on the normal path (AE8) ----------------------------------
+
+def _removed_claim_turn(client, office, monkeypatch) -> str:
+    wrong = final("השווי למ\"ר בנוי הוא 9,500 ₪ [S1]. דמי הניהול הם 41 ₪ למ\"ר [S1].", documents=[office.public])
+    agent = _agent([[call("search", query="שווי", document_ids=[office.public], limit=None)], wrong, wrong, wrong])
+    cloud(monkeypatch, office, agent)
+    login(client, "emp@example.test")
+    m = send(client, new_conversation(client), "מה השווי?")
+    assert m["status"] == "done", m
+    return m["id"]
+
+
+def test_removed_claims_reach_the_owner_and_an_admin_only_through_diagnostics(client, setup, monkeypatch):
+    mid = _removed_claim_turn(client, setup, monkeypatch)
+    m = client.get(f"/api/chat/messages/{mid}").json()
+    v = m["answer"]["verification"]
+    assert v["removed"] == 1 and "problems" not in v and "rounds" not in v
+    assert "דמי הניהול הם 41" not in json.dumps(m["answer"], ensure_ascii=False)
+    d = client.get(f"/api/chat/messages/{mid}/diagnostics")
+    assert d.status_code == 200 and any("41" in p["reason"] for p in d.json()["removed"]) and d.json()["rounds"]
+    # another employee of the office: not theirs
+    make_user(setup, "emp2@example.test", [setup.g2])
+    login(client, "emp2@example.test")
+    assert client.get(f"/api/chat/messages/{mid}/diagnostics").status_code == 404
+    # the office admin reads it, and the read is audited
+    login(client, "admin-a@example.test")
+    assert client.get(f"/api/chat/messages/{mid}/diagnostics").status_code == 200
+    with tenant_tx(setup.system) as conn:
+        assert conn.execute(text("SELECT count(*) FROM audit_events WHERE action = 'chat.diagnostics.read'"
+                                 " AND target_id = :m"), {"m": mid}).scalar_one() == 1
+
+
+def test_an_admin_of_another_office_never_reads_diagnostics(client, db, setup, monkeypatch):
+    mid = _removed_claim_turn(client, setup, monkeypatch)
+    make_office(db, "משרד ב", "admin-b@example.test")
+    login(client, "admin-b@example.test")
+    assert client.get(f"/api/chat/messages/{mid}/diagnostics").status_code == 404
+
+
+def test_diagnostics_are_hidden_once_a_document_behind_them_is_revoked(client, setup, monkeypatch):
+    mid = _removed_claim_turn(client, setup, monkeypatch)
+    _revoke(setup, setup.public)
+    login(client, "emp@example.test")
+    assert client.get(f"/api/chat/messages/{mid}/diagnostics").status_code == 404
+
+
+def test_an_answer_stored_in_the_old_shape_shows_counts_only(client, setup, monkeypatch):
+    mid = _removed_claim_turn(client, setup, monkeypatch)
+    old = {"judged": True, "judge_status": "ok", "rounds": [[{"text": "x", "reason": "סוד 41"}]],
+           "problems": [{"text": "דמי הניהול הם 41", "reason": "סוד 41", "severity": "error"}]}
+    with tenant_tx(setup.system) as conn:
+        conn.execute(text("UPDATE messages SET answer = jsonb_set(answer, '{verification}', CAST(:v AS jsonb))"
+                          " WHERE id = :m"), {"v": json.dumps(old, ensure_ascii=False), "m": mid})
+    login(client, "emp@example.test")
+    v = client.get(f"/api/chat/messages/{mid}").json()["answer"]["verification"]
+    assert v["removed"] == 1 and "problems" not in v and "rounds" not in v
+
+
+def test_a_rewritten_summary_with_its_old_record_is_not_used(client, setup, monkeypatch):
+    cid, agent = _conversation(client, setup, monkeypatch, 4)
+    # other code rewrites the text but leaves the record: the record no longer describes it
+    with tenant_tx(setup.system) as conn:
+        conn.execute(text("UPDATE conversations SET summary = :s WHERE id = :c"), {"s": "סיכום שנכתב מחדש", "c": cid})
+    m, seen = _follow_up(client, setup, agent, cid)
+    assert "סיכום שנכתב מחדש" not in seen
+
+
+def test_a_summary_record_of_another_message_count_is_not_used(client, setup, monkeypatch):
+    cid, agent = _conversation(client, setup, monkeypatch, 4)
+    with tenant_tx(setup.system) as conn:
+        conn.execute(text("UPDATE conversations SET summary_message_count = summary_message_count + 1 WHERE id = :c"),
+                     {"c": cid})
+    m, seen = _follow_up(client, setup, agent, cid)
+    assert "סיכום השיחה עד כה" not in seen
+
+
+# --- stopping ---------------------------------------------------------------------------------------------
+
+def test_a_stop_before_the_turn_starts_ends_it_cancelled(client, setup, monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_run_inline", False)
+    started: list = []
+    monkeypatch.setattr(chat_api, "_start", lambda *a: started.append(a))  # the worker has not picked it up yet
+    cloud(monkeypatch, setup, _agent([]))
+    login(client, "emp@example.test")
+    r = client.post(f"/api/chat/conversations/{new_conversation(client)}/messages", json={"content": "מה השווי?"})
+    mid = r.json()["assistant"]["id"]
+    assert client.post(f"/api/chat/messages/{mid}/cancel").json()["status"] == "cancelling"
+    chat_api.run_message(*started[0])  # now the worker runs it
+    m = client.get(f"/api/chat/messages/{mid}").json()
+    assert m["status"] == "cancelled" and m["answer"] is None
+
+
+def test_a_stop_after_the_answer_finished_leaves_it_done(client, setup, monkeypatch):
+    agent = _agent(_public_turn(setup.public))
+    cloud(monkeypatch, setup, agent)
+    login(client, "emp@example.test")
+    m = send(client, new_conversation(client), "מה השווי?")
+    assert m["status"] == "done"
+    after = client.post(f"/api/chat/messages/{m['id']}/cancel").json()
+    assert after["status"] == "done" and "9,500" in after["answer"]["markdown"]

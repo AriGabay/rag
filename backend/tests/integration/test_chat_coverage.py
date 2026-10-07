@@ -97,14 +97,32 @@ def test_a_matching_document_that_came_up_in_search_but_was_not_used_is_named(cl
     assert a["status"] == "partial" and "לא נמצא בהם נתון שנכלל בתשובה" in a["markdown"]
 
 
-def test_a_set_answer_using_every_matching_document_has_no_note(client, setup, monkeypatch):
+def test_a_set_answer_from_retrieved_passages_covers_the_documents_but_says_they_were_not_read(client, setup,
+                                                                                               monkeypatch):
+    # AE7: a passage from every matching document, none opened: document coverage full, section reading none
     a, _ = _ask(client, setup, monkeypatch, [
         [call("find_documents", query=PLACE, page=None)],
         [call("search", query="שווי", document_ids=[setup.d1], limit=None),
          call("search", query="שווי", document_ids=[setup.d2], limit=None)],
-        lambda items: final(f"בהגפן 9,500 ₪ [{_source_of(items, setup.d1)}] ובהזית 11,000 ₪ "
+        lambda items: final(f"בהגפן 9,500 ₪ למ\"ר בנוי [{_source_of(items, setup.d1)}] ובהזית 11,000 ₪ למ\"ר בנוי "
                             f"[{_source_of(items, setup.d2)}].", scope="set", scope_query=PLACE)])
-    assert a["ledger"]["complete"] is True and a["status"] == "answered" and "כיסוי" not in a["markdown"]
+    led = a["ledger"]
+    assert led["complete"] is True and a["status"] == "answered"
+    assert len(led["with_data"]) == 2 and led["read"] == [] and len(led["retrieved_only"]) == 2
+    assert set(led["levels"].values()) == {"verified"}
+    assert "נקראו (סעיף/טבלה) 0 · נשלפו קטעים בלבד מ-2 · נתון מאומת מ-2" in a["markdown"]
+    assert "ייתכנו בהם נתונים נוספים" in a["markdown"]
+
+
+def test_a_document_only_located_is_not_checked(client, setup, monkeypatch):
+    a, _ = _ask(client, setup, monkeypatch, [
+        [call("find_documents", query=PLACE, page=None)],
+        [call("search", query="שווי", document_ids=[setup.d1], limit=None)],
+        lambda items: final(f"בהגפן 9,500 ₪ למ\"ר בנוי [{_source_of(items, setup.d1)}].", scope="set",
+                            scope_query=PLACE)])
+    led = a["ledger"]
+    assert led["levels"][setup.d2] == "located" and _titles(led["not_checked"]) == {f"שומה הזית 7 {PLACE}"}
+    assert led["complete"] is False and a["status"] == "partial"
 
 
 def test_an_omission_the_answer_explains_is_not_flagged(client, setup, monkeypatch):
@@ -127,7 +145,7 @@ def test_listing_all_documents_after_find_documents_keeps_the_set(client, setup,
         [call("list_documents", query=None, page=None)],
         [call("search", query="שווי", document_ids=[setup.d1], limit=None),
          call("search", query="שווי", document_ids=[setup.d2], limit=None)],
-        lambda items: final(f"בהגפן 9,500 ₪ [{_source_of(items, setup.d1)}] ובהזית 11,000 ₪ "
+        lambda items: final(f"בהגפן 9,500 ₪ למ\"ר בנוי [{_source_of(items, setup.d1)}] ובהזית 11,000 ₪ למ\"ר בנוי "
                             f"[{_source_of(items, setup.d2)}].", scope="set", scope_query=PLACE)])
     assert a["ledger"]["scope_query"] == PLACE and a["ledger"]["complete"] is True
     assert len(a["ledger"]["matching"]) == 2
@@ -293,3 +311,117 @@ def test_open_table_states_its_size(setup):
     sid = re.search(r'<source id="(S\d+)"', out).group(1)
     table = T.tool_open_source(ws, sid, "table")
     assert "הטבלה: 9 שורות; ערכים מספריים לפי עמודה:" in table and "שכ\"ד למ\"ר 9" in table
+
+
+# --- reading levels and the dedup key ----------------------------------------------------------------------------
+
+def _long_section(office) -> tuple[str, object]:
+    doc, ver = make_document(office, office.default_group_id, "שומה רחוב השיטה 5", sha="s" * 64)
+    with tenant_tx(office.system) as conn:
+        for i in range(7):
+            conn.execute(text(
+                "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
+                " section_path, paragraph_no, text) VALUES (app_office(), :d, :v, :b, 'paragraph', 'תיאור הנכס',"
+                " ARRAY['תיאור הנכס'], :p, :t)"),
+                {"d": doc, "v": ver, "b": i + 2, "p": i + 1, "t": f"פסקה {i + 1}: " + "תיאור מפורט של המבנה. " * 40})
+    return str(doc), ver
+
+
+def test_a_section_opened_after_the_paragraphs_around_the_same_place_is_sent_in_full(setup):
+    doc, ver = _long_section(setup)
+    ws = T.Workspace(ctx=setup.ctx())
+    ws.add_source(document_id=doc, version_id=ver, title="שומה רחוב השיטה 5", section="תיאור הנכס",
+                  location="סעיף", kind="text", text="פסקה 4", block_start=5, block_end=5)
+    near = T.tool_open_source(ws, "S1", "neighbors")
+    assert "קוצר" in near and ws.activity[doc]["read"] is False
+    section = T.tool_open_source(ws, "S1", "section")
+    assert "same_as" not in section and "פסקה 7" in section and "קוצר" not in section
+    a = ws.activity[doc]
+    assert a["read"] is True and a["openings"] == [{"sid": "S3", "scope": "section", "name": "תיאור הנכס"}]
+    # the same section opened again is a reference to the first
+    assert 'same_as="S3"' in T.tool_open_source(ws, "S1", "section")
+
+
+def test_a_table_answer_states_the_rows_it_presented(client, setup, monkeypatch):
+    doc = _rent_table(setup)
+
+    def answer(items):  # cites the opened table, not the row hits that led to it
+        outputs = [i["output"] for i in items if isinstance(i, dict) and i.get("type") == "function_call_output"]
+        sid = re.search(r'<source id="(S\d+)"[^>]*kind="table"', outputs[-1]).group(1)
+        return final(f"ברחוב הדגמה 3 שכ\"ד למ\"ר 53 ₪, וברחוב הדגמה 4 שכ\"ד למ\"ר 54 ₪ [{sid}].",
+                     documents=[doc], scope="set", scope_query="סקר היצע משרדים")
+
+    a, _ = _ask(client, setup, monkeypatch, [
+        [call("find_documents", query="סקר היצע משרדים", page=None)],
+        [call("search", query="רחוב הדגמה 4", document_ids=[doc], limit=None)],
+        lambda items: [call("open_source", source_id=_source_of(items, doc), scope="table")],
+        answer], question="מה שכר הדירה בסקר ההיצע?")
+    (table,) = a["ledger"]["tables"]
+    assert table["rows"] == 9 and table["presented"] == 2
+    assert "הוצגו ערכים מ-2 מתוך 9 שורות" in a["markdown"]
+
+
+# --- explicit absence (AE6) ---------------------------------------------------------------------------------
+
+def _described_property(office) -> str:
+    doc, ver = make_document(office, office.default_group_id, "שומה רחוב האשל 9", sha="e" * 64)
+    blocks = ["תיאור הנכס", "המבנה בן שתי קומות מעל קרקע, בנוי בבנייה קשיחה.",
+              "השטח הבנוי של המבנה הוא 184 מ\"ר.", "לנכס חצר מגוננת וחניה מקורה."]
+    with tenant_tx(office.system) as conn:
+        for i, t in enumerate(blocks):
+            conn.execute(text(
+                "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
+                " section_path, paragraph_no, text) VALUES (app_office(), :d, :v, :b, :k, 'תיאור הנכס',"
+                " ARRAY['תיאור הנכס'], :p, :t)"),
+                {"d": doc, "v": ver, "b": i, "k": "heading" if i == 0 else "paragraph", "p": i or None, "t": t})
+        conn.execute(text("INSERT INTO chunks (office_id, document_id, version_id, chunk_index, kind, page_list, text,"
+                          " normalized_text, section, block_start, block_end) VALUES (app_office(), :d, :v, 0, 'text',"
+                          " :p, :t, :t, 'תיאור הנכס', 2, 2)"), {"d": doc, "v": ver, "p": [1], "t": blocks[2]})
+    pipeline.embed_stage(office.system, pipeline.VersionInfo(ver, doc, "k", "application/pdf", None), 1e18)
+    return str(doc)
+
+
+def test_a_missing_datum_is_said_first_with_the_section_that_was_checked(client, setup, monkeypatch):
+    doc = _described_property(setup)
+    a, _ = _ask(client, setup, monkeypatch, [
+        [call("search", query="שטח המגרש", document_ids=[doc], limit=None)],
+        [call("open_source", source_id="S1", scope="section")],
+        final("השטח הבנוי (נתון אחר) הוא 184 מ\"ר [S2].", documents=[doc],
+              requested=[{"label": "שטח המגרש", "document_ids": [doc], "status": "section_checked_absent",
+                          "checked_where": "S2"}])], question="מה שטח המגרש באשל 9?")
+    assert a["markdown"].startswith("**שטח המגרש** לא מופיע בסעיף \"תיאור הנכס\" שנבדק [S2].")
+    assert "(נתון אחר)" in a["markdown"] and a["status"] == "partial"
+    (r,) = a["requested"]
+    assert r["status"] == "section_checked_absent" and r["section"] == "תיאור הנכס"
+
+
+def test_a_section_claim_after_a_search_only_says_not_found_in_search(client, setup, monkeypatch):
+    doc = _described_property(setup)
+    a, _ = _ask(client, setup, monkeypatch, [
+        [call("search", query="שטח המגרש", document_ids=[doc], limit=None)],
+        final("השטח הבנוי (נתון אחר) הוא 184 מ\"ר [S1].", documents=[doc],
+              requested=[{"label": "שטח המגרש", "document_ids": [doc], "status": "section_checked_absent",
+                          "checked_where": "S1"}])], question="מה שטח המגרש באשל 9?")
+    assert a["markdown"].startswith("**שטח המגרש** לא נמצא בחיפוש במסמכים שנבדקו.")
+    assert a["requested"][0]["status"] == "not_found_search"
+
+
+def test_a_not_found_sentence_is_added_after_verification_and_survives_a_strict_judge(client, setup, monkeypatch):
+    doc = _described_property(setup)
+
+    def judge(input: str) -> dict:  # a judge that rejects everything without sources
+        out = []
+        for m in re.finditer(r'<unit index="(\d+)" cites="([^"]*)">', input):
+            out.append({"index": int(m.group(1)), "verdict": "supported" if m.group(2) else "unsupported",
+                        "reason": "בדיקה"})
+        return {"verdicts": out}
+
+    agent = ScriptedAgent([[call("search", query="שטח המגרש", document_ids=[doc], limit=None)],
+                           final("השטח הבנוי (נתון אחר) הוא 184 מ\"ר [S1].", documents=[doc],
+                                 requested=[{"label": "שטח המגרש", "document_ids": [doc],
+                                             "status": "not_found_search", "checked_where": ""}])], judge=judge)
+    cloud(monkeypatch, setup, agent)
+    login(client, "admin-a@example.test")
+    a = send(client, new_conversation(client), "מה שטח המגרש באשל 9?")["answer"]
+    assert a["markdown"].startswith("**שטח המגרש** לא נמצא בחיפוש במסמכים שנבדקו.")
+    assert a["verification"]["removed"] == 0

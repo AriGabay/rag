@@ -10,7 +10,9 @@ applies_when:
   - "Comparing quality, cost or latency of the conversational engine before and after a change on the same eval cases"
   - "The Docker backend cannot reach the model provider while the host can"
   - "Re-grading stored eval answers with new structured expectations"
-tags: [evaluation, real-model, before-after, git-worktree, docker-networking, openai, chat-eval, rescore]
+  - "Running a held-out set while the code under evaluation is still changing"
+tags: [evaluation, real-model, before-after, git-worktree, docker-networking, openai, chat-eval, rescore, held-out]
+last_updated: 2026-10-07
 ---
 
 # Measuring a chat change before and after against the real model on the local stack
@@ -46,6 +48,10 @@ and after a change cannot separate a regression from noise. In this round (PR #2
   (`cached_input_tokens` in `backend/app/providers/llm.py`), and the worktree was cut from that commit.
 
 **2. When Docker cannot reach the provider, run the backend and worker on the host.**
+- First run `scripts/check-model-egress.sh`, which checks DNS, TCP, TLS, proxy and HTTPS from inside both containers;
+  see `docs/operations/local-model-egress.md`. In the next round the containers reached the provider again after
+  they were recreated, with a host packet-tunnel VPN disconnected. Use the host runtime only when the check fails
+  and the cause cannot be removed.
 - **Symptom.** Turns failed with `provider openai agent step failed: error (APIConnectionError)` after long waits.
   From inside the containers, TCP to the `api.openai.com` addresses timed out, while other hosts behind the same
   CDN and the host itself connected. No code change fixes this; it is the Docker VM's route.
@@ -73,10 +79,26 @@ and after a change cannot separate a regression from noise. In this round (PR #2
   latency).
 - Use `--rescore <results.json>` to grade stored answers with new expectations. It makes no model calls, so two
   runs can be compared on identical answers.
-- When a claim disappears from an answer, read `answer.verification.rounds`: it holds what each verification round
-  removed or repaired, and why.
+- When a claim disappears from an answer, read its diagnostics. `GET /api/chat/messages/{id}/diagnostics` returns,
+  to the message's owner or an office admin, what each verification round removed or repaired, and why.
+  `chat_eval` stores them with each turn under `diagnostics`; the answer itself carries counts only.
 - To trace one question end to end, run `engine.run_turn` in-process with the real provider and wrap
   `verify.verify_answer` to print each round.
+
+**4. A held-out set runs once, on the build that will ship.**
+- Write the set, with its references, before any run of the round. A set whose results guided a fix is a regression
+  set from then on.
+- If the code changes after a held-out run has started (here: review fixes that changed how the meaning check
+  attaches qualifiers), stop the run and discard its output unread. Then rebuild the Docker services and run the set
+  once on the final build.
+  - Results from the earlier build are not "the held-out score". They describe code that will not ship.
+  - Reading them before the rerun would turn the set into a development set.
+- Run the regression sets twice on that same build too, so all the numbers in the report describe one build. Earlier
+  runs may be reported, labelled with their build, as an intermediate data point.
+- When manual review shows a reference answer was wrong, do not edit it silently. Keep the original under
+  `reference_corrected: {date, evidence, was}` beside the corrected `expect`. `chat_eval` (live and `--rescore`) then
+  reports the score against the original reference and the score after corrections separately, and lists each
+  correction with its evidence.
 
 ## Why This Matters
 

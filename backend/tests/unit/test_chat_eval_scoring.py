@@ -86,3 +86,67 @@ def test_positive_control_passes_everything():
               "attribution": [{"value": "11000", "document": DOC_B}],
               "coverage": {"expect_complete": True}}
     assert check(a, expect) == []
+
+
+# --- absence and reference corrections ---------------------------------------------------------------------
+
+ABSENT = {"absence": {"near_values": ["184"]}}
+
+
+def test_absence_said_first_with_the_near_datum_labelled_passes():
+    md = "**שטח המגרש** לא מופיע בסעיף \"תיאור הנכס\" שנבדק [S1].\n\nהשטח הבנוי (נתון אחר) הוא 184 מ\"ר [S1]."
+    assert check(_answer(md), ABSENT) == []
+
+
+def test_a_near_datum_given_as_the_answer_fails():
+    md = "שטח המגרש הוא 184 מ\"ר [S1]."
+    problems = check(_answer(md), ABSENT)
+    assert any("אינה פותחת" in p for p in problems) and any("184" in p for p in problems)
+
+
+def test_absence_said_only_at_the_end_fails():
+    md = "השטח הבנוי הוא 184 מ\"ר (נתון אחר) [S1].\nשטח המגרש לא מופיע במסמך [S1]."
+    assert any("אינה פותחת" in p for p in check(_answer(md), ABSENT))
+
+
+def test_a_corrected_reference_is_graded_both_ways():
+    from eval.chat_eval import original_grade, rescore
+
+    turn = {"ask": "באיזו שנה נבנה הבניין?", "expect": {"must": ["2016"]},
+            "reference_corrected": {"date": "2026-10-07", "evidence": "שורת ההשוואה באותה חלקה",
+                                    "was": {"must": ["לא נמצא"]}}}
+    m = {"status": "done", "answer": {"markdown": "הבניין נבנה בשנת 2016 [S1].", "status": "answered", "sources": []}}
+    assert original_grade(m, turn, {}) is False
+    stored = [{"kind": "answers", "id": "X1", "ok": False, "detail": [],
+               "data": {"turns": [{"ask": turn["ask"], "status": "done", "markdown": m["answer"]["markdown"],
+                                   "answer": m["answer"]}]}}]
+    (r,) = rescore({"answers": [{"id": "X1", "turns": [turn]}]}, stored)
+    assert r.ok and r.data["turns"][0]["passed_original_reference"] is False
+    assert r.data["corrections"] == [{"turn": 1, "date": "2026-10-07", "evidence": "שורת ההשוואה באותה חלקה"}]
+
+
+# --- data coverage and the report numbers ---------------------------------------------------------------------
+
+def test_a_complete_ledger_from_retrieved_passages_may_carry_its_note():
+    note = "השווי 9,500 ₪ [S1].\n\n> **כיסוי:** נמצא נתון מאומת בכל המסמכים."
+    ledger = {"scope_kind": "set", "complete": True, "retrieved_only": [{"document_id": "d", "title": "t"}]}
+    assert check(_answer(note, ledger=ledger), {}) == []
+    assert any("מסויגת" in p for p in check(_answer(note, ledger=ledger | {"retrieved_only": []}), {}))
+
+
+def test_expect_all_rows_fails_a_partly_presented_table():
+    ledger = {"scope_kind": "focused", "complete": True, "tables": [{"title": "סקר", "rows": 9, "presented": 2}]}
+    expect = {"coverage": {"expect_all_rows": True}}
+    assert any("2 מתוך 9" in p for p in check(_answer("שכ\"ד 55 ₪ [S1].", ledger=ledger), expect))
+    full = ledger | {"tables": [{"title": "סקר", "rows": 9, "presented": 9}]}
+    assert check(_answer("שכ\"ד 55 ₪ [S1].", ledger=full), expect) == []
+
+
+def test_original_score_and_cost_per_pass():
+    from eval.chat_eval import Result, cost_per_pass, original_score
+
+    passed = Result("answers", "A", True, [], {"turns": [{"problems": [], "passed_original_reference": False}]})
+    failed = Result("answers", "B", False, [], {"turns": [{"problems": ["x"]}]})
+    assert original_score([passed, failed]) == 0
+    assert cost_per_pass([passed, failed], 0.5).startswith("0.5000$ (1")
+    assert cost_per_pass([failed], 0.5) == "אין שיחות שעברו"

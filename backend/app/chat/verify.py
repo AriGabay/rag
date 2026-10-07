@@ -8,22 +8,30 @@ the ids it cites. Deterministic checks first:
 - every number in a unit is stated by what it cites (passage text, a measurement's written value or quote, a
   computation's result) — or, for a unit without citations, by some source of the turn — or is in the question;
 - VAT the unit gives a number was written for that number in what it cites: a VAT phrase belongs to the nearest
-  number before it in its sentence, so "9,500 ₪, ללא מע״מ ודמ״ש ... 55 ₪" gives no VAT status to the 55.
+  number before it in its sentence, so "9,500 ₪, ללא מע״מ ודמ״ש ... 55 ₪" gives no VAT status to the 55;
+- the meaning of each cited number (``app.chat.meaning``): a basis or period the evidence does not give the
+  number fails here; an area basis, period or approximation the evidence gives it and the unit omits is a
+  problem for the repair round, the unit is still judged, and when it is supported the server finally writes the
+  one attested qualifier next to the number, marked as the source's.
 
 Then judge calls read each unit next to the evidence of the sources it cites (``app.chat.evidence``: the parts
 of each source that cover the claims, never an arbitrary prefix; each source once per call) and decide whether
 they support it, with the meaning of each number in view: which metric, unit, period, VAT status, area basis and
 subject.
 
-Verification fails closed. A unit the judge gave no verdict is a problem unless it is structurally not a claim
-(a heading, a short label, a question, a bare connective): lacking a number or a citation does not make a
-sentence non-factual. A judge verdict ``not_factual`` on a unit that states a number is not accepted. A judge
+Verification fails closed. A unit the judge gave no verdict is a problem unless it is neutral navigation text
+(``exempt_without_verdict``: a one-word heading, label or column names, a question, a bare connective): lacking
+a number or a citation does not make a sentence non-factual, and Markdown formatting, bold or a colon do not
+either — "# הנכס פנוי" is a claim. A ``navigation`` verdict is accepted only for a heading, label or table header
+that states no amount; ``not_factual`` is accepted for a table header that states no amount and for prose without
+numbers, never for a multi-word heading or label. A judge
 call that fails is retried once (an ``incomplete`` one is split instead); when verification still cannot
 complete, ``VerificationUnavailable`` is raised and the turn fails with a retry — an unchecked answer is never
 shown as checked.
 
-``VerifyReport.apply`` removes what failed (after the engine's repair attempts) and says so in the answer; a
-partly supported unit is kept and marked.
+``VerifyReport.apply`` removes what failed (after the engine's repair attempts) and says so in the answer — a
+failed table header takes its whole table, so no broken table is left; a partly supported unit is kept and
+marked.
 """
 
 from __future__ import annotations
@@ -36,6 +44,7 @@ from pydantic import BaseModel, ConfigDict
 
 from app.answering.verify import _NUMBER as _NUM_AT  # one reading of numbers for both checks
 from app.answering.verify import numbers_in
+from app.chat import meaning
 from app.chat.evidence import select
 from app.providers.llm import (
     CallStatus,
@@ -63,7 +72,10 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 JUDGE_POLICY = (
     "אתה בודק עובדות במשרד שמאות. לכל יחידה ממוספרת מתשובה מצורפים רק המקורות שהיא מצטטת. קבע לכל יחידה:\n"
     "supported — המקורות תומכים בה במלואה; partial — רק בחלקה; unsupported — אינם תומכים, סותרים, או שאין לה "
-    "מקורות למרות שהיא טענה עובדתית; not_factual — אינה טענה עובדתית (פתיח, מעבר, הסתייגות, הצעה, שאלה, כותרת).\n"
+    "מקורות למרות שהיא טענה עובדתית; not_factual — אינה טענה עובדתית (פתיח, מעבר, הסתייגות, הצעה, שאלה); "
+    "navigation — כותרת, תווית או שורת כותרות של טבלה שרק מכריזה מה בא אחריה (שם נכס, מסמך, נושא או עמודה) ואינה "
+    "קובעת דבר. כותרת או תווית שקובעת משהו על נכס, מסמך או ערך (\"הנכס פנוי\", \"השווי נקבע לפי גישת ההשוואה\") "
+    "היא טענה ונבדקת ככל טענה; עיצוב, הדגשה או נקודתיים אינם הופכים טענה ללא-עובדתית.\n"
     "בדוק את משמעות כל מספר: איזה נתון הוא, יחידה, תקופה (לחודש/לשנה), מע\"מ, בסיס שטח, ולאיזה נכס או רכיב הוא "
     "מתייחס. יחידה שמייחסת למספר משמעות שהמקור לא נותן לו (למשל מע\"מ שנכתב לגבי ערך אחר, שכירות כמחיר, ערך של "
     "נכס השוואה כשווי הנכס הנישום) — unsupported. ניסוח אחר, סדר מילים אחר, שורת טבלה שנוסחה כמשפט, וכתיבה אחרת של "
@@ -79,7 +91,8 @@ JUDGE_POLICY = (
     "שהמקור אינו מציין דבר מסוים, מול מקור כזה, היא partial ולא supported. (6) יחידה שמציגה ערך אחד מתוך מקור שיש "
     "בו כמה ערכים מאותו סוג לאותה שאלה (למשל שורה אחת מטבלה בת כמה שורות) כאילו הוא הערך היחיד או המייצג, בלי לומר "
     "שהוא דוגמה ובלי היקף הטבלה — partial, עם הסיבה \"ריבוי ערכים\". (7) מסקנה מסומנת (\"מכאן עולה\", \"מכך "
-    "נובע\") נבדקת לפי האם היא נובעת מהתוכן המצוטט; אם כן — supported."
+    "נובע\") נבדקת לפי האם היא נובעת מהתוכן המצוטט; אם כן — supported. (8) נתון קרוב שמוצג כאילו הוא הנתון "
+    "שהתבקש (למשל שטח בנוי כתשובה לשאלה על שטח המגרש, בלי לומר שזה נתון אחר) — unsupported."
 )
 
 
@@ -89,7 +102,7 @@ class _Strict(BaseModel):
 
 class JudgeVerdict(_Strict):
     index: int
-    verdict: Literal["supported", "partial", "unsupported", "not_factual"]
+    verdict: Literal["supported", "partial", "unsupported", "not_factual", "navigation"]
     reason: str
 
 
@@ -113,7 +126,9 @@ class Unit:
     ids: list[str]
     start: int = 0  # its span in the answer's Markdown
     end: int = 0
-    table_header: bool = False  # a Markdown table's header row (column names, not a statement)
+    table_header: bool = False  # a Markdown table's header row (column names — or a claim, judged as one)
+    table_span: tuple[int, int] | None = None  # for a table row: the span of its whole table (with separator)
+    context: str = ""  # for a table row: the table's header row and the line before the table
 
 
 @dataclass
@@ -121,9 +136,21 @@ class Problem:
     unit: Unit
     reason: str
     severity: Literal["error", "partial"] = "error"
+    kind: str = "claim"  # "missing_qualifier": the number's evidence gives it a qualifier the unit omits
+    number: str | None = None  # for a missing qualifier: the number as written in the unit
+    annotation: str | None = None  # for a missing qualifier: the one qualifier attested, as written
+
+    @property
+    def annotatable(self) -> bool:
+        return self.kind == "missing_qualifier" and self.annotation is not None
+
+    @property
+    def removes_unit(self) -> bool:
+        """The unit is removed for it (a qualifier the server can write in, or a request mismatch, is not)."""
+        return self.severity == "error" and not self.annotatable and self.kind != "request"
 
     def as_dict(self) -> dict:
-        return {"text": self.unit.raw[:300], "reason": self.reason, "severity": self.severity}
+        return {"text": self.unit.raw[:300], "reason": self.reason, "severity": self.severity, "kind": self.kind}
 
 
 @dataclass
@@ -137,22 +164,47 @@ class VerifyReport:
     def ok(self) -> bool:
         return not self.problems
 
+    def counts(self) -> dict:
+        """What the user's normal path shows of verification (the removed text is diagnostics)."""
+        errors = {p.unit.index for p in self.problems if p.removes_unit}
+        return {"judged": self.judged, "judge_status": self.judge_status, "removed": len(errors),
+                "partial": len({p.unit.index for p in self.problems if p.severity == "partial"} - errors),
+                "annotated": sum(1 for p in self.problems if p.annotatable and p.unit.index not in errors),
+                "request_mismatch": any(p.kind == "request" for p in self.problems)}
+
     def problems_text(self) -> str:
         return "\n".join(f"- \"{p.unit.raw[:200]}\": {p.reason}" for p in self.problems)
 
     def apply(self, answer: FinalAnswer) -> FinalAnswer:
         """The answer with failing units removed and partly supported units marked; a note says what was removed."""
-        errors = {p.unit.index for p in self.problems if p.severity == "error"}
+        errors = {p.unit.index for p in self.problems if p.removes_unit}
         partial = {p.unit.index for p in self.problems if p.severity == "partial"}
-        if not errors and not partial:
+        notes = [p for p in self.problems if p.annotatable and p.unit.index not in errors]
+        requests = [p.reason for p in self.problems if p.kind == "request"]
+        if not errors and not partial and not notes and not requests:
             return answer
-        # edit by span, last unit first, so earlier spans stay valid and no edit depends on matching text again
+        # a failed table header takes its whole table: a separator and rows without their header are no table
+        cuts = [u.table_span if (u.table_header and u.table_span) else (u.start, u.end)
+                for u in self.units if u.index in errors]
+        # a failed row inside a table that is removed whole is part of that cut, not an edit of its own
+        cuts = [c for c in cuts if not any(o != c and o[0] <= c[0] and c[1] <= o[1] for o in cuts)]
+        edits = [(a, b, "") for a, b in cuts]
+        edits += [(u.end, u.end, " *(אומת חלקית)*") for u in self.units if u.index in partial
+                  and not any(a <= u.start < b for a, b in cuts)]
+        # a qualifier still missing after the repair rounds is written next to its number, marked as the source's
+        for p in notes:
+            at = _after_number(p.unit, p.number or "")
+            if at is not None and not any(a <= at < b for a, b in cuts):
+                edits.append((at, at, f" ({p.annotation}, כפי שנכתב במקור)"))
+        # edit by span, last first, so earlier spans stay valid and no edit depends on matching text again
         text = answer.answer_markdown
-        for u in sorted(self.units, key=lambda u: u.start, reverse=True):
-            if u.index in errors:
-                text = text[:u.start] + text[u.end:]
-            elif u.index in partial:
-                text = text[:u.end] + " *(אומת חלקית)*" + text[u.end:]
+        done_from = len(text) + 1
+        for a, b, insert in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+            if b > done_from:  # inside a span already removed (a row of a removed table)
+                continue
+            text = text[:a] + insert + text[b:]
+            if b > a:
+                done_from = a
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
         removed = len(errors)
         claims = [c for c in answer.claims if not any(
@@ -168,7 +220,23 @@ class VerifyReport:
                 text += note
                 if status == "answered":
                     status = "partial"
+        if requests and text:
+            # the answer is about another datum than the one requested: said plainly, never passed off as it
+            text += "\n\n> **שימו לב:** " + requests[0] + "."
+            status = "partial" if status == "answered" else status
         return answer.model_copy(update={"answer_markdown": text, "claims": claims, "status": status})
+
+
+_AFTER_NUMBER = re.compile(r"\s*(?:₪|ש[\"״]ח)?(?:\s*ל?מ[\"״]ר)?")
+
+
+def _after_number(unit: Unit, written: str) -> int | None:
+    """The position in the answer right after a number of the unit (and its currency and per-m² words)."""
+    m = re.search(rf"(?<![\d,.]){re.escape(written)}(?![\d])", unit.raw)
+    if m is None:
+        return None
+    tail = _AFTER_NUMBER.match(unit.raw, m.end())
+    return unit.start + (tail.end() if tail else m.end())
 
 
 def split_units(markdown: str) -> list[Unit]:
@@ -177,6 +245,9 @@ def split_units(markdown: str) -> list[Unit]:
     units: list[Unit] = []
     offset = 0
     lines = markdown.split("\n")
+    starts = [0]
+    for line in lines:
+        starts.append(starts[-1] + len(line) + 1)
     for n, line in enumerate(lines):
         line_start = offset
         offset += len(line) + 1
@@ -186,8 +257,18 @@ def split_units(markdown: str) -> list[Unit]:
         following = next((x.strip() for x in lines[n + 1:] if x.strip()), "")
         header_row = stripped.startswith("|") and bool(re.fullmatch(r"\|?[\s:]*-[|\-:\s]*", following))
         base = line_start + line.index(stripped)
+        table_span = None
+        context = ""
         if stripped.startswith("|"):
             pieces = [(0, len(stripped))]
+            first = last = n
+            while first > 0 and lines[first - 1].strip().startswith("|"):
+                first -= 1
+            while last + 1 < len(lines) and lines[last + 1].strip().startswith("|"):
+                last += 1
+            table_span = (starts[first], min(starts[last + 1], len(markdown)))
+            before = next((lines[i].strip() for i in range(first - 1, -1, -1) if lines[i].strip()), "")
+            context = (lines[first].strip() if first < n else "") + "\n" + before
         else:
             pieces, pos = [], 0
             for m in _SENTENCE.finditer(stripped):
@@ -215,7 +296,7 @@ def split_units(markdown: str) -> list[Unit]:
             if not re.search(r"[א-תA-Za-z0-9]", clean):
                 continue
             units.append(Unit(len(units), part, clean, list(dict.fromkeys(ids)), base + a, base + a + len(part),
-                              header_row))
+                              header_row, table_span, context))
     return units
 
 
@@ -335,7 +416,12 @@ def _vat_problems(unit: Unit, ws: Workspace) -> list[str]:
     return [f"מע\"מ שהתשובה מייחסת ל-{x} לא נכתב לגבי ערך זה במקור" for x in dict.fromkeys(shown)][:1]
 
 
-def deterministic(units: list[Unit], ws: Workspace, question: str) -> list[Problem]:
+def deterministic(units: list[Unit], ws: Workspace, question: str,
+                  meanings: dict[int, list[meaning.MeaningProblem]] | None = None) -> list[Problem]:
+    """Unknown citations, numbers no cited source states, VAT the sources do not give a number, and a basis or
+    period the evidence does not give a number (``app.chat.meaning``, the blocking kind)."""
+    if meanings is None:
+        meanings = {u.index: meaning.check(u, ws) for u in units}
     problems: list[Problem] = []
     question_numbers = numbers_in(question)
     everything = _all_numbers(ws)
@@ -360,6 +446,9 @@ def deterministic(units: list[Unit], ws: Workspace, question: str) -> list[Probl
             continue
         for reason in _vat_problems(u, ws) if u.ids else []:
             problems.append(Problem(u, reason))
+        blocking = [m for m in meanings.get(u.index, []) if m.blocking]
+        if blocking:
+            problems.append(Problem(u, "; ".join(m.reason for m in blocking)))
     return problems
 
 
@@ -394,6 +483,45 @@ def structural_kind(unit: Unit) -> str | None:
     if not has_digit and not unit.ids and words <= 3 and re.search(r"[,،—–-]$", text):
         return "connective"
     return None
+
+
+_MARKUP = re.compile(r"[#*_`>:|.,;\-–—]+")
+_AMOUNT = re.compile(r"\d[\d,.]*\s*(?:₪|ש[\"״']?ח|%|מ[\"״']?ר|דונם|מטר)|(?:₪|ש[\"״']?ח)\s*\d")
+
+
+def _one_word(text: str) -> bool:
+    words = _MARKUP.sub(" ", text).split()
+    return len(words) == 1 and not _DIGIT.search(words[0])
+
+
+def exempt_without_verdict(unit: Unit) -> bool:
+    """Whether a unit may pass without a judge verdict: only neutral navigation text — a question, a bare
+    connective, or a heading, label or table header that is one digit-free word (each column name, for a header
+    row). The shape alone proves nothing: "# הנכס פנוי" and "**הנכס מושכר:**" are claims."""
+    kind = structural_kind(unit)
+    if kind in ("question", "connective"):
+        return True
+    if kind is None or unit.ids:
+        return False
+    if kind == "table_header":
+        cells = [c for c in unit.text.strip().strip("|").split("|") if c.strip()]
+        return bool(cells) and all(_one_word(c) for c in cells)
+    return _one_word(unit.text)
+
+
+def _non_claim_accepted(unit: Unit, verdict: str) -> bool:
+    """Whether a ``not_factual`` or ``navigation`` verdict lets the unit pass: never for text that states an
+    amount; ``navigation`` only for a heading, label or table header; ``not_factual`` for a table header (column
+    names, years included) or prose without numbers — not for a multi-word heading or label, where the judge must
+    say it is navigation."""
+    if exempt_without_verdict(unit):
+        return True
+    if _AMOUNT.search(unit.text):
+        return False
+    kind = structural_kind(unit)
+    if kind in ("heading", "label", "table_header"):
+        return verdict == "navigation" or kind == "table_header"
+    return verdict == "not_factual" and not numbers_in(unit.text)
 
 
 @dataclass
@@ -488,12 +616,26 @@ def _judge_all(provider: LLMProvider, units: list[Unit], ws: Workspace, usage: l
 
 
 def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, question: str,
-                  usage: list[dict], deadline: float | None = None) -> VerifyReport:
-    """Deterministic checks, then the judge on every remaining unit. Raises ``VerificationUnavailable``."""
+                  usage: list[dict], deadline: float | None = None, mismatch: str | None = None) -> VerifyReport:
+    """Deterministic checks, then the judge on every remaining unit. ``mismatch`` says why the answer's datum is
+    not the one the resolved request asked for (``app.chat.resolve.mismatch``): a problem of the whole answer,
+    for the repair round, and a note on the final answer. Raises ``VerificationUnavailable``."""
     units = split_units(answer.answer_markdown)
     report = VerifyReport(units)
-    report.problems = deterministic(units, ws, question)
+    meanings = {u.index: meaning.check(u, ws) for u in units}
+    report.problems = deterministic(units, ws, question, meanings)
     failed = {p.unit.index for p in report.problems}
+    # a missing qualifier does not keep the unit from the judge: it is annotated only if the unit is supported
+    for u in units:
+        if u.index in failed:
+            continue
+        for m in meanings[u.index]:
+            if not m.blocking:
+                report.problems.append(Problem(u, m.reason, kind="missing_qualifier", number=m.number,
+                                               annotation=m.annotation))
+    if mismatch:
+        report.problems.append(Problem(Unit(-1, "", "", []), f"התשובה אינה מציגה את הנתון שהתבקש: {mismatch}",
+                                       kind="request"))
     to_judge = [u for u in units if u.index not in failed]
     if to_judge:
         verdicts = _judge_all(provider, to_judge, ws, usage, deadline)
@@ -501,12 +643,13 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         for u in to_judge:
             v = verdicts.get(u.index)
             if v is None:
-                # never judged: only a unit that is structurally not a claim passes
-                if structural_kind(u) is None:
+                # never judged: only neutral navigation text passes
+                if not exempt_without_verdict(u):
                     report.problems.append(Problem(u, "הטענה לא נבדקה מול המקורות"))
                 continue
-            if v.verdict == "not_factual" and numbers_in(u.text) and structural_kind(u) is None:
-                report.problems.append(Problem(u, "טענה עם מספר סווגה כלא-עובדתית; לא אומתה"))
+            if v.verdict in ("not_factual", "navigation"):
+                if not _non_claim_accepted(u, v.verdict):
+                    report.problems.append(Problem(u, "טענה סווגה כלא-עובדתית או ככותרת; לא אומתה"))
             elif v.verdict == "unsupported":
                 report.problems.append(Problem(u, "לא נתמך במקורות: " + v.reason))
             elif v.verdict == "partial":

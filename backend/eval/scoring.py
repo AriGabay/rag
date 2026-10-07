@@ -11,7 +11,10 @@ such answers:
 - ``value_meaning``: for a value, words that must (must not) stand in a sentence stating it (unit, period, VAT);
 - ``attribution``: a value must be stated in a sentence that cites the given document (and not with words of
   another role);
-- ``coverage``: whether the ledger must be complete, and documents it must list as not covered;
+- ``coverage``: whether the ledger must be complete, documents it must list as not covered, and
+  (``expect_all_rows``) whether every cited table must be presented in full;
+- ``absence``: the requested datum is not in the documents — the answer must say so first (its first statement),
+  and each of ``near_values`` (a nearby datum) may appear only labelled as another datum ("נתון אחר");
 - hedging (always, when the answer has a ledger): an incomplete ledger needs the coverage note in the answer,
   and a complete one must not carry it.
 
@@ -26,6 +29,8 @@ from app.answering.verify import numbers_in
 from app.chat.verify import split_units
 
 EXAMPLE_WORDS = r"לדוגמה|לדוגמא|למשל|דוגמה|דוגמא|כגון"
+ABSENT_WORDS = r"לא נמצא|לא מופיע|אינו מופיע|אינה מופיעה|לא צוין|לא מצוין|לא נכתב|אין (?:נתון|אזכור|מידע)"
+OTHER_DATUM = r"נתון אחר|אינו .{0,30}המבוקש|ולא .{0,30}המבוקש|במקום"
 NOTE_PATTERN = r"\*\*כיסוי:\*\*|\*\*שימו לב:\*\*"
 
 
@@ -91,6 +96,17 @@ def check(answer: dict | None, expect: dict) -> list[str]:
         if not ok:
             problems.append(f"משמעות הערך {vm['value']} שגויה או חסרה: «{hits[0][0][:160]}»")
 
+    ab = expect.get("absence")
+    if ab:
+        if not sents or not re.search(ABSENT_WORDS, sents[0][0]):
+            problems.append("התשובה אינה פותחת בכך שהנתון המבוקש לא נמצא: «" + (sents[0][0][:160] if sents else "")
+                            + "»")
+        for v in ab.get("near_values", []):
+            for t, _ in _with_value(sents, v):
+                if not re.search(OTHER_DATUM, t):
+                    problems.append(f"נתון קרוב {v} מוצג בלי לומר שהוא נתון אחר: «{t[:160]}»")
+                    break
+
     for at in expect.get("attribution", []):
         hits = _with_value(sents, at["value"])
         good = [t for t, ds in hits if any(at["document"] in d for d in ds)
@@ -113,10 +129,19 @@ def check(answer: dict | None, expect: dict) -> list[str]:
             for needle in cov.get("must_list_unchecked", []):
                 if not any(needle in t for t in listed):
                     problems.append(f"הכיסוי אינו מציין שהמסמך '{needle}' לא נבדק")
+            # data coverage, apart from document coverage: every cited table presented row by row
+            if cov.get("expect_all_rows"):
+                for t in ledger.get("tables") or []:
+                    if t.get("presented", 0) < (t.get("rows") or 0):
+                        problems.append(f"מהטבלה ב'{t.get('title')}' הוצגו {t.get('presented')} מתוך {t.get('rows')} שורות")
     if ledger:
         noted = bool(re.search(NOTE_PATTERN, md))
+        # a note is due when documents were not covered, or were covered from retrieved passages only, or a set
+        # answer presented part of a table
+        partial_data = bool(ledger.get("retrieved_only")) or (ledger.get("scope_kind") == "set" and any(
+            t.get("presented", 0) < (t.get("rows") or 0) for t in ledger.get("tables") or []))
         if ledger.get("complete") is False and not noted:
             problems.append("הכיסוי חלקי אבל התשובה אינה אומרת זאת")
-        if ledger.get("complete") is True and noted:
+        if ledger.get("complete") is True and noted and not partial_data:
             problems.append("הכיסוי מלא אבל התשובה מסויגת כחלקית")
     return problems

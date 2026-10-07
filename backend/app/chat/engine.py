@@ -30,7 +30,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from app.chat import coverage
+from app.chat import coverage, resolve
 from app.chat import tools as T
 from app.chat.verify import VERIFY_ALLOWANCE_SECONDS, VerificationUnavailable, VerifyReport, verify_answer
 from app.config import get_settings
@@ -82,8 +82,12 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
   נושא — אל תגרור תנאים מהנושא הקודם. "זה" בשאלת המשך מתייחס לנתון שבמרכז השאלה והתשובה הקודמות, לא לפרט צדדי.
 - בקש הבהרה (status=clarification) רק כשיש עמימות שמשנה את התשובה ושנובעת מהשאלה ומהמקורות (למשל שני מסמכים
   מתאימים לכתובת שנשאלה). אחרת — ענה עם הסתייגות ברורה.
-- אם המידע חסר, אמור בקצרה מה נמצא ומה חסר, והבחן בין: "לא נמצא בחיפוש", "המסמך לא נקרא במלואו" (מסמך שנקרא
-  חלקית), ו"נבדק ולא מופיע" (פתחת את הסעיף הרלוונטי והנתון לא מופיע בו).
+- requested: כל נתון שהשאלה ביקשה, עם המסמכים שבהם חיפשת אותו ו-status: found — נמצא; not_found_search — לא נמצא
+  בחיפוש; source_partial — המסמך שבו הוא אמור להיות נקרא חלקית; section_checked_absent — פתחת (open_source: section
+  או table) את הסעיף או הטבלה שבהם הוא אמור להופיע, והוא לא שם (checked_where = ה-S# של מה שפתחת). לפני שאתה
+  קובע "לא מופיע", פתח את הסעיף או הטבלה. כשנתון לא נמצא, השרת פותח את התשובה במשפט שאומר זאת — אל תכתוב אותו
+  בעצמך. נתון קרוב (למשל שטח בנוי כשנשאלת על שטח מגרש) מותר להציג רק בנפרד ובתיוג מפורש "(נתון אחר)", ולעולם לא
+  כאילו הוא הנתון שהתבקש.
 
 ניסוח התשובה (answer_markdown):
 - התשובה הישירה קודם, בקצרה. אחר כך פרטים רלוונטיים בלבד. Markdown: פסקאות קצרות, רשימות, טבלה כשמשווים.
@@ -140,6 +144,18 @@ class Focus(_Strict):
     document_ids: list[str]
 
 
+class Requested(_Strict):
+    """A datum the question asked for, and whether it was found: ``not_found_search`` (searching did not find it),
+    ``source_partial`` (a document that may hold it was read only in part), ``section_checked_absent`` (the section
+    or table where it belongs was opened, ``checked_where`` = that source's S#, and it is not there). The server
+    checks the status against what the turn did and states it first (``coverage.state_absence``)."""
+
+    label: str
+    document_ids: list[str]
+    status: Literal["found", "not_found_search", "source_partial", "section_checked_absent"]
+    checked_where: str
+
+
 class Omitted(_Strict):
     document_id: str  # the document the left-out datum is in ("" when not one document)
     what: str
@@ -157,6 +173,7 @@ class FinalAnswer(_Strict):
     scope_query: str
     omitted: list[Omitted]
     focus: Focus | None
+    requested: list[Requested]
 
 
 FINAL_SCHEMA = FinalAnswer.model_json_schema()
@@ -197,9 +214,10 @@ class TurnOutcome:
     usage: list[dict] = field(default_factory=list)
     ledger: dict = field(default_factory=dict)
     rounds: list[list[dict]] = field(default_factory=list)  # each verification round's problems, in order
+    request: dict | None = None  # the follow-up resolved in context (``app.chat.resolve``), when there was one
 
 
-def _context_message(inp: TurnInput) -> str:
+def _context_message(inp: TurnInput, request: resolve.Request | None = None) -> str:
     parts = []
     if inp.summary:
         parts.append("סיכום השיחה עד כה (לא מקור עובדתי):\n" + prompt_text(inp.summary))
@@ -213,7 +231,7 @@ def _context_message(inp: TurnInput) -> str:
             limit = HISTORY_USER_CHARS if m.role == "user" else HISTORY_ANSWER_CHARS
             lines.append(f"{who}: {prompt_text(content[:limit] + ('…' if len(content) > limit else ''))}")
         parts.append("ההודעות האחרונות בשיחה (תשובות העוזר אינן מקור עובדתי):\n" + "\n\n".join(lines))
-    if inp.focus:
+    if inp.focus and not (request and request.kind == "new_topic"):
         f = inp.focus
         def label(labels: dict, key: str) -> str:
             value = f.get(key)
@@ -237,6 +255,8 @@ def _context_message(inp: TurnInput) -> str:
             + (f" — «{prompt_text(r['excerpt'])}»" if r.get("excerpt") else "")
             for pid, r in inp.prior_refs.items()))
     parts.append("ההודעה החדשה של המשתמש:\n" + prompt_text(inp.question))
+    if request is not None:
+        parts.append(resolve.requested_block(request))
     return "\n\n".join(parts)
 
 
@@ -248,12 +268,27 @@ def run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput,
         raise ProviderFailure("unsupported", "provider has no tool loop")
     deadline = time.monotonic() + settings.chat_turn_seconds
     ws = T.Workspace(ctx=ctx, prior=dict(inp.prior_refs))
-    items: list = [{"role": "user", "content": _context_message(inp)}]
     usage: list[dict] = []
     steps = 0
     attempt = 0  # 0: first answer, 1: repaired with tools, 2: rewritten from verified content only
     rounds: list[list[dict]] = []
     progress("understand", "מבין את הבקשה")
+    request = None
+    if inp.history or inp.focus:
+        # a follow-up is resolved in its context, and validated, before anything is searched
+        visible = {d["document_id"] for d in inp.focus_documents} | set((inp.focus or {}).get("document_ids") or [])
+        request = resolve.resolve(provider, inp.focus, inp.history, inp.question, inp.focus_documents, visible, usage,
+                                  deadline)
+        if cancelled():
+            raise TurnCancelled
+        # a clarification has nothing to verify against, so one that states a figure is not used
+        if request is not None and request.clarify and not re.search(r"\d", request.clarify):
+            answer = FinalAnswer(status="clarification", answer_markdown=request.clarify, claims=[],
+                                 clarification_question=request.clarify, missing_info="", referenced_document_ids=[],
+                                 scope_kind="focused", scope_query="", omitted=[], focus=None, requested=[])
+            return TurnOutcome(answer, ws, VerifyReport([], judged=True, judge_status="no_claims"), steps, usage, {},
+                               rounds, request.as_dict())
+    items: list = [{"role": "user", "content": _context_message(inp, request)}]
     while True:
         if cancelled():
             raise TurnCancelled
@@ -281,22 +316,30 @@ def run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput,
             raise ProviderFailure(CallStatus.INVALID.value, "final schema") from exc
         if answer.status == "clarification" and answer.clarification_question.strip() and not answer.answer_markdown.strip():
             answer.answer_markdown = answer.clarification_question
+        # a datum that was not found is said first, at the level the turn actually checked; a sentence that rests on
+        # an opened section is judged with the answer, one about the search itself is added after verification
+        answer = coverage.state_absence(ws, answer, cited=True)
         progress("verify", "מאמת את הטענות מול המקורות")
         try:
             report = verify_answer(provider, answer, ws, inp.question, usage,
-                                   deadline=deadline + VERIFY_ALLOWANCE_SECONDS)
+                                   deadline=deadline + VERIFY_ALLOWANCE_SECONDS,
+                                   mismatch=resolve.mismatch(request, answer.focus))
         except VerificationUnavailable as exc:
             # the answer could not be checked against its sources: a failure with retry, never an unchecked answer
             raise ProviderFailure("verify_unavailable", exc.status) from exc
         if cancelled():
             raise TurnCancelled
         rounds.append([p.as_dict() for p in report.problems])
-        if report.ok or attempt == 2 or time.monotonic() > deadline - 20:
-            final = report.apply(answer)
+        # after the repair round, what is left for the server (a qualifier it writes from the source, a note that
+        # the datum is not the one requested) does not justify a rewrite that would drop the datum
+        settled = attempt >= 1 and not any(p.removes_unit or p.severity == "partial" for p in report.problems)
+        if report.ok or settled or attempt == 2 or time.monotonic() > deadline - 20:
+            final = coverage.state_absence(ws, report.apply(answer), cited=False)
             ledger: dict = {}
             if final.status != "clarification":
                 ledger, final = coverage.build(ws, final, inp.question)
-            return TurnOutcome(final, ws, report, steps, usage, ledger, rounds)
+            return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
+                               request.as_dict() if request is not None else None)
         attempt += 1
         if attempt == 1:
             progress("repair", "מתקן טענות שלא אומתו")

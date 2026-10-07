@@ -8,10 +8,15 @@ verification. ``cancel`` asks the thread to stop: the message shows ``cancelling
 next check — a model call already in flight is waited for and its result discarded — and only then
 ``cancelled``. A message left ``running`` by a process that died is reported as failed once it is older than the
 turn's bound. Conversations and messages are per user (RLS ``user_isolation``) and per office.
+
+What verification removed, and why, is kept for diagnosis in ``message_diagnostics``, not in the answer: the
+normal message API gives counts only. ``GET /messages/{id}/diagnostics`` returns the detail to the message's
+owner and to an office admin (audited), and only while every document behind the answer is visible to them.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -24,6 +29,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
+from app.audit import audit
 from app.chat import coverage, engine
 from app.config import get_settings
 from app.db import TenantContext, current_data_version, tenant_tx
@@ -173,6 +179,8 @@ def _message_json(r, dv: int | None = None, sh: str | None = None, visible: set 
     answer = r.answer
     content = r.content
     stale = False
+    if answer and isinstance(answer.get("verification"), dict):
+        answer = answer | {"verification": public_verification(answer["verification"])}
     if answer and r.role == "assistant" and status_ == "done":
         if _hidden(r, visible):
             # nothing of an answer whose source the user may no longer see: not its text, quotes or titles
@@ -187,11 +195,22 @@ def _message_json(r, dv: int | None = None, sh: str | None = None, visible: set 
             "usage": [{k: u.get(k) for k in USAGE_FIELDS} for u in (getattr(r, "usage", None) or [])]}
 
 
+def public_verification(v: dict) -> dict:
+    """What the user's normal path shows of verification: whether it ran and how many claims it removed, marked
+    or completed from the source — not the removed text (that is diagnostics). Answers stored before the detail
+    moved out are reduced the same way."""
+    problems = v.get("problems") or []
+    return {"judged": v.get("judged"), "judge_status": v.get("judge_status"),
+            "removed": v.get("removed", sum(1 for p in problems if p.get("severity") == "error")),
+            "partial": v.get("partial", sum(1 for p in problems if p.get("severity") == "partial")),
+            "annotated": v.get("annotated", 0), "request_mismatch": v.get("request_mismatch", False)}
+
+
 def _answer_documents(answer: dict | None) -> set[str]:
     """Every document an answer draws on or names: its sources, measurements and documents, the documents its
     coverage ledger lists (in scope, checked or not), the documents of its focus, and every document the turn's
-    tools touched (a claim removed in verification may have quoted one; its text is kept in the verification
-    record). A message is shown, and carried into the model's context, only while all of them are visible."""
+    tools touched (a claim removed in verification may have quoted one; its text is kept in
+    message_diagnostics, whose document ids come from this set). A message is shown, and carried into the model's context, only while all of them are visible."""
     if not answer:
         return set()
     ids = {s.get("document_id") for s in answer.get("sources") or []}
@@ -199,6 +218,8 @@ def _answer_documents(answer: dict | None) -> set[str]:
     ids |= {d.get("document_id") for d in answer.get("documents") or []}
     ids |= coverage.ledger_documents(answer.get("ledger"))
     ids |= set((answer.get("focus") or {}).get("document_ids") or [])
+    ids |= set((answer.get("request") or {}).get("document_ids") or [])
+    ids |= {d for r in answer.get("requested") or [] for d in r.get("document_ids") or []}
     ids |= set(answer.get("touched_documents") or [])
     ids.discard(None)
     return ids
@@ -263,6 +284,23 @@ def get_message(message_id: str, ctx: TenantContext = Depends(get_ctx)) -> dict:
         dv = current_data_version(conn)
         visible = _visible_documents(conn, [r])
     return _message_json(r, dv, scope_hash(ctx), visible)
+
+
+@router.get("/messages/{message_id}/diagnostics")
+def get_diagnostics(message_id: str, ctx: TenantContext = Depends(get_ctx)) -> dict:
+    """What each verification round removed or repaired, and why. RLS lets the message's owner and an office
+    admin read the row; it is shown only while every document behind the answer is visible to the reader."""
+    mid = parse_uuid(message_id)
+    with tenant_tx(ctx) as conn:
+        row = conn.execute(text("SELECT * FROM message_diagnostics WHERE message_id = :m"), {"m": mid}).first()
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
+        docs = set(row.document_ids or [])
+        if not docs <= _visible_ids(conn, docs):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
+        if row.user_id != ctx.user_id:
+            audit(conn, "chat.diagnostics.read", ctx.user_id, "message", mid, owner=str(row.user_id))
+    return {"message_id": str(mid), "rounds": row.rounds, "removed": row.removed}
 
 
 @router.post("/conversations/{conversation_id}/messages")
@@ -371,9 +409,11 @@ def _cancel_requested(ctx: TenantContext, message_id: UUID) -> bool:
 
 
 def _finish(ctx: TenantContext, message_id: UUID, status_: str, *, content: str = "", answer: dict | None = None,
-            error: str | None = None, usage: list | None = None, model: str | None = None) -> None:
+            error: str | None = None, usage: list | None = None, model: str | None = None,
+            diagnostics: dict | None = None) -> None:
     """Record the end of a turn. An answer is written only while no cancellation was asked for: a stop that lands
-    after the turn's last check still ends the turn as cancelled, never with the answer shown."""
+    after the turn's last check still ends the turn as cancelled, never with the answer shown. Its diagnostics
+    are written with it."""
     with tenant_tx(ctx) as conn:
         if status_ == "done":
             done = conn.execute(text(
@@ -386,6 +426,16 @@ def _finish(ctx: TenantContext, message_id: UUID, status_: str, *, content: str 
             if done:
                 conn.execute(text("UPDATE conversations SET updated_at = now() WHERE id = (SELECT conversation_id FROM"
                                   " messages WHERE id = :m)"), {"m": message_id})
+                if diagnostics is not None:
+                    conn.execute(text(
+                        "INSERT INTO message_diagnostics (message_id, office_id, user_id, rounds, removed, document_ids)"
+                        " VALUES (:m, app_office(), :u, CAST(:r AS jsonb), CAST(:x AS jsonb), :d)"
+                        " ON CONFLICT (message_id) DO UPDATE SET rounds = EXCLUDED.rounds, removed = EXCLUDED.removed,"
+                        " document_ids = EXCLUDED.document_ids"),
+                        {"m": message_id, "u": ctx.user_id,
+                         "r": json.dumps(diagnostics["rounds"], ensure_ascii=False, default=str),
+                         "x": json.dumps(diagnostics["removed"], ensure_ascii=False, default=str),
+                         "d": sorted(diagnostics["document_ids"])})
                 return
             status_, content, answer, error = "cancelled", "", None, "העיבוד נעצר לבקשתך."
         conn.execute(text(
@@ -408,8 +458,17 @@ def _summary_usable(conn: Connection, ctx: TenantContext, conv) -> bool:
         return False
     if meta.get("scope_hash") != scope_hash(ctx):
         return False
+    # the record describes this text, built from this many messages: a summary rewritten by other code (or by an
+    # older version, which did not update the record) does not match it
+    if meta.get("summary_sha256") != summary_digest(conv.summary) or meta.get("summary_message_count") != \
+            conv.summary_message_count:
+        return False
     docs = set(meta.get("document_ids") or [])
     return docs <= _visible_ids(conn, docs)
+
+
+def summary_digest(summary: str | None) -> str:
+    return hashlib.sha256((summary or "").encode("utf-8")).hexdigest()
 
 
 def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
@@ -446,11 +505,23 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
                           "block_end": s.get("block_end"), "table_index": s.get("table_index"),
                           "chunk_id": s.get("chunk_id"), "title": s.get("title"), "location": s.get("location"),
                           "excerpt": " ".join((s.get("text") or "").split())[:160]}
-    # the last answer's focus; its message is in ``rows`` only while every document it names is visible
-    last_focus = (last.answer.get("focus") or None) if last is not None else None
+    # the last answer's focus, or, when it named no datum, the request it answered (``app.chat.resolve``); its
+    # message is in ``rows`` only while every document it names is visible
+    last_focus = None
+    if last is not None:
+        last_focus = last.answer.get("focus") or _request_focus(last.answer.get("request"))
     return engine.TurnInput(question=user.content, history=history, summary=summary, focus=last_focus,
                             focus_documents=[{"document_id": k, "title": v} for k, v in list(focus.items())[-8:]],
                             prior_refs=prior)
+
+
+def _request_focus(request: dict | None) -> dict | None:
+    if not request or request.get("metric_kind", "unknown") == "unknown":
+        return None
+    return {"metric_as_written": "", "metric_kind": request["metric_kind"], "unit": request.get("unit", "unknown"),
+            "period": request.get("period", "unknown"), "area_basis": request.get("area_basis", ""),
+            "vat": request.get("vat", "unknown"), "subject": request.get("subject", ""), "value_role": "unknown",
+            "document_ids": list(request.get("document_ids") or [])}
 
 
 def _answer_payload(outcome: engine.TurnOutcome) -> dict:
@@ -496,14 +567,21 @@ def _answer_payload(outcome: engine.TurnOutcome) -> dict:
         "clarification": a.clarification_question or None, "missing": a.missing_info or None,
         "sources": sources, "measurements": measurements, "computations": computations,
         "documents": [{"document_id": k, "title": v} for k, v in docs.items()],
-        "verification": {"judged": outcome.report.judged, "judge_status": outcome.report.judge_status,
-                         "problems": [p.as_dict() for p in outcome.report.problems],
-                         # what each round found (first answer, repair, rewrite): why a claim was repaired or removed
-                         "rounds": outcome.rounds},
+        # counts only; what was removed and why is diagnostics (``_diagnostics``)
+        "verification": outcome.report.counts(),
         "searches": ws.searches, "coverage": ws.coverage, "steps": outcome.steps,
-        "ledger": outcome.ledger or None, "scope_kind": a.scope_kind, "focus": focus,
+        "ledger": outcome.ledger or None, "scope_kind": a.scope_kind, "focus": focus, "request": outcome.request,
+        # each requested datum with the status the turn's actions support (found, or how it was not found)
+        "requested": coverage.validate_requested(ws, a.requested),
         "touched_documents": sorted(ws.activity),
     }
+
+
+def _diagnostics(outcome: engine.TurnOutcome, payload: dict) -> dict:
+    """What each verification round found (first answer, repair, rewrite) and what the final answer lost, with
+    every document behind the answer (the reader must see them all)."""
+    return {"rounds": outcome.rounds, "removed": [p.as_dict() for p in outcome.report.problems],
+            "document_ids": _answer_documents(payload)}
 
 
 def _limited_answer(ctx: TenantContext, question: str, reason: str) -> dict:
@@ -534,11 +612,13 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
         with tenant_tx(ctx) as conn:
             row = conn.execute(text("SELECT status, EXTRACT(EPOCH FROM (now() - updated_at)) AS age FROM messages"
                                     " WHERE id = :m"), {"m": message_id}).first()
-            if row is None or row.status != "running":
-                return  # deleted, or cancelled before it started
+            if row is None or row.status not in ("running", "cancelling"):
+                return  # deleted, or already ended
             if row.age > _stale_after():
                 # it waited so long that the user was told it failed (and may have moved on): never answer late
                 raise engine.ProviderFailure("queued_too_long")
+            if row.status == "cancelling":
+                raise engine.TurnCancelled  # stopped before it started: cancelled now, not after the stale bound
             conn.execute(text("UPDATE messages SET updated_at = now() WHERE id = :m"), {"m": message_id})
             state = office_provider_state(conn)
             inp = _turn_input(conn, ctx, conversation_id, user_message_id)
@@ -558,7 +638,7 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
             for u in outcome.usage:
                 log_usage(conn, provider, u["purpose"], _U(u), u["status"] == "ok", u["status"])
         _finish(ctx, message_id, "done", content=outcome.answer.answer_markdown, answer=payload, usage=outcome.usage,
-                model=provider.model)
+                model=provider.model, diagnostics=_diagnostics(outcome, payload))
     except engine.TurnCancelled:
         _finish(ctx, message_id, "cancelled", error="העיבוד נעצר לבקשתך.")
     except engine.ProviderFailure as e:
@@ -641,7 +721,8 @@ def _maybe_summarize(ctx: TenantContext, conversation_id: UUID, message_id: UUID
                           " WHERE id = :m"), {"u": json.dumps([usage]), "m": message_id})
         if r.ok:
             meta = {"document_ids": sorted(docs), "scope_hash": scope_hash(ctx), "data_version": dv,
-                    "through_message_id": str(rows[-1].id) if rows else None, "built_at": datetime.now().isoformat()}
+                    "through_message_id": str(rows[-1].id) if rows else None, "built_at": datetime.now().isoformat(),
+                    "summary_sha256": summary_digest(r.parsed.summary), "summary_message_count": upto}
             conn.execute(text("UPDATE conversations SET summary = :s, summary_message_count = :n,"
                               " summary_meta = CAST(:m AS jsonb) WHERE id = :c"),
                          {"s": r.parsed.summary, "n": upto, "m": json.dumps(meta), "c": conversation_id})

@@ -20,11 +20,11 @@ def call(name: str, **arguments) -> dict:
 
 def final(markdown: str, status: str = "answered", claims: list | None = None, clarification: str = "",
           missing: str = "", documents: list[str] | None = None, scope: str = "focused", scope_query: str = "",
-          omitted: list | None = None, focus: dict | None = None) -> dict:
+          omitted: list | None = None, focus: dict | None = None, requested: list | None = None) -> dict:
     return {"final": {"status": status, "answer_markdown": markdown, "claims": claims or [],
                       "clarification_question": clarification, "missing_info": missing,
                       "referenced_document_ids": documents or [], "scope_kind": scope, "scope_query": scope_query,
-                      "omitted": omitted or [], "focus": focus}}
+                      "omitted": omitted or [], "focus": focus, "requested": requested or []}}
 
 
 class ScriptedAgent(ScriptedProvider):

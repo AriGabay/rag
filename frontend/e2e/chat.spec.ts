@@ -103,8 +103,13 @@ test.describe("chat (office B, real model)", () => {
     await composer(page).press("Enter");
     const stop = page.getByRole("button", { name: "עצירת התשובה" });
     await expect(stop).toBeVisible();
-    await stop.click();
     const reply = assistantMessages(page).last();
+    // stop only once the server is working on it (a step past "queued"); an answer that finished before the click
+    // is a different, valid case (the stop leaves it done), covered by the API tests
+    await expect(reply.locator(".status-line")).toContainText(/מבין את הבקשה|מחפש|קורא|מאתר|בודק|מאמת/, {
+      timeout: 60_000,
+    });
+    await stop.click();
     // either still finishing the call already in flight ("עוצר…"), or confirmed as stopped
     await expect(reply).toContainText(/עוצר|נעצר/);
     await expect(reply).toContainText("העיבוד נעצר", { timeout: 180_000 });

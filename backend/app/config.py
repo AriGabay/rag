@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     chat_reasoning_effort: str = "low"
     measure_reasoning_effort: str = "low"  # measurements: completeness over speed (a background job)
     judge_reasoning_effort: str = "low"  # the answer verifier reads meaning, not only words
+    resolve_reasoning_effort: str = "low"  # resolving a follow-up in its context (a small structured call)
     chat_max_steps: int = 8
     chat_turn_seconds: int = 150
     chat_workers: int = 6

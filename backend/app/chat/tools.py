@@ -3,8 +3,10 @@
 The model never runs SQL and never sees anything the user may not: every tool runs in its own short
 transaction under the user's tenant context (RLS decides what is visible), validates its arguments, and returns
 plain text the model reads. Every passage a tool returns is registered as a source with an id (``S1``...); every
-stored measurement as ``M1``...; every computation as ``C1``.... Every tool also records which documents it
-touched (searched, opened, their measurements read), so the server can state an answer's coverage itself. An
+stored measurement as ``M1``...; every computation as ``C1``.... Every tool also records how deep it reached
+into each document — located (listed in a set or outlined), a passage retrieved, a section or table read (or its
+measurements listed) — and which sections and tables it opened, so the server can state an answer's coverage
+itself; a document whose datum the verified answer cites is ``verified`` (``coverage.build``). An
 answer may cite only ids issued in the same turn, so a previous answer is never a source: an earlier turn's
 passages are offered as ``P`` references the model must re-open (``open_source``), which reads them again under
 the current permissions.
@@ -70,6 +72,13 @@ KIND_LABELS = {
     "area": "שטח", "rights_area": "שטח זכויות", "rate": "שיעור", "coefficient": "מקדם", "count": "כמות",
     "duration": "משך", "other": "אחר",
 }
+
+
+# how deep the turn reached into a document, in order: listed in a set or outlined; a passage retrieved (a search
+# hit, or the paragraphs around it); a section or table read (or its stored measurements listed); its datum cited
+# by the verified answer
+LEVELS = ("located", "retrieved", "read", "verified")
+NOT_REACHED = "not_reached"  # a document of the set the turn never touched
 
 
 class ToolError(Exception):
@@ -147,7 +156,9 @@ class Workspace:
     prior: dict[str, dict] = field(default_factory=dict)  # P# -> {version_id, block_start, block_end, chunk_id}
     searches: list[str] = field(default_factory=list)
     coverage: list[dict] = field(default_factory=list)
-    # document id -> {"title", "searched", "opened", "measurements", "partial"}: what the turn's tools touched
+    # document id -> {"title", "level", "read", "partial", "openings": [{"sid", "scope", "name"}]}: how deep the
+    # turn's tools reached into each document (``LEVELS``), whether a section or table of it was read, and the
+    # sections and tables they opened
     activity: dict[str, dict] = field(default_factory=dict)
     # the set a question is about: {"query", "matching": [{document_id, title}], "pages", "pages_read"}
     scope: dict | None = None
@@ -165,11 +176,15 @@ class Workspace:
             self.returned[key] = source.sid
         return source
 
-    def touch(self, document_id, title: str, what: str, partial: bool = False) -> None:
-        a = self.activity.setdefault(str(document_id), {"title": title, "searched": False, "opened": False,
-                                                        "measurements": False, "partial": False})
-        a[what] = True
+    def touch(self, document_id, title: str, level: str, partial: bool = False, opening: dict | None = None) -> None:
+        a = self.activity.setdefault(str(document_id), {"title": title, "level": "located", "read": False,
+                                                        "partial": False, "openings": []})
+        if LEVELS.index(level) > LEVELS.index(a["level"]):
+            a["level"] = level
+        a["read"] = a["read"] or level == "read"  # kept apart: a verified datum may come from a passage only
         a["partial"] = a["partial"] or partial
+        if opening is not None:
+            a["openings"].append(opening)
 
     def _sid(self) -> str:
         return f"S{len(self.sources) + 1}"
@@ -233,6 +248,15 @@ def _visible_documents(conn: Connection, ids: list[str]) -> list[UUID]:
     if missing:
         raise ToolError("מסמכים לא נמצאו או שאין הרשאה אליהם: " + ", ".join(missing))
     return out
+
+
+_TABLE_ROWS = re.compile(re.escape(TABLE_SIZE_PREFIX) + r"\s*(\d+)\s*שורות")
+
+
+def table_row_count(text: str) -> int | None:
+    """The row count a source's table size line states (``table_size_line``), or None."""
+    m = _TABLE_ROWS.search(text or "")
+    return int(m.group(1)) if m else None
 
 
 def table_size_line(structure: dict | None) -> str:
@@ -328,7 +352,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                                                 _clip(h["text"], PASSAGE_CHARS)), block_start=bs, block_end=be,
                 table_index=h.get("table_index"), chunk_id=h["chunk_id"], page_list=h["page_list"] or None,
                 partial_document=h["version_id"] in partial), ("chunk", h["chunk_id"])))
-            ws.touch(h["document_id"], h["title"], "searched", h["version_id"] in partial)
+            ws.touch(h["document_id"], h["title"], "retrieved", h["version_id"] in partial)
     if not out:
         return f'לא נמצאו קטעים עבור "{query}". אפשר לנסות ניסוח אחר, מונחים נרדפים או חיפוש בתוך מסמך מסוים.'
     return "\n\n".join(_render_source(s) for s in out)
@@ -357,7 +381,7 @@ def tool_open_source(ws: Workspace, source_id: str, scope: str = "neighbors") ->
         if head is None:
             raise ToolError("המקור אינו זמין עוד (נמחק או שאין הרשאה)")
         partial = bool(_partial_versions(conn, [vid]))
-        ws.touch(head.document_id, head.title, "opened", partial)
+        ws.touch(head.document_id, head.title, "retrieved", partial)
         start, end = ref.get("block_start"), ref.get("block_end")
         table_index = ref.get("table_index")
         if start is None and ref.get("chunk_id") and not (scope == "table" and table_index is not None):
@@ -369,7 +393,7 @@ def tool_open_source(ws: Workspace, source_id: str, scope: str = "neighbors") ->
                               location=_location(row.section, row.kind, row.page_list, None, None, (None, None), None),
                               kind=row.kind, text=_clip(row.text, CONTEXT_CHARS[scope]), page_list=row.page_list,
                               partial_document=partial)
-            return _render_source(ws.once(s, ("chunk", ref["chunk_id"], scope)))
+            return _render_source(ws.once(s, ("text", vid, s.text)))
         if scope == "table":
             if table_index is None and start is not None:
                 hit = conn.execute(text(
@@ -397,7 +421,10 @@ def tool_open_source(ws: Workspace, source_id: str, scope: str = "neighbors") ->
                               location=_location(st.get("section"), "table", None, None, None, (None, None), media),
                               kind="table", text=_clip(body, CONTEXT_CHARS["table"]), block_start=st.get("block_index"),
                               block_end=st.get("block_index"), table_index=table_index, partial_document=partial)
-            return _render_source(ws.once(s, ("table", vid, table_index)))
+            ws.touch(head.document_id, head.title, "read", partial,
+                     {"sid": s.sid, "scope": "table", "name": st.get("caption") or (st.get("title") or [""])[0]
+                      or st.get("section") or "טבלה"})
+            return _render_source(ws.once(s, ("text", vid, s.text)))
         if start is None:
             raise ToolError("למקור הזה אין מיקום במסמך להרחבה")
         if scope == "section":
@@ -423,7 +450,11 @@ def tool_open_source(ws: Workspace, source_id: str, scope: str = "neighbors") ->
                                              (min(nums), max(nums)) if nums else (None, None), None),
                           kind="context", text=_clip(body, CONTEXT_CHARS[scope]), block_start=rows[0].block_index,
                           block_end=rows[-1].block_index, partial_document=partial)
-        return _render_source(ws.once(s, ("blocks", vid, rows[0].block_index, rows[-1].block_index)))
+        if scope == "section":
+            ws.touch(head.document_id, head.title, "read", partial,
+                     {"sid": s.sid, "scope": "section", "name": section or "הסעיף"})
+        # keyed by the text sent: a section opened after the paragraphs around the same place is longer, and is sent
+        return _render_source(ws.once(s, ("text", vid, s.text)))
 
 
 def _paginate(page, total: int, size: int) -> tuple[int, int]:
@@ -516,6 +547,8 @@ def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> s
     if ws.scope is None or ws.scope.get("query") != query:
         ws.scope = new_scope(query, [(d["document_id"], d["title"]) for d in found], pages)
     ws.scope["pages_read"].add(page)
+    for d in found[(page - 1) * SCOPE_PAGE:page * SCOPE_PAGE]:
+        ws.touch(d["document_id"], d["title"], "located")
     if not found:
         return f'לא נמצאו מסמכים שמכילים את כל המונחים של "{query}". אפשר לנסות מונחים אחרים או פחות מונחים.'
     lines = [_page_line(page, pages, total, "מסמכים מתאימים"),
@@ -606,7 +639,7 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
             ws.measurements[m.mid] = m
             known[r.id] = m
         m.listings.add(key)
-        ws.touch(r.document_id, r.title, "measurements")
+        ws.touch(r.document_id, r.title, "read")
         groups.setdefault(_compat_key(r), []).append(m)
     cov = {"documents": len(scope_rows), "extracted": sum(1 for s in scope_rows if s.state == "done"),
            "total": total, "page": page, "pages": pages,

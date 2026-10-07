@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useMemo, useState } from "react";
-import type { ChatAnswer, ChatLedger, ChatMessage, ChatSource, LedgerDocument } from "@/lib/chatTypes";
+import type { ChatAnswer, ChatLedger, ChatMessage, ChatSource, LedgerDocument, LedgerTable } from "@/lib/chatTypes";
 import { type CitationTarget, Markdown, citationOrder, plainAnswer } from "./Markdown";
 
 export interface CitedItem {
@@ -185,7 +185,8 @@ function AnswerDetails({
   onCite: (id: string) => void;
 }) {
   const ordered = [...citations.values()];
-  const problems = answer.verification?.problems ?? [];
+  const verification = answer.verification;
+  const changed = verification ? verification.removed + verification.partial + verification.annotated : 0;
   const coverage = answer.coverage.at(-1);
   return (
     <details className="msg-details">
@@ -252,23 +253,22 @@ function AnswerDetails({
           <p>{answer.missing}</p>
         </div>
       )}
-      {problems.length > 0 && (
-        <div className="details-section">
+      {verification && changed > 0 && (
+        <div className="details-section" data-testid="verification">
           <h4>אימות</h4>
           <ul>
-            {problems.map((p, i) => (
-              <li key={i}>
-                {p.severity === "error" ? "הוסר: " : "אומת חלקית: "}
-                {p.text} — {p.reason}
-              </li>
-            ))}
+            {verification.removed > 0 && <li>הוסרו {verification.removed} טענות שלא נמצאה להן תמיכה במקורות.</li>}
+            {verification.partial > 0 && <li>{verification.partial} טענות אומתו חלקית (מסומנות בתשובה).</li>}
+            {verification.annotated > 0 && (
+              <li>ל-{verification.annotated} נתונים נוסף ליד המספר תיאור שנכתב במקור (מסומן «כפי שנכתב במקור»).</li>
+            )}
           </ul>
         </div>
       )}
-      {answer.verification && problems.length === 0 && (
+      {verification && changed === 0 && (
         <div className="details-section">
           <h4>אימות</h4>
-          <p>{answer.verification.judged ? "כל הטענות נבדקו מול המקורות המצוטטים." : "הטענות בתשובה זו לא נבדקו מול המקורות (תשובה מגרסה קודמת, שבה בדיקה שנכשלה לא עצרה את התשובה). יש לבדוק במקור לפני שימוש."}</p>
+          <p>{verification.judged ? "כל הטענות נבדקו מול המקורות המצוטטים." : "הטענות בתשובה זו לא נבדקו מול המקורות (תשובה מגרסה קודמת, שבה בדיקה שנכשלה לא עצרה את התשובה). יש לבדוק במקור לפני שימוש."}</p>
         </div>
       )}
       {answer.searches.length > 0 && (
@@ -314,30 +314,63 @@ function titles(docs: LedgerDocument[] | undefined): string {
   return (docs ?? []).map((d) => d.title ?? "").filter(Boolean).join("; ");
 }
 
-/** The coverage ledger: the set the question was about, what was checked and used, and what was not. */
+/** The cited tables the answer presented only part of. */
+function shortTables(tables: LedgerTable[] | undefined): LedgerTable[] {
+  return (tables ?? []).filter((t) => t.presented < t.rows);
+}
+
+/** Rows of the cited tables the answer did not present. */
+function TableLines({ tables }: { tables: LedgerTable[] | undefined }) {
+  const short = shortTables(tables);
+  return (
+    <>
+      {short.map((t, i) => (
+        <li key={`t${i}`} data-testid="ledger-table">
+          טבלה ב<bdi>{t.title}</bdi>: הוצגו ערכים מ-{t.presented} מתוך {t.rows} שורות
+        </li>
+      ))}
+    </>
+  );
+}
+
+/** The coverage ledger: the set the question was about, how deep each document was read, what the answer used,
+ * and what it did not. Document coverage (a verified datum from each document) is shown apart from data
+ * coverage (sections and tables read, or only passages retrieved). */
 function LedgerSection({ ledger }: { ledger: ChatLedger }) {
   if (ledger.scope_kind === "focused") {
-    if (!ledger.also_matching?.length) return null;
+    if (!ledger.also_matching?.length && !shortTables(ledger.tables).length) return null;
     return (
       <div className="details-section ledger" data-testid="ledger">
         <h4>כיסוי</h4>
-        <p>מסמכים נוספים שכותרתם מתאימה לשאלה ולא נבדקו: {titles(ledger.also_matching)}.</p>
+        <ul>
+          {ledger.also_matching?.length ? (
+            <li>מסמכים נוספים שכותרתם מתאימה לשאלה ולא נבדקו: {titles(ledger.also_matching)}.</li>
+          ) : null}
+          <TableLines tables={ledger.tables} />
+        </ul>
       </div>
     );
   }
   const rows: [string, LedgerDocument[] | undefined][] = [
     ["לא נבדקו", ledger.not_checked],
+    ["נשלפו מהם קטעים בלבד (הסעיף או הטבלה לא נקראו)", ledger.retrieved_only],
     ["נבדקו, לא נמצא בהם נתון שנכלל בתשובה", ledger.unused],
     ["נקראו חלקית", ledger.partially_read],
   ];
   return (
     <div className="details-section ledger" data-testid="ledger">
       <h4>כיסוי</h4>
-      <p>
-        תחום: <bdi>{ledger.scope_query}</bdi> · {ledger.matching?.length ?? 0} מסמכים מתאימים · נבדקו{" "}
-        {ledger.checked?.length ?? 0} · בשימוש בתשובה {ledger.with_data?.length ?? 0}
-        {ledger.complete ? " · התשובה מכסה את כל התחום" : " · התשובה אינה מכסה את כל התחום"}
+      <p data-testid="ledger-documents">
+        תחום: <bdi>{ledger.scope_query}</bdi> · {ledger.matching?.length ?? 0} מסמכים מתאימים · נתון מאומת מ-
+        {ledger.with_data?.length ?? 0}
+        {ledger.complete ? " · התשובה מכסה את כל מסמכי התחום" : " · התשובה אינה מכסה את כל מסמכי התחום"}
       </p>
+      {/* answers stored before reading levels were recorded have no data-coverage figures to show */}
+      {ledger.levels && (
+        <p data-testid="ledger-data">
+          קריאה: נקראו (סעיף/טבלה) {ledger.read?.length ?? 0} · נשלפו קטעים בלבד מ-{ledger.retrieved_only?.length ?? 0}
+        </p>
+      )}
       <ul>
         {rows
           .filter(([, docs]) => docs && docs.length > 0)
@@ -351,6 +384,7 @@ function LedgerSection({ ledger }: { ledger: ChatLedger }) {
             הושמט{o.title ? ` (${o.title})` : ""}: {o.what} — {o.why}
           </li>
         ))}
+        <TableLines tables={ledger.tables} />
       </ul>
     </div>
   );

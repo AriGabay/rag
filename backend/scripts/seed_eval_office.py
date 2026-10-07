@@ -1,5 +1,5 @@
-"""Creates the isolated evaluation office C and uploads the synthetic v5 documents to it (tests/fixtures/eval_v5/,
-written by scripts/make_eval_docs.py). Cloud use is enabled for office C only, so the real model can answer there.
+"""Creates the isolated evaluation office C and uploads the synthetic documents of the evaluation sets to it
+(tests/fixtures/eval_v5/ and eval_v6/, written by scripts/make_eval_docs.py). Cloud use is enabled for office C only, so the real model can answer there.
 
 Runs against a live stack, like seed_demo.py: the office is bootstrapped with the owner role, everything else
 goes through the public API. Idempotent: an existing office C is reused and documents already there are not
@@ -28,7 +28,7 @@ BACKEND = os.environ.get("BACKEND_URL", "http://localhost:8000")
 PASSWORD = os.environ.get("DEMO_PASSWORD", "demo1234")
 NAME = "משרד הערכה ג׳ (סינתטי, סט v5)"
 ADMIN = "admin-c@eval.test"
-FOLDER = ROOT / "tests" / "fixtures" / "eval_v5"
+FOLDERS = [ROOT / "tests" / "fixtures" / "eval_v5", ROOT / "tests" / "fixtures" / "eval_v6"]
 
 
 def log(msg: str) -> None:
@@ -53,14 +53,15 @@ def main() -> int:
         log("office C created")
         admin = login()
     assert admin is not None
-    expected = {p.name for p in FOLDER.glob("*.docx")}
+    files = sorted(p for folder in FOLDERS for p in folder.glob("*.docx"))
+    expected = {p.name for p in files}
     present = {d["current_version"]["filename"]: d for d in admin.get("/api/documents").json()["documents"]
                if d.get("current_version")}
     foreign = set(present) - expected
     if foreign:
         raise SystemExit(f"office C holds documents this script did not upload: {sorted(foreign)}")
     group = admin.get("/api/admin/groups").json()["groups"][0]["id"]
-    for path in sorted(FOLDER.glob("*.docx")):
+    for path in files:
         if path.name in present:
             continue
         r = admin.post("/api/documents", data={"group_id": group},

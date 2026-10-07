@@ -16,7 +16,7 @@ function messages(conversationId: string, ledger: object, markdown: string) {
       title: doc(1).title, section: null, location: "סעיף \"השומה\"", kind: "text", text: "השווי למ\"ר הוא 9,500 ₪.",
       block_start: null, block_end: null, table_index: null, page_list: null, chunk_id: null }],
     measurements: [], computations: [], documents: [doc(1)],
-    verification: { judged: true, judge_status: "ok", problems: [] }, searches: ["שווי"], coverage: [],
+    verification: { judged: true, judge_status: "ok", removed: 0, partial: 0, annotated: 0 }, searches: ["שווי"], coverage: [],
     ledger: { cited: [doc(1)], ...ledger }, scope_kind: (ledger as { scope_kind: string }).scope_kind, focus: null,
   };
   return {
@@ -36,8 +36,10 @@ test("a set answer that did not cover its whole scope shows the coverage note an
   const { id } = await created.json();
   const doc = (n: number) => ({ document_id: `00000000-0000-0000-0000-00000000000${n}`, title: `שומה סינתטית ${n}` });
   const ledger = {
-    scope_kind: "set", scope_query: "עיר הבדיקה", matching: [doc(1), doc(2), doc(3)], checked: [doc(1), doc(2)],
-    with_data: [doc(1)], not_checked: [doc(3)], unused: [doc(2)], partially_read: [], omitted: [], complete: false,
+    scope_kind: "set", scope_query: "עיר הבדיקה", matching: [doc(1), doc(2), doc(3)], read: [doc(1)],
+    retrieved_only: [doc(2)], with_data: [doc(1)], not_checked: [doc(3)], unused: [doc(2)], partially_read: [],
+    omitted: [], complete: false,
+    levels: { [doc(1).document_id]: "verified", [doc(2).document_id]: "retrieved", [doc(3).document_id]: "located" },
   };
   const md = "השווי למ\"ר הוא 9,500 ₪ [S1].\n\n> **כיסוי:** 3 מסמכים מתאימים לתחום \"עיר הבדיקה\"; התשובה מבוססת על 1 מהם.";
   await page.route(`**/api/chat/conversations/${id}/messages*`, (route) =>
@@ -48,7 +50,9 @@ test("a set answer that did not cover its whole scope shows the coverage note an
   await reply.getByText(/מקורות ופרטים/).click();
   const block = reply.getByTestId("ledger");
   await expect(block).toContainText("3 מסמכים מתאימים");
-  await expect(block).toContainText("התשובה אינה מכסה את כל התחום");
+  await expect(block).toContainText("התשובה אינה מכסה את כל מסמכי התחום");
+  await expect(block.getByTestId("ledger-data")).toContainText("נקראו (סעיף/טבלה) 1 · נשלפו קטעים בלבד מ-1");
+  await expect(block).toContainText("נשלפו מהם קטעים בלבד (הסעיף או הטבלה לא נקראו): שומה סינתטית 2");
   await expect(block).toContainText("לא נבדקו: שומה סינתטית 3");
   await expect(block).toContainText("נבדקו, לא נמצא בהם נתון שנכלל בתשובה: שומה סינתטית 2");
   await page.request.delete(`/api/chat/conversations/${id}`);
@@ -65,5 +69,47 @@ test("a focused answer lists other documents whose titles match the question", a
   const reply = assistantMessages(page).last();
   await reply.getByText(/מקורות ופרטים/).click();
   await expect(reply.getByTestId("ledger")).toContainText("מסמכים נוספים שכותרתם מתאימה לשאלה ולא נבדקו: שומה סינתטית 2");
+  await page.request.delete(`/api/chat/conversations/${id}`);
+});
+
+test("document coverage is shown apart from data coverage, with the rows of a cited table", async ({ page }) => {
+  await login(page, USERS.adminB);
+  const { id } = await (await page.request.post("/api/chat/conversations")).json();
+  const doc = (n: number) => ({ document_id: `00000000-0000-0000-0000-00000000000${n}`, title: `שומה סינתטית ${n}` });
+  // every document gave a verified datum, but from retrieved passages only: document coverage 3/3, reading 0/3
+  const ledger = {
+    scope_kind: "set", scope_query: "עיר הבדיקה", matching: [doc(1), doc(2), doc(3)], read: [],
+    retrieved_only: [doc(1), doc(2), doc(3)], with_data: [doc(1), doc(2), doc(3)], not_checked: [], unused: [],
+    partially_read: [], omitted: [], complete: true,
+    tables: [{ title: "שומה סינתטית 1", location: "טבלה", rows: 9, presented: 2 }],
+    levels: { [doc(1).document_id]: "verified", [doc(2).document_id]: "verified", [doc(3).document_id]: "verified" },
+  };
+  await page.route(`**/api/chat/conversations/${id}/messages*`, (route) =>
+    route.fulfill({ json: messages(id, ledger, "השווי למ\"ר הוא 9,500 ₪ [S1].") }));
+  await page.goto(`/chat?c=${id}`);
+  const reply = assistantMessages(page).last();
+  await reply.getByText(/מקורות ופרטים/).click();
+  const block = reply.getByTestId("ledger");
+  await expect(block.getByTestId("ledger-documents")).toContainText("נתון מאומת מ-3");
+  await expect(block.getByTestId("ledger-documents")).toContainText("התשובה מכסה את כל מסמכי התחום");
+  await expect(block.getByTestId("ledger-data")).toContainText("נקראו (סעיף/טבלה) 0 · נשלפו קטעים בלבד מ-3");
+  await expect(block.getByTestId("ledger-table")).toContainText("הוצגו ערכים מ-2 מתוך 9 שורות");
+  await page.request.delete(`/api/chat/conversations/${id}`);
+});
+
+test("an answer stored before reading levels shows no data-coverage figures", async ({ page }) => {
+  await login(page, USERS.adminB);
+  const { id } = await (await page.request.post("/api/chat/conversations")).json();
+  const doc = (n: number) => ({ document_id: `00000000-0000-0000-0000-00000000000${n}`, title: `שומה סינתטית ${n}` });
+  // the older shape: "checked", no levels, no read / retrieved_only
+  const ledger = { scope_kind: "set", scope_query: "עיר הבדיקה", matching: [doc(1)], checked: [doc(1)],
+    with_data: [doc(1)], not_checked: [], unused: [], partially_read: [], omitted: [], complete: true };
+  await page.route(`**/api/chat/conversations/${id}/messages*`, (route) =>
+    route.fulfill({ json: messages(id, ledger, "השווי למ\"ר הוא 9,500 ₪ [S1].") }));
+  await page.goto(`/chat?c=${id}`);
+  const reply = assistantMessages(page).last();
+  await reply.getByText(/מקורות ופרטים/).click();
+  await expect(reply.getByTestId("ledger-documents")).toContainText("נתון מאומת מ-1");
+  await expect(reply.getByTestId("ledger-data")).toHaveCount(0);
   await page.request.delete(`/api/chat/conversations/${id}`);
 });

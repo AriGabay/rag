@@ -21,6 +21,11 @@ Four separate measures, never folded into one number:
 ``--rescore <results.json>`` grades stored answers again with the set's current expectations (no model calls),
 so two runs can be compared on the same answers and expectations.
 
+A reference answer found wrong is corrected in the set, not silently: the turn keeps the original expectation in
+``reference_corrected: {date, evidence, was}`` beside the corrected ``expect``. Every run and rescore grades such
+a turn both ways, and the report gives the original automated score and the score after reference corrections
+apart, with each correction and its evidence. The cost table gives the cost per conversation that passed.
+
 Each check passes or fails on its own; the report lists every failure with the text that caused it, so a
 person can read the failing answers.
 """
@@ -136,6 +141,8 @@ def run_turn(c: httpx.Client, cid: str, content: str) -> dict:
         m = c.get(f"/api/chat/messages/{mid}").json()
         if m["status"] not in ("running", "cancelling") or time.monotonic() - started > TURN_TIMEOUT:
             m["_seconds"] = round(time.monotonic() - started, 1)
+            d = c.get(f"/api/chat/messages/{mid}/diagnostics")  # what verification removed, and why
+            m["_diagnostics"] = d.json() if d.status_code == 200 else None
             return m
         time.sleep(POLL_SECONDS)
 
@@ -176,19 +183,22 @@ def check_answers(c: httpx.Client, docs: dict, items: list[dict]) -> list[Result
         for i, t in enumerate(it["turns"]):
             m = run_turn(c, cid, t["ask"])
             problems, structured, lines = grade(m, t.get("expect") or {}, docs, i + 1)
+            original = original_grade(m, t, docs)
             ok = ok and not problems and not structured
             detail += lines
             a = m.get("answer") or {}
             turns.append({"ask": t["ask"], "status": m["status"], "answer_status": a.get("status"),
-                          "structured_problems": structured,
+                          "structured_problems": structured, "passed_original_reference": original,
                           "markdown": a.get("markdown"), "seconds": m["_seconds"], "problems": problems,
                           "sources": [f"{s['id']} {s['title']} — {s['location']}" for s in a.get("sources") or []],
                           "searches": a.get("searches"), "verification": a.get("verification"),
+                          "diagnostics": m.get("_diagnostics"),
                           "progress": [p["label"] for p in m.get("progress") or []], "error": m.get("error"),
                           # the full payload, so the turn can be rescored later with new expectations
                           "answer": a, "usage": m.get("usage") or []})
         out.append(Result("answers", it["id"], ok, detail, {"category": it.get("category"), "turns": turns,
-                                                            "conversation_id": cid}))
+                                                            "conversation_id": cid,
+                                                            "corrections": corrections_of(it["turns"])}))
     return out
 
 
@@ -198,6 +208,21 @@ def grade(m: dict, expect: dict, docs: dict, turn: int) -> tuple[list[str], list
     structured = structured_check(m.get("answer"), expect) if m["status"] == "done" else []
     detail = [f"תור {turn}: {p}" for p in problems] + [f"תור {turn} (מבני): {p}" for p in structured]
     return problems, structured, detail
+
+
+def corrections_of(spec_turns: list[dict]) -> list[dict]:
+    """The reference corrections of a conversation's turns, for the report (without the original reference)."""
+    return [{"turn": i + 1, **{k: v for k, v in t["reference_corrected"].items() if k != "was"}}
+            for i, t in enumerate(spec_turns) if t.get("reference_corrected")]
+
+
+def original_grade(m: dict, spec_turn: dict, docs: dict) -> bool | None:
+    """For a turn whose reference was corrected: whether it passed under the original (wrong) reference."""
+    fix = spec_turn.get("reference_corrected")
+    if not fix:
+        return None
+    problems, structured, _ = grade(m, fix.get("was") or {}, docs, 0)
+    return not problems and not structured
 
 
 def rescore(spec: dict, stored: list[dict]) -> list[Result]:
@@ -216,9 +241,11 @@ def rescore(spec: dict, stored: list[dict]) -> list[Result]:
                 "sources": [{"title": s.split(" ", 1)[1].rsplit(" — ", 1)[0]} for s in t.get("sources") or []]}}
             problems, structured, lines = grade(m, spec_turn.get("expect") or {}, {}, i + 1)
             t["problems"], t["structured_problems"] = problems, structured
+            t["passed_original_reference"] = original_grade(m, spec_turn, {})
             ok = ok and not problems and not structured
             detail += lines
-        out.append(Result("answers", r["id"], ok, detail, r["data"]))
+        out.append(Result("answers", r["id"], ok, detail,
+                          r["data"] | {"corrections": corrections_of(items[r["id"]]["turns"])}))
     return out
 
 
@@ -267,7 +294,22 @@ def usage_summary(results: list[Result]) -> list[str]:
             f"- טוקני פלט לתור: ממוצע {mean(per(lambda t: tok(t, 'output_tokens'))):,.0f}",
             f"- עלות לתור (מחירון {PRICE_INPUT}/{PRICE_CACHED}/{PRICE_OUTPUT}$ למיליון): ממוצע "
             f"{mean(per(cost)):.4f}$, סה\"כ {sum(per(cost)):.3f}$",
-            f"- זמן לתור: חציון {pct(secs, 0.5)} שנ׳, p90 {pct(secs, 0.9)} שנ׳, מקסימום {max(secs)} שנ׳", ""]
+            f"- זמן לתור: חציון {pct(secs, 0.5)} שנ׳, p90 {pct(secs, 0.9)} שנ׳, מקסימום {max(secs)} שנ׳",
+            f"- עלות לשיחה שעברה: {cost_per_pass(results, sum(per(cost)))}", ""]
+
+
+def cost_per_pass(results: list[Result], total: float) -> str:
+    passed = sum(r.ok for r in results if r.kind == "answers")
+    return f"{total / passed:.4f}$ ({passed} שיחות עברו)" if passed else "אין שיחות שעברו"
+
+
+def original_score(rs: list[Result]) -> int:
+    """Conversations that passed under the original references: a corrected turn counts as it graded before."""
+    def turn_ok(t: dict) -> bool:
+        if t.get("passed_original_reference") is not None:
+            return t["passed_original_reference"]
+        return not t.get("problems") and not t.get("structured_problems")
+    return sum(all(turn_ok(t) for t in r.data.get("turns", [])) for r in rs)
 
 
 def report(results: list[Result], path: Path, title: str) -> str:
@@ -283,6 +325,12 @@ def report(results: list[Result], path: Path, title: str) -> str:
             regex_ok = sum(all(not t.get("problems") for t in r.data.get("turns", [])) for r in rs)
             struct_ok = sum(all(not t.get("structured_problems") for t in r.data.get("turns", [])) for r in rs)
             lines.append(f"\nשכבת הביטויים (רגרסיה): {regex_ok}/{len(rs)}; שכבה מבנית: {struct_ok}/{len(rs)}")
+            fixes = [(r.id, c) for r in rs for c in r.data.get("corrections") or []]
+            if fixes:
+                lines.append(f"\nציון אוטומטי מול הייחוס המקורי: {original_score(rs)}/{len(rs)}; אחרי תיקוני ייחוס: "
+                             f"{passed}/{len(rs)}")
+                lines += [f"- תיקון ייחוס {cid} תור {c['turn']} ({c.get('date', '')}): {c.get('evidence', '')}"
+                          for cid, c in fixes]
         if kind == "answers":
             cats: dict[str, list[Result]] = {}
             for r in rs:

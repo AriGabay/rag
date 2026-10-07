@@ -28,7 +28,7 @@ def _ws(*texts: str, kind: str = "context") -> Workspace:
 def _answer(markdown: str) -> FinalAnswer:
     return FinalAnswer(status="answered", answer_markdown=markdown, claims=[], clarification_question="",
                        missing_info="", referenced_document_ids=[], scope_kind="focused", scope_query="", omitted=[],
-                       focus=None)
+                       focus=None, requested=[])
 
 
 def _tag(i: int) -> str:
@@ -56,7 +56,7 @@ def _judge(rule) -> ScriptedProvider:
     return p
 
 
-SOURCE = "סיכום: השווי למ\"ר בנוי הוא 9,500 ₪. דמי השכירות הם 55 ₪ למ\"ר לחודש. הנכס פנוי."
+SOURCE = "סיכום: השווי למ\"ר הוא 9,500 ₪. דמי השכירות הם 55 ₪ למ\"ר לחודש. הנכס פנוי."
 
 
 # --- structural kinds -----------------------------------------------------------------------------------------
@@ -78,6 +78,29 @@ def test_structural_units(raw, kind):
 def test_claims_are_not_structural(raw):
     (u,) = split_units(raw)
     assert structural_kind(u) is None
+
+
+# A shape is not evidence: only one-word, digit-free navigation text passes without a verdict.
+@pytest.mark.parametrize("raw", ["## מקורות", "**סיכום**", "### פירוט:", "האם תרצה פירוט נוסף?", "בנוסף,"])
+def test_neutral_navigation_is_exempt(raw):
+    (u,) = split_units(raw)
+    assert verify.exempt_without_verdict(u)
+
+
+@pytest.mark.parametrize("raw", [
+    "# הנכס פנוי", "## השווי נקבע לפי גישת ההשוואה", "**הנכס מושכר:**", "**השווי נקבע ל-9,800 ₪**",
+    "### הדקל 14", "להלן הנתונים:",
+])
+def test_claims_styled_as_structure_are_not_exempt(raw):
+    (u,) = split_units(raw)
+    assert not verify.exempt_without_verdict(u)
+
+
+def test_a_claim_table_header_is_not_exempt():
+    header, _row = split_units("| הנכס פנוי | כן |\n|---|---|\n| הגפן 3 | 4 חדרים [S1] |")
+    assert header.table_header and not verify.exempt_without_verdict(header)
+    (single,) = split_units("| נכס |\n|---|")[:1]
+    assert verify.exempt_without_verdict(single)
 
 
 # --- fail closed --------------------------------------------------------------------------------------------
@@ -107,14 +130,50 @@ def test_a_verbal_claim_without_a_verdict_fails():
 
 
 def test_a_structural_unit_without_a_verdict_passes():
-    p = _judge(lambda t: None if t.startswith("##") or t.endswith(":") else "supported")
-    r = verify_answer(p, _answer("## סיכום\nלהלן הנתונים:\nהשווי למ\"ר הוא 9,500 ₪ [S1]."), _ws(SOURCE), "?", [])
+    p = _judge(lambda t: None if t.startswith("##") or t.startswith("**") else "supported")
+    r = verify_answer(p, _answer("## סיכום\n**הנתונים**\nהשווי למ\"ר הוא 9,500 ₪ [S1]."), _ws(SOURCE), "?", [])
     assert r.ok
+
+
+def test_claims_styled_as_headings_labels_or_table_headers_fail_when_the_judge_skips_them():
+    md = ("# הנכס פנוי\n**השווי נקבע ל-9,800 ₪**\n**הנכס מושכר:**\n## מקורות\n"
+          "השווי למ\"ר הוא 9,500 ₪ [S1].\n\n| הנכס פנוי | כן |\n|---|---|\n| הגפן | 9,500 ₪ [S1] |")
+    p = _judge(lambda t: "supported" if t.startswith("השווי למ") or t.startswith("| הגפן") else None)
+    a = _answer(md)
+    r = verify_answer(p, a, _ws(SOURCE + " 9,800"), "?", [])
+    failed = sorted(x.unit.text for x in r.problems)
+    assert failed == sorted(["# הנכס פנוי", "**השווי נקבע ל-9,800 ₪**", "**הנכס מושכר:**", "| הנכס פנוי | כן |"])
+    out = r.apply(a).answer_markdown
+    assert "## מקורות" in out and "השווי למ\"ר הוא 9,500" in out
+    # the failed header takes its whole table with it: no separator or orphan row is left behind
+    assert "|" not in out and "הגפן" not in out
+
+
+def test_navigation_verdict_is_accepted_only_for_headings_and_labels():
+    def rule(t):
+        if t.startswith("##"):
+            return "navigation"
+        return "navigation" if "פנוי" in t else "supported"
+    md = "## פירוט לפי מסמך\nהנכס פנוי [S1].\nהשווי למ\"ר הוא 9,500 ₪ [S1]."
+    r = verify_answer(_judge(rule), _answer(md), _ws(SOURCE), "?", [])
+    assert [x.unit.text for x in r.problems] == ["הנכס פנוי ."]
+
+
+def test_not_factual_on_a_multi_word_heading_is_not_accepted():
+    p = _judge(lambda t: "not_factual" if t.startswith("##") else "supported")
+    r = verify_answer(p, _answer("## הנכס פנוי\nהשווי למ\"ר הוא 9,500 ₪ [S1]."), _ws(SOURCE), "?", [])
+    assert [x.unit.text for x in r.problems] == ["## הנכס פנוי"]
+
+
+def test_navigation_heading_with_an_amount_is_not_accepted():
+    p = _judge(lambda t: "navigation" if t.startswith("##") else "supported")
+    r = verify_answer(p, _answer("## השווי 9,500 ₪\nהשווי למ\"ר הוא 9,500 ₪ [S1]."), _ws(SOURCE), "?", [])
+    assert [x.unit.text for x in r.problems] == ["## השווי 9,500 ₪"]
 
 
 def test_not_factual_on_a_number_is_not_accepted():
     p = _judge(lambda t: "not_factual")
-    r = verify_answer(p, _answer("השווי הוא 9,500 ₪ [S1].\nלהלן הפירוט [S1]:"), _ws(SOURCE), "?", [])
+    r = verify_answer(p, _answer("השווי הוא 9,500 ₪ [S1].\nאשמח לעזור בשאלות נוספות."), _ws(SOURCE), "?", [])
     assert [x.unit.text for x in r.problems] == ["השווי הוא 9,500 ₪ ."]
 
 
@@ -242,13 +301,23 @@ def test_vat_claim_backed_by_a_measurement_record():
     assert verify.deterministic(split_units("דמי השכירות הם 58 ₪ ללא מע\"מ [M1]."), ws, "?") == []
 
 
-def test_a_numbered_heading_or_table_header_judged_not_factual_is_kept():
-    p = _judge(lambda t: "not_factual" if t.startswith("###") or "שווי 2024" in t else "supported")
+def test_a_numbered_heading_or_table_header_judged_navigation_or_not_factual_is_kept():
+    def rule(t):
+        if t.startswith("###"):
+            return "navigation"
+        return "not_factual" if "שווי 2024" in t else "supported"
     md = "### הדקל 14\n| נכס | שווי 2024 |\n|---|---|\n| הדקל 14 | 9,500 ₪ [S1] |"
-    r = verify_answer(p, _answer(md), _ws(SOURCE + " הדקל 14 2024"), "?", [])
+    r = verify_answer(_judge(rule), _answer(md), _ws(SOURCE + " הדקל 14 2024"), "?", [])
     assert r.ok, [x.reason for x in r.problems]
     (head, header, row) = split_units(md)
     assert structural_kind(header) == "table_header" and structural_kind(row) is None
+
+
+def test_a_table_header_asserting_a_value_judged_not_factual_fails():
+    p = _judge(lambda t: "not_factual" if "פנוי" in t else "supported")
+    md = "| הנכס פנוי | 9,500 ₪ |\n|---|---|\n| הגפן | 9,500 ₪ [S1] |"
+    r = verify_answer(p, _answer(md), _ws(SOURCE), "?", [])
+    assert [x.unit.text for x in r.problems] == ["| הנכס פנוי | 9,500 ₪ |"]
 
 
 @pytest.mark.parametrize("claim", [
@@ -258,3 +327,12 @@ def test_a_numbered_heading_or_table_header_judged_not_factual_is_kept():
 def test_vat_skips_a_year_an_area_or_a_parenthesized_number(claim):
     source = "השווי למ\"ר נקבע ל-9,500 ₪, לא כולל מע\"מ. שטח הנכס 120 מ\"ר. השומה נכונה לשנת 2024."
     assert _deterministic(claim, source) == []
+
+
+def test_a_failed_header_and_a_failed_row_remove_the_whole_table():
+    md = "השווי למ\"ר הוא 9,500 ₪ [S1].\n\n| הנכס פנוי | כן |\n|---|---|\n| הגפן | 9,500 ₪ [S1] |\n| הזית | 7 [S1] |"
+    a = _answer(md)
+    r = verify_answer(_judge(lambda t: "supported" if t.startswith("השווי") or "הגפן" in t else None), a, _ws(SOURCE),
+                      "?", [])
+    out = r.apply(a).answer_markdown
+    assert "|" not in out and "הגפן" not in out and out.startswith("השווי למ\"ר הוא 9,500")

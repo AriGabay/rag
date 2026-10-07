@@ -76,7 +76,7 @@ def test_answer_from_searched_passage_is_cited_and_verified(client, office, monk
     assert a["kind"] == "rag" and a["status"] == "answered"
     assert "55" in a["markdown"] and "[S1]" in a["markdown"]
     assert [s["id"] for s in a["sources"]] == ["S1"] and a["sources"][0]["document_id"] == office.doc
-    assert a["verification"]["judged"] and a["verification"]["problems"] == []
+    assert a["verification"]["judged"] and a["verification"]["removed"] == 0
     labels = [p["step"] for p in m["progress"]]
     assert labels[:2] == ["queued", "understand"] and "search" in labels and "verify" in labels
     # the cost of the turn: token counts per model call, nothing of the content
@@ -98,7 +98,9 @@ def test_number_no_source_states_is_repaired_or_removed(client, office, monkeypa
     a = m["answer"]
     assert "70" not in a["markdown"]
     assert a["status"] == "partial"
-    assert any("70" in p["reason"] for p in a["verification"]["problems"])
+    assert a["verification"]["removed"] == 1 and "problems" not in a["verification"]
+    d = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()
+    assert any("70" in p["reason"] for p in d["removed"]) and len(d["rounds"]) == 3
     # the repair step told the model what failed
     assert any("70" in str(i) for i in agent.seen[2])
 
@@ -130,9 +132,10 @@ def test_citing_an_id_never_issued_fails_verification(client, office, monkeypatc
     agent = ScriptedAgent([final("השווי נקבע 9,500 ₪ [S7].")] * 3)
     cloud(monkeypatch, office, agent)
     login(client, "admin-a@example.test")
-    a = send(client, new_conversation(client), "מה השווי?")["answer"]
-    assert "[S7]" not in a["markdown"]
-    assert any("S7" in p["reason"] for p in a["verification"]["problems"])
+    m = send(client, new_conversation(client), "מה השווי?")
+    assert "[S7]" not in m["answer"]["markdown"]
+    d = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()
+    assert any("S7" in p["reason"] for p in d["removed"])
 
 
 def test_judge_rejects_a_meaning_the_source_does_not_give(client, office, monkeypatch):
@@ -154,7 +157,7 @@ def test_follow_up_sees_history_and_reopens_prior_sources_under_current_permissi
     first_answer = send(client, cid, "מה דמי השכירות הראויים?")
     assert first_answer["status"] == "done", first_answer
     second = ScriptedAgent([[call("open_source", source_id="P1", scope="neighbors")],
-                            final("לפי אותו מקור, השווי הוא 9,500 ₪ ללא מע\"מ [S1].")])
+                            final("לפי אותו מקור, השווי למ\"ר בנוי ברוטו הוא 9,500 ₪ ללא מע\"מ [S1].")])
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
     m = send(client, cid, "ומה השווי באותה שומה?")
     context = second.seen[0][0]["content"]
@@ -204,7 +207,7 @@ def test_provider_failure_is_reported_and_retry_runs_again(client, office, monke
     m = send(client, new_conversation(client), "מה השווי?")
     assert m["status"] == "failed" and m["answer"] is None and "נסות שוב" in m["error"]
     good = ScriptedAgent([[call("search", query="שווי", document_ids=None, limit=None)],
-                          final("השווי נקבע 9,500 ₪ למ\"ר [S1].")])
+                          final("השווי נקבע 9,500 ₪ למ\"ר בנוי ברוטו [S1].")])
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: good)
     r = client.post(f"/api/chat/messages/{m['id']}/retry")
     assert r.status_code == 200
@@ -333,7 +336,7 @@ def test_a_passage_returned_again_is_referenced_not_resent_and_still_citable(cli
     second = agent.tool_outputs(2)[-1]
     assert 'same_as="S1"' in second and "9,500" not in second  # the summary passage is not sent twice
     a = m["answer"]
-    assert a["status"] == "answered" and a["verification"]["problems"] == []
+    assert a["status"] == "answered" and a["verification"]["removed"] == 0
 
 
 def test_earlier_answers_reach_the_model_shortened_and_the_users_words_whole(client, office, monkeypatch):
@@ -350,3 +353,149 @@ def test_earlier_answers_reach_the_model_shortened_and_the_users_words_whole(cli
     context = next(items[0]["content"] for items in agent.seen if "ומה עוד?" in str(items[0].get("content")))
     assert question.strip() in context
     assert "הסבר נוסף על הסביבה. " * 40 not in context and "…" in context
+
+
+# --- follow-ups resolved in context (app.chat.resolve) ---------------------------------------------------------
+
+def _rent_focus(doc: str) -> dict:
+    return {"metric_as_written": "דמ\"ש ראויים למ\"ר", "metric_kind": "rent_per_area", "unit": "ILS_per_sqm",
+            "period": "month", "area_basis": "", "vat": "unknown", "subject": "הנכס ברחוב הגפן",
+            "value_role": "appraiser_determination", "document_ids": [doc]}
+
+
+def _value_focus(doc: str, kind: str) -> dict:
+    return _rent_focus(doc) | {"metric_as_written": "השווי למ\"ר בנוי ברוטו", "metric_kind": kind,
+                               "unit": "ILS_per_sqm" if kind.endswith("_per_area") else "ILS", "period": "none",
+                               "vat": "excluded"}
+
+
+def _resolution(**kw) -> dict:
+    return {"kind": "correction", "standalone_question": "מה השווי?", "changed_fields": [], "metric_kind": "unknown",
+            "unit": "unknown", "period": "unknown", "area_basis": "", "vat": "unknown", "subject": "",
+            "document_ids": [], "ambiguity": ""} | kw
+
+
+def _first_turn(client, office, monkeypatch) -> str:
+    first = ScriptedAgent([[call("search", query="דמי שכירות ראויים", document_ids=None, limit=None)],
+                           final("דמי השכירות הראויים הם 55 ₪ למ\"ר לחודש [S1].", focus=_rent_focus(office.doc))])
+    cloud(monkeypatch, office, first)
+    login(client, "admin-a@example.test")
+    cid = new_conversation(client)
+    assert send(client, cid, "מה דמי השכירות הראויים?")["status"] == "done"
+    return cid
+
+
+def test_a_rent_to_value_correction_is_resolved_per_area_and_a_total_is_repaired(client, office, monkeypatch):
+    cid = _first_turn(client, office, monkeypatch)
+    # the resolver errs: a total value, with the rent's period; the server keeps the per-m² class and drops it
+    second = ScriptedAgent([
+        [call("search", query="שווי", document_ids=[office.doc], limit=None)],
+        final("השווי הוא 9,500 ₪ למ\"ר בנוי ברוטו, ללא מע\"מ [S1].", focus=_value_focus(office.doc, "value")),
+        final("השווי למ\"ר בנוי ברוטו הוא 9,500 ₪, ללא מע\"מ [S1].",
+              focus=_value_focus(office.doc, "value_per_area"))])
+    second.on("agent", _resolution(changed_fields=[{"field": "metric_kind", "user_words": "השווי"}],
+                                   metric_kind="value", unit="ILS", period="month", document_ids=[office.doc]))
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
+    m = send(client, cid, "דווקא את השווי, לא השכירות")
+    assert m["status"] == "done", m
+    task = second.seen[0][0]["content"]
+    assert "סוג המדד: שווי ליחידת שטח" in task and "יחידה: ₪ למ״ר" in task and "תקופה: לא צוין" in task
+    assert "דווקא את השווי, לא השכירות" in task  # the user's own words are still shown
+    req = m["answer"]["request"]
+    assert req["metric_kind"] == "value_per_area" and req["period"] == "unknown" and req["document_ids"] == [office.doc]
+    # the first answer named a total: a problem for the repair round, which answered the requested datum
+    assert len(second.seen) == 3 and "שהתבקש" not in m["answer"]["markdown"]
+    assert m["answer"]["status"] == "answered" and "שימו לב" not in m["answer"]["markdown"]
+
+
+def test_a_total_that_survives_the_repairs_is_said_plainly(client, office, monkeypatch):
+    cid = _first_turn(client, office, monkeypatch)
+    total = final("השווי הוא 9,500 ₪ למ\"ר בנוי ברוטו, ללא מע\"מ [S1].", focus=_value_focus(office.doc, "value"))
+    second = ScriptedAgent([[call("search", query="שווי", document_ids=[office.doc], limit=None)], total, total, total])
+    second.on("agent", _resolution(changed_fields=[{"field": "metric_kind", "user_words": "השווי"}],
+                                   metric_kind="value_per_area", unit="ILS_per_sqm", document_ids=[office.doc]))
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
+    a = send(client, cid, "רציתי את השווי ולא את השכירות")["answer"]
+    assert a["status"] == "partial" and "שימו לב" in a["markdown"] and "שווי ליחידת שטח" in a["markdown"]
+
+
+def test_an_ambiguous_correction_gets_one_question_and_no_tools(client, office, monkeypatch):
+    cid = _first_turn(client, office, monkeypatch)
+    second = ScriptedAgent([])
+    second.on("agent", _resolution(changed_fields=[{"field": "metric_kind", "user_words": "השווי"}],
+                                   metric_kind="value_per_area", ambiguity="התכוונת לשווי למ\"ר או לשווי הכולל?"))
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
+    m = send(client, cid, "רציתי את השווי")
+    assert m["status"] == "done" and m["answer"]["status"] == "clarification"
+    assert m["answer"]["markdown"] == "התכוונת לשווי למ\"ר או לשווי הכולל?" and second.seen == []
+    assert m["answer"]["verification"]["judged"] and m["answer"]["verification"]["judge_status"] == "no_claims"
+
+
+def test_a_failed_resolution_falls_back_to_the_message_and_focus(client, office, monkeypatch):
+    cid = _first_turn(client, office, monkeypatch)
+    second = ScriptedAgent([[call("search", query="שווי", document_ids=None, limit=None)],
+                            final("השווי למ\"ר בנוי ברוטו הוא 9,500 ₪, ללא מע\"מ [S1].")])
+    second.on("agent", CallStatus.TIMEOUT)  # the resolver is down
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
+    m = send(client, cid, "רציתי את השווי")
+    assert m["status"] == "done" and m["answer"]["request"] is None
+    assert any(u["purpose"] == "resolve" and u["status"] == "timeout" for u in m["usage"])
+    assert "הנתון שבמרכז השיחה" in second.seen[0][0]["content"]
+
+
+def test_an_answer_without_a_focus_hands_its_request_to_the_next_turn(client, office, monkeypatch):
+    cid = _first_turn(client, office, monkeypatch)
+    second = ScriptedAgent([[call("search", query="מקור", document_ids=[office.doc], limit=None)],
+                            final("המקור הוא סעיף הסיכום של השומה [S1].")])
+    second.on("agent", _resolution(kind="follow_up", metric_kind="rent_per_area", unit="ILS_per_sqm",
+                                   period="month", document_ids=[office.doc]))
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
+    assert send(client, cid, "מאיפה זה לקוח?")["answer"]["focus"] is None
+    third = ScriptedAgent([final("לא נמצא.", "not_found")])
+    third.on("agent", _resolution(kind="follow_up"))
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: third)
+    send(client, cid, "ומה עוד?")
+    resolve_input = next(c.input for c in third.calls if c.purpose.value == "agent")
+    assert "rent_per_area" in resolve_input
+
+
+def test_a_new_topic_leaves_the_previous_datum_out_of_the_task(client, office, monkeypatch):
+    cid = _first_turn(client, office, monkeypatch)
+    second = ScriptedAgent([final("לא נמצא.", "not_found")])
+    second.on("agent", _resolution(kind="new_topic", changed_fields=[{"field": "subject", "user_words": "תיאור הנכס"}],
+                                   subject="תיאור הנכס", standalone_question="מה תיאור הנכס?"))
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
+    send(client, cid, "שאלה אחרת: מה תיאור הנכס?")
+    task = second.seen[0][0]["content"]
+    assert "הנתון שבמרכז השיחה" not in task and "ההודעות האחרונות בשיחה" in task
+
+
+def test_a_follow_up_keeps_the_previous_datum_in_the_task(client, office, monkeypatch):
+    cid = _first_turn(client, office, monkeypatch)
+    second = ScriptedAgent([final("לא נמצא.", "not_found")])
+    second.on("agent", _resolution(kind="follow_up"))
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
+    send(client, cid, "ומה המקור לזה?")
+    assert "הנתון שבמרכז השיחה" in second.seen[0][0]["content"]
+
+
+def test_a_clarification_that_states_a_figure_is_not_used(client, office, monkeypatch):
+    cid = _first_turn(client, office, monkeypatch)
+    second = ScriptedAgent([[call("search", query="שווי", document_ids=[office.doc], limit=None)],
+                            final("השווי למ\"ר בנוי ברוטו הוא 9,500 ₪, ללא מע\"מ [S1].")])
+    second.on("agent", _resolution(changed_fields=[{"field": "metric_kind", "user_words": "השווי"}],
+                                   metric_kind="value_per_area", ambiguity="התכוונת ל-9,500 ₪ למ\"ר או ל-13,700?"))
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
+    m = send(client, cid, "רציתי את השווי")
+    assert m["answer"]["status"] != "clarification" and len(second.seen) == 2  # the turn went on with tools
+
+
+def test_a_qualifier_still_missing_after_the_repair_is_written_in_without_a_rewrite(client, office, monkeypatch):
+    bare = final("השווי למ\"ר הוא 9,500 ₪, ללא מע\"מ [S1].")  # the source says "למ"ר בנוי ברוטו"
+    agent = ScriptedAgent([[call("search", query="שווי", document_ids=None, limit=None)], bare, bare, bare])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    a = send(client, new_conversation(client), "מה השווי למ\"ר?")["answer"]
+    assert len(agent.seen) == 3  # first answer and one repair; no rewrite that would drop the datum
+    assert "9,500 ₪ (מ״ר בנוי ברוטו, כפי שנכתב במקור)" in a["markdown"]
+    assert a["verification"]["annotated"] == 1 and a["verification"]["removed"] == 0
