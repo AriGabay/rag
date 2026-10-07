@@ -46,7 +46,8 @@ def cited_documents(ws: Workspace, markdown: str) -> dict[str, str]:
     out: dict[str, str] = {}
     for i in cited_ids(markdown):
         if i in ws.sources:
-            out[str(ws.sources[i].document_id)] = ws.sources[i].title
+            if not ws.sources[i].is_listing:  # a listing names documents; it is not one of them
+                out[str(ws.sources[i].document_id)] = ws.sources[i].title
         elif i in ws.measurements:
             out[str(ws.measurements[i].document_id)] = ws.measurements[i].title
         elif i in ws.computations:
@@ -173,6 +174,26 @@ def short_tables(tables: list[dict]) -> list[dict]:
     return [t for t in tables if t["presented"] < t["rows"]]
 
 
+def _membership(ws: Workspace, answer: FinalAnswer, listings: list) -> tuple[dict, FinalAnswer]:
+    """An answer about which documents are in a set (a count, a list) that cites only listings: it covers the set
+    when every page of the listing was read; the documents' content was not read, and the note says so."""
+    scope = ws.scope or {"query": "", "matching": [], "pages": 1, "pages_read": {1}}
+    pages, read = scope.get("pages") or 1, len(scope.get("pages_read") or ())
+    complete = read >= pages
+    query = scope.get("query") or ""
+    what = f"לתחום \"{query}\"" if query else "במאגר"
+    note = (f"**כיסוי:** רשימת {len(scope['matching'])} המסמכים {what} נבדקה לפי התאמת המונחים (בכותרת או בתוכן); "
+            "תוכן המסמכים לא נקרא.")
+    if not complete:
+        note += f" נקראו {read} מתוך {pages} עמודי הרשימה, ולכן הספירה חלקית."
+    ledger = {"scope_kind": "set", "scope_query": query, "membership": True, "cited": [],
+              "matching": scope["matching"], "pages": pages, "pages_read": read, "complete": complete,
+              "note": note, "tables": []}
+    status = "partial" if not complete and answer.status == "answered" else answer.status
+    return ledger, answer.model_copy(update={
+        "answer_markdown": (answer.answer_markdown.rstrip() + "\n\n> " + note).strip(), "status": status})
+
+
 def build(ws: Workspace, answer: FinalAnswer, question: str) -> tuple[dict, FinalAnswer]:
     """The coverage ledger of the answer, and the answer with the coverage note and status cap when needed."""
     from app.chat.tools import LEVELS, new_scope
@@ -181,6 +202,10 @@ def build(ws: Workspace, answer: FinalAnswer, question: str) -> tuple[dict, Fina
     cited = cited_documents(ws, answer.answer_markdown)
     for doc, title in cited.items():  # its datum passed verification (what failed was removed before this)
         ws.touch(doc, title, "verified")
+    ids = cited_ids(answer.answer_markdown)
+    listings = [ws.sources[i] for i in ids if i in ws.sources and ws.sources[i].is_listing]
+    if listings and len(listings) == len(ids):
+        return _membership(ws, answer, listings)
     scope_kind = answer.scope_kind
     ledger: dict = {"scope_kind": scope_kind, "scope_query": answer.scope_query or "",
                     "cited": [{"document_id": d, "title": t} for d, t in cited.items()],

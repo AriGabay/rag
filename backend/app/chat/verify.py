@@ -364,9 +364,12 @@ def _texts(ws: Workspace, ids: list[str]) -> list[tuple[str, str]]:
 
 
 def _all_numbers(ws: Workspace) -> set[str]:
+    """Every number the turn's evidence states, for a unit that cites nothing (a listing's counts and house
+    numbers are not: a count over a set must cite the listing)."""
     nums: set[str] = set()
     for s in ws.sources.values():
-        nums |= numbers_in(s.text, words=True)
+        if not s.is_listing:
+            nums |= numbers_in(s.text, words=True)
     for m in ws.measurements.values():
         nums |= numbers_in(f"{m.row.value_text} {m.row.quote}", words=True)
     for c in ws.computations.values():
@@ -475,7 +478,8 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
             cited.add(str(len(c.measurement_ids)))
             cited.add(str(c.documents))
         pool = cited if u.ids else everything
-        missing = [n for n in numbers_in(u.text) - question_numbers if n not in pool and not _small_ordinal(n, u.text)]
+        missing = [n for n in numbers_in(u.text) - question_numbers if n not in pool and not (
+            _small_ordinal(n, u.text) and not _document_count(n, u.text))]
         if missing:
             problems.append(Problem(u, "מספרים שאינם מופיעים במקורות המצוטטים: " + ", ".join(sorted(missing)[:5])))
             continue
@@ -493,6 +497,12 @@ def _small_ordinal(n: str, text: str) -> bool:
         return int(n) <= 10 and bool(re.search(rf"\b{n}\s+(?:מסמכים|מסמך|ערכים|נתונים|שומות|מקורות|טבלאות)", text))
     except ValueError:
         return False
+
+
+def _document_count(n: str, text: str) -> bool:
+    """A count of documents in the repository ("3 שומות", "2 מסמכים"): a fact about the set, which the server
+    holds to a cited listing or computation that states it — never the answer's own count."""
+    return bool(re.search(rf"(?<![\d,.]){re.escape(n)}\s+(?:מסמכים|מסמך|שומות|שומה|חוות\s+דעת|דוחות)", text))
 
 
 _DIGIT = re.compile(r"\d")

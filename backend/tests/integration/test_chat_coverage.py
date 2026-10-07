@@ -77,7 +77,7 @@ def test_set_answer_that_read_one_of_two_matching_documents_says_so(client, setu
     a, _ = _ask(client, setup, monkeypatch, [
         [call("find_documents", query=PLACE, page=None)],
         [call("search", query="שווי למ\"ר", document_ids=[setup.d1], limit=None)],
-        final("השווי למ\"ר בנוי הוא 9,500 ₪ [S1].", scope="set", scope_query=PLACE)])
+        final("השווי למ\"ר בנוי הוא 9,500 ₪ [S2].", scope="set", scope_query=PLACE)])  # S1: the listing
     led = a["ledger"]
     assert _titles(led["matching"]) == {f"שומה הגפן 12 {PLACE}", f"שומה הזית 7 {PLACE}"}  # not the third
     assert _titles(led["not_checked"]) == {f"שומה הזית 7 {PLACE}"} and led["complete"] is False
@@ -224,10 +224,10 @@ def test_list_documents_pages_and_records_the_scope(setup):
         make_document(setup, setup.default_group_id, f"מסמך {n:03d}", sha=f"{n:064d}")
     ws = T.Workspace(ctx=setup.ctx())
     first = T.tool_list_documents(ws, None)
-    assert first.startswith("עמוד 1 מתוך 2; סה\"כ 75 מסמכים") and "page=2" in first
+    assert "עמוד 1 מתוך 2; סה\"כ 75 מסמכים" in first and "page=2" in first
     assert len(ws.scope["matching"]) == 75 and ws.scope["pages_read"] == {1}
     second = T.tool_list_documents(ws, None, 2)
-    assert second.startswith("עמוד 2 מתוך 2") and ws.scope["pages_read"] == {1, 2}
+    assert "עמוד 2 מתוך 2" in second and ws.scope["pages_read"] == {1, 2}
     titles = re.findall(r'"(מסמך \d{3}|שומה [^"]+)"', first + second)
     assert len(titles) == len(set(titles)) == 75  # every document exactly once across the pages
     assert "אין עמוד 3" in T.run_tool(ws, "list_documents", json.dumps({"query": None, "page": 3}))

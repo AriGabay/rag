@@ -374,7 +374,7 @@ class Fetcher:
                 occ, _ = source_occurrences(cand.text, set(forms))
                 if any(key in o.qualifiers.keys(kind) for o in occ):
                     return self.adopt(cand)
-        docs = {self.ws.sources[i].document_id for i in cited}
+        docs = {self.ws.sources[i].document_id for i in cited if self.ws.sources[i].document_id}
         docs |= {self.ws.measurements[i].document_id for i in unit.ids if i in self.ws.measurements}
         for row in self.subject_measurements(docs) if docs else []:
             if not forms & numbers_in(row.value_text or ""):

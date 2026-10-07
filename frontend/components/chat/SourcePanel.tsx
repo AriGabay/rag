@@ -36,7 +36,8 @@ export function SourcePanel({ source, onClose }: { source: ChatSource; onClose: 
     const ctrl = new AbortController();
     const start = source.block_start;
     const end = source.block_end ?? start;
-    if (start == null) return () => ctrl.abort();
+    // a listing of documents has no place in a document: its text is all there is
+    if (start == null || !source.document_id || !source.version_id) return () => ctrl.abort();
     chatApi
       .blocks(source.document_id, source.version_id, Math.max(0, start - WINDOW), (end ?? start) + WINDOW, ctrl.signal)
       .then(setData)
@@ -81,8 +82,11 @@ export function SourcePanel({ source, onClose }: { source: ChatSource; onClose: 
           {source.text}
         </div>
         {error && <div className="alert alert-error">{error}</div>}
-        {source.block_start == null && !error && (
-          <p className="muted">למקור הזה אין מיקום מפורט במסמך; מוצג הקטע שצוטט.</p>
+        {source.kind === "listing" ? (
+          <p className="muted">רשימת המסמכים שהוחזרה בחיפוש בתור הזה (לא קטע ממסמך).</p>
+        ) : (
+          source.block_start == null &&
+          !error && <p className="muted">למקור הזה אין מיקום מפורט במסמך; מוצג הקטע שצוטט.</p>
         )}
         {source.block_start != null && !data && !error && <p className="muted">טוען את המסמך…</p>}
         {data?.blocks.map((b) => (

@@ -526,7 +526,7 @@ export default function ChatApp() {
           }}
         />
       </main>
-      {panel && <SourcePanel key={`${panel.version_id}:${panel.id}`} source={panel} onClose={() => setPanel(null)} />}
+      {panel && <SourcePanel key={`${panel.version_id ?? "listing"}:${panel.id}`} source={panel} onClose={() => setPanel(null)} />}
     </div>
   );
 }

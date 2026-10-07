@@ -337,6 +337,24 @@ function TableLines({ tables }: { tables: LedgerTable[] | undefined }) {
  * and what it did not. Document coverage (a verified datum from each document) is shown apart from data
  * coverage (sections and tables read, or only passages retrieved). */
 function LedgerSection({ ledger }: { ledger: ChatLedger }) {
+  if (ledger.membership) {
+    return (
+      <div className="details-section ledger" data-testid="ledger">
+        <h4>כיסוי</h4>
+        <p data-testid="ledger-documents">
+          {ledger.scope_query ? (
+            <>
+              תחום: <bdi>{ledger.scope_query}</bdi> ·{" "}
+            </>
+          ) : null}
+          {ledger.matching?.length ?? 0} מסמכים ברשימה · נבדקו לפי התאמת המונחים; תוכן המסמכים לא נקרא
+          {ledger.complete
+            ? " · כל עמודי הרשימה נקראו"
+            : ` · נקראו ${ledger.pages_read ?? 0} מתוך ${ledger.pages ?? 1} עמודי הרשימה (ספירה חלקית)`}
+        </p>
+      </div>
+    );
+  }
   if (ledger.scope_kind === "focused") {
     if (!ledger.also_matching?.length && !shortTables(ledger.tables).length) return null;
     return (

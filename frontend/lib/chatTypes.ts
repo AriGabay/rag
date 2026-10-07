@@ -16,8 +16,9 @@ export interface ChatProgressStep {
 
 export interface ChatSource {
   id: string;
-  document_id: string;
-  version_id: string;
+  /** null for a listing of documents (kind "listing"): it names documents, it is not one */
+  document_id: string | null;
+  version_id: string | null;
   title: string;
   section: string | null;
   location: string;
@@ -28,6 +29,7 @@ export interface ChatSource {
   table_index: number | null;
   page_list: number[] | null;
   chunk_id: string | null;
+  listed_document_ids?: string[];
 }
 
 export interface ChatMeasurement {
@@ -119,6 +121,10 @@ export interface ChatLedger {
   omitted?: (LedgerDocument & { what: string; why: string })[];
   also_matching?: LedgerDocument[];
   tables?: LedgerTable[];
+  /** an answer about which documents are in the set (a count, a list), resting on a listing only */
+  membership?: boolean;
+  pages?: number;
+  pages_read?: number;
   complete: boolean;
   note?: string;
 }

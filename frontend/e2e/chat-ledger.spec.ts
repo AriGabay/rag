@@ -113,3 +113,36 @@ test("an answer stored before reading levels shows no data-coverage figures", as
   await expect(reply.getByTestId("ledger-data")).toHaveCount(0);
   await page.request.delete(`/api/chat/conversations/${id}`);
 });
+
+test("a count from a listing shows the listing inline and says the documents were not read", async ({ page }) => {
+  await login(page, USERS.adminB);
+  const { id } = await (await page.request.post("/api/chat/conversations")).json();
+  const docs = [1, 2].map((n) => ({ document_id: `00000000-0000-0000-0000-00000000000${n}`, title: `שומה סינתטית ${n}` }));
+  const md = "יש לנו 2 שומות בעיר הבדיקה [S1].\n\n> **כיסוי:** רשימת 2 המסמכים לתחום \"עיר הבדיקה\" נבדקה; תוכן המסמכים לא נקרא.";
+  const body = messages(id, { scope_kind: "set", scope_query: "עיר הבדיקה", membership: true, matching: docs, pages: 1,
+    pages_read: 1, complete: true, tables: [] }, md);
+  const answer = body.messages[1].answer as Record<string, unknown>;
+  answer.sources = [{ id: "S1", document_id: null, version_id: null, title: "מסמכים בתחום \"עיר הבדיקה\"",
+    section: null, location: "רשימת מסמכים", kind: "listing",
+    text: "תחום: מסמכים שמכילים את כל המונחים \"עיר הבדיקה\"\nעמוד 1 מתוך 1; סה\"כ 2 מסמכים מתאימים\n- \"שומה סינתטית 1\"\n- \"שומה סינתטית 2\"",
+    block_start: null, block_end: null, table_index: null, page_list: null, chunk_id: null,
+    listed_document_ids: docs.map((d) => d.document_id) }];
+  answer.documents = [];
+  answer.ledger = { ...(answer.ledger as object), cited: [] };
+  await page.route(`**/api/chat/conversations/${id}/messages*`, (route) => route.fulfill({ json: body }));
+  let blocksRequested = false;
+  await page.route("**/api/documents/**/blocks*", (route) => {
+    blocksRequested = true;
+    return route.abort();
+  });
+  await page.goto(`/chat?c=${id}`);
+  const reply = assistantMessages(page).last();
+  await reply.getByText(/מקורות ופרטים/).click();
+  await expect(reply.getByTestId("ledger")).toContainText("2 מסמכים ברשימה · נבדקו לפי התאמת המונחים; תוכן המסמכים לא נקרא");
+  await reply.locator(".cite").first().click();
+  const panel = page.getByRole("complementary", { name: "תצוגת מקור" });
+  await expect(panel).toContainText("סה\"כ 2 מסמכים מתאימים");
+  await expect(panel).toContainText("רשימת המסמכים שהוחזרה בחיפוש בתור הזה");
+  expect(blocksRequested).toBe(false);
+  await page.request.delete(`/api/chat/conversations/${id}`);
+});

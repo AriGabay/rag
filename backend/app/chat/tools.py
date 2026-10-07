@@ -88,8 +88,8 @@ class ToolError(Exception):
 @dataclass
 class Source:
     sid: str
-    document_id: UUID
-    version_id: UUID
+    document_id: UUID | None  # None for a listing: it names documents, it is not one
+    version_id: UUID | None
     title: str
     section: str | None
     location: str
@@ -102,12 +102,21 @@ class Source:
     page_list: list[int] | None = None
     partial_document: bool = False
     same_as: str | None = None  # an earlier id of this turn that returned the same text (not sent again)
+    listed: list[str] = field(default_factory=list)  # a listing's documents (its page), for permission checks
+
+    @property
+    def is_listing(self) -> bool:
+        return self.kind == "listing"
 
     def public(self) -> dict:
-        return {"id": self.sid, "document_id": str(self.document_id), "version_id": str(self.version_id),
-                "title": self.title, "section": self.section, "location": self.location, "kind": self.kind,
-                "text": self.text, "block_start": self.block_start, "block_end": self.block_end,
-                "table_index": self.table_index, "page_list": self.page_list}
+        out = {"id": self.sid, "document_id": str(self.document_id) if self.document_id else None,
+               "version_id": str(self.version_id) if self.version_id else None,
+               "title": self.title, "section": self.section, "location": self.location, "kind": self.kind,
+               "text": self.text, "block_start": self.block_start, "block_end": self.block_end,
+               "table_index": self.table_index, "page_list": self.page_list}
+        if self.is_listing:
+            out["listed_document_ids"] = list(self.listed)
+        return out
 
 
 @dataclass
@@ -302,6 +311,8 @@ def _with_size(size: str | None, body: str) -> str:
 
 
 def _render_source(s: Source) -> str:
+    if s.is_listing:
+        return f'<source id="{s.sid}" kind="listing" title="{_attr(s.title)}">\n{_txt(s.text)}\n</source>'
     if s.same_as:
         return (f'<source id="{s.sid}" same_as="{s.same_as}" document_id="{s.document_id}" title="{_attr(s.title)}"'
                 f' location="{_attr(s.location)}"/> (אותו טקסט כמו {s.same_as}, שכבר הוחזר בתור הזה)')
@@ -492,6 +503,21 @@ def _paginate(page, total: int, size: int) -> tuple[int, int]:
     return page, pages
 
 
+_LISTED_ID = re.compile(r"document_id=[0-9a-fA-F-]+\s*\|\s*")
+
+
+def _listing(ws: Workspace, title: str, lines: list[str], documents: list[tuple]) -> str:
+    """A page of documents as a source of the turn: a count or a list over the set cites it (S#), and is
+    checked against it like any passage. It has no document of its own; the documents it names are kept for the
+    permission checks of the answer that cites it."""
+    # the source keeps the text without the document ids: their hex digits are no numbers of the set
+    s = ws.add_source(document_id=None, version_id=None, title=title, section=None, location="רשימת מסמכים",
+                      kind="listing", text="\n".join(_LISTED_ID.sub("", ln) for ln in lines),
+                      listed=[str(d) for d, _ in documents])
+    return (f'<source id="{s.sid}" kind="listing" title="{_attr(title)}">\n' + "\n".join(_txt(ln) for ln in lines)
+            + f"\n</source>\nאפשר לצטט את הרשימה הזו ({s.sid}) לספירה או לרשימה של המסמכים בתחום.")
+
+
 def new_scope(query: str, documents, pages: int) -> dict:
     """The turn's scope: the set a question is about (``documents`` as (id, title) pairs), read page by page."""
     return {"query": query, "matching": [{"document_id": str(i), "title": t} for i, t in documents],
@@ -533,7 +559,9 @@ def tool_list_documents(ws: Workspace, query: str | None = None, page: int | Non
                 ws.scope["pages_read"].add(page)
     if not rows:
         return "לא נמצאו מסמכים" + (f' שכותרתם כוללת "{query}"' if query else "") + "."
-    lines = [_page_line(page, pages, total, "מסמכים")]
+    criterion = (f'מסמכים שכותרתם כוללת את אחת המילים "{_txt(query)}"' if words
+                 else "כל המסמכים שהמשתמש מורשה לראות")
+    lines = [f"תחום: {criterion}", _page_line(page, pages, total, "מסמכים")]
     for r in rows:
         ing = r.ingestion or {}
         images = ing.get("images") or {}
@@ -551,13 +579,13 @@ def tool_list_documents(ws: Workspace, query: str | None = None, page: int | Non
             r.mstate or "", "טרם חולצו")
         lines.append(f'- document_id={r.id} | "{_txt(r.title)}" | עיבוד: {r.status} | קריאה: {status}'
                      + (f" ({'; '.join(details)})" if details else "") + f" | נתונים כמותיים: {mstate}")
-    return "\n".join(lines)
+    return _listing(ws, "רשימת מסמכים", lines, [(r.id, r.title) for r in rows])
 
 
 def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> str:
     """The set a question is about: every visible document containing all the terms that define it (in its title
     or text). The server keeps the whole set as the turn's scope; the model reads it a page at a time."""
-    from app.platform.search import documents_matching
+    from app.platform.search import _scope_terms, documents_matching
 
     query = (query or "").strip()
     if len(query) < 2:
@@ -573,16 +601,22 @@ def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> s
         ws.touch(d["document_id"], d["title"], "located")
     if not found:
         return f'לא נמצאו מסמכים שמכילים את כל המונחים של "{query}". אפשר לנסות מונחים אחרים או פחות מונחים.'
-    lines = [_page_line(page, pages, total, "מסמכים מתאימים"),
+    shown = found[(page - 1) * SCOPE_PAGE:page * SCOPE_PAGE]
+    in_title = sum(1 for d in found if len(d["in_title"]) == len(_scope_terms(query)))
+    lines = [f'תחום: מסמכים שמכילים את כל המונחים "{_txt(query)}" (בכותרת או בתוכן)',
+             _page_line(page, pages, total, "מסמכים מתאימים"),
+             f"מתוכם {in_title} שכל המונחים בכותרתם; השאר מזכירים אותם בתוכן בלבד.",
              "אלה כל המסמכים בתחום; תשובה על התחום צריכה לבדוק את כולם או לומר אילו לא נבדקו."]
-    for d in found[(page - 1) * SCOPE_PAGE:page * SCOPE_PAGE]:
+    for d in shown:
         why = []
         if d["in_title"]:
             why.append("בכותרת: " + ", ".join(d["in_title"]))
         if d["in_text"]:
             why.append(f"בתוכן: {d['hits']} קטעים")
         lines.append(f'- document_id={d["document_id"]} | "{_txt(d["title"])}" | ' + "; ".join(why))
-    return "\n".join(lines)
+    if page < pages:
+        lines.append(f"הרשימה חלקית: זה עמוד {page} מתוך {pages}.")
+    return _listing(ws, f'מסמכים בתחום "{query}"', lines, [(d["document_id"], d["title"]) for d in shown])
 
 
 def tool_outline(ws: Workspace, document_id: str) -> str:

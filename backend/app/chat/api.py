@@ -214,6 +214,7 @@ def _answer_documents(answer: dict | None) -> set[str]:
     if not answer:
         return set()
     ids = {s.get("document_id") for s in answer.get("sources") or []}
+    ids |= {d for s in answer.get("sources") or [] for d in s.get("listed_document_ids") or []}
     ids |= {m.get("document_id") for m in answer.get("measurements") or []}
     ids |= {d.get("document_id") for d in answer.get("documents") or []}
     ids |= coverage.ledger_documents(answer.get("ledger"))
@@ -546,10 +547,11 @@ def _answer_payload(outcome: engine.TurnOutcome) -> dict:
                              if x not in cited and x in ws.measurements]
     docs: dict[str, str] = {}
     for s in sources:
-        docs[s["document_id"]] = s["title"]
+        if s["document_id"]:  # a listing names documents; it is not one of them
+            docs[s["document_id"]] = s["title"]
     for m in measurements:
         docs[m["document_id"]] = m["title"]
-    titles = {str(s.document_id): s.title for s in ws.sources.values()}
+    titles = {str(s.document_id): s.title for s in ws.sources.values() if not s.is_listing}
     for d in a.referenced_document_ids:
         if d in titles:
             docs.setdefault(d, titles[d])
