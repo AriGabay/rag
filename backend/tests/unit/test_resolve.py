@@ -38,7 +38,7 @@ def lookup_in(focus_ids: set[str]):
         terms = _scope_terms(words)
         found = []
         for doc_id, (title, body) in CORPUS.items():
-            tokens = _tokens(title) | _tokens(body) | entities._title_tokens(title)
+            tokens = _tokens(title) | _tokens(body) | entities.title_tokens(title)
             if terms and all(tokens & set(forms) for forms in terms):
                 found.append({"document_id": doc_id, "title": title, "hits": sum(
                     body.count(forms[0]) for forms in terms)})
@@ -295,3 +295,32 @@ def test_the_resolution_records_the_parse_and_the_decisions():
     assert req.resolution["parse"]["metric_kind"] == "value"
     assert req.resolution["decisions"]["scale"].startswith("rejected") and req.resolution["decisions"][
         "metric_kind"].startswith("accepted")
+
+
+# --- review round: numbers and forms that name (or do not name) another property ------------------------------
+
+def test_a_single_digit_house_number_on_the_same_street_is_another_property():
+    found = [{"document_id": "a", "title": "שומה - הנרקיס 14 עין ורד", "hits": 9},
+             {"document_id": "b", "title": "שומה - הנרקיס 4 עין ורד", "hits": 1}]
+    assert [d.document_id for d in entities.choose(found, "בהנרקיס 4", {"a"}).documents] == ["b"]
+    # the named number is nowhere: the focus on the same street is not the answer
+    assert entities.choose(found[:1], "בהנרקיס 4", {"a"}).kind == "not_found"
+
+
+def test_a_floor_a_year_or_a_duration_names_no_property():
+    focus = VALUE_FOCUS | {"document_ids": [BUILDING], "subject": "האלה 9"}
+    for message in ("ומה השווי של הדירה בקומה 12?", "ומה השווי ב-2024?", "וכמה זה ל-12 חודשים?"):
+        req = _validate(_resolved(relation="same_datum"), focus, message)
+        assert req.document_ids == [BUILDING] and not req.entity_changed and not req.clarify, message
+
+
+def test_a_number_beside_a_title_word_still_names_a_property():
+    req = _validate(_resolved(relation="same_datum"), RENT_FOCUS, "ובהסנונית 12?")
+    assert req.document_ids == [OTHER] and req.entity_changed
+
+
+def test_a_prefixed_word_of_the_focus_title_keeps_the_focus():
+    focus = RENT_FOCUS | {"document_ids": [NARKIS_B], "subject": "הנרקיס 4"}
+    req = validate(_resolved(relation="same_datum"), focus, "ומה כתוב בשומה של כפר גפן על זה?", authorized, TITLES,
+                   lookup_in({NARKIS_B}), focus_titles=[CORPUS[NARKIS_B][0]])
+    assert req.document_ids == [NARKIS_B] and not req.entity_changed and req.subject == "הנרקיס 4"

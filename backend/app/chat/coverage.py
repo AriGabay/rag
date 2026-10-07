@@ -174,21 +174,34 @@ def short_tables(tables: list[dict]) -> list[dict]:
     return [t for t in tables if t["presented"] < t["rows"]]
 
 
-def _membership(ws: Workspace, answer: FinalAnswer, listings: list) -> tuple[dict, FinalAnswer]:
-    """An answer about which documents are in a set (a count, a list) that cites only listings: it covers the set
-    when every page of the listing was read; the documents' content was not read, and the note says so."""
-    scope = ws.scope or {"query": "", "matching": [], "pages": 1, "pages_read": {1}}
-    pages, read = scope.get("pages") or 1, len(scope.get("pages_read") or ())
-    complete = read >= pages
-    query = scope.get("query") or ""
-    what = f"לתחום \"{query}\"" if query else "במאגר"
-    note = (f"**כיסוי:** רשימת {len(scope['matching'])} המסמכים {what} נבדקה לפי התאמת המונחים (בכותרת או בתוכן); "
-            "תוכן המסמכים לא נקרא.")
-    if not complete:
-        note += f" נקראו {read} מתוך {pages} עמודי הרשימה, ולכן הספירה חלקית."
-    ledger = {"scope_kind": "set", "scope_query": query, "membership": True, "cited": [],
-              "matching": scope["matching"], "pages": pages, "pages_read": read, "complete": complete,
-              "note": note, "tables": []}
+def _membership(ws: Workspace, answer: FinalAnswer, ids: set[str]) -> tuple[dict, FinalAnswer]:
+    """An answer about which documents are in a set (a count, a list) that cites only listings. Each cited
+    listing is a page of one set (a tool and its query); the set is covered when every page of it was listed in
+    the turn. The documents' content was not read, and the note says so."""
+    sets: dict[tuple, dict] = {}
+    for s in ws.sources.values():
+        if s.is_listing and s.listing:
+            entry = sets.setdefault(s.listing["key"], {"listing": s.listing, "pages_read": set(), "documents": {},
+                                                       "cited": False})
+            entry["pages_read"].add(s.listing["page"])
+            entry["documents"] |= {d["document_id"]: d for d in s.listing["documents"]}
+            entry["cited"] = entry["cited"] or s.sid in ids
+    cited = [e for e in sets.values() if e["cited"]]
+    notes, matching, pages, read = [], {}, 0, 0
+    for e in cited:
+        lst = e["listing"]
+        e_pages, e_read = lst["pages"] or 1, len(e["pages_read"])
+        pages, read = pages + e_pages, read + min(e_read, e_pages)
+        matching |= e["documents"]
+        note = f"רשימת {lst['total']} {lst['criterion']} נבדקה לפי התאמת המונחים; תוכן המסמכים לא נקרא."
+        if e_read < e_pages:
+            note += f" נקראו {e_read} מתוך {e_pages} עמודי הרשימה, ולכן הספירה חלקית."
+        notes.append(note)
+    complete = bool(cited) and read >= pages
+    note = "**כיסוי:** " + " ".join(notes)
+    ledger = {"scope_kind": "set", "scope_query": "; ".join(e["listing"]["criterion"] for e in cited),
+              "membership": True, "cited": [], "matching": list(matching.values()), "pages": pages,
+              "pages_read": read, "complete": complete, "note": note, "tables": []}
     status = "partial" if not complete and answer.status == "answered" else answer.status
     return ledger, answer.model_copy(update={
         "answer_markdown": (answer.answer_markdown.rstrip() + "\n\n> " + note).strip(), "status": status})
@@ -203,9 +216,8 @@ def build(ws: Workspace, answer: FinalAnswer, question: str) -> tuple[dict, Fina
     for doc, title in cited.items():  # its datum passed verification (what failed was removed before this)
         ws.touch(doc, title, "verified")
     ids = cited_ids(answer.answer_markdown)
-    listings = [ws.sources[i] for i in ids if i in ws.sources and ws.sources[i].is_listing]
-    if listings and len(listings) == len(ids):
-        return _membership(ws, answer, listings)
+    if ids and all(i in ws.sources and ws.sources[i].is_listing for i in ids):
+        return _membership(ws, answer, ids)
     scope_kind = answer.scope_kind
     ledger: dict = {"scope_kind": scope_kind, "scope_query": answer.scope_query or "",
                     "cited": [{"document_id": d, "title": t} for d, t in cited.items()],

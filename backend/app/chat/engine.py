@@ -20,6 +20,7 @@ as a failure (with retry), never as a template answer.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import re
@@ -285,10 +286,11 @@ def run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput,
         # stay apart: the conversation's documents (context), the documents the user may see (the database decides,
         # under the user's permissions) and the documents the new request names (looked up the same way)
         focus_ids = {d["document_id"] for d in inp.focus_documents} | set((inp.focus or {}).get("document_ids") or [])
+        titles = functools.cache(lambda: entities.titles_of(ctx))  # read once, and only when needed
         request = resolve.resolve(
             provider, inp.focus, inp.history, inp.question, inp.focus_documents,
-            lambda ids: entities.authorized(ctx, ids), entities.titles_of(ctx), usage, deadline,
-            lookup=lambda words: entities.lookup(ctx, words, focus_ids), candidates=inp.candidates or None)
+            lambda ids: entities.authorized(ctx, ids), titles, usage, deadline,
+            lookup=lambda words: entities.lookup(ctx, words, focus_ids, titles), candidates=inp.candidates or None)
         if cancelled():
             raise TurnCancelled
         # a model's clarification has nothing to verify against, so one that states a figure is not used; the

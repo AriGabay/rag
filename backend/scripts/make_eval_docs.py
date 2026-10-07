@@ -171,7 +171,8 @@ def v8() -> None:
     ])
 
 
+SETS = {"v5": v5, "v6": v6, "v8": v8}
+
 if __name__ == "__main__":
-    which = sys.argv[1:] or ["v5", "v6", "v8"]
-    for name in which:
-        {"v5": v5, "v6": v6, "v8": v8}[name]()
+    for name in sys.argv[1:] or list(SETS):
+        SETS[name]()

@@ -103,6 +103,8 @@ class Source:
     partial_document: bool = False
     same_as: str | None = None  # an earlier id of this turn that returned the same text (not sent again)
     listed: list[str] = field(default_factory=list)  # a listing's documents (its page), for permission checks
+    # a listing's set: {"key", "criterion", "total", "page", "pages", "documents": [{document_id, title}]}
+    listing: dict | None = None
 
     @property
     def is_listing(self) -> bool:
@@ -174,6 +176,7 @@ class Workspace:
     # find_measurements listings: filter key -> {"pages", "pages_read", "total"}
     listings: dict[tuple, dict] = field(default_factory=dict)
     returned: dict[tuple, str] = field(default_factory=dict)  # what was already returned -> its first id
+    fetched: dict = field(default_factory=dict)  # what the meaning check read for the turn (``meaning.Fetcher``)
 
     def once(self, source: Source, key: tuple) -> Source:
         """Mark a source whose text this turn already returned: it keeps its own id (citable, verified against
@@ -199,9 +202,16 @@ class Workspace:
         return f"S{len(self.sources) + 1}"
 
     def add_source(self, **kw) -> Source:
-        s = Source(sid=self._sid(), **kw)
-        self.sources[s.sid] = s
-        return s
+        return self.adopt(Source(sid="", **kw))
+
+    def add_measurement(self, row) -> Measurement:
+        """A stored measurement as the turn's M#; one found again keeps its id, so it is never counted twice."""
+        known = next((m for m in self.measurements.values() if m.id == row.id), None)
+        if known is None:
+            known = Measurement(f"M{len(self.measurements) + 1}", row.id, row.document_id, row.version_id, row.title,
+                                row)
+            self.measurements[known.mid] = known
+        return known
 
     def adopt(self, source: Source) -> Source:
         """Register a source the server read for its own checks, once it is cited (a new id)."""
@@ -506,14 +516,19 @@ def _paginate(page, total: int, size: int) -> tuple[int, int]:
 _LISTED_ID = re.compile(r"document_id=[0-9a-fA-F-]+\s*\|\s*")
 
 
-def _listing(ws: Workspace, title: str, lines: list[str], documents: list[tuple]) -> str:
+def _listing(ws: Workspace, title: str, lines: list[str], documents: list[tuple], *, key: tuple, criterion: str,
+             total: int, page: int, pages: int) -> str:
     """A page of documents as a source of the turn: a count or a list over the set cites it (S#), and is
     checked against it like any passage. It has no document of its own; the documents it names are kept for the
-    permission checks of the answer that cites it."""
+    permission checks of the answer that cites it, and the set it is a page of (``key``: the tool and its query)
+    for the coverage of that answer."""
     # the source keeps the text without the document ids: their hex digits are no numbers of the set
+    docs = [{"document_id": str(d), "title": t} for d, t in documents]
     s = ws.add_source(document_id=None, version_id=None, title=title, section=None, location="רשימת מסמכים",
                       kind="listing", text="\n".join(_LISTED_ID.sub("", ln) for ln in lines),
-                      listed=[str(d) for d, _ in documents])
+                      listed=[d["document_id"] for d in docs],
+                      listing={"key": key, "criterion": criterion, "total": total, "page": page, "pages": pages,
+                               "documents": docs})
     return (f'<source id="{s.sid}" kind="listing" title="{_attr(title)}">\n' + "\n".join(_txt(ln) for ln in lines)
             + f"\n</source>\nאפשר לצטט את הרשימה הזו ({s.sid}) לספירה או לרשימה של המסמכים בתחום.")
 
@@ -560,7 +575,7 @@ def tool_list_documents(ws: Workspace, query: str | None = None, page: int | Non
     if not rows:
         return "לא נמצאו מסמכים" + (f' שכותרתם כוללת "{query}"' if query else "") + "."
     criterion = (f'מסמכים שכותרתם כוללת את אחת המילים "{_txt(query)}"' if words
-                 else "כל המסמכים שהמשתמש מורשה לראות")
+                 else "המסמכים שהמשתמש מורשה לראות")
     lines = [f"תחום: {criterion}", _page_line(page, pages, total, "מסמכים")]
     for r in rows:
         ing = r.ingestion or {}
@@ -579,7 +594,8 @@ def tool_list_documents(ws: Workspace, query: str | None = None, page: int | Non
             r.mstate or "", "טרם חולצו")
         lines.append(f'- document_id={r.id} | "{_txt(r.title)}" | עיבוד: {r.status} | קריאה: {status}'
                      + (f" ({'; '.join(details)})" if details else "") + f" | נתונים כמותיים: {mstate}")
-    return _listing(ws, "רשימת מסמכים", lines, [(r.id, r.title) for r in rows])
+    return _listing(ws, "רשימת מסמכים", lines, [(r.id, r.title) for r in rows], key=("list_documents", " ".join(words)),
+                    criterion=criterion, total=total, page=page, pages=pages)
 
 
 def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> str:
@@ -602,7 +618,8 @@ def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> s
     if not found:
         return f'לא נמצאו מסמכים שמכילים את כל המונחים של "{query}". אפשר לנסות מונחים אחרים או פחות מונחים.'
     shown = found[(page - 1) * SCOPE_PAGE:page * SCOPE_PAGE]
-    in_title = sum(1 for d in found if len(d["in_title"]) == len(_scope_terms(query)))
+    n_terms = len(_scope_terms(query))
+    in_title = sum(1 for d in found if len(d["in_title"]) == n_terms)
     lines = [f'תחום: מסמכים שמכילים את כל המונחים "{_txt(query)}" (בכותרת או בתוכן)',
              _page_line(page, pages, total, "מסמכים מתאימים"),
              f"מתוכם {in_title} שכל המונחים בכותרתם; השאר מזכירים אותם בתוכן בלבד.",
@@ -616,7 +633,9 @@ def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> s
         lines.append(f'- document_id={d["document_id"]} | "{_txt(d["title"])}" | ' + "; ".join(why))
     if page < pages:
         lines.append(f"הרשימה חלקית: זה עמוד {page} מתוך {pages}.")
-    return _listing(ws, f'מסמכים בתחום "{query}"', lines, [(d["document_id"], d["title"]) for d in shown])
+    return _listing(ws, f'מסמכים בתחום "{query}"', lines, [(d["document_id"], d["title"]) for d in shown],
+                    key=("find_documents", query), criterion=f'מסמכים שמכילים את כל המונחים "{query}"', total=total,
+                    page=page, pages=pages)
 
 
 def tool_outline(ws: Workspace, document_id: str) -> str:
@@ -687,13 +706,8 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
     listing = ws.listings.setdefault(key, {"pages": pages, "pages_read": set(), "total": total})
     listing["pages_read"].add(page)
     groups: dict[tuple, list] = {}
-    known = {m.id: m for m in ws.measurements.values()}
     for r in rows:
-        m = known.get(r.id)  # a measurement found again keeps its id, so it is never counted twice
-        if m is None:
-            m = Measurement(f"M{len(ws.measurements) + 1}", r.id, r.document_id, r.version_id, r.title, r)
-            ws.measurements[m.mid] = m
-            known[r.id] = m
+        m = ws.add_measurement(r)
         m.listings.add(key)
         ws.touch(r.document_id, r.title, "read")
         groups.setdefault(_compat_key(r), []).append(m)

@@ -22,8 +22,10 @@ A reply to such a clarification is resolved among the documents it named, and on
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
+from uuid import UUID
 
 from sqlalchemy import text
 
@@ -58,7 +60,7 @@ class Outcome:
         return {"kind": self.kind, "query": self.query, "documents": [d.as_dict() for d in self.documents]}
 
 
-def _title_tokens(title: str) -> set[str]:
+def title_tokens(title: str) -> set[str]:
     """The title's words with their forms, and its numbers however short ("4" in "הנרקיס 4")."""
     words = set(_title_words(title))
     words |= {t for t in (w.strip("-'״׳\"") for w in _TOKEN.findall(base_normalize(title))) if any(c.isdigit() for c in t)}
@@ -70,28 +72,65 @@ _AMOUNT = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d+|\d+\s*(?:₪|ש[\"�
                      r"|[₪]\s*\d[\d,.]*")
 
 
-def identifying(words: str, titles: list[str]) -> list[str]:
+def _numbers(text: str) -> set[str]:
+    """The numbers of a text however short, with any letters they carry ("4", "143", "c14")."""
+    return {t for t in (w.strip("-'״׳\"?.!,:;()") for w in _TOKEN.findall(base_normalize(text)))
+            if any(c.isdigit() for c in t)}
+
+
+def forms(token: str) -> set[str]:
+    """A word's forms (prefix-stripped and inflected), as titles are matched."""
+    found = _scope_terms(token)
+    return set(found[0]) | {token} if found else {token}
+
+
+def identifying(words: str, titles: list[str], bare_numbers: bool = True) -> list[str]:
     """The words that can name a document: a number (a house or unit number, not an amount), Latin letters, or a
-    word of some title the user may see."""
-    vocabulary = set().union(*(_title_tokens(t) for t in titles)) if titles else set()
+    word of some title the user may see. With ``bare_numbers`` off, a number counts only beside such a word
+    ("הנרקיס 4", "דירה B7"): a floor, a year or a duration ("בקומה 21", "ב-2024") names no property."""
+    vocabulary = set().union(*(title_tokens(t) for t in titles)) if titles else set()
+    tokens: list[tuple[str, str | None]] = []
+    for raw in _TOKEN.findall(base_normalize(_AMOUNT.sub(" ", words))):
+        tok = raw.strip("-'״׳\"?.!,:;()")
+        if not tok:
+            continue
+        if re.search(r"[A-Za-z]", tok):
+            tokens.append((tok, "name"))
+        elif any(c.isdigit() for c in tok):
+            tokens.append((tok, "number"))
+        else:
+            found = _scope_terms(tok)
+            named = bool(found) and bool(vocabulary & set(found[0]))
+            tokens.append((found[0][0] if found else tok, "name" if named else None))
     out = []
-    for forms in _scope_terms(_AMOUNT.sub(" ", words)):
-        tok = forms[0]
-        if any(c.isdigit() for c in tok) or re.search(r"[A-Za-z]", tok) or vocabulary & set(forms):
+    for i, (tok, kind) in enumerate(tokens):
+        if kind == "name":
             out.append(tok)
-    return out
+        elif kind == "number":
+            beside = any(0 <= j < len(tokens) and tokens[j][1] == "name" for j in (i - 1, i + 1))
+            if bare_numbers or beside:
+                out.append(tok)
+    return list(dict.fromkeys(out))
 
 
 def choose(found: list[dict], query: str, focus_ids: set[str]) -> Outcome:
-    """The outcome of a lookup (rows of ``documents_matching`` for ``query``), by the rules of the module."""
-    if not found:
-        return Outcome("not_found", query=query)
-    terms = _scope_terms(query)
+    """The outcome of a lookup (rows of ``documents_matching`` for ``query``), by the rules of the module. A number
+    the user named counts as a title term however short ("הנרקיס 4"), and a title that holds other numbers but not
+    the named one is another property ("הנרקיס 14")."""
+    asked = _numbers(query)
+    words = [f for f in _scope_terms(query) if not any(c.isdigit() for c in f[0])]
     cands = []
     for d in found:
-        title = _title_tokens(d["title"])
-        cands.append(Candidate(str(d["document_id"]), d["title"], sum(1 for forms in terms if title & set(forms)),
-                               int(d.get("hits") or 0)))
+        title = title_tokens(d["title"])
+        named = {t for t in title if any(c.isdigit() for c in t)}
+        # a house number the title does not hold: another property; a unit label ("A2") is no house number
+        house, held = {t for t in asked if t.isdigit()}, {t for t in named if t.isdigit()}
+        if house and held and not house & held:
+            continue
+        cands.append(Candidate(str(d["document_id"]), d["title"],
+                               sum(1 for f in words if title & set(f)) + len(asked & named), int(d.get("hits") or 0)))
+    if not cands:
+        return Outcome("not_found", query=query)
     best = max(c.title_terms for c in cands)
     tier = [c for c in cands if c.title_terms == best]  # best == 0: every document that holds the words in its text
     if len(tier) == 1:
@@ -113,7 +152,7 @@ def among(candidates: list[dict], reply: str, authorized: set[str]) -> Outcome:
     for w in words:
         if w in _ORDINALS and _ORDINALS[w] < len(cands):
             return Outcome("resolved", [cands[_ORDINALS[w]]], reply)
-    titles = {c.document_id: _title_tokens(c.title) for c in cands}
+    titles = {c.document_id: title_tokens(c.title) for c in cands}
     # a word of the reply that some candidates' titles hold and others lack ("בכפר גפן", not "הנרקיס")
     telling = [set(forms) for forms in _scope_terms(reply)
                if 0 < sum(1 for t in titles.values() if t & set(forms)) < len(cands)]
@@ -123,16 +162,21 @@ def among(candidates: list[dict], reply: str, authorized: set[str]) -> Outcome:
     return Outcome("ambiguous", cands, reply)
 
 
-def lookup(ctx: TenantContext, words: str, focus_ids: set[str]) -> Outcome:
-    """The documents the user's words name, under the user's permissions (see the module docstring)."""
+def _visible_titles(conn) -> list[str]:
+    return [r.title for r in conn.execute(text(
+        "SELECT d.title FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
+        " WHERE d.deleted_at IS NULL"))]
+
+
+def lookup(ctx: TenantContext, words: str, focus_ids: set[str],
+           titles: Callable[[], list[str]] | None = None) -> Outcome:
+    """The documents the user's words name, under the user's permissions (see the module docstring). ``titles``:
+    every title the user may see, when the caller already holds them."""
     with tenant_tx(ctx) as conn:
         found = documents_matching(conn, words) if _scope_terms(words) else []
         query = words
         if not found:
-            titles = [r.title for r in conn.execute(text(
-                "SELECT d.title FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
-                " WHERE d.deleted_at IS NULL"))]
-            relaxed = " ".join(identifying(words, titles))
+            relaxed = " ".join(identifying(words, titles() if titles else _visible_titles(conn)))
             if relaxed and relaxed != words:
                 query = relaxed
                 found = documents_matching(conn, relaxed)
@@ -141,8 +185,6 @@ def lookup(ctx: TenantContext, words: str, focus_ids: set[str]) -> Outcome:
 
 def authorized(ctx: TenantContext, ids) -> set[str]:
     """The given document ids the user may see now (RLS decides; deleted documents are not seen)."""
-    from uuid import UUID
-
     uuids = []
     for i in ids or ():
         try:
@@ -157,7 +199,6 @@ def authorized(ctx: TenantContext, ids) -> set[str]:
 
 
 def titles_of(ctx: TenantContext) -> list[str]:
+    """Every title the user may see."""
     with tenant_tx(ctx) as conn:
-        return [r.title for r in conn.execute(text(
-            "SELECT d.title FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
-            " WHERE d.deleted_at IS NULL"))]
+        return _visible_titles(conn)

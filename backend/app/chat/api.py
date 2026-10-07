@@ -438,8 +438,8 @@ def _finish(ctx: TenantContext, message_id: UUID, status_: str, *, content: str 
                         {"m": message_id, "u": ctx.user_id,
                          "r": json.dumps(diagnostics["rounds"], ensure_ascii=False, default=str),
                          "x": json.dumps(diagnostics["removed"], ensure_ascii=False, default=str),
-                         "res": json.dumps(diagnostics.get("resolution"), ensure_ascii=False, default=str)
-                         if diagnostics.get("resolution") else None,
+                         "res": json.dumps(res, ensure_ascii=False, default=str)
+                         if (res := diagnostics.get("resolution")) else None,
                          "d": sorted(diagnostics["document_ids"])})
                 return
             status_, content, answer, error = "cancelled", "", None, "העיבוד נעצר לבקשתך."
@@ -505,6 +505,8 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
     last = next((r for r in reversed(rows) if r.role == "assistant" and r.answer), None)
     if last is not None:
         for s in (last.answer.get("sources") or [])[:12]:
+            if not s.get("version_id"):  # a listing names documents; there is no place in one to reopen
+                continue
             pid = f"P{len(prior) + 1}"
             prior[pid] = {"version_id": s["version_id"], "block_start": s.get("block_start"),
                           "block_end": s.get("block_end"), "table_index": s.get("table_index"),

@@ -233,11 +233,11 @@ def _clarify_missing(words: str) -> str:
 
 
 def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
-             authorized: Callable[[Iterable[str]], set[str]], titles: list[str],
+             authorized: Callable[[Iterable[str]], set[str]], titles: list[str] | Callable[[], list[str]],
              lookup: Callable[[str], entities.Outcome] | None = None,
              candidates: list[dict] | None = None, focus_titles: list[str] | None = None) -> Request:
-    """``titles``: every title the user may see (the words that can name a document); ``focus_titles``: the titles
-    of the documents the conversation was about."""
+    """``titles``: every title the user may see (the words that can name a document), or a provider of them, read
+    only when needed; ``focus_titles``: the titles of the documents the conversation was about."""
     decisions: dict[str, str] = {}
     ok: set[str] = set()
     claimed = {c.field for c in resolved.changed_fields}
@@ -333,8 +333,9 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
         out.approved.append("scale")  # a correction keeps the scale of what it corrects
     # documents: the focus, unless the user's words name another entity, or the question is over a set
     focus_ids = list(f.get("document_ids") or [])
-    seen = authorized(focus_ids) if focus_ids else set()
-    out.document_ids = [d for d in focus_ids if d in seen] if focus and not new_question else []
+    keep_focus = bool(focus) and not new_question and resolved.scope != "set"
+    seen = authorized(focus_ids) if keep_focus and focus_ids else set()
+    out.document_ids = [d for d in focus_ids if d in seen]
     if resolved.scope == "set":
         out.document_ids = []
         out.entity_changed = bool(focus)
@@ -347,14 +348,16 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
         # message that the focus does not hold ("ובהנרקיס 4?" parsed as the same datum)
         words = " ".join(quotes[n] for n in ("subject", "documents") if n in quotes)
         focus_text = " ".join([f.get("subject") or "", *(focus_titles or [])])
-        unnamed = [t for t in entities.identifying(message, titles) if not _mentions(focus_text, t)] if focus else []
+        focus_tokens, focus_norm = entities.title_tokens(focus_text), _norm(focus_text)
+        # a word of the focus in any form ("בשומה") names the focus; a bare floor, year or duration names nothing
+        named = entities.identifying(message, titles() if callable(titles) else titles, bare_numbers=False) \
+            if focus else []
+        unnamed = [t for t in named if not entities.forms(t) & focus_tokens and _norm(t) not in focus_norm]
         query = words or " ".join(unnamed)
         if query:
-            _take(out, lookup(query), query, decisions)
-            if "subject" in ok:
-                out.subject = resolved.subject.strip() or quotes["subject"]
-            elif unnamed and not words:
-                out.subject = " ".join(unnamed)
+            _take(out, lookup(query), query, decisions, set(focus_ids))
+            if out.entity_changed and out.document_ids:  # the new entity was found: the request is about it
+                out.subject = (resolved.subject.strip() or quotes["subject"]) if "subject" in ok else " ".join(unnamed)
     elif SUBJECT_FIELDS & ok:
         out.document_ids = []  # no lookup here: the tools find the documents the user named
         out.entity_changed = True
@@ -365,23 +368,21 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
     parse = resolved.model_dump()
     # only documents the user may see are kept, even in diagnostics
     parse["document_ids"] = sorted(authorized(parse["document_ids"])) if parse["document_ids"] else []
-    out.resolution = {"parse": parse, "decisions": decisions, **({"lookup": out.resolution["lookup"]}
-                                                                   if "lookup" in out.resolution else {})}
+    out.resolution.update(parse=parse, decisions=decisions)
     return out
 
 
-def _mentions(text: str, token: str) -> bool:
-    return token in entities._title_tokens(text) or _norm(token) in _norm(text)
-
-
-def _take(out: Request, outcome: entities.Outcome, words: str, decisions: dict) -> None:
-    """The scope the lookup's outcome sets, or the clarification it needs."""
+def _take(out: Request, outcome: entities.Outcome, words: str, decisions: dict,
+          focus_ids: set[str] | None = None) -> None:
+    """The scope the lookup's outcome sets, or the clarification it needs. A lookup that lands on the focus's own
+    documents changes nothing: the conversation stays where it was."""
     decisions["entity"] = outcome.kind
     out.resolution["lookup"] = outcome.as_dict()
-    out.entity_changed = True
     if outcome.kind == "resolved":
         out.document_ids = [d.document_id for d in outcome.documents]
+        out.entity_changed = set(out.document_ids) != set(focus_ids or ())
         return
+    out.entity_changed = True
     out.document_ids, out.server_clarify = [], True
     out.candidates = [d.as_dict() for d in outcome.documents]
     out.clarify = _clarify_titles(outcome, words) if outcome.kind == "ambiguous" else _clarify_missing(words)
@@ -417,7 +418,8 @@ def _input(focus: dict | None, history: list, message: str, documents: list[dict
 
 
 def resolve(provider: LLMProvider, focus: dict | None, history: list, message: str, documents: list[dict],
-            authorized: Callable[[Iterable[str]], set[str]], titles: list[str], usage: list[dict],
+            authorized: Callable[[Iterable[str]], set[str]], titles: list[str] | Callable[[], list[str]],
+            usage: list[dict],
             deadline: float | None = None, lookup: Callable[[str], entities.Outcome] | None = None,
             candidates: list[dict] | None = None) -> Request | None:
     """The validated request of a follow-up, or None when the call failed (the turn then goes on as before).

@@ -98,3 +98,57 @@ def test_a_subject_measurement_with_the_period_is_cited(office):
     md = "דמי השכירות הראויים הם 70 ₪ למ\"ר לחודש [S1]."
     report = verify_answer(_judge(), _answer(md), ws, "?", [])
     assert report.ok and "[S1][M1]" in report.apply(_answer(md)).answer_markdown
+
+
+def test_a_later_verification_round_reuses_what_was_read(office):
+    doc, ver = _doc(office, [("תחשיב", "דמי השכירות הראויים לנכס הם 70 ₪ למ\"ר."),
+                             ("תחשיב", "לאחר התאמות, דמי השכירות נקבעו ל-70 ₪ למ\"ר לחודש.")], "4" * 64)
+    ws = _ws(office, doc, ver, 0, "דמי השכירות הראויים לנכס הם 70 ₪ למ\"ר.")
+    md = "דמי השכירות הראויים הם 70 ₪ למ\"ר לחודש [S1]."
+    verify_answer(_judge(), _answer(md), ws, "?", [])
+    registered = len(ws.sources)
+    verify_answer(_judge(), _answer(md), ws, "?", [])  # the repair round checks the same answer again
+    assert len(ws.sources) == registered == 2
+
+
+def test_a_rate_cited_from_one_table_row_gets_the_basis_and_period_its_table_states(office):
+    import json
+    import uuid
+
+    doc, ver = make_document(office, office.default_group_id, TITLE, sha="5" * 64)
+    structure = {"caption": "תחשיב שווי בגישת היוון ההכנסות", "headers": ["רכיב", "ערך"], "block_index": 3,
+                 "rows": [{"cells": ["סה\"כ מ\"ר אקווי'", "2,480"]}, {"cells": ["דמ\"ש למ\"ר", "₪ 52"]},
+                          {"cells": ["שווי מעוגל", "₪ 20,630,000"]}],
+                 "notes": ["(*) דמי השכירות בטבלה הם לחודש."]}
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("INSERT INTO extracted_tables (office_id, document_id, version_id, table_index, structure)"
+                          " VALUES (app_office(), :d, :v, 0, CAST(:s AS jsonb))"),
+                     {"d": doc, "v": ver, "s": json.dumps(structure, ensure_ascii=False)})
+    ws = T.Workspace(ctx=office.ctx())
+    ws.add_source(document_id=doc, version_id=ver, title=TITLE, section="תחשיב", location="טבלה", kind="table",
+                  text="דמ\"ש למ\"ר | ₪ 52", table_index=0, chunk_id=uuid.uuid4())
+    md = "דמי השכירות בתחשיב הם 52 ₪ למ\"ר [S1]."
+    report = verify_answer(_judge(), _answer(md), ws, "?", [])
+    final = report.apply(_answer(md)).answer_markdown
+    assert "מ״ר אקווי׳, כפי שנכתב במקור [S2]" in final and "לחודש, כפי שנכתב במקור" in final
+    assert ws.sources["S2"].kind == "table" and "2,480" in ws.sources["S2"].text
+
+
+def test_a_table_with_two_periods_annotates_no_period(office):
+    import json
+    import uuid
+
+    doc, ver = make_document(office, office.default_group_id, TITLE, sha="6" * 64)
+    structure = {"caption": "תחשיב", "headers": ["רכיב", "ערך"], "block_index": 3,
+                 "rows": [{"cells": ["דמ\"ש למ\"ר", "₪ 52"]}],
+                 "notes": ["(*) דמי השכירות לחודש; ההכנסה לשנה."]}
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("INSERT INTO extracted_tables (office_id, document_id, version_id, table_index, structure)"
+                          " VALUES (app_office(), :d, :v, 0, CAST(:s AS jsonb))"),
+                     {"d": doc, "v": ver, "s": json.dumps(structure, ensure_ascii=False)})
+    ws = T.Workspace(ctx=office.ctx())
+    ws.add_source(document_id=doc, version_id=ver, title=TITLE, section="תחשיב", location="טבלה", kind="table",
+                  text="דמ\"ש למ\"ר | ₪ 52", table_index=0, chunk_id=uuid.uuid4())
+    md = "דמי השכירות בתחשיב הם 52 ₪ למ\"ר [S1]."
+    final = verify_answer(_judge(), _answer(md), ws, "?", []).apply(_answer(md)).answer_markdown
+    assert "כפי שנכתב במקור" not in final

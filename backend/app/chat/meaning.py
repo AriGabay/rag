@@ -296,8 +296,11 @@ class Fetcher:
     survey row never counts: only the same table or section, or a measurement of the subject property."""
 
     ws: Workspace
-    reads: int = READS
-    cache: dict = field(default_factory=dict)
+    reads: int = READS  # per verification round; what was read is kept for the turn's later rounds
+
+    @property
+    def cache(self) -> dict:
+        return self.ws.fetched
 
     def _read(self, key: tuple, load):
         if key not in self.cache:
@@ -351,29 +354,31 @@ class Fetcher:
 
     def adopt(self, found) -> str:
         """The id of a source or measurement the check uses: registered as the turn's, once."""
-        from app.chat.tools import Measurement, Source
+        from app.chat.tools import Source
 
         if isinstance(found, Source):
             if not found.sid or self.ws.sources.get(found.sid) is not found:
                 self.ws.adopt(found)
             return found.sid
-        known = next((m for m in self.ws.measurements.values() if m.id == found.id), None)
-        if known is None:
-            known = Measurement(f"M{len(self.ws.measurements) + 1}", found.id, found.document_id,
-                                found.version_id, found.title, found)
-            self.ws.measurements[known.mid] = known
-        return known.mid
+        return self.ws.add_measurement(found).mid
 
     def attesting(self, unit: Unit, forms: frozenset[str], kind: str, key: str, words: set[str]) -> str | None:
         """The id of evidence that states ``kind`` ``key`` for the number, beyond the unit's citations."""
+        def states(cand) -> bool:
+            if cand is None or cand.sid in unit.ids:
+                return False
+            occ, _ = source_occurrences(cand.text, set(forms))
+            return any(key in o.qualifiers.keys(kind) for o in occ)
+
         cited = [i for i in unit.ids if i in self.ws.sources]
         for sid in cited:
-            for cand in [*self.same_calculation(sid), self.expansion(sid)]:
-                if cand is None or cand.sid in unit.ids:
-                    continue
-                occ, _ = source_occurrences(cand.text, set(forms))
-                if any(key in o.qualifiers.keys(kind) for o in occ):
+            # the passages the turn already has first; the table or section is read only when they do not say it
+            for cand in self.same_calculation(sid):
+                if states(cand):
                     return self.adopt(cand)
+            expansion = self.expansion(sid)
+            if states(expansion):
+                return self.adopt(expansion)
         docs = {self.ws.sources[i].document_id for i in cited if self.ws.sources[i].document_id}
         docs |= {self.ws.measurements[i].document_id for i in unit.ids if i in self.ws.measurements}
         for row in self.subject_measurements(docs) if docs else []:
@@ -421,6 +426,11 @@ def _closest(occurrences: list[Occurrence], words: set[str]) -> list[Occurrence]
     return [o for s, o in scored if s == best]
 
 
+def _as_written(kind: str, found: dict[str, str]) -> str:
+    """A qualifier as the answer shows it: a period by its label, a basis in the source's words."""
+    return PERIOD_TEXT[sorted(found)[0]] if kind == "period" else display(" ".join(found.values()))
+
+
 def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[MeaningProblem]:
     """The meaning problems of one cited unit. With a ``fetcher``, a qualifier the cited passages do not state is
     looked for in the same calculation before it counts as unsupported, and a needed one the cited passage omits
@@ -466,24 +476,21 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
         # missing: what every closest occurrence attaches to the number, and the unit does not say at all; when the
         # cited passage does not say it, the table or section around it may (a basis in the table's area row)
         closest = _closest(occurrences, words)
-        expanded = fetcher.expanded_occurrences(unit, forms) if fetcher else []
+        expanded: list | None = None  # read only for a qualifier the cited passages do not attach
         for kind in ("basis", "period", "approx"):
-            cite = None
             if not all(o.qualifiers.keys(kind) for o in closest):
-                if kind == "approx" or not expanded:
+                if kind == "approx" or fetcher is None or whole.keys(kind):
                     continue
+                if expanded is None:
+                    expanded = fetcher.expanded_occurrences(unit, forms)
                 near = _closest([o for o, _ in expanded], words)
                 if not near or not all(o.qualifiers.keys(kind) for o in near):
                     continue
-                if (kind == "basis" and whole.keys("basis")) or (kind == "period" and whole.keys("period")):
+                if len({tuple(sorted(o.qualifiers.found[kind])) for o in near}) != 1:
                     continue
-                values = {tuple(sorted(o.qualifiers.found[kind])) for o in near}
-                if len(values) != 1:
-                    continue
-                cite = fetcher.adopt(next(src for o, src in expanded if o is near[0]))
                 o = near[0]
-                keys = tuple(sorted(o.qualifiers.found[kind]))
-                as_written = PERIOD_TEXT[keys[0]] if kind == "period" else display(" ".join(o.qualifiers.found[kind].values()))
+                cite = fetcher.adopt(next(src for x, src in expanded if x is o))
+                as_written = _as_written(kind, o.qualifiers.found[kind])
                 if cite not in unit.ids:
                     unit.ids.append(cite)
                 problems.append(MeaningProblem(
@@ -502,7 +509,7 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
                 needed.setdefault(tuple(sorted(values)), " ".join(values.values()))
             if len(needed) == 1:
                 keys, written_q = next(iter(needed.items()))
-                as_written = PERIOD_TEXT[keys[0]] if kind == "period" else display(written_q)
+                as_written = PERIOD_TEXT[keys[0]] if kind == "period" else display(written_q)  # one occurrence's words
                 problems.append(MeaningProblem(
                     written, kind, f"למספר {written} חסר {KIND_LABELS[kind]} כפי שנכתב במקור (\"{as_written}\"); "
                     "כתוב אותו ליד המספר", blocking=False, annotation=as_written))

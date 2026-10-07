@@ -144,6 +144,11 @@ class Problem:
     cite: str | None = None  # the source or measurement the server found that states the qualifier
 
     @property
+    def uncited(self) -> bool:
+        """The server found evidence (``cite``) that the unit does not cite yet."""
+        return bool(self.cite) and f"[{self.cite}]" not in self.unit.raw
+
+    @property
     def annotatable(self) -> bool:
         return self.kind == "missing_qualifier" and self.annotation is not None
 
@@ -185,8 +190,7 @@ class VerifyReport:
         partial = {p.unit.index for p in self.problems if p.severity == "partial"}
         notes = [p for p in self.problems if p.annotatable and p.unit.index not in errors]
         requests = [p.reason for p in self.problems if p.kind == "request"]
-        cites = [p for p in self.problems if p.kind == "needs_citation" and p.cite and p.unit.index not in errors
-                 and f"[{p.cite}]" not in p.unit.raw]
+        cites = [p for p in self.problems if p.kind == "needs_citation" and p.uncited and p.unit.index not in errors]
         if not errors and not partial and not notes and not requests and not cites:
             return answer
         # a failed table header takes its whole table: a separator and rows without their header are no table
@@ -201,11 +205,10 @@ class VerifyReport:
         for p in notes:
             at = _after_number(p.unit, p.number or "")
             if at is not None and not any(a <= at < b for a, b in cuts):
-                cite = f" [{p.cite}]" if p.cite and f"[{p.cite}]" not in p.unit.raw else ""
+                cite = f" [{p.cite}]" if p.uncited else ""
                 edits.append((at, at, f" ({p.annotation}, כפי שנכתב במקור{cite})"))
         # evidence the server found in the same calculation is cited with the unit it supports
-        for u_index, ids in _cites_by_unit(cites).items():
-            u = next(x for x in self.units if x.index == u_index)
+        for u, ids in _cites_by_unit(cites):
             at = _citation_point(answer.answer_markdown, u)
             if not any(a <= at < b for a, b in cuts):
                 edits.append((at, at, "".join(f"[{i}]" for i in ids)))
@@ -240,13 +243,13 @@ class VerifyReport:
         return answer.model_copy(update={"answer_markdown": text, "claims": claims, "status": status})
 
 
-def _cites_by_unit(problems: list[Problem]) -> dict[int, list[str]]:
-    out: dict[int, list[str]] = {}
+def _cites_by_unit(problems: list[Problem]) -> list[tuple[Unit, list[str]]]:
+    out: dict[int, tuple[Unit, list[str]]] = {}
     for p in problems:
-        ids = out.setdefault(p.unit.index, [])
+        _, ids = out.setdefault(p.unit.index, (p.unit, []))
         if p.cite not in ids:
             ids.append(p.cite)
-    return out
+    return list(out.values())
 
 
 def _citation_point(markdown: str, unit: Unit) -> int:
