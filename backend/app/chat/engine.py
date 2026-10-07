@@ -30,11 +30,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from app.chat import coverage
 from app.chat import tools as T
-from app.chat.verify import VerifyReport, verify_answer
+from app.chat.verify import VERIFY_ALLOWANCE_SECONDS, VerificationUnavailable, VerifyReport, verify_answer
 from app.config import get_settings
 from app.db import TenantContext
-from app.providers.llm import CallStatus, LLMProvider, prompt_text
+from app.measurements.extract import PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
+from app.providers.llm import CallStatus, LLMProvider, prompt_text, usage_entry
 
 logger = logging.getLogger(__name__)
 
@@ -46,18 +48,34 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
 - חפש לפי משמעות השאלה (search). נסח שאילתות במילים שסביר שיופיעו במסמך, ונסה ניסוח נוסף או מונחים נרדפים אם
   התוצאות חלשות (שומה/חוות דעת, דמ"ש/דמי שכירות, שווי למ"ר/מחיר למ"ר...). כשהשאלה על מסמך מסוים, מצא אותו
   (list_documents) וחפש בתוכו.
+- מקור עם same_as הוא אותו טקסט כמו המקור שהוא מפנה אליו (לא נשלח שוב); מותר לצטט כל אחד מהם. התאם את היקף הקריאה
+  לשאלה: לנתון ממוקד — חיפוש אחד ממוקד בדרך כלל מספיק; פתח הקשר רק כשמשמעות המספר אינה ברורה מהקטע.
 - לפני שאתה מציג מספר, ודא מה הוא מתאר: איזה נתון, יחידה, תקופה (לחודש/לשנה), בסיס שטח, מע"מ, ולאיזה נכס הוא
   מתייחס. אם הקטע קצר מדי — פתח את ההקשר (open_source: neighbors, section או table).
 - הבחן בין הנכס הנישום, נכסי השוואה, נתוני סקר והיצע, והנחות כלליות. אל תייחס נתון לנכס רק כי הוא מופיע בשומה שלו.
 - אל תערבב סוגי נתונים: שווי, מחיר עסקה, מחיר מבוקש ודמי שכירות שונים זה מזה גם אם כולם ב-₪ למ"ר. אל תסיק מע"מ,
   תקופה או בסיס שטח שלא נכתבו לגבי הערך עצמו. "פלדלת" נשאר "פלדלת". כשהמסמך מציין לגבי הערך בסיס שטח (אקוו',
   פלדלת, ברוטו, עיקרי), תקופה או מע"מ — כתוב אותם ליד המספר בתשובה.
-- "השווי שנקבע לנכס": חפש את הקביעה הסופית (פרק השומה, "הננו שמים", סיכום השווי) והבחן בינה לבין שווי בגישה אחת,
+- "השווי שנקבע לנכס" כשאלה עצמאית: חפש את הקביעה הסופית (פרק השומה, "הננו שמים", סיכום השווי) והבחן בינה לבין שווי בגישה אחת,
   שווי משוקלל או שורת ביניים בתחשיב. אם הסופי לא נמצא, אמור מה כן נמצא ומה הוא.
 - אם באותו מסמך מופיעים שני ערכים שונים לאותו נתון, הצג את שניהם עם המקור של כל אחד וציין שיש אי-התאמה.
+- שאלה על קבוצת מסמכים — סקירה, השוואה, רשימה, חישוב על כמה מסמכים, או שאלה "בעיר/באזור/בסוג נכס X" שאינה נוקבת
+  במסמך מסוים: קרא קודם find_documents עם המונחים שמגדירים את הקבוצה בלבד (מקום, סוג מסמך — לא המדד), ובדוק כל
+  מסמך בתחום (search עם document_ids, או find_measurements). החזר scope_kind=set ו-scope_query עם אותם מונחים. נתון
+  שמצאת במסמך בתחום ולא כללת בתשובה — רשום ב-omitted עם המסמך והסיבה. אם יש יותר מעמוד אחד — קרא את כולם או אמור
+  שלא. שאלה על מסמך, נכס או כתובת אחת — scope_kind=focused ו-scope_query ריק, ואין צורך לסרוק את כל המאגר. השרת
+  מוסיף לתשובה הערת כיסוי לפי מה שנבדק בפועל, ולכן אל תכתוב בעצמך שהתשובה מכסה את כל המאגר.
+- טבלה עם כמה ערכים מהסוג המבוקש (למשל כמה שורות של דמי שכירות): הצג את כל הערכים, או את מספרם ואת הטווח. אם אתה
+  מציג ערך אחד — אמור במפורש שהוא דוגמה וכמה ערכים יש בטבלה (שורת "הטבלה: N שורות").
 - חישוב (ממוצע, סכום, טווח, ספירה): find_measurements ואז compute. לעולם אל תחשב בעצמך. ציין על כמה ערכים
   ומסמכים החישוב מבוסס ומה הכיסוי; אם הכיסוי חלקי — אמור זאת, ואל תציג את התוצאה כמייצגת את כל המאגר. אם compute
   מסרב כי הנתונים אינם מאותו סוג — הסבר למשתמש למה, ואל תחזיר מספר מטעה.
+- focus: אחרי כל תשובה, מלא את הנתון שבמרכזה — הנתון כפי שנכתב, סוג המדד, יחידה, תקופה, בסיס שטח, מע"מ, הנכס או
+  הנושא, תפקיד הערך והמסמכים (document_id). אם התשובה אינה על נתון אחד — null.
+- תיקון של המשתמש ("התכוונתי ל...", "לא, ה..."): שנה רק את מה שתוקן, ושמור מ"הנתון שבמרכז השיחה" את כל השאר — אותו
+  נכס, אותם מסמכים, אותה יחידה ובסיס שטח. "התכוונתי לשווי" אחרי שאלה על שכירות למ"ר = שווי למ"ר באותו נכס, לא השווי
+  הכולל. כשהנתון שבמרכז השיחה הוא ליחידת שטח (למ"ר), "שווי" בתיקון או בשאלת המשך הוא השווי ליחידת שטח של אותו נכס;
+  אם יש ספק — הצג אותו, ואת השווי הכולל במשפט נפרד. "זה" = הנתון שבמרכז השיחה. שאלה בנושא חדש — התעלם ממנו. אם יש שתי קריאות שמשנות את התשובה — שאל שאלה קצרה.
 - שאלת המשך: השתמש בהקשר השיחה. תשובות קודמות אינן מקור: כדי להסתמך על מה שנאמר קודם, פתח את ההפניות P# מחדש
   (open_source) או חפש שוב. אם המשתמש מתקן אותך ("התכוונתי לשווי, לא לשכירות") — עבור למה שביקש ושמור על שאר
   ההגדרות של השאלה הקודמת (אותו נכס, אותה יחידה: אם נשאלת על ערך למ"ר, התיקון מתייחס לערך למ"ר). אם הוא מחליף
@@ -89,6 +107,10 @@ REWRITE = """גם התשובה המתוקנת לא אומתה במלואה. אל
 אומתה, ציין בקצרה שלא ניתן היה לאמת אותה במקורות. החזר באותו מבנה."""
 
 
+HISTORY_USER_CHARS = 2500
+HISTORY_ANSWER_CHARS = 600
+
+
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -99,6 +121,31 @@ class Claim(_Strict):
     basis: Literal["explicit", "inference", "computed"]
 
 
+def _choice(*keys: str):
+    return Literal[tuple(dict.fromkeys([*keys, "unknown"]))]  # noqa: F821 - a Literal of the stored labels
+
+
+class Focus(_Strict):
+    """The datum at the centre of the conversation after this answer: what a follow-up or a correction refers
+    to. Strings as the documents write them; kinds and units from the measurement vocabulary."""
+
+    metric_as_written: str
+    metric_kind: _choice(*T.KIND_LABELS)
+    unit: _choice(*UNIT_LABELS)
+    period: _choice(*PERIOD_LABELS)
+    area_basis: str
+    vat: _choice(*VAT_LABELS)
+    subject: str
+    value_role: _choice(*T.ROLE_LABELS)
+    document_ids: list[str]
+
+
+class Omitted(_Strict):
+    document_id: str  # the document the left-out datum is in ("" when not one document)
+    what: str
+    why: str
+
+
 class FinalAnswer(_Strict):
     status: Literal["answered", "partial", "not_found", "clarification"]
     answer_markdown: str
@@ -106,6 +153,10 @@ class FinalAnswer(_Strict):
     clarification_question: str
     missing_info: str
     referenced_document_ids: list[str]
+    scope_kind: Literal["focused", "set"]
+    scope_query: str
+    omitted: list[Omitted]
+    focus: Focus | None
 
 
 FINAL_SCHEMA = FinalAnswer.model_json_schema()
@@ -134,6 +185,7 @@ class TurnInput:
     summary: str | None
     focus_documents: list[dict]  # [{document_id, title}]
     prior_refs: dict[str, dict]  # P# -> {version_id, block_start, block_end, table_index, chunk_id, title, location}
+    focus: dict | None = None  # the previous answer's focus, when its documents are all still visible
 
 
 @dataclass
@@ -143,6 +195,8 @@ class TurnOutcome:
     report: VerifyReport
     steps: int
     usage: list[dict] = field(default_factory=list)
+    ledger: dict = field(default_factory=dict)
+    rounds: list[list[dict]] = field(default_factory=list)  # each verification round's problems, in order
 
 
 def _context_message(inp: TurnInput) -> str:
@@ -155,8 +209,25 @@ def _context_message(inp: TurnInput) -> str:
             who = "משתמש" if m.role == "user" else "עוזר"
             # an earlier answer's [S3] named a passage of that turn; here it would name another one
             content = re.sub(r"\s*\[[SMCP]\d+(?:\s*[,،;]\s*[SMCP]\d+)*\]", "", m.content)
-            lines.append(f"{who}: {prompt_text(content[:2500])}")
+            # an earlier answer is context, not a source (its datum is in the focus): its opening is enough
+            limit = HISTORY_USER_CHARS if m.role == "user" else HISTORY_ANSWER_CHARS
+            lines.append(f"{who}: {prompt_text(content[:limit] + ('…' if len(content) > limit else ''))}")
         parts.append("ההודעות האחרונות בשיחה (תשובות העוזר אינן מקור עובדתי):\n" + "\n\n".join(lines))
+    if inp.focus:
+        f = inp.focus
+        def label(labels: dict, key: str) -> str:
+            value = f.get(key)
+            return labels.get(value, value) if value and value != "unknown" else ""
+
+        fields = [("נתון כפי שנכתב", f.get("metric_as_written")), ("סוג", label(T.KIND_LABELS, "metric_kind")),
+                  ("יחידה", label(UNIT_LABELS, "unit")), ("תקופה", label(PERIOD_LABELS, "period")),
+                  ("בסיס שטח", f.get("area_basis")), ("מע\"מ", label(VAT_LABELS, "vat")),
+                  ("נכס/נושא", f.get("subject")), ("תפקיד", label(T.ROLE_LABELS, "value_role")),
+                  ("מסמכים (document_id)", ", ".join(f.get("document_ids") or []))]
+        parts.append("הנתון שבמרכז השיחה (מהתור הקודם; לא מקור עובדתי):\n" + "\n".join(
+            f"- {k}: {prompt_text(v)}" for k, v in fields if v)
+            + "\nאם ההודעה החדשה מתקנת את התור הקודם, שנה רק את מה שתוקן ושמור את כל השאר מהרשימה הזו "
+              "(אותו נכס, אותם מסמכים, אותה יחידה — למשל ערך למ\"ר נשאר ערך למ\"ר).")
     if inp.focus_documents:
         parts.append("מסמכים שהשיחה עסקה בהם:\n" + "\n".join(
             f"- document_id={d['document_id']} | {prompt_text(d['title'])}" for d in inp.focus_documents))
@@ -181,6 +252,7 @@ def run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput,
     usage: list[dict] = []
     steps = 0
     attempt = 0  # 0: first answer, 1: repaired with tools, 2: rewritten from verified content only
+    rounds: list[list[dict]] = []
     progress("understand", "מבין את הבקשה")
     while True:
         if cancelled():
@@ -191,8 +263,7 @@ def run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput,
         step = provider.agent_step(POLICY, items, [] if last else T.TOOLS, FINAL_SCHEMA,
                                    reasoning_effort=settings.chat_reasoning_effort,
                                    timeout=max(15.0, min(left, settings.llm_timeout_agent_seconds)))
-        usage.append({"purpose": "agent", "status": step.status.value, "input_tokens": step.input_tokens,
-                      "output_tokens": step.output_tokens, "latency_ms": step.latency_ms})
+        usage.append(usage_entry("agent", step))
         if cancelled():
             raise TurnCancelled  # the call that was in flight is discarded
         if not step.ok:
@@ -211,12 +282,21 @@ def run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput,
         if answer.status == "clarification" and answer.clarification_question.strip() and not answer.answer_markdown.strip():
             answer.answer_markdown = answer.clarification_question
         progress("verify", "מאמת את הטענות מול המקורות")
-        report = verify_answer(provider, answer, ws, inp.question, usage)
+        try:
+            report = verify_answer(provider, answer, ws, inp.question, usage,
+                                   deadline=deadline + VERIFY_ALLOWANCE_SECONDS)
+        except VerificationUnavailable as exc:
+            # the answer could not be checked against its sources: a failure with retry, never an unchecked answer
+            raise ProviderFailure("verify_unavailable", exc.status) from exc
         if cancelled():
             raise TurnCancelled
+        rounds.append([p.as_dict() for p in report.problems])
         if report.ok or attempt == 2 or time.monotonic() > deadline - 20:
             final = report.apply(answer)
-            return TurnOutcome(final, ws, report, steps, usage)
+            ledger: dict = {}
+            if final.status != "clarification":
+                ledger, final = coverage.build(ws, final, inp.question)
+            return TurnOutcome(final, ws, report, steps, usage, ledger, rounds)
         attempt += 1
         if attempt == 1:
             progress("repair", "מתקן טענות שלא אומתו")
@@ -238,6 +318,8 @@ def _announce(progress: Callable[[str, str], None], call) -> None:
         progress("read", label.get(args.get("scope"), "קורא מקור"))
     elif call.name == "list_documents":
         progress("documents", "בודק אילו מסמכים זמינים")
+    elif call.name == "find_documents":
+        progress("documents", f"מאתר את המסמכים בתחום: {str(args.get('query', ''))[:60]}")
     elif call.name == "outline":
         progress("read", "קורא את מבנה המסמך")
     elif call.name == "find_measurements":

@@ -6,6 +6,8 @@ runs are reported separately)."""
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from sqlalchemy import text
 
@@ -77,6 +79,10 @@ def test_answer_from_searched_passage_is_cited_and_verified(client, office, monk
     assert a["verification"]["judged"] and a["verification"]["problems"] == []
     labels = [p["step"] for p in m["progress"]]
     assert labels[:2] == ["queued", "understand"] and "search" in labels and "verify" in labels
+    # the cost of the turn: token counts per model call, nothing of the content
+    assert [u["purpose"] for u in m["usage"]] == ["agent", "agent", "verify"]
+    assert set(m["usage"][0]) == {"purpose", "status", "input_tokens", "cached_input_tokens", "output_tokens",
+                                  "latency_ms"}
     # the model saw the passage as data inside a source tag, and only office A's
     out = agent.tool_outputs(1)[0]
     assert '<source id="S1"' in out and "9,500" in out and "7,000" not in out
@@ -301,3 +307,46 @@ def test_same_client_id_does_not_start_a_second_turn(client, office, monkeypatch
     r2 = client.post(f"/api/chat/conversations/{cid}/messages", json=body).json()
     assert r1["user"]["id"] == r2["user"]["id"] and r1["assistant"]["id"] == r2["assistant"]["id"]
     assert len(agent.seen) == steps  # the repeated request started no model step
+
+
+def test_an_answer_the_judge_cannot_check_fails_with_retry_and_shows_nothing(client, office, monkeypatch):
+    # the judge times out on the call and on its retry: the answer was never checked, so it is not shown
+    agent = ScriptedAgent([[call("search", query="דמי שכירות", document_ids=None, limit=None)],
+                           final("הנכס פנוי ומושכר לטווח ארוך.")], judge=lambda input: CallStatus.TIMEOUT)
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), "האם הנכס פנוי?")
+    assert m["status"] == "failed" and m["answer"] is None and m["content"] == ""
+    assert "לא ניתן היה לאמת" in m["error"] and "לנסות שוב" in m["error"]
+    assert sum(c.purpose.value == "verify" for c in agent.calls) == 2
+
+
+def test_a_passage_returned_again_is_referenced_not_resent_and_still_citable(client, office, monkeypatch):
+    agent = ScriptedAgent([[call("search", query="דמי שכירות ראויים", document_ids=None, limit=None)],
+                           [call("search", query="דמ\"ש ראויים למ\"ר", document_ids=None, limit=None)],
+                           lambda items: final("דמי השכירות הראויים הם 55 ₪ למ\"ר לחודש "
+                                               f"[{re.search(r'<source id=.(S[0-9]+). same_as', str(items)).group(1)}]."),
+                           ])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), "מה דמי השכירות הראויים?")
+    second = agent.tool_outputs(2)[-1]
+    assert 'same_as="S1"' in second and "9,500" not in second  # the summary passage is not sent twice
+    a = m["answer"]
+    assert a["status"] == "answered" and a["verification"]["problems"] == []
+
+
+def test_earlier_answers_reach_the_model_shortened_and_the_users_words_whole(client, office, monkeypatch):
+    long_answer = "דמי השכירות הראויים הם 55 ₪ למ\"ר לחודש [S1]. " + "הסבר נוסף על הסביבה. " * 150
+    question = "שאלה ארוכה של המשתמש " * 60
+    agent = ScriptedAgent([[call("search", query="דמי שכירות", document_ids=None, limit=None)], final(long_answer),
+                           final("כן [S1].") ])
+    agent.steps.insert(2, [call("search", query="דמי שכירות", document_ids=None, limit=None)])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    cid = new_conversation(client)
+    send(client, cid, question)
+    send(client, cid, "ומה עוד?")
+    context = next(items[0]["content"] for items in agent.seen if "ומה עוד?" in str(items[0].get("content")))
+    assert question.strip() in context
+    assert "הסבר נוסף על הסביבה. " * 40 not in context and "…" in context

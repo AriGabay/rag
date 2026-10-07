@@ -82,6 +82,28 @@ export interface ChatCoverage {
   partially_read: string[];
 }
 
+export interface LedgerDocument {
+  document_id: string | null;
+  title: string | null;
+}
+
+/** What the answer covered, computed by the server from what the turn's tools did. */
+export interface ChatLedger {
+  scope_kind: "focused" | "set";
+  scope_query: string;
+  cited: LedgerDocument[];
+  matching?: LedgerDocument[];
+  checked?: LedgerDocument[];
+  with_data?: LedgerDocument[];
+  not_checked?: LedgerDocument[];
+  unused?: LedgerDocument[];
+  partially_read?: LedgerDocument[];
+  omitted?: (LedgerDocument & { what: string; why: string })[];
+  also_matching?: LedgerDocument[];
+  complete: boolean;
+  note?: string;
+}
+
 export interface ChatAnswer {
   kind: "rag" | "search_only";
   status: "answered" | "partial" | "not_found" | "clarification";
@@ -96,6 +118,7 @@ export interface ChatAnswer {
   verification: ChatVerification | null;
   searches: string[];
   coverage: ChatCoverage[];
+  ledger?: ChatLedger | null;
   steps?: number;
   hidden?: boolean;
 }

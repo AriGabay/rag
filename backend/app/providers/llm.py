@@ -99,6 +99,7 @@ class StructuredResult:
     output_tokens: int | None = None
     latency_ms: int | None = None
     detail: str | None = None  # short machine reason (error class, code); never a message body or key
+    cached_input_tokens: int | None = None  # input tokens served from the provider's prompt cache, when reported
 
     @property
     def ok(self) -> bool:
@@ -115,10 +116,21 @@ class AgentStep:
     output_tokens: int | None = None
     latency_ms: int | None = None
     detail: str | None = None
+    cached_input_tokens: int | None = None
 
     @property
     def ok(self) -> bool:
         return self.status == CallStatus.OK
+
+
+USAGE_FIELDS = ("purpose", "status", "input_tokens", "cached_input_tokens", "output_tokens", "latency_ms")
+
+
+def usage_entry(purpose: str, result: StructuredResult | AgentStep) -> dict:
+    """One model call's cost record: token counts and latency, no content."""
+    return {"purpose": purpose, "status": result.status.value, "input_tokens": result.input_tokens,
+            "cached_input_tokens": result.cached_input_tokens, "output_tokens": result.output_tokens,
+            "latency_ms": result.latency_ms}
 
 
 class ProviderCallError(RuntimeError):
@@ -333,7 +345,8 @@ class OpenAIProvider(BaseProvider):
         # The body is read first: a truncated or refused output must not be reported as merely invalid.
         body = raw.http_response.json()
         usage = body.get("usage") or {}
-        tokens = {"input_tokens": usage.get("input_tokens"), "output_tokens": usage.get("output_tokens")}
+        tokens = {"input_tokens": usage.get("input_tokens"), "output_tokens": usage.get("output_tokens"),
+                  "cached_input_tokens": (usage.get("input_tokens_details") or {}).get("cached_tokens")}
         reason = (body.get("incomplete_details") or {}).get("reason")
         if _refused(body.get("output") or []) or reason == "content_filter":
             return self._failed(purpose, CallStatus.REFUSAL, reason, started, **tokens)
@@ -393,7 +406,9 @@ class OpenAIProvider(BaseProvider):
         usage = getattr(resp, "usage", None)
         step = AgentStep(CallStatus.OK, list(resp.output or []), [], None,
                          input_tokens=getattr(usage, "input_tokens", None),
-                         output_tokens=getattr(usage, "output_tokens", None), latency_ms=_elapsed_ms(started))
+                         output_tokens=getattr(usage, "output_tokens", None), latency_ms=_elapsed_ms(started),
+                         cached_input_tokens=getattr(getattr(usage, "input_tokens_details", None), "cached_tokens",
+                                                     None))
         reason = getattr(getattr(resp, "incomplete_details", None), "reason", None)
         for item in step.output:
             kind = getattr(item, "type", None)

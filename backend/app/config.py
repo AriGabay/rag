@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     llm_timeout_clarify_seconds: float = 15
     llm_timeout_extract_seconds: float = 30
     llm_timeout_answer_seconds: float = 30
-    llm_timeout_verify_seconds: float = 20
+    llm_timeout_verify_seconds: float = 45  # a judge call reads every claim of an answer with its evidence
     llm_timeout_test_seconds: float = 20
     llm_timeout_vision_seconds: float = 90
     # The conversational answering loop: reasoning effort of its model steps, its step bound and wall clock.

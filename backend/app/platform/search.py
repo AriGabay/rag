@@ -395,6 +395,82 @@ def documents_named(conn: Connection, query: str, scope: SearchScope | None = No
     return [(i, hit) for _, _, i, hit in named]
 
 
+def _scope_terms(query: str) -> list[list[str]]:
+    """The query's terms, each with its forms: the word, its prefix-stripped and inflected variants, and the
+    other spelling of an abbreviation ("דמ״ש" / "דמי שכירות" become one term)."""
+    from app.extraction.abbreviations import variants
+    from app.extraction.normalize_text import _word_variants
+
+    terms: list[list[str]] = []
+    base = base_normalize(query)
+    alternates = [base_normalize(v) for v in variants(query, limit=4)]
+    for raw in _WORD_RE.findall(base):
+        tok = raw.strip("./-׳״")
+        if tok in STOPWORDS or (sum(ch.isalpha() for ch in tok) < 2 and not any(ch.isdigit() for ch in tok)):
+            continue
+        forms = [tok, *(_word_variants(tok) if _HEB.fullmatch(tok) else [])]
+        if "״" in tok:  # an abbreviation: its spelled-out form counts as the same term
+            for alt in alternates:
+                if tok not in alt:
+                    forms += [w for w in alt.split() if w not in base.split() and w not in STOPWORDS]
+        terms.append(list(dict.fromkeys(f for f in forms if len(f) >= 2)))
+    return [t for t in terms if t]
+
+
+def documents_matching(conn: Connection, query: str) -> list[dict]:
+    """Every visible current document that contains **every** term of ``query`` — in its title or in its current
+    text, each term in any of its forms. An AND per document, so a generic word of the query cannot pull in
+    documents that lack its defining terms. Returns [{document_id, title, in_title, in_text, hits}], title
+    matches first, then by hits. No ranking cut-off: the whole matching set."""
+    terms = _scope_terms(query)
+    if not terms:
+        return []
+    params: dict = {}
+    filters = []
+    for i, forms in enumerate(terms):
+        q = " || ".join(f"plainto_tsquery('simple', :t{i}_{j})" for j in range(len(forms)))
+        params |= {f"t{i}_{j}": f for j, f in enumerate(forms)}
+        filters.append(f"count(c.id) FILTER (WHERE c.tsv @@ ({q})) AS h{i}")
+    rows = conn.execute(text(
+        "SELECT d.id, d.title, " + ", ".join(filters) + " FROM documents d JOIN document_versions v"
+        " ON v.document_id = d.id AND v.is_current LEFT JOIN chunks c ON c.version_id = v.id"
+        " WHERE d.deleted_at IS NULL GROUP BY d.id, d.title"), params).all()
+    out = []
+    term_sets = [set(t) for t in terms]
+    for r in rows:
+        title = _title_words(r.title)
+        in_title = [t[0] for t, ts in zip(terms, term_sets, strict=True) if title & ts]
+        in_text = [t[0] for i, t in enumerate(terms) if getattr(r, f"h{i}")]
+        if all(title & ts or getattr(r, f"h{i}") for i, ts in enumerate(term_sets)):
+            out.append({"document_id": r.id, "title": r.title, "in_title": in_title, "in_text": in_text,
+                        "hits": sum(getattr(r, f"h{i}") for i in range(len(terms)))})
+    out.sort(key=lambda d: (-len(d["in_title"]), -d["hits"], d["title"], str(d["document_id"])))
+    return out
+
+
+def documents_sharing_title_words(conn: Connection, question: str) -> dict[str, list[tuple[UUID, str]]]:
+    """Question words that appear in the titles of several visible documents, but not in most titles: word ->
+    [(document id, title)]. Between 2 and min(8, 40% of the titles) documents, so a word every title carries
+    ("תקן", "שומה") never counts."""
+    docs = [(r.id, r.title) for r in conn.execute(text(
+        "SELECT d.id, d.title FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
+        " WHERE d.deleted_at IS NULL ORDER BY d.title, d.id"))]
+    if len(docs) < 2:
+        return {}
+    ceiling = min(8, max(2, int(0.4 * len(docs))))
+    words_of = {i: _title_words(t) for i, t in docs}
+    out: dict[str, list[tuple[UUID, str]]] = {}
+    for raw in _TITLE_WORD.findall(base_normalize(question)):
+        w = raw.strip("-'״׳\"")
+        if len(w) < 2 or w in STOPWORDS or not any(ch.isalpha() for ch in w):
+            continue
+        forms = {w, *prefix_variants(w)}
+        hit = [(i, t) for i, t in docs if words_of[i] & forms]
+        if 2 <= len(hit) <= ceiling:
+            out[w] = hit
+    return out
+
+
 def search_passages(conn: Connection, query: str, limit: int = 8, *, scope: SearchScope | None = None) -> list[dict]:
     """The search the answering tools and the search screen share: the query and its abbreviation variants over
     the scope, and — when the query names a document by its title — the same query inside that document, whose

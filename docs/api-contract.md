@@ -185,7 +185,12 @@ Every change appends the prior state to `previous`, bumps only that attribute's 
 | POST | `/api/chat/messages/{id}/cancel` | asks the server to stop; `cancelling` until the worker reaches its next check, then `cancelled` |
 | POST | `/api/chat/messages/{id}/retry` | replaces a finished/failed/cancelled answer with a new run |
 
-`ChatMessage`: `{id, role, content, status: "running"|"cancelling"|"cancelled"|"done"|"failed", error, progress: [{step, label}], answer, reply_to, client_id, created_at, stale, cancel_requested}`. `answer`: `{kind: "rag"|"search_only", status: "answered"|"partial"|"not_found"|"clarification", markdown, claims, clarification, missing, sources, measurements, computations, documents, verification: {judged, judge_status, problems}, searches, coverage}`. Citations in `markdown` are `[S#]` (passage), `[M#]` (measurement), `[C#]` (computation). An answer whose source was deleted or is no longer visible comes back `hidden`; one built before a data or permission change is `stale`.
+`ChatMessage`: `{id, role, content, status: "running"|"cancelling"|"cancelled"|"done"|"failed", error, progress: [{step, label}], answer, reply_to, client_id, created_at, stale, cancel_requested}`. `answer`: `{kind: "rag"|"search_only", status: "answered"|"partial"|"not_found"|"clarification", markdown, claims, clarification, missing, sources, measurements, computations, documents, verification: {judged, judge_status, problems}, searches, coverage, ledger, scope_kind, focus}`. Citations in `markdown` are `[S#]` (passage), `[M#]` (measurement), `[C#]` (computation).
+
+- `ledger` is the server's coverage record: `{scope_kind, scope_query, cited, matching, checked, with_data, not_checked, unused, partially_read, omitted, also_matching, complete, note}`. Every entry is `{document_id, title}`, and `omitted` entries add `{what, why}`. A set answer that is not `complete` carries the note in `markdown` (`> **כיסוי:** …`) and its status is at most `partial`.
+- `focus` holds the datum at the centre of the answer: `{metric_as_written, metric_kind, unit, period, area_basis, vat, subject, value_role, document_ids}`. The next turn receives it.
+- `usage` lists the token counts per model call, with no content: `[{purpose, status, input_tokens, cached_input_tokens, output_tokens, latency_ms}]`.
+- A turn whose answer could not be verified ends `failed` with `"לא ניתן היה לאמת את התשובה מול המקורות. אפשר לנסות שוב."`. An answer whose source was deleted or is no longer visible comes back `hidden`; one built before a data or permission change is `stale`.
 
 ## Admin (admin role only)
 

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -25,10 +24,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
-from app.chat import engine
+from app.chat import coverage, engine
 from app.config import get_settings
 from app.db import TenantContext, current_data_version, tenant_tx
 from app.deps import NOT_FOUND, get_ctx, parse_uuid
+from app.providers.llm import USAGE_FIELDS, usage_entry
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -50,6 +50,7 @@ FAILURE_TEXT = {
     "invalid": "תשובת המודל לא הייתה בפורמט תקין.",
     "unsupported": "ספק המודל שנבחר אינו תומך בשיחה עם כלים.",
     "queued_too_long": "השאלה המתינה זמן רב מדי לעיבוד.",
+    "verify_unavailable": "לא ניתן היה לאמת את התשובה מול המקורות.",
 }
 
 _pool: ThreadPoolExecutor | None = None
@@ -181,15 +182,24 @@ def _message_json(r, dv: int | None = None, sh: str | None = None, visible: set 
     return {"id": str(r.id), "role": r.role, "content": content, "status": status_, "error": error,
             "progress": r.progress or [], "answer": answer, "reply_to": str(r.reply_to) if r.reply_to else None,
             "client_id": str(r.client_id) if r.client_id else None, "created_at": r.created_at.isoformat(),
-            "stale": stale, "cancel_requested": r.cancel_requested}
+            "stale": stale, "cancel_requested": r.cancel_requested,
+            # token counts per model call (no content): the cost and latency of the turn
+            "usage": [{k: u.get(k) for k in USAGE_FIELDS} for u in (getattr(r, "usage", None) or [])]}
 
 
 def _answer_documents(answer: dict | None) -> set[str]:
+    """Every document an answer draws on or names: its sources, measurements and documents, the documents its
+    coverage ledger lists (in scope, checked or not), the documents of its focus, and every document the turn's
+    tools touched (a claim removed in verification may have quoted one; its text is kept in the verification
+    record). A message is shown, and carried into the model's context, only while all of them are visible."""
     if not answer:
         return set()
     ids = {s.get("document_id") for s in answer.get("sources") or []}
     ids |= {m.get("document_id") for m in answer.get("measurements") or []}
     ids |= {d.get("document_id") for d in answer.get("documents") or []}
+    ids |= coverage.ledger_documents(answer.get("ledger"))
+    ids |= set((answer.get("focus") or {}).get("document_ids") or [])
+    ids |= set(answer.get("touched_documents") or [])
     ids.discard(None)
     return ids
 
@@ -199,12 +209,21 @@ def _hidden(r, visible: set | None) -> bool:
 
 
 def _visible_documents(conn: Connection, rows) -> set[str]:
-    ids = {d for r in rows for d in _answer_documents(r.answer)}
-    ids.discard(None)
-    if not ids:
+    return _visible_ids(conn, {d for r in rows for d in _answer_documents(r.answer)})
+
+
+def _visible_ids(conn: Connection, ids) -> set[str]:
+    """The given document ids the user sees now (RLS on documents decides; deleted documents are not seen)."""
+    uuids = []
+    for i in ids or ():
+        try:
+            uuids.append(UUID(str(i)))
+        except ValueError:
+            continue
+    if not uuids:
         return set()
     return {str(x.id) for x in conn.execute(text("SELECT id FROM documents WHERE id = ANY(:i) AND deleted_at IS NULL"),
-                                            {"i": [UUID(i) for i in ids]})}
+                                            {"i": uuids})}
 
 
 _SELECT = ("SELECT m.*, EXTRACT(EPOCH FROM (now() - m.updated_at)) AS age FROM messages m")
@@ -380,9 +399,28 @@ def _finish(ctx: TenantContext, message_id: UUID, status_: str, *, content: str 
                           " messages WHERE id = :m)"), {"m": message_id})
 
 
-def _turn_input(conn: Connection, conversation_id: UUID, user_message_id: UUID) -> engine.TurnInput:
-    conv = conn.execute(text("SELECT summary, summary_message_count FROM conversations WHERE id = :c"),
+def _summary_usable(conn: Connection, ctx: TenantContext, conv) -> bool:
+    """A summary is shown to the model only when it records what it was built from, it was built under the
+    user's current permission scope, and every document behind it is still visible. A summary without that
+    record (written before summaries kept one) is never shown."""
+    meta = conv.summary_meta
+    if not conv.summary or not isinstance(meta, dict) or meta.get("invalid"):
+        return False
+    if meta.get("scope_hash") != scope_hash(ctx):
+        return False
+    docs = set(meta.get("document_ids") or [])
+    return docs <= _visible_ids(conn, docs)
+
+
+def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
+                user_message_id: UUID) -> engine.TurnInput:
+    conv = conn.execute(text("SELECT summary, summary_message_count, summary_meta FROM conversations WHERE id = :c"),
                         {"c": conversation_id}).one()
+    summary = conv.summary if _summary_usable(conn, ctx, conv) else None
+    if conv.summary and summary is None and not (conv.summary_meta or {}).get("invalid"):
+        # rebuilt after the turn from what the user may see now; the old text is never used again
+        conn.execute(text("UPDATE conversations SET summary_meta = COALESCE(summary_meta, '{}'::jsonb)"
+                          " || '{\"invalid\": true}'::jsonb WHERE id = :c"), {"c": conversation_id})
     user = conn.execute(text("SELECT content, created_at FROM messages WHERE id = :m"), {"m": user_message_id}).one()
     rows = conn.execute(text(
         "SELECT role, content, answer, status FROM messages WHERE conversation_id = :c AND created_at < :t"
@@ -408,16 +446,16 @@ def _turn_input(conn: Connection, conversation_id: UUID, user_message_id: UUID) 
                           "block_end": s.get("block_end"), "table_index": s.get("table_index"),
                           "chunk_id": s.get("chunk_id"), "title": s.get("title"), "location": s.get("location"),
                           "excerpt": " ".join((s.get("text") or "").split())[:160]}
-    return engine.TurnInput(question=user.content, history=history, summary=conv.summary,
+    # the last answer's focus; its message is in ``rows`` only while every document it names is visible
+    last_focus = (last.answer.get("focus") or None) if last is not None else None
+    return engine.TurnInput(question=user.content, history=history, summary=summary, focus=last_focus,
                             focus_documents=[{"document_id": k, "title": v} for k, v in list(focus.items())[-8:]],
                             prior_refs=prior)
 
 
 def _answer_payload(outcome: engine.TurnOutcome) -> dict:
     ws, a = outcome.workspace, outcome.answer
-    cited = set()
-    for m in re.finditer(r"\[([SMC]\d+(?:\s*[,،;]\s*[SMC]\d+)*)\]", a.answer_markdown):
-        cited |= set(re.findall(r"[SMC]\d+", m.group(1)))
+    cited = coverage.cited_ids(a.answer_markdown)
     sources = [ws.sources[i].public() | {"chunk_id": str(ws.sources[i].chunk_id) if ws.sources[i].chunk_id else None}
                for i in ws.sources if i in cited]
     # measurements and computations cite the documents behind them
@@ -445,15 +483,26 @@ def _answer_payload(outcome: engine.TurnOutcome) -> dict:
                             "kind": "measurement", "text": m["quote"], "block_start": m["block_index"],
                             "block_end": m["block_index"], "table_index": m["table_index"], "page_list": None,
                             "chunk_id": None})
+    focus = None
+    if a.focus is not None:
+        # only documents this turn actually touched or cites; a focus with none is no focus
+        known = set(ws.activity) | set(docs)
+        focus = a.focus.model_dump()
+        focus["document_ids"] = [d for d in focus["document_ids"] if d in known]
+        if not focus["document_ids"] and a.status == "not_found":
+            focus = None
     return {
         "kind": "rag", "status": a.status, "markdown": a.answer_markdown, "claims": [c.model_dump() for c in a.claims],
         "clarification": a.clarification_question or None, "missing": a.missing_info or None,
         "sources": sources, "measurements": measurements, "computations": computations,
         "documents": [{"document_id": k, "title": v} for k, v in docs.items()],
         "verification": {"judged": outcome.report.judged, "judge_status": outcome.report.judge_status,
-                         "problems": [{"text": p.unit.raw[:300], "reason": p.reason, "severity": p.severity}
-                                      for p in outcome.report.problems]},
+                         "problems": [p.as_dict() for p in outcome.report.problems],
+                         # what each round found (first answer, repair, rewrite): why a claim was repaired or removed
+                         "rounds": outcome.rounds},
         "searches": ws.searches, "coverage": ws.coverage, "steps": outcome.steps,
+        "ledger": outcome.ledger or None, "scope_kind": a.scope_kind, "focus": focus,
+        "touched_documents": sorted(ws.activity),
     }
 
 
@@ -492,7 +541,7 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
                 raise engine.ProviderFailure("queued_too_long")
             conn.execute(text("UPDATE messages SET updated_at = now() WHERE id = :m"), {"m": message_id})
             state = office_provider_state(conn)
-            inp = _turn_input(conn, conversation_id, user_message_id)
+            inp = _turn_input(conn, ctx, conversation_id, user_message_id)
         if state.mode != Mode.CLOUD:
             reason = state.limitation() or "שליחת קטעים לספק מודל ענן כבויה במשרד."
             reason = reason.split(";")[0].rstrip(".") + "."
@@ -510,7 +559,6 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
                 log_usage(conn, provider, u["purpose"], _U(u), u["status"] == "ok", u["status"])
         _finish(ctx, message_id, "done", content=outcome.answer.answer_markdown, answer=payload, usage=outcome.usage,
                 model=provider.model)
-        _maybe_summarize(ctx, conversation_id, provider)
     except engine.TurnCancelled:
         _finish(ctx, message_id, "cancelled", error="העיבוד נעצר לבקשתך.")
     except engine.ProviderFailure as e:
@@ -522,6 +570,12 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
             _finish(ctx, message_id, "failed", error="אירעה תקלה בעיבוד התשובה. אפשר לנסות שוב.")
         except Exception:  # noqa: BLE001
             logger.exception("could not record the failed turn")
+    else:
+        # the summary is best-effort: the answer is stored, and a summary that fails is tried again next turn
+        try:
+            _maybe_summarize(ctx, conversation_id, message_id, provider)
+        except Exception:  # noqa: BLE001
+            logger.exception("conversation summary failed")
 
 
 class _U:
@@ -539,31 +593,58 @@ class _Summary(BaseModel):
     summary: str
 
 
-def _maybe_summarize(ctx: TenantContext, conversation_id: UUID, provider) -> None:
-    """Fold messages older than the recent window into the conversation summary, every few messages."""
+SUMMARY_REBUILD_MAX = 40  # messages folded when a summary is rebuilt from scratch
+
+
+def _maybe_summarize(ctx: TenantContext, conversation_id: UUID, message_id: UUID, provider) -> None:
+    """Fold messages older than the recent window into the conversation summary, every few messages.
+
+    Only what the user may see now goes in: an assistant message whose answer draws on a document that is no
+    longer visible is left out (the user's own messages stay — they are the user's words). The summary records
+    the documents behind the folded answers, the permission scope and data version, and the last message folded.
+    A summary that is no longer usable (or never recorded this) is rebuilt from scratch, without its old text."""
     from app.providers.llm import Purpose, prompt_text
 
     with tenant_tx(ctx) as conn:
-        conv = conn.execute(text("SELECT summary, summary_message_count FROM conversations WHERE id = :c"),
-                            {"c": conversation_id}).first()
+        conv = conn.execute(text("SELECT summary, summary_message_count, summary_meta FROM conversations"
+                                 " WHERE id = :c"), {"c": conversation_id}).first()
         if conv is None:
             return
         total = conn.execute(text("SELECT count(*) FROM messages WHERE conversation_id = :c AND status = 'done'"),
                              {"c": conversation_id}).scalar_one()
         upto = total - HISTORY_MESSAGES
-        if upto <= conv.summary_message_count or upto - conv.summary_message_count < SUMMARY_EVERY:
+        rebuild = bool(conv.summary) and not _summary_usable(conn, ctx, conv)
+        if upto <= 0:
             return
-        rows = conn.execute(text("SELECT role, content FROM messages WHERE conversation_id = :c AND status = 'done'"
-                                 " ORDER BY created_at, id OFFSET :o LIMIT :n"),
-                            {"c": conversation_id, "o": conv.summary_message_count,
-                             "n": upto - conv.summary_message_count}).all()
-    body = ("סיכום קודם:\n" + prompt_text(conv.summary or "אין") + "\n\nהודעות נוספות:\n"
-            + "\n".join(f"{'משתמש' if r.role == 'user' else 'עוזר'}: {prompt_text(r.content[:1500])}" for r in rows))
+        if not rebuild and (upto <= conv.summary_message_count or upto - conv.summary_message_count < SUMMARY_EVERY):
+            return
+        start = max(0, upto - SUMMARY_REBUILD_MAX) if rebuild else conv.summary_message_count
+        rows = conn.execute(text("SELECT id, role, content, answer FROM messages WHERE conversation_id = :c"
+                                 " AND status = 'done' ORDER BY created_at, id OFFSET :o LIMIT :n"),
+                            {"c": conversation_id, "o": start, "n": upto - start}).all()
+        visible = _visible_documents(conn, rows)
+        rows = [r for r in rows if not (r.role == "assistant" and _hidden(r, visible))]
+        docs = set() if rebuild else set((conv.summary_meta or {}).get("document_ids") or [])
+        for r in rows:
+            if r.role == "assistant":
+                docs |= _answer_documents(r.answer)
+        dv = current_data_version(conn)
+    previous = "אין" if rebuild or not conv.summary else prompt_text(conv.summary)
+    body = ("סיכום קודם:\n" + previous + "\n\nהודעות נוספות:\n"
+            + "\n".join(f"{'משתמש' if r.role == 'user' else 'עוזר'}: {prompt_text((r.content or '')[:1500])}"
+                        for r in rows))
     r = provider.structured(Purpose.AGENT, SUMMARY_POLICY, body, _Summary, max_output_tokens=1200)
-    if r.ok:
-        with tenant_tx(ctx) as conn:
-            conn.execute(text("UPDATE conversations SET summary = :s, summary_message_count = :n WHERE id = :c"),
-                         {"s": r.parsed.summary, "n": upto, "c": conversation_id})
+    usage = usage_entry("summary", r)
+    with tenant_tx(ctx) as conn:
+        # the summary's cost belongs to the turn that triggered it
+        conn.execute(text("UPDATE messages SET usage = COALESCE(usage, '[]'::jsonb) || CAST(:u AS jsonb)"
+                          " WHERE id = :m"), {"u": json.dumps([usage]), "m": message_id})
+        if r.ok:
+            meta = {"document_ids": sorted(docs), "scope_hash": scope_hash(ctx), "data_version": dv,
+                    "through_message_id": str(rows[-1].id) if rows else None, "built_at": datetime.now().isoformat()}
+            conn.execute(text("UPDATE conversations SET summary = :s, summary_message_count = :n,"
+                              " summary_meta = CAST(:m AS jsonb) WHERE id = :c"),
+                         {"s": r.parsed.summary, "n": upto, "m": json.dumps(meta), "c": conversation_id})
 
 
 def new_client_id() -> str:

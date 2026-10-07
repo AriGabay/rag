@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useMemo, useState } from "react";
-import type { ChatAnswer, ChatMessage, ChatSource } from "@/lib/chatTypes";
+import type { ChatAnswer, ChatLedger, ChatMessage, ChatSource, LedgerDocument } from "@/lib/chatTypes";
 import { type CitationTarget, Markdown, citationOrder, plainAnswer } from "./Markdown";
 
 export interface CitedItem {
@@ -235,9 +235,10 @@ function AnswerDetails({
           </ul>
         </div>
       )}
+      {answer.ledger && <LedgerSection ledger={answer.ledger} />}
       {coverage && (
         <div className="details-section">
-          <h4>כיסוי</h4>
+          <h4>נתונים כמותיים בתחום</h4>
           <p>
             {coverage.extracted} מתוך {coverage.documents} מסמכים בתחום חולצו לנתונים כמותיים.
             {coverage.not_extracted.length > 0 && ` טרם חולצו: ${coverage.not_extracted.join("; ")}.`}
@@ -267,7 +268,7 @@ function AnswerDetails({
       {answer.verification && problems.length === 0 && (
         <div className="details-section">
           <h4>אימות</h4>
-          <p>{answer.verification.judged ? "כל הטענות נבדקו מול המקורות המצוטטים." : "בדיקת האימות לא הושלמה; נבדקו רק מספרים ומראי מקום."}</p>
+          <p>{answer.verification.judged ? "כל הטענות נבדקו מול המקורות המצוטטים." : "הטענות בתשובה זו לא נבדקו מול המקורות (תשובה מגרסה קודמת, שבה בדיקה שנכשלה לא עצרה את התשובה). יש לבדוק במקור לפני שימוש."}</p>
         </div>
       )}
       {answer.searches.length > 0 && (
@@ -304,6 +305,53 @@ export function UserMessage({ message, error, onResend }: { message: ChatMessage
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+
+function titles(docs: LedgerDocument[] | undefined): string {
+  return (docs ?? []).map((d) => d.title ?? "").filter(Boolean).join("; ");
+}
+
+/** The coverage ledger: the set the question was about, what was checked and used, and what was not. */
+function LedgerSection({ ledger }: { ledger: ChatLedger }) {
+  if (ledger.scope_kind === "focused") {
+    if (!ledger.also_matching?.length) return null;
+    return (
+      <div className="details-section ledger" data-testid="ledger">
+        <h4>כיסוי</h4>
+        <p>מסמכים נוספים שכותרתם מתאימה לשאלה ולא נבדקו: {titles(ledger.also_matching)}.</p>
+      </div>
+    );
+  }
+  const rows: [string, LedgerDocument[] | undefined][] = [
+    ["לא נבדקו", ledger.not_checked],
+    ["נבדקו, לא נמצא בהם נתון שנכלל בתשובה", ledger.unused],
+    ["נקראו חלקית", ledger.partially_read],
+  ];
+  return (
+    <div className="details-section ledger" data-testid="ledger">
+      <h4>כיסוי</h4>
+      <p>
+        תחום: <bdi>{ledger.scope_query}</bdi> · {ledger.matching?.length ?? 0} מסמכים מתאימים · נבדקו{" "}
+        {ledger.checked?.length ?? 0} · בשימוש בתשובה {ledger.with_data?.length ?? 0}
+        {ledger.complete ? " · התשובה מכסה את כל התחום" : " · התשובה אינה מכסה את כל התחום"}
+      </p>
+      <ul>
+        {rows
+          .filter(([, docs]) => docs && docs.length > 0)
+          .map(([label, docs]) => (
+            <li key={label}>
+              {label}: {titles(docs)}
+            </li>
+          ))}
+        {(ledger.omitted ?? []).map((o, i) => (
+          <li key={`o${i}`}>
+            הושמט{o.title ? ` (${o.title})` : ""}: {o.what} — {o.why}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

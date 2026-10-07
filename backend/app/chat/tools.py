@@ -3,9 +3,11 @@
 The model never runs SQL and never sees anything the user may not: every tool runs in its own short
 transaction under the user's tenant context (RLS decides what is visible), validates its arguments, and returns
 plain text the model reads. Every passage a tool returns is registered as a source with an id (``S1``...); every
-stored measurement as ``M1``...; every computation as ``C1``.... An answer may cite only ids issued in the same
-turn, so a previous answer is never a source: an earlier turn's passages are offered as ``P`` references the
-model must re-open (``open_source``), which reads them again under the current permissions.
+stored measurement as ``M1``...; every computation as ``C1``.... Every tool also records which documents it
+touched (searched, opened, their measurements read), so the server can state an answer's coverage itself. An
+answer may cite only ids issued in the same turn, so a previous answer is never a source: an earlier turn's
+passages are offered as ``P`` references the model must re-open (``open_source``), which reads them again under
+the current permissions.
 
 Tools:
 
@@ -13,10 +15,12 @@ Tools:
   optionally within named documents;
 - ``open_source``: the context around a source — neighbouring paragraphs, the whole section, or the whole
   table with its caption, header and notes;
-- ``list_documents``: visible documents with their reading status (fully read, partial: what was not read);
+- ``find_documents``: every document that contains all the terms that define a set (a place, a document type),
+  in its title or text — the scope of a question about a set of documents, paged, with the total;
+- ``list_documents``: visible documents with their reading status (fully read, partial: what was not read), paged;
 - ``outline``: a document's section headings;
 - ``find_measurements``: stored measurements with their meaning (kind, unit, period, area basis, VAT, role,
-  subject), grouped by what can be compared, with the coverage of the documents in scope;
+  subject), grouped by what can be compared, with the coverage of the documents in scope, paged;
 - ``compute``: mean / median / sum / min / max / count / difference / ratio over measurements, in exact
   decimal code, refusing to mix kinds, units, periods, VAT status, area bases or roles.
 """
@@ -25,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import statistics
 from dataclasses import dataclass, field
@@ -34,18 +39,20 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from app.chat.evidence import TABLE_SIZE_PREFIX
 from app.db import TenantContext, tenant_tx
 from app.measurements.extract import EXTRACTION_VERSION, PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
 from app.platform.search import SearchScope, search_passages
 
 logger = logging.getLogger(__name__)
 
-SEARCH_LIMIT = 8
+SEARCH_LIMIT = 6
 SEARCH_MAX = 12
 PASSAGE_CHARS = 1600
 CONTEXT_CHARS = {"neighbors": 3500, "section": 9000, "table": 14000}
-MEASUREMENTS_MAX = 120
-LIST_MAX = 60
+MEASUREMENTS_MAX = 120  # per page
+LIST_MAX = 60  # per page
+SCOPE_PAGE = 30
 
 ROLE_LABELS = {
     "appraiser_determination": "קביעת השמאי", "actual_contract": "חוזה בפועל",
@@ -85,6 +92,7 @@ class Source:
     chunk_id: UUID | None = None
     page_list: list[int] | None = None
     partial_document: bool = False
+    same_as: str | None = None  # an earlier id of this turn that returned the same text (not sent again)
 
     def public(self) -> dict:
         return {"id": self.sid, "document_id": str(self.document_id), "version_id": str(self.version_id),
@@ -101,6 +109,7 @@ class Measurement:
     version_id: UUID
     title: str
     row: Any
+    listings: set = field(default_factory=set)  # the find_measurements listings that returned it
 
     def public(self) -> dict:
         r = self.row
@@ -138,6 +147,29 @@ class Workspace:
     prior: dict[str, dict] = field(default_factory=dict)  # P# -> {version_id, block_start, block_end, chunk_id}
     searches: list[str] = field(default_factory=list)
     coverage: list[dict] = field(default_factory=list)
+    # document id -> {"title", "searched", "opened", "measurements", "partial"}: what the turn's tools touched
+    activity: dict[str, dict] = field(default_factory=dict)
+    # the set a question is about: {"query", "matching": [{document_id, title}], "pages", "pages_read"}
+    scope: dict | None = None
+    # find_measurements listings: filter key -> {"pages", "pages_read", "total"}
+    listings: dict[tuple, dict] = field(default_factory=dict)
+    returned: dict[tuple, str] = field(default_factory=dict)  # what was already returned -> its first id
+
+    def once(self, source: Source, key: tuple) -> Source:
+        """Mark a source whose text this turn already returned: it keeps its own id (citable, verified against
+        the same text) but is sent to the model as a reference to the first one."""
+        first = self.returned.get(key)
+        if first is not None and first != source.sid:
+            source.same_as = first
+        else:
+            self.returned[key] = source.sid
+        return source
+
+    def touch(self, document_id, title: str, what: str, partial: bool = False) -> None:
+        a = self.activity.setdefault(str(document_id), {"title": title, "searched": False, "opened": False,
+                                                        "measurements": False, "partial": False})
+        a[what] = True
+        a["partial"] = a["partial"] or partial
 
     def _sid(self) -> str:
         return f"S{len(self.sources) + 1}"
@@ -203,11 +235,46 @@ def _visible_documents(conn: Connection, ids: list[str]) -> list[UUID]:
     return out
 
 
+def table_size_line(structure: dict | None) -> str:
+    """"הטבלה: 9 שורות; ערכים לפי עמודה: ..." — so a single row is never read as the whole table."""
+    st = structure or {}
+    rows = [r.get("cells") or [] for r in st.get("rows") or []]
+    if not rows:
+        return ""
+    headers = st.get("headers") or []
+    counts = []
+    for i, h in enumerate(headers):
+        n = sum(1 for r in rows if i < len(r) and re.search(r"\d", r[i] or ""))
+        if h and n:
+            counts.append(f"{h} {n}")
+    return f"{TABLE_SIZE_PREFIX} {len(rows)} שורות" + (f"; ערכים מספריים לפי עמודה: {', '.join(counts[:6])}" if counts else "")
+
+
+def _table_sizes(conn: Connection, keys: set[tuple]) -> dict[tuple, str]:
+    if not keys:
+        return {}
+    vids = list({k[0] for k in keys})
+    out = {}
+    for r in conn.execute(text("SELECT version_id, table_index, structure FROM extracted_tables"
+                               " WHERE version_id = ANY(:v) AND table_index = ANY(:t)"),
+                          {"v": vids, "t": list({k[1] for k in keys})}):
+        if (r.version_id, r.table_index) in keys:
+            out[(r.version_id, r.table_index)] = table_size_line(r.structure)
+    return out
+
+
 def _clip(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n].rstrip() + " …[קוצר]"
 
 
+def _with_size(size: str | None, body: str) -> str:
+    return f"{size}\n{body}" if size else body
+
+
 def _render_source(s: Source) -> str:
+    if s.same_as:
+        return (f'<source id="{s.sid}" same_as="{s.same_as}" document_id="{s.document_id}" title="{_attr(s.title)}"'
+                f' location="{_attr(s.location)}"/> (אותו טקסט כמו {s.same_as}, שכבר הוחזר בתור הזה)')
     flag = " (המסמך נקרא חלקית: חלק מהתמונות לא נקראו)" if s.partial_document else ""
     return (f'<source id="{s.sid}" document_id="{s.document_id}" title="{_attr(s.title)}" location="{_attr(s.location)}"'
             f' kind="{s.kind}">{flag}\n{_txt(s.text)}\n</source>')
@@ -241,6 +308,8 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
         extra = {r.id: r for r in conn.execute(text(
             "SELECT id, block_start, block_end FROM chunks WHERE id = ANY(:i)"), {"i": ids})} if ids else {}
         partial = _partial_versions(conn, list({h["version_id"] for h in hits}))
+        sizes = _table_sizes(conn, {(h["version_id"], h.get("table_index")) for h in hits
+                                    if h["kind"] in ("table", "table_row") and h.get("table_index") is not None})
         # a table chunk already holds its rows: a row hit of a returned table part adds nothing
         tables = [h for h in hits if h["kind"] == "table"]
         out = []
@@ -252,12 +321,14 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
             e = extra.get(h["chunk_id"])
             bs, be = (e.block_start, e.block_end) if e else (None, None)
             paragraphs, media = _block_info(conn, h["version_id"], bs, be)
-            out.append(ws.add_source(
+            out.append(ws.once(ws.add_source(
                 document_id=h["document_id"], version_id=h["version_id"], title=h["title"], section=h["section"],
                 location=_location(h["section"], h["kind"], h["page_list"], bs, be, paragraphs, media),
-                kind=h["kind"], text=_clip(h["text"], PASSAGE_CHARS), block_start=bs, block_end=be,
+                kind=h["kind"], text=_with_size(sizes.get((h["version_id"], h.get("table_index"))),
+                                                _clip(h["text"], PASSAGE_CHARS)), block_start=bs, block_end=be,
                 table_index=h.get("table_index"), chunk_id=h["chunk_id"], page_list=h["page_list"] or None,
-                partial_document=h["version_id"] in partial))
+                partial_document=h["version_id"] in partial), ("chunk", h["chunk_id"])))
+            ws.touch(h["document_id"], h["title"], "searched", h["version_id"] in partial)
     if not out:
         return f'לא נמצאו קטעים עבור "{query}". אפשר לנסות ניסוח אחר, מונחים נרדפים או חיפוש בתוך מסמך מסוים.'
     return "\n\n".join(_render_source(s) for s in out)
@@ -286,9 +357,10 @@ def tool_open_source(ws: Workspace, source_id: str, scope: str = "neighbors") ->
         if head is None:
             raise ToolError("המקור אינו זמין עוד (נמחק או שאין הרשאה)")
         partial = bool(_partial_versions(conn, [vid]))
+        ws.touch(head.document_id, head.title, "opened", partial)
         start, end = ref.get("block_start"), ref.get("block_end")
         table_index = ref.get("table_index")
-        if start is None and ref.get("chunk_id"):
+        if start is None and ref.get("chunk_id") and not (scope == "table" and table_index is not None):
             row = conn.execute(text("SELECT text, section, page_list, kind FROM chunks WHERE id = :c"),
                                {"c": ref["chunk_id"]}).first()
             if row is None:
@@ -297,9 +369,9 @@ def tool_open_source(ws: Workspace, source_id: str, scope: str = "neighbors") ->
                               location=_location(row.section, row.kind, row.page_list, None, None, (None, None), None),
                               kind=row.kind, text=_clip(row.text, CONTEXT_CHARS[scope]), page_list=row.page_list,
                               partial_document=partial)
-            return _render_source(s)
+            return _render_source(ws.once(s, ("chunk", ref["chunk_id"], scope)))
         if scope == "table":
-            if table_index is None:
+            if table_index is None and start is not None:
                 hit = conn.execute(text(
                     "SELECT table_index FROM document_blocks WHERE version_id = :v AND block_index BETWEEN :a AND :b"
                     " AND table_index IS NOT NULL ORDER BY block_index LIMIT 1"),
@@ -312,7 +384,7 @@ def tool_open_source(ws: Workspace, source_id: str, scope: str = "neighbors") ->
             if t is None:
                 raise ToolError("הטבלה לא נמצאה")
             st = t.structure or {}
-            lines = [x for x in [st.get("caption"), *(st.get("title") or [])] if x]
+            lines = [x for x in [st.get("caption"), *(st.get("title") or []), table_size_line(st)] if x]
             if any(st.get("headers") or []):
                 lines.append(" | ".join(st["headers"]))
             lines += [" | ".join(r.get("cells") or []) for r in st.get("rows") or []]
@@ -325,7 +397,7 @@ def tool_open_source(ws: Workspace, source_id: str, scope: str = "neighbors") ->
                               location=_location(st.get("section"), "table", None, None, None, (None, None), media),
                               kind="table", text=_clip(body, CONTEXT_CHARS["table"]), block_start=st.get("block_index"),
                               block_end=st.get("block_index"), table_index=table_index, partial_document=partial)
-            return _render_source(s)
+            return _render_source(ws.once(s, ("table", vid, table_index)))
         if start is None:
             raise ToolError("למקור הזה אין מיקום במסמך להרחבה")
         if scope == "section":
@@ -351,10 +423,36 @@ def tool_open_source(ws: Workspace, source_id: str, scope: str = "neighbors") ->
                                              (min(nums), max(nums)) if nums else (None, None), None),
                           kind="context", text=_clip(body, CONTEXT_CHARS[scope]), block_start=rows[0].block_index,
                           block_end=rows[-1].block_index, partial_document=partial)
-        return _render_source(s)
+        return _render_source(ws.once(s, ("blocks", vid, rows[0].block_index, rows[-1].block_index)))
 
 
-def tool_list_documents(ws: Workspace, query: str | None = None) -> str:
+def _paginate(page, total: int, size: int) -> tuple[int, int]:
+    """(the requested page, the number of pages) for ``total`` items, ``size`` per page; refuses a page out of
+    range."""
+    pages = math.ceil(total / size)
+    try:
+        page = int(page or 1)
+    except (TypeError, ValueError):
+        raise ToolError("מספר עמוד לא תקין") from None
+    if page < 1 or (pages and page > pages):
+        raise ToolError(f"אין עמוד {page}; יש {pages} עמודים")
+    return page, pages
+
+
+def new_scope(query: str, documents, pages: int) -> dict:
+    """The turn's scope: the set a question is about (``documents`` as (id, title) pairs), read page by page."""
+    return {"query": query, "matching": [{"document_id": str(i), "title": t} for i, t in documents],
+            "pages": pages, "pages_read": set()}
+
+
+def _page_line(page: int, pages: int, total: int, what: str) -> str:
+    more = f" — יש עוד; לקבלת הבאים: page={page + 1}" if page < pages else ""
+    return f"עמוד {page} מתוך {max(pages, 1)}; סה\"כ {total} {what}{more}"
+
+
+def tool_list_documents(ws: Workspace, query: str | None = None, page: int | None = None) -> str:
+    """Visible documents with their reading state, a page at a time. Without a title query the listing is the
+    whole repository the user sees, and it becomes the turn's scope (all of it), read page by page."""
     words = [w for w in re.findall(r"[\w\"״׳'-]+", query or "") if len(w) >= 2][:6]
     with tenant_tx(ws.ctx) as conn:
         params: dict = {"e": EXTRACTION_VERSION}
@@ -362,14 +460,27 @@ def tool_list_documents(ws: Workspace, query: str | None = None) -> str:
         if words:
             params["p"] = [f"%{w.lower()}%" for w in words]
             cond = " AND lower(d.title) LIKE ANY(:p)"
+        total = conn.execute(text("SELECT count(*) FROM documents d JOIN document_versions v ON v.document_id = d.id"
+                                  f" AND v.is_current WHERE d.deleted_at IS NULL{cond}"), params).scalar_one()
+        page, pages = _paginate(page, total, LIST_MAX)
         rows = conn.execute(text(
             "SELECT d.id, d.title, v.id AS vid, v.status, v.page_count, v.pages_incomplete, v.ingestion,"
             " v.created_at, r.state AS mstate FROM documents d JOIN document_versions v ON v.document_id = d.id"
             " AND v.is_current LEFT JOIN measurement_runs r ON r.version_id = v.id AND r.extraction_version = :e"
-            f" WHERE d.deleted_at IS NULL{cond} ORDER BY d.title LIMIT {LIST_MAX}"), params).all()
+            f" WHERE d.deleted_at IS NULL{cond} ORDER BY d.title, d.id LIMIT {LIST_MAX} OFFSET :o"),
+            params | {"o": (page - 1) * LIST_MAX}).all()
+        if not words:
+            # the whole repository is the scope only when no set was looked up (find_documents keeps precedence)
+            if ws.scope is None:
+                everything = conn.execute(text(
+                    "SELECT d.id, d.title FROM documents d JOIN document_versions v ON v.document_id = d.id"
+                    " AND v.is_current WHERE d.deleted_at IS NULL ORDER BY d.title, d.id")).all()
+                ws.scope = new_scope("", [(r.id, r.title) for r in everything], pages)
+            if ws.scope["query"] == "":
+                ws.scope["pages_read"].add(page)
     if not rows:
         return "לא נמצאו מסמכים" + (f' שכותרתם כוללת "{query}"' if query else "") + "."
-    lines = []
+    lines = [_page_line(page, pages, total, "מסמכים")]
     for r in rows:
         ing = r.ingestion or {}
         images = ing.get("images") or {}
@@ -387,6 +498,35 @@ def tool_list_documents(ws: Workspace, query: str | None = None) -> str:
             r.mstate or "", "טרם חולצו")
         lines.append(f'- document_id={r.id} | "{_txt(r.title)}" | עיבוד: {r.status} | קריאה: {status}'
                      + (f" ({'; '.join(details)})" if details else "") + f" | נתונים כמותיים: {mstate}")
+    return "\n".join(lines)
+
+
+def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> str:
+    """The set a question is about: every visible document containing all the terms that define it (in its title
+    or text). The server keeps the whole set as the turn's scope; the model reads it a page at a time."""
+    from app.platform.search import documents_matching
+
+    query = (query or "").strip()
+    if len(query) < 2:
+        raise ToolError("שאילתת תחום ריקה")
+    with tenant_tx(ws.ctx) as conn:
+        found = documents_matching(conn, query)
+    total = len(found)
+    page, pages = _paginate(page, total, SCOPE_PAGE)
+    if ws.scope is None or ws.scope.get("query") != query:
+        ws.scope = new_scope(query, [(d["document_id"], d["title"]) for d in found], pages)
+    ws.scope["pages_read"].add(page)
+    if not found:
+        return f'לא נמצאו מסמכים שמכילים את כל המונחים של "{query}". אפשר לנסות מונחים אחרים או פחות מונחים.'
+    lines = [_page_line(page, pages, total, "מסמכים מתאימים"),
+             "אלה כל המסמכים בתחום; תשובה על התחום צריכה לבדוק את כולם או לומר אילו לא נבדקו."]
+    for d in found[(page - 1) * SCOPE_PAGE:page * SCOPE_PAGE]:
+        why = []
+        if d["in_title"]:
+            why.append("בכותרת: " + ", ".join(d["in_title"]))
+        if d["in_text"]:
+            why.append(f"בתוכן: {d['hits']} קטעים")
+        lines.append(f'- document_id={d["document_id"]} | "{_txt(d["title"])}" | ' + "; ".join(why))
     return "\n".join(lines)
 
 
@@ -420,7 +560,8 @@ def _describe_key(key: tuple) -> str:
 
 
 def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | None = None,
-                           document_ids: list[str] | None = None, value_roles: list[str] | None = None) -> str:
+                           document_ids: list[str] | None = None, value_roles: list[str] | None = None,
+                           page: int | None = None) -> str:
     words = [w for w in re.findall(r"[֐-׿\w\"״׳']+", query or "") if len(w) >= 2]
     with tenant_tx(ws.ctx) as conn:
         docs = _visible_documents(conn, document_ids or [])
@@ -438,17 +579,24 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
         if words and not metric_kinds:
             params["w"] = [f"%{w}%" for w in words]
             conds.append("(m.metric ILIKE ANY(:w) OR m.quote ILIKE ANY(:w) OR m.subject ILIKE ANY(:w))")
+        where = (" FROM measurements m JOIN document_versions v ON v.id = m.version_id"
+                 " JOIN documents d ON d.id = m.document_id WHERE " + " AND ".join(conds))
+        total = conn.execute(text("SELECT count(*)" + where), params).scalar_one()
+        page, pages = _paginate(page, total, MEASUREMENTS_MAX)
+        # a total order (the id breaks ties), so no row falls between two pages
         rows = conn.execute(text(
-            "SELECT m.*, d.title FROM measurements m JOIN document_versions v ON v.id = m.version_id"
-            " JOIN documents d ON d.id = m.document_id WHERE " + " AND ".join(conds)
-            + f" ORDER BY d.title, m.block_index, m.row_index LIMIT {MEASUREMENTS_MAX + 1}"), params).all()
+            "SELECT m.*, d.title" + where + " ORDER BY d.title, d.id, m.block_index NULLS FIRST,"
+            f" m.row_index NULLS FIRST, m.id LIMIT {MEASUREMENTS_MAX} OFFSET :o"),
+            params | {"o": (page - 1) * MEASUREMENTS_MAX}).all()
         scope_rows = conn.execute(text(
             "SELECT d.id, d.title, v.id AS vid, r.state, COALESCE((v.ingestion->>'partial')::boolean, false) AS partial"
             " FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
             " LEFT JOIN measurement_runs r ON r.version_id = v.id AND r.extraction_version = :e"
             " WHERE d.deleted_at IS NULL" + (" AND d.id = ANY(:d)" if docs else "")), params).all()
-    truncated = len(rows) > MEASUREMENTS_MAX
-    rows = rows[:MEASUREMENTS_MAX]
+    key = (" ".join(words) if not metric_kinds else "", tuple(sorted(metric_kinds or [])),
+           tuple(sorted(str(d) for d in docs)), tuple(sorted(value_roles or [])))
+    listing = ws.listings.setdefault(key, {"pages": pages, "pages_read": set(), "total": total})
+    listing["pages_read"].add(page)
     groups: dict[tuple, list] = {}
     known = {m.id: m for m in ws.measurements.values()}
     for r in rows:
@@ -457,13 +605,17 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
             m = Measurement(f"M{len(ws.measurements) + 1}", r.id, r.document_id, r.version_id, r.title, r)
             ws.measurements[m.mid] = m
             known[r.id] = m
+        m.listings.add(key)
+        ws.touch(r.document_id, r.title, "measurements")
         groups.setdefault(_compat_key(r), []).append(m)
     cov = {"documents": len(scope_rows), "extracted": sum(1 for s in scope_rows if s.state == "done"),
+           "total": total, "page": page, "pages": pages,
            "partial_extraction": [s.title for s in scope_rows if s.state == "partial"],
            "not_extracted": [s.title for s in scope_rows if s.state not in ("done", "partial")],
            "partially_read": [s.title for s in scope_rows if s.partial]}
     ws.coverage.append(cov)
-    out = [f"כיסוי: {cov['extracted']} מתוך {cov['documents']} מסמכים בתחום חולצו לנתונים כמותיים."]
+    out = [f"כיסוי: {cov['extracted']} מתוך {cov['documents']} מסמכים בתחום חולצו לנתונים כמותיים.",
+           _page_line(page, pages, total, "נתונים מתאימים")]
     if cov["not_extracted"]:
         out.append("טרם חולצו (נתוניהם לא נכללים כאן; אפשר לחפש בהם בטקסט): "
                    + "; ".join(_txt(t) for t in cov["not_extracted"]))
@@ -474,8 +626,8 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
     if not rows:
         out.append("לא נמצאו נתונים כמותיים מתאימים.")
         return "\n".join(out)
-    if truncated:
-        out.append(f"(מוצגים {MEASUREMENTS_MAX} הראשונים; צמצם את החיפוש לסוג מדד או למסמכים)")
+    if pages > 1:
+        out.append("חישוב על כל הנתונים המתאימים דורש לקרוא את כל העמודים; חישוב על חלקם יסומן כחלקי.")
     for key, ms in groups.items():
         out.append(f"\nקבוצה [{_describe_key(key)}] — {len(ms)} ערכים:")
         for m in ms:
@@ -551,6 +703,12 @@ def tool_compute(ws: Workspace, operation: str, measurement_ids: list[str]) -> s
     approx = [m.mid for m in ms if m.row.value_form != "exact"]
     if approx:
         note = "חלק מהערכים מקורבים או גבולות (" + ", ".join(approx) + "); התוצאה מקורבת בהתאם."
+    # the values were chosen from a listing whose later pages were not read: more matching values may exist
+    unread = [ws.listings[k] for k in {k for m in ms for k in m.listings}
+              if len(ws.listings[k]["pages_read"]) < ws.listings[k]["pages"]]
+    if unread:
+        note += (" " if note else "") + ("חישוב חלקי: לא נקראו כל העמודים של הנתונים המתאימים (נקראו "
+                                          f"{len(unread[0]['pages_read'])} מתוך {unread[0]['pages']}).")
     pending = [m.mid for m in ms if m.row.status in ("auto_validated", "needs_review")]
     if pending:
         note += (" " if note else "") + f"{len(pending)} מהערכים טרם אומתו על ידי אדם (נתון ראשוני)."
@@ -582,8 +740,15 @@ TOOLS = [
         {"source_id": {"type": "string", "description": "S# מהתור הזה או P# מתור קודם"},
          "scope": {"type": "string", "enum": ["neighbors", "section", "table"]}},
         ["source_id", "scope"]),
-    _fn("list_documents", "רשימת המסמכים הזמינים למשתמש, עם מצב הקריאה שלהם. אפשר לסנן לפי מילים בכותרת.",
-        {"query": {"type": ["string", "null"], "description": "מילים בכותרת, או null לכל המסמכים"}}, ["query"]),
+    _fn("find_documents",
+        "התחום של שאלה על קבוצת מסמכים (סקירה, השוואה, רשימה או חישוב על כמה מסמכים; שאלה \"בעיר/באזור X\"): כל "
+        "המסמכים שמכילים את כל המונחים שמגדירים את הקבוצה, בכותרת או בתוכן. מחזיר את כולם בעמודים, עם הסך הכול.",
+        {"query": {"type": "string", "description": "רק המונחים שמגדירים את הקבוצה (מקום, סוג מסמך) — לא המדד"},
+         "page": {"type": ["integer", "null"], "description": "מספר עמוד, null לראשון"}},
+        ["query", "page"]),
+    _fn("list_documents", "רשימת המסמכים הזמינים למשתמש, עם מצב הקריאה שלהם, בעמודים. אפשר לסנן לפי מילים בכותרת.",
+        {"query": {"type": ["string", "null"], "description": "מילים בכותרת, או null לכל המסמכים"},
+         "page": {"type": ["integer", "null"], "description": "מספר עמוד, null לראשון"}}, ["query", "page"]),
     _fn("outline", "כותרות הסעיפים של מסמך.", {"document_id": {"type": "string"}}, ["document_id"]),
     _fn("find_measurements",
         "נתונים כמותיים שחולצו מהמסמכים עם משמעותם (סוג מדד, יחידה, תקופה, בסיס שטח, מע\"מ, תפקיד, נושא), מקובצים "
@@ -591,8 +756,9 @@ TOOLS = [
         {"query": {"type": "string", "description": "תיאור הנתון המבוקש"},
          "metric_kinds": {**_NULLABLE_IDS, "description": "סוגי מדד מתוך: " + ", ".join(KIND_LABELS)},
          "document_ids": _NULLABLE_IDS,
-         "value_roles": {**_NULLABLE_IDS, "description": "תפקידים מתוך: " + ", ".join(ROLE_LABELS)}},
-        ["query", "metric_kinds", "document_ids", "value_roles"]),
+         "value_roles": {**_NULLABLE_IDS, "description": "תפקידים מתוך: " + ", ".join(ROLE_LABELS)},
+         "page": {"type": ["integer", "null"], "description": "מספר עמוד, null לראשון"}},
+        ["query", "metric_kinds", "document_ids", "value_roles", "page"]),
     _fn("compute", "חישוב מדויק בקוד על נתונים M# מאותה קבוצה בלבד. מסרב לערבב סוגי מדד, יחידות, תקופות, מע\"מ, "
                    "בסיסי שטח או תפקידים.",
         {"operation": {"type": "string", "enum": list(OPERATIONS)}, "measurement_ids": _IDS},
@@ -602,10 +768,12 @@ TOOLS = [
 HANDLERS = {
     "search": lambda ws, a: tool_search(ws, a["query"], a.get("document_ids"), a.get("limit")),
     "open_source": lambda ws, a: tool_open_source(ws, a["source_id"], a["scope"]),
-    "list_documents": lambda ws, a: tool_list_documents(ws, a.get("query")),
+    "find_documents": lambda ws, a: tool_find_documents(ws, a["query"], a.get("page")),
+    "list_documents": lambda ws, a: tool_list_documents(ws, a.get("query"), a.get("page")),
     "outline": lambda ws, a: tool_outline(ws, a["document_id"]),
     "find_measurements": lambda ws, a: tool_find_measurements(ws, a["query"], a.get("metric_kinds"),
-                                                              a.get("document_ids"), a.get("value_roles")),
+                                                              a.get("document_ids"), a.get("value_roles"),
+                                                              a.get("page")),
     "compute": lambda ws, a: tool_compute(ws, a["operation"], a["measurement_ids"]),
 }
 

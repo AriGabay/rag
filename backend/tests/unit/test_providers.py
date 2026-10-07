@@ -102,6 +102,24 @@ def test_openai_parsed_response_is_ok_with_usage():
     assert transport.requests[0].headers["authorization"] == f"Bearer {FAKE_KEY}"
 
 
+def test_openai_cached_input_tokens_are_recorded():
+    body = _response(_text('{"text": "שלום"}'))
+    body["usage"]["input_tokens_details"]["cached_tokens"] = 512
+    provider, _ = openai_provider(httpx2.Response(200, json=body))
+    assert call(provider).cached_input_tokens == 512
+    body["usage"].pop("input_tokens_details")
+    provider, _ = openai_provider(httpx2.Response(200, json=body))
+    assert call(provider).cached_input_tokens is None  # not reported: unknown, never zero
+
+
+def test_openai_agent_step_records_cached_input_tokens():
+    body = _response(_text('{"text": "שלום"}'))
+    body["usage"]["input_tokens_details"]["cached_tokens"] = 2048
+    provider, _ = openai_provider(httpx2.Response(200, json=body))
+    step = provider.agent_step("הוראות", [{"role": "user", "content": "שלום"}], [], Echo.model_json_schema())
+    assert step.ok and step.cached_input_tokens == 2048 and step.input_tokens == 11
+
+
 def test_openai_refusal_item_maps_to_refusal():
     provider, _ = openai_provider(httpx2.Response(200, json=_response([{"type": "refusal", "refusal": "לא"}])))
     r = call(provider)
