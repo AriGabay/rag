@@ -66,6 +66,11 @@ def check(answer: dict | None, expect: dict) -> list[str]:
     md = norm(answer.get("markdown") or "")
     sents = sentences(answer)
     cited = {t for _, ds in sents for t in ds} | {s.get("title") or "" for s in answer.get("sources") or []}
+    # a cited listing (a count or a list over a set) names its documents: they are what the answer is about
+    listed = {d for s in answer.get("sources") or [] if s.get("kind") == "listing"
+              for d in s.get("listed_document_ids") or []}
+    cited |= {m.get("title") or "" for m in (answer.get("ledger") or {}).get("matching") or []
+              if m.get("document_id") in listed}
     problems: list[str] = []
 
     for needle in expect.get("required_documents", []):
@@ -138,8 +143,10 @@ def check(answer: dict | None, expect: dict) -> list[str]:
         noted = bool(re.search(NOTE_PATTERN, md))
         # a note is due when documents were not covered, or were covered from retrieved passages only, or a set
         # answer presented part of a table
-        partial_data = bool(ledger.get("retrieved_only")) or (ledger.get("scope_kind") == "set" and any(
-            t.get("presented", 0) < (t.get("rows") or 0) for t in ledger.get("tables") or []))
+        # a membership answer (a count from a listing) says that the documents' content was not read
+        partial_data = bool(ledger.get("retrieved_only")) or bool(ledger.get("membership")) or (
+            ledger.get("scope_kind") == "set" and any(t.get("presented", 0) < (t.get("rows") or 0)
+                                                    for t in ledger.get("tables") or []))
         if ledger.get("complete") is False and not noted:
             problems.append("הכיסוי חלקי אבל התשובה אינה אומרת זאת")
         if ledger.get("complete") is True and noted and not partial_data:

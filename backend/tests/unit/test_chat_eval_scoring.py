@@ -166,3 +166,16 @@ def test_a_failed_turn_shows_how_its_follow_up_was_resolved():
     assert "scale_change" in text and "«לכל השארית»" in text and "scale: rejected: not_in_message" in text
     assert "ambiguous" in text and "שומה א" in text and "מוחזק ל-metric" in text
     assert resolution_lines({"answer": {}}) == []
+
+
+def test_a_count_from_a_cited_listing_covers_the_documents_it_lists():
+    from eval.scoring import check
+
+    docs = [{"document_id": "d1", "title": "שומה - הדקל 14"}, {"document_id": "d2", "title": "שומה - התמר 3"}]
+    answer = {"status": "answered", "markdown": "יש לנו 2 שומות [S1].\n\n> **כיסוי:** רשימת 2 המסמכים נבדקה; תוכן "
+              "המסמכים לא נקרא.", "sources": [{"id": "S1", "kind": "listing", "title": "מסמכים בתחום",
+                                               "listed_document_ids": ["d1", "d2"]}],
+              "ledger": {"scope_kind": "set", "membership": True, "matching": docs, "complete": True,
+                         "note": "x", "tables": []}}
+    assert check(answer, {"required_documents": ["הדקל 14", "התמר 3"]}) == []
+    assert check(answer, {"required_documents": ["הנחל 8"]}) == ["אין ציטוט מהמסמך 'הנחל 8'"]
