@@ -68,6 +68,15 @@ _PREFIX = "[והבלמשכ]{0,3}"
 _CURRENCY = re.compile(_PREFIX + r"(?:ש\"ח|שח|₪|שקל(?:ים)?|ש'ח)")
 # an area unit the user wrote as the unit of the datum: למ"ר, למטר, לדונם, ליחידה (with ו/ה/ב before it)
 _AREA_MARKER = re.compile(r"(?<![א-ת\w])[וה]?ל(?:מ\"ר|מטר|דונם|יחידה|יח')(?![א-ת])")
+# an area unit the user negates ("לא במטר", "ולא למ״ר"): it asks for the other scale, not for this one
+_NEGATED_AREA = re.compile(r"(?<![א-ת])(?:ו?לא|במקום|בלי)\s+(?:[^\s]+\s+){0,2}?[והלבכ]{0,3}(?:מ\"ר|מטר|דונם|יחידה)(?![א-ת])")
+
+
+def _affirmed_area(text: str) -> str:
+    """The text without the area units it negates."""
+    return _NEGATED_AREA.sub(" ", _norm(text))
+
+
 # an area unit anywhere in words (לכל המ"ר, במטר)
 _AREA_UNIT = re.compile(r"(?<![א-ת\w])[והלבכ]{0,3}(?:מ\"ר|מטר|דונם|יחידה)(?![א-ת])")
 _MONEY_UNITS = {"ILS", "ILS_per_sqm", "unknown"}
@@ -314,12 +323,12 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
         if "area_basis" in ok:
             out.area_basis = resolved.area_basis.strip()
     # an area unit the user wrote sets a per-area scale the parse left open
-    if _AREA_MARKER.search(_norm(message)) and not (SCALE_FIELDS & ok) and resolved.scale == "unknown" \
+    if _AREA_MARKER.search(_affirmed_area(message)) and not (SCALE_FIELDS & ok) and resolved.scale == "unknown" \
             and out.metric_kind != "unknown" and relation != "same_datum":
         _apply_scale(out, True)
         decisions["scale"] = "set per_area from the user's area unit"
     if "scale" in ok and resolved.scale == "total":
-        quoted = _norm(" ".join(quotes.get(n, "") for n in ("scale", "unit", "metric_kind")))
+        quoted = _affirmed_area(" ".join(quotes.get(n, "") for n in ("scale", "unit", "metric_kind")))
         if _AREA_UNIT.search(quoted):
             out.clarify = "התכוונת לנתון ליחידת שטח (למ״ר) או לסכום הכולל?"
             out.server_clarify = True
@@ -343,17 +352,29 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
     elif candidates and relation == "clarification_answer":
         outcome = entities.among(candidates, message, authorized([c["document_id"] for c in candidates]))
         _take(out, outcome, message, decisions)
+        if outcome.kind == "resolved":
+            # the chosen document is the subject now: nothing of the previous property's (a unit, an address) stays
+            out.subject = outcome.documents[0].title
     elif lookup is not None:
         # the user's words for the new entity, or — when the parse claimed none — the identifying words of the
         # message that the focus does not hold ("ובהנרקיס 4?" parsed as the same datum)
         words = " ".join(quotes[n] for n in ("subject", "documents") if n in quotes)
+        vocabulary = titles() if callable(titles) else titles
+        # the model's words for a new subject name one only when they hold a word that can name a document (a
+        # title word, a house number beside it, a unit label), when the user corrects the property, or when a new
+        # question names an address ("ובהיסמין 3?"); a pronoun or a generic word on a follow-up ("בזה", "שלה",
+        # "מאיזה מסמך") leaves the focus where it is
+        switching = relation == "correction" or (relation == "new_question" and re.search(r"\d", words))
+        if words and not switching and not entities.identifying(words, vocabulary, bare_numbers=False):
+            decisions["subject"] = "kept the focus: the quoted words name no document"
+            words = ""
         focus_text = " ".join([f.get("subject") or "", *(focus_titles or [])])
         focus_tokens, focus_norm = entities.title_tokens(focus_text), _norm(focus_text)
         # a word of the focus in any form ("בשומה") names the focus; a bare floor, year or duration names nothing
-        named = entities.identifying(message, titles() if callable(titles) else titles, bare_numbers=False) \
-            if focus else []
+        named = entities.identifying(message, vocabulary, bare_numbers=False) if focus else []
         unnamed = [t for t in named if not entities.forms(t) & focus_tokens and _norm(t) not in focus_norm]
-        query = words or " ".join(unnamed)
+        # the user's words for the entity, with any word of theirs that names a title the focus does not hold
+        query = " ".join(dict.fromkeys([*words.split(), *unnamed])) if words else " ".join(unnamed)
         if query:
             _take(out, lookup(query), query, decisions, set(focus_ids))
             if out.entity_changed and out.document_ids:  # the new entity was found: the request is about it

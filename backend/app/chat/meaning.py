@@ -284,7 +284,7 @@ class MeaningProblem:
 
 
 SUBJECT_ROLES = ("appraiser_determination", "actual_contract", "calculation")
-READS = 4  # database reads per verification for evidence beyond the cited passages
+READS = 6  # database reads per verification for evidence beyond the cited passages
 
 
 @dataclass
@@ -313,20 +313,30 @@ class Fetcher:
                 self.cache[key] = None
         return self.cache[key]
 
-    def expansion(self, sid: str):
-        """The whole table of a passage from a table, or the whole section around a passage or table."""
+    def expansions(self, sid: str) -> list:
+        """What is around a cited passage, nearest first: the whole table of a passage from a table, then the whole
+        section around the passage or its table (a table's notes are often a paragraph after it)."""
         from app.chat.tools import read_scope
 
         src = self.ws.sources.get(sid)
         if src is None:
-            return None
+            return []
+        out = []
         whole_table = src.kind == "table" and src.chunk_id is None and src.table_index is not None
-        scope = "table" if src.table_index is not None and not whole_table else "section"
-        if scope == "section" and src.block_start is None:
-            return None
-        got = self._read(("x", str(src.version_id), src.table_index, src.block_start, src.block_end, scope),
-                         lambda: read_scope(self.ws, sid, scope, quiet=True))
-        return got if got is not None and len(got.text) > len(src.text) else None
+        if src.table_index is not None and not whole_table:
+            table = self._read(("x", str(src.version_id), src.table_index, src.block_start, src.block_end, "table"),
+                               lambda: read_scope(self.ws, sid, "table", quiet=True))
+            if table is not None:
+                out.append(table)
+        anchor = src if src.block_start is not None else next((x for x in out if x.block_start is not None), None)
+        if anchor is not None:
+            ref = {"version_id": anchor.version_id, "block_start": anchor.block_start, "block_end": anchor.block_end,
+                   "table_index": anchor.table_index, "chunk_id": None}
+            section = self._read(("x", str(src.version_id), None, anchor.block_start, anchor.block_end, "section"),
+                                 lambda: read_scope(self.ws, sid, "section", quiet=True, ref=ref))
+            if section is not None:
+                out.append(section)
+        return [x for x in out if len(x.text) > len(src.text)]
 
     def same_calculation(self, sid: str) -> list:
         """The turn's other passages of the same table or section of the same document version."""
@@ -376,9 +386,9 @@ class Fetcher:
             for cand in self.same_calculation(sid):
                 if states(cand):
                     return self.adopt(cand)
-            expansion = self.expansion(sid)
-            if states(expansion):
-                return self.adopt(expansion)
+            for expansion in self.expansions(sid):
+                if states(expansion):
+                    return self.adopt(expansion)
         docs = {self.ws.sources[i].document_id for i in cited if self.ws.sources[i].document_id}
         docs |= {self.ws.measurements[i].document_id for i in unit.ids if i in self.ws.measurements}
         for row in self.subject_measurements(docs) if docs else []:
@@ -388,13 +398,28 @@ class Fetcher:
                 return self.adopt(row)
         return None
 
-    def expanded_occurrences(self, unit: Unit, forms: frozenset[str]) -> list[tuple[Occurrence, object]]:
-        out = []
+    def subject_statement(self, unit: Unit, forms: frozenset[str], kind: str, words: set[str]):
+        """The subject property's stored measurement of the number with the same metric (its words in the unit),
+        when every such measurement gives ``kind`` one value; else None."""
+        docs = {self.ws.sources[i].document_id for i in unit.ids
+                if i in self.ws.sources and self.ws.sources[i].document_id}
+        rows = [r for r in self.subject_measurements(docs) if forms & numbers_in(r.value_text or "")
+                and words & _content_words(r.metric or "")] if docs else []
+        values = {tuple(sorted(measurement_qualifiers(r).keys(kind))) for r in rows}
+        if len(values) != 1 or not next(iter(values)):
+            return None
+        return rows[0]
+
+    def expanded_occurrences(self, unit: Unit, forms: frozenset[str]) -> list[list[tuple[Occurrence, object]]]:
+        """The number's occurrences around the unit's cited passages, by ring: the nearest expansion of each cited
+        passage first (its table), then the next (its section)."""
+        rings: list[list[tuple[Occurrence, object]]] = []
         for sid in [i for i in unit.ids if i in self.ws.sources]:
-            exp = self.expansion(sid)
-            if exp is not None:
-                out += [(o, exp) for o in source_occurrences(exp.text, set(forms))[0]]
-        return out
+            for depth, exp in enumerate(self.expansions(sid)):
+                while len(rings) <= depth:
+                    rings.append([])
+                rings[depth] += [(o, exp) for o in source_occurrences(exp.text, set(forms))[0]]
+        return rings
 
 
 def _evidence(unit: Unit, ws: Workspace, forms: frozenset[str]) -> tuple[list[Occurrence], Qualifiers]:
@@ -483,13 +508,26 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
                     continue
                 if expanded is None:
                     expanded = fetcher.expanded_occurrences(unit, forms)
-                near = _closest([o for o, _ in expanded], words)
-                if not near or not all(o.qualifiers.keys(kind) for o in near):
+                # the nearest ring that states it for every closest occurrence, with one value
+                ring = next((r for r in expanded if (near := _closest([o for o, _ in r], words))
+                             and all(o.qualifiers.keys(kind) for o in near)
+                             and len({tuple(sorted(o.qualifiers.found[kind])) for o in near}) == 1), None)
+                if ring is None:
+                    # the subject property's stored measurement of the same metric states it once
+                    row = fetcher.subject_statement(unit, forms, kind, words)
+                    if row is None:
+                        continue
+                    cite = fetcher.adopt(row)
+                    as_written = _as_written(kind, measurement_qualifiers(row).found[kind])
+                    if cite not in unit.ids:
+                        unit.ids.append(cite)
+                    problems.append(MeaningProblem(
+                        written, kind, f"למספר {written} חסר {KIND_LABELS[kind]} כפי שנכתב ב-{cite} (\"{as_written}\"); "
+                        f"כתוב אותו ליד המספר וצטט את {cite}", blocking=False, annotation=as_written, cite=cite))
                     continue
-                if len({tuple(sorted(o.qualifiers.found[kind])) for o in near}) != 1:
-                    continue
+                near = _closest([o for o, _ in ring], words)
                 o = near[0]
-                cite = fetcher.adopt(next(src for x, src in expanded if x is o))
+                cite = fetcher.adopt(next(src for x, src in ring if x is o))
                 as_written = _as_written(kind, o.qualifiers.found[kind])
                 if cite not in unit.ids:
                     unit.ids.append(cite)

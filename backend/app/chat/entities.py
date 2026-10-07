@@ -84,10 +84,12 @@ def forms(token: str) -> set[str]:
     return set(found[0]) | {token} if found else {token}
 
 
-def identifying(words: str, titles: list[str], bare_numbers: bool = True) -> list[str]:
+def identifying(words: str, titles: list[str], bare_numbers: bool = True, pairs_only: bool = False) -> list[str]:
     """The words that can name a document: a number (a house or unit number, not an amount), Latin letters, or a
     word of some title the user may see. With ``bare_numbers`` off, a number counts only beside such a word
-    ("הנרקיס 4", "דירה B7"): a floor, a year or a duration ("בקומה 21", "ב-2024") names no property."""
+    ("הנרקיס 4", "דירה B7"): a floor, a year or a duration ("בקומה 21", "ב-2024") names no property. With
+    ``pairs_only``, only an address — a title word with the number beside it — and Latin labels count: a common
+    word that happens to share a title word's form ("שאלה" and "האלה") is dropped."""
     vocabulary = set().union(*(title_tokens(t) for t in titles)) if titles else set()
     tokens: list[tuple[str, str | None]] = []
     for raw in _TOKEN.findall(base_normalize(_AMOUNT.sub(" ", words))):
@@ -95,21 +97,25 @@ def identifying(words: str, titles: list[str], bare_numbers: bool = True) -> lis
         if not tok:
             continue
         if re.search(r"[A-Za-z]", tok):
-            tokens.append((tok, "name"))
+            tokens.append((tok, "label"))
         elif any(c.isdigit() for c in tok):
             tokens.append((tok, "number"))
         else:
             found = _scope_terms(tok)
             named = bool(found) and bool(vocabulary & set(found[0]))
             tokens.append((found[0][0] if found else tok, "name" if named else None))
+
+    def beside(i: int, kinds: tuple[str, ...]) -> bool:
+        return any(0 <= j < len(tokens) and tokens[j][1] in kinds for j in (i - 1, i + 1))
+
     out = []
     for i, (tok, kind) in enumerate(tokens):
-        if kind == "name":
+        if kind == "label":
             out.append(tok)
-        elif kind == "number":
-            beside = any(0 <= j < len(tokens) and tokens[j][1] == "name" for j in (i - 1, i + 1))
-            if bare_numbers or beside:
-                out.append(tok)
+        elif kind == "name" and (not pairs_only or beside(i, ("number",))):
+            out.append(tok)
+        elif kind == "number" and (bare_numbers and not pairs_only or beside(i, ("name", "label"))):
+            out.append(tok)
     return list(dict.fromkeys(out))
 
 
@@ -123,8 +129,10 @@ def choose(found: list[dict], query: str, focus_ids: set[str]) -> Outcome:
     for d in found:
         title = title_tokens(d["title"])
         named = {t for t in title if any(c.isdigit() for c in t)}
-        # a house number the title does not hold: another property; a unit label ("A2") is no house number
-        house, held = {t for t in asked if t.isdigit()}, {t for t in named if t.isdigit()}
+        # a one-digit house number the title does not hold: another property ("הנרקיס 4" is not "הנרקיס 14").
+        # A longer number was a search term, so the document already holds it (a comparable it names: "האורן 30" in
+        # the report on "האורן 26"); a unit label ("A2") is no house number
+        house, held = {t for t in asked if t.isdigit() and len(t) == 1}, {t for t in named if t.isdigit()}
         if house and held and not house & held:
             continue
         cands.append(Candidate(str(d["document_id"]), d["title"],
@@ -176,10 +184,15 @@ def lookup(ctx: TenantContext, words: str, focus_ids: set[str],
         found = documents_matching(conn, words) if _scope_terms(words) else []
         query = words
         if not found:
-            relaxed = " ".join(identifying(words, titles() if titles else _visible_titles(conn)))
-            if relaxed and relaxed != words:
-                query = relaxed
-                found = documents_matching(conn, relaxed)
+            # relaxed: the words that can name a document, then only the address or label among them
+            vocabulary = titles() if titles else _visible_titles(conn)
+            for relaxed in (" ".join(identifying(words, vocabulary)),
+                            " ".join(identifying(words, vocabulary, pairs_only=True))):
+                if relaxed and relaxed != query:
+                    query = relaxed
+                    found = documents_matching(conn, relaxed)
+                    if found:
+                        break
     return choose(found, query, focus_ids)
 
 

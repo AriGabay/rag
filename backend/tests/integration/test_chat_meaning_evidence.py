@@ -152,3 +152,49 @@ def test_a_table_with_two_periods_annotates_no_period(office):
     md = "דמי השכירות בתחשיב הם 52 ₪ למ\"ר [S1]."
     final = verify_answer(_judge(), _answer(md), ws, "?", []).apply(_answer(md)).answer_markdown
     assert "כפי שנכתב במקור" not in final
+
+
+def test_a_table_whose_notes_are_a_paragraph_after_it_gives_the_period_from_its_section(office):
+    import json
+    import uuid
+
+    doc, ver = _doc(office, [("תחשיב", "תחשיב שווי בגישת היוון ההכנסות:"),
+                             ("תחשיב", "רכיב | ערך\nסה\"כ מ\"ר אקווי' | 2,480\nדמ\"ש למ\"ר | ₪ 52"),
+                             ("תחשיב", "(*) דמי השכירות בטבלה הם לחודש.")], "7" * 64)
+    structure = {"caption": "תחשיב", "headers": ["רכיב", "ערך"], "block_index": 1,
+                 "rows": [{"cells": ["סה\"כ מ\"ר אקווי'", "2,480"]}, {"cells": ["דמ\"ש למ\"ר", "₪ 52"]}]}
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("INSERT INTO extracted_tables (office_id, document_id, version_id, table_index, structure)"
+                          " VALUES (app_office(), :d, :v, 0, CAST(:s AS jsonb))"),
+                     {"d": doc, "v": ver, "s": json.dumps(structure, ensure_ascii=False)})
+
+    def ws_with_chunk():  # a search hit on the table: a chunk, with no place in the document of its own
+        ws = T.Workspace(ctx=office.ctx())
+        ws.add_source(document_id=doc, version_id=ver, title=TITLE, section="תחשיב", location="טבלה", kind="table",
+                      text="דמ\"ש למ\"ר | ₪ 52", table_index=0, chunk_id=uuid.uuid4())
+        return ws
+
+    # the model wrote the period: it is kept and cited from the section, not removed
+    md = "דמי השכירות חושבו לפי 52 ₪ למ\"ר אקווי' לחודש [S1]."
+    report = verify_answer(_judge(), _answer(md), ws_with_chunk(), "?", [])
+    assert report.ok and "לחודש" in report.apply(_answer(md)).answer_markdown
+    # the model left it out: the server writes it from the section, cited
+    md = "דמי השכירות חושבו לפי 52 ₪ למ\"ר אקווי' [S1]."
+    final = verify_answer(_judge(), _answer(md), ws_with_chunk(), "?", []).apply(_answer(md)).answer_markdown
+    assert "לחודש, כפי שנכתב במקור [S" in final
+
+
+def test_a_period_the_subject_measurement_states_is_written_in_when_the_answer_omits_it(office):
+    doc, ver = _doc(office, [("השוואה", "דמי השכירות הראויים לנכס הם 70 ₪ למ\"ר.")], "8" * 64)
+    with tenant_tx(office.system) as conn:
+        conn.execute(text(
+            "INSERT INTO measurements (office_id, document_id, version_id, block_index, statement_key, metric,"
+            " metric_kind, value, value_form, value_text, unit, period, area_basis, vat, subject, subject_role,"
+            " value_role, quote, section, extraction_version, model, status, issues) VALUES (app_office(), :d, :v, 9,"
+            " 'k9', 'דמי שכירות ראויים למ\"ר', 'rent_per_area', 70, 'exact', '70 ₪ למ\"ר', 'ILS_per_sqm', 'month',"
+            " '', 'unknown', 'הנכס', 'appraised_property', 'appraiser_determination', 'דמי שכירות ראויים 70 ₪ למ\"ר"
+            " לחודש', 'סיכום', 'test', 'test', 'auto_validated', '[]'::jsonb)"), {"d": doc, "v": ver})
+    ws = _ws(office, doc, ver, 0, "דמי השכירות הראויים לנכס הם 70 ₪ למ\"ר.")
+    md = "דמי השכירות הראויים הם 70 ₪ למ\"ר [S1]."
+    final = verify_answer(_judge(), _answer(md), ws, "?", []).apply(_answer(md)).answer_markdown
+    assert "70 ₪ למ\"ר (לחודש, כפי שנכתב במקור [M1])" in final

@@ -402,13 +402,14 @@ def tool_open_source(ws: Workspace, source_id: str, scope: str = "neighbors") ->
     return _render_source(ws.once(s, ("text", s.version_id, s.text)))
 
 
-def read_scope(ws: Workspace, source_id: str, scope: str = "neighbors", quiet: bool = False) -> Source:
+def read_scope(ws: Workspace, source_id: str, scope: str = "neighbors", quiet: bool = False,
+               ref: dict | None = None) -> Source:
     """The context around a source (``neighbors``), its whole section, or its whole table, as a new source of the
     turn. ``quiet``: read for the server's own checks (``app.chat.meaning``): the source is not registered and the
     turn's coverage does not change — the caller registers it (``Workspace.adopt``) only if it cites it."""
     if scope not in CONTEXT_CHARS:
         raise ToolError("scope חייב להיות neighbors, section או table")
-    ref = _ref(ws, source_id)
+    ref = ref or _ref(ws, source_id)
 
     def make(**kw) -> Source:
         return Source(sid="", **kw) if quiet else ws.add_source(**kw)

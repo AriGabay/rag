@@ -43,9 +43,12 @@ def lookup_in(focus_ids: set[str]):
                 found.append({"document_id": doc_id, "title": title, "hits": sum(
                     body.count(forms[0]) for forms in terms)})
         if not found:
-            relaxed = " ".join(entities.identifying(words, TITLES))
-            if relaxed and relaxed != words:
-                return lookup(relaxed)
+            for relaxed in (" ".join(entities.identifying(words, TITLES)),
+                            " ".join(entities.identifying(words, TITLES, pairs_only=True))):
+                if relaxed and relaxed != words:
+                    out = lookup(relaxed)
+                    if out.kind != "not_found":
+                        return out
         return entities.choose(found, words, focus_ids)
     return lookup
 
@@ -126,6 +129,9 @@ def test_a_bare_reply_to_the_clarification_is_resolved_among_its_candidates():
         r = _resolved(relation="clarification_answer", changed_fields=[])
         req = _validate(r, RENT_FOCUS, reply, candidates=offered)
         assert req.document_ids == [expected], reply
+    focus = RENT_FOCUS | {"subject": "הדרור 5, דירה A3"}
+    chosen = _validate(_resolved(relation="clarification_answer"), focus, "בכפר גפן", candidates=offered)
+    assert "A3" not in chosen.subject and "כפר גפן" in chosen.subject  # nothing of the previous property stays
     again = _validate(_resolved(relation="clarification_answer"), RENT_FOCUS, "בהנרקיס", candidates=offered)
     assert again.server_clarify and again.document_ids == [] and DOC not in again.document_ids
 
@@ -324,3 +330,41 @@ def test_a_prefixed_word_of_the_focus_title_keeps_the_focus():
     req = validate(_resolved(relation="same_datum"), focus, "ומה כתוב בשומה של כפר גפן על זה?", authorized, TITLES,
                    lookup_in({NARKIS_B}), focus_titles=[CORPUS[NARKIS_B][0]])
     assert req.document_ids == [NARKIS_B] and not req.entity_changed and req.subject == "הנרקיס 4"
+
+
+def test_a_negated_area_unit_asks_for_the_total_not_for_a_clarification():
+    for words, message in (("לא במטר — כמה זה בסך הכול", "לא במטר — כמה זה בסך הכול לכל הקומה?"),
+                           ("ולא למ״ר, הכולל", "ולא למ״ר, הכולל בבקשה")):
+        r = _resolved(relation="scale_change", changed_fields=_changed(("scale", words)), scale="total",
+                      metric_kind="rent", unit="ILS")
+        req = _validate(r, RENT_FOCUS, message)
+        assert not req.clarify and req.metric_kind == "rent" and req.unit == "ILS", message
+
+
+def test_a_generic_subject_word_with_a_title_word_the_focus_lacks_looks_up_that_title():
+    # the parse quoted only "המתחם"; the user also named a title word the focus does not hold
+    r = _resolved(relation="new_question", changed_fields=_changed(("subject", "המתחם")), subject="המתחם")
+    req = _validate(r, RENT_FOCUS, "שאלה אחרת: מה שטח המתחם בהסנונית 12?")
+    assert req.document_ids == [OTHER] and req.entity_changed
+
+
+def test_a_comparable_named_inside_the_focus_report_keeps_the_report():
+    # "האורן 30" is a row of the report on "האורן 26": the report holds both words
+    found = [{"document_id": "f", "title": "שומה - האורן 26 עין ורד", "hits": 3}]
+    out = entities.choose(found, "למשרד בהאורן 30", {"f"})
+    assert out.kind == "resolved" and [d.document_id for d in out.documents] == ["f"]
+
+
+def test_a_pronoun_or_a_generic_word_quoted_as_the_subject_keeps_the_focus():
+    for relation, field, words, message in (("same_datum", "documents", "לפי איזה מסמך", "ולפי איזה מסמך זה נקבע?"),
+                                            ("metric_change", "subject", "בזה", "וכמה מחסנים יש בזה?"),
+                                            ("metric_change", "subject", "שלו", "ומה גובה הארנונה שלו?")):
+        r = _resolved(relation=relation, changed_fields=_changed((field, words)), metric_kind="count")
+        req = _validate(r, RENT_FOCUS, message)
+        assert req.document_ids == [DOC] and not req.clarify and not req.entity_changed, message
+
+
+def test_a_correction_to_a_property_without_a_title_word_still_asks():
+    r = _resolved(changed_fields=_changed(("subject", "בית האגם הצפוני")), subject="בית האגם הצפוני")
+    req = _validate(r, RENT_FOCUS, "טעיתי, התכוונתי לבית האגם הצפוני")
+    assert req.server_clarify and req.document_ids == []
