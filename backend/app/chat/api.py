@@ -302,7 +302,7 @@ def get_diagnostics(message_id: str, ctx: TenantContext = Depends(get_ctx)) -> d
             raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
         if row.user_id != ctx.user_id:
             audit(conn, "chat.diagnostics.read", ctx.user_id, "message", mid, owner=str(row.user_id))
-    return {"message_id": str(mid), "rounds": row.rounds, "removed": row.removed}
+    return {"message_id": str(mid), "rounds": row.rounds, "removed": row.removed, "resolution": row.resolution}
 
 
 @router.post("/conversations/{conversation_id}/messages")
@@ -430,13 +430,16 @@ def _finish(ctx: TenantContext, message_id: UUID, status_: str, *, content: str 
                                   " messages WHERE id = :m)"), {"m": message_id})
                 if diagnostics is not None:
                     conn.execute(text(
-                        "INSERT INTO message_diagnostics (message_id, office_id, user_id, rounds, removed, document_ids)"
-                        " VALUES (:m, app_office(), :u, CAST(:r AS jsonb), CAST(:x AS jsonb), :d)"
-                        " ON CONFLICT (message_id) DO UPDATE SET rounds = EXCLUDED.rounds, removed = EXCLUDED.removed,"
+                        "INSERT INTO message_diagnostics (message_id, office_id, user_id, rounds, removed, resolution,"
+                        " document_ids) VALUES (:m, app_office(), :u, CAST(:r AS jsonb), CAST(:x AS jsonb),"
+                        " CAST(:res AS jsonb), :d) ON CONFLICT (message_id) DO UPDATE SET rounds = EXCLUDED.rounds,"
+                        " removed = EXCLUDED.removed, resolution = EXCLUDED.resolution,"
                         " document_ids = EXCLUDED.document_ids"),
                         {"m": message_id, "u": ctx.user_id,
                          "r": json.dumps(diagnostics["rounds"], ensure_ascii=False, default=str),
                          "x": json.dumps(diagnostics["removed"], ensure_ascii=False, default=str),
+                         "res": json.dumps(diagnostics.get("resolution"), ensure_ascii=False, default=str)
+                         if diagnostics.get("resolution") else None,
                          "d": sorted(diagnostics["document_ids"])})
                 return
             status_, content, answer, error = "cancelled", "", None, "העיבוד נעצר לבקשתך."
@@ -588,8 +591,12 @@ def _answer_payload(outcome: engine.TurnOutcome) -> dict:
 def _diagnostics(outcome: engine.TurnOutcome, payload: dict) -> dict:
     """What each verification round found (first answer, repair, rewrite) and what the final answer lost, with
     every document behind the answer (the reader must see them all)."""
+    resolution = outcome.resolution or None
+    lookup = (resolution or {}).get("lookup") or {}
+    found = {d["document_id"] for d in lookup.get("documents") or []}
+    found |= set(((resolution or {}).get("parse") or {}).get("document_ids") or [])
     return {"rounds": outcome.rounds, "removed": [p.as_dict() for p in outcome.report.problems],
-            "document_ids": _answer_documents(payload)}
+            "resolution": resolution, "document_ids": _answer_documents(payload) | found}
 
 
 def _limited_answer(ctx: TenantContext, question: str, reason: str) -> dict:

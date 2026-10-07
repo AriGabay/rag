@@ -126,3 +126,19 @@ def test_the_lookup_never_sees_another_offices_documents(setup):
     assert entities.authorized(setup.ctx(), [setup.foreign, setup.snunit]) == {setup.snunit}
     outcome = entities.lookup(setup.ctx(), "הסנונית 12", {setup.dror})
     assert [d.document_id for d in outcome.documents] == [setup.snunit]
+
+
+def test_the_resolution_is_diagnostics_only_and_follows_the_documents_it_names(client, setup, monkeypatch):
+    cid = _first_turn(client, setup, monkeypatch)
+    _turn(monkeypatch, [], _resolution(relation="new_question", document_ids=[setup.foreign],
+                                       changed_fields=[{"field": "subject", "user_words": "בהנרקיס 4"},
+                                                       {"field": "scale", "user_words": "הכולל"}]))
+    m = send(client, cid, "ובהנרקיס 4?")
+    assert "parse" not in m["answer"]["request"] and "decisions" not in str(m["answer"])
+    d = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["resolution"]
+    assert d["parse"]["relation"] == "new_question" and d["parse"]["document_ids"] == []  # not another office's
+    assert d["decisions"]["subject"].startswith("accepted") and d["decisions"]["scale"] == "rejected: not_in_message"
+    assert d["lookup"]["kind"] == "ambiguous"
+    with tenant_tx(setup.system) as conn:
+        conn.execute(text("UPDATE documents SET deleted_at = now() WHERE id = :d"), {"d": setup.narkis_b})
+    assert client.get(f"/api/chat/messages/{m['id']}/diagnostics").status_code == 404

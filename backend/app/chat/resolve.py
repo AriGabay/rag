@@ -362,7 +362,11 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
         decisions.setdefault("subject", "rejected")
     if resolved.ambiguity.strip() and relation == "correction" and not out.clarify:
         out.clarify = resolved.ambiguity.strip()
-    out.resolution = {"parse": resolved.model_dump(), "decisions": decisions}
+    parse = resolved.model_dump()
+    # only documents the user may see are kept, even in diagnostics
+    parse["document_ids"] = sorted(authorized(parse["document_ids"])) if parse["document_ids"] else []
+    out.resolution = {"parse": parse, "decisions": decisions, **({"lookup": out.resolution["lookup"]}
+                                                                   if "lookup" in out.resolution else {})}
     return out
 
 

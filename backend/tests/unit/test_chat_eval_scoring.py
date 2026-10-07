@@ -150,3 +150,19 @@ def test_original_score_and_cost_per_pass():
     assert original_score([passed, failed]) == 0
     assert cost_per_pass([passed, failed], 0.5).startswith("0.5000$ (1")
     assert cost_per_pass([failed], 0.5) == "אין שיחות שעברו"
+
+
+def test_a_failed_turn_shows_how_its_follow_up_was_resolved():
+    from eval.chat_eval import resolution_lines
+
+    turn = {"diagnostics": {"resolution": {
+        "parse": {"relation": "scale_change", "scope": "entity", "metric_kind": "value", "scale": "total",
+                  "changed_fields": [{"field": "scale", "user_words": "לכל השארית"}]},
+        "decisions": {"scale": "rejected: not_in_message"},
+        "lookup": {"kind": "ambiguous", "query": "הנרקיס 4", "documents": [{"title": "שומה א"}, {"title": "שומה ב"}]}}},
+        "answer": {"request": {"metric_kind": "value_per_area", "unit": "ILS_per_sqm", "approved": ["metric"],
+                               "document_ids": ["d"]}}}
+    text = "\n".join(resolution_lines(turn))
+    assert "scale_change" in text and "«לכל השארית»" in text and "scale: rejected: not_in_message" in text
+    assert "ambiguous" in text and "שומה א" in text and "מוחזק ל-metric" in text
+    assert resolution_lines({"answer": {}}) == []

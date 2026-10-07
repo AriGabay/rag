@@ -312,6 +312,31 @@ def original_score(rs: list[Result]) -> int:
     return sum(all(turn_ok(t) for t in r.data.get("turns", [])) for r in rs)
 
 
+def resolution_lines(turn: dict) -> list[str]:
+    """How a failed turn's follow-up was resolved, to tell the stage of the failure: the resolving model's parse,
+    the server's decision on each field, the entity lookup, and the request the answer was held to."""
+    res = (turn.get("diagnostics") or {}).get("resolution")
+    req = (turn.get("answer") or {}).get("request")
+    if not res and not req:
+        return []
+    out = []
+    if res:
+        parse = res.get("parse") or {}
+        claimed = ", ".join(f"{c['field']}=«{c['user_words']}»" for c in parse.get("changed_fields") or [])
+        out.append(f"    - פענוח: {parse.get('relation')} / {parse.get('scope')}; מדד {parse.get('metric_kind')}, "
+                   f"סקאלה {parse.get('scale')}; שינויים: {claimed or 'אין'}")
+        if res.get("decisions"):
+            out.append("    - החלטות השרת: " + "; ".join(f"{k}: {v}" for k, v in res["decisions"].items()))
+        if res.get("lookup"):
+            lk = res["lookup"]
+            out.append(f"    - איתור ישות: {lk.get('kind')} («{lk.get('query')}»): "
+                       + ", ".join(d.get("title", "") for d in lk.get("documents") or []))
+    if req:
+        out.append(f"    - הבקשה שאושרה: מדד {req.get('metric_kind')}, יחידה {req.get('unit')}, מוחזק ל-"
+                   f"{','.join(req.get('approved') or []) or '—'}; מסמכים {len(req.get('document_ids') or [])}")
+    return out
+
+
 def report(results: list[Result], path: Path, title: str) -> str:
     lines = [f"# {title}", ""]
     lines += usage_summary(results)
@@ -351,6 +376,8 @@ def report(results: list[Result], path: Path, title: str) -> str:
                 for t in r.data.get("turns", []):
                     lines.append(f"  - שאלה: {t['ask']}")
                     lines.append("    - תשובה: " + (t["markdown"] or t.get("error") or "").replace("\n", " ⏎ ")[:1500])
+                    if not r.ok:
+                        lines += resolution_lines(t)
         lines.append("")
     text_ = "\n".join(lines)
     path.write_text(text_, encoding="utf-8")
