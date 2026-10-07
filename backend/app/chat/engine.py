@@ -30,7 +30,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from app.chat import coverage, resolve
+from app.chat import coverage, entities, resolve
 from app.chat import tools as T
 from app.chat.verify import VERIFY_ALLOWANCE_SECONDS, VerificationUnavailable, VerifyReport, verify_answer
 from app.config import get_settings
@@ -203,6 +203,7 @@ class TurnInput:
     focus_documents: list[dict]  # [{document_id, title}]
     prior_refs: dict[str, dict]  # P# -> {version_id, block_start, block_end, table_index, chunk_id, title, location}
     focus: dict | None = None  # the previous answer's focus, when its documents are all still visible
+    candidates: list[dict] = field(default_factory=list)  # the documents a previous server clarification offered
 
 
 @dataclass
@@ -215,6 +216,7 @@ class TurnOutcome:
     ledger: dict = field(default_factory=dict)
     rounds: list[list[dict]] = field(default_factory=list)  # each verification round's problems, in order
     request: dict | None = None  # the follow-up resolved in context (``app.chat.resolve``), when there was one
+    resolution: dict | None = None  # the raw parse and the server's decisions on it (diagnostics only)
 
 
 def _context_message(inp: TurnInput, request: resolve.Request | None = None) -> str:
@@ -231,7 +233,8 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None) -> 
             limit = HISTORY_USER_CHARS if m.role == "user" else HISTORY_ANSWER_CHARS
             lines.append(f"{who}: {prompt_text(content[:limit] + ('…' if len(content) > limit else ''))}")
         parts.append("ההודעות האחרונות בשיחה (תשובות העוזר אינן מקור עובדתי):\n" + "\n\n".join(lines))
-    if inp.focus and not (request and request.kind == "new_topic"):
+    moved = request is not None and (request.kind == "new_topic" or request.entity_changed)
+    if inp.focus and not moved:
         f = inp.focus
         def label(labels: dict, key: str) -> str:
             value = f.get(key)
@@ -246,10 +249,10 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None) -> 
             f"- {k}: {prompt_text(v)}" for k, v in fields if v)
             + "\nאם ההודעה החדשה מתקנת את התור הקודם, שנה רק את מה שתוקן ושמור את כל השאר מהרשימה הזו "
               "(אותו נכס, אותם מסמכים, אותה יחידה — למשל ערך למ\"ר נשאר ערך למ\"ר).")
-    if inp.focus_documents:
+    if inp.focus_documents and not moved:
         parts.append("מסמכים שהשיחה עסקה בהם:\n" + "\n".join(
             f"- document_id={d['document_id']} | {prompt_text(d['title'])}" for d in inp.focus_documents))
-    if inp.prior_refs:
+    if inp.prior_refs and not moved:
         parts.append("הפניות למקורות שצוטטו בתשובה הקודמת (יש לפתוח מחדש עם open_source לפני שימוש):\n" + "\n".join(
             f"- {pid}: {prompt_text(r.get('title') or '')} — {prompt_text(r.get('location') or '')}"
             + (f" — «{prompt_text(r['excerpt'])}»" if r.get("excerpt") else "")
@@ -275,19 +278,24 @@ def run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput,
     progress("understand", "מבין את הבקשה")
     request = None
     if inp.history or inp.focus:
-        # a follow-up is resolved in its context, and validated, before anything is searched
-        visible = {d["document_id"] for d in inp.focus_documents} | set((inp.focus or {}).get("document_ids") or [])
-        request = resolve.resolve(provider, inp.focus, inp.history, inp.question, inp.focus_documents, visible, usage,
-                                  deadline)
+        # a follow-up is resolved in its context, and validated, before anything is searched. Three document sets
+        # stay apart: the conversation's documents (context), the documents the user may see (the database decides,
+        # under the user's permissions) and the documents the new request names (looked up the same way)
+        focus_ids = {d["document_id"] for d in inp.focus_documents} | set((inp.focus or {}).get("document_ids") or [])
+        request = resolve.resolve(
+            provider, inp.focus, inp.history, inp.question, inp.focus_documents,
+            lambda ids: entities.authorized(ctx, ids), entities.titles_of(ctx), usage, deadline,
+            lookup=lambda words: entities.lookup(ctx, words, focus_ids), candidates=inp.candidates or None)
         if cancelled():
             raise TurnCancelled
-        # a clarification has nothing to verify against, so one that states a figure is not used
-        if request is not None and request.clarify and not re.search(r"\d", request.clarify):
+        # a model's clarification has nothing to verify against, so one that states a figure is not used; the
+        # server's names only titles the user may see and the user's own words
+        if request is not None and request.clarify and (request.server_clarify or not re.search(r"\d", request.clarify)):
             answer = FinalAnswer(status="clarification", answer_markdown=request.clarify, claims=[],
                                  clarification_question=request.clarify, missing_info="", referenced_document_ids=[],
                                  scope_kind="focused", scope_query="", omitted=[], focus=None, requested=[])
             return TurnOutcome(answer, ws, VerifyReport([], judged=True, judge_status="no_claims"), steps, usage, {},
-                               rounds, request.as_dict())
+                               rounds, request.as_dict(), request.resolution)
     items: list = [{"role": "user", "content": _context_message(inp, request)}]
     while True:
         if cancelled():
@@ -339,7 +347,8 @@ def run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput,
             if final.status != "clarification":
                 ledger, final = coverage.build(ws, final, inp.question)
             return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
-                               request.as_dict() if request is not None else None)
+                               request.as_dict() if request is not None else None,
+                               request.resolution if request is not None else None)
         attempt += 1
         if attempt == 1:
             progress("repair", "מתקן טענות שלא אומתו")

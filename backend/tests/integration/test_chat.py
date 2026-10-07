@@ -370,9 +370,9 @@ def _value_focus(doc: str, kind: str) -> dict:
 
 
 def _resolution(**kw) -> dict:
-    return {"kind": "correction", "standalone_question": "מה השווי?", "changed_fields": [], "metric_kind": "unknown",
-            "unit": "unknown", "period": "unknown", "area_basis": "", "vat": "unknown", "subject": "",
-            "document_ids": [], "ambiguity": ""} | kw
+    return {"relation": "correction", "scope": "entity", "standalone_question": "מה השווי?", "changed_fields": [],
+            "metric_kind": "unknown", "unit": "unknown", "scale": "unknown", "period": "unknown", "area_basis": "",
+            "vat": "unknown", "subject": "", "document_ids": [], "ambiguity": ""} | kw
 
 
 def _first_turn(client, office, monkeypatch) -> str:
@@ -447,12 +447,12 @@ def test_an_answer_without_a_focus_hands_its_request_to_the_next_turn(client, of
     cid = _first_turn(client, office, monkeypatch)
     second = ScriptedAgent([[call("search", query="מקור", document_ids=[office.doc], limit=None)],
                             final("המקור הוא סעיף הסיכום של השומה [S1].")])
-    second.on("agent", _resolution(kind="follow_up", metric_kind="rent_per_area", unit="ILS_per_sqm",
+    second.on("agent", _resolution(relation="same_datum", metric_kind="rent_per_area", unit="ILS_per_sqm",
                                    period="month", document_ids=[office.doc]))
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
     assert send(client, cid, "מאיפה זה לקוח?")["answer"]["focus"] is None
     third = ScriptedAgent([final("לא נמצא.", "not_found")])
-    third.on("agent", _resolution(kind="follow_up"))
+    third.on("agent", _resolution(relation="same_datum"))
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: third)
     send(client, cid, "ומה עוד?")
     resolve_input = next(c.input for c in third.calls if c.purpose.value == "agent")
@@ -462,8 +462,7 @@ def test_an_answer_without_a_focus_hands_its_request_to_the_next_turn(client, of
 def test_a_new_topic_leaves_the_previous_datum_out_of_the_task(client, office, monkeypatch):
     cid = _first_turn(client, office, monkeypatch)
     second = ScriptedAgent([final("לא נמצא.", "not_found")])
-    second.on("agent", _resolution(kind="new_topic", changed_fields=[{"field": "subject", "user_words": "תיאור הנכס"}],
-                                   subject="תיאור הנכס", standalone_question="מה תיאור הנכס?"))
+    second.on("agent", _resolution(relation="new_question", standalone_question="מה תיאור הנכס?"))
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
     send(client, cid, "שאלה אחרת: מה תיאור הנכס?")
     task = second.seen[0][0]["content"]
@@ -473,7 +472,7 @@ def test_a_new_topic_leaves_the_previous_datum_out_of_the_task(client, office, m
 def test_a_follow_up_keeps_the_previous_datum_in_the_task(client, office, monkeypatch):
     cid = _first_turn(client, office, monkeypatch)
     second = ScriptedAgent([final("לא נמצא.", "not_found")])
-    second.on("agent", _resolution(kind="follow_up"))
+    second.on("agent", _resolution(relation="same_datum"))
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
     send(client, cid, "ומה המקור לזה?")
     assert "הנתון שבמרכז השיחה" in second.seen[0][0]["content"]

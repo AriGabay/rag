@@ -219,6 +219,7 @@ def _answer_documents(answer: dict | None) -> set[str]:
     ids |= coverage.ledger_documents(answer.get("ledger"))
     ids |= set((answer.get("focus") or {}).get("document_ids") or [])
     ids |= set((answer.get("request") or {}).get("document_ids") or [])
+    ids |= {c.get("document_id") for c in (answer.get("request") or {}).get("candidates") or []}
     ids |= {d for r in answer.get("requested") or [] for d in r.get("document_ids") or []}
     ids |= set(answer.get("touched_documents") or [])
     ids.discard(None)
@@ -508,11 +509,16 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
     # the last answer's focus, or, when it named no datum, the request it answered (``app.chat.resolve``); its
     # message is in ``rows`` only while every document it names is visible
     last_focus = None
+    candidates: list[dict] = []
     if last is not None:
         last_focus = last.answer.get("focus") or _request_focus(last.answer.get("request"))
+        if last.answer.get("status") == "clarification":
+            # the documents a server clarification offered: the reply is resolved among them (the message is in
+            # ``rows`` only while every one of them is visible)
+            candidates = list((last.answer.get("request") or {}).get("candidates") or [])
     return engine.TurnInput(question=user.content, history=history, summary=summary, focus=last_focus,
                             focus_documents=[{"document_id": k, "title": v} for k, v in list(focus.items())[-8:]],
-                            prior_refs=prior)
+                            prior_refs=prior, candidates=candidates)
 
 
 def _request_focus(request: dict | None) -> dict | None:
