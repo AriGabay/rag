@@ -15,3 +15,11 @@ A user belongs to exactly one office, and the office is always taken from the us
 A named set of an office's documents that is the unit of access below the office: an office admin sees every group, while an employee sees only the documents of the groups they are a member of.
 
 Group visibility follows a document into everything derived from it, so a record or passage that comes from a group the user cannot see never appears in their answers, statistics, sources, or review queue.
+
+## Conversation
+
+### Conversation focus
+
+The datum and documents a conversation is about after its last answer: what a follow-up such as "and the total?" or "I meant the value" refers to.
+
+The focus is context, not a filter. When the user names another property, unit or document, the focus documents are dropped and the newly named documents — found only among those the user may see — replace them; when nothing or several documents match, the user is asked which one, never answered from the focus.

@@ -95,6 +95,13 @@ and after a change cannot separate a regression from noise. In this round (PR #2
   - Reading them before the rerun would turn the set into a development set.
 - Run the regression sets twice on that same build too, so all the numbers in the report describe one build. Earlier
   runs may be reported, labelled with their build, as an intermediate data point.
+- **A provider outage in the middle of a run** (turns ending `failed` with a provider error while the egress
+  check passes again minutes later) is not a result of the build. Rerun only the conversations that got no
+  answer, on the same build, with `--only`, keep them in a separate `*-infra-rerun` directory, and report the
+  scores as "including reruns after the outage". Never rerun conversations that got an answer, failed or not.
+- **A held-out set that was read to diagnose a failure is a regression set from then on,** even when the fix
+  comes after its one run. Report its score as measured on the build it ran on, label later fixes as verified by
+  tests and targeted reruns only, and write a new held-out set for the next round.
 - When manual review shows a reference answer was wrong, do not edit it silently. Keep the original under
   `reference_corrected: {date, evidence, was}` beside the corrected `expect`. `chat_eval` (live and `--rescore`) then
   reports the score against the original reference and the score after corrections separately, and lists each
