@@ -1,5 +1,5 @@
 """Creates the isolated evaluation office C and uploads the synthetic documents of the evaluation sets to it
-(tests/fixtures/eval_v5/ and eval_v6/, written by scripts/make_eval_docs.py). Cloud use is enabled for office C only, so the real model can answer there.
+(tests/fixtures/eval_v5/, eval_v6/ and eval_v8/, written by scripts/make_eval_docs.py). Cloud use is enabled for office C only, so the real model can answer there.
 
 Runs against a live stack, like seed_demo.py: the office is bootstrapped with the owner role, everything else
 goes through the public API. Idempotent: an existing office C is reused and documents already there are not
@@ -28,7 +28,7 @@ BACKEND = os.environ.get("BACKEND_URL", "http://localhost:8000")
 PASSWORD = os.environ.get("DEMO_PASSWORD", "demo1234")
 NAME = "משרד הערכה ג׳ (סינתטי, סט v5)"
 ADMIN = "admin-c@eval.test"
-FOLDERS = [ROOT / "tests" / "fixtures" / "eval_v5", ROOT / "tests" / "fixtures" / "eval_v6"]
+FOLDERS = [ROOT / "tests" / "fixtures" / f"eval_{v}" for v in ("v5", "v6", "v8")]
 
 
 def log(msg: str) -> None:

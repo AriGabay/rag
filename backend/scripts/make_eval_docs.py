@@ -16,8 +16,15 @@ value on an equivalent-area basis including VAT, a negative statement, and a lan
 - a survey table of eight asking rents that must be given whole;
 - an approximate annual income, and a parking facility with no value per m² at all.
 
+**v8** (tests/fixtures/eval_v8/), four reports in two more invented towns, for the held-out set of round 4 (no test
+fixture or regression case uses them):
+- the same street address in two towns (a follow-up naming it is ambiguous until the town is given);
+- one building with several units, each with its own value (a follow-up about another unit stays in the report);
+- a capitalisation table whose rent per m² gets its area basis from another row and its period from the notes;
+- two reports per town, for counts over a town.
+
 The file names are the documents' titles (a title is taken from the uploaded file's name, as in the office).
-Run from backend/: ``uv run python scripts/make_eval_docs.py [v5|v6]`` (both when no argument is given).
+Run from backend/: ``uv run python scripts/make_eval_docs.py [v5|v6|v8]`` (all when no argument is given).
 """
 
 from __future__ import annotations
@@ -129,7 +136,42 @@ def v6() -> None:
     ])
 
 
+V8_A, V8_B = "נווה אשחר", "כרם הזית"
+
+
+def v8() -> None:
+    out = FIXTURES / "eval_v8"
+    report(out, "שומה - הכלנית 6 נווה אשחר.docx", f"שומת מקרקעין – בניין מגורים, רחוב הכלנית 6, {V8_A}", [
+        ("1. תיאור המקרקעין", ["שטח המגרש הרשום הוא 1,860 מ\"ר.",
+                               "על המגרש בניין מגורים בן 9 קומות, ובו 27 דירות."]),
+        ("2. השומה", ["השווי למ\"ר אקוו' לדירות בבניין נקבע ל-19,800 ₪, כולל מע\"מ.",
+                      "שווי הבניין כולו נקבע ל-41,580,000 ₪, כולל מע\"מ."]),
+    ])
+    report(out, "שומה - הכלנית 6 כרם הזית.docx", f"שומת מקרקעין – מבנה מסחרי, רחוב הכלנית 6, {V8_B}", [
+        ("1. תיאור הנכס", ["מבנה מסחרי בן שתי קומות, בשטח בנוי של 1,150 מ\"ר, ובו 7 חנויות."]),
+        ("2. השומה", ["השווי למ\"ר בנוי למסחר נקבע ל-8,700 ₪, ללא מע\"מ.",
+                      "השווי הכולל של המבנה הוא 10,005,000 ₪, ללא מע\"מ."]),
+    ])
+    report(out, "שומה - הצבעוני 21 נווה אשחר.docx", f"שומת מקרקעין – דירות בבניין, רחוב הצבעוני 21, {V8_A}", [
+        ("1. מטרת חוות הדעת", ["הערכת שווי ארבע דירות בבניין לצורך מכירה."]),
+        ("2. הדירות", [("פירוט הדירות נשואות חוות הדעת:",
+                        ["דירה", "קומה", "שטח במ\"ר", "שווי"],
+                        [["D1", "2", "96", "₪ 2,350,000"], ["D2", "3", "104", "₪ 2,520,000"],
+                         ["D3", "5", "88", "₪ 2,190,000"], ["D4", "7", "121", "₪ 3,080,000"]],
+                        ["(*) השווי כולל מע\"מ, ומתייחס לדירה עם חניה ומחסן."])]),
+    ])
+    report(out, "שומה - דרך הנחשול 40 כרם הזית.docx", f"שומת מקרקעין – מבנה תעשייה, דרך הנחשול 40, {V8_B}", [
+        ("1. תיאור הנכס", ["מבנה תעשייה בן קומה אחת וגלריה, על מגרש בשטח 4,300 מ\"ר."]),
+        ("2. תחשיב השווי", [("תחשיב שווי הנכס בגישת היוון ההכנסות:",
+                             ["רכיב", "ערך"],
+                             [["סה\"כ מ\"ר אקווי'", "2,480"], ["דמ\"ש למ\"ר", "₪ 52"],
+                              ["הכנסה שנתית", "₪ 1,547,520"], ["שיעור היוון", "7.5%"],
+                              ["שווי מעוגל", "₪ 20,630,000"]],
+                             ["(*) דמי השכירות בטבלה הם לחודש, ללא מע\"מ."])]),
+    ])
+
+
 if __name__ == "__main__":
-    which = sys.argv[1:] or ["v5", "v6"]
+    which = sys.argv[1:] or ["v5", "v6", "v8"]
     for name in which:
-        {"v5": v5, "v6": v6}[name]()
+        {"v5": v5, "v6": v6, "v8": v8}[name]()
