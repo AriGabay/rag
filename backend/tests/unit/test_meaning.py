@@ -218,3 +218,64 @@ def test_a_period_written_before_its_amount_belongs_to_it():
 def test_an_approximate_number_written_as_approximate_passes():
     ws = _ws("התקבולים השנתיים מהחניון נאמדו בכ-310,000 ₪.")
     assert _problems("התקבולים השנתיים הם כ-310,000 ₪ [S1].", ws) == []
+
+
+# --- meaning stated elsewhere in the same calculation (plan 2026-10-07-1643, KTD5) ---------------------------
+
+CALC = ("תחשיב שווי בגישת היוון ההכנסות:\nרכיב | ערך\nסה\"כ מ\"ר אקווי' | 2,480\nדמ\"ש למ\"ר | ₪ 52\n"
+        "הכנסה שנתית | ₪ 1,547,520\nשווי מעוגל | ₪ 20,630,000\n(*) דמי השכירות בטבלה הם לחודש, ללא מע\"מ.")
+
+
+def test_a_rate_gets_the_basis_of_its_tables_area_row_and_the_period_of_its_notes():
+    found = {p.kind: p for p in _problems("דמי השכירות בתחשיב הם 52 ₪ למ\"ר [S1].", _ws(CALC, kind="table"))}
+    assert found["basis"].annotation == "מ״ר אקווי׳" and not found["basis"].blocking
+    assert found["period"].annotation == "לחודש"
+    # the total of the same table gets neither
+    assert _problems("השווי המעוגל הוא 20,630,000 ₪ [S1].", _ws(CALC, kind="table")) == []
+
+
+def test_a_table_with_two_bases_binds_none():
+    two = CALC.replace("דמ\"ש למ\"ר | ₪ 52", "שטח פלדלת במ\"ר | 2,100\nדמ\"ש למ\"ר | ₪ 52")
+    assert not [p for p in _problems("דמי השכירות הם 52 ₪ למ\"ר [S1].", _ws(two, kind="table")) if p.kind == "basis"]
+
+
+def test_text_around_a_table_in_a_long_passage_is_not_the_tables_definition():
+    passage = "\n".join([f"פסקה {i}: תיאור כללי של הנכס." for i in range(5)]
+                        + ["שטח הבניין נמדד במ\"ר אקוו'.", "רכיב | ערך", "דמ\"ש למ\"ר | ₪ 52"])
+    assert not [p for p in _problems("דמי השכירות הם 52 ₪ למ\"ר [S1].", _ws(passage)) if p.kind == "basis"]
+
+
+def test_spellings_of_the_equivalent_basis_are_one_basis_shown_as_written():
+    src = "השווי למ\"ר אקוו' לנכס נקבע ל-14,250 ₪."
+    for said in ("אקווי׳", "אקוי׳", "אקו׳"):
+        assert _problems(f"השווי למ״ר {said} הוא 14,250 ₪ [S1].", _ws(src)) == [], said
+    (p,) = _problems("השווי למ\"ר הוא 52 ₪ [S1].", _ws("השווי למ\"ר אקווי' נקבע ל-52 ₪."))
+    assert p.annotation == "מ״ר אקווי׳"
+
+
+def _same_document(*sections: tuple[str, str]) -> Workspace:
+    ws = Workspace(ctx=None)
+    doc, ver = uuid.uuid4(), uuid.uuid4()
+    for section, t in sections:
+        ws.add_source(document_id=doc, version_id=ver, title="שומת בדיקה", section=section,
+                      location=f"סעיף \"{section}\"", kind="context", text=t)
+    return ws
+
+
+def test_a_correct_period_written_elsewhere_in_the_calculation_is_cited_not_removed():
+    ws = _same_document(("תחשיב", "דמי השכירות הראויים לנכס הם 70 ₪ למ\"ר."),
+                        ("תחשיב", "לאחר התאמות, דמי השכירות הראויים נקבעו ל-70 ₪ למ\"ר לחודש."))
+    (u,) = split_units("דמי השכירות הראויים הם 70 ₪ למ\"ר לחודש [S1].")
+    (p,) = meaning.check(u, ws, meaning.Fetcher(ws))
+    assert p.needs_citation and p.cite == "S2" and not p.blocking and "S2" in u.ids
+    out = verify_answer(_judge(), _answer("דמי השכירות הראויים הם 70 ₪ למ\"ר לחודש [S1]."), ws, "?", [])
+    final = out.apply(_answer("דמי השכירות הראויים הם 70 ₪ למ\"ר לחודש [S1]."))
+    assert out.ok and "לחודש" in final.answer_markdown and "[S1][S2]" in final.answer_markdown
+
+
+def test_the_same_number_with_a_period_in_a_comparables_section_attests_nothing():
+    ws = _same_document(("תחשיב", "דמי השכירות הראויים לנכס הם 70 ₪ למ\"ר."),
+                        ("סקר שוק", "עסקת השוואה ברחוב הערבה: 70 ₪ למ\"ר לחודש."))
+    (u,) = split_units("דמי השכירות הראויים הם 70 ₪ למ\"ר לחודש [S1].")
+    (p,) = meaning.check(u, ws, meaning.Fetcher(ws))
+    assert p.blocking and p.kind == "period" and u.ids == ["S1"]

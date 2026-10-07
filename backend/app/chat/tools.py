@@ -194,6 +194,12 @@ class Workspace:
         self.sources[s.sid] = s
         return s
 
+    def adopt(self, source: Source) -> Source:
+        """Register a source the server read for its own checks, once it is cited (a new id)."""
+        source.sid = self._sid()
+        self.sources[source.sid] = source
+        return source
+
 
 # --- helpers ---------------------------------------------------------------------------------------------
 
@@ -370,9 +376,26 @@ def _ref(ws: Workspace, source_id: str) -> dict:
 
 
 def tool_open_source(ws: Workspace, source_id: str, scope: str = "neighbors") -> str:
+    s = read_scope(ws, source_id, scope)
+    # keyed by the text sent: a section opened after the paragraphs around the same place is longer, and is sent
+    return _render_source(ws.once(s, ("text", s.version_id, s.text)))
+
+
+def read_scope(ws: Workspace, source_id: str, scope: str = "neighbors", quiet: bool = False) -> Source:
+    """The context around a source (``neighbors``), its whole section, or its whole table, as a new source of the
+    turn. ``quiet``: read for the server's own checks (``app.chat.meaning``): the source is not registered and the
+    turn's coverage does not change — the caller registers it (``Workspace.adopt``) only if it cites it."""
     if scope not in CONTEXT_CHARS:
         raise ToolError("scope חייב להיות neighbors, section או table")
     ref = _ref(ws, source_id)
+
+    def make(**kw) -> Source:
+        return Source(sid="", **kw) if quiet else ws.add_source(**kw)
+
+    def touch(*args, **kw) -> None:
+        if not quiet:
+            ws.touch(*args, **kw)
+
     vid = UUID(str(ref["version_id"]))
     with tenant_tx(ws.ctx) as conn:
         head = conn.execute(text(
@@ -381,7 +404,7 @@ def tool_open_source(ws: Workspace, source_id: str, scope: str = "neighbors") ->
         if head is None:
             raise ToolError("המקור אינו זמין עוד (נמחק או שאין הרשאה)")
         partial = bool(_partial_versions(conn, [vid]))
-        ws.touch(head.document_id, head.title, "retrieved", partial)
+        touch(head.document_id, head.title, "retrieved", partial)
         start, end = ref.get("block_start"), ref.get("block_end")
         table_index = ref.get("table_index")
         if start is None and ref.get("chunk_id") and not (scope == "table" and table_index is not None):
@@ -389,11 +412,11 @@ def tool_open_source(ws: Workspace, source_id: str, scope: str = "neighbors") ->
                                {"c": ref["chunk_id"]}).first()
             if row is None:
                 raise ToolError("המקור אינו זמין עוד")
-            s = ws.add_source(document_id=head.document_id, version_id=vid, title=head.title, section=row.section,
+            s = make(document_id=head.document_id, version_id=vid, title=head.title, section=row.section,
                               location=_location(row.section, row.kind, row.page_list, None, None, (None, None), None),
                               kind=row.kind, text=_clip(row.text, CONTEXT_CHARS[scope]), page_list=row.page_list,
                               partial_document=partial)
-            return _render_source(ws.once(s, ("text", vid, s.text)))
+            return s
         if scope == "table":
             if table_index is None and start is not None:
                 hit = conn.execute(text(
@@ -417,14 +440,14 @@ def tool_open_source(ws: Workspace, source_id: str, scope: str = "neighbors") ->
             source_note = {"emf": "טבלה מתוך תמונה וקטורית (נקראה במדויק)", "vision": "טבלה מתוך תמונה (קריאה חזותית)",
                            "ocr": "טבלה מתוך תמונה (OCR)"}.get(st.get("source") or "", "")
             body = (source_note + "\n" if source_note else "") + "\n".join(lines)
-            s = ws.add_source(document_id=head.document_id, version_id=vid, title=head.title, section=st.get("section"),
+            s = make(document_id=head.document_id, version_id=vid, title=head.title, section=st.get("section"),
                               location=_location(st.get("section"), "table", None, None, None, (None, None), media),
                               kind="table", text=_clip(body, CONTEXT_CHARS["table"]), block_start=st.get("block_index"),
                               block_end=st.get("block_index"), table_index=table_index, partial_document=partial)
-            ws.touch(head.document_id, head.title, "read", partial,
+            touch(head.document_id, head.title, "read", partial,
                      {"sid": s.sid, "scope": "table", "name": st.get("caption") or (st.get("title") or [""])[0]
                       or st.get("section") or "טבלה"})
-            return _render_source(ws.once(s, ("text", vid, s.text)))
+            return s
         if start is None:
             raise ToolError("למקור הזה אין מיקום במסמך להרחבה")
         if scope == "section":
@@ -445,16 +468,15 @@ def tool_open_source(ws: Workspace, source_id: str, scope: str = "neighbors") ->
         body = "\n".join(r.text for r in rows)
         nums = [r.paragraph_no for r in rows if r.paragraph_no]
         section = rows[0].section if scope == "neighbors" else (top or rows[0].section)
-        s = ws.add_source(document_id=head.document_id, version_id=vid, title=head.title, section=section,
+        s = make(document_id=head.document_id, version_id=vid, title=head.title, section=section,
                           location=_location(section, "text", None, rows[0].block_index, rows[-1].block_index,
                                              (min(nums), max(nums)) if nums else (None, None), None),
                           kind="context", text=_clip(body, CONTEXT_CHARS[scope]), block_start=rows[0].block_index,
                           block_end=rows[-1].block_index, partial_document=partial)
         if scope == "section":
-            ws.touch(head.document_id, head.title, "read", partial,
+            touch(head.document_id, head.title, "read", partial,
                      {"sid": s.sid, "scope": "section", "name": section or "הסעיף"})
-        # keyed by the text sent: a section opened after the paragraphs around the same place is longer, and is sent
-        return _render_source(ws.once(s, ("text", vid, s.text)))
+        return s
 
 
 def _paginate(page, total: int, size: int) -> tuple[int, int]:

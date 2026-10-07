@@ -47,7 +47,8 @@ if TYPE_CHECKING:
 
 # (key, pattern) — the key compares spellings; the matched text is the qualifier as written
 _BASIS = [
-    ("אקוו", r"(?:מ\"ר\s*)?אקוו?(?:יוולנטי|ולנטי|יוולנטיים|')?(?![א-ת])"),
+    # אקוו׳, אקווי׳, אקוי׳, אקו׳, אקוו, אקוויוולנטי(ים), אקוולנטי: one basis however it is spelt
+    ("אקוו", r"(?:מ\"ר\s*)?אקו(?:ו?י?ו?ולנטי(?:ים)?|ו?י?'|ו)(?![א-ת])"),
     ("פלדלת", r"(?:מ\"ר\s*)?(?<![א-ת])[ולב]?פלדלת"),
     ("ברוטו", r"(?:מ\"ר\s*)?(?<![א-ת])[ו]?ברוטו(?![א-ת])"),
     ("נטו", r"(?:מ\"ר\s*)?(?<![א-ת])[ו]?נטו(?![א-ת])"),
@@ -180,16 +181,47 @@ def _row_cells(line: str) -> list[str]:
     return [c.strip() for c in line.strip().strip("|").split("|")]
 
 
+# a per-area amount: its row or column says "למ״ר", "/מ״ר", "למטר", "לדונם"
+_PER_AREA = re.compile(r"(?:(?<![א-ת])ל|/\s?)(?:מ\"ר|מטר|דונם)(?![א-ת])")
+
+
+def _table_definitions(lines: list[str], is_row: list[bool], heads: list[str]) -> dict[str, dict[str, str]]:
+    """What a calculation table states once for its per-area amounts, by kind -> {key: as written}: the area basis
+    of its area row ("סה״כ מ״ר אקווי׳ | 2,480") or of its title, caption or notes, and the period of its title,
+    caption or notes ("דמי השכירות בטבלה הם לחודש"). Text around a table in a longer passage is not the table's."""
+    found: dict[str, dict[str, str]] = {"basis": {}, "period": {}}
+    for line, row in zip(lines, is_row, strict=True):
+        if not row:
+            continue
+        cells = _row_cells(line)
+        label = cells[0] if cells else ""
+        if 'מ"ר' in label or any('מ"ר' in h for h in heads[:1]):
+            for _, kind, key, written in _scan(label):
+                if kind == "basis" and not _PER_AREA.search(label):
+                    found["basis"].setdefault(key, written.strip())
+    around = [ln for ln, row in zip(lines, is_row, strict=True) if not row]
+    if len(around) <= 4:  # a caption, a title, a size line and notes; a longer passage is not the table's own text
+        for line in around:
+            for _, kind, key, written in _scan(line):
+                found[kind].setdefault(key, written.strip())
+    return found
+
+
 @lru_cache(maxsize=256)
 def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ...], Qualifiers]:
     """Every number a source states with what it attaches to it there, and what the source states for all its
-    numbers. Parsed once per source text: the same sources are read for every number, unit and round."""
+    numbers. Parsed once per source text: the same sources are read for every number, unit and round.
+
+    In a table, a number also gets its row's label and its column's header; and a per-area amount ("דמ״ש למ״ר |
+    75") gets the area basis and the period the table states once for the whole calculation — in its area row, its
+    title, caption or notes — when the table states exactly one of each kind. A table with two bases binds none."""
     text = _norm(text)
     lines = [ln for ln in text.split("\n") if ln.strip()]
     is_row = [_ROW in ln or ln.strip().startswith("|") for ln in lines]
     rows = [ln for ln, row in zip(lines, is_row, strict=True) if row]
     header = next((r for r in rows if not re.search(r"\d", r)), None)
     heads = _row_cells(header) if header else []
+    table = _table_definitions(lines, is_row, heads) if rows else {"basis": {}, "period": {}}
     occurrences: list[tuple[frozenset[str], Occurrence]] = []
     general = Qualifiers()
     for line, row in zip(lines, is_row, strict=True):
@@ -205,6 +237,11 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
                         q.merge(_all(cells[0]))  # the row's label
                     if i < len(heads):
                         q.merge(_all(heads[i]))  # the column's header
+                    if _PER_AREA.search(cells[0] + " " + (heads[i] if i < len(heads) else "") + " " + cell):
+                        for kind, defined in table.items():
+                            if len(defined) == 1 and not q.keys(kind):
+                                key, written = next(iter(defined.items()))
+                                q.add(kind, key, written)
                     occurrences.append((f, Occurrence(q, line)))
             continue
         found, gen = attached(line)
@@ -242,6 +279,117 @@ class MeaningProblem:
     reason: str
     blocking: bool
     annotation: str | None = None  # the qualifier as written, when exactly one is attested
+    cite: str | None = None  # the source (S#/M#) the server found that states it, cited with it
+    needs_citation: bool = False  # the unit is right; only the citation of ``cite`` is missing
+
+
+SUBJECT_ROLES = ("appraiser_determination", "actual_contract", "calculation")
+READS = 4  # database reads per verification for evidence beyond the cited passages
+
+
+@dataclass
+class Fetcher:
+    """Evidence for a number beyond the passages a unit cites, read by the server for this check only: the same
+    calculation's other passages that the turn already has, the whole table or section around a cited passage,
+    and the stored measurements of the subject property in the cited documents. What it finds and uses is
+    registered as a source of the turn (cited with the number); what it does not use is dropped. A comparables or
+    survey row never counts: only the same table or section, or a measurement of the subject property."""
+
+    ws: Workspace
+    reads: int = READS
+    cache: dict = field(default_factory=dict)
+
+    def _read(self, key: tuple, load):
+        if key not in self.cache:
+            if self.reads <= 0:
+                return None
+            self.reads -= 1
+            try:
+                self.cache[key] = load()
+            except Exception:  # noqa: BLE001 - evidence not read is evidence not found; the check stays strict
+                self.cache[key] = None
+        return self.cache[key]
+
+    def expansion(self, sid: str):
+        """The whole table of a passage from a table, or the whole section around a passage or table."""
+        from app.chat.tools import read_scope
+
+        src = self.ws.sources.get(sid)
+        if src is None:
+            return None
+        whole_table = src.kind == "table" and src.chunk_id is None and src.table_index is not None
+        scope = "table" if src.table_index is not None and not whole_table else "section"
+        if scope == "section" and src.block_start is None:
+            return None
+        got = self._read(("x", str(src.version_id), src.table_index, src.block_start, src.block_end, scope),
+                         lambda: read_scope(self.ws, sid, scope, quiet=True))
+        return got if got is not None and len(got.text) > len(src.text) else None
+
+    def same_calculation(self, sid: str) -> list:
+        """The turn's other passages of the same table or section of the same document version."""
+        src = self.ws.sources.get(sid)
+        if src is None:
+            return []
+        return [o for o in self.ws.sources.values() if o.sid != sid and o.version_id == src.version_id and (
+            (src.table_index is not None and o.table_index == src.table_index)
+            or (src.section and o.section == src.section))]
+
+    def subject_measurements(self, document_ids: set) -> list:
+        from sqlalchemy import text as sql
+
+        from app.db import tenant_tx
+
+        def load():
+            with tenant_tx(self.ws.ctx) as conn:
+                return conn.execute(sql(
+                    "SELECT m.*, d.title FROM measurements m JOIN document_versions v ON v.id = m.version_id"
+                    " AND v.is_current JOIN documents d ON d.id = m.document_id AND d.deleted_at IS NULL"
+                    " WHERE m.document_id = ANY(:d) AND m.status <> 'rejected' AND m.subject_role ="
+                    " 'appraised_property' AND m.value_role = ANY(:r) ORDER BY m.block_index NULLS FIRST, m.id"
+                    " LIMIT 400"), {"d": sorted(document_ids), "r": list(SUBJECT_ROLES)}).all()
+        return self._read(("m", tuple(sorted(str(d) for d in document_ids))), load) or []
+
+    def adopt(self, found) -> str:
+        """The id of a source or measurement the check uses: registered as the turn's, once."""
+        from app.chat.tools import Measurement, Source
+
+        if isinstance(found, Source):
+            if not found.sid or self.ws.sources.get(found.sid) is not found:
+                self.ws.adopt(found)
+            return found.sid
+        known = next((m for m in self.ws.measurements.values() if m.id == found.id), None)
+        if known is None:
+            known = Measurement(f"M{len(self.ws.measurements) + 1}", found.id, found.document_id,
+                                found.version_id, found.title, found)
+            self.ws.measurements[known.mid] = known
+        return known.mid
+
+    def attesting(self, unit: Unit, forms: frozenset[str], kind: str, key: str, words: set[str]) -> str | None:
+        """The id of evidence that states ``kind`` ``key`` for the number, beyond the unit's citations."""
+        cited = [i for i in unit.ids if i in self.ws.sources]
+        for sid in cited:
+            for cand in [*self.same_calculation(sid), self.expansion(sid)]:
+                if cand is None or cand.sid in unit.ids:
+                    continue
+                occ, _ = source_occurrences(cand.text, set(forms))
+                if any(key in o.qualifiers.keys(kind) for o in occ):
+                    return self.adopt(cand)
+        docs = {self.ws.sources[i].document_id for i in cited}
+        docs |= {self.ws.measurements[i].document_id for i in unit.ids if i in self.ws.measurements}
+        for row in self.subject_measurements(docs) if docs else []:
+            if not forms & numbers_in(row.value_text or ""):
+                continue
+            if key in measurement_qualifiers(row).keys(kind) and words & _content_words(f"{row.metric} {row.quote}"):
+                return self.adopt(row)
+        return None
+
+    def expanded_occurrences(self, unit: Unit, forms: frozenset[str]) -> list[tuple[Occurrence, object]]:
+        out = []
+        for sid in [i for i in unit.ids if i in self.ws.sources]:
+            exp = self.expansion(sid)
+            if exp is not None:
+                out += [(o, exp) for o in source_occurrences(exp.text, set(forms))[0]]
+        return out
 
 
 def _evidence(unit: Unit, ws: Workspace, forms: frozenset[str]) -> tuple[list[Occurrence], Qualifiers]:
@@ -273,8 +421,10 @@ def _closest(occurrences: list[Occurrence], words: set[str]) -> list[Occurrence]
     return [o for s, o in scored if s == best]
 
 
-def check(unit: Unit, ws: Workspace) -> list[MeaningProblem]:
-    """The meaning problems of one cited unit."""
+def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[MeaningProblem]:
+    """The meaning problems of one cited unit. With a ``fetcher``, a qualifier the cited passages do not state is
+    looked for in the same calculation before it counts as unsupported, and a needed one the cited passage omits
+    may come from the table or section around it; either is then cited (``cite``)."""
     if not unit.ids:
         return []
     text = _norm(unit.text)
@@ -298,15 +448,47 @@ def check(unit: Unit, ws: Workspace) -> list[MeaningProblem]:
         # unsupported: a basis or period given to the number that its evidence does not give it
         for kind in ("basis", "period"):
             extra = claimed.keys(kind) - attested.keys(kind)
+            found_in = {k: fetcher.attesting(unit, forms, kind, k, words) for k in sorted(extra)} if fetcher else {}
+            for k, where in found_in.items():
+                if where is not None:
+                    # stated in the same calculation: judged and shown with that evidence, not removed
+                    if where not in unit.ids:
+                        unit.ids.append(where)
+                    problems.append(MeaningProblem(
+                        written, kind, f"{KIND_LABELS[kind]} \"{display(claimed.found[kind][k])}\" של {written} נכתב "
+                        f"ב-{where}; צטט אותו", blocking=False, cite=where, needs_citation=True))
+            extra = {k for k in extra if found_in.get(k) is None}
             if extra:
                 said = claimed.found[kind][sorted(extra)[0]]
                 problems.append(MeaningProblem(
                     written, kind, f"התשובה מייחסת ל-{written} {KIND_LABELS[kind]} \"{display(said)}\" שלא נכתב לגבי ערך זה "
                     "במקור; אין להוסיף תקופה או בסיס שטח שלא נכתבו", blocking=True))
-        # missing: what every closest occurrence attaches to the number, and the unit does not say at all
+        # missing: what every closest occurrence attaches to the number, and the unit does not say at all; when the
+        # cited passage does not say it, the table or section around it may (a basis in the table's area row)
         closest = _closest(occurrences, words)
+        expanded = fetcher.expanded_occurrences(unit, forms) if fetcher else []
         for kind in ("basis", "period", "approx"):
+            cite = None
             if not all(o.qualifiers.keys(kind) for o in closest):
+                if kind == "approx" or not expanded:
+                    continue
+                near = _closest([o for o, _ in expanded], words)
+                if not near or not all(o.qualifiers.keys(kind) for o in near):
+                    continue
+                if (kind == "basis" and whole.keys("basis")) or (kind == "period" and whole.keys("period")):
+                    continue
+                values = {tuple(sorted(o.qualifiers.found[kind])) for o in near}
+                if len(values) != 1:
+                    continue
+                cite = fetcher.adopt(next(src for o, src in expanded if o is near[0]))
+                o = near[0]
+                keys = tuple(sorted(o.qualifiers.found[kind]))
+                as_written = PERIOD_TEXT[keys[0]] if kind == "period" else display(" ".join(o.qualifiers.found[kind].values()))
+                if cite not in unit.ids:
+                    unit.ids.append(cite)
+                problems.append(MeaningProblem(
+                    written, kind, f"למספר {written} חסר {KIND_LABELS[kind]} כפי שנכתב ב-{cite} (\"{as_written}\"); "
+                    f"כתוב אותו ליד המספר וצטט את {cite}", blocking=False, annotation=as_written, cite=cite))
                 continue
             if kind == "approx":
                 if claimed.keys("approx") or approx_anywhere:

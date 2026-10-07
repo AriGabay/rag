@@ -136,9 +136,12 @@ class Problem:
     unit: Unit
     reason: str
     severity: Literal["error", "partial"] = "error"
-    kind: str = "claim"  # "missing_qualifier": the number's evidence gives it a qualifier the unit omits
+    # "missing_qualifier": the number's evidence gives it a qualifier the unit omits; "needs_citation": the unit is
+    # supported by evidence the server found in the same calculation (``cite``), which the answer must cite
+    kind: str = "claim"
     number: str | None = None  # for a missing qualifier: the number as written in the unit
     annotation: str | None = None  # for a missing qualifier: the one qualifier attested, as written
+    cite: str | None = None  # the source or measurement the server found that states the qualifier
 
     @property
     def annotatable(self) -> bool:
@@ -147,7 +150,7 @@ class Problem:
     @property
     def removes_unit(self) -> bool:
         """The unit is removed for it (a qualifier the server can write in, or a request mismatch, is not)."""
-        return self.severity == "error" and not self.annotatable and self.kind != "request"
+        return self.severity == "error" and not self.annotatable and self.kind not in ("request", "needs_citation")
 
     def as_dict(self) -> dict:
         return {"text": self.unit.raw[:300], "reason": self.reason, "severity": self.severity, "kind": self.kind}
@@ -162,7 +165,8 @@ class VerifyReport:
 
     @property
     def ok(self) -> bool:
-        return not self.problems
+        # a citation the server adds itself needs no repair round
+        return all(p.kind == "needs_citation" for p in self.problems)
 
     def counts(self) -> dict:
         """What the user's normal path shows of verification (the removed text is diagnostics)."""
@@ -181,7 +185,9 @@ class VerifyReport:
         partial = {p.unit.index for p in self.problems if p.severity == "partial"}
         notes = [p for p in self.problems if p.annotatable and p.unit.index not in errors]
         requests = [p.reason for p in self.problems if p.kind == "request"]
-        if not errors and not partial and not notes and not requests:
+        cites = [p for p in self.problems if p.kind == "needs_citation" and p.cite and p.unit.index not in errors
+                 and f"[{p.cite}]" not in p.unit.raw]
+        if not errors and not partial and not notes and not requests and not cites:
             return answer
         # a failed table header takes its whole table: a separator and rows without their header are no table
         cuts = [u.table_span if (u.table_header and u.table_span) else (u.start, u.end)
@@ -195,7 +201,14 @@ class VerifyReport:
         for p in notes:
             at = _after_number(p.unit, p.number or "")
             if at is not None and not any(a <= at < b for a, b in cuts):
-                edits.append((at, at, f" ({p.annotation}, כפי שנכתב במקור)"))
+                cite = f" [{p.cite}]" if p.cite and f"[{p.cite}]" not in p.unit.raw else ""
+                edits.append((at, at, f" ({p.annotation}, כפי שנכתב במקור{cite})"))
+        # evidence the server found in the same calculation is cited with the unit it supports
+        for u_index, ids in _cites_by_unit(cites).items():
+            u = next(x for x in self.units if x.index == u_index)
+            at = _citation_point(answer.answer_markdown, u)
+            if not any(a <= at < b for a, b in cuts):
+                edits.append((at, at, "".join(f"[{i}]" for i in ids)))
         # edit by span, last first, so earlier spans stay valid and no edit depends on matching text again
         text = answer.answer_markdown
         done_from = len(text) + 1
@@ -225,6 +238,28 @@ class VerifyReport:
             text += "\n\n> **שימו לב:** " + requests[0] + "."
             status = "partial" if status == "answered" else status
         return answer.model_copy(update={"answer_markdown": text, "claims": claims, "status": status})
+
+
+def _cites_by_unit(problems: list[Problem]) -> dict[int, list[str]]:
+    out: dict[int, list[str]] = {}
+    for p in problems:
+        ids = out.setdefault(p.unit.index, [])
+        if p.cite not in ids:
+            ids.append(p.cite)
+    return out
+
+
+def _citation_point(markdown: str, unit: Unit) -> int:
+    """Where a citation joins a unit: after its last citation, else before its final punctuation."""
+    span = markdown[unit.start:unit.end]
+    last = list(_IDS.finditer(span))
+    if last:
+        return unit.start + last[-1].end()
+    stripped = span.rstrip()
+    end = unit.start + len(stripped)
+    while end > unit.start and markdown[end - 1] in ".:;!?":
+        end -= 1
+    return end
 
 
 _AFTER_NUMBER = re.compile(r"\s*(?:₪|ש[\"״]ח)?(?:\s*ל?מ[\"״]ר)?")
@@ -622,7 +657,10 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     for the repair round, and a note on the final answer. Raises ``VerificationUnavailable``."""
     units = split_units(answer.answer_markdown)
     report = VerifyReport(units)
-    meanings = {u.index: meaning.check(u, ws) for u in units}
+    # the meaning check first: evidence it finds in the same calculation joins the unit's citations, so the number
+    # check and the judge read the unit with it
+    fetcher = meaning.Fetcher(ws)
+    meanings = {u.index: meaning.check(u, ws, fetcher) for u in units}
     report.problems = deterministic(units, ws, question, meanings)
     failed = {p.unit.index for p in report.problems}
     # a missing qualifier does not keep the unit from the judge: it is annotated only if the unit is supported
@@ -630,9 +668,11 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         if u.index in failed:
             continue
         for m in meanings[u.index]:
-            if not m.blocking:
+            if m.needs_citation:
+                report.problems.append(Problem(u, m.reason, kind="needs_citation", cite=m.cite))
+            elif not m.blocking:
                 report.problems.append(Problem(u, m.reason, kind="missing_qualifier", number=m.number,
-                                               annotation=m.annotation))
+                                               annotation=m.annotation, cite=m.cite))
     if mismatch:
         report.problems.append(Problem(Unit(-1, "", "", []), f"התשובה אינה מציגה את הנתון שהתבקש: {mismatch}",
                                        kind="request"))
