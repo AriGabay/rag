@@ -3954,14 +3954,325 @@ def write_blocks(out: Path, font_dir: Path) -> None:
     print(f"wrote {BLOCKS_DIR}/B2_synthetic_pictures.pdf ({len(data):,} bytes)")
 
 
+# --------------------------------------------------------------------------- uncovered regions (regions/)
+
+REGIONS_DIR = "regions"
+# An invented rent survey: drawn into pictures, never into the text layer.
+REGION_TABLE_HEADERS = ["אזור", "שטח (מ״ר)", "דמי שכירות (₪)", "תפוסה"]
+REGION_TABLE_ROWS = [
+    ["צפון", "1,250", "48,600", "92.5%"],
+    ["מרכז", "2,340", "97,350", "88.0%"],
+    ["דרום", "1,880", "61,420", "95.5%"],
+    ["מערב", "960", "33,780", "79.5%"],
+]
+REGION_TABLE_NOTE = "(*) הנתונים בדויים ולצורך הדגמה בלבד."
+VECTOR_TEXT_LINES = ["שטח המגרש 1,450 מ״ר", "שווי הקרקע 3,780,000 ₪"]
+
+
+def _pil_font(font_dir: Path, px: int, bold: bool = False):
+    from PIL import ImageFont
+
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    return ImageFont.truetype(str(font_dir / name), px, layout_engine=ImageFont.Layout.BASIC)
+
+
+def _draw_centered(draw, box: tuple[int, int, int, int], text: str, font, fill=(0, 0, 0)) -> None:
+    visual = to_visual(text)
+    x0, y0, x1, y1 = box
+    left, top, right, bottom = draw.textbbox((0, 0), visual, font=font)
+    draw.text(((x0 + x1 - (right - left)) / 2 - left, (y0 + y1 - (bottom - top)) / 2 - top), visual, font=font,
+              fill=fill)
+
+
+def raster_table(font_dir: Path, size: tuple[int, int], font_px: int, line: int):
+    """A ruled table drawn as a picture: header row shaded, columns right to left (logical order)."""
+    from PIL import Image, ImageDraw
+
+    w, h = size
+    img = Image.new("RGB", (w, h), "white")
+    draw = ImageDraw.Draw(img)
+    rows = [REGION_TABLE_HEADERS, *REGION_TABLE_ROWS]
+    row_h = h // len(rows)
+    col_w = w // len(REGION_TABLE_HEADERS)
+    draw.rectangle((0, 0, w - 1, row_h), fill=(225, 225, 225))
+    for r, cells in enumerate(rows):
+        font = _pil_font(font_dir, font_px, bold=r == 0)
+        for c, cell in enumerate(cells):
+            x1 = w - c * col_w
+            _draw_centered(draw, (x1 - col_w, r * row_h, x1, (r + 1) * row_h), cell, font)
+    for r in range(len(rows) + 1):
+        y = min(r * row_h, h - line)
+        draw.rectangle((0, y, w - 1, y + line - 1), fill="black")
+    for c in range(len(REGION_TABLE_HEADERS) + 1):
+        x = min(c * col_w, w - line)
+        draw.rectangle((x, 0, x + line - 1, h - 1), fill="black")
+    return img
+
+
+def raster_logo(font_dir: Path):
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (440, 66), "white")
+    draw = ImageDraw.Draw(img)
+    draw.ellipse((376, 5, 432, 61), fill=(30, 90, 160))
+    _draw_centered(draw, (8, 0, 368, 66), "משרד שמאות לדוגמה", _pil_font(font_dir, 30, bold=True), (30, 90, 160))
+    return img
+
+
+def raster_watermark():
+    """A light emblem drawn without text, tiled under the body text the way some producers stamp every page."""
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (200, 250), "white")
+    draw = ImageDraw.Draw(img)
+    draw.ellipse((20, 45, 180, 205), outline=(200, 200, 200), width=6)
+    draw.polygon([(100, 70), (122, 135), (178, 135), (132, 168), (150, 230), (100, 192), (50, 230), (68, 168),
+                  (22, 135), (78, 135)], outline=(205, 205, 205), width=4)
+    return img
+
+
+def raster_stamp(font_dir: Path):
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (240, 110), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((3, 3, 236, 106), outline=(20, 40, 150), width=4)
+    _draw_centered(draw, (8, 8, 232, 56), "שמאי מקרקעין", _pil_font(font_dir, 24, bold=True), (20, 40, 150))
+    _draw_centered(draw, (8, 56, 232, 102), "רישיון 4821", _pil_font(font_dir, 22), (20, 40, 150))
+    return img
+
+
+def raster_photo(seed: int):
+    """A continuous-tone picture without text (a stand-in for a photograph of a building)."""
+    from PIL import Image
+
+    rng = random.Random(seed)
+    img = Image.new("RGB", (300, 200))
+    px = img.load()
+    for y in range(200):
+        for x in range(300):
+            base = 90 + (x * 120) // 300 + (y * 40) // 200
+            n = rng.randrange(-25, 26)
+            px[x, y] = (min(255, base + n), min(255, base // 2 + 60 + n), max(0, 200 - base // 2 + n))
+    return img
+
+
+class _GlyphPen:
+    """fontTools pen drawing a glyph outline into an fpdf2 path (points, y down)."""
+
+    def __init__(self, path, scale: float, x: float, baseline: float):
+        from fontTools.pens.basePen import BasePen
+
+        outer = self
+
+        class Pen(BasePen):
+            def _moveTo(self, pt):
+                outer.path.move_to(*outer.at(pt))
+
+            def _lineTo(self, pt):
+                outer.path.line_to(*outer.at(pt))
+
+            def _curveToOne(self, p1, p2, p3):
+                outer.path.curve_to(*outer.at(p1), *outer.at(p2), *outer.at(p3))
+
+            def _qCurveToOne(self, p1, p2):
+                outer.path.quadratic_curve_to(*outer.at(p1), *outer.at(p2))
+
+            def _closePath(self):
+                outer.path.close()
+
+        self.path, self.scale, self.x, self.baseline = path, scale, x, baseline
+        self.pen_class = Pen
+
+    def at(self, pt) -> tuple[float, float]:
+        return self.x + pt[0] * self.scale, self.baseline - pt[1] * self.scale
+
+
+class RegionsPdfRenderer(BlocksPdfRenderer):
+    """Synthetic reproductions of page content the text layer does not cover: a raster table under a valid text
+    layer, a low-resolution raster table, a logo and a watermark repeated on every page, a searchable scan (a page
+    image with an invisible text layer), a ruled vector table with a dark header, vector text drawn as outlines
+    (no text layer) and a small stamp next to a photograph. Every value is invented."""
+
+    def __init__(self, font_dir: Path) -> None:
+        super().__init__(font_dir)
+        self.font_dir = font_dir
+
+    def picture(self, img, w_mm: float, h_mm: float | None = None, x: float | None = None) -> None:
+        pdf = self.pdf
+        h_mm = h_mm if h_mm is not None else w_mm * img.size[1] / img.size[0]
+        x = pdf.w - pdf.r_margin - w_mm if x is None else x
+        pdf.image(img, x=x, y=pdf.get_y(), w=w_mm, h=h_mm)
+        pdf.set_y(pdf.get_y() + h_mm + 3)
+
+    def render_raster_table(self) -> bytes:
+        """R1: ten pages, each with the same logo and two watermark tiles under the text; page 1 also holds a raster
+        table between two paragraphs."""
+        logo, mark = raster_logo(self.font_dir), raster_watermark()
+        table = raster_table(self.font_dir, (1400, 420), 30, 3)
+        pdf = self.pdf
+        for page in range(1, 11):
+            pdf.add_page()
+            pdf.image(logo, x=pdf.w - pdf.r_margin - 60, y=10, w=60)
+            pdf.image(mark, x=40, y=120, w=50)
+            pdf.image(mark, x=120, y=120, w=50)
+            pdf.set_y(28)
+            if page == 1:
+                self._line("1. סקר דמי שכירות", size=12.5, bold=True, h=8)
+                self.paragraph("להלן נתוני דמי השכירות שנאספו באזורי העיר:")
+                self.picture(table, 170)
+                self.note(REGION_TABLE_NOTE)
+                pdf.ln(2)
+                self.paragraph("הנתונים מלמדים על ביקוש יציב לשטחי מסחר בכל אזורי העיר.")
+            else:
+                self._line(f"{page}. פרק לדוגמה {page}", size=12.5, bold=True, h=8)
+                pdf.set_y(125)
+                for _ in range(3):
+                    self.paragraph("פסקה זו נכתבה לצורך הדגמה בלבד ואינה מתייחסת לנכס אמיתי. כל השמות והמספרים בה "
+                                   "בדויים, והיא מודפסת מעל סימן מים שחוזר בכל עמוד.")
+        return bytes(pdf.output())
+
+    def render_lowres_table(self) -> bytes:
+        """R2: the same logo, and a raster table drawn at about 90 dpi over most of the page width."""
+        pdf = self.pdf
+        pdf.add_page()
+        pdf.image(raster_logo(self.font_dir), x=pdf.w - pdf.r_margin - 60, y=10, w=60)
+        pdf.set_y(28)
+        self._line("1. נתוני שוק", size=12.5, bold=True, h=8)
+        self.paragraph("להלן סיכום נתוני השוק כפי שהתקבל מהלקוח:")
+        self.picture(raster_table(self.font_dir, (600, 300), 13, 1), 170, 85)
+        self.paragraph("הטבלה צורפה כתמונה ברזולוציה נמוכה.")
+        return bytes(pdf.output())
+
+    def _scan_text(self) -> None:
+        self._line("1. תיאור הסביבה", size=12.5, bold=True, h=8)
+        for _ in range(4):
+            self.paragraph("הנכס ממוקם ברחוב שקט באזור מגורים ותיק. בסביבה מבני מגורים בני ארבע קומות, גני ילדים "
+                           "ומרכז מסחרי קטן במרחק הליכה.")
+
+    def render_searchable_scan(self) -> bytes:
+        """R3: a page image (the page rendered at 200 dpi) with the same text laid over it invisibly."""
+        import pypdfium2 as pdfium
+        from fpdf.enums import TextMode
+
+        plain = RegionsPdfRenderer(self.font_dir)
+        plain.pdf.add_page()
+        plain._scan_text()
+        doc = pdfium.PdfDocument(bytes(plain.pdf.output()))
+        image = doc[0].render(scale=200 / 72, grayscale=True).to_pil().convert("L")
+        doc.close()
+        pdf = self.pdf
+        pdf.add_page()
+        pdf.image(image, x=0, y=0, w=pdf.w, h=pdf.h)
+        pdf.text_mode = TextMode.INVISIBLE
+        pdf.set_y(pdf.t_margin)
+        self._scan_text()
+        pdf.text_mode = TextMode.FILL
+        return bytes(pdf.output())
+
+    def render_vector_table(self) -> bytes:
+        """R4: a ruled table with a dark header row (white text), a heading underline and bullet marks."""
+        pdf = self.pdf
+        pdf.add_page()
+        self._line("1. פירוט השטחים", size=12.5, bold=True, h=8)
+        pdf.set_draw_color(0, 0, 0)
+        pdf.line(pdf.w - pdf.r_margin - 45, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
+        pdf.ln(3)
+        for item in ("קומת קרקע: מסחר", "קומות עליונות: משרדים"):
+            pdf.circle(x=pdf.w - pdf.r_margin - 1.5, y=pdf.get_y() + 3, radius=0.8, style="F")
+            self._line(item + "   ")
+        self.paragraph("להלן פירוט השטחים לפי קומות:")
+        pdf.set_fill_color(60, 60, 60)
+        pdf.set_text_color(255, 255, 255)
+        self._grow(["קומה", "שימוש", "שטח (מ״ר)"], self.WIDTHS, bold=True)
+        pdf.set_text_color(0, 0, 0)
+        for row in (["קרקע", "מסחר", "420"], ["1", "משרדים", "380"], ["2", "משרדים", "380"]):
+            self._grow(row, self.WIDTHS)
+        pdf.ln(2)
+        self.paragraph("סך השטחים הבנויים הוא 1,180 מ״ר.")
+        return bytes(pdf.output())
+
+    def outline_text(self, text: str, size_pt: float, right_mm: float, baseline_mm: float) -> None:
+        """Draw ``text`` as filled glyph outlines (no text object), right-aligned at ``right_mm``."""
+        from fontTools.ttLib import TTFont
+        from fpdf.drawing import PaintedPath
+
+        font = TTFont(str(self.font_dir / "DejaVuSans.ttf"))
+        cmap, glyphs, hmtx = font.getBestCmap(), font.getGlyphSet(), font["hmtx"]
+        scale = (size_pt * 25.4 / 72) / font["head"].unitsPerEm
+        visual = to_visual(text)
+        width = sum(hmtx[cmap[ord(ch)]][0] for ch in visual) * scale
+        x = right_mm - width
+        pdf = self.pdf
+        with pdf.drawing_context() as ctx:
+            path = PaintedPath()
+            path.style.fill_color = "#000000"
+            path.style.stroke_color = None
+            for ch in visual:
+                name = cmap[ord(ch)]
+                pen = _GlyphPen(path, scale, x, baseline_mm)
+                glyphs[name].draw(pen.pen_class(glyphs))
+                x += hmtx[name][0] * scale
+            ctx.add_item(path)
+
+    def render_vector_text(self) -> bytes:
+        """R5: a paragraph with a text layer, then two lines drawn as outlines without any text layer."""
+        pdf = self.pdf
+        pdf.add_page()
+        self._line("1. נתוני המגרש", size=12.5, bold=True, h=8)
+        self.paragraph("נתוני המגרש שלהלן הודפסו כקווי מתאר בלבד, ללא שכבת טקסט:")
+        y = pdf.get_y() + 8
+        for k, line in enumerate(VECTOR_TEXT_LINES):
+            self.outline_text(line, 14, pdf.w - pdf.r_margin, y + k * 9)
+        pdf.set_y(y + len(VECTOR_TEXT_LINES) * 9 + 4)
+        self.paragraph("הנתונים נמסרו על ידי הלקוח.")
+        return bytes(pdf.output())
+
+    def render_stamp_and_photo(self) -> bytes:
+        """R6: a small stamp with text and a photograph without text."""
+        pdf = self.pdf
+        pdf.add_page()
+        self._line("1. חתימה", size=12.5, bold=True, h=8)
+        self.paragraph("חוות הדעת נחתמה כמפורט להלן:")
+        self.picture(raster_stamp(self.font_dir), 30)
+        self._line("2. צילום הנכס", size=12.5, bold=True, h=8)
+        self.picture(raster_photo(5), 60)
+        self.paragraph("הצילום מתאר את חזית הבניין.")
+        return bytes(pdf.output())
+
+
+REGION_FIXTURES = {
+    "R1_synthetic_raster_table.pdf": "render_raster_table",
+    "R2_synthetic_lowres_table.pdf": "render_lowres_table",
+    "R3_synthetic_searchable_scan.pdf": "render_searchable_scan",
+    "R4_synthetic_vector_table.pdf": "render_vector_table",
+    "R5_synthetic_vector_text.pdf": "render_vector_text",
+    "R6_synthetic_stamp_and_photo.pdf": "render_stamp_and_photo",
+}
+
+
+def write_regions(out: Path, font_dir: Path) -> None:
+    rdir = out / REGIONS_DIR
+    rdir.mkdir(parents=True, exist_ok=True)
+    for name, method in REGION_FIXTURES.items():
+        data = getattr(RegionsPdfRenderer(font_dir), method)()
+        (rdir / name).write_bytes(data)
+        print(f"wrote {REGIONS_DIR}/{name} ({len(data):,} bytes)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--font-dir", default=DEFAULT_FONT_DIR)
     parser.add_argument("--out", default="tests/fixtures")
+    parser.add_argument("--only", choices=["all", "regions"], default="all",
+                        help="regions: write only the uncovered-region fixtures (tests/fixtures/regions/)")
     args = parser.parse_args()
     font_dir = Path(args.font_dir)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    if args.only == "regions":
+        write_regions(out, font_dir)
+        return
 
     docs: dict[str, dict[str, Any]] = {}
     facts: list[dict[str, Any]] = []
@@ -4005,6 +4316,7 @@ def main() -> None:
     print(f"wrote ground_truth.yaml ({len(text):,} chars)")
     write_holdout_v2(out, font_dir, reports, layouts)
     write_blocks(out, font_dir)
+    write_regions(out, font_dir)
 
 
 if __name__ == "__main__":

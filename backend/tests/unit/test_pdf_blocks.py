@@ -170,18 +170,25 @@ def test_a_table_continuing_on_the_next_page_is_one_table_with_row_pages():
 
 # --- pictures --------------------------------------------------------------------------------------------------
 
-def test_pictures_become_unread_placeholders_in_reading_order():
-    got = [(b.kind, b.page) for b in blocks(B2)]
+def _pictures_unread(monkeypatch) -> ExtractionResult:
+    """B2 without OCR and without the vision model: its pictures cannot be read (U4 reads them when it can)."""
+    monkeypatch.setattr("app.extraction.ocr.ocr_available", lambda languages: False)
+    return extract_pdf(B2.read_bytes(), time.monotonic() + 600, get_settings())
+
+
+def test_pictures_become_unread_placeholders_in_reading_order(monkeypatch):
+    result = _pictures_unread(monkeypatch)
+    got = [(b.kind, b.page) for b in result.blocks]
     assert got == [("image", 1), ("heading", 1), ("paragraph", 1), ("image", 1), ("paragraph", 1),
                    ("image", 2), ("heading", 2), ("paragraph", 2)]
-    pictures = [b for b in blocks(B2) if b.kind == "image"]
+    pictures = [b for b in result.blocks if b.kind == "image"]
     assert all(b.status == "unread" and b.note and b.bbox and b.content_hash for b in pictures)
     assert pictures[0].content_hash == pictures[2].content_hash != pictures[1].content_hash  # the repeated logo
     assert pictures[1].bbox[0] > 300  # the photo is on the right half of the page, in points
 
 
-def test_a_pdf_with_unread_pictures_is_partly_read():
-    result = read(B2)
+def test_a_pdf_with_unread_pictures_is_partly_read(monkeypatch):
+    result = _pictures_unread(monkeypatch)
     comp = result.components
     assert comp["images"] == {"unread": 3} and comp["partial"] is True
     assert [u["page"] for u in comp["unread"]] == [1, 1, 2]

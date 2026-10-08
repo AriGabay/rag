@@ -13,9 +13,13 @@ The text layer is cleaned before anything reads it:
 - a line whose last letters were drawn on a slightly different baseline is joined back into one line;
 - a page whose words carry no orientation evidence (a title page) takes the orientation of the document.
 
-Pictures on a text-layer page are not read here: each becomes an ``image`` block marked ``unread`` with its
-region and a hash of its image bytes (the same picture on many pages has one hash), so a document with pictures
-is partly read until they are. Validation errors (encrypted, corrupt, too many pages, deadline) raise
+Content the text layer does not cover is found and read by ``app.extraction.regions`` (KTD4, KTD5): image
+objects and vector ink outside the text layer, each read once per content (OCR, or the vision model on a crop at
+legible scale) or reported ``unread`` with its reason, so a document with unread regions is partly read. A region
+becomes an ``image`` block at its place with its region and content hash; a table read from it becomes a table
+(source ``ocr`` or ``vision``) whose rows keep the page, with the text above it as caption and the note lines
+below it as notes. A region the text layer already holds (a searchable scan) becomes no block, and a page whose
+regions added text is ``mixed``. Validation errors (encrypted, corrupt, too many pages, deadline) raise
 ``ExtractionError`` with a Hebrew reason. Document text is content only: nothing in it changes processing (R29).
 """
 
@@ -33,7 +37,15 @@ import pypdfium2 as pdfium
 
 from app.config import Settings
 from app.extraction import ocr
-from app.extraction.base import Block, ExtractionError, ExtractionResult, PageResult, check_deadline
+from app.extraction.base import (
+    Block,
+    ExtractionError,
+    ExtractionResult,
+    PageResult,
+    TableResult,
+    TableRow,
+    check_deadline,
+)
 from app.extraction.chunking import chunk_blocks, heading_label, is_footer
 from app.extraction.hebrew import (
     QUALITY_THRESHOLD,
@@ -42,12 +54,14 @@ from app.extraction.hebrew import (
     page_is_visual,
     quality_score,
 )
-from app.extraction.tables import RawTable, assemble_tables, logical_row
+from app.extraction.images import PictureReading, VisionReader
+from app.extraction.regions import PageLayer, ReadingCache, Region, read_regions
+from app.extraction.tables import RawTable, assemble_tables, logical_row, units_for
 
 log = logging.getLogger(__name__)
 
 # The reader that produced a PDF's blocks; a version read by an older one is reprocessed.
-READER_VERSION = "pdf-blocks-v1"
+READER_VERSION = "pdf-blocks-v2"
 
 MSG_ENCRYPTED = "הקובץ מוגן בסיסמה ולא ניתן לעבד אותו"
 MSG_CORRUPT = "הקובץ פגום או שאינו PDF תקין"
@@ -85,19 +99,16 @@ class _Line:
 
 
 @dataclass
-class _Picture:
-    bbox: list[float]
-    content_hash: str
-
-
-@dataclass
 class _PageOut:
     page: PageResult
     lines: list[_Line]
     tables: list[RawTable]
-    pictures: list[_Picture] = field(default_factory=list)
+    pictures: list[Region] = field(default_factory=list)
+    chars: list[tuple[float, float, float, float]] = field(default_factory=list)  # text-layer character boxes
     raw_undecided: list[str] | None = None  # text-layer lines whose orientation the page alone did not decide
     raw_texts: list[str] = field(default_factory=list)
+    width: float = 0.0  # page size in points
+    height: float = 0.0
 
 
 def open_pdf(data: bytes, max_pages: int) -> pdfium.PdfDocument:
@@ -167,7 +178,7 @@ def _picture_hash(img: dict) -> str | None:
 
 
 def _text_layer(page) -> tuple[list[_Line], list[tuple[list[float], list[list[str]]]], bool | None, list[str],
-                                list[_Picture]]:
+                                list[Region], list[tuple[float, float, float, float]]]:
     page = page.dedupe_chars(tolerance=DEDUPE_TOLERANCE)
     raw_lines = _rejoin(page.extract_text_lines(return_chars=True))
     raw_texts = [ln["text"] for ln in raw_lines]
@@ -192,8 +203,11 @@ def _text_layer(page) -> tuple[list[_Line], list[tuple[list[float], list[list[st
         bbox = [round(float(img[k]), 1) for k in ("x0", "top", "x1", "bottom")]
         digest = _picture_hash(img)
         if digest and bbox[2] > bbox[0] and bbox[3] > bbox[1]:
-            pictures.append(_Picture(bbox, digest))
-    return lines, tables, visual, raw_texts, pictures
+            size = img.get("srcsize")
+            srcsize = (int(size[0]), int(size[1])) if size and size[0] and size[1] else None
+            pictures.append(Region(page.page_number, bbox, "image", digest, srcsize))
+    chars = [(float(c["x0"]), float(c["top"]), float(c["x1"]), float(c["bottom"])) for c in page.chars]
+    return lines, tables, visual, raw_texts, pictures, chars
 
 
 def _mark_table_lines(lines: list[_Line], tables: list[RawTable]) -> None:
@@ -224,16 +238,17 @@ def _process_page(doc, plumber, index: int, settings: Settings, warnings: list[s
     page_no = index + 1
     lines: list[_Line] = []
     tables: list[tuple[list[float], list[list[str]]]] = []
-    pictures: list[_Picture] = []
+    pictures: list[Region] = []
+    chars: list[tuple[float, float, float, float]] = []
     visual: bool | None = None
     raw_texts: list[str] = []
     if plumber is not None:
         page = plumber.pages[index]
         try:
-            lines, tables, visual, raw_texts, pictures = _text_layer(page)
+            lines, tables, visual, raw_texts, pictures, chars = _text_layer(page)
         except Exception:  # noqa: BLE001 - a broken page falls through to OCR
             log.warning("text layer failed on page %s", page_no, exc_info=True)
-            lines, tables, raw_texts, pictures = [], [], [], []
+            lines, tables, raw_texts, pictures, chars = [], [], [], [], []
         finally:
             page.close()
     text = "\n".join(ln.text for ln in lines)
@@ -241,7 +256,7 @@ def _process_page(doc, plumber, index: int, settings: Settings, warnings: list[s
     if quality >= QUALITY_THRESHOLD:
         raws = [RawTable(page_no, rows, ocr=False, top=bbox[1], bbox=bbox) for bbox, rows in tables]
         _mark_table_lines(lines, raws)
-        return _PageOut(PageResult(page_no, text, "text_layer", quality, True), lines, raws, pictures,
+        return _PageOut(PageResult(page_no, text, "text_layer", quality, True), lines, raws, pictures, chars,
                         raw_texts if visual is None else None, raw_texts)
 
     if not ocr.ocr_available(settings.ocr_languages):
@@ -289,7 +304,9 @@ class _Walker:
     raws: list[RawTable] = field(default_factory=list)
     table_raw: dict[int, RawTable] = field(default_factory=dict)  # table block index -> its piece
     captions: dict[int, str] = field(default_factory=dict)  # id(raw) -> caption
-    notes: dict[int, list[str]] = field(default_factory=dict)  # id(raw) -> note lines under it
+    notes: dict[int, list[str]] = field(default_factory=dict)  # id(raw or region) -> note lines under it
+    pictures: dict[int, tuple[Region, PictureReading, str]] = field(default_factory=dict)  # image block -> reading
+    repeated: set = field(default_factory=set)  # (page, hash) of a picture without text already placed
     path: list[str] = field(default_factory=list)
     labels: list[str] = field(default_factory=list)
     last_text: str = ""
@@ -325,7 +342,7 @@ class _Walker:
             items.append((pic.bbox[1], 0, pic))
         items.sort(key=lambda x: (x[0], x[1]))
         para: list[_Line] = []
-        notes_of: RawTable | None = None
+        notes_of: RawTable | Region | None = None
         notes_bottom = 0.0
 
         def flush() -> None:
@@ -350,11 +367,21 @@ class _Walker:
                 self.raws.append(item)
                 notes_of, notes_bottom = (item, item.bbox[3]) if item.bbox else (None, 0.0)
                 continue
-            if isinstance(item, _Picture):
+            if isinstance(item, Region):
+                if item.covered:
+                    continue  # the text layer holds it
+                r = item.reading or PictureReading("unread", "none", note=NOTE_NOT_READ)
+                if r.status in ("no_text", "decorative"):
+                    # a watermark or emblem repeated on the page: one block for it per page
+                    if (page_no, item.content_hash) in self.repeated:
+                        continue
+                    self.repeated.add((page_no, item.content_hash))
                 flush()
-                self.add("image", "", page_no, item.bbox, "none", source="none", status="unread",
-                         note=NOTE_NOT_READ, content_hash=item.content_hash)
-                notes_of = None
+                b = self.add("image", "", page_no, item.bbox, r.method, source=r.method, status=r.status,
+                             note=r.note, content_hash=item.content_hash)
+                b.picture_text = r.text
+                self.pictures[b.index] = (item, r, _caption(self.last_text))
+                notes_of, notes_bottom = (item, item.bbox[3]) if r.tables else (None, 0.0)
                 continue
             ln: _Line = item
             text = ln.text.strip()
@@ -405,6 +432,22 @@ class _Walker:
         for t in tables:
             if t.block_index is not None:
                 kept[t.block_index].text = render_table(t)
+        for old, (region, reading, caption) in sorted(self.pictures.items()):
+            b = kept[renumber[old]]
+            texts = [reading.text] if reading.text else []
+            extra = self.notes.get(id(region), [])
+            for k, pt in enumerate(reading.tables):
+                t = TableResult(index=len(tables), headers=pt.headers, units=units_for(pt.headers),
+                                rows=[TableRow(page=b.page, cells=cells) for cells in pt.rows], page_start=b.page,
+                                page_end=b.page, ocr=True, section=b.section, source=reading.method,
+                                caption=caption or None, title=list(pt.title),
+                                notes=list(pt.notes) + (extra if k == len(reading.tables) - 1 else []),
+                                block_index=b.index)
+                tables.append(t)
+                if b.table_index is None:
+                    b.table_index = t.index
+                texts.append("\n".join(x for x in [*t.title, render_table(t)] if x))
+            b.text = "\n".join(x for x in texts if x)
         return kept, tables
 
 
@@ -431,7 +474,41 @@ def _breaks(prev: _Line, ln: _Line, para: list[_Line]) -> bool:
     return abs(prev.size - ln.size) > 0.2 * max(prev.size, ln.size, 1.0)
 
 
-def extract_pdf(data: bytes, deadline: float, settings: Settings) -> ExtractionResult:
+def _layers(outs: list[_PageOut]) -> list[PageLayer]:
+    """The pages read from their text layer, with their pictures, for region reading."""
+    layers = []
+    for k, o in enumerate(outs):
+        if o.page.method != "text_layer" or not o.page.ok:
+            continue
+        for pic in o.pictures:
+            pic.page = o.page.page_no
+        layers.append(PageLayer(index=k, width=o.width, height=o.height, chars=o.chars,
+                                lines=[(ln.bbox, ln.text) for ln in o.lines if ln.bbox], regions=o.pictures))
+    return layers
+
+
+def _region_text(r: PictureReading) -> str:
+    rows = [" | ".join(c for c in row if c) for t in r.tables for row in [t.headers, *t.rows]]
+    return "\n".join(x for x in [r.text, *rows] if x.strip())
+
+
+def _merge_region_text(out: _PageOut) -> None:
+    """A page whose regions added text: its text holds them at their place and its method is ``mixed``."""
+    found = [(pic.bbox[1], _region_text(pic.reading)) for pic in out.pictures
+             if not pic.covered and pic.reading is not None and pic.reading.status in ("read", "read_uncertain")]
+    found = [(top, t) for top, t in found if t]
+    if not found:
+        return
+    items = [(ln.top, ln.text) for ln in out.lines] + found
+    items.sort(key=lambda x: x[0])
+    out.page.text = "\n".join(t for _, t in items)
+    out.page.method = "mixed"
+
+
+def extract_pdf(data: bytes, deadline: float, settings: Settings, vision: VisionReader | None = None,
+                readings: ReadingCache | None = None) -> ExtractionResult:
+    """``vision``: the office's vision reader (None: OCR only). ``readings``: the office's earlier readings of
+    region content (``image_readings``), consulted and filled by region reading."""
     doc = open_pdf(data, settings.max_pages)
     warnings: list[str] = []
     try:
@@ -444,20 +521,26 @@ def extract_pdf(data: bytes, deadline: float, settings: Settings) -> ExtractionR
             outs: list[_PageOut] = []
             for index in range(len(doc)):
                 check_deadline(deadline)
-                outs.append(_process_page(doc, plumber, index, settings, warnings))
+                out = _process_page(doc, plumber, index, settings, warnings)
+                pdf_page = doc[index]
+                out.width, out.height = pdf_page.get_size()
+                pdf_page.close()
+                outs.append(out)
         finally:
             if plumber is not None:
                 plumber.close()
         page_count = len(doc)
+        _orient_undecided_pages(outs)
+        read_regions(doc, data, _layers(outs), settings, vision, readings, deadline)
     finally:
         doc.close()
 
-    _orient_undecided_pages(outs)
     walker = _Walker()
     for out in outs:
         for k, raw in enumerate(sorted(out.tables, key=lambda t: t.top)):
             raw.first_on_page = k == 0
         if out.page.ok:
+            _merge_region_text(out)
             walker.page(out)
     blocks, tables = walker.finish()
     pages = [o.page for o in outs]

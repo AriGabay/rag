@@ -4,7 +4,10 @@ Stages run in the worker under the job's office with role ``system``:
 
 1. extract  — pages, tables, chunks. One transaction: delete this version's prior outputs, insert.
               A version whose file already exists (processed) in a group the uploader cannot see
-              clones those outputs instead of re-running OCR and indexing.
+              clones those outputs instead of re-running OCR and indexing. Picture content already read in
+              another document of the office is taken from ``image_readings`` (``ImageReadingStore``).
+              A vision failure that is transient or a configuration error fails the job before anything is
+              written, so the version keeps its earlier reading.
 2. embed    — vectors for chunks without one for the active model.
 3. publish  — facts, validation, dedup, version status and data-version bump, in one transaction.
 
@@ -14,6 +17,8 @@ becomes ``ready``/``needs_review`` only in the publish transaction, never in bet
 
 from __future__ import annotations
 
+import dataclasses
+import inspect
 import json
 import logging
 import time
@@ -242,18 +247,53 @@ def extract_stage(ctx: TenantContext, info: VersionInfo, deadline: float) -> Non
     from app.platform.storage import get_storage
 
     data = get_storage().get(info.storage_key)
-    result = _extract(data, info.mime_type, deadline, vision_reader(ctx))
+    result = _extract(data, info.mime_type, deadline, vision_reader(ctx), ImageReadingStore(ctx))
     with tenant_tx(ctx) as conn:
         persist_extraction(conn, info, result)
 
 
-def _extract(data: bytes, mime_type: str, deadline: float, vision) -> ExtractionResult:
+def _extract(data: bytes, mime_type: str, deadline: float, vision, readings=None) -> ExtractionResult:
     from app.extraction.pipeline import get_extractor
 
     extractor = get_extractor()
-    if vision is None:  # extractors written before pictures were read by the vision model take no reader
-        return extractor.extract(data, mime_type, deadline)
-    return extractor.extract(data, mime_type, deadline, vision=vision)
+    kwargs = {}
+    if vision is not None:  # extractors written before pictures were read by the vision model take no reader
+        kwargs["vision"] = vision
+    if readings is not None and "readings" in inspect.signature(extractor.extract).parameters:
+        kwargs["readings"] = readings
+    return extractor.extract(data, mime_type, deadline, **kwargs)
+
+
+class ImageReadingStore:
+    """The office's readings of picture content (``image_readings``, KTD5), for region reading during ingestion
+    only: every access runs under the office's system context, which the table's policies require."""
+
+    def __init__(self, ctx: TenantContext):
+        self.ctx = ctx
+
+    def get(self, key):
+        from app.extraction.images import PictureReading, PictureTable
+
+        with tenant_tx(self.ctx) as conn:
+            row = conn.execute(text(
+                "SELECT reading FROM image_readings WHERE content_hash = :h AND reader_version = :r"
+                " AND model_config = :m AND crop_scale = :c"),
+                {"h": key.content_hash, "r": key.reader_version, "m": key.model_config, "c": key.crop_scale}).first()
+        if row is None:
+            return None
+        data = dict(row.reading)
+        data["tables"] = [PictureTable(**t) for t in data.get("tables") or []]
+        return PictureReading(**data)
+
+    def put(self, key, reading) -> None:
+        with tenant_tx(self.ctx) as conn:
+            conn.execute(text(
+                "INSERT INTO image_readings (office_id, content_hash, reader_version, model_config, crop_scale,"
+                " status, reading) VALUES (app_office(), :h, :r, :m, :c, :s, CAST(:g AS jsonb))"
+                " ON CONFLICT (office_id, content_hash, reader_version, model_config, crop_scale)"
+                " DO UPDATE SET status = EXCLUDED.status, reading = EXCLUDED.reading, updated_at = now()"),
+                {"h": key.content_hash, "r": key.reader_version, "m": key.model_config, "c": key.crop_scale,
+                 "s": reading.status, "g": json.dumps(dataclasses.asdict(reading), ensure_ascii=False)})
 
 
 def vision_reader(ctx: TenantContext):
@@ -367,7 +407,8 @@ def reindex_version(office_id: UUID, version_id: UUID) -> str | None:
     if row is None:
         return None
     info = VersionInfo(row.id, row.document_id, row.storage_key, row.mime_type, None)
-    result = _extract(get_storage().get(info.storage_key), info.mime_type, deadline, vision_reader(ctx))
+    result = _extract(get_storage().get(info.storage_key), info.mime_type, deadline, vision_reader(ctx),
+                      ImageReadingStore(ctx))
     with tenant_tx(ctx) as conn:
         for table in _DERIVED_TEXT_TABLES:
             conn.execute(text(f"DELETE FROM {table} WHERE version_id = :v"), {"v": info.id})

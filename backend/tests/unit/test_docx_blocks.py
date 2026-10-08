@@ -128,8 +128,9 @@ def test_without_ocr_and_without_the_model_a_picture_is_unread(monkeypatch):
     assert reading.status == "unread"
 
 
-def test_tiny_pictures_are_decorative():
-    assert read_raster(_png(30, 30), "", None, "heb+eng").status == "decorative"
+def test_only_pictures_too_thin_for_a_glyph_are_decorative():
+    assert read_raster(_png(400, 4), "", None, "heb+eng").status == "decorative"
+    assert read_raster(_png(30, 30), "", None, "heb+eng").status != "decorative"  # small is not decorative (U4)
 
 
 def test_a_reading_that_drops_a_column_of_names_is_retried_carefully_and_kept_uncertain(monkeypatch):

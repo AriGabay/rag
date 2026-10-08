@@ -4,6 +4,11 @@ The model transcribes; it does not interpret. Numbers keep their separators and 
 written in reading order, an empty cell stays empty, and anything it could not read with confidence is listed
 in ``uncertain`` (the reading is then ``read_uncertain``). A drawing, map or photo gets a short description and
 only its legible labels. Every call is logged in ``provider_usage`` under the office.
+
+A call that returns no reading raises ``VisionCallFailed`` with the provider's status, so the caller can tell a
+transient failure (timeout, rate limit, network), a configuration error (key, quota, model) and a deterministic
+one (refusal, invalid or truncated output) apart. ``config`` (model and effort) is part of the key a reading is
+cached by. A PDF region is sent without context: its reading depends on its pixels alone.
 """
 
 from __future__ import annotations
@@ -15,7 +20,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
-from app.extraction.images import VisionOut, VisionTableOut
+from app.extraction.images import VisionCallFailed, VisionOut, VisionTableOut
 from app.providers.llm import CallStatus, Purpose, get_provider, prompt_text
 
 logger = logging.getLogger(__name__)
@@ -68,12 +73,17 @@ class ModelVisionReader:
     def __init__(self, office_id: UUID):
         self.office_id = office_id
         self.provider = get_provider(Purpose.VISION)
+        model = getattr(self.provider, "model", None) or getattr(self.provider, "name", type(self.provider).__name__)
+        self.config = f"{model}:{getattr(self.provider, 'reasoning_effort', None) or 'default'}"
 
-    def read(self, png: bytes, context: str, careful: bool = False) -> VisionOut | None:
+    def read(self, png: bytes, context: str, careful: bool = False) -> VisionOut:
         if not hasattr(self.provider, "structured_image"):
-            return None
-        prompt = ("ההקשר במסמך (הטקסט שלפני התמונה, לעזרה בלבד):\n<context>" + prompt_text(context[:400])
-                  + "</context>\nתמלל את התמונה לפי ההוראות.")
+            raise VisionCallFailed(CallStatus.UNSUPPORTED.value)
+        prompt = ""
+        if context.strip():
+            prompt = ("ההקשר במסמך (הטקסט שלפני התמונה, לעזרה בלבד):\n<context>" + prompt_text(context[:400])
+                      + "</context>\n")
+        prompt += "תמלל את התמונה לפי ההוראות."
         if careful:
             prompt += ("\nקריאה קודמת של התמונה הזו השמיטה תוכן. קרא את כל העמודות, כולל עמודת השמות או האזורים "
                        "שבקצה הטבלה, ואת כל השורות, ובדוק שלכל כותרת יש עמודה משלה.")
@@ -83,7 +93,7 @@ class ModelVisionReader:
         self._log(result)
         if result.status != CallStatus.OK:
             logger.warning("vision reading failed: %s (%s)", result.status, result.detail)
-            return None
+            raise VisionCallFailed(CallStatus(result.status).value, result.detail)
         v: VisionSchema = result.parsed
         return VisionOut(kind=v.kind, legible=v.legible, text=v.text, description=v.description,
                          uncertain=v.uncertain,
