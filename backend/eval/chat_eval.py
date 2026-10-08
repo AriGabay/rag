@@ -8,18 +8,32 @@ Usage::
 The question set is YAML. It may describe real office documents, so the set and the results belong outside
 the repository (``real_documents/`` is ignored by git); the runner holds no document content.
 
-Four separate measures, never folded into one number:
+Separate measures, never folded into one number:
 
-- ``ingestion``: text that must be readable in a document's blocks (what was read from pictures and tables);
-- ``retrieval``: for a search query, a text that must be among the top passages;
+- ``ingestion``: a value read where the document puts it (``eval.scoring.structure_check``): an item names
+  ``document``, ``value`` and, for a table, ``row`` and ``column`` (and ``table``, a caption, title or heading
+  fragment), or for prose a ``heading`` and ``near`` text; ``unit`` and ``page`` when given. The same number in
+  another row or column fails;
+- ``ingestion_text``: the legacy layer, ``must_read`` texts that must appear anywhere in a document's blocks;
+- ``retrieval``: for a search query, every text of ``expect_all`` (or the one ``expect``) among the top ``k``
+  passages, with the rank of each and the missing ones named;
 - ``meaning``: stored measurements that must carry the stated kind, period, VAT, area basis or form;
-- ``answers``: conversations. Each turn's answer is checked in two layers, reported separately: the regression
+- ``answers``: conversations. Each turn's answer is checked in three layers, reported separately: the regression
   layer (``must`` / ``must_not`` regular expressions, allowed answer statuses, the documents its sources must and
-  must not come from) and the structured layer (``eval.scoring``: required documents, value sets, the meaning
-  and attribution of values, coverage and hedging), which fails answers that only contain the right words.
+  must not come from), the structured layer (``eval.scoring``: required documents, value sets, the meaning
+  and attribution of values, coverage and hedging), which fails answers that only contain the right words, and
+  the calculation layer (``calc: [{value, precision}]``: a result shown at the stated precision).
 
-``--rescore <results.json>`` grades stored answers again with the set's current expectations (no model calls),
-so two runs can be compared on the same answers and expectations.
+Every run records what it ran against (a ``run`` record first in the results): the checkout's commit (``git
+rev-parse``, with whether the tree had changes) or the ``--build`` given, the backend image id given with
+``--image``, and for each document used (checked, or cited by an answer) its ``ingestion_version`` and
+``reading_id``. The documents that ingestion items check keep their blocks there too, as evidence. The report
+adds the model seen per purpose in the calls' usage.
+
+``--rescore <results.json>`` grades stored results again with the set's current expectations (no model calls, no
+stack): answers from their stored payload, ingestion from the stored blocks, retrieval from the stored passages,
+so two runs can be compared on the same answers and expectations. A stored result without its evidence (from a
+run before it was kept) is kept as it was.
 
 A reference answer found wrong is corrected in the set, not silently: the turn keeps the original expectation in
 ``reference_corrected: {date, evidence, was}`` beside the corrected ``expect``. Every run and rescore grades such
@@ -35,6 +49,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -43,8 +58,8 @@ from pathlib import Path
 import httpx
 import yaml
 
+from eval.scoring import calc_check, norm, retrieval_check, structure_check
 from eval.scoring import check as structured_check
-from eval.scoring import norm
 
 POLL_SECONDS = 1.5
 TURN_TIMEOUT = 300
@@ -81,30 +96,80 @@ def find_doc(docs: dict[str, dict], needle: str) -> dict | None:
     return None
 
 
-def check_ingestion(c: httpx.Client, docs: dict, items: list[dict]) -> list[Result]:
+# what a block keeps as evidence for a rescore: its place, status, text and table structure
+EVIDENCE_KEYS = ("index", "kind", "page", "section", "section_path", "status", "text", "table")
+
+
+def doc_info(d: dict, reading_id: str | None, blocks: list[dict] | None = None) -> dict:
+    """A document used by the run: its current version, the ingestion version and reading it was answered from,
+    and (for documents that ingestion items check) its blocks as evidence."""
+    v = d["current_version"]
+    info = {"id": d["id"], "title": d["title"], "version_id": v["id"],
+            "ingestion_version": (v.get("reading") or {}).get("ingestion_version"), "reading_id": reading_id}
+    if blocks is not None:
+        info["blocks"] = [{k: b.get(k) for k in EVIDENCE_KEYS} for b in blocks]
+    return info
+
+
+def fetch_blocks(c: httpx.Client, d: dict, *, first_only: bool = False) -> tuple[list[dict], str | None]:
+    """A document's current blocks in reading order, page by page of the endpoint's window, and its reading id;
+    ``first_only``: one block, for the reading id alone."""
+    url = f"/api/documents/{d['id']}/versions/{d['current_version']['id']}/blocks"
+    blocks: list[dict] = []
+    start, reading_id = 0, None
+    while True:
+        r = c.get(url, params={"start": start, "end": 0 if first_only else 1_000_000}).json()
+        reading_id = r.get("reading_id")
+        window = r.get("blocks") or []
+        blocks += window
+        if first_only or not window or len(blocks) >= (r.get("total") or 0):
+            return blocks, reading_id
+        start = window[-1]["index"] + 1
+
+
+def grade_ingestion(it: dict, info: dict | None) -> list[Result]:
+    """One ingestion item against a document's blocks: the structural check when it names a value, the legacy
+    text check when it has ``must_read``; each its own result."""
+    layers = [k for k, on in (("ingestion", "value" in it), ("ingestion_text", bool(it.get("must_read")))) if on]
+    if info is None:
+        return [Result(k, it["id"], False, ["המסמך לא נמצא"], {"layer": "structure"} if k == "ingestion" else {})
+                for k in layers]
+    blocks = info.get("blocks") or []
+    meta = {"document_id": info["id"], "reading_id": info.get("reading_id")}
+    out = []
+    if "ingestion" in layers:
+        problems = structure_check(blocks, it)
+        out.append(Result("ingestion", it["id"], not problems, problems, meta | {"layer": "structure"}))
+    if "ingestion_text" in layers:
+        text = norm("\n".join(b.get("text") or "" for b in blocks))
+        missing = [t for t in it["must_read"] if norm(t) not in text]
+        out.append(Result("ingestion_text", it["id"], not missing, [f"לא נקרא: {m}" for m in missing], meta))
+    return out
+
+
+def check_ingestion(c: httpx.Client, docs: dict, items: list[dict], used: dict[str, dict]) -> list[Result]:
+    """``used``: the run's documents by id, filled here with the blocks of every document an item checks."""
     out = []
     for it in items:
         d = find_doc(docs, it["document"])
-        if d is None:
-            out.append(Result("ingestion", it["id"], False, ["המסמך לא נמצא"]))
-            continue
-        v = d["current_version"]
-        blocks = c.get(f"/api/documents/{d['id']}/versions/{v['id']}/blocks").json()["blocks"]
-        text = norm("\n".join(b["text"] for b in blocks))
-        missing = [t for t in it["must_read"] if norm(t) not in text]
-        out.append(Result("ingestion", it["id"], not missing, [f"לא נקרא: {m}" for m in missing],
-                          {"reading": v.get("reading")}))
+        if d is not None and "blocks" not in used.get(d["id"], {}):
+            blocks, reading_id = fetch_blocks(c, d)
+            used[d["id"]] = doc_info(d, reading_id, blocks)
+        out += grade_ingestion(it, used[d["id"]] if d is not None else None)
     return out
+
+
+def grade_retrieval(it: dict, hits: list[str], titles: list[str] | None = None) -> Result:
+    problems, data = retrieval_check(hits, it)
+    return Result("retrieval", it["id"], not problems, problems, data | {"hits": hits, "titles": titles or []})
 
 
 def check_retrieval(c: httpx.Client, items: list[dict]) -> list[Result]:
     out = []
     for it in items:
         hits = c.get("/api/search", params={"q": it["query"], "limit": it.get("k", 8)}).json()["results"]
-        texts = [norm(h.get("text") or h.get("snippet") or "") for h in hits]
-        rank = next((i + 1 for i, t in enumerate(texts) if norm(it["expect"]) in t), None)
-        out.append(Result("retrieval", it["id"], rank is not None,
-                          [] if rank else [f"לא בתוצאות הראשונות: {it['expect']}"], {"rank": rank}))
+        out.append(grade_retrieval(it, [h.get("text") or h.get("snippet") or "" for h in hits],
+                                   [h.get("title") or "" for h in hits]))
     return out
 
 
@@ -182,13 +247,15 @@ def check_answers(c: httpx.Client, docs: dict, items: list[dict]) -> list[Result
         detail = []
         for i, t in enumerate(it["turns"]):
             m = run_turn(c, cid, t["ask"])
-            problems, structured, lines = grade(m, t.get("expect") or {}, docs, i + 1)
+            expect = t.get("expect") or {}
+            problems, structured, calc, lines = grade(m, expect, docs, i + 1)
             original = original_grade(m, t, docs)
-            ok = ok and not problems and not structured
+            ok = ok and not problems and not structured and not calc
             detail += lines
             a = m.get("answer") or {}
             turns.append({"ask": t["ask"], "status": m["status"], "answer_status": a.get("status"),
                           "structured_problems": structured, "passed_original_reference": original,
+                          "calc_problems": calc, "calc_checked": bool(expect.get("calc")),
                           "markdown": a.get("markdown"), "seconds": m["_seconds"], "problems": problems,
                           "sources": [f"{s['id']} {s['title']} — {s['location']}" for s in a.get("sources") or []],
                           "searches": a.get("searches"), "verification": a.get("verification"),
@@ -202,12 +269,16 @@ def check_answers(c: httpx.Client, docs: dict, items: list[dict]) -> list[Result
     return out
 
 
-def grade(m: dict, expect: dict, docs: dict, turn: int) -> tuple[list[str], list[str], list[str]]:
-    """Both layers for one turn: (regression problems, structured problems, report lines)."""
+def grade(m: dict, expect: dict, docs: dict, turn: int) -> tuple[list[str], list[str], list[str], list[str]]:
+    """The three layers for one turn: (regression problems, structured problems, calculation problems, report
+    lines)."""
     problems = grade_turn(m, expect, docs)
-    structured = structured_check(m.get("answer"), expect) if m["status"] == "done" else []
-    detail = [f"תור {turn}: {p}" for p in problems] + [f"תור {turn} (מבני): {p}" for p in structured]
-    return problems, structured, detail
+    done = m["status"] == "done"
+    structured = structured_check(m.get("answer"), expect) if done else []
+    calc = calc_check(m.get("answer"), expect) if done else []
+    detail = ([f"תור {turn}: {p}" for p in problems] + [f"תור {turn} (מבני): {p}" for p in structured]
+              + [f"תור {turn} (חישוב): {p}" for p in calc])
+    return problems, structured, calc, detail
 
 
 def corrections_of(spec_turns: list[dict]) -> list[dict]:
@@ -221,16 +292,33 @@ def original_grade(m: dict, spec_turn: dict, docs: dict) -> bool | None:
     fix = spec_turn.get("reference_corrected")
     if not fix:
         return None
-    problems, structured, _ = grade(m, fix.get("was") or {}, docs, 0)
-    return not problems and not structured
+    problems, structured, calc, _ = grade(m, fix.get("was") or {}, docs, 0)
+    return not problems and not structured and not calc
 
 
 def rescore(spec: dict, stored: list[dict]) -> list[Result]:
-    """Stored answers graded again with the set's current expectations."""
+    """Stored results graded again with the set's current expectations, without a model call or the stack:
+    answers from their stored payload, ingestion items from the blocks the run record keeps, retrieval from the
+    stored passages. A result whose evidence was not stored is kept as it was."""
     items = {it["id"]: it for it in spec.get("answers", [])}
+    searches = {it["id"]: it for it in spec.get("retrieval", [])}
+    run = next((r for r in stored if r["kind"] == "run"), None)
+    evidence = {e["title"]: e for e in ((run or {}).get("data", {}).get("documents") or {}).values()
+                if e.get("blocks") is not None}
+    regraded = {(x.kind, x.id): x for it in spec.get("ingestion", [])
+                if (info := find_doc(evidence, it["document"])) is not None for x in grade_ingestion(it, info)}
     out = []
     for r in stored:
-        if r["kind"] != "answers" or r["id"] not in items:
+        kind = r["kind"]
+        if kind == "ingestion" and (r.get("data") or {}).get("layer") != "structure":
+            kind = "ingestion_text"  # stored before the structural layer: the text layer
+        if kind in ("ingestion", "ingestion_text"):
+            out.append(regraded.pop((kind, r["id"]), None) or Result(**(r | {"kind": kind})))
+            continue
+        if kind == "retrieval" and r["id"] in searches and "hits" in (r.get("data") or {}):
+            out.append(grade_retrieval(searches[r["id"]], r["data"]["hits"], r["data"].get("titles")))
+            continue
+        if kind != "answers" or r["id"] not in items:
             out.append(Result(**r))
             continue
         ok, detail = True, []
@@ -239,14 +327,71 @@ def rescore(spec: dict, stored: list[dict]) -> list[Result]:
             m = {"status": t["status"], "error": t.get("error"), "answer": t.get("answer") or {
                 "markdown": t.get("markdown"), "status": t.get("answer_status"),
                 "sources": [{"title": s.split(" ", 1)[1].rsplit(" — ", 1)[0]} for s in t.get("sources") or []]}}
-            problems, structured, lines = grade(m, spec_turn.get("expect") or {}, {}, i + 1)
-            t["problems"], t["structured_problems"] = problems, structured
+            expect = spec_turn.get("expect") or {}
+            problems, structured, calc, lines = grade(m, expect, {}, i + 1)
+            t["problems"], t["structured_problems"], t["calc_problems"] = problems, structured, calc
+            t["calc_checked"] = bool(expect.get("calc"))
             t["passed_original_reference"] = original_grade(m, spec_turn, {})
-            ok = ok and not problems and not structured
+            ok = ok and not problems and not structured and not calc
             detail += lines
         out.append(Result("answers", r["id"], ok, detail,
                           r["data"] | {"corrections": corrections_of(items[r["id"]]["turns"])}))
-    return out
+    # items the stored run did not check, graded from the evidence it kept
+    return out + list(regraded.values())
+
+
+def _git(*args: str) -> str | None:
+    try:
+        r = subprocess.run(["git", *args], cwd=Path(__file__).resolve().parent, capture_output=True, text=True,
+                           timeout=10, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip()
+
+
+def build_info(build: str | None, image: str | None) -> dict:
+    """What the run ran against: the checkout's commit at run time (None outside a checkout) and whether its
+    tracked files had changes, the build named with ``--build`` (the stack may run another build than the
+    checkout), and the backend image id given with ``--image``."""
+    commit = _git("rev-parse", "HEAD") or None
+    changes = _git("status", "--porcelain", "--untracked-files=no") if commit else None
+    return {"commit": commit, "dirty": bool(changes), "build": build or None, "image": image or None}
+
+
+def run_record(info: dict, used: dict[str, dict]) -> Result:
+    return Result("run", "run", True, [], info | {"documents": used})
+
+
+def models_per_purpose(results: list[Result]) -> dict[str, list[str]]:
+    """The models each purpose's calls ran on, as the usage of the stored turns records them."""
+    seen: dict[str, set[str]] = {}
+    for r in results:
+        if r.kind == "answers":
+            for t in r.data.get("turns", []):
+                for u in t.get("usage") or []:
+                    seen.setdefault(u.get("purpose") or "-", set()).add(u.get("model") or "לא ידוע")
+    return {k: sorted(v) for k, v in sorted(seen.items())}
+
+
+def run_lines(results: list[Result]) -> list[str]:
+    run = next((r for r in results if r.kind == "run"), None)
+    models = models_per_purpose(results)
+    if run is None and not models:
+        return []
+    lines = ["## build", ""]
+    if run is not None:
+        d = run.data
+        lines.append(f"- commit: {d.get('commit') or 'לא ידוע'}" + (" (עם שינויים שלא נשמרו)" if d.get("dirty") else "")
+                     + (f"; build: {d['build']}" if d.get("build") else "")
+                     + f"; image: {d.get('image') or 'לא נמסר'}")
+    if models:
+        lines.append("- מודל לפי מטרה: " + "; ".join(f"{k}: {', '.join(v)}" for k, v in models.items()))
+    docs = sorted(((run.data.get("documents") or {}) if run else {}).values(), key=lambda e: e.get("title") or "")
+    if docs:
+        lines += ["", "| מסמך | ingestion_version | reading_id |", "|---|---|---|"]
+        lines += [f"| {e.get('title')} | {e.get('ingestion_version') or '—'} | {e.get('reading_id') or '—'} |"
+                  for e in docs]
+    return lines + [""]
 
 
 def call_cost(u: dict) -> float | None:
@@ -325,7 +470,7 @@ def original_score(rs: list[Result]) -> int:
     def turn_ok(t: dict) -> bool:
         if t.get("passed_original_reference") is not None:
             return t["passed_original_reference"]
-        return not t.get("problems") and not t.get("structured_problems")
+        return not t.get("problems") and not t.get("structured_problems") and not t.get("calc_problems")
     return sum(all(turn_ok(t) for t in r.data.get("turns", [])) for r in rs)
 
 
@@ -356,8 +501,9 @@ def resolution_lines(turn: dict) -> list[str]:
 
 def report(results: list[Result], path: Path, title: str) -> str:
     lines = [f"# {title}", ""]
+    lines += run_lines(results)
     lines += usage_summary(results)
-    for kind in ("ingestion", "retrieval", "meaning", "answers"):
+    for kind in ("ingestion", "ingestion_text", "retrieval", "meaning", "answers"):
         rs = [r for r in results if r.kind == kind]
         if not rs:
             continue
@@ -366,7 +512,10 @@ def report(results: list[Result], path: Path, title: str) -> str:
         if kind == "answers":
             regex_ok = sum(all(not t.get("problems") for t in r.data.get("turns", [])) for r in rs)
             struct_ok = sum(all(not t.get("structured_problems") for t in r.data.get("turns", [])) for r in rs)
-            lines.append(f"\nשכבת הביטויים (רגרסיה): {regex_ok}/{len(rs)}; שכבה מבנית: {struct_ok}/{len(rs)}")
+            calc_rs = [r for r in rs if any(t.get("calc_checked") for t in r.data.get("turns", []))]
+            calc_ok = sum(all(not t.get("calc_problems") for t in r.data.get("turns", [])) for r in calc_rs)
+            lines.append(f"\nשכבת הביטויים (רגרסיה): {regex_ok}/{len(rs)}; שכבה מבנית: {struct_ok}/{len(rs)}"
+                         + (f"; שכבת חישוב: {calc_ok}/{len(calc_rs)}" if calc_rs else ""))
             fixes = [(r.id, c) for r in rs for c in r.data.get("corrections") or []]
             if fixes:
                 lines.append(f"\nציון אוטומטי מול הייחוס המקורי: {original_score(rs)}/{len(rs)}; אחרי תיקוני ייחוס: "
@@ -392,7 +541,7 @@ def report(results: list[Result], path: Path, title: str) -> str:
             if kind == "answers":
                 for t in r.data.get("turns", []):
                     lines.append(f"  - שאלה: {t['ask']}")
-                    lines.append("    - תשובה: " + (t["markdown"] or t.get("error") or "").replace("\n", " ⏎ ")[:1500])
+                    lines.append("    - תשובה: " + (t.get("markdown") or (t.get("answer") or {}).get("markdown") or t.get("error") or "").replace("\n", " ⏎ ")[:1500])
                     if not r.ok:
                         lines += resolution_lines(t)
         lines.append("")
@@ -413,6 +562,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rescore", default="")
     ap.add_argument("--office", default="A", help="run the answer items of this office only (items without "
                     "an `office` key belong to A); sign in with that office's --email")
+    ap.add_argument("--build", default="", help="the build the stack runs, recorded beside the checkout's commit")
+    ap.add_argument("--image", default="", help="the backend image id, recorded in the report")
     args = ap.parse_args(argv)
     spec = yaml.safe_load(Path(args.set).read_text(encoding="utf-8"))
     if args.rescore:
@@ -430,16 +581,26 @@ def main(argv: list[str] | None = None) -> int:
     c = login(args.base, args.email, args.password)
     docs = documents(c)
     results: list[Result] = []
+    used: dict[str, dict] = {}
 
     def pick(xs: list[dict]) -> list[dict]:
         return [x for x in xs if not only or x["id"] in only]
 
-    results += check_ingestion(c, docs, pick(spec.get("ingestion", [])))
+    results += check_ingestion(c, docs, pick(spec.get("ingestion", [])), used)
     results += check_retrieval(c, pick(spec.get("retrieval", [])))
-    results += check_meaning(c, docs, pick(spec.get("meaning", [])))
+    meaning = pick(spec.get("meaning", []))
+    results += check_meaning(c, docs, meaning)
     if not args.skip_answers:
         results += check_answers(c, docs, [x for x in pick(spec.get("answers", []))
                                        if x.get("office", "A") == args.office])
+    # every other document the run used: checked for meaning, or cited by an answer
+    by_id = {d["id"]: d for d in docs.values()}
+    cited = {s.get("document_id") for r in results if r.kind == "answers" for t in r.data.get("turns", [])
+             for s in (t.get("answer") or {}).get("sources") or []}
+    for d in [find_doc(docs, it["document"]) for it in meaning] + [by_id.get(i) for i in cited]:
+        if d is not None and d["id"] not in used:
+            used[d["id"]] = doc_info(d, fetch_blocks(c, d, first_only=True)[1])
+    results.insert(0, run_record(build_info(args.build, args.image), used))
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")

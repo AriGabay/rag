@@ -19,11 +19,17 @@ such answers:
   and a complete one must not carry it.
 
 Pure functions over the stored payload, so stored results can be rescored with new expectations.
+
+Beside the answer checks, the other layers' pure checks live here too, so a rescore regrades them from stored
+evidence: ``structure_check`` (a value in a named table row and column, or in a paragraph under a heading),
+``retrieval_check`` (every required text among the top passages) and ``calc_check`` (a calculation result shown
+at a stated precision).
 """
 
 from __future__ import annotations
 
 import re
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from app.answering.verify import numbers_in
 from app.chat.verify import split_units
@@ -151,4 +157,199 @@ def check(answer: dict | None, expect: dict) -> list[str]:
             problems.append("הכיסוי חלקי אבל התשובה אינה אומרת זאת")
         if ledger.get("complete") is True and noted and not partial_data:
             problems.append("הכיסוי מלא אבל התשובה מסויגת כחלקית")
+    return problems
+
+
+# --- ingestion: a value where the document puts it ---------------------------------------------------------------
+
+def _key(s) -> str:
+    return re.sub(r"\s+", " ", norm(str(s or ""))).strip()
+
+
+def _has(hay, needle) -> bool:
+    return _key(needle) in _key(hay)
+
+
+def _value_in(text, value) -> bool:
+    """A number is matched in any written form (9,500 and 9500); anything else as text."""
+    forms = numbers_in(str(value))
+    return bool(forms & numbers_in(norm(str(text or "")))) if forms else _has(text, value)
+
+
+def _lines(x) -> list[str]:
+    return [x] if isinstance(x, str) else list(x or [])
+
+
+def _rows(block: dict) -> list[tuple[int | None, list[str]]]:
+    """A table block's rows as (page, cells): a row's own page when it has one, else the table's."""
+    out = []
+    for r in (block.get("table") or {}).get("rows") or []:
+        page, cells = (r.get("page"), r.get("cells")) if isinstance(r, dict) else (None, r)
+        out.append((page if page is not None else block.get("page"), [str(c or "") for c in cells or []]))
+    return out
+
+
+def _column(table: dict, rows: list, column: str | None) -> tuple[int | None, str, list] | None:
+    """The named column's index and header, and the data rows under it: from the table's headers, or from a
+    header row read into the body (OCR and pictures often have one); None when no header names it."""
+    if not column:
+        return None, "", rows
+    for i, h in enumerate(table.get("headers") or []):
+        if _has(h, column):
+            return i, str(h), rows
+    for n, (_, cells) in enumerate(rows[:3]):
+        for i, h in enumerate(cells):
+            if _has(h, column):
+                return i, h, rows[n + 1:]
+    return None
+
+
+def _label(cells: list[str], skip: int | None) -> str:
+    return " | ".join(c for j, c in enumerate(cells) if j != skip and c.strip())[:80]
+
+
+def _table_check(blocks: list[dict], item: dict) -> list[str]:
+    value, unit, page = item["value"], item.get("unit"), item.get("page")
+    tables = [b for b in blocks if b.get("table")]
+    if item.get("table"):
+        tables = [b for b in tables if _has(" ".join([*_lines(b["table"].get("caption")), *_lines(b["table"].get(
+            "title")), b.get("section") or "", *(b.get("section_path") or [])]), item["table"])]
+    if not tables:
+        return [f"לא נמצאה טבלה «{item['table']}»" if item.get("table") else "לא נמצאה טבלה במסמך"]
+    # the closest miss over the candidate tables: 0 page or unit, 1 another value in the named cell, 2 no such
+    # row, 3 no such column
+    best: tuple[int, str] = (9, "")
+    found_at: list[str] = []
+    for b in tables:
+        t = b["table"]
+        rows = _rows(b)
+        col = _column(t, rows, item.get("column"))
+        for _, cells in rows:
+            for j, c in enumerate(cells):
+                if _value_in(c, value):
+                    found_at.append(f"«{_label(cells, j)}»")
+        if col is None:
+            best = min(best, (3, f"לא נמצאה עמודה «{item['column']}»"))
+            continue
+        ci, header, data = col
+        row = item.get("row")
+        named = [(p, cs) for p, cs in data if not row or any(_key(c) == _key(row) for j, c in enumerate(cs) if j != ci)]
+        if row and not named:
+            named = [(p, cs) for p, cs in data if any(_has(c, row) for j, c in enumerate(cs) if j != ci)]
+        if not named:
+            best = min(best, (2, f"לא נמצאה שורה «{row}»"))
+            continue
+        for p, cs in named:
+            cell = cs[ci] if ci is not None and ci < len(cs) else " ".join(cs)
+            if not _value_in(cell, value):
+                best = min(best, (1, f"בתא שצוין ({_label(cs, ci)} / {header or 'כל השורה'}) נקרא «{cell}», לא {value}"))
+                continue
+            units = list(t.get("units") or [])
+            places = [cell, header, units[ci] if ci is not None and ci < len(units) else "", *cs,
+                      *_lines(t.get("caption")), *_lines(t.get("title"))]
+            if unit and not any(_has(x, unit) for x in places if x):
+                best = min(best, (0, f"הערך {value} נמצא בשורה ובעמודה שצוינו, בלי היחידה «{unit}»"))
+                continue
+            if page is not None and p != page:
+                best = min(best, (0, f"הערך {value} נמצא בשורה ובעמודה שצוינו בעמוד {p}, לא בעמוד {page}"))
+                continue
+            return []
+    problems = [best[1]]
+    if best[0] >= 1 and found_at:
+        problems.append(f"הערך {value} נמצא בשורה " + ", ".join(found_at[:4]))
+    return problems
+
+
+def _paragraph_check(blocks: list[dict], item: dict) -> list[str]:
+    value, unit, page, heading, near = (item["value"], item.get("unit"), item.get("page"), item.get("heading"),
+                                        item.get("near"))
+    texts = [b for b in blocks if not b.get("table")
+             and (not heading or _has(" ".join([b.get("section") or "", *(b.get("section_path") or [])]), heading))]
+    hits = [b for b in texts if _value_in(b.get("text"), value) and (not near or _has(b.get("text"), near))
+            and (not unit or _has(b.get("text"), unit))]
+    if hits and (page is None or any(b.get("page") == page for b in hits)):
+        return []
+    where = f" תחת «{heading}»" if heading else ""
+    if hits:
+        return [f"הערך {value}{where} נמצא בעמוד {hits[0].get('page')}, לא בעמוד {page}"]
+    return [f"הערך {value}" + (f" ליד «{near}»" if near else "") + (f" עם «{unit}»" if unit else "")
+            + f" לא נמצא בטקסט{where}"]
+
+
+def structure_check(blocks: list[dict], item: dict) -> list[str]:
+    """An ingestion check against the document's structure (``/blocks``): with ``row`` or ``column``, ``value``
+    must sit in that row and column of a table (``table``: a caption, title or heading fragment; a number in
+    another row or column fails), else in a text block under ``heading`` (with ``near`` in the same block).
+    ``unit`` must be read with it, and ``page``, when given, is the row's (the block's) page."""
+    if item.get("row") or item.get("column"):
+        return _table_check(blocks, item)
+    return _paragraph_check(blocks, item)
+
+
+# --- retrieval: every required passage ----------------------------------------------------------------------------
+
+def retrieval_check(texts: list[str], item: dict) -> tuple[list[str], dict]:
+    """``expect_all``: every text must be among the top ``k`` passages (``expect``: one text). Returns the
+    problems and each required text's rank (None when missing)."""
+    top = [_key(t) for t in texts[:item.get("k", 8)]]
+    required = list(item.get("expect_all") or []) + ([item["expect"]] if item.get("expect") else [])
+    ranks = {t: next((i + 1 for i, x in enumerate(top) if _key(t) in x), None) for t in required}
+    problems = [f"לא בתוצאות הראשונות: {t}" for t, r in ranks.items() if r is None]
+    found = [r for r in ranks.values() if r is not None]
+    rank = ranks[item["expect"]] if item.get("expect") else (max(found) if found and not problems else None)
+    return problems, {"rank": rank, "ranks": ranks}
+
+
+# --- calculation: a result shown at the stated precision ----------------------------------------------------------
+
+_SHOWN = re.compile(r"(?<![\d.,])(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)")
+_CITE_ID = re.compile(r"\[[A-Z]+\d+\]")
+
+
+def _plain(x) -> str:
+    """A number as written, without thousands separators; a YAML float in positional notation."""
+    s = format(Decimal(repr(x)), "f") if isinstance(x, float) else str(x)
+    return s.replace(",", "").strip()
+
+
+def _places(x) -> int:
+    s = _plain(x)
+    return len(s.split(".", 1)[1]) if "." in s else 0
+
+
+def _round(d: Decimal, places: int) -> Decimal:
+    return d.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+
+
+def shown_at_precision(shown: str, expected, precision: int) -> bool:
+    """A displayed number is the expected result when it shows at least ``precision`` decimals, equals the result
+    rounded to ``precision``, and every further decimal it shows agrees with the result as far as the result is
+    known (8.87 and 8.872 for 8.8719…, not 8.9 nor 8.874). The sign is not compared: answers write a loss in
+    words as often as with a minus."""
+    try:
+        x, e = abs(Decimal(_plain(shown))), abs(Decimal(_plain(expected)))
+    except InvalidOperation:
+        return False
+    d = _places(shown)
+    if d < precision or _round(x, precision) != _round(e, precision):
+        return False
+    return _places(expected) < d or x == _round(e, d)
+
+
+def displayed_numbers(markdown: str) -> list[str]:
+    return _SHOWN.findall(_CITE_ID.sub(" ", norm(markdown)))
+
+
+def calc_check(answer: dict | None, expect: dict) -> list[str]:
+    """``calc: [{value, precision}]``: each result must be shown at its precision (default: the decimals the
+    value is written with)."""
+    shown = displayed_numbers((answer or {}).get("markdown") or "")
+    problems = []
+    for c in expect.get("calc") or []:
+        value = c["value"]
+        p = c.get("precision")
+        p = _places(value) if p is None else int(p)
+        if not any(shown_at_precision(s, value, p) for s in shown):
+            problems.append(f"תוצאת החישוב {_plain(value)} (בדיוק של {p} ספרות אחרי הנקודה) לא מוצגת"
+                            + (f"; מספרים בתשובה: {', '.join(shown[:8])}" if shown else ""))
     return problems
