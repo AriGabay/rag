@@ -304,3 +304,9 @@ def test_the_equivalent_basis_written_without_a_geresh_is_that_basis():
     src = "שווי הנכס: 8,640 ₪ X 68.40 מ\"ר אקווי'."
     for said in ("אקווי", "אקוי"):
         assert _problems(f"בתחשיב השווי הוכפל ב-68.40 מ״ר {said} [S1].", _ws(src)) == [], said
+
+
+def test_a_per_area_amount_named_only_by_its_column_header_still_needs_its_basis():
+    table = "דירות בבניין\nדירה | שטח | שווי למ\"ר\nדירה 3 | 80 | 8,700\nסה\"כ מ\"ר אקוו' | 2,480"
+    (p,) = _problems("השווי של דירה 3 הוא 8,700 ₪ [S1].", _ws(table, kind="table"))
+    assert p.kind == "basis" and "אקוו" in p.annotation

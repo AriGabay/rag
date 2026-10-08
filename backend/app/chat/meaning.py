@@ -172,6 +172,7 @@ class Occurrence:
     qualifiers: Qualifiers
     context: str  # the words around it, to choose the occurrence closest to the unit
     measurement: bool = False
+    area: bool = False  # its row or column names it a per-area amount, or its row label or cell an area
 
     @cached_property
     def context_words(self) -> set[str]:
@@ -203,7 +204,7 @@ def _area_amount(text: str, pos: int, written: str, closest: list[Occurrence]) -
     end = _CLAUSE_END.search(text, pos)
     if _PER_AREA.search(text[starts[-1] if starts else 0:end.start() if end else len(text)]):
         return True
-    return any(_AREA_WORD.search(o.context) for o in closest)
+    return any(o.area or _AREA_WORD.search(o.context) for o in closest)
 
 
 def _table_definitions(lines: list[str], is_row: list[bool], heads: list[str]) -> dict[str, dict[str, str]]:
@@ -263,7 +264,12 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
                             if len(defined) == 1 and not q.keys(kind):
                                 key, written = next(iter(defined.items()))
                                 q.add(kind, key, written)
-                    occurrences.append((f, Occurrence(q, line)))
+                    # a per-area amount by its label, header or cell ("שווי למ״ר"); an area by its own label or cell —
+                    # a column header of areas ("סה״כ מ״ר אקוו׳") also heads a calculation's totals and factors
+                    own = cells[0] + " " + cell
+                    area = bool(_PER_AREA.search(own + " " + (heads[i] if i < len(heads) else ""))
+                                or _AREA_WORD.search(own))
+                    occurrences.append((f, Occurrence(q, line, area=area)))
             continue
         found, gen = attached(line)
         # a clause with no number speaks for the source; a table's title, caption or notes for its numbers

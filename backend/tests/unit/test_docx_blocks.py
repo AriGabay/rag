@@ -218,3 +218,23 @@ def test_a_picture_reading_depends_on_its_context_and_the_reader():
     assert key == _reading_key(b"png", "להלן תשריט:", vision)
     assert key != _reading_key(b"png", "להלן טבלה:", vision)
     assert key != _reading_key(b"png", "להלן תשריט:", None)  # an OCR-only reading is not the model's
+
+
+def test_a_reading_after_every_model_call_failed_is_not_kept_for_the_next_ingestion(monkeypatch):
+    from app.extraction.images import VisionCallFailed
+
+    class _Failing:
+        config = "scripted:low"
+        calls = 0
+
+        def read(self, png, context, careful=False):
+            self.calls += 1
+            raise VisionCallFailed("rate_limited")
+
+    words = _words("אזור", "שטח", "120,500", "97.5%", "שיעור", "צפון", "דרום", "מרכז", "מערב")
+    monkeypatch.setattr(images, "_ocr_words", lambda gray, lang: words)
+    monkeypatch.setattr("app.extraction.ocr.ocr_available", lambda lang: True)
+    monkeypatch.setattr(images, "_from_ocr", lambda gray, lang, note: images.PictureReading(
+        "read_uncertain", "ocr", text=" ".join(w["text"] for w in words), note=note))
+    reading = read_raster(_drawn_png(), "", _Failing(), "heb+eng")
+    assert reading.method == "ocr" and not reading.cacheable  # the next ingestion asks the model again

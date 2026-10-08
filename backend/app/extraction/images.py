@@ -520,7 +520,10 @@ def _read_docx_picture(gray, context: str, vision: VisionReader | None, language
     if len(confident) < OCR_RELIABLE_WORDS or len(confident) < OCR_RELIABLE_SHARE * len(words):
         # mostly unreadable words (a map, a scanned stamp): OCR text would only add noise to the index
         return PictureReading("unread", "ocr", note="בתמונה יש טקסט שלא ניתן היה לקרוא ב-OCR באיכות מספקת")
-    return _from_ocr(gray, languages, note="נקרא ב-OCR בלבד; ייתכנו שגיאות זיהוי")
+    reading = _from_ocr(gray, languages, note="נקרא ב-OCR בלבד; ייתכנו שגיאות זיהוי")
+    if vision is not None:
+        reading.cacheable = False  # the model was not reached: the next ingestion asks it again
+    return reading
 
 
 _HEB_WORD = re.compile(r"^[\u05D0-\u05EA]{3,}$")
