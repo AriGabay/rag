@@ -27,8 +27,10 @@ text). Two occurrences on two pages are kept (a table or a signature repeated in
 one block.
 
 pdfium is not thread-safe: every render and image decode happens on the calling thread; the OCR and model calls
-run in a small worker pool. A vision failure that is transient or a configuration error raises
-``images.VisionUnavailable`` out of the pool and fails the job; the version keeps its earlier reading.
+run in a small worker pool. A vision configuration error raises ``images.VisionUnavailable`` out of the pool at once
+and fails the job. A transient vision failure (KTD9) lets every other region finish reading, so those readings reach
+the cache, and is raised once all are done: the job's next attempt (its bounded ``max_attempts``) calls the model
+only for the regions that failed. Either way the version keeps its earlier reading.
 """
 
 from __future__ import annotations
@@ -53,6 +55,7 @@ from app.extraction.images import (
     PictureReading,
     RegionHints,
     VisionReader,
+    VisionUnavailable,
     flatten,
     long_runs,
     ocr_words,
@@ -462,10 +465,19 @@ def read_regions(doc, data: bytes, layers: list[PageLayer], settings: Settings, 
     if not contents:
         return
     pool = ThreadPoolExecutor(max_workers=REGION_WORKERS)
+    transient: VisionUnavailable | None = None
     try:
         futures = [(c, pool.submit(_read_content, c, settings, vision, cache, deadline)) for c in contents]
         for c, future in futures:
-            covered, reading = future.result()
+            try:
+                covered, reading = future.result()
+            except VisionUnavailable as exc:
+                if exc.permanent:
+                    raise  # a configuration error: every other call would fail the same way
+                # transient (KTD9): the other regions are still read, so their readings reach the cache and the
+                # job's next attempt reads only the regions that failed
+                transient = transient or exc
+                continue
             for r in c.occurrences:
                 r.covered = covered[id(r)]
                 r.reading = None if r.covered else reading
@@ -473,6 +485,8 @@ def read_regions(doc, data: bytes, layers: list[PageLayer], settings: Settings, 
         pool.shutdown(wait=True, cancel_futures=True)
         raise
     pool.shutdown(wait=True)
+    if transient is not None:
+        raise transient
 
 
 # --- repeated pictures -----------------------------------------------------------------------------------------

@@ -228,8 +228,9 @@ def coverage_summary(ctx: TenantContext = Depends(require_admin)) -> dict:
 
 class ReprocessBody(BaseModel):
     all: bool = False  # False: only versions read by an older reader / not yet measured
-    # reprocess only: read again the versions whose last reading was held back as worse than the current one
-    # (``ingestion.reprocess_regression``), accepting that regression (KTD7)
+    # reprocess only, optional: read again the versions whose last reading was held back as worse than the current
+    # one (``ingestion.reprocess_regression``), accepting that regression (KTD7). Those versions never wait for it:
+    # they keep their current reading and stay available (KTD9)
     accept_regression: bool = False
 
 
@@ -237,8 +238,9 @@ class ReprocessBody(BaseModel):
 def reprocess(body: ReprocessBody, ctx: TenantContext = Depends(require_admin)) -> dict:
     """Queue a fresh reading of the office's current documents (blocks, pictures, chunks, embeddings; records and
     reviewed decisions kept). Without ``all``, only versions read by an older reader; a version whose new reading
-    was held back as worse than its current one waits for an admin: ``accept_regression`` reads exactly those
-    again and lets the new reading replace the current one despite the recorded regression."""
+    was held back as worse than its current one keeps its current reading (reading it again would read the same):
+    ``accept_regression``, an optional admin override, reads exactly those again and lets the new reading replace
+    the current one despite the recorded regression. A ``kept_previous`` job is re-queued for it."""
     from app.platform.jobs import enqueue_reindex
     from app.platform.pipeline import INGESTION_VERSION, PDF_INGESTION_VERSION, ingestion_version
 
@@ -327,9 +329,19 @@ def jobs_summary(ctx: TenantContext = Depends(require_admin)) -> dict:
             "SELECT v.id, d.title, v.ingestion->'reprocess_regression' AS r FROM document_versions v JOIN documents d"
             " ON d.id = v.document_id AND d.deleted_at IS NULL WHERE v.is_current AND v.ingestion ?"
             " 'reprocess_regression' ORDER BY d.title")).all()
-    # new readings held back as worse than the current one: kept until an admin accepts them (KTD7)
+        kept = conn.execute(text(
+            "SELECT v.id, d.title, v.ingestion->'reprocess_kept' AS k, (v.ingestion ? 'reprocess_regression') AS held"
+            " FROM document_versions v JOIN documents d ON d.id = v.document_id AND d.deleted_at IS NULL"
+            " WHERE v.is_current AND v.ingestion ? 'reprocess_kept' ORDER BY d.title")).all()
+    # new readings held back as worse than the current one: the current reading stays and the document is available;
+    # an admin may still apply the new one (KTD7, KTD9)
     return {"jobs": [{"kind": r.kind + (f":{r.mode}" if r.mode else ""), "status": r.status, "count": r.n}
                      for r in rows],
             "regressions": [{"version_id": str(r.id), "title": r.title, "summary": regression_summary(r.r),
                              "regression": r.r} for r in held],
+            # every version whose last reprocess kept its current reading, with why (KTD9); ``can_accept`` when the
+            # kept reading was a regression an admin may apply
+            "kept_previous": [{"version_id": str(r.id), "title": r.title, "reason": (r.k or {}).get("reason"),
+                               "attempts": (r.k or {}).get("attempts"), "at": (r.k or {}).get("at"),
+                               "can_accept": bool(r.held)} for r in kept],
             "positions": positions}

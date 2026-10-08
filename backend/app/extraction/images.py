@@ -134,7 +134,7 @@ class VisionReader(Protocol):
 
 TRANSIENT_STATUSES = frozenset({"timeout", "rate_limited", "error"})
 CONFIG_STATUSES = frozenset({"auth", "quota", "model_unavailable"})
-MSG_VISION_TRANSIENT = "קריאת התמונות במודל נכשלה זמנית ({status}); העיבוד ינוסה שוב והקריאה הקודמת נשמרת"
+MSG_VISION_TRANSIENT = "קריאת התמונות במודל נכשלה זמנית ({status}); הקריאה הקודמת נשמרת"
 MSG_VISION_CONFIG = "קריאת התמונות במודל אינה זמינה בשל הגדרות הספק ({status}); יש לבדוק מפתח, מכסה ומודל"
 NOTE_VISION_FAILED = "הקריאה החזותית נכשלה ({status})"
 

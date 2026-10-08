@@ -194,7 +194,7 @@ def test_a_page_that_loses_a_number_keeps_the_old_reading_and_records_the_regres
     office.reader["next"] = reading(lost, CORRECTIONS)
     reprocess(office)
     j = job(office)
-    assert j.status == "failed" and "120" in j.last_error  # permanent: re-running reads the same
+    assert j.status == "kept_previous" and "120" in j.last_error  # permanent: kept at once, re-running reads the same
     assert snapshot(office)[:3] == before[:3]
     record = q(office, "SELECT ingestion->'reprocess_regression' AS r FROM document_versions WHERE id = :v")[0].r
     assert record["pages"] == [{"page": 1, "missing_numbers": ["120"]}]
@@ -246,7 +246,7 @@ def test_an_accepted_regression_does_not_cover_a_different_one(office, change):
     with tenant_tx(office.system) as conn:
         conn.execute(text("DELETE FROM jobs"))
     reprocess(office, accept=True)
-    assert job(office).status == "failed"
+    assert job(office).status == "kept_previous"
     assert snapshot(office)[:3] == before[:3]
     record = recorded_regression(office)
     assert record["pages"] == [{"page": 1, "missing_numbers": ["120"]}]
@@ -304,7 +304,7 @@ def test_more_failed_pages_or_fewer_tables_keep_the_old_reading(office, worse):
         office.reader["next"] = reading({1: NEW[1], 2: [COMPARABLES[0] + " " + " ".join(
             c for row in [COMPARABLES[1], *COMPARABLES[2]] for c in row)]}, CORRECTIONS)
     reprocess(office)
-    assert job(office).status == "failed"
+    assert job(office).status == "kept_previous"
     record = q(office, "SELECT ingestion->'reprocess_regression' AS r FROM document_versions WHERE id = :v")[0].r
     if worse == "failed_page":
         assert record["failed_pages"] == [2]

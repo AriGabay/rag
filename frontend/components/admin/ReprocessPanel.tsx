@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { ErrorAlert, Notice } from "@/components/ui";
 import { errorMessage, request } from "@/lib/api";
+import { JOB_STATUS_LABEL, KEPT_PREVIOUS_TITLE, keptPreviousText, type KeptPrevious } from "@/lib/format";
 import { useApi, useInterval } from "@/lib/useApi";
 
 interface JobRow {
@@ -18,21 +19,32 @@ interface HeldReading {
   summary: string;
 }
 
+/** A version whose last reprocess kept its current reading, with why (KTD9). ``can_accept``: the kept reading was a
+ * regression an admin may still apply. */
+interface KeptReading extends KeptPrevious {
+  version_id: string;
+  title: string;
+  can_accept: boolean;
+}
+
 const KIND_LABEL: Record<string, string> = {
   process: "עיבוד מסמך",
   "process:reindex": "קריאה מחדש",
   extract_measurements: "חילוץ נתונים כמותיים",
   extract_facts: "חילוץ עובדות (מנוע קודם)",
+  positions: "הוספת מיקומי מקור",
 };
-const STATUS_LABEL: Record<string, string> = { queued: "בתור", running: "רץ", done: "הסתיים", failed: "נכשל" };
 
 /** Reading the office's documents again after the reader changed, and the background queue's state. */
-const fetchJobs = () => request<{ jobs: JobRow[]; regressions?: HeldReading[] }>("/api/admin/jobs");
+const fetchJobs = () =>
+  request<{ jobs: JobRow[]; regressions?: HeldReading[]; kept_previous?: KeptReading[] }>("/api/admin/jobs");
 
 export function ReprocessPanel() {
   const jobsApi = useApi(fetchJobs);
   const jobs = jobsApi.data?.jobs ?? null;
   const held = jobsApi.data?.regressions ?? [];
+  // kept for another reason than a regression (a transient failure after the job's attempts): nothing to accept
+  const keptOther = (jobsApi.data?.kept_previous ?? []).filter((k) => !k.can_accept);
   const load = jobsApi.reload;
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -75,10 +87,12 @@ export function ReprocessPanel() {
       </div>
       {held.length > 0 && (
         <div className="stack small" role="note">
-          <strong>קריאות חדשות שנעצרו ({held.length})</strong>
+          <strong>
+            {KEPT_PREVIOUS_TITLE}: קריאות חדשות שאיבדו מידע (<bdi>{held.length}</bdi>)
+          </strong>
           <span className="muted">
-            הקריאה החדשה של המסמכים האלה קראה פחות מהקריאה הקיימת, ולכן הקריאה הקיימת נשארה. אפשר לאשר את הקריאה
-            החדשה רק לאחר בדיקה.
+            הקריאה החדשה של המסמכים האלה איבדה מידע ביחס לקריאה הקיימת, ולכן הקריאה הקיימת נשארה והמסמכים זמינים כרגיל.
+            אין צורך בפעולה; אפשר להחיל את הקריאה החדשה בכל זאת, לאחר בדיקה.
           </span>
           <ul>
             {held.map((h) => (
@@ -92,11 +106,25 @@ export function ReprocessPanel() {
               type="button"
               className="btn"
               disabled={busy}
-              onClick={() => void run("/api/admin/reprocess", false, "אישור קריאות שנעצרו", true)}
+              onClick={() => void run("/api/admin/reprocess", false, "החלת הקריאות החדשות", true)}
             >
-              אישור הקריאות החדשות שנעצרו
+              החלת הקריאות החדשות בכל זאת
             </button>
           </div>
+        </div>
+      )}
+      {keptOther.length > 0 && (
+        <div className="stack small" role="note">
+          <strong>
+            {KEPT_PREVIOUS_TITLE}: קריאה מחדש שלא הושלמה (<bdi>{keptOther.length}</bdi>)
+          </strong>
+          <ul>
+            {keptOther.map((k) => (
+              <li key={k.version_id}>
+                <bdi>{k.title}</bdi>: <bdi>{keptPreviousText(k)}</bdi>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
       {notice && <Notice kind="ok">{notice}</Notice>}
@@ -108,7 +136,7 @@ export function ReprocessPanel() {
           <ul>
             {active.map((j) => (
               <li key={`${j.kind}-${j.status}`}>
-                {KIND_LABEL[j.kind] ?? j.kind}: {j.count} {STATUS_LABEL[j.status] ?? j.status}
+                {KIND_LABEL[j.kind] ?? j.kind}: <bdi>{j.count}</bdi> {JOB_STATUS_LABEL[j.status] ?? j.status}
               </li>
             ))}
           </ul>

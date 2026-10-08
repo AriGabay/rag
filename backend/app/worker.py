@@ -89,7 +89,7 @@ def handle_extract_facts(ctx: TenantContext, job, worker_id: str) -> None:
 def handle_background(ctx: TenantContext, job, worker_id: str) -> None:
     """Reindexing a processed version, or extracting its measurements. Neither changes the version's status: a
     failure is recorded on the job only (the version keeps its earlier reading). A reading worse than the current
-    one (``pipeline.ReadingRegression``) fails permanently: reading again would read the same."""
+    one (``pipeline.ReadingRegression``) ends at once as ``kept_previous`` (``jobs.fail_job``): reading again would read the same."""
     keeper = _LeaseKeeper(job.office_id, job.job_id, worker_id)
     keeper.start()
     try:

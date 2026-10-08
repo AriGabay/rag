@@ -3,13 +3,19 @@
 Several kinds share the queue: ``process`` (ingestion, one per version, and reindexing), ``extract_facts`` (one
 attribute from one version, U7), ``extract_measurements`` and ``positions`` (the geometry-only backfill of a version
 read before positions existed, KTD3). ``jobs_claim`` serves process jobs first, so no background work starves
-ingestion."""
+ingestion.
+
+A reindex never writes before its gate, so a reindex job that ends without replacing the reading (a regression,
+or a transient failure after its bounded attempts) ends as ``kept_previous``, not ``failed`` (KTD9): the version keeps
+its current reading and stays available, and its ingestion report records why (``reprocess_kept``). No admin action
+is needed; an admin may still re-queue it (``_requeue`` resets ``kept_previous`` jobs too)."""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import Connection, text
@@ -115,30 +121,68 @@ def finish_job(conn: Connection, job_id: UUID) -> None:
     )
 
 
+ERROR_SHOWN = 500  # characters of a failure kept on the job and on the version
+
+
+def is_reindex(kind: str, payload: dict | None) -> bool:
+    return kind == "process" and (payload or {}).get("mode") == "reindex"
+
+
+def failure_status(kind: str, payload: dict | None, terminal: bool) -> str:
+    """A failed job's next status: queued again while attempts remain; once terminal, ``kept_previous`` for a reindex
+    (its current reading was never touched, KTD9) and ``failed`` for everything else."""
+    if not terminal:
+        return "queued"
+    return "kept_previous" if is_reindex(kind, payload) else "failed"
+
+
+def kept_previous_record(reason: str, attempts: int) -> dict:
+    """What a version records when a reprocess kept its reading (``ingestion.reprocess_kept``): why, after how many
+    attempts, and when. Shown on the documents screen and in the admin jobs list."""
+    return {"reason": reason[:ERROR_SHOWN], "attempts": attempts, "at": datetime.now(UTC).isoformat()}
+
+
+def record_kept_previous(conn: Connection, version_id: UUID, reason: str, attempts: int) -> None:
+    """Record on the version that a reprocess kept its current reading. A later reading that replaces it writes a
+    whole new ingestion report, which drops the record."""
+    conn.execute(
+        text("UPDATE document_versions SET ingestion = COALESCE(ingestion, '{}'::jsonb)"
+             " || jsonb_build_object('reprocess_kept', CAST(:k AS jsonb)) WHERE id = :v"),
+        {"v": version_id, "k": json.dumps(kept_previous_record(reason, attempts), ensure_ascii=False)},
+    )
+
+
 def fail_job(conn: Connection, job_id: UUID, error: str, permanent: bool, attempts: int, max_attempts: int) -> bool:
-    """Record a failure. Returns True when the job is now terminally failed."""
+    """Record a failure. Returns True when the job is now terminal: ``failed``, or ``kept_previous`` for a reindex,
+    whose reason is then recorded on the version too (KTD9)."""
     terminal = permanent or attempts >= max_attempts
     backoff = min(300, 5 * 2 ** max(0, attempts - 1))
+    job = conn.execute(text("SELECT kind, payload, version_id FROM jobs WHERE id = :j"), {"j": job_id}).first()
+    status = failure_status(job.kind, job.payload, terminal) if job is not None else (
+        "failed" if terminal else "queued")
     conn.execute(
         text(
             "UPDATE jobs SET status = :st, last_error = :e, locked_by = NULL, lease_until = NULL,"
             " run_after = now() + make_interval(secs => :b), updated_at = now() WHERE id = :j"
         ),
-        {"st": "failed" if terminal else "queued", "e": error[:500], "b": backoff, "j": job_id},
+        {"st": status, "e": error[:ERROR_SHOWN], "b": backoff, "j": job_id},
     )
+    if status == "kept_previous" and job.version_id is not None:
+        record_kept_previous(conn, job.version_id, error, attempts)
     return terminal
 
 
 def _requeue(conn: Connection, version_id: UUID, kind: str, key: str, payload: dict) -> bool:
-    """Queue a job under ``key``; a finished or failed job with that key is reset to a fresh queued job, a queued
-    or running one is left alone. True when a job was queued."""
+    """Queue a job under ``key``; a finished, failed or ``kept_previous`` job with that key is reset to a fresh queued
+    job (an admin's accept of a kept reading re-queues it), a queued or running one is left alone. True when a job
+    was queued."""
     return conn.execute(
         text(
             "INSERT INTO jobs (office_id, version_id, kind, payload, idempotency_key, max_attempts)"
             " VALUES (app_office(), :v, :kind, CAST(:p AS jsonb), :k, :m)"
             " ON CONFLICT (idempotency_key) DO UPDATE SET status = 'queued', attempts = 0, run_after = now(),"
             " locked_by = NULL, lease_until = NULL, last_error = NULL, payload = EXCLUDED.payload,"
-            " updated_at = now() WHERE jobs.status IN ('failed', 'done') RETURNING id"
+            " updated_at = now() WHERE jobs.status IN ('failed', 'done', 'kept_previous') RETURNING id"
         ),
         {"v": version_id, "kind": kind, "p": json.dumps(payload), "k": key, "m": get_settings().job_max_attempts},
     ).first() is not None
@@ -147,7 +191,8 @@ def _requeue(conn: Connection, version_id: UUID, kind: str, key: str, payload: d
 def enqueue_reindex(conn: Connection, version_id: UUID, ingestion_version: str,
                     accept_regression: bool = False) -> bool:
     """Read a processed version again (blocks, pictures, chunks, embeddings) without touching its records.
-    ``accept_regression``: an admin's decision to accept the regression recorded by an earlier run (KTD7)."""
+    ``accept_regression``: an admin's optional decision to apply a reading an earlier run held back as worse than the
+    current one (KTD7, KTD9); the version never waits for it."""
     payload = {"mode": "reindex", "ingestion_version": ingestion_version}
     if accept_regression:
         payload["accept_regression"] = True

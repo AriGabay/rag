@@ -7,7 +7,14 @@ import { B, Dialog, ErrorAlert, Notice, StatusBadge } from "@/components/ui";
 import { UploadPanel, UploadResults } from "@/components/UploadPanel";
 import { api, errorMessage, fileUrl } from "@/lib/api";
 import { useApi, useInterval } from "@/lib/useApi";
-import { BLOCK_KIND_LABEL, formatTimestamp, VERSION_STATUS_LABEL } from "@/lib/format";
+import {
+  BLOCK_KIND_LABEL,
+  formatTimestamp,
+  KEPT_PREVIOUS_TITLE,
+  keptPreviousText,
+  type KeptPrevious,
+  VERSION_STATUS_LABEL,
+} from "@/lib/format";
 import type {
   DocumentDetail,
   DocumentSummary,
@@ -120,6 +127,30 @@ function ReadingDetails({ coverage }: { coverage: PageCoverage[] }) {
   );
 }
 
+/** Why the last reprocess of a version kept its current reading (KTD9): the document stays available, nothing waits
+ * for an admin. Read from the version's reading report when the server includes it. */
+function keptPrevious(v: Version): KeptPrevious | null {
+  const r = v.reading as (Version["reading"] & { kept_previous?: KeptPrevious | null }) | undefined;
+  return r?.kept_previous ?? null;
+}
+
+function KeptPreviousNote({ v }: { v: Version }) {
+  const kept = keptPrevious(v);
+  if (!kept) return null;
+  return (
+    <div className="small" role="note" style={{ color: "var(--warn)" }}>
+      <span aria-hidden="true">↺ </span>
+      {KEPT_PREVIOUS_TITLE}: <bdi>{keptPreviousText(kept)}</bdi>
+      {kept.at && (
+        <span className="muted">
+          {" "}
+          (<bdi>{formatTimestamp(kept.at)}</bdi>)
+        </span>
+      )}
+    </div>
+  );
+}
+
 /** What was read: searchable passages and tables, pictures by status, measurements and structured records — each
  * counted on its own, so zero structured records never reads as "nothing searchable". A partly read version lists,
  * per page, what was not read and why. */
@@ -201,6 +232,7 @@ function StatusCell({ v }: { v: Version | null }) {
           {v.status_reason}
         </div>
       )}
+      <KeptPreviousNote v={v} />
     </div>
   );
 }

@@ -256,3 +256,80 @@ export function factCoverageLine(c: FactCoverage): string {
   for (const [n, text] of optional) if (n > 0) parts.push(text);
   return parts.join(" · ");
 }
+
+// ---------- Reprocessing and value statuses (KTD9, R25, R27) ----------
+
+/** A background job's state. ``kept_previous``: a reprocess that kept the current reading (no admin action needed). */
+export const JOB_STATUS_LABEL: Record<string, string> = {
+  queued: "בתור",
+  running: "רץ",
+  done: "הסתיים",
+  failed: "נכשל",
+  kept_previous: "נשמרה הקריאה הקודמת",
+};
+
+/** Why a reprocess kept a version's current reading (``ingestion.reprocess_kept``). */
+export interface KeptPrevious {
+  reason: string | null;
+  attempts?: number | null;
+  at?: string | null;
+}
+
+export const KEPT_PREVIOUS_TITLE = "נשמרה הקריאה הקודמת — המסמך זמין כרגיל";
+
+/** The reason a reprocess kept the current reading, on one line, with the attempts when it was retried. */
+export function keptPreviousText(k: KeptPrevious): string {
+  const reason = k.reason?.trim() || "לא נרשמה סיבה";
+  const attempts = k.attempts && k.attempts > 1 ? ` (אחרי ${k.attempts} ניסיונות)` : "";
+  return `${reason}${attempts}`;
+}
+
+/** The four statuses a value or measurement is shown with (R25). Each has its own text and icon, never colour alone,
+ * and "checked by a person" is shown only when a person's review is recorded. */
+export type ValueStatus = "auto_verified" | "human_verified" | "uncertain" | "unread";
+
+export const VALUE_STATUS: Record<ValueStatus, { icon: string; label: string; description: string }> = {
+  auto_verified: {
+    icon: "✓",
+    label: "נבדק אוטומטית",
+    description: "הערך נמצא במקור ועבר את בדיקות המקור והמשמעות; לא נבדק על ידי אדם",
+  },
+  human_verified: {
+    icon: "✎",
+    label: "אומת או תוקן על ידי אדם",
+    description: "אדם בדק את הערך ואישר או תיקן אותו",
+  },
+  uncertain: {
+    icon: "?",
+    label: "לא ודאי",
+    description: "הערך נקרא בקריאה לא ודאית או שלא אומת מול הקריאה הנוכחית של המסמך",
+  },
+  unread: {
+    icon: "∅",
+    label: "לא נקרא",
+    description: "האזור במסמך לא נקרא, ולכן אין לו ערך",
+  },
+};
+
+/** A stored measurement's status (M#): a person's decision only when one was recorded (verified, corrected); a
+ * value whose place was lost on reprocessing, or one extraction flagged, is uncertain; otherwise checked
+ * automatically. */
+export function measurementValueStatus(m: { status: string; anchor_lost?: boolean | null }): ValueStatus {
+  if (m.anchor_lost) return "uncertain";
+  if (m.status === "verified" || m.status === "corrected") return "human_verified";
+  if (m.status === "needs_review") return "uncertain";
+  return "auto_verified";
+}
+
+/** A value taken in chat (V#): checked automatically when it was verified in its source, uncertain when it was only
+ * asserted or its source was read uncertainly, unread when its region was not read. Never a person's decision. */
+export function chatValueStatus(certainty: string | null | undefined, sourceStatus?: string | null): ValueStatus {
+  if (sourceStatus === "unread") return "unread";
+  if (certainty !== "verified" || sourceStatus === "uncertain_reading") return "uncertain";
+  return "auto_verified";
+}
+
+/** "✓ נבדק אוטומטית": the status with its icon, for a line of text. */
+export function valueStatusText(s: ValueStatus): string {
+  return `${VALUE_STATUS[s].icon} ${VALUE_STATUS[s].label}`;
+}

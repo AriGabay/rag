@@ -16,7 +16,9 @@ becomes ``ready``/``needs_review`` only in the publish transaction, never in bet
 
 Reprocessing a published version (``reindex_version``, KTD7) reads and embeds before any write, keeps the current
 reading when the new one is worse (``reading_regression``), and otherwise swaps the whole reading, with its
-embeddings and a new ``reading_id``, in one transaction.
+embeddings and a new ``reading_id``, in one transaction. A reprocess that keeps the current reading ends its job as
+``kept_previous`` with the reason on the version (KTD9, ``jobs.fail_job``): the document stays available and no admin
+action is needed.
 """
 
 from __future__ import annotations
@@ -151,7 +153,7 @@ def clone_outputs(conn: Connection, info: VersionInfo) -> int:
     ).scalar_one()
     conn.execute(
         text("UPDATE document_versions SET page_count = :p, pages_incomplete = :i, ingestion = (SELECT ingestion"
-             " - 'reprocess_regression' FROM document_versions WHERE id = :s), extraction_version = (SELECT extraction_version FROM"
+             " - 'reprocess_regression' - 'reprocess_kept' FROM document_versions WHERE id = :s), extraction_version = (SELECT extraction_version FROM"
              " document_versions WHERE id = :s) WHERE id = :v"),
         {"p": page_count, "i": pages_incomplete, "v": info.id, "s": src},
     )
@@ -419,14 +421,16 @@ def process_version(office_id: UUID, version_id: UUID) -> str | None:
 _DERIVED_TEXT_TABLES = ("chunks", "extracted_tables", "pages", "document_blocks")
 EMBED_BATCH = 64
 MISSING_SHOWN = 20  # missing numbers recorded per page
-MSG_REGRESSION = "הקריאה החדשה גרועה מהקיימת ולכן לא הוחלפה ({summary}). מנהל יכול לאשר אותה בהרצה חוזרת"
+MSG_REGRESSION = ("הקריאה החדשה איבדה מידע ביחס לקריאה הקיימת ({summary}), ולכן נשמרה הקריאה הקיימת והמסמך זמין"
+                  " כרגיל. מנהל יכול להחיל את הקריאה החדשה בכל זאת")
 _NUMBER = re.compile(r"\d+(?:[.,]\d+)*")
 
 
 class ReadingRegression(ExtractionError):
     """A new reading is worse than the current one on a measure both readers produce. The current reading stays,
-    the regression is recorded on the version (``ingestion.reprocess_regression``) and the job fails permanently:
-    reading again would read the same. An admin may accept it on a re-run (``accept_regression``)."""
+    the regression is recorded on the version (``ingestion.reprocess_regression``) and the job ends at once as
+    ``kept_previous`` (permanent: reading again would read the same; KTD9). Nothing waits for an admin; one may
+    still apply the new reading on a re-run (``accept_regression``)."""
 
     def __init__(self, findings: dict):
         super().__init__(MSG_REGRESSION.format(summary=regression_summary(findings)), permanent=True)
@@ -566,9 +570,11 @@ def _embed_reading(ctx: TenantContext, info: VersionInfo, result: ExtractionResu
 def reindex_version(office_id: UUID, version_id: UUID, accept_regression: bool = False) -> str | None:
     """Read a processed version again under the current reader (KTD7). Extraction and embedding run before any
     write; a gate then compares the new reading with the current one (``reading_regression``). A worse reading is
-    recorded on the version and fails the job (``ReadingRegression``), leaving the current reading in place,
-    unless an admin accepts the recorded regression (``accept_regression``) and the new one is within it
-    (``regression_within``). Otherwise one transaction replaces
+    recorded on the version and ends the job as ``kept_previous`` (``ReadingRegression``, KTD9), leaving the current
+    reading in place and the document available, unless an admin chose to accept the recorded regression
+    (``accept_regression``) and the new one is within it (``regression_within``). A transient vision failure raises
+    before the gate; the job's bounded attempts read again, regions already read coming from ``image_readings``.
+    Otherwise one transaction replaces
     the blocks, pictures, tables, pages and chunks (with their embeddings) under a new ``reading_id``, re-anchors
     the version's measurements in the new reading, drops facts the earlier engine extracted from the old chunks
     and never reviewed (a reviewed fact stays), clears cached answers and moves the data version, so no answer

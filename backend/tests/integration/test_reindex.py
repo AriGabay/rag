@@ -1,8 +1,11 @@
 """Reading a processed document again (reindex): its reading is replaced, people's work is kept, and nothing
-built on the old reading is served again."""
+built on the old reading is served again. A reprocess that cannot replace the reading (a regression, or a transient
+failure after the job's bounded attempts) ends as ``kept_previous`` with its reason, and the document stays available
+without an admin (U12, KTD9)."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -10,10 +13,14 @@ from sqlalchemy import text
 
 from app import worker
 from app.db import tenant_tx
+from app.extraction.images import VisionUnavailable
 from app.platform import pipeline
 from app.platform.jobs import enqueue_reindex
+from app.platform.search import hybrid_search
+from app.platform.storage import get_storage, storage_key
 from tests.conftest import login
 from tests.factories import make_office
+from tests.integration.test_reprocess_gate import CORRECTIONS, LOST_120, NEW, OLD, reading
 from tests.unit.test_docx_blocks import FIXTURE
 
 pytestmark = pytest.mark.db
@@ -179,3 +186,155 @@ def test_reindex_and_clone_keep_the_pdf_provenance(pdf_office, client):
             " RETURNING id"), {"v": v}).scalar_one()
         pipeline.clone_outputs(conn, pipeline.VersionInfo(copy, doc, "k", "application/pdf", v))
     assert _blocks(pdf_office, copy) == before
+
+
+# --- a reprocess that keeps the current reading (U12, KTD9, AE8) ------------------------------------------------
+# A scripted reader (``tests.integration.test_reprocess_gate.reading``): no PDF is parsed and no model is called.
+
+
+@pytest.fixture
+def gated(db, client, monkeypatch):
+    return make_gated(db, client, monkeypatch)
+
+
+def make_gated(db, client, monkeypatch):
+    """An office with one PDF version read by the scripted reader; ``gated.reader["next"]`` is what the next reading
+    returns or raises, and ``gated.reader["calls"]`` counts the readings."""
+    a = make_office(db, "משרד א", "admin-a@example.test")
+    login(client, "admin-a@example.test")
+    a.reader = {"next": reading(OLD), "calls": 0}
+
+    def scripted(data, mime_type, deadline, vision, readings=None):
+        a.reader["calls"] += 1
+        r = a.reader["next"]
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    monkeypatch.setattr(pipeline, "_extract", scripted)
+    monkeypatch.setattr(pipeline, "vision_reader", lambda ctx: None)
+    data = b"%PDF-1.4 synthetic kept-previous"
+    sha = hashlib.sha256(data).hexdigest()
+    key = storage_key(a.office_id, sha)
+    get_storage().put(key, data)
+    with tenant_tx(a.ctx()) as conn:
+        a.document = conn.execute(text("INSERT INTO documents (office_id, group_id, title) VALUES (app_office(), :g,"
+                                       " 'שומה סינתטית לקריאה חוזרת') RETURNING id"),
+                                  {"g": a.default_group_id}).scalar_one()
+        a.version = conn.execute(text(
+            "INSERT INTO document_versions (office_id, document_id, version_no, sha256, filename, mime_type,"
+            " size_bytes, storage_key, uploaded_by) VALUES (app_office(), :d, 1, :s, 'synthetic.pdf',"
+            " 'application/pdf', :b, :k, :u) RETURNING id"),
+            {"d": a.document, "s": sha, "b": len(data), "k": key, "u": a.admin_id}).scalar_one()
+    pipeline.process_version(a.office_id, a.version)
+    return a
+
+
+def _reprocess(office, accept: bool = False) -> None:
+    with tenant_tx(office.system) as conn:
+        enqueue_reindex(conn, office.version, pipeline.PDF_INGESTION_VERSION, accept_regression=accept)
+    while worker.run_one("test-worker"):
+        pass
+
+
+def _job(office):
+    with tenant_tx(office.system) as conn:
+        return conn.execute(text("SELECT status, attempts, max_attempts, last_error FROM jobs"
+                                 " WHERE payload->>'mode' = 'reindex'")).one()
+
+
+def _ingestion(office) -> dict:
+    return scalar(office, "SELECT ingestion FROM document_versions WHERE id = :v", v=office.version)
+
+
+def _reading_rows(office) -> tuple:
+    with tenant_tx(office.system) as conn:
+        return (conn.execute(text("SELECT block_index, text FROM document_blocks WHERE version_id = :v"
+                                  " ORDER BY block_index"), {"v": office.version}).all(),
+                conn.execute(text("SELECT chunk_index, text FROM chunks WHERE version_id = :v ORDER BY chunk_index"),
+                             {"v": office.version}).all())
+
+
+def test_a_reprocess_that_loses_numbers_keeps_the_previous_reading_without_an_admin(gated, client):
+    """AE8: the job ends ``kept_previous`` (not failed) with the reason; the previous reading stays current, search
+    still finds its passages, the documents screen and the admin jobs list say why, and no admin action is needed."""
+    before, reading_id = _reading_rows(gated), _ingestion(gated)["reading_id"]
+    status_before = scalar(gated, "SELECT status FROM document_versions WHERE id = :v", v=gated.version)
+    gated.reader["next"] = reading(LOST_120, CORRECTIONS)
+    _reprocess(gated)
+
+    j = _job(gated)
+    assert j.status == "kept_previous" and "120" in j.last_error
+    assert gated.reader["calls"] == 2  # one reading at upload, one reprocess: permanent, not read again
+    assert _reading_rows(gated) == before
+    ing = _ingestion(gated)
+    assert ing["reading_id"] == reading_id
+    assert "120" in ing["reprocess_kept"]["reason"] and ing["reprocess_kept"]["attempts"] == 1
+    assert scalar(gated, "SELECT status FROM document_versions WHERE id = :v", v=gated.version) == status_before
+    with tenant_tx(gated.ctx()) as conn:
+        hits = hybrid_search(conn, "השטח הבנוי 120", 5)
+    assert hits and any("120" in h["text"] and str(h["version_id"]) == str(gated.version) for h in hits)
+
+    doc = client.get(f"/api/documents/{gated.document}").json()
+    kept = (doc.get("latest_version") or doc["versions"][0])["reading"]["kept_previous"]
+    assert "120" in kept["reason"]
+    body = client.get("/api/admin/jobs").json()
+    assert any(r["status"] == "kept_previous" and r["kind"] == "process:reindex" for r in body["jobs"])
+    assert [(k["version_id"], k["can_accept"]) for k in body["kept_previous"]] == [(str(gated.version), True)]
+
+
+def test_an_admin_accept_after_kept_previous_requeues_the_job_and_applies_the_held_reading(gated, client):
+    gated.reader["next"] = reading(LOST_120, CORRECTIONS)
+    _reprocess(gated)
+    assert _job(gated).status == "kept_previous"
+
+    r = client.post("/api/admin/reprocess", json={"accept_regression": True}).json()
+    assert r["queued"] == 1 and r["versions"] == [str(gated.version)]  # the kept job is queued again
+    while worker.run_one("test-worker"):
+        pass
+    assert _job(gated).status == "done"
+    ing = _ingestion(gated)
+    assert "reprocess_kept" not in ing and "reprocess_regression" not in ing
+    assert ing["accepted_regression"]["pages"] == [{"page": 1, "missing_numbers": ["120"]}]
+    assert client.get("/api/admin/jobs").json()["kept_previous"] == []
+
+
+def _drain_with_retries(office) -> None:
+    """Run the reindex job through every attempt it has, without waiting for its backoff."""
+    for _ in range(20):
+        while worker.run_one("test-worker"):
+            pass
+        if _job(office).status != "queued":
+            return
+        with tenant_tx(office.system) as conn:
+            conn.execute(text("UPDATE jobs SET run_after = now() WHERE status = 'queued'"))
+
+
+def test_a_transient_vision_failure_retries_within_its_attempts_then_keeps_the_previous_reading(gated, client):
+    before, reading_id = _reading_rows(gated), _ingestion(gated)["reading_id"]
+    gated.reader["next"] = VisionUnavailable("timeout")
+    with tenant_tx(gated.system) as conn:
+        enqueue_reindex(conn, gated.version, pipeline.PDF_INGESTION_VERSION)
+    _drain_with_retries(gated)
+
+    j = _job(gated)
+    assert j.status == "kept_previous" and j.attempts == j.max_attempts and "timeout" in j.last_error
+    assert gated.reader["calls"] == 1 + j.max_attempts  # bounded: the job's own attempts, no more
+    assert _reading_rows(gated) == before and _ingestion(gated)["reading_id"] == reading_id
+    kept = _ingestion(gated)["reprocess_kept"]
+    assert kept["attempts"] == j.max_attempts and "timeout" in kept["reason"]
+    assert "reprocess_regression" not in _ingestion(gated)  # nothing for an admin to accept
+    assert client.get("/api/admin/jobs").json()["kept_previous"][0]["can_accept"] is False
+
+
+def test_a_transient_failure_that_clears_on_a_later_attempt_swaps_the_reading(gated):
+    gated.reader["next"] = VisionUnavailable("rate_limited")
+    with tenant_tx(gated.system) as conn:
+        enqueue_reindex(conn, gated.version, pipeline.PDF_INGESTION_VERSION)
+    while worker.run_one("test-worker"):
+        pass
+    assert _job(gated).status == "queued"  # attempts remain: retried, not kept yet
+    assert "reprocess_kept" not in _ingestion(gated)
+    gated.reader["next"] = reading(NEW, CORRECTIONS)
+    _drain_with_retries(gated)
+    assert _job(gated).status == "done" and "reprocess_kept" not in _ingestion(gated)
