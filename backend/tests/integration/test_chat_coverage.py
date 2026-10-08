@@ -82,7 +82,8 @@ def test_set_answer_that_read_one_of_two_matching_documents_says_so(client, setu
     assert _titles(led["matching"]) == {f"שומה הגפן 12 {PLACE}", f"שומה הזית 7 {PLACE}"}  # not the third
     assert _titles(led["not_checked"]) == {f"שומה הזית 7 {PLACE}"} and led["complete"] is False
     assert a["status"] == "partial"
-    assert "**כיסוי:** 2 מסמכים מתאימים" in a["markdown"] and f"לא נבדקו: שומה הזית 7 {PLACE}" in a["markdown"]
+    assert "**כיסוי:** 2 מסמכים מתאימים" in a["markdown"] and "הפירוט בחלונית המקורות" in a["markdown"]
+    assert f"שומה הזית 7 {PLACE}" not in a["markdown"]  # the names are listed in the panel (ledger), not the answer
 
 
 def test_a_matching_document_that_came_up_in_search_but_was_not_used_is_named(client, setup, monkeypatch):
@@ -94,7 +95,7 @@ def test_a_matching_document_that_came_up_in_search_but_was_not_used_is_named(cl
                             scope_query=PLACE)])
     led = a["ledger"]
     assert _titles(led["unused"]) == {f"שומה הזית 7 {PLACE}"} and not led["not_checked"]
-    assert a["status"] == "partial" and "לא נמצא בהם נתון שנכלל בתשובה" in a["markdown"]
+    assert a["status"] == "partial" and "הפירוט בחלונית המקורות" in a["markdown"]  # the names: in the ledger
 
 
 def test_a_set_answer_from_retrieved_passages_covers_the_documents_but_says_they_were_not_read(client, setup,

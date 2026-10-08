@@ -474,10 +474,10 @@ def test_every_purpose_gets_luna_with_its_effort(configured):
     configured(OPENAI_KEY=FAKE_KEY)
     got = {p: llm.get_provider(p) for p in PURPOSES}
     assert {p.value: (g.model, g.reasoning_effort) for p, g in got.items()} == {
-        "agent": ("gpt-6-luna", "low"), "verify": ("gpt-6-luna", "low"), "vision": ("gpt-6-luna", "low"),
+        "agent": ("gpt-6-luna", "medium"), "verify": ("gpt-6-luna", "low"), "vision": ("gpt-6-luna", "low"),
         "measure": ("gpt-6-luna", "low"), "resolve": ("gpt-6-luna", "none"), "summary": ("gpt-6-luna", "none")}
     # one provider per (model, effort); every provider of one key shares one client (and connection pool)
-    assert got[Purpose.AGENT] is got[Purpose.VERIFY] and got[Purpose.RESOLVE] is got[Purpose.SUMMARY]
+    assert got[Purpose.VERIFY] is got[Purpose.VISION] and got[Purpose.RESOLVE] is got[Purpose.SUMMARY]
     assert got[Purpose.AGENT] is not got[Purpose.RESOLVE]
     assert got[Purpose.AGENT].client is got[Purpose.RESOLVE].client
 

@@ -12,7 +12,7 @@ FAKE_KEY = "test-openai-key-not-real-0001"
 FAKE_FALLBACK = "test-openai-fallback-not-real-0002"
 PROVIDER_ENV = ("OPENAI_KEY", "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_REASONING_EFFORT", "LLM_PROVIDER",
                 "ANTHROPIC_API_KEY", *(f"{kind}_{p.upper()}" for kind in ("MODEL", "EFFORT") for p in MODEL_PURPOSES))
-DEFAULT_EFFORTS = {"agent": "low", "verify": "low", "vision": "low", "measure": "low", "resolve": "none",
+DEFAULT_EFFORTS = {"agent": "medium", "verify": "low", "vision": "low", "measure": "low", "resolve": "none",
                    "summary": "none"}
 
 
@@ -92,7 +92,7 @@ def test_a_purpose_model_overrides_only_that_purpose(env):
     env.setenv("MODEL_VISION", "gpt-6-luna")
     env.setenv("EFFORT_VISION", "high")
     s = settings()
-    assert s.model_for("vision") == ("gpt-6-luna", "high") and s.model_for("agent") == ("gpt-5.4-mini", "low")
+    assert s.model_for("vision") == ("gpt-6-luna", "high") and s.model_for("agent") == ("gpt-5.4-mini", "medium")
 
 
 def test_empty_purpose_settings_mean_default(env):

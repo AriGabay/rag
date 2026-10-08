@@ -106,7 +106,7 @@ class Settings(BaseSettings):
     model_measure: str = ""  # measurements with their meaning (a background job)
     model_vision: str = ""  # reading a picture embedded in a document (ingestion)
     model_summary: str = ""  # the conversation summary
-    effort_agent: str = "low"
+    effort_agent: str = "medium"  # measured: completes calculations and explanations that "low" left partial
     effort_resolve: str = "none"
     effort_verify: str = "low"  # the verifier reads meaning, not only words
     effort_measure: str = "low"  # completeness over speed

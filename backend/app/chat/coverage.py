@@ -419,15 +419,10 @@ def build(ws: Workspace, answer: FinalAnswer, question: str) -> tuple[dict, Fina
         if not matching:
             note = f"**כיסוי:** לא נמצאו מסמכים שמכילים את כל המונחים של \"{scope['query']}\"."
         elif not complete:
-            parts = [f"**כיסוי:** {len(matching)} מסמכים מתאימים לתחום \"{scope['query']}\"; התשובה מבוססת על "
-                     f"{len(with_data)} מהם, ולכן אינה מכסה את כל התחום ({counts})."]
-            if not_checked:
-                parts.append(f"לא נבדקו: {_names(not_checked)}.")
-            if unused:
-                parts.append(f"נבדקו, לא נמצא בהם נתון שנכלל בתשובה: {_names(unused)}.")
-            if partially:
-                parts.append(f"נקראו חלקית (חלק מהתמונות לא נקראו): {_names(partially)}.")
-            note = " ".join(parts)
+            # one sentence in the answer; which documents were not checked, unused or partly read is listed in the
+            # sources panel (the ledger), not in the answer text
+            note = (f"**כיסוי:** {len(matching)} מסמכים מתאימים לתחום \"{scope['query']}\"; התשובה מבוססת על "
+                    f"{len(with_data)} מהם, ולכן אינה מכסה את כל התחום ({counts}). הפירוט בחלונית המקורות.")
         elif retrieved_only:
             # every document gave a verified datum, but some only through retrieved passages: not a full reading
             note = (f"**כיסוי:** נמצא נתון מאומת בכל {len(matching)} המסמכים המתאימים ({counts}). מ-"
