@@ -277,11 +277,49 @@ def extract_measurements(body: ReprocessBody, ctx: TenantContext = Depends(requi
     return {"queued": len(queued), "extraction_version": EXTRACTION_VERSION}
 
 
+@router.post("/positions")
+def backfill_positions(ctx: TenantContext = Depends(require_admin)) -> dict:
+    """Queue the geometry-only backfill (KTD3) for the office's current PDF versions read before positions existed:
+    their pages, words and table cells gain positions from the stored file, their reading (and every citation of it)
+    stays. It runs after ingestion; versions already queued are left alone."""
+    from app.extraction.geometry import POSITIONS_VERSION
+    from app.platform.jobs import enqueue_missing_positions
+
+    with tenant_tx(ctx) as conn:
+        queued = [str(v) for v in enqueue_missing_positions(conn)]
+        audit(conn, "positions_backfill", ctx.user_id, "office", ctx.office_id, queued=len(queued))
+    return {"queued": len(queued), "versions": queued, "positions_version": POSITIONS_VERSION}
+
+
+def _positions_progress(conn: Connection) -> dict:
+    """How far the geometry backfill is (KTD3): the office's current PDF versions, how many store positions, and over
+    the backfilled ones the blocks and tables that aligned, did not align, or sit on pages that cannot be converted."""
+    from app.extraction.geometry import POSITIONS_VERSION
+
+    def total(kind: str, state: str) -> str:
+        return (f"COALESCE(sum((v.ingestion->'positions_backfill'->'{kind}'->>'{state}')::int), 0)"
+                f" AS {kind}_{state}")
+
+    states = ("aligned", "unaligned", "no_positions")
+    r = conn.execute(text(
+        "SELECT count(*) AS total, count(*) FILTER (WHERE v.ingestion->>'positions' = :pv) AS positioned,"
+        " count(*) FILTER (WHERE v.ingestion ? 'positions_backfill') AS backfilled, "
+        + ", ".join(total(k, s) for k in ("blocks", "tables") for s in states)
+        + " FROM document_versions v JOIN documents d ON d.id = v.document_id AND d.deleted_at IS NULL"
+        " WHERE v.is_current AND v.status IN ('ready', 'needs_review') AND v.mime_type = 'application/pdf'"),
+        {"pv": POSITIONS_VERSION}).one()
+    return {"pdf_versions": r.total, "with_positions": r.positioned, "without_positions": r.total - r.positioned,
+            "backfilled": r.backfilled,
+            "blocks": {s: getattr(r, f"blocks_{s}") for s in states},
+            "tables": {s: getattr(r, f"tables_{s}") for s in states}}
+
+
 @router.get("/jobs")
 def jobs_summary(ctx: TenantContext = Depends(require_admin)) -> dict:
     from app.platform.pipeline import regression_summary
 
     with tenant_tx(ctx) as conn:
+        positions = _positions_progress(conn)
         rows = conn.execute(text(
             "SELECT kind, COALESCE(payload->>'mode', '') AS mode, status, count(*) AS n FROM jobs"
             " GROUP BY 1, 2, 3 ORDER BY 1, 2, 3")).all()
@@ -293,4 +331,5 @@ def jobs_summary(ctx: TenantContext = Depends(require_admin)) -> dict:
     return {"jobs": [{"kind": r.kind + (f":{r.mode}" if r.mode else ""), "status": r.status, "count": r.n}
                      for r in rows],
             "regressions": [{"version_id": str(r.id), "title": r.title, "summary": regression_summary(r.r),
-                             "regression": r.r} for r in held]}
+                             "regression": r.r} for r in held],
+            "positions": positions}

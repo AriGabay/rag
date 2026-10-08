@@ -1,7 +1,9 @@
 """PostgreSQL job queue with leases (KTD8).
 
-Two kinds share the queue: ``process`` (ingestion, one per version) and ``extract_facts`` (one attribute
-from one version, U7). ``jobs_claim`` serves process jobs first, so extraction never starves ingestion."""
+Several kinds share the queue: ``process`` (ingestion, one per version, and reindexing), ``extract_facts`` (one
+attribute from one version, U7), ``extract_measurements`` and ``positions`` (the geometry-only backfill of a version
+read before positions existed, KTD3). ``jobs_claim`` serves process jobs first, so no background work starves
+ingestion."""
 
 from __future__ import annotations
 
@@ -13,6 +15,9 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from app.config import get_settings
+from app.extraction.geometry import POSITIONS_VERSION
+
+PDF_MIME = "application/pdf"
 
 
 def enqueue_processing(conn: Connection, version_id: UUID) -> None:
@@ -152,3 +157,30 @@ def enqueue_reindex(conn: Connection, version_id: UUID, ingestion_version: str,
 def enqueue_measurements(conn: Connection, version_id: UUID, extraction_version: str) -> bool:
     return _requeue(conn, version_id, "extract_measurements", f"measure:{version_id}:{extraction_version}",
                     {"extraction_version": extraction_version})
+
+
+def positions_job_key(version_id: UUID) -> str:
+    return f"positions:{version_id}:{POSITIONS_VERSION}"
+
+
+def enqueue_positions(conn: Connection, version_id: UUID) -> bool:
+    """Queue the geometry-only backfill of one version (KTD3). One job per version and positions scheme: a queued or
+    running job is left alone; a finished or failed one is queued again (a file restored after it was missing)."""
+    return _requeue(conn, version_id, "positions", positions_job_key(version_id),
+                    {"positions_version": POSITIONS_VERSION})
+
+
+def versions_without_positions(conn: Connection, limit: int | None = None) -> list[UUID]:
+    """The office's current PDF versions whose reading predates positions (no ``positions`` marker of the current
+    scheme in their ingestion report), oldest first."""
+    return list(conn.execute(text(
+        "SELECT v.id FROM document_versions v JOIN documents d ON d.id = v.document_id AND d.deleted_at IS NULL"
+        " WHERE v.is_current AND v.status IN ('ready', 'needs_review') AND v.mime_type = :pdf"
+        " AND (v.ingestion->>'positions') IS DISTINCT FROM :pv ORDER BY v.created_at, v.id LIMIT :n"),
+        {"pdf": PDF_MIME, "pv": POSITIONS_VERSION, "n": limit}).scalars())
+
+
+def enqueue_missing_positions(conn: Connection, limit: int | None = None) -> list[UUID]:
+    """Queue the backfill for the office's current PDF versions without positions (lazily: only those, and only when
+    asked; it ranks below ingestion in ``jobs_claim``). Returns the versions a job was queued for."""
+    return [v for v in versions_without_positions(conn, limit) if enqueue_positions(conn, v)]

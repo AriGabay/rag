@@ -1,7 +1,8 @@
 """Document processing worker: claims jobs from the Postgres queue and dispatches them by kind.
 
 ``process`` jobs run the ingestion pipeline; ``extract_facts`` jobs extract one attribute from one
-version (KTD8). Run with ``python -m app.worker``. Several workers may run; ``jobs_claim`` uses
+version (KTD8); ``positions`` jobs give a version read before positions existed its page geometry, word spans and
+cell boxes from its stored file, keeping its reading (KTD3). Run with ``python -m app.worker``. Several workers may run; ``jobs_claim`` uses
 FOR UPDATE SKIP LOCKED so a job is never processed twice concurrently, and an expired lease
 lets another worker resume a crashed job."""
 
@@ -113,6 +114,30 @@ def handle_background(ctx: TenantContext, job, worker_id: str) -> None:
     logger.info("%s job %s: %s", job.kind, job.job_id, outcome)
 
 
+def handle_positions(ctx: TenantContext, job, worker_id: str) -> None:
+    """The geometry-only backfill of one version (KTD3). It never changes the version's status or reading: a
+    failure is recorded on the job only. A stored file that is missing (or a file the reader cannot open) fails the
+    job permanently with the reason, and nothing is written."""
+    keeper = _LeaseKeeper(job.office_id, job.job_id, worker_id)
+    keeper.start()
+    try:
+        try:
+            outcome = pipeline.backfill_positions(job.office_id, job.version_id)
+        finally:
+            keeper.stop_event.set()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("positions job %s failed: %s", job.job_id, type(exc).__name__)
+        logger.debug("%s", traceback.format_exc())
+        reason = exc.reason if isinstance(exc, ExtractionError) else type(exc).__name__
+        permanent = isinstance(exc, ExtractionError) and exc.permanent
+        with tenant_tx(ctx) as conn:
+            fail_job(conn, job.job_id, reason, permanent, job.attempts, job.max_attempts)
+        return
+    with tenant_tx(ctx) as conn:
+        finish_job(conn, job.job_id)
+    logger.info("positions job %s: %s", job.job_id, outcome)
+
+
 def run_one(worker_id: str) -> bool:
     """Claim and run one job. Returns False when the queue was empty."""
     job = claim(worker_id)
@@ -121,6 +146,9 @@ def run_one(worker_id: str) -> bool:
     ctx = pipeline.system_ctx(job.office_id)
     if job.kind == "extract_facts":
         handle_extract_facts(ctx, job, worker_id)
+        return True
+    if job.kind == "positions":
+        handle_positions(ctx, job, worker_id)
         return True
     if job.kind == "extract_measurements" or (job.payload or {}).get("mode") == "reindex":
         handle_background(ctx, job, worker_id)

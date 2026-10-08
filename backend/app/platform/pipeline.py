@@ -648,3 +648,94 @@ def run_measurements(office_id: UUID, version_id: UUID) -> str:
     with tenant_tx(ctx) as conn:
         bump_data_version(conn)
     return result.state
+
+
+# --- positions for versions read before them (KTD3) ---------------------------------------------------------------
+
+MSG_POSITIONS_NO_FILE = "הקובץ המקורי לא נמצא באחסון, ולכן לא נוספו לו מיקומי מקור"
+_POSITIONED_STATUSES = "('ready', 'needs_review', 'superseded')"  # versions with a reading a citation may point at
+
+
+def backfill_positions(office_id: UUID, version_id: UUID) -> str | None:
+    """Give a version read before positions existed the positions a fresh reading stores (U3, KTD3, R13), without a
+    new reading: the stored PDF's text layer is read again (no OCR, no vision, no model; font-map-repaired pages
+    through the corrections recorded in its ingestion report) and aligned to the existing blocks and tables by text
+    (``app.platform.positions``). One transaction writes every page's geometry and printed number, the spans of the
+    blocks that aligned, the cell boxes of the tables that aligned, the ``positions`` marker and the counts of what
+    aligned (``ingestion.positions_backfill``). The ``reading_id``, the ingestion version, the block numbers and
+    texts stay as they are, so no citation of the version becomes stale; a block or table that does not align gets
+    nothing. Idempotent: a version that has the marker is left alone, and so is one read again (a new
+    ``reading_id``) while this ran. A stored file that is missing ends the job (``ExtractionError``, permanent) with
+    nothing written."""
+    from app.platform import positions
+    from app.platform.storage import get_storage
+
+    ctx = system_ctx(office_id)
+    deadline = time.monotonic() + get_settings().job_timeout_seconds
+    select = ("SELECT v.storage_key, v.mime_type, v.ingestion FROM document_versions v JOIN documents d ON"
+              " d.id = v.document_id AND d.deleted_at IS NULL WHERE v.id = :v AND v.status IN "
+              + _POSITIONED_STATUSES)
+    with tenant_tx(ctx) as conn:
+        row = conn.execute(text(select), {"v": version_id}).first()
+        if row is None:
+            return None  # deleted, or never read
+        ing = row.ingestion or {}
+        if row.mime_type != "application/pdf":
+            return "skipped"
+        if ing.get("positions") == POSITIONS_VERSION:
+            return "present"
+        pages = [positions.StoredPage(r.page_no, r.method, r.ok) for r in conn.execute(text(
+            "SELECT page_no, method, ok FROM pages WHERE version_id = :v ORDER BY page_no"), {"v": version_id})]
+        blocks = [positions.StoredBlock(r.block_index, r.kind, r.page, r.method, r.text or "") for r in conn.execute(
+            text("SELECT block_index, kind, page, method, text FROM document_blocks WHERE version_id = :v"
+                 " ORDER BY block_index"), {"v": version_id})]
+        tables = [positions.StoredTable(r.table_index, r.structure or {}) for r in conn.execute(text(
+            "SELECT table_index, structure FROM extracted_tables WHERE version_id = :v ORDER BY table_index"),
+            {"v": version_id})]
+    try:
+        data = get_storage().get(row.storage_key)
+    except (OSError, ValueError):
+        logger.info("positions for version %s: stored file missing", version_id)
+        raise ExtractionError(MSG_POSITIONS_NO_FILE, permanent=True) from None
+    found = positions.read_positions(data, pages, blocks, tables, ing.get("fontmap"), get_settings(), deadline)
+    texts = {b.index: b.text for b in blocks}
+    with tenant_tx(ctx) as conn:
+        current = conn.execute(text(select + " FOR UPDATE OF v"), {"v": version_id}).first()
+        if current is None:
+            return None
+        now = current.ingestion or {}
+        if now.get("positions") == POSITIONS_VERSION:
+            return "present"
+        if now.get("reading_id") != ing.get("reading_id"):
+            return "reread"  # read again meanwhile: the new reading brought its own positions
+        for p in found.pages:
+            g = p.geometry
+            conn.execute(text(
+                "UPDATE pages SET mediabox = CAST(:mb AS jsonb), cropbox = CAST(:cb AS jsonb), rotation = :r,"
+                " display_width = :w, display_height = :h, printed_label = :pl, geometry_issue = :gi"
+                " WHERE version_id = :v AND page_no = :n"),
+                {"v": version_id, "n": p.page_no,
+                 "mb": json.dumps(g.mediabox) if g is not None and g.mediabox is not None else None,
+                 "cb": json.dumps(g.cropbox) if g is not None and g.cropbox is not None else None,
+                 "r": g.rotation if g is not None else None, "w": g.width if g is not None else None,
+                 "h": g.height if g is not None else None, "pl": p.printed_label,
+                 "gi": g.issue if g is not None else None})
+        for index, spans in found.spans.items():
+            # the text it was aligned to is still the block's text (the guard against a concurrent change)
+            conn.execute(text(
+                "UPDATE document_blocks SET spans = CAST(:s AS jsonb) WHERE version_id = :v AND block_index = :i"
+                " AND text = :t AND spans IS NULL"),
+                {"v": version_id, "i": index, "t": texts[index], "s": json.dumps(spans)})
+        for index, structure in found.tables.items():
+            conn.execute(text(
+                "UPDATE extracted_tables SET structure = CAST(:s AS jsonb) WHERE version_id = :v AND table_index = :i"),
+                {"v": version_id, "i": index, "s": json.dumps(structure, ensure_ascii=False)})
+        record = found.counts | {"pages": len(found.pages), "at": datetime.now(UTC).isoformat()}
+        conn.execute(text(
+            "UPDATE document_versions SET ingestion = COALESCE(ingestion, '{}'::jsonb)"
+            " || jsonb_build_object('positions', CAST(:p AS text), 'positions_backfill', CAST(:r AS jsonb))"
+            " WHERE id = :v"),
+            {"v": version_id, "p": POSITIONS_VERSION, "r": json.dumps(record)})
+    logger.info("positions for version %s: blocks %s, tables %s", version_id, found.counts["blocks"],
+                found.counts["tables"])
+    return "positioned"
