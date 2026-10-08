@@ -22,6 +22,7 @@ Tables (Word's own and those read from pictures) keep the paragraph that introdu
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import os
@@ -44,7 +45,7 @@ from app.extraction.base import (
     check_deadline,
 )
 from app.extraction.chunking import chunk_blocks, is_heading
-from app.extraction.images import PictureReading, VisionReader, read_picture
+from app.extraction.images import CONTEXT_CHARS, PictureReading, VisionReader, read_picture
 from app.extraction.tables import clean_cell, units_for
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,7 @@ HEADING_MAX_WORDS = 12
 HEADING_MAX_CHARS = 90
 NUMBERED_HEADING_LEVELS = 2  # numbered short paragraphs on list levels 0..1 are section headings
 PICTURE_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
+PICTURE_READER_VERSION = "docx-pictures-v2"  # a picture's reading, cached by content (v2: the model decides no-text)
 _HEB_LETTERS = "אבגדהוזחטיכלמנסעפצקרשת"
 
 
@@ -470,9 +472,21 @@ def _rels(zf: zipfile.ZipFile) -> dict[str, str]:
     return out
 
 
-def _read_pictures(w: _Walker, vision: VisionReader | None, settings: Settings) -> None:
+def _reading_key(data: bytes, context: str, vision: VisionReader | None):
+    """The cache key of a picture's reading: its bytes and the context the model is shown with it."""
+    from app.extraction.regions import IMAGE_CROP, ReadingKey, model_config
+
+    digest = hashlib.sha256(data + b"\0" + context[:CONTEXT_CHARS].encode()).hexdigest()
+    return ReadingKey("docx:" + digest, PICTURE_READER_VERSION, model_config(vision), IMAGE_CROP)
+
+
+def _read_pictures(w: _Walker, vision: VisionReader | None, settings: Settings, cache=None) -> None:
     """Read every picture once (a media part used twice is read once) in a small thread pool, then fill the
-    picture blocks in document order: text into the block, tables into ``w.tables``."""
+    picture blocks in document order: text into the block, tables into ``w.tables``. ``cache``: the office's
+    readings by content (``app.extraction.regions.ReadingCache``): a picture read before, in this or another
+    document, with the same context and reader configuration is not read again."""
+    from app.extraction.regions import CACHEABLE
+
     unique: dict[str, _Picture] = {}
     for pic in w.pictures:
         unique.setdefault(pic.rid, pic)
@@ -483,8 +497,23 @@ def _read_pictures(w: _Walker, vision: VisionReader | None, settings: Settings) 
             data = w.zf.read(pic.rid)
         except KeyError:
             return pic.rid, PictureReading("unread", "none", note="קובץ התמונה חסר במסמך")
+        key = _reading_key(data, pic.context, vision) if cache is not None else None
+        if key is not None:
+            try:
+                cached = cache.get(key)
+            except Exception:  # noqa: BLE001 - a cache that cannot be read only costs a fresh reading
+                logger.warning("reading cache lookup failed")
+                cached = None
+            if cached is not None:
+                return pic.rid, cached
         ext = posixpath.splitext(pic.rid)[1]
-        return pic.rid, read_picture(data, ext, pic.context, vision, settings.ocr_languages)
+        reading = read_picture(data, ext, pic.context, vision, settings.ocr_languages)
+        if key is not None and reading.cacheable and reading.status in CACHEABLE:
+            try:
+                cache.put(key, reading)
+            except Exception:  # noqa: BLE001
+                logger.warning("reading cache store failed")
+        return pic.rid, reading
 
     with ThreadPoolExecutor(max_workers=PICTURE_WORKERS) as pool:
         readings = dict(pool.map(read, unique.values()))
@@ -501,8 +530,8 @@ def _read_pictures(w: _Walker, vision: VisionReader | None, settings: Settings) 
         b.text = "\n".join(x for x in texts if x)
 
 
-def extract_docx(data: bytes, deadline: float, settings: Settings, vision: VisionReader | None = None
-                 ) -> ExtractionResult:
+def extract_docx(data: bytes, deadline: float, settings: Settings, vision: VisionReader | None = None,
+                 readings=None) -> ExtractionResult:
     _check_zip(data, settings.max_docx_uncompressed_mb)
     try:
         zf = zipfile.ZipFile(io.BytesIO(data))
@@ -529,7 +558,7 @@ def extract_docx(data: bytes, deadline: float, settings: Settings, vision: Visio
                     walk(content)
 
     walk(body)
-    _read_pictures(w, vision, settings)
+    _read_pictures(w, vision, settings, readings)
     blocks = w.blocks
     text = "\n".join(b.text for b in blocks if b.text)
     page = PageResult(page_no=1, text=text, method="docx", quality=1.0, ok=True)

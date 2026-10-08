@@ -76,7 +76,7 @@ from app.extraction.tables import RawTable, assemble_tables, logical_row, units_
 log = logging.getLogger(__name__)
 
 # The reader that produced a PDF's blocks; a version read by an older one is reprocessed.
-READER_VERSION = "pdf-blocks-v4"
+READER_VERSION = "pdf-blocks-v5"
 
 MSG_ENCRYPTED = "הקובץ מוגן בסיסמה ולא ניתן לעבד אותו"
 MSG_CORRUPT = "הקובץ פגום או שאינו PDF תקין"

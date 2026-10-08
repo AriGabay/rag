@@ -64,7 +64,8 @@ LOW_DPI = 150  # a PDF picture printed at less than this many pixels per inch is
 NUMERIC_WORDS = 4  # confident OCR words with digits that make a picture table-like (with NUMERIC_SHARE)
 NUMERIC_SHARE = 0.3
 VISION_MAX_SIDE = 2048  # long side of a picture sent to the model: the bound of a high-detail reading
-OCR_MIN_WORDS = 5  # confident words below which a picture is taken as carrying no text
+CONTEXT_CHARS = 400  # characters of the document text before a DOCX picture shown to the model with it
+OCR_MIN_WORDS = 5  # without the vision model, confident words below which a picture is taken as carrying no text
 OCR_MIN_CONFIDENCE = 60.0
 OCR_TARGET_WIDTH = 1600
 AGREEMENT_OK = 0.8
@@ -436,7 +437,8 @@ def read_gray(gray, context: str, vision: VisionReader | None, languages: str,
     share = _confident_share(words, confident)
     legible = ocr_ok and bool(confident) and share >= OCR_RELIABLE_SHARE  # what OCR found, it read with confidence
     reliable = ocr_ok and not few and share >= OCR_REGION_SHARE
-    if look.photo and not table_like and (few or share < 0.5):
+    # few OCR words are no proof a picture holds nothing: with the model, it decides (once per content, cached)
+    if vision is None and look.photo and not table_like and (few or share < 0.5):
         return PictureReading("no_text", "ocr" if ocr_on else "none", note="צילום ללא טקסט קריא", kind="photo")
     if reliable and not table_like and not low_res:
         return _from_ocr(gray, languages, note="נקרא ב-OCR בלבד; ייתכנו שגיאות זיהוי")
@@ -492,9 +494,10 @@ def _read_strict(gray, vision: VisionReader, languages: str, confident: list[str
 
 def _read_docx_picture(gray, context: str, vision: VisionReader | None, languages: str, words: list[dict],
                        confident: list[str], ocr_ok: bool, table_like: bool) -> PictureReading:
-    """A DOCX picture: few confident OCR words mean no text unless it looks like a table; the model's failures
-    fall back to OCR."""
-    if ocr_ok and len(confident) < OCR_MIN_WORDS and not table_like:
+    """A DOCX picture: with the model, the model reads it (few confident OCR words are no proof it holds nothing:
+    a scanned plan's labels are words OCR finds but cannot trust); without it, few confident OCR words mean no text
+    unless it looks like a table. The model's failures fall back to OCR."""
+    if vision is None and ocr_ok and len(confident) < OCR_MIN_WORDS and not table_like:
         return PictureReading("no_text", "ocr", note="תמונה ללא טקסט קריא", kind="photo")
     if vision is not None:
         png = _vision_png(gray)

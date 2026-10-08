@@ -25,6 +25,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict
 
 from app.extraction.images import (
+    CONTEXT_CHARS,
     PictureReading,
     VisionCallFailed,
     VisionOut,
@@ -97,7 +98,7 @@ class ModelVisionReader:
             raise VisionCallFailed(CallStatus.UNSUPPORTED.value)
         prompt = ""
         if context.strip():
-            prompt = ("ההקשר במסמך (הטקסט שלפני התמונה, לעזרה בלבד):\n<context>" + prompt_text(context[:400])
+            prompt = ("ההקשר במסמך (הטקסט שלפני התמונה, לעזרה בלבד):\n<context>" + prompt_text(context[:CONTEXT_CHARS])
                       + "</context>\n")
         prompt += "תמלל את התמונה לפי ההוראות."
         if careful:

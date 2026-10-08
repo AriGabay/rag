@@ -62,7 +62,7 @@ from app.extraction.images import (
 log = logging.getLogger(__name__)
 
 # The reader of regions: a cached reading made by an older one is not reused.
-REGION_READER_VERSION = "regions-v1"
+REGION_READER_VERSION = "regions-v2"
 
 INK_DPI = 100  # resolution of the paths-only render that finds ink outside the text layer
 INK_THRESHOLD = 160

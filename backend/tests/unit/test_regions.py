@@ -351,14 +351,21 @@ def test_a_low_resolution_table_with_two_ocr_words_goes_to_the_model(monkeypatch
 STAMP_WORDS = ["שמאי", "מקרקעין", "רישיון", "4821"]
 
 
-def test_a_small_stamp_with_text_is_read_and_a_photo_is_not_sent(monkeypatch):
+def test_a_small_stamp_with_text_is_read_and_the_model_decides_a_photo_holds_no_text(monkeypatch):
     scripted_ocr(monkeypatch, {STAMP: STAMP_WORDS})
     vision = ScriptedVision()
     result = extract(R6, vision)
     stamp, photo = images_of(result)
     assert (stamp.status, stamp.picture_text) == ("read", "שמאי מקרקעין\nרישיון 4821")
-    assert photo.status == "no_text" and photo.note
-    assert vision.calls == [STAMP]
+    # few OCR words are no proof a photo holds nothing (a scanned plan's labels): the model reads it once
+    assert (photo.status, photo.method) == ("no_text", "vision") and photo.note
+    assert vision.count(STAMP) == 1 and len(vision.calls) == 2
+
+
+def test_without_the_model_a_photo_with_few_ocr_words_is_taken_as_holding_no_text(monkeypatch):
+    scripted_ocr(monkeypatch, {STAMP: STAMP_WORDS})
+    photo = images_of(extract(R6, None))[1]
+    assert photo.status == "no_text" and photo.method != "vision" and photo.note
 
 
 # --- vision failures (KTD4) -----------------------------------------------------------------------------------
@@ -452,7 +459,7 @@ def test_a_reading_without_the_model_is_not_reused_once_the_model_is_allowed(mon
     assert {k.model_config for k in cache.rows} == {"none"}
     vision = ScriptedVision()
     stamp = images_of(extract(R6, vision, cache))[0]
-    assert vision.calls == [STAMP] and stamp.status == "read"
+    assert vision.count(STAMP) == 1 and stamp.status == "read"
 
 
 # --- pictures (images.py) -------------------------------------------------------------------------------------

@@ -82,6 +82,19 @@ def _png(w=400, h=200) -> bytes:
     return buf.getvalue()
 
 
+def _drawn_png(w=400, h=300) -> bytes:
+    """A picture with content (not blank): a gradient with lines, as a scanned drawing."""
+    from PIL import Image, ImageDraw
+
+    im = Image.linear_gradient("L").resize((w, h)).convert("RGB")
+    draw = ImageDraw.Draw(im)
+    for x in range(0, w, 37):
+        draw.line([(x, 0), (w - x, h)], fill="black", width=2)
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    return buf.getvalue()
+
+
 class _Vision:
     def __init__(self, out):
         self.out, self.calls = out, 0
@@ -95,12 +108,27 @@ def _words(*texts):
     return [{"text": t, "conf": 95.0} for t in texts]
 
 
-def test_a_photo_without_text_is_not_sent_to_the_model(monkeypatch):
+def test_without_the_model_a_picture_with_few_ocr_words_holds_no_text(monkeypatch):
     monkeypatch.setattr(images, "_ocr_words", lambda gray, lang: _words("x"))
     monkeypatch.setattr("app.extraction.ocr.ocr_available", lambda lang: True)
-    vision = _Vision(None)
-    reading = read_raster(_png(), "", vision, "heb+eng")
-    assert reading.status == "no_text" and vision.calls == 0
+    assert read_raster(_drawn_png(), "", None, "heb+eng").status == "no_text"
+
+
+def test_few_confident_ocr_words_are_no_proof_a_picture_holds_nothing(monkeypatch):
+    # a scanned plan: OCR finds many words but trusts almost none; the model reads its labels
+    monkeypatch.setattr(images, "_ocr_words", lambda gray, lang: _words("גוש") + [{"text": "3?49", "conf": 20.0}] * 60)
+    monkeypatch.setattr("app.extraction.ocr.ocr_available", lambda lang: True)
+    vision = _Vision(VisionOut("map", True, "גוש 3749 גוש 3853", [], "תשריט", []))
+    reading = read_raster(_drawn_png(), "", vision, "heb+eng")
+    assert vision.calls >= 1 and reading.method == "vision" and "3749" in reading.text
+
+
+def test_the_model_decides_a_photo_holds_no_text(monkeypatch):
+    monkeypatch.setattr(images, "_ocr_words", lambda gray, lang: _words("x"))
+    monkeypatch.setattr("app.extraction.ocr.ocr_available", lambda lang: True)
+    vision = _Vision(VisionOut("photo", True, "", [], "חזית הבניין", []))
+    reading = read_raster(_drawn_png(), "", vision, "heb+eng")
+    assert (reading.status, reading.method, reading.note) == ("no_text", "vision", "חזית הבניין") and vision.calls == 1
 
 
 def test_vision_table_confirmed_by_ocr_numbers_is_read(monkeypatch):
@@ -150,3 +178,43 @@ def test_duplicate_headers_make_a_reading_uncertain(monkeypatch):
     out = VisionOut("table", True, "", [VisionTableOut("", ["מחיר חציון", "מחיר חציון"], [["120,500", "97.5%"]], [])],
                     "טבלה", [])
     assert read_raster(_png(), "", _Vision(out), "heb+eng").status == "read_uncertain"
+
+
+class _Readings:
+    def __init__(self):
+        self.rows: dict = {}
+
+    def get(self, key):
+        return self.rows.get(key)
+
+    def put(self, key, reading):
+        self.rows[key] = reading
+
+
+def test_a_picture_read_once_is_taken_from_the_office_readings_on_the_next_ingestion(monkeypatch):
+    from app.extraction import docx
+
+    calls = []
+
+    def read_picture(data, ext, context, vision, languages):
+        calls.append(ext)
+        return images.PictureReading("read", "vision", text="מקרא: גוש 1234")
+
+    monkeypatch.setattr(docx, "read_picture", read_picture)
+    readings = _Readings()
+    first = extract_docx(FIXTURE.read_bytes(), time.monotonic() + 60, get_settings(), None, readings)
+    again = extract_docx(FIXTURE.read_bytes(), time.monotonic() + 60, get_settings(), None, readings)
+    assert len(calls) == 1 and len(readings.rows) == 1
+    assert [b.picture_text for b in again.blocks if b.kind == "image"] == \
+        [b.picture_text for b in first.blocks if b.kind == "image"] == ["מקרא: גוש 1234"]
+
+
+def test_a_picture_reading_depends_on_its_context_and_the_reader():
+    from app.extraction.docx import _reading_key
+
+    vision = _Vision(None)
+    vision.config = "gpt-6-luna:low"
+    key = _reading_key(b"png", "להלן תשריט:", vision)
+    assert key == _reading_key(b"png", "להלן תשריט:", vision)
+    assert key != _reading_key(b"png", "להלן טבלה:", vision)
+    assert key != _reading_key(b"png", "להלן תשריט:", None)  # an OCR-only reading is not the model's

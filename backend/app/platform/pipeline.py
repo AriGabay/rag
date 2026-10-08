@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 EXTRACTION_VERSION = "rules-v1"
 # Version of the document reading itself (blocks, pictures, chunk boundaries), per format. A version processed
 # under an older one is queued again by the admin reprocess.
-INGESTION_VERSION = "docx-blocks-v3"
+INGESTION_VERSION = "docx-blocks-v4"
 PDF_INGESTION_VERSION = PDF_READER_VERSION
 
 
