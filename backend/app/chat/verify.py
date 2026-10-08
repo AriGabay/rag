@@ -19,7 +19,10 @@ the ids it cites. Deterministic checks first:
 Then judge calls read each unit next to the evidence of the sources it cites (``app.chat.evidence``: the parts
 of each source that cover the claims, never an arbitrary prefix; each source once per call) and decide whether
 they support it, with the meaning of each number in view: which metric, unit, period, VAT status, area basis and
-subject.
+subject. A unit that cites nothing (or the wrong id) but that a source shown in the same call fully supports is
+``supported`` with that source in ``supported_by``; the server keeps it only when every named id is a source shown in
+that call and evidence of the turn, and the unit, cited so, passes the deterministic checks — then it cites the source
+itself (as ``needs_citation``). Otherwise the unit is unsupported, as without the naming.
 
 Verification fails closed. A unit the judge gave no verdict is a problem unless it is neutral navigation text
 (``exempt_without_verdict``: a one-word heading, label or column names, a question, a bare connective): lacking
@@ -49,7 +52,7 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.answering.verify import _NUMBER as _NUM_AT  # one reading of numbers for both checks
 from app.answering.verify import numbers_in
@@ -82,6 +85,7 @@ _NO_END = re.compile(r"(?:^|[\s(\-–—:*])(?:\d{1,2}(?:\.\d{1,2})*|[א-תA-Za-
 _LINE_LEAD = re.compile(r"\s*(?:#{1,6}\s+|>\s*|[-*+]\s+)?(?:\d{1,3}\.\s+)?")
 # a numbered heading's number ("9. השומה", "9.1 שיטת השומה", "**9.2.** ..."): part of the heading, never a claim
 _HEADING_NUMBER = re.compile(r"^(?:#{1,6}\s+)?(?:\*\*)?(?:\d{1,3}\.|\d{1,3}(?:\.\d{1,3})+\.?)(?:\*\*)?\s+(?=\S)")
+_EVIDENCE_ID = re.compile(r"[SMVC]\d+")  # what a judge may name as a unit's support: a turn's evidence, no assumption
 _QUANTITY_WORD = re.compile(r"₪|%|ש[\"״']?ח|מ[\"״']?ר|מיליון|אלף|דונם|מטר")
 JUDGE_CALL_CHARS = 30_000  # evidence per judge call; more units go to further calls, nothing is cut to fit
 JUDGE_MAX_UNITS = 40  # units per judge call (the verdicts must fit the output)
@@ -89,9 +93,10 @@ VERIFY_ALLOWANCE_SECONDS = 60  # verification may run this long past the turn's 
 RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures worth one more call
 
 JUDGE_POLICY = (
-    "אתה בודק עובדות במשרד שמאות. לכל יחידה ממוספרת מתשובה מצורפים רק המקורות שהיא מצטטת. קבע לכל יחידה:\n"
+    "אתה בודק עובדות במשרד שמאות. ליחידות הממוספרות מתשובה מצורפים רק המקורות שהן מצטטות (<sources>). קבע לכל "
+    "יחידה:\n"
     "supported — המקורות תומכים בה במלואה; partial — רק בחלקה; unsupported — אינם תומכים, סותרים, או שאין לה "
-    "מקורות למרות שהיא טענה עובדתית; not_factual — אינה טענה עובדתית (פתיח, מעבר, הסתייגות, הצעה, שאלה); "
+    "מקורות למרות שהיא טענה עובדתית (ראה כלל 9); not_factual — אינה טענה עובדתית (פתיח, מעבר, הסתייגות, הצעה, שאלה); "
     "navigation — כותרת, תווית או שורת כותרות של טבלה שרק מכריזה מה בא אחריה (שם נכס, מסמך, נושא או עמודה) ואינה "
     "קובעת דבר. כותרת או תווית שקובעת משהו על נכס, מסמך או ערך (\"הנכס פנוי\", \"השווי נקבע לפי גישת ההשוואה\") "
     "היא טענה ונבדקת ככל טענה; עיצוב, הדגשה או נקודתיים אינם הופכים טענה ללא-עובדתית.\n"
@@ -113,7 +118,10 @@ JUDGE_POLICY = (
     "בו כמה ערכים מאותו סוג לאותה שאלה (למשל שורה אחת מטבלה בת כמה שורות) כאילו הוא הערך היחיד או המייצג, בלי לומר "
     "שהוא דוגמה ובלי היקף הטבלה — partial, עם הסיבה \"ריבוי ערכים\". (7) מסקנה מסומנת (\"מכאן עולה\", \"מכך "
     "נובע\") נבדקת לפי האם היא נובעת מהתוכן המצוטט; אם כן — supported. (8) נתון קרוב שמוצג כאילו הוא הנתון "
-    "שהתבקש (למשל שטח בנוי כתשובה לשאלה על שטח המגרש, בלי לומר שזה נתון אחר) — unsupported."
+    "שהתבקש (למשל שטח בנוי כתשובה לשאלה על שטח המגרש, בלי לומר שזה נתון אחר) — unsupported. (9) supported_by: "
+    "יחידה שאינה מצטטת דבר, או מצטטת מזהה שאינו תומך בה, ואחד המקורות המוצגים ב-<sources> תומך בה במלואה — "
+    "supported, וב-supported_by ציין את מזהה (id) המקור המוצג שתומך בה; השרת יבדוק ויוסיף את הציטוט. אל תציין "
+    "מקור שלא הוצג. בכל מקרה אחר supported_by ריק."
 )
 
 
@@ -134,6 +142,9 @@ class JudgeVerdict(_Strict):
     index: int
     verdict: Literal["supported", "partial", "unsupported", "not_factual", "navigation"]
     reason: str
+    # for a supported unit that does not cite its support: the shown sources that support it (the server checks
+    # them and cites them). A factory default: optional for a reply, still required by the strict schema.
+    supported_by: list[str] = Field(default_factory=list)
 
 
 class JudgeOutput(_Strict):
@@ -283,7 +294,8 @@ class VerifyReport:
         for u, ids in _cites_by_unit(cites):
             at = _citation_point(markdown, u)
             if not any(a <= at < b for a, b in cuts):
-                edits.append((at, at, "".join(f"[{i}]" for i in ids)))
+                space = "" if at > 0 and markdown[at - 1] in "] " else " "
+                edits.append((at, at, space + "".join(f"[{i}]" for i in ids)))
         # edit by span, last first, so earlier spans stay valid and no edit depends on matching text again
         text = markdown
         done_from = len(text) + 1
@@ -425,12 +437,15 @@ def _cites_by_unit(problems: list[Problem]) -> list[tuple[Unit, list[str]]]:
 
 
 def _citation_point(markdown: str, unit: Unit) -> int:
-    """Where a citation joins a unit: after its last citation, else before its final punctuation."""
+    """Where a citation joins a unit: after its last citation, else before its final punctuation (in a table row,
+    inside its last cell)."""
     span = markdown[unit.start:unit.end]
     last = list(_IDS.finditer(span))
     if last:
         return unit.start + last[-1].end()
     stripped = span.rstrip()
+    if unit.table_span is not None and stripped.endswith("|"):
+        stripped = stripped[:-1].rstrip()
     end = unit.start + len(stripped)
     while end > unit.start and markdown[end - 1] in ".:;!?":
         end -= 1
@@ -923,7 +938,38 @@ def _judge_batch(provider: LLMProvider, batch: _Batch, ws: Workspace, usage: lis
         got, status, parts = judge(provider, batch, rendered, usage, deadline, coverage)
     if status != "ok":
         raise VerificationUnavailable(status)
-    return got, parts
+    return _shown_support(got, batch, ws), parts
+
+
+def _shown_support(verdicts: dict[int, JudgeVerdict], batch: _Batch, ws: Workspace) -> dict[int, JudgeVerdict]:
+    """A ``supported`` verdict that names a support the unit does not cite stands only when every id it names is a
+    source shown in this call and evidence of the turn (``S#``, ``M#``, ``V#``, ``C#``); otherwise the unit is
+    unsupported, as if no source supported it."""
+    shown = {sid for u in batch.units for sid in u.ids if _source_parts(ws, sid) is not None}
+    units = {u.index: u for u in batch.units}
+    out = dict(verdicts)
+    for i, v in verdicts.items():
+        named = [s for s in v.supported_by if s not in units[i].ids]
+        if v.verdict != "supported" or not named:
+            continue
+        wrong = [s for s in named if s not in shown or not _EVIDENCE_ID.fullmatch(s)]
+        if wrong:
+            out[i] = v.model_copy(update={"verdict": "unsupported", "supported_by": [], "reason": (
+                f"הטענה אינה מצטטת מקור, והמקור שצוין כתומך בה ({', '.join(wrong)}) לא הוצג לבדיקה; צטט את המקור "
+                "שתומך בה")})
+    return out
+
+
+def _named_support(unit: Unit, named: list[str], ws: Workspace, question: str) -> Problem | None:
+    """The deterministic checks of a unit that cites ``named`` too (numbers, VAT, the meaning of each number,
+    against their full text): the judge's naming of a support is accepted only if the unit, cited so, passes them.
+    None when it does; otherwise the problem, on the unit itself."""
+    cited = Unit(unit.index, unit.raw, unit.text, [*unit.ids, *named], unit.start, unit.end, unit.table_header,
+                 unit.table_span, unit.context)
+    failed = deterministic([cited], ws, question, {unit.index: meaning.check(cited, ws)})
+    if not failed:
+        return None
+    return Problem(unit, f"לא נתמך במקורות: הטענה אינה מצטטת מקור, ולפי {', '.join(named)}: {failed[0].reason}")
 
 
 def _judge_all(provider: LLMProvider, units: list[Unit], ws: Workspace, usage: list[dict],
@@ -1004,5 +1050,13 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 report.problems.append(Problem(u, "לא נתמך במקורות: " + v.reason))
             elif v.verdict == "partial":
                 report.problems.append(Problem(u, "נתמך חלקית: " + v.reason, "partial"))
+            elif named := [s for s in dict.fromkeys(v.supported_by) if s not in u.ids]:
+                # supported by a shown source the unit does not cite: kept, and cited, only if the numbers agree
+                failed = _named_support(u, named, ws, question)
+                if failed is not None:
+                    report.problems.append(failed)
+                else:
+                    report.problems += [Problem(u, f"נתמך ב-{s}, שהתשובה לא ציטטה", kind="needs_citation", cite=s)
+                                        for s in named]
     return report
 

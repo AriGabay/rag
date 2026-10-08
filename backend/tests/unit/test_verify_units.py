@@ -525,3 +525,104 @@ def test_without_parts_the_judge_schema_and_answer_are_unchanged():
     r = verify_answer(p, a, _ws(SOURCE), "?", [])
     assert "<request_parts>" not in p.calls[0].input and p.calls[0].schema is verify.JudgeOutput
     assert r.part_outcomes(r.apply(a)) == []
+
+
+# --- a correct claim that cites nothing, next to a claim citing its source: the judge names the source -------------
+
+TABLE = ("טבלת שלבים: שלב א — סף 40 נקודות, יחס 0.62, עבר. שלב ב — סף 55 נקודות, יחס 0.71, עבר. "
+         "סה\"כ הפרויקט: 95 נקודות, עבר.")
+OTHER = "נספח: בשלב ג נקבע סף של 63 נקודות."
+
+
+def _supported_by(rule) -> ScriptedProvider:
+    """A judge answering each unit by ``rule(unit_text, cites) -> (verdict, supported_by)``."""
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        out = []
+        for m in re.finditer(r'<unit index="(\d+)" cites="([^"]*)">\n(.*?)\n</unit>', input, re.S):
+            verdict, by = rule(m.group(3), m.group(2))
+            out.append({"index": int(m.group(1)), "verdict": verdict, "reason": "בדיקה", "supported_by": by})
+        return {"verdicts": out}
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    return p
+
+
+def _named(source: str, also: str | None = None):
+    """Every unit supported; one citing nothing is said to be supported by ``source``."""
+    return lambda text, cites: ("supported", [] if cites else [source, *([also] if also else [])])
+
+
+def test_the_judge_schema_and_policy_name_the_supporting_source():
+    assert "supported_by" in verify.JudgeVerdict.model_fields and "supported_by" in verify.JUDGE_POLICY
+    v = verify.JudgeVerdict(index=0, verdict="supported", reason="x")  # optional: older replies stay valid
+    assert v.supported_by == []
+
+
+def test_an_uncited_correct_sentence_next_to_a_cited_one_is_kept_with_the_citation_appended():
+    md = "שלב א עבר עם סף 40 נקודות [S1]. בשלב ב הסף היה 55 נקודות והיחס 0.71, ולכן גם הוא עבר."
+    a = _answer(md)
+    r = verify_answer(_supported_by(_named("S1")), a, _ws(TABLE), "?", [])
+    assert r.ok and not r.removed_units()
+    out = r.apply(a).answer_markdown
+    assert out == "שלב א עבר עם סף 40 נקודות [S1]. בשלב ב הסף היה 55 נקודות והיחס 0.71, ולכן גם הוא עבר [S1]."
+
+
+def test_an_uncited_sentence_whose_number_is_not_in_the_named_source_is_removed():
+    md = "שלב א עבר עם סף 40 נקודות [S1].\nבשלב ג נקבע סף של 63 נקודות."
+    a = _answer(md)  # 63 is a number of the turn (S2), so it passes the uncited number check, but not of S1
+    r = verify_answer(_supported_by(_named("S1")), a, _ws(TABLE, OTHER), "?", [])
+    assert [p.unit.index for p in r.problems if p.removes_unit] == [1]
+    out = r.apply(a).answer_markdown
+    assert "63" not in out and "40 נקודות [S1]" in out
+
+
+def test_supported_by_a_source_not_shown_in_the_batch_is_ignored_and_the_unit_removed():
+    md = "שלב א עבר עם סף 40 נקודות [S1].\nבשלב ג נקבע סף של 63 נקודות."
+    a = _answer(md)  # S2 states the 63, but no unit cites it, so the judge was never shown it
+    r = verify_answer(_supported_by(_named("S2")), a, _ws(TABLE, OTHER), "?", [])
+    assert [p.unit.index for p in r.problems if p.removes_unit] == [1]
+    assert "63" not in r.apply(a).answer_markdown
+
+
+@pytest.mark.parametrize("named", ["S7", "P1", "A1"])
+def test_supported_by_an_id_that_is_no_evidence_of_the_turn_is_removed(named):
+    md = "שלב א עבר עם סף 40 נקודות [S1].\nבשלב ב הסף היה 55 נקודות."
+    a = _answer(md)
+    r = verify_answer(_supported_by(_named("S1", also=named)), a, _ws(TABLE), "?", [])
+    assert [p.unit.index for p in r.problems if p.removes_unit] == [1]
+
+
+def test_an_uncited_claim_with_no_evidence_in_the_batch_stays_unsupported():
+    md = "שלב א עבר עם סף 40 נקודות.\nהנכס פנוי."
+    a = _answer(md)  # nothing is cited, so no source is shown; a source the judge names anyway is not accepted
+    p = _supported_by(lambda t, c: ("supported", ["S1"]))
+    r = verify_answer(p, a, _ws(TABLE), "?", [])
+    assert "<source id=" not in p.calls[0].input
+    assert sorted(x.unit.index for x in r.problems if x.removes_unit) == [0, 1]
+
+
+def test_a_cited_unit_naming_its_own_source_is_unchanged():
+    md = "שלב א עבר עם סף 40 נקודות [S1]."
+    a = _answer(md)
+    r = verify_answer(_supported_by(lambda t, c: ("supported", ["S1"])), a, _ws(TABLE), "?", [])
+    assert r.ok and not r.problems and r.apply(a).answer_markdown == md
+
+
+def test_supported_by_is_ignored_for_a_verdict_other_than_supported():
+    md = "שלב א עבר עם סף 40 נקודות [S1].\nבשלב ב הסף היה 55 נקודות."
+    a = _answer(md)
+    r = verify_answer(_supported_by(lambda t, c: ("supported", []) if c else ("unsupported", ["S1"])), a,
+                      _ws(TABLE), "?", [])
+    assert [p.unit.index for p in r.problems if p.removes_unit] == [1]
+
+
+def test_an_uncited_table_row_gets_the_citation_inside_its_last_cell():
+    md = "שלב א עבר עם סף 40 נקודות [S1].\n\n| שלב | סף | יחס |\n|---|---|---|\n| ב | 55 | 0.71 |"
+    a = _answer(md)
+    p = _supported_by(lambda t, c: ("navigation" if "שלב" in t and "|" in t else "supported",
+                                    [] if c or "שלב" in t else ["S1"]))
+    r = verify_answer(p, a, _ws(TABLE), "?", [])
+    assert r.ok and not r.removed_units()
+    assert r.apply(a).answer_markdown.endswith("| ב | 55 | 0.71 [S1] |")

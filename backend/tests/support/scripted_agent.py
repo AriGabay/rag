@@ -54,7 +54,8 @@ class ScriptedAgent(ScriptedProvider):
             if callable(verdict):
                 return verdict(input)
             indexes = [int(i) for i in re.findall(r'<unit index="(\d+)"', input)]
-            out = {"verdicts": [{"index": i, "verdict": verdict, "reason": "בדיקה"} for i in indexes]}
+            out = {"verdicts": [{"index": i, "verdict": verdict, "reason": "בדיקה", "supported_by": []}
+                                for i in indexes]}
             if "<request_parts>" in input:  # every part answered by the batch (a test of coverage scripts its own)
                 out["parts"] = [{"index": int(i), "coverage": "answered", "units": indexes, "reason": "בדיקה"}
                                 for i in re.findall(r'<part index="(\d+)">', input)]
