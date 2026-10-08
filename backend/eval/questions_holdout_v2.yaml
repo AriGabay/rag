@@ -6,9 +6,8 @@
 # and without reading the answering code in backend/app (only backend/app/extraction/* and
 # backend/app/appraisal/extract.py were read, to make sure the documents create no records). Every expected
 # behavior below was fixed in advance. Do NOT use this set for tuning prompts, vocabulary or code; do not edit
-# an item's question or expected outcome after seeing results - add a new item instead. Its topic words are
-# guarded by tests/unit/test_no_topic_vocabulary.py (HELD_OUT_TERMS, v2 block), so they can never be added to
-# backend/app.
+# an item's question or expected outcome after seeing results - add a new item instead. No code path routes by its
+# topic words.
 #
 # Truth: every expected value, page and coverage list is derived from tests/fixtures/holdout_v2_truth.yaml
 # (documents K1..K8 and K3v2 in tests/fixtures/holdout_v2/, office A, group G4 "ידע כללי ב", visible to

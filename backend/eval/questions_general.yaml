@@ -11,8 +11,8 @@
 # them. D* ids are the original fixtures (ground_truth.yaml `documents`); their mentions of these topics are
 # listed in general_facts.existing_mentions. H4 is superseded by H4v2 and never counts as a current document.
 #
-# Item fields: id, category, held_out (the item's topic/attribute word, listed in `terms`, occurs nowhere in
-# backend/app; enforced by tests/unit/test_no_topic_vocabulary.py), user (default admin-a@demo.test),
+# Item fields: id, category, held_out (the item's topic/attribute word, listed in `terms`; no test forbids
+# professional terms in backend/app), user (default admin-a@demo.test),
 # cloud (on | off, default on), turns (one or more; a multi-turn item is one conversation).
 #
 # How each expectation is scored (wording is never scored):

@@ -166,6 +166,8 @@ def test_a_table_continuing_on_the_next_page_is_one_table_with_row_pages():
     assert rows[0].text.startswith("טבלת התחשיב לפי רכיבים: ")
     whole = [c for c in result.chunks if c.kind == "table" and c.table_index == 1]
     assert sorted({p for c in whole for p in c.page_list}) == [2, 3]
+    # every part of the table passage repeats its caption and header, so search finds it by them (U12)
+    assert all(c.text.startswith("טבלת התחשיב לפי רכיבים:\nרכיב | שטח (מ״ר) | שווי (₪)") for c in whole)
 
 
 # --- pictures --------------------------------------------------------------------------------------------------

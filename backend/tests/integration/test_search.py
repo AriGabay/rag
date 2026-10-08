@@ -600,3 +600,158 @@ def test_a_negated_variant_added_to_a_question_about_presence_is_dropped(setup):
         negative = locate_evidence(conn, ["מעלית", "אין מעלית"], question="באילו שומות אין מעלית?")
     assert "דוח 777" in [d.title for d in positive.documents if d.full_support]
     assert [d.title for d in negative.documents if d.full_support] == ["דוח 888"]
+
+
+# --- U12: search on corrected content, abbreviations, table hints and title naming -------------------------------
+
+def _passages(ctx, query, limit=8, **kw):
+    from app.platform.search import search_passages
+
+    with tenant_tx(ctx) as conn:
+        return search_passages(conn, query, limit, **kw)
+
+
+def _named(ctx, query):
+    from app.platform.search import documents_named
+
+    with tenant_tx(ctx) as conn:
+        return [d for d, _ in documents_named(conn, query)]
+
+
+_STREETS = ("האלון", "הברוש", "האורן", "הדולב", "התאנה", "הזית")
+
+
+def _reports_sharing_professional_words(a, n=6):
+    """Reports whose text carries the office's common professional words ("השווי", "מצב התחזוקה")."""
+    return [_doc(a, [(f"השווי של הנכס נקבע בגישת ההשוואה. מצב התחזוקה של הבניין טוב. הדירה בקומה {i + 1}.", [1])],
+                 title=f"שומה — רחוב {_STREETS[i]} {i + 10}")[0] for i in range(n)]
+
+
+def _generic_title_report(a):
+    """A long report whose title holds the generic word "שווי" next to its address."""
+    return _doc(a, [(f"סעיף {i}: שווי השוק של הנכס נבחן מול עסקאות באזור, והשווי נקבע בהתאם לנתוני הסביבה.", [i + 1])
+                    for i in range(12)] + [("מצב התחזוקה של הבניין סביר.", [13])],
+                title="שומה שווי שוק — רחוב התמר 5, כפר הדר")[0]
+
+
+def test_a_generic_word_in_one_title_does_not_capture_the_results(office):
+    """Real content: every top result of a value question came from the one report whose title happened to hold the
+    generic word "שווי"; the passage that answered it, in another report, was pushed out. A word most documents'
+    text carries names no document, and one word never names a document twice through its prefix-stripped form."""
+    a, *_ = office
+    _reports_sharing_professional_words(a)
+    generic = _generic_title_report(a)
+    answer, _ = _doc(a, [("רקע כללי על הסביבה.", [1]), ('שווי מ"ר מבונה בשפ"פ נקבע ל-4,000 ₪.', [2])],
+                     title="שומה — רחוב הדקל 3")
+    for query in ('שווי מ"ר מבונה שפ"פ', 'שווי מ"ר מבונה', "שווי מטר מרובע מבונה"):
+        assert _named(a.ctx(), query) == [], query
+        hits = _passages(a.ctx(), query)
+        assert any(h["document_id"] == answer and "4,000" in h["text"] for h in hits), query
+        assert {h["document_id"] for h in hits} != {generic}, query
+
+
+def test_a_distinctive_name_or_address_in_the_query_still_leads_with_its_document(office):
+    a, *_ = office
+    reports = _reports_sharing_professional_words(a)
+    generic = _generic_title_report(a)
+    towers, _ = _doc(a, [("מצב התחזוקה של הבניין טעון שיפוץ.", [1])], title="חוות דעת — מגדלי הנחל")
+    # an address: a title word with its house number, though the title also holds a generic word
+    assert _named(a.ctx(), "מה מצב התחזוקה בהתמר 5?") == [generic]
+    hits = _passages(a.ctx(), "מה מצב התחזוקה בהתמר 5?")
+    assert hits[0]["document_id"] == generic and "סביר" in hits[0]["text"]
+    # a name: two words no other title and few documents hold
+    assert _named(a.ctx(), "מה מצב התחזוקה במגדלי הנחל?") == [towers]
+    assert _passages(a.ctx(), "מה מצב התחזוקה במגדלי הנחל?")[0]["document_id"] == towers
+    # a word most titles hold, with a number, names nothing ("שומה 12" is any report's number)
+    assert _named(a.ctx(), "שומה 12") == []
+    assert _named(a.ctx(), "מה השווי בהאורן 12?") == [reports[2]]
+
+
+def test_an_abbreviation_and_its_spelled_out_form_retrieve_the_same_passage(office):
+    """Each spelling finds the passage written in the other, as lexical evidence, among reports that share the other
+    words of the question."""
+    a, *_ = office
+    for i in range(4):
+        _doc(a, [(f"שטח הדירה {80 + i} מ\"ר. הדירה כוללת מחסן ושכירות החניה כלולה.", [1])],
+             title=f"שומה — רחוב האלה {i + 1}")
+    rent, _ = _doc(a, [("דמ\"ש ראויים לנכס: 60 ₪ למ\"ר לחודש.", [1])], title="שומה — רחוב הרימון 4")
+    open_space, _ = _doc(a, [('לדירה צמוד שפ"פ מגונן.', [1])], title="שומה — רחוב השקד 8")
+    planning, _ = _doc(a, [("לפי תכנית בניין עיר החלה, ייעוד המגרש למגורים.", [1])], title="שומה — רחוב הארז 6")
+    for short, full, doc in (('מה הדמ"ש הראויים?', "מה דמי השכירות הראויים?", rent),
+                             ('מה שטח השפ"פ?', "מה השטח הפרטי הפתוח?", open_space),
+                             ('מה קובעת התב"ע?', "מה קובעת תכנית בניין עיר?", planning)):
+        for query in (short, full):
+            assert any(h["document_id"] == doc and h["lexical_support"] for h in _passages(a.ctx(), query)), query
+
+
+def test_corrected_text_is_what_lexical_and_semantic_search_index(office):
+    """A block whose font map was repaired keeps its original text for audit only: the corrected text is indexed
+    for lexical search and embedded, and the broken form finds nothing."""
+    from app.extraction.base import Block
+    from app.extraction.chunking import chunk_blocks
+    from app.platform.search import _lexical, _scope_sql, _semantic
+    from app.providers.embeddings import get_embedding_provider, to_pgvector
+
+    a, *_ = office
+    _reports_sharing_professional_words(a, 3)
+    doc, ver = make_document(a, a.default_group_id, "שומה — רחוב הערבה 2", sha="5c" * 32)
+    corrected, original = "הנכס נמצא בשכונה שקטה ומבוקשת.", "הðכס ðמצא בשכוðה שקטה ומבוקשת."
+    blocks = [Block(0, "heading", "1. תיאור הסביבה", section="1. תיאור הסביבה", page=1),
+              Block(1, "paragraph", corrected, section="1. תיאור הסביבה", page=1, original_text=original)]
+    result = ExtractionResult(1, [PageResult(1, corrected, "text_layer", 1.0, True)], [],
+                              chunk_blocks(blocks, []), blocks=blocks)
+    info = pipeline.VersionInfo(ver, doc, "k", "application/pdf", None)
+    with tenant_tx(a.system) as conn:
+        pipeline.persist_extraction(conn, info, result)
+    pipeline.embed_stage(a.system, info, 1e18)
+    with tenant_tx(a.ctx()) as conn:
+        [chunk] = conn.execute(text("SELECT id, normalized_text, embedding::text AS e FROM chunks WHERE version_id = :v"),
+                               {"v": ver}).all()
+        assert "ð" not in chunk.normalized_text and "שכונה" in chunk.normalized_text.split()
+        assert _lexical(conn, ["שכונה"], _scope_sql(None))[0] == chunk.id
+        assert _lexical(conn, ["בשכוðה"], _scope_sql(None)) == []
+        assert _semantic(conn, "שכונה שקטה ומבוקשת", _scope_sql(None))[0] == chunk.id
+    expected = to_pgvector(get_embedding_provider().embed_passages([chunk_blocks(blocks, [])[0].text])[0])
+    assert [round(float(x), 4) for x in chunk.e.strip("[]").split(",")] == [
+        round(float(x), 4) for x in expected.strip("[]").split(",")]
+
+
+def _table_report(a, title="שומה — רחוב הברוש 9"):
+    from app.extraction.base import Block, TableResult, TableRow
+    from app.extraction.chunking import chunk_blocks
+
+    doc, ver = make_document(a, a.default_group_id, title, sha="7d" * 32)
+    rows = [["חנות 1", "40", "קרקע"], ["חנות 2", "35", "קרקע"], ["חנות 3", "50", "קרקע"], ["משרד 4", "80", "א"],
+            ["משרד 5", "90", "ב"]]
+    table = TableResult(0, ["יחידה", "שטח", "קומה"], [None, "מ״ר", None], [TableRow(1, r) for r in rows], 1, 1,
+                        section="3. פירוט היחידות", caption="להלן פירוט היחידות בבניין:", block_index=2)
+    blocks = [Block(0, "heading", "3. פירוט היחידות", section="3. פירוט היחידות", page=1),
+              Block(1, "paragraph", "להלן פירוט היחידות בבניין:", section="3. פירוט היחידות", page=1),
+              Block(2, "table", "\n".join(" | ".join(r) for r in rows), section="3. פירוט היחידות", page=1,
+                    table_index=0)]
+    result = ExtractionResult(1, [PageResult(1, "x", "text_layer", 1.0, True)], [table], chunk_blocks(blocks, [table]),
+                              blocks=blocks)
+    info = pipeline.VersionInfo(ver, doc, "k", "application/pdf", None)
+    with tenant_tx(a.system) as conn:
+        pipeline.persist_extraction(conn, info, result)
+    pipeline.embed_stage(a.system, info, 1e18)
+    return doc, ver
+
+
+def test_rows_capped_by_the_diversity_cap_keep_the_table_and_name_its_handle(office):
+    """A query matching three rows of one table: the row cap shows two of them, the table passage stands in for the
+    rest, and the search result names the table's handle so the whole table can be opened."""
+    from app.chat import tools as T
+
+    a, *_ = office
+    _reports_sharing_professional_words(a, 3)
+    doc, ver = _table_report(a)
+    hits = _passages(a.ctx(), "חנות בקומת קרקע", 3)
+    assert sum(h["kind"] == "table_row" for h in hits) == 2
+    assert any(h["kind"] == "table" and h["table_index"] == 0 for h in hits)
+    ws = T.Workspace(ctx=a.ctx())
+    out = T.tool_search(ws, "חנות בקומת קרקע", None, 3)
+    handle = next(h for h, v in ws.handles.items() if v["kind"] == "T" and v["table_index"] == 0)
+    assert 'kind="table"' in out and "להלן פירוט היחידות בבניין:" in out
+    hint = out.split("</source>")[-1]
+    assert handle in hint and "read" in hint and "table=" in hint

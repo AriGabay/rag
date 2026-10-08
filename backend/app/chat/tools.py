@@ -501,6 +501,10 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                                     if h["kind"] in ("table", "table_row") and h.get("table_index") is not None})
         # a table chunk already holds its rows: a row hit of a returned table part adds nothing
         tables = [h for h in hits if h["kind"] == "table"]
+        # matching rows the per-table cap left out: the handle of their table, to open it whole
+        capped = [(_table_handle(ws, h["document_id"], h["version_id"], ws.readings.get(str(h["version_id"])),
+                                 h["table_index"]), h["rows_not_shown"])
+                  for h in hits if h.get("rows_not_shown") and h.get("table_index") is not None]
         out = []
         for h in hits:
             if h["kind"] == "table_row" and any(
@@ -524,7 +528,12 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
             ws.touch(h["document_id"], h["title"], "retrieved", h["version_id"] in partial)
     if not out:
         return f'לא נמצאו קטעים עבור "{query}". אפשר לנסות ניסוח אחר, מונחים נרדפים או חיפוש בתוך מסמך מסוים.'
-    return "\n\n".join(_render_source(s) for s in out)
+    hints = [MSG_ROWS_NOT_SHOWN.format(handle=t, n=n) for t, n in capped]
+    return "\n\n".join([*(_render_source(s) for s in out), *hints])
+
+
+MSG_ROWS_NOT_SHOWN = ("בטבלה {handle} התאימו לחיפוש עוד {n} שורות שלא הוצגו כאן. לקריאת הטבלה כולה, עם הכותרות "
+                      "וההערות: read עם table={handle}.")
 
 
 MSG_STALE_REF = ("המקור {source_id} נקרא מקריאה קודמת של המסמך: המסמך עובד מחדש מאז, והמיקום שלו אינו תקף עוד. "

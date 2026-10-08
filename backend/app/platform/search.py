@@ -334,19 +334,42 @@ ROWS_PER_TABLE = 2
 
 
 def diversify_rows(hits: list[dict], limit: int) -> list[dict]:
-    """Hits in rank order with at most ``ROWS_PER_TABLE`` row passages per table (a table passage, which holds
-    its rows, is always kept), so the rows of one long table do not crowd out every other passage."""
+    """Hits in rank order with at most ``ROWS_PER_TABLE`` row passages per table, so the rows of one long table do
+    not crowd out every other passage. A table passage, which holds its rows, is always kept, and the first row past
+    the cap brings it forward to its own place. The first hit of a table whose matching rows the cap left out
+    carries their number (``rows_not_shown``), so the caller can point at the whole table."""
+    def table(h: dict) -> tuple:
+        return h["version_id"], h.get("table_index")
+
     out: list[dict] = []
     per_table: dict[tuple, int] = {}
-    for h in hits:
+    taken: set[int] = set()
+    for i, h in enumerate(hits):
+        if i in taken:
+            continue
         if h["kind"] == "table_row":
-            key = (h["version_id"], h.get("table_index"))
-            if per_table.get(key, 0) >= ROWS_PER_TABLE:
-                continue
-            per_table[key] = per_table.get(key, 0) + 1
+            if per_table.get(table(h), 0) >= ROWS_PER_TABLE:
+                # the table's own passage stands in for the rows past the cap
+                j = next((j for j in range(i + 1, len(hits)) if j not in taken and hits[j]["kind"] == "table"
+                          and table(hits[j]) == table(h)), None)
+                if j is None:
+                    continue
+                taken.add(j)
+                h = hits[j]
+            else:
+                per_table[table(h)] = per_table.get(table(h), 0) + 1
+        taken.add(i)
         out.append(h)
         if len(out) >= limit:
             break
+    shown = {id(h) for h in out}
+    hidden: dict[tuple, int] = {}
+    for h in hits:
+        if h["kind"] == "table_row" and id(h) not in shown and per_table.get(table(h), 0) >= ROWS_PER_TABLE:
+            hidden[table(h)] = hidden.get(table(h), 0) + 1
+    for k, h in enumerate(out):
+        if hidden.get(table(h)) and h["kind"] in ("table", "table_row"):
+            out[k] = h | {"rows_not_shown": hidden.pop(table(h))}
     return out
 
 
@@ -363,31 +386,67 @@ def _title_words(title: str) -> set[str]:
     return words
 
 
+# A word in more than this share of the visible documents' text, or of their titles (and in more than two titles),
+# is a word of the trade ("שווי", "שומה"), not a name: it names no document, whatever title holds it.
+NAMING_DF_SHARE = 0.5
+
+
+def _numbers_of(title: str) -> set[str]:
+    return {w for w in (raw.strip("-'״׳\"") for raw in _TITLE_WORD.findall(base_normalize(title))) if w.isdigit()}
+
+
+def _text_document_frequency(conn: Connection, forms: dict[str, set[str]]) -> tuple[int, dict[str, int]]:
+    """The number of visible current documents, and for each word the number whose current text holds it in any of
+    its forms."""
+    words = [w for w in forms if forms[w]]
+    params: dict = {}
+    cols = ["count(DISTINCT c.document_id) AS n"]
+    for i, w in enumerate(words):
+        cols.append(f"count(DISTINCT c.document_id) FILTER (WHERE {_any_form(forms[w], f'f{i}', params)}) AS f{i}")
+    base = _Sql()
+    row = conn.execute(text("SELECT " + ", ".join(cols) + base.joins + " WHERE " + base.where), params).one()
+    return row.n, {w: getattr(row, f"f{i}") for i, w in enumerate(words)}
+
+
 def documents_named(conn: Connection, query: str, scope: SearchScope | None = None) -> list[tuple[UUID, set[str]]]:
-    """Visible current documents the query names by their title: at least two of the title's words, one of them
-    a number ("הגפן 12", "הזית 7") or both distinctive (in no more than two titles). Returns (document id, the
-    query words that named it), best first; empty when the query names none or too many."""
+    """Visible current documents the query names by their title: at least two query words in the title (a word and
+    its prefix-stripped form are one word), one of them a number ("הגפן 12", "הזית 7") or both distinctive (in no
+    more than two titles). A word of the trade never counts, however few titles hold it: one in more than
+    ``NAMING_DF_SHARE`` of the visible documents' text or titles ("שווי" in a title like "שומה שווי שוק ..."). Returns
+    (document id, the query words that named it), best first; empty when the query names none or too many. Word
+    frequencies are over every visible document; ``scope`` only limits which of them may be named."""
     docs = [(r.id, r.title) for r in conn.execute(text(
         "SELECT d.id, d.title FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
         " WHERE d.deleted_at IS NULL"))]
-    if scope and scope.document_ids:
-        docs = [(i, t) for i, t in docs if i in set(scope.document_ids)]
-    q_words = set()
-    for raw in _TITLE_WORD.findall(base_normalize(query)):
-        w = raw.strip("-'״׳\"")
-        if len(w) >= 2:
-            q_words.add(w)
-            q_words.update(prefix_variants(w))
-    words_of = {i: _title_words(t) for i, t in docs}
+    # a title's words, and its numbers however short (the house number of "התמר 5")
+    words_of = {i: _title_words(t) | _numbers_of(t) for i, t in docs}
     df: dict[str, int] = {}
     for ws in words_of.values():
         for w in ws:
             df[w] = df.get(w, 0) + 1
+    # each query word with its forms, as titles hold them
+    forms: dict[str, set[str]] = {}
+    for raw in _TITLE_WORD.findall(base_normalize(query)):
+        w = raw.strip("-'״׳\"")
+        if len(w) >= 2 or w.isdigit():
+            forms.setdefault(w, set()).update({w, *prefix_variants(w)} & set(df))
+    forms = {w: f for w, f in forms.items() if f}
+    if not forms:
+        return []
+    many_titles = max(2, NAMING_DF_SHARE * len(docs))
+    alpha = {w: f for w, f in forms.items() if not w.isdigit()}
+    n, text_df = _text_document_frequency(conn, alpha) if alpha else (0, {})
+    trade = {w for w, f in forms.items() if max(df[x] for x in f) > many_titles
+             or text_df.get(w, 0) > NAMING_DF_SHARE * n}
+    allowed = set(scope.document_ids) if scope and scope.document_ids else None
     named = []
     for i, ws in words_of.items():
-        hit = q_words & ws
-        distinctive = {w for w in hit if df.get(w, 0) <= 2}
-        if len(hit) >= 2 and (any(w.isdigit() for w in hit) or len(distinctive) >= 2):
+        if allowed is not None and i not in allowed:
+            continue
+        hit = {w for w, f in forms.items() if w not in trade and f & ws}
+        distinctive = {w for w in hit if min(df[x] for x in forms[w] & ws) <= 2}
+        if len(hit) >= 2 and any(not w.isdigit() for w in hit) and (
+                any(w.isdigit() for w in hit) or len(distinctive) >= 2):
             named.append((len(distinctive), len(hit), i, hit))
     named.sort(key=lambda x: (-x[0], -x[1]))
     if not named or len(named) > 2:

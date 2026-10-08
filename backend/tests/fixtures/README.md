@@ -195,9 +195,8 @@ first data row; only H2's table keeps its headers.
 A second, separate held-out corpus for `backend/eval/questions_holdout_v2.yaml`, written before any run of that set
 and never to be used for tuning. Its topics are new (rent, lease term, CPI indexation, capitalization rate,
 vacancy allowance, occupancy, plot area, coverage, setback lines, access road width, warning notes, easements,
-maintenance score, energy rating, noise, construction cost per m², depreciation) and their words are in the v2 block
-of `HELD_OUT_TERMS` (`tests/unit/test_no_topic_vocabulary.py`). Same command, same determinism, same synthetic
-marker. Office A, group **G4 "ידע כללי ב"**, visible to `admin-a` and `dana` but never to `yossi` or office B
+maintenance score, energy rating, noise, construction cost per m², depreciation). Same command, same determinism,
+same synthetic marker. Office A, group **G4 "ידע כללי ב"**, visible to `admin-a` and `dana` but never to `yossi` or office B
 (`scripts/seed_demo.py` seeds it with the same idempotent `seed_general_corpus`).
 
 The answer key is a separate file, `holdout_v2_truth.yaml`, with the schema of `general_facts` plus

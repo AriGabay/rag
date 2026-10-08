@@ -498,3 +498,35 @@ def test_a_qualifier_still_missing_after_the_repair_is_written_in_without_a_rewr
     assert len(agent.seen) == 3  # first answer and one repair; no rewrite that would drop the datum
     assert "9,500 ₪ (מ״ר בנוי ברוטו, כפי שנכתב במקור)" in a["markdown"]
     assert a["verification"]["annotated"] == 1 and a["verification"]["removed"] == 0
+
+
+def test_a_general_question_after_a_focused_turn_searches_every_authorized_document(client, office, monkeypatch):
+    """AE6 (R25, R26): after a turn about one report, a general question the report does not answer is searched over
+    every document the user may see. The report's title holding a generic word of the question ("שווי") neither
+    keeps the scope on it nor fills the results with its passages."""
+    from tests.integration.test_entities import add_doc
+
+    for i, street in enumerate(("האלון", "הברוש", "האורן", "הדולב")):
+        add_doc(office, office.default_group_id, [(f"השווי של הנכס נקבע בגישת ההשוואה. הדירה בקומה {i + 1}.", [1])],
+                f"שומה — רחוב {street} {i + 10}")
+    focus, _ = add_doc(office, office.default_group_id,
+                       [(f"סעיף {i}: שווי השוק של הנכס נבחן מול עסקאות באזור, והשווי נקבע בהתאם.", [i + 1])
+                        for i in range(12)], "שומה שווי שוק — רחוב התמר 5")
+    answer, _ = add_doc(office, office.default_group_id, [('שווי מ"ר מבונה בשפ"פ נקבע ל-4,000 ₪.', [2])],
+                        "שומה — רחוב הדקל 3")
+    first = ScriptedAgent([[call("search", query="שווי השוק", document_ids=[str(focus)], limit=None)],
+                           final("שווי השוק נבחן מול עסקאות באזור [S1].",
+                                 focus=_value_focus(str(focus), "value") | {"subject": "התמר 5"})])
+    cloud(monkeypatch, office, first)
+    login(client, "admin-a@example.test")
+    cid = new_conversation(client)
+    assert send(client, cid, "מה נכתב על שווי השוק בהתמר 5?")["status"] == "done"
+    second = ScriptedAgent([[call("search", query='שווי מ"ר מבונה שפ"פ', document_ids=None, limit=None)],
+                            final("לא נמצא.", "not_found")])
+    second.on("resolve", _resolution(relation="new_question", standalone_question='מה שווי מ"ר מבונה בשפ"פ?'))
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
+    send(client, cid, 'ומה שווי מ"ר מבונה בשפ"פ?')
+    task = second.seen[0][0]["content"]
+    assert str(focus) not in task and "הנתון שבמרכז השיחה" not in task
+    out = second.tool_outputs(1)[0]
+    assert "4,000" in out and f'document_id="{answer}"' in out
