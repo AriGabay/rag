@@ -47,6 +47,7 @@ def _db_available() -> bool:
 
 def alembic_config():
     """Alembic config bound to the test database (owner role)."""
+    _assert_test_database()
     from alembic.config import Config
 
     cfg = Config(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
@@ -55,8 +56,23 @@ def alembic_config():
     return cfg
 
 
+TEST_DATABASE = "rag_test"
+
+
+def _assert_test_database() -> None:
+    """Tests migrate and truncate every table: refuse any database but the test one. Inside a Compose container the
+    service environment points at the office database, and ``setdefault`` above does not override it."""
+    from sqlalchemy.engine import make_url
+
+    s = get_settings()
+    for name, url in (("DATABASE_URL", s.database_url), ("OWNER_DATABASE_URL", s.owner_database_url)):
+        if make_url(url).database != TEST_DATABASE:
+            pytest.exit(f"refusing to run database tests: {name} is not the '{TEST_DATABASE}' database", returncode=2)
+
+
 @pytest.fixture(scope="session")
 def owner_engine():
+    _assert_test_database()
     if not _db_available():
         pytest.skip("Postgres test database not reachable (start: docker compose up -d db)")
     from alembic import command
@@ -70,6 +86,7 @@ def owner_engine():
 @pytest.fixture
 def db(owner_engine):
     """Clean database for one test. Yields the owner engine (for bootstrap/inspection only)."""
+    _assert_test_database()
     with owner_engine.begin() as conn:
         conn.execute(text(f"TRUNCATE {_TABLES} CASCADE"))
     reset_engine()
