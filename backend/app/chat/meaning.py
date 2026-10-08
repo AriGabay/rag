@@ -187,6 +187,7 @@ def _row_cells(line: str) -> list[str]:
 _PER_AREA = re.compile(r"(?:(?<![א-ת])ל|/\s?)(?:מ\"ר|מטר|דונם)(?![א-ת])")
 
 
+_SEGMENT_END = re.compile(r"[.;\n](?!\d)|,\s")  # a clause or a comma-separated part of one ("41,260,500" stays whole)
 _AREA_AFTER = re.compile(r"\s*(?:מ\"ר|מטר|דונם)(?![א-ת])")
 
 
@@ -200,8 +201,10 @@ def _area_amount(text: str, pos: int, written: str, closest: list[Occurrence]) -
     אקוו׳" is neither, though the column's header binds the basis to it."""
     if _AREA_AFTER.match(text, pos + len(written)):
         return True
-    starts = [m.end() for m in _CLAUSE_END.finditer(text, 0, pos)]
-    end = _CLAUSE_END.search(text, pos)
+    # its own part of the sentence: a list of figures ("2,870 ₪ למ״ר, שווי כזמין של 41,260,500 ₪, מקדם 0.8712")
+    # gives "למ״ר" to the figure it follows, not to the others
+    starts = [m.end() for m in _SEGMENT_END.finditer(text, 0, pos)]
+    end = _SEGMENT_END.search(text, pos)
     if _PER_AREA.search(text[starts[-1] if starts else 0:end.start() if end else len(text)]):
         return True
     return any(o.area or _AREA_WORD.search(o.context) for o in closest)

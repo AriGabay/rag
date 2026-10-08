@@ -93,6 +93,17 @@ def _read(ws: Workspace, document_id: str) -> bool:
     return bool((ws.activity.get(document_id) or {}).get("read"))
 
 
+def less_named(question: str, others: dict[str, str], cited: dict[str, str]) -> dict[str, str]:
+    """``others`` (id -> title) without the documents whose titles carry fewer of the question's words than a cited
+    document's title: a title sharing "אזור התעשייה" with a question that also names the city of the cited one
+    matches the question less, however either title spells the shared words."""
+    from app.platform.search import question_words_in_title
+
+    words = {i: question_words_in_title(question, t) for i, t in {**others, **cited}.items()}
+    best = max((len(words[c]) for c in cited), default=0)
+    return {i: t for i, t in others.items() if len(words[i]) >= best}
+
+
 def _names(docs: list[dict]) -> str:
     shown = "; ".join(d["title"] for d in docs[:NAMES_SHOWN])
     return shown + (f" ועוד {len(docs) - NAMES_SHOWN}" if len(docs) > NAMES_SHOWN else "")
@@ -374,7 +385,6 @@ def build(ws: Workspace, answer: FinalAnswer, question: str) -> tuple[dict, Fina
         documents_matching,
         documents_named,
         documents_sharing_title_words,
-        question_words_in_title,
     )
 
     cited = cited_documents(ws, answer.answer_markdown)
@@ -448,10 +458,7 @@ def build(ws: Workspace, answer: FinalAnswer, question: str) -> tuple[dict, Fina
             if set(ids) & set(cited) and set(ids) - set(cited):
                 others |= {i: t for i, t in ids.items() if i not in cited}
                 cited_titles |= {i: t for i, t in ids.items() if i in cited}
-        # a document whose title carries fewer of the question's words than a cited one's ("אזור התעשייה" against
-        # "אזור התעשייה ... לוד" for a question that names both) matches the question less: it is not named
-        words = {i: question_words_in_title(question, t) for i, t in {**others, **cited_titles}.items()}
-        others = {i: t for i, t in others.items() if not any(words[i] < words[c] for c in cited_titles)}
+        others = less_named(question, others, cited_titles)
         also = [{"document_id": i, "title": t} for i, t in others.items()]
         ledger |= {"also_matching": also, "complete": not also}
         if also:

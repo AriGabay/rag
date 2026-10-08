@@ -310,3 +310,9 @@ def test_a_per_area_amount_named_only_by_its_column_header_still_needs_its_basis
     table = "דירות בבניין\nדירה | שטח | שווי למ\"ר\nדירה 3 | 80 | 8,700\nסה\"כ מ\"ר אקוו' | 2,480"
     (p,) = _problems("השווי של דירה 3 הוא 8,700 ₪ [S1].", _ws(table, kind="table"))
     assert p.kind == "basis" and "אקוו" in p.annotation
+
+
+def test_a_per_area_word_belongs_to_the_figure_it_follows_in_a_list():
+    answer = ("למצב החדש נרשמו 145 ₪ למ\"ר מבונה, שווי מצב חדש של 28,940,300 ₪, ומקדם דחיה 0.8712 [S1].")
+    numbers = {p.number for p in _problems(answer, _ws(AREA_CALC, kind="table"))}
+    assert not numbers & {"28,940,300", "0.8712"}
