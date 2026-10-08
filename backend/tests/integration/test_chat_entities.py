@@ -62,7 +62,7 @@ def _first_turn(client, setup, monkeypatch) -> str:
 
 def _turn(monkeypatch, steps, resolution) -> ScriptedAgent:
     agent = ScriptedAgent(steps)
-    agent.on("agent", resolution)
+    agent.on("resolve", resolution)
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: agent)
     return agent
 

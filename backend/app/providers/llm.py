@@ -19,6 +19,13 @@ per-purpose timeout and the client's retries.
 
 Document text placed in a prompt goes through ``prompt_text`` (inside a tag) or ``prompt_attr`` (inside a
 quoted tag attribute): no document can open, close or forge a prompt tag.
+
+Every model purpose has its own model and reasoning effort from settings (KTD1): ``get_provider(purpose)``
+returns one provider per (model, effort), and every provider of one key shares one client. A provider sends
+only the optional parameters its model's capability row lists (``app.config.MODEL_CAPABILITIES``); an unknown
+model is sent none. Prompt caching (KTD2): a structured call is one-shot, so on a model with cache options it
+runs in explicit mode with no breakpoint (no cache write, no write surcharge); the agent loop keeps implicit
+caching under a hashed per-office ``prompt_cache_key``, since every step extends the previous step's input.
 """
 
 from __future__ import annotations
@@ -35,7 +42,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from app.config import get_settings
+from app.config import base_model, get_settings, model_capabilities
 from app.extraction.normalize_text import base_normalize, query_tokens
 
 logger = logging.getLogger(__name__)
@@ -75,6 +82,8 @@ class Purpose(StrEnum):
     VISION = "vision"  # reading a picture embedded in a document (ingestion)
     AGENT = "agent"  # one step of the conversational answering loop (tools or the final answer)
     MEASURE = "measure"  # measurements with their meaning, from one document's passages
+    RESOLVE = "resolve"  # resolving a follow-up in its context
+    SUMMARY = "summary"  # the conversation summary
 
 
 class CallStatus(StrEnum):
@@ -129,7 +138,6 @@ class AgentStep:
 
 USAGE_FIELDS = ("purpose", "model", "status", "input_tokens", "cached_input_tokens", "cache_write_tokens",
                 "output_tokens", "latency_ms", "cost_usd")
-_SNAPSHOT = re.compile(r"-\d{4}-\d{2}-\d{2}$")  # a dated snapshot of a model: gpt-6-luna-2026-09-30
 
 
 def usage_cost(model: str | None, *, input_tokens: int | None, cached_input_tokens: int | None,
@@ -140,7 +148,7 @@ def usage_cost(model: str | None, *, input_tokens: int | None, cached_input_toke
     table does not price or a call whose input or output count was not reported. A cache bucket the provider
     did not report is counted as ordinary input."""
     prices = get_settings().llm_prices
-    price = prices.get(model or "") or prices.get(_SNAPSHOT.sub("", model or ""))
+    price = prices.get(model or "") or prices.get(base_model(model))
     if price is None or input_tokens is None or output_tokens is None:
         return None
     cached, written = cached_input_tokens or 0, cache_write_tokens or 0
@@ -254,12 +262,20 @@ def _elapsed_ms(started: float) -> int:
     return int((time.perf_counter() - started) * 1000)
 
 
+def office_cache_key(office_id: object) -> str:
+    """The agent loop's ``prompt_cache_key`` for an office (KTD2): stable per office, so its turns share cached
+    prefixes and are accounted apart from other offices' (no cross-office cache probing), and a hash, so the
+    provider never sees the office id."""
+    return "office-" + hashlib.sha256(f"rag-prompt-cache:{office_id}".encode()).hexdigest()[:32]
+
+
 class BaseProvider:
     """Wrappers shared by real providers: everything goes through ``structured``."""
 
     name: str
     model: str
     demo = False
+    routed = False  # built by ``get_provider``: ``for_purpose`` may swap it for another purpose's provider
 
     def structured(self, purpose: Purpose, instructions: str, input: str, schema: type[BaseModel], *,
                    max_output_tokens: int | None = None, deadline: float | None = None) -> StructuredResult:
@@ -353,6 +369,16 @@ class OpenAIProvider(BaseProvider):
         self.model = model
         self.reasoning_effort = reasoning_effort
 
+    def _reasoning(self, effort: str | None) -> dict | None:
+        """The ``reasoning`` parameter, only for an effort the model's capability row lists."""
+        caps = model_capabilities(self.model)
+        if not effort or caps is None:
+            return None
+        if effort not in caps.efforts:
+            logger.warning("provider %s: effort %s is not supported by %s, not sent", self.name, effort, self.model)
+            return None
+        return {"effort": effort}
+
     def structured(self, purpose: Purpose, instructions: str, input: str | list, schema: type[BaseModel], *,
                    max_output_tokens: int | None = None, deadline: float | None = None,
                    reasoning_effort: str | None = None) -> StructuredResult:
@@ -362,9 +388,13 @@ class OpenAIProvider(BaseProvider):
             "model": self.model, "instructions": instructions, "input": input, "text_format": schema,
             "max_output_tokens": max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS, "store": False,
         }
-        effort = reasoning_effort or self.reasoning_effort
-        if effort:
-            kwargs["reasoning"] = {"effort": effort}
+        reasoning = self._reasoning(reasoning_effort or self.reasoning_effort)
+        if reasoning:
+            kwargs["reasoning"] = reasoning
+        caps = model_capabilities(self.model)
+        if caps is not None and caps.prompt_cache_options:
+            # one-shot: no later call extends this input, so nothing is written to the cache
+            kwargs["prompt_cache_options"] = {"mode": "explicit"}
         started = time.perf_counter()
         options = client_options(purpose, deadline)
         if options is None:
@@ -400,35 +430,40 @@ class OpenAIProvider(BaseProvider):
     def structured_image(self, purpose: Purpose, instructions: str, prompt: str, image_png: bytes,
                          schema: type[BaseModel], *, max_output_tokens: int | None = None,
                          reasoning_effort: str | None = None) -> StructuredResult:
-        """``structured`` with one picture (PNG) next to the text prompt, at high detail."""
+        """``structured`` with one picture (PNG) next to the text prompt, at high detail when the model lists it."""
         import base64
 
-        content = [{"type": "input_text", "text": prompt},
-                   {"type": "input_image", "detail": "high",
-                    "image_url": "data:image/png;base64," + base64.b64encode(image_png).decode()}]
+        image = {"type": "input_image", "image_url": "data:image/png;base64," + base64.b64encode(image_png).decode()}
+        caps = model_capabilities(self.model)
+        if caps is not None and "high" in caps.image_detail:
+            image["detail"] = "high"
+        content = [{"type": "input_text", "text": prompt}, image]
         return self.structured(purpose, instructions, [{"role": "user", "content": content}], schema,
                                max_output_tokens=max_output_tokens, reasoning_effort=reasoning_effort)
 
     def agent_step(self, instructions: str, items: list, tools: list[dict], final_schema: dict, *,
                    reasoning_effort: str | None = None, max_output_tokens: int = 6000,
-                   timeout: float | None = None) -> AgentStep:
+                   timeout: float | None = None, cache_key: str | None = None) -> AgentStep:
         """One step of a tool-using loop: the model either calls tools or returns the final JSON answer (strict
         ``final_schema``). Responses are not stored; reasoning items come back encrypted so the next step can
-        carry them."""
+        carry them. ``cache_key`` (``office_cache_key``): the prompt cache key, when the model takes one; the
+        cache mode stays implicit, as each step extends the previous step's input."""
         import openai
 
-        effort = reasoning_effort if reasoning_effort is not None else self.reasoning_effort
+        reasoning = self._reasoning(reasoning_effort if reasoning_effort is not None else self.reasoning_effort)
         kwargs: dict[str, Any] = {
             "model": self.model, "instructions": instructions, "input": items, "tools": tools, "store": False,
             "max_output_tokens": max_output_tokens, "parallel_tool_calls": True,
             "text": {"format": {"type": "json_schema", "name": "final_answer", "schema": final_schema,
                                 "strict": True}},
         }
-        if effort and effort != "none":
-            kwargs["reasoning"] = {"effort": effort}
-            kwargs["include"] = ["reasoning.encrypted_content"]
-        elif effort == "none":
-            kwargs["reasoning"] = {"effort": "none"}
+        if reasoning:
+            kwargs["reasoning"] = reasoning
+            if reasoning["effort"] != "none":
+                kwargs["include"] = ["reasoning.encrypted_content"]
+        caps = model_capabilities(self.model)
+        if cache_key and caps is not None and caps.prompt_cache_key:
+            kwargs["prompt_cache_key"] = cache_key
         started = time.perf_counter()
         try:
             resp = self.client.with_options(timeout=timeout or timeout_for(Purpose.AGENT)).responses.create(**kwargs)
@@ -465,11 +500,12 @@ class OpenAIProvider(BaseProvider):
 
     def parse_conditions(self, question: str, schema: dict) -> dict | None:
         """Legacy parse path: the conditions schema is not strict-mode compatible, so it is non-strict."""
+        reasoning = self._reasoning(self.reasoning_effort)
         resp = self.client.with_options(timeout=timeout_for(Purpose.INTERPRET)).responses.create(
             model=self.model, instructions=PARSE_POLICY, input=question, store=False,
             max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
             text={"format": {"type": "json_schema", "name": "conditions", "schema": schema, "strict": False}},
-            **({"reasoning": {"effort": self.reasoning_effort}} if self.reasoning_effort else {}),
+            **({"reasoning": reasoning} if reasoning else {}),
         )
         return json.loads(resp.output_text) if resp.status == "completed" else None
 
@@ -553,30 +589,69 @@ def _key_hash(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
-def _selected_key_and_model() -> tuple[str, str, str]:
+def _selected_key() -> tuple[str, str]:
     s = get_settings()
     if s.llm_provider == "anthropic":
-        return "anthropic", s.anthropic_api_key.get_secret_value(), s.anthropic_model
-    return "openai", s.openai_api_key.get_secret_value(), s.openai_model
+        return "anthropic", s.anthropic_api_key.get_secret_value()
+    return "openai", s.openai_api_key.get_secret_value()
+
+
+def purpose_model(purpose: Purpose | str) -> tuple[str, str]:
+    """(model, reasoning effort) settings select for a purpose; Anthropic serves every purpose with its one model
+    and takes no effort."""
+    s = get_settings()
+    if s.llm_provider == "anthropic":
+        return s.anthropic_model, ""
+    return s.model_for(Purpose(purpose).value)
 
 
 def selected_provider_configured() -> bool:
     """True when the server holds a key for the provider that settings select."""
-    return bool(_selected_key_and_model()[1])
+    return bool(_selected_key()[1])
+
+
+def get_provider(purpose: Purpose | str) -> LLMProvider:
+    """The provider for one purpose: its configured model and reasoning effort (KTD1)."""
+    kind, key = _selected_key()
+    model, effort = purpose_model(purpose)
+    return _provider(kind, _key_hash(key), model, effort)
 
 
 def get_selected_provider() -> LLMProvider:
-    kind, key, model = _selected_key_and_model()
-    return _provider(kind, _key_hash(key), model, get_settings().openai_reasoning_effort)
+    """The turn's provider: the agent's model at ``openai_reasoning_effort``, serving the calls with no purpose
+    setting (the connection test, the earlier answer path). Calls with a purpose setting go through
+    ``for_purpose``."""
+    return get_provider(Purpose.TEST)
+
+
+def for_purpose(provider: LLMProvider, purpose: Purpose) -> LLMProvider:
+    """The provider a call of ``purpose`` goes to. A provider built from settings is swapped for that purpose's
+    (same provider and key, the purpose's model and effort); any other provider (a test double, a provider
+    built by hand) serves every purpose itself."""
+    return get_provider(purpose) if getattr(provider, "routed", False) else provider
+
+
+@lru_cache(maxsize=16)
+def _provider(kind: str, key_hash: str, model: str, reasoning_effort: str) -> LLMProvider:
+    """One provider per provider kind, key, model and effort; the cache never holds the key."""
+    _, key = _selected_key()
+    provider = (AnthropicLLM(key, model, client=_client(kind, key_hash)) if kind == "anthropic"
+                else OpenAIProvider(key, model, reasoning_effort=reasoning_effort, client=_client(kind, key_hash)))
+    provider.routed = True
+    return provider
 
 
 @lru_cache(maxsize=4)
-def _provider(kind: str, key_hash: str, model: str, reasoning_effort: str) -> LLMProvider:
-    """One client (and HTTP connection pool) per provider, key and model; the cache never holds the key."""
-    _, key, _ = _selected_key_and_model()
+def _client(kind: str, key_hash: str) -> Any:
+    """One SDK client (and HTTP connection pool) per provider kind and key, shared by every model and effort."""
+    _, key = _selected_key()
     if kind == "anthropic":
-        return AnthropicLLM(key, model)
-    return OpenAIProvider(key, model, reasoning_effort=reasoning_effort)
+        import anthropic
+
+        return anthropic.Anthropic(api_key=key, max_retries=2, timeout=60)
+    import openai
+
+    return openai.OpenAI(api_key=key, timeout=60.0, max_retries=1)
 
 
 # Earlier names, still used by the admin screen and the parse path until they move to the selected provider.

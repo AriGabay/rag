@@ -13,9 +13,17 @@ import {
   providerStatusLabel,
   versionStatusLabel,
 } from "@/lib/format";
-import type { AdminGroup, AdminSettings, AdminUser, Role } from "@/lib/types";
+import type { AdminGroup, AdminSettings, AdminUser, PurposeModel, Role } from "@/lib/types";
 
 const MIN_PASSWORD = 8;
+const PURPOSE_LABELS: Record<PurposeModel["purpose"], string> = {
+  agent: "שיחה",
+  resolve: "הבנת שאלת המשך",
+  verify: "אימות תשובה",
+  measure: "חילוץ מדידות",
+  vision: "קריאה חזותית",
+  summary: "סיכום שיחה",
+};
 
 // ---------------- Coverage ----------------
 
@@ -178,6 +186,21 @@ export function ProviderPanel() {
             <dt>מודל</dt>
             <dd>
               <bdi>{settings.model}</bdi>
+            </dd>
+            <dt>מודל לפי שימוש</dt>
+            <dd data-testid="provider-purposes">
+              <ul className="small">
+                {(settings.purposes ?? []).map((p) => (
+                  <li key={p.purpose}>
+                    {PURPOSE_LABELS[p.purpose] ?? p.purpose}: <bdi>{p.model}</bdi>
+                    {p.effort && (
+                      <span className="muted">
+                        {" · "}מאמץ חשיבה <bdi>{p.effort}</bdi>
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
             </dd>
             <dt>מפתח בשרת</dt>
             <dd>

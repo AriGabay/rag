@@ -86,9 +86,9 @@ def test_a_follow_up_after_a_count_does_not_offer_the_listing_as_a_reference(cli
         [call("find_documents", query=PLACE, page=None)],
         final(f"יש לנו 2 שומות ב{PLACE} [S1].", scope="set", scope_query=PLACE)])
     agent = ScriptedAgent([final("לא נמצא.", "not_found")])
-    agent.on("agent", {"relation": "same_datum", "scope": "entity", "standalone_question": "?", "changed_fields": [],
-                       "metric_kind": "unknown", "unit": "unknown", "scale": "unknown", "period": "unknown",
-                       "area_basis": "", "vat": "unknown", "subject": "", "document_ids": [], "ambiguity": ""})
+    agent.on("resolve", {"relation": "same_datum", "scope": "entity", "standalone_question": "?", "changed_fields": [],
+                         "metric_kind": "unknown", "unit": "unknown", "scale": "unknown", "period": "unknown",
+                         "area_basis": "", "vat": "unknown", "subject": "", "document_ids": [], "ambiguity": ""})
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: agent)
     send(client, cid, "ומה עוד?")
     assert "הפניות למקורות שצוטטו" not in agent.seen[0][0]["content"]

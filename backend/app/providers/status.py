@@ -25,7 +25,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Connection, text
 
-from app.config import get_settings
+from app.config import MODEL_PURPOSES, get_settings
 from app.providers import llm
 from app.providers.llm import CallStatus, LLMProvider, Purpose, StructuredResult
 
@@ -109,11 +109,15 @@ class ProviderState:
 
 
 def selected_provider_and_model() -> tuple[str, str]:
-    """The provider kind and model that settings select (never the key)."""
-    s = get_settings()
-    if s.llm_provider == "anthropic":
-        return "anthropic", s.anthropic_model
-    return "openai", s.openai_model
+    """The provider kind and the conversation's model that settings select (never the key). The connection test
+    runs on this model."""
+    return get_settings().llm_provider, llm.purpose_model(Purpose.AGENT)[0]
+
+
+def purpose_models() -> list[dict]:
+    """The model and reasoning effort of every model purpose (KTD1), for the admin status screen."""
+    return [{"purpose": p, "model": model, "effort": effort or None}
+            for p in MODEL_PURPOSES for model, effort in [llm.purpose_model(p)]]
 
 
 def consent_matches(consent_provider: str | None, provider: str) -> bool:

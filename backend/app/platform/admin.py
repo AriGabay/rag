@@ -17,6 +17,7 @@ from app.platform.documents import latest_status_counts
 from app.providers.status import (
     RETENTION_NOTES,
     office_provider_state,
+    purpose_models,
     record_test,
     run_connection_test,
     selected_provider_and_model,
@@ -152,7 +153,8 @@ def _settings_json(conn: Connection) -> dict:
     last = state.last_test
     return {
         "cloud_llm_enabled": row.cloud_llm_enabled, "provider": state.provider, "provider_name": state.provider_name,
-        "model": state.model, "key_present": state.key_present, "mode": state.mode.value,
+        "model": state.model, "purposes": purpose_models(), "key_present": state.key_present,
+        "mode": state.mode.value,
         "mode_status": state.status, "untested": state.untested,
         "last_test": {"provider": last.provider, "model": last.model, "ok": last.ok, "status": last.status,
                       "tested_at": last.tested_at.isoformat() if last.tested_at else None} if last else None,

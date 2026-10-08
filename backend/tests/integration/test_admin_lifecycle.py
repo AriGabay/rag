@@ -174,12 +174,15 @@ def test_no_key_status_and_test_without_network(client, office, no_key):
     login(client, "admin-a@example.test")
     s = client.get("/api/admin/settings").json()
     assert s["key_present"] is False and s["mode"] == "demo" and s["provider_name"] == "OpenAI"
-    assert s["model"] == get_settings().openai_model and s["last_test"] is None
+    assert s["model"] == get_settings().model_for("agent")[0] and s["last_test"] is None
+    # the status screen lists every purpose's model and effort as settings resolve them (KTD1)
+    assert [u["purpose"] for u in s["purposes"]] == ["agent", "resolve", "verify", "measure", "vision", "summary"]
+    assert all((u["model"], u["effort"]) == get_settings().model_for(u["purpose"]) for u in s["purposes"])
     r = client.post("/api/admin/provider/test")
     assert r.status_code == 200, r.text
     t = r.json()["last_test"]
     assert t["ok"] is False and t["status"] == "missing_key" and t["tested_at"]
-    assert t["provider"] == "openai" and t["model"] == get_settings().openai_model
+    assert t["provider"] == "openai" and t["model"] == get_settings().model_for("agent")[0]
     assert r.json()["mode"] == "demo"  # allowed while cloud use is off; no office content is sent
     with tenant_tx(office.system) as conn:
         assert conn.execute(text("SELECT count(*) FROM audit_events WHERE action = 'provider_test'")).scalar() == 1

@@ -713,7 +713,7 @@ def _maybe_summarize(ctx: TenantContext, conversation_id: UUID, message_id: UUID
     longer visible is left out (the user's own messages stay — they are the user's words). The summary records
     the documents behind the folded answers, the permission scope and data version, and the last message folded.
     A summary that is no longer usable (or never recorded this) is rebuilt from scratch, without its old text."""
-    from app.providers.llm import Purpose, prompt_text
+    from app.providers.llm import Purpose, for_purpose, prompt_text
 
     with tenant_tx(ctx) as conn:
         conv = conn.execute(text("SELECT summary, summary_message_count, summary_meta FROM conversations"
@@ -743,9 +743,10 @@ def _maybe_summarize(ctx: TenantContext, conversation_id: UUID, message_id: UUID
     body = ("סיכום קודם:\n" + previous + "\n\nהודעות נוספות:\n"
             + "\n".join(f"{'משתמש' if r.role == 'user' else 'עוזר'}: {prompt_text((r.content or '')[:1500])}"
                         for r in rows))
-    r = provider.structured(Purpose.AGENT, SUMMARY_POLICY, body, _Summary, max_output_tokens=1200)
-    usage = usage_entry("summary", r, provider.model)
-    _log_turn_usage(ctx, provider, [usage])
+    summarizer = for_purpose(provider, Purpose.SUMMARY)
+    r = summarizer.structured(Purpose.SUMMARY, SUMMARY_POLICY, body, _Summary, max_output_tokens=1200)
+    usage = usage_entry("summary", r, summarizer.model)
+    _log_turn_usage(ctx, summarizer, [usage])
     with tenant_tx(ctx) as conn:
         # the summary's cost belongs to the turn that triggered it
         conn.execute(text("UPDATE messages SET usage = COALESCE(usage, '[]'::jsonb) || CAST(:u AS jsonb)"

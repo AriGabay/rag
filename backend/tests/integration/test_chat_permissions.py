@@ -50,7 +50,7 @@ def setup(db, monkeypatch):
 def _agent(steps: list) -> ScriptedAgent:
     agent = ScriptedAgent(steps)
     # the summarizer echoes what it was given, so whatever reaches it shows up in the stored summary
-    agent.on(Purpose.AGENT, lambda instructions, input: {"summary": input[-3000:]}, repeat=True)
+    agent.on(Purpose.SUMMARY, lambda instructions, input: {"summary": input[-3000:]}, repeat=True)
     return agent
 
 

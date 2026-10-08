@@ -442,11 +442,19 @@ export interface ProviderTest {
   tested_at: string | null;
 }
 
+export interface PurposeModel {
+  purpose: "agent" | "resolve" | "verify" | "measure" | "vision" | "summary";
+  model: string;
+  effort: string | null;
+}
+
 export interface AdminSettings {
   cloud_llm_enabled: boolean;
   provider: "openai" | "anthropic";
   provider_name: string;
   model: string;
+  /** Every model purpose with its configured model and reasoning effort (null: the provider takes none). */
+  purposes: PurposeModel[];
   /** Whether the server holds a key for the selected provider. The key itself never leaves the server. */
   key_present: boolean;
   mode: ProviderMode;

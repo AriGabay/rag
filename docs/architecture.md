@@ -14,7 +14,7 @@ flowchart TB
   WK --> EX[חילוץ: pdfplumber + תיקון RTL + Tesseract heb]
   WK --> EMB[Embeddings מקומיים multilingual-e5-small]
   API --> EMB
-  API --> LLM[ספק מודל: OpenAI gpt-5.4-mini כברירת מחדל או Anthropic, רק אם המשרד הפעיל; אחרת demo mock או מצב מוגבל]
+  API --> LLM[ספק מודל: OpenAI gpt-6-luna כברירת מחדל, מודל ומאמץ לכל שימוש או Anthropic, רק אם המשרד הפעיל; אחרת demo mock או מצב מוגבל]
   WK -->|חילוץ עובדות ברקע| LLM
 ```
 

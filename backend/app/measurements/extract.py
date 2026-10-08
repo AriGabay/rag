@@ -466,11 +466,8 @@ class RunResult:
 def _call(provider: LLMProvider, batch: list[Passage]) -> list[tuple[list[Passage], ExtractionOutput | None, object]]:
     """One batch through the model. An output cut at the token limit is retried as two halves (down to one
     passage), so a dense passage costs more calls instead of losing the batch."""
-    from app.config import get_settings
-
-    kwargs = {"reasoning_effort": get_settings().measure_reasoning_effort} if hasattr(provider, "agent_step") else {}
     result = provider.structured(Purpose.MEASURE, INSTRUCTIONS, batch_input(batch), ExtractionOutput,
-                                 max_output_tokens=MAX_OUTPUT_TOKENS, **kwargs)
+                                 max_output_tokens=MAX_OUTPUT_TOKENS)
     if result.status == CallStatus.INCOMPLETE and len(batch) > 1:
         half = len(batch) // 2
         return [(batch, None, result), *_call(provider, batch[:half]), *_call(provider, batch[half:])]
@@ -482,6 +479,9 @@ def extract_version(ctx: TenantContext, version_id: UUID, provider: LLMProvider)
     version's unreviewed ones, keeping reviewed decisions; see ``store``)."""
     from app.answering.content import log_usage
     from app.measurements.store import store_rows
+    from app.providers.llm import for_purpose
+
+    provider = for_purpose(provider, Purpose.MEASURE)
 
     with tenant_tx(ctx) as conn:
         row = conn.execute(text("SELECT document_id FROM document_versions WHERE id = :v"), {"v": version_id}).first()

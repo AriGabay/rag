@@ -1,5 +1,6 @@
 """Runtime configuration. Every secret comes from the environment; nothing is hard-coded."""
 
+import re
 from functools import lru_cache
 from typing import Literal
 
@@ -7,7 +8,42 @@ from pydantic import BaseModel, Field, SecretStr, field_validator, model_validat
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_LLM_PROVIDER = "openai"
-DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
+DEFAULT_OPENAI_MODEL = "gpt-6-luna"
+# The model purposes with their own model and reasoning-effort settings (KTD1, R27). Every other call (the
+# connection test, the earlier answer path) uses the agent's model at OPENAI_REASONING_EFFORT.
+MODEL_PURPOSES = ("agent", "resolve", "verify", "measure", "vision", "summary")
+_SNAPSHOT = re.compile(r"-\d{4}-\d{2}-\d{2}$")  # a dated snapshot of a model: gpt-6-luna-2026-09-30
+
+
+def base_model(model: str | None) -> str:
+    """The model a dated snapshot belongs to (``gpt-6-luna-2026-09-30`` -> ``gpt-6-luna``)."""
+    return _SNAPSHOT.sub("", model or "")
+
+
+class ModelCapabilities(BaseModel):
+    """What one model accepts beyond the required parameters (KTD1). Only what is listed here is ever sent."""
+
+    efforts: tuple[str, ...]  # reasoning efforts the model accepts
+    prompt_cache_options: bool = False  # ``prompt_cache_options`` (implicit or explicit cache mode)
+    prompt_cache_key: bool = False  # ``prompt_cache_key``, the cache routing and accounting key
+    image_detail: tuple[str, ...] = ()  # accepted ``detail`` values of an input image
+
+
+# Verified against the provider's documentation (2026-10-08). A model absent from the table is sent no optional
+# parameter at all (no reasoning effort, cache options, cache key or image detail). Neither model takes
+# ``temperature``; gpt-6-luna has no "minimal" effort; ``prompt_cache_retention`` is deprecated and never sent.
+MODEL_CAPABILITIES = {
+    "gpt-6-luna": ModelCapabilities(efforts=("none", "low", "medium", "high", "xhigh", "max"),
+                                    prompt_cache_options=True, prompt_cache_key=True,
+                                    image_detail=("low", "high", "original", "auto")),
+    "gpt-5.4-mini": ModelCapabilities(efforts=("none", "low", "medium", "high", "xhigh"), prompt_cache_key=True,
+                                      image_detail=("low", "high", "auto")),
+}
+
+
+def model_capabilities(model: str | None) -> ModelCapabilities | None:
+    """The capability row of a model or of the model its dated snapshot belongs to; None when unknown."""
+    return MODEL_CAPABILITIES.get(model or "") or MODEL_CAPABILITIES.get(base_model(model))
 
 
 class ModelPrice(BaseModel):
@@ -59,8 +95,23 @@ class Settings(BaseSettings):
     # Resolved key: the first non-empty of OPENAI_KEY, then OPENAI_API_KEY (Compose injects both, maybe empty).
     openai_key: SecretStr = SecretStr("")
     openai_api_key: SecretStr = SecretStr("")
+    # OPENAI_MODEL is every purpose's model, a single switch for all of them (the evaluation's comparison
+    # columns); MODEL_<PURPOSE> overrides it for one purpose. EFFORT_<PURPOSE> is that purpose's reasoning effort,
+    # checked against the model's capabilities at startup.
     openai_model: str = DEFAULT_OPENAI_MODEL
-    openai_reasoning_effort: str = "none"  # empty means: send no reasoning setting
+    openai_reasoning_effort: str = "none"  # calls with no purpose setting; empty means: send no reasoning setting
+    model_agent: str = ""  # one step of the conversational answering loop
+    model_resolve: str = ""  # resolving a follow-up in its context (a small structured call)
+    model_verify: str = ""  # the answer verifier (judge)
+    model_measure: str = ""  # measurements with their meaning (a background job)
+    model_vision: str = ""  # reading a picture embedded in a document (ingestion)
+    model_summary: str = ""  # the conversation summary
+    effort_agent: str = "low"
+    effort_resolve: str = "none"
+    effort_verify: str = "low"  # the verifier reads meaning, not only words
+    effort_measure: str = "low"  # completeness over speed
+    effort_vision: str = "low"
+    effort_summary: str = "none"
     # Price table for the cost of logged model calls; no budget logic reads it.
     llm_prices: dict[str, ModelPrice] = Field(default_factory=lambda: dict(DEFAULT_LLM_PRICES))
 
@@ -72,11 +123,9 @@ class Settings(BaseSettings):
     llm_timeout_verify_seconds: float = 45  # a judge call reads every claim of an answer with its evidence
     llm_timeout_test_seconds: float = 20
     llm_timeout_vision_seconds: float = 90
-    # The conversational answering loop: reasoning effort of its model steps, its step bound and wall clock.
-    chat_reasoning_effort: str = "low"
-    measure_reasoning_effort: str = "low"  # measurements: completeness over speed (a background job)
-    judge_reasoning_effort: str = "low"  # the answer verifier reads meaning, not only words
-    resolve_reasoning_effort: str = "low"  # resolving a follow-up in its context (a small structured call)
+    llm_timeout_resolve_seconds: float = 30
+    llm_timeout_summary_seconds: float = 60  # a background call after the answer is stored
+    # The conversational answering loop: its step bound and wall clock.
     chat_max_steps: int = 8
     chat_turn_seconds: int = 150
     chat_workers: int = 6
@@ -104,12 +153,34 @@ class Settings(BaseSettings):
     ocr_timeout_seconds: int = 60  # per Tesseract call; a hung call fails the page instead of the whole job
 
 
-    @field_validator("llm_provider", "openai_model", mode="before")
+    @field_validator("llm_provider", "openai_model", *(f"{kind}_{p}" for kind in ("model", "effort")
+                                                        for p in MODEL_PURPOSES), mode="before")
     @classmethod
     def _empty_means_default(cls, value, info):
         if isinstance(value, str) and not value.strip():
             return cls.model_fields[info.field_name].default
         return value.strip() if isinstance(value, str) else value
+
+    def model_for(self, purpose: str) -> tuple[str, str]:
+        """(model, reasoning effort) of an OpenAI call of ``purpose``: its own settings for a purpose in
+        ``MODEL_PURPOSES``, else the agent's model at ``openai_reasoning_effort``."""
+        if purpose in MODEL_PURPOSES:
+            return getattr(self, f"model_{purpose}") or self.openai_model, getattr(self, f"effort_{purpose}")
+        return self.model_for("agent")[0], self.openai_reasoning_effort
+
+    @model_validator(mode="after")
+    def _check_efforts(self) -> "Settings":
+        """An effort the purpose's model does not accept fails startup instead of being sent (KTD1)."""
+        if self.llm_provider != "openai":
+            return self
+        checks = [(f"EFFORT_{p.upper()}", *self.model_for(p)) for p in MODEL_PURPOSES]
+        checks.append(("OPENAI_REASONING_EFFORT", *self.model_for("test")))
+        for name, model, effort in checks:
+            caps = model_capabilities(model)
+            if effort and caps is not None and effort not in caps.efforts:
+                raise ValueError(f"{name}={effort!r} is not a reasoning effort {model} accepts"
+                                 f" (allowed: {', '.join(caps.efforts)})")
+        return self
 
     @model_validator(mode="after")
     def _resolve_openai_key(self) -> "Settings":

@@ -393,8 +393,8 @@ def test_a_rent_to_value_correction_is_resolved_per_area_and_a_total_is_repaired
         final("השווי הוא 9,500 ₪ למ\"ר בנוי ברוטו, ללא מע\"מ [S1].", focus=_value_focus(office.doc, "value")),
         final("השווי למ\"ר בנוי ברוטו הוא 9,500 ₪, ללא מע\"מ [S1].",
               focus=_value_focus(office.doc, "value_per_area"))])
-    second.on("agent", _resolution(changed_fields=[{"field": "metric_kind", "user_words": "השווי"}],
-                                   metric_kind="value", unit="ILS", period="month", document_ids=[office.doc]))
+    second.on("resolve", _resolution(changed_fields=[{"field": "metric_kind", "user_words": "השווי"}],
+                                     metric_kind="value", unit="ILS", period="month", document_ids=[office.doc]))
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
     m = send(client, cid, "דווקא את השווי, לא השכירות")
     assert m["status"] == "done", m
@@ -412,8 +412,8 @@ def test_a_total_that_survives_the_repairs_is_said_plainly(client, office, monke
     cid = _first_turn(client, office, monkeypatch)
     total = final("השווי הוא 9,500 ₪ למ\"ר בנוי ברוטו, ללא מע\"מ [S1].", focus=_value_focus(office.doc, "value"))
     second = ScriptedAgent([[call("search", query="שווי", document_ids=[office.doc], limit=None)], total, total, total])
-    second.on("agent", _resolution(changed_fields=[{"field": "metric_kind", "user_words": "השווי"}],
-                                   metric_kind="value_per_area", unit="ILS_per_sqm", document_ids=[office.doc]))
+    second.on("resolve", _resolution(changed_fields=[{"field": "metric_kind", "user_words": "השווי"}],
+                                     metric_kind="value_per_area", unit="ILS_per_sqm", document_ids=[office.doc]))
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
     a = send(client, cid, "רציתי את השווי ולא את השכירות")["answer"]
     assert a["status"] == "partial" and "שימו לב" in a["markdown"] and "שווי ליחידת שטח" in a["markdown"]
@@ -422,8 +422,8 @@ def test_a_total_that_survives_the_repairs_is_said_plainly(client, office, monke
 def test_an_ambiguous_correction_gets_one_question_and_no_tools(client, office, monkeypatch):
     cid = _first_turn(client, office, monkeypatch)
     second = ScriptedAgent([])
-    second.on("agent", _resolution(changed_fields=[{"field": "metric_kind", "user_words": "השווי"}],
-                                   metric_kind="value_per_area", ambiguity="התכוונת לשווי למ\"ר או לשווי הכולל?"))
+    second.on("resolve", _resolution(changed_fields=[{"field": "metric_kind", "user_words": "השווי"}],
+                                     metric_kind="value_per_area", ambiguity="התכוונת לשווי למ\"ר או לשווי הכולל?"))
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
     m = send(client, cid, "רציתי את השווי")
     assert m["status"] == "done" and m["answer"]["status"] == "clarification"
@@ -435,7 +435,7 @@ def test_a_failed_resolution_falls_back_to_the_message_and_focus(client, office,
     cid = _first_turn(client, office, monkeypatch)
     second = ScriptedAgent([[call("search", query="שווי", document_ids=None, limit=None)],
                             final("השווי למ\"ר בנוי ברוטו הוא 9,500 ₪, ללא מע\"מ [S1].")])
-    second.on("agent", CallStatus.TIMEOUT)  # the resolver is down
+    second.on("resolve", CallStatus.TIMEOUT)  # the resolver is down
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
     m = send(client, cid, "רציתי את השווי")
     assert m["status"] == "done" and m["answer"]["request"] is None
@@ -447,22 +447,22 @@ def test_an_answer_without_a_focus_hands_its_request_to_the_next_turn(client, of
     cid = _first_turn(client, office, monkeypatch)
     second = ScriptedAgent([[call("search", query="מקור", document_ids=[office.doc], limit=None)],
                             final("המקור הוא סעיף הסיכום של השומה [S1].")])
-    second.on("agent", _resolution(relation="same_datum", metric_kind="rent_per_area", unit="ILS_per_sqm",
-                                   period="month", document_ids=[office.doc]))
+    second.on("resolve", _resolution(relation="same_datum", metric_kind="rent_per_area", unit="ILS_per_sqm",
+                                     period="month", document_ids=[office.doc]))
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
     assert send(client, cid, "מאיפה זה לקוח?")["answer"]["focus"] is None
     third = ScriptedAgent([final("לא נמצא.", "not_found")])
-    third.on("agent", _resolution(relation="same_datum"))
+    third.on("resolve", _resolution(relation="same_datum"))
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: third)
     send(client, cid, "ומה עוד?")
-    resolve_input = next(c.input for c in third.calls if c.purpose.value == "agent")
+    resolve_input = next(c.input for c in third.calls if c.purpose.value == "resolve")
     assert "rent_per_area" in resolve_input
 
 
 def test_a_new_topic_leaves_the_previous_datum_out_of_the_task(client, office, monkeypatch):
     cid = _first_turn(client, office, monkeypatch)
     second = ScriptedAgent([final("לא נמצא.", "not_found")])
-    second.on("agent", _resolution(relation="new_question", standalone_question="מה תיאור הנכס?"))
+    second.on("resolve", _resolution(relation="new_question", standalone_question="מה תיאור הנכס?"))
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
     send(client, cid, "שאלה אחרת: מה תיאור הנכס?")
     task = second.seen[0][0]["content"]
@@ -472,7 +472,7 @@ def test_a_new_topic_leaves_the_previous_datum_out_of_the_task(client, office, m
 def test_a_follow_up_keeps_the_previous_datum_in_the_task(client, office, monkeypatch):
     cid = _first_turn(client, office, monkeypatch)
     second = ScriptedAgent([final("לא נמצא.", "not_found")])
-    second.on("agent", _resolution(relation="same_datum"))
+    second.on("resolve", _resolution(relation="same_datum"))
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
     send(client, cid, "ומה המקור לזה?")
     assert "הנתון שבמרכז השיחה" in second.seen[0][0]["content"]
@@ -482,8 +482,8 @@ def test_a_clarification_that_states_a_figure_is_not_used(client, office, monkey
     cid = _first_turn(client, office, monkeypatch)
     second = ScriptedAgent([[call("search", query="שווי", document_ids=[office.doc], limit=None)],
                             final("השווי למ\"ר בנוי ברוטו הוא 9,500 ₪, ללא מע\"מ [S1].")])
-    second.on("agent", _resolution(changed_fields=[{"field": "metric_kind", "user_words": "השווי"}],
-                                   metric_kind="value_per_area", ambiguity="התכוונת ל-9,500 ₪ למ\"ר או ל-13,700?"))
+    second.on("resolve", _resolution(changed_fields=[{"field": "metric_kind", "user_words": "השווי"}],
+                                     metric_kind="value_per_area", ambiguity="התכוונת ל-9,500 ₪ למ\"ר או ל-13,700?"))
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
     m = send(client, cid, "רציתי את השווי")
     assert m["answer"]["status"] != "clarification" and len(second.seen) == 2  # the turn went on with tools

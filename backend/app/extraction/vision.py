@@ -16,7 +16,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict
 
 from app.extraction.images import VisionOut, VisionTableOut
-from app.providers.llm import CallStatus, Purpose, get_selected_provider, prompt_text
+from app.providers.llm import CallStatus, Purpose, get_provider, prompt_text
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ class VisionSchema(BaseModel):
 class ModelVisionReader:
     def __init__(self, office_id: UUID):
         self.office_id = office_id
-        self.provider = get_selected_provider()
+        self.provider = get_provider(Purpose.VISION)
 
     def read(self, png: bytes, context: str, careful: bool = False) -> VisionOut | None:
         if not hasattr(self.provider, "structured_image"):
@@ -77,9 +77,9 @@ class ModelVisionReader:
         if careful:
             prompt += ("\nקריאה קודמת של התמונה הזו השמיטה תוכן. קרא את כל העמודות, כולל עמודת השמות או האזורים "
                        "שבקצה הטבלה, ואת כל השורות, ובדוק שלכל כותרת יש עמודה משלה.")
+        # a careful reading changes the prompt, not the purpose's configured effort
         result = self.provider.structured_image(Purpose.VISION, VISION_INSTRUCTIONS, prompt, png, VisionSchema,
-                                                max_output_tokens=12000,
-                                                reasoning_effort="low" if careful else None)
+                                                max_output_tokens=12000)
         self._log(result)
         if result.status != CallStatus.OK:
             logger.warning("vision reading failed: %s (%s)", result.status, result.detail)

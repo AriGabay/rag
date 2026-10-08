@@ -37,7 +37,15 @@ from app.chat.verify import VERIFY_ALLOWANCE_SECONDS, VerificationUnavailable, V
 from app.config import get_settings
 from app.db import TenantContext
 from app.measurements.extract import PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
-from app.providers.llm import CallStatus, LLMProvider, prompt_text, usage_entry
+from app.providers.llm import (
+    CallStatus,
+    LLMProvider,
+    Purpose,
+    for_purpose,
+    office_cache_key,
+    prompt_text,
+    usage_entry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -286,8 +294,10 @@ def run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput,
 def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progress: Callable[[str, str], None],
               cancelled: Callable[[], bool], usage: list[dict]) -> TurnOutcome:
     settings = get_settings()
-    if not hasattr(provider, "agent_step"):
+    agent = for_purpose(provider, Purpose.AGENT)
+    if not hasattr(agent, "agent_step"):
         raise ProviderFailure("unsupported", "provider has no tool loop")
+    cache_key = office_cache_key(ctx.office_id)
     deadline = time.monotonic() + settings.chat_turn_seconds
     ws = T.Workspace(ctx=ctx, prior=dict(inp.prior_refs))
     steps = 0
@@ -322,10 +332,9 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         steps += 1
         left = deadline - time.monotonic()
         last = steps >= settings.chat_max_steps or left < 25 or attempt == 2
-        step = provider.agent_step(POLICY, items, [] if last else T.TOOLS, FINAL_SCHEMA,
-                                   reasoning_effort=settings.chat_reasoning_effort,
-                                   timeout=max(15.0, min(left, settings.llm_timeout_agent_seconds)))
-        usage.append(usage_entry("agent", step, provider.model))
+        step = agent.agent_step(POLICY, items, [] if last else T.TOOLS, FINAL_SCHEMA, cache_key=cache_key,
+                                timeout=max(15.0, min(left, settings.llm_timeout_agent_seconds)))
+        usage.append(usage_entry("agent", step, agent.model))
         if cancelled():
             raise TurnCancelled  # the call that was in flight is discarded
         if not step.ok:

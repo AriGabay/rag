@@ -81,7 +81,8 @@ docker compose exec -e OWNER_DATABASE_URL="postgresql+psycopg://rag_owner:<RAG_O
 | `LLM_PROVIDER` | `openai` (ברירת מחדל) או `anthropic` |
 | `OPENAI_KEY` | מפתח OpenAI. אם הוא ריק נלקח `OPENAI_API_KEY`; אם שניהם מוגדרים — `OPENAI_KEY` קובע |
 | `OPENAI_API_KEY` | גיבוי למפתח (השם הסטנדרטי של OpenAI) |
-| `OPENAI_MODEL` | ברירת מחדל `gpt-5.4-mini`. המערכת אינה מחליפה מודל בעצמה; מודל אחר נקבע רק כאן |
+| `OPENAI_MODEL` | המודל של כל השימושים, ברירת מחדל `gpt-6-luna`. המערכת אינה מחליפה מודל בעצמה; מודל אחר נקבע רק כאן |
+| `MODEL_<PURPOSE>`, `EFFORT_<PURPOSE>` | מודל ומאמץ חשיבה לשימוש אחד (`AGENT`, `RESOLVE`, `VERIFY`, `MEASURE`, `VISION`, `SUMMARY`). מודל ריק = `OPENAI_MODEL`. מאמץ שהמודל אינו תומך בו עוצר את השרת בעלייה. בדיקה אמיתית לכל שימוש: `docker compose exec backend python scripts/probe_models.py` |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | רק כש-`LLM_PROVIDER=anthropic` |
 | `DEMO_MODE` | `true` בפיתוח: כשהענן כבוי משיבים בעזרת mock מקומי שמסומן "דמו" |
 

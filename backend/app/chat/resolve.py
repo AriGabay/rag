@@ -41,9 +41,16 @@ from pydantic import BaseModel, ConfigDict
 
 from app.chat import entities
 from app.chat import tools as T
-from app.config import get_settings
 from app.measurements.extract import PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
-from app.providers.llm import CallStatus, LLMProvider, Purpose, call_structured, prompt_text, usage_entry
+from app.providers.llm import (
+    CallStatus,
+    LLMProvider,
+    Purpose,
+    call_structured,
+    for_purpose,
+    prompt_text,
+    usage_entry,
+)
 
 # words that confirm a change of their field at once (prefixes such as ו/ה/ל/ב/ש are allowed before them); a change
 # whose words are not here is judged by its evidence and its consistency, never rejected for missing from this list
@@ -446,9 +453,9 @@ def resolve(provider: LLMProvider, focus: dict | None, history: list, message: s
     """The validated request of a follow-up, or None when the call failed (the turn then goes on as before).
     ``documents``: the documents the conversation was about; ``authorized`` and ``titles``: what the user may see;
     ``lookup``: the documents the user's words name; ``candidates``: what the previous clarification offered."""
-    kwargs = {"reasoning_effort": get_settings().resolve_reasoning_effort} if hasattr(provider, "agent_step") else {}
-    r = call_structured(provider, Purpose.AGENT, POLICY, _input(focus, history, message, documents, candidates),
-                        ResolvedRequest, max_output_tokens=1500, deadline=deadline, **kwargs)
+    provider = for_purpose(provider, Purpose.RESOLVE)
+    r = call_structured(provider, Purpose.RESOLVE, POLICY, _input(focus, history, message, documents, candidates),
+                        ResolvedRequest, max_output_tokens=1500, deadline=deadline)
     usage.append(usage_entry("resolve", r, provider.model))
     if r.status != CallStatus.OK or r.parsed is None:
         return None

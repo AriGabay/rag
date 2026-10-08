@@ -51,6 +51,7 @@ from app.providers.llm import (
     LLMProvider,
     Purpose,
     call_structured,
+    for_purpose,
     prompt_attr,
     prompt_text,
     usage_entry,
@@ -621,11 +622,9 @@ def _batches(units: list[Unit], ws: Workspace) -> list[_Batch]:
 def judge(provider: LLMProvider, batch: _Batch, rendered: str, usage: list[dict], deadline: float | None = None
           ) -> tuple[dict[int, JudgeVerdict], str]:
     """One judge call on a rendered batch: the verdicts of the batch's units, and the call's status."""
-    from app.config import get_settings
-
-    kwargs = {"reasoning_effort": get_settings().judge_reasoning_effort} if hasattr(provider, "agent_step") else {}
+    provider = for_purpose(provider, Purpose.VERIFY)
     r = call_structured(provider, Purpose.VERIFY, JUDGE_POLICY, rendered, JudgeOutput, deadline=deadline,
-                        max_output_tokens=6000, **kwargs)
+                        max_output_tokens=6000)
     usage.append(usage_entry("verify", r, provider.model))
     if r.status != CallStatus.OK:
         return {}, r.status.value

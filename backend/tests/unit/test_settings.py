@@ -1,16 +1,19 @@
-"""Provider settings (U1, KTD4, R5, R6): key resolution, model default, secrets never rendered."""
+"""Provider settings (U1, KTD4, R5, R6; KTD1, R27): key resolution, model default per purpose, secrets never
+rendered."""
 
 import logging
 
 import pytest
 from pydantic import ValidationError
 
-from app.config import DEFAULT_OPENAI_MODEL, Settings
+from app.config import DEFAULT_OPENAI_MODEL, MODEL_PURPOSES, Settings
 
 FAKE_KEY = "test-openai-key-not-real-0001"
 FAKE_FALLBACK = "test-openai-fallback-not-real-0002"
 PROVIDER_ENV = ("OPENAI_KEY", "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_REASONING_EFFORT", "LLM_PROVIDER",
-                "ANTHROPIC_API_KEY")
+                "ANTHROPIC_API_KEY", *(f"{kind}_{p.upper()}" for kind in ("MODEL", "EFFORT") for p in MODEL_PURPOSES))
+DEFAULT_EFFORTS = {"agent": "low", "verify": "low", "vision": "low", "measure": "low", "resolve": "none",
+                   "summary": "none"}
 
 
 @pytest.fixture
@@ -57,12 +60,71 @@ def test_no_key_resolves_to_empty(env):
 def test_model_defaults_when_unset_or_empty(env, value):
     if value is not None:
         env.setenv("OPENAI_MODEL", value)
-    assert settings().openai_model == DEFAULT_OPENAI_MODEL == "gpt-5.4-mini"
+    assert settings().openai_model == DEFAULT_OPENAI_MODEL == "gpt-6-luna"
 
 
 def test_model_from_env(env):
     env.setenv("OPENAI_MODEL", "x")
     assert settings().openai_model == "x"
+
+
+def test_every_purpose_defaults_to_luna_with_its_effort(env):
+    s = settings()
+    assert set(MODEL_PURPOSES) == set(DEFAULT_EFFORTS)
+    assert {p: s.model_for(p) for p in MODEL_PURPOSES} == {p: ("gpt-6-luna", e) for p, e in DEFAULT_EFFORTS.items()}
+    # the calls with no purpose setting of their own (connection test, earlier answer path) ride on the agent's model
+    assert s.model_for("test") == ("gpt-6-luna", "none")
+
+
+def test_single_override_switches_every_purpose(env):
+    env.setenv("OPENAI_MODEL", "gpt-5.4-mini")
+    s = settings()
+    assert {s.model_for(p)[0] for p in (*MODEL_PURPOSES, "test")} == {"gpt-5.4-mini"}
+    assert {p: s.model_for(p)[1] for p in MODEL_PURPOSES} == DEFAULT_EFFORTS
+
+
+def test_a_purpose_model_overrides_only_that_purpose(env):
+    env.setenv("MODEL_VISION", "gpt-5.4-mini")
+    s = settings()
+    assert {p: s.model_for(p)[0] for p in MODEL_PURPOSES} == {p: "gpt-5.4-mini" if p == "vision" else "gpt-6-luna"
+                                                               for p in MODEL_PURPOSES}
+    env.setenv("OPENAI_MODEL", "gpt-5.4-mini")
+    env.setenv("MODEL_VISION", "gpt-6-luna")
+    env.setenv("EFFORT_VISION", "high")
+    s = settings()
+    assert s.model_for("vision") == ("gpt-6-luna", "high") and s.model_for("agent") == ("gpt-5.4-mini", "low")
+
+
+def test_empty_purpose_settings_mean_default(env):
+    """Compose passes every per-purpose variable through, empty when unset."""
+    for p in MODEL_PURPOSES:
+        env.setenv(f"MODEL_{p.upper()}", "")
+        env.setenv(f"EFFORT_{p.upper()}", " ")
+    s = settings()
+    assert {p: s.model_for(p) for p in MODEL_PURPOSES} == {p: ("gpt-6-luna", e) for p, e in DEFAULT_EFFORTS.items()}
+
+
+@pytest.mark.parametrize("name, value, model", [
+    ("EFFORT_AGENT", "minimal", None),  # gpt-6-luna has no "minimal"
+    ("EFFORT_VERIFY", "max", "gpt-5.4-mini"),  # gpt-5.4-mini stops at xhigh
+    ("EFFORT_SUMMARY", "lowest", None),
+    ("OPENAI_REASONING_EFFORT", "minimal", None),
+])
+def test_unsupported_effort_fails_at_startup(env, name, value, model):
+    env.setenv(name, value)
+    if model:
+        env.setenv("OPENAI_MODEL", model)
+    with pytest.raises(ValidationError) as info:
+        settings()
+    message = str(info.value)
+    assert name in message and repr(value) in message and (model or "gpt-6-luna") in message
+
+
+def test_effort_of_an_unknown_model_is_not_checked(env):
+    """A model the capability table does not know is sent no optional parameter, so its effort is never sent."""
+    env.setenv("MODEL_MEASURE", "house-model")
+    env.setenv("EFFORT_MEASURE", "minimal")
+    assert settings().model_for("measure") == ("house-model", "minimal")
 
 
 def test_provider_selection(env):

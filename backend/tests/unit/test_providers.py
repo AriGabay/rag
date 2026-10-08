@@ -16,7 +16,7 @@ import pytest
 from openai.types.chat import ChatCompletion
 from pydantic import BaseModel, ConfigDict
 
-from app.config import Settings
+from app.config import MODEL_PURPOSES, Settings
 from app.providers import llm
 from app.providers.llm import (
     AnswerOutput,
@@ -74,11 +74,11 @@ class Transport:
         return self.reply
 
 
-def openai_provider(reply) -> tuple[OpenAIProvider, Transport]:
+def openai_provider(reply, model: str = "gpt-5.4-mini", effort: str = "none") -> tuple[OpenAIProvider, Transport]:
     transport = Transport(reply)
     client = openai.OpenAI(api_key=FAKE_KEY, max_retries=0,
                            http_client=httpx2.Client(transport=httpx2.MockTransport(transport)))
-    return OpenAIProvider(FAKE_KEY, "gpt-5.4-mini", reasoning_effort="none", client=client), transport
+    return OpenAIProvider(FAKE_KEY, model, reasoning_effort=effort, client=client), transport
 
 
 def call(provider, purpose=Purpose.INTERPRET) -> StructuredResult:
@@ -100,6 +100,79 @@ def test_openai_parsed_response_is_ok_with_usage():
     assert sent["reasoning"] == {"effort": "none"}
     assert sent["text"]["format"]["strict"] is True
     assert transport.requests[0].headers["authorization"] == f"Bearer {FAKE_KEY}"
+
+
+def _sent(transport: Transport, i: int = 0) -> dict:
+    return json.loads(transport.requests[i].content)
+
+
+def _ok() -> httpx2.Response:
+    return httpx2.Response(200, json=_response(_text('{"text": "שלום"}')))
+
+
+@pytest.mark.parametrize("effort", ["none", "low"])
+def test_luna_requests_carry_its_effort_and_no_unsupported_parameter(effort):
+    provider, transport = openai_provider(_ok(), "gpt-6-luna", effort)
+    assert call(provider, Purpose.VERIFY).ok
+    provider.agent_step("הוראות", [{"role": "user", "content": "שלום"}], [], Echo.model_json_schema())
+    provider.structured_image(Purpose.VISION, "הוראות", "תמלל", b"\x89PNG", Echo)
+    for i in range(3):
+        sent = _sent(transport, i)
+        assert sent["model"] == "gpt-6-luna" and sent["reasoning"] == {"effort": effort}
+        assert "temperature" not in sent and "top_p" not in sent and "prompt_cache_retention" not in sent
+        assert "minimal" not in transport.requests[i].content.decode()
+
+
+def test_one_shot_calls_send_explicit_cache_mode_without_a_breakpoint():
+    """A cache write costs more than ordinary input on gpt-6-luna; a call no later call extends writes nothing."""
+    provider, transport = openai_provider(_ok(), "gpt-6-luna", "low")
+    provider.structured_image(Purpose.VISION, "הוראות", "תמלל", b"\x89PNG", Echo)
+    call(provider, Purpose.RESOLVE)
+    for i in range(2):
+        sent = _sent(transport, i)
+        assert sent["prompt_cache_options"] == {"mode": "explicit"} and "prompt_cache_key" not in sent
+        assert "prompt_cache_breakpoint" not in transport.requests[i].content.decode()
+    image = _sent(transport)["input"][0]["content"][1]
+    assert image["type"] == "input_image" and image["detail"] == "high"
+
+
+def test_agent_step_keeps_implicit_caching_under_a_hashed_office_key():
+    office_a, office_b = "11111111-2222-4333-8444-555555555555", "66666666-7777-4888-8999-000000000000"
+    key_a, key_b = llm.office_cache_key(office_a), llm.office_cache_key(office_b)
+    assert key_a != key_b and key_a == llm.office_cache_key(office_a)
+    for office, key in ((office_a, key_a), (office_b, key_b)):
+        assert office not in key and office.replace("-", "") not in key
+    provider, transport = openai_provider(_ok(), "gpt-6-luna", "low")
+    provider.agent_step("הוראות", [{"role": "user", "content": "שלום"}], [], Echo.model_json_schema(),
+                        cache_key=key_a)
+    sent = _sent(transport)
+    assert sent["prompt_cache_key"] == key_a and "prompt_cache_options" not in sent
+    assert sent["include"] == ["reasoning.encrypted_content"]
+
+
+def test_mini_is_sent_no_cache_options():
+    provider, transport = openai_provider(_ok(), "gpt-5.4-mini", "low")
+    call(provider, Purpose.VERIFY)
+    provider.agent_step("הוראות", [], [], Echo.model_json_schema(), cache_key=llm.office_cache_key("x"))
+    assert "prompt_cache_options" not in _sent(transport, 0) and _sent(transport, 0)["reasoning"] == {"effort": "low"}
+    assert "prompt_cache_options" not in _sent(transport, 1) and _sent(transport, 1)["prompt_cache_key"]
+
+
+def test_unknown_model_is_sent_no_optional_parameter():
+    provider, transport = openai_provider(_ok(), "house-model", "low")
+    call(provider, Purpose.VERIFY)
+    provider.agent_step("הוראות", [], [], Echo.model_json_schema(), cache_key=llm.office_cache_key("x"))
+    provider.structured_image(Purpose.VISION, "הוראות", "תמלל", b"\x89PNG", Echo)
+    for i in range(3):
+        sent = _sent(transport, i)
+        assert not {"reasoning", "include", "prompt_cache_options", "prompt_cache_key"} & set(sent)
+    assert "detail" not in _sent(transport, 2)["input"][0]["content"][1]
+
+
+def test_an_effort_the_model_does_not_support_is_never_sent():
+    provider, transport = openai_provider(_ok(), "gpt-6-luna", "low")
+    provider.structured(Purpose.VISION, "הוראות", "שלום", Echo, reasoning_effort="minimal")
+    assert "reasoning" not in _sent(transport)
 
 
 def test_openai_cached_input_tokens_are_recorded():
@@ -343,7 +416,8 @@ def test_scripted_provider_replays_by_purpose_and_match():
 @pytest.fixture
 def configured(monkeypatch):
     """Point the provider module at fresh settings built from the patched environment."""
-    for name in ("OPENAI_KEY", "OPENAI_API_KEY", "OPENAI_MODEL", "LLM_PROVIDER", "ANTHROPIC_API_KEY"):
+    for name in ("OPENAI_KEY", "OPENAI_API_KEY", "OPENAI_MODEL", "LLM_PROVIDER", "ANTHROPIC_API_KEY",
+                 *(f"{kind}_{p.upper()}" for kind in ("MODEL", "EFFORT") for p in MODEL_PURPOSES)):
         monkeypatch.delenv(name, raising=False)
 
     def apply(**env):
@@ -362,7 +436,7 @@ def test_openai_selected_needs_only_openai_key(configured):
     configured(OPENAI_KEY=FAKE_KEY)
     assert llm.selected_provider_configured() and llm.cloud_configured()
     provider = llm.get_selected_provider()
-    assert isinstance(provider, OpenAIProvider) and provider.model == "gpt-5.4-mini"
+    assert isinstance(provider, OpenAIProvider) and provider.model == "gpt-6-luna"
     assert llm.get_selected_provider() is provider  # one client per key and model
     assert llm.get_cloud_provider() is provider
 
@@ -378,6 +452,59 @@ def test_anthropic_selected_checks_anthropic_key(configured):
     configured(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY="test-anthropic-not-real")
     assert llm.selected_provider_configured()
     assert isinstance(llm.get_selected_provider(), AnthropicLLM)
+
+
+PURPOSES = [Purpose(p) for p in MODEL_PURPOSES]
+
+
+def test_every_purpose_gets_luna_with_its_effort(configured):
+    configured(OPENAI_KEY=FAKE_KEY)
+    got = {p: llm.get_provider(p) for p in PURPOSES}
+    assert {p.value: (g.model, g.reasoning_effort) for p, g in got.items()} == {
+        "agent": ("gpt-6-luna", "low"), "verify": ("gpt-6-luna", "low"), "vision": ("gpt-6-luna", "low"),
+        "measure": ("gpt-6-luna", "low"), "resolve": ("gpt-6-luna", "none"), "summary": ("gpt-6-luna", "none")}
+    # one provider per (model, effort); every provider of one key shares one client (and connection pool)
+    assert got[Purpose.AGENT] is got[Purpose.VERIFY] and got[Purpose.RESOLVE] is got[Purpose.SUMMARY]
+    assert got[Purpose.AGENT] is not got[Purpose.RESOLVE]
+    assert got[Purpose.AGENT].client is got[Purpose.RESOLVE].client
+
+
+def test_the_single_override_switches_every_purpose(configured):
+    configured(OPENAI_KEY=FAKE_KEY, OPENAI_MODEL="gpt-5.4-mini")
+    assert {llm.get_provider(p).model for p in PURPOSES} == {"gpt-5.4-mini"}
+    assert llm.get_selected_provider().model == "gpt-5.4-mini"
+
+
+def test_a_purpose_model_switches_only_that_purpose(configured):
+    configured(OPENAI_KEY=FAKE_KEY, MODEL_VISION="gpt-5.4-mini")
+    assert {p.value: llm.get_provider(p).model for p in PURPOSES} == {
+        p.value: "gpt-5.4-mini" if p == Purpose.VISION else "gpt-6-luna" for p in PURPOSES}
+
+
+def test_for_purpose_routes_a_selected_provider_and_keeps_a_test_double(configured):
+    configured(OPENAI_KEY=FAKE_KEY, MODEL_SUMMARY="gpt-5.4-mini")
+    base = llm.get_selected_provider()
+    assert llm.for_purpose(base, Purpose.SUMMARY) is llm.get_provider(Purpose.SUMMARY)
+    assert llm.for_purpose(base, Purpose.SUMMARY).model == "gpt-5.4-mini"
+    double = ScriptedProvider()
+    assert llm.for_purpose(double, Purpose.SUMMARY) is double
+    unrouted = OpenAIProvider(FAKE_KEY, "gpt-6-luna", client=object())
+    assert llm.for_purpose(unrouted, Purpose.VERIFY) is unrouted
+
+
+def test_the_vision_reader_uses_the_vision_model(configured):
+    from uuid import uuid4
+
+    from app.extraction.vision import ModelVisionReader
+
+    configured(OPENAI_KEY=FAKE_KEY, MODEL_VISION="gpt-5.4-mini", EFFORT_VISION="medium")
+    reader = ModelVisionReader(uuid4())
+    assert (reader.provider.model, reader.provider.reasoning_effort) == ("gpt-5.4-mini", "medium")
+
+
+def test_anthropic_serves_every_purpose_with_its_model(configured):
+    configured(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY="test-anthropic-not-real")
+    assert {type(llm.get_provider(p)) for p in PURPOSES} == {AnthropicLLM}
 
 
 def test_provider_cache_is_not_keyed_by_raw_key():

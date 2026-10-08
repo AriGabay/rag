@@ -61,7 +61,7 @@ def test_every_call_of_a_turn_is_recorded_with_its_purpose_model_buckets_and_cos
     cid = _first_turn(client, office, monkeypatch)
     second = PricedAgent([[call("search", query="שווי", document_ids=None, limit=None)],
                           final("השווי למ\"ר בנוי ברוטו הוא 9,500 ₪, ללא מע\"מ [S1].")])
-    second.on("agent", _resolution(relation="new_question"))
+    second.on("resolve", _resolution(relation="new_question"))
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
     with tenant_tx(office.system) as conn:
         conn.execute(text("DELETE FROM provider_usage"))  # only the priced turn
@@ -69,6 +69,8 @@ def test_every_call_of_a_turn_is_recorded_with_its_purpose_model_buckets_and_cos
     assert m["status"] == "done", m
     got = rows(office)
     assert [r.purpose for r in got] == ["resolve", "agent", "agent", "verify"]
+    # resolve and verify are called under their own purposes (their own model and effort), not the agent's
+    assert [c.purpose for c in second.calls] == [Purpose.RESOLVE, Purpose.VERIFY]
     for r in got:
         assert (r.model, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens) == (
             MODEL, 1000, 400, 100, 50)
