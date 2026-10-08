@@ -1167,6 +1167,8 @@ def make_pdf_class():
         visual = False
 
         def footer(self) -> None:  # noqa: D401 - fpdf hook
+            if self.page_no() in getattr(self, "no_footer_pages", ()):
+                return
             self.set_y(-12)
             self.set_font("DejaVu", "", 8)
             text = f"{SYNTHETIC_MARKER} | עמוד {self.page_no()}"
@@ -3832,6 +3834,126 @@ def write_holdout_v2(out: Path, font_dir: Path, reports: list[Report], layouts: 
 # --------------------------------------------------------------------------- main
 
 
+# --------------------------------------------------------------------------- reading-order fixtures (blocks/)
+
+BLOCKS_DIR = "blocks"
+
+
+class BlocksPdfRenderer(GeneralPdfRenderer):
+    """Synthetic reproductions of PDF producer quirks the block reader must undo. Nothing here comes from a real
+    document: the layouts imitate the defects only (bold drawn twice, a title page without orientation evidence, a
+    heading whose last letter sits on its own baseline, tables between paragraphs and across a page break)."""
+
+    WIDTHS = [80, 50, 50]
+
+    def bold_twice(self, text: str, size: float = 12.5, h: float = 8) -> None:
+        """Fake bold the way some producers draw it: the same glyphs twice, the second copy 0.15 mm to the right."""
+        pdf = self.pdf
+        y = pdf.get_y()
+        pdf.set_font("DejaVu", "B", size)
+        pdf.set_xy(pdf.l_margin + 0.15, y)
+        pdf.cell(pdf.w - pdf.l_margin - pdf.r_margin, h, text, align="R")
+        pdf.set_xy(pdf.l_margin, y)
+        pdf.cell(0, h, text, align="R", new_x=self.XPos.LMARGIN, new_y=self.YPos.NEXT)
+
+    def split_heading(self, head: str, tail: str, size: float = 12.5, h: float = 8) -> None:
+        """A heading whose last letters are a separate run 1.8 mm lower (a text-layer line break inside a word)."""
+        pdf = self.pdf
+        y = pdf.get_y()
+        pdf.set_font("DejaVu", "B", size)
+        right = pdf.w - pdf.r_margin
+        head_w = pdf.get_string_width(head)
+        pdf.set_xy(right - head_w - 0.5, y)
+        pdf.cell(head_w + 0.5, h, head, align="R")
+        tail_w = pdf.get_string_width(tail)
+        pdf.set_xy(right - head_w - 0.5 - tail_w - 0.2, y + 1.8)
+        pdf.cell(tail_w + 0.2, h, tail, align="R")
+        pdf.set_xy(pdf.l_margin, y + h)
+
+    def note(self, text: str) -> None:
+        self._line(text, size=9)
+
+    def btable(self, headers: list[str], rows: list[list[str]]) -> list[int]:
+        """A ruled table that continues on the next page without repeating its header; returns each row's page."""
+        pdf = self.pdf
+        pdf.set_fill_color(225, 225, 225)
+        self._grow(headers, self.WIDTHS, bold=True)
+        pages = []
+        for row in rows:
+            if pdf.get_y() + self.ROW_H > pdf.page_break_trigger:
+                pdf.add_page()
+            self._grow(row, self.WIDTHS)
+            pages.append(pdf.page_no())
+        pdf.ln(2)
+        return pages
+
+    def render_reading_order(self) -> tuple[bytes, list[int]]:
+        pdf = self.pdf
+        pdf.no_footer_pages = {1}
+        pdf.add_page()  # title page: no word carries orientation evidence, so only the document can decide it
+        pdf.ln(60)
+        self._line("חוות דעת שמאית", size=22, bold=True, h=14)
+        self._line("גבעת התאנה", size=15, h=10)
+        pdf.add_page()
+        self.bold_twice("1. מטרת חוות הדעת")
+        self.paragraph("חוות דעת זו נערכה לצורך הדגמה בלבד ואינה מתייחסת לנכס אמיתי. כל השמות והמספרים בה בדויים.")
+        self.bold_twice("2. נתוני השוואה")
+        self.paragraph("להלן עסקאות שנמצאו בסביבת הנכס:")
+        self.btable(["כתובת", "שטח (מ״ר)", "מחיר (₪)"],
+                    [["התאנה 3", "82", "1,640,000"], ["התאנה 9", "95", "1,910,000"], ["הרימון 4", "77", "1,520,000"]])
+        self.note("(*) המחירים כוללים מע״מ.")
+        pdf.ln(2)
+        self.paragraph("העסקאות מלמדות על מחיר ממוצע של כ-20,000 ₪ למ״ר בנוי.")
+        self.bold_twice("3. תיאור הנכס")
+        self.bold_twice("3.1 הבניין", size=11)
+        self.paragraph("הבניין בן ארבע קומות ונבנה בשנת 1995.")
+        self.bold_twice("3.2 הדירה", size=11)
+        self.paragraph("הדירה בקומה השנייה ושטחה 88 מ״ר.")
+        self.split_heading("4. התחשי", "ב")
+        self.paragraph("טבלת התחשיב לפי רכיבים:")
+        rows = [[f"רכיב {i}", str(10 + i), f"{(10 + i) * 20_000:,}"] for i in range(1, 25)]
+        pages = self.btable(["רכיב", "שטח (מ״ר)", "שווי (₪)"], rows)
+        assert pages[0] == 2 and pages[-1] == 3, pages
+        self.paragraph("סך שווי הרכיבים מופיע בשורה האחרונה של הטבלה.")
+        self._line("5. סיכום", size=12.5, bold=True, h=8)
+        self.paragraph("שווי הנכס המוערך הוא 1,760,000 ₪.")
+        return bytes(pdf.output()), pages
+
+    def render_pictures(self) -> bytes:
+        from PIL import Image, ImageDraw
+
+        logo = Image.new("RGB", (60, 60), (255, 255, 255))
+        ImageDraw.Draw(logo).ellipse((6, 6, 54, 54), fill=(30, 90, 160))
+        photo = Image.new("RGB", (120, 80), (200, 220, 200))
+        ImageDraw.Draw(photo).rectangle((20, 20, 100, 60), fill=(120, 80, 40))
+        pdf = self.pdf
+        pdf.add_page()
+        pdf.image(logo, x=pdf.l_margin, y=pdf.get_y(), w=15)
+        pdf.ln(18)
+        self._line("1. תמונות הנכס", size=12.5, bold=True, h=8)
+        self.paragraph("להלן צילום חזית הבניין:")
+        pdf.image(photo, x=pdf.w - pdf.r_margin - 60, y=pdf.get_y(), w=60)
+        pdf.ln(44)
+        self.paragraph("הצילום מתאר את חזית הבניין בלבד.")
+        pdf.add_page()
+        pdf.image(logo, x=pdf.l_margin, y=pdf.get_y(), w=15)
+        pdf.ln(18)
+        self._line("2. סיכום", size=12.5, bold=True, h=8)
+        self.paragraph("שווי הנכס המוערך הוא 990,000 ₪.")
+        return bytes(pdf.output())
+
+
+def write_blocks(out: Path, font_dir: Path) -> None:
+    bdir = out / BLOCKS_DIR
+    bdir.mkdir(parents=True, exist_ok=True)
+    data, _ = BlocksPdfRenderer(font_dir).render_reading_order()
+    (bdir / "B1_synthetic_reading_order.pdf").write_bytes(data)
+    print(f"wrote {BLOCKS_DIR}/B1_synthetic_reading_order.pdf ({len(data):,} bytes)")
+    data = BlocksPdfRenderer(font_dir).render_pictures()
+    (bdir / "B2_synthetic_pictures.pdf").write_bytes(data)
+    print(f"wrote {BLOCKS_DIR}/B2_synthetic_pictures.pdf ({len(data):,} bytes)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--font-dir", default=DEFAULT_FONT_DIR)
@@ -3882,6 +4004,7 @@ def main() -> None:
     (out / "ground_truth.yaml").write_text(text, encoding="utf-8")
     print(f"wrote ground_truth.yaml ({len(text):,} chars)")
     write_holdout_v2(out, font_dir, reports, layouts)
+    write_blocks(out, font_dir)
 
 
 if __name__ == "__main__":

@@ -216,3 +216,14 @@ value column; `test_fixtures_ground_truth.py` runs the rules extractor on each a
 | K6 | `holdout_v2/K6_synthetic_holon_haplada_industrial_2024.docx` | docx | חולון | Same building 2024 (not a version): plot **2,450** m² (conflict with K5), let: 72,000 ₪/month, 48 ₪/m², 7 years, cap rate 7.75% |
 | K7 | `holdout_v2/K7_synthetic_petahtikva_herzl_building.pdf` | pdf_digital | פתח תקווה | Residential building at **הרצל 15**: 24 units, plot 1,150 m², coverage 35%, energy A, noise 55 dB, setbacks table, no warning notes, easement, cost 6,800, depreciation 20% |
 | K8 | `holdout_v2/K8_synthetic_holon_herzl_land.pdf` | pdf_digital | חולון | Vacant land at **הרצל 15** (ambiguous referent with K7): plot 1.8 dunam, road "שישה מטרים" (words only), noise 72 dB, permitted coverage 45%, two warning notes, no easements, cost "7.2 אלף ₪" per m² |
+
+## Reading-order fixtures (`blocks/`)
+
+Small synthetic PDFs that reproduce PDF producer quirks for the block reader (`app/extraction/pdf.py`), written by the
+same script and run (`write_blocks`). Their expectations live in `tests/unit/test_pdf_blocks.py`; nothing is added to
+`ground_truth.yaml`, and the earlier fixture files stay byte-identical.
+
+| file | what it exercises |
+|---|---|
+| `blocks/B1_synthetic_reading_order.pdf` | Title page without footer whose words carry no orientation evidence; headings drawn twice 0.15 mm apart (fake bold, doubled letters in the raw text layer); sub-sections `3.1`/`3.2` under `3.`; heading `4. התחשיב` whose last letter is drawn 1.8 mm lower (a separate raw line); a table between two paragraphs with a `(*)` note line under it; a 24-row table that continues from page 2 to page 3 without a repeated header |
+| `blocks/B2_synthetic_pictures.pdf` | A small logo on both pages (one image object, the same raw bytes) and a photo between two paragraphs on page 1 |

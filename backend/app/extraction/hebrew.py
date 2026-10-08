@@ -138,6 +138,12 @@ def page_is_visual(lines: list[str]) -> bool | None:
     return looks_visual("\n".join(lines))
 
 
+def document_is_visual(pages: list[list[str]]) -> bool | None:
+    """The orientation of a whole document, for its pages whose own words decide nothing (a title page whose words
+    carry no final letter or punctuation): one producer writes every page the same way."""
+    return looks_visual("\n".join(line for lines in pages for line in lines))
+
+
 def fix_text_lines(lines: list[str], default_visual: bool | None = None) -> list[str]:
     """Fix all lines of one page. The page majority decides lines with weak evidence; a line
     overrides the page only with a clear margin (mixed-producer documents)."""

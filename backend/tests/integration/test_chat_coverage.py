@@ -342,6 +342,30 @@ def test_a_section_opened_after_the_paragraphs_around_the_same_place_is_sent_in_
     assert 'same_as="S3"' in T.tool_open_source(ws, "S1", "section")
 
 
+def test_a_section_opened_from_a_sub_section_reads_its_whole_top_level_section(setup):
+    """PDF blocks carry sub-section paths (["3. תיאור הנכס", "3.1 הבניין"]): opening the section from a block of
+    3.1 still opens all of 3, its sub-sections included, and nothing of 4."""
+    doc, ver = make_document(setup, setup.default_group_id, "שומה רחוב הצאלון 2", sha="u" * 64)
+    blocks = [("heading", ["3. תיאור הנכס"], "3. תיאור הנכס"),
+              ("heading", ["3. תיאור הנכס", "3.1 הבניין"], "3.1 הבניין"),
+              ("paragraph", ["3. תיאור הנכס", "3.1 הבניין"], "הבניין בן ארבע קומות."),
+              ("heading", ["3. תיאור הנכס", "3.2 הדירה"], "3.2 הדירה"),
+              ("paragraph", ["3. תיאור הנכס", "3.2 הדירה"], "הדירה בקומה השנייה."),
+              ("heading", ["4. התחשיב"], "4. התחשיב"),
+              ("paragraph", ["4. התחשיב"], "שווי הנכס 990,000 ₪.")]
+    with tenant_tx(setup.system) as conn:
+        for i, (kind, path, t) in enumerate(blocks):
+            conn.execute(text(
+                "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
+                " section_path, page, text) VALUES (app_office(), :d, :v, :b, :k, :s, :sp, 2, :t)"),
+                {"d": doc, "v": ver, "b": i, "k": kind, "s": path[-1], "sp": path, "t": t})
+    ws = T.Workspace(ctx=setup.ctx())
+    ws.add_source(document_id=str(doc), version_id=ver, title="שומה רחוב הצאלון 2", section="3.1 הבניין",
+                  location="עמוד 2", kind="text", text="הבניין בן ארבע קומות.", block_start=2, block_end=2)
+    section = T.tool_open_source(ws, "S1", "section")
+    assert "הדירה בקומה השנייה." in section and "3.1 הבניין" in section and "990,000" not in section
+
+
 def test_a_table_answer_states_the_rows_it_presented(client, setup, monkeypatch):
     doc = _rent_table(setup)
 

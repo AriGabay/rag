@@ -351,7 +351,8 @@ def get_blocks(document_id: str, version_id: str, start: int | None = Query(None
                         "b": end if end is not None else 1_000_000}
         rows = conn.execute(text(
             "SELECT block_index, kind, section, section_path, label, paragraph_no, page, media, source, status, note,"
-            " table_index, text FROM document_blocks WHERE version_id = :v AND block_index BETWEEN :a AND :b"
+            " table_index, text, bbox, method, reader_version, content_hash, original_text FROM document_blocks"
+            " WHERE version_id = :v AND block_index BETWEEN :a AND :b"
             f" ORDER BY block_index LIMIT {BLOCKS_MAX}"), params).all()
         tables = {r.table_index: r.structure for r in conn.execute(text(
             "SELECT table_index, structure FROM extracted_tables WHERE version_id = :v"), {"v": ver_uuid})}
@@ -362,7 +363,8 @@ def get_blocks(document_id: str, version_id: str, start: int | None = Query(None
     for r in rows:
         b = {"index": r.block_index, "kind": r.kind, "section": r.section, "section_path": list(r.section_path or []),
              "paragraph_no": r.paragraph_no, "page": r.page, "media": r.media, "source": r.source, "status": r.status,
-             "note": r.note, "text": r.text}
+             "note": r.note, "text": r.text, "bbox": r.bbox, "method": r.method, "reader_version": r.reader_version,
+             "content_hash": r.content_hash, "original_text": r.original_text}
         if r.table_index is not None and r.table_index in tables:
             st = tables[r.table_index] or {}
             b["table"] = {k: st.get(k) for k in ("headers", "caption", "title", "notes", "source", "media")} | {

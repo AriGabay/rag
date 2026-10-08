@@ -30,7 +30,7 @@ def check_deadline(deadline: float) -> None:
 class PageResult:
     page_no: int  # physical page in the file, 1-based
     text: str  # logical-order text
-    method: Literal["text_layer", "ocr", "docx", "failed"]
+    method: Literal["text_layer", "ocr", "mixed", "docx", "failed"]
     quality: float
     ok: bool
 
@@ -67,9 +67,16 @@ class Block:
     """One unit of a document in reading order: a heading, a paragraph, a text box, a table, or a picture.
 
     DOCX has no pages, so a block is located by its section (the heading path), its numbering label ("6.2")
-    and its running paragraph number; a picture also by its media name. ``status`` says whether its content
-    was read: ``read``, ``read_uncertain`` (OCR, or a model reading that OCR could not confirm), ``no_text``
-    (a photo or drawing without legible text), ``decorative`` (too small to carry content) or ``unread``."""
+    and its running paragraph number; a picture also by its media name. A PDF block also has its page and its
+    region on the page (``bbox``: x0, top, x1, bottom in points from the top-left corner). ``status`` says whether
+    its content was read: ``read``, ``read_uncertain`` (OCR, or a model reading that OCR could not confirm),
+    ``no_text`` (a photo or drawing without legible text), ``decorative`` (too small to carry content) or
+    ``unread``.
+
+    Provenance (PDF): ``method`` is how the text was obtained (``text_layer``, ``ocr``, ``vision``, ``none`` for a
+    picture not read yet), ``reader_version`` the reader that produced the block, ``content_hash`` a picture's
+    hash over its raw image bytes (the key a reading is reused by), and ``original_text`` the text as extracted
+    when ``text`` is a corrected form of it. DOCX blocks leave them empty."""
 
     index: int
     kind: Literal["heading", "paragraph", "textbox", "table", "image"]
@@ -85,6 +92,11 @@ class Block:
     note: str | None = None  # why a picture is unread or uncertain; what a non-text picture shows
     table_index: int | None = None
     picture_text: str = ""  # a picture's text outside its tables (labels, a screenshot's lines)
+    bbox: list[float] | None = None
+    method: str | None = None
+    reader_version: str | None = None
+    content_hash: str | None = None
+    original_text: str | None = None
 
 
 @dataclass
@@ -124,7 +136,8 @@ class ExtractionResult:
                 images[b.status] = images.get(b.status, 0) + 1
                 methods[b.source] = methods.get(b.source, 0) + 1
                 if b.status == "unread":
-                    unread.append({"media": b.media, "section": b.section, "reason": b.note})
+                    entry = {"media": b.media, "section": b.section, "reason": b.note}
+                    unread.append(entry if b.page is None else entry | {"page": b.page})
         return {"blocks": kinds, "images": images, "image_methods": methods, "unread": unread,
                 "tables": len(self.tables), "partial": bool(unread) or self.pages_incomplete > 0}
 

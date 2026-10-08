@@ -80,7 +80,8 @@ def logical_row(cells_ltr: list[str | None], visual_default: bool = True) -> lis
 
 @dataclass
 class RawTable:
-    """One table found on one page, rows already in logical column order."""
+    """One table found on one page, rows already in logical column order. ``assemble_tables`` records which
+    table the piece went into (``table_index``) and whether it continued an earlier one (``continues``)."""
 
     page: int | None
     rows: list[list[str]]
@@ -88,6 +89,9 @@ class RawTable:
     section: str | None = None
     first_on_page: bool = True
     top: float = 0.0
+    bbox: list[float] | None = None
+    table_index: int | None = None
+    continues: bool = False
 
 
 def _width(t: TableResult) -> int:
@@ -130,6 +134,7 @@ def assemble_tables(raws: list[RawTable]) -> list[TableResult]:
 
 
 def _new(tables: list[TableResult], headers: list[str], body: list[list[str]], raw: RawTable) -> None:
+    raw.table_index = len(tables)
     tables.append(
         TableResult(
             index=len(tables),
@@ -145,6 +150,7 @@ def _new(tables: list[TableResult], headers: list[str], body: list[list[str]], r
 
 
 def _append(table: TableResult, body: list[list[str]], raw: RawTable) -> None:
+    raw.table_index, raw.continues = table.index, True
     table.rows.extend(TableRow(page=raw.page, cells=r) for r in body)
     table.page_end = raw.page
     table.ocr = table.ocr or raw.ocr

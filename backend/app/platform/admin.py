@@ -235,17 +235,18 @@ def reprocess(body: ReprocessBody, ctx: TenantContext = Depends(require_admin)) 
     """Queue a fresh reading of the office's current documents (blocks, pictures, chunks, embeddings; records and
     reviewed decisions kept). Without ``all``, only versions read by an older reader."""
     from app.platform.jobs import enqueue_reindex
-    from app.platform.pipeline import INGESTION_VERSION
+    from app.platform.pipeline import INGESTION_VERSION, PDF_INGESTION_VERSION, ingestion_version
 
     with tenant_tx(ctx) as conn:
         rows = conn.execute(text(
-            "SELECT v.id, v.ingestion->>'ingestion_version' AS iv FROM document_versions v JOIN documents d"
-            " ON d.id = v.document_id AND d.deleted_at IS NULL WHERE v.is_current AND v.status IN ('ready',"
-            " 'needs_review')")).all()
-        queued = [str(r.id) for r in rows if (body.all or r.iv != INGESTION_VERSION)
-                  and enqueue_reindex(conn, r.id, INGESTION_VERSION)]
+            "SELECT v.id, v.mime_type, v.ingestion->>'ingestion_version' AS iv FROM document_versions v JOIN"
+            " documents d ON d.id = v.document_id AND d.deleted_at IS NULL WHERE v.is_current AND v.status IN"
+            " ('ready', 'needs_review')")).all()
+        queued = [str(r.id) for r in rows if (body.all or r.iv != ingestion_version(r.mime_type))
+                  and enqueue_reindex(conn, r.id, ingestion_version(r.mime_type))]
         audit(conn, "reprocess", ctx.user_id, "office", ctx.office_id)
-    return {"queued": len(queued), "versions": queued, "ingestion_version": INGESTION_VERSION}
+    return {"queued": len(queued), "versions": queued, "ingestion_version": INGESTION_VERSION,
+            "ingestion_versions": {"docx": INGESTION_VERSION, "pdf": PDF_INGESTION_VERSION}}
 
 
 @router.post("/measurements")

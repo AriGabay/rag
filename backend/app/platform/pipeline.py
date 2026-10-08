@@ -31,13 +31,20 @@ from app.db import (  # noqa: F401 - system_ctx re-exported
 )
 from app.extraction.base import Block, ExtractionResult, check_deadline
 from app.extraction.normalize_text import normalize_for_search
+from app.extraction.pdf import READER_VERSION as PDF_READER_VERSION
 
 logger = logging.getLogger(__name__)
 
 EXTRACTION_VERSION = "rules-v1"
-# Version of the document reading itself (blocks, pictures, chunk boundaries). A version processed under an
-# older one is reprocessed by ``reprocess_outdated``.
+# Version of the document reading itself (blocks, pictures, chunk boundaries), per format. A version processed
+# under an older one is queued again by the admin reprocess.
 INGESTION_VERSION = "docx-blocks-v3"
+PDF_INGESTION_VERSION = PDF_READER_VERSION
+
+
+def ingestion_version(mime_type: str | None) -> str:
+    """The current reader version of a file type: a PDF's block reader, or the DOCX reader."""
+    return PDF_INGESTION_VERSION if mime_type == "application/pdf" else INGESTION_VERSION
 
 
 @dataclass
@@ -114,9 +121,10 @@ def clone_outputs(conn: Connection, info: VersionInfo) -> int:
     conn.execute(
         text(
             "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section, section_path,"
-            " label, paragraph_no, page, media, source, status, note, table_index, text) SELECT office_id, :d, :v,"
-            " block_index, kind, section, section_path, label, paragraph_no, page, media, source, status, note,"
-            " table_index, text FROM document_blocks WHERE version_id = :s"
+            " label, paragraph_no, page, media, source, status, note, table_index, text, bbox, method, reader_version,"
+            " content_hash, original_text) SELECT office_id, :d, :v, block_index, kind, section, section_path, label,"
+            " paragraph_no, page, media, source, status, note, table_index, text, bbox, method, reader_version,"
+            " content_hash, original_text FROM document_blocks WHERE version_id = :s"
         ),
         params,
     )
@@ -136,8 +144,9 @@ def clone_outputs(conn: Connection, info: VersionInfo) -> int:
 
 
 def _blocks_of(result: ExtractionResult) -> list[Block]:
-    """The result's blocks; a PDF has none of its own, so each chunk is one block on its first page (tables are
-    their own blocks) and the chunk points at it."""
+    """The result's blocks. The built-in readers always produce them; for an extractor that returns chunks only (a
+    plug-in adapter), each chunk becomes one block on its first page (tables are their own blocks) and the chunk
+    points at it."""
     if result.blocks:
         return result.blocks
     blocks: list[Block] = []
@@ -180,12 +189,14 @@ def _insert_outputs(conn: Connection, info: VersionInfo, result: ExtractionResul
         conn.execute(
             text(
                 "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
-                " section_path, label, paragraph_no, page, media, source, status, note, table_index, text)"
-                " VALUES (app_office(), :d, :v, :i, :k, :s, :sp, :l, :pn, :pg, :m, :src, :st, :n, :ti, :t)"
+                " section_path, label, paragraph_no, page, media, source, status, note, table_index, text, bbox,"
+                " method, reader_version, content_hash, original_text) VALUES (app_office(), :d, :v, :i, :k, :s,"
+                " :sp, :l, :pn, :pg, :m, :src, :st, :n, :ti, :t, CAST(:bb AS jsonb), :me, :rv, :ch, :ot)"
             ),
             {"d": info.document_id, "v": info.id, "i": b.index, "k": b.kind, "s": b.section, "sp": b.section_path,
              "l": b.label, "pn": b.paragraph_no, "pg": b.page, "m": b.media, "src": b.source, "st": b.status,
-             "n": b.note, "ti": b.table_index, "t": b.text},
+             "n": b.note, "ti": b.table_index, "t": b.text, "bb": json.dumps(b.bbox) if b.bbox else None,
+             "me": b.method, "rv": b.reader_version, "ch": b.content_hash, "ot": b.original_text},
         )
     for t in result.tables:
         structure = {
@@ -213,7 +224,8 @@ def _insert_outputs(conn: Connection, info: VersionInfo, result: ExtractionResul
              "t": c.text, "n": normalize_for_search(c.text), "ti": c.table_index, "ri": c.row_index,
              "bs": c.block_start, "be": c.block_end},
         )
-    report = result.components | {"ingestion_version": INGESTION_VERSION, "chunks": len(result.chunks)}
+    version = INGESTION_VERSION if result.is_docx else PDF_INGESTION_VERSION
+    report = result.components | {"ingestion_version": version, "chunks": len(result.chunks)}
     conn.execute(
         text("UPDATE document_versions SET page_count = :p, pages_incomplete = :i, extraction_version = :e,"
              " ingestion = CAST(:g AS jsonb) WHERE id = :v"),

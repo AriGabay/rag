@@ -157,12 +157,26 @@ def test_chunks_have_sections_pages_and_table_rows(doc):
     assert rc.page_list == (None if result.is_docx else [first_row["page"]])
 
 
+@pytest.mark.parametrize("doc", [d for d in DIGITAL if d["kind"] != "docx"], ids=lambda d: d["id"])
+def test_pdf_blocks_have_pages_and_the_ground_truth_headings(doc):
+    result = extract(doc["id"])
+    counts = result.components["blocks"]
+    assert counts.get("paragraph") and counts.get("table", 0) == len(doc["tables"])
+    assert all(b.page and b.bbox and b.method == "text_layer" for b in result.blocks)
+    assert [(b.text, b.page) for b in result.blocks if b.kind == "heading"] == [
+        (s["title"], s["page"]) for s in doc["sections"]]
+    table = next(b for b in result.blocks if b.kind == "table")
+    assert table.section == "3. עסקאות השוואה" and result.tables[0].block_index == table.index
+    assert [b.index for b in result.blocks] == list(range(len(result.blocks)))
+
+
 def test_d3_table_crosses_pages_and_a_chunk_spans_two_pages():
     result = extract("D3")
     t = result.tables[0]
     assert {r.page for r in t.rows} == {1, 2}
-    spanning = [c for c in result.chunks if c.kind == "text" and c.page_list == [1, 2]]
-    assert spanning, [(c.section, c.page_list) for c in result.chunks if c.kind == "text"]
+    # The table is its own block (its cells are no paragraph text), so the chunk of its whole rows spans the pages.
+    spanning = [c for c in result.chunks if c.kind in ("text", "table") and c.page_list == [1, 2]]
+    assert spanning, [(c.section, c.page_list) for c in result.chunks if c.kind in ("text", "table")]
     assert spanning[0].section == "3. עסקאות השוואה"
     page2_rows = [c for c in result.chunks if c.kind == "table_row" and c.page_list == [2]]
     assert len(page2_rows) == sum(1 for r in DOCS["D3"]["tables"][0]["rows"] if r["page"] == 2)
