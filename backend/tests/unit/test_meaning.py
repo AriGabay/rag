@@ -155,7 +155,7 @@ def test_a_missing_basis_is_judged_and_finally_annotated():
     a = _answer("השווי למ\"ר בצאלון 7 הוא 14,250 ₪ [S1].")
     p = _judge("supported")
     r = verify_answer(p, a, ws, "?", [])
-    assert not r.ok and len(p.calls) == 1  # still judged, and still a problem for the repair round
+    assert r.ok and len(p.calls) == 1  # still judged; the server writes the qualifier in itself, so no repair round
     out = r.apply(a).answer_markdown
     assert out.startswith("השווי למ\"ר בצאלון 7 הוא 14,250 ₪ (מ״ר אקוו׳, כפי שנכתב במקור) [S1].")
     assert "הוסרו" not in out

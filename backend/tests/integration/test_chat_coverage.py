@@ -289,7 +289,8 @@ def test_a_table_row_hit_carries_the_table_size_to_the_model_and_the_judge(clien
     def judge(input: str) -> dict:
         seen.append(input)
         n = input.count("<unit index=")
-        return {"verdicts": [{"index": i, "verdict": "partial", "reason": "ריבוי ערכים"} for i in range(n)]}
+        return {"verdicts": [{"index": i, "verdict": "partial", "reason": "ריבוי ערכים", "defect": "multiple_values"}
+                             for i in range(n)]}
 
     def answer(items):
         return final(f"שכר הדירה למ\"ר הוא 53 ₪ [{_source_of(items, doc)}].", documents=[doc])

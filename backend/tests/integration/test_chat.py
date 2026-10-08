@@ -110,9 +110,8 @@ def test_a_failed_repair_is_rewritten_from_verified_content_instead_of_cut(clien
     rewritten = final("דמי השכירות הם 55 ₪ למ\"ר לחודש [S1]. מעמד המע\"מ שלהם לא צוין במקור [S1].")
 
     def judge(input: str) -> dict:
-        n = input.count("<unit index=")
-        verdicts = []
-        for i in range(n):
+        verdicts = []  # a re-judge sends only the units that changed, so read the indexes it gives
+        for i in map(int, re.findall(r'<unit index="(\d+)"', input)):
             unit = input.split(f'<unit index="{i}"')[1].split("</unit>")[0]
             bad = "כוללים מע" in unit.split("<source")[0]
             verdicts.append({"index": i, "verdict": "unsupported" if bad else "supported", "reason": "בדיקה"})
@@ -489,13 +488,13 @@ def test_a_clarification_that_states_a_figure_is_not_used(client, office, monkey
     assert m["answer"]["status"] != "clarification" and len(second.seen) == 2  # the turn went on with tools
 
 
-def test_a_qualifier_still_missing_after_the_repair_is_written_in_without_a_rewrite(client, office, monkeypatch):
+def test_a_missing_qualifier_is_written_in_without_a_repair_round_or_a_rewrite(client, office, monkeypatch):
     bare = final("השווי למ\"ר הוא 9,500 ₪, ללא מע\"מ [S1].")  # the source says "למ"ר בנוי ברוטו"
     agent = ScriptedAgent([[call("search", query="שווי", document_ids=None, limit=None)], bare, bare, bare])
     cloud(monkeypatch, office, agent)
     login(client, "admin-a@example.test")
     a = send(client, new_conversation(client), "מה השווי למ\"ר?")["answer"]
-    assert len(agent.seen) == 3  # first answer and one repair; no rewrite that would drop the datum
+    assert len(agent.seen) == 2  # no repair round for a qualifier the server writes in; no rewrite drops the datum
     assert "9,500 ₪ (מ״ר בנוי ברוטו, כפי שנכתב במקור)" in a["markdown"]
     assert a["verification"]["annotated"] == 1 and a["verification"]["removed"] == 0
 

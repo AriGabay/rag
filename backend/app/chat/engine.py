@@ -23,6 +23,12 @@ One turn:
    the server (``coverage.state_parts``), and correctness and completeness are reported apart
    (``VerifyReport.counts``; each requirement in the ledger's ``requirements``).
 
+Repair rounds cost what changed (KTD10): verdicts are kept for the turn (``verify.VerdictCache``), so a round judges
+only the units that are new or changed, and a problem the server resolves itself — a citation it attaches, a
+qualifier it writes in from the source, a ``partial`` whose judge named no concrete defect — does not start a round.
+Each model call keeps its own usage record; the turn's totals (``usage_summary``: calls per purpose, tokens with the
+cached share, cost, latency, verdicts reused) are on the outcome and in the log.
+
 Limits (KTD12). Reading stops early enough for the answer, its verification and its repair rounds to fit: one
 step per repair round is kept from the step bound, and ``chat_verify_reserve_seconds`` from the clock. A limit
 reached while reading — the tool-output budget, the step bound or the time reserve — makes the next step the last:
@@ -59,6 +65,7 @@ from app.chat import tools as T
 from app.chat.verify import (
     VERIFY_ALLOWANCE_SECONDS,
     TurnRequirements,
+    VerdictCache,
     VerificationUnavailable,
     VerifyReport,
     verify_answer,
@@ -67,6 +74,7 @@ from app.config import get_settings
 from app.db import TenantContext
 from app.measurements.extract import PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
 from app.providers.llm import (
+    TOKEN_FIELDS,
     CallStatus,
     LLMProvider,
     Purpose,
@@ -339,6 +347,22 @@ class TurnOutcome:
     rounds: list[list[dict]] = field(default_factory=list)  # each verification round's problems, in order
     request: dict | None = None  # the follow-up resolved in context (``app.chat.resolve``), when there was one
     resolution: dict | None = None  # the raw parse and the server's decisions on it (diagnostics only)
+    summary: dict = field(default_factory=dict)  # the turn's totals (``usage_summary``), no content
+
+
+def usage_summary(usage: list[dict], **extra) -> dict:
+    """A turn's model calls in one record (R31), from the per-call records (``usage_entry``), which stay as they are:
+    the calls, per purpose; each token bucket; the cost of the priced calls and how many were not priced; and the
+    summed latency. ``extra`` adds the turn's own counts (rounds, verdicts reused). No content."""
+    by_purpose: dict[str, int] = {}
+    for u in usage:
+        by_purpose[u.get("purpose") or "-"] = by_purpose.get(u.get("purpose") or "-", 0) + 1
+    costs = [u.get("cost_usd") for u in usage]
+    return {"calls": len(usage), "by_purpose": by_purpose,
+            **{k: sum(u.get(k) or 0 for u in usage) for k in TOKEN_FIELDS},
+            "cost_usd": round(sum(c for c in costs if c is not None), 8),
+            "unpriced_calls": sum(1 for c in costs if c is None),
+            "latency_ms": sum(u.get("latency_ms") or 0 for u in usage), **extra}
 
 
 def _context_message(inp: TurnInput, request: resolve.Request | None = None) -> str:
@@ -424,6 +448,9 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     rounds: list[list[dict]] = []
     # the request's requirements, derived by the first judge call and frozen for the turn, and its tool failures
     turn = TurnRequirements()
+    # the turn's verdicts: a repair round judges only what changed (KTD10)
+    verdicts = VerdictCache()
+    reused = 0
     progress("understand", "מבין את הבקשה")
     request = None
     if inp.history or inp.focus:
@@ -446,7 +473,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                                  scope_kind="focused", scope_query="", omitted=[], focus=None, requested=[],
                                  parts=[])
             return TurnOutcome(answer, ws, VerifyReport([], judged=True, judge_status="no_claims"), steps, usage, {},
-                               rounds, request.as_dict(), request.resolution)
+                               rounds, request.as_dict(), request.resolution, _summary(usage, rounds, reused))
     items: list = [{"role": "user", "content": _context_message(inp, request)}]
     while True:
         if cancelled():
@@ -510,16 +537,20 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                                    mismatch=resolve.mismatch(request, answer.focus),
                                    statements=coverage.planned_statements(ws, answer),
                                    request=request.standalone_question if request is not None else None,
-                                   requirements=turn if answer.status != "clarification" else None)
+                                   requirements=turn if answer.status != "clarification" else None,
+                                   cache=verdicts)
         except VerificationUnavailable as exc:
             # the answer could not be checked against its sources: a failure with retry, never an unchecked answer
             raise ProviderFailure("verify_unavailable", exc.status) from exc
         if cancelled():
             raise TurnCancelled
         rounds.append([p.as_dict() for p in report.problems])
+        reused += report.reused
         # after the repair round, what is left for the server (a qualifier it writes from the source, a note that
-        # the datum is not the one requested) does not justify a rewrite that would drop the datum
-        settled = attempt >= 1 and not any(p.removes_unit or p.severity == "partial" for p in report.problems)
+        # the datum is not the one requested, a partial with no concrete defect) does not justify a rewrite that
+        # would drop the datum
+        settled = attempt >= 1 and not any(p.removes_unit or (p.severity == "partial" and p.repairable)
+                                           for p in report.problems)
         if report.ok or settled or attempt >= repairs or time.monotonic() > deadline - REPAIR_MIN_SECONDS:
             # a server sentence saying a datum was not found is not added when the turn holds its values
             final = coverage.state_absence(ws, report.apply(answer), cited=False, withdrawn=report.withdrawn)
@@ -533,7 +564,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                 ledger["requirements"] = outcomes
             return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
                                request.as_dict() if request is not None else None,
-                               request.resolution if request is not None else None)
+                               request.resolution if request is not None else None, _summary(usage, rounds, reused))
         attempt += 1
         if attempt == 1:
             progress("repair", "מתקן טענות שלא אומתו")
@@ -542,6 +573,13 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             progress("repair", "מנסח מחדש רק ממה שאומת")
             # a rewrite from verified content cannot complete a requirement: only the claims are its problems
             items.append({"role": "user", "content": REWRITE.format(problems=report.problems_text(claims_only=True))})
+
+
+def _summary(usage: list[dict], rounds: list, reused: int) -> dict:
+    """The finished turn's totals, logged (numbers only) and kept on the outcome."""
+    summary = usage_summary(usage, rounds=len(rounds), verdicts_reused=reused)
+    logger.info("chat turn: %s", json.dumps(summary))
+    return summary
 
 
 def _state_limits(answer: FinalAnswer, limits: list[str]) -> FinalAnswer:

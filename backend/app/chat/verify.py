@@ -52,10 +52,21 @@ Scores are merged by id; a requirement counts as given only through a unit that 
 or reading covered, is a problem for the repair round (``kind="requirement"``, nothing removed); a unit or server
 sentence saying "not found" for a requirement whose values were found is removed or withdrawn. What is still missing
 is stated by the server with a reason computed from the turn (``coverage.state_parts``).
+
+Repair rounds are cheaper (KTD10). Within a turn, verdicts are kept (``VerdictCache``) by the unit's text, the ids it
+cites with the content of each, its context (a table row's header and the line before its table; the heading above
+it) and the request: a later round judges only the units that are new or changed, and what the judge says about the
+requirements is merged by id across fresh and cached verdicts — the last round's scores move with their unchanged
+units to the indexes they have now, and a requirement given jointly with a unit that changed is judged again whole.
+A verdict that accepted a support the unit did not cite depended on what else its call showed, and is never reused.
+``VerifyReport.ok`` ignores what the server resolves itself (a citation it attaches, a qualifier it writes in from the
+source) and a ``partial`` whose judge named no concrete defect (``defect``); such a unit is still marked as partly
+verified.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -140,8 +151,14 @@ JUDGE_POLICY = (
     "הכנסות): מכנה או בסיס אחוז אחר — unsupported; את היחידות — הן מתאימות לפעולה (₪ למ\"ר × מ\"ר = ₪) והתוצאה "
     "מוצגת ביחידה, בתקופה ובמע\"מ שלה; ואת המסגור — תוצאת חישוב מוצגת כחישוב שנעשה עכשיו, ולא כפי שנכתב במסמך, "
     "כקביעת השומה או ההחלטה או כטענת צד (\"השומה מציינת רווח של...\" לתוצאת חישוב — unsupported, אלא אם החישוב "
-    "משחזר ערך שכתוב במקור)."
+    "משחזר ערך שכתוב במקור). "
+    "(11) defect: ל-partial ציין את הפגם הקונקרטי שתיקון של התשובה יכול לסלק — input (קלט שגוי לחישוב: נכס, שלב, "
+    "תקופה או תרחיש אחרים), scenario (הנחה או תרחיש שלא הוצגו כמותנים, או לא כפי שהמשתמש ביקש), formula (פעולה, "
+    "מכנה או בסיס אחוז שגויים), units (יחידה, תקופה או מע\"מ של התוצאה), framing (תוצאת חישוב שמוצגת כנתון מהמסמך "
+    "או כטענת צד), part (חלק מסוים של הטענה שהמקורות אינם תומכים בו — ציין אותו בסיבה), multiple_values (כלל 6); "
+    "none — כשאין פגם כזה (למשל המקור הוצג בקטעים בלבד, כלל 5). לכל verdict אחר — none."
 )
+DEFECTS = ("none", "input", "scenario", "formula", "units", "framing", "part", "multiple_values")
 
 
 JUDGE_REQUIREMENTS_POLICY = (
@@ -187,6 +204,8 @@ class JudgeVerdict(_Strict):
     # for a supported unit that does not cite its support: the shown sources that support it (the server checks
     # them and cites them). A factory default: optional for a reply, still required by the strict schema.
     supported_by: list[str] = Field(default_factory=list)
+    # for a partial verdict: the concrete defect a repair can remove, or "none" (only that costs a repair round)
+    defect: Literal["none", "input", "scenario", "formula", "units", "framing", "part", "multiple_values"] = "none"
 
 
 class JudgeOutput(_Strict):
@@ -272,6 +291,94 @@ def _incident_kind(name: str, output: str) -> str | None:
     return None
 
 
+@dataclass
+class _Round:
+    """What one verification of the turn leaves for the next: each unit's key (by index), the server statements (by
+    index), the requirement scores (with indexes into that answer) and the signature of the completeness input."""
+
+    keys: list[str]
+    statements: dict[int, str]
+    votes: list[JudgeRequirement]
+    signature: tuple
+
+
+@dataclass
+class VerdictCache:
+    """The turn's judge verdicts by unit key (``unit_key``), and the last verification's requirement scores, so a
+    repair round re-judges only what changed (KTD10). One per turn; never shared between turns."""
+
+    verdicts: dict[str, JudgeVerdict] = field(default_factory=dict)
+    last: _Round | None = None
+
+    def reuse(self, units: list[Unit], to_judge: list[Unit], keys: dict[int, str],
+              statements: list[tuple[int, str]]) -> tuple[dict[int, JudgeVerdict], list[JudgeRequirement]]:
+        """The cached verdicts of the units to judge that the last verification judged unchanged, at their indexes
+        now, and the last verification's requirement scores that rest on them alone (moved to those indexes; a
+        server statement they named is kept when this verification adds it too). A unit that gave a requirement with
+        a unit that changed is judged again, so the requirement is scored on the two together."""
+        last = self.last
+        if last is None:
+            return {}, []
+        known = len(last.keys)
+        candidates = {u.index for u in to_judge if keys[u.index] in self.verdicts}
+        while True:
+            moved = _match(last.keys, [(i, keys[i]) for i in sorted(candidates)])
+            keep = set(moved.values())
+            for v in last.votes:
+                refs = [i for i in v.units if i < known]
+                if v.status in ("full", "partial") and any(i not in moved for i in refs):
+                    keep -= {moved[i] for i in refs if i in moved}
+            if keep == candidates:
+                break
+            candidates = keep
+        by_text = {t: i for i, t in statements}
+        carried = []
+        for v in last.votes:
+            refs = [i for i in v.units if i < known]
+            if not refs or any(i not in moved for i in refs):
+                continue  # scored again by this verification's calls
+            said = [by_text[last.statements[i]] for i in v.units if i >= known and last.statements.get(i) in by_text]
+            carried.append(v.model_copy(update={"units": [moved[i] for i in refs] + said}))
+        return {i: self.verdicts[keys[i]].model_copy(update={"index": i}) for i in candidates}, carried
+
+
+def _match(old: list[str], new: list[tuple[int, str]]) -> dict[int, int]:
+    """Old unit index -> new unit index for the same key, in order (an answer may repeat a sentence)."""
+    free: dict[str, list[int]] = {}
+    for i, k in new:
+        free.setdefault(k, []).append(i)
+    out = {}
+    for n, k in enumerate(old):
+        if free.get(k):
+            out[n] = free[k].pop(0)
+    return out
+
+
+def _headings_above(markdown: str, units: list[Unit]) -> dict[int, str]:
+    """For each unit, the nearest heading or label line above its line (without citations): what it is about."""
+    out: dict[int, str] = {}
+    for u in units:
+        line_start = markdown.rfind("\n", 0, u.start) + 1
+        above = markdown[:line_start].split("\n")
+        out[u.index] = next((" ".join(_IDS.sub("", ln).split()) for ln in reversed(above) if _heading_line(ln)), "")
+    return out
+
+
+def unit_key(unit: Unit, ws: Workspace, request: str, heading: str, digests: dict[str, str]) -> str:
+    """What a unit's verdict depends on: its text, the ids it cites with the content of each (``digests``, filled
+    per id), its context (a table row's header row and the line before its table; the heading above it) and the
+    request."""
+    evidence = []
+    for i in sorted(set(unit.ids)):
+        if i not in digests:
+            parts = _source_parts(ws, i)
+            digests[i] = hashlib.sha256("\x1f".join(parts).encode()).hexdigest() if parts else "unknown"
+        evidence.append((i, digests[i]))
+    raw = json.dumps([" ".join(unit.text.split()), evidence, unit.context, heading, unit.table_header, request],
+                     ensure_ascii=False)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
 class VerificationUnavailable(Exception):
     """The judge could not be reached (or kept failing): the answer cannot be shown as checked."""
 
@@ -305,6 +412,7 @@ class Problem:
     number: str | None = None  # for a missing qualifier: the number as written in the unit
     annotation: str | None = None  # for a missing qualifier: the one qualifier attested, as written
     cite: str | None = None  # the source or measurement the server found that states the qualifier
+    defect: str | None = None  # for a judge's partial: the concrete defect it named ("none": none; None: not given)
 
     @property
     def uncited(self) -> bool:
@@ -314,6 +422,14 @@ class Problem:
     @property
     def annotatable(self) -> bool:
         return self.kind == "missing_qualifier" and self.annotation is not None
+
+    @property
+    def repairable(self) -> bool:
+        """Whether it takes a repair round (KTD10): not a citation the server attaches or a qualifier it writes in
+        from the source, nor a partly supported unit whose judge named no concrete defect (it stays marked)."""
+        if self.kind == "needs_citation" or self.annotatable:
+            return False
+        return not (self.severity == "partial" and self.defect == "none")
 
     @property
     def removes_unit(self) -> bool:
@@ -338,11 +454,12 @@ class VerifyReport:
     withdrawn: set[str] = field(default_factory=set)
     # the answer's completeness (``coverage.completeness``), set once the final answer is stated
     completeness: dict | None = None
+    reused: int = 0  # units whose verdict came from an earlier round of the turn (``VerdictCache``)
 
     @property
     def ok(self) -> bool:
-        # a citation the server adds itself needs no repair round
-        return all(p.kind == "needs_citation" for p in self.problems)
+        """No problem a repair round must fix: what the server resolves itself does not count (``repairable``)."""
+        return not any(p.repairable for p in self.problems)
 
     def removed_units(self) -> set[int]:
         return {p.unit.index for p in self.problems if p.removes_unit}
@@ -1356,14 +1473,15 @@ def _judge_all(provider: LLMProvider, units: list[Unit], ws: Workspace, usage: l
 def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, question: str,
                   usage: list[dict], deadline: float | None = None, mismatch: str | None = None,
                   statements: list[str] | None = None, request: str | None = None,
-                  requirements: TurnRequirements | None = None) -> VerifyReport:
+                  requirements: TurnRequirements | None = None, cache: VerdictCache | None = None) -> VerifyReport:
     """Deterministic checks, then the judge on every remaining unit. ``mismatch`` says why the answer's datum is
     not the one the resolved request asked for (``app.chat.resolve.mismatch``): a problem of the whole answer,
     for the repair round, and a note on the final answer. ``requirements``: the turn's requirements (KTD7) — derived
     by this call's first judge call when the turn has none yet, then scored by id; without it (a check outside a
     turn) completeness is not judged. ``statements``: the sentences the server adds after verification
     (``coverage.planned_statements``), which can state a requirement missing; ``request``: the request as resolved
-    in context (the question itself when there is none). Raises ``VerificationUnavailable``."""
+    in context (the question itself when there is none). ``cache``: the turn's verdicts (KTD10) — a unit judged
+    before in the turn, unchanged, is not judged again. Raises ``VerificationUnavailable``."""
     units = split_units(answer.answer_markdown)
     report = VerifyReport(units)
     coverage = None
@@ -1399,11 +1517,40 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     # a unit the deterministic checks failed is not judged; with nothing left to judge, the requirements are still
     # derived and scored against the server's statements (a coverage-only call)
     to_judge = [u for u in units if u.index not in failed]
+    verdicts: dict[int, JudgeVerdict] = {}
     votes: list[JudgeRequirement] = []
-    if coverage and not to_judge:
-        _, votes = _judge_batch(provider, _Batch([]), ws, usage, deadline, coverage)
+    keys: dict[int, str] = {}
+    signature: tuple = ()
+    if cache is not None:
+        # a unit judged earlier in the turn, unchanged, keeps its verdict, and the requirements it gave keep theirs
+        digests: dict[str, str] = {}
+        headings = _headings_above(answer.answer_markdown, units)
+        keys = {u.index: unit_key(u, ws, request or question, headings[u.index], digests) for u in units}
+        verdicts, votes = cache.reuse(units, to_judge, keys, report.statements)
+        report.reused = len(verdicts)
+        signature = (tuple((keys[u.index], u.index in failed) for u in units), tuple(report.statements),
+                     coverage.workspace if coverage else "", request or question,
+                     tuple(r["id"] for r in requirements.items) if requirements is not None else ())
+    fresh = [u for u in to_judge if u.index not in verdicts]
+    if coverage and not fresh:
+        if cache is not None and cache.last is not None and requirements.derived and cache.last.signature == signature:
+            votes = list(cache.last.votes)  # the same answer over the same workspace: scored already
+        else:
+            _, scored = _judge_batch(provider, _Batch([]), ws, usage, deadline, coverage)
+            votes += scored
+    if fresh:
+        judged, scored = _judge_all(provider, fresh, ws, usage, deadline, coverage)
+        verdicts |= judged
+        votes += scored
+        if cache is not None:
+            for u in fresh:
+                v = judged.get(u.index)
+                # a support the unit does not cite was accepted for what else the call showed: never reused
+                if v is not None and not [s for s in v.supported_by if s not in u.ids]:
+                    cache.verdicts[keys[u.index]] = v
+    if cache is not None:
+        cache.last = _Round([keys[u.index] for u in units], dict(report.statements), list(votes), signature)
     if to_judge:
-        verdicts, votes = _judge_all(provider, to_judge, ws, usage, deadline, coverage)
         report.judged, report.judge_status = True, "ok"
         for u in to_judge:
             v = verdicts.get(u.index)
@@ -1418,7 +1565,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
             elif v.verdict == "unsupported":
                 report.problems.append(Problem(u, "לא נתמך במקורות: " + v.reason))
             elif v.verdict == "partial":
-                report.problems.append(Problem(u, "נתמך חלקית: " + v.reason, "partial"))
+                report.problems.append(Problem(u, "נתמך חלקית: " + v.reason, "partial", defect=v.defect))
             elif named := [s for s in dict.fromkeys(v.supported_by) if s not in u.ids]:
                 # supported by a shown source the unit does not cite: kept, and cited, only if the numbers agree
                 problem = _named_support(u, named, ws, question)
