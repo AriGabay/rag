@@ -91,8 +91,7 @@ _PROVENANCE = ("SELECT block_index, kind, page, section_path, status, bbox, meth
                " original_text FROM document_blocks WHERE version_id = :v ORDER BY block_index")
 
 
-@pytest.fixture
-def pdf_office(db, client):
+def _upload_pictures_pdf(db, client):
     a = make_office(db, "משרד א", "admin-a@example.test")
     login(client, "admin-a@example.test")
     groups = client.get("/api/admin/groups").json()["groups"]
@@ -104,6 +103,24 @@ def pdf_office(db, client):
     while worker.run_one("test-worker"):
         pass
     return a
+
+
+@pytest.fixture
+def pdf_office(db, client, monkeypatch):
+    """The pictures PDF read with neither OCR nor a vision model: its pictures stay unread, whatever tesseract the
+    machine has (CI installs Hebrew OCR, a developer host may not)."""
+    monkeypatch.setattr("app.extraction.ocr.ocr_available", lambda languages: False)
+    return _upload_pictures_pdf(db, client)
+
+
+@pytest.fixture
+def pdf_office_ocr(db, client, monkeypatch):
+    """The same PDF with OCR available and no model: OCR finds no confident words in the synthetic pictures."""
+    from app.extraction import images
+
+    monkeypatch.setattr("app.extraction.ocr.ocr_available", lambda languages: True)
+    monkeypatch.setattr(images, "_ocr_words", lambda gray, lang: [])
+    return _upload_pictures_pdf(db, client)
 
 
 def _blocks(office, v):
@@ -129,6 +146,14 @@ def test_a_pdf_is_stored_as_blocks_with_their_provenance(pdf_office, client):
     first = body["blocks"][0]
     assert first["kind"] == "image" and first["bbox"] == list(blocks[0][5]) and first["content_hash"] == blocks[0][8]
     assert first["method"] == "none" and first["reader_version"] == pipeline.PDF_INGESTION_VERSION
+
+
+def test_with_ocr_and_no_model_pictures_without_words_hold_no_text(pdf_office_ocr):
+    v = pdf_office_ocr.version
+    pictures = [b for b in _blocks(pdf_office_ocr, v) if b[1] == "image"]
+    assert len(pictures) == 3 and all(b[4] == "no_text" and b[6] == "ocr" for b in pictures)
+    ingestion = scalar(pdf_office_ocr, "SELECT ingestion FROM document_versions WHERE id = :v", v=v)
+    assert ingestion["images"] == {"no_text": 3} and ingestion["partial"] is False
 
 
 def test_reindex_and_clone_keep_the_pdf_provenance(pdf_office, client):
