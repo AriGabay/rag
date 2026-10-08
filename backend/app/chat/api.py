@@ -207,7 +207,9 @@ def public_verification(v: dict) -> dict:
     return {"judged": v.get("judged"), "judge_status": v.get("judge_status"),
             "removed": v.get("removed", sum(1 for p in problems if p.get("severity") == "error")),
             "partial": v.get("partial", sum(1 for p in problems if p.get("severity") == "partial")),
-            "annotated": v.get("annotated", 0), "request_mismatch": v.get("request_mismatch", False)}
+            "annotated": v.get("annotated", 0), "request_mismatch": v.get("request_mismatch", False)} | {
+        # claim correctness and answer completeness, shown apart (answers stored before them have neither)
+        k: v[k] for k in ("correctness", "completeness") if k in v}
 
 
 def _answer_documents(answer: dict | None) -> set[str]:

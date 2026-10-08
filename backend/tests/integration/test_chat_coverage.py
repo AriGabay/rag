@@ -471,37 +471,6 @@ def test_a_not_found_sentence_is_added_after_verification_and_survives_a_strict_
 
 # --- every part of the request is answered or said to be missing (R19) ----------------------------------------
 
-def test_a_two_part_question_answered_for_one_part_says_the_other_was_not_found(client, setup, monkeypatch):
-    doc = _described_property(setup)
-
-    def judge(input: str) -> dict:  # supports every claim; a part is covered by a unit that names it
-        units = dict(re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S))
-        parts = []
-        for i, ask in re.findall(r'<part index="(\d+)">\n(.*?)\n</part>', input, re.S):
-            hits = [int(n) for n, t in units.items() if ask in t]
-            parts.append({"index": int(i), "coverage": "answered" if hits else "not_covered", "units": hits,
-                          "reason": "בדיקה"})
-        return {"verdicts": [{"index": int(n), "verdict": "supported", "reason": "בדיקה"} for n in units],
-                "parts": parts}
-
-    agent = ScriptedAgent([[call("search", query="שטח בנוי", document_ids=[doc], limit=None)],
-                           final("השטח הבנוי של המבנה הוא 184 מ\"ר [S1].", documents=[doc],
-                                 parts=[{"ask": "השטח הבנוי", "answered": True, "missing_kind": "none"},
-                                        {"ask": "שטח המגרש", "answered": True, "missing_kind": "none"}])],
-                          judge=judge)
-    cloud(monkeypatch, setup, agent)
-    login(client, "admin-a@example.test")
-    m = send(client, new_conversation(client), "מה השטח הבנוי ומה שטח המגרש באשל 9?")
-    a = m["answer"]
-    assert m["status"] == "done" and a["status"] == "partial"
-    assert a["markdown"].startswith("**שטח המגרש** לא נמצא בחיפוש במסמכים שנבדקו.")
-    assert "השטח הבנוי של המבנה הוא 184 מ\"ר [S1]." in a["markdown"]
-    assert [(p["ask"], p["coverage"]) for p in a["ledger"]["parts"]] == [("השטח הבנוי", "answered"),
-                                                                         ("שטח המגרש", "not_covered")]
-    judged = next(c.input for c in agent.calls if c.purpose.value == "verify")
-    assert "<request_parts>" in judged and "שטח המגרש" in judged
-
-
 def test_a_document_whose_title_carries_fewer_of_the_questions_words_is_not_named(client, setup, monkeypatch):
     for n in range(5):  # enough titles that the place is a shared word and does not name a document by itself
         add_doc(setup, setup.default_group_id, f"דוח שוק {n}", [f"סקירה כללית מספר {n}."], f"{n + 4}" * 64)

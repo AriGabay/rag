@@ -14,10 +14,14 @@ One turn:
 3. It answers in Markdown with citations ``[S#]`` (passages), ``[M#]`` (measurements), ``[V#]`` (values),
    ``[A#]`` (user assumptions), ``[C#]`` (calculations).
 4. ``app.chat.verify`` checks the answer against what the tools returned: unknown citations, numbers that no
-   cited source states, and — through a separate judge call — sentences the cited sources do not support, and
-   whether each part of the request the answer lists (``parts``) is answered or stated missing. A failed check
-   gets one repair step; what still fails is removed, and the answer says so; a part neither answered nor stated
-   missing is stated missing by the server (``coverage.state_parts``).
+   cited source states, and — through a separate judge call — sentences the cited sources do not support. The
+   turn's first judge call also derives what the request requires (KTD7: from the request, the answer's ``parts``
+   being hints), frozen for the turn (``verify.TurnRequirements``, which also records the turn's failed tools and
+   calculations); every judge call scores those requirements by id. A failed check gets one repair step — which may
+   call tools, within the step bound, to complete a requirement whose data were found or that nothing searched for;
+   what still fails is removed, and the answer says so; a requirement still not given is stated with its reason by
+   the server (``coverage.state_parts``), and correctness and completeness are reported apart
+   (``VerifyReport.counts``; each requirement in the ledger's ``requirements``).
 
 Limits (KTD12). Reading stops early enough for the answer, its verification and its repair rounds to fit: one
 step per repair round is kept from the step bound, and ``chat_verify_reserve_seconds`` from the clock. A limit
@@ -52,7 +56,13 @@ from pydantic import BaseModel, ConfigDict
 
 from app.chat import coverage, entities, resolve
 from app.chat import tools as T
-from app.chat.verify import VERIFY_ALLOWANCE_SECONDS, VerificationUnavailable, VerifyReport, verify_answer
+from app.chat.verify import (
+    VERIFY_ALLOWANCE_SECONDS,
+    TurnRequirements,
+    VerificationUnavailable,
+    VerifyReport,
+    verify_answer,
+)
 from app.config import get_settings
 from app.db import TenantContext
 from app.measurements.extract import PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
@@ -170,7 +180,9 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
 REPAIR = """בדיקת האימות של התשובה מצאה בעיות:
 {problems}
 תקן את התשובה: הסר או נסח מחדש כל טענה שאינה נתמכת במקורות, וצטט רק מזהים שקיבלת. אפשר להשתמש בכלים לבדיקה נוספת
-(למשל לפתוח את הקטע שבו הנתון כתוב). החזר תשובה סופית מתוקנת באותו מבנה."""
+(למשל לפתוח את הקטע שבו הנתון כתוב). חלק של הבקשה שהתשובה לא נתנה — השלם אותו: מהנתונים שכבר נמצאו (וחשב ב-calculate
+כשהוא דורש חישוב), או חפש אותו אם לא חיפשת. אם עדיין אי אפשר להשלים אותו — אל תכתוב שהוא "לא נמצא" כשהנתונים שלו
+נמצאו; השרת יוסיף את הסיבה. החזר תשובה סופית מתוקנת באותו מבנה."""
 
 REWRITE = """גם התשובה המתוקנת לא אומתה במלואה. אלה המשפטים שלא נמצאה להם תמיכה:
 {problems}
@@ -410,6 +422,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     attempt = 0  # 0: first answer, 1: repaired with tools, 2: rewritten from verified content only
     limits = ws.limits_hit
     rounds: list[list[dict]] = []
+    # the request's requirements, derived by the first judge call and frozen for the turn, and its tool failures
+    turn = TurnRequirements()
     progress("understand", "מבין את הבקשה")
     request = None
     if inp.history or inp.focus:
@@ -472,6 +486,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             for call in step.calls:
                 _announce(progress, call)
                 output = T.run_tool(ws, call.name, call.arguments)
+                turn.record(call.name, call.arguments, output)
                 items.append({"type": "function_call_output", "call_id": call.call_id, "output": output})
             continue
         try:
@@ -494,7 +509,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                                    deadline=deadline + VERIFY_ALLOWANCE_SECONDS,
                                    mismatch=resolve.mismatch(request, answer.focus),
                                    statements=coverage.planned_statements(ws, answer),
-                                   request=request.standalone_question if request is not None else None)
+                                   request=request.standalone_question if request is not None else None,
+                                   requirements=turn if answer.status != "clarification" else None)
         except VerificationUnavailable as exc:
             # the answer could not be checked against its sources: a failure with retry, never an unchecked answer
             raise ProviderFailure("verify_unavailable", exc.status) from exc
@@ -505,14 +521,16 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         # the datum is not the one requested) does not justify a rewrite that would drop the datum
         settled = attempt >= 1 and not any(p.removes_unit or p.severity == "partial" for p in report.problems)
         if report.ok or settled or attempt >= repairs or time.monotonic() > deadline - REPAIR_MIN_SECONDS:
-            final = coverage.state_absence(ws, report.apply(answer), cited=False)
-            # a part of the request the verified answer neither gives nor says is missing is said to be missing
-            final, parts = coverage.state_parts(ws, final, report)
+            # a server sentence saying a datum was not found is not added when the turn holds its values
+            final = coverage.state_absence(ws, report.apply(answer), cited=False, withdrawn=report.withdrawn)
+            # a requirement the verified answer neither gives nor says is missing is stated with its reason
+            final, outcomes = coverage.state_parts(ws, final, report, turn)
+            report.completeness = coverage.completeness(outcomes)
             final = _state_limits(final, limits)
             ledger: dict = {}
             if final.status != "clarification":
                 ledger, final = coverage.build(ws, final, inp.question)
-                ledger["parts"] = parts
+                ledger["requirements"] = outcomes
             return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
                                request.as_dict() if request is not None else None,
                                request.resolution if request is not None else None)
@@ -522,7 +540,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             items.append({"role": "user", "content": REPAIR.format(problems=report.problems_text())})
         else:
             progress("repair", "מנסח מחדש רק ממה שאומת")
-            items.append({"role": "user", "content": REWRITE.format(problems=report.problems_text())})
+            # a rewrite from verified content cannot complete a requirement: only the claims are its problems
+            items.append({"role": "user", "content": REWRITE.format(problems=report.problems_text(claims_only=True))})
 
 
 def _state_limits(answer: FinalAnswer, limits: list[str]) -> FinalAnswer:

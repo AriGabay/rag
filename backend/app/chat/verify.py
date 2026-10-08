@@ -39,15 +39,24 @@ sentences only: a numbered heading ("9. השומה", "9.1 שיטת השומה") 
 text, a bullet or heading whose content went goes with it, and a failed table header takes its whole table, so no
 fragment or broken table is left; a partly supported unit is kept and marked.
 
-The second plane is coverage (R19): the final answer lists the parts of the user's request, and the judge says of
-each part whether the answer gives it, says it is missing (in a unit, or in a sentence the server adds after
-verification — ``statements``), or does not cover it. A part counts as covered only through a unit that survived
-verification (``VerifyReport.part_outcomes``); one that is not covered is stated missing by the server
-(``coverage.state_parts``).
+The second plane is completeness (R18–R21, KTD7), apart from correctness. What the request requires is derived by
+the judge, not taken from the parts the answer declares about itself (those are hints): the first judge call of the
+turn derives the requirements from the request as resolved in context, even when no unit reaches the judge (a
+coverage-only call), and the list is frozen in the turn's ``TurnRequirements`` with stable ids (``Q1``...). Every
+later call — the next batch, a split batch, the call for units left out, a repair round's re-judge — scores the same
+list by id: ``full``, ``partial``, ``missing`` or ``undeterminable``, with the units (or the sentences the server adds
+after verification — ``statements``) that give it or say it is missing, and the ids of what the turn found or did
+about it (``<workspace>``: values, measurements, calculations, failed calculations and tools, searches, readings).
+Scores are merged by id; a requirement counts as given only through a unit that survived verification
+(``VerifyReport.requirement_outcomes``). A requirement not given whose data the turn already found, or that no search
+or reading covered, is a problem for the repair round (``kind="requirement"``, nothing removed); a unit or server
+sentence saying "not found" for a requirement whose values were found is removed or withdrawn. What is still missing
+is stated by the server with a reason computed from the turn (``coverage.state_parts``).
 """
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
@@ -135,13 +144,36 @@ JUDGE_POLICY = (
 )
 
 
-JUDGE_PARTS_POLICY = (
-    "\nבנוסף מצורפים הבקשה כפי שהובנה (<request>), חלקיה (<part>) ומשפטים שהשרת יוסיף לתשובה על נתונים שלא נמצאו "
-    "(<statement>). "
-    "לכל חלק קבע coverage לפי היחידות והמשפטים שבקלט זה: answered — יחידה נותנת את מה שהחלק מבקש (גם בחלקו); "
-    "stated_missing — יחידה או משפט שרת אומרים במפורש שהוא חסר או לא נמצא; not_covered — אין דבר עליו. ב-units "
-    "ציין את מספרי ה-index של היחידות או המשפטים שמכסים אותו. אזכור בלבד, בלי לתת את המבוקש, אינו answered."
+JUDGE_REQUIREMENTS_POLICY = (
+    "\nבנוסף מצורפים הבקשה כפי שהובנה (<request>), מה שהתור מצא ובדק (<workspace>: ערכים V#, נתונים M#, חישובים "
+    "C#, חישובים שנכשלו F#, כלים שנכשלו E#, חיפושים H#, וסעיפים, טבלאות או עמודים שנקראו S#) ומשפטים שהשרת יוסיף "
+    "לתשובה על נתונים שלא נמצאו (<statement>).\n"
+    "דרישות הבקשה: כשמופיע <derive_requirements> — גזור מהבקשה ומהקשר השיחה את רשימת הדרישות: כל נתון, הסבר, השוואה "
+    "או חישוב שהבקשה דורשת, כל אחד פעם אחת ובמילות הבקשה, ו-calculation=true לדרישה שהיא חישוב או השוואה מספרית. "
+    "<hint> הם החלקים שהתשובה הצהירה עליהם — רמז בלבד: הוסף דרישה שהם השמיטו, והשמט רמז שאינו דרישה של הבקשה; "
+    "השאר את id ריק. כשמופיעה רשימה קבועה (<requirement id=...>) — דרג כל דרישה שבה לפי ה-id שלה, ואל תוסיף, תאחד "
+    "או תנסח מחדש דרישות.\n"
+    "לכל דרישה קבע status לפי היחידות והמשפטים שבקלט זה בלבד: full — יחידות נותנות אותה במלואה; partial — רק חלק "
+    "ממנה; missing — אין כאן יחידה שנותנת אותה (גם כשיחידה או משפט אומרים שהיא חסרה; דרישה שיחידותיה בקריאה אחרת — "
+    "missing, והשרת מאחד בין הקריאות לפי id); undeterminable — היחידות או המקורות מראים שהמסמכים אינם מאפשרים "
+    "להכריע בה. אזכור בלבד, בלי לתת את המבוקש, אינו full. ב-units ציין את מספרי ה-index של היחידות או המשפטים "
+    "שנותנים אותה, או שאומרים שהיא חסרה או שאי אפשר להכריע בה. ב-related ציין את המזהים מ-<workspace> שנוגעים "
+    "לה: הערכים, הנתונים והחישובים שמחזיקים אותה או את הקלטים שלה (לא נתון קרוב מסוג אחר), חישוב או כלי שנכשלו "
+    "בדרך אליה, והחיפושים והקריאות שחיפשו אותה. יחידה שאומרת שנתון לא נמצא, כש-<workspace> מחזיק ערך, נתון או "
+    "חישוב שלו — unsupported."
 )
+REQUIREMENT_STATUSES = ("full", "partial", "missing", "undeterminable")
+_RANK = {s: n for n, s in enumerate(REQUIREMENT_STATUSES)}
+# a sentence saying a datum was not found ("לא נמצא", "לא נמצאו", "לא אותר")
+NOT_FOUND = re.compile(r"(?<![א-ת])לא\s+(?:נמצא|נמצאה|נמצאו|אותר|אותרה|אותרו)(?![א-ת])")
+WORKSPACE_MEASUREMENTS = 30  # measurements listed for the judge (a listing may hold hundreds)
+REQ_DATA_FOUND = ("חלק של הבקשה שהתשובה לא נתנה במלואו: «{text}». הנתונים שלו כבר נמצאו בתור הזה ({ids}): השלם "
+                  "אותו בתשובה מהם, וחשב ב-calculate אם הוא דורש חישוב")
+REQ_NOT_SEARCHED = ("חלק של הבקשה שהתשובה לא נתנה: «{text}». לא בוצע חיפוש או קריאה שמכסים אותו: יש לחפש אותו "
+                    "בכלים ולהשלים אותו אם נמצא; אם לא נמצא — אל תכתוב זאת בעצמך, השרת יציין זאת")
+REQ_FOUND_NOT_ABSENT = ("התשובה אומרת שהנתון לא נמצא, אבל בתור הזה נמצאו לו נתונים ({ids}): השתמש בהם, או אמור "
+                        "מה מנע להשלים אותו")
+TOOL_FAILED = "שגיאה: הכלי נכשל"  # ``tools.run_tool``'s output for a tool that raised
 
 
 class _Strict(BaseModel):
@@ -161,17 +193,83 @@ class JudgeOutput(_Strict):
     verdicts: list[JudgeVerdict]
 
 
-class JudgePart(_Strict):
-    index: int
-    coverage: Literal["answered", "stated_missing", "not_covered"]
-    units: list[int]  # the units (or server statements) that answer it or say it is missing
-    reason: str
+class JudgeRequirement(_Strict):
+    """A requirement of the request with its score in one judge call. The deriving call gives ``text`` and
+    ``calculation`` (the server assigns the id); a later call gives the frozen ``id``. Defaults keep a reply that
+    leaves a field out valid; the strict schema still requires every field."""
+
+    id: str = ""
+    text: str = ""
+    calculation: bool = False
+    status: Literal["full", "partial", "missing", "undeterminable"]
+    units: list[int] = Field(default_factory=list)  # the units or server statements that give it or say it is missing
+    related: list[str] = Field(default_factory=list)  # the ``<workspace>`` ids about it
+    reason: str = ""
 
 
 class JudgeCoverageOutput(JudgeOutput):
-    """The judge's output when the answer lists the parts of the request: the verdicts, and each part's coverage."""
+    """The judge's output when the turn's requirements are derived or scored: the verdicts, and each requirement."""
 
-    parts: list[JudgePart]
+    requirements: list[JudgeRequirement] = Field(default_factory=list)
+
+
+@dataclass
+class TurnRequirements:
+    """The turn's requirements (KTD7) and the failures its tools met. ``items`` is derived by the turn's first judge
+    call and then frozen: [{"id": "Q1", "text", "calculation"}]. ``incidents``: the failed calculations (``F#``) and
+    the tools that failed (``E#``), recorded by the engine as the turn runs, so a reason can name them."""
+
+    items: list[dict] = field(default_factory=list)
+    derived: bool = False
+    incidents: list[dict] = field(default_factory=list)
+
+    def freeze(self, derived: list[JudgeRequirement]) -> list[tuple[JudgeRequirement, dict]]:
+        """Freeze the derived requirements with stable ids (one per text); each with the score it came with."""
+        pairs, seen = [], set()
+        for r in derived:
+            text = " ".join(r.text.split())
+            if not text or text.casefold() in seen:
+                continue
+            seen.add(text.casefold())
+            item = {"id": f"Q{len(self.items) + 1}", "text": text, "calculation": bool(r.calculation)}
+            self.items.append(item)
+            pairs.append((r, item))
+        self.derived = True
+        return pairs
+
+    def record(self, name: str, arguments: str, output: str) -> None:
+        """One tool call's outcome: a calculation that was refused or failed (``F#``), or a tool or provider that
+        failed (``E#``); anything else is not an incident."""
+        kind = _incident_kind(name, output or "")
+        if kind is None:
+            return
+        try:
+            args = json.loads(arguments or "{}")
+        except ValueError:
+            args = {}
+        args = args if isinstance(args, dict) else {}
+        prefix = "F" if kind == "calculation" else "E"
+        n = sum(1 for x in self.incidents if x["id"].startswith(prefix)) + 1
+        label = str(args.get("label") or args.get("expression") or args.get("query") or "")[:120]
+        self.incidents.append({"id": f"{prefix}{n}", "kind": kind, "tool": name, "label": label,
+                               "detail": (output or "")[:300]})
+
+
+def _template(message: str) -> re.Pattern:
+    """A tool message template ("... {what} נכשלה ({status}) ...") as a pattern of its fixed words."""
+    return re.compile(re.sub(r"\\\{\w+\\\}", ".*?", re.escape(message)), re.S)
+
+
+def _incident_kind(name: str, output: str) -> str | None:
+    from app.chat import tools as T
+
+    if output.startswith(TOOL_FAILED):
+        return "tool"
+    if name == "calculate" and output.startswith("שגיאה:"):
+        return "calculation"
+    if name == "inspect" and any(_template(m).search(output) for m in (T.MSG_INSPECT_FAILED, T.MSG_INSPECT_RENDER)):
+        return "tool"
+    return None
 
 
 class VerificationUnavailable(Exception):
@@ -201,8 +299,9 @@ class Problem:
     reason: str
     severity: Literal["error", "partial"] = "error"
     # "missing_qualifier": the number's evidence gives it a qualifier the unit omits; "needs_citation": the unit is
-    # supported by evidence the server found in the same calculation (``cite``), which the answer must cite
-    kind: Literal["claim", "missing_qualifier", "needs_citation", "request"] = "claim"
+    # supported by evidence the server found in the same calculation (``cite``), which the answer must cite;
+    # "requirement": a requirement of the request the answer does not give, for the repair round (nothing removed)
+    kind: Literal["claim", "missing_qualifier", "needs_citation", "request", "requirement"] = "claim"
     number: str | None = None  # for a missing qualifier: the number as written in the unit
     annotation: str | None = None  # for a missing qualifier: the one qualifier attested, as written
     cite: str | None = None  # the source or measurement the server found that states the qualifier
@@ -219,7 +318,8 @@ class Problem:
     @property
     def removes_unit(self) -> bool:
         """The unit is removed for it (a qualifier the server can write in, or a request mismatch, is not)."""
-        return self.severity == "error" and not self.annotatable and self.kind not in ("request", "needs_citation")
+        return (self.severity == "error" and not self.annotatable
+                and self.kind not in ("request", "needs_citation", "requirement"))
 
     def as_dict(self) -> dict:
         return {"text": self.unit.raw[:300], "reason": self.reason, "severity": self.severity, "kind": self.kind}
@@ -231,9 +331,13 @@ class VerifyReport:
     problems: list[Problem] = field(default_factory=list)
     judged: bool = False
     judge_status: str | None = None
-    parts: list[dict] = field(default_factory=list)  # the request's parts: [{"ask", "answered", "missing_kind"}]
+    requirements: list[dict] = field(default_factory=list)  # the turn's frozen requirements, when they were judged
     statements: list[tuple[int, str]] = field(default_factory=list)  # (index, text) the server adds after it
-    part_votes: dict[int, list[JudgePart]] = field(default_factory=dict)  # each part's coverage, per judge call
+    requirement_votes: dict[str, list[JudgeRequirement]] = field(default_factory=dict)  # per id, per judge call
+    # the server statements a requirement whose values were found contradicts ("not found"): not added
+    withdrawn: set[str] = field(default_factory=set)
+    # the answer's completeness (``coverage.completeness``), set once the final answer is stated
+    completeness: dict | None = None
 
     @property
     def ok(self) -> bool:
@@ -243,40 +347,62 @@ class VerifyReport:
     def removed_units(self) -> set[int]:
         return {p.unit.index for p in self.problems if p.removes_unit}
 
+    def correctness(self) -> str:
+        """``verified`` (every claim supported), ``partial`` (claims removed or only partly supported) or
+        ``unverified`` (no claim survived) — apart from completeness."""
+        errors = self.removed_units()
+        if self.units and all(u.index in errors for u in self.units):
+            return "unverified"
+        if errors or any(p.severity == "partial" for p in self.problems):
+            return "partial"
+        return "verified"
+
     def counts(self) -> dict:
-        """What the user's normal path shows of verification (the removed text is diagnostics)."""
+        """What the user's normal path shows of verification (the removed text is diagnostics): correctness and,
+        apart from it, completeness against the request's requirements."""
         errors = self.removed_units()
         out = {"judged": self.judged, "judge_status": self.judge_status, "removed": len(errors),
                "partial": len({p.unit.index for p in self.problems if p.severity == "partial"} - errors),
                "annotated": sum(1 for p in self.problems if p.annotatable and p.unit.index not in errors),
-               "request_mismatch": any(p.kind == "request" for p in self.problems)}
-        if self.parts:
-            out["parts"] = len(self.parts)
+               "request_mismatch": any(p.kind == "request" for p in self.problems),
+               "correctness": self.correctness()}
+        if self.completeness is not None:
+            out["completeness"] = self.completeness
         return out
 
-    def problems_text(self) -> str:
-        return "\n".join(f"- \"{p.unit.raw[:200]}\": {p.reason}" for p in self.problems)
+    def problems_text(self, claims_only: bool = False) -> str:
+        """The problems for the repair prompt; ``claims_only``: without the requirements to complete (a rewrite
+        from verified content cannot add them)."""
+        return "\n".join("- " + (f"\"{p.unit.raw[:200]}\": " if p.unit.raw else "") + p.reason
+                         for p in self.problems if not (claims_only and p.kind == "requirement"))
 
-    def part_outcomes(self, applied: FinalAnswer) -> list[dict]:
-        """Each part of the request with its coverage in the verified answer (``applied``, after ``apply``):
-        ``answered`` or ``stated_missing`` only through a unit that survived verification, or a server statement;
-        a part the judge gave no verdict is ``not_covered`` — coverage is never assumed."""
+    def requirement_outcomes(self, applied: FinalAnswer | None = None) -> list[dict]:
+        """Each requirement with its status in the verified answer, merged by id across the judge calls: given
+        (``full`` or ``partial``) only through a unit that survived verification; otherwise ``undeterminable`` when
+        a call said so, else ``missing`` — never assumed given. ``stated``: a surviving unit or a server statement
+        (not withdrawn) says it is missing or undeterminable. ``related``: the workspace ids the calls named."""
         errors = self.removed_units()
         kept = {u.index for u in self.units if u.index not in errors}
-        if errors and not _IDS.search(applied.answer_markdown):
+        if applied is not None and errors and not _IDS.search(applied.answer_markdown):
             kept = set()  # nothing cited survived: the answer was replaced by a statement that it was not supported
-        alive = kept | {i for i, _ in self.statements}
+        alive = kept | {i for i, t in self.statements if t not in self.withdrawn}
         out = []
-        for n, part in enumerate(self.parts):
-            coverage, reason = "not_covered", ""
-            for v in sorted(self.part_votes.get(n, []), key=lambda v: v.coverage != "answered"):
-                if v.coverage == "not_covered":
-                    continue
-                if (set(v.units) & alive) if v.units else alive:
-                    coverage, reason = v.coverage, v.reason
-                    break
-            out.append({"index": n, "ask": part["ask"], "answered": part["answered"],
-                        "missing_kind": part["missing_kind"], "coverage": coverage, "reason": reason})
+        for r in self.requirements:
+            votes = self.requirement_votes.get(r["id"], [])
+            live = {id(v): [i for i in v.units if i in alive] for v in votes}
+            given = [v for v in votes if v.status in ("full", "partial") and live[id(v)]]
+            if given:
+                best = min(given, key=lambda v: _RANK[v.status])
+                status, stated, chosen = best.status, False, [best]
+            else:
+                absent = [v for v in votes if v.status in ("missing", "undeterminable")]
+                status = "undeterminable" if any(v.status == "undeterminable" for v in absent) else "missing"
+                said = [v for v in absent if live[id(v)]]
+                stated, chosen = bool(said), said or absent
+            out.append({"id": r["id"], "text": r["text"], "calculation": r["calculation"], "status": status,
+                        "stated": stated, "units": sorted({i for v in chosen for i in live[id(v)]}),
+                        "related": list(dict.fromkeys(x for v in votes for x in v.related)),
+                        "reason": chosen[0].reason if chosen else ""})
         return out
 
     def apply(self, answer: FinalAnswer) -> FinalAnswer:
@@ -1024,29 +1150,77 @@ class _Batch:
 
 @dataclass
 class _Coverage:
-    """The coverage plane of a judge call: the request's parts and the sentences the server adds after
-    verification, each with the index the judge refers to it by."""
+    """The completeness plane of a judge call: the turn's requirements (to derive, with the answer's declared parts
+    as hints, or frozen, to score by id), what the turn found and did (``<workspace>``) and the sentences the server
+    adds after verification, each with the index the judge refers to it by."""
 
-    parts: list[dict]
+    turn: TurnRequirements
+    hints: list[str]
     statements: list[tuple[int, str]]
     request: str = ""
+    workspace: str = ""
+    known: set[str] = field(default_factory=set)  # the workspace ids a requirement may name as related
 
     def render(self) -> str:
-        if not self.parts:
-            return ""
-        parts = "\n".join(f'<part index="{n}">\n{prompt_text(p["ask"])}\n</part>' for n, p in enumerate(self.parts))
-        out = (f"\n\n<request>\n{prompt_text(self.request)}\n</request>" if self.request.strip() else "\n")
-        out += f"\n<request_parts>\n{parts}\n</request_parts>"
+        out = f"\n\n<request>\n{prompt_text(self.request)}\n</request>" if self.request.strip() else "\n"
+        if self.turn.derived:
+            out += "\n<requirements>\n" + "\n".join(
+                f'<requirement id="{r["id"]}" calculation="{"true" if r["calculation"] else "false"}">\n'
+                f'{prompt_text(r["text"])}\n</requirement>' for r in self.turn.items) + "\n</requirements>"
+        else:
+            out += "\n<derive_requirements>" + "".join(f"\n<hint>{prompt_text(h)}</hint>" for h in self.hints) \
+                + "\n</derive_requirements>"
+        out += f"\n<workspace>\n{self.workspace}\n</workspace>"
         if self.statements:
             out += "\n<server_statements>\n" + "\n".join(
                 f'<statement index="{i}">\n{prompt_text(t)}\n</statement>' for i, t in self.statements) \
                 + "\n</server_statements>"
         return out
 
+    def accept(self, scored: list[JudgeRequirement], indexes: set[int]) -> list[JudgeRequirement]:
+        """A call's requirement scores, by frozen id: the deriving call freezes the list first. Units are kept only
+        when they are the call's units or the server's statements, related ids only when the workspace lists them."""
+        if not self.turn.derived:
+            scored = [r.model_copy(update={"id": item["id"]}) for r, item in self.turn.freeze(scored)]
+        ids = {r["id"] for r in self.turn.items}
+        return [r.model_copy(update={"units": [i for i in r.units if i in indexes],
+                                     "related": [x for x in dict.fromkeys(r.related) if x in self.known]})
+                for r in scored if r.id in ids]
+
+
+_SCOPE_LABELS = {"section": "סעיף", "table": "טבלה", "pages": "עמודים"}
+
+
+def _workspace_listing(ws: Workspace, turn: TurnRequirements) -> tuple[str, set[str]]:
+    """What the turn found and did, for the judge to name what concerns each requirement: values (V#),
+    measurements (M#, the first ``WORKSPACE_MEASUREMENTS``), calculations (C#), failed calculations (F#) and tools
+    (E#), searches (H#, in the order made) and the sections, tables and pages read (their S#)."""
+    lines: list[tuple[str, str]] = []
+    for vid, v in ws.values.items():
+        note = "; תכונות שנקבעו ולא נמצאו במקור" if v.certainty != "verified" else ""
+        lines.append((vid, f"ערך: {v.label} = {v.written} («{v.title}»{note})"))
+    for mid, m in list(ws.measurements.items())[:WORKSPACE_MEASUREMENTS]:
+        pub = m.public()
+        lines.append((mid, f"נתון: {pub['metric']} = {pub['value_text']} («{pub['title']}»)"))
+    for cid, c in ws.computations.items():
+        lines.append((cid, f"חישוב: {c.label} = {c.display()['value']}"))
+    for x in turn.incidents:
+        what = "חישוב שנכשל" if x["kind"] == "calculation" else f"כלי שנכשל ({x['tool']})"
+        lines.append((x["id"], f"{what}: {x['label']} — {x['detail'][:160]}"))
+    for n, q in enumerate(ws.searches, 1):
+        lines.append((f"H{n}", f"חיפוש: «{q}»"))
+    for a in ws.activity.values():
+        for o in a.get("openings") or []:
+            partial = " (המסמך נקרא רק בחלקו)" if a.get("partial") or a.get("read_partial") else ""
+            lines.append((o["sid"], f"נקרא ({_SCOPE_LABELS.get(o.get('scope'), 'מקום')}): «{o.get('name') or ''}» "
+                                    f"ב«{a.get('title') or ''}»{partial}"))
+    text = "\n".join(f"{i}: {prompt_text(t)}" for i, t in lines) or "(לא נמצא ולא נבדק דבר)"
+    return text, {i for i, _ in lines}
+
 
 def _render_batch(batch: _Batch, ws: Workspace, coverage: _Coverage | None = None) -> str:
-    """The judge input: every cited source once (its evidence for this batch's units), then the units, then the
-    request's parts and the server's statements, when the answer lists parts."""
+    """The judge input: every cited source once (its evidence for this batch's units), then the units, then — in a
+    turn — the request, its requirements (to derive or to score), the workspace and the server's statements."""
     claims_of: dict[str, list[str]] = {}
     for u in batch.units:
         for sid in u.ids:
@@ -1087,45 +1261,43 @@ def _batches(units: list[Unit], ws: Workspace) -> list[_Batch]:
 
 
 def judge(provider: LLMProvider, batch: _Batch, rendered: str, usage: list[dict], deadline: float | None = None,
-          coverage: _Coverage | None = None) -> tuple[dict[int, JudgeVerdict], str, list[JudgePart]]:
+          coverage: _Coverage | None = None) -> tuple[dict[int, JudgeVerdict], str, list[JudgeRequirement]]:
     """One judge call on a rendered batch: the verdicts of the batch's units, the call's status, and — when the
-    answer lists the request's parts — each part's coverage by the batch's units and the server's statements."""
+    turn's requirements are in play — each requirement's score by the batch's units and the server's statements
+    (the turn's first call derives the requirements and freezes them)."""
     provider = for_purpose(provider, Purpose.VERIFY)
-    with_parts = bool(coverage and coverage.parts)
-    r = call_structured(provider, Purpose.VERIFY, JUDGE_POLICY + (JUDGE_PARTS_POLICY if with_parts else ""),
-                        rendered, JudgeCoverageOutput if with_parts else JudgeOutput, deadline=deadline,
+    r = call_structured(provider, Purpose.VERIFY, JUDGE_POLICY + (JUDGE_REQUIREMENTS_POLICY if coverage else ""),
+                        rendered, JudgeCoverageOutput if coverage else JudgeOutput, deadline=deadline,
                         max_output_tokens=6000)
     usage.append(usage_entry("verify", r, provider.model))
     if r.status != CallStatus.OK:
         return {}, r.status.value, []
     wanted = {u.index for u in batch.units}
-    parts: list[JudgePart] = []
-    if with_parts:
-        # a part is covered only by a unit of this call or a server statement; other indexes are ignored
-        known = wanted | {i for i, _ in coverage.statements}
-        parts = [p.model_copy(update={"units": [i for i in p.units if i in known]})
-                 for p in r.parsed.parts if 0 <= p.index < len(coverage.parts)]
-    return {v.index: v for v in r.parsed.verdicts if v.index in wanted}, "ok", parts
+    scores: list[JudgeRequirement] = []
+    if coverage:
+        # a requirement is given only by a unit of this call or a server statement; other indexes are ignored
+        scores = coverage.accept(r.parsed.requirements, wanted | {i for i, _ in coverage.statements})
+    return {v.index: v for v in r.parsed.verdicts if v.index in wanted}, "ok", scores
 
 
 def _judge_batch(provider: LLMProvider, batch: _Batch, ws: Workspace, usage: list[dict],
                  deadline: float | None, coverage: _Coverage | None = None
-                 ) -> tuple[dict[int, JudgeVerdict], list[JudgePart]]:
-    """One batch to verdicts (and part coverage): a call that timed out, was rate-limited or came back invalid is
+                 ) -> tuple[dict[int, JudgeVerdict], list[JudgeRequirement]]:
+    """One batch to verdicts (and requirement scores): a call that timed out, was rate-limited or came back invalid is
     made once more; a truncated (``incomplete``) reply is split in half instead of resent. Raises
     ``VerificationUnavailable`` when the judge cannot answer."""
     rendered = _render_batch(batch, ws, coverage)
-    got, status, parts = judge(provider, batch, rendered, usage, deadline, coverage)
+    got, status, scores = judge(provider, batch, rendered, usage, deadline, coverage)
     if status == "incomplete" and len(batch.units) > 1:
         half = len(batch.units) // 2
         first, p1 = _judge_batch(provider, _Batch(batch.units[:half], batch.narrow), ws, usage, deadline, coverage)
         second, p2 = _judge_batch(provider, _Batch(batch.units[half:], batch.narrow), ws, usage, deadline, coverage)
         return first | second, p1 + p2
     if status in RETRYABLE:
-        got, status, parts = judge(provider, batch, rendered, usage, deadline, coverage)
+        got, status, scores = judge(provider, batch, rendered, usage, deadline, coverage)
     if status != "ok":
         raise VerificationUnavailable(status)
-    return _shown_support(got, batch, ws), parts
+    return _shown_support(got, batch, ws), scores
 
 
 def _shown_support(verdicts: dict[int, JudgeVerdict], batch: _Batch, ws: Workspace) -> dict[int, JudgeVerdict]:
@@ -1164,37 +1336,42 @@ def _named_support(unit: Unit, named: list[str], ws: Workspace, question: str) -
 
 def _judge_all(provider: LLMProvider, units: list[Unit], ws: Workspace, usage: list[dict],
                deadline: float | None = None, coverage: _Coverage | None = None
-               ) -> tuple[dict[int, JudgeVerdict], list[JudgePart]]:
-    """Every unit judged; a unit the judge left out is asked about once more. With the request's parts, every
-    call also reports their coverage (a part may be answered in any batch)."""
+               ) -> tuple[dict[int, JudgeVerdict], list[JudgeRequirement]]:
+    """Every unit judged; a unit the judge left out is asked about once more. With the turn's requirements, every
+    call also scores them by id (a requirement may be given in any batch)."""
     verdicts: dict[int, JudgeVerdict] = {}
-    parts: list[JudgePart] = []
+    scores: list[JudgeRequirement] = []
     for batch in _batches(units, ws):
         got, p = _judge_batch(provider, batch, ws, usage, deadline, coverage)
         verdicts |= got
-        parts += p
+        scores += p
     missing = [u for u in units if u.index not in verdicts]
     for batch in _batches(missing, ws):
         got, p = _judge_batch(provider, batch, ws, usage, deadline, coverage)
         verdicts |= got
-        parts += p
-    return verdicts, parts
+        scores += p
+    return verdicts, scores
 
 
 def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, question: str,
                   usage: list[dict], deadline: float | None = None, mismatch: str | None = None,
-                  statements: list[str] | None = None, request: str | None = None) -> VerifyReport:
+                  statements: list[str] | None = None, request: str | None = None,
+                  requirements: TurnRequirements | None = None) -> VerifyReport:
     """Deterministic checks, then the judge on every remaining unit. ``mismatch`` says why the answer's datum is
     not the one the resolved request asked for (``app.chat.resolve.mismatch``): a problem of the whole answer,
-    for the repair round, and a note on the final answer. ``statements``: the sentences the server adds after
-    verification (``coverage.planned_statements``), which can state a part of the request missing; ``request``: the
-    request as resolved in context (the question itself when there is none), beside the parts. Raises
-    ``VerificationUnavailable``."""
+    for the repair round, and a note on the final answer. ``requirements``: the turn's requirements (KTD7) — derived
+    by this call's first judge call when the turn has none yet, then scored by id; without it (a check outside a
+    turn) completeness is not judged. ``statements``: the sentences the server adds after verification
+    (``coverage.planned_statements``), which can state a requirement missing; ``request``: the request as resolved
+    in context (the question itself when there is none). Raises ``VerificationUnavailable``."""
     units = split_units(answer.answer_markdown)
     report = VerifyReport(units)
-    report.parts = [p.model_dump() for p in getattr(answer, "parts", None) or []]
-    report.statements = [(len(units) + n, t) for n, t in enumerate(statements or [])] if report.parts else []
-    coverage = _Coverage(report.parts, report.statements, request or question) if report.parts else None
+    coverage = None
+    if requirements is not None:
+        report.statements = [(len(units) + n, t) for n, t in enumerate(statements or [])]
+        listing, known = _workspace_listing(ws, requirements)
+        coverage = _Coverage(requirements, [p.ask for p in getattr(answer, "parts", None) or []], report.statements,
+                             request or question, listing, known)
     # a result of the turn's calculations that a unit shows without citing it is bound to its C#, which joins the
     # unit's citations (and the answer's, once the unit is verified)
     bound = bind_computations(units, ws, question)
@@ -1219,18 +1396,15 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     if mismatch:
         report.problems.append(Problem(Unit(-1, "", "", []), f"התשובה אינה מציגה את הנתון שהתבקש: {mismatch}",
                                        kind="request"))
-    # a unit the deterministic checks failed is not judged; with parts and nothing left to judge, the parts are still
-    # checked against the server's statements (without either, no part is covered)
+    # a unit the deterministic checks failed is not judged; with nothing left to judge, the requirements are still
+    # derived and scored against the server's statements (a coverage-only call)
     to_judge = [u for u in units if u.index not in failed]
-    if coverage and not to_judge and coverage.statements:
+    votes: list[JudgeRequirement] = []
+    if coverage and not to_judge:
         _, votes = _judge_batch(provider, _Batch([]), ws, usage, deadline, coverage)
-        for v in votes:
-            report.part_votes.setdefault(v.index, []).append(v)
     if to_judge:
         verdicts, votes = _judge_all(provider, to_judge, ws, usage, deadline, coverage)
         report.judged, report.judge_status = True, "ok"
-        for v in votes:
-            report.part_votes.setdefault(v.index, []).append(v)
         for u in to_judge:
             v = verdicts.get(u.index)
             if v is None:
@@ -1253,5 +1427,45 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 else:
                     report.problems += [Problem(u, f"נתמך ב-{s}, שהתשובה לא ציטטה", kind="needs_citation", cite=s)
                                         for s in named]
+    if coverage:
+        report.requirements = [dict(r) for r in requirements.items]
+        for v in votes:
+            report.requirement_votes.setdefault(v.id, []).append(v)
+        _check_requirements(report, ws, requirements)
     return report
+
+
+def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequirements) -> None:
+    """The requirements against what the turn found (R20, R21). A unit or server statement that says a requirement
+    was not found, when the turn holds its values, measurements or calculation, is removed (the unit) or withdrawn
+    (the statement). Then a requirement not given — missing and not said to be, or partly given — whose data the
+    turn found, or missing with no search, reading or failure behind it, is a problem for the repair round, which
+    may call tools; nothing is removed for it."""
+    from app.chat.coverage import related_evidence
+
+    units = {u.index: u for u in report.units}
+    statements = dict(report.statements)
+    failed = {p.unit.index for p in report.problems if p.removes_unit}
+    for r in report.requirements:
+        for v in report.requirement_votes.get(r["id"], []):
+            data = related_evidence(ws, {"related": v.related}, turn)["data"]
+            if not data or v.status not in ("missing", "partial"):
+                continue
+            for i in v.units:
+                if i in statements and NOT_FOUND.search(statements[i]):
+                    report.withdrawn.add(statements[i])
+                elif i in units and i not in failed and NOT_FOUND.search(units[i].text):
+                    failed.add(i)
+                    report.problems.append(Problem(units[i], REQ_FOUND_NOT_ABSENT.format(ids=", ".join(data))))
+    for o in report.requirement_outcomes():
+        if o["status"] not in ("missing", "partial") or (o["status"] == "missing" and o["stated"]):
+            continue
+        ev = related_evidence(ws, o, turn)
+        if ev["data"]:
+            reason = REQ_DATA_FOUND.format(text=o["text"], ids=", ".join(ev["data"]))
+        elif o["status"] == "missing" and not ev["checks"] and not ev["failures"]:
+            reason = REQ_NOT_SEARCHED.format(text=o["text"])
+        else:
+            continue
+        report.problems.append(Problem(Unit(-1, "", "", []), reason, kind="requirement"))
 

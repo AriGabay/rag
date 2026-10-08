@@ -23,11 +23,20 @@ region, or a document read in part); the relevant source was read and does not s
 to its end); the sources conflict (values registered this turn give it different amounts). One sentence per datum:
 requested data are deduplicated by label, and a part of the request the verified answer does not cover gets one
 too (``state_parts``), unless it is already stated.
+
+What the request requires is derived by the verification judge (``verify.TurnRequirements``, KTD7). A requirement the
+verified answer does not give gets one sentence with its reason (R21), computed from what the turn found and did
+(``limitation``): a tool or provider failure; a calculation that failed, or whose inputs were found and never
+computed; the sources disagree, or the documents do not allow a conclusion (insufficient to conclude); a value found
+with an uncertain reading or meaning, or a document it needs read only in part (found but uncertain); not found in
+the search — only when a search or reading covered it; otherwise not searched, never "not found". The answer is then
+tidied (``tidy``): no orphan list marker and no repeated line is left by the removals and additions (R22).
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Collection
 from typing import TYPE_CHECKING
 
 from app.chat.tools import READ_TO_END
@@ -36,6 +45,7 @@ from app.db import tenant_tx
 if TYPE_CHECKING:
     from app.chat.engine import FinalAnswer
     from app.chat.tools import Workspace
+    from app.chat.verify import TurnRequirements
 
 _CITE = re.compile(r"\[([SMCVA]\d+(?:\s*[,،;]\s*[SMCVA]\d+)*)\]")
 NAMES_SHOWN = 8
@@ -70,7 +80,7 @@ def cited_documents(ws: Workspace, markdown: str) -> dict[str, str]:
 
 
 LEDGER_DOCUMENT_KEYS = ("cited", "matching", "read", "retrieved_only", "with_data", "not_checked", "unused",
-                        "partially_read", "omitted", "also_matching", "tables", "parts")
+                        "partially_read", "omitted", "also_matching", "tables", "requirements")
 
 
 def ledger_documents(ledger: dict | None) -> set[str]:
@@ -223,10 +233,12 @@ def _per_label(rows: list[dict]) -> dict[str, list[dict]]:
     return out
 
 
-def _absence_sentences(ws: Workspace, answer: FinalAnswer, *, cited: bool) -> list[str]:
+def _absence_sentences(ws: Workspace, answer: FinalAnswer, *, cited: bool,
+                       withdrawn: Collection[str] = ()) -> list[str]:
     """One sentence per datum not found. ``cited=True``: the data whose section or table was read and does not
     show them. ``cited=False``: every other datum — and one whose section sentence is not in the answer (removed
-    in verification) falls to its next limitation."""
+    in verification) falls to its next limitation. A sentence verification ``withdrawn`` (its datum was found) is
+    not given."""
     out: list[str] = []
     for rows in _per_label(validate_requested(ws, answer.requested)).values():
         if cited:
@@ -236,7 +248,7 @@ def _absence_sentences(ws: Workspace, answer: FinalAnswer, *, cited: bool) -> li
                       and absence_sentence(r) in answer.answer_markdown]
             chosen = None if stated else next((r for r in rows if r["status"] != "section_checked_absent"), None)
         sentence = absence_sentence(chosen) if chosen else None
-        if sentence and sentence not in answer.answer_markdown and sentence not in out:
+        if sentence and sentence not in answer.answer_markdown and sentence not in out and sentence not in withdrawn:
             out.append(sentence)
     return out
 
@@ -256,7 +268,7 @@ def _prepend(answer: FinalAnswer, sentences: list[str]) -> FinalAnswer:
                                      "status": status})
 
 
-def state_absence(ws: Workspace, answer: FinalAnswer, *, cited: bool) -> FinalAnswer:
+def state_absence(ws: Workspace, answer: FinalAnswer, *, cited: bool, withdrawn: Collection[str] = ()) -> FinalAnswer:
     """The answer opened by a sentence for each requested datum that was not found, before any near datum the
     answer gives; its status is then at most ``partial``.
 
@@ -264,55 +276,175 @@ def state_absence(ws: Workspace, answer: FinalAnswer, *, cited: bool) -> FinalAn
     which cites the opened section it rests on and is judged like any claim. ``cited=False`` (after
     verification): "not found in the search", "the document was read in part" and "the sources conflict" —
     statements about what the turn did, validated against it (``validate_requested``), with no source a judge
-    could read. A datum gets one sentence, however many times it is listed."""
+    could read. A datum gets one sentence, however many times it is listed; none when verification ``withdrew`` it
+    (the turn holds the datum's values)."""
     if answer.status == "clarification":
         return answer
-    sentences = _absence_sentences(ws, answer, cited=cited)
+    sentences = _absence_sentences(ws, answer, cited=cited, withdrawn=withdrawn)
     return _prepend(answer, sentences) if sentences else answer
 
 
-def _part_limitation(ws: Workspace, part: dict) -> dict:
-    """The limitation a part of the request the answer does not cover gets, from what the turn did: the sources
-    conflict (claimed, and values of the turn conflict); a document of the turn was read in part; otherwise not
-    found in the search. "Read and not shown" needs a section read to its end for that datum, which only a
-    requested datum names (``validate_requested``)."""
-    row = {"label": part["ask"].strip(), "status": "not_found_search", "partial_document": None,
-           "partial_reason": None}
-    if part.get("missing_kind") == "sources_conflict" and conflicting(ws):
-        return row | {"status": "sources_conflict"}
-    for a in ws.activity.values():
-        if a.get("partial") or a.get("read_partial"):
-            return row | {"status": "source_partial", "partial_document": a["title"],
-                          "partial_reason": None if a.get("partial") else "read_in_part"}
-    return row
+# the reasons a requirement is not given (R21), as the completeness indicator names them
+LIMITATIONS = {
+    "not_found": "לא נמצא בחיפוש שבוצע",
+    "uncertain": "נמצא, אך לא בוודאות",
+    "tool_failure": "תקלה בכלי או בשירות המודל",
+    "calculation_incomplete": "החישוב לא הושלם",
+    "insufficient": "אין די במקורות כדי להכריע",
+    "not_searched": "לא נבדק",
+}
+_H = re.compile(r"H(\d+)")
 
 
-def state_parts(ws: Workspace, answer: FinalAnswer, report) -> tuple[FinalAnswer, list[dict]]:
-    """Each part of the request with its coverage in the verified answer (``VerifyReport.part_outcomes``), and the
-    answer opened by a sentence for each part it neither gives nor states missing; a part not given makes the
-    answer at most ``partial``. The sentence names the part's limitation (``_part_limitation``), once per label."""
-    if answer.status == "clarification" or not report.parts:
+def related_evidence(ws: Workspace, outcome: dict, turn: TurnRequirements | None) -> dict:
+    """What the turn holds for a requirement, from the ids the judge named as related (each checked against the
+    workspace): ``data`` — values, measurements and calculations; ``failures`` — failed calculations and tools;
+    ``checks`` — searches (H#) and readings (S#); ``documents`` — the documents of its data and readings."""
+    incidents = {x["id"]: x for x in (turn.incidents if turn is not None else [])}
+    data, failures, checks, documents = [], [], [], []
+    for i in outcome.get("related") or []:
+        if i in ws.values:
+            data.append(i)
+            documents.append(str(ws.values[i].document_id))
+        elif i in ws.measurements:
+            data.append(i)
+            documents.append(str(ws.measurements[i].document_id))
+        elif i in ws.computations:
+            data.append(i)
+            # a calculation's leaves are values, measurements and the user's assumptions (which have no document)
+            documents += [str(src.document_id) for leaf in ws.computations[i].leaves
+                          if (src := ws.values.get(leaf) or ws.measurements.get(leaf)) is not None]
+        elif i in incidents:
+            failures.append(incidents[i])
+        elif i in ws.sources:
+            checks.append(i)
+            documents.append(str(ws.sources[i].document_id))
+        elif (m := _H.fullmatch(i)) and 1 <= int(m.group(1)) <= len(ws.searches):
+            checks.append(i)
+    return {"data": data, "failures": failures, "checks": checks, "documents": list(dict.fromkeys(documents))}
+
+
+def _uncertain_value(ws: Workspace, ids: list[str]) -> bool:
+    """A value among ``ids`` whose meaning was asserted rather than found in its source, or whose source was read
+    uncertainly."""
+    for i in ids:
+        v = ws.values.get(i)
+        if v is None:
+            continue
+        source = ws.sources.get(v.source_id)
+        if v.certainty != "verified" or (source is not None and source.status == "uncertain_reading"):
+            return True
+    return False
+
+
+def limitation(ws: Workspace, outcome: dict, turn: TurnRequirements | None = None) -> dict:
+    """Why a requirement is not given, computed from what the turn found and did (R21): ``kind`` (a
+    ``LIMITATIONS`` key) and the sentence that says so. "Not found in the search" only when a search or reading
+    covered it and none of its data was found; with no search behind it, "not searched"."""
+    label = " ".join(re.sub(r"\*+", " ", outcome["text"]).split())
+    ev = related_evidence(ws, outcome, turn)
+    kinds = {f["kind"] for f in ev["failures"]}
+    partly = next((ws.activity[d]["title"] for d in ev["documents"] if d in ws.activity
+                   and (ws.activity[d].get("partial") or ws.activity[d].get("read_partial"))), None)
+    if "tool" in kinds:
+        return {"kind": "tool_failure",
+                "sentence": f"**{label}** לא הושלם בגלל תקלה בכלי או בשירות המודל בזמן הבדיקה."}
+    if "calculation" in kinds:
+        return {"kind": "calculation_incomplete",
+                "sentence": f"**{label}**: החישוב נכשל על הנתונים שנמצאו, ולכן התוצאה לא הושלמה."}
+    if ev["data"] and len(ev["documents"]) and conflicting(ws, ev["documents"]):
+        return {"kind": "insufficient",
+                "sentence": f"**{label}**: המקורות סותרים — הם נותנים ערכים שונים, ולכן אין די כדי להכריע."}
+    if outcome["status"] == "undeterminable":
+        return {"kind": "insufficient", "sentence": f"**{label}**: המסמכים אינם מספיקים כדי להכריע בכך."}
+    if _uncertain_value(ws, ev["data"]):
+        return {"kind": "uncertain", "sentence": (f"**{label}**: נמצא ערך, אבל קריאתו או משמעותו אינן ודאיות, ולכן "
+                                                  "הוא לא הוצג כנתון מאומת.")}
+    if partly:
+        return {"kind": "uncertain",
+                "sentence": f"**{label}**: המסמך \"{partly}\" נקרא רק בחלקו, ולכן אין ודאות לגבי הנתון."}
+    if ev["data"] and outcome.get("calculation"):
+        return {"kind": "calculation_incomplete",
+                "sentence": f"**{label}**: הנתונים לחישוב נמצאו, אבל החישוב לא הושלם."}
+    if ev["data"]:
+        return {"kind": "insufficient", "sentence": f"**{label}**: נמצאו נתונים, אבל אין בהם די כדי להכריע בכך."}
+    if ev["checks"]:
+        return {"kind": "not_found", "sentence": f"**{label}** לא נמצא בחיפוש במסמכים שנבדקו."}
+    return {"kind": "not_searched", "sentence": (f"**{label}** לא נבדק: לא בוצע חיפוש או קריאה שמכסים אותו, ולכן "
+                                                 "לא ידוע אם הוא מופיע במסמכים.")}
+
+
+def state_parts(ws: Workspace, answer: FinalAnswer, report,
+                turn: TurnRequirements | None = None) -> tuple[FinalAnswer, list[dict]]:
+    """Each requirement of the request with its status in the verified answer (``VerifyReport.requirement_outcomes``)
+    and, when not given in full, its limitation (``limitation``); the answer opened by a sentence for each
+    requirement it neither gives nor says is missing or undeterminable, once per label. A requirement not given in
+    full makes the answer at most ``partial``. The answer is tidied last (``tidy``)."""
+    if answer.status == "clarification" or not report.requirements:
         return answer, []
-    outcomes = report.part_outcomes(answer)
+    outcomes = report.requirement_outcomes(answer)
     # the data whose limitation the answer already states (a requested datum's sentence that is in the answer)
     stated = {_norm_label(r["label"]) for r in validate_requested(ws, answer.requested)
               if r["kind"] and absence_sentence(r) in answer.answer_markdown}
     sentences: list[str] = []
     for o in outcomes:
-        o["stated"] = None
-        if o["coverage"] != "not_covered":
+        lim = limitation(ws, o, turn) if o["status"] != "full" else None
+        o["limitation"] = lim["kind"] if lim else None
+        o["limitation_text"] = LIMITATIONS[lim["kind"]] if lim else None
+        if lim is None or o["status"] == "partial" or o["stated"]:
             continue
-        row = _part_limitation(ws, o)
-        o["stated"] = _KIND_OF_STATUS[row["status"]]
-        sentence = absence_sentence(row)
-        if sentence and _norm_label(row["label"]) not in stated and sentence not in sentences:
-            stated.add(_norm_label(row["label"]))
+        sentence = lim["sentence"]
+        if _norm_label(o["text"]) not in stated and sentence not in sentences and sentence not in answer.answer_markdown:
+            stated.add(_norm_label(o["text"]))
             sentences.append(sentence)
     if sentences:
         answer = _prepend(answer, sentences)
-    elif any(o["coverage"] != "answered" for o in outcomes) and answer.status == "answered":
+    elif any(o["status"] != "full" for o in outcomes) and answer.status == "answered":
         answer = answer.model_copy(update={"status": "partial"})
-    return answer, outcomes
+    return answer.model_copy(update={"answer_markdown": tidy(answer.answer_markdown)}), outcomes
+
+
+def completeness(outcomes: list[dict]) -> dict | None:
+    """The answer's completeness, apart from its correctness (R19): ``full`` (every requirement given), ``partial``
+    (some given, in full or in part), ``missing`` (none given) or ``undeterminable`` (none can be concluded from the
+    documents); and each requirement not given in full with its reason, for the line under the answer. None when no
+    requirements were judged."""
+    if not outcomes:
+        return None
+    statuses = [o["status"] for o in outcomes]
+    if all(s == "full" for s in statuses):
+        status = "full"
+    elif any(s in ("full", "partial") for s in statuses):
+        status = "partial"
+    elif all(s == "undeterminable" for s in statuses):
+        status = "undeterminable"
+    else:
+        status = "missing"
+    return {"status": status, "requirements": len(outcomes),
+            "missing": [{"id": o["id"], "text": o["text"], "status": o["status"], "reason": o["limitation"],
+                         "reason_text": LIMITATIONS.get(o["limitation"])} for o in outcomes if o["status"] != "full"]}
+
+
+# a line with nothing left but markup: a list marker, a list item's number, a quote mark, bold marks
+_ORPHAN_LINE = re.compile(r"(?:[-*+]|\d{1,3}[.)]|>)?\s*(?:\*\*|__)?\s*(?:\*\*|__)?")
+
+
+def tidy(markdown: str) -> str:
+    """The answer without the remnants of removals and additions (R22): a line left with nothing but markup, and a
+    prose line repeated (an absence sentence said twice); tables are kept as they are."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in markdown.split("\n"):
+        s = line.strip()
+        if s and not s.startswith("|"):
+            if _ORPHAN_LINE.fullmatch(s):
+                continue
+            if re.search(r"[א-תA-Za-z0-9]", s):
+                if s in seen:
+                    continue
+                seen.add(s)
+        out.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
 
 
 def tables_presented(ws: Workspace, markdown: str) -> list[dict]:

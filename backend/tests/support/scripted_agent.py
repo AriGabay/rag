@@ -36,6 +36,13 @@ def final(markdown: str, status: str = "answered", claims: list | None = None, c
                       "omitted": omitted or [], "focus": focus, "requested": requested or [], "parts": parts or []}}
 
 
+def requirement(text: str = "", status: str = "full", units: list | None = None, related: list | None = None,
+                id: str = "", calculation: bool = False) -> dict:
+    """A judge's score of one requirement: ``text`` when the call derives it, ``id`` when it scores a frozen one."""
+    return {"id": id, "text": text, "calculation": calculation, "status": status, "units": units or [],
+            "related": related or [], "reason": "בדיקה"}
+
+
 class ScriptedAgent(ScriptedProvider):
     """``steps``: a list whose items are a list of tool calls (one model step calling them), a ``final(...)``
     dict, a ``CallStatus`` (a failed step), or a callable ``(items) -> one of those``."""
@@ -56,9 +63,14 @@ class ScriptedAgent(ScriptedProvider):
             indexes = [int(i) for i in re.findall(r'<unit index="(\d+)"', input)]
             out = {"verdicts": [{"index": i, "verdict": verdict, "reason": "בדיקה", "supported_by": []}
                                 for i in indexes]}
-            if "<request_parts>" in input:  # every part answered by the batch (a test of coverage scripts its own)
-                out["parts"] = [{"index": int(i), "coverage": "answered", "units": indexes, "reason": "בדיקה"}
-                                for i in re.findall(r'<part index="(\d+)">', input)]
+            # the turn's requirements: derived from the answer's declared parts, each given in full by the batch (a
+            # test of completeness scripts its own judge)
+            if "<derive_requirements>" in input:
+                out["requirements"] = [requirement(text=h, units=indexes)
+                                       for h in re.findall(r"<hint>(.*?)</hint>", input, re.S)]
+            elif "<requirements>" in input:
+                out["requirements"] = [requirement(id=i, units=indexes)
+                                       for i in re.findall(r'<requirement id="(Q\d+)"', input)]
             return out
 
         self.on(Purpose.VERIFY, judge_fn, repeat=True)
