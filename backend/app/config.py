@@ -125,12 +125,24 @@ class Settings(BaseSettings):
     llm_timeout_vision_seconds: float = 90
     llm_timeout_resolve_seconds: float = 30
     llm_timeout_summary_seconds: float = 60  # a background call after the answer is stored
-    # The conversational answering loop: its step bound and wall clock.
-    chat_max_steps: int = 8
-    chat_turn_seconds: int = 150
+    # The conversational answering loop: its step bound and wall clock (KTD12). Every limit the loop reaches ends
+    # the reading with a forced final step and a visible limitation, never an answer that looks complete.
+    # model steps of a turn, its repair rounds included: reading takes up to 8, the last of them forced to answer
+    chat_max_steps: int = 10
+    chat_turn_seconds: int = 150  # verification may run ``VERIFY_ALLOWANCE_SECONDS`` past it
     chat_workers: int = 6
     chat_run_inline: bool = False  # tests: run a turn inside the request instead of a background thread
     chat_max_inspections: int = 3  # visual readings (``inspect``) one turn may make with the vision model
+    # characters of tool output one turn may send the model; past it, reading tools return a header only (0: none)
+    chat_tool_output_chars: int = 60_000
+    chat_read_chars: int = 3500  # a part of a section, a page range or the paragraphs around a source
+    chat_table_rows: int = 40  # rows in a part of a table
+    chat_passage_chars: int = 1600  # a search hit
+    # The verification reserve: reading stops this long before the turn's deadline, and one step per repair round
+    # before its step bound, so the answer, its verification and its repair rounds still fit
+    chat_repair_rounds: int = 2  # 1: a repair with tools; 2: then a rewrite from verified content only
+    chat_verify_reserve_seconds: int = 40
+    chat_verify_min_seconds: int = 15  # less time than this left for a verification fails the turn
     llm_timeout_agent_seconds: float = 60
     llm_timeout_measure_seconds: float = 90
 

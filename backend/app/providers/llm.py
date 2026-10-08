@@ -443,11 +443,13 @@ class OpenAIProvider(BaseProvider):
 
     def agent_step(self, instructions: str, items: list, tools: list[dict], final_schema: dict, *,
                    reasoning_effort: str | None = None, max_output_tokens: int = 6000,
-                   timeout: float | None = None, cache_key: str | None = None) -> AgentStep:
+                   timeout: float | None = None, cache_key: str | None = None,
+                   tool_choice: str | None = None) -> AgentStep:
         """One step of a tool-using loop: the model either calls tools or returns the final JSON answer (strict
         ``final_schema``). Responses are not stored; reasoning items come back encrypted so the next step can
         carry them. ``cache_key`` (``office_cache_key``): the prompt cache key, when the model takes one; the
-        cache mode stays implicit, as each step extends the previous step's input."""
+        cache mode stays implicit, as each step extends the previous step's input. ``tool_choice`` "none": the
+        step must answer — the tools are still sent, so the cached prefix stays the same (KTD12)."""
         import openai
 
         reasoning = self._reasoning(reasoning_effort if reasoning_effort is not None else self.reasoning_effort)
@@ -457,6 +459,8 @@ class OpenAIProvider(BaseProvider):
             "text": {"format": {"type": "json_schema", "name": "final_answer", "schema": final_schema,
                                 "strict": True}},
         }
+        if tool_choice:
+            kwargs["tool_choice"] = tool_choice
         if reasoning:
             kwargs["reasoning"] = reasoning
             if reasoning["effort"] != "none":

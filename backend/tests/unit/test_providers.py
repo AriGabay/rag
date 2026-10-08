@@ -150,6 +150,19 @@ def test_agent_step_keeps_implicit_caching_under_a_hashed_office_key():
     assert sent["include"] == ["reasoning.encrypted_content"]
 
 
+def test_a_last_agent_step_keeps_its_tools_and_only_sets_the_tool_choice():
+    """The forced final step (KTD12): the same tools, so the cached prefix survives, with ``tool_choice`` none."""
+    tools = [{"type": "function", "name": "search", "description": "חיפוש", "strict": True,
+              "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}}]
+    provider, transport = openai_provider(_ok(), "gpt-6-luna", "low")
+    provider.agent_step("הוראות", [], tools, Echo.model_json_schema(), cache_key=llm.office_cache_key("x"))
+    provider.agent_step("הוראות", [], tools, Echo.model_json_schema(), cache_key=llm.office_cache_key("x"),
+                        tool_choice="none")
+    free, last = _sent(transport, 0), _sent(transport, 1)
+    assert "tool_choice" not in free and last["tool_choice"] == "none"
+    assert last["tools"] == free["tools"] == tools and last["prompt_cache_key"] == free["prompt_cache_key"]
+
+
 def test_mini_is_sent_no_cache_options():
     provider, transport = openai_provider(_ok(), "gpt-5.4-mini", "low")
     call(provider, Purpose.VERIFY)

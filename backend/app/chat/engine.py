@@ -9,7 +9,8 @@ One turn:
    without a search (the paragraphs around a source, pages, a section from the document's outline, a table, the
    continuation of a part), lists documents, and, for calculations, registers values it read (verified by the
    server), the user's own scenario numbers and stored measurements, and calculates over them in code
-   (``app.chat.calc``). Steps are bounded (``chat_max_steps``) and the turn has a wall clock.
+   (``app.chat.calc``). Steps are bounded (``chat_max_steps``), the turn has a wall clock and its tool outputs a
+   budget (``chat_tool_output_chars``).
 3. It answers in Markdown with citations ``[S#]`` (passages), ``[M#]`` (measurements), ``[V#]`` (values),
    ``[A#]`` (user assumptions), ``[C#]`` (calculations).
 4. ``app.chat.verify`` checks the answer against what the tools returned: unknown citations, numbers that no
@@ -17,6 +18,18 @@ One turn:
    whether each part of the request the answer lists (``parts``) is answered or stated missing. A failed check
    gets one repair step; what still fails is removed, and the answer says so; a part neither answered nor stated
    missing is stated missing by the server (``coverage.state_parts``).
+
+Limits (KTD12). Reading stops early enough for the answer, its verification and its repair rounds to fit: one
+step per repair round is kept from the step bound, and ``chat_verify_reserve_seconds`` from the clock. A limit
+reached while reading — the tool-output budget, the step bound or the time reserve — makes the next step the last:
+it keeps the same tools in the same order with ``tool_choice`` "none", and an item appended to the conversation
+tells the model it ran out and must not present the answer as complete. The answer is still verified; it is then
+``partial``, a sentence names the limit, and ``limits_hit`` goes to diagnostics. When less time is left than a
+verification needs, the turn fails with its own message (its calls are still logged).
+
+Prompt caching. The policy, the tools and the turn's first message are the same at every step and carry nothing
+of the moment the turn runs; each step only appends to the items the previous step sent, and a tool output is
+never rewritten within a turn, so every step's input extends the cached prefix of the one before.
 
 Between steps the loop checks for cancellation; a model call already in flight cannot be recalled, so the loop
 waits for it, discards its result and reports the turn as cancelled only then. A provider failure is reported
@@ -152,6 +165,29 @@ REWRITE = """גם התשובה המתוקנת לא אומתה במלואה. אל
 כתוב תשובה סופית קוהרנטית שמשתמשת רק בתוכן שאומת ובמראי המקום שלו. אל תוסיף טענות חדשות. אם נקודה חשובה לשאלה לא
 אומתה, ציין בקצרה שלא ניתן היה לאמת אותה במקורות. החזר באותו מבנה."""
 
+
+# the item that makes a step the last one, by the limit that was reached (appended, so the cached prefix survives)
+LIMIT_NOTICE = """אין עוד קריאה לכלים בשאלה הזו: {why}. ענה עכשיו רק ממה שכבר קראת ומהמזהים שקיבלת. אל תציג את
+התשובה כמלאה: status partial (או not_found / clarification כשמתאים), ואמור במילים פשוטות מה לא נבדק או לא נקרא.
+השרת מוסיף לתשובה משפט על המגבלה — אל תכתוב אותו בעצמך."""
+STEP_LIMIT, TIME_LIMIT = "step_limit", "time_limit"
+LIMIT_WHY = {
+    T.TOOL_BUDGET: "הגעת למגבלת היקף הקריאה לשאלה אחת (כמות הטקסט שהכלים מחזירים)",
+    STEP_LIMIT: "הגעת למספר הצעדים המרבי לשאלה אחת",
+    TIME_LIMIT: "הזמן לחיפוש ולקריאה בשאלה הזו הסתיים (נשאר זמן לאימות התשובה בלבד)",
+}
+REPAIR_LAST = "אין עוד קריאה לכלים בתיקון הזה: תקן רק ממה שכבר קראת, באותו מבנה."
+# the sentence an answer gets for each limit its turn reached (``Workspace.limits_hit``), in this order
+LIMIT_SENTENCES = {
+    T.TOOL_BUDGET: "הקריאה במסמכים נעצרה במגבלת הקריאה לשאלה אחת, ולכן חלקים מהמקורות לא נקראו והתשובה עשויה להיות "
+                   "חסרה.",
+    STEP_LIMIT: "החיפוש והקריאה נעצרו במספר הצעדים המרבי לשאלה אחת, ולכן ייתכן שחלקים רלוונטיים במסמכים לא נבדקו.",
+    TIME_LIMIT: "החיפוש והקריאה נעצרו במגבלת הזמן לשאלה אחת, ולכן ייתכן שחלקים רלוונטיים במסמכים לא נבדקו.",
+    T.INSPECT_LIMIT: "מספר הקריאות החזותיות לשאלה אחת הגיע למרבי, ולכן אזורים שלא נקראו בעיבוד המסמך נשארו לא "
+                     "קרואים.",
+}
+FINAL_STEP_SECONDS = 25  # less time than this before the deadline: a repair step answers without tools
+REPAIR_MIN_SECONDS = 20  # less time than this before the deadline: no further repair round
 
 HISTORY_USER_CHARS = 2500
 HISTORY_ANSWER_CHARS = 600
@@ -344,13 +380,18 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         raise ProviderFailure("unsupported", "provider has no tool loop")
     cache_key = office_cache_key(ctx.office_id)
     deadline = time.monotonic() + settings.chat_turn_seconds
-    ws = T.Workspace(ctx=ctx, prior=dict(inp.prior_refs), usage=usage)  # inspect's vision calls join the turn's usage
+    # reading stops this early, so the answer, its verification and the repair rounds still fit (KTD12)
+    read_until = deadline - settings.chat_verify_reserve_seconds
+    repairs = max(0, min(2, settings.chat_repair_rounds))
+    ws = T.Workspace(ctx=ctx, prior=dict(inp.prior_refs), usage=usage,  # inspect's vision calls join the turn's usage
+                     tool_budget=settings.chat_tool_output_chars or None)
     # what the user wrote, as this turn sees it: an assumption (A#) quotes it, never an answer or a document
     users = [m.content for m in inp.history if m.role == "user"]
     ws.user_messages = [{"turn": n + 1, "text": t, "current": False} for n, t in enumerate(users)] + [
         {"turn": len(users) + 1, "text": inp.question, "current": True}]
     steps = 0
     attempt = 0  # 0: first answer, 1: repaired with tools, 2: rewritten from verified content only
+    limits = ws.limits_hit
     rounds: list[list[dict]] = []
     progress("understand", "מבין את הבקשה")
     request = None
@@ -380,15 +421,30 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         if cancelled():
             raise TurnCancelled
         steps += 1
-        left = deadline - time.monotonic()
-        last = steps >= settings.chat_max_steps or left < 25 or attempt == 2
-        step = agent.agent_step(POLICY, items, [] if last else T.TOOLS, FINAL_SCHEMA, cache_key=cache_key,
-                                timeout=max(15.0, min(left, settings.llm_timeout_agent_seconds)))
+        now = time.monotonic()
+        left = deadline - now
+        # each repair round still to come keeps one step of the bound
+        bound = max(1, settings.chat_max_steps - (repairs - attempt))
+        reason = (T.TOOL_BUDGET if ws.budget_spent else STEP_LIMIT if steps >= bound
+                  else TIME_LIMIT if (now >= read_until if attempt == 0 else left < FINAL_STEP_SECONDS) else None)
+        last = reason is not None or attempt == 2
+        if last and attempt == 0:
+            if reason not in limits:
+                limits.append(reason)
+            items.append({"role": "user", "content": LIMIT_NOTICE.format(why=LIMIT_WHY[reason])})
+        elif last and attempt == 1:
+            items.append({"role": "user", "content": REPAIR_LAST})
+        # the same tools in the same order at every step, the last one included: only the choice changes
+        step = agent.agent_step(POLICY, items, T.TOOLS, FINAL_SCHEMA, cache_key=cache_key,
+                                timeout=max(15.0, min(left, settings.llm_timeout_agent_seconds)),
+                                tool_choice="none" if last else None)
         usage.append(usage_entry("agent", step, agent.model))
         if cancelled():
             raise TurnCancelled  # the call that was in flight is discarded
         if not step.ok:
             raise ProviderFailure(step.status.value, step.detail)
+        if step.calls and last:
+            raise ProviderFailure(CallStatus.INVALID.value, "tool call on the last step")
         items.extend(step.output)
         if step.calls:
             for call in step.calls:
@@ -405,6 +461,9 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         # a datum that was not found is said first, at the level the turn actually checked; a sentence that rests on
         # an opened section is judged with the answer, one about the search itself is added after verification
         answer = coverage.state_absence(ws, answer, cited=True)
+        if deadline + VERIFY_ALLOWANCE_SECONDS - time.monotonic() < settings.chat_verify_min_seconds:
+            # an answer that cannot be checked is never shown: the turn fails, saying why
+            raise ProviderFailure("verify_no_time")
         progress("verify", "מאמת את הטענות מול המקורות")
         try:
             # the judge checks each part of the request against the answer and the sentences the server adds
@@ -423,10 +482,11 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         # after the repair round, what is left for the server (a qualifier it writes from the source, a note that
         # the datum is not the one requested) does not justify a rewrite that would drop the datum
         settled = attempt >= 1 and not any(p.removes_unit or p.severity == "partial" for p in report.problems)
-        if report.ok or settled or attempt == 2 or time.monotonic() > deadline - 20:
+        if report.ok or settled or attempt >= repairs or time.monotonic() > deadline - REPAIR_MIN_SECONDS:
             final = coverage.state_absence(ws, report.apply(answer), cited=False)
             # a part of the request the verified answer neither gives nor says is missing is said to be missing
             final, parts = coverage.state_parts(ws, final, report)
+            final = _state_limits(final, limits)
             ledger: dict = {}
             if final.status != "clarification":
                 ledger, final = coverage.build(ws, final, inp.question)
@@ -441,6 +501,17 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         else:
             progress("repair", "מנסח מחדש רק ממה שאומת")
             items.append({"role": "user", "content": REWRITE.format(problems=report.problems_text())})
+
+
+def _state_limits(answer: FinalAnswer, limits: list[str]) -> FinalAnswer:
+    """The verified answer of a turn that reached a limit: a sentence naming each limit after it, and a status of
+    at most ``partial`` — never an answer that looks complete (R30). A clarification asks; it claims nothing."""
+    sentences = [LIMIT_SENTENCES[k] for k in LIMIT_SENTENCES if k in limits]
+    if not sentences or answer.status == "clarification":
+        return answer
+    body = answer.answer_markdown.strip()
+    return answer.model_copy(update={"answer_markdown": (body + "\n\n" if body else "") + " ".join(sentences),
+                                     "status": "partial"})
 
 
 def _announce(progress: Callable[[str, str], None], call) -> None:

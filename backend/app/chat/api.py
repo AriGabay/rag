@@ -57,6 +57,8 @@ FAILURE_TEXT = {
     "unsupported": "ספק המודל שנבחר אינו תומך בשיחה עם כלים.",
     "queued_too_long": "השאלה המתינה זמן רב מדי לעיבוד.",
     "verify_unavailable": "לא ניתן היה לאמת את התשובה מול המקורות.",
+    # the turn's time ran out before its answer could be checked against its sources (KTD12)
+    "verify_no_time": "הזמן שהוקצב לשאלה הסתיים לפני שאפשר היה לאמת את התשובה מול המקורות, ולכן היא לא מוצגת.",
 }
 # the turn's answer drew on a document the user could no longer see when it was ready (AE7)
 PERMISSIONS_CHANGED = "הרשאות המסמכים השתנו בזמן ההכנה; אפשר לשאול שוב."
@@ -293,7 +295,7 @@ def get_message(message_id: str, ctx: TenantContext = Depends(get_ctx)) -> dict:
 
 @router.get("/messages/{message_id}/diagnostics")
 def get_diagnostics(message_id: str, ctx: TenantContext = Depends(get_ctx)) -> dict:
-    """What each verification round removed or repaired, and why. RLS lets the message's owner and an office
+    """What each verification round removed or repaired, and why, and the turn limits it reached. RLS lets the message's owner and an office
     admin read the row; it is shown only while every document behind the answer is visible to the reader."""
     mid = parse_uuid(message_id)
     with tenant_tx(ctx) as conn:
@@ -305,7 +307,8 @@ def get_diagnostics(message_id: str, ctx: TenantContext = Depends(get_ctx)) -> d
             raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
         if row.user_id != ctx.user_id:
             audit(conn, "chat.diagnostics.read", ctx.user_id, "message", mid, owner=str(row.user_id))
-    return {"message_id": str(mid), "rounds": row.rounds, "removed": row.removed, "resolution": row.resolution}
+    return {"message_id": str(mid), "rounds": row.rounds, "removed": row.removed, "resolution": row.resolution,
+            "limits_hit": row.limits_hit or []}
 
 
 @router.post("/conversations/{conversation_id}/messages")
@@ -442,16 +445,17 @@ def _finish(ctx: TenantContext, message_id: UUID, status_: str, *, content: str 
                 if diagnostics is not None:
                     conn.execute(text(
                         "INSERT INTO message_diagnostics (message_id, office_id, user_id, rounds, removed, resolution,"
-                        " document_ids) VALUES (:m, app_office(), :u, CAST(:r AS jsonb), CAST(:x AS jsonb),"
-                        " CAST(:res AS jsonb), :d) ON CONFLICT (message_id) DO UPDATE SET rounds = EXCLUDED.rounds,"
-                        " removed = EXCLUDED.removed, resolution = EXCLUDED.resolution,"
-                        " document_ids = EXCLUDED.document_ids"),
+                        " document_ids, limits_hit) VALUES (:m, app_office(), :u, CAST(:r AS jsonb), CAST(:x AS jsonb),"
+                        " CAST(:res AS jsonb), :d, CAST(:lim AS jsonb)) ON CONFLICT (message_id) DO UPDATE SET"
+                        " rounds = EXCLUDED.rounds, removed = EXCLUDED.removed, resolution = EXCLUDED.resolution,"
+                        " document_ids = EXCLUDED.document_ids, limits_hit = EXCLUDED.limits_hit"),
                         {"m": message_id, "u": ctx.user_id,
                          "r": json.dumps(diagnostics["rounds"], ensure_ascii=False, default=str),
                          "x": json.dumps(diagnostics["removed"], ensure_ascii=False, default=str),
                          "res": json.dumps(res, ensure_ascii=False, default=str)
                          if (res := diagnostics.get("resolution")) else None,
-                         "d": sorted(diagnostics["document_ids"])})
+                         "d": sorted(diagnostics["document_ids"]),
+                         "lim": json.dumps(diagnostics.get("limits_hit") or [])})
                 return status_
             status_, content, answer, error = "cancelled", "", None, "העיבוד נעצר לבקשתך."
         conn.execute(text(
@@ -610,6 +614,8 @@ def _answer_payload(outcome: engine.TurnOutcome) -> dict:
         # counts only; what was removed and why is diagnostics (``_diagnostics``)
         "verification": outcome.report.counts(),
         "searches": ws.searches, "coverage": ws.coverage, "steps": outcome.steps,
+        # the turn limits it reached (tool-output budget, steps, time, visual readings): the answer says so
+        "limits_hit": list(ws.limits_hit),
         "ledger": outcome.ledger or None, "scope_kind": a.scope_kind, "focus": focus, "request": outcome.request,
         # each requested datum with the status the turn's actions support (found, or how it was not found)
         "requested": coverage.validate_requested(ws, a.requested),
@@ -625,7 +631,8 @@ def _diagnostics(outcome: engine.TurnOutcome, payload: dict) -> dict:
     found = {d["document_id"] for d in lookup.get("documents") or []}
     found |= set(((resolution or {}).get("parse") or {}).get("document_ids") or [])
     return {"rounds": outcome.rounds, "removed": [p.as_dict() for p in outcome.report.problems],
-            "resolution": resolution, "document_ids": _answer_documents(payload) | found}
+            "resolution": resolution, "document_ids": _answer_documents(payload) | found,
+            "limits_hit": list(outcome.workspace.limits_hit)}
 
 
 def _limited_answer(ctx: TenantContext, question: str, reason: str) -> dict:

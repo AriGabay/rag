@@ -16,6 +16,12 @@ Documents, sections, tables, continuations and unread regions get turn-local sho
 ``T#``, ``K#``, ``R#``) the server maps to what they name; every handle but ``D#`` is bound to the version and
 the reading it was issued for, and every use resolves the document again under the current permissions (KTD9).
 
+Every result has a bounded size (``chat_read_chars``, ``chat_table_rows``, ``chat_passage_chars``) and every
+output sent to the model counts against the turn's tool-output budget (``chat_tool_output_chars``, KTD12). Once it
+is spent, the reading tools (``READING_TOOLS``) return a header with the call that would read on and no body —
+nothing is read or counted as read — and ``Workspace.limits_hit`` records ``tool_budget``; registering values and
+calculating over what was already read still work.
+
 Tools:
 
 - ``search``: hybrid retrieval (lexical, trigram, semantic) over text, tables, table rows and picture text,
@@ -71,7 +77,6 @@ logger = logging.getLogger(__name__)
 
 SEARCH_LIMIT = 6
 SEARCH_MAX = 12
-PASSAGE_CHARS = 1600
 CONTEXT_CHARS = {"neighbors": 3500, "section": 9000, "table": 14000}
 MEASUREMENTS_MAX = 120  # per page
 LIST_MAX = 60  # per page
@@ -101,6 +106,17 @@ KIND_LABELS = {
 LEVELS = ("located", "retrieved", "read", "verified")
 NOT_REACHED = "not_reached"  # a document of the set the turn never touched
 READ_TO_END = "end"  # a read target read from its beginning to its end (``Workspace.read_progress``)
+TOOL_BUDGET = "tool_budget"  # ``Workspace.limits_hit``: the turn's tool-output budget is spent
+
+
+def read_chars() -> int:
+    """The size of a part of a section, a page range or the paragraphs around a source (KTD12)."""
+    return get_settings().chat_read_chars
+
+
+def table_rows() -> int:
+    """The rows in a part of a table (KTD12)."""
+    return get_settings().chat_table_rows
 
 
 class ToolError(Exception):
@@ -228,10 +244,26 @@ class Workspace:
     reads: dict[tuple, dict] = field(default_factory=dict)
     inspections: int = 0  # vision model calls ``inspect`` made in the turn (capped by ``chat_max_inspections``)
     audited: set = field(default_factory=set)  # documents the turn already wrote a ``source_view`` audit row for
-    limits_hit: list[str] = field(default_factory=list)  # turn limits a tool reached (``inspect_cap``)
+    limits_hit: list[str] = field(default_factory=list)  # turn limits reached (``inspect_cap``, ``tool_budget``...)
+    # characters of tool output the turn may send the model (``chat_tool_output_chars``; None: no budget), and how
+    # many it sent: once they are spent, reading tools return a header and how to read on, never a body
+    tool_budget: int | None = None
+    tool_chars: int = 0
     # the turn's model-call cost records (``usage_entry``), when the turn passes its own: a tool's model call is then
     # logged with the turn's calls; None: the tool's reader logs its call itself
     usage: list[dict] | None = None
+
+    def spend(self, output: str) -> str:
+        """Count a tool output sent to the model against the turn's budget; the output that reaches it is sent
+        whole (each result is bounded by its own size), and the budget is then spent (``TOOL_BUDGET``)."""
+        self.tool_chars += len(output)
+        if self.tool_budget is not None and self.tool_chars >= self.tool_budget and TOOL_BUDGET not in self.limits_hit:
+            self.limits_hit.append(TOOL_BUDGET)
+        return output
+
+    @property
+    def budget_spent(self) -> bool:
+        return TOOL_BUDGET in self.limits_hit
 
     def handle(self, prefix: str, key: tuple, **data) -> str:
         """The turn's short handle for what ``key`` names; the same thing keeps its handle."""
@@ -486,7 +518,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 document_id=h["document_id"], version_id=h["version_id"], title=h["title"], section=h["section"],
                 location=_location(h["section"], h["kind"], h["page_list"], bs, be, paragraphs, media),
                 kind=h["kind"], text=_with_size(sizes.get((h["version_id"], h.get("table_index"))),
-                                                _clip(h["text"], PASSAGE_CHARS)), block_start=bs, block_end=be,
+                                                _clip(h["text"], get_settings().chat_passage_chars)), block_start=bs, block_end=be,
                 table_index=h.get("table_index"), chunk_id=h["chunk_id"], page_list=h["page_list"] or None,
                 partial_document=h["version_id"] in partial, tags=tags), ("chunk", h["chunk_id"])))
             ws.touch(h["document_id"], h["title"], "retrieved", h["version_id"] in partial)
@@ -792,7 +824,7 @@ def _read_window(ws: Workspace, conn: Connection, v: reader.Version, target: tup
         if unread_pages:
             raise ToolError(f"{name}: לא נקראו בעיבוד המסמך (אין בהם טקסט שנקרא)")
         raise ToolError(f"אין קטעים שנשמרו ב{name}" if target[0] == "pages" else "אין קטעים בסעיף הזה")
-    part = reader.take(rows, pos, reader.SECTION_CHARS, set(ws.sent.get(str(vid), {})))
+    part = reader.take(rows, pos, read_chars(), set(ws.sent.get(str(vid), {})))
     pages = sorted({r.page for r, _, _ in part.items if r.page})
     if target[0] == "section":
         location = _location(name, "text", pages, None, None, (None, None), None)
@@ -810,13 +842,14 @@ def _read_window(ws: Workspace, conn: Connection, v: reader.Version, target: tup
 
 
 def _read_table(ws: Workspace, conn: Connection, v: reader.Version, table_index: int, row0: int = 0) -> Source:
-    """``reader.TABLE_ROWS`` rows of a table from ``row0``, each part with the table's caption, size, headers and
+    """``table_rows()`` rows of a table from ``row0``, each part with the table's caption, size, headers and
     notes."""
     st = reader.table_structure(conn, v.version_id, table_index)
     if st is None:
         raise ToolError("הטבלה לא נמצאה")
     rows = st.get("rows") or []
-    window = rows[row0:row0 + reader.TABLE_ROWS]
+    size = table_rows()
+    window = rows[row0:row0 + size]
     nxt = row0 + len(window) if row0 + len(window) < len(rows) else None
     block = reader.table_block(conn, v.version_id, table_index)
     target = ("table", str(v.version_id), table_index)
@@ -825,7 +858,7 @@ def _read_table(ws: Workspace, conn: Connection, v: reader.Version, table_index:
     uncertain = block is not None and block.status == reader.UNCERTAIN
     status = "clipped" if nxt is not None else "uncertain_reading" if uncertain else "complete"
     head = [f"מצב: {STATUS_LABELS[status]}" + (f"; להמשך: read(cursor={more})" if more else "")]
-    if len(rows) > reader.TABLE_ROWS:
+    if len(rows) > size:
         head.append(f"שורות {row0 + 1}–{row0 + len(window)} מתוך {len(rows)}")
     body = _table_text(st, window)
     page = block.page if block is not None else st.get("page")
@@ -861,7 +894,7 @@ def _neighbors(rows: list, start: int, end: int, sent: set) -> tuple[list, bool]
     core = [r for r in rows if start <= r.block_index <= end]
     if not core:
         return [], False
-    budget = reader.SECTION_CHARS - sum(cost(r) for r in core)
+    budget = read_chars() - sum(cost(r) for r in core)
     lo, hi = rows.index(core[0]), rows.index(core[-1])
     grow = True
     while grow:
@@ -905,11 +938,11 @@ def _read_source(ws: Workspace, conn: Connection, sid: str) -> Source:
                            {"c": ref["chunk_id"], "v": v.version_id}).first()
         if row is None:
             raise ToolError(MSG_UNAVAILABLE)
-        clipped = len(row.text) > reader.SECTION_CHARS
+        clipped = len(row.text) > read_chars()
         status = "clipped" if clipped else "complete"
         s = ws.add_source(document_id=v.document_id, version_id=v.version_id, title=v.title, section=row.section,
                           location=_location(row.section, row.kind, row.page_list, None, None, (None, None), None),
-                          kind=row.kind, text=row.text[:reader.SECTION_CHARS], page_list=row.page_list,
+                          kind=row.kind, text=row.text[:read_chars()], page_list=row.page_list,
                           partial_document=v.partial, reading_id=v.reading_id, status=status, clipped=clipped,
                           tags={"document": ws.doc_handle(v.document_id)})
         s.body = "\n".join([f"מצב: {STATUS_LABELS[status]}"] + lines + [s.text])
@@ -2107,7 +2140,42 @@ HANDLERS = {
 }
 
 
+# the tools whose results carry document content: once the turn's tool-output budget is spent they are not run
+READING_TOOLS = frozenset({"search", "read", "outline", "find_documents", "list_documents", "find_measurements",
+                           "inspect"})
+MSG_BUDGET = ("מגבלת היקף הקריאה לשאלה אחת הגיעה לסופה: זה לא נקרא ולא נשלח דבר מתוכו (more — הקריאה שהייתה פותחת "
+              "אותו). אל תציג את התשובה כמלאה. רישום ערכים וחישוב (take_value, assume, calculate) על מה שכבר נקרא "
+              "עדיין אפשריים.")
+
+
+def _call_text(name: str, args: dict) -> str:
+    """A call as the model would write it, with its given arguments only: ``read(section=§3)``."""
+    given = args.get("target") if name in ("read", "inspect") and isinstance(args.get("target"), dict) else args
+    parts = []
+    for k, v in given.items():
+        if v in (None, "", [], {}):
+            continue
+        if isinstance(v, dict):
+            v = "{" + ", ".join(f"{a}={b}" for a, b in v.items() if b not in (None, "")) + "}"
+        elif isinstance(v, list):
+            v = "[" + ", ".join(str(x) for x in v) + "]"
+        parts.append(f"{k}={v}")
+    return f"{name}({', '.join(parts)})"
+
+
+def _withheld(name: str, args: dict) -> str:
+    """What a reading tool returns once the budget is spent: a header and how to read on, no body — nothing is
+    read, registered or counted as read."""
+    return (f'<not_read tool="{name}" status="{TOOL_BUDGET}" more="{_attr(_call_text(name, args))}"/>\n'
+            + MSG_BUDGET)
+
+
 def run_tool(ws: Workspace, name: str, arguments: str) -> str:
+    """Run one tool call and return what is sent to the model, counted against the turn's tool-output budget."""
+    return ws.spend(_run_tool(ws, name, arguments))
+
+
+def _run_tool(ws: Workspace, name: str, arguments: str) -> str:
     handler = HANDLERS.get(name)
     if handler is None:
         return f"כלי לא קיים: {name}"
@@ -2117,6 +2185,8 @@ def run_tool(ws: Workspace, name: str, arguments: str) -> str:
             raise ValueError
     except ValueError:
         return "ארגומנטים לא תקינים (JSON)"
+    if name in READING_TOOLS and ws.budget_spent:
+        return _withheld(name, args)
     try:
         return handler(ws, args)
     except ToolError as e:
