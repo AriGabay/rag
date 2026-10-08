@@ -395,6 +395,18 @@ textarea.input {
   color: #fff;
 }
 
+/* The reading of a document per page (documents screen). */
+.coverage-list {
+  margin: 4px 0 0;
+  padding-inline-start: 18px;
+  max-width: 42ch;
+}
+
+.coverage-list ul {
+  margin: 2px 0 4px;
+  padding-inline-start: 16px;
+}
+
 /* ---------- Tables ---------- */
 
 .table-wrap {

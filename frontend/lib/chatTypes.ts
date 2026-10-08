@@ -183,7 +183,17 @@ export interface SourceBlock {
   status: string;
   note: string | null;
   text: string;
+  /** PDF: the block's box on its page (x0, top, x1, bottom in points), how it was read, and the text as
+   * extracted when `text` is a verified correction of it. */
+  bbox?: [number, number, number, number] | null;
+  method?: string | null;
+  reader_version?: string | null;
+  content_hash?: string | null;
+  original_text?: string | null;
   media_url?: string;
+  /** PDF: the block's page, and its region when it has a box, rendered as an image. */
+  page_url?: string;
+  region_url?: string;
   table?: {
     headers: string[] | null;
     caption: string | null;

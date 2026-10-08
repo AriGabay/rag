@@ -44,6 +44,7 @@ from sqlalchemy import Connection, text
 from app.chat.evidence import TABLE_SIZE_PREFIX
 from app.db import TenantContext, tenant_tx
 from app.measurements.extract import EXTRACTION_VERSION, PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
+from app.platform.documents import reading_notes
 from app.platform.search import SearchScope, search_passages
 
 logger = logging.getLogger(__name__)
@@ -579,18 +580,8 @@ def tool_list_documents(ws: Workspace, query: str | None = None, page: int | Non
                  else "המסמכים שהמשתמש מורשה לראות")
     lines = [f"תחום: {criterion}", _page_line(page, pages, total, "מסמכים")]
     for r in rows:
-        ing = r.ingestion or {}
-        images = ing.get("images") or {}
-        unread = images.get("unread", 0)
-        uncertain = images.get("read_uncertain", 0)
-        status = "נקרא במלואו" if not (unread or r.pages_incomplete) else "נקרא חלקית"
-        details = []
-        if unread:
-            details.append(f"{unread} תמונות לא נקראו")
-        if uncertain:
-            details.append(f"{uncertain} תמונות נקראו בקריאה לא ודאית")
-        if r.pages_incomplete:
-            details.append(f"{r.pages_incomplete} עמודים לא נקראו")
+        partial, details = reading_notes(r.ingestion or {}, r.pages_incomplete)
+        status = "נקרא חלקית" if partial else "נקרא במלואו"
         mstate = {"done": "חולצו", "partial": "חולצו חלקית", "failed": "החילוץ נכשל", "pending": "בתהליך"}.get(
             r.mstate or "", "טרם חולצו")
         lines.append(f'- document_id={r.id} | "{_txt(r.title)}" | עיבוד: {r.status} | קריאה: {status}'

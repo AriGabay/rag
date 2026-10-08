@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import threading
 import zipfile
 from pathlib import PurePath
 from types import SimpleNamespace
@@ -204,10 +205,60 @@ def _version_json(row) -> dict:
     }
 
 
+def coverage_of(ing: dict) -> list[dict]:
+    """The reading report's per-page coverage (``ExtractionResult.coverage``). A report written before coverage
+    was recorded lists its unread pictures, grouped by page, without block or box."""
+    if "coverage" in ing:
+        return ing["coverage"] or []
+    pages: dict = {}
+    for u in ing.get("unread") or []:
+        e = pages.setdefault(u.get("page"), {"page": u.get("page"), "ok": True, "method": None, "corrected": 0,
+                                             "regions": []})
+        e["regions"].append({"block": None, "kind": "image", "status": "unread", "reason": u.get("reason"),
+                             "bbox": None, "section": u.get("section"), "media": u.get("media")})
+    return sorted(pages.values(), key=lambda e: (e["page"] is not None, e["page"] or 0))
+
+
+def _pages_text(pages: list) -> str:
+    shown = sorted({p for p in pages if p is not None})
+    if not shown:
+        return ""
+    listed = ", ".join(str(p) for p in shown[:8]) + (", …" if len(shown) > 8 else "")
+    return f" בעמוד {listed}" if len(shown) == 1 else f" בעמודים {listed}"
+
+
+def reading_notes(ing: dict, pages_incomplete: int | None) -> tuple[bool, list[str]]:
+    """A version's reading in a few Hebrew words for the model: whether it was only partly read, and what was not
+    read, read uncertainly or corrected, with the pages."""
+    coverage = coverage_of(ing)
+    unread = [(e["page"], r) for e in coverage for r in e["regions"] if r["status"] == "unread"]
+    uncertain = [(e["page"], r) for e in coverage for r in e["regions"] if r["status"] == "read_uncertain"]
+    failed = [e["page"] for e in coverage if not e["ok"]]
+    notes = []
+    if unread:
+        notes.append(f"{len(unread)} אזורים לא נקראו" + _pages_text([p for p, _ in unread]))
+    if uncertain:
+        notes.append(f"{len(uncertain)} אזורים נקראו בקריאה לא ודאית" + _pages_text([p for p, _ in uncertain]))
+    if failed or pages_incomplete:
+        notes.append(f"{len(failed) or pages_incomplete} עמודים לא נקראו" + _pages_text(failed))
+    corrected = ing.get("corrected_blocks") or 0
+    if corrected:
+        notes.append(f"טקסט תוקן ממיפוי גופן פגום ב-{corrected} קטעים"
+                     + _pages_text([e["page"] for e in coverage if e["corrected"]]))
+    repeated = len(ing.get("repeated_images") or [])
+    if repeated:
+        notes.append(f"{repeated} תמונות חוזרות נקראו פעם אחת")
+    return bool(ing.get("partial")) or bool(pages_incomplete), notes
+
+
 def _reading(row) -> dict:
     """What was read of a version, kept apart: searchable passages, tables, stored measurements, structured
     records, and pictures by status. ``partial`` when any picture or page was not read: zero structured records
-    is not zero searchable content, and a document is never shown as fully read while parts were not."""
+    is not zero searchable content, and a document is never shown as fully read while parts were not.
+    ``coverage`` names each page with an unread or uncertain region (with its reason) or with corrected text;
+    ``corrected_blocks`` counts the blocks whose text is a verified font-map correction (``corrections`` the
+    accepted mappings), ``uncertain_blocks`` the text left uncertain, and ``repeated_images`` the pictures
+    repeated through the document and read once."""
     ing = getattr(row, "ingestion", None) or {}
     images = ing.get("images") or {}
     return {
@@ -216,6 +267,11 @@ def _reading(row) -> dict:
         "measurements_state": getattr(row, "measurements_state", None),
         "images_total": sum(images.values()), "images": images, "unread": ing.get("unread") or [],
         "partial": bool(ing.get("partial")) or bool(row.pages_incomplete),
+        "coverage": coverage_of(ing),
+        "uncertain_blocks": sum(u.get("blocks", 0) for u in ing.get("uncertain") or []),
+        "corrected_blocks": ing.get("corrected_blocks") or 0,
+        "corrections": len((ing.get("fontmap") or {}).get("corrections") or []),
+        "repeated_images": len(ing.get("repeated_images") or []),
         "ingestion_version": ing.get("ingestion_version"),
     }
 
@@ -330,7 +386,8 @@ _MEDIA_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "
 
 def _version_row(conn: Connection, doc_uuid: UUID, ver_uuid: UUID):
     row = conn.execute(
-        text("SELECT v.id, v.storage_key, v.mime_type, v.filename, v.is_current, d.title FROM document_versions v"
+        text("SELECT v.id, v.storage_key, v.mime_type, v.filename, v.is_current, v.page_count, d.title"
+             " FROM document_versions v"
              " JOIN documents d ON d.id = v.document_id WHERE v.id = :v AND d.id = :d AND d.deleted_at IS NULL"),
         {"v": ver_uuid, "d": doc_uuid},
     ).first()
@@ -371,6 +428,10 @@ def get_blocks(document_id: str, version_id: str, start: int | None = Query(None
                 "rows": [x.get("cells") for x in st.get("rows") or []]}
         if r.media and r.media.rsplit(".", 1)[-1].lower() in _MEDIA_TYPES:
             b["media_url"] = f"/api/documents/{document_id}/versions/{version_id}/media/{quote(r.media)}"
+        if v.mime_type == PDF_MIME and r.page:
+            b["page_url"] = f"/api/documents/{document_id}/versions/{version_id}/pages/{r.page}/image"
+            if r.bbox:
+                b["region_url"] = f"/api/documents/{document_id}/versions/{version_id}/regions/{r.block_index}/image"
         blocks.append(b)
     return {"document_id": document_id, "version_id": version_id, "title": v.title, "is_current": v.is_current,
             "mime_type": v.mime_type, "total": total, "blocks": blocks,
@@ -398,3 +459,92 @@ def get_media(document_id: str, version_id: str, name: str, ctx: TenantContext =
         raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND) from None
     return Response(content=data, media_type=_MEDIA_TYPES[ext],
                     headers={"Cache-Control": "private, max-age=600", "X-Content-Type-Options": "nosniff"})
+
+
+# --- PDF page and region view ------------------------------------------------------------------------------------
+
+PAGE_SCALE = 1.5  # 108 dpi: a whole page to look at
+REGION_SCALE = 3.0  # 216 dpi: a region's cells and numbers stay legible
+RENDER_MAX_SIDE = 2000  # pixels on the long side, whatever the size of the page or region
+REGION_MARGIN = 4.0  # points shown around a region
+# pdfium is not thread-safe and sync endpoints run on a thread pool: one render at a time per process
+_RENDER_LOCK = threading.Lock()
+
+
+def _number(value: str) -> int:
+    """A page number or block index from the path; anything else is not found."""
+    if not (value.isascii() and value.isdigit()) or len(value) > 6:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
+    return int(value)
+
+
+def _render_png(data: bytes, page_no: int, bbox: list[float] | None) -> bytes:
+    """One page of a PDF (``bbox`` None) or a region of it (x0, top, x1, bottom in points from the page's top-left
+    corner, with a small margin), rendered at a fixed scale with the long side capped at ``RENDER_MAX_SIDE``."""
+    import pypdfium2 as pdfium
+
+    with _RENDER_LOCK:
+        try:
+            doc = pdfium.PdfDocument(data)
+        except Exception:  # noqa: BLE001 - a file pdfium cannot open has no page to show
+            raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND) from None
+        try:
+            if not 1 <= page_no <= len(doc):
+                raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
+            page = doc[page_no - 1]
+            try:
+                width, height = page.get_size()
+                if bbox is None:
+                    crop, scale, long_side = (0, 0, 0, 0), PAGE_SCALE, max(width, height)
+                else:
+                    x0, top = max(0.0, bbox[0] - REGION_MARGIN), max(0.0, bbox[1] - REGION_MARGIN)
+                    x1, bottom = min(width, bbox[2] + REGION_MARGIN), min(height, bbox[3] + REGION_MARGIN)
+                    if x1 - x0 < 1 or bottom - top < 1:
+                        raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
+                    # pdfium crops by the amount removed from each side: left, bottom, right, top
+                    crop = (x0, height - bottom, width - x1, top)
+                    scale, long_side = REGION_SCALE, max(x1 - x0, bottom - top)
+                scale = min(scale, RENDER_MAX_SIDE / max(long_side, 1.0))
+                image = page.render(scale=scale, crop=crop).to_pil()
+            finally:
+                page.close()
+        finally:
+            doc.close()
+    out = io.BytesIO()
+    image.save(out, "PNG")
+    return out.getvalue()
+
+
+def _image_response(data: bytes) -> Response:
+    return Response(content=data, media_type="image/png",
+                    headers={"Cache-Control": "private, max-age=600", "X-Content-Type-Options": "nosniff"})
+
+
+@router.get("/{document_id}/versions/{version_id}/pages/{page_no}/image")
+def get_page_image(document_id: str, version_id: str, page_no: str, ctx: TenantContext = Depends(get_ctx)) -> Response:
+    """One page of a PDF version as an image: only a page number within the version's page count."""
+    doc_uuid, ver_uuid = parse_uuid(document_id), parse_uuid(version_id)
+    number = _number(page_no)
+    with tenant_tx(ctx) as conn:
+        v = _version_row(conn, doc_uuid, ver_uuid)
+        if v.mime_type != PDF_MIME or not v.page_count or not 1 <= number <= v.page_count:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
+        audit(conn, "source_view", ctx.user_id, "document_version", ver_uuid, page=number)
+    return _image_response(_render_png(get_storage().get(v.storage_key), number, None))
+
+
+@router.get("/{document_id}/versions/{version_id}/regions/{block_index}/image")
+def get_region_image(document_id: str, version_id: str, block_index: str,
+                     ctx: TenantContext = Depends(get_ctx)) -> Response:
+    """A region of a PDF version as an image: only a block of this version stored with its page and box."""
+    doc_uuid, ver_uuid = parse_uuid(document_id), parse_uuid(version_id)
+    index = _number(block_index)
+    with tenant_tx(ctx) as conn:
+        v = _version_row(conn, doc_uuid, ver_uuid)
+        block = conn.execute(text("SELECT page, bbox FROM document_blocks WHERE version_id = :v AND block_index = :i"),
+                             {"v": ver_uuid, "i": index}).first()
+        if v.mime_type != PDF_MIME or block is None or not block.page or not block.bbox or len(block.bbox) != 4:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
+        audit(conn, "source_view", ctx.user_id, "document_version", ver_uuid, block=index)
+    bbox = [float(x) for x in block.bbox]
+    return _image_response(_render_png(get_storage().get(v.storage_key), block.page, bbox))

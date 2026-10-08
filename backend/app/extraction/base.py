@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 MSG_DEADLINE = "חריגה מזמן העיבוד המותר למסמך"
+COVERAGE_REGIONS_MAX = 40  # regions listed per page in the reading report (the rest are counted)
 
 
 class ExtractionError(Exception):
@@ -134,8 +135,9 @@ class ExtractionResult:
     def components(self) -> dict:
         """What the document holds and what was read: counts per block kind, pictures per status, the pictures
         that were not read and the text whose reading stays uncertain (the document is then only partly read),
-        the font-map record when a font was suspect, and the pictures repeated through the document and read
-        once (``repeated_images``)."""
+        the font-map record when a font was suspect, the pictures repeated through the document and read
+        once (``repeated_images``), what each page left unread, uncertain or corrected (``coverage``), and the
+        number of blocks whose text is a verified correction of the extracted text (``corrected_blocks``)."""
         kinds: dict[str, int] = {}
         images: dict[str, int] = {}
         methods: dict[str, int] = {}
@@ -157,7 +159,45 @@ class ExtractionResult:
             out["fontmap"] = self.fontmap
         if self.repeated:
             out["repeated_images"] = self.repeated
+        coverage = self.coverage
+        if coverage:
+            out["coverage"] = coverage
+        corrected = sum(1 for b in self.blocks if b.original_text is not None)
+        if corrected:
+            out["corrected_blocks"] = corrected
         return out
+
+    @property
+    def coverage(self) -> list[dict]:
+        """Per page, what was not fully read or was corrected: ``{"page", "ok", "method", "corrected", "regions"}``,
+        only for pages with something to report (in page order; DOCX blocks, which have no page, under ``page``
+        None). A region is a block left ``unread``, or ``read_uncertain`` with a reason, located by its block index
+        and box: ``{"block", "kind", "status", "reason", "bbox", "section", "media"}``. A page holds at most
+        ``COVERAGE_REGIONS_MAX`` regions; ``more`` counts the rest. A picture repeated through the document is one
+        block, so it is reported once (``repeated_images``), not on every page."""
+        pages: dict[int | None, dict] = {}
+
+        def entry(page: int | None) -> dict:
+            if page not in pages:
+                p = next((p for p in self.pages if p.page_no == page), None)
+                pages[page] = {"page": page, "ok": p.ok if p else True, "method": p.method if p else None,
+                               "corrected": 0, "regions": []}
+            return pages[page]
+
+        for p in self.pages:
+            if not p.ok:
+                entry(p.page_no)
+        for b in self.blocks:
+            if b.original_text is not None:
+                entry(b.page)["corrected"] += 1
+            if b.status == "unread" or (b.status == "read_uncertain" and b.note):
+                e = entry(b.page)
+                if len(e["regions"]) >= COVERAGE_REGIONS_MAX:
+                    e["more"] = e.get("more", 0) + 1
+                    continue
+                e["regions"].append({"block": b.index, "kind": b.kind, "status": b.status, "reason": b.note,
+                                     "bbox": b.bbox, "section": b.section, "media": b.media})
+        return sorted(pages.values(), key=lambda e: (e["page"] is not None, e["page"] or 0))
 
     @property
     def pages_incomplete(self) -> int:

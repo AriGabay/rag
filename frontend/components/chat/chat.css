@@ -750,6 +750,54 @@ details.msg-details[open] {
   margin: 6px 0;
 }
 
+.source-body .region-marker {
+  display: inline-block;
+  margin: 2px 0 4px;
+  padding: 1px 8px;
+  border: 1px solid var(--chat-border);
+  border-radius: 999px;
+  background: var(--chat-code);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: normal;
+}
+
+.source-body .region-marker[aria-expanded="true"] {
+  outline: 1px solid var(--chat-cite-text, currentColor);
+}
+
+.source-body .region-marker:focus-visible,
+.source-body .original-toggle button:focus-visible {
+  outline: 2px solid var(--chat-cite-text, currentColor);
+  outline-offset: 2px;
+}
+
+.source-body .region-view img[hidden] {
+  display: none;
+}
+
+.source-body .region-note {
+  margin: 4px 0;
+  font-size: 13px;
+  white-space: normal;
+}
+
+.source-body .original-toggle {
+  margin-top: 4px;
+  font-size: 13px;
+  white-space: normal;
+}
+
+.source-body .original-text {
+  margin-top: 4px;
+  padding: 4px 8px;
+  border-inline-start: 3px solid var(--chat-border);
+  white-space: pre-wrap;
+  unicode-bidi: plaintext;
+}
+
 .source-cited {
   background: var(--chat-code);
   border-radius: 8px;

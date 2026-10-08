@@ -48,7 +48,39 @@ export interface VersionReading {
   images: Partial<Record<"read" | "read_uncertain" | "no_text" | "decorative" | "unread", number>>;
   unread: { media: string | null; section: string | null; reason: string | null }[];
   partial: boolean;
+  /** Pages with an unread or uncertain region, an unread page, or corrected text (page null: a DOCX, no pages). */
+  coverage: PageCoverage[];
+  /** Text left uncertain by a font map no verified repair fixed. */
+  uncertain_blocks: number;
+  /** Blocks whose text is a verified font-map correction (the original is kept); `corrections` the mappings. */
+  corrected_blocks: number;
+  corrections: number;
+  /** Pictures repeated through the document (a logo, a stamp), each read once. */
+  repeated_images: number;
   ingestion_version: string | null;
+}
+
+export type RegionStatus = "unread" | "read_uncertain";
+
+/** One region of a page that was not read, or read uncertainly, with its reason. */
+export interface CoverageRegion {
+  block: number | null;
+  kind: "heading" | "paragraph" | "textbox" | "table" | "image";
+  status: RegionStatus;
+  reason: string | null;
+  bbox: [number, number, number, number] | null;
+  section: string | null;
+  media: string | null;
+}
+
+export interface PageCoverage {
+  page: number | null;
+  ok: boolean;
+  method: "text_layer" | "ocr" | "mixed" | "docx" | "failed" | null;
+  corrected: number;
+  regions: CoverageRegion[];
+  /** Regions beyond the ones listed for the page. */
+  more?: number;
 }
 
 export interface DocumentSummary {

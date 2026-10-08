@@ -8,7 +8,16 @@ import { UploadPanel, UploadResults } from "@/components/UploadPanel";
 import { api, errorMessage, fileUrl } from "@/lib/api";
 import { useApi, useInterval } from "@/lib/useApi";
 import { formatTimestamp, VERSION_STATUS_LABEL } from "@/lib/format";
-import type { DocumentDetail, DocumentSummary, SearchResult, UploadResult, Version } from "@/lib/types";
+import type {
+  CoverageRegion,
+  DocumentDetail,
+  DocumentSummary,
+  PageCoverage,
+  RegionStatus,
+  SearchResult,
+  UploadResult,
+  Version,
+} from "@/lib/types";
 
 const POLL_MS = 3000;
 
@@ -44,8 +53,84 @@ const MEASURE_STATE: Record<string, string> = {
   pending: "בתהליך",
 };
 
+const REGION_KIND: Record<CoverageRegion["kind"], string> = {
+  image: "תמונה",
+  table: "טבלה",
+  paragraph: "פסקה",
+  heading: "כותרת",
+  textbox: "תיבת טקסט",
+};
+const REGION_STATUS: Record<RegionStatus, string> = {
+  unread: "לא נקרא",
+  read_uncertain: "נקרא בקריאה לא ודאית",
+};
+
+/** One page's line in the reading details: its unread or uncertain regions with their reasons, a page that was not
+ * read, and text that was corrected. */
+function PageCoverageItem({ p }: { p: PageCoverage }) {
+  return (
+    <li>
+      <strong>{p.page != null ? <>עמוד <B>{p.page}</B></> : "במסמך (ללא עמודים)"}</strong>
+      {!p.ok && <span> · העמוד לא נקרא</span>}
+      {p.corrected > 0 && (
+        <span>
+          {" "}
+          · טקסט תוקן (<B>{p.corrected}</B>)
+        </span>
+      )}
+      {p.regions.length > 0 && (
+        <ul>
+          {p.regions.map((g, i) => (
+            <li key={g.block ?? `r${i}`}>
+              {REGION_KIND[g.kind] ?? g.kind} – {REGION_STATUS[g.status] ?? g.status}
+              {g.section && (
+                <span className="muted">
+                  {" "}
+                  (סעיף <bdi>{g.section}</bdi>)
+                </span>
+              )}
+              : <bdi>{g.reason || "לא נרשמה סיבה"}</bdi>
+            </li>
+          ))}
+        </ul>
+      )}
+      {p.more ? (
+        <div className="muted">
+          ועוד <B>{p.more}</B> אזורים בעמוד זה
+        </div>
+      ) : null}
+    </li>
+  );
+}
+
+/** The reading per page, opened on demand with a button (keyboard-operable, its state announced). */
+function ReadingDetails({ coverage }: { coverage: PageCoverage[] }) {
+  const [open, setOpen] = useState(false);
+  const listId = useId();
+  if (coverage.length === 0) return null;
+  return (
+    <div>
+      <button
+        type="button"
+        className="btn-link"
+        aria-expanded={open}
+        aria-controls={listId}
+        onClick={() => setOpen((o) => !o)}
+      >
+        פירוט לפי עמוד
+      </button>
+      <ul id={listId} className="coverage-list" aria-label="פירוט הקריאה לפי עמוד" hidden={!open}>
+        {coverage.map((p) => (
+          <PageCoverageItem key={p.page ?? "document"} p={p} />
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 /** What was read: searchable passages and tables, pictures by status, measurements and structured records — each
- * counted on its own, so zero structured records never reads as "nothing searchable". */
+ * counted on its own, so zero structured records never reads as "nothing searchable". A partly read version lists,
+ * per page, what was not read and why. */
 function ReadingCell({ v }: { v: Version | null }) {
   const r = v?.reading;
   if (!v || !r || v.status === "pending" || v.status === "processing") return <span className="muted">—</span>;
@@ -56,15 +141,19 @@ function ReadingCell({ v }: { v: Version | null }) {
     img.unread ? `${img.unread} לא נקראו` : null,
     img.no_text ? `${img.no_text} ללא טקסט (תצלומים, תשריטים)` : null,
   ].filter(Boolean);
+  const corrected = r.corrected_blocks ?? 0;
   return (
     <div className="small">
-      <div>
+      <div className="row" style={{ gap: 4 }}>
         {r.partial ? (
-          <span className="badge badge-warn" title={r.unread.map((u) => `${u.media ?? ""}: ${u.reason ?? ""}`).join("\n")}>
-            נקרא חלקית
-          </span>
+          <span className="badge badge-warn">נקרא חלקית</span>
         ) : (
           <span className="badge badge-ok">נקרא במלואו</span>
+        )}
+        {corrected > 0 && (
+          <span className="badge badge-info">
+            טקסט תוקן (<B>{corrected}</B>)
+          </span>
         )}
       </div>
       <div>
@@ -75,6 +164,17 @@ function ReadingCell({ v }: { v: Version | null }) {
           תמונות ({r.images_total}): {details.join(", ")}
         </div>
       )}
+      {(r.uncertain_blocks ?? 0) > 0 && (
+        <div className="muted">
+          <B>{r.uncertain_blocks}</B> קטעי טקסט בקריאה לא ודאית (מיפוי גופן פגום)
+        </div>
+      )}
+      {(r.repeated_images ?? 0) > 0 && (
+        <div className="muted">
+          <B>{r.repeated_images}</B> תמונות חוזרות (לוגו, חותמת) נקראו פעם אחת
+        </div>
+      )}
+      <ReadingDetails coverage={r.coverage ?? []} />
     </div>
   );
 }

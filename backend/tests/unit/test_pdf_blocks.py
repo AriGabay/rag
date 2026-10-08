@@ -226,8 +226,15 @@ def test_docx_output_is_unchanged(name, monkeypatch):
     monkeypatch.setattr(docx, "read_picture", lambda *a: PictureReading("unread", "none", note="stub"))
     r = docx.extract_docx((FIXTURES / name).read_bytes(), time.monotonic() + 600, get_settings())
     assert all(b.bbox is None and b.method is None and b.original_text is None for b in r.blocks)
+    # the per-page coverage report (U6) was added to the components after the digests were taken; it only
+    # restates the blocks' statuses, and a DOCX has no pages, so its regions are listed under page None
+    components = dict(r.components)
+    coverage = components.pop("coverage", [])
+    assert all(e["page"] is None for e in coverage)
+    assert sum(len(e["regions"]) for e in coverage) == sum(
+        1 for b in r.blocks if b.status == "unread" or (b.status == "read_uncertain" and b.note))
     out = {"blocks": [{k: getattr(b, k) for k in _BLOCK_FIELDS} for b in r.blocks],
            "chunks": [dataclasses.asdict(c) for c in r.chunks], "tables": [dataclasses.asdict(t) for t in r.tables],
-           "pages": [dataclasses.asdict(x) for x in r.pages], "components": r.components, "warnings": r.warnings}
+           "pages": [dataclasses.asdict(x) for x in r.pages], "components": components, "warnings": r.warnings}
     digest = hashlib.sha256(json.dumps(out, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     assert digest == _DOCX_DIGESTS[name]
