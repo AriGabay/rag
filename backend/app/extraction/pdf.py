@@ -19,8 +19,20 @@ legible scale) or reported ``unread`` with its reason, so a document with unread
 becomes an ``image`` block at its place with its region and content hash; a table read from it becomes a table
 (source ``ocr`` or ``vision``) whose rows keep the page, with the text above it as caption and the note lines
 below it as notes. A region the text layer already holds (a searchable scan) becomes no block, and a page whose
-regions added text is ``mixed``. Validation errors (encrypted, corrupt, too many pages, deadline) raise
-``ExtractionError`` with a Hebrew reason. Document text is content only: nothing in it changes processing (R29).
+regions added text is ``mixed``.
+
+A font whose character map is broken (the page shows the right Hebrew letter, the text layer another character)
+is found and repaired per document by ``app.extraction.fontmap`` (KTD6): the words of every page are collected
+while the pages are read, the suspect ``font × character`` pairs are verified against OCR of their rendered glyphs,
+and only the pages holding a suspect character are read again from a corrected text layer. Corrected text is the
+text of record (blocks, tables, pages, chunks); a block whose text changed keeps the text as extracted in
+``original_text``, and the corrections go to the ingestion report. A corruption no verified repair fixed leaves
+the text as extracted: its blocks are ``read_uncertain`` with the reason, the page quality is scored down, and the
+document is partly read. Such a page keeps its text layer rather than falling back to whole-page OCR: its letters
+are otherwise readable, and the OCR of its glyphs is what did not agree.
+
+Validation errors (encrypted, corrupt, too many pages, deadline) raise ``ExtractionError`` with a Hebrew reason.
+Document text is content only: nothing in it changes processing (R29).
 """
 
 from __future__ import annotations
@@ -36,7 +48,7 @@ import pdfplumber
 import pypdfium2 as pdfium
 
 from app.config import Settings
-from app.extraction import ocr
+from app.extraction import fontmap, ocr
 from app.extraction.base import (
     Block,
     ExtractionError,
@@ -47,6 +59,7 @@ from app.extraction.base import (
     check_deadline,
 )
 from app.extraction.chunking import chunk_blocks, heading_label, is_footer
+from app.extraction.fontmap import FontMapConfig, FontMapFix, WordSample
 from app.extraction.hebrew import (
     QUALITY_THRESHOLD,
     document_is_visual,
@@ -61,7 +74,7 @@ from app.extraction.tables import RawTable, assemble_tables, logical_row, units_
 log = logging.getLogger(__name__)
 
 # The reader that produced a PDF's blocks; a version read by an older one is reprocessed.
-READER_VERSION = "pdf-blocks-v2"
+READER_VERSION = "pdf-blocks-v3"
 
 MSG_ENCRYPTED = "הקובץ מוגן בסיסמה ולא ניתן לעבד אותו"
 MSG_CORRUPT = "הקובץ פגום או שאינו PDF תקין"
@@ -70,6 +83,7 @@ WARN_NO_OCR = "זיהוי טקסט (OCR) אינו זמין בשרת; עמודי�
 WARN_PLUMBER = "שכבת הטקסט של הקובץ לא נקראה; כל העמודים עברו זיהוי טקסט (OCR)"
 WARN_PAGE_FAILED = "עמוד {page}: לא ניתן היה לחלץ טקסט באיכות מספקת"
 WARN_PICTURES = "{n} תמונות לא נקראו"
+WARN_FONTMAP = "{n} קטעי טקסט נקראו עם תווים שגויים שלא ניתן היה לתקן (מיפוי גופן פגום)"
 NOTE_NOT_READ = "התמונה עדיין לא נקראה"
 
 DEDUPE_TOLERANCE = 1.0  # points: a glyph repeated closer than this (same font and size) is one glyph
@@ -90,6 +104,10 @@ class _Line:
     size: float = 0.0
     bold: bool = False
     in_table: bool = False
+    original: str | None = None  # the text as extracted, when a font-map correction changed it
+    uncertain: str | None = None  # why its text is uncertain (a font-map corruption left unrepaired)
+    raw: str = ""  # a corrected line's raw text and chars, to restore its original after a reorientation
+    fm_chars: list[dict] | None = None
 
     @property
     def bbox(self) -> list[float] | None:
@@ -109,6 +127,21 @@ class _PageOut:
     raw_texts: list[str] = field(default_factory=list)
     width: float = 0.0  # page size in points
     height: float = 0.0
+    words: list[WordSample] = field(default_factory=list)  # the text layer's words with their fonts (font maps)
+    corruption: float = 0.0  # share of the page's Hebrew words with an unrepaired font-map corruption
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _TextLayer:
+    lines: list[_Line] = field(default_factory=list)
+    tables: list[tuple[list[float], list[list[str]], str | None]] = field(default_factory=list)  # + uncertain
+    visual: bool | None = None
+    raw_texts: list[str] = field(default_factory=list)
+    pictures: list[Region] = field(default_factory=list)
+    chars: list[tuple[float, float, float, float]] = field(default_factory=list)
+    words: list[WordSample] = field(default_factory=list)
+    corruption: float = 0.0
 
 
 def open_pdf(data: bytes, max_pages: int) -> pdfium.PdfDocument:
@@ -177,37 +210,55 @@ def _picture_hash(img: dict) -> str | None:
         return None
 
 
-def _text_layer(page) -> tuple[list[_Line], list[tuple[list[float], list[list[str]]]], bool | None, list[str],
-                                list[Region], list[tuple[float, float, float, float]]]:
+def _uncertain_in(chars: list[dict], bbox) -> str | None:
+    """Why text inside ``bbox`` is uncertain: the reason of an unrepaired font-map char there, or None."""
+    x0, top, x1, bottom = bbox
+    return next((c["fontmap_uncertain"] for c in chars if c.get("fontmap_uncertain")
+                 and x0 <= (c["x0"] + c["x1"]) / 2 <= x1 and top <= (c["top"] + c["bottom"]) / 2 <= bottom), None)
+
+
+def _text_layer(page, index: int, fix: FontMapFix | None = None) -> _TextLayer:
+    """The page's text layer. Without ``fix`` it also collects the page's words for font-map detection; with it
+    the page is read from its corrected text layer (``FontMapFix.correct_page``)."""
     page = page.dedupe_chars(tolerance=DEDUPE_TOLERANCE)
+    out = _TextLayer()
+    if fix is None:
+        out.words = fontmap.words_of_page(page, index)
+    else:
+        corrected = fix.correct_page(page)
+        page, out.corruption = corrected.page, corrected.corruption
     raw_lines = _rejoin(page.extract_text_lines(return_chars=True))
-    raw_texts = [ln["text"] for ln in raw_lines]
-    visual = page_is_visual(raw_texts)
+    out.raw_texts = raw_texts = [ln["text"] for ln in raw_lines]
+    out.visual = visual = page_is_visual(raw_texts)
     fixed = fix_text_lines(raw_texts, default_visual=visual)
-    lines = []
     for ln, t in zip(raw_lines, fixed, strict=True):
         chars = ln.get("chars") or []
         bold = sum(1 for c in chars if _BOLD.search(c.get("fontname") or "")) * 2 > len(chars) if chars else False
-        lines.append(_Line(float(ln["top"]), t, float(ln["bottom"]), float(ln["x0"]), float(ln["x1"]),
-                           _line_size(ln), bold))
-    tables = []
+        line = _Line(float(ln["top"]), t, float(ln["bottom"]), float(ln["x0"]), float(ln["x1"]), _line_size(ln),
+                     bold)
+        if fix is not None:
+            line.uncertain = fix.uncertain_reason(chars)
+            line.original = fix.original_line(ln["text"], t, chars)
+            if line.original is not None:
+                line.raw, line.fm_chars = ln["text"], chars
+        out.lines.append(line)
     for t in page.find_tables():
         grid = t.extract()
         if not grid or max(len(r) for r in grid) < 2:
             continue
         # pdfplumber returns columns left -> right: reverse to logical order, fix each cell's text.
         rows = [logical_row(r, visual_default=True if visual is None else visual) for r in grid]
-        tables.append(([round(float(x), 1) for x in t.bbox], rows))
-    pictures = []
+        reason = _uncertain_in(page.chars, t.bbox) if fix is not None else None
+        out.tables.append(([round(float(x), 1) for x in t.bbox], rows, reason))
     for img in page.images:
         bbox = [round(float(img[k]), 1) for k in ("x0", "top", "x1", "bottom")]
         digest = _picture_hash(img)
         if digest and bbox[2] > bbox[0] and bbox[3] > bbox[1]:
             size = img.get("srcsize")
             srcsize = (int(size[0]), int(size[1])) if size and size[0] and size[1] else None
-            pictures.append(Region(page.page_number, bbox, "image", digest, srcsize))
-    chars = [(float(c["x0"]), float(c["top"]), float(c["x1"]), float(c["bottom"])) for c in page.chars]
-    return lines, tables, visual, raw_texts, pictures, chars
+            out.pictures.append(Region(page.page_number, bbox, "image", digest, srcsize))
+    out.chars = [(float(c["x0"]), float(c["top"]), float(c["x1"]), float(c["bottom"])) for c in page.chars]
+    return out
 
 
 def _mark_table_lines(lines: list[_Line], tables: list[RawTable]) -> None:
@@ -234,51 +285,51 @@ def _ocr_page(doc, index: int, settings: Settings) -> tuple[list[_Line], list[tu
     return lines, [(t.top, t.rows) for t in result.tables]
 
 
-def _process_page(doc, plumber, index: int, settings: Settings, warnings: list[str]) -> _PageOut:
+def _process_page(doc, plumber, index: int, settings: Settings, warnings: list[str],
+                  fix: FontMapFix | None = None) -> _PageOut:
     page_no = index + 1
-    lines: list[_Line] = []
-    tables: list[tuple[list[float], list[list[str]]]] = []
-    pictures: list[Region] = []
-    chars: list[tuple[float, float, float, float]] = []
-    visual: bool | None = None
-    raw_texts: list[str] = []
+    layer = _TextLayer()
     if plumber is not None:
         page = plumber.pages[index]
         try:
-            lines, tables, visual, raw_texts, pictures, chars = _text_layer(page)
+            layer = _text_layer(page, index, fix)
         except Exception:  # noqa: BLE001 - a broken page falls through to OCR
             log.warning("text layer failed on page %s", page_no, exc_info=True)
-            lines, tables, raw_texts, pictures, chars = [], [], [], [], []
+            layer = _TextLayer()
         finally:
             page.close()
+    lines = layer.lines
     text = "\n".join(ln.text for ln in lines)
-    quality = quality_score(text)
-    if quality >= QUALITY_THRESHOLD:
-        raws = [RawTable(page_no, rows, ocr=False, top=bbox[1], bbox=bbox) for bbox, rows in tables]
+    quality = quality_score(text, corruption=layer.corruption)
+    # an unrepaired font-map corruption scores the page down but keeps its text layer (its blocks are uncertain)
+    if (quality_score(text) if layer.corruption else quality) >= QUALITY_THRESHOLD:
+        raws = [RawTable(page_no, rows, ocr=False, top=bbox[1], bbox=bbox, uncertain=reason)
+                for bbox, rows, reason in layer.tables]
         _mark_table_lines(lines, raws)
-        return _PageOut(PageResult(page_no, text, "text_layer", quality, True), lines, raws, pictures, chars,
-                        raw_texts if visual is None else None, raw_texts)
+        return _PageOut(PageResult(page_no, text, "text_layer", quality, True), lines, raws, layer.pictures,
+                        layer.chars, layer.raw_texts if layer.visual is None else None, layer.raw_texts,
+                        words=layer.words, corruption=layer.corruption)
 
     if not ocr.ocr_available(settings.ocr_languages):
         if WARN_NO_OCR not in warnings:
             warnings.append(WARN_NO_OCR)
-        return _PageOut(PageResult(page_no, text, "failed", quality, False), [], [])
+        return _PageOut(PageResult(page_no, text, "failed", quality, False), [], [], words=layer.words)
 
     try:
         ocr_lines, ocr_tables = _ocr_page(doc, index, settings)
     except RuntimeError:  # pytesseract raises RuntimeError on its per-call timeout
         log.warning("OCR timed out on page %s", page_no)
         warnings.append(WARN_PAGE_FAILED.format(page=page_no))
-        return _PageOut(PageResult(page_no, text, "failed", quality, False), [], [])
+        return _PageOut(PageResult(page_no, text, "failed", quality, False), [], [], words=layer.words)
     ocr_text = "\n".join(ln.text for ln in ocr_lines)
     ocr_quality = quality_score(ocr_text)
     if ocr_quality >= QUALITY_THRESHOLD:
         return _PageOut(PageResult(page_no, ocr_text, "ocr", ocr_quality, True), ocr_lines,
-                        [RawTable(page_no, rows, ocr=True, top=top) for top, rows in ocr_tables])
+                        [RawTable(page_no, rows, ocr=True, top=top) for top, rows in ocr_tables], words=layer.words)
     # Still bad: the page is incomplete; garbled text never counts as decoded and is not indexed.
     warnings.append(WARN_PAGE_FAILED.format(page=page_no))
     best_text, best_q = (ocr_text, ocr_quality) if ocr_quality >= quality else (text, quality)
-    return _PageOut(PageResult(page_no, best_text, "failed", best_q, False), [], [])
+    return _PageOut(PageResult(page_no, best_text, "failed", best_q, False), [], [], words=layer.words)
 
 
 def _orient_undecided_pages(outs: list[_PageOut]) -> None:
@@ -292,8 +343,10 @@ def _orient_undecided_pages(outs: list[_PageOut]) -> None:
             continue
         for ln, t in zip(o.lines, fix_text_lines(o.raw_undecided, default_visual=visual), strict=True):
             ln.text = t
+            if ln.fm_chars is not None:
+                ln.original = FontMapFix.original_line(ln.raw, t, ln.fm_chars)
         o.page.text = "\n".join(ln.text for ln in o.lines)
-        o.page.quality = quality_score(o.page.text)
+        o.page.quality = quality_score(o.page.text, corruption=o.corruption)
 
 
 # --- blocks ----------------------------------------------------------------------------------------------------
@@ -310,6 +363,7 @@ class _Walker:
     path: list[str] = field(default_factory=list)
     labels: list[str] = field(default_factory=list)
     last_text: str = ""
+    uncertain: list[Block] = field(default_factory=list)  # blocks left uncertain by an unrepaired font map
 
     def add(self, kind: str, text: str, page: int, bbox: list[float] | None, method: str, **kw) -> Block:
         b = Block(index=len(self.blocks), kind=kind, text=text, section=self.path[-1] if self.path else None,
@@ -317,6 +371,27 @@ class _Walker:
                   **kw)
         self.blocks.append(b)
         return b
+
+    def add_text(self, kind: str, lines: list[_Line], page: int, bbox: list[float] | None, method: str,
+                 **kw) -> Block:
+        """A heading or paragraph from its lines: the corrected text, the text as extracted when a font-map
+        correction changed it, and ``read_uncertain`` with the reason when a corruption stays unrepaired."""
+        text = "\n".join(ln.text.strip() for ln in lines)
+        original = "\n".join((ln.original if ln.original is not None else ln.text).strip() for ln in lines)
+        reason = next((ln.uncertain for ln in lines if ln.uncertain), None)
+        if original != text:
+            kw["original_text"] = original
+        if reason:
+            kw |= {"status": "read_uncertain", "note": reason}
+        b = self.add(kind, text, page, bbox, method, source="ocr" if method == "ocr" else "text", **kw)
+        if reason:
+            self.uncertain.append(b)
+        return b
+
+    def mark_uncertain(self, b: Block, reason: str) -> None:
+        b.status, b.note = "read_uncertain", b.note or reason
+        if all(b is not u for u in self.uncertain):
+            self.uncertain.append(b)
 
     def heading_depth(self, text: str) -> tuple[int, str] | None:
         """(depth, label) when the line opens a section: any top-level numbered heading, a sub-section only
@@ -348,12 +423,10 @@ class _Walker:
         def flush() -> None:
             nonlocal para
             if para:
-                text = "\n".join(ln.text.strip() for ln in para)
                 boxes = [ln.bbox for ln in para if ln.bbox]
                 bbox = [min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes),
                         max(b[3] for b in boxes)] if boxes else None
-                self.add("paragraph", text, page_no, bbox, method, source="ocr" if method == "ocr" else "text")
-                self.last_text = text
+                self.last_text = self.add_text("paragraph", para, page_no, bbox, method).text
             para = []
 
         for _, _, item in items:
@@ -362,6 +435,8 @@ class _Walker:
                 item.section = self.path[-1] if self.path else None
                 b = self.add("table", "", page_no, item.bbox, method, source="ocr" if item.ocr else "text",
                              status="read_uncertain" if item.ocr else "read")
+                if item.uncertain:
+                    self.mark_uncertain(b, item.uncertain)
                 self.table_raw[b.index] = item
                 self.captions[id(item)] = _caption(self.last_text)
                 self.raws.append(item)
@@ -396,8 +471,7 @@ class _Walker:
                 flush()
                 depth, label = found
                 self.path, self.labels = self.path[: depth - 1] + [text], self.labels[: depth - 1] + [label]
-                self.add("heading", text, page_no, ln.bbox, method, label=label,
-                         source="ocr" if method == "ocr" else "text")
+                self.add_text("heading", [ln], page_no, ln.bbox, method, label=label)
                 self.last_text = text
                 continue
             if para and _breaks(para[-1], ln, para):
@@ -429,6 +503,8 @@ class _Walker:
                 b = kept[renumber[old]]
                 b.table_index, t.block_index = t.index, b.index
                 t.caption = self.captions.get(id(raw)) or None
+            elif raw.uncertain and t.block_index is not None:  # a continuation's uncertainty is its table's
+                self.mark_uncertain(kept[t.block_index], raw.uncertain)
         for t in tables:
             if t.block_index is not None:
                 kept[t.block_index].text = render_table(t)
@@ -448,7 +524,18 @@ class _Walker:
                     b.table_index = t.index
                 texts.append("\n".join(x for x in [*t.title, render_table(t)] if x))
             b.text = "\n".join(x for x in texts if x)
+        kept_ids = {id(b) for b in kept}
+        self.uncertain = [b for b in self.uncertain if id(b) in kept_ids]
         return kept, tables
+
+
+def _uncertain_report(blocks: list[Block]) -> list[dict]:
+    """The text left uncertain by unrepaired font maps, per page and reason: {"page", "blocks", "reason"}."""
+    out: dict[tuple, dict] = {}
+    for b in blocks:
+        entry = out.setdefault((b.page, b.note), {"page": b.page, "blocks": 0, "reason": b.note})
+        entry["blocks"] += 1
+    return list(out.values())
 
 
 def _caption(text: str) -> str:
@@ -505,6 +592,16 @@ def _merge_region_text(out: _PageOut) -> None:
     out.page.method = "mixed"
 
 
+def _read_page(doc, plumber, index: int, settings: Settings, fix: FontMapFix | None = None) -> _PageOut:
+    warnings: list[str] = []
+    out = _process_page(doc, plumber, index, settings, warnings, fix)
+    out.warnings = warnings
+    pdf_page = doc[index]
+    out.width, out.height = pdf_page.get_size()
+    pdf_page.close()
+    return out
+
+
 def extract_pdf(data: bytes, deadline: float, settings: Settings, vision: VisionReader | None = None,
                 readings: ReadingCache | None = None) -> ExtractionResult:
     """``vision``: the office's vision reader (None: OCR only). ``readings``: the office's earlier readings of
@@ -521,14 +618,22 @@ def extract_pdf(data: bytes, deadline: float, settings: Settings, vision: Vision
             outs: list[_PageOut] = []
             for index in range(len(doc)):
                 check_deadline(deadline)
-                out = _process_page(doc, plumber, index, settings, warnings)
-                pdf_page = doc[index]
-                out.width, out.height = pdf_page.get_size()
-                pdf_page.close()
-                outs.append(out)
+                outs.append(_read_page(doc, plumber, index, settings))
+            # broken font maps: detected over the whole document, verified against the glyphs; only the pages
+            # holding a suspect character are read again, from their corrected text layer
+            fix = fontmap.detect_and_repair([w for o in outs for w in o.words], doc,
+                                            FontMapConfig.from_settings(settings))
+            for index in sorted(fix.pages):
+                check_deadline(deadline)
+                outs[index] = _read_page(doc, plumber, index, settings, fix)
         finally:
             if plumber is not None:
                 plumber.close()
+        for o in outs:
+            o.words = []
+            for w in o.warnings:
+                if w not in warnings:
+                    warnings.append(w)
         page_count = len(doc)
         _orient_undecided_pages(outs)
         read_regions(doc, data, _layers(outs), settings, vision, readings, deadline)
@@ -545,9 +650,13 @@ def extract_pdf(data: bytes, deadline: float, settings: Settings, vision: Vision
     blocks, tables = walker.finish()
     pages = [o.page for o in outs]
     chunks = chunk_blocks(blocks, tables)
+    report = fix.report()
     result = ExtractionResult(page_count=page_count, pages=pages, tables=tables, chunks=chunks, warnings=warnings,
-                              blocks=blocks)
+                              blocks=blocks, uncertain=_uncertain_report(walker.uncertain),
+                              fontmap=report if any(report.values()) else None)
     unread = result.components["unread"]
     if unread:
         warnings.append(WARN_PICTURES.format(n=len(unread)))
+    if walker.uncertain:
+        warnings.append(WARN_FONTMAP.format(n=len(walker.uncertain)))
     return result

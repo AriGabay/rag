@@ -286,3 +286,99 @@ def test_english_document_needs_no_reader_and_changes_nothing():
     reader = CleanTwinReader(CLEAN)
     fix = fontmap.detect_and_repair(_words(ENGLISH), config=FontMapConfig(), reader=reader)
     assert reader.calls == 0 and not fix.corrections and not fix.unresolved and fix.pages == set()
+
+
+# --- the PDF reader: corrected blocks, the original kept, uncertainty and the ingestion report ------------------
+
+_TOKEN = re.compile(r"[\d%₪/.,:]+|[A-Za-z]+")
+
+
+def _extract(path: Path, monkeypatch=None, reader: CleanTwinReader | None = None, ocr: bool | None = None):
+    """``extract_pdf`` on a fixture; ``reader`` stands in for OCR of the word crops, ``ocr=False`` makes Tesseract
+    unavailable everywhere."""
+    import time
+
+    from app.config import get_settings
+    from app.extraction.pdf import extract_pdf
+
+    if monkeypatch is not None and ocr is False:
+        monkeypatch.setattr("app.extraction.ocr.ocr_available", lambda languages: False)
+    if monkeypatch is not None and reader is not None:
+        real = fontmap.detect_and_repair
+        monkeypatch.setattr(fontmap, "detect_and_repair",
+                            lambda words, pdf_doc=None, config=None, reader_=None: real(words, pdf_doc, config, reader))
+    return extract_pdf(path.read_bytes(), time.monotonic() + 600, get_settings())
+
+
+def _text_blocks(result):
+    return [b for b in result.blocks if b.kind in ("heading", "paragraph")]
+
+
+def test_extract_pdf_reads_a_repaired_document_like_its_intact_twin(monkeypatch):
+    unrepaired = _extract(BROKEN, monkeypatch, ocr=False)
+    monkeypatch.undo()
+    reader = CleanTwinReader(CLEAN)
+    result = _extract(BROKEN, monkeypatch, reader=reader)
+    clean = _extract(CLEAN)
+    assert [(b.kind, b.text, b.page) for b in result.blocks] == [(b.kind, b.text, b.page) for b in clean.blocks]
+    assert [c.text for c in result.chunks] == [c.text for c in clean.chunks]
+    assert [p.text for p in result.pages] == [p.text for p in clean.pages]
+    assert result.pages[0].method == "text_layer" and result.pages[0].quality == clean.pages[0].quality
+    assert any("הנכס נמצא בשכונה שקטה" in c.text for c in result.chunks)  # the text of record for search
+    changed = 0
+    for before, after in zip(_text_blocks(unrepaired), _text_blocks(result), strict=True):
+        assert _TOKEN.findall(before.text) == _TOKEN.findall(after.text)  # digits, %, ₪, '/', Latin untouched
+        assert after.original_text == (before.text if before.text != after.text else None)
+        assert after.status == "read" and after.note is None
+        changed += before.text != after.text
+    assert changed > 5
+    comp = result.components
+    assert comp["partial"] is False and "uncertain" not in comp
+    record = {(c["font"], c["from"], c["to"]) for c in comp["fontmap"]["corrections"]}
+    assert record == {(BOOK, ETH, "נ"), (BOLD, ETH, "ר")}
+    assert comp["fontmap"]["unresolved"] == []
+    assert all(c["samples"] >= 3 and c["agreement"] == 1.0 for c in comp["fontmap"]["corrections"])
+
+
+def test_extract_pdf_marks_an_unverifiable_map_uncertain_and_the_document_partly_read(monkeypatch):
+    plain = _extract(INCONSISTENT, monkeypatch, ocr=False)
+    monkeypatch.undo()
+    result = _extract(INCONSISTENT, monkeypatch, reader=CleanTwinReader(CLEAN))
+    assert [b.text for b in result.blocks] == [b.text for b in plain.blocks]  # nothing changed without evidence
+    page = result.pages[0]
+    assert page.ok and page.method == "text_layer" and page.quality < 0.8  # kept, but scored down
+    for b in _text_blocks(result):
+        assert b.original_text is None
+        if ETH in b.text:
+            assert b.status == "read_uncertain" and b.note == fontmap.REASON_INCONSISTENT
+        else:
+            assert b.status == "read" and b.note is None
+    comp = result.components
+    assert comp["partial"] is True
+    n = sum(1 for b in result.blocks if b.status == "read_uncertain")
+    assert comp["uncertain"] == [{"page": 1, "blocks": n, "reason": fontmap.REASON_INCONSISTENT}]
+    assert comp["fontmap"]["corrections"] == []
+    assert [(u["font"], u["char"], u["reason"]) for u in comp["fontmap"]["unresolved"]] == [
+        (BOOK, ETH, fontmap.REASON_INCONSISTENT)]
+    assert result.warnings
+
+
+def test_extract_pdf_without_ocr_keeps_the_broken_text_uncertain_instead_of_failing_the_page(monkeypatch):
+    result = _extract(BROKEN, monkeypatch, ocr=False)
+    page = result.pages[0]
+    assert page.ok and page.method == "text_layer"
+    assert any(b.status == "read_uncertain" and b.note == fontmap.REASON_NO_OCR for b in result.blocks)
+    assert all(b.original_text is None for b in result.blocks)
+    assert result.components["partial"] is True
+    assert {u["reason"] for u in result.components["fontmap"]["unresolved"]} == {fontmap.REASON_NO_OCR}
+
+
+def test_extract_pdf_leaves_english_with_eth_and_clean_hebrew_unchanged(monkeypatch):
+    reader = CleanTwinReader(CLEAN)
+    for path in (ENGLISH, CLEAN):
+        result = _extract(path, monkeypatch, reader=reader)
+        assert all(b.status == "read" and b.original_text is None for b in result.blocks)
+        comp = result.components
+        assert comp["partial"] is False and "fontmap" not in comp and "uncertain" not in comp
+    assert reader.calls == 0
+    assert "Garðabær" in "\n".join(b.text for b in _extract(ENGLISH).blocks)

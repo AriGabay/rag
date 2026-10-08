@@ -121,11 +121,17 @@ class ExtractionResult:
     is_docx: bool = False
     warnings: list[str] = field(default_factory=list)
     blocks: list[Block] = field(default_factory=list)
+    # PDF font maps (``fontmap.FontMapFix.report``): suspect fonts, accepted corrections, unresolved pairs; None
+    # when no font was suspect. ``uncertain``: text kept with a corruption no verified repair fixed, per page and
+    # reason ({"page", "blocks", "reason"}); the document is then only partly read.
+    fontmap: dict | None = None
+    uncertain: list[dict] = field(default_factory=list)
 
     @property
     def components(self) -> dict:
-        """What the document holds and what was read: counts per block kind, pictures per status, and the
-        pictures that were not read (the document is then only partly indexed)."""
+        """What the document holds and what was read: counts per block kind, pictures per status, the pictures
+        that were not read and the text whose reading stays uncertain (the document is then only partly read),
+        and the font-map record when a font was suspect."""
         kinds: dict[str, int] = {}
         images: dict[str, int] = {}
         methods: dict[str, int] = {}
@@ -138,8 +144,14 @@ class ExtractionResult:
                 if b.status == "unread":
                     entry = {"media": b.media, "section": b.section, "reason": b.note}
                     unread.append(entry if b.page is None else entry | {"page": b.page})
-        return {"blocks": kinds, "images": images, "image_methods": methods, "unread": unread,
-                "tables": len(self.tables), "partial": bool(unread) or self.pages_incomplete > 0}
+        out = {"blocks": kinds, "images": images, "image_methods": methods, "unread": unread,
+               "tables": len(self.tables),
+               "partial": bool(unread) or bool(self.uncertain) or self.pages_incomplete > 0}
+        if self.uncertain:
+            out["uncertain"] = self.uncertain
+        if self.fontmap:
+            out["fontmap"] = self.fontmap
+        return out
 
     @property
     def pages_incomplete(self) -> int:

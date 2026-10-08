@@ -92,6 +92,7 @@ class RawTable:
     bbox: list[float] | None = None
     table_index: int | None = None
     continues: bool = False
+    uncertain: str | None = None  # why some of its text is uncertain (an unrepaired font map)
 
 
 def _width(t: TableResult) -> int:
