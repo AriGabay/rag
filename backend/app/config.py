@@ -130,6 +130,7 @@ class Settings(BaseSettings):
     chat_turn_seconds: int = 150
     chat_workers: int = 6
     chat_run_inline: bool = False  # tests: run a turn inside the request instead of a background thread
+    chat_max_inspections: int = 3  # visual readings (``inspect``) one turn may make with the vision model
     llm_timeout_agent_seconds: float = 60
     llm_timeout_measure_seconds: float = 90
 

@@ -9,6 +9,10 @@ A call that returns no reading raises ``VisionCallFailed`` with the provider's s
 transient failure (timeout, rate limit, network), a configuration error (key, quota, model) and a deterministic
 one (refusal, invalid or truncated output) apart. ``config`` (model and effort) is part of the key a reading is
 cached by. A PDF region is sent without context: its reading depends on its pixels alone.
+
+The answering model's ``inspect`` tool reads a region or a page through ``transcribe``: one call, no careful retry
+(the model may inspect again), the outcome as a ``PictureReading``. A reader given a ``usage`` list records each
+call's cost record there instead, and the turn that made the call logs it with its own calls.
 """
 
 from __future__ import annotations
@@ -20,10 +24,21 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
-from app.extraction.images import VisionCallFailed, VisionOut, VisionTableOut
-from app.providers.llm import CallStatus, Purpose, get_provider, prompt_text
+from app.extraction.images import (
+    PictureReading,
+    VisionCallFailed,
+    VisionOut,
+    VisionReader,
+    VisionTableOut,
+    _from_vision,
+)
+from app.providers.llm import CallStatus, Purpose, get_provider, prompt_text, usage_entry
 
 logger = logging.getLogger(__name__)
+
+# The reader of ``inspect``: its render scales (``app.chat.tools``) and this module's prompt. A stored reading made
+# by an older one is not reused.
+INSPECT_READER_VERSION = "inspect-v1"
 
 VISION_INSTRUCTIONS = (
     "אתה מתמלל תמונות מתוך מסמכי שמאות מקרקעין בעברית. תמלל רק את מה שכתוב בתמונה, מילה במילה, בלי לפרש, "
@@ -75,6 +90,7 @@ class ModelVisionReader:
         self.provider = get_provider(Purpose.VISION)
         model = getattr(self.provider, "model", None) or getattr(self.provider, "name", type(self.provider).__name__)
         self.config = f"{model}:{getattr(self.provider, 'reasoning_effort', None) or 'default'}"
+        self.usage: list[dict] | None = None  # the turn's cost records, when a turn reads through it
 
     def read(self, png: bytes, context: str, careful: bool = False) -> VisionOut:
         if not hasattr(self.provider, "structured_image"):
@@ -102,6 +118,10 @@ class ModelVisionReader:
 
     def _log(self, result) -> None:
         from app.answering.content import log_usage
+
+        if self.usage is not None:  # the turn logs its calls when it ends: logged here too, it would count twice
+            self.usage.append(usage_entry(Purpose.VISION.value, result, getattr(self.provider, "model", None)))
+            return
         from app.db import system_ctx, tenant_tx
 
         try:
@@ -109,6 +129,31 @@ class ModelVisionReader:
                 log_usage(conn, self.provider, Purpose.VISION.value, result, result.ok)
         except Exception:  # noqa: BLE001 - usage logging never fails a reading
             logger.warning("vision usage log failed")
+
+
+def transcribe(reader: VisionReader, png: bytes) -> PictureReading:
+    """One reading of a rendered region or page, without context: ``read`` (with a transcription),
+    ``read_uncertain`` or ``no_text``. A failed call raises ``VisionCallFailed``."""
+    out = reader.read(png, "")
+    if out is None:
+        raise VisionCallFailed(CallStatus.UNSUPPORTED.value)
+    return _from_vision(out, [])
+
+
+def reading_text(reading: PictureReading) -> str:
+    """A reading as text a model and a verifier read: its text, then each table with its title, headers (one
+    line), rows (one line each, cells separated by `` | ``) and notes; a picture without text is its
+    description."""
+    lines = [reading.text] if reading.text else []
+    for t in reading.tables:
+        lines += [x for x in t.title if x]
+        if any(t.headers):
+            lines.append(" | ".join(t.headers))
+        lines += [" | ".join(r) for r in t.rows]
+        lines += [n for n in t.notes if n]
+    if not lines and reading.note:
+        lines.append(reading.note)
+    return "\n".join(lines)
 
 
 def aligned_row(headers: list[str], row: _Row) -> list[str]:

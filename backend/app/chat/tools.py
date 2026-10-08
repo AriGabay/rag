@@ -29,6 +29,10 @@ Tools:
   in its title or text — the scope of a question about a set of documents, paged, with the total;
 - ``list_documents``: visible documents with their reading status (fully read, partial: what was not read), paged;
 - ``outline``: a document's sections and tables as openable handles, with their sizes and unread regions;
+- ``inspect``: a visual reading of a region (``R#``) or a page of a PDF that ingestion did not read (or read
+  uncertainly without text): rendered at a legible scale and read once by the vision model, stored per version,
+  reading and region (``region_readings``) for later turns, capped per turn (``chat_max_inspections``); a region or
+  page ingestion did read returns that reading without a model call;
 - ``find_measurements``: stored measurements with their meaning (kind, unit, period, area basis, VAT, role,
   subject), grouped by what can be compared, with the coverage of the documents in scope, paged;
 - ``take_value``: a value of a source the turn read, verified by the server — the cell at a named row and column
@@ -42,6 +46,7 @@ Tools:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import math
@@ -56,6 +61,7 @@ from sqlalchemy import Connection, text
 from app.answering.verify import numbers_in
 from app.chat import calc, meaning, reader
 from app.chat.evidence import TABLE_SIZE_PREFIX
+from app.config import get_settings
 from app.db import TenantContext, tenant_tx
 from app.measurements.extract import EXTRACTION_VERSION, PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
 from app.platform.documents import reading_notes
@@ -137,6 +143,7 @@ class Source:
     body: str | None = None
     tags: dict = field(default_factory=dict)  # handles shown on the source's tag: {"document": "D1", "table": "T2"}
     table_part: bool = False  # some rows of a table read in parts, not all of them
+    method: str | None = None  # how its text was read when not from the text layer (``vision`` for an inspection)
 
     @property
     def is_listing(self) -> bool:
@@ -149,7 +156,7 @@ class Source:
                "text": self.text, "block_start": self.block_start, "block_end": self.block_end,
                "table_index": self.table_index, "page_list": self.page_list, "reading_id": self.reading_id,
                "status": self.status, "clipped": self.clipped, "unread_regions": len(self.unread_regions),
-               "more": self.resume}
+               "more": self.resume, "method": self.method}
         if self.is_listing:
             out["listed_document_ids"] = list(self.listed)
         return out
@@ -219,6 +226,12 @@ class Workspace:
     # contiguously from its beginning (``READ_TO_END`` at its end), "unread": a region of it was not read,
     # "document_id"}
     reads: dict[tuple, dict] = field(default_factory=dict)
+    inspections: int = 0  # vision model calls ``inspect`` made in the turn (capped by ``chat_max_inspections``)
+    audited: set = field(default_factory=set)  # documents the turn already wrote a ``source_view`` audit row for
+    limits_hit: list[str] = field(default_factory=list)  # turn limits a tool reached (``inspect_cap``)
+    # the turn's model-call cost records (``usage_entry``), when the turn passes its own: a tool's model call is then
+    # logged with the turn's calls; None: the tool's reader logs its call itself
+    usage: list[dict] | None = None
 
     def handle(self, prefix: str, key: tuple, **data) -> str:
         """The turn's short handle for what ``key`` names; the same thing keeps its handle."""
@@ -1140,6 +1153,227 @@ def tool_outline(ws: Workspace, document: str) -> str:
     return "\n".join(out)
 
 
+# --- inspect: a visual reading of a region or a page (KTD9) -------------------------------------------------------
+
+MSG_INSPECT_TARGET = "יש לבחור region=R# (אזור שסומן בקריאה), או document (D#) ו-page — לא את שניהם"
+MSG_INSPECT_UNKNOWN = "מזהה לא מוכר: {value}. נדרש R# של אזור שסומן בתוצאת read בתור הזה."
+MSG_INSPECT_NOT_PDF = "קריאה חזותית אפשרית רק לעמוד או לאזור של מסמך PDF"
+MSG_INSPECT_NO_CLOUD = ("קריאה חזותית אינה זמינה במשרד הזה: המשרד אינו מאפשר שליחת תוכן מסמכים למודל בענן, ולכן "
+                        "{what} לא נקרא. אם התשובה תלויה בו — ציין שהוא לא נקרא.")
+MSG_INSPECT_CAP = ("מגבלה: בתור הזה כבר נעשו {n} קריאות חזותיות, המספר המרבי לתור. {what} לא נקרא. אם התשובה תלויה "
+                   "בו — ציין שהוא לא נקרא בשל מגבלת הקריאות החזותיות.")
+MSG_INSPECT_FAILED = "הקריאה החזותית של {what} נכשלה ({status}); הוא נשאר לא נקרא. אפשר לציין שהוא לא נקרא."
+MSG_INSPECT_RENDER = "לא ניתן היה להציג את {what} כתמונה; הוא נשאר לא נקרא."
+INSPECT_LIMIT = "inspect_cap"
+
+
+def inspect_reader(ctx: TenantContext):
+    """The office's vision reader for ``inspect``: only when the office allows its document content to reach the
+    cloud model (the same consent as ingestion's visual reading); None otherwise."""
+    from app.platform.pipeline import vision_reader
+
+    return vision_reader(ctx)
+
+
+@dataclass
+class _Spot:
+    """What an inspection reads: a block's region (``block`` with a box) or a whole page."""
+
+    v: reader.Version
+    region: str  # the stored key: block:<index> | page:<number>
+    page: int
+    bbox: list[float] | None
+    what: str  # how it is named to the model
+    block: Any = None
+    handle: str | None = None  # the R# it was asked by
+
+
+def _audit_view(ws: Workspace, conn: Connection, v: reader.Version, region: str) -> None:
+    """One ``source_view`` audit row per turn and document, whatever the turn inspects in it."""
+    from app.audit import audit
+
+    if str(v.document_id) not in ws.audited:
+        audit(conn, "source_view", ws.ctx.user_id, "document_version", v.version_id, tool="inspect", region=region)
+        ws.audited.add(str(v.document_id))
+
+
+def _inspected(ws: Workspace, spot: _Spot, key: tuple, *, text_: str, body: list[str], kind: str, status: str,
+               method: str | None, location: str, table_index: int | None = None) -> Source:
+    v = spot.v
+    tags = {"document": ws.doc_handle(v.document_id)} | ({"region": spot.handle} if spot.handle else {})
+    index = spot.block.block_index if spot.block is not None else None
+    s = ws.add_source(document_id=v.document_id, version_id=v.version_id, title=v.title,
+                      section=getattr(spot.block, "section", None), location=location, kind=kind, text=text_,
+                      block_start=index, block_end=index, table_index=table_index,
+                      page_list=[spot.page] if spot.page else None,
+                      partial_document=v.partial, reading_id=v.reading_id, status=status, clipped=False, more=None,
+                      body="\n".join(body + [text_]), tags=tags, method=method)
+    first = ws.returned.get(key)
+    if first is not None:
+        s.same_as = first
+    else:
+        ws.returned[key] = s.sid
+    ws.touch(v.document_id, v.title, "retrieved", v.partial)
+    return s
+
+
+def _stored_region(ws: Workspace, conn: Connection, spot: _Spot) -> Source:
+    """A region ingestion read (with or without certainty): its stored reading, no model call."""
+    r = spot.block
+    st = reader.table_structure(conn, spot.v.version_id, r.table_index) if r.table_index is not None else None
+    uncertain = r.status == reader.UNCERTAIN
+    status = "uncertain_reading" if uncertain else "complete"
+    head = [f"מצב: {STATUS_LABELS[status]}; {spot.what} נקרא בעיבוד המסמך ({r.method or 'לא ידוע'}): זו הקריאה "
+            "השמורה, בלי קריאה חזותית נוספת"]
+    if uncertain and r.note:
+        head.append(f"קריאה לא ודאית: {r.note}")
+    return _inspected(ws, spot, ("inspect", str(spot.v.version_id), spot.region),
+                      text_=_table_text(st, st.get("rows") or []) if st else (r.text or ""), body=head,
+                      kind="table" if st else "image", status=status, method=r.method,
+                      location=_location(r.section, "table" if st else "image", [spot.page] if spot.page else None,
+                                         None, None,
+                                         (None, None), r.media),
+                      table_index=r.table_index if st else None)
+
+
+def _spot(ws: Workspace, conn: Connection, target: dict) -> tuple[_Spot, bool]:
+    """What the target names, under the current permissions, and whether ingestion read it (its stored reading
+    is then the answer)."""
+    region = str(target.get("region") or "").strip()
+    document, page = target.get("document"), target.get("page")
+    if bool(region) == bool(document or page is not None) or (not region and (not document or page is None)):
+        raise ToolError(MSG_INSPECT_TARGET)
+    if region:
+        data = ws.handles.get(region)
+        if data is None or data["kind"] != "R":
+            raise ToolError(MSG_INSPECT_UNKNOWN.format(value=region))
+        v = _bound(conn, ws, region, data)
+        rows = reader.blocks_between(conn, v.version_id, data["block_index"], data["block_index"], limit=1)
+        if not rows:
+            raise ToolError(MSG_STALE_HANDLE.format(handle=region))
+        r = rows[0]
+        read_at_ingestion = r.status in ("read", reader.UNCERTAIN) and bool((r.text or "").strip())
+        if not read_at_ingestion and (not v.is_pdf or not r.page):
+            raise ToolError(MSG_INSPECT_NOT_PDF)
+        bbox = [float(x) for x in r.bbox] if r.bbox and len(r.bbox) == 4 else None
+        if bbox is None and not read_at_ingestion:  # a region without a box: its whole page is read
+            return _Spot(v, f"page:{r.page}", r.page, None, f"עמוד {r.page}", None, region), False
+        return _Spot(v, f"block:{r.block_index}", r.page or 0, bbox, f"האזור {region}", r, region), read_at_ingestion
+    v = _document(conn, ws, document)
+    if not v.is_pdf:
+        raise ToolError(MSG_INSPECT_NOT_PDF)
+    try:
+        page = int(page)
+    except (TypeError, ValueError):
+        raise ToolError("מספר עמוד לא תקין") from None
+    if page < 1 or (v.page_count and page > v.page_count):
+        raise ToolError(f"מספר עמוד לא תקין: למסמך יש {v.page_count} עמודים" if v.page_count else "מספר עמוד לא תקין")
+    rows = reader.blocks_on_pages(conn, v.version_id, page, page)
+    read_at_ingestion = (not reader.unread_pages(conn, v.version_id, page, page)
+                         and any((r.text or "").strip() for r in rows)
+                         and not any(r.status == reader.UNREAD or (r.status == reader.UNCERTAIN
+                                                                   and not (r.text or "").strip()) for r in rows))
+    return _Spot(v, f"page:{page}", page, None, f"עמוד {page}"), read_at_ingestion
+
+
+def _cached(conn: Connection, spot: _Spot, config: str):
+    from app.extraction.images import PictureReading, PictureTable
+    from app.extraction.vision import INSPECT_READER_VERSION
+
+    row = conn.execute(text(
+        "SELECT reading FROM region_readings WHERE version_id = :v AND reading_id = :r AND region = :g"
+        " AND reader_version = :rv AND model_config = :m"),
+        {"v": spot.v.version_id, "r": spot.v.reading_id or "", "g": spot.region, "rv": INSPECT_READER_VERSION,
+         "m": config}).first()
+    if row is None:
+        return None
+    data = dict(row.reading)
+    data["tables"] = [PictureTable(**t) for t in data.get("tables") or []]
+    return PictureReading(**data)
+
+
+def _visual(ws: Workspace, spot: _Spot, reading, earlier: bool) -> Source:
+    """A visual reading as the turn's source: always ``uncertain_reading`` (a model's transcription, not the
+    document's own text), citable, at its page and region, with nothing more to read."""
+    from app.extraction.vision import reading_text
+
+    head = [f"מצב: {STATUS_LABELS['uncertain_reading']}; קריאה חזותית של {spot.what} (תמלול של מודל מתמונת העמוד, "
+            "לא טקסט המסמך עצמו)" + ("; נקראה כבר בתור קודם, בלי קריאה נוספת" if earlier else "")]
+    if reading.status == "read_uncertain" and reading.note:
+        head.append(f"קריאה לא ודאית: {reading.note}")
+    if reading.status == "no_text":
+        head.append("אין בו טקסט קריא" + (f": {reading.note}" if reading.note else ""))
+    where = f"עמוד {spot.page}, " + ("אזור בעמוד" if spot.bbox is not None else "העמוד כולו") + " (קריאה חזותית)"
+    return _inspected(ws, spot, ("inspect", str(spot.v.version_id), spot.region), text_=reading_text(reading),
+                      body=head, kind="image", status="uncertain_reading", method="vision", location=where)
+
+
+def tool_inspect(ws: Workspace, target: dict) -> str:
+    """A visual reading of a region (``R#``) or a page. Permission is resolved again on every call, a stored
+    reading included; a reading ingestion made is returned as it is; otherwise the stored visual reading of the
+    same version, reading, region, reader and model, or one new model call (capped per turn)."""
+    from app.extraction import regions
+    from app.extraction.images import VISION_MAX_SIDE, VisionCallFailed
+    from app.extraction.render import RenderError, render_png
+    from app.extraction.vision import INSPECT_READER_VERSION, transcribe
+    from app.platform.storage import get_storage
+
+    if not isinstance(target, dict):
+        raise ToolError(MSG_INSPECT_TARGET)
+    with tenant_tx(ws.ctx) as conn:
+        spot, read_at_ingestion = _spot(ws, conn, target)
+        if read_at_ingestion:
+            if spot.block is not None:
+                s = _stored_region(ws, conn, spot)
+            else:  # the page through the same reader as ``read``
+                s = _read_window(ws, conn, spot.v, ("pages", str(spot.v.version_id), spot.page, spot.page), None)
+                s.body = (f"{spot.what} נקרא בעיבוד המסמך: זו הקריאה השמורה שלו, בלי קריאה חזותית\n" + s.body)
+            _audit_view(ws, conn, spot.v, spot.region)
+            return _render_source(s)
+        vision = inspect_reader(ws.ctx)
+        if vision is None:
+            raise ToolError(MSG_INSPECT_NO_CLOUD.format(what=spot.what))
+        config = regions.model_config(vision)
+        cached = _cached(conn, spot, config)
+        if cached is not None:
+            _audit_view(ws, conn, spot.v, spot.region)
+            return _render_source(_visual(ws, spot, cached, earlier=True))
+        cap = get_settings().chat_max_inspections
+        if ws.inspections >= cap:
+            if INSPECT_LIMIT not in ws.limits_hit:
+                ws.limits_hit.append(INSPECT_LIMIT)
+            return MSG_INSPECT_CAP.format(n=cap, what=spot.what)
+        ws.inspections += 1
+    # rendered and read outside any transaction: a model call never holds one open
+    try:
+        png = render_png(get_storage().get(spot.v.storage_key), spot.page, spot.bbox,
+                         scale=regions.READ_DPI / 72, max_side=VISION_MAX_SIDE)
+    except RenderError:
+        raise ToolError(MSG_INSPECT_RENDER.format(what=spot.what)) from None
+    if hasattr(vision, "usage"):
+        vision.usage = ws.usage
+    try:
+        reading = transcribe(vision, png)
+    except VisionCallFailed as exc:
+        raise ToolError(MSG_INSPECT_FAILED.format(what=spot.what, status=exc.status)) from None
+    with tenant_tx(ws.ctx) as conn:
+        v = reader.version(conn, spot.v.version_id)  # access may have changed while the model read
+        if v is None:
+            raise ToolError(MSG_UNAVAILABLE)
+        if v.reading_id != spot.v.reading_id:
+            raise ToolError(MSG_STALE_HANDLE.format(handle=spot.handle or spot.what))
+        conn.execute(text(
+            "INSERT INTO region_readings (office_id, document_id, version_id, reading_id, region, reader_version,"
+            " model_config, page, bbox, status, reading, created_by) VALUES (app_office(), :d, :v, :r, :g, :rv, :m,"
+            " :p, CAST(:b AS jsonb), :s, CAST(:x AS jsonb), :u) ON CONFLICT DO NOTHING"),
+            {"d": v.document_id, "v": v.version_id, "r": v.reading_id or "", "g": spot.region,
+             "rv": INSPECT_READER_VERSION, "m": config, "p": spot.page, "b": json.dumps(spot.bbox),
+             "s": reading.status, "x": json.dumps(dataclasses.asdict(reading), ensure_ascii=False),
+             "u": ws.ctx.user_id})
+        _audit_view(ws, conn, v, spot.region)
+    return _render_source(_visual(ws, spot, reading, earlier=False))
+
+
 # --- measurements and computation ----------------------------------------------------------------------------
 
 def _compat_key(r) -> tuple:
@@ -1844,6 +2078,17 @@ TOOLS = [
          "justification": {"type": ["string", "null"],
                            "description": "רק כשהחישוב מערבב מע\"מ, בסיס שטח או נושא: למה זה תקף; אחרת null"}},
         ["expression", "label", "justification"]),
+    _fn("inspect",
+        "קריאה חזותית של אזור או עמוד במסמך PDF שהטקסט שלו חסר או לא ודאי: region — R# מסימון [אזור שלא נקרא R#] "
+        "או [קריאה לא ודאית R#] בתוצאת read; או document (D#) ו-page — עמוד שלם (השאר null). מחזיר מקור S# עם "
+        "תמלול (status uncertain_reading: תמלול של מודל, לא טקסט המסמך) שאפשר לצטט. אזור שנקרא בעיבוד המסמך מוחזר "
+        "כפי שנקרא. מספר הקריאות החזותיות בתור מוגבל: השתמש רק כשהתשובה תלויה בתוכן שלא נקרא.",
+        {"target": {"type": "object", "additionalProperties": False, "required": ["region", "document", "page"],
+                    "properties": {
+                        "region": {"type": ["string", "null"], "description": "R# מתוצאת read בתור הזה"},
+                        "document": {"type": ["string", "null"], "description": "D# או document_id (עם page)"},
+                        "page": {"type": ["integer", "null"], "description": "מספר העמוד (מ-1), עם document"}}}},
+        ["target"]),
 ]
 
 HANDLERS = {
@@ -1858,6 +2103,7 @@ HANDLERS = {
     "take_value": lambda ws, a: tool_take_value(ws, a["source"], a.get("locator"), a.get("meaning"), a.get("label") or ""),
     "assume": lambda ws, a: tool_assume(ws, a["value"], a["quote"], a.get("label") or ""),
     "calculate": lambda ws, a: tool_calculate(ws, a["expression"], a.get("label") or "", a.get("justification")),
+    "inspect": lambda ws, a: tool_inspect(ws, a["target"]),
 }
 
 

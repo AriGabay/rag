@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import threading
 import zipfile
 from pathlib import PurePath
 from types import SimpleNamespace
@@ -19,6 +18,13 @@ from app.chat import reader
 from app.config import get_settings
 from app.db import TenantContext, bump_data_version, tenant_tx
 from app.deps import FORBIDDEN, NOT_FOUND, get_ctx, parse_uuid
+from app.extraction.render import (  # noqa: F401 - the view's scales
+    PAGE_SCALE,
+    REGION_SCALE,
+    RENDER_MAX_SIDE,
+    RenderError,
+    render_png,
+)
 from app.platform.jobs import enqueue_processing
 from app.platform.storage import get_storage, storage_key
 
@@ -464,14 +470,6 @@ def get_media(document_id: str, version_id: str, name: str, ctx: TenantContext =
 
 # --- PDF page and region view ------------------------------------------------------------------------------------
 
-PAGE_SCALE = 1.5  # 108 dpi: a whole page to look at
-REGION_SCALE = 3.0  # 216 dpi: a region's cells and numbers stay legible
-RENDER_MAX_SIDE = 2000  # pixels on the long side, whatever the size of the page or region
-REGION_MARGIN = 4.0  # points shown around a region
-# pdfium is not thread-safe and sync endpoints run on a thread pool: one render at a time per process
-_RENDER_LOCK = threading.Lock()
-
-
 def _number(value: str) -> int:
     """A page number or block index from the path; anything else is not found."""
     if not (value.isascii() and value.isdigit()) or len(value) > 6:
@@ -480,40 +478,12 @@ def _number(value: str) -> int:
 
 
 def _render_png(data: bytes, page_no: int, bbox: list[float] | None) -> bytes:
-    """One page of a PDF (``bbox`` None) or a region of it (x0, top, x1, bottom in points from the page's top-left
-    corner, with a small margin), rendered at a fixed scale with the long side capped at ``RENDER_MAX_SIDE``."""
-    import pypdfium2 as pdfium
-
-    with _RENDER_LOCK:
-        try:
-            doc = pdfium.PdfDocument(data)
-        except Exception:  # noqa: BLE001 - a file pdfium cannot open has no page to show
-            raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND) from None
-        try:
-            if not 1 <= page_no <= len(doc):
-                raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
-            page = doc[page_no - 1]
-            try:
-                width, height = page.get_size()
-                if bbox is None:
-                    crop, scale, long_side = (0, 0, 0, 0), PAGE_SCALE, max(width, height)
-                else:
-                    x0, top = max(0.0, bbox[0] - REGION_MARGIN), max(0.0, bbox[1] - REGION_MARGIN)
-                    x1, bottom = min(width, bbox[2] + REGION_MARGIN), min(height, bbox[3] + REGION_MARGIN)
-                    if x1 - x0 < 1 or bottom - top < 1:
-                        raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
-                    # pdfium crops by the amount removed from each side: left, bottom, right, top
-                    crop = (x0, height - bottom, width - x1, top)
-                    scale, long_side = REGION_SCALE, max(x1 - x0, bottom - top)
-                scale = min(scale, RENDER_MAX_SIDE / max(long_side, 1.0))
-                image = page.render(scale=scale, crop=crop).to_pil()
-            finally:
-                page.close()
-        finally:
-            doc.close()
-    out = io.BytesIO()
-    image.save(out, "PNG")
-    return out.getvalue()
+    """One page of a PDF (``bbox`` None) or a region of it at the view's fixed scale (``app.extraction.render``);
+    a page or region that cannot be rendered is not found."""
+    try:
+        return render_png(data, page_no, bbox)
+    except RenderError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND) from None
 
 
 def _image_response(data: bytes) -> Response:

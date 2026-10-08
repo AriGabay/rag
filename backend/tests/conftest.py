@@ -30,7 +30,7 @@ _TABLES = (
     "transactions, provider_usage, audit_events, jobs, chunks, extracted_tables, pages, document_versions, "
     "documents, sessions, user_groups, document_groups, users, office_data_versions, office_settings, offices, "
     "attribute_definitions, facts, fact_extraction_ledger, messages, document_blocks, measurements, measurement_runs, "
-    "image_readings"
+    "image_readings, region_readings"
 )
 
 
