@@ -235,8 +235,16 @@ def test_docx_output_is_unchanged(name, monkeypatch):
     assert all(e["page"] is None for e in coverage)
     assert sum(len(e["regions"]) for e in coverage) == sum(
         1 for b in r.blocks if b.status == "unread" or (b.status == "read_uncertain" and b.note))
+    # positions (round 6) were added after the digests were taken; a DOCX has no page geometry, spans or cell boxes
+    assert all(b.spans is None for b in r.blocks)
+    tables = [dataclasses.asdict(t) for t in r.tables]
+    for t in tables:
+        assert t.pop("header_boxes") is None
+        assert all(row.pop("cell_boxes") is None for row in t["rows"])
+    pages = [dataclasses.asdict(x) for x in r.pages]
+    assert all(p.pop("geometry") is None and p.pop("printed_label") is None for p in pages)
     out = {"blocks": [{k: getattr(b, k) for k in _BLOCK_FIELDS} for b in r.blocks],
-           "chunks": [dataclasses.asdict(c) for c in r.chunks], "tables": [dataclasses.asdict(t) for t in r.tables],
-           "pages": [dataclasses.asdict(x) for x in r.pages], "components": components, "warnings": r.warnings}
+           "chunks": [dataclasses.asdict(c) for c in r.chunks], "tables": tables,
+           "pages": pages, "components": components, "warnings": r.warnings}
     digest = hashlib.sha256(json.dumps(out, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     assert digest == _DOCX_DIGESTS[name]

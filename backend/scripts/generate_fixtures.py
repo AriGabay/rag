@@ -1171,7 +1171,8 @@ def make_pdf_class():
                 return
             self.set_y(-12)
             self.set_font("DejaVu", "", 8)
-            text = f"{SYNTHETIC_MARKER} | עמוד {self.page_no()}"
+            # a printed page number may differ from the file page (a report bound after its cover pages)
+            text = f"{SYNTHETIC_MARKER} | עמוד {self.page_no() + getattr(self, 'page_label_offset', 0)}"
             if self.visual:
                 text = to_visual(text)
             self.cell(0, 6, text, align="C")
@@ -3954,6 +3955,105 @@ def write_blocks(out: Path, font_dir: Path) -> None:
     print(f"wrote {BLOCKS_DIR}/B2_synthetic_pictures.pdf ({len(data):,} bytes)")
 
 
+# --------------------------------------------------------------------------- positions (positions/)
+
+POSITIONS_DIR = "positions"
+# An invented valuation line: Hebrew around numbers, the sentence the position tests locate on every page variant.
+POSITIONS_SENTENCE = "שטח הדירה הוא 88 מ״ר ושוויה 1,760,000 ₪ לפי ההערכה."
+POSITIONS_EMPTY_ROWS = (3, 37)  # body rows drawn with empty cells: one on each page of the table
+POSITIONS_LABEL_OFFSET = 4  # the footer prints "עמוד 5" on file page 1
+# (rotation, MediaBox shift, CropBox insets left/bottom/right/top) in points: every variant shows the same upright page
+POSITIONS_VARIANTS = {
+    "P1_synthetic_upright.pdf": (0, (0, 0), (0, 0, 0, 0)),
+    "P2_synthetic_rotated_90_cropped.pdf": (90, (36, 24), (10, 8, 12, 6)),
+    "P3_synthetic_rotated_180_cropped.pdf": (180, (36, 24), (10, 8, 12, 6)),
+    "P4_synthetic_rotated_270_cropped.pdf": (270, (36, 24), (10, 8, 12, 6)),
+    "P6_synthetic_cropped.pdf": (0, (36, 24), (10, 8, 12, 6)),
+}
+POSITIONS_UNSUPPORTED = "P5_synthetic_rotate_45.pdf"  # /Rotate 45 on page 1: no reader agrees on such a page
+
+
+class PositionsPdfRenderer(BlocksPdfRenderer):
+    """A page with a Hebrew sentence around numbers and a ruled table with empty rows that continues on the next page
+    without repeating its header; the footer's page number is offset from the file page. Every value is invented."""
+
+    def render_positions(self) -> tuple[bytes, list[int]]:
+        pdf = self.pdf
+        pdf.page_label_offset = POSITIONS_LABEL_OFFSET
+        pdf.add_page()
+        self._line("1. נתוני הנכס", size=12.5, bold=True, h=8)
+        self._line(POSITIONS_SENTENCE)
+        pdf.ln(2)
+        self.paragraph("טבלת הרכיבים:")
+        rows = [["", "", ""] if i in POSITIONS_EMPTY_ROWS else [f"רכיב {i}", str(10 + i), f"{(10 + i) * 21_000:,}"]
+                for i in range(1, 41)]
+        pages = self.btable(["רכיב", "שטח (מ״ר)", "שווי (₪)"], rows)
+        assert pages[0] == 1 and pages[-1] == 2, pages
+        assert pages[POSITIONS_EMPTY_ROWS[0] - 1] == 1 and pages[POSITIONS_EMPTY_ROWS[1] - 1] == 2, pages
+        self.paragraph("סך שווי הרכיבים מופיע בטבלה.")
+        return bytes(pdf.output()), pages
+
+
+def turn_pdf(data: bytes, rotation: int, shift: tuple[float, float], insets: tuple[float, float, float, float]
+             ) -> bytes:
+    """The same pages shown upright under ``/Rotate rotation``: the content is turned the other way first. The
+    MediaBox then moves by ``shift`` (its origin is no longer 0, 0) and the CropBox is inset from it."""
+    from pypdf import PdfReader, PdfWriter, Transformation
+    from pypdf.generic import RectangleObject
+
+    reader = PdfReader(io.BytesIO(data))
+    writer = PdfWriter()
+    for page in reader.pages:
+        if rotation:
+            page.rotate((360 - rotation) % 360)
+            page.transfer_rotation_to_content()
+            page.rotate(rotation)
+        x0, y0 = float(page.mediabox.left), float(page.mediabox.bottom)
+        x1, y1 = float(page.mediabox.right), float(page.mediabox.top)
+        dx, dy = shift
+        if dx or dy:
+            page.add_transformation(Transformation().translate(dx, dy))
+        page.mediabox = RectangleObject([x0 + dx, y0 + dy, x1 + dx, y1 + dy])
+        left, bottom, right, top = insets
+        page.cropbox = RectangleObject([x0 + dx + left, y0 + dy + bottom, x1 + dx - right, y1 + dy - top])
+        writer.add_page(page)
+    writer.add_metadata({"/Title": f"{SYNTHETIC_MARKER} - positions", "/Producer": "generate_fixtures.py",
+                         "/CreationDate": "D:20240101000000Z"})
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def rotate_45(data: bytes) -> bytes:
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import NameObject, NumberObject
+
+    reader = PdfReader(io.BytesIO(data))
+    writer = PdfWriter()
+    for k, page in enumerate(reader.pages):
+        if k == 0:
+            page[NameObject("/Rotate")] = NumberObject(45)
+        writer.add_page(page)
+    writer.add_metadata({"/Title": f"{SYNTHETIC_MARKER} - positions", "/Producer": "generate_fixtures.py",
+                         "/CreationDate": "D:20240101000000Z"})
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def write_positions(out: Path, font_dir: Path) -> None:
+    pdir = out / POSITIONS_DIR
+    pdir.mkdir(parents=True, exist_ok=True)
+    base, _ = PositionsPdfRenderer(font_dir).render_positions()
+    for name, (rotation, shift, insets) in POSITIONS_VARIANTS.items():
+        data = turn_pdf(base, rotation, shift, insets) if rotation or any(shift) or any(insets) else base
+        (pdir / name).write_bytes(data)
+        print(f"wrote {POSITIONS_DIR}/{name} ({len(data):,} bytes)")
+    data = rotate_45(base)
+    (pdir / POSITIONS_UNSUPPORTED).write_bytes(data)
+    print(f"wrote {POSITIONS_DIR}/{POSITIONS_UNSUPPORTED} ({len(data):,} bytes)")
+
+
 # --------------------------------------------------------------------------- uncovered regions (regions/)
 
 REGIONS_DIR = "regions"
@@ -4296,14 +4396,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--font-dir", default=DEFAULT_FONT_DIR)
     parser.add_argument("--out", default="tests/fixtures")
-    parser.add_argument("--only", choices=["all", "regions"], default="all",
-                        help="regions: write only the uncovered-region fixtures (tests/fixtures/regions/)")
+    parser.add_argument("--only", choices=["all", "regions", "positions"], default="all",
+                        help="regions: write only the uncovered-region fixtures (tests/fixtures/regions/); "
+                             "positions: only the page-position fixtures (tests/fixtures/positions/)")
     args = parser.parse_args()
     font_dir = Path(args.font_dir)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     if args.only == "regions":
         write_regions(out, font_dir)
+        return
+    if args.only == "positions":
+        write_positions(out, font_dir)
         return
 
     docs: dict[str, dict[str, Any]] = {}
@@ -4349,6 +4453,7 @@ def main() -> None:
     write_holdout_v2(out, font_dir, reports, layouts)
     write_blocks(out, font_dir)
     write_regions(out, font_dir)
+    write_positions(out, font_dir)
 
 
 if __name__ == "__main__":

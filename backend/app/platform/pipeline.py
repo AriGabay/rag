@@ -41,6 +41,7 @@ from app.db import (  # noqa: F401 - system_ctx re-exported
     tenant_tx,
 )
 from app.extraction.base import Block, ExtractionError, ExtractionResult, check_deadline
+from app.extraction.geometry import POSITIONS_VERSION
 from app.extraction.normalize_text import normalize_for_search, undouble_word
 from app.extraction.pdf import READER_VERSION as PDF_READER_VERSION
 from app.extraction.regions import shown_hash
@@ -108,8 +109,10 @@ def clone_outputs(conn: Connection, info: VersionInfo) -> int:
     params = {"v": info.id, "d": info.document_id, "s": src}
     conn.execute(
         text(
-            "INSERT INTO pages (office_id, document_id, version_id, page_no, text, method, quality, ok)"
-            " SELECT office_id, :d, :v, page_no, text, method, quality, ok FROM pages WHERE version_id = :s"
+            "INSERT INTO pages (office_id, document_id, version_id, page_no, text, method, quality, ok, mediabox,"
+            " cropbox, rotation, display_width, display_height, printed_label, geometry_issue)"
+            " SELECT office_id, :d, :v, page_no, text, method, quality, ok, mediabox, cropbox, rotation,"
+            " display_width, display_height, printed_label, geometry_issue FROM pages WHERE version_id = :s"
         ),
         params,
     )
@@ -134,9 +137,9 @@ def clone_outputs(conn: Connection, info: VersionInfo) -> int:
         text(
             "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section, section_path,"
             " label, paragraph_no, page, media, source, status, note, table_index, text, bbox, method, reader_version,"
-            " content_hash, original_text) SELECT office_id, :d, :v, block_index, kind, section, section_path, label,"
-            " paragraph_no, page, media, source, status, note, table_index, text, bbox, method, reader_version,"
-            " content_hash, original_text FROM document_blocks WHERE version_id = :s"
+            " content_hash, original_text, spans) SELECT office_id, :d, :v, block_index, kind, section, section_path,"
+            " label, paragraph_no, page, media, source, status, note, table_index, text, bbox, method, reader_version,"
+            " content_hash, original_text, spans FROM document_blocks WHERE version_id = :s"
         ),
         params,
     )
@@ -190,37 +193,53 @@ def _insert_outputs(conn: Connection, info: VersionInfo, result: ExtractionResul
                     embeddings: tuple[list[str], str] | None = None, report_extra: dict | None = None) -> None:
     """Write a reading. ``embeddings``: each chunk's vector (pgvector text) and the model, when computed before
     the write (reprocessing); otherwise the embed stage fills them. Every reading gets a new ``reading_id`` in its
-    ingestion report: what an answer's sources and references are bound to (KTD7)."""
+    ingestion report: what an answer's sources and references are bound to (KTD7). Positions (KTD2) go with it:
+    each page's geometry and printed number, each text block's word spans, each text-layer table cell's box
+    (``structure.rows[k].cell_boxes``, ``structure.header_boxes``), and the ``positions`` marker the geometry
+    backfill selects versions by (KTD3)."""
     blocks = _blocks_of(result)
     for p in result.pages:
+        g = p.geometry
         conn.execute(
             text(
-                "INSERT INTO pages (office_id, document_id, version_id, page_no, text, method, quality, ok)"
-                " VALUES (app_office(), :d, :v, :n, :t, :m, :q, :ok)"
+                "INSERT INTO pages (office_id, document_id, version_id, page_no, text, method, quality, ok, mediabox,"
+                " cropbox, rotation, display_width, display_height, printed_label, geometry_issue)"
+                " VALUES (app_office(), :d, :v, :n, :t, :m, :q, :ok, CAST(:mb AS jsonb), CAST(:cb AS jsonb), :r,"
+                " :w, :h, :pl, :gi)"
             ),
             {"d": info.document_id, "v": info.id, "n": p.page_no, "t": p.text, "m": p.method,
-             "q": round(p.quality, 4), "ok": p.ok},
+             "q": round(p.quality, 4), "ok": p.ok,
+             "mb": json.dumps(g.mediabox) if g is not None and g.mediabox is not None else None,
+             "cb": json.dumps(g.cropbox) if g is not None and g.cropbox is not None else None,
+             "r": g.rotation if g is not None else None, "w": g.width if g is not None else None,
+             "h": g.height if g is not None else None, "pl": p.printed_label,
+             "gi": g.issue if g is not None else None},
         )
     for b in blocks:
         conn.execute(
             text(
                 "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
                 " section_path, label, paragraph_no, page, media, source, status, note, table_index, text, bbox,"
-                " method, reader_version, content_hash, original_text) VALUES (app_office(), :d, :v, :i, :k, :s,"
-                " :sp, :l, :pn, :pg, :m, :src, :st, :n, :ti, :t, CAST(:bb AS jsonb), :me, :rv, :ch, :ot)"
+                " method, reader_version, content_hash, original_text, spans) VALUES (app_office(), :d, :v, :i, :k,"
+                " :s, :sp, :l, :pn, :pg, :m, :src, :st, :n, :ti, :t, CAST(:bb AS jsonb), :me, :rv, :ch, :ot,"
+                " CAST(:spans AS jsonb))"
             ),
             {"d": info.document_id, "v": info.id, "i": b.index, "k": b.kind, "s": b.section, "sp": b.section_path,
              "l": b.label, "pn": b.paragraph_no, "pg": b.page, "m": b.media, "src": b.source, "st": b.status,
              "n": b.note, "ti": b.table_index, "t": b.text, "bb": json.dumps(b.bbox) if b.bbox else None,
-             "me": b.method, "rv": b.reader_version, "ch": b.content_hash, "ot": b.original_text},
+             "me": b.method, "rv": b.reader_version, "ch": b.content_hash, "ot": b.original_text,
+             "spans": json.dumps(b.spans) if b.spans else None},
         )
     for t in result.tables:
         structure = {
             "headers": t.headers, "units": t.units, "ocr": t.ocr, "section": t.section,
-            "rows": [{"page": r.page, "cells": r.cells} for r in t.rows],
+            "rows": [{"page": r.page, "cells": r.cells} | ({"cell_boxes": r.cell_boxes} if r.cell_boxes else {})
+                     for r in t.rows],
             "source": t.source, "media": t.media, "caption": t.caption, "title": t.title, "notes": t.notes,
             "block_index": t.block_index,
         }
+        if t.header_boxes:
+            structure["header_boxes"] = t.header_boxes
         conn.execute(
             text(
                 "INSERT INTO extracted_tables (office_id, document_id, version_id, table_index, page_start,"
@@ -244,7 +263,7 @@ def _insert_outputs(conn: Connection, info: VersionInfo, result: ExtractionResul
         )
     version = INGESTION_VERSION if result.is_docx else PDF_INGESTION_VERSION
     report = result.components | {"ingestion_version": version, "chunks": len(result.chunks),
-                                  "reading_id": str(uuid4())} | (report_extra or {})
+                                  "reading_id": str(uuid4()), "positions": POSITIONS_VERSION} | (report_extra or {})
     conn.execute(
         text("UPDATE document_versions SET page_count = :p, pages_incomplete = :i, extraction_version = :e,"
              " ingestion = CAST(:g AS jsonb) WHERE id = :v"),

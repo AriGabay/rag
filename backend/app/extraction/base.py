@@ -28,18 +28,38 @@ def check_deadline(deadline: float) -> None:
 
 
 @dataclass
+class PageGeometry:
+    """Where a PDF page's positions live (KTD2): the raw ``/MediaBox`` and ``/CropBox`` (``[x0, y0, x1, y1]`` in PDF
+    user space, corners sorted), ``/Rotate`` in degrees, and the size of the rendered page in points (the CropBox
+    within the MediaBox, turned by the rotation). ``issue`` says why positions on the page cannot be converted into
+    the frame of the rendered page (``app.extraction.geometry``); such a page keeps block boxes only."""
+
+    mediabox: list[float] | None
+    cropbox: list[float] | None
+    rotation: int | None
+    width: float | None
+    height: float | None
+    issue: str | None = None
+
+
+@dataclass
 class PageResult:
     page_no: int  # physical page in the file, 1-based
     text: str  # logical-order text
     method: Literal["text_layer", "ocr", "mixed", "docx", "failed"]
     quality: float
     ok: bool
+    geometry: PageGeometry | None = None  # PDF pages only
+    printed_label: str | None = None  # the page number printed on the page (``/PageLabels`` or its page-number line)
 
 
 @dataclass
 class TableRow:
     page: int | None  # physical page of this row (None for DOCX)
     cells: list[str]
+    # each cell's box on the rendered page ([x0, top, x1, bottom], display frame), None for a merged cell; None for
+    # the whole row when the table was not read from a PDF text layer or its page cannot be converted (KTD2)
+    cell_boxes: list[list[float] | None] | None = None
 
 
 @dataclass
@@ -61,6 +81,7 @@ class TableResult:
     title: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     block_index: int | None = None
+    header_boxes: list[list[float] | None] | None = None  # the header cells' boxes, like ``TableRow.cell_boxes``
 
 
 @dataclass
@@ -77,7 +98,11 @@ class Block:
     Provenance (PDF): ``method`` is how the text was obtained (``text_layer``, ``ocr``, ``vision``, ``none`` for a
     picture not read yet), ``reader_version`` the reader that produced the block, ``content_hash`` a picture's
     hash over its raw image bytes (the key a reading is reused by), and ``original_text`` the text as extracted
-    when ``text`` is a corrected form of it. DOCX blocks leave them empty."""
+    when ``text`` is a corrected form of it. DOCX blocks leave them empty.
+
+    ``spans`` (PDF text-layer headings and paragraphs): each word's character range in ``text`` and its box on the
+    rendered page, ``[line, word, start, end, x0, top, x1, bottom]`` (``app.extraction.geometry``); None for OCR,
+    pictures, tables, DOCX and pages whose positions cannot be converted."""
 
     index: int
     kind: Literal["heading", "paragraph", "textbox", "table", "image"]
@@ -98,6 +123,7 @@ class Block:
     reader_version: str | None = None
     content_hash: str | None = None
     original_text: str | None = None
+    spans: list[list] | None = None
 
 
 @dataclass

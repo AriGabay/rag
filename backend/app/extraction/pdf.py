@@ -33,6 +33,13 @@ the text as extracted: its blocks are ``read_uncertain`` with the reason, the pa
 document is partly read. Such a page keeps its text layer rather than falling back to whole-page OCR: its letters
 are otherwise readable, and the OCR of its glyphs is what did not agree.
 
+Positions (KTD2): every page records its geometry (MediaBox, CropBox, rotation, rendered size) and the page number
+printed on it when one is found (``/PageLabels``, or a page-number line consistent across pages). Headings and
+paragraphs read from the text layer keep each word's character range in their final text and its box on the
+rendered page, taken from the same read that produced the text (the corrected read on font-map pages); tables read
+from the text layer keep each cell's box. Boxes go through ``app.extraction.geometry``; a page it cannot convert
+keeps block boxes only. OCR and vision content get no word or cell positions.
+
 Validation errors (encrypted, corrupt, too many pages, deadline) raise ``ExtractionError`` with a Hebrew reason.
 Document text is content only: nothing in it changes processing (R29).
 """
@@ -50,11 +57,12 @@ import pdfplumber
 import pypdfium2 as pdfium
 
 from app.config import Settings
-from app.extraction import fontmap, ocr
+from app.extraction import fontmap, geometry, ocr
 from app.extraction.base import (
     Block,
     ExtractionError,
     ExtractionResult,
+    PageGeometry,
     PageResult,
     TableResult,
     TableRow,
@@ -71,7 +79,7 @@ from app.extraction.hebrew import (
 )
 from app.extraction.images import PictureReading, VisionReader
 from app.extraction.regions import PageLayer, ReadingCache, Region, mark_repeated, read_regions
-from app.extraction.tables import RawTable, assemble_tables, logical_row, units_for
+from app.extraction.tables import RawTable, assemble_tables, logical_boxes, logical_row, units_for
 
 log = logging.getLogger(__name__)
 
@@ -94,6 +102,11 @@ _HEB_LETTER = re.compile(r"[א-ת]")
 _BOLD = re.compile(r"bold|black|heavy", re.IGNORECASE)
 # a note under a table: "(*) ...", "* ...", "הערה: ...", "מקור: ..."
 _NOTE = re.compile(r"^\s*(?:\(\s*\*+\s*\)|\*+\s|הערה\s*:|הערות\s*:|מקור\s*:)")
+# pdfplumber's text-line pattern (``TextMap.extract_text_lines`` with ``strip``), matched here to keep each
+# character's glyph
+_TEXT_LINE = re.compile(r" *([^\n]+?) *(\n|$)")
+_PRINTED_NO = re.compile(r"עמוד\s+(\d{1,4})|^[\s\-–—]*(\d{1,4})[\s\-–—]*$")
+PAGE_NUMBER_ZONE = 0.15  # share of the page height at its top and bottom where a page-number line may sit
 
 
 @dataclass
@@ -110,6 +123,8 @@ class _Line:
     uncertain: str | None = None  # why its text is uncertain (a font-map corruption left unrepaired)
     raw: str = ""  # a corrected line's raw text and chars, to restore its original after a reorientation
     fm_chars: list[dict] | None = None
+    layer_text: str | None = None  # the line as the text layer read it (visual order when the producer wrote so)
+    glyphs: list[list[float] | None] | None = None  # per character of ``layer_text``: its glyph's box (None: a gap)
 
     @property
     def bbox(self) -> list[float] | None:
@@ -132,12 +147,14 @@ class _PageOut:
     words: list[WordSample] = field(default_factory=list)  # the text layer's words with their fonts (font maps)
     corruption: float = 0.0  # share of the page's Hebrew words with an unrepaired font-map corruption
     warnings: list[str] = field(default_factory=list)
+    frame: tuple | None = None  # the (MediaBox, CropBox, rotation) the text layer was read with (pdfminer)
 
 
 @dataclass
 class _TextLayer:
     lines: list[_Line] = field(default_factory=list)
-    tables: list[tuple[list[float], list[list[str]], str | None]] = field(default_factory=list)  # + uncertain
+    # bbox, logical rows, why uncertain, each cell's box (logical order, pdfplumber frame)
+    tables: list[tuple[list[float], list[list[str]], str | None, list]] = field(default_factory=list)
     visual: bool | None = None
     raw_texts: list[str] = field(default_factory=list)
     pictures: list[Region] = field(default_factory=list)
@@ -197,12 +214,40 @@ def _rejoin(lines: list[dict]) -> list[dict]:
         prev = out[-1] if out else None
         if prev is not None and _is_fragment_of(ln, prev):
             left, right = (ln, prev) if ln["x1"] <= prev["x0"] + 1 else (prev, ln)
-            out[-1] = prev | {"text": left["text"] + right["text"], "x0": min(ln["x0"], prev["x0"]),
-                              "x1": max(ln["x1"], prev["x1"]), "bottom": max(ln["bottom"], prev["bottom"]),
-                              "chars": (left.get("chars") or []) + (right.get("chars") or [])}
+            joined = prev | {"text": left["text"] + right["text"], "x0": min(ln["x0"], prev["x0"]),
+                             "x1": max(ln["x1"], prev["x1"]), "bottom": max(ln["bottom"], prev["bottom"]),
+                             "chars": (left.get("chars") or []) + (right.get("chars") or [])}
+            if "slots" in left and "slots" in right:  # each character keeps its glyph
+                joined["slots"] = left["slots"] + right["slots"]
+            else:
+                joined.pop("slots", None)
+            out[-1] = joined
             continue
         out.append(ln)
     return out
+
+
+def _text_lines(page) -> list[dict]:
+    """``page.extract_text_lines(return_chars=True)``, each line also with ``slots``: the char object behind each
+    character of its text (None for a space the layout inserted), so a word of the final text can be located."""
+    tm = page.get_textmap()
+    if len(tm.as_string) != len(tm.tuples):  # a non-default text direction: no per-character mapping
+        return page.extract_text_lines(return_chars=True)
+    out = []
+    for m in _TEXT_LINE.finditer(tm.as_string):
+        if not m.group(1).strip():
+            continue
+        line = tm.match_to_dict(m, main_group=1, return_groups=False, return_chars=True)
+        line["slots"] = [c for _, c in tm.tuples[m.start(1):m.end(1)]]
+        out.append(line)
+    return out
+
+
+def _glyph_boxes(slots: list | None) -> list[list[float] | None] | None:
+    if slots is None:
+        return None
+    return [[float(c["x0"]), float(c["top"]), float(c["x1"]), float(c["bottom"])] if c is not None else None
+            for c in slots]
 
 
 def _picture_hash(img: dict) -> str | None:
@@ -229,7 +274,7 @@ def _text_layer(page, index: int, fix: FontMapFix | None = None) -> _TextLayer:
     else:
         corrected = fix.correct_page(page)
         page, out.corruption = corrected.page, corrected.corruption
-    raw_lines = _rejoin(page.extract_text_lines(return_chars=True))
+    raw_lines = _rejoin(_text_lines(page))
     out.raw_texts = raw_texts = [ln["text"] for ln in raw_lines]
     out.visual = visual = page_is_visual(raw_texts)
     fixed = fix_text_lines(raw_texts, default_visual=visual)
@@ -237,7 +282,7 @@ def _text_layer(page, index: int, fix: FontMapFix | None = None) -> _TextLayer:
         chars = ln.get("chars") or []
         bold = sum(1 for c in chars if _BOLD.search(c.get("fontname") or "")) * 2 > len(chars) if chars else False
         line = _Line(float(ln["top"]), t, float(ln["bottom"]), float(ln["x0"]), float(ln["x1"]), _line_size(ln),
-                     bold)
+                     bold, layer_text=ln["text"], glyphs=_glyph_boxes(ln.get("slots")))
         if fix is not None:
             line.uncertain = fix.uncertain_reason(chars)
             line.original = fix.original_line(ln["text"], t, chars)
@@ -251,7 +296,9 @@ def _text_layer(page, index: int, fix: FontMapFix | None = None) -> _TextLayer:
         # pdfplumber returns columns left -> right: reverse to logical order, fix each cell's text.
         rows = [logical_row(r, visual_default=True if visual is None else visual) for r in grid]
         reason = _uncertain_in(page.chars, t.bbox) if fix is not None else None
-        out.tables.append(([round(float(x), 1) for x in t.bbox], rows, reason))
+        # ``extract`` reads ``t.rows`` cell by cell, so its grid and the cell boxes line up (None: a merged cell)
+        boxes = [logical_boxes([list(c) if c is not None else None for c in row.cells]) for row in t.rows]
+        out.tables.append(([round(float(x), 1) for x in t.bbox], rows, reason, boxes))
     for img in page.images:
         bbox = [round(float(img[k]), 1) for k in ("x0", "top", "x1", "bottom")]
         digest = _picture_hash(img)
@@ -305,8 +352,8 @@ def _process_page(doc, plumber, index: int, settings: Settings, warnings: list[s
     quality = quality_score(text, corruption=layer.corruption)
     # an unrepaired font-map corruption scores the page down but keeps its text layer (its blocks are uncertain)
     if (quality_score(text) if layer.corruption else quality) >= QUALITY_THRESHOLD:
-        raws = [RawTable(page_no, rows, ocr=False, top=bbox[1], bbox=bbox, uncertain=reason)
-                for bbox, rows, reason in layer.tables]
+        raws = [RawTable(page_no, rows, ocr=False, top=bbox[1], bbox=bbox, uncertain=reason, boxes=boxes)
+                for bbox, rows, reason, boxes in layer.tables]
         _mark_table_lines(lines, raws)
         return _PageOut(PageResult(page_no, text, "text_layer", quality, True), lines, raws, layer.pictures,
                         layer.chars, layer.raw_texts if layer.visual is None else None, layer.raw_texts,
@@ -382,6 +429,8 @@ class _Walker:
         reason = next((ln.uncertain for ln in lines if ln.uncertain), None)
         if original != text:
             kw["original_text"] = original
+        if method in ("text_layer", "mixed"):  # OCR lines carry no glyphs
+            kw["spans"] = geometry.word_spans([(ln.text, ln.layer_text, ln.glyphs) for ln in lines])
         if reason:
             kw |= {"status": "read_uncertain", "note": reason}
         b = self.add(kind, text, page, bbox, method, source="ocr" if method == "ocr" else "text", **kw)
@@ -594,10 +643,96 @@ def _read_page(doc, plumber, index: int, settings: Settings, fix: FontMapFix | N
     warnings: list[str] = []
     out = _process_page(doc, plumber, index, settings, warnings, fix)
     out.warnings = warnings
+    out.frame = _frame(plumber, index)
     pdf_page = doc[index]
-    out.width, out.height = pdf_page.get_size()
-    pdf_page.close()
+    try:
+        out.width, out.height = pdf_page.get_size()
+        out.page.geometry = _page_geometry(pdf_page, out)
+    finally:
+        pdf_page.close()
+    _place(out)
     return out
+
+
+def _frame(plumber, index: int) -> tuple | None:
+    """The (MediaBox, CropBox, rotation) pdfminer read the page with, inherited entries resolved: the frame of every
+    text-layer coordinate on it."""
+    if plumber is None:
+        return None
+    try:
+        obj = plumber.pages[index].page_obj
+        return list(obj.mediabox), list(obj.cropbox), int(obj.rotate)
+    except Exception:  # noqa: BLE001 - without it the page's positions are not converted
+        return None
+
+
+def _page_geometry(pdf_page, out: _PageOut) -> PageGeometry:
+    """The page's geometry in the text layer's frame, checked against what the renderer shows. Without a text
+    layer frame the renderer's own boxes describe the page (nothing on it is converted then)."""
+    try:
+        shown, rotation = pdf_page.get_bbox(), pdf_page.get_rotation()
+        if out.frame is not None:
+            mediabox, cropbox, frame_rotation = out.frame
+        else:
+            mediabox, cropbox, frame_rotation = pdf_page.get_mediabox(fallback_ok=False) or shown, shown, rotation
+    except Exception:  # noqa: BLE001 - a page whose boxes cannot be read keeps no positions
+        return PageGeometry(None, None, None, None, None, geometry.ISSUE_BOX)
+    return geometry.page_geometry(mediabox, cropbox, frame_rotation, (out.width, out.height), shown, rotation)
+
+
+def _place(out: _PageOut) -> None:
+    """Text-layer glyph and cell boxes into the frame of the rendered page; dropped when the page cannot be
+    converted (its blocks keep their region only)."""
+    geom = out.page.geometry
+    usable = out.page.method == "text_layer" and geom is not None and geom.issue is None and out.frame is not None
+    for ln in out.lines:
+        if ln.glyphs is not None:
+            ln.glyphs = [geometry.geometry_box(b, geom) if b else None for b in ln.glyphs] if usable else None
+    for raw in out.tables:
+        if raw.boxes is not None:
+            raw.boxes = [[geometry.geometry_box(b, geom) if b else None for b in row] for row in raw.boxes] \
+                if usable else None
+
+
+def _page_number_line(out: _PageOut) -> int | None:
+    """The number of the page-number line at the top or bottom of a text-layer page ("עמוד 7", "- 7 -"), when the
+    page has exactly one such number."""
+    found = set()
+    for ln in out.lines:
+        text = ln.text.strip()
+        if ln.in_table or ln.bbox is None or not is_footer(text):
+            continue
+        box = geometry.geometry_box(ln.bbox, out.page.geometry) or ln.bbox
+        height = (out.page.geometry.height if out.page.geometry and out.page.geometry.height else out.height) or 0
+        if height <= 0 or PAGE_NUMBER_ZONE * height < box[1] < (1 - PAGE_NUMBER_ZONE) * height:
+            continue
+        m = _PRINTED_NO.search(text)
+        if m:
+            found.add(int(m.group(1) or m.group(2)))
+    return found.pop() if len(found) == 1 else None
+
+
+def _printed_labels(doc, outs: list[_PageOut]) -> None:
+    """Each page's printed page number (R8): the document's ``/PageLabels`` when it has them; otherwise the number
+    of a page-number line, kept only when at least two pages have one and every such number differs from its file
+    page by the same amount (a numbering that skips or restarts says nothing reliable)."""
+    labels: list[str] = []
+    for index in range(len(outs)):
+        try:
+            labels.append(doc.get_page_label(index) or "")
+        except Exception:  # noqa: BLE001 - an unreadable label tree is no label
+            labels.append("")
+    if any(labels):
+        for out, label in zip(outs, labels, strict=True):
+            out.page.printed_label = label or None
+        return
+    numbers = {out.page.page_no: n for out in outs
+               if out.page.ok and out.lines and (n := _page_number_line(out)) is not None}
+    if len(numbers) < 2 or len({n - page for page, n in numbers.items()}) != 1:
+        return
+    for out in outs:
+        if out.page.page_no in numbers:
+            out.page.printed_label = str(numbers[out.page.page_no])
 
 
 def extract_pdf(data: bytes, deadline: float, settings: Settings, vision: VisionReader | None = None,
@@ -634,6 +769,7 @@ def extract_pdf(data: bytes, deadline: float, settings: Settings, vision: Vision
                     warnings.append(w)
         page_count = len(doc)
         _orient_undecided_pages(outs)
+        _printed_labels(doc, outs)
         layers = _layers(outs)
         read_regions(doc, data, layers, settings, vision, readings, deadline)
         repeated = mark_repeated(layers)

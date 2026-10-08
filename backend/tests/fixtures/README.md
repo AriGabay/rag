@@ -226,3 +226,21 @@ same script and run (`write_blocks`). Their expectations live in `tests/unit/tes
 |---|---|
 | `blocks/B1_synthetic_reading_order.pdf` | Title page without footer whose words carry no orientation evidence; headings drawn twice 0.15 mm apart (fake bold, doubled letters in the raw text layer); sub-sections `3.1`/`3.2` under `3.`; heading `4. התחשיב` whose last letter is drawn 1.8 mm lower (a separate raw line); a table between two paragraphs with a `(*)` note line under it; a 24-row table that continues from page 2 to page 3 without a repeated header |
 | `blocks/B2_synthetic_pictures.pdf` | A small logo on both pages (one image object, the same raw bytes) and a photo between two paragraphs on page 1 |
+
+## Page-position fixtures (`positions/`)
+
+Synthetic PDFs with known word and cell positions for page geometry, word spans and table cell boxes
+(`app/extraction/geometry.py`). One base document (a sentence with a number, a table that continues onto a second page
+with empty rows, a footer page number offset from the file page) is written once and then given a page box and
+rotation per file. Generate them on the host with `uv run python scripts/generate_fixtures.py --only positions
+--font-dir <dir with DejaVu TTFs>`; their expectations live in `tests/unit/test_pdf_positions.py`, which checks them
+against pypdfium2's character boxes rather than pdfplumber's.
+
+| file | page box and rotation |
+|---|---|
+| `positions/P1_synthetic_upright.pdf` | No rotation, MediaBox at the origin, no CropBox inset |
+| `positions/P2_synthetic_rotated_90_cropped.pdf` | `/Rotate 90`, MediaBox shifted by (36, 24), CropBox inset by (10, 8, 12, 6) |
+| `positions/P3_synthetic_rotated_180_cropped.pdf` | `/Rotate 180`, same boxes as P2 |
+| `positions/P4_synthetic_rotated_270_cropped.pdf` | `/Rotate 270`, same boxes as P2 |
+| `positions/P5_synthetic_rotate_45.pdf` | `/Rotate 45` on page 1: recorded as `rotation_unsupported`, no spans or cell boxes there |
+| `positions/P6_synthetic_cropped.pdf` | No rotation, same shifted MediaBox and inset CropBox as P2 |
