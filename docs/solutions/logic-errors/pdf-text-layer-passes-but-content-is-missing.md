@@ -63,7 +63,10 @@ Look for content per page, regardless of how good the text is, and read each dis
    (`backend/app/extraction/images.py`, `backend/app/providers/llm.py`): transient or configuration failures raise and fail the job,
    so the previous good reading stays; a deterministic failure (BadRequest / 422 → `INVALID`, refusal) leaves the
    region unread and the document is marked partial with the reason, visible to the model and the documents
-   screen.
+   screen. The same holds for DOCX pictures and photo-like regions: a scanned plan gave OCR 222 words of which 3
+   were confident, and a "few confident words means no text" rule dropped its block numbers. With a vision reader
+   the model decides whether a picture holds text (once per content; DOCX readings are cached by picture bytes and
+   the context shown with them); without one, the OCR rules still apply.
 4. **Repair a broken font map only from verified evidence** (`backend/app/extraction/fontmap.py`). Detect per font: a
    foreign glyph inside Hebrew words, or a frequent Hebrew letter a large font never emits (`min_hebrew_letters`,
    `min_expected_absent`). Verify each suspect glyph by OCR on single-word crops (`--psm 7`) aligned with the
