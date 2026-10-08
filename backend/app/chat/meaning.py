@@ -293,7 +293,8 @@ class Fetcher:
     calculation's other passages that the turn already has, the whole table or section around a cited passage,
     and the stored measurements of the subject property in the cited documents. What it finds and uses is
     registered as a source of the turn (cited with the number); what it does not use is dropped. A comparables or
-    survey row never counts: only the same table or section, or a measurement of the subject property."""
+    survey row never counts: only the same table or section, or a measurement of the subject property still
+    anchored in the document's current reading (``anchor_lost`` is not)."""
 
     ws: Workspace
     reads: int = READS  # per verification round; what was read is kept for the turn's later rounds
@@ -355,9 +356,11 @@ class Fetcher:
         def load():
             with tenant_tx(self.ws.ctx) as conn:
                 return conn.execute(sql(
-                    "SELECT m.*, d.title FROM measurements m JOIN document_versions v ON v.id = m.version_id"
+                    "SELECT m.*, d.title, v.ingestion->>'reading_id' AS reading_id FROM measurements m"
+                    " JOIN document_versions v ON v.id = m.version_id"
                     " AND v.is_current JOIN documents d ON d.id = m.document_id AND d.deleted_at IS NULL"
-                    " WHERE m.document_id = ANY(:d) AND m.status <> 'rejected' AND m.subject_role ="
+                    " WHERE m.document_id = ANY(:d) AND m.status <> 'rejected' AND m.anchor_lost IS NULL"
+                    " AND m.subject_role ="
                     " 'appraised_property' AND m.value_role = ANY(:r) ORDER BY m.block_index NULLS FIRST, m.id"
                     " LIMIT 400"), {"d": sorted(document_ids), "r": list(SUBJECT_ROLES)}).all()
         return self._read(("m", tuple(sorted(str(d) for d in document_ids))), load) or []

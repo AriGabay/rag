@@ -13,6 +13,10 @@ Stages run in the worker under the job's office with role ``system``:
 
 Every stage is idempotent, so a crashed job whose lease expired simply runs again. The version
 becomes ``ready``/``needs_review`` only in the publish transaction, never in between.
+
+Reprocessing a published version (``reindex_version``, KTD7) reads and embeds before any write, keeps the current
+reading when the new one is worse (``reading_regression``), and otherwise swaps the whole reading, with its
+embeddings and a new ``reading_id``, in one transaction.
 """
 
 from __future__ import annotations
@@ -21,9 +25,12 @@ import dataclasses
 import inspect
 import json
 import logging
+import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass
-from uuid import UUID
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, text
 
@@ -34,8 +41,8 @@ from app.db import (  # noqa: F401 - system_ctx re-exported
     system_ctx,
     tenant_tx,
 )
-from app.extraction.base import Block, ExtractionResult, check_deadline
-from app.extraction.normalize_text import normalize_for_search
+from app.extraction.base import Block, ExtractionError, ExtractionResult, check_deadline
+from app.extraction.normalize_text import normalize_for_search, undouble_word
 from app.extraction.pdf import READER_VERSION as PDF_READER_VERSION
 
 logger = logging.getLogger(__name__)
@@ -141,7 +148,7 @@ def clone_outputs(conn: Connection, info: VersionInfo) -> int:
     ).scalar_one()
     conn.execute(
         text("UPDATE document_versions SET page_count = :p, pages_incomplete = :i, ingestion = (SELECT ingestion"
-             " FROM document_versions WHERE id = :s), extraction_version = (SELECT extraction_version FROM"
+             " - 'reprocess_regression' FROM document_versions WHERE id = :s), extraction_version = (SELECT extraction_version FROM"
              " document_versions WHERE id = :s) WHERE id = :v"),
         {"p": page_count, "i": pages_incomplete, "v": info.id, "s": src},
     )
@@ -179,7 +186,11 @@ def persist_extraction(conn: Connection, info: VersionInfo, result: ExtractionRe
     _insert_outputs(conn, info, result)
 
 
-def _insert_outputs(conn: Connection, info: VersionInfo, result: ExtractionResult) -> None:
+def _insert_outputs(conn: Connection, info: VersionInfo, result: ExtractionResult,
+                    embeddings: tuple[list[str], str] | None = None, report_extra: dict | None = None) -> None:
+    """Write a reading. ``embeddings``: each chunk's vector (pgvector text) and the model, when computed before
+    the write (reprocessing); otherwise the embed stage fills them. Every reading gets a new ``reading_id`` in its
+    ingestion report: what an answer's sources and references are bound to (KTD7)."""
     blocks = _blocks_of(result)
     for p in result.pages:
         conn.execute(
@@ -218,19 +229,22 @@ def _insert_outputs(conn: Connection, info: VersionInfo, result: ExtractionResul
             {"d": info.document_id, "v": info.id, "i": t.index, "ps": t.page_start, "pe": t.page_end,
              "s": json.dumps(structure, ensure_ascii=False)},
         )
-    for c in result.chunks:
+    vectors, model = embeddings if embeddings is not None else ([None] * len(result.chunks), None)
+    for c, vec in zip(result.chunks, vectors, strict=True):
         conn.execute(
             text(
                 "INSERT INTO chunks (office_id, document_id, version_id, chunk_index, kind, page_list, section,"
-                " text, normalized_text, table_index, row_index, block_start, block_end) VALUES (app_office(), :d,"
-                " :v, :i, :k, :pl, :s, :t, :n, :ti, :ri, :bs, :be)"
+                " text, normalized_text, table_index, row_index, block_start, block_end, embedding, embedding_model)"
+                " VALUES (app_office(), :d, :v, :i, :k, :pl, :s, :t, :n, :ti, :ri, :bs, :be, CAST(:e AS vector),"
+                " :em)"
             ),
             {"d": info.document_id, "v": info.id, "i": c.index, "k": c.kind, "pl": c.page_list, "s": c.section,
              "t": c.text, "n": normalize_for_search(c.text), "ti": c.table_index, "ri": c.row_index,
-             "bs": c.block_start, "be": c.block_end},
+             "bs": c.block_start, "be": c.block_end, "e": vec, "em": model if vec is not None else None},
         )
     version = INGESTION_VERSION if result.is_docx else PDF_INGESTION_VERSION
-    report = result.components | {"ingestion_version": version, "chunks": len(result.chunks)}
+    report = result.components | {"ingestion_version": version, "chunks": len(result.chunks),
+                                  "reading_id": str(uuid4())} | (report_extra or {})
     conn.execute(
         text("UPDATE document_versions SET page_count = :p, pages_incomplete = :i, extraction_version = :e,"
              " ingestion = CAST(:g AS jsonb) WHERE id = :v"),
@@ -386,14 +400,132 @@ def process_version(office_id: UUID, version_id: UUID) -> str | None:
 # --- reindexing and measurements ----------------------------------------------------------------------------
 
 _DERIVED_TEXT_TABLES = ("chunks", "extracted_tables", "pages", "document_blocks")
+EMBED_BATCH = 64
+MISSING_SHOWN = 20  # missing numbers recorded per page
+MSG_REGRESSION = "הקריאה החדשה גרועה מהקיימת ולכן לא הוחלפה ({summary}). מנהל יכול לאשר אותה בהרצה חוזרת"
+_NUMBER = re.compile(r"\d+(?:[.,]\d+)*")
 
 
-def reindex_version(office_id: UUID, version_id: UUID) -> str | None:
-    """Read a processed version again under the current reader: its blocks, pictures, tables, chunks and
-    embeddings are replaced; its records (and their reviews) are kept. Facts the earlier engine extracted from
-    the old chunks and never reviewed go (a reviewed fact stays); cached answers are dropped and the data version
-    moves, so no answer built on the old reading is served again. Measurements are then re-extracted when the
-    office allows the cloud model."""
+class ReadingRegression(ExtractionError):
+    """A new reading is worse than the current one on a measure both readers produce. The current reading stays,
+    the regression is recorded on the version (``ingestion.reprocess_regression``) and the job fails permanently:
+    reading again would read the same. An admin may accept it on a re-run (``accept_regression``)."""
+
+    def __init__(self, findings: dict):
+        super().__init__(MSG_REGRESSION.format(summary=regression_summary(findings)), permanent=True)
+        self.findings = findings
+
+
+def regression_summary(findings: dict) -> str:
+    parts = [f"עמוד {p['page']}: חסרים המספרים {', '.join(p['missing_numbers'][:5])}"
+             for p in findings.get("pages") or []][:5]
+    if findings.get("failed_pages"):
+        parts.append("עמודים שלא נקראו: " + ", ".join(str(p) for p in findings["failed_pages"][:10]))
+    if findings.get("tables"):
+        parts.append(f"טבלאות: {findings['tables']['before']} ← {findings['tables']['after']}")
+    return "; ".join(parts)
+
+
+def _numbers(text_: str) -> set[str]:
+    """The number tokens of a text, thousands separators dropped ("1,250,000" and "1250000" are one number)."""
+    return {t.replace(",", "") for t in _NUMBER.findall(text_ or "")}
+
+
+def _missing_numbers(old_text: str, new_numbers: set[str]) -> list[str]:
+    """The numbers of an old page's text the new reading of that page no longer has. A word an older reader took
+    from a bold font drawn twice (``"2200,,550000"``) counts as present when its single reading is."""
+    missing: list[str] = []
+    for word in (old_text or "").split():
+        found = _numbers(word)
+        if found <= new_numbers or _numbers(undouble_word(word)) <= new_numbers:
+            continue
+        missing += sorted(found - new_numbers)
+    return list(dict.fromkeys(missing))
+
+
+def _page_texts(result: ExtractionResult) -> dict[int, str]:
+    """Per page, all text the new reading has there: the page text, its blocks, its table rows and each table's
+    caption, title, headers and notes, and (for a reader without blocks) its chunks."""
+    out: dict[int, list[str]] = defaultdict(list)
+    for p in result.pages:
+        out[p.page_no].append(p.text or "")
+    for b in result.blocks:
+        if b.page is not None:
+            out[b.page] += [b.text or "", b.picture_text or ""]
+    for t in result.tables:
+        for r in t.rows:
+            if r.page is not None:
+                out[r.page].append(" ".join(r.cells))
+        if t.page_start is not None:
+            for page in range(t.page_start, (t.page_end or t.page_start) + 1):
+                out[page].append(" ".join([t.caption or "", *t.title, *t.headers, *t.notes]))
+    if not result.blocks:
+        for c in result.chunks:
+            for page in c.page_list or []:
+                out[page].append(c.text)
+    return {page: "\n".join(parts) for page, parts in out.items()}
+
+
+def reading_regression(conn: Connection, version_id: UUID, result: ExtractionResult) -> dict | None:
+    """Whether ``result`` reads the version worse than its current reading, on measures both readers produce
+    (KTD7): per page, every number of the current page text is still in the new reading of that page; no page
+    read before fails now; no table is lost. Unread or uncertain regions the new reader reports are not counted:
+    the old reader could not see them. None when the new reading is not worse."""
+    old_pages = conn.execute(text("SELECT page_no, text, ok FROM pages WHERE version_id = :v ORDER BY page_no"),
+                             {"v": version_id}).all()
+    old_tables = conn.execute(text("SELECT count(*) FROM extracted_tables WHERE version_id = :v"),
+                              {"v": version_id}).scalar_one()
+    texts = _page_texts(result)
+    new_ok = {p.page_no: p.ok for p in result.pages}
+    pages = []
+    for p in old_pages:
+        missing = _missing_numbers(p.text, _numbers(texts.get(p.page_no, "")))
+        if missing:
+            pages.append({"page": p.page_no, "missing_numbers": missing[:MISSING_SHOWN]})
+    failed = [p.page_no for p in old_pages if p.ok and not new_ok.get(p.page_no, False)]
+    fewer = len(result.tables) < old_tables
+    if not (pages or failed or fewer):
+        return None
+    out: dict = {"pages": pages, "failed_pages": failed,
+                 "ingestion_version": INGESTION_VERSION if result.is_docx else PDF_INGESTION_VERSION,
+                 "at": datetime.now(UTC).isoformat()}
+    if fewer:
+        out["tables"] = {"before": old_tables, "after": len(result.tables)}
+    return out
+
+
+def _embed_reading(ctx: TenantContext, info: VersionInfo, result: ExtractionResult,
+                   deadline: float) -> tuple[list[str], str]:
+    """Every chunk's vector for a new reading, computed before it replaces the current one, so the swap never
+    commits a chunk search cannot reach. A chunk whose text the current reading already embedded with the active
+    model reuses that vector."""
+    from app.providers.embeddings import get_embedding_provider, to_pgvector
+
+    provider = get_embedding_provider()
+    with tenant_tx(ctx) as conn:
+        known = {r.text: r.e for r in conn.execute(text(
+            "SELECT text, embedding::text AS e FROM chunks WHERE version_id = :v AND embedding IS NOT NULL"
+            " AND embedding_model = :m"), {"v": info.id, "m": provider.model_id})}
+    todo = [t for t in dict.fromkeys(c.text for c in result.chunks) if t not in known]
+    for i in range(0, len(todo), EMBED_BATCH):
+        check_deadline(deadline)
+        batch = todo[i:i + EMBED_BATCH]
+        for t, vec in zip(batch, provider.embed_passages(batch), strict=True):
+            known[t] = to_pgvector(vec)
+    return [known[c.text] for c in result.chunks], provider.model_id
+
+
+def reindex_version(office_id: UUID, version_id: UUID, accept_regression: bool = False) -> str | None:
+    """Read a processed version again under the current reader (KTD7). Extraction and embedding run before any
+    write; a gate then compares the new reading with the current one (``reading_regression``). A worse reading is
+    recorded on the version and fails the job (``ReadingRegression``), leaving the current reading in place,
+    unless an admin accepts the recorded regression (``accept_regression``). Otherwise one transaction replaces
+    the blocks, pictures, tables, pages and chunks (with their embeddings) under a new ``reading_id``, re-anchors
+    the version's measurements in the new reading, drops facts the earlier engine extracted from the old chunks
+    and never reviewed (a reviewed fact stays), clears cached answers and moves the data version, so no answer
+    built on the old reading is served again. Its records (and their reviews) are kept. Measurements are then
+    re-extracted when the office allows the cloud model."""
+    from app.measurements.store import measurement_anchors, reanchor_measurements
     from app.platform.jobs import enqueue_measurements
     from app.platform.storage import get_storage
 
@@ -409,18 +541,44 @@ def reindex_version(office_id: UUID, version_id: UUID) -> str | None:
     info = VersionInfo(row.id, row.document_id, row.storage_key, row.mime_type, None)
     result = _extract(get_storage().get(info.storage_key), info.mime_type, deadline, vision_reader(ctx),
                       ImageReadingStore(ctx))
+    embeddings = _embed_reading(ctx, info, result, deadline)
     with tenant_tx(ctx) as conn:
-        for table in _DERIVED_TEXT_TABLES:
-            conn.execute(text(f"DELETE FROM {table} WHERE version_id = :v"), {"v": info.id})
-        records = conn.execute(text("SELECT count(*) FROM occurrences WHERE version_id = :v"), {"v": info.id}).scalar_one()
-        _insert_outputs(conn, info, result)
-        conn.execute(text("DELETE FROM facts WHERE version_id = :v AND status IN ('auto_validated', 'needs_review')"),
-                     {"v": info.id})
-        conn.execute(text("DELETE FROM fact_extraction_ledger WHERE version_id = :v"), {"v": info.id})
-        conn.execute(text("DELETE FROM answer_cache"))
-        bump_data_version(conn)
-        logger.info("reindexed version %s (%d records kept)", info.id, records)
-    embed_stage(ctx, info, deadline)
+        current = conn.execute(text(
+            "SELECT v.ingestion FROM document_versions v JOIN documents d ON d.id = v.document_id"
+            " AND d.deleted_at IS NULL WHERE v.id = :v AND v.status IN ('ready', 'needs_review') FOR UPDATE OF v"),
+            {"v": info.id}).first()
+        if current is None:
+            return None  # deleted or superseded while it was read
+        regression = reading_regression(conn, info.id, result)
+        recorded = (current.ingestion or {}).get("reprocess_regression")
+        if regression is not None and not (accept_regression and recorded):
+            regression["current_reading_id"] = (current.ingestion or {}).get("reading_id")
+        else:
+            anchors = measurement_anchors(conn, info.id)  # where each measurement sits, before the old reading goes
+            for table in _DERIVED_TEXT_TABLES:
+                conn.execute(text(f"DELETE FROM {table} WHERE version_id = :v"), {"v": info.id})
+            records = conn.execute(text("SELECT count(*) FROM occurrences WHERE version_id = :v"),
+                                   {"v": info.id}).scalar_one()
+            _insert_outputs(conn, info, result, embeddings,
+                            {"accepted_regression": regression} if regression is not None else None)
+            anchored = reanchor_measurements(conn, info.id, anchors,
+                                             ((result.fontmap or {}).get("corrections") or []))
+            conn.execute(text("DELETE FROM facts WHERE version_id = :v AND status IN ('auto_validated',"
+                              " 'needs_review')"), {"v": info.id})
+            conn.execute(text("DELETE FROM fact_extraction_ledger WHERE version_id = :v"), {"v": info.id})
+            conn.execute(text("DELETE FROM answer_cache"))
+            bump_data_version(conn)
+            logger.info("reindexed version %s (%d records kept; measurements %s%s)", info.id, records, anchored,
+                        "; regression accepted" if regression is not None else "")
+            regression = None
+    if regression is not None:
+        with tenant_tx(ctx) as conn:
+            conn.execute(text(
+                "UPDATE document_versions SET ingestion = COALESCE(ingestion, '{}'::jsonb)"
+                " || jsonb_build_object('reprocess_regression', CAST(:r AS jsonb)) WHERE id = :v"),
+                {"v": info.id, "r": json.dumps(regression, ensure_ascii=False)})
+        logger.info("reindex of version %s kept the current reading: %s", info.id, regression_summary(regression))
+        raise ReadingRegression(regression)
     if vision_reader(ctx) is not None:
         from app.measurements.extract import EXTRACTION_VERSION as MEASURE_VERSION
 

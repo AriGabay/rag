@@ -30,6 +30,9 @@ export interface ChatSource {
   page_list: number[] | null;
   chunk_id: string | null;
   listed_document_ids?: string[];
+  /** The reading the cited blocks belong to (null: an answer from before readings had ids). Absent on a source
+   * that does not come from an answer (the review screen opens the current reading). */
+  reading_id?: string | null;
 }
 
 export interface ChatMeasurement {
@@ -52,6 +55,10 @@ export interface ChatMeasurement {
   section: string | null;
   block_index: number | null;
   table_index: number | null;
+  /** The reading its place belongs to. */
+  reading_id?: string | null;
+  /** Its place was not found again when the document was reprocessed: not verified against the current reading. */
+  anchor_lost?: boolean;
 }
 
 export interface ChatComputation {
@@ -214,4 +221,8 @@ export interface SourceBlocks {
   total: number;
   blocks: SourceBlock[];
   file_url: string;
+  /** The version's current reading. */
+  reading_id?: string | null;
+  /** The document was reprocessed after the citation: its block numbers mean other text now, so no blocks. */
+  stale?: boolean;
 }

@@ -106,8 +106,11 @@ def test_re_ingestion_reads_nothing_again(offices):
 def test_a_rate_limited_reading_fails_the_job_and_keeps_the_earlier_reading(offices):
     a, _ = offices
     ver = ingest(a, R1, ScriptedVision())
-    before = rows(a, "SELECT block_index, status, text FROM document_blocks WHERE version_id = :v"
-                     " ORDER BY block_index", v=ver)
+    reading = ("SELECT block_index, status, text FROM document_blocks WHERE version_id = :v ORDER BY block_index",
+               "SELECT chunk_index, text, embedding::text, embedding_model FROM chunks WHERE version_id = :v"
+               " ORDER BY chunk_index",
+               "SELECT ingestion->>'reading_id' FROM document_versions WHERE id = :v")
+    before = [rows(a, sql, v=ver) for sql in reading]
     with tenant_tx(a.system) as conn:  # a reading under a new reader version: nothing cached for it
         conn.execute(text("DELETE FROM image_readings"))
         assert enqueue_reindex(conn, ver, pipeline.PDF_INGESTION_VERSION)
@@ -116,9 +119,8 @@ def test_a_rate_limited_reading_fails_the_job_and_keeps_the_earlier_reading(offi
         pass
     job = rows(a, "SELECT status, last_error FROM jobs WHERE payload->>'mode' = 'reindex'")[0]
     assert job.status in ("queued", "failed") and "rate_limited" in job.last_error  # retried later
-    after = rows(a, "SELECT block_index, status, text FROM document_blocks WHERE version_id = :v"
-                    " ORDER BY block_index", v=ver)
-    assert after == before
+    after = [rows(a, sql, v=ver) for sql in reading]
+    assert after == before  # blocks, chunks with their embeddings, and the reading id: all as they were
 
 
 def test_invalid_output_twice_leaves_the_region_unread_and_the_job_completes(offices):

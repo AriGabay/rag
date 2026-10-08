@@ -174,9 +174,18 @@ export const chatApi = {
     request<ChatMessage>(`/api/chat/messages/${encodeURIComponent(id)}`, { signal }),
   cancel: (id: string) => request<ChatMessage>(`/api/chat/messages/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
   retry: (id: string) => request<ChatMessage>(`/api/chat/messages/${encodeURIComponent(id)}/retry`, { method: "POST" }),
-  blocks: (documentId: string, versionId: string, start?: number, end?: number, signal?: AbortSignal) =>
+  /** `readingId`: the reading a citation was made from ("none" for one from before readings had ids); a
+   * reprocessed document then answers `stale` with no blocks. */
+  blocks: (
+    documentId: string,
+    versionId: string,
+    start?: number,
+    end?: number,
+    signal?: AbortSignal,
+    readingId?: string,
+  ) =>
     request<SourceBlocks>(
-      `/api/documents/${encodeURIComponent(documentId)}/versions/${encodeURIComponent(versionId)}/blocks${qs({ start, end })}`,
+      `/api/documents/${encodeURIComponent(documentId)}/versions/${encodeURIComponent(versionId)}/blocks${qs({ start, end, reading_id: readingId })}`,
       { signal },
     ),
 };

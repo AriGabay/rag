@@ -139,10 +139,14 @@ def _requeue(conn: Connection, version_id: UUID, kind: str, key: str, payload: d
     ).first() is not None
 
 
-def enqueue_reindex(conn: Connection, version_id: UUID, ingestion_version: str) -> bool:
-    """Read a processed version again (blocks, pictures, chunks, embeddings) without touching its records."""
-    return _requeue(conn, version_id, "process", f"reindex:{version_id}:{ingestion_version}",
-                    {"mode": "reindex", "ingestion_version": ingestion_version})
+def enqueue_reindex(conn: Connection, version_id: UUID, ingestion_version: str,
+                    accept_regression: bool = False) -> bool:
+    """Read a processed version again (blocks, pictures, chunks, embeddings) without touching its records.
+    ``accept_regression``: an admin's decision to accept the regression recorded by an earlier run (KTD7)."""
+    payload = {"mode": "reindex", "ingestion_version": ingestion_version}
+    if accept_regression:
+        payload["accept_regression"] = True
+    return _requeue(conn, version_id, "process", f"reindex:{version_id}:{ingestion_version}", payload)
 
 
 def enqueue_measurements(conn: Connection, version_id: UUID, extraction_version: str) -> bool:

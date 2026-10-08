@@ -11,6 +11,13 @@ interface JobRow {
   count: number;
 }
 
+/** A new reading held back because it read a document worse than its current reading (the current one stays). */
+interface HeldReading {
+  version_id: string;
+  title: string;
+  summary: string;
+}
+
 const KIND_LABEL: Record<string, string> = {
   process: "עיבוד מסמך",
   "process:reindex": "קריאה מחדש",
@@ -20,22 +27,24 @@ const KIND_LABEL: Record<string, string> = {
 const STATUS_LABEL: Record<string, string> = { queued: "בתור", running: "רץ", done: "הסתיים", failed: "נכשל" };
 
 /** Reading the office's documents again after the reader changed, and the background queue's state. */
-const fetchJobs = () => request<{ jobs: JobRow[] }>("/api/admin/jobs");
+const fetchJobs = () => request<{ jobs: JobRow[]; regressions?: HeldReading[] }>("/api/admin/jobs");
 
 export function ReprocessPanel() {
   const jobsApi = useApi(fetchJobs);
   const jobs = jobsApi.data?.jobs ?? null;
+  const held = jobsApi.data?.regressions ?? [];
   const load = jobsApi.reload;
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   useInterval(load, 5000, true);
 
-  const run = async (path: string, all: boolean, label: string) => {
+  const run = async (path: string, all: boolean, label: string, acceptRegression = false) => {
     setBusy(true);
     setError(null);
     try {
-      const res = await request<{ queued: number }>(path, { method: "POST", body: { all } });
+      const body = acceptRegression ? { all, accept_regression: true } : { all };
+      const res = await request<{ queued: number }>(path, { method: "POST", body });
       setNotice(`${label}: ${res.queued} מסמכים נוספו לתור.`);
       load();
     } catch (err) {
@@ -64,6 +73,32 @@ export function ReprocessPanel() {
           חילוץ נתונים כמותיים חסרים
         </button>
       </div>
+      {held.length > 0 && (
+        <div className="stack small" role="note">
+          <strong>קריאות חדשות שנעצרו ({held.length})</strong>
+          <span className="muted">
+            הקריאה החדשה של המסמכים האלה קראה פחות מהקריאה הקיימת, ולכן הקריאה הקיימת נשארה. אפשר לאשר את הקריאה
+            החדשה רק לאחר בדיקה.
+          </span>
+          <ul>
+            {held.map((h) => (
+              <li key={h.version_id}>
+                <bdi>{h.title}</bdi>: <bdi>{h.summary}</bdi>
+              </li>
+            ))}
+          </ul>
+          <div className="row">
+            <button
+              type="button"
+              className="btn"
+              disabled={busy}
+              onClick={() => void run("/api/admin/reprocess", false, "אישור קריאות שנעצרו", true)}
+            >
+              אישור הקריאות החדשות שנעצרו
+            </button>
+          </div>
+        </div>
+      )}
       {notice && <Notice kind="ok">{notice}</Notice>}
       <ErrorAlert message={error ?? jobsApi.error} onRetry={load} />
       <div className="small">

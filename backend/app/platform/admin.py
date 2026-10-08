@@ -228,25 +228,36 @@ def coverage_summary(ctx: TenantContext = Depends(require_admin)) -> dict:
 
 class ReprocessBody(BaseModel):
     all: bool = False  # False: only versions read by an older reader / not yet measured
+    # reprocess only: read again the versions whose last reading was held back as worse than the current one
+    # (``ingestion.reprocess_regression``), accepting that regression (KTD7)
+    accept_regression: bool = False
 
 
 @router.post("/reprocess")
 def reprocess(body: ReprocessBody, ctx: TenantContext = Depends(require_admin)) -> dict:
     """Queue a fresh reading of the office's current documents (blocks, pictures, chunks, embeddings; records and
-    reviewed decisions kept). Without ``all``, only versions read by an older reader."""
+    reviewed decisions kept). Without ``all``, only versions read by an older reader; a version whose new reading
+    was held back as worse than its current one waits for an admin: ``accept_regression`` reads exactly those
+    again and lets the new reading replace the current one despite the recorded regression."""
     from app.platform.jobs import enqueue_reindex
     from app.platform.pipeline import INGESTION_VERSION, PDF_INGESTION_VERSION, ingestion_version
 
     with tenant_tx(ctx) as conn:
         rows = conn.execute(text(
-            "SELECT v.id, v.mime_type, v.ingestion->>'ingestion_version' AS iv FROM document_versions v JOIN"
+            "SELECT v.id, v.mime_type, v.ingestion->>'ingestion_version' AS iv,"
+            " (v.ingestion ? 'reprocess_regression') AS held FROM document_versions v JOIN"
             " documents d ON d.id = v.document_id AND d.deleted_at IS NULL WHERE v.is_current AND v.status IN"
             " ('ready', 'needs_review')")).all()
-        queued = [str(r.id) for r in rows if (body.all or r.iv != ingestion_version(r.mime_type))
-                  and enqueue_reindex(conn, r.id, ingestion_version(r.mime_type))]
-        audit(conn, "reprocess", ctx.user_id, "office", ctx.office_id)
+        if body.accept_regression:
+            wanted = [r for r in rows if r.held]
+        else:
+            wanted = [r for r in rows if body.all or (r.iv != ingestion_version(r.mime_type) and not r.held)]
+        queued = [str(r.id) for r in wanted
+                  if enqueue_reindex(conn, r.id, ingestion_version(r.mime_type), body.accept_regression)]
+        audit(conn, "reprocess", ctx.user_id, "office", ctx.office_id, accept_regression=body.accept_regression)
     return {"queued": len(queued), "versions": queued, "ingestion_version": INGESTION_VERSION,
-            "ingestion_versions": {"docx": INGESTION_VERSION, "pdf": PDF_INGESTION_VERSION}}
+            "ingestion_versions": {"docx": INGESTION_VERSION, "pdf": PDF_INGESTION_VERSION},
+            "held": sum(1 for r in rows if r.held)}
 
 
 @router.post("/measurements")
@@ -268,9 +279,18 @@ def extract_measurements(body: ReprocessBody, ctx: TenantContext = Depends(requi
 
 @router.get("/jobs")
 def jobs_summary(ctx: TenantContext = Depends(require_admin)) -> dict:
+    from app.platform.pipeline import regression_summary
+
     with tenant_tx(ctx) as conn:
         rows = conn.execute(text(
             "SELECT kind, COALESCE(payload->>'mode', '') AS mode, status, count(*) AS n FROM jobs"
             " GROUP BY 1, 2, 3 ORDER BY 1, 2, 3")).all()
+        held = conn.execute(text(
+            "SELECT v.id, d.title, v.ingestion->'reprocess_regression' AS r FROM document_versions v JOIN documents d"
+            " ON d.id = v.document_id AND d.deleted_at IS NULL WHERE v.is_current AND v.ingestion ?"
+            " 'reprocess_regression' ORDER BY d.title")).all()
+    # new readings held back as worse than the current one: kept until an admin accepts them (KTD7)
     return {"jobs": [{"kind": r.kind + (f":{r.mode}" if r.mode else ""), "status": r.status, "count": r.n}
-                     for r in rows]}
+                     for r in rows],
+            "regressions": [{"version_id": str(r.id), "title": r.title, "summary": regression_summary(r.r),
+                             "regression": r.r} for r in held]}

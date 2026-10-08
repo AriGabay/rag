@@ -511,7 +511,9 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
             prior[pid] = {"version_id": s["version_id"], "block_start": s.get("block_start"),
                           "block_end": s.get("block_end"), "table_index": s.get("table_index"),
                           "chunk_id": s.get("chunk_id"), "title": s.get("title"), "location": s.get("location"),
-                          "excerpt": " ".join((s.get("text") or "").split())[:160]}
+                          "excerpt": " ".join((s.get("text") or "").split())[:160],
+                          # the reading it was read from; an answer from before reading ids has none (KTD7)
+                          "reading_id": s.get("reading_id")}
     # the last answer's focus, or, when it named no datum, the request it answered (``app.chat.resolve``); its
     # message is in ``rows`` only while every document it names is visible
     last_focus = None
@@ -566,7 +568,7 @@ def _answer_payload(outcome: engine.TurnOutcome) -> dict:
                             "title": m["title"], "section": m["section"], "location": "נתון כמותי שחולץ",
                             "kind": "measurement", "text": m["quote"], "block_start": m["block_index"],
                             "block_end": m["block_index"], "table_index": m["table_index"], "page_list": None,
-                            "chunk_id": None})
+                            "chunk_id": None, "reading_id": m.get("reading_id")})
     focus = None
     if a.focus is not None:
         # only documents this turn actually touched or cites; a focus with none is no focus

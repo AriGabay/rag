@@ -386,8 +386,8 @@ _MEDIA_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "
 
 def _version_row(conn: Connection, doc_uuid: UUID, ver_uuid: UUID):
     row = conn.execute(
-        text("SELECT v.id, v.storage_key, v.mime_type, v.filename, v.is_current, v.page_count, d.title"
-             " FROM document_versions v"
+        text("SELECT v.id, v.storage_key, v.mime_type, v.filename, v.is_current, v.page_count, d.title,"
+             " v.ingestion->>'reading_id' AS reading_id FROM document_versions v"
              " JOIN documents d ON d.id = v.document_id WHERE v.id = :v AND d.id = :d AND d.deleted_at IS NULL"),
         {"v": ver_uuid, "d": doc_uuid},
     ).first()
@@ -396,14 +396,25 @@ def _version_row(conn: Connection, doc_uuid: UUID, ver_uuid: UUID):
     return row
 
 
+NO_READING = "none"  # the cited reading predates reading ids
+
+
 @router.get("/{document_id}/versions/{version_id}/blocks")
 def get_blocks(document_id: str, version_id: str, start: int | None = Query(None, ge=0),
-               end: int | None = Query(None, ge=0), ctx: TenantContext = Depends(get_ctx)) -> dict:
+               end: int | None = Query(None, ge=0), reading_id: str | None = Query(None, max_length=64),
+               ctx: TenantContext = Depends(get_ctx)) -> dict:
     """The version's blocks in reading order (a window when ``start``/``end`` are given), with each table's
-    structure: what the source viewer shows around a cited location."""
+    structure: what the source viewer shows around a cited location. ``reading_id``: the reading the citation was
+    made from (``none`` for one made before readings had ids). When the version has been read again since, block
+    numbers no longer mean what the citation meant: the answer is ``stale`` with no blocks (KTD7)."""
     doc_uuid, ver_uuid = parse_uuid(document_id), parse_uuid(version_id)
     with tenant_tx(ctx) as conn:
         v = _version_row(conn, doc_uuid, ver_uuid)
+        if reading_id is not None and (None if reading_id == NO_READING else reading_id) != v.reading_id:
+            return {"document_id": document_id, "version_id": version_id, "title": v.title,
+                    "is_current": v.is_current, "mime_type": v.mime_type, "total": 0, "blocks": [],
+                    "reading_id": v.reading_id, "stale": True,
+                    "file_url": f"/api/documents/{document_id}/versions/{version_id}/file"}
         params: dict = {"v": ver_uuid, "a": start if start is not None else 0,
                         "b": end if end is not None else 1_000_000}
         rows = conn.execute(text(
@@ -434,7 +445,7 @@ def get_blocks(document_id: str, version_id: str, start: int | None = Query(None
                 b["region_url"] = f"/api/documents/{document_id}/versions/{version_id}/regions/{r.block_index}/image"
         blocks.append(b)
     return {"document_id": document_id, "version_id": version_id, "title": v.title, "is_current": v.is_current,
-            "mime_type": v.mime_type, "total": total, "blocks": blocks,
+            "mime_type": v.mime_type, "total": total, "blocks": blocks, "reading_id": v.reading_id, "stale": False,
             "file_url": f"/api/documents/{document_id}/versions/{version_id}/file"}
 
 

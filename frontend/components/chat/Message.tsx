@@ -23,8 +23,9 @@ const STATUS: Record<string, string> = {
 
 /** The source a citation opens: a passage itself, or the passage of the measurement it cites. */
 export function citedSource(answer: ChatAnswer, id: string): ChatSource | null {
+  // an answer's source is bound to the reading it was read from (null: an answer from before reading ids)
   const direct = answer.sources.find((s) => s.id === id);
-  if (direct) return direct;
+  if (direct) return { ...direct, reading_id: direct.reading_id ?? null };
   const m = answer.measurements.find((x) => x.id === id);
   if (m) {
     return {
@@ -41,6 +42,7 @@ export function citedSource(answer: ChatAnswer, id: string): ChatSource | null {
       table_index: m.table_index,
       page_list: null,
       chunk_id: null,
+      reading_id: m.reading_id ?? null,
     };
   }
   return null;

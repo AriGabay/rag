@@ -135,3 +135,11 @@ def is_negation(word: str, *, ambiguous: bool = True) -> bool:
 
     return listed(word, True) or any(
         word.startswith(p) and listed(word[len(p):], False) for p in _NEGATION_PREFIXES)
+
+
+def undouble_word(word: str) -> str:
+    """A word whose every character appears twice in a row (``'ההננככסס'``, ``'2200,,550000'``) read once: what an
+    older reader extracted from a bold font drawn twice, before char dedupe. Any other word is returned as is."""
+    if len(word) >= 2 and len(word) % 2 == 0 and word[0::2] == word[1::2]:
+        return word[0::2]
+    return word

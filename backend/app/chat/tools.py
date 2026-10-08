@@ -106,6 +106,9 @@ class Source:
     listed: list[str] = field(default_factory=list)  # a listing's documents (its page), for permission checks
     # a listing's set: {"key", "criterion", "total", "page", "pages", "documents": [{document_id, title}]}
     listing: dict | None = None
+    # the reading its blocks were read from (``document_versions.ingestion.reading_id``, KTD7): a reference to it
+    # after the version was read again is stale
+    reading_id: str | None = None
 
     @property
     def is_listing(self) -> bool:
@@ -116,7 +119,7 @@ class Source:
                "version_id": str(self.version_id) if self.version_id else None,
                "title": self.title, "section": self.section, "location": self.location, "kind": self.kind,
                "text": self.text, "block_start": self.block_start, "block_end": self.block_end,
-               "table_index": self.table_index, "page_list": self.page_list}
+               "table_index": self.table_index, "page_list": self.page_list, "reading_id": self.reading_id}
         if self.is_listing:
             out["listed_document_ids"] = list(self.listed)
         return out
@@ -139,7 +142,14 @@ class Measurement:
                 "metric_kind": r.metric_kind, "value_text": r.value_text, "unit": r.unit, "period": r.period,
                 "vat": r.vat, "area_basis": r.area_basis, "subject": r.subject, "value_role": r.value_role,
                 "status": r.status, "quote": r.quote, "section": r.section, "block_index": r.block_index,
-                "table_index": r.table_index}
+                "table_index": r.table_index, "anchor_lost": anchor_lost(r),
+                "reading_id": getattr(r, "reading_id", None)}
+
+
+def anchor_lost(row) -> bool:
+    """A reviewed measurement whose place was not found again when its document was reprocessed (KTD7): its
+    value keeps the reviewer's decision, but it is not verified against a cell or passage of the current reading."""
+    return getattr(row, "anchor_lost", None) is not None
 
 
 @dataclass
@@ -178,6 +188,17 @@ class Workspace:
     listings: dict[tuple, dict] = field(default_factory=dict)
     returned: dict[tuple, str] = field(default_factory=dict)  # what was already returned -> its first id
     fetched: dict = field(default_factory=dict)  # what the meaning check read for the turn (``meaning.Fetcher``)
+    # version id -> its reading id as the turn first read it (KTD7). Pinned for the turn: a version read again
+    # mid-turn makes the turn's earlier sources of it stale, never silently re-bound.
+    readings: dict = field(default_factory=dict)
+
+    def note_readings(self, conn: Connection, version_ids) -> None:
+        """Pin the reading ids of versions the turn is reading, in the transaction that reads them."""
+        todo = list({str(v) for v in version_ids if v is not None} - set(self.readings))
+        if todo:
+            for r in conn.execute(text("SELECT id, ingestion->>'reading_id' AS reading_id FROM document_versions"
+                                       " WHERE id = ANY(:v)"), {"v": [UUID(v) for v in todo]}):
+                self.readings[str(r.id)] = r.reading_id
 
     def once(self, source: Source, key: tuple) -> Source:
         """Mark a source whose text this turn already returned: it keeps its own id (citable, verified against
@@ -216,6 +237,8 @@ class Workspace:
 
     def adopt(self, source: Source) -> Source:
         """Register a source the server read for its own checks, once it is cited (a new id)."""
+        if source.version_id is not None and source.reading_id is None:
+            source.reading_id = self.readings.get(str(source.version_id))
         source.sid = self._sid()
         self.sources[source.sid] = source
         return source
@@ -360,6 +383,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
         extra = {r.id: r for r in conn.execute(text(
             "SELECT id, block_start, block_end FROM chunks WHERE id = ANY(:i)"), {"i": ids})} if ids else {}
         partial = _partial_versions(conn, list({h["version_id"] for h in hits}))
+        ws.note_readings(conn, {h["version_id"] for h in hits})
         sizes = _table_sizes(conn, {(h["version_id"], h.get("table_index")) for h in hits
                                     if h["kind"] in ("table", "table_row") and h.get("table_index") is not None})
         # a table chunk already holds its rows: a row hit of a returned table part adds nothing
@@ -386,12 +410,16 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
     return "\n\n".join(_render_source(s) for s in out)
 
 
+MSG_STALE_REF = ("המקור {source_id} נקרא מקריאה קודמת של המסמך: המסמך עובד מחדש מאז, והמיקום שלו אינו תקף עוד. "
+                 "לא נפתח דבר. כדי להסתמך על התוכן יש לחפש אותו מחדש במסמך (search או outline).")
+
+
 def _ref(ws: Workspace, source_id: str) -> dict:
     sid = (source_id or "").strip()
     if sid in ws.sources:
         s = ws.sources[sid]
         return {"version_id": s.version_id, "block_start": s.block_start, "block_end": s.block_end,
-                "table_index": s.table_index, "chunk_id": s.chunk_id}
+                "table_index": s.table_index, "chunk_id": s.chunk_id, "reading_id": s.reading_id}
     if sid in ws.prior:
         return ws.prior[sid]
     raise ToolError(f"מזהה מקור לא מוכר: {source_id}. אפשר לפתוח רק מקורות שהוחזרו בתור הזה (S#) או הפניות מתורות קודמות (P#).")
@@ -413,6 +441,7 @@ def read_scope(ws: Workspace, source_id: str, scope: str = "neighbors", quiet: b
     ref = ref or _ref(ws, source_id)
 
     def make(**kw) -> Source:
+        kw["reading_id"] = head.reading_id
         return Source(sid="", **kw) if quiet else ws.add_source(**kw)
 
     def touch(*args, **kw) -> None:
@@ -422,10 +451,14 @@ def read_scope(ws: Workspace, source_id: str, scope: str = "neighbors", quiet: b
     vid = UUID(str(ref["version_id"]))
     with tenant_tx(ws.ctx) as conn:
         head = conn.execute(text(
-            "SELECT v.id, v.document_id, d.title FROM document_versions v JOIN documents d ON d.id = v.document_id"
-            " AND d.deleted_at IS NULL WHERE v.id = :v"), {"v": vid}).first()
+            "SELECT v.id, v.document_id, d.title, v.ingestion->>'reading_id' AS reading_id FROM document_versions v"
+            " JOIN documents d ON d.id = v.document_id AND d.deleted_at IS NULL WHERE v.id = :v"), {"v": vid}).first()
         if head is None:
             raise ToolError("המקור אינו זמין עוד (נמחק או שאין הרשאה)")
+        if "reading_id" in ref and ref["reading_id"] != head.reading_id:
+            # block numbers of an earlier reading mean other text in the current one: nothing is opened
+            raise ToolError(MSG_STALE_REF.format(source_id=source_id))
+        ws.readings.setdefault(str(vid), head.reading_id)
         partial = bool(_partial_versions(conn, [vid]))
         touch(head.document_id, head.title, "retrieved", partial)
         start, end = ref.get("block_start"), ref.get("block_end")
@@ -685,7 +718,7 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
         page, pages = _paginate(page, total, MEASUREMENTS_MAX)
         # a total order (the id breaks ties), so no row falls between two pages
         rows = conn.execute(text(
-            "SELECT m.*, d.title" + where + " ORDER BY d.title, d.id, m.block_index NULLS FIRST,"
+            "SELECT m.*, d.title, v.ingestion->>'reading_id' AS reading_id" + where + " ORDER BY d.title, d.id, m.block_index NULLS FIRST,"
             f" m.row_index NULLS FIRST, m.id LIMIT {MEASUREMENTS_MAX} OFFSET :o"),
             params | {"o": (page - 1) * MEASUREMENTS_MAX}).all()
         scope_rows = conn.execute(text(
@@ -731,6 +764,8 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
                       "needs_review": "ממתין לבדיקה"}.get(r.status, r.status)
             extra = f" | נושא: {_txt(r.subject)}" if r.subject else ""
             issues = f" | הערות: {_txt('; '.join(r.issues))}" if r.issues else ""
+            if anchor_lost(r):
+                issues += " | המיקום במסמך אבד בעיבוד מחדש: הערך אינו מאומת מול הקריאה הנוכחית של המסמך"
             out.append(f'  {m.mid}: {_txt(r.metric)} = {_txt(r.value_text)} | מסמך: "{_txt(m.title)}"{extra}'
                        f" | סטטוס: {status}{issues}\n    ציטוט: {_txt(_clip(r.quote, 300))}")
     return "\n".join(out)
@@ -798,6 +833,10 @@ def tool_compute(ws: Workspace, operation: str, measurement_ids: list[str]) -> s
     approx = [m.mid for m in ms if m.row.value_form != "exact"]
     if approx:
         note = "חלק מהערכים מקורבים או גבולות (" + ", ".join(approx) + "); התוצאה מקורבת בהתאם."
+    lost = [m.mid for m in ms if anchor_lost(m.row)]
+    if lost:
+        note = (note + " " if note else "") + ("מיקומם של חלק מהערכים במסמך אבד בעיבוד מחדש (" + ", ".join(lost)
+                                              + "); הם אינם מאומתים מול הקריאה הנוכחית.")
     # the values were chosen from a listing whose later pages were not read: more matching values may exist
     unread = [ws.listings[k] for k in {k for m in ms for k in m.listings}
               if len(ws.listings[k]["pages_read"]) < ws.listings[k]["pages"]]

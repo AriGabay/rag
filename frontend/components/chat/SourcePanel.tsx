@@ -34,6 +34,14 @@ const REGION_STATUS: Record<string, string> = {
 };
 const MSG_IMAGE_UNAVAILABLE = "התמונה אינה זמינה";
 const MSG_REVOKED = "המקור אינו זמין עוד (ייתכן שהמסמך נמחק או שההרשאה אליו הוסרה).";
+const MSG_STALE =
+  "המסמך עובד מחדש אחרי שניתנה התשובה, ולכן המיקום המדויק של הציטוט אינו זמין. מוצג הטקסט כפי שצוטט בתשובה.";
+/** The reading a citation is bound to, as the blocks request carries it: an answer's source always checks it ("none"
+ * for an answer from before readings had ids); a source from elsewhere (the review screen) opens the current one. */
+function citedReading(source: ChatSource): string | undefined {
+  if (source.reading_id === undefined) return undefined;
+  return source.reading_id ?? "none";
+}
 
 /** Where a block can be opened as an image: PDF pictures and tables, blocks not fully read, and the cited ones. */
 function hasRegionMarker(block: SourceBlock, cited: boolean): boolean {
@@ -55,6 +63,8 @@ export function SourcePanel({ source, onClose }: { source: ChatSource; onClose: 
     closeRef.current?.focus();
   }, [source.id]);
 
+  const reading = citedReading(source);
+
   useEffect(() => {
     // the parent keys this panel by source, so a new source starts from empty state
     const ctrl = new AbortController();
@@ -63,13 +73,20 @@ export function SourcePanel({ source, onClose }: { source: ChatSource; onClose: 
     // a listing of documents has no place in a document: its text is all there is
     if (start == null || !source.document_id || !source.version_id) return () => ctrl.abort();
     chatApi
-      .blocks(source.document_id, source.version_id, Math.max(0, start - WINDOW), (end ?? start) + WINDOW, ctrl.signal)
+      .blocks(
+        source.document_id,
+        source.version_id,
+        Math.max(0, start - WINDOW),
+        (end ?? start) + WINDOW,
+        ctrl.signal,
+        reading,
+      )
       .then(setData)
       .catch((err: unknown) => {
         if (!isAbortError(err)) setError(errorMessage(err));
       });
     return () => ctrl.abort();
-  }, [source.document_id, source.version_id, source.block_start, source.block_end]);
+  }, [source.document_id, source.version_id, source.block_start, source.block_end, reading]);
 
   useEffect(() => {
     if (!data) return;
@@ -137,6 +154,11 @@ export function SourcePanel({ source, onClose }: { source: ChatSource; onClose: 
           !error && <p className="muted">למקור הזה אין מיקום מפורט במסמך; מוצג הקטע שצוטט.</p>
         )}
         {source.block_start != null && !data && !error && <p className="muted">טוען את המסמך…</p>}
+        {data?.stale && (
+          <p className="muted" role="note">
+            {MSG_STALE}
+          </p>
+        )}
         {data?.blocks.map((b) => (
           <Block
             key={b.index}
