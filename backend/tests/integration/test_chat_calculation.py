@@ -375,3 +375,59 @@ def test_parallel_tool_calls_of_one_step_all_run_and_count_as_one_step(client, o
     assert [i["output"][:2] for i in third] == ["V1", "V2", "A1"] and all("נרשם" in i["output"] for i in third)
     assert len(agent.seen) == 6 and m["answer"]["limits_hit"] == [] and m["answer"]["status"] == "answered"
     assert m["answer"]["steps"] == 6
+
+
+# --- U8: a computed result is verified as a computation -----------------------------------------------------------
+
+SCENARIO_LEAD = "לפי הנחתך שהעלויות יעלו ב-5% [A1]. "
+
+
+def test_a_computed_profit_cited_only_through_its_inputs_is_kept_and_cites_its_calculation(client, office,
+                                                                                           monkeypatch):
+    answer = SCENARIO_LEAD + "הרווח בתרחיש יהיה 1,530,000 ₪ [V1][V2]."
+    agent = ScriptedAgent([*_ae4_steps(office.doc)[:4], final(answer, documents=[office.doc])])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), QUESTION)
+    assert m["status"] == "done", m
+    a = m["answer"]
+    assert a["verification"]["removed"] == 0 and a["status"] == "answered", a
+    assert "1,530,000 ₪ [V1][V2][C1]" in a["markdown"]
+    assert [c["id"] for c in a["computations"]] == ["C1"] and a["computations"][0]["vat"] == "excluded"
+
+
+@pytest.mark.parametrize("shown, kept", [
+    ("הרווח בתרחיש יהיה 1.53 מיליון ₪, ללא מע״מ [C1].", True),
+    ("הרווח בתרחיש יהיה 1.53 מיליון ₪ [V1][V2].", True),
+    ("הרווח בתרחיש יהיה 1.6 מיליון ₪ [C1].", False),
+    ("הרווח בתרחיש יהיה 1,530,000 ₪ כולל מע״מ [C1].", False),
+    ("השומה מציינת רווח של 1,530,000 ₪ [V1][V2].", False),
+])
+def test_a_computed_result_is_kept_at_its_scale_and_vat_basis_and_removed_when_misstated_or_misattributed(
+        client, office, monkeypatch, shown, kept):
+    answer = final(SCENARIO_LEAD + shown, documents=[office.doc])
+    # a misstated result stays misstated through the repair and the rewrite
+    agent = ScriptedAgent([*_ae4_steps(office.doc)[:4], answer, answer, answer])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), QUESTION)
+    assert m["status"] == "done", m
+    a = m["answer"]
+    if kept:
+        assert a["verification"]["removed"] == 0 and "[C1]" in a["markdown"], a
+    else:
+        assert a["verification"]["removed"] == 1 and "1,530,000" not in a["markdown"] and "1.6" not in a["markdown"]
+        assert "[C1]" not in a["markdown"]
+
+
+def test_a_division_by_zero_on_found_values_is_reported_as_a_failed_calculation_not_missing_data(office):
+    ws = workspace(office)
+    s = read_table(ws, office.doc)
+    for label in ("הכנסות", "הכנסות (שוב)"):
+        assert run(ws, "take_value", source=s, locator=cell("סה\"כ", INCOME), meaning=meaning("income", role="income"),
+                   label=label).startswith("V")
+    assert run(ws, "take_value", source=s, locator=cell("סה\"כ", COST), meaning=meaning("cost", role="cost"),
+               label="עלויות").startswith("V3")
+    out = run(ws, "calculate", expression="V3 / (V1 - V2)", label="יחס", justification=None)
+    assert out.startswith("שגיאה") and "חלוקה באפס" in out
+    assert "החישוב נכשל" in out and "לא נתון חסר" in out and not ws.computations

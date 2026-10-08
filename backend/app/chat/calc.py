@@ -90,6 +90,9 @@ class Leaf:
     total: bool = False
     table: tuple | None = None  # (version id, table index) of a value taken from a table
     role: str | None = None
+    # the VAT status of an amount of money ("included", "excluded" or "unknown"); None for an input that is not money
+    # (an area, a rate, a coefficient), which has no VAT to share with the result
+    vat: str | None = None
 
 
 @dataclass(frozen=True)
@@ -135,9 +138,11 @@ def operand(id: str, value, unit: str, *, period: str | None = "none", vat: str 
             assumption: bool = False) -> Operand:
     """An input operand from its meaning, as the tools register it."""
     total = total or role == "total"
-    return Operand(id, None if value is None else Decimal(str(value)), dims_of(unit), _period(period), _vat(vat),
+    dims = dims_of(unit)
+    money = (_vat(vat) or "unknown") if "ILS" in dict(dims) else None
+    return Operand(id, None if value is None else Decimal(str(value)), dims, _period(period), _vat(vat),
                    (basis or "").strip(), kind, role, norm_subject(subject), group, same, approx, None,
-                   (Leaf(id, total, table, role),), (id,) if assumption else ())
+                   (Leaf(id, total, table, role, money),), (id,) if assumption else ())
 
 
 @dataclass
@@ -417,6 +422,9 @@ MSG_TOTAL = ("אי אפשר לחבר שורת סה״כ עם הרכיבים של�
              "הרכיבים, או להשתמש בסה״כ לבדו")
 MSG_UNITS = "יחידות שונות ({a} ו-{b}) אינן מתחברות ({ids})"
 MSG_PERIODS = ("ערך לחודש וערך לשנה אינם מתחברים ({ids}): המר קודם ב-× 12 (חודשי לשנתי) או ב-÷ 12 (שנתי לחודשי)")
+# a calculation that fails on values that were all found is a failed calculation, never missing data (R17)
+MSG_FAILED = ("החישוב נכשל על הנתונים שנמצאו — זו תקלה בחישוב, לא נתון חסר: אמור למשתמש שהחישוב נכשל ומדוע, ואל "
+              "תכתוב שהנתונים לא נמצאו")
 MSG_RECURRING = ("ערך לתקופה (לחודש/לשנה, כמו דמי שכירות) וערך שאינו לתקופה (כמו שווי או עלות חד-פעמית) אינם "
                  "מתחברים ({ids})")
 
@@ -581,7 +589,7 @@ class _Eval:
                 dims = _combine(a.dims, b.dims, 1)
         else:
             if _value(b) == 0:
-                raise CalcError(f"חלוקה באפס ({ids})")
+                raise CalcError(f"חלוקה באפס ({ids}). {MSG_FAILED}")
             if a.dims == (pct,) and b.literal == hundred:
                 dims = ()
             elif (pct in a.dims) != (pct in b.dims):
@@ -666,7 +674,7 @@ def evaluate(node, operands: dict[str, Operand], justification: str | None = Non
         try:
             out = ev.eval(node)
         except (InvalidOperation, ArithmeticError) as exc:
-            raise CalcError(f"החישוב נכשל: {type(exc).__name__}") from None
+            raise CalcError(f"{type(exc).__name__}. {MSG_FAILED}") from None
     if ev.needs and not (justification or "").strip():
         raise CalcError("החישוב מערבב נתונים שאינם תואמים: " + "; ".join(ev.needs) + ". אפשר לחשב רק עם "
                         "justification שמסביר מדוע הערבוב תקף (התוצאה תסומן כמותנית), או לשאול את המשתמש")
@@ -699,9 +707,32 @@ def display(value: Decimal, dims: Dims, kind: str | None = None) -> dict:
     return out
 
 
-def display_matches(written: str, percent: bool, value: Decimal, dims: Dims, kind: str | None = None) -> bool:
-    """Whether a number shown in an answer (as written, with a % sign after it or not) is the full value rounded to
-    the precision it shows: 14.3% is 0.143155…, 14.30% and 14.4% are not."""
+# the scale words an answer writes after an amount ("1.53 מיליון ₪", "850 אלף", "2.1 מיליארד", "1.53M"), with their
+# multiplier; "מ׳" is also a metre, so it is a million only next to a currency ("₪1.53 מ׳", "1.53 מ׳ ש״ח")
+_SCALE = re.compile(r"[ \u00a0]?(?:(?P<word>מיליארדי|מיליארד|מיליוני|מיליון|אלפי|אלפים|אלף|מיל[׳'])"
+                    r"|(?P<abbr>מ[׳'])|(?P<latin>[KkM])(?![A-Za-z]))(?![א-ת])")
+SCALES = {"מיליארד": 10**9, "מיליארדי": 10**9, "מיליון": 10**6, "מיליוני": 10**6, "מיל׳": 10**6, "מיל'": 10**6,
+          "מ׳": 10**6, "מ'": 10**6, "אלף": 10**3, "אלפי": 10**3, "אלפים": 10**3, "K": 10**3, "k": 10**3, "M": 10**6}
+_CURRENCY = re.compile(r"₪|ש[\"״']ח|שקל")
+
+
+def scale_after(text: str, start: int, end: int) -> tuple[int, int]:
+    """The scale a number written at ``text[start:end]`` is shown in — the multiplier of the scale word right after
+    it (1 when there is none) — and where that word ends."""
+    m = _SCALE.match(text, end)
+    if m is None:
+        return 1, end
+    if m.group("abbr") and not (_CURRENCY.search(text[max(0, start - 3):start])
+                                or _CURRENCY.match(text[m.end():m.end() + 5].lstrip())):
+        return 1, end
+    return SCALES[m.group(0).strip(" \u00a0")], m.end()
+
+
+def display_matches(written: str, percent: bool, value: Decimal, dims: Dims, kind: str | None = None,
+                    scale: int = 1) -> bool:
+    """Whether a number shown in an answer (as written, with a % sign after it or not, and in the ``scale`` its scale
+    word gives it) is the full value rounded to the precision it shows: 14.3% is 0.143155…, 14.30% and 14.4% are
+    not; 1.53 מיליון is 1,530,000.4, and 1.6 מיליון is not."""
     raw = written.replace(",", "").strip()
     try:
         shown = Decimal(raw)
@@ -712,7 +743,7 @@ def display_matches(written: str, percent: bool, value: Decimal, dims: Dims, kin
     if percent and dims == () and kind != "count":
         candidates.append(value * 100)
     if not percent or dims == (("%", 1),):
-        candidates.append(value)
+        candidates.append(value if percent or scale == 1 else value / Decimal(scale))
     return any(_round(abs(c), places) == abs(shown) for c in candidates)
 
 
@@ -830,6 +861,16 @@ class Computation:
     def unit_label(self) -> str:
         return unit_label(self.dims, self.outcome.period)
 
+    @property
+    def vat(self) -> str | None:
+        """The VAT basis of an amount of money: the status every money input it rests on shares, through earlier
+        results ("included" or "excluded"); None for a result that is not money, or whose inputs differ or do not
+        say — VAT phrasing of the result is checked against it."""
+        if "ILS" not in dict(self.dims):
+            return None
+        statuses = {lf.vat for lf in self.outcome.leaves if lf.vat is not None}
+        return next(iter(statuses)) if len(statuses) == 1 and statuses <= {"included", "excluded"} else None
+
     def display(self) -> dict:
         return display(self.value, self.dims, self.outcome.kind)
 
@@ -839,7 +880,7 @@ class Computation:
                 "kind": self.outcome.kind, "result_kind": self.result_kind,
                 "result_kind_label": RESULT_KINDS[self.result_kind], "inputs": self.inputs,
                 "assumptions": self.assumptions, "sources": self.sources, "documents": self.documents,
-                "conditional": self.conditional, "conditions": list(self.outcome.conditional),
+                "conditional": self.conditional, "conditions": list(self.outcome.conditional), "vat": self.vat,
                 "justification": self.justification, "note": self.note, "reproduces": self.reproduces,
                 "n": self.outcome.n,
                 # the earlier shape, for readers of stored answers
