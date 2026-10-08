@@ -146,3 +146,75 @@ test("a count from a listing shows the listing inline and says the documents wer
   expect(blocksRequested).toBe(false);
   await page.request.delete(`/api/chat/conversations/${id}`);
 });
+
+test("a scenario answer shows its calculation and the user's assumption apart from the document data", async ({ page }) => {
+  await login(page, USERS.adminB);
+  const { id } = await (await page.request.post("/api/chat/conversations")).json();
+  const doc = { document_id: "00000000-0000-0000-0000-000000000001", title: "בדיקת כדאיות סינתטית" };
+  const md = "לפי הנחתך שהעלויות יעלו ב-5% [A1]: ההכנסות 12,450,000 ₪ [V1] והעלויות 10,400,000 ₪ [V2]. הרווח בתרחיש " +
+    "יהיה 1,530,000 ₪ [C1], שהם 12.3% מההכנסות [C2].";
+  const body = messages(id, { scope_kind: "focused", scope_query: "", complete: true }, md);
+  const answer = body.messages[1].answer as Record<string, unknown>;
+  const value = (vid: string, label: string, column: string, written: string) => ({
+    id: vid, value: written.replace(/,/g, ""), value_text: written, label, source_id: "S1", ...doc,
+    version_id: "00000000-0000-0000-0000-0000000000a1", reading_id: "r1", location: "עמוד 4, טבלה",
+    kind: vid === "V1" ? "income" : "cost", unit: "ILS", unit_label: "₪", period: "none", vat: "excluded",
+    area_basis: "", subject: "פרויקט סינתטי", role: vid === "V1" ? "income" : "cost",
+    provenance: { unit: "source", vat: "source", kind: "source", period: "not_stated", area_basis: "not_stated" },
+    certainty: "verified", locator: { row: "סה\"כ", column, row_number: 3, column_number: 2 },
+    quote: "סה\"כ | 12,450,000 | 10,400,000", total: true, approx: false });
+  const inputs = [
+    { id: "V1", label: "סה״כ הכנסות", kind: "value", value: "12450000", display: "12,450,000", value_text: "12,450,000",
+      source_id: "S1", certainty: "verified" },
+    { id: "V2", label: "סה״כ עלויות", kind: "value", value: "10400000", display: "10,400,000", value_text: "10,400,000",
+      source_id: "S1", certainty: "verified" },
+    { id: "A1", label: "עליית העלויות", kind: "assumption", value: "5", display: "5", value_text: "5",
+      quote: "העלויות יעלו ב-5%" },
+  ];
+  const calc = (cid: string, extra: object) => ({ id: cid, operation: "", result: "", unit: "₪", documents: 1, note: "",
+    kind: "profit", result_kind: "scenario", result_kind_label: "תרחיש לפי בקשה", assumptions: ["A1"], sources: ["S1"],
+    conditional: false, conditions: [], justification: null, reproduces: null, n: null, ...extra });
+  answer.computations = [
+    calc("C1", { label: "הרווח בתרחיש", expression: "V1 − V2 × (1 + A1%)", value: "1530000.00", result: "1530000.00",
+      formula: "«סה״כ הכנסות» − «סה״כ עלויות» × (1 + «עליית העלויות»%)", display: { value: "1,530,000" }, inputs }),
+    calc("C2", { label: "שיעור הרווח מההכנסות", expression: "C1 ÷ V1", unit: "", kind: "ratio",
+      value: "0.1228915662650602409638554217", result: "0.1228915662650602409638554217",
+      formula: "«הרווח בתרחיש» ÷ «סה״כ הכנסות»", display: { value: "0.1229", percent: "12.29%" },
+      inputs: [{ id: "C1", label: "הרווח בתרחיש", kind: "computation", value: "1530000.00", display: "1,530,000" },
+        inputs[0]] }),
+    calc("C3", { label: "שווי לפי שטח ברוטו", expression: "V1 × V2", result_kind: "computed", assumptions: [],
+      value: "1282500", result: "1282500", formula: "«שווי למ״ר» × «שטח ברוטו»", display: { value: "1,282,500" },
+      inputs: [], conditional: true, conditions: ["בסיס שטח: «אקוו» מול «ברוטו»"],
+      justification: "המשתמש ביקש לפי השטח ברוטו" }),
+  ];
+  answer.values = [value("V1", "סה״כ הכנסות", "הכנסות (₪)", "12,450,000"),
+    value("V2", "סה״כ עלויות", "עלויות (₪)", "10,400,000")];
+  answer.assumptions = [{ id: "A1", value: "5", value_text: "5", unit: "percent", label: "עליית העלויות",
+    quote: "העלויות יעלו ב-5%", turn: 1, current: true }];
+  answer.documents = [doc];
+  await page.route(`**/api/chat/conversations/${id}/messages*`, (route) => route.fulfill({ json: body }));
+  await page.goto(`/chat?c=${id}`);
+  const reply = assistantMessages(page).last();
+  await reply.getByText(/מקורות ופרטים/).click();
+  const section = reply.getByTestId("calculations");
+  const first = section.getByTestId("calculation").first();
+  await expect(first).toContainText("«סה״כ הכנסות» − «סה״כ עלויות» × (1 + «עליית העלויות»%)");
+  await expect(first).toContainText("1,530,000 ₪");
+  await expect(first.getByTestId("calc-kind")).toHaveText("תרחיש לפי בקשה");
+  await expect(section.getByTestId("calculation").nth(1)).toContainText("12.29%");
+  // the user's assumption is its own group, with the user's words, outside the document data
+  const assumptions = section.getByTestId("calc-assumptions");
+  await expect(assumptions).toContainText("העלויות יעלו ב-5%");
+  await expect(assumptions).toContainText("5%");
+  const data = section.getByTestId("calc-document-data");
+  await expect(data).toContainText("סה״כ הכנסות");
+  await expect(data).toContainText("שורה «סה\"כ», עמודה «הכנסות (₪)»");
+  await expect(data).not.toContainText("העלויות יעלו");
+  await expect(data.getByTestId("calc-assumptions")).toHaveCount(0);
+  // a conditional result says so, with its justification
+  const conditional = section.getByTestId("calculation").nth(2);
+  await expect(conditional.getByTestId("calc-kind")).toHaveText("חישוב");
+  await expect(conditional.getByTestId("calc-conditional")).toContainText("מותנה:");
+  await expect(conditional.getByTestId("calc-conditional")).toContainText("המשתמש ביקש לפי השטח ברוטו");
+  await page.request.delete(`/api/chat/conversations/${id}`);
+});

@@ -3,7 +3,8 @@
 The model never runs SQL and never sees anything the user may not: every tool runs in its own short
 transaction under the user's tenant context (RLS decides what is visible), validates its arguments, and returns
 plain text the model reads. Every passage a tool returns is registered as a source with an id (``S1``...); every
-stored measurement as ``M1``...; every computation as ``C1``.... Every tool also records how deep it reached
+stored measurement as ``M1``...; every value taken from a source as ``V1``..., every user assumption as ``A1``...
+and every calculation as ``C1``.... Every tool also records how deep it reached
 into each document — located (listed in a set or outlined), a passage retrieved, a section or table read (or its
 measurements listed) — and which sections and tables it opened, so the server can state an answer's coverage
 itself; a document whose datum the verified answer cites is ``verified`` (``coverage.build``). An
@@ -30,8 +31,13 @@ Tools:
 - ``outline``: a document's sections and tables as openable handles, with their sizes and unread regions;
 - ``find_measurements``: stored measurements with their meaning (kind, unit, period, area basis, VAT, role,
   subject), grouped by what can be compared, with the coverage of the documents in scope, paged;
-- ``compute``: mean / median / sum / min / max / count / difference / ratio over measurements, in exact
-  decimal code, refusing to mix kinds, units, periods, VAT status, area bases or roles.
+- ``take_value``: a value of a source the turn read, verified by the server — the cell at a named row and column
+  of the table the source is (``extracted_tables.structure``), or a number inside an exact quote of the source —
+  with its meaning; what the source attests about it is recorded as the source's, the rest as the model's (``V#``);
+- ``assume``: a number the user gave for a scenario, quoted from the user's own message (``A#``);
+- ``calculate``: an expression over ``M#``/``V#``/``A#``/``C#`` (``app.chat.calc``): exact decimals, compatibility
+  by operation, every result a ``C#`` with its formula, inputs, assumptions and sources that later calculations
+  may use.
 """
 
 from __future__ import annotations
@@ -40,15 +46,15 @@ import json
 import logging
 import math
 import re
-import statistics
 from dataclasses import dataclass, field
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy import Connection, text
 
-from app.chat import reader
+from app.answering.verify import numbers_in
+from app.chat import calc, meaning, reader
 from app.chat.evidence import TABLE_SIZE_PREFIX
 from app.db import TenantContext, tenant_tx
 from app.measurements.extract import EXTRACTION_VERSION, PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
@@ -177,28 +183,17 @@ def anchor_lost(row) -> bool:
 
 
 @dataclass
-class Computation:
-    cid: str
-    operation: str
-    result: Decimal | None
-    unit_label: str
-    measurement_ids: list[str]
-    documents: int
-    note: str
-
-    def public(self) -> dict:
-        return {"id": self.cid, "operation": self.operation, "result": None if self.result is None else str(self.result),
-                "unit": self.unit_label, "inputs": self.measurement_ids, "documents": self.documents, "note": self.note}
-
-
-@dataclass
 class Workspace:
     """Everything one turn gathered: sources, measurements, computations, and earlier-turn references."""
 
     ctx: TenantContext
     sources: dict[str, Source] = field(default_factory=dict)
     measurements: dict[str, Measurement] = field(default_factory=dict)
-    computations: dict[str, Computation] = field(default_factory=dict)
+    computations: dict[str, calc.Computation] = field(default_factory=dict)
+    values: dict[str, calc.Value] = field(default_factory=dict)  # V#: values verified in a source of the turn
+    assumptions: dict[str, calc.Assumption] = field(default_factory=dict)  # A#: numbers the user gave
+    # the user's messages visible to the turn, oldest first, the current one last: [{"turn", "text", "current"}]
+    user_messages: list[dict] = field(default_factory=list)
     prior: dict[str, dict] = field(default_factory=dict)  # P# -> {version_id, block_start, block_end, chunk_id}
     searches: list[str] = field(default_factory=list)
     coverage: list[dict] = field(default_factory=list)
@@ -1238,86 +1233,517 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
     return "\n".join(out)
 
 
-OPERATIONS = ("mean", "median", "sum", "min", "max", "count", "difference", "ratio")
+# --- values, assumptions and calculation (KTD10) ---------------------------------------------------------------
+
+VALUE_KINDS = {**KIND_LABELS, "income": "הכנסות", "profit": "רווח"}
+_SIGNED = re.compile(r"([-−]\s*)?(\()?\s*(\d[\d,]*(?:\.\d+)?)\s*(\))?")
+MSG_VALUE_UNAVAILABLE = ("{ids}: המסמך שממנו נלקח הערך אינו זמין עוד (נמחק, או שאין הרשאה אליו); אי אפשר להשתמש בו "
+                         "בחישוב")
+MSG_VALUE_STALE = ("{ids}: המסמך שממנו נלקח הערך עובד מחדש מאז שנלקח; הערך אינו תקף עוד. יש לקרוא את המקור מחדש "
+                   "ולקחת את הערך שוב")
 
 
-def _q(value: Decimal) -> Decimal:
-    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if value != value.to_integral() else value
+def _parse_number(raw: str) -> tuple[str, Decimal] | None:
+    """A number as written, tolerant of ₪, %, NBSP, spaces, thousands commas and a sign: ("12,450,000", 12450000).
+    None when it holds no number or more than one."""
+    s = meaning._norm(str(raw or "")).replace(" ", " ").replace(" ", " ")
+    found = [m for m in _SIGNED.finditer(s) if m.group(3)]
+    if len(found) != 1:
+        return None
+    m = found[0]
+    try:
+        value = Decimal(m.group(3).replace(",", ""))
+    except ArithmeticError:
+        return None
+    if m.group(1) or (m.group(2) and m.group(4)):  # "-5" / "(5)": a negative amount
+        value = -value
+    return m.group(3), value
 
 
-def tool_compute(ws: Workspace, operation: str, measurement_ids: list[str]) -> str:
-    if operation not in OPERATIONS:
-        raise ToolError("פעולה לא נתמכת. אפשרויות: " + ", ".join(OPERATIONS))
-    ids = list(dict.fromkeys(measurement_ids or []))
-    unknown = [i for i in ids if i not in ws.measurements]
-    if unknown:
-        raise ToolError("מזהי נתונים לא מוכרים: " + ", ".join(unknown) + ". יש לאתר אותם קודם ב-find_measurements.")
-    if not ids:
-        raise ToolError("לא נבחרו נתונים לחישוב")
-    ms = list({ws.measurements[i].id: ws.measurements[i] for i in ids}.values())  # each stored value once
-    ids = [m.mid for m in ms]
-    keys = {_compat_key(m.row) for m in ms}
-    if len(keys) > 1:
-        lines = ["אי אפשר לחשב: הנתונים שנבחרו אינם מאותו סוג, ולכן חישוב משותף יטעה. הקבוצות:"]
-        for k in keys:
-            lines.append(f"- [{_describe_key(k)}]: " + ", ".join(m.mid for m in ms if _compat_key(m.row) == k))
-        lines.append("אפשר לחשב בנפרד לכל קבוצה, או להסביר למשתמש מדוע הנתונים אינם ברי השוואה.")
-        return "\n".join(lines)
-    if any(m.row.value is None for m in ms) and operation != "count":
-        ranges = [m.mid for m in ms if m.row.value is None]
-        return ("אי אפשר לחשב: חלק מהנתונים הם טווחים ולא ערך יחיד (" + ", ".join(ranges)
-                + "). אפשר לחשב על הערכים היחידים בלבד או להציג את הטווחים.")
-    values = [Decimal(str(m.row.value)) for m in ms if m.row.value is not None]
-    key = next(iter(keys))
-    unit_label = UNIT_LABELS.get(key[1], "")
-    note = ""
-    if operation == "mean":
-        result = sum(values) / len(values)
-    elif operation == "median":
-        result = Decimal(str(statistics.median(values)))
-    elif operation == "sum":
-        if key[0] in ("value_per_area", "price_per_area", "rent_per_area", "management_fee_per_area",
-                      "cost_per_area", "rate", "coefficient"):
-            return "אי אפשר לסכם ערכים ליחידת שטח, שיעורים או מקדמים: סכום כזה אינו בעל משמעות."
-        result = sum(values)
-    elif operation == "min":
-        result = min(values)
-    elif operation == "max":
-        result = max(values)
-    elif operation == "count":
-        result = Decimal(len(ms))
-        unit_label = "ערכים"
-    elif operation in ("difference", "ratio"):
-        if len(values) != 2:
-            raise ToolError("הפרש ויחס דורשים בדיוק שני נתונים (הראשון פחות/חלקי השני)")
-        if operation == "difference":
-            result = values[0] - values[1]
+def _numbers_of(text_: str) -> list[tuple[str, int, int, Decimal]]:
+    """Every number written in a text: (as written, start, end, value)."""
+    from app.answering.verify import _NUMBER
+
+    out = []
+    for m in _NUMBER.finditer(text_ or ""):
+        try:
+            out.append((m.group(0), m.start(), m.end(), Decimal(m.group(0).rstrip(".,").replace(",", ""))))
+        except ArithmeticError:
+            continue
+    return out
+
+
+def _key(s) -> str:
+    """A row label or a column header for matching: one spelling of the abbreviation marks, one space."""
+    return " ".join(meaning._norm(str(s or "")).replace(" ", " ").split()).strip(" :")
+
+
+def _match_one(wanted: str, options: list[str], what: str) -> int:
+    """The index of the option a label names: an exact match, else the only option that contains it."""
+    k = _key(wanted)
+    exact = [i for i, o in enumerate(options) if _key(o) == k]
+    if len(exact) == 1:
+        return exact[0]
+    near = exact or [i for i, o in enumerate(options) if k and k in _key(o)]
+    if len(near) == 1:
+        return near[0]
+    if not near:
+        raise ToolError(f"{what} «{wanted}» לא נמצא בטבלה. האפשרויות: " + "; ".join(f"«{o}»" for o in options[:20] if o))
+    raise ToolError(f"{what} «{wanted}» מתאים לכמה ({', '.join(str(i + 1) for i in near[:8])}); בחר לפי מספר")
+
+
+def _table_of(ws: Workspace, src: Source, given) -> int:
+    """The table a cell locator names: the source's own table, or the T# / table S# given (of the same table)."""
+    index = src.table_index
+    if given:
+        g = str(given).strip()
+        h = ws.handles.get(g)
+        if h is not None and h["kind"] == "T":
+            if h["version_id"] != str(src.version_id):
+                raise ToolError(f"{g} היא טבלה של מסמך אחר מזה של {src.sid}")
+            named = h["table_index"]
+        elif g in ws.sources and ws.sources[g].table_index is not None:
+            if ws.sources[g].version_id != src.version_id:
+                raise ToolError(f"{g} הוא מקור של מסמך אחר מזה של {src.sid}")
+            named = ws.sources[g].table_index
         else:
-            if values[1] == 0:
-                raise ToolError("חלוקה באפס")
-            result = values[0] / values[1]
-            unit_label = "יחס"
-    approx = [m.mid for m in ms if m.row.value_form != "exact"]
+            raise ToolError(f"טבלה לא מוכרת: {g}. נדרש T# או S# של טבלה שנקראה בתור הזה")
+        if index is not None and named != index:
+            raise ToolError(f"{src.sid} אינו מהטבלה {g}: קח את התא מהמקור שבו הטבלה נקראה")
+        index = named
+    if index is None:
+        raise ToolError(f"{src.sid} אינו טבלה: פתח את הטבלה (read עם table=T#) וקח את התא מהמקור שהוחזר, או צטט "
+                        "משפט (quote) שבו המספר כתוב")
+    return index
+
+
+def _take_cell(ws: Workspace, conn: Connection, src: Source, full: str, loc: dict) -> dict:
+    """The number in the cell at a named row and column of the source's table, verified against the table's stored
+    structure; a number the model names that is in another row or column is refused, with where it is."""
+    index = _table_of(ws, src, loc.get("table"))
+    st = reader.table_structure(conn, src.version_id, index)
+    if st is None:
+        raise ToolError("הטבלה לא נמצאה בקריאה הנוכחית של המסמך")
+    rows = [list(r.get("cells") or []) for r in st.get("rows") or []]
+    headers = list(st.get("headers") or [])
+    if not rows:
+        raise ToolError("לטבלה אין שורות")
+    if loc.get("row_number") is not None:
+        ri = int(loc["row_number"]) - 1
+        if not 0 <= ri < len(rows):
+            raise ToolError(f"לטבלה {len(rows)} שורות; row_number מ-1 עד {len(rows)}")
+        if loc.get("row") and _key(loc["row"]) not in (_key(c) for c in rows[ri]):
+            raise ToolError(f"שורה {ri + 1} אינה «{loc['row']}»: היא «{' | '.join(rows[ri])}»")
+    elif loc.get("row"):
+        labels = [r[0] if r else "" for r in rows]
+        try:
+            ri = _match_one(loc["row"], labels, "השורה")
+        except ToolError:
+            # a label in another cell of the row (a table whose label column is not the first)
+            hits = [i for i, r in enumerate(rows) if any(_key(c) == _key(loc["row"]) and _parse_number(c) is None
+                                                         for c in r)]
+            if len(hits) != 1:
+                raise
+            ri = hits[0]
+    else:
+        raise ToolError("תא בטבלה נבחר לפי שורה (row: התווית, או row_number) ועמודה (column: הכותרת, או "
+                        "column_number)")
+    cells = rows[ri]
+    if loc.get("column_number") is not None:
+        ci = int(loc["column_number"]) - 1
+        if not 0 <= ci < len(cells):
+            raise ToolError(f"בשורה {len(cells)} עמודות; column_number מ-1 עד {len(cells)}")
+    elif loc.get("column"):
+        if not any(headers):
+            raise ToolError("לטבלה אין כותרות עמודה: בחר עמודה לפי column_number")
+        ci = _match_one(loc["column"], headers, "העמודה")
+        if ci >= len(cells):
+            raise ToolError(f"בשורה «{cells[0] if cells else ''}» אין תא בעמודה «{headers[ci]}»")
+    else:
+        raise ToolError("חסרה עמודה: column (הכותרת) או column_number")
+    cell = cells[ci]
+    header = headers[ci] if ci < len(headers) else ""
+    numbers = _numbers_of(meaning._norm(cell))
+    where = f"שורה «{cells[0] if cells else ri + 1}», עמודה «{header or ci + 1}»"
+    if loc.get("number"):
+        wanted = _parse_number(loc["number"])
+        if wanted is None:
+            raise ToolError(f"number «{loc['number']}» אינו מספר אחד")
+        hit = [n for n in numbers if n[3] == wanted[1]]
+        if not hit:
+            elsewhere = [(r, c) for r, row in enumerate(rows) for c, x in enumerate(row)
+                         if any(n[3] == wanted[1] for n in _numbers_of(meaning._norm(x)))]
+            if elsewhere:
+                r, c = elsewhere[0]
+                at = f"שורה «{rows[r][0] if rows[r] else r + 1}», עמודה «{headers[c] if c < len(headers) else c + 1}»"
+                raise ToolError(f"המספר {loc['number']} נמצא בטבלה ב{at}, לא ב{where} שנבחרו (שם כתוב «{cell}»). ערך "
+                                "נלקח רק מהשורה והעמודה שהוא שייך להן")
+            raise ToolError(f"המספר {loc['number']} אינו בתא שנבחר ({where}: «{cell}») ואינו בטבלה")
+        written, value = hit[0][0], hit[0][3]
+    else:
+        if len(numbers) != 1:
+            raise ToolError(f"בתא שנבחר ({where}) " + ("אין מספר" if not numbers else f"יש כמה מספרים («{cell}»); "
+                                                       "ציין number"))
+        written, value = numbers[0][0], numbers[0][3]
+        sign = _parse_number(cell)
+        if sign is not None and sign[1] == -value:
+            value = -value
+    forms = frozenset(numbers_in(written))
+    if not forms & numbers_in(full):
+        raise ToolError(f"הערך {written} ({where}) אינו בטקסט של {src.sid}: קרא את חלק הטבלה שבו הוא נמצא "
+                        "(read עם table=T# או cursor) וקח אותו מהמקור הזה")
+    line = " | ".join(cells)
+    label = cells[0] if cells else ""
+    column_units = st.get("units") or []
+    near = [cell, label, header, str(column_units[ci]) if ci < len(column_units) and column_units[ci] else ""]
+    table_text = [st.get("caption") or "", *(st.get("title") or []), *(st.get("notes") or [])]
+    # the unit of the cell, its row or its column; the table's caption or notes only when those state none
+    units = meaning.units_attested(" ".join(near)) or meaning.units_attested(" ".join(table_text))
+    return {"written": written, "value": value, "forms": forms, "quote": line,
+            "qualifiers": meaning.number_qualifiers(_table_text(st, st.get("rows") or []), forms, line),
+            "units": units, "vat": meaning.vat_attested("\n".join(near + table_text), forms),
+            "kind_context": " ".join([label, header, st.get("caption") or ""]),
+            "locator": {"table_index": index, "row": cells[0] if cells else "", "row_number": ri + 1,
+                        "column": header, "column_number": ci + 1},
+            "total": bool(calc.TOTAL_WORDS.search(meaning._norm(cells[0] if cells else ""))),
+            "table": (str(src.version_id), index)}
+
+
+def _take_quote(src: Source, full: str, loc: dict) -> dict:
+    """The number inside an exact quote of the source: the quote must occur in the source's full text, and the
+    number inside the quote."""
+    if not loc.get("number"):
+        raise ToolError("ציטוט (quote) דורש גם את המספר כפי שנכתב בו (number)")
+    wanted = _parse_number(loc["number"])
+    if wanted is None:
+        raise ToolError(f"number «{loc['number']}» אינו מספר אחד")
+    quote = " ".join(meaning._norm(loc["quote"]).split())
+    text_ = " ".join(meaning._norm(full).split())
+    if len(quote) < 3 or quote not in text_:
+        raise ToolError(f"הציטוט אינו מופיע כלשונו ב-{src.sid}: העתק את המשפט מהמקור בדיוק (או בחר תא בטבלה)")
+    if " | " in quote:
+        raise ToolError("הציטוט הוא שורת טבלה: קח את הערך כתא (row ו-column), כדי שהשרת יבדוק לאיזו עמודה הוא שייך")
+    hit = [n for n in _numbers_of(quote) if n[3] == abs(wanted[1])]
+    if not hit:
+        if any(n[3] == abs(wanted[1]) for n in _numbers_of(text_)):
+            raise ToolError(f"המספר {loc['number']} נמצא ב-{src.sid} אבל לא בתוך הציטוט: צטט את המשפט שבו הוא כתוב")
+        raise ToolError(f"המספר {loc['number']} אינו בציטוט ואינו ב-{src.sid}")
+    written, start, end, value = hit[0]
+    at = text_.index(quote)
+    local = text_[max(0, at + start - 8):at + end + 16]
+    forms = frozenset(numbers_in(written))
+    line = next((ln for ln in meaning._norm(full).split("\n") if quote[:40] in " ".join(ln.split())), quote)
+    sign = -1 if wanted[1] < 0 else 1
+    units = meaning.units_attested(local)
+    if units == {"ILS"} and meaning._PER_SQM.search(quote):
+        # "השווי למ״ר ... 9,500 ₪": a per-area amount whose "למ״ר" is not next to it; either reading is the source's
+        units = {"ILS", "ILS_per_sqm"}
+    return {"written": written, "value": sign * value, "forms": forms, "quote": loc["quote"].strip(),
+            "qualifiers": meaning.number_qualifiers(full, forms, quote),
+            "units": units, "vat": meaning.vat_attested(line, forms, full),
+            "kind_context": quote, "locator": {"quote": loc["quote"].strip()}, "total": False, "table": None}
+
+
+def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict]:
+    """The value's meaning: what the source attests about the number is the source's (and fills what the model left
+    unknown); what it does not is the model's (``model_asserted``); a contradiction is refused."""
+    written = taken["written"]
+    q: meaning.Qualifiers = taken["qualifiers"]
+    out = dict(given)
+    prov: dict[str, str] = {}
+    units = taken["units"]
+    if units and given["unit"] not in units:
+        raise ToolError(f"המקור נותן ל-{written} יחידה {', '.join(UNIT_LABELS.get(u, u) for u in sorted(units))}, "
+                        f"לא {UNIT_LABELS.get(given['unit'], given['unit']) or given['unit']}")
+    prov["unit"] = "source" if units else "model_asserted"
+    periods = q.keys("period")
+    if periods:
+        if given["period"] == "unknown" and len(periods) == 1:
+            out["period"] = next(iter(periods))
+        elif given["period"] not in periods:
+            raise ToolError(f"המקור נותן ל-{written} תקופה "
+                            + " / ".join(PERIOD_LABELS.get(p, p) for p in sorted(periods))
+                            + f", לא {PERIOD_LABELS.get(given['period'], given['period']) or given['period']}")
+        prov["period"] = "source"
+    else:
+        prov["period"] = "model_asserted" if given["period"] in ("month", "year") else "not_stated"
+    vats = taken["vat"]
+    if vats:
+        if given["vat"] in ("unknown", "not_applicable") and len(vats) == 1:
+            out["vat"] = next(iter(vats))
+        elif given["vat"] not in vats:
+            raise ToolError(f"המקור נותן ל-{written} " + " / ".join(VAT_LABELS[v] for v in sorted(vats))
+                            + f", לא {VAT_LABELS.get(given['vat']) or given['vat']}")
+        prov["vat"] = "source"
+    else:
+        prov["vat"] = "model_asserted" if given["vat"] in ("included", "excluded") else "not_stated"
+    bases = q.found.get("basis", {})
+    said = (given.get("area_basis") or "").strip()
+    if bases:
+        keys = meaning.Qualifiers()
+        for _, kind, key, w in meaning._scan(meaning._norm(said)):
+            keys.add(kind, key, w)
+        if not said:
+            out["area_basis"] = meaning.display(" ".join(bases.values()))
+        elif not keys.keys("basis") & set(bases):
+            raise ToolError(f"המקור נותן ל-{written} בסיס שטח «{meaning.display(' '.join(bases.values()))}», לא «{said}»")
+        else:
+            out["area_basis"] = meaning.display(" ".join(bases.values()))
+        prov["area_basis"] = "source"
+    else:
+        prov["area_basis"] = "model_asserted" if said else "not_stated"
+    prov["kind"] = "source" if meaning.kind_attested(given["kind"], taken["kind_context"]) else "model_asserted"
+    return out, prov
+
+
+def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: dict | None, label: str = "") -> str:
+    """Register a value of a source the turn read (V#) once the server verified that the number is the one the
+    locator names: the cell at that row and column of the table, or a number inside an exact quote."""
+    sid = (source or "").strip()
+    src = ws.sources.get(sid)
+    if src is None:
+        raise ToolError(f"מקור לא מוכר: {source}. ערך נלקח רק ממקור S# שהוחזר בתור הזה (search או read)")
+    if src.is_listing or src.version_id is None:
+        raise ToolError("רשימת מסמכים אינה מקור לערך: קח את הערך ממקור במסמך")
+    full = src.text or (ws.sources[src.same_as].text if src.same_as in ws.sources else "")
+    loc = {k: v for k, v in (locator or {}).items() if v not in (None, "")}
+    given = dict(meaning_ or {})
+    for name, allowed in (("kind", VALUE_KINDS), ("unit", UNIT_LABELS), ("period", PERIOD_LABELS),
+                          ("vat", VAT_LABELS), ("role", calc.ROLE_LABELS)):
+        if given.get(name) not in allowed:
+            raise ToolError(f"meaning.{name} חייב להיות אחד מ: " + ", ".join(allowed))
+    cell = any(k in loc for k in ("table", "row", "row_number", "column", "column_number"))
+    if cell == ("quote" in loc):
+        raise ToolError("locator: תא בטבלה (row או row_number, ו-column או column_number; אפשר גם table) או ציטוט "
+                        "(quote ו-number) — אחד מהם בלבד")
+    with tenant_tx(ws.ctx) as conn:
+        v = reader.version(conn, src.version_id)
+        if v is None:
+            raise ToolError(MSG_UNAVAILABLE)
+        if src.reading_id is not None and v.reading_id != src.reading_id:
+            raise ToolError(MSG_STALE_REF.format(source_id=sid))
+        taken = _take_cell(ws, conn, src, full, loc) if cell else _take_quote(src, full, loc)
+    fields, prov = _settle_meaning(taken, given)
+    approx = "approx" in taken["qualifiers"].keys("approx")
+    total = taken["total"] or given["role"] == "total"
+    where = taken["locator"]
+    default = (f"{where['row']} — {where['column']}" if "row" in where
+               else f"{VALUE_KINDS[fields['kind']]} {fields.get('subject') or ''}".strip())
+    value = calc.Value(f"V{len(ws.values) + 1}", taken["value"], taken["written"], sid, src.document_id,
+                       src.version_id, src.reading_id or v.reading_id, src.title, src.location,
+                       (label or "").strip() or default, fields["kind"], fields["unit"], fields["period"],
+                       fields["vat"], fields.get("area_basis") or "", (fields.get("subject") or "").strip(),
+                       fields["role"], prov, where, taken["quote"], total, taken["table"], approx)
+    ws.values[value.vid] = value
+    shown = [UNIT_LABELS.get(value.unit, ""), PERIOD_LABELS.get(value.period, ""), VAT_LABELS.get(value.vat, ""),
+             f"בסיס שטח: {value.area_basis}" if value.area_basis else ""]
+    place = (f"שורה «{where['row']}» (מס' {where['row_number']}), עמודה «{where['column']}»" if "row" in where
+             else f"ציטוט «{_clip(value.quote, 200)}»")
+    asserted = [{"unit": "יחידה", "period": "תקופה", "vat": "מע\"מ", "area_basis": "בסיס שטח", "kind": "סוג"}[k]
+                for k, p in prov.items() if p == "model_asserted"]
+    lines = [f"{value.vid} נרשם: «{_txt(value.label)}» = {value.written} ({'; '.join(x for x in shown if x) or 'ללא יחידה'})"
+             f" | סוג: {VALUE_KINDS[value.kind]} | תפקיד: {calc.ROLE_LABELS[value.role]}"
+             + (f" | נושא: {_txt(value.subject)}" if value.subject else "") + (" | שורת סה\"כ" if total else ""),
+             f"אומת ב-{sid}: {_txt(place)}"]
     if approx:
-        note = "חלק מהערכים מקורבים או גבולות (" + ", ".join(approx) + "); התוצאה מקורבת בהתאם."
-    lost = [m.mid for m in ms if anchor_lost(m.row)]
+        lines.append("המקור כותב את הערך כמקורב.")
+    lines.append("ודאות: " + ("כל התכונות שצוינו נמצאו במקור" if not asserted else
+                              "נמוכה יותר — תכונות שהמודל קבע ולא נמצאו במקור: " + ", ".join(asserted)))
+    return "\n".join(lines)
+
+
+def tool_assume(ws: Workspace, value: str, quote: str, label: str = "") -> str:
+    """Register a number the user gave for a scenario (A#): quoted from a user message visible to the turn — the
+    current one or an earlier one, never an answer's or a document's text."""
+    wanted = _parse_number(value)
+    if wanted is None:
+        raise ToolError("value חייב להיות מספר אחד כפי שהמשתמש כתב אותו (למשל 5%)")
+    q = " ".join(meaning._norm(quote or "").split())
+    if len(q) < 2:
+        raise ToolError("quote חייב להיות ציטוט מדויק מהודעת המשתמש")
+    found = None
+    for msg in [m for m in ws.user_messages if m["current"]] + [m for m in reversed(ws.user_messages)
+                                                                if not m["current"]]:
+        if q in " ".join(meaning._norm(msg["text"]).split()):
+            found = msg
+            break
+    if found is None:
+        raise ToolError("הציטוט אינו מופיע בהודעות המשתמש בשיחה הזו. הנחה היא רק מספר שהמשתמש עצמו כתב (לא מתשובה "
+                        "קודמת ולא ממסמך). אם התרחיש דורש מספר שהמשתמש לא נתן — שאל את המשתמש")
+    hit = [n for n in _numbers_of(q) if n[3] == abs(wanted[1])]
+    if not hit:
+        raise ToolError(f"הערך {value} אינו בתוך הציטוט «{_txt(quote)}». הנחה נרשמת רק כפי שהמשתמש כתב אותה; אם "
+                        "הערך לא נכתב — שאל את המשתמש")
+    written, _, end, number = hit[0]
+    after = q[end:end + 8]
+    raw = meaning._norm(value)
+    unit = ("percent" if "%" in raw or after.lstrip().startswith(("%", "אחוז")) else
+            "ILS" if re.match(r"\s*(?:₪|ש\"ח|שקל)", after) else
+            "sqm" if re.match(r"\s*מ\"ר", after) else "ratio")
+    a = calc.Assumption(f"A{len(ws.assumptions) + 1}", number if wanted[1] >= 0 else -number, written, unit,
+                        (label or "").strip() or "הנחת המשתמש", (quote or "").strip(), found["turn"], found["current"])
+    ws.assumptions[a.aid] = a
+    turn = "מההודעה הנוכחית" if a.current else "מהודעה קודמת"
+    return (f"{a.aid} נרשם: «{_txt(a.label)}» = {written}{'%' if unit == 'percent' else ''} — הנחת המשתמש, מצוטטת "
+            f"{turn}: «{_txt(a.quote)}». בחישוב: {a.aid}% הוא {a.aid}/100. בתשובה הצג אותה כהנחת המשתמש, בנפרד "
+            "מנתוני המסמך, וצטט [" + a.aid + "].")
+
+
+def _operand(ws: Workspace, i: str) -> calc.Operand:
+    if i in ws.values:
+        return ws.values[i].operand()
+    if i in ws.assumptions:
+        return ws.assumptions[i].operand()
+    if i in ws.computations:
+        return calc.result_operand(i, ws.computations[i].outcome)
+    if i in ws.measurements:
+        m = ws.measurements[i]
+        r = m.row
+        return calc.operand(i, r.value, r.unit, period=r.period, vat=r.vat, basis=meaning.basis_key(r.area_basis),
+                            kind=r.metric_kind, subject=r.subject or "",
+                            total=bool(calc.TOTAL_WORDS.search(meaning._norm(r.metric or ""))),
+                            table=(str(m.version_id), r.table_index) if r.table_index is not None else None,
+                            group=r.value_role, same=str(m.id), approx=r.value_form != "exact")
+    raise ToolError(f"מזהה לא מוכר: {i}. אפשר להשתמש רק במזהים שנרשמו בתור הזה: V# (take_value), A# (assume), "
+                    "M# (find_measurements), C# (calculate)")
+
+
+def _leaves(ws: Workspace, ids) -> list[str]:
+    """The registered values and measurements an expression rests on, through earlier results."""
+    out: list[str] = []
+    for i in ids:
+        if i in ws.computations:
+            out += ws.computations[i].leaves
+        elif i not in out:
+            out.append(i)
+    return list(dict.fromkeys(out))
+
+
+def _check_available(ws: Workspace, leaves: list[str]) -> None:
+    """Every document a value rests on is still visible, in the reading the value was taken from (R13)."""
+    versions: dict[str, list[str]] = {}
+    for i in leaves:
+        vid = (ws.values[i].version_id if i in ws.values else ws.measurements[i].version_id if i in ws.measurements
+               else None)
+        if vid is not None:
+            versions.setdefault(str(vid), []).append(i)
+    if not versions:
+        return
+    with tenant_tx(ws.ctx) as conn:
+        for vid, ids in versions.items():
+            v = reader.version(conn, UUID(vid))
+            if v is None:
+                raise ToolError(MSG_VALUE_UNAVAILABLE.format(ids=", ".join(ids)))
+            stale = [i for i in ids if i in ws.values and ws.values[i].reading_id is not None
+                     and ws.values[i].reading_id != v.reading_id]
+            if stale:
+                raise ToolError(MSG_VALUE_STALE.format(ids=", ".join(stale)))
+
+
+def _reproduces(ws: Workspace, out: calc.Outcome, leaves: list[str]) -> dict | None:
+    """A number the report writes that the result equals at the precision it is written in, in the turn's sources of
+    the documents the inputs come from (not one of the inputs themselves)."""
+    versions = {ws.values[i].version_id for i in leaves if i in ws.values}
+    versions |= {ws.measurements[i].version_id for i in leaves if i in ws.measurements}
+    inputs = set()
+    for i in leaves:
+        if i in ws.values:
+            inputs |= numbers_in(ws.values[i].written)
+        elif i in ws.measurements:
+            inputs |= numbers_in(ws.measurements[i].row.value_text or "")
+    texts = [(s.sid, s.text) for s in ws.sources.values() if s.version_id in versions and not s.is_listing]
+    texts += [(i, ws.measurements[i].row.quote or "") for i in leaves if i in ws.measurements]
+    for sid, t in texts:
+        for written, _, end, _ in _numbers_of(t):
+            if numbers_in(written) & inputs or len(re.sub(r"\D", "", written).lstrip("0")) < 3:
+                continue
+            percent = t[end:end + 2].lstrip().startswith("%")
+            if calc.display_matches(written, percent, out.value, out.dims):
+                return {"source": sid, "as_written": written + ("%" if percent else "")}
+    return None
+
+
+def tool_calculate(ws: Workspace, expression: str, label: str = "", justification: str | None = None) -> str:
+    """Evaluate an expression over the turn's ids (``app.chat.calc``) and register the result as a C#."""
+    try:
+        node = calc.parse(expression)
+    except calc.CalcError as e:
+        raise ToolError(f"ביטוי לא תקין: {e}") from None
+    ids = list(dict.fromkeys(calc.ids_of(node)))
+    operands = {i: _operand(ws, i) for i in ids}
+    leaves = _leaves(ws, ids)
+    _check_available(ws, leaves)
+    justification = (justification or "").strip() or None
+    try:
+        out = calc.evaluate(node, operands, justification)
+    except calc.CalcError as e:
+        raise ToolError(f"אי אפשר לחשב: {e}") from None
+
+    def name(i: str) -> str:
+        if i in ws.values:
+            return ws.values[i].label
+        if i in ws.assumptions:
+            return ws.assumptions[i].label
+        if i in ws.computations:
+            return ws.computations[i].label
+        return ws.measurements[i].row.metric if i in ws.measurements else i
+
+    inputs = []
+    for i in out.inputs:
+        kind = ("value" if i in ws.values else "assumption" if i in ws.assumptions else
+                "computation" if i in ws.computations else "measurement")
+        value = (ws.values[i].value if i in ws.values else ws.assumptions[i].value if i in ws.assumptions
+                 else ws.computations[i].value if i in ws.computations else ws.measurements[i].row.value)
+        entry = {"id": i, "label": name(i), "kind": kind, "value": None if value is None else str(value),
+                 "display": None if value is None else calc.fmt(Decimal(str(value)))}
+        if i in ws.values:
+            entry |= {"source_id": ws.values[i].source_id, "value_text": ws.values[i].written,
+                      "certainty": ws.values[i].certainty}
+        elif i in ws.assumptions:
+            entry |= {"quote": ws.assumptions[i].quote, "value_text": ws.assumptions[i].written}
+        elif i in ws.measurements:
+            entry |= {"value_text": ws.measurements[i].row.value_text}
+        inputs.append(entry)
+    sources = list(dict.fromkeys([ws.values[i].source_id for i in leaves if i in ws.values]
+                                 + [i for i in leaves if i in ws.measurements]))
+    docs = {str(ws.values[i].document_id) for i in leaves if i in ws.values}
+    docs |= {str(ws.measurements[i].document_id) for i in leaves if i in ws.measurements}
+    notes = []
+    if out.approx:
+        notes.append("חלק מהערכים מקורבים; התוצאה מקורבת בהתאם.")
+    asserted = [i for i in leaves if i in ws.values and ws.values[i].certainty != "verified"]
+    if asserted:
+        notes.append("ודאות נמוכה יותר: תכונות של " + ", ".join(asserted) + " נקבעו ולא נמצאו במקור.")
+    lost = [i for i in leaves if i in ws.measurements and anchor_lost(ws.measurements[i].row)]
     if lost:
-        note = (note + " " if note else "") + ("מיקומם של חלק מהערכים במסמך אבד בעיבוד מחדש (" + ", ".join(lost)
-                                              + "); הם אינם מאומתים מול הקריאה הנוכחית.")
-    # the values were chosen from a listing whose later pages were not read: more matching values may exist
-    unread = [ws.listings[k] for k in {k for m in ms for k in m.listings}
+        notes.append("מיקומם של חלק מהערכים במסמך אבד בעיבוד מחדש (" + ", ".join(lost)
+                     + "); הם אינם מאומתים מול הקריאה הנוכחית.")
+    # values chosen from a listing whose later pages were not read: more matching values may exist
+    unread = [ws.listings[k] for k in {k for i in leaves if i in ws.measurements for k in ws.measurements[i].listings}
               if len(ws.listings[k]["pages_read"]) < ws.listings[k]["pages"]]
     if unread:
-        note += (" " if note else "") + ("חישוב חלקי: לא נקראו כל העמודים של הנתונים המתאימים (נקראו "
-                                          f"{len(unread[0]['pages_read'])} מתוך {unread[0]['pages']}).")
-    pending = [m.mid for m in ms if m.row.status in ("auto_validated", "needs_review")]
+        notes.append("חישוב חלקי: לא נקראו כל העמודים של הנתונים המתאימים (נקראו "
+                     f"{len(unread[0]['pages_read'])} מתוך {unread[0]['pages']}).")
+    pending = [i for i in leaves if i in ws.measurements
+               and ws.measurements[i].row.status in ("auto_validated", "needs_review")]
     if pending:
-        note += (" " if note else "") + f"{len(pending)} מהערכים טרם אומתו על ידי אדם (נתון ראשוני)."
-    docs = len({m.document_id for m in ms})
-    c = Computation(f"C{len(ws.computations) + 1}", operation, _q(result), unit_label, ids, docs, note)
+        notes.append(f"{len(pending)} מהערכים טרם אומתו על ידי אדם (נתון ראשוני).")
+    conditional = ("מותנה: " + "; ".join(out.conditional) + f" — לפי ההצדקה: {justification}"
+                   if out.conditional else "")
+    reproduces = None if out.assumptions else _reproduces(ws, out, leaves)
+    kind = "scenario" if out.assumptions else "reproduces_report_value" if reproduces else "computed"
+    c = calc.Computation(f"C{len(ws.computations) + 1}", (label or "").strip() or calc.render(node, name, True),
+                         calc.render(node, lambda i: i), calc.render(node, lambda i: f"«{name(i)}»", True), out,
+                         inputs, sources, len(docs), kind, justification if out.conditional else None, " ".join(notes),
+                         reproduces, [lf.id for lf in out.leaves])
     ws.computations[c.cid] = c
-    return json.dumps({"id": c.cid, "operation": operation, "result": str(c.result), "unit": unit_label,
-                       "kind": _describe_key(key), "n": len(ms), "documents": docs, "note": note}, ensure_ascii=False)
+    return json.dumps({"id": c.cid, "label": c.label, "expression": c.expression, "formula": c.formula,
+                       "value": str(c.value), "display": c.display(), "unit": c.unit_label,
+                       "result_kind": calc.RESULT_KINDS[kind], "reproduces": reproduces, "conditional": c.conditional,
+                       "inputs": [x["id"] for x in inputs], "assumptions": c.assumptions, "n": out.n,
+                       "documents": c.documents, "note": " ".join(x for x in (c.note, conditional) if x),
+                       "how_to_show": f"הצג את התוצאה מעוגלת (display) וצטט [{c.cid}]; הנחות המשתמש בנפרד עם [A#]"},
+                      ensure_ascii=False)
 
 
 # --- registry ----------------------------------------------------------------------------------------------
@@ -1328,7 +1754,6 @@ def _fn(name: str, description: str, properties: dict, required: list[str]) -> d
                            "additionalProperties": False}}
 
 
-_IDS = {"type": "array", "items": {"type": "string"}}
 _NULLABLE_IDS = {"type": ["array", "null"], "items": {"type": "string"}}
 
 TOOLS = [
@@ -1375,10 +1800,50 @@ TOOLS = [
          "value_roles": {**_NULLABLE_IDS, "description": "תפקידים מתוך: " + ", ".join(ROLE_LABELS)},
          "page": {"type": ["integer", "null"], "description": "מספר עמוד, null לראשון"}},
         ["query", "metric_kinds", "document_ids", "value_roles", "page"]),
-    _fn("compute", "חישוב מדויק בקוד על נתונים M# מאותה קבוצה בלבד. מסרב לערבב סוגי מדד, יחידות, תקופות, מע\"מ, "
-                   "בסיסי שטח או תפקידים.",
-        {"operation": {"type": "string", "enum": list(OPERATIONS)}, "measurement_ids": _IDS},
-        ["operation", "measurement_ids"]),
+    _fn("take_value",
+        "רישום ערך ממקור S# שקראת בתור הזה, אחרי שהשרת מאמת שהמספר הוא זה שבמיקום שבחרת: תא בטבלה (שורה ועמודה; "
+        "השאר null) או ציטוט מדויק מהמקור שהמספר בתוכו (quote ו-number; השאר null), עם משמעות הערך. מחזיר V#. מספר "
+        "שנמצא בשורה או בעמודה אחרת נדחה עם הסיבה; מה שהמקור מעיד על הערך נרשם כשל המקור, והשאר כקביעה שלך.",
+        {"source": {"type": "string", "description": "S# מהתור הזה (טבלה שנקראה, שורת טבלה מחיפוש, או קטע)"},
+         "locator": {"type": "object", "additionalProperties": False,
+                     "required": ["table", "row", "row_number", "column", "column_number", "quote", "number"],
+                     "properties": {
+                         "table": {"type": ["string", "null"], "description": "T# או S# של הטבלה (לא חובה)"},
+                         "row": {"type": ["string", "null"], "description": "תווית השורה כפי שכתובה בטבלה"},
+                         "row_number": {"type": ["integer", "null"], "description": "מספר השורה (מ-1)"},
+                         "column": {"type": ["string", "null"], "description": "כותרת העמודה כפי שכתובה"},
+                         "column_number": {"type": ["integer", "null"], "description": "מספר העמודה (מ-1)"},
+                         "quote": {"type": ["string", "null"], "description": "ציטוט מדויק מהמקור שהמספר בתוכו"},
+                         "number": {"type": ["string", "null"], "description": "המספר כפי שנכתב"}}},
+         "meaning": {"type": "object", "additionalProperties": False,
+                     "required": ["kind", "unit", "period", "vat", "area_basis", "subject", "role"],
+                     "properties": {
+                         "kind": {"type": "string", "enum": list(VALUE_KINDS)},
+                         "unit": {"type": "string", "enum": list(UNIT_LABELS)},
+                         "period": {"type": "string", "enum": list(PERIOD_LABELS)},
+                         "vat": {"type": "string", "enum": list(VAT_LABELS)},
+                         "area_basis": {"type": "string", "description": "בסיס השטח כפי שנכתב, או ריק"},
+                         "subject": {"type": "string", "description": "הנכס, השלב, התקופה או מערך הנתונים"},
+                         "role": {"type": "string", "enum": list(calc.ROLE_LABELS)}}},
+         "label": {"type": "string", "description": "שם קצר בעברית לערך, כפי שיוצג בנוסחה"}},
+        ["source", "locator", "meaning", "label"]),
+    _fn("assume",
+        "רישום מספר שהמשתמש נתן לתרחיש (למשל \"העלויות יעלו ב-5%\") כהנחת משתמש A#, עם ציטוט מדויק מהודעת המשתמש "
+        "(הנוכחית או קודמת). לעולם לא מספר מתשובה קודמת או ממסמך; אם המשתמש לא נתן את המספר — שאל אותו.",
+        {"value": {"type": "string", "description": "המספר כפי שהמשתמש כתב (למשל 5%)"},
+         "quote": {"type": "string", "description": "ציטוט מדויק מהודעת המשתמש שהמספר בתוכו"},
+         "label": {"type": "string", "description": "שם קצר בעברית להנחה"}},
+        ["value", "quote", "label"]),
+    _fn("calculate",
+        "חישוב מדויק בקוד על מזהים: V# (take_value), A# (assume), M# (find_measurements), C# (חישוב קודם). מותר: + - * / "
+        "(או × ÷), סוגריים, % אחרי ערך (A1% = A1/100), sum/mean/median/min/max/count(מזהים), והקבועים 1, 100, 12 בלבד. "
+        "מסרב לחבר יחידות או תקופות שונות, שכירות עם שווי, או סה\"כ עם הרכיבים שלו; ערבוב מע\"מ, בסיסי שטח או נושאים "
+        "מותר רק עם justification, והתוצאה מותנית. מחזיר C# בדיוק מלא.",
+        {"expression": {"type": "string", "description": "למשל V1 - V2 * (1 + A1%) או mean(M1, M2, M3)"},
+         "label": {"type": "string", "description": "שם קצר בעברית לתוצאה"},
+         "justification": {"type": ["string", "null"],
+                           "description": "רק כשהחישוב מערבב מע\"מ, בסיס שטח או נושא: למה זה תקף; אחרת null"}},
+        ["expression", "label", "justification"]),
 ]
 
 HANDLERS = {
@@ -1390,7 +1855,9 @@ HANDLERS = {
     "find_measurements": lambda ws, a: tool_find_measurements(ws, a["query"], a.get("metric_kinds"),
                                                               a.get("document_ids"), a.get("value_roles"),
                                                               a.get("page")),
-    "compute": lambda ws, a: tool_compute(ws, a["operation"], a["measurement_ids"]),
+    "take_value": lambda ws, a: tool_take_value(ws, a["source"], a.get("locator"), a.get("meaning"), a.get("label") or ""),
+    "assume": lambda ws, a: tool_assume(ws, a["value"], a["quote"], a.get("label") or ""),
+    "calculate": lambda ws, a: tool_calculate(ws, a["expression"], a.get("label") or "", a.get("justification")),
 }
 
 

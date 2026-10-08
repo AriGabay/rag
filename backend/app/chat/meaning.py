@@ -34,6 +34,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 from app.answering.verify import _NUMBER as _NUM_AT
@@ -257,6 +258,88 @@ def source_occurrences(text: str, forms: set[str]) -> tuple[list[Occurrence], Qu
     return [o for f, o in parsed if f & forms], general
 
 
+def _flat(text: str) -> str:
+    return " ".join(_norm(text).split())
+
+
+def number_qualifiers(text: str, forms: frozenset[str], within: str) -> Qualifiers:
+    """What a source attaches to a number where it states it inside ``within`` (a quote of the source, or a table
+    row as read), with what the source states for all its numbers — the qualifiers a value taken from the source
+    may carry as the source's own (``tools.tool_take_value``). The same number elsewhere in the source does not
+    count."""
+    parsed, general = parse_source(text)
+    w = _flat(within)
+    q = Qualifiers().merge(general)
+    for f, o in parsed:
+        line = _flat(o.context)
+        if f & forms and line and (w in line or line in w):
+            q.merge(o.qualifiers)
+    return q
+
+
+def basis_key(text: str | None) -> str:
+    """One spelling of an area basis for comparing two values ("מ״ר אקוו׳" and "אקווי'" are one basis); a basis
+    the vocabulary does not know is compared as written."""
+    keys = sorted({key for _, kind, key, _ in _scan(_norm(text or "")) if kind == "basis"})
+    return " ".join(keys) if keys else " ".join(_norm(text or "").split())
+
+
+_CURRENCY = re.compile(r"₪|ש\"ח|(?<![א-ת])שקל")
+# a scale the unit vocabulary does not carry ("באלפי ₪"): the unit is then not attested
+_SCALE = re.compile(r"(?<![א-ת])(?:ב?אלפי|אלף|ב?מיליוני|מיליון|מלש\"ח|אש\"ח)(?![א-ת])")
+_PER_SQM = re.compile(r"(?:(?<![א-ת])ל|/\s?)(?:מ\"ר|מטר)(?![א-ת])")
+
+
+def units_attested(context: str) -> set[str]:
+    """The units (measurement vocabulary) the words around a number give it: ₪, ₪ למ״ר, מ״ר, דונם or %; none when
+    they state no unit, or a scale ("באלפי ₪") the vocabulary does not carry."""
+    c = _norm(context)
+    if "%" in c:
+        return {"percent"}
+    money = bool(_CURRENCY.search(c))
+    if money and _SCALE.search(c):
+        return set()
+    if money:
+        return {"ILS_per_sqm"} if _PER_SQM.search(c) else ({"ILS"} if not re.search(r"(?<![א-ת])לדונם", c) else set())
+    if re.search(r"(?<![א-ת])דונם", c):
+        return {"dunam"}
+    if re.search(r"מ\"ר|מטר רבוע", c):
+        return {"sqm"}
+    return set()
+
+
+# the words that name a kind of value in its row, column or sentence (professional vocabulary, R26)
+KIND_WORDS = {
+    "value": r"שווי", "price": r"מחיר|תמורה", "rent": r"שכירות|שכ\"ד|דמ\"ש|שכר\s+דירה",
+    "management_fee": r"ניהול|דמ\"נ", "cost": r"עלות|עלויות|הוצאות|הוצאה", "income": r"הכנסות|הכנסה|תקבולים|פדיון",
+    "area": r"שטח|מ\"ר", "rights_area": r"זכויות", "levy": r"היטל|(?<![א-ת])מס(?![א-ת])",
+    "rate": r"שיעור|%|תשואה|היוון", "coefficient": r"מקדם", "count": r"מספר|כמות|יח\"ד", "duration": r"שנים|חודשים|תקופת",
+    "profit": r"רווח",
+}
+
+
+def kind_attested(kind: str, context: str) -> bool:
+    """Whether the words around a number name its kind (a per-area kind also needs "למ״ר")."""
+    c = _norm(context)
+    base = kind.removesuffix("_per_area")
+    words = KIND_WORDS.get(base)
+    if not words or not re.search(words, c):
+        return False
+    return not kind.endswith("_per_area") or bool(_PER_AREA.search(c))
+
+
+def vat_attested(context: str, forms: frozenset[str], general_text: str = "") -> set[str]:
+    """The VAT statuses the source gives the number: written for it in ``context`` (the VAT phrase belongs to the
+    nearest number before it), or stated for the whole source in a clause with no number."""
+    from app.chat.verify import vat_attachments
+
+    pairs, general = vat_attachments(_norm(context))
+    out = {pol for f, pol in pairs if f in forms} | general
+    if general_text:
+        out |= vat_attachments(_norm(general_text))[1]
+    return out
+
+
 def measurement_qualifiers(row) -> Qualifiers:
     q = Qualifiers()
     basis = (getattr(row, "area_basis", None) or "").strip()
@@ -435,6 +518,13 @@ def _evidence(unit: Unit, ws: Workspace, forms: frozenset[str]) -> tuple[list[Oc
             row = ws.measurements[sid].row
             if forms & numbers_in(row.value_text or ""):
                 occurrences.append(Occurrence(measurement_qualifiers(row), row.quote or "", measurement=True))
+            continue
+        if sid in ws.values:  # a value the server verified in its source, with the meaning recorded for it
+            v = ws.values[sid]
+            if forms & numbers_in(v.written):
+                row = SimpleNamespace(area_basis=v.area_basis, period=v.period,
+                                      value_form="approx" if v.approx else "exact")
+                occurrences.append(Occurrence(measurement_qualifiers(row), v.quote, measurement=True))
             continue
         src = ws.sources.get(sid)
         if src is None:

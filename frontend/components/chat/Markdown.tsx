@@ -4,8 +4,9 @@ import { memo, useMemo } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-/** Citation ids an answer may carry: passages (S), measurements (M), computations (C). */
-const CITATION_GROUP = /\[((?:[SMC]\d+)(?:\s*[,،;]\s*[SMC]\d+)*)\]/g;
+/** Citation ids an answer may carry: passages (S), measurements (M), values (V), user assumptions (A),
+ * calculations (C). */
+const CITATION_GROUP = /\[((?:[SMCVA]\d+)(?:\s*[,،;]\s*[SMCVA]\d+)*)\]/g;
 
 export interface CitationTarget {
   id: string;

@@ -1,7 +1,18 @@
 "use client";
 
 import { useCallback, useMemo, useState } from "react";
-import type { ChatAnswer, ChatLedger, ChatMessage, ChatSource, LedgerDocument, LedgerTable } from "@/lib/chatTypes";
+import type {
+  ChatAnswer,
+  ChatAssumption,
+  ChatComputation,
+  ChatComputationInput,
+  ChatLedger,
+  ChatMessage,
+  ChatSource,
+  ChatValue,
+  LedgerDocument,
+  LedgerTable,
+} from "@/lib/chatTypes";
 import { type CitationTarget, Markdown, citationOrder, plainAnswer } from "./Markdown";
 
 export interface CitedItem {
@@ -11,7 +22,12 @@ export interface CitedItem {
   id: string;
 }
 
-const KIND_LABEL: Record<string, string> = { M: "נתון", C: "חישוב", S: "מקור" };
+const KIND_LABEL: Record<string, string> = { M: "נתון", C: "חישוב", S: "מקור", V: "ערך", A: "הנחה" };
+const RESULT_KIND: Record<string, string> = {
+  scenario: "תרחיש לפי בקשה",
+  reproduces_report_value: "משחזר ערך מהשומה",
+  computed: "חישוב",
+};
 const VAT: Record<string, string> = { included: "כולל מע״מ", excluded: "ללא מע״מ", unknown: "מע״מ לא צוין", not_applicable: "" };
 const PERIOD: Record<string, string> = { month: "לחודש", year: "לשנה", one_time: "חד-פעמי", none: "", unknown: "תקופה לא צוינה" };
 const STATUS: Record<string, string> = {
@@ -26,6 +42,12 @@ export function citedSource(answer: ChatAnswer, id: string): ChatSource | null {
   // an answer's source is bound to the reading it was read from (null: an answer from before reading ids)
   const direct = answer.sources.find((s) => s.id === id);
   if (direct) return { ...direct, reading_id: direct.reading_id ?? null };
+  // a value opens the passage it was verified in
+  const v = answer.values?.find((x) => x.id === id);
+  if (v) {
+    const src = answer.sources.find((s) => s.id === v.source_id);
+    return src ? { ...src, reading_id: src.reading_id ?? null } : null;
+  }
   const m = answer.measurements.find((x) => x.id === id);
   if (m) {
     return {
@@ -54,9 +76,14 @@ function citationTargets(answer: ChatAnswer): Map<string, CitationTarget> {
     const s = answer.sources.find((x) => x.id === id);
     const m = answer.measurements.find((x) => x.id === id);
     const c = answer.computations.find((x) => x.id === id);
+    const v = answer.values?.find((x) => x.id === id);
+    const a = answer.assumptions?.find((x) => x.id === id);
     let title = KIND_LABEL[id[0]] ?? "מקור";
     if (s) title = `${s.title} — ${s.location}`;
     else if (m) title = `${m.title} — ${m.metric}: ${m.value_text}`;
+    else if (v) title = `${v.label}: ${v.value_text} — ${v.title}`;
+    else if (a) title = `הנחה שלך: ${a.label} = ${assumptionText(a)}`;
+    else if (c?.formula) title = `חישוב: ${c.label ?? c.formula}`;
     else if (c) title = `חישוב: ${c.operation} על ${c.inputs.length} ערכים`;
     out.set(id, { id, n: i + 1, label: id, title });
   });
@@ -225,19 +252,7 @@ function AnswerDetails({
           </ul>
         </div>
       )}
-      {answer.computations.length > 0 && (
-        <div className="details-section">
-          <h4>חישובים</h4>
-          <ul>
-            {answer.computations.map((c) => (
-              <li key={c.id}>
-                {c.operation} = <bdi>{c.result}</bdi> {c.unit} · {c.inputs.length} ערכים מ-{c.documents} מסמכים
-                {c.note ? ` · ${c.note}` : ""}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
+      {answer.computations.length > 0 && <CalculationsSection answer={answer} onCite={onCite} />}
       {answer.ledger && <LedgerSection ledger={answer.ledger} />}
       {coverage && (
         <div className="details-section">
@@ -286,6 +301,138 @@ function AnswerDetails({
         </div>
       )}
     </details>
+  );
+}
+
+function assumptionText(a: ChatAssumption): string {
+  return a.unit === "percent" && !a.value_text.includes("%") ? `${a.value_text}%` : a.value_text;
+}
+
+function resultText(c: ChatComputation): string {
+  const d = c.display;
+  if (!d) return `${c.result ?? ""} ${c.unit}`.trim();
+  // a ratio reads as a percentage; an amount with its unit
+  if (d.percent && (c.unit === "" || c.unit === "%")) return d.percent;
+  return `${d.value} ${c.unit}`.trim();
+}
+
+function InputLine({ input, onCite }: { input: ChatComputationInput; onCite: (id: string) => void }) {
+  const shown = input.value_text ?? input.display ?? "";
+  if (input.kind === "assumption") {
+    return (
+      <li>
+        {input.id} {input.label}: <bdi>{shown}</bdi> — הנחה שלך
+      </li>
+    );
+  }
+  return (
+    <li>
+      {input.kind === "computation" ? (
+        input.id
+      ) : (
+        <button type="button" className="source-link" onClick={() => onCite(input.id)}>
+          {input.id}
+        </button>
+      )}{" "}
+      {input.label}: <bdi>{shown}</bdi>
+      {input.kind === "value" && input.certainty === "model_asserted" && " · חלק ממשמעות הערך נקבע ולא נמצא במקור"}
+    </li>
+  );
+}
+
+/** Each calculation with its formula in Hebrew labels, its inputs linked to their sources, what it is (a scenario
+ * on request, a value the report writes, or a computation) and whether it is conditional; then the document data
+ * it rests on, and apart from it, the user's own assumptions with the words they were quoted from. */
+function CalculationsSection({ answer, onCite }: { answer: ChatAnswer; onCite: (id: string) => void }) {
+  const values: ChatValue[] = answer.values ?? [];
+  const assumptions: ChatAssumption[] = answer.assumptions ?? [];
+  return (
+    <div className="details-section calculations" data-testid="calculations">
+      <h4>חישובים</h4>
+      <ul>
+        {answer.computations.map((c) =>
+          c.formula ? (
+            <li key={c.id} data-testid="calculation">
+              <div>
+                <strong>
+                  {c.id} · {c.label}
+                </strong>{" "}
+                {c.result_kind && (
+                  <span
+                    className={`badge ${c.result_kind === "scenario" ? "badge-warn" : c.result_kind === "reproduces_report_value" ? "badge-ok" : "badge-info"}`}
+                    data-testid="calc-kind"
+                  >
+                    {RESULT_KIND[c.result_kind] ?? c.result_kind_label}
+                  </span>
+                )}
+              </div>
+              <div className="calc-formula">
+                <bdi>{c.formula}</bdi> = <bdi>{resultText(c)}</bdi>
+              </div>
+              <ul className="calc-inputs">
+                {c.inputs
+                  .filter((x): x is ChatComputationInput => typeof x !== "string")
+                  .map((x) => (
+                    <InputLine key={x.id} input={x} onCite={onCite} />
+                  ))}
+              </ul>
+              {c.conditional && (
+                <div className="calc-conditional" data-testid="calc-conditional">
+                  <strong>מותנה:</strong> {(c.conditions ?? []).join("; ")}
+                  {c.justification ? ` — לפי ההצדקה: ${c.justification}` : ""}
+                </div>
+              )}
+              {c.reproduces && (
+                <div>
+                  שווה לערך <bdi>{c.reproduces.as_written}</bdi> שכתוב במקור
+                </div>
+              )}
+              {c.note && <div className="calc-note">{c.note}</div>}
+            </li>
+          ) : (
+            <li key={c.id}>
+              {c.operation} = <bdi>{c.result}</bdi> {c.unit} · {c.inputs.length} ערכים מ-{c.documents} מסמכים
+              {c.note ? ` · ${c.note}` : ""}
+            </li>
+          ),
+        )}
+      </ul>
+      {values.length > 0 && (
+        <div className="calc-group" data-testid="calc-document-data">
+          <h4>נתונים מהמסמכים</h4>
+          <ul>
+            {values.map((v) => (
+              <li key={v.id}>
+                <button type="button" className="source-link" onClick={() => onCite(v.id)}>
+                  {v.id}
+                </button>{" "}
+                {v.label}: <bdi>{v.value_text}</bdi>
+                {[v.unit_label, PERIOD[v.period], VAT[v.vat], v.area_basis ? `בסיס שטח: ${v.area_basis}` : ""]
+                  .filter(Boolean)
+                  .map((x) => ` · ${x}`)
+                  .join("")}
+                {" — "}
+                {v.title}, {v.locator.row ? `שורה «${v.locator.row}», עמודה «${v.locator.column}»` : v.location}
+                {v.certainty === "model_asserted" && " · חלק ממשמעות הערך נקבע ולא נמצא במקור"}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {assumptions.length > 0 && (
+        <div className="calc-group calc-assumptions" data-testid="calc-assumptions">
+          <h4>הנחות שלך (לא מהמסמכים)</h4>
+          <ul>
+            {assumptions.map((a) => (
+              <li key={a.id}>
+                {a.id} {a.label}: <bdi>{assumptionText(a)}</bdi> — לפי מה שכתבת{a.current ? "" : " בהודעה קודמת"}: «
+                <bdi>{a.quote}</bdi>»
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
   );
 }
 

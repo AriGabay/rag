@@ -888,3 +888,28 @@ details.msg-details[open] {
     opacity: 1;
   }
 }
+
+/* An answer's calculations: formula, inputs, what the result is, and a conditional note that stays visible. */
+.calculations li[data-testid="calculation"] {
+  margin-bottom: 6px;
+}
+
+.calc-formula {
+  color: var(--chat-text);
+}
+
+.calc-inputs {
+  font-size: 13px;
+}
+
+.calc-conditional {
+  margin-top: 2px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.calc-group {
+  margin-top: 6px;
+}

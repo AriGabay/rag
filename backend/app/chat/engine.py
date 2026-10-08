@@ -7,9 +7,11 @@ One turn:
    and the new message.
 2. It works with tools (``app.chat.tools``): searches by meaning, reads what it found or any part of a document
    without a search (the paragraphs around a source, pages, a section from the document's outline, a table, the
-   continuation of a part), lists documents, and, for computations, reads stored measurements and computes in
-   code. Steps are bounded (``chat_max_steps``) and the turn has a wall clock.
-3. It answers in Markdown with citations ``[S#]`` (passages), ``[M#]`` (measurements), ``[C#]`` (computations).
+   continuation of a part), lists documents, and, for calculations, registers values it read (verified by the
+   server), the user's own scenario numbers and stored measurements, and calculates over them in code
+   (``app.chat.calc``). Steps are bounded (``chat_max_steps``) and the turn has a wall clock.
+3. It answers in Markdown with citations ``[S#]`` (passages), ``[M#]`` (measurements), ``[V#]`` (values),
+   ``[A#]`` (user assumptions), ``[C#]`` (calculations).
 4. ``app.chat.verify`` checks the answer against what the tools returned: unknown citations, numbers that no
    cited source states, and — through a separate judge call — sentences the cited sources do not support. A
    failed check gets one repair step; what still fails is removed, and the answer says so.
@@ -89,9 +91,15 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
   עמודים — קרא אותם, או אמור שהספירה חלקית. אמור לפי איזה קריטריון נספרו המסמכים (המונחים בכותרת או בתוכן).
 - טבלה עם כמה ערכים מהסוג המבוקש (למשל כמה שורות של דמי שכירות): הצג את כל הערכים, או את מספרם ואת הטווח. אם אתה
   מציג ערך אחד — אמור במפורש שהוא דוגמה וכמה ערכים יש בטבלה (שורת "הטבלה: N שורות").
-- חישוב (ממוצע, סכום, טווח, ספירה): find_measurements ואז compute. לעולם אל תחשב בעצמך. ציין על כמה ערכים
-  ומסמכים החישוב מבוסס ומה הכיסוי; אם הכיסוי חלקי — אמור זאת, ואל תציג את התוצאה כמייצגת את כל המאגר. אם compute
-  מסרב כי הנתונים אינם מאותו סוג — הסבר למשתמש למה, ואל תחזיר מספר מטעה.
+- חישוב (סכום, הפרש, יחס, אחוז, ממוצע, ספירה, תרחיש): לעולם אל תחשב בעצמך, גם לא חישוב פשוט. (1) כל ערך מהמסמכים
+  רשום קודם ב-take_value מתוך מקור S# שקראת בתור הזה: תא בטבלה (שורה ועמודה) או ציטוט מדויק שהמספר בתוכו, עם
+  משמעותו (סוג, יחידה, תקופה, מע"מ, בסיס שטח, נושא, תפקיד) → V#. נתונים מ-find_measurements (M#) נכנסים לחישוב
+  ישירות. (2) מספר שהמשתמש נתן לתרחיש ("העלויות יעלו ב-5%") רשום ב-assume עם ציטוט מדויק מהודעת המשתמש → A#; מספר
+  שהמשתמש לא כתב אינו הנחה — שאל אותו. (3) calculate עם ביטוי על המזהים (+ - * /, סוגריים, A1% = A1/100,
+  sum/mean/median/min/max/count, והקבועים 1, 100, 12 בלבד) → C#, שאפשר להזין לחישוב הבא. התוצאה נשמרת בדיוק מלא:
+  הצג אותה מעוגלת (למשל 14.3%) עם [C#], והצג את הנחות המשתמש בנפרד מנתוני המסמך, עם [A#] ובמילים "לפי הנחתך".
+  ציין על כמה ערכים ומסמכים החישוב מבוסס ומה הכיסוי; אם הכיסוי חלקי — אמור זאת. אם calculate מסרב — הסבר למשתמש
+  למה, ואל תחזיר מספר מטעה. ערבוב מע"מ, בסיסי שטח או נושאים מותר רק עם justification, והתוצאה מותנית — אמור זאת.
 - focus: אחרי כל תשובה, מלא את הנתון שבמרכזה — הנתון כפי שנכתב, סוג המדד, יחידה, תקופה, בסיס שטח, מע"מ, הנכס או
   הנושא, תפקיד הערך והמסמכים (document_id). אם התשובה אינה על נתון אחד — null.
 - תיקון של המשתמש ("התכוונתי ל...", "לא, ה..."): שנה רק את מה שתוקן, ושמור מ"הנתון שבמרכז השיחה" את כל השאר — אותו
@@ -114,7 +122,8 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
 
 ניסוח התשובה (answer_markdown):
 - התשובה הישירה קודם, בקצרה. אחר כך פרטים רלוונטיים בלבד. Markdown: פסקאות קצרות, רשימות, טבלה כשמשווים.
-- בכל משפט עובדתי — מראה מקום בסוגריים מרובעים לפני סוף המשפט: "... 55 ₪ למ"ר לחודש [S3]." (אפשר כמה: [S3][M2]).
+- בכל משפט עובדתי — מראה מקום בסוגריים מרובעים לפני סוף המשפט: "... 55 ₪ למ"ר לחודש [S3]." (אפשר כמה: [S3][M2]);
+  ערך שנרשם [V#], הנחת משתמש [A#], תוצאת חישוב [C#].
   רק מזהים שקיבלת בתור הזה.
 - מספרים כפי שנכתבו, עם יחידה ותקופה. ערך מקורב ("כ-21,000") נשאר מקורב.
 - מה שכתוב במפורש — כעובדה; מסקנה שלך מהראיות — סמן במפורש ("מכאן עולה ש...").
@@ -253,7 +262,7 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None) -> 
         for m in inp.history:
             who = "משתמש" if m.role == "user" else "עוזר"
             # an earlier answer's [S3] named a passage of that turn; here it would name another one
-            content = re.sub(r"\s*\[[SMCP]\d+(?:\s*[,،;]\s*[SMCP]\d+)*\]", "", m.content)
+            content = re.sub(r"\s*\[[SMCPVA]\d+(?:\s*[,،;]\s*[SMCPVA]\d+)*\]", "", m.content)
             # an earlier answer is context, not a source (its datum is in the focus): its opening is enough
             limit = HISTORY_USER_CHARS if m.role == "user" else HISTORY_ANSWER_CHARS
             lines.append(f"{who}: {prompt_text(content[:limit] + ('…' if len(content) > limit else ''))}")
@@ -313,6 +322,10 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     cache_key = office_cache_key(ctx.office_id)
     deadline = time.monotonic() + settings.chat_turn_seconds
     ws = T.Workspace(ctx=ctx, prior=dict(inp.prior_refs))
+    # what the user wrote, as this turn sees it: an assumption (A#) quotes it, never an answer or a document
+    users = [m.content for m in inp.history if m.role == "user"]
+    ws.user_messages = [{"turn": n + 1, "text": t, "current": False} for n, t in enumerate(users)] + [
+        {"turn": len(users) + 1, "text": inp.question, "current": True}]
     steps = 0
     attempt = 0  # 0: first answer, 1: repaired with tools, 2: rewritten from verified content only
     rounds: list[list[dict]] = []
@@ -423,5 +436,9 @@ def _announce(progress: Callable[[str, str], None], call) -> None:
         progress("read", "קורא את מבנה המסמך")
     elif call.name == "find_measurements":
         progress("measure", f"מאתר נתונים: {str(args.get('query', ''))[:60]}")
-    elif call.name == "compute":
-        progress("compute", "מחשב בקוד על הנתונים שנבחרו")
+    elif call.name == "take_value":
+        progress("compute", "רושם ערך מהמקור ומאמת אותו")
+    elif call.name == "assume":
+        progress("compute", "רושם את הנחת המשתמש")
+    elif call.name == "calculate":
+        progress("compute", f"מחשב בקוד: {str(args.get('label') or '')[:60]}".rstrip(": "))

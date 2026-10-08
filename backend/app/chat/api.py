@@ -207,7 +207,7 @@ def public_verification(v: dict) -> dict:
 
 
 def _answer_documents(answer: dict | None) -> set[str]:
-    """Every document an answer draws on or names: its sources, measurements and documents, the documents its
+    """Every document an answer draws on or names: its sources, measurements, values and documents, the documents its
     coverage ledger lists (in scope, checked or not), the documents of its focus, and every document the turn's
     tools touched (a claim removed in verification may have quoted one; its text is kept in
     message_diagnostics, whose document ids come from this set). A message is shown, and carried into the model's context, only while all of them are visible."""
@@ -216,6 +216,7 @@ def _answer_documents(answer: dict | None) -> set[str]:
     ids = {s.get("document_id") for s in answer.get("sources") or []}
     ids |= {d for s in answer.get("sources") or [] for d in s.get("listed_document_ids") or []}
     ids |= {m.get("document_id") for m in answer.get("measurements") or []}
+    ids |= {v.get("document_id") for v in answer.get("values") or []}
     ids |= {d.get("document_id") for d in answer.get("documents") or []}
     ids |= coverage.ledger_documents(answer.get("ledger"))
     ids |= set((answer.get("focus") or {}).get("document_ids") or [])
@@ -546,15 +547,25 @@ def _answer_payload(outcome: engine.TurnOutcome) -> dict:
     cited = coverage.cited_ids(a.answer_markdown)
     sources = [ws.sources[i].public() | {"chunk_id": str(ws.sources[i].chunk_id) if ws.sources[i].chunk_id else None}
                for i in ws.sources if i in cited]
-    # measurements and computations cite the documents behind them
-    measurements = [ws.measurements[i].public() for i in ws.measurements if i in cited]
-    computations = []
-    for i in ws.computations:
-        if i in cited:
-            c = ws.computations[i]
-            computations.append(c.public())
-            measurements += [ws.measurements[x].public() for x in c.measurement_ids
-                             if x not in cited and x in ws.measurements]
+    # measurements, values and calculations cite the documents behind them: a calculation brings the earlier
+    # calculations, values, assumptions and measurements it rests on, and a value the source it was verified in
+    used = set(cited)
+    todo = [i for i in cited if i in ws.computations]
+    while todo:
+        c = ws.computations[todo.pop()]
+        for i in [x["id"] for x in c.inputs] + c.leaves:
+            if i not in used:
+                used.add(i)
+                if i in ws.computations:
+                    todo.append(i)
+    measurements = [ws.measurements[i].public() for i in ws.measurements if i in used]
+    computations = [ws.computations[i].public() for i in ws.computations if i in used]
+    values = [ws.values[i].public() for i in ws.values if i in used]
+    assumptions = [ws.assumptions[i].public() for i in ws.assumptions if i in used]
+    for v in values:  # the passage a value was verified in opens from the value
+        if v["source_id"] in ws.sources and not any(s["id"] == v["source_id"] for s in sources):
+            src = ws.sources[v["source_id"]]
+            sources.append(src.public() | {"chunk_id": str(src.chunk_id) if src.chunk_id else None})
     docs: dict[str, str] = {}
     for s in sources:
         if s["document_id"]:  # a listing names documents; it is not one of them
@@ -583,8 +594,8 @@ def _answer_payload(outcome: engine.TurnOutcome) -> dict:
     return {
         "kind": "rag", "status": a.status, "markdown": a.answer_markdown, "claims": [c.model_dump() for c in a.claims],
         "clarification": a.clarification_question or None, "missing": a.missing_info or None,
-        "sources": sources, "measurements": measurements, "computations": computations,
-        "documents": [{"document_id": k, "title": v} for k, v in docs.items()],
+        "sources": sources, "measurements": measurements, "computations": computations, "values": values,
+        "assumptions": assumptions, "documents": [{"document_id": k, "title": v} for k, v in docs.items()],
         # counts only; what was removed and why is diagnostics (``_diagnostics``)
         "verification": outcome.report.counts(),
         "searches": ws.searches, "coverage": ws.coverage, "steps": outcome.steps,

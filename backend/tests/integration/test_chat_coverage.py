@@ -253,11 +253,11 @@ def test_find_measurements_pages_without_skipping_rows_and_compute_says_partial(
     first = T.tool_find_measurements(ws, "דמי שכירות", ["rent_per_area"])
     assert "עמוד 1 מתוך 2; סה\"כ 130" in first
     ids = list(ws.measurements)
-    partial = json.loads(T.tool_compute(ws, "mean", ids))
+    partial = json.loads(T.tool_calculate(ws, f"mean({', '.join(ids)})", "ממוצע"))
     assert "חישוב חלקי" in partial["note"]
     T.tool_find_measurements(ws, "דמי שכירות", ["rent_per_area"], page=2)
     assert len(ws.measurements) == 130  # every value exactly once
-    full = json.loads(T.tool_compute(ws, "mean", list(ws.measurements)))
+    full = json.loads(T.tool_calculate(ws, f"mean({', '.join(ws.measurements)})", "ממוצע"))
     assert "חישוב חלקי" not in full["note"] and full["n"] == 130
 
 

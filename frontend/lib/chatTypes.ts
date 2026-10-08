@@ -69,14 +69,97 @@ export interface ChatMeasurement {
   anchor_lost?: boolean;
 }
 
+/** An input of a calculation: a value verified in a source (V#), a user assumption (A#), a stored measurement (M#)
+ * or an earlier calculation (C#), with its full value. */
+export interface ChatComputationInput {
+  id: string;
+  label: string;
+  kind: "value" | "assumption" | "measurement" | "computation";
+  value: string | null;
+  display: string | null;
+  value_text?: string;
+  /** For a value: the passage it was verified in. */
+  source_id?: string;
+  certainty?: "verified" | "model_asserted";
+  /** For an assumption: the user's words. */
+  quote?: string;
+}
+
+/** What a calculation is: a scenario the user asked for (it rests on a user assumption), a value the report itself
+ * writes reproduced, or a computation. */
+export type ChatResultKind = "scenario" | "reproduces_report_value" | "computed";
+
 export interface ChatComputation {
   id: string;
+  /** The expression in ids (an answer stored before the calculator holds the aggregate's name). */
   operation: string;
+  /** The full value (never rounded). */
   result: string | null;
   unit: string;
-  inputs: string[];
+  /** Ids in an answer stored before the calculator; inputs with their values after. */
+  inputs: (string | ChatComputationInput)[];
   documents: number;
   note: string;
+  label?: string;
+  expression?: string;
+  /** The formula with the inputs' Hebrew labels. */
+  formula?: string;
+  value?: string;
+  /** The result as shown: rounded for reading, and as a percentage for a ratio. */
+  display?: { value: string; percent?: string };
+  kind?: string | null;
+  result_kind?: ChatResultKind;
+  result_kind_label?: string;
+  assumptions?: string[];
+  sources?: string[];
+  /** It mixes what does not combine (VAT, area basis, subject) on the stated justification. */
+  conditional?: boolean;
+  conditions?: string[];
+  justification?: string | null;
+  reproduces?: { source: string; as_written: string } | null;
+  n?: number | null;
+}
+
+/** A value the server verified in a source the answer's turn read (V#): the cell at a row and column, or a number
+ * inside an exact quote, with its meaning and which parts of it the source attests. */
+export interface ChatValue {
+  id: string;
+  value: string;
+  value_text: string;
+  label: string;
+  source_id: string;
+  document_id: string;
+  version_id: string;
+  reading_id?: string | null;
+  title: string;
+  location: string;
+  kind: string;
+  unit: string;
+  unit_label: string;
+  period: string;
+  vat: string;
+  area_basis: string;
+  subject: string;
+  role: string;
+  provenance: Record<string, "source" | "model_asserted" | "not_stated">;
+  certainty: "verified" | "model_asserted";
+  locator: { row?: string; column?: string; row_number?: number; column_number?: number; quote?: string };
+  quote: string;
+  total: boolean;
+  approx: boolean;
+}
+
+/** A number the user gave for a scenario (A#), quoted from the user's own message. */
+export interface ChatAssumption {
+  id: string;
+  value: string;
+  value_text: string;
+  unit: string;
+  label: string;
+  quote: string;
+  /** Which user message it quotes (1 = the first visible one), and whether it is the message this answer replied to. */
+  turn: number;
+  current: boolean;
 }
 
 export interface ChatClaim {
@@ -154,6 +237,9 @@ export interface ChatAnswer {
   sources: ChatSource[];
   measurements: ChatMeasurement[];
   computations: ChatComputation[];
+  /** Values and user assumptions the answer's calculations and citations use (absent on older answers). */
+  values?: ChatValue[];
+  assumptions?: ChatAssumption[];
   documents: { document_id: string; title: string }[];
   verification: ChatVerification | null;
   searches: string[];

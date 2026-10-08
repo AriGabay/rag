@@ -30,20 +30,20 @@ if TYPE_CHECKING:
     from app.chat.engine import FinalAnswer
     from app.chat.tools import Workspace
 
-_CITE = re.compile(r"\[([SMC]\d+(?:\s*[,،;]\s*[SMC]\d+)*)\]")
+_CITE = re.compile(r"\[([SMCVA]\d+(?:\s*[,،;]\s*[SMCVA]\d+)*)\]")
 NAMES_SHOWN = 8
 
 
 def cited_ids(markdown: str) -> set[str]:
-    """The S#, M# and C# ids the answer cites."""
+    """The S#, M#, V#, A# and C# ids the answer cites."""
     ids: set[str] = set()
     for m in _CITE.finditer(markdown or ""):
-        ids |= set(re.findall(r"[SMC]\d+", m.group(1)))
+        ids |= set(re.findall(r"[SMCVA]\d+", m.group(1)))
     return ids
 
 
 def cited_documents(ws: Workspace, markdown: str) -> dict[str, str]:
-    """Document id -> title of every source, measurement and computation input the answer cites."""
+    """Document id -> title of every source, measurement, value and calculation input the answer cites."""
     out: dict[str, str] = {}
     for i in cited_ids(markdown):
         if i in ws.sources:
@@ -51,10 +51,14 @@ def cited_documents(ws: Workspace, markdown: str) -> dict[str, str]:
                 out[str(ws.sources[i].document_id)] = ws.sources[i].title
         elif i in ws.measurements:
             out[str(ws.measurements[i].document_id)] = ws.measurements[i].title
-        elif i in ws.computations:
-            for mid in ws.computations[i].measurement_ids:
-                if mid in ws.measurements:
-                    out[str(ws.measurements[mid].document_id)] = ws.measurements[mid].title
+        elif i in ws.values:
+            out[str(ws.values[i].document_id)] = ws.values[i].title
+        elif i in ws.computations:  # the documents of the values and measurements it rests on
+            for leaf in ws.computations[i].leaves:
+                if leaf in ws.measurements:
+                    out[str(ws.measurements[leaf].document_id)] = ws.measurements[leaf].title
+                elif leaf in ws.values:
+                    out[str(ws.values[leaf].document_id)] = ws.values[leaf].title
     return out
 
 

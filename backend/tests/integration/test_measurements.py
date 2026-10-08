@@ -3,7 +3,9 @@ the review API (permissions, stale protection, history), and compute refusing to
 
 from __future__ import annotations
 
+import json
 import time
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import text
@@ -152,13 +154,17 @@ def test_compute_refuses_to_mix_rent_with_value_and_computes_within_one_kind(off
     ids = {m.row.metric_kind: [] for m in ws.measurements.values()}
     for mid, m in ws.measurements.items():
         ids[m.row.metric_kind].append(mid)
-    mixed = T.tool_compute(ws, "mean", ids["value_per_area"] + ids["rent_per_area"][:1])
-    assert mixed.startswith("אי אפשר לחשב")
+    mixed = T.run_tool(ws, "calculate", json.dumps({
+        "expression": f"mean({', '.join(ids['value_per_area'] + ids['rent_per_area'][:1])})", "label": "ממוצע",
+        "justification": None}))
+    assert mixed.startswith("שגיאה: אי אפשר לחשב") and "שכירות" in mixed
     table = [mid for mid, m in ws.measurements.items()
              if m.row.metric_kind == "rent_per_area" and m.row.table_index is not None]
-    result = T.tool_compute(ws, "mean", table)
-    assert '"result": "56.50"' in result and '"n": 4' in result
-    assert "אי אפשר לסכם" in T.tool_compute(ws, "sum", table)
+    result = json.loads(T.tool_calculate(ws, f"mean({', '.join(table)})", "ממוצע דמי השכירות"))
+    assert Decimal(result["value"]) == Decimal("56.5") and result["n"] == 4
+    with pytest.raises(T.ToolError) as e:
+        T.tool_calculate(ws, f"sum({', '.join(table)})", "סכום")
+    assert "אי אפשר לסכם" in str(e.value)
 
 
 def test_blocks_and_media_follow_document_permissions(client, office):
@@ -225,4 +231,4 @@ def test_finding_the_same_value_twice_does_not_count_it_twice(office):
     table = [mid for mid, m in ws.measurements.items()
              if m.row.metric_kind == "rent_per_area" and m.row.table_index is not None]
     assert set(table) == first
-    assert '"n": 4' in T.tool_compute(ws, "count", table + table)
+    assert json.loads(T.tool_calculate(ws, f"count({', '.join(table + table)})", "ספירה"))["n"] == 4
