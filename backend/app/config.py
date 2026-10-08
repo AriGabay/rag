@@ -127,8 +127,11 @@ class Settings(BaseSettings):
     llm_timeout_summary_seconds: float = 60  # a background call after the answer is stored
     # The conversational answering loop: its step bound and wall clock (KTD12). Every limit the loop reaches ends
     # the reading with a forced final step and a visible limitation, never an answer that looks complete.
-    # model steps of a turn, its repair rounds included: reading takes up to 8, the last of them forced to answer
-    chat_max_steps: int = 10
+    # model steps of a turn, its repair rounds included: reading takes up to 12, the last of them forced to answer —
+    # room for a calculation reached one tool per step (scope, search, read, values, assumption, calculations). A
+    # step mostly extends a cached prefix, so it is cheap; the tool-output budget and the time reserve below are the
+    # cost limits that bind
+    chat_max_steps: int = 14
     chat_turn_seconds: int = 150  # verification may run ``VERIFY_ALLOWANCE_SECONDS`` past it
     chat_workers: int = 6
     chat_run_inline: bool = False  # tests: run a turn inside the request instead of a background thread

@@ -312,3 +312,66 @@ def test_a_value_from_a_document_the_user_can_no_longer_see_cannot_be_used(offic
     # through an earlier result as well
     assert "אינו זמין" in run(ws, "calculate", expression="C1 / 12", label="בדיקה", justification=None)
     assert "C2" not in ws.computations
+
+
+# --- the step bound fits a calculation flow ---------------------------------------------------------------------
+
+def _sequential_flow(doc: str) -> list:
+    """A calculation reached one tool per step, as a cautious model does: the scope, the stored measurements, a
+    search, the outline, the table, each value, the assumption and both calculations — ten steps before the answer."""
+    table: dict = {}
+
+    def source(items) -> str:
+        if "id" not in table:  # the table read is the step before the first value
+            table["id"] = re.search(r'<source id="(S\d+)"', _last_output(items)).group(1)
+        return table["id"]
+
+    return [
+        [call("find_documents", query="שדרות האלון", page=None)],
+        [call("find_measurements", query="רווח יזמי", metric_kinds=None, document_ids=None, value_roles=None,
+              page=None)],
+        [call("search", query="הכנסות ועלויות", document_ids=[doc], limit=None)],
+        [call("outline", document=doc)],
+        lambda items: [read(table=handle_of(_last_output(items), CAPTION))],
+        lambda items: [take(source(items), cell("סה\"כ", INCOME), meaning("income", role="income", vat="excluded"),
+                            "סה״כ הכנסות")],
+        lambda items: [take(source(items), cell("סה\"כ", COST), meaning("cost", role="cost", vat="excluded"),
+                            "סה״כ עלויות")],
+        [call("assume", value="5%", quote="העלויות יעלו ב-5%", label="עליית העלויות")],
+        [call("calculate", expression="V1 - V2*(1+A1%)", label="הרווח בתרחיש", justification=None)],
+        [call("calculate", expression="C1 / V1", label="שיעור הרווח מההכנסות", justification=None)],
+    ]
+
+
+def test_a_calculation_reached_in_ten_sequential_tool_steps_completes_within_the_default_bound(
+        client, office, monkeypatch):
+    agent = ScriptedAgent([*_sequential_flow(office.doc), final(ANSWER, documents=[office.doc])])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), QUESTION)
+    assert m["status"] == "done", (m.get("error"), len(agent.seen))
+    a = m["answer"]
+    assert len(agent.seen) == 11 and not agent.steps  # every scripted step ran, the answer at the eleventh
+    assert a["limits_hit"] == [] and "מספר הצעדים המרבי" not in a["markdown"]
+    assert a["status"] == "answered" and a["verification"]["removed"] == 0
+    assert sorted(c["id"] for c in a["computations"]) == ["C1", "C2"] and "12.3%" in a["markdown"]
+    assert a["steps"] == 11
+
+
+def test_parallel_tool_calls_of_one_step_all_run_and_count_as_one_step(client, office, monkeypatch):
+    # a bound of seven model steps (two kept for repairs): AE4 takes six, its third step calling three tools; counted
+    # per call it would take eight and reach the bound
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_max_steps", 9)
+    agent = ScriptedAgent([*_ae4_steps(office.doc), final(ANSWER, documents=[office.doc])])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), QUESTION)
+    assert m["status"] == "done", m
+    # the step after the parallel one sees all three outputs, each answering its own call
+    third = [i for i in agent.seen[3] if isinstance(i, dict) and i.get("type") == "function_call_output"][-3:]
+    assert [i["call_id"] for i in third] == ["call_2_0", "call_2_1", "call_2_2"]
+    assert [i["output"][:2] for i in third] == ["V1", "V2", "A1"] and all("נרשם" in i["output"] for i in third)
+    assert len(agent.seen) == 6 and m["answer"]["limits_hit"] == [] and m["answer"]["status"] == "answered"
+    assert m["answer"]["steps"] == 6

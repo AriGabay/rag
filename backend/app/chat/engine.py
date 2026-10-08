@@ -25,7 +25,8 @@ reached while reading — the tool-output budget, the step bound or the time res
 it keeps the same tools in the same order with ``tool_choice`` "none", and an item appended to the conversation
 tells the model it ran out and must not present the answer as complete. The answer is still verified; it is then
 ``partial``, a sentence names the limit, and ``limits_hit`` goes to diagnostics. When less time is left than a
-verification needs, the turn fails with its own message (its calls are still logged).
+verification needs, the turn fails with its own message (its calls are still logged). Two tool steps before the
+step bound, an appended item tells the model to register what it still needs and calculate, or answer, now.
 
 Prompt caching. The policy, the tools and the turn's first message are the same at every step and carry nothing
 of the moment the turn runs; each step only appends to the items the previous step sent, and a tool output is
@@ -73,8 +74,12 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
 
 איך לעבוד:
 - חפש לפי משמעות השאלה (search). נסח שאילתות במילים שסביר שיופיעו במסמך, ונסה ניסוח נוסף או מונחים נרדפים אם
-  התוצאות חלשות (שומה/חוות דעת, דמ"ש/דמי שכירות, שווי למ"ר/מחיר למ"ר...). כשהשאלה על מסמך מסוים, מצא אותו
-  (list_documents) וחפש בתוכו.
+  התוצאות חלשות (שומה/חוות דעת, דמ"ש/דמי שכירות, שווי למ"ר/מחיר למ"ר...). שאלה על מסמך, פרויקט או נכס אחד שנקוב
+  בשמו: גש אליו ישירות — search עם שמו ועם הנתון, ואז read או outline של המסמך שנמצא (list_documents רק אם צריך
+  את המסמך לפי כותרתו). find_documents הוא לשאלה על קבוצת מסמכים, לא לפתיחה של שאלה על מסמך אחד.
+- מספר הצעדים בתור מוגבל, וצעד אחד יכול לכלול כמה קריאות לכלים. קריאות שאינן תלויות זו בזו — שלח באותו צעד: למשל
+  take_value לכמה תאים של טבלה שקראת יחד עם assume, או search ו-read לכמה מקומות. רק מה שתלוי בתוצאה של קריאה
+  אחרת — בצעד הבא (calculate על V#/A# שנרשמים עכשיו). קרא ל-calculate מיד כשכל הקלטים שלו רשומים.
 - מקור עם same_as הוא אותו טקסט כמו המקור שהוא מפנה אליו (לא נשלח שוב); מותר לצטט כל אחד מהם. קטעים שכבר הוחזרו
   בתור לא נשלחים שוב בקריאה חדשה: במקומם מופיעה הפניה ל-S# שבו הם נמצאים, והמקור החדש כולל אותם ומותר לצטט אותו.
   התאם את היקף הקריאה לשאלה: לנתון ממוקד — חיפוש אחד ממוקד בדרך כלל מספיק; פתח הקשר רק כשמשמעות המספר אינה ברורה
@@ -170,6 +175,11 @@ REWRITE = """גם התשובה המתוקנת לא אומתה במלואה. אל
 LIMIT_NOTICE = """אין עוד קריאה לכלים בשאלה הזו: {why}. ענה עכשיו רק ממה שכבר קראת ומהמזהים שקיבלת. אל תציג את
 התשובה כמלאה: status partial (או not_found / clarification כשמתאים), ואמור במילים פשוטות מה לא נבדק או לא נקרא.
 השרת מוסיף לתשובה משפט על המגבלה — אל תכתוב אותו בעצמך."""
+# the item appended two tool steps before the step bound (once; appended, so the cached prefix survives)
+NEAR_LIMIT_NOTICE = """נותרו שני צעדים אחרונים עם כלים בשאלה הזו — זה והבא — ואחריהם תענה בלי כלים. אם התשובה דורשת
+חישוב: רשום עכשיו, באותו צעד, את כל הערכים וההנחות שעוד חסרים (take_value, assume), וקרא ל-calculate לכל המאוחר
+בצעד הבא. אם כבר יש בידך מה שצריך — ענה עכשיו."""
+NEAR_LIMIT_STEPS = 2  # tool steps left (this one included) when ``NEAR_LIMIT_NOTICE`` is appended
 STEP_LIMIT, TIME_LIMIT = "step_limit", "time_limit"
 LIMIT_WHY = {
     T.TOOL_BUDGET: "הגעת למגבלת היקף הקריאה לשאלה אחת (כמות הטקסט שהכלים מחזירים)",
@@ -434,6 +444,9 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             items.append({"role": "user", "content": LIMIT_NOTICE.format(why=LIMIT_WHY[reason])})
         elif last and attempt == 1:
             items.append({"role": "user", "content": REPAIR_LAST})
+        elif attempt == 0 and steps == bound - NEAR_LIMIT_STEPS:
+            # the reading's step count only grows, so this is said once; a calculation still fits after it
+            items.append({"role": "user", "content": NEAR_LIMIT_NOTICE})
         # the same tools in the same order at every step, the last one included: only the choice changes
         step = agent.agent_step(POLICY, items, T.TOOLS, FINAL_SCHEMA, cache_key=cache_key,
                                 timeout=max(15.0, min(left, settings.llm_timeout_agent_seconds)),

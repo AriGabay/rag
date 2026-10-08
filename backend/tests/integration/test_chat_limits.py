@@ -157,17 +157,53 @@ def test_a_turn_within_the_budget_is_not_marked(client, office, monkeypatch):
 
 # --- the step bound and the time reserve ---------------------------------------------------------------------------
 
+def notices(snapshot: list) -> list[int]:
+    """The positions of the near-limit notice among a step's items."""
+    return [i for i, item in enumerate(snapshot) if item.get("role") == "user" and item["content"] == engine.NEAR_LIMIT_NOTICE]
+
+
 def test_the_step_limit_ends_reading_with_a_verified_partial_answer(client, office, monkeypatch):
-    # eight steps, two kept for the repair rounds: the reading may take six, the sixth of them forced to answer
-    setting(monkeypatch, chat_max_steps=8, chat_repair_rounds=2)
-    agent = Reader([[pages(office.doc, p)] for p in (1, 2, 3, 4, 1, 2, 3, 4)], ANSWER)
+    # the defaults: fourteen steps, two kept for the repair rounds — the reading may take twelve, the twelfth of them
+    # forced to answer
+    agent = Reader([[pages(office.doc, p)] for p in (1, 2, 3, 4) * 5], ANSWER)
     m = ask(client, office, monkeypatch, agent)
     a = m["answer"]
-    assert len(agent.snapshots) == 6
+    assert len(agent.snapshots) == 12
     assert_forced_final(agent, "מספר הצעדים המרבי")
     assert a["verification"]["judged"] and a["verification"]["removed"] == 0
     assert a["status"] == "partial" and "812" in a["markdown"] and "מספר הצעדים המרבי לשאלה אחת" in a["markdown"]
     assert a["limits_hit"] == ["step_limit"] and diagnostics(client, m)["limits_hit"] == ["step_limit"]
+
+
+def test_two_tool_steps_before_the_step_limit_the_model_is_told_once_to_compute_and_answer(client, office, monkeypatch):
+    agent = Reader([[pages(office.doc, p)] for p in (1, 2, 3, 4) * 5], ANSWER)
+    ask(client, office, monkeypatch, agent)
+    # appended as the last item of the tenth step (two tool steps left, then the forced twelfth), and only then
+    assert [notices(s) for s in agent.snapshots[:9]] == [[]] * 9
+    assert notices(agent.snapshots[9]) == [len(agent.snapshots[9]) - 1]
+    assert all(len(notices(s)) == 1 for s in agent.snapshots[9:])
+    assert "calculate" in engine.NEAR_LIMIT_NOTICE and "באותו צעד" in engine.NEAR_LIMIT_NOTICE
+    # the steps after it still only append, and the forced final step behaves as before
+    for before, after in zip(agent.snapshots, agent.snapshots[1:], strict=False):
+        assert after[:len(before)] == before
+    assert agent.choices[9:11] == [None, None]
+    assert_forced_final(agent, "מספר הצעדים המרבי")
+
+
+def test_the_step_bound_is_configurable_and_the_notice_follows_it(client, office, monkeypatch):
+    # eight steps, two kept for the repair rounds: the reading may take six, the notice comes at the fourth
+    setting(monkeypatch, chat_max_steps=8, chat_repair_rounds=2)
+    agent = Reader([[pages(office.doc, p)] for p in (1, 2, 3, 4, 1, 2, 3, 4)], ANSWER)
+    m = ask(client, office, monkeypatch, agent)
+    assert len(agent.snapshots) == 6 and m["answer"]["limits_hit"] == ["step_limit"]
+    assert [len(notices(s)) for s in agent.snapshots] == [0, 0, 0, 1, 1, 1]
+    assert_forced_final(agent, "מספר הצעדים המרבי")
+
+
+def test_a_model_that_answers_before_the_notice_never_gets_it(client, office, monkeypatch):
+    agent = Reader([[pages(office.doc, 2)], [pages(office.doc, 3)]], final("שטח המגרש הוא 812 מ\"ר [S1]."))
+    m = ask(client, office, monkeypatch, agent)
+    assert m["answer"]["limits_hit"] == [] and not any(notices(s) for s in agent.snapshots)
 
 
 def test_the_repair_rounds_fit_inside_the_step_bound(client, office, monkeypatch):
@@ -178,6 +214,7 @@ def test_the_repair_rounds_fit_inside_the_step_bound(client, office, monkeypatch
     # two reading steps (the second forced), one repair step and one rewrite: never more than the bound
     assert len(agent.snapshots) == 4 and agent.choices == [None, "none", "none", "none"]
     assert agent.tools == [TOOLS] * 4
+    assert not any(notices(s) for s in agent.snapshots)  # a bound too short for the notice gets only the limit
     assert m["status"] == "done" and "990" not in m["answer"]["markdown"]
     assert len(diagnostics(client, m)["rounds"]) == 3
 
