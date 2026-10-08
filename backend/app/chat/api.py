@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
 from app.audit import audit
-from app.chat import coverage, engine
+from app.chat import anchors, coverage, engine
 from app.config import get_settings
 from app.db import TenantContext, current_data_version, tenant_tx
 from app.deps import NOT_FOUND, get_ctx, parse_uuid
@@ -216,7 +216,9 @@ def _answer_documents(answer: dict | None) -> set[str]:
     """Every document an answer draws on or names: its sources, measurements, values and documents, the documents its
     coverage ledger lists (in scope, checked or not), the documents of its focus, and every document the turn's
     tools touched (a claim removed in verification may have quoted one; its text is kept in
-    message_diagnostics, whose document ids come from this set). A message is shown, and carried into the model's context, only while all of them are visible."""
+    message_diagnostics, whose document ids come from this set), and every document a citation's anchor points at
+    (``app.chat.anchors``). A message is shown, and carried into the model's context, only while all of them are
+    visible."""
     if not answer:
         return set()
     ids = {s.get("document_id") for s in answer.get("sources") or []}
@@ -230,6 +232,7 @@ def _answer_documents(answer: dict | None) -> set[str]:
     ids |= {c.get("document_id") for c in (answer.get("request") or {}).get("candidates") or []}
     ids |= {d for r in answer.get("requested") or [] for d in r.get("document_ids") or []}
     ids |= set(answer.get("touched_documents") or [])
+    ids |= anchors.anchored_documents(answer)
     ids.discard(None)
     return ids
 
@@ -611,7 +614,7 @@ def _answer_payload(outcome: engine.TurnOutcome) -> dict:
         focus["document_ids"] = [d for d in focus["document_ids"] if d in known]
         if not focus["document_ids"] and a.status == "not_found":
             focus = None
-    return {
+    payload = {
         "kind": "rag", "status": a.status, "markdown": a.answer_markdown, "claims": [c.model_dump() for c in a.claims],
         "clarification": a.clarification_question or None, "missing": a.missing_info or None,
         "sources": sources, "measurements": measurements, "computations": computations, "values": values,
@@ -626,6 +629,10 @@ def _answer_payload(outcome: engine.TurnOutcome) -> dict:
         "requested": coverage.validate_requested(ws, a.requested),
         "touched_documents": sorted(ws.activity),
     }
+    # every cited source, value and measurement keeps where it points, resolved against the turn's pinned readings
+    # (KTD1); a computation keeps its inputs
+    anchors.attach(ws, payload)
+    return payload
 
 
 def _diagnostics(outcome: engine.TurnOutcome, payload: dict) -> dict:
@@ -650,6 +657,7 @@ def _limited_answer(ctx: TenantContext, question: str, reason: str) -> dict:
     except T.ToolError:
         pass
     sources = [_public_source(s) for s in ws.sources.values()]
+    anchors.attach(ws, {"sources": sources})
     lines = [f"**{reason}** לכן לא נוסחה תשובה מנותחת. אלה הקטעים הקרובים ביותר שנמצאו בחיפוש — יש לקרוא אותם "
              "במקור:" if sources else f"**{reason}** וגם החיפוש לא העלה קטעים מתאימים."]
     for s in ws.sources.values():

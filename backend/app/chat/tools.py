@@ -66,7 +66,7 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from app.answering.verify import numbers_in
-from app.chat import calc, meaning, reader
+from app.chat import anchors, calc, meaning, reader
 from app.chat.evidence import TABLE_SIZE_PREFIX
 from app.config import get_settings
 from app.db import TenantContext, tenant_tx
@@ -162,6 +162,7 @@ class Source:
     tags: dict = field(default_factory=dict)  # handles shown on the source's tag: {"document": "D1", "table": "T2"}
     table_part: bool = False  # some rows of a table read in parts, not all of them
     method: str | None = None  # how its text was read when not from the text layer (``vision`` for an inspection)
+    row_index: int | None = None  # a table-row search hit: the body row of its table (``structure.rows``) it is
 
     @property
     def is_listing(self) -> bool:
@@ -174,7 +175,7 @@ class Source:
                "text": self.text, "block_start": self.block_start, "block_end": self.block_end,
                "table_index": self.table_index, "page_list": self.page_list, "reading_id": self.reading_id,
                "status": self.status, "clipped": self.clipped, "unread_regions": len(self.unread_regions),
-               "more": self.resume, "method": self.method}
+               "more": self.resume, "method": self.method, "row_index": self.row_index}
         if self.is_listing:
             out["listed_document_ids"] = list(self.listed)
         return out
@@ -257,6 +258,8 @@ class Workspace:
     # the turn's model-call cost records (``usage_entry``), when the turn passes its own: a tool's model call is then
     # logged with the turn's calls; None: the tool's reader logs its call itself
     usage: list[dict] | None = None
+    # S#, V#, M# -> where it points, as the tool read it (``app.chat.anchors``): snapshotted when the answer is stored
+    anchors: dict[str, dict] = field(default_factory=dict)
 
     def spend(self, output: str) -> str:
         """Count a tool output sent to the model against the turn's budget; the output that reaches it is sent
@@ -346,6 +349,7 @@ class Workspace:
             known = Measurement(f"M{len(self.measurements) + 1}", row.id, row.document_id, row.version_id, row.title,
                                 row)
             self.measurements[known.mid] = known
+            self.anchors[known.mid] = anchors.measurement_stub(known)
         return known
 
     def adopt(self, source: Source) -> Source:
@@ -354,6 +358,9 @@ class Workspace:
             source.reading_id = self.readings.get(str(source.version_id))
         source.sid = self._sid()
         self.sources[source.sid] = source
+        stub = anchors.source_stub(source)
+        if stub is not None:
+            self.anchors[source.sid] = stub
         return source
 
 
@@ -529,7 +536,8 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 kind=h["kind"], text=_with_size(sizes.get((h["version_id"], h.get("table_index"))),
                                                 _clip(h["text"], get_settings().chat_passage_chars)), block_start=bs, block_end=be,
                 table_index=h.get("table_index"), chunk_id=h["chunk_id"], page_list=h["page_list"] or None,
-                partial_document=h["version_id"] in partial, tags=tags), ("chunk", h["chunk_id"])))
+                partial_document=h["version_id"] in partial, tags=tags,
+                row_index=h.get("row_index") if h["kind"] == "table_row" else None), ("chunk", h["chunk_id"])))
             ws.touch(h["document_id"], h["title"], "retrieved", h["version_id"] in partial)
     if not out:
         return f'לא נמצאו קטעים עבור "{query}". אפשר לנסות ניסוח אחר, מונחים נרדפים או חיפוש בתוך מסמך מסוים.'
@@ -1681,12 +1689,22 @@ def _take_cell(ws: Workspace, conn: Connection, src: Source, full: str, loc: dic
             "locator": {"table_index": index, "row": cells[0] if cells else "", "row_number": ri + 1,
                         "column": header, "column_number": ci + 1},
             "total": bool(calc.TOTAL_WORDS.search(meaning._norm(cells[0] if cells else ""))),
-            "table": (str(src.version_id), index)}
+            "table": (str(src.version_id), index),
+            # the cell as stored (KTD1): its box is looked up when the answer is stored, never searched for
+            "anchor": {"table_index": index, "row": ri, "column": ci,
+                       "pages": [p] if (p := (st.get("rows") or [])[ri].get("page")) else []}}
 
 
-def _take_quote(src: Source, full: str, loc: dict) -> dict:
+MSG_QUOTE_AMBIGUOUS = ("הציטוט מופיע ב-{sid} יותר מפעם אחת, ובמקומות שונים כתוב בו מספר אחר: צטט ציטוט ארוך יותר, "
+                       "שמופיע במקור פעם אחת בלבד ושהמספר כתוב בו במלואו")
+
+
+def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = None) -> dict:
     """The number inside an exact quote of the source: the quote must occur in the source's full text, and the
-    number inside the quote."""
+    number inside the quote. ``blocks``: the source's blocks (``(block_index, text, page)``), where the quote is
+    located within the cited range only (KTD4): one occurrence records its block and word span; several that write
+    the same number record the blocks holding them (block precision); several that write different numbers are
+    refused, asking for a longer quote. Never the first occurrence."""
     if not loc.get("number"):
         raise ToolError("ציטוט (quote) דורש גם את המספר כפי שנכתב בו (number)")
     wanted = _parse_number(loc["number"])
@@ -1704,6 +1722,17 @@ def _take_quote(src: Source, full: str, loc: dict) -> dict:
             raise ToolError(f"המספר {loc['number']} נמצא ב-{src.sid} אבל לא בתוך הציטוט: צטט את המשפט שבו הוא כתוב")
         raise ToolError(f"המספר {loc['number']} אינו בציטוט ואינו ב-{src.sid}")
     written, start, end, value = hit[0]
+    anchor: dict = {}
+    if blocks:
+        try:
+            found = anchors.locate_quote(blocks, loc["quote"], abs(wanted[1]))
+        except anchors.AmbiguousQuote:
+            raise ToolError(MSG_QUOTE_AMBIGUOUS.format(sid=src.sid)) from None
+        if found is not None:
+            pages = {b[0]: b[2] for b in blocks if len(b) > 2}
+            anchor = ({"segments": found.segments, "number": found.number} if found.segments
+                      else {"blocks": found.blocks})
+            anchor["pages"] = sorted({pages[i] for i in found.blocks if pages.get(i)})
     at = text_.index(quote)
     local = text_[max(0, at + start - 8):at + end + 16]
     forms = frozenset(numbers_in(written))
@@ -1716,7 +1745,8 @@ def _take_quote(src: Source, full: str, loc: dict) -> dict:
     return {"written": written, "value": sign * value, "forms": forms, "quote": loc["quote"].strip(),
             "qualifiers": meaning.number_qualifiers(full, forms, quote),
             "units": units, "vat": meaning.vat_attested(line, forms, full),
-            "kind_context": quote, "locator": {"quote": loc["quote"].strip()}, "total": False, "table": None}
+            "kind_context": quote, "locator": {"quote": loc["quote"].strip()}, "total": False, "table": None,
+            "anchor": anchor}
 
 
 def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict]:
@@ -1797,7 +1827,15 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
             raise ToolError(MSG_UNAVAILABLE)
         if src.reading_id is not None and v.reading_id != src.reading_id:
             raise ToolError(MSG_STALE_REF.format(source_id=sid))
-        taken = _take_cell(ws, conn, src, full, loc) if cell else _take_quote(src, full, loc)
+        if cell:
+            taken = _take_cell(ws, conn, src, full, loc)
+        else:
+            blocks = None
+            if src.block_start is not None:
+                blocks = [(r.block_index, r.text or "", r.page) for r in reader.blocks_between(
+                    conn, src.version_id, src.block_start,
+                    src.block_end if src.block_end is not None else src.block_start)]
+            taken = _take_quote(src, full, loc, blocks)
     fields, prov = _settle_meaning(taken, given)
     approx = "approx" in taken["qualifiers"].keys("approx")
     total = taken["total"] or given["role"] == "total"
@@ -1810,6 +1848,15 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
                        fields["vat"], fields.get("area_basis") or "", (fields.get("subject") or "").strip(),
                        fields["role"], prov, where, taken["quote"], total, taken["table"], approx)
     ws.values[value.vid] = value
+    stub = anchors.source_stub(src)
+    if stub is not None:  # where the value is, as taken (KTD1): the source's range, narrowed to its span or cell
+        extra = dict(taken.get("anchor") or {})
+        pages = extra.pop("pages", None)
+        stub = {k: v for k, v in stub.items() if k != "row"} | extra | {
+            "kind": "cell" if cell else "quote", "reading_id": value.reading_id}
+        if pages:
+            stub["pages"] = pages
+        ws.anchors[value.vid] = stub
     shown = [UNIT_LABELS.get(value.unit, ""), PERIOD_LABELS.get(value.period, ""), VAT_LABELS.get(value.vat, ""),
              f"בסיס שטח: {value.area_basis}" if value.area_basis else ""]
     place = (f"שורה «{where['row']}» (מס' {where['row_number']}), עמודה «{where['column']}»" if "row" in where

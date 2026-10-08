@@ -14,6 +14,110 @@ export interface ChatProgressStep {
   label: string;
 }
 
+/** Where a citation points (backend `app/chat/anchors.py`), snapshotted into the answer when it was stored, so an old
+ * conversation keeps its original place after a reprocess. Absent on answers stored before anchors: they open as
+ * before. Rectangles are fractions of the rendered page (origin top-left), never model-supplied positions. */
+export type ChatAnchorPrecision = "span" | "cell" | "block" | "region" | "page" | "structured";
+
+/** Why an anchor is less precise than its source asked for. */
+export type ChatAnchorDegraded =
+  | "reading_changed"
+  | "no_geometry"
+  | "no_cell_box"
+  | "not_located"
+  | "unavailable"
+  | "anchor_lost";
+
+/** [x0, y0, x1, y1] as fractions of the page's width and height. */
+export type ChatAnchorRect = [number, number, number, number];
+
+export interface ChatAnchorPage {
+  /** File page, 1-based. */
+  page: number;
+  /** The page number printed on the page, when detected. */
+  printed_label: string | null;
+  /** Size of the rendered page in points (null when not stored). */
+  width: number | null;
+  height: number | null;
+  rects: ChatAnchorRect[];
+  /** The cited number inside the rects (span precision). */
+  focus: ChatAnchorRect[];
+}
+
+export interface ChatAnchorTable {
+  table_index: number;
+  title: string | null;
+  row_label: string | null;
+  row_number: number | null;
+  column_header: string | null;
+  column_number: number | null;
+  unit_note: string | null;
+  /** How the table was read when not from the text layer: "vision", "ocr", "emf". */
+  source: string | null;
+  /** The column header cell (or the header row) on the page, when its box is stored. */
+  header: { page: number; rects: ChatAnchorRect[] } | null;
+  notes: { text: string; page?: number }[];
+}
+
+export interface ChatAnchorStructured {
+  section_path: string[];
+  paragraph_no: number | null;
+  paragraph_end: number | null;
+  label: string | null;
+  /** The cited paragraph or cell text (bounded). */
+  text: string;
+  /** [start, end) of the quoted words in `text`. */
+  highlight: [number, number] | null;
+  cell: {
+    table_index: number;
+    row_number: number;
+    column_number: number;
+    row_label: string | null;
+    column_header: string | null;
+    text: string;
+  } | null;
+}
+
+export interface ChatAnchor {
+  v: number;
+  precision: ChatAnchorPrecision;
+  /** Hebrew label for the viewer's header. */
+  precision_label: string;
+  /** What a "region" covers. */
+  region: "table" | "row" | null;
+  degraded: ChatAnchorDegraded | null;
+  document_id: string;
+  version_id: string;
+  /** The reading the turn pinned: the region route must be asked for this one. */
+  reading_id: string | null;
+  block_start: number | null;
+  block_end: number | null;
+  /** Empty for DOCX (structured) and when nothing more than the document is known. */
+  pages: ChatAnchorPage[];
+  location: {
+    /** A readable title (null when the title and file name are garbled or ids). */
+    title: string | null;
+    /** The readable location: page (printed page), section, table, row, column or paragraph. Never ids. */
+    label: string;
+    page: number | null;
+    page_end: number | null;
+    printed_page: string | null;
+    section: string | null;
+  };
+  table: ChatAnchorTable | null;
+  structured: ChatAnchorStructured | null;
+  /** Pages or rectangles were cut to keep the snapshot bounded. */
+  truncated: boolean;
+}
+
+/** A computed result (C#) anchors to its inputs, never to a place in a document. */
+export interface ChatComputedAnchor {
+  v: number;
+  precision: "computed";
+  precision_label: string;
+  inputs: string[];
+}
+
 export interface ChatSource {
   id: string;
   /** null for a listing of documents (kind "listing"): it names documents, it is not one */
@@ -41,6 +145,10 @@ export interface ChatSource {
   unread_regions?: number;
   /** Where a clipped source continues (server-side position; a later turn reopens it from there). */
   more?: { target: (string | number | string[])[]; pos: number | number[] } | null;
+  /** A table-row search hit: its body row in the table (0-based). */
+  row_index?: number | null;
+  /** Where the citation points (absent on older answers). */
+  anchor?: ChatAnchor | null;
 }
 
 export interface ChatMeasurement {
@@ -67,6 +175,7 @@ export interface ChatMeasurement {
   reading_id?: string | null;
   /** Its place was not found again when the document was reprocessed: not verified against the current reading. */
   anchor_lost?: boolean;
+  anchor?: ChatAnchor | null;
 }
 
 /** An input of a calculation: a value verified in a source (V#), a user assumption (A#), a stored measurement (M#)
@@ -118,6 +227,8 @@ export interface ChatComputation {
   justification?: string | null;
   reproduces?: { source: string; as_written: string } | null;
   n?: number | null;
+  /** Its inputs, each opened through its own anchor (absent on older answers). */
+  anchor?: ChatComputedAnchor | null;
 }
 
 /** A value the server verified in a source the answer's turn read (V#): the cell at a row and column, or a number
@@ -147,6 +258,8 @@ export interface ChatValue {
   quote: string;
   total: boolean;
   approx: boolean;
+  /** The cell or quoted words it was taken from (absent on older answers). */
+  anchor?: ChatAnchor | null;
 }
 
 /** A number the user gave for a scenario (A#), quoted from the user's own message. */
