@@ -31,3 +31,9 @@ The focus is context, not a filter. When the user names another property, unit o
 What the system actually read of a document, kept per block and summarised per document: each heading, paragraph, table and picture or page region is read, read with uncertainty (OCR, a visual reading OCR could not confirm, or text repaired from a broken font map), without text, or unread with a reason.
 
 A document with any meaningful unread region is *partly read*. That state is shown on the documents screen and given to the assistant, and an answer never treats a partly read source, or a section it read only in part, as evidence that a datum is absent.
+
+### Page furniture
+
+Content that repeats across a document's pages, such as a logo, a letterhead, a footer or a watermark, recognised by its content rather than its size and stored and read once for the whole document.
+
+Its text counts as present on every page it appears on, so it is not mistaken for content lost between two readings. A small picture that does not repeat is never treated as furniture and is read like any other region.
