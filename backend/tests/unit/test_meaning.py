@@ -279,3 +279,28 @@ def test_the_same_number_with_a_period_in_a_comparables_section_attests_nothing(
     (u,) = split_units("דמי השכירות הראויים הם 70 ₪ למ\"ר לחודש [S1].")
     (p,) = meaning.check(u, ws, meaning.Fetcher(ws))
     assert p.blocking and p.kind == "period" and u.ids == ["S1"]
+
+
+# --- an area basis qualifies an area or a per-area amount, never a total in ₪ or a factor --------------------------
+
+AREA_CALC = ("תחשיב מצב חדש\nמהות | שטח | מקדם אקוו' | סה\"כ מ\"ר אקוו'\nשטח עיקרי | 145 | 1 | 145\n"
+        "שטח חצר | 100 | 0.25 | 25\nמקדם דחיה | | | 0.8712\nשווי מצב חדש | | | 28,940,300")
+
+
+@pytest.mark.parametrize("answer", [
+    "שווי המצב החדש שנקבע הוא 28,940,300 ₪ [S1].",
+    "הובא בחשבון מקדם דחיה של 0.8712 [S1].",
+])
+def test_a_total_or_a_factor_in_an_area_table_is_not_given_the_tables_area_basis(answer):
+    assert _problems(answer, _ws(AREA_CALC, kind="table")) == []
+
+
+def test_an_area_in_the_same_table_still_needs_its_basis():
+    (p,) = _problems("שטח החצר המשוקלל הוא 25 מ\"ר [S1].", _ws(AREA_CALC, kind="table"))
+    assert p.kind == "basis" and "אקוו" in p.annotation
+
+
+def test_the_equivalent_basis_written_without_a_geresh_is_that_basis():
+    src = "שווי הנכס: 8,640 ₪ X 68.40 מ\"ר אקווי'."
+    for said in ("אקווי", "אקוי"):
+        assert _problems(f"בתחשיב השווי הוכפל ב-68.40 מ״ר {said} [S1].", _ws(src)) == [], said

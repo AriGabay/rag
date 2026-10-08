@@ -48,8 +48,8 @@ if TYPE_CHECKING:
 
 # (key, pattern) — the key compares spellings; the matched text is the qualifier as written
 _BASIS = [
-    # אקוו׳, אקווי׳, אקוי׳, אקו׳, אקוו, אקוויוולנטי(ים), אקוולנטי: one basis however it is spelt
-    ("אקוו", r"(?:מ\"ר\s*)?אקו(?:ו?י?ו?ולנטי(?:ים)?|ו?י?'|ו)(?![א-ת])"),
+    # אקוו׳, אקווי׳, אקוי׳, אקו׳, אקוו, אקווי, אקוי, אקוויוולנטי(ים), אקוולנטי: one basis however it is spelt
+    ("אקוו", r"(?:מ\"ר\s*)?אקו(?:ו?י?ו?ולנטי(?:ים)?|ו?י?'|ו?י|ו)(?![א-ת])"),
     ("פלדלת", r"(?:מ\"ר\s*)?(?<![א-ת])[ולב]?פלדלת"),
     ("ברוטו", r"(?:מ\"ר\s*)?(?<![א-ת])[ו]?ברוטו(?![א-ת])"),
     ("נטו", r"(?:מ\"ר\s*)?(?<![א-ת])[ו]?נטו(?![א-ת])"),
@@ -184,6 +184,26 @@ def _row_cells(line: str) -> list[str]:
 
 # a per-area amount: its row or column says "למ״ר", "/מ״ר", "למטר", "לדונם"
 _PER_AREA = re.compile(r"(?:(?<![א-ת])ל|/\s?)(?:מ\"ר|מטר|דונם)(?![א-ת])")
+
+
+_AREA_AFTER = re.compile(r"\s*(?:מ\"ר|מטר|דונם)(?![א-ת])")
+
+
+_AREA_WORD = re.compile(r"(?<![א-ת])[לב]?(?:מ\"ר|מטר|דונם)(?![א-ת])")
+
+
+def _area_amount(text: str, pos: int, written: str, closest: list[Occurrence]) -> bool:
+    """Whether the number at ``pos`` is an area or a per-area amount, the only numbers an area basis qualifies:
+    the answer presents it so ("145 מ״ר", or its clause says "למ״ר"), or its own line in the source does ("שווי
+    למ״ר בנוי | 8,700"). A total in ₪ or a factor in the rows of a calculation table whose area column is "מ״ר
+    אקוו׳" is neither, though the column's header binds the basis to it."""
+    if _AREA_AFTER.match(text, pos + len(written)):
+        return True
+    starts = [m.end() for m in _CLAUSE_END.finditer(text, 0, pos)]
+    end = _CLAUSE_END.search(text, pos)
+    if _PER_AREA.search(text[starts[-1] if starts else 0:end.start() if end else len(text)]):
+        return True
+    return any(_AREA_WORD.search(o.context) for o in closest)
 
 
 def _table_definitions(lines: list[str], is_row: list[bool], heads: list[str]) -> dict[str, dict[str, str]]:
@@ -598,6 +618,8 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
         closest = _closest(occurrences, words)
         expanded: list | None = None  # read only for a qualifier the cited passages do not attach
         for kind in ("basis", "period", "approx"):
+            if kind == "basis" and not _area_amount(text, pos, written, closest):
+                continue  # an area basis qualifies an area or a per-area amount only
             if not all(o.qualifiers.keys(kind) for o in closest):
                 if kind == "approx" or fetcher is None or whole.keys(kind):
                     continue

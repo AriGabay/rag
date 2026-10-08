@@ -500,3 +500,14 @@ def test_a_two_part_question_answered_for_one_part_says_the_other_was_not_found(
                                                                          ("שטח המגרש", "not_covered")]
     judged = next(c.input for c in agent.calls if c.purpose.value == "verify")
     assert "<request_parts>" in judged and "שטח המגרש" in judged
+
+
+def test_a_document_whose_title_carries_fewer_of_the_questions_words_is_not_named(client, setup, monkeypatch):
+    for n in range(5):  # enough titles that the place is a shared word and does not name a document by itself
+        add_doc(setup, setup.default_group_id, f"דוח שוק {n}", [f"סקירה כללית מספר {n}."], f"{n + 4}" * 64)
+    add_doc(setup, setup.default_group_id, f"שומה האלה 5 {PLACE}", ["השווי למ\"ר הוא 10,000 ₪."], "9" * 64)
+    # the question carries the place (three titles) and the cited title's street: the others carry less of it
+    a, _ = _ask(client, setup, monkeypatch, [
+        [call("search", query="שווי", document_ids=[setup.d1], limit=None)],
+        final("השווי למ\"ר בנוי הוא 9,500 ₪ [S1].")], question=f"מה השווי בהגפן ב{PLACE}?")
+    assert not a["ledger"]["also_matching"]

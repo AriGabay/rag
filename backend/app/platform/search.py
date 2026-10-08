@@ -539,6 +539,17 @@ def documents_sharing_title_words(conn: Connection, question: str) -> dict[str, 
     return out
 
 
+def question_words_in_title(question: str, title: str) -> frozenset[str]:
+    """The words of ``question`` that ``title`` carries (in any prefixed form), as the question writes them."""
+    in_title = _title_words(title)
+    out = set()
+    for raw in _TITLE_WORD.findall(base_normalize(question)):
+        w = raw.strip("-'״׳\"")
+        if len(w) >= 2 and w not in STOPWORDS and in_title & {w, *prefix_variants(w)}:
+            out.add(w)
+    return frozenset(out)
+
+
 def search_passages(conn: Connection, query: str, limit: int = 8, *, scope: SearchScope | None = None) -> list[dict]:
     """The search the answering tools and the search screen share: the query and its abbreviation variants over
     the scope, and — when the query names a document by its title — the same query inside that document, whose

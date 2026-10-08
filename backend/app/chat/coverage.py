@@ -370,7 +370,12 @@ def _membership(ws: Workspace, answer: FinalAnswer, ids: set[str]) -> tuple[dict
 def build(ws: Workspace, answer: FinalAnswer, question: str) -> tuple[dict, FinalAnswer]:
     """The coverage ledger of the answer, and the answer with the coverage note and status cap when needed."""
     from app.chat.tools import LEVELS, new_scope
-    from app.platform.search import documents_matching, documents_named, documents_sharing_title_words
+    from app.platform.search import (
+        documents_matching,
+        documents_named,
+        documents_sharing_title_words,
+        question_words_in_title,
+    )
 
     cited = cited_documents(ws, answer.answer_markdown)
     for doc, title in cited.items():  # its datum passed verification (what failed was removed before this)
@@ -437,10 +442,16 @@ def build(ws: Workspace, answer: FinalAnswer, question: str) -> tuple[dict, Fina
             named = documents_named(conn, question)
             shared = {} if named else documents_sharing_title_words(conn, question)
         others: dict[str, str] = {}
+        cited_titles: dict[str, str] = {}
         for docs in shared.values():
             ids = {str(i): t for i, t in docs}
             if set(ids) & set(cited) and set(ids) - set(cited):
                 others |= {i: t for i, t in ids.items() if i not in cited}
+                cited_titles |= {i: t for i, t in ids.items() if i in cited}
+        # a document whose title carries fewer of the question's words than a cited one's ("אזור התעשייה" against
+        # "אזור התעשייה ... לוד" for a question that names both) matches the question less: it is not named
+        words = {i: question_words_in_title(question, t) for i, t in {**others, **cited_titles}.items()}
+        others = {i: t for i, t in others.items() if not any(words[i] < words[c] for c in cited_titles)}
         also = [{"document_id": i, "title": t} for i, t in others.items()]
         ledger |= {"also_matching": also, "complete": not also}
         if also:
