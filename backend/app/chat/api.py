@@ -58,6 +58,8 @@ FAILURE_TEXT = {
     "queued_too_long": "השאלה המתינה זמן רב מדי לעיבוד.",
     "verify_unavailable": "לא ניתן היה לאמת את התשובה מול המקורות.",
 }
+# the turn's answer drew on a document the user could no longer see when it was ready (AE7)
+PERMISSIONS_CHANGED = "הרשאות המסמכים השתנו בזמן ההכנה; אפשר לשאול שוב."
 
 _pool: ThreadPoolExecutor | None = None
 _pool_lock = threading.Lock()
@@ -413,11 +415,19 @@ def _cancel_requested(ctx: TenantContext, message_id: UUID) -> bool:
 
 def _finish(ctx: TenantContext, message_id: UUID, status_: str, *, content: str = "", answer: dict | None = None,
             error: str | None = None, usage: list | None = None, model: str | None = None,
-            diagnostics: dict | None = None) -> None:
-    """Record the end of a turn. An answer is written only while no cancellation was asked for: a stop that lands
-    after the turn's last check still ends the turn as cancelled, never with the answer shown. Its diagnostics
-    are written with it."""
+            diagnostics: dict | None = None) -> str:
+    """Record the end of a turn, and return the status it was recorded with. An answer is written only while no
+    cancellation was asked for: a stop that lands after the turn's last check still ends the turn as cancelled,
+    never with the answer shown. It is written only while the user still sees every document it cites, refers to
+    or touched (rechecked here, under the user's permissions, in the transaction that writes it): an answer that
+    lost one during the turn is not stored as answered and hidden later — the turn fails, saying the permissions
+    changed, and keeps only its usage. Its diagnostics are written with it."""
     with tenant_tx(ctx) as conn:
+        if status_ == "done":
+            documents = _answer_documents(answer) | set((diagnostics or {}).get("document_ids") or ())
+            if not documents <= _visible_ids(conn, documents):
+                status_, content, answer, diagnostics = "failed", "", None, None
+                error = PERMISSIONS_CHANGED
         if status_ == "done":
             done = conn.execute(text(
                 "UPDATE messages SET status = 'done', content = :c, answer = CAST(:a AS jsonb), error = NULL, usage ="
@@ -442,7 +452,7 @@ def _finish(ctx: TenantContext, message_id: UUID, status_: str, *, content: str 
                          "res": json.dumps(res, ensure_ascii=False, default=str)
                          if (res := diagnostics.get("resolution")) else None,
                          "d": sorted(diagnostics["document_ids"])})
-                return
+                return status_
             status_, content, answer, error = "cancelled", "", None, "העיבוד נעצר לבקשתך."
         conn.execute(text(
             "UPDATE messages SET status = :s, content = :c, answer = CAST(:a AS jsonb), error = :e, usage = CAST(:us AS"
@@ -453,6 +463,7 @@ def _finish(ctx: TenantContext, message_id: UUID, status_: str, *, content: str 
              "dv": current_data_version(conn), "sh": scope_hash(ctx)})
         conn.execute(text("UPDATE conversations SET updated_at = now() WHERE id = (SELECT conversation_id FROM"
                           " messages WHERE id = :m)"), {"m": message_id})
+    return status_
 
 
 def _summary_usable(conn: Connection, ctx: TenantContext, conv) -> bool:
@@ -668,8 +679,8 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
                                   lambda: _cancel_requested(ctx, message_id))
         _log_turn_usage(ctx, provider, outcome.usage)
         payload = _answer_payload(outcome)
-        _finish(ctx, message_id, "done", content=outcome.answer.answer_markdown, answer=payload, usage=outcome.usage,
-                model=provider.model, diagnostics=_diagnostics(outcome, payload))
+        recorded = _finish(ctx, message_id, "done", content=outcome.answer.answer_markdown, answer=payload,
+                           usage=outcome.usage, model=provider.model, diagnostics=_diagnostics(outcome, payload))
     # every exit logs the calls the turn made: a cancelled, failed or broken turn was still billed for them
     except engine.TurnCancelled as e:
         usage = _log_turn_usage(ctx, provider, getattr(e, "usage", None))
@@ -688,6 +699,8 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
         except Exception:  # noqa: BLE001
             logger.exception("could not record the failed turn")
     else:
+        if recorded != "done":
+            return  # not stored as answered (stopped, or its documents' permissions changed): nothing to summarize
         # the summary is best-effort: the answer is stored, and a summary that fails is tried again next turn
         try:
             _maybe_summarize(ctx, conversation_id, message_id, provider)

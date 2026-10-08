@@ -57,7 +57,8 @@ from app.providers.llm import (
 VOCABULARY = {
     "metric_kind": ("שווי", "ערך", "מחיר", "שכירות", "שכר", "שכ\"ד", "דמ\"ש", "דמי", "ניהול", "דמ\"נ", "עלות", "היטל",
                     "מס", "שטח", "זכויות", "שיעור", "תשואה", "מקדם", "עסקה", "עסקת", "מבוקש", "תקבול", "הכנסה",
-                    "גודל", "מידות", "כמות", "מספר", "כמה", "יחידות", "יח\"ד", "דירות", "חדרים",
+                    "גודל", "מידות", "כמות", "מספר", "כמה", "יחידות", "יח\"ד", "דירות", "חדרים", "רווח",
+                    "הכנסות", "הוצאה", "הוצאות", "יחס",
                     "קומות", "משך", "תקופה", "תקופת", "זמן", "שנים", "חודשים", "עולה", "עלה", "יקר", "אחוז"),
     "unit": ("מ\"ר", "מטר", "כולל", "הכולל", "סה\"כ", "סך", "כולו", "ליחידה", "יחידה", "דונם", "אחוז", "%", "לנכס",
              "הכל", "שלם"),
@@ -90,6 +91,15 @@ _MONEY_UNITS = {"ILS", "ILS_per_sqm", "unknown"}
 SUBJECT_FIELDS = {"subject", "documents"}
 SCALE_FIELDS = {"unit", "scale"}
 
+# the kinds of datum a request or an answer's focus can be about: the stored measurement kinds, and the terms of a
+# calculation (income, cost, profit, a ratio, a rate), so a profit question is not read as a value question
+REQUEST_KINDS = {**{k: v for k, v in T.KIND_LABELS.items() if k != "other"}, "income": "הכנסה", "profit": "רווח",
+                 "ratio": "יחס", "other": T.KIND_LABELS.get("other", "אחר")}
+# kinds that are one datum for the answer check: a ratio and a rate are both a proportion of two amounts
+_FAMILY = {"ratio": "proportion", "rate": "proportion"}
+# kinds that name no specific datum: no answer can be held to them
+_UNSPECIFIC = {"unknown", "other"}
+
 KIND_OF_RELATION = {"new_question": "new_topic", "same_datum": "follow_up", "correction": "correction",
                     "metric_change": "follow_up", "scale_change": "follow_up",
                     "clarification_answer": "clarification_answer"}
@@ -114,7 +124,7 @@ class ResolvedRequest(_Strict):
     scope: Literal["entity", "set"]
     standalone_question: str
     changed_fields: list[ChangedField]
-    metric_kind: _choice(*T.KIND_LABELS)
+    metric_kind: _choice(*REQUEST_KINDS)
     unit: _choice(*UNIT_LABELS)
     scale: Literal["per_area", "total", "unknown"]
     period: _choice(*PERIOD_LABELS)
@@ -221,7 +231,7 @@ def _with_class(kind: str, per_area: bool) -> str:
     if kind == "unknown":
         return kind
     candidate = f"{_base(kind)}_per_area" if per_area else _base(kind)
-    return candidate if candidate in T.KIND_LABELS else kind
+    return candidate if candidate in REQUEST_KINDS else kind
 
 
 def _apply_scale(out: Request, per_area: bool) -> None:
@@ -428,7 +438,7 @@ def _input(focus: dict | None, history: list, message: str, documents: list[dict
 
         parts.append("הנתון שבמרכז השיחה:\n" + "\n".join([
             f"- metric_as_written: {prompt_text(focus.get('metric_as_written') or '')}",
-            f"- metric_kind: {label(T.KIND_LABELS, 'metric_kind')}", f"- unit: {label(UNIT_LABELS, 'unit')}",
+            f"- metric_kind: {label(REQUEST_KINDS, 'metric_kind')}", f"- unit: {label(UNIT_LABELS, 'unit')}",
             f"- period: {label(PERIOD_LABELS, 'period')}", f"- area_basis: {prompt_text(focus.get('area_basis') or '')}",
             f"- vat: {label(VAT_LABELS, 'vat')}", f"- subject: {prompt_text(focus.get('subject') or '')}",
             f"- document_ids: {', '.join(focus.get('document_ids') or [])}"]))
@@ -469,7 +479,7 @@ def requested_block(req: Request) -> str:
         return labels.get(value, value) if value and value != "unknown" else "לא צוין"
 
     lines = [f"- שאלה: {prompt_text(req.standalone_question)}",
-             f"- סוג המדד: {label(T.KIND_LABELS, req.metric_kind)}", f"- יחידה: {label(UNIT_LABELS, req.unit)}",
+             f"- סוג המדד: {label(REQUEST_KINDS, req.metric_kind)}", f"- יחידה: {label(UNIT_LABELS, req.unit)}",
              f"- תקופה: {label(PERIOD_LABELS, req.period)}", f"- בסיס שטח: {prompt_text(req.area_basis) or 'לא צוין'}",
              f"- נכס/נושא: {prompt_text(req.subject) or 'לא צוין'}"]
     if req.document_ids:
@@ -484,18 +494,26 @@ def requested_block(req: Request) -> str:
     return head + "\n" + "\n".join(lines)
 
 
+def family(kind: str) -> str:
+    """The datum a kind names, whatever its scale: value and value per area are one family, as are a ratio and a
+    rate; income, cost and profit are each their own."""
+    base = _base(kind)
+    return _FAMILY.get(base, base)
+
+
 def mismatch(req: Request | None, answer_focus) -> str | None:
     """Why the answer's datum is not the requested one, or None. The answer is held only to the dimensions the user
-    set (``approved``): the metric, when its change was accepted on the user's words; the per-area or total scale,
-    when the user set it, or when a correction carries it over. Unknown on either side is no mismatch."""
-    if req is None or answer_focus is None or req.metric_kind == "unknown" or not req.approved:
+    set (``approved``): the metric, when its change was accepted on the user's words — compared by family, so a
+    profit question answered with a profit figure matches; the per-area or total scale, when the user set it, or
+    when a correction carries it over. An unknown or unspecific kind ("other") on either side is no mismatch."""
+    if req is None or answer_focus is None or req.metric_kind in _UNSPECIFIC or not req.approved:
         return None
     got = getattr(answer_focus, "metric_kind", "unknown")
-    if got == "unknown":
+    if got in _UNSPECIFIC:
         return None
-    wrong_metric = "metric" in req.approved and _base(got) != _base(req.metric_kind)
+    wrong_metric = "metric" in req.approved and family(got) != family(req.metric_kind)
     wrong_scale = "scale" in req.approved and got.endswith("_per_area") != req.per_area
     if wrong_metric or wrong_scale:
-        return (f"התבקש {T.KIND_LABELS.get(req.metric_kind, req.metric_kind)}, והתשובה מציגה "
-                f"{T.KIND_LABELS.get(got, got)}")
+        return (f"התבקש {REQUEST_KINDS.get(req.metric_kind, req.metric_kind)}, והתשובה מציגה "
+                f"{REQUEST_KINDS.get(got, got)}")
     return None

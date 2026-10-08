@@ -13,8 +13,10 @@ One turn:
 3. It answers in Markdown with citations ``[S#]`` (passages), ``[M#]`` (measurements), ``[V#]`` (values),
    ``[A#]`` (user assumptions), ``[C#]`` (calculations).
 4. ``app.chat.verify`` checks the answer against what the tools returned: unknown citations, numbers that no
-   cited source states, and — through a separate judge call — sentences the cited sources do not support. A
-   failed check gets one repair step; what still fails is removed, and the answer says so.
+   cited source states, and — through a separate judge call — sentences the cited sources do not support, and
+   whether each part of the request the answer lists (``parts``) is answered or stated missing. A failed check
+   gets one repair step; what still fails is removed, and the answer says so; a part neither answered nor stated
+   missing is stated missing by the server (``coverage.state_parts``).
 
 Between steps the loop checks for cancellation; a model call already in flight cannot be recalled, so the loop
 waits for it, discards its result and reports the turn as cancelled only then. A provider failure is reported
@@ -69,6 +71,9 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
   פותח עמודים של מסמך PDF. כל תוצאה מציינת status: complete — נקרא במלואו; clipped — נקרא רק חלק, וההמשך ב-more
   (read עם cursor=K#); has_unread_regions — יש בו אזורים שלא נקראו, מסומנים במקומם [אזור שלא נקרא R#];
   uncertain_reading — חלק נקרא בקריאה לא ודאית. אל תציג חלק כאילו הוא הכול.
+- אזור שלא נקרא [אזור שלא נקרא R#] או קריאה לא ודאית, כשהתשובה תלויה בו: inspect עם region=R# (או document=D# ו-page
+  לעמוד שלם) מחזיר תמלול חזותי S# (status uncertain_reading) שמותר לצטט — ציין שהנתון נקרא בקריאה חזותית. מספר
+  הקריאות החזותיות בתור מוגבל; אם inspect מסרב או מחזיר מגבלה — אמור שהאזור לא נקרא, ואל תנחש את תוכנו.
 - D# הוא קיצור למסמך בכלים בלבד (outline, read pages). בשדות התשובה (document_ids, referenced_document_ids,
   omitted, focus) כתוב תמיד את ה-document_id המלא.
 - לפני שאתה מציג מספר, ודא מה הוא מתאר: איזה נתון, יחידה, תקופה (לחודש/לשנה), בסיס שטח, מע"מ, ולאיזה נכס הוא
@@ -118,7 +123,12 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
   עד שאין more) בלי אזור שלא נקרא, והוא לא שם (checked_where = ה-S# של מה שקראת). לפני שאתה קובע "לא מופיע", קרא
   את הסעיף או הטבלה עד סופם; השרת בודק זאת, וקריאה חלקית תוצג כ"נקרא רק בחלקו". כשנתון לא נמצא, השרת פותח את התשובה במשפט שאומר זאת — אל תכתוב אותו
   בעצמך. נתון קרוב (למשל שטח בנוי כשנשאלת על שטח מגרש) מותר להציג רק בנפרד ובתיוג מפורש "(נתון אחר)", ולעולם לא
-  כאילו הוא הנתון שהתבקש.
+  כאילו הוא הנתון שהתבקש. sources_conflict — המקורות נותנים לנתון ערכים שונים (רשום כל ערך ב-take_value או
+  find_measurements, והצג את שניהם).
+- parts: חלקי הבקשה של המשתמש, כל אחד במילותיו (ask) — כל נתון, הסבר, השוואה או חישוב שנשאלו; שאלה של חלק אחד היא
+  חלק אחד. לכל חלק answered — האם התשובה נותנת אותו — ואם לא, missing_kind: not_found_search, source_partial,
+  read_absent (נקרא במלואו ואינו שם), sources_conflict; לחלק שנענה — none. השרת בודק כל חלק מול התשובה, וחלק שלא
+  נענה ולא נאמר שהוא חסר נפתח במשפט שאומר זאת.
 
 ניסוח התשובה (answer_markdown):
 - התשובה הישירה קודם, בקצרה. אחר כך פרטים רלוונטיים בלבד. Markdown: פסקאות קצרות, רשימות, טבלה כשמשווים.
@@ -166,7 +176,7 @@ class Focus(_Strict):
     to. Strings as the documents write them; kinds and units from the measurement vocabulary."""
 
     metric_as_written: str
-    metric_kind: _choice(*T.KIND_LABELS)
+    metric_kind: _choice(*resolve.REQUEST_KINDS)
     unit: _choice(*UNIT_LABELS)
     period: _choice(*PERIOD_LABELS)
     area_basis: str
@@ -179,13 +189,25 @@ class Focus(_Strict):
 class Requested(_Strict):
     """A datum the question asked for, and whether it was found: ``not_found_search`` (searching did not find it),
     ``source_partial`` (a document that may hold it was read only in part), ``section_checked_absent`` (the section
-    or table where it belongs was opened, ``checked_where`` = that source's S#, and it is not there). The server
-    checks the status against what the turn did and states it first (``coverage.state_absence``)."""
+    or table where it belongs was opened, ``checked_where`` = that source's S#, and it is not there),
+    ``sources_conflict`` (the sources give it different values). The server checks the status against what the turn
+    did and states it first (``coverage.state_absence``)."""
 
     label: str
     document_ids: list[str]
-    status: Literal["found", "not_found_search", "source_partial", "section_checked_absent"]
+    status: Literal["found", "not_found_search", "source_partial", "section_checked_absent", "sources_conflict"]
     checked_where: str
+
+
+class Part(_Strict):
+    """One part of the user's request (a datum, an explanation, a comparison...), in the user's words, and whether
+    the answer gives it — or, when it does not, why (the model's view; the server derives the kind it states from
+    what the turn did). The judge checks every part against the answer (``verify``): a part neither answered nor
+    stated missing gets the server's missing sentence (``coverage.state_parts``), never silence."""
+
+    ask: str
+    answered: bool
+    missing_kind: Literal["none", "not_found_search", "source_partial", "read_absent", "sources_conflict"]
 
 
 class Omitted(_Strict):
@@ -206,6 +228,7 @@ class FinalAnswer(_Strict):
     omitted: list[Omitted]
     focus: Focus | None
     requested: list[Requested]
+    parts: list[Part]
 
 
 FINAL_SCHEMA = FinalAnswer.model_json_schema()
@@ -274,7 +297,7 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None) -> 
             value = f.get(key)
             return labels.get(value, value) if value and value != "unknown" else ""
 
-        fields = [("נתון כפי שנכתב", f.get("metric_as_written")), ("סוג", label(T.KIND_LABELS, "metric_kind")),
+        fields = [("נתון כפי שנכתב", f.get("metric_as_written")), ("סוג", label(resolve.REQUEST_KINDS, "metric_kind")),
                   ("יחידה", label(UNIT_LABELS, "unit")), ("תקופה", label(PERIOD_LABELS, "period")),
                   ("בסיס שטח", f.get("area_basis")), ("מע\"מ", label(VAT_LABELS, "vat")),
                   ("נכס/נושא", f.get("subject")), ("תפקיד", label(T.ROLE_LABELS, "value_role")),
@@ -321,7 +344,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         raise ProviderFailure("unsupported", "provider has no tool loop")
     cache_key = office_cache_key(ctx.office_id)
     deadline = time.monotonic() + settings.chat_turn_seconds
-    ws = T.Workspace(ctx=ctx, prior=dict(inp.prior_refs))
+    ws = T.Workspace(ctx=ctx, prior=dict(inp.prior_refs), usage=usage)  # inspect's vision calls join the turn's usage
     # what the user wrote, as this turn sees it: an assumption (A#) quotes it, never an answer or a document
     users = [m.content for m in inp.history if m.role == "user"]
     ws.user_messages = [{"turn": n + 1, "text": t, "current": False} for n, t in enumerate(users)] + [
@@ -348,7 +371,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         if request is not None and request.clarify and (request.server_clarify or not re.search(r"\d", request.clarify)):
             answer = FinalAnswer(status="clarification", answer_markdown=request.clarify, claims=[],
                                  clarification_question=request.clarify, missing_info="", referenced_document_ids=[],
-                                 scope_kind="focused", scope_query="", omitted=[], focus=None, requested=[])
+                                 scope_kind="focused", scope_query="", omitted=[], focus=None, requested=[],
+                                 parts=[])
             return TurnOutcome(answer, ws, VerifyReport([], judged=True, judge_status="no_claims"), steps, usage, {},
                                rounds, request.as_dict(), request.resolution)
     items: list = [{"role": "user", "content": _context_message(inp, request)}]
@@ -383,9 +407,13 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         answer = coverage.state_absence(ws, answer, cited=True)
         progress("verify", "מאמת את הטענות מול המקורות")
         try:
+            # the judge checks each part of the request against the answer and the sentences the server adds
+            # after verification (what was not found), so a part stated missing there is not stated twice
             report = verify_answer(provider, answer, ws, inp.question, usage,
                                    deadline=deadline + VERIFY_ALLOWANCE_SECONDS,
-                                   mismatch=resolve.mismatch(request, answer.focus))
+                                   mismatch=resolve.mismatch(request, answer.focus),
+                                   statements=coverage.planned_statements(ws, answer),
+                                   request=request.standalone_question if request is not None else None)
         except VerificationUnavailable as exc:
             # the answer could not be checked against its sources: a failure with retry, never an unchecked answer
             raise ProviderFailure("verify_unavailable", exc.status) from exc
@@ -397,9 +425,12 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         settled = attempt >= 1 and not any(p.removes_unit or p.severity == "partial" for p in report.problems)
         if report.ok or settled or attempt == 2 or time.monotonic() > deadline - 20:
             final = coverage.state_absence(ws, report.apply(answer), cited=False)
+            # a part of the request the verified answer neither gives nor says is missing is said to be missing
+            final, parts = coverage.state_parts(ws, final, report)
             ledger: dict = {}
             if final.status != "clarification":
                 ledger, final = coverage.build(ws, final, inp.question)
+                ledger["parts"] = parts
             return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
                                request.as_dict() if request is not None else None,
                                request.resolution if request is not None else None)
@@ -440,5 +471,8 @@ def _announce(progress: Callable[[str, str], None], call) -> None:
         progress("compute", "רושם ערך מהמקור ומאמת אותו")
     elif call.name == "assume":
         progress("compute", "רושם את הנחת המשתמש")
+    elif call.name == "inspect":
+        target = args.get("target") if isinstance(args.get("target"), dict) else {}
+        progress("read", f"קורא חזותית את עמוד {target.get('page')}" if target.get("page") else "קורא חזותית אזור שלא נקרא")
     elif call.name == "calculate":
         progress("compute", f"מחשב בקוד: {str(args.get('label') or '')[:60]}".rstrip(": "))

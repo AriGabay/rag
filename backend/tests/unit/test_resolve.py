@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from app.chat import entities, resolve
 from app.chat.resolve import ChangedField, ResolvedRequest, validate
 from app.extraction.normalize_text import base_normalize
@@ -368,3 +370,51 @@ def test_a_correction_to_a_property_without_a_title_word_still_asks():
     r = _resolved(changed_fields=_changed(("subject", "בית האגם הצפוני")), subject="בית האגם הצפוני")
     req = _validate(r, RENT_FOCUS, "טעיתי, התכוונתי לבית האגם הצפוני")
     assert req.server_clarify and req.document_ids == []
+
+
+# --- calculation terms are request kinds of their own (R22: no wrong-metric notice) ---
+
+INCOME_FOCUS = RENT_FOCUS | {"metric_as_written": "סך ההכנסות", "metric_kind": "income", "unit": "ILS",
+                             "period": "year", "area_basis": ""}
+
+
+@pytest.mark.parametrize("kind", ["income", "cost", "profit", "ratio", "rate"])
+def test_income_cost_profit_ratio_and_rate_are_request_and_focus_kinds(kind):
+    from app.chat.engine import Focus
+
+    assert _resolved(metric_kind=kind).metric_kind == kind
+    Focus(metric_as_written="", metric_kind=kind, unit="unknown", period="unknown", area_basis="", vat="unknown",
+          subject="", value_role="unknown", document_ids=[])
+    assert kind in resolve.REQUEST_KINDS
+
+
+def test_a_profit_question_answered_with_a_profit_figure_gets_no_notice():
+    r = _resolved(relation="metric_change", changed_fields=_changed(("metric_kind", "הרווח")), metric_kind="profit")
+    req = _validate(r, INCOME_FOCUS, "ומה הרווח?")
+    assert req.metric_kind == "profit" and "metric" in req.approved
+    assert resolve.mismatch(req, SimpleNamespace(metric_kind="profit")) is None
+    # within the family a different datum is still not the one requested
+    assert resolve.mismatch(req, SimpleNamespace(metric_kind="cost"))
+    assert resolve.mismatch(req, SimpleNamespace(metric_kind="value"))
+
+
+def test_a_profit_correction_after_a_per_area_rent_gets_no_notice():
+    r = _resolved(changed_fields=_changed(("metric_kind", "לרווח")), metric_kind="profit")
+    req = _validate(r, RENT_FOCUS, "התכוונתי לרווח")
+    assert req.metric_kind == "profit"
+    assert resolve.mismatch(req, SimpleNamespace(metric_kind="profit")) is None
+
+
+def test_a_ratio_and_a_rate_are_one_family():
+    r = _resolved(relation="metric_change", changed_fields=_changed(("metric_kind", "שיעור הרווח")), metric_kind="rate")
+    req = _validate(r, INCOME_FOCUS, "ומה שיעור הרווח?")
+    assert resolve.mismatch(req, SimpleNamespace(metric_kind="ratio")) is None
+    assert resolve.mismatch(req, SimpleNamespace(metric_kind="profit"))
+
+
+def test_an_unspecific_kind_on_either_side_is_no_mismatch():
+    r = _resolved(relation="metric_change", changed_fields=_changed(("metric_kind", "הנתון האחר")), metric_kind="other")
+    req = _validate(r, INCOME_FOCUS, "ומה הנתון האחר?")
+    assert resolve.mismatch(req, SimpleNamespace(metric_kind="profit")) is None
+    r = _resolved(relation="metric_change", changed_fields=_changed(("metric_kind", "הרווח")), metric_kind="profit")
+    assert resolve.mismatch(_validate(r, INCOME_FOCUS, "ומה הרווח?"), SimpleNamespace(metric_kind="other")) is None

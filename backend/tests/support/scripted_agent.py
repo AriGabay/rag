@@ -28,11 +28,12 @@ def read(**locator) -> dict:
 
 def final(markdown: str, status: str = "answered", claims: list | None = None, clarification: str = "",
           missing: str = "", documents: list[str] | None = None, scope: str = "focused", scope_query: str = "",
-          omitted: list | None = None, focus: dict | None = None, requested: list | None = None) -> dict:
+          omitted: list | None = None, focus: dict | None = None, requested: list | None = None,
+          parts: list | None = None) -> dict:
     return {"final": {"status": status, "answer_markdown": markdown, "claims": claims or [],
                       "clarification_question": clarification, "missing_info": missing,
                       "referenced_document_ids": documents or [], "scope_kind": scope, "scope_query": scope_query,
-                      "omitted": omitted or [], "focus": focus, "requested": requested or []}}
+                      "omitted": omitted or [], "focus": focus, "requested": requested or [], "parts": parts or []}}
 
 
 class ScriptedAgent(ScriptedProvider):
@@ -53,7 +54,11 @@ class ScriptedAgent(ScriptedProvider):
             if callable(verdict):
                 return verdict(input)
             indexes = [int(i) for i in re.findall(r'<unit index="(\d+)"', input)]
-            return {"verdicts": [{"index": i, "verdict": verdict, "reason": "בדיקה"} for i in indexes]}
+            out = {"verdicts": [{"index": i, "verdict": verdict, "reason": "בדיקה"} for i in indexes]}
+            if "<request_parts>" in input:  # every part answered by the batch (a test of coverage scripts its own)
+                out["parts"] = [{"index": int(i), "coverage": "answered", "units": indexes, "reason": "בדיקה"}
+                                for i in re.findall(r'<part index="(\d+)">', input)]
+            return out
 
         self.on(Purpose.VERIFY, judge_fn, repeat=True)
 

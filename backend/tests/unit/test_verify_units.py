@@ -25,10 +25,10 @@ def _ws(*texts: str, kind: str = "context") -> Workspace:
     return ws
 
 
-def _answer(markdown: str) -> FinalAnswer:
+def _answer(markdown: str, parts: list | None = None) -> FinalAnswer:
     return FinalAnswer(status="answered", answer_markdown=markdown, claims=[], clarification_question="",
                        missing_info="", referenced_document_ids=[], scope_kind="focused", scope_query="", omitted=[],
-                       focus=None, requested=[])
+                       focus=None, requested=[], parts=parts or [])
 
 
 def _tag(i: int) -> str:
@@ -336,3 +336,192 @@ def test_a_failed_header_and_a_failed_row_remove_the_whole_table():
                       "?", [])
     out = r.apply(a).answer_markdown
     assert "|" not in out and "הגפן" not in out and out.startswith("השווי למ\"ר הוא 9,500")
+
+
+# --- numbered headings stay whole, and removal leaves no fragment (R22) ------------------------------------------
+
+@pytest.mark.parametrize("md", ["9. השומה\nהשווי למ\"ר הוא 9,500 ₪ [S1].", "## 9. השומה\nהשווי למ\"ר הוא 9,500 ₪ [S1].",
+                                "9.1 שיטת השומה\nהשווי למ\"ר הוא 9,500 ₪ [S1].", "**9.2. השומה**\nהנכס פנוי [S1]."])
+def test_a_numbered_heading_is_one_unit(md):
+    head = split_units(md)[0]
+    assert head.raw == md.split("\n")[0] and len(split_units(md)) == 2
+
+
+def test_a_numbered_heading_followed_by_text_on_its_line_is_never_split():
+    (u,) = split_units("9. השומה: השווי למ\"ר הוא 9,500 ₪ [S1].")
+    assert u.raw.startswith("9. השומה") and u.ids == ["S1"]
+
+
+def test_a_numbered_heading_passes_as_navigation_and_its_number_is_no_claim():
+    p = _judge(lambda t: "supported" if "9,500" in t else None)
+    r = verify_answer(p, _answer("9. השומה\nהשווי למ\"ר הוא 9,500 ₪ [S1]."), _ws(SOURCE), "?", [])
+    assert r.ok, [x.reason for x in r.problems]
+
+
+def test_a_numbered_list_item_keeps_its_number_with_its_claim():
+    md = "1. השווי למ\"ר הוא 9,500 ₪ [S1].\n2. הנכס מושכר לטווח ארוך [S1]."
+    assert [u.raw for u in split_units(md)] == md.split("\n")
+    p = _judge(lambda t: "unsupported" if "מושכר" in t else "supported")
+    a = _answer(md)
+    out = verify_answer(p, a, _ws(SOURCE), "?", []).apply(a).answer_markdown
+    assert out.startswith("1. השווי למ\"ר הוא 9,500 ₪ [S1].") and "2." not in out and "מושכר" not in out
+
+
+def test_removing_a_claim_in_the_middle_of_a_sentence_removes_the_whole_sentence():
+    md = ("השווי למ\"ר הוא 9,500 ₪ [S1].\n"
+          "התשלום כולל שני רכיבים: 1. מקדמה של 41 ₪ [S1] ו-2. יתרה של 55 ₪ [S1], שתיהן לפני החתימה.\n"
+          "הנכס פנוי [S1].")
+    p = _judge(lambda t: "unsupported" if "מקדמה" in t else "supported")
+    a = _answer(md)
+    r = verify_answer(p, a, _ws(SOURCE + " 41"), "?", [])
+    out = r.apply(a).answer_markdown
+    for fragment in ("התשלום", "רכיבים", "יתרה", "החתימה", ": 1."):
+        assert fragment not in out, out
+    assert "השווי למ\"ר הוא 9,500 ₪ [S1]." in out and "הנכס פנוי [S1]." in out
+
+
+def test_a_bullet_whose_content_went_leaves_no_empty_bullet():
+    md = "השווי למ\"ר הוא 9,500 ₪ [S1].\n- הנכס מושכר לטווח ארוך [S1].\n- הנכס פנוי [S1]."
+    p = _judge(lambda t: "unsupported" if "מושכר" in t else "supported")
+    a = _answer(md)
+    out = verify_answer(p, a, _ws(SOURCE), "?", []).apply(a).answer_markdown
+    lines = [ln for ln in out.split("\n") if ln.strip()]
+    assert all(re.search(r"[א-ת]", ln) for ln in lines), out
+    assert "- הנכס פנוי [S1]." in out and "מושכר" not in out
+
+
+def test_the_first_sentence_of_a_bullet_goes_and_the_bullet_keeps_its_marker():
+    md = "- הנכס מושכר לטווח ארוך [S1]. הנכס פנוי [S1]."
+    p = _judge(lambda t: "unsupported" if "מושכר" in t else "supported")
+    a = _answer(md)
+    out = verify_answer(p, a, _ws(SOURCE), "?", []).apply(a).answer_markdown
+    assert out.startswith("- הנכס פנוי [S1].")
+
+
+def test_a_heading_whose_whole_content_went_goes_with_it():
+    md = ("## שווי\nהשווי למ\"ר הוא 9,500 ₪ [S1].\n\n## שכירות\n- הנכס מושכר לטווח ארוך [S1].\n"
+          "- השוכר הוא חברת בדיקה [S1].")
+    p = _judge(lambda t: "supported" if "9,500" in t or t.startswith("##") else "unsupported")
+    a = _answer(md)
+    out = verify_answer(p, a, _ws(SOURCE), "?", []).apply(a).answer_markdown
+    assert "## שכירות" not in out and "## שווי" in out and "9,500" in out
+
+
+# --- the coverage plane: every part of the request is answered or said to be missing (R19) ------------------------
+
+def _parts_judge(coverage_of) -> ScriptedProvider:
+    """A judge that supports every unit and answers each request part by ``coverage_of(ask, units) ->
+    (coverage, [unit indexes])``; ``units``: {index: text} of the batch, statements included."""
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        units = {int(i): t for i, t in re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S)}
+        statements = {int(i): t for i, t in re.findall(r'<statement index="(\d+)">\n(.*?)\n</statement>', input,
+                                                         re.S)}
+        verdicts = [{"index": i, "verdict": "supported", "reason": "בדיקה"} for i in units]
+        parts = []
+        for i, ask in re.findall(r'<part index="(\d+)">\n(.*?)\n</part>', input, re.S):
+            coverage, idx = coverage_of(ask, units | statements)
+            parts.append({"index": int(i), "coverage": coverage, "units": idx, "reason": "בדיקה"})
+        return {"verdicts": verdicts, "parts": parts}
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    return p
+
+
+def _part(ask: str, answered: bool = True, missing: str = "none") -> dict:
+    return {"ask": ask, "answered": answered, "missing_kind": missing}
+
+
+def _by_words(ask: str, units: dict) -> tuple[str, list[int]]:
+    hits = [i for i, t in units.items() if ask.split()[0] in t]
+    return ("answered", hits) if hits else ("not_covered", [])
+
+
+def test_the_judge_receives_the_parts_and_reports_coverage_per_part():
+    p = _parts_judge(_by_words)
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].", parts=[_part("השווי למ\"ר"), _part("דמי הניהול")])
+    r = verify_answer(p, a, _ws(SOURCE), "?", [])
+    assert "<part index=\"0\">" in p.calls[0].input and "דמי הניהול" in p.calls[0].input
+    assert [x["coverage"] for x in r.part_outcomes(r.apply(a))] == ["answered", "not_covered"]
+
+
+def test_a_part_neither_answered_nor_stated_missing_gets_an_explicit_sentence_and_the_answer_is_partial():
+    from app.chat import coverage
+
+    ws = _ws(SOURCE)
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].", parts=[_part("השווי למ\"ר"), _part("דמי הניהול")])
+    r = verify_answer(_parts_judge(_by_words), a, ws, "?", [])
+    final, parts = coverage.state_parts(ws, r.apply(a), r)
+    assert final.status == "partial"
+    assert final.answer_markdown.startswith("**דמי הניהול** לא נמצא בחיפוש במסמכים שנבדקו.")
+    assert "השווי למ\"ר הוא 9,500 ₪ [S1]." in final.answer_markdown
+    assert [(x["ask"], x["coverage"], x["stated"]) for x in parts] == [
+        ("השווי למ\"ר", "answered", None), ("דמי הניהול", "not_covered", "not_found_search")]
+
+
+def test_a_part_answered_only_by_a_removed_claim_is_not_covered():
+    from app.chat import coverage
+
+    ws = _ws(SOURCE)
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:  # the management-fee claim is unsupported
+        units = dict(re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S))
+        return {"verdicts": [{"index": int(i), "verdict": "unsupported" if "ניהול" in t else "supported",
+                              "reason": "בדיקה"} for i, t in units.items()],
+                "parts": [{"index": 0, "coverage": "answered", "units": [0], "reason": "בדיקה"},
+                          {"index": 1, "coverage": "answered", "units": [1], "reason": "בדיקה"}]}
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nדמי הניהול הם 9,500 ₪ [S1].",
+                parts=[_part("השווי למ\"ר"), _part("דמי הניהול")])
+    r = verify_answer(p, a, ws, "?", [])
+    final, _ = coverage.state_parts(ws, r.apply(a), r)
+    assert "**דמי הניהול** לא נמצא" in final.answer_markdown and final.status == "partial"
+
+
+def test_a_part_stated_missing_by_the_servers_absence_sentence_gets_no_second_sentence():
+    from app.chat import coverage
+    from app.chat.engine import Requested
+
+    ws = _ws(SOURCE)
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].", parts=[_part("השווי למ\"ר"), _part("דמי הניהול", False,
+                                                                                  "not_found_search")])
+    a = a.model_copy(update={"requested": [Requested(label="דמי הניהול", document_ids=[], status="not_found_search",
+                                                     checked_where="")]})
+
+    def cover(ask, units):
+        hits = [i for i, t in units.items() if ask in t]
+        return ("stated_missing" if any("לא נמצא" in units[i] for i in hits) else "answered", hits) if hits \
+            else ("not_covered", [])
+
+    p = _parts_judge(cover)
+    r = verify_answer(p, a, ws, "?", [], statements=coverage.planned_statements(ws, a))
+    assert "<statement index=" in p.calls[0].input
+    final = coverage.state_absence(ws, r.apply(a), cited=False)
+    final, parts = coverage.state_parts(ws, final, r)
+    assert final.answer_markdown.count("דמי הניהול") == 1 and final.status == "partial"
+    assert parts[1]["coverage"] == "stated_missing"
+
+
+def test_a_part_without_any_verdict_is_not_taken_as_answered():
+    from app.chat import coverage
+
+    ws = _ws(SOURCE)
+    p = ScriptedProvider()  # the judge answers the first part only
+    p.on(Purpose.VERIFY, lambda i, input: {
+        "verdicts": [{"index": int(n), "verdict": "supported", "reason": "ok"} for n in _indexes(input)],
+        "parts": [{"index": 0, "coverage": "answered", "units": [0], "reason": "ok"}]}, repeat=True)
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].", parts=[_part("השווי למ\"ר"), _part("דמי הניהול")])
+    r = verify_answer(p, a, ws, "?", [])
+    final, parts = coverage.state_parts(ws, r.apply(a), r)
+    assert parts[1]["coverage"] == "not_covered" and "**דמי הניהול** לא נמצא" in final.answer_markdown
+
+
+def test_without_parts_the_judge_schema_and_answer_are_unchanged():
+    p = _judge(lambda t: "supported")
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].")
+    r = verify_answer(p, a, _ws(SOURCE), "?", [])
+    assert "<request_parts>" not in p.calls[0].input and p.calls[0].schema is verify.JudgeOutput
+    assert r.part_outcomes(r.apply(a)) == []

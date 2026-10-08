@@ -31,9 +31,16 @@ call that fails is retried once (an ``incomplete`` one is split instead); when v
 complete, ``VerificationUnavailable`` is raised and the turn fails with a retry — an unchecked answer is never
 shown as checked.
 
-``VerifyReport.apply`` removes what failed (after the engine's repair attempts) and says so in the answer — a
-failed table header takes its whole table, so no broken table is left; a partly supported unit is kept and
-marked.
+``VerifyReport.apply`` removes what failed (after the engine's repair attempts) and says so in the answer — whole
+sentences only: a numbered heading ("9. השומה", "9.1 שיטת השומה") or a list item's number is never split from its
+text, a bullet or heading whose content went goes with it, and a failed table header takes its whole table, so no
+fragment or broken table is left; a partly supported unit is kept and marked.
+
+The second plane is coverage (R19): the final answer lists the parts of the user's request, and the judge says of
+each part whether the answer gives it, says it is missing (in a unit, or in a sentence the server adds after
+verification — ``statements``), or does not cover it. A part counts as covered only through a unit that survived
+verification (``VerifyReport.part_outcomes``); one that is not covered is stated missing by the server
+(``coverage.state_parts``).
 """
 
 from __future__ import annotations
@@ -67,6 +74,15 @@ _IDS = re.compile(r"\[((?:[SMCPVA]\d+)(?:\s*[,،;]\s*[SMCPVA]\d+)*)\]")
 _ID = re.compile(r"[SMCPVA]\d+")
 _LEADING_IDS = re.compile(r"^(?:\s*\[(?:[SMCPVA]\d+)(?:\s*[,،;]\s*[SMCPVA]\d+)*\])+[\s.,;:]*")
 _SENTENCE = re.compile(r"(?<=[.!?])\s+(?=\S)")
+# a split point that is no sentence end: right after a heading's or list item's number ("9.", "9.1.", "ו-2.") or a
+# one-letter abbreviation ("ס. 4"); the number stays with its text, and the sentence stays whole
+_NO_END = re.compile(r"(?:^|[\s(\-–—:*])(?:\d{1,2}(?:\.\d{1,2})*|[א-תA-Za-z])\.$")
+# the markup a line starts with that stays when its first sentence goes and another stays: a heading, quote or
+# bullet mark, and a list item's own number ("- A. B." without A is "- B.")
+_LINE_LEAD = re.compile(r"\s*(?:#{1,6}\s+|>\s*|[-*+]\s+)?(?:\d{1,3}\.\s+)?")
+# a numbered heading's number ("9. השומה", "9.1 שיטת השומה", "**9.2.** ..."): part of the heading, never a claim
+_HEADING_NUMBER = re.compile(r"^(?:#{1,6}\s+)?(?:\*\*)?(?:\d{1,3}\.|\d{1,3}(?:\.\d{1,3})+\.?)(?:\*\*)?\s+(?=\S)")
+_QUANTITY_WORD = re.compile(r"₪|%|ש[\"״']?ח|מ[\"״']?ר|מיליון|אלף|דונם|מטר")
 JUDGE_CALL_CHARS = 30_000  # evidence per judge call; more units go to further calls, nothing is cut to fit
 JUDGE_MAX_UNITS = 40  # units per judge call (the verdicts must fit the output)
 VERIFY_ALLOWANCE_SECONDS = 60  # verification may run this long past the turn's deadline
@@ -101,6 +117,15 @@ JUDGE_POLICY = (
 )
 
 
+JUDGE_PARTS_POLICY = (
+    "\nבנוסף מצורפים הבקשה כפי שהובנה (<request>), חלקיה (<part>) ומשפטים שהשרת יוסיף לתשובה על נתונים שלא נמצאו "
+    "(<statement>). "
+    "לכל חלק קבע coverage לפי היחידות והמשפטים שבקלט זה: answered — יחידה נותנת את מה שהחלק מבקש (גם בחלקו); "
+    "stated_missing — יחידה או משפט שרת אומרים במפורש שהוא חסר או לא נמצא; not_covered — אין דבר עליו. ב-units "
+    "ציין את מספרי ה-index של היחידות או המשפטים שמכסים אותו. אזכור בלבד, בלי לתת את המבוקש, אינו answered."
+)
+
+
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -113,6 +138,19 @@ class JudgeVerdict(_Strict):
 
 class JudgeOutput(_Strict):
     verdicts: list[JudgeVerdict]
+
+
+class JudgePart(_Strict):
+    index: int
+    coverage: Literal["answered", "stated_missing", "not_covered"]
+    units: list[int]  # the units (or server statements) that answer it or say it is missing
+    reason: str
+
+
+class JudgeCoverageOutput(JudgeOutput):
+    """The judge's output when the answer lists the parts of the request: the verdicts, and each part's coverage."""
+
+    parts: list[JudgePart]
 
 
 class VerificationUnavailable(Exception):
@@ -172,37 +210,66 @@ class VerifyReport:
     problems: list[Problem] = field(default_factory=list)
     judged: bool = False
     judge_status: str | None = None
+    parts: list[dict] = field(default_factory=list)  # the request's parts: [{"ask", "answered", "missing_kind"}]
+    statements: list[tuple[int, str]] = field(default_factory=list)  # (index, text) the server adds after it
+    part_votes: dict[int, list[JudgePart]] = field(default_factory=dict)  # each part's coverage, per judge call
 
     @property
     def ok(self) -> bool:
         # a citation the server adds itself needs no repair round
         return all(p.kind == "needs_citation" for p in self.problems)
 
+    def removed_units(self) -> set[int]:
+        return {p.unit.index for p in self.problems if p.removes_unit}
+
     def counts(self) -> dict:
         """What the user's normal path shows of verification (the removed text is diagnostics)."""
-        errors = {p.unit.index for p in self.problems if p.removes_unit}
-        return {"judged": self.judged, "judge_status": self.judge_status, "removed": len(errors),
-                "partial": len({p.unit.index for p in self.problems if p.severity == "partial"} - errors),
-                "annotated": sum(1 for p in self.problems if p.annotatable and p.unit.index not in errors),
-                "request_mismatch": any(p.kind == "request" for p in self.problems)}
+        errors = self.removed_units()
+        out = {"judged": self.judged, "judge_status": self.judge_status, "removed": len(errors),
+               "partial": len({p.unit.index for p in self.problems if p.severity == "partial"} - errors),
+               "annotated": sum(1 for p in self.problems if p.annotatable and p.unit.index not in errors),
+               "request_mismatch": any(p.kind == "request" for p in self.problems)}
+        if self.parts:
+            out["parts"] = len(self.parts)
+        return out
 
     def problems_text(self) -> str:
         return "\n".join(f"- \"{p.unit.raw[:200]}\": {p.reason}" for p in self.problems)
 
+    def part_outcomes(self, applied: FinalAnswer) -> list[dict]:
+        """Each part of the request with its coverage in the verified answer (``applied``, after ``apply``):
+        ``answered`` or ``stated_missing`` only through a unit that survived verification, or a server statement;
+        a part the judge gave no verdict is ``not_covered`` — coverage is never assumed."""
+        errors = self.removed_units()
+        kept = {u.index for u in self.units if u.index not in errors}
+        if errors and not _IDS.search(applied.answer_markdown):
+            kept = set()  # nothing cited survived: the answer was replaced by a statement that it was not supported
+        alive = kept | {i for i, _ in self.statements}
+        out = []
+        for n, part in enumerate(self.parts):
+            coverage, reason = "not_covered", ""
+            for v in sorted(self.part_votes.get(n, []), key=lambda v: v.coverage != "answered"):
+                if v.coverage == "not_covered":
+                    continue
+                if (set(v.units) & alive) if v.units else alive:
+                    coverage, reason = v.coverage, v.reason
+                    break
+            out.append({"index": n, "ask": part["ask"], "answered": part["answered"],
+                        "missing_kind": part["missing_kind"], "coverage": coverage, "reason": reason})
+        return out
+
     def apply(self, answer: FinalAnswer) -> FinalAnswer:
-        """The answer with failing units removed and partly supported units marked; a note says what was removed."""
-        errors = {p.unit.index for p in self.problems if p.removes_unit}
+        """The answer with failing units removed and partly supported units marked; a note says what was removed.
+        Removal is by whole sentence: a bullet, list item or heading whose content went goes with it."""
+        errors = self.removed_units()
         partial = {p.unit.index for p in self.problems if p.severity == "partial"}
         notes = [p for p in self.problems if p.annotatable and p.unit.index not in errors]
         requests = [p.reason for p in self.problems if p.kind == "request"]
         cites = [p for p in self.problems if p.kind == "needs_citation" and p.uncited and p.unit.index not in errors]
         if not errors and not partial and not notes and not requests and not cites:
             return answer
-        # a failed table header takes its whole table: a separator and rows without their header are no table
-        cuts = [u.table_span if (u.table_header and u.table_span) else (u.start, u.end)
-                for u in self.units if u.index in errors]
-        # a failed row inside a table that is removed whole is part of that cut, not an edit of its own
-        cuts = [c for c in cuts if not any(o != c and o[0] <= c[0] and c[1] <= o[1] for o in cuts)]
+        markdown = answer.answer_markdown
+        cuts = _sentence_cuts(markdown, self.units, errors)
         edits = [(a, b, "") for a, b in cuts]
         edits += [(u.end, u.end, " *(אומת חלקית)*") for u in self.units if u.index in partial
                   and not any(a <= u.start < b for a, b in cuts)]
@@ -214,11 +281,11 @@ class VerifyReport:
                 edits.append((at, at, f" ({p.annotation}, כפי שנכתב במקור{cite})"))
         # evidence the server found in the same calculation is cited with the unit it supports
         for u, ids in _cites_by_unit(cites):
-            at = _citation_point(answer.answer_markdown, u)
+            at = _citation_point(markdown, u)
             if not any(a <= at < b for a, b in cuts):
                 edits.append((at, at, "".join(f"[{i}]" for i in ids)))
         # edit by span, last first, so earlier spans stay valid and no edit depends on matching text again
-        text = answer.answer_markdown
+        text = markdown
         done_from = len(text) + 1
         for a, b, insert in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
             if b > done_from:  # inside a span already removed (a row of a removed table)
@@ -226,6 +293,8 @@ class VerifyReport:
             text = text[:a] + insert + text[b:]
             if b > a:
                 done_from = a
+        if cuts:
+            text = _drop_orphan_headings(markdown, text)
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
         removed = len(errors)
         claims = [c for c in answer.claims if not any(
@@ -246,6 +315,104 @@ class VerifyReport:
             text += "\n\n> **שימו לב:** " + requests[0] + "."
             status = "partial" if status == "answered" else status
         return answer.model_copy(update={"answer_markdown": text, "claims": claims, "status": status})
+
+
+def _line_bounds(markdown: str, at: int) -> tuple[int, int]:
+    """The span of the line holding position ``at`` (without its newline)."""
+    start = markdown.rfind("\n", 0, at) + 1
+    end = markdown.find("\n", at)
+    return start, len(markdown) if end < 0 else end
+
+
+def _sentence_cuts(markdown: str, units: list[Unit], errors: set[int]) -> list[tuple[int, int]]:
+    """The spans to remove for the failed units: a failed table header takes its whole table; any other unit is a
+    whole sentence, with the space after it, and without its line's markup when another sentence of the line stays
+    ("- A. B." without A is "- B."). A line left with markup only (a bullet mark, a heading's or list item's number,
+    bold marks) goes whole, with its newline."""
+    cuts: list[tuple[int, int]] = []
+    lines: dict[int, list[Unit]] = {}
+    for u in units:
+        if u.table_span is None:
+            lines.setdefault(_line_bounds(markdown, u.start)[0], []).append(u)
+    for u in units:
+        if u.index not in errors:
+            continue
+        if u.table_span:
+            cuts.append(u.table_span if u.table_header else (u.start, u.end))
+            continue
+        line_start, line_end = _line_bounds(markdown, u.start)
+        a, b = u.start, u.end
+        siblings = lines[line_start]
+        if siblings[0] is u and any(x.index not in errors for x in siblings):
+            lead = _LINE_LEAD.match(markdown, line_start, line_end)
+            a = max(a, lead.end() if lead else a)
+        while b < line_end and markdown[b] in " \t":
+            b += 1
+        if b == line_end:
+            while a > line_start and markdown[a - 1] in " \t":
+                a -= 1
+        cuts.append((a, b))
+    # a row inside a table that is removed whole is part of that cut, not an edit of its own
+    cuts = [c for c in cuts if not any(o != c and o[0] <= c[0] and c[1] <= o[1] for o in cuts)]
+    # a line with nothing left but markup goes whole
+    for line_start, siblings in lines.items():
+        if not any(u.index in errors for u in siblings):
+            continue
+        _, line_end = _line_bounds(markdown, line_start)
+        rest, pos = [], line_start
+        for a, b in sorted(c for c in cuts if line_start <= c[0] <= line_end):
+            rest.append(markdown[pos:a])
+            pos = max(pos, b)
+        rest.append(markdown[pos:line_end])
+        if not re.search(r"[א-תA-Za-z]", _IDS.sub("", "".join(rest))):
+            whole = (line_start, min(line_end + 1, len(markdown)))
+            cuts = [c for c in cuts if not (whole[0] <= c[0] and c[1] <= whole[1])] + [whole]
+    return sorted(cuts)
+
+
+def _numbered_heading(text: str) -> bool:
+    """A numbered heading ("9. השומה", "9.1 שיטת השומה", "## 9.2. השומה"): its number, then a few words with no
+    other number or amount, and no full stop."""
+    m = _HEADING_NUMBER.match(text.strip())
+    if m is None:
+        return False
+    rest = _IDS.sub("", text.strip()[m.end():]).strip().strip("*:").strip()
+    return (bool(rest) and len(rest.split()) <= 8 and not _DIGIT.search(rest) and not _QUANTITY_WORD.search(rest)
+            and not rest.endswith("."))
+
+
+def _heading_line(line: str) -> bool:
+    """A line that only introduces what follows: a Markdown heading, a numbered heading ("9. השומה"), or a short
+    digit-free label (bold, or ending in a colon)."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("|"):
+        return False
+    if re.match(r"#{1,6}\s", stripped) or _numbered_heading(stripped):
+        return True
+    label = re.fullmatch(r"\*\*[^*]+\*\*:?", stripped) or stripped.endswith(":")
+    return bool(label) and not _DIGIT.search(stripped) and len(stripped.split()) <= 8
+
+
+def _orphans(markdown: str) -> list[str]:
+    """The heading lines with nothing under them: followed by another heading, or by the end."""
+    lines = [ln for ln in markdown.split("\n") if ln.strip()]
+    return [ln.strip() for n, ln in enumerate(lines)
+            if _heading_line(ln) and (n + 1 == len(lines) or _heading_line(lines[n + 1]))]
+
+
+def _drop_orphan_headings(original: str, text: str) -> str:
+    """Remove the headings whose whole content was removed (orphaned now, not in the original answer)."""
+    before = _orphans(original)
+    gone = [h for h in _orphans(text) if before.count(h) < _orphans(text).count(h)]
+    if not gone:
+        return text
+    out = []
+    for ln in text.split("\n"):
+        if ln.strip() in gone:
+            gone.remove(ln.strip())
+            continue
+        out.append(ln)
+    return "\n".join(out)
 
 
 def _cites_by_unit(problems: list[Problem]) -> list[tuple[Unit, list[str]]]:
@@ -284,7 +451,9 @@ def _after_number(unit: Unit, written: str) -> int | None:
 
 def split_units(markdown: str) -> list[Unit]:
     """Every statement of the answer with its character span: lines; long lines split into sentences; a Markdown
-    table row is one unit. Citations written after a sentence's full stop ("... 55 ₪. [S2]") belong to it."""
+    table row is one unit. Citations written after a sentence's full stop ("... 55 ₪. [S2]") belong to it. A
+    numbered heading or list item ("9. השומה", "9.1. שיטת השומה", "1. השווי ...") is never split after its number,
+    nor a sentence after an inner enumeration ("שני רכיבים: 1. ... ו-2. ...") or a one-letter abbreviation."""
     units: list[Unit] = []
     offset = 0
     lines = markdown.split("\n")
@@ -315,6 +484,8 @@ def split_units(markdown: str) -> list[Unit]:
         else:
             pieces, pos = [], 0
             for m in _SENTENCE.finditer(stripped):
+                if _NO_END.search(stripped, 0, m.start()):
+                    continue
                 pieces.append((pos, m.start()))
                 pos = m.end()
             pieces.append((pos, len(stripped)))
@@ -546,7 +717,9 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
             cited.add(str(len(c.inputs)))
             cited.add(str(c.documents))
         pool = cited if u.ids else everything
-        missing = [n for n in numbers_in(u.text) - question_numbers if n not in pool and not (
+        # a numbered heading's own number ("9.1 שיטת השומה") is its place in the answer, not a fact
+        stated = _HEADING_NUMBER.sub("", u.text.strip(), count=1) if _numbered_heading(u.text) else u.text
+        missing = [n for n in numbers_in(stated) - question_numbers if n not in pool and not (
             _small_ordinal(n, u.text) and not _document_count(n, u.text))]
         if missing:  # a calculation's result shown rounded to the precision it is written in
             shown = _computed_numbers(u.text, computations if u.ids else list(ws.computations.values()))
@@ -584,7 +757,7 @@ def structural_kind(unit: Unit) -> str | None:
     otherwise. Conservative: anything else is a claim and needs a verdict."""
     text = unit.text.strip()
     words = len(text.split())
-    if re.match(r"^#{1,6}\s", unit.raw.strip()):
+    if re.match(r"^#{1,6}\s", unit.raw.strip()) or _numbered_heading(unit.raw):
         return "heading"
     if unit.table_header and not unit.ids:
         return "table_header"
@@ -622,7 +795,8 @@ def exempt_without_verdict(unit: Unit) -> bool:
     if kind == "table_header":
         cells = [c for c in unit.text.strip().strip("|").split("|") if c.strip()]
         return bool(cells) and all(_one_word(c) for c in cells)
-    return _one_word(unit.text)
+    # a numbered heading's number is part of the heading: "9. השומה" is one word of navigation
+    return _one_word(_HEADING_NUMBER.sub("", unit.text.strip(), count=1))
 
 
 def _non_claim_accepted(unit: Unit, verdict: str) -> bool:
@@ -646,8 +820,31 @@ class _Batch:
     narrow: bool = False
 
 
-def _render_batch(batch: _Batch, ws: Workspace) -> str:
-    """The judge input: every cited source once (its evidence for this batch's units), then the units."""
+@dataclass
+class _Coverage:
+    """The coverage plane of a judge call: the request's parts and the sentences the server adds after
+    verification, each with the index the judge refers to it by."""
+
+    parts: list[dict]
+    statements: list[tuple[int, str]]
+    request: str = ""
+
+    def render(self) -> str:
+        if not self.parts:
+            return ""
+        parts = "\n".join(f'<part index="{n}">\n{prompt_text(p["ask"])}\n</part>' for n, p in enumerate(self.parts))
+        out = (f"\n\n<request>\n{prompt_text(self.request)}\n</request>" if self.request.strip() else "\n")
+        out += f"\n<request_parts>\n{parts}\n</request_parts>"
+        if self.statements:
+            out += "\n<server_statements>\n" + "\n".join(
+                f'<statement index="{i}">\n{prompt_text(t)}\n</statement>' for i, t in self.statements) \
+                + "\n</server_statements>"
+        return out
+
+
+def _render_batch(batch: _Batch, ws: Workspace, coverage: _Coverage | None = None) -> str:
+    """The judge input: every cited source once (its evidence for this batch's units), then the units, then the
+    request's parts and the server's statements, when the answer lists parts."""
     claims_of: dict[str, list[str]] = {}
     for u in batch.units:
         for sid in u.ids:
@@ -663,7 +860,8 @@ def _render_batch(batch: _Batch, ws: Workspace) -> str:
                       f"{prompt_text(text_)}\n</source>")
     units = [f'<unit index="{u.index}" cites="{prompt_attr(",".join(u.ids))}">\n{prompt_text(u.text)}\n</unit>'
              for u in batch.units]
-    return "<sources>\n" + "\n".join(blocks) + "\n</sources>\n\n" + "\n".join(units)
+    return ("<sources>\n" + "\n".join(blocks) + "\n</sources>\n\n" + "\n".join(units)
+            + (coverage.render() if coverage else ""))
 
 
 def _batches(units: list[Unit], ws: Workspace) -> list[_Batch]:
@@ -686,56 +884,81 @@ def _batches(units: list[Unit], ws: Workspace) -> list[_Batch]:
     return out
 
 
-def judge(provider: LLMProvider, batch: _Batch, rendered: str, usage: list[dict], deadline: float | None = None
-          ) -> tuple[dict[int, JudgeVerdict], str]:
-    """One judge call on a rendered batch: the verdicts of the batch's units, and the call's status."""
+def judge(provider: LLMProvider, batch: _Batch, rendered: str, usage: list[dict], deadline: float | None = None,
+          coverage: _Coverage | None = None) -> tuple[dict[int, JudgeVerdict], str, list[JudgePart]]:
+    """One judge call on a rendered batch: the verdicts of the batch's units, the call's status, and — when the
+    answer lists the request's parts — each part's coverage by the batch's units and the server's statements."""
     provider = for_purpose(provider, Purpose.VERIFY)
-    r = call_structured(provider, Purpose.VERIFY, JUDGE_POLICY, rendered, JudgeOutput, deadline=deadline,
+    with_parts = bool(coverage and coverage.parts)
+    r = call_structured(provider, Purpose.VERIFY, JUDGE_POLICY + (JUDGE_PARTS_POLICY if with_parts else ""),
+                        rendered, JudgeCoverageOutput if with_parts else JudgeOutput, deadline=deadline,
                         max_output_tokens=6000)
     usage.append(usage_entry("verify", r, provider.model))
     if r.status != CallStatus.OK:
-        return {}, r.status.value
+        return {}, r.status.value, []
     wanted = {u.index for u in batch.units}
-    return {v.index: v for v in r.parsed.verdicts if v.index in wanted}, "ok"
+    parts: list[JudgePart] = []
+    if with_parts:
+        # a part is covered only by a unit of this call or a server statement; other indexes are ignored
+        known = wanted | {i for i, _ in coverage.statements}
+        parts = [p.model_copy(update={"units": [i for i in p.units if i in known]})
+                 for p in r.parsed.parts if 0 <= p.index < len(coverage.parts)]
+    return {v.index: v for v in r.parsed.verdicts if v.index in wanted}, "ok", parts
 
 
 def _judge_batch(provider: LLMProvider, batch: _Batch, ws: Workspace, usage: list[dict],
-                 deadline: float | None) -> dict[int, JudgeVerdict]:
-    """One batch to verdicts: a call that timed out, was rate-limited or came back invalid is made once more; a
-    truncated (``incomplete``) reply is split in half instead of resent. Raises ``VerificationUnavailable`` when
-    the judge cannot answer."""
-    rendered = _render_batch(batch, ws)
-    got, status = judge(provider, batch, rendered, usage, deadline)
+                 deadline: float | None, coverage: _Coverage | None = None
+                 ) -> tuple[dict[int, JudgeVerdict], list[JudgePart]]:
+    """One batch to verdicts (and part coverage): a call that timed out, was rate-limited or came back invalid is
+    made once more; a truncated (``incomplete``) reply is split in half instead of resent. Raises
+    ``VerificationUnavailable`` when the judge cannot answer."""
+    rendered = _render_batch(batch, ws, coverage)
+    got, status, parts = judge(provider, batch, rendered, usage, deadline, coverage)
     if status == "incomplete" and len(batch.units) > 1:
         half = len(batch.units) // 2
-        return (_judge_batch(provider, _Batch(batch.units[:half], batch.narrow), ws, usage, deadline)
-                | _judge_batch(provider, _Batch(batch.units[half:], batch.narrow), ws, usage, deadline))
+        first, p1 = _judge_batch(provider, _Batch(batch.units[:half], batch.narrow), ws, usage, deadline, coverage)
+        second, p2 = _judge_batch(provider, _Batch(batch.units[half:], batch.narrow), ws, usage, deadline, coverage)
+        return first | second, p1 + p2
     if status in RETRYABLE:
-        got, status = judge(provider, batch, rendered, usage, deadline)
+        got, status, parts = judge(provider, batch, rendered, usage, deadline, coverage)
     if status != "ok":
         raise VerificationUnavailable(status)
-    return got
+    return got, parts
 
 
 def _judge_all(provider: LLMProvider, units: list[Unit], ws: Workspace, usage: list[dict],
-               deadline: float | None = None) -> dict[int, JudgeVerdict]:
-    """Every unit judged; a unit the judge left out is asked about once more."""
+               deadline: float | None = None, coverage: _Coverage | None = None
+               ) -> tuple[dict[int, JudgeVerdict], list[JudgePart]]:
+    """Every unit judged; a unit the judge left out is asked about once more. With the request's parts, every
+    call also reports their coverage (a part may be answered in any batch)."""
     verdicts: dict[int, JudgeVerdict] = {}
+    parts: list[JudgePart] = []
     for batch in _batches(units, ws):
-        verdicts |= _judge_batch(provider, batch, ws, usage, deadline)
+        got, p = _judge_batch(provider, batch, ws, usage, deadline, coverage)
+        verdicts |= got
+        parts += p
     missing = [u for u in units if u.index not in verdicts]
     for batch in _batches(missing, ws):
-        verdicts |= _judge_batch(provider, batch, ws, usage, deadline)
-    return verdicts
+        got, p = _judge_batch(provider, batch, ws, usage, deadline, coverage)
+        verdicts |= got
+        parts += p
+    return verdicts, parts
 
 
 def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, question: str,
-                  usage: list[dict], deadline: float | None = None, mismatch: str | None = None) -> VerifyReport:
+                  usage: list[dict], deadline: float | None = None, mismatch: str | None = None,
+                  statements: list[str] | None = None, request: str | None = None) -> VerifyReport:
     """Deterministic checks, then the judge on every remaining unit. ``mismatch`` says why the answer's datum is
     not the one the resolved request asked for (``app.chat.resolve.mismatch``): a problem of the whole answer,
-    for the repair round, and a note on the final answer. Raises ``VerificationUnavailable``."""
+    for the repair round, and a note on the final answer. ``statements``: the sentences the server adds after
+    verification (``coverage.planned_statements``), which can state a part of the request missing; ``request``: the
+    request as resolved in context (the question itself when there is none), beside the parts. Raises
+    ``VerificationUnavailable``."""
     units = split_units(answer.answer_markdown)
     report = VerifyReport(units)
+    report.parts = [p.model_dump() for p in getattr(answer, "parts", None) or []]
+    report.statements = [(len(units) + n, t) for n, t in enumerate(statements or [])] if report.parts else []
+    coverage = _Coverage(report.parts, report.statements, request or question) if report.parts else None
     # the meaning check first: evidence it finds in the same calculation joins the unit's citations, so the number
     # check and the judge read the unit with it
     fetcher = meaning.Fetcher(ws)
@@ -755,10 +978,18 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     if mismatch:
         report.problems.append(Problem(Unit(-1, "", "", []), f"התשובה אינה מציגה את הנתון שהתבקש: {mismatch}",
                                        kind="request"))
+    # a unit the deterministic checks failed is not judged; with parts and nothing left to judge, the parts are still
+    # checked against the server's statements (without either, no part is covered)
     to_judge = [u for u in units if u.index not in failed]
+    if coverage and not to_judge and coverage.statements:
+        _, votes = _judge_batch(provider, _Batch([]), ws, usage, deadline, coverage)
+        for v in votes:
+            report.part_votes.setdefault(v.index, []).append(v)
     if to_judge:
-        verdicts = _judge_all(provider, to_judge, ws, usage, deadline)
+        verdicts, votes = _judge_all(provider, to_judge, ws, usage, deadline, coverage)
         report.judged, report.judge_status = True, "ok"
+        for v in votes:
+            report.part_votes.setdefault(v.index, []).append(v)
         for u in to_judge:
             v = verdicts.get(u.index)
             if v is None:
@@ -774,3 +1005,4 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
             elif v.verdict == "partial":
                 report.problems.append(Problem(u, "נתמך חלקית: " + v.reason, "partial"))
     return report
+

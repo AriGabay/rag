@@ -16,6 +16,13 @@ presented as covering the set when it covers part of it. An answer that covers e
 passages only says so. For a focused answer to a question that names no document, when several documents share a
 distinctive word of the question in their titles and the answer cites only some of them, the note names the
 others. For a table it cites, the ledger records the rows it presented against the rows in the table.
+
+A datum that was not found gets exactly one limitation, of four kinds (R21), derived from what the turn did: not
+found in the search performed (search only); the source was read only in part (a read clipped or with an unread
+region, or a document read in part); the relevant source was read and does not show it (a section or table read
+to its end); the sources conflict (values registered this turn give it different amounts). One sentence per datum:
+requested data are deduplicated by label, and a part of the request the verified answer does not cover gets one
+too (``state_parts``), unless it is already stated.
 """
 
 from __future__ import annotations
@@ -63,7 +70,7 @@ def cited_documents(ws: Workspace, markdown: str) -> dict[str, str]:
 
 
 LEDGER_DOCUMENT_KEYS = ("cited", "matching", "read", "retrieved_only", "with_data", "not_checked", "unused",
-                        "partially_read", "omitted", "also_matching", "tables")
+                        "partially_read", "omitted", "also_matching", "tables", "parts")
 
 
 def ledger_documents(ledger: dict | None) -> set[str]:
@@ -91,14 +98,50 @@ def _names(docs: list[dict]) -> str:
     return shown + (f" ועוד {len(docs) - NAMES_SHOWN}" if len(docs) > NAMES_SHOWN else "")
 
 
+# the four kinds of limitation (R21), and the requested status each comes from
+ABSENCE_KINDS = {"not_found_search": "לא נמצא בחיפוש שבוצע", "source_partial": "המקור נקרא רק בחלקו",
+                 "read_absent": "המקורות הרלוונטיים נקראו ואינם מציגים את הנתון", "sources_conflict": "המקורות סותרים"}
+_KIND_OF_STATUS = {"not_found_search": "not_found_search", "source_partial": "source_partial",
+                   "section_checked_absent": "read_absent", "sources_conflict": "sources_conflict"}
+# when one datum is claimed missing more than once: the limitation the turn supports most specifically
+_STRENGTH = ("section_checked_absent", "sources_conflict", "source_partial", "not_found_search")
+
+
+def _norm_label(label: str) -> str:
+    return " ".join(re.sub(r"[*_`]+", " ", label or "").split()).strip(" :.").casefold()
+
+
+def conflicting(ws: Workspace, document_ids: list[str] | None = None) -> bool:
+    """Whether values the turn registered (V#) or measurements it listed (M#) give one datum different amounts:
+    the same kind (by family), unit, period, area basis and named subject, and different numbers. Only documents
+    in ``document_ids``, when given."""
+    from app.answering.verify import numbers_in
+    from app.chat.resolve import family
+
+    seen: dict[tuple, set] = {}
+    entries = [(str(v.document_id), v.kind, v.unit, v.period, v.area_basis, v.subject, str(v.value))
+               for v in ws.values.values()]
+    entries += [(str(m.document_id), m.row.metric_kind, m.row.unit, m.row.period, m.row.area_basis, m.row.subject,
+                 frozenset(numbers_in(m.row.value_text or ""))) for m in ws.measurements.values()]
+    for doc, kind, unit, period, basis, subject, amount in entries:
+        if document_ids and doc not in document_ids:
+            continue
+        if not (subject or "").strip() or kind in (None, "unknown", "other"):
+            continue  # a datum of no named subject cannot be said to conflict with another
+        key = (family(kind), unit, period, _norm_label(basis or ""), _norm_label(subject))
+        seen.setdefault(key, set()).add(amount)
+    return any(len(amounts) > 1 for amounts in seen.values())
+
+
 def validate_requested(ws: Workspace, requested) -> list[dict]:
     """Each requested datum with the status the turn's actions support. "The section was checked" needs a section,
     table or page range of one of its documents opened this turn and named in ``checked_where`` (a measurements
     listing is not a reading of the section), read to its end with no unread region in it (R12): one read only in
     part — clipped and not continued to the end, or with a region that was not read — supports only "the source was
     read in part" (``partial_reason``: ``clipped`` or ``unread``). "Read in part" otherwise needs one of its
-    documents read in part. An unsupported status falls to the strongest one the turn does support, down to "not
-    found in the search"."""
+    documents read in part. "The sources conflict" needs values of the turn that conflict (``conflicting``);
+    without them the datum was found. An unsupported status falls to the strongest one the turn does support, down
+    to "not found in the search". ``kind`` is the limitation's kind (``ABSENCE_KINDS``), None when found."""
     out = []
     for r in requested or []:
         docs = [d for d in r.document_ids if d in ws.activity]
@@ -113,11 +156,13 @@ def validate_requested(ws: Workspace, requested) -> list[dict]:
                 status, reason = "source_partial", "unread" if st["to"] == READ_TO_END else "clipped"
         if status == "source_partial" and reason is None and not any(ws.activity[d]["partial"] for d in docs):
             status = "not_found_search"
+        if status == "sources_conflict" and not conflicting(ws, docs or None):
+            status = "found"
         partial = next((ws.activity[d]["title"] for d in docs if ws.activity[d]["partial"]), None)
         out.append({"label": r.label.strip(), "document_ids": docs, "status": status, "claimed": r.status,
                     "checked_where": where["sid"] if where else None, "section": where["name"] if where else None,
                     "scope": where["scope"] if where else None, "partial_document": partial,
-                    "partial_reason": reason})
+                    "partial_reason": reason, "kind": _KIND_OF_STATUS.get(status)})
     return out
 
 
@@ -133,7 +178,7 @@ def _place(r: dict) -> tuple[str, str, str]:
 
 def absence_sentence(r: dict) -> str | None:
     """The opening sentence for a datum that was not found, at the level the turn checked."""
-    label = r["label"]
+    label = " ".join(re.sub(r"\*+", " ", r["label"]).split())
     in_it, of_it, what = _place(r)
     if r["status"] == "section_checked_absent":
         return f"**{label}** לא מופיע {in_it} שנבדק [{r['checked_where']}]."
@@ -146,9 +191,58 @@ def absence_sentence(r: dict) -> str | None:
     if r["status"] == "source_partial":
         return (f"**{label}** לא נמצא. המסמך \"{r['partial_document']}\" נקרא חלקית (חלק מהתמונות או העמודים לא "
                 "נקראו), ולכן ייתכן שהנתון מופיע בחלק שלא נקרא.")
+    if r["status"] == "source_partial" and r.get("partial_reason") == "read_in_part":
+        return (f"**{label}** לא נמצא. המסמך \"{r['partial_document']}\" נקרא רק בחלקו, ולכן ייתכן שהנתון מופיע "
+                "בחלק שלא נקרא.")
+    if r["status"] == "sources_conflict":
+        return f"**{label}**: המקורות סותרים — הם נותנים לנתון ערכים שונים, ולכן אין לו ערך אחד."
     if r["status"] == "not_found_search":
         return f"**{label}** לא נמצא בחיפוש במסמכים שנבדקו."
     return None
+
+
+def _per_label(rows: list[dict]) -> dict[str, list[dict]]:
+    """The validated limitations of each datum (by its label, normalized), strongest first; found data left out."""
+    out: dict[str, list[dict]] = {}
+    for r in rows:
+        if r["status"] in _STRENGTH:
+            out.setdefault(_norm_label(r["label"]), []).append(r)
+    for rs in out.values():
+        rs.sort(key=lambda r: _STRENGTH.index(r["status"]))
+    return out
+
+
+def _absence_sentences(ws: Workspace, answer: FinalAnswer, *, cited: bool) -> list[str]:
+    """One sentence per datum not found. ``cited=True``: the data whose section or table was read and does not
+    show them. ``cited=False``: every other datum — and one whose section sentence is not in the answer (removed
+    in verification) falls to its next limitation."""
+    out: list[str] = []
+    for rows in _per_label(validate_requested(ws, answer.requested)).values():
+        if cited:
+            chosen = rows[0] if rows[0]["status"] == "section_checked_absent" else None
+        else:
+            stated = [r for r in rows if r["status"] == "section_checked_absent"
+                      and absence_sentence(r) in answer.answer_markdown]
+            chosen = None if stated else next((r for r in rows if r["status"] != "section_checked_absent"), None)
+        sentence = absence_sentence(chosen) if chosen else None
+        if sentence and sentence not in answer.answer_markdown and sentence not in out:
+            out.append(sentence)
+    return out
+
+
+def planned_statements(ws: Workspace, answer: FinalAnswer) -> list[str]:
+    """The sentences ``state_absence(cited=False)`` will add to this answer after verification: the judge reads
+    them beside the answer, so a part of the request they state missing is not stated again."""
+    if answer.status == "clarification":
+        return []
+    return _absence_sentences(ws, answer, cited=False)
+
+
+def _prepend(answer: FinalAnswer, sentences: list[str]) -> FinalAnswer:
+    body = answer.answer_markdown.strip()
+    status = "partial" if answer.status == "answered" else answer.status
+    return answer.model_copy(update={"answer_markdown": "\n".join(sentences) + ("\n\n" + body if body else ""),
+                                     "status": status})
 
 
 def state_absence(ws: Workspace, answer: FinalAnswer, *, cited: bool) -> FinalAnswer:
@@ -157,19 +251,57 @@ def state_absence(ws: Workspace, answer: FinalAnswer, *, cited: bool) -> FinalAn
 
     Two kinds, added at two points. ``cited=True`` (before verification): "not in the section that was checked",
     which cites the opened section it rests on and is judged like any claim. ``cited=False`` (after
-    verification): "not found in the search" and "the document was read in part" — statements about what the
-    turn did, validated against it (``validate_requested``), with no source a judge could read."""
+    verification): "not found in the search", "the document was read in part" and "the sources conflict" —
+    statements about what the turn did, validated against it (``validate_requested``), with no source a judge
+    could read. A datum gets one sentence, however many times it is listed."""
     if answer.status == "clarification":
         return answer
-    checked = [r for r in validate_requested(ws, answer.requested)
-               if (r["status"] == "section_checked_absent") == cited]
-    sentences = [x for x in (absence_sentence(r) for r in checked) if x]
-    if not sentences:
-        return answer
-    body = answer.answer_markdown.strip()
-    status = "partial" if answer.status == "answered" else answer.status
-    return answer.model_copy(update={"answer_markdown": "\n".join(sentences) + ("\n\n" + body if body else ""),
-                                     "status": status})
+    sentences = _absence_sentences(ws, answer, cited=cited)
+    return _prepend(answer, sentences) if sentences else answer
+
+
+def _part_limitation(ws: Workspace, part: dict) -> dict:
+    """The limitation a part of the request the answer does not cover gets, from what the turn did: the sources
+    conflict (claimed, and values of the turn conflict); a document of the turn was read in part; otherwise not
+    found in the search. "Read and not shown" needs a section read to its end for that datum, which only a
+    requested datum names (``validate_requested``)."""
+    row = {"label": part["ask"].strip(), "status": "not_found_search", "partial_document": None,
+           "partial_reason": None}
+    if part.get("missing_kind") == "sources_conflict" and conflicting(ws):
+        return row | {"status": "sources_conflict"}
+    for a in ws.activity.values():
+        if a.get("partial") or a.get("read_partial"):
+            return row | {"status": "source_partial", "partial_document": a["title"],
+                          "partial_reason": None if a.get("partial") else "read_in_part"}
+    return row
+
+
+def state_parts(ws: Workspace, answer: FinalAnswer, report) -> tuple[FinalAnswer, list[dict]]:
+    """Each part of the request with its coverage in the verified answer (``VerifyReport.part_outcomes``), and the
+    answer opened by a sentence for each part it neither gives nor states missing; a part not given makes the
+    answer at most ``partial``. The sentence names the part's limitation (``_part_limitation``), once per label."""
+    if answer.status == "clarification" or not report.parts:
+        return answer, []
+    outcomes = report.part_outcomes(answer)
+    # the data whose limitation the answer already states (a requested datum's sentence that is in the answer)
+    stated = {_norm_label(r["label"]) for r in validate_requested(ws, answer.requested)
+              if r["kind"] and absence_sentence(r) in answer.answer_markdown}
+    sentences: list[str] = []
+    for o in outcomes:
+        o["stated"] = None
+        if o["coverage"] != "not_covered":
+            continue
+        row = _part_limitation(ws, o)
+        o["stated"] = _KIND_OF_STATUS[row["status"]]
+        sentence = absence_sentence(row)
+        if sentence and _norm_label(row["label"]) not in stated and sentence not in sentences:
+            stated.add(_norm_label(row["label"]))
+            sentences.append(sentence)
+    if sentences:
+        answer = _prepend(answer, sentences)
+    elif any(o["coverage"] != "answered" for o in outcomes) and answer.status == "answered":
+        answer = answer.model_copy(update={"status": "partial"})
+    return answer, outcomes
 
 
 def tables_presented(ws: Workspace, markdown: str) -> list[dict]:
