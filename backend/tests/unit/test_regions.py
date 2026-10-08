@@ -3,14 +3,16 @@ read by OCR or a scripted vision reader, or reported unread with its reason.
 
 The fixtures under ``tests/fixtures/regions/`` are synthetic (``scripts/generate_fixtures.py --only regions``): a
 raster table under a valid text layer with a logo and a watermark on ten pages, a low-resolution raster table, a
-searchable scan, a ruled vector table with a dark header, vector text drawn as outlines, and a stamp next to a
-photograph. Every value in them is invented. The vision reader is scripted by the size of the picture it is
+searchable scan, a ruled vector table with a dark header, vector text drawn as outlines, a stamp next to a
+photograph, and page furniture (a logo and 25 watermark tiles with text on four pages, a stamp on two). Every value
+in them is invented. The vision reader is scripted by the size of the picture it is
 shown; no model is called. OCR is switched off unless a test scripts it (``ocr`` tests use Tesseract ``heb``)."""
 
 from __future__ import annotations
 
 import io
 import time
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -31,7 +33,7 @@ from app.extraction.images import (
 )
 from app.extraction.ocr import ocr_available
 from app.extraction.pdf import extract_pdf
-from app.extraction.regions import REGION_READER_VERSION, ReadingKey
+from app.extraction.regions import REGION_READER_VERSION, PageLayer, ReadingKey, Region, mark_repeated
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 REGIONS = FIXTURES / "regions"
@@ -41,9 +43,11 @@ R3 = REGIONS / "R3_synthetic_searchable_scan.pdf"
 R4 = REGIONS / "R4_synthetic_vector_table.pdf"
 R5 = REGIONS / "R5_synthetic_vector_text.pdf"
 R6 = REGIONS / "R6_synthetic_stamp_and_photo.pdf"
+R7 = REGIONS / "R7_synthetic_repeated_pictures.pdf"
 
 # picture sizes in the fixtures (pixels): what the scripted reader recognises a picture by
-TABLE, LOWRES, LOGO, MARK, STAMP = (1400, 420), (600, 300), (440, 66), (200, 250), (240, 110)
+TABLE, LOWRES, LOGO, MARK, STAMP, TILE = (1400, 420), (600, 300), (440, 66), (200, 250), (240, 110), (180, 90)
+LOGO_TEXT, TILE_TEXT = "משרד שמאות לדוגמה", "עותק לדוגמה"
 HEADERS = ["אזור", "שטח (מ״ר)", "דמי שכירות (₪)", "תפוסה"]
 ROWS = [["צפון", "1,250", "48,600", "92.5%"], ["מרכז", "2,340", "97,350", "88.0%"],
         ["דרום", "1,880", "61,420", "95.5%"], ["מערב", "960", "33,780", "79.5%"]]
@@ -57,7 +61,8 @@ def table_out() -> VisionOut:
 SCRIPT = {
     TABLE: table_out,
     LOWRES: table_out,
-    LOGO: lambda: VisionOut("text", True, "משרד שמאות לדוגמה", [], "", []),
+    LOGO: lambda: VisionOut("text", True, LOGO_TEXT, [], "", []),
+    TILE: lambda: VisionOut("text", True, TILE_TEXT, [], "", []),
     MARK: lambda: VisionOut("diagram", True, "", [], "סמל עגול עם כוכב", []),
     STAMP: lambda: VisionOut("text", True, "שמאי מקרקעין\nרישיון 4821", [], "", []),
 }
@@ -155,13 +160,95 @@ def test_a_logo_and_a_watermark_on_ten_pages_are_read_once():
     vision = ScriptedVision()
     result = extract(R1, vision)
     assert vision.count(LOGO) == 1 and vision.count(MARK) == 1
+    # the logo on every page is page furniture: one block, at its first occurrence, with its reading
     logos = [b for b in images_of(result) if b.bbox[1] < 60]
-    assert [b.page for b in logos] == list(range(1, 11))
-    assert {(b.status, b.picture_text, b.content_hash) for b in logos} == {
-        ("read", "משרד שמאות לדוגמה", logos[0].content_hash)}
+    assert [(b.page, b.status, b.picture_text) for b in logos] == [(1, "read", LOGO_TEXT)]
     # page 1's two watermark tiles: one block, recorded without text; on pages 2-10 the body text covers them
     marks = [b for b in images_of(result) if b.bbox[1] > 300]
     assert [(b.page, b.status) for b in marks] == [(1, "no_text")] and marks[0].note == "סמל עגול עם כוכב"
+    repeated = {e["hash"]: e for e in result.components["repeated_images"]}
+    assert repeated[logos[0].content_hash[:12]] | {"hash": None} == {
+        "hash": None, "occurrences": 10, "pages": 10, "first_page": 1, "status": "read"}
+    assert (repeated[marks[0].content_hash[:12]]["occurrences"], repeated[marks[0].content_hash[:12]]["status"]) == (
+        20, "no_text")
+    # only page 1's table is content read from a picture: the logo leaves pages 2-10 read from their text layer
+    assert [p.method for p in result.pages] == ["mixed"] + ["text_layer"] * 9
+    assert LOGO_TEXT not in result.pages[1].text
+    assert sum(c.text.count(LOGO_TEXT) for c in result.chunks) == 1
+
+
+# --- page furniture (KTD5): a picture repeated three times or more is one block, read once -----------------------
+
+def test_tiled_watermark_and_logo_are_one_block_each_and_read_once(monkeypatch):
+    scripted_ocr(monkeypatch, {STAMP: STAMP_WORDS, TABLE: TABLE_WORDS})
+    vision = ScriptedVision()
+    result = extract(R7, vision)
+    assert vision.count(LOGO) == 1 and vision.count(TILE) == 1 and vision.count(STAMP) == 1
+    found = images_of(result)
+    per_hash = Counter(b.content_hash for b in found)
+    logo = next(b for b in found if b.picture_text == LOGO_TEXT)
+    tile = next(b for b in found if b.picture_text == TILE_TEXT)
+    assert per_hash[logo.content_hash] == 1 and per_hash[tile.content_hash] == 1  # 4 logos and 100 tiles
+    assert (logo.page, logo.status, logo.method) == (1, "read", "vision")
+    assert (tile.page, tile.status, tile.method) == (1, "read", "vision")  # repeated is not decorative
+    # the same stamp twice, on two pages: plausibly content (a signature on two sections), both kept
+    stamps = [b for b in found if b.picture_text.startswith("שמאי")]
+    assert [(b.page, b.status) for b in stamps] == [(3, "read"), (4, "read")]
+    assert len(found) == 5  # logo, tile, the table on page 2, the two stamps
+    repeated = result.components["repeated_images"]
+    assert sorted((e["hash"], e["occurrences"], e["pages"], e["first_page"], e["status"]) for e in repeated) == sorted(
+        [(logo.content_hash[:12], 4, 4, 1, "read"), (tile.content_hash[:12], 100, 4, 1, "read")])
+    # furniture alone does not make a page mixed; the table and the stamps do
+    assert [p.method for p in result.pages] == ["text_layer", "mixed", "mixed", "mixed"]
+    assert all(TILE_TEXT not in p.text and LOGO_TEXT not in p.text for p in result.pages)
+    for text in (TILE_TEXT, LOGO_TEXT):
+        assert sum(c.text.count(text) for c in result.chunks) == 1
+    assert result.components["partial"] is False
+
+
+def test_unread_page_furniture_is_one_unread_block_per_picture():
+    result = extract(R7, None)
+    comp = result.components
+    assert len(images_of(result)) == 5 and len(comp["unread"]) == 5
+    assert {e["status"] for e in comp["repeated_images"]} == {"unread"}
+    assert [p.method for p in result.pages] == ["text_layer"] * 4
+
+
+def _occurrence(page: int, top: float, digest: str, covered: bool = False) -> Region:
+    r = Region(page=page, bbox=[10.0, top, 60.0, top + 20], content_hash=digest, covered=covered)
+    r.reading = None if covered else PictureReading("read", "vision", text="x")
+    return r
+
+
+def test_the_repeated_picture_rule():
+    """Three occurrences or more in a document (on any pages) are page furniture: one block, at the first
+    occurrence the text layer does not cover. Exactly two on two pages are kept (a table or signature repeated in
+    two sections); two on one page are one block."""
+    pages = [PageLayer(index=k, width=600, height=800, chars=[], lines=[]) for k in range(3)]
+    occ = {
+        "twice-one-page": [_occurrence(1, 300, "a" * 64), _occurrence(1, 100, "a" * 64)],
+        "twice-two-pages": [_occurrence(1, 500, "b" * 64), _occurrence(2, 500, "b" * 64)],
+        "three-pages": [_occurrence(p, 20, "c" * 64) for p in (1, 2, 3)],
+        "three-on-a-page": [_occurrence(3, top, "d" * 64) for top in (200, 400, 600)],
+        "first-covered": [_occurrence(1, 700, "e" * 64, covered=True), _occurrence(2, 700, "e" * 64),
+                          _occurrence(3, 700, "e" * 64)],
+    }
+    for regions in occ.values():
+        for r in regions:
+            pages[r.page - 1].regions.append(r)
+    report = mark_repeated(pages)
+
+    def blocks(name):
+        return [(r.page, r.bbox[1]) for r in occ[name] if not r.covered and not r.duplicate]
+
+    assert blocks("twice-one-page") == [(1, 100)]  # the upper one, where reading meets it first
+    assert blocks("twice-two-pages") == [(1, 500), (2, 500)]
+    assert blocks("three-pages") == [(1, 20)]
+    assert blocks("three-on-a-page") == [(3, 200)]
+    assert blocks("first-covered") == [(2, 700)]
+    assert not any(r.furniture for name in ("twice-one-page", "twice-two-pages") for r in occ[name])
+    assert sorted((e["hash"], e["occurrences"], e["pages"], e["first_page"]) for e in report) == [
+        ("c" * 12, 3, 3, 1), ("d" * 12, 3, 1, 3), ("e" * 12, 3, 3, 2)]
 
 
 def test_without_the_vision_model_a_table_region_is_unread_and_its_page_named(monkeypatch):

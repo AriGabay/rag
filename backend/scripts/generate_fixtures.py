@@ -4031,6 +4031,16 @@ def raster_watermark():
     return img
 
 
+def raster_text_tile(font_dir: Path):
+    """A small watermark tile carrying text, the kind some producers tile over every page."""
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (180, 90), "white")
+    _draw_centered(ImageDraw.Draw(img), (6, 6, 174, 84), "עותק לדוגמה", _pil_font(font_dir, 26, bold=True),
+                   (205, 205, 205))
+    return img
+
+
 def raster_stamp(font_dir: Path):
     from PIL import Image, ImageDraw
 
@@ -4092,7 +4102,8 @@ class RegionsPdfRenderer(BlocksPdfRenderer):
     """Synthetic reproductions of page content the text layer does not cover: a raster table under a valid text
     layer, a low-resolution raster table, a logo and a watermark repeated on every page, a searchable scan (a page
     image with an invisible text layer), a ruled vector table with a dark header, vector text drawn as outlines
-    (no text layer) and a small stamp next to a photograph. Every value is invented."""
+    (no text layer), a small stamp next to a photograph, and page furniture (a logo and tiled watermark with text on
+    every page). Every value is invented."""
 
     def __init__(self, font_dir: Path) -> None:
         super().__init__(font_dir)
@@ -4240,6 +4251,26 @@ class RegionsPdfRenderer(BlocksPdfRenderer):
         self.paragraph("הצילום מתאר את חזית הבניין.")
         return bytes(pdf.output())
 
+    def render_repeated_pictures(self) -> bytes:
+        """R7: page furniture. Four pages, each with the same logo and a grid of 25 identical watermark tiles that
+        carry text; page 2 also holds a raster table, and the same stamp signs pages 3 and 4."""
+        logo, tile, stamp = raster_logo(self.font_dir), raster_text_tile(self.font_dir), raster_stamp(self.font_dir)
+        pdf = self.pdf
+        for page in range(1, 5):
+            pdf.add_page()
+            pdf.image(logo, x=pdf.w - pdf.r_margin - 60, y=10, w=60)
+            for row in range(5):
+                for col in range(5):
+                    pdf.image(tile, x=12 + col * 38, y=60 + row * 42, w=30, h=15)
+            pdf.set_y(28)
+            self._line(f"{page}. פרק לדוגמה {page}", size=12.5, bold=True, h=8)
+            self.paragraph("פסקה קצרה זו נכתבה לצורך הדגמה בלבד, וכל הנתונים בה בדויים.")
+            if page == 2:
+                self.picture(raster_table(self.font_dir, (1400, 420), 30, 3), 170)
+            if page >= 3:
+                pdf.image(stamp, x=pdf.w - pdf.r_margin - 30, y=262, w=30)
+        return bytes(pdf.output())
+
 
 REGION_FIXTURES = {
     "R1_synthetic_raster_table.pdf": "render_raster_table",
@@ -4248,6 +4279,7 @@ REGION_FIXTURES = {
     "R4_synthetic_vector_table.pdf": "render_vector_table",
     "R5_synthetic_vector_text.pdf": "render_vector_text",
     "R6_synthetic_stamp_and_photo.pdf": "render_stamp_and_photo",
+    "R7_synthetic_repeated_pictures.pdf": "render_repeated_pictures",
 }
 
 

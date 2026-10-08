@@ -19,7 +19,9 @@ legible scale) or reported ``unread`` with its reason, so a document with unread
 becomes an ``image`` block at its place with its region and content hash; a table read from it becomes a table
 (source ``ocr`` or ``vision``) whose rows keep the page, with the text above it as caption and the note lines
 below it as notes. A region the text layer already holds (a searchable scan) becomes no block, and a page whose
-regions added text is ``mixed``.
+regions added text is ``mixed``. A picture repeated through the document (a logo on every page, watermark tiles)
+is page furniture: one block at its first occurrence, kept out of the page text, not making any page ``mixed``,
+and counted in the ingestion report (``repeated_images``).
 
 A font whose character map is broken (the page shows the right Hebrew letter, the text layer another character)
 is found and repaired per document by ``app.extraction.fontmap`` (KTD6): the words of every page are collected
@@ -68,13 +70,13 @@ from app.extraction.hebrew import (
     quality_score,
 )
 from app.extraction.images import PictureReading, VisionReader
-from app.extraction.regions import PageLayer, ReadingCache, Region, read_regions
+from app.extraction.regions import PageLayer, ReadingCache, Region, mark_repeated, read_regions
 from app.extraction.tables import RawTable, assemble_tables, logical_row, units_for
 
 log = logging.getLogger(__name__)
 
 # The reader that produced a PDF's blocks; a version read by an older one is reprocessed.
-READER_VERSION = "pdf-blocks-v3"
+READER_VERSION = "pdf-blocks-v4"
 
 MSG_ENCRYPTED = "הקובץ מוגן בסיסמה ולא ניתן לעבד אותו"
 MSG_CORRUPT = "הקובץ פגום או שאינו PDF תקין"
@@ -359,7 +361,6 @@ class _Walker:
     captions: dict[int, str] = field(default_factory=dict)  # id(raw) -> caption
     notes: dict[int, list[str]] = field(default_factory=dict)  # id(raw or region) -> note lines under it
     pictures: dict[int, tuple[Region, PictureReading, str]] = field(default_factory=dict)  # image block -> reading
-    repeated: set = field(default_factory=set)  # (page, hash) of a picture without text already placed
     path: list[str] = field(default_factory=list)
     labels: list[str] = field(default_factory=list)
     last_text: str = ""
@@ -443,14 +444,9 @@ class _Walker:
                 notes_of, notes_bottom = (item, item.bbox[3]) if item.bbox else (None, 0.0)
                 continue
             if isinstance(item, Region):
-                if item.covered:
-                    continue  # the text layer holds it
+                if item.covered or item.duplicate:
+                    continue  # the text layer holds it, or another occurrence of the same picture stands for it
                 r = item.reading or PictureReading("unread", "none", note=NOTE_NOT_READ)
-                if r.status in ("no_text", "decorative"):
-                    # a watermark or emblem repeated on the page: one block for it per page
-                    if (page_no, item.content_hash) in self.repeated:
-                        continue
-                    self.repeated.add((page_no, item.content_hash))
                 flush()
                 b = self.add("image", "", page_no, item.bbox, r.method, source=r.method, status=r.status,
                              note=r.note, content_hash=item.content_hash)
@@ -580,9 +576,11 @@ def _region_text(r: PictureReading) -> str:
 
 
 def _merge_region_text(out: _PageOut) -> None:
-    """A page whose regions added text: its text holds them at their place and its method is ``mixed``."""
+    """A page whose regions added text: its text holds them at their place and its method is ``mixed``. Page
+    furniture (a logo, a watermark) is no content of the page: its one block carries its reading."""
     found = [(pic.bbox[1], _region_text(pic.reading)) for pic in out.pictures
-             if not pic.covered and pic.reading is not None and pic.reading.status in ("read", "read_uncertain")]
+             if not (pic.covered or pic.furniture or pic.duplicate) and pic.reading is not None
+             and pic.reading.status in ("read", "read_uncertain")]
     found = [(top, t) for top, t in found if t]
     if not found:
         return
@@ -636,7 +634,9 @@ def extract_pdf(data: bytes, deadline: float, settings: Settings, vision: Vision
                     warnings.append(w)
         page_count = len(doc)
         _orient_undecided_pages(outs)
-        read_regions(doc, data, _layers(outs), settings, vision, readings, deadline)
+        layers = _layers(outs)
+        read_regions(doc, data, layers, settings, vision, readings, deadline)
+        repeated = mark_repeated(layers)
     finally:
         doc.close()
 
@@ -653,7 +653,7 @@ def extract_pdf(data: bytes, deadline: float, settings: Settings, vision: Vision
     report = fix.report()
     result = ExtractionResult(page_count=page_count, pages=pages, tables=tables, chunks=chunks, warnings=warnings,
                               blocks=blocks, uncertain=_uncertain_report(walker.uncertain),
-                              fontmap=report if any(report.values()) else None)
+                              fontmap=report if any(report.values()) else None, repeated=repeated)
     unread = result.components["unread"]
     if unread:
         warnings.append(WARN_PICTURES.format(n=len(unread)))

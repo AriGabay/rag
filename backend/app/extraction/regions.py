@@ -20,6 +20,12 @@ office's documents a ``ReadingCache`` (the office-scoped ``image_readings`` tabl
 content hash, reader version, model configuration and crop scale. Only successful and uncertain readings are
 cached. The vision prompt carries no page context, so a reading depends on the content alone.
 
+A picture repeated in a document is shown once (``mark_repeated``): content occurring ``REPEAT_MIN`` times or more
+(a logo on every page, watermark tiles, a header stamp) is page furniture and becomes one block, at its first
+occurrence the text layer does not cover, with its reading (repeated is not decorative: a logo with text keeps that
+text). Two occurrences on two pages are kept (a table or a signature repeated in two sections); two on one page are
+one block.
+
 pdfium is not thread-safe: every render and image decode happens on the calling thread; the OCR and model calls
 run in a small worker pool. A vision failure that is transient or a configuration error raises
 ``images.VisionUnavailable`` out of the pool and fails the job; the version keeps its earlier reading.
@@ -74,6 +80,8 @@ COVER_MIN_WORDS = 5
 COVER_AGREEMENT = 0.5  # share of OCR's confident words the text layer must also hold
 COVER_DENSITY = 0.04  # without OCR: share of the region the characters' boxes must fill ...
 COVER_SPAN = 0.4  # ... with the characters spread over this share of it (not one caption line over a picture)
+REPEAT_MIN = 3  # a content occurring this often in a document (on any pages) is page furniture
+HASH_SHOWN = 12  # characters of a content hash shown in the ingestion report
 REGION_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
 IMAGE_CROP = f"native<={VISION_MAX_SIDE}"
 NOTE_NO_PIXELS = "לא ניתן היה לחלץ את התמונה מהקובץ"
@@ -83,7 +91,9 @@ NOTE_NO_PIXELS = "לא ניתן היה לחלץ את התמונה מהקובץ"
 class Region:
     """A picture or a group of ink on one page. ``bbox``: x0, top, x1, bottom in points from the top-left corner.
     ``kind``: ``image`` (an image object) or ``ink`` (vector content outside the text layer). After reading,
-    ``covered`` says the text layer already holds its content and ``reading`` what was read from it."""
+    ``covered`` says the text layer already holds its content and ``reading`` what was read from it;
+    ``furniture`` says the same content repeats through the document (``mark_repeated``) and ``duplicate`` that
+    another occurrence of it already stands for it (it becomes no block)."""
 
     page: int
     bbox: list[float]
@@ -92,6 +102,8 @@ class Region:
     srcsize: tuple[int, int] | None = None
     reading: PictureReading | None = None
     covered: bool = False
+    furniture: bool = False
+    duplicate: bool = False
     # filled before reading: what the text layer holds inside the region
     layer_text: str = ""
     layer_chars: int = 0
@@ -461,3 +473,39 @@ def read_regions(doc, data: bytes, layers: list[PageLayer], settings: Settings, 
         pool.shutdown(wait=True, cancel_futures=True)
         raise
     pool.shutdown(wait=True)
+
+
+# --- repeated pictures -----------------------------------------------------------------------------------------
+
+def mark_repeated(layers: list[PageLayer]) -> list[dict]:
+    """Mark the regions of ``layers`` (read already) that repeat one content: page furniture (``REPEAT_MIN``
+    occurrences or more, counting the ones the text layer covers) keeps a block at its first uncovered occurrence
+    only, and two occurrences on one page are one block. Returns the ingestion report of the furniture shown:
+    ``{"hash", "occurrences", "pages", "first_page", "status"}`` per content."""
+    by_hash: dict[str, list[Region]] = {}
+    for layer in layers:
+        for r in sorted(layer.regions, key=lambda r: (r.bbox[1], r.bbox[0])):
+            if r.content_hash:
+                by_hash.setdefault(r.content_hash, []).append(r)
+    report = []
+    for digest, regions in by_hash.items():
+        if len(regions) < 2:
+            continue
+        shown = [r for r in regions if not r.covered]
+        pages = {r.page for r in regions}
+        furniture = len(regions) >= REPEAT_MIN
+        if not furniture and len(pages) > 1:
+            continue  # twice, on two pages: plausibly content, each place keeps its block
+        for r in shown[1:]:
+            r.duplicate = True
+        if not furniture:
+            continue
+        for r in regions:
+            r.furniture = True
+        if shown:
+            first = shown[0]
+            status = first.reading.status if first.reading is not None else "unread"
+            prefix = "ink:" if digest.startswith("ink:") else ""
+            report.append({"hash": prefix + digest.removeprefix(prefix)[:HASH_SHOWN], "occurrences": len(regions),
+                           "pages": len(pages), "first_page": first.page, "status": status})
+    return report

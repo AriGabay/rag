@@ -16,7 +16,7 @@ from app.platform import pipeline
 from app.platform.jobs import enqueue_reindex
 from app.platform.storage import get_storage, storage_key
 from tests.factories import make_office
-from tests.unit.test_regions import LOGO, LOWRES, R1, R2, TABLE, ScriptedVision
+from tests.unit.test_regions import LOGO, LOGO_TEXT, LOWRES, R1, R2, TABLE, ScriptedVision
 
 pytestmark = pytest.mark.db
 
@@ -66,9 +66,17 @@ def test_readings_are_reused_within_the_office_only(offices):
     first = ScriptedVision()
     ver = ingest(a, R1, first)
     assert first.count(LOGO) == 1 and first.count(TABLE) == 2  # without OCR the table's numbers stay unconfirmed
+    # the logo on all ten pages is page furniture: one block, one chunk, counted in the ingestion report
     logos = rows(a, "SELECT page, status, text FROM document_blocks WHERE version_id = :v AND kind = 'image'"
                     " AND (bbox->>1)::float < 60 ORDER BY page", v=ver)
-    assert [r.page for r in logos] == list(range(1, 11)) and {r.status for r in logos} == {"read"}
+    assert [(r.page, r.status) for r in logos] == [(1, "read")] and LOGO_TEXT in logos[0].text
+    assert len(rows(a, "SELECT 1 FROM chunks WHERE version_id = :v AND text LIKE :t", v=ver,
+                    t=f"%{LOGO_TEXT}%")) == 1
+    report = rows(a, "SELECT ingestion FROM document_versions WHERE id = :v", v=ver)[0].ingestion
+    assert {(e["occurrences"], e["pages"], e["status"]) for e in report["repeated_images"]} == {
+        (10, 10, "read"), (20, 10, "no_text")}
+    pages = rows(a, "SELECT page_no, method FROM pages WHERE version_id = :v ORDER BY page_no", v=ver)
+    assert [r.method for r in pages] == ["mixed"] + ["text_layer"] * 9
     table = rows(a, "SELECT structure FROM extracted_tables WHERE version_id = :v", v=ver)
     assert [t.structure["source"] for t in table] == ["vision"] and table[0].structure["rows"][0]["page"] == 1
     assert len(rows(a, "SELECT 1 FROM image_readings")) >= 2
@@ -92,7 +100,7 @@ def test_re_ingestion_reads_nothing_again(offices):
     assert again.calls == []
     read = rows(a, "SELECT status FROM document_blocks WHERE version_id = :v AND kind = 'image'"
                    " AND status IN ('read', 'read_uncertain')", v=ver)
-    assert len(read) == 11  # ten logos and the table, from the office's readings
+    assert len(read) == 2  # the logo (once for its ten pages) and the table, from the office's readings
 
 
 def test_a_rate_limited_reading_fails_the_job_and_keeps_the_earlier_reading(offices):

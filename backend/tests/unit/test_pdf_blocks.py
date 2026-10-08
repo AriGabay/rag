@@ -184,6 +184,7 @@ def test_pictures_become_unread_placeholders_in_reading_order(monkeypatch):
     pictures = [b for b in result.blocks if b.kind == "image"]
     assert all(b.status == "unread" and b.note and b.bbox and b.content_hash for b in pictures)
     assert pictures[0].content_hash == pictures[2].content_hash != pictures[1].content_hash  # the repeated logo
+    assert "repeated_images" not in result.components  # twice, on two pages: each place keeps its block
     assert pictures[1].bbox[0] > 300  # the photo is on the right half of the page, in points
 
 

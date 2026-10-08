@@ -126,12 +126,16 @@ class ExtractionResult:
     # reason ({"page", "blocks", "reason"}); the document is then only partly read.
     fontmap: dict | None = None
     uncertain: list[dict] = field(default_factory=list)
+    # PDF page furniture: each picture repeated through the document and shown as one block
+    # ({"hash", "occurrences", "pages", "first_page", "status"}; ``regions.mark_repeated``)
+    repeated: list[dict] = field(default_factory=list)
 
     @property
     def components(self) -> dict:
         """What the document holds and what was read: counts per block kind, pictures per status, the pictures
         that were not read and the text whose reading stays uncertain (the document is then only partly read),
-        and the font-map record when a font was suspect."""
+        the font-map record when a font was suspect, and the pictures repeated through the document and read
+        once (``repeated_images``)."""
         kinds: dict[str, int] = {}
         images: dict[str, int] = {}
         methods: dict[str, int] = {}
@@ -151,6 +155,8 @@ class ExtractionResult:
             out["uncertain"] = self.uncertain
         if self.fontmap:
             out["fontmap"] = self.fontmap
+        if self.repeated:
+            out["repeated_images"] = self.repeated
         return out
 
     @property
