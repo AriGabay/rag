@@ -5,9 +5,10 @@ One turn:
 1. The model gets the office's policy, a faithful summary of the earlier conversation with its last messages,
    the documents the conversation has been about (with references ``P#`` to the passages earlier answers cited)
    and the new message.
-2. It works with tools (``app.chat.tools``): searches by meaning, opens the context around what it found
-   (paragraphs, the whole section, the whole table), lists documents, and, for computations, reads stored
-   measurements and computes in code. Steps are bounded (``chat_max_steps``) and the turn has a wall clock.
+2. It works with tools (``app.chat.tools``): searches by meaning, reads what it found or any part of a document
+   without a search (the paragraphs around a source, pages, a section from the document's outline, a table, the
+   continuation of a part), lists documents, and, for computations, reads stored measurements and computes in
+   code. Steps are bounded (``chat_max_steps``) and the turn has a wall clock.
 3. It answers in Markdown with citations ``[S#]`` (passages), ``[M#]`` (measurements), ``[C#]`` (computations).
 4. ``app.chat.verify`` checks the answer against what the tools returned: unknown citations, numbers that no
    cited source states, and — through a separate judge call — sentences the cited sources do not support. A
@@ -57,10 +58,19 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
 - חפש לפי משמעות השאלה (search). נסח שאילתות במילים שסביר שיופיעו במסמך, ונסה ניסוח נוסף או מונחים נרדפים אם
   התוצאות חלשות (שומה/חוות דעת, דמ"ש/דמי שכירות, שווי למ"ר/מחיר למ"ר...). כשהשאלה על מסמך מסוים, מצא אותו
   (list_documents) וחפש בתוכו.
-- מקור עם same_as הוא אותו טקסט כמו המקור שהוא מפנה אליו (לא נשלח שוב); מותר לצטט כל אחד מהם. התאם את היקף הקריאה
-  לשאלה: לנתון ממוקד — חיפוש אחד ממוקד בדרך כלל מספיק; פתח הקשר רק כשמשמעות המספר אינה ברורה מהקטע.
+- מקור עם same_as הוא אותו טקסט כמו המקור שהוא מפנה אליו (לא נשלח שוב); מותר לצטט כל אחד מהם. קטעים שכבר הוחזרו
+  בתור לא נשלחים שוב בקריאה חדשה: במקומם מופיעה הפניה ל-S# שבו הם נמצאים, והמקור החדש כולל אותם ומותר לצטט אותו.
+  התאם את היקף הקריאה לשאלה: לנתון ממוקד — חיפוש אחד ממוקד בדרך כלל מספיק; פתח הקשר רק כשמשמעות המספר אינה ברורה
+  מהקטע.
+- קריאה בלי חיפוש (read, מיקום אחד בדיוק): source=S#/P# — ההקשר סביב מקור (קטע מטבלה: הטבלה כולה); outline עם
+  document=D# מחזיר סעיפים (§#) וטבלאות (T#) עם עמודים, גודל ואזורים שלא נקראו, ואז section=§# או table=T#; pages
+  פותח עמודים של מסמך PDF. כל תוצאה מציינת status: complete — נקרא במלואו; clipped — נקרא רק חלק, וההמשך ב-more
+  (read עם cursor=K#); has_unread_regions — יש בו אזורים שלא נקראו, מסומנים במקומם [אזור שלא נקרא R#];
+  uncertain_reading — חלק נקרא בקריאה לא ודאית. אל תציג חלק כאילו הוא הכול.
+- D# הוא קיצור למסמך בכלים בלבד (outline, read pages). בשדות התשובה (document_ids, referenced_document_ids,
+  omitted, focus) כתוב תמיד את ה-document_id המלא.
 - לפני שאתה מציג מספר, ודא מה הוא מתאר: איזה נתון, יחידה, תקופה (לחודש/לשנה), בסיס שטח, מע"מ, ולאיזה נכס הוא
-  מתייחס. אם הקטע קצר מדי — פתח את ההקשר (open_source: neighbors, section או table).
+  מתייחס. אם הקטע קצר מדי — פתח את ההקשר (read: source=S#, או הסעיף §# / הטבלה T# שהתוצאה מציינת).
 - הבחן בין הנכס הנישום, נכסי השוואה, נתוני סקר והיצע, והנחות כלליות. אל תייחס נתון לנכס רק כי הוא מופיע בשומה שלו.
 - אל תערבב סוגי נתונים: שווי, מחיר עסקה, מחיר מבוקש ודמי שכירות שונים זה מזה גם אם כולם ב-₪ למ"ר. אל תסיק מע"מ,
   תקופה או בסיס שטח שלא נכתבו לגבי הערך עצמו. "פלדלת" נשאר "פלדלת". כשהמסמך מציין לגבי הערך בסיס שטח (אקוו',
@@ -89,15 +99,16 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
   הכולל. כשהנתון שבמרכז השיחה הוא ליחידת שטח (למ"ר), "שווי" בתיקון או בשאלת המשך הוא השווי ליחידת שטח של אותו נכס;
   אם יש ספק — הצג אותו, ואת השווי הכולל במשפט נפרד. "זה" = הנתון שבמרכז השיחה. שאלה בנושא חדש — התעלם ממנו. אם יש שתי קריאות שמשנות את התשובה — שאל שאלה קצרה.
 - שאלת המשך: השתמש בהקשר השיחה. תשובות קודמות אינן מקור: כדי להסתמך על מה שנאמר קודם, פתח את ההפניות P# מחדש
-  (open_source) או חפש שוב. אם המשתמש מתקן אותך ("התכוונתי לשווי, לא לשכירות") — עבור למה שביקש ושמור על שאר
+  (read עם source=P#) או חפש שוב. אם המשתמש מתקן אותך ("התכוונתי לשווי, לא לשכירות") — עבור למה שביקש ושמור על שאר
   ההגדרות של השאלה הקודמת (אותו נכס, אותה יחידה: אם נשאלת על ערך למ"ר, התיקון מתייחס לערך למ"ר). אם הוא מחליף
   נושא — אל תגרור תנאים מהנושא הקודם. "זה" בשאלת המשך מתייחס לנתון שבמרכז השאלה והתשובה הקודמות, לא לפרט צדדי.
 - בקש הבהרה (status=clarification) רק כשיש עמימות שמשנה את התשובה ושנובעת מהשאלה ומהמקורות (למשל שני מסמכים
   מתאימים לכתובת שנשאלה). אחרת — ענה עם הסתייגות ברורה.
 - requested: כל נתון שהשאלה ביקשה, עם המסמכים שבהם חיפשת אותו ו-status: found — נמצא; not_found_search — לא נמצא
-  בחיפוש; source_partial — המסמך שבו הוא אמור להיות נקרא חלקית; section_checked_absent — פתחת (open_source: section
-  או table) את הסעיף או הטבלה שבהם הוא אמור להופיע, והוא לא שם (checked_where = ה-S# של מה שפתחת). לפני שאתה
-  קובע "לא מופיע", פתח את הסעיף או הטבלה. כשנתון לא נמצא, השרת פותח את התשובה במשפט שאומר זאת — אל תכתוב אותו
+  בחיפוש; source_partial — המסמך שבו הוא אמור להיות נקרא חלקית; section_checked_absent — פתחת (read: section או
+  table) את הסעיף או הטבלה שבהם הוא אמור להופיע, קראת אותם עד הסוף (status complete; אם clipped — המשך ב-cursor
+  עד שאין more) בלי אזור שלא נקרא, והוא לא שם (checked_where = ה-S# של מה שקראת). לפני שאתה קובע "לא מופיע", קרא
+  את הסעיף או הטבלה עד סופם; השרת בודק זאת, וקריאה חלקית תוצג כ"נקרא רק בחלקו". כשנתון לא נמצא, השרת פותח את התשובה במשפט שאומר זאת — אל תכתוב אותו
   בעצמך. נתון קרוב (למשל שטח בנוי כשנשאלת על שטח מגרש) מותר להציג רק בנפרד ובתיוג מפורש "(נתון אחר)", ולעולם לא
   כאילו הוא הנתון שהתבקש.
 
@@ -267,9 +278,11 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None) -> 
         parts.append("מסמכים שהשיחה עסקה בהם:\n" + "\n".join(
             f"- document_id={d['document_id']} | {prompt_text(d['title'])}" for d in inp.focus_documents))
     if inp.prior_refs and not moved:
-        parts.append("הפניות למקורות שצוטטו בתשובה הקודמת (יש לפתוח מחדש עם open_source לפני שימוש):\n" + "\n".join(
+        parts.append("הפניות למקורות שצוטטו בתשובה הקודמת (יש לפתוח מחדש עם read, source=P#, לפני שימוש):\n"
+                     + "\n".join(
             f"- {pid}: {prompt_text(r.get('title') or '')} — {prompt_text(r.get('location') or '')}"
             + (f" — «{prompt_text(r['excerpt'])}»" if r.get("excerpt") else "")
+            + (" — נקרא בתור הקודם רק בחלקו (הפתיחה מחדש מציעה המשך)" if r.get("resume") else "")
             for pid, r in inp.prior_refs.items()))
     parts.append("ההודעה החדשה של המשתמש:\n" + prompt_text(inp.question))
     if request is not None:
@@ -393,9 +406,15 @@ def _announce(progress: Callable[[str, str], None], call) -> None:
         args = {}
     if call.name == "search":
         progress("search", f"מחפש: {str(args.get('query', ''))[:80]}")
-    elif call.name == "open_source":
-        label = {"neighbors": "קורא את ההקשר", "section": "קורא את הסעיף", "table": "קורא את הטבלה"}
-        progress("read", label.get(args.get("scope"), "קורא מקור"))
+    elif call.name == "read":
+        target = args.get("target") if isinstance(args.get("target"), dict) else {}
+        pages = target.get("pages") if isinstance(target.get("pages"), dict) else None
+        if pages:
+            progress("read", f"קורא עמודים {pages.get('from_page')}–{pages.get('to_page')}")
+        else:
+            label = {"source": "קורא את ההקשר", "section": "קורא את הסעיף", "table": "קורא את הטבלה",
+                     "cursor": "ממשיך לקרוא"}
+            progress("read", next((v for k, v in label.items() if target.get(k)), "קורא מקור"))
     elif call.name == "list_documents":
         progress("documents", "בודק אילו מסמכים זמינים")
     elif call.name == "find_documents":

@@ -16,7 +16,7 @@ from app.providers.llm import CallStatus
 from tests.conftest import login
 from tests.factories import make_group, make_office, make_user
 from tests.integration.test_search import add_chunks
-from tests.support.scripted_agent import ScriptedAgent, call, final
+from tests.support.scripted_agent import ScriptedAgent, call, final, read
 
 pytestmark = pytest.mark.db
 
@@ -156,7 +156,7 @@ def test_follow_up_sees_history_and_reopens_prior_sources_under_current_permissi
     cid = new_conversation(client)
     first_answer = send(client, cid, "מה דמי השכירות הראויים?")
     assert first_answer["status"] == "done", first_answer
-    second = ScriptedAgent([[call("open_source", source_id="P1", scope="neighbors")],
+    second = ScriptedAgent([[read(source="P1")],
                             final("לפי אותו מקור, השווי למ\"ר בנוי ברוטו הוא 9,500 ₪ ללא מע\"מ [S1].")])
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
     m = send(client, cid, "ומה השווי באותה שומה?")
@@ -175,7 +175,7 @@ def test_prior_reference_of_a_deleted_document_is_not_reopened(client, office, m
     cid = new_conversation(client)
     first_answer = send(client, cid, "מה דמי השכירות הראויים?")
     assert client.delete(f"/api/documents/{office.doc}").status_code == 200
-    second = ScriptedAgent([[call("open_source", source_id="P1", scope="neighbors")], final("לא נמצא מקור זמין.", "not_found")])
+    second = ScriptedAgent([[read(source="P1")], final("לא נמצא מקור זמין.", "not_found")])
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
     send(client, cid, "ומה עוד נכתב שם?")
     # the earlier answer rests on a document that is gone: neither its text nor its references reach the model

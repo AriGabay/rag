@@ -33,6 +33,14 @@ export interface ChatSource {
   /** The reading the cited blocks belong to (null: an answer from before readings had ids). Absent on a source
    * that does not come from an answer (the review screen opens the current reading). */
   reading_id?: string | null;
+  /** What a reading tool returned: read in full, clipped (more remains), with unread regions, or with uncertain
+   * reading. Absent on a search passage. */
+  status?: "complete" | "clipped" | "has_unread_regions" | "uncertain_reading" | null;
+  clipped?: boolean;
+  /** How many regions inside it were not read. */
+  unread_regions?: number;
+  /** Where a clipped source continues (server-side position; a later turn reopens it from there). */
+  more?: { target: (string | number | string[])[]; pos: number | number[] } | null;
 }
 
 export interface ChatMeasurement {
@@ -156,6 +164,8 @@ export interface ChatAnswer {
     label: string;
     status: "found" | "not_found_search" | "source_partial" | "section_checked_absent";
     section: string | null;
+    /** Why a section claimed absent counts only as read in part: clipped, or with a region not read. */
+    partial_reason?: "clipped" | "unread" | null;
   }[];
   steps?: number;
   hidden?: boolean;

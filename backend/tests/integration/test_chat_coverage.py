@@ -19,7 +19,7 @@ from app.platform import pipeline
 from tests.conftest import login
 from tests.factories import make_document, make_group, make_office, make_user
 from tests.integration.test_chat import cloud, new_conversation, send
-from tests.support.scripted_agent import ScriptedAgent, call, final
+from tests.support.scripted_agent import ScriptedAgent, call, final, read
 
 pytestmark = pytest.mark.db
 
@@ -309,8 +309,9 @@ def test_open_table_states_its_size(setup):
     ws = T.Workspace(ctx=setup.ctx())
     out = T.tool_search(ws, "רחוב הדגמה 4", [doc])
     sid = re.search(r'<source id="(S\d+)"', out).group(1)
-    table = T.tool_open_source(ws, sid, "table")
+    table = T.tool_read(ws, {"source": sid})  # a row's source opens its whole table
     assert "הטבלה: 9 שורות; ערכים מספריים לפי עמודה:" in table and "שכ\"ד למ\"ר 9" in table
+    assert 'kind="table"' in table and 'status="complete"' in table and "רחוב הדגמה 9 |" in table
 
 
 # --- reading levels and the dedup key ----------------------------------------------------------------------------
@@ -327,19 +328,28 @@ def _long_section(office) -> tuple[str, object]:
     return str(doc), ver
 
 
-def test_a_section_opened_after_the_paragraphs_around_the_same_place_is_sent_in_full(setup):
+def test_a_section_opened_after_the_paragraphs_around_the_same_place_sends_only_what_is_new(setup):
     doc, ver = _long_section(setup)
     ws = T.Workspace(ctx=setup.ctx())
     ws.add_source(document_id=doc, version_id=ver, title="שומה רחוב השיטה 5", section="תיאור הנכס",
                   location="סעיף", kind="text", text="פסקה 4", block_start=5, block_end=5)
-    near = T.tool_open_source(ws, "S1", "neighbors")
-    assert "קוצר" in near and ws.activity[doc]["read"] is False
-    section = T.tool_open_source(ws, "S1", "section")
-    assert "same_as" not in section and "פסקה 7" in section and "קוצר" not in section
+    near = T.tool_read(ws, {"source": "S1"})
+    assert 'status="clipped"' in near and ws.activity[doc]["read"] is False
+    handle = re.search(r"(§\d+) «תיאור הנכס»", near).group(1)
+    assert f'more="{handle}"' in near  # the paragraphs around it read on as its section
+    section = T.tool_read(ws, {"section": handle})
+    assert "same_as" not in section and "פסקה 6:" in section and "כבר הוחזרו בתור הזה ב-S2" in section
+    assert "פסקה 4:" not in section and "פסקה 4:" in ws.sources["S3"].text  # the source keeps the full text
+    assert 'status="clipped"' in section and "פסקה 7:" not in section
+    rest = T.tool_read(ws, {"cursor": re.search(r'more="(K\d+)"', section).group(1)})
+    assert 'status="complete"' in rest and "פסקה 7:" in rest and "פסקה 6:" not in rest
     a = ws.activity[doc]
-    assert a["read"] is True and a["openings"] == [{"sid": "S3", "scope": "section", "name": "תיאור הנכס"}]
+    target = ("section", str(ver), ("תיאור הנכס",))
+    assert a["read"] is True and a["read_complete"] is True
+    assert a["openings"] == [{"sid": sid, "scope": "section", "name": "תיאור הנכס", "target": target}
+                             for sid in ("S3", "S4")]
     # the same section opened again is a reference to the first
-    assert 'same_as="S3"' in T.tool_open_source(ws, "S1", "section")
+    assert 'same_as="S3"' in T.tool_read(ws, {"section": handle})
 
 
 def test_a_section_opened_from_a_sub_section_reads_its_whole_top_level_section(setup):
@@ -362,8 +372,14 @@ def test_a_section_opened_from_a_sub_section_reads_its_whole_top_level_section(s
     ws = T.Workspace(ctx=setup.ctx())
     ws.add_source(document_id=str(doc), version_id=ver, title="שומה רחוב הצאלון 2", section="3.1 הבניין",
                   location="עמוד 2", kind="text", text="הבניין בן ארבע קומות.", block_start=2, block_end=2)
-    section = T.tool_open_source(ws, "S1", "section")
-    assert "הדירה בקומה השנייה." in section and "3.1 הבניין" in section and "990,000" not in section
+    near = T.tool_read(ws, {"source": "S1"})
+    top, sub = re.search(r"בסעיף: (§\d+) «3\. תיאור הנכס» / (§\d+) «3\.1 הבניין»", near).groups()
+    T.tool_read(ws, {"section": top})
+    whole = ws.sources["S3"]
+    assert "3.1 הבניין" in whole.text and "הדירה בקומה השנייה." in whole.text and "990,000" not in whole.text
+    assert (whole.block_start, whole.block_end) == (0, 4)
+    T.tool_read(ws, {"section": sub})  # a sub-section is its own part
+    assert "הבניין בן ארבע קומות." in ws.sources["S4"].text and "הדירה" not in ws.sources["S4"].text
 
 
 def test_a_table_answer_states_the_rows_it_presented(client, setup, monkeypatch):
@@ -378,7 +394,7 @@ def test_a_table_answer_states_the_rows_it_presented(client, setup, monkeypatch)
     a, _ = _ask(client, setup, monkeypatch, [
         [call("find_documents", query="סקר היצע משרדים", page=None)],
         [call("search", query="רחוב הדגמה 4", document_ids=[doc], limit=None)],
-        lambda items: [call("open_source", source_id=_source_of(items, doc), scope="table")],
+        lambda items: [read(source=_source_of(items, doc))],
         answer], question="מה שכר הדירה בסקר ההיצע?")
     (table,) = a["ledger"]["tables"]
     assert table["rows"] == 9 and table["presented"] == 2
@@ -409,7 +425,8 @@ def test_a_missing_datum_is_said_first_with_the_section_that_was_checked(client,
     doc = _described_property(setup)
     a, _ = _ask(client, setup, monkeypatch, [
         [call("search", query="שטח המגרש", document_ids=[doc], limit=None)],
-        [call("open_source", source_id="S1", scope="section")],
+        [call("outline", document=doc)],
+        lambda items: [read(section=re.search(r"(§\d+) «תיאור הנכס»", items[-1]["output"]).group(1))],
         final("השטח הבנוי (נתון אחר) הוא 184 מ\"ר [S2].", documents=[doc],
               requested=[{"label": "שטח המגרש", "document_ids": [doc], "status": "section_checked_absent",
                           "checked_where": "S2"}])], question="מה שטח המגרש באשל 9?")

@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Respon
 from sqlalchemy import Connection, text
 
 from app.audit import audit
+from app.chat import reader
 from app.config import get_settings
 from app.db import TenantContext, bump_data_version, tenant_tx
 from app.deps import FORBIDDEN, NOT_FOUND, get_ctx, parse_uuid
@@ -385,12 +386,8 @@ _MEDIA_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "
 
 
 def _version_row(conn: Connection, doc_uuid: UUID, ver_uuid: UUID):
-    row = conn.execute(
-        text("SELECT v.id, v.storage_key, v.mime_type, v.filename, v.is_current, v.page_count, d.title,"
-             " v.ingestion->>'reading_id' AS reading_id FROM document_versions v"
-             " JOIN documents d ON d.id = v.document_id WHERE v.id = :v AND d.id = :d AND d.deleted_at IS NULL"),
-        {"v": ver_uuid, "d": doc_uuid},
-    ).first()
+    """The version through the reader (``app.chat.reader``): visible, of this document, not deleted; else 404."""
+    row = reader.version(conn, ver_uuid, doc_uuid)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
     return row
@@ -415,17 +412,10 @@ def get_blocks(document_id: str, version_id: str, start: int | None = Query(None
                     "is_current": v.is_current, "mime_type": v.mime_type, "total": 0, "blocks": [],
                     "reading_id": v.reading_id, "stale": True,
                     "file_url": f"/api/documents/{document_id}/versions/{version_id}/file"}
-        params: dict = {"v": ver_uuid, "a": start if start is not None else 0,
-                        "b": end if end is not None else 1_000_000}
-        rows = conn.execute(text(
-            "SELECT block_index, kind, section, section_path, label, paragraph_no, page, media, source, status, note,"
-            " table_index, text, bbox, method, reader_version, content_hash, original_text FROM document_blocks"
-            " WHERE version_id = :v AND block_index BETWEEN :a AND :b"
-            f" ORDER BY block_index LIMIT {BLOCKS_MAX}"), params).all()
-        tables = {r.table_index: r.structure for r in conn.execute(text(
-            "SELECT table_index, structure FROM extracted_tables WHERE version_id = :v"), {"v": ver_uuid})}
-        total = conn.execute(text("SELECT count(*) FROM document_blocks WHERE version_id = :v"),
-                             {"v": ver_uuid}).scalar_one()
+        # the same reader the agent's ``read`` uses, so a citation opens exactly what the model read (KTD8)
+        rows = reader.blocks_between(conn, ver_uuid, start, end, BLOCKS_MAX)
+        tables = reader.tables_of(conn, ver_uuid)
+        total = reader.block_count(conn, ver_uuid)
         audit(conn, "source_view", ctx.user_id, "document_version", ver_uuid)
     blocks = []
     for r in rows:

@@ -18,6 +18,14 @@ def call(name: str, **arguments) -> dict:
     return {"call": name, "arguments": arguments}
 
 
+LOCATORS = ("source", "pages", "section", "table", "cursor")
+
+
+def read(**locator) -> dict:
+    """A ``read`` call with one locator given and the others null, as the strict schema has the model send it."""
+    return call("read", target={k: locator.get(k) for k in LOCATORS})
+
+
 def final(markdown: str, status: str = "answered", claims: list | None = None, clarification: str = "",
           missing: str = "", documents: list[str] | None = None, scope: str = "focused", scope_query: str = "",
           omitted: list | None = None, focus: dict | None = None, requested: list | None = None) -> dict:

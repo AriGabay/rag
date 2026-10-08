@@ -323,10 +323,12 @@ class Fetcher:
         if src is None:
             return []
         out = []
-        whole_table = src.kind == "table" and src.chunk_id is None and src.table_index is not None
+        # a part of a table read in parts (``read``) is not the whole table
+        whole_table = (src.kind == "table" and src.chunk_id is None and src.table_index is not None
+                       and not src.table_part)
         if src.table_index is not None and not whole_table:
             table = self._read(("x", str(src.version_id), src.table_index, src.block_start, src.block_end, "table"),
-                               lambda: read_scope(self.ws, sid, "table", quiet=True))
+                               lambda: read_scope(self.ws, sid, "table"))
             if table is not None:
                 out.append(table)
         anchor = src if src.block_start is not None else next((x for x in out if x.block_start is not None), None)
@@ -334,7 +336,7 @@ class Fetcher:
             ref = {"version_id": anchor.version_id, "block_start": anchor.block_start, "block_end": anchor.block_end,
                    "table_index": anchor.table_index, "chunk_id": None}
             section = self._read(("x", str(src.version_id), None, anchor.block_start, anchor.block_end, "section"),
-                                 lambda: read_scope(self.ws, sid, "section", quiet=True, ref=ref))
+                                 lambda: read_scope(self.ws, sid, "section", ref=ref))
             if section is not None:
                 out.append(section)
         return [x for x in out if len(x.text) > len(src.text)]

@@ -337,7 +337,7 @@ def test_a_reference_to_an_earlier_reading_is_stale_and_opens_nothing(office, cl
     assert src.public()["reading_id"] == old  # an answer's sources keep the reading they were read from
     prior = {"version_id": str(office.version), "block_start": 0, "block_end": 0, "table_index": None,
              "chunk_id": None, "reading_id": old}
-    assert "שווי" in T.tool_open_source(T.Workspace(ctx=office.ctx(), prior={"P1": prior}), "P1")
+    assert "שווי" in T.tool_read(T.Workspace(ctx=office.ctx(), prior={"P1": prior}), {"source": "P1"})
     blocks = client.get(f"/api/documents/{office.document}/versions/{office.version}/blocks",
                         params={"start": 0, "end": 2, "reading_id": old}).json()
     assert blocks["stale"] is False and blocks["reading_id"] == old and blocks["blocks"]
@@ -346,11 +346,11 @@ def test_a_reference_to_an_earlier_reading_is_stale_and_opens_nothing(office, cl
     reprocess(office)
 
     with pytest.raises(T.ToolError, match="קריאה קודמת"):
-        T.tool_open_source(T.Workspace(ctx=office.ctx(), prior={"P1": prior}), "P1")
+        T.tool_read(T.Workspace(ctx=office.ctx(), prior={"P1": prior}), {"source": "P1"})
     with pytest.raises(T.ToolError, match="קריאה קודמת"):  # an answer stored before reading ids: stale as well
-        T.tool_open_source(T.Workspace(ctx=office.ctx(), prior={"P1": prior | {"reading_id": None}}), "P1")
+        T.tool_read(T.Workspace(ctx=office.ctx(), prior={"P1": prior | {"reading_id": None}}), {"source": "P1"})
     with pytest.raises(T.ToolError, match="קריאה קודמת"):  # a source of this turn read before the swap
-        T.tool_open_source(ws, src.sid)
+        T.tool_read(ws, {"source": src.sid})
     for stale in (old, "none"):
         body = client.get(f"/api/documents/{office.document}/versions/{office.version}/blocks",
                           params={"start": 0, "end": 2, "reading_id": stale}).json()

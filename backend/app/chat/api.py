@@ -513,7 +513,10 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
                           "chunk_id": s.get("chunk_id"), "title": s.get("title"), "location": s.get("location"),
                           "excerpt": " ".join((s.get("text") or "").split())[:160],
                           # the reading it was read from; an answer from before reading ids has none (KTD7)
-                          "reading_id": s.get("reading_id")}
+                          "reading_id": s.get("reading_id"),
+                          # where a source read only in part continues (``tools._target_json``): reopening it
+                          # offers the continuation, checked against the same reading
+                          "resume": s.get("more") if isinstance(s.get("more"), dict) else None}
     # the last answer's focus, or, when it named no datum, the request it answered (``app.chat.resolve``); its
     # message is in ``rows`` only while every document it names is visible
     last_focus = None

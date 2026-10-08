@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+from app.chat.tools import READ_TO_END
 from app.db import tenant_tx
 
 if TYPE_CHECKING:
@@ -87,34 +88,57 @@ def _names(docs: list[dict]) -> str:
 
 
 def validate_requested(ws: Workspace, requested) -> list[dict]:
-    """Each requested datum with the status the turn's actions support. "The section was checked" needs a section
-    or table of one of its documents opened this turn and named in ``checked_where`` (a measurements listing is
-    not a reading of the section); "read in part" needs one of its documents read in part. An unsupported status
-    falls to the strongest one the turn does support, down to "not found in the search"."""
+    """Each requested datum with the status the turn's actions support. "The section was checked" needs a section,
+    table or page range of one of its documents opened this turn and named in ``checked_where`` (a measurements
+    listing is not a reading of the section), read to its end with no unread region in it (R12): one read only in
+    part — clipped and not continued to the end, or with a region that was not read — supports only "the source was
+    read in part" (``partial_reason``: ``clipped`` or ``unread``). "Read in part" otherwise needs one of its
+    documents read in part. An unsupported status falls to the strongest one the turn does support, down to "not
+    found in the search"."""
     out = []
     for r in requested or []:
         docs = [d for d in r.document_ids if d in ws.activity]
         openings = {o["sid"]: o for d in docs for o in ws.activity[d]["openings"]}
-        status, where = r.status, None
+        status, where, reason = r.status, None, None
         if status == "section_checked_absent":
             where = openings.get((r.checked_where or "").strip())
             if where is None:
                 status = "source_partial"
-        if status == "source_partial" and not any(ws.activity[d]["partial"] for d in docs):
+            elif ws.read_complete(where.get("target")) is False:
+                st = ws.reads[where["target"]]
+                status, reason = "source_partial", "unread" if st["to"] == READ_TO_END else "clipped"
+        if status == "source_partial" and reason is None and not any(ws.activity[d]["partial"] for d in docs):
             status = "not_found_search"
         partial = next((ws.activity[d]["title"] for d in docs if ws.activity[d]["partial"]), None)
         out.append({"label": r.label.strip(), "document_ids": docs, "status": status, "claimed": r.status,
                     "checked_where": where["sid"] if where else None, "section": where["name"] if where else None,
-                    "scope": where["scope"] if where else None, "partial_document": partial})
+                    "scope": where["scope"] if where else None, "partial_document": partial,
+                    "partial_reason": reason})
     return out
+
+
+def _place(r: dict) -> tuple[str, str, str]:
+    """Where a datum was looked for: (in it, of it, what it is) — "בסעיף "X"", "מהסעיף "X"", "הסעיף"."""
+    scope, name = r.get("scope") or "section", r.get("section") or ""
+    if scope == "pages":
+        return f"ב{name}", f"מ{name}", "הטווח"
+    if scope == "table":
+        return f"בטבלה \"{name}\"", f"מהטבלה \"{name}\"", "הטבלה"
+    return f"בסעיף \"{name}\"", f"מהסעיף \"{name}\"", "הסעיף"
 
 
 def absence_sentence(r: dict) -> str | None:
     """The opening sentence for a datum that was not found, at the level the turn checked."""
     label = r["label"]
+    in_it, of_it, what = _place(r)
     if r["status"] == "section_checked_absent":
-        place = "בטבלה" if r["scope"] == "table" else "בסעיף"
-        return f"**{label}** לא מופיע {place} \"{r['section']}\" שנבדק [{r['checked_where']}]."
+        return f"**{label}** לא מופיע {in_it} שנבדק [{r['checked_where']}]."
+    if r["status"] == "source_partial" and r.get("partial_reason") == "clipped":
+        return (f"**{label}** לא נמצא בחלק שנקרא {of_it}: {what} נקרא רק בחלקו, ולכן ייתכן שהנתון מופיע בחלק שלא "
+                "נקרא.")
+    if r["status"] == "source_partial" and r.get("partial_reason") == "unread":
+        return (f"**{label}** לא נמצא {in_it}, אבל יש בו אזורים שלא נקראו (תמונה או טבלה), ולכן ייתכן שהנתון "
+                "מופיע בהם.")
     if r["status"] == "source_partial":
         return (f"**{label}** לא נמצא. המסמך \"{r['partial_document']}\" נקרא חלקית (חלק מהתמונות או העמודים לא "
                 "נקראו), ולכן ייתכן שהנתון מופיע בחלק שלא נקרא.")
