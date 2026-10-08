@@ -14,13 +14,13 @@ of a bounded size with the exact position where the next part starts.
 
 from __future__ import annotations
 
+from collections.abc import Collection, Container
 from dataclasses import dataclass, field
 from uuid import UUID
 
 from sqlalchemy import Connection, text
 
 SECTION_CHARS = 3500  # a part of a section or a page range (KTD12)
-TABLE_ROWS = 40  # rows in a part of a table
 WINDOW_MAX = 400  # blocks in one window of the source panel
 MARKER_CHARS = 80  # what a region marker costs in a part, whatever its text
 UNREAD = "unread"
@@ -92,24 +92,28 @@ def block_count(conn: Connection, version_id: UUID) -> int:
                         {"v": version_id}).scalar_one()
 
 
-def blocks_on_pages(conn: Connection, version_id: UUID, first: int, last: int) -> list:
-    """The blocks of a page range, in reading order."""
+def _from(from_block: int | None) -> str:
+    return " AND block_index >= :from" if from_block is not None else ""
+
+
+def blocks_on_pages(conn: Connection, version_id: UUID, first: int, last: int, from_block: int | None = None) -> list:
+    """The blocks of a page range, in reading order (from block ``from_block`` when given)."""
     return conn.execute(text(
         f"SELECT {BLOCK_COLS} FROM document_blocks WHERE version_id = :v AND page BETWEEN :a AND :b"
-        " ORDER BY block_index"), {"v": version_id, "a": first, "b": last}).all()
+        f"{_from(from_block)} ORDER BY block_index"), {"v": version_id, "a": first, "b": last, "from": from_block}).all()
 
 
-def blocks_in_section(conn: Connection, version_id: UUID, path: tuple[str, ...]) -> list:
-    """The blocks of a section, its sub-sections included: every block whose section path starts with ``path``.
-    The empty path is the part before the first heading."""
+def blocks_in_section(conn: Connection, version_id: UUID, path: tuple[str, ...], from_block: int | None = None) -> list:
+    """The blocks of a section, its sub-sections included: every block whose section path starts with ``path``
+    (from block ``from_block`` when given). The empty path is the part before the first heading."""
     if not path:
         return conn.execute(text(
             f"SELECT {BLOCK_COLS} FROM document_blocks WHERE version_id = :v AND cardinality(section_path) = 0"
-            " ORDER BY block_index"), {"v": version_id}).all()
+            f"{_from(from_block)} ORDER BY block_index"), {"v": version_id, "from": from_block}).all()
     return conn.execute(text(
         f"SELECT {BLOCK_COLS} FROM document_blocks WHERE version_id = :v"
-        f" AND section_path[1:{len(path)}] = CAST(:p AS text[]) ORDER BY block_index"),
-        {"v": version_id, "p": list(path)}).all()
+        f" AND section_path[1:{len(path)}] = CAST(:p AS text[]){_from(from_block)} ORDER BY block_index"),
+        {"v": version_id, "p": list(path), "from": from_block}).all()
 
 
 def section_path_of(conn: Connection, version_id: UUID, block_index: int) -> tuple[str, ...]:
@@ -124,10 +128,12 @@ def table_structure(conn: Connection, version_id: UUID, table_index: int) -> dic
     return (row.structure or {}) if row else None
 
 
-def tables_of(conn: Connection, version_id: UUID) -> dict[int, dict]:
+def tables_of(conn: Connection, version_id: UUID, indexes: Collection[int] | None = None) -> dict[int, dict]:
+    """A version's tables by index (only those of ``indexes`` when given)."""
     return {r.table_index: (r.structure or {}) for r in conn.execute(text(
-        "SELECT table_index, structure FROM extracted_tables WHERE version_id = :v ORDER BY table_index"),
-        {"v": version_id})}
+        "SELECT table_index, structure FROM extracted_tables WHERE version_id = :v"
+        + (" AND table_index = ANY(:t)" if indexes is not None else "") + " ORDER BY table_index"),
+        {"v": version_id, "t": list(indexes) if indexes is not None else None})}
 
 
 def table_block(conn: Connection, version_id: UUID, table_index: int):
@@ -201,7 +207,8 @@ class Part:
     next: Position | None
 
 
-def take(rows: list, pos: Position | None = None, chars: int = SECTION_CHARS, sent: set[int] | None = None) -> Part:
+def take(rows: list, pos: Position | None = None, chars: int = SECTION_CHARS, sent: Container[int] | None = None
+         ) -> Part:
     """From ``pos`` (None: the window's beginning) as many whole blocks as fit in ``chars``; a single block longer
     than that is cut at a word boundary and continued from there. Never an empty part while blocks remain. A block
     in ``sent`` (already returned whole to the reader) costs nothing: it is sent as a pointer."""

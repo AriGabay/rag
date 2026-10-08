@@ -7,9 +7,8 @@ import { B, Dialog, ErrorAlert, Notice, StatusBadge } from "@/components/ui";
 import { UploadPanel, UploadResults } from "@/components/UploadPanel";
 import { api, errorMessage, fileUrl } from "@/lib/api";
 import { useApi, useInterval } from "@/lib/useApi";
-import { formatTimestamp, VERSION_STATUS_LABEL } from "@/lib/format";
+import { BLOCK_KIND_LABEL, formatTimestamp, VERSION_STATUS_LABEL } from "@/lib/format";
 import type {
-  CoverageRegion,
   DocumentDetail,
   DocumentSummary,
   PageCoverage,
@@ -53,13 +52,6 @@ const MEASURE_STATE: Record<string, string> = {
   pending: "בתהליך",
 };
 
-const REGION_KIND: Record<CoverageRegion["kind"], string> = {
-  image: "תמונה",
-  table: "טבלה",
-  paragraph: "פסקה",
-  heading: "כותרת",
-  textbox: "תיבת טקסט",
-};
 const REGION_STATUS: Record<RegionStatus, string> = {
   unread: "לא נקרא",
   read_uncertain: "נקרא בקריאה לא ודאית",
@@ -82,7 +74,7 @@ function PageCoverageItem({ p }: { p: PageCoverage }) {
         <ul>
           {p.regions.map((g, i) => (
             <li key={g.block ?? `r${i}`}>
-              {REGION_KIND[g.kind] ?? g.kind} – {REGION_STATUS[g.status] ?? g.status}
+              {BLOCK_KIND_LABEL[g.kind] ?? g.kind} – {REGION_STATUS[g.status] ?? g.status}
               {g.section && (
                 <span className="muted">
                   {" "}

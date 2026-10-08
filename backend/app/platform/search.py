@@ -434,20 +434,29 @@ def documents_named(conn: Connection, query: str, scope: SearchScope | None = No
     if not forms:
         return []
     many_titles = max(2, NAMING_DF_SHARE * len(docs))
-    alpha = {w: f for w, f in forms.items() if not w.isdigit()}
-    n, text_df = _text_document_frequency(conn, alpha) if alpha else (0, {})
-    trade = {w for w, f in forms.items() if max(df[x] for x in f) > many_titles
-             or text_df.get(w, 0) > NAMING_DF_SHARE * n}
     allowed = set(scope.document_ids) if scope and scope.document_ids else None
-    named = []
-    for i, ws in words_of.items():
-        if allowed is not None and i not in allowed:
-            continue
-        hit = {w for w, f in forms.items() if w not in trade and f & ws}
-        distinctive = {w for w in hit if min(df[x] for x in forms[w] & ws) <= 2}
-        if len(hit) >= 2 and any(not w.isdigit() for w in hit) and (
-                any(w.isdigit() for w in hit) or len(distinctive) >= 2):
-            named.append((len(distinctive), len(hit), i, hit))
+
+    def naming(trade: set[str], ids) -> list[tuple]:
+        out = []
+        for i in ids:
+            ws = words_of[i]
+            hit = {w for w, f in forms.items() if w not in trade and f & ws}
+            distinctive = {w for w in hit if min(df[x] for x in forms[w] & ws) <= 2}
+            if len(hit) >= 2 and any(not w.isdigit() for w in hit) and (
+                    any(w.isdigit() for w in hit) or len(distinctive) >= 2):
+                out.append((len(distinctive), len(hit), i, hit))
+        return out
+
+    # the documents the titles alone name; a word of the trade by the text can only remove words, so the text's
+    # frequencies are read only for the words of these candidates (and not at all when there is none)
+    trade = {w for w, f in forms.items() if max(df[x] for x in f) > many_titles}
+    candidates = naming(trade, [i for i in words_of if allowed is None or i in allowed])
+    if not candidates:
+        return []
+    alpha = {w: forms[w] for _, _, _, hit in candidates for w in hit if not w.isdigit()}
+    n, text_df = _text_document_frequency(conn, alpha)
+    trade |= {w for w in alpha if text_df.get(w, 0) > NAMING_DF_SHARE * n}
+    named = naming(trade, [i for _, _, i, _ in candidates])
     named.sort(key=lambda x: (-x[0], -x[1]))
     if not named or len(named) > 2:
         return []

@@ -180,7 +180,7 @@ NEAR_LIMIT_NOTICE = """נותרו שני צעדים אחרונים עם כלים
 חישוב: רשום עכשיו, באותו צעד, את כל הערכים וההנחות שעוד חסרים (take_value, assume), וקרא ל-calculate לכל המאוחר
 בצעד הבא. אם כבר יש בידך מה שצריך — ענה עכשיו."""
 NEAR_LIMIT_STEPS = 2  # tool steps left (this one included) when ``NEAR_LIMIT_NOTICE`` is appended
-STEP_LIMIT, TIME_LIMIT = "step_limit", "time_limit"
+STEP_LIMIT, TIME_LIMIT = "step_limit", T.TIME_LIMIT
 LIMIT_WHY = {
     T.TOOL_BUDGET: "הגעת למגבלת היקף הקריאה לשאלה אחת (כמות הטקסט שהכלים מחזירים)",
     STEP_LIMIT: "הגעת למספר הצעדים המרבי לשאלה אחת",
@@ -394,7 +394,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     read_until = deadline - settings.chat_verify_reserve_seconds
     repairs = max(0, min(2, settings.chat_repair_rounds))
     ws = T.Workspace(ctx=ctx, prior=dict(inp.prior_refs), usage=usage,  # inspect's vision calls join the turn's usage
-                     tool_budget=settings.chat_tool_output_chars or None)
+                     tool_budget=settings.chat_tool_output_chars or None, read_until=read_until)
     # what the user wrote, as this turn sees it: an assumption (A#) quotes it, never an answer or a document
     users = [m.content for m in inp.history if m.role == "user"]
     ws.user_messages = [{"turn": n + 1, "text": t, "current": False} for n, t in enumerate(users)] + [
@@ -436,7 +436,9 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         # each repair round still to come keeps one step of the bound
         bound = max(1, settings.chat_max_steps - (repairs - attempt))
         reason = (T.TOOL_BUDGET if ws.budget_spent else STEP_LIMIT if steps >= bound
-                  else TIME_LIMIT if (now >= read_until if attempt == 0 else left < FINAL_STEP_SECONDS) else None)
+                  # an inspection refused for lack of time (``TIME_LIMIT`` in limits) ends the reading too
+                  else TIME_LIMIT if ((now >= read_until or TIME_LIMIT in limits) if attempt == 0
+                                      else left < FINAL_STEP_SECONDS) else None)
         last = reason is not None or attempt == 2
         if last and attempt == 0:
             if reason not in limits:

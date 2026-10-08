@@ -99,6 +99,21 @@ def test_client_options():
     assert client_options(Purpose.INTERPRET, time.monotonic()) is None
 
 
+def test_a_picture_call_takes_the_deadline_and_ingestion_calls_keep_their_timeout_and_retries():
+    """``inspect`` passes the turn's reading deadline through the vision reader; ingestion passes none."""
+    from app.extraction.vision import ModelVisionReader
+
+    client = Recorder()
+    reader = ModelVisionReader.__new__(ModelVisionReader)
+    reader.provider, reader.usage = OpenAIProvider("test-key-not-real", "m", client=client), []
+    for deadline in (time.monotonic() + 5, None):
+        with pytest.raises(RuntimeError):
+            reader.read(b"\x89PNG", "", deadline=deadline)
+    assert len(client.options) == 2 and client.options[0]["max_retries"] == 0
+    assert 3 < client.options[0]["timeout"] <= 5
+    assert client.options[1] == {"timeout": timeout_for(Purpose.VISION)}
+
+
 class Kw:
     """A provider that records the keyword arguments of each structured call."""
 

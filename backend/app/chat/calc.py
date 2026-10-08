@@ -40,7 +40,7 @@ from decimal import ROUND_HALF_UP, Context, Decimal, InvalidOperation, localcont
 from typing import Any
 from uuid import UUID
 
-from app.measurements.extract import PERIOD_LABELS, UNIT_LABELS
+from app.measurements.extract import PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
 
 MAX_EXPRESSION = 4000  # characters (an aggregate may name a few hundred measurements)
 MAX_TOKENS = 1000
@@ -376,11 +376,13 @@ def ids_of(node) -> list[str]:
 
 # --- evaluation ------------------------------------------------------------------------------------------------
 
+_KNOWN_UNITS = {dims_of(k): v for k, v in UNIT_LABELS.items() if k in UNIT_DIMS and k not in ("other",)}
+
+
 def unit_label(dims: Dims, period: str | None = None) -> str:
     """₪, ₪ למ״ר, מ״ר, % ... for dimensions, with the period."""
-    known = {dims_of(k): v for k, v in UNIT_LABELS.items() if k in UNIT_DIMS and k not in ("other",)}
-    if dims in known:
-        label = known[dims]
+    if dims in _KNOWN_UNITS:
+        label = _KNOWN_UNITS[dims]
     else:
         num = " × ".join(_DIM_LABELS.get(d, d) + (f"^{e}" if e > 1 else "") for d, e in dims if e > 0)
         den = " × ".join(_DIM_LABELS.get(d, d) + (f"^{-e}" if e < -1 else "") for d, e in dims if e < 0)
@@ -489,7 +491,7 @@ class _Eval:
                 raise CalcError(MSG_RECURRING.format(ids=ids))
         vats = {o.vat for o in items if o.vat is not None}
         if len(vats) > 1:
-            self.need("מע״מ: " + " מול ".join(sorted(_VAT_TEXT[v] for v in vats)))
+            self.need("מע״מ: " + " מול ".join(sorted(VAT_LABELS[v] for v in vats)))
         if _area(first.dims) and len({o.basis for o in items}) > 1:
             self.need("בסיס שטח: " + " מול ".join(sorted(o.basis or "לא צוין" for o in {o.basis: o for o in items}.values())))
 
@@ -620,7 +622,7 @@ class _Eval:
                 period = pa or pb
         # VAT: two money amounts with different VAT statuses
         if "ILS" in dict(a.dims) and "ILS" in dict(b.dims) and a.vat and b.vat and a.vat != b.vat:
-            self.need("מע״מ: " + " מול ".join(sorted({_VAT_TEXT[a.vat], _VAT_TEXT[b.vat]})))
+            self.need("מע״מ: " + " מול ".join(sorted({VAT_LABELS[a.vat], VAT_LABELS[b.vat]})))
         vat = (a.vat if "ILS" in dict(a.dims) else b.vat) if "ILS" in dict(dims) else None
         value = _value(a) * _value(b) if op == "*" else _value(a) / _value(b)
         kind = self._kind(op, a, b, dims)
@@ -640,16 +642,13 @@ class _Eval:
                 if x.kind in PER_AREA_BASE and _area(y.dims) and not _area(dims):
                     return PER_AREA_BASE[x.kind]
             return None
-        if dims == () and a.dims != ():
-            return "ratio"
+        if dims == () and (a.dims != () or b.kind == "count"):
+            return "ratio"  # a share: of two quantities of one unit, or of a count
         if b.dims == ():
             return a.kind
         if "ILS" in dict(a.dims) and _area(b.dims) and a.kind in BASE_PER_AREA:
             return BASE_PER_AREA[a.kind]
         return None
-
-
-_VAT_TEXT = {"included": "כולל מע״מ", "excluded": "ללא מע״מ", "unknown": "מע״מ לא צוין"}
 
 
 def _value(o: Operand) -> Decimal:
@@ -689,17 +688,18 @@ def fmt(value: Decimal, places: int = 2) -> str:
     return s.rstrip("0").rstrip(".") if "." in s else s
 
 
-def display(value: Decimal, dims: Dims) -> dict:
-    """The forms a result is shown in: the value, and a percentage for a ratio or a percent."""
+def display(value: Decimal, dims: Dims, kind: str | None = None) -> dict:
+    """The forms a result is shown in: the value, and a percentage for a ratio or a percent (a count, also
+    dimensionless, is a number of values and has none)."""
     out = {"value": fmt(value)}
-    if dims == ():
+    if dims == () and kind != "count":
         out["percent"] = fmt(value * 100) + "%"
     elif dims == (("%", 1),):
         out["percent"] = fmt(value) + "%"
     return out
 
 
-def display_matches(written: str, percent: bool, value: Decimal, dims: Dims) -> bool:
+def display_matches(written: str, percent: bool, value: Decimal, dims: Dims, kind: str | None = None) -> bool:
     """Whether a number shown in an answer (as written, with a % sign after it or not) is the full value rounded to
     the precision it shows: 14.3% is 0.143155…, 14.30% and 14.4% are not."""
     raw = written.replace(",", "").strip()
@@ -709,7 +709,7 @@ def display_matches(written: str, percent: bool, value: Decimal, dims: Dims) -> 
         return False
     places = len(raw.split(".", 1)[1]) if "." in raw else 0
     candidates = []
-    if percent and dims == ():
+    if percent and dims == () and kind != "count":
         candidates.append(value * 100)
     if not percent or dims == (("%", 1),):
         candidates.append(value)
@@ -831,7 +831,7 @@ class Computation:
         return unit_label(self.dims, self.outcome.period)
 
     def display(self) -> dict:
-        return display(self.value, self.dims)
+        return display(self.value, self.dims, self.outcome.kind)
 
     def public(self) -> dict:
         return {"id": self.cid, "label": self.label, "expression": self.expression, "formula": self.formula,

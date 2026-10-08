@@ -3,6 +3,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { ApiError, chatApi, errorMessage, isAbortError, safeApiUrl } from "@/lib/api";
 import type { ChatSource, SourceBlock, SourceBlocks } from "@/lib/chatTypes";
+import { BLOCK_KIND_LABEL } from "@/lib/format";
 import "./chat.css";
 
 const WINDOW = 10;
@@ -17,13 +18,6 @@ const SOURCE_NOTE: Record<string, string> = {
   vision: "תוכן מתוך תמונה (קריאה חזותית)",
   ocr: "תוכן מתוך תמונה (OCR)",
   word_table: "טבלת Word",
-};
-const KIND_LABEL: Record<SourceBlock["kind"], string> = {
-  image: "תמונה",
-  table: "טבלה",
-  paragraph: "פסקה",
-  heading: "כותרת",
-  textbox: "תיבת טקסט",
 };
 const REGION_STATUS: Record<string, string> = {
   read: "נקרא",
@@ -208,7 +202,7 @@ function Block({
   ].filter(Boolean);
   const showMeta = cited || block.kind === "image" || block.kind === "table" || !!block.original_text;
   const marker = hasRegionMarker(block, cited);
-  const kind = KIND_LABEL[block.kind] ?? block.kind;
+  const kind = BLOCK_KIND_LABEL[block.kind] ?? block.kind;
   const status = REGION_STATUS[block.status] ?? block.status;
   return (
     <div className={`blk ${block.kind}`} data-cited={cited ? "true" : "false"}>
@@ -284,7 +278,7 @@ function RegionView({
   const ctrl = useRef<AbortController | null>(null);
   useEffect(() => () => ctrl.current?.abort(), []);
   const url = safeApiUrl(block.region_url);
-  const kind = KIND_LABEL[block.kind] ?? block.kind;
+  const kind = BLOCK_KIND_LABEL[block.kind] ?? block.kind;
 
   if (block.status === "unread") {
     return (

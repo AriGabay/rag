@@ -269,3 +269,17 @@ def test_the_tool_list_has_the_calculator_and_strict_schemas():
 
     for t in T.TOOLS:
         strict(t["parameters"])
+
+
+def test_a_count_is_shown_as_a_number_while_a_ratio_keeps_its_percentage():
+    rents = [operand(f"M{i}", str(v), "ILS_per_sqm", kind="rent_per_area", period="month", group="asking_price",
+                     same=f"m{i}") for i, v in enumerate((55, 56, 57, 58, 59), start=1)]
+    counted = run("count(M1, M2, M3, M4, M5)", ops(*rents))
+    assert counted.dims == () and counted.kind == "count"
+    assert calc.display(counted.value, counted.dims, counted.kind) == {"value": "5"}
+    assert not calc.display_matches("500", True, counted.value, counted.dims, counted.kind)
+    ratio = run("V2 / V1", ops(INCOME, COST))
+    assert calc.display(ratio.value, ratio.dims, ratio.kind)["percent"] == "83.53%"
+    assert calc.display_matches("83.5", True, ratio.value, ratio.dims, ratio.kind)
+    share = run("count(M1, M2) / count(M1, M2, M3, M4, M5)", ops(*rents))
+    assert share.kind == "ratio" and calc.display(share.value, share.dims, share.kind)["percent"] == "40%"

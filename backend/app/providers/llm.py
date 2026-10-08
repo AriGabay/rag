@@ -136,8 +136,8 @@ class AgentStep:
         return self.status == CallStatus.OK
 
 
-USAGE_FIELDS = ("purpose", "model", "status", "input_tokens", "cached_input_tokens", "cache_write_tokens",
-                "output_tokens", "latency_ms", "cost_usd")
+TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens")  # the token buckets
+USAGE_FIELDS = ("purpose", "model", "status", *TOKEN_FIELDS, "latency_ms", "cost_usd")
 
 
 def usage_cost(model: str | None, *, input_tokens: int | None, cached_input_tokens: int | None,
@@ -165,8 +165,7 @@ def usage_entry(purpose: str, result: StructuredResult | AgentStep, model: str |
     """One model call's cost record: the model, token buckets, latency and estimated cost; no content. ``model``
     names the provider's model for a result that does not carry its own."""
     model = getattr(result, "model", None) or model
-    tokens = {k: getattr(result, k, None)
-              for k in ("input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens")}
+    tokens = {k: getattr(result, k, None) for k in TOKEN_FIELDS}
     cost = usage_cost(model, **tokens)
     return {"purpose": purpose, "model": model, "status": CallStatus(result.status).value, **tokens,
             "latency_ms": result.latency_ms, "cost_usd": round(cost, 8) if cost is not None else None}
@@ -347,7 +346,14 @@ def _openai_error_status(exc: Exception) -> CallStatus:
         return CallStatus.QUOTA if code == "insufficient_quota" else CallStatus.RATE_LIMITED
     if isinstance(exc, openai.APITimeoutError):
         return CallStatus.TIMEOUT
+    # a request the provider rejects as it is (an image it cannot read, a policy rejection): the same request
+    # fails the same way again, so it is not transient
+    if isinstance(exc, openai.BadRequestError | openai.UnprocessableEntityError):
+        return CallStatus.REFUSAL if code in CONTENT_POLICY_CODES else CallStatus.INVALID
     return CallStatus.ERROR
+
+
+CONTENT_POLICY_CODES = frozenset({"content_policy_violation", "content_filter"})
 
 
 def _refused(items: list[dict]) -> bool:
@@ -429,8 +435,9 @@ class OpenAIProvider(BaseProvider):
 
     def structured_image(self, purpose: Purpose, instructions: str, prompt: str, image_png: bytes,
                          schema: type[BaseModel], *, max_output_tokens: int | None = None,
-                         reasoning_effort: str | None = None) -> StructuredResult:
-        """``structured`` with one picture (PNG) next to the text prompt, at high detail when the model lists it."""
+                         reasoning_effort: str | None = None, deadline: float | None = None) -> StructuredResult:
+        """``structured`` with one picture (PNG) next to the text prompt, at high detail when the model lists it.
+        ``deadline``: a chat turn's (the timeout cut to it, no SDK retry); ingestion passes none."""
         import base64
 
         image = {"type": "input_image", "image_url": "data:image/png;base64," + base64.b64encode(image_png).decode()}
@@ -439,7 +446,8 @@ class OpenAIProvider(BaseProvider):
             image["detail"] = "high"
         content = [{"type": "input_text", "text": prompt}, image]
         return self.structured(purpose, instructions, [{"role": "user", "content": content}], schema,
-                               max_output_tokens=max_output_tokens, reasoning_effort=reasoning_effort)
+                               max_output_tokens=max_output_tokens, reasoning_effort=reasoning_effort,
+                               deadline=deadline)
 
     def agent_step(self, instructions: str, items: list, tools: list[dict], final_schema: dict, *,
                    reasoning_effort: str | None = None, max_output_tokens: int = 6000,

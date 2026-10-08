@@ -399,10 +399,9 @@ def call_cost(u: dict) -> float | None:
     and token buckets; None when the model is unknown or unpriced (never counted as free)."""
     if "cost_usd" in u:
         return u["cost_usd"]
-    from app.providers.llm import usage_cost
+    from app.providers.llm import TOKEN_FIELDS, usage_cost
 
-    return usage_cost(u.get("model"), **{k: u.get(k) for k in ("input_tokens", "cached_input_tokens",
-                                                                  "cache_write_tokens", "output_tokens")})
+    return usage_cost(u.get("model"), **{k: u.get(k) for k in TOKEN_FIELDS})
 
 
 def usage_summary(results: list[Result]) -> list[str]:

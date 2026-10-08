@@ -92,7 +92,7 @@ class ModelVisionReader:
         self.config = f"{model}:{getattr(self.provider, 'reasoning_effort', None) or 'default'}"
         self.usage: list[dict] | None = None  # the turn's cost records, when a turn reads through it
 
-    def read(self, png: bytes, context: str, careful: bool = False) -> VisionOut:
+    def read(self, png: bytes, context: str, careful: bool = False, deadline: float | None = None) -> VisionOut:
         if not hasattr(self.provider, "structured_image"):
             raise VisionCallFailed(CallStatus.UNSUPPORTED.value)
         prompt = ""
@@ -105,7 +105,7 @@ class ModelVisionReader:
                        "שבקצה הטבלה, ואת כל השורות, ובדוק שלכל כותרת יש עמודה משלה.")
         # a careful reading changes the prompt, not the purpose's configured effort
         result = self.provider.structured_image(Purpose.VISION, VISION_INSTRUCTIONS, prompt, png, VisionSchema,
-                                                max_output_tokens=12000)
+                                                max_output_tokens=12000, deadline=deadline)
         self._log(result)
         if result.status != CallStatus.OK:
             logger.warning("vision reading failed: %s (%s)", result.status, result.detail)
@@ -131,10 +131,10 @@ class ModelVisionReader:
             logger.warning("vision usage log failed")
 
 
-def transcribe(reader: VisionReader, png: bytes) -> PictureReading:
+def transcribe(reader: VisionReader, png: bytes, deadline: float | None = None) -> PictureReading:
     """One reading of a rendered region or page, without context: ``read`` (with a transcription),
     ``read_uncertain`` or ``no_text``. A failed call raises ``VisionCallFailed``."""
-    out = reader.read(png, "")
+    out = reader.read(png, "", deadline=deadline)
     if out is None:
         raise VisionCallFailed(CallStatus.UNSUPPORTED.value)
     return _from_vision(out, [])

@@ -420,7 +420,7 @@ def get_blocks(document_id: str, version_id: str, start: int | None = Query(None
                     "file_url": f"/api/documents/{document_id}/versions/{version_id}/file"}
         # the same reader the agent's ``read`` uses, so a citation opens exactly what the model read (KTD8)
         rows = reader.blocks_between(conn, ver_uuid, start, end, BLOCKS_MAX)
-        tables = reader.tables_of(conn, ver_uuid)
+        tables = reader.tables_of(conn, ver_uuid, {r.table_index for r in rows if r.table_index is not None})
         total = reader.block_count(conn, ver_uuid)
         audit(conn, "source_view", ctx.user_id, "document_version", ver_uuid)
     blocks = []

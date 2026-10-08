@@ -298,6 +298,44 @@ def test_a_section_read_after_its_neighbors_sends_only_the_new_blocks(office):
     assert 'same_as="S3"' in again
 
 
+@pytest.mark.parametrize("opened", ["section", "pages"])
+def test_a_continued_read_returns_the_parts_of_the_whole_window_from_its_cursor(office, monkeypatch, opened):
+    """Every part after the first, a block cut in the middle included, holds the blocks and text the whole
+    window's parts hold from the same position."""
+    from app.chat import reader
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_read_chars", 500)  # paragraphs of ~830 characters are cut
+    ws = T.Workspace(ctx=office.ctx())
+    with tenant_tx(office.ctx()) as conn:
+        if opened == "section":
+            rows = conn.execute(text(f"SELECT {reader.BLOCK_COLS} FROM document_blocks WHERE version_id = :v"
+                                     " AND section_path[1] = :p ORDER BY block_index"),
+                                {"v": office.ver, "p": DESCRIPTION}).all()
+            result = T.tool_read(ws, {"section": section_handle(ws, office.doc)})
+        else:
+            rows = conn.execute(text(f"SELECT {reader.BLOCK_COLS} FROM document_blocks WHERE version_id = :v"
+                                     " AND page BETWEEN 2 AND 3 ORDER BY block_index"), {"v": office.ver}).all()
+            result = T.tool_read(ws, {"pages": {"document": office.doc, "from_page": 2, "to_page": 3}})
+    expected, pos, cuts = [], None, 0
+    while True:
+        part = reader.take(rows, pos, 500)
+        expected.append(([r.block_index for r, _, _ in part.items], "\n".join(p for _, p, _ in part.items if p)))
+        if part.next is None:
+            break
+        pos = part.next
+        cuts += pos[1] > 0
+    got = []
+    while True:
+        s = ws.sources[re.search(r'<source id="(S\d+)"', result).group(1)]
+        got.append((list(range(s.block_start, s.block_end + 1)), s.text))
+        if not tag(result, "more"):
+            break
+        result = T.tool_read(ws, {"cursor": tag(result, "more")})
+    assert len(expected) > 3 and cuts  # parts that start inside a block, and parts that start at one
+    assert got == expected
+
+
 def test_the_verifier_receives_the_full_text_of_a_part_sent_as_a_reference(client, office, monkeypatch):
     seen: list[str] = []
 

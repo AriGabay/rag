@@ -21,7 +21,6 @@ embeddings and a new ``reading_id``, in one transaction.
 
 from __future__ import annotations
 
-import dataclasses
 import inspect
 import json
 import logging
@@ -44,6 +43,7 @@ from app.db import (  # noqa: F401 - system_ctx re-exported
 from app.extraction.base import Block, ExtractionError, ExtractionResult, check_deadline
 from app.extraction.normalize_text import normalize_for_search, undouble_word
 from app.extraction.pdf import READER_VERSION as PDF_READER_VERSION
+from app.extraction.regions import shown_hash
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +286,7 @@ class ImageReadingStore:
         self.ctx = ctx
 
     def get(self, key):
-        from app.extraction.images import PictureReading, PictureTable
+        from app.extraction.images import PictureReading
 
         with tenant_tx(self.ctx) as conn:
             row = conn.execute(text(
@@ -295,9 +295,7 @@ class ImageReadingStore:
                 {"h": key.content_hash, "r": key.reader_version, "m": key.model_config, "c": key.crop_scale}).first()
         if row is None:
             return None
-        data = dict(row.reading)
-        data["tables"] = [PictureTable(**t) for t in data.get("tables") or []]
-        return PictureReading(**data)
+        return PictureReading.from_json(row.reading)
 
     def put(self, key, reading) -> None:
         with tenant_tx(self.ctx) as conn:
@@ -307,7 +305,7 @@ class ImageReadingStore:
                 " ON CONFLICT (office_id, content_hash, reader_version, model_config, crop_scale)"
                 " DO UPDATE SET status = EXCLUDED.status, reading = EXCLUDED.reading, updated_at = now()"),
                 {"h": key.content_hash, "r": key.reader_version, "m": key.model_config, "c": key.crop_scale,
-                 "s": reading.status, "g": json.dumps(dataclasses.asdict(reading), ensure_ascii=False)})
+                 "s": reading.status, "g": reading.to_json()})
 
 
 def vision_reader(ctx: TenantContext):
@@ -472,14 +470,7 @@ def _furniture_numbers(result: ExtractionResult) -> set[str]:
     page it is on, so no page lost them."""
     shown = {r["hash"] for r in result.repeated}
     return set().union(*(_numbers(f"{b.text or ''} {b.picture_text or ''}") for b in result.blocks
-                         if b.content_hash and any(_hash_shown(b.content_hash) == h for h in shown)))
-
-
-def _hash_shown(digest: str) -> str:
-    from app.extraction.regions import HASH_SHOWN
-
-    prefix = "ink:" if digest.startswith("ink:") else ""
-    return prefix + digest.removeprefix(prefix)[:HASH_SHOWN]
+                         if b.content_hash and shown_hash(b.content_hash) in shown))
 
 
 def reading_regression(conn: Connection, version_id: UUID, result: ExtractionResult) -> dict | None:
@@ -511,6 +502,25 @@ def reading_regression(conn: Connection, version_id: UUID, result: ExtractionRes
     return out
 
 
+def regression_within(new: dict, recorded: dict | None) -> bool:
+    """Whether a newly computed regression is no worse than the one an admin reviewed and accepted: the same
+    reader, every page's missing numbers among those recorded for that page, no page failing that was not recorded,
+    and no larger table loss. Anything else is a different regression, which the acceptance does not cover."""
+    if not recorded or new.get("ingestion_version") != recorded.get("ingestion_version"):
+        return False
+    seen = {p["page"]: set(p["missing_numbers"]) for p in recorded.get("pages") or []}
+    if any(not set(p["missing_numbers"]) <= seen.get(p["page"], set()) for p in new.get("pages") or []):
+        return False
+    if not set(new.get("failed_pages") or []) <= set(recorded.get("failed_pages") or []):
+        return False
+
+    def lost(r: dict) -> int:
+        t = r.get("tables") or {}
+        return (t.get("before", 0) - t.get("after", 0)) if t else 0
+
+    return lost(new) <= lost(recorded)
+
+
 def _embed_reading(ctx: TenantContext, info: VersionInfo, result: ExtractionResult,
                    deadline: float) -> tuple[list[str], str]:
     """Every chunk's vector for a new reading, computed before it replaces the current one, so the swap never
@@ -519,11 +529,13 @@ def _embed_reading(ctx: TenantContext, info: VersionInfo, result: ExtractionResu
     from app.providers.embeddings import get_embedding_provider, to_pgvector
 
     provider = get_embedding_provider()
+    texts = list(dict.fromkeys(c.text for c in result.chunks))
     with tenant_tx(ctx) as conn:
         known = {r.text: r.e for r in conn.execute(text(
             "SELECT text, embedding::text AS e FROM chunks WHERE version_id = :v AND embedding IS NOT NULL"
-            " AND embedding_model = :m"), {"v": info.id, "m": provider.model_id})}
-    todo = [t for t in dict.fromkeys(c.text for c in result.chunks) if t not in known]
+            " AND embedding_model = :m AND text = ANY(:texts)"),
+            {"v": info.id, "m": provider.model_id, "texts": texts})}
+    todo = [t for t in texts if t not in known]
     for i in range(0, len(todo), EMBED_BATCH):
         check_deadline(deadline)
         batch = todo[i:i + EMBED_BATCH]
@@ -536,7 +548,8 @@ def reindex_version(office_id: UUID, version_id: UUID, accept_regression: bool =
     """Read a processed version again under the current reader (KTD7). Extraction and embedding run before any
     write; a gate then compares the new reading with the current one (``reading_regression``). A worse reading is
     recorded on the version and fails the job (``ReadingRegression``), leaving the current reading in place,
-    unless an admin accepts the recorded regression (``accept_regression``). Otherwise one transaction replaces
+    unless an admin accepts the recorded regression (``accept_regression``) and the new one is within it
+    (``regression_within``). Otherwise one transaction replaces
     the blocks, pictures, tables, pages and chunks (with their embeddings) under a new ``reading_id``, re-anchors
     the version's measurements in the new reading, drops facts the earlier engine extracted from the old chunks
     and never reviewed (a reviewed fact stays), clears cached answers and moves the data version, so no answer
@@ -568,7 +581,8 @@ def reindex_version(office_id: UUID, version_id: UUID, accept_regression: bool =
             return None  # deleted or superseded while it was read
         regression = reading_regression(conn, info.id, result)
         recorded = (current.ingestion or {}).get("reprocess_regression")
-        if regression is not None and not (accept_regression and recorded):
+        # an acceptance covers the regression the admin reviewed, never a different or a larger one
+        if regression is not None and not (accept_regression and regression_within(regression, recorded)):
             regression["current_reading_id"] = (current.ingestion or {}).get("reading_id")
         else:
             anchors = measurement_anchors(conn, info.id)  # where each measurement sits, before the old reading goes

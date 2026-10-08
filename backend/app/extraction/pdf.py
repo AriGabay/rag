@@ -637,6 +637,9 @@ def extract_pdf(data: bytes, deadline: float, settings: Settings, vision: Vision
         layers = _layers(outs)
         read_regions(doc, data, layers, settings, vision, readings, deadline)
         repeated = mark_repeated(layers)
+        for o in outs:
+            o.chars = []  # the character boxes served region reading only
+        del layers
     finally:
         doc.close()
 

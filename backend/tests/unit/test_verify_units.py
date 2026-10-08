@@ -626,3 +626,21 @@ def test_an_uncited_table_row_gets_the_citation_inside_its_last_cell():
     r = verify_answer(p, a, _ws(TABLE), "?", [])
     assert r.ok and not r.removed_units()
     assert r.apply(a).answer_markdown.endswith("| ב | 55 | 0.71 [S1] |")
+
+
+# --- a part not covered whose only limitation is a document the turn read in part ---------------------------------
+
+def test_a_part_whose_document_the_turn_read_in_part_says_so_not_that_pictures_were_unread():
+    from app.chat import coverage
+
+    ws = _ws(SOURCE)
+    ws.activity["d1"] = {"title": "דוח הדגמה", "read_partial": True}
+    row = coverage._part_limitation(ws, {"ask": "דמי הניהול"})
+    assert row["status"] == "source_partial" and row["partial_reason"] == "read_in_part"
+    sentence = coverage.absence_sentence(row)
+    assert sentence == ("**דמי הניהול** לא נמצא. המסמך \"דוח הדגמה\" נקרא רק בחלקו, ולכן ייתכן שהנתון מופיע "
+                        "בחלק שלא נקרא.")
+    # a document ingestion read in part keeps the pictures-or-pages reason
+    ws.activity["d1"] = {"title": "דוח הדגמה", "partial": True}
+    assert "חלק מהתמונות או העמודים לא נקראו" in coverage.absence_sentence(coverage._part_limitation(
+        ws, {"ask": "דמי הניהול"}))

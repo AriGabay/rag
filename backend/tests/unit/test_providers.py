@@ -330,11 +330,14 @@ def test_openai_parse_time_errors(exc, status):
     (httpx2.Response(400, json=_error("model_not_found")), CallStatus.MODEL_UNAVAILABLE),
     (httpx2.Response(429, json=_error("rate_limit_exceeded", "requests")), CallStatus.RATE_LIMITED),
     (httpx2.Response(429, json=_error("insufficient_quota", "insufficient_quota")), CallStatus.QUOTA),
-    (httpx2.Response(400, json=_error("invalid_json_schema")), CallStatus.ERROR),
+    (httpx2.Response(400, json=_error("invalid_image")), CallStatus.INVALID),
+    (httpx2.Response(422, json=_error("unprocessable")), CallStatus.INVALID),
+    (httpx2.Response(400, json=_error("content_policy_violation")), CallStatus.REFUSAL),
     (httpx2.Response(500, json=_error("server_error", "server_error")), CallStatus.ERROR),
     (httpx2.ReadTimeout("slow"), CallStatus.TIMEOUT),
     (httpx2.ConnectError("down"), CallStatus.ERROR),
-], ids=["401", "403", "404-model", "400-model", "429", "429-quota", "400", "500", "timeout", "connection"])
+], ids=["401", "403", "404-model", "400-model", "429", "429-quota", "400", "422", "400-policy", "500", "timeout",
+        "connection"])
 def test_openai_sdk_errors_map_to_statuses(reply, status):
     provider, _ = openai_provider(reply)
     r = call(provider)

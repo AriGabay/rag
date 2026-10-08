@@ -37,16 +37,20 @@ const STATUS: Record<string, string> = {
   needs_review: "ממתין לבדיקה",
 };
 
+// an answer's source is bound to the reading it was read from (null: an answer from before reading ids)
+function withReading(src: ChatSource): ChatSource {
+  return { ...src, reading_id: src.reading_id ?? null };
+}
+
 /** The source a citation opens: a passage itself, or the passage of the measurement it cites. */
 export function citedSource(answer: ChatAnswer, id: string): ChatSource | null {
-  // an answer's source is bound to the reading it was read from (null: an answer from before reading ids)
   const direct = answer.sources.find((s) => s.id === id);
-  if (direct) return { ...direct, reading_id: direct.reading_id ?? null };
+  if (direct) return withReading(direct);
   // a value opens the passage it was verified in
   const v = answer.values?.find((x) => x.id === id);
   if (v) {
     const src = answer.sources.find((s) => s.id === v.source_id);
-    return src ? { ...src, reading_id: src.reading_id ?? null } : null;
+    return src ? withReading(src) : null;
   }
   const m = answer.measurements.find((x) => x.id === id);
   if (m) {

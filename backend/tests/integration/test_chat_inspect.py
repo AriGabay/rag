@@ -41,9 +41,11 @@ class ScriptedVision:
         self.calls: list[tuple[int, int]] = []
         self.uncertain = uncertain or []
         self.usage = None
+        self.deadlines: list[float | None] = []
 
-    def read(self, png: bytes, context: str, careful: bool = False) -> VisionOut:
+    def read(self, png: bytes, context: str, careful: bool = False, deadline: float | None = None) -> VisionOut:
         self.calls.append(Image.open(io.BytesIO(png)).size)
+        self.deadlines.append(deadline)
         return VisionOut("table", True, "", [VisionTableOut("", HEADERS, [list(r) for r in ROWS], [])], "טבלה",
                          list(self.uncertain))
 
@@ -258,3 +260,63 @@ def test_a_scripted_turn_reads_an_unread_table_region_through_inspect_and_cites_
     m = send(client, new_conversation(client), "מה דמי השכירות באזור צפון?")
     assert m["answer"]["status"] == "answered" and "48,600" in m["answer"]["markdown"]
     assert len(office.vision.calls) == 1
+
+
+# --- the turn's reading deadline -------------------------------------------------------------------------------------
+
+def test_an_inspection_is_bounded_by_the_turns_reading_deadline(office, monkeypatch):
+    import time
+
+    doc = ingest_r1(office, monkeypatch)
+    ws = emp(office)
+    ws.read_until = time.monotonic() + 600
+    T.tool_inspect(ws, {"region": region_of(ws, doc)})
+    assert office.vision.deadlines == [ws.read_until]  # the call is cut to the reading window, without retries
+
+
+class Clock:
+    """``time.monotonic`` moved forward by hand: a slow model call is a jump of the clock."""
+
+    def __init__(self, monkeypatch):
+        import time
+
+        self.offset, real = 0.0, time.monotonic
+        monkeypatch.setattr(time, "monotonic", lambda: real() + self.offset)
+
+
+def test_an_inspection_near_the_reading_deadline_makes_no_call_and_the_turn_ends_partial(client, office, monkeypatch):
+    """At 80 of the turn's 110 reading seconds, an inspection would need longer than is left. Made, a slow vision
+    call (120 s) would leave no time to verify the answer (verify_no_time); refused, the turn ends as a verified
+    partial answer that names the time limit."""
+    from app.config import get_settings
+
+    for k, v in {"chat_turn_seconds": 150, "chat_verify_reserve_seconds": 40, "chat_verify_min_seconds": 15}.items():
+        monkeypatch.setattr(get_settings(), k, v)
+    monkeypatch.setattr(get_settings(), "chat_inspect_reserve_seconds", 45, raising=False)
+    doc = ingest_r1(office, monkeypatch)
+    clock = Clock(monkeypatch)
+    slow_read = office.vision.read
+
+    def slow(*args, **kwargs):
+        clock.offset += 120
+        return slow_read(*args, **kwargs)
+
+    monkeypatch.setattr(office.vision, "read", slow)
+
+    def inspect_region(items):
+        clock.offset += 80  # the turn has read for 80 seconds
+        region = re.search(r"\[אזור שלא נקרא (R\d+)", _last_output(items)).group(1)
+        return [call("inspect", target={"region": region, "document": None, "page": None})]
+
+    answer = final("דמי השכירות באזור צפון לא נקראו: הטבלה בעמוד הראשון לא נקראה.", "not_found")
+    agent = ScriptedAgent([[read(pages={"document": doc, "from_page": 1, "to_page": 1})], inspect_region,
+                           answer, answer, answer])  # the same answer to a repair round, if verification asks
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), "מה דמי השכירות באזור צפון?")
+    assert m["status"] == "done", m.get("error")
+    assert office.vision.calls == []
+    refused = _last_output(agent.seen[2])
+    assert "מגבלה" in refused and "לא נקרא" in refused
+    a = m["answer"]
+    assert a["status"] == "partial" and "time_limit" in a["limits_hit"] and "מגבלת הזמן לשאלה אחת" in a["markdown"]

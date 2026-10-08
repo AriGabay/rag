@@ -28,10 +28,11 @@ keeps a one-line description and only the labels that were legible.
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Protocol
 
 from app.extraction.base import ExtractionError
@@ -91,6 +92,16 @@ class PictureReading:
     kind: str | None = None  # table | text | diagram | map | photo | chart | signature | other
     cacheable: bool = True  # False for a fallback after a failed model call: the next ingestion tries again
 
+    @classmethod
+    def from_json(cls, data: dict) -> PictureReading:
+        """A reading as stored (``to_json``) in a readings cache."""
+        data = dict(data)
+        data["tables"] = [PictureTable(**t) for t in data.get("tables") or []]
+        return cls(**data)
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), ensure_ascii=False)
+
 
 @dataclass
 class VisionTableOut:
@@ -111,11 +122,13 @@ class VisionOut:
 
 
 class VisionReader(Protocol):
-    def read(self, png: bytes, context: str, careful: bool = False) -> VisionOut | None:
+    def read(self, png: bytes, context: str, careful: bool = False,
+             deadline: float | None = None) -> VisionOut | None:
         """The model's reading of one picture. A failed call raises ``VisionCallFailed`` with the provider's status
         (None: no reading, cause unknown). ``careful``: a second, slower reading after the first one failed the OCR
-        cross-checks or the call failed deterministically. A reader may carry ``config`` (model and effort), part
-        of the key its readings are cached by."""
+        cross-checks or the call failed deterministically. ``deadline`` (``time.monotonic()``; a chat turn's
+        reading deadline, None for ingestion): the call is cut to it, without SDK retries. A reader may carry
+        ``config`` (model and effort), part of the key its readings are cached by."""
 
 
 TRANSIENT_STATUSES = frozenset({"timeout", "rate_limited", "error"})

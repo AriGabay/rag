@@ -557,11 +557,15 @@ def _request_focus(request: dict | None) -> dict | None:
             "document_ids": list(request.get("document_ids") or [])}
 
 
+def _public_source(src) -> dict:
+    """A source as the client receives it, with the chunk it opens."""
+    return src.public() | {"chunk_id": str(src.chunk_id) if src.chunk_id else None}
+
+
 def _answer_payload(outcome: engine.TurnOutcome) -> dict:
     ws, a = outcome.workspace, outcome.answer
     cited = coverage.cited_ids(a.answer_markdown)
-    sources = [ws.sources[i].public() | {"chunk_id": str(ws.sources[i].chunk_id) if ws.sources[i].chunk_id else None}
-               for i in ws.sources if i in cited]
+    sources = [_public_source(ws.sources[i]) for i in ws.sources if i in cited]
     # measurements, values and calculations cite the documents behind them: a calculation brings the earlier
     # calculations, values, assumptions and measurements it rests on, and a value the source it was verified in
     used = set(cited)
@@ -579,8 +583,7 @@ def _answer_payload(outcome: engine.TurnOutcome) -> dict:
     assumptions = [ws.assumptions[i].public() for i in ws.assumptions if i in used]
     for v in values:  # the passage a value was verified in opens from the value
         if v["source_id"] in ws.sources and not any(s["id"] == v["source_id"] for s in sources):
-            src = ws.sources[v["source_id"]]
-            sources.append(src.public() | {"chunk_id": str(src.chunk_id) if src.chunk_id else None})
+            sources.append(_public_source(ws.sources[v["source_id"]]))
     docs: dict[str, str] = {}
     for s in sources:
         if s["document_id"]:  # a listing names documents; it is not one of them
@@ -644,7 +647,7 @@ def _limited_answer(ctx: TenantContext, question: str, reason: str) -> dict:
         T.tool_search(ws, question, None, 5)
     except T.ToolError:
         pass
-    sources = [s.public() | {"chunk_id": str(s.chunk_id) if s.chunk_id else None} for s in ws.sources.values()]
+    sources = [_public_source(s) for s in ws.sources.values()]
     lines = [f"**{reason}** לכן לא נוסחה תשובה מנותחת. אלה הקטעים הקרובים ביותר שנמצאו בחיפוש — יש לקרוא אותם "
              "במקור:" if sources else f"**{reason}** וגם החיפוש לא העלה קטעים מתאימים."]
     for s in ws.sources.values():

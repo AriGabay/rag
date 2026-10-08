@@ -188,12 +188,12 @@ def absence_sentence(r: dict) -> str | None:
     if r["status"] == "source_partial" and r.get("partial_reason") == "unread":
         return (f"**{label}** לא נמצא {in_it}, אבל יש בו אזורים שלא נקראו (תמונה או טבלה), ולכן ייתכן שהנתון "
                 "מופיע בהם.")
-    if r["status"] == "source_partial":
-        return (f"**{label}** לא נמצא. המסמך \"{r['partial_document']}\" נקרא חלקית (חלק מהתמונות או העמודים לא "
-                "נקראו), ולכן ייתכן שהנתון מופיע בחלק שלא נקרא.")
     if r["status"] == "source_partial" and r.get("partial_reason") == "read_in_part":
         return (f"**{label}** לא נמצא. המסמך \"{r['partial_document']}\" נקרא רק בחלקו, ולכן ייתכן שהנתון מופיע "
                 "בחלק שלא נקרא.")
+    if r["status"] == "source_partial":
+        return (f"**{label}** לא נמצא. המסמך \"{r['partial_document']}\" נקרא חלקית (חלק מהתמונות או העמודים לא "
+                "נקראו), ולכן ייתכן שהנתון מופיע בחלק שלא נקרא.")
     if r["status"] == "sources_conflict":
         return f"**{label}**: המקורות סותרים — הם נותנים לנתון ערכים שונים, ולכן אין לו ערך אחד."
     if r["status"] == "not_found_search":

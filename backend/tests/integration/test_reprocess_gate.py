@@ -219,6 +219,82 @@ def test_a_page_that_loses_a_number_keeps_the_old_reading_and_records_the_regres
     assert any("12O" in b.text for b in q(office, "SELECT text FROM document_blocks WHERE version_id = :v"))
 
 
+LOST_120 = {1: [VALUE_NEW, AREA.replace("120", "12O"), RENT_NEW, PRICE_NEW], 2: [("table", *COMPARABLES)]}
+
+
+def recorded_regression(office) -> dict | None:
+    return q(office, "SELECT ingestion->'reprocess_regression' AS r FROM document_versions WHERE id = :v")[0].r
+
+
+@pytest.mark.parametrize("change", ["more_pages_lost", "fewer_tables", "other_reader"])
+def test_an_accepted_regression_does_not_cover_a_different_one(office, change):
+    """The admin accepted what was recorded (page 1 lost "120"). A re-run that reads worse in another way, or under
+    another reader, is a new regression: it is recorded and the current reading stays."""
+    office.reader["next"] = reading(LOST_120, CORRECTIONS)
+    reprocess(office)
+    before = snapshot(office)
+    if change == "more_pages_lost":
+        office.reader["next"] = reading(LOST_120, CORRECTIONS, failed=(2,))
+    elif change == "fewer_tables":
+        office.reader["next"] = reading({1: LOST_120[1], 2: [COMPARABLES[0] + " " + " ".join(
+            c for row in [COMPARABLES[1], *COMPARABLES[2]] for c in row)]}, CORRECTIONS)
+    else:
+        with tenant_tx(office.system) as conn:
+            conn.execute(text("UPDATE document_versions SET ingestion = jsonb_set(ingestion,"
+                              " '{reprocess_regression,ingestion_version}', '\"pdf-blocks-old\"') WHERE id = :v"),
+                         {"v": office.version})
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("DELETE FROM jobs"))
+    reprocess(office, accept=True)
+    assert job(office).status == "failed"
+    assert snapshot(office)[:3] == before[:3]
+    record = recorded_regression(office)
+    assert record["pages"] == [{"page": 1, "missing_numbers": ["120"]}]
+    assert record["ingestion_version"] == pipeline.PDF_INGESTION_VERSION
+    if change == "more_pages_lost":
+        assert record["failed_pages"] == [2]
+    elif change == "fewer_tables":
+        assert record["tables"] == {"before": 1, "after": 0}
+    ing = q(office, "SELECT ingestion FROM document_versions WHERE id = :v")[0].ingestion
+    assert "accepted_regression" not in ing
+
+
+def test_an_accepted_regression_covers_a_re_run_that_loses_less(office):
+    office.reader["next"] = reading(LOST_120, CORRECTIONS, failed=(2,))
+    reprocess(office)
+    assert recorded_regression(office)["failed_pages"] == [2]
+    office.reader["next"] = reading(LOST_120, CORRECTIONS)  # page 2 reads again; page 1 still lost "120"
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("DELETE FROM jobs"))
+    reprocess(office, accept=True)
+    assert job(office).status == "done"
+    ing = q(office, "SELECT ingestion FROM document_versions WHERE id = :v")[0].ingestion
+    assert "reprocess_regression" not in ing
+    assert ing["accepted_regression"]["pages"] == [{"page": 1, "missing_numbers": ["120"]}]
+
+
+def test_a_reindex_reuses_an_unchanged_chunks_vector_and_embeds_only_changed_text(office, monkeypatch):
+    from app.providers.embeddings import get_embedding_provider
+
+    provider = get_embedding_provider()
+    embedded: list[str] = []
+    real = provider.embed_passages
+
+    def recorded(texts):
+        embedded.extend(texts)
+        return real(texts)
+
+    monkeypatch.setattr(type(provider), "embed_passages", lambda self, texts: recorded(texts))
+    old = {r.text: r.e for r in q(office, "SELECT text, embedding::text AS e FROM chunks WHERE version_id = :v")}
+    changed = {1: [*OLD[1], "תוספת סינתטית: חניה אחת בקומת המרתף."], 2: OLD[2]}
+    office.reader["next"] = reading(changed)
+    assert pipeline.reindex_version(office.office_id, office.version) == "reindexed"
+    new = {r.text: r.e for r in q(office, "SELECT text, embedding::text AS e FROM chunks WHERE version_id = :v")}
+    kept = set(old) & set(new)
+    assert kept and all(new[t] == old[t] for t in kept)  # the unchanged chunk's vector, without a call
+    assert embedded and set(embedded) == set(new) - set(old)
+
+
 @pytest.mark.parametrize("worse", ["failed_page", "fewer_tables"])
 def test_more_failed_pages_or_fewer_tables_keep_the_old_reading(office, worse):
     before = snapshot(office)

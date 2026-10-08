@@ -136,6 +136,9 @@ class Settings(BaseSettings):
     chat_workers: int = 6
     chat_run_inline: bool = False  # tests: run a turn inside the request instead of a background thread
     chat_max_inspections: int = 3  # visual readings (``inspect``) one turn may make with the vision model
+    # less time than this left before the turn's reading deadline: ``inspect`` makes no new vision call (a call cut
+    # to the time left still has to fit the answer and its verification after it)
+    chat_inspect_reserve_seconds: int = 45
     # characters of tool output one turn may send the model; past it, reading tools return a header only (0: none)
     chat_tool_output_chars: int = 60_000
     chat_read_chars: int = 3500  # a part of a section, a page range or the paragraphs around a source

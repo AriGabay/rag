@@ -232,6 +232,7 @@ def test_the_repeated_picture_rule():
         "three-on-a-page": [_occurrence(3, top, "d" * 64) for top in (200, 400, 600)],
         "first-covered": [_occurrence(1, 700, "e" * 64, covered=True), _occurrence(2, 700, "e" * 64),
                           _occurrence(3, 700, "e" * 64)],
+        "ink": [_occurrence(p, 760, "ink:" + "f" * 64) for p in (1, 2, 3)],  # vector ink, hashed by its drawing
     }
     for regions in occ.values():
         for r in regions:
@@ -246,9 +247,10 @@ def test_the_repeated_picture_rule():
     assert blocks("three-pages") == [(1, 20)]
     assert blocks("three-on-a-page") == [(3, 200)]
     assert blocks("first-covered") == [(2, 700)]
+    assert blocks("ink") == [(1, 760)]
     assert not any(r.furniture for name in ("twice-one-page", "twice-two-pages") for r in occ[name])
     assert sorted((e["hash"], e["occurrences"], e["pages"], e["first_page"]) for e in report) == [
-        ("c" * 12, 3, 3, 1), ("d" * 12, 3, 1, 3), ("e" * 12, 3, 3, 2)]
+        ("c" * 12, 3, 3, 1), ("d" * 12, 3, 1, 3), ("e" * 12, 3, 3, 2), ("ink:ffffffffffff", 3, 3, 1)]
 
 
 def test_without_the_vision_model_a_table_region_is_unread_and_its_page_named(monkeypatch):
@@ -384,6 +386,32 @@ def test_invalid_output_twice_leaves_the_region_unread_with_the_status():
     assert vision.count(TABLE) == 2  # one careful retry
     assert result.components["partial"] is True
     assert not any(k for k in cache.rows if k.content_hash == block.content_hash)  # a failure is never cached
+
+
+def test_a_picture_the_provider_rejects_with_a_400_is_left_unread_and_the_document_still_reads(monkeypatch):
+    """A deterministic request rejection (HTTP 400) on one picture: the real provider and reader, a mocked HTTP
+    transport. The region is retried carefully once, then left unread with the status; extraction completes."""
+    import httpx2
+    import openai
+
+    from app.extraction.vision import ModelVisionReader
+    from app.providers.llm import OpenAIProvider
+
+    def reject(request):
+        return httpx2.Response(400, json={"error": {"message": "stubbed rejection", "type": "invalid_request_error",
+                                                    "param": None, "code": "invalid_image"}})
+
+    client = openai.OpenAI(api_key="test-openai-key-not-real-0002", max_retries=0,
+                           http_client=httpx2.Client(transport=httpx2.MockTransport(reject)))
+    provider = OpenAIProvider("test-openai-key-not-real-0002", "gpt-5.4-mini", client=client)
+    monkeypatch.setattr("app.extraction.vision.get_provider", lambda purpose: provider)
+    reader = ModelVisionReader(office_id=None)
+    reader.usage = []  # the cost records stay in memory (no database)
+    result = extract(R1, reader)
+    block = images_of(result, 1)[1]
+    assert (block.status, block.note) == ("unread", "הקריאה החזותית נכשלה (invalid)")
+    assert result.components["partial"] is True
+    assert {e["status"] for e in reader.usage} == {"invalid"}
 
 
 def test_invalid_output_with_ocr_text_keeps_the_ocr_reading_uncertain(monkeypatch):

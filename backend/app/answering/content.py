@@ -12,6 +12,7 @@ from sqlalchemy import Connection, text
 from app.answering.compose import Usage
 from app.platform.documents import source_file_url
 from app.providers.llm import (
+    TOKEN_FIELDS,
     CallStatus,
     LLMProvider,
     MockLLM,
@@ -41,8 +42,7 @@ def log_usage(conn: Connection, provider: LLMProvider, purpose: str, result, ok:
     one), its token buckets, latency and estimated cost; ``status`` defaults to the result's own call status."""
     status = status if status is not None else getattr(result, "status", None)
     model = getattr(result, "model", None) or provider.model
-    tokens = {k: getattr(result, k, None)
-              for k in ("input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens")}
+    tokens = {k: getattr(result, k, None) for k in TOKEN_FIELDS}
     _insert(conn, provider.name, model, str(purpose), tokens, getattr(result, "latency_ms", None), ok,
             str(status) if status is not None else None, usage_cost(model, **tokens))
 
@@ -50,7 +50,7 @@ def log_usage(conn: Connection, provider: LLMProvider, purpose: str, result, ok:
 def log_usage_entries(conn: Connection, provider: LLMProvider, entries: Iterable[dict]) -> None:
     """The ``provider_usage`` rows of a chat turn's calls, from their ``usage_entry`` records (priced at entry)."""
     for u in entries:
-        tokens = {k: u.get(k) for k in ("input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens")}
+        tokens = {k: u.get(k) for k in TOKEN_FIELDS}
         _insert(conn, provider.name, u.get("model") or provider.model, u["purpose"], tokens, u.get("latency_ms"),
                 u.get("status") == CallStatus.OK.value, u.get("status"), u.get("cost_usd"))
 

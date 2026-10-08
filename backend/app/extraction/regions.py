@@ -477,6 +477,13 @@ def read_regions(doc, data: bytes, layers: list[PageLayer], settings: Settings, 
 
 # --- repeated pictures -----------------------------------------------------------------------------------------
 
+def shown_hash(digest: str) -> str:
+    """A content hash as the ingestion report shows it: its first ``HASH_SHOWN`` characters (an ``ink:`` prefix
+    kept)."""
+    prefix = "ink:" if digest.startswith("ink:") else ""
+    return prefix + digest.removeprefix(prefix)[:HASH_SHOWN]
+
+
 def mark_repeated(layers: list[PageLayer]) -> list[dict]:
     """Mark the regions of ``layers`` (read already) that repeat one content: page furniture (``REPEAT_MIN``
     occurrences or more, counting the ones the text layer covers) keeps a block at its first uncovered occurrence
@@ -505,7 +512,6 @@ def mark_repeated(layers: list[PageLayer]) -> list[dict]:
         if shown:
             first = shown[0]
             status = first.reading.status if first.reading is not None else "unread"
-            prefix = "ink:" if digest.startswith("ink:") else ""
-            report.append({"hash": prefix + digest.removeprefix(prefix)[:HASH_SHOWN], "occurrences": len(regions),
+            report.append({"hash": shown_hash(digest), "occurrences": len(regions),
                            "pages": len(pages), "first_page": first.page, "status": status})
     return report

@@ -52,11 +52,12 @@ Tools:
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import logging
 import math
 import re
+import time
+from collections.abc import Container
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -107,6 +108,7 @@ LEVELS = ("located", "retrieved", "read", "verified")
 NOT_REACHED = "not_reached"  # a document of the set the turn never touched
 READ_TO_END = "end"  # a read target read from its beginning to its end (``Workspace.read_progress``)
 TOOL_BUDGET = "tool_budget"  # ``Workspace.limits_hit``: the turn's tool-output budget is spent
+TIME_LIMIT = "time_limit"  # ``Workspace.limits_hit``: the turn's reading time is up (``inspect``, or the loop's clock)
 
 
 def read_chars() -> int:
@@ -243,6 +245,9 @@ class Workspace:
     # "document_id"}
     reads: dict[tuple, dict] = field(default_factory=dict)
     inspections: int = 0  # vision model calls ``inspect`` made in the turn (capped by ``chat_max_inspections``)
+    # the turn's reading deadline (``time.monotonic()``; None outside a turn): a vision call of ``inspect`` is cut to
+    # it, and none starts with less than ``chat_inspect_reserve_seconds`` left
+    read_until: float | None = None
     audited: set = field(default_factory=set)  # documents the turn already wrote a ``source_view`` audit row for
     limits_hit: list[str] = field(default_factory=list)  # turn limits reached (``inspect_cap``, ``tool_budget``...)
     # characters of tool output the turn may send the model (``chat_tool_output_chars``; None: no budget), and how
@@ -797,11 +802,7 @@ def _emit(ws: Workspace, v: reader.Version, target: tuple, pos, part: reader.Par
                       clipped=clipped, unread_regions=regions, more=more,
                       resume=_target_json(target, part.next), body="\n".join(head + lines + body),
                       tags={"document": ws.doc_handle(v.document_id)})
-    first = ws.returned.get(("read", target, pos))
-    if first is not None:
-        s.same_as = first
-    else:
-        ws.returned[("read", target, pos)] = s.sid
+    ws.once(s, ("read", target, pos))
     for r, _, whole in part.items:
         if whole:
             sent.setdefault(r.block_index, s.sid)
@@ -818,14 +819,15 @@ def _read_window(ws: Workspace, conn: Connection, v: reader.Version, target: tup
     """A part of a section (its sub-sections included) or of a page range, from ``pos`` (None: its beginning)."""
     vid = v.version_id
     unread_pages = None
+    from_block = pos[0] if pos else None  # ``take`` starts at ``pos``: the blocks before it are not loaded
     if target[0] == "section":
         path = target[2]
-        rows = reader.blocks_in_section(conn, vid, path)
+        rows = reader.blocks_in_section(conn, vid, path, from_block)
         name = _section_name(path)
         lines = []
     else:
         first, last = target[2], target[3]
-        rows = reader.blocks_on_pages(conn, vid, first, last)
+        rows = reader.blocks_on_pages(conn, vid, first, last, from_block)
         unread_pages = reader.unread_pages(conn, vid, first, last)
         name = _pages_label([first, last])
         lines = []
@@ -833,7 +835,7 @@ def _read_window(ws: Workspace, conn: Connection, v: reader.Version, target: tup
         if unread_pages:
             raise ToolError(f"{name}: לא נקראו בעיבוד המסמך (אין בהם טקסט שנקרא)")
         raise ToolError(f"אין קטעים שנשמרו ב{name}" if target[0] == "pages" else "אין קטעים בסעיף הזה")
-    part = reader.take(rows, pos, read_chars(), set(ws.sent.get(str(vid), {})))
+    part = reader.take(rows, pos, read_chars(), ws.sent.get(str(vid), {}))
     pages = sorted({r.page for r, _, _ in part.items if r.page})
     if target[0] == "section":
         location = _location(name, "text", pages, None, None, (None, None), None)
@@ -883,18 +885,14 @@ def _read_table(ws: Workspace, conn: Connection, v: reader.Version, table_index:
                       body="\n".join(head) + "\n" + body,
                       tags={"document": ws.doc_handle(v.document_id),
                             "table": _table_handle(ws, v.document_id, vid, v.reading_id, table_index)})
-    first = ws.returned.get(("read", target, row0))
-    if first is not None:
-        s.same_as = first
-    else:
-        ws.returned[("read", target, row0)] = s.sid
+    ws.once(s, ("read", target, row0))
     ws.touch(v.document_id, v.title, "read", v.partial, {"sid": s.sid, "scope": "table", "name": name,
                                                          "target": target})
     ws.read_progress(target, row0 or None, nxt, str(v.document_id), False)
     return s
 
 
-def _neighbors(rows: list, start: int, end: int, sent: set) -> tuple[list, bool]:
+def _neighbors(rows: list, start: int, end: int, sent: Container[int]) -> tuple[list, bool]:
     """The source's blocks and as many around them as fit, nearest first, kept contiguous; whether some were
     left out. Blocks the turn already returned cost nothing: they are sent as a pointer."""
     def cost(r) -> int:
@@ -959,7 +957,7 @@ def _read_source(ws: Workspace, conn: Connection, sid: str) -> Source:
         return s
     end = end if end is not None else start
     rows = reader.blocks_between(conn, v.version_id, max(0, start - NEIGHBORS), end + NEIGHBORS)
-    chosen, cut = _neighbors(rows, start, end, set(ws.sent.get(vid, {})))
+    chosen, cut = _neighbors(rows, start, end, ws.sent.get(vid, {}))
     if not chosen:
         raise ToolError("למקור הזה אין קטעים בקריאה הנוכחית של המסמך")
     path = tuple(next((r.section_path for r in chosen if start <= r.block_index <= end), None) or ())
@@ -1130,11 +1128,11 @@ def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> s
     if ws.scope is None or ws.scope.get("query") != query:
         ws.scope = new_scope(query, [(d["document_id"], d["title"]) for d in found], pages)
     ws.scope["pages_read"].add(page)
-    for d in found[(page - 1) * SCOPE_PAGE:page * SCOPE_PAGE]:
+    shown = found[(page - 1) * SCOPE_PAGE:page * SCOPE_PAGE]
+    for d in shown:
         ws.touch(d["document_id"], d["title"], "located")
     if not found:
         return f'לא נמצאו מסמכים שמכילים את כל המונחים של "{query}". אפשר לנסות מונחים אחרים או פחות מונחים.'
-    shown = found[(page - 1) * SCOPE_PAGE:page * SCOPE_PAGE]
     n_terms = len(_scope_terms(query))
     in_title = sum(1 for d in found if len(d["in_title"]) == n_terms)
     lines = [f'תחום: מסמכים שמכילים את כל המונחים "{_txt(query)}" (בכותרת או בתוכן)',
@@ -1204,6 +1202,8 @@ MSG_INSPECT_NO_CLOUD = ("קריאה חזותית אינה זמינה במשרד 
                         "{what} לא נקרא. אם התשובה תלויה בו — ציין שהוא לא נקרא.")
 MSG_INSPECT_CAP = ("מגבלה: בתור הזה כבר נעשו {n} קריאות חזותיות, המספר המרבי לתור. {what} לא נקרא. אם התשובה תלויה "
                    "בו — ציין שהוא לא נקרא בשל מגבלת הקריאות החזותיות.")
+MSG_INSPECT_TIME = ("מגבלה: הזמן לקריאה בתור הזה כמעט הסתיים, ולכן {what} לא נקרא בקריאה חזותית. ענה ממה שכבר "
+                    "נקרא, ואם התשובה תלויה בו — ציין שהוא לא נקרא בשל מגבלת הזמן.")
 MSG_INSPECT_FAILED = "הקריאה החזותית של {what} נכשלה ({status}); הוא נשאר לא נקרא. אפשר לציין שהוא לא נקרא."
 MSG_INSPECT_RENDER = "לא ניתן היה להציג את {what} כתמונה; הוא נשאר לא נקרא."
 INSPECT_LIMIT = "inspect_cap"
@@ -1250,11 +1250,7 @@ def _inspected(ws: Workspace, spot: _Spot, key: tuple, *, text_: str, body: list
                       page_list=[spot.page] if spot.page else None,
                       partial_document=v.partial, reading_id=v.reading_id, status=status, clipped=False, more=None,
                       body="\n".join(body + [text_]), tags=tags, method=method)
-    first = ws.returned.get(key)
-    if first is not None:
-        s.same_as = first
-    else:
-        ws.returned[key] = s.sid
+    ws.once(s, key)
     ws.touch(v.document_id, v.title, "retrieved", v.partial)
     return s
 
@@ -1319,7 +1315,7 @@ def _spot(ws: Workspace, conn: Connection, target: dict) -> tuple[_Spot, bool]:
 
 
 def _cached(conn: Connection, spot: _Spot, config: str):
-    from app.extraction.images import PictureReading, PictureTable
+    from app.extraction.images import PictureReading
     from app.extraction.vision import INSPECT_READER_VERSION
 
     row = conn.execute(text(
@@ -1329,9 +1325,7 @@ def _cached(conn: Connection, spot: _Spot, config: str):
          "m": config}).first()
     if row is None:
         return None
-    data = dict(row.reading)
-    data["tables"] = [PictureTable(**t) for t in data.get("tables") or []]
-    return PictureReading(**data)
+    return PictureReading.from_json(row.reading)
 
 
 def _visual(ws: Workspace, spot: _Spot, reading, earlier: bool) -> Source:
@@ -1385,6 +1379,11 @@ def tool_inspect(ws: Workspace, target: dict) -> str:
             if INSPECT_LIMIT not in ws.limits_hit:
                 ws.limits_hit.append(INSPECT_LIMIT)
             return MSG_INSPECT_CAP.format(n=cap, what=spot.what)
+        if ws.read_until is not None and ws.read_until - time.monotonic() < get_settings().chat_inspect_reserve_seconds:
+            # a vision call now would end past the reading window and leave no time to verify the answer
+            if TIME_LIMIT not in ws.limits_hit:
+                ws.limits_hit.append(TIME_LIMIT)
+            return MSG_INSPECT_TIME.format(what=spot.what)
         ws.inspections += 1
     # rendered and read outside any transaction: a model call never holds one open
     try:
@@ -1395,7 +1394,7 @@ def tool_inspect(ws: Workspace, target: dict) -> str:
     if hasattr(vision, "usage"):
         vision.usage = ws.usage
     try:
-        reading = transcribe(vision, png)
+        reading = transcribe(vision, png, deadline=ws.read_until)
     except VisionCallFailed as exc:
         raise ToolError(MSG_INSPECT_FAILED.format(what=spot.what, status=exc.status)) from None
     with tenant_tx(ws.ctx) as conn:
@@ -1410,7 +1409,7 @@ def tool_inspect(ws: Workspace, target: dict) -> str:
             " :p, CAST(:b AS jsonb), :s, CAST(:x AS jsonb), :u) ON CONFLICT DO NOTHING"),
             {"d": v.document_id, "v": v.version_id, "r": v.reading_id or "", "g": spot.region,
              "rv": INSPECT_READER_VERSION, "m": config, "p": spot.page, "b": json.dumps(spot.bbox),
-             "s": reading.status, "x": json.dumps(dataclasses.asdict(reading), ensure_ascii=False),
+             "s": reading.status, "x": reading.to_json(),
              "u": ws.ctx.user_id})
         _audit_view(ws, conn, v, spot.region)
     return _render_source(_visual(ws, spot, reading, earlier=False))
@@ -1551,7 +1550,7 @@ def _numbers_of(text_: str) -> list[tuple[str, int, int, Decimal]]:
 
 def _key(s) -> str:
     """A row label or a column header for matching: one spelling of the abbreviation marks, one space."""
-    return " ".join(meaning._norm(str(s or "")).replace(" ", " ").split()).strip(" :")
+    return meaning._flat(str(s or "")).strip(" :")
 
 
 def _match_one(wanted: str, options: list[str], what: str) -> int:
@@ -1693,8 +1692,8 @@ def _take_quote(src: Source, full: str, loc: dict) -> dict:
     wanted = _parse_number(loc["number"])
     if wanted is None:
         raise ToolError(f"number «{loc['number']}» אינו מספר אחד")
-    quote = " ".join(meaning._norm(loc["quote"]).split())
-    text_ = " ".join(meaning._norm(full).split())
+    quote = meaning._flat(loc["quote"])
+    text_ = meaning._flat(full)
     if len(quote) < 3 or quote not in text_:
         raise ToolError(f"הציטוט אינו מופיע כלשונו ב-{src.sid}: העתק את המשפט מהמקור בדיוק (או בחר תא בטבלה)")
     if " | " in quote:
@@ -1834,13 +1833,13 @@ def tool_assume(ws: Workspace, value: str, quote: str, label: str = "") -> str:
     wanted = _parse_number(value)
     if wanted is None:
         raise ToolError("value חייב להיות מספר אחד כפי שהמשתמש כתב אותו (למשל 5%)")
-    q = " ".join(meaning._norm(quote or "").split())
+    q = meaning._flat(quote or "")
     if len(q) < 2:
         raise ToolError("quote חייב להיות ציטוט מדויק מהודעת המשתמש")
     found = None
     for msg in [m for m in ws.user_messages if m["current"]] + [m for m in reversed(ws.user_messages)
                                                                 if not m["current"]]:
-        if q in " ".join(meaning._norm(msg["text"]).split()):
+        if q in meaning._flat(msg["text"]):
             found = msg
             break
     if found is None:
@@ -1934,7 +1933,7 @@ def _reproduces(ws: Workspace, out: calc.Outcome, leaves: list[str]) -> dict | N
             if numbers_in(written) & inputs or len(re.sub(r"\D", "", written).lstrip("0")) < 3:
                 continue
             percent = t[end:end + 2].lstrip().startswith("%")
-            if calc.display_matches(written, percent, out.value, out.dims):
+            if calc.display_matches(written, percent, out.value, out.dims, out.kind):
                 return {"source": sid, "as_written": written + ("%" if percent else "")}
     return None
 

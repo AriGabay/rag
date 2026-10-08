@@ -192,7 +192,7 @@ class Problem:
     severity: Literal["error", "partial"] = "error"
     # "missing_qualifier": the number's evidence gives it a qualifier the unit omits; "needs_citation": the unit is
     # supported by evidence the server found in the same calculation (``cite``), which the answer must cite
-    kind: str = "claim"
+    kind: Literal["claim", "missing_qualifier", "needs_citation", "request"] = "claim"
     number: str | None = None  # for a missing qualifier: the number as written in the unit
     annotation: str | None = None  # for a missing qualifier: the one qualifier attested, as written
     cite: str | None = None  # the source or measurement the server found that states the qualifier
@@ -415,7 +415,8 @@ def _orphans(markdown: str) -> list[str]:
 def _drop_orphan_headings(original: str, text: str) -> str:
     """Remove the headings whose whole content was removed (orphaned now, not in the original answer)."""
     before = _orphans(original)
-    gone = [h for h in _orphans(text) if before.count(h) < _orphans(text).count(h)]
+    after = _orphans(text)
+    gone = [h for h in after if before.count(h) < after.count(h)]
     if not gone:
         return text
     out = []
@@ -597,7 +598,7 @@ def _computed_numbers(text: str, computations: list) -> set[str]:
         written = m.group(0).rstrip(".,")
         percent = bool(re.match(r"\s*(?:%|אחוז)", text[m.end():m.end() + 6]))
         for c in computations:
-            if display_matches(written, percent, c.value, c.dims) or any(
+            if display_matches(written, percent, c.value, c.dims, c.outcome.kind) or any(
                     display_matches(written, False, v, ()) for _, v in c.outcome.steps):
                 out |= numbers_in(written)
                 break
@@ -945,13 +946,16 @@ def _shown_support(verdicts: dict[int, JudgeVerdict], batch: _Batch, ws: Workspa
     """A ``supported`` verdict that names a support the unit does not cite stands only when every id it names is a
     source shown in this call and evidence of the turn (``S#``, ``M#``, ``V#``, ``C#``); otherwise the unit is
     unsupported, as if no source supported it."""
-    shown = {sid for u in batch.units for sid in u.ids if _source_parts(ws, sid) is not None}
     units = {u.index: u for u in batch.units}
     out = dict(verdicts)
+    shown = None
     for i, v in verdicts.items():
         named = [s for s in v.supported_by if s not in units[i].ids]
         if v.verdict != "supported" or not named:
             continue
+        if shown is None:  # the evidence ids the batch cites, built only when a verdict names another
+            evidence = (ws.sources, ws.measurements, ws.values, ws.assumptions, ws.computations)
+            shown = {sid for u in batch.units for sid in u.ids if any(sid in d for d in evidence)}
         wrong = [s for s in named if s not in shown or not _EVIDENCE_ID.fullmatch(s)]
         if wrong:
             out[i] = v.model_copy(update={"verdict": "unsupported", "supported_by": [], "reason": (
@@ -1052,9 +1056,9 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 report.problems.append(Problem(u, "נתמך חלקית: " + v.reason, "partial"))
             elif named := [s for s in dict.fromkeys(v.supported_by) if s not in u.ids]:
                 # supported by a shown source the unit does not cite: kept, and cited, only if the numbers agree
-                failed = _named_support(u, named, ws, question)
-                if failed is not None:
-                    report.problems.append(failed)
+                problem = _named_support(u, named, ws, question)
+                if problem is not None:
+                    report.problems.append(problem)
                 else:
                     report.problems += [Problem(u, f"נתמך ב-{s}, שהתשובה לא ציטטה", kind="needs_citation", cite=s)
                                         for s in named]

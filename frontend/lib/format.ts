@@ -1,7 +1,16 @@
 // Display formatting. Decimal strings are formatted directly (Intl accepts exact numeric strings),
 // so no float arithmetic touches money or area. Nothing here aggregates values.
 
-import type { AbstentionKind, ClaimKind, FactCoverage, Provider, ProviderMode, ProviderStatus, VersionStatus } from "./types";
+import type {
+  AbstentionKind,
+  ClaimKind,
+  CoverageRegion,
+  FactCoverage,
+  Provider,
+  ProviderMode,
+  ProviderStatus,
+  VersionStatus,
+} from "./types";
 
 const DECIMAL_RE = /^[-+]?\d+(\.\d+)?$/;
 
@@ -189,6 +198,15 @@ export const ABSTENTION_HEADING: Record<AbstentionKind, string> = {
 export function abstentionHeading(kind: string | null | undefined): string {
   return (kind && ABSTENTION_HEADING[kind as AbstentionKind]) || "לא ניתן לענות על סמך המסמכים";
 }
+
+/** A block or region kind of a document reading (the documents page and the source panel). */
+export const BLOCK_KIND_LABEL: Record<CoverageRegion["kind"], string> = {
+  image: "תמונה",
+  table: "טבלה",
+  paragraph: "פסקה",
+  heading: "כותרת",
+  textbox: "תיבת טקסט",
+};
 
 /** Canonical unit codes of computed attributes (backend templates.UNIT_LABELS). */
 export const UNIT_LABEL: Record<string, string> = {
