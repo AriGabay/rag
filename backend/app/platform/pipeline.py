@@ -466,6 +466,22 @@ def _page_texts(result: ExtractionResult) -> dict[int, str]:
     return {page: "\n".join(parts) for page, parts in out.items()}
 
 
+def _furniture_numbers(result: ExtractionResult) -> set[str]:
+    """The numbers of the page furniture the new reading read once for the whole document (a letterhead, a footer
+    with an address and phone numbers): its one block stands at the first occurrence, but the numbers are on every
+    page it is on, so no page lost them."""
+    shown = {r["hash"] for r in result.repeated}
+    return set().union(*(_numbers(f"{b.text or ''} {b.picture_text or ''}") for b in result.blocks
+                         if b.content_hash and any(_hash_shown(b.content_hash) == h for h in shown)))
+
+
+def _hash_shown(digest: str) -> str:
+    from app.extraction.regions import HASH_SHOWN
+
+    prefix = "ink:" if digest.startswith("ink:") else ""
+    return prefix + digest.removeprefix(prefix)[:HASH_SHOWN]
+
+
 def reading_regression(conn: Connection, version_id: UUID, result: ExtractionResult) -> dict | None:
     """Whether ``result`` reads the version worse than its current reading, on measures both readers produce
     (KTD7): per page, every number of the current page text is still in the new reading of that page; no page
@@ -476,10 +492,11 @@ def reading_regression(conn: Connection, version_id: UUID, result: ExtractionRes
     old_tables = conn.execute(text("SELECT count(*) FROM extracted_tables WHERE version_id = :v"),
                               {"v": version_id}).scalar_one()
     texts = _page_texts(result)
+    furniture = _furniture_numbers(result)
     new_ok = {p.page_no: p.ok for p in result.pages}
     pages = []
     for p in old_pages:
-        missing = _missing_numbers(p.text, _numbers(texts.get(p.page_no, "")))
+        missing = _missing_numbers(p.text, _numbers(texts.get(p.page_no, "")) | furniture)
         if missing:
             pages.append({"page": p.page_no, "missing_numbers": missing[:MISSING_SHOWN]})
     failed = [p.page_no for p in old_pages if p.ok and not new_ok.get(p.page_no, False)]
