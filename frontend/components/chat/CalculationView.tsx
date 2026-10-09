@@ -1,6 +1,6 @@
 "use client";
 
-import { type RefObject, useEffect, useRef, useState } from "react";
+import { type RefObject, useMemo, useState } from "react";
 import type {
   ChatAnswer,
   ChatAssumption,
@@ -11,6 +11,7 @@ import type {
 } from "@/lib/chatTypes";
 import { VALUE_STATUS, valueStatusText } from "@/lib/format";
 import { assumptionText, citedTarget, resultText } from "./Message";
+import { useInitialFocus } from "./SourceViewer";
 import "./chat.css";
 
 // The calculation breakdown (U7, R14, R16, KTD6): a computed result (C#) opens its formula, its steps, its full value
@@ -195,16 +196,6 @@ function PanelHeader({
   );
 }
 
-function useInitialFocus(hidden: boolean | undefined): RefObject<HTMLButtonElement | null> {
-  const ref = useRef<HTMLButtonElement>(null);
-  useEffect(() => {
-    if (!hidden) ref.current?.focus();
-    // focus moves into the panel when it opens; a level shown again gets focus back from the stack
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  return ref;
-}
-
 /** "Go to your message": scrolls the thread to the user message an assumption quotes, or says it is not shown. */
 function MessageLink({
   assumption,
@@ -272,8 +263,9 @@ export function CalculationView({
   const closeRef = useInitialFocus(hidden);
   const answer = origin.answer;
   const c = answer.computations.find((x) => x.id === id);
+  // resolved once per answer and calculation, not on every render of the level
+  const rows = useMemo(() => (c ? inputRows(answer, c) : []), [answer, c]);
   if (!c) return null;
-  const rows = inputRows(answer, c);
   const documents = rows.filter((r) => r.kind === "value" || r.kind === "measurement" || r.kind === "source");
   const assumptions = rows.filter((r) => r.kind === "assumption");
   const chained = rows.filter((r) => r.kind === "computation");
@@ -289,7 +281,7 @@ export function CalculationView({
   return (
     <aside className="source-panel calc-view" aria-label="פירוט החישוב" data-testid="calc-view" data-id={c.id} hidden={hidden}>
       <PanelHeader
-        title={c.label ? `${c.label}` : "חישוב"}
+        title={c.label || "חישוב"}
         subtitle={`חישוב ${c.id}`}
         label="סגירת פירוט החישוב"
         back={back}

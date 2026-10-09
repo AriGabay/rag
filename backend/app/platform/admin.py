@@ -296,6 +296,7 @@ def backfill_positions(ctx: TenantContext = Depends(require_admin)) -> dict:
 def _positions_progress(conn: Connection) -> dict:
     """How far the geometry backfill is (KTD3): the office's current PDF versions, how many store positions, and over
     the backfilled ones the blocks and tables that aligned, did not align, or sit on pages that cannot be converted."""
+    from app.extraction.default import PDF_MIME
     from app.extraction.geometry import POSITIONS_VERSION
 
     def total(kind: str, state: str) -> str:
@@ -308,8 +309,8 @@ def _positions_progress(conn: Connection) -> dict:
         " count(*) FILTER (WHERE v.ingestion ? 'positions_backfill') AS backfilled, "
         + ", ".join(total(k, s) for k in ("blocks", "tables") for s in states)
         + " FROM document_versions v JOIN documents d ON d.id = v.document_id AND d.deleted_at IS NULL"
-        " WHERE v.is_current AND v.status IN ('ready', 'needs_review') AND v.mime_type = 'application/pdf'"),
-        {"pv": POSITIONS_VERSION}).one()
+        " WHERE v.is_current AND v.status IN ('ready', 'needs_review') AND v.mime_type = :pdf"),
+        {"pv": POSITIONS_VERSION, "pdf": PDF_MIME}).one()
     return {"pdf_versions": r.total, "with_positions": r.positioned, "without_positions": r.total - r.positioned,
             "backfilled": r.backfilled,
             "blocks": {s: getattr(r, f"blocks_{s}") for s in states},

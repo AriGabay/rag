@@ -15,6 +15,7 @@ import socket
 import threading
 import time
 import traceback
+from collections.abc import Callable
 from uuid import UUID
 
 from sqlalchemy import text
@@ -25,7 +26,7 @@ from app.config import get_settings
 from app.db import TenantContext, anonymous_tx, tenant_tx
 from app.extraction.base import ExtractionError
 from app.platform import pipeline
-from app.platform.jobs import fail_job, finish_job, renew_lease
+from app.platform.jobs import fail_job, finish_job, is_reindex, renew_lease
 
 logger = logging.getLogger("app.worker")
 
@@ -86,19 +87,14 @@ def handle_extract_facts(ctx: TenantContext, job, worker_id: str) -> None:
     logger.info("extract job %s: %s (%s)", job.job_id, result.outcome, result.reason)
 
 
-def handle_background(ctx: TenantContext, job, worker_id: str) -> None:
-    """Reindexing a processed version, or extracting its measurements. Neither changes the version's status: a
-    failure is recorded on the job only (the version keeps its earlier reading). A reading worse than the current
-    one (``pipeline.ReadingRegression``) ends at once as ``kept_previous`` (``jobs.fail_job``): reading again would read the same."""
+def _run_background(ctx: TenantContext, job, worker_id: str, work: Callable[[], object]) -> None:
+    """Run a background job's ``work`` under a lease and record its outcome on the job only, never on the version: an
+    ``ExtractionError`` fails it with its reason (terminally when permanent), any other error with its type's name."""
     keeper = _LeaseKeeper(job.office_id, job.job_id, worker_id)
     keeper.start()
     try:
         try:
-            if job.kind == "extract_measurements":
-                outcome = pipeline.run_measurements(job.office_id, job.version_id)
-            else:
-                outcome = pipeline.reindex_version(job.office_id, job.version_id,
-                                                   accept_regression=bool((job.payload or {}).get("accept_regression")))
+            outcome = work()
         finally:
             keeper.stop_event.set()
     except Exception as exc:  # noqa: BLE001
@@ -114,28 +110,25 @@ def handle_background(ctx: TenantContext, job, worker_id: str) -> None:
     logger.info("%s job %s: %s", job.kind, job.job_id, outcome)
 
 
+def handle_background(ctx: TenantContext, job, worker_id: str) -> None:
+    """Reindexing a processed version, or extracting its measurements. Neither changes the version's status: a
+    failure is recorded on the job only (the version keeps its earlier reading). A reading worse than the current
+    one (``pipeline.ReadingRegression``) ends at once as ``kept_previous`` (``jobs.fail_job``): reading again would read the same."""
+    def work():
+        if job.kind == "extract_measurements":
+            return pipeline.run_measurements(job.office_id, job.version_id)
+        return pipeline.reindex_version(job.office_id, job.version_id,
+                                        accept_regression=bool((job.payload or {}).get("accept_regression")))
+
+    _run_background(ctx, job, worker_id, work)
+
+
 def handle_positions(ctx: TenantContext, job, worker_id: str) -> None:
     """The geometry-only backfill of one version (KTD3). It never changes the version's status or reading: a
     failure is recorded on the job only. A stored file that is missing (or a file the reader cannot open) fails the
-    job permanently with the reason, and nothing is written."""
-    keeper = _LeaseKeeper(job.office_id, job.job_id, worker_id)
-    keeper.start()
-    try:
-        try:
-            outcome = pipeline.backfill_positions(job.office_id, job.version_id)
-        finally:
-            keeper.stop_event.set()
-    except Exception as exc:  # noqa: BLE001
-        logger.error("positions job %s failed: %s", job.job_id, type(exc).__name__)
-        logger.debug("%s", traceback.format_exc())
-        reason = exc.reason if isinstance(exc, ExtractionError) else type(exc).__name__
-        permanent = isinstance(exc, ExtractionError) and exc.permanent
-        with tenant_tx(ctx) as conn:
-            fail_job(conn, job.job_id, reason, permanent, job.attempts, job.max_attempts)
-        return
-    with tenant_tx(ctx) as conn:
-        finish_job(conn, job.job_id)
-    logger.info("positions job %s: %s", job.job_id, outcome)
+    job permanently with the reason, and nothing is written. ``job.kind`` is ``positions``, so its log lines read
+    "positions job ..."."""
+    _run_background(ctx, job, worker_id, lambda: pipeline.backfill_positions(job.office_id, job.version_id))
 
 
 def run_one(worker_id: str) -> bool:
@@ -150,7 +143,8 @@ def run_one(worker_id: str) -> bool:
     if job.kind == "positions":
         handle_positions(ctx, job, worker_id)
         return True
-    if job.kind == "extract_measurements" or (job.payload or {}).get("mode") == "reindex":
+    # what is left is a ``process`` job (the jobs table allows four kinds), so ``is_reindex`` reads only its mode
+    if job.kind == "extract_measurements" or is_reindex(job.kind, job.payload):
         handle_background(ctx, job, worker_id)
         return True
     keeper = _LeaseKeeper(job.office_id, job.job_id, worker_id)

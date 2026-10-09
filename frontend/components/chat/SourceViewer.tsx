@@ -142,6 +142,18 @@ interface SourceViewerProps {
   hidden?: boolean;
 }
 
+/** The close button's ref of a panel level, focused once when the level opens shown (not when it opens hidden, and
+ * not on later renders): a level shown again gets focus back from the panel stack. */
+export function useInitialFocus(hidden: boolean | undefined): RefObject<HTMLButtonElement | null> {
+  const ref = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!hidden) ref.current?.focus();
+    // focus moves into the panel when it opens; a level shown again gets focus back from the stack
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return ref;
+}
+
 /** One level of the panel stack showing a cited place. The wide mode and the zoom stay while moving between
  * citations; everything about a target (its tab, its failure, its revocation) starts fresh with it. */
 export function SourceViewer({ nav, onNavigate, onClose, hidden }: SourceViewerProps) {
@@ -149,16 +161,11 @@ export function SourceViewer({ nav, onNavigate, onClose, hidden }: SourceViewerP
   const [zoom, setZoom] = useState(false);
   // the target whose document stopped being visible (a new target starts unrevoked)
   const [revokedKey, setRevokedKey] = useState<string | null>(null);
-  const closeRef = useRef<HTMLButtonElement>(null);
+  // focus moves into the viewer when it opens, not on every navigation inside it
+  const closeRef = useInitialFocus(hidden);
   const target = nav.items[nav.index];
   const key = target ? `${nav.index}:${target.id}:${target.anchor?.version_id ?? target.source.version_id ?? "-"}` : "";
   const onRevoked = useCallback(() => setRevokedKey(key), [key]);
-
-  useEffect(() => {
-    if (!hidden) closeRef.current?.focus();
-    // focus moves into the viewer when it opens, not on every navigation inside it
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   if (!target) return null;
   const revoked = revokedKey === key;
@@ -305,6 +312,11 @@ function ViewerHeader({
   const subtitle = anchor ? (loc?.title ? loc.label : null) : target.source.location;
   const status = target.valueStatus ?? null;
   const structured = anchor ? viewKind(anchor) === "structured" : false;
+  const statusLine = status && (
+    <li data-testid="viewer-value-status" title={VALUE_STATUS[status].description}>
+      {valueStatusText(status)}
+    </li>
+  );
   return (
     <header>
       <div className="t">
@@ -319,20 +331,10 @@ function ViewerHeader({
               </li>
             )}
             <li data-testid="viewer-precision">{precisionLabel(anchor)}</li>
-            {status && (
-              <li data-testid="viewer-value-status" title={VALUE_STATUS[status].description}>
-                {valueStatusText(status)}
-              </li>
-            )}
+            {statusLine}
           </ul>
         )}
-        {!revoked && !anchor && status && (
-          <ul className="viewer-meta">
-            <li data-testid="viewer-value-status" title={VALUE_STATUS[status].description}>
-              {valueStatusText(status)}
-            </li>
-          </ul>
-        )}
+        {!revoked && !anchor && status && <ul className="viewer-meta">{statusLine}</ul>}
       </div>
       <div className="viewer-header-actions">
         <button
@@ -694,7 +696,7 @@ function PageView({
           const headerRects = header && header.page === p.page ? header.rects : [];
           const printed = p.printed_label && p.printed_label !== String(p.page) ? p.printed_label : null;
           // the cited place: its first rectangle, or the page itself when the mark is at page level
-          const pageCited = !draw || anchor.pages.every((x) => x.rects.length === 0) ? i === 0 : false;
+          const pageCited = (!draw || anchor.pages.every((x) => x.rects.length === 0)) && i === 0;
           return (
             <section key={p.page} className="viewer-page" aria-label={`עמוד ${p.page}`}>
               <div className="viewer-page-label" dir="rtl">

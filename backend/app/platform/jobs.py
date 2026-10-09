@@ -21,9 +21,8 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from app.config import get_settings
+from app.extraction.default import PDF_MIME
 from app.extraction.geometry import POSITIONS_VERSION
-
-PDF_MIME = "application/pdf"
 
 
 def enqueue_processing(conn: Connection, version_id: UUID) -> None:

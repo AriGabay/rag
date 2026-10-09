@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import { errorMessage } from "./api";
 
 /**
@@ -32,6 +32,16 @@ export function useApi<T>(fetcher: (() => Promise<T>) | null) {
 
   const reload = useCallback(() => setTick((t) => t + 1), []);
   return { data, error, reload, setData };
+}
+
+function onVisibilityChange(cb: () => void): () => void {
+  document.addEventListener("visibilitychange", cb);
+  return () => document.removeEventListener("visibilitychange", cb);
+}
+
+/** Whether the page is visible (its tab in front); true on the server. Polling pauses while it is hidden. */
+export function usePageVisible(): boolean {
+  return useSyncExternalStore(onVisibilityChange, () => !document.hidden, () => true);
 }
 
 /** Calls `fn` every `ms` while `active` is true. */

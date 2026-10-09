@@ -43,6 +43,7 @@ from app.db import (  # noqa: F401 - system_ctx re-exported
     tenant_tx,
 )
 from app.extraction.base import Block, ExtractionError, ExtractionResult, check_deadline
+from app.extraction.default import PDF_MIME
 from app.extraction.geometry import POSITIONS_VERSION
 from app.extraction.normalize_text import normalize_for_search, undouble_word
 from app.extraction.pdf import READER_VERSION as PDF_READER_VERSION
@@ -59,7 +60,7 @@ PDF_INGESTION_VERSION = PDF_READER_VERSION
 
 def ingestion_version(mime_type: str | None) -> str:
     """The current reader version of a file type: a PDF's block reader, or the DOCX reader."""
-    return PDF_INGESTION_VERSION if mime_type == "application/pdf" else INGESTION_VERSION
+    return PDF_INGESTION_VERSION if mime_type == PDF_MIME else INGESTION_VERSION
 
 
 @dataclass
@@ -191,6 +192,16 @@ def persist_extraction(conn: Connection, info: VersionInfo, result: ExtractionRe
     _insert_outputs(conn, info, result)
 
 
+def _page_params(g, printed_label: str | None) -> dict:
+    """A page's geometry and printed number as the ``pages`` columns' bind parameters, the same for a fresh reading
+    and the positions backfill. A page without geometry (``g`` None) gets NULL in each."""
+    return {"mb": json.dumps(g.mediabox) if g is not None and g.mediabox is not None else None,
+            "cb": json.dumps(g.cropbox) if g is not None and g.cropbox is not None else None,
+            "r": g.rotation if g is not None else None, "w": g.width if g is not None else None,
+            "h": g.height if g is not None else None, "pl": printed_label,
+            "gi": g.issue if g is not None else None}
+
+
 def _insert_outputs(conn: Connection, info: VersionInfo, result: ExtractionResult,
                     embeddings: tuple[list[str], str] | None = None, report_extra: dict | None = None) -> None:
     """Write a reading. ``embeddings``: each chunk's vector (pgvector text) and the model, when computed before
@@ -201,7 +212,6 @@ def _insert_outputs(conn: Connection, info: VersionInfo, result: ExtractionResul
     backfill selects versions by (KTD3)."""
     blocks = _blocks_of(result)
     for p in result.pages:
-        g = p.geometry
         conn.execute(
             text(
                 "INSERT INTO pages (office_id, document_id, version_id, page_no, text, method, quality, ok, mediabox,"
@@ -210,12 +220,7 @@ def _insert_outputs(conn: Connection, info: VersionInfo, result: ExtractionResul
                 " :w, :h, :pl, :gi)"
             ),
             {"d": info.document_id, "v": info.id, "n": p.page_no, "t": p.text, "m": p.method,
-             "q": round(p.quality, 4), "ok": p.ok,
-             "mb": json.dumps(g.mediabox) if g is not None and g.mediabox is not None else None,
-             "cb": json.dumps(g.cropbox) if g is not None and g.cropbox is not None else None,
-             "r": g.rotation if g is not None else None, "w": g.width if g is not None else None,
-             "h": g.height if g is not None else None, "pl": p.printed_label,
-             "gi": g.issue if g is not None else None},
+             "q": round(p.quality, 4), "ok": p.ok, **_page_params(p.geometry, p.printed_label)},
         )
     for b in blocks:
         conn.execute(
@@ -686,7 +691,7 @@ def backfill_positions(office_id: UUID, version_id: UUID) -> str | None:
         if row is None:
             return None  # deleted, or never read
         ing = row.ingestion or {}
-        if row.mime_type != "application/pdf":
+        if row.mime_type != PDF_MIME:
             return "skipped"
         if ing.get("positions") == POSITIONS_VERSION:
             return "present"
@@ -715,17 +720,11 @@ def backfill_positions(office_id: UUID, version_id: UUID) -> str | None:
         if now.get("reading_id") != ing.get("reading_id"):
             return "reread"  # read again meanwhile: the new reading brought its own positions
         for p in found.pages:
-            g = p.geometry
             conn.execute(text(
                 "UPDATE pages SET mediabox = CAST(:mb AS jsonb), cropbox = CAST(:cb AS jsonb), rotation = :r,"
                 " display_width = :w, display_height = :h, printed_label = :pl, geometry_issue = :gi"
                 " WHERE version_id = :v AND page_no = :n"),
-                {"v": version_id, "n": p.page_no,
-                 "mb": json.dumps(g.mediabox) if g is not None and g.mediabox is not None else None,
-                 "cb": json.dumps(g.cropbox) if g is not None and g.cropbox is not None else None,
-                 "r": g.rotation if g is not None else None, "w": g.width if g is not None else None,
-                 "h": g.height if g is not None else None, "pl": p.printed_label,
-                 "gi": g.issue if g is not None else None})
+                {"v": version_id, "n": p.page_no, **_page_params(p.geometry, p.printed_label)})
         for index, spans in found.spans.items():
             # the text it was aligned to is still the block's text (the guard against a concurrent change)
             conn.execute(text(

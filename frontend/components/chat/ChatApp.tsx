@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useSession } from "@/components/AppShell";
 import { api, ApiError, chatApi, errorMessage, isAbortError, newTurnId } from "@/lib/api";
 import type { ChatAnswer, ChatConversation, ChatMessage, ViewerNav } from "@/lib/chatTypes";
@@ -729,8 +729,10 @@ export default function ChatApp() {
   );
 }
 
-/** One level of the panel stack; the levels below the top stay mounted (their state kept) but hidden. */
-function PanelLevelView({
+/** One level of the panel stack; the levels below the top stay mounted (their state kept) but hidden. Memoized: its
+ * props are the entry's level, primitives and the stack's stable callbacks, so a re-render of the conversation (a
+ * keystroke in the composer, a poll) does not re-render the open levels. */
+const PanelLevelView = memo(function PanelLevelView({
   level,
   top,
   back,
@@ -782,7 +784,7 @@ function PanelLevelView({
     default:
       return null;
   }
-}
+});
 
 function ConversationList({
   items,

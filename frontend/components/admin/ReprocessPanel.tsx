@@ -4,7 +4,7 @@ import { useState } from "react";
 import { ErrorAlert, Notice } from "@/components/ui";
 import { errorMessage, request } from "@/lib/api";
 import { JOB_STATUS_LABEL, KEPT_PREVIOUS_TITLE, keptPreviousText, type KeptPrevious } from "@/lib/format";
-import { useApi, useInterval } from "@/lib/useApi";
+import { useApi, useInterval, usePageVisible } from "@/lib/useApi";
 
 interface JobRow {
   kind: string;
@@ -49,7 +49,9 @@ export function ReprocessPanel() {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  useInterval(load, 5000, true);
+  const visible = usePageVisible();
+  // no polling while the tab is hidden; it resumes when the tab is shown again
+  useInterval(load, 5000, visible);
 
   const run = async (path: string, all: boolean, label: string, acceptRegression = false) => {
     setBusy(true);

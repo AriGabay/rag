@@ -70,7 +70,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -78,6 +78,7 @@ from app.answering.verify import _NUMBER as _NUM_AT  # one reading of numbers fo
 from app.answering.verify import numbers_in
 from app.chat import meaning
 from app.chat.evidence import select
+from app.measurements.extract import stance_label
 from app.providers.llm import (
     CallStatus,
     LLMProvider,
@@ -163,7 +164,6 @@ JUDGE_POLICY = (
     "הופכת אותו להחלטה. כשהבקשה שואלת מה נקבע או אומץ, הייחוס לא ידוע ושום דבר בראיה אינו מראה שהערך אומץ — "
     "partial (defect part), אלא אם היחידה אומרת שלא ברור אם הערך אומץ. ייחוס שסומן כקביעת המודל אינו ראיה."
 )
-DEFECTS = ("none", "input", "scenario", "formula", "units", "framing", "part", "multiple_values")
 
 
 JUDGE_REQUIREMENTS_POLICY = (
@@ -800,7 +800,7 @@ def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
                 f" תקופה: {m['period']}, מע\"מ: {m['vat']}, בסיס שטח: {m['area_basis'] or 'לא צוין'}, נושא: "
                 f"{m['subject'] or 'לא צוין'}, תפקיד: {m['value_role']})"
                 + (f"\nסעיף: {m['section']}" if m.get("section") else "")
-                + (f"\nייחוס (מהטקסט): {_stance_label(m.get('stance'))}"
+                + (f"\nייחוס (מהטקסט): {stance_label(m['stance'])}"
                    + (f" של {m['stated_by']}" if m.get("stated_by") else "") if m.get("stance") else "")
                 + f"\nציטוט: {m['quote']}", "measurement")
     if sid in ws.values:
@@ -824,12 +824,6 @@ def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
     return None
 
 
-def _stance_label(stance: str | None) -> str:
-    from app.measurements.extract import STANCE_LABELS
-
-    return STANCE_LABELS.get(stance or "unknown", stance or "")
-
-
 def _attribution_text(v: dict) -> str:
     """A value's attribution for the judge (KTD8): its stance and who stated it, each marked as found in the text
     around it or asserted by the model, its scenario, and the source's own words that say it."""
@@ -842,7 +836,7 @@ def _attribution_text(v: dict) -> str:
     if stance == "unknown":
         out = "ייחוס: לא ידוע — המקור אינו אומר מי קבע את הערך או אם אומץ"
     else:
-        out = f"ייחוס: {_stance_label(stance)}{mark('stance')}"
+        out = f"ייחוס: {stance_label(stance)}{mark('stance')}"
     if v.get("stated_by"):
         out += f"; נאמר על ידי: {v['stated_by']}{mark('stated_by')}"
     if v.get("scenario"):
@@ -912,9 +906,18 @@ def computation_text(c, ws: Workspace | None = None) -> str:
     return "\n".join(lines)
 
 
-def _shown(text: str) -> list[tuple[str, bool, int, int, int]]:
-    """Each number of a text as it is shown: (as written, followed by a percent sign, the scale its scale word gives
-    it — 10**6 for "1.53 מיליון" — and its span)."""
+class Shown(NamedTuple):
+    """A number of a text as it is shown (``_shown``)."""
+
+    written: str  # as written, without a trailing period or comma
+    percent: bool  # followed by a percent sign
+    scale: int  # the scale its scale word gives it: 10**6 for "1.53 מיליון"
+    start: int  # its span in the text
+    end: int
+
+
+def _shown(text: str) -> list[Shown]:
+    """Each number of a text as it is shown (``Shown``)."""
     from app.chat.calc import scale_after
 
     out = []
@@ -922,7 +925,7 @@ def _shown(text: str) -> list[tuple[str, bool, int, int, int]]:
         written = m.group(0).rstrip(".,")
         end = m.start() + len(written)
         percent = bool(re.match(r"\s*(?:%|אחוז)", text[end:end + 6]))
-        out.append((written, percent, 1 if percent else scale_after(text, m.start(), end)[0], m.start(), end))
+        out.append(Shown(written, percent, 1 if percent else scale_after(text, m.start(), end)[0], m.start(), end))
     return out
 
 
@@ -941,9 +944,9 @@ def _computed_numbers(text: str, computations: list) -> set[str]:
     the scale they are written in (14.3% for 0.143155…, 1,530,000 or 1.53 מיליון for 1530000.00); a wrong digit, or
     more digits than the value rounds to (14.30%, 1.6 מיליון), is not one of them."""
     out: set[str] = set()
-    for written, percent, scale, _, _ in _shown(text):
-        if any(_shows(c, written, percent, scale) for c in computations):
-            out |= numbers_in(written)
+    for n in _shown(text):
+        if any(_shows(c, n.written, n.percent, n.scale) for c in computations):
+            out |= numbers_in(n.written)
     return out
 
 
@@ -1063,9 +1066,9 @@ def _computation_vat(unit: Unit, ws: Workspace, c) -> set[tuple[str, str]]:
     VAT recorded for it. Never a VAT word of its labels or conditions ("מע״מ: ללא מע״מ מול מע״מ לא צוין")."""
     out: set[tuple[str, str]] = set()
     if c.vat:
-        for written, percent, scale, _, _ in _shown(unit.text):
-            if _shows(c, written, percent, scale, steps=False):
-                out |= {(f, c.vat) for f in numbers_in(written)}
+        for n in _shown(unit.text):
+            if _shows(c, n.written, n.percent, n.scale, steps=False):
+                out |= {(f, c.vat) for f in numbers_in(n.written)}
     for x in c.inputs:
         v = ws.values.get(x["id"])
         if v is not None and v.vat in ("included", "excluded"):
@@ -1177,12 +1180,12 @@ def _framed_result(u: Unit, ws: Workspace) -> str | None:
     written_by_documents: set[str] = set()
     for _, t in _texts(ws, [i for i in u.ids if i not in ws.computations]):
         written_by_documents |= numbers_in(t)
-    for written, percent, scale, start, _ in _shown(u.text):
-        if numbers_in(written) & written_by_documents or not _stated_as_written(u.text, start):
+    for n in _shown(u.text):
+        if numbers_in(n.written) & written_by_documents or not _stated_as_written(u.text, n.start):
             continue
-        results = [c for c in computations if _shows(c, written, percent, scale, steps=False)]
+        results = [c for c in computations if _shows(c, n.written, n.percent, n.scale, steps=False)]
         if results and not any(c.reproduces for c in results):
-            return written
+            return n.written
     return None
 
 
@@ -1199,16 +1202,17 @@ def _misattributed(u: Unit, ws: Workspace) -> str | None:
             and v.provenance.get("stance") == "source" and v.provenance.get("stated_by") == "source"]
     if not held:
         return None
-    for written, _, _, start, end in _shown(u.text):
+    for n in _shown(u.text):
+        written = n.written
         for v in held:
             if not numbers_in(written) & numbers_in(v.written):
                 continue
-            said = attribution_at(u.text, start, end)
+            said = attribution_at(u.text, n.start, n.end)
             if said is None or names_match(v.stated_by, said.evidence):
                 continue
             other = said.stated_by and not names_match(v.stated_by, said.stated_by)
             if "adopted" in said.stances or other:
-                label = _stance_label(v.stance)
+                label = stance_label(v.stance or "unknown")
                 return (f"{written} הוא {label} של {v.stated_by} לפי המקור, והתשובה מציגה אותו כ"
                         + (f"דברי {said.stated_by}" if other and "adopted" not in said.stances else "מה שנקבע או אומץ")
                         + f"; ייחס אותו ל{v.stated_by}, או הצג את הערך שנקבע")
@@ -1233,11 +1237,11 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
         if not loose:
             continue
         chosen: list[str] = []
-        for written, percent, scale, start, _ in _shown(u.text):
-            if not numbers_in(written) & loose or _stated_as_written(u.text, start):
+        for n in _shown(u.text):
+            if not numbers_in(n.written) & loose or _stated_as_written(u.text, n.start):
                 continue
             matches = [c for cid, c in ws.computations.items() if cid not in u.ids and cid not in chosen
-                       and _shows(c, written, percent, scale, steps=False)]
+                       and _shows(c, n.written, n.percent, n.scale, steps=False)]
             if matches:
                 order = list(ws.computations)
                 best = max(matches, key=lambda c: (len(set(c.leaves) & set(u.ids)), -order.index(c.cid)))

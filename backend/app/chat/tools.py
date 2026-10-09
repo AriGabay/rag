@@ -84,6 +84,7 @@ from app.measurements.extract import (
     attribution_at,
     attribution_in,
     names_match,
+    stance_label,
 )
 from app.platform.documents import coverage_of, display_box_of, reading_notes
 from app.platform.search import SearchScope, search_passages
@@ -1697,7 +1698,7 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
             status = measurement_status(r)
             extra = f" | נושא: {_txt(r.subject)}" if r.subject else ""
             if getattr(r, "stance", None):
-                extra += f" | ייחוס: {STANCE_LABELS.get(r.stance, r.stance)}" + (
+                extra += f" | ייחוס: {stance_label(r.stance)}" + (
                     f" של {_txt(r.stated_by)}" if getattr(r, "stated_by", None) else "")
             issues = f" | הערות: {_txt('; '.join(r.issues))}" if r.issues else ""
             if anchor_lost(r):
@@ -1727,13 +1728,12 @@ def _cached_listing(conn: Connection, docs: list, metric_kinds: list[str] | None
     where = (" FROM verified_values c JOIN document_versions v ON v.id = c.version_id AND v.is_current"
              " AND v.ingestion->>'reading_id' = c.reading_id JOIN documents d ON d.id = c.document_id WHERE "
              + " AND ".join(conds))
-    total = conn.execute(text("SELECT count(*)" + where), params).scalar_one()
-    if not total:
-        return [], 0
     rows = conn.execute(text(
         "SELECT c.document_id, c.version_id, c.reading_id, c.locator, c.value, d.title" + where
         + f" ORDER BY d.title, d.id, c.created_at, c.locator::text LIMIT {CACHED_MAX}"), params).all()
-    return rows, total
+    if len(rows) < CACHED_MAX:  # the page holds them all: no count needed
+        return rows, len(rows)
+    return rows, conn.execute(text("SELECT count(*)" + where), params).scalar_one()
 
 
 def _cached_lines(ws: Workspace, rows: list, total: int) -> list[str]:
@@ -1750,13 +1750,12 @@ def _cached_lines(ws: Workspace, rows: list, total: int) -> list[str]:
                      and v.reading_id == r.reading_id and v.locator == r.locator), None)
         name = held or _cached_handle(ws, r.version_id, r.reading_id, r.document_id, r.locator)
         ws.touch(r.document_id, r.title, "retrieved")
-        attested = [VALUE_KINDS.get(record.get("kind"), "") if record.get("kind") else "",
-                    UNIT_LABELS.get(record.get("unit"), "") if record.get("unit") else "",
-                    PERIOD_LABELS.get(record.get("period"), "") if record.get("period") else "",
-                    VAT_LABELS.get(record.get("vat"), "") if record.get("vat") else "",
+        # the cached fields are strings or absent, and no label table has a None or "" key
+        attested = [VALUE_KINDS.get(record.get("kind"), ""), UNIT_LABELS.get(record.get("unit"), ""),
+                    PERIOD_LABELS.get(record.get("period"), ""), VAT_LABELS.get(record.get("vat"), ""),
                     f"בסיס שטח: {record['area_basis']}" if record.get("area_basis") else ""]
         if record.get("stance"):
-            attested.append(f"ייחוס: {STANCE_LABELS.get(record['stance'], record['stance'])}"
+            attested.append(f"ייחוס: {stance_label(record['stance'])}"
                             + (f" של {record['stated_by']}" if record.get("stated_by") else ""))
         says = "; ".join(x for x in attested if x) or "המקור אינו מעיד על משמעותו"
         out.append(f'  {name}{" (כבר נרשם בתור הזה)" if held else ""}: {_txt(record.get("value_text"))} | מסמך: '
@@ -2132,7 +2131,7 @@ def _attribution_line(value: calc.Value, said: Attribution | None) -> str:
     """The value's attribution as the tool reports it: the stance and speaker, what was asserted, and the source's
     own words when they say something else."""
     p = value.provenance
-    out = f"ייחוס: {STANCE_LABELS.get(value.stance, value.stance)}" + (f" של {value.stated_by}" if value.stated_by else "")
+    out = f"ייחוס: {stance_label(value.stance)}" + (f" של {value.stated_by}" if value.stated_by else "")
     if value.scenario:
         out += f" | תרחיש/מועד: {_txt(value.scenario)}"
     asserted = [n for k, n in (("stance", "העמדה"), ("stated_by", "מי אמר"), ("scenario", "התרחיש"))
@@ -2264,7 +2263,7 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
     # the same value verified clearly before, in this reading: its earlier clear reading is reused (KTD12)
     known = _known_clear(ws, src.version_id, reading_id, taken["locator"]) if unclear is not None else None
     # its section path: the block holding the number (a quote), or the table's block (a cell); else the source's
-    holder = next((r for r in rows if at is None or r.block_index in at), None)
+    holder = region[0] if region else None
     path = tuple(getattr(holder, "section_path", None) or ()) or ((src.section,) if src.section else ())
     settled = _settle(taken, given, path)
     reread = None
@@ -2272,7 +2271,7 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
         if known is not None and known["record"].get("value") == str(taken["value"]):
             reread = (True, MSG_CACHED_CLEAR)
         else:
-            key = (str(src.version_id), reading_id, json.dumps(taken["locator"], sort_keys=True, ensure_ascii=False))
+            key = _locator_key(src.version_id, reading_id, taken["locator"])
             reread = _reread_value(ws, v, unclear, taken["forms"], key)
     value = _new_value(ws, src, sid, taken, settled, given, label, path, reading_id)
     # how its own region was read, on the value itself, so coverage and the stored answer see it (R28)
@@ -2452,11 +2451,16 @@ def _store_verified(ws: Workspace, value: calc.Value, doc: dict) -> None:
         logger.warning("verified value cache store failed")
 
 
+def _locator_key(version_id, reading_id: str | None, locator: dict) -> tuple:
+    """A place in a reading as a hashable key: the version, the reading and the locator in one canonical spelling, so
+    the same place read again or listed from the cache is one handle."""
+    return (str(version_id), reading_id, json.dumps(locator, sort_keys=True, ensure_ascii=False))
+
+
 def _cached_handle(ws: Workspace, version_id, reading_id: str, document_id, locator: dict) -> str:
     """The turn's ``Q#`` for a cached value, bound to its version and reading like every handle."""
-    key = (str(version_id), reading_id, json.dumps(locator, sort_keys=True, ensure_ascii=False))
-    return ws.handle(CACHE_HANDLE, key, version_id=str(version_id), reading_id=reading_id,
-                     document_id=str(document_id), locator=dict(locator))
+    return ws.handle(CACHE_HANDLE, _locator_key(version_id, reading_id, locator), version_id=str(version_id),
+                     reading_id=reading_id, document_id=str(document_id), locator=dict(locator))
 
 
 def _cached_where(record: dict) -> str:

@@ -140,24 +140,22 @@ class Located:
     blocks: list[int]  # the blocks holding the quote
 
 
+def _number_value(written: str) -> Decimal | None:
+    try:
+        return Decimal(written.rstrip(".,").replace(",", ""))
+    except InvalidOperation:
+        return None
+
+
 def _number_at(s: str, pos: int) -> Decimal | None:
     for m in _NUMBER.finditer(s):
         if m.start() <= pos < m.end():
-            try:
-                return Decimal(m.group(0).rstrip(".,").replace(",", ""))
-            except InvalidOperation:
-                return None
+            return _number_value(m.group(0))
     return None
 
 
 def _values_in(s: str) -> list[Decimal]:
-    out = []
-    for m in _NUMBER.finditer(_norm(s or "")):
-        try:
-            out.append(Decimal(m.group(0).rstrip(".,").replace(",", "")))
-        except InvalidOperation:
-            continue
-    return out
+    return [v for m in _NUMBER.finditer(_norm(s or "")) if (v := _number_value(m.group(0))) is not None]
 
 
 def locate_quote(blocks, quote: str, value: Decimal) -> Located | None:
@@ -228,13 +226,6 @@ def locate_quote(blocks, quote: str, value: Decimal) -> Located | None:
         block, pos = raw_at(hits[0] + in_quote.start())
         number = [block, pos, pos + len(in_quote.group(0))]
     return Located(segments, number, [s[0] for s in segments])
-
-
-def _number_value(written: str) -> Decimal | None:
-    try:
-        return Decimal(written.rstrip(".,").replace(",", ""))
-    except InvalidOperation:
-        return None
 
 
 # --- the stored reading an answer's anchors are resolved against -------------------------------------------------

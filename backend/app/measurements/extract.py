@@ -83,6 +83,12 @@ STANCES = ("adopted", "claim", "proposal", "estimate", "other", "unknown")
 STANCE_LABELS = {"adopted": "מסקנה שאומצה", "claim": "טענה", "proposal": "הצעה", "estimate": "אומדן", "other": "אחר",
                  "unknown": "לא ידוע"}
 
+
+def stance_label(stance: str) -> str:
+    """The Hebrew label of a stance; a stance without one is shown as written. One lookup for the chat tools and the
+    verifier, so the model and the reader see the same word."""
+    return STANCE_LABELS.get(stance, stance)
+
 _HE = "א-ת"
 _VERB_PREFIX = rf"(?<![{_HE}])(?:ו|ש|וש|כש|וכש)?"  # never "ה": "המועד הקובע" is an adjective
 _NOUN_PREFIX = rf"(?<![{_HE}])[ובלכשמה]{{0,2}}"
@@ -163,7 +169,7 @@ def _markers(text: str, adopted: bool = True) -> list[tuple[int, str, str]]:
     """The attribution words of ``text`` in order: (position, stance, speaker). A verb takes its subject as speaker
     and a noun the actor after it; a party's own determination is its position (a claim), never an adoption. A party
     named with no attribution word marks its position too; a decision maker named alone marks an adoption."""
-    out: list[tuple[int, str, str]] = []
+    out: list[tuple[int, str, re.Match | None]] = []  # (position, stance, the actor it names, if any)
     tied: set[int] = set()
     for stance, rx in _VERBS:
         for m in rx.finditer(text):
@@ -551,8 +557,8 @@ def validate_text(ms: list[TextMeasurement], passages: dict[str, Passage]) -> li
 
 def _attributed(said: Attribution | None) -> dict:
     """A measurement's optional ``stance`` and ``stated_by``: one stance the text attests, or none."""
-    if said is None or said.stance is None:
-        return {"stance": None, "stated_by": (said.stated_by or None) if said else None}
+    if said is None:
+        return {"stance": None, "stated_by": None}
     return {"stance": said.stance, "stated_by": said.stated_by or None}
 
 

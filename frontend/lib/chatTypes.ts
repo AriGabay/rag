@@ -273,8 +273,8 @@ export interface ChatValue {
   stance?: "adopted" | "claim" | "proposal" | "estimate" | "other" | "unknown" | null;
   scenario?: string | null;
   attribution?: string | null;
-  /** Where its unit or meaning was read: the cell, row, column header, table or quote. */
-  meaning_from?: string | null;
+  /** Where its unit or meaning was read, per field (`{ unit: "header" }`): the cell, row, column header, table or quote. */
+  meaning_from?: Record<string, string> | null;
   /** How its own region was read: "clear" (also after a confirmed re-read) or "uncertain". */
   reading?: "clear" | "uncertain" | null;
   reading_note?: string | null;

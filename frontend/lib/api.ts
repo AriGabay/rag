@@ -145,8 +145,12 @@ export function safeApiUrl(url: string | null | undefined): string | null {
   return url.startsWith("/api/") ? url : null;
 }
 
+function versionBase(documentId: string, versionId: string): string {
+  return `/api/documents/${encodeURIComponent(documentId)}/versions/${encodeURIComponent(versionId)}`;
+}
+
 export function fileUrl(documentId: string, versionId: string, page?: number | null): string {
-  const base = `/api/documents/${encodeURIComponent(documentId)}/versions/${encodeURIComponent(versionId)}/file`;
+  const base = `${versionBase(documentId, versionId)}/file`;
   return page ? `${base}#page=${page}` : base;
 }
 
@@ -177,16 +181,9 @@ export interface SourceImage {
   url: string;
   /** With a reading id: whether the anchor's reading is still the stored one (null when not asked). */
   readingState: "current" | "stale" | null;
-  /** The page's display frame in points (the frame an anchor's rectangles are fractions of). */
-  displayWidth: number | null;
-  displayHeight: number | null;
 }
 
 export type PageScale = "normal" | "zoom";
-
-function versionBase(documentId: string, versionId: string): string {
-  return `/api/documents/${encodeURIComponent(documentId)}/versions/${encodeURIComponent(versionId)}`;
-}
 
 /** The page image route; `readingId` is the anchor's reading ("none" for one from before readings had ids). */
 export function pageImageUrl(
@@ -197,11 +194,6 @@ export function pageImageUrl(
   readingId?: string,
 ): string {
   return `${versionBase(documentId, versionId)}/pages/${page}/image${qs({ scale, reading_id: readingId })}`;
-}
-
-function headerNumber(res: Response, name: string): number | null {
-  const v = Number(res.headers.get(name));
-  return Number.isFinite(v) && v > 0 ? v : null;
 }
 
 /** Fetches a source image once. A failure is a `SourceError`: `revoked` for lost access, `state` for a typed
@@ -239,8 +231,6 @@ export async function fetchSourceImage(url: string, signal?: AbortSignal): Promi
   return {
     url: URL.createObjectURL(blob),
     readingState: reading === "current" || reading === "stale" ? reading : null,
-    displayWidth: headerNumber(res, "X-Display-Width"),
-    displayHeight: headerNumber(res, "X-Display-Height"),
   };
 }
 
@@ -279,7 +269,7 @@ export const chatApi = {
     readingId?: string,
   ) =>
     request<SourceBlocks>(
-      `/api/documents/${encodeURIComponent(documentId)}/versions/${encodeURIComponent(versionId)}/blocks${qs({ start, end, reading_id: readingId })}`,
+      `${versionBase(documentId, versionId)}/blocks${qs({ start, end, reading_id: readingId })}`,
       { signal },
     ),
 };

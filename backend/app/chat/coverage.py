@@ -39,7 +39,7 @@ import re
 from collections.abc import Collection
 from typing import TYPE_CHECKING
 
-from app.chat.tools import READ_TO_END
+from app.chat.tools import READ_TO_END, value_uncertain
 from app.db import tenant_tx
 
 if TYPE_CHECKING:
@@ -328,17 +328,7 @@ def _uncertain_value(ws: Workspace, ids: list[str]) -> bool:
     """A value among ``ids`` whose meaning was asserted rather than found in its source, whose own region stayed
     unclear after its focused re-reads (``Value.reading``), or whose source was read uncertainly while its own
     region was not found clear."""
-    for i in ids:
-        v = ws.values.get(i)
-        if v is None:
-            continue
-        source = ws.sources.get(v.source_id)
-        if v.certainty != "verified" or i in ws.uncertain_values:
-            return True
-        if (source is not None and source.status == "uncertain_reading" and v.reading != "clear"
-                and i not in ws.settled_values):
-            return True
-    return False
+    return any(value_uncertain(ws, i) for i in ids if i in ws.values)
 
 
 def limitation(ws: Workspace, outcome: dict, turn: TurnRequirements | None = None) -> dict:
