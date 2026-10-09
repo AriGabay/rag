@@ -494,3 +494,22 @@ test.describe("answer completeness and value statuses", () => {
     await page.request.delete(`/api/chat/conversations/${id}`);
   });
 });
+
+test.describe("a hidden answer", () => {
+  test("an answer hidden after its source was revoked shows the hidden note and the page keeps working", async ({
+    page,
+  }) => {
+    await login(page, USERS.adminB);
+    const { id } = await (await page.request.post("/api/chat/conversations")).json();
+    const errors: string[] = [];
+    page.on("pageerror", (e) => errors.push(e.message));
+    // the server keeps only the answer's kind once a document behind it is no longer visible
+    const body = messages(id, { kind: "rag", hidden: true });
+    body.messages[1].content = "";
+    await page.route(`**/api/chat/conversations/${id}/messages*`, (route) => route.fulfill({ json: body }));
+    await page.goto(`/chat?c=${id}`);
+    await expect(page.locator(".msg-assistant").last()).toContainText("התשובה הוסתרה");
+    await expect(page.getByRole("button", { name: "שיחה חדשה" }).first()).toBeVisible();
+    expect(errors).toEqual([]);
+  });
+});

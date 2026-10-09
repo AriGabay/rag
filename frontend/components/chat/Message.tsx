@@ -189,7 +189,8 @@ interface AssistantProps {
 export function AssistantMessage({ message, isLast, onCite, onRetry, onStop }: AssistantProps) {
   const [copied, setCopied] = useState(false);
   const answer = message.answer;
-  const citations = useMemo(() => (answer ? citationTargets(answer) : new Map()), [answer]);
+  // a hidden answer keeps only its kind: it has no text or sources to cite
+  const citations = useMemo(() => (answer && !answer.hidden ? citationTargets(answer) : new Map()), [answer]);
   const cite = useCallback((id: string) => answer && onCite(answer, id, message), [answer, onCite, message]);
 
   if (message.status === "running" || message.status === "cancelling") {

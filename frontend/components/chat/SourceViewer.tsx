@@ -120,7 +120,11 @@ function shownPages(anchor: ChatAnchor): ChatAnchorPage[] {
   const pages = [...anchor.pages].sort((a, b) => a.page - b.page);
   const header = anchor.table?.header;
   if (header && !pages.some((p) => p.page === header.page)) {
-    pages.push({ page: header.page, printed_label: null, width: null, height: null, rects: [], focus: [] });
+    // the header's page is laid out at a cited page's size before its image loads, so centring the cited row does
+    // not shift when it arrives (the pages of one document share a size far more often than not)
+    const known = pages.find((p) => p.width && p.height);
+    pages.push({ page: header.page, printed_label: null, width: known?.width ?? null, height: known?.height ?? null,
+                 rects: [], focus: [] });
     pages.sort((a, b) => a.page - b.page);
   }
   return pages;

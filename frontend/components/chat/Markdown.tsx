@@ -17,9 +17,9 @@ export interface CitationTarget {
 }
 
 /** Order of first appearance of every cited id: the chips show these numbers, the details list uses them too. */
-export function citationOrder(markdown: string): string[] {
+export function citationOrder(markdown: string | null | undefined): string[] {
   const out: string[] = [];
-  for (const m of markdown.matchAll(CITATION_GROUP)) {
+  for (const m of (markdown ?? "").matchAll(CITATION_GROUP)) {
     for (const id of m[1].split(/\s*[,،;]\s*/)) {
       if (!out.includes(id)) out.push(id);
     }
