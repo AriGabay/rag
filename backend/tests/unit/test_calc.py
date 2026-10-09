@@ -536,3 +536,91 @@ def test_a_calculation_component_waiting_for_a_detail_nobody_gave_needs_clarific
     statuses = {o["id"]: o["status"] for o in report.requirement_outcomes()}
     assert statuses == {"N1": "needs_clarification", "N2": "not_answered"}
     assert VerifyReport([], requirements=[item]).requirement_outcomes()[0]["status"] == "not_answered"
+
+
+# --- the scale a source states its amounts in (R14): "באלפי ₪" -------------------------------------------------------
+
+K_INCOME = operand("V1", "412300", "ILS", kind="income", role="income", subject="פרויקט הדגמה", vat="excluded",
+                   scale=1000)
+K_COST = operand("V2", "368150", "ILS", kind="cost", role="cost", subject="פרויקט הדגמה", vat="excluded", scale=1000)
+UNITS_COST = operand("V3", "1250000", "ILS", kind="cost", role="cost", subject="פרויקט הדגמה", vat="excluded")
+AREA = operand("V4", "2000", "sqm", subject="פרויקט הדגמה")
+
+
+@pytest.mark.parametrize("expression, value, scale", [
+    ("V1 - V2", "44150", 1000),  # a difference of amounts of one scale keeps it
+    ("V1 + V2", "780450", 1000),
+    ("max(V2, V5)", "368150", 1000),
+    ("V1 - V2*(1+A1%)", "25742.5", 1000),  # an amount × a rate keeps it
+    ("V1 * 12", "4947600", 1000),
+    ("(V1 - V2) / V2", "0.1199239440445470596224365069", 1),  # amount ÷ amount: the scale cancels
+    ("V1 / V4", "206.15", 1000),  # thousands of ₪ per m²
+    ("V1 / V4 * V4", "412300", 1000),
+])
+def test_a_result_carries_the_scale_its_inputs_are_stated_in(expression, value, scale):
+    other = operand("V5", "300000", "ILS", kind="cost", role="cost", subject="פרויקט הדגמה", vat="excluded", scale=1000)
+    out = run(expression, ops(K_INCOME, K_COST, RISE, AREA, other))
+    assert (out.value, out.scale, out.rescaled) == (Decimal(value), scale, False)
+
+
+def test_amounts_of_different_scales_are_brought_to_units_before_they_are_combined():
+    out = run("V1 - V3", ops(K_INCOME, UNITS_COST))
+    assert (out.value, out.scale, out.rescaled) == (Decimal("411050000"), 1, True)
+    # a ratio of amounts in different scales is a plain ratio, never off by the scale
+    ratio = run("V3 / V1", ops(K_INCOME, UNITS_COST))
+    assert (ratio.value.quantize(Decimal("0.000001")), ratio.scale) == (Decimal("0.003032"), 1)
+    # an earlier result keeps its scale as an input
+    c1 = calc.result_operand("C1", run("V1 - V2", ops(K_INCOME, K_COST)))
+    assert run("C1 * A1%", ops(c1, RISE)).scale == 1000
+
+
+def test_a_display_in_a_scale_is_checked_against_the_amount_the_value_is():
+    value = Decimal("25742.5")  # thousands of ₪
+    ils = (("ILS", 1),)
+    assert calc.display_matches("25.74", False, value, ils, scale=10**6, source_scale=1000)
+    assert calc.display_matches("25,742.5", False, value, ils, scale=10**3, source_scale=1000)
+    assert calc.display_matches("25,742,500", False, value, ils, source_scale=1000)
+    assert calc.display_matches("25,742.5", False, value, ils, source_scale=1000)  # as the source writes it
+    assert not calc.display_matches("27.4", False, value, ils, scale=10**6, source_scale=1000)
+    assert not calc.display_matches("25,742.5", False, value, ils, scale=10**6, source_scale=1000)
+    assert not calc.display_matches("25.74", False, value, ils, scale=10**3, source_scale=1000)
+
+
+@pytest.mark.parametrize("own, contexts, scale", [
+    ("412,300", ["הכנסות", "טבלה 4: תחזית (באלפי ₪)"], 1000),
+    ("412,300", ["הכנסות (אלפי ש״ח)", ""], 1000),
+    ("412,300", ["סכום (K ₪)"], 1000),
+    ("412,300", ["הכנסות אש\"ח"], 1000),
+    ("412.3", ["סכום (במיליוני ₪)"], 10**6),
+    ("412,300", ["₪ באלפים"], 1000),
+    ("5,600 אלף ₪", ["הכנסות"], 1000),  # the number's own scale word
+    ("1.53 מיליון ₪", [], 10**6),
+    ("5,000,000 ₪", ["הנתונים בטבלה באלפי ₪"], 1),  # a currency right after it: in units
+    ("412,300", ["הכנסות", "הכנסות (באלפי ₪) ועלויות (במיליוני ₪)"], 1),  # two scales say nothing
+    ("412,300", ["עלות (מיליוני ₪)", "טבלה (באלפי ₪)"], 10**6),  # the nearest note wins
+    ("412,300", ["השווי 1,530 אלפי ₪"], 1),  # another number's own scale word is no note
+    ("412,300", ["הכנסות", "סיכום"], 1),
+])
+def test_the_scale_a_source_states_a_number_in(own, contexts, scale):
+    m = calc._WRITTEN_NUMBER.search(own)
+    assert calc.stated_scale(own, m.start(), m.end(), *contexts) == scale
+
+
+def test_a_value_taken_from_a_table_in_thousands_or_a_quote_carries_its_scale():
+    from types import SimpleNamespace
+
+    from app.chat import tools
+
+    src = SimpleNamespace(sid="S1", version_id="v1")
+    st = {"headers": ["סעיף", "2025"], "rows": [{"cells": ["סה״כ הכנסות", "412,300"]}],
+          "caption": "טבלה 4: תחזית הכנסות ועלויות (באלפי ₪)", "title": [], "notes": []}
+    full = "טבלה 4: תחזית הכנסות ועלויות (באלפי ₪)\nסה״כ הכנסות | 412,300"
+    taken = tools._cell_of(src, full, {"row": "סה״כ הכנסות", "column": "2025"}, st, 0)
+    assert taken["scale"] == 1000
+    st["caption"] = "טבלה 4: תחזית הכנסות ועלויות"
+    assert tools._cell_of(src, full, {"row": "סה״כ הכנסות", "column": "2025"}, st, 0)["scale"] == 1
+    text = "סך ההכנסות הצפויות (באלפי ₪) הוא 412,300, והעלויות 368,150."
+    taken = tools._take_quote(src, text, {"quote": "סך ההכנסות הצפויות (באלפי ₪) הוא 412,300", "number": "412,300"})
+    assert taken["scale"] == 1000
+    taken = tools._take_quote(src, "עלות היתר 1,250,000 ₪.", {"quote": "עלות היתר 1,250,000 ₪", "number": "1,250,000"})
+    assert taken["scale"] == 1

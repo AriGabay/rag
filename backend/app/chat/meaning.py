@@ -320,19 +320,17 @@ def basis_key(text: str | None) -> str:
 
 _CURRENCY = re.compile(r"₪|ש\"ח|(?<![א-ת])שקל")
 # a scale the unit vocabulary does not carry ("באלפי ₪"): the unit is then not attested
-_SCALE = re.compile(r"(?<![א-ת])(?:ב?אלפי|אלף|ב?מיליוני|מיליון|מלש\"ח|אש\"ח)(?![א-ת])")
 _PER_SQM = re.compile(r"(?:(?<![א-ת])ל|/\s?)(?:מ\"ר|מטר)(?![א-ת])")
 
 
 def units_attested(context: str) -> set[str]:
     """The units (measurement vocabulary) the words around a number give it: ₪, ₪ למ״ר, מ״ר, דונם or %; none when
-    they state no unit, or a scale ("באלפי ₪") the vocabulary does not carry."""
+    they state no unit. A currency stated with a scale ("באלפי ₪") attests the currency: the scale itself is carried
+    apart, as the value's source scale (``calc.stated_scale``, round 7 R14), so it no longer hides the unit."""
     c = _norm(context)
     if "%" in c:
         return {"percent"}
     money = bool(_CURRENCY.search(c))
-    if money and _SCALE.search(c):
-        return set()
     if money:
         return {"ILS_per_sqm"} if _PER_SQM.search(c) else ({"ILS"} if not re.search(r"(?<![א-ת])לדונם", c) else set())
     if re.search(r"(?<![א-ת])דונם", c):

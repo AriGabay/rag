@@ -1,7 +1,10 @@
 """Verifying a conversational answer against what the turn's tools returned.
 
 The answer is split into units (lines; long lines into sentences; a Markdown table row is one unit), each with
-the ids it cites. Deterministic checks first:
+the ids it cites. A bare answer — only כן / לא / נכון / לא נכון / חלקית, with punctuation or emphasis, no number and
+no citation (``bare_answer``) — is never a unit of its own: it joins the sentence after it (the one before it when it
+is last), in its line or, alone on its line, the prose unit next to it, so the conclusion is verified with the
+sentence that supports it and removed only with it (round 7 R15). Deterministic checks first:
 
 - every cited id was issued in this turn (``S#`` passages, ``M#`` measurements, ``V#`` values verified in a
   source, ``A#`` user assumptions, ``C#`` calculations); an earlier turn's ``P#`` is not a source until reopened;
@@ -65,7 +68,13 @@ unit is removed too, with that claim's kind. The repair prompt gives each proble
 repair of that kind goes (``REPAIR_HINTS``). The user's normal path gets one summary per removal — kind, component and
 the server's fixed sentence (``REMOVAL_SENTENCES``), never the claim or a judge's words (``VerifyReport.counts``). A
 number of the evidence shown with a scale word, or a correct rounding marked as one ("1.53 מיליון" for 1,530,000,
-"כ-14 אלף" for 14,250), is the evidence's number (``_restated``, R14).
+"כ-14 אלף" for 14,250), is the evidence's number (``_restated``, R14). An amount whose source states its scale (a
+``V#`` of a table "באלפי ₪", and a ``C#`` over such amounts: ``calc.stated_scale``) is matched in every number path —
+a calculation's result (``computation_mismatch``, ``framed_result``, binding), a restated value (``_restated``) and
+the server's qualifier placement — as the shown number times its scale word against the value times its scale:
+"25.74 מיליון", "25,742.5 אלף" and "25,742,500" show 25,742.5 thousand ₪; a value's digits shown with a scale word
+that makes them another amount ("412,300 מיליון" for 412,300 thousand) are a number no source states
+(``_wrong_scale``), and a number wrong at its scale is never accepted.
 
 The second plane is completeness (R18–R21), apart from correctness. What the request requires is frozen before
 the answer (round 7 KTD1): the request's typed components (``app.chat.request``: information, calculation,
@@ -86,7 +95,12 @@ the shown answer as a whole (round 7 KTD2).
 
 Scores are merged by id into one status per component (``VerifyReport.requirement_outcomes``, round 7 KTD3, R6,
 R7): ``full`` or ``partial`` only through a unit that survived verification — a component given only by removed
-units is ``not_answered``, with those units kept (``removed_units``) so its reason is "removed in verification";
+units is ``not_answered``, with those units kept (``removed_units``) so its reason is "removed in verification"; a
+calculation component is ``full`` only when a surviving unit that gives it shows a computation of the turn — it cites
+a successful ``C#`` (bound ones included), or a source that writes the number a computation reproduces, showing it
+(``computed_ids``) — otherwise it is at most ``partial`` (``not_computed``), its reason "calculation not completed"
+when its inputs were found, and before the repair decision the "data found — complete it, compute it" problem asks
+the repair round to compute it; a calculation waiting for the user's detail keeps its own path (KTD9);
 otherwise ``not_answered``, the judge's ``undeterminable`` kept as an evidence state (``evidence_state``), never a
 status; ``needs_clarification`` for a clarification component; ``not_relevant`` for a user's assumption nothing
 used; and a parent's status from its children. A citation instruction is checked deterministically from the units
@@ -192,7 +206,9 @@ JUDGE_POLICY = (
     "מתייחס. יחידה שמייחסת למספר משמעות שהמקור לא נותן לו (למשל מע\"מ שנכתב לגבי ערך אחר, שכירות כמחיר, ערך של "
     "נכס השוואה כשווי הנכס הנישום) — unsupported. ניסוח אחר, סדר מילים אחר, שורת טבלה שנוסחה כמשפט, וכתיבה אחרת של "
     "אותו מספר (9,500 ו-9500) אינם סיבה לפסול. תוצאת חישוב (C#) היא חישוב של המערכת ותומכת בטענה שמציגה אותה "
-    "כפי שהיא, גם מעוגלת (14.3% לתוצאה 0.14315...) או במילת סדר גודל (1.53 מיליון לתוצאה 1,530,000); ערך V# "
+    "כפי שהיא, גם מעוגלת (14.3% לתוצאה 0.14315...) או במילת סדר גודל (1.53 מיליון לתוצאה 1,530,000); ערך או "
+    "תוצאה שבמקור שלהם צוין קנה מידה (\"קנה מידה\": באלפי ₪) תומכים באותו סכום בכל קנה מידה (25.74 מיליון, 25,742.5 אלף "
+    "או 25,742,500 ל-25,742.5 באלפי ₪); ערך V# "
     "הוא ערך שהשרת אימת במקור, עם המשמעות שנרשמה לו; "
     "הנחה A# היא מספר שהמשתמש עצמו נתן — היא תומכת בטענה שמציגה אותה כהנחת המשתמש או כתרחיש, ולא כנתון מהמסמך; "
     "תוצאה שסומנה מותנית נתמכת רק כשהתשובה אומרת שהיא מותנית. <server_qualifier unit=\"N\"> הוא סימון קבוע "
@@ -747,6 +763,11 @@ class VerifyReport:
     # calculation components waiting for a detail only the user can give (round 7 KTD9): id -> the parameters no
     # user assumption and no document rate of the turn fills (``unfilled_parameters``)
     pending_parameters: dict[str, list[str]] = field(default_factory=dict)
+    # what fills a calculation component as computed (round 7 KTD3, R6, R7): each successful computation of the turn
+    # (C#: any number) and each source that writes a number a computation reproduces (S#/M#: that number) — id ->
+    # the numbers a unit citing it must show (empty: none needed); None outside a turn's verification, where it is
+    # not known
+    computed: dict[str, set[str]] | None = None
 
     @property
     def ok(self) -> bool:
@@ -930,6 +951,12 @@ class VerifyReport:
                 best = min(given, key=lambda v: _RANK[v.status])
                 o |= {"status": best.status, "reason": best.reason,
                       "units": sorted({i for v in given if v.status == best.status for i in live[id(v)]})}
+                if (kind == "calculation" and best.status == "full" and not self.pending_parameters.get(r["id"])
+                        and not self._computes({i for v in given for i in live[id(v)]})):
+                    # explained, or said not to be computed, but no surviving unit shows a computation of the turn: at
+                    # most partial (its reason, "calculation not completed" when its inputs were found, is the
+                    # server's), and a repair round is asked to compute it (``_check_requirements``)
+                    o |= {"status": "partial", "not_computed": True}
             else:
                 status = {"clarification": "needs_clarification", "assumption": "not_relevant"}.get(kind,
                                                                                                   "not_answered")
@@ -960,6 +987,23 @@ class VerifyReport:
         for cid in out:
             derive(cid)
         return list(out.values())
+
+    def _computes(self, indexes: set[int]) -> bool:
+        """Whether one of the units ``indexes`` shows a computation of the turn: it cites a successful ``C#``, or a
+        source that writes a number a computation reproduces, showing that number (``computed``). True when the turn's
+        computations are not known (``computed`` None)."""
+        if self.computed is None:
+            return True
+        units = {u.index: u for u in self.units}
+        for i in indexes:
+            u = units.get(i)
+            if u is None:
+                continue
+            for x in u.ids:
+                need = self.computed.get(x)
+                if need is not None and (not need or need & numbers_in(u.text)):
+                    return True
+        return False
 
     def uncited_data(self, kept: set[int] | None = None) -> list[int]:
         """The units that survive verification (``kept``, else every unit not removed) and state a material datum —
@@ -1211,11 +1255,14 @@ _AFTER_NUMBER = re.compile(r"\s*(?:₪|ש[\"״]ח)?(?:\s*ל?מ[\"״]ר)?")
 
 
 def _after_number(unit: Unit, written: str) -> int | None:
-    """The position in the answer right after a number of the unit (and its currency and per-m² words)."""
+    """The position in the answer right after a number of the unit (and its scale word, currency and per-m² words:
+    "25.74 מיליון ₪")."""
+    from app.chat.calc import scale_after
+
     m = re.search(rf"(?<![\d,.]){re.escape(written)}(?![\d])", unit.raw)
     if m is None:
         return None
-    tail = _AFTER_NUMBER.match(unit.raw, m.end())
+    tail = _AFTER_NUMBER.match(unit.raw, scale_after(unit.raw, m.start(), m.end())[1])
     return unit.start + (tail.end() if tail else m.end())
 
 
@@ -1273,6 +1320,8 @@ def split_units(markdown: str) -> list[Unit]:
                 spans[-1][1] = b
             else:
                 spans.append([a, b])
+        if table_span is None:
+            spans = _attach_bare_answers(stripped, spans)
         for a, b in spans:
             part = stripped[a:b].rstrip()
             ids = [i for m in _IDS.finditer(part) for i in _ID.findall(m.group(1))]
@@ -1281,7 +1330,78 @@ def split_units(markdown: str) -> list[Unit]:
                 continue
             units.append(Unit(len(units), part, clean, list(dict.fromkeys(ids)), base + a, base + a + len(part),
                               header_row, table_span, context))
-    return units
+    return _attach_bare_lines(markdown, units)
+
+
+# a bare answer to a yes/no question ("לא.", "**כן**", "נכון חלקית") — a conclusion verified with the sentence that
+# supports it, never a claim of its own (R15)
+_BARE_ANSWER = re.compile(r"(?:כן|לא|נכון|לא\s+נכון|חלקית|נכון\s+חלקית|לא\s+בהכרח|בהחלט(?:\s+לא)?|ממש\s+לא)")
+_BARE_MARKUP = re.compile(r"[#*_`>\-–—.,;:!?()\s]+")
+
+
+def bare_answer(text: str) -> bool:
+    """Whether a piece of the answer is only a short answer word or phrase — כן / לא / נכון / לא נכון / חלקית,
+    with punctuation or emphasis — with no number and no citation."""
+    if _IDS.search(text) or _DIGIT.search(text):
+        return False
+    return bool(_BARE_ANSWER.fullmatch(" ".join(_BARE_MARKUP.sub(" ", text).split())))
+
+
+def _attach_bare_answers(line: str, spans: list[list[int]]) -> list[list[int]]:
+    """The spans of a line with a bare answer (``bare_answer``) joined to the sentence after it ("לא. שיעור הרווח
+    16.1% נמוך מהסף [S1]" is one unit), or before it when it is the line's last — so the conclusion is verified with
+    the sentence that supports it, and removed only with it."""
+    out: list[list[int]] = []
+    carry: int | None = None
+    for a, b in spans:
+        if carry is not None:
+            a, carry = carry, None
+        if len(spans) > 1 and bare_answer(line[a:b]):
+            carry = a
+            continue
+        out.append([a, b])
+    if carry is not None:
+        if out:
+            out[-1][1] = spans[-1][1]
+        else:
+            out.append([carry, spans[-1][1]])
+    return out
+
+
+def _attach_bare_lines(markdown: str, units: list[Unit]) -> list[Unit]:
+    """A bare answer alone on its line ("**לא.**" above the paragraph that explains it) joined to the next unit —
+    or, when it is the answer's last, the one before it — when that unit is prose (no table row, no heading): one
+    unit, so the conclusion is verified with the sentence that supports it, and removed only with it."""
+    out: list[Unit] = []
+    pending: Unit | None = None
+    for n, u in enumerate(units):
+        if pending is not None:
+            if u.table_span is None and structural_kind(u) != "heading":
+                u = _joined(markdown, pending, u)
+            else:
+                out.append(pending)
+            pending = None
+        start, end = _line_bounds(markdown, u.start)
+        alone = markdown[start:end].strip() == u.raw.strip()
+        if alone and u.table_span is None and bare_answer(u.raw):
+            if n + 1 < len(units):
+                pending = u
+                continue
+            if out and out[-1].table_span is None and structural_kind(out[-1]) != "heading":
+                out[-1] = _joined(markdown, out[-1], u)
+                continue
+        out.append(u)
+    if pending is not None:
+        out.append(pending)
+    for i, u in enumerate(out):
+        u.index = i
+    return out
+
+
+def _joined(markdown: str, first: Unit, second: Unit) -> Unit:
+    raw = markdown[first.start:second.end]
+    return Unit(first.index, raw, _IDS.sub("", raw).strip(), list(dict.fromkeys([*first.ids, *second.ids])),
+                first.start, second.end, False, None, "")
 
 
 def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
@@ -1311,7 +1431,7 @@ def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
                 f"מע\"מ: {v['vat']}, בסיס שטח: {v['area_basis'] or 'לא צוין'}, נושא: {v['subject'] or 'לא צוין'}, "
                 f"תפקיד: {v['role']}" + (f"; נקבעו ולא נמצאו במקור: {', '.join(asserted)}" if asserted else "")
                 + ")" + (f"\nסעיף: {v['section']}" if v.get("section") else "") + "\n" + _attribution_text(v)
-                + f"\nמקום: {where}\nציטוט: {v['quote']}" + _context_text(v), "value")
+                + f"\nמקום: {where}\nציטוט: {v['quote']}" + _context_text(v) + _scale_text(ws.values[sid]), "value")
     if sid in ws.assumptions:
         a = ws.assumptions[sid]
         return ("הנחת המשתמש", f"הנחה שהמשתמש נתן (לא נתון מהמסמכים): {a.label} = {a.written}"
@@ -1319,6 +1439,17 @@ def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
     if sid in ws.computations:
         return ("חישוב מערכת", computation_text(ws.computations[sid], ws), "computation")
     return None
+
+
+def _scale_text(v) -> str:
+    """The scale a value's source states it in (R14), with the amount it is: the judge reads "412.3 מיליון ₪" against
+    412,300 of a table "באלפי ₪" as the same amount."""
+    from app.chat.calc import SCALE_LABELS, fmt
+
+    if v.scale == 1:
+        return ""
+    return (f"\nקנה מידה במקור: {SCALE_LABELS.get(v.scale) or f'פי {v.scale:,}'} — {v.written} במקור הוא "
+            f"{fmt(v.value * v.scale)} ביחידות מלאות")
 
 
 _SUBJECT_FROM = {"context": "הנושא שניתן לו הוא הנכס של ההקשר הזה",
@@ -1397,6 +1528,12 @@ def computation_text(c, ws: Workspace | None = None) -> str:
              "קלטים: " + "; ".join(_input_text(x, ws) for x in c.inputs),
              f"תוצאה: {d['value']} {c.unit_label}".rstrip() + (f" ({d['percent']})" if "percent" in d else "")
              + f"; ערך מלא: {c.value}"]
+    if c.outcome.scale != 1:
+        # the scale its inputs' sources state (R14): the same amount in units, as an answer may show it
+        lines.append(f"קנה מידה: התוצאה ב{c.unit_label}, כמו הקלטים במקור — {d['value']} {c.unit_label} הם "
+                     f"{fmt(c.value * c.outcome.scale)} ביחידות מלאות")
+    if c.outcome.rescaled:
+        lines.append("קלטים בקני מידה שונים (למשל באלפי ₪ וב-₪) הובאו ליחידות מלאות לפני החישוב; התוצאה ביחידות מלאות")
     if c.vat:
         lines.append(f"בסיס מע״מ של התוצאה ושל קלטיה הכספיים: {VAT_LABELS[c.vat]}")
     steps = [f"{t} = {fmt(v)}" for t, v in c.outcome.steps[:-1]]
@@ -1481,12 +1618,15 @@ def _shown(text: str) -> list[Shown]:
 
 def _shows(c, written: str, percent: bool, scale: int, steps: bool = True) -> bool:
     """Whether a number as shown is calculation ``c``'s result (or, with ``steps``, one of its intermediate results)
-    rounded to the precision and in the scale it is written in."""
+    rounded to the precision and in the scale it is written in — the scale word's against the scale the result is
+    in (``Computation.scale``: "38.04 מיליון" for 38,043.5 in thousands, R14)."""
     from app.chat.calc import display_matches
 
-    if display_matches(written, percent, c.value, c.dims, c.outcome.kind, scale):
+    if display_matches(written, percent, c.value, c.dims, c.outcome.kind, scale, c.outcome.scale):
         return True
-    return steps and any(display_matches(written, False, v, (), None, scale) for _, v in c.outcome.steps)
+    scales = list(getattr(c.outcome, "step_scales", None) or [])
+    return steps and any(display_matches(written, False, v, (), None, scale, scales[n] if n < len(scales) else 1)
+                         for n, (_, v) in enumerate(c.outcome.steps))
 
 
 def _computed_numbers(text: str, computations: list) -> set[str]:
@@ -1839,7 +1979,9 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
               strict: bool = False) -> list[str]:
     """The numbers of a unit that nothing it cites states (for a unit that cites nothing, nothing of the turn —
     unless ``strict``, which holds it to its citations too), that the question does not give and that show no
-    result of a calculation it cites (any of the turn's, for a unit citing nothing, unless ``strict``)."""
+    result of a calculation it cites (any of the turn's, for a unit citing nothing, unless ``strict``) — and the
+    numbers that write a scaled value or result of what it cites with a scale word that is not its scale
+    (``_wrong_scale``)."""
     cited: set[str] = set()
     for _, t in _texts(ws, u.ids):
         cited |= numbers_in(t, words=True)
@@ -1849,6 +1991,7 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
         cited.add(str(c.documents))
     held = bool(u.ids) or strict
     pool = cited if held else everything
+    values = [ws.values[i] for i in u.ids if i in ws.values] if held else list(ws.values.values())
     # a numbered heading's own number ("9.1 שיטת השומה") is its place in the answer, not a fact
     stated = _HEADING_NUMBER.sub("", u.text.strip(), count=1) if _numbered_heading(u.text) else u.text
     missing = [n for n in numbers_in(stated) - question_numbers if n not in pool and not (
@@ -1857,20 +2000,61 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
         shown = _computed_numbers(u.text, computations if held else list(ws.computations.values()))
         missing = [n for n in missing if n not in shown]
     if missing:  # a number of the evidence in another form: a scale word, or a correct rounding marked as one (R14)
-        restated = _restated(u.text, pool)
+        restated = _restated(u.text, pool, {v.value * v.scale for v in values if v.scale != 1})
         missing = [n for n in missing if n not in restated]
-    return missing
+    wrong = _wrong_scale(u, ws, values, computations if held else list(ws.computations.values()))
+    return missing + [n for n in wrong if n not in missing]
+
+
+def _wrong_scale(u: Unit, ws: Workspace, values: list, computations: list) -> list[str]:
+    """The numbers of a unit that write the digits of a value or a result whose source states its scale (``scale``
+    other than 1: "412,300" of a table "באלפי ₪") with a scale word that makes it another amount ("412,300 מיליון ₪"),
+    when no source or measurement the unit cites writes that amount (R14: a number wrong at its scale is never
+    accepted). A number with no scale word may repeat the value as its source writes it."""
+    from app.chat.calc import display_matches, fmt
+
+    scaled = [(numbers_in(v.written), v.value, (), None, v.scale) for v in values if v.scale != 1]
+    scaled += [(numbers_in(fmt(c.value)), c.value, c.dims, c.outcome.kind, c.outcome.scale) for c in computations
+               if c.outcome.scale != 1]
+    if not scaled:
+        return []
+    written: set[Decimal] = set()  # the amounts the unit's cited sources write, each in its own scale
+    for _, t in _texts(ws, [i for i in u.ids if i in ws.sources or i in ws.measurements]):
+        for n in _shown(t):
+            try:
+                written.add(Decimal(n.written.replace(",", "")) * n.scale)
+            except InvalidOperation:
+                continue
+    out = []
+    for n in _shown(u.text):
+        if n.percent or n.scale == 1:
+            continue
+        digits = numbers_in(n.written)
+        mine = [x for x in scaled if digits & x[0]]
+        if not mine:
+            continue
+        try:
+            if Decimal(n.written.replace(",", "")) * n.scale in written:
+                continue
+        except InvalidOperation:
+            continue
+        if not any(display_matches(n.written, False, value, dims, kind, n.scale, scale)
+                   for _, value, dims, kind, scale in mine):
+            out += sorted(digits)
+    return out
 
 
 # a note that a number is rounded ("בעיגול", "מעוגל מ-14,250"), anywhere in the unit
 _ROUNDING_NOTE = re.compile(r"(?<![א-ת])(?:בעיגול|מעוגל(?:ת|ים|ות)?|בקירוב|בערך|בסביבות)(?![א-ת])")
 
 
-def _restated(text: str, pool: set[str]) -> set[str]:
+def _restated(text: str, pool: set[str], scaled: set[Decimal] | frozenset = frozenset()) -> set[str]:
     """The numbers of a text that show a number of ``pool`` (normalized, as ``numbers_in`` gives them) in another
     form (round 7 R14): with a scale word, equal to it ("1.53 מיליון" for 1,530,000); marked as approximate ("כ-" before
     it) or with a rounding note in the text, it rounded to the precision and scale shown ("כ-14 אלף" for 14,250). A
-    plain number is its value only: "1.6 מיליון", "כ-15 אלף" and "1.53 אלף" are none of them."""
+    plain number is its value only: "1.6 מיליון", "כ-15 אלף" and "1.53 אלף" are none of them. ``scaled``: the amounts
+    of the values whose source states a scale (value × scale: 412,300 of a table "באלפי ₪" is 412,300,000), which a
+    number may also show — in full ("412,300,000 ₪"), or with a scale word ("412.3 מיליון")."""
     from app.chat.calc import display_matches
 
     values = []
@@ -1887,7 +2071,13 @@ def _restated(text: str, pool: set[str]) -> set[str]:
         except InvalidOperation:
             continue
         approx = noted or bool(meaning._APPROX_BEFORE.search(text[:n.start]))
-        if n.percent or (n.scale == 1 and not approx):
+        if n.percent:
+            continue
+        if any(v == shown * n.scale for v in scaled) or (approx and any(
+                display_matches(n.written, False, v, (), None, n.scale) for v in scaled)):
+            out |= numbers_in(n.written)
+            continue
+        if n.scale == 1 and not approx:
             continue
         if any(v == shown * n.scale for v in values) or (approx and any(
                 display_matches(n.written, False, v, (), None, n.scale) for v in values)):
@@ -2506,6 +2696,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                                         for s in named]
         _remove_dependents(report, verdicts)
     if coverage:
+        report.computed = computed_ids(ws)
         report.requirements = [dict(r) for r in requirements.items]
         for v in votes:
             report.requirement_votes.setdefault(v.id, []).append(v)
@@ -2513,6 +2704,16 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         _check_requirements(report, ws, requirements)
         report.assign_components()
     return report
+
+
+def computed_ids(ws: Workspace) -> dict[str, set[str]]:
+    """What shows a computation of the turn (``VerifyReport.computed``): each successful ``C#`` (a failed calculation
+    is never registered), and each source a computation reproduces a number of, with that number."""
+    out: dict[str, set[str]] = {cid: set() for cid in ws.computations}
+    for c in ws.computations.values():
+        if c.reproduces and c.reproduces.get("source"):
+            out.setdefault(c.reproduces["source"], set()).update(numbers_in(c.reproduces.get("as_written") or ""))
+    return out
 
 
 def _judged_failure(u: Unit, v: JudgeVerdict, ws: Workspace) -> str:
@@ -2600,4 +2801,4 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
             reason = REQ_NOT_SEARCHED.format(text=o["text"])
         else:
             continue
-        report.problems.append(Problem(Unit(-1, "", "", []), reason, kind="requirement"))
+        report.problems.append(Problem(Unit(-1, "", "", []), reason, kind="requirement", component=o["id"]))

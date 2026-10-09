@@ -41,6 +41,17 @@ and compatibility depends on the operation (R17):
   unit, a monthly amount × 12 is yearly. Per-area values meet areas only on the same area basis (else a
   justification makes the result conditional). A percentage applies only through ``%``.
 
+An amount carries the scale its source states it in (round 7 R14: ``Operand.scale``, from ``stated_scale`` — a
+table "(באלפי ₪)", a column "אלפי ש״ח", a number's own "אלף"), so its amount is value × scale; nothing is rescaled
+behind the model's back. Sums, differences and aggregates of amounts of one scale keep it, and × or ÷ by a
+dimensionless value (a rate, 12) keep it; scales multiply and divide with the values (thousands ÷ thousands cancel),
+and a dimensionless result carries none. Amounts of different scales are never combined as if they were one: each is
+brought to units (value × scale) before it is added, subtracted or aggregated, the result is in units and is marked
+``rescaled`` — chosen over refusing because the model cannot convert a scale itself (the literals are structural
+only), and the conversion is exact and rests only on what the sources state. ``display_matches`` compares a shown
+number in the scale its word gives it with the value in the scale it is in: 25,742.5 in thousands is "25.74 מיליון",
+"25,742.5 אלף" and "25,742,500", never "25,742.5 מיליון".
+
 Every input of a file holding several appraisals carries its appraisal context (round 7 U6, KTD7, R20–R21:
 ``Leaf.context``, from ``app.chat.contexts``). When the context checks are enforced (``evaluate(contexts=...)``), a
 calculation over inputs of two or more contexts — through ``+`` ``−``, ``×`` ``÷`` or an aggregate alike, earlier
@@ -54,6 +65,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Context, Decimal, InvalidOperation, localcontext
+from fractions import Fraction
 from typing import Any
 from uuid import UUID
 
@@ -132,6 +144,9 @@ class Operand:
     literal: Decimal | None = None
     leaves: tuple[Leaf, ...] = ()
     assumptions: tuple[str, ...] = ()
+    # the scale the source states the number in (``stated_scale``): 1,000 for "343,679" of a table "(באלפי ₪)", so
+    # the amount is value × scale; 1 for a number in units or one whose scale no source states
+    scale: int = 1
 
 
 def dims_of(unit: str | None) -> Dims:
@@ -155,14 +170,15 @@ def norm_subject(subject: str | None) -> str:
 def operand(id: str, value, unit: str, *, period: str | None = "none", vat: str | None = None, basis: str = "",
             kind: str | None = None, role: str | None = None, subject: str = "", total: bool = False,
             table: tuple | None = None, group: str | None = None, same: str | None = None, approx: bool = False,
-            assumption: bool = False, context: tuple[str, str] | None = None) -> Operand:
+            assumption: bool = False, context: tuple[str, str] | None = None, scale: int = 1) -> Operand:
     """An input operand from its meaning, as the tools register it."""
     total = total or role == "total"
     dims = dims_of(unit)
     money = (_vat(vat) or "unknown") if "ILS" in dict(dims) else None
     return Operand(id, None if value is None else Decimal(str(value)), dims, _period(period), _vat(vat),
                    (basis or "").strip(), kind, role, norm_subject(subject), group, same, approx, None,
-                   (Leaf(id, total, table, role, money, context),), (id,) if assumption else ())
+                   (Leaf(id, total, table, role, money, context),), (id,) if assumption else (),
+                   scale if dims and dims != (("%", 1),) else 1)
 
 
 @dataclass
@@ -181,6 +197,11 @@ class Outcome:
     inputs: list[str]  # the ids the expression names, in order
     approx: bool
     n: int | None = None  # the number of values, for an expression that is one aggregate
+    # the scale the result is in (``Operand.scale``): the amount is value × scale; the scale of each step, in order;
+    # whether inputs of different scales were brought to units before they were combined
+    scale: int = 1
+    step_scales: list[int] = field(default_factory=list)
+    rescaled: bool = False
 
 
 def result_operand(cid: str, out: Outcome) -> Operand:
@@ -188,7 +209,7 @@ def result_operand(cid: str, out: Outcome) -> Operand:
     roles = {lf.role for lf in out.leaves}
     return Operand(cid, out.value, out.dims, out.period, out.vat, out.basis, out.kind,
                    next(iter(roles)) if len(roles) == 1 else None, out.subject, None, None, out.approx, None,
-                   tuple(out.leaves), tuple(out.assumptions))
+                   tuple(out.leaves), tuple(out.assumptions), out.scale)
 
 
 # --- parsing ---------------------------------------------------------------------------------------------------
@@ -529,7 +550,9 @@ class _Eval:
         self.operands = operands
         self.needs: list[str] = []
         self.steps: list[tuple[str, Decimal]] = []
+        self.step_scales: list[int] = []
         self.n: int | None = None
+        self.rescaled = False
 
     def need(self, reason: str) -> None:
         if reason not in self.needs:
@@ -589,7 +612,18 @@ class _Eval:
     def step(self, node, out: Operand) -> Operand:
         if out.value is not None:
             self.steps.append((render(node, lambda i: i), out.value))
+            self.step_scales.append(out.scale)
         return out
+
+    def same_scale(self, items: list[Operand]) -> tuple[list[Decimal], int]:
+        """The values of operands that are added, subtracted or aggregated, and the scale of the result: their own
+        scale when they share one; otherwise each is brought to units (value × scale) first and the result is in
+        units — never two scales combined as if they were one."""
+        scales = {o.scale for o in items}
+        if len(scales) == 1:
+            return [_value(o) for o in items], next(iter(scales))
+        self.rescaled = True
+        return [_value(o) * o.scale for o in items], 1
 
     # + −, and the aggregates ------------------------------------------------------------------------------------
     def _additive_checks(self, items: list[Operand], op: str) -> None:
@@ -627,7 +661,8 @@ class _Eval:
         if a.subject and b.subject and a.subject != b.subject and not (
                 op == "+" and a.role == "component" and b.role == "component"):
             self.need(f"נושא: «{a.subject}» מול «{b.subject}»")
-        value = _value(a) + _value(b) if op == "+" else _value(a) - _value(b)
+        (va, vb), scale = self.same_scale([a, b])
+        value = va + vb if op == "+" else va - vb
         if a.kind == b.kind or b.kind is None:
             kind = a.kind
         elif a.kind is None:
@@ -641,7 +676,7 @@ class _Eval:
                        a.role if a.role == b.role else None, a.subject if a.subject == b.subject else (
                            a.subject if not b.subject else b.subject if not a.subject else ""),
                        None, None, a.approx or b.approx, None, a.leaves + b.leaves,
-                       _union(a.assumptions, b.assumptions))
+                       _union(a.assumptions, b.assumptions), scale)
 
     def aggregate(self, node: Agg) -> Operand:
         seen, items = set(), []
@@ -670,7 +705,7 @@ class _Eval:
             self.need("סוגי נתונים שונים בצבירה: " + ", ".join(sorted(str(o.kind) for o in {o.kind: o for o in items}.values())))
         if len({o.group for o in items}) > 1:
             self.need("תפקידים שונים בצבירה (למשל מחיר מבוקש ועסקה)")
-        values = [_value(o) for o in items]
+        values, scale = self.same_scale(items)
         self.n = len(items)
         if node.func == "sum":
             value = sum(values, Decimal(0))
@@ -688,7 +723,7 @@ class _Eval:
                        next(iter(kinds)) if len(kinds) == 1 else None, None,
                        next(iter(subjects)) if len(subjects) == 1 else "", first.group, None,
                        any(o.approx for o in items), None, tuple(lf for o in items for lf in o.leaves),
-                       _union(*(o.assumptions for o in items)))
+                       _union(*(o.assumptions for o in items)), scale)
 
     # × ÷ ----------------------------------------------------------------------------------------------------------
     def multiplicative(self, op: str, a: Operand, b: Operand) -> Operand:
@@ -752,11 +787,12 @@ class _Eval:
             self.need("מע״מ: " + " מול ".join(sorted({VAT_LABELS[a.vat], VAT_LABELS[b.vat]})))
         vat = (a.vat if "ILS" in dict(a.dims) else b.vat) if "ILS" in dict(dims) else None
         value = _value(a) * _value(b) if op == "*" else _value(a) / _value(b)
+        value, scale = _product_scale(value, a.scale * b.scale if op == "*" else Fraction(a.scale, b.scale), dims)
         kind = self._kind(op, a, b, dims)
         role = a.role if b.dims == () and op in "*/" else (b.role if a.dims == () and op == "*" else None)
         subject = a.subject if a.subject == b.subject or not b.subject else (b.subject if not a.subject else "")
         return Operand(None, value, dims, period, vat, basis, kind, role, subject, None, None, a.approx or b.approx,
-                       None, a.leaves + b.leaves, _union(a.assumptions, b.assumptions))
+                       None, a.leaves + b.leaves, _union(a.assumptions, b.assumptions), scale)
 
     @staticmethod
     def _kind(op: str, a: Operand, b: Operand, dims: Dims) -> str | None:
@@ -776,6 +812,18 @@ class _Eval:
         if "ILS" in dict(a.dims) and _area(b.dims) and a.kind in BASE_PER_AREA:
             return BASE_PER_AREA[a.kind]
         return None
+
+
+def _product_scale(value: Decimal, scale: int | Fraction, dims: Dims) -> tuple[Decimal, int]:
+    """The value and scale of a product or quotient: the scales multiply (an amount in thousands × a rate stays in
+    thousands) and divide (thousands ÷ thousands cancel). A dimensionless result (a ratio, a percentage) carries no
+    scale, nor does a scale that is not a whole multiplier: the value is brought to units instead."""
+    if dims and ("%", 1) not in dims and Fraction(scale).denominator == 1:
+        return value, int(scale)
+    if scale == 1:
+        return value, 1
+    f = Fraction(scale)
+    return value * Decimal(f.numerator) / Decimal(f.denominator), 1
 
 
 def _literal_text(o: Operand) -> str:
@@ -822,7 +870,8 @@ def evaluate(node, operands: dict[str, Operand], justification: str | None = Non
                         "justification שמסביר מדוע הערבוב תקף (התוצאה תסומן כמותנית), או לשאול את המשתמש")
     return Outcome(_value(out), out.dims, out.period, out.vat, out.basis, out.kind, out.subject, list(ev.needs),
                    ev.steps, list(out.assumptions), list(dict.fromkeys(out.leaves)),
-                   list(dict.fromkeys(ids_of(node))), out.approx, ev.n if isinstance(node, Agg) else None)
+                   list(dict.fromkeys(ids_of(node))), out.approx, ev.n if isinstance(node, Agg) else None,
+                   out.scale, list(ev.step_scales), ev.rescaled)
 
 
 # --- display -----------------------------------------------------------------------------------------------------
@@ -896,10 +945,14 @@ def scale_after(text: str, start: int, end: int) -> tuple[int, int]:
 
 
 def display_matches(written: str, percent: bool, value: Decimal, dims: Dims, kind: str | None = None,
-                    scale: int = 1) -> bool:
+                    scale: int = 1, source_scale: int = 1) -> bool:
     """Whether a number shown in an answer (as written, with a % sign after it or not, and in the ``scale`` its scale
     word gives it) is the full value rounded to the precision it shows: 14.3% is 0.143155…, 14.30% and 14.4% are
-    not; 1.53 מיליון is 1,530,000.4, and 1.6 מיליון is not."""
+    not; 1.53 מיליון is 1,530,000.4, and 1.6 מיליון is not. ``source_scale``: the scale the value itself is in (an
+    amount of a table "באלפי ₪", ``stated_scale``) — the amount is value × source_scale, so 38,043.5 in thousands is
+    "38.04 מיליון", "38,043.5 אלף" and "38,043,500"; a number shown with no scale word may also repeat the value as
+    the source writes it ("38,043.5", the scale said by the answer's own header or words). A number wrong at its
+    scale is never one of them: "38.4 מיליון", "38,043.5 מיליון"."""
     raw = written.replace(",", "").strip()
     try:
         shown = Decimal(raw)
@@ -909,9 +962,70 @@ def display_matches(written: str, percent: bool, value: Decimal, dims: Dims, kin
     candidates = []
     if percent and dims == () and kind != "count":
         candidates.append(value * 100)
-    if not percent or dims == (("%", 1),):
-        candidates.append(value if percent or scale == 1 else value / Decimal(scale))
+    if percent and dims == (("%", 1),):
+        candidates.append(value)
+    elif not percent:
+        full = value * source_scale
+        if scale == 1:
+            candidates += [value, full] if source_scale != 1 else [value]
+        else:
+            candidates.append(full / Decimal(scale))
     return any(_round(abs(c), places) == abs(shown) for c in candidates)
+
+
+# the scale a source states its amounts in, as a note for a table, a column, a row or a sentence ("(באלפי ₪)",
+# "אלפי ש״ח", "במיליוני ₪", "₪ באלפים", "אש״ח", "מלש״ח", "K ₪") — never a scale word right after a number, which is
+# that number's own ("1,530 אלפי ₪": ``scale_after``)
+_NOT_AFTER_NUMBER = r"(?<!\d)(?<!\d[ \u00a0])"
+_NOTE_CURRENCY = r"(?:₪|ש[\"״']ח|שקל(?:ים)?(?![א-ת])|ש\"ח)"
+_NOTE_SCALE = re.compile(
+    rf"{_NOT_AFTER_NUMBER}(?<![א-ת])ב?(?P<construct>אלפי|מיליוני|מיליארדי)\s*{_NOTE_CURRENCY}"
+    rf"|{_NOTE_CURRENCY}\s*\(?ב?(?P<plural>אלפים|מיליונים|מיליארדים)(?![א-ת])"
+    rf"|{_NOT_AFTER_NUMBER}(?<![א-ת])ב?(?P<plural_first>אלפים|מיליונים|מיליארדים)\s*{_NOTE_CURRENCY}"
+    rf"|(?<![א-ת])(?P<abbr>אש[\"״']ח|אלש[\"״']ח|מלש[\"״']ח)(?![א-ת])"
+    rf"|(?<![\dA-Za-z.,])(?P<latin>[KkM])\s*₪|₪\s*(?P<latin_after>[KkM])(?![A-Za-z])")
+_NOTE_VALUES = {"אלפי": 10**3, "מיליוני": 10**6, "מיליארדי": 10**9, "אלפים": 10**3, "מיליונים": 10**6,
+                "מיליארדים": 10**9, "K": 10**3, "k": 10**3, "M": 10**6}
+SCALE_LABELS = {10**3: "אלפי", 10**6: "מיליוני", 10**9: "מיליארדי"}
+_UNITS_AFTER = re.compile(r"[ \u00a0]?(?:₪|ש[\"״']ח)")
+
+
+def scale_notes(text: str) -> set[int]:
+    """The scales the notes of a text state (``_NOTE_SCALE``)."""
+    out = set()
+    for m in _NOTE_SCALE.finditer(text or ""):
+        word = next(g for g in m.groups() if g)
+        if word in _NOTE_VALUES:
+            out.add(_NOTE_VALUES[word])
+        else:  # אש״ח (אלפי ש״ח), מלש״ח (מיליוני ש״ח)
+            out.add(10**6 if word.startswith("מ") else 10**3)
+    return out
+
+
+def stated_scale(own: str, start: int, end: int, *contexts: str) -> int:
+    """The scale a source states a number in (R14): the scale word right after it ("5,600 אלף ₪": ``scale_after``);
+    else 1 when a currency follows it directly ("5,000,000 ₪" is in units); else the scale the nearest context that
+    notes one states — ``contexts`` from the nearest: the cell, its row label and column header before the table's
+    caption, title and notes; the quote before the line it is in. A context whose notes state two scales says
+    nothing, and none is looked for further. 1 when no source states a scale."""
+    word = scale_after(own, start, end)[0]
+    if word != 1:
+        return word
+    if _UNITS_AFTER.match(own, end):
+        return 1
+    for text in contexts:
+        notes = scale_notes(text)
+        if notes:
+            return next(iter(notes)) if len(notes) == 1 else 1
+    return 1
+
+
+def scaled_label(label: str, scale: int) -> str:
+    """A unit label in a scale: "אלפי ₪" for ₪ in thousands, "פי 100 ₪" for a multiplier with no word."""
+    if scale == 1:
+        return label
+    word = SCALE_LABELS.get(scale) or f"פי {scale:,}"
+    return f"{word} {label}".strip() if label else word
 
 
 # --- what the turn registers ---------------------------------------------------------------------------------------
@@ -964,6 +1078,9 @@ class Value:
     # "contradicted" (it names another context's), "asserted" (it names none of them: the model's word only), ""
     # (no subject, or a file with one context)
     subject_from: str = ""
+    # the scale its source states it in (``stated_scale``, R14): 1,000 for a cell of a table "(באלפי ₪)" — the amount
+    # is value × scale; 1 when the source states none
+    scale: int = 1
 
     @property
     def certainty(self) -> str:
@@ -980,7 +1097,7 @@ class Value:
                        kind=self.kind, role=self.role, subject=self.subject, total=self.total, table=self.table,
                        approx=self.approx,
                        context=(self.context["key"], self.context.get("described") or self.context["label"])
-                       if self.context else None)
+                       if self.context else None, scale=self.scale)
 
     def public(self) -> dict:
         return {"id": self.vid, "value": str(self.value), "value_text": self.written, "label": self.label,
@@ -993,7 +1110,7 @@ class Value:
                 "stated_by": self.stated_by, "stance": self.stance, "scenario": self.scenario,
                 "attribution": self.attribution, "meaning_from": dict(self.meaning_from), "reading": self.reading,
                 "reading_note": self.reading_note, "context": dict(self.context) if self.context else None,
-                "subject_from": self.subject_from}
+                "subject_from": self.subject_from, "scale": self.scale}
 
 
 @dataclass
@@ -1066,8 +1183,14 @@ class Computation:
         return [i for i in self.leaves if i.startswith("M")]
 
     @property
+    def scale(self) -> int:
+        """The scale the result is in, as its inputs' sources state theirs (``Outcome.scale``)."""
+        return self.outcome.scale
+
+    @property
     def unit_label(self) -> str:
-        return unit_label(self.dims, self.outcome.period)
+        """Its unit, in its scale ("אלפי ₪" for a result in thousands)."""
+        return scaled_label(unit_label(self.dims, self.outcome.period), self.scale)
 
     @property
     def vat(self) -> str | None:
@@ -1095,6 +1218,6 @@ class Computation:
                 "steps": [{"expression": t, "value": str(v), "display": fmt(v)} for t, v in self.outcome.steps[:-1]],
                 "rounding": rounding_rule(self.value, self.dims, self.outcome.kind),
                 "explicit_amount_available": self.explicit_amount, "stated_amount_differs": self.stated_amount_differs,
-                "rates": list(self.rates),
+                "rates": list(self.rates), "scale": self.scale,
                 # the earlier shape, for readers of stored answers
                 "operation": self.expression, "result": str(self.value)}

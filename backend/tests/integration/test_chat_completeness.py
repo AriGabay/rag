@@ -221,3 +221,59 @@ def test_an_unmet_style_instruction_triggers_a_repair_round_that_changes_the_ans
     assert len(agent.seen) == 5  # the repair round answered at once: no tool was called, no search
     assert a["markdown"] == tabled and a["status"] == "answered"
     assert a["verification"]["completeness"] == {"status": "full", "requirements": 2, "missing": []}
+
+
+# --- a calculation component is full only through a computation (round 7 KTD3, R6, R7) -------------------------------
+
+FORMULA_ASK, SCENARIO_ASK = "איך מחושב הרווח הכולל", "הרווח אם כל העלויות יעלו ב-5%"
+SCENARIO_QUESTION = "איך מחושב הרווח הכולל, ומה יקרה אם כל העלויות יעלו ב-5% וההכנסות יישארו קבועות?"
+EXPLAINED = ("הרווח הכולל מחושב כהכנסות פחות העלויות [V1][V2]. אם כל העלויות יעלו ב-5% [A1] וההכנסות יישארו "
+             "קבועות, הרווח יקטן; הסכום החדש לא חושב כאן.")
+COMPUTED = ("הרווח הכולל מחושב כהכנסות פחות העלויות [V1][V2]. אם כל העלויות יעלו ב-5% [A1] וההכנסות יישארו "
+            "קבועות, הרווח יהיה 1,530,000 ₪ [C1].")
+SCENARIO_ASKS = [(FORMULA_ASK, "מחושב", ("הכנסות", "עלויות")),
+                 (SCENARIO_ASK, "יעלו ב-5%", ("הכנסות", "עלויות", "עליית"))]
+SCENARIO_COMPONENTS = [component(FORMULA_ASK), component(SCENARIO_ASK, kind="calculation")]
+
+
+def _scenario_ask(client, office, monkeypatch, steps: list) -> tuple[dict, ScriptedAgent]:
+    agent = ScriptedAgent(steps, judge=_judge(SCENARIO_ASKS), request=SCENARIO_COMPONENTS)
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), SCENARIO_QUESTION)
+    assert m["status"] == "done", m
+    return m["answer"], agent
+
+
+def test_a_calculation_the_judge_scored_full_with_no_computation_is_sent_to_a_repair_round_to_compute_it(
+        client, office, monkeypatch):
+    steps = [*_ae4_steps(office.doc)[:3], final(EXPLAINED, documents=[office.doc]),
+             # the repair round computes it, then answers with the result
+             [call("calculate", expression="V1 - V2*(1+A1%)", label="הרווח בתרחיש", justification=None)],
+             final(COMPUTED, documents=[office.doc])]
+    a, agent = _scenario_ask(client, office, monkeypatch, steps)
+    repair = next(i["content"] for i in agent.seen[4] if isinstance(i, dict) and i.get("role") == "user"
+                  and "בדיקת האימות" in str(i.get("content")))
+    assert SCENARIO_ASK in repair and "calculate" in repair and FORMULA_ASK not in repair
+    assert agent.tool_outputs(5)[-1].startswith("{") and '"C1"' in agent.tool_outputs(5)[-1]
+    assert a["status"] == "answered" and "1,530,000 ₪ [C1]" in a["markdown"]
+    assert a["verification"]["completeness"] == {"status": "full", "requirements": 2, "missing": []}
+
+
+def test_a_calculation_still_not_computed_after_the_repair_bound_is_partial_with_the_calculation_not_completed(
+        client, office, monkeypatch):
+    steps = [*_ae4_steps(office.doc)[:3], *[final(EXPLAINED, documents=[office.doc])] * 4]
+    a, _ = _scenario_ask(client, office, monkeypatch, steps)
+    assert a["verification"]["removed"] == 0 and a["verification"]["correctness"] == "verified"
+    assert [(c["id"], c["status"], c["limitation"]) for c in a["components"]] == [
+        ("N1", "full", None), ("N2", "partial", "calculation_incomplete")]
+    assert a["verification"]["completeness"]["status"] == "partial"
+
+
+def test_a_calculation_filled_by_a_unit_citing_its_computation_stays_full_with_no_repair_round(
+        client, office, monkeypatch):
+    steps = [*_ae4_steps(office.doc)[:4], final(COMPUTED, documents=[office.doc])]
+    a, agent = _scenario_ask(client, office, monkeypatch, steps)
+    assert not agent.steps  # no repair round was asked for
+    assert [(c["id"], c["status"]) for c in a["components"]] == [("N1", "full"), ("N2", "full")]
+    assert a["status"] == "answered"

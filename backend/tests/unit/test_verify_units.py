@@ -780,3 +780,62 @@ def test_the_repair_prompt_names_each_problems_failure_kind_and_the_ids_checked(
     text = verify_answer(p, a, _ws(SOURCE), "?", []).problems_text()
     assert verify.FAILURE_LABELS["wrong_subject"] in text and "S1" in text
     assert verify.REPAIR_HINTS["wrong_subject"] in text
+
+
+# --- a bare answer is verified with the sentence that supports it (round 7 R15) --------------------------------------
+
+THRESHOLD = "שיעור הרווח לעלות בפרויקט הוא 12.4%, והסף שנקבע הוא 15%."
+
+
+@pytest.mark.parametrize("markdown, units", [
+    ("לא. שיעור הרווח לעלות 12.4% נמוך מהסף של 15% [S1].",
+     ["לא. שיעור הרווח לעלות 12.4% נמוך מהסף של 15% [S1]."]),
+    ("**כן.** הסף של 15% נקבע בשומה [S1].", ["**כן.** הסף של 15% נקבע בשומה [S1]."]),
+    ("- לא נכון. שיעור הרווח לעלות הוא 12.4% [S1].", ["- לא נכון. שיעור הרווח לעלות הוא 12.4% [S1]."]),
+    # last in its line: joined to the sentence before it
+    ("שיעור הרווח לעלות 12.4% נמוך מהסף של 15% [S1]. לא.", ["שיעור הרווח לעלות 12.4% נמוך מהסף של 15% [S1]. לא."]),
+    # alone on its line: joined to the paragraph that explains it
+    ("**לא.**\n\nשיעור הרווח לעלות 12.4% נמוך מהסף של 15% [S1].",
+     ["**לא.**\n\nשיעור הרווח לעלות 12.4% נמוך מהסף של 15% [S1]."]),
+    ("שיעור הרווח לעלות 12.4% נמוך מהסף של 15% [S1].\n\nחלקית.",
+     ["שיעור הרווח לעלות 12.4% נמוך מהסף של 15% [S1].\n\nחלקית."]),
+])
+def test_a_bare_answer_is_one_unit_with_the_sentence_that_supports_it(markdown, units):
+    assert [u.raw for u in split_units(markdown)] == units
+    assert all(u.ids == ["S1"] for u in split_units(markdown))
+
+
+@pytest.mark.parametrize("markdown, n", [
+    ("לא נמצא בשומה שיעור רווח. הסף הוא 15% [S1].", 2),  # a claim, not a bare answer
+    ("לא 15%. הסף הוא 15% [S1].", 2),  # a number: a claim of its own
+    ("לא [S1]. הסף הוא 15% [S1].", 2),  # cited: a claim of its own
+    ("## לא\n\n| שנה | שיעור |\n|---|---|\n| 2025 | 12.4% [S1] |", 3),  # never joined to a table row
+])
+def test_what_is_not_a_bare_answer_stays_a_unit_of_its_own(markdown, n):
+    assert len(split_units(markdown)) == n
+
+
+def test_a_bare_answer_with_its_supported_sentence_is_kept_and_an_uncited_claim_is_still_removed():
+    ws = _ws(THRESHOLD)
+    a = _answer("לא. שיעור הרווח לעלות 12.4% נמוך מהסף של 15% [S1]. הנכס נמכר אשתקד.")
+    judged: list[str] = []
+
+    def rule(text: str) -> str:
+        judged.append(text)
+        return "supported" if "[S1]" in text or "12.4%" in text else "unsupported"
+
+    r = verify_answer(_judge(rule), a, ws, "האם שיעור הרווח עומד בסף?", [])
+    assert judged[0].startswith("לא. שיעור הרווח")
+    applied = r.apply(a)
+    assert applied.answer_markdown.startswith("לא. שיעור הרווח לעלות 12.4% נמוך מהסף של 15% [S1].")
+    assert "הנכס נמכר אשתקד" not in applied.answer_markdown
+    assert [(d.failure_kind, d.unit.text) for d in r.removals()] == [("absent_from_source", "הנכס נמכר אשתקד.")]
+
+
+def test_a_bare_answer_goes_with_its_supporting_sentence_when_that_sentence_fails():
+    ws = _ws(THRESHOLD)
+    a = _answer("כן. שיעור הרווח לעלות 19% עובר את הסף [S1].\n\nהסף שנקבע הוא 15% [S1].")
+    r = verify_answer(_judge(lambda text: "supported"), a, ws, "האם שיעור הרווח עומד בסף?", [])
+    applied = r.apply(a)
+    assert applied.answer_markdown.startswith("הסף שנקבע הוא 15% [S1].")
+    assert "כן" not in applied.answer_markdown.split("\n")[0]

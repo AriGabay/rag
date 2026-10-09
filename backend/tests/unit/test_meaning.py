@@ -316,3 +316,12 @@ def test_a_per_area_word_belongs_to_the_figure_it_follows_in_a_list():
     answer = ("למצב החדש נרשמו 145 ₪ למ\"ר מבונה, שווי מצב חדש של 28,940,300 ₪, ומקדם דחיה 0.8712 [S1].")
     numbers = {p.number for p in _problems(answer, _ws(AREA_CALC, kind="table"))}
     assert not numbers & {"28,940,300", "0.8712"}
+
+
+def test_a_currency_stated_with_a_scale_attests_the_currency():
+    """Round 7 R14: the scale is carried apart (``calc.stated_scale``), so "באלפי ₪" attests ₪ like a plain ₪."""
+    from app.chat.meaning import units_attested
+    assert units_attested("סך ההכנסות (באלפי ₪) 412,300") == {"ILS"}
+    assert units_attested("עלות 5,000,000 ₪") == {"ILS"}
+    assert units_attested("שיעור 17%") == {"percent"}
+    assert units_attested("12 קומות") == set()

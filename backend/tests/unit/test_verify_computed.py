@@ -460,3 +460,106 @@ def test_a_result_of_a_calculation_that_is_not_conditional_gets_no_qualifier():
 def test_a_conditional_result_bound_to_a_unit_that_cites_only_its_inputs_is_qualified_too():
     _, applied = _qualified(_conditional_sum(), "סך העלות הוא 20,220,000 ₪ [V1][V2].")
     assert "20,220,000 ₪ (תוצאה מותנית: הערכים V1, V2 אינם ודאיים) [V1][V2][C1]" in applied.answer_markdown
+
+
+# --- amounts a source states in a scale (R14): "באלפי ₪" -------------------------------------------------------------
+#
+# A table states its amounts in thousands; the values carry that scale (``Value.scale``) and so do the results over
+# them (``Outcome.scale``). A number shown in another equivalent representation — with a scale word, or in full — is
+# the same amount; a number wrong at its scale never is.
+
+THOUSANDS_QUESTION = "מה יהיה הרווח אם העלויות יעלו ב-5%, ומה עמלת השיווק של 1.5% מההכנסות?"
+
+
+def _thousands() -> Workspace:
+    """V1 income 412,300 and V2 cost 368,150, both in thousands of ₪ (a table "באלפי ₪"); A1 costs up 5%, A2 a
+    1.5% fee: C1 the profit in the scenario (25,742.5 thousand ₪ = 25.74 million ₪), C2 the fee (6,184.5 thousand
+    ₪)."""
+    ws = Workspace(ctx=None)
+    ws.user_messages = [{"turn": 1, "text": THOUSANDS_QUESTION, "current": True}]
+    for vid in (_value(ws, "412,300", "סה״כ הכנסות", "income", "income"),
+                _value(ws, "368,150", "סה״כ עלויות", "cost", "cost")):
+        ws.values[vid].scale = 1000
+    _assume(ws, "5", "עליית העלויות", "העלויות יעלו ב-5%")
+    _assume(ws, "1.5", "עמלת שיווק", "עמלת השיווק של 1.5%")
+    _compute(ws, "V1 - V2*(1+A1%)", "הרווח בתרחיש")
+    _compute(ws, "V1 * A2%", "עמלת השיווק")
+    return ws
+
+
+def test_a_result_over_amounts_in_thousands_is_in_thousands():
+    ws = _thousands()
+    c1, c2 = ws.computations["C1"], ws.computations["C2"]
+    assert (c1.value, c1.scale, c1.unit_label) == (Decimal("25742.5"), 1000, "אלפי ₪")
+    assert (c2.value, c2.scale) == (Decimal("6184.5"), 1000)
+    # the judge reads the result with its scale and the amount it is in units
+    assert "25,742,500 ביחידות מלאות" in verify.computation_text(c1, ws)
+
+
+@pytest.mark.parametrize("shown", [
+    "25.74 מיליון ₪", "כ-25.7 מיליון ₪", "25,742.5 אלף ₪", "25,742,500 ₪", "25,742.5 ₪", "26 מיליון ₪",
+])
+def test_a_result_in_thousands_shown_in_an_equivalent_representation_is_kept(shown):
+    report, _ = _verify(_thousands(), f"לפי הנחתך [A1], הרווח בתרחיש יהיה {shown} [C1].",
+                        question=THOUSANDS_QUESTION)
+    assert not report.removed_units(), report.problems_text()
+
+
+@pytest.mark.parametrize("shown", ["6,184.5 אלף ₪", "6.18 מיליון ₪", "6.2 מיליון ₪"])
+def test_a_fee_in_thousands_shown_in_thousands_or_millions_is_kept(shown):
+    report, _ = _verify(_thousands(), f"עמלת השיווק תהיה {shown} [C2][A2].", question=THOUSANDS_QUESTION)
+    assert not report.removed_units(), report.problems_text()
+
+
+@pytest.mark.parametrize("shown", [
+    "27.4 מיליון ₪",  # a wrong digit
+    "25,742.5 מיליון ₪",  # the digits of the result with a scale word that makes it another amount
+    "25.74 אלף ₪",  # thousands of thousands, shown as thousands
+    "2.57 מיליון ₪",
+])
+def test_a_result_in_thousands_wrong_at_its_scale_is_removed_as_a_wrong_calculation(shown):
+    report, _ = _verify(_thousands(), f"לפי הנחתך [A1], הרווח בתרחיש יהיה {shown} [C1].",
+                        question=THOUSANDS_QUESTION)
+    (decision,) = report.removals()
+    assert (decision.failure_kind, decision.check) == ("wrong_calculation", "computation_mismatch")
+
+
+def test_a_result_in_thousands_shown_in_millions_without_citing_it_is_bound_to_its_calculation():
+    report, applied = _verify(_thousands(), "לפי הנחתך [A1], הרווח בתרחיש יהיה 25.74 מיליון ₪ [V1][V2].",
+                              question=THOUSANDS_QUESTION)
+    assert not report.removed_units(), report.problems_text()
+    assert "25.74 מיליון ₪ [V1][V2][C1]" in applied.answer_markdown
+
+
+@pytest.mark.parametrize("shown, ok", [
+    ("412,300,000 ₪", True), ("412.3 מיליון ₪", True), ("412,300 אלף ₪", True), ("412,300 ₪", True),
+    ("כ-412 מיליון ₪", True),
+    ("412,300 מיליון ₪", False), ("4.123 מיליון ₪", False), ("412,300,000,000 ₪", False),
+])
+def test_a_value_written_in_thousands_restated_in_full_or_with_a_scale_word(shown, ok):
+    cited = _numbers_only(_thousands(), f"ההכנסות הכוללות הן {shown} [V1].", question=THOUSANDS_QUESTION)
+    assert (cited == []) is ok, cited
+
+
+def test_a_scale_word_on_a_value_whose_scale_no_source_states_is_checked_as_before():
+    ws = _scenario()  # amounts in units: no scale stated
+    assert _numbers_only(ws, "ההכנסות הכוללות הן 12.45 מיליון ₪ [V1].") == []
+    (problem,) = _numbers_only(ws, "ההכנסות הכוללות הן 12.5 מיליון ₪ [V1].")
+    assert "12.5" in problem.reason
+
+
+def test_a_sum_of_an_amount_in_thousands_and_an_amount_in_units_is_computed_in_units():
+    ws = _thousands()
+    vid = _value(ws, "1,250,000", "עלות היתר", "cost", "cost")  # stated in units
+    c = _compute(ws, f"V1 + {vid}", "סכום בדיקה")
+    assert (c.value, c.scale, c.outcome.rescaled) == (Decimal("413550000"), 1, True)
+    assert "הובאו ליחידות מלאות" in verify.computation_text(c, ws)
+    for shown, ok in (("413.55 מיליון ₪", True), ("413,550,000 ₪", True), ("413,550 ₪", False),
+                      ("1,662,300 ₪", False)):
+        cited = _numbers_only(ws, f"הסכום הוא {shown} [{c.cid}].", question=THOUSANDS_QUESTION)
+        assert (cited == []) is ok, (shown, cited)
+
+
+def test_the_servers_qualifier_follows_a_result_shown_with_a_scale_word_after_the_word():
+    _, applied = _qualified(_conditional_sum(), "סך העלות הוא 20.22 מיליון ₪ [C1].")
+    assert "20.22 מיליון ₪ (תוצאה מותנית: הערכים V1, V2 אינם ודאיים) [C1]" in applied.answer_markdown

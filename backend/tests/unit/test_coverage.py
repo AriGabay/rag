@@ -749,3 +749,105 @@ def test_a_claim_the_deterministic_checks_removed_is_shown_to_the_judge_so_its_c
     _, outcomes = _finish(ws, a, r, turn)
     assert [(o["id"], o["status"], o["limitation"], o["removed_units"]) for o in outcomes] == [
         ("N1", "full", None, []), ("N2", "not_answered", "removed", [1])]
+
+
+# --- a calculation component is full only through a computation (round 7 KTD3, R6, R7) -------------------------------
+
+def _computed(ws: Workspace, expression: str, label: str, reproduces: dict | None = None) -> str:
+    """A calculation registered as ``tools.tool_calculate`` registers it (without the database checks)."""
+    node = calc.parse(expression)
+    ids = list(dict.fromkeys(calc.ids_of(node)))
+    out = calc.evaluate(node, {i: ws.values[i].operand() for i in ids})
+    cid = f"C{len(ws.computations) + 1}"
+    ws.computations[cid] = calc.Computation(cid, label, calc.render(node, lambda i: i), label, out, [
+        {"id": i, "label": ws.values[i].label, "kind": "value", "value": str(ws.values[i].value),
+         "display": calc.fmt(ws.values[i].value), "source_id": "S1", "value_text": ws.values[i].written}
+        for i in out.inputs], ["S1"], 1, "reproduces_report_value" if reproduces else "computed", None, "",
+        reproduces, list(out.inputs))
+    return cid
+
+
+FORMULA = "הרווח מחושב כהכנסות פחות העלויות [S1]."
+PROFIT_QUESTION = "איך מחושב הרווח הכולל, ומה יקרה אם כל העלויות יעלו ב-5% וההכנסות יישארו קבועות?"
+NOT_COMPUTED = "אם כל העלויות יעלו ב-5% וההכנסות יישארו קבועות, הרווח יקטן; הסכום החדש לא חושב כאן [S1]."
+
+
+def _profit_turn() -> TurnRequirements:
+    return _turn({"id": "a", "text": "איך מחושב הרווח הכולל", "kind": "calculation"},
+                 {"id": "b", "text": "הרווח אם העלויות יעלו ב-5%", "kind": "calculation"})
+
+
+def _profit_ws() -> tuple[Workspace, str, str]:
+    ws = _ws("סיכום: סה\"כ הכנסות 9,500 ₪, סה\"כ עלויות 8,000 ₪, רווח 1,500 ₪.")
+    return ws, _value(ws, "9,500", "סה\"כ הכנסות", "income"), _value(ws, "8,000", "סה\"כ עלויות", "cost")
+
+
+def test_a_calculation_component_scored_full_without_a_computation_is_partial_and_asks_to_compute():
+    ws, v1, v2 = _profit_ws()
+    turn = _profit_turn()
+    a = _answer(f"{FORMULA} {NOT_COMPUTED}")
+    scores = _scores({"N1": {"status": "full", "units": [0], "related": [v1, v2]},
+                      "N2": {"status": "full", "units": [1], "related": [v1, v2]}})
+    r = verify_answer(_judge(scores), a, ws, PROFIT_QUESTION, [], requirements=turn)
+    outcomes = {o["id"]: o for o in r.requirement_outcomes()}
+    assert [(o["status"], o.get("not_computed")) for o in outcomes.values()] == [("partial", True), ("partial", True)]
+    assert outcomes["N2"]["units"] == [1]  # what fills it is kept, the claims are not removed
+    assert not r.removed_units()
+    # before the repair decision: the existing "data found — complete it, compute it" problem, per component
+    problems = [p for p in r.problems if p.kind == "requirement"]
+    assert [p.component for p in problems] == ["N1", "N2"] and not r.ok
+    assert all("calculate" in p.reason and v1 in p.reason for p in problems)
+    # after the repair bound, the gap's reason is the server's: the calculation was not completed
+    final, outcomes = _finish(ws, a, r, turn)
+    assert [o["limitation"] for o in outcomes] == ["calculation_incomplete", "calculation_incomplete"]
+
+
+def test_a_calculation_component_filled_by_a_unit_citing_a_computation_stays_full():
+    ws, v1, v2 = _profit_ws()
+    cid = _computed(ws, f"{v1} - {v2}", "הרווח")
+    turn = _profit_turn()
+    a = _answer(f"{FORMULA} הרווח הוא 1,500 ₪ [{cid}].")
+    scores = _scores({"N1": {"status": "full", "units": [0, 1], "related": [v1, v2, cid]},
+                      "N2": {"status": "full", "units": [1], "related": [cid]}})
+    r = verify_answer(_judge(scores), a, ws, "?", [], requirements=turn)
+    assert [o["status"] for o in r.requirement_outcomes()] == ["full", "full"]
+    assert not [p for p in r.problems if p.kind == "requirement"] and r.ok
+
+
+def test_a_computation_bound_to_a_unit_that_shows_its_result_without_citing_it_fills_the_component():
+    ws, v1, v2 = _profit_ws()
+    _computed(ws, f"{v1} - {v2}", "הרווח")
+    turn = _turn({"id": "a", "text": "הרווח", "kind": "calculation"})
+    a = _answer(f"הרווח הוא 1,500 ₪ [{v1}][{v2}].")
+    r = verify_answer(_judge(_scores({"N1": {"status": "full", "units": [0]}})), a, ws, "?", [], requirements=turn)
+    assert [o["status"] for o in r.requirement_outcomes()] == ["full"]
+
+
+def test_a_document_value_a_computation_reproduces_fills_the_component():
+    ws, v1, v2 = _profit_ws()
+    _computed(ws, f"{v1} - {v2}", "הרווח", reproduces={"source": "S1", "as_written": "1,500"})
+    turn = _turn({"id": "a", "text": "הרווח", "kind": "calculation"})
+    shown = verify_answer(_judge(_scores({"N1": {"status": "full", "units": [0]}})),
+                          _answer("לפי השומה הרווח הוא 1,500 ₪ [S1]."), ws, "?", [], requirements=turn)
+    assert [o["status"] for o in shown.requirement_outcomes()] == ["full"]
+    # citing the same source for something else is no computation
+    other = verify_answer(_judge(_scores({"N1": {"status": "full", "units": [0]}})),
+                          _answer("ההכנסות הן 9,500 ₪ [S1]."), ws, "?", [], requirements=turn)
+    assert [o["status"] for o in other.requirement_outcomes()] == ["partial"]
+
+
+def test_an_information_component_or_a_calculation_waiting_for_the_user_keeps_its_path():
+    ws, v1, v2 = _profit_ws()
+    turn = _turn({"id": "a", "text": "איך מחושב הרווח הכולל"})  # information
+    r = verify_answer(_judge(_scores({"N1": {"status": "full", "units": [0]}})), _answer(FORMULA), ws, "?", [],
+                      requirements=turn)
+    assert [o["status"] for o in r.requirement_outcomes()] == ["full"]
+    # a calculation waiting for a detail only the user can give (KTD9) is not sent to compute
+    turn = _turn({"id": "a", "text": "הרווח בתרחיש", "kind": "calculation",
+                  "parameters": [{"name": "שיעור העלייה", "source": "not_given_by_user", "quote": ""}]})
+    r = verify_answer(_judge(_scores({"N1": {"status": "full", "units": [0]}})),
+                      _answer("כדי לחשב את הרווח בתרחיש צריך את שיעור העלייה: מה הוא? הרווח מחושב כהכנסות פחות העלויות "
+                              "[S1]."), ws, "?", [], requirements=turn)
+    assert r.pending_parameters == {"N1": ["שיעור העלייה"]}
+    assert [o["status"] for o in r.requirement_outcomes()] == ["full"]
+    assert not [p for p in r.problems if p.kind == "requirement"]

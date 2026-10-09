@@ -735,3 +735,56 @@ def test_ae8_a_cost_increase_without_a_rate_asks_once_and_the_reply_computes_wit
     (assumption,) = b["assumptions"]
     assert assumption["quote"] == "8%" and assumption["current"] is True
     assert [c["status"] for c in b["components"]] == ["full"]
+
+
+# --- a table that states its amounts in thousands (round 7 R14) -------------------------------------------------------
+
+K_TITLE = "תחזית פרויקט רחוב הדקל 9"
+K_CAPTION = "תחזית הכנסות ועלויות (באלפי ₪)"
+K_ROWS = [["שלב א", "180,000", "161,000"], ["שלב ב", "232,300", "207,150"], ["סה\"כ", "412,300", "368,150"]]
+
+
+def add_thousands_document(office) -> str:
+    doc, ver = make_document(office, office.default_group_id, K_TITLE, sha="d" * 64)
+    structure = {"headers": ["רכיב", "הכנסות", "עלויות"], "caption": K_CAPTION, "title": [],
+                 "notes": ["הסכומים ללא מע\"מ."], "section": SECTION, "block_index": 1,
+                 "rows": [{"cells": r} for r in K_ROWS]}
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_versions SET page_count = 1, ingestion = CAST(:i AS jsonb) WHERE id = :v"),
+                     {"v": ver, "i": json.dumps({"reading_id": "reading-1"})})
+        for i, (kind, t, table) in enumerate([("heading", SECTION, None), ("table", K_CAPTION, 0)]):
+            conn.execute(text(
+                "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
+                " section_path, page, text, status, table_index) VALUES (app_office(), :d, :v, :b, :k, :s, :sp, 1,"
+                " :t, 'read', :ti)"),
+                {"d": doc, "v": ver, "b": i, "k": kind, "s": SECTION, "sp": [SECTION], "t": t, "ti": table})
+        conn.execute(text("INSERT INTO extracted_tables (office_id, document_id, version_id, table_index, page_start,"
+                          " page_end, structure) VALUES (app_office(), :d, :v, 0, 1, 1, CAST(:s AS jsonb))"),
+                     {"d": doc, "v": ver, "s": json.dumps(structure, ensure_ascii=False)})
+    return str(doc)
+
+
+def test_a_result_over_a_table_in_thousands_shown_in_millions_is_kept(client, office, monkeypatch):
+    doc = add_thousands_document(office)
+    answer = "לפי הנחתך שהעלויות יעלו ב-5% [A1], הרווח בתרחיש יהיה כ-25.74 מיליון ₪ [C1]."
+    agent = ScriptedAgent([
+        [call("outline", document=doc)],
+        lambda items: [read(table=handle_of(_last_output(items), K_CAPTION))],
+        [take("S1", cell("סה\"כ", "הכנסות"), meaning("income", role="income", vat="excluded"), "סה״כ הכנסות"),
+         take("S1", cell("סה\"כ", "עלויות"), meaning("cost", role="cost", vat="excluded"), "סה״כ עלויות"),
+         call("assume", value="5%", quote="העלויות יעלו ב-5%", label="עליית העלויות")],
+        [call("calculate", expression="V1 - V2*(1+A1%)", label="הרווח בתרחיש", justification=None)],
+        final(answer, documents=[doc])])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), QUESTION)
+    assert m["status"] == "done", m
+    (taken,) = [o for o in agent.tool_outputs(3) if o.startswith("V1 נרשם")]
+    assert "באלפי" in taken and "412,300,000 ביחידות מלאות" in taken
+    result = json.loads(agent.tool_outputs(4)[-1])
+    assert (Decimal(result["value"]), result["scale"], result["unit"]) == (Decimal("25742.5"), 1000, "אלפי ₪")
+    a = m["answer"]
+    assert a["verification"]["removed"] == 0, a
+    assert "25.74 מיליון ₪" in a["markdown"] and "[C1]" in a["markdown"]
+    (c1,) = a["computations"]
+    assert c1["scale"] == 1000 and c1["unit"] == "אלפי ₪"

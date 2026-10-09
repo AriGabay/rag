@@ -39,7 +39,8 @@ table, first match wins (``reason_of``):
    calculation of the turn applied and no computation of the component over document values and user assumptions
    only fills (round 7 KTD9; its status is then ``needs_clarification``), or a clarification component — a detail
    missing from the request;
-6. a calculation whose inputs were found and never computed — calculation not completed;
+6. a calculation whose inputs were found and never computed — calculation not completed (also a calculation component
+   the judge scored full whose surviving units show no computation of the turn: it is partial, KTD3);
 7. a value found with an uncertain reading or meaning — found, not verifiable;
 8. values for the same property, kind, unit, period, basis, scenario and status that differ — sources conflict (in
    a file holding several appraisals, with ``chat_appraisal_context_enforced``, the property is the value's appraisal

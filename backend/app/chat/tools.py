@@ -51,11 +51,16 @@ Tools:
   verified only when OCR of the crop or the region's text layer puts its number in its row and column, otherwise
   uncertain with the reason; its anchor is the region and, when confirmed, the cell's box (KTD6, R17–R19).
   A value read clearly is cached per version, reading and locator with what its source attests only, and a ``Q#``
-  is taken again with that turn's meaning checked against it;
+  is taken again with that turn's meaning checked against it. A value carries the scale its source states it in
+  (``calc.stated_scale``, round 7 R14): its own scale word ("5,600 אלף ₪"), else a note of its cell, row or column,
+  else of its table's caption, title or notes ("(באלפי ₪)", "אלפי ש״ח", "K ₪"); for a quote, of the quote, else of
+  its line; a number followed directly by a currency is in units;
 - ``assume``: a number the user gave for a scenario, quoted from the user's own message (``A#``);
 - ``calculate``: an expression over ``M#``/``V#``/``A#``/``C#`` (``app.chat.calc``): exact decimals, compatibility
   by operation, every result a ``C#`` with its formula, inputs, assumptions and sources that later calculations
-  may use; a result resting on an uncertain input is conditional and says why each input is uncertain (R18). A
+  may use, and the scale its inputs' sources state (a result over amounts "באלפי ₪" is in thousands; inputs of
+  different scales are brought to units first, and the model is told so); a result resting on an uncertain input is
+  conditional and says why each input is uncertain (R18). A
   product of a document rate (a ``V#`` percentage, never the user's ``A#``) is compared with the amounts the rate's
   source and section state for the same quantity (round 7 U7, KTD8, R23): one within the product's range over the
   rate's rounding interval ("כ-17%": 16.5%–17.5%) is reported and kept in the record (``explicit_amount_available``,
@@ -2390,11 +2395,13 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index) -> dict:
                                 "נלקח רק מהשורה והעמודה שהוא שייך להן")
             raise ToolError(f"המספר {loc['number']} אינו בתא שנבחר ({where}: «{cell}») ואינו בטבלה")
         written, value = hit[0][0], hit[0][3]
+        at_cell = hit[0][1:3]
     else:
         if len(numbers) != 1:
             raise ToolError(f"בתא שנבחר ({where}) " + ("אין מספר" if not numbers else f"יש כמה מספרים («{cell}»); "
                                                        "ציין number"))
         written, value = numbers[0][0], numbers[0][3]
+        at_cell = numbers[0][1:3]
         sign = _parse_number(cell)
         if sign is not None and sign[1] == -value:
             value = -value
@@ -2413,6 +2420,10 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index) -> dict:
     # read from it), else the table's caption, title or notes
     unit_from = next((where for where, t in (("cell", near[0]), ("row", near[1]), ("header", near[2] + " " + near[3]))
                       if meaning.units_attested(t)), "table" if units else None)
+    # the scale the table states it in (R14): the cell's own scale word, else a note of its cell, row or column
+    # ("הכנסות (אלפי ₪)"), else of the table's caption, title or notes ("טבלה 4 (באלפי ₪)")
+    scale = calc.stated_scale(meaning._norm(cell), *at_cell, meaning._norm(" ".join(near)),
+                              meaning._norm(" ".join(x for x in table_text if x)))
     # who stated it: the column header, else the row label, else the table's caption, title or notes (KTD8)
     said = (attribution_in(header, adopted=True) or attribution_in(label, adopted=True)
             or attribution_in(" ".join(x for x in table_text if x), adopted=True))
@@ -2424,7 +2435,7 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index) -> dict:
                         "column": header, "column_number": ci + 1},
             "total": bool(calc.TOTAL_WORDS.search(meaning._norm(cells[0] if cells else ""))),
             "table": (str(src.version_id), index), "said": said, "context": " ".join([*near, *table_text]),
-            "meaning_from": {"unit": unit_from} if unit_from else {},
+            "meaning_from": {"unit": unit_from} if unit_from else {}, "scale": scale,
             # the cell as stored (KTD1): its box is looked up when the answer is stored, never searched for
             "anchor": {"table_index": index, "row": ri, "column": ci,
                        "pages": [p] if (p := (st.get("rows") or [])[ri].get("page")) else []}}
@@ -2585,12 +2596,14 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
     # who stated it: the words of the number's own clause, else of its sentence (KTD8); never the first occurrence
     # elsewhere — the number as quoted
     said = attribution_at(text_, at + start, at + end)
+    # the scale the source states it in (R14): its own scale word, else a note of the quote, else of its line
+    scale = calc.stated_scale(text_, at + start, at + end, quote, line)
     return {"written": written, "value": sign * value, "forms": forms, "quote": loc["quote"].strip(),
             "qualifiers": meaning.number_qualifiers(full, forms, quote),
             "units": units, "vat": meaning.vat_attested(line, forms, full),
             "kind_context": quote, "locator": {"quote": loc["quote"].strip()}, "total": False, "table": None,
             "anchor": anchor, "said": said, "context": f"{line}\n{quote}",
-            "meaning_from": {"unit": "quote"} if units else {}}
+            "meaning_from": {"unit": "quote"} if units else {}, "scale": scale}
 
 
 def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict]:
@@ -2747,7 +2760,7 @@ def _new_value(ws: Workspace, src: Source, sid: str, taken: dict, settled: tuple
                        taken["table"], "approx" in taken["qualifiers"].keys("approx"),
                        section=" › ".join(path), stated_by=who["stated_by"], stance=who["stance"],
                        scenario=who["scenario"], attribution=said.evidence if said is not None else "",
-                       meaning_from=dict(taken.get("meaning_from") or {}))
+                       meaning_from=dict(taken.get("meaning_from") or {}), scale=int(taken.get("scale") or 1))
     ws.values[value.vid] = value
     return value
 
@@ -2768,6 +2781,9 @@ def _value_report(ws: Workspace, value: calc.Value, said: Attribution | None, no
              + (f" | נושא: {_txt(value.subject)}" if value.subject else "") + (" | שורת סה\"כ" if value.total else ""),
              f"אומת ב-{value.source_id}: {_txt(place)}" + (f" | סעיף: {_txt(value.section)}" if value.section else ""),
              _attribution_line(value, said)]
+    if value.scale != 1:
+        lines.append(MSG_VALUE_SCALE.format(scale=calc.scaled_label("", value.scale), written=value.written,
+                                            full=calc.fmt(value.value * value.scale)))
     if value.approx:
         lines.append("המקור כותב את הערך כמקורב.")
     lines.append("ודאות: " + ("כל התכונות שצוינו נמצאו במקור" if not asserted else
@@ -2777,6 +2793,11 @@ def _value_report(ws: Workspace, value: calc.Value, said: Attribution | None, no
     lines += context or []
     lines.append(f"סטטוס: {value_status(ws, value.vid)}")
     return "\n".join(lines)
+
+
+# a value its source states in a scale (R14): the model computes with it as written and shows the result in that scale
+MSG_VALUE_SCALE = ("קנה מידה: המקור מציין את הערך ב{scale} — {written} הוא {full} ביחידות מלאות. חשב איתו כפי שהוא "
+                   "כתוב; תוצאת חישוב עליו תהיה באותו קנה מידה")
 
 
 def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: dict | None, label: str = "") -> str:
@@ -2947,7 +2968,7 @@ def _facts_json(taken: dict, path: tuple) -> dict:
             "said": ({"stances": sorted(said.stances), "stated_by": said.stated_by, "evidence": said.evidence}
                      if said is not None else None),
             "context": taken.get("context") or "", "meaning_from": dict(taken.get("meaning_from") or {}),
-            "anchor": dict(taken.get("anchor") or {}), "path": list(path)}
+            "anchor": dict(taken.get("anchor") or {}), "path": list(path), "scale": int(taken.get("scale") or 1)}
 
 
 def _facts_from_json(d: dict) -> tuple[dict, tuple]:
@@ -2961,7 +2982,7 @@ def _facts_from_json(d: dict) -> tuple[dict, tuple]:
              "said": (Attribution(frozenset(said["stances"]), said["stated_by"], said["evidence"])
                       if said is not None else None),
              "context": d.get("context") or "", "meaning_from": dict(d.get("meaning_from") or {}),
-             "anchor": dict(d.get("anchor") or {})}
+             "anchor": dict(d.get("anchor") or {}), "scale": int(d.get("scale") or 1)}
     return taken, tuple(d.get("path") or ())
 
 
@@ -3229,7 +3250,8 @@ def _reproduces(ws: Workspace, out: calc.Outcome, leaves: list[str]) -> dict | N
             if numbers_in(written) & inputs or len(re.sub(r"\D", "", written).lstrip("0")) < 3:
                 continue
             percent = t[end:end + 2].lstrip().startswith("%")
-            if calc.display_matches(written, percent, out.value, out.dims, out.kind):
+            scale = 1 if percent else calc.scale_after(t, end - len(written), end)[0]
+            if calc.display_matches(written, percent, out.value, out.dims, out.kind, scale, out.scale):
                 return {"source": sid, "as_written": written + ("%" if percent else "")}
     return None
 
@@ -3360,6 +3382,13 @@ def _near_misses(ws: Workspace, node, operands: dict[str, calc.Operand], justifi
     return near, (None if near is not None else differs)
 
 
+# the scale of a result (R14): kept from inputs of one scale, and inputs of different scales brought to units first
+MSG_RESULT_SCALE = ("התוצאה ב{unit}, כקנה המידה שבו המקור מציין את הקלטים (= {full} ביחידות מלאות): הצג אותה כך, או "
+                    "ביחידות מלאות, או במילת סדר גודל לפי הערך המלא (למשל מיליון)")
+MSG_RESCALED = ("הקלטים מצוינים במקורות בקני מידה שונים (למשל באלפי ₪ וב-₪): כל אחד הובא ליחידות מלאות לפני החישוב, "
+                "והתוצאה ביחידות מלאות")
+
+
 def tool_calculate(ws: Workspace, expression: str, label: str = "", justification: str | None = None) -> str:
     """Evaluate an expression over the turn's ids (``app.chat.calc``) and register the result as a C#."""
     try:
@@ -3408,6 +3437,11 @@ def tool_calculate(ws: Workspace, expression: str, label: str = "", justificatio
     notes = []
     if out.approx:
         notes.append("חלק מהערכים מקורבים; התוצאה מקורבת בהתאם.")
+    if out.rescaled:
+        notes.append(MSG_RESCALED)
+    elif out.scale != 1:
+        notes.append(MSG_RESULT_SCALE.format(unit=calc.scaled_label(calc.unit_label(out.dims, out.period), out.scale),
+                                             full=calc.fmt(out.value * out.scale)))
     asserted = [i for i in leaves if i in ws.values and ws.values[i].certainty == "model_asserted"]
     if asserted:
         notes.append("ודאות נמוכה יותר: תכונות של " + ", ".join(asserted) + " נקבעו ולא נמצאו במקור.")
@@ -3465,7 +3499,7 @@ def tool_calculate(ws: Workspace, expression: str, label: str = "", justificatio
                          list(uncertain))
     ws.computations[c.cid] = c
     return json.dumps({"id": c.cid, "label": c.label, "expression": c.expression, "formula": c.formula,
-                       "value": str(c.value), "display": c.display(), "unit": c.unit_label,
+                       "value": str(c.value), "display": c.display(), "unit": c.unit_label, "scale": c.scale,
                        "result_kind": calc.RESULT_KINDS[kind], "reproduces": reproduces, "conditional": c.conditional,
                        "inputs": [x["id"] for x in inputs], "assumptions": c.assumptions, "n": out.n,
                        "documents": c.documents, "note": " ".join(x for x in (c.note, conditional) if x),
