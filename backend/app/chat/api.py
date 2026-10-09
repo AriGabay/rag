@@ -646,6 +646,10 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
         "ledger": outcome.ledger or None, "scope_kind": a.scope_kind, "focus": focus, "request": outcome.request,
         # each requested datum with the status the turn's actions support (found, or how it was not found)
         "requested": coverage.validate_requested(ws, a.requested),
+        # round 7 U3 (KTD3, KTD4): each component of the request with its status, reason and evidence (the detail
+        # the UI expands), and the gap paragraph the answer ends with, grouped by reason. Absent on older answers.
+        "components": coverage.public_components((outcome.ledger or {}).get("requirements") or []),
+        "gaps": list(outcome.report.gaps),
         "touched_documents": sorted(ws.activity),
     }
     # every cited source, value and measurement keeps where it points, resolved against the turn's pinned readings

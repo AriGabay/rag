@@ -50,11 +50,13 @@ def requirement(text: str = "", status: str = "full", units: list | None = None,
 
 
 def component(text: str, kind: str = "information", id: str = "", parent: str = "", conditional: bool = False,
-              subject: str = "", parameters: list | None = None, compares: list | None = None) -> dict:
+              subject: str = "", parameters: list | None = None, compares: list | None = None,
+              aspect: str = "") -> dict:
     """One component of the request as the analysis (or the resolve call) returns it; ``id`` is the model's own
-    label (the server assigns the ``N#`` ids), ``parent`` the label of the component it refines."""
+    label (the server assigns the ``N#`` ids), ``parent`` the label of the component it refines, ``aspect`` what an
+    instruction is about (``citation`` is checked by the server from the answer's units)."""
     return {"id": id, "text": text, "kind": kind, "parent": parent, "conditional": conditional, "subject": subject,
-            "parameters": parameters or [], "compares": compares or []}
+            "parameters": parameters or [], "compares": compares or [], "aspect": aspect}
 
 
 class ScriptedAgent(ScriptedProvider):

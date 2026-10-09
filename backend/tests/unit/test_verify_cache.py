@@ -181,7 +181,7 @@ def test_requirements_given_by_cached_units_survive_a_re_judge_that_moves_their_
     p = _judge(_wrong_management, seen, score=_by_words(["השווי למ\"ר", "דמי השכירות", "פנוי"]))
     first = verify_answer(p, _answer(THREE), ws, "?", [], requirements=turn, cache=cache)
     assert [(o["id"], o["status"]) for o in first.requirement_outcomes()] == [
-        ("N1", "full"), ("N2", "full"), ("N3", "missing")]
+        ("N1", "full"), ("N2", "full"), ("N3", "not_answered")]
     moved = "הנתונים לקוחים מהדוח [S1].\n" + REPAIRED  # every unit's index moves by one
     again = verify_answer(p, _answer(moved), ws, "?", [], requirements=turn, cache=cache)
     assert list(_units(seen[1])) == [0, 3]  # the new opening line and the repaired sentence

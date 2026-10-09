@@ -432,7 +432,8 @@ def test_a_missing_datum_is_said_first_with_the_section_that_was_checked(client,
         final("השטח הבנוי (נתון אחר) הוא 184 מ\"ר [S2].", documents=[doc],
               requested=[{"label": "שטח המגרש", "document_ids": [doc], "status": "section_checked_absent",
                           "checked_where": "S2"}])], question="מה שטח המגרש באשל 9?")
-    assert a["markdown"].startswith("**שטח המגרש** לא מופיע בסעיף \"תיאור הנכס\" שנבדק [S2].")
+    # stated once by the server, after the answer (round 7 KTD4)
+    assert a["markdown"].endswith("\n\n**שטח המגרש** לא מופיע בסעיף \"תיאור הנכס\" שנבדק [S2].")
     assert "(נתון אחר)" in a["markdown"] and a["status"] == "partial"
     (r,) = a["requested"]
     assert r["status"] == "section_checked_absent" and r["section"] == "תיאור הנכס"
@@ -445,7 +446,7 @@ def test_a_section_claim_after_a_search_only_says_not_found_in_search(client, se
         final("השטח הבנוי (נתון אחר) הוא 184 מ\"ר [S1].", documents=[doc],
               requested=[{"label": "שטח המגרש", "document_ids": [doc], "status": "section_checked_absent",
                           "checked_where": "S1"}])], question="מה שטח המגרש באשל 9?")
-    assert a["markdown"].startswith("**שטח המגרש** לא נמצא בחיפוש במסמכים שנבדקו.")
+    assert a["markdown"].endswith("\n\n**שטח המגרש** לא נמצא בחיפוש במסמכים שנבדקו.")
     assert a["requested"][0]["status"] == "not_found_search"
 
 
@@ -466,7 +467,7 @@ def test_a_not_found_sentence_is_added_after_verification_and_survives_a_strict_
     cloud(monkeypatch, setup, agent)
     login(client, "admin-a@example.test")
     a = send(client, new_conversation(client), "מה שטח המגרש באשל 9?")["answer"]
-    assert a["markdown"].startswith("**שטח המגרש** לא נמצא בחיפוש במסמכים שנבדקו.")
+    assert a["markdown"].endswith("\n\n**שטח המגרש** לא נמצא בחיפוש במסמכים שנבדקו.")
     assert a["verification"]["removed"] == 0
 
 

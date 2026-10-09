@@ -511,3 +511,96 @@ def test_an_uncited_table_row_gets_the_citation_inside_its_last_cell():
 
 
 # --- a part not covered whose only limitation is a document the turn read in part ---------------------------------
+
+
+# --- instruction components are checked against the shown answer, never searched (round 7 KTD2, R4, AE1) ----------
+
+STYLE, CITE = "כתיבה בסגנון מקצועי", "מראה מקום לכל נתון"
+
+
+def _instructed(*extra: dict) -> verify.TurnRequirements:
+    turn = verify.TurnRequirements()
+    turn.adopt([{"id": "N1", "text": "השווי למ\"ר"}, {"id": "N2", "text": STYLE, "kind": "instruction", "aspect": "style"},
+                {"id": "N3", "text": CITE, "kind": "instruction", "aspect": "citation"}, *extra], "analysis")
+    return turn
+
+
+def _scoring(table: dict[str, str], seen: list | None = None, rule=lambda text: "supported") -> ScriptedProvider:
+    """Every unit by ``rule``; each frozen requirement ``table[id]`` (default ``missing``), given by every unit when
+    it is ``full``."""
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        if seen is not None:
+            seen.append(input)
+        units = {int(i): t for i, t in re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S)}
+        ids = re.findall(r'<requirement id="(N[\d.]+)"', input)
+        return {"verdicts": [{"index": i, "verdict": rule(t), "reason": "בדיקה"} for i, t in units.items()],
+                "requirements": [{"id": i, "status": table.get(i, "missing"),
+                                  "units": list(units) if table.get(i) == "full" else [], "related": [],
+                                  "reason": "בדיקה"} for i in ids]}
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    return p
+
+
+def test_the_judge_scores_instructions_as_a_separate_list_against_the_answer():
+    seen: list[str] = []
+    verify_answer(_scoring({"N1": "full", "N2": "full"}, seen), _answer("השווי למ\"ר הוא 9,500 ₪ [S1]."),
+                  _ws(SOURCE), "?", [], requirements=_instructed())
+    requirements = re.search(r"<requirements>(.*?)</requirements>", seen[0], re.S).group(1)
+    instructions = re.search(r"<instructions>(.*?)</instructions>", seen[0], re.S).group(1)
+    assert 'id="N1"' in requirements and "N2" not in requirements and "N3" not in requirements
+    assert 'id="N2"' in instructions and 'aspect="style"' in instructions and 'id="N3"' in instructions
+
+
+def test_a_citation_instruction_is_met_when_every_datum_of_the_shown_answer_is_cited_whatever_the_judge_says():
+    r = verify_answer(_scoring({"N1": "full", "N2": "full", "N3": "missing"}),
+                      _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nהנכס פנוי [S1]."), _ws(SOURCE), "?", [],
+                      requirements=_instructed())
+    assert r.ok and not r.problems
+    (cite,) = [o for o in r.requirement_outcomes() if o["id"] == "N3"]
+    assert cite["status"] == "full" and cite["check"] == "citation"
+
+
+def test_a_datum_without_a_citation_leaves_the_citation_instruction_unmet_naming_it_and_asks_for_an_answer_change():
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nדמי השכירות הם 55 ₪ למ\"ר לחודש.")
+    r = verify_answer(_scoring({"N1": "full", "N2": "full", "N3": "full"}), a, _ws(SOURCE), "?", [],
+                      requirements=_instructed())
+    (cite,) = [o for o in r.requirement_outcomes() if o["id"] == "N3"]
+    assert cite["status"] == "not_answered" and cite["uncited"] == ["דמי השכירות הם 55 ₪ למ\"ר לחודש."]
+    (problem,) = [p for p in r.problems if p.kind == "instruction"]
+    assert not r.ok and problem.repairable and not problem.removes_unit and not r.removed_units()
+    assert CITE in problem.reason and "דמי השכירות הם 55" in problem.reason
+    assert "לחפש" not in r.problems_text()  # an answer change, never a search
+
+
+def test_an_unmet_style_instruction_is_a_repair_problem_never_a_search_or_a_removal():
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].")
+    r = verify_answer(_scoring({"N1": "full", "N3": "full"}), a, _ws(SOURCE), "?", [], requirements=_instructed())
+    (problem,) = r.problems
+    assert problem.kind == "instruction" and STYLE in problem.reason and problem.repairable
+    assert "לחפש" not in r.problems_text() and not r.removed_units()
+    assert "לחפש" not in verify.REQ_INSTRUCTION
+    # a rewrite from verified content can still meet an instruction: it is among the rewrite's problems
+    assert STYLE in r.problems_text(claims_only=True)
+
+
+def test_an_instruction_still_unmet_is_a_gap_of_its_own_reason_never_missing_from_the_documents():
+    from app.chat import coverage
+
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].")
+    turn = _instructed()
+    r = verify_answer(_scoring({"N1": "full", "N3": "full"}), a, _ws(SOURCE), "?", [], requirements=turn)
+    final, outcomes = coverage.state_components(_ws(SOURCE), a, r, turn)
+    (style,) = [o for o in outcomes if o["id"] == "N2"]
+    assert style["limitation"] == "instruction_not_met"
+    gap = final.answer_markdown[len(a.answer_markdown):].strip()
+    assert gap == f"הוראה שלא קוימה בתשובה: **{STYLE}**."
+    assert not re.search(r"לא\s+(?:נמצא|נבדק|מופיע|אותר)", gap)
+
+
+def test_the_judges_verdicts_are_kept_on_the_report():
+    r = verify_answer(_judge(lambda t: "not_factual" if "פנוי" in t else "supported"),
+                      _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nהנכס פנוי."), _ws(SOURCE), "?", [])
+    assert r.verdicts == {0: "supported", 1: "not_factual"}

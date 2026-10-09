@@ -140,16 +140,12 @@ F1_ANSWER = ("לפי תכנית דמו/4521 המאושרת, ייעוד הקרק�
              "לפי תכנית דמו/4521, מספר יחידות הדיור המותר הוא 84 יח״ד [S1].")
 
 
-@pytest.mark.xfail(strict=True, reason="round 7 F1: the judge derives the request's instructions as requirements "
-                                       "with no kind; a missing one becomes REQ_NOT_SEARCHED (a repair round told to "
-                                       "search for it) and then a 'not searched' gap sentence (verify.py "
-                                       "_check_requirements, coverage.limitation/state_parts)")
 def test_f1_instructions_are_never_searched_or_reported_missing_from_the_documents(offline):
     asks = [("השימושים לפי התכנית המאושרת", "ייעוד", []), ("מספר יחידות הדיור", "84", []), (STYLE, None, []),
             (CITE, None, [])]
     # the request analysis (U2): the two data, conditional on their appearing, and the two instructions
     analysed = [component(asks[0][0], conditional=True), component(asks[1][0], conditional=True),
-                component(STYLE, "instruction"), component(CITE, "instruction")]
+                component(STYLE, "instruction", aspect="style"), component(CITE, "instruction", aspect="citation")]
     agent = ScriptedAgent([SEARCH, final(F1_ANSWER), final(F1_ANSWER), final(F1_ANSWER)], judge=_judge(asks),
                           request=analysed)
     out = _turn(agent, F1_QUESTION)
@@ -178,11 +174,6 @@ def _quote_cell(quote: str, number: str) -> dict:
             "number": number}
 
 
-@pytest.mark.xfail(strict=True, reason="round 7 F3: the model's own 'not found in the search' sentence is removed "
-                                       "only when the judge links it to the requirement (REQ_FOUND_NOT_ABSENT); "
-                                       "otherwise it passes as not_factual and the server adds its own reason beside "
-                                       "it - two reasons for one gap (verify._non_claim_accepted, "
-                                       "coverage.state_parts)")
 def test_f3_a_model_not_found_sentence_beside_found_data_gives_way_to_one_precise_reason(offline):
     offline.text, offline.section = F3_SOURCE, "סיכום"
     take = [call("take_value", source="S1", locator=_quote_cell("השווי למ\"ר הוא 9,500 ₪", "9,500"), meaning=None,
@@ -311,10 +302,6 @@ ITEMS = (("שימושים", "מסחר"), ("יח״ד", "84"), ("שטחים", None
 
 
 @pytest.mark.db
-@pytest.mark.xfail(strict=True, reason="round 7 F2: the request's six-item category is derived and frozen as one "
-                                       "requirement (verify JUDGE_REQUIREMENTS_POLICY 'once, in the request's words', "
-                                       "TurnRequirements.freeze); scored missing, coverage.limitation states the whole "
-                                       "category 'not found in the search' beside the three items the answer gives")
 def test_f2_a_category_partly_answered_is_never_declared_missing_and_each_absent_item_is_named(client, office,
                                                                                              monkeypatch):
     doc = ingest_round7(office, monkeypatch, "plan_status")

@@ -27,7 +27,7 @@ from tests.integration.test_chat_calculation import (
     meaning,
     take,
 )
-from tests.support.scripted_agent import ScriptedAgent, call, final, read, requirement
+from tests.support.scripted_agent import ScriptedAgent, call, component, final, read, requirement
 
 pytestmark = pytest.mark.db
 
@@ -125,10 +125,19 @@ def test_a_calculation_that_still_fails_is_stated_as_not_completed_not_as_not_fo
     a, agent = _ask(client, office, monkeypatch, steps, _judge(ASKS))
     assert agent.tool_outputs(6)[-1].startswith("שגיאה")
     assert a["status"] == "partial"
-    assert a["markdown"].startswith("**שיעור הרווח מההכנסות**: החישוב נכשל על הנתונים שנמצאו")
+    # the answer as verified, then the server's one gap paragraph (KTD4): the reason is said once, after it
+    assert a["markdown"].startswith("ההכנסות הכוללות הן 12,450,000 ₪ [V1].")
+    assert [line for line in a["markdown"].splitlines() if RATE_ASK in line] == [
+        "**שיעור הרווח מההכנסות**: החישוב נכשל על הנתונים שנמצאו, ולכן התוצאה לא הושלמה."]
     assert "לא נמצא בחיפוש" not in a["markdown"]
     (missing,) = a["verification"]["completeness"]["missing"]
     assert missing["id"] == "N3" and missing["reason"] == "calculation_incomplete"
+    # the payload keeps the gap paragraph grouped by reason, and each component's outcome for the UI to expand
+    assert a["gaps"] == [{"reason": "calculation_incomplete", "reason_text": "החישוב לא הושלם", "components": ["N3"],
+                          "texts": [RATE_ASK], "text": "**שיעור הרווח מההכנסות**: החישוב נכשל על הנתונים שנמצאו, "
+                                                       "ולכן התוצאה לא הושלמה."}]
+    assert [(c["id"], c["status"], c["limitation"], c["stated"]) for c in a["components"]] == [
+        ("N1", "full", None, False), ("N2", "full", None, False), ("N3", "not_answered", "calculation_incomplete", True)]
     assert a["verification"]["completeness"]["status"] == "partial"
     assert a["verification"]["correctness"] == "verified"  # what the answer claims is correct, only incomplete
 
@@ -140,9 +149,12 @@ def test_an_answer_that_declares_no_parts_gets_requirements_from_the_judge(clien
              final("ההכנסות הכוללות הן 12,450,000 ₪ [V1].", documents=[office.doc])]
     asks = [(INCOME_ASK, "ההכנסות הכוללות", ("הכנסות",)), ("שטח המגרש", "שטח המגרש", (CAPTION,))]
     a, _ = _ask(client, office, monkeypatch, steps, _judge(asks), question="מה ההכנסות הכוללות ומה שטח המגרש?")
-    assert a["markdown"].startswith("**שטח המגרש** לא נמצא בחיפוש במסמכים שנבדקו.")
+    # the table it was looked for in was read to its end: "not present in the part read", naming it (R8)
+    assert a["markdown"].startswith("ההכנסות הכוללות הן 12,450,000 ₪ [V1].")
+    assert a["markdown"].endswith(f"**שטח המגרש** לא מופיע בטבלה \"{CAPTION}\" שנבדק [S1].")
     assert a["status"] == "partial"
-    assert [(m["id"], m["reason"]) for m in a["verification"]["completeness"]["missing"]] == [("N2", "not_found")]
+    assert [(m["id"], m["reason"]) for m in a["verification"]["completeness"]["missing"]] == [
+        ("N2", "not_in_part_read")]
 
 
 def test_a_value_found_but_written_as_not_found_is_corrected(client, office, monkeypatch):
@@ -168,6 +180,44 @@ def test_an_undeterminable_requirement_is_stated_as_insufficient_to_conclude(cli
     asks = [(INCOME_ASK, "ההכנסות הכוללות", ("הכנסות",)), ("האם הפרויקט כדאי", "כדאי", (CAPTION,))]
     a, _ = _ask(client, office, monkeypatch, steps, _judge(asks, absent={"האם הפרויקט כדאי": "undeterminable"}),
                 question="מה ההכנסות הכוללות, והאם הפרויקט כדאי?")
-    assert a["markdown"].startswith("**האם הפרויקט כדאי**: המסמכים אינם מספיקים כדי להכריע בכך.")
+    assert a["markdown"].endswith("**האם הפרויקט כדאי**: המסמכים אינם מספיקים כדי להכריע בכך.")
+    # "undeterminable" is the judge's evidence state on a component not answered, not a status of its own (KTD3)
     (missing,) = a["verification"]["completeness"]["missing"]
-    assert missing["status"] == "undeterminable" and missing["reason"] == "insufficient"
+    assert missing["status"] == "not_answered" and missing["reason"] == "not_verifiable"
+    (req,) = [r for r in a["ledger"]["requirements"] if r["id"] == "N2"]
+    assert req["evidence_state"] == "undeterminable"
+
+
+def test_an_unmet_style_instruction_triggers_a_repair_round_that_changes_the_answer_with_no_search_call(
+        client, office, monkeypatch):
+    """KTD2: an instruction is checked against the shown answer; unmet, it sends the answer back to be changed —
+    never to search — and a changed answer that meets it is complete."""
+    style = "כתיבה בטבלה"
+    plain = "ההכנסות הכוללות הן 12,450,000 ₪ [V1]."
+    tabled = "| נתון | סכום |\n|---|---|\n| ההכנסות הכוללות | 12,450,000 ₪ [V1] |"
+    steps = [[call("outline", document=office.doc)],
+             lambda items: [read(table=handle_of(_last_output(items), CAPTION))],
+             [take("S1", cell("סה\"כ", INCOME), meaning("income", role="income", vat="excluded"), "סה״כ הכנסות")],
+             final(plain, documents=[office.doc]), final(tabled, documents=[office.doc])]
+
+    def judge(input: str) -> dict:
+        units = dict((int(i), t) for i, t in re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>',
+                                                         input, re.S))
+        ids = re.findall(r'<requirement id="(N[\d.]+)"', input)
+        table = any(t.startswith("|") for t in units.values())  # the instruction is met by a table
+        gives = [i for i, t in units.items() if "12,450,000" in t]
+        return {"verdicts": [{"index": i, "verdict": "supported", "reason": "בדיקה"} for i in units],
+                "requirements": [requirement(id=ids[0], units=gives),
+                                 requirement(id=ids[1], status="full" if table else "missing")]}
+
+    agent = ScriptedAgent(steps, judge=judge, request=[component(INCOME_ASK),
+                                                       component(style, "instruction", aspect="layout")])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    a = send(client, new_conversation(client), f"מה ההכנסות הכוללות? {style}.")["answer"]
+    repair = next(i["content"] for i in agent.seen[4] if isinstance(i, dict) and i.get("role") == "user"
+                  and "בדיקת האימות" in str(i.get("content")))
+    assert style in repair and "לחפש" not in repair
+    assert len(agent.seen) == 5  # the repair round answered at once: no tool was called, no search
+    assert a["markdown"] == tabled and a["status"] == "answered"
+    assert a["verification"]["completeness"] == {"status": "full", "requirements": 2, "missing": []}

@@ -12,6 +12,9 @@ conversation context — never from the answer (R1). Each component has (R2):
   ``instruction`` (about the answer itself: citations, style, layout, the presentation of a distinction, units —
   never information), ``assumption`` (given by the user), ``clarification`` (a detail the user must supply to
   choose a datum, formula or scenario);
+- for an instruction, what it is about (``aspect``: ``citation``, ``style``, ``layout``, ``units``,
+  ``presentation``): a citation instruction is checked by the server from the verified answer's units, the others
+  by the judge against the shown answer (round 7 U3, KTD2, R4); dropped for any other kind;
 - its parent, when it refines a broader component (a compound request is one parent with a child per item the user
   named, never split beyond what the user asked);
 - whether it is conditional on availability ("as far as it appears"); a child of a conditional component is
@@ -74,6 +77,9 @@ logger = logging.getLogger(__name__)
 
 Kind = Literal["information", "calculation", "instruction", "assumption", "clarification"]
 KINDS: tuple[str, ...] = get_args(Kind)
+# what an instruction is about (KTD2): ``citation`` is checked deterministically from the answer's units
+Aspect = Literal["", "citation", "style", "layout", "units", "presentation"]
+ASPECTS: tuple[str, ...] = get_args(Aspect)
 ID_PREFIX = "N"
 # the prefixes of every handle a turn's workspace issues (tools, verify, api): a component id never starts with one
 HANDLE_PREFIXES = ("S", "M", "V", "A", "C", "P", "Q", "H", "F", "E", "D", "T", "K", "R", "§")
@@ -109,6 +115,7 @@ class Component(_Strict):
     subject: str = ""
     parameters: list[Parameter] = Field(default_factory=list)
     compares: list[str] = Field(default_factory=list)
+    aspect: Aspect = ""
 
 
 class RequestAnalysis(_Strict):
@@ -132,6 +139,8 @@ COMPONENTS_POLICY = """components — רכיבי הבקשה, כל אחד כפי 
   עם source: given_by_user — המשתמש נתן אותו (quote = המילים המדויקות מהודעתו); not_given_by_user — לא נתן (quote ריק).
   אל תקבע אם המסמכים מספקים אותו. נתון שמחפשים במסמכים אינו parameter.
 - compares — רק ל-calculation שמשווה בין נושאים (נכסים, שומות, חלופות): שמות הנושאים כפי שהבקשה נוקבת בהם; אחרת ריק.
+- aspect — רק ל-instruction: במה ההוראה עוסקת: citation — מראי מקום לנתונים; style — סגנון או טון; layout — מבנה, סדר,
+  טבלה או רשימה; units — יחידות או אופן כתיבת מספרים; presentation — אופן הצגה של הבחנה או של נתון. לכל kind אחר — ריק.
 - id: תווית קצרה וייחודית משלך לכל רכיב (למשל 1, 2, 2.1), רק כדי לקשר parent; השרת קובע את המזהים."""
 
 POLICY = ("אתה מנתח בקשות בשיחה של משרד שמאות מקרקעין. קבל את הודעת המשתמש והחזר את רכיבי הבקשה, לפני שמישהו "
@@ -140,9 +149,12 @@ POLICY = ("אתה מנתח בקשות בשיחה של משרד שמאות מקר
 
 KIND_LABELS = {"information": "מידע מהמקורות", "calculation": "חישוב", "instruction": "הוראה על התשובה",
                "assumption": "הנחה של המשתמש", "clarification": "פרט שהמשתמש צריך להשלים"}
+ASPECT_LABELS = {"citation": "מראי מקום", "style": "סגנון", "layout": "מבנה", "units": "יחידות",
+                 "presentation": "אופן הצגה"}
 BLOCK_HEAD = ("רכיבי הבקשה, כפי שנותחו מההודעה לפני התשובה (קבועים לתור הזה: השרת בודק את התשובה מול כל רכיב לפי "
               "המזהה שלו, ורכיב אינו מושמט ואינו מצומצם):")
-BLOCK_TAIL = "הוראה על התשובה מקיימים בתשובה עצמה; לא מחפשים אותה במסמכים."
+BLOCK_TAIL = ("הוראה על התשובה מקיימים בתשובה עצמה; לא מחפשים אותה במסמכים. רכיב שלא נמצא או שלא הושלם — השרת "
+              "מציין אותו ואת הסיבה אחרי התשובה; אל תכתוב זאת בעצמך, וציין ב-requested את ה-id שלו.")
 
 
 @dataclass
@@ -223,10 +235,13 @@ def freeze(components: list[Component] | None, user_texts: Iterable[str]) -> tup
                                    "quote": quote if source == "given_by_user" else ""})
         elif c.parameters or c.compares:
             decisions.append(f"{cid}: parameters or compares dropped (not a calculation)")
+        aspect = c.aspect if c.kind == "instruction" else ""
+        if c.aspect and c.kind != "instruction":
+            decisions.append(f"{cid}: aspect dropped (not an instruction)")
         items.append({"id": cid, "text": " ".join(c.text.split()), "kind": c.kind, "parent": parent,
                       "conditional": conditional, "subject": " ".join(c.subject.split()), "parameters": parameters,
                       "compares": [" ".join(s.split()) for s in c.compares if s.strip()] if calculation else [],
-                      "calculation": calculation})
+                      "calculation": calculation, "aspect": aspect})
         for k, child in enumerate(children.get(n, []), 1):
             visit(child, f"{cid}.{k}", cid, conditional)
 
@@ -327,6 +342,8 @@ def block(items: list[dict]) -> str:
     lines = [BLOCK_HEAD]
     for i in items:
         notes = [KIND_LABELS.get(i["kind"], i["kind"])]
+        if i.get("aspect"):
+            notes.append(ASPECT_LABELS.get(i["aspect"], i["aspect"]))
         if i.get("conditional"):
             notes.append("ככל שמופיע")
         if i.get("subject"):

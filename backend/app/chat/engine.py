@@ -24,11 +24,17 @@ One turn:
    (the analysis failed, timed out, was invalid or empty; the resolution failed or its component part was invalid)
    the turn's first judge call derives them (KTD7, the answer's ``parts`` being hints), and the turn records the
    fallback (``requirements_origin`` and ``requirements_fallback`` in the summary, ``requirements_origin`` in the
-   ledger). Every judge call scores the requirements by id. A failed check gets one repair step — which may
-   call tools, within the step bound, to complete a requirement whose data were found or that nothing searched for;
-   what still fails is removed, and the answer says so; a requirement still not given is stated with its reason by
-   the server (``coverage.state_parts``), and correctness and completeness are reported apart
-   (``VerifyReport.counts``; each requirement in the ledger's ``requirements``).
+   ledger). Every judge call scores the requirements by id (the instructions as a list of their own). A failed
+   check gets one repair step — which may call tools, within the step bound, to complete a requirement whose data
+   were found or that nothing searched for, or change the answer to meet an instruction (never a search, round 7
+   KTD2); what still fails is removed, and the answer says so.
+5. ``finish`` (round 7 U3, KTD3, KTD4): the failed units are removed (``VerifyReport.apply``); each component's
+   status is recomputed from the units that survived, a parent's from its children; the units stating the absence
+   of a component the server states are removed; and the server writes one gap paragraph after the answer, one
+   reason per component not given, grouped by reason (``coverage.state_components``) — the model writes no absence
+   sentence, it declares each component's status in ``requested``. Then the limits it reached and the coverage
+   ledger. Correctness and completeness are reported apart (``VerifyReport.counts``; each component, with its
+   status, reason and evidence, in the ledger's ``requirements``).
 
 Repair rounds cost what changed (KTD10): verdicts are kept for the turn (``verify.VerdictCache``), so a round judges
 only the units that are new or changed, and a problem the server resolves itself — a citation it attaches, a
@@ -171,18 +177,21 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
   נושא — אל תגרור תנאים מהנושא הקודם. "זה" בשאלת המשך מתייחס לנתון שבמרכז השאלה והתשובה הקודמות, לא לפרט צדדי.
 - בקש הבהרה (status=clarification) רק כשיש עמימות שמשנה את התשובה ושנובעת מהשאלה ומהמקורות (למשל שני מסמכים
   מתאימים לכתובת שנשאלה). אחרת — ענה עם הסתייגות ברורה.
-- requested: כל נתון שהשאלה ביקשה, עם המסמכים שבהם חיפשת אותו ו-status: found — נמצא; not_found_search — לא נמצא
-  בחיפוש; source_partial — המסמך שבו הוא אמור להיות נקרא חלקית; section_checked_absent — פתחת (read: section או
-  table) את הסעיף או הטבלה שבהם הוא אמור להופיע, קראת אותם עד הסוף (status complete; אם clipped — המשך ב-cursor
-  עד שאין more) בלי אזור שלא נקרא, והוא לא שם (checked_where = ה-S# של מה שקראת). לפני שאתה קובע "לא מופיע", קרא
-  את הסעיף או הטבלה עד סופם; השרת בודק זאת, וקריאה חלקית תוצג כ"נקרא רק בחלקו". כשנתון לא נמצא, השרת פותח את התשובה במשפט שאומר זאת — אל תכתוב אותו
-  בעצמך. נתון קרוב (למשל שטח בנוי כשנשאלת על שטח מגרש) מותר להציג רק בנפרד ובתיוג מפורש "(נתון אחר)", ולעולם לא
+- אל תכתוב בתשובה שנתון או חלק של הבקשה "לא נמצא", "לא מופיע" או "לא נבדק": השרת מציין כל פער פעם אחת, אחרי
+  התשובה, עם הסיבה לפי מה שהתור עשה בפועל. במקום זה הצהר על כל רכיב בשדות המובנים:
+- requested: לכל רכיב של הבקשה (כשרכיבי הבקשה מופיעים — component = ה-id שלו, N#; label במילות הבקשה), עם המסמכים
+  שבהם חיפשת אותו ו-status: found — נמצא; not_found_search — לא נמצא בחיפוש; source_partial — המסמך שבו הוא אמור
+  להיות נקרא חלקית; section_checked_absent — פתחת (read: section או table) את הסעיף או הטבלה שבהם הוא אמור להופיע,
+  קראת אותם עד הסוף (status complete; אם clipped — המשך ב-cursor עד שאין more) בלי אזור שלא נקרא, והוא לא שם
+  (checked_where = ה-S# של מה שקראת). לפני שאתה קובע "לא מופיע", קרא את הסעיף או הטבלה עד סופם; השרת בודק כל הצהרה
+  מול מה שנעשה בתור, ומוריד אותה לרמה שנבדקה בפועל (קריאה חלקית — "נקרא רק בחלקו"; בלי חיפוש שכיסה אותו — "לא
+  אותר"). נתון קרוב (למשל שטח בנוי כשנשאלת על שטח מגרש) מותר להציג רק בנפרד ובתיוג מפורש "(נתון אחר)", ולעולם לא
   כאילו הוא הנתון שהתבקש. sources_conflict — המקורות נותנים לנתון ערכים שונים (רשום כל ערך ב-take_value או
-  find_measurements, והצג את שניהם).
+  find_measurements, והצג את שניהם). הוראה על התשובה (מראי מקום, סגנון, מבנה) — קיים אותה בתשובה; היא אינה נתון.
 - parts: חלקי הבקשה של המשתמש, כל אחד במילותיו (ask) — כל נתון, הסבר, השוואה או חישוב שנשאלו; שאלה של חלק אחד היא
   חלק אחד. לכל חלק answered — האם התשובה נותנת אותו — ואם לא, missing_kind: not_found_search, source_partial,
-  read_absent (נקרא במלואו ואינו שם), sources_conflict; לחלק שנענה — none. השרת בודק כל חלק מול התשובה, וחלק שלא
-  נענה ולא נאמר שהוא חסר נפתח במשפט שאומר זאת.
+  read_absent (נקרא במלואו ואינו שם), sources_conflict; לחלק שנענה — none. השרת בודק כל רכיב מול התשובה, ורכיב
+  שלא ניתן מצוין על ידי השרת אחרי התשובה.
 
 ניסוח התשובה (answer_markdown):
 - התשובה הישירה קודם, בקצרה. אחר כך פרטים רלוונטיים בלבד. Markdown: פסקאות קצרות, רשימות, טבלה כשמשווים.
@@ -200,19 +209,20 @@ REPAIR = """בדיקת האימות של התשובה מצאה בעיות:
 {problems}
 תקן את התשובה: הסר או נסח מחדש כל טענה שאינה נתמכת במקורות, וצטט רק מזהים שקיבלת. אפשר להשתמש בכלים לבדיקה נוספת
 (למשל לפתוח את הקטע שבו הנתון כתוב). חלק של הבקשה שהתשובה לא נתנה — השלם אותו: מהנתונים שכבר נמצאו (וחשב ב-calculate
-כשהוא דורש חישוב), או חפש אותו אם לא חיפשת. אם עדיין אי אפשר להשלים אותו — אל תכתוב שהוא "לא נמצא" כשהנתונים שלו
-נמצאו; השרת יוסיף את הסיבה. החזר תשובה סופית מתוקנת באותו מבנה."""
+כשהוא דורש חישוב), או חפש אותו אם לא חיפשת. הוראה על התשובה שלא קוימה — שנה את התשובה עצמה כך שתקיים אותה, בלי
+כלים. אם עדיין אי אפשר להשלים חלק — אל תכתוב שהוא "לא נמצא"; השרת יוסיף אחרי התשובה את הסיבה. החזר תשובה סופית
+מתוקנת באותו מבנה."""
 
 REWRITE = """גם התשובה המתוקנת לא אומתה במלואה. אלה המשפטים שלא נמצאה להם תמיכה:
 {problems}
 כתוב תשובה סופית קוהרנטית שמשתמשת רק בתוכן שאומת ובמראי המקום שלו. אל תוסיף טענות חדשות. אם נקודה חשובה לשאלה לא
-אומתה, ציין בקצרה שלא ניתן היה לאמת אותה במקורות. החזר באותו מבנה."""
+אומתה, השמט אותה — השרת יציין אחרי התשובה מה לא ניתן ולמה. החזר באותו מבנה."""
 
 
 # the item that makes a step the last one, by the limit that was reached (appended, so the cached prefix survives)
 LIMIT_NOTICE = """אין עוד קריאה לכלים בשאלה הזו: {why}. ענה עכשיו רק ממה שכבר קראת ומהמזהים שקיבלת. אל תציג את
-התשובה כמלאה: status partial (או not_found / clarification כשמתאים), ואמור במילים פשוטות מה לא נבדק או לא נקרא.
-השרת מוסיף לתשובה משפט על המגבלה — אל תכתוב אותו בעצמך."""
+התשובה כמלאה: status partial (או not_found / clarification כשמתאים), והצהר ב-requested על כל רכיב שלא הושלם.
+השרת מוסיף לתשובה משפט על המגבלה ואת מה שחסר, עם הסיבה — אל תכתוב אותם בעצמך."""
 # the item appended two tool steps before the step bound (once; appended, so the cached prefix survives)
 NEAR_LIMIT_NOTICE = """נותרו שני צעדים אחרונים עם כלים בשאלה הזו — זה והבא — ואחריהם תענה בלי כלים. אם התשובה דורשת
 חישוב: רשום עכשיו, באותו צעד, את כל הערכים וההנחות שעוד חסרים (take_value, assume), וקרא ל-calculate לכל המאוחר
@@ -273,12 +283,14 @@ class Focus(_Strict):
 
 
 class Requested(_Strict):
-    """A datum the question asked for, and whether it was found: ``not_found_search`` (searching did not find it),
-    ``source_partial`` (a document that may hold it was read only in part), ``section_checked_absent`` (the section
-    or table where it belongs was opened, ``checked_where`` = that source's S#, and it is not there),
-    ``sources_conflict`` (the sources give it different values). The server checks the status against what the turn
-    did and states it first (``coverage.state_absence``)."""
+    """The model's status claim for one component of the request (``component``: its N# id; ``label`` in the
+    request's words): ``found``, ``not_found_search`` (searching did not find it), ``source_partial`` (a document that
+    may hold it was read only in part), ``section_checked_absent`` (the section or table where it belongs was
+    opened, ``checked_where`` = that source's S#, and it is not there), ``sources_conflict`` (the sources give it
+    different values). A claim, not a statement: the server validates it against what the turn did, may downgrade it
+    and never upgrades it, and states the gap itself (``coverage.validate_requested``, ``reason_of``; round 7 KTD4)."""
 
+    component: str = ""  # the N# id of the component it is about ("" when the turn showed none)
     label: str
     document_ids: list[str]
     status: Literal["found", "not_found_search", "source_partial", "section_checked_absent", "sources_conflict"]
@@ -287,9 +299,9 @@ class Requested(_Strict):
 
 class Part(_Strict):
     """One part of the user's request (a datum, an explanation, a comparison...), in the user's words, and whether
-    the answer gives it — or, when it does not, why (the model's view; the server derives the kind it states from
-    what the turn did). The judge checks every part against the answer (``verify``): a part neither answered nor
-    stated missing gets the server's missing sentence (``coverage.state_parts``), never silence."""
+    the answer gives it — or, when it does not, why (the model's view; the server derives the reason it states from
+    what the turn did). Hints for the judge when the turn has no components (KTD7); a part not given is stated by the
+    server after the answer (``coverage.state_components``), never by the model, never silence."""
 
     ask: str
     answered: bool
@@ -504,16 +516,16 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             return TurnOutcome(answer, ws, VerifyReport([], judged=True, judge_status="no_claims"), steps, usage, {},
                                rounds, request.as_dict(), request.resolution, _summary(usage, rounds, reused, turn))
     def finish(answer: FinalAnswer, report: VerifyReport) -> TurnOutcome:
-        # a server sentence saying a datum was not found is not added when the turn holds its values
-        final = coverage.state_absence(ws, report.apply(answer), cited=False, withdrawn=report.withdrawn)
-        # a requirement the verified answer neither gives nor says is missing is stated with its reason
-        final, outcomes = coverage.state_parts(ws, final, report, turn)
+        # removals; each component recomputed from the surviving units; the absences the server states removed; one
+        # gap paragraph after the answer (round 7 U3) — then the limits reached and the coverage ledger
+        final, outcomes = coverage.state_components(ws, answer, report, turn)
         report.completeness = coverage.completeness(outcomes)
         final = _state_limits(final, limits)
         ledger: dict = {}
         if final.status != "clarification":
             ledger, final = coverage.build(ws, final, inp.question)
             ledger["requirements"] = outcomes
+            ledger["gap_documents"] = coverage.gap_documents(outcomes)
             ledger["requirements_origin"] = turn.record_origin()
         return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
                            request.as_dict() if request is not None else None,
@@ -603,9 +615,6 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             settle_analysis()  # the first step answered: the requirements are frozen before verification
         if answer.status == "clarification" and answer.clarification_question.strip() and not answer.answer_markdown.strip():
             answer.answer_markdown = answer.clarification_question
-        # a datum that was not found is said first, at the level the turn actually checked; a sentence that rests on
-        # an opened section is judged with the answer, one about the search itself is added after verification
-        answer = coverage.state_absence(ws, answer, cited=True)
         if deadline + VERIFY_ALLOWANCE_SECONDS - time.monotonic() < settings.chat_verify_min_seconds:
             # an answer that cannot be checked is never shown: a repaired one gives way to the answer already
             # verified, a first one fails the turn, saying why
@@ -614,12 +623,11 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             raise ProviderFailure("verify_no_time")
         progress("verify", "מאמת את הטענות מול המקורות")
         try:
-            # the judge checks each part of the request against the answer and the sentences the server adds
-            # after verification (what was not found), so a part stated missing there is not stated twice
+            # the judge scores each component of the request against the answer (the instructions as a list of
+            # their own); what is still not given is stated by the server after verification, once
             report = verify_answer(provider, answer, ws, inp.question, usage,
                                    deadline=deadline + VERIFY_ALLOWANCE_SECONDS,
                                    mismatch=resolve.mismatch(request, answer.focus),
-                                   statements=coverage.planned_statements(ws, answer),
                                    request=request.standalone_question if request is not None else None,
                                    requirements=turn if answer.status != "clarification" else None,
                                    cache=verdicts)

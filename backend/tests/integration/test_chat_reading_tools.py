@@ -165,7 +165,8 @@ def test_ae3_an_absence_after_part_of_a_section_is_read_in_part_and_after_the_en
     a = send(client, new_conversation(client), "מה חזית המגרש בערבה 14?")["answer"]
     (r,) = a["requested"]
     assert r["status"] == "source_partial" and r["partial_reason"] == "clipped"
-    assert a["markdown"].startswith(f"**חזית המגרש** לא נמצא בחלק שנקרא מהסעיף \"{DESCRIPTION}\"")
+    # stated once by the server, after the answer (round 7 KTD4)
+    assert f"\n\n**חזית המגרש** לא נמצא בחלק שנקרא מהסעיף \"{DESCRIPTION}\"" in a["markdown"]
     assert a["status"] == "partial"
 
     agent = ScriptedAgent([[call("outline", document=office.doc)], _outline_then(office.doc),
@@ -175,7 +176,7 @@ def test_ae3_an_absence_after_part_of_a_section_is_read_in_part_and_after_the_en
     a = send(client, new_conversation(client), "מה חזית המגרש בערבה 14?")["answer"]
     (r,) = a["requested"]
     assert r["status"] == "section_checked_absent" and r["section"] == DESCRIPTION
-    assert a["markdown"].startswith(f"**חזית המגרש** לא מופיע בסעיף \"{DESCRIPTION}\" שנבדק [S2].")
+    assert a["markdown"].endswith(f"\n\n**חזית המגרש** לא מופיע בסעיף \"{DESCRIPTION}\" שנבדק [S2].")
     assert a["searches"] == []  # read to the end without any search
 
 

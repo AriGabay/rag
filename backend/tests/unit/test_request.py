@@ -243,11 +243,12 @@ def test_the_judge_is_given_the_frozen_components_with_their_kind_parent_and_con
                   component("מראה מקום לכל נתון", "instruction")])
     turn = TurnRequirements()
     turn.adopt(a.items, "analysis")
-    rendered = _Coverage(turn, ["רמז שאינו דרישה"], [], "?").render()
+    rendered = _Coverage(turn, ["רמז שאינו דרישה"], "?").render()
     assert "<derive_requirements>" not in rendered and "<hint>" not in rendered
     assert '<requirement id="N1" kind="information" conditional="true">' in rendered
     assert '<requirement id="N1.1" kind="information" parent="N1" conditional="true">' in rendered
-    assert '<requirement id="N2" kind="instruction">' in rendered
+    # an instruction reaches the judge in a list of its own, scored against the shown answer (round 7 KTD2)
+    assert '<requirement id="N2" kind="instruction">' in rendered.split("<instructions>")[1]
     assert turn.derived and turn.origin == "analysis" and turn.fallback is None
 
 
