@@ -244,3 +244,33 @@ against pypdfium2's character boxes rather than pdfplumber's.
 | `positions/P4_synthetic_rotated_270_cropped.pdf` | `/Rotate 270`, same boxes as P2 |
 | `positions/P5_synthetic_rotate_45.pdf` | `/Rotate 45` on page 1: recorded as `rotation_unsupported`, no spans or cell boxes there |
 | `positions/P6_synthetic_cropped.pdf` | No rotation, same shifted MediaBox and inset CropBox as P2 |
+
+## Citation fixtures (`citations/`)
+
+Synthetic documents for the end-to-end citation test `frontend/e2e/citations.spec.ts` (U14, R33, AE1–AE4): it uploads
+them to office B, asks in limited mode (search results with citations), opens a citation and checks the page image the
+viewer requests (version, page, reading), the highlight rectangle against an independently known box, and that the
+rendered page is dark (text) under the rectangle. Generate them on the host with `uv run python
+scripts/generate_fixtures.py --only citations --font-dir <dir with DejaVu TTFs>` (byte-identical on a second run with
+the same fonts); the other fixtures are not touched.
+
+`citations/manifest.json` records, per document, the question the browser test asks, which passage it should open
+(`expect.pick`: the source kind and a phrase of its text), the precision the viewer should state, and every cited
+place as `box`: `[x0, y0, x1, y1]` fractions of the **shown** page's display width and height (origin top-left, after
+`/Rotate` and the CropBox), with `box_points` the same in points. The boxes come from the generator's own layout (a
+line from fpdf2's placement: right margin, string width, baseline and the font's em box; a table cell from its ruled
+rectangle; the picture from where it is placed), never from reading the files back. `tests/unit/test_citation_fixtures.py`
+checks them against pypdfium2's character boxes and image objects and against ink in the rendered page, independently
+of pdfplumber and of the application's readers. The browser test's tolerance is `tolerance` (0.02 of the page's
+width or height per edge).
+
+| file | what it exercises | expected citation |
+|---|---|---|
+| `citations/C1_synthetic_citations_digital.pdf` | Two text-layer pages; the cited sentence is the only line of section 3 on page 2 | Block precision on page 2: the sentence and its heading |
+| `citations/C2_synthetic_citations_scanned.pdf` | The same kind of page rasterized at 200 dpi with speckle and a 0.4° skew (no text layer) | Page precision on page 1, no rectangle (OCR lines carry no position) |
+| `citations/C3_synthetic_citations_mixed_table_image.pdf` | Text-layer paragraphs around a ruled table drawn as a picture | Read by the vision model only in cloud mode: a table row is marked at table level, on the picture's region |
+| `citations/C4_synthetic_citations_rotated_90_cropped.pdf` | One page under `/Rotate 90`, MediaBox shifted by (36, 24), CropBox inset by (10, 8, 12, 6) | Block precision; the rectangle lies on the sentence in the shown page |
+| `citations/C5_synthetic_citations_repeated_number.pdf` | The number 1,375 in a summary sentence and in a table cell | The row citation covers the cell and not the sentence; the sentence citation covers the sentence and not the cell |
+| `citations/C6_synthetic_citations_cross_page_table.pdf` | A ruled table from page 1 to page 2 without a repeated header; the cited row is on page 2 | Row on page 2, the column headers anchored on page 1 |
+| `citations/C7_synthetic_citations_docx_table.docx` | A DOCX with sections and a table of shops | Structured view, no page; a value taken from a cell (real model) marks the cell |
+| `citations/C8_synthetic_citations_replaced.pdf`, `C8v2_synthetic_citations_replaced_v2.pdf` | A version and its replacement (a line added above the cited sentence, its year changed) | The old conversation still opens version 1's page with the original rectangle |

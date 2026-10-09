@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import random
 import zipfile
 from dataclasses import dataclass, field
@@ -4392,13 +4393,465 @@ def write_regions(out: Path, font_dir: Path) -> None:
         print(f"wrote {REGIONS_DIR}/{name} ({len(data):,} bytes)")
 
 
+# --------------------------------------------------------------------------- citations (citations/)
+
+CITATIONS_DIR = "citations"
+CITATIONS_MANIFEST = "manifest.json"
+PT_PER_MM = 72 / 25.4
+# A line's box as a text reader reports it: the advance width of its glyphs, and from the baseline the font's ascent
+# above and descent below. fpdf2 puts a cell's baseline at ``top + h / 2 + 0.3 * font size``. DejaVu Sans: ascent 0.76
+# and descent 0.24 of the font size (the em box the PDF readers use for a character's height).
+CITATIONS_ASCENT = 0.76
+CITATIONS_DESCENT = 0.24
+CITATIONS_TOLERANCE = 0.02  # of the page's display width (x) and height (y), per edge, for the browser test
+# (rotation, MediaBox shift, CropBox insets left/bottom/right/top) in points, as the positions set turns its pages
+CITATIONS_TURN = (90, (36, 24), (10, 8, 12, 6))
+CITATIONS_PICTURE_HEADERS = ["מרכז מסחרי", "שטח (מ״ר)", "תפוסה"]
+CITATIONS_PICTURE_ROWS = [
+    ["מרכז הכרכום", "4,150", "91.5%"],
+    ["מרכז החצב", "2,780", "86.0%"],
+    ["מרכז הרקפת", "3,320", "94.5%"],
+]
+CITATIONS_DOCX_HEADERS = ["יחידה", "שטח (מ״ר)", "מחיר למ״ר (₪)"]
+CITATIONS_DOCX_ROWS = [
+    ["חנות השחף", "48", "21,500"],
+    ["חנות הנשר", "62", "19,800"],
+    ["חנות העפרוני", "35", "24,300"],
+]
+
+
+def _title_of(name: str) -> str:
+    """The title the application gives an uploaded file: its name without the extension, underscores as spaces."""
+    return Path(name).stem.replace("_", " ")
+
+
+def _frac_box(box: list[float], width: float, height: float) -> list[float]:
+    return [round(box[0] / width, 4), round(box[1] / height, 4), round(box[2] / width, 4), round(box[3] / height, 4)]
+
+
+def _union_box(boxes: list[list[float]]) -> list[float]:
+    return [min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)]
+
+
+def turned_box(box: list[float], rotation: int, insets: tuple[float, float, float, float]) -> list[float]:
+    """Where a box of the upright page (points, origin top-left) is shown once ``turn_pdf`` turned the page under
+    ``/Rotate rotation`` and inset its CropBox: the MediaBox shift moves content and box together, so only the insets
+    move the content on the shown page. Under /Rotate 90 the user space's bottom edge is the shown page's left edge
+    and its left edge the shown top."""
+    left, bottom, right, top = insets
+    dx, dy = {0: (left, top), 90: (bottom, left)}[rotation]
+    return [box[0] - dx, box[1] - dy, box[2] - dx, box[3] - dy]
+
+
+def turned_size(width: float, height: float, rotation: int, insets: tuple[float, float, float, float]
+                ) -> tuple[float, float]:
+    left, bottom, right, top = insets
+    return {0: (width - left - right, height - bottom - top), 90: (width - bottom - top, height - left - right)}[rotation]
+
+
+class CitationsPdfRenderer(RegionsPdfRenderer):
+    """Synthetic appraisal-like pages whose every cited place is recorded as it is drawn: a line's box from fpdf2's
+    own placement (right margin, string width, baseline) and a table cell's box from its ruled rectangle, in points on
+    the upright page. Nothing is read back from the PDF. Every name and value is invented."""
+
+    def __init__(self, font_dir: Path) -> None:
+        super().__init__(font_dir)
+        self.boxes: dict[str, dict[str, Any]] = {}
+
+    def _page_box(self) -> tuple[float, float]:
+        return self.pdf.w * PT_PER_MM, self.pdf.h * PT_PER_MM
+
+    def placed(self, key: str | None, text: str, size: float = 10.5, bold: bool = False, h: float | None = None
+               ) -> list[float]:
+        """Draws one right-aligned line and returns (and records under ``key``) its box in points."""
+        pdf = self.pdf
+        h = h or self.LINE_H
+        if pdf.get_y() + h > pdf.page_break_trigger:
+            pdf.add_page()
+        pdf.set_font("DejaVu", "B" if bold else "", size)
+        y = pdf.get_y()
+        right = pdf.w - pdf.r_margin - pdf.c_margin
+        width = pdf.get_string_width(text)
+        baseline = y + 0.5 * h + 0.3 * pdf.font_size
+        box = [(right - width) * PT_PER_MM, (baseline - CITATIONS_ASCENT * pdf.font_size) * PT_PER_MM,
+               right * PT_PER_MM, (baseline + CITATIONS_DESCENT * pdf.font_size) * PT_PER_MM]
+        self._line(text, size=size, bold=bold, h=h)
+        if key is not None:
+            self.boxes[key] = {"page": pdf.page_no(), "box": box, "text": text}
+        return box
+
+    def heading_line(self, key: str | None, text: str) -> list[float]:
+        self.pdf.ln(2)
+        return self.placed(key, text, size=12.5, bold=True, h=8)
+
+    def body_line(self, key: str | None, text: str) -> list[float]:
+        box = self.placed(key, text)
+        self.pdf.ln(2)
+        return box
+
+    def ruled_row(self, cells: list[str], widths: list[int], bold: bool = False) -> tuple[int, list[list[float]]]:
+        """One ruled table row (``_grow``); returns its page and each cell's rectangle in points, in cell order (the
+        first cell is the rightmost)."""
+        pdf = self.pdf
+        y = pdf.get_y()
+        x_right = pdf.w - pdf.r_margin
+        boxes = []
+        for width in widths:
+            x_right -= width
+            boxes.append([x_right * PT_PER_MM, y * PT_PER_MM, (x_right + width) * PT_PER_MM,
+                          (y + self.ROW_H) * PT_PER_MM])
+        self._grow(cells, widths, bold=bold)
+        return pdf.page_no(), boxes
+
+    def header(self, title: str) -> None:
+        self.placed(None, title, size=15, bold=True, h=9)
+        self.placed(None, f"{SYNTHETIC_MARKER} — כל הנתונים בדויים", size=10, bold=True)
+        self.placed(None, "משרד: שמאות דמו ב׳ (סינתטי)", size=9.5)
+        self.pdf.ln(2)
+
+    # --- the documents ------------------------------------------------------------------------------------------
+
+    def render_digital(self) -> bytes:
+        """C1: two text-layer pages; the cited sentence is the only line of section 3, on page 2."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.header("חוות דעת לדוגמה — מתחם גבעת הסנונית")
+        self.heading_line(None, "1. מטרת חוות הדעת")
+        self.body_line(None, "חוות דעת זו נערכה לצורך הדגמה בלבד ואינה מתייחסת לנכס אמיתי.")
+        self.heading_line(None, "2. תיאור הסביבה")
+        for line in ("הסביבה כוללת בנייה רוויה בת ארבע עד שש קומות, מבני ציבור ושטחים פתוחים.",
+                     "הגישה לנכס היא מרחוב ראשי ברוחב של כ-20 מטרים."):
+            self.placed(None, line)
+        pdf.add_page()
+        self.heading_line("heading", "3. ממצאי הביקור")
+        self.body_line("target", "חזית הבניין מצופה אבן בגוון ענבר טורקיזי ונמצאה במצב תחזוקה טוב.")
+        self.heading_line(None, "4. סיכום")
+        self.body_line(None, "השווי המוערך של הנכס הוא 2,480,000 ₪ (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+    def render_scan_source(self) -> bytes:
+        """C2 before rasterizing: large type, so a Hebrew OCR reads the cited line."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.header("חוות דעת לדוגמה — סריקה של רחוב הנחליאלי")
+        self.heading_line("heading", "1. מצב הגג")
+        self.placed("target", "הגג מצופה ברעפי חרס בגוון סגלגל ונמצא תקין.", size=14, h=9)
+        pdf.ln(2)
+        self.heading_line(None, "2. סיכום")
+        self.placed(None, "השווי המוערך הוא 1,930,000 ₪.", size=14, h=9)
+        return bytes(pdf.output())
+
+    def render_mixed(self) -> bytes:
+        """C3: text-layer paragraphs around a table drawn as a picture (its values are in no text layer)."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.header("סקר תפוסה לדוגמה — מרכזי מסחר")
+        self.heading_line("heading", "1. סקר תפוסה")
+        self.body_line("intro", "להלן נתוני התפוסה שנאספו במרכזי המסחר של העיר:")
+        img = raster_rows_table(self.font_dir, (1200, 360), 34, 3, CITATIONS_PICTURE_HEADERS, CITATIONS_PICTURE_ROWS)
+        w_mm = 150.0
+        h_mm = w_mm * img.size[1] / img.size[0]
+        x_mm = pdf.w - pdf.r_margin - w_mm
+        y_mm = pdf.get_y()
+        self.picture(img, w_mm, h_mm, x_mm)
+        self.boxes["picture"] = {"page": pdf.page_no(), "text": "",
+                                 "box": [x_mm * PT_PER_MM, y_mm * PT_PER_MM, (x_mm + w_mm) * PT_PER_MM,
+                                         (y_mm + h_mm) * PT_PER_MM]}
+        self.note("(*) הנתונים בדויים ולצורך הדגמה בלבד.")
+        self.heading_line(None, "2. סיכום")
+        self.body_line(None, "התפוסה הממוצעת במרכזים שנסקרו גבוהה מ-85%.")
+        return bytes(pdf.output())
+
+    def render_rotated_source(self) -> bytes:
+        """C4 before turning: one upright page whose cited sentence is the only line of section 1."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.header("חוות דעת לדוגמה — רחוב הצופית 11")
+        self.heading_line("heading", "1. נתוני המבנה")
+        self.body_line("target", "המבנה בנוי מבלוקי איטונג בגוון חרדלי וכולל שלוש קומות מגורים.")
+        self.heading_line(None, "2. סיכום")
+        self.body_line(None, "השווי המוערך של הדירה הוא 1,615,000 ₪.")
+        return bytes(pdf.output())
+
+    def render_repeated(self) -> bytes:
+        """C5: the same number in a summary sentence and in a table cell, each a separate citable place."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.header("חוות דעת לדוגמה — מתחם המחסנים בעמק השקמים")
+        self.heading_line("heading", "1. סיכום השטחים")
+        self.body_line("paragraph", "סך שטח מחסן הדולפין במתחם הוא 1,375 מ״ר לפי המדידה.")
+        self.heading_line(None, "2. פירוט השטחים")
+        self.body_line(None, "טבלת שטחי המחסנים:")
+        widths = [80, 50, 50]
+        pdf.set_fill_color(225, 225, 225)
+        headers = ["מבנה", "שטח (מ״ר)", "שווי (₪)"]
+        _, header = self.ruled_row(headers, widths, bold=True)
+        rows = [["מחסן האלמוג", "860", "1,720,000"], ["מחסן הדולפין", "1,375", "2,750,000"],
+                ["מחסן הצדפה", "640", "1,280,000"]]
+        for i, cells in enumerate(rows):
+            page, boxes = self.ruled_row(cells, widths)
+            if cells[0] == "מחסן הדולפין":
+                self.boxes["row"] = {"page": page, "box": _union_box(boxes), "text": " | ".join(cells),
+                                     "row_index": i}
+                self.boxes["cell"] = {"page": page, "box": boxes[1], "text": cells[1], "row_index": i, "column": 1}
+        self.boxes["table_header"] = {"page": 1, "box": _union_box(header), "text": " | ".join(headers)}
+        pdf.ln(3)
+        self.heading_line(None, "3. סיכום")
+        self.body_line(None, "שטחי המחסנים נמדדו בביקור במקום (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+    def render_cross_page(self) -> bytes:
+        """C6: a ruled table that continues on page 2 without repeating its header; the cited row is on page 2."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.header("חוות דעת לדוגמה — בניין היחידות בכרם הגפן")
+        self.heading_line(None, "1. רשימת היחידות")
+        self.body_line(None, "פירוט שטחי היחידות ושוויין:")
+        widths = [80, 50, 50]
+        pdf.set_fill_color(225, 225, 225)
+        headers = ["יחידה", "שטח (מ״ר)", "שווי (₪)"]
+        _, header = self.ruled_row(headers, widths, bold=True)
+        self.boxes["table_header"] = {"page": pdf.page_no(), "box": _union_box(header), "text": " | ".join(headers)}
+        for i in range(1, 37):
+            cells = ["יחידת הנחליאלי", "143", "3,146,000"] if i == 34 else [f"יחידה {i}", str(40 + i),
+                                                                               f"{(40 + i) * 22_000:,}"]
+            if pdf.get_y() + self.ROW_H > pdf.page_break_trigger:
+                pdf.add_page()
+            page, boxes = self.ruled_row(cells, widths)
+            if i == 34:
+                self.boxes["row"] = {"page": page, "box": _union_box(boxes), "text": " | ".join(cells),
+                                     "row_index": i - 1}
+                self.boxes["cell"] = {"page": page, "box": boxes[1], "text": cells[1], "row_index": i - 1,
+                                      "column": 1}
+        assert self.boxes["table_header"]["page"] == 1 and self.boxes["row"]["page"] == 2, self.boxes
+        pdf.ln(3)
+        self.heading_line(None, "2. סיכום")
+        self.body_line(None, "סך השטחים מופיע בטבלה (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+    def render_replaced(self, second: bool) -> bytes:
+        """C8: a version and its replacement; the replacement adds a line above the cited one and changes its year,
+        so the cited sentence sits lower on the replacement's page."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.header("חוות דעת לדוגמה — רחוב הדוכיפת 5")
+        if second:
+            self.body_line(None, "גרסה מעודכנת של חוות הדעת (מסמך סינתטי).")
+        self.heading_line("heading", "1. שימוש בנכס")
+        year = 2014 if second else 2011
+        self.body_line("target", f"המחסן ברחוב הדוכיפת 5 משמש לאחסון ציוד חקלאי מאז שנת {year}.")
+        self.heading_line(None, "2. סיכום")
+        self.body_line(None, "השווי המוערך של המחסן הוא 940,000 ₪.")
+        return bytes(pdf.output())
+
+
+def raster_rows_table(font_dir: Path, size: tuple[int, int], font_px: int, line: int, headers: list[str],
+                      rows: list[list[str]]):
+    """A ruled table drawn as a picture (``raster_table``'s drawing, with the given header and rows)."""
+    from PIL import Image, ImageDraw
+
+    w, h = size
+    img = Image.new("RGB", (w, h), "white")
+    draw = ImageDraw.Draw(img)
+    all_rows = [headers, *rows]
+    row_h = h // len(all_rows)
+    col_w = w // len(headers)
+    draw.rectangle((0, 0, w - 1, row_h), fill=(225, 225, 225))
+    for r, cells in enumerate(all_rows):
+        font = _pil_font(font_dir, font_px, bold=r == 0)
+        for c, cell in enumerate(cells):
+            x1 = w - c * col_w
+            _draw_centered(draw, (x1 - col_w, r * row_h, x1, (r + 1) * row_h), cell, font)
+    for r in range(len(all_rows) + 1):
+        y = min(r * row_h, h - line)
+        draw.rectangle((0, y, w - 1, y + line - 1), fill="black")
+    for c in range(len(headers) + 1):
+        x = min(c * col_w, w - line)
+        draw.rectangle((x, 0, x + line - 1, h - 1), fill="black")
+    return img
+
+
+def render_citations_docx() -> bytes:
+    """C7: a DOCX with sections, a paragraph and a table of shops; its citations have no pages (structured)."""
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+
+    document = Document()
+    cp = document.core_properties
+    cp.title = f"{SYNTHETIC_MARKER} - חוות דעת לדוגמה"
+    cp.author = "synthetic fixture generator"
+    cp.last_modified_by = "synthetic fixture generator"
+    cp.created = FIXED_TS.replace(tzinfo=None)
+    cp.modified = FIXED_TS.replace(tzinfo=None)
+    cp.revision = 1
+
+    def para(text: str) -> None:
+        p = document.add_paragraph(text)
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        _rtl_paragraph(p)
+
+    def heading(text: str, level: int) -> None:
+        p = document.add_heading(text, level=level)
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        _rtl_paragraph(p)
+
+    heading("חוות דעת לדוגמה — מרכז המסחר בשדרות האירוסים", 0)
+    para(f"{SYNTHETIC_MARKER} — כל הנתונים בדויים")
+    para("משרד: שמאות דמו ב׳ (סינתטי)")
+    heading("1. כללי", 1)
+    para("חוות דעת זו נערכה לצורך הדגמה בלבד ואינה מתייחסת לנכס אמיתי.")
+    heading("2. טבלת היחידות", 1)
+    para("פירוט יחידות המסחר בבניין:")
+    table = document.add_table(rows=1 + len(CITATIONS_DOCX_ROWS), cols=len(CITATIONS_DOCX_HEADERS))
+    table.style = "Table Grid"
+    table._tbl.tblPr.append(OxmlElement("w:bidiVisual"))
+    for r, cells in enumerate([CITATIONS_DOCX_HEADERS, *CITATIONS_DOCX_ROWS]):
+        for c, text in enumerate(cells):
+            cell = table.cell(r, c)
+            cell.text = text
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                _rtl_paragraph(p)
+                if r == 0:
+                    for run in p.runs:
+                        run.bold = True
+    heading("3. סיכום", 1)
+    para("המחירים למ״ר אינם כוללים מע״מ (מסמך סינתטי).")
+    buf = io.BytesIO()
+    document.save(buf)
+    return normalize_zip(buf.getvalue())
+
+
+def _pdf_entry(name: str, kind: str, boxes: dict[str, dict[str, Any]], pages: int, size: tuple[float, float],
+               rotation: int = 0, insets: tuple[float, float, float, float] = (0, 0, 0, 0), **extra: Any
+               ) -> dict[str, Any]:
+    """A PDF's manifest entry: each recorded place on the shown page, as fractions of the shown page's size."""
+    width, height = turned_size(size[0], size[1], rotation, insets)
+    places = {}
+    for key, rec in boxes.items():
+        shown = turned_box(rec["box"], rotation, insets)
+        places[key] = {k: v for k, v in rec.items() if k != "box"} | {
+            "box": _frac_box(shown, width, height), "box_points": [round(v, 2) for v in shown]}
+    return {"file": f"{CITATIONS_DIR}/{name}", "title": _title_of(name), "kind": kind, "pages": pages,
+            "display": {"width": round(width, 2), "height": round(height, 2), "rotation": rotation},
+            "places": places} | extra
+
+
+def write_citations(out: Path, font_dir: Path) -> None:
+    """Writes the citation fixtures and ``manifest.json``: what each browser scenario asks, which passage it should
+    cite and where that passage is on the shown page (fractions of its display width and height, origin top-left)."""
+    from pypdf import PdfReader
+
+    cdir = out / CITATIONS_DIR
+    cdir.mkdir(parents=True, exist_ok=True)
+    docs: dict[str, dict[str, Any]] = {}
+
+    def save(name: str, data: bytes) -> None:
+        (cdir / name).write_bytes(data)
+        print(f"wrote {CITATIONS_DIR}/{name} ({len(data):,} bytes)")
+
+    def pages_of(data: bytes) -> int:
+        return len(PdfReader(io.BytesIO(data)).pages)
+
+    r = CitationsPdfRenderer(font_dir)
+    data = r.render_digital()
+    save(name := "C1_synthetic_citations_digital.pdf", data)
+    docs["digital"] = _pdf_entry(
+        name, "pdf_digital", r.boxes, pages_of(data), r._page_box(), query="חזית בגוון ענבר טורקיזי",
+        expect={"precision": "block", "target": "target", "also": ["heading"], "pick": {"kind": "text",
+                                                                                         "contains": "ענבר טורקיזי"}})
+
+    r = CitationsPdfRenderer(font_dir)
+    data = rasterize_to_scan(r.render_scan_source(), seed=7)
+    save(name := "C2_synthetic_citations_scanned.pdf", data)
+    # the page image only: OCR lines carry no position, so the citation is page level (no rectangle); the boxes are
+    # where the text was drawn before rasterizing (turned by at most 0.4 degrees there)
+    docs["scanned"] = _pdf_entry(
+        name, "pdf_scanned", r.boxes, pages_of(data), r._page_box(), query="רעפי חרס בגוון סגלגל",
+        expect={"precision": "page", "target": "target", "page": 1, "pick": {"kind": "text", "contains": "רעפי"}})
+
+    r = CitationsPdfRenderer(font_dir)
+    data = r.render_mixed()
+    save(name := "C3_synthetic_citations_mixed_table_image.pdf", data)
+    # read by the vision model only in cloud mode: a row of a table read from a picture is marked at table level, on
+    # the picture's region
+    docs["mixed"] = _pdf_entry(
+        name, "pdf_mixed", r.boxes, pages_of(data), r._page_box(), query="תפוסה מרכז הכרכום",
+        picture_table={"headers": CITATIONS_PICTURE_HEADERS, "rows": CITATIONS_PICTURE_ROWS},
+        expect={"precision": "region", "region": "table", "target": "picture",
+                "pick": {"kind": "table_row", "contains": "הכרכום"}})
+
+    r = CitationsPdfRenderer(font_dir)
+    rotation, shift, insets = CITATIONS_TURN
+    data = turn_pdf(r.render_rotated_source(), rotation, shift, insets)
+    save(name := "C4_synthetic_citations_rotated_90_cropped.pdf", data)
+    docs["rotated"] = _pdf_entry(
+        name, "pdf_rotated", r.boxes, pages_of(data), r._page_box(), rotation, insets,
+        query="בלוקי איטונג בגוון חרדלי",
+        expect={"precision": "block", "target": "target", "also": ["heading"],
+                "pick": {"kind": "text", "contains": "איטונג"}})
+
+    r = CitationsPdfRenderer(font_dir)
+    data = r.render_repeated()
+    save(name := "C5_synthetic_citations_repeated_number.pdf", data)
+    docs["repeated"] = _pdf_entry(
+        name, "pdf_digital", r.boxes, pages_of(data), r._page_box(), query="שטח מחסן הדולפין", number="1,375",
+        expect={"row": {"precision": "region", "region": "row", "target": "row", "contains": "cell",
+                        "avoid": "paragraph", "pick": {"kind": "table_row", "contains": "הדולפין"}},
+                "paragraph": {"precision": "block", "target": "paragraph", "also": ["heading"], "avoid": "cell",
+                              "pick": {"kind": "text", "contains": "הדולפין"}}})
+
+    r = CitationsPdfRenderer(font_dir)
+    data = r.render_cross_page()
+    save(name := "C6_synthetic_citations_cross_page_table.pdf", data)
+    docs["cross_page"] = _pdf_entry(
+        name, "pdf_digital", r.boxes, pages_of(data), r._page_box(), query="יחידת הנחליאלי",
+        expect={"precision": "region", "region": "row", "target": "row", "contains": "cell", "header": "table_header",
+                "pick": {"kind": "table_row", "contains": "הנחליאלי"}})
+
+    data = render_citations_docx()
+    save(name := "C7_synthetic_citations_docx_table.docx", data)
+    docs["docx"] = {
+        "file": f"{CITATIONS_DIR}/{name}", "title": _title_of(name), "kind": "docx", "query": "חנות העפרוני",
+        "headers": CITATIONS_DOCX_HEADERS, "rows": CITATIONS_DOCX_ROWS, "section": "2. טבלת היחידות",
+        "expect": {"precision": "structured", "pick": {"kind": "table_row", "contains": "העפרוני"}},
+        # the real-model scenario: a value computed from two cells of one row (35 x 24,300 = 850,500)
+        "computation": {"row": "חנות העפרוני", "inputs": ["35", "24,300"], "result": "850,500"}}
+
+    first = CitationsPdfRenderer(font_dir)
+    data = first.render_replaced(second=False)
+    save(name := "C8_synthetic_citations_replaced.pdf", data)
+    second = CitationsPdfRenderer(font_dir)
+    data2 = second.render_replaced(second=True)
+    save(name2 := "C8v2_synthetic_citations_replaced_v2.pdf", data2)
+    docs["replaced"] = _pdf_entry(
+        name, "pdf_digital", first.boxes, pages_of(data), first._page_box(), query="ציוד חקלאי ברחוב הדוכיפת",
+        expect={"precision": "block", "target": "target", "also": ["heading"],
+                "pick": {"kind": "text", "contains": "ציוד חקלאי"}},
+        replacement=_pdf_entry(name2, "pdf_digital", second.boxes, pages_of(data2), second._page_box()))
+
+    manifest = {
+        "about": f"{SYNTHETIC_MARKER}. Expected citation places for the browser test frontend/e2e/citations.spec.ts; "
+                 "generated by scripts/generate_fixtures.py --only citations from the generator's own layout (never "
+                 "read back from the files) - do not edit by hand. Boxes: [x0, y0, x1, y1] as fractions of the shown "
+                 "page's display width and height, origin top-left (box_points: the same in points).",
+        "tolerance": CITATIONS_TOLERANCE,
+        "documents": docs,
+    }
+    text_ = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+    (cdir / CITATIONS_MANIFEST).write_text(text_, encoding="utf-8")
+    print(f"wrote {CITATIONS_DIR}/{CITATIONS_MANIFEST} ({len(text_):,} chars)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--font-dir", default=DEFAULT_FONT_DIR)
     parser.add_argument("--out", default="tests/fixtures")
-    parser.add_argument("--only", choices=["all", "regions", "positions"], default="all",
+    parser.add_argument("--only", choices=["all", "regions", "positions", "citations"], default="all",
                         help="regions: write only the uncovered-region fixtures (tests/fixtures/regions/); "
-                             "positions: only the page-position fixtures (tests/fixtures/positions/)")
+                             "positions: only the page-position fixtures (tests/fixtures/positions/); "
+                             "citations: only the citation fixtures and their manifest (tests/fixtures/citations/)")
     args = parser.parse_args()
     font_dir = Path(args.font_dir)
     out = Path(args.out)
@@ -4408,6 +4861,9 @@ def main() -> None:
         return
     if args.only == "positions":
         write_positions(out, font_dir)
+        return
+    if args.only == "citations":
+        write_citations(out, font_dir)
         return
 
     docs: dict[str, dict[str, Any]] = {}
@@ -4454,6 +4910,7 @@ def main() -> None:
     write_blocks(out, font_dir)
     write_regions(out, font_dir)
     write_positions(out, font_dir)
+    write_citations(out, font_dir)
 
 
 if __name__ == "__main__":
