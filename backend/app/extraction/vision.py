@@ -132,13 +132,16 @@ class ModelVisionReader:
             logger.warning("vision usage log failed")
 
 
-def transcribe(reader: VisionReader, png: bytes, deadline: float | None = None) -> PictureReading:
+def transcribe(reader: VisionReader, png: bytes, deadline: float | None = None,
+               ocr_words: list[str] | None = None) -> PictureReading:
     """One reading of a rendered region or page, without context: ``read`` (with a transcription),
-    ``read_uncertain`` or ``no_text``. A failed call raises ``VisionCallFailed``."""
+    ``read_uncertain`` or ``no_text``. Its numbers are checked against ``ocr_words`` (the confident OCR words of the
+    same image) as at ingestion; without them nothing independent confirms the model's reading, so it is
+    ``read_uncertain``. A failed call raises ``VisionCallFailed``."""
     out = reader.read(png, "", deadline=deadline)
     if out is None:
         raise VisionCallFailed(CallStatus.UNSUPPORTED.value)
-    return _from_vision(out, [])
+    return _from_vision(out, ocr_words or [])
 
 
 def reading_text(reading: PictureReading) -> str:

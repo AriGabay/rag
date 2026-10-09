@@ -866,7 +866,9 @@ def computation_text(c, ws: Workspace | None = None) -> str:
     else:
         lines.append("התוצאה חושבה עכשיו על ידי המערכת ואינה כתובה במסמך")
     if c.conditional:
-        lines.append("מותנה: " + "; ".join(c.outcome.conditional) + f" — לפי ההצדקה: {c.justification}")
+        # conditional on an uncertain input needs no justification; a justified mix of bases carries its own
+        lines.append("מותנה: " + "; ".join(c.outcome.conditional)
+                     + (f" — לפי ההצדקה: {c.justification}" if c.justification else ""))
     if c.note:
         lines.append(c.note)
     return "\n".join(lines)

@@ -71,7 +71,7 @@ from app.chat.evidence import TABLE_SIZE_PREFIX
 from app.config import get_settings
 from app.db import TenantContext, tenant_tx
 from app.measurements.extract import EXTRACTION_VERSION, PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
-from app.platform.documents import reading_notes
+from app.platform.documents import coverage_of, reading_notes
 from app.platform.search import SearchScope, search_passages
 
 logger = logging.getLogger(__name__)
@@ -99,6 +99,16 @@ KIND_LABELS = {
     "area": "שטח", "rights_area": "שטח זכויות", "rate": "שיעור", "coefficient": "מקדם", "count": "כמות",
     "duration": "משך", "other": "אחר",
 }
+
+# A value's or measurement's status (R25), as the frontend shows it (``VALUE_STATUS`` in ``frontend/lib/format.ts``):
+# its own text and icon each, never colour alone. Using a value never waits for a person; "checked by a person" is
+# said only when a person's review is recorded.
+STATUS_AUTO = "✓ נבדק אוטומטית"
+STATUS_HUMAN = "✎ אומת או תוקן על ידי אדם"
+STATUS_UNCERTAIN = "? לא ודאי"
+STATUS_UNREAD = "∅ לא נקרא"
+PERSON_DECISIONS = ("verified", "corrected")  # the statuses only a person's review sets (``measurements.review``)
+REREADS_PER_VALUE = 2  # focused re-reads of an unclear value's region per turn (R28)
 
 
 # how deep the turn reached into a document, in order: listed in a set or outlined; a passage retrieved (a search
@@ -208,6 +218,22 @@ def anchor_lost(row) -> bool:
     return getattr(row, "anchor_lost", None) is not None
 
 
+def measurement_uncertain(row) -> bool:
+    """A measurement that cannot be presented as certain: its place was lost on reprocessing, or extraction flagged
+    it for a look (``needs_review``). Uncertain, not blocked: it is still usable, shown as such."""
+    return anchor_lost(row) or row.status == "needs_review"
+
+
+def measurement_status(row) -> str:
+    """A stored measurement's status label (M#): uncertain first; a person's decision only when a review set it and
+    recorded who made it (``reviewed_by``); otherwise checked automatically, which needs no approval to be used."""
+    if measurement_uncertain(row):
+        return STATUS_UNCERTAIN
+    if row.status in PERSON_DECISIONS and getattr(row, "reviewed_by", True) is not None:
+        return STATUS_HUMAN
+    return STATUS_AUTO
+
+
 @dataclass
 class Workspace:
     """Everything one turn gathered: sources, measurements, computations, and earlier-turn references."""
@@ -260,6 +286,13 @@ class Workspace:
     usage: list[dict] | None = None
     # S#, V#, M# -> where it points, as the tool read it (``app.chat.anchors``): snapshotted when the answer is stored
     anchors: dict[str, dict] = field(default_factory=dict)
+    # a value's locator (version, reading, where in it) -> the focused re-reads of its unclear region the turn made
+    # (at most ``REREADS_PER_VALUE``); V# -> why it stays uncertain after them (R28)
+    rereads: dict[tuple, int] = field(default_factory=dict)
+    uncertain_values: dict[str, str] = field(default_factory=dict)
+    # V# whose own region was read clearly (at ingestion, or by a re-read): an uncertain region elsewhere in its
+    # source does not make it uncertain
+    settled_values: set = field(default_factory=set)
 
     def spend(self, output: str) -> str:
         """Count a tool output sent to the model against the turn's budget; the output that reaches it is sent
@@ -394,12 +427,51 @@ def _block_info(conn: Connection, version_id: UUID, start: int | None, end: int 
     return ((min(nums), max(nums)) if nums else (None, None)), media
 
 
-def _partial_versions(conn: Connection, version_ids: list[UUID]) -> set[UUID]:
+@dataclass(frozen=True)
+class ReadingGaps:
+    """Where a version's reading has unread regions (R28): the pages with an unread region or whose reading failed,
+    and, for a document without pages (DOCX), the sections of its unread regions (``unplaced``: one whose section is
+    unknown too). ``partial``: the version is partly read anywhere (unread or uncertain), which bounds what a search
+    of it can say is absent."""
+
+    partial: bool
+    pages: frozenset = frozenset()
+    sections: frozenset = frozenset()
+    unplaced: bool = False
+
+    @classmethod
+    def of(cls, ingestion: dict | None, failed_pages, partial: bool) -> ReadingGaps:
+        pages, sections, unplaced = set(failed_pages or ()), set(), False
+        for e in coverage_of(ingestion or {}):
+            if not e.get("ok", True) and e.get("page") is not None:
+                pages.add(e["page"])
+            for r in e.get("regions") or []:
+                if r.get("status") != reader.UNREAD:
+                    continue
+                if e.get("page") is not None:
+                    pages.add(e["page"])
+                elif r.get("section"):
+                    sections.add(r["section"])
+                else:
+                    unplaced = True
+        return cls(partial, frozenset(pages), frozenset(sections), unplaced)
+
+    def cites(self, page_list, section: str | None) -> bool:
+        """Whether a passage on ``page_list`` (or, without pages, in ``section``) is in or next to an unread region:
+        only then is it marked as read in part. An unread region elsewhere in the document does not."""
+        if page_list:
+            return bool(self.pages.intersection(page_list))
+        return self.unplaced or (section is not None and section in self.sections)
+
+
+def _reading_gaps(conn: Connection, version_ids: list[UUID]) -> dict[UUID, ReadingGaps]:
     if not version_ids:
-        return set()
-    return {r.id for r in conn.execute(text(
-        "SELECT id FROM document_versions WHERE id = ANY(:v) AND (pages_incomplete > 0 OR"
-        " COALESCE((ingestion->>'partial')::boolean, false))"), {"v": version_ids})}
+        return {}
+    return {r.id: ReadingGaps.of(r.ingestion, r.failed, bool(r.partial)) for r in conn.execute(text(
+        "SELECT v.id, v.ingestion, (COALESCE(v.pages_incomplete, 0) > 0 OR"
+        " COALESCE((v.ingestion->>'partial')::boolean, false)) AS partial,"
+        " ARRAY(SELECT p.page_no FROM pages p WHERE p.version_id = v.id AND NOT p.ok) AS failed"
+        " FROM document_versions v WHERE v.id = ANY(:v)"), {"v": version_ids})}
 
 
 def _visible_documents(conn: Connection, ids: list[str]) -> list[UUID]:
@@ -507,7 +579,8 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
         ids = [h["chunk_id"] for h in hits]
         extra = {r.id: r for r in conn.execute(text(
             "SELECT id, block_start, block_end FROM chunks WHERE id = ANY(:i)"), {"i": ids})} if ids else {}
-        partial = _partial_versions(conn, list({h["version_id"] for h in hits}))
+        gaps = _reading_gaps(conn, list({h["version_id"] for h in hits}))
+        whole = ReadingGaps(False)
         ws.note_readings(conn, {h["version_id"] for h in hits})
         sizes = _table_sizes(conn, {(h["version_id"], h.get("table_index")) for h in hits
                                     if h["kind"] in ("table", "table_row") and h.get("table_index") is not None})
@@ -536,9 +609,11 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 kind=h["kind"], text=_with_size(sizes.get((h["version_id"], h.get("table_index"))),
                                                 _clip(h["text"], get_settings().chat_passage_chars)), block_start=bs, block_end=be,
                 table_index=h.get("table_index"), chunk_id=h["chunk_id"], page_list=h["page_list"] or None,
-                partial_document=h["version_id"] in partial, tags=tags,
+                # read in part only when the page or section it cites has an unread region (R28)
+                partial_document=gaps.get(h["version_id"], whole).cites(h["page_list"], h["section"]), tags=tags,
                 row_index=h.get("row_index") if h["kind"] == "table_row" else None), ("chunk", h["chunk_id"])))
-            ws.touch(h["document_id"], h["title"], "retrieved", h["version_id"] in partial)
+            # the document as a whole: a datum not found may be in a part of it that was not read
+            ws.touch(h["document_id"], h["title"], "retrieved", gaps.get(h["version_id"], whole).partial)
     if not out:
         return f'לא נמצאו קטעים עבור "{query}". אפשר לנסות ניסוח אחר, מונחים נרדפים או חיפוש בתוך מסמך מסוים.'
     hints = [MSG_ROWS_NOT_SHOWN.format(handle=t, n=n) for t, n in capped]
@@ -1352,28 +1427,34 @@ def _visual(ws: Workspace, spot: _Spot, reading, earlier: bool) -> Source:
                       body=head, kind="image", status="uncertain_reading", method="vision", location=where)
 
 
-def tool_inspect(ws: Workspace, target: dict) -> str:
-    """A visual reading of a region (``R#``) or a page. Permission is resolved again on every call, a stored
-    reading included; a reading ingestion made is returned as it is; otherwise the stored visual reading of the
-    same version, reading, region, reader and model, or one new model call (capped per turn)."""
+def _crop_ocr_words(png: bytes) -> list[str]:
+    """The confident OCR words of a rendered crop, which a visual reading's numbers are checked against (as at
+    ingestion); none when OCR is not available or fails."""
+    import io
+
+    from PIL import Image
+
+    from app.extraction.images import _confident, _ocr_words
+
+    try:
+        words = _ocr_words(Image.open(io.BytesIO(png)).convert("L"), get_settings().ocr_languages)
+    except Exception:  # noqa: BLE001 - no OCR check leaves the reading uncertain, never fails the tool
+        return []
+    return _confident(words or [])
+
+
+def _vision_read(ws: Workspace, spot: _Spot):
+    """The visual reading of a spot through the inspect path: the stored reading of the same version, reading,
+    region, reader and model, or one new model call (capped per turn and cut to the turn's reading deadline, never
+    a costlier model). Returns ``(reading, earlier)``, or the message saying why no reading was made (the cap or
+    the time); a refusal (no cloud reading, a page that cannot be rendered, a failed call) is a ``ToolError``."""
     from app.extraction import regions
     from app.extraction.images import VISION_MAX_SIDE, VisionCallFailed
     from app.extraction.render import RenderError, render_png
     from app.extraction.vision import INSPECT_READER_VERSION, transcribe
     from app.platform.storage import get_storage
 
-    if not isinstance(target, dict):
-        raise ToolError(MSG_INSPECT_TARGET)
     with tenant_tx(ws.ctx) as conn:
-        spot, read_at_ingestion = _spot(ws, conn, target)
-        if read_at_ingestion:
-            if spot.block is not None:
-                s = _stored_region(ws, conn, spot)
-            else:  # the page through the same reader as ``read``
-                s = _read_window(ws, conn, spot.v, ("pages", str(spot.v.version_id), spot.page, spot.page), None)
-                s.body = (f"{spot.what} נקרא בעיבוד המסמך: זו הקריאה השמורה שלו, בלי קריאה חזותית\n" + s.body)
-            _audit_view(ws, conn, spot.v, spot.region)
-            return _render_source(s)
         vision = inspect_reader(ws.ctx)
         if vision is None:
             raise ToolError(MSG_INSPECT_NO_CLOUD.format(what=spot.what))
@@ -1381,7 +1462,7 @@ def tool_inspect(ws: Workspace, target: dict) -> str:
         cached = _cached(conn, spot, config)
         if cached is not None:
             _audit_view(ws, conn, spot.v, spot.region)
-            return _render_source(_visual(ws, spot, cached, earlier=True))
+            return cached, True
         cap = get_settings().chat_max_inspections
         if ws.inspections >= cap:
             if INSPECT_LIMIT not in ws.limits_hit:
@@ -1402,7 +1483,7 @@ def tool_inspect(ws: Workspace, target: dict) -> str:
     if hasattr(vision, "usage"):
         vision.usage = ws.usage
     try:
-        reading = transcribe(vision, png, deadline=ws.read_until)
+        reading = transcribe(vision, png, deadline=ws.read_until, ocr_words=_crop_ocr_words(png))
     except VisionCallFailed as exc:
         raise ToolError(MSG_INSPECT_FAILED.format(what=spot.what, status=exc.status)) from None
     with tenant_tx(ws.ctx) as conn:
@@ -1420,7 +1501,88 @@ def tool_inspect(ws: Workspace, target: dict) -> str:
              "s": reading.status, "x": reading.to_json(),
              "u": ws.ctx.user_id})
         _audit_view(ws, conn, v, spot.region)
-    return _render_source(_visual(ws, spot, reading, earlier=False))
+    return reading, False
+
+
+def tool_inspect(ws: Workspace, target: dict) -> str:
+    """A visual reading of a region (``R#``) or a page. Permission is resolved again on every call, a stored
+    reading included; a reading ingestion made is returned as it is; otherwise the stored visual reading of the
+    same version, reading, region, reader and model, or one new model call (capped per turn)."""
+    if not isinstance(target, dict):
+        raise ToolError(MSG_INSPECT_TARGET)
+    with tenant_tx(ws.ctx) as conn:
+        spot, read_at_ingestion = _spot(ws, conn, target)
+        if read_at_ingestion:
+            if spot.block is not None:
+                s = _stored_region(ws, conn, spot)
+            else:  # the page through the same reader as ``read``
+                s = _read_window(ws, conn, spot.v, ("pages", str(spot.v.version_id), spot.page, spot.page), None)
+                s.body = (f"{spot.what} נקרא בעיבוד המסמך: זו הקריאה השמורה שלו, בלי קריאה חזותית\n" + s.body)
+            _audit_view(ws, conn, spot.v, spot.region)
+            return _render_source(s)
+    got = _vision_read(ws, spot)
+    if isinstance(got, str):
+        return got
+    reading, earlier = got
+    return _render_source(_visual(ws, spot, reading, earlier=earlier))
+
+
+# --- a focused re-read of an unclear value (R28) ------------------------------------------------------------------
+
+MSG_REREAD_CLEAR = "האזור של הערך נקרא בעיבוד המסמך בקריאה לא ודאית; קריאה חזותית ממוקדת שלו קראה את הערך בבירור."
+MSG_REREAD_UNCLEAR = ("האזור של הערך נקרא בקריאה לא ודאית, וגם הקריאה החזותית הממוקדת שלו לא קראה אותו בבירור: "
+                      "הערך לא ודאי.")
+MSG_REREAD_SPENT = ("האזור של הערך נקרא בקריאה לא ודאית, והוא כבר נקרא שוב {n} פעמים בתור הזה: הערך לא ודאי.")
+MSG_REREAD_NONE = "האזור של הערך נקרא בקריאה לא ודאית ואין דרך לקרוא אותו שוב ({why}): הערך לא ודאי."
+
+
+def _value_blocks(anchor: dict) -> list[int] | None:
+    """The blocks a quoted value is in, from its anchor: the cited number's block, else the blocks holding the
+    quote; None when the anchor does not say (a table cell, or a quote not located)."""
+    if anchor.get("number"):
+        return [anchor["number"][0]]
+    return list(anchor["blocks"]) if anchor.get("blocks") else None
+
+
+def _block_spot(v: reader.Version, block) -> _Spot | None:
+    """What a re-read of a block reads: its region when it has a box, else its page; None for a block that cannot
+    be rendered (not a PDF, or no page)."""
+    if not v.is_pdf or not block.page:
+        return None
+    bbox = [float(x) for x in block.bbox] if block.bbox and len(block.bbox) == 4 else None
+    if bbox is None:
+        return _Spot(v, f"page:{block.page}", block.page, None, f"עמוד {block.page}")
+    return _Spot(v, f"block:{block.block_index}", block.page, bbox, f"האזור של הערך בעמוד {block.page}", block)
+
+
+def _reread_value(ws: Workspace, v: reader.Version, block, forms: frozenset, key: tuple) -> tuple[bool, str]:
+    """One focused visual re-read of the unclear region a value was taken from, through the inspect path, at most
+    ``REREADS_PER_VALUE`` times per value (``key``: its locator) per turn. The value is settled only when the re-read
+    is clear and writes the value's number; otherwise it stays uncertain. Returns (settled, the note why)."""
+    from app.extraction.ocr import ocr_available
+
+    n = ws.rereads.get(key, 0)
+    if n >= REREADS_PER_VALUE:
+        return False, MSG_REREAD_SPENT.format(n=n)
+    if not ocr_available(get_settings().ocr_languages):
+        # nothing independent would confirm a new visual reading: the model's own reading is no verification
+        return False, MSG_REREAD_NONE.format(why="אין OCR לאימות קריאה חוזרת")
+    spot = _block_spot(v, block)
+    if spot is None:
+        return False, MSG_REREAD_NONE.format(why="אין לו עמוד להצגה")
+    ws.rereads[key] = n + 1
+    try:
+        got = _vision_read(ws, spot)
+    except ToolError as e:
+        return False, MSG_REREAD_NONE.format(why=str(e))
+    if isinstance(got, str):
+        return False, MSG_REREAD_NONE.format(why=got)
+    from app.extraction.vision import reading_text
+
+    reading, _ = got
+    if reading.status == "read" and forms & numbers_in(reading_text(reading)):
+        return True, MSG_REREAD_CLEAR
+    return False, MSG_REREAD_UNCLEAR
 
 
 # --- measurements and computation ----------------------------------------------------------------------------
@@ -1505,8 +1667,7 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
         out.append(f"\nקבוצה [{_describe_key(key)}] — {len(ms)} ערכים:")
         for m in ms:
             r = m.row
-            status = {"verified": "מאומת", "corrected": "תוקן ידנית", "auto_validated": "ראשוני",
-                      "needs_review": "ממתין לבדיקה"}.get(r.status, r.status)
+            status = measurement_status(r)
             extra = f" | נושא: {_txt(r.subject)}" if r.subject else ""
             issues = f" | הערות: {_txt('; '.join(r.issues))}" if r.issues else ""
             if anchor_lost(r):
@@ -1524,6 +1685,32 @@ MSG_VALUE_UNAVAILABLE = ("{ids}: המסמך שממנו נלקח הערך אינ�
                          "בחישוב")
 MSG_VALUE_STALE = ("{ids}: המסמך שממנו נלקח הערך עובד מחדש מאז שנלקח; הערך אינו תקף עוד. יש לקרוא את המקור מחדש "
                    "ולקחת את הערך שוב")
+MSG_UNCERTAIN_INPUTS = "הערכים {ids} אינם ודאיים"
+
+
+def value_uncertain(ws: Workspace, vid: str) -> bool:
+    """A value (V#) that cannot be presented as certain: part of its meaning was asserted rather than found in its
+    source, its source was read uncertainly (a visual transcription included), or its region stayed unclear after
+    the focused re-reads (``Workspace.uncertain_values``)."""
+    v = ws.values[vid]
+    source = ws.sources.get(v.source_id)
+    return (v.certainty != "verified" or vid in ws.uncertain_values
+            or (source is not None and source.status == "uncertain_reading" and vid not in ws.settled_values))
+
+
+def value_status(ws: Workspace, i: str) -> str:
+    """The status label of a value (V#) or a measurement (M#) of the turn. A value taken in chat is never a person's
+    decision: it is checked automatically, or uncertain."""
+    if i in ws.measurements:
+        return measurement_status(ws.measurements[i].row)
+    return STATUS_UNCERTAIN if value_uncertain(ws, i) else STATUS_AUTO
+
+
+def uncertain_inputs(ws: Workspace, ids) -> list[str]:
+    """The values and measurements among ``ids`` that are uncertain: a calculation resting on any of them is
+    conditional, never certain (R28)."""
+    return [i for i in ids if (i in ws.values and value_uncertain(ws, i))
+            or (i in ws.measurements and measurement_uncertain(ws.measurements[i].row))]
 
 
 def _parse_number(raw: str) -> tuple[str, Decimal] | None:
@@ -1827,16 +2014,29 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
             raise ToolError(MSG_UNAVAILABLE)
         if src.reading_id is not None and v.reading_id != src.reading_id:
             raise ToolError(MSG_STALE_REF.format(source_id=sid))
+        rows: list = []
         if cell:
             taken = _take_cell(ws, conn, src, full, loc)
+            block = reader.table_block(conn, src.version_id, taken["locator"]["table_index"])
+            rows, at = ([block] if block is not None else []), None
         else:
             blocks = None
             if src.block_start is not None:
-                blocks = [(r.block_index, r.text or "", r.page) for r in reader.blocks_between(
-                    conn, src.version_id, src.block_start,
-                    src.block_end if src.block_end is not None else src.block_start)]
+                rows = reader.blocks_between(conn, src.version_id, src.block_start,
+                                             src.block_end if src.block_end is not None else src.block_start)
+                blocks = [(r.block_index, r.text or "", r.page) for r in rows]
             taken = _take_quote(src, full, loc, blocks)
+            at = _value_blocks(taken.get("anchor") or {})
     fields, prov = _settle_meaning(taken, given)
+    # the value's own region: read clearly, or read uncertainly at ingestion (then re-read, below, at most
+    # REREADS_PER_VALUE times; the same region again is served from the stored readings)
+    region = [r for r in rows if at is None or r.block_index in at]
+    unclear = next((r for r in region if r.status == reader.UNCERTAIN), None)
+    reread = None
+    if unclear is not None:
+        key = (str(src.version_id), src.reading_id or v.reading_id,
+               json.dumps(taken["locator"], sort_keys=True, ensure_ascii=False))
+        reread = _reread_value(ws, v, unclear, taken["forms"], key)
     approx = "approx" in taken["qualifiers"].keys("approx")
     total = taken["total"] or given["role"] == "total"
     where = taken["locator"]
@@ -1848,6 +2048,10 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
                        fields["vat"], fields.get("area_basis") or "", (fields.get("subject") or "").strip(),
                        fields["role"], prov, where, taken["quote"], total, taken["table"], approx)
     ws.values[value.vid] = value
+    if reread is not None and not reread[0]:
+        ws.uncertain_values[value.vid] = reread[1]
+    elif region:
+        ws.settled_values.add(value.vid)  # its own region read clearly: another region of the source does not matter
     stub = anchors.source_stub(src)
     if stub is not None:  # where the value is, as taken (KTD1): the source's range, narrowed to its span or cell
         extra = dict(taken.get("anchor") or {})
@@ -1871,6 +2075,9 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
         lines.append("המקור כותב את הערך כמקורב.")
     lines.append("ודאות: " + ("כל התכונות שצוינו נמצאו במקור" if not asserted else
                               "נמוכה יותר — תכונות שהמודל קבע ולא נמצאו במקור: " + ", ".join(asserted)))
+    if reread is not None:
+        lines.append(reread[1])
+    lines.append(f"סטטוס: {value_status(ws, value.vid)}")
     return "\n".join(lines)
 
 
@@ -2046,17 +2253,23 @@ def tool_calculate(ws: Workspace, expression: str, label: str = "", justificatio
     if unread:
         notes.append("חישוב חלקי: לא נקראו כל העמודים של הנתונים המתאימים (נקראו "
                      f"{len(unread[0]['pages_read'])} מתוך {unread[0]['pages']}).")
-    pending = [i for i in leaves if i in ws.measurements
-               and ws.measurements[i].row.status in ("auto_validated", "needs_review")]
-    if pending:
-        notes.append(f"{len(pending)} מהערכים טרם אומתו על ידי אדם (נתון ראשוני).")
-    conditional = ("מותנה: " + "; ".join(out.conditional) + f" — לפי ההצדקה: {justification}"
+    # each input's status; using a value never waits for a review (R25), but an uncertain one makes the result
+    # conditional, never certain (R28)
+    statuses = [f"{i} {value_status(ws, i)}" for i in leaves if i in ws.values or i in ws.measurements]
+    if statuses:
+        notes.append("מצב הערכים: " + "; ".join(statuses) + ".")
+    justified = bool(out.conditional)  # conditional on the justification the mix needed
+    uncertain = uncertain_inputs(ws, leaves)
+    if uncertain:
+        out.conditional.append(MSG_UNCERTAIN_INPUTS.format(ids=", ".join(uncertain)))
+    conditional = ("מותנה: " + "; ".join(out.conditional)
+                   + (f" — לפי ההצדקה: {justification}" if justified else "")
                    if out.conditional else "")
     reproduces = None if out.assumptions else _reproduces(ws, out, leaves)
     kind = "scenario" if out.assumptions else "reproduces_report_value" if reproduces else "computed"
     c = calc.Computation(f"C{len(ws.computations) + 1}", (label or "").strip() or calc.render(node, name, True),
                          calc.render(node, lambda i: i), calc.render(node, lambda i: f"«{name(i)}»", True), out,
-                         inputs, sources, len(docs), kind, justification if out.conditional else None, " ".join(notes),
+                         inputs, sources, len(docs), kind, justification if justified else None, " ".join(notes),
                          reproduces, [lf.id for lf in out.leaves])
     ws.computations[c.cid] = c
     return json.dumps({"id": c.cid, "label": c.label, "expression": c.expression, "formula": c.formula,
