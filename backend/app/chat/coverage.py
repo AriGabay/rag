@@ -39,7 +39,9 @@ table, first match wins (``reason_of``):
    calculation of it, or a clarification component — a detail missing from the request;
 6. a calculation whose inputs were found and never computed — calculation not completed;
 7. a value found with an uncertain reading or meaning — found, not verifiable;
-8. values for the same property, kind, unit, period, basis, scenario and status that differ — sources conflict;
+8. values for the same property, kind, unit, period, basis, scenario and status that differ — sources conflict (in
+   a file holding several appraisals, with ``chat_appraisal_context_enforced``, the property is the value's appraisal
+   context: two appraisals' values never conflict — round 7 U6, KTD7);
 9. the judge's "undeterminable" (an evidence state, not a status) — found, not verifiable (or sources conflict, 8);
 10. data found that the verified answer does not present — found, not verifiable;
 11. a reading of the section, table or pages it concerns that was clipped or has an unread region, or a model claim
@@ -189,22 +191,30 @@ def conflicting(ws: Workspace, document_ids: list[str] | None = None, ids: Colle
     """Whether values the turn registered (V#) or measurements it listed (M#) give one datum different amounts: the
     same kind (by family), unit, period, area basis, named subject (the property), scenario and stance (status), and
     different numbers (R8: a conflict only after that check — two properties, two scenarios or a party's claim and the
-    decision are not one datum). Only documents in ``document_ids``, and only the ids in ``ids``, when given."""
+    decision are not one datum). Only documents in ``document_ids``, and only the ids in ``ids``, when given.
+
+    In a file holding several appraisals, when the context checks are enforced (round 7 U6, KTD7), the property is the
+    value's appraisal context, never the subject's words: two appraisals' values are two properties' however the model
+    named their subject."""
     from app.answering.verify import numbers_in
+    from app.chat.contexts import enforced
     from app.chat.resolve import family
 
+    by_context = enforced()
     seen: dict[tuple, set] = {}
     entries = [(i, str(v.document_id), v.kind, v.unit, v.period, v.area_basis, v.subject, v.scenario, v.stance,
-                str(v.value)) for i, v in ws.values.items()]
+                str(v.value), (getattr(v, "context", None) or {}).get("key")) for i, v in ws.values.items()]
     entries += [(i, str(m.document_id), m.row.metric_kind, m.row.unit, m.row.period, m.row.area_basis, m.row.subject,
                  getattr(m.row, "scenario", "") or "", getattr(m.row, "stance", "") or "",
-                 frozenset(numbers_in(m.row.value_text or ""))) for i, m in ws.measurements.items()]
-    for i, doc, kind, unit, period, basis, subject, scenario, stance, amount in entries:
+                 frozenset(numbers_in(m.row.value_text or "")), (getattr(m, "context", None) or {}).get("key"))
+                for i, m in ws.measurements.items()]
+    for i, doc, kind, unit, period, basis, subject, scenario, stance, amount, context in entries:
         if (document_ids and doc not in document_ids) or (ids is not None and i not in ids):
             continue
         if not (subject or "").strip() or kind in (None, "unknown", "other"):
             continue  # a datum of no named subject cannot be said to conflict with another
-        key = (family(kind), unit, period, _norm_label(basis or ""), _norm_label(subject), _norm_label(scenario),
+        prop = ("context", context) if by_context and context else _norm_label(subject)
+        key = (family(kind), unit, period, _norm_label(basis or ""), prop, _norm_label(scenario),
                stance or "unknown")
         seen.setdefault(key, set()).add(amount)
     return any(len(amounts) > 1 for amounts in seen.values())

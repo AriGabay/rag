@@ -27,6 +27,11 @@ Two kinds of problem:
 
 Only the turn's own evidence is read: cited passages and measurements. No answer field is fixed in advance; the
 model still writes the answer.
+
+In a file holding several appraisals (round 7 U6, KTD7, R20), the subject property's stored measurements a check
+reads (``Fetcher.subject_measurements``) are, when the context checks are enforced, only those of the appraisal
+context the unit's cited evidence is in: another appraisal's, or an appendix's comparison property's, figure never
+attests a number of this one.
 """
 
 from __future__ import annotations
@@ -462,7 +467,37 @@ class Fetcher:
             (src.table_index is not None and o.table_index == src.table_index)
             or (src.section and o.section == src.section))]
 
-    def subject_measurements(self, document_ids: set) -> list:
+    def subject_measurements(self, document_ids: set, unit: Unit | None = None) -> list:
+        """The subject property's stored measurements in the documents; with ``unit`` and the context checks
+        enforced, only those of the appraisal contexts the unit's cited evidence is in (KTD7)."""
+        rows = self._subject_rows(document_ids)
+        return rows if unit is None else self._in_context(rows, unit)
+
+    def _in_context(self, rows: list, unit: Unit) -> list:
+        from app.chat import contexts
+
+        if not rows or not contexts.enforced():
+            return rows
+        cited: dict[str, set[int]] = {}
+        for i in unit.ids:
+            src = self.ws.sources.get(i)
+            if src is not None and src.contexts:
+                cited.setdefault(str(src.version_id), set()).update(src.contexts)
+            v = self.ws.values.get(i)
+            if v is not None and v.context:
+                cited.setdefault(str(v.version_id), set()).add(v.context["number"])
+            m = self.ws.measurements.get(i)
+            if m is not None and m.context:
+                cited.setdefault(str(m.version_id), set()).add(m.context["number"])
+        out = []
+        for r in rows:
+            cx = self.ws.contexts.get(str(r.version_id))
+            own = cited.get(str(r.version_id))
+            if cx is None or not cx.multi or not own or cx.at_block(r.block_index) in own:
+                out.append(r)
+        return out
+
+    def _subject_rows(self, document_ids: set) -> list:
         from sqlalchemy import text as sql
 
         from app.db import tenant_tx
@@ -508,7 +543,7 @@ class Fetcher:
                     return self.adopt(expansion)
         docs = {self.ws.sources[i].document_id for i in cited if self.ws.sources[i].document_id}
         docs |= {self.ws.measurements[i].document_id for i in unit.ids if i in self.ws.measurements}
-        for row in self.subject_measurements(docs) if docs else []:
+        for row in self.subject_measurements(docs, unit) if docs else []:
             if not forms & numbers_in(row.value_text or ""):
                 continue
             if key in measurement_qualifiers(row).keys(kind) and words & _content_words(f"{row.metric} {row.quote}"):
@@ -520,7 +555,7 @@ class Fetcher:
         when every such measurement gives ``kind`` one value; else None."""
         docs = {self.ws.sources[i].document_id for i in unit.ids
                 if i in self.ws.sources and self.ws.sources[i].document_id}
-        rows = [r for r in self.subject_measurements(docs) if forms & numbers_in(r.value_text or "")
+        rows = [r for r in self.subject_measurements(docs, unit) if forms & numbers_in(r.value_text or "")
                 and words & _content_words(r.metric or "")] if docs else []
         values = {tuple(sorted(measurement_qualifiers(r).keys(kind))) for r in rows}
         if len(values) != 1 or not next(iter(values)):

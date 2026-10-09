@@ -188,6 +188,8 @@ def cached(monkeypatch):
 
     monkeypatch.setattr(T, "tenant_tx", lambda ctx: contextlib.nullcontext())
     monkeypatch.setattr(T, "_bound", bound)
+    # the version's appraisal contexts are read from the database too: one context, as a single report has (U6)
+    monkeypatch.setattr(T.contexts, "of_version", lambda conn, vid, reading: T.contexts.derive([], str(vid)))
     monkeypatch.setattr(T, "_cached_value", lambda conn, version_id, reading_id, locator: state["doc"])
     ws = T.Workspace(ctx=None)
     handle = T._cached_handle(ws, VER, "r1", DOC, doc["record"]["locator"])

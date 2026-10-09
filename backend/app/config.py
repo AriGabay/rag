@@ -144,6 +144,13 @@ class Settings(BaseSettings):
     chat_read_chars: int = 3500  # a part of a section, a page range or the paragraphs around a source
     chat_table_rows: int = 40  # rows in a part of a table
     chat_passage_chars: int = 1600  # a search hit
+    # Appraisal contexts inside one file (round 7 KTD7, ``app.chat.contexts``): the tools always show them; their
+    # enforcement — subject measurements of the cited context only, no calculation across contexts without a
+    # comparison component, conflicts keyed on the context, a claim about the asked property resting on another
+    # context removed (``wrong_subject``) — was enabled once the contexts were counted per regression report
+    # (``scripts/count_appraisal_contexts.py``): every single-appraisal report derives exactly one, and the one
+    # multi-appraisal file splits at its second report's start only. Set false to show contexts without enforcing.
+    chat_appraisal_context_enforced: bool = True
     # The verification reserve: reading stops this long before the turn's deadline, and one step per repair round
     # before its step bound, so the answer, its verification and its repair rounds still fit
     chat_repair_rounds: int = 2  # 1: a repair with tools; 2: then a rewrite from verified content only

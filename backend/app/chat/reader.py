@@ -10,6 +10,14 @@ A version's reading is its ``document_blocks`` in reading order (each with page,
 its ``extracted_tables`` (headers, rows, caption, notes) and its ``pages``. Windows are cut by block index, page
 range, section path (a section includes its ``N.M`` sub-sections) or table; ``take`` cuts a window into parts
 of a bounded size with the exact position where the next part starts.
+
+A file holding several appraisals (round 7 U6, KTD7: ``app.chat.contexts``) has the same numbered chapters once per
+appraisal, and each block keeps its own section path — the extraction does not merge them; what merged them was
+reading a section by its path across the whole file. A section is therefore read within a block window (``window``):
+the outline lists each context's sections apart, with the window each covers, and a context that starts inside
+another's last chapter has its own title part (the blocks before its first heading). A table the extraction merged
+across two appraisals (continued on the next page under the same headers) is listed with the rows of each context,
+by each row's position.
 """
 
 from __future__ import annotations
@@ -103,9 +111,19 @@ def blocks_on_pages(conn: Connection, version_id: UUID, first: int, last: int, f
         f"{_from(from_block)} ORDER BY block_index"), {"v": version_id, "a": first, "b": last, "from": from_block}).all()
 
 
-def blocks_in_section(conn: Connection, version_id: UUID, path: tuple[str, ...], from_block: int | None = None) -> list:
+def blocks_in_section(conn: Connection, version_id: UUID, path: tuple[str, ...], from_block: int | None = None,
+                      window: tuple[int, int] | None = None) -> list:
     """The blocks of a section, its sub-sections included: every block whose section path starts with ``path``
-    (from block ``from_block`` when given). The empty path is the part before the first heading."""
+    (from block ``from_block`` when given). The empty path is the part before the first heading. ``window``: only
+    the blocks of that range (a section of one appraisal context); with the empty path, every block of it (the
+    context's title part, whatever path the extraction gave it)."""
+    if window is not None:
+        lo, hi = window
+        cond = "" if not path else f" AND section_path[1:{len(path)}] = CAST(:p AS text[])"
+        return conn.execute(text(
+            f"SELECT {BLOCK_COLS} FROM document_blocks WHERE version_id = :v AND block_index BETWEEN :lo AND :hi"
+            f"{cond}{_from(from_block)} ORDER BY block_index"),
+            {"v": version_id, "p": list(path), "lo": lo, "hi": hi, "from": from_block}).all()
     if not path:
         return conn.execute(text(
             f"SELECT {BLOCK_COLS} FROM document_blocks WHERE version_id = :v AND cardinality(section_path) = 0"
@@ -162,19 +180,79 @@ class Section:
     unread: int = 0
     uncertain: int = 0
     pages: set = field(default_factory=set)
+    context: int | None = None  # its appraisal context, in a file holding several (KTD7)
+    window: tuple[int, int] | None = None  # the blocks it is read within (``blocks_in_section``)
 
 
-def outline(conn: Connection, version_id: UUID) -> tuple[list[Section], list[dict]]:
+def effective_path(cx, block_index: int, stored) -> tuple[str, ...]:
+    """A block's section path within its appraisal context: a block of a later context's title part (before its
+    first heading) belongs to no chapter of the context before it."""
+    seg = cx.segment_at(block_index) if cx is not None and cx.multi else None
+    if seg is not None and seg is not cx.segments[0] and (seg.lead is None or block_index < seg.lead):
+        return ()
+    return tuple(stored or ())
+
+
+def section_window(cx, block_index: int, path: tuple[str, ...]) -> tuple[int, int] | None:
+    """The block window a section is read within, for the context the block is in (None: a file with one context).
+    The title part of a context is its blocks before its first heading; its chapters are read from that heading on."""
+    seg = cx.segment_at(block_index) if cx is not None and cx.multi else None
+    if seg is None:
+        return None
+    if not path:
+        return (seg.first, seg.lead - 1 if seg.lead is not None and seg.lead > seg.first else seg.last)
+    return (max(seg.first, seg.lead if seg.lead is not None else seg.first), seg.last)
+
+
+def row_top(row: dict) -> float | None:
+    try:
+        return float((row.get("cell_boxes") or [])[0][1])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def table_contexts(cx, st: dict, block_index: int | None, block_page: int | None) -> list[dict]:
+    """The rows of a table by appraisal context, in order: ``[{"context", "first", "last", "pages"}]`` with rows
+    counted from 1; a row is in the context of its own position (its page and top), a row with none in the table's
+    block's. Empty in a file with one context."""
+    if cx is None or not cx.multi:
+        return []
+    own = cx.at_block(block_index) if block_index is not None else None
+    out: list[dict] = []
+    for n, row in enumerate(st.get("rows") or [], 1):
+        page = row.get("page") or block_page
+        number = cx.at_position(page, row_top(row)) if row.get("page") else own
+        number = number or own or 1
+        if out and out[-1]["context"] == number:
+            out[-1]["last"] = n
+            if page:
+                out[-1]["pages"].add(page)
+        else:
+            out.append({"context": number, "first": n, "last": n, "pages": {page} if page else set()})
+    return out
+
+
+def outline(conn: Connection, version_id: UUID, cx=None) -> tuple[list[Section], list[dict]]:
     """Every section (each prefix of a block's section path, sub-sections included, in reading order) with its
-    size and its unread and uncertain regions, and every table with its caption, rows, page and section."""
+    size and its unread and uncertain regions, and every table with its caption, rows, page and section. ``cx``: the
+    version's appraisal contexts (``app.chat.contexts``); in a file holding several, each context's sections are
+    its own (the same path in two contexts is two sections), and each table lists its rows by context."""
+    multi = cx is not None and cx.multi
     sections: dict[tuple, Section] = {}
     table_at: dict[int, tuple] = {}
     for r in conn.execute(text(
             "SELECT block_index, section_path, page, status, table_index, length(text) AS chars FROM document_blocks"
             " WHERE version_id = :v ORDER BY block_index"), {"v": version_id}):
-        path = tuple(r.section_path or ())
+        path = effective_path(cx, r.block_index, r.section_path) if multi else tuple(r.section_path or ())
+        seg = cx.segments.index(cx.segment_at(r.block_index)) if multi and cx.segment_at(r.block_index) else None
         for p in [path[:i] for i in range(1, len(path) + 1)] or [()]:
-            s = sections.setdefault(p, Section(p, r.block_index, r.block_index))
+            key = (seg, p) if multi else p
+            s = sections.get(key)
+            if s is None:
+                s = sections[key] = Section(p, r.block_index, r.block_index)
+                if multi and seg is not None:
+                    s.context = cx.segments[seg].number
+                    s.window = section_window(cx, r.block_index, p)
             s.last = r.block_index
             s.chars += r.chars or 0
             s.blocks += 1
@@ -189,7 +267,8 @@ def outline(conn: Connection, version_id: UUID) -> tuple[list[Section], list[dic
         block, page, path = table_at.get(index, (st.get("block_index"), st.get("page"), ()))
         tables.append({"table_index": index, "caption": st.get("caption") or next(iter(st.get("title") or []), None),
                        "rows": len(st.get("rows") or []), "block": block, "page": page,
-                       "section": path[-1] if path else st.get("section"), "path": path})
+                       "section": path[-1] if path else st.get("section"), "path": path,
+                       "contexts": table_contexts(cx, st, block, page)})
     return list(sections.values()), tables
 
 

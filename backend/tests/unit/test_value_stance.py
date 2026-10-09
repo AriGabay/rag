@@ -104,6 +104,8 @@ def decision(monkeypatch):
 def _workspace(monkeypatch, blocks, *, status="complete", table=None) -> SimpleNamespace:
     monkeypatch.setattr(T, "tenant_tx", lambda ctx: contextlib.nullcontext(None))
     monkeypatch.setattr(T.reader, "version", lambda conn, vid: VERSION)
+    # the version's appraisal contexts are read from the database too: one context, as a single report has (U6)
+    monkeypatch.setattr(T.contexts, "of_version", lambda conn, vid, reading: T.contexts.derive([], str(vid)))
     monkeypatch.setattr(T.reader, "blocks_between",
                         lambda conn, vid, a, b, limit=None: [x for x in blocks if a <= x.block_index <= b])
     if table is not None:

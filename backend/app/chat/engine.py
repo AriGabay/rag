@@ -486,6 +486,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     # the request's requirements, frozen for the turn (the request's components, or the judge's derivation when there
     # are none), and its tool failures
     turn = TurnRequirements()
+    ws.requirements = turn  # the tools read what the request asks about and compares (round 7 U6, KTD7)
     # the turn's verdicts: a repair round judges only what changed (KTD10)
     verdicts = VerdictCache()
     reused = 0

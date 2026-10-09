@@ -380,10 +380,6 @@ F6_QUESTION = f"מה השווי למ״ר שנקבע לנכס ב{FIRST['street']}
 
 
 @pytest.mark.db
-@pytest.mark.xfail(strict=True, reason="round 7 F6: property identity stops at the file: a value's subject is the "
-                                       "model's free text with no provenance (tools._settle_meaning) and no check ties "
-                                       "a block to the appraisal it belongs to, so the second appraisal's figure is "
-                                       "accepted for the first property")
 def test_f6_a_figure_of_the_second_appraisal_in_one_file_is_not_accepted_for_the_first_property(client, office,
                                                                                                monkeypatch):
     doc = ingest_round7(office, monkeypatch, "two_appraisals")

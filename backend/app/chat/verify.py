@@ -42,7 +42,9 @@ fragment or broken table is left; a partly supported unit is kept and marked.
 Every removal is a structured decision, made where its check fires (round 7 U4: KTD5, KTD10; R12–R15): the
 ``Problem`` carries its failure kind (``FAILURE_KINDS``), the check (``unknown_id`` — invalid citation;
 ``unstated_number`` — absent from the source; ``computation_mismatch`` and ``framed_result`` — wrong calculation;
-``misattribution`` — wrong property or party; ``vat`` and ``meaning`` — wrong unit; ``judge``, whose ``unsupported``
+``misattribution`` — wrong property or party; ``context`` — a claim about the asked property that rests on another
+appraisal context of the same file (round 7 U6, KTD7, R21: ``_wrong_context``, only with
+``chat_appraisal_context_enforced``); ``vat`` and ``meaning`` — wrong unit; ``judge``, whose ``unsupported``
 verdict names a ``failure`` (defaulting from what the unit cites: a calculation, an uncertain reading, else absent
 from the source); ``dependency``), the component it gave (``N#``, from the judge's scores), the ids it was checked
 against and whether a repair round was asked to fix it. A check that did not finish — a judge call that failed
@@ -1176,7 +1178,8 @@ def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
     computation as one short statement of its meaning."""
     if sid in ws.sources:
         src = ws.sources[sid]
-        return f"{src.title} — {src.location}", src.text, src.kind
+        # in a file holding several appraisals, the context the passage is in (round 7 U6, KTD7)
+        return f"{src.title} — {src.location}" + (f" — {src.context}" if src.context else ""), src.text, src.kind
     if sid in ws.measurements:
         m = ws.measurements[sid].public()
         return (m["title"], f"נתון: {m['metric']} = {m['value_text']} (סוג: {m['metric_kind']}, יחידה: {m['unit']},"
@@ -1197,7 +1200,7 @@ def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
                 f"מע\"מ: {v['vat']}, בסיס שטח: {v['area_basis'] or 'לא צוין'}, נושא: {v['subject'] or 'לא צוין'}, "
                 f"תפקיד: {v['role']}" + (f"; נקבעו ולא נמצאו במקור: {', '.join(asserted)}" if asserted else "")
                 + ")" + (f"\nסעיף: {v['section']}" if v.get("section") else "") + "\n" + _attribution_text(v)
-                + f"\nמקום: {where}\nציטוט: {v['quote']}", "value")
+                + f"\nמקום: {where}\nציטוט: {v['quote']}" + _context_text(v), "value")
     if sid in ws.assumptions:
         a = ws.assumptions[sid]
         return ("הנחת המשתמש", f"הנחה שהמשתמש נתן (לא נתון מהמסמכים): {a.label} = {a.written}"
@@ -1205,6 +1208,20 @@ def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
     if sid in ws.computations:
         return ("חישוב מערכת", computation_text(ws.computations[sid], ws), "computation")
     return None
+
+
+_SUBJECT_FROM = {"context": "הנושא שניתן לו הוא הנכס של ההקשר הזה",
+                 "asserted": "הנושא שניתן לו אינו מזוהה מתוך ההקשר (קביעה של המודל)",
+                 "contradicted": "הנושא שניתן לו הוא נכס של הקשר אחר בקובץ"}
+
+
+def _context_text(v: dict) -> str:
+    """A value's appraisal context in a file holding several (round 7 U6, KTD7): the property it belongs to, as the
+    judge reads it, and where its given subject stands against it."""
+    if not v.get("context"):
+        return ""
+    out = f"\nהקשר בקובץ (הנכס שהערך שייך לו): {v['context']['described']}"
+    return out + (f" — {_SUBJECT_FROM[v['subject_from']]}" if v.get("subject_from") in _SUBJECT_FROM else "")
 
 
 def _attribution_text(v: dict) -> str:
@@ -1522,6 +1539,10 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
         if misattributed:
             problems.append(Problem(u, misattributed, failure_kind="wrong_subject", check="misattribution"))
             continue
+        elsewhere = _wrong_context(u, ws, question)
+        if elsewhere:
+            problems.append(Problem(u, elsewhere, failure_kind="wrong_subject", check="context"))
+            continue
         for reason in _vat_problems(u, ws) if u.ids else []:
             problems.append(Problem(u, reason, failure_kind="wrong_unit", check="vat"))
         blocking = [m for m in meanings.get(u.index, []) if m.blocking]
@@ -1642,6 +1663,67 @@ def _misattributed(u: Unit, ws: Workspace) -> str | None:
                 return (f"{written} הוא {label} של {v.stated_by} לפי המקור, והתשובה מציגה אותו כ"
                         + (f"דברי {said.stated_by}" if other and "adopted" not in said.stances else "מה שנקבע או אומץ")
                         + f"; ייחס אותו ל{v.stated_by}, או הצג את הערך שנקבע")
+    return None
+
+
+def _evidence_contexts(u: Unit, ws: Workspace) -> list[tuple[str, set[int], str, str]]:
+    """What a unit's numbers rest on, by appraisal context (KTD7): ``(version id, its contexts, what, id)`` for each cited
+    value or measurement whose number the unit shows, each cited source of one context that writes a number the unit
+    shows, and each cited calculation (the contexts of its inputs). Files with one context give nothing."""
+    shown = numbers_in(u.text)
+    out: list[tuple[str, set[int], str, str]] = []
+    for i in u.ids:
+        if i in ws.values:
+            v = ws.values[i]
+            if v.context and numbers_in(v.written) & shown:
+                out.append((str(v.version_id), {v.context["number"]}, f"{v.written} ({i})", i))
+        elif i in ws.measurements:
+            m = ws.measurements[i]
+            if m.context and numbers_in(m.row.value_text or "") & shown:
+                out.append((str(m.version_id), {m.context["number"]}, f"{m.row.value_text} ({i})", i))
+        elif i in ws.computations:
+            by_version: dict[str, set[int]] = {}
+            for lf in ws.computations[i].outcome.leaves:
+                if lf.context is not None:
+                    version, _, n = lf.context[0].rpartition("#")
+                    by_version.setdefault(version, set()).add(int(n))
+            out += [(version, numbers, i, i) for version, numbers in by_version.items()]
+        elif i in ws.sources:
+            src = ws.sources[i]
+            if len(src.contexts) == 1 and numbers_in(src.text or "") & shown:
+                out.append((str(src.version_id), set(src.contexts), i, i))
+    return out
+
+
+def _wrong_context(u: Unit, ws: Workspace, question: str) -> str | None:
+    """A claim about the asked property that rests on another appraisal context of the same file (round 7 U6, KTD7,
+    R21): the property is the one the unit names (an identifier of one of the file's contexts), else the one the
+    request's components name (their subjects), else the one the question names, else the one the value's own subject
+    names; a value, measurement or source of another context, or a calculation none of whose inputs is of the asked
+    context, is another property's figure — the file, its title or the conversation's focus never prove otherwise.
+    Only when the context checks are enforced (``contexts.enforced``); None when nothing is asked or nothing is
+    elsewhere."""
+    from app.chat import contexts
+    from app.chat.tools import asked_subjects
+
+    if not contexts.enforced():
+        return None
+    subjects, from_components = asked_subjects(ws)
+    for version, numbers, what, i in _evidence_contexts(u, ws):
+        cx = ws.contexts.get(version)
+        if cx is None or not cx.multi:
+            continue
+        asked = set(cx.named(u.text))
+        if not asked:
+            asked = {n for x in subjects for n in cx.named(x)} if from_components else set()
+        if not asked:
+            asked = set(cx.named(question))
+        if not asked and i in ws.values and ws.values[i].subject_from == "contradicted":
+            asked = set(cx.named(ws.values[i].subject))
+        if asked and not numbers & asked:
+            return (f"{what} כתוב ב" + ", ".join(cx.describe(n) for n in sorted(numbers)) + ", והטענה עוסקת ב"
+                    + ", ".join(cx.describe(n) for n in sorted(asked)) + ": זה נתון של נכס אחר באותו קובץ. קח את "
+                    "הנתון מההקשר של הנכס שנשאל עליו, או ייחס אותו לנכס שלו")
     return None
 
 

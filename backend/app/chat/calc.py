@@ -30,6 +30,13 @@ and compatibility depends on the operation (R17):
 - ``×`` ``÷`` derive units: ₪ למ״ר × מ״ר is ₪, a ratio of the same units is dimensionless, × (1 + A1%) keeps the
   unit, a monthly amount × 12 is yearly. Per-area values meet areas only on the same area basis (else a
   justification makes the result conditional). A percentage applies only through ``%``.
+
+Every input of a file holding several appraisals carries its appraisal context (round 7 U6, KTD7, R20–R21:
+``Leaf.context``, from ``app.chat.contexts``). When the context checks are enforced (``evaluate(contexts=...)``), a
+calculation over inputs of two or more contexts — through ``+`` ``−``, ``×`` ``÷`` or an aggregate alike, earlier
+results included — is refused with the contexts it mixes, unless a frozen calculation component of the turn
+compares them (its ``compares`` names every one of those contexts, KTD1). A justification does not lift it: a
+figure of another appraisal is another property's.
 """
 
 from __future__ import annotations
@@ -93,6 +100,9 @@ class Leaf:
     # the VAT status of an amount of money ("included", "excluded" or "unknown"); None for an input that is not money
     # (an area, a rate, a coefficient), which has no VAT to share with the result
     vat: str | None = None
+    # the appraisal context it was read in (KTD7): (its key, as the tools describe it); None outside a file holding
+    # several appraisals
+    context: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -135,14 +145,14 @@ def norm_subject(subject: str | None) -> str:
 def operand(id: str, value, unit: str, *, period: str | None = "none", vat: str | None = None, basis: str = "",
             kind: str | None = None, role: str | None = None, subject: str = "", total: bool = False,
             table: tuple | None = None, group: str | None = None, same: str | None = None, approx: bool = False,
-            assumption: bool = False) -> Operand:
+            assumption: bool = False, context: tuple[str, str] | None = None) -> Operand:
     """An input operand from its meaning, as the tools register it."""
     total = total or role == "total"
     dims = dims_of(unit)
     money = (_vat(vat) or "unknown") if "ILS" in dict(dims) else None
     return Operand(id, None if value is None else Decimal(str(value)), dims, _period(period), _vat(vat),
                    (basis or "").strip(), kind, role, norm_subject(subject), group, same, approx, None,
-                   (Leaf(id, total, table, role, money),), (id,) if assumption else ())
+                   (Leaf(id, total, table, role, money, context),), (id,) if assumption else ())
 
 
 @dataclass
@@ -665,16 +675,35 @@ def _value(o: Operand) -> Decimal:
     return o.value
 
 
-def evaluate(node, operands: dict[str, Operand], justification: str | None = None) -> Outcome:
+MSG_CONTEXTS = ("החישוב משלב ערכים מכמה שומות או נכסים באותו קובץ: {which}. ערך של שומה אחת אינו ערך של נכס אחר, "
+                "ואף רכיב חישוב של הבקשה אינו משווה ביניהם. חשב מערכים של הקשר אחד בלבד (קח את הערך מההקשר של הנכס "
+                "שנשאל עליו), או — אם המשתמש ביקש להשוות ביניהם — שאל אותו")
+
+
+def _check_contexts(out: Operand, allowed: list[frozenset[str]] | None) -> None:
+    """A calculation over inputs of several appraisal contexts (KTD7) is refused unless one of ``allowed`` — the
+    contexts a frozen comparison component names — holds them all; ``allowed`` None: not enforced."""
+    if allowed is None:
+        return
+    mixed = dict.fromkeys(lf.context for lf in out.leaves if lf.context is not None)
+    keys = {k for k, _ in mixed}
+    if len(keys) > 1 and not any(keys <= a for a in allowed):
+        raise CalcError(MSG_CONTEXTS.format(which="; ".join(label for _, label in mixed)))
+
+
+def evaluate(node, operands: dict[str, Operand], justification: str | None = None,
+             contexts: list[frozenset[str]] | None = None) -> Outcome:
     """The exact value of a parsed expression with its meaning, or ``CalcError`` with the reason. What needs a
     justification (a different VAT status, area basis or subject) is refused without one, and with one the result
-    is conditional on it."""
+    is conditional on it. ``contexts``: when enforced, the sets of appraisal contexts the turn's comparison
+    components allow to be combined (``_check_contexts``); None leaves contexts unchecked."""
     ev = _Eval(operands)
     with localcontext(_PRECISION):
         try:
             out = ev.eval(node)
         except (InvalidOperation, ArithmeticError) as exc:
             raise CalcError(f"{type(exc).__name__}. {MSG_FAILED}") from None
+    _check_contexts(out, contexts)
     if ev.needs and not (justification or "").strip():
         raise CalcError("החישוב מערבב נתונים שאינם תואמים: " + "; ".join(ev.needs) + ". אפשר לחשב רק עם "
                         "justification שמסביר מדוע הערבוב תקף (התוצאה תסומן כמותנית), או לשאול את המשתמש")
@@ -815,6 +844,13 @@ class Value:
     # reading status decides)
     reading: str = ""
     reading_note: str = ""
+    # its appraisal context in a file holding several (KTD7, R20): {"key", "number", "label", "pages"}, from the block
+    # or table row it was read at (the source's, never the model's); None in a file with one context
+    context: dict | None = None
+    # where its subject stands against that context (R21): "context" (the subject names the context's identifiers),
+    # "contradicted" (it names another context's), "asserted" (it names none of them: the model's word only), ""
+    # (no subject, or a file with one context)
+    subject_from: str = ""
 
     @property
     def certainty(self) -> str:
@@ -829,7 +865,9 @@ class Value:
 
         return operand(self.vid, self.value, self.unit, period=self.period, vat=self.vat, basis=basis_key(self.area_basis),
                        kind=self.kind, role=self.role, subject=self.subject, total=self.total, table=self.table,
-                       approx=self.approx)
+                       approx=self.approx,
+                       context=(self.context["key"], self.context.get("described") or self.context["label"])
+                       if self.context else None)
 
     def public(self) -> dict:
         return {"id": self.vid, "value": str(self.value), "value_text": self.written, "label": self.label,
@@ -841,7 +879,8 @@ class Value:
                 "quote": self.quote, "total": self.total, "approx": self.approx, "section": self.section,
                 "stated_by": self.stated_by, "stance": self.stance, "scenario": self.scenario,
                 "attribution": self.attribution, "meaning_from": dict(self.meaning_from), "reading": self.reading,
-                "reading_note": self.reading_note}
+                "reading_note": self.reading_note, "context": dict(self.context) if self.context else None,
+                "subject_from": self.subject_from}
 
 
 @dataclass
