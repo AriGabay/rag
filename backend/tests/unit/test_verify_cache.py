@@ -18,7 +18,7 @@ from app.chat.engine import FinalAnswer
 from app.chat.tools import Workspace
 from app.chat.verify import TurnRequirements, VerdictCache, verify_answer
 from app.db import TenantContext
-from app.providers.llm import Purpose
+from app.providers.llm import CallStatus, Purpose
 from tests.support.scripted_agent import ScriptedAgent, call, final
 from tests.support.scripted_provider import ScriptedProvider
 
@@ -306,6 +306,28 @@ def test_the_engines_repair_round_re_judges_only_the_changed_sentence(offline):
     assert [len(j) for j in judged] == [3, 1] and list(judged[1]) == [2]
     assert out.answer.answer_markdown == REPAIRED and out.answer.status == "answered"
     assert out.summary["verdicts_reused"] == 2 and out.summary["rounds"] == 2
+
+
+def _judge_wrong_management(input):
+    return {"verdicts": [{"index": i, "verdict": _wrong_management(t), "reason": "בדיקה"}
+                         for i, t in _units(input).items()]}
+
+
+@pytest.mark.parametrize("failure", [CallStatus.TIMEOUT, CallStatus.ERROR])
+def test_a_repair_round_that_fails_keeps_the_verified_answer_without_its_unsupported_sentence(offline, failure):
+    agent = ScriptedAgent([SEARCH, final(THREE), failure], judge=_judge_wrong_management)
+    out = _turn(agent)
+    assert len(agent.seen) == 3 and len(_verify_inputs(agent)) == 1
+    assert out.answer.answer_markdown.strip() and out.report.counts()["removed"] >= 1
+    assert out.summary["rounds"] == 1  # the turn ended with the verified answer, not a ProviderFailure
+
+
+def test_a_repair_round_that_would_not_fit_in_the_time_left_is_not_started(offline, monkeypatch):
+    monkeypatch.setattr(engine, "REPAIR_TIME_FACTOR", 1e12)  # any answer step "took" longer than the turn has left
+    agent = ScriptedAgent([SEARCH, final(THREE), final(REPAIRED)], judge=_judge_wrong_management)
+    out = _turn(agent)
+    assert len(agent.seen) == 2 and len(_verify_inputs(agent)) == 1
+    assert out.report.counts()["removed"] >= 1
 
 
 def test_an_answer_whose_only_problem_is_a_missing_qualifier_gets_no_repair_round(offline):

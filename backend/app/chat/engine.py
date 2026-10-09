@@ -228,6 +228,8 @@ LIMIT_SENTENCES = {
 }
 FINAL_STEP_SECONDS = 25  # less time than this before the deadline: a repair step answers without tools
 REPAIR_MIN_SECONDS = 20  # less time than this before the deadline: no further repair round
+# a repair round rewrites the answer, so it starts only with this many times the answer step's time still left
+REPAIR_TIME_FACTOR = 1.5
 
 HISTORY_USER_CHARS = 2500
 HISTORY_ANSWER_CHARS = 600
@@ -454,6 +456,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     # the turn's verdicts: a repair round judges only what changed (KTD10)
     verdicts = VerdictCache()
     reused = 0
+    checked = None  # the last verified answer with its report, kept when a repair round cannot finish
+    answer_seconds = 0.0  # how long the step that wrote the last answer took
     progress("understand", "מבין את הבקשה")
     request = None
     if inp.history or inp.focus:
@@ -477,6 +481,21 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                                  parts=[])
             return TurnOutcome(answer, ws, VerifyReport([], judged=True, judge_status="no_claims"), steps, usage, {},
                                rounds, request.as_dict(), request.resolution, _summary(usage, rounds, reused))
+    def finish(answer: FinalAnswer, report: VerifyReport) -> TurnOutcome:
+        # a server sentence saying a datum was not found is not added when the turn holds its values
+        final = coverage.state_absence(ws, report.apply(answer), cited=False, withdrawn=report.withdrawn)
+        # a requirement the verified answer neither gives nor says is missing is stated with its reason
+        final, outcomes = coverage.state_parts(ws, final, report, turn)
+        report.completeness = coverage.completeness(outcomes)
+        final = _state_limits(final, limits)
+        ledger: dict = {}
+        if final.status != "clarification":
+            ledger, final = coverage.build(ws, final, inp.question)
+            ledger["requirements"] = outcomes
+        return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
+                           request.as_dict() if request is not None else None,
+                           request.resolution if request is not None else None, _summary(usage, rounds, reused))
+
     items: list = [{"role": "user", "content": _context_message(inp, request)}]
     while True:
         if cancelled():
@@ -501,16 +520,23 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             # the reading's step count only grows, so this is said once; a calculation still fits after it
             items.append({"role": "user", "content": NEAR_LIMIT_NOTICE})
         # the same tools in the same order at every step, the last one included: only the choice changes
+        started = time.monotonic()
         step = agent.agent_step(POLICY, items, T.TOOLS, FINAL_SCHEMA, cache_key=cache_key,
                                 timeout=max(15.0, min(left, settings.llm_timeout_agent_seconds)),
                                 tool_choice="none" if last else None)
         usage.append(usage_entry("agent", step, agent.model))
         if cancelled():
             raise TurnCancelled  # the call that was in flight is discarded
-        if not step.ok:
-            raise ProviderFailure(step.status.value, step.detail)
-        if step.calls and last:
-            raise ProviderFailure(CallStatus.INVALID.value, "tool call on the last step")
+        failure = (None if step.ok and not (step.calls and last) else
+                   (step.status.value, step.detail) if not step.ok else
+                   (CallStatus.INVALID.value, "tool call on the last step"))
+        if failure is not None and checked is not None:
+            # a repair round that fails (a timeout on a long rewrite, say) leaves the answer already verified: it is
+            # used as a round without time would use it, its unverified claims removed, instead of failing the turn
+            logger.warning("chat repair round failed: %s; the verified answer is kept", failure[0])
+            return finish(*checked)
+        if failure is not None:
+            raise ProviderFailure(*failure)
         items.extend(step.output)
         if step.calls:
             for call in step.calls:
@@ -522,14 +548,21 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         try:
             answer = FinalAnswer.model_validate(step.final)
         except ValueError as exc:
+            if checked is not None:
+                logger.warning("chat repair round failed: final schema; the verified answer is kept")
+                return finish(*checked)
             raise ProviderFailure(CallStatus.INVALID.value, "final schema") from exc
+        answer_seconds = time.monotonic() - started
         if answer.status == "clarification" and answer.clarification_question.strip() and not answer.answer_markdown.strip():
             answer.answer_markdown = answer.clarification_question
         # a datum that was not found is said first, at the level the turn actually checked; a sentence that rests on
         # an opened section is judged with the answer, one about the search itself is added after verification
         answer = coverage.state_absence(ws, answer, cited=True)
         if deadline + VERIFY_ALLOWANCE_SECONDS - time.monotonic() < settings.chat_verify_min_seconds:
-            # an answer that cannot be checked is never shown: the turn fails, saying why
+            # an answer that cannot be checked is never shown: a repaired one gives way to the answer already
+            # verified, a first one fails the turn, saying why
+            if checked is not None:
+                return finish(*checked)
             raise ProviderFailure("verify_no_time")
         progress("verify", "מאמת את הטענות מול המקורות")
         try:
@@ -544,6 +577,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                                    cache=verdicts)
         except VerificationUnavailable as exc:
             # the answer could not be checked against its sources: a failure with retry, never an unchecked answer
+            if checked is not None:
+                return finish(*checked)
             raise ProviderFailure("verify_unavailable", exc.status) from exc
         if cancelled():
             raise TurnCancelled
@@ -554,20 +589,11 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         # would drop the datum
         settled = attempt >= 1 and not any(p.removes_unit or (p.severity == "partial" and p.repairable)
                                            for p in report.problems)
-        if report.ok or settled or attempt >= repairs or time.monotonic() > deadline - REPAIR_MIN_SECONDS:
-            # a server sentence saying a datum was not found is not added when the turn holds its values
-            final = coverage.state_absence(ws, report.apply(answer), cited=False, withdrawn=report.withdrawn)
-            # a requirement the verified answer neither gives nor says is missing is stated with its reason
-            final, outcomes = coverage.state_parts(ws, final, report, turn)
-            report.completeness = coverage.completeness(outcomes)
-            final = _state_limits(final, limits)
-            ledger: dict = {}
-            if final.status != "clarification":
-                ledger, final = coverage.build(ws, final, inp.question)
-                ledger["requirements"] = outcomes
-            return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
-                               request.as_dict() if request is not None else None,
-                               request.resolution if request is not None else None, _summary(usage, rounds, reused))
+        checked = (answer, report)
+        # a rewrite takes about as long as the answer it rewrites: a round that would not fit is not started
+        repair_from = deadline - max(REPAIR_MIN_SECONDS, REPAIR_TIME_FACTOR * answer_seconds)
+        if report.ok or settled or attempt >= repairs or time.monotonic() > repair_from:
+            return finish(answer, report)
         attempt += 1
         if attempt == 1:
             progress("repair", "מתקן טענות שלא אומתו")
