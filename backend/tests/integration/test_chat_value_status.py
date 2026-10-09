@@ -4,7 +4,10 @@ A stored measurement is labelled as a person's decision only when a review recor
 its inputs' statuses without implying a review is needed; an uncertain input makes the result conditional. A value
 taken from a region ingestion read uncertainly gets a focused visual re-read through the inspect path, at most twice
 per value in a turn, and stays uncertain when the re-read is unclear. A search hit in a partly read document is
-marked partial only when its own page has an unread region. The vision model is scripted; synthetic documents only."""
+marked partial only when its own page has an unread region. A cell of a table read by inspect is verified only when
+OCR of the crop sees its number in its row and column (U5, KTD6, R16–R19): AE5's total is certain in the same turn;
+a number OCR does not see, sees twice, or sees in another row leaves its value uncertain and its calculation
+conditional, with the reason. The vision model and OCR are scripted; synthetic documents only."""
 
 from __future__ import annotations
 
@@ -20,7 +23,22 @@ from app.extraction.base import ChunkResult, ExtractionResult, PageResult
 from app.measurements.extract import EXTRACTION_VERSION
 from app.platform import pipeline
 from tests.factories import make_document, make_group, make_office, make_user
-from tests.integration.test_chat_inspect import ScriptedVision, emp, ingest_r1, region_of, tag
+from tests.integration.test_chat_inspect import (
+    COST,
+    COST_TOTAL,
+    PICTURE,
+    CostTable,
+    ScriptedVision,
+    cost_meaning,
+    cost_ocr,
+    emp,
+    ingest_cost_table,
+    ingest_r1,
+    inspect_cost_table,
+    region_of,
+    tag,
+    take_cost,
+)
 
 pytestmark = pytest.mark.db
 
@@ -193,3 +211,122 @@ def test_without_ocr_an_unclear_value_is_not_re_read_and_stays_uncertain(vision_
     assert vision_office.vision.calls == [] and T.STATUS_UNCERTAIN in out and "אין OCR" in out
     assert "V1" in ws.uncertain_values
 
+
+
+# --- a table read by inspect: values confirmed by OCR in their cells, in the same turn (U5, KTD6, R16–R19) ---------
+
+def _cell(row: str, column: str, number: str | None = None) -> dict:
+    return {"table": None, "row": row, "row_number": None, "column": column, "column_number": None, "quote": None,
+            "number": number}
+
+
+def _anchor(ws, vid: str) -> dict:
+    from app.chat import anchors
+
+    answer = {"values": [{"id": vid}]}
+    anchors.attach(ws, answer)
+    return answer["values"][0]["anchor"]
+
+
+def test_ae5_two_ocr_confirmed_cells_of_a_table_read_by_inspect_give_a_certain_total_in_the_same_turn(
+        client, vision_office, monkeypatch):
+    from tests.conftest import login
+    from tests.integration.test_chat import cloud, new_conversation, send
+    from tests.support.scripted_agent import ScriptedAgent, call, final, read
+
+    doc = ingest_cost_table(vision_office, monkeypatch)
+    vision_office.vision = CostTable()
+    cost_ocr(monkeypatch)
+    q = COST["question_total"]
+
+    def last(items) -> str:
+        return [i["output"] for i in items if isinstance(i, dict) and i.get("type") == "function_call_output"][-1]
+
+    def inspect_region(items):
+        region = re.search(r"\[אזור שלא נקרא (R\d+)", last(items)).group(1)
+        return [call("inspect", target={"region": region, "document": None, "page": None})]
+
+    def take_both(items):
+        sid = re.findall(r'<source id="(S\d+)"', last(items))[-1]
+        return [call("take_value", source=sid, locator=_cell(row, COST_TOTAL, number), meaning=cost_meaning(),
+                     label=row) for row, number in zip(q["rows"], q["inputs"], strict=True)]
+
+    answer = final(f"עלות הבנייה העילית והחניון התת-קרקעי יחד היא {q['result']} ₪ [C1].", documents=[doc])
+    agent = ScriptedAgent([[read(pages={"document": doc, "from_page": 1, "to_page": 1})], inspect_region, take_both,
+                           [call("calculate", expression="V1 + V2", label="עלות הבנייה והחניון", justification=None)],
+                           answer])
+    cloud(monkeypatch, vision_office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), "מה עלות הבנייה העילית והחניון יחד?")
+    assert m["status"] == "done", m
+    a = m["answer"]
+    assert a["status"] == "answered" and a["verification"]["removed"] == 0, a
+    assert q["result"] in a["markdown"] and vision_office.vision.calls == 1
+    (c,) = a["computations"]
+    assert c["value"] == "20220000" and c["conditional"] is False, c
+    values = {v["id"]: v for v in a["values"]}
+    assert set(values) == {"V1", "V2"}
+    for v, row in zip((values["V1"], values["V2"]), q["rows"], strict=True):
+        assert v["certainty"] == "verified" and v["reading"] == "clear", v
+        anchor = v["anchor"]  # the input opens the table, at its cell, with the table's context
+        assert anchor["precision"] == "cell" and anchor["table"]["row_label"] == row, anchor
+        assert anchor["table"]["column_header"] == COST_TOTAL and anchor["table"]["source"] == "vision"
+        assert "table_index" not in v["locator"]
+
+
+def test_a_number_ocr_does_not_see_stays_uncertain_and_its_calculation_is_conditional_and_says_why(
+        vision_office, monkeypatch):
+    doc = ingest_cost_table(vision_office, monkeypatch)
+    vision_office.vision = CostTable()
+    cost_ocr(monkeypatch, drop=("4,620,000",))
+    ws = emp(vision_office)
+    sid = inspect_cost_table(vision_office, ws, doc)
+    first, second = take_cost(ws, sid, "בנייה עילית"), take_cost(ws, sid, "חניון תת-קרקעי")
+    assert T.STATUS_AUTO in first and T.STATUS_UNCERTAIN in second and "OCR" in second
+    out = json.loads(T.tool_calculate(ws, "V1 + V2", "סכום"))
+    assert out["conditional"] is True and "V2" in out["note"] and "V1" not in T.uncertain_inputs(ws, ["V1"])
+    assert ws.uncertain_values["V2"] in out["note"]  # why it is uncertain, not only that it is
+    assert vision_office.vision.calls == 1  # the same crop is not read again: nothing new would confirm it
+
+
+def test_a_number_seen_twice_in_the_crop_stays_uncertain_and_is_highlighted_as_its_table(vision_office, monkeypatch):
+    from app.chat import anchors
+
+    doc = ingest_cost_table(vision_office, monkeypatch)
+    vision_office.vision = CostTable()
+    cost_ocr(monkeypatch, twice=("15,600,000",))
+    ws = emp(vision_office)
+    sid = inspect_cost_table(vision_office, ws, doc)
+    out = take_cost(ws, sid, "בנייה עילית")
+    assert T.STATUS_UNCERTAIN in out and "יותר מפעם אחת" in out
+    snap = _anchor(ws, "V1")
+    assert (snap["precision"], snap["region"], snap["degraded"]) == ("region", "table", anchors.NO_CELL_BOX), snap
+    assert snap["table"]["row_label"] == "בנייה עילית" and snap["table"]["column_header"] == COST_TOTAL
+
+
+def test_values_the_transcription_swapped_between_rows_both_stay_uncertain_and_their_sum_is_conditional(
+        vision_office, monkeypatch):
+    rows = [list(r) for r in PICTURE["rows"]]
+    rows[0][3], rows[1][3] = rows[1][3], rows[0][3]  # the model put each row's cost in the other row
+    doc = ingest_cost_table(vision_office, monkeypatch)
+    vision_office.vision = CostTable(rows)
+    cost_ocr(monkeypatch)  # OCR sees the table as drawn: both numbers, each in its own row
+    ws = emp(vision_office)
+    sid = inspect_cost_table(vision_office, ws, doc)
+    outs = [take_cost(ws, sid, "בנייה עילית"), take_cost(ws, sid, "חניון תת-קרקעי")]
+    assert all(T.STATUS_UNCERTAIN in o for o in outs), outs
+    out = json.loads(T.tool_calculate(ws, "V1 + V2", "סכום"))
+    assert out["conditional"] is True and "V1" in out["note"] and "V2" in out["note"]
+
+
+def test_a_quoted_row_of_a_table_read_by_inspect_is_taken_as_its_cell(vision_office, monkeypatch):
+    doc = ingest_cost_table(vision_office, monkeypatch)
+    vision_office.vision = CostTable()
+    cost_ocr(monkeypatch)
+    ws = emp(vision_office)
+    sid = inspect_cost_table(vision_office, ws, doc)
+    out = T.tool_take_value(ws, sid, {"quote": " | ".join(PICTURE["rows"][0]), "number": "15,600,000"},
+                            cost_meaning(), "בנייה עילית")
+    assert out.startswith("V1 נרשם") and T.STATUS_AUTO in out, out
+    where = ws.values["V1"].locator
+    assert (where["row"], where["column"]) == ("בנייה עילית", COST_TOTAL)

@@ -23,6 +23,11 @@ picture keeps its OCR fallback on any model failure.
 
 A reading never invents structure: a table keeps its title, header, rows and notes as read; a drawing or map
 keeps a one-line description and only the labels that were legible.
+
+A reading made on demand during a chat turn (``inspect``) also keeps what OCR of the same crop and the region's
+text layer confirm of it (``ocr_evidence``, ``PictureReading.ocr``): per number, how often OCR saw it and where; per
+table cell, whether its number was seen once inside its row's and its column's bands (``cell_evidence``, KTD6,
+R18).
 """
 
 from __future__ import annotations
@@ -92,6 +97,9 @@ class PictureReading:
     note: str | None = None  # the reason for unread/uncertain, or what a non-text picture shows
     kind: str | None = None  # table | text | diagram | map | photo | chart | signature | other
     cacheable: bool = True  # False for a fallback after a failed model call: the next ingestion tries again
+    # an on-demand (``inspect``) reading only: what OCR of the same crop and the region's text layer confirm of it
+    # (``ocr_evidence``) and the frame the crop was rendered in (``app.chat.tools``), KTD6
+    ocr: dict | None = None
 
     @classmethod
     def from_json(cls, data: dict) -> PictureReading:
@@ -101,7 +109,10 @@ class PictureReading:
         return cls(**data)
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), ensure_ascii=False)
+        out = asdict(self)
+        if out["ocr"] is None:  # a reading without on-demand evidence is stored as before it existed
+            del out["ocr"]
+        return json.dumps(out, ensure_ascii=False)
 
 
 @dataclass
@@ -296,6 +307,12 @@ def ocr_words(gray, languages: str) -> list[dict] | None:
     return _ocr_words(gray, languages)
 
 
+def ocr_upscale(width: int) -> float:
+    """How much ``_ocr_words`` enlarges a picture ``width`` pixels wide before OCR: its words' boxes are in the
+    enlarged picture's pixels."""
+    return OCR_TARGET_WIDTH / width if 0 < width < OCR_TARGET_WIDTH else 1.0
+
+
 def _ocr_words(gray, languages: str) -> list[dict] | None:
     from PIL import Image
 
@@ -305,7 +322,7 @@ def _ocr_words(gray, languages: str) -> list[dict] | None:
         return []
     img = without_rules(gray)
     if img.size[0] < OCR_TARGET_WIDTH:
-        scale = OCR_TARGET_WIDTH / img.size[0]
+        scale = ocr_upscale(img.size[0])
         img = img.resize((OCR_TARGET_WIDTH, max(1, int(img.size[1] * scale))), Image.Resampling.LANCZOS)
     try:
         return _words(img, languages)
@@ -316,6 +333,12 @@ def _ocr_words(gray, languages: str) -> list[dict] | None:
 
 def _confident(words: list[dict]) -> list[str]:
     return [w["text"] for w in words if w["conf"] >= OCR_MIN_CONFIDENCE and len(w["text"]) >= 2
+            and re.search(r"[א-ת\dA-Za-z]", w["text"])]
+
+
+def confident_words(words: list[dict]) -> list[dict]:
+    """``_confident`` keeping each word with its box; a single digit (a cell writing "3") is kept too."""
+    return [w for w in words if w["conf"] >= OCR_MIN_CONFIDENCE and (len(w["text"]) >= 2 or w["text"].isdigit())
             and re.search(r"[א-ת\dA-Za-z]", w["text"])]
 
 
@@ -609,3 +632,201 @@ def _from_ocr(gray, languages: str, note: str) -> PictureReading:
         return PictureReading("no_text", "ocr", note="תמונה ללא טקסט קריא")
     return PictureReading("read_uncertain", "ocr", text=text, tables=tables, note=note,
                           kind="table" if tables else "text")
+
+
+# --- an on-demand reading's numbers, confirmed in their place (KTD6, R18, R19) ----------------------------------------
+#
+# ``inspect`` reads a region during a chat turn: a model's transcription, which by itself verifies nothing. A cell of
+# a table it transcribed is confirmed only when an independent reading of the same pixels puts the cell's number in
+# the cell's place: OCR of the same crop (or the region's own text layer) sees the number exactly once, and that
+# word's box lies in the row band of the row's label words and the column band of its column header, both located by
+# their own word boxes in the crop. A number seen twice, not seen, or seen outside its row or column stays unconfirmed:
+# a transcription that swapped two rows' values keeps every number OCR saw and still fails here. Boxes are in the
+# OCR picture's pixels (the crop as ``_ocr_words`` enlarged it, ``ocr_upscale``); ``app.chat.anchors.page_box`` maps
+# them into the rendered page.
+
+CELL_CONFIRMED = "confirmed"  # seen once, in the row band of its label and the column band of its header
+CELL_NOT_SEEN = "not_seen"  # OCR did not see the number
+CELL_REPEATED = "repeated"  # OCR saw the number more than once in the crop: which one is the cell is not known
+CELL_NOT_PLACED = "not_placed"  # seen once, but not in its row and column, or they could not be located
+CELL_NO_OCR = "no_ocr"  # no OCR of the crop (and no text layer confirmed it)
+PHRASE_GAP = 1.0  # a gap wider than this many word heights separates two cells on a line
+ROW_OVERLAP = 0.5  # the share of the lower of two heights a number and its row label must overlap by
+
+
+def _number_key(text: str) -> str | None:
+    """The digits of the one number a cell writes, None when it writes none or several."""
+    found = _NUM.findall(text or "")
+    return _digits(found[0]) or None if len(found) == 1 else None
+
+
+def _box(w: dict) -> list[float]:
+    x0, y0 = float(w["left"]), float(w["top"])
+    return [x0, y0, x0 + float(w["width"]), y0 + float(w["height"])]
+
+
+def _placed(words: list[dict] | None) -> list[dict]:
+    """The words that carry a box (Tesseract's always do): only they can place a number in a cell."""
+    return [w for w in words or [] if all(w.get(k) is not None for k in ("left", "top", "width", "height"))]
+
+
+def _label_tokens(text: str) -> tuple[frozenset, frozenset]:
+    """A label's words as compared with OCR: (words with a letter, words of digits), punctuation, quote marks and
+    currency signs dropped."""
+    tokens = [re.sub(r"[^\w]|_", "", t) for t in (text or "").split()]
+    tokens = [t for t in tokens if t]
+    return (frozenset(t for t in tokens if re.search(r"[^\W\d_]", t)),
+            frozenset(t for t in tokens if t.isdigit()))
+
+
+def _phrases(words: list[dict]) -> list[tuple[frozenset, frozenset, list[float]]]:
+    """Runs of words on one line with no wide gap (one cell each, as drawn): their tokens and their joint box."""
+    lines: list[list[dict]] = []
+    for w in sorted(words, key=lambda w: float(w["top"])):
+        b = _box(w)
+        for line in lines:
+            top, bottom = min(_box(x)[1] for x in line), max(_box(x)[3] for x in line)
+            if min(b[3], bottom) - max(b[1], top) >= ROW_OVERLAP * min(b[3] - b[1], bottom - top):
+                line.append(w)
+                break
+        else:
+            lines.append([w])
+    out = []
+    for line in lines:
+        line.sort(key=lambda w: float(w["left"]))
+        heights = sorted(_box(w)[3] - _box(w)[1] for w in line)
+        gap = PHRASE_GAP * heights[len(heights) // 2]
+        run = [line[0]]
+        for w in line[1:]:
+            if _box(w)[0] - _box(run[-1])[2] > gap:
+                out.append(run)
+                run = []
+            run.append(w)
+        out.append(run)
+    phrases = []
+    for run in out:
+        letters, numbers = _label_tokens(" ".join(w["text"] for w in run))
+        boxes = [_box(w) for w in run]
+        phrases.append((letters, numbers, [min(b[0] for b in boxes), min(b[1] for b in boxes),
+                                           max(b[2] for b in boxes), max(b[3] for b in boxes)]))
+    return phrases
+
+
+def _locate(label: str, phrases) -> list[float] | None:
+    """The box of the one phrase that is ``label`` (the same words with a letter, its numbers among them); None when
+    no phrase or several are."""
+    letters, numbers = _label_tokens(label)
+    if not letters:
+        return None
+    hits = [box for ls, ns, box in phrases if ls == letters and numbers <= ns]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _column_bands(headers: list[str], phrases) -> list[tuple[float, float] | None]:
+    """Each header's column band: when every header is located, from the midpoint to its neighbour on each side
+    (a number right- or left-aligned under a short header is still in its column); otherwise the header's own box."""
+    boxes = [_locate(h, phrases) if h.strip() else None for h in headers]
+    named = [i for i, h in enumerate(headers) if h.strip()]
+    if not named or any(boxes[i] is None for i in named):
+        return [(b[0], b[2]) if b is not None else None for b in boxes]
+    order = sorted(named, key=lambda i: (boxes[i][0] + boxes[i][2]) / 2)
+    bands: list[tuple[float, float] | None] = [None] * len(headers)
+    for k, i in enumerate(order):
+        left = (boxes[order[k - 1]][2] + boxes[i][0]) / 2 if k > 0 else float("-inf")
+        right = (boxes[i][2] + boxes[order[k + 1]][0]) / 2 if k + 1 < len(order) else float("inf")
+        bands[i] = (left, right)
+    return bands
+
+
+def _placements(table: PictureTable, words: list[dict]) -> list[list[dict | None]]:
+    """Each cell's evidence from one set of words (OCR of the crop, or the region's text layer)."""
+    words = _placed(words)
+    phrases = _phrases(words)
+    seen: dict[str, list[list[float]]] = {}
+    for w in words:
+        for key in {_digits(m) for m in _NUM.findall(w["text"])} - {""}:
+            seen.setdefault(key, []).append(_box(w))
+    bands = _column_bands(table.headers, phrases)
+    out = []
+    for row in table.rows:
+        label = next((c for c in row if c.strip() and _number_key(c) is None), row[0] if row else "")
+        row_box = _locate(label, phrases)
+        cells: list[dict | None] = []
+        for j, cell in enumerate(row):
+            key = _number_key(cell)
+            if key is None or cell == label:
+                cells.append(None)
+                continue
+            hits = seen.get(key, [])
+            if not hits:
+                cells.append({"status": CELL_NOT_SEEN, "box": None, "by": None})
+                continue
+            if len(hits) > 1:
+                cells.append({"status": CELL_REPEATED, "box": None, "by": None})
+                continue
+            box = hits[0]
+            band = bands[j] if j < len(bands) else None
+            in_row = row_box is not None and (min(box[3], row_box[3]) - max(box[1], row_box[1])
+                                              >= ROW_OVERLAP * min(box[3] - box[1], row_box[3] - row_box[1]))
+            in_column = band is not None and band[0] <= (box[0] + box[2]) / 2 <= band[1]
+            cells.append({"status": CELL_CONFIRMED, "box": box, "by": None} if in_row and in_column
+                         else {"status": CELL_NOT_PLACED, "box": None, "by": None})
+        out.append(cells)
+    return out
+
+
+def cell_evidence(tables: list[PictureTable], words: list[dict] | None,
+                  layer: list[dict] | None = None) -> list[list[list[dict | None]]]:
+    """For each table, row and cell of a transcription: None for a cell without exactly one number; otherwise
+    ``{"status", "box", "by"}`` — ``confirmed`` with the confirming word's box (OCR pixels) and ``by`` (``ocr`` or
+    ``text_layer``), or why not (``CELL_*``). ``words``: the confident OCR words of the crop with their boxes (None:
+    no OCR); ``layer``: the region's text-layer words in the same pixels, accepted under the same placement test."""
+    out = []
+    for table in tables:
+        by_ocr = _placements(table, words or [])
+        by_layer = _placements(table, layer) if layer else None
+        rows = []
+        for i, row in enumerate(by_ocr):
+            cells = []
+            for j, cell in enumerate(row):
+                if cell is None:
+                    cells.append(None)
+                    continue
+                if cell["status"] == CELL_CONFIRMED:
+                    cell = cell | {"by": "ocr"}
+                else:
+                    other = by_layer[i][j] if by_layer is not None else None
+                    if other is not None and other["status"] == CELL_CONFIRMED:
+                        cell = other | {"by": "text_layer"}
+                    elif other is not None and other["status"] != CELL_NOT_SEEN and (
+                            words is None or cell["status"] == CELL_NOT_SEEN):
+                        cell = other  # the text layer saw it, where OCR did not: its reason is the one to give
+                    elif words is None:
+                        cell = {"status": CELL_NO_OCR, "box": None, "by": None}
+                cells.append(cell)
+            rows.append(cells)
+        out.append(rows)
+    return out
+
+
+def ocr_evidence(reading: PictureReading, words: list[dict] | None, layer: list[dict] | None = None) -> dict:
+    """What OCR of the crop (``words``: confident words with boxes; None: no OCR) and the region's text layer confirm
+    of an on-demand reading: per transcribed number, how many times OCR saw it and, when once, where; per table
+    cell, ``cell_evidence``. Kept in the stored reading (``PictureReading.ocr``)."""
+    texts = [reading.text, *[c for t in reading.tables for r in [t.headers, *t.rows] for c in r]]
+    found: dict[str, list[list[float]]] = {}
+    for w in _placed(words):
+        for key in {_digits(m) for m in _NUM.findall(w["text"])} - {""}:
+            found.setdefault(key, []).append(_box(w))
+    numbers, keys = [], set()
+    for t in texts:
+        for written in _NUM.findall(t or ""):
+            key = _digits(written)
+            if len(key) < 2 or key in keys:
+                continue
+            keys.add(key)
+            hits = found.get(key, [])
+            numbers.append({"number": key, "text": written, "seen": len(hits),
+                            "box": hits[0] if len(hits) == 1 else None})
+    return {"available": words is not None, "numbers": numbers,
+            "cells": cell_evidence(reading.tables, words, layer)}

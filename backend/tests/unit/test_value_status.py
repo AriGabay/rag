@@ -4,8 +4,10 @@ A stored measurement (M#) is shown as checked by a person only when a person's r
 was lost on reprocessing, or that extraction flagged, is uncertain; anything else was checked automatically. A
 calculation states its inputs' statuses and never implies a review is needed; an uncertain input makes the result
 conditional. A value whose region was read uncertainly gets a bounded focused re-read through the inspect path.
-A search hit is marked partly read only when the page or section it cites has an unread region. Synthetic values
-only; the project is invented."""
+A search hit is marked partly read only when the page or section it cites has an unread region. A cell of a table
+read by inspect is confirmed only when OCR (or the region's text layer) sees its number once in its row's and
+column's bands; its OCR box maps into the rendered page, and its anchor is cell-precise only with that box (U5,
+KTD6, R18, R19). Synthetic values only; the project is invented."""
 
 from __future__ import annotations
 
@@ -302,3 +304,149 @@ def test_an_older_report_without_coverage_uses_its_unread_pictures():
 def test_a_fully_read_document_is_never_partial():
     gaps = T.ReadingGaps.of({"partial": False}, [], False)
     assert not gaps.partial and not gaps.cites([1], None) and not gaps.cites(None, None)
+
+
+# --- a table read by inspect: each cell confirmed by OCR in its place (U5, KTD6, R18, R19) -----------------------------
+#
+# The OCR words are scripted at the OCR boundary (the host's Tesseract has no Hebrew data): a small table laid out on a
+# grid in the crop's OCR pixels, the columns right to left. The placement is the server's: the number's OCR box in the
+# row band of its row label and in the column band of its header, both located by OCR word boxes.
+
+from app.chat import anchors  # noqa: E402
+from app.extraction import images as I  # noqa: E402
+
+HEAD = ["רכיב", "עלות למ״ר (₪)", "עלות (₪)"]
+BODY = [["בנייה עילית", "6,500", "15,600,000"], ["חניון תת-קרקעי", "4,200", "4,620,000"]]
+COLUMNS = [(820, 1000), (450, 700), (60, 360)]  # x bands of the columns, right to left (OCR pixels)
+
+
+def _word(text: str, x0: float, y0: float, x1: float, y1: float, conf: float = 95.0) -> dict:
+    return {"text": text, "conf": conf, "left": x0, "top": y0, "width": x1 - x0, "height": y1 - y0}
+
+
+def _cell_words(text: str, column: int, line: int) -> list[dict]:
+    """A cell's words, right-aligned in its column, on its line (40 px high, 60 px apart)."""
+    out, right = [], COLUMNS[column][1] - 10
+    for token in text.split():
+        width = 18 * len(token)
+        out.append(_word(token, right - width, 20 + 60 * line, right, 60 + 60 * line))
+        right -= width + 10
+    return out
+
+
+def _layout(rows=BODY, drop=(), extra=()) -> list[dict]:
+    """The header on line 0 and each row below it; ``drop``: numbers OCR does not see; ``extra``: more words."""
+    words = [w for j, h in enumerate(HEAD) for w in _cell_words(h, j, 0)]
+    for i, row in enumerate(rows, 1):
+        words += [w for j, c in enumerate(row) for w in _cell_words(c, j, i) if w["text"] not in drop]
+    return words + list(extra)
+
+
+def _table(rows=BODY) -> list[I.PictureTable]:
+    return [I.PictureTable(headers=list(HEAD), rows=[list(r) for r in rows])]
+
+
+def test_a_number_ocr_sees_once_in_its_rows_band_and_its_columns_band_is_confirmed_with_its_box():
+    cells = I.cell_evidence(_table(), _layout())
+    first = cells[0][0][2]
+    assert first["status"] == I.CELL_CONFIRMED and first["by"] == "ocr"
+    expected = next(w for w in _layout() if w["text"] == "15,600,000")
+    assert first["box"] == [expected["left"], expected["top"], expected["left"] + expected["width"],
+                            expected["top"] + expected["height"]]
+    assert cells[0][1][2]["status"] == I.CELL_CONFIRMED and cells[0][1][1]["status"] == I.CELL_CONFIRMED
+    assert cells[0][0][0] is None  # a label holds no number: nothing to confirm
+
+
+def test_headers_sharing_a_word_are_told_apart_by_all_their_words():
+    cells = I.cell_evidence(_table(), _layout())
+    assert cells[0][0][1]["status"] == I.CELL_CONFIRMED  # under «עלות למ״ר (₪)», not «עלות (₪)»
+
+
+def test_a_number_ocr_does_not_see_is_not_confirmed():
+    cells = I.cell_evidence(_table(), _layout(drop=("4,620,000",)))
+    assert cells[0][1][2] == {"status": I.CELL_NOT_SEEN, "box": None, "by": None}
+    assert cells[0][0][2]["status"] == I.CELL_CONFIRMED
+
+
+def test_a_number_ocr_sees_twice_in_the_crop_is_not_confirmed_and_has_no_box():
+    twice = _word("15,600,000", 60, 400, 240, 440)  # also in a line under the table
+    cells = I.cell_evidence(_table(), _layout(extra=[twice]))
+    assert cells[0][0][2] == {"status": I.CELL_REPEATED, "box": None, "by": None}
+
+
+def test_values_the_transcription_swapped_between_rows_are_seen_by_ocr_but_not_placed():
+    swapped = [["בנייה עילית", "6,500", "4,620,000"], ["חניון תת-קרקעי", "4,200", "15,600,000"]]
+    cells = I.cell_evidence(_table(swapped), _layout())  # OCR sees the page as it is
+    assert cells[0][0][2]["status"] == I.CELL_NOT_PLACED and cells[0][1][2]["status"] == I.CELL_NOT_PLACED
+    assert cells[0][0][2]["box"] is None
+
+
+def test_a_row_whose_label_ocr_cannot_locate_leaves_its_numbers_unplaced():
+    cells = I.cell_evidence(_table(), _layout(drop=("חניון", "תת-קרקעי")))
+    assert cells[0][1][2]["status"] == I.CELL_NOT_PLACED and cells[0][0][2]["status"] == I.CELL_CONFIRMED
+
+
+def test_the_regions_text_layer_is_accepted_under_the_same_placement_test():
+    layer = _layout()
+    cells = I.cell_evidence(_table(), [], layer)
+    assert cells[0][0][2]["status"] == I.CELL_CONFIRMED and cells[0][0][2]["by"] == "text_layer"
+    swapped = [["בנייה עילית", "6,500", "4,620,000"], ["חניון תת-קרקעי", "4,200", "15,600,000"]]
+    assert I.cell_evidence(_table(swapped), [], layer)[0][0][2]["status"] == I.CELL_NOT_PLACED
+
+
+def test_the_reading_keeps_per_number_ocr_evidence_and_without_ocr_says_so():
+    reading = I.PictureReading("read", "vision", tables=_table(), kind="table")
+    ev = I.ocr_evidence(reading, _layout(drop=("4,620,000",)))
+    assert ev["available"] is True
+    seen = {n["number"]: n["seen"] for n in ev["numbers"]}
+    assert seen["15600000"] == 1 and seen["4620000"] == 0
+    assert ev["cells"][0][1][2]["status"] == I.CELL_NOT_SEEN
+    none = I.ocr_evidence(reading, None)
+    assert none["available"] is False and none["cells"][0][0][2]["status"] == I.CELL_NO_OCR
+    # stored with the reading and read back; a reading without it keeps its old JSON
+    back = I.PictureReading.from_json(json.loads(I.PictureReading("read", "vision", ocr=ev).to_json()))
+    assert back.ocr == ev
+    assert "ocr" not in json.loads(I.PictureReading("read", "vision").to_json())
+
+
+def test_an_ocr_box_is_mapped_into_the_rendered_page_by_the_upscale_the_render_scale_and_the_crop_origin():
+    frame = {"origin": [100.0, 200.0], "scale": 4.0, "upscale": 1.25}
+    # 50 points right and 10 down of the crop's corner, 20 x 5 points: in OCR pixels x 4 (render) x 1.25 (OCR)
+    assert anchors.page_box([250, 50, 350, 75], frame) == [150.0, 210.0, 170.0, 215.0]
+    assert anchors.page_box(None, frame) is None
+
+
+def _vision_reading(block_bbox=(99.2, 249.4, 552.8, 417.9)) -> anchors.Reading:
+    vid = str(uuid.uuid4())
+    page = anchors.Page(1, 595.28, 841.89, [0, 0, 595.28, 841.89], [0, 0, 595.28, 841.89], 0)
+    block = anchors.Block(8, "image", 1, "", list(block_bbox), None, ("2. עלויות הבנייה",))
+    return anchors.Reading(str(uuid.uuid4()), vid, "שומה סינתטית", "f.pdf", True, "r1", {1: page}, {8: block})
+
+
+def _vision_stub(reading: anchors.Reading, box) -> dict:
+    return {"kind": "cell", "document_id": reading.document_id, "version_id": reading.version_id, "reading_id": "r1",
+            "block_start": 8, "block_end": 8, "pages": [1], "section": "2. עלויות הבנייה",
+            "vision": {"region": "block:8", "table": 0, "row": 0, "column": 2, "page": 1, "cell_box": box,
+                       "title": None, "row_label": "בנייה עילית", "row_number": 1, "column_header": "עלות (₪)",
+                       "column_number": 3, "unit_note": "(*) הסכומים בש״ח", "notes": ["(*) הסכומים בש״ח"]}}
+
+
+def test_a_vision_cell_with_its_box_is_highlighted_at_cell_precision_with_its_table_context():
+    reading = _vision_reading()
+    snap = anchors.snapshot(_vision_stub(reading, [400.0, 300.0, 450.0, 310.0]), reading, "r1")
+    assert snap["precision"] == "cell" and snap["degraded"] is None
+    assert snap["pages"][0]["rects"] == [[round(400 / 595.28, 4), round(300 / 841.89, 4), round(450 / 595.28, 4),
+                                          round(310 / 841.89, 4)]]
+    t = snap["table"]
+    assert (t["row_label"], t["column_header"], t["source"], t["table_index"]) == ("בנייה עילית", "עלות (₪)",
+                                                                                     "vision", None)
+    assert "שורה «בנייה עילית»" in snap["location"]["label"]
+
+
+def test_a_vision_cell_without_a_box_is_highlighted_as_its_whole_table_with_context():
+    reading = _vision_reading()
+    snap = anchors.snapshot(_vision_stub(reading, None), reading, "r1")
+    assert (snap["precision"], snap["region"], snap["degraded"]) == ("region", "table", anchors.NO_CELL_BOX)
+    assert snap["pages"][0]["rects"] == [[round(99.2 / 595.28, 4), round(249.4 / 841.89, 4),
+                                          round(552.8 / 595.28, 4), round(417.9 / 841.89, 4)]]
+    assert snap["table"]["row_label"] == "בנייה עילית" and snap["table"]["unit_note"] == "(*) הסכומים בש״ח"

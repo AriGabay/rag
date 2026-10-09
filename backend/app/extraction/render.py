@@ -53,8 +53,20 @@ def applied_scale(long_side: float, scale: float, max_side: int) -> float:
     return min(scale, max_side / max(long_side, 1.0))
 
 
+@dataclass(frozen=True)
+class RenderedRegion:
+    """A region (or a whole page) as rendered for a visual reading, with the frame a pixel of it is in: pixel
+    ``(x, y)`` is the point ``origin + (x, y) / scale`` of the page's display frame."""
+
+    png: bytes
+    width: float  # the page's display frame in points
+    height: float
+    scale: float  # pixels per point actually applied (the cap may have lowered it)
+    origin: tuple[float, float]  # the crop's top-left corner in the display frame (the region's box less the margin)
+
+
 def _render(data: bytes, page_no: int, bbox: list[float] | None, scale: float | None, max_side: int):
-    """The image, the page's display size in points and the scale applied."""
+    """The image, the page's display size in points, the scale applied and the crop's origin."""
     import pypdfium2 as pdfium
 
     with RENDER_LOCK:
@@ -70,6 +82,7 @@ def _render(data: bytes, page_no: int, bbox: list[float] | None, scale: float | 
                 width, height = page.get_size()
                 if bbox is None:
                     crop, wanted, long_side = (0, 0, 0, 0), scale or PAGE_SCALE, max(width, height)
+                    origin = (0.0, 0.0)
                 else:
                     x0, top = max(0.0, bbox[0] - REGION_MARGIN), max(0.0, bbox[1] - REGION_MARGIN)
                     x1, bottom = min(width, bbox[2] + REGION_MARGIN), min(height, bbox[3] + REGION_MARGIN)
@@ -78,6 +91,7 @@ def _render(data: bytes, page_no: int, bbox: list[float] | None, scale: float | 
                     # pdfium crops by the amount removed from each side: left, bottom, right, top
                     crop = (x0, height - bottom, width - x1, top)
                     wanted, long_side = scale or REGION_SCALE, max(x1 - x0, bottom - top)
+                    origin = (float(x0), float(top))
                 applied = applied_scale(long_side, wanted, max_side)
                 try:
                     image = page.render(scale=applied, crop=crop).to_pil()
@@ -89,7 +103,7 @@ def _render(data: bytes, page_no: int, bbox: list[float] | None, scale: float | 
             doc.close()
     out = io.BytesIO()
     image.save(out, "PNG")
-    return out.getvalue(), float(width), float(height), applied
+    return out.getvalue(), float(width), float(height), applied, origin
 
 
 def render_png(data: bytes, page_no: int, bbox: list[float] | None, *, scale: float | None = None,
@@ -100,7 +114,15 @@ def render_png(data: bytes, page_no: int, bbox: list[float] | None, *, scale: fl
     return _render(data, page_no, bbox, scale, max_side)[0]
 
 
+def render_region(data: bytes, page_no: int, bbox: list[float] | None, *, scale: float | None = None,
+                  max_side: int = RENDER_MAX_SIDE) -> RenderedRegion:
+    """``render_png`` with the frame of the picture: the scale actually applied and the crop's origin in the
+    display frame, so a box found in the picture (an OCR word) can be placed on the page (``app.chat.tools.inspect``)."""
+    png, width, height, applied, origin = _render(data, page_no, bbox, scale, max_side)
+    return RenderedRegion(png, width, height, applied, origin)
+
+
 def render_page(data: bytes, page_no: int, *, scale: float, max_side: int) -> RenderedPage:
     """One whole page at ``scale`` (capped at ``max_side`` pixels), with its display size and the scale applied."""
-    png, width, height, applied = _render(data, page_no, None, scale, max_side)
+    png, width, height, applied, _ = _render(data, page_no, None, scale, max_side)
     return RenderedPage(png, width, height, applied)

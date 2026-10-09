@@ -4,7 +4,11 @@ R8, R10, R11).
 A tool that returns a passage (``S#``), takes a value (``V#``) or lists a stored measurement (``M#``) records a
 *stub* in ``Workspace.anchors``: the document, version and reading it read, the block range, and — when known — the
 word span inside a block (``segments``: ``[block, start, end]`` character ranges of the block's text) or the table
-cell (``table_index``, ``row``, ``column``, 0-based into ``extracted_tables.structure.rows``). A stub holds only what
+cell (``table_index``, ``row``, ``column``, 0-based into ``extracted_tables.structure.rows``). A cell of a table read
+by ``inspect`` has no ``extracted_tables`` row: its stub carries the inspected region instead (``vision``: the region
+key, table, row and column of the stored reading, the table's context as transcribed, and ``cell_box``, the box of
+the OCR word that confirmed the number, mapped into the rendered page by ``page_box``; None when OCR did not confirm
+it in its place, KTD6). A stub holds only what
 the server read from stored data: never a position the model supplied, and never a place found by searching the
 document for the first occurrence of a number (a quote is located inside the cited block range only, ``locate_quote``).
 
@@ -35,7 +39,8 @@ original place after a reprocess replaced its blocks (R11):
      "truncated": bool}
 
 Precision rules: a cell is highlighted only with its stored cell box; otherwise the table (or picture) region is
-highlighted and labelled as table level (R6). A page whose positions cannot be converted into the rendered frame
+highlighted and labelled as table level (R6). A vision cell is highlighted at cell precision only with its
+``cell_box``; otherwise its inspected region, labelled table level, with the table's context (R19). A page whose positions cannot be converted into the rendered frame
 (``pages.geometry_issue``) or that stores none gives page precision. DOCX has no pages: structured precision with the
 section path, paragraph number or normalized cell, and the cited text (R9). A stub whose reading is not the turn's
 pinned one, or a version read again before the answer was stored, gives page precision with the pinned reading id and
@@ -630,6 +635,52 @@ def _cell(out: dict, stub: dict, reading: Reading) -> dict:
     return _table_region(out, stub, reading, ti, page_no, table, reason)
 
 
+def page_box(box, frame: dict) -> list[float] | None:
+    """An OCR word box of an inspected crop (pixels of the picture OCR read) in the rendered page's frame, in points:
+    divided by the OCR upscale and the render scale actually applied to the crop, then offset by the crop's origin
+    in the rendered frame (``display_box_of`` gave the crop, so the box is already in that frame and is never
+    converted again). None without a box (KTD6)."""
+    if not box:
+        return None
+    try:
+        per_point = float(frame["scale"]) * float(frame.get("upscale") or 1.0)
+        ox, oy = (float(v) for v in frame["origin"])
+        x0, y0, x1, y1 = (float(v) for v in box)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if per_point <= 0:
+        return None
+    return [round(ox + x0 / per_point, 2), round(oy + y0 / per_point, 2), round(ox + x1 / per_point, 2),
+            round(oy + y1 / per_point, 2)]
+
+
+def _vision_cell(out: dict, stub: dict, reading: Reading) -> dict:
+    """A cell of a table read by ``inspect`` (no ``extracted_tables`` row): cell precision with the box its confirming
+    OCR word gave (``vision.cell_box``, rendered-frame points); otherwise the inspected region, labelled table level,
+    or its page; always with the table's context as the transcription gave it (R17, R19)."""
+    v = stub["vision"]
+    page_no = v.get("page") or next(iter(stub.get("pages") or []), None)
+    notes = [n for n in v.get("notes") or [] if n]
+    table = {"table_index": None, "title": v.get("title"), "row_label": v.get("row_label"),
+             "row_number": v.get("row_number"), "column_header": v.get("column_header"),
+             "column_number": v.get("column_number"), "unit_note": v.get("unit_note"), "source": "vision",
+             "header": None,
+             "notes": [{"text": n} | ({"page": page_no} if page_no else {}) for n in notes[:MAX_NOTES]]}
+    block = reading.blocks.get(stub.get("block_start")) if stub.get("block_start") is not None else None
+    section = _section_of([block] if block else [], stub, reading)
+    page = reading.pages.get(page_no) if page_no else None
+    usable = page is not None and page.usable
+    rect = _frac(v["cell_box"], page) if v.get("cell_box") and usable else None
+    if rect is not None:
+        return _finish(out, reading, "cell", {page_no: {"rects": [rect]}}, table=table, section=section)
+    reason = NO_CELL_BOX if usable else NO_GEOMETRY
+    region = _block_rect(block, reading)
+    if region is not None and region[0] == page_no:
+        return _finish(out, reading, "region", {page_no: {"rects": [region[1]]}}, region="table", degraded=reason,
+                       table=table, section=section)
+    return _page_only(out, stub, reading, reason, [page_no] if page_no else None, table=table, section=section)
+
+
 def _refine_measurement(stub: dict, reading: Reading) -> dict:
     """A stored measurement's cell (the one cell of its row that holds its value) or word span (its quote, inside its
     own block), found in the stored reading; none when that is not unambiguous."""
@@ -718,6 +769,8 @@ def snapshot(stub: dict, reading: Reading | None, pinned: str | None, cited: str
         stub = _refine_measurement(stub, reading)
     if not reading.is_pdf:
         return _structured(out, stub, reading)
+    if stub.get("vision"):
+        return _vision_cell(out, stub, reading)
     ti = stub.get("table_index")
     if ti is not None and stub.get("row") is not None:
         return _cell(out, stub, reading)

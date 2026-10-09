@@ -38,19 +38,24 @@ Tools:
 - ``inspect``: a visual reading of a region (``R#``) or a page of a PDF that ingestion did not read (or read
   uncertainly without text): rendered at a legible scale and read once by the vision model, stored per version,
   reading and region (``region_readings``) for later turns, capped per turn (``chat_max_inspections``); a region or
-  page ingestion did read returns that reading without a model call;
+  page ingestion did read returns that reading without a model call. The stored reading keeps, per number and table
+  cell, whether OCR of the same crop (or the region's text layer) confirms it in its place, and the crop's frame;
+  each table it transcribed is a vision ``T#``, usable by ``take_value`` in the same turn (KTD6, R16);
 - ``find_measurements``: stored measurements with their meaning (kind, unit, period, area basis, VAT, role,
   subject), grouped by what can be compared, with the coverage of the documents in scope, paged; beside them the
   values verified in earlier turns from the current readings (``verified_values``, ``Q#``, KTD12);
 - ``take_value``: a value of a source the turn read, verified by the server — the cell at a named row and column
   of the table the source is (``extracted_tables.structure``), or a number inside an exact quote of the source —
   with its meaning; what the source attests about it is recorded as the source's, the rest as the model's (``V#``).
+  A cell of a table ``inspect`` read resolves through the stored region reading (a quoted row of it as its cell):
+  verified only when OCR of the crop or the region's text layer puts its number in its row and column, otherwise
+  uncertain with the reason; its anchor is the region and, when confirmed, the cell's box (KTD6, R17–R19).
   A value read clearly is cached per version, reading and locator with what its source attests only, and a ``Q#``
   is taken again with that turn's meaning checked against it;
 - ``assume``: a number the user gave for a scenario, quoted from the user's own message (``A#``);
 - ``calculate``: an expression over ``M#``/``V#``/``A#``/``C#`` (``app.chat.calc``): exact decimals, compatibility
   by operation, every result a ``C#`` with its formula, inputs, assumptions and sources that later calculations
-  may use.
+  may use; a result resting on an uncertain input is conditional and says why each input is uncertain (R18).
 """
 
 from __future__ import annotations
@@ -188,6 +193,10 @@ class Source:
     table_part: bool = False  # some rows of a table read in parts, not all of them
     method: str | None = None  # how its text was read when not from the text layer (``vision`` for an inspection)
     row_index: int | None = None  # a table-row search hit: the body row of its table (``structure.rows``) it is
+    # a visual reading by ``inspect`` (KTD6): {"region", "page", "reading": its ``PictureReading`` (tables and OCR
+    # evidence), "tables": the vision T# of each table}; its cells are taken through the reading, never through
+    # ``extracted_tables``
+    vision: dict | None = None
 
     @property
     def is_listing(self) -> bool:
@@ -1114,6 +1123,9 @@ def tool_read(ws: Workspace, target: dict) -> str:
             s = _read_window(ws, conn, v, ("section", str(v.version_id), tuple(data["path"])), None)
         elif kind == "table":
             data = _handle(ws, value, "T")
+            if data.get("vision"):  # read whole by inspect: nothing more to read, its cells are taken from its source
+                _bound(conn, ws, value, data)
+                raise ToolError(MSG_VISION_TABLE_READ.format(handle=value, sid=data["vision"]["source"]))
             s = _read_table(ws, conn, _bound(conn, ws, value, data), data["table_index"])
         else:
             data = _handle(ws, value, "K")
@@ -1416,7 +1428,7 @@ def _spot(ws: Workspace, conn: Connection, target: dict) -> tuple[_Spot, bool]:
 
 def inspect_config(vision) -> str:
     """The configuration component of an inspection's key (``region_readings.model_config``, KTD11): the vision
-    model and the OCR languages a visual reading's numbers are checked with (``_crop_ocr_words``)."""
+    model and the OCR languages a visual reading's numbers are checked with (``_crop_ocr``)."""
     from app.extraction import regions
 
     return regions.model_config(vision, get_settings().ocr_languages)
@@ -1436,9 +1448,17 @@ def _cached(conn: Connection, spot: _Spot, config: str):
     return PictureReading.from_json(row.reading)
 
 
+MSG_VISION_TABLE = ("טבלה {handle} (קריאה חזותית{which}): {rows} שורות. ערך מתא שלה נלקח ב-take_value מ-{sid} עם row "
+                    "ו-column{table}; הוא מאומת רק כש-OCR של אותו חיתוך רואה את המספר בשורה ובעמודה של התא, ואחרת "
+                    "הוא לא ודאי.")
+MSG_VISION_TABLE_READ = ("{handle} היא טבלה שנקראה במלואה בקריאה חזותית ב-{sid}: אין בה עוד מה לקרוא. ערך ממנה נלקח "
+                         "ב-take_value מ-{sid} (row ו-column).")
+
+
 def _visual(ws: Workspace, spot: _Spot, reading, earlier: bool) -> Source:
     """A visual reading as the turn's source: always ``uncertain_reading`` (a model's transcription, not the
-    document's own text), citable, at its page and region, with nothing more to read."""
+    document's own text), citable, at its page and region, with nothing more to read. Each table it transcribed is
+    a table source of its own (a vision ``T#``, KTD6): its cells are taken from this source, through the reading."""
     from app.extraction.vision import reading_text
 
     head = [f"מצב: {STATUS_LABELS['uncertain_reading']}; קריאה חזותית של {spot.what} (תמלול של מודל מתמונת העמוד, "
@@ -1448,24 +1468,73 @@ def _visual(ws: Workspace, spot: _Spot, reading, earlier: bool) -> Source:
     if reading.status == "no_text":
         head.append("אין בו טקסט קריא" + (f": {reading.note}" if reading.note else ""))
     where = f"עמוד {spot.page}, " + ("אזור בעמוד" if spot.bbox is not None else "העמוד כולו") + " (קריאה חזותית)"
-    return _inspected(ws, spot, ("inspect", str(spot.v.version_id), spot.region), text_=reading_text(reading),
-                      body=head, kind="image", status="uncertain_reading", method="vision", location=where)
+    text_ = reading_text(reading)
+    s = _inspected(ws, spot, ("inspect", str(spot.v.version_id), spot.region), text_=text_,
+                   body=head, kind="image", status="uncertain_reading", method="vision", location=where)
+    v = spot.v
+    handles = [ws.handle("T", ("vision", str(v.version_id), spot.region, i), document_id=str(v.document_id),
+                         version_id=str(v.version_id), reading_id=v.reading_id, table_index=None,
+                         vision={"region": spot.region, "table": i, "source": s.sid})
+               for i in range(len(reading.tables))]
+    s.vision = {"region": spot.region, "page": spot.page, "reading": reading, "tables": handles}
+    if handles:
+        s.tags["table"] = " ".join(handles)
+        many = len(handles) > 1
+        head += [MSG_VISION_TABLE.format(handle=h, which=f", טבלה {i + 1} מתוך {len(handles)}" if many else "",
+                                         rows=len(t.rows), sid=s.sid, table=f" ו-table={h}" if many else "")
+                 for i, (h, t) in enumerate(zip(handles, reading.tables, strict=True))]
+        s.body = "\n".join(head + [text_])
+    return s
 
 
-def _crop_ocr_words(png: bytes) -> list[str]:
-    """The confident OCR words of a rendered crop, which a visual reading's numbers are checked against (as at
-    ingestion); none when OCR is not available or fails."""
+def _crop_ocr(png: bytes) -> list[dict] | None:
+    """The confident OCR words of a rendered crop with their boxes (in the pixels of the picture OCR read: the crop
+    enlarged by ``images.ocr_upscale``), which a visual reading's numbers and table cells are checked against (as at
+    ingestion, KTD6); None when OCR is not available or fails."""
     import io
 
     from PIL import Image
 
-    from app.extraction.images import _confident, _ocr_words
+    from app.extraction import images
+    from app.extraction.ocr import ocr_available
 
+    languages = get_settings().ocr_languages
+    if not ocr_available(languages):
+        return None
     try:
-        words = _ocr_words(Image.open(io.BytesIO(png)).convert("L"), get_settings().ocr_languages)
+        words = images._ocr_words(Image.open(io.BytesIO(png)).convert("L"), languages)
     except Exception:  # noqa: BLE001 - no OCR check leaves the reading uncertain, never fails the tool
-        return []
-    return _confident(words or [])
+        return None
+    return images.confident_words(words) if words is not None else None
+
+
+def _layer_words(conn: Connection, version_id, page: int, crop: list[float] | None) -> list[tuple[str, list[float]]]:
+    """The region's own text layer: the stored words (``document_blocks.spans``, rendered frame) of the page whose
+    centre lies in the crop (the whole page without one), as (text, box in points)."""
+    from app.extraction.geometry import Span
+
+    out = []
+    for r in conn.execute(text("SELECT text, spans FROM document_blocks WHERE version_id = :v AND page = :p"
+                               " AND spans IS NOT NULL"), {"v": version_id, "p": page}):
+        for raw in r.spans or []:
+            try:
+                sp = Span.from_json(raw)
+            except (TypeError, ValueError, IndexError):
+                continue
+            word = (r.text or "")[sp.start:sp.end].strip()
+            cx, cy = (sp.box[0] + sp.box[2]) / 2, (sp.box[1] + sp.box[3]) / 2
+            if word and (crop is None or (crop[0] <= cx <= crop[2] and crop[1] <= cy <= crop[3])):
+                out.append((word, list(sp.box)))
+    return out
+
+
+def _in_pixels(words: list[tuple[str, list[float]]], frame: dict) -> list[dict]:
+    """Text-layer words (rendered-frame points) in the pixels OCR's words are in, so both pass the same placement
+    test (``images.cell_evidence``)."""
+    per_point = frame["scale"] * frame["upscale"]
+    ox, oy = frame["origin"]
+    return [{"text": w, "conf": 100.0, "left": (b[0] - ox) * per_point, "top": (b[1] - oy) * per_point,
+             "width": (b[2] - b[0]) * per_point, "height": (b[3] - b[1]) * per_point} for w, b in words]
 
 
 def _vision_read(ws: Workspace, spot: _Spot):
@@ -1473,9 +1542,13 @@ def _vision_read(ws: Workspace, spot: _Spot):
     region, reader, model and OCR languages, or one new model call (capped per turn and cut to the turn's reading
     deadline, never a costlier model). Returns ``(reading, earlier)``, or the message saying why no reading was made (the cap or
     the time); a refusal (no cloud reading, a page that cannot be rendered, a failed call) is a ``ToolError``."""
+    import io
+
+    from PIL import Image
+
     from app.extraction import regions
-    from app.extraction.images import VISION_MAX_SIDE, VisionCallFailed
-    from app.extraction.render import RenderError, render_png
+    from app.extraction.images import VISION_MAX_SIDE, VisionCallFailed, ocr_upscale
+    from app.extraction.render import RenderError, render_region
     from app.extraction.vision import INSPECT_READER_VERSION, transcribe
     from app.platform.storage import get_storage
 
@@ -1502,18 +1575,26 @@ def _vision_read(ws: Workspace, spot: _Spot):
         # the stored box is in the text reader's frame; the crop is cut in the rendered page's frame (rotation,
         # CropBox offset), exactly as the region view cuts it
         crop = display_box_of(conn, spot.v.version_id, spot.page, spot.bbox) if spot.bbox else None
+        layer = _layer_words(conn, spot.v.version_id, spot.page, crop)
     # rendered and read outside any transaction: a model call never holds one open
     try:
-        png = render_png(get_storage().get(spot.v.storage_key), spot.page, crop,
-                         scale=regions.READ_DPI / 72, max_side=VISION_MAX_SIDE)
+        shot = render_region(get_storage().get(spot.v.storage_key), spot.page, crop,
+                             scale=regions.READ_DPI / 72, max_side=VISION_MAX_SIDE)
     except RenderError:
         raise ToolError(MSG_INSPECT_RENDER.format(what=spot.what)) from None
+    png = shot.png
+    # where a pixel of the crop is on the page: the crop is already in the rendered frame, so an OCR box found in it
+    # is mapped back with these alone (``anchors.page_box``), never through ``display_box_of`` again (KTD6)
+    frame = {"page": spot.page, "origin": [round(shot.origin[0], 4), round(shot.origin[1], 4)],
+             "scale": shot.scale, "upscale": ocr_upscale(Image.open(io.BytesIO(png)).size[0])}
     if hasattr(vision, "usage"):
         vision.usage = ws.usage
     try:
-        reading = transcribe(vision, png, deadline=ws.read_until, ocr_words=_crop_ocr_words(png))
+        reading = transcribe(vision, png, deadline=ws.read_until, evidence=True, ocr_boxes=_crop_ocr(png),
+                             layer_words=_in_pixels(layer, frame))
     except VisionCallFailed as exc:
         raise ToolError(MSG_INSPECT_FAILED.format(what=spot.what, status=exc.status)) from None
+    reading.ocr["frame"] = frame
     with tenant_tx(ws.ctx) as conn:
         v = reader.version(conn, spot.v.version_id)  # access may have changed while the model read
         if v is None:
@@ -1859,6 +1940,9 @@ def _table_of(ws: Workspace, src: Source, given) -> int:
     if given:
         g = str(given).strip()
         h = ws.handles.get(g)
+        if h is not None and h["kind"] == "T" and h.get("vision"):
+            raise ToolError(f"{g} היא טבלה שנקראה בקריאה חזותית: קח את התא מהמקור שבו היא נקראה "
+                            f"({h['vision']['source']})")
         if h is not None and h["kind"] == "T":
             if h["version_id"] != str(src.version_id):
                 raise ToolError(f"{g} היא טבלה של מסמך אחר מזה של {src.sid}")
@@ -1885,6 +1969,12 @@ def _take_cell(ws: Workspace, conn: Connection, src: Source, full: str, loc: dic
     st = reader.table_structure(conn, src.version_id, index)
     if st is None:
         raise ToolError("הטבלה לא נמצאה בקריאה הנוכחית של המסמך")
+    return _cell_of(src, full, loc, st, index)
+
+
+def _cell_of(src: Source, full: str, loc: dict, st: dict, index) -> dict:
+    """The cell a locator names in a table structure (``extracted_tables.structure``, or a visual reading's table in
+    the same shape), its number checked against the cell and the source's text, with what the table attests."""
     rows = [list(r.get("cells") or []) for r in st.get("rows") or []]
     headers = list(st.get("headers") or [])
     if not rows:
@@ -1979,6 +2069,110 @@ def _take_cell(ws: Workspace, conn: Connection, src: Source, full: str, loc: dic
             # the cell as stored (KTD1): its box is looked up when the answer is stored, never searched for
             "anchor": {"table_index": index, "row": ri, "column": ci,
                        "pages": [p] if (p := (st.get("rows") or [])[ri].get("page")) else []}}
+
+
+# --- a cell of a table read by inspect (KTD6, R16–R19) -----------------------------------------------------------------
+#
+# A table ``inspect`` transcribed is addressed through its source (and its vision ``T#``) and its cells resolve through
+# the stored region reading, never ``extracted_tables``. A cell's value is verified only with evidence beyond the
+# transcription: OCR of the same crop (or the region's text layer) sees its number once, inside the row band of its
+# row label and the column band of its header (``images.cell_evidence``). Otherwise it is uncertain, with the reason,
+# and a calculation using it is conditional. No focused re-read is spent on it: the only re-read of a region is its
+# stored reading, which cannot add evidence. Its anchor carries the region key and, when confirmed, the confirming
+# word's box mapped into the rendered page (``anchors.page_box``), never an ``extracted_tables`` index.
+
+MSG_VISION_CELL = {
+    "ocr": "המספר אומת מול OCR של אותו חיתוך: OCR ראה אותו פעם אחת, בשורה ובעמודה של התא.",
+    "text_layer": "המספר אומת מול שכבת הטקסט של האזור: הוא כתוב בה פעם אחת, בשורה ובעמודה של התא.",
+}
+MSG_VISION_UNCERTAIN = {
+    "not_seen": "OCR של אותו חיתוך לא ראה את המספר הזה: הוא תמלול של המודל בלבד, ולכן הערך לא ודאי.",
+    "repeated": "המספר מופיע בחיתוך יותר מפעם אחת, ולכן OCR אינו מראה שהוא בתא הזה: הערך לא ודאי.",
+    "not_placed": ("OCR ראה את המספר, אבל לא בשורה ובעמודה של התא (או שלא ניתן היה לאתר אותן בחיתוך): ייתכן שהתמלול "
+                   "שייך אותו לתא אחר, ולכן הערך לא ודאי."),
+    "no_ocr": "אין OCR של החיתוך שיאמת את התמלול: הערך לא ודאי.",
+}
+
+
+def _vision_table(ws: Workspace, src: Source, given) -> int:
+    """The table of a visual reading a cell locator names: the only one, or the vision T# given (of this reading)."""
+    handles = src.vision["tables"]
+    if given:
+        g = str(given).strip()
+        h = ws.handles.get(g)
+        if h is not None and h.get("vision") and h["version_id"] == str(src.version_id) \
+                and h["vision"]["region"] == src.vision["region"]:
+            return h["vision"]["table"]
+        if g != src.sid:
+            raise ToolError(f"{g} אינה טבלה של הקריאה החזותית ב-{src.sid}"
+                            + (f": הטבלאות בה {', '.join(handles)}" if handles else ""))
+    if not handles:
+        raise ToolError(f"בקריאה החזותית ב-{src.sid} אין טבלה: צטט (quote) את המשפט שבו המספר כתוב")
+    if len(handles) > 1:
+        raise ToolError(f"ב-{src.sid} יש {len(handles)} טבלאות: בחר אחת ב-table ({', '.join(handles)})")
+    return 0
+
+
+def _take_vision_cell(ws: Workspace, src: Source, full: str, loc: dict) -> dict:
+    """A cell of a table read by inspect, through its stored reading, with its OCR evidence (``evidence``: the
+    cell's ``images.cell_evidence`` entry, ``why``: the message for its status) and an anchor of the region and the
+    cell's box in the rendered page when OCR confirmed it in its place."""
+    from app.extraction.images import CELL_CONFIRMED, CELL_NO_OCR
+
+    vis = src.vision
+    reading = vis["reading"]
+    ti = _vision_table(ws, src, loc.get("table"))
+    t = reading.tables[ti]
+    st = {"headers": list(t.headers), "rows": [{"cells": list(r)} for r in t.rows], "title": list(t.title),
+          "notes": list(t.notes), "source": "vision"}
+    taken = _cell_of(src, full, loc, st, ti)
+    ri, ci = taken["anchor"]["row"], taken["anchor"]["column"]
+    ocr = reading.ocr or {}
+    cells = ocr.get("cells") or []
+    try:
+        evidence = cells[ti][ri][ci]
+    except (IndexError, TypeError):
+        evidence = None
+    evidence = evidence or {"status": CELL_NO_OCR, "box": None, "by": None}
+    confirmed = evidence["status"] == CELL_CONFIRMED
+    box = anchors.page_box(evidence.get("box"), ocr["frame"]) if confirmed and ocr.get("frame") else None
+    row_cells = t.rows[ri]
+    header = t.headers[ci] if ci < len(t.headers) else ""
+    unit_note = next((n for n in t.notes if meaning.units_attested(n)), None)
+    taken["locator"] = {"region": vis["region"], "vision_table": ti, "row": row_cells[0] if row_cells else "",
+                        "row_number": ri + 1, "column": header, "column_number": ci + 1}
+    taken["table"] = (str(src.version_id), f"{vis['region']}#{ti}")
+    taken["anchor"] = {"vision": {"region": vis["region"], "table": ti, "row": ri, "column": ci, "page": vis["page"],
+                                  "cell_box": box, "title": next((x for x in t.title if x), None),
+                                  "row_label": (row_cells[0] or None) if row_cells else None, "row_number": ri + 1,
+                                  "column_header": header or None, "column_number": ci + 1, "unit_note": unit_note,
+                                  "notes": list(t.notes[:3])},
+                       "pages": [vis["page"]] if vis["page"] else []}
+    taken["evidence"] = evidence
+    taken["why"] = (MSG_VISION_CELL.get(evidence.get("by") or "ocr", MSG_VISION_CELL["ocr"]) if confirmed
+                    else MSG_VISION_UNCERTAIN.get(evidence["status"], MSG_VISION_UNCERTAIN["no_ocr"]))
+    return taken
+
+
+def _vision_quote_cell(ws: Workspace, src: Source, loc: dict) -> dict | None:
+    """A quote of a visual reading that is (part of) one row of one of its tables and holds the number in one cell
+    of it: that cell's locator, so it is taken and checked as a cell. None otherwise (the quote is taken as a
+    quote)."""
+    wanted = _parse_number(loc.get("number") or "")
+    if wanted is None:
+        return None
+    quote = meaning._flat(loc["quote"])
+    hits = []
+    for ti, t in enumerate(src.vision["reading"].tables):
+        for ri, row in enumerate(t.rows):
+            if quote and quote in meaning._flat(" | ".join(row)):
+                cols = [ci for ci, c in enumerate(row)
+                        if any(n[3] == abs(wanted[1]) for n in _numbers_of(meaning._norm(c)))]
+                hits += [(ti, ri, ci) for ci in cols]
+    if len(hits) != 1:
+        return None
+    ti, ri, ci = hits[0]
+    return {"table": src.vision["tables"][ti], "row_number": ri + 1, "column_number": ci + 1, "number": loc["number"]}
 
 
 MSG_QUOTE_AMBIGUOUS = ("הציטוט מופיע ב-{sid} יותר מפעם אחת, ובמקומות שונים כתוב בו מספר אחר: צטט ציטוט ארוך יותר, "
@@ -2236,6 +2430,11 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
     if cell == ("quote" in loc):
         raise ToolError("locator: תא בטבלה (row או row_number, ו-column או column_number; אפשר גם table) או ציטוט "
                         "(quote ו-number) — אחד מהם בלבד")
+    vision = src.vision is not None
+    if vision and not cell:  # a quoted row of a table read by inspect is its cell, checked as one
+        resolved = _vision_quote_cell(ws, src, loc)
+        if resolved is not None:
+            loc, cell = resolved, True
     with tenant_tx(ws.ctx) as conn:
         v = reader.version(conn, src.version_id)
         if v is None:
@@ -2243,7 +2442,10 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
         if src.reading_id is not None and v.reading_id != src.reading_id:
             raise ToolError(MSG_STALE_REF.format(source_id=sid))
         rows: list = []
-        if cell:
+        if cell and vision:
+            taken = _take_vision_cell(ws, src, full, loc)
+            at = None
+        elif cell:
             taken = _take_cell(ws, conn, src, full, loc)
             block = reader.table_block(conn, src.version_id, taken["locator"]["table_index"])
             rows, at = ([block] if block is not None else []), None
@@ -2274,8 +2476,17 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
             key = _locator_key(src.version_id, reading_id, taken["locator"])
             reread = _reread_value(ws, v, unclear, taken["forms"], key)
     value = _new_value(ws, src, sid, taken, settled, given, label, path, reading_id)
+    note = reread[1] if reread is not None else None
     # how its own region was read, on the value itself, so coverage and the stored answer see it (R28)
-    if reread is not None and not reread[0]:
+    if "evidence" in taken:  # a cell of a table read by inspect: confirmed by OCR in its place, or uncertain (R18)
+        note = taken["why"]
+        if taken["evidence"]["status"] == "confirmed":
+            ws.settled_values.add(value.vid)
+            value.reading = "clear"
+        else:
+            ws.uncertain_values[value.vid] = note
+            value.reading, value.reading_note = "uncertain", note
+    elif reread is not None and not reread[0]:
         ws.uncertain_values[value.vid] = reread[1]
         value.reading, value.reading_note = "uncertain", reread[1]
     elif (reread is not None and reread[0]) or (
@@ -2300,7 +2511,7 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
     if known is None and _cacheable(ws, value, src, reread):
         span = (min(r.block_index for r in region), max(r.block_index for r in region)) if region else None
         _store_verified(ws, value, _cache_doc(value, taken, path, ws.anchors.get(value.vid), src, span))
-    return _value_report(ws, value, settled[3], reread[1] if reread is not None else None)
+    return _value_report(ws, value, settled[3], note)
 
 
 # --- verified values cached per reading (KTD12, R29) --------------------------------------------------------------
@@ -2681,7 +2892,11 @@ def tool_calculate(ws: Workspace, expression: str, label: str = "", justificatio
     justified = bool(out.conditional)  # conditional on the justification the mix needed
     uncertain = uncertain_inputs(ws, leaves)
     if uncertain:
-        out.conditional.append(MSG_UNCERTAIN_INPUTS.format(ids=", ".join(uncertain)))
+        # why each is uncertain, when the turn knows (an unclear region, a cell OCR did not confirm in its place)
+        why = [f"{i}: {r}" for i in uncertain
+               if (r := ws.uncertain_values.get(i) or (ws.values[i].reading_note if i in ws.values else ""))]
+        out.conditional.append(MSG_UNCERTAIN_INPUTS.format(ids=", ".join(uncertain))
+                               + (f" ({'; '.join(why)})" if why else ""))
     conditional = ("מותנה: " + "; ".join(out.conditional)
                    + (f" — לפי ההצדקה: {justification}" if justified else "")
                    if out.conditional else "")
@@ -2762,7 +2977,8 @@ TOOLS = [
         "שנמצא בשורה או בעמודה אחרת נדחה עם הסיבה; מה שהמקור מעיד על הערך נרשם כשל המקור, והשאר כקביעה שלך. ערך "
         "מאומת שמור (Q# מ-find_measurements) נרשם עם locator ריק (כל השדות null).",
         {"source": {"type": "string",
-                    "description": "S# מהתור הזה (טבלה שנקראה, שורת טבלה מחיפוש, או קטע), או Q# מ-find_measurements"},
+                    "description": ("S# מהתור הזה (טבלה שנקראה, גם טבלה בקריאה חזותית של inspect, שורת טבלה "
+                                    "מחיפוש, או קטע), או Q# מ-find_measurements")},
          "locator": {"type": "object", "additionalProperties": False,
                      "required": ["table", "row", "row_number", "column", "column_number", "quote", "number"],
                      "properties": {

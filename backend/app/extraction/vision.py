@@ -11,7 +11,8 @@ one (refusal, invalid or truncated output) apart. ``config`` (model and effort) 
 cached by. A PDF region is sent without context: its reading depends on its pixels alone.
 
 The answering model's ``inspect`` tool reads a region or a page through ``transcribe``: one call, no careful retry
-(the model may inspect again), the outcome as a ``PictureReading``. A reader given a ``usage`` list records each
+(the model may inspect again), the outcome as a ``PictureReading`` that keeps, per number and table cell, whether
+OCR of the same crop (or the region's text layer) confirms it in its place (KTD6, R18). A reader given a ``usage`` list records each
 call's cost record there instead, and the turn that made the call logs it with its own calls.
 """
 
@@ -32,6 +33,7 @@ from app.extraction.images import (
     VisionReader,
     VisionTableOut,
     _from_vision,
+    ocr_evidence,
 )
 from app.providers.llm import CallStatus, Purpose, get_provider, prompt_text, usage_entry
 
@@ -39,8 +41,10 @@ logger = logging.getLogger(__name__)
 
 # The reader of ``inspect``: its render scales (``app.chat.tools``), the frame its crop is cut in and this module's
 # prompt and checks. A stored reading made by an older one is not reused. v2: the crop is cut in the rendered page's
-# frame (rotation, CropBox offset) and the reading is checked against OCR of the crop.
-INSPECT_READER_VERSION = "inspect-v2"
+# frame (rotation, CropBox offset) and the reading is checked against OCR of the crop. v3 (KTD6): the reading keeps
+# what OCR of the crop and the region's text layer confirm of each number and cell, with the confirming word's box
+# and the crop's frame (``PictureReading.ocr``), so a cell of its tables can be verified and highlighted.
+INSPECT_READER_VERSION = "inspect-v3"
 
 VISION_INSTRUCTIONS = (
     "אתה מתמלל תמונות מתוך מסמכי שמאות מקרקעין בעברית. תמלל רק את מה שכתוב בתמונה, מילה במילה, בלי לפרש, "
@@ -134,15 +138,25 @@ class ModelVisionReader:
 
 
 def transcribe(reader: VisionReader, png: bytes, deadline: float | None = None,
-               ocr_words: list[str] | None = None) -> PictureReading:
+               ocr_words: list[str] | None = None, *, evidence: bool = False, ocr_boxes: list[dict] | None = None,
+               layer_words: list[dict] | None = None) -> PictureReading:
     """One reading of a rendered region or page, without context: ``read`` (with a transcription),
     ``read_uncertain`` or ``no_text``. Its numbers are checked against ``ocr_words`` (the confident OCR words of the
     same image) as at ingestion; without them nothing independent confirms the model's reading, so it is
-    ``read_uncertain``. A failed call raises ``VisionCallFailed``."""
+    ``read_uncertain``. A failed call raises ``VisionCallFailed``.
+
+    ``evidence`` (the ``inspect`` path, KTD6): ``ocr_boxes`` are those confident words with their boxes (None: no
+    OCR of the image) and ``layer_words`` the region's text-layer words in the same pixels; the reading then keeps
+    what they confirm of each number and table cell (``images.ocr_evidence``, ``PictureReading.ocr``)."""
     out = reader.read(png, "", deadline=deadline)
     if out is None:
         raise VisionCallFailed(CallStatus.UNSUPPORTED.value)
-    return _from_vision(out, ocr_words or [])
+    if ocr_words is None and ocr_boxes is not None:
+        ocr_words = [w["text"] for w in ocr_boxes]
+    reading = _from_vision(out, ocr_words or [])
+    if evidence:
+        reading.ocr = ocr_evidence(reading, ocr_boxes, layer_words)
+    return reading
 
 
 def reading_text(reading: PictureReading) -> str:

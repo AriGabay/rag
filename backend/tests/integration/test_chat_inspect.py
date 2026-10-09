@@ -5,13 +5,18 @@ that reading without a model call; an unread one is rendered and read once, stor
 region, and served from storage to a later turn without another call; permission is checked on every call, so a
 user outside the document's group gets "not available" even when a stored reading exists; the per-turn cap ends
 in a visible limitation; an office without cloud reading refuses with the reason; and a scripted turn cites the
-transcription. Synthetic documents only."""
+transcription. A table it reads becomes a vision table source whose stored reading keeps the OCR evidence of each
+cell and the crop's frame (U5, KTD6): a confirmed cell's box lands on the cell even on a rotated, CropBox-offset page;
+a reading of the previous reader is read again once; a user without access gets no cell value or crop. OCR of a crop
+is scripted at the OCR boundary (``images._ocr_words``), since the host's Tesseract has no Hebrew data. Synthetic
+documents only."""
 
 from __future__ import annotations
 
 import io
 import json
 import re
+from pathlib import Path
 
 import pytest
 from PIL import Image
@@ -337,9 +342,9 @@ def test_a_region_is_cropped_in_the_rendered_pages_frame_like_the_region_view(of
         converted.append(list(bbox))
         return [1.0, 2.0, 3.0, 4.0]
 
-    real = render.render_png
+    real = render.render_region
     monkeypatch.setattr(T, "display_box_of", display_box_of)
-    monkeypatch.setattr(render, "render_png", lambda data, page, bbox, **kw: cropped.append(bbox) or real(
+    monkeypatch.setattr(render, "render_region", lambda data, page, bbox, **kw: cropped.append(bbox) or real(
         data, page, None, **kw))
     T.tool_inspect(ws, {"region": region})
     assert converted and cropped == [[1.0, 2.0, 3.0, 4.0]]
@@ -363,3 +368,244 @@ def test_a_reading_stored_by_an_older_inspect_reader_is_read_again(office, monke
     later = emp(office)
     T.tool_inspect(later, {"region": region_of(later, doc)})
     assert len(office.vision.calls) == 2
+
+
+# --- a table read by inspect, usable in the same turn (U5, KTD6, R16–R19) ---------------------------------------------
+#
+# R7c's cost table is a picture no text layer holds. The vision model is scripted to transcribe it as the manifest
+# records it; OCR of the crop is scripted at the OCR boundary (``images._ocr_words``: the host's Tesseract has no
+# Hebrew data) as the table laid out on a grid over the crop actually rendered, in the pixels of the picture OCR reads.
+
+ROUND7 = Path(__file__).resolve().parents[1] / "fixtures" / "round7"
+COST = json.loads((ROUND7 / "manifest.json").read_text(encoding="utf-8"))["documents"]["cost_table_image"]
+PICTURE = COST["facts"]["picture"]
+COST_TOTAL = PICTURE["headers"][3]  # "עלות (₪)"
+CITATIONS = Path(__file__).resolve().parents[1] / "fixtures" / "citations"
+ROTATED = json.loads((CITATIONS / "manifest.json").read_text(encoding="utf-8"))["documents"]["rotated"]
+
+
+class CostTable:
+    """A vision reader that transcribes R7c's cost table as the manifest records it, or as ``rows`` when given (a
+    misreading), and counts its calls."""
+
+    config = "scripted-vision:low"
+
+    def __init__(self, rows: list[list[str]] | None = None) -> None:
+        self.calls = 0
+        self.usage = None
+        self.rows = [list(r) for r in (rows or PICTURE["rows"])]
+
+    def read(self, png: bytes, context: str, careful: bool = False, deadline: float | None = None) -> VisionOut:
+        self.calls += 1
+        return VisionOut("table", True, "", [VisionTableOut("", PICTURE["headers"], [list(r) for r in self.rows],
+                                                            [PICTURE["note"]])], "טבלת עלויות", [])
+
+
+def table_words(size: tuple[int, int], headers: list[str], rows: list[list[str]], *, drop=(), twice=()) -> list[dict]:
+    """OCR words of a table laid out on a grid over a crop of ``size`` pixels, in the pixels of the picture OCR reads
+    (the crop enlarged by ``images.ocr_upscale``): the header on the first line, each row on its own line, the
+    columns right to left, each cell's words right-aligned in its column. ``drop``: words OCR does not see;
+    ``twice``: numbers it also sees on a line under the table."""
+    from app.extraction.images import ocr_upscale
+
+    w, h = size
+    up = ocr_upscale(w)
+    pitch = h / (len(rows) + 3)
+    height, column = pitch * 0.4, w / len(headers)
+    char = height * 0.55
+    words: list[dict] = []
+
+    def place(cell: str, line: int, right: float) -> None:
+        for token in cell.split():
+            width = char * len(token)
+            if token not in drop:
+                words.append({"text": token, "conf": 95.0, "left": (right - width) * up,
+                              "top": pitch * (line + 0.5) * up, "width": width * up, "height": height * up})
+            right -= width + char * 0.5
+
+    for j, head in enumerate(headers):
+        place(head, 0, w - j * column - column * 0.05)
+    for i, row in enumerate(rows, 1):
+        for j, cell in enumerate(row):
+            place(cell, i, w - j * column - column * 0.05)
+    for k, number in enumerate(twice):
+        place(number, len(rows) + 1, column * (k + 1) - column * 0.05)
+    return words
+
+
+def script_ocr(monkeypatch, words_of) -> list:
+    """OCR of every crop is available and sees ``words_of(gray)``; returns the crops' sizes as OCR got them."""
+    sizes: list = []
+    monkeypatch.setattr("app.extraction.ocr.ocr_available", lambda languages: True)
+    monkeypatch.setattr("app.extraction.images._ocr_words",
+                        lambda gray, languages: sizes.append(gray.size) or words_of(gray))
+    return sizes
+
+
+def cost_ocr(monkeypatch, rows=None, **kw) -> list:
+    """OCR of the crop sees R7c's table as it is drawn (``rows``: as given instead)."""
+    return script_ocr(monkeypatch, lambda gray: table_words(gray.size, PICTURE["headers"], rows or PICTURE["rows"],
+                                                            **kw))
+
+
+def ingest_fixture(office, monkeypatch, path: Path, title: str) -> tuple[str, str]:
+    """A fixture ingested without OCR or vision (a picture stays an unread region), in the closed group."""
+    from app.platform import pipeline
+    from tests.integration.test_documents_api import ingest
+
+    monkeypatch.setattr("app.extraction.ocr.ocr_available", lambda languages: False)
+    monkeypatch.setattr(pipeline, "vision_reader", lambda ctx: None)
+    monkeypatch.setattr(pipeline, "run_measurements", lambda office_id, version_id: "skipped")
+    doc, ver = ingest(office, path, title)
+    with tenant_tx(office.ctx()) as conn:
+        conn.execute(text("UPDATE documents SET group_id = :g WHERE id = :d"), {"g": office.private, "d": doc})
+    return doc, ver
+
+
+def ingest_cost_table(office, monkeypatch) -> str:
+    return ingest_fixture(office, monkeypatch, ROUND7 / Path(COST["file"]).name, COST["title"])[0]
+
+
+def cost_meaning(**kw) -> dict:
+    return {"kind": "cost", "unit": "ILS", "period": "none", "vat": "unknown", "area_basis": "",
+            "subject": "פרויקט שדרות הדובדבן", "role": "component", "stated_by": "", "stance": "unknown",
+            "scenario": ""} | kw
+
+
+def take_cost(ws, sid: str, row: str, number: str | None = None) -> str:
+    return T.tool_take_value(ws, sid, {"row": row, "column": COST_TOTAL} | ({"number": number} if number else {}),
+                             cost_meaning(), row)
+
+
+def inspect_cost_table(office, ws, doc: str) -> str:
+    """The cost table's region inspected in ``ws``; the source id it was returned as."""
+    out = T.tool_inspect(ws, {"region": region_of(ws, doc)})
+    return tag(out, "id")
+
+
+def test_an_inspected_table_is_a_table_source_whose_reading_keeps_the_ocr_evidence_and_the_crops_frame(
+        office, monkeypatch):
+    from app.extraction.images import CELL_CONFIRMED, ocr_upscale
+    from app.extraction.vision import INSPECT_READER_VERSION
+
+    doc = ingest_cost_table(office, monkeypatch)
+    office.vision = CostTable()
+    sizes = cost_ocr(monkeypatch)
+    ws = emp(office)
+    region = region_of(ws, doc)
+    out = T.tool_inspect(ws, {"region": region})
+    s = ws.sources[tag(out, "id")]
+    handle = tag(out, "table")
+    assert handle and ws.handles[handle]["kind"] == "T" and ws.handles[handle]["vision"]["source"] == s.sid
+    assert handle in out and "take_value" in out
+    assert (s.status, s.method) == ("uncertain_reading", "vision")  # a transcription, until a cell is confirmed
+    with tenant_tx(office.system) as conn:
+        row = conn.execute(text("SELECT reader_version, reading FROM region_readings")).one()
+        box = conn.execute(text("SELECT bbox FROM document_blocks WHERE block_index = :b"),
+                           {"b": ws.handles[region]["block_index"]}).scalar_one()
+    assert row.reader_version == INSPECT_READER_VERSION == "inspect-v3"
+    ocr = row.reading["ocr"]
+    frame = ocr["frame"]
+    # an upright page: the rendered frame is the stored one; the crop starts 4 points before the region
+    assert frame["origin"] == pytest.approx([box[0] - 4, box[1] - 4], abs=0.01)
+    assert frame["scale"] == pytest.approx(300 / 72) and frame["upscale"] == ocr_upscale(sizes[0][0])
+    assert frame["page"] == 1
+    cells = ocr["cells"][0]
+    numeric = [(i, j) for i, r in enumerate(PICTURE["rows"]) for j, c in enumerate(r) if any(ch.isdigit() for ch in c)]
+    assert all(cells[i][j]["status"] == CELL_CONFIRMED for i, j in numeric)
+    assert {n["number"]: n["seen"] for n in ocr["numbers"]}["15600000"] == 1
+
+
+def test_a_reading_stored_by_inspect_v2_is_read_again_once_under_the_new_reader(office, monkeypatch):
+    doc = ingest_cost_table(office, monkeypatch)
+    office.vision = CostTable()
+    cost_ocr(monkeypatch)
+    inspect_cost_table(office, emp(office), doc)
+    with tenant_tx(office.system) as conn:  # a reading the previous reader stored, without the OCR evidence
+        conn.execute(text("UPDATE region_readings SET reader_version = 'inspect-v2', reading = reading - 'ocr'"))
+    for _ in range(2):
+        ws = emp(office)
+        sid = inspect_cost_table(office, ws, doc)
+        assert T.STATUS_AUTO in take_cost(ws, sid, "בנייה עילית")
+    assert office.vision.calls == 2  # read again once; the new reading then serves later turns
+    with tenant_tx(office.system) as conn:
+        versions = conn.execute(text("SELECT reader_version FROM region_readings ORDER BY 1")).scalars().all()
+    assert versions == ["inspect-v2", "inspect-v3"]  # the older reading is kept, not deleted
+
+
+def test_on_a_rotated_cropped_page_a_confirmed_cells_box_lands_on_the_cell_in_the_rendered_page(office, monkeypatch):
+    """C4's page is turned 90 degrees, with its MediaBox shifted and its CropBox inset: the stored box and the
+    rendered frame differ. The target sentence's block is made an unread region and read by inspect; OCR (scripted)
+    sees the cell's number over the left part of the ink the crop actually shows, so its box, mapped back with the
+    upscale, the render scale and the crop's origin, must lie on the sentence where the viewer draws it."""
+    from PIL import ImageOps
+
+    from app.chat import anchors
+    from app.extraction.images import ocr_upscale
+
+    target = ROTATED["places"]["target"]
+    doc, ver = ingest_fixture(office, monkeypatch, CITATIONS / Path(ROTATED["file"]).name, ROTATED["title"])
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_blocks SET status = 'unread', text = '', spans = NULL"
+                          " WHERE version_id = :v AND text LIKE '%איטונג%'"), {"v": ver})
+
+    class Floors:
+        config = "scripted-vision:low"
+        usage = None
+        calls = 0
+
+        def read(self, png, context, careful=False, deadline=None):
+            Floors.calls += 1
+            return VisionOut("table", True, "", [VisionTableOut("", ["פריט", "שטח (מ״ר)"], [["חניה", "35"]], [])],
+                             "טבלה", [])
+
+    def words(gray):
+        up = ocr_upscale(gray.size[0])
+        x0, y0, x1, y1 = ImageOps.invert(gray).point(lambda p: 255 if p > 96 else 0).getbbox()
+        w = x1 - x0
+
+        def word(text_, box):
+            return {"text": text_, "conf": 95.0, "left": box[0] * up, "top": box[1] * up,
+                    "width": (box[2] - box[0]) * up, "height": (box[3] - box[1]) * up}
+
+        top, bottom = 1, max(2, y0 - 3)  # the header: above the ink, in the crop's margin
+        return [word("35", (x0, y0, x0 + 0.4 * w, y1)), word("חניה", (x1 - 0.3 * w, y0, x1, y1)),
+                word("(מ״ר)", (x0, top, x0 + 0.15 * w, bottom)), word("שטח", (x0 + 0.155 * w, top, x0 + 0.4 * w, bottom))]
+
+    office.vision = Floors()
+    script_ocr(monkeypatch, words)
+    ws = emp(office)
+    sid = tag(T.tool_inspect(ws, {"region": region_of(ws, doc)}), "id")
+    out = T.tool_take_value(ws, sid, {"row": "חניה", "column": "שטח (מ״ר)"},
+                            cost_meaning(kind="area", unit="sqm", role="other"), "שטח החניה")
+    assert T.STATUS_AUTO in out, out
+    answer = {"values": [{"id": "V1"}]}
+    anchors.attach(ws, answer)
+    snap = answer["values"][0]["anchor"]
+    assert snap["precision"] == "cell", snap
+    (rect,) = snap["pages"][0]["rects"]
+    tol = 0.02
+    tb = target["box"]
+    assert tb[0] - tol <= rect[0] < rect[2] <= tb[2] + tol and tb[1] - tol <= rect[1] < rect[3] <= tb[3] + tol, (
+        rect, tb)
+    assert rect[2] - rect[0] == pytest.approx(0.4 * (tb[2] - tb[0]), abs=tol)  # the number's part of the ink
+
+
+def test_a_user_without_access_gets_no_cell_value_or_crop(client, office, monkeypatch):
+    doc = ingest_cost_table(office, monkeypatch)
+    office.vision = CostTable()
+    cost_ocr(monkeypatch)
+    ws = emp(office)
+    sid = inspect_cost_table(office, ws, doc)
+    s = ws.sources[sid]
+    with tenant_tx(office.ctx()) as conn:
+        conn.execute(text("DELETE FROM user_groups WHERE user_id = :u AND group_id = :g"),
+                     {"u": office.emp, "g": office.private})
+    with pytest.raises(T.ToolError) as e:
+        take_cost(ws, sid, "בנייה עילית")
+    assert "אינו זמין" in str(e.value) and ws.values == {}
+    login(client, "outsider@example.test")
+    r = client.get(f"/api/documents/{doc}/versions/{s.version_id}/regions/{s.block_start}/image",
+                   params={"reading_id": s.reading_id})
+    assert r.status_code == 404
+    assert office.vision.calls == 1

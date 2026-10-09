@@ -342,14 +342,14 @@ class ScriptedTable:
 
 
 @pytest.mark.db
-@pytest.mark.xfail(strict=True, reason="round 7 F5: an inspected table is registered as an image source with no "
-                                       "table index (tools._visual), so take_value refuses its cells (_table_of: "
-                                       "'S# אינו טבלה') and its rows as quotes (_take_quote); no value from it can "
-                                       "enter calculate in the turn")
 def test_f5_a_cell_of_a_table_read_by_inspect_is_taken_and_computed_in_the_same_turn(office, monkeypatch):
     doc = ingest_round7(office, monkeypatch, "cost_table_image")
     vision = ScriptedTable()
     monkeypatch.setattr(T, "inspect_reader", lambda ctx: vision)
+    # OCR of the crop sees the table as drawn, scripted at the OCR boundary (the host's Tesseract lacks Hebrew)
+    from tests.integration.test_chat_inspect import cost_ocr
+
+    cost_ocr(monkeypatch)
     ws = T.Workspace(ctx=office.ctx())
     ws.user_messages = [{"turn": 1, "text": "מה עלות הבנייה העילית והחניון יחד?", "current": True}]
     page = T.tool_read(ws, {"pages": {"document": doc, "from_page": 1, "to_page": 1}})
