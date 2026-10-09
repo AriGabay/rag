@@ -311,24 +311,63 @@ export interface ChatClaim {
  * supported, or none survived. Reported apart from completeness (R19). */
 export type ChatCorrectness = "verified" | "partial" | "unverified";
 
-/** How a requirement of the question was given in the verified answer. */
-export type ChatRequirementStatus = "full" | "partial" | "missing" | "undeterminable";
+/** How a component of the request was given in the shown answer (round 7): given in full or in part, not given,
+ * waiting on the user's clarification, or not relevant (an assumption nothing used). `missing` and `undeterminable`
+ * are the statuses of answers stored before round 7. */
+export type ChatComponentStatus = "full" | "partial" | "not_answered" | "needs_clarification" | "not_relevant";
+export type ChatRequirementStatus = ChatComponentStatus | "missing" | "undeterminable";
 
-/** A requirement not given in full, with the reason computed from what the turn found and did (R21). */
+/** Why a component was not given (the server's one reason vocabulary, `coverage.REASONS`; KTD4). */
+export type ChatGapReason =
+  | "not_located"
+  | "not_in_part_read"
+  | "region_not_read"
+  | "not_verifiable"
+  | "sources_conflict"
+  | "detail_missing"
+  | "calculation_incomplete"
+  | "tool_failure"
+  | "instruction_not_met"
+  | "removed";
+
+/** Why verification removed a claim (KTD5, R12). `not_checked`: it could not be checked, never that it was wrong. */
+export type ChatFailureKind =
+  | "absent_from_source"
+  | "wrong_subject"
+  | "wrong_unit"
+  | "uncertain_reading"
+  | "contradicts_source"
+  | "wrong_calculation"
+  | "invalid_citation"
+  | "not_checked";
+
+/** A requirement not given in full. Round 7 answers carry no reason text here: the reason is said once, in the
+ * answer's gap paragraph (KTD4). */
 export interface ChatCompletenessGap {
   id: string;
   text: string;
   status: Exclude<ChatRequirementStatus, "full">;
-  /** "not_found" | "uncertain" | "tool_failure" | "calculation_incomplete" | "insufficient" | "not_searched" */
+  /** A gap reason key (older answers: "not_found", "uncertain", …). */
   reason: string | null;
-  reason_text: string | null;
+  /** Answers stored before round 7 only. */
+  reason_text?: string | null;
+  parent?: string;
+  conditional?: boolean;
 }
 
 /** The answer's completeness against the requirements derived from the question (R18, R19). */
 export interface ChatCompleteness {
-  status: ChatRequirementStatus;
+  status: "full" | "partial" | "missing" | "undeterminable";
   requirements: number;
   missing: ChatCompletenessGap[];
+}
+
+/** One claim verification removed, on the normal path: its kind, its component and the server's fixed sentence for
+ * the kind — never the claim's text (that is diagnostics). */
+export interface ChatRemoval {
+  failure_kind: ChatFailureKind | string;
+  component: string | null;
+  text: string;
 }
 
 /** What verification did, in counts; what it removed, and why, is diagnostics (not on this path). */
@@ -343,6 +382,93 @@ export interface ChatVerification {
   correctness?: ChatCorrectness;
   /** Absent when no requirements were judged (and on older answers). */
   completeness?: ChatCompleteness;
+  /** One summary per removed claim, in the answer's order (absent on answers stored before round 7). */
+  removals?: ChatRemoval[];
+}
+
+/** A component of the request with its outcome in the shown answer (round 7 U3; `coverage.public_components`). */
+export interface ChatComponent {
+  id: string;
+  text: string;
+  kind: "information" | "calculation" | "instruction" | "assumption" | "clarification" | string;
+  aspect?: string;
+  /** The component it belongs to ("" for a top-level one). */
+  parent?: string;
+  conditional?: boolean;
+  subject?: string;
+  status: ChatRequirementStatus;
+  /** "undeterminable": the sources were found but do not settle it. */
+  evidence_state?: "undeterminable" | null;
+  /** Why it was not given: a gap reason key, null when it was given. */
+  limitation?: ChatGapReason | string | null;
+  limitation_text?: string | null;
+  /** The server states it in the answer's gap paragraph. */
+  stated?: boolean;
+  /** Its sentence in the gap paragraph (already in the answer's text: never shown again). */
+  gap?: string | null;
+  units?: number[];
+  removed_units?: number[];
+  /** The failure kinds of its removed claims. */
+  removal_kinds?: string[];
+  absence_units?: number[];
+  /** The workspace ids (S#, V#, M#, C#) the checks tied to it. */
+  related?: string[];
+  /** The section, table or pages read for it. */
+  place?: { sid?: string | null; scope?: string | null; name?: string | null } | null;
+  document?: string | null;
+  document_id?: string | null;
+  document_title?: string | null;
+  searched?: boolean | null;
+  claimed?: string | null;
+  /** The parameters missing, or the first claim without a citation. */
+  detail?: string | null;
+  /** For an instruction: checked by its citations or by the judge. */
+  check?: "citation" | "judge" | string;
+  /** For a citation instruction: the claims left without a source. */
+  uncited?: string[];
+}
+
+/** One group of the server's gap paragraph: a reason and the components it covers. `text` is the line already in
+ * the answer's markdown. */
+export interface ChatGap {
+  reason: ChatGapReason | string;
+  reason_text: string;
+  components: string[];
+  texts: string[];
+  text: string;
+}
+
+/** A source a removed claim was checked against, as the diagnostics route serves it: an answer-shaped record of its
+ * `type` (a passage, a value, a measurement, a calculation or an assumption) with its anchor. */
+export type ChatCheckedSource =
+  | (ChatSource & { type: "sources" })
+  | (ChatValue & { type: "values" })
+  | (ChatMeasurement & { type: "measurements" })
+  | (ChatComputation & { type: "computations" })
+  | (ChatAssumption & { type: "assumptions" });
+
+/** A removed claim's decision (diagnostics only): the draft text (never a fact), the factual reason and the sources
+ * it was checked against. */
+export interface ChatRemovalDecision {
+  text: string;
+  reason: string;
+  severity: string;
+  kind: string;
+  failure_kind: string | null;
+  check: string | null;
+  component: string | null;
+  checked_ids: string[];
+  repair_attempted: boolean;
+  sources?: ChatCheckedSource[];
+}
+
+/** GET /api/chat/messages/{id}/diagnostics: the owner's or an office admin's view of what verification removed. */
+export interface ChatDiagnostics {
+  message_id: string;
+  rounds: unknown;
+  removed: ChatRemovalDecision[];
+  resolution: unknown;
+  limits_hit: string[];
 }
 
 /** A requirement of the question with its status in the verified answer (the ledger's per-requirement detail). */
@@ -439,6 +565,10 @@ export interface ChatAnswer {
     /** Why a section claimed absent counts only as read in part: clipped, or with a region not read. */
     partial_reason?: "clipped" | "unread" | null;
   }[];
+  /** Each component of the request with its outcome (absent on answers stored before round 7). */
+  components?: ChatComponent[];
+  /** The groups of the gap paragraph the markdown ends with (absent on answers stored before round 7). */
+  gaps?: ChatGap[];
   steps?: number;
   hidden?: boolean;
 }

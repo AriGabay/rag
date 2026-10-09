@@ -1,13 +1,17 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type {
   ChatAnswer,
   ChatAssumption,
+  ChatCheckedSource,
+  ChatComponent,
   ChatComputation,
   ChatComputationInput,
   ChatLedger,
   ChatMessage,
+  ChatRemoval,
+  ChatRemovalDecision,
   ChatRequirement,
   ChatSource,
   ChatValue,
@@ -17,10 +21,15 @@ import type {
   ViewerNav,
   ViewerTarget,
 } from "@/lib/chatTypes";
+import { ApiError, chatApi, isAbortError } from "@/lib/api";
 import {
+  COMPONENT_KIND_LABEL,
+  COMPONENT_STATUS_LABEL,
   VALUE_STATUS,
   type ValueStatus,
   chatValueStatus,
+  failureKindText,
+  gapReasonText,
   measurementValueStatus,
   valueStatusText,
 } from "@/lib/format";
@@ -42,12 +51,6 @@ const RESULT_KIND: Record<string, string> = {
 };
 const VAT: Record<string, string> = { included: "כולל מע״מ", excluded: "ללא מע״מ", unknown: "מע״מ לא צוין", not_applicable: "" };
 const PERIOD: Record<string, string> = { month: "לחודש", year: "לשנה", one_time: "חד-פעמי", none: "", unknown: "תקופה לא צוינה" };
-const REQUIREMENT_STATUS: Record<string, string> = {
-  full: "ניתן במלואו",
-  partial: "ניתן בחלקו",
-  missing: "חסר",
-  undeterminable: "לא ניתן להכריע",
-};
 const COMPLETENESS_LEAD: Record<string, string> = {
   partial: "התשובה חלקית",
   missing: "התשובה אינה עונה על השאלה",
@@ -58,6 +61,9 @@ const CORRECTNESS_LINE: Record<string, string> = {
   unverified: "הטענות בתשובה לא אומתו מול המקורות; יש לבדוק במקור לפני שימוש.",
 };
 
+/** What a citation is looked up in: an answer, or the records the diagnostics route returned for a removal. */
+type CitedRecords = Pick<ChatAnswer, "sources" | "values" | "measurements">;
+
 // an answer's source is bound to the reading it was read from (null: an answer from before reading ids)
 function withReading(src: ChatSource): ChatSource {
   return { ...src, reading_id: src.reading_id ?? null };
@@ -65,7 +71,7 @@ function withReading(src: ChatSource): ChatSource {
 
 /** The source a citation opens: a passage itself, or the passage of the value or measurement it cites; null for a
  * calculation (C#) or an assumption (A#), which have no place in a document (`citedView` opens their own views). */
-export function citedSource(answer: ChatAnswer, id: string): ChatSource | null {
+export function citedSource(answer: CitedRecords, id: string): ChatSource | null {
   const direct = answer.sources.find((s) => s.id === id);
   if (direct) return withReading(direct);
   // a value opens the passage it was verified in
@@ -97,14 +103,14 @@ export function citedSource(answer: ChatAnswer, id: string): ChatSource | null {
 }
 
 /** A value's status (V#): checked automatically in its passage, uncertain, or unread (never a person's decision). */
-function valueStatusOf(answer: ChatAnswer, v: ChatValue): ValueStatus {
+function valueStatusOf(answer: CitedRecords, v: ChatValue): ValueStatus {
   const src = answer.sources.find((s) => s.id === v.source_id);
   return chatValueStatus(v.certainty, src?.status, v.reading);
 }
 
 /** What the source viewer opens for a citation: its passage (the text view) and its anchor (the page or structured
  * view), with a value's or measurement's status; null for an id with no place in a document (C#, A#). */
-export function citedTarget(answer: ChatAnswer, id: string): ViewerTarget | null {
+export function citedTarget(answer: CitedRecords, id: string): ViewerTarget | null {
   const source = citedSource(answer, id);
   if (!source) return null;
   const s = answer.sources.find((x) => x.id === id);
@@ -184,9 +190,12 @@ interface AssistantProps {
   onCite: (answer: ChatAnswer, id: string, message: ChatMessage) => void;
   onRetry: (message: ChatMessage) => void;
   onStop: (message: ChatMessage) => void;
+  /** Opens the source viewer at a place that is not one of the answer's citations (a removed claim's checked source,
+   * as the diagnostics route returned it). Without it those places are listed but not opened. */
+  onOpenSource?: (nav: ViewerNav) => void;
 }
 
-export function AssistantMessage({ message, isLast, onCite, onRetry, onStop }: AssistantProps) {
+export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onOpenSource }: AssistantProps) {
   const [copied, setCopied] = useState(false);
   const answer = message.answer;
   // a hidden answer keeps only its kind: it has no text or sources to cite
@@ -275,7 +284,7 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop }: A
       <div className="body" dir="rtl">
         <Markdown markdown={answer.markdown} citations={citations} onCite={cite} />
       </div>
-      {answer.verification && <AnswerQuality verification={answer.verification} />}
+      <AnswerQuality answer={answer} />
       <div className="msg-actions">
         <button type="button" className="icon-btn" onClick={copy} aria-label="העתקת התשובה" title="העתקה">
           {copied ? "✓" : "⧉"}
@@ -288,22 +297,72 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop }: A
         {answer.status === "partial" && <span className="note">תשובה חלקית</span>}
         {answer.status === "not_found" && <span className="note">לא נמצא במקורות</span>}
       </div>
-      <AnswerDetails answer={answer} citations={citations} onCite={cite} />
+      <AnswerDetails
+        answer={answer}
+        messageId={message.id}
+        citations={citations}
+        onCite={cite}
+        onOpenSource={onOpenSource}
+      />
     </div>
   );
 }
 
-/** Claim correctness and answer completeness, apart (R19): nothing for a complete answer whose claims all held;
- * otherwise one short line for each that falls short. Answers stored before either was reported show nothing new. */
-function AnswerQuality({ verification }: { verification: ChatVerification }) {
-  const completeness = verification.completeness;
-  const correctness = verification.correctness;
-  const incomplete = completeness && completeness.status !== "full";
-  const doubtful = correctness && correctness !== "verified";
-  if (!incomplete && !doubtful) return null;
+/** An answer stored with round 7's component outcomes: its markdown ends with the server's gap paragraph (KTD4). */
+function hasComponents(answer: ChatAnswer): boolean {
+  return answer.components !== undefined || answer.gaps !== undefined;
+}
+
+/** The most frequent failure kind of the removals (the first one on a tie). */
+function dominantKind(removals: ChatRemoval[]): string {
+  const counts = new Map<string, number>();
+  for (const r of removals) counts.set(r.failure_kind, (counts.get(r.failure_kind) ?? 0) + 1);
+  let best = removals[0]?.failure_kind ?? "";
+  for (const [kind, n] of counts) if (n > (counts.get(best) ?? 0)) best = kind;
+  return best;
+}
+
+/** The detail a clarification waits for: the components needing it, else what the answer says is missing. */
+function pendingDetail(answer: ChatAnswer): string {
+  const waiting = (answer.components ?? []).filter((c) => c.status === "needs_clarification").map((c) => c.text);
+  return waiting.length ? waiting.join("; ") : (answer.missing ?? "").trim();
+}
+
+/** Above the collapsed details: claim correctness and answer completeness, apart (R19); nothing for a complete answer
+ * whose claims all held. A round-7 answer's gap paragraph is the one gap summary (KTD4), so its completeness line
+ * shows the status only; one short notice says how many claims verification removed and mostly why (no draft text);
+ * a clarification shows what it waits for instead of the partial-answer wording. Answers stored before any of these
+ * show what they showed. */
+function AnswerQuality({ answer }: { answer: ChatAnswer }) {
+  const verification = answer.verification;
+  const clarification = answer.status === "clarification";
+  const completeness = verification?.completeness;
+  const correctness = verification?.correctness;
+  const removals = verification?.removals ?? [];
+  const incomplete = !clarification && completeness && completeness.status !== "full";
+  // claims only removed (none partly supported): the removal notice says it, with its kind, instead of the
+  // generic correctness line
+  const onlyRemoved = correctness === "partial" && removals.length > 0 && !verification?.partial;
+  const doubtful = correctness && correctness !== "verified" && !onlyRemoved;
+  if (!clarification && !incomplete && !doubtful && removals.length === 0) return null;
+  const structured = hasComponents(answer);
+  const pending = clarification ? pendingDetail(answer) : "";
   return (
     <div className="answer-quality">
-      {incomplete && (
+      {clarification && (
+        <p className="clarification-line" data-testid="clarification-lead">
+          <strong>נדרשת הבהרה{pending ? ":" : ""}</strong> {pending && <bdi>{pending}</bdi>}
+          {pending ? ". " : " "}
+          אפשר להשיב בתיבת ההודעה, והמשימה תמשיך עם מה שכבר נמצא.
+        </p>
+      )}
+      {incomplete && structured && (
+        <p className="completeness-line" data-testid="completeness" data-status={completeness.status}>
+          <strong>{COMPLETENESS_LEAD[completeness.status] ?? "התשובה חלקית"}.</strong> הפירוט לפי רכיבי הבקשה
+          בפרטים שמתחת לתשובה.
+        </p>
+      )}
+      {incomplete && !structured && (
         <p className="completeness-line" data-testid="completeness" data-status={completeness.status}>
           <strong>{COMPLETENESS_LEAD[completeness.status] ?? "התשובה חלקית"}:</strong>{" "}
           {completeness.missing.map((m, i) => (
@@ -316,6 +375,11 @@ function AnswerQuality({ verification }: { verification: ChatVerification }) {
           ))}
         </p>
       )}
+      {removals.length > 0 && (
+        <p className="removal-line" data-testid="removal-notice" data-kind={dominantKind(removals)}>
+          {removalNotice(removals)}
+        </p>
+      )}
       {doubtful && (
         <p className="correctness-line" data-testid="correctness" data-status={correctness}>
           {CORRECTNESS_LINE[correctness]}
@@ -325,14 +389,26 @@ function AnswerQuality({ verification }: { verification: ChatVerification }) {
   );
 }
 
+/** "Verification removed 2 claims; mostly: …" — the count and the dominant kind's label, never a claim's words. */
+function removalNotice(removals: ChatRemoval[]): string {
+  const kind = failureKindText(dominantKind(removals));
+  const mixed = new Set(removals.map((r) => r.failure_kind)).size > 1;
+  const head = removals.length === 1 ? "האימות הסיר טענה אחת" : `האימות הסיר ${removals.length} טענות`;
+  return `${head}; ${mixed ? "הסיבה העיקרית" : "הסיבה"}: ${kind}. הפירוט בפרטים שמתחת לתשובה.`;
+}
+
 function AnswerDetails({
   answer,
+  messageId,
   citations,
   onCite,
+  onOpenSource,
 }: {
   answer: ChatAnswer;
+  messageId: string;
   citations: Map<string, CitationTarget>;
   onCite: (id: string) => void;
+  onOpenSource?: (nav: ViewerNav) => void;
 }) {
   const ordered = [...citations.values()];
   const verification = answer.verification;
@@ -396,12 +472,29 @@ function AnswerDetails({
         <div className="details-section" data-testid="verification">
           <h4>אימות</h4>
           <ul>
-            {verification.removed > 0 && <li>הוסרו {verification.removed} טענות שלא נמצאה להן תמיכה במקורות.</li>}
+            {verification.removed > 0 && !verification.removals && (
+              <li>הוסרו {verification.removed} טענות שלא נמצאה להן תמיכה במקורות.</li>
+            )}
+            {verification.removals && verification.removals.length > 0 && (
+              <li>
+                {verification.removals.length === 1
+                  ? "האימות הסיר טענה אחת מהתשובה."
+                  : `האימות הסיר ${verification.removals.length} טענות מהתשובה.`}
+              </li>
+            )}
             {verification.partial > 0 && <li>{verification.partial} טענות אומתו חלקית (מסומנות בתשובה).</li>}
             {verification.annotated > 0 && (
               <li>ל-{verification.annotated} נתונים נוסף ליד המספר תיאור שנכתב במקור (מסומן «כפי שנכתב במקור»).</li>
             )}
           </ul>
+          {verification.removals && verification.removals.length > 0 && (
+            <RemovalsSection
+              removals={verification.removals}
+              components={answer.components ?? []}
+              messageId={messageId}
+              onOpenSource={onOpenSource}
+            />
+          )}
         </div>
       )}
       {verification && changed === 0 && (
@@ -410,8 +503,11 @@ function AnswerDetails({
           <p>{checkedText(verification)}</p>
         </div>
       )}
-      {answer.ledger?.requirements && answer.ledger.requirements.length > 0 && (
-        <RequirementsSection requirements={answer.ledger.requirements} />
+      {answer.components ? (
+        answer.components.length > 0 && <ComponentsSection answer={answer} components={answer.components} onCite={onCite} />
+      ) : (
+        answer.ledger?.requirements &&
+        answer.ledger.requirements.length > 0 && <RequirementsSection requirements={answer.ledger.requirements} />
       )}
       {answer.searches.length > 0 && (
         <div className="details-section">
@@ -451,12 +547,329 @@ function RequirementsSection({ requirements }: { requirements: ChatRequirement[]
         {requirements.map((r) => (
           <li key={r.id} data-testid="requirement" data-status={r.status}>
             <bdi>{r.text}</bdi>
-            {r.calculation && " (חישוב)"} — {REQUIREMENT_STATUS[r.status] ?? r.status}
+            {r.calculation && " (חישוב)"} — {COMPONENT_STATUS_LABEL[r.status] ?? r.status}
             {r.status !== "full" && r.limitation_text && <> · {r.limitation_text}</>}
             {r.status !== "full" && r.reason && <span className="muted"> · {r.reason}</span>}
           </li>
         ))}
       </ul>
+    </div>
+  );
+}
+
+/** The components of the request that were not given in full, each with its status, its reason (one label table,
+ * never the model's words), where it was looked for, and its claims: those verification removed and the citations
+ * tied to it. Components given in full are one count line; components not relevant to the answer are not shown.
+ * The gap paragraph itself is in the answer's text, so no gap sentence is repeated here (KTD4). */
+function ComponentsSection({
+  answer,
+  components,
+  onCite,
+}: {
+  answer: ChatAnswer;
+  components: ChatComponent[];
+  onCite: (id: string) => void;
+}) {
+  const byId = new Map(components.map((c) => [c.id, c]));
+  const parents = new Set(components.map((c) => c.parent).filter(Boolean));
+  const leaves = components.filter((c) => !parents.has(c.id) && c.status !== "not_relevant");
+  const unmet = leaves.filter((c) => c.status !== "full");
+  const full = leaves.length - unmet.length;
+  const removals = answer.verification?.removals ?? [];
+  if (leaves.length === 0) return null;
+  return (
+    <div className="details-section components" data-testid="components">
+      <h4>רכיבי הבקשה</h4>
+      {unmet.length > 0 && (
+        <ul>
+          {unmet.map((c) => {
+            const kinds = [
+              ...new Set([
+                ...removals.filter((r) => r.component === c.id).map((r) => r.failure_kind),
+                ...(c.removal_kinds ?? []),
+              ]),
+            ];
+            const reason = gapReasonText(c.limitation) || c.limitation_text || "";
+            const where = [c.document_title ?? c.document, c.place?.name].filter(Boolean).join(", ");
+            const parent = c.parent ? byId.get(c.parent) : undefined;
+            const cited = (c.related ?? []).filter((id) => citedView(answer, id) !== null);
+            const kind = COMPONENT_KIND_LABEL[c.kind] ?? "";
+            return (
+              <li key={c.id} data-testid="component" data-id={c.id} data-status={c.status}>
+                {parent && (
+                  <span className="muted">
+                    <bdi>{parent.text}</bdi> ›{" "}
+                  </span>
+                )}
+                <bdi>{c.text}</bdi>
+                {kind && ` (${kind})`}
+                {c.conditional && " (מותנה)"} — {COMPONENT_STATUS_LABEL[c.status] ?? c.status}
+                {reason && <> · {reason}</>}
+                {c.evidence_state === "undeterminable" && c.limitation !== "not_verifiable" && " · המקורות אינם מכריעים"}
+                {c.detail && (
+                  <span className="muted">
+                    {" "}
+                    · <bdi>{c.detail}</bdi>
+                  </span>
+                )}
+                {where && (
+                  <span className="muted">
+                    {" "}
+                    · נבדק ב: <bdi>{where}</bdi>
+                  </span>
+                )}
+                {c.uncited && c.uncited.length > 0 && (
+                  <span className="muted"> · {c.uncited.length} טענות בלי מקור</span>
+                )}
+                {(kinds.length > 0 || cited.length > 0) && (
+                  <ul className="component-claims">
+                    {kinds.map((k) => (
+                      <li key={k} data-testid="component-removal">
+                        טענה שהוסרה באימות: {failureKindText(k)}
+                      </li>
+                    ))}
+                    {cited.length > 0 && (
+                      <li>
+                        נתמך ב:{" "}
+                        {cited.map((id, i) => (
+                          <span key={id}>
+                            {i > 0 && " "}
+                            <button type="button" className="source-link" onClick={() => onCite(id)}>
+                              {id}
+                            </button>
+                          </span>
+                        ))}
+                      </li>
+                    )}
+                  </ul>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {full > 0 && (
+        <p data-testid="components-full">
+          ניתנו במלואם: {full} מתוך {leaves.length} רכיבים.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** Each claim verification removed: its kind and the server's fixed sentence; expanded, its draft and factual reason
+ * from the diagnostics route (`RemovalItem`). */
+function RemovalsSection({
+  removals,
+  components,
+  messageId,
+  onOpenSource,
+}: {
+  removals: ChatRemoval[];
+  components: ChatComponent[];
+  messageId: string;
+  onOpenSource?: (nav: ViewerNav) => void;
+}) {
+  const byId = new Map(components.map((c) => [c.id, c]));
+  return (
+    <ul className="removals" data-testid="removals">
+      {removals.map((r, i) => (
+        <RemovalItem
+          key={i}
+          removal={r}
+          index={i}
+          component={r.component ? byId.get(r.component) : undefined}
+          messageId={messageId}
+          onOpenSource={onOpenSource}
+        />
+      ))}
+    </ul>
+  );
+}
+
+type RemovalState =
+  | { phase: "idle" }
+  | { phase: "loading" }
+  | { phase: "error" }
+  /** The route answered 404 (a document behind the answer is no longer visible), or it has no matching decision. */
+  | { phase: "gone" }
+  | { phase: "ready"; decision: ChatRemovalDecision };
+
+/** One removed claim. Its draft text and reason are loaded from the diagnostics route on every expand and dropped on
+ * collapse: nothing is cached, so a draft is never shown once the route no longer serves it. While loading the kind
+ * stays visible; a failure offers a retry; a 404 leaves the kind only. */
+function RemovalItem({
+  removal,
+  index,
+  component,
+  messageId,
+  onOpenSource,
+}: {
+  removal: ChatRemoval;
+  index: number;
+  component: ChatComponent | undefined;
+  messageId: string;
+  onOpenSource?: (nav: ViewerNav) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [state, setState] = useState<RemovalState>({ phase: "idle" });
+  const ctrl = useRef<AbortController | null>(null);
+  const panelId = useId();
+  useEffect(() => () => ctrl.current?.abort(), []);
+
+  const load = () => {
+    ctrl.current?.abort();
+    const c = new AbortController();
+    ctrl.current = c;
+    setState({ phase: "loading" });
+    chatApi
+      .diagnostics(messageId, c.signal)
+      .then((d) => {
+        if (c.signal.aborted) return;
+        const item = Array.isArray(d.removed) ? d.removed[index] : undefined;
+        // the decisions come in the order of the summaries; one of another kind is not this claim's
+        const same = item && (item.failure_kind || "absent_from_source") === removal.failure_kind;
+        setState(same ? { phase: "ready", decision: item } : { phase: "gone" });
+      })
+      .catch((err: unknown) => {
+        if (c.signal.aborted || isAbortError(err)) return;
+        setState(err instanceof ApiError && err.status === 404 ? { phase: "gone" } : { phase: "error" });
+      });
+  };
+
+  const toggle = () => {
+    if (open) {
+      ctrl.current?.abort();
+      setOpen(false);
+      setState({ phase: "idle" });
+      return;
+    }
+    setOpen(true);
+    load();
+  };
+
+  return (
+    <li className="removal" data-testid="removal" data-kind={removal.failure_kind}>
+      <div>
+        <strong data-testid="removal-kind">{failureKindText(removal.failure_kind)}</strong>
+        {component && (
+          <span className="muted">
+            {" "}
+            · רכיב: <bdi>{component.text}</bdi>
+          </span>
+        )}
+      </div>
+      <div data-testid="removal-sentence">{removal.text}</div>
+      <button type="button" className="source-link" aria-expanded={open} aria-controls={panelId} onClick={toggle}>
+        {open ? "הסתרת פירוט הטענה" : "פירוט הטענה שהוסרה"}
+      </button>
+      {open && (
+        <div id={panelId} className="removal-detail" aria-busy={state.phase === "loading"}>
+          {state.phase === "loading" && (
+            <span className="removal-loading" role="status" data-testid="removal-loading">
+              <span className="dot-pulse" aria-hidden="true" /> טוען את פירוט הטענה…
+            </span>
+          )}
+          {state.phase === "error" && (
+            <p className="removal-error" role="alert" data-testid="removal-error">
+              טעינת הפירוט נכשלה.{" "}
+              <button type="button" className="source-link" onClick={load}>
+                ניסיון חוזר
+              </button>
+            </p>
+          )}
+          {state.phase === "gone" && (
+            <p className="muted" data-testid="removal-unavailable">
+              אין פירוט נוסף להצגה.
+            </p>
+          )}
+          {state.phase === "ready" && <RemovalDetail decision={state.decision} onOpenSource={onOpenSource} />}
+        </div>
+      )}
+    </li>
+  );
+}
+
+/** A checked source's line: what it is and where, from its own record. */
+function checkedLabel(s: ChatCheckedSource): string {
+  switch (s.type) {
+    case "sources":
+      return `${s.title} — ${s.location}`;
+    case "values":
+      return `${s.label}: ${s.value_text} — ${s.title}`;
+    case "measurements":
+      return `${s.metric}: ${s.value_text} — ${s.title}`;
+    case "computations":
+      return `חישוב ${s.id}${s.label ? `: ${s.label}` : ""}`;
+    case "assumptions":
+      return `הנחה שלך: ${s.label} = ${assumptionText(s)}`;
+  }
+}
+
+/** The removed claim's decision: the factual reason, the draft under its "unverified draft" label (never beside the
+ * verified answer as fact), and the sources it was checked against — a passage, value or measurement opening the
+ * viewer at its place, only as the route returned it. */
+function RemovalDetail({
+  decision,
+  onOpenSource,
+}: {
+  decision: ChatRemovalDecision;
+  onOpenSource?: (nav: ViewerNav) => void;
+}) {
+  const checked = (decision.sources ?? []).filter((s) => s && typeof s === "object" && typeof s.id === "string");
+  const records: CitedRecords = {
+    sources: checked.filter((s): s is ChatSource & { type: "sources" } => s.type === "sources"),
+    values: checked.filter((s): s is ChatValue & { type: "values" } => s.type === "values"),
+    measurements: checked.filter((s) => s.type === "measurements") as ChatAnswer["measurements"],
+  };
+  const openable = ["sources", "values", "measurements"];
+  const items: ViewerTarget[] = [];
+  const targetIndex = new Map<ChatCheckedSource, number>();
+  for (const s of checked) {
+    const t = openable.includes(s.type) ? citedTarget(records, s.id) : null;
+    if (t) {
+      targetIndex.set(s, items.length);
+      items.push(t);
+    }
+  }
+  return (
+    <div data-testid="removal-detail">
+      {decision.reason && (
+        <p data-testid="removal-reason">
+          <strong>סיבת ההסרה:</strong> <bdi>{decision.reason}</bdi>
+        </p>
+      )}
+      {decision.repair_attempted && <p className="muted">לפני ההסרה נוסה תיקון, והוא לא אומת.</p>}
+      <div className="removal-draft" data-testid="removal-draft">
+        <span className="removal-draft-label">טיוטה שלא אומתה</span>
+        <blockquote dir="auto">{decision.text}</blockquote>
+      </div>
+      {checked.length > 0 && (
+        <div className="removal-sources">
+          <span>נבדק מול:</span>
+          <ul>
+            {checked.map((s, i) => {
+              const at = targetIndex.get(s);
+              return (
+                <li key={`${s.type}-${s.id}-${i}`}>
+                  {at !== undefined && onOpenSource ? (
+                    <button
+                      type="button"
+                      className="source-link"
+                      data-testid="removal-source"
+                      onClick={() => onOpenSource({ items, index: at })}
+                    >
+                      {checkedLabel(s)}
+                    </button>
+                  ) : (
+                    <bdi>{checkedLabel(s)}</bdi>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
     </div>
   );
 }

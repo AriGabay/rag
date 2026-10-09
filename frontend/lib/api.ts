@@ -18,7 +18,7 @@ import type {
   SearchResult,
   UploadResult,
 } from "./types";
-import type { ChatConversation, ChatMessage, SourceBlocks } from "./chatTypes";
+import type { ChatConversation, ChatDiagnostics, ChatMessage, SourceBlocks } from "./chatTypes";
 // Facts review (U11)
 import type { FactDetail, FactReviewGroup, FactStatus } from "./types";
 
@@ -258,6 +258,10 @@ export const chatApi = {
     request<ChatMessage>(`/api/chat/messages/${encodeURIComponent(id)}`, { signal }),
   cancel: (id: string) => request<ChatMessage>(`/api/chat/messages/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
   retry: (id: string) => request<ChatMessage>(`/api/chat/messages/${encodeURIComponent(id)}/retry`, { method: "POST" }),
+  /** What verification removed from an answer, with each draft and its sources (owner or office admin; a 404 when
+   * any document behind it is no longer visible). Never cached: every call asks the server again. */
+  diagnostics: (id: string, signal?: AbortSignal) =>
+    request<ChatDiagnostics>(`/api/chat/messages/${encodeURIComponent(id)}/diagnostics`, { signal }),
   /** `readingId`: the reading a citation was made from ("none" for one from before readings had ids); a
    * reprocessed document then answers `stale` with no blocks. */
   blocks: (

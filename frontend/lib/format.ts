@@ -336,3 +336,60 @@ export function chatValueStatus(certainty: string | null | undefined, sourceStat
 export function valueStatusText(s: ValueStatus): string {
   return `${VALUE_STATUS[s].icon} ${VALUE_STATUS[s].label}`;
 }
+
+// --- gaps and removals in an answer (round 7 U8) ----------------------------------------------------------------
+
+/** One label table for what the answer UI says of a component's gap and of a removed claim: fixed Hebrew per key,
+ * never the model's words. The gap reasons match the server's (`coverage.REASONS`). A claim that could not be checked
+ * is said to be unchecked, never wrong. */
+export const GAP_REASON_LABEL: Record<string, string> = {
+  not_located: "לא אותר בחיפושים שבוצעו",
+  not_in_part_read: "לא מופיע בחלק שנקרא ונבדק",
+  region_not_read: "האזור הרלוונטי לא נקרא במלואו",
+  not_verifiable: "נמצא, אך לא ניתן לאמת או להכריע",
+  sources_conflict: "המקורות סותרים",
+  detail_missing: "חסר פרט בבקשה",
+  calculation_incomplete: "החישוב לא הושלם",
+  tool_failure: "תקלה בכלי או בשירות המודל",
+  instruction_not_met: "הוראה שלא קוימה",
+  removed: "הוסר באימות",
+};
+
+export const FAILURE_KIND_LABEL: Record<string, string> = {
+  absent_from_source: "המקורות שנבדקו אינם מציינים זאת",
+  wrong_subject: "שויך לנכס או לצד אחר מזה שבמקור",
+  wrong_unit: "יחידה, תקופה, בסיס שטח או מע״מ שאינם כבמקור",
+  uncertain_reading: "נשען על קריאה לא ודאית של המקור",
+  contradicts_source: "סותר את המקור",
+  wrong_calculation: "חישוב שגוי או על קלטים שגויים",
+  invalid_citation: "ציטט מקור שלא נבדק בתור הזה",
+  not_checked: "לא ניתן היה לבדוק מול המקורות",
+};
+
+/** A component's status in the shown answer (older answers: missing, undeterminable). */
+export const COMPONENT_STATUS_LABEL: Record<string, string> = {
+  full: "ניתן במלואו",
+  partial: "ניתן בחלקו",
+  not_answered: "לא ניתן",
+  needs_clarification: "ממתין להבהרה",
+  not_relevant: "לא רלוונטי",
+  missing: "חסר",
+  undeterminable: "לא ניתן להכריע",
+};
+
+export const COMPONENT_KIND_LABEL: Record<string, string> = {
+  information: "",
+  calculation: "חישוב",
+  instruction: "הוראה",
+  assumption: "הנחה",
+  clarification: "הבהרה",
+};
+
+export function gapReasonText(reason: string | null | undefined): string {
+  return reason ? GAP_REASON_LABEL[reason] ?? "" : "";
+}
+
+/** A failure kind's label; an unknown kind reads as removed in verification, never as a specific fault. */
+export function failureKindText(kind: string | null | undefined): string {
+  return (kind && FAILURE_KIND_LABEL[kind]) || "הוסרה באימות";
+}

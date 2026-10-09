@@ -469,6 +469,40 @@ test.describe("answer completeness and value statuses", () => {
     await page.request.delete(`/api/chat/conversations/${id}`);
   });
 
+  test("an answer with the server's gap paragraph shows the status only; details list each component's reason", async ({
+    page,
+  }) => {
+    // round 7 (KTD4): the gap paragraph in the answer is the one gap summary; the line under it never repeats it
+    const gap = "החישוב לא הושלם: השוואה לסף.";
+    const answer = answerWith(`השווי למ״ר 9,500 ₪ [S1].\n\n${gap}`, {
+      status: "partial",
+      verification: { judged: true, judge_status: "ok", removed: 0, partial: 0, annotated: 0, correctness: "verified",
+        removals: [], completeness: { status: "partial", requirements: 2, missing: [{ id: "N2", text: "השוואה לסף",
+          status: "not_answered", reason: "calculation_incomplete", parent: "", conditional: false }] } },
+      components: [
+        { id: "N1", text: "השווי למ״ר", kind: "information", status: "full", limitation: null, related: ["S1"] },
+        { id: "N2", text: "השוואה לסף", kind: "calculation", status: "not_answered", limitation: "calculation_incomplete",
+          limitation_text: "החישוב לא הושלם", stated: true, gap },
+      ],
+      gaps: [{ reason: "calculation_incomplete", reason_text: "החישוב לא הושלם", components: ["N2"],
+        texts: ["השוואה לסף"], text: gap }],
+    });
+    const { viewer, id } = await openViewer(page, answer);
+    await page.keyboard.press("Escape");
+    await expect(viewer).toHaveCount(0);
+    const reply = assistantMessages(page).last();
+    await expect(reply.locator(".body")).toContainText(gap);
+    await expect(reply.getByTestId("completeness")).toContainText("התשובה חלקית");
+    await expect(reply.getByTestId("completeness")).not.toContainText("השוואה לסף");
+    await expect(reply.getByTestId("completeness")).not.toContainText("החישוב לא הושלם");
+    await reply.getByText(/מקורות ופרטים/).click();
+    const n2 = reply.locator('[data-testid="component"][data-id="N2"]');
+    await expect(n2).toContainText("השוואה לסף");
+    await expect(n2).toContainText("החישוב לא הושלם");
+    await expect(reply.getByTestId("requirements")).toHaveCount(0);
+    await page.request.delete(`/api/chat/conversations/${id}`);
+  });
+
   test("a complete verified answer shows no indicator; values and measurements show their statuses", async ({
     page,
   }) => {

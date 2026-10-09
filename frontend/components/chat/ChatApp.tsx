@@ -501,6 +501,9 @@ export default function ChatApp() {
     [openFromThread],
   );
 
+  /** A place outside the answer's citations (a removed claim's checked source): the source viewer at it. */
+  const openNav = useCallback((nav: ViewerNav) => openFromThread({ kind: "source", nav }), [openFromThread]);
+
   /** Shows a user message an assumption quotes: the thread scrolls to it and it is marked for a moment. Where the
    * panels cover the conversation (a small screen), they close first. */
   const showMessage = useCallback(
@@ -693,6 +696,7 @@ export default function ChatApp() {
           sendErrors={active?.sendErrors ?? {}}
           onLoadOlder={() => activeId && void loadMessages(activeId, true)}
           onCite={openSource}
+          onOpenSource={openNav}
           onRetry={retry}
           onStop={stop}
           onResend={(m) => void send(m.content, m.client_id ?? undefined)}
@@ -924,6 +928,7 @@ function ThreadView({
   sendErrors,
   onLoadOlder,
   onCite,
+  onOpenSource,
   onRetry,
   onStop,
   onResend,
@@ -933,6 +938,7 @@ function ThreadView({
   sendErrors: Record<string, string>;
   onLoadOlder: () => void;
   onCite: (answer: ChatAnswer, id: string, message: ChatMessage) => void;
+  onOpenSource: (nav: ViewerNav) => void;
   onRetry: (m: ChatMessage) => void;
   onStop: (m: ChatMessage) => void;
   onResend: (m: ChatMessage) => void;
@@ -1006,6 +1012,7 @@ function ThreadView({
                 message={m}
                 isLast={i === messages.length - 1}
                 onCite={onCite}
+                onOpenSource={onOpenSource}
                 onRetry={onRetry}
                 onStop={onStop}
               />

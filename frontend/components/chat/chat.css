@@ -1073,6 +1073,70 @@ details.msg-details[open] {
   white-space: nowrap;
 }
 
+/* a clarification waits for the user: it is not a fault, so it reads as information, not a warning */
+.answer-quality p.clarification-line {
+  color: var(--chat-text);
+  background: var(--primary-soft);
+}
+
+/* --- gaps and removals inside the answer's details (round 7 U8) ---------------------------------------------- */
+
+.components .component-claims,
+.removals {
+  margin: 4px 0 0;
+  padding-inline-start: 18px;
+}
+
+.removal {
+  margin: 6px 0;
+  overflow-wrap: anywhere;
+}
+
+.removal-detail {
+  margin-top: 4px;
+}
+
+.removal-detail p {
+  margin: 4px 0;
+}
+
+.removal-loading {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.removal-error {
+  color: var(--warn);
+}
+
+/* an unverified draft: set apart from the verified answer, never styled as its text */
+.removal-draft {
+  margin: 6px 0;
+  padding: 6px 10px;
+  border: 1px dashed var(--chat-border);
+  border-radius: 8px;
+}
+
+.removal-draft-label {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--warn);
+}
+
+.removal-draft blockquote {
+  margin: 4px 0 0;
+  color: var(--chat-muted);
+  font-style: italic;
+  white-space: pre-wrap;
+}
+
+.removal-sources ul {
+  margin: 2px 0 0;
+  padding-inline-start: 18px;
+}
+
 .chat-scrim {
   display: none;
 }
