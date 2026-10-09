@@ -32,6 +32,12 @@ What the system actually read of a document, kept per block and summarised per d
 
 A document with any meaningful unread region is *partly read*. That state is shown on the documents screen and given to the assistant, and an answer never treats a partly read source, or a section it read only in part, as evidence that a datum is absent.
 
+### Display frame
+
+The coordinates of a page as it is shown to a reader: the visible part of the page, turned upright, measured from its top-left corner. It differs from the frame a PDF text reader reports positions in whenever the page is rotated or its visible area is cropped from the full sheet.
+
+Every highlight, crop or cited place shown to a person or a model is expressed in the display frame, converted from the stored page geometry. A position taken from the text reader and used without that conversion lands in the right place only on upright, uncropped pages, so a test on such a page cannot tell the two frames apart.
+
 ### Page furniture
 
 Content that repeats across a document's pages, such as a logo, a letterhead, a footer or a watermark, recognised by its content rather than its size and stored and read once for the whole document.
