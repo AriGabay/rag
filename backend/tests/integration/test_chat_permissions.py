@@ -357,6 +357,34 @@ def test_an_answer_stored_in_the_old_shape_shows_counts_only(client, setup, monk
     assert v["removed"] == 1 and "problems" not in v and "rounds" not in v
 
 
+def test_stored_removals_pass_only_a_known_kind_a_component_id_and_the_fixed_sentence(client, setup, monkeypatch):
+    """A stored removal list carrying drafts, reasons, unknown kinds, malformed component ids or non-dict entries
+    shows only the known kind, a well-formed N# id (else none) and the server's fixed sentence (KTD5, R13)."""
+    mid = _removed_claim_turn(client, setup, monkeypatch)
+    stored = {"judged": True, "judge_status": "ok", "removed": 3, "removals": [
+        {"failure_kind": "absent_from_source", "component": "N1", "text": f"טיוטה {MARKER}", "reason": "סוד 41"},
+        {"failure_kind": "bogus", "component": "N2", "text": "x"},
+        {"failure_kind": "wrong_unit", "component": "<script>", "reason": "סוד 41"},
+        {"failure_kind": "wrong_calculation", "component": 7},
+        "junk", None, ["absent_from_source"]]}
+    with tenant_tx(setup.system) as conn:
+        conn.execute(text("UPDATE messages SET answer = jsonb_set(answer, '{verification}', CAST(:v AS jsonb))"
+                          " WHERE id = :m"), {"v": json.dumps(stored, ensure_ascii=False), "m": mid})
+    login(client, "emp@example.test")
+    v = client.get(f"/api/chat/messages/{mid}").json()["answer"]["verification"]
+    assert v["removals"] == [
+        {"failure_kind": "absent_from_source", "component": "N1",
+         "text": verify.REMOVAL_SENTENCES["absent_from_source"]},
+        {"failure_kind": "wrong_unit", "component": None, "text": verify.REMOVAL_SENTENCES["wrong_unit"]},
+        {"failure_kind": "wrong_calculation", "component": None,
+         "text": verify.REMOVAL_SENTENCES["wrong_calculation"]}]
+    assert MARKER not in json.dumps(v, ensure_ascii=False) and "סוד 41" not in json.dumps(v, ensure_ascii=False)
+    # the same filter, called directly
+    assert chat_api.public_removals([{"failure_kind": "bogus"}, "junk", 3]) == []
+    assert chat_api.public_removals([{"failure_kind": "wrong_subject", "component": "N1.2", "reason": "r"}]) == [
+        {"failure_kind": "wrong_subject", "component": "N1.2", "text": verify.REMOVAL_SENTENCES["wrong_subject"]}]
+
+
 def test_a_rewritten_summary_with_its_old_record_is_not_used(client, setup, monkeypatch):
     cid, agent = _conversation(client, setup, monkeypatch, 4)
     # other code rewrites the text but leaves the record: the record no longer describes it

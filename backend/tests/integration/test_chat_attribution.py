@@ -437,3 +437,42 @@ def test_without_components_the_question_names_the_context_or_the_tools_ask_to_c
     assert "השאלה אינה נוקבת באחד מהנכסים האלה" in T.tool_outline(ws, r7b)
     ws.user_messages = [{"turn": 1, "text": f"מה השווי למ״ר של הנכס ב{SECOND_TITLE['street']}?", "current": True}]
     assert "הוא של הקשר 2" in T.tool_outline(ws, r7b)
+
+
+def test_on_a_turned_cropped_page_the_stored_reading_places_table_rows_by_their_rendered_position(office):
+    """The stored reading (``contexts.of_version``, ``reader.blocks_at``) brings each block's page geometry, so the
+    second appraisal's start (stored in pdfplumber's frame) is compared with the rows' cell boxes (stored on the
+    rendered page) in one frame, on a page turned by /Rotate 90 whose CropBox is offset."""
+    from app.chat import contexts, reader
+    from tests.unit.test_appraisal_context import SHIFT, TURNED, turned_two
+
+    doc, ver = make_document(office, office.default_group_id, "שתי שומות בעמוד מסובב (סינתטי)", sha="5" * 64)
+    blocks = turned_two(geometry=None)
+    rows = [{"page": 1, "cells": ["א"], "cell_boxes": [[40.0, 160.0, 90.0, 172.0]]},
+            {"page": 2, "cells": ["ב"], "cell_boxes": [[40.0, 60.0, 90.0, 72.0]]},
+            {"page": 2, "cells": ["ג"], "cell_boxes": [[40.0, 130.0, 90.0, 142.0]]},
+            {"page": 2, "cells": ["ד"], "cell_boxes": [[40.0, 300.0, 90.0, 312.0]]}]
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_versions SET page_count = 2, ingestion = CAST(:i AS jsonb) WHERE id = :v"),
+                     {"v": ver, "i": json.dumps({"reading_id": "reading-turned"})})
+        for page in (1, 2):
+            conn.execute(text(
+                "INSERT INTO pages (office_id, document_id, version_id, page_no, text, method, quality, ok, mediabox,"
+                " cropbox, rotation, display_width, display_height) VALUES (app_office(), :d, :v, :n, '',"
+                " 'text_layer', 1, true, CAST(:mb AS jsonb), CAST(:cb AS jsonb), :r, :w, :h)"),
+                {"d": doc, "v": ver, "n": page, "mb": json.dumps(TURNED["mediabox"]),
+                 "cb": json.dumps(TURNED["cropbox"]), "r": TURNED["rotation"], "w": TURNED["display_width"],
+                 "h": TURNED["display_height"]})
+        for b in blocks:
+            conn.execute(text(
+                "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
+                " section_path, page, bbox, text, status, table_index) VALUES (app_office(), :d, :v, :b, :k, NULL,"
+                " '{}', :p, CAST(:bb AS jsonb), :t, 'read', :ti)"),
+                {"d": doc, "v": ver, "b": b.block_index, "k": b.kind, "p": b.page, "bb": json.dumps(b.bbox),
+                 "t": b.text, "ti": b.table_index})
+        cx = contexts.of_version(conn, ver, "reading-turned")
+        assert cx.multi and cx.segments[1].start == (2, 260.0 - SHIFT)
+        groups = reader.table_contexts(cx, {"rows": rows}, 4, 1)
+        assert [(g["context"], g["first"], g["last"]) for g in groups] == [(1, 1, 2), (2, 3, 4)]
+        edge = reader.blocks_at(conn, ver, [6])[6]
+        assert contexts.top_of(edge) == 260.0 - SHIFT

@@ -1844,6 +1844,22 @@ def _only_calculation(ws: Workspace, item: dict, items: list[dict] | None = None
     return not others
 
 
+def _left_by_assumptions(ws: Workspace, item: dict, names: list[str], items: list[dict] | None) -> list[str]:
+    """The not-given parameters ``names`` of a component that the turn's user assumptions leave unfilled: those
+    named by an assumption's ``parameter`` are filled; then each assumption with no parameter link fills the next
+    one in order — except one whose number the user wrote for a parameter marked given (a frozen component's
+    parameter quote), which fills that given parameter instead."""
+    if not ws.assumptions:
+        return names
+    linked = {" ".join(a.parameter.split()) for a in ws.assumptions.values() if a.parameter}
+    left = [n for n in names if " ".join(n.split()) not in linked]
+    given = [p.get("quote") or "" for i in [item, *(items if items is not None else ws.requirement_items)]
+             for p in i.get("parameters") or [] if p.get("source") == "given_by_user"]
+    loose = [a for a in ws.assumptions.values()
+             if not a.parameter and not any(numbers_in(a.written) & numbers_in(q) for q in given)]
+    return left[len(loose):]
+
+
 def unfilled_parameters(ws: Workspace, item: dict, linked=None, items: list[dict] | None = None) -> list[str]:
     """The parameters of a calculation component the user did not give (KTD1) that the workspace fills with none of:
     a user assumption (``A#``); a value applied as a rate by one of the turn's calculations (``Computation.rates``: a
@@ -1852,11 +1868,16 @@ def unfilled_parameters(ws: Workspace, item: dict, linked=None, items: list[dict
     document data, or the report states the scenario). ``linked``: the component's computations (the ``C#`` the judge
     links to it); None — every ``C#`` of the turn when it is the only calculation component among ``items`` (default:
     the turn's frozen components), else none. The
-    detail the result waits for (round 7 KTD9, R25). None for any other component, or once the turn holds a filler."""
+    detail the result waits for (round 7 KTD9, R25). None for any other component, or once the turn holds a filler.
+    A user assumption fills one parameter, never every one: the parameter it records (``Assumption.parameter``, the
+    one a reply to a clarification was bound to), by name; one with no parameter link fills the next not-given
+    parameter in the component's order, unless its number is one the user gave for a parameter marked given
+    (``_left_by_assumptions``)."""
     if item.get("kind") != "calculation":
         return []
     names = [p.get("name") or "" for p in item.get("parameters") or [] if p.get("source") == "not_given_by_user"]
-    if not names or ws.assumptions:
+    names = _left_by_assumptions(ws, item, names, items)
+    if not names:
         return []
     # a rate a calculation applied is a registered id — a source's value, a user's assumption or a result built on
     # them: the calculator never applies a literal as one

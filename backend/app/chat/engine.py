@@ -44,9 +44,11 @@ asks one focused question. A calculation's product of a rounded document rate be
 reported by the calculator (``tools.tool_calculate``) and, when an answer rests on it, is a repairable
 ``input_choice`` problem; a scenario number nobody gave is a repairable ``assumption`` problem (``verify``). A
 clarification stores its pending parameter on the message (``TurnOutcome.pending``, ``_pending``); the next turn binds
-the reply to it before anything else (``resolve.bind_pending``), freezes the component with the parameter given by the
-user, and tells the model to register it with ``assume`` and to reopen the values already found through their
-``P#`` — no new search.
+the reply to it before anything else (``resolve.bind_pending``: the parameter the question asked, else the first
+still waiting), freezes the component with that parameter given by the user and the others still not given, and
+tells the model to register it with ``assume`` (the ``A#`` records the parameter it fills) and to reopen the values
+already found through their ``P#`` — no new search. When the follow-up's resolution call fails, only a reply of a
+number alone stays bound (``resolve.number_only_reply``).
 
 Every removal is a structured decision (round 7 U4, KTD5, KTD10): the repair prompt gives each problem's failure kind,
 the ids it was checked against and how a repair of that kind goes, within the same repair-round budget and
@@ -540,6 +542,10 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             raise TurnCancelled
         if request is not None and request.relation == "new_question":
             binding = None  # a new question is no reply to the clarification, whatever number it holds
+        elif request is None and binding is not None and not resolve.number_only_reply(inp.question):
+            # the resolution failed: only a reply of a number alone is surely the clarification's answer; a message
+            # with words around its number may be a new question, never forced into the old calculation
+            binding = None
         # the components came with the resolution; a failed resolution or an invalid component part leaves them to
         # the judge, and the rest of the resolution still stands
         if request is not None and request.components:
@@ -594,6 +600,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         else:
             turn.fall_back(analysis.status)
 
+    ws.binding = binding  # an ``assume`` of the bound number records the parameter it fills (KTD9)
     items: list = [{"role": "user", "content": _context_message(inp, request, binding)}]
     if request is None and not (inp.history or inp.focus):
         # a first turn: the request is analysed beside the first step (no added latency), within the reading time

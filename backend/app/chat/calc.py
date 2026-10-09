@@ -1125,13 +1125,18 @@ class Assumption:
     quote: str
     turn: int  # the user message it quotes, counted from the conversation's visible start (1 = first)
     current: bool  # quoted from this turn's message
+    # the calculation parameter it fills (round 7 KTD9): the pending parameter a reply to a clarification was bound
+    # to (``resolve.bind_pending``); None when nothing links it to one — it then fills one parameter, in the
+    # component's order (``verify.unfilled_parameters``)
+    parameter: str | None = None
 
     def operand(self) -> Operand:
         return operand(self.aid, self.value, self.unit, assumption=True)
 
     def public(self) -> dict:
         return {"id": self.aid, "value": str(self.value), "value_text": self.written, "unit": self.unit,
-                "label": self.label, "quote": self.quote, "turn": self.turn, "current": self.current}
+                "label": self.label, "quote": self.quote, "turn": self.turn, "current": self.current} | (
+            {"parameter": self.parameter} if self.parameter else {})
 
 
 @dataclass

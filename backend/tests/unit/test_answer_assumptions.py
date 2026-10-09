@@ -106,3 +106,30 @@ def test_a_resolutions_component_takes_the_reply_for_the_pending_parameter():
     assert c["parameters"] == [{"name": "שיעור העלייה של העלויות", "source": "given_by_user", "quote": "8%"},
                                {"name": "מועד", "source": "not_given_by_user", "quote": ""}]
     assert engine._with_binding(resolved, None) is resolved
+
+
+TWO_PENDING = dict(PENDING, parameters=["שיעור העלייה של העלויות", "תקופת העלייה"],
+                   question="מהי תקופת העלייה שלפיה לחשב?")
+
+
+def test_a_reply_is_bound_to_the_parameter_the_clarification_asked_about_and_the_others_stay_pending():
+    from app.chat import resolve
+
+    bound = resolve.bind_pending(TWO_PENDING, "3")
+    assert bound["parameter"] == "תקופת העלייה"
+    assert bound["component"]["parameters"] == [
+        {"name": "שיעור העלייה של העלויות", "source": "not_given_by_user", "quote": ""},
+        {"name": "תקופת העלייה", "source": "given_by_user", "quote": "3"}]
+    # a question that names both, or neither: the first parameter still waiting, in order
+    for question in ("באיזה שיעור ולאיזו תקופה?", "מהי תקופת העלייה ומהו שיעור העלייה של העלויות?"):
+        assert resolve.bind_pending(dict(TWO_PENDING, question=question), "8%")["parameter"] == \
+            "שיעור העלייה של העלויות"
+
+
+def test_only_a_short_reply_of_a_number_alone_is_a_number_only_reply():
+    from app.chat import resolve
+
+    for reply in ("8%", " 8 % ", "8 אחוז", "כ-8%", "1,500,000 ₪", "3.5.", "-2%"):
+        assert resolve.number_only_reply(reply), reply
+    for reply in ("מה השווי למ\"ר בקומה 3?", "נניח שהעלויות יעלו ב-8 אחוז", "דירה 4", "", "אחוז"):
+        assert not resolve.number_only_reply(reply), reply

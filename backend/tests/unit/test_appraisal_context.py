@@ -228,3 +228,55 @@ def test_without_numbered_headings_an_identifier_run_alone_never_splits():
             B(2, "paragraph", 1, "טקסט."),
             B(3, "paragraph", 2, "כתובת הנכס: רחוב הצפצפה 7\nגוש: 30874 חלקה: 9", 30), B(4, "heading", 2, "מבוא")]
     assert not contexts.derive(rows, "v").multi
+
+
+# --- a turned page with a CropBox offset: block tops and row tops in one frame ---------------------------------------
+# Stored block boxes are in pdfplumber's frame and a table's cell boxes in the frame of the rendered page; on a page
+# turned by /Rotate 90 whose CropBox is offset, the two differ by a translation (here 40 points across, 150 down), so
+# a segment's start is converted to the rendered frame before a row's top is compared with it.
+
+TURNED = {"mediabox": [0, 0, 612, 792], "cropbox": [150, 40, 600, 700], "rotation": 90, "display_width": 660.0,
+          "display_height": 450.0, "geometry_issue": None}
+SHIFT = 150.0  # the rendered frame's top is the pdfplumber frame's top less this, on a TURNED page
+
+
+def turned_two(geometry: dict | None = TURNED) -> list:
+    """Two synthetic appraisals: the first on page 1 and the top of page 2, the second opening mid-page 2 with a
+    heading that restates its address and parcel; ``top`` is in pdfplumber's frame, as ``document_blocks.bbox``."""
+    rows = [(1, "paragraph", "שומת מקרקעין — רחוב הדמומית 12, כפר הדמה\nגוש: 30871 חלקה: 15", 200.0),
+            (1, "heading", "1. מבוא", 230.0), (1, "paragraph", "שומה זו נערכה לבקשת הבעלים.", 250.0),
+            (1, "heading", "2. נתוני השוואה", 270.0), (1, "table", "עסקאות להשוואה", 290.0),
+            (2, "paragraph", "המשך טבלת העסקאות מהעמוד הקודם.", 170.0),
+            (2, "heading", "שומת מקרקעין — רחוב הצפצפה 7, גוש 30874 חלקה 9", 260.0),
+            (2, "heading", "1. מבוא", 330.0), (2, "paragraph", "שומה נוספת לנכס אחר.", 350.0),
+            (2, "heading", "2. תחשיב השווי", 380.0), (2, "paragraph", "השווי למ״ר שנקבע לנכס: 22,100 ₪.", 400.0)]
+    out = []
+    for i, (page, kind, t, top) in enumerate(rows):
+        b = B(i, kind, page, t, top, table_index=0 if kind == "table" else None)
+        for k, v in (geometry or {}).items():
+            setattr(b, k, v)
+        out.append(b)
+    return out
+
+
+def test_a_table_row_on_a_turned_cropped_page_lands_in_the_context_of_its_rendered_position():
+    from app.chat import reader
+
+    cx = contexts.derive(turned_two(), "v")
+    assert cx.multi and cx.numbers == [1, 2]
+    second = cx.segments[1]
+    assert second.first == 6 and second.start == (2, 260.0 - SHIFT)  # the heading's top on the rendered page
+    # the merged comparables table: one row on page 1, three on page 2 with their cells' boxes on the rendered page —
+    # above the second heading (rendered top 110), just below it, and further down
+    st = {"rows": [{"page": 1, "cells": ["א"], "cell_boxes": [[40.0, 160.0, 90.0, 172.0]]},
+                   {"page": 2, "cells": ["ב"], "cell_boxes": [[40.0, 60.0, 90.0, 72.0]]},
+                   {"page": 2, "cells": ["ג"], "cell_boxes": [[40.0, 130.0, 90.0, 142.0]]},
+                   {"page": 2, "cells": ["ד"], "cell_boxes": [[40.0, 300.0, 90.0, 312.0]]}]}
+    groups = reader.table_contexts(cx, st, 4, 1)
+    assert [(g["context"], g["first"], g["last"]) for g in groups] == [(1, 1, 2), (2, 3, 4)]
+
+
+def test_a_page_without_usable_geometry_keeps_its_stored_block_top():
+    for geometry in (None, dict(TURNED, geometry_issue="frame_mismatch"), dict(TURNED, rotation=None)):
+        cx = contexts.derive(turned_two(geometry), "v")
+        assert cx.segments[1].start == (2, 260.0), geometry

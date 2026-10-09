@@ -35,8 +35,9 @@ table is split by context at query time, never re-extracted.
 **Caching** (``of_version``): the result is cached per version and reading (a version read again is a new key), in
 process; the caller has already resolved the version under the user's permissions.
 
-**Enforcement** (``enforced``, the ``chat_appraisal_context_enforced`` setting, off until the contexts are counted
-per report on the office's regression reports by ``scripts/count_appraisal_contexts.py``): the subject
+**Enforcement** (``enforced``, the ``chat_appraisal_context_enforced`` setting, on by default — enabled once the
+contexts were counted per report on the regression reports by ``scripts/count_appraisal_contexts.py``: every
+single-appraisal report derives exactly one; set it false to show the labels without enforcing): the subject
 measurements a meaning check reads are restricted to the cited context (``meaning.Fetcher``), ``calculate``
 refuses to combine values of different contexts unless a frozen calculation component of the turn compares them
 (``calc.evaluate``), ``coverage.conflicting`` keys on the context, and verification removes a claim about the
@@ -57,6 +58,8 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from app.answering.entities import _BP_LABELED, _PREFIXES, STREET_LABELS, _canon, _street_regex, _strip_prefix
+from app.extraction.base import PageGeometry
+from app.extraction.geometry import geometry_box
 
 ADDRESS = "address"
 PARCEL = "block_parcel"
@@ -172,7 +175,8 @@ def identifiers(raw: str | None) -> Identity:
 class Segment:
     """A range of blocks of one context: ``number`` is the context's (1 for the file's own property), ``first`` and
     ``last`` its blocks, ``lead`` the block of its first heading (the blocks before it are its title part; None: it
-    has no heading), ``start`` the position it starts at (page, top) for a table row, and its pages."""
+    has no heading), ``start`` the position it starts at (page, top on the rendered page: ``top_of``) for a table
+    row, and its pages."""
 
     number: int
     identity: Identity
@@ -230,7 +234,8 @@ class Contexts:
         return s.number if s is not None else None
 
     def at_position(self, page: int | None, top: float | None) -> int | None:
-        """The context of a position (a table row's page and top): the last segment that starts at or before it."""
+        """The context of a position (a table row's page and top on the rendered page): the last segment that
+        starts at or before it."""
         if page is None:
             return None
         where = (page, top if top is not None else 0.0)
@@ -272,11 +277,27 @@ def _first_heading(rows: Sequence) -> int | None:
 
 
 def top_of(r) -> float:
+    """A block's top in the frame of the rendered page — the frame a table's cell boxes are stored in
+    (``reader.row_top``), so ``Contexts.at_position`` compares like with like. ``document_blocks.bbox`` keeps
+    pdfplumber's frame; with its page's stored geometry on the row (``mediabox``, ``cropbox``, ``rotation``,
+    ``display_width``, ``display_height``, ``geometry_issue``, as ``of_version`` reads them) the box is converted
+    as ``geometry.geometry_box`` does (a translation on a turned or cropped page); a page without usable geometry
+    keeps the stored top, as its rows keep no cell boxes."""
     bbox = getattr(r, "bbox", None)
     try:
-        return float(bbox[1]) if bbox else 0.0
-    except (TypeError, ValueError, IndexError):
+        box = [float(x) for x in bbox] if bbox else None
+    except (TypeError, ValueError):
         return 0.0
+    if not box or len(box) < 4:
+        return 0.0
+    if getattr(r, "mediabox", None) is not None:
+        geom = PageGeometry(r.mediabox, getattr(r, "cropbox", None), getattr(r, "rotation", None),
+                            getattr(r, "display_width", None), getattr(r, "display_height", None),
+                            getattr(r, "geometry_issue", None))
+        shown = geometry_box(box, geom)
+        if shown is not None:
+            return float(shown[1])
+    return box[1]
 
 
 def _candidates(rows: Sequence) -> list[tuple[int, Identity]]:
@@ -310,7 +331,8 @@ def _candidates(rows: Sequence) -> list[tuple[int, Identity]]:
 
 def derive(blocks: Iterable, version_id: str = "") -> Contexts:
     """The contexts of a version's blocks (``block_index``, ``kind``, ``page``, ``bbox``, ``text``, ``status``,
-    ``table_index``), in reading order (KTD7). Tables, pictures and blocks not read are never read for identifiers."""
+    ``table_index``, and optionally their page's geometry for ``top_of``), in reading order (KTD7). Tables, pictures
+    and blocks not read are never read for identifiers."""
     every = sorted(blocks, key=lambda r: r.block_index)
     if not every:
         return Contexts(version_id, (Segment(1, Identity(), 0, 0, None, None, None, None),))
@@ -375,7 +397,8 @@ _LOCK = threading.Lock()
 def of_version(conn: Connection, version_id: UUID | str, reading_id: str | None) -> Contexts:
     """The contexts of a version's reading, derived once per reading (the caller resolved the version under the
     user's permissions, in ``conn``). Only headings and blocks that may hold a labelled identifier bring their text,
-    never a table's or a picture's (``derive`` never reads those for identifiers)."""
+    never a table's or a picture's (``derive`` never reads those for identifiers). Each block comes with its page's
+    stored geometry, in the same query, so a segment's start is placed on the rendered page (``top_of``)."""
     key = (str(version_id), reading_id)
     with _LOCK:
         found = _CACHE.get(key)
@@ -383,10 +406,12 @@ def of_version(conn: Connection, version_id: UUID | str, reading_id: str | None)
             _CACHE.move_to_end(key)
             return found
     rows = conn.execute(text(
-        "SELECT block_index, kind, page, bbox, status, table_index,"
-        " CASE WHEN kind NOT IN ('table', 'image') AND table_index IS NULL AND (kind = 'heading' OR text ~ :pat)"
-        " THEN text END AS text"
-        " FROM document_blocks WHERE version_id = :v ORDER BY block_index"),
+        "SELECT b.block_index, b.kind, b.page, b.bbox, b.status, b.table_index,"
+        " CASE WHEN b.kind NOT IN ('table', 'image') AND b.table_index IS NULL AND (b.kind = 'heading' OR b.text ~ :pat)"
+        " THEN b.text END AS text,"
+        " p.mediabox, p.cropbox, p.rotation, p.display_width, p.display_height, p.geometry_issue"
+        " FROM document_blocks b LEFT JOIN pages p ON p.version_id = b.version_id AND p.page_no = b.page"
+        " WHERE b.version_id = :v ORDER BY b.block_index"),
         {"v": UUID(str(version_id)), "pat": _CANDIDATE_SQL}).all()
     found = derive(rows, str(version_id))
     with _LOCK:
@@ -397,8 +422,9 @@ def of_version(conn: Connection, version_id: UUID | str, reading_id: str | None)
 
 
 def enforced() -> bool:
-    """Whether the context checks are enforced (``chat_appraisal_context_enforced``): off until the contexts are
-    counted per report on the regression reports (KTD7, "measured before enforced")."""
+    """Whether the context checks are enforced (``chat_appraisal_context_enforced``, on by default since the contexts
+    were counted per report on the regression reports — KTD7, "measured before enforced"; false shows the labels
+    only)."""
     from app.config import get_settings
 
     return bool(getattr(get_settings(), "chat_appraisal_context_enforced", False))

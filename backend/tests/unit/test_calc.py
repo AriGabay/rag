@@ -527,6 +527,48 @@ def test_a_number_the_answer_assumes_for_a_pending_parameter_is_an_unrequested_a
     assert p.repairable and "שיעור העלייה של העלויות" in p.reason
 
 
+TWO_PARAMETERS = {"id": "N1", "text": "הרווח אם העלויות יעלו לאורך תקופה", "kind": "calculation",
+                  "parameters": [{"name": "שיעור העלייה של העלויות", "source": "not_given_by_user", "quote": ""},
+                                 {"name": "תקופת העלייה", "source": "not_given_by_user", "quote": ""}]}
+
+
+def _assume(ws, aid: str, written: str, quote: str, parameter: str | None = None) -> None:
+    ws.assumptions[aid] = calc.Assumption(aid, Decimal(written), written, "percent", "הנחת המשתמש", quote, 2, True,
+                                          parameter)
+
+
+def test_one_user_assumption_fills_one_parameter_never_every_missing_one():
+    """Round 7 KTD9: an A# fills the parameter it was registered for (by name, ``Assumption.parameter``); an A# with no
+    parameter link fills one parameter, in the component's order — never every not-given parameter of the turn."""
+    from app.chat.verify import pending_parameters, unfilled_parameters
+
+    ws = _workspace_with({"explicit_amount": None, "rates": []}, [TWO_PARAMETERS])
+    ws.computations.clear()
+    item = ws.requirements.items[0]
+    assert unfilled_parameters(ws, item) == ["שיעור העלייה של העלויות", "תקופת העלייה"]
+    # linked by name: the other parameter still waits, whichever of the two the user gave
+    _assume(ws, "A1", "8", "8%", parameter="תקופת העלייה")
+    assert unfilled_parameters(ws, item) == ["שיעור העלייה של העלויות"]
+    assert pending_parameters(ws) == {"N1": ["שיעור העלייה של העלויות"]}
+    ws.assumptions.clear()
+    # no link: one assumption counts as one parameter, in order
+    _assume(ws, "A1", "8", "8%")
+    assert unfilled_parameters(ws, item) == ["תקופת העלייה"]
+    _assume(ws, "A2", "3", "3 שנים")
+    assert unfilled_parameters(ws, item) == [] and pending_parameters(ws) == {}
+
+
+def test_an_assumption_for_a_parameter_the_user_gave_fills_no_missing_one():
+    from app.chat.verify import unfilled_parameters
+
+    given = dict(TWO_PARAMETERS, parameters=[{"name": "שיעור העלייה של העלויות", "source": "given_by_user",
+                                              "quote": "יעלו ב-8%"}, TWO_PARAMETERS["parameters"][1]])
+    ws = _workspace_with({"explicit_amount": None, "rates": []}, [given])
+    ws.computations.clear()
+    _assume(ws, "A1", "8", "יעלו ב-8%")  # the rate the user wrote: the period still waits
+    assert unfilled_parameters(ws, ws.requirements.items[0]) == ["תקופת העלייה"]
+
+
 def test_a_calculation_component_waiting_for_a_detail_nobody_gave_needs_clarification():
     from app.chat.verify import VerifyReport, requirement_item
 

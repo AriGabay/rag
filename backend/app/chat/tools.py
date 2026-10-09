@@ -354,6 +354,9 @@ class Workspace:
     # about, and the subjects a calculation component compares
     requirements: Any = None
     context_notes: set = field(default_factory=set)  # documents whose contexts a read or a search already listed
+    # the reply's binding to the pending parameter of the previous turn's clarification (``resolve.bind_pending``),
+    # set by the engine: an ``assume`` of the bound number from the current message records that parameter (KTD9)
+    binding: dict | None = None
     # read once per turn: (version id, table index) -> (its stored structure, the block it is read at) (``_table_at``);
     # (version id, reading id) -> every block's index, section path and status (``reader.section_blocks``), and each
     # table's first block with its rows' positions (``_table_rows``)
@@ -1938,8 +1941,10 @@ def _in_pixels(words: list[tuple[str, list[float]]], frame: dict) -> list[dict]:
 def _vision_read(ws: Workspace, spot: _Spot):
     """The visual reading of a spot through the inspect path: the stored reading of the same version, reading,
     region, reader, model and OCR languages, or one new model call (capped per turn and cut to the turn's reading
-    deadline, never a costlier model). Returns ``(reading, earlier)``, or the message saying why no reading was made (the cap or
-    the time); a refusal (no cloud reading, a page that cannot be rendered, a failed call) is a ``ToolError``."""
+    deadline, never a costlier model). A new reading is stored only when OCR of its crop ran (``_crop_ocr``): one
+    made without that evidence can never have its cells confirmed, so it serves this turn only and a later inspect
+    reads again. Returns ``(reading, earlier)``, or the message saying why no reading was made (the cap or the
+    time); a refusal (no cloud reading, a page that cannot be rendered, a failed call) is a ``ToolError``."""
     import io
 
     from PIL import Image
@@ -1987,8 +1992,9 @@ def _vision_read(ws: Workspace, spot: _Spot):
              "scale": shot.scale, "upscale": ocr_upscale(Image.open(io.BytesIO(png)).size[0])}
     if hasattr(vision, "usage"):
         vision.usage = ws.usage
+    ocr = _crop_ocr(png)
     try:
-        reading = transcribe(vision, png, deadline=ws.read_until, evidence=True, ocr_boxes=_crop_ocr(png),
+        reading = transcribe(vision, png, deadline=ws.read_until, evidence=True, ocr_boxes=ocr,
                              layer_words=_in_pixels(layer, frame))
     except VisionCallFailed as exc:
         raise ToolError(MSG_INSPECT_FAILED.format(what=spot.what, status=exc.status)) from None
@@ -1999,6 +2005,11 @@ def _vision_read(ws: Workspace, spot: _Spot):
             raise ToolError(MSG_UNAVAILABLE)
         if v.reading_id != spot.v.reading_id:
             raise ToolError(MSG_STALE_HANDLE.format(handle=spot.handle or spot.what))
+        if ocr is None:
+            # OCR of the crop was unavailable or failed: the reading has no evidence that could confirm its cells,
+            # so it is used in this turn only and never stored — a later inspect reads again, with OCR
+            _audit_view(ws, conn, v, spot.region)
+            return reading, False
         conn.execute(text(
             "INSERT INTO region_readings (office_id, document_id, version_id, reading_id, region, reader_version,"
             " model_config, page, bbox, status, reading, created_by) VALUES (app_office(), :d, :v, :r, :g, :rv, :m,"
@@ -3165,6 +3176,23 @@ def _take_cached(ws: Workspace, handle: str, data: dict, loc: dict, given: dict,
     return _value_report(ws, value, settled[3], MSG_CACHED_TAKEN.format(handle=handle), _context_lines(ws, cx, value))
 
 
+def _bound_parameter(ws: Workspace, number: Decimal, current: bool) -> str | None:
+    """The pending parameter an assumption fills (round 7 KTD9): the one the reply to a clarification was bound to
+    (``Workspace.binding``), when the assumption is the bound number quoted from the current message and no earlier
+    assumption of the turn already fills it; else None."""
+    b = ws.binding
+    if not b or not current:
+        return None
+    try:
+        bound = Decimal(str(b.get("value") or "").replace(",", ""))
+    except ArithmeticError:
+        return None
+    name = b.get("parameter") or None
+    if bound != number or any(a.parameter == name for a in ws.assumptions.values()):
+        return None
+    return name
+
+
 def tool_assume(ws: Workspace, value: str, quote: str, label: str = "") -> str:
     """Register a number the user gave for a scenario (A#): quoted from a user message visible to the turn — the
     current one or an earlier one, never an answer's or a document's text."""
@@ -3194,7 +3222,8 @@ def tool_assume(ws: Workspace, value: str, quote: str, label: str = "") -> str:
             "ILS" if re.match(r"\s*(?:₪|ש\"ח|שקל)", after) else
             "sqm" if re.match(r"\s*מ\"ר", after) else "ratio")
     a = calc.Assumption(f"A{len(ws.assumptions) + 1}", number if wanted[1] >= 0 else -number, written, unit,
-                        (label or "").strip() or "הנחת המשתמש", (quote or "").strip(), found["turn"], found["current"])
+                        (label or "").strip() or "הנחת המשתמש", (quote or "").strip(), found["turn"], found["current"],
+                        _bound_parameter(ws, number, found["current"]))
     ws.assumptions[a.aid] = a
     turn = "מההודעה הנוכחית" if a.current else "מהודעה קודמת"
     return (f"{a.aid} נרשם: «{_txt(a.label)}» = {written}{'%' if unit == 'percent' else ''} — הנחת המשתמש, מצוטטת "
@@ -3377,7 +3406,11 @@ def _near_misses(ws: Workspace, node, operands: dict[str, calc.Operand], justifi
     source and section state for the same quantity (the amount's line shares a word with the rate's quote or label,
     or with the calculation's label): within the product's range over the rate's rounding interval — a near-miss
     (``explicit_amount_available``); else, within a factor of two of it, an amount that differs (a material gap).
-    An amount the product reproduces at its precision, or an input's own number, is neither."""
+    An amount the product reproduces at its precision, or an input's own number, is neither. Amounts are compared
+    in units: the product as value × its scale, each stated amount as its number × the scale its source states it in
+    (``calc.stated_scale``: its own scale word, else a note of its line), so a cost of a table "(באלפי ₪)" times a
+    rate meets a profit stated in full ₪ in the prose; the record's ``value``, ``computed`` and ``range`` are in
+    units."""
     near = differs = None
     near_key = differs_key = None
     for product, rid in calc.rate_products(node):
@@ -3388,12 +3421,15 @@ def _near_misses(ws: Workspace, node, operands: dict[str, calc.Operand], justifi
         if interval is None:
             continue
         try:
-            exact = calc.evaluate(product, operands, justification).value
-            ends = [calc.evaluate(product, operands | {rid: replace(operands[rid], value=x)}, justification).value
+            out = calc.evaluate(product, operands, justification)
+            ends = [calc.evaluate(product, operands | {rid: replace(operands[rid], value=x)}, justification)
                     for x in interval]
         except calc.CalcError:
             continue
-        low, high = min(ends), max(ends)
+        # compared in units: the product is in its base's scale (a cost of a table "(באלפי ₪)" times a rate stays in
+        # thousands), and each stated amount in the scale its own source states (R14)
+        exact = out.value * out.scale
+        low, high = min(e.value * e.scale for e in ends), max(e.value * e.scale for e in ends)
         own = set()
         for i in _leaves(ws, calc.ids_of(product)):
             if i in ws.values:
@@ -3412,8 +3448,11 @@ def _near_misses(ws: Workspace, node, operands: dict[str, calc.Operand], justifi
                     continue
                 seen.add((written, line))
                 overlap = len(words & _content_words(line))
-                if not overlap or calc.display_matches(written, False, exact, ()):
+                stated = calc.stated_scale(full, start, end, line)
+                if not overlap or calc.display_matches(written, False, out.value, (), scale=stated,
+                                                       source_scale=out.scale):
                     continue
+                number *= stated
                 key = (overlap, src.sid == rate.source_id, -abs(number - exact))
                 record = _amount_record(src.sid, written, line, number, rate, interval, exact, low, high)
                 if low <= number <= high:

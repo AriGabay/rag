@@ -523,6 +523,56 @@ def test_ae7_cost_times_a_rounded_rate_reports_the_amount_the_section_states_and
     assert ws.computations["C1"].value == Decimal("3119500.00")
 
 
+THOUSANDS_CAPTION = "ריכוז עלויות הפרויקט (באלפי ₪)"
+COST_ROW = "סך עלויות הבנייה והפיתוח"
+
+
+def add_residual_in_thousands(office, sha: str = "7" * 64) -> str:
+    """R7d's calculation section with the cost total in a table stated in thousands ("(באלפי ₪)") and the rate, the
+    profit amount and the land value in the prose, in full ₪ — one source, two scales."""
+    section = CALC_SECTION
+    structure = {"headers": ["רכיב", "סכום"], "caption": THOUSANDS_CAPTION, "title": [], "notes": [],
+                 "section": section, "block_index": 1, "rows": [{"cells": [COST_ROW, "18,350"]}]}
+    prose = [FACTS[k]["text"] for k in ("profit_rate", "profit_amount", "land_value")]
+    blocks = [("heading", section, None), ("table", THOUSANDS_CAPTION, 0), *(("paragraph", t, None) for t in prose)]
+    doc, ver = make_document(office, office.default_group_id, "בדיקת כדאיות — רחוב התאנה 30 (סינתטי, אלפים)", sha=sha)
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_versions SET page_count = 1, ingestion = CAST(:i AS jsonb) WHERE id = :v"),
+                     {"v": ver, "i": json.dumps({"reading_id": "reading-r7-k"})})
+        for i, (kind, t, table) in enumerate(blocks):
+            conn.execute(text(
+                "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
+                " section_path, page, text, status, table_index) VALUES (app_office(), :d, :v, :b, :k, :s, :sp, 1,"
+                " :t, 'read', :ti)"),
+                {"d": doc, "v": ver, "b": i, "k": kind, "s": section, "sp": [section], "t": t, "ti": table})
+        conn.execute(text("INSERT INTO extracted_tables (office_id, document_id, version_id, table_index, page_start,"
+                          " page_end, structure) VALUES (app_office(), :d, :v, 0, 1, 1, CAST(:s AS jsonb))"),
+                     {"d": doc, "v": ver, "s": json.dumps(structure, ensure_ascii=False)})
+    return str(doc)
+
+
+def test_a_cost_in_thousands_times_a_rounded_rate_meets_the_profit_stated_in_full_shekels(office):
+    """The near-miss check compares amounts in units (R14, R23): a cost of 18,350 in a table "(באלפי ₪)" times "כ-17%"
+    is 3,119,500 ₪, and its rounding range (3,027,750–3,211,250 ₪) holds the profit the prose states as 3,210,000 ₪."""
+    doc = add_residual_in_thousands(office)
+    ws = workspace(office, question="מה הרווח היזמי בתחשיב?")
+    s = _section_source(ws, doc, CALC_SECTION)
+    table = T.tool_read(ws, {"table": handle_of(T.tool_outline(ws, doc), THOUSANDS_CAPTION)})
+    t = re.search(r'<source id="(S\d+)"', table).group(1)
+    assert run(ws, "take_value", **take(t, cell(COST_ROW, "סכום"), rmeaning("cost", role="cost"),
+                                        "סך העלויות")["arguments"]).startswith("V1")
+    assert ws.values["V1"].scale == 1000
+    assert run(ws, "take_value", **fact("profit_rate", s, rmeaning("rate", "percent", "rate"),
+                                        "שיעור הרווח היזמי")["arguments"]).startswith("V2")
+    out = json.loads(T.tool_calculate(ws, "V1 * V2%", "הרווח היזמי"))
+    near = out["explicit_amount_available"]
+    assert near is not None, out
+    assert near["amount"] == FACTS["profit_amount"]["value"] and near["source"] == s and near["rate"] == "V2"
+    assert Decimal(near["computed"]) == Decimal("3119500") and Decimal(near["value"]) == Decimal("3210000")
+    assert [Decimal(x) for x in near["range"]] == [Decimal("3027750"), Decimal("3211250")]
+    assert FACTS["land_value"]["value"] not in json.dumps(near) and out["stated_amount_differs"] is None
+
+
 def test_a_stated_amount_outside_the_rounding_interval_is_no_near_miss_and_both_figures_stay(client, office,
                                                                                             monkeypatch):
     doc = add_residual(office, amount="3,400,000")  # 18.5% of the cost: not what "כ-17%" rounds from
@@ -735,6 +785,83 @@ def test_ae8_a_cost_increase_without_a_rate_asks_once_and_the_reply_computes_wit
     (assumption,) = b["assumptions"]
     assert assumption["quote"] == "8%" and assumption["current"] is True
     assert [c["status"] for c in b["components"]] == ["full"]
+
+
+RISE_OVER_TIME = component("הרווח היזמי אם עלויות הבנייה והפיתוח יעלו לאורך תקופה", "calculation", subject=SUBJECT,
+                           parameters=[{"name": "שיעור העלייה של העלויות", "source": "not_given_by_user", "quote": ""},
+                                       {"name": "תקופת העלייה", "source": "not_given_by_user", "quote": ""}])
+
+
+def _clarification_turn(client, office, monkeypatch, request: list) -> tuple[str, str, dict]:
+    """A first turn that finds the income and the cost and asks for the missing detail (as AE8): the conversation,
+    the document and the stored pending parameters."""
+    doc = add_residual(office, sensitivity=False)
+    income, cost = FACTS["income"]["value"], FACTS["cost"]["value"]
+    found = f"ההכנסות הצפויות הן {income} ₪ [V1] והעלויות {cost} ₪ [V2]."
+    first = ScriptedAgent([
+        [call("outline", document=doc)], _open(CALC_SECTION),
+        [fact("income", "S1", rmeaning("income", role="income"), "ההכנסות"),
+         fact("cost", "S1", rmeaning("cost", role="cost"), "העלויות")],
+        final(found, documents=[doc]),
+        final(found + " באיזה שיעור יעלו העלויות?", status="clarification",
+              clarification="באיזה שיעור יעלו העלויות?", documents=[doc])],
+        judge=_scripted_judge(), request=request)
+    cloud(monkeypatch, office, first)
+    login(client, "admin-a@example.test")
+    cid = new_conversation(client)
+    m = send(client, cid, RISE_QUESTION)
+    assert m["status"] == "done" and m["answer"]["status"] == "clarification", m
+    return cid, doc, m["answer"]["pending"]
+
+
+def test_a_reply_giving_one_of_two_missing_parameters_leaves_the_other_pending_and_asks_for_it_only(
+        client, office, monkeypatch):
+    """Round 7 KTD9, R25: the user's reply gives the rate; the period is still not given, so the reply turn's
+    clarification stores it — and only it — as pending (one assumption never fills every missing parameter)."""
+    cid, doc, pending = _clarification_turn(client, office, monkeypatch, [RISE_OVER_TIME])
+    assert pending["parameters"] == ["שיעור העלייה של העלויות", "תקופת העלייה"]
+    income, cost = FACTS["income"]["value"], FACTS["cost"]["value"]
+
+    def reopen(items):
+        context = items[0]["content"]
+        assert "«שיעור העלייה של העלויות»" in context  # bound to the parameter asked, the first still waiting
+        return [read(source=re.search(r"(P\d+)", context.split("נמצא בתור הקודם", 1)[1]).group(1))]
+
+    ask = (f"לפי הנחתך שהעלויות יעלו ב-8% [A1]: ההכנסות {income} ₪ [V1] והעלויות {cost} ₪ [V2]. "
+           "לאיזו תקופה לחשב את העלייה?")
+    second = ScriptedAgent([
+        reopen,
+        [fact("income", "S1", rmeaning("income", role="income"), "ההכנסות"),
+         fact("cost", "S1", rmeaning("cost", role="cost"), "העלויות"),
+         call("assume", value="8%", quote="8%", label="שיעור העלייה של העלויות")],
+        final(ask, status="clarification", clarification="לאיזו תקופה לחשב את העלייה?", documents=[doc])],
+        judge=_scripted_judge())
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
+    m2 = send(client, cid, "8%")
+    assert m2["status"] == "done", m2
+    b = m2["answer"]
+    assert b["status"] == "clarification", b
+    assert b["pending"] is not None and b["pending"]["parameters"] == ["תקופת העלייה"], b.get("pending")
+    (assumption,) = b["assumptions"]
+    assert assumption["parameter"] == "שיעור העלייה של העלויות"  # the A# records the parameter it fills
+
+
+def test_a_new_one_number_question_after_a_clarification_is_not_forced_into_the_old_calculation_when_resolve_fails(
+        client, office, monkeypatch):
+    """The follow-up's resolution call fails (request None) and the message is a new question holding one number,
+    not a reply of a number alone: it is not bound to the pending parameter, and the old component is not adopted."""
+    cid, doc, pending = _clarification_turn(client, office, monkeypatch, [RISE])
+    assert pending["parameters"] == ["שיעור העלייה של העלויות"]
+    second = ScriptedAgent([final("בתחשיב אין נתון על השווי למ\"ר בקומה 3.", documents=[doc])])
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)  # resolve is unscripted: it fails
+    m2 = send(client, cid, "מה השווי למ\"ר של הדירה בקומה 3?")
+    assert m2["status"] == "done", m2
+    assert any(c.purpose == "resolve" and c.result.status != "ok" for c in second.calls)
+    context = second.seen[0][0]["content"]
+    assert "תשובה לשאלת ההבהרה" not in context and "assume" not in context
+    b = m2["answer"]
+    assert not [c for c in b.get("components") or [] if c.get("kind") == "calculation"], b.get("components")
+    assert not b.get("assumptions") and b.get("pending") is None
 
 
 # --- a table that states its amounts in thousands (round 7 R14) -------------------------------------------------------

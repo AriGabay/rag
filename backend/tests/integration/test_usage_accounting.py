@@ -4,6 +4,8 @@ reports synthetic token counts; no content is recorded."""
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 from sqlalchemy import text
 
@@ -92,6 +94,42 @@ def test_a_turn_that_fails_after_two_calls_still_records_both(client, office, mo
     assert [(r.purpose, r.ok, r.status) for r in rows(office)] == [("agent", True, "ok"), ("request", True, "ok"),
                                                                   ("agent", False, "rate_limited")]
     assert [u["status"] for u in m["usage"]] == ["ok", "ok", "rate_limited"]
+
+
+def test_a_first_step_failure_records_the_finished_request_analysis_it_never_collected(
+        client, office, monkeypatch):  # noqa: F811
+    """The first agent step fails while the request analysis started beside it has finished but was never collected:
+    ``run_turn`` records the analysis through ``Pending.abandon()`` with its own usage (a billed call never vanishes)."""
+    finished = threading.Event()
+
+    def analysis(_input: str) -> list:
+        finished.set()
+        return []
+
+    agent = PricedAgent([CallStatus.RATE_LIMITED], request=analysis)
+    agent.on_step = lambda step: finished.wait(5)  # the analysis finishes before the first step fails
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), "מה השווי?")
+    assert m["status"] == "failed"
+    assert [(r.purpose, r.ok, r.status) for r in rows(office)] == [("agent", False, "rate_limited"),
+                                                                  ("request", True, "ok")]
+    assert [(u["purpose"], u["status"]) for u in m["usage"]] == [("agent", "rate_limited"), ("request", "ok")]
+
+
+def test_a_first_step_failure_records_an_analysis_still_in_flight_as_a_timeout(client, office, monkeypatch):  # noqa: F811
+    gate = threading.Event()
+    agent = PricedAgent([CallStatus.RATE_LIMITED], request=lambda _input: gate.wait(10) and [])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    try:
+        m = send(client, new_conversation(client), "מה השווי?")
+    finally:
+        gate.set()
+    assert m["status"] == "failed"
+    assert [(r.purpose, r.ok, r.status) for r in rows(office)] == [("agent", False, "rate_limited"),
+                                                                  ("request", False, "timeout")]
+    assert [(u["purpose"], u["status"]) for u in m["usage"]] == [("agent", "rate_limited"), ("request", "timeout")]
 
 
 def test_a_cancelled_turn_records_the_calls_made_before_the_stop(client, office, monkeypatch):  # noqa: F811

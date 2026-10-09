@@ -518,9 +518,11 @@ def bind_pending(pending: dict | None, message: str) -> dict | None:
     """The user's reply bound to the parameter the previous turn's clarification asked for (round 7 KTD9, R25):
     {"parameter", "value" (the number as written), "quote" (the user's words that give it, for ``assume``),
     "component" (the calculation component again, its parameter now given by the user, to freeze as the turn's
-    requirement), "found" (the values the previous turn found)}. Deterministic — it holds whether or not the
-    resolution call succeeds. None when nothing is pending, or when the reply holds no number or several (the
-    agent then reads the reply as it is)."""
+    requirement), "found" (the values the previous turn found)}. The parameter is the pending one the stored
+    clarification question names, when it names exactly one; otherwise the first still waiting, in order — the
+    others stay not given. Deterministic — it holds whether or not the resolution call succeeds (the engine keeps
+    it after a failed call only for a reply of a number alone, ``number_only_reply``). None when nothing is pending,
+    or when the reply holds no number or several (the agent then reads the reply as it is)."""
     names = [n for n in (pending or {}).get("parameters") or [] if n]
     text_ = " ".join((message or "").split())
     numbers = _REPLY_NUMBER.findall(text_)
@@ -533,7 +535,9 @@ def bind_pending(pending: dict | None, message: str) -> dict | None:
         start = max(text_.rfind(c, 0, at) for c in ".,;\n") + 1
         ends = [i for i in (text_.find(c, at) for c in ".,;\n") if i >= 0]
         quote = text_[start:min(ends) if ends else len(text_)].strip()
-    name = names[0]
+    question = _norm(pending.get("question") or "")
+    asked = [n for n in names if _norm(n) and _norm(n) in question]
+    name = asked[0] if len(asked) == 1 else names[0]
     parameters = [{"name": n, "source": "given_by_user", "quote": quote} if n == name
                   else {"name": n, "source": "not_given_by_user", "quote": ""} for n in names]
     component = {"id": pending.get("component") or "N1", "text": pending.get("text") or name, "kind": "calculation",
@@ -541,6 +545,19 @@ def bind_pending(pending: dict | None, message: str) -> dict | None:
                  "parameters": parameters, "compares": [], "aspect": ""}
     return {"parameter": name, "value": numbers[0], "quote": quote, "component": component,
             "found": list(pending.get("found") or [])}
+
+
+# a reply of a number alone: the number, with an approximation mark, a sign, a percent or currency unit and a closing
+# mark at most ("8%", "כ-8 אחוז", "1,500,000 ₪")
+_NUMBER_ONLY = re.compile(r"(?:כ-?\s*)?[-+]?\d[\d,]*(?:\.\d+)?\s*(?:%|אחוז(?:ים)?|₪|ש\"ח|שקל(?:ים)?)?\s*[.!]?")
+NUMBER_ONLY_CHARS = 24
+
+
+def number_only_reply(message: str) -> bool:
+    """Whether a message is a short reply of one number alone — the reply to a clarification the engine binds even
+    when the follow-up's resolution call fails, since no other reading of it exists."""
+    text_ = _norm(message)
+    return len(text_) <= NUMBER_ONLY_CHARS and bool(_NUMBER_ONLY.fullmatch(text_))
 
 
 def pending_block(binding: dict) -> str:

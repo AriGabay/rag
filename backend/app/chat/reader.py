@@ -155,9 +155,12 @@ def in_section(blocks: list[tuple], path: tuple[str, ...], window: tuple[int, in
 
 
 def blocks_at(conn: Connection, version_id: UUID, indexes: Collection[int]) -> dict[int, object]:
-    """The blocks of ``indexes`` that exist, by index (their page and box)."""
+    """The blocks of ``indexes`` that exist, by index: their page, their stored box and their page's stored geometry
+    (so ``contexts.top_of`` places them on the rendered page, the frame of a table row's top: ``row_top``)."""
     return {r.block_index: r for r in conn.execute(text(
-        "SELECT block_index, page, bbox FROM document_blocks WHERE version_id = :v AND block_index = ANY(:i)"),
+        "SELECT b.block_index, b.page, b.bbox, p.mediabox, p.cropbox, p.rotation, p.display_width, p.display_height,"
+        " p.geometry_issue FROM document_blocks b LEFT JOIN pages p ON p.version_id = b.version_id"
+        " AND p.page_no = b.page WHERE b.version_id = :v AND b.block_index = ANY(:i)"),
         {"v": version_id, "i": list(indexes)})}
 
 
@@ -240,6 +243,8 @@ def section_window(cx, block_index: int, path: tuple[str, ...]) -> tuple[int, in
 
 
 def row_top(row: dict) -> float | None:
+    """A table row's top on the rendered page (its first cell's box: cell boxes are stored in the display frame);
+    None for a row stored without cell boxes."""
     try:
         return float((row.get("cell_boxes") or [])[0][1])
     except (TypeError, ValueError, IndexError):

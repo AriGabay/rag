@@ -251,6 +251,44 @@ def test_waiting_for_the_analysis_stops_when_the_turn_is_cancelled():
     assert a.status == "cancelled" and a.items is None
 
 
+def test_a_provider_exception_inside_the_worker_is_an_error_analysis_with_its_usage():
+    def broken(instructions, input):
+        raise RuntimeError("provider exploded")
+
+    p = ScriptedProvider()
+    p.on(Purpose.RESOLVE, broken)
+    pending = R.start(p, "מה השווי?", deadline=time.monotonic() + 30)
+    a = pending.wait(lambda: False)
+    assert a.status == "error" and a.items is None
+    assert a.usage["purpose"] == "request" and a.usage["status"] == "error"
+    assert pending.abandon() is None  # collected: nothing left to record
+
+
+def test_abandoning_a_collected_analysis_records_nothing():
+    pending = R.start(_provider([component("השווי")]), "מה השווי?", deadline=time.monotonic() + 30)
+    assert pending.wait(lambda: False).status == "ok"
+    assert pending.abandon() is None
+
+
+def test_abandoning_a_finished_analysis_never_collected_records_its_own_usage_once():
+    pending = R.start(_provider([component("השווי")]), "מה השווי?", deadline=time.monotonic() + 30)
+    assert pending._done.wait(5)
+    entry = pending.abandon()
+    assert entry is not None and entry["purpose"] == "request" and entry["status"] == "ok"
+    assert pending.abandon() is None  # recorded once
+
+
+def test_abandoning_an_analysis_still_in_flight_records_a_timeout():
+    gate = threading.Event()
+    p = ScriptedProvider()
+    p.on(Purpose.RESOLVE, lambda i, x: gate.wait(10) and {"components": []})
+    pending = R.start(p, "מה השווי?", deadline=time.monotonic() + 30)
+    entry = pending.abandon()
+    gate.set()
+    assert entry is not None and entry["purpose"] == "request" and entry["status"] == "timeout"
+    assert pending.abandon() is None
+
+
 # --- the judge scores the frozen components ---------------------------------------------------------------------
 
 def test_the_judge_is_given_the_frozen_components_with_their_kind_parent_and_condition():

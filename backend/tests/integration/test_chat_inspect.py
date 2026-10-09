@@ -69,9 +69,11 @@ def office(db, monkeypatch):
     return a
 
 
-def ingest_r1(office, monkeypatch, at_ingestion=None) -> str:
+def ingest_r1(office, monkeypatch, at_ingestion=None, ocr_at_inspect: bool = False) -> str:
     """The synthetic raster-table PDF, ingested without OCR (and without vision unless ``at_ingestion``), in the
-    closed group."""
+    closed group. ``ocr_at_inspect``: afterwards OCR of an inspected crop runs and sees no word (the host's
+    Tesseract has no Hebrew data), so an inspect reading is stored (a reading made without OCR is not:
+    ``_vision_read``); else OCR stays off."""
     from app.platform import pipeline
     from tests.integration.test_documents_api import ingest
 
@@ -81,6 +83,8 @@ def ingest_r1(office, monkeypatch, at_ingestion=None) -> str:
     doc, _ = ingest(office, R1, TITLE)
     with tenant_tx(office.ctx()) as conn:
         conn.execute(text("UPDATE documents SET group_id = :g WHERE id = :d"), {"g": office.private, "d": doc})
+    if ocr_at_inspect:
+        script_ocr(monkeypatch, lambda gray: [])
     return doc
 
 
@@ -130,7 +134,7 @@ def test_a_region_read_at_ingestion_returns_its_stored_reading_without_a_model_c
 # --- an unread region: one model call, stored for later turns ------------------------------------------------------
 
 def test_the_first_inspect_makes_one_call_and_a_later_turn_none(office, monkeypatch):
-    doc = ingest_r1(office, monkeypatch)
+    doc = ingest_r1(office, monkeypatch, ocr_at_inspect=True)
     ws = emp(office)
     region = region_of(ws, doc)
     out = T.tool_inspect(ws, {"region": region})
@@ -153,8 +157,37 @@ def test_the_first_inspect_makes_one_call_and_a_later_turn_none(office, monkeypa
     assert later.inspections == 0 and stored(office) == 1 and inspect_views(office) == 2
 
 
-def test_a_page_with_an_unread_region_is_read_whole_once(office, monkeypatch):
+def test_a_reading_made_without_ocr_of_its_crop_is_not_stored_and_a_later_inspect_reads_again(office, monkeypatch):
+    """A reading whose crop OCR was unavailable (or failed) has no evidence that could ever confirm its cells, so it
+    is not stored: a later turn reads again, with OCR, and only that reading is stored and reused (KTD6)."""
     doc = ingest_r1(office, monkeypatch)
+    monkeypatch.setattr("app.extraction.ocr.ocr_available", lambda languages: False)
+    ws = emp(office)
+    out = T.tool_inspect(ws, {"region": region_of(ws, doc)})
+    assert len(office.vision.calls) == 1 and "48,600" in out
+    assert stored(office) == 0 and inspect_views(office) == 1  # read and audited, never stored
+    # OCR failing on the crop is the same as OCR being unavailable
+    monkeypatch.setattr("app.extraction.ocr.ocr_available", lambda languages: True)
+
+    def broken(gray, languages):
+        raise RuntimeError("tesseract crashed")
+
+    monkeypatch.setattr("app.extraction.images._ocr_words", broken)
+    later = emp(office)
+    T.tool_inspect(later, {"region": region_of(later, doc)})
+    assert len(office.vision.calls) == 2 and stored(office) == 0
+    # with OCR of the crop, the reading is stored and a later turn reuses it
+    script_ocr(monkeypatch, lambda gray: [])
+    third = emp(office)
+    T.tool_inspect(third, {"region": region_of(third, doc)})
+    assert len(office.vision.calls) == 3 and stored(office) == 1
+    fourth = emp(office)
+    T.tool_inspect(fourth, {"region": region_of(fourth, doc)})
+    assert len(office.vision.calls) == 3
+
+
+def test_a_page_with_an_unread_region_is_read_whole_once(office, monkeypatch):
+    doc = ingest_r1(office, monkeypatch, ocr_at_inspect=True)
     ws = emp(office)
     out = T.tool_inspect(ws, {"document": doc, "page": 1})
     assert len(office.vision.calls) == 1 and "48,600" in out and tag(out, "status") == "uncertain_reading"
@@ -166,7 +199,7 @@ def test_a_page_with_an_unread_region_is_read_whole_once(office, monkeypatch):
 # --- permissions ---------------------------------------------------------------------------------------------------
 
 def test_a_user_outside_the_documents_group_gets_not_available_even_when_a_reading_is_stored(office, monkeypatch):
-    doc = ingest_r1(office, monkeypatch)
+    doc = ingest_r1(office, monkeypatch, ocr_at_inspect=True)
     ws = emp(office)
     region = region_of(ws, doc)
     T.tool_inspect(ws, {"region": region})
@@ -249,7 +282,7 @@ def _turn(doc: str) -> ScriptedAgent:
 
 
 def test_a_scripted_turn_reads_an_unread_table_region_through_inspect_and_cites_it(client, office, monkeypatch):
-    doc = ingest_r1(office, monkeypatch)
+    doc = ingest_r1(office, monkeypatch, ocr_at_inspect=True)
     agent = _turn(doc)
     cloud(monkeypatch, office, agent)
     login(client, "admin-a@example.test")
