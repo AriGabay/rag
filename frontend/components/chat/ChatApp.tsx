@@ -4,9 +4,9 @@ import Link from "next/link";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useSession } from "@/components/AppShell";
 import { api, ApiError, chatApi, errorMessage, isAbortError, newTurnId } from "@/lib/api";
-import type { ChatAnswer, ChatConversation, ChatMessage, ChatSource } from "@/lib/chatTypes";
-import { AssistantMessage, UserMessage, citedSource } from "./Message";
-import { SourcePanel } from "./SourcePanel";
+import type { ChatAnswer, ChatConversation, ChatMessage, ViewerNav } from "@/lib/chatTypes";
+import { AssistantMessage, UserMessage, answerNav } from "./Message";
+import { SourceViewer } from "./SourceViewer";
 import "./chat.css";
 
 const POLL_MS = 900;
@@ -14,6 +14,28 @@ const LAST_KEY = "rag.chat.last";
 const THEME_KEY = "rag.theme";
 const NEAR_BOTTOM = 120;
 const RUNNING = new Set(["running", "cancelling"]);
+/** The history-state key of a panel level: its depth in the panel stack (1 = the first panel). */
+const PANEL_DEPTH = "ragPanelDepth";
+
+/** One level of the panel stack beside the thread (R7). The calculation breakdown (U7) adds a level kind here and
+ * renders it in `PanelLevelView`; its document inputs open a "source" level above it through `onOpen`. */
+export type PanelLevel = { kind: "source"; nav: ViewerNav };
+
+interface PanelEntry {
+  key: number;
+  level: PanelLevel;
+  /** The element that opened it: focus returns there when it closes. */
+  opener: HTMLElement | null;
+}
+
+function panelDepth(state: unknown): number {
+  const d = state && typeof state === "object" ? (state as Record<string, unknown>)[PANEL_DEPTH] : undefined;
+  return typeof d === "number" && d > 0 ? d : 0;
+}
+
+function focusedElement(): HTMLElement | null {
+  return typeof document !== "undefined" && document.activeElement instanceof HTMLElement ? document.activeElement : null;
+}
 
 interface Thread {
   messages: ChatMessage[];
@@ -84,7 +106,12 @@ export default function ChatApp() {
   const [threads, setThreads] = useState<Record<string, Thread>>({});
   const [draftThread, setDraftThread] = useState<ChatMessage[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [panel, setPanel] = useState<ChatSource | null>(null);
+  // the panel stack: each level is one browser-history entry, so Back, Esc and close pop only the top one
+  const [panels, setPanels] = useState<PanelEntry[]>([]);
+  const panelsRef = useRef<PanelEntry[]>([]);
+  const panelKey = useRef(0);
+  const refocus = useRef<HTMLElement | null>(null);
+  const afterUnwind = useRef<(() => void) | null>(null);
   const [theme, setTheme] = useState<Theme>("system");
   const [sending, setSending] = useState(false);
   const [composerText, setComposerText] = useState("");
@@ -171,8 +198,14 @@ export default function ChatApp() {
     [threads, updateThread, touchConversation],
   );
 
+  const commitPanels = useCallback((next: PanelEntry[]) => {
+    panelsRef.current = next;
+    setPanels(next);
+  }, []);
+
   useEffect(() => {
-    setPanel(null);
+    // panels belong to the conversation they were opened from (switching unwinds their history first)
+    if (panelsRef.current.length) commitPanels([]);
     if (activeId) {
       setUrlConversation(activeId);
       writeLocal(LAST_KEY, activeId);
@@ -339,26 +372,131 @@ export default function ChatApp() {
     [busy, updateThread],
   );
 
-  const openSource = useCallback((answer: ChatAnswer, id: string) => {
-    const s = citedSource(answer, id);
-    if (s) setPanel(s);
+  // --- panel stack ------------------------------------------------------------------------------------------
+  /** Opens a level above the current ones (a breakdown's input above the breakdown). */
+  const pushPanel = useCallback(
+    (level: PanelLevel) => {
+      const cur = panelsRef.current;
+      window.history.pushState({ [PANEL_DEPTH]: cur.length + 1 }, "");
+      commitPanels([...cur, { key: ++panelKey.current, level, opener: focusedElement() }]);
+    },
+    [commitPanels],
+  );
+
+  /** Opens a level from the thread: it replaces whatever panels are open (one level, one history entry). */
+  const openFromThread = useCallback(
+    (level: PanelLevel) => {
+      const cur = panelsRef.current;
+      if (cur.length === 0) {
+        pushPanel(level);
+        return;
+      }
+      commitPanels([{ key: ++panelKey.current, level, opener: focusedElement() }]);
+      // the entries of the levels it replaced are unwound; the popstate finds the stack already at depth 1
+      if (cur.length > 1) window.history.go(-(cur.length - 1));
+    },
+    [commitPanels, pushPanel],
+  );
+
+  /** Moves the top level to another target (previous/next citation) without a new history entry. */
+  const navigateTop = useCallback(
+    (index: number) => {
+      const cur = panelsRef.current;
+      const top = cur[cur.length - 1];
+      if (!top || top.level.kind !== "source") return;
+      const nav = top.level.nav;
+      if (index < 0 || index >= nav.items.length) return;
+      commitPanels([...cur.slice(0, -1), { ...top, level: { ...top.level, nav: { ...nav, index } } }]);
+    },
+    [commitPanels],
+  );
+
+  /** Close, Esc and Back pop the top level only: through history, so the entries and the stack stay in step. */
+  const closeTop = useCallback(() => {
+    if (panelsRef.current.length) window.history.back();
   }, []);
+
+  /** Closes every panel, then runs `then` (a conversation switch must not leave panel entries in history). */
+  const unwindPanels = useCallback((then: () => void) => {
+    const n = panelsRef.current.length;
+    if (n === 0) {
+      then();
+      return;
+    }
+    afterUnwind.current = then;
+    window.history.go(-n);
+  }, []);
+
+  useEffect(() => {
+    const onPop = (e: PopStateEvent) => {
+      const depth = panelDepth(e.state);
+      const cur = panelsRef.current;
+      if (depth < cur.length) {
+        refocus.current = cur[depth].opener;
+        commitPanels(cur.slice(0, depth));
+      }
+      if (depth === 0 && afterUnwind.current) {
+        const then = afterUnwind.current;
+        afterUnwind.current = null;
+        then();
+      }
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, [commitPanels]);
+
+  // focus returns to the element that opened the closed level, once the level below is shown again
+  useEffect(() => {
+    const el = refocus.current;
+    if (!el) return;
+    refocus.current = null;
+    if (el.isConnected) el.focus();
+  }, [panels]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented || e.isComposing || !panelsRef.current.length) return;
+      // Esc inside the conversation list (renaming) is the list's own
+      if (e.target instanceof Element && e.target.closest(".chat-sidebar")) return;
+      e.preventDefault();
+      closeTop();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [closeTop]);
+
+  /** A chip in an answer: S#, V# and M# open the source viewer at their place, moving through the answer's
+   * citations in answer order. C# and A# have no place in a document (U7 opens the breakdown for them). */
+  const openSource = useCallback(
+    (answer: ChatAnswer, id: string) => {
+      const nav = answerNav(answer, id);
+      if (nav) openFromThread({ kind: "source", nav });
+    },
+    [openFromThread],
+  );
 
   // --- conversation actions --------------------------------------------------------------------------------
   const newChat = useCallback(() => {
-    setActiveId(null);
-    setDraftThread([]);
-    setComposerText("");
-    setNotice(null);
-    writeLocal(LAST_KEY, null);
-    if (window.matchMedia("(max-width: 768px)").matches) setSidebarOpen(false);
-  }, []);
+    unwindPanels(() => {
+      setActiveId(null);
+      setDraftThread([]);
+      setComposerText("");
+      setNotice(null);
+      writeLocal(LAST_KEY, null);
+      if (window.matchMedia("(max-width: 768px)").matches) setSidebarOpen(false);
+    });
+  }, [unwindPanels]);
 
-  const select = useCallback((id: string) => {
-    setActiveId(id);
-    setNotice(null);
-    if (window.matchMedia("(max-width: 768px)").matches) setSidebarOpen(false);
-  }, []);
+  const select = useCallback(
+    (id: string) => {
+      unwindPanels(() => {
+        setActiveId(id);
+        setNotice(null);
+        if (window.matchMedia("(max-width: 768px)").matches) setSidebarOpen(false);
+      });
+    },
+    [unwindPanels],
+  );
 
   const rename = useCallback(async (id: string, title: string) => {
     try {
@@ -526,9 +664,40 @@ export default function ChatApp() {
           }}
         />
       </main>
-      {panel && <SourcePanel key={`${panel.version_id ?? "listing"}:${panel.id}`} source={panel} onClose={() => setPanel(null)} />}
+      {panels.map((entry, i) => (
+        <PanelLevelView
+          key={entry.key}
+          level={entry.level}
+          top={i === panels.length - 1}
+          onClose={closeTop}
+          onNavigate={navigateTop}
+          onOpen={pushPanel}
+        />
+      ))}
     </div>
   );
+}
+
+/** One level of the panel stack; the levels below the top stay mounted (their state kept) but hidden. */
+function PanelLevelView({
+  level,
+  top,
+  onClose,
+  onNavigate,
+}: {
+  level: PanelLevel;
+  top: boolean;
+  onClose: () => void;
+  onNavigate: (index: number) => void;
+  /** Opens a level above this one (U7: a breakdown's input opens the viewer at its anchor). */
+  onOpen: (level: PanelLevel) => void;
+}) {
+  switch (level.kind) {
+    case "source":
+      return <SourceViewer nav={level.nav} hidden={!top} onClose={onClose} onNavigate={onNavigate} />;
+    default:
+      return null;
+  }
 }
 
 function ConversationList({

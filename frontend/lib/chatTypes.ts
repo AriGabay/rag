@@ -1,5 +1,7 @@
 // Types of the conversational chat API (/api/chat). Kept apart from the earlier /api/ask types.
 
+import type { ValueStatus } from "./format";
+
 export interface ChatConversation {
   id: string;
   title: string;
@@ -281,6 +283,30 @@ export interface ChatClaim {
   basis: "explicit" | "inference" | "computed";
 }
 
+/** Whether the answer's claims held against their sources: every claim supported, some removed or only partly
+ * supported, or none survived. Reported apart from completeness (R19). */
+export type ChatCorrectness = "verified" | "partial" | "unverified";
+
+/** How a requirement of the question was given in the verified answer. */
+export type ChatRequirementStatus = "full" | "partial" | "missing" | "undeterminable";
+
+/** A requirement not given in full, with the reason computed from what the turn found and did (R21). */
+export interface ChatCompletenessGap {
+  id: string;
+  text: string;
+  status: Exclude<ChatRequirementStatus, "full">;
+  /** "not_found" | "uncertain" | "tool_failure" | "calculation_incomplete" | "insufficient" | "not_searched" */
+  reason: string | null;
+  reason_text: string | null;
+}
+
+/** The answer's completeness against the requirements derived from the question (R18, R19). */
+export interface ChatCompleteness {
+  status: ChatRequirementStatus;
+  requirements: number;
+  missing: ChatCompletenessGap[];
+}
+
 /** What verification did, in counts; what it removed, and why, is diagnostics (not on this path). */
 export interface ChatVerification {
   judged: boolean;
@@ -289,6 +315,27 @@ export interface ChatVerification {
   partial: number;
   annotated: number;
   request_mismatch?: boolean;
+  /** Absent on answers stored before claim correctness and completeness were reported apart. */
+  correctness?: ChatCorrectness;
+  /** Absent when no requirements were judged (and on older answers). */
+  completeness?: ChatCompleteness;
+}
+
+/** A requirement of the question with its status in the verified answer (the ledger's per-requirement detail). */
+export interface ChatRequirement {
+  id: string;
+  text: string;
+  /** It asks for a calculation. */
+  calculation: boolean;
+  status: ChatRequirementStatus;
+  /** The answer itself says it is missing or undeterminable. */
+  stated: boolean;
+  units: number[];
+  related: string[];
+  /** The judge's reason. */
+  reason: string;
+  limitation: string | null;
+  limitation_text: string | null;
 }
 
 export interface ChatCoverage {
@@ -338,6 +385,8 @@ export interface ChatLedger {
   pages_read?: number;
   complete: boolean;
   note?: string;
+  /** Each requirement of the question and how the answer gave it (absent on older answers). */
+  requirements?: ChatRequirement[];
 }
 
 export interface ChatAnswer {
@@ -434,4 +483,24 @@ export interface SourceBlocks {
   reading_id?: string | null;
   /** The document was reprocessed after the citation: its block numbers mean other text now, so no blocks. */
   stale?: boolean;
+}
+
+/** What the source viewer opens: a citation's place in its document. The text view always has `source` (the passage,
+ * or the passage behind a value or measurement); the page or structured view needs a document anchor. A breakdown's
+ * input (U7) builds the same target. */
+export interface ViewerTarget {
+  /** The citation id (S#, V#, M#). */
+  id: string;
+  source: ChatSource;
+  /** null: an answer stored before anchors, or a source with no place in a document (a listing); the text view only. */
+  anchor: ChatAnchor | null;
+  /** A value's or measurement's status (V#, M#). */
+  valueStatus?: ValueStatus | null;
+}
+
+/** The targets a viewer moves through with previous/next: the answer's citations in answer order (a chip), or a
+ * breakdown's document inputs (U7). */
+export interface ViewerNav {
+  items: ViewerTarget[];
+  index: number;
 }

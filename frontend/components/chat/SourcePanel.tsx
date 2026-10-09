@@ -43,24 +43,72 @@ function hasRegionMarker(block: SourceBlock, cited: boolean): boolean {
   return cited || block.kind === "image" || block.kind === "table" || block.status === "unread" || block.status === "read_uncertain";
 }
 
-/** The cited place in its document: the blocks around it, the cited ones highlighted, tables as tables, and a
- * picture next to what was read from it. A DOCX is located by section and paragraph; nothing invents pages. */
+/** The cited place in its document, as a standalone panel (the review screen): a header and the extracted-text
+ * view. The chat opens citations in the source viewer (`SourceViewer`), whose text tab is the same view. */
 export function SourcePanel({ source, onClose }: { source: ChatSource; onClose: () => void }) {
-  const [data, setData] = useState<SourceBlocks | null>(null);
-  const [error, setError] = useState<string | null>(null);
   // the document became unavailable while the panel was open: nothing read from it is shown any more
   const [revoked, setRevoked] = useState(false);
-  const bodyRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     closeRef.current?.focus();
   }, [source.id]);
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <aside className="source-panel" aria-label="תצוגת מקור">
+      <header>
+        <div className="t">
+          <strong>{source.title}</strong>
+          {!revoked && <span>{source.location}</span>}
+        </div>
+        <button ref={closeRef} type="button" className="icon-btn" onClick={onClose} aria-label="סגירת תצוגת המקור">
+          ✕
+        </button>
+      </header>
+      {revoked ? <SourceRevoked /> : <SourceTextView source={source} onRevoked={() => setRevoked(true)} />}
+    </aside>
+  );
+}
+
+/** What a source no longer visible shows: nothing read from it, only that it is unavailable. */
+export function SourceRevoked() {
+  return (
+    <div className="source-body">
+      <div className="alert alert-error" role="alert" data-testid="source-unavailable">
+        {MSG_REVOKED}
+      </div>
+    </div>
+  );
+}
+
+/** The extracted-text view of a cited place: the blocks around it, the cited ones highlighted, tables as tables,
+ * and a picture next to what was read from it. A DOCX is located by section and paragraph; nothing invents pages.
+ * `onRevoked`: the document stopped being visible (the owner then shows nothing read from it). */
+export function SourceTextView({
+  source,
+  onRevoked,
+  note,
+}: {
+  source: ChatSource;
+  onRevoked: () => void;
+  /** A line above the text (the viewer says why it shows the text instead of the page). */
+  note?: string | null;
+}) {
+  const [data, setData] = useState<SourceBlocks | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
   const reading = citedReading(source);
 
   useEffect(() => {
-    // the parent keys this panel by source, so a new source starts from empty state
+    // the owner keys this view by source, so a new source starts from empty state
     const ctrl = new AbortController();
     const start = source.block_start;
     const end = source.block_end ?? start;
@@ -77,9 +125,12 @@ export function SourcePanel({ source, onClose }: { source: ChatSource; onClose: 
       )
       .then(setData)
       .catch((err: unknown) => {
-        if (!isAbortError(err)) setError(errorMessage(err));
+        if (isAbortError(err)) return;
+        if (err instanceof ApiError && err.status === 404) onRevoked();
+        else setError(errorMessage(err));
       });
     return () => ctrl.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [source.document_id, source.version_id, source.block_start, source.block_end, reading]);
 
   useEffect(() => {
@@ -88,90 +139,52 @@ export function SourcePanel({ source, onClose }: { source: ChatSource; onClose: 
     if (el && "scrollIntoView" in el) (el as HTMLElement).scrollIntoView({ block: "center" });
   }, [data]);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
   const lo = source.block_start ?? -1;
   const hi = source.block_end ?? lo;
   const file = safeApiUrl(data?.file_url ?? null);
-  const onRevoked = () => {
-    setRevoked(true);
-    setData(null);
-  };
-
-  if (revoked) {
-    return (
-      <aside className="source-panel" aria-label="תצוגת מקור">
-        <header>
-          <div className="t">
-            <strong>{source.title}</strong>
-          </div>
-          <button ref={closeRef} type="button" className="icon-btn" onClick={onClose} aria-label="סגירת תצוגת המקור">
-            ✕
-          </button>
-        </header>
-        <div className="source-body">
-          <div className="alert alert-error" role="alert">
-            {MSG_REVOKED}
-          </div>
-        </div>
-      </aside>
-    );
-  }
 
   return (
-    <aside className="source-panel" aria-label="תצוגת מקור">
-      <header>
-        <div className="t">
-          <strong>{source.title}</strong>
-          <span>{source.location}</span>
-          {data && !data.is_current && <span> · גרסה קודמת של המסמך</span>}
-        </div>
-        <button ref={closeRef} type="button" className="icon-btn" onClick={onClose} aria-label="סגירת תצוגת המקור">
-          ✕
-        </button>
-      </header>
-      <div className="source-body" ref={bodyRef}>
-        <div className="source-cited" dir="auto">
-          {source.text}
-        </div>
-        {error && <div className="alert alert-error">{error}</div>}
-        {source.kind === "listing" ? (
-          <p className="muted">רשימת המסמכים שהוחזרה בחיפוש בתור הזה (לא קטע ממסמך).</p>
-        ) : (
-          source.block_start == null &&
-          !error && <p className="muted">למקור הזה אין מיקום מפורט במסמך; מוצג הקטע שצוטט.</p>
-        )}
-        {source.block_start != null && !data && !error && <p className="muted">טוען את המסמך…</p>}
-        {data?.stale && (
-          <p className="muted" role="note">
-            {MSG_STALE}
-          </p>
-        )}
-        {data?.blocks.map((b) => (
-          <Block
-            key={b.index}
-            block={b}
-            cited={b.index >= lo && b.index <= hi}
-            documentId={data.document_id}
-            versionId={data.version_id}
-            onRevoked={onRevoked}
-          />
-        ))}
-        {file && (
-          <p>
-            <a href={file} target="_blank" rel="noreferrer">
-              הורדת הקובץ המקורי
-            </a>
-          </p>
-        )}
+    <div className="source-body" ref={bodyRef} data-testid="source-text-view">
+      {note && (
+        <p className="viewer-note" role="note">
+          {note}
+        </p>
+      )}
+      {data && !data.is_current && <p className="muted">גרסה קודמת של המסמך</p>}
+      <div className="source-cited" dir="auto">
+        {source.text}
       </div>
-    </aside>
+      {error && <div className="alert alert-error">{error}</div>}
+      {source.kind === "listing" ? (
+        <p className="muted">רשימת המסמכים שהוחזרה בחיפוש בתור הזה (לא קטע ממסמך).</p>
+      ) : (
+        source.block_start == null &&
+        !error && <p className="muted">למקור הזה אין מיקום מפורט במסמך; מוצג הקטע שצוטט.</p>
+      )}
+      {source.block_start != null && !data && !error && <p className="muted">טוען את המסמך…</p>}
+      {data?.stale && (
+        <p className="muted" role="note">
+          {MSG_STALE}
+        </p>
+      )}
+      {data?.blocks.map((b) => (
+        <Block
+          key={b.index}
+          block={b}
+          cited={b.index >= lo && b.index <= hi}
+          documentId={data.document_id}
+          versionId={data.version_id}
+          onRevoked={onRevoked}
+        />
+      ))}
+      {file && (
+        <p>
+          <a href={file} target="_blank" rel="noreferrer">
+            הורדת הקובץ המקורי
+          </a>
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -337,7 +350,14 @@ function RegionView({
   );
 }
 
-function TableView({ table }: { table: NonNullable<SourceBlock["table"]> }) {
+/** A table as a table. `mark`: a cell to highlight (0-based body row and column), the structured view's cited cell. */
+export function TableView({
+  table,
+  mark,
+}: {
+  table: NonNullable<SourceBlock["table"]>;
+  mark?: { row: number; column: number } | null;
+}) {
   const headers = table.headers ?? [];
   return (
     <div>
@@ -360,11 +380,20 @@ function TableView({ table }: { table: NonNullable<SourceBlock["table"]> }) {
           <tbody>
             {table.rows.map((r, i) => (
               <tr key={i}>
-                {r.map((c, j) => (
-                  <td key={j} dir="auto">
-                    {c}
-                  </td>
-                ))}
+                {r.map((c, j) => {
+                  const marked = mark?.row === i && mark.column === j;
+                  return (
+                    <td
+                      key={j}
+                      dir="auto"
+                      className={marked ? "cell-cited" : undefined}
+                      data-cited={marked ? "true" : undefined}
+                      data-testid={marked ? "structured-cell" : undefined}
+                    >
+                      {c}
+                    </td>
+                  );
+                })}
               </tr>
             ))}
           </tbody>

@@ -150,6 +150,100 @@ export function fileUrl(documentId: string, versionId: string, page?: number | n
   return page ? `${base}#page=${page}` : base;
 }
 
+// ---------- Source images (page views) ----------
+
+/** The typed states of a visible source that cannot be shown (KTD5, R12): its reading changed (stale), its file is
+ * gone from storage, or the page cannot be drawn. Lost access is never one of them: it is the uniform 404. */
+export type SourceFailureState = "stale" | "file_missing" | "render_failed";
+const SOURCE_STATES: readonly string[] = ["stale", "file_missing", "render_failed"];
+
+/** A source request that failed. Branch on `state` (and `revoked`), not on the status code: 422 is also FastAPI's
+ * validation error, which carries no state. */
+export class SourceError extends ApiError {
+  readonly state: SourceFailureState | null;
+  constructor(status: number, message: string, state: SourceFailureState | null) {
+    super(status, message);
+    this.state = state;
+  }
+  /** The document is no longer visible to this user (deleted, moved to another group, access revoked). */
+  get revoked(): boolean {
+    return this.status === 404 && this.state === null;
+  }
+}
+
+/** A rendered page, held as an object URL (the caller revokes it): the server sends sources `no-store`, so the
+ * image is fetched once per view and never cached by the browser. */
+export interface SourceImage {
+  url: string;
+  /** With a reading id: whether the anchor's reading is still the stored one (null when not asked). */
+  readingState: "current" | "stale" | null;
+  /** The page's display frame in points (the frame an anchor's rectangles are fractions of). */
+  displayWidth: number | null;
+  displayHeight: number | null;
+}
+
+export type PageScale = "normal" | "zoom";
+
+function versionBase(documentId: string, versionId: string): string {
+  return `/api/documents/${encodeURIComponent(documentId)}/versions/${encodeURIComponent(versionId)}`;
+}
+
+/** The page image route; `readingId` is the anchor's reading ("none" for one from before readings had ids). */
+export function pageImageUrl(
+  documentId: string,
+  versionId: string,
+  page: number,
+  scale: PageScale,
+  readingId?: string,
+): string {
+  return `${versionBase(documentId, versionId)}/pages/${page}/image${qs({ scale, reading_id: readingId })}`;
+}
+
+function headerNumber(res: Response, name: string): number | null {
+  const v = Number(res.headers.get(name));
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
+
+/** Fetches a source image once. A failure is a `SourceError`: `revoked` for lost access, `state` for a typed
+ * failure of a visible source; the caller decides, and nothing here retries. */
+export async function fetchSourceImage(url: string, signal?: AbortSignal): Promise<SourceImage> {
+  let res: Response;
+  try {
+    res = await fetch(url, { credentials: "same-origin", cache: "no-store", headers: { Accept: "image/png" }, signal });
+  } catch (err) {
+    if (signal?.aborted) throw signal.reason ?? err;
+    throw new SourceError(0, NETWORK_ERROR, null);
+  }
+  if (res.status === 401) {
+    redirectToLogin();
+    throw new SourceError(401, "נדרשת התחברות מחדש.", null);
+  }
+  if (!res.ok) {
+    let state: string | null = res.headers.get("X-Source-State");
+    let detail: string | null = null;
+    try {
+      const data: unknown = await res.json();
+      if (data && typeof data === "object") {
+        const d = data as { detail?: unknown; state?: unknown };
+        if (typeof d.detail === "string") detail = d.detail;
+        if (typeof d.state === "string") state = d.state;
+      }
+    } catch {
+      // not JSON: an untyped failure
+    }
+    const typed = state && SOURCE_STATES.includes(state) ? (state as SourceFailureState) : null;
+    throw new SourceError(res.status, detail ?? (res.status >= 500 ? SERVER_ERROR : GENERIC_ERROR), typed);
+  }
+  const blob = await res.blob();
+  const reading = res.headers.get("X-Reading-State");
+  return {
+    url: URL.createObjectURL(blob),
+    readingState: reading === "current" || reading === "stale" ? reading : null,
+    displayWidth: headerNumber(res, "X-Display-Width"),
+    displayHeight: headerNumber(res, "X-Display-Height"),
+  };
+}
+
 export const chatApi = {
   conversations: (opts: { q?: string; archived?: boolean; before?: string | null; limit?: number } = {}, signal?: AbortSignal) =>
     request<{ conversations: ChatConversation[]; next: string | null }>(

@@ -8,12 +8,24 @@ import type {
   ChatComputationInput,
   ChatLedger,
   ChatMessage,
+  ChatRequirement,
   ChatSource,
   ChatValue,
+  ChatVerification,
   LedgerDocument,
   LedgerTable,
+  ViewerNav,
+  ViewerTarget,
 } from "@/lib/chatTypes";
+import {
+  VALUE_STATUS,
+  type ValueStatus,
+  chatValueStatus,
+  measurementValueStatus,
+  valueStatusText,
+} from "@/lib/format";
 import { type CitationTarget, Markdown, citationOrder, plainAnswer } from "./Markdown";
+import { documentAnchor } from "./SourceViewer";
 
 export interface CitedItem {
   /** A passage, or the document passage behind a measurement or computation input. */
@@ -30,11 +42,20 @@ const RESULT_KIND: Record<string, string> = {
 };
 const VAT: Record<string, string> = { included: "כולל מע״מ", excluded: "ללא מע״מ", unknown: "מע״מ לא צוין", not_applicable: "" };
 const PERIOD: Record<string, string> = { month: "לחודש", year: "לשנה", one_time: "חד-פעמי", none: "", unknown: "תקופה לא צוינה" };
-const STATUS: Record<string, string> = {
-  verified: "מאומת",
-  corrected: "תוקן ידנית",
-  auto_validated: "ראשוני (טרם אומת)",
-  needs_review: "ממתין לבדיקה",
+const REQUIREMENT_STATUS: Record<string, string> = {
+  full: "ניתן במלואו",
+  partial: "ניתן בחלקו",
+  missing: "חסר",
+  undeterminable: "לא ניתן להכריע",
+};
+const COMPLETENESS_LEAD: Record<string, string> = {
+  partial: "התשובה חלקית",
+  missing: "התשובה אינה עונה על השאלה",
+  undeterminable: "לא ניתן להכריע מהמסמכים",
+};
+const CORRECTNESS_LINE: Record<string, string> = {
+  partial: "חלק מהטענות הוסרו או אומתו רק בחלקן מול המקורות (פירוט ב«מקורות ופרטים»).",
+  unverified: "הטענות בתשובה לא אומתו מול המקורות; יש לבדוק במקור לפני שימוש.",
 };
 
 // an answer's source is bound to the reading it was read from (null: an answer from before reading ids)
@@ -72,6 +93,54 @@ export function citedSource(answer: ChatAnswer, id: string): ChatSource | null {
     };
   }
   return null;
+}
+
+/** A value's status (V#): checked automatically in its passage, uncertain, or unread (never a person's decision). */
+function valueStatusOf(answer: ChatAnswer, v: ChatValue): ValueStatus {
+  const src = answer.sources.find((s) => s.id === v.source_id);
+  return chatValueStatus(v.certainty, src?.status);
+}
+
+/** What the source viewer opens for a citation: its passage (the text view) and its anchor (the page or structured
+ * view), with a value's or measurement's status; null for an id with no place in a document (C#, A#). */
+export function citedTarget(answer: ChatAnswer, id: string): ViewerTarget | null {
+  const source = citedSource(answer, id);
+  if (!source) return null;
+  const s = answer.sources.find((x) => x.id === id);
+  if (s) return { id, source, anchor: documentAnchor(s.anchor) };
+  const v = answer.values?.find((x) => x.id === id);
+  if (v) {
+    // the cell or quoted words it was taken from; else the passage it was verified in
+    const passage = answer.sources.find((x) => x.id === v.source_id);
+    return {
+      id,
+      source,
+      anchor: documentAnchor(v.anchor) ?? documentAnchor(passage?.anchor),
+      valueStatus: valueStatusOf(answer, v),
+    };
+  }
+  const m = answer.measurements.find((x) => x.id === id);
+  if (m) return { id, source, anchor: documentAnchor(m.anchor), valueStatus: measurementValueStatus(m) };
+  return null;
+}
+
+/** The viewer's targets for a chip: the answer's citations in answer order (those with a place in a document), the
+ * clicked one current. */
+export function answerNav(answer: ChatAnswer, id: string): ViewerNav | null {
+  const items: ViewerTarget[] = [];
+  for (const cid of citationOrder(answer.markdown)) {
+    const t = citedTarget(answer, cid);
+    if (t) items.push(t);
+  }
+  let index = items.findIndex((t) => t.id === id);
+  if (index < 0) {
+    // cited only in the details (not in the text): it opens alone
+    const t = citedTarget(answer, id);
+    if (!t) return null;
+    items.splice(0, items.length, t);
+    index = 0;
+  }
+  return { items, index };
 }
 
 function citationTargets(answer: ChatAnswer): Map<string, CitationTarget> {
@@ -191,6 +260,7 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop }: A
       <div className="body" dir="rtl">
         <Markdown markdown={answer.markdown} citations={citations} onCite={cite} />
       </div>
+      {answer.verification && <AnswerQuality verification={answer.verification} />}
       <div className="msg-actions">
         <button type="button" className="icon-btn" onClick={copy} aria-label="העתקת התשובה" title="העתקה">
           {copied ? "✓" : "⧉"}
@@ -204,6 +274,38 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop }: A
         {answer.status === "not_found" && <span className="note">לא נמצא במקורות</span>}
       </div>
       <AnswerDetails answer={answer} citations={citations} onCite={cite} />
+    </div>
+  );
+}
+
+/** Claim correctness and answer completeness, apart (R19): nothing for a complete answer whose claims all held;
+ * otherwise one short line for each that falls short. Answers stored before either was reported show nothing new. */
+function AnswerQuality({ verification }: { verification: ChatVerification }) {
+  const completeness = verification.completeness;
+  const correctness = verification.correctness;
+  const incomplete = completeness && completeness.status !== "full";
+  const doubtful = correctness && correctness !== "verified";
+  if (!incomplete && !doubtful) return null;
+  return (
+    <div className="answer-quality">
+      {incomplete && (
+        <p className="completeness-line" data-testid="completeness" data-status={completeness.status}>
+          <strong>{COMPLETENESS_LEAD[completeness.status] ?? "התשובה חלקית"}:</strong>{" "}
+          {completeness.missing.map((m, i) => (
+            <span key={m.id} data-testid="completeness-gap">
+              {i > 0 && "; "}
+              <bdi>{m.text}</bdi>
+              {m.status === "partial" && " (ניתן בחלקו)"}
+              {m.reason_text && <> — {m.reason_text}</>}
+            </span>
+          ))}
+        </p>
+      )}
+      {doubtful && (
+        <p className="correctness-line" data-testid="correctness" data-status={correctness}>
+          {CORRECTNESS_LINE[correctness]}
+        </p>
+      )}
     </div>
   );
 }
@@ -250,7 +352,8 @@ function AnswerDetails({
                   .map((x) => ` · ${x}`)
                   .join("")}
                 {" — "}
-                {m.title} ({STATUS[m.status] ?? m.status})
+                {m.title}{" "}
+                <ValueStatusBadge status={measurementValueStatus(m)} />
               </li>
             ))}
           </ul>
@@ -287,10 +390,13 @@ function AnswerDetails({
         </div>
       )}
       {verification && changed === 0 && (
-        <div className="details-section">
+        <div className="details-section" data-testid="verification">
           <h4>אימות</h4>
-          <p>{verification.judged ? "כל הטענות נבדקו מול המקורות המצוטטים." : "הטענות בתשובה זו לא נבדקו מול המקורות (תשובה מגרסה קודמת, שבה בדיקה שנכשלה לא עצרה את התשובה). יש לבדוק במקור לפני שימוש."}</p>
+          <p>{checkedText(verification)}</p>
         </div>
+      )}
+      {answer.ledger?.requirements && answer.ledger.requirements.length > 0 && (
+        <RequirementsSection requirements={answer.ledger.requirements} />
       )}
       {answer.searches.length > 0 && (
         <div className="details-section">
@@ -305,6 +411,47 @@ function AnswerDetails({
         </div>
       )}
     </details>
+  );
+}
+
+/** What verification says when it changed nothing: "every claim held" only when the claims were verified and the
+ * answer gives everything the question asked; never a blanket claim over an incomplete or partly verified answer. */
+function checkedText(v: ChatVerification): string {
+  if (!v.judged) {
+    return "הטענות בתשובה זו לא נבדקו מול המקורות (תשובה מגרסה קודמת, שבה בדיקה שנכשלה לא עצרה את התשובה). יש לבדוק במקור לפני שימוש.";
+  }
+  if (v.correctness && v.correctness !== "verified") return CORRECTNESS_LINE[v.correctness];
+  if (v.completeness && v.completeness.status !== "full") {
+    return "הטענות שבתשובה נבדקו מול המקורות המצוטטים, אך התשובה אינה עונה על כל מה שנשאל (פירוט בדרישות השאלה).";
+  }
+  return "כל הטענות נבדקו מול המקורות המצוטטים.";
+}
+
+/** Each requirement of the question and how the answer gave it, with the reason a part is missing (R19, R21). */
+function RequirementsSection({ requirements }: { requirements: ChatRequirement[] }) {
+  return (
+    <div className="details-section" data-testid="requirements">
+      <h4>דרישות השאלה</h4>
+      <ul>
+        {requirements.map((r) => (
+          <li key={r.id} data-testid="requirement" data-status={r.status}>
+            <bdi>{r.text}</bdi>
+            {r.calculation && " (חישוב)"} — {REQUIREMENT_STATUS[r.status] ?? r.status}
+            {r.status !== "full" && r.limitation_text && <> · {r.limitation_text}</>}
+            {r.status !== "full" && r.reason && <span className="muted"> · {r.reason}</span>}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** A value's status with its icon and words, and its meaning on hover (R25). */
+function ValueStatusBadge({ status }: { status: ValueStatus }) {
+  return (
+    <span className="value-status" data-testid="value-status" data-status={status} title={VALUE_STATUS[status].description}>
+      ({valueStatusText(status)})
+    </span>
   );
 }
 
@@ -417,7 +564,8 @@ function CalculationsSection({ answer, onCite }: { answer: ChatAnswer; onCite: (
                   .join("")}
                 {" — "}
                 {v.title}, {v.locator.row ? `שורה «${v.locator.row}», עמודה «${v.locator.column}»` : v.location}
-                {v.certainty === "model_asserted" && " · חלק ממשמעות הערך נקבע ולא נמצא במקור"}
+                {v.certainty === "model_asserted" && " · חלק ממשמעות הערך נקבע ולא נמצא במקור"}{" "}
+                <ValueStatusBadge status={valueStatusOf(answer, v)} />
               </li>
             ))}
           </ul>
