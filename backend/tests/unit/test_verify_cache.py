@@ -514,3 +514,37 @@ def test_a_follow_up_whose_component_part_is_invalid_uses_the_rest_and_the_judge
     assert "<derive_requirements>" in seen[0]
     assert out.summary["requirements_origin"] == "judge" and out.summary["requirements_fallback"] == "invalid"
     assert [u["purpose"] for u in out.usage].count("request") == 0
+
+
+# --- a repairable failure kind is sent to the repair round, and the decision records it (round 7 U4, KTD10) -------
+
+def _wrong_subject_judge(input: str) -> dict:
+    return {"verdicts": [{"index": i, "reason": "בדיקה"} | (
+        {"verdict": "unsupported", "failure": "wrong_subject"} if "מושכר" in t else {"verdict": "supported"})
+        for i, t in _units(input).items()]}
+
+
+def _user_prompts(agent: ScriptedAgent) -> list[str]:
+    return list(dict.fromkeys(i["content"] for step in agent.seen for i in step if isinstance(i, dict)
+                              and i.get("role") == "user" and isinstance(i.get("content"), str)))
+
+
+def test_a_repairable_kind_goes_to_the_repair_round_with_its_kind_and_ids_and_the_decision_records_the_attempt(
+        offline):
+    agent = ScriptedAgent([SEARCH, final(THREE), final(THREE), final(THREE)], judge=_wrong_subject_judge)
+    out = _turn(agent)
+    repairs = [p for p in _user_prompts(agent) if p.startswith("בדיקת האימות")]
+    assert len(repairs) == 1  # one repair round with tools, within the existing budget
+    assert verify.FAILURE_LABELS["wrong_subject"] in repairs[0] and "S1" in repairs[0]
+    assert len(agent.seen) <= 2 + max(0, min(2, get_settings().chat_repair_rounds))
+    (decision,) = out.report.removals()
+    assert decision.failure_kind == "wrong_subject" and decision.repair_attempted is True
+    assert "מושכר" not in out.answer.answer_markdown
+
+
+def test_a_removal_with_no_repair_round_records_that_none_was_attempted(offline, monkeypatch):
+    monkeypatch.setattr(engine, "REPAIR_TIME_FACTOR", 1e12)  # no repair round fits
+    agent = ScriptedAgent([SEARCH, final(THREE)], judge=_wrong_subject_judge)
+    out = _turn(agent)
+    (decision,) = out.report.removals()
+    assert decision.failure_kind == "wrong_subject" and decision.repair_attempted is False

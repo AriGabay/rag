@@ -686,3 +686,66 @@ def test_tidy_drops_orphan_markers_and_repeated_lines_but_keeps_tables():
           "**דמי הניהול** לא נמצא בחיפוש במסמכים שנבדקו.\n\n| א | ב |\n|---|---|\n| 1 | 2 |")
     out = coverage.tidy(md)
     assert out == ("**דמי הניהול** לא נמצא בחיפוש במסמכים שנבדקו.\n\nטקסט [S1].\n\n| א | ב |\n|---|---|\n| 1 | 2 |")
+
+
+# --- a removal names its component and its failure kind (round 7 U4: KTD5, R7, R12, AE3) ---------------------------
+
+def _wrong_property(text: str) -> dict:
+    return ({"verdict": "unsupported", "failure": "wrong_subject"} if "שכירות" in text else {"verdict": "supported"})
+
+
+def _structured_judge(score, rule) -> ScriptedProvider:
+    """A judge whose verdict on each unit is ``rule(text)`` (a dict of the verdict's fields), with ``score`` as
+    ``_judge``'s; the removed units it is shown join the call's units for the scores."""
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        units = {int(i): t for i, t in re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S)}
+        removed = {int(i): t for i, t in re.findall(r'<removed_unit index="(\d+)">\n(.*?)\n</removed_unit>', input,
+                                                    re.S)}
+        frozen = re.findall(r'<requirement id="(N[\d.]+)"[^>]*>\n(.*?)\n</requirement>', input, re.S)
+        return {"verdicts": [{"index": i, "reason": "בדיקה"} | rule(t) for i, t in units.items()],
+                "requirements": score(frozen, units | removed)}
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    return p
+
+
+def test_ae3_a_claim_citing_another_propertys_value_is_removed_as_wrong_property_and_its_component_is_named():
+    ws = _ws()
+    turn = _turn({"id": "1", "text": "השווי למ\"ר"}, {"id": "2", "text": "דמי השכירות"})
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nדמי השכירות בנכס הם 55 ₪ למ\"ר לחודש [S1].")
+    p = _structured_judge(_scores({"N1": {"status": "full", "units": [0]}, "N2": {"status": "full", "units": [1]}}),
+                          _wrong_property)
+    r = verify_answer(p, a, ws, "?", [], requirements=turn)
+    final, outcomes = _finish(ws, a, r, turn)
+    (decision,) = r.removals()
+    assert (decision.failure_kind, decision.component, decision.checked_ids) == ("wrong_subject", "N2", ["S1"])
+    rent = outcomes[1]
+    assert rent["status"] == "not_answered" and rent["limitation"] == "removed"
+    assert rent["removal_kinds"] == ["wrong_subject"]
+    assert "דמי השכירות בנכס" not in final.answer_markdown
+    (gap,) = [g for g in r.gaps if g["components"] == ["N2"]]
+    assert gap["reason"] == "removed" and "**דמי השכירות**" in gap["text"] and "לנכס או לצד אחר" in gap["text"]
+    assert gap["text"] in final.answer_markdown
+    assert r.counts()["removals"] == [{"failure_kind": "wrong_subject", "component": "N2",
+                                       "text": verify.REMOVAL_SENTENCES["wrong_subject"]}]
+
+
+def test_a_claim_the_deterministic_checks_removed_is_shown_to_the_judge_so_its_component_is_known():
+    ws = _ws()
+    turn = _turn({"id": "1", "text": "השווי למ\"ר"}, {"id": "2", "text": "דמי השכירות"})
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nדמי השכירות הם 1,234 ₪ למ\"ר לחודש [S1].")
+    seen: list[str] = []
+
+    def score(frozen, units):
+        seen.append(json.dumps(units, ensure_ascii=False))
+        return [_req("", "full", [i for i, t in units.items() if ask.split()[0] in t], id=n) for n, ask in frozen]
+
+    r = verify_answer(_structured_judge(score, lambda t: {"verdict": "supported"}), a, ws, "?", [], requirements=turn)
+    assert "1,234" in seen[0]  # the removed unit was in the call, as removed
+    (decision,) = r.removals()
+    assert (decision.failure_kind, decision.check, decision.component) == ("absent_from_source", "unstated_number", "N2")
+    _, outcomes = _finish(ws, a, r, turn)
+    assert [(o["id"], o["status"], o["limitation"], o["removed_units"]) for o in outcomes] == [
+        ("N1", "full", None, []), ("N2", "not_answered", "removed", [1])]

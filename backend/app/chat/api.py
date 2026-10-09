@@ -10,8 +10,14 @@ next check — a model call already in flight is waited for and its result disca
 turn's bound. Conversations and messages are per user (RLS ``user_isolation``) and per office.
 
 What verification removed, and why, is kept for diagnosis in ``message_diagnostics``, not in the answer: the
-normal message API gives counts only. ``GET /messages/{id}/diagnostics`` returns the detail to the message's
-owner and to an office admin (audited), and only while every document behind the answer is visible to them.
+normal message API gives counts, and — round 7 U4 (KTD5, R12, R13) — one summary per removal: its failure kind, its
+component and the server's fixed sentence for that kind (``verify.REMOVAL_SENTENCES``), never the claim's text or a
+judge's words. ``message_diagnostics.removed`` keeps only the problems that removed a claim, each with its decision
+(the draft text, the factual reason, the check that fired, the failure kind, the component, the ids checked, whether a
+repair was attempted) and the sources it was checked against. ``GET /messages/{id}/diagnostics`` returns the detail
+to the message's owner and to an office admin (audited), and only while every document behind the answer — the
+documents every removal was checked against included — is visible to them; those documents are behind the message
+too (``removal_documents``), so revoking one hides both.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -30,7 +37,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
 from app.audit import audit
-from app.chat import anchors, coverage, engine
+from app.chat import anchors, coverage, engine, verify
 from app.config import get_settings
 from app.db import TenantContext, current_data_version, tenant_tx
 from app.deps import NOT_FOUND, get_ctx, parse_uuid
@@ -209,7 +216,28 @@ def public_verification(v: dict) -> dict:
             "partial": v.get("partial", sum(1 for p in problems if p.get("severity") == "partial")),
             "annotated": v.get("annotated", 0), "request_mismatch": v.get("request_mismatch", False)} | {
         # claim correctness and answer completeness, shown apart (answers stored before them have neither)
-        k: v[k] for k in ("correctness", "completeness") if k in v}
+        k: v[k] for k in ("correctness", "completeness") if k in v} | (
+        # each removal's kind, component and the server's fixed sentence, rebuilt here from the kind (KTD5)
+        {"removals": public_removals(v["removals"])} if isinstance(v.get("removals"), list) else {})
+
+
+_COMPONENT_ID = re.compile(r"N\d+(?:\.\d+)*")
+
+
+def public_removals(items: list) -> list[dict]:
+    """The removal summaries the normal path shows: a known failure kind, a component id and the fixed sentence for
+    the kind — nothing else that was stored passes."""
+    out = []
+    for r in items:
+        kind = r.get("failure_kind") if isinstance(r, dict) else None
+        if kind not in verify.REMOVAL_SENTENCES:
+            continue
+        component = r.get("component")
+        out.append({"failure_kind": kind,
+                    "component": component if isinstance(component, str) and _COMPONENT_ID.fullmatch(component)
+                    else None,
+                    "text": verify.REMOVAL_SENTENCES[kind]})
+    return out
 
 
 def _answer_documents(answer: dict | None) -> set[str]:
@@ -232,6 +260,7 @@ def _answer_documents(answer: dict | None) -> set[str]:
     ids |= {c.get("document_id") for c in (answer.get("request") or {}).get("candidates") or []}
     ids |= {d for r in answer.get("requested") or [] for d in r.get("document_ids") or []}
     ids |= set(answer.get("touched_documents") or [])
+    ids |= set(answer.get("removal_documents") or [])  # what each removal was checked against (round 7 KTD5)
     ids |= anchors.anchored_documents(answer)
     ids.discard(None)
     return ids
@@ -651,6 +680,8 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
         "components": coverage.public_components((outcome.ledger or {}).get("requirements") or []),
         "gaps": list(outcome.report.gaps),
         "touched_documents": sorted(ws.activity),
+        # the documents each removal was checked against (round 7 KTD5): the message is shown only while they are
+        "removal_documents": sorted(_removal_documents(ws, outcome.report)),
     }
     # every cited source, value and measurement keeps where it points, resolved against the turn's pinned readings
     # (KTD1); a computation keeps its inputs
@@ -658,15 +689,80 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
     return payload
 
 
+def _checked_ids(ws, ids: list[str]) -> list[str]:
+    """The ids a removal was checked against, with what they rest on: a value's passage, and a calculation's inputs,
+    leaves and passages (each once, in order)."""
+    out: list[str] = []
+    todo = list(ids)
+    while todo:
+        i = todo.pop(0)
+        if i in out:
+            continue
+        out.append(i)
+        if i in ws.values:
+            todo.append(ws.values[i].source_id)
+        elif i in ws.computations:
+            c = ws.computations[i]
+            todo += [x["id"] for x in c.inputs] + list(c.leaves) + list(c.sources or [])
+    return [i for i in out if any(i in d for d in (ws.sources, ws.values, ws.measurements, ws.computations,
+                                                   ws.assumptions))]
+
+
+def _checked_record(ws, i: str) -> tuple[str, dict]:
+    """One id a removal was checked against, as the diagnostics route serves it, under its kind's key."""
+    if i in ws.sources:
+        return "sources", _public_source(ws.sources[i])
+    if i in ws.values:
+        return "values", ws.values[i].public()
+    if i in ws.measurements:
+        return "measurements", ws.measurements[i].public()
+    if i in ws.computations:
+        return "computations", ws.computations[i].public()
+    return "assumptions", ws.assumptions[i].public()
+
+
+def _record_documents(record: dict) -> set[str]:
+    return {d for d in [record.get("document_id"), *(record.get("listed_document_ids") or [])] if d}
+
+
+def _removal_documents(ws, report) -> set[str]:
+    """The documents every removal was checked against (``_checked_ids``)."""
+    return {d for p in report.removals() for i in _checked_ids(ws, p.checked_ids or [])
+            for d in _record_documents(_checked_record(ws, i)[1])}
+
+
+def _removal_decisions(ws, report) -> list[dict]:
+    """Each removal's decision (round 7 KTD5, R12): the unit's draft text, the factual reason, the check that fired,
+    the failure kind, the component, the ids checked and whether a repair was attempted, with ``sources`` — each id
+    it was checked against (and what that rests on) as the client opens it, with its anchor (``anchors.attach``,
+    resolved against the turn's pinned readings) and its ``type`` (``sources``, ``values``, ``measurements``,
+    ``computations``, ``assumptions``)."""
+    removals = report.removals()
+    closure = {id(p): _checked_ids(ws, p.checked_ids or []) for p in removals}
+    records: dict[str, dict] = {}
+    grouped: dict[str, list[dict]] = {}
+    for i in dict.fromkeys(i for ids in closure.values() for i in ids):
+        key, record = _checked_record(ws, i)
+        records[i] = record | {"type": key}
+        grouped.setdefault(key, []).append(records[i])
+    if records:
+        anchors.attach(ws, grouped)
+    return [p.as_dict() | {"sources": [records[i] for i in closure[id(p)]]} for p in removals]
+
+
 def _diagnostics(outcome: engine.TurnOutcome, payload: dict) -> dict:
-    """What each verification round found (first answer, repair, rewrite) and what the final answer lost, with
-    every document behind the answer (the reader must see them all)."""
+    """What each verification round found (first answer, repair, rewrite) and — only — the decisions of what the final
+    answer lost (``_removal_decisions``), with every document behind the answer and behind each removal (the reader
+    must see them all)."""
     resolution = outcome.resolution or None
     lookup = (resolution or {}).get("lookup") or {}
     found = {d["document_id"] for d in lookup.get("documents") or []}
     found |= set(((resolution or {}).get("parse") or {}).get("document_ids") or [])
-    return {"rounds": outcome.rounds, "removed": [p.as_dict() for p in outcome.report.problems],
-            "resolution": resolution, "document_ids": _answer_documents(payload) | found,
+    removed = _removal_decisions(outcome.workspace, outcome.report)
+    checked = {d for r in removed for s in r["sources"] for d in _record_documents(s)}
+    checked |= {d for r in removed for s in r["sources"] for d in anchors.anchored_documents({s["type"]: [s]})}
+    return {"rounds": outcome.rounds, "removed": removed, "resolution": resolution,
+            "document_ids": _answer_documents(payload) | found | checked,
             "limits_hit": list(outcome.workspace.limits_hit)}
 
 

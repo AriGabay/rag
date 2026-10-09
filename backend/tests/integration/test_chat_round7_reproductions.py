@@ -201,10 +201,6 @@ F4_ANSWER = ("השווי למ\"ר הוא 9,500 ₪ [S1].\n"
              "הנכס פנוי ומושכר בחלקו [S1].")
 
 
-@pytest.mark.xfail(strict=True, reason="round 7 F4: a removal keeps only text, reason, severity and kind "
-                                       "(Problem.as_dict); diagnostics 'removed' holds every problem, removals or not "
-                                       "(api._diagnostics), and the public verification is counts only "
-                                       "(api.public_verification)")
 def test_f4_a_removal_is_recorded_with_its_failure_kind_and_the_sources_checked(offline):
     offline.text, offline.section = F4_SOURCE, "סיכום"
 

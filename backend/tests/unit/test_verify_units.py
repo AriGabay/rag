@@ -4,6 +4,7 @@ server's handling of its verdicts and failures, not the model's judgement. Synth
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 
@@ -604,3 +605,178 @@ def test_the_judges_verdicts_are_kept_on_the_report():
     r = verify_answer(_judge(lambda t: "not_factual" if "פנוי" in t else "supported"),
                       _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nהנכס פנוי."), _ws(SOURCE), "?", [])
     assert r.verdicts == {0: "supported", 1: "not_factual"}
+
+
+# --- structured removal decisions (round 7 U4: KTD5, KTD10; R12, R14, R15) -----------------------------------------
+
+BIG = "סיכום: שווי הנכס הוא 1,530,000 ₪. השווי למ\"ר הוא 14,250 ₪. הנכס פנוי."
+
+
+def _decided(rule) -> ScriptedProvider:
+    """A judge answering each unit by ``rule(text, input) -> dict`` (the verdict's fields; ``verdict`` at least), or
+    None to leave the unit out."""
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        out = []
+        for m in re.finditer(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S):
+            v = rule(m.group(2), input)
+            if v is not None:
+                out.append({"index": int(m.group(1)), "reason": "השווי שייך לנכס אחר"} | v)
+        return {"verdicts": out}
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    return p
+
+
+def test_the_judge_verdict_carries_a_failure_kind_and_dependencies_with_defaults_for_older_replies():
+    v = verify.JudgeVerdict(index=0, verdict="unsupported", reason="x")
+    assert v.failure == "none" and v.depends_on == []
+    fields = verify.JudgeVerdict.model_fields
+    assert {"failure", "depends_on"} <= set(fields)
+    assert set(verify.FAILURE_KINDS) == {"absent_from_source", "wrong_subject", "wrong_unit", "uncertain_reading",
+                                         "contradicts_source", "wrong_calculation", "invalid_citation", "not_checked"}
+    # the judge never says "not checked": that is the server's when a check did not finish
+    assert "not_checked" not in verify.JudgeVerdict.model_json_schema()["properties"]["failure"]["enum"]
+    assert "failure" in verify.JUDGE_POLICY and "depends_on" in verify.JUDGE_POLICY
+
+
+def test_a_judges_wrong_property_verdict_is_removed_as_wrong_subject_with_the_sources_checked():
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nדמי השכירות בנכס הם 55 ₪ למ\"ר לחודש [S1].")
+    p = _decided(lambda t, _: {"verdict": "unsupported", "failure": "wrong_subject"} if "שכירות" in t
+                 else {"verdict": "supported"})
+    r = verify_answer(p, a, _ws(SOURCE), "?", [])
+    (decision,) = r.removals()
+    assert (decision.unit.index, decision.failure_kind, decision.check) == (1, "wrong_subject", "judge")
+    assert decision.checked_ids == ["S1"] and decision.repair_attempted is False
+    stored = decision.as_dict()
+    assert {"failure_kind", "check", "component", "checked_ids", "repair_attempted"} <= set(stored)
+
+
+def test_an_unsupported_verdict_without_a_failure_kind_is_absent_from_the_source():
+    a = _answer("הנכס מושכר לטווח ארוך [S1].")
+    r = verify_answer(_judge(lambda t: "unsupported"), a, _ws(SOURCE), "?", [])
+    assert [(d.failure_kind, d.check) for d in r.removals()] == [("absent_from_source", "judge")]
+
+
+@pytest.mark.parametrize("markdown, sources, kind, check", [
+    ("השווי למ\"ר הוא 9,500 ₪ [S7].", (SOURCE,), "invalid_citation", "unknown_id"),
+    ("השווי למ\"ר הוא 1,234 ₪ [S1].", (SOURCE,), "absent_from_source", "unstated_number"),
+    ("השווי למ\"ר הוא 9,500 ₪ כולל מע\"מ [S1].", ("השווי למ\"ר הוא 9,500 ₪ ללא מע\"מ. דמי הניהול 12 ₪ כולל מע\"מ.",),
+     "wrong_unit", "vat"),
+])
+def test_each_deterministic_check_sets_its_failure_kind(markdown, sources, kind, check):
+    r = verify_answer(_judge(lambda t: "supported"), _answer(markdown), _ws(*sources), "?", [])
+    (decision,) = r.removals()
+    assert (decision.failure_kind, decision.check) == (kind, check)
+    assert decision.checked_ids == verify.split_units(markdown)[0].ids
+
+
+@pytest.mark.parametrize("claim", [
+    "שווי הנכס הוא 1.53 מיליון ₪ [S1].",  # an equivalent representation of 1,530,000
+    "השווי למ\"ר הוא כ-14 אלף ₪ (בעיגול) [S1].",  # 14,250 rounded, and marked as rounded
+    "השווי למ\"ר הוא כ-14 אלף ₪ (מעוגל מ-14,250 ₪) [S1].",
+    "השווי למ\"ר הוא 14,250 ש\"ח, [S1].",  # punctuation and another spelling of the currency
+])
+def test_a_valid_claim_is_never_removed_for_its_representation_or_a_marked_correct_rounding(claim):
+    r = verify_answer(_judge(lambda t: "supported"), _answer(claim), _ws(BIG), "?", [])
+    assert not r.removed_units(), r.problems_text()
+
+
+@pytest.mark.parametrize("claim", [
+    "שווי הנכס הוא 1.6 מיליון ₪ [S1].",  # not 1,530,000 at the precision shown
+    "השווי למ\"ר הוא כ-15 אלף ₪ [S1].",  # 14,250 does not round to 15 thousand
+    "שווי הנכס הוא 1.53 אלף ₪ [S1].",  # another scale is another number
+])
+def test_a_wrong_number_in_another_representation_is_still_removed(claim):
+    r = verify_answer(_judge(lambda t: "supported"), _answer(claim), _ws(BIG), "?", [])
+    assert [d.failure_kind for d in r.removals()] == ["absent_from_source"]
+
+
+def test_a_judge_timeout_on_one_batch_records_its_units_as_not_checked_never_as_wrong(monkeypatch):
+    monkeypatch.setattr(verify, "JUDGE_MAX_UNITS", 1)
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str):
+        if 1 in _indexes(input):  # the batch of the second unit
+            return StructuredResult(CallStatus.TIMEOUT, detail="timeout")
+        return {"verdicts": [{"index": n, "verdict": "supported", "reason": "ok"} for n in _indexes(input)]}
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nהנכס פנוי [S1].")
+    usage: list = []
+    r = verify_answer(p, a, _ws(SOURCE), "?", usage)
+    (decision,) = r.removals()
+    assert (decision.unit.index, decision.failure_kind) == (1, "not_checked")
+    assert len(usage) == 3  # the batch that timed out was tried twice, never a third time
+    (summary,) = r.counts()["removals"]
+    assert summary == {"failure_kind": "not_checked", "component": None,
+                       "text": verify.REMOVAL_SENTENCES["not_checked"]}
+    assert "שגוי" not in summary["text"].replace("לא נמצאה שגויה", "") and "תמיכה" not in summary["text"]
+    out = r.apply(a).answer_markdown
+    assert "פנוי" not in out and "לא נמצאה להן תמיכה" not in out and "לא ניתן היה לבדוק" in out
+
+
+def test_a_judge_that_fails_on_every_batch_still_fails_the_verification(monkeypatch):
+    monkeypatch.setattr(verify, "JUDGE_MAX_UNITS", 1)
+    p = ScriptedProvider().on(Purpose.VERIFY, CallStatus.TIMEOUT, repeat=True)
+    with pytest.raises(VerificationUnavailable):
+        verify_answer(p, _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nהנכס פנוי [S1]."), _ws(SOURCE), "?", [])
+
+
+def test_a_unit_the_judge_left_out_is_not_checked():
+    p = _judge(lambda t: None if "פנוי" in t else "supported")
+    r = verify_answer(p, _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nהנכס פנוי."), _ws(SOURCE), "?", [])
+    assert [(d.failure_kind, d.check) for d in r.removals()] == [("not_checked", "judge")]
+
+
+def test_a_conclusion_resting_on_a_removed_claim_is_removed_too_and_no_broken_list_item_remains():
+    md = ("- השווי למ\"ר הוא 9,500 ₪ [S1].\n"
+          "- דמי השכירות הם 1,234 ₪ למ\"ר לחודש [S1].\n"
+          "- מכאן עולה שהנכס מניב תשואה גבוהה.")
+    seen: list[str] = []
+
+    def rule(text, input):
+        seen.append(input)
+        if "מכאן" in text:  # its conclusion rests on the removed rent (unit 1), shown to the judge as removed
+            return {"verdict": "supported", "depends_on": [1]}
+        return {"verdict": "supported"}
+
+    a = _answer(md)
+    r = verify_answer(_decided(rule), a, _ws(SOURCE), "?", [])
+    assert '<removed_unit index="1">' in seen[0] and "1,234" in seen[0]
+    assert r.removed_units() == {1, 2}
+    dependent = next(d for d in r.removals() if d.unit.index == 2)
+    assert dependent.check == "dependency" and dependent.failure_kind == "absent_from_source"
+    out = r.apply(a).answer_markdown
+    assert out.split("\n\n")[0] == "- השווי למ\"ר הוא 9,500 ₪ [S1]."
+
+
+def test_a_dependency_on_a_kept_claim_removes_nothing():
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nמכאן עולה שהנכס יקר יחסית.")
+    p = _decided(lambda t, _: {"verdict": "supported", "depends_on": [0]} if "מכאן" in t else {"verdict": "supported"})
+    assert verify_answer(p, a, _ws(SOURCE), "?", []).ok
+
+
+def test_the_public_removal_summary_has_the_kind_and_a_fixed_sentence_never_the_claim_or_the_judges_reason():
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nדמי השכירות בנכס הם 55 ₪ למ\"ר לחודש [S1].\nהנכס פנוי [S1].")
+    p = _decided(lambda t, _: {"verdict": "unsupported", "failure": "wrong_subject"} if "שכירות" in t
+                 else {"verdict": "partial", "defect": "none"} if "פנוי" in t else {"verdict": "supported"})
+    r = verify_answer(p, a, _ws(SOURCE), "?", [])
+    counts = r.counts()
+    assert counts["removed"] == len(counts["removals"]) == 1
+    (summary,) = counts["removals"]
+    assert summary == {"failure_kind": "wrong_subject", "component": None,
+                       "text": verify.REMOVAL_SENTENCES["wrong_subject"]}
+    shown = json.dumps(counts, ensure_ascii=False)
+    assert "שכירות" not in shown and "השווי שייך לנכס אחר" not in shown
+    assert set(verify.REMOVAL_SENTENCES) == set(verify.FAILURE_KINDS)
+
+
+def test_the_repair_prompt_names_each_problems_failure_kind_and_the_ids_checked():
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nדמי השכירות בנכס הם 55 ₪ למ\"ר לחודש [S1].")
+    p = _decided(lambda t, _: {"verdict": "unsupported", "failure": "wrong_subject"} if "שכירות" in t
+                 else {"verdict": "supported"})
+    text = verify_answer(p, a, _ws(SOURCE), "?", []).problems_text()
+    assert verify.FAILURE_LABELS["wrong_subject"] in text and "S1" in text
+    assert verify.REPAIR_HINTS["wrong_subject"] in text

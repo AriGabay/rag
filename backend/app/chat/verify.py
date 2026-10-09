@@ -39,6 +39,23 @@ sentences only: a numbered heading ("9. השומה", "9.1 שיטת השומה") 
 text, a bullet or heading whose content went goes with it, and a failed table header takes its whole table, so no
 fragment or broken table is left; a partly supported unit is kept and marked.
 
+Every removal is a structured decision, made where its check fires (round 7 U4: KTD5, KTD10; R12–R15): the
+``Problem`` carries its failure kind (``FAILURE_KINDS``), the check (``unknown_id`` — invalid citation;
+``unstated_number`` — absent from the source; ``computation_mismatch`` and ``framed_result`` — wrong calculation;
+``misattribution`` — wrong property or party; ``vat`` and ``meaning`` — wrong unit; ``judge``, whose ``unsupported``
+verdict names a ``failure`` (defaulting from what the unit cites: a calculation, an uncertain reading, else absent
+from the source); ``dependency``), the component it gave (``N#``, from the judge's scores), the ids it was checked
+against and whether a repair round was asked to fix it. A check that did not finish — a judge call that failed
+twice while other calls answered, a unit the judge left out or misclassified — removes the unit as ``not_checked``:
+kept out of the answer, never called wrong (when no call answers at all, ``VerificationUnavailable`` still fails the
+turn). The units the deterministic checks removed are shown to the judge as removed (``<removed_units>``), so it names
+the component they gave and the surviving units whose conclusion rests on a removed claim (``depends_on``); such a
+unit is removed too, with that claim's kind. The repair prompt gives each problem's kind, the ids checked and how a
+repair of that kind goes (``REPAIR_HINTS``). The user's normal path gets one summary per removal — kind, component and
+the server's fixed sentence (``REMOVAL_SENTENCES``), never the claim or a judge's words (``VerifyReport.counts``). A
+number of the evidence shown with a scale word, or a correct rounding marked as one ("1.53 מיליון" for 1,530,000,
+"כ-14 אלף" for 14,250), is the evidence's number (``_restated``, R14).
+
 The second plane is completeness (R18–R21), apart from correctness. What the request requires is frozen before
 the answer (round 7 KTD1): the request's typed components (``app.chat.request``: information, calculation,
 instruction, assumption, clarification, with a parent, a condition and a subject), from the first turn's request
@@ -92,6 +109,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -185,7 +203,17 @@ JUDGE_POLICY = (
     "אומדן. יחידה שמציגה כקביעה, כהחלטה או כמסקנה שאומצה ערך שהראיה (הסעיף, הייחוס או הטקסט) מציגה כעמדת צד, "
     "טענה, הצעה או אומדן — unsupported; ערך של צד שמיוחס לאותו צד — supported. הופעת המספר במסמך ההחלטה אינה "
     "הופכת אותו להחלטה. כשהבקשה שואלת מה נקבע או אומץ, הייחוס לא ידוע ושום דבר בראיה אינו מראה שהערך אומץ — "
-    "partial (defect part), אלא אם היחידה אומרת שלא ברור אם הערך אומץ. ייחוס שסומן כקביעת המודל אינו ראיה."
+    "partial (defect part), אלא אם היחידה אומרת שלא ברור אם הערך אומץ. ייחוס שסומן כקביעת המודל אינו ראיה. "
+    "(13) failure: ל-unsupported ציין את סוג הכשל — absent_from_source (המקורות אינם מציינים זאת), contradicts_source "
+    "(המקורות סותרים זאת), wrong_subject (הערך שייך לנכס, לפרויקט, לשלב או לצד אחר מזה שהיחידה מייחסת לו), wrong_unit "
+    "(יחידה, תקופה, מע\"מ או בסיס שטח אחרים), uncertain_reading (נשען על ערך שנקרא בקריאה לא ודאית, או על תוצאה מותנית "
+    "שהוצגה כוודאית), wrong_calculation (קלט, הנחה, נוסחה, יחידות או מסגור שגויים של חישוב), invalid_citation (מצטט "
+    "מזהה שאינו המקור של הטענה); לכל verdict אחר — none. "
+    "(14) depends_on: יחידה שמסקנתה נשענת על טענה של יחידה אחרת בקלט (\"מכאן עולה\", \"לכן\", השוואה לערך שנאמר "
+    "ביחידה אחרת) — ציין את מספרי ה-index של היחידות שהיא נשענת עליהן, גם יחידות מ-<removed_units>; אחרת ריק. "
+    "<removed_units> הן יחידות שהשרת כבר הסיר מהתשובה בבדיקה שלו: אל תשפוט אותן ואל תיתן להן verdict. "
+    "(15) כתיבה של אותו מספר במילת סדר גודל (1.53 מיליון ל-1,530,000 במקור) ועיגול נכון שהתשובה מסמנת כמקורב "
+    "(\"כ-14 אלף\" ל-14,250) אינם סיבה לפסול."
 )
 
 
@@ -212,7 +240,8 @@ JUDGE_REQUIREMENTS_POLICY = (
     "שאומרות שהדרישה, או חלק ממנה, חסרה, לא נמצאה, לא מופיעה או שאי אפשר להכריע בה. ב-related ציין את המזהים "
     "מ-<workspace> שנוגעים לה: הערכים, הנתונים והחישובים שמחזיקים אותה או את הקלטים שלה (לא נתון קרוב מסוג אחר), "
     "חישוב או כלי שנכשלו בדרך אליה, והחיפושים והקריאות שחיפשו אותה. יחידה שאומרת שנתון לא נמצא, כש-<workspace> "
-    "מחזיק ערך, נתון או חישוב שלו — unsupported."
+    "מחזיק ערך, נתון או חישוב שלו — unsupported. יחידה מ-<removed_units> שנתנה דרישה — ציין אותה ב-units של "
+    "הדרישה כרגיל (השרת יודע שהוסרה)."
 )
 # the judge's scores of a requirement in one call
 REQUIREMENT_STATUSES = ("full", "partial", "missing", "undeterminable")
@@ -242,6 +271,59 @@ REQ_FOUND_NOT_ABSENT = ("התשובה אומרת שהנתון לא נמצא, א�
                         "מה מנע להשלים אותו")
 TOOL_FAILED = "שגיאה: הכלי נכשל"  # ``tools.run_tool``'s output for a tool that raised
 
+# Why a claim was removed (round 7 KTD5, R12): one failure kind per removal decision. ``not_checked`` is the server's
+# own — a check that did not finish (the judge timed out on the unit's call, or left it out) — and is never "wrong".
+FAILURE_KINDS = ("absent_from_source", "wrong_subject", "wrong_unit", "uncertain_reading", "contradicts_source",
+                 "wrong_calculation", "invalid_citation", "not_checked")
+JudgeFailure = Literal["none", "absent_from_source", "wrong_subject", "wrong_unit", "uncertain_reading",
+                       "contradicts_source", "wrong_calculation", "invalid_citation"]
+# the failure kinds a bounded repair can remove (KTD10): a re-attribution, a recomputation from the right inputs, one
+# focused re-read; the others go to the repair round as before (another source may support the claim), then out
+REPAIRABLE_FAILURES = ("wrong_subject", "wrong_calculation", "uncertain_reading")
+# a failure kind in the repair prompt, and what a repair of it does
+FAILURE_LABELS = {
+    "absent_from_source": "המקורות המצוטטים אינם מציינים זאת",
+    "wrong_subject": "נתון של נכס או צד אחר",
+    "wrong_unit": "יחידה, תקופה, בסיס שטח או מע\"מ שאינם כבמקור",
+    "uncertain_reading": "נשען על קריאה לא ודאית של המקור",
+    "contradicts_source": "סותר את המקור",
+    "wrong_calculation": "חישוב שגוי או קלטים שגויים",
+    "invalid_citation": "ציטוט של מזהה שלא הוחזר בתור הזה",
+    "not_checked": "לא נבדק מול המקורות",
+}
+REPAIR_HINTS = {
+    "wrong_subject": "ייחס את הנתון לנכס או לצד הנכון, או קח אותו מההקשר של הנכס שעליו נשאלת השאלה",
+    "wrong_calculation": "חשב מחדש ב-calculate מהקלטים הנכונים לבקשה, והצג את התוצאה כחישוב",
+    "uncertain_reading": "קרא שוב פעם אחת את המקום (read או inspect); אם הקריאה עדיין לא ודאית — הצג את הערך כלא ודאי "
+                         "או השמט אותו",
+    "absent_from_source": "צטט מקור שהנתון כתוב בו, או השמט את הטענה",
+    "wrong_unit": "הצג את הנתון ביחידה, בתקופה, בבסיס השטח ובמע\"מ שנכתבו לו במקור",
+    "contradicts_source": "תקן לפי המקור או השמט",
+    "invalid_citation": "צטט רק מזהים שהוחזרו בתור הזה",
+}
+# the server's fixed sentence for each removal on the user's normal path (KTD5): never the claim or a judge's words
+REMOVAL_SENTENCES = {
+    "absent_from_source": "הוסרה טענה שהמקורות שנבדקו אינם מציינים.",
+    "wrong_subject": "הוסרה טענה שייחסה נתון לנכס או לצד אחר מזה שבמקור.",
+    "wrong_unit": "הוסרה טענה שהציגה נתון ביחידה, בתקופה, בבסיס שטח או במע\"מ שאינם כבמקור.",
+    "uncertain_reading": "הוסרה טענה שנשענה על קריאה לא ודאית של המקור.",
+    "contradicts_source": "הוסרה טענה שסותרת את המקור.",
+    "wrong_calculation": "הוסרה טענה שהציגה חישוב שגוי או חישוב על קלטים שגויים.",
+    "invalid_citation": "הוסרה טענה שציטטה מקור שלא נבדק בתור הזה.",
+    "not_checked": "הוסרה טענה שלא ניתן היה לבדוק מול המקורות; היא לא נמצאה שגויה.",
+}
+# a judge's concrete defect of a partly supported unit, as a failure kind (for the repair prompt)
+DEFECT_FAILURES = {"input": "wrong_calculation", "scenario": "wrong_calculation", "formula": "wrong_calculation",
+                   "framing": "wrong_calculation", "units": "wrong_unit", "part": "absent_from_source"}
+# problem kinds that are not failure kinds, as the failure kind a removal of theirs has (KTD5): a calculation from the
+# wrong input or on an assumption the user did not give is a wrong calculation (round 7 U7 adds these kinds); an
+# unmet instruction is a gap, never a removal
+KIND_FAILURES = {"input_choice": "wrong_calculation", "assumption": "wrong_calculation"}
+NOT_CHECKED = "הטענה לא נבדקה מול המקורות"
+NOT_CHECKED_FAILED = "הטענה לא נבדקה מול המקורות: הבדיקה לא הושלמה ({status})"
+NOT_CLASSIFIED = "טענה סווגה כלא-עובדתית או ככותרת; לא אומתה"
+DEPENDS_ON_REMOVED = "מסקנה שנשענת על טענה שהוסרה באימות (\"{text}\")"
+
 
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -256,6 +338,10 @@ class JudgeVerdict(_Strict):
     supported_by: list[str] = Field(default_factory=list)
     # for a partial verdict: the concrete defect a repair can remove, or "none" (only that costs a repair round)
     defect: Literal["none", "input", "scenario", "formula", "units", "framing", "part", "multiple_values"] = "none"
+    # for an unsupported verdict: why (round 7 KTD5, R12); "none" for any other verdict, or a reply that leaves it out
+    failure: JudgeFailure = "none"
+    # the units of this call (removed ones included) whose claims this unit's conclusion rests on (KTD10, R15)
+    depends_on: list[int] = Field(default_factory=list)
 
 
 class JudgeOutput(_Strict):
@@ -407,12 +493,15 @@ class VerdictCache:
         if last is None:
             return {}, []
         known = len(last.keys)
+        # the units the deterministic checks removed last time: shown to its calls as removed (round 7 KTD5), they
+        # gave nothing that counted, so a score naming them rests on its other units alone
+        dropped = {n for n, (_, failed) in enumerate(last.signature[0] if last.signature else ()) if failed}
         candidates = {u.index for u in to_judge if keys[u.index] in self.verdicts}
         while True:
             moved = _match(last.keys, [(i, keys[i]) for i in sorted(candidates)])
             keep = set(moved.values())
             for v in last.votes:
-                refs = [i for i in v.units if i < known]
+                refs = [i for i in v.units if i < known and i not in dropped]
                 if v.status in ("full", "partial") and any(i not in moved for i in refs):
                     keep -= {moved[i] for i in refs if i in moved}
             if keep == candidates:
@@ -420,7 +509,7 @@ class VerdictCache:
             candidates = keep
         carried = []
         for v in last.votes:
-            refs = [i for i in v.units if i < known]
+            refs = [i for i in v.units if i < known and i not in dropped]
             if not refs or any(i not in moved for i in refs):
                 continue  # scored again by this verification's calls
             carried.append(v.model_copy(update={"units": [moved[i] for i in refs],
@@ -486,6 +575,11 @@ class Unit:
     context: str = ""  # for a table row: the table's header row and the line before the table
 
 
+def repair_key(unit: Unit) -> str:
+    """A unit as a repair prompt names it, so a later round's same sentence is known (``mark_repairs``)."""
+    return " ".join(unit.text.split())
+
+
 @dataclass
 class Problem:
     unit: Unit
@@ -504,6 +598,20 @@ class Problem:
     annotation: str | None = None  # for a missing qualifier: the one qualifier attested, as written
     cite: str | None = None  # the source or measurement the server found that states the qualifier
     defect: str | None = None  # for a judge's partial: the concrete defect it named ("none": none; None: not given)
+    # the structured decision (round 7 KTD5, R12): why (``FAILURE_KINDS``), the check that fired (a deterministic
+    # check's name, ``judge`` or ``dependency``), the component the unit gave (``N#``, when known), the ids it was
+    # checked against (its citations when the check fired), and whether a repair round was asked to fix it
+    failure_kind: str | None = None
+    check: str | None = None
+    component: str | None = None
+    checked_ids: list[str] | None = None
+    repair_attempted: bool = False
+
+    def __post_init__(self) -> None:
+        if self.checked_ids is None:
+            self.checked_ids = list(self.unit.ids)
+        if self.failure_kind is None:
+            self.failure_kind = KIND_FAILURES.get(self.kind)
 
     @property
     def uncited(self) -> bool:
@@ -534,7 +642,27 @@ class Problem:
         return self.removes_unit and self.kind != "absence"
 
     def as_dict(self) -> dict:
-        return {"text": self.unit.raw[:300], "reason": self.reason, "severity": self.severity, "kind": self.kind}
+        """The problem for diagnostics: the unit's text (a draft, never a fact), the factual reason, and the decision."""
+        return {"text": self.unit.raw[:300], "reason": self.reason, "severity": self.severity, "kind": self.kind,
+                "failure_kind": self.failure_kind, "check": self.check, "component": self.component,
+                "checked_ids": list(self.checked_ids or []), "repair_attempted": self.repair_attempted}
+
+    def summary(self) -> dict:
+        """The removal on the user's normal path (KTD5): its kind, its component and the server's fixed sentence."""
+        kind = self.failure_kind or "absent_from_source"
+        return {"failure_kind": kind, "component": self.component, "text": REMOVAL_SENTENCES[kind]}
+
+    def repair_note(self) -> str:
+        """What the repair prompt says of the problem beside its reason (KTD10): its kind, the ids checked and how
+        a repair of that kind goes."""
+        if not self.failure_kind:
+            return ""
+        parts = [f"סוג: {FAILURE_LABELS[self.failure_kind]}"]
+        if self.checked_ids:
+            parts.append("נבדק מול: " + ", ".join(self.checked_ids))
+        if self.failure_kind in REPAIR_HINTS:
+            parts.append("תיקון: " + REPAIR_HINTS[self.failure_kind])
+        return " (" + "; ".join(parts) + ")"
 
 
 @dataclass
@@ -565,6 +693,47 @@ class VerifyReport:
         """The units removed as claims that failed their check (what the user is told was removed)."""
         return {p.unit.index for p in self.problems if p.fails_claim}
 
+    def removals(self) -> list[Problem]:
+        """One decision per unit removed as a claim (round 7 KTD5, R12), in the answer's order: the first problem that
+        removed it. An absence the server replaced is not one."""
+        first: dict[int, Problem] = {}
+        for p in self.problems:
+            if p.fails_claim:
+                first.setdefault(p.unit.index, p)
+        return [first[i] for i in sorted(first)]
+
+    def assign_components(self) -> None:
+        """Each unit problem's component (``N#``) from the judge's scores: a component the unit gave (a leaf before a
+        parent, in the request's order), else one it was marked as saying is missing. Kept when already set."""
+        if not self.requirements:
+            return
+        parents = {r.get("parent") for r in self.requirements if r.get("parent")}
+        order = [r["id"] for r in self.requirements if r["id"] not in parents] + [
+            r["id"] for r in self.requirements if r["id"] in parents]
+        gave: dict[int, str] = {}
+        said: dict[int, str] = {}
+        for cid in order:
+            for v in self.requirement_votes.get(cid, []):
+                for i in v.units if v.status in ("full", "partial") else ():
+                    gave.setdefault(i, cid)
+                for i in [*v.absent, *(v.units if v.status in ("missing", "undeterminable") else ())]:
+                    said.setdefault(i, cid)
+        for p in self.problems:
+            if p.component is None and p.unit.index >= 0:
+                p.component = gave.get(p.unit.index) or said.get(p.unit.index)
+
+    def mark_repairs(self, attempted: set[str]) -> None:
+        """Record on each unit problem whether a repair round was asked to fix its unit (``attempted``: the keys,
+        ``repair_key``, of the units the turn's repair prompts named)."""
+        for p in self.problems:
+            if p.unit.index >= 0:
+                p.repair_attempted = repair_key(p.unit) in attempted
+
+    def repair_keys(self, claims_only: bool = False) -> set[str]:
+        """The units the repair prompt (``problems_text``) names."""
+        return {repair_key(p.unit) for p in self.problems if p.unit.index >= 0
+                and not (claims_only and p.kind == "requirement")}
+
     def correctness(self) -> str:
         """``verified`` (every claim supported), ``partial`` (claims removed or only partly supported) or
         ``unverified`` (no claim survived) — apart from completeness."""
@@ -583,7 +752,9 @@ class VerifyReport:
                "partial": len({p.unit.index for p in self.problems if p.severity == "partial"} - errors),
                "annotated": sum(1 for p in self.problems if p.annotatable and p.unit.index not in errors),
                "request_mismatch": any(p.kind == "request" for p in self.problems),
-               "correctness": self.correctness()}
+               "correctness": self.correctness(),
+               # each removal's kind, component and the server's fixed sentence (KTD5), as many as ``removed``
+               "removals": [p.summary() for p in self.removals()]}
         if self.completeness is not None:
             out["completeness"] = self.completeness
         return out
@@ -591,7 +762,7 @@ class VerifyReport:
     def problems_text(self, claims_only: bool = False) -> str:
         """The problems for the repair prompt; ``claims_only``: without the requirements to complete (a rewrite
         from verified content cannot add them; it can still meet an instruction)."""
-        return "\n".join("- " + (f"\"{p.unit.raw[:200]}\": " if p.unit.raw else "") + p.reason
+        return "\n".join("- " + (f"\"{p.unit.raw[:200]}\": " if p.unit.raw else "") + p.reason + p.repair_note()
                          for p in self.problems if not (claims_only and p.kind == "requirement"))
 
     def requirement_outcomes(self, applied: FinalAnswer | None = None) -> list[dict]:
@@ -618,6 +789,7 @@ class VerifyReport:
             kept = set()  # nothing cited survived: the answer was replaced by a statement that it was not supported
         texts = {u.index: u.text for u in self.units}
         uncited = [texts[i] for i in self.uncited_data(kept)]
+        kind_of = {p.unit.index: p.failure_kind for p in self.removals()}
         children: dict[str, list[str]] = {}
         for r in self.requirements:
             if r.get("parent"):
@@ -635,6 +807,9 @@ class VerifyReport:
                  "conditional": bool(r.get("conditional")), "subject": r.get("subject") or "",
                  "parameters": list(r.get("parameters") or []), "children": children.get(r["id"], []),
                  "units": [], "removed_units": sorted({i for v in offered for i in v.units if i in errors}),
+                 # why its removed units went (KTD5): the gap of a component they alone gave names it
+                 "removal_kinds": sorted({kind_of[i] for v in offered for i in v.units
+                                          if i in kind_of and kind_of[i]}),
                  "absence_units": sorted({i for v in votes for i in v.absent}
                                          | {i for v in absent for i in v.units}),
                  "related": list(dict.fromkeys(x for v in votes for x in v.related)),
@@ -724,7 +899,8 @@ class VerifyReport:
                 reason = ABSENCE_UNCITED
             else:
                 continue
-            self.problems.append(Problem(u, reason, kind="absence"))
+            component = next((o["id"] for o in outcomes if o["id"] in stated and u.index in o["absence_units"]), None)
+            self.problems.append(Problem(u, reason, kind="absence", check="absence", component=component))
             added = True
         return added
 
@@ -767,13 +943,18 @@ class VerifyReport:
         if cuts:
             text = _drop_orphan_headings(markdown, text)
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
-        removed = len(self.failed_units())  # an absence the server replaced is not a claim that failed
+        # an absence the server replaced is not a claim that failed; a claim not checked is not called unsupported
+        kinds = [p.failure_kind for p in self.removals()]
+        removed = len(kinds)
+        unchecked = kinds.count("not_checked")
         claims = [c for c in answer.claims if not any(
             c.text.strip() and c.text.strip()[:40] in u.raw for u in self.units if u.index in errors)]
         status = answer.status
         if removed:
-            note = (f"\n\n> הוסרו מהתשובה {removed} טענות שלא נמצאה להן תמיכה במקורות."
-                    if text else "")
+            lines = ([f"> הוסרו מהתשובה {removed - unchecked} טענות שלא נמצאה להן תמיכה במקורות."]
+                     if removed > unchecked else [])
+            lines += [f"> הוסרו מהתשובה {unchecked} טענות שלא ניתן היה לבדוק מול המקורות."] if unchecked else []
+            note = "\n\n" + "\n>\n".join(lines) if text else ""
             if not text or not _IDS.search(text):
                 # the model's own words on what is missing are not added: the server states each gap (KTD4)
                 text = "לא הצלחתי לבסס תשובה על המקורות."
@@ -1308,7 +1489,8 @@ def _vat_problems(unit: Unit, ws: Workspace) -> list[str]:
 def deterministic(units: list[Unit], ws: Workspace, question: str,
                   meanings: dict[int, list[meaning.MeaningProblem]] | None = None) -> list[Problem]:
     """Unknown citations, numbers no cited source states, VAT the sources do not give a number, and a basis or
-    period the evidence does not give a number (``app.chat.meaning``, the blocking kind)."""
+    period the evidence does not give a number (``app.chat.meaning``, the blocking kind) — each problem with its
+    failure kind and check (round 7 KTD5)."""
     if meanings is None:
         meanings = {u.index: meaning.check(u, ws) for u in units}
     problems: list[Problem] = []
@@ -1320,26 +1502,32 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
             prior = [i for i in unknown if i.startswith("P")]
             reason = ("ציטוט הפניה מתור קודם בלי לפתוח אותה מחדש" if prior and len(prior) == len(unknown)
                       else "ציטוט מזהה שלא הוחזר בתור הזה: " + ", ".join(unknown))
-            problems.append(Problem(u, reason))
+            problems.append(Problem(u, reason, failure_kind="invalid_citation", check="unknown_id"))
             continue
         missing = _unstated(u, ws, question_numbers, everything)
         if missing:
-            problems.append(Problem(u, "מספרים שאינם מופיעים במקורות המצוטטים: " + ", ".join(sorted(missing)[:5])))
+            # a number a calculation it cites does not give, at the precision shown, is a wrong calculation
+            computed = any(i in ws.computations for i in u.ids)
+            problems.append(Problem(u, "מספרים שאינם מופיעים במקורות המצוטטים: " + ", ".join(sorted(missing)[:5]),
+                                    failure_kind="wrong_calculation" if computed else "absent_from_source",
+                                    check="computation_mismatch" if computed else "unstated_number"))
             continue
         framed = _framed_result(u, ws)
         if framed:
             problems.append(Problem(u, f"{framed} הוא תוצאת חישוב שהמערכת חישבה עכשיו, והתשובה מציגה אותו כאילו נכתב "
-                                       "במסמך או נטען על ידי צד; הצג אותו כחישוב"))
+                                       "במסמך או נטען על ידי צד; הצג אותו כחישוב",
+                                    failure_kind="wrong_calculation", check="framed_result"))
             continue
         misattributed = _misattributed(u, ws)
         if misattributed:
-            problems.append(Problem(u, misattributed))
+            problems.append(Problem(u, misattributed, failure_kind="wrong_subject", check="misattribution"))
             continue
         for reason in _vat_problems(u, ws) if u.ids else []:
-            problems.append(Problem(u, reason))
+            problems.append(Problem(u, reason, failure_kind="wrong_unit", check="vat"))
         blocking = [m for m in meanings.get(u.index, []) if m.blocking]
         if blocking:
-            problems.append(Problem(u, "; ".join(m.reason for m in blocking)))
+            problems.append(Problem(u, "; ".join(m.reason for m in blocking), failure_kind="wrong_unit",
+                                    check="meaning"))
     return problems
 
 
@@ -1369,7 +1557,43 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
     if missing:  # a calculation's result shown rounded to the precision and in the scale it is written in
         shown = _computed_numbers(u.text, computations if held else list(ws.computations.values()))
         missing = [n for n in missing if n not in shown]
+    if missing:  # a number of the evidence in another form: a scale word, or a correct rounding marked as one (R14)
+        restated = _restated(u.text, pool)
+        missing = [n for n in missing if n not in restated]
     return missing
+
+
+# a note that a number is rounded ("בעיגול", "מעוגל מ-14,250"), anywhere in the unit
+_ROUNDING_NOTE = re.compile(r"(?<![א-ת])(?:בעיגול|מעוגל(?:ת|ים|ות)?|בקירוב|בערך|בסביבות)(?![א-ת])")
+
+
+def _restated(text: str, pool: set[str]) -> set[str]:
+    """The numbers of a text that show a number of ``pool`` (normalized, as ``numbers_in`` gives them) in another
+    form (round 7 R14): with a scale word, equal to it ("1.53 מיליון" for 1,530,000); marked as approximate ("כ-" before
+    it) or with a rounding note in the text, it rounded to the precision and scale shown ("כ-14 אלף" for 14,250). A
+    plain number is its value only: "1.6 מיליון", "כ-15 אלף" and "1.53 אלף" are none of them."""
+    from app.chat.calc import display_matches
+
+    values = []
+    for p in pool:
+        try:
+            values.append(Decimal(p))
+        except InvalidOperation:
+            continue
+    noted = bool(_ROUNDING_NOTE.search(text))
+    out: set[str] = set()
+    for n in _shown(text):
+        try:
+            shown = Decimal(n.written.replace(",", ""))
+        except InvalidOperation:
+            continue
+        approx = noted or bool(meaning._APPROX_BEFORE.search(text[:n.start]))
+        if n.percent or (n.scale == 1 and not approx):
+            continue
+        if any(v == shown * n.scale for v in values) or (approx and any(
+                display_matches(n.written, False, v, (), None, n.scale) for v in values)):
+            out |= numbers_in(n.written)
+    return out
 
 
 def _framed_result(u: Unit, ws: Workspace) -> str | None:
@@ -1542,6 +1766,9 @@ def _non_claim_accepted(unit: Unit, verdict: str) -> bool:
 class _Batch:
     units: list[Unit]
     narrow: bool = False
+    # the units the deterministic checks removed, shown as removed (round 7 KTD5, KTD10): the judge names them as a
+    # component's units and as what a conclusion rests on, never judges them
+    removed: list[Unit] = field(default_factory=list)
 
 
 @dataclass
@@ -1651,13 +1878,23 @@ def _render_batch(batch: _Batch, ws: Workspace, coverage: _Coverage | None = Non
                       f"{prompt_text(text_)}\n</source>")
     units = [f'<unit index="{u.index}" cites="{prompt_attr(",".join(u.ids))}">\n{prompt_text(u.text)}\n</unit>'
              for u in batch.units]
+    removed = "".join(f'\n<removed_unit index="{u.index}">\n{prompt_text(u.text)}\n</removed_unit>'
+                      for u in batch.removed)
     return ("<sources>\n" + "\n".join(blocks) + "\n</sources>\n\n" + "\n".join(units)
+            + (f"\n\n<removed_units>{removed}\n</removed_units>" if removed else "")
             + (coverage.render() if coverage else ""))
 
 
-def _batches(units: list[Unit], ws: Workspace) -> list[_Batch]:
+def _batches(units: list[Unit], ws: Workspace, removed: list[Unit] | None = None) -> list[_Batch]:
     """Units packed into judge calls by the size of their evidence; a unit too big for one call alone is
-    judged on its narrow evidence (numbers and table headers)."""
+    judged on its narrow evidence (numbers and table headers). Every call shows the ``removed`` units."""
+    out = _pack(units, ws)
+    for b in out:
+        b.removed = list(removed or [])
+    return out
+
+
+def _pack(units: list[Unit], ws: Workspace) -> list[_Batch]:
     out: list[_Batch] = []
     current: list[Unit] = []
     for u in units:
@@ -1688,11 +1925,15 @@ def judge(provider: LLMProvider, batch: _Batch, rendered: str, usage: list[dict]
     if r.status != CallStatus.OK:
         return {}, r.status.value, []
     wanted = {u.index for u in batch.units}
+    shown = wanted | {u.index for u in batch.removed}
     scores: list[JudgeRequirement] = []
     if coverage:
-        # a requirement is given only by a unit of this call; other indexes are ignored
-        scores = coverage.accept(r.parsed.requirements, wanted)
-    return {v.index: v for v in r.parsed.verdicts if v.index in wanted}, "ok", scores
+        # a requirement is given only by a unit of this call (a removed one included); other indexes are ignored
+        scores = coverage.accept(r.parsed.requirements, shown)
+    # a conclusion rests only on another unit this call showed
+    return {v.index: v.model_copy(update={"depends_on": [i for i in dict.fromkeys(v.depends_on)
+                                                         if i in shown and i != v.index]})
+            for v in r.parsed.verdicts if v.index in wanted}, "ok", scores
 
 
 def _judge_batch(provider: LLMProvider, batch: _Batch, ws: Workspace, usage: list[dict],
@@ -1705,8 +1946,10 @@ def _judge_batch(provider: LLMProvider, batch: _Batch, ws: Workspace, usage: lis
     got, status, scores = judge(provider, batch, rendered, usage, deadline, coverage)
     if status == "incomplete" and len(batch.units) > 1:
         half = len(batch.units) // 2
-        first, p1 = _judge_batch(provider, _Batch(batch.units[:half], batch.narrow), ws, usage, deadline, coverage)
-        second, p2 = _judge_batch(provider, _Batch(batch.units[half:], batch.narrow), ws, usage, deadline, coverage)
+        first, p1 = _judge_batch(provider, _Batch(batch.units[:half], batch.narrow, batch.removed), ws, usage,
+                                 deadline, coverage)
+        second, p2 = _judge_batch(provider, _Batch(batch.units[half:], batch.narrow, batch.removed), ws, usage,
+                                  deadline, coverage)
         return first | second, p1 + p2
     if status in RETRYABLE:
         got, status, scores = judge(provider, batch, rendered, usage, deadline, coverage)
@@ -1733,7 +1976,7 @@ def _shown_support(verdicts: dict[int, JudgeVerdict], batch: _Batch, ws: Workspa
         if wrong:
             out[i] = v.model_copy(update={"verdict": "unsupported", "supported_by": [], "reason": (
                 f"הטענה אינה מצטטת מקור, והמקור שצוין כתומך בה ({', '.join(wrong)}) לא הוצג לבדיקה; צטט את המקור "
-                "שתומך בה")})
+                "שתומך בה"), "failure": "absent_from_source"})
     return out
 
 
@@ -1746,26 +1989,39 @@ def _named_support(unit: Unit, named: list[str], ws: Workspace, question: str) -
     failed = deterministic([cited], ws, question, {unit.index: meaning.check(cited, ws)})
     if not failed:
         return None
-    return Problem(unit, f"לא נתמך במקורות: הטענה אינה מצטטת מקור, ולפי {', '.join(named)}: {failed[0].reason}")
+    return Problem(unit, f"לא נתמך במקורות: הטענה אינה מצטטת מקור, ולפי {', '.join(named)}: {failed[0].reason}",
+                   failure_kind=failed[0].failure_kind, check=failed[0].check, checked_ids=list(cited.ids))
 
 
 def _judge_all(provider: LLMProvider, units: list[Unit], ws: Workspace, usage: list[dict],
-               deadline: float | None = None, coverage: _Coverage | None = None
-               ) -> tuple[dict[int, JudgeVerdict], list[JudgeRequirement]]:
+               deadline: float | None = None, coverage: _Coverage | None = None, removed: list[Unit] | None = None
+               ) -> tuple[dict[int, JudgeVerdict], list[JudgeRequirement], dict[int, str]]:
     """Every unit judged; a unit the judge left out is asked about once more. With the turn's requirements, every
-    call also scores them by id (a requirement may be given in any batch)."""
+    call also scores them by id (a requirement may be given in any batch). A call the judge cannot answer (after its
+    retry) leaves its units not checked (round 7 KTD5: returned with the call's status, and removed as not checked,
+    never as wrong) while other calls answered; when no call answers, ``VerificationUnavailable`` is raised."""
     verdicts: dict[int, JudgeVerdict] = {}
     scores: list[JudgeRequirement] = []
-    for batch in _batches(units, ws):
-        got, p = _judge_batch(provider, batch, ws, usage, deadline, coverage)
-        verdicts |= got
-        scores += p
-    missing = [u for u in units if u.index not in verdicts]
-    for batch in _batches(missing, ws):
-        got, p = _judge_batch(provider, batch, ws, usage, deadline, coverage)
-        verdicts |= got
-        scores += p
-    return verdicts, scores
+    unchecked: dict[int, str] = {}
+    failure: VerificationUnavailable | None = None
+
+    def run(batches: list[_Batch]) -> None:
+        nonlocal failure, scores
+        for batch in batches:
+            try:
+                got, p = _judge_batch(provider, batch, ws, usage, deadline, coverage)
+            except VerificationUnavailable as exc:
+                failure = exc
+                unchecked.update({u.index: exc.status for u in batch.units})
+                continue
+            verdicts.update(got)
+            scores += p
+
+    run(_batches(units, ws, removed))
+    run(_batches([u for u in units if u.index not in verdicts and u.index not in unchecked], ws, removed))
+    if failure is not None and not verdicts:
+        raise failure
+    return verdicts, scores, unchecked
 
 
 def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, question: str,
@@ -1811,8 +2067,11 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         report.problems.append(Problem(Unit(-1, "", "", []), f"התשובה אינה מציגה את הנתון שהתבקש: {mismatch}",
                                        kind="request"))
     # a unit the deterministic checks failed is not judged; with nothing left to judge, the requirements are still
-    # derived and scored (a coverage-only call)
+    # derived and scored (a coverage-only call). A unit they removed is shown as removed (KTD5, KTD10): the judge
+    # names the component it gave and the conclusions resting on it
     to_judge = [u for u in units if u.index not in failed]
+    removed_shown = [u for u in units if u.index in {p.unit.index for p in report.problems if p.removes_unit}]
+    unchecked: dict[int, str] = {}
     verdicts: dict[int, JudgeVerdict] = {}
     votes: list[JudgeRequirement] = []
     keys: dict[int, str] = {}
@@ -1832,17 +2091,18 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         if cache is not None and cache.last is not None and requirements.derived and cache.last.signature == signature:
             votes = list(cache.last.votes)  # the same answer over the same workspace: scored already
         else:
-            _, scored = _judge_batch(provider, _Batch([]), ws, usage, deadline, coverage)
+            _, scored = _judge_batch(provider, _Batch([], removed=removed_shown), ws, usage, deadline, coverage)
             votes += scored
     if fresh:
-        judged, scored = _judge_all(provider, fresh, ws, usage, deadline, coverage)
+        judged, scored, unchecked = _judge_all(provider, fresh, ws, usage, deadline, coverage, removed_shown)
         verdicts |= judged
         votes += scored
         if cache is not None:
             for u in fresh:
                 v = judged.get(u.index)
-                # a support the unit does not cite was accepted for what else the call showed: never reused
-                if v is not None and not [s for s in v.supported_by if s not in u.ids]:
+                # a support the unit does not cite, or a conclusion resting on another unit, was judged with what
+                # else the call showed: never reused
+                if v is not None and not [s for s in v.supported_by if s not in u.ids] and not v.depends_on:
                     cache.verdicts[keys[u.index]] = v
     if cache is not None:
         cache.last = _Round([keys[u.index] for u in units], list(votes), signature)
@@ -1852,17 +2112,21 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         for u in to_judge:
             v = verdicts.get(u.index)
             if v is None:
-                # never judged: only neutral navigation text passes
+                # never judged: only neutral navigation text passes; anything else is not checked, never wrong
                 if not exempt_without_verdict(u):
-                    report.problems.append(Problem(u, "הטענה לא נבדקה מול המקורות"))
+                    reason = (NOT_CHECKED_FAILED.format(status=unchecked[u.index]) if u.index in unchecked
+                              else NOT_CHECKED)
+                    report.problems.append(Problem(u, reason, failure_kind="not_checked", check="judge"))
                 continue
             if v.verdict in ("not_factual", "navigation"):
                 if not _non_claim_accepted(u, v.verdict):
-                    report.problems.append(Problem(u, "טענה סווגה כלא-עובדתית או ככותרת; לא אומתה"))
+                    report.problems.append(Problem(u, NOT_CLASSIFIED, failure_kind="not_checked", check="judge"))
             elif v.verdict == "unsupported":
-                report.problems.append(Problem(u, "לא נתמך במקורות: " + v.reason))
+                report.problems.append(Problem(u, "לא נתמך במקורות: " + v.reason, failure_kind=_judged_failure(u, v, ws),
+                                               check="judge"))
             elif v.verdict == "partial":
-                report.problems.append(Problem(u, "נתמך חלקית: " + v.reason, "partial", defect=v.defect))
+                report.problems.append(Problem(u, "נתמך חלקית: " + v.reason, "partial", defect=v.defect,
+                                               failure_kind=DEFECT_FAILURES.get(v.defect), check="judge"))
             elif named := [s for s in dict.fromkeys(v.supported_by) if s not in u.ids]:
                 # supported by a shown source the unit does not cite: kept, and cited, only if the numbers agree
                 problem = _named_support(u, named, ws, question)
@@ -1871,12 +2135,47 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 else:
                     report.problems += [Problem(u, f"נתמך ב-{s}, שהתשובה לא ציטטה", kind="needs_citation", cite=s)
                                         for s in named]
+        _remove_dependents(report, verdicts)
     if coverage:
         report.requirements = [dict(r) for r in requirements.items]
         for v in votes:
             report.requirement_votes.setdefault(v.id, []).append(v)
         _check_requirements(report, ws, requirements)
+        report.assign_components()
     return report
+
+
+def _judged_failure(u: Unit, v: JudgeVerdict, ws: Workspace) -> str:
+    """The failure kind of a judge's ``unsupported`` verdict (KTD5): the one it named; else, for a unit resting on a
+    calculation, a wrong calculation, on a value read uncertainly, an uncertain reading, and otherwise absent from
+    the source."""
+    if v.failure != "none":
+        return v.failure
+    if any(i in ws.computations for i in u.ids):
+        return "wrong_calculation"
+    if any((i in ws.values and ws.values[i].certainty == "uncertain_reading")
+           or (i in ws.sources and ws.sources[i].status == "uncertain_reading") for i in u.ids):
+        return "uncertain_reading"
+    return "absent_from_source"
+
+
+def _remove_dependents(report: VerifyReport, verdicts: dict[int, JudgeVerdict]) -> None:
+    """A unit whose conclusion the judge said rests on a removed claim is removed too (KTD10, R15), with that claim's
+    failure kind (check ``dependency``), until nothing more rests on a removed one."""
+    units = {u.index: u for u in report.units}
+    while True:
+        removed = {p.unit.index: p for p in reversed(report.removals())}
+        added = False
+        for i, v in sorted(verdicts.items()):
+            base = next((removed[d] for d in v.depends_on if d in removed), None)
+            if i in removed or i not in units or base is None:
+                continue
+            report.problems.append(Problem(units[i], DEPENDS_ON_REMOVED.format(text=base.unit.text[:120]),
+                                           failure_kind=base.failure_kind, check="dependency"))
+            removed[i] = report.problems[-1]
+            added = True
+        if not added:
+            return
 
 
 def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequirements) -> None:
@@ -1905,7 +2204,7 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
                     # repair round is asked to use the data by the component's own problem below)
                     failed.add(i)
                     report.problems.append(Problem(units[i], REQ_FOUND_NOT_ABSENT.format(ids=", ".join(data)),
-                                                   kind="absence"))
+                                                   kind="absence", check="absence", component=r["id"]))
     for o in report.requirement_outcomes():
         if o["children"]:
             continue

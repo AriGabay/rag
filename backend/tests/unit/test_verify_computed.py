@@ -346,3 +346,29 @@ def test_a_division_by_zero_on_found_values_is_a_calculation_failure_not_missing
     with pytest.raises(calc.CalcError) as e:
         calc.evaluate(calc.parse("V1 / V2"), {"V1": income, "V2": zero})
     assert "החישוב נכשל" in str(e.value) and "לא נתון חסר" in str(e.value)
+
+
+# --- structured removal decisions for computed claims (round 7 U4: KTD5, R12, R14) --------------------------------
+
+@pytest.mark.parametrize("markdown, check", [
+    ("הרווח בתרחיש יהיה 1,600,000 ₪ [C1].", "computation_mismatch"),  # not the result at the precision shown
+    ("השומה מציינת רווח של 1,530,000 ₪ [C1].", "framed_result"),  # computed now, presented as the report's
+])
+def test_a_computed_claim_that_fails_a_deterministic_check_is_a_wrong_calculation(markdown, check):
+    report, _ = _verify(_scenario(), markdown)
+    (decision,) = report.removals()
+    assert (decision.failure_kind, decision.check) == ("wrong_calculation", check)
+    assert "C1" in decision.checked_ids
+
+
+def test_a_judges_unsupported_computed_claim_is_a_wrong_calculation_unless_it_names_another_kind():
+    question = "מה יהיה שיעור הרווח מהעלויות אם העלויות יעלו ב-5%?"
+    report, _ = _verify(_scenario(), "הרווח בתרחיש הוא 12.3% מהעלויות [C2].", rule=lambda text: "unsupported",
+                        question=question)
+    assert [(d.failure_kind, d.check) for d in report.removals()] == [("wrong_calculation", "judge")]
+
+
+@pytest.mark.parametrize("shown", ["1.53 מיליון ₪", "כ-1.5 מיליון ₪", "1,530,000 ₪"])
+def test_a_computed_result_shown_in_an_equivalent_form_or_marked_rounding_is_kept(shown):
+    report, _ = _verify(_scenario(), f"לפי הנחתך [A1], הרווח בתרחיש יהיה {shown} [C1].")
+    assert not report.removed_units(), report.problems_text()

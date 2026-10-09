@@ -269,6 +269,14 @@ def test_ae7_the_adopted_figure_and_an_attributed_party_figure_are_kept(decision
     assert verify.deterministic([_unit(text, ids)], decision.ws, "מה נקבע?") == []
 
 
+def test_the_right_number_given_to_the_wrong_party_is_removed_as_wrong_subject(decision):
+    """Round 7 U4 (KTD5, R12): the number is right, its party is not — a removal of kind wrong property or party."""
+    _take(decision, CLAIM_TEXT, "200")
+    (problem,) = verify.deterministic([_unit("לטענת העוררת השווי 200 ₪ למ\"ר.", ["V1"])], decision.ws, "מה נטען?")
+    assert (problem.failure_kind, problem.check, problem.checked_ids) == ("wrong_subject", "misattribution", ["V1"])
+    assert problem.removes_unit
+
+
 def test_a_figure_attributed_to_another_party_is_caught(decision):
     _take(decision, CLAIM_TEXT, "200")
     assert verify.deterministic([_unit("לטענת העוררת השווי 200 ₪ למ\"ר.", ["V1"])], decision.ws, "מה נטען?")

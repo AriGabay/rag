@@ -15,6 +15,7 @@ import pytest
 from sqlalchemy import text
 
 from app.chat import api as chat_api
+from app.chat import verify
 from app.db import tenant_tx
 from app.providers.llm import Purpose
 from tests.conftest import login
@@ -286,6 +287,14 @@ def test_removed_claims_reach_the_owner_and_an_admin_only_through_diagnostics(cl
     assert "דמי הניהול הם 41" not in json.dumps(m["answer"], ensure_ascii=False)
     d = client.get(f"/api/chat/messages/{mid}/diagnostics")
     assert d.status_code == 200 and any("41" in p["reason"] for p in d.json()["removed"]) and d.json()["rounds"]
+    # round 7 U4 (KTD5, R12, R13): the normal path names each removal's kind with the server's fixed sentence only;
+    # the draft text, the factual reason and the sources checked are diagnostics
+    assert v["removals"] == [{"failure_kind": "absent_from_source", "component": None,
+                              "text": verify.REMOVAL_SENTENCES["absent_from_source"]}]
+    (decision,) = d.json()["removed"]
+    assert "41" in decision["text"] and decision["failure_kind"] == "absent_from_source"
+    assert decision["check"] == "unstated_number" and decision["checked_ids"] == ["S1"]
+    assert [s["document_id"] for s in decision["sources"]] == [setup.public]
     # another employee of the office: not theirs
     make_user(setup, "emp2@example.test", [setup.g2])
     login(client, "emp2@example.test")
@@ -310,6 +319,30 @@ def test_diagnostics_are_hidden_once_a_document_behind_them_is_revoked(client, s
     _revoke(setup, setup.public)
     login(client, "emp@example.test")
     assert client.get(f"/api/chat/messages/{mid}/diagnostics").status_code == 404
+
+
+def test_revoking_a_document_only_a_removed_claim_checked_hides_the_message_and_its_diagnostics(client, setup,
+                                                                                               monkeypatch):
+    """Round 7 U4 (KTD5, R13, R29): the kept sentence cites one document, the removed one another; the removal's
+    documents are behind both the message and its diagnostics."""
+    answer = final("השווי למ\"ר בנוי הוא 9,500 ₪ [S1]. דמי הניהול הם 41 ₪ למ\"ר [S2].",
+                   documents=[setup.public])
+    agent = _agent([[call("search", query="שווי", document_ids=[setup.public], limit=None),
+                     call("search", query="דמי ניהול", document_ids=[setup.secret], limit=None)],
+                    answer, answer, answer])
+    cloud(monkeypatch, setup, agent)
+    login(client, "emp@example.test")
+    m = send(client, new_conversation(client), "מה השווי ודמי הניהול?")
+    assert m["status"] == "done" and "41" not in m["answer"]["markdown"], m
+    (decision,) = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["removed"]
+    assert decision["checked_ids"] == ["S2"] and [s["document_id"] for s in decision["sources"]] == [setup.secret]
+    with tenant_tx(setup.system) as conn:
+        docs = conn.execute(text("SELECT document_ids FROM message_diagnostics WHERE message_id = :m"),
+                            {"m": m["id"]}).scalar_one()
+    assert setup.secret in {str(x) for x in docs}
+    _revoke(setup, setup.secret)
+    assert client.get(f"/api/chat/messages/{m['id']}").json()["answer"].get("hidden") is True
+    assert client.get(f"/api/chat/messages/{m['id']}/diagnostics").status_code == 404
 
 
 def test_an_answer_stored_in_the_old_shape_shows_counts_only(client, setup, monkeypatch):

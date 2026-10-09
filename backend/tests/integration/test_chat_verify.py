@@ -99,3 +99,33 @@ def test_an_uncited_correct_sentence_is_kept_with_the_table_cited(client, db, mo
     assert m["status"] == "done"
     md = m["answer"]["markdown"]
     assert "והיחס 0.71, ולכן עבר [S1]." in md and "הוסרו" not in md
+
+
+# --- what diagnostics keep of verification: only the units removed, each with its decision (round 7 U4, KTD5) -------
+
+def _marked_judge(input: str) -> dict:
+    """The rent sentence is partly supported with no concrete defect (kept, marked); the rest supported."""
+    units = re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S)
+    return {"verdicts": [{"index": int(i), "verdict": "partial" if "לחודש" in t else "supported", "reason": "בדיקה",
+                          "defect": "none"} for i, t in units]}
+
+
+def test_the_stored_diagnostics_hold_only_the_removed_units_each_with_its_decision(client, setup, monkeypatch):
+    answer = final(f"דמי הניהול במגדל {MARKER} הם 33 ₪ למ\"ר לחודש [S1]. השטח הוא 812 מ\"ר [S1].",
+                   documents=[setup.secret])
+    agent = ScriptedAgent([[call("search", query="דמי ניהול", document_ids=[setup.secret], limit=None)],
+                           answer, answer, answer], judge=_marked_judge)
+    cloud(monkeypatch, setup, agent)
+    login(client, "emp@example.test")
+    m = send(client, new_conversation(client), "מה דמי הניהול והשטח?")
+    assert m["status"] == "done" and "812" not in m["answer"]["markdown"], m
+    v = m["answer"]["verification"]
+    assert v["removed"] == 1 and v["partial"] == 1
+    assert [r["failure_kind"] for r in v["removals"]] == ["absent_from_source"]
+    with tenant_tx(setup.system) as conn:
+        row = conn.execute(text("SELECT removed, rounds FROM message_diagnostics WHERE message_id = :m"),
+                           {"m": m["id"]}).one()
+    (decision,) = row.removed  # the marked sentence is not a removal
+    assert "812" in decision["text"] and decision["failure_kind"] == "absent_from_source"
+    assert decision["checked_ids"] == ["S1"] and decision["repair_attempted"] is True
+    assert any(p["severity"] == "partial" for p in row.rounds[-1])  # every problem stays in the rounds

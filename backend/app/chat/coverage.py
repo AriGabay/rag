@@ -30,7 +30,9 @@ evidence — the ids the judge named as related to it, the model's validated cla
 table, first match wins (``reason_of``):
 
 1. an instruction the shown answer does not meet — instruction not met;
-2. filled only by units removed in verification — removed in verification;
+2. filled only by units removed in verification — removed in verification, its sentence naming why when they share
+   one failure kind (round 7 U4, KTD5: ``removal_kinds``, ``REMOVED_BECAUSE``; a unit not checked is never called
+   wrong);
 3. a tool or provider failure tied to it (``E#``) — tool failure;
 4. a failed calculation tied to it (``F#``) — calculation not completed;
 5. a calculation resting on a parameter the user did not give, with no user assumption (``A#``) in the turn and no
@@ -159,6 +161,18 @@ REASONS = {
     "not_located": "לא אותר בחיפושים שבוצעו",
 }
 _ORDER = tuple(REASONS)
+# why a component's units were removed (round 7 KTD5, R12): the variant of "removed" is their one failure kind
+REMOVED_BECAUSE = {
+    "": "כי לא נמצאה לו תמיכה במקורות.",
+    "absent_from_source": "כי המקורות שנבדקו אינם מציינים אותו.",
+    "wrong_subject": "כי הנתון שבו שייך לנכס או לצד אחר.",
+    "wrong_unit": "כי היחידה, התקופה, בסיס השטח או המע\"מ שלו אינם כבמקור.",
+    "uncertain_reading": "כי הוא נשען על קריאה לא ודאית של המקור.",
+    "contradicts_source": "כי הוא סותר את המקור.",
+    "wrong_calculation": "כי החישוב או הקלטים שלו שגויים.",
+    "invalid_citation": "כי הוא ציטט מקור שלא נבדק בתור הזה.",
+    "not_checked": "כי לא ניתן היה לבדוק אותו מול המקורות (הוא לא נמצא שגוי).",
+}
 # a model claim's status -> the reason it supports, once validated
 _KIND_OF_STATUS = {"not_found_search": "not_located", "source_partial": "region_not_read",
                    "section_checked_absent": "not_in_part_read", "sources_conflict": "sources_conflict"}
@@ -264,7 +278,7 @@ def gap_sentence(reason: str, variant: str, texts: list[str], place: dict | None
         lead = "הוראות שלא קוימו בתשובה" if many else "הוראה שלא קוימה בתשובה"
         return f"{lead}: {who}" + (f" (נתון בלי מראה מקום: «{detail}»)" if detail else "") + "."
     if reason == "removed":
-        return f"{who}: מה שנכתב על כך בתשובה הוסר באימות, כי לא נמצאה לו תמיכה במקורות."
+        return f"{who}: מה שנכתב על כך בתשובה הוסר באימות, " + REMOVED_BECAUSE.get(variant, REMOVED_BECAUSE[""])
     if reason == "tool_failure":
         return f"{who} לא {'הושלמו' if many else 'הושלם'} בגלל תקלה בכלי או בשירות המודל בזמן הבדיקה."
     if reason == "calculation_incomplete" and variant == "failed":
@@ -387,7 +401,8 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
         return out | {"reason": "instruction_not_met", "variant": o.get("check") or "",
                       "detail": snippet[:80] + ("…" if len(snippet) > 80 else "")}
     if o.get("removed_units") and not o.get("units"):
-        return out | {"reason": "removed"}
+        kinds = o.get("removal_kinds") or []
+        return out | {"reason": "removed", "variant": kinds[0] if len(kinds) == 1 else ""}
     if "tool" in kinds:
         return out | {"reason": "tool_failure"}
     if "calculation" in kinds:
@@ -515,7 +530,8 @@ def gap_lines(items: list[dict]) -> list[str]:
 
 # what the payload keeps of each component (the UI's per-component detail)
 PUBLIC_FIELDS = ("id", "text", "kind", "aspect", "parent", "conditional", "subject", "status", "evidence_state",
-                 "limitation", "limitation_text", "stated", "gap", "units", "removed_units", "absence_units",
+                 "limitation", "limitation_text", "stated", "gap", "units", "removed_units", "removal_kinds",
+                 "absence_units",
                  "related", "place", "document", "document_id", "document_title", "searched", "claimed", "detail",
                  "uncited", "check")
 
