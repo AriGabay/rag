@@ -320,3 +320,26 @@ def test_an_inspection_near_the_reading_deadline_makes_no_call_and_the_turn_ends
     assert "מגבלה" in refused and "לא נקרא" in refused
     a = m["answer"]
     assert a["status"] == "partial" and "time_limit" in a["limits_hit"] and "מגבלת הזמן לשאלה אחת" in a["markdown"]
+
+
+def test_a_region_is_cropped_in_the_rendered_pages_frame_like_the_region_view(office, monkeypatch):
+    """The stored box is in the text reader's frame; the crop sent to the model is converted with the page's stored
+    geometry (a rotated page or one with a CropBox offset would otherwise be cut in the wrong place)."""
+    from app.extraction import render
+
+    doc = ingest_r1(office, monkeypatch)
+    ws = emp(office)
+    region = region_of(ws, doc)
+    converted: list = []
+    cropped: list = []
+
+    def display_box_of(conn, version_id, page_no, bbox):
+        converted.append(list(bbox))
+        return [1.0, 2.0, 3.0, 4.0]
+
+    real = render.render_png
+    monkeypatch.setattr(T, "display_box_of", display_box_of)
+    monkeypatch.setattr(render, "render_png", lambda data, page, bbox, **kw: cropped.append(bbox) or real(
+        data, page, None, **kw))
+    T.tool_inspect(ws, {"region": region})
+    assert converted and cropped == [[1.0, 2.0, 3.0, 4.0]]

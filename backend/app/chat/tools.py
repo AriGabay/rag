@@ -85,7 +85,7 @@ from app.measurements.extract import (
     attribution_in,
     names_match,
 )
-from app.platform.documents import coverage_of, reading_notes
+from app.platform.documents import coverage_of, display_box_of, reading_notes
 from app.platform.search import SearchScope, search_passages
 
 logger = logging.getLogger(__name__)
@@ -1498,9 +1498,12 @@ def _vision_read(ws: Workspace, spot: _Spot):
                 ws.limits_hit.append(TIME_LIMIT)
             return MSG_INSPECT_TIME.format(what=spot.what)
         ws.inspections += 1
+        # the stored box is in the text reader's frame; the crop is cut in the rendered page's frame (rotation,
+        # CropBox offset), exactly as the region view cuts it
+        crop = display_box_of(conn, spot.v.version_id, spot.page, spot.bbox) if spot.bbox else None
     # rendered and read outside any transaction: a model call never holds one open
     try:
-        png = render_png(get_storage().get(spot.v.storage_key), spot.page, spot.bbox,
+        png = render_png(get_storage().get(spot.v.storage_key), spot.page, crop,
                          scale=regions.READ_DPI / 72, max_side=VISION_MAX_SIDE)
     except RenderError:
         raise ToolError(MSG_INSPECT_RENDER.format(what=spot.what)) from None

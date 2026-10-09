@@ -602,6 +602,15 @@ def get_page_image(document_id: str, version_id: str, page_no: str,
     return _image_response(page.png, headers)
 
 
+def display_box_of(conn: Connection, version_id, page_no: int, bbox) -> list[float]:
+    """A block's stored box on ``page_no`` of a version in the frame of the rendered page (what ``render_png``
+    crops), from that page's stored geometry; the region view and the chat's visual reading crop the same place."""
+    page = conn.execute(text(
+        "SELECT mediabox, cropbox, rotation, display_width, display_height, geometry_issue FROM pages"
+        " WHERE version_id = :v AND page_no = :n"), {"v": version_id, "n": page_no}).first()
+    return _display_box(bbox, page)
+
+
 def _display_box(bbox, page) -> list[float]:
     """A block's stored box (the text reader's frame) in the frame of the rendered page, with the page's stored
     geometry (``app.extraction.geometry``); the stored box itself for a page without usable geometry (read before
@@ -634,13 +643,11 @@ def get_region_image(document_id: str, version_id: str, block_index: str,
                              {"v": ver_uuid, "i": index}).first()
         if block is None or not block.page or not block.bbox or len(block.bbox) != 4:
             raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
-        page = conn.execute(text(
-            "SELECT mediabox, cropbox, rotation, display_width, display_height, geometry_issue FROM pages"
-            " WHERE version_id = :v AND page_no = :n"), {"v": ver_uuid, "n": block.page}).first()
+        crop = display_box_of(conn, ver_uuid, block.page, block.bbox)
         audit(conn, "source_view", ctx.user_id, "document_version", ver_uuid, block=index)
         _queue_positions(conn, v)
     try:
-        return _image_response(render_png(_stored_file(v), block.page, _display_box(block.bbox, page)))
+        return _image_response(render_png(_stored_file(v), block.page, crop))
     except SourceFailure as failure:
         return failure.response()
     except RenderError:
