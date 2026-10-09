@@ -354,6 +354,12 @@ class Workspace:
     # about, and the subjects a calculation component compares
     requirements: Any = None
     context_notes: set = field(default_factory=set)  # documents whose contexts a read or a search already listed
+    # read once per turn: (version id, table index) -> (its stored structure, the block it is read at) (``_table_at``);
+    # (version id, reading id) -> every block's index, section path and status (``reader.section_blocks``), and each
+    # table's first block with its rows' positions (``_table_rows``)
+    tables: dict[tuple, tuple] = field(default_factory=dict)
+    section_blocks: dict[tuple, list] = field(default_factory=dict)
+    table_rows: dict[tuple, dict] = field(default_factory=dict)
 
     def spend(self, output: str) -> str:
         """Count a tool output sent to the model against the turn's budget; the output that reaches it is sent
@@ -366,6 +372,11 @@ class Workspace:
     @property
     def budget_spent(self) -> bool:
         return TOOL_BUDGET in self.limits_hit
+
+    @property
+    def requirement_items(self) -> list[dict]:
+        """The turn's frozen components (``requirements.items``); none before the engine sets them."""
+        return getattr(self.requirements, "items", None) or []
 
     def handle(self, prefix: str, key: tuple, **data) -> str:
         """The turn's short handle for what ``key`` names; the same thing keeps its handle."""
@@ -664,7 +675,7 @@ def contexts_of(ws: Workspace, conn: Connection, version_id, reading_id: str | N
 
 def asked_subjects(ws: Workspace) -> tuple[list[str], bool]:
     """What the request asks about: each frozen component's subject (True), else the current question (False)."""
-    items = getattr(ws.requirements, "items", None) or []
+    items = ws.requirement_items
     subjects = list(dict.fromkeys(i["subject"] for i in items if i.get("subject")))
     if subjects:
         return subjects, True
@@ -714,18 +725,28 @@ def _mark(s: Source, cx, numbers) -> Source:
     return s
 
 
-def _row_contexts(conn: Connection, cx, version_id, table_index: int) -> tuple[list[dict], dict]:
-    st = reader.table_structure(conn, version_id, table_index) or {}
-    block = reader.table_block(conn, version_id, table_index)
+def _table_at(ws: Workspace, conn: Connection, version_id, table_index: int) -> tuple[dict | None, Any]:
+    """A table's stored structure (None: not stored) and the block it is read at (None: none), read once per turn."""
+    key = (str(version_id), table_index)
+    found = ws.tables.get(key)
+    if found is None:
+        found = ws.tables[key] = (reader.table_structure(conn, version_id, table_index),
+                                  reader.table_block(conn, version_id, table_index))
+    return found
+
+
+def _row_contexts(ws: Workspace, conn: Connection, cx, version_id, table_index: int) -> tuple[list[dict], dict]:
+    st, block = _table_at(ws, conn, version_id, table_index)
+    st = st or {}
     return reader.table_contexts(cx, st, block.block_index if block else st.get("block_index"),
                                  block.page if block else st.get("page")), st
 
 
-def _hit_contexts(conn: Connection, cx, h: dict, bs, be) -> list[int]:
+def _hit_contexts(ws: Workspace, conn: Connection, cx, h: dict, bs, be) -> list[int]:
     """The contexts of a search hit: of its rows for a table or a table row, else of its blocks."""
     ti = h.get("table_index")
     if ti is not None and h["kind"] in ("table", "table_row"):
-        groups, _ = _row_contexts(conn, cx, h["version_id"], ti)
+        groups, _ = _row_contexts(ws, conn, cx, h["version_id"], ti)
         if h["kind"] == "table_row" and h.get("row_index") is not None:
             n = int(h["row_index"]) + 1
             return [g["context"] for g in groups if g["first"] <= n <= g["last"]]
@@ -733,17 +754,18 @@ def _hit_contexts(conn: Connection, cx, h: dict, bs, be) -> list[int]:
     return cx.spanned(bs, be)
 
 
-def _context_number(conn: Connection, cx, version_id, anchor: dict, holder: int | None) -> int | None:
+def _context_number(ws: Workspace, conn: Connection, cx, version_id, anchor: dict,
+                    holder: int | None) -> int | None:
     """The context a value is in, from where it was read (KTD7): a table cell's row (its page and top), else the
     block holding its number or quote; None in a file with one context."""
     if cx is None or not cx.multi:
         return None
     if anchor.get("table_index") is not None and isinstance(anchor.get("row"), int):
-        rows = (reader.table_structure(conn, version_id, anchor["table_index"]) or {}).get("rows") or []
+        st, block = _table_at(ws, conn, version_id, anchor["table_index"])
+        rows = (st or {}).get("rows") or []
         if 0 <= anchor["row"] < len(rows) and rows[anchor["row"]].get("page"):
             row = rows[anchor["row"]]
             return cx.at_position(row["page"], reader.row_top(row))
-        block = reader.table_block(conn, version_id, anchor["table_index"])
         return cx.at_block(block.block_index) if block is not None else None
     blocks = _value_blocks(anchor) or ([holder] if holder is not None else [])
     found = {cx.at_block(b) for b in blocks} - {None}
@@ -846,7 +868,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 # read in part only when the page or section it cites has an unread region (R28)
                 partial_document=gaps.get(h["version_id"], whole).cites(h["page_list"], h["section"]), tags=tags,
                 row_index=h.get("row_index") if h["kind"] == "table_row" else None),
-                cx, _hit_contexts(conn, cx, h, bs, be) if cx.multi else [])
+                cx, _hit_contexts(ws, conn, cx, h, bs, be) if cx.multi else [])
             out.append(ws.once(src, ("chunk", h["chunk_id"])))
             # the document as a whole: a datum not found may be in a part of it that was not read
             ws.touch(h["document_id"], h["title"], "retrieved", gaps.get(h["version_id"], whole).partial)
@@ -990,6 +1012,22 @@ def _section_name(path: tuple, later: bool = False) -> str:
     if path:
         return path[-1]
     return "תחילת ההקשר (לפני הכותרת הראשונה שלו)" if later else "תחילת המסמך (לפני הכותרת הראשונה)"
+
+
+def _later_context(cx, window: tuple[int, int] | None) -> bool:
+    """Whether a section's window is in a context after the file's first (its title part is then the context's)."""
+    return window is not None and cx is not None and cx.multi and cx.segment_at(window[0]) is not cx.segments[0]
+
+
+def _sections_of(cx, items: list) -> dict[tuple, None]:
+    """The sections the blocks of a part are in — each prefix of a block's section path, within its context — as
+    (path, window), in reading order."""
+    paths: dict[tuple, None] = {}
+    for r, _, _ in items:
+        path = reader.effective_path(cx, r.block_index, r.section_path)
+        for i in range(1, len(path) + 1):
+            paths.setdefault((path[:i], reader.section_window(cx, r.block_index, path[:i])), None)
+    return paths
 
 
 def _section_target(v: reader.Version, path: tuple, window: tuple[int, int] | None) -> tuple:
@@ -1173,8 +1211,7 @@ def _read_window(ws: Workspace, conn: Connection, v: reader.Version, target: tup
         path = target[2]
         window = (target[3], target[4]) if len(target) >= 5 else None  # a section of one context (KTD7)
         rows = reader.blocks_in_section(conn, vid, path, from_block, window)
-        later = window is not None and cx.multi and cx.segment_at(window[0]) is not cx.segments[0]
-        name = _section_name(path, later)
+        name = _section_name(path, _later_context(cx, window))
         lines = []
     else:
         first, last = target[2], target[3]
@@ -1196,11 +1233,7 @@ def _read_window(ws: Workspace, conn: Connection, v: reader.Version, target: tup
     else:
         location, section = _pages_label(pages), None
         # the sections these pages are in, as handles that open each of them whole (each within its context)
-        paths: dict = {}
-        for r, _, _ in part.items:
-            path = reader.effective_path(cx, r.block_index, r.section_path)
-            for i in range(1, len(path) + 1):
-                paths.setdefault((path[:i], reader.section_window(cx, r.block_index, path[:i])), None)
+        paths = _sections_of(cx, part.items)
         if paths:
             lines.append("סעיפים בעמודים האלה: " + "; ".join(
                 f"{_section_handle(ws, v, p, w)} «{_section_name(p)}»" for p, w in list(paths)[:SECTIONS_LISTED]))
@@ -1220,29 +1253,26 @@ def _whole_sections(ws: Workspace, conn: Connection, v: reader.Version, cx, part
     whole = {r.block_index for r, _, full in part.items if full}
     if not whole:
         return
-    candidates: dict[tuple, None] = {}
-    for r, _, _ in part.items:
-        path = reader.effective_path(cx, r.block_index, r.section_path)
-        for i in range(1, len(path) + 1):
-            candidates.setdefault((path[:i], reader.section_window(cx, r.block_index, path[:i])), None)
+    # every block's section and status, read once per reading of the turn: each candidate is checked from them
+    key = (str(v.version_id), v.reading_id)
+    every = ws.section_blocks.get(key)
+    if every is None:
+        every = ws.section_blocks[key] = reader.section_blocks(conn, v.version_id)
     covered = []
-    for path, window in candidates:
+    for path, window in _sections_of(cx, part.items):
         if any(len(p) < len(path) and path[:len(p)] == p and w == window for p, w, _ in covered):
             continue  # inside a section already covered whole: the broader one is named
-        blocks = reader.blocks_in_section(conn, v.version_id, path, None, window)
-        if blocks and {b.block_index for b in blocks} <= whole:
+        blocks = reader.in_section(every, path, window)  # (index, section path, status)
+        if blocks and {b[0] for b in blocks} <= whole:
             covered = [c for c in covered if not (len(path) < len(c[0]) and c[0][:len(path)] == path
                                                   and c[1] == window)]
             covered.append((path, window, blocks))
     if not covered:
         return
-    names = []
-    for path, window, _ in covered:
-        later = window is not None and cx is not None and cx.multi and cx.segment_at(window[0]) is not cx.segments[0]
-        names.append(_section_name(path, later))
+    names = [_section_name(path, _later_context(cx, window)) for path, window, _ in covered]
     targets = tuple(_section_target(v, path, window) for path, window, _ in covered)
     target = targets[0] if len(targets) == 1 else ("sections", str(v.version_id), targets)
-    unread = any(b.status == reader.UNREAD for _, _, blocks in covered for b in blocks)
+    unread = any(b[2] == reader.UNREAD for _, _, blocks in covered for b in blocks)
     name = names[0] if len(names) == 1 else (", ".join(f'"{n}"' for n in names[:-1]) + f' ו"{names[-1]}"')
     ws.touch(v.document_id, v.title, "read", v.partial,
              {"sid": s.sid, "scope": "section" if len(names) == 1 else "sections", "name": name, "target": target,
@@ -1254,28 +1284,37 @@ def _foreign_rows(ws: Workspace, conn: Connection, v: reader.Version, cx, window
     """Rows of a table stored with another context's block (a table the extraction merged across two appraisals)
     that lie within this section of this context: where to read them."""
     first, last = window
-    nxt = reader.blocks_between(conn, v.version_id, last + 1, last + 1, limit=1)
-    bounds = reader.blocks_between(conn, v.version_id, first, first, limit=1)
-    if not bounds:
+    edges = reader.blocks_at(conn, v.version_id, (first, last + 1))
+    if first not in edges:
         return []
-    start = (bounds[0].page or 0, contexts.top_of(bounds[0]))
-    end = (nxt[0].page or 0, contexts.top_of(nxt[0])) if nxt else None
+    start = (edges[first].page or 0, contexts.top_of(edges[first]))
+    end = (edges[last + 1].page or 0, contexts.top_of(edges[last + 1])) if last + 1 in edges else None
     number = cx.at_block(first)
     lines = []
-    for index, st in reader.tables_of(conn, v.version_id).items():
-        block = reader.table_block(conn, v.version_id, index)
-        if block is None or first <= block.block_index <= last:
+    for index, (block_index, placed) in _table_rows(ws, conn, v).items():
+        if first <= block_index <= last:
             continue
-        rows = [n for n, row in enumerate(st.get("rows") or [], 1) if row.get("page")
-                and start <= (row["page"], reader.row_top(row) or 0.0) and (end is None or (
-                    row["page"], reader.row_top(row) or 0.0) < end)
-                and cx.at_position(row["page"], reader.row_top(row)) == number]
+        rows = [(n, page) for n, page, top in placed if start <= (page, top or 0.0)
+                and (end is None or (page, top or 0.0) < end) and cx.at_position(page, top) == number]
         if rows:
-            pages = sorted({(st["rows"][n - 1].get("page")) for n in rows})
             h = _table_handle(ws, v.document_id, v.version_id, v.reading_id, index)
-            lines.append(MSG_FOREIGN_ROWS.format(first=rows[0], last=rows[-1], handle=h, pages=_rows_pages(
-                {"pages": set(pages)})))
+            lines.append(MSG_FOREIGN_ROWS.format(first=rows[0][0], last=rows[-1][0], handle=h,
+                                                 pages=_rows_pages(page for _, page in rows)))
     return lines
+
+
+def _table_rows(ws: Workspace, conn: Connection, v: reader.Version) -> dict[int, tuple[int, list[tuple]]]:
+    """Each table of a version stored with a block: its first block, and its rows that have a page as (row number
+    from 1, page, top), read once per reading of the turn."""
+    key = (str(v.version_id), v.reading_id)
+    found = ws.table_rows.get(key)
+    if found is None:
+        firsts = reader.table_first_blocks(conn, v.version_id)
+        found = ws.table_rows[key] = {
+            index: (firsts[index], [(n, row["page"], reader.row_top(row))
+                                    for n, row in enumerate(st.get("rows") or [], 1) if row.get("page")])
+            for index, st in reader.tables_of(conn, v.version_id).items() if index in firsts}
+    return found
 
 
 def _read_table(ws: Workspace, conn: Connection, v: reader.Version, table_index: int, row0: int = 0) -> Source:
@@ -1650,7 +1689,7 @@ def tool_outline(ws: Workspace, document: str) -> str:
                     + (f", בסעיף «{_txt(t['section'])}»" if t["section"] else ""))
             if len(t["contexts"]) > 1:  # rows of several contexts, merged into one table by the extraction
                 line += "; " + "; ".join(
-                    f"שורות {g['first']}–{g['last']}{_rows_pages(g)}: הקשר {g['context']}" for g in t["contexts"])
+                    f"שורות {g['first']}–{g['last']}{_rows_pages(g['pages'])}: הקשר {g['context']}" for g in t["contexts"])
             elif t["contexts"]:
                 line += f" (הקשר {t['contexts'][0]['context']})"
             out.append(line)
@@ -1658,11 +1697,10 @@ def tool_outline(ws: Workspace, document: str) -> str:
     return "\n".join(out)
 
 
-def _rows_pages(group: dict) -> str:
-    pages = sorted(group["pages"])
-    if not pages:
-        return ""
-    return f" (עמוד {pages[0]})" if len(pages) == 1 else f" (עמודים {pages[0]}–{pages[-1]})"
+def _rows_pages(pages) -> str:
+    """" (עמודים 3–4)" for the distinct pages of a run of rows; nothing without pages."""
+    pages = sorted(set(pages))
+    return f" ({_pages_label(pages)})" if pages else ""
 
 
 # --- inspect: a visual reading of a region or a page (KTD9) -------------------------------------------------------
@@ -2330,7 +2368,7 @@ def _take_cell(ws: Workspace, conn: Connection, src: Source, full: str, loc: dic
     """The number in the cell at a named row and column of the source's table, verified against the table's stored
     structure; a number the model names that is in another row or column is refused, with where it is."""
     index = _table_of(ws, src, loc.get("table"))
-    st = reader.table_structure(conn, src.version_id, index)
+    st, _ = _table_at(ws, conn, src.version_id, index)
     if st is None:
         raise ToolError("הטבלה לא נמצאה בקריאה הנוכחית של המסמך")
     return _cell_of(src, full, loc, st, index)
@@ -2452,6 +2490,8 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index) -> dict:
 # stored reading, which cannot add evidence. Its anchor carries the region key and, when confirmed, the confirming
 # word's box mapped into the rendered page (``anchors.page_box``), never an ``extracted_tables`` index.
 
+# keyed by a confirmed cell's ``by`` (``images.BY_OCR``, ``images.BY_TEXT_LAYER``) and an uncertain cell's status
+# (``images.CELL_*``), written out: this module imports ``app.extraction.images`` only where it is used
 MSG_VISION_CELL = {
     "ocr": "המספר אומת מול OCR של אותו חיתוך: OCR ראה אותו פעם אחת, בשורה ובעמודה של התא.",
     "text_layer": "המספר אומת מול שכבת הטקסט של האזור: הוא כתוב בה פעם אחת, בשורה ובעמודה של התא.",
@@ -2488,7 +2528,7 @@ def _take_vision_cell(ws: Workspace, src: Source, full: str, loc: dict) -> dict:
     """A cell of a table read by inspect, through its stored reading, with its OCR evidence (``evidence``: the
     cell's ``images.cell_evidence`` entry, ``why``: the message for its status) and an anchor of the region and the
     cell's box in the rendered page when OCR confirmed it in its place."""
-    from app.extraction.images import CELL_CONFIRMED, CELL_NO_OCR, placed_cells
+    from app.extraction.images import BY_OCR, CELL_CONFIRMED, CELL_NO_OCR, placed_cells
 
     vis = src.vision
     reading = vis["reading"]
@@ -2520,7 +2560,7 @@ def _take_vision_cell(ws: Workspace, src: Source, full: str, loc: dict) -> dict:
                                   "notes": list(t.notes[:3])},
                        "pages": [vis["page"]] if vis["page"] else []}
     taken["evidence"] = evidence
-    taken["why"] = (MSG_VISION_CELL.get(evidence.get("by") or "ocr", MSG_VISION_CELL["ocr"]) if confirmed
+    taken["why"] = (MSG_VISION_CELL.get(evidence.get("by") or BY_OCR, MSG_VISION_CELL[BY_OCR]) if confirmed
                     else MSG_VISION_UNCERTAIN.get(evidence["status"], MSG_VISION_UNCERTAIN["no_ocr"]))
     return taken
 
@@ -2839,7 +2879,7 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
             at = None
         elif cell:
             taken = _take_cell(ws, conn, src, full, loc)
-            block = reader.table_block(conn, src.version_id, taken["locator"]["table_index"])
+            _, block = _table_at(ws, conn, src.version_id, taken["locator"]["table_index"])
             rows, at = ([block] if block is not None else []), None
         else:
             blocks = None
@@ -2857,7 +2897,7 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
         cx = contexts_of(ws, conn, src.version_id, v.reading_id)
         here = None
         if cx.multi and not (cell and vision):
-            here = _context_number(conn, cx, src.version_id, taken.get("anchor") or {},
+            here = _context_number(ws, conn, cx, src.version_id, taken.get("anchor") or {},
                                    region[0].block_index if region else src.block_start)
             if here is None and len(src.contexts) == 1:
                 here = src.contexts[0]
@@ -2884,8 +2924,10 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
     note = reread[1] if reread is not None else None
     # how its own region was read, on the value itself, so coverage and the stored answer see it (R28)
     if "evidence" in taken:  # a cell of a table read by inspect: confirmed by OCR in its place, or uncertain (R18)
+        from app.extraction.images import CELL_CONFIRMED
+
         note = taken["why"]
-        if taken["evidence"]["status"] == "confirmed":
+        if taken["evidence"]["status"] == CELL_CONFIRMED:
             ws.settled_values.add(value.vid)
             value.reading = "clear"
         else:
@@ -3094,7 +3136,7 @@ def _take_cached(ws: Workspace, handle: str, data: dict, loc: dict, given: dict,
         doc = _cached_value(conn, v.version_id, data["reading_id"], data["locator"])
         cx = contexts_of(ws, conn, v.version_id, v.reading_id)
         place = (doc or {}).get("source") or {}
-        number = _context_number(conn, cx, v.version_id, (doc or {}).get("anchor") or {},
+        number = _context_number(ws, conn, cx, v.version_id, (doc or {}).get("anchor") or {},
                                  place.get("block_start")) if doc is not None else None
     if doc is None:
         raise ToolError(MSG_UNAVAILABLE)
@@ -3187,7 +3229,7 @@ def allowed_contexts(ws: Workspace) -> list[frozenset[str]] | None:
     if not contexts.enforced():
         return None
     allowed = []
-    for item in getattr(ws.requirements, "items", None) or []:
+    for item in ws.requirement_items:
         compared = [x for x in item.get("compares") or [] if x.strip()]
         if item.get("kind") != "calculation" or len(compared) < 2:
             continue
@@ -3313,7 +3355,7 @@ def _rate_sources(ws: Workspace, value: calc.Value) -> list[Source]:
     return out
 
 
-def _user_gave(ws: Workspace, written: str) -> bool:
+def user_gave(ws: Workspace, written: str) -> bool:
     """The user wrote the rate itself ("לפי 17%"): a calculation by it is what was asked."""
     raw = re.sub(r"[^\d.]", "", written or "").strip(".")
     if not raw:
@@ -3340,7 +3382,7 @@ def _near_misses(ws: Workspace, node, operands: dict[str, calc.Operand], justifi
     near_key = differs_key = None
     for product, rid in calc.rate_products(node):
         rate = ws.values.get(rid)
-        if rate is None or rate.unit != "percent" or _user_gave(ws, rate.written):
+        if rate is None or rate.unit != "percent" or user_gave(ws, rate.written):
             continue
         interval = calc.rounding_interval(rate.written)
         if interval is None:

@@ -134,6 +134,41 @@ def blocks_in_section(conn: Connection, version_id: UUID, path: tuple[str, ...],
         {"v": version_id, "p": list(path), "from": from_block}).all()
 
 
+def section_blocks(conn: Connection, version_id: UUID) -> list[tuple[int, tuple[str, ...] | None, str | None]]:
+    """Every block's (index, section path, status), in reading order, without its text: ``in_section`` picks a
+    section's blocks from them."""
+    return [(r.block_index, tuple(r.section_path) if r.section_path is not None else None, r.status)
+            for r in conn.execute(text("SELECT block_index, section_path, status FROM document_blocks"
+                                       " WHERE version_id = :v ORDER BY block_index"), {"v": version_id})]
+
+
+def in_section(blocks: list[tuple], path: tuple[str, ...], window: tuple[int, int] | None = None) -> list[tuple]:
+    """The blocks of ``section_blocks`` that ``blocks_in_section`` (without ``from_block``) returns for ``path`` and
+    ``window``."""
+    n = len(path)
+    if window is not None:
+        lo, hi = window
+        return [b for b in blocks if lo <= b[0] <= hi and (not path or (b[1] is not None and b[1][:n] == path))]
+    if not path:
+        return [b for b in blocks if b[1] is not None and not b[1]]
+    return [b for b in blocks if b[1] is not None and b[1][:n] == path]
+
+
+def blocks_at(conn: Connection, version_id: UUID, indexes: Collection[int]) -> dict[int, object]:
+    """The blocks of ``indexes`` that exist, by index (their page and box)."""
+    return {r.block_index: r for r in conn.execute(text(
+        "SELECT block_index, page, bbox FROM document_blocks WHERE version_id = :v AND block_index = ANY(:i)"),
+        {"v": version_id, "i": list(indexes)})}
+
+
+def table_first_blocks(conn: Connection, version_id: UUID) -> dict[int, int]:
+    """Each table's first block (the block ``table_block`` reads it at), by table index; a table stored without a
+    block is not among them."""
+    return {r.table_index: r.block_index for r in conn.execute(text(
+        "SELECT table_index, min(block_index) AS block_index FROM document_blocks WHERE version_id = :v"
+        " AND table_index IS NOT NULL GROUP BY table_index"), {"v": version_id})}
+
+
 def section_path_of(conn: Connection, version_id: UUID, block_index: int) -> tuple[str, ...]:
     row = conn.execute(text("SELECT section_path FROM document_blocks WHERE version_id = :v AND block_index = :b"),
                        {"v": version_id, "b": block_index}).first()
@@ -238,13 +273,15 @@ def outline(conn: Connection, version_id: UUID, cx=None) -> tuple[list[Section],
     version's appraisal contexts (``app.chat.contexts``); in a file holding several, each context's sections are
     its own (the same path in two contexts is two sections), and each table lists its rows by context."""
     multi = cx is not None and cx.multi
+    position = {id(s): n for n, s in enumerate(cx.segments)} if multi else {}  # a segment's place in ``segments``
     sections: dict[tuple, Section] = {}
     table_at: dict[int, tuple] = {}
     for r in conn.execute(text(
             "SELECT block_index, section_path, page, status, table_index, length(text) AS chars FROM document_blocks"
             " WHERE version_id = :v ORDER BY block_index"), {"v": version_id}):
         path = effective_path(cx, r.block_index, r.section_path) if multi else tuple(r.section_path or ())
-        seg = cx.segments.index(cx.segment_at(r.block_index)) if multi and cx.segment_at(r.block_index) else None
+        at = cx.segment_at(r.block_index) if multi else None
+        seg = position[id(at)] if at is not None else None
         for p in [path[:i] for i in range(1, len(path) + 1)] or [()]:
             key = (seg, p) if multi else p
             s = sections.get(key)

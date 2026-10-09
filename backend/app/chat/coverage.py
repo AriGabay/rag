@@ -206,15 +206,17 @@ def conflicting(ws: Workspace, document_ids: list[str] | None = None, ids: Colle
 
     by_context = enforced()
     seen: dict[tuple, set] = {}
-    entries = [(i, str(v.document_id), v.kind, v.unit, v.period, v.area_basis, v.subject, v.scenario, v.stance,
-                str(v.value), (getattr(v, "context", None) or {}).get("key")) for i, v in ws.values.items()]
-    entries += [(i, str(m.document_id), m.row.metric_kind, m.row.unit, m.row.period, m.row.area_basis, m.row.subject,
+
+    def kept(i: str, doc: str) -> bool:
+        return not ((document_ids and doc not in document_ids) or (ids is not None and i not in ids))
+
+    entries = [(v.kind, v.unit, v.period, v.area_basis, v.subject, v.scenario, v.stance, str(v.value),
+                (v.context or {}).get("key")) for i, v in ws.values.items() if kept(i, str(v.document_id))]
+    entries += [(m.row.metric_kind, m.row.unit, m.row.period, m.row.area_basis, m.row.subject,
                  getattr(m.row, "scenario", "") or "", getattr(m.row, "stance", "") or "",
-                 frozenset(numbers_in(m.row.value_text or "")), (getattr(m, "context", None) or {}).get("key"))
-                for i, m in ws.measurements.items()]
-    for i, doc, kind, unit, period, basis, subject, scenario, stance, amount, context in entries:
-        if (document_ids and doc not in document_ids) or (ids is not None and i not in ids):
-            continue
+                 frozenset(numbers_in(m.row.value_text or "")), (m.context or {}).get("key"))
+                for i, m in ws.measurements.items() if kept(i, str(m.document_id))]
+    for kind, unit, period, basis, subject, scenario, stance, amount, context in entries:
         if not (subject or "").strip() or kind in (None, "unknown", "other"):
             continue  # a datum of no named subject cannot be said to conflict with another
         prop = ("context", context) if by_context and context else _norm_label(subject)
@@ -224,7 +226,7 @@ def conflicting(ws: Workspace, document_ids: list[str] | None = None, ids: Colle
     return any(len(amounts) > 1 for amounts in seen.values())
 
 
-def validate_requested(ws: Workspace, requested) -> list[dict]:
+def validate_requested(ws: Workspace, requested, opened: dict[str, tuple[str, dict]] | None = None) -> list[dict]:
     """Each requested datum (a model claim, linked to its component by ``component``) with the status the turn's
     actions support. "The section was checked" needs a section, table or page range of one of its documents opened
     this turn and named in ``checked_where`` (a measurements listing is not a reading of the section), read to its
@@ -233,14 +235,16 @@ def validate_requested(ws: Workspace, requested) -> list[dict]:
     ``unread``). "Read in part" otherwise needs one of its documents read in part. "The sources conflict" needs values
     of the turn that conflict (``conflicting``); without them the datum was found. An unsupported status falls to the
     strongest one the turn does support, down to "not found in the search" — never up. ``kind`` is the reason it
-    supports (``REASONS``), None when found; ``searched``: the turn made a search or opened one of its documents."""
+    supports (``REASONS``), None when found; ``searched``: the turn made a search or opened one of its documents.
+    ``opened``: the turn's openings (``_openings``), when the caller already has them."""
     out = []
     for r in requested or []:
         docs = [d for d in r.document_ids if d in ws.activity]
-        openings = _openings(ws, docs)
         status, where, reason = r.status, None, None
         if status == "section_checked_absent":
-            where = (openings.get((r.checked_where or "").strip()) or (None, None))[1]
+            # an opening of one of its documents (an S# is one document's)
+            found = (_openings(ws, docs) if opened is None else opened).get((r.checked_where or "").strip())
+            where = found[1] if found is not None and found[0] in docs else None
             if where is None:
                 status = "source_partial"
             elif ws.read_complete(where.get("target")) is False:
@@ -251,7 +255,7 @@ def validate_requested(ws: Workspace, requested) -> list[dict]:
         if status == "sources_conflict" and not conflicting(ws, docs or None):
             status = "found"
         partial = next((ws.activity[d]["title"] for d in docs if ws.activity[d]["partial"]), None)
-        out.append({"component": (getattr(r, "component", "") or "").strip(), "label": r.label.strip(),
+        out.append({"component": (r.component or "").strip(), "label": r.label.strip(),
                     "document_ids": docs, "status": status, "claimed": r.status,
                     "checked_where": where["sid"] if where else None, "section": where["name"] if where else None,
                     "scope": where["scope"] if where else None, "partial_document": partial,
@@ -427,10 +431,12 @@ def _missing_parameters(ws: Workspace, o: dict, ev: dict) -> list[str]:
     return unfilled_parameters(ws, o)
 
 
-def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict | None = None) -> dict:
+def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict | None = None,
+              opened: dict[str, tuple[str, dict]] | None = None) -> dict:
     """Why a component is not given, chosen from the turn's evidence by the reason table (first match wins; the
     module docstring lists it): {"reason", "variant", "place", "document", "searched", "detail"}. ``claim``: the
-    model's validated claim about it, which adds evidence and never upgrades."""
+    model's validated claim about it, which adds evidence and never upgrades. ``opened``: the turn's openings
+    (``_openings``), when the caller already has them."""
     ev = related_evidence(ws, o, turn)
     kinds = {f["kind"] for f in ev["failures"]}
     # covered only by a search or reading the judge tied to it: a model's "not found in the search" proves none
@@ -462,7 +468,8 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
         return out | {"reason": "not_verifiable", "variant": "undeterminable"}
     if ev["data"]:
         return out | {"reason": "not_verifiable", "variant": "not_presented"}
-    opened = _openings(ws)
+    if opened is None:
+        opened = _openings(ws)
     readings = [(sid, *opened[sid]) for sid in ev["checks"] if sid in opened]
     for sid, doc, o_ in readings:
         st = ws.reads.get(o_.get("target")) if o_.get("target") is not None else None
@@ -493,11 +500,12 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
     return out | {"reason": "not_located"}
 
 
-def _claims_by_component(ws: Workspace, requested) -> tuple[dict[str, dict], list[dict]]:
+def _claims_by_component(ws: Workspace, requested, opened: dict[str, tuple[str, dict]] | None = None
+                         ) -> tuple[dict[str, dict], list[dict]]:
     """The model's validated claims: the strongest per component id, and those linked to none (strongest per label)."""
     linked: dict[str, list[dict]] = {}
     unlinked: dict[str, list[dict]] = {}
-    for r in validate_requested(ws, requested):
+    for r in validate_requested(ws, requested, opened):
         if r["status"] not in _STRENGTH:
             continue
         if r["component"]:
@@ -520,7 +528,8 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
     first unit without a citation); ``gap`` (its sentence alone) and ``stated`` — whether the server states it in the
     gap paragraph (a leaf not answered or needing clarification, and an instruction not met; a partly given leaf is
     listed in completeness only)."""
-    claims, _ = _claims_by_component(ws, requested)
+    opened = _openings(ws)  # the turn's openings, for every claim and component
+    claims, _ = _claims_by_component(ws, requested, opened)
     outcomes = report.requirement_outcomes(applied)
     for o in outcomes:
         o |= {"limitation": None, "limitation_text": None, "place": None, "document": None, "document_id": None,
@@ -529,7 +538,7 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
               "gap": None}
         if o["children"] or o["status"] not in UNMET:
             continue
-        why = reason_of(ws, o, turn, claims.get(o["id"]))
+        why = reason_of(ws, o, turn, claims.get(o["id"]), opened)
         o |= {"limitation": why["reason"], "limitation_text": REASONS[why["reason"]], "place": why.get("place"),
               "document": why.get("document"), "document_id": why.get("document_id"), "searched": why["searched"],
               "detail": why.get("detail") or "", "variant": why.get("variant") or ""}
@@ -560,11 +569,6 @@ def gap_groups(items: list[dict]) -> list[dict]:
         out.append({"reason": key[0], "reason_text": REASONS[key[0]],
                     "components": [m["id"] for m in members if m.get("id")], "texts": texts, "text": line})
     return out
-
-
-def gap_lines(items: list[dict]) -> list[str]:
-    """The gap paragraph's lines (``gap_groups``)."""
-    return [g["text"] for g in gap_groups(items)]
 
 
 # what the payload keeps of each component (the UI's per-component detail)
@@ -603,7 +607,7 @@ def state_components(ws: Workspace, answer: FinalAnswer, report,
     """The verified answer as the server finishes it (round 7 U3, ``engine.finish``), in order: the units that failed
     removed (``VerifyReport.apply``); each component's outcome recomputed from the surviving units with its reason
     (``component_outcomes``); the units stating an absence of a component the server states removed
-    (``VerifyReport.supersede``, then applied again); and one gap paragraph after the answer (``gap_lines``). A
+    (``VerifyReport.supersede``, then applied again); and one gap paragraph after the answer (``gap_groups``). A
     component not given makes the answer at most ``partial``. Returns the answer, tidied, and the outcomes (none
     for a clarification, which asks and states nothing)."""
     final = report.apply(answer)

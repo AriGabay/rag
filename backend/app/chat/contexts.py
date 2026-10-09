@@ -101,9 +101,6 @@ class Identity:
     def count(self, kind: str) -> int:
         return len(self.addresses if kind == ADDRESS else self.parcels)
 
-    def values(self, kind: str) -> frozenset:
-        return self.addresses if kind == ADDRESS else self.parcels
-
     def shares(self, other: Identity) -> bool:
         """Whether the two sets name a common identifier."""
         return bool(self.addresses & other.addresses or self.parcels & other.parcels)
@@ -377,7 +374,8 @@ _LOCK = threading.Lock()
 
 def of_version(conn: Connection, version_id: UUID | str, reading_id: str | None) -> Contexts:
     """The contexts of a version's reading, derived once per reading (the caller resolved the version under the
-    user's permissions, in ``conn``). Only headings and blocks that may hold a labelled identifier bring their text."""
+    user's permissions, in ``conn``). Only headings and blocks that may hold a labelled identifier bring their text,
+    never a table's or a picture's (``derive`` never reads those for identifiers)."""
     key = (str(version_id), reading_id)
     with _LOCK:
         found = _CACHE.get(key)
@@ -386,7 +384,8 @@ def of_version(conn: Connection, version_id: UUID | str, reading_id: str | None)
             return found
     rows = conn.execute(text(
         "SELECT block_index, kind, page, bbox, status, table_index,"
-        " CASE WHEN kind = 'heading' OR text ~ :pat THEN text END AS text"
+        " CASE WHEN kind NOT IN ('table', 'image') AND table_index IS NULL AND (kind = 'heading' OR text ~ :pat)"
+        " THEN text END AS text"
         " FROM document_blocks WHERE version_id = :v ORDER BY block_index"),
         {"v": UUID(str(version_id)), "pat": _CANDIDATE_SQL}).all()
     found = derive(rows, str(version_id))
@@ -395,11 +394,6 @@ def of_version(conn: Connection, version_id: UUID | str, reading_id: str | None)
         while len(_CACHE) > CACHE_MAX:
             _CACHE.popitem(last=False)
     return found
-
-
-def clear_cache() -> None:
-    with _LOCK:
-        _CACHE.clear()
 
 
 def enforced() -> bool:

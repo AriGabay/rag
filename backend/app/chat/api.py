@@ -36,6 +36,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from typing import NamedTuple
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -557,6 +558,7 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
     history = [engine.HistoryMessage(r.role, r.content) for r in rows if r.content]
     focus: dict[str, str] = {}
     prior: dict[str, dict] = {}
+    prior_ids: dict[str, str] = {}  # the last answer's source id -> the P# that reopens it
     for r in rows:
         if r.role != "assistant" or not r.answer:
             continue
@@ -568,6 +570,7 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
             if not s.get("version_id"):  # a listing names documents; there is no place in one to reopen
                 continue
             pid = f"P{len(prior) + 1}"
+            prior_ids[s.get("id")] = pid
             prior[pid] = {"version_id": s["version_id"], "block_start": s.get("block_start"),
                           "block_end": s.get("block_end"), "table_index": s.get("table_index"),
                           "chunk_id": s.get("chunk_id"), "title": s.get("title"), "location": s.get("location"),
@@ -591,22 +594,18 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
             # the parameter a clarification asked for (round 7 KTD9): the reply is bound to it, and the values it
             # kept are reopened through the references above
             if isinstance(last.answer.get("pending"), dict):
-                pending = _pending_refs(last.answer["pending"], last.answer.get("sources") or [])
+                pending = _pending_refs(last.answer["pending"], prior_ids)
     return engine.TurnInput(question=user.content, history=history, summary=summary, focus=last_focus,
                             focus_documents=[{"document_id": k, "title": v} for k, v in list(focus.items())[-8:]],
                             prior_refs=prior, candidates=candidates,
                             pending=pending), _user_message_ids(rows, user_message_id)
 
 
-def _pending_refs(pending: dict, sources: list[dict]) -> dict:
+def _pending_refs(pending: dict, prior_ids: dict[str, str]) -> dict:
     """A stored pending parameter with each value it kept pointed at the ``P#`` that reopens the passage it was
-    verified in — numbered as ``_turn_input`` numbers the last answer's sources (None when that passage is not one
-    of them)."""
-    pids: dict[str, str] = {}
-    for s in sources[:12]:
-        if s.get("version_id"):
-            pids[s.get("id")] = f"P{len(pids) + 1}"
-    return pending | {"found": [v | {"prior": pids.get(v.get("source_id"))} for v in pending.get("found") or []]}
+    verified in (``prior_ids``: the last answer's source ids as ``_turn_input`` numbered them; None when that passage
+    is not one of them)."""
+    return pending | {"found": [v | {"prior": prior_ids.get(v.get("source_id"))} for v in pending.get("found") or []]}
 
 
 def _user_message_ids(rows, user_message_id) -> list[str]:
@@ -639,7 +638,8 @@ def _public_source(src) -> dict:
     return src.public() | {"chunk_id": str(src.chunk_id) if src.chunk_id else None}
 
 
-def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = None) -> dict:
+def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = None,
+                    removals: _Removals | None = None) -> dict:
     ws, a = outcome.workspace, outcome.answer
     cited = coverage.cited_ids(a.answer_markdown)
     sources = [_public_source(ws.sources[i]) for i in ws.sources if i in cited]
@@ -711,7 +711,8 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
         "gaps": list(outcome.report.gaps),
         "touched_documents": sorted(ws.activity),
         # the documents each removal was checked against (round 7 KTD5): the message is shown only while they are
-        "removal_documents": sorted(_removal_documents(ws, outcome.report)),
+        "removal_documents": sorted(_removal_documents(removals if removals is not None
+                                                          else _removals(ws, outcome.report))),
     }
     # every cited source, value and measurement keeps where it points, resolved against the turn's pinned readings
     # (KTD1); a computation keeps its inputs
@@ -755,40 +756,57 @@ def _record_documents(record: dict) -> set[str]:
     return {d for d in [record.get("document_id"), *(record.get("listed_document_ids") or [])] if d}
 
 
-def _removal_documents(ws, report) -> set[str]:
+class _Removals(NamedTuple):
+    """The turn's removals (``VerifyReport.removals``) with what each was checked against, gathered once for the
+    payload and the diagnostics: ``closure``, each removal's ids (``_checked_ids``); ``records``, one record per id
+    checked (``_checked_record``) with its ``type``; ``grouped``, the same records by type."""
+
+    problems: list
+    closure: list[list[str]]
+    records: dict[str, dict]
+    grouped: dict[str, list[dict]]
+
+
+def _removals(ws, report) -> _Removals:
+    problems = report.removals()
+    closure = [_checked_ids(ws, p.checked_ids or []) for p in problems]
+    records: dict[str, dict] = {}
+    grouped: dict[str, list[dict]] = {}
+    for i in dict.fromkeys(i for ids in closure for i in ids):
+        key, record = _checked_record(ws, i)
+        records[i] = record | {"type": key}
+        grouped.setdefault(key, []).append(records[i])
+    return _Removals(problems, closure, records, grouped)
+
+
+def _removal_documents(removals: _Removals) -> set[str]:
     """The documents every removal was checked against (``_checked_ids``)."""
-    return {d for p in report.removals() for i in _checked_ids(ws, p.checked_ids or [])
-            for d in _record_documents(_checked_record(ws, i)[1])}
+    return {d for record in removals.records.values() for d in _record_documents(record)}
 
 
-def _removal_decisions(ws, report) -> list[dict]:
+def _removal_decisions(ws, removals: _Removals) -> list[dict]:
     """Each removal's decision (round 7 KTD5, R12): the unit's draft text, the factual reason, the check that fired,
     the failure kind, the component, the ids checked and whether a repair was attempted, with ``sources`` — each id
     it was checked against (and what that rests on) as the client opens it, with its anchor (``anchors.attach``,
     resolved against the turn's pinned readings) and its ``type`` (``sources``, ``values``, ``measurements``,
     ``computations``, ``assumptions``)."""
-    removals = report.removals()
-    closure = {id(p): _checked_ids(ws, p.checked_ids or []) for p in removals}
-    records: dict[str, dict] = {}
-    grouped: dict[str, list[dict]] = {}
-    for i in dict.fromkeys(i for ids in closure.values() for i in ids):
-        key, record = _checked_record(ws, i)
-        records[i] = record | {"type": key}
-        grouped.setdefault(key, []).append(records[i])
-    if records:
-        anchors.attach(ws, grouped)
-    return [p.as_dict() | {"sources": [records[i] for i in closure[id(p)]]} for p in removals]
+    if removals.records:
+        anchors.attach(ws, removals.grouped)
+    return [p.as_dict() | {"sources": [removals.records[i] for i in ids]}
+            for p, ids in zip(removals.problems, removals.closure, strict=True)]
 
 
-def _diagnostics(outcome: engine.TurnOutcome, payload: dict) -> dict:
+def _diagnostics(outcome: engine.TurnOutcome, payload: dict, removals: _Removals | None = None) -> dict:
     """What each verification round found (first answer, repair, rewrite) and — only — the decisions of what the final
     answer lost (``_removal_decisions``), with every document behind the answer and behind each removal (the reader
-    must see them all)."""
+    must see them all). ``removals``: the turn's, when the payload already gathered them."""
     resolution = outcome.resolution or None
     lookup = (resolution or {}).get("lookup") or {}
     found = {d["document_id"] for d in lookup.get("documents") or []}
     found |= set(((resolution or {}).get("parse") or {}).get("document_ids") or [])
-    removed = _removal_decisions(outcome.workspace, outcome.report)
+    if removals is None:
+        removals = _removals(outcome.workspace, outcome.report)
+    removed = _removal_decisions(outcome.workspace, removals)
     checked = {d for r in removed for s in r["sources"] for d in _record_documents(s)}
     checked |= {d for r in removed for s in r["sources"] for d in anchors.anchored_documents({s["type"]: [s]})}
     return {"rounds": outcome.rounds, "removed": removed, "resolution": resolution,
@@ -847,9 +865,11 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
         outcome = engine.run_turn(ctx, provider, inp, lambda step, label: _progress(ctx, message_id, step, label),
                                   lambda: _cancel_requested(ctx, message_id))
         _log_turn_usage(ctx, provider, outcome.usage)
-        payload = _answer_payload(outcome, user_ids)
+        removals = _removals(outcome.workspace, outcome.report)  # the payload's documents and the diagnostics' decisions
+        payload = _answer_payload(outcome, user_ids, removals)
         recorded = _finish(ctx, message_id, "done", content=outcome.answer.answer_markdown, answer=payload,
-                           usage=outcome.usage, model=provider.model, diagnostics=_diagnostics(outcome, payload))
+                           usage=outcome.usage, model=provider.model,
+                           diagnostics=_diagnostics(outcome, payload, removals))
     # every exit logs the calls the turn made: a cancelled, failed or broken turn was still billed for them
     except engine.TurnCancelled as e:
         usage = _log_turn_usage(ctx, provider, getattr(e, "usage", None))

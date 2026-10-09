@@ -79,14 +79,14 @@ Kind = Literal["information", "calculation", "instruction", "assumption", "clari
 KINDS: tuple[str, ...] = get_args(Kind)
 # what an instruction is about (KTD2): ``citation`` is checked deterministically from the answer's units
 Aspect = Literal["", "citation", "style", "layout", "units", "presentation"]
-ASPECTS: tuple[str, ...] = get_args(Aspect)
 ID_PREFIX = "N"
 # the prefixes of every handle a turn's workspace issues (tools, verify, api): a component id never starts with one
 HANDLE_PREFIXES = ("S", "M", "V", "A", "C", "P", "Q", "H", "F", "E", "D", "T", "K", "R", "§")
 USAGE_PURPOSE = "request"  # the label the analysis call's usage is recorded under (measured apart from ``resolve``)
 ANALYSIS_OUTPUT_TOKENS = 4000
 ANALYSIS_GRACE_SECONDS = 2.0  # waited past the call's own deadline before it is abandoned
-_POLL_SECONDS = 0.25  # how often a wait looks at the turn's cancellation (a database read in a real turn)
+_POLL_SECONDS = 0.25  # how often a wait wakes to see whether the analysis finished or its time ran out
+_CANCEL_POLL_SECONDS = 1.0  # how often, at most, it asks whether the turn was cancelled (a database read in a real turn)
 
 
 class _Strict(BaseModel):
@@ -310,9 +310,12 @@ class Pending:
         """The analysis, once finished; ``timeout`` when it is not finished by its deadline (and a grace), and
         ``cancelled`` when the turn is — a call still in flight is then abandoned, recorded as a timeout."""
         until = self.deadline + ANALYSIS_GRACE_SECONDS
+        asked = None  # when ``cancelled`` was last asked: at the first wake, then at most once a second
         while not self._done.wait(_POLL_SECONDS):
-            if cancelled():
-                return self._give_up("cancelled")
+            if asked is None or time.monotonic() - asked >= _CANCEL_POLL_SECONDS:
+                asked = time.monotonic()
+                if cancelled():
+                    return self._give_up("cancelled")
             if time.monotonic() >= until:
                 return self._give_up(CallStatus.TIMEOUT.value)
         self.collected = True

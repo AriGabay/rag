@@ -145,12 +145,13 @@ unit is still marked as partly verified.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Literal, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -332,10 +333,12 @@ _SCENARIO_MARK = re.compile(r"(?<![א-ת])(?:אם|בהנחה|בהנחת|בתרח
 
 # Why a claim was removed (round 7 KTD5, R12): one failure kind per removal decision. ``not_checked`` is the server's
 # own — a check that did not finish (the judge timed out on the unit's call, or left it out) — and is never "wrong".
-FAILURE_KINDS = ("absent_from_source", "wrong_subject", "wrong_unit", "uncertain_reading", "contradicts_source",
-                 "wrong_calculation", "invalid_citation", "not_checked")
-JudgeFailure = Literal["none", "absent_from_source", "wrong_subject", "wrong_unit", "uncertain_reading",
-                       "contradicts_source", "wrong_calculation", "invalid_citation"]
+_JudgedFailure = Literal["absent_from_source", "wrong_subject", "wrong_unit", "uncertain_reading", "contradicts_source",
+                         "wrong_calculation", "invalid_citation"]
+FailureKind = Literal[_JudgedFailure, "not_checked"]
+FAILURE_KINDS: tuple[str, ...] = get_args(FailureKind)
+# the judge's field: every failure kind but the server's own ``not_checked``, or "none"
+JudgeFailure = Literal["none", _JudgedFailure]
 # the failure kinds a bounded repair can remove (KTD10): a re-attribution, a recomputation from the right inputs, one
 # focused re-read; the others go to the repair round as before (another source may support the claim), then out
 REPAIRABLE_FAILURES = ("wrong_subject", "wrong_calculation", "uncertain_reading")
@@ -681,7 +684,7 @@ class Problem:
     # the structured decision (round 7 KTD5, R12): why (``FAILURE_KINDS``), the check that fired (a deterministic
     # check's name, ``judge`` or ``dependency``), the component the unit gave (``N#``, when known), the ids it was
     # checked against (its citations when the check fired), and whether a repair round was asked to fix it
-    failure_kind: str | None = None
+    failure_kind: FailureKind | None = None
     check: str | None = None
     component: str | None = None
     checked_ids: list[str] | None = None
@@ -1021,8 +1024,7 @@ class VerifyReport:
             kind = structural_kind(u)
             if kind == "table_header" or exempt_without_verdict(u):
                 continue
-            stated = _HEADING_NUMBER.sub("", u.text.strip(), count=1) if _numbered_heading(u.text) else u.text
-            if numbers_in(stated) or self.verdicts.get(u.index) in ("supported", "partial"):
+            if numbers_in(_stated_text(u)) or self.verdicts.get(u.index) in ("supported", "partial"):
                 out.append(u.index)
         return out
 
@@ -1178,6 +1180,12 @@ def _sentence_cuts(markdown: str, units: list[Unit], errors: set[int]) -> list[t
             whole = (line_start, min(line_end + 1, len(markdown)))
             cuts = [c for c in cuts if not (whole[0] <= c[0] and c[1] <= whole[1])] + [whole]
     return sorted(cuts)
+
+
+def _stated_text(u: Unit) -> str:
+    """A unit's text without a numbered heading's own number ("9.1 שיטת השומה"): its place in the answer, not a
+    fact."""
+    return _HEADING_NUMBER.sub("", u.text.strip(), count=1) if _numbered_heading(u.text) else u.text
 
 
 def _numbered_heading(text: str) -> bool:
@@ -1444,11 +1452,11 @@ def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
 def _scale_text(v) -> str:
     """The scale a value's source states it in (R14), with the amount it is: the judge reads "412.3 מיליון ₪" against
     412,300 of a table "באלפי ₪" as the same amount."""
-    from app.chat.calc import SCALE_LABELS, fmt
+    from app.chat.calc import fmt, scaled_label
 
     if v.scale == 1:
         return ""
-    return (f"\nקנה מידה במקור: {SCALE_LABELS.get(v.scale) or f'פי {v.scale:,}'} — {v.written} במקור הוא "
+    return (f"\nקנה מידה במקור: {scaled_label('', v.scale)} — {v.written} במקור הוא "
             f"{fmt(v.value * v.scale)} ביחידות מלאות")
 
 
@@ -1561,7 +1569,7 @@ def conditional_qualifier(c, stated: bool = False) -> str:
     reason is given."""
     from app.chat.tools import MSG_UNCERTAIN_INPUTS
 
-    uncertain = list(getattr(c, "uncertain", None) or [])
+    uncertain = list(c.uncertain or [])
     said = MSG_UNCERTAIN_INPUTS.format(ids=", ".join(uncertain)) if uncertain else None
     why = []
     if uncertain:
@@ -1602,9 +1610,18 @@ class Shown(NamedTuple):
     start: int  # its span in the text
     end: int
 
+    @property
+    def amount(self) -> Decimal | None:
+        """The number as written, before its scale word's multiplier; None when its digits are not one number."""
+        try:
+            return Decimal(self.written.replace(",", ""))
+        except InvalidOperation:
+            return None
 
-def _shown(text: str) -> list[Shown]:
-    """Each number of a text as it is shown (``Shown``)."""
+
+@functools.lru_cache(maxsize=1024)
+def _shown(text: str) -> tuple[Shown, ...]:
+    """Each number of a text as it is shown (``Shown``); kept per text (a tuple of immutable ``Shown``)."""
     from app.chat.calc import scale_after
 
     out = []
@@ -1613,7 +1630,7 @@ def _shown(text: str) -> list[Shown]:
         end = m.start() + len(written)
         percent = bool(re.match(r"\s*(?:%|אחוז)", text[end:end + 6]))
         out.append(Shown(written, percent, 1 if percent else scale_after(text, m.start(), end)[0], m.start(), end))
-    return out
+    return tuple(out)
 
 
 def _shows(c, written: str, percent: bool, scale: int, steps: bool = True) -> bool:
@@ -1624,7 +1641,7 @@ def _shows(c, written: str, percent: bool, scale: int, steps: bool = True) -> bo
 
     if display_matches(written, percent, c.value, c.dims, c.outcome.kind, scale, c.outcome.scale):
         return True
-    scales = list(getattr(c.outcome, "step_scales", None) or [])
+    scales = list(c.outcome.step_scales or [])
     return steps and any(display_matches(written, False, v, (), None, scale, scales[n] if n < len(scales) else 1)
                          for n, (_, v) in enumerate(c.outcome.steps))
 
@@ -1822,7 +1839,7 @@ def rests_on_documents(ws: Workspace, cid: str, _seen: frozenset = frozenset()) 
 
 def _only_calculation(ws: Workspace, item: dict, items: list[dict] | None = None) -> bool:
     """Whether ``item`` is the only calculation component among ``items`` (default: the turn's frozen components)."""
-    items = items if items is not None else getattr(ws.requirements, "items", None) or []
+    items = items if items is not None else ws.requirement_items
     others = [i for i in items if i.get("kind") == "calculation" and i.get("id") != item.get("id")]
     return not others
 
@@ -1843,7 +1860,7 @@ def unfilled_parameters(ws: Workspace, item: dict, linked=None, items: list[dict
         return []
     # a rate a calculation applied is a registered id — a source's value, a user's assumption or a result built on
     # them: the calculator never applies a literal as one
-    if any(getattr(c, "rates", None) for c in ws.computations.values()):
+    if any(c.rates for c in ws.computations.values()):
         return []
     if linked is None:
         linked = list(ws.computations) if _only_calculation(ws, item, items) else []
@@ -1856,7 +1873,7 @@ def pending_parameters(ws: Workspace, requirements=None) -> dict[str, list[str]]
     """Each frozen calculation component of the turn (``requirements``, default the workspace's) still waiting for a
     detail only the user can give."""
     out = {}
-    items = getattr(requirements if requirements is not None else ws.requirements, "items", None) or []
+    items = (getattr(requirements, "items", None) or []) if requirements is not None else ws.requirement_items
     for item in items:
         names = unfilled_parameters(ws, item, items=items)
         if names:
@@ -1864,21 +1881,17 @@ def pending_parameters(ws: Workspace, requirements=None) -> dict[str, list[str]]
     return out
 
 
-def _user_gave(ws: Workspace, written: str) -> bool:
-    from app.chat.tools import _user_gave as gave
-
-    return gave(ws, written)
-
-
 def _input_choice(u: Unit, ws: Workspace) -> Problem | None:
     """A unit resting on a calculation built from a rounded document rate while the rate's source states the amount
     within its rounding interval (``Computation.explicit_amount``, round 7 KTD8, R23): an input choice the repair
     round fixes from the stated amount. A user's assumption is never one (only a document rate is checked), nor a
     rate the user wrote."""
+    from app.chat.tools import user_gave
+
     for cid in u.ids:
         c = ws.computations.get(cid)
-        near = getattr(c, "explicit_amount", None) if c is not None else None
-        if not near or _user_gave(ws, near.get("rate_written") or ""):
+        near = c.explicit_amount if c is not None else None
+        if not near or user_gave(ws, near.get("rate_written") or ""):
             continue
         origin = near.get("from")
         via = f" (דרך {origin})" if origin and origin != cid else ""
@@ -1916,12 +1929,13 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
     problems: list[Problem] = []
     question_numbers = numbers_in(question)
     everything = _all_numbers(ws)
+    stated_by: dict[str, set[str]] = {}  # the numbers each cited id states, read once for all units
     for u in units:
         unknown = _unknown_ids(u, ws)
         # a scenario's result nobody's number gave, for a detail only the user can give, is an unrequested assumption
         # even when it cites a calculation the calculator refused (KTD9): the repair asks rather than re-cites
-        assumed = _unrequested_assumption(u, ws, _unstated(u, ws, question_numbers, everything)) if unknown and all(
-            i.startswith("C") for i in unknown) else None
+        assumed = _unrequested_assumption(u, ws, _unstated(u, ws, question_numbers, everything, stated_by=stated_by)
+                                          ) if unknown and all(i.startswith("C") for i in unknown) else None
         if assumed is not None:
             problems.append(assumed)
             continue
@@ -1931,7 +1945,7 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
                       else "ציטוט מזהה שלא הוחזר בתור הזה: " + ", ".join(unknown))
             problems.append(Problem(u, reason, failure_kind="invalid_citation", check="unknown_id"))
             continue
-        missing = _unstated(u, ws, question_numbers, everything)
+        missing = _unstated(u, ws, question_numbers, everything, stated_by=stated_by)
         assumed = _unrequested_assumption(u, ws, missing)
         if assumed is not None:
             problems.append(assumed)
@@ -1976,15 +1990,20 @@ def _unknown_ids(u: Unit, ws: Workspace) -> list[str]:
 
 
 def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: set[str],
-              strict: bool = False) -> list[str]:
+              strict: bool = False, stated_by: dict[str, set[str]] | None = None) -> list[str]:
     """The numbers of a unit that nothing it cites states (for a unit that cites nothing, nothing of the turn —
     unless ``strict``, which holds it to its citations too), that the question does not give and that show no
     result of a calculation it cites (any of the turn's, for a unit citing nothing, unless ``strict``) — and the
     numbers that write a scaled value or result of what it cites with a scale word that is not its scale
-    (``_wrong_scale``)."""
+    (``_wrong_scale``). ``stated_by``: the numbers each cited id states, kept across one verification's units."""
     cited: set[str] = set()
-    for _, t in _texts(ws, u.ids):
-        cited |= numbers_in(t, words=True)
+    for i, t in _texts(ws, u.ids):
+        found = stated_by.get(i) if stated_by is not None else None
+        if found is None:
+            found = numbers_in(t, words=True)
+            if stated_by is not None:
+                stated_by[i] = found
+        cited |= found
     computations = [ws.computations[i] for i in u.ids if i in ws.computations]
     for c in computations:
         cited.add(str(len(c.inputs)))
@@ -1993,8 +2012,7 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
     pool = cited if held else everything
     values = [ws.values[i] for i in u.ids if i in ws.values] if held else list(ws.values.values())
     # a numbered heading's own number ("9.1 שיטת השומה") is its place in the answer, not a fact
-    stated = _HEADING_NUMBER.sub("", u.text.strip(), count=1) if _numbered_heading(u.text) else u.text
-    missing = [n for n in numbers_in(stated) - question_numbers if n not in pool and not (
+    missing = [n for n in numbers_in(_stated_text(u)) - question_numbers if n not in pool and not (
         _small_ordinal(n, u.text) and not _document_count(n, u.text))]
     if missing:  # a calculation's result shown rounded to the precision and in the scale it is written in
         shown = _computed_numbers(u.text, computations if held else list(ws.computations.values()))
@@ -2020,23 +2038,14 @@ def _wrong_scale(u: Unit, ws: Workspace, values: list, computations: list) -> li
         return []
     written: set[Decimal] = set()  # the amounts the unit's cited sources write, each in its own scale
     for _, t in _texts(ws, [i for i in u.ids if i in ws.sources or i in ws.measurements]):
-        for n in _shown(t):
-            try:
-                written.add(Decimal(n.written.replace(",", "")) * n.scale)
-            except InvalidOperation:
-                continue
+        written |= {a * n.scale for n in _shown(t) if (a := n.amount) is not None}
     out = []
     for n in _shown(u.text):
         if n.percent or n.scale == 1:
             continue
         digits = numbers_in(n.written)
         mine = [x for x in scaled if digits & x[0]]
-        if not mine:
-            continue
-        try:
-            if Decimal(n.written.replace(",", "")) * n.scale in written:
-                continue
-        except InvalidOperation:
+        if not mine or n.amount is None or n.amount * n.scale in written:
             continue
         if not any(display_matches(n.written, False, value, dims, kind, n.scale, scale)
                    for _, value, dims, kind, scale in mine):
@@ -2066,9 +2075,8 @@ def _restated(text: str, pool: set[str], scaled: set[Decimal] | frozenset = froz
     noted = bool(_ROUNDING_NOTE.search(text))
     out: set[str] = set()
     for n in _shown(text):
-        try:
-            shown = Decimal(n.written.replace(",", ""))
-        except InvalidOperation:
+        shown = n.amount
+        if shown is None:
             continue
         approx = noted or bool(meaning._APPROX_BEFORE.search(text[:n.start]))
         if n.percent:
@@ -2206,10 +2214,11 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
         return {}
     question_numbers = numbers_in(question)
     bound: dict[int, list[str]] = {}
+    stated_by: dict[str, set[str]] = {}  # the numbers each cited id states, read once for all units
     for u in units:
         if _unknown_ids(u, ws):
             continue
-        loose = set(_unstated(u, ws, question_numbers, set(), strict=True))
+        loose = set(_unstated(u, ws, question_numbers, set(), strict=True, stated_by=stated_by))
         if not loose:
             continue
         chosen: list[str] = []
@@ -2226,7 +2235,7 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
             continue
         trial = Unit(u.index, u.raw, u.text, [*u.ids, *chosen], u.start, u.end, u.table_header, u.table_span,
                      u.context)
-        if _unstated(trial, ws, question_numbers, set()) or _framed_result(trial, ws):
+        if _unstated(trial, ws, question_numbers, set(), stated_by=stated_by) or _framed_result(trial, ws):
             continue
         u.ids.extend(chosen)
         bound[u.index] = chosen

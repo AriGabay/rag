@@ -730,14 +730,14 @@ def _pending(ws: T.Workspace, turn: TurnRequirements, answer: FinalAnswer) -> di
     reopened rather than searched again. None for any other answer."""
     if answer.status != "clarification":
         return None
-    item = next((i for i in turn.items if unfilled_parameters(ws, i)), None)
+    item, names = next(((i, names) for i in turn.items if (names := unfilled_parameters(ws, i))), (None, None))
     if item is None:
         return None
     cited = coverage.cited_ids(answer.answer_markdown)
     found = [{"id": v.vid, "label": v.label, "value_text": v.written, "source_id": v.source_id}
              for vid, v in ws.values.items() if vid in cited]
     return {"component": item["id"], "text": item["text"], "subject": item.get("subject") or "",
-            "parameters": unfilled_parameters(ws, item), "question": answer.clarification_question or "",
+            "parameters": names, "question": answer.clarification_question or "",
             "found": found}
 
 

@@ -8,6 +8,7 @@ import type {
   ChatComponent,
   ChatComputation,
   ChatComputationInput,
+  ChatDiagnostics,
   ChatLedger,
   ChatMessage,
   ChatRemoval,
@@ -582,6 +583,11 @@ function ComponentsSection({
   const unmet = leaves.filter((c) => c.status !== "full");
   const full = leaves.length - unmet.length;
   const removals = answer.verification?.removals ?? [];
+  // the ids the components' claims cite that open something (`citedView`), each checked once per answer
+  const citable = useMemo(
+    () => new Set([...new Set(components.flatMap((c) => c.related ?? []))].filter((id) => citedView(answer, id) !== null)),
+    [answer, components],
+  );
   if (leaves.length === 0) return null;
   return (
     <div className="details-section components" data-testid="components">
@@ -598,7 +604,7 @@ function ComponentsSection({
             const reason = gapReasonText(c.limitation) || c.limitation_text || "";
             const where = [c.document_title ?? c.document, c.place?.name].filter(Boolean).join(", ");
             const parent = c.parent ? byId.get(c.parent) : undefined;
-            const cited = (c.related ?? []).filter((id) => citedView(answer, id) !== null);
+            const cited = (c.related ?? []).filter((id) => citable.has(id));
             const kind = COMPONENT_KIND_LABEL[c.kind] ?? "";
             return (
               <li key={c.id} data-testid="component" data-id={c.id} data-status={c.status}>
@@ -663,8 +669,18 @@ function ComponentsSection({
   );
 }
 
+/** A diagnostics request shared by the removals of one message while it is in flight (`RemovalsSection`): `waiting`
+ * counts the expanded removals still waiting for it; the last one to stop waiting aborts it. */
+type SharedDiagnostics = {
+  messageId: string;
+  promise: Promise<ChatDiagnostics>;
+  ctrl: AbortController;
+  waiting: number;
+};
+
 /** Each claim verification removed: its kind and the server's fixed sentence; expanded, its draft and factual reason
- * from the diagnostics route (`RemovalItem`). */
+ * from the diagnostics route (`RemovalItem`). Removals expanded while a request is in flight share it; it is dropped
+ * once it settles, so every later expand asks the route again (nothing is cached). */
 function RemovalsSection({
   removals,
   components,
@@ -677,6 +693,42 @@ function RemovalsSection({
   onOpenSource?: (nav: ViewerNav) => void;
 }) {
   const byId = new Map(components.map((c) => [c.id, c]));
+  const shared = useRef<SharedDiagnostics | null>(null);
+  const diagnostics = useCallback(
+    (signal: AbortSignal): Promise<ChatDiagnostics> => {
+      let entry = shared.current;
+      if (!entry || entry.messageId !== messageId) {
+        const ctrl = new AbortController();
+        const created: SharedDiagnostics = {
+          messageId,
+          promise: chatApi.diagnostics(messageId, ctrl.signal),
+          ctrl,
+          waiting: 0,
+        };
+        const drop = () => {
+          if (shared.current === created) shared.current = null;
+        };
+        created.promise.then(drop, drop);
+        shared.current = created;
+        entry = created;
+      }
+      const mine = entry;
+      mine.waiting += 1;
+      signal.addEventListener(
+        "abort",
+        () => {
+          mine.waiting -= 1;
+          if (mine.waiting === 0) {
+            mine.ctrl.abort();
+            if (shared.current === mine) shared.current = null;
+          }
+        },
+        { once: true },
+      );
+      return mine.promise;
+    },
+    [messageId],
+  );
   return (
     <ul className="removals" data-testid="removals">
       {removals.map((r, i) => (
@@ -685,7 +737,7 @@ function RemovalsSection({
           removal={r}
           index={i}
           component={r.component ? byId.get(r.component) : undefined}
-          messageId={messageId}
+          diagnostics={diagnostics}
           onOpenSource={onOpenSource}
         />
       ))}
@@ -701,20 +753,21 @@ type RemovalState =
   | { phase: "gone" }
   | { phase: "ready"; decision: ChatRemovalDecision };
 
-/** One removed claim. Its draft text and reason are loaded from the diagnostics route on every expand and dropped on
- * collapse: nothing is cached, so a draft is never shown once the route no longer serves it. While loading the kind
- * stays visible; a failure offers a retry; a 404 leaves the kind only. */
+/** One removed claim. Its draft text and reason are loaded from the diagnostics route on every expand (`diagnostics`:
+ * the section's request, shared while in flight) and dropped on collapse: nothing is cached, so a draft is never shown
+ * once the route no longer serves it. While loading the kind stays visible; a failure offers a retry; a 404 leaves
+ * the kind only. */
 function RemovalItem({
   removal,
   index,
   component,
-  messageId,
+  diagnostics,
   onOpenSource,
 }: {
   removal: ChatRemoval;
   index: number;
   component: ChatComponent | undefined;
-  messageId: string;
+  diagnostics: (signal: AbortSignal) => Promise<ChatDiagnostics>;
   onOpenSource?: (nav: ViewerNav) => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -728,8 +781,7 @@ function RemovalItem({
     const c = new AbortController();
     ctrl.current = c;
     setState({ phase: "loading" });
-    chatApi
-      .diagnostics(messageId, c.signal)
+    diagnostics(c.signal)
       .then((d) => {
         if (c.signal.aborted) return;
         const item = Array.isArray(d.removed) ? d.removed[index] : undefined;

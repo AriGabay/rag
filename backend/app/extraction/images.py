@@ -332,8 +332,7 @@ def _ocr_words(gray, languages: str) -> list[dict] | None:
 
 
 def _confident(words: list[dict]) -> list[str]:
-    return [w["text"] for w in words if w["conf"] >= OCR_MIN_CONFIDENCE and len(w["text"]) >= 2
-            and re.search(r"[א-ת\dA-Za-z]", w["text"])]
+    return [w["text"] for w in confident_words(words) if len(w["text"]) >= 2]
 
 
 def confident_words(words: list[dict]) -> list[dict]:
@@ -667,6 +666,8 @@ CELL_NOT_SEEN = "not_seen"  # OCR did not see the number
 CELL_REPEATED = "repeated"  # OCR saw the number more than once in the crop: which one is the cell is not known
 CELL_NOT_PLACED = "not_placed"  # seen once, but not in its row and column, or they could not be located
 CELL_NO_OCR = "no_ocr"  # no OCR of the crop (and no text layer confirmed it)
+BY_OCR = "ocr"  # a confirmed cell's ``by``: OCR of the crop confirmed it
+BY_TEXT_LAYER = "text_layer"  # a confirmed cell's ``by``: the region's text layer confirmed it
 PHRASE_GAP = 1.0  # a gap wider than this many word heights separates two cells on a line
 ROW_OVERLAP = 0.5  # the share of the lower of two heights a number and its row label must overlap by
 GRID_ANCHORS = 2  # numbers of a row on its line (of a column in its band), the cell's included, to place it by the grid
@@ -703,15 +704,17 @@ def _label_tokens(text: str) -> tuple[frozenset, frozenset]:
 def _phrases(words: list[dict]) -> list[tuple[frozenset, frozenset, list[float]]]:
     """Runs of words on one line with no wide gap (one cell each, as drawn): their tokens and their joint box."""
     lines: list[list[dict]] = []
+    extents: list[list[float]] = []  # each line's running [top, bottom], over its members
     for w in sorted(words, key=lambda w: float(w["top"])):
         b = _box(w)
-        for line in lines:
-            top, bottom = min(_box(x)[1] for x in line), max(_box(x)[3] for x in line)
-            if min(b[3], bottom) - max(b[1], top) >= ROW_OVERLAP * min(b[3] - b[1], bottom - top):
+        for line, extent in zip(lines, extents, strict=True):
+            if _same_line(b, [0.0, extent[0], 0.0, extent[1]]):
                 line.append(w)
+                extent[0], extent[1] = min(extent[0], b[1]), max(extent[1], b[3])
                 break
         else:
             lines.append([w])
+            extents.append([b[1], b[3]])
     out = []
     for line in lines:
         line.sort(key=lambda w: float(w["left"]))
@@ -905,8 +908,7 @@ def _placements(table: PictureTable, words: list[dict]) -> list[list[dict | None
                 continue
             box = hits[0]
             band = bands[j] if j < len(bands) else None
-            in_row = row_box is not None and (min(box[3], row_box[3]) - max(box[1], row_box[1])
-                                              >= ROW_OVERLAP * min(box[3] - box[1], row_box[3] - row_box[1]))
+            in_row = row_box is not None and _same_line(box, row_box)
             in_column = band is not None and band[0] <= (box[0] + box[2]) / 2 <= band[1]
             by_grid = grid[i][j] is not None and i not in vetoed_rows and j not in vetoed_columns
             cells.append({"status": CELL_CONFIRMED, "box": box, "by": None} if (in_row and in_column) or by_grid
@@ -924,7 +926,7 @@ def cell_evidence(tables: list[PictureTable], words: list[dict] | None,
     out = []
     for table in tables:
         by_ocr = _placements(table, words or [])
-        by_layer = _placements(table, layer) if layer else None
+        by_layer = None  # the text layer's placements, computed at the first cell OCR did not confirm
         rows = []
         for i, row in enumerate(by_ocr):
             cells = []
@@ -933,11 +935,13 @@ def cell_evidence(tables: list[PictureTable], words: list[dict] | None,
                     cells.append(None)
                     continue
                 if cell["status"] == CELL_CONFIRMED:
-                    cell = cell | {"by": "ocr"}
+                    cell = cell | {"by": BY_OCR}
                 else:
+                    if by_layer is None and layer:
+                        by_layer = _placements(table, layer)
                     other = by_layer[i][j] if by_layer is not None else None
                     if other is not None and other["status"] == CELL_CONFIRMED:
-                        cell = other | {"by": "text_layer"}
+                        cell = other | {"by": BY_TEXT_LAYER}
                     elif other is not None and other["status"] != CELL_NOT_SEEN and (
                             words is None or cell["status"] == CELL_NOT_SEEN):
                         cell = other  # the text layer saw it, where OCR did not: its reason is the one to give
@@ -989,7 +993,7 @@ def placed_cells(reading: PictureReading) -> list:
         grid, _, _ = _grid(reading.tables[ti], hits)
         rows = []
         for i, row in enumerate(stored):
-            rows.append([{"status": CELL_CONFIRMED, "box": grid[i][j], "by": "ocr"}
+            rows.append([{"status": CELL_CONFIRMED, "box": grid[i][j], "by": BY_OCR}
                          if cell is not None and cell.get("status") == CELL_NOT_PLACED and i < len(grid)
                          and j < len(grid[i]) and grid[i][j] is not None else cell
                          for j, cell in enumerate(row)])

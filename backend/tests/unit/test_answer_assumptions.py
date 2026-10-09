@@ -75,7 +75,8 @@ def test_a_reply_without_a_number_or_without_a_pending_parameter_binds_nothing()
 
 
 def test_the_pending_found_values_are_reopened_through_the_previous_answers_references():
-    sources = [{"id": "S1", "version_id": "v1"}, {"id": "S2", "version_id": None}, {"id": "S3", "version_id": "v2"}]
+    # the previous answer's sources S1 (v1), S2 (a listing: no version) and S3 (v2), as ``_turn_input`` numbers them
+    sources = {"S1": "P1", "S3": "P2"}
     out = api._pending_refs(PENDING, sources)
     assert [(v["id"], v["prior"]) for v in out["found"]] == [("V1", "P1"), ("V2", "P1")]
     # a value whose passage is not among the references keeps no P#
@@ -86,7 +87,7 @@ def test_the_pending_found_values_are_reopened_through_the_previous_answers_refe
 def test_the_turn_is_told_the_reply_gives_the_pending_parameter_and_where_the_found_values_are():
     from app.chat import engine, resolve
 
-    pending = api._pending_refs(PENDING, [{"id": "S1", "version_id": "v1"}])
+    pending = api._pending_refs(PENDING, {"S1": "P1"})
     inp = engine.TurnInput(question="8%", history=[], summary=None, focus_documents=[], prior_refs={"P1": {}},
                            pending=pending)
     text = engine._context_message(inp, binding=resolve.bind_pending(pending, "8%"))

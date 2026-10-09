@@ -54,14 +54,11 @@ def applied_scale(long_side: float, scale: float, max_side: int) -> float:
 
 
 @dataclass(frozen=True)
-class RenderedRegion:
+class RenderedRegion(RenderedPage):
     """A region (or a whole page) as rendered for a visual reading, with the frame a pixel of it is in: pixel
-    ``(x, y)`` is the point ``origin + (x, y) / scale`` of the page's display frame."""
+    ``(x, y)`` is the point ``origin + (x, y) / scale`` of the page's display frame (``width``/``height``: the page's
+    display frame in points; ``scale``: pixels per point actually applied, the cap may have lowered it)."""
 
-    png: bytes
-    width: float  # the page's display frame in points
-    height: float
-    scale: float  # pixels per point actually applied (the cap may have lowered it)
     origin: tuple[float, float]  # the crop's top-left corner in the display frame (the region's box less the margin)
 
 
