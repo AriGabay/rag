@@ -498,7 +498,9 @@ def summary_digest(summary: str | None) -> str:
 
 
 def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
-                user_message_id: UUID) -> engine.TurnInput:
+                user_message_id: UUID) -> tuple[engine.TurnInput, list[str]]:
+    """The turn's input, and the id of each user message it sees in the order the engine numbers them (an
+    assumption's ``turn``): the stored answer links each assumption back to the message it quotes."""
     conv = conn.execute(text("SELECT summary, summary_message_count, summary_meta FROM conversations WHERE id = :c"),
                         {"c": conversation_id}).one()
     summary = conv.summary if _summary_usable(conn, ctx, conv) else None
@@ -508,7 +510,7 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
                           " || '{\"invalid\": true}'::jsonb WHERE id = :c"), {"c": conversation_id})
     user = conn.execute(text("SELECT content, created_at FROM messages WHERE id = :m"), {"m": user_message_id}).one()
     rows = conn.execute(text(
-        "SELECT role, content, answer, status FROM messages WHERE conversation_id = :c AND created_at < :t"
+        "SELECT id, role, content, answer, status FROM messages WHERE conversation_id = :c AND created_at < :t"
         " AND status = 'done' ORDER BY created_at DESC, id DESC LIMIT :n"),
         {"c": conversation_id, "t": user.created_at, "n": HISTORY_MESSAGES}).all()
     rows = list(reversed(rows))
@@ -550,7 +552,23 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
             candidates = list((last.answer.get("request") or {}).get("candidates") or [])
     return engine.TurnInput(question=user.content, history=history, summary=summary, focus=last_focus,
                             focus_documents=[{"document_id": k, "title": v} for k, v in list(focus.items())[-8:]],
-                            prior_refs=prior, candidates=candidates)
+                            prior_refs=prior, candidates=candidates), _user_message_ids(rows, user_message_id)
+
+
+def _user_message_ids(rows, user_message_id) -> list[str]:
+    """The ids of the user messages a turn sees, numbered as the engine numbers them for an assumption's ``turn``
+    (1 = first): the history's user messages that have content, then the current message."""
+    return [str(r.id) for r in rows if r.role == "user" and r.content] + [str(user_message_id)]
+
+
+def _assumption_origins(assumptions: list[dict], user_ids: list[str] | None) -> list[dict]:
+    """Each assumption with the id of the user message it quotes (``message_id``), so the answer can link back to
+    the user's own words; None when the message is not known (a numbering outside the turn's messages)."""
+    for a in assumptions:
+        turn = a.get("turn")
+        known = user_ids and isinstance(turn, int) and 1 <= turn <= len(user_ids)
+        a["message_id"] = user_ids[turn - 1] if known else None
+    return assumptions
 
 
 def _request_focus(request: dict | None) -> dict | None:
@@ -567,7 +585,7 @@ def _public_source(src) -> dict:
     return src.public() | {"chunk_id": str(src.chunk_id) if src.chunk_id else None}
 
 
-def _answer_payload(outcome: engine.TurnOutcome) -> dict:
+def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = None) -> dict:
     ws, a = outcome.workspace, outcome.answer
     cited = coverage.cited_ids(a.answer_markdown)
     sources = [_public_source(ws.sources[i]) for i in ws.sources if i in cited]
@@ -585,7 +603,8 @@ def _answer_payload(outcome: engine.TurnOutcome) -> dict:
     measurements = [ws.measurements[i].public() for i in ws.measurements if i in used]
     computations = [ws.computations[i].public() for i in ws.computations if i in used]
     values = [ws.values[i].public() for i in ws.values if i in used]
-    assumptions = [ws.assumptions[i].public() for i in ws.assumptions if i in used]
+    # each user assumption names the message it quotes (``user_ids``: the turn's user messages, as numbered)
+    assumptions = _assumption_origins([ws.assumptions[i].public() for i in ws.assumptions if i in used], user_ids)
     for v in values:  # the passage a value was verified in opens from the value
         if v["source_id"] in ws.sources and not any(s["id"] == v["source_id"] for s in sources):
             sources.append(_public_source(ws.sources[v["source_id"]]))
@@ -685,7 +704,7 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
                 raise engine.TurnCancelled  # stopped before it started: cancelled now, not after the stale bound
             conn.execute(text("UPDATE messages SET updated_at = now() WHERE id = :m"), {"m": message_id})
             state = office_provider_state(conn)
-            inp = _turn_input(conn, ctx, conversation_id, user_message_id)
+            inp, user_ids = _turn_input(conn, ctx, conversation_id, user_message_id)
         if state.mode != Mode.CLOUD:
             reason = state.limitation() or "שליחת קטעים לספק מודל ענן כבויה במשרד."
             reason = reason.split(";")[0].rstrip(".") + "."
@@ -698,7 +717,7 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
         outcome = engine.run_turn(ctx, provider, inp, lambda step, label: _progress(ctx, message_id, step, label),
                                   lambda: _cancel_requested(ctx, message_id))
         _log_turn_usage(ctx, provider, outcome.usage)
-        payload = _answer_payload(outcome)
+        payload = _answer_payload(outcome, user_ids)
         recorded = _finish(ctx, message_id, "done", content=outcome.answer.answer_markdown, answer=payload,
                            usage=outcome.usage, model=provider.model, diagnostics=_diagnostics(outcome, payload))
     # every exit logs the calls the turn made: a cancelled, failed or broken turn was still billed for them

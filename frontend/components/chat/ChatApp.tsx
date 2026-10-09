@@ -5,7 +5,8 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { useSession } from "@/components/AppShell";
 import { api, ApiError, chatApi, errorMessage, isAbortError, newTurnId } from "@/lib/api";
 import type { ChatAnswer, ChatConversation, ChatMessage, ViewerNav } from "@/lib/chatTypes";
-import { AssistantMessage, UserMessage, answerNav } from "./Message";
+import { type AnswerOrigin, AssumptionView, CalculationView } from "./CalculationView";
+import { AssistantMessage, UserMessage, citedView } from "./Message";
 import { SourceViewer } from "./SourceViewer";
 import "./chat.css";
 
@@ -17,9 +18,25 @@ const RUNNING = new Set(["running", "cancelling"]);
 /** The history-state key of a panel level: its depth in the panel stack (1 = the first panel). */
 const PANEL_DEPTH = "ragPanelDepth";
 
-/** One level of the panel stack beside the thread (R7). The calculation breakdown (U7) adds a level kind here and
- * renders it in `PanelLevelView`; its document inputs open a "source" level above it through `onOpen`. */
-export type PanelLevel = { kind: "source"; nav: ViewerNav };
+/** One level of the panel stack beside the thread (R7): the source viewer at a cited place, a calculation's
+ * breakdown (U7) or a user assumption. A breakdown's document inputs open a "source" level above it, and a chained
+ * calculation its own breakdown, through `onOpen`. */
+export type PanelLevel =
+  | { kind: "source"; nav: ViewerNav }
+  | { kind: "calculation"; origin: AnswerOrigin; id: string }
+  | { kind: "assumption"; origin: AnswerOrigin; id: string };
+
+/** The back step a level offers to the level below it. */
+function levelName(level: PanelLevel | undefined): string | null {
+  if (!level) return null;
+  if (level.kind === "calculation") return `חישוב ${level.id}`;
+  if (level.kind === "assumption") return `הנחה ${level.id}`;
+  return "המקור";
+}
+
+/** Below this width the panel stack covers the conversation (chat.css). */
+const FULL_SCREEN_PANELS = "(max-width: 900px)";
+const FLASH_MS = 2000;
 
 interface PanelEntry {
   key: number;
@@ -466,13 +483,45 @@ export default function ChatApp() {
   }, [closeTop]);
 
   /** A chip in an answer: S#, V# and M# open the source viewer at their place, moving through the answer's
-   * citations in answer order. C# and A# have no place in a document (U7 opens the breakdown for them). */
+   * citations in answer order; C# opens its calculation breakdown and A# the user's assumption (U7). */
   const openSource = useCallback(
-    (answer: ChatAnswer, id: string) => {
-      const nav = answerNav(answer, id);
-      if (nav) openFromThread({ kind: "source", nav });
+    (answer: ChatAnswer, id: string, message: ChatMessage) => {
+      const view = citedView(answer, id);
+      if (!view) return;
+      if (view.kind === "source") {
+        openFromThread(view);
+        return;
+      }
+      openFromThread({ kind: view.kind, id: view.id, origin: { answer, messageId: message.id, replyTo: message.reply_to } });
     },
     [openFromThread],
+  );
+
+  /** Shows a user message an assumption quotes: the thread scrolls to it and it is marked for a moment. Where the
+   * panels cover the conversation (a small screen), they close first. */
+  const showMessage = useCallback(
+    (el: HTMLElement) => {
+      const reveal = () => {
+        if (!el.isConnected) return;
+        const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        el.scrollIntoView({ block: "center", behavior: still ? "auto" : "smooth" });
+        el.focus({ preventScroll: true });
+        el.dataset.flash = "true";
+        window.setTimeout(() => {
+          delete el.dataset.flash;
+        }, FLASH_MS);
+      };
+      if (window.matchMedia(FULL_SCREEN_PANELS).matches) {
+        unwindPanels(() => {
+          // the panels closed for this: focus goes to the message, not back to the chip that opened them
+          refocus.current = null;
+          window.setTimeout(reveal, 0);
+        });
+      } else {
+        reveal();
+      }
+    },
+    [unwindPanels],
   );
 
   // --- conversation actions --------------------------------------------------------------------------------
@@ -669,9 +718,11 @@ export default function ChatApp() {
           key={entry.key}
           level={entry.level}
           top={i === panels.length - 1}
+          back={i > 0 ? levelName(panels[i - 1].level) : null}
           onClose={closeTop}
           onNavigate={navigateTop}
           onOpen={pushPanel}
+          onShowMessage={showMessage}
         />
       ))}
     </div>
@@ -682,19 +733,52 @@ export default function ChatApp() {
 function PanelLevelView({
   level,
   top,
+  back,
   onClose,
   onNavigate,
+  onOpen,
+  onShowMessage,
 }: {
   level: PanelLevel;
   top: boolean;
+  /** The level below, when there is one: the breakdown and assumption views offer a back step to it. */
+  back: string | null;
   onClose: () => void;
   onNavigate: (index: number) => void;
-  /** Opens a level above this one (U7: a breakdown's input opens the viewer at its anchor). */
+  /** Opens a level above this one (a breakdown's input opens the viewer at its anchor, a chained calculation its
+   * own breakdown). */
   onOpen: (level: PanelLevel) => void;
+  /** Scrolls the thread to the user message an assumption quotes. */
+  onShowMessage: (el: HTMLElement) => void;
 }) {
   switch (level.kind) {
     case "source":
       return <SourceViewer nav={level.nav} hidden={!top} onClose={onClose} onNavigate={onNavigate} />;
+    case "calculation":
+      return (
+        <CalculationView
+          origin={level.origin}
+          id={level.id}
+          hidden={!top}
+          back={back}
+          onClose={onClose}
+          onOpenSource={(nav) => onOpen({ kind: "source", nav })}
+          onOpenCalculation={(id) => onOpen({ kind: "calculation", origin: level.origin, id })}
+          onShowMessage={onShowMessage}
+        />
+      );
+    case "assumption":
+      return (
+        <AssumptionView
+          origin={level.origin}
+          id={level.id}
+          hidden={!top}
+          back={back}
+          onClose={onClose}
+          onOpenCalculation={(id) => onOpen({ kind: "calculation", origin: level.origin, id })}
+          onShowMessage={onShowMessage}
+        />
+      );
     default:
       return null;
   }
@@ -842,7 +926,7 @@ function ThreadView({
   thread: Thread | null;
   sendErrors: Record<string, string>;
   onLoadOlder: () => void;
-  onCite: (answer: ChatAnswer, id: string) => void;
+  onCite: (answer: ChatAnswer, id: string, message: ChatMessage) => void;
   onRetry: (m: ChatMessage) => void;
   onStop: (m: ChatMessage) => void;
   onResend: (m: ChatMessage) => void;

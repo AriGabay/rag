@@ -63,7 +63,8 @@ function withReading(src: ChatSource): ChatSource {
   return { ...src, reading_id: src.reading_id ?? null };
 }
 
-/** The source a citation opens: a passage itself, or the passage of the measurement it cites. */
+/** The source a citation opens: a passage itself, or the passage of the value or measurement it cites; null for a
+ * calculation (C#) or an assumption (A#), which have no place in a document (`citedView` opens their own views). */
 export function citedSource(answer: ChatAnswer, id: string): ChatSource | null {
   const direct = answer.sources.find((s) => s.id === id);
   if (direct) return withReading(direct);
@@ -98,7 +99,7 @@ export function citedSource(answer: ChatAnswer, id: string): ChatSource | null {
 /** A value's status (V#): checked automatically in its passage, uncertain, or unread (never a person's decision). */
 function valueStatusOf(answer: ChatAnswer, v: ChatValue): ValueStatus {
   const src = answer.sources.find((s) => s.id === v.source_id);
-  return chatValueStatus(v.certainty, src?.status);
+  return chatValueStatus(v.certainty, src?.status, v.reading);
 }
 
 /** What the source viewer opens for a citation: its passage (the text view) and its anchor (the page or structured
@@ -143,6 +144,17 @@ export function answerNav(answer: ChatAnswer, id: string): ViewerNav | null {
   return { items, index };
 }
 
+/** What a chip opens: S#, V# and M# the source viewer at their place (moving through the answer's citations); C# its
+ * calculation breakdown; A# the user's assumption with the words it was quoted from (U7). */
+export type CitedView = { kind: "source"; nav: ViewerNav } | { kind: "calculation"; id: string } | { kind: "assumption"; id: string };
+
+export function citedView(answer: ChatAnswer, id: string): CitedView | null {
+  if (answer.computations.some((c) => c.id === id)) return { kind: "calculation", id };
+  if (answer.assumptions?.some((a) => a.id === id)) return { kind: "assumption", id };
+  const nav = answerNav(answer, id);
+  return nav ? { kind: "source", nav } : null;
+}
+
 function citationTargets(answer: ChatAnswer): Map<string, CitationTarget> {
   const out = new Map<string, CitationTarget>();
   citationOrder(answer.markdown).forEach((id, i) => {
@@ -167,7 +179,9 @@ interface AssistantProps {
   message: ChatMessage;
   /** Only the conversation's last answer can be generated again (an earlier one would land out of order). */
   isLast: boolean;
-  onCite: (answer: ChatAnswer, id: string) => void;
+  /** A citation: what it opens depends on the answer and on where the answer sits in the thread (an assumption's
+   * message). */
+  onCite: (answer: ChatAnswer, id: string, message: ChatMessage) => void;
   onRetry: (message: ChatMessage) => void;
   onStop: (message: ChatMessage) => void;
 }
@@ -176,7 +190,7 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop }: A
   const [copied, setCopied] = useState(false);
   const answer = message.answer;
   const citations = useMemo(() => (answer ? citationTargets(answer) : new Map()), [answer]);
-  const cite = useCallback((id: string) => answer && onCite(answer, id), [answer, onCite]);
+  const cite = useCallback((id: string) => answer && onCite(answer, id, message), [answer, onCite, message]);
 
   if (message.status === "running" || message.status === "cancelling") {
     const steps = message.progress.filter((p) => p.step !== "queued");
@@ -250,7 +264,7 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop }: A
   };
 
   return (
-    <div className="msg msg-assistant">
+    <div className="msg msg-assistant" data-message-id={message.id}>
       {answer.kind === "search_only" && (
         <div className="limited-note">תוצאות חיפוש בלבד — המודל לא ניתח את המקורות.</div>
       )}
@@ -455,11 +469,11 @@ function ValueStatusBadge({ status }: { status: ValueStatus }) {
   );
 }
 
-function assumptionText(a: ChatAssumption): string {
+export function assumptionText(a: ChatAssumption): string {
   return a.unit === "percent" && !a.value_text.includes("%") ? `${a.value_text}%` : a.value_text;
 }
 
-function resultText(c: ChatComputation): string {
+export function resultText(c: ChatComputation): string {
   const d = c.display;
   if (!d) return `${c.result ?? ""} ${c.unit}`.trim();
   // a ratio reads as a percentage; an amount with its unit
@@ -469,22 +483,22 @@ function resultText(c: ChatComputation): string {
 
 function InputLine({ input, onCite }: { input: ChatComputationInput; onCite: (id: string) => void }) {
   const shown = input.value_text ?? input.display ?? "";
+  // every input opens: a document input its place, an assumption the user's words, a calculation its breakdown
+  const link = (
+    <button type="button" className="source-link" onClick={() => onCite(input.id)}>
+      {input.id}
+    </button>
+  );
   if (input.kind === "assumption") {
     return (
       <li>
-        {input.id} {input.label}: <bdi>{shown}</bdi> — הנחה שלך
+        {link} {input.label}: <bdi>{shown}</bdi> — הנחה שלך
       </li>
     );
   }
   return (
     <li>
-      {input.kind === "computation" ? (
-        input.id
-      ) : (
-        <button type="button" className="source-link" onClick={() => onCite(input.id)}>
-          {input.id}
-        </button>
-      )}{" "}
+      {link}{" "}
       {input.label}: <bdi>{shown}</bdi>
       {input.kind === "value" && input.certainty === "model_asserted" && " · חלק ממשמעות הערך נקבע ולא נמצא במקור"}
     </li>
@@ -590,7 +604,8 @@ function CalculationsSection({ answer, onCite }: { answer: ChatAnswer; onCite: (
 
 export function UserMessage({ message, error, onResend }: { message: ChatMessage; error?: string | null; onResend?: () => void }) {
   return (
-    <div className="msg msg-user">
+    // the target of an assumption's "go to your message" (U7): found by its id, focused without a tab stop
+    <div className="msg msg-user" data-message-id={message.id} tabIndex={-1}>
       <div>
         <div className="bubble" dir="auto">
           {message.content}

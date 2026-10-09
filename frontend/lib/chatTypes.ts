@@ -191,7 +191,7 @@ export interface ChatComputationInput {
   value_text?: string;
   /** For a value: the passage it was verified in. */
   source_id?: string;
-  certainty?: "verified" | "model_asserted";
+  certainty?: "verified" | "model_asserted" | "uncertain_reading";
   /** For an assumption: the user's words. */
   quote?: string;
 }
@@ -199,6 +199,12 @@ export interface ChatComputationInput {
 /** What a calculation is: a scenario the user asked for (it rests on a user assumption), a value the report itself
  * writes reproduced, or a computation. */
 export type ChatResultKind = "scenario" | "reproduces_report_value" | "computed";
+
+/** An intermediate result of a calculation: its formula in ids and its full value (when the server provides steps). */
+export interface ChatComputationStep {
+  expression: string;
+  value: string;
+}
 
 export interface ChatComputation {
   id: string;
@@ -228,6 +234,10 @@ export interface ChatComputation {
   conditions?: string[];
   justification?: string | null;
   reproduces?: { source: string; as_written: string } | null;
+  /** The VAT basis every money input shares; null for a result that is not money, or whose inputs differ. */
+  vat?: "included" | "excluded" | null;
+  /** Intermediate results, in order (absent until the server stores them). */
+  steps?: ChatComputationStep[];
   n?: number | null;
   /** Its inputs, each opened through its own anchor (absent on older answers). */
   anchor?: ChatComputedAnchor | null;
@@ -255,7 +265,19 @@ export interface ChatValue {
   subject: string;
   role: string;
   provenance: Record<string, "source" | "model_asserted" | "not_stated">;
-  certainty: "verified" | "model_asserted";
+  /** "uncertain_reading": its own region was read uncertainly and no re-read confirmed it. */
+  certainty: "verified" | "model_asserted" | "uncertain_reading";
+  /** Who stated it and its standing, as the cited text says (absent on older answers). */
+  section?: string | null;
+  stated_by?: string | null;
+  stance?: "adopted" | "claim" | "proposal" | "estimate" | "other" | "unknown" | null;
+  scenario?: string | null;
+  attribution?: string | null;
+  /** Where its unit or meaning was read: the cell, row, column header, table or quote. */
+  meaning_from?: string | null;
+  /** How its own region was read: "clear" (also after a confirmed re-read) or "uncertain". */
+  reading?: "clear" | "uncertain" | null;
+  reading_note?: string | null;
   locator: { row?: string; column?: string; row_number?: number; column_number?: number; quote?: string };
   quote: string;
   total: boolean;
@@ -275,6 +297,8 @@ export interface ChatAssumption {
   /** Which user message it quotes (1 = the first visible one), and whether it is the message this answer replied to. */
   turn: number;
   current: boolean;
+  /** The id of the user message it quotes (absent on answers stored before it was recorded; null when not known). */
+  message_id?: string | null;
 }
 
 export interface ChatClaim {

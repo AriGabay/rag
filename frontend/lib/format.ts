@@ -323,9 +323,12 @@ export function measurementValueStatus(m: { status: string; anchor_lost?: boolea
 
 /** A value taken in chat (V#): checked automatically when it was verified in its source, uncertain when it was only
  * asserted or its source was read uncertainly, unread when its region was not read. Never a person's decision. */
-export function chatValueStatus(certainty: string | null | undefined, sourceStatus?: string | null): ValueStatus {
+export function chatValueStatus(certainty: string | null | undefined, sourceStatus?: string | null,
+                                reading?: string | null): ValueStatus {
   if (sourceStatus === "unread") return "unread";
-  if (certainty !== "verified" || sourceStatus === "uncertain_reading") return "uncertain";
+  if (certainty !== "verified") return "uncertain";
+  // a value whose own region a focused re-read confirmed stays settled inside a source read uncertainly elsewhere
+  if (sourceStatus === "uncertain_reading" && reading !== "clear") return "uncertain";
   return "auto_verified";
 }
 

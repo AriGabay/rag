@@ -1192,3 +1192,161 @@ details.msg-details[open] {
 .calc-group {
   margin-top: 6px;
 }
+
+/* --- calculation breakdown (U7): a computed result, its formula and the inputs it rests on --------------------- */
+
+.calc-body h4 {
+  margin: 0 0 4px;
+  font-size: 13px;
+  color: var(--chat-muted);
+  font-weight: 600;
+}
+
+.calc-block + .calc-block {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--chat-border);
+}
+
+.calc-headline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+}
+
+.calc-value {
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.calc-statement {
+  margin: 4px 0 6px;
+}
+
+.calc-facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 12px;
+  margin: 6px 0;
+  font-size: 13.5px;
+}
+
+.calc-facts > div {
+  display: contents;
+}
+
+.calc-facts dt {
+  color: var(--chat-muted);
+}
+
+.calc-facts dd {
+  margin: 0;
+}
+
+.calc-conditional ul {
+  margin: 2px 0;
+  padding-inline-start: 18px;
+}
+
+.calc-conditional p {
+  margin: 2px 0 0;
+}
+
+.calc-expression {
+  margin: 2px 0 0;
+  font-size: 13px;
+}
+
+.calc-steps {
+  margin: 6px 0 0;
+  padding-inline-start: 20px;
+  font-size: 13.5px;
+}
+
+.calc-note {
+  color: var(--chat-muted);
+  font-size: 13px;
+}
+
+.calc-input-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.calc-input-list > li {
+  padding: 4px 0;
+}
+
+.calc-input-list > li + li {
+  border-top: 1px dashed var(--chat-border);
+}
+
+.calc-input-open {
+  border: 0;
+  background: transparent;
+  color: var(--chat-accent);
+  cursor: pointer;
+  padding: 0;
+  font: inherit;
+  text-align: start;
+}
+
+.calc-input-open:hover {
+  text-decoration: underline;
+}
+
+.calc-input-open:focus-visible,
+.calc-back:focus-visible,
+.calc-view .source-link:focus-visible {
+  outline: 2px solid var(--chat-accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+.calc-input-id {
+  display: inline-block;
+  min-width: 2.2em;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--chat-cite);
+  color: var(--chat-cite-text);
+  font-size: 12px;
+  text-align: center;
+}
+
+.calc-input-where,
+.calc-asserted,
+.calc-missing {
+  font-size: 13px;
+}
+
+.calc-asserted {
+  color: var(--warn);
+}
+
+.calc-back {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 13px;
+}
+
+.calc-quote {
+  margin: 6px 0;
+  padding: 6px 10px;
+  border-inline-start: 3px solid var(--chat-accent);
+  background: var(--chat-bubble);
+  border-radius: 6px;
+}
+
+/* the user message an assumption quotes, marked for a moment when the breakdown leads back to it */
+.msg-user:focus {
+  outline: none;
+}
+
+.msg-user[data-flash="true"] .bubble {
+  outline: 2px solid var(--chat-accent);
+  outline-offset: 2px;
+  transition: outline-color 0.3s ease;
+}
