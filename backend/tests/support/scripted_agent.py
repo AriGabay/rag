@@ -39,7 +39,10 @@ def final(markdown: str, status: str = "answered", claims: list | None = None, c
     return {"final": {"status": status, "answer_markdown": markdown, "claims": claims or [],
                       "clarification_question": clarification, "missing_info": missing,
                       "referenced_document_ids": documents or [], "scope_kind": scope, "scope_query": scope_query,
-                      "omitted": omitted or [], "focus": focus, "requested": requested or [], "parts": parts or []}}
+                      "omitted": omitted or [], "focus": focus,
+                      # the strict schema has the model send every field: a claim tied to no component says ""
+                      "requested": [{"component": ""} | r if isinstance(r, dict) else r for r in requested or []],
+                      "parts": parts or []}}
 
 
 def requirement(text: str = "", status: str = "full", units: list | None = None, related: list | None = None,

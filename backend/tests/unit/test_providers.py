@@ -545,3 +545,30 @@ def test_real_openai_structured_echo(monkeypatch):
     print(f"real_model status={r.status} model={s.openai_model} detail={r.detail}")
     assert r.status == CallStatus.OK, (r.status, r.detail)
     assert r.parsed is not None and "שלום" in r.parsed.text
+
+
+def _non_strict_objects(schema, path: str = "") -> list[str]:
+    """Every object of a JSON schema whose ``required`` does not list each of its properties, by path."""
+    out: list[str] = []
+    if isinstance(schema, dict):
+        if "properties" in schema and set(schema.get("required") or []) != set(schema["properties"]):
+            out.append(f"{path or '/'}: {sorted(set(schema['properties']) - set(schema.get('required') or []))}")
+        for k, v in schema.items():
+            out += _non_strict_objects(v, f"{path}/{k}")
+    elif isinstance(schema, list):
+        for i, v in enumerate(schema):
+            out += _non_strict_objects(v, f"{path}[{i}]")
+    return out
+
+
+def test_the_turns_final_answer_and_tool_schemas_are_valid_strict_structured_output():
+    """The agent step sends ``FINAL_SCHEMA`` and the tools as strict schemas, unconverted: strict mode rejects an
+    object that leaves any property out of ``required`` (U9: a field with a default, ``Requested.component``, failed
+    every real turn with a 400)."""
+    from app.chat import engine
+    from app.chat import tools as T
+
+    assert _non_strict_objects(engine.FINAL_SCHEMA) == []
+    for tool in T.TOOLS:
+        if tool.get("strict"):
+            assert _non_strict_objects(tool["parameters"]) == [], tool["name"]

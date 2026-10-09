@@ -363,3 +363,25 @@ export async function expectNumberInVisualOrder(scope: Locator, digits: string):
     expect(result.xs[i], `character ${i} of "${digits}" is right of character ${i - 1}`).toBeGreaterThan(result.xs[i - 1]);
   }
 }
+
+/** The source viewer beside the chat. */
+export function sourceViewer(page: Page): Locator {
+  return page.getByRole("complementary", { name: "תצוגת מקור" });
+}
+
+/** Opens a reply's details (collapsed by default). */
+export async function openDetails(reply: Locator): Promise<void> {
+  const details = reply.locator("details.msg-details");
+  if ((await details.getAttribute("open")) === null) await details.locator("> summary").click();
+  await expect(details).toHaveAttribute("open", "");
+}
+
+/** Whether an office B version's reading holds a table the vision model read from a picture (at ingestion). */
+export async function officeBHasVisionTable(request: APIRequestContext, doc: OfficeBDoc): Promise<boolean> {
+  await apiLogin(request, USERS.adminB);
+  const res = await request.get(`/api/documents/${doc.id}/versions/${doc.versionId}/blocks`);
+  expect(res.ok(), `blocks of ${doc.id}: ${res.status()}`).toBeTruthy();
+  const { blocks } = (await res.json()) as { blocks: { table?: { source?: string | null } }[] };
+  await request.post("/api/auth/logout");
+  return blocks.some((b) => b.table?.source === "vision");
+}

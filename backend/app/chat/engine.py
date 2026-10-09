@@ -316,7 +316,8 @@ class Requested(_Strict):
     different values). A claim, not a statement: the server validates it against what the turn did, may downgrade it
     and never upgrades it, and states the gap itself (``coverage.validate_requested``, ``reason_of``; round 7 KTD4)."""
 
-    component: str = ""  # the N# id of the component it is about ("" when the turn showed none)
+    component: str  # the N# id of the component it is about ("" when the turn showed none); required, as strict
+    # structured output requires every property (a default would leave it out of the schema's ``required``)
     label: str
     document_ids: list[str]
     status: Literal["found", "not_found_search", "source_partial", "section_checked_absent", "sources_conflict"]

@@ -187,7 +187,7 @@ def test_an_absence_in_a_section_with_an_unread_region_is_read_in_part(office):
     ws = T.Workspace(ctx=office.ctx())
     out = T.tool_read(ws, {"section": section_handle(ws, office.doc, "3. התחשיב")})
     assert tag(out, "status") == "has_unread_regions" and tag(out, "more") is None
-    (r,) = coverage.validate_requested(ws, [Requested(label="שווי הקרקע", document_ids=[office.doc],
+    (r,) = coverage.validate_requested(ws, [Requested(component="", label="שווי הקרקע", document_ids=[office.doc],
                                                       status="section_checked_absent", checked_where="S1")])
     assert r["status"] == "source_partial" and r["partial_reason"] == "unread"
     assert "אזורים שלא נקראו" in coverage.absence_sentence(r)
