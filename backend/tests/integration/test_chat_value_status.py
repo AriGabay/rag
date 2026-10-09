@@ -192,3 +192,4 @@ def test_without_ocr_an_unclear_value_is_not_re_read_and_stays_uncertain(vision_
     out = _take(ws, sid)
     assert vision_office.vision.calls == [] and T.STATUS_UNCERTAIN in out and "אין OCR" in out
     assert "V1" in ws.uncertain_values
+

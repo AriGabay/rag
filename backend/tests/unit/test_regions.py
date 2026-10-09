@@ -437,7 +437,8 @@ def test_readings_are_reused_by_content_across_documents_and_re_ingestion():
     extract(R1, first, office_a)
     assert first.count(LOGO) == 1
     key = next(k for k in office_a.rows if office_a.rows[k].text == "משרד שמאות לדוגמה")
-    assert (key.reader_version, key.model_config) == (REGION_READER_VERSION, "scripted:low")
+    # the configuration component names the OCR languages, as migration 0016 wrote it for the readings before it
+    assert (key.reader_version, key.model_config) == (REGION_READER_VERSION, "scripted:low|ocr=heb+eng")
     again = ScriptedVision()
     extract(R1, again, office_a)
     assert again.calls == []  # re-ingestion: no new vision call for content already read
@@ -456,10 +457,23 @@ def test_a_reading_without_the_model_is_not_reused_once_the_model_is_allowed(mon
     cache = MemoryCache()
     stamp = images_of(extract(R6, None, cache))[0]  # the few words OCR read with confidence: an OCR reading
     assert (stamp.status, stamp.method) == ("read_uncertain", "ocr")
-    assert {k.model_config for k in cache.rows} == {"none"}
+    assert {k.model_config for k in cache.rows} == {"none|ocr=heb+eng"}
     vision = ScriptedVision()
     stamp = images_of(extract(R6, vision, cache))[0]
     assert vision.count(STAMP) == 1 and stamp.status == "read"
+
+
+def test_a_reading_made_with_other_ocr_languages_is_not_reused():
+    cache = MemoryCache()
+    extract(R1, ScriptedVision(), cache)
+    same = ScriptedVision()
+    extract(R1, same, cache)
+    assert same.calls == []  # the same languages hit the cache
+    other = ScriptedVision()
+    settings = get_settings().model_copy(update={"ocr_languages": "eng"})
+    extract_pdf(R1.read_bytes(), time.monotonic() + 600, settings, other, cache)
+    assert other.count(LOGO) == 1  # another OCR configuration reads again
+    assert {k.model_config for k in cache.rows} == {"scripted:low|ocr=heb+eng", "scripted:low|ocr=eng"}
 
 
 # --- pictures (images.py) -------------------------------------------------------------------------------------

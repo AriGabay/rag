@@ -40,10 +40,13 @@ Tools:
   reading and region (``region_readings``) for later turns, capped per turn (``chat_max_inspections``); a region or
   page ingestion did read returns that reading without a model call;
 - ``find_measurements``: stored measurements with their meaning (kind, unit, period, area basis, VAT, role,
-  subject), grouped by what can be compared, with the coverage of the documents in scope, paged;
+  subject), grouped by what can be compared, with the coverage of the documents in scope, paged; beside them the
+  values verified in earlier turns from the current readings (``verified_values``, ``Q#``, KTD12);
 - ``take_value``: a value of a source the turn read, verified by the server — the cell at a named row and column
   of the table the source is (``extracted_tables.structure``), or a number inside an exact quote of the source —
-  with its meaning; what the source attests about it is recorded as the source's, the rest as the model's (``V#``);
+  with its meaning; what the source attests about it is recorded as the source's, the rest as the model's (``V#``).
+  A value read clearly is cached per version, reading and locator with what its source attests only, and a ``Q#``
+  is taken again with that turn's meaning checked against it;
 - ``assume``: a number the user gave for a scenario, quoted from the user's own message (``A#``);
 - ``calculate``: an expression over ``M#``/``V#``/``A#``/``C#`` (``app.chat.calc``): exact decimals, compatibility
   by operation, every result a ``C#`` with its formula, inputs, assumptions and sources that later calculations
@@ -1410,6 +1413,14 @@ def _spot(ws: Workspace, conn: Connection, target: dict) -> tuple[_Spot, bool]:
     return _Spot(v, f"page:{page}", page, None, f"עמוד {page}"), read_at_ingestion
 
 
+def inspect_config(vision) -> str:
+    """The configuration component of an inspection's key (``region_readings.model_config``, KTD11): the vision
+    model and the OCR languages a visual reading's numbers are checked with (``_crop_ocr_words``)."""
+    from app.extraction import regions
+
+    return regions.model_config(vision, get_settings().ocr_languages)
+
+
 def _cached(conn: Connection, spot: _Spot, config: str):
     from app.extraction.images import PictureReading
     from app.extraction.vision import INSPECT_READER_VERSION
@@ -1458,8 +1469,8 @@ def _crop_ocr_words(png: bytes) -> list[str]:
 
 def _vision_read(ws: Workspace, spot: _Spot):
     """The visual reading of a spot through the inspect path: the stored reading of the same version, reading,
-    region, reader and model, or one new model call (capped per turn and cut to the turn's reading deadline, never
-    a costlier model). Returns ``(reading, earlier)``, or the message saying why no reading was made (the cap or
+    region, reader, model and OCR languages, or one new model call (capped per turn and cut to the turn's reading
+    deadline, never a costlier model). Returns ``(reading, earlier)``, or the message saying why no reading was made (the cap or
     the time); a refusal (no cloud reading, a page that cannot be rendered, a failed call) is a ``ToolError``."""
     from app.extraction import regions
     from app.extraction.images import VISION_MAX_SIDE, VisionCallFailed
@@ -1471,7 +1482,7 @@ def _vision_read(ws: Workspace, spot: _Spot):
         vision = inspect_reader(ws.ctx)
         if vision is None:
             raise ToolError(MSG_INSPECT_NO_CLOUD.format(what=spot.what))
-        config = regions.model_config(vision)
+        config = inspect_config(vision)
         cached = _cached(conn, spot, config)
         if cached is not None:
             _audit_view(ws, conn, spot.v, spot.region)
@@ -1646,6 +1657,7 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
             " FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
             " LEFT JOIN measurement_runs r ON r.version_id = v.id AND r.extraction_version = :e"
             " WHERE d.deleted_at IS NULL" + (" AND d.id = ANY(:d)" if docs else "")), params).all()
+        cached, cached_total = _cached_listing(conn, docs, metric_kinds, words)
     key = (" ".join(words) if not metric_kinds else "", tuple(sorted(metric_kinds or [])),
            tuple(sorted(str(d) for d in docs)), tuple(sorted(value_roles or [])))
     listing = ws.listings.setdefault(key, {"pages": pages, "pages_read": set(), "total": total})
@@ -1673,8 +1685,7 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
         out.append("מסמכים שנקראו חלקית (תמונות שלא נקראו): " + "; ".join(_txt(t) for t in cov["partially_read"]))
     if not rows:
         out.append("לא נמצאו נתונים כמותיים מתאימים.")
-        return "\n".join(out)
-    if pages > 1:
+    if rows and pages > 1:
         out.append("חישוב על כל הנתונים המתאימים דורש לקרוא את כל העמודים; חישוב על חלקם יסומן כחלקי.")
     for key, ms in groups.items():
         out.append(f"\nקבוצה [{_describe_key(key)}] — {len(ms)} ערכים:")
@@ -1690,7 +1701,67 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
                 issues += " | המיקום במסמך אבד בעיבוד מחדש: הערך אינו מאומת מול הקריאה הנוכחית של המסמך"
             out.append(f'  {m.mid}: {_txt(r.metric)} = {_txt(r.value_text)} | מסמך: "{_txt(m.title)}"{extra}'
                        f" | סטטוס: {status}{issues}\n    ציטוט: {_txt(_clip(r.quote, 300))}")
+    out += _cached_lines(ws, cached, cached_total)
     return "\n".join(out)
+
+
+def _cached_listing(conn: Connection, docs: list, metric_kinds: list[str] | None, words: list[str]) -> tuple[list, int]:
+    """Cached verified values (KTD12) of the current readings of the documents the user may see (row security), by
+    the same filters as the measurements: the documents, the kinds their source attests, else words of their quote,
+    section or column. At most ``CACHED_MAX``, with the total."""
+    params: dict = {}
+    conds = ["d.deleted_at IS NULL"]
+    if docs:
+        params["d"] = docs
+        conds.append("c.document_id = ANY(:d)")
+    if metric_kinds:
+        params["k"] = list(metric_kinds)
+        conds.append("c.value->'record'->>'kind' = ANY(:k)")
+    elif words:
+        params["w"] = [f"%{w}%" for w in words]
+        conds.append("(c.value->'record'->>'quote' ILIKE ANY(:w) OR c.value->'record'->>'section' ILIKE ANY(:w)"
+                     " OR c.locator->>'column' ILIKE ANY(:w))")
+    where = (" FROM verified_values c JOIN document_versions v ON v.id = c.version_id AND v.is_current"
+             " AND v.ingestion->>'reading_id' = c.reading_id JOIN documents d ON d.id = c.document_id WHERE "
+             + " AND ".join(conds))
+    total = conn.execute(text("SELECT count(*)" + where), params).scalar_one()
+    if not total:
+        return [], 0
+    rows = conn.execute(text(
+        "SELECT c.document_id, c.version_id, c.reading_id, c.locator, c.value, d.title" + where
+        + f" ORDER BY d.title, d.id, c.created_at, c.locator::text LIMIT {CACHED_MAX}"), params).all()
+    return rows, total
+
+
+def _cached_lines(ws: Workspace, rows: list, total: int) -> list[str]:
+    """The listing of cached verified values: each as its ``Q#`` (or the V# the turn already registered for it), with
+    its value, document, place and what its source attests."""
+    if not rows:
+        return []
+    out = ["", MSG_CACHED_HEADER]
+    if total > len(rows):
+        out.append(f"מוצגים {len(rows)} מתוך {total} ערכים שמורים; צמצם לפי מסמך או סוג נתון כדי לראות את השאר.")
+    for r in rows:
+        record = r.value.get("record") or {}
+        held = next((v.vid for v in ws.values.values() if str(v.version_id) == str(r.version_id)
+                     and v.reading_id == r.reading_id and v.locator == r.locator), None)
+        name = held or _cached_handle(ws, r.version_id, r.reading_id, r.document_id, r.locator)
+        ws.touch(r.document_id, r.title, "retrieved")
+        attested = [VALUE_KINDS.get(record.get("kind"), "") if record.get("kind") else "",
+                    UNIT_LABELS.get(record.get("unit"), "") if record.get("unit") else "",
+                    PERIOD_LABELS.get(record.get("period"), "") if record.get("period") else "",
+                    VAT_LABELS.get(record.get("vat"), "") if record.get("vat") else "",
+                    f"בסיס שטח: {record['area_basis']}" if record.get("area_basis") else ""]
+        if record.get("stance"):
+            attested.append(f"ייחוס: {STANCE_LABELS.get(record['stance'], record['stance'])}"
+                            + (f" של {record['stated_by']}" if record.get("stated_by") else ""))
+        says = "; ".join(x for x in attested if x) or "המקור אינו מעיד על משמעותו"
+        out.append(f'  {name}{" (כבר נרשם בתור הזה)" if held else ""}: {_txt(record.get("value_text"))} | מסמך: '
+                   f'"{_txt(r.title)}" | מקום: {_txt(_cached_where(record))}'
+                   + (f" | סעיף: {_txt(record['section'])}" if record.get("section") else "")
+                   + f" | המקור מעיד: {_txt(says)} | סטטוס: {STATUS_AUTO}"
+                   + f"\n    ציטוט: {_txt(_clip(record.get('quote') or '', 300))}")
+    return out
 
 
 # --- values, assumptions and calculation (KTD10) ---------------------------------------------------------------
@@ -2074,17 +2145,8 @@ def _attribution_line(value: calc.Value, said: Attribution | None) -> str:
     return out
 
 
-def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: dict | None, label: str = "") -> str:
-    """Register a value of a source the turn read (V#) once the server verified that the number is the one the
-    locator names: the cell at that row and column of the table, or a number inside an exact quote."""
-    sid = (source or "").strip()
-    src = ws.sources.get(sid)
-    if src is None:
-        raise ToolError(f"מקור לא מוכר: {source}. ערך נלקח רק ממקור S# שהוחזר בתור הזה (search או read)")
-    if src.is_listing or src.version_id is None:
-        raise ToolError("רשימת מסמכים אינה מקור לערך: קח את הערך ממקור במסמך")
-    full = src.text or (ws.sources[src.same_as].text if src.same_as in ws.sources else "")
-    loc = {k: v for k, v in (locator or {}).items() if v not in (None, "")}
+def _given_meaning(meaning_: dict | None) -> dict:
+    """The model's meaning of a value, its vocabulary checked."""
     given = dict(meaning_ or {})
     for name, allowed in (("kind", VALUE_KINDS), ("unit", UNIT_LABELS), ("period", PERIOD_LABELS),
                           ("vat", VAT_LABELS), ("role", calc.ROLE_LABELS)):
@@ -2092,6 +2154,82 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
             raise ToolError(f"meaning.{name} חייב להיות אחד מ: " + ", ".join(allowed))
     if (given.get("stance") or "unknown") not in STANCES:
         raise ToolError("meaning.stance חייב להיות אחד מ: " + ", ".join(STANCES))
+    return given
+
+
+def _settle(taken: dict, given: dict, path: tuple) -> tuple[dict, dict, dict, Attribution | None]:
+    """The value's meaning and attribution from what its source gave (``taken``, with the section path of the block
+    holding it) and the model's meaning: ``(fields, provenance, who, said)``. The same for a fresh take and for a
+    cached value's facts (KTD12), so a reused value is checked exactly as a fresh one."""
+    fields, prov = _settle_meaning(taken, given)
+    said = taken.get("said") or _section_said(path)
+    context = "\n".join([taken.get("context") or "", *path])
+    who, prov_who = _settle_attribution(given, said, context)
+    return fields, prov | prov_who, who, said
+
+
+def _new_value(ws: Workspace, src: Source, sid: str, taken: dict, settled: tuple, given: dict, label: str,
+               path: tuple, reading_id: str | None) -> calc.Value:
+    fields, prov, who, said = settled
+    where = taken["locator"]
+    default = (f"{where['row']} — {where['column']}" if "row" in where
+               else f"{VALUE_KINDS[fields['kind']]} {fields.get('subject') or ''}".strip())
+    value = calc.Value(f"V{len(ws.values) + 1}", taken["value"], taken["written"], sid, src.document_id,
+                       src.version_id, reading_id, src.title, src.location,
+                       (label or "").strip() or default, fields["kind"], fields["unit"], fields["period"],
+                       fields["vat"], fields.get("area_basis") or "", (fields.get("subject") or "").strip(),
+                       fields["role"], prov, where, taken["quote"], taken["total"] or given["role"] == "total",
+                       taken["table"], "approx" in taken["qualifiers"].keys("approx"),
+                       section=" › ".join(path), stated_by=who["stated_by"], stance=who["stance"],
+                       scenario=who["scenario"], attribution=said.evidence if said is not None else "",
+                       meaning_from=dict(taken.get("meaning_from") or {}))
+    ws.values[value.vid] = value
+    return value
+
+
+def _value_report(ws: Workspace, value: calc.Value, said: Attribution | None, note: str | None) -> str:
+    """What ``take_value`` reports about the value it registered."""
+    where, prov = value.locator, value.provenance
+    shown = [UNIT_LABELS.get(value.unit, ""), PERIOD_LABELS.get(value.period, ""), VAT_LABELS.get(value.vat, ""),
+             f"בסיס שטח: {value.area_basis}" if value.area_basis else ""]
+    place = (f"שורה «{where['row']}» (מס' {where['row_number']}), עמודה «{where['column']}»" if "row" in where
+             else f"ציטוט «{_clip(value.quote, 200)}»")
+    asserted = [{"unit": "יחידה", "period": "תקופה", "vat": "מע\"מ", "area_basis": "בסיס שטח", "kind": "סוג",
+                 "stance": "עמדה", "stated_by": "מי אמר", "scenario": "תרחיש"}[k]
+                for k, p in prov.items() if p == "model_asserted"]
+    lines = [f"{value.vid} נרשם: «{_txt(value.label)}» = {value.written} ({'; '.join(x for x in shown if x) or 'ללא יחידה'})"
+             f" | סוג: {VALUE_KINDS[value.kind]} | תפקיד: {calc.ROLE_LABELS[value.role]}"
+             + (f" | נושא: {_txt(value.subject)}" if value.subject else "") + (" | שורת סה\"כ" if value.total else ""),
+             f"אומת ב-{value.source_id}: {_txt(place)}" + (f" | סעיף: {_txt(value.section)}" if value.section else ""),
+             _attribution_line(value, said)]
+    if value.approx:
+        lines.append("המקור כותב את הערך כמקורב.")
+    lines.append("ודאות: " + ("כל התכונות שצוינו נמצאו במקור" if not asserted else
+                              "נמוכה יותר — תכונות שהמודל קבע ולא נמצאו במקור: " + ", ".join(asserted)))
+    if note:
+        lines.append(note)
+    lines.append(f"סטטוס: {value_status(ws, value.vid)}")
+    return "\n".join(lines)
+
+
+def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: dict | None, label: str = "") -> str:
+    """Register a value of a source the turn read (V#) once the server verified that the number is the one the
+    locator names: the cell at that row and column of the table, or a number inside an exact quote. ``source`` may
+    also be a verified value cached in an earlier turn (``Q#`` from ``find_measurements``): it is reused, under the
+    current permissions and only while its reading is current, with this turn's meaning checked against what its
+    source attests (KTD12). A value read clearly is cached for later turns."""
+    sid = (source or "").strip()
+    loc = {k: v for k, v in (locator or {}).items() if v not in (None, "")}
+    data = ws.handles.get(sid)
+    if data is not None and data["kind"] == CACHE_HANDLE:
+        return _take_cached(ws, sid, data, loc, _given_meaning(meaning_), label)
+    src = ws.sources.get(sid)
+    if src is None:
+        raise ToolError(f"מקור לא מוכר: {source}. ערך נלקח רק ממקור S# שהוחזר בתור הזה (search או read)")
+    if src.is_listing or src.version_id is None:
+        raise ToolError("רשימת מסמכים אינה מקור לערך: קח את הערך ממקור במסמך")
+    full = src.text or (ws.sources[src.same_as].text if src.same_as in ws.sources else "")
+    given = _given_meaning(meaning_)
     cell = any(k in loc for k in ("table", "row", "row_number", "column", "column_number"))
     if cell == ("quote" in loc):
         raise ToolError("locator: תא בטבלה (row או row_number, ו-column או column_number; אפשר גם table) או ציטוט "
@@ -2115,42 +2253,33 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
                 blocks = [(r.block_index, r.text or "", r.page) for r in rows]
             taken = _take_quote(src, full, loc, blocks)
             at = _value_blocks(taken.get("anchor") or {})
-    fields, prov = _settle_meaning(taken, given)
+        reading_id = src.reading_id or v.reading_id
+        # the value's own region: read clearly, or read uncertainly at ingestion (then re-read, below, at most
+        # REREADS_PER_VALUE times; the same region again is served from the stored readings)
+        region = [r for r in rows if at is None or r.block_index in at]
+        unclear = next((r for r in region if r.status == reader.UNCERTAIN), None)
+    # the same value verified clearly before, in this reading: its earlier clear reading is reused (KTD12)
+    known = _known_clear(ws, src.version_id, reading_id, taken["locator"]) if unclear is not None else None
     # its section path: the block holding the number (a quote), or the table's block (a cell); else the source's
     holder = next((r for r in rows if at is None or r.block_index in at), None)
     path = tuple(getattr(holder, "section_path", None) or ()) or ((src.section,) if src.section else ())
-    said = taken.get("said") or _section_said(path)
-    context = "\n".join([taken.get("context") or "", *path])
-    who, prov_who = _settle_attribution(given, said, context)
-    prov |= prov_who
-    # the value's own region: read clearly, or read uncertainly at ingestion (then re-read, below, at most
-    # REREADS_PER_VALUE times; the same region again is served from the stored readings)
-    region = [r for r in rows if at is None or r.block_index in at]
-    unclear = next((r for r in region if r.status == reader.UNCERTAIN), None)
+    settled = _settle(taken, given, path)
     reread = None
     if unclear is not None:
-        key = (str(src.version_id), src.reading_id or v.reading_id,
-               json.dumps(taken["locator"], sort_keys=True, ensure_ascii=False))
-        reread = _reread_value(ws, v, unclear, taken["forms"], key)
-    approx = "approx" in taken["qualifiers"].keys("approx")
-    total = taken["total"] or given["role"] == "total"
-    where = taken["locator"]
-    default = (f"{where['row']} — {where['column']}" if "row" in where
-               else f"{VALUE_KINDS[fields['kind']]} {fields.get('subject') or ''}".strip())
-    value = calc.Value(f"V{len(ws.values) + 1}", taken["value"], taken["written"], sid, src.document_id,
-                       src.version_id, src.reading_id or v.reading_id, src.title, src.location,
-                       (label or "").strip() or default, fields["kind"], fields["unit"], fields["period"],
-                       fields["vat"], fields.get("area_basis") or "", (fields.get("subject") or "").strip(),
-                       fields["role"], prov, where, taken["quote"], total, taken["table"], approx,
-                       section=" › ".join(path), stated_by=who["stated_by"], stance=who["stance"],
-                       scenario=who["scenario"], attribution=said.evidence if said is not None else "",
-                       meaning_from=dict(taken.get("meaning_from") or {}))
-    ws.values[value.vid] = value
+        if known is not None and known["record"].get("value") == str(taken["value"]):
+            reread = (True, MSG_CACHED_CLEAR)
+        else:
+            key = (str(src.version_id), reading_id, json.dumps(taken["locator"], sort_keys=True, ensure_ascii=False))
+            reread = _reread_value(ws, v, unclear, taken["forms"], key)
+    value = _new_value(ws, src, sid, taken, settled, given, label, path, reading_id)
     # how its own region was read, on the value itself, so coverage and the stored answer see it (R28)
     if reread is not None and not reread[0]:
         ws.uncertain_values[value.vid] = reread[1]
         value.reading, value.reading_note = "uncertain", reread[1]
-    elif region:
+    elif (reread is not None and reread[0]) or (
+            region and all(r.status not in (reader.UNREAD, reader.UNCERTAIN) for r in region)):
+        # confirmed by a focused re-read, or its own region read clearly (never a region left unread, which only a
+        # visual transcription made now has read)
         ws.settled_values.add(value.vid)  # its own region read clearly: another region of the source does not matter
         value.reading = "clear"
     elif src.status == "uncertain_reading":
@@ -2166,26 +2295,203 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
         if pages:
             stub["pages"] = pages
         ws.anchors[value.vid] = stub
-    shown = [UNIT_LABELS.get(value.unit, ""), PERIOD_LABELS.get(value.period, ""), VAT_LABELS.get(value.vat, ""),
-             f"בסיס שטח: {value.area_basis}" if value.area_basis else ""]
-    place = (f"שורה «{where['row']}» (מס' {where['row_number']}), עמודה «{where['column']}»" if "row" in where
-             else f"ציטוט «{_clip(value.quote, 200)}»")
-    asserted = [{"unit": "יחידה", "period": "תקופה", "vat": "מע\"מ", "area_basis": "בסיס שטח", "kind": "סוג",
-                 "stance": "עמדה", "stated_by": "מי אמר", "scenario": "תרחיש"}[k]
-                for k, p in prov.items() if p == "model_asserted"]
-    lines = [f"{value.vid} נרשם: «{_txt(value.label)}» = {value.written} ({'; '.join(x for x in shown if x) or 'ללא יחידה'})"
-             f" | סוג: {VALUE_KINDS[value.kind]} | תפקיד: {calc.ROLE_LABELS[value.role]}"
-             + (f" | נושא: {_txt(value.subject)}" if value.subject else "") + (" | שורת סה\"כ" if total else ""),
-             f"אומת ב-{sid}: {_txt(place)}" + (f" | סעיף: {_txt(value.section)}" if value.section else ""),
-             _attribution_line(value, said)]
-    if approx:
-        lines.append("המקור כותב את הערך כמקורב.")
-    lines.append("ודאות: " + ("כל התכונות שצוינו נמצאו במקור" if not asserted else
-                              "נמוכה יותר — תכונות שהמודל קבע ולא נמצאו במקור: " + ", ".join(asserted)))
-    if reread is not None:
-        lines.append(reread[1])
-    lines.append(f"סטטוס: {value_status(ws, value.vid)}")
-    return "\n".join(lines)
+    if known is None and _cacheable(ws, value, src, reread):
+        span = (min(r.block_index for r in region), max(r.block_index for r in region)) if region else None
+        _store_verified(ws, value, _cache_doc(value, taken, path, ws.anchors.get(value.vid), src, span))
+    return _value_report(ws, value, settled[3], reread[1] if reread is not None else None)
+
+
+# --- verified values cached per reading (KTD12, R29) --------------------------------------------------------------
+#
+# A value ``take_value`` verified and whose own region was read clearly is kept in ``verified_values``, keyed by its
+# version, reading id and locator. Only what its source attests is kept: the number as written, its quote and
+# locator, its anchor, the facts the source gave (``_facts_json``) and the fields of its record whose provenance is
+# the source — never a field the model asserted, nor its label, subject or role. ``find_measurements`` lists the
+# cached values of current readings the user may see as ``Q#``; ``take_value`` on a ``Q#`` re-checks the document
+# and the reading, and settles that turn's meaning against the cached facts exactly as a fresh take would. A value
+# of an earlier reading is never listed or reused: its key names the reading.
+
+CACHE_HANDLE = "Q"
+CACHED_MAX = 40  # cached values listed by one find_measurements call
+SOURCE_FIELDS = ("kind", "unit", "period", "vat", "area_basis", "stance", "stated_by", "scenario")
+RECORD_FIELDS = ("value", "value_text", "document_id", "version_id", "reading_id", "title", "location", "locator",
+                 "quote", "total", "approx", "section", "attribution", "meaning_from")
+MSG_CACHED_CLEAR = ("האזור של הערך נקרא בעיבוד המסמך בקריאה לא ודאית; הערך כבר אומת בקריאה ברורה של אותה קריאת "
+                    "מסמך (ערך מאומת שמור), בלי קריאה חוזרת.")
+MSG_CACHED_TAKEN = ("נלקח מערך מאומת שמור ({handle}) של הקריאה הנוכחית של המסמך, בלי קריאה נוספת; המשמעות שנתת "
+                    "נבדקה שוב מול מה שהמקור מעיד.")
+MSG_CACHED_LOCATOR = ("{handle} הוא הערך ב{where}; ה-locator שנתת מצביע על מקום אחר. ל-{handle} שלח locator ריק, "
+                      "ולערך אחר קרא את המקור (read) וקח אותו ממנו.")
+MSG_CACHED_HEADER = ("ערכים שאומתו בתורות קודמים מתוך הקריאה הנוכחית של המסמכים (Q#; לא נקראו מחדש בתור הזה). "
+                     "לשימוש בחישוב רשום ערך ב-take_value עם source=Q# ו-locator ריק; המשמעות שתיתן תיבדק שוב מול "
+                     "המקור:")
+
+
+def _cacheable(ws: Workspace, value: calc.Value, src: Source, reread) -> bool:
+    """Whether a value just taken may be cached: its reading is known, its own region was read clearly (as ingested,
+    or settled by a focused re-read), and it is not a number of a visual transcription the turn made."""
+    if not value.reading_id or value.reading == "uncertain" or value.vid in ws.uncertain_values:
+        return False
+    if value.reading != "clear" and src.status == "uncertain_reading":
+        return False
+    transcribed = src.method == "vision" and src.status == "uncertain_reading"
+    return not transcribed or (reread is not None and bool(reread[0]))
+
+
+def _facts_json(taken: dict, path: tuple) -> dict:
+    """What the source gave about a taken value (``_take_cell`` / ``_take_quote``), with the section path of the
+    block holding it, as JSON: everything ``_settle`` reads, so a later take settles its meaning against it."""
+    said = taken.get("said")
+    return {"written": taken["written"], "value": str(taken["value"]), "forms": sorted(taken["forms"]),
+            "quote": taken["quote"], "qualifiers": {k: dict(v) for k, v in taken["qualifiers"].found.items()},
+            "units": sorted(taken["units"]), "vat": sorted(taken["vat"]), "kind_context": taken["kind_context"],
+            "locator": dict(taken["locator"]), "total": bool(taken["total"]),
+            "table": list(taken["table"]) if taken.get("table") else None,
+            "said": ({"stances": sorted(said.stances), "stated_by": said.stated_by, "evidence": said.evidence}
+                     if said is not None else None),
+            "context": taken.get("context") or "", "meaning_from": dict(taken.get("meaning_from") or {}),
+            "anchor": dict(taken.get("anchor") or {}), "path": list(path)}
+
+
+def _facts_from_json(d: dict) -> tuple[dict, tuple]:
+    """The facts of ``_facts_json`` back as ``take_value``'s ``taken``, and the section path."""
+    said = d.get("said")
+    taken = {"written": d["written"], "value": Decimal(d["value"]), "forms": frozenset(d["forms"]),
+             "quote": d["quote"], "qualifiers": meaning.Qualifiers({k: dict(v) for k, v in d["qualifiers"].items()}),
+             "units": set(d["units"]), "vat": set(d["vat"]), "kind_context": d["kind_context"],
+             "locator": dict(d["locator"]), "total": bool(d["total"]),
+             "table": tuple(d["table"]) if d.get("table") else None,
+             "said": (Attribution(frozenset(said["stances"]), said["stated_by"], said["evidence"])
+                      if said is not None else None),
+             "context": d.get("context") or "", "meaning_from": dict(d.get("meaning_from") or {}),
+             "anchor": dict(d.get("anchor") or {})}
+    return taken, tuple(d.get("path") or ())
+
+
+def _cache_record(value: calc.Value) -> dict:
+    """A value's public record as cached: the number, its place and the fields its source attests, with their
+    provenance; a field the model asserted, and the label, subject and role it named, are left out."""
+    pub = value.public()
+    record = {k: pub[k] for k in RECORD_FIELDS}
+    record |= {f: pub[f] for f in SOURCE_FIELDS if value.provenance.get(f) == "source"}
+    record["provenance"] = {k: p for k, p in value.provenance.items() if p == "source"}
+    return record
+
+
+def _cache_doc(value: calc.Value, taken: dict, path: tuple, stub: dict | None, src: Source,
+               span: tuple[int, int] | None) -> dict:
+    """The ``verified_values.value`` of a value: its record, the facts, its anchor stub and where it was read (the
+    blocks of its own region, else the source's)."""
+    start, end = span if span is not None else (src.block_start, src.block_end)
+    return {"record": _cache_record(value), "facts": _facts_json(taken, path), "anchor": stub,
+            "source": {"kind": src.kind, "section": src.section, "location": src.location, "block_start": start,
+                       "block_end": end, "table_index": src.table_index,
+                       "page_list": list((stub or {}).get("pages") or src.page_list or [])}}
+
+
+def _locator_agrees(record: dict, loc: dict) -> bool:
+    """Whether a locator given with a ``Q#`` names the cached value: every part given matches its place."""
+    where = record.get("locator") or {}
+    if loc.get("quote") and meaning._flat(loc["quote"]).strip() != meaning._flat(where.get("quote") or "").strip():
+        return False
+    for k in ("row", "column"):
+        if loc.get(k) and (k not in where or _key(loc[k]) != _key(where[k])):
+            return False
+    for k in ("row_number", "column_number"):
+        if loc.get(k) is not None:
+            try:
+                if int(loc[k]) != where.get(k):
+                    return False
+            except (TypeError, ValueError):
+                return False
+    if loc.get("number"):
+        n = _parse_number(str(loc["number"]))
+        if n is None or abs(n[1]) != abs(Decimal(str(record.get("value")))):
+            return False
+    return True
+
+
+def _cached_value(conn: Connection, version_id, reading_id: str, locator: dict) -> dict | None:
+    """The cached value at a version, reading and locator the user may see (row security), or None."""
+    row = conn.execute(text(
+        "SELECT value FROM verified_values WHERE version_id = :v AND reading_id = :r AND locator = CAST(:l AS jsonb)"),
+        {"v": version_id, "r": reading_id, "l": json.dumps(locator, ensure_ascii=False)}).first()
+    return row.value if row is not None else None
+
+
+def _known_clear(ws: Workspace, version_id, reading_id: str | None, locator: dict) -> dict | None:
+    """The cached value at a locator of a reading, looked up in its own transaction (only for a value whose region
+    was read uncertainly, which it spares a re-read); a cache that cannot be read only costs that re-read."""
+    if not reading_id:
+        return None
+    try:
+        with tenant_tx(ws.ctx) as conn:
+            return _cached_value(conn, version_id, reading_id, locator)
+    except Exception:  # noqa: BLE001
+        logger.warning("verified value cache lookup failed")
+        return None
+
+
+def _store_verified(ws: Workspace, value: calc.Value, doc: dict) -> None:
+    """Cache a verified value, in its own transaction, only while the user still sees its version and its reading
+    is the current one. A cache that cannot be written only costs a later re-verification."""
+    try:
+        with tenant_tx(ws.ctx) as conn:
+            v = reader.version(conn, value.version_id)
+            if v is None or v.reading_id != value.reading_id:
+                return
+            conn.execute(text(
+                "INSERT INTO verified_values (office_id, document_id, version_id, reading_id, locator, value)"
+                " VALUES (app_office(), :d, :v, :r, CAST(:l AS jsonb), CAST(:x AS jsonb)) ON CONFLICT DO NOTHING"),
+                {"d": v.document_id, "v": value.version_id, "r": value.reading_id,
+                 "l": json.dumps(value.locator, ensure_ascii=False), "x": json.dumps(doc, ensure_ascii=False)})
+    except Exception:  # noqa: BLE001 - the value itself is registered; only its reuse is lost
+        logger.warning("verified value cache store failed")
+
+
+def _cached_handle(ws: Workspace, version_id, reading_id: str, document_id, locator: dict) -> str:
+    """The turn's ``Q#`` for a cached value, bound to its version and reading like every handle."""
+    key = (str(version_id), reading_id, json.dumps(locator, sort_keys=True, ensure_ascii=False))
+    return ws.handle(CACHE_HANDLE, key, version_id=str(version_id), reading_id=reading_id,
+                     document_id=str(document_id), locator=dict(locator))
+
+
+def _cached_where(record: dict) -> str:
+    where = record.get("locator") or {}
+    return (f"שורה «{where.get('row')}», עמודה «{where.get('column')}»" if "row" in where
+            else f"ציטוט «{_clip(where.get('quote') or record.get('quote') or '', 200)}»")
+
+
+def _take_cached(ws: Workspace, handle: str, data: dict, loc: dict, given: dict, label: str) -> str:
+    """Register a cached verified value (``Q#``) as this turn's V#: the document is resolved again under the current
+    permissions and the reading must still be the one it was verified in; its meaning and attribution are settled
+    from the cached facts and this turn's meaning, as on a fresh take; its anchor is the cached one."""
+    with tenant_tx(ws.ctx) as conn:
+        v = _bound(conn, ws, handle, data)
+        doc = _cached_value(conn, v.version_id, data["reading_id"], data["locator"])
+    if doc is None:
+        raise ToolError(MSG_UNAVAILABLE)
+    record = doc["record"]
+    if not _locator_agrees(record, loc):
+        raise ToolError(MSG_CACHED_LOCATOR.format(handle=handle, where=_cached_where(record)))
+    taken, path = _facts_from_json(doc["facts"])
+    settled = _settle(taken, given, path)
+    place = doc.get("source") or {}
+    src = ws.add_source(document_id=v.document_id, version_id=v.version_id, title=v.title,
+                        section=place.get("section"), location=place.get("location") or record.get("location") or "",
+                        kind=place.get("kind") or "context", text=record.get("quote") or taken["quote"],
+                        block_start=place.get("block_start"), block_end=place.get("block_end"),
+                        table_index=place.get("table_index"), page_list=place.get("page_list") or None,
+                        partial_document=v.partial, reading_id=v.reading_id, status="complete",
+                        tags={"document": ws.doc_handle(v.document_id)})
+    ws.touch(v.document_id, v.title, "retrieved", v.partial)
+    value = _new_value(ws, src, src.sid, taken, settled, given, label, path, v.reading_id)
+    ws.settled_values.add(value.vid)  # cached only when its own region was read clearly
+    value.reading = "clear"
+    stub = doc.get("anchor")
+    if stub:
+        ws.anchors[value.vid] = dict(stub) | {"reading_id": value.reading_id}
+    return _value_report(ws, value, settled[3], MSG_CACHED_TAKEN.format(handle=handle))
 
 
 def tool_assume(ws: Workspace, value: str, quote: str, label: str = "") -> str:
@@ -2435,7 +2741,8 @@ TOOLS = [
         {"document": {"type": "string", "description": "D# או document_id"}}, ["document"]),
     _fn("find_measurements",
         "נתונים כמותיים שחולצו מהמסמכים עם משמעותם (סוג מדד, יחידה, תקופה, בסיס שטח, מע\"מ, תפקיד, נושא), מקובצים "
-        "לפי מה שניתן להשוות, עם כיסוי המסמכים. מחזיר מזהי M# לחישוב.",
+        "לפי מה שניתן להשוות, עם כיסוי המסמכים. מחזיר מזהי M# לחישוב, ולצדם ערכים שאומתו בתורות קודמים (Q#) "
+        "שאפשר לרשום ב-take_value בלי לקרוא שוב.",
         {"query": {"type": "string", "description": "תיאור הנתון המבוקש"},
          "metric_kinds": {**_NULLABLE_IDS, "description": "סוגי מדד מתוך: " + ", ".join(KIND_LABELS)},
          "document_ids": _NULLABLE_IDS,
@@ -2445,8 +2752,10 @@ TOOLS = [
     _fn("take_value",
         "רישום ערך ממקור S# שקראת בתור הזה, אחרי שהשרת מאמת שהמספר הוא זה שבמיקום שבחרת: תא בטבלה (שורה ועמודה; "
         "השאר null) או ציטוט מדויק מהמקור שהמספר בתוכו (quote ו-number; השאר null), עם משמעות הערך. מחזיר V#. מספר "
-        "שנמצא בשורה או בעמודה אחרת נדחה עם הסיבה; מה שהמקור מעיד על הערך נרשם כשל המקור, והשאר כקביעה שלך.",
-        {"source": {"type": "string", "description": "S# מהתור הזה (טבלה שנקראה, שורת טבלה מחיפוש, או קטע)"},
+        "שנמצא בשורה או בעמודה אחרת נדחה עם הסיבה; מה שהמקור מעיד על הערך נרשם כשל המקור, והשאר כקביעה שלך. ערך "
+        "מאומת שמור (Q# מ-find_measurements) נרשם עם locator ריק (כל השדות null).",
+        {"source": {"type": "string",
+                    "description": "S# מהתור הזה (טבלה שנקראה, שורת טבלה מחיפוש, או קטע), או Q# מ-find_measurements"},
          "locator": {"type": "object", "additionalProperties": False,
                      "required": ["table", "row", "row_number", "column", "column_number", "quote", "number"],
                      "properties": {

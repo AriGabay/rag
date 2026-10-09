@@ -17,7 +17,8 @@ Everything else is read once per content (``images.read_raster`` with ``RegionHi
 model on a crop at legible scale for tables, low-resolution pictures and uncertain OCR, and a photograph is
 recorded without text. Within a document the first reading of a hash applies to every occurrence; across the
 office's documents a ``ReadingCache`` (the office-scoped ``image_readings`` table) returns earlier readings by
-content hash, reader version, model configuration and crop scale. Only successful and uncertain readings are
+content hash, reader version, model configuration (the model and the OCR languages, ``model_config``) and crop
+scale. Only successful and uncertain readings are
 cached. The vision prompt carries no page context, so a reading depends on the content alone.
 
 A picture repeated in a document is shown once (``mark_repeated``): content occurring ``REPEAT_MIN`` times or more
@@ -145,11 +146,14 @@ class ReadingCache(Protocol):
 CACHEABLE = ("read", "read_uncertain", "no_text")
 
 
-def model_config(vision: VisionReader | None) -> str:
-    """The reader configuration a reading depends on: the vision model and effort, or ``none`` (OCR only)."""
-    if vision is None:
-        return "none"
-    return getattr(vision, "config", None) or type(vision).__name__
+def model_config(vision: VisionReader | None, ocr_languages: str) -> str:
+    """The reader configuration a reading depends on (KTD11): the vision model and effort, or ``none`` (OCR only),
+    and the OCR languages the reading's words were read and checked with, as ``<model>|ocr=<languages>``. Migration
+    0016 gave every reading stored before it this form with ``heb+eng`` (the only languages ever configured), so
+    those readings keep hitting under the default languages, and a reading made with other languages is another
+    reading: it is never served for these."""
+    model = "none" if vision is None else (getattr(vision, "config", None) or type(vision).__name__)
+    return f"{model}|ocr={ocr_languages}"
 
 
 # --- ink outside the text layer --------------------------------------------------------------------------------
@@ -424,7 +428,7 @@ def _read_content(c: _Content, settings: Settings, vision: VisionReader | None, 
 
     check_deadline(deadline)
     languages = settings.ocr_languages
-    key = ReadingKey(c.content_hash, REGION_READER_VERSION, model_config(vision), c.crop_scale)
+    key = ReadingKey(c.content_hash, REGION_READER_VERSION, model_config(vision, languages), c.crop_scale)
     cached = None
     if cache is not None:
         try:

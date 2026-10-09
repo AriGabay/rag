@@ -472,12 +472,16 @@ def _rels(zf: zipfile.ZipFile) -> dict[str, str]:
     return out
 
 
-def _reading_key(data: bytes, context: str, vision: VisionReader | None):
-    """The cache key of a picture's reading: its bytes and the context the model is shown with it."""
+def _reading_key(data: bytes, context: str, vision: VisionReader | None, ocr_languages: str | None = None):
+    """The cache key of a picture's reading: its bytes and the context the model is shown with it, and the reader
+    configuration with the OCR languages (``regions.model_config``, KTD11); ``ocr_languages`` defaults to the
+    configured ones."""
+    from app.config import get_settings
     from app.extraction.regions import IMAGE_CROP, ReadingKey, model_config
 
+    languages = ocr_languages if ocr_languages is not None else get_settings().ocr_languages
     digest = hashlib.sha256(data + b"\0" + context[:CONTEXT_CHARS].encode()).hexdigest()
-    return ReadingKey("docx:" + digest, PICTURE_READER_VERSION, model_config(vision), IMAGE_CROP)
+    return ReadingKey("docx:" + digest, PICTURE_READER_VERSION, model_config(vision, languages), IMAGE_CROP)
 
 
 def _read_pictures(w: _Walker, vision: VisionReader | None, settings: Settings, cache=None) -> None:
@@ -497,7 +501,7 @@ def _read_pictures(w: _Walker, vision: VisionReader | None, settings: Settings, 
             data = w.zf.read(pic.rid)
         except KeyError:
             return pic.rid, PictureReading("unread", "none", note="קובץ התמונה חסר במסמך")
-        key = _reading_key(data, pic.context, vision) if cache is not None else None
+        key = _reading_key(data, pic.context, vision, settings.ocr_languages) if cache is not None else None
         if key is not None:
             try:
                 cached = cache.get(key)
