@@ -67,7 +67,7 @@ def _judge(score, rule=lambda text: "supported", seen: list | None = None) -> Sc
         statements = {int(i): t for i, t in re.findall(r'<statement index="(\d+)">\n(.*?)\n</statement>', input,
                                                          re.S)}
         frozen = None if "<derive_requirements>" in input else re.findall(
-            r'<requirement id="(Q\d+)"[^>]*>\n(.*?)\n</requirement>', input, re.S)
+            r'<requirement id="(N[\d.]+)"[^>]*>\n(.*?)\n</requirement>', input, re.S)
         out = {"verdicts": [{"index": i, "verdict": rule(t), "reason": "בדיקה"} for i, t in units.items()]}
         if "<derive_requirements>" in input or "<requirements>" in input:
             out["requirements"] = score(frozen, units, statements)
@@ -112,12 +112,12 @@ def test_an_answer_that_declares_no_parts_still_gets_requirements_and_a_missing_
     p = _judge(_by_words({"השווי למ\"ר": {}, "דמי הניהול": {"related": ["H1"]}}), seen=seen)
     r = verify_answer(p, a, ws, "מה השווי למ\"ר ומה דמי הניהול?", [], requirements=turn)
     assert "<derive_requirements>" in seen[0] and "<workspace>" in seen[0] and "H1" in seen[0]
-    assert [(x["id"], x["text"]) for x in turn.items] == [("Q1", "השווי למ\"ר"), ("Q2", "דמי הניהול")]
+    assert [(x["id"], x["text"]) for x in turn.items] == [("N1", "השווי למ\"ר"), ("N2", "דמי הניהול")]
     final, outcomes = _finish(ws, a, r, turn)
     assert final.status == "partial"
     assert final.answer_markdown.startswith("**דמי הניהול** לא נמצא בחיפוש במסמכים שנבדקו.")
     assert [(o["id"], o["status"], o["limitation"]) for o in outcomes] == [
-        ("Q1", "full", None), ("Q2", "missing", "not_found")]
+        ("N1", "full", None), ("N2", "missing", "not_found")]
 
 
 def test_the_declared_parts_are_hints_in_the_deriving_call_only():
@@ -129,7 +129,7 @@ def test_the_declared_parts_are_hints_in_the_deriving_call_only():
     verify_answer(p, a, ws, "?", [], requirements=turn)
     verify_answer(p, a, ws, "?", [], requirements=turn)
     assert "<hint>" in seen[0] and "<hint>" not in seen[1] and "<derive_requirements>" not in seen[1]
-    assert '<requirement id="Q1"' in seen[1]
+    assert '<requirement id="N1"' in seen[1]
 
 
 def test_requirements_derived_in_the_first_batch_are_scored_by_id_in_the_next_batch_and_on_a_rejudge(monkeypatch):
@@ -141,12 +141,12 @@ def test_requirements_derived_in_the_first_batch_are_scored_by_id_in_the_next_ba
     p = _judge(_by_words({"השווי למ\"ר": {}, "דמי השכירות": {}}), seen=seen)
     r = verify_answer(p, a, ws, "?", [], requirements=turn)
     assert len(seen) == 2 and "<derive_requirements>" in seen[0]
-    assert '<requirement id="Q1"' in seen[1] and '<requirement id="Q2"' in seen[1]
+    assert '<requirement id="N1"' in seen[1] and '<requirement id="N2"' in seen[1]
     # the second requirement is missing in the first batch and given in the second: merged by id
-    assert [(o["id"], o["status"]) for o in r.requirement_outcomes()] == [("Q1", "full"), ("Q2", "full")]
+    assert [(o["id"], o["status"]) for o in r.requirement_outcomes()] == [("N1", "full"), ("N2", "full")]
     again = verify_answer(p, a, ws, "?", [], requirements=turn)
-    assert "<derive_requirements>" not in seen[2] and [x["id"] for x in turn.items] == ["Q1", "Q2"]
-    assert [(o["id"], o["status"]) for o in again.requirement_outcomes()] == [("Q1", "full"), ("Q2", "full")]
+    assert "<derive_requirements>" not in seen[2] and [x["id"] for x in turn.items] == ["N1", "N2"]
+    assert [(o["id"], o["status"]) for o in again.requirement_outcomes()] == [("N1", "full"), ("N2", "full")]
 
 
 def test_requirements_are_derived_even_when_no_unit_reaches_the_judge():
@@ -199,7 +199,7 @@ def test_a_requirement_no_call_scored_is_never_taken_as_given():
 
     verify_answer(_judge(score), a, ws, "?", [], requirements=turn)  # derived: the second given by no unit
     r = verify_answer(_judge(score), a, ws, "?", [], requirements=turn)  # re-judged: the second is not scored
-    assert [(o["id"], o["status"]) for o in r.requirement_outcomes()] == [("Q1", "full"), ("Q2", "missing")]
+    assert [(o["id"], o["status"]) for o in r.requirement_outcomes()] == [("N1", "full"), ("N2", "missing")]
 
 
 # --- a missing requirement whose data exist is a repair problem (R20, AE6) ---------------------------------------
@@ -248,7 +248,7 @@ def test_a_failed_calculation_is_stated_as_not_completed_never_as_not_found():
     assert final.answer_markdown.startswith("**היחס לסף**: החישוב נכשל על הנתונים שנמצאו")
     assert outcomes[1]["limitation"] == "calculation_incomplete"
     assert r.counts()["completeness"]["missing"] == [{
-        "id": "Q2", "text": "היחס לסף", "status": "missing", "reason": "calculation_incomplete",
+        "id": "N2", "text": "היחס לסף", "status": "missing", "reason": "calculation_incomplete",
         "reason_text": coverage.LIMITATIONS["calculation_incomplete"]}]
 
 
@@ -377,12 +377,12 @@ def test_a_partial_answer_lists_each_missing_requirement_with_its_reason():
     counts = r.counts()
     assert counts["correctness"] == "partial"
     assert counts["completeness"]["status"] == "partial"
-    assert [(m["id"], m["reason"]) for m in counts["completeness"]["missing"]] == [("Q2", "not_found")]
+    assert [(m["id"], m["reason"]) for m in counts["completeness"]["missing"]] == [("N2", "not_found")]
 
 
 def test_overall_completeness_status():
     def outcome(status):
-        return {"id": "Q1", "text": "א", "status": status, "limitation": None if status == "full" else "not_found"}
+        return {"id": "N1", "text": "א", "status": status, "limitation": None if status == "full" else "not_found"}
 
     assert coverage.completeness([]) is None
     assert coverage.completeness([outcome("full")])["status"] == "full"

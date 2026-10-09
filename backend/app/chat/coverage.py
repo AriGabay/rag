@@ -24,7 +24,8 @@ to its end); the sources conflict (values registered this turn give it different
 requested data are deduplicated by label, and a part of the request the verified answer does not cover gets one
 too (``state_parts``), unless it is already stated.
 
-What the request requires is derived by the verification judge (``verify.TurnRequirements``, KTD7). A requirement the
+What the request requires is frozen in ``verify.TurnRequirements``: the request's components before the answer
+(round 7 KTD1), or, when the turn has none, the judge's derivation (KTD7). A requirement the
 verified answer does not give gets one sentence with its reason (R21), computed from what the turn found and did
 (``limitation``): a tool or provider failure; a calculation that failed, or whose inputs were found and never
 computed; the sources disagree, or the documents do not allow a conclusion (insufficient to conclude); a value found

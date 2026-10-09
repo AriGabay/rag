@@ -64,7 +64,7 @@ def _judge(asks: list[tuple[str, str, tuple[str, ...]]], absent: dict[str, str] 
                                                               input, re.S))
         block = re.search(r"<workspace>\n(.*?)\n</workspace>", input, re.S)
         listing = re.findall(r"^([A-Z]\d+): (.*)$", block.group(1) if block else "", re.M)
-        frozen = dict((t, i) for i, t in re.findall(r'<requirement id="(Q\d+)"[^>]*>\n(.*?)\n</requirement>', input,
+        frozen = dict((t, i) for i, t in re.findall(r'<requirement id="(N[\d.]+)"[^>]*>\n(.*?)\n</requirement>', input,
                                                    re.S))
         out = []
         for text, keyword, words in asks:
@@ -110,9 +110,9 @@ def test_ae6_an_omitted_part_whose_inputs_were_found_is_added_by_a_repair_round_
     first, *later = _verify_inputs(agent)
     assert "<derive_requirements>" in first and later
     # the repair round's re-judge scores the same requirements by the same ids
-    assert all('<requirement id="Q3"' in x and "<derive_requirements>" not in x for x in later)
-    assert [(r["id"], r["status"]) for r in a["ledger"]["requirements"]] == [("Q1", "full"), ("Q2", "full"),
-                                                                             ("Q3", "full")]
+    assert all('<requirement id="N3"' in x and "<derive_requirements>" not in x for x in later)
+    assert [(r["id"], r["status"]) for r in a["ledger"]["requirements"]] == [("N1", "full"), ("N2", "full"),
+                                                                             ("N3", "full")]
     repair = next(i["content"] for i in agent.seen[5] if isinstance(i, dict) and i.get("role") == "user"
                   and "בדיקת האימות" in str(i.get("content")))
     assert RATE_ASK in repair and "calculate" in repair
@@ -128,7 +128,7 @@ def test_a_calculation_that_still_fails_is_stated_as_not_completed_not_as_not_fo
     assert a["markdown"].startswith("**שיעור הרווח מההכנסות**: החישוב נכשל על הנתונים שנמצאו")
     assert "לא נמצא בחיפוש" not in a["markdown"]
     (missing,) = a["verification"]["completeness"]["missing"]
-    assert missing["id"] == "Q3" and missing["reason"] == "calculation_incomplete"
+    assert missing["id"] == "N3" and missing["reason"] == "calculation_incomplete"
     assert a["verification"]["completeness"]["status"] == "partial"
     assert a["verification"]["correctness"] == "verified"  # what the answer claims is correct, only incomplete
 
@@ -142,7 +142,7 @@ def test_an_answer_that_declares_no_parts_gets_requirements_from_the_judge(clien
     a, _ = _ask(client, office, monkeypatch, steps, _judge(asks), question="מה ההכנסות הכוללות ומה שטח המגרש?")
     assert a["markdown"].startswith("**שטח המגרש** לא נמצא בחיפוש במסמכים שנבדקו.")
     assert a["status"] == "partial"
-    assert [(m["id"], m["reason"]) for m in a["verification"]["completeness"]["missing"]] == [("Q2", "not_found")]
+    assert [(m["id"], m["reason"]) for m in a["verification"]["completeness"]["missing"]] == [("N2", "not_found")]
 
 
 def test_a_value_found_but_written_as_not_found_is_corrected(client, office, monkeypatch):

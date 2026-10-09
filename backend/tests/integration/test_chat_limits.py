@@ -240,10 +240,10 @@ def test_a_turn_that_cannot_be_verified_in_time_fails_with_its_message_and_logs_
     assert m["status"] == "failed" and m["answer"] is None and m["content"] == ""
     assert api.FAILURE_TEXT["verify_no_time"] in m["error"] and "לאמת" in m["error"]
     assert not any(c.purpose.value == "verify" for c in agent.calls)  # the judge was never called
-    assert [u["purpose"] for u in m["usage"]] == ["agent", "agent"]
+    assert [u["purpose"] for u in m["usage"]] == ["agent", "request", "agent"]  # the request analysis (round 7 KTD1) is a call of its own
     with tenant_tx(office.system) as conn:
         assert [r.purpose for r in conn.execute(text("SELECT purpose FROM provider_usage ORDER BY id"))] == [
-            "agent", "agent"]
+            "agent", "request", "agent"]
 
 
 # --- a cache-friendly loop ---------------------------------------------------------------------------------------

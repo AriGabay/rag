@@ -88,9 +88,10 @@ def test_a_turn_that_fails_after_two_calls_still_records_both(client, office, mo
     login(client, "admin-a@example.test")
     m = send(client, new_conversation(client), "מה השווי?")
     assert m["status"] == "failed"
-    assert [(r.purpose, r.ok, r.status) for r in rows(office)] == [("agent", True, "ok"),
+    # the request analysis (round 7 KTD1) is a call of its own, collected before the second step
+    assert [(r.purpose, r.ok, r.status) for r in rows(office)] == [("agent", True, "ok"), ("request", True, "ok"),
                                                                   ("agent", False, "rate_limited")]
-    assert [u["status"] for u in m["usage"]] == ["ok", "rate_limited"]
+    assert [u["status"] for u in m["usage"]] == ["ok", "ok", "rate_limited"]
 
 
 def test_a_cancelled_turn_records_the_calls_made_before_the_stop(client, office, monkeypatch):  # noqa: F811
@@ -106,8 +107,8 @@ def test_a_cancelled_turn_records_the_calls_made_before_the_stop(client, office,
     login(client, "admin-a@example.test")
     m = send(client, new_conversation(client), "מה השווי?")
     assert m["status"] == "cancelled"
-    assert [r.purpose for r in rows(office)] == ["agent", "agent"]
-    assert len(m["usage"]) == 2
+    assert [r.purpose for r in rows(office)] == ["agent", "request", "agent"]  # the request analysis (round 7 KTD1) is a call of its own
+    assert len(m["usage"]) == 3
 
 
 def test_a_turn_that_breaks_unexpectedly_still_records_its_calls(client, office, monkeypatch):  # noqa: F811
@@ -121,7 +122,7 @@ def test_a_turn_that_breaks_unexpectedly_still_records_its_calls(client, office,
     login(client, "admin-a@example.test")
     m = send(client, new_conversation(client), "מה השווי?")
     assert m["status"] == "failed"
-    assert [r.purpose for r in rows(office)] == ["agent", "agent"]
+    assert [r.purpose for r in rows(office)] == ["agent", "request", "agent"]  # the request analysis (round 7 KTD1) is a call of its own
 
 
 def test_an_unpriced_model_is_recorded_with_unknown_cost(client, office, monkeypatch):  # noqa: F811

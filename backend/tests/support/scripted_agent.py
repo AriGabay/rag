@@ -1,6 +1,11 @@
-"""Test-only model for the conversational loop: replays scripted steps (tool calls or a final answer) and
-answers the verification judge. Every step records the input items it received, so tests can check what the
-model was shown (history, prior references, tool outputs)."""
+"""Test-only model for the conversational loop: replays scripted steps (tool calls or a final answer), answers
+the request analysis of a first turn (``app.chat.request``) and the verification judge. Every step records the
+input items it received, so tests can check what the model was shown (history, prior references, tool outputs).
+
+The request analysis answers with the components a test gives (``request=``: a list of ``component(...)``, a
+``CallStatus`` for a failed call, or a callable ``(input) -> one of those or a dict``); by default with one
+information component per part the first scripted final answer declares, and with none when it declares none —
+an empty analysis, so the judge derives the requirements as before the analysis existed (the fallback)."""
 
 from __future__ import annotations
 
@@ -10,8 +15,9 @@ from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 
+from app.chat.request import RequestAnalysis
 from app.providers.llm import AgentStep, CallStatus, Purpose
-from tests.support.scripted_provider import ScriptedProvider
+from tests.support.scripted_provider import ScriptedCall, ScriptedProvider
 
 
 def call(name: str, **arguments) -> dict:
@@ -43,6 +49,14 @@ def requirement(text: str = "", status: str = "full", units: list | None = None,
             "related": related or [], "reason": "בדיקה"}
 
 
+def component(text: str, kind: str = "information", id: str = "", parent: str = "", conditional: bool = False,
+              subject: str = "", parameters: list | None = None, compares: list | None = None) -> dict:
+    """One component of the request as the analysis (or the resolve call) returns it; ``id`` is the model's own
+    label (the server assigns the ``N#`` ids), ``parent`` the label of the component it refines."""
+    return {"id": id, "text": text, "kind": kind, "parent": parent, "conditional": conditional, "subject": subject,
+            "parameters": parameters or [], "compares": compares or []}
+
+
 class ScriptedAgent(ScriptedProvider):
     """``steps``: a list whose items are a list of tool calls (one model step calling them), a ``final(...)``
     dict, a ``CallStatus`` (a failed step), or a callable ``(items) -> one of those``."""
@@ -50,9 +64,13 @@ class ScriptedAgent(ScriptedProvider):
     name = "scripted-agent"
     model = "scripted-agent"
 
-    def __init__(self, steps: list, judge: str | Callable[[str], dict] = "supported") -> None:
+    def __init__(self, steps: list, judge: str | Callable[[str], dict] = "supported",
+                 request: list | CallStatus | Callable[[str], Any] | None = None) -> None:
         super().__init__()
         self.steps = list(steps)
+        self.request = request
+        # read now: the analysis runs while the first step is being taken from ``steps``
+        self._first_final = next((s["final"] for s in self.steps if isinstance(s, dict) and "final" in s), None)
         self.seen: list[list] = []
         self.on_step: Callable[[int], None] | None = None
         verdict = judge
@@ -70,10 +88,23 @@ class ScriptedAgent(ScriptedProvider):
                                        for h in re.findall(r"<hint>(.*?)</hint>", input, re.S)]
             elif "<requirements>" in input:
                 out["requirements"] = [requirement(id=i, units=indexes)
-                                       for i in re.findall(r'<requirement id="(Q\d+)"', input)]
+                                       for i in re.findall(r'<requirement id="([A-Z][\d.]+)"', input)]
             return out
 
         self.on(Purpose.VERIFY, judge_fn, repeat=True)
+
+    def _analysis(self, input: str) -> Any:
+        response = self.request(input) if callable(self.request) else self.request
+        if response is None:  # the default: the parts the first scripted final answer declares
+            response = [component(p["ask"]) for p in (self._first_final or {}).get("parts") or []]
+        return {"components": response} if isinstance(response, list) else response
+
+    def structured(self, purpose: Purpose, instructions: str, input: str, schema, **kw: Any):
+        if schema is not RequestAnalysis:
+            return super().structured(purpose, instructions, input, schema, **kw)
+        result = self._result(lambda i, x: self._analysis(x), instructions, input, schema)
+        self.calls.append(ScriptedCall(Purpose(purpose), instructions, input, schema, result))
+        return result
 
     def agent_step(self, instructions: str, items: list, tools: list[dict], final_schema: dict, **kw: Any) -> AgentStep:
         self.seen.append(list(items))

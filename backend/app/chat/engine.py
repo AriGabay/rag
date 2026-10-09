@@ -14,10 +14,17 @@ One turn:
 3. It answers in Markdown with citations ``[S#]`` (passages), ``[M#]`` (measurements), ``[V#]`` (values),
    ``[A#]`` (user assumptions), ``[C#]`` (calculations).
 4. ``app.chat.verify`` checks the answer against what the tools returned: unknown citations, numbers that no
-   cited source states, and — through a separate judge call — sentences the cited sources do not support. The
-   turn's first judge call also derives what the request requires (KTD7: from the request, the answer's ``parts``
-   being hints), frozen for the turn (``verify.TurnRequirements``, which also records the turn's failed tools and
-   calculations); every judge call scores those requirements by id. A failed check gets one repair step — which may
+   cited source states, and — through a separate judge call — sentences the cited sources do not support. What the
+   request requires is frozen before the answer (round 7 KTD1, R1-R3): on a first turn, the request analysis
+   (``app.chat.request``) runs in a worker thread started with the first step and is collected before the second
+   — or, when the first step answers, before verification — its components appended as one user item (so the cached
+   prefix is unchanged); on a follow-up they come with the resolution (no extra call) and are part of the turn's
+   first message. They are the turn's requirements (``verify.TurnRequirements``, which also records the turn's failed
+   tools and calculations), with ids ``N#``; the answer's ``parts`` cannot remove or narrow one. Without components
+   (the analysis failed, timed out, was invalid or empty; the resolution failed or its component part was invalid)
+   the turn's first judge call derives them (KTD7, the answer's ``parts`` being hints), and the turn records the
+   fallback (``requirements_origin`` and ``requirements_fallback`` in the summary, ``requirements_origin`` in the
+   ledger). Every judge call scores the requirements by id. A failed check gets one repair step — which may
    call tools, within the step bound, to complete a requirement whose data were found or that nothing searched for;
    what still fails is removed, and the answer says so; a requirement still not given is stated with its reason by
    the server (``coverage.state_parts``), and correctness and completeness are reported apart
@@ -61,6 +68,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from app.chat import coverage, entities, resolve
+from app.chat import request as request_analysis
 from app.chat import tools as T
 from app.chat.verify import (
     VERIFY_ALLOWANCE_SECONDS,
@@ -413,6 +421,8 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None) -> 
     parts.append("ההודעה החדשה של המשתמש:\n" + prompt_text(inp.question))
     if request is not None:
         parts.append(resolve.requested_block(request))
+        if request.components:
+            parts.append(request_analysis.block(request.components))
     return "\n\n".join(parts)
 
 
@@ -423,15 +433,20 @@ def run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput,
     The turn's usage records travel with it: on the outcome, and on any exception it raises (``usage``), so the
     calls made before a stop, a failure or a crash are still logged and billed."""
     usage: list[dict] = []
+    started: list[request_analysis.Pending] = []  # the request analysis, when one was started
     try:
-        return _run_turn(ctx, provider, inp, progress, cancelled, usage)
+        return _run_turn(ctx, provider, inp, progress, cancelled, usage, started)
     except Exception as exc:
+        # an analysis the turn never collected was still a call: its usage (or an abandoned record) stays
+        for pending in started:
+            if (entry := pending.abandon()) is not None:
+                usage.append(entry)
         exc.usage = usage
         raise
 
 
 def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progress: Callable[[str, str], None],
-              cancelled: Callable[[], bool], usage: list[dict]) -> TurnOutcome:
+              cancelled: Callable[[], bool], usage: list[dict], started: list) -> TurnOutcome:
     settings = get_settings()
     agent = for_purpose(provider, Purpose.AGENT)
     if not hasattr(agent, "agent_step"):
@@ -451,7 +466,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     attempt = 0  # 0: first answer, 1: repaired with tools, 2: rewritten from verified content only
     limits = ws.limits_hit
     rounds: list[list[dict]] = []
-    # the request's requirements, derived by the first judge call and frozen for the turn, and its tool failures
+    # the request's requirements, frozen for the turn (the request's components, or the judge's derivation when there
+    # are none), and its tool failures
     turn = TurnRequirements()
     # the turn's verdicts: a repair round judges only what changed (KTD10)
     verdicts = VerdictCache()
@@ -472,6 +488,12 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             lookup=lambda words: entities.lookup(ctx, words, focus_ids, titles), candidates=inp.candidates or None)
         if cancelled():
             raise TurnCancelled
+        # the components came with the resolution; a failed resolution or an invalid component part leaves them to
+        # the judge, and the rest of the resolution still stands
+        if request is not None and request.components:
+            turn.adopt(request.components, "resolve")  # the decisions on them are in the resolution
+        else:
+            turn.fall_back("resolve_failed" if request is None else request.components_status)
         # a model's clarification has nothing to verify against, so one that states a figure is not used; the
         # server's names only titles the user may see and the user's own words
         if request is not None and request.clarify and (request.server_clarify or not re.search(r"\d", request.clarify)):
@@ -480,7 +502,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                                  scope_kind="focused", scope_query="", omitted=[], focus=None, requested=[],
                                  parts=[])
             return TurnOutcome(answer, ws, VerifyReport([], judged=True, judge_status="no_claims"), steps, usage, {},
-                               rounds, request.as_dict(), request.resolution, _summary(usage, rounds, reused))
+                               rounds, request.as_dict(), request.resolution, _summary(usage, rounds, reused, turn))
     def finish(answer: FinalAnswer, report: VerifyReport) -> TurnOutcome:
         # a server sentence saying a datum was not found is not added when the turn holds its values
         final = coverage.state_absence(ws, report.apply(answer), cited=False, withdrawn=report.withdrawn)
@@ -492,14 +514,38 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         if final.status != "clarification":
             ledger, final = coverage.build(ws, final, inp.question)
             ledger["requirements"] = outcomes
+            ledger["requirements_origin"] = turn.record_origin()
         return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
                            request.as_dict() if request is not None else None,
-                           request.resolution if request is not None else None, _summary(usage, rounds, reused))
+                           request.resolution if request is not None else None, _summary(usage, rounds, reused, turn))
+
+    pending: request_analysis.Pending | None = None
+
+    def settle_analysis() -> None:
+        """The first turn's request analysis, collected once: its components frozen as the turn's requirements and
+        appended as one item, or the fallback recorded. Waiting stops when the turn is cancelled."""
+        nonlocal pending
+        analysis, pending = pending.wait(cancelled), None
+        if analysis.usage is not None:
+            usage.append(analysis.usage)
+        if analysis.status == "cancelled":
+            raise TurnCancelled
+        if analysis.items:
+            turn.adopt(analysis.items, "analysis", analysis.decisions)
+            items.append({"role": "user", "content": request_analysis.block(analysis.items)})
+        else:
+            turn.fall_back(analysis.status)
 
     items: list = [{"role": "user", "content": _context_message(inp, request)}]
+    if request is None and not (inp.history or inp.focus):
+        # a first turn: the request is analysed beside the first step (no added latency), within the reading time
+        pending = request_analysis.start(provider, inp.question, read_until)
+        started.append(pending)
     while True:
         if cancelled():
             raise TurnCancelled
+        if pending is not None and steps >= 1:
+            settle_analysis()  # before the second step: appended after the first step's items
         steps += 1
         now = time.monotonic()
         left = deadline - now
@@ -520,7 +566,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             # the reading's step count only grows, so this is said once; a calculation still fits after it
             items.append({"role": "user", "content": NEAR_LIMIT_NOTICE})
         # the same tools in the same order at every step, the last one included: only the choice changes
-        started = time.monotonic()
+        step_started = time.monotonic()
         step = agent.agent_step(POLICY, items, T.TOOLS, FINAL_SCHEMA, cache_key=cache_key,
                                 timeout=max(15.0, min(left, settings.llm_timeout_agent_seconds)),
                                 tool_choice="none" if last else None)
@@ -552,7 +598,9 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                 logger.warning("chat repair round failed: final schema; the verified answer is kept")
                 return finish(*checked)
             raise ProviderFailure(CallStatus.INVALID.value, "final schema") from exc
-        answer_seconds = time.monotonic() - started
+        answer_seconds = time.monotonic() - step_started
+        if pending is not None:
+            settle_analysis()  # the first step answered: the requirements are frozen before verification
         if answer.status == "clarification" and answer.clarification_question.strip() and not answer.answer_markdown.strip():
             answer.answer_markdown = answer.clarification_question
         # a datum that was not found is said first, at the level the turn actually checked; a sentence that rests on
@@ -604,9 +652,12 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             items.append({"role": "user", "content": REWRITE.format(problems=report.problems_text(claims_only=True))})
 
 
-def _summary(usage: list[dict], rounds: list, reused: int) -> dict:
-    """The finished turn's totals, logged (numbers only) and kept on the outcome."""
-    summary = usage_summary(usage, rounds=len(rounds), verdicts_reused=reused)
+def _summary(usage: list[dict], rounds: list, reused: int, turn: TurnRequirements) -> dict:
+    """The finished turn's totals, logged (numbers and labels only) and kept on the outcome: with where the turn's
+    requirements came from (``analysis``, ``resolve``, ``judge``) and, when the judge derived them, why."""
+    origin = turn.record_origin()
+    summary = usage_summary(usage, rounds=len(rounds), verdicts_reused=reused,
+                            requirements_origin=origin["origin"], requirements_fallback=origin["fallback"])
     logger.info("chat turn: %s", json.dumps(summary))
     return summary
 

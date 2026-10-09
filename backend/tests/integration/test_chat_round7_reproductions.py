@@ -9,7 +9,8 @@ the judge are scripted: these tests prove what the server does with what they re
 scripted judge plays the behaviour the trace found (for instance, a requirement derived from an instruction and
 scored ``missing``); a script may also hold the steps a repair round would take once the fix sends the turn back to
 the model (unused while the failure lasts). When a fix adds a model call (the request analysis of KTD1, say), the
-unit that lands it scripts that call and keeps the asserted outcome.
+unit that lands it scripts that call and keeps the asserted outcome: F1, F2, F3 and F8 script the components their
+request has (U2); the others leave the analysis empty, so the judge derives the requirements as before.
 
 F1–F4 run offline (the turn's engine with a scripted tool runner, no database); F2 and F5–F8 run against the test
 database because their outcome rests on what the turn actually read (an opened section, an inspected region, a
@@ -36,7 +37,7 @@ from app.providers.llm import CallStatus
 from tests.conftest import login
 from tests.factories import make_document, make_office
 from tests.integration.test_chat import cloud, new_conversation, send
-from tests.support.scripted_agent import ScriptedAgent, call, final, read, requirement
+from tests.support.scripted_agent import ScriptedAgent, call, component, final, read, requirement
 
 ROUND7 = Path(__file__).resolve().parents[1] / "fixtures" / "round7"
 MANIFEST = json.loads((ROUND7 / "manifest.json").read_text(encoding="utf-8"))
@@ -146,7 +147,11 @@ F1_ANSWER = ("לפי תכנית דמו/4521 המאושרת, ייעוד הקרק�
 def test_f1_instructions_are_never_searched_or_reported_missing_from_the_documents(offline):
     asks = [("השימושים לפי התכנית המאושרת", "ייעוד", []), ("מספר יחידות הדיור", "84", []), (STYLE, None, []),
             (CITE, None, [])]
-    agent = ScriptedAgent([SEARCH, final(F1_ANSWER), final(F1_ANSWER), final(F1_ANSWER)], judge=_judge(asks))
+    # the request analysis (U2): the two data, conditional on their appearing, and the two instructions
+    analysed = [component(asks[0][0], conditional=True), component(asks[1][0], conditional=True),
+                component(STYLE, "instruction"), component(CITE, "instruction")]
+    agent = ScriptedAgent([SEARCH, final(F1_ANSWER), final(F1_ANSWER), final(F1_ANSWER)], judge=_judge(asks),
+                          request=analysed)
     out = _turn(agent, F1_QUESTION)
     # every datum of the shown answer carries a valid citation: the citation instruction is met
     assert all("[S1]" in line for line in out.answer.answer_markdown.splitlines() if re.search(r"\d", line)
@@ -187,7 +192,8 @@ def test_f3_a_model_not_found_sentence_beside_found_data_gives_way_to_one_precis
     asks = [("השווי למ\"ר", "9,500", []), (RATIO, None, ["V1", "V2", "F1"])]
     verdict = lambda text: "not_factual" if GAP.search(text) else "supported"  # noqa: E731
     agent = ScriptedAgent([SEARCH, take, [call("calculate", expression="V1 / V2", label=RATIO, justification=None)],
-                           final(F3_ANSWER), final(F3_ANSWER), final(F3_ANSWER)], judge=_judge(asks, verdict))
+                           final(F3_ANSWER), final(F3_ANSWER), final(F3_ANSWER)], judge=_judge(asks, verdict),
+                          request=[component(asks[0][0]), component(RATIO, "calculation")])
     out = _turn(agent, F3_QUESTION)
     md = out.answer.answer_markdown
     assert "9,500" in md
@@ -299,6 +305,9 @@ F2_ANSWER = ("לפי תכנית דמו/4521 המאושרת, ייעוד הקרק�
              "מספר יחידות הדיור המותר הוא 84 יח״ד [S1].\n"
              "מספר הקומות המותר הוא 9 קומות מעל קומת הקרקע [S1].")
 ABSENT = ("שטחים", "גובה", "קווי בניין")  # in the request's words; the manifest's ``absent`` lists the same three
+# the six items the request names, each with what gives it in the answer (None: nothing does)
+ITEMS = (("שימושים", "מסחר"), ("יח״ד", "84"), ("שטחים", None), ("גובה", None), ("קומות", "9 קומות"),
+         ("קווי בניין", None))
 
 
 @pytest.mark.db
@@ -310,10 +319,16 @@ def test_f2_a_category_partly_answered_is_never_declared_missing_and_each_absent
                                                                                              monkeypatch):
     doc = ingest_round7(office, monkeypatch, "plan_status")
     assert DOCS["plan_status"]["absent"]["section"] == PLAN_SECTION
+    # the request analysis (U2): the category, conditional on its items appearing, with a child per item; the judge
+    # scores each item and, as the trace found, the category as a whole missing
+    analysed = [component(CATEGORY, id="1", conditional=True),
+                *(component(item, id=f"1.{n}", parent="1") for n, (item, _) in enumerate(ITEMS, 1))]
     agent = ScriptedAgent([[call("outline", document=doc)], _open_section(PLAN_SECTION),
                            final(F2_ANSWER, documents=[doc]), final(F2_ANSWER, documents=[doc]),
                            final(F2_ANSWER, documents=[doc])],
-                          judge=_judge([(CATEGORY, None, ["S1"])]))
+                          judge=_judge([(CATEGORY, None, ["S1"]),
+                                        *((item, keyword, [] if keyword else ["S1"]) for item, keyword in ITEMS)]),
+                          request=analysed)
     a = _ask(client, office, monkeypatch, agent, F2_QUESTION)
     md = a["markdown"]
     assert "84" in md and "9 קומות" in md and "מסחר" in md
@@ -497,7 +512,11 @@ def test_f8_a_cost_increase_with_no_rate_given_asks_for_the_rate_and_keeps_the_f
         final(wrong, documents=[doc]),
         # a repair round, once the unrequested assumption is caught: the found values and one question
         final(ask, status="clarification", clarification="באיזה שיעור יעלו העלויות?", documents=[doc]),
-        final(ask, status="clarification", clarification="באיזה שיעור יעלו העלויות?", documents=[doc])])
+        final(ask, status="clarification", clarification="באיזה שיעור יעלו העלויות?", documents=[doc])],
+        # the request analysis (U2): a calculation resting on a rate the user did not give
+        request=[component("הרווח היזמי אם עלויות הבנייה והפיתוח יעלו", "calculation", subject=subject,
+                           parameters=[{"name": "שיעור העלייה של העלויות", "source": "not_given_by_user",
+                                        "quote": ""}])])
     a = _ask(client, office, monkeypatch, agent, "מה יהיה הרווח היזמי אם עלויות הבנייה והפיתוח יעלו?")
     md = a["markdown"]
     assert invented not in md, md

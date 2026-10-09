@@ -39,19 +39,26 @@ sentences only: a numbered heading ("9. השומה", "9.1 שיטת השומה") 
 text, a bullet or heading whose content went goes with it, and a failed table header takes its whole table, so no
 fragment or broken table is left; a partly supported unit is kept and marked.
 
-The second plane is completeness (R18–R21, KTD7), apart from correctness. What the request requires is derived by
-the judge, not taken from the parts the answer declares about itself (those are hints): the first judge call of the
-turn derives the requirements from the request as resolved in context, even when no unit reaches the judge (a
-coverage-only call), and the list is frozen in the turn's ``TurnRequirements`` with stable ids (``Q1``...). Every
-later call — the next batch, a split batch, the call for units left out, a repair round's re-judge — scores the same
-list by id: ``full``, ``partial``, ``missing`` or ``undeterminable``, with the units (or the sentences the server adds
-after verification — ``statements``) that give it or say it is missing, and the ids of what the turn found or did
+The second plane is completeness (R18–R21), apart from correctness. What the request requires is frozen before
+the answer (round 7 KTD1): the request's typed components (``app.chat.request``: information, calculation,
+instruction, assumption, clarification, with a parent, a condition and a subject), from the first turn's request
+analysis or a follow-up's resolution, become the turn's ``TurnRequirements`` with stable ids (``N1``, ``N1.2``: a
+prefix no workspace handle uses), and the judge only scores them; nothing the answer declares about itself — its
+``parts`` — removes or narrows one (R3). Only when the turn has no components (the analysis failed, timed out, was
+invalid or empty — the turn records which, ``fallback``) does the first judge call derive the requirements as in
+round 6 (KTD7), with the same typed fields and the answer's declared parts as hints, even when no unit reaches the
+judge (a coverage-only call), freezing them with the same kind of ids. Every judge call — the next batch, a split
+batch, the call for units left out, a repair round's re-judge — scores the frozen list by id: ``full``,
+``partial``, ``missing`` or ``undeterminable``, with the units (or the sentences the server adds after
+verification — ``statements``) that give it or say it is missing, and the ids of what the turn found or did
 about it (``<workspace>``: values, measurements, calculations, failed calculations and tools, searches, readings).
 Scores are merged by id; a requirement counts as given only through a unit that survived verification
-(``VerifyReport.requirement_outcomes``). A requirement not given whose data the turn already found, or that no search
-or reading covered, is a problem for the repair round (``kind="requirement"``, nothing removed); a unit or server
-sentence saying "not found" for a requirement whose values were found is removed or withdrawn. What is still missing
-is stated by the server with a reason computed from the turn (``coverage.state_parts``).
+(``VerifyReport.requirement_outcomes``). A requirement about the documents (information or calculation) not given
+whose data the turn already found, or that no search or reading covered, is a problem for the repair round
+(``kind="requirement"``, nothing removed) — an instruction, an assumption or a clarification is never sent to search
+(R4); a unit or server sentence saying "not found" for a requirement whose values were found is removed or
+withdrawn. What is still missing is stated by the server with a reason computed from the turn
+(``coverage.state_parts``).
 
 Repair rounds are cheaper (KTD10). Within a turn, verdicts are kept (``VerdictCache``) by the unit's text, the ids it
 cites with the content of each, its context (a table row's header and the line before its table; the heading above
@@ -78,6 +85,7 @@ from app.answering.verify import _NUMBER as _NUM_AT  # one reading of numbers fo
 from app.answering.verify import numbers_in
 from app.chat import meaning
 from app.chat.evidence import select
+from app.chat.request import ID_PREFIX, Kind
 from app.measurements.extract import stance_label
 from app.providers.llm import (
     CallStatus,
@@ -170,11 +178,15 @@ JUDGE_REQUIREMENTS_POLICY = (
     "\nבנוסף מצורפים הבקשה כפי שהובנה (<request>), מה שהתור מצא ובדק (<workspace>: ערכים V#, נתונים M#, חישובים "
     "C#, חישובים שנכשלו F#, כלים שנכשלו E#, חיפושים H#, וסעיפים, טבלאות או עמודים שנקראו S#) ומשפטים שהשרת יוסיף "
     "לתשובה על נתונים שלא נמצאו (<statement>).\n"
-    "דרישות הבקשה: כשמופיע <derive_requirements> — גזור מהבקשה ומהקשר השיחה את רשימת הדרישות: כל נתון, הסבר, השוואה "
-    "או חישוב שהבקשה דורשת, כל אחד פעם אחת ובמילות הבקשה, ו-calculation=true לדרישה שהיא חישוב או השוואה מספרית. "
+    "דרישות הבקשה: כשמופיע <derive_requirements> — גזור מהבקשה ומהקשר השיחה את רשימת הדרישות: כל נתון, הסבר, השוואה, "
+    "חישוב או הוראה שהבקשה דורשת, כל אחד פעם אחת ובמילות הבקשה, עם kind: information — נתון או הסבר מהמקורות; "
+    "calculation — חישוב או השוואה מספרית (וגם calculation=true); instruction — הוראה על התשובה עצמה (מראי מקום, "
+    "סגנון, מבנה, אופן הצגה), לעולם לא נתון מהמסמכים; assumption — הנחה שהמשתמש נתן; clarification — פרט שהמשתמש "
+    "צריך להשלים; ו-conditional=true לדרישה שהמשתמש ביקש רק אם היא מופיעה. "
     "<hint> הם החלקים שהתשובה הצהירה עליהם — רמז בלבד: הוסף דרישה שהם השמיטו, והשמט רמז שאינו דרישה של הבקשה; "
-    "השאר את id ריק. כשמופיעה רשימה קבועה (<requirement id=...>) — דרג כל דרישה שבה לפי ה-id שלה, ואל תוסיף, תאחד "
-    "או תנסח מחדש דרישות.\n"
+    "השאר את id ריק. כשמופיעה רשימה קבועה (<requirement id=...>, שנקבעה מהבקשה לפני התשובה; kind, parent — הדרישה "
+    "שהיא מפרטת, conditional — רק אם היא מופיעה, subject — הנושא) — דרג כל דרישה שבה לפי ה-id שלה, ואל תוסיף, תאחד, "
+    "תשמיט או תנסח מחדש דרישות.\n"
     "לכל דרישה קבע status לפי היחידות והמשפטים שבקלט זה בלבד: full — יחידות נותנות אותה במלואה; partial — רק חלק "
     "ממנה; missing — אין כאן יחידה שנותנת אותה (גם כשיחידה או משפט אומרים שהיא חסרה; דרישה שיחידותיה בקריאה אחרת — "
     "missing, והשרת מאחד בין הקריאות לפי id); undeterminable — היחידות או המקורות מראים שהמסמכים אינם מאפשרים "
@@ -185,6 +197,8 @@ JUDGE_REQUIREMENTS_POLICY = (
     "חישוב שלו — unsupported."
 )
 REQUIREMENT_STATUSES = ("full", "partial", "missing", "undeterminable")
+# the kinds of requirement that are about the documents: only these are completed from found data or searched for
+SEARCHABLE_KINDS = ("information", "calculation")
 _RANK = {s: n for n, s in enumerate(REQUIREMENT_STATUSES)}
 # a sentence saying a datum was not found ("לא נמצא", "לא נמצאו", "לא אותר")
 NOT_FOUND = re.compile(r"(?<![א-ת])לא\s+(?:נמצא|נמצאה|נמצאו|אותר|אותרה|אותרו)(?![א-ת])")
@@ -218,13 +232,15 @@ class JudgeOutput(_Strict):
 
 
 class JudgeRequirement(_Strict):
-    """A requirement of the request with its score in one judge call. The deriving call gives ``text`` and
-    ``calculation`` (the server assigns the id); a later call gives the frozen ``id``. Defaults keep a reply that
-    leaves a field out valid; the strict schema still requires every field."""
+    """A requirement of the request with its score in one judge call. A deriving call (the fallback) gives ``text``,
+    ``kind``, ``calculation`` and ``conditional`` (the server assigns the id); a scoring call gives the frozen
+    ``id``. Defaults keep a reply that leaves a field out valid; the strict schema still requires every field."""
 
     id: str = ""
     text: str = ""
     calculation: bool = False
+    kind: Kind = "information"
+    conditional: bool = False
     status: Literal["full", "partial", "missing", "undeterminable"]
     units: list[int] = Field(default_factory=list)  # the units or server statements that give it or say it is missing
     related: list[str] = Field(default_factory=list)  # the ``<workspace>`` ids about it
@@ -237,15 +253,45 @@ class JudgeCoverageOutput(JudgeOutput):
     requirements: list[JudgeRequirement] = Field(default_factory=list)
 
 
+def requirement_item(id: str, text: str, kind: str = "information", parent: str = "", conditional: bool = False,
+                     subject: str = "", parameters: list | None = None, compares: list | None = None) -> dict:
+    """One frozen requirement: a request component (``app.chat.request.freeze``) with every field present."""
+    return {"id": id, "text": text, "kind": kind, "parent": parent, "conditional": bool(conditional),
+            "subject": subject, "parameters": list(parameters or []), "compares": list(compares or []),
+            "calculation": kind == "calculation"}
+
+
 @dataclass
 class TurnRequirements:
-    """The turn's requirements (KTD7) and the failures its tools met. ``items`` is derived by the turn's first judge
-    call and then frozen: [{"id": "Q1", "text", "calculation"}]. ``incidents``: the failed calculations (``F#``) and
-    the tools that failed (``E#``), recorded by the engine as the turn runs, so a reason can name them."""
+    """The turn's requirements and the failures its tools met. ``items`` are frozen once (``derived``): adopted from
+    the request's components before the answer (``adopt``: ``origin`` ``analysis`` on a first turn, ``resolve`` on a
+    follow-up), or — when the turn has none, ``fallback`` saying why — derived by the turn's first judge call
+    (``freeze``, ``origin`` ``judge``). Each item: {"id": "N1", "text", "kind", "parent", "conditional", "subject",
+    "parameters", "compares", "calculation"}. ``incidents``: the failed calculations (``F#``) and the tools that
+    failed (``E#``), recorded by the engine as the turn runs, so a reason can name them."""
 
     items: list[dict] = field(default_factory=list)
     derived: bool = False
     incidents: list[dict] = field(default_factory=list)
+    origin: str = ""
+    fallback: str | None = None
+    decisions: list[str] = field(default_factory=list)  # the server's decisions on the components it adopted
+
+    def adopt(self, items: list[dict], origin: str, decisions: list[str] | None = None) -> None:
+        """Freeze the request's components as the turn's requirements; the judge only scores them."""
+        self.items = [requirement_item(i["id"], i["text"], i.get("kind") or "information", i.get("parent") or "",
+                                       bool(i.get("conditional")), i.get("subject") or "", i.get("parameters"),
+                                       i.get("compares")) for i in items]
+        self.derived, self.origin, self.fallback = True, origin, None
+        self.decisions = list(decisions or [])
+
+    def fall_back(self, why: str) -> None:
+        """The turn has no components (why: the analysis's or the resolution's status): the judge derives them."""
+        self.fallback = why
+
+    def record_origin(self) -> dict:
+        """Where the turn's requirements came from, and why the judge derived them when it did (no content)."""
+        return {"origin": self.origin or None, "fallback": self.fallback}
 
     def freeze(self, derived: list[JudgeRequirement]) -> list[tuple[JudgeRequirement, dict]]:
         """Freeze the derived requirements with stable ids (one per text); each with the score it came with."""
@@ -255,10 +301,12 @@ class TurnRequirements:
             if not text or text.casefold() in seen:
                 continue
             seen.add(text.casefold())
-            item = {"id": f"Q{len(self.items) + 1}", "text": text, "calculation": bool(r.calculation)}
+            kind = "calculation" if r.calculation and r.kind == "information" else r.kind
+            item = requirement_item(f"{ID_PREFIX}{len(self.items) + 1}", text, kind, conditional=r.conditional)
             self.items.append(item)
             pairs.append((r, item))
         self.derived = True
+        self.origin = self.origin or "judge"
         return pairs
 
     def record(self, name: str, arguments: str, output: str) -> None:
@@ -521,7 +569,9 @@ class VerifyReport:
                 status = "undeterminable" if any(v.status == "undeterminable" for v in absent) else "missing"
                 said = [v for v in absent if live[id(v)]]
                 stated, chosen = bool(said), said or absent
-            out.append({"id": r["id"], "text": r["text"], "calculation": r["calculation"], "status": status,
+            out.append({"id": r["id"], "text": r["text"], "calculation": r["calculation"],
+                        "kind": r.get("kind") or ("calculation" if r["calculation"] else "information"),
+                        "parent": r.get("parent") or "", "conditional": bool(r.get("conditional")), "status": status,
                         "stated": stated, "units": sorted({i for v in chosen for i in live[id(v)]}),
                         "related": list(dict.fromkeys(x for v in votes for x in v.related)),
                         "reason": chosen[0].reason if chosen else ""})
@@ -1359,8 +1409,8 @@ class _Coverage:
         out = f"\n\n<request>\n{prompt_text(self.request)}\n</request>" if self.request.strip() else "\n"
         if self.turn.derived:
             out += "\n<requirements>\n" + "\n".join(
-                f'<requirement id="{r["id"]}" calculation="{"true" if r["calculation"] else "false"}">\n'
-                f'{prompt_text(r["text"])}\n</requirement>' for r in self.turn.items) + "\n</requirements>"
+                f"<requirement {_requirement_attrs(r)}>\n{prompt_text(r['text'])}\n</requirement>"
+                for r in self.turn.items) + "\n</requirements>"
         else:
             out += "\n<derive_requirements>" + "".join(f"\n<hint>{prompt_text(h)}</hint>" for h in self.hints) \
                 + "\n</derive_requirements>"
@@ -1380,6 +1430,20 @@ class _Coverage:
         return [r.model_copy(update={"units": [i for i in r.units if i in indexes],
                                      "related": [x for x in dict.fromkeys(r.related) if x in self.known]})
                 for r in scored if r.id in ids]
+
+
+def _requirement_attrs(r: dict) -> str:
+    """A frozen requirement's attributes for the judge: its id and kind, and its parent, condition and subject when
+    it has them."""
+    kind = r.get("kind") or ("calculation" if r.get("calculation") else "information")
+    out = f'id="{prompt_attr(r["id"])}" kind="{kind}"'
+    if r.get("parent"):
+        out += f' parent="{prompt_attr(r["parent"])}"'
+    if r.get("conditional"):
+        out += ' conditional="true"'
+    if r.get("subject"):
+        out += f' subject="{prompt_attr(r["subject"])}"'
+    return out
 
 
 _SCOPE_LABELS = {"section": "סעיף", "table": "טבלה", "pages": "עמודים"}
@@ -1459,7 +1523,7 @@ def judge(provider: LLMProvider, batch: _Batch, rendered: str, usage: list[dict]
           coverage: _Coverage | None = None) -> tuple[dict[int, JudgeVerdict], str, list[JudgeRequirement]]:
     """One judge call on a rendered batch: the verdicts of the batch's units, the call's status, and — when the
     turn's requirements are in play — each requirement's score by the batch's units and the server's statements
-    (the turn's first call derives the requirements and freezes them)."""
+    (when the turn has no frozen requirements, its first call derives them and freezes them)."""
     provider = for_purpose(provider, Purpose.VERIFY)
     r = call_structured(provider, Purpose.VERIFY, JUDGE_POLICY + (JUDGE_REQUIREMENTS_POLICY if coverage else ""),
                         rendered, JudgeCoverageOutput if coverage else JudgeOutput, deadline=deadline,
@@ -1554,9 +1618,10 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                   requirements: TurnRequirements | None = None, cache: VerdictCache | None = None) -> VerifyReport:
     """Deterministic checks, then the judge on every remaining unit. ``mismatch`` says why the answer's datum is
     not the one the resolved request asked for (``app.chat.resolve.mismatch``): a problem of the whole answer,
-    for the repair round, and a note on the final answer. ``requirements``: the turn's requirements (KTD7) — derived
-    by this call's first judge call when the turn has none yet, then scored by id; without it (a check outside a
-    turn) completeness is not judged. ``statements``: the sentences the server adds after verification
+    for the repair round, and a note on the final answer. ``requirements``: the turn's requirements — frozen from the
+    request's components before the answer (KTD1), or, when the turn has none, derived by this call's first judge
+    call (the fallback) — scored by id; without it (a check outside a turn) completeness is not judged.
+    ``statements``: the sentences the server adds after verification
     (``coverage.planned_statements``), which can state a requirement missing; ``request``: the request as resolved
     in context (the question itself when there is none). ``cache``: the turn's verdicts (KTD10) — a unit judged
     before in the turn, unchanged, is not judged again. Raises ``VerificationUnavailable``."""
@@ -1685,6 +1750,8 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
     for o in report.requirement_outcomes():
         if o["status"] not in ("missing", "partial") or (o["status"] == "missing" and o["stated"]):
             continue
+        if o["kind"] not in SEARCHABLE_KINDS:
+            continue  # an instruction, an assumption or a clarification is never searched for (R4)
         ev = related_evidence(ws, o, turn)
         if ev["data"]:
             reason = REQ_DATA_FOUND.format(text=o["text"], ids=", ".join(ev["data"]))

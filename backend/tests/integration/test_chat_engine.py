@@ -52,8 +52,9 @@ def test_a_simple_first_turn_question_takes_its_agent_steps_and_one_verify_call(
     login(client, "admin-a@example.test")
     m = send(client, new_conversation(client), "מה דמי השכירות הראויים?")
     assert m["status"] == "done", m
-    # no resolve call on a first turn, no repair round: the per-call records stay one per call
-    assert [u["purpose"] for u in m["usage"]] == ["agent", "agent", "verify"]
+    # no resolve call on a first turn, no repair round: the per-call records stay one per call; the request analysis
+    # (round 7 KTD1) runs beside the first step and is recorded when it is collected, before the second
+    assert [u["purpose"] for u in m["usage"]] == ["agent", "request", "agent", "verify"]
     assert m["answer"]["verification"]["correctness"] == "verified"
 
 
@@ -77,7 +78,7 @@ def test_a_repair_round_that_changes_one_sentence_re_judges_one_unit(client, off
     a = m["answer"]
     assert "בסיכום השומה" in a["markdown"] and "גישת ההכנסות" not in a["markdown"]
     assert a["verification"]["removed"] == 0
-    assert [u["purpose"] for u in m["usage"]] == ["agent", "agent", "verify", "agent", "verify"]
+    assert [u["purpose"] for u in m["usage"]] == ["agent", "request", "agent", "verify", "agent", "verify"]
 
 
 def test_a_repair_that_changes_a_tables_column_header_re_judges_the_rows_under_it(client, office, monkeypatch):
@@ -104,6 +105,6 @@ def test_an_answer_whose_only_problem_is_a_missing_qualifier_gets_no_repair_roun
     login(client, "admin-a@example.test")
     m = send(client, new_conversation(client), "מה השווי למ\"ר?")
     a = m["answer"]
-    assert len(agent.seen) == 2 and [u["purpose"] for u in m["usage"]] == ["agent", "agent", "verify"]
+    assert len(agent.seen) == 2 and [u["purpose"] for u in m["usage"]] == ["agent", "request", "agent", "verify"]
     assert "9,500 ₪ (מ״ר בנוי ברוטו, כפי שנכתב במקור)" in a["markdown"]
     assert a["verification"]["annotated"] == 1 and a["verification"]["removed"] == 0

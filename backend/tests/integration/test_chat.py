@@ -80,7 +80,7 @@ def test_answer_from_searched_passage_is_cited_and_verified(client, office, monk
     labels = [p["step"] for p in m["progress"]]
     assert labels[:2] == ["queued", "understand"] and "search" in labels and "verify" in labels
     # the cost of the turn: token counts per model call, nothing of the content
-    assert [u["purpose"] for u in m["usage"]] == ["agent", "agent", "verify"]
+    assert [u["purpose"] for u in m["usage"]] == ["agent", "request", "agent", "verify"]  # the request analysis (round 7 KTD1) is a call of its own
     assert set(m["usage"][0]) == {"purpose", "model", "status", "input_tokens", "cached_input_tokens",
                                   "cache_write_tokens", "output_tokens", "latency_ms", "cost_usd"}
     # the model saw the passage as data inside a source tag, and only office A's
