@@ -37,9 +37,10 @@ from app.providers.llm import CallStatus, Purpose, get_provider, prompt_text, us
 
 logger = logging.getLogger(__name__)
 
-# The reader of ``inspect``: its render scales (``app.chat.tools``) and this module's prompt. A stored reading made
-# by an older one is not reused.
-INSPECT_READER_VERSION = "inspect-v1"
+# The reader of ``inspect``: its render scales (``app.chat.tools``), the frame its crop is cut in and this module's
+# prompt and checks. A stored reading made by an older one is not reused. v2: the crop is cut in the rendered page's
+# frame (rotation, CropBox offset) and the reading is checked against OCR of the crop.
+INSPECT_READER_VERSION = "inspect-v2"
 
 VISION_INSTRUCTIONS = (
     "אתה מתמלל תמונות מתוך מסמכי שמאות מקרקעין בעברית. תמלל רק את מה שכתוב בתמונה, מילה במילה, בלי לפרש, "

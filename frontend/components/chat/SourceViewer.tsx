@@ -603,7 +603,13 @@ function PageView({
     }
     return () => {
       ctrl.abort();
+      const gone = new Set(urls);
       for (const u of urls) URL.revokeObjectURL(u);
+      // a revoked image is never drawn again: its page shows as loading until the next fetch (a zoom back) lands
+      setLoads((cur) => {
+        const kept = Object.entries(cur).filter(([, l]) => !(l.state === "loaded" && gone.has(l.url)));
+        return kept.length === Object.keys(cur).length ? cur : Object.fromEntries(kept);
+      });
     };
   }, [anchor, pages, scale, onRevoked, onFailure, onStale]);
 

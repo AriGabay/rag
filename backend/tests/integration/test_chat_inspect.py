@@ -343,3 +343,23 @@ def test_a_region_is_cropped_in_the_rendered_pages_frame_like_the_region_view(of
         data, page, None, **kw))
     T.tool_inspect(ws, {"region": region})
     assert converted and cropped == [[1.0, 2.0, 3.0, 4.0]]
+
+
+def test_a_reading_stored_by_an_older_inspect_reader_is_read_again(office, monkeypatch):
+    """A region read on demand before its crop was cut in the rendered page's frame (or checked against OCR) may
+    show another place on a rotated or cropped page: the newer reader reads it again rather than reuse it."""
+    from sqlalchemy import text
+
+    from app.extraction.vision import INSPECT_READER_VERSION
+
+    doc = ingest_r1(office, monkeypatch)
+    ws = emp(office)
+    region = region_of(ws, doc)
+    T.tool_inspect(ws, {"region": region})
+    assert len(office.vision.calls) == 1
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE region_readings SET reader_version = 'inspect-v1'"))
+    assert INSPECT_READER_VERSION != "inspect-v1"
+    later = emp(office)
+    T.tool_inspect(later, {"region": region_of(later, doc)})
+    assert len(office.vision.calls) == 2

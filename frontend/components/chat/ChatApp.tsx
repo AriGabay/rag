@@ -451,6 +451,10 @@ export default function ChatApp() {
       if (depth < cur.length) {
         refocus.current = cur[depth].opener;
         commitPanels(cur.slice(0, depth));
+      } else if (depth > cur.length) {
+        // Forward into an entry of a panel already closed: the entry is renumbered to the stack actually shown,
+        // so the next open pushes above it and its close pops back here
+        window.history.replaceState({ ...(e.state ?? {}), [PANEL_DEPTH]: cur.length }, "");
       }
       if (depth === 0 && afterUnwind.current) {
         const then = afterUnwind.current;

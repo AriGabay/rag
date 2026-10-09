@@ -513,3 +513,32 @@ test.describe("a hidden answer", () => {
     expect(errors).toEqual([]);
   });
 });
+
+test.describe("panel history and zoom", () => {
+  test("Back then Forward, then opening and closing again, keeps the panels in step with history", async ({ page }) => {
+    const { viewer, id } = await openViewer(page, answerWith("הנכס נמצא בשכונה שקטה [S1]."));
+    await page.goBack();
+    await expect(viewer).toHaveCount(0);
+    await page.goForward();
+    await expect(viewer).toHaveCount(0); // a closed panel does not come back
+    await assistantMessages(page).last().locator(".cite").first().click();
+    await expect(viewer).toBeVisible();
+    await viewer.getByRole("button", { name: "סגירת תצוגת המקור" }).click();
+    await expect(viewer).toHaveCount(0); // one close pops it, though Forward had left an entry behind
+    await expect(page).toHaveURL(new RegExp(`/chat\\?c=${id}`));
+    await page.request.delete(`/api/chat/conversations/${id}`);
+  });
+
+  test("zooming in and back out shows a live page image, never a revoked one", async ({ page }) => {
+    const { viewer, id } = await openViewer(page, answerWith("הנכס נמצא בשכונה שקטה [S1]."));
+    const image = viewer.getByTestId("viewer-page-image");
+    await expect(image).toBeVisible();
+    await viewer.getByRole("button", { name: "הגדלת העמוד" }).click();
+    await expect(viewer.getByTestId("viewer-pages")).toHaveAttribute("data-scale", "zoom");
+    await viewer.getByRole("button", { name: "הקטנת העמוד" }).click();
+    await expect(viewer.getByTestId("viewer-pages")).toHaveAttribute("data-scale", "normal");
+    // every image shown after the toggle decodes: a revoked blob URL would leave it broken (naturalWidth 0)
+    await expect.poll(() => image.evaluate((el: HTMLImageElement) => el.complete && el.naturalWidth > 0)).toBe(true);
+    await page.request.delete(`/api/chat/conversations/${id}`);
+  });
+});
