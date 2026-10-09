@@ -325,14 +325,18 @@ def related_evidence(ws: Workspace, outcome: dict, turn: TurnRequirements | None
 
 
 def _uncertain_value(ws: Workspace, ids: list[str]) -> bool:
-    """A value among ``ids`` whose meaning was asserted rather than found in its source, or whose source was read
-    uncertainly."""
+    """A value among ``ids`` whose meaning was asserted rather than found in its source, whose own region stayed
+    unclear after its focused re-reads (``Value.reading``), or whose source was read uncertainly while its own
+    region was not found clear."""
     for i in ids:
         v = ws.values.get(i)
         if v is None:
             continue
         source = ws.sources.get(v.source_id)
-        if v.certainty != "verified" or (source is not None and source.status == "uncertain_reading"):
+        if v.certainty != "verified" or i in ws.uncertain_values:
+            return True
+        if (source is not None and source.status == "uncertain_reading" and v.reading != "clear"
+                and i not in ws.settled_values):
             return True
     return False
 

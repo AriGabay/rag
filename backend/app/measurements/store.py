@@ -97,15 +97,18 @@ def store_rows(conn: Connection, document_id: UUID, version_id: UUID, rows: list
             "INSERT INTO measurements (office_id, document_id, version_id, block_index, table_index, row_index,"
             " statement_key, metric, metric_kind, value, value_low, value_high, value_form, value_text, unit, period,"
             " area_basis, vat, subject, subject_role, value_role, effective_date, quote, section, extraction_version,"
-            " model, status, issues) VALUES (app_office(), :d, :v, :bi, :ti, :ri, :sk, :m, :mk, :val, :lo, :hi, :f,"
-            " :vt, :u, :p, :ab, :vat, :s, :sr, :vr, :ed, :q, :sec, :e, :model, :st, CAST(:iss AS jsonb)) RETURNING id"),
+            " model, status, issues, stated_by, stance) VALUES (app_office(), :d, :v, :bi, :ti, :ri, :sk, :m, :mk, :val,"
+            " :lo, :hi, :f, :vt, :u, :p, :ab, :vat, :s, :sr, :vr, :ed, :q, :sec, :e, :model, :st, CAST(:iss AS jsonb),"
+            " :sb, :stn) RETURNING id"),
             {"d": document_id, "v": version_id, "bi": r.block_index, "ti": r.table_index, "ri": r.row_index,
              "sk": r.statement_key, "m": r.metric[:300], "mk": r.metric_kind, "val": r.value, "lo": r.low,
              "hi": r.high, "f": r.form, "vt": r.value_text[:200], "u": r.unit, "p": r.period, "ab": r.area_basis,
              "vat": r.vat, "s": r.subject, "sr": r.subject_role, "vr": r.value_role, "ed": r.effective_date,
              "q": r.quote[:2000], "sec": r.section, "e": extraction_version, "model": model,
              "st": "needs_review" if issues else "auto_validated",
-             "iss": json.dumps(issues, ensure_ascii=False)}).scalar_one()
+             "iss": json.dumps(issues, ensure_ascii=False),
+             # who stated the value and its stance, only as the text, header or section says (U10)
+             "sb": r.stated_by[:200] if r.stated_by else None, "stn": r.stance}).scalar_one()
         entry = json.dumps([{"measurement_id": str(new_id), "value_text": r.value_text,
                              "extraction_version": extraction_version}], ensure_ascii=False)
         for m in disagreeing:

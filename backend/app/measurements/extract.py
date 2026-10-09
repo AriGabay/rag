@@ -72,6 +72,186 @@ _YEAR_WORDS = re.compile(r"לשנה|שנתי|/\s*שנה|בשנה")
 _AREA_WORDS = re.compile(r"מ[\"״']ר|מטר|למ[\"״']ר|דונם")
 
 
+# --- who stated a value, and how (KTD8, R23) -------------------------------------------------------------------
+#
+# A number in a decision is not the decision's because it appears there: the words around it say whether it was
+# adopted, or is a party's claim, a proposal or an estimate, and who stated it. These are generic Hebrew attribution
+# words; they mark what the text attests, never what a value "must" be. A section heading can attest a party's
+# position ("טענות המשיבה") but never an adoption: a decision's discussion section quotes parties' figures too.
+
+STANCES = ("adopted", "claim", "proposal", "estimate", "other", "unknown")
+STANCE_LABELS = {"adopted": "מסקנה שאומצה", "claim": "טענה", "proposal": "הצעה", "estimate": "אומדן", "other": "אחר",
+                 "unknown": "לא ידוע"}
+
+_HE = "א-ת"
+_VERB_PREFIX = rf"(?<![{_HE}])(?:ו|ש|וש|כש|וכש)?"  # never "ה": "המועד הקובע" is an adjective
+_NOUN_PREFIX = rf"(?<![{_HE}])[ובלכשמה]{{0,2}}"
+_END = rf"(?![{_HE}])"
+# verbs: their speaker is the subject before them ("המשיבה טוענת", "שמאי המשיבה קבע")
+_STANCE_VERBS = {
+    "adopted": r"נקבע|נקבעה|נקבעו|קובע|קובעת|קובעים|קבע|קבעה|קבעו|קבעתי|קבענו|הוחלט|הוחלטה|החלטתי|החלטנו|מחליט|"
+               r"מחליטה|אימץ|אימצה|אימצתי|אימצנו|מאמץ|מאמצת|מאמצים|אומץ|אומצה|מעמיד|מעמידה|העמיד|העמידה|העמדתי|"
+               r"הכרעתי|הכרענו|"
+               r"(?:מקבל|מקבלת|קיבלתי|קיבלנו)\s+את|מקובל(?:ת)?\s+עלי(?:נו)?",
+    "claim": r"טוען|טוענת|טוענים|טוענות|טען|טענה|טענו|סבור|סבורה|סבורים|דורש|דורשת|דורשים|דרש|דרשה|דרשו",
+    "proposal": r"מציע|מציעה|מציעים|הציע|הציעה|הציעו|הוצע|הוצעה|הוצעו",
+}
+# nouns: their speaker follows them ("לטענת המשיבה", "עמדת שמאי העוררת", "הצעת היזם")
+_STANCE_NOUNS = {
+    "adopted": r"הכרעה|הכרעת|הכרעתי|קביעה|קביעת|קביעתי|החלטה|החלטת|מאומץ|מאומצת",
+    # not "שיטת"/"גישת" alone: "גישת ההשוואה" is a valuation approach, not a position
+    "claim": r"טענה|טענת|טענות|טענתו|טענתה|טענתם|עמדת|עמדתו|עמדתה|עמדתם|לשיטת|לשיטתו|לשיטתה|לגישת|לגישתו|לגישתה|"
+             r"לדברי",
+    "proposal": r"הצעה|הצעת|הצעתו|הצעתה",  # not "מוצע": "המצב המוצע" is a planning scenario
+    "estimate": r"אומדן|אומדנה|אומדנו|משוער|משוערת|משוערים|תחזית|הערכה\s+גסה",
+}
+_PARTY = (r"(?:(?:שמאי|שמאית|שמאיות|שמאיי|בא\s+כוח|באת\s+כוח|באי\s+כוח|ב[\"']כ|נציג|נציגת|נציגי|מומחה|מומחית)\s+)?"
+          r"ה(?:משיב(?:ה|ים|ות)?|עורר(?:ת|ים|ות)?|מבקש(?:ת|ים|ות)?|תובע(?:ת|ים|ות)?|נתבע(?:ת|ים|ות)?|צדדים)")
+# who decides or writes: named as the speaker, never a party; standing alone, a decision maker marks an adoption
+_DECIDER = (r"ה?שמאי(?:ת)?\s+ה?מכריע(?:ה)?|ה?מכריע(?:ה)?|ועדת\s+ה?ערר|בית\s+ה?משפט|ה?החלטה|ה?הכרעה|"
+            r"ה?ועדה(?:\s+ה?מקומית)?|ה?שמאי(?:ת)?|ה?יזם|ה?כותב(?:ת)?")
+_ACTOR = re.compile(rf"(?<![{_HE}])[ובלמש]?(?P<a>{_PARTY}|{_DECIDER}){_END}")
+_ADOPTING_DECIDERS = re.compile(r"מכריע|ועדת\s+ה?ערר|בית\s+ה?משפט|החלטה|הכרעה")
+
+
+def _alternatives(words: dict[str, str], prefix: str) -> list[tuple[str, re.Pattern]]:
+    return [(stance, re.compile(rf"{prefix}(?:{w}){_END}")) for stance, w in words.items()]
+
+
+_VERBS = _alternatives(_STANCE_VERBS, _VERB_PREFIX)
+_NOUNS = _alternatives(_STANCE_NOUNS, _NOUN_PREFIX)
+_SENTENCE_END = re.compile(r"\.(?=\s|$)|[!?\n]")
+_CLAUSE_BREAK = re.compile(rf"[;:](?=\s|$)|,(?=\s)|\s[-–—]\s|(?<![{_HE}])ו?(?:אך|אולם|ואילו|אילו|לעומת|בעוד|ברם|מנגד|אלא)"
+                           rf"{_END}")
+_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
+_WORD = re.compile(rf"[{_HE}\w\"'./-]+")
+_PREFIX_LETTERS = "ובלכשמה"
+
+
+@dataclass(frozen=True)
+class Attribution:
+    """What the text around a value attests about it: the stances its words give (one, or several when a clause
+    both adopts and quotes a position), who stated it (``""``: not named, e.g. the author speaking in first person)
+    and the words that say it."""
+
+    stances: frozenset
+    stated_by: str
+    evidence: str
+
+    @property
+    def stance(self) -> str | None:
+        return next(iter(self.stances)) if len(self.stances) == 1 else None
+
+
+def _words_between(text: str) -> int:
+    return len(text.split())
+
+
+def _actor_before(text: str, at: int) -> re.Match | None:
+    """The speaker of a verb at ``at``: an actor ending at most three words before it."""
+    found = [m for m in _ACTOR.finditer(text, 0, at) if _words_between(text[m.end():at]) <= 3]
+    return found[-1] if found else None
+
+
+def _actor_after(text: str, at: int) -> re.Match | None:
+    """The speaker of a noun ending at ``at``: an actor starting at most two words after it."""
+    m = next(iter(_ACTOR.finditer(text, at)), None)
+    return m if m is not None and _words_between(text[at:m.start()]) <= 2 else None
+
+
+def _markers(text: str, adopted: bool = True) -> list[tuple[int, str, str]]:
+    """The attribution words of ``text`` in order: (position, stance, speaker). A verb takes its subject as speaker
+    and a noun the actor after it; a party's own determination is its position (a claim), never an adoption. A party
+    named with no attribution word marks its position too; a decision maker named alone marks an adoption."""
+    out: list[tuple[int, str, str]] = []
+    tied: set[int] = set()
+    for stance, rx in _VERBS:
+        for m in rx.finditer(text):
+            actor = _actor_before(text, m.start())
+            out.append((m.start(), stance, actor))
+    for stance, rx in _NOUNS:
+        for m in rx.finditer(text):
+            actor = _actor_after(text, m.end())
+            out.append((m.start(), stance, actor))
+    marks: list[tuple[int, str, str]] = []
+    for pos, stance, actor in out:
+        who = ""
+        if actor is not None:
+            tied.add(actor.start())
+            who = " ".join(actor.group("a").split())
+            if stance == "adopted" and re.fullmatch(_PARTY, who):
+                stance = "claim"
+        marks.append((pos, stance, who))
+    for m in _ACTOR.finditer(text):
+        if m.start() in tied:
+            continue
+        who = " ".join(m.group("a").split())
+        if re.fullmatch(_PARTY, who):
+            marks.append((m.start(), "claim", who))
+        elif _ADOPTING_DECIDERS.search(who):
+            marks.append((m.start(), "adopted", who))
+    if not adopted:
+        marks = [x for x in marks if x[1] != "adopted"]
+    return sorted(marks)
+
+
+def _resolve(marks: list[tuple[int, str, str]], nearest: tuple[int, str, str], evidence: str) -> Attribution:
+    named = nearest[2] or next((w for _, _, w in sorted(marks, key=lambda x: abs(x[0] - nearest[0])) if w), "")
+    return Attribution(frozenset(s for _, s, _ in marks), named, " ".join(evidence.split())[:300])
+
+
+def attribution_at(text: str, start: int, end: int) -> Attribution | None:
+    """What the words around the number at ``text[start:end]`` attest: first its own clause (since the number
+    before it), then its sentence — the words before it, else the words after it. None when neither says."""
+    text = (text or "").replace("״", '"').replace("׳", "'")
+    s0 = max((m.end() for m in _SENTENCE_END.finditer(text, 0, start)), default=0)
+    nxt = _SENTENCE_END.search(text, end)
+    s1 = nxt.start() if nxt else len(text)
+    c0 = max([s0, *(m.end() for m in _CLAUSE_BREAK.finditer(text, s0, start)),
+              *(m.end() for m in _NUMBER.finditer(text, s0, start))])
+    c1 = min([s1, *(m.start() for m in _CLAUSE_BREAK.finditer(text, end, s1)),
+              *(m.start() for m in _NUMBER.finditer(text, end, s1))])
+    for a, b in ((c0, c1), (s0, s1)):
+        before, after = _markers(text[a:start]), _markers(text[end:b])
+        if before:
+            return _resolve(before, before[-1], text[a:b])
+        if after:
+            return _resolve(after, after[0], text[a:b])
+    return None
+
+
+def attribution_in(label: str | None, *, adopted: bool) -> Attribution | None:
+    """What a heading, column header, row label or caption attests about the values under it. ``adopted``: whether
+    it may attest an adoption (a column header "הכרעה" may; a section heading may not)."""
+    text = (label or "").replace("״", '"').replace("׳", "'")
+    marks = _markers(text, adopted=adopted)
+    return _resolve(marks, marks[0], text) if marks else None
+
+
+def _variants(word: str) -> set[str]:
+    out = {word}
+    for n in (1, 2):
+        if len(word) - n >= 2 and all(c in _PREFIX_LETTERS for c in word[:n]):
+            out.add(word[n:])
+    return out
+
+
+def _tokens(text: str) -> list[str]:
+    return [w.strip("\"'.-/") for w in _WORD.findall((text or "").replace("״", '"').replace("׳", "'"))]
+
+
+def names_match(given: str | None, text: str | None) -> bool:
+    """Whether every word of ``given`` (a speaker, a scenario) is written in ``text``, allowing Hebrew prefix
+    letters on either side ("המשיבה" in "לטענת המשיבה", "מצב תכנוני קודם" in "במצב התכנוני הקודם")."""
+    wanted = [w for w in _tokens(given or "") if len(w) >= 2]
+    if not wanted:
+        return False
+    have: set[str] = set()
+    for w in _tokens(text or ""):
+        have |= _variants(w)
+    return all(_variants(w) & have for w in wanted)
+
+
 # --- model schemas --------------------------------------------------------------------------------------
 
 class _Strict(BaseModel):
@@ -257,6 +437,10 @@ class Row:
     row_index: int | None
     statement_key: str
     issues: list[str] = field(default_factory=list)
+    # who stated it and how (KTD8), only as its own words, header or section attest (``attribution_at``); None: the
+    # text does not say, or says several things
+    stated_by: str | None = None
+    stance: str | None = None
 
     @property
     def status(self) -> str:
@@ -352,14 +536,24 @@ def validate_text(ms: list[TextMeasurement], passages: dict[str, Passage]) -> li
                 issues.append("הערך לא נמצא בקטע של התיאור שלו; התנאים שלו לא שויכו")
             if p.uncertain:
                 issues.append("הטקסט נקרא מתמונה בקריאה לא ודאית")
+            said = (attribution_at(src, vpos, vpos + len(vt)) if vpos >= 0 else None) or \
+                attribution_in(p.section, adopted=False)
             rows.append(Row(
                 metric=m.metric.strip() or m.metric_quote.strip(), metric_kind=m.metric_kind,
                 value=amount.value, low=amount.low, high=amount.high, form=form, value_text=m.value_text.strip(),
                 unit=m.unit, period=period, area_basis=basis, vat=vat, subject=m.subject.strip() or None,
                 subject_role=m.subject_role, value_role=m.value_role, effective_date=m.effective_date.strip() or None,
                 quote=m.quote.strip(), section=p.section, block_index=p.block_index, table_index=None, row_index=None,
-                statement_key=f"b{p.block_index}:" + hashlib.sha1(q.encode()).hexdigest()[:10], issues=issues))
+                statement_key=f"b{p.block_index}:" + hashlib.sha1(q.encode()).hexdigest()[:10], issues=issues,
+                **_attributed(said)))
     return rows
+
+
+def _attributed(said: Attribution | None) -> dict:
+    """A measurement's optional ``stance`` and ``stated_by``: one stance the text attests, or none."""
+    if said is None or said.stance is None:
+        return {"stance": None, "stated_by": (said.stated_by or None) if said else None}
+    return {"stance": said.stance, "stated_by": said.stated_by or None}
 
 
 def numeric_cell(cell: str) -> bool:
@@ -381,6 +575,12 @@ def expand_table(a: TableAnnotation, p: Passage) -> list[Row]:
     rows = [r.get("cells") or [] for r in s.get("rows") or []]
     context = _norm(p.header_text)
     out: list[Row] = []
+    table_label = " ".join(x for x in [s.get("caption") or "", *(s.get("title") or [])] if x)
+
+    def said(key: str) -> Attribution | None:
+        """What the column header (or row label), else the caption or title, else the section says of a value."""
+        return (attribution_in(key, adopted=True) or attribution_in(table_label, adopted=True)
+                or attribution_in(p.section, adopted=False))
 
     def qualifiers(ann: Annotation) -> tuple[str, str, str | None, list[str]]:
         issues: list[str] = []
@@ -416,7 +616,8 @@ def expand_table(a: TableAnnotation, p: Passage) -> list[Row]:
             high=amount.high, form=amount.form, value_text=cell, unit=ann.unit, period=period, area_basis=basis,
             vat=vat, subject=subject, subject_role=a.subject_role, value_role=a.value_role, effective_date=None,
             quote=quote, section=p.section, block_index=p.block_index, table_index=p.table_index, row_index=r_index,
-            statement_key=f"t{p.table_index}:r{r_index}:{_cell_key(ann.key)}", issues=issues + extra))
+            statement_key=f"t{p.table_index}:r{r_index}:{_cell_key(ann.key)}", issues=issues + extra,
+            **_attributed(said(ann.key))))
 
     if a.orientation == "columns":
         cols = {}

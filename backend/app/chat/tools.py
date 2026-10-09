@@ -70,7 +70,18 @@ from app.chat import anchors, calc, meaning, reader
 from app.chat.evidence import TABLE_SIZE_PREFIX
 from app.config import get_settings
 from app.db import TenantContext, tenant_tx
-from app.measurements.extract import EXTRACTION_VERSION, PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
+from app.measurements.extract import (
+    EXTRACTION_VERSION,
+    PERIOD_LABELS,
+    STANCE_LABELS,
+    STANCES,
+    UNIT_LABELS,
+    VAT_LABELS,
+    Attribution,
+    attribution_at,
+    attribution_in,
+    names_match,
+)
 from app.platform.documents import coverage_of, reading_notes
 from app.platform.search import SearchScope, search_passages
 
@@ -209,7 +220,9 @@ class Measurement:
                 "vat": r.vat, "area_basis": r.area_basis, "subject": r.subject, "value_role": r.value_role,
                 "status": r.status, "quote": r.quote, "section": r.section, "block_index": r.block_index,
                 "table_index": r.table_index, "anchor_lost": anchor_lost(r),
-                "reading_id": getattr(r, "reading_id", None)}
+                "reading_id": getattr(r, "reading_id", None),
+                # optional (KTD8): who stated it and how, only as its text attested at extraction
+                "stated_by": getattr(r, "stated_by", None), "stance": getattr(r, "stance", None)}
 
 
 def anchor_lost(row) -> bool:
@@ -1669,6 +1682,9 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
             r = m.row
             status = measurement_status(r)
             extra = f" | נושא: {_txt(r.subject)}" if r.subject else ""
+            if getattr(r, "stance", None):
+                extra += f" | ייחוס: {STANCE_LABELS.get(r.stance, r.stance)}" + (
+                    f" של {_txt(r.stated_by)}" if getattr(r, "stated_by", None) else "")
             issues = f" | הערות: {_txt('; '.join(r.issues))}" if r.issues else ""
             if anchor_lost(r):
                 issues += " | המיקום במסמך אבד בעיבוד מחדש: הערך אינו מאומת מול הקריאה הנוכחית של המסמך"
@@ -1686,6 +1702,7 @@ MSG_VALUE_UNAVAILABLE = ("{ids}: המסמך שממנו נלקח הערך אינ�
 MSG_VALUE_STALE = ("{ids}: המסמך שממנו נלקח הערך עובד מחדש מאז שנלקח; הערך אינו תקף עוד. יש לקרוא את המקור מחדש "
                    "ולקחת את הערך שוב")
 MSG_UNCERTAIN_INPUTS = "הערכים {ids} אינם ודאיים"
+MSG_SOURCE_UNCERTAIN = "המקור נקרא בקריאה לא ודאית"
 
 
 def value_uncertain(ws: Workspace, vid: str) -> bool:
@@ -1695,7 +1712,8 @@ def value_uncertain(ws: Workspace, vid: str) -> bool:
     v = ws.values[vid]
     source = ws.sources.get(v.source_id)
     return (v.certainty != "verified" or vid in ws.uncertain_values
-            or (source is not None and source.status == "uncertain_reading" and vid not in ws.settled_values))
+            or (source is not None and source.status == "uncertain_reading" and vid not in ws.settled_values
+                and v.reading != "clear"))
 
 
 def value_status(ws: Workspace, i: str) -> str:
@@ -1869,6 +1887,13 @@ def _take_cell(ws: Workspace, conn: Connection, src: Source, full: str, loc: dic
     table_text = [st.get("caption") or "", *(st.get("title") or []), *(st.get("notes") or [])]
     # the unit of the cell, its row or its column; the table's caption or notes only when those state none
     units = meaning.units_attested(" ".join(near)) or meaning.units_attested(" ".join(table_text))
+    # where the source states the unit (R10): the cell, its row label, its column header (or the column's unit
+    # read from it), else the table's caption, title or notes
+    unit_from = next((where for where, t in (("cell", near[0]), ("row", near[1]), ("header", near[2] + " " + near[3]))
+                      if meaning.units_attested(t)), "table" if units else None)
+    # who stated it: the column header, else the row label, else the table's caption, title or notes (KTD8)
+    said = (attribution_in(header, adopted=True) or attribution_in(label, adopted=True)
+            or attribution_in(" ".join(x for x in table_text if x), adopted=True))
     return {"written": written, "value": value, "forms": forms, "quote": line,
             "qualifiers": meaning.number_qualifiers(_table_text(st, st.get("rows") or []), forms, line),
             "units": units, "vat": meaning.vat_attested("\n".join(near + table_text), forms),
@@ -1876,7 +1901,8 @@ def _take_cell(ws: Workspace, conn: Connection, src: Source, full: str, loc: dic
             "locator": {"table_index": index, "row": cells[0] if cells else "", "row_number": ri + 1,
                         "column": header, "column_number": ci + 1},
             "total": bool(calc.TOTAL_WORDS.search(meaning._norm(cells[0] if cells else ""))),
-            "table": (str(src.version_id), index),
+            "table": (str(src.version_id), index), "said": said, "context": " ".join([*near, *table_text]),
+            "meaning_from": {"unit": unit_from} if unit_from else {},
             # the cell as stored (KTD1): its box is looked up when the answer is stored, never searched for
             "anchor": {"table_index": index, "row": ri, "column": ci,
                        "pages": [p] if (p := (st.get("rows") or [])[ri].get("page")) else []}}
@@ -1929,11 +1955,15 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
     if units == {"ILS"} and meaning._PER_SQM.search(quote):
         # "השווי למ״ר ... 9,500 ₪": a per-area amount whose "למ״ר" is not next to it; either reading is the source's
         units = {"ILS", "ILS_per_sqm"}
+    # who stated it: the words of the number's own clause, else of its sentence (KTD8); never the first occurrence
+    # elsewhere — the number as quoted
+    said = attribution_at(text_, at + start, at + end)
     return {"written": written, "value": sign * value, "forms": forms, "quote": loc["quote"].strip(),
             "qualifiers": meaning.number_qualifiers(full, forms, quote),
             "units": units, "vat": meaning.vat_attested(line, forms, full),
             "kind_context": quote, "locator": {"quote": loc["quote"].strip()}, "total": False, "table": None,
-            "anchor": anchor}
+            "anchor": anchor, "said": said, "context": f"{line}\n{quote}",
+            "meaning_from": {"unit": "quote"} if units else {}}
 
 
 def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict]:
@@ -1988,6 +2018,62 @@ def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict]:
     return out, prov
 
 
+def _section_said(path: tuple) -> Attribution | None:
+    """What the value's section path attests (a party's position, never an adoption): its deepest heading that
+    says anything."""
+    return next((a for h in reversed(path) if (a := attribution_in(h, adopted=False)) is not None), None)
+
+
+def _settle_attribution(given: dict, said: Attribution | None, context: str) -> tuple[dict, dict]:
+    """Who stated the value, how, and its scenario (KTD8): what the words around it attest is the source's (and
+    fills a stance or speaker the model left unknown when the text gives one); what they do not is the model's
+    (``model_asserted``, which leaves the value uncertain). A stance the text contradicts is kept as the model's,
+    asserted, beside the text's words — never as found."""
+    stance = given.get("stance") or "unknown"
+    who = " ".join(str(given.get("stated_by") or "").split())
+    scenario = " ".join(str(given.get("scenario") or "").split())
+    named = said.stated_by if said is not None else ""
+    prov: dict[str, str] = {}
+    if said is not None and stance == "unknown" and said.stance is not None:
+        stance, prov["stance"] = said.stance, "source"
+    elif stance == "unknown":
+        prov["stance"] = "not_stated"
+    else:
+        prov["stance"] = "source" if said is not None and stance in said.stances else "model_asserted"
+    if not who:
+        if named and said is not None and said.stance is not None:
+            who, prov["stated_by"] = named, "source"
+        else:
+            prov["stated_by"] = "not_stated"
+    else:
+        prov["stated_by"] = "source" if named and names_match(who, named) else "model_asserted"
+    if not scenario:
+        prov["scenario"] = "not_stated"
+    else:
+        prov["scenario"] = "source" if names_match(scenario, context) else "model_asserted"
+    return {"stance": stance, "stated_by": who, "scenario": scenario}, prov
+
+
+def _attribution_line(value: calc.Value, said: Attribution | None) -> str:
+    """The value's attribution as the tool reports it: the stance and speaker, what was asserted, and the source's
+    own words when they say something else."""
+    p = value.provenance
+    out = f"ייחוס: {STANCE_LABELS.get(value.stance, value.stance)}" + (f" של {value.stated_by}" if value.stated_by else "")
+    if value.scenario:
+        out += f" | תרחיש/מועד: {_txt(value.scenario)}"
+    asserted = [n for k, n in (("stance", "העמדה"), ("stated_by", "מי אמר"), ("scenario", "התרחיש"))
+                if p.get(k) == "model_asserted"]
+    if asserted:
+        out += " | קביעה שלך שלא נמצאה במקור: " + ", ".join(asserted)
+    if said is not None and (p.get("stance") == "model_asserted" or p.get("stated_by") == "model_asserted"):
+        text_says = " / ".join(STANCE_LABELS[s] for s in sorted(said.stances)) + (
+            f" של {said.stated_by}" if said.stated_by else "")
+        out += f" | המקור מציג אותו כ: {text_says} («{_txt(_clip(said.evidence, 160))}»)"
+    elif value.stance == "unknown":
+        out += " (המקור אינו אומר מי קבע את הערך או אם אומץ)"
+    return out
+
+
 def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: dict | None, label: str = "") -> str:
     """Register a value of a source the turn read (V#) once the server verified that the number is the one the
     locator names: the cell at that row and column of the table, or a number inside an exact quote."""
@@ -2004,6 +2090,8 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
                           ("vat", VAT_LABELS), ("role", calc.ROLE_LABELS)):
         if given.get(name) not in allowed:
             raise ToolError(f"meaning.{name} חייב להיות אחד מ: " + ", ".join(allowed))
+    if (given.get("stance") or "unknown") not in STANCES:
+        raise ToolError("meaning.stance חייב להיות אחד מ: " + ", ".join(STANCES))
     cell = any(k in loc for k in ("table", "row", "row_number", "column", "column_number"))
     if cell == ("quote" in loc):
         raise ToolError("locator: תא בטבלה (row או row_number, ו-column או column_number; אפשר גם table) או ציטוט "
@@ -2028,6 +2116,13 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
             taken = _take_quote(src, full, loc, blocks)
             at = _value_blocks(taken.get("anchor") or {})
     fields, prov = _settle_meaning(taken, given)
+    # its section path: the block holding the number (a quote), or the table's block (a cell); else the source's
+    holder = next((r for r in rows if at is None or r.block_index in at), None)
+    path = tuple(getattr(holder, "section_path", None) or ()) or ((src.section,) if src.section else ())
+    said = taken.get("said") or _section_said(path)
+    context = "\n".join([taken.get("context") or "", *path])
+    who, prov_who = _settle_attribution(given, said, context)
+    prov |= prov_who
     # the value's own region: read clearly, or read uncertainly at ingestion (then re-read, below, at most
     # REREADS_PER_VALUE times; the same region again is served from the stored readings)
     region = [r for r in rows if at is None or r.block_index in at]
@@ -2046,18 +2141,28 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
                        src.version_id, src.reading_id or v.reading_id, src.title, src.location,
                        (label or "").strip() or default, fields["kind"], fields["unit"], fields["period"],
                        fields["vat"], fields.get("area_basis") or "", (fields.get("subject") or "").strip(),
-                       fields["role"], prov, where, taken["quote"], total, taken["table"], approx)
+                       fields["role"], prov, where, taken["quote"], total, taken["table"], approx,
+                       section=" › ".join(path), stated_by=who["stated_by"], stance=who["stance"],
+                       scenario=who["scenario"], attribution=said.evidence if said is not None else "",
+                       meaning_from=dict(taken.get("meaning_from") or {}))
     ws.values[value.vid] = value
+    # how its own region was read, on the value itself, so coverage and the stored answer see it (R28)
     if reread is not None and not reread[0]:
         ws.uncertain_values[value.vid] = reread[1]
+        value.reading, value.reading_note = "uncertain", reread[1]
     elif region:
         ws.settled_values.add(value.vid)  # its own region read clearly: another region of the source does not matter
+        value.reading = "clear"
+    elif src.status == "uncertain_reading":
+        value.reading, value.reading_note = "uncertain", MSG_SOURCE_UNCERTAIN
     stub = anchors.source_stub(src)
     if stub is not None:  # where the value is, as taken (KTD1): the source's range, narrowed to its span or cell
         extra = dict(taken.get("anchor") or {})
         pages = extra.pop("pages", None)
         stub = {k: v for k, v in stub.items() if k != "row"} | extra | {
             "kind": "cell" if cell else "quote", "reading_id": value.reading_id}
+        if value.meaning_from:  # where its meaning is stated: a cell's header is anchored with the cell (R10)
+            stub["context"] = dict(value.meaning_from)
         if pages:
             stub["pages"] = pages
         ws.anchors[value.vid] = stub
@@ -2065,12 +2170,14 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
              f"בסיס שטח: {value.area_basis}" if value.area_basis else ""]
     place = (f"שורה «{where['row']}» (מס' {where['row_number']}), עמודה «{where['column']}»" if "row" in where
              else f"ציטוט «{_clip(value.quote, 200)}»")
-    asserted = [{"unit": "יחידה", "period": "תקופה", "vat": "מע\"מ", "area_basis": "בסיס שטח", "kind": "סוג"}[k]
+    asserted = [{"unit": "יחידה", "period": "תקופה", "vat": "מע\"מ", "area_basis": "בסיס שטח", "kind": "סוג",
+                 "stance": "עמדה", "stated_by": "מי אמר", "scenario": "תרחיש"}[k]
                 for k, p in prov.items() if p == "model_asserted"]
     lines = [f"{value.vid} נרשם: «{_txt(value.label)}» = {value.written} ({'; '.join(x for x in shown if x) or 'ללא יחידה'})"
              f" | סוג: {VALUE_KINDS[value.kind]} | תפקיד: {calc.ROLE_LABELS[value.role]}"
              + (f" | נושא: {_txt(value.subject)}" if value.subject else "") + (" | שורת סה\"כ" if total else ""),
-             f"אומת ב-{sid}: {_txt(place)}"]
+             f"אומת ב-{sid}: {_txt(place)}" + (f" | סעיף: {_txt(value.section)}" if value.section else ""),
+             _attribution_line(value, said)]
     if approx:
         lines.append("המקור כותב את הערך כמקורב.")
     lines.append("ודאות: " + ("כל התכונות שצוינו נמצאו במקור" if not asserted else
@@ -2240,7 +2347,7 @@ def tool_calculate(ws: Workspace, expression: str, label: str = "", justificatio
     notes = []
     if out.approx:
         notes.append("חלק מהערכים מקורבים; התוצאה מקורבת בהתאם.")
-    asserted = [i for i in leaves if i in ws.values and ws.values[i].certainty != "verified"]
+    asserted = [i for i in leaves if i in ws.values and ws.values[i].certainty == "model_asserted"]
     if asserted:
         notes.append("ודאות נמוכה יותר: תכונות של " + ", ".join(asserted) + " נקבעו ולא נמצאו במקור.")
     lost = [i for i in leaves if i in ws.measurements and anchor_lost(ws.measurements[i].row)]
@@ -2351,7 +2458,8 @@ TOOLS = [
                          "quote": {"type": ["string", "null"], "description": "ציטוט מדויק מהמקור שהמספר בתוכו"},
                          "number": {"type": ["string", "null"], "description": "המספר כפי שנכתב"}}},
          "meaning": {"type": "object", "additionalProperties": False,
-                     "required": ["kind", "unit", "period", "vat", "area_basis", "subject", "role"],
+                     "required": ["kind", "unit", "period", "vat", "area_basis", "subject", "role", "stated_by",
+                                  "stance", "scenario"],
                      "properties": {
                          "kind": {"type": "string", "enum": list(VALUE_KINDS)},
                          "unit": {"type": "string", "enum": list(UNIT_LABELS)},
@@ -2359,7 +2467,14 @@ TOOLS = [
                          "vat": {"type": "string", "enum": list(VAT_LABELS)},
                          "area_basis": {"type": "string", "description": "בסיס השטח כפי שנכתב, או ריק"},
                          "subject": {"type": "string", "description": "הנכס, השלב, התקופה או מערך הנתונים"},
-                         "role": {"type": "string", "enum": list(calc.ROLE_LABELS)}}},
+                         "role": {"type": "string", "enum": list(calc.ROLE_LABELS)},
+                         "stated_by": {"type": "string",
+                                       "description": "מי אמר את הערך (צד, שמאי, הכרעה) כפי שכתוב סביבו, או ריק"},
+                         "stance": {"type": "string", "enum": list(STANCES),
+                                    "description": "adopted — נקבע ואומץ; claim/proposal/estimate — טענה, הצעה או "
+                                                   "אומדן; unknown — כשהטקסט אינו אומר"},
+                         "scenario": {"type": "string",
+                                      "description": "התרחיש, השלב או המועד שהערך שייך להם כפי שכתוב, או ריק"}}},
          "label": {"type": "string", "description": "שם קצר בעברית לערך, כפי שיוצג בנוסחה"}},
         ["source", "locator", "meaning", "label"]),
     _fn("assume",

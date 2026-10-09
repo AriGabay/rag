@@ -689,11 +689,36 @@ def _round(value: Decimal, places: int) -> Decimal:
     return value.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
 
 
-def fmt(value: Decimal, places: int = 2) -> str:
+DISPLAY_PLACES = 2  # decimals a result is shown with
+SMALL_PLACES = 4  # decimals for a value strictly between -1 and 1 (other than 0)
+
+
+def _places(value: Decimal, places: int = DISPLAY_PLACES) -> int:
+    return places if abs(value) >= 1 or value == 0 else max(places, SMALL_PLACES)
+
+
+def fmt(value: Decimal, places: int = DISPLAY_PLACES) -> str:
     """A value for reading: thousands separated, rounded half up, without trailing zeros."""
-    places = places if abs(value) >= 1 or value == 0 else max(places, 4)
-    s = f"{_round(value, places):,f}"
+    s = f"{_round(value, _places(value, places)):,f}"
     return s.rstrip("0").rstrip(".") if "." in s else s
+
+
+def rounding_rule(value: Decimal, dims: Dims, kind: str | None = None) -> dict:
+    """The display rule ``display`` applies to a result, exactly as ``fmt`` does it: rounded half up to
+    ``decimals`` places (``SMALL_PLACES`` for a value between -1 and 1), trailing zeros dropped, thousands
+    separated; ``percent_decimals`` for its percentage form when it has one. The breakdown view shows it next to
+    the full-precision value."""
+    shown = display(value, dims, kind)
+    out = {"rule": "half_up", "decimals": _places(value), "trailing_zeros": False, "thousands_separator": ",",
+           "percent": "percent" in shown}
+    if out["percent"]:
+        pct = value if dims == (("%", 1),) else value * 100
+        out["percent_decimals"] = _places(pct)
+    text = f"מעוגל חצי למעלה עד {out['decimals']} ספרות אחרי הנקודה, בלי אפסים בסוף"
+    if out["percent"]:
+        text += f"; האחוז עד {out['percent_decimals']} ספרות"
+    out["text"] = text
+    return out
 
 
 def display(value: Decimal, dims: Dims, kind: str | None = None) -> dict:
@@ -776,10 +801,28 @@ class Value:
     total: bool = False
     table: tuple | None = None
     approx: bool = False
+    # the section path of the block the value is in (KTD8): the judge reads a party's section as its position
+    section: str = ""
+    # who stated it, how (``extract.STANCES``) and the scenario, stage or date it belongs to; each has a
+    # ``provenance`` entry like the meaning fields: found in the text around it, or asserted by the model
+    stated_by: str = ""
+    stance: str = "unknown"
+    scenario: str = ""
+    attribution: str = ""  # the source's words that say who stated it or how ("לטענת המשיבה ..."), when found
+    meaning_from: dict = field(default_factory=dict)  # field -> where the source states it ("header", "cell", ...)
+    # how its own region was read (R28): "clear" (as ingested, or settled by a focused re-read), "uncertain" (still
+    # unclear after the re-reads, or in an uncertain reading with no region of its own), "" (not known: the source's
+    # reading status decides)
+    reading: str = ""
+    reading_note: str = ""
 
     @property
     def certainty(self) -> str:
-        return "model_asserted" if "model_asserted" in self.provenance.values() else "verified"
+        """"model_asserted": part of its meaning or attribution was asserted rather than found in its source;
+        "uncertain_reading": its region stayed unclear; otherwise "verified"."""
+        if "model_asserted" in self.provenance.values():
+            return "model_asserted"
+        return "uncertain_reading" if self.reading == "uncertain" else "verified"
 
     def operand(self) -> Operand:
         from app.chat.meaning import basis_key
@@ -795,7 +838,10 @@ class Value:
                 "unit": self.unit, "unit_label": UNIT_LABELS.get(self.unit, ""), "period": self.period,
                 "vat": self.vat, "area_basis": self.area_basis, "subject": self.subject, "role": self.role,
                 "provenance": dict(self.provenance), "certainty": self.certainty, "locator": dict(self.locator),
-                "quote": self.quote, "total": self.total, "approx": self.approx}
+                "quote": self.quote, "total": self.total, "approx": self.approx, "section": self.section,
+                "stated_by": self.stated_by, "stance": self.stance, "scenario": self.scenario,
+                "attribution": self.attribution, "meaning_from": dict(self.meaning_from), "reading": self.reading,
+                "reading_note": self.reading_note}
 
 
 @dataclass
@@ -883,5 +929,8 @@ class Computation:
                 "conditional": self.conditional, "conditions": list(self.outcome.conditional), "vat": self.vat,
                 "justification": self.justification, "note": self.note, "reproduces": self.reproduces,
                 "n": self.outcome.n,
+                # the intermediate results (the last step is the result itself), at full precision and as shown
+                "steps": [{"expression": t, "value": str(v), "display": fmt(v)} for t, v in self.outcome.steps[:-1]],
+                "rounding": rounding_rule(self.value, self.dims, self.outcome.kind),
                 # the earlier shape, for readers of stored answers
                 "operation": self.expression, "result": str(self.value)}

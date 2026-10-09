@@ -156,7 +156,12 @@ JUDGE_POLICY = (
     "תקופה או תרחיש אחרים), scenario (הנחה או תרחיש שלא הוצגו כמותנים, או לא כפי שהמשתמש ביקש), formula (פעולה, "
     "מכנה או בסיס אחוז שגויים), units (יחידה, תקופה או מע\"מ של התוצאה), framing (תוצאת חישוב שמוצגת כנתון מהמסמך "
     "או כטענת צד), part (חלק מסוים של הטענה שהמקורות אינם תומכים בו — ציין אותו בסיבה), multiple_values (כלל 6); "
-    "none — כשאין פגם כזה (למשל המקור הוצג בקטעים בלבד, כלל 5). לכל verdict אחר — none."
+    "none — כשאין פגם כזה (למשל המקור הוצג בקטעים בלבד, כלל 5). לכל verdict אחר — none. "
+    "(12) ייחוס: ערך V# ונתון M# מציינים סעיף וייחוס — מי אמר את הערך, ואם הוא מסקנה שאומצה, טענה, הצעה או "
+    "אומדן. יחידה שמציגה כקביעה, כהחלטה או כמסקנה שאומצה ערך שהראיה (הסעיף, הייחוס או הטקסט) מציגה כעמדת צד, "
+    "טענה, הצעה או אומדן — unsupported; ערך של צד שמיוחס לאותו צד — supported. הופעת המספר במסמך ההחלטה אינה "
+    "הופכת אותו להחלטה. כשהבקשה שואלת מה נקבע או אומץ, הייחוס לא ידוע ושום דבר בראיה אינו מראה שהערך אומץ — "
+    "partial (defect part), אלא אם היחידה אומרת שלא ברור אם הערך אומץ. ייחוס שסומן כקביעת המודל אינו ראיה."
 )
 DEFECTS = ("none", "input", "scenario", "formula", "units", "framing", "part", "multiple_values")
 
@@ -793,7 +798,11 @@ def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
         m = ws.measurements[sid].public()
         return (m["title"], f"נתון: {m['metric']} = {m['value_text']} (סוג: {m['metric_kind']}, יחידה: {m['unit']},"
                 f" תקופה: {m['period']}, מע\"מ: {m['vat']}, בסיס שטח: {m['area_basis'] or 'לא צוין'}, נושא: "
-                f"{m['subject'] or 'לא צוין'}, תפקיד: {m['value_role']})\nציטוט: {m['quote']}", "measurement")
+                f"{m['subject'] or 'לא צוין'}, תפקיד: {m['value_role']})"
+                + (f"\nסעיף: {m['section']}" if m.get("section") else "")
+                + (f"\nייחוס (מהטקסט): {_stance_label(m.get('stance'))}"
+                   + (f" של {m['stated_by']}" if m.get("stated_by") else "") if m.get("stance") else "")
+                + f"\nציטוט: {m['quote']}", "measurement")
     if sid in ws.values:
         v = ws.values[sid].public()
         p = v["provenance"]
@@ -804,7 +813,8 @@ def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
                 f"ערך: {v['label']} = {v['value_text']} (סוג: {v['kind']}, יחידה: {v['unit']}, תקופה: {v['period']}, "
                 f"מע\"מ: {v['vat']}, בסיס שטח: {v['area_basis'] or 'לא צוין'}, נושא: {v['subject'] or 'לא צוין'}, "
                 f"תפקיד: {v['role']}" + (f"; נקבעו ולא נמצאו במקור: {', '.join(asserted)}" if asserted else "")
-                + f")\nמקום: {where}\nציטוט: {v['quote']}", "value")
+                + ")" + (f"\nסעיף: {v['section']}" if v.get("section") else "") + "\n" + _attribution_text(v)
+                + f"\nמקום: {where}\nציטוט: {v['quote']}", "value")
     if sid in ws.assumptions:
         a = ws.assumptions[sid]
         return ("הנחת המשתמש", f"הנחה שהמשתמש נתן (לא נתון מהמסמכים): {a.label} = {a.written}"
@@ -812,6 +822,34 @@ def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
     if sid in ws.computations:
         return ("חישוב מערכת", computation_text(ws.computations[sid], ws), "computation")
     return None
+
+
+def _stance_label(stance: str | None) -> str:
+    from app.measurements.extract import STANCE_LABELS
+
+    return STANCE_LABELS.get(stance or "unknown", stance or "")
+
+
+def _attribution_text(v: dict) -> str:
+    """A value's attribution for the judge (KTD8): its stance and who stated it, each marked as found in the text
+    around it or asserted by the model, its scenario, and the source's own words that say it."""
+    p = v.get("provenance") or {}
+
+    def mark(key: str) -> str:
+        return {"source": " (נמצא במקור)", "model_asserted": " (קביעת המודל, לא נמצא במקור)"}.get(p.get(key), "")
+
+    stance = v.get("stance") or "unknown"
+    if stance == "unknown":
+        out = "ייחוס: לא ידוע — המקור אינו אומר מי קבע את הערך או אם אומץ"
+    else:
+        out = f"ייחוס: {_stance_label(stance)}{mark('stance')}"
+    if v.get("stated_by"):
+        out += f"; נאמר על ידי: {v['stated_by']}{mark('stated_by')}"
+    if v.get("scenario"):
+        out += f"; תרחיש/מועד: {v['scenario']}{mark('scenario')}"
+    if v.get("attribution"):
+        out += f"\nבמקור: «{v['attribution']}»"
+    return out
 
 
 def _input_text(x: dict, ws: Workspace | None) -> str:
@@ -1088,6 +1126,10 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
             problems.append(Problem(u, f"{framed} הוא תוצאת חישוב שהמערכת חישבה עכשיו, והתשובה מציגה אותו כאילו נכתב "
                                        "במסמך או נטען על ידי צד; הצג אותו כחישוב"))
             continue
+        misattributed = _misattributed(u, ws)
+        if misattributed:
+            problems.append(Problem(u, misattributed))
+            continue
         for reason in _vat_problems(u, ws) if u.ids else []:
             problems.append(Problem(u, reason))
         blocking = [m for m in meanings.get(u.index, []) if m.blocking]
@@ -1141,6 +1183,35 @@ def _framed_result(u: Unit, ws: Workspace) -> str | None:
         results = [c for c in computations if _shows(c, written, percent, scale, steps=False)]
         if results and not any(c.reproduces for c in results):
             return written
+    return None
+
+
+def _misattributed(u: Unit, ws: Workspace) -> str | None:
+    """A number of the unit that is a value its source attributes to a speaker as a claim, proposal or estimate
+    (stance and speaker both found in the text, never asserted), which the unit presents as adopted — by the decision,
+    a decider or adoption words — or as another speaker's, without naming the one who stated it (KTD8, R24). A party's
+    figure is never the decision's because it appears in the decision document. None when there is none; a number
+    the unit does not attribute at all is left to the judge, which sees the value's section and stance."""
+    from app.measurements.extract import attribution_at, names_match
+
+    held = [ws.values[i] for i in u.ids if i in ws.values]
+    held = [v for v in held if v.stance in ("claim", "proposal", "estimate") and v.stated_by
+            and v.provenance.get("stance") == "source" and v.provenance.get("stated_by") == "source"]
+    if not held:
+        return None
+    for written, _, _, start, end in _shown(u.text):
+        for v in held:
+            if not numbers_in(written) & numbers_in(v.written):
+                continue
+            said = attribution_at(u.text, start, end)
+            if said is None or names_match(v.stated_by, said.evidence):
+                continue
+            other = said.stated_by and not names_match(v.stated_by, said.stated_by)
+            if "adopted" in said.stances or other:
+                label = _stance_label(v.stance)
+                return (f"{written} הוא {label} של {v.stated_by} לפי המקור, והתשובה מציגה אותו כ"
+                        + (f"דברי {said.stated_by}" if other and "adopted" not in said.stances else "מה שנקבע או אומץ")
+                        + f"; ייחס אותו ל{v.stated_by}, או הצג את הערך שנקבע")
     return None
 
 
@@ -1316,7 +1387,8 @@ def _workspace_listing(ws: Workspace, turn: TurnRequirements) -> tuple[str, set[
     (E#), searches (H#, in the order made) and the sections, tables and pages read (their S#)."""
     lines: list[tuple[str, str]] = []
     for vid, v in ws.values.items():
-        note = "; תכונות שנקבעו ולא נמצאו במקור" if v.certainty != "verified" else ""
+        note = {"model_asserted": "; תכונות שנקבעו ולא נמצאו במקור",
+                "uncertain_reading": "; נקרא בקריאה לא ודאית"}.get(v.certainty, "")
         lines.append((vid, f"ערך: {v.label} = {v.written} («{v.title}»{note})"))
     for mid, m in list(ws.measurements.items())[:WORKSPACE_MEASUREMENTS]:
         pub = m.public()
