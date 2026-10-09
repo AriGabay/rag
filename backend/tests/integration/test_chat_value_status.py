@@ -319,6 +319,50 @@ def test_values_the_transcription_swapped_between_rows_both_stay_uncertain_and_t
     assert out["conditional"] is True and "V1" in out["note"] and "V2" in out["note"]
 
 
+def _garbled_cost_ocr(monkeypatch) -> None:
+    """OCR of the crop as Tesseract read the real one (U9): every header and label word junk, the numbers exact and
+    each on its row's line."""
+    from tests.integration.test_chat_inspect import script_ocr, table_words
+
+    letters = re.compile(r"[א-ת]")
+    script_ocr(monkeypatch, lambda gray: [w | {"text": "nn" + str(k)} if letters.search(w["text"]) else w
+                                          for k, w in enumerate(table_words(gray.size, PICTURE["headers"],
+                                                                            PICTURE["rows"]))])
+
+
+def test_cells_whose_headers_and_labels_ocr_garbles_are_confirmed_by_their_numbers_and_sum_unconditionally(
+        vision_office, monkeypatch):
+    doc = ingest_cost_table(vision_office, monkeypatch)
+    vision_office.vision = CostTable()
+    _garbled_cost_ocr(monkeypatch)
+    ws = emp(vision_office)
+    sid = inspect_cost_table(vision_office, ws, doc)
+    outs = [take_cost(ws, sid, "בנייה עילית"), take_cost(ws, sid, "חניון תת-קרקעי")]
+    assert all(T.STATUS_AUTO in o for o in outs), outs
+    out = json.loads(T.tool_calculate(ws, "V1 + V2", "סכום"))
+    assert out["conditional"] is False and out["value"] == COST["question_total"]["result"].replace(",", "")
+    assert ws.anchors["V1"]["vision"]["cell_box"] is not None  # highlighted at its cell
+
+
+def test_a_reading_stored_before_the_grid_placement_is_placed_from_its_stored_number_boxes(vision_office,
+                                                                                            monkeypatch):
+    doc = ingest_cost_table(vision_office, monkeypatch)
+    vision_office.vision = CostTable()
+    _garbled_cost_ocr(monkeypatch)
+    inspect_cost_table(vision_office, emp(vision_office), doc)
+    with tenant_tx(vision_office.system) as conn:  # as inspect-v3 stored it: label placement only, every cell unplaced
+        reading = conn.execute(text("SELECT reading FROM region_readings")).scalar_one()
+        ocr = reading["ocr"]
+        ocr.pop("placement", None)
+        ocr["cells"] = [[[c if c is None else {"status": "not_placed", "box": None, "by": None} for c in r] for r in t]
+                        for t in ocr["cells"]]
+        conn.execute(text("UPDATE region_readings SET reading = CAST(:r AS jsonb)"), {"r": json.dumps(reading)})
+    ws = emp(vision_office)
+    sid = inspect_cost_table(vision_office, ws, doc)
+    assert T.STATUS_AUTO in take_cost(ws, sid, "בנייה עילית")
+    assert vision_office.vision.calls == 1  # the stored reading served: nothing was read again
+
+
 def test_a_quoted_row_of_a_table_read_by_inspect_is_taken_as_its_cell(vision_office, monkeypatch):
     doc = ingest_cost_table(vision_office, monkeypatch)
     vision_office.vision = CostTable()

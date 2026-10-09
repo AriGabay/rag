@@ -576,16 +576,16 @@ def test_a_rate_the_user_asks_for_is_used_as_the_requested_assumption_with_no_fl
     assert not [p for r in rounds for p in r if p["kind"] == "input_choice"]
 
 
-def _scripted_judge(missing_without: str = "[C"):
-    """A judge that supports every unit and scores each frozen component full when a unit cites a calculation
-    (``missing_without``), else missing, naming the values the turn found as related."""
+def _scripted_judge(missing_without: str = "[C", given: str = "full"):
+    """A judge that supports every unit and scores each frozen component ``given`` (full) when a unit cites a
+    calculation (``missing_without``), else missing, naming the values the turn found as related."""
     def respond(input: str) -> dict:
         units = {int(i): t for i, t in re.findall(r'<unit index="(\d+)" cites="([^"]*)"', input)}
         raw = dict(re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S))
         out = {"verdicts": [{"index": i, "verdict": "supported", "reason": "בדיקה", "supported_by": []} for i in units]}
         if "<requirements>" in input:
             computed = [i for i, cites in units.items() if "C" in cites or missing_without in raw.get(str(i), "")]
-            out["requirements"] = [requirement(id=r, status="full" if computed else "missing", units=computed,
+            out["requirements"] = [requirement(id=r, status=given if computed else "missing", units=computed,
                                                related=[] if computed else ["V1", "V2"])
                                    for r in re.findall(r'<requirement id="([A-Z][\d.]+)"', input)]
         return out
@@ -615,6 +615,41 @@ def test_a_cost_increase_rate_the_report_states_is_computed_as_the_reports_scena
     assert a["computations"][0]["value"] == "5149000.00" and "5,149,000" in a["markdown"]
     assert [c["status"] for c in a["components"]] == ["full"] and a.get("pending") is None
     assert a["computations"][0]["explicit_amount_available"] is None
+
+
+GAP_QUESTION = "בכמה עולה הרווח היזמי שבתחשיב על הסף המינימלי הנדרש? חשב."
+# the analysis took the report's own figures for parameters of the user's (U9 evidence): document data, not a scenario
+GAP = component("הפער בין הרווח היזמי שבתחשיב לבין הסף המינימלי הנדרש", "calculation", subject=SUBJECT,
+                parameters=[{"name": "הרווח היזמי שבתחשיב", "source": "not_given_by_user", "quote": ""},
+                            {"name": "הסף המינימלי הנדרש", "source": "not_given_by_user", "quote": ""}])
+
+
+def test_a_computation_over_the_reports_figures_fills_parameters_that_were_document_data_and_nothing_is_asked(
+        client, office, monkeypatch):
+    doc = add_residual(office)
+    right = ROUND7["gap_to_threshold"]["right"]
+    answer = (f"סכום הרווח היזמי בתחשיב הוא {FACTS['profit_amount']['value']} ₪ [V1], הרווח המינימלי הנדרש "
+              f"{FACTS['threshold']['value']} ₪ [V2], והפער ביניהם הוא {right} ₪ [C1].")
+    agent = ScriptedAgent([
+        [call("outline", document=doc)], _open(CALC_SECTION), _open(CHECK_SECTION),
+        [fact("profit_amount", "S1", rmeaning("profit"), "סכום הרווח היזמי"),
+         fact("threshold", "S2", rmeaning("profit"), "הרווח המינימלי הנדרש")],
+        [call("calculate", expression="V1 - V2", label="הפער לסף", justification=None)],
+        final(answer, documents=[doc]), final(answer, documents=[doc]), final(answer, documents=[doc])],
+        judge=_scripted_judge(given="partial"), request=[GAP])  # the judge found the answer partial (U9 evidence)
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), GAP_QUESTION)
+    assert m["status"] == "done", m
+    a = m["answer"]
+    assert a["verification"]["removed"] == 0 and right in a["markdown"] and a.get("pending") is None, a
+    assert [c["status"] for c in a["components"]] == ["partial"], a["components"]
+    # the report's figures were never a detail for the user: no gap says one is missing, and no repair round was told
+    # to ask the user for one
+    assert not [g for g in a.get("gaps") or [] if g["reason"] == "detail_missing"], a.get("gaps")
+    rounds = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["rounds"]
+    asked = [p for r in rounds for p in r if p["kind"] == "requirement" and "שהמשתמש לא נתן" in p["reason"]]
+    assert not asked, asked
 
 
 def test_a_rate_nobody_gave_is_refused_as_a_literal_and_its_assumed_result_repaired_into_a_clarification(

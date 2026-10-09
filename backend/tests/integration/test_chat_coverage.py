@@ -439,6 +439,82 @@ def test_a_missing_datum_is_said_first_with_the_section_that_was_checked(client,
     assert r["status"] == "section_checked_absent" and r["section"] == "תיאור הנכס"
 
 
+def test_a_section_read_whole_through_the_paragraphs_around_a_hit_is_named_as_the_section_checked(
+        client, setup, monkeypatch):
+    """The paragraphs around a search hit (read(source)) hold every block of the hit's section: that read is a
+    complete opening of the section, so a claim that it is not there names the section (round 7 KTD4, R8, R10)."""
+    doc = _described_property(setup)
+    a, _ = _ask(client, setup, monkeypatch, [
+        [call("search", query="שטח המגרש", document_ids=[doc], limit=None)],
+        [read(source="S1")],
+        final("השטח הבנוי (נתון אחר) הוא 184 מ\"ר [S2].", documents=[doc],
+              requested=[{"label": "שטח המגרש", "document_ids": [doc], "status": "section_checked_absent",
+                          "checked_where": "S2"}])], question="מה שטח המגרש באשל 9?")
+    assert a["markdown"].endswith("\n\n**שטח המגרש** לא מופיע בסעיף \"תיאור הנכס\" שנבדק [S2].")
+    (r,) = a["requested"]
+    assert (r["status"], r["section"], r["scope"]) == ("section_checked_absent", "תיאור הנכס", "section")
+
+
+def _three_sections(office) -> tuple[str, object]:
+    """Page 1: a long section, a short one, another long one — a page window reads them in parts."""
+    doc, ver = make_document(office, office.default_group_id, "שומה רחוב הערבה 4", sha="t" * 64)
+    long_ = "תיאור מפורט של המבנה. " * 40
+    blocks = [("heading", "1. תיאור הנכס", "1. תיאור הנכס"), *[("paragraph", "1. תיאור הנכס", f"פסקה {i}: {long_}")
+                                                             for i in range(1, 5)],
+              ("heading", "2. זכויות", "2. זכויות"), ("paragraph", "2. זכויות", "הזכויות רשומות בבעלות פרטית."),
+              ("heading", "3. תחשיב", "3. תחשיב"), *[("paragraph", "3. תחשיב", f"שלב {i}: {long_}")
+                                                     for i in range(1, 5)]]
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_versions SET page_count = 1 WHERE id = :v"), {"v": ver})
+        for i, (kind, section, t) in enumerate(blocks):
+            conn.execute(text(
+                "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
+                " section_path, page, text) VALUES (app_office(), :d, :v, :b, :k, :s, :sp, 1, :t)"),
+                {"d": doc, "v": ver, "b": i, "k": kind, "s": section, "sp": [section], "t": t})
+    return str(doc), ver
+
+
+def _claim(doc: str, sid: str):
+    from app.chat.engine import Requested
+
+    return Requested(component="", label="שטח המגרש", document_ids=[doc], status="section_checked_absent",
+                     checked_where=sid)
+
+
+def test_a_page_windows_part_that_holds_a_whole_section_is_a_complete_opening_of_it(setup):
+    from app.chat import coverage
+
+    doc, _ = _three_sections(setup)
+    ws = T.Workspace(ctx=setup.ctx())
+    first = T.tool_read(ws, {"pages": {"document": doc, "from_page": 1, "to_page": 1}})
+    assert 'status="clipped"' in first and "2. זכויות" not in first
+    second = T.tool_read(ws, {"cursor": re.search(r'more="(K\d+)"', first).group(1)})
+    sid = re.search(r'<source id="(S\d+)"', second).group(1)
+    assert 'status="clipped"' in second and "הזכויות רשומות" in second  # the page is not read to its end
+    (r,) = coverage.validate_requested(ws, [_claim(doc, sid)])
+    assert (r["status"], r["section"], r["scope"], r["checked_where"]) == ("section_checked_absent", "2. זכויות",
+                                                                           "section", sid)
+    assert coverage.absence_sentence(r) == f"**שטח המגרש** לא מופיע בסעיף \"2. זכויות\" שנבדק [{sid}]."
+    # the first part holds only the start of «1. תיאור הנכס»: a part of a section opens nothing whole
+    (r,) = coverage.validate_requested(ws, [_claim(doc, "S1")])
+    assert r["status"] != "section_checked_absent"
+
+
+def test_paragraphs_around_a_hit_that_hold_only_part_of_its_section_keep_not_located(client, setup, monkeypatch):
+    from app.chat import coverage
+
+    doc, ver = _long_section(setup)
+    ws = T.Workspace(ctx=setup.ctx())
+    ws.searches.append("שטח המגרש")
+    ws.add_source(document_id=doc, version_id=ver, title="שומה רחוב השיטה 5", section="תיאור הנכס",
+                  location="סעיף", kind="text", text="פסקה 4", block_start=5, block_end=5)
+    near = T.tool_read(ws, {"source": "S1"})
+    assert 'status="clipped"' in near
+    (r,) = coverage.validate_requested(ws, [_claim(doc, "S2")])
+    assert (r["status"], r["kind"]) == ("not_found_search", "not_located")
+    assert ws.activity[doc]["openings"] == [] and ws.activity[doc]["read"] is False
+
+
 def test_a_section_claim_after_a_search_only_says_not_found_in_search(client, setup, monkeypatch):
     doc = _described_property(setup)
     a, _ = _ask(client, setup, monkeypatch, [

@@ -381,9 +381,166 @@ def test_values_the_transcription_swapped_between_rows_are_seen_by_ocr_but_not_p
     assert cells[0][0][2]["box"] is None
 
 
-def test_a_row_whose_label_ocr_cannot_locate_leaves_its_numbers_unplaced():
+def test_a_row_whose_label_ocr_cannot_locate_is_placed_by_its_numbers_grid():
     cells = I.cell_evidence(_table(), _layout(drop=("חניון", "תת-קרקעי")))
-    assert cells[0][1][2]["status"] == I.CELL_NOT_PLACED and cells[0][0][2]["status"] == I.CELL_CONFIRMED
+    assert cells[0][1][2]["status"] == I.CELL_CONFIRMED and cells[0][1][1]["status"] == I.CELL_CONFIRMED
+    expected = next(w for w in _layout() if w["text"] == "4,620,000")
+    assert cells[0][1][2]["box"] == I._box(expected)
+
+
+# The placement by the numbers' own grid (KTD6, U9 residual): Tesseract garbles Hebrew header text and the model's
+# label may differ from the drawn one, while the numbers are read once each. A cell is placed when its number lies on
+# one OCR line with another number of its transcribed row, in one x band with another number of its transcribed
+# column, the rows top to bottom and the columns in the table's reading direction (right to left for Hebrew) as the
+# transcription orders them; a line or band holding as many numbers of another row or column leaves them unplaced.
+
+JUNK = {"רכיב": "no", "עלות": "(RI)", "למ״ר": "now", "(₪)": "(Rl)", "בנייה": "nmn", "עילית": "ny",
+        "חניון": "pn", "תת-קרקעי": "ypn-nn"}
+
+
+def _garbled(rows=BODY, drop=()) -> list[dict]:
+    """The drawn table as Tesseract read the real crop: every header and label word junk, the numbers exact."""
+    return [w | {"text": JUNK.get(w["text"], w["text"])} for w in _layout(rows, drop=drop)]
+
+
+def test_garbled_header_and_label_ocr_with_exact_numbers_confirms_every_numeric_cell_with_its_box():
+    words = _garbled()
+    cells = I.cell_evidence(_table(), words)
+    for i, row in enumerate(BODY):
+        for j in (1, 2):
+            assert cells[0][i][j]["status"] == I.CELL_CONFIRMED and cells[0][i][j]["by"] == "ocr", (i, j)
+            word = next(w for w in words if w["text"] == row[j])
+            assert cells[0][i][j]["box"] == I._box(word)
+    assert cells[0][0][0] is None
+
+
+def test_values_swapped_between_rows_stay_unplaced_however_garbled_the_labels():
+    swapped = [["בנייה עילית", "6,500", "4,620,000"], ["חניון תת-קרקעי", "4,200", "15,600,000"]]
+    cells = I.cell_evidence(_table(swapped), _garbled())  # OCR sees the page as it is
+    assert cells[0][0][2]["status"] == I.CELL_NOT_PLACED and cells[0][1][2]["status"] == I.CELL_NOT_PLACED
+    assert cells[0][0][2]["box"] is None and cells[0][1][2]["box"] is None
+
+
+THREE = [["בנייה עילית", "2,410", "6,450", "15,544,500"], ["חניון תת-קרקעי", "1,130", "4,150", "4,689,500"],
+         ["פיתוח השטח", "820", "610", "500,200"]]
+
+
+def _wide(rows=THREE, junk=True) -> list[dict]:
+    """A four-column table (label and three numeric columns, right to left) on a grid, its header words junk."""
+    bands = [(1500, 1800), (1050, 1300), (600, 850), (100, 420)]
+    words = []
+    for line, row in enumerate([["רכיב", "שטח (מ״ר)", "עלות למ״ר (₪)", "עלות (₪)"], *rows]):
+        for j, text_ in enumerate(row):
+            right = bands[j][1] - 10
+            for token in text_.split():
+                width = 20 * len(token)
+                words.append(_word(JUNK.get(token, "x" + str(j)) if junk and line == 0 else token,
+                                   right - width, 60 + 120 * line, right, 97 + 120 * line))
+                right -= width + 12
+    return words
+
+
+def _wide_table(rows=THREE) -> list[I.PictureTable]:
+    return [I.PictureTable(headers=["רכיב", "שטח (מ״ר)", "עלות למ״ר (₪)", "עלות (₪)"], rows=[list(r) for r in rows])]
+
+
+def test_a_value_swapped_in_one_column_of_three_rows_leaves_only_the_two_swapped_cells_unplaced():
+    rows = [list(r) for r in THREE]
+    rows[0][3], rows[1][3] = rows[1][3], rows[0][3]
+    cells = I.cell_evidence(_wide_table(rows), _wide())
+    assert cells[0][0][3]["status"] == I.CELL_NOT_PLACED and cells[0][1][3]["status"] == I.CELL_NOT_PLACED
+    # each of their lines still holds two numbers of its own row, and the column three of its own
+    assert all(cells[0][i][j]["status"] == I.CELL_CONFIRMED for i in range(3) for j in (1, 2))
+    assert cells[0][2][3]["status"] == I.CELL_CONFIRMED
+
+
+def test_rows_transcribed_in_the_wrong_order_are_unplaced_though_each_lies_on_one_line():
+    rows = [THREE[1], THREE[0], THREE[2]]  # the model read the second row first, labels and all
+    cells = I.cell_evidence(_wide_table([[THREE[0][0], *rows[0][1:]], [THREE[1][0], *rows[1][1:]], rows[2]]),
+                            _wide())
+    assert all(cells[0][i][j]["status"] == I.CELL_NOT_PLACED for i in (0, 1) for j in (1, 2, 3))
+    assert all(cells[0][2][j]["status"] == I.CELL_CONFIRMED for j in (1, 2, 3))
+
+
+def test_columns_transcribed_left_to_right_in_a_right_to_left_table_are_unplaced():
+    headers = ["עלות (₪)", "עלות למ״ר (₪)", "שטח (מ״ר)", "רכיב"]
+    table = [I.PictureTable(headers=headers, rows=[list(reversed(r)) for r in THREE])]
+    cells = I.cell_evidence(table, _wide())
+    assert all(cells[0][i][j]["status"] != I.CELL_CONFIRMED for i in range(3) for j in (0, 1, 2))
+
+
+def test_a_label_ocr_reads_on_another_rows_line_vetoes_that_rows_placement():
+    swapped_labels = [["חניון תת-קרקעי", "6,500", "15,600,000"], ["בנייה עילית", "4,200", "4,620,000"]]
+    cells = I.cell_evidence(_table(swapped_labels), _layout())  # the labels are legible: they contradict the model
+    assert all(cells[0][i][j]["status"] == I.CELL_NOT_PLACED for i in (0, 1) for j in (1, 2))
+
+
+def test_a_number_alone_in_its_row_or_its_column_is_not_placed_by_the_grid():
+    # OCR missed 4,620,000: 4,200 is alone on its row's line, 15,600,000 alone in its column's band
+    cells = I.cell_evidence(_table(), _garbled(drop=("4,620,000",)))
+    assert cells[0][1][2]["status"] == I.CELL_NOT_SEEN
+    assert cells[0][1][1]["status"] == I.CELL_NOT_PLACED and cells[0][0][2]["status"] == I.CELL_NOT_PLACED
+    assert cells[0][0][1]["status"] == I.CELL_CONFIRMED  # on a line with 15,600,000, in a band with 4,200
+
+
+# The real crop's shape (U9 evidence, synthetic words only): Tesseract read the label header, junk for a header
+# («now»), the first word of two headers that share it with junk or nothing after it, the labels (one of them spelt
+# differently from the model's), every number once on its row's line, and a total row with a single number.
+REAL_HEAD = [("רכיב", 1628, 64, 1712, 89), ("now", 1227, 64, 1316, 89), ("עלות", 787, 58, 883, 92),
+             ("(RI)", 568, 56, 640, 96), ("עלות", 251, 58, 346, 92), ("(₪)", 160, 56, 232, 96)]
+REAL_ROWS = [["בנייה עלית", "2,350", "6,700", "15,745,000"], ["חניון תת-קרקעי", "1,050", "4,300", "4,515,000"],
+             ["פיתוח השטח", "760", "690", "524,400"], ["סה״כ", "", "", "20,784,400"]]
+REAL_TABLE = [I.PictureTable(headers=["רכיב", "שטח (מ״ר)", "עלות למ״ר (₪)", "עלות (₪)"],
+                             rows=[list(r) for r in REAL_ROWS])]
+
+
+def _real_shape() -> list[dict]:
+    words = [_word(t, x0, y0, x1, y1, 91.0) for t, x0, y0, x1, y1 in REAL_HEAD]
+    lines = [(179, 216), (301, 338), (423, 460), (545, 581)]
+    labels = [[("בנייה", 1685, 1769), ("עילית", 1569, 1664)], [("חניון", 1739, 1811), ("תת-קרקעי", 1529, 1718)],
+              [("פיתוח", 1687, 1786), ("השטח", 1557, 1665)], [("3”n0", 1618, 1722)]]
+    columns = [(1256, 116), (783, 116), (372, 237)]  # right edge, widest width: numbers right-aligned in a column
+    for i, row in enumerate(REAL_ROWS):
+        y0, y1 = lines[i]
+        words += [_word(t, x0, y0, x1, y1, 92.0) for t, x0, x1 in labels[i]]
+        for j, cell in enumerate(row[1:]):
+            if cell:
+                right, widest = columns[j]
+                width = widest * len(cell) / max(len(r[j + 1]) for r in REAL_ROWS)
+                words.append(_word(cell, right - width, y0, right, y1, 96.5))
+    return words
+
+
+def test_the_real_crops_ocr_shape_confirms_the_cost_cells_and_leaves_the_lone_total_unplaced():
+    words = I.confident_words(_real_shape())
+    cells = I.cell_evidence(REAL_TABLE, words)[0]
+    for i in range(3):
+        for j in (1, 2, 3):
+            assert cells[i][j]["status"] == I.CELL_CONFIRMED, (i, j, cells[i][j])
+    assert cells[0][3]["box"] == I._box(next(w for w in words if w["text"] == "15,745,000"))
+    # the total is the only number on its line: nothing in its row anchors it (the minimum is one other number)
+    assert cells[3][3]["status"] == I.CELL_NOT_PLACED
+
+
+def test_an_older_stored_reading_is_placed_again_from_its_stored_number_boxes():
+    reading = I.PictureReading("read", "vision", tables=REAL_TABLE, kind="table")
+    ev = I.ocr_evidence(reading, I.confident_words(_real_shape()))
+    assert ev["placement"] == I.GRID_PLACEMENT
+    # as an inspect-v3 reading stored it before the grid: no marker, the label-and-header placement's statuses
+    old = {k: v for k, v in ev.items() if k != "placement"}
+    old["cells"] = [[[c if c is None or c["status"] != I.CELL_CONFIRMED else
+                      {"status": I.CELL_NOT_PLACED, "box": None, "by": None} for c in row] for row in t]
+                    for t in ev["cells"]]
+    stored = I.PictureReading("read", "vision", tables=REAL_TABLE, kind="table", ocr=old)
+    cells = I.placed_cells(stored)[0]
+    assert cells[0][3] == ev["cells"][0][0][3] and cells[0][3]["status"] == I.CELL_CONFIRMED
+    assert cells[3][3]["status"] == I.CELL_NOT_PLACED
+    # a reading that has the marker is used as stored
+    assert I.placed_cells(I.PictureReading("read", "vision", tables=REAL_TABLE, kind="table", ocr=ev)) == ev["cells"]
+    # without OCR nothing is placed again
+    none = I.ocr_evidence(reading, None)
+    none.pop("placement")
+    assert I.placed_cells(I.PictureReading("read", "vision", tables=REAL_TABLE, ocr=none)) == none["cells"]
 
 
 def test_the_regions_text_layer_is_accepted_under_the_same_placement_test():

@@ -99,7 +99,11 @@ rate while the rate's source states the amount within its rounding interval (``C
 through later results) is a repairable ``input_choice`` problem (check ``input_choice``; the checked ids name the
 calculation, the rate and the source of the stated amount); a user's ``A#``, or a rate the user wrote, never is. A
 calculation component whose parameter the user did not give is waiting for the user (``unfilled_parameters``) until a
-user assumption or a document value applied as a rate fills it: its status is then ``needs_clarification``, the repair
+user assumption or a document value applied as a rate fills it, or a computation of the component rests only on the
+turn's document values and the user's assumptions — no literal and no unsourced number fills a scenario there, so the
+parameter was document data or the report states the scenario (the component's computations: the ``C#`` the judge
+links to it, ``VerifyReport.settle_parameters``; before the judge, any ``C#`` of the turn when it is the turn's only
+calculation component). Otherwise its status is ``needs_clarification``, the repair
 round is asked for one focused question that keeps the data found (``REQ_PARAMETER``, never "compute"), and a unit that
 presents a scenario's number neither the user nor a source gave is an unrequested assumption (kind ``assumption``,
 check ``unrequested_assumption``), repairable into a clarification. Both are removed after the repair bound as a wrong
@@ -738,6 +742,30 @@ class VerifyReport:
             if p.fails_claim:
                 first.setdefault(p.unit.index, p)
         return [first[i] for i in sorted(first)]
+
+    def settle_parameters(self, ws: Workspace) -> None:
+        """Once the judge scored the components: a calculation component whose parameters are pending is filled by a
+        computation the judge links to it (a ``C#`` it named as related, or that a unit giving it cites) that rests
+        only on document values and user assumptions (``unfilled_parameters``), so a correct computation over the
+        documents' data is never held for a detail the documents gave (KTD9)."""
+        units = {u.index: u for u in self.units}
+        by_id = {r["id"]: r for r in self.requirements}
+        for cid in list(self.pending_parameters):
+            item = by_id.get(cid)
+            if item is None:
+                continue
+            votes = self.requirement_votes.get(cid, [])
+            linked = [x for v in votes for x in v.related if x in ws.computations]
+            linked += [x for v in votes if v.status in ("full", "partial") for i in v.units if i in units
+                       for x in units[i].ids if x in ws.computations]
+            linked = list(dict.fromkeys(linked))
+            if not linked:
+                continue
+            names = unfilled_parameters(ws, item, linked)
+            if names:
+                self.pending_parameters[cid] = names
+            else:
+                del self.pending_parameters[cid]
 
     def assign_components(self) -> None:
         """Each unit problem's component (``N#``) from the judge's scores: a component the unit gave (a leaf before a
@@ -1542,11 +1570,49 @@ def _vat_problems(unit: Unit, ws: Workspace) -> list[str]:
     return [f"מע\"מ שהתשובה מייחסת ל-{x} לא נכתב לגבי ערך זה במקור" for x in dict.fromkeys(shown)][:1]
 
 
-def unfilled_parameters(ws: Workspace, item: dict) -> list[str]:
-    """The parameters of a calculation component the user did not give (KTD1) that the workspace fills with neither
-    a user assumption (``A#``) nor a value applied as a rate by one of the turn's calculations (``Computation.rates``:
-    a document's ``V#`` or ``M#`` — a rate the report itself states, say in a sensitivity section): the detail the
-    result waits for (round 7 KTD9, R25). None for any other component, or once the turn holds such a filler."""
+def rests_on_documents(ws: Workspace, cid: str, _seen: frozenset = frozenset()) -> bool:
+    """Whether a calculation of the turn rests only on registered document values (``V#``, values of an inspected
+    table included, and ``M#``) and the user's assumptions (``A#``), directly or through earlier results: no literal
+    in any of its expressions (not even a structural one), so no scenario number of its comes from anywhere else."""
+    from app.chat import calc
+
+    c = ws.computations.get(cid)
+    if c is None or cid in _seen:
+        return False
+    try:
+        node = calc.parse(c.expression)
+    except calc.CalcError:
+        return False
+
+    def literal(n) -> bool:
+        if isinstance(n, calc.Lit):
+            return True
+        if isinstance(n, calc.Pct):
+            return literal(n.node)
+        return isinstance(n, calc.Bin) and (literal(n.left) or literal(n.right))
+
+    if literal(node):
+        return False
+    return all(i in ws.values or i in ws.measurements or i in ws.assumptions
+               or (i in ws.computations and rests_on_documents(ws, i, _seen | {cid})) for i in calc.ids_of(node))
+
+
+def _only_calculation(ws: Workspace, item: dict, items: list[dict] | None = None) -> bool:
+    """Whether ``item`` is the only calculation component among ``items`` (default: the turn's frozen components)."""
+    items = items if items is not None else getattr(ws.requirements, "items", None) or []
+    others = [i for i in items if i.get("kind") == "calculation" and i.get("id") != item.get("id")]
+    return not others
+
+
+def unfilled_parameters(ws: Workspace, item: dict, linked=None, items: list[dict] | None = None) -> list[str]:
+    """The parameters of a calculation component the user did not give (KTD1) that the workspace fills with none of:
+    a user assumption (``A#``); a value applied as a rate by one of the turn's calculations (``Computation.rates``: a
+    document's ``V#`` or ``M#`` — a rate the report itself states, say in a sensitivity section); a computation of the
+    component that rests only on document values and user assumptions (``rests_on_documents``: then the parameter was
+    document data, or the report states the scenario). ``linked``: the component's computations (the ``C#`` the judge
+    links to it); None — every ``C#`` of the turn when it is the only calculation component among ``items`` (default:
+    the turn's frozen components), else none. The
+    detail the result waits for (round 7 KTD9, R25). None for any other component, or once the turn holds a filler."""
     if item.get("kind") != "calculation":
         return []
     names = [p.get("name") or "" for p in item.get("parameters") or [] if p.get("source") == "not_given_by_user"]
@@ -1556,14 +1622,20 @@ def unfilled_parameters(ws: Workspace, item: dict) -> list[str]:
     # them: the calculator never applies a literal as one
     if any(getattr(c, "rates", None) for c in ws.computations.values()):
         return []
+    if linked is None:
+        linked = list(ws.computations) if _only_calculation(ws, item, items) else []
+    if any(rests_on_documents(ws, cid) for cid in linked):
+        return []
     return names
 
 
-def pending_parameters(ws: Workspace) -> dict[str, list[str]]:
-    """Each frozen calculation component of the turn still waiting for a detail only the user can give."""
+def pending_parameters(ws: Workspace, requirements=None) -> dict[str, list[str]]:
+    """Each frozen calculation component of the turn (``requirements``, default the workspace's) still waiting for a
+    detail only the user can give."""
     out = {}
-    for item in getattr(ws.requirements, "items", None) or []:
-        names = unfilled_parameters(ws, item)
+    items = getattr(requirements if requirements is not None else ws.requirements, "items", None) or []
+    for item in items:
+        names = unfilled_parameters(ws, item, items=items)
         if names:
             out[item["id"]] = names
     return out
@@ -2034,7 +2106,7 @@ def _requirement_attrs(r: dict) -> str:
     return out
 
 
-_SCOPE_LABELS = {"section": "סעיף", "table": "טבלה", "pages": "עמודים"}
+_SCOPE_LABELS = {"section": "סעיף", "sections": "סעיפים", "table": "טבלה", "pages": "עמודים"}
 
 
 def _workspace_listing(ws: Workspace, turn: TurnRequirements) -> tuple[str, set[str]]:
@@ -2241,7 +2313,8 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     ``request``: the request as resolved in context (the question itself when there is none). ``cache``: the turn's verdicts (KTD10) — a unit judged
     before in the turn, unchanged, is not judged again. Raises ``VerificationUnavailable``."""
     units = split_units(answer.answer_markdown)
-    report = VerifyReport(units, pending_parameters=pending_parameters(ws) if requirements is not None else {})
+    report = VerifyReport(units, pending_parameters=pending_parameters(ws, requirements) if requirements is not None
+                          else {})
     coverage = None
     if requirements is not None:
         listing, known = _workspace_listing(ws, requirements)
@@ -2345,6 +2418,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         report.requirements = [dict(r) for r in requirements.items]
         for v in votes:
             report.requirement_votes.setdefault(v.id, []).append(v)
+        report.settle_parameters(ws)
         _check_requirements(report, ws, requirements)
         report.assign_components()
     return report

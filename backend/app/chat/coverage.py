@@ -35,9 +35,10 @@ table, first match wins (``reason_of``):
    wrong);
 3. a tool or provider failure tied to it (``E#``) — tool failure;
 4. a failed calculation tied to it (``F#``) — calculation not completed;
-5. a calculation resting on a parameter the user did not give, which no user assumption (``A#``) and no document
-   rate a calculation of the turn applied fills (round 7 KTD9; its status is then ``needs_clarification``), or a
-   clarification component — a detail missing from the request;
+5. a calculation resting on a parameter the user did not give, which no user assumption (``A#``), no document rate a
+   calculation of the turn applied and no computation of the component over document values and user assumptions
+   only fills (round 7 KTD9; its status is then ``needs_clarification``), or a clarification component — a detail
+   missing from the request;
 6. a calculation whose inputs were found and never computed — calculation not completed;
 7. a value found with an uncertain reading or meaning — found, not verifiable;
 8. values for the same property, kind, unit, period, basis, scenario and status that differ — sources conflict (in
@@ -47,7 +48,8 @@ table, first match wins (``reason_of``):
 10. data found that the verified answer does not present — found, not verifiable;
 11. a reading of the section, table or pages it concerns that was clipped or has an unread region, or a model claim
     validated as "read in part" — the relevant region was not fully read;
-12. a section, table or pages read to the end without it — not present in the part read (naming it, with its S#);
+12. a section, table or pages read to the end without it — not present in the part read (naming it, with its S#); a
+    read of paragraphs or pages that returned every block of a section counts as reading that section (``_openings``);
 13. a document it concerns read only in part — the relevant region was not fully read;
 14. a search or reading covered it, nothing found — not located by the searches performed;
 15. nothing covered it, after the repair bound — not located by the searches performed, saying no search covered it:
@@ -234,10 +236,10 @@ def validate_requested(ws: Workspace, requested) -> list[dict]:
     out = []
     for r in requested or []:
         docs = [d for d in r.document_ids if d in ws.activity]
-        openings = {o["sid"]: o for d in docs for o in ws.activity[d]["openings"]}
+        openings = _openings(ws, docs)
         status, where, reason = r.status, None, None
         if status == "section_checked_absent":
-            where = openings.get((r.checked_where or "").strip())
+            where = (openings.get((r.checked_where or "").strip()) or (None, None))[1]
             if where is None:
                 status = "source_partial"
             elif ws.read_complete(where.get("target")) is False:
@@ -264,6 +266,8 @@ def _place(scope: str | None, name: str | None) -> tuple[str, str, str]:
         return f"ב{name}", f"מ{name}", "הטווח"
     if scope == "table":
         return f"בטבלה \"{name}\"", f"מהטבלה \"{name}\"", "הטבלה"
+    if scope == "sections":  # several sections a read returned whole: their names, quoted
+        return f"בסעיפים {name}", f"מהסעיפים {name}", "הסעיפים"
     return f"בסעיף \"{name}\"", f"מהסעיף \"{name}\"", "הסעיף"
 
 
@@ -386,18 +390,40 @@ def _uncertain_value(ws: Workspace, ids: list[str]) -> bool:
     return any(value_uncertain(ws, i) for i in ids if i in ws.values)
 
 
-def _openings(ws: Workspace) -> dict[str, tuple[str, dict]]:
-    """S# of each section, table or page range the turn opened -> (its document, the opening)."""
-    return {o["sid"]: (doc, o) for doc, a in ws.activity.items() for o in a.get("openings") or []}
+def _openings(ws: Workspace, documents: Collection[str] | None = None) -> dict[str, tuple[str, dict]]:
+    """S# of each section, table or page range the turn opened -> (its document, the opening it counts as). A read of
+    paragraphs or pages that returned whole sections (``tools._whole_sections``, ``covers``) is an opening of those
+    sections (round 7 KTD4, R10), counted as its opening unless the read's own one is a section or a table, or a page
+    range read to its end (the broader place, as before). ``documents``: only those."""
+    def counted(own: dict, covered: dict) -> dict:
+        broader = own.get("scope") in ("section", "table") or ws.read_complete(own.get("target")) is True
+        return own if broader else covered
+
+    out: dict[str, tuple[str, dict]] = {}
+    for doc, a in ws.activity.items():
+        if documents is not None and doc not in documents:
+            continue
+        for o in a.get("openings") or []:
+            have = out.get(o["sid"])
+            if have is None:
+                out[o["sid"]] = (doc, o)
+            elif bool(have[1].get("covers")) != bool(o.get("covers")):  # the read's own opening, and what it covered
+                own, covered = (o, have[1]) if have[1].get("covers") else (have[1], o)
+                out[o["sid"]] = (doc, counted(own, covered))
+    return out
 
 
 def _missing_parameters(ws: Workspace, o: dict, ev: dict) -> list[str]:
-    """The parameters of a calculation the user did not give that the workspace fills with neither a user assumption
-    (A#) nor a document value applied as a rate (round 7 KTD9: ``verify.unfilled_parameters``; a rate the report
-    states in a sensitivity section fills it): the detail its result waits for."""
+    """The parameters of a calculation the user did not give that the workspace does not fill — with a user
+    assumption (A#), a document value applied as a rate (a rate the report states in a sensitivity section), or a
+    computation of the component over document values and user assumptions only (round 7 KTD9:
+    ``verify.unfilled_parameters``): the detail its result waits for. A verified component's own
+    ``pending_parameters`` (settled with the judge's links, ``VerifyReport.settle_parameters``) decide when present."""
     from app.chat.verify import unfilled_parameters
 
-    return list(o.get("pending_parameters") or unfilled_parameters(ws, o))
+    if "pending_parameters" in o:
+        return list(o["pending_parameters"] or [])
+    return unfilled_parameters(ws, o)
 
 
 def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict | None = None) -> dict:

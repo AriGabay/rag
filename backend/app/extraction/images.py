@@ -26,8 +26,8 @@ keeps a one-line description and only the labels that were legible.
 
 A reading made on demand during a chat turn (``inspect``) also keeps what OCR of the same crop and the region's
 text layer confirm of it (``ocr_evidence``, ``PictureReading.ocr``): per number, how often OCR saw it and where; per
-table cell, whether its number was seen once inside its row's and its column's bands (``cell_evidence``, KTD6,
-R18).
+table cell, whether its number was seen once in the cell's place — inside its row's and its column's bands, located
+by their own words or by the grid of the numbers themselves (``cell_evidence``, KTD6, R18).
 """
 
 from __future__ import annotations
@@ -639,11 +639,28 @@ def _from_ocr(gray, languages: str, note: str) -> PictureReading:
 # ``inspect`` reads a region during a chat turn: a model's transcription, which by itself verifies nothing. A cell of
 # a table it transcribed is confirmed only when an independent reading of the same pixels puts the cell's number in
 # the cell's place: OCR of the same crop (or the region's own text layer) sees the number exactly once, and that
-# word's box lies in the row band of the row's label words and the column band of its column header, both located by
-# their own word boxes in the crop. A number seen twice, not seen, or seen outside its row or column stays unconfirmed:
-# a transcription that swapped two rows' values keeps every number OCR saw and still fails here. Boxes are in the
-# OCR picture's pixels (the crop as ``_ocr_words`` enlarged it, ``ocr_upscale``); ``app.chat.anchors.page_box`` maps
-# them into the rendered page.
+# word's box is where the transcription puts it. Two placements establish that, either one enough:
+#
+# - by the labels: the box lies in the row band of the row's label words and the column band of its column header,
+#   both located by their own word boxes in the crop;
+# - by the grid of the numbers (``_grid``), which needs no header or label text (Tesseract garbles Hebrew header
+#   text, and the model's label may differ slightly from the drawn one, while the numbers are read once each): the
+#   numbers OCR saw once are grouped into OCR lines (overlapping heights) and x bands (overlapping widths). A row is
+#   placed on the line where it has more numbers than on any other, which holds more of its numbers than of any other
+#   row's, and at least two (the cell and one more: a number alone has no band but its own box, so its place would
+#   prove nothing); a column likewise on its x band. The rows' lines must run top to bottom in the transcription's
+#   row order, and the columns' bands in the table's reading direction (right to left for a Hebrew table, as the
+#   transcription lists them), or the rows or columns out of order stay unplaced. A cell is placed when its number is
+#   on its row's line and in its column's band; a number the transcription writes in two cells places neither. A label
+#   or a header the words do locate must agree: a row label read on another line, or a header over another band,
+#   leaves that row or column unplaced.
+#
+# A number seen twice, not seen, or seen outside its row or column stays unconfirmed: a transcription that swapped
+# two rows' values keeps every number OCR saw and still fails here (each swapped number lies on the other row's
+# line). Boxes are in the OCR picture's pixels (the crop as ``_ocr_words`` enlarged it, ``ocr_upscale``);
+# ``app.chat.anchors.page_box`` maps them into the rendered page. A reading stored before the grid placement
+# (``GRID_PLACEMENT`` absent from its evidence) is placed again from its stored per-number boxes when a cell is taken
+# (``placed_cells``), so no stored reading has to be read again.
 
 CELL_CONFIRMED = "confirmed"  # seen once, in the row band of its label and the column band of its header
 CELL_NOT_SEEN = "not_seen"  # OCR did not see the number
@@ -652,6 +669,10 @@ CELL_NOT_PLACED = "not_placed"  # seen once, but not in its row and column, or t
 CELL_NO_OCR = "no_ocr"  # no OCR of the crop (and no text layer confirmed it)
 PHRASE_GAP = 1.0  # a gap wider than this many word heights separates two cells on a line
 ROW_OVERLAP = 0.5  # the share of the lower of two heights a number and its row label must overlap by
+GRID_ANCHORS = 2  # numbers of a row on its line (of a column in its band), the cell's included, to place it by the grid
+# the evidence's placement: its cells were placed by the labels and by the numbers' grid (a reading stored without it
+# is placed again from its stored number boxes, ``placed_cells``)
+GRID_PLACEMENT = "labels+grid"
 
 
 def _number_key(text: str) -> str | None:
@@ -738,18 +759,136 @@ def _column_bands(headers: list[str], phrases) -> list[tuple[float, float] | Non
     return bands
 
 
-def _placements(table: PictureTable, words: list[dict]) -> list[list[dict | None]]:
-    """Each cell's evidence from one set of words (OCR of the crop, or the region's text layer)."""
-    words = _placed(words)
-    phrases = _phrases(words)
+def _row_label(row: list[str]) -> str:
+    """The cell a row is named by: its first non-empty cell that is not a number."""
+    return next((c for c in row if c.strip() and _number_key(c) is None), row[0] if row else "")
+
+
+def _rtl(table: PictureTable) -> bool:
+    """Whether a table reads right to left: its words are mostly Hebrew (a table of numbers alone reads as the
+    documents do)."""
+    words = " ".join([*table.title, *table.headers, *(c for r in table.rows for c in r)])
+    return len(re.findall(r"[א-ת]", words)) >= len(re.findall(r"[A-Za-z]", words))
+
+
+def _same_line(a: list[float], b: list[float]) -> bool:
+    return min(a[3], b[3]) - max(a[1], b[1]) >= ROW_OVERLAP * min(a[3] - a[1], b[3] - b[1])
+
+
+def _same_band(a: list[float], b: list[float]) -> bool:
+    return min(a[2], b[2]) - max(a[0], b[0]) > 0
+
+
+def _groups(boxes: dict[tuple[int, int], list[float]], same) -> dict[tuple[int, int], int]:
+    """Each cell's group: cells joined, through one another, by ``same`` on their boxes."""
+    keys = list(boxes)
+    parent = {k: k for k in keys}
+
+    def root(k):
+        while parent[k] != k:
+            parent[k] = parent[parent[k]]
+            k = parent[k]
+        return k
+
+    for x, a in enumerate(keys):
+        for b in keys[x + 1:]:
+            if same(boxes[a], boxes[b]):
+                parent[root(b)] = root(a)
+    roots: dict = {}
+    return {k: roots.setdefault(root(k), len(roots)) for k in keys}
+
+
+def _owned(group_of: dict[tuple[int, int], int], axis: int) -> dict[int, int]:
+    """Each row (``axis`` 0) or column (1) placed on a group: the group where it has the most of its numbers, more
+    than in any other group and at least ``GRID_ANCHORS``, and where no other row (column) has as many."""
+    count: dict[tuple[int, int], int] = {}
+    for cell, g in group_of.items():
+        count[(cell[axis], g)] = count.get((cell[axis], g), 0) + 1
+    out = {}
+    for who in {cell[axis] for cell in group_of}:
+        mine = sorted(((n, g) for (w, g), n in count.items() if w == who), reverse=True)
+        n, g = mine[0]
+        if n < GRID_ANCHORS or (len(mine) > 1 and mine[1][0] == n):
+            continue
+        if any(m >= n for (w, h), m in count.items() if h == g and w != who):
+            continue
+        out[who] = g
+    return out
+
+
+def _out_of_order(placed: dict[int, float], descending: bool) -> set[int]:
+    """The rows (columns) whose group's position contradicts their order in the transcription."""
+    bad = set()
+    for a in placed:
+        for b in placed:
+            if a < b and (placed[a] <= placed[b] if descending else placed[a] >= placed[b]):
+                bad |= {a, b}
+    return bad
+
+
+def _grid(table: PictureTable, hits: dict[str, list]) -> tuple[list[list[list[float] | None]], dict, dict]:
+    """The cells the numbers' own grid places (module comment): per row and cell, the confirming box or None; and
+    the line (y0, y1) of each placed row and the band (x0, x1) of each placed column. ``hits``: per number (its
+    digits), the boxes of the words OCR saw it in (None for a box not kept)."""
+    rows = table.rows
+    keys: dict[tuple[int, int], str] = {}
+    for i, row in enumerate(rows):
+        label = _row_label(row)
+        for j, cell in enumerate(row):
+            key = _number_key(cell)
+            if key is not None and cell != label:
+                keys[(i, j)] = key
+    written: dict[str, int] = {}
+    for key in keys.values():
+        written[key] = written.get(key, 0) + 1
+    boxes = {cell: hits[key][0] for cell, key in keys.items()
+             if written[key] == 1 and len(hits.get(key) or []) == 1 and hits[key][0] is not None}
+    lines, bands = _groups(boxes, _same_line), _groups(boxes, _same_band)
+    row_line, column_band = _owned(lines, 0), _owned(bands, 1)
+
+    def extent(group_of: dict, g: int, lo: int, hi: int) -> tuple[float, float]:
+        members = [boxes[c] for c, h in group_of.items() if h == g]
+        return min(b[lo] for b in members), max(b[hi] for b in members)
+
+    line_of = {i: extent(lines, g, 1, 3) for i, g in row_line.items()}
+    band_of = {j: extent(bands, g, 0, 2) for j, g in column_band.items()}
+    bad_rows = _out_of_order({i: (y0 + y1) / 2 for i, (y0, y1) in line_of.items()}, descending=False)
+    bad_columns = _out_of_order({j: (x0 + x1) / 2 for j, (x0, x1) in band_of.items()}, descending=_rtl(table))
+    out = []
+    for i, row in enumerate(rows):
+        out.append([boxes[(i, j)] if (i, j) in boxes and i not in bad_rows and j not in bad_columns
+                    and lines[(i, j)] == row_line.get(i) and bands[(i, j)] == column_band.get(j) else None
+                    for j in range(len(row))])
+    return out, {i: line_of[i] for i in line_of if i not in bad_rows}, \
+        {j: band_of[j] for j in band_of if j not in bad_columns}
+
+
+def _number_hits(words: list[dict]) -> dict[str, list[list[float]]]:
     seen: dict[str, list[list[float]]] = {}
     for w in words:
         for key in {_digits(m) for m in _NUM.findall(w["text"])} - {""}:
             seen.setdefault(key, []).append(_box(w))
+    return seen
+
+
+def _placements(table: PictureTable, words: list[dict]) -> list[list[dict | None]]:
+    """Each cell's evidence from one set of words (OCR of the crop, or the region's text layer): placed by its row
+    label and column header, or by the numbers' grid where no located label or header contradicts it."""
+    words = _placed(words)
+    phrases = _phrases(words)
+    seen = _number_hits(words)
     bands = _column_bands(table.headers, phrases)
+    grid, grid_lines, grid_bands = _grid(table, seen)
+    # a label or header the words locate where the grid does not put its row or column: the grid is not trusted there
+    vetoed_rows = {i for i, (y0, y1) in grid_lines.items()
+                   if (b := _locate(_row_label(table.rows[i]), phrases)) is not None
+                   and not _same_line(b, [0.0, y0, 0.0, y1])}
+    vetoed_columns = {j for j, (x0, x1) in grid_bands.items()
+                      if j < len(table.headers) and table.headers[j].strip()
+                      and (b := _locate(table.headers[j], phrases)) is not None and not _same_band(b, [x0, 0.0, x1, 0.0])}
     out = []
-    for row in table.rows:
-        label = next((c for c in row if c.strip() and _number_key(c) is None), row[0] if row else "")
+    for i, row in enumerate(table.rows):
+        label = _row_label(row)
         row_box = _locate(label, phrases)
         cells: list[dict | None] = []
         for j, cell in enumerate(row):
@@ -769,7 +908,8 @@ def _placements(table: PictureTable, words: list[dict]) -> list[list[dict | None
             in_row = row_box is not None and (min(box[3], row_box[3]) - max(box[1], row_box[1])
                                               >= ROW_OVERLAP * min(box[3] - box[1], row_box[3] - row_box[1]))
             in_column = band is not None and band[0] <= (box[0] + box[2]) / 2 <= band[1]
-            cells.append({"status": CELL_CONFIRMED, "box": box, "by": None} if in_row and in_column
+            by_grid = grid[i][j] is not None and i not in vetoed_rows and j not in vetoed_columns
+            cells.append({"status": CELL_CONFIRMED, "box": box, "by": None} if (in_row and in_column) or by_grid
                          else {"status": CELL_NOT_PLACED, "box": None, "by": None})
         out.append(cells)
     return out
@@ -812,12 +952,10 @@ def cell_evidence(tables: list[PictureTable], words: list[dict] | None,
 def ocr_evidence(reading: PictureReading, words: list[dict] | None, layer: list[dict] | None = None) -> dict:
     """What OCR of the crop (``words``: confident words with boxes; None: no OCR) and the region's text layer confirm
     of an on-demand reading: per transcribed number, how many times OCR saw it and, when once, where; per table
-    cell, ``cell_evidence``. Kept in the stored reading (``PictureReading.ocr``)."""
+    cell, ``cell_evidence``, placed by the labels and the numbers' grid (``placement``). Kept in the stored reading
+    (``PictureReading.ocr``)."""
     texts = [reading.text, *[c for t in reading.tables for r in [t.headers, *t.rows] for c in r]]
-    found: dict[str, list[list[float]]] = {}
-    for w in _placed(words):
-        for key in {_digits(m) for m in _NUM.findall(w["text"])} - {""}:
-            found.setdefault(key, []).append(_box(w))
+    found = _number_hits(_placed(words))
     numbers, keys = [], set()
     for t in texts:
         for written in _NUM.findall(t or ""):
@@ -829,4 +967,31 @@ def ocr_evidence(reading: PictureReading, words: list[dict] | None, layer: list[
             numbers.append({"number": key, "text": written, "seen": len(hits),
                             "box": hits[0] if len(hits) == 1 else None})
     return {"available": words is not None, "numbers": numbers,
-            "cells": cell_evidence(reading.tables, words, layer)}
+            "cells": cell_evidence(reading.tables, words, layer), "placement": GRID_PLACEMENT}
+
+
+def placed_cells(reading: PictureReading) -> list:
+    """The per-cell evidence of a stored on-demand reading (``ocr_evidence``'s ``cells``). A reading stored before the
+    numbers' grid placed cells (no ``placement``) is placed again from its stored per-number OCR boxes: a cell its
+    labels left unplaced is confirmed when the grid places it (``_grid``; the labels' words were not stored, so only
+    the grid's own checks apply). Nothing else changes: a number not seen, seen twice or without OCR stays so."""
+    ocr = reading.ocr or {}
+    cells = ocr.get("cells") or []
+    if ocr.get("placement") or not ocr.get("available"):
+        return cells
+    hits = {n["number"]: [n.get("box")] if n.get("seen") == 1 else [None] * int(n.get("seen") or 0)
+            for n in ocr.get("numbers") or []}
+    out = []
+    for ti, stored in enumerate(cells):
+        if ti >= len(reading.tables):
+            out.append(stored)
+            continue
+        grid, _, _ = _grid(reading.tables[ti], hits)
+        rows = []
+        for i, row in enumerate(stored):
+            rows.append([{"status": CELL_CONFIRMED, "box": grid[i][j], "by": "ocr"}
+                         if cell is not None and cell.get("status") == CELL_NOT_PLACED and i < len(grid)
+                         and j < len(grid[i]) and grid[i][j] is not None else cell
+                         for j, cell in enumerate(row)])
+        out.append(rows)
+    return out

@@ -74,6 +74,21 @@ def test_the_policy_states_the_kinds_and_the_rules_the_model_is_held_to():
     assert R.COMPONENTS_POLICY in R.POLICY and R.COMPONENTS_POLICY in resolve.POLICY
 
 
+def test_the_policy_makes_a_parameter_only_what_the_user_decides_never_a_datum_of_the_documents():
+    """A parameter is what only the user can decide for the calculation (a scenario's rate or change, a period, a
+    choice between alternatives); a datum expected in the documents (an amount, a threshold, a profit the calculation
+    takes from the report) is never one, even when the calculation depends on it and the request names it (U9: the
+    analysis marked "the developer profit in the calculation" and "the minimal required threshold" as parameters)."""
+    rule = R.COMPONENTS_POLICY[R.COMPONENTS_POLICY.index("- parameters"):]
+    rule = " ".join(rule[:rule.index("\n- ", 1)].split())
+    assert "רק מה שהמשתמש עצמו צריך להחליט" in rule
+    for example in ("שיעור או שינוי של תרחיש", "תקופה", "בחירה בין חלופות"):
+        assert example in rule
+    assert "נתון שאמור להימצא במסמכים לעולם אינו parameter" in rule
+    assert "וגם כשהבקשה נוקבת בו בשמו" in rule
+    assert R.COMPONENTS_POLICY in resolve.POLICY  # a follow-up's resolution is held to the same rule
+
+
 def test_distinguishing_statuses_is_one_information_and_one_instruction_component():
     a = _analyze([component("הסטטוס של כל נתון בתכנית: מאושר, מוצע או הנחת השמאי"),
                   component("הצגה ברורה של הסטטוס ליד כל נתון", "instruction")],

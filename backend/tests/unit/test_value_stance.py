@@ -172,6 +172,30 @@ def test_a_stance_and_speaker_the_text_does_not_give_are_asserted_not_verified(d
     assert "לא נמצא במקור" in body
 
 
+def test_a_stance_the_source_says_nothing_about_tells_the_model_to_take_it_again_unknown(decision):
+    """The model's own stance or speaker, where the words around the number say nothing of who stated it or how
+    (U9: a cost table taken as "estimate"): the value stays uncertain, and the tool says plainly that the source
+    does not state it and how to take it again; the re-take with stance unknown and no speaker is verified."""
+    out = T.tool_take_value(decision.ws, decision.sid, _quote(PLAIN_TEXT, "210"),
+                            _meaning(stance="estimate", stated_by="השמאי"), "שווי")
+    assert decision.ws.values["V1"].certainty == "model_asserted" and T.STATUS_UNCERTAIN in out
+    assert T.MSG_ATTRIBUTION_UNSTATED in out
+    again = T.tool_take_value(decision.ws, decision.sid, _quote(PLAIN_TEXT, "210"), _meaning(), "שווי")
+    assert decision.ws.values["V2"].certainty == "verified" and T.STATUS_AUTO in again
+    assert T.MSG_ATTRIBUTION_UNSTATED not in again
+    # where the source does say who stated it, the tool shows its words instead (and never this hint)
+    other = T.tool_take_value(decision.ws, decision.sid, _quote(CLAIM_TEXT, "200"), _meaning(stance="adopted"), "שווי")
+    assert T.MSG_ATTRIBUTION_UNSTATED not in other and "המשיבה" in other
+
+
+def test_the_take_value_schema_says_to_leave_stance_and_speaker_unknown_unless_the_source_states_them():
+    tool = next(t for t in T.TOOLS if t["name"] == "take_value")
+    props = tool["parameters"]["properties"]["meaning"]["properties"]
+    for key in ("stance", "stated_by"):
+        description = props[key]["description"]
+        assert "המילים המצוטטות" in description and "כותרת השורה או העמודה" in description and "הסעיף" in description
+
+
 def test_an_unknown_stance_with_no_attribution_words_stays_unknown_and_certain(decision):
     v = _take(decision, PLAIN_TEXT, "210")
     assert v.stance == "unknown" and v.provenance["stance"] == "not_stated" and v.certainty == "verified"

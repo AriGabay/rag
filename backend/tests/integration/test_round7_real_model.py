@@ -14,8 +14,9 @@ file under ``real_documents/eval/round7/u9-real-model/`` (gitignored, private: a
 Opt in with ``-m real_model``; skipped without a key. Host only, against ``rag_test`` (``tests/conftest.py`` guard).
 
 Environment note: ingestion runs without OCR or vision (R7c's picture stays an unread region the turn must inspect).
-The turn's crop OCR, which confirms a visual reading's cells by locating each row's label and each column's header,
-needs Hebrew: when the host's Tesseract lacks it, the backend image's Tesseract is called for the crop (``crop_ocr``)."""
+The turn's crop OCR, which confirms a visual reading's cells in their place (by each row's label and each column's
+header, or by the grid of the numbers themselves), is run with Hebrew: when the host's Tesseract lacks it, the backend
+image's Tesseract is called for the crop (``crop_ocr``)."""
 
 from __future__ import annotations
 
@@ -429,12 +430,6 @@ def test_a_partly_found_category_states_only_its_missing_items(chat, office, mon
     cases.check()
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "U9 residual: real Tesseract (heb+eng, the backend image's) places none of R7c's cells — two headers garble "
-    "('שטח (מ״ר)' -> 'now', '(₪)' -> '(RI)'), 'עלות' starts two headers so the cost column is ambiguous, and the "
-    "vision label 'בנייה עלית' differs from the drawn 'עילית' — so every cell stays not_placed and the sum is "
-    "conditional. Placement rests on locating header and row-label text (images._placements); changing what "
-    "confirms a cell is a verification decision left to the user."))
 def test_an_inspected_image_table_feeds_a_non_conditional_computation_anchored_to_the_table(chat, office,
                                                                                             monkeypatch):
     ingest(office, monkeypatch, "cost_table_image")

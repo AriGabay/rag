@@ -298,9 +298,10 @@ class Workspace:
     prior: dict[str, dict] = field(default_factory=dict)  # P# -> {version_id, block_start, block_end, chunk_id}
     searches: list[str] = field(default_factory=list)
     coverage: list[dict] = field(default_factory=list)
-    # document id -> {"title", "level", "read", "partial", "openings": [{"sid", "scope", "name"}]}: how deep the
-    # turn's tools reached into each document (``LEVELS``), whether a section or table of it was read, and the
-    # sections and tables they opened
+    # document id -> {"title", "level", "read", "partial", "openings": [{"sid", "scope", "name", "target"}]}: how deep
+    # the turn's tools reached into each document (``LEVELS``), whether a section or table of it was read, and the
+    # sections, tables and page ranges they opened — and the sections a read of paragraphs or pages returned whole
+    # (``covers``, ``_whole_sections``; several sections: scope ``sections``, ``name`` their quoted names)
     activity: dict[str, dict] = field(default_factory=dict)
     # the set a question is about: {"query", "matching": [{document_id, title}], "pages", "pages_read"}
     scope: dict | None = None
@@ -1198,8 +1199,50 @@ def _read_window(ws: Workspace, conn: Connection, v: reader.Version, target: tup
         if paths:
             lines.append("סעיפים בעמודים האלה: " + "; ".join(
                 f"{_section_handle(ws, v, p, w)} «{_section_name(p)}»" for p, w in list(paths)[:SECTIONS_LISTED]))
-    return _emit(ws, v, target, pos, part, name=name, scope=target[0], location=location, section=section,
-                 lines=lines, read=True, unread_pages=unread_pages if pos is None else None, cx=cx)
+    s = _emit(ws, v, target, pos, part, name=name, scope=target[0], location=location, section=section,
+              lines=lines, read=True, unread_pages=unread_pages if pos is None else None, cx=cx)
+    if target[0] == "pages":  # a section opened by name is its own opening
+        _whole_sections(ws, conn, v, cx, part, s)
+    return s
+
+
+def _whole_sections(ws: Workspace, conn: Connection, v: reader.Version, cx, part: reader.Part, s: Source) -> None:
+    """The sections a read of paragraphs or pages (``read(source)``, a page window or its cursor) returned whole: every
+    block of the section, from its start to its end in the stored outline and within one appraisal context, among
+    the blocks this read returned in full. Such a read is a complete opening of those sections (round 7 KTD4, R8,
+    R10): it is recorded as an opening of the read's S# (``covers``: the broadest such sections, by name), so a claim
+    that a datum is not there names them (``coverage._openings``). A part of a section opens nothing whole."""
+    whole = {r.block_index for r, _, full in part.items if full}
+    if not whole:
+        return
+    candidates: dict[tuple, None] = {}
+    for r, _, _ in part.items:
+        path = reader.effective_path(cx, r.block_index, r.section_path)
+        for i in range(1, len(path) + 1):
+            candidates.setdefault((path[:i], reader.section_window(cx, r.block_index, path[:i])), None)
+    covered = []
+    for path, window in candidates:
+        if any(len(p) < len(path) and path[:len(p)] == p and w == window for p, w, _ in covered):
+            continue  # inside a section already covered whole: the broader one is named
+        blocks = reader.blocks_in_section(conn, v.version_id, path, None, window)
+        if blocks and {b.block_index for b in blocks} <= whole:
+            covered = [c for c in covered if not (len(path) < len(c[0]) and c[0][:len(path)] == path
+                                                  and c[1] == window)]
+            covered.append((path, window, blocks))
+    if not covered:
+        return
+    names = []
+    for path, window, _ in covered:
+        later = window is not None and cx is not None and cx.multi and cx.segment_at(window[0]) is not cx.segments[0]
+        names.append(_section_name(path, later))
+    targets = tuple(_section_target(v, path, window) for path, window, _ in covered)
+    target = targets[0] if len(targets) == 1 else ("sections", str(v.version_id), targets)
+    unread = any(b.status == reader.UNREAD for _, _, blocks in covered for b in blocks)
+    name = names[0] if len(names) == 1 else (", ".join(f'"{n}"' for n in names[:-1]) + f' ו"{names[-1]}"')
+    ws.touch(v.document_id, v.title, "read", v.partial,
+             {"sid": s.sid, "scope": "section" if len(names) == 1 else "sections", "name": name, "target": target,
+              "covers": True})
+    ws.read_progress(target, None, None, str(v.document_id), unread)
 
 
 def _foreign_rows(ws: Workspace, conn: Connection, v: reader.Version, cx, window: tuple[int, int]) -> list[str]:
@@ -1368,6 +1411,7 @@ def _read_source(ws: Workspace, conn: Connection, sid: str) -> Source:
               location=_location(section, "text", pages, None, None, (None, None), None), section=section,
               lines=lines, read=False, more=_section_handle(ws, v, path, window(path)) if cut and path else None,
               cut=cut, cx=cx)
+    _whole_sections(ws, conn, v, cx, part, s)
     return s
 
 
@@ -2390,8 +2434,9 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index) -> dict:
 #
 # A table ``inspect`` transcribed is addressed through its source (and its vision ``T#``) and its cells resolve through
 # the stored region reading, never ``extracted_tables``. A cell's value is verified only with evidence beyond the
-# transcription: OCR of the same crop (or the region's text layer) sees its number once, inside the row band of its
-# row label and the column band of its header (``images.cell_evidence``). Otherwise it is uncertain, with the reason,
+# transcription: OCR of the same crop (or the region's text layer) sees its number once, in the cell's place — inside
+# the row band of its row label and the column band of its header, or on its row's line and in its column's band of
+# the numbers' own grid (``images.cell_evidence``, ``images.placed_cells``). Otherwise it is uncertain, with the reason,
 # and a calculation using it is conditional. No focused re-read is spent on it: the only re-read of a region is its
 # stored reading, which cannot add evidence. Its anchor carries the region key and, when confirmed, the confirming
 # word's box mapped into the rendered page (``anchors.page_box``), never an ``extracted_tables`` index.
@@ -2432,7 +2477,7 @@ def _take_vision_cell(ws: Workspace, src: Source, full: str, loc: dict) -> dict:
     """A cell of a table read by inspect, through its stored reading, with its OCR evidence (``evidence``: the
     cell's ``images.cell_evidence`` entry, ``why``: the message for its status) and an anchor of the region and the
     cell's box in the rendered page when OCR confirmed it in its place."""
-    from app.extraction.images import CELL_CONFIRMED, CELL_NO_OCR
+    from app.extraction.images import CELL_CONFIRMED, CELL_NO_OCR, placed_cells
 
     vis = src.vision
     reading = vis["reading"]
@@ -2443,7 +2488,7 @@ def _take_vision_cell(ws: Workspace, src: Source, full: str, loc: dict) -> dict:
     taken = _cell_of(src, full, loc, st, ti)
     ri, ci = taken["anchor"]["row"], taken["anchor"]["column"]
     ocr = reading.ocr or {}
-    cells = ocr.get("cells") or []
+    cells = placed_cells(reading)  # a reading stored before the numbers' grid placed cells is placed again here
     try:
         evidence = cells[ti][ri][ci]
     except (IndexError, TypeError):
@@ -2636,6 +2681,13 @@ def _settle_attribution(given: dict, said: Attribution | None, context: str) -> 
     return {"stance": stance, "stated_by": who, "scenario": scenario}, prov
 
 
+# a stance or a speaker the model gave where the words around the number say nothing of who stated it or how: the
+# value stays uncertain (round 6 KTD8), and the model is told how to take it as the source has it
+MSG_ATTRIBUTION_UNSTATED = ("המקור אינו אומר מי קבע את הערך או באיזה מעמד (אומץ, טענה, הצעה או אומדן). אם אין לכך "
+                            "בסיס במילים המצוטטות, בכותרת השורה או העמודה או בסעיף — קח את הערך שוב ב-take_value עם "
+                            "stance=unknown ו-stated_by ריק: כך הוא נרשם כפי שהמקור כותב אותו")
+
+
 def _attribution_line(value: calc.Value, said: Attribution | None) -> str:
     """The value's attribution as the tool reports it: the stance and speaker, what was asserted, and the source's
     own words when they say something else."""
@@ -2651,6 +2703,8 @@ def _attribution_line(value: calc.Value, said: Attribution | None) -> str:
         text_says = " / ".join(STANCE_LABELS[s] for s in sorted(said.stances)) + (
             f" של {said.stated_by}" if said.stated_by else "")
         out += f" | המקור מציג אותו כ: {text_says} («{_txt(_clip(said.evidence, 160))}»)"
+    elif p.get("stance") == "model_asserted" or p.get("stated_by") == "model_asserted":
+        out += " | " + MSG_ATTRIBUTION_UNSTATED
     elif value.stance == "unknown":
         out += " (המקור אינו אומר מי קבע את הערך או אם אומץ)"
     return out
@@ -3504,10 +3558,12 @@ TOOLS = [
                          "subject": {"type": "string", "description": "הנכס, השלב, התקופה או מערך הנתונים"},
                          "role": {"type": "string", "enum": list(calc.ROLE_LABELS)},
                          "stated_by": {"type": "string",
-                                       "description": "מי אמר את הערך (צד, שמאי, הכרעה) כפי שכתוב סביבו, או ריק"},
+                                       "description": "מי אמר את הערך (צד, שמאי, הכרעה) — רק כשהמילים המצוטטות, "
+                                                      "כותרת השורה או העמודה, או הסעיף אומרים זאת; אחרת ריק"},
                          "stance": {"type": "string", "enum": list(STANCES),
                                     "description": "adopted — נקבע ואומץ; claim/proposal/estimate — טענה, הצעה או "
-                                                   "אומדן; unknown — כשהטקסט אינו אומר"},
+                                                   "אומדן — רק כשהמילים המצוטטות, כותרת השורה או העמודה, או הסעיף "
+                                                   "אומרים זאת; אחרת unknown"},
                          "scenario": {"type": "string",
                                       "description": "התרחיש, השלב או המועד שהערך שייך להם כפי שכתוב, או ריק"}}},
          "label": {"type": "string", "description": "שם קצר בעברית לערך, כפי שיוצג בנוסחה"}},

@@ -420,6 +420,102 @@ def test_a_parameter_nobody_gave_is_pending_until_a_user_assumption_or_a_documen
     assert unfilled_parameters(ws, given) == [] and unfilled_parameters(ws, dict(RISE_COMPONENT, kind="information")) == []
 
 
+# A parameter the analysis marked as not given may be document data ("the developer profit in the calculation"): a
+# computation of the component resting only on the turn's registered document values and the user's assumptions
+# fills it, since then either it was document data or the report states the scenario (U9 residual, KTD9). A literal
+# in it, or no computation at all, leaves it pending (F8).
+
+GAP_COMPONENT = {"id": "N1", "text": "הפער בין הרווח היזמי לרווח המינימלי הנדרש", "kind": "calculation",
+                 "parameters": [{"name": "הרווח היזמי בתחשיב", "source": "not_given_by_user", "quote": ""},
+                                {"name": "הסף המינימלי הנדרש", "source": "not_given_by_user", "quote": ""}]}
+
+
+def _document_value(ws, vid: str, written: str, label: str):
+    import uuid
+
+    ws.values[vid] = calc.Value(vid, Decimal(written.replace(",", "")), written, "S1", uuid.uuid4(), uuid.uuid4(),
+                                None, "בדיקת כדאיות", "עמוד 1", label, "profit", "ILS", "none", "unknown", "",
+                                "פרויקט הדגמה", "profit", {"unit": "source"}, {"quote": written}, written)
+    return ws.values[vid].operand()
+
+
+def _gap_workspace(expression: str, requirements: list[dict]):
+    from app.chat import tools as T
+    from app.chat.verify import TurnRequirements
+
+    ws = T.Workspace(ctx=None)
+    a = _document_value(ws, "V1", "3,210,000", "סכום הרווח היזמי")
+    b = _document_value(ws, "V2", "2,800,000", "הרווח המינימלי הנדרש")
+    out = run(expression, ops(a, b))
+    ws.computations["C1"] = calc.Computation("C1", "הפער", expression, expression, out, [], ["S1"], 1, "computed",
+                                             None, "", None, ["V1", "V2"])
+    turn = TurnRequirements()
+    turn.adopt(requirements, "analysis")
+    ws.requirements = turn
+    return ws
+
+
+def test_a_parameter_that_was_document_data_is_filled_by_a_computation_resting_on_document_values():
+    from app.chat.verify import pending_parameters, unfilled_parameters
+
+    ws = _gap_workspace("V1 - V2", [GAP_COMPONENT])
+    assert unfilled_parameters(ws, ws.requirements.items[0]) == [] and pending_parameters(ws) == {}
+    # a result built on an earlier one (a C# over V#s) rests on the values under it
+    ws.computations["C2"] = calc.Computation("C2", "הפער", "C1", "C1", ws.computations["C1"].outcome, [], [], 1,
+                                             "computed", None, "", None, ["V1", "V2"])
+    assert unfilled_parameters(ws, ws.requirements.items[0], linked=["C2"]) == []
+    del ws.computations["C1"]
+    assert unfilled_parameters(ws, ws.requirements.items[0], linked=["C2"]) == ["הרווח היזמי בתחשיב",
+                                                                               "הסף המינימלי הנדרש"]
+
+
+def test_a_computation_with_a_literal_or_an_unregistered_input_does_not_fill_a_parameter():
+    from app.chat.verify import unfilled_parameters
+
+    ws = _gap_workspace("V1 * 12", [GAP_COMPONENT])  # a structural literal fills nothing of a scenario
+    assert unfilled_parameters(ws, ws.requirements.items[0]) == ["הרווח היזמי בתחשיב", "הסף המינימלי הנדרש"]
+    ws = _gap_workspace("V1 - V2", [GAP_COMPONENT])
+    del ws.values["V2"]  # an input the turn holds no registered value for
+    assert unfilled_parameters(ws, ws.requirements.items[0]) == ["הרווח היזמי בתחשיב", "הסף המינימלי הנדרש"]
+
+
+def test_with_two_calculation_components_only_a_computation_the_judge_links_fills_one():
+    from app.chat.verify import (
+        JudgeRequirement,
+        VerifyReport,
+        pending_parameters,
+        requirement_item,
+        unfilled_parameters,
+    )
+
+    other = dict(RISE_COMPONENT, id="N2")
+    ws = _gap_workspace("V1 - V2", [GAP_COMPONENT, other])
+    gap, rise = ws.requirements.items
+    # no link: neither is assumed to be the computation's component
+    assert set(pending_parameters(ws)) == {"N1", "N2"}
+    assert unfilled_parameters(ws, gap, linked=["C1"]) == []
+    assert unfilled_parameters(ws, rise, linked=[]) == ["שיעור העלייה של העלויות"]
+    # the judge names C1 for the gap: the gap's parameters are filled, the rise still waits for the user
+    report = VerifyReport([], requirements=[requirement_item("N1", gap["text"], "calculation",
+                                                             parameters=gap["parameters"]),
+                                            requirement_item("N2", rise["text"], "calculation",
+                                                             parameters=rise["parameters"])],
+                          pending_parameters=pending_parameters(ws))
+    report.requirement_votes = {"N1": [JudgeRequirement(id="N1", status="full", related=["C1", "V1"])],
+                                "N2": [JudgeRequirement(id="N2", status="missing")]}
+    report.settle_parameters(ws)
+    assert report.pending_parameters == {"N2": ["שיעור העלייה של העלויות"]}
+    statuses = {o["id"]: o["status"] for o in report.requirement_outcomes()}
+    assert statuses["N2"] == "needs_clarification" and statuses["N1"] != "needs_clarification"
+
+
+def test_a_cost_increase_with_no_rate_stays_pending_whatever_the_turn_computed_from_a_literal():
+    from app.chat.verify import pending_parameters
+
+    ws = _gap_workspace("V1 * 12", [RISE_COMPONENT])
+    assert pending_parameters(ws) == {"N1": ["שיעור העלייה של העלויות"]}
+
+
 def test_a_number_the_answer_assumes_for_a_pending_parameter_is_an_unrequested_assumption():
     from app.chat.verify import deterministic, split_units
 
