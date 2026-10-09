@@ -274,3 +274,27 @@ width or height per edge).
 | `citations/C6_synthetic_citations_cross_page_table.pdf` | A ruled table from page 1 to page 2 without a repeated header; the cited row is on page 2 | Row on page 2, the column headers anchored on page 1 |
 | `citations/C7_synthetic_citations_docx_table.docx` | A DOCX with sections and a table of shops | Structured view, no page; a value taken from a cell (real model) marks the cell |
 | `citations/C8_synthetic_citations_replaced.pdf`, `C8v2_synthetic_citations_replaced_v2.pdf` | A version and its replacement (a line added above the cited sentence, its year changed) | The old conversation still opens version 1's page with the original rectangle |
+
+## Round-7 fixtures (`round7/`)
+
+Synthetic documents for the round-7 reproductions (`tests/integration/test_chat_round7_reproductions.py`) and the
+later real-model and browser acceptance: request components, precise gaps, removals, tables read during a turn,
+appraisal context inside one file and input choice. Every name, address, plan number ("דמו/…"), block, parcel and
+amount is invented (the town "כפר הדמה" included). Regenerate only this set in the backend image:
+
+```bash
+docker run --rm -v "$PWD/backend:/app" -w /app appraisal-rag-backend python scripts/generate_fixtures.py --only round7
+```
+
+The output is byte-identical on a second run. `round7/manifest.json` records, per document, its file, title, page
+count, section headings with their pages, and the known facts the tests ask about (the line's text, page, section,
+what it states and its box in points on the upright page, origin top-left), written from the generator's own layout,
+never read back from the files.
+
+| file | what it holds | used for |
+|---|---|---|
+| `round7/R7a_synthetic_plan_status_chapter.pdf` | A planning-status chapter: plan דמו/4521 approved and דמו/4630 proposed, each with uses, housing units and floors; height, building areas and building lines are absent from section "2. מצב תכנוני" | Instructions in the request (F1); a category of six items of which three appear (F2) |
+| `round7/R7b_synthetic_two_appraisals_one_file.pdf` | One file, two appraisals (page 1: רחוב הדמומית 12, גוש 30871 חלקה 15; page 2: רחוב הצפצפה 7, גוש 30874 חלקה 9), the same numbered sections, a planning chapter naming plans, a comparison table of other parcels, and close values (21,400 vs 22,100 ₪ per m²) | A figure of the second appraisal must not be accepted for the first property (F6) |
+| `round7/R7c_synthetic_cost_table_image.pdf` | A cost table drawn as a picture (header, rows, total row and the unit note, none in the text layer) under a text sentence giving its context | A table read visually in the turn feeds `take_value` and `calculate` (F5): 15,600,000 + 4,620,000 = 20,220,000 |
+| `round7/R7d_synthetic_residual_explicit_profit.pdf` | A residual-method calculation: cost 18,350,000, profit stated as "כ-17%" of cost and, on another line of the same section, as 3,210,000 (cost × 17% = 3,119,500); a minimal-profit threshold of 2,800,000; a sensitivity section with a 6% cost increase | The explicit amount over the rounded rate (F7: gap 410,000, not 319,500); a cost-increase question with no rate (F8, without the sensitivity section) |
+| `round7/R7e_synthetic_decision_two_parties.pdf` | A decision: the applicant's figure (14,200), the respondent's (16,800) and the adopted one (15,350) | Who stated a value and whether it was adopted, within the right context (R22) |

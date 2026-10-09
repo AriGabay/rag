@@ -4844,14 +4844,269 @@ def write_citations(out: Path, font_dir: Path) -> None:
     print(f"wrote {CITATIONS_DIR}/{CITATIONS_MANIFEST} ({len(text_):,} chars)")
 
 
+# --------------------------------------------------------------------------- round 7 (request components, gaps,
+# removals, in-turn tables, appraisal context, input choice)
+
+ROUND7_DIR = "round7"
+ROUND7_MANIFEST = "manifest.json"
+ROUND7_PLACE = "כפר הדמה"  # an invented town; every street, plan, block and parcel below is invented too
+ROUND7_COST_HEADERS = ["רכיב", "שטח (מ״ר)", "עלות למ״ר (₪)", "עלות (₪)"]
+ROUND7_COST_ROWS = [
+    ["בנייה עילית", "2,400", "6,500", "15,600,000"],
+    ["חניון תת-קרקעי", "1,100", "4,200", "4,620,000"],
+    ["פיתוח השטח", "800", "650", "520,000"],
+    ["סה״כ", "", "", "20,740,000"],
+]
+ROUND7_COST_NOTE = "(*) הסכומים בש״ח, ללא מע״מ. הנתונים בדויים."
+ROUND7_COMPARABLE_HEADERS = ["גוש/חלקה", "כתובת", "שטח (מ״ר)", "מחיר למ״ר (₪)"]
+ROUND7_APPRAISALS = [
+    {"key": "first", "street": "רחוב הדמומית 12", "block": "30871", "parcel": "15", "rooms": "4", "floor": "3",
+     "area": "120", "per_sqm": "21,400", "value": "2,568,000", "approved_plan": "דמו/5110", "proposed_plan": "דמו/5112",
+     "comparables": [["30871/22", "רחוב הדמומית 4", "105", "20,900"], ["30871/31", "רחוב הסחלב 9", "130", "21,800"],
+                     ["30874/40", "רחוב הצפצפה 15", "115", "22,300"]]},
+    {"key": "second", "street": "רחוב הצפצפה 7", "block": "30874", "parcel": "9", "rooms": "3", "floor": "2",
+     "area": "110", "per_sqm": "22,100", "value": "2,431,000", "approved_plan": "דמו/5110", "proposed_plan": "דמו/5140",
+     "comparables": [["30874/12", "רחוב הצפצפה 3", "98", "22,500"], ["30875/3", "רחוב הלוטם 21", "112", "21,950"],
+                     ["30871/27", "רחוב הסחלב 2", "125", "21,600"]]},
+]
+
+
+def raster_cost_table(font_dir: Path):
+    """R7c's cost table drawn as a picture: header, rows, a total row and the unit note, all inside the image (no
+    text layer for any of it)."""
+    from PIL import Image, ImageDraw
+
+    table = raster_rows_table(font_dir, (1400, 450), 32, 3, ROUND7_COST_HEADERS, ROUND7_COST_ROWS)
+    img = Image.new("RGB", (1400, 520), "white")
+    img.paste(table, (0, 0))
+    draw = ImageDraw.Draw(img)
+    _draw_centered(draw, (700, 455, 1390, 515), ROUND7_COST_NOTE, _pil_font(font_dir, 26))
+    return img
+
+
+class Round7PdfRenderer(CitationsPdfRenderer):
+    """The round-7 documents. Every fact line is recorded as it is drawn (page, section, text and box in points), so
+    the manifest holds what each test asks about without reading the files back. Every name, address, plan number,
+    block, parcel and amount is invented."""
+
+    def __init__(self, font_dir: Path) -> None:
+        super().__init__(font_dir)
+        self.section: str | None = None
+        self.sections: list[dict[str, Any]] = []
+        self.facts: dict[str, dict[str, Any]] = {}
+
+    def title_block(self, title: str, address: str, block: str, parcel: str, extra: list[str] = ()) -> None:
+        self.header(title)
+        self.placed(None, f"כתובת הנכס: {address}")
+        self.placed(None, f"גוש: {block} חלקה: {parcel}")
+        for line in extra:
+            self.placed(None, line)
+        self.pdf.ln(2)
+
+    def section_heading(self, title: str) -> None:
+        self.heading_line(None, title)
+        self.section = title
+        self.sections.append({"title": title, "page": self.pdf.page_no()})
+
+    def fact(self, key: str | None, text: str, **known: Any) -> None:
+        """One body line; with a key, recorded with its page, section and what it states (``known``)."""
+        box = self.body_line(None, text)
+        if key is not None:
+            assert key not in self.facts, key
+            self.facts[key] = {"page": self.pdf.page_no(), "section": self.section, "text": text, "box": box} | known
+
+    # --- the documents ------------------------------------------------------------------------------------------
+
+    def render_plan_status(self) -> bytes:
+        """R7a: a planning-status chapter: an approved plan and a proposed one, each with uses, housing units and
+        floors; height, building areas and building lines are deliberately absent."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.title_block("פרק מצב תכנוני — מתחם שדרות הצבעוני", f"שדרות הצבעוני 18, {ROUND7_PLACE}", "30902", "6")
+        self.section_heading("1. מבוא")
+        self.fact(None, "פרק זה מפרט את המצב התכנוני החל על המתחם (מסמך סינתטי).")
+        self.section_heading("2. מצב תכנוני")
+        self.fact("approved_plan", "תכנית דמו/4521 — תכנית מאושרת, פורסמה למתן תוקף ביום 12/05/2019.",
+                  plan="דמו/4521", status="approved")
+        self.fact("approved_uses", "לפי תכנית דמו/4521: ייעוד הקרקע מגורים, עם מסחר בקומת הקרקע.",
+                  plan="דמו/4521", status="approved", item="uses", value="מגורים, מסחר בקומת הקרקע")
+        self.fact("approved_units", "לפי תכנית דמו/4521: מספר יחידות הדיור המותר הוא 84 יח״ד.",
+                  plan="דמו/4521", status="approved", item="housing_units", value="84")
+        self.fact("approved_floors", "לפי תכנית דמו/4521: מספר הקומות המותר הוא 9 קומות מעל קומת הקרקע.",
+                  plan="דמו/4521", status="approved", item="floors", value="9")
+        self.fact("proposed_plan", "תכנית דמו/4630 — תכנית מוצעת, הופקדה ביום 03/02/2024 וטרם אושרה.",
+                  plan="דמו/4630", status="proposed")
+        self.fact("proposed_units", "לפי תכנית דמו/4630 המוצעת: תוספת של 22 יח״ד ושימוש נוסף למבני ציבור.",
+                  plan="דמו/4630", status="proposed", item="housing_units", value="22")
+        self.fact("proposed_floors", "לפי תכנית דמו/4630 המוצעת: מספר הקומות יגדל ל-12 קומות.",
+                  plan="דמו/4630", status="proposed", item="floors", value="12")
+        self.section_heading("3. סיכום")
+        self.fact(None, "המתחם מיועד למגורים; התוספת המוצעת טרם אושרה (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+    def render_two_appraisals(self) -> bytes:
+        """R7b: one file holding two appraisals of two invented properties, each with its own title block (labelled
+        address and block/parcel), the same numbered sections, a planning chapter naming plans, a comparison table of
+        other parcels, and similar but different values."""
+        pdf = self.pdf
+        for n, a in enumerate(ROUND7_APPRAISALS):
+            pdf.add_page()
+            k = a["key"]
+            self.title_block(f"שומת מקרקעין — {a['street']}, {ROUND7_PLACE}", f"{a['street']}, {ROUND7_PLACE}",
+                             a["block"], a["parcel"], [f"המועד הקובע: 0{n + 1}/03/2025"])
+            self.facts[f"{k}_title"] = {"page": pdf.page_no(), "section": None, "street": a["street"],
+                                        "block": a["block"], "parcel": a["parcel"]}
+            self.section_heading("1. מבוא")
+            self.fact(None, "שומה זו נערכה לבקשת הבעלים לצורך מכירה (מסמך סינתטי).")
+            self.section_heading("2. תיאור הנכס")
+            self.fact(f"{k}_area",
+                      f"הנכס הוא דירת מגורים בת {a['rooms']} חדרים בשטח {a['area']} מ״ר, בקומה {a['floor']}.",
+                      value=a["area"])
+            self.section_heading("3. מצב תכנוני")
+            self.fact(f"{k}_plans", f"על המקרקעין חלות תכנית {a['approved_plan']} (מאושרת) ותכנית "
+                                    f"{a['proposed_plan']} (מוצעת).", plans=[a["approved_plan"], a["proposed_plan"]])
+            self.section_heading("4. נתוני השוואה")
+            self.fact(None, "עסקאות להשוואה בסביבת הנכס:")
+            widths = [40, 60, 35, 45]
+            pdf.set_fill_color(225, 225, 225)
+            self.ruled_row(ROUND7_COMPARABLE_HEADERS, widths, bold=True)
+            for row in a["comparables"]:
+                self.ruled_row(row, widths)
+            pdf.ln(3)
+            self.facts[f"{k}_comparables"] = {"page": pdf.page_no(), "section": self.section,
+                                              "headers": ROUND7_COMPARABLE_HEADERS, "rows": a["comparables"]}
+            self.section_heading("5. תחשיב השווי")
+            self.fact(f"{k}_per_sqm", f"השווי למ״ר שנקבע לנכס: {a['per_sqm']} ₪.", value=a["per_sqm"])
+            self.fact(f"{k}_value", f"שווי הנכס: {a['area']} מ״ר × {a['per_sqm']} ₪ = {a['value']} ₪.",
+                      value=a["value"])
+            self.section_heading("6. סיכום")
+            self.fact(None, f"שווי השוק של הנכס ב{a['street']} נאמד ב-{a['value']} ₪ (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+    def render_cost_table_image(self) -> bytes:
+        """R7c: a report whose cost table is a picture (rows, columns, headers and the unit note in no text layer),
+        with a text-layer sentence giving its context."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.title_block("תחשיב עלויות לדוגמה — פרויקט שדרות הדובדבן", f"שדרות הדובדבן 40, {ROUND7_PLACE}", "30911",
+                         "21")
+        self.section_heading("1. כללי")
+        self.fact(None, "פרק זה מציג את עלויות הבנייה שהוערכו לפרויקט (מסמך סינתטי).")
+        self.section_heading("2. עלויות הבנייה")
+        self.fact("context", "טבלת עלויות הבנייה של הפרויקט, לפי רכיבים, מוצגת להלן:")
+        img = raster_cost_table(self.font_dir)
+        w_mm = 160.0
+        h_mm = w_mm * img.size[1] / img.size[0]
+        x_mm = pdf.w - pdf.r_margin - w_mm
+        y_mm = pdf.get_y()
+        self.picture(img, w_mm, h_mm, x_mm)
+        self.facts["picture"] = {"page": pdf.page_no(), "section": self.section,
+                                 "box": [x_mm * PT_PER_MM, y_mm * PT_PER_MM, (x_mm + w_mm) * PT_PER_MM,
+                                         (y_mm + h_mm) * PT_PER_MM],
+                                 "headers": ROUND7_COST_HEADERS, "rows": ROUND7_COST_ROWS, "note": ROUND7_COST_NOTE}
+        self.section_heading("3. סיכום")
+        self.fact(None, "העלויות משמשות לתחשיב הכדאיות של הפרויקט (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+    def render_residual(self) -> bytes:
+        """R7d: a residual-method calculation stating developer profit both as an explicit amount and, in another
+        line of the same section, as a rounded rate of cost (cost x the rounded rate is not the amount); a minimal
+        profit threshold; and a sensitivity section stating a cost-increase rate."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.title_block("שומת קרקע בשיטת השייר — מגרש ברחוב התאנה 30", f"רחוב התאנה 30, {ROUND7_PLACE}", "30920", "4")
+        self.section_heading("1. מבוא")
+        self.fact(None, "שומה זו מעריכה את שווי המגרש בשיטת השייר (מסמך סינתטי).")
+        self.section_heading("2. תחשיב בשיטת השייר")
+        self.fact("income", "סך ההכנסות הצפויות מהפרויקט: 24,600,000 ₪.", value="24,600,000")
+        self.fact("cost", "סך עלויות הבנייה והפיתוח: 18,350,000 ₪.", value="18,350,000")
+        self.fact("profit_rate", "הרווח היזמי נקבע בשיעור של כ-17% מסך העלויות.", value="17%")
+        self.fact("profit_amount", "סכום הרווח היזמי בתחשיב: 3,210,000 ₪.", value="3,210,000")
+        self.fact("land_value", "שווי הקרקע בשיטת השייר: 3,040,000 ₪.", value="3,040,000")
+        self.section_heading("3. בדיקת כדאיות")
+        self.fact("threshold", "הרווח היזמי המינימלי הנדרש לכדאיות הפרויקט: 2,800,000 ₪.", value="2,800,000")
+        self.section_heading("4. ניתוח רגישות")
+        self.fact("sensitivity_rate", "בתרחיש הרגישות נבחנה עלייה של 6% בעלויות הבנייה והפיתוח.", value="6%")
+        self.section_heading("5. סיכום")
+        self.fact(None, "הפרויקט כדאי בתנאים שנבחנו (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+    def render_decision(self) -> bytes:
+        """R7e: a decision between two parties: the applicant's figure, the respondent's figure and the adopted
+        figure, which differs from both."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.title_block("הכרעת שמאי מכריע — היטל השבחה, רחוב הרימון 5", f"רחוב הרימון 5, {ROUND7_PLACE}", "30933",
+                         "11", ["המבקש: דמו נכסים בע״מ (שם בדוי)", f"המשיב: הוועדה המקומית {ROUND7_PLACE} (בדויה)"])
+        self.section_heading("1. רקע")
+        self.fact(None, "ההכרעה עוסקת בשומת היטל השבחה לנכס (מסמך סינתטי).")
+        self.section_heading("2. עמדת המבקש")
+        self.fact("applicant", "שמאי המבקש העריך את השווי למ״ר במצב החדש ב-14,200 ₪.", value="14,200",
+                  stated_by="applicant")
+        self.section_heading("3. עמדת המשיב")
+        self.fact("respondent", "שמאי המשיב העריך את השווי למ״ר במצב החדש ב-16,800 ₪.", value="16,800",
+                  stated_by="respondent")
+        self.section_heading("4. ההכרעה")
+        self.fact("adopted", "לאחר בחינת הטענות, אני קובע את השווי למ״ר במצב החדש ב-15,350 ₪.", value="15,350",
+                  stated_by="decision")
+        self.section_heading("5. סיכום")
+        self.fact(None, "השווי שנקבע משמש לחישוב ההיטל (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+
+def write_round7(out: Path, font_dir: Path) -> None:
+    """Writes the round-7 fixtures and ``manifest.json``: per document its file, title, pages, section headings
+    with their pages, and the known facts (text, page, section, value, box in points) the reproductions and the
+    real-model tests ask about."""
+    from pypdf import PdfReader
+
+    rdir = out / ROUND7_DIR
+    rdir.mkdir(parents=True, exist_ok=True)
+    docs: dict[str, dict[str, Any]] = {}
+    specs = [
+        ("plan_status", "R7a_synthetic_plan_status_chapter.pdf", Round7PdfRenderer.render_plan_status,
+         {"absent": {"items": ["גובה", "שטחי בנייה", "קווי בניין"], "section": "2. מצב תכנוני"}}),
+        ("two_appraisals", "R7b_synthetic_two_appraisals_one_file.pdf", Round7PdfRenderer.render_two_appraisals, {}),
+        ("cost_table_image", "R7c_synthetic_cost_table_image.pdf", Round7PdfRenderer.render_cost_table_image,
+         {"question_total": {"rows": ["בנייה עילית", "חניון תת-קרקעי"], "column": "עלות (₪)",
+                             "inputs": ["15,600,000", "4,620,000"], "result": "20,220,000"}}),
+        ("residual", "R7d_synthetic_residual_explicit_profit.pdf", Round7PdfRenderer.render_residual,
+         {"gap_to_threshold": {"right": "410,000", "from_rounded_rate": "319,500", "cost_times_rate": "3,119,500"}}),
+        ("decision", "R7e_synthetic_decision_two_parties.pdf", Round7PdfRenderer.render_decision, {}),
+    ]
+    for key, name, render, extra in specs:
+        r = Round7PdfRenderer(font_dir)
+        data = render(r)
+        (rdir / name).write_bytes(data)
+        print(f"wrote {ROUND7_DIR}/{name} ({len(data):,} bytes)")
+        facts = {k: {kk: ([round(x, 2) for x in vv] if kk == "box" else vv) for kk, vv in f.items()}
+                 for k, f in r.facts.items()}
+        docs[key] = {"file": f"{ROUND7_DIR}/{name}", "title": _title_of(name),
+                     "pages": len(PdfReader(io.BytesIO(data)).pages), "sections": r.sections, "facts": facts} | extra
+    manifest = {
+        "about": f"{SYNTHETIC_MARKER}. Known contents of the round-7 fixtures (request components, precise gaps, "
+                 "removals, tables read in the turn, appraisal context inside one file, input choice); generated by "
+                 "scripts/generate_fixtures.py --only round7 from the generator's own layout (never read back from "
+                 "the files) - do not edit by hand. Pages are file pages from 1; box: [x0, y0, x1, y1] in points on "
+                 "the upright page, origin top-left. Every name, address, plan number, block, parcel and amount is "
+                 "invented.",
+        "synthetic_marker": SYNTHETIC_MARKER,
+        "documents": docs,
+    }
+    text_ = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+    (rdir / ROUND7_MANIFEST).write_text(text_, encoding="utf-8")
+    print(f"wrote {ROUND7_DIR}/{ROUND7_MANIFEST} ({len(text_):,} chars)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--font-dir", default=DEFAULT_FONT_DIR)
     parser.add_argument("--out", default="tests/fixtures")
-    parser.add_argument("--only", choices=["all", "regions", "positions", "citations"], default="all",
+    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7"], default="all",
                         help="regions: write only the uncovered-region fixtures (tests/fixtures/regions/); "
                              "positions: only the page-position fixtures (tests/fixtures/positions/); "
-                             "citations: only the citation fixtures and their manifest (tests/fixtures/citations/)")
+                             "citations: only the citation fixtures and their manifest (tests/fixtures/citations/); "
+                             "round7: only the round-7 fixtures and their manifest (tests/fixtures/round7/)")
     args = parser.parse_args()
     font_dir = Path(args.font_dir)
     out = Path(args.out)
@@ -4864,6 +5119,9 @@ def main() -> None:
         return
     if args.only == "citations":
         write_citations(out, font_dir)
+        return
+    if args.only == "round7":
+        write_round7(out, font_dir)
         return
 
     docs: dict[str, dict[str, Any]] = {}
@@ -4911,6 +5169,7 @@ def main() -> None:
     write_regions(out, font_dir)
     write_positions(out, font_dir)
     write_citations(out, font_dir)
+    write_round7(out, font_dir)
 
 
 if __name__ == "__main__":
