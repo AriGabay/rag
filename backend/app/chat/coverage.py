@@ -35,8 +35,9 @@ table, first match wins (``reason_of``):
    wrong);
 3. a tool or provider failure tied to it (``E#``) — tool failure;
 4. a failed calculation tied to it (``F#``) — calculation not completed;
-5. a calculation resting on a parameter the user did not give, with no user assumption (``A#``) in the turn and no
-   calculation of it, or a clarification component — a detail missing from the request;
+5. a calculation resting on a parameter the user did not give, which no user assumption (``A#``) and no document
+   rate a calculation of the turn applied fills (round 7 KTD9; its status is then ``needs_clarification``), or a
+   clarification component — a detail missing from the request;
 6. a calculation whose inputs were found and never computed — calculation not completed;
 7. a value found with an uncertain reading or meaning — found, not verifiable;
 8. values for the same property, kind, unit, period, basis, scenario and status that differ — sources conflict (in
@@ -391,11 +392,12 @@ def _openings(ws: Workspace) -> dict[str, tuple[str, dict]]:
 
 
 def _missing_parameters(ws: Workspace, o: dict, ev: dict) -> list[str]:
-    """The parameters of a calculation the user did not give, when the turn holds no user assumption (A#) and no
-    calculation of it: the detail its result waits for (KTD9 refines which parameter an assumption fills)."""
-    if o["kind"] != "calculation" or ws.assumptions or any(i in ws.computations for i in ev["data"]):
-        return []
-    return [p["name"] for p in o.get("parameters") or [] if p.get("source") == "not_given_by_user"]
+    """The parameters of a calculation the user did not give that the workspace fills with neither a user assumption
+    (A#) nor a document value applied as a rate (round 7 KTD9: ``verify.unfilled_parameters``; a rate the report
+    states in a sensitivity section fills it): the detail its result waits for."""
+    from app.chat.verify import unfilled_parameters
+
+    return list(o.get("pending_parameters") or unfilled_parameters(ws, o))
 
 
 def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict | None = None) -> dict:
@@ -543,7 +545,7 @@ PUBLIC_FIELDS = ("id", "text", "kind", "aspect", "parent", "conditional", "subje
                  "limitation", "limitation_text", "stated", "gap", "units", "removed_units", "removal_kinds",
                  "absence_units",
                  "related", "place", "document", "document_id", "document_title", "searched", "claimed", "detail",
-                 "uncited", "check")
+                 "uncited", "check", "pending_parameters")
 
 
 def public_components(outcomes: list[dict]) -> list[dict]:

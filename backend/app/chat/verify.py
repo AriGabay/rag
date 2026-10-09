@@ -94,6 +94,17 @@ and — the backstop — an uncited unit the judge did not mark that states an a
 states a gap, are removed then (``VerifyReport.supersede``, ``kind="absence"``): the server's statement replaces
 them, so they are not counted as claims that failed.
 
+Inputs and assumptions (round 7 U7: KTD8, KTD9, R23–R25). A unit resting on a calculation built from a rounded document
+rate while the rate's source states the amount within its rounding interval (``Computation.explicit_amount``, carried
+through later results) is a repairable ``input_choice`` problem (check ``input_choice``; the checked ids name the
+calculation, the rate and the source of the stated amount); a user's ``A#``, or a rate the user wrote, never is. A
+calculation component whose parameter the user did not give is waiting for the user (``unfilled_parameters``) until a
+user assumption or a document value applied as a rate fills it: its status is then ``needs_clarification``, the repair
+round is asked for one focused question that keeps the data found (``REQ_PARAMETER``, never "compute"), and a unit that
+presents a scenario's number neither the user nor a source gave is an unrequested assumption (kind ``assumption``,
+check ``unrequested_assumption``), repairable into a clarification. Both are removed after the repair bound as a wrong
+calculation (``KIND_FAILURES``).
+
 Repair rounds are cheaper (KTD10). Within a turn, verdicts are kept (``VerdictCache``) by the unit's text, the ids it
 cites with the content of each, its context (a table row's header and the line before its table; the heading above
 it) and the request: a later round judges only the units that are new or changed, and what the judge says about the
@@ -272,6 +283,19 @@ ABSENCE_UNCITED = ("הצהרה שנתון חסר, בלי מקור: היעדר א
 REQ_FOUND_NOT_ABSENT = ("התשובה אומרת שהנתון לא נמצא, אבל בתור הזה נמצאו לו נתונים ({ids}): השתמש בהם, או אמור "
                         "מה מנע להשלים אותו")
 TOOL_FAILED = "שגיאה: הכלי נכשל"  # ``tools.run_tool``'s output for a tool that raised
+# a calculation component waiting for a detail only the user can give (round 7 KTD9, R25): asked, never computed
+REQ_PARAMETER = ("חלק של הבקשה שדורש חישוב: «{text}». החישוב תלוי בפרט שהמשתמש לא נתן ושהמסמכים אינם מציינים: "
+                 "{names}. אל תניח אותו ואל תחשב תוצאה: שאל את המשתמש שאלה אחת ממוקדת על הפרט הזה "
+                 "(status=clarification), ושמור בתשובה את הנתונים שכבר נמצאו עם מראי המקום שלהם; מותר להציג את הנוסחה "
+                 "הכללית במילים, בלי מספר")
+INPUT_CHOICE = ("{cid} חושב מהשיעור המעוגל {rate} («{written}%»), בעוד שבמקור {source} כתוב סכום מפורש לאותו נתון, "
+                "בתוך טווח העיגול של השיעור: {amount} («{quote}»){via}. קח את הסכום הכתוב ב-take_value וחשב ממנו מחדש — "
+                "אלא אם המשתמש ביקש לחשב לפי השיעור")
+UNREQUESTED_ASSUMPTION = ("מספר של תרחיש שלא המשתמש ולא המסמכים נתנו, בחישוב שתלוי בפרט שהמשתמש לא נתן ({names}): "
+                          "אל תניח אותו. כתוב את הנתונים שנמצאו עם מראי המקום שלהם, את הנוסחה הכללית במילים בלי מספר, "
+                          "ושאלה אחת ממוקדת על הפרט החסר (status=clarification)")
+# a unit that presents a worked-out or conditional result ("אם ... יעלו", "בהנחה", "בתרחיש", "יהיה")
+_SCENARIO_MARK = re.compile(r"(?<![א-ת])(?:אם|בהנחה|בהנחת|בתרחיש|בעלייה|בירידה|יהיה|תהיה|יהיו)(?![א-ת])")
 
 # Why a claim was removed (round 7 KTD5, R12): one failure kind per removal decision. ``not_checked`` is the server's
 # own — a check that did not finish (the judge timed out on the unit's call, or left it out) — and is never "wrong".
@@ -321,6 +345,10 @@ DEFECT_FAILURES = {"input": "wrong_calculation", "scenario": "wrong_calculation"
 # wrong input or on an assumption the user did not give is a wrong calculation (round 7 U7 adds these kinds); an
 # unmet instruction is a gap, never a removal
 KIND_FAILURES = {"input_choice": "wrong_calculation", "assumption": "wrong_calculation"}
+# how a repair of those kinds goes (KTD10): the stated amount, or the question the user must answer
+KIND_HINTS = {"input_choice": "קח את הסכום שהמקור מציין (take_value) וחשב ממנו מחדש ב-calculate",
+              "assumption": "אל תניח את הפרט: הצג את הנתונים שנמצאו עם מראי המקום, נוסחה כללית בלי מספר ושאלה אחת "
+                            "ממוקדת (status=clarification)"}
 NOT_CHECKED = "הטענה לא נבדקה מול המקורות"
 NOT_CHECKED_FAILED = "הטענה לא נבדקה מול המקורות: הבדיקה לא הושלמה ({status})"
 NOT_CLASSIFIED = "טענה סווגה כלא-עובדתית או ככותרת; לא אומתה"
@@ -594,8 +622,11 @@ class Problem:
     # removed: an unmet instruction is a gap, never a claim removal); "absence": a unit stating the absence of a
     # component the server states itself, removed after verification (``VerifyReport.supersede``) — replaced, not
     # a claim that failed
+    # "input_choice": a result built from a rounded document rate while its source states the amount (round 7 KTD8);
+    # "assumption": a number of a scenario that neither the user nor a source gave, for a parameter the user did not
+    # give (KTD9) — both repairable, and removed after the repair bound as a wrong calculation (``KIND_FAILURES``)
     kind: Literal["claim", "missing_qualifier", "needs_citation", "request", "requirement", "instruction",
-                  "absence"] = "claim"
+                  "absence", "input_choice", "assumption"] = "claim"
     number: str | None = None  # for a missing qualifier: the number as written in the unit
     annotation: str | None = None  # for a missing qualifier: the one qualifier attested, as written
     cite: str | None = None  # the source or measurement the server found that states the qualifier
@@ -662,8 +693,9 @@ class Problem:
         parts = [f"סוג: {FAILURE_LABELS[self.failure_kind]}"]
         if self.checked_ids:
             parts.append("נבדק מול: " + ", ".join(self.checked_ids))
-        if self.failure_kind in REPAIR_HINTS:
-            parts.append("תיקון: " + REPAIR_HINTS[self.failure_kind])
+        hint = KIND_HINTS.get(self.kind) or REPAIR_HINTS.get(self.failure_kind)
+        if hint:
+            parts.append("תיקון: " + hint)
         return " (" + "; ".join(parts) + ")"
 
 
@@ -681,6 +713,9 @@ class VerifyReport:
     verdicts: dict[int, str] = field(default_factory=dict)  # the judge's verdict on each unit it judged, by index
     # the server's gap paragraph, grouped by reason (``coverage.gap_groups``), set once the final answer is stated
     gaps: list[dict] = field(default_factory=list)
+    # calculation components waiting for a detail only the user can give (round 7 KTD9): id -> the parameters no
+    # user assumption and no document rate of the turn fills (``unfilled_parameters``)
+    pending_parameters: dict[str, list[str]] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -775,8 +810,9 @@ class VerifyReport:
           (several may fill one component, one may fill several), ``removed_units`` the units that gave it and were
           removed (a component they alone gave is ``not_answered``);
         - otherwise ``not_answered`` — never assumed given — with ``evidence_state`` ``undeterminable`` when a call
-          said the documents do not allow a conclusion; a clarification is ``needs_clarification`` and a user's
-          assumption nothing used ``not_relevant``;
+          said the documents do not allow a conclusion; a clarification is ``needs_clarification``, as is a
+          calculation whose parameter the user did not give and no user assumption or document rate of the turn
+          fills (``pending_parameters``, round 7 KTD9); a user's assumption nothing used ``not_relevant``;
         - an instruction takes its score against the shown answer whatever units it names; a citation instruction is
           checked from the units (``uncited``: the surviving material units without a valid, attached citation) and
           the judge's score is not used (``check``: ``citation`` or ``judge``);
@@ -832,7 +868,10 @@ class VerifyReport:
             else:
                 status = {"clarification": "needs_clarification", "assumption": "not_relevant"}.get(kind,
                                                                                                   "not_answered")
+                if kind == "calculation" and self.pending_parameters.get(r["id"]):
+                    status = "needs_clarification"  # waiting for the user's detail (KTD9), not missing data
                 o |= {"status": status, "reason": (absent or votes)[0].reason if votes else ""}
+            o["pending_parameters"] = list(self.pending_parameters.get(r["id"]) or [])
             out[r["id"]] = o
 
         def derive(cid: str) -> str:
@@ -1503,6 +1542,75 @@ def _vat_problems(unit: Unit, ws: Workspace) -> list[str]:
     return [f"מע\"מ שהתשובה מייחסת ל-{x} לא נכתב לגבי ערך זה במקור" for x in dict.fromkeys(shown)][:1]
 
 
+def unfilled_parameters(ws: Workspace, item: dict) -> list[str]:
+    """The parameters of a calculation component the user did not give (KTD1) that the workspace fills with neither
+    a user assumption (``A#``) nor a value applied as a rate by one of the turn's calculations (``Computation.rates``:
+    a document's ``V#`` or ``M#`` — a rate the report itself states, say in a sensitivity section): the detail the
+    result waits for (round 7 KTD9, R25). None for any other component, or once the turn holds such a filler."""
+    if item.get("kind") != "calculation":
+        return []
+    names = [p.get("name") or "" for p in item.get("parameters") or [] if p.get("source") == "not_given_by_user"]
+    if not names or ws.assumptions:
+        return []
+    # a rate a calculation applied is a registered id — a source's value, a user's assumption or a result built on
+    # them: the calculator never applies a literal as one
+    if any(getattr(c, "rates", None) for c in ws.computations.values()):
+        return []
+    return names
+
+
+def pending_parameters(ws: Workspace) -> dict[str, list[str]]:
+    """Each frozen calculation component of the turn still waiting for a detail only the user can give."""
+    out = {}
+    for item in getattr(ws.requirements, "items", None) or []:
+        names = unfilled_parameters(ws, item)
+        if names:
+            out[item["id"]] = names
+    return out
+
+
+def _user_gave(ws: Workspace, written: str) -> bool:
+    from app.chat.tools import _user_gave as gave
+
+    return gave(ws, written)
+
+
+def _input_choice(u: Unit, ws: Workspace) -> Problem | None:
+    """A unit resting on a calculation built from a rounded document rate while the rate's source states the amount
+    within its rounding interval (``Computation.explicit_amount``, round 7 KTD8, R23): an input choice the repair
+    round fixes from the stated amount. A user's assumption is never one (only a document rate is checked), nor a
+    rate the user wrote."""
+    for cid in u.ids:
+        c = ws.computations.get(cid)
+        near = getattr(c, "explicit_amount", None) if c is not None else None
+        if not near or _user_gave(ws, near.get("rate_written") or ""):
+            continue
+        origin = near.get("from")
+        via = f" (דרך {origin})" if origin and origin != cid else ""
+        reason = INPUT_CHOICE.format(cid=cid, rate=near["rate"], written=near.get("rate_written") or "",
+                                     source=near["source"], amount=near["amount"], quote=near.get("quote") or "",
+                                     via=via)
+        checked = list(dict.fromkeys([*u.ids, *([origin] if origin else []), near["rate"], near["source"]]))
+        return Problem(u, reason, kind="input_choice", check="input_choice", checked_ids=checked)
+    return None
+
+
+def _unrequested_assumption(u: Unit, ws: Workspace, missing: list[str]) -> Problem | None:
+    """A unit that presents a scenario's number neither the user nor a source gave (``missing``) while a calculation
+    component of the turn waits for a detail only the user can give (round 7 KTD9): an unrequested assumption, which
+    the repair round turns into a clarification. (A literal can never stand for such a number: the calculator
+    refuses one as a rate.)"""
+    pending = pending_parameters(ws)
+    if not missing or not pending:
+        return None
+    if not (any(i in ws.computations for i in u.ids) or _SCENARIO_MARK.search(u.text) or _COMPUTED_MARK.search(u.text)):
+        return None
+    names = ", ".join(f"«{n}»" for names in pending.values() for n in names)
+    shown = list(dict.fromkeys(n.written for n in _shown(u.text) if numbers_in(n.written) & set(missing)))
+    return Problem(u, UNREQUESTED_ASSUMPTION.format(names=names) + ": " + ", ".join((shown or sorted(missing))[:5]),
+                   kind="assumption", check="unrequested_assumption")
+
+
 def deterministic(units: list[Unit], ws: Workspace, question: str,
                   meanings: dict[int, list[meaning.MeaningProblem]] | None = None) -> list[Problem]:
     """Unknown citations, numbers no cited source states, VAT the sources do not give a number, and a basis or
@@ -1515,6 +1623,13 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
     everything = _all_numbers(ws)
     for u in units:
         unknown = _unknown_ids(u, ws)
+        # a scenario's result nobody's number gave, for a detail only the user can give, is an unrequested assumption
+        # even when it cites a calculation the calculator refused (KTD9): the repair asks rather than re-cites
+        assumed = _unrequested_assumption(u, ws, _unstated(u, ws, question_numbers, everything)) if unknown and all(
+            i.startswith("C") for i in unknown) else None
+        if assumed is not None:
+            problems.append(assumed)
+            continue
         if unknown:
             prior = [i for i in unknown if i.startswith("P")]
             reason = ("ציטוט הפניה מתור קודם בלי לפתוח אותה מחדש" if prior and len(prior) == len(unknown)
@@ -1522,12 +1637,20 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
             problems.append(Problem(u, reason, failure_kind="invalid_citation", check="unknown_id"))
             continue
         missing = _unstated(u, ws, question_numbers, everything)
+        assumed = _unrequested_assumption(u, ws, missing)
+        if assumed is not None:
+            problems.append(assumed)
+            continue
         if missing:
             # a number a calculation it cites does not give, at the precision shown, is a wrong calculation
             computed = any(i in ws.computations for i in u.ids)
             problems.append(Problem(u, "מספרים שאינם מופיעים במקורות המצוטטים: " + ", ".join(sorted(missing)[:5]),
                                     failure_kind="wrong_calculation" if computed else "absent_from_source",
                                     check="computation_mismatch" if computed else "unstated_number"))
+            continue
+        choice = _input_choice(u, ws)
+        if choice is not None:
+            problems.append(choice)
             continue
         framed = _framed_result(u, ws)
         if framed:
@@ -2118,7 +2241,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     ``request``: the request as resolved in context (the question itself when there is none). ``cache``: the turn's verdicts (KTD10) — a unit judged
     before in the turn, unchanged, is not judged again. Raises ``VerificationUnavailable``."""
     units = split_units(answer.answer_markdown)
-    report = VerifyReport(units)
+    report = VerifyReport(units, pending_parameters=pending_parameters(ws) if requirements is not None else {})
     coverage = None
     if requirements is not None:
         listing, known = _workspace_listing(ws, requirements)
@@ -2296,6 +2419,12 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
                        if o.get("check") == "citation" else (f" — {o['reason']}" if o.get("reason") else ""))
                 report.problems.append(Problem(Unit(-1, "", "", []), REQ_INSTRUCTION.format(text=o["text"], why=why),
                                                kind="instruction"))
+            continue
+        if o["kind"] == "calculation" and o.get("pending_parameters") and o["status"] != "full":
+            # a detail only the user can give (KTD9): asked for, keeping the data found — never computed
+            report.problems.append(Problem(Unit(-1, "", "", []), REQ_PARAMETER.format(
+                text=o["text"], names=", ".join(f"«{n}»" for n in o["pending_parameters"])), kind="requirement",
+                component=o["id"]))
             continue
         if o["status"] not in ("not_answered", "partial") or o["kind"] not in SEARCHABLE_KINDS:
             continue  # an assumption or a clarification is never searched for (R4)

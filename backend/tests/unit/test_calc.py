@@ -1,7 +1,9 @@
 """The calculator's expression language and its operation-dependent compatibility (U10, KTD10, R15–R18).
 
 Pure tests: operands are built directly, as the tools build them from verified values (V#), user assumptions
-(A#), stored measurements (M#) and earlier results (C#). Synthetic values only."""
+(A#), stored measurements (M#) and earlier results (C#). Synthetic values only. Round 7 U7 (KTD8, KTD9, R23–R25):
+the literals stay structural, a written rate has a rounding interval, and verification flags a result built from a
+rounded rate beside a stated amount (``input_choice``) and a scenario number nobody gave (``assumption``)."""
 
 from decimal import Decimal
 
@@ -283,3 +285,158 @@ def test_a_count_is_shown_as_a_number_while_a_ratio_keeps_its_percentage():
     assert calc.display_matches("83.5", True, ratio.value, ratio.dims, ratio.kind)
     share = run("count(M1, M2) / count(M1, M2, M3, M4, M5)", ops(*rents))
     assert share.kind == "ratio" and calc.display(share.value, share.dims, share.kind)["percent"] == "40%"
+
+
+# --- round 7 U7: literals stay structural; a written rate has a rounding interval (KTD8, R23–R25) -------------
+
+RENT = operand("V5", "7560", "ILS", kind="rent", period="month", subject="הנכס")
+SHARE = operand("V3", "17", "percent", kind="rate", role="rate", subject="פרויקט הדגמה")
+
+
+@pytest.mark.parametrize("expression", [
+    "V2 * 12%",                # the structural 12 as a rate
+    "V1 - V2 * (1 + 12%)",     # an increase nobody gave (round 7 F8)
+    "V1 - V2 * (1 + 1%)",
+    "V2 * 100%",
+    "V2 * 12 / 100",           # 12 of every 100: a rate again
+    "V2 * (1 + 12 / 100)",
+    "V2 * (12 + 1)",           # literals combined into another number
+    "V1 / 100",                # an amount over 100 is a rate of it, not a conversion
+    "V2 * 100",                # an amount times 100 is not a percentage
+    "12 / V2",
+])
+def test_a_structural_literal_never_acts_as_a_rate_or_an_assumption(expression):
+    with pytest.raises(CalcError) as e:
+        run(expression, ops(INCOME, COST))
+    assert "קבוע" in str(e.value) or "שיעור" in str(e.value), str(e.value)
+
+
+def test_the_structural_literals_keep_their_structural_uses():
+    rent, annual = RENT, operand("V12", "90720", "ILS", kind="rent", period="year", subject="הנכס")
+    assert run("V5 * 12", ops(rent)).period == "year"
+    assert run("V12 / 12", ops(annual)).value == Decimal("7560")
+    assert run("V1 - V2*(1+A1%)", ops(INCOME, COST, RISE)).value == Decimal("1530000")
+    assert run("V2 * (1 - A1%)", ops(COST, RISE)).value == Decimal("9880000")
+    ratio = calc.result_operand("C1", run("V2 / V1", ops(INCOME, COST)))
+    assert run("C1 * 100", ops(ratio)).dims == (("%", 1),)
+    assert run("V3 / 100", ops(SHARE)).value == Decimal("0.17")
+    assert run("V2 * V3%", ops(COST, SHARE)).value == Decimal("1768000")
+
+
+@pytest.mark.parametrize("written, low, high", [
+    ("17", "16.5", "17.5"), ("כ-17%", "16.5", "17.5"), ("20", "19.5", "20.5"), ("17.5", "17.45", "17.55"),
+    ("6.25%", "6.245", "6.255"), ("0.5", "0.45", "0.55"),
+])
+def test_a_written_rate_has_the_rounding_interval_of_its_last_written_digit(written, low, high):
+    assert calc.rounding_interval(written) == (Decimal(low), Decimal(high))
+
+
+@pytest.mark.parametrize("written", ["", "כ-", "17 או 18"])
+def test_a_text_without_one_number_has_no_rounding_interval(written):
+    assert calc.rounding_interval(written) is None
+
+
+def test_a_rate_applied_through_percent_is_found_in_the_expression():
+    assert calc.applied_rates(calc.parse("V1 - V2 * (1 + A1%)")) == ["A1"]
+    assert calc.applied_rates(calc.parse("V2 * (V3 / 100) + V2 * C2%")) == ["V3", "C2"]
+    assert calc.applied_rates(calc.parse("V1 - V2")) == []
+    products = calc.rate_products(calc.parse("V1 - V2 * (1 + V3%)"))
+    assert [(calc.render(n, lambda i: i), i) for n, i in products] == [("V2 × (1 + V3%)", "V3")]
+
+
+# --- round 7 U7: verification of a rounded rate's product and of a parameter nobody gave (KTD8, KTD9) ----------
+
+def _workspace_with(computation_kwargs: dict, requirements: list[dict] | None = None):
+    from app.chat import tools as T
+    from app.chat.verify import TurnRequirements
+
+    ws = T.Workspace(ctx=None)
+    ws.user_messages = [{"turn": 1, "text": "מה הפער בין הרווח היזמי לרווח הנדרש?", "current": True}]
+    cost = operand("V1", "18350000", "ILS", kind="cost", role="cost", subject="פרויקט הדגמה")
+    rate = operand("V2", "17", "percent", kind="rate", role="rate", subject="פרויקט הדגמה")
+    out = run("V1 * V2%", ops(cost, rate))
+    inputs = [{"id": "V1", "label": "סך העלויות", "kind": "value", "value": "18350000", "display": "18,350,000",
+               "value_text": "18,350,000"},
+              {"id": "V2", "label": "שיעור הרווח היזמי", "kind": "value", "value": "17", "display": "17",
+               "value_text": "17"}]
+    ws.computations["C1"] = calc.Computation("C1", "הרווח היזמי", "V1 × V2%", "«סך העלויות» × «שיעור הרווח»%", out,
+                                             inputs, [], 1, "computed", None, "", None, ["V1", "V2"],
+                                             **computation_kwargs)
+    if requirements is not None:
+        turn = TurnRequirements()
+        turn.adopt(requirements, "analysis")
+        ws.requirements = turn
+    return ws
+
+
+NEAR_MISS = {"amount": "3,210,000", "value": "3210000", "source": "S1", "quote": "סכום הרווח היזמי בתחשיב: 3,210,000 ₪",
+             "rate": "V2", "rate_written": "17", "interval": ["16.5", "17.5"], "computed": "3119500",
+             "range": ["3027750", "3211250"], "from": None}
+
+
+def test_a_result_built_from_a_rounded_rate_beside_a_stated_amount_is_an_input_choice_problem():
+    from app.chat.verify import deterministic, split_units
+
+    ws = _workspace_with({"explicit_amount": NEAR_MISS, "rates": ["V2"]})
+    units = split_units("לפי החישוב, הרווח היזמי הוא 3,119,500 ₪ [C1].")
+    (p,) = deterministic(units, ws, "מה הרווח היזמי?", meanings={u.index: [] for u in units})
+    assert p.kind == "input_choice" and p.failure_kind == "wrong_calculation" and p.check == "input_choice"
+    assert p.repairable and p.removes_unit
+    assert {"C1", "V2", "S1"} <= set(p.checked_ids) and "3,210,000" in p.reason
+
+
+def test_the_users_own_rate_is_never_flagged():
+    from app.chat.verify import deterministic, split_units
+
+    ws = _workspace_with({"explicit_amount": None, "rates": ["A1"]})
+    ws.user_messages = [{"turn": 1, "text": "חשב את הרווח לפי 17% מהעלויות", "current": True}]
+    units = split_units("לפי בקשתך, הרווח היזמי הוא 3,119,500 ₪ [C1].")
+    assert deterministic(units, ws, "חשב את הרווח לפי 17% מהעלויות", meanings={u.index: [] for u in units}) == []
+    # a document rate the user asked for by its number is not an input choice either
+    ws = _workspace_with({"explicit_amount": NEAR_MISS, "rates": ["V2"]})
+    ws.user_messages = [{"turn": 1, "text": "חשב את הרווח לפי 17% מהעלויות", "current": True}]
+    assert deterministic(units, ws, "חשב את הרווח לפי 17% מהעלויות", meanings={u.index: [] for u in units}) == []
+
+
+RISE_COMPONENT = {"id": "N1", "text": "הרווח אם העלויות יעלו", "kind": "calculation",
+                  "parameters": [{"name": "שיעור העלייה של העלויות", "source": "not_given_by_user", "quote": ""}]}
+
+
+def test_a_parameter_nobody_gave_is_pending_until_a_user_assumption_or_a_document_rate_fills_it():
+    from app.chat.verify import unfilled_parameters
+
+    ws = _workspace_with({"explicit_amount": None, "rates": []}, [RISE_COMPONENT])
+    item = ws.requirements.items[0]
+    ws.computations.clear()
+    assert unfilled_parameters(ws, item) == ["שיעור העלייה של העלויות"]
+    # a computation that applies a document rate (a scenario the report states) fills it
+    filled = _workspace_with({"explicit_amount": None, "rates": ["V2"]}, [RISE_COMPONENT])
+    assert unfilled_parameters(filled, filled.requirements.items[0]) == []
+    # so does the user's own number
+    ws.assumptions["A1"] = calc.Assumption("A1", Decimal("8"), "8", "percent", "עליית העלויות", "8%", 2, True)
+    assert unfilled_parameters(ws, item) == []
+    # a parameter the user gave, or a component that is no calculation, is never pending
+    given = dict(RISE_COMPONENT, parameters=[{"name": "שיעור", "source": "given_by_user", "quote": "8%"}])
+    assert unfilled_parameters(ws, given) == [] and unfilled_parameters(ws, dict(RISE_COMPONENT, kind="information")) == []
+
+
+def test_a_number_the_answer_assumes_for_a_pending_parameter_is_an_unrequested_assumption():
+    from app.chat.verify import deterministic, split_units
+
+    ws = _workspace_with({"explicit_amount": None, "rates": []}, [RISE_COMPONENT])
+    ws.computations.clear()
+    units = split_units("אם העלויות יעלו ב-10%, הרווח יהיה כ-4.4 מיליון ₪.")
+    (p,) = deterministic(units, ws, "מה יהיה הרווח אם העלויות יעלו?", meanings={u.index: [] for u in units})
+    assert p.kind == "assumption" and p.failure_kind == "wrong_calculation" and p.check == "unrequested_assumption"
+    assert p.repairable and "שיעור העלייה של העלויות" in p.reason
+
+
+def test_a_calculation_component_waiting_for_a_detail_nobody_gave_needs_clarification():
+    from app.chat.verify import VerifyReport, requirement_item
+
+    item = requirement_item("N1", RISE_COMPONENT["text"], "calculation", parameters=RISE_COMPONENT["parameters"])
+    other = requirement_item("N2", "ההכנסות", "information")
+    report = VerifyReport([], requirements=[item, other], pending_parameters={"N1": ["שיעור העלייה של העלויות"]})
+    statuses = {o["id"]: o["status"] for o in report.requirement_outcomes()}
+    assert statuses == {"N1": "needs_clarification", "N2": "not_answered"}
+    assert VerifyReport([], requirements=[item]).requirement_outcomes()[0]["status"] == "not_answered"

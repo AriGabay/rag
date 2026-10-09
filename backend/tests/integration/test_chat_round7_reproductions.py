@@ -410,10 +410,6 @@ def _quoted(doc_key: str, key: str, source: str, meaning_: dict, label: str) -> 
 
 
 @pytest.mark.db
-@pytest.mark.xfail(strict=True, reason="round 7 F7: calculate compares only its result with numbers written in the "
-                                       "input documents (tools._reproduces); nothing compares cost x a rounded rate "
-                                       "with the explicit amount the same section states, so the near-miss passes as a "
-                                       "plain computation and the gap to the threshold is built on it")
 def test_f7_cost_times_a_rounded_rate_is_reported_beside_the_explicit_amount_and_not_accepted(client, office,
                                                                                              monkeypatch):
     doc = ingest_round7(office, monkeypatch, "residual")
@@ -469,10 +465,6 @@ def add_residual_without_sensitivity(office) -> str:
 
 
 @pytest.mark.db
-@pytest.mark.xfail(strict=True, reason="round 7 F8: nothing detects a calculation resting on a parameter the user "
-                                       "never gave: no first-turn request analysis, no clarification route besides "
-                                       "resolve's entity checks, and calculate accepts its structural literal 12 as a "
-                                       "rate ('12%'), so a scenario result with an invented rate is shown as computed")
 def test_f8_a_cost_increase_with_no_rate_given_asks_for_the_rate_and_keeps_the_found_values(client, office,
                                                                                            monkeypatch):
     doc = add_residual_without_sensitivity(office)

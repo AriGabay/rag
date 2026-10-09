@@ -1,6 +1,7 @@
 """An assumption (A#) in a stored answer names the user message it quotes, so the breakdown can link back to it (U7).
 
-Database-free: the turn's user messages are plain rows, and the stored assumptions are their public dicts."""
+Database-free: the turn's user messages are plain rows, and the stored assumptions are their public dicts. Round 7 U7
+(KTD9, R25): a clarification's pending parameter is bound to the user's reply and its found values to their P#."""
 
 from decimal import Decimal
 from types import SimpleNamespace
@@ -43,3 +44,64 @@ def test_an_assumption_whose_message_is_unknown_has_no_message_id():
     out = api._assumption_origins([_assumption("A1", 4, False), _assumption("A2", 0, False)], [str(U1)])
     assert [a["message_id"] for a in out] == [None, None]
     assert api._assumption_origins([_assumption("A1", 1, True)], None)[0]["message_id"] is None
+
+
+# --- round 7 U7 (KTD9, R25): a clarification's pending parameter, bound to the user's reply -----------------------
+
+PENDING = {"component": "N1", "text": "הרווח היזמי אם העלויות יעלו", "parameters": ["שיעור העלייה של העלויות"],
+           "question": "באיזה שיעור יעלו העלויות?",
+           "found": [{"id": "V1", "label": "ההכנסות", "value_text": "24,600,000", "source_id": "S1"},
+                     {"id": "V2", "label": "העלויות", "value_text": "18,350,000", "source_id": "S1"}]}
+
+
+def test_a_reply_with_a_number_is_bound_to_the_pending_parameter():
+    from app.chat import resolve
+
+    bound = resolve.bind_pending(PENDING, "8%")
+    assert bound["parameter"] == "שיעור העלייה של העלויות" and bound["quote"] == "8%" and bound["value"] == "8"
+    assert bound["component"]["kind"] == "calculation" and bound["component"]["text"] == PENDING["text"]
+    (p,) = bound["component"]["parameters"]
+    assert p == {"name": "שיעור העלייה של העלויות", "source": "given_by_user", "quote": "8%"}
+    longer = resolve.bind_pending(PENDING, "נניח שהעלויות יעלו ב-8 אחוז")
+    assert longer["quote"] == "נניח שהעלויות יעלו ב-8 אחוז" and longer["value"] == "8"
+
+
+def test_a_reply_without_a_number_or_without_a_pending_parameter_binds_nothing():
+    from app.chat import resolve
+
+    assert resolve.bind_pending(PENDING, "לא יודע, מה אתה מציע?") is None
+    assert resolve.bind_pending(None, "8%") is None
+    assert resolve.bind_pending(dict(PENDING, parameters=[]), "8%") is None
+
+
+def test_the_pending_found_values_are_reopened_through_the_previous_answers_references():
+    sources = [{"id": "S1", "version_id": "v1"}, {"id": "S2", "version_id": None}, {"id": "S3", "version_id": "v2"}]
+    out = api._pending_refs(PENDING, sources)
+    assert [(v["id"], v["prior"]) for v in out["found"]] == [("V1", "P1"), ("V2", "P1")]
+    # a value whose passage is not among the references keeps no P#
+    moved = dict(PENDING, found=[dict(PENDING["found"][0], source_id="S9")])
+    assert api._pending_refs(moved, sources)["found"][0]["prior"] is None
+
+
+def test_the_turn_is_told_the_reply_gives_the_pending_parameter_and_where_the_found_values_are():
+    from app.chat import engine, resolve
+
+    pending = api._pending_refs(PENDING, [{"id": "S1", "version_id": "v1"}])
+    inp = engine.TurnInput(question="8%", history=[], summary=None, focus_documents=[], prior_refs={"P1": {}},
+                           pending=pending)
+    text = engine._context_message(inp, binding=resolve.bind_pending(pending, "8%"))
+    assert "שיעור העלייה של העלויות" in text and "assume" in text and "«8%»" in text
+    assert "P1" in text and "24,600,000" in text and "search" in text
+
+
+def test_a_resolutions_component_takes_the_reply_for_the_pending_parameter():
+    from app.chat import engine, resolve
+
+    binding = resolve.bind_pending(PENDING, "8%")
+    resolved = [{"id": "N1", "text": "הרווח בתרחיש", "kind": "calculation",
+                 "parameters": [{"name": "שיעור העלייה של העלויות", "source": "not_given_by_user", "quote": ""},
+                                {"name": "מועד", "source": "not_given_by_user", "quote": ""}]}]
+    (c,) = engine._with_binding(resolved, binding)
+    assert c["parameters"] == [{"name": "שיעור העלייה של העלויות", "source": "given_by_user", "quote": "8%"},
+                               {"name": "מועד", "source": "not_given_by_user", "quote": ""}]
+    assert engine._with_binding(resolved, None) is resolved

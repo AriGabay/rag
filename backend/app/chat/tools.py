@@ -55,7 +55,14 @@ Tools:
 - ``assume``: a number the user gave for a scenario, quoted from the user's own message (``A#``);
 - ``calculate``: an expression over ``M#``/``V#``/``A#``/``C#`` (``app.chat.calc``): exact decimals, compatibility
   by operation, every result a ``C#`` with its formula, inputs, assumptions and sources that later calculations
-  may use; a result resting on an uncertain input is conditional and says why each input is uncertain (R18).
+  may use; a result resting on an uncertain input is conditional and says why each input is uncertain (R18). A
+  product of a document rate (a ``V#`` percentage, never the user's ``A#``) is compared with the amounts the rate's
+  source and section state for the same quantity (round 7 U7, KTD8, R23): one within the product's range over the
+  rate's rounding interval ("כ-17%": 16.5%–17.5%) is reported and kept in the record (``explicit_amount_available``,
+  with its quote), and a result built on that product carries it — the model is told to take the stated amount
+  unless the user asked for the rate, and nothing is substituted; one outside the interval is recorded as differing
+  (``stated_amount_differs``), to be shown beside the result. The literals stay structural (``calc``): a rate nobody
+  gave is refused, never applied.
 
 A file holding several appraisals, or an appendix about a comparison property, is read as several appraisal contexts
 (round 7 U6: KTD7; R20–R22; ``app.chat.contexts``, derived from the stored reading and cached per reading): search
@@ -76,7 +83,7 @@ import math
 import re
 import time
 from collections.abc import Container
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -3173,6 +3180,132 @@ def _reproduces(ws: Workspace, out: calc.Outcome, leaves: list[str]) -> dict | N
     return None
 
 
+# --- a stated amount beside a rounded rate (round 7 U7, KTD8, R23) ------------------------------------------------
+
+# words that name no quantity, left out when an amount's line is matched with the rate's words
+_FUNCTION_WORDS = frozenset({"של", "את", "על", "עם", "או", "גם", "כי", "אם", "לפי", "בין", "כל", "זה", "זו", "הוא",
+                             "היא", "הם", "הן", "אשר", "כפי", "לכל", "בכל", "מתוך", "עבור"})
+_HEBREW_WORD = re.compile(r"[א-ת][א-ת\"״׳']*")
+MSG_NEAR_MISS = ("שים לב — סכום כתוב לעומת שיעור מעוגל: התוצאה חושבה מ-{rate} (שיעור כתוב «{written}%», שטווח העיגול "
+                 "שלו {low}%–{high}%), וב-{source}, באותו מקום במסמך, כתוב סכום מפורש בתוך הטווח הזה: {amount} "
+                 "(«{quote}»). אלא אם המשתמש ביקש לחשב לפי השיעור — קח את הסכום הכתוב ב-take_value מ-{source} והשתמש "
+                 "בו במקום התוצאה הזו; אל תציג את התוצאה הזו כסכום שבמסמך.")
+MSG_NEAR_MISS_CARRIED = ("שים לב: החישוב נשען על {origin}, שחושב משיעור מעוגל ({rate}) בעוד שהמסמך מציין סכום מפורש "
+                         "לאותו נתון: {amount} ({source}, «{quote}»). אלא אם המשתמש ביקש לחשב לפי השיעור — קח את "
+                         "הסכום הכתוב ב-take_value וחשב ממנו מחדש.")
+MSG_STATED_DIFFERS = ("באותו מקום במסמך ({source}) כתוב סכום {amount} («{quote}») מחוץ לטווח העיגול של {rate} "
+                      "({low}%–{high}%): הוא אינו עיגול של החישוב הזה. אם תציג את התוצאה, הצג לידה גם את הסכום הכתוב "
+                      "ואת הפער ביניהם.")
+
+
+def _content_words(text_: str) -> set[str]:
+    """The words of a text that may name a quantity, with one conjunction and one prefix letter dropped, so
+    "והרווח" and "רווח" meet."""
+    out = set()
+    for w in _HEBREW_WORD.findall(meaning._norm(text_ or "")):
+        w = w.strip("\"'״׳")
+        if len(w) >= 4 and w[0] == "ו":
+            w = w[1:]
+        if len(w) >= 4 and w[0] in "הבלמשכ":
+            w = w[1:]
+        if len(w) >= 3 and w not in _FUNCTION_WORDS:
+            out.add(w)
+    return out
+
+
+def _line_of(text_: str, start: int, end: int) -> str:
+    a = text_.rfind("\n", 0, start) + 1
+    b = text_.find("\n", end)
+    return " ".join(text_[a:b if b >= 0 else len(text_)].split())
+
+
+def _last_part(section: str | None) -> str:
+    return " ".join((section or "").split("›")[-1].split())
+
+
+def _rate_sources(ws: Workspace, value: calc.Value) -> list[Source]:
+    """The rate's own source and the turn's other sources of its section, in its document and appraisal context."""
+    out = []
+    for s in ws.sources.values():
+        if s.is_listing or s.version_id != value.version_id:
+            continue
+        if s.sid != value.source_id and not (value.section and _last_part(s.section) == _last_part(value.section)):
+            continue
+        if value.context and s.contexts and value.context.get("number") not in s.contexts:
+            continue
+        out.append(s)
+    return out
+
+
+def _user_gave(ws: Workspace, written: str) -> bool:
+    """The user wrote the rate itself ("לפי 17%"): a calculation by it is what was asked."""
+    raw = re.sub(r"[^\d.]", "", written or "").strip(".")
+    if not raw:
+        return False
+    pattern = re.compile(r"(?<![\d.,])" + re.escape(raw) + r"(?:\.0+)?\s*(?:%|אחוז)")
+    return any(pattern.search(meaning._norm(m["text"])) for m in ws.user_messages)
+
+
+def _amount_record(sid: str, written: str, line: str, number: Decimal, rate: calc.Value,
+                   interval: tuple[Decimal, Decimal], exact: Decimal, low: Decimal, high: Decimal) -> dict:
+    return {"amount": written, "value": str(number), "source": sid, "quote": _clip(line, 300), "rate": rate.vid,
+            "rate_written": rate.written, "interval": [str(interval[0]), str(interval[1])], "computed": str(exact),
+            "range": [str(low), str(high)], "from": None}
+
+
+def _near_misses(ws: Workspace, node, operands: dict[str, calc.Operand], justification: str | None,
+                 label: str) -> tuple[dict | None, dict | None]:
+    """For each product of a document rate (a V# percentage, never the user's A#) in the expression, the amount its
+    source and section state for the same quantity (the amount's line shares a word with the rate's quote or label,
+    or with the calculation's label): within the product's range over the rate's rounding interval — a near-miss
+    (``explicit_amount_available``); else, within a factor of two of it, an amount that differs (a material gap).
+    An amount the product reproduces at its precision, or an input's own number, is neither."""
+    near = differs = None
+    near_key = differs_key = None
+    for product, rid in calc.rate_products(node):
+        rate = ws.values.get(rid)
+        if rate is None or rate.unit != "percent" or _user_gave(ws, rate.written):
+            continue
+        interval = calc.rounding_interval(rate.written)
+        if interval is None:
+            continue
+        try:
+            exact = calc.evaluate(product, operands, justification).value
+            ends = [calc.evaluate(product, operands | {rid: replace(operands[rid], value=x)}, justification).value
+                    for x in interval]
+        except calc.CalcError:
+            continue
+        low, high = min(ends), max(ends)
+        own = set()
+        for i in _leaves(ws, calc.ids_of(product)):
+            if i in ws.values:
+                own |= numbers_in(ws.values[i].written)
+        words = _content_words(" ".join([rate.quote, rate.label, label]))
+        seen = set()
+        for src in _rate_sources(ws, rate):
+            full = src.text or ""
+            for written, start, end, number in _numbers_of(full):
+                if numbers_in(written) & own or len(re.sub(r"\D", "", written).lstrip("0")) < 3:
+                    continue
+                if full[end:end + 2].lstrip().startswith("%"):
+                    continue
+                line = _line_of(full, start, end)
+                if (written, line) in seen:
+                    continue
+                seen.add((written, line))
+                overlap = len(words & _content_words(line))
+                if not overlap or calc.display_matches(written, False, exact, ()):
+                    continue
+                key = (overlap, src.sid == rate.source_id, -abs(number - exact))
+                record = _amount_record(src.sid, written, line, number, rate, interval, exact, low, high)
+                if low <= number <= high:
+                    if near_key is None or key > near_key:
+                        near, near_key = record, key
+                elif abs(exact) / 2 <= number <= abs(exact) * 2 and (differs_key is None or key > differs_key):
+                    differs, differs_key = record, key
+    return near, (None if near is not None else differs)
+
+
 def tool_calculate(ws: Workspace, expression: str, label: str = "", justification: str | None = None) -> str:
     """Evaluate an expression over the turn's ids (``app.chat.calc``) and register the result as a C#."""
     try:
@@ -3252,16 +3385,36 @@ def tool_calculate(ws: Workspace, expression: str, label: str = "", justificatio
                    if out.conditional else "")
     reproduces = None if out.assumptions else _reproduces(ws, out, leaves)
     kind = "scenario" if out.assumptions else "reproduces_report_value" if reproduces else "computed"
+    # a product of a rounded document rate beside the amount its section states (KTD8): reported and kept in the
+    # record, never substituted; a result built on such a product carries it
+    near, differs = _near_misses(ws, node, operands, justification, label)
+    if near is not None:
+        notes.append(MSG_NEAR_MISS.format(rate=near["rate"], written=near["rate_written"], low=near["interval"][0],
+                                          high=near["interval"][1], source=near["source"], amount=near["amount"],
+                                          quote=near["quote"]))
+    else:
+        carried = next((ws.computations[i] for i in out.inputs if i in ws.computations
+                        and ws.computations[i].explicit_amount), None)
+        if carried is not None:
+            near = dict(carried.explicit_amount)
+            near["from"] = near.get("from") or carried.cid
+            notes.append(MSG_NEAR_MISS_CARRIED.format(origin=near["from"], rate=near["rate"], amount=near["amount"],
+                                                      source=near["source"], quote=near["quote"]))
+    if differs is not None:
+        notes.append(MSG_STATED_DIFFERS.format(source=differs["source"], amount=differs["amount"],
+                                               quote=differs["quote"], rate=differs["rate"],
+                                               low=differs["interval"][0], high=differs["interval"][1]))
     c = calc.Computation(f"C{len(ws.computations) + 1}", (label or "").strip() or calc.render(node, name, True),
                          calc.render(node, lambda i: i), calc.render(node, lambda i: f"«{name(i)}»", True), out,
                          inputs, sources, len(docs), kind, justification if justified else None, " ".join(notes),
-                         reproduces, [lf.id for lf in out.leaves])
+                         reproduces, [lf.id for lf in out.leaves], near, differs, calc.applied_rates(node))
     ws.computations[c.cid] = c
     return json.dumps({"id": c.cid, "label": c.label, "expression": c.expression, "formula": c.formula,
                        "value": str(c.value), "display": c.display(), "unit": c.unit_label,
                        "result_kind": calc.RESULT_KINDS[kind], "reproduces": reproduces, "conditional": c.conditional,
                        "inputs": [x["id"] for x in inputs], "assumptions": c.assumptions, "n": out.n,
                        "documents": c.documents, "note": " ".join(x for x in (c.note, conditional) if x),
+                       "explicit_amount_available": near, "stated_amount_differs": differs,
                        "how_to_show": f"הצג את התוצאה מעוגלת (display) וצטט [{c.cid}]; הנחות המשתמש בנפרד עם [A#]"},
                       ensure_ascii=False)
 

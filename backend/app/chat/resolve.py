@@ -24,6 +24,11 @@ metric, unit, scale, period and area basis. The server then validates the parse:
   user's words are looked up (``app.chat.entities``) and the outcome is the scope, or a clarification. A question
   over a set of documents leaves the set to the tools;
 - a correction the model finds genuinely ambiguous gets one short clarification question, without tools;
+- **a pending parameter** (round 7 KTD9, R25): when the previous answer asked for a detail only the user can give,
+  the reply is bound to it deterministically (``bind_pending``), apart from the call: the calculation component is
+  frozen again with that parameter given by the user, quoting the reply, and the answering model is told to register
+  it with ``assume`` and to reopen the values already found through their ``P#`` rather than search again (unless the
+  resolution reads the message as a new question);
 - **components** (round 7 KTD1): the same call returns the request's typed components (``app.chat.request``), so a
   follow-up's requirements are frozen before the answer with no extra call; its output budget fits the list. They
   are validated apart from the rest: a component part that does not validate, or whose structure is broken (an
@@ -503,6 +508,54 @@ def resolve(provider: LLMProvider, focus: dict | None, history: list, message: s
     users = [m.content for m in history if getattr(m, "role", None) == "user"]
     return validate(r.parsed, focus, message, authorized, titles, lookup, candidates,
                     focus_titles=[d["title"] for d in documents], user_texts=[*users, message])
+
+
+_REPLY_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
+PENDING_QUOTE_CHARS = 160  # a reply this long or shorter is quoted whole; a longer one by the clause of its number
+
+
+def bind_pending(pending: dict | None, message: str) -> dict | None:
+    """The user's reply bound to the parameter the previous turn's clarification asked for (round 7 KTD9, R25):
+    {"parameter", "value" (the number as written), "quote" (the user's words that give it, for ``assume``),
+    "component" (the calculation component again, its parameter now given by the user, to freeze as the turn's
+    requirement), "found" (the values the previous turn found)}. Deterministic — it holds whether or not the
+    resolution call succeeds. None when nothing is pending, or when the reply holds no number or several (the
+    agent then reads the reply as it is)."""
+    names = [n for n in (pending or {}).get("parameters") or [] if n]
+    text_ = " ".join((message or "").split())
+    numbers = _REPLY_NUMBER.findall(text_)
+    if not names or len(numbers) != 1:
+        return None
+    if len(text_) <= PENDING_QUOTE_CHARS:
+        quote = text_
+    else:
+        at = text_.index(numbers[0])
+        start = max(text_.rfind(c, 0, at) for c in ".,;\n") + 1
+        ends = [i for i in (text_.find(c, at) for c in ".,;\n") if i >= 0]
+        quote = text_[start:min(ends) if ends else len(text_)].strip()
+    name = names[0]
+    parameters = [{"name": n, "source": "given_by_user", "quote": quote} if n == name
+                  else {"name": n, "source": "not_given_by_user", "quote": ""} for n in names]
+    component = {"id": pending.get("component") or "N1", "text": pending.get("text") or name, "kind": "calculation",
+                 "parent": "", "conditional": False, "subject": pending.get("subject") or "",
+                 "parameters": parameters, "compares": [], "aspect": ""}
+    return {"parameter": name, "value": numbers[0], "quote": quote, "component": component,
+            "found": list(pending.get("found") or [])}
+
+
+def pending_block(binding: dict) -> str:
+    """The answering model's task when the reply gives the parameter a clarification asked for: register it with
+    ``assume`` quoting the reply, reopen the values the previous turn found through their ``P#`` (no new search), and
+    compute."""
+    lines = [f"- הפרט שנשאל: «{prompt_text(binding['parameter'])}», לחישוב «{prompt_text(binding['component']['text'])}»",
+             f"- תשובת המשתמש: «{prompt_text(binding['quote'])}» — רשום אותה ב-assume (value={binding['value']}, quote "
+             f"מדויק מההודעה החדשה) וחשב ב-calculate"]
+    for v in binding["found"]:
+        where = f"פתח מחדש ב-read עם source={v['prior']}" if v.get("prior") else "חפש אותו שוב רק אם אין הפניה"
+        lines.append(f"- נמצא בתור הקודם: {v['id']} «{prompt_text(v.get('label') or '')}» = "
+                     f"{prompt_text(v.get('value_text') or '')} — {where}, ורשום אותו שוב ב-take_value")
+    return ("תשובה לשאלת ההבהרה של התור הקודם (אל תחפש מחדש את מה שכבר נמצא: אין צורך ב-search):\n"
+            + "\n".join(lines))
 
 
 def requested_block(req: Request) -> str:

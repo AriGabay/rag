@@ -15,8 +15,18 @@ grammar is a whitelist:
 
 ``×`` ``÷`` ``−`` are accepted for ``*`` ``/`` ``-``; ``A1%`` is ``A1 / 100``. Anything else — a name, an attribute,
 a call outside the list, a power, another number, a unary minus — is refused with the reason; nothing is ever
-evaluated as code. The literals are structural only: 1 (as in ``1 + A1%``), 100 (percent points) and 12 (months
-in a year); every other number must come from a source or from the user.
+evaluated as code. The literals are structural only (round 7 U7, KTD9, R25), and are checked where they are used:
+1 only beside a dimensionless value (``1 + A1%``, ``1 − C1``) or as a reciprocal's numerator, 100 only to convert a
+ratio to percentage points (``C1 × 100``) and back (``V3 ÷ 100``), 12 only as months in a year (``× 12``, ``÷ 12``).
+A literal never takes ``%``, two literals never combine, and none divides or scales an amount into a rate
+(``V2 × 12 ÷ 100``, ``V1 ÷ 100``): a rate, an increase or any other number of a scenario must come from a source
+(``V#``, ``M#``) or from the user (``A#``), else the user is asked for it.
+
+A rate written in a source has a rounding interval (round 7 KTD8, R23): half a unit of its last written digit
+(``rounding_interval``: "כ-17%" is 16.5%–17.5%). ``rate_products`` finds the products an expression applies a rate in,
+and ``applied_rates`` the ids it applies as rates; the tools use them to compare a product of a document rate with
+the amounts its source states (``tools.tool_calculate``), and to tell whether a parameter the user did not give was
+filled by a document rate (``verify.unfilled_parameters``).
 
 Values are exact ``Decimal`` throughout; nothing is rounded before display. Each operand carries its meaning —
 unit (as dimensions: ₪, מ״ר, דונם, %, ...), period, VAT, area basis, kind, role, subject, and where it came from —
@@ -216,8 +226,16 @@ _WORD = re.compile(r"[A-Za-z_֐-׿][A-Za-z0-9_֐-׿]*")
 _NUM = re.compile(r"\d+(?:\.\d+)?")
 _OPS = {"+": "+", "-": "-", "−": "-", "–": "-", "*": "*", "×": "*", "·": "*", "/": "/", "÷": "/", "%": "%",
         "(": "(", ")": ")", ",": ","}
-ALLOWED = ("מותרים רק מזהים M#/V#/A#/C#, הקבועים 1, 100, 12, הפעולות + − × ÷, סוגריים, % אחרי ערך, "
+ALLOWED = ("מותרים רק מזהים M#/V#/A#/C#, הקבועים המבניים 1, 100, 12, הפעולות + − × ÷, סוגריים, % אחרי מזהה, "
            "והפונקציות " + ", ".join(FUNCS) + " על רשימת מזהים")
+# a literal outside its structural use (round 7 U7): never a rate, an increase or an assumption
+MSG_LITERAL = ("הקבוע {lit} אינו מותר כאן: הקבועים מבניים בלבד — 1 ליד ערך ללא יחידה (1 + A1%), 100 להמרה בין יחס "
+               "לאחוז (C1 × 100, V3 ÷ 100), 12 להמרה בין חודש לשנה (× 12, ÷ 12). קבוע לעולם אינו שיעור, תוספת או "
+               "הנחה: שיעור נלקח מהמקור (take_value, V#) או מהמשתמש (assume, A#); אם אף אחד מהם לא נתן אותו — "
+               "אל תניח אותו, שאל את המשתמש")
+MSG_LITERAL_PERCENT = ("% מותר רק אחרי מזהה (V#/A#/C#), לא אחרי קבוע: {lit}% הוא שיעור שאיש לא נתן. שיעור נלקח מהמקור "
+                       "(take_value, V#) או מהמשתמש (assume, A#); אם אף אחד מהם לא נתן אותו — אל תניח אותו, שאל את "
+                       "המשתמש")
 
 
 def _tokens(expression: str) -> list[tuple[str, str]]:
@@ -389,6 +407,73 @@ def ids_of(node) -> list[str]:
     return []
 
 
+def _rate_id(node) -> str | None:
+    """The id a node applies as a rate: ``X%``, or ``X ÷ 100`` of a percentage, over one id."""
+    if isinstance(node, Pct) and isinstance(node.node, Ref):
+        return node.node.id
+    if (isinstance(node, Bin) and node.op == "/" and isinstance(node.left, Ref) and isinstance(node.right, Lit)
+            and node.right.text == "100"):
+        return node.left.id
+    return None
+
+
+def applied_rates(node) -> list[str]:
+    """The ids an expression applies as rates (``A1%``, ``V3 ÷ 100``), in order, each once (round 7 KTD9): what
+    fills a scenario's rate — a user's assumption or a value of a source, never a literal."""
+    out: list[str] = []
+
+    def walk(n) -> None:
+        rate = _rate_id(n)
+        if rate is not None:
+            out.append(rate)
+        elif isinstance(n, Pct):
+            walk(n.node)
+        elif isinstance(n, Bin):
+            walk(n.left)
+            walk(n.right)
+
+    walk(node)
+    return list(dict.fromkeys(out))
+
+
+def rate_products(node) -> list[tuple[Any, str]]:
+    """Each product an expression applies a rate in (round 7 KTD8): (the nearest ``×`` above the rate, the rate's
+    id) — ``V1 × V2%`` itself, ``V2 × (1 + V3%)`` inside ``V1 − V2 × (1 + V3%)``."""
+    out: list[tuple[Any, str]] = []
+
+    def walk(n, product) -> None:
+        rate = _rate_id(n)
+        if rate is not None:
+            if product is not None:
+                out.append((product, rate))
+        elif isinstance(n, Pct):
+            walk(n.node, product)
+        elif isinstance(n, Bin):
+            inner = n if n.op == "*" else product
+            walk(n.left, inner)
+            walk(n.right, inner)
+
+    walk(node, None)
+    return out
+
+
+_WRITTEN_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+def rounding_interval(written: str) -> tuple[Decimal, Decimal] | None:
+    """The values a number written with its precision may stand for (round 7 KTD8, R23): half a unit of its last
+    written digit on each side — "17" (or "כ-17%") is 16.5–17.5, "17.5" is 17.45–17.55. None unless the text holds
+    exactly one number."""
+    found = _WRITTEN_NUMBER.findall(written or "")
+    if len(found) != 1:
+        return None
+    raw = found[0].replace(",", "")
+    places = len(raw.split(".", 1)[1]) if "." in raw else 0
+    half = Decimal(5).scaleb(-(places + 1))
+    value = Decimal(raw)
+    return value - half, value + half
+
+
 # --- evaluation ------------------------------------------------------------------------------------------------
 
 _KNOWN_UNITS = {dims_of(k): v for k, v in UNIT_LABELS.items() if k in UNIT_DIMS and k not in ("other",)}
@@ -465,6 +550,8 @@ class _Eval:
             return Operand(None, v, literal=v)
         if isinstance(node, Pct):
             x = self.eval(node.node)
+            if not x.leaves:  # a literal, or literals combined: a rate nobody gave
+                raise CalcError(MSG_LITERAL_PERCENT.format(lit=render(node.node, lambda i: i)))
             if x.dims not in ((), (("%", 1),)):
                 raise CalcError(f"% מותר רק אחרי אחוז או מספר (למשל A1%); {render(node.node, lambda i: i)} הוא "
                                 f"{unit_label(x.dims)}")
@@ -474,8 +561,30 @@ class _Eval:
         if isinstance(node, Agg):
             return self.step(node, self.aggregate(node))
         a, b = self.eval(node.left), self.eval(node.right)
+        self._literals(node.op, a, b)
         out = self.additive(node.op, a, b) if node.op in "+-" else self.multiplicative(node.op, a, b)
         return self.step(node, out)
+
+    @staticmethod
+    def _literals(op: str, a: Operand, b: Operand) -> None:
+        """A literal only in its structural use (module docstring): 1 beside a dimensionless value or over one, 100
+        between a ratio and percentage points, 12 between a month and a year — never a rate or an assumption."""
+        la, lb = not a.leaves, not b.leaves
+        if not (la or lb):
+            return
+        if la and lb:
+            raise CalcError(MSG_LITERAL.format(lit=_literal_text(a if a.literal is not None else b)))
+        lit, other, left = (a, b, True) if la else (b, a, False)
+        n = lit.literal
+        pct = (("%", 1),)
+        if op in "+-":
+            ok = n == 1 and other.dims == ()
+        elif op == "*":
+            ok = n in (1, 12) or (n == 100 and other.dims == ())
+        else:  # "/": a literal divisor converts; a literal numerator only as a reciprocal
+            ok = (n == 1 and other.dims == ()) if left else (n in (1, 12) or (n == 100 and other.dims == pct))
+        if not ok:
+            raise CalcError(MSG_LITERAL.format(lit=_literal_text(lit)))
 
     def step(self, node, out: Operand) -> Operand:
         if out.value is not None:
@@ -667,6 +776,10 @@ class _Eval:
         if "ILS" in dict(a.dims) and _area(b.dims) and a.kind in BASE_PER_AREA:
             return BASE_PER_AREA[a.kind]
         return None
+
+
+def _literal_text(o: Operand) -> str:
+    return fmt(o.value) if o.value is not None else "?"
 
 
 def _value(o: Operand) -> Decimal:
@@ -921,6 +1034,13 @@ class Computation:
     note: str
     reproduces: dict | None = None  # {"source": S#|M#, "as_written"} when it equals a number the report writes
     leaves: list[str] = field(default_factory=list)
+    # round 7 KTD8 (R23): a product of a document rate whose source states an amount within the rate's rounding
+    # interval — {"amount", "value", "source", "quote", "rate", "rate_written", "interval", "computed", "range",
+    # "from" (the C# it came through, or None)} — reported, kept in the record, never substituted; and an amount the
+    # same source states outside that interval (the same shape), which the answer shows beside the result as a gap
+    explicit_amount: dict | None = None
+    stated_amount_differs: dict | None = None
+    rates: list[str] = field(default_factory=list)  # the ids it applies as rates (``applied_rates``, KTD9)
 
     @property
     def value(self) -> Decimal:
@@ -971,5 +1091,7 @@ class Computation:
                 # the intermediate results (the last step is the result itself), at full precision and as shown
                 "steps": [{"expression": t, "value": str(v), "display": fmt(v)} for t, v in self.outcome.steps[:-1]],
                 "rounding": rounding_rule(self.value, self.dims, self.outcome.kind),
+                "explicit_amount_available": self.explicit_amount, "stated_amount_differs": self.stated_amount_differs,
+                "rates": list(self.rates),
                 # the earlier shape, for readers of stored answers
                 "operation": self.expression, "result": str(self.value)}

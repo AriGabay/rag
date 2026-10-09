@@ -4,13 +4,18 @@ The model is scripted; these tests prove what the server checks and records: a v
 number is the one at the named row and column (or inside the exact quote), with what the source attests about it;
 an assumption only when the user wrote it; a calculation keeps full precision, chains, refuses what does not combine,
 and labels a scenario; the answer that shows its results rounded verifies with nothing removed; and a value from a
-document the user can no longer see cannot be used. Synthetic documents only; the project and streets are invented."""
+document the user can no longer see cannot be used. Round 7 U7 (KTD8, KTD9, R23–R25, AE7, AE8): over the synthetic
+round-7 residual report, a product of a rounded rate is reported beside the amount its section states, a user's rate
+is the requested assumption, a report-stated scenario rate is computed without asking, and a rate nobody gave leads
+to one clarification that keeps the found values, whose reply computes in the next turn without a new search.
+Synthetic documents only; the project and streets are invented."""
 
 from __future__ import annotations
 
 import json
 import re
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from sqlalchemy import text
@@ -20,7 +25,7 @@ from app.db import tenant_tx
 from tests.conftest import login
 from tests.factories import make_document, make_group, make_office, make_user
 from tests.integration.test_chat import cloud, new_conversation, send
-from tests.support.scripted_agent import ScriptedAgent, call, final, read
+from tests.support.scripted_agent import ScriptedAgent, call, component, final, read, requirement
 
 pytestmark = pytest.mark.db
 
@@ -431,3 +436,267 @@ def test_a_division_by_zero_on_found_values_is_reported_as_a_failed_calculation_
     out = run(ws, "calculate", expression="V3 / (V1 - V2)", label="יחס", justification=None)
     assert out.startswith("שגיאה") and "חלוקה באפס" in out
     assert "החישוב נכשל" in out and "לא נתון חסר" in out and not ws.computations
+
+
+# --- round 7 U7: a stated amount over a rounded rate, and a parameter nobody gave (KTD8, KTD9, R23–R25) -----------
+
+ROUND7 = json.loads((Path(__file__).resolve().parents[1] / "fixtures" / "round7" / "manifest.json").read_text(
+    encoding="utf-8"))["documents"]["residual"]
+FACTS = ROUND7["facts"]
+CALC_SECTION, CHECK_SECTION = FACTS["cost"]["section"], FACTS["threshold"]["section"]
+SENSITIVITY = FACTS["sensitivity_rate"]["section"]
+SUBJECT = "פרויקט ברחוב התאנה 30"
+RISE_QUESTION = "מה יהיה הרווח היזמי אם עלויות הבנייה והפיתוח יעלו?"
+RISE = component("הרווח היזמי אם עלויות הבנייה והפיתוח יעלו", "calculation", subject=SUBJECT,
+                 parameters=[{"name": "שיעור העלייה של העלויות", "source": "not_given_by_user", "quote": ""}])
+
+
+def add_residual(office, amount: str | None = None, sensitivity: bool = True, sha: str = "8" * 64) -> str:
+    """R7d's sections as stored blocks (the synthetic round-7 residual report): the calculation section — income,
+    cost, the developer's profit as "כ-17%" of cost and as an amount, the land value — the threshold and, when
+    ``sensitivity``, the sensitivity section with its 6% cost increase. ``amount``: another stated profit amount."""
+    calc_lines = [FACTS[k]["text"] for k in ("income", "cost", "profit_rate", "profit_amount", "land_value")]
+    if amount is not None:
+        calc_lines[3] = calc_lines[3].replace(FACTS["profit_amount"]["value"], amount)
+    sections = [(CALC_SECTION, calc_lines), (CHECK_SECTION, [FACTS["threshold"]["text"]])]
+    if sensitivity:
+        sections.append((SENSITIVITY, [FACTS["sensitivity_rate"]["text"]]))
+    doc, ver = make_document(office, office.default_group_id, "בדיקת כדאיות — רחוב התאנה 30 (סינתטי)", sha=sha)
+    blocks = [(kind, section, t) for section, lines in sections
+              for kind, t in [("heading", section), *(("paragraph", x) for x in lines)]]
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_versions SET page_count = 1, ingestion = CAST(:i AS jsonb) WHERE id = :v"),
+                     {"v": ver, "i": json.dumps({"reading_id": "reading-r7"})})
+        for i, (kind, section, t) in enumerate(blocks):
+            conn.execute(text(
+                "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
+                " section_path, page, text, status) VALUES (app_office(), :d, :v, :b, :k, :s, :sp, 1, :t, 'read')"),
+                {"d": doc, "v": ver, "b": i, "k": kind, "s": section, "sp": [section], "t": t})
+    return str(doc)
+
+
+def rmeaning(kind: str, unit: str = "ILS", role: str = "other", scenario: str = "") -> dict:
+    return {"kind": kind, "unit": unit, "period": "none", "vat": "unknown", "area_basis": "", "subject": SUBJECT,
+            "role": role, "stated_by": "", "stance": "unknown", "scenario": scenario}
+
+
+def fact(key: str, source: str, meaning_: dict, label: str, text_: str | None = None) -> dict:
+    f = FACTS[key]
+    return take(source, quote((text_ or f["text"]).rstrip("."), f["value"]), meaning_, label)
+
+
+def _section_source(ws, doc: str, name: str) -> str:
+    out = T.tool_read(ws, {"section": handle_of(T.tool_outline(ws, doc), name)})
+    return re.search(r'<source id="(S\d+)"', out).group(1)
+
+
+def _open(name: str):
+    return lambda items: [read(section=handle_of(next(o for o in reversed(_outputs(items)) if "«" + name + "»" in o),
+                                                 name))]
+
+
+def test_ae7_cost_times_a_rounded_rate_reports_the_amount_the_section_states_and_keeps_it_in_the_record(office):
+    doc = add_residual(office)
+    ws = workspace(office, question="מה הפער בין הרווח היזמי לבין הרווח המינימלי הנדרש?")
+    s = _section_source(ws, doc, CALC_SECTION)
+    t = _section_source(ws, doc, CHECK_SECTION)
+    for step in (fact("cost", s, rmeaning("cost", role="cost"), "סך העלויות"),
+                 fact("profit_rate", s, rmeaning("rate", "percent", "rate"), "שיעור הרווח היזמי"),
+                 fact("threshold", t, rmeaning("profit"), "הרווח המינימלי הנדרש")):
+        assert run(ws, "take_value", **step["arguments"]).startswith("V"), step
+    out = json.loads(T.tool_calculate(ws, "V1 * V2%", "הרווח היזמי"))
+    assert out["display"]["value"] == ROUND7["gap_to_threshold"]["cost_times_rate"]
+    near = out["explicit_amount_available"]
+    # the amount the section states for the same quantity, within 16.5%–17.5% of the cost — never the land value,
+    # which the interval holds too but which states another quantity
+    assert near["amount"] == FACTS["profit_amount"]["value"] and near["source"] == s
+    assert FACTS["profit_amount"]["text"].rstrip(".") in near["quote"] and near["rate"] == "V2"
+    assert near["interval"] == ["16.5", "17.5"] and FACTS["land_value"]["value"] not in json.dumps(near)
+    assert "take_value" in out["note"] and FACTS["profit_amount"]["value"] in out["note"]
+    assert ws.computations["C1"].public()["explicit_amount_available"] == near  # kept in the calculation record
+    # the gap built on it carries the stated amount; chained at full precision, rounded once for display
+    gap = json.loads(T.tool_calculate(ws, "C1 - V3", "הפער לסף"))
+    assert Decimal(gap["value"]) == Decimal("18350000") * Decimal("0.17") - Decimal("2800000")
+    assert gap["display"]["value"] == ROUND7["gap_to_threshold"]["from_rounded_rate"]
+    assert gap["explicit_amount_available"]["amount"] == near["amount"] and gap["explicit_amount_available"]["from"] == "C1"
+    # nothing was replaced: both results are the computation the model asked for
+    assert ws.computations["C1"].value == Decimal("3119500.00")
+
+
+def test_a_stated_amount_outside_the_rounding_interval_is_no_near_miss_and_both_figures_stay(client, office,
+                                                                                            monkeypatch):
+    doc = add_residual(office, amount="3,400,000")  # 18.5% of the cost: not what "כ-17%" rounds from
+    stated = FACTS["profit_amount"]["text"].replace(FACTS["profit_amount"]["value"], "3,400,000").rstrip(".")
+    answer = ("לפי חישוב, 17% מהעלויות [V2] הם 3,119,500 ₪ [C1], ואילו התחשיב מציין סכום רווח יזמי של "
+              "3,400,000 ₪ [V3]; בין השניים פער מהותי.")
+    agent = ScriptedAgent([
+        [call("outline", document=doc)], _open(CALC_SECTION),
+        [fact("cost", "S1", rmeaning("cost", role="cost"), "סך העלויות"),
+         fact("profit_rate", "S1", rmeaning("rate", "percent", "rate"), "שיעור הרווח היזמי"),
+         take("S1", quote(stated, "3,400,000"), rmeaning("profit"), "סכום הרווח היזמי")],
+        [call("calculate", expression="V1 * V2%", label="הרווח לפי השיעור", justification=None)],
+        final(answer, documents=[doc])])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), "מה הרווח היזמי בתחשיב?")
+    assert m["status"] == "done", m
+    out = json.loads(agent.tool_outputs(4)[-1])
+    assert out["explicit_amount_available"] is None
+    assert out["stated_amount_differs"]["amount"] == "3,400,000"  # recorded, and the note says to show both
+    a = m["answer"]
+    assert a["verification"]["removed"] == 0, a
+    assert "3,119,500" in a["markdown"] and "3,400,000" in a["markdown"]
+
+
+USE_RATE = "חשב את הרווח היזמי לפי 17% מסך העלויות"
+
+
+def test_a_rate_the_user_asks_for_is_used_as_the_requested_assumption_with_no_flag(client, office, monkeypatch):
+    doc = add_residual(office)
+    answer = "לפי הנחתך, 17% [A1] מסך העלויות 18,350,000 ₪ [V1] הם 3,119,500 ₪ [C1] (חישוב)."
+    agent = ScriptedAgent([
+        [call("outline", document=doc)], _open(CALC_SECTION),
+        [fact("cost", "S1", rmeaning("cost", role="cost"), "סך העלויות"),
+         call("assume", value="17%", quote="לפי 17% מסך העלויות", label="שיעור הרווח שביקשת")],
+        [call("calculate", expression="V1 * A1%", label="הרווח לפי השיעור שביקשת", justification=None)],
+        final(answer, documents=[doc])])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), USE_RATE)
+    assert m["status"] == "done", m
+    out = json.loads(agent.tool_outputs(4)[-1])
+    assert out["explicit_amount_available"] is None and out["assumptions"] == ["A1"]
+    a = m["answer"]
+    assert a["verification"]["removed"] == 0 and a["status"] == "answered", a
+    (c1,) = a["computations"]
+    assert c1["result_kind"] == "scenario" and c1["explicit_amount_available"] is None
+    (assumption,) = a["assumptions"]
+    assert assumption["quote"] == "לפי 17% מסך העלויות"
+    rounds = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["rounds"]
+    assert not [p for r in rounds for p in r if p["kind"] == "input_choice"]
+
+
+def _scripted_judge(missing_without: str = "[C"):
+    """A judge that supports every unit and scores each frozen component full when a unit cites a calculation
+    (``missing_without``), else missing, naming the values the turn found as related."""
+    def respond(input: str) -> dict:
+        units = {int(i): t for i, t in re.findall(r'<unit index="(\d+)" cites="([^"]*)"', input)}
+        raw = dict(re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S))
+        out = {"verdicts": [{"index": i, "verdict": "supported", "reason": "בדיקה", "supported_by": []} for i in units]}
+        if "<requirements>" in input:
+            computed = [i for i, cites in units.items() if "C" in cites or missing_without in raw.get(str(i), "")]
+            out["requirements"] = [requirement(id=r, status="full" if computed else "missing", units=computed,
+                                               related=[] if computed else ["V1", "V2"])
+                                   for r in re.findall(r'<requirement id="([A-Z][\d.]+)"', input)]
+        return out
+
+    return respond
+
+
+def test_a_cost_increase_rate_the_report_states_is_computed_as_the_reports_scenario_and_nothing_is_asked(
+        client, office, monkeypatch):
+    doc = add_residual(office)
+    answer = ("לפי תרחיש הרגישות בתחשיב, עלייה של 6% בעלויות [V3]: ההכנסות 24,600,000 ₪ [V1] והעלויות "
+              "18,350,000 ₪ [V2], והרווח היזמי בתרחיש זה יהיה, לפי חישוב, 5,149,000 ₪ [C1].")
+    agent = ScriptedAgent([
+        [call("outline", document=doc)], _open(CALC_SECTION), _open(SENSITIVITY),
+        [fact("income", "S1", rmeaning("income", role="income"), "ההכנסות"),
+         fact("cost", "S1", rmeaning("cost", role="cost"), "העלויות"),
+         fact("sensitivity_rate", "S2", rmeaning("rate", "percent", "rate", scenario="תרחיש הרגישות"),
+              "עליית העלויות בתרחיש הרגישות")],
+        [call("calculate", expression="V1 - V2 * (1 + V3%)", label="הרווח בתרחיש הרגישות", justification=None)],
+        final(answer, documents=[doc])], judge=_scripted_judge(), request=[RISE])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), RISE_QUESTION)
+    assert m["status"] == "done", m
+    a = m["answer"]
+    assert a["status"] == "answered" and a["verification"]["removed"] == 0, a
+    assert a["computations"][0]["value"] == "5149000.00" and "5,149,000" in a["markdown"]
+    assert [c["status"] for c in a["components"]] == ["full"] and a.get("pending") is None
+    assert a["computations"][0]["explicit_amount_available"] is None
+
+
+def test_a_rate_nobody_gave_is_refused_as_a_literal_and_its_assumed_result_repaired_into_a_clarification(
+        client, office, monkeypatch):
+    doc = add_residual(office, sensitivity=False)
+    income, cost = FACTS["income"]["value"], FACTS["cost"]["value"]
+    assumed = (f"ההכנסות {income} ₪ [V1] והעלויות {cost} ₪ [V2]. אם העלויות יעלו ב-12%, הרווח היזמי יהיה "
+               "כ-4 מיליון ₪.")
+    ask = (f"ההכנסות {income} ₪ [V1] והעלויות {cost} ₪ [V2]. הרווח בתרחיש הוא ההכנסות פחות העלויות אחרי העלייה. "
+           "באיזה שיעור יעלו העלויות?")
+    agent = ScriptedAgent([
+        [call("outline", document=doc)], _open(CALC_SECTION),
+        [fact("income", "S1", rmeaning("income", role="income"), "ההכנסות"),
+         fact("cost", "S1", rmeaning("cost", role="cost"), "העלויות")],
+        [call("calculate", expression="V1 - V2 * (1 + 12%)", label="הרווח בתרחיש", justification=None)],
+        final(assumed, documents=[doc]),
+        final(ask, status="clarification", clarification="באיזה שיעור יעלו העלויות?", documents=[doc])],
+        judge=_scripted_judge(), request=[RISE])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), RISE_QUESTION)
+    assert m["status"] == "done", m
+    refused = agent.tool_outputs(4)[-1]
+    assert refused.startswith("שגיאה") and "קבוע" in refused and "שאל את המשתמש" in refused
+    rounds = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["rounds"]
+    (assumption,) = [p for p in rounds[0] if p["kind"] == "assumption"]
+    assert assumption["failure_kind"] == "wrong_calculation" and assumption["check"] == "unrequested_assumption"
+    a = m["answer"]
+    assert a["status"] == "clarification" and "4 מיליון" not in a["markdown"]
+    assert income in a["markdown"] and cost in a["markdown"] and "[V1]" in a["markdown"]  # found data and citations kept
+    assert {v["id"] for v in a["values"]} == {"V1", "V2"}
+    assert a["pending"]["parameters"] == ["שיעור העלייה של העלויות"] and a["missing"]
+
+
+def test_ae8_a_cost_increase_without_a_rate_asks_once_and_the_reply_computes_without_searching_again(
+        client, office, monkeypatch):
+    doc = add_residual(office, sensitivity=False)
+    income, cost = FACTS["income"]["value"], FACTS["cost"]["value"]
+    found = f"ההכנסות הצפויות הן {income} ₪ [V1] והעלויות {cost} ₪ [V2]."
+    ask = found + " באיזה שיעור לדעתך יעלו העלויות?"
+    first = ScriptedAgent([
+        [call("outline", document=doc)], _open(CALC_SECTION),
+        [fact("income", "S1", rmeaning("income", role="income"), "ההכנסות"),
+         fact("cost", "S1", rmeaning("cost", role="cost"), "העלויות")],
+        final(found, documents=[doc]),  # the found values, and no question: the repair asks for the missing rate
+        final(ask, status="clarification", clarification="באיזה שיעור יעלו העלויות?", documents=[doc])],
+        judge=_scripted_judge(), request=[RISE])
+    cloud(monkeypatch, office, first)
+    login(client, "admin-a@example.test")
+    cid = new_conversation(client)
+    m = send(client, cid, RISE_QUESTION)
+    assert m["status"] == "done", m
+    a = m["answer"]
+    repair = [i["content"] for i in first.seen[-1] if isinstance(i, dict) and i.get("role") == "user"][-1]
+    assert "שאל" in repair and "שיעור העלייה של העלויות" in repair
+    assert a["status"] == "clarification" and income in a["markdown"] and cost in a["markdown"]
+    pending = a["pending"]
+    assert pending["component"] == "N1" and pending["parameters"] == ["שיעור העלייה של העלויות"]
+    assert [v["id"] for v in pending["found"]] == ["V1", "V2"] and pending["found"][0]["value_text"] == income
+
+    def reopen(items):
+        context = items[0]["content"]
+        assert "שיעור העלייה של העלויות" in context and "assume" in context  # the reply is bound to the parameter
+        return [read(source=re.search(r"(P\d+)", context.split("שיעור העלייה של העלויות", 1)[1]).group(1))]
+
+    answer = (f"לפי הנחתך שהעלויות יעלו ב-8% [A1]: ההכנסות {income} ₪ [V1] והעלויות {cost} ₪ [V2], והרווח היזמי "
+              "יהיה, לפי חישוב, 4,782,000 ₪ [C1].")
+    second = ScriptedAgent([
+        reopen,
+        [fact("income", "S1", rmeaning("income", role="income"), "ההכנסות"),
+         fact("cost", "S1", rmeaning("cost", role="cost"), "העלויות"),
+         call("assume", value="8%", quote="8%", label="שיעור העלייה של העלויות")],
+        [call("calculate", expression="V1 - V2 * (1 + A1%)", label="הרווח היזמי בתרחיש", justification=None)],
+        final(answer, documents=[doc])], judge=_scripted_judge())
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
+    m2 = send(client, cid, "8%")
+    assert m2["status"] == "done", m2
+    b = m2["answer"]
+    calls = [i["name"] for step in second.seen for i in step if isinstance(i, dict) and i.get("type") == "function_call"]
+    assert "search" not in calls and "read" in calls  # the found values reopened, never searched again
+    assert b["status"] == "answered" and b["verification"]["removed"] == 0, b
+    assert b["computations"][0]["value"] == "4782000.00" and "4,782,000" in b["markdown"]
+    (assumption,) = b["assumptions"]
+    assert assumption["quote"] == "8%" and assumption["current"] is True
+    assert [c["status"] for c in b["components"]] == ["full"]

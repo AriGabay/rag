@@ -36,6 +36,18 @@ One turn:
    ledger. Correctness and completeness are reported apart (``VerifyReport.counts``; each component, with its
    status, reason and evidence, in the ledger's ``requirements``).
 
+Inputs and missing assumptions (round 7 U7, KTD8, KTD9, R23–R25). The policy has one rule on assumptions: a
+material parameter the user did not give is never assumed; a rate the report itself states (a sensitivity scenario,
+say) is a document value to compute from and present as the report's; when neither gave it, the answer is a
+clarification that keeps the values found with their citations, may give the general formula without a number, and
+asks one focused question. A calculation's product of a rounded document rate beside an amount its section states is
+reported by the calculator (``tools.tool_calculate``) and, when an answer rests on it, is a repairable
+``input_choice`` problem; a scenario number nobody gave is a repairable ``assumption`` problem (``verify``). A
+clarification stores its pending parameter on the message (``TurnOutcome.pending``, ``_pending``); the next turn binds
+the reply to it before anything else (``resolve.bind_pending``), freezes the component with the parameter given by the
+user, and tells the model to register it with ``assume`` and to reopen the values already found through their
+``P#`` — no new search.
+
 Every removal is a structured decision (round 7 U4, KTD5, KTD10): the repair prompt gives each problem's failure kind,
 the ids it was checked against and how a repair of that kind goes, within the same repair-round budget and
 ``REPAIR_TIME_FACTOR``; ``finish`` records on each decision whether a repair prompt named its unit
@@ -87,6 +99,7 @@ from app.chat.verify import (
     VerdictCache,
     VerificationUnavailable,
     VerifyReport,
+    unfilled_parameters,
     verify_answer,
 )
 from app.config import get_settings
@@ -155,15 +168,21 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
 - טבלה עם כמה ערכים מהסוג המבוקש (למשל כמה שורות של דמי שכירות): הצג את כל הערכים, או את מספרם ואת הטווח. אם אתה
   מציג ערך אחד — אמור במפורש שהוא דוגמה וכמה ערכים יש בטבלה (שורת "הטבלה: N שורות").
 - חישוב (סכום, הפרש, יחס, אחוז, ממוצע, ספירה, תרחיש): לעולם אל תחשב בעצמך, גם לא חישוב פשוט. כשהבקשה דורשת חישוב
-  והקלטים שלו נמצאו במסמכים — חשב אותו בכלים, גם אם המסמך עצמו אינו מציג את החישוב או את התוצאה; אל תענה שהנתון
-  לא נמצא רק כי התוצאה אינה כתובה במסמך. (1) כל ערך מהמסמכים
+  וכל הקלטים שלו נמצאו — במסמכים או בדברי המשתמש — חשב אותו בכלים, גם אם המסמך עצמו אינו מציג את החישוב או את
+  התוצאה; אל תענה שהנתון לא נמצא רק כי התוצאה אינה כתובה במסמך. כשהמסמך מציין לאותו נתון גם סכום מפורש וגם שיעור
+  מעוגל שמתאר אותו ("כ-17% מהעלויות" ו"סכום הרווח: ..."), השתמש בסכום הכתוב, אלא אם המשתמש ביקש לחשב לפי השיעור;
+  אם calculate מדווח explicit_amount_available — קח את הסכום הכתוב ב-take_value וחשב ממנו. (1) כל ערך מהמסמכים
   רשום קודם ב-take_value מתוך מקור S# שקראת בתור הזה: תא בטבלה (שורה ועמודה) או ציטוט מדויק שהמספר בתוכו, עם
   משמעותו (סוג, יחידה, תקופה, מע"מ, בסיס שטח, נושא, תפקיד) → V#. נתונים מ-find_measurements (M#) נכנסים לחישוב
   ישירות. (2) מספר שהמשתמש נתן לתרחיש ("העלויות יעלו ב-5%") רשום ב-assume עם ציטוט מדויק מהודעת המשתמש → A#; מספר
-  שהמשתמש לא כתב אינו הנחה — שאל אותו. כשחסרה הנחה מהותית שהמשתמש לא נתן (שיעור, תקופה, בסיס, איזה שלב):
-  שאל אותו (status=clarification), או — כשאפשר לחשב בלי מספר שהוא לא כתב, למשל לפי חלופה שכתובה במסמך עם
-  justification — הצג את החישוב במפורש כתרחיש מותנה ואמור על מה הוא מותנה; לעולם אל תציג תרחיש כזה כעובדה. (3) calculate עם ביטוי על המזהים (+ - * /, סוגריים, A1% = A1/100,
-  sum/mean/median/min/max/count, והקבועים 1, 100, 12 בלבד) → C#, שאפשר להזין לחישוב הבא. התוצאה נשמרת בדיוק מלא:
+  שהמשתמש לא כתב אינו הנחה. פרמטר מהותי לחישוב שהמשתמש לא נתן (שיעור שינוי, תקופה, בסיס, איזה שלב): אם המסמך עצמו
+  מציין אותו (למשל שיעור עלייה בתרחיש רגישות, או חלופה שכתובה במסמך) — זה ערך מהמסמך: רשום אותו ב-take_value, חשב
+  ממנו, והצג את התוצאה במפורש כתרחיש מותנה של המסמך (אמור על מה הוא מותנה; לעולם לא כעובדה), בלי לשאול. אם לא
+  המשתמש ולא המסמכים נתנו אותו — לעולם אל תניח אותו ואל תציג תוצאה: ענה
+  status=clarification עם הנתונים שכבר נמצאו ומראי המקום שלהם, מותר עם הנוסחה הכללית במילים (בלי מספר), ושאלה אחת
+  ממוקדת שנוקבת בפרט החסר. בתור הבא, כשהמשתמש עונה, רשום את תשובתו ב-assume וחשב. (3) calculate עם ביטוי על המזהים
+  (+ - * /, סוגריים, A1% = A1/100, sum/mean/median/min/max/count, והקבועים המבניים 1, 100, 12 בלבד: 1 + A1%, המרה בין
+  יחס לאחוז, חודשים בשנה — קבוע לעולם אינו שיעור או הנחה) → C#, שאפשר להזין לחישוב הבא. התוצאה נשמרת בדיוק מלא:
   הצג אותה מעוגלת (למשל 14.3%) עם [C#], והצג את הנחות המשתמש בנפרד מנתוני המסמך, עם [A#] ובמילים "לפי הנחתך".
   הבחן בתשובה בין מספרים שנכתבו במסמך ([V#]/[S#]), הנחות המשתמש ([A#]) ותוצאות שחושבו עכשיו לבקשתו ([C#]):
   אמור אילו מספרים נכתבו במסמך ואילו חושבו עכשיו ("לפי חישוב", "מחושב"), ולעולם אל תציג תוצאת חישוב כאילו נכתב
@@ -180,8 +199,9 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
   (read עם source=P#) או חפש שוב. אם המשתמש מתקן אותך ("התכוונתי לשווי, לא לשכירות") — עבור למה שביקש ושמור על שאר
   ההגדרות של השאלה הקודמת (אותו נכס, אותה יחידה: אם נשאלת על ערך למ"ר, התיקון מתייחס לערך למ"ר). אם הוא מחליף
   נושא — אל תגרור תנאים מהנושא הקודם. "זה" בשאלת המשך מתייחס לנתון שבמרכז השאלה והתשובה הקודמות, לא לפרט צדדי.
-- בקש הבהרה (status=clarification) רק כשיש עמימות שמשנה את התשובה ושנובעת מהשאלה ומהמקורות (למשל שני מסמכים
-  מתאימים לכתובת שנשאלה). אחרת — ענה עם הסתייגות ברורה.
+- בקש הבהרה (status=clarification) כשיש עמימות שמשנה את התשובה ושנובעת מהשאלה ומהמקורות (למשל שני מסמכים
+  מתאימים לכתובת שנשאלה), או כשחסר פרמטר מהותי לחישוב שלא המשתמש ולא המסמכים נתנו (ראה חישוב). שאלת הבהרה שומרת
+  את הנתונים שכבר נמצאו עם מראי המקום שלהם ושואלת שאלה אחת. בעמימות אחרת — ענה עם הסתייגות ברורה.
 - אל תכתוב בתשובה שנתון או חלק של הבקשה "לא נמצא", "לא מופיע" או "לא נבדק": השרת מציין כל פער פעם אחת, אחרי
   התשובה, עם הסיבה לפי מה שהתור עשה בפועל. במקום זה הצהר על כל רכיב בשדות המובנים:
 - requested: לכל רכיב של הבקשה (כשרכיבי הבקשה מופיעים — component = ה-id שלו, N#; label במילות הבקשה), עם המסמכים
@@ -214,8 +234,9 @@ REPAIR = """בדיקת האימות של התשובה מצאה בעיות (לי�
 {problems}
 תקן את התשובה: הסר או נסח מחדש כל טענה שאינה נתמכת במקורות, וצטט רק מזהים שקיבלת. אפשר להשתמש בכלים לבדיקה נוספת
 (למשל לפתוח את הקטע שבו הנתון כתוב). חלק של הבקשה שהתשובה לא נתנה — השלם אותו: מהנתונים שכבר נמצאו (וחשב ב-calculate
-כשהוא דורש חישוב), או חפש אותו אם לא חיפשת. הוראה על התשובה שלא קוימה — שנה את התשובה עצמה כך שתקיים אותה, בלי
-כלים. אם עדיין אי אפשר להשלים חלק — אל תכתוב שהוא "לא נמצא"; השרת יוסיף אחרי התשובה את הסיבה. החזר תשובה סופית
+כשהוא דורש חישוב), או חפש אותו אם לא חיפשת. חישוב שתלוי בפרט שהמשתמש לא נתן ושהמסמכים אינם מציינים — אל תניח אותו:
+שאל עליו שאלה אחת ממוקדת (status=clarification) ושמור את הנתונים שנמצאו עם מראי המקום שלהם. הוראה על התשובה שלא
+קוימה — שנה את התשובה עצמה כך שתקיים אותה, בלי כלים. אם עדיין אי אפשר להשלים חלק — אל תכתוב שהוא "לא נמצא"; השרת יוסיף אחרי התשובה את הסיבה. החזר תשובה סופית
 מתוקנת באותו מבנה."""
 
 REWRITE = """גם התשובה המתוקנת לא אומתה במלואה. אלה המשפטים שלא נמצאה להם תמיכה:
@@ -364,6 +385,9 @@ class TurnInput:
     prior_refs: dict[str, dict]  # P# -> {version_id, block_start, block_end, table_index, chunk_id, title, location}
     focus: dict | None = None  # the previous answer's focus, when its documents are all still visible
     candidates: list[dict] = field(default_factory=list)  # the documents a previous server clarification offered
+    # the parameter the previous answer's clarification asked for (round 7 KTD9): {"component", "text",
+    # "parameters", "question", "found": [{"id", "label", "value_text", "source_id", "prior"}]}
+    pending: dict | None = None
 
 
 @dataclass
@@ -378,6 +402,8 @@ class TurnOutcome:
     request: dict | None = None  # the follow-up resolved in context (``app.chat.resolve``), when there was one
     resolution: dict | None = None  # the raw parse and the server's decisions on it (diagnostics only)
     summary: dict = field(default_factory=dict)  # the turn's totals (``usage_summary``), no content
+    # a clarification's pending parameter (round 7 KTD9), stored on the message so the next reply is bound to it
+    pending: dict | None = None
 
 
 def usage_summary(usage: list[dict], **extra) -> dict:
@@ -395,7 +421,7 @@ def usage_summary(usage: list[dict], **extra) -> dict:
             "latency_ms": sum(u.get("latency_ms") or 0 for u in usage), **extra}
 
 
-def _context_message(inp: TurnInput, request: resolve.Request | None = None) -> str:
+def _context_message(inp: TurnInput, request: resolve.Request | None = None, binding: dict | None = None) -> str:
     parts = []
     if inp.summary:
         parts.append("סיכום השיחה עד כה (לא מקור עובדתי):\n" + prompt_text(inp.summary))
@@ -436,6 +462,8 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None) -> 
             + (" — נקרא בתור הקודם רק בחלקו (הפתיחה מחדש מציעה המשך)" if r.get("resume") else "")
             for pid, r in inp.prior_refs.items()))
     parts.append("ההודעה החדשה של המשתמש:\n" + prompt_text(inp.question))
+    if binding is not None:
+        parts.append(resolve.pending_block(binding))
     if request is not None:
         parts.append(resolve.requested_block(request))
         if request.components:
@@ -495,6 +523,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     answer_seconds = 0.0  # how long the step that wrote the last answer took
     progress("understand", "מבין את הבקשה")
     request = None
+    # a reply to a clarification that asked for a parameter: bound to it before anything else (round 7 KTD9)
+    binding = resolve.bind_pending(inp.pending, inp.question)
     if inp.history or inp.focus:
         # a follow-up is resolved in its context, and validated, before anything is searched. Three document sets
         # stay apart: the conversation's documents (context), the documents the user may see (the database decides,
@@ -507,10 +537,15 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             lookup=lambda words: entities.lookup(ctx, words, focus_ids, titles), candidates=inp.candidates or None)
         if cancelled():
             raise TurnCancelled
+        if request is not None and request.relation == "new_question":
+            binding = None  # a new question is no reply to the clarification, whatever number it holds
         # the components came with the resolution; a failed resolution or an invalid component part leaves them to
         # the judge, and the rest of the resolution still stands
         if request is not None and request.components:
-            turn.adopt(request.components, "resolve")  # the decisions on them are in the resolution
+            turn.adopt(_with_binding(request.components, binding), "resolve")  # the decisions are in the resolution
+        elif binding is not None:
+            # the reply to a clarification gives its pending parameter: the component is frozen again, given (KTD9)
+            turn.adopt([binding["component"]], "clarification_answer")
         else:
             turn.fall_back("resolve_failed" if request is None else request.components_status)
         # a model's clarification has nothing to verify against, so one that states a figure is not used; the
@@ -538,7 +573,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             ledger["requirements_origin"] = turn.record_origin()
         return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
                            request.as_dict() if request is not None else None,
-                           request.resolution if request is not None else None, _summary(usage, rounds, reused, turn))
+                           request.resolution if request is not None else None, _summary(usage, rounds, reused, turn),
+                           _pending(ws, turn, final))
 
     pending: request_analysis.Pending | None = None
 
@@ -557,7 +593,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         else:
             turn.fall_back(analysis.status)
 
-    items: list = [{"role": "user", "content": _context_message(inp, request)}]
+    items: list = [{"role": "user", "content": _context_message(inp, request, binding)}]
     if request is None and not (inp.history or inp.focus):
         # a first turn: the request is analysed beside the first step (no added latency), within the reading time
         pending = request_analysis.start(provider, inp.question, read_until)
@@ -669,6 +705,39 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             # a rewrite from verified content cannot complete a requirement: only the claims are its problems
             items.append({"role": "user", "content": REWRITE.format(problems=report.problems_text(claims_only=True))})
             repaired |= report.repair_keys(claims_only=True)
+
+
+def _with_binding(components: list[dict], binding: dict | None) -> list[dict]:
+    """The resolution's components with the parameter a clarification asked for given by the user's reply (KTD9):
+    the parameter of the same name, still marked not given, takes the reply's words."""
+    if binding is None:
+        return components
+    name = " ".join(binding["parameter"].split())
+    out = []
+    for c in components:
+        params = [p | {"source": "given_by_user", "quote": binding["quote"]}
+                  if " ".join((p.get("name") or "").split()) == name and p.get("source") == "not_given_by_user"
+                  else p for p in c.get("parameters") or []]
+        out.append(c | {"parameters": params})
+    return out
+
+
+def _pending(ws: T.Workspace, turn: TurnRequirements, answer: FinalAnswer) -> dict | None:
+    """A clarification's pending parameter (round 7 KTD9, R25), stored on the message: the first calculation
+    component still waiting for a detail only the user can give, its parameters, the question asked and the values
+    the answer kept (with the passages they were verified in), so the reply is bound to it and those values are
+    reopened rather than searched again. None for any other answer."""
+    if answer.status != "clarification":
+        return None
+    item = next((i for i in turn.items if unfilled_parameters(ws, i)), None)
+    if item is None:
+        return None
+    cited = coverage.cited_ids(answer.answer_markdown)
+    found = [{"id": v.vid, "label": v.label, "value_text": v.written, "source_id": v.source_id}
+             for vid, v in ws.values.items() if vid in cited]
+    return {"component": item["id"], "text": item["text"], "subject": item.get("subject") or "",
+            "parameters": unfilled_parameters(ws, item), "question": answer.clarification_question or "",
+            "found": found}
 
 
 def _summary(usage: list[dict], rounds: list, reused: int, turn: TurnRequirements) -> dict:

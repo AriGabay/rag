@@ -18,6 +18,12 @@ repair was attempted) and the sources it was checked against. ``GET /messages/{i
 to the message's owner and to an office admin (audited), and only while every document behind the answer — the
 documents every removal was checked against included — is visible to them; those documents are behind the message
 too (``removal_documents``), so revoking one hides both.
+
+A clarification that asks for a detail only the user can give (round 7 U7, KTD9, R25) keeps its found values and
+citations, and stores its pending parameter in the answer (``answer.pending``: the component, its parameters, the
+question and the values kept, each with the passage it was verified in; ``answer.missing`` names the parameters). No
+migration: ``messages.answer`` is JSON. The next turn's input carries it with each value pointed at the ``P#`` that
+reopens its passage (``_pending_refs``), so the reply is bound to the parameter and nothing is searched again.
 """
 
 from __future__ import annotations
@@ -573,15 +579,32 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
     # message is in ``rows`` only while every document it names is visible
     last_focus = None
     candidates: list[dict] = []
+    pending = None
     if last is not None:
         last_focus = last.answer.get("focus") or _request_focus(last.answer.get("request"))
         if last.answer.get("status") == "clarification":
             # the documents a server clarification offered: the reply is resolved among them (the message is in
             # ``rows`` only while every one of them is visible)
             candidates = list((last.answer.get("request") or {}).get("candidates") or [])
+            # the parameter a clarification asked for (round 7 KTD9): the reply is bound to it, and the values it
+            # kept are reopened through the references above
+            if isinstance(last.answer.get("pending"), dict):
+                pending = _pending_refs(last.answer["pending"], last.answer.get("sources") or [])
     return engine.TurnInput(question=user.content, history=history, summary=summary, focus=last_focus,
                             focus_documents=[{"document_id": k, "title": v} for k, v in list(focus.items())[-8:]],
-                            prior_refs=prior, candidates=candidates), _user_message_ids(rows, user_message_id)
+                            prior_refs=prior, candidates=candidates,
+                            pending=pending), _user_message_ids(rows, user_message_id)
+
+
+def _pending_refs(pending: dict, sources: list[dict]) -> dict:
+    """A stored pending parameter with each value it kept pointed at the ``P#`` that reopens the passage it was
+    verified in — numbered as ``_turn_input`` numbers the last answer's sources (None when that passage is not one
+    of them)."""
+    pids: dict[str, str] = {}
+    for s in sources[:12]:
+        if s.get("version_id"):
+            pids[s.get("id")] = f"P{len(pids) + 1}"
+    return pending | {"found": [v | {"prior": pids.get(v.get("source_id"))} for v in pending.get("found") or []]}
 
 
 def _user_message_ids(rows, user_message_id) -> list[str]:
@@ -662,9 +685,14 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
         focus["document_ids"] = [d for d in focus["document_ids"] if d in known]
         if not focus["document_ids"] and a.status == "not_found":
             focus = None
+    pending = outcome.pending
+    missing = a.missing_info or ("; ".join(pending["parameters"]) if pending else "")
     payload = {
         "kind": "rag", "status": a.status, "markdown": a.answer_markdown, "claims": [c.model_dump() for c in a.claims],
-        "clarification": a.clarification_question or None, "missing": a.missing_info or None,
+        "clarification": a.clarification_question or None, "missing": missing or None,
+        # round 7 KTD9: the parameter a clarification asks for — {"component", "text", "subject", "parameters",
+        # "question", "found": [{"id", "label", "value_text", "source_id"}]} — bound to the user's reply next turn
+        "pending": pending,
         "sources": sources, "measurements": measurements, "computations": computations, "values": values,
         "assumptions": assumptions, "documents": [{"document_id": k, "title": v} for k, v in docs.items()],
         # counts only; what was removed and why is diagnostics (``_diagnostics``)
