@@ -384,6 +384,8 @@ export interface ChatVerification {
   completeness?: ChatCompleteness;
   /** One summary per removed claim, in the answer's order (absent on answers stored before round 7). */
   removals?: ChatRemoval[];
+  /** Results kept with the server's conditional qualifier (absent on older answers). */
+  conditional?: number;
 }
 
 /** A component of the request with its outcome in the shown answer (round 7 U3; `coverage.public_components`). */

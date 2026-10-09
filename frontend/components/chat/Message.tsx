@@ -60,6 +60,8 @@ const CORRECTNESS_LINE: Record<string, string> = {
   partial: "חלק מהטענות הוסרו או אומתו רק בחלקן מול המקורות (פירוט ב«מקורות ופרטים»).",
   unverified: "הטענות בתשובה לא אומתו מול המקורות; יש לבדוק במקור לפני שימוש.",
 };
+// the only reason the answer is not verified: a result shown with the server's conditional qualifier
+const CONDITIONAL_LINE = "חלק מהתוצאות מחושבות מערכים שלא אומתו מול המקור, ומוצגות כמותנות (ההסתייגות כתובה ליד המספר).";
 
 /** What a citation is looked up in: an answer, or the records the diagnostics route returned for a removal. */
 type CitedRecords = Pick<ChatAnswer, "sources" | "values" | "measurements">;
@@ -343,6 +345,10 @@ function AnswerQuality({ answer }: { answer: ChatAnswer }) {
   // claims only removed (none partly supported): the removal notice says it, with its kind, instead of the
   // generic correctness line
   const onlyRemoved = correctness === "partial" && removals.length > 0 && !verification?.partial;
+  // results kept with the server's conditional qualifier, and nothing else partial or removed
+  const onlyConditional =
+    correctness === "partial" && (verification?.conditional ?? 0) > 0 && removals.length === 0 &&
+    !verification?.partial && !verification?.removed;
   const doubtful = correctness && correctness !== "verified" && !onlyRemoved;
   if (!clarification && !incomplete && !doubtful && removals.length === 0) return null;
   const structured = hasComponents(answer);
@@ -382,7 +388,7 @@ function AnswerQuality({ answer }: { answer: ChatAnswer }) {
       )}
       {doubtful && (
         <p className="correctness-line" data-testid="correctness" data-status={correctness}>
-          {CORRECTNESS_LINE[correctness]}
+          {onlyConditional ? CONDITIONAL_LINE : CORRECTNESS_LINE[correctness]}
         </p>
       )}
     </div>

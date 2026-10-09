@@ -274,6 +274,72 @@ def test_ae5_two_ocr_confirmed_cells_of_a_table_read_by_inspect_give_a_certain_t
         assert "table_index" not in v["locator"]
 
 
+def test_a_conditional_total_shown_without_a_hedge_is_kept_with_the_servers_conditional_qualifier(
+        client, vision_office, monkeypatch):
+    """R7c in the browser: OCR does not confirm either cell, so C1 = V1 + V2 is conditional; the model writes the
+    total without hedging it. The judge (scripted as the real one ruled) fails such a unit unless the server's
+    qualifier is shown with it; the server writes that qualifier, so the total stays in the answer as conditional —
+    never removed, never a gap, never shown as certain."""
+    from tests.conftest import login
+    from tests.integration.test_chat import cloud, new_conversation, send
+    from tests.support.scripted_agent import ScriptedAgent, call, component, final, read, requirement
+
+    doc = ingest_cost_table(vision_office, monkeypatch)
+    vision_office.vision = CostTable()
+    q = COST["question_total"]
+    cost_ocr(monkeypatch, drop=tuple(q["inputs"]))  # neither number confirmed in its cell
+
+    def last(items) -> str:
+        return [i["output"] for i in items if isinstance(i, dict) and i.get("type") == "function_call_output"][-1]
+
+    def inspect_region(items):
+        region = re.search(r"\[אזור שלא נקרא (R\d+)", last(items)).group(1)
+        return [call("inspect", target={"region": region, "document": None, "page": None})]
+
+    def take_both(items):
+        sid = re.findall(r'<source id="(S\d+)"', last(items))[-1]
+        return [call("take_value", source=sid, locator=_cell(row, COST_TOTAL, number), meaning=cost_meaning(),
+                     label=row) for row, number in zip(q["rows"], q["inputs"], strict=True)]
+
+    judged: list[str] = []
+
+    def judge(input: str) -> dict:
+        judged.append(input)
+        units = {int(i): cites.split(",") for i, cites in re.findall(r'<unit index="(\d+)" cites="([^"]*)">', input)}
+        qualified = {int(i) for i in re.findall(r'<server_qualifier unit="(\d+)">', input)}
+        # a conditional result shown as certain fails (uncertain_reading), unless the server's qualifier goes with it
+        held = {i: i in qualified or "C1" not in cites for i, cites in units.items()}
+        verdicts = [{"index": i, "verdict": "supported" if ok else "unsupported",
+                     "reason": "בדיקה" if ok else "תוצאה מותנית שהוצגה כוודאית", "supported_by": [],
+                     "failure": "none" if ok else "uncertain_reading"} for i, ok in held.items()]
+        return {"verdicts": verdicts, "requirements": [
+            requirement(id=r, units=list(units), related=["C1"])
+            for r in re.findall(r'<requirement id="([A-Z][\d.]+)"', input)]}
+
+    answer = final(f"עלות הבנייה העילית והחניון התת-קרקעי יחד היא {q['result']} ₪ [C1].", documents=[doc])
+    agent = ScriptedAgent([[read(pages={"document": doc, "from_page": 1, "to_page": 1})], inspect_region, take_both,
+                           [call("calculate", expression="V1 + V2", label="עלות הבנייה והחניון", justification=None)],
+                           answer], judge=judge,
+                          request=[component("עלות הבנייה העילית והחניון יחד", kind="calculation")])
+    cloud(monkeypatch, vision_office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), "מה עלות הבנייה העילית והחניון יחד?")
+    assert m["status"] == "done", m
+    a = m["answer"]
+    (c,) = a["computations"]
+    assert c["value"] == "20220000" and c["conditional"] is True, c
+    # the total is in the answer, with the server's conditional qualifier next to it
+    assert (f"{q['result']} ₪ (תוצאה מותנית: הערכים V1, V2 אינם ודאיים) [C1]" in a["markdown"]), a["markdown"]
+    assert "החישוב לא הושלם" not in a["markdown"] and "כפי שנכתב במקור" not in a["markdown"]
+    v = a["verification"]
+    assert v["removed"] == 0 and v["removals"] == [] and v["conditional"] == 1, v
+    assert v["correctness"] == "partial"  # shown as conditional, never as verified certainty
+    (n1,) = [x for x in a["components"] if x["kind"] == "calculation"]
+    assert n1["status"] != "not_answered", n1
+    # one judged answer: no repair round for the qualifier the server writes itself
+    assert len([s for s in agent.seen]) == 5 and any('<server_qualifier unit="0">' in i for i in judged)
+
+
 def test_a_number_ocr_does_not_see_stays_uncertain_and_its_calculation_is_conditional_and_says_why(
         vision_office, monkeypatch):
     doc = ingest_cost_table(vision_office, monkeypatch)

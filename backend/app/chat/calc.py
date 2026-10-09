@@ -1041,6 +1041,9 @@ class Computation:
     explicit_amount: dict | None = None
     stated_amount_differs: dict | None = None
     rates: list[str] = field(default_factory=list)  # the ids it applies as rates (``applied_rates``, KTD9)
+    # the uncertain inputs (V#, M#) that made it conditional when it was computed (R28): what the server's conditional
+    # qualifier names next to a result shown without saying so (``verify.conditional_qualifier``)
+    uncertain: list[str] = field(default_factory=list)
 
     @property
     def value(self) -> Decimal:

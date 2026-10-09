@@ -213,14 +213,16 @@ def _message_json(r, dv: int | None = None, sh: str | None = None, visible: set 
 
 
 def public_verification(v: dict) -> dict:
-    """What the user's normal path shows of verification: whether it ran and how many claims it removed, marked
-    or completed from the source — not the removed text (that is diagnostics). Answers stored before the detail
+    """What the user's normal path shows of verification: whether it ran and how many claims it removed, marked,
+    completed from the source or marked conditional — not the removed text (that is diagnostics). Answers stored before the detail
     moved out are reduced the same way."""
     problems = v.get("problems") or []
     return {"judged": v.get("judged"), "judge_status": v.get("judge_status"),
             "removed": v.get("removed", sum(1 for p in problems if p.get("severity") == "error")),
             "partial": v.get("partial", sum(1 for p in problems if p.get("severity") == "partial")),
-            "annotated": v.get("annotated", 0), "request_mismatch": v.get("request_mismatch", False)} | {
+            "annotated": v.get("annotated", 0), "request_mismatch": v.get("request_mismatch", False),
+            # results the server marked conditional next to their number (none on answers stored before it)
+            "conditional": v.get("conditional", 0)} | {
         # claim correctness and answer completeness, shown apart (answers stored before them have neither)
         k: v[k] for k in ("correctness", "completeness") if k in v} | (
         # each removal's kind, component and the server's fixed sentence, rebuilt here from the kind (KTD5)

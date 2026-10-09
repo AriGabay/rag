@@ -180,6 +180,21 @@ test.describe("gap summary", () => {
     expect(count(await reply.innerText(), GAP_LINE)).toBe(0);
     await page.request.delete(`/api/chat/conversations/${id}`);
   });
+
+  test("a result kept with the server's conditional qualifier gets the conditional line, not the generic one", async ({
+    page,
+  }) => {
+    const answer = answerWith({
+      status: "answered", markdown: "סך העלויות הוא 20,220,000 ₪ (תוצאה מותנית: הערכים V1, V2 אינם ודאיים) [C1].",
+      gaps: [], components: [component("N1", "סך העלויות", "full", { units: [0], related: ["C1"] })],
+    }, { correctness: "partial", conditional: 1, completeness: { status: "full", requirements: 1, missing: [] } });
+    const { id, reply } = await openAnswer(page, answer);
+    const line = reply.getByTestId("correctness");
+    await expect(line).toContainText("מותנות");
+    await expect(line).not.toContainText("הוסרו");
+    await expect(reply.getByTestId("removal-notice")).toHaveCount(0);
+    await page.request.delete(`/api/chat/conversations/${id}`);
+  });
 });
 
 // --- removals -----------------------------------------------------------------------------------------------------

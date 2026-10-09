@@ -372,3 +372,91 @@ def test_a_judges_unsupported_computed_claim_is_a_wrong_calculation_unless_it_na
 def test_a_computed_result_shown_in_an_equivalent_form_or_marked_rounding_is_kept(shown):
     report, _ = _verify(_scenario(), f"לפי הנחתך [A1], הרווח בתרחיש יהיה {shown} [C1].")
     assert not report.removed_units(), report.problems_text()
+
+
+# --- a conditional result is shown as conditional, never lost (R18, R24, R28; KTD5, KTD10) ------------------------
+
+COST_QUESTION = "מה עלות הבנייה העילית והחניון יחד?"
+
+
+def _conditional_sum(uncertain: tuple[str, ...] = ("V1", "V2")) -> Workspace:
+    """V1 15,600,000 ₪ and V2 4,620,000 ₪ read from an image table; C1 their sum (20,220,000 ₪), conditional on the
+    inputs in ``uncertain`` as ``tools.tool_calculate`` records it."""
+    from app.chat.tools import MSG_UNCERTAIN_INPUTS
+
+    ws = Workspace(ctx=None)
+    ws.user_messages = [{"turn": 1, "text": COST_QUESTION, "current": True}]
+    _value(ws, "15,600,000", "בנייה עילית", "cost", "cost")
+    _value(ws, "4,620,000", "חניון תת-קרקעי", "cost", "cost")
+    c = _compute(ws, "V1 + V2", "עלות הבנייה והחניון")
+    if uncertain:
+        c.outcome.conditional.append(MSG_UNCERTAIN_INPUTS.format(ids=", ".join(uncertain)) + " (V1: התא לא אושר)")
+        c.uncertain = list(uncertain)
+    return ws
+
+
+def _qualified(ws: Workspace, markdown: str, seen: list | None = None, rule=lambda text: "supported"):
+    return _verify(ws, markdown, rule=rule, seen=seen, question=COST_QUESTION)
+
+
+def test_a_result_of_a_conditional_calculation_shown_without_a_hedge_is_kept_with_the_servers_qualifier():
+    ws = _conditional_sum()
+    seen: list = []
+    report, applied = _qualified(ws, "עלות הבנייה העילית והחניון יחד היא 20,220,000 ₪ [C1].", seen=seen)
+    assert not report.removed_units() and report.removals() == [], report.problems_text()
+    assert report.ok  # the server writes the qualifier itself: no repair round for it alone
+    (p,) = [p for p in report.problems if p.annotatable]
+    assert p.conditional and p.cite == "C1" and p.number == "20,220,000"
+    assert ("20,220,000 ₪ (תוצאה מותנית: הערכים V1, V2 אינם ודאיים) [C1]."
+            in applied.answer_markdown), applied.answer_markdown
+    assert "כפי שנכתב במקור" not in applied.answer_markdown  # the server's, never presented as the source's
+    # shown as conditional, never as verified certainty; not a removal and not a source qualifier
+    counts = report.counts()
+    assert counts["conditional"] == 1 and counts["annotated"] == 0 and counts["removed"] == 0
+    assert counts["correctness"] == "partial" and counts["removals"] == []
+    # the judge reads the unit with the qualifier the server will write, and is told so
+    judged = "\n".join(i for _, i in seen)
+    assert '<server_qualifier unit="0">(תוצאה מותנית: הערכים V1, V2 אינם ודאיים)</server_qualifier>' in judged
+    assert "server_qualifier" in JUDGE_POLICY
+
+
+def test_a_conditional_qualifier_names_one_uncertain_input_in_the_singular():
+    _, applied = _qualified(_conditional_sum(("V2",)), "סך העלות הוא 20,220,000 ₪ [C1].")
+    assert "20,220,000 ₪ (תוצאה מותנית: הערך V2 אינו ודאי) [C1]" in applied.answer_markdown
+
+
+def test_a_conditional_calculation_on_a_justified_mix_is_qualified_with_the_mix_it_rests_on():
+    ws = _scenario(cost_vat="unknown")
+    report, applied = _verify(ws, "לפי הנחתך [A1], הרווח בתרחיש יהיה 1,530,000 ₪ [C1].")
+    assert not report.removed_units(), report.problems_text()
+    assert "1,530,000 ₪ (תוצאה מותנית: לפי הצדקה לערבוב נתונים שאינם תואמים — מע״מ:" in applied.answer_markdown
+
+
+def test_a_unit_that_already_says_its_result_is_conditional_gets_only_the_short_reason():
+    _, applied = _qualified(_conditional_sum(), "בכפוף לאימות הקלטים, התוצאה מותנית: 20,220,000 ₪ [C1].")
+    assert "20,220,000 ₪ (הערכים V1, V2 אינם ודאיים) [C1]" in applied.answer_markdown
+    assert applied.answer_markdown.count("מותנית") == 1
+
+
+def test_a_wrong_number_for_a_conditional_calculation_is_still_removed_as_a_wrong_calculation():
+    report, applied = _qualified(_conditional_sum(), "עלות הבנייה העילית והחניון יחד היא 20,230,000 ₪ [C1].")
+    assert [(d.failure_kind, d.check) for d in report.removals()] == [("wrong_calculation", "computation_mismatch")]
+    assert "תוצאה מותנית" not in applied.answer_markdown
+
+
+def test_a_conditional_result_the_judge_finds_wrong_is_still_removed_and_not_qualified():
+    report, applied = _qualified(_conditional_sum(), "עלות הבנייה העילית והחניון יחד היא 20,220,000 ₪ [C1].",
+                                 rule=lambda text: "unsupported")
+    assert [d.failure_kind for d in report.removals()] == ["wrong_calculation"]
+    assert "תוצאה מותנית" not in applied.answer_markdown and report.counts()["conditional"] == 0
+
+
+def test_a_result_of_a_calculation_that_is_not_conditional_gets_no_qualifier():
+    report, applied = _qualified(_conditional_sum(()), "עלות הבנייה העילית והחניון יחד היא 20,220,000 ₪ [C1].")
+    assert not report.problems, report.problems_text()
+    assert "מותנית" not in applied.answer_markdown and report.counts()["correctness"] == "verified"
+
+
+def test_a_conditional_result_bound_to_a_unit_that_cites_only_its_inputs_is_qualified_too():
+    _, applied = _qualified(_conditional_sum(), "סך העלות הוא 20,220,000 ₪ [V1][V2].")
+    assert "20,220,000 ₪ (תוצאה מותנית: הערכים V1, V2 אינם ודאיים) [V1][V2][C1]" in applied.answer_markdown

@@ -3461,7 +3461,8 @@ def tool_calculate(ws: Workspace, expression: str, label: str = "", justificatio
     c = calc.Computation(f"C{len(ws.computations) + 1}", (label or "").strip() or calc.render(node, name, True),
                          calc.render(node, lambda i: i), calc.render(node, lambda i: f"«{name(i)}»", True), out,
                          inputs, sources, len(docs), kind, justification if justified else None, " ".join(notes),
-                         reproduces, [lf.id for lf in out.leaves], near, differs, calc.applied_rates(node))
+                         reproduces, [lf.id for lf in out.leaves], near, differs, calc.applied_rates(node),
+                         list(uncertain))
     ws.computations[c.cid] = c
     return json.dumps({"id": c.cid, "label": c.label, "expression": c.expression, "formula": c.formula,
                        "value": str(c.value), "display": c.display(), "unit": c.unit_label,
