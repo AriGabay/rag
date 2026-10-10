@@ -11,7 +11,13 @@ A qualifier belongs to the nearest amount (a number written with ₪, מ״ר, ד
 with none before it, to the first amount after it; in a clause without amounts, to the nearest number before it.
 In "השווי למ״ר אקוו׳ לנכס ברחוב הצאלון 7 נקבע ל-14,250 ₪" the basis is the 14,250's, not the house number's; in
 "63 ₪ למ״ר לחודש" the period is the 63's. In a table row it also comes from the row's label cell and the column's header. A source states a
-qualifier for all its numbers when it says it in a clause with no number, or in a table's title, caption or notes.
+basis for all its numbers when it says it in a clause with no number, or in a table's title, caption or notes. A
+period it states beyond a number's own clause attests that number only from the number's own line or sentence (a
+clause with no number in its line, a period word opening the next line of a wrapped sentence), the line above that
+governs it (the nearest line with no number stating a period), or its table's title, caption or notes — never from
+another sentence of a neighbouring paragraph. A rate's period word ("בריבית שנתית", "שיעור היוון שנתי") is the
+rate's: it qualifies a percent of its clause and never an amount, so a feasibility check's totals do not become
+"לשנה" because the financing paragraph after them speaks of an annual interest rate.
 
 Two kinds of problem:
 
@@ -38,7 +44,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from functools import cached_property, lru_cache
+from functools import cache, cached_property, lru_cache
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -73,6 +79,16 @@ _AMOUNT_AFTER = re.compile(r"\s*(?:₪|ש\"ח|מ\"ר|דונם|%|אלף|מילי�
 _APPROX_WORDS = re.compile(r"(?<![א-ת])(?:מקורב|בקירוב|בערך|בסביבות)(?![א-ת])")
 _CLAUSE_END = re.compile(r"[.;\n](?!\d)")
 _ROW = " | "
+# a period word right after a rate's noun ("ריבית שנתית", "שיעור היוון שנתי", "תשואה לשנה") is that rate's: it
+# qualifies a percent of its own clause ("בריבית שנתית של 6%") and never an amount, and it states nothing for the
+# source's other numbers
+_RATE_NOUN = re.compile(r"(?<![א-ת])[הבולמ]?(?:ריבית|תשואה|היוון|הצמדה|אינפלציה|צמיחה|שיעור)\s+$")
+_PERCENT_AFTER = re.compile(r"\s?%")
+_SENTENCE_END = re.compile(r"[.;:!?]\s*$")
+# lines looked at above a number for the line that states its period (the scale note's rule, ``calc.NOTE_WINDOW``)
+NOTE_LINES = 6
+# a heading's enumeration ("7.", "7.2", "(3)") is not a number of its own (``calc.governing_note``)
+_ENUMERATION = re.compile(r"^\s*\(?\d+(?:\.\d+)*[.)]?\s")
 
 KIND_LABELS = {"basis": "בסיס השטח", "period": "התקופה", "approx": "היותו ערך מקורב"}
 PERIOD_TEXT = {k: PERIOD_LABELS[k] for k in ("month", "year")}
@@ -108,13 +124,20 @@ class Qualifiers:
         return set(self.found.get(kind, {}))
 
 
-def _scan(text: str) -> list[tuple[int, str, str, str]]:
-    """Every qualifier in the text, in reading order: (position, kind, key, as written)."""
+def _of_rate(text: str, pos: int) -> bool:
+    """Whether the period word at ``pos`` follows a rate's noun (``_RATE_NOUN``): the rate's period."""
+    return bool(_RATE_NOUN.search(text[max(0, pos - 24):pos]))
+
+
+def _scan(text: str, rates: bool = True) -> list[tuple[int, str, str, str]]:
+    """Every qualifier in the text, in reading order: (position, kind, key, as written). ``rates=False``: without the
+    period words of a rate (``_of_rate``) — what a text states for numbers other than that rate."""
     out = []
     for kind, table in (("basis", _BASIS), ("period", _PERIOD)):
         for key, pattern in table:
             for m in re.finditer(pattern, text):
-                out.append((m.start(), kind, key, m.group(0)))
+                if rates or kind != "period" or not _of_rate(text, m.start()):
+                    out.append((m.start(), kind, key, m.group(0)))
     return sorted(out)
 
 
@@ -139,7 +162,8 @@ def _owner(nums: list, amounts: list[int], pos: int, clause: str) -> int:
 
 def attached(text: str) -> tuple[list[tuple[frozenset[str], int, Qualifiers]], Qualifiers]:
     """For each number in the text, its forms, position and the qualifiers attached to it; and the qualifiers of
-    clauses with no number (they cover the whole text)."""
+    clauses with no number (what the text states beyond its own numbers). A rate's period word ("בריבית שנתית")
+    belongs to a percent of its clause — the first after it, else the last before it — and with none, to nothing."""
     text = _norm(text)
     out: list[tuple[frozenset[str], int, Qualifiers]] = []
     general = Qualifiers()
@@ -151,6 +175,13 @@ def attached(text: str) -> tuple[list[tuple[frozenset[str], int, Qualifiers]], Q
         quals = [Qualifiers() for _ in nums]
         amounts = [i for i, (_, b, _) in enumerate(nums) if _AMOUNT_AFTER.match(clause, b)]
         for pos, kind, key, written in _scan(clause):
+            if kind == "period" and _of_rate(clause, pos):
+                percents = [i for i, (a, b, _) in enumerate(nums)
+                            if _PERCENT_AFTER.match(clause, b) or clause[max(0, a - 1):a] == "%"]
+                after = [i for i in percents if nums[i][0] > pos]
+                if percents:
+                    quals[after[0] if after else percents[-1]].add(kind, key, written)
+                continue
             if not nums:
                 general.add(kind, key, written)
                 continue
@@ -163,11 +194,16 @@ def attached(text: str) -> tuple[list[tuple[frozenset[str], int, Qualifiers]], Q
     return out, general
 
 
-def _all(text: str) -> Qualifiers:
+def _all(text: str, rates: bool = True) -> Qualifiers:
     q = Qualifiers()
-    for _, kind, key, written in _scan(_norm(text)):
+    for _, kind, key, written in _scan(_norm(text), rates):
         q.add(kind, key, written)
     return q
+
+
+def _only(q: Qualifiers, kind: str, keep: bool = True) -> Qualifiers:
+    """The qualifiers of one kind (``keep``), or all but that kind."""
+    return Qualifiers({k: dict(v) for k, v in q.found.items() if (k == kind) == keep})
 
 
 @dataclass
@@ -215,6 +251,9 @@ def _area_amount(text: str, pos: int, written: str, closest: list[Occurrence]) -
     return any(o.area or _AREA_WORD.search(o.context) for o in closest)
 
 
+TABLE_AROUND = 4  # lines around a table that are its own (caption, title, size, notes); more are a passage's
+
+
 def _table_definitions(lines: list[str], is_row: list[bool], heads: list[str]) -> dict[str, dict[str, str]]:
     """What a calculation table states once for its per-area amounts, by kind -> {key: as written}: the area basis
     of its area row ("סה״כ מ״ר אקווי׳ | 2,480") or of its title, caption or notes, and the period of its title,
@@ -230,11 +269,76 @@ def _table_definitions(lines: list[str], is_row: list[bool], heads: list[str]) -
                 if kind == "basis" and not _PER_AREA.search(label):
                     found["basis"].setdefault(key, written.strip())
     around = [ln for ln, row in zip(lines, is_row, strict=True) if not row]
-    if len(around) <= 4:  # a caption, a title, a size line and notes; a longer passage is not the table's own text
+    if len(around) <= TABLE_AROUND:  # a caption, a title, a size line and notes; a longer passage is not the table's
         for line in around:
-            for _, kind, key, written in _scan(line):
+            for _, kind, key, written in _scan(line, rates=False):
                 found[kind].setdefault(key, written.strip())
     return found
+
+
+def _period_lines(lines: list[str], is_row: list[bool]):
+    """The period a source states for each number's line beyond the number's own clause, by line index: a function
+    ``(i) -> Qualifiers``. A period word attests a number of its own line, sentence or governing line only, never one
+    of another sentence of a neighbouring paragraph, and a rate's period word (``_of_rate``) never attests one:
+
+    - a clause with no number in the number's own line;
+    - a period word opening the next line when the number's line does not end its sentence ("נקבעו ל-310,000 ₪" /
+      "לשנה, בהתאם להסכם": a sentence wrapped across lines);
+    - the nearest line above, within ``NOTE_LINES``, that has no number and states a period ("ההכנסות להלן הן
+      לשנה") — never across a table's rows, and never a wrapped sentence's end, which is the number's above it;
+    - for a table's row: its title, caption and notes — every line around the table when they are few
+      (``TABLE_AROUND``), else the line above it by the rule above and the lines with no number right after it."""
+    has_num = [bool(_numbers(_ENUMERATION.sub("", ln))) for ln in lines]
+    stated = [Qualifiers() if row else _only(attached(ln)[1], "period") for ln, row in zip(lines, is_row, strict=True)]
+
+    def opening(j: int) -> Qualifiers:  # a period word that opens line j, continuing the sentence of the line above
+        if j <= 0 or j >= len(lines) or is_row[j] or is_row[j - 1] or not has_num[j - 1] \
+                or _SENTENCE_END.search(lines[j - 1]):
+            return Qualifiers()
+        line = lines[j]
+        found = _scan(line.lstrip(), rates=False)
+        q = Qualifiers()
+        if found and found[0][0] == 0 and found[0][1] == "period":
+            q.add("period", found[0][2], found[0][3])
+        return q
+
+    def above(i: int) -> Qualifiers:
+        for k in range(i - 1, max(-1, i - 1 - NOTE_LINES), -1):
+            if is_row[k] or _ENUMERATION.match(lines[k]):
+                break
+            if has_num[k] or opening(k).found:
+                continue
+            if stated[k].found:
+                return stated[k]
+        return Qualifiers()
+
+    around = [i for i, row in enumerate(is_row) if not row]
+    few = len(around) <= TABLE_AROUND
+    table = Qualifiers()
+    if any(is_row) and few:
+        for i in around:
+            table.merge(_only(_all(lines[i], rates=False), "period"))
+
+    @cache
+    def period(i: int) -> Qualifiers:
+        if not is_row[i]:
+            q = Qualifiers().merge(stated[i]).merge(opening(i + 1)).merge(above(i))
+            return q
+        if few:
+            return table
+        first, last = i, i
+        while first > 0 and is_row[first - 1]:
+            first -= 1
+        while last + 1 < len(lines) and is_row[last + 1]:
+            last += 1
+        q = Qualifiers().merge(above(first))
+        for j in range(last + 1, min(len(lines), last + 3)):
+            if is_row[j] or has_num[j]:
+                break
+            q.merge(stated[j])
+        return q
+
+    return period
 
 
 @lru_cache(maxsize=256)
@@ -244,7 +348,11 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
 
     In a table, a number also gets its row's label and its column's header; and a per-area amount ("דמ״ש למ״ר |
     75") gets the area basis and the period the table states once for the whole calculation — in its area row, its
-    title, caption or notes — when the table states exactly one of each kind. A table with two bases binds none."""
+    title, caption or notes — when the table states exactly one of each kind. A table with two bases binds none.
+
+    What the source states for all its numbers is an area basis only: a period is stated for the numbers of its own
+    line, sentence or governing line, or of its table (``_period_lines``) — "בריבית שנתית"
+    in a paragraph after a feasibility check's totals is the interest rate's, not the totals'."""
     text = _norm(text)
     lines = [ln for ln in text.split("\n") if ln.strip()]
     is_row = [_ROW in ln or ln.strip().startswith("|") for ln in lines]
@@ -252,9 +360,14 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
     header = next((r for r in rows if not re.search(r"\d", r)), None)
     heads = _row_cells(header) if header else []
     table = _table_definitions(lines, is_row, heads) if rows else {"basis": {}, "period": {}}
+    period = _period_lines(lines, is_row)
     occurrences: list[tuple[frozenset[str], Occurrence]] = []
     general = Qualifiers()
-    for line, row in zip(lines, is_row, strict=True):
+    # A short table's notes can attest a stated period; they require it only for its per-area amounts.
+    # Valuation totals do not inherit the period of rents used to calculate them.
+    for key, written in table["period"].items():
+        general.add("period", key, written)
+    for n, (line, row) in enumerate(zip(lines, is_row, strict=True)):
         if row:
             if line is header:
                 continue
@@ -277,12 +390,24 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
                     own = cells[0] + " " + cell
                     area = bool(_PER_AREA.search(own + " " + (heads[i] if i < len(heads) else ""))
                                 or _AREA_WORD.search(own))
+                    if _PER_AREA.search(own + " " + (heads[i] if i < len(heads) else "")):
+                        q.merge(period(n))
                     occurrences.append((f, Occurrence(q, line, area=area)))
             continue
         found, gen = attached(line)
-        # a clause with no number speaks for the source; a table's title, caption or notes for its numbers
-        general.merge(_all(line) if rows else gen)
-        occurrences += [(f, Occurrence(q, line)) for f, _, q in found]
+        # a clause with no number speaks for the source; a table's title, caption or notes for its numbers — an area
+        # basis only: a period, for the numbers it governs (``_period_lines``)
+        general.merge(_only(_all(line) if rows else gen, "period", keep=False))
+        for i, (f, _, q) in enumerate(found):
+            q.merge(period(n))
+            # A wrapped rate's period belongs solely to the percentage immediately following it.
+            if i == 0 and n > 0 and not _SENTENCE_END.search(lines[n - 1]) \
+                    and not _numbers(_ENUMERATION.sub("", lines[n - 1])) \
+                    and re.match(r"\s*(?:של\s+)?[\d.,]+\s?%", line):
+                for pos, kind, key, written in _scan(lines[n - 1]):
+                    if kind == "period" and _of_rate(lines[n - 1], pos):
+                        q.add(kind, key, written)
+            occurrences.append((f, Occurrence(q, line)))
     return tuple(occurrences), general
 
 
@@ -298,9 +423,9 @@ def _flat(text: str) -> str:
 
 def number_qualifiers(text: str, forms: frozenset[str], within: str) -> Qualifiers:
     """What a source attaches to a number where it states it inside ``within`` (a quote of the source, or a table
-    row as read), with what the source states for all its numbers — the qualifiers a value taken from the source
-    may carry as the source's own (``tools.tool_take_value``). The same number elsewhere in the source does not
-    count."""
+    row as read), with the period stated for it there and what the source states for all
+    its numbers — the qualifiers a value taken from the source may carry as the source's own
+    (``tools.tool_take_value``). The same number elsewhere in the source does not count."""
     parsed, general = parse_source(text)
     w = _flat(within)
     q = Qualifiers().merge(general)
@@ -636,7 +761,7 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
         # qualifier phrased before the amount ("השטח 120 מ"ר, דמי השכירות לחודש 7,560 ₪") is never "added"
         attested = Qualifiers().merge(general)
         for o in occurrences:
-            attested.merge(o.qualifiers).merge(_all(o.context))
+            attested.merge(o.qualifiers).merge(_all(o.context, rates=False))
         # unsupported: a basis or period given to the number that its evidence does not give it
         for kind in ("basis", "period"):
             extra = claimed.keys(kind) - attested.keys(kind)

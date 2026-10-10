@@ -666,3 +666,35 @@ def test_a_value_taken_from_a_table_in_thousands_or_a_quote_carries_its_scale():
     assert taken["scale"] == 1000
     taken = tools._take_quote(src, "עלות היתר 1,250,000 ₪.", {"quote": "עלות היתר 1,250,000 ₪", "number": "1,250,000"})
     assert taken["scale"] == 1
+
+
+# --- a scale note on a heading-like line governs the figures under it (final evaluation, round 7) ------------------
+
+NOTE = "ממצאי בדיקת הכדאיות לפרויקט באלפי ₪ לא כולל מע״מ"
+
+
+@pytest.mark.parametrize("preceding, governing", [
+    # (kind, text, same section), nearest first: the heading-like paragraph above the figures' paragraphs
+    ([("paragraph", "סה״כ הכנסות היזם 117,860", True), ("paragraph", NOTE, True), ("heading", "7. כדאיות", True)],
+     NOTE),
+    ([("heading", "7. בדיקת כדאיות (באלפי ₪)", True)], "7. בדיקת כדאיות (באלפי ₪)"),  # a heading's own note
+    ([("heading", "7. בדיקת כדאיות", True), ("paragraph", NOTE, True)], ""),  # not across the section's heading
+    ([("paragraph", NOTE, False)], ""),  # another section's note
+    ([("table", "טבלה 3 (במיליוני ₪)", True), ("paragraph", NOTE, True)], ""),  # a table with its own note
+    ([("table", "טבלה 3: לוח זמנים", True), ("paragraph", NOTE, True)], NOTE),  # a table without one
+    ([("paragraph", "העלויות (באלפי ₪) 104,610", True), ("paragraph", NOTE, True)], ""),  # another figure's note
+    ([("paragraph", f"שורה {i} ללא הערה", True) for i in range(calc.NOTE_WINDOW)] + [("paragraph", NOTE, True)],
+     ""),  # beyond the window
+])
+def test_the_note_that_governs_a_figure_is_the_nearest_heading_like_line_of_its_section(preceding, governing):
+    assert calc.governing_note(preceding) == governing
+
+
+def test_a_governing_note_is_the_farthest_context_and_never_scales_a_percent():
+    own = "רווח שוטף (הפסד) 13,250"
+    m = calc._WRITTEN_NUMBER.search(own)
+    assert calc.stated_scale(own, m.start(), m.end(), own, NOTE) == 1000
+    assert calc.stated_scale(own, m.start(), m.end(), "טבלה (במיליוני ₪)", NOTE) == 10**6  # the nearer note wins
+    rate = "שיעור רווח לעלות (הפסד) 12.7%"
+    m = calc._WRITTEN_NUMBER.search(rate)
+    assert calc.stated_scale(rate, m.start(), m.end(), rate, NOTE) == 1

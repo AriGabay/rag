@@ -325,3 +325,80 @@ def test_a_currency_stated_with_a_scale_attests_the_currency():
     assert units_attested("עלות 5,000,000 ₪") == {"ILS"}
     assert units_attested("שיעור 17%") == {"percent"}
     assert units_attested("12 קומות") == set()
+
+
+# --- a period word attests a number of its own line, sentence or governing line only (final evaluation, round 7) ----
+#
+# A feasibility section in thousands: a heading-like line, one figure per paragraph, and a later paragraph on the
+# financing whose "ריבית שנתית" wraps onto the next line — the interest rate's period, in another paragraph.
+
+FEASIBILITY = ("ממצאי בדיקת הכדאיות לפרויקט באלפי ₪ לא כולל מע״מ\nסה״כ הכנסות היזם 117,860\n"
+               "סה״כ הוצאות (כולל מימון ועקיפות) 104,610-\nרווח שוטף (הפסד) 13,250\nשיעור רווח לעלות (הפסד) 12.7%\n"
+               "הבדיקה נערכה על בסיס הנחות היזם, לרבות מימון בנקאי בריבית שנתית\nשל 6% לכל תקופת ההקמה.")
+
+
+def _periods(text: str, number: str, within: str) -> set[str]:
+    return meaning.number_qualifiers(text, frozenset(meaning.numbers_in(number)), within).keys("period")
+
+
+@pytest.mark.parametrize("number, within", [
+    ("104,610", "סה״כ הוצאות (כולל מימון ועקיפות) 104,610-"),
+    ("13,250", "רווח שוטף (הפסד) 13,250"),
+    ("12.7", "שיעור רווח לעלות (הפסד) 12.7%"),
+])
+def test_an_interest_rates_year_in_another_paragraph_is_not_the_totals_period(number, within):
+    assert _periods(FEASIBILITY, number, within) == set()
+
+
+def test_an_interest_rates_period_is_the_rates_own():
+    assert _periods("המימון הבנקאי בריבית שנתית של 6% לכל תקופת ההקמה.", "6", "בריבית שנתית של 6%") == {"year"}
+    # a line on the financing above the figures states the rate's period, not theirs
+    above = "המימון חושב בריבית שנתית.\nסה״כ הוצאות 104,610"
+    assert _periods(above, "104,610", "סה״כ הוצאות 104,610") == set()
+
+
+@pytest.mark.parametrize("text, number, within", [
+    ("סה״כ ההכנסות מהחניון 310,000 ₪ לשנה.", "310,000", "ההכנסות מהחניון 310,000"),  # its own line
+    ("ההכנסות המוצגות להלן הן לשנה\nהכנסות מהחניון 310,000\nהכנסות מהמחסנים 42,500", "42,500", "המחסנים 42,500"),
+    ("דמי השכירות לנכס נקבעו ל-310,000 ₪\nלשנה, בהתאם להסכם.", "310,000", "נקבעו ל-310,000 ₪"),  # wrapped
+])
+def test_a_genuine_period_on_the_values_line_its_sentence_or_its_heading_line_still_attests_it(text, number, within):
+    assert _periods(text, number, within) == {"year"}
+
+
+def test_a_period_in_a_later_paragraph_is_not_the_figures():
+    text = "סה״כ הכנסות היזם 117,860\nרווח שוטף 13,250\nההצמדה למדד מחושבת לשנה."
+    assert _periods(text, "13,250", "רווח שוטף 13,250") == set()
+    # nor does it attest a period an answer gives the figure
+    (p,) = _problems("הרווח השוטף הוא 13,250 ₪ לשנה [S1].", _ws(text))
+    assert p.blocking and p.kind == "period"
+
+
+@pytest.mark.parametrize("source", [
+    "ההכנסות המוצגות להלן הן לשנה\nהכנסות מהחניון 310,000",
+    "הכנסות מהחניון 310,000 ₪\nלשנה, בהתאם להסכם.",
+])
+def test_a_governing_period_is_required_when_the_answer_omits_it(source):
+    (p,) = _problems("הכנסות מהחניון הן 310,000 ₪ [S1].", _ws(source))
+    assert not p.blocking and p.kind == "period" and p.annotation == "לשנה"
+
+
+def test_a_period_heading_does_not_cross_a_numbered_new_section():
+    source = "ההכנסות לשנה\nהכנסות 100\n8. סיכום עלויות הפרויקט\nעלות כוללת 450"
+    assert _periods(source, "450", "עלות כוללת 450") == set()
+
+
+def test_a_wrapped_interest_rate_keeps_its_own_period():
+    source = "מימון בנקאי בריבית שנתית\nשל 6% לכל תקופת ההקמה."
+    assert _periods(source, "6", "של 6% לכל תקופת ההקמה") == {"year"}
+
+
+def test_an_expanded_source_can_attest_its_governing_period():
+    ws = _ws("הכנסות מהחניון 310,000")
+    original = ws.sources["S1"]
+    expanded = ws.add_source(document_id=original.document_id, version_id=original.version_id,
+                             title=original.title, section=original.section, location="", kind="context",
+                             text="ההכנסות לשנה\nהכנסות מהחניון 310,000")
+    (unit,) = split_units("הכנסות מהחניון הן 310,000 ₪ לשנה [S1].")
+    assert meaning.Fetcher(ws).attesting(unit, frozenset(meaning.numbers_in("310,000")),
+                                        "period", "year", set()) == expanded.sid

@@ -915,3 +915,102 @@ def test_a_result_over_a_table_in_thousands_shown_in_millions_is_kept(client, of
     assert "25.74 מיליון ₪" in a["markdown"] and "[C1]" in a["markdown"]
     (c1,) = a["computations"]
     assert c1["scale"] == 1000 and c1["unit"] == "אלפי ₪"
+
+
+# --- a scale stated by a heading-like line, and a period that is an interest rate's (final evaluation) -------------
+#
+# A synthetic feasibility section: a heading-like paragraph "באלפי ₪" with no figure of its own, one figure per
+# paragraph under it, and a later paragraph on the financing whose "ריבית שנתית" wraps onto the next line.
+
+FEAS_SECTION = "7. בדיקת כדאיות כלכלית"
+FEAS_NOTE = "ממצאי בדיקת הכדאיות לפרויקט באלפי ₪ לא כולל מע״מ"
+FEAS_COST = "סה״כ הוצאות (כולל מימון ועקיפות) 104,610-"
+FEAS_PROFIT = "רווח שוטף (הפסד) 13,250"
+FEAS_LINES = ["סה״כ הכנסות היזם 117,860", FEAS_COST, FEAS_PROFIT, "שיעור רווח לעלות (הפסד) 12.7%",
+              "הבדיקה נערכה על בסיס הנחות היזם, לרבות מימון בנקאי בריבית שנתית\nשל 6% לכל תקופת ההקמה."]
+FEAS_QUESTION = "מה ההפרש בין 18% מסך ההוצאות לבין הרווח השוטף בבדיקת הכדאיות?"
+FEAS_TABLE = "טבלה 7: עלויות עקיפות (במיליוני ₪)"
+
+
+def add_feasibility(office, sha: str = "9" * 64) -> str:
+    """The synthetic feasibility section as stored blocks, and after it a table with a note of its own (millions)."""
+    structure = {"headers": ["רכיב", "סכום"], "caption": FEAS_TABLE, "title": [], "notes": [],
+                 "section": FEAS_SECTION, "block_index": 7, "rows": [{"cells": ["תכנון ופיקוח", "4.2"]}]}
+    blocks = [("heading", FEAS_SECTION, None), ("paragraph", FEAS_NOTE, None),
+              *(("paragraph", t, None) for t in FEAS_LINES), ("table", FEAS_TABLE, 0)]
+    doc, ver = make_document(office, office.default_group_id, "בדיקת כדאיות — רחוב הרימון 12 (סינתטי)", sha=sha)
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_versions SET page_count = 1, ingestion = CAST(:i AS jsonb) WHERE id = :v"),
+                     {"v": ver, "i": json.dumps({"reading_id": "reading-feas"})})
+        for i, (kind, t, table) in enumerate(blocks):
+            conn.execute(text(
+                "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
+                " section_path, page, text, status, table_index) VALUES (app_office(), :d, :v, :b, :k, :s, :sp, 1,"
+                " :t, 'read', :ti)"),
+                {"d": doc, "v": ver, "b": i, "k": kind, "s": FEAS_SECTION, "sp": [FEAS_SECTION], "t": t, "ti": table})
+        conn.execute(text("INSERT INTO extracted_tables (office_id, document_id, version_id, table_index, page_start,"
+                          " page_end, structure) VALUES (app_office(), :d, :v, 0, 1, 1, CAST(:s AS jsonb))"),
+                     {"d": doc, "v": ver, "s": json.dumps(structure, ensure_ascii=False)})
+    return str(doc)
+
+
+def _feas_takes(source: str) -> list:
+    return [take(source, quote(FEAS_COST, "104,610"), meaning("cost", role="cost", period="unknown"), "סה״כ הוצאות"),
+            take(source, quote(FEAS_PROFIT, "13,250"), meaning("profit", period="unknown"), "רווח שוטף"),
+            call("assume", value="18%", quote="18% מסך ההוצאות", label="שיעור מסך ההוצאות")]
+
+
+def test_figures_under_a_heading_line_in_thousands_are_in_thousands_and_take_no_interest_rates_year(office):
+    doc = add_feasibility(office)
+    ws = workspace(office, question=FEAS_QUESTION)
+    s = _section_source(ws, doc, FEAS_SECTION)
+    for step in _feas_takes(s):
+        out = run(ws, step["call"], **step["arguments"])
+        assert out[:2] in ("V1", "V2", "A1"), out
+    v1, v2 = ws.values["V1"], ws.values["V2"]
+    assert (v1.scale, v2.scale) == (1000, 1000)
+    assert "year" not in (v1.period, v2.period) and v1.provenance["period"] != "source"
+    out = json.loads(T.tool_calculate(ws, "A1% * V1 - V2", "ההפרש בין 18% מההוצאות לרווח"))
+    assert Decimal(out["value"]) == Decimal("5579.8") and out["scale"] == 1000 and out["unit"] == "אלפי ₪", out
+    # the table after the figures states its own scale: its cell is in millions, not in the heading line's thousands
+    t = re.search(r'<source id="(S\d+)"', T.tool_read(ws, {"table": handle_of(T.tool_outline(ws, doc), FEAS_TABLE)}))
+    assert run(ws, "take_value", **take(t.group(1), cell("תכנון ופיקוח", "סכום"), meaning("cost", role="cost"),
+                                        "תכנון ופיקוח")["arguments"]).startswith("V3")
+    assert ws.values["V3"].scale == 10**6
+
+
+def test_a_result_in_thousands_is_kept_and_judged_in_thousands_with_no_period_demanded(client, office, monkeypatch):
+    doc = add_feasibility(office)
+    answer = ("סך ההוצאות בבדיקת הכדאיות הוא 104,610 אלפי ₪ [V1] והרווח השוטף 13,250 אלפי ₪ [V2]; "
+              "18% מסך ההוצאות [A1] פחות הרווח השוטף הם 5,579.8 אלפי ₪ [C1].")
+    shown: list[str] = []
+
+    def judge(input: str) -> dict:
+        # the judge reads a calculation as the evidence shows it: in ₪, 5,579.8 is a wrong calculation
+        shown.append(input)
+        units = re.findall(r'<unit index="(\d+)" cites="([^"]*)"', input)
+        in_thousands = "התוצאה באלפי ₪" in input and "5,579,800 ביחידות מלאות" in input
+        return {"verdicts": [{"index": int(i), "verdict": "unsupported" if "C1" in c and not in_thousands
+                              else "supported", "reason": "בדיקה", "supported_by": []} for i, c in units]}
+
+    agent = ScriptedAgent([
+        [call("outline", document=doc)],
+        _open(FEAS_SECTION),
+        _feas_takes("S1"),
+        [call("calculate", expression="A1% * V1 - V2", label="ההפרש בין 18% מההוצאות לרווח", justification=None)],
+        final(answer, documents=[doc]), final(answer, documents=[doc]), final(answer, documents=[doc])], judge=judge)
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), FEAS_QUESTION)
+    assert m["status"] == "done", m
+    a = m["answer"]
+    assert a["verification"]["removed"] == 0 and a["status"] == "answered", a
+    assert "5,579.8 אלפי ₪" in a["markdown"] and "[C1]" in a["markdown"]
+    assert "לשנה" not in a["markdown"] and not any("לשנה" in x for x in shown)
+    (c1,) = a["computations"]
+    assert c1["scale"] == 1000 and c1["unit"] == "אלפי ₪"
+    rounds = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["rounds"]
+    # no period demanded for the totals (a conditional result's note is another matter: the values' ₪ is the
+    # heading line's, so their unit is the model's)
+    assert not [p for r in rounds for p in r
+                if p["kind"] == "missing_qualifier" and "לשנה" in json.dumps(p, ensure_ascii=False)]

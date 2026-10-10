@@ -54,7 +54,10 @@ Tools:
   is taken again with that turn's meaning checked against it. A value carries the scale its source states it in
   (``calc.stated_scale``, round 7 R14): its own scale word ("5,600 אלף ₪"), else a note of its cell, row or column,
   else of its table's caption, title or notes ("(באלפי ₪)", "אלפי ש״ח", "K ₪"); for a quote, of the quote, else of
-  its line; a number followed directly by a currency is in units;
+  its line; else, for either, of the heading-like line above it in its section that notes a scale and holds no
+  figure of its own ("ממצאי הבדיקה באלפי ₪" over one figure per paragraph: ``calc.governing_note``, the nearest
+  table with its own note stopping it); a number followed directly by a currency is in units, and a percent is
+  never scaled;
 - ``assume``: a number the user gave for a scenario, quoted from the user's own message (``A#``);
 - ``calculate``: an expression over ``M#``/``V#``/``A#``/``C#`` (``app.chat.calc``): exact decimals, compatibility
   by operation, every result a ``C#`` with its formula, inputs, assumptions and sources that later calculations
@@ -87,7 +90,7 @@ import logging
 import math
 import re
 import time
-from collections.abc import Container
+from collections.abc import Callable, Container
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any
@@ -736,6 +739,33 @@ def _table_at(ws: Workspace, conn: Connection, version_id, table_index: int) -> 
         found = ws.tables[key] = (reader.table_structure(conn, version_id, table_index),
                                   reader.table_block(conn, version_id, table_index))
     return found
+
+
+def _note_above(full: str, start: int) -> str:
+    """The scale note that governs a number at ``start`` of a source's text from a line above it
+    (``calc.governing_note`` over the text's lines, nearest first, all in the source's own section)."""
+    above = full[:start].split("\n")[:-1]
+    return calc.governing_note([("paragraph", ln, True) for ln in reversed(above) if ln.strip()])
+
+
+def _governing_note(ws: Workspace, conn: Connection, version_id, block_index: int | None) -> str:
+    """The scale note that governs a figure in block ``block_index`` from above (``calc.governing_note``): the
+    blocks before it, nearest first, each with whether it is in the figure's section; a table's with its caption,
+    title and notes. "" when there is none (or the block is not known)."""
+    if block_index is None or block_index <= 0:
+        return ""
+    rows = reader.blocks_between(conn, version_id, max(0, block_index - calc.NOTE_WINDOW), block_index)
+    held = next((r for r in rows if r.block_index == block_index), None)
+    own = tuple(getattr(held, "section_path", None) or ())
+    preceding = []
+    for r in reversed([r for r in rows if r.block_index < block_index]):
+        text_, kind = r.text or "", getattr(r, "kind", None) or "paragraph"
+        if kind == "table" and getattr(r, "table_index", None) is not None:
+            st = _table_at(ws, conn, version_id, r.table_index)[0] or {}
+            text_ = "\n".join(x for x in [text_, st.get("caption") or "", *(st.get("title") or []),
+                                          *(st.get("notes") or [])] if x)
+        preceding.append((kind, text_, tuple(getattr(r, "section_path", None) or ()) == own))
+    return calc.governing_note(preceding)
 
 
 def _row_contexts(ws: Workspace, conn: Connection, cx, version_id, table_index: int) -> tuple[list[dict], dict]:
@@ -2379,15 +2409,17 @@ def _take_cell(ws: Workspace, conn: Connection, src: Source, full: str, loc: dic
     """The number in the cell at a named row and column of the source's table, verified against the table's stored
     structure; a number the model names that is in another row or column is refused, with where it is."""
     index = _table_of(ws, src, loc.get("table"))
-    st, _ = _table_at(ws, conn, src.version_id, index)
+    st, block = _table_at(ws, conn, src.version_id, index)
     if st is None:
         raise ToolError("הטבלה לא נמצאה בקריאה הנוכחית של המסמך")
-    return _cell_of(src, full, loc, st, index)
+    return _cell_of(src, full, loc, st, index,
+                    _governing_note(ws, conn, src.version_id, block.block_index if block is not None else None))
 
 
-def _cell_of(src: Source, full: str, loc: dict, st: dict, index) -> dict:
+def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str = "") -> dict:
     """The cell a locator names in a table structure (``extracted_tables.structure``, or a visual reading's table in
-    the same shape), its number checked against the cell and the source's text, with what the table attests."""
+    the same shape), its number checked against the cell and the source's text, with what the table attests.
+    ``governing``: the scale note that governs the table from a block above it (``calc.governing_note``)."""
     rows = [list(r.get("cells") or []) for r in st.get("rows") or []]
     headers = list(st.get("headers") or [])
     if not rows:
@@ -2470,9 +2502,10 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index) -> dict:
     unit_from = next((where for where, t in (("cell", near[0]), ("row", near[1]), ("header", near[2] + " " + near[3]))
                       if meaning.units_attested(t)), "table" if units else None)
     # the scale the table states it in (R14): the cell's own scale word, else a note of its cell, row or column
-    # ("הכנסות (אלפי ₪)"), else of the table's caption, title or notes ("טבלה 4 (באלפי ₪)")
+    # ("הכנסות (אלפי ₪)"), else of the table's caption, title or notes ("טבלה 4 (באלפי ₪)"), else of the heading-like
+    # line above the table that governs it ("ממצאי הבדיקה באלפי ₪") — a table's own note is nearer than that line's
     scale = calc.stated_scale(meaning._norm(cell), *at_cell, meaning._norm(" ".join(near)),
-                              meaning._norm(" ".join(x for x in table_text if x)))
+                              meaning._norm(" ".join(x for x in table_text if x)), meaning._norm(governing))
     # who stated it: the column header, else the row label, else the table's caption, title or notes (KTD8)
     said = (attribution_in(header, adopted=True) or attribution_in(label, adopted=True)
             or attribution_in(" ".join(x for x in table_text if x), adopted=True))
@@ -2535,10 +2568,11 @@ def _vision_table(ws: Workspace, src: Source, given) -> int:
     return 0
 
 
-def _take_vision_cell(ws: Workspace, src: Source, full: str, loc: dict) -> dict:
+def _take_vision_cell(ws: Workspace, src: Source, full: str, loc: dict, governing: str = "") -> dict:
     """A cell of a table read by inspect, through its stored reading, with its OCR evidence (``evidence``: the
     cell's ``images.cell_evidence`` entry, ``why``: the message for its status) and an anchor of the region and the
-    cell's box in the rendered page when OCR confirmed it in its place."""
+    cell's box in the rendered page when OCR confirmed it in its place. ``governing``: the scale note that governs
+    the region from a block above it (``calc.governing_note``)."""
     from app.extraction.images import BY_OCR, CELL_CONFIRMED, CELL_NO_OCR, placed_cells
 
     vis = src.vision
@@ -2547,7 +2581,7 @@ def _take_vision_cell(ws: Workspace, src: Source, full: str, loc: dict) -> dict:
     t = reading.tables[ti]
     st = {"headers": list(t.headers), "rows": [{"cells": list(r)} for r in t.rows], "title": list(t.title),
           "notes": list(t.notes), "source": "vision"}
-    taken = _cell_of(src, full, loc, st, ti)
+    taken = _cell_of(src, full, loc, st, ti, governing)
     ri, ci = taken["anchor"]["row"], taken["anchor"]["column"]
     ocr = reading.ocr or {}
     cells = placed_cells(reading)  # a reading stored before the numbers' grid placed cells is placed again here
@@ -2601,12 +2635,14 @@ MSG_QUOTE_AMBIGUOUS = ("הציטוט מופיע ב-{sid} יותר מפעם אח�
                        "שמופיע במקור פעם אחת בלבד ושהמספר כתוב בו במלואו")
 
 
-def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = None) -> dict:
+def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = None,
+                governing: Callable[[int], str] | None = None) -> dict:
     """The number inside an exact quote of the source: the quote must occur in the source's full text, and the
     number inside the quote. ``blocks``: the source's blocks (``(block_index, text, page)``), where the quote is
     located within the cited range only (KTD4): one occurrence records its block and word span; several that write
     the same number record the blocks holding them (block precision); several that write different numbers are
-    refused, asking for a longer quote. Never the first occurrence."""
+    refused, asking for a longer quote. Never the first occurrence. ``governing``: the scale note that governs a
+    block from a block above it (``calc.governing_note``), for the block the number is in."""
     if not loc.get("number"):
         raise ToolError("ציטוט (quote) דורש גם את המספר כפי שנכתב בו (number)")
     wanted = _parse_number(loc["number"])
@@ -2647,8 +2683,14 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
     # who stated it: the words of the number's own clause, else of its sentence (KTD8); never the first occurrence
     # elsewhere — the number as quoted
     said = attribution_at(text_, at + start, at + end)
-    # the scale the source states it in (R14): its own scale word, else a note of the quote, else of its line
-    scale = calc.stated_scale(text_, at + start, at + end, quote, line)
+    # the scale the source states it in (R14): its own scale word, else a note of the quote, else of its line, else
+    # of the heading-like line above that governs its block ("ממצאי הבדיקה באלפי ₪" over one figure per paragraph)
+    held = _value_blocks(anchor)
+    notes = [governing(b) for b in sorted(held)] if governing is not None and held else [""]
+    scales = {calc.stated_scale(text_, at + start, at + end, quote, line, meaning._norm(note)) for note in notes}
+    if len(scales) != 1:
+        raise ToolError(MSG_QUOTE_AMBIGUOUS.format(sid=src.sid))
+    scale = scales.pop()
     return {"written": written, "value": sign * value, "forms": forms, "quote": loc["quote"].strip(),
             "qualifiers": meaning.number_qualifiers(full, forms, quote),
             "units": units, "vat": meaning.vat_attested(line, forms, full),
@@ -2886,7 +2928,7 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
             raise ToolError(MSG_STALE_REF.format(source_id=sid))
         rows: list = []
         if cell and vision:
-            taken = _take_vision_cell(ws, src, full, loc)
+            taken = _take_vision_cell(ws, src, full, loc, _governing_note(ws, conn, src.version_id, src.block_start))
             at = None
         elif cell:
             taken = _take_cell(ws, conn, src, full, loc)
@@ -2898,7 +2940,7 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
                 rows = reader.blocks_between(conn, src.version_id, src.block_start,
                                              src.block_end if src.block_end is not None else src.block_start)
                 blocks = [(r.block_index, r.text or "", r.page) for r in rows]
-            taken = _take_quote(src, full, loc, blocks)
+            taken = _take_quote(src, full, loc, blocks, lambda b: _governing_note(ws, conn, src.version_id, b))
             at = _value_blocks(taken.get("anchor") or {})
         reading_id = src.reading_id or v.reading_id
         # the value's own region: read clearly, or read uncertainly at ingestion (then re-read, below, at most
@@ -3408,7 +3450,8 @@ def _near_misses(ws: Workspace, node, operands: dict[str, calc.Operand], justifi
     (``explicit_amount_available``); else, within a factor of two of it, an amount that differs (a material gap).
     An amount the product reproduces at its precision, or an input's own number, is neither. Amounts are compared
     in units: the product as value × its scale, each stated amount as its number × the scale its source states it in
-    (``calc.stated_scale``: its own scale word, else a note of its line), so a cost of a table "(באלפי ₪)" times a
+    (``calc.stated_scale``: its own scale word, else a note of its line, else of the line above that governs it:
+    ``_note_above``), so a cost of a table "(באלפי ₪)" times a
     rate meets a profit stated in full ₪ in the prose; the record's ``value``, ``computed`` and ``range`` are in
     units."""
     near = differs = None
@@ -3448,7 +3491,7 @@ def _near_misses(ws: Workspace, node, operands: dict[str, calc.Operand], justifi
                     continue
                 seen.add((written, line))
                 overlap = len(words & _content_words(line))
-                stated = calc.stated_scale(full, start, end, line)
+                stated = calc.stated_scale(full, start, end, line, _note_above(full, start))
                 if not overlap or calc.display_matches(written, False, out.value, (), scale=stated,
                                                        source_scale=out.scale):
                     continue

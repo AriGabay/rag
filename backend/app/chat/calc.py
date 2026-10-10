@@ -42,9 +42,10 @@ and compatibility depends on the operation (R17):
   justification makes the result conditional). A percentage applies only through ``%``.
 
 An amount carries the scale its source states it in (round 7 R14: ``Operand.scale``, from ``stated_scale`` — a
-table "(באלפי ₪)", a column "אלפי ש״ח", a number's own "אלף"), so its amount is value × scale; nothing is rescaled
-behind the model's back. Sums, differences and aggregates of amounts of one scale keep it, and × or ÷ by a
-dimensionless value (a rate, 12) keep it; scales multiply and divide with the values (thousands ÷ thousands cancel),
+table "(באלפי ₪)", a column "אלפי ש״ח", a number's own "אלף", or the heading-like line above it that notes a scale
+and holds no figure of its own, "ממצאי הבדיקה באלפי ₪", in its section: ``governing_note``; a percent is never
+scaled), so its amount is value × scale; nothing is rescaled behind the model's back. Sums, differences and
+aggregates of amounts of one scale keep it, and × or ÷ by a dimensionless value (a rate, 12) keep it; scales multiply and divide with the values (thousands ÷ thousands cancel),
 and a dimensionless result carries none. Amounts of different scales are never combined as if they were one: each is
 brought to units (value × scale) before it is added, subtracted or aggregated, the result is in units and is marked
 ``rescaled`` — chosen over refusing because the model cannot convert a scale itself (the literals are structural
@@ -988,6 +989,11 @@ _NOTE_VALUES = {"אלפי": 10**3, "מיליוני": 10**6, "מיליארדי": 
                 "מיליארדים": 10**9, "K": 10**3, "k": 10**3, "M": 10**6}
 SCALE_LABELS = {10**3: "אלפי", 10**6: "מיליוני", 10**9: "מיליארדי"}
 _UNITS_AFTER = re.compile(r"[ \u00a0]?(?:₪|ש[\"״']ח)")
+_PERCENT_AT = re.compile(r"[ \u00a0]?%")
+# blocks looked at above a figure for the note that governs it (``governing_note``)
+NOTE_WINDOW = 6
+# a heading's enumeration ("7.", "7.2", "(3)") is not a number of its own
+_ENUMERATION = re.compile(r"^\s*\(?\d+(?:\.\d+)*[.)]?\s")
 
 
 def scale_notes(text: str) -> set[int]:
@@ -1004,20 +1010,46 @@ def scale_notes(text: str) -> set[int]:
 
 def stated_scale(own: str, start: int, end: int, *contexts: str) -> int:
     """The scale a source states a number in (R14): the scale word right after it ("5,600 אלף ₪": ``scale_after``);
-    else 1 when a currency follows it directly ("5,000,000 ₪" is in units); else the scale the nearest context that
-    notes one states — ``contexts`` from the nearest: the cell, its row label and column header before the table's
-    caption, title and notes; the quote before the line it is in. A context whose notes state two scales says
-    nothing, and none is looked for further. 1 when no source states a scale."""
+    else 1 when a currency follows it directly ("5,000,000 ₪" is in units) or it is a percent ("12.7%": a rate has no
+    scale); else the scale the nearest context that notes one states — ``contexts`` from the nearest: the cell, its
+    row label and column header before the table's caption, title and notes; the quote before the line it is in;
+    last, the note that governs it from a line above (``governing_note``). A context whose notes state two scales
+    says nothing, and none is looked for further. 1 when no source states a scale."""
     word = scale_after(own, start, end)[0]
     if word != 1:
         return word
-    if _UNITS_AFTER.match(own, end):
+    if _UNITS_AFTER.match(own, end) or _PERCENT_AT.match(own, end) or own[max(0, start - 1):start] == "%":
         return 1
     for text in contexts:
         notes = scale_notes(text)
         if notes:
             return next(iter(notes)) if len(notes) == 1 else 1
     return 1
+
+
+def governing_note(preceding) -> str:
+    """The note that states the scale for the figures under it (R14): a figure whose own words, line, cell, row,
+    column or table state no scale is in the scale of the nearest block above it, in its section, that notes one and
+    holds no figure of its own — a heading-like line "ממצאי הבדיקה באלפי ₪ לא כולל מע״מ" over one figure per
+    paragraph, or the section's heading itself. ``preceding``: the blocks above the figure's own, nearest first, as
+    (kind, text, in the figure's section); for a table, its text with its caption, title and notes. At most
+    ``NOTE_WINDOW`` blocks are looked at, and the search stops — with no note — at a block of another section, at the
+    section's heading when it notes none, at a table with a note of its own (its note is its own cells'), and at a
+    block noting a scale beside a figure of its own (that note is that figure's). The note's text, or ""; a note of
+    two scales says nothing (``stated_scale``)."""
+    for n, (kind, text, same) in enumerate(preceding):
+        if n >= NOTE_WINDOW or (not same and kind != "heading"):
+            return ""
+        notes = scale_notes(text)
+        if kind == "table":
+            if notes:
+                return ""
+            continue
+        if notes:
+            return text if kind == "heading" or not re.search(r"\d", _ENUMERATION.sub("", text or "")) else ""
+        if kind == "heading" or not same:
+            return ""
+    return ""
 
 
 def scaled_label(label: str, scale: int) -> str:

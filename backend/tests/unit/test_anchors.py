@@ -345,6 +345,18 @@ def test_take_quote_with_the_same_number_twice_is_accepted_at_block_precision():
     assert taken["anchor"]["pages"] == [3, 4]
 
 
+def test_same_quote_under_conflicting_scale_notes_requires_disambiguation():
+    from app.chat.tools import ToolError, _take_quote
+
+    quote = "רווח שוטף 9,500"
+    full = quote + "\n" + quote
+    src = _source(text=full, block_start=4, block_end=8, reading_id="r1")
+    blocks = [(4, quote, 3), (8, quote, 4)]
+    with pytest.raises(ToolError, match="ציטוט ארוך יותר"):
+        _take_quote(src, full, {"quote": quote, "number": "9,500"}, blocks,
+                    governing=lambda b: "באלפי ₪" if b == 4 else "במיליוני ₪")
+
+
 def test_take_quote_records_the_block_and_word_span():
     from app.chat.tools import _take_quote
 
