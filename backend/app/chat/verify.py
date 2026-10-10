@@ -1259,11 +1259,11 @@ def _citation_point(markdown: str, unit: Unit) -> int:
     return end
 
 
-_AFTER_NUMBER = re.compile(r"\s*(?:₪|ש[\"״]ח)?(?:\s*ל?מ[\"״]ר)?")
+_AFTER_NUMBER = re.compile(r"\s*(?:%|₪|ש[\"״]ח)?(?:\s*ל?מ[\"״]ר)?")  # "12.11%" is never split from its sign
 
 
 def _after_number(unit: Unit, written: str) -> int | None:
-    """The position in the answer right after a number of the unit (and its scale word, currency and per-m² words:
+    """The position in the answer right after a number of the unit (and its scale word, percent sign, currency and per-m² words:
     "25.74 מיליון ₪")."""
     from app.chat.calc import scale_after
 

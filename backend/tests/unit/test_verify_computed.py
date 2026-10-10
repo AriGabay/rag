@@ -563,3 +563,17 @@ def test_a_sum_of_an_amount_in_thousands_and_an_amount_in_units_is_computed_in_u
 def test_the_servers_qualifier_follows_a_result_shown_with_a_scale_word_after_the_word():
     _, applied = _qualified(_conditional_sum(), "סך העלות הוא 20.22 מיליון ₪ [C1].")
     assert "20.22 מיליון ₪ (תוצאה מותנית: הערכים V1, V2 אינם ודאיים) [C1]" in applied.answer_markdown
+
+
+@pytest.mark.parametrize("raw, number, after", [
+    ("שיעור הרווח לעלות יהיה כ־12.11% בתרחיש.", "12.11", "12.11%"),
+    ("שיעור הרווח לעלות יהיה 12.11 % בתרחיש.", "12.11", "12.11 %"),
+    ("הרווח יהיה 37,123.38 אלף ₪ בתרחיש.", "37,123.38", "37,123.38 אלף ₪"),
+])
+def test_a_qualifier_goes_after_the_number_with_its_percent_sign_or_currency(raw, number, after):
+    """The server's qualifier never splits a number from its "%" ("12.11 (תוצאה מותנית: ...)%")."""
+    from app.chat.verify import Unit, _after_number
+
+    unit = Unit(0, raw, 0, len(raw))
+    at = _after_number(unit, number)
+    assert raw[:at].endswith(after)

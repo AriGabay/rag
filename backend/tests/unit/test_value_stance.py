@@ -417,3 +417,14 @@ def test_a_computation_states_the_rounding_rule_its_display_follows():
     assert r["text"] and r["trailing_zeros"] is False
     big = _computation("V1 + V2", [a, calc.operand("V2", "1000000", "ILS", kind="cost", subject="הפרויקט")]).public()
     assert big["rounding"]["decimals"] == 2 and big["rounding"]["percent"] is False and big["steps"] == []
+
+
+def test_a_scenario_the_source_does_not_name_tells_the_model_to_take_it_again_without_one(decision):
+    """A scenario label of the model's own ("בדיקה בסיסית" for the only figures there are) leaves the value
+    uncertain and every result built on it conditional: the tool says the source names no such scenario and how
+    to take the value again; the re-take with no scenario is verified."""
+    out = T.tool_take_value(decision.ws, decision.sid, _quote(PLAIN_TEXT, "210"),
+                            _meaning(scenario="בדיקה בסיסית"), "שווי")
+    assert decision.ws.values["V1"].certainty == "model_asserted" and T.MSG_SCENARIO_UNSTATED in out
+    again = T.tool_take_value(decision.ws, decision.sid, _quote(PLAIN_TEXT, "210"), _meaning(), "שווי")
+    assert decision.ws.values["V2"].certainty == "verified" and T.MSG_SCENARIO_UNSTATED not in again

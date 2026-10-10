@@ -2844,6 +2844,9 @@ def _settle_attribution(given: dict, said: Attribution | None, context: str) -> 
 MSG_ATTRIBUTION_UNSTATED = ("המקור אינו אומר מי קבע את הערך או באיזה מעמד (אומץ, טענה, הצעה או אומדן). אם אין לכך "
                             "בסיס במילים המצוטטות, בכותרת השורה או העמודה או בסעיף — קח את הערך שוב ב-take_value עם "
                             "stance=unknown ו-stated_by ריק: כך הוא נרשם כפי שהמקור כותב אותו")
+MSG_SCENARIO_UNSTATED = ("המקור אינו מציין את התרחיש או המועד שנתת. אם המילים המצוטטות, כותרת השורה או העמודה או "
+                         "הסעיף אינם מציינים תרחיש — קח את הערך שוב ב-take_value עם scenario ריק: תרחיש שאינו "
+                         "במקור משאיר את הערך לא ודאי ואת החישובים עליו מותנים")
 
 
 def _attribution_line(value: calc.Value, said: Attribution | None) -> str:
@@ -2865,6 +2868,8 @@ def _attribution_line(value: calc.Value, said: Attribution | None) -> str:
         out += " | " + MSG_ATTRIBUTION_UNSTATED
     elif value.stance == "unknown":
         out += " (המקור אינו אומר מי קבע את הערך או אם אומץ)"
+    if p.get("scenario") == "model_asserted":
+        out += " | " + MSG_SCENARIO_UNSTATED
     return out
 
 
