@@ -359,6 +359,33 @@ def assert_no_document_gap_for_instructions(a: dict) -> None:
 PLAN_SECTION = fact("plan_status", "approved_units")["section"]  # "2. מצב תכנוני"
 
 
+def test_reported_calculation_classification_keeps_source_context_separate_from_new_arithmetic(real_key):
+    """A source's existing allowance and its contractual counterpart are facts to retrieve. Only a request to
+    compute their difference is a calculation; mentioning the source's calculation does not change the request.
+    This calls the real analysis boundary without creating or truncating database rows."""
+    from app.chat import request
+
+    questions = [
+        ("לפי הדוח הסינתטי למתחם שדרות הקורנית, מהי תוספת השטח שנלקחה בחישוב, והבחן בינה לבין התוספת "
+         "שנקבעה בהסכם?", False),
+        ("בדוח הסינתטי למתחם שדרות הקורנית, מה ההבדל בין תוספת השטח שנלקחה בתחשיב לבין התוספת "
+         "שנקבעה בהסכם? הצג את הנתונים כפי שנכתבו.", False),
+        ("לפי הדוח הסינתטי למתחם שדרות הקורנית, חשב את ההפרש במ״ר בין תוספת השטח שנלקחה בחישוב לבין "
+         "התוספת שנקבעה בהסכם.", True),
+    ]
+    for question, calculation in questions:
+        analysis = request.analyze(llm.get_provider(Purpose.AGENT), question, deadline=None)
+        record = {"case": "reported-calculation-classification", "question": question,
+                  "expected_calculation": calculation, "components": analysis.items, "usage": analysis.usage,
+                  "outcome": "pass" if analysis.status == "ok" and
+                  any(c["calculation"] for c in analysis.items or []) == calculation else "fail"}
+        RESULTS.append(record)
+        flush()
+        assert analysis.status == "ok", analysis.status
+        assert any(c["calculation"] for c in analysis.items or []) == calculation, analysis.items
+        assert any(c["kind"] == ("calculation" if calculation else "information") for c in analysis.items)
+
+
 def test_mixed_information_and_writing_instructions_never_become_document_gaps(chat, office, monkeypatch):
     ingest(office, monkeypatch, "plan_status")
     phrasings = [
@@ -381,6 +408,62 @@ def test_mixed_information_and_writing_instructions_never_become_document_gaps(c
                     uncited = [line for line in body_lines(a) if re.search(r"\d", line) and not cited_ids(line)]
                     assert uncited, comp
         cases.run(f"instructions/{i}", chat, body)
+    cases.check()
+
+
+def test_a_reported_allowance_keeps_its_contractual_contrast_and_only_a_requested_difference_is_computed(
+    chat, office, monkeypatch,
+):
+    """Synthetic reported allowances exercise analysis, reading, complete contrast citations and repair through
+    the chat API. Retrieval asks for both original quantities; arithmetic asks for a newly computed difference."""
+    from tests.integration.test_search import add_chunks
+
+    title = "דוח סינתטי למתחם שדרות הקורנית"
+    section = "2. תוספות השטח בהסכם ובתחשיב"
+    paragraphs = [
+        "מסמך סינתטי לדמו — דוח למתחם שדרות הקורנית. בסעיף ההסכם נקבעה תוספת שטח של 29 מ״ר לכל דירה.",
+        "בתחשיב השמאי למתחם שדרות הקורנית נלקחה בחשבון תוספת שטח של 16 מ״ר לכל דירה. זו הנחת התחשיב, "
+        "בשונה מתוספת השטח של 29 מ״ר שנקבעה בהסכם.",
+    ]
+    doc, ver = add_chunks(office, office.default_group_id, paragraphs, "e" * 64)
+    # Store the actual reading as well as searchable chunks: outline/read and exact-quote take_value use blocks.
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE documents SET title = :title WHERE id = :d"), {"title": title, "d": doc})
+        conn.execute(text("UPDATE chunks SET page_list = ARRAY[1], section = :s WHERE version_id = :v"),
+                     {"v": ver, "s": section})
+        conn.execute(text("UPDATE document_versions SET page_count = 1, ingestion = CAST(:i AS jsonb) WHERE id = :v"),
+                     {"v": ver, "i": json.dumps({"reading_id": "reading-reported-allowance"})})
+        for index, (kind, content) in enumerate([("heading", section),
+                                                *(("paragraph", p) for p in paragraphs)]):
+            conn.execute(text(
+                "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
+                " section_path, page, text, status) VALUES (app_office(), :d, :v, :b, :k, :s, :sp, 1, :t, 'read')"),
+                {"d": doc, "v": ver, "b": index, "k": kind, "s": section, "sp": [section], "t": content})
+    phrasings = [
+        ("לפי הדוח למתחם שדרות הקורנית, מהי תוספת השטח שנלקחה בחישוב, והבחן בינה לבין התוספת שנקבעה בהסכם?",
+         False),
+        ("לפי הדוח למתחם שדרות הקורנית, חשב במ״ר את ההפרש: התוספת שנקבעה בהסכם פחות התוספת שנלקחה בתחשיב.",
+         True),
+    ]
+    cases = Phrasings()
+    for i, (q, calculate) in enumerate(phrasings, 1):
+        def body(c, cid, record, q=q, calculate=calculate):
+            a = ask(c, cid, q, record)
+            assert any(x["kind"] == "calculation" for x in a.get("components") or []) == calculate
+            if calculate:
+                computation = computation_with(a, "13")
+                assert computation is not None, a.get("computations")
+                assert computation["id"] in cited_ids(a["markdown"]), a["markdown"]
+                return
+            assert not a.get("computations"), a.get("computations")
+            for number in ("16", "29"):
+                assert lines_with(a["markdown"], number), a["markdown"]
+                assert cited_pages_of(a, number), (number, a["markdown"])
+            assert "הסכם" in a["markdown"] and "תחשיב" in a["markdown"], a["markdown"]
+            assert not any(g["reason"] == "calculation_incomplete" for g in a.get("gaps") or [])
+            assert not any(x.get("status") != "full" for x in a.get("components") or []
+                           if x["kind"] == "information"), a.get("components")
+        cases.run(f"reported-allowance/{i}", chat, body)
     cases.check()
 
 
