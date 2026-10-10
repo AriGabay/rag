@@ -84,6 +84,16 @@ def forms(token: str) -> set[str]:
     return set(found[0]) | {token} if found else {token}
 
 
+
+def _metric_word(token: str) -> bool:
+    """A word that names a kind of value ("שווי", "לשכירות", "הרווח": ``meaning.KIND_WORDS``, with its prefix
+    letters): it names the datum, never a document, even where a title holds it ("שומה שווי שוק ..."). The whole
+    word must be the metric's: a name that merely contains its letters ("שוויצר") is still a name."""
+    from app.chat.meaning import KIND_WORDS, _norm
+
+    word = _norm(token)
+    return any(re.fullmatch(rf"[והבלמשכ]{{0,2}}(?:{rx})", word) for rx in KIND_WORDS.values())
+
 def identifying(words: str, titles: list[str], bare_numbers: bool = True, pairs_only: bool = False) -> list[str]:
     """The words that can name a document: a number (a house or unit number, not an amount), Latin letters, or a
     word of some title the user may see. With ``bare_numbers`` off, a number counts only beside such a word
@@ -102,7 +112,7 @@ def identifying(words: str, titles: list[str], bare_numbers: bool = True, pairs_
             tokens.append((tok, "number"))
         else:
             found = _scope_terms(tok)
-            named = bool(found) and bool(vocabulary & set(found[0]))
+            named = bool(found) and bool(vocabulary & set(found[0])) and not _metric_word(tok)
             tokens.append((found[0][0] if found else tok, "name" if named else None))
 
     def beside(i: int, kinds: tuple[str, ...]) -> bool:

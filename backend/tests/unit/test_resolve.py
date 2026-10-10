@@ -418,3 +418,17 @@ def test_an_unspecific_kind_on_either_side_is_no_mismatch():
     assert resolve.mismatch(req, SimpleNamespace(metric_kind="profit")) is None
     r = _resolved(relation="metric_change", changed_fields=_changed(("metric_kind", "הרווח")), metric_kind="profit")
     assert resolve.mismatch(_validate(r, INCOME_FOCUS, "ומה הרווח?"), SimpleNamespace(metric_kind="other")) is None
+
+
+def test_a_metric_word_never_names_a_document_even_when_a_title_holds_it():
+    """A correction of the metric ("התכוונתי לשווי, לא לשכירות") keeps the property: "שווי" and "שכירות" name the
+    datum, not a document, even where some title holds them ("שומה שווי שוק ..."); a street that merely contains the
+    letters of a metric word still names its document."""
+    titles = [*TITLES, "שומה שווי שוק - הצבעוני 3 עין ורד", "שומה - שוויצר 8 עין ורד"]
+    assert entities.identifying("התכוונתי לשווי, לא לשכירות", titles, bare_numbers=False) == []
+    assert entities.identifying("ומה בשוויצר 8?", titles, bare_numbers=False)
+    r = _resolved(changed_fields=_changed(("metric_kind", "לשווי")), metric_kind="value_per_area")
+    focus_ids = set(RENT_FOCUS["document_ids"])
+    req = validate(r, RENT_FOCUS, "התכוונתי לשווי, לא לשכירות", authorized, titles, lookup_in(focus_ids), None,
+                   focus_titles=[CORPUS[DOC][0]])
+    assert req.document_ids == [DOC] and not req.entity_changed and not req.clarify
