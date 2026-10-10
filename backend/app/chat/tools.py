@@ -748,7 +748,24 @@ def _note_above(full: str, start: int) -> str:
     return calc.governing_note([("paragraph", ln, True) for ln in reversed(above) if ln.strip()])
 
 
-def _governing_note(ws: Workspace, conn: Connection, version_id, block_index: int | None) -> str:
+@dataclass(frozen=True)
+class _ScaleNote:
+    text: str
+    block_index: int
+    status: str
+
+
+def _value_scale(own: str, start: int, end: int, *local: str, governing: str | _ScaleNote = "") -> int:
+    """An inherited scale must be read clearly; nearer, explicit scales need no inherited evidence."""
+    note = governing.text if isinstance(governing, _ScaleNote) else governing
+    scale = calc.stated_scale(own, start, end, *local, meaning._norm(note))
+    if isinstance(governing, _ScaleNote) and governing.status in (reader.UNREAD, reader.UNCERTAIN) \
+            and scale != calc.stated_scale(own, start, end, *local):
+        raise ToolError(f"קנה המידה בבלוק {governing.block_index} לא ודאי: קרא ואמת את ההערה לפני לקיחת הערך")
+    return scale
+
+
+def _governing_note(ws: Workspace, conn: Connection, version_id, block_index: int | None) -> str | _ScaleNote:
     """The scale note that governs a figure in block ``block_index`` from above (``calc.governing_note``): the
     blocks before it, nearest first, each with whether it is in the figure's section; a table's with its caption,
     title and notes. "" when there is none (or the block is not known)."""
@@ -756,16 +773,26 @@ def _governing_note(ws: Workspace, conn: Connection, version_id, block_index: in
         return ""
     rows = reader.blocks_between(conn, version_id, max(0, block_index - calc.NOTE_WINDOW), block_index)
     held = next((r for r in rows if r.block_index == block_index), None)
-    own = tuple(getattr(held, "section_path", None) or ())
+    cx = contexts_of(ws, conn, version_id)
+    segment = cx.segment_at(block_index) if cx.multi else None
+    own = reader.effective_path(cx, block_index, getattr(held, "section_path", None))
     preceding = []
+    candidates = []
     for r in reversed([r for r in rows if r.block_index < block_index]):
+        if segment is not None and r.block_index < segment.first:
+            break
         text_, kind = r.text or "", getattr(r, "kind", None) or "paragraph"
         if kind == "table" and getattr(r, "table_index", None) is not None:
             st = _table_at(ws, conn, version_id, r.table_index)[0] or {}
             text_ = "\n".join(x for x in [text_, st.get("caption") or "", *(st.get("title") or []),
                                           *(st.get("notes") or [])] if x)
-        preceding.append((kind, text_, tuple(getattr(r, "section_path", None) or ()) == own))
-    return calc.governing_note(preceding)
+        preceding.append((kind, text_, reader.effective_path(cx, r.block_index, getattr(r, "section_path", None)) == own))
+        candidates.append((r, text_))
+    note = calc.governing_note(preceding)
+    if not note:
+        return ""
+    row = next(r for r, text_ in candidates if text_ == note)
+    return _ScaleNote(note, row.block_index, row.status)
 
 
 def _row_contexts(ws: Workspace, conn: Connection, cx, version_id, table_index: int) -> tuple[list[dict], dict]:
@@ -2237,8 +2264,8 @@ def _cached_listing(conn: Connection, docs: list, metric_kinds: list[str] | None
     """Cached verified values (KTD12) of the current readings of the documents the user may see (row security), by
     the same filters as the measurements: the documents, the kinds their source attests, else words of their quote,
     section or column. At most ``CACHED_MAX``, with the total."""
-    params: dict = {}
-    conds = ["d.deleted_at IS NULL"]
+    params: dict = {"verifier_version": VALUE_VERIFIER_VERSION}
+    conds = ["d.deleted_at IS NULL", "c.value->>'verifier_version' = :verifier_version"]
     if docs:
         params["d"] = docs
         conds.append("c.document_id = ANY(:d)")
@@ -2416,7 +2443,7 @@ def _take_cell(ws: Workspace, conn: Connection, src: Source, full: str, loc: dic
                     _governing_note(ws, conn, src.version_id, block.block_index if block is not None else None))
 
 
-def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str = "") -> dict:
+def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str | _ScaleNote = "") -> dict:
     """The cell a locator names in a table structure (``extracted_tables.structure``, or a visual reading's table in
     the same shape), its number checked against the cell and the source's text, with what the table attests.
     ``governing``: the scale note that governs the table from a block above it (``calc.governing_note``)."""
@@ -2504,8 +2531,8 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     # the scale the table states it in (R14): the cell's own scale word, else a note of its cell, row or column
     # ("הכנסות (אלפי ₪)"), else of the table's caption, title or notes ("טבלה 4 (באלפי ₪)"), else of the heading-like
     # line above the table that governs it ("ממצאי הבדיקה באלפי ₪") — a table's own note is nearer than that line's
-    scale = calc.stated_scale(meaning._norm(cell), *at_cell, meaning._norm(" ".join(near)),
-                              meaning._norm(" ".join(x for x in table_text if x)), meaning._norm(governing))
+    scale = _value_scale(meaning._norm(cell), *at_cell, meaning._norm(" ".join(near)),
+                         meaning._norm(" ".join(x for x in table_text if x)), governing=governing)
     # who stated it: the column header, else the row label, else the table's caption, title or notes (KTD8)
     said = (attribution_in(header, adopted=True) or attribution_in(label, adopted=True)
             or attribution_in(" ".join(x for x in table_text if x), adopted=True))
@@ -2568,7 +2595,7 @@ def _vision_table(ws: Workspace, src: Source, given) -> int:
     return 0
 
 
-def _take_vision_cell(ws: Workspace, src: Source, full: str, loc: dict, governing: str = "") -> dict:
+def _take_vision_cell(ws: Workspace, src: Source, full: str, loc: dict, governing: str | _ScaleNote = "") -> dict:
     """A cell of a table read by inspect, through its stored reading, with its OCR evidence (``evidence``: the
     cell's ``images.cell_evidence`` entry, ``why``: the message for its status) and an anchor of the region and the
     cell's box in the rendered page when OCR confirmed it in its place. ``governing``: the scale note that governs
@@ -2636,7 +2663,7 @@ MSG_QUOTE_AMBIGUOUS = ("הציטוט מופיע ב-{sid} יותר מפעם אח�
 
 
 def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = None,
-                governing: Callable[[int], str] | None = None) -> dict:
+                governing: Callable[[int], str | _ScaleNote] | None = None) -> dict:
     """The number inside an exact quote of the source: the quote must occur in the source's full text, and the
     number inside the quote. ``blocks``: the source's blocks (``(block_index, text, page)``), where the quote is
     located within the cited range only (KTD4): one occurrence records its block and word span; several that write
@@ -2687,7 +2714,7 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
     # of the heading-like line above that governs its block ("ממצאי הבדיקה באלפי ₪" over one figure per paragraph)
     held = _value_blocks(anchor)
     notes = [governing(b) for b in sorted(held)] if governing is not None and held else [""]
-    scales = {calc.stated_scale(text_, at + start, at + end, quote, line, meaning._norm(note)) for note in notes}
+    scales = {_value_scale(text_, at + start, at + end, quote, line, governing=note) for note in notes}
     if len(scales) != 1:
         raise ToolError(MSG_QUOTE_AMBIGUOUS.format(sid=src.sid))
     scale = scales.pop()
@@ -3091,12 +3118,16 @@ def _cache_record(value: calc.Value) -> dict:
     return record
 
 
+VALUE_VERIFIER_VERSION = "value-v2"  # v2: number-bound periods and context-bound, clearly read inherited scales
+
+
 def _cache_doc(value: calc.Value, taken: dict, path: tuple, stub: dict | None, src: Source,
                span: tuple[int, int] | None) -> dict:
     """The ``verified_values.value`` of a value: its record, the facts, its anchor stub and where it was read (the
     blocks of its own region, else the source's)."""
     start, end = span if span is not None else (src.block_start, src.block_end)
-    return {"record": _cache_record(value), "facts": _facts_json(taken, path), "anchor": stub,
+    return {"verifier_version": VALUE_VERIFIER_VERSION,
+            "record": _cache_record(value), "facts": _facts_json(taken, path), "anchor": stub,
             "source": {"kind": src.kind, "section": src.section, "location": src.location, "block_start": start,
                        "block_end": end, "table_index": src.table_index,
                        "page_list": list((stub or {}).get("pages") or src.page_list or [])}}
@@ -3127,8 +3158,10 @@ def _locator_agrees(record: dict, loc: dict) -> bool:
 def _cached_value(conn: Connection, version_id, reading_id: str, locator: dict) -> dict | None:
     """The cached value at a version, reading and locator the user may see (row security), or None."""
     row = conn.execute(text(
-        "SELECT value FROM verified_values WHERE version_id = :v AND reading_id = :r AND locator = CAST(:l AS jsonb)"),
-        {"v": version_id, "r": reading_id, "l": json.dumps(locator, ensure_ascii=False)}).first()
+        "SELECT value FROM verified_values WHERE version_id = :v AND reading_id = :r AND locator = CAST(:l AS jsonb)"
+        " AND value->>'verifier_version' = :verifier_version"),
+        {"v": version_id, "r": reading_id, "l": json.dumps(locator, ensure_ascii=False),
+         "verifier_version": VALUE_VERIFIER_VERSION}).first()
     return row.value if row is not None else None
 
 
@@ -3155,9 +3188,12 @@ def _store_verified(ws: Workspace, value: calc.Value, doc: dict) -> None:
                 return
             conn.execute(text(
                 "INSERT INTO verified_values (office_id, document_id, version_id, reading_id, locator, value)"
-                " VALUES (app_office(), :d, :v, :r, CAST(:l AS jsonb), CAST(:x AS jsonb)) ON CONFLICT DO NOTHING"),
+                " VALUES (app_office(), :d, :v, :r, CAST(:l AS jsonb), CAST(:x AS jsonb))"
+                " ON CONFLICT (version_id, reading_id, locator) DO UPDATE SET value = EXCLUDED.value"
+                " WHERE verified_values.value->>'verifier_version' IS DISTINCT FROM :verifier_version"),
                 {"d": v.document_id, "v": value.version_id, "r": value.reading_id,
-                 "l": json.dumps(value.locator, ensure_ascii=False), "x": json.dumps(doc, ensure_ascii=False)})
+                 "l": json.dumps(value.locator, ensure_ascii=False), "x": json.dumps(doc, ensure_ascii=False),
+                 "verifier_version": VALUE_VERIFIER_VERSION})
     except Exception:  # noqa: BLE001 - the value itself is registered; only its reuse is lost
         logger.warning("verified value cache store failed")
 

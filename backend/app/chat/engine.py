@@ -737,7 +737,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         checked = (answer, report)
         # a rewrite takes about as long as the answer it rewrites: a round that would not fit is not started
         repair_from = deadline - max(REPAIR_MIN_SECONDS, REPAIR_TIME_FACTOR * answer_seconds)
-        if report.ok or settled or attempt >= repairs or time.monotonic() > repair_from:
+        if report.ok or settled or attempt >= repairs or steps >= settings.chat_max_steps or time.monotonic() > repair_from:
             return finish(answer, report)
         attempt += 1
         if attempt == 1:

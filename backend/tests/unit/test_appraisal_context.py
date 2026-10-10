@@ -43,6 +43,24 @@ def appraisal(first: int, page: int, street: str, block: str, parcel: str, per_s
 TWO = appraisal(0, 1, "הדמומית 12", "30871", "15", "21,400") + appraisal(13, 2, "הצפצפה 7", "30874", "9", "22,100")
 
 
+def test_a_governing_scale_stops_at_an_appraisal_title_with_an_inherited_section_path(monkeypatch):
+    from app.chat import reader, tools
+
+    rows = [B(0, "paragraph", 1, "כתובת הנכס: רחוב הדמומית 12; גוש: 30871 חלקה: 15"),
+            B(1, "heading", 1, "1. מבוא"), B(2, "heading", 1, "2. תחשיב"),
+            B(3, "paragraph", 1, "ממצאי הבדיקה באלפי ₪"),
+            B(4, "paragraph", 2, "כתובת הנכס: רחוב הצפצפה 7; גוש: 30874 חלקה: 9"),
+            B(5, "paragraph", 2, "סך העלויות 104,610"), B(6, "heading", 2, "1. מבוא")]
+    for row in rows:
+        row.section_path = ["2. תחשיב"]
+    cx = contexts.derive(rows, "version")
+    assert cx.multi and cx.segment_at(5).first == 4
+    ws = tools.Workspace(ctx=None)
+    ws.contexts["version"] = cx
+    monkeypatch.setattr(reader, "blocks_between", lambda *args: rows[:6])
+    assert tools._governing_note(ws, None, "version", 5) == ""
+
+
 def test_identifiers_are_labelled_only():
     ident = contexts.identifiers("כתובת הנכס: רחוב הצפצפה 7, כפר הדמה\nגוש: 30874 חלקה: 9")
     assert ident.addresses == {("צפצפה", "7")} and ident.parcels == {("30874", "9")}

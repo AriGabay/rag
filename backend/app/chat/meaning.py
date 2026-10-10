@@ -363,10 +363,6 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
     period = _period_lines(lines, is_row)
     occurrences: list[tuple[frozenset[str], Occurrence]] = []
     general = Qualifiers()
-    # A short table's notes can attest a stated period; they require it only for its per-area amounts.
-    # Valuation totals do not inherit the period of rents used to calculate them.
-    for key, written in table["period"].items():
-        general.add("period", key, written)
     for n, (line, row) in enumerate(zip(lines, is_row, strict=True)):
         if row:
             if line is header:
@@ -390,7 +386,10 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
                     own = cells[0] + " " + cell
                     area = bool(_PER_AREA.search(own + " " + (heads[i] if i < len(heads) else ""))
                                 or _AREA_WORD.search(own))
-                    if _PER_AREA.search(own + " " + (heads[i] if i < len(heads) else "")):
+                    # Without a header, a table-wide period also attests its data rows (e.g. an address/rent
+                    # table headed "all rents in this table are monthly"). A labelled calculation table binds
+                    # that period to its per-area amounts; totals keep only their own row/header qualifiers.
+                    if not heads or _PER_AREA.search(own + " " + (heads[i] if i < len(heads) else "")):
                         q.merge(period(n))
                     occurrences.append((f, Occurrence(q, line, area=area)))
             continue

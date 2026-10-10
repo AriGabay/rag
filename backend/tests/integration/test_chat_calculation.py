@@ -979,6 +979,20 @@ def test_figures_under_a_heading_line_in_thousands_are_in_thousands_and_take_no_
     assert ws.values["V3"].scale == 10**6
 
 
+def test_a_clear_figure_cannot_take_its_scale_from_an_uncertain_heading(office):
+    doc = add_feasibility(office)
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_blocks SET status = 'read_uncertain' WHERE block_index = 1"))
+    ws = workspace(office, question=FEAS_QUESTION)
+    s = _section_source(ws, doc, FEAS_SECTION)
+    step = _feas_takes(s)[0]
+    out = run(ws, step["call"], **step["arguments"])
+    assert "לא ודאי" in out, out
+    assert not ws.values and not ws.settled_values
+    with tenant_tx(office.ctx()) as conn:
+        assert conn.execute(text("SELECT count(*) FROM verified_values")).scalar_one() == 0
+
+
 def test_a_result_in_thousands_is_kept_and_judged_in_thousands_with_no_period_demanded(client, office, monkeypatch):
     doc = add_feasibility(office)
     answer = ("סך ההוצאות בבדיקת הכדאיות הוא 104,610 אלפי ₪ [V1] והרווח השוטף 13,250 אלפי ₪ [V2]; "

@@ -79,6 +79,13 @@ def test_a_period_in_the_column_header_is_needed_and_written_there_passes():
     assert _problems("בדולב 6 דמי השכירות החודשיים הם 64 ₪ למ\"ר [S1].", ws) == []
 
 
+def test_a_monthly_rent_table_does_not_attest_a_period_for_a_project_total():
+    source = 'שווי הפרויקט הוא 2,730,000 ₪.\nנכס | שכ"ד לחודש (₪ למ"ר)\nהדולב 6 | 64'
+    q = meaning.number_qualifiers(source, frozenset({"2730000", "2,730,000"}), 'שווי הפרויקט הוא 2,730,000 ₪.')
+    assert not q.keys("period")
+    assert _problems('שווי הפרויקט הוא 2,730,000 ₪ [S1].', _ws(source)) == []
+
+
 def test_a_row_label_carries_the_basis():
     table = "סיכום שווי\nרכיב | ערך\nשווי למ\"ר פלדלת | 11,900\nשווי כולל | 1,130,500"
     (p,) = _problems("השווי למ\"ר הוא 11,900 ₪ [S1].", _ws(table, kind="table"))
@@ -232,6 +239,13 @@ def test_a_rate_gets_the_basis_of_its_tables_area_row_and_the_period_of_its_note
     assert found["period"].annotation == "לחודש"
     # the total of the same table gets neither
     assert _problems("השווי המעוגל הוא 20,630,000 ₪ [S1].", _ws(CALC, kind="table")) == []
+
+
+def test_a_table_note_qualifies_the_rent_rate_only_when_a_total_is_taken():
+    total = meaning.number_qualifiers(CALC, frozenset({"20630000", "20,630,000"}), 'שווי מעוגל | ₪ 20,630,000')
+    rate = meaning.number_qualifiers(CALC, frozenset({"52"}), 'דמ"ש למ"ר | ₪ 52')
+    assert not total.keys("period")
+    assert rate.keys("period") == {"month"}
 
 
 def test_a_table_with_two_bases_binds_none():

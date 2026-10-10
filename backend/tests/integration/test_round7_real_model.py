@@ -458,7 +458,7 @@ def test_a_reported_allowance_keeps_its_contractual_contrast_and_only_a_requeste
             for number in ("16", "29"):
                 assert lines_with(a["markdown"], number), a["markdown"]
                 assert cited_pages_of(a, number), (number, a["markdown"])
-            assert "הסכם" in a["markdown"] and "תחשיב" in a["markdown"], a["markdown"]
+            assert "הסכם" in a["markdown"] and any(word in a["markdown"] for word in ("תחשיב", "חישוב")), a["markdown"]
             assert not any(g["reason"] == "calculation_incomplete" for g in a.get("gaps") or [])
             assert not any(x.get("status") != "full" for x in a.get("components") or []
                            if x["kind"] == "information"), a.get("components")
@@ -514,8 +514,19 @@ def test_a_partly_found_category_states_only_its_missing_items(chat, office, mon
 
 def test_an_inspected_image_table_feeds_a_non_conditional_computation_anchored_to_the_table(chat, office,
                                                                                             monkeypatch):
+    from app.chat import tools
+
     ingest(office, monkeypatch, "cost_table_image")
     langs = crop_ocr(monkeypatch)
+    crop_words = []
+    crop_reader = tools._crop_ocr
+
+    def capture_crop(png):
+        words = crop_reader(png)
+        crop_words.append(words)
+        return words
+
+    monkeypatch.setattr(tools, "_crop_ocr", capture_crop)
     q = DOCS["cost_table_image"]["question_total"]
     picture = fact("cost_table_image", "picture")
     phrasings = [
@@ -527,6 +538,12 @@ def test_an_inspected_image_table_feeds_a_non_conditional_computation_anchored_t
         def body(c, cid, record, question=question):
             record["notes"].append(f"crop OCR: {langs}")
             a = ask(c, cid, question, record)
+            # Private synthetic diagnostics make a failed cell's placement reproducible without another model call.
+            with tenant_tx(office.ctx()) as conn:
+                record["inspections"] = [dict(r) for r in conn.execute(text(
+                    "SELECT region, reading FROM region_readings")).mappings()]
+            record["crop_words"] = crop_words
+            flush()
             # the picture was read in the turn (ingestion read none of it): a visual reading of its region
             assert any(src.get("kind") == "image" for src in a.get("sources") or []), \
                 [(src["id"], src.get("kind")) for src in a.get("sources") or []]

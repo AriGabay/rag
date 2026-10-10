@@ -383,6 +383,27 @@ def test_an_unsupported_claim_in_the_output_retry_is_still_removed(client, offic
     assert "990" not in m["answer"]["markdown"] and m["answer"]["verification"]["removed"] > 0
 
 
+def test_a_truncation_consuming_a_repair_slot_keeps_the_global_step_bound(client, office, monkeypatch):
+    setting(monkeypatch, chat_max_steps=4, chat_repair_rounds=2)
+    wrong = final('שטח המגרש הוא 990 מ"ר [S1].')
+    agent = TruncatedAgent([[pages(office.doc, 2)], CallStatus.INCOMPLETE, wrong, wrong, wrong])
+    m = ask(client, office, monkeypatch, agent)
+    assert len(agent.seen) == 4
+    assert m["status"] == "done" and "990" not in m["answer"]["markdown"]
+    assert m["answer"]["verification"]["removed"] > 0
+
+
+def test_a_truncated_repair_keeps_only_the_previously_verified_content(client, office, monkeypatch):
+    setting(monkeypatch, chat_max_steps=5, chat_repair_rounds=2)
+    mixed = final('שטח המגרש הוא 812 מ"ר [S1].\n\nגובה המבנה הוא 990 מטר [S1].')
+    agent = TruncatedAgent([[pages(office.doc, 2)], mixed, CallStatus.INCOMPLETE, CallStatus.INCOMPLETE])
+    m = ask(client, office, monkeypatch, agent)
+    assert m["status"] == "done" and len(agent.seen) == 4
+    assert "812" in m["answer"]["markdown"] and "990" not in m["answer"]["markdown"]
+    assert "פלט קטוע" not in m["answer"]["markdown"]
+    assert m["answer"]["verification"]["removed"] > 0
+
+
 # --- a cache-friendly loop ---------------------------------------------------------------------------------------
 
 def test_every_step_sends_the_previous_steps_items_unchanged_and_only_appends(client, office, monkeypatch):

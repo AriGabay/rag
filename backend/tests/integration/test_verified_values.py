@@ -121,6 +121,22 @@ def test_a_value_of_an_earlier_reading_is_not_listed_or_reused(office):
     assert sorted(r.reading_id for r in _rows(office)) == ["reading-1", "reading-2"]
 
 
+def test_a_value_verified_by_older_rules_is_rechecked_before_reuse(office):
+    _take_total_income(workspace(office, office.emp), office)
+    stale = workspace(office, office.emp)
+    q = _q(T.tool_find_measurements(stale, "הכנסות"))
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE verified_values SET value = value - 'verifier_version'"))
+    assert "Q1" not in T.tool_find_measurements(workspace(office, office.emp), "הכנסות")
+    out = run(stale, "take_value", source=q, locator=cell(None, None), meaning=meaning("income", role="total"))
+    assert out.startswith("שגיאה") and not stale.values
+    fresh = workspace(office, office.emp)
+    assert _take_total_income(fresh, office).startswith("V1 נרשם")
+    (row,) = _rows(office)
+    assert row.value["verifier_version"] == T.VALUE_VERIFIER_VERSION
+    assert "Q1" in T.tool_find_measurements(workspace(office, office.emp), "הכנסות")
+
+
 def test_a_cached_value_of_a_document_no_longer_visible_is_not_listed_or_used(office):
     _take_total_income(workspace(office, office.emp), office)
     ws = workspace(office, office.other)
