@@ -248,6 +248,29 @@ def test_a_table_note_qualifies_the_rent_rate_only_when_a_total_is_taken():
     assert rate.keys("period") == {"month"}
 
 
+def test_a_headed_income_table_keeps_the_period_of_its_caption():
+    source = 'ההכנסות בטבלה הן לשנה.\nרכיב | סכום (₪)\nשכירות | 100,000\nחניה | 20,000\nסה״כ | 120,000'
+    for number, row in [('100,000', 'שכירות'), ('20,000', 'חניה'), ('120,000', 'סה״כ')]:
+        assert _periods(source, number, f'{row} | {number}') == {"year"}
+
+
+def test_a_headerless_rent_and_capital_table_keeps_the_period_off_capital():
+    source = CALC.replace('\nרכיב | ערך', '')
+    assert _periods(source, '20,630,000', 'שווי מעוגל | ₪ 20,630,000') == set()
+    assert _periods(source, '52', 'דמ"ש למ"ר | ₪ 52') == {"month"}
+    assert _periods(source, '2,480', 'סה"כ מ"ר אקווי\' | 2,480') == set()
+
+
+def test_a_rent_caption_does_not_give_a_month_to_a_capital_rate():
+    source = CALC + '\nשווי למ"ר | ₪ 8,320'
+    assert _periods(source, '8,320', 'שווי למ"ר | ₪ 8,320') == set()
+
+
+def test_a_rent_caption_does_not_give_a_month_to_a_purchase_price():
+    source = CALC + '\nמחיר רכישה | ₪ 2,000,000'
+    assert _periods(source, '2,000,000', 'מחיר רכישה | ₪ 2,000,000') == set()
+
+
 def test_a_table_with_two_bases_binds_none():
     two = CALC.replace("דמ\"ש למ\"ר | ₪ 52", "שטח פלדלת במ\"ר | 2,100\nדמ\"ש למ\"ר | ₪ 52")
     assert not [p for p in _problems("דמי השכירות הם 52 ₪ למ\"ר [S1].", _ws(two, kind="table")) if p.kind == "basis"]
@@ -416,3 +439,15 @@ def test_an_expanded_source_can_attest_its_governing_period():
     (unit,) = split_units("הכנסות מהחניון הן 310,000 ₪ לשנה [S1].")
     assert meaning.Fetcher(ws).attesting(unit, frozenset(meaning.numbers_in("310,000")),
                                         "period", "year", set()) == expanded.sid
+
+
+@pytest.mark.parametrize("context, units", [
+    ("מספר יח\"ד בפרויקט", {"units"}),
+    ("מקדם התאמה", {"ratio"}),
+    ("מספר השנים שנותרו בחכירה", set()),
+    ("מספר חודשי הגרייס", set()),
+])
+def test_a_count_is_units_but_a_number_of_years_is_not(context, units):
+    from app.chat.meaning import units_attested
+
+    assert units_attested(context) == units

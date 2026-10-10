@@ -969,6 +969,7 @@ def test_figures_under_a_heading_line_in_thousands_are_in_thousands_and_take_no_
         assert out[:2] in ("V1", "V2", "A1"), out
     v1, v2 = ws.values["V1"], ws.values["V2"]
     assert (v1.scale, v2.scale) == (1000, 1000)
+    assert v1.unit == v2.unit == "ILS" and v1.provenance["unit"] == v2.provenance["unit"] == "source"
     assert "year" not in (v1.period, v2.period) and v1.provenance["period"] != "source"
     out = json.loads(T.tool_calculate(ws, "A1% * V1 - V2", "ההפרש בין 18% מההוצאות לרווח"))
     assert Decimal(out["value"]) == Decimal("5579.8") and out["scale"] == 1000 and out["unit"] == "אלפי ₪", out
@@ -1024,7 +1025,6 @@ def test_a_result_in_thousands_is_kept_and_judged_in_thousands_with_no_period_de
     (c1,) = a["computations"]
     assert c1["scale"] == 1000 and c1["unit"] == "אלפי ₪"
     rounds = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["rounds"]
-    # no period demanded for the totals (a conditional result's note is another matter: the values' ₪ is the
-    # heading line's, so their unit is the model's)
+    # The clearly read governing heading attests currency, not the neighbouring interest rate's period.
     assert not [p for r in rounds for p in r
                 if p["kind"] == "missing_qualifier" and "לשנה" in json.dumps(p, ensure_ascii=False)]

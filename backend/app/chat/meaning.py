@@ -314,29 +314,46 @@ def _period_lines(lines: list[str], is_row: list[bool]):
 
     around = [i for i, row in enumerate(is_row) if not row]
     few = len(around) <= TABLE_AROUND
-    table = Qualifiers()
+    table = []
     if any(is_row) and few:
         for i in around:
-            table.merge(_only(_all(lines[i], rates=False), "period"))
+            table.append((lines[i], _only(_all(lines[i], rates=False), "period")))
+
+    def scoped(notes, context: str) -> Qualifiers:
+        q = Qualifiers()
+        money_kinds = {"value", "price", "rent", "management_fee", "cost", "income", "profit", "levy"}
+        recurring = {"rent", "management_fee", "income"}
+        row_kinds = {k for k in money_kinds if kind_attested(k, context)}
+        for note, quals in notes:
+            kinds = {k for k in money_kinds if kind_attested(k, note)}
+            if not kinds or not row_kinds or kinds & row_kinds or kinds & recurring and row_kinds & recurring:
+                q.merge(quals)
+        return q
 
     @cache
-    def period(i: int) -> Qualifiers:
+    def period(i: int, context: str = "") -> Qualifiers:
         if not is_row[i]:
             q = Qualifiers().merge(stated[i]).merge(opening(i + 1)).merge(above(i))
             return q
         if few:
-            return table
+            return scoped(table, context)
         first, last = i, i
         while first > 0 and is_row[first - 1]:
             first -= 1
         while last + 1 < len(lines) and is_row[last + 1]:
             last += 1
-        q = Qualifiers().merge(above(first))
+        notes = []
+        for k in range(first - 1, max(-1, first - 1 - NOTE_LINES), -1):
+            if is_row[k] or _ENUMERATION.match(lines[k]):
+                break
+            if not has_num[k] and stated[k].found and not opening(k).found:
+                notes.append((lines[k], stated[k]))
+                break
         for j in range(last + 1, min(len(lines), last + 3)):
             if is_row[j] or has_num[j]:
                 break
-            q.merge(stated[j])
-        return q
+            notes.append((lines[j], stated[j]))
+        return scoped(notes, context)
 
     return period
 
@@ -378,7 +395,7 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
                         q.merge(_all(heads[i]))  # the column's header
                     if _PER_AREA.search(cells[0] + " " + (heads[i] if i < len(heads) else "") + " " + cell):
                         for kind, defined in table.items():
-                            if len(defined) == 1 and not q.keys(kind):
+                            if kind != "period" and len(defined) == 1 and not q.keys(kind):
                                 key, written = next(iter(defined.items()))
                                 q.add(kind, key, written)
                     # a per-area amount by its label, header or cell ("שווי למ״ר"); an area by its own label or cell —
@@ -386,11 +403,15 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
                     own = cells[0] + " " + cell
                     area = bool(_PER_AREA.search(own + " " + (heads[i] if i < len(heads) else ""))
                                 or _AREA_WORD.search(own))
-                    # Without a header, a table-wide period also attests its data rows (e.g. an address/rent
-                    # table headed "all rents in this table are monthly"). A labelled calculation table binds
-                    # that period to its per-area amounts; totals keep only their own row/header qualifiers.
-                    if not heads or _PER_AREA.search(own + " " + (heads[i] if i < len(heads) else "")):
-                        q.merge(period(n))
+                    # A caption also governs absolute monetary amounts, not only rates. Capital values and
+                    # area/factor rows do not inherit a recurring period from neighbouring rent notes, even
+                    # without a header. An explicit row/header period takes precedence over the caption.
+                    row_meaning = own + " " + (heads[i] if i < len(heads) else "")
+                    units = units_attested(row_meaning)
+                    monetary = bool(units & {"ILS", "ILS_per_sqm"})
+                    rent_rate = bool(_PER_AREA.search(row_meaning) and kind_attested("rent", row_meaning))
+                    if not q.keys("period") and (monetary or rent_rate or not units and not heads):
+                        q.merge(period(n, row_meaning))
                     occurrences.append((f, Occurrence(q, line, area=area)))
             continue
         found, gen = attached(line)
@@ -461,6 +482,10 @@ def units_attested(context: str) -> set[str]:
         return {"dunam"}
     if re.search(r"מ\"ר|מטר רבוע", c):
         return {"sqm"}
+    if kind_attested("coefficient", c):
+        return {"ratio"}
+    if kind_attested("count", c) and not (kind_attested("duration", c) or re.search(r"חודש|(?<![א-ת])שנ(?:ים|ות|ה)", c)):
+        return {"units"}  # "מספר השנים", "מספר חודשי הגרייס" count time: a duration, not units
     return set()
 
 
@@ -794,6 +819,7 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
                 # the nearest ring that states it for every closest occurrence, with one value
                 ring = next((r for r in expanded if (near := _closest([o for o, _ in r], words))
                              and all(o.qualifiers.keys(kind) for o in near)
+                             and (kind != "period" or all(len(o.qualifiers.keys(kind)) == 1 for o in near))
                              and len({tuple(sorted(o.qualifiers.found[kind])) for o in near}) == 1), None)
                 if ring is None:
                     # the subject property's stored measurement of the same metric states it once
@@ -830,6 +856,8 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
                 needed.setdefault(tuple(sorted(values)), " ".join(values.values()))
             if len(needed) == 1:
                 keys, written_q = next(iter(needed.items()))
+                if kind == "period" and len(keys) != 1:
+                    continue  # agreeing on two periods does not establish which one belongs to this number
                 as_written = PERIOD_TEXT[keys[0]] if kind == "period" else display(written_q)  # one occurrence's words
                 problems.append(MeaningProblem(
                     written, kind, f"למספר {written} חסר {KIND_LABELS[kind]} כפי שנכתב במקור (\"{as_written}\"); "

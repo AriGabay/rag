@@ -755,6 +755,15 @@ class _ScaleNote:
     status: str
 
 
+def _note_units(governing: str | _ScaleNote) -> set[str]:
+    """A clearly read scale heading also attests its unit; callers prefer a number's nearer unit."""
+    note = governing.text if isinstance(governing, _ScaleNote) else governing
+    units = meaning.units_attested(note)
+    if units and isinstance(governing, _ScaleNote) and governing.status in (reader.UNREAD, reader.UNCERTAIN):
+        raise ToolError(f"היחידה בבלוק {governing.block_index} לא ודאית: קרא ואמת את ההערה לפני לקיחת הערך")
+    return units
+
+
 def _value_scale(own: str, start: int, end: int, *local: str, governing: str | _ScaleNote = "") -> int:
     """An inherited scale must be read clearly; nearer, explicit scales need no inherited evidence."""
     note = governing.text if isinstance(governing, _ScaleNote) else governing
@@ -2528,11 +2537,16 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     # read from it), else the table's caption, title or notes
     unit_from = next((where for where, t in (("cell", near[0]), ("row", near[1]), ("header", near[2] + " " + near[3]))
                       if meaning.units_attested(t)), "table" if units else None)
+    if not units:
+        units = _note_units(governing)
+        if units:
+            unit_from = "governing_note"
     # the scale the table states it in (R14): the cell's own scale word, else a note of its cell, row or column
     # ("הכנסות (אלפי ₪)"), else of the table's caption, title or notes ("טבלה 4 (באלפי ₪)"), else of the heading-like
     # line above the table that governs it ("ממצאי הבדיקה באלפי ₪") — a table's own note is nearer than that line's
-    scale = _value_scale(meaning._norm(cell), *at_cell, meaning._norm(" ".join(near)),
-                         meaning._norm(" ".join(x for x in table_text if x)), governing=governing)
+    scale = (calc.stated_scale(meaning._norm(cell), *at_cell) if units and not units & {"ILS", "ILS_per_sqm"} else
+             _value_scale(meaning._norm(cell), *at_cell, meaning._norm(" ".join(near)),
+                          meaning._norm(" ".join(x for x in table_text if x)), governing=governing))
     # who stated it: the column header, else the row label, else the table's caption, title or notes (KTD8)
     said = (attribution_in(header, adopted=True) or attribution_in(label, adopted=True)
             or attribution_in(" ".join(x for x in table_text if x), adopted=True))
@@ -2704,6 +2718,8 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
     line = next((ln for ln in meaning._norm(full).split("\n") if quote[:40] in " ".join(ln.split())), quote)
     sign = -1 if wanted[1] < 0 else 1
     units = meaning.units_attested(local)
+    if not units and len(_numbers_of(quote)) == 1:
+        units = meaning.units_attested(quote)
     if units == {"ILS"} and meaning._PER_SQM.search(quote):
         # "השווי למ״ר ... 9,500 ₪": a per-area amount whose "למ״ר" is not next to it; either reading is the source's
         units = {"ILS", "ILS_per_sqm"}
@@ -2714,16 +2730,25 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
     # of the heading-like line above that governs its block ("ממצאי הבדיקה באלפי ₪" over one figure per paragraph)
     held = _value_blocks(anchor)
     notes = [governing(b) for b in sorted(held)] if governing is not None and held else [""]
-    scales = {_value_scale(text_, at + start, at + end, quote, line, governing=note) for note in notes}
+    scales = ({calc.stated_scale(text_, at + start, at + end)} if units and not units & {"ILS", "ILS_per_sqm"} else
+              {_value_scale(text_, at + start, at + end, quote, line, governing=note) for note in notes})
     if len(scales) != 1:
         raise ToolError(MSG_QUOTE_AMBIGUOUS.format(sid=src.sid))
     scale = scales.pop()
+    unit_from = "quote" if units else None
+    if not units:
+        inherited = {frozenset(_note_units(note)) for note in notes}
+        if len(inherited) > 1:
+            raise ToolError(MSG_QUOTE_AMBIGUOUS.format(sid=src.sid))
+        units = set(inherited.pop())
+        if units:
+            unit_from = "governing_note"
     return {"written": written, "value": sign * value, "forms": forms, "quote": loc["quote"].strip(),
             "qualifiers": meaning.number_qualifiers(full, forms, quote),
             "units": units, "vat": meaning.vat_attested(line, forms, full),
             "kind_context": quote, "locator": {"quote": loc["quote"].strip()}, "total": False, "table": None,
             "anchor": anchor, "said": said, "context": f"{line}\n{quote}",
-            "meaning_from": {"unit": "quote"} if units else {}, "scale": scale}
+            "meaning_from": {"unit": unit_from} if unit_from else {}, "scale": scale}
 
 
 def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict]:
@@ -3118,7 +3143,7 @@ def _cache_record(value: calc.Value) -> dict:
     return record
 
 
-VALUE_VERIFIER_VERSION = "value-v2"  # v2: number-bound periods and context-bound, clearly read inherited scales
+VALUE_VERIFIER_VERSION = "value-v3"  # v3: scoped table periods and clearly read governing currency as well as scale
 
 
 def _cache_doc(value: calc.Value, taken: dict, path: tuple, stub: dict | None, src: Source,
@@ -3750,7 +3775,7 @@ TOOLS = [
                          "period": {"type": "string", "enum": list(PERIOD_LABELS)},
                          "vat": {"type": "string", "enum": list(VAT_LABELS)},
                          "area_basis": {"type": "string", "description": "בסיס השטח כפי שנכתב, או ריק"},
-                         "subject": {"type": "string", "description": "הנכס, השלב, התקופה או מערך הנתונים"},
+                         "subject": {"type": "string", "description": "הנכס, השלב, התקופה או מערך הנתונים — בלי שם המדד (\"פרויקט X\", לא \"רווח פרויקט X\"), ובאותו נוסח לכל ערכי אותו נכס"},
                          "role": {"type": "string", "enum": list(calc.ROLE_LABELS)},
                          "stated_by": {"type": "string",
                                        "description": "מי אמר את הערך (צד, שמאי, הכרעה) — רק כשהמילים המצוטטות, "

@@ -659,7 +659,7 @@ class _Eval:
 
     def additive(self, op: str, a: Operand, b: Operand) -> Operand:
         self._additive_checks([a, b], op)
-        if a.subject and b.subject and a.subject != b.subject and not (
+        if a.subject and b.subject and not same_subject(a.subject, b.subject) and not (
                 op == "+" and a.role == "component" and b.role == "component"):
             self.need(f"נושא: «{a.subject}» מול «{b.subject}»")
         (va, vb), scale = self.same_scale([a, b])
@@ -852,6 +852,33 @@ def _check_contexts(out: Operand, allowed: list[frozenset[str]] | None) -> None:
     if len(keys) > 1 and not any(keys <= a for a in allowed):
         raise CalcError(MSG_CONTEXTS.format(which="; ".join(label for _, label in mixed)))
 
+
+
+# a one- or two-letter Hebrew prefix (ו, ה, ב, ל, מ, ש, כ) before a word of three letters or more
+_SUBJECT_PREFIX = re.compile(r"^[והבלמשכ]{1,2}(?=[א-ת]{3,})")
+
+
+def _subject_words(subject: str) -> set[str]:
+    """The words of a subject that name its scope: the metric's own words ("רווח", "עלויות" — the value's kind,
+    ``meaning.KIND_WORDS``) are left out, and each word is taken without its prefix letters."""
+    from app.chat.meaning import KIND_WORDS, _norm
+
+    words = set()
+    for w in re.findall(r"[\w\"']+", _norm(subject)):
+        if any(re.search(rx, w) for rx in KIND_WORDS.values()):
+            continue
+        words.add(_SUBJECT_PREFIX.sub("", w))
+    return words
+
+
+def same_subject(a: str, b: str) -> bool:
+    """Whether two subjects name one scope: the same words once the metric is left out, or one of them a narrower
+    wording of the other ("רווח הפרויקט" and "עלויות הפרויקט" are one project). Wording that adds a scope the
+    other lacks on both sides stays two subjects."""
+    if a.strip() == b.strip():
+        return True
+    x, y = _subject_words(a), _subject_words(b)
+    return bool(x) and bool(y) and (x <= y or y <= x)
 
 def evaluate(node, operands: dict[str, Operand], justification: str | None = None,
              contexts: list[frozenset[str]] | None = None) -> Outcome:

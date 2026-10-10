@@ -673,6 +673,72 @@ def test_a_value_taken_from_a_table_in_thousands_or_a_quote_carries_its_scale():
 NOTE = "ממצאי בדיקת הכדאיות לפרויקט באלפי ₪ לא כולל מע״מ"
 
 
+@pytest.mark.parametrize("status", ["read", "read_uncertain"])
+def test_a_quote_inherits_its_currency_only_from_a_clearly_read_governing_note(status):
+    from types import SimpleNamespace
+
+    from app.chat import tools
+
+    text = 'רווח שוטף 13,250'
+    note = tools._ScaleNote(NOTE, 1, status)
+    src = SimpleNamespace(sid="S1", version_id="v1")
+    if status == "read_uncertain":
+        with pytest.raises(tools.ToolError, match="לא ודאי"):
+            tools._take_quote(src, text, {"quote": text, "number": "13,250"}, [(2, text, 1)], lambda _: note)
+    else:
+        taken = tools._take_quote(src, text, {"quote": text, "number": "13,250"}, [(2, text, 1)], lambda _: note)
+        assert taken["units"] == {"ILS"}
+        assert taken["meaning_from"]["unit"] == "governing_note"
+
+
+def test_a_table_inherits_currency_from_its_governing_note_but_its_own_unit_wins():
+    from types import SimpleNamespace
+
+    from app.chat import tools
+
+    src = SimpleNamespace(sid="S1", version_id="v1")
+    st = {"headers": ["רכיב", "סכום"], "rows": [{"cells": ["הכנסה", "13,250"]}],
+          "caption": "תוצאות", "title": [], "notes": []}
+    taken = tools._cell_of(src, 'הכנסה | 13,250', {"row": "הכנסה", "column": "סכום"}, st, 0,
+                          tools._ScaleNote(NOTE, 1, "read"))
+    assert taken["units"] == {"ILS"} and taken["meaning_from"]["unit"] == "governing_note"
+    st["headers"][1] = "שטח במ״ר"
+    taken = tools._cell_of(src, 'הכנסה | 13,250', {"row": "הכנסה", "column": "שטח במ״ר"}, st, 0,
+                          tools._ScaleNote(NOTE, 1, "read"))
+    assert taken["units"] == {"sqm"} and taken["scale"] == 1
+
+
+@pytest.mark.parametrize("label, unit", [('מספר יח״ד', 'units'), ('מקדם התאמה', 'ratio')])
+def test_a_governing_currency_does_not_replace_a_count_or_a_coefficient(label, unit):
+    from types import SimpleNamespace
+
+    from app.chat import tools
+
+    src = SimpleNamespace(sid="S1", version_id="v1")
+    st = {"headers": ["רכיב", "ערך"], "rows": [{"cells": [label, "80"]}],
+          "caption": "תוצאות", "title": [], "notes": []}
+    taken = tools._cell_of(src, f'{label} | 80', {"row": label, "column": "ערך"}, st, 0,
+                          tools._ScaleNote(NOTE, 1, "read"))
+    assert taken["units"] == {unit}
+    assert taken["scale"] == 1
+    quote = f'{label} 80'
+    taken = tools._take_quote(src, quote, {"quote": quote, "number": "80"}, [(2, quote, 1)],
+                              lambda _: tools._ScaleNote(NOTE, 1, "read"))
+    assert taken["units"] == {unit} and taken["scale"] == 1
+
+
+def test_a_nonmonetary_quantity_keeps_its_own_explicit_scale():
+    from types import SimpleNamespace
+
+    from app.chat import tools
+
+    src = SimpleNamespace(sid="S1", version_id="v1")
+    quote = 'שטח המבנה 10 אלף מ״ר'
+    taken = tools._take_quote(src, quote, {"quote": quote, "number": "10"}, [(2, quote, 1)],
+                              lambda _: tools._ScaleNote(NOTE, 1, "read"))
+    assert taken["units"] == {"sqm"} and taken["scale"] == 1000
+
+
 @pytest.mark.parametrize("preceding, governing", [
     # (kind, text, same section), nearest first: the heading-like paragraph above the figures' paragraphs
     ([("paragraph", "סה״כ הכנסות היזם 117,860", True), ("paragraph", NOTE, True), ("heading", "7. כדאיות", True)],
@@ -698,3 +764,25 @@ def test_a_governing_note_is_the_farthest_context_and_never_scales_a_percent():
     rate = "שיעור רווח לעלות (הפסד) 12.7%"
     m = calc._WRITTEN_NUMBER.search(rate)
     assert calc.stated_scale(rate, m.start(), m.end(), rate, NOTE) == 1
+
+
+@pytest.mark.parametrize("a, b, same", [
+    ("רווח פרויקט הדגמה", "עלויות פרויקט הדגמה", True),  # the metric's own words are not the scope
+    ("רווח פרויקט הדגמה שלב א", "עלויות פרויקט הדגמה שלב ב", False),  # each names a stage the other lacks
+    ("הפרויקט במתחם הדגמה", "מתחם הדגמה", True),  # one is a narrower wording of the other
+    ("דירה 3", "דירה 5", False),
+    ("שלב א", "שלב ב", False),
+])
+def test_two_subjects_are_one_scope_without_the_metric_words(a, b, same):
+    assert calc.same_subject(a, b) is same
+
+
+def test_a_profit_less_a_cost_of_the_same_project_is_not_a_mix_of_subjects():
+    profit = operand("V1", "47680", "ILS", kind="profit", subject="רווח פרויקט הדגמה", vat="excluded")
+    cost = operand("V2", "192815", "ILS", kind="cost", role="cost", subject="עלויות פרויקט הדגמה", vat="excluded")
+    out = run("V1 - V2 * A1%", ops(profit, cost, RISE))
+    assert out.value == Decimal("38039.25") and not out.conditional
+    # another property's figure still needs a justification
+    other = operand("V3", "9000", "ILS", kind="cost", role="cost", subject="פרויקט אחר", vat="excluded")
+    with pytest.raises(CalcError):
+        run("V1 - V3", ops(profit, other))
