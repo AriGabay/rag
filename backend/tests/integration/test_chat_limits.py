@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import text
@@ -20,6 +21,7 @@ from sqlalchemy import text
 from app.chat import api, engine
 from app.chat import tools as T
 from app.db import tenant_tx
+from app.providers.llm import CallStatus, Purpose
 from tests.conftest import login
 from tests.factories import make_office
 from tests.integration.test_chat import cloud, new_conversation, send
@@ -244,6 +246,141 @@ def test_a_turn_that_cannot_be_verified_in_time_fails_with_its_message_and_logs_
     with tenant_tx(office.system) as conn:
         assert [r.purpose for r in conn.execute(text("SELECT purpose FROM provider_usage ORDER BY id"))] == [
             "agent", "request", "agent"]
+
+
+# --- truncated model output ------------------------------------------------------------------------------------
+
+class TruncatedAgent(ScriptedAgent):
+    def __init__(self, steps, **kw):
+        super().__init__(steps, **kw)
+        self.options = []
+
+    def agent_step(self, instructions, items, tools, final_schema, **kw):
+        self.options.append(dict(kw))
+        step = super().agent_step(instructions, items, tools, final_schema, **kw)
+        if step.status == CallStatus.INCOMPLETE:
+            step.detail = "max_output_tokens"
+            step.output_tokens = kw.get("max_output_tokens", 6000)
+            # An unfinished response is never used as input or executed, even if it contains a tool call.
+            step.output = [{"role": "assistant", "content": "פלט קטוע שאסור להציג"}]
+            step.calls = [SimpleNamespace(name="must_not_run")]
+        return step
+
+
+def test_a_truncated_answer_retries_with_more_tokens_and_is_verified(client, office, monkeypatch):
+    agent = TruncatedAgent([[pages(office.doc, 2)], CallStatus.INCOMPLETE,
+                            final('שטח המגרש הוא 812 מ"ר [S1].')])
+    m = ask(client, office, monkeypatch, agent)
+    assert m["status"] == "done", m
+    assert m["answer"]["verification"]["judged"] and "812" in m["answer"]["markdown"]
+    assert [o["max_output_tokens"] for o in agent.options] == [12000, 12000, 24000]
+    assert agent.seen[1] == agent.seen[2]  # same evidence, without any interrupted output
+    assert agent.options[1]["cache_key"] == agent.options[2]["cache_key"]
+    assert "retry" in [p["step"] for p in m["progress"]]
+    assert [u["status"] for u in m["usage"] if u["purpose"] == "agent"] == ["ok", "incomplete", "ok"]
+    assert any(c.purpose == Purpose.VERIFY for c in agent.calls)
+
+
+def test_a_second_truncation_fails_with_actionable_text_and_no_partial_answer(client, office, monkeypatch):
+    agent = TruncatedAgent([CallStatus.INCOMPLETE, CallStatus.INCOMPLETE, final("אסור להציג")])
+    m = ask(client, office, monkeypatch, agent)
+    assert m["status"] == "failed" and m["answer"] is None and not m["content"]
+    assert "אורך" in m["error"] and "סעיפים" in m["error"]
+    assert len(agent.seen) == 2
+    assert [u["status"] for u in m["usage"] if u["purpose"] == "agent"] == ["incomplete", "incomplete"]
+    assert not any(c.purpose == Purpose.VERIFY for c in agent.calls)
+
+
+def test_the_output_retry_is_once_per_turn_even_when_the_retry_calls_a_tool(client, office, monkeypatch):
+    agent = TruncatedAgent([CallStatus.INCOMPLETE, [pages(office.doc, 2)], CallStatus.INCOMPLETE,
+                            final('שטח המגרש הוא 812 מ"ר [S1].')])
+    m = ask(client, office, monkeypatch, agent)
+    assert m["status"] == "failed" and len(agent.seen) == 3
+    assert [o["max_output_tokens"] for o in agent.options] == [12000, 24000, 24000]
+
+
+@pytest.mark.parametrize("failure", [CallStatus.INCOMPLETE, CallStatus.REFUSAL, CallStatus.TIMEOUT])
+def test_a_failure_without_the_output_limit_reason_is_not_retried(client, office, monkeypatch, failure):
+    agent = ScriptedAgent([failure, final("אסור להציג")])
+    m = ask(client, office, monkeypatch, agent)
+    assert m["status"] == "failed" and len(agent.seen) == 1
+    assert "retry" not in [p["step"] for p in m["progress"]]
+
+
+def test_an_output_retry_keeps_the_forced_final_choice_and_the_step_bound(client, office, monkeypatch):
+    setting(monkeypatch, chat_max_steps=3, chat_repair_rounds=2)
+    agent = TruncatedAgent([CallStatus.INCOMPLETE, final("לא נמצא הנתון.", "not_found")])
+    m = ask(client, office, monkeypatch, agent)
+    assert m["status"] == "done", m
+    assert [o["tool_choice"] for o in agent.options] == ["none", "none"]
+    assert m["answer"]["limits_hit"] == ["step_limit"]
+
+
+def test_no_output_retry_is_started_after_the_step_bound(client, office, monkeypatch):
+    setting(monkeypatch, chat_max_steps=1)
+    agent = TruncatedAgent([CallStatus.INCOMPLETE, final("אסור להציג")])
+    m = ask(client, office, monkeypatch, agent)
+    assert m["status"] == "failed" and len(agent.seen) == 1
+
+
+@pytest.mark.parametrize("elapsed, reserve, retried", [(95, 40, True), (95, 60, True), (115, 40, False), (130, 40, False)])
+def test_the_output_retry_leaves_time_to_verify(client, office, monkeypatch, elapsed, reserve, retried):
+    from tests.integration.test_chat_inspect import Clock
+
+    setting(monkeypatch, chat_turn_seconds=150, chat_verify_min_seconds=15, chat_verify_reserve_seconds=reserve)
+    clock = Clock(monkeypatch)
+    agent = TruncatedAgent([CallStatus.INCOMPLETE, final("לא נמצא הנתון.", "not_found")])
+    agent.on_step = lambda i: setattr(clock, "offset", elapsed) if i == 0 else None
+    m = ask(client, office, monkeypatch, agent)
+    assert len(agent.seen) == (2 if retried else 1)
+    if retried:
+        assert m["status"] == "done", m
+        assert 0 < agent.options[1]["timeout"] <= 150 - elapsed - 15
+        assert agent.options[1]["tool_choice"] == ("none" if elapsed >= 150 - reserve else None)
+    else:
+        assert m["status"] == "failed" and m["answer"] is None
+
+
+def test_cancellation_after_a_truncated_call_prevents_a_retry(office, monkeypatch):
+    agent = TruncatedAgent([CallStatus.INCOMPLETE, final("אסור להציג")])
+    stopped = False
+
+    def stop(i):
+        nonlocal stopped
+        stopped = True
+
+    agent.on_step = stop
+    with pytest.raises(engine.TurnCancelled) as exc:
+        engine.run_turn(office.ctx(), agent, engine.TurnInput("שאלה", [], None, [], {}), lambda *a: None,
+                        lambda: stopped)
+    assert len(agent.seen) == 1
+    assert [u["status"] for u in exc.value.usage if u["purpose"] == "agent"] == ["incomplete"]
+
+
+def test_an_output_retry_that_uses_the_last_reading_step_must_answer(client, office, monkeypatch):
+    setting(monkeypatch, chat_max_steps=4, chat_repair_rounds=2)
+    agent = TruncatedAgent([CallStatus.INCOMPLETE, final("לא נמצא הנתון.", "not_found")])
+    m = ask(client, office, monkeypatch, agent)
+    assert m["status"] == "done", m
+    assert [o["tool_choice"] for o in agent.options] == [None, "none"]
+    assert m["answer"]["limits_hit"] == ["step_limit"]
+
+
+def test_the_output_budget_is_configurable_and_only_doubled_on_truncation(client, office, monkeypatch):
+    setting(monkeypatch, chat_agent_output_tokens=8000)
+    agent = TruncatedAgent([CallStatus.INCOMPLETE, final("לא נמצא הנתון.", "not_found")])
+    m = ask(client, office, monkeypatch, agent)
+    assert m["status"] == "done", m
+    assert [o["max_output_tokens"] for o in agent.options] == [8000, 16000]
+
+
+def test_an_unsupported_claim_in_the_output_retry_is_still_removed(client, office, monkeypatch):
+    setting(monkeypatch, chat_repair_rounds=0)
+    agent = TruncatedAgent([[pages(office.doc, 2)], CallStatus.INCOMPLETE,
+                            final('שטח המגרש הוא 990 מ"ר [S1].')])
+    m = ask(client, office, monkeypatch, agent)
+    assert m["status"] == "done", m
+    assert "990" not in m["answer"]["markdown"] and m["answer"]["verification"]["removed"] > 0
 
 
 # --- a cache-friendly loop ---------------------------------------------------------------------------------------

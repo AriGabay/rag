@@ -206,6 +206,21 @@ def test_openai_agent_step_records_cached_input_tokens():
     assert step.ok and step.cached_input_tokens == 2048 and step.input_tokens == 11
 
 
+def test_agent_http_failures_do_not_trigger_hidden_sdk_retries():
+    provider, transport = openai_provider(httpx2.Response(500, json=_error("server_error")))
+    provider.client = provider.client.with_options(max_retries=3)
+    step = provider.agent_step("הוראות", [], [], Echo.model_json_schema(), timeout=1)
+    assert step.status == CallStatus.ERROR and len(transport.requests) == 1
+
+
+def test_agent_truncation_preserves_the_reason_needed_for_the_turn_retry():
+    body = _response(_text('{"text": "של'), "incomplete", "max_output_tokens")
+    provider, transport = openai_provider(httpx2.Response(200, json=body))
+    step = provider.agent_step("הוראות", [], [], Echo.model_json_schema(), max_output_tokens=12000)
+    assert step.status == CallStatus.INCOMPLETE and step.detail == "max_output_tokens" and step.final is None
+    assert _sent(transport)["max_output_tokens"] == 12000
+
+
 def test_openai_cache_write_tokens_and_model_are_recorded_on_every_result():
     body = _response(_text('{"text": "שלום"}'))
     body["usage"]["input_tokens_details"] = {"cached_tokens": 3, "cache_write_tokens": 5}

@@ -478,7 +478,8 @@ class OpenAIProvider(BaseProvider):
             kwargs["prompt_cache_key"] = cache_key
         started = time.perf_counter()
         try:
-            resp = self.client.with_options(timeout=timeout or timeout_for(Purpose.AGENT)).responses.create(**kwargs)
+            # The turn owns retries and its deadline; SDK retries would silently repeat a timed-out call.
+            resp = self.client.with_options(timeout=timeout or timeout_for(Purpose.AGENT), max_retries=0).responses.create(**kwargs)
         except openai.OpenAIError as exc:
             status = _openai_error_status(exc)
             logger.warning("provider %s agent step failed: %s (%s)", self.name, status, type(exc).__name__)

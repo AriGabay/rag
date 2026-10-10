@@ -133,6 +133,7 @@ class Settings(BaseSettings):
     # cost limits that bind
     chat_max_steps: int = 14
     chat_turn_seconds: int = 150  # verification may run ``VERIFY_ALLOWANCE_SECONDS`` past it
+    chat_agent_output_tokens: int = Field(default=12_000, ge=1)
     chat_workers: int = 6
     chat_run_inline: bool = False  # tests: run a turn inside the request instead of a background thread
     chat_max_inspections: int = 3  # visual readings (``inspect``) one turn may make with the vision model
@@ -156,7 +157,7 @@ class Settings(BaseSettings):
     chat_repair_rounds: int = 2  # 1: a repair with tools; 2: then a rewrite from verified content only
     chat_verify_reserve_seconds: int = 40
     chat_verify_min_seconds: int = 15  # less time than this left for a verification fails the turn
-    llm_timeout_agent_seconds: float = 60
+    llm_timeout_agent_seconds: float = 90
     llm_timeout_measure_seconds: float = 90
 
     # Turn limits (KTD8, KTD13).

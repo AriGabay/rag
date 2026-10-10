@@ -67,6 +67,7 @@ FAILURE_TEXT = {
     "model_unavailable": "המודל שהוגדר אינו זמין.",
     "refusal": "המודל סירב לענות על הבקשה.",
     "incomplete": "תשובת המודל נקטעה.",
+    "output_limit": "התשובה נקטעה בגלל מגבלת האורך. אפשר לבקש פרק קצר יותר או לחלק את הבקשה לסעיפים.",
     "invalid": "תשובת המודל לא הייתה בפורמט תקין.",
     "unsupported": "ספק המודל שנבחר אינו תומך בשיחה עם כלים.",
     "queued_too_long": "השאלה המתינה זמן רב מדי לעיבוד.",
@@ -877,7 +878,8 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
     except engine.ProviderFailure as e:
         usage = _log_turn_usage(ctx, provider, getattr(e, "usage", None))
         text_ = FAILURE_TEXT.get(e.status, "אירעה תקלה בספק המודל.")
-        _finish(ctx, message_id, "failed", error=f"{text_} אפשר לנסות שוב.", usage=usage, model=getattr(provider, "model", None))
+        error = text_ if e.status == "output_limit" else f"{text_} אפשר לנסות שוב."
+        _finish(ctx, message_id, "failed", error=error, usage=usage, model=getattr(provider, "model", None))
     except Exception as e:  # noqa: BLE001 - the message must end in a state the user can act on
         logger.exception("chat turn failed")
         # a break after the turn returned comes after its calls were logged: they are only kept on the message

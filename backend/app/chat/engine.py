@@ -109,6 +109,7 @@ from app.db import TenantContext
 from app.measurements.extract import PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
 from app.providers.llm import (
     TOKEN_FIELDS,
+    AgentStep,
     CallStatus,
     LLMProvider,
     Purpose,
@@ -511,6 +512,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     ws.user_messages = [{"turn": n + 1, "text": t, "current": False} for n, t in enumerate(users)] + [
         {"turn": len(users) + 1, "text": inp.question, "current": True}]
     steps = 0
+    output_tokens = settings.chat_agent_output_tokens
+    output_retried = False  # at most one retry in the whole turn, including its repair rounds
     attempt = 0  # 0: first answer, 1: repaired with tools, 2: rewritten from verified content only
     limits = ws.limits_hit
     rounds: list[list[dict]] = []
@@ -600,6 +603,24 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         else:
             turn.fall_back(analysis.status)
 
+    def final_notice(reason: str | None) -> None:
+        if attempt == 0:
+            assert reason is not None
+            if reason not in limits:
+                limits.append(reason)
+            items.append({"role": "user", "content": LIMIT_NOTICE.format(why=LIMIT_WHY[reason])})
+        elif attempt == 1:
+            items.append({"role": "user", "content": REPAIR_LAST})
+
+    def call_agent(timeout: float) -> AgentStep:
+        step = agent.agent_step(POLICY, items, T.TOOLS, FINAL_SCHEMA, cache_key=cache_key,
+                                max_output_tokens=output_tokens, timeout=timeout,
+                                tool_choice="none" if last else None)
+        usage.append(usage_entry("agent", step, agent.model))
+        if cancelled():
+            raise TurnCancelled  # discard the result of the call that was in flight
+        return step
+
     ws.binding = binding  # an ``assume`` of the bound number records the parameter it fills (KTD9)
     items: list = [{"role": "user", "content": _context_message(inp, request, binding)}]
     if request is None and not (inp.history or inp.focus):
@@ -621,25 +642,33 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                   else TIME_LIMIT if ((now >= read_until or TIME_LIMIT in limits) if attempt == 0
                                       else left < FINAL_STEP_SECONDS) else None)
         last = reason is not None or attempt == 2
-        if last and attempt == 0:
-            if reason not in limits:
-                limits.append(reason)
-            items.append({"role": "user", "content": LIMIT_NOTICE.format(why=LIMIT_WHY[reason])})
-        elif last and attempt == 1:
-            items.append({"role": "user", "content": REPAIR_LAST})
+        if last:
+            final_notice(reason)
         elif attempt == 0 and steps == bound - NEAR_LIMIT_STEPS:
             # the reading's step count only grows, so this is said once; a calculation still fits after it
             items.append({"role": "user", "content": NEAR_LIMIT_NOTICE})
         # the same tools in the same order at every step, the last one included: only the choice changes
         step_started = time.monotonic()
-        step = agent.agent_step(POLICY, items, T.TOOLS, FINAL_SCHEMA, cache_key=cache_key,
-                                timeout=max(15.0, min(left, settings.llm_timeout_agent_seconds)),
-                                tool_choice="none" if last else None)
-        usage.append(usage_entry("agent", step, agent.model))
-        if cancelled():
-            raise TurnCancelled  # the call that was in flight is discarded
+        step = call_agent(max(15.0, min(left, settings.llm_timeout_agent_seconds)))
+        output_limit = step.status == CallStatus.INCOMPLETE and step.detail == "max_output_tokens"
+        retry_timeout = min(settings.llm_timeout_agent_seconds,
+                            deadline - time.monotonic() - settings.chat_verify_min_seconds)
+        if (output_limit and not output_retried and steps < settings.chat_max_steps
+                and retry_timeout >= FINAL_STEP_SECONDS):
+            # Replay the same input: no truncated JSON, reasoning or tool call is ever appended or executed.
+            # The extra call counts toward the step bound and keeps time for source verification.
+            output_retried = True
+            output_tokens *= 2
+            steps += 1
+            # A retry can consume the last reading step or start after the reading window closed.
+            if not last and (steps >= bound or (attempt == 0 and time.monotonic() >= read_until)):
+                last = True
+                final_notice(STEP_LIMIT if steps >= bound else TIME_LIMIT)
+            progress("retry", "מכין מחדש את התשובה לאחר שנקטעה")
+            step = call_agent(retry_timeout)
+            output_limit = step.status == CallStatus.INCOMPLETE and step.detail == "max_output_tokens"
         failure = (None if step.ok and not (step.calls and last) else
-                   (step.status.value, step.detail) if not step.ok else
+                   ("output_limit" if output_limit else step.status.value, step.detail) if not step.ok else
                    (CallStatus.INVALID.value, "tool call on the last step"))
         if failure is not None and checked is not None:
             # a repair round that fails (a timeout on a long rewrite, say) leaves the answer already verified: it is
