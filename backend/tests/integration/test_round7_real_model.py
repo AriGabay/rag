@@ -416,7 +416,9 @@ def test_a_reported_allowance_keeps_its_contractual_contrast_and_only_a_requeste
 ):
     """Synthetic reported allowances exercise analysis, reading, complete contrast citations and repair through
     the chat API. Retrieval asks for both original quantities; arithmetic asks for a newly computed difference."""
-    from tests.integration.test_search import add_chunks
+    from app.extraction.base import Block, ChunkResult, ExtractionResult, PageResult
+    from app.platform import pipeline
+    from tests.factories import make_document
 
     title = "דוח סינתטי למתחם שדרות הקורנית"
     section = "2. תוספות השטח בהסכם ובתחשיב"
@@ -425,20 +427,17 @@ def test_a_reported_allowance_keeps_its_contractual_contrast_and_only_a_requeste
         "בתחשיב השמאי למתחם שדרות הקורנית נלקחה בחשבון תוספת שטח של 16 מ״ר לכל דירה. זו הנחת התחשיב, "
         "בשונה מתוספת השטח של 29 מ״ר שנקבעה בהסכם.",
     ]
-    doc, ver = add_chunks(office, office.default_group_id, paragraphs, "e" * 64)
-    # Store the actual reading as well as searchable chunks: outline/read and exact-quote take_value use blocks.
+    doc, ver = make_document(office, office.default_group_id, title, sha="e" * 64)
+    info = pipeline.VersionInfo(ver, doc, "k", "application/pdf", None)
+    blocks = [Block(0, "heading", section, section=section, section_path=[section], page=1),
+              *(Block(i + 1, "paragraph", p, section=section, section_path=[section], page=1)
+                for i, p in enumerate(paragraphs))]
+    reading = ExtractionResult(1, [PageResult(1, "\n".join([section, *paragraphs]), "text_layer", 1.0, True)], [],
+                               [ChunkResult(i, "text", [1], section, p, block_start=i + 1, block_end=i + 1)
+                                for i, p in enumerate(paragraphs)], blocks=blocks)
     with tenant_tx(office.system) as conn:
-        conn.execute(text("UPDATE documents SET title = :title WHERE id = :d"), {"title": title, "d": doc})
-        conn.execute(text("UPDATE chunks SET page_list = ARRAY[1], section = :s WHERE version_id = :v"),
-                     {"v": ver, "s": section})
-        conn.execute(text("UPDATE document_versions SET page_count = 1, ingestion = CAST(:i AS jsonb) WHERE id = :v"),
-                     {"v": ver, "i": json.dumps({"reading_id": "reading-reported-allowance"})})
-        for index, (kind, content) in enumerate([("heading", section),
-                                                *(("paragraph", p) for p in paragraphs)]):
-            conn.execute(text(
-                "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
-                " section_path, page, text, status) VALUES (app_office(), :d, :v, :b, :k, :s, :sp, 1, :t, 'read')"),
-                {"d": doc, "v": ver, "b": index, "k": kind, "s": section, "sp": [section], "t": content})
+        pipeline.persist_extraction(conn, info, reading)
+    pipeline.embed_stage(office.system, info, 1e18)
     phrasings = [
         ("לפי הדוח למתחם שדרות הקורנית, מהי תוספת השטח שנלקחה בחישוב, והבחן בינה לבין התוספת שנקבעה בהסכם?",
          False),
