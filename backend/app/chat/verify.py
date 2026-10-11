@@ -141,6 +141,13 @@ A verdict that accepted a support the unit did not cite depended on what else it
 ``VerifyReport.ok`` ignores what the server resolves itself (a citation it attaches, a qualifier it writes in from the
 source or a conditional result's own) and a ``partial`` whose judge named no concrete defect (``defect``); such a
 unit is still marked as partly verified.
+
+Claim records (round 8 U3, KTD2, KTD3): every unit and claim has a stable id (``assign_ids``: a hash of the turn's
+salt and the content, never a position or a verdict) and the report keeps one ``ClaimRecord`` per claim — verdict,
+citation state (the instruction plane, ``VerifyReport.instructions``), action — apart from completeness. An uncited
+factual unit is judged against the turn's already-read sources that hold its numbers or words (``_unit_candidates``);
+a failing claim is a ``Problem`` carrying its ``claim_id``; a claim resting on a failing claim fails with it
+(``_claim_cascade``); a claim that could not be checked has one of three causes (``NOT_CHECKED_CAUSES``).
 """
 
 from __future__ import annotations
@@ -199,7 +206,14 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # The judge contract's version (round 8 KTD7): part of every verdict key, bumped whenever the policy, the schema or what
 # a call renders changes what a verdict means, so a verdict of an older contract is never reused (cached readings are
 # versioned).
-JUDGE_VERSION = 2
+JUDGE_VERSION = 3
+# an uncited factual unit is judged against the sources the turn already read (round 8 KTD3, R2): the sources of the
+# turn whose text holds its numbers or content words are shown beside it as candidates, bounded so the call stays
+# within ``JUDGE_CALL_CHARS``. How many candidates a unit gets, how many characters one candidate may show, and how
+# many all the candidates of a call may show.
+CANDIDATE_SOURCES = 3
+CANDIDATE_SOURCE_CHARS = 2_000
+CANDIDATE_CHARS = 6_000
 # the reason of a factual claim that cites nothing and that no source shown in the call supports (rule 9, KTD3):
 # neither an external source nor wrong, only not linked to anything the turn read
 NOT_LINKED_REASON = "לא מקושר למקור שנקרא"
@@ -243,7 +257,9 @@ JUDGE_POLICY = (
     "המקורות המוצגים ב-<sources> בקריאה הזו, ולא רק מול מה שציטטה. מקור מוצג תומך בה במלואה — supported, וב-supported_by "
     "ציין את מזהה (id) המקור המוצג שתומך בה (השרת יבדוק ויוסיף את הציטוט; ציטוט חסר הוא פגם בציטוט ולא בתוכן). אף "
     "מקור מוצג אינו תומך בה — unsupported, failure absent_from_source, ובסיבה כתוב \"לא מקושר למקור שנקרא\" (לא מקור "
-    "חיצוני, ולא טענה שגויה). אל תציין מקור שלא הוצג. בכל מקרה אחר supported_by ריק. "
+    "חיצוני, ולא טענה שגויה). מקור עם candidate=\"true\" הוא מקור שהתור כבר קרא ושהיחידה לא ציטטה; השרת בחר אותו "
+    "כי יש בו מספר או מילים מהיחידה, וזה אינו הוכחה: בדוק אם הוא באמת תומך בה. אל תציין מקור שלא הוצג. בכל מקרה "
+    "אחר supported_by ריק. "
     "(10) טענה שמציגה תוצאת חישוב (C#) נבדקת כחישוב ולא כנתון מהמסמך: התוצאה אינה צריכה להופיע במסמך. בדוק את "
     "הקלטים — כל קלט הוא הנתון הנכון לבקשה: אותו נכס או פרויקט, אותו שלב, אותו תרחיש ואותה תקופה (עלות של שלב אחר, "
     "או נתון של נכס השוואה, כקלט של חישוב על הפרויקט כולו — unsupported); את ההנחות — כל הנחה A# היא מה שהמשתמש "
@@ -322,7 +338,8 @@ JUDGE_REQUIREMENTS_POLICY = (
     "מ-<workspace> שנוגעים לה: הערכים, הנתונים והחישובים שמחזיקים אותה או את הקלטים שלה (לא נתון קרוב מסוג אחר), "
     "חישוב או כלי שנכשלו בדרך אליה, והחיפושים והקריאות שחיפשו אותה. יחידה שאומרת שנתון לא נמצא, כש-<workspace> "
     "מחזיק ערך, נתון או חישוב שלו — unsupported. יחידה מ-<removed_units> שנתנה דרישה — ציין אותה ב-units של "
-    "הדרישה כרגיל (השרת יודע שהוסרה)."
+    "הדרישה כרגיל (השרת יודע שהוסרה). claims: כשרק טענה אחת מתוך יחידה נותנת את הדרישה (ליחידה כמה טענות), ציין ב-claims "
+    "את ה-span של הטענה הנותנת אותה, כפי שהוא כתוב ביחידה; אחרת claims ריק והיחידה כולה נותנת אותה."
 )
 # the judge's scores of a requirement in one call
 REQUIREMENT_STATUSES = ("full", "partial", "missing", "undeterminable")
@@ -419,6 +436,15 @@ KIND_FAILURES = {"input_choice": "wrong_calculation", "assumption": "wrong_calcu
 KIND_HINTS = {"input_choice": "קח את הסכום שהמקור מציין (take_value) וחשב ממנו מחדש ב-calculate",
               "assumption": "אל תניח את הפרט: הצג את הנתונים שנמצאו עם מראי המקום, נוסחה כללית בלי מספר ושאלה אחת "
                             "ממוקדת (status=clarification)"}
+# why a claim was "not checked" (round 8 R6, R14): the three causes stay distinct, and none is a contradiction or a
+# claim found wrong. ``check_failed``: the judge call failed after its retry; ``omitted``: the judge left the unit out
+# twice; ``not_classified``: the judge called it not factual or navigation, but its shape is a claim.
+NOT_CHECKED_CAUSES = ("check_failed", "omitted", "not_classified")
+CHECK_CAUSE_SENTENCES = {
+    "check_failed": "הוסרה טענה שבדיקתה לא הושלמה בגלל תקלה בבדיקה; היא לא נמצאה שגויה ולא נמצאה חסרה.",
+    "omitted": "הוסרה טענה שהבדיקה לא החזירה לה תשובה; היא לא נמצאה שגויה.",
+    "not_classified": "הוסרה טענה שהבדיקה לא סיווגה כטענה לבדיקה, ולכן לא אומתה; היא לא נמצאה שגויה.",
+}
 NOT_CHECKED = "הטענה לא נבדקה מול המקורות"
 NOT_CHECKED_FAILED = "הטענה לא נבדקה מול המקורות: הבדיקה לא הושלמה ({status})"
 NOT_CLASSIFIED = "טענה סווגה כלא-עובדתית או ככותרת; לא אומתה"
@@ -501,6 +527,9 @@ class JudgeRequirement(_Strict):
     units: list[int] = Field(default_factory=list)  # the units that give it (for ``missing``: that say it is missing)
     absent: list[int] = Field(default_factory=list)  # the units that say it, or part of it, is missing (KTD4)
     related: list[str] = Field(default_factory=list)  # the ``<workspace>`` ids about it
+    # the spans of the claims (inside ``units``) that give it, when only a claim of a unit does (round 8 KTD9): the
+    # component then stands or falls with those claims, not with the unit. Empty: the units give it whole.
+    claims: list[str] = Field(default_factory=list)
     reason: str = ""
 
 
@@ -616,10 +645,12 @@ class _Round:
 @dataclass
 class VerdictCache:
     """The turn's judge verdicts by unit key (``unit_key``), and the last verification's requirement scores, so a
-    repair round re-judges only what changed (KTD10). One per turn; never shared between turns."""
+    repair round re-judges only what changed (KTD10). One per turn; never shared between turns. ``records``: every claim
+    record of the turn's earlier verifications by id, so a claim a repair changed is linked to its parent."""
 
     verdicts: dict[str, JudgeVerdict] = field(default_factory=dict)
     last: _Round | None = None
+    records: dict[str, ClaimRecord] = field(default_factory=dict)
 
     def reuse(self, units: list[Unit], to_judge: list[Unit],
               keys: dict[int, str]) -> tuple[dict[int, JudgeVerdict], list[JudgeRequirement]]:
@@ -706,6 +737,13 @@ def unit_key(unit: Unit, ws: Workspace, request: str, heading: str, digests: dic
             parts = _source_parts(ws, i)
             digests[i] = hashlib.sha256("\x1f".join(parts).encode()).hexdigest() if parts else "unknown"
         evidence.append((i, digests[i]))
+    if not unit.ids:
+        # an uncited unit is judged against the turn's sources that hold its numbers or words (``_unit_candidates``):
+        # a source the turn read since is a new verdict
+        if "*" not in digests:
+            digests["*"] = hashlib.sha256("\x1f".join(
+                f"{sid}\x1e" + "\x1f".join(_source_parts(ws, sid) or ()) for sid in ws.sources).encode()).hexdigest()
+        evidence.append(("*", digests["*"]))
     raw = json.dumps([" ".join(unit.text.split()), evidence, unit.context, heading, unit.table_header, request,
                       JUDGE_VERSION], ensure_ascii=False)
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -734,6 +772,42 @@ class Unit:
     # server-written spans inside the unit (a marker, a qualifier, an inserted citation), shown to the judge as
     # ``<server>`` elements: never claims and never grounds for a verdict (round 8 KTD1). None until a composer sets them.
     server: list[str] = field(default_factory=list)
+    id: str = ""  # a stable id from the unit's content, not its position (``assign_ids``, round 8 KTD2)
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _digest(*parts) -> str:
+    return hashlib.sha256(json.dumps(parts, ensure_ascii=False).encode()).hexdigest()[:12]
+
+
+def _without_server(text: str, server: list[str]) -> str:
+    """``text`` without the server spans registered inside it (a marker, a qualifier, an inserted citation): the
+    model-written text, which is what an id stands for."""
+    for span in server:
+        if span:
+            text = text.replace(span, "", 1)
+    return _norm(text)
+
+
+def assign_ids(units: list[Unit], salt: str) -> None:
+    """Give every unit its stable id (round 8 KTD2, R18): a short hash of the message's ``salt``, the unit's
+    normalised model-written text (registered server spans left out), the heading chain and the table-header context
+    above it, and its occurrence among units that are the same on all of those — so a repeated sentence under another
+    heading is another unit, the same sentence stated twice is two, and an id never depends on a verdict, a source or
+    the judge's version (those belong to the reuse key, ``unit_key``). The salt keeps an id from revealing text."""
+    seen: dict[tuple, int] = {}
+    for u in units:
+        key = (_without_server(u.text, u.server), u.heading, u.context, u.table_header)
+        n = seen[key] = seen.get(key, -1) + 1
+        u.id = "u" + _digest("unit", salt, *key, n)
+
+
+def claim_id_of(unit: Unit, span: str, occurrence: int = 0) -> str:
+    """A claim's id: the unit's id, the normalised span (server spans left out) and its occurrence in the unit."""
+    return "k" + _digest("claim", unit.id, _without_server(span, unit.server), occurrence)
 
 
 def repair_key(unit: Unit) -> str:
@@ -773,6 +847,12 @@ class Problem:
     component: str | None = None
     checked_ids: list[str] | None = None
     repair_attempted: bool = False
+    # the claim this problem is about (round 8 KTD2, R5): the id of a ``ClaimRecord``; "" for a problem of the whole
+    # answer (a request or a requirement). And, for ``not_checked``, why it could not be checked
+    # (``NOT_CHECKED_CAUSES``).
+    claim_id: str = ""
+    cause: str = ""
+    basis: str = ""  # for a dependency: the id of the claim whose removal took this one's basis away
 
     def __post_init__(self) -> None:
         if self.checked_ids is None:
@@ -812,12 +892,17 @@ class Problem:
         """The problem for diagnostics: the unit's text (a draft, never a fact), the factual reason, and the decision."""
         return {"text": self.unit.raw[:300], "reason": self.reason, "severity": self.severity, "kind": self.kind,
                 "failure_kind": self.failure_kind, "check": self.check, "component": self.component,
-                "checked_ids": list(self.checked_ids or []), "repair_attempted": self.repair_attempted}
+                "checked_ids": list(self.checked_ids or []), "repair_attempted": self.repair_attempted,
+                "claim_id": self.claim_id, "cause": self.cause, "basis": self.basis}
 
     def summary(self) -> dict:
         """The removal on the user's normal path (KTD5): its kind, its component and the server's fixed sentence."""
         kind = self.failure_kind or "absent_from_source"
-        return {"failure_kind": kind, "component": self.component, "text": REMOVAL_SENTENCES[kind]}
+        # a claim that could not be checked says why (R14): each cause its own sentence, none a contradiction
+        cause = self.cause if kind == "not_checked" and self.cause in CHECK_CAUSE_SENTENCES else ""
+        return {"failure_kind": kind, "component": self.component,
+                "text": CHECK_CAUSE_SENTENCES[cause] if cause else REMOVAL_SENTENCES[kind]} | (
+            {"cause": cause} if cause else {})
 
     def repair_note(self) -> str:
         """What the repair prompt says of the problem beside its reason (KTD10): its kind, the ids checked and how
@@ -845,9 +930,13 @@ class VerifyReport:
     completeness: dict | None = None
     reused: int = 0  # units whose verdict came from an earlier round of the turn (``VerdictCache``)
     verdicts: dict[int, str] = field(default_factory=dict)  # the judge's verdict on each unit it judged, by index
-    # the validated claims of each judged unit, by index (round 8 KTD1, ``unit_claims``): informational until the
-    # claim records and the edit ladder (U3, U4) act on them
-    claims: dict[int, list[UnitClaim]] = field(default_factory=dict)
+    # the claim records of each unit, by index (round 8 KTD1, KTD2, R5): the judge's validated claims
+    # (``unit_claims``) with a stable id, position, verdict, citation state and action; a unit the deterministic checks
+    # removed, or that could not be checked, has its whole-unit claim here too. The edit ladder (U4) acts on them.
+    claims: dict[int, list[ClaimRecord]] = field(default_factory=dict)
+    # the instruction plane (round 8 KTD3, R2): the citation state of every claim, and the instruction components
+    # with the claims that fail them (``instruction_plane``)
+    instructions: dict = field(default_factory=dict)
     # the server's gap paragraph, grouped by reason (``coverage.gap_groups``), set once the final answer is stated
     gaps: list[dict] = field(default_factory=list)
     # calculation components waiting for a detail only the user can give (round 7 KTD9): id -> the parameters no
@@ -1004,6 +1093,10 @@ class VerifyReport:
         texts = {u.index: u.text for u in self.units}
         uncited = [texts[i] for i in self.uncited_data(kept)]
         kind_of = {p.unit.index: p.failure_kind for p in self.removals()}
+        for i, recs in self.claims.items():  # a claim failing inside a unit that stays: why (R20)
+            failing = next((r for r in recs if r.verdict in FAILING_VERDICTS), None)
+            if i not in kind_of and failing is not None:
+                kind_of[i] = failing.failure_kind()
         children: dict[str, list[str]] = {}
         for r in self.requirements:
             if r.get("parent"):
@@ -1013,14 +1106,15 @@ class VerifyReport:
             votes = self.requirement_votes.get(r["id"], [])
             kind = r.get("kind") or ("calculation" if r.get("calculation") else "information")
             offered = [v for v in votes if v.status in ("full", "partial")]
-            live = {id(v): [i for i in v.units if i in kept] for v in votes}
+            live = {id(v): [i for i in v.units if i in kept and self.gives(v, i)] for v in votes}
             given = [v for v in offered if live[id(v)]]
             absent = [v for v in votes if v.status in ("missing", "undeterminable")]
             o = {"id": r["id"], "text": r["text"], "calculation": bool(r.get("calculation")), "kind": kind,
                  "aspect": r.get("aspect") or "", "parent": r.get("parent") or "",
                  "conditional": bool(r.get("conditional")), "subject": r.get("subject") or "",
                  "parameters": list(r.get("parameters") or []), "children": children.get(r["id"], []),
-                 "units": [], "removed_units": sorted({i for v in offered for i in v.units if i in errors}),
+                 "units": [], "removed_units": sorted({i for v in offered for i in v.units
+                                                       if i in errors or (i in kept and not self.gives(v, i))}),
                  # why its removed units went (KTD5): the gap of a component they alone gave names it
                  "removal_kinds": sorted({kind_of[i] for v in offered for i in v.units
                                           if i in kind_of and kind_of[i]}),
@@ -1077,6 +1171,38 @@ class VerifyReport:
         for cid in out:
             derive(cid)
         return list(out.values())
+
+    def gives(self, vote: JudgeRequirement, index: int) -> bool:
+        """Whether the unit ``index``, which ``vote`` names, still gives the component it scored (round 8 KTD9, R20).
+        A vote that names the spans of the claims that give it counts the unit only while one of those claims
+        stands: a component given only by a failing claim is not given, though its unit stays (and, with the whole
+        unit removed, as before). A vote that names no span, or a span none of the unit's claims holds, counts the
+        unit whole."""
+        if not vote.claims:
+            return True
+        found = [r for r in self.claims.get(index, []) if any(_same_span(r.text, s) for s in vote.claims)]
+        return not found or any(r.verdict not in FAILING_VERDICTS for r in found)
+
+    def failing_claims(self) -> list[ClaimRecord]:
+        """The claims that failed their check, in the answer's order (an unchecked one among them)."""
+        return [r for i in sorted(self.claims) for r in self.claims[i] if r.verdict in FAILING_VERDICTS]
+
+    def instruction_plane(self, outcomes: list[dict] | None = None) -> dict:
+        """The instruction plane, apart from content and completeness (round 8 KTD3, R2): the citation state of every
+        claim (``cited``, ``repaired``, ``missing``, ``not_needed``) and the instruction components of the request
+        with their status; a citation instruction names the claims that fail it (``missing`` among the claims that
+        stay). ``outcomes``: the components as stated (default: from the report's own votes)."""
+        records = [r for i in sorted(self.claims) for r in self.claims[i] if r.verdict in RECORD_VERDICTS]
+        citations = [{"claim_id": r.id, "unit_id": r.unit_id, "unit": r.unit, "state": r.citation} for r in records]
+        if outcomes is None:
+            outcomes = self.requirement_outcomes() if self.requirements else []
+        missing = [r.id for r in records if r.citation == "missing" and r.verdict not in FAILING_VERDICTS]
+        components = [{"id": o["id"], "text": o["text"], "aspect": o.get("aspect") or "", "status": o["status"],
+                       "check": o.get("check") or "", "claims": missing if o.get("check") == "citation" else []}
+                      for o in outcomes if o.get("kind") == "instruction"]
+        return {"citations": citations, "components": components,
+                "counts": {k: sum(1 for c in citations if c["state"] == k)
+                           for k in ("cited", "repaired", "missing", "not_needed")}}
 
     def _computes(self, indexes: set[int]) -> bool:
         """Whether one of the units ``indexes`` shows a computation of the turn: it cites a successful ``C#``, or a
@@ -2065,7 +2191,11 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
         if missing:
             # a number a calculation it cites does not give, at the precision shown, is a wrong calculation
             computed = any(i in ws.computations for i in u.ids)
-            problems.append(Problem(u, "מספרים שאינם מופיעים במקורות המצוטטים: " + ", ".join(sorted(missing)[:5]),
+            numbers = ", ".join(sorted(missing)[:5])
+            # a unit that cites nothing, with a number no source of the turn states: not linked to a read source (R2)
+            reason = (f"{NOT_LINKED_REASON}: מספרים שאינם מופיעים באף מקור שנקרא בתור הזה: {numbers}"
+                      if not u.ids and not computed else "מספרים שאינם מופיעים במקורות המצוטטים: " + numbers)
+            problems.append(Problem(u, reason,
                                     failure_kind="wrong_calculation" if computed else "absent_from_source",
                                     check="computation_mismatch" if computed else "unstated_number"))
             continue
@@ -2439,6 +2569,62 @@ class _Batch:
     # the units the deterministic checks removed, shown as removed (round 7 KTD5, KTD10): the judge names them as a
     # component's units and as what a conclusion rests on, never judges them
     removed: list[Unit] = field(default_factory=list)
+    # unit index -> the turn's sources shown beside an uncited unit (``_candidate_ids``); filled on first use
+    candidates: dict[int, list[str]] | None = None
+
+
+_WORD = re.compile(r"[א-תA-Za-z]{3,}")
+
+
+def _unit_candidates(u: Unit, ws: Workspace) -> list[str]:
+    """The sources of the turn an uncited factual unit is judged against too (round 8 KTD3, R2): at most
+    ``CANDIDATE_SOURCES`` sources already read in the turn (``ws.sources``) whose text holds the unit's numbers — a
+    unit with numbers needs one of them — or, with no number, at least two of its content words; best first. This only
+    chooses what the judge is shown: it is never proof (the judge decides, and the server's number and meaning checks
+    still run on the support it names, ``_named_support``). Nothing for a unit that cites something, or that is
+    navigation."""
+    if u.ids or exempt_without_verdict(u):
+        return []
+    numbers = numbers_in(_stated_text(u))
+    words = set(_WORD.findall(_IDS.sub("", u.text)))
+    scored = []
+    for n, sid in enumerate(ws.sources):
+        parts = _source_parts(ws, sid)
+        if parts is None:
+            continue
+        body = parts[1]
+        shared_numbers = len(numbers & numbers_in(body)) if numbers else 0
+        shared_words = len(words & set(_WORD.findall(body)))
+        if (numbers and not shared_numbers) or (not numbers and shared_words < 2):
+            continue
+        scored.append((-shared_numbers, -shared_words, n, sid))
+    return [sid for *_, sid in sorted(scored)[:CANDIDATE_SOURCES]]
+
+
+def _candidate_ids(batch: _Batch, ws: Workspace) -> dict[int, list[str]]:
+    """Each uncited unit of the batch with its candidate sources (``_unit_candidates``); units with none are left out."""
+    if batch.candidates is None:
+        found = {u.index: _unit_candidates(u, ws) for u in batch.units}
+        batch.candidates = {i: ids for i, ids in found.items() if ids}
+    return batch.candidates
+
+
+def _candidate_block(sid: str, texts: list[str], ws: Workspace, narrow: bool) -> str | None:
+    """A candidate source as the judge sees it: the part of it the units that name it need (numbers and table headers
+    only when ``narrow``), cut to ``CANDIDATE_SOURCE_CHARS`` around the first number the units share with it."""
+    parts = _source_parts(ws, sid)
+    if parts is None:
+        return None
+    head, body, kind = parts
+    shown, excerpt = select(texts, body, kind, narrow=True)
+    if len(shown) > CANDIDATE_SOURCE_CHARS // (2 if narrow else 1):
+        limit = CANDIDATE_SOURCE_CHARS // (2 if narrow else 1)
+        wanted = {n for t in texts for n in numbers_in(t)}
+        at = min((m.start() for m in re.finditer(r"\d[\d,.]*", shown) if numbers_in(m.group()) & wanted), default=0)
+        a = max(0, min(at - limit // 4, len(shown) - limit))
+        shown, excerpt = shown[a:a + limit], True
+    return (f'<source id="{sid}" excerpt="{"true" if excerpt else "false"}" candidate="true" '
+            f'title="{prompt_attr(head)}">\n{prompt_text(shown)}\n</source>')
 
 
 @dataclass
@@ -2577,6 +2763,13 @@ def _render_batch(batch: _Batch, ws: Workspace, coverage: _Coverage | None = Non
         text_, excerpt = select(claims, body, kind, narrow=batch.narrow)
         blocks.append(f'<source id="{sid}" excerpt="{"true" if excerpt else "false"}" title="{prompt_attr(head)}">\n'
                       f"{prompt_text(text_)}\n</source>")
+    # an uncited unit also sees the turn's sources that hold its numbers or words (R2, KTD3): the judge decides
+    wanted: dict[str, list[str]] = {}
+    for u in batch.units:
+        for sid in _candidate_ids(batch, ws).get(u.index, []):
+            if sid not in claims_of:
+                wanted.setdefault(sid, []).append(u.text)
+    blocks += [b for sid, texts in wanted.items() if (b := _candidate_block(sid, texts, ws, batch.narrow))]
     # before a unit: the headings above it and its table row's header (R7); after a unit showing a result of a
     # conditional calculation: the qualifier the server writes next to it
     units = [_unit_context(u) + f'<unit index="{u.index}" cites="{prompt_attr(",".join(u.ids))}">\n'
@@ -2666,7 +2859,7 @@ def _judge_batch(provider: LLMProvider, batch: _Batch, ws: Workspace, usage: lis
 
 def _shown_support(verdicts: dict[int, JudgeVerdict], batch: _Batch, ws: Workspace) -> dict[int, JudgeVerdict]:
     """A ``supported`` verdict that names a support the unit does not cite stands only when every id it names is a
-    source shown in this call and evidence of the turn (``S#``, ``M#``, ``V#``, ``C#``); otherwise the unit is
+    source shown in this call (cited by a unit of it, or shown for this unit as a source the turn read) and evidence of the turn (``S#``, ``M#``, ``V#``, ``C#``); otherwise the unit is
     unsupported, as if no source supported it."""
     units = {u.index: u for u in batch.units}
     out = dict(verdicts)
@@ -2678,7 +2871,9 @@ def _shown_support(verdicts: dict[int, JudgeVerdict], batch: _Batch, ws: Workspa
         if shown is None:  # the evidence ids the batch cites, built only when a verdict names another
             evidence = (ws.sources, ws.measurements, ws.values, ws.assumptions, ws.computations)
             shown = {sid for u in batch.units for sid in u.ids if any(sid in d for d in evidence)}
-        wrong = [s for s in named if s not in shown or not _EVIDENCE_ID.fullmatch(s)]
+        # a source the batch cites, or one shown for this unit among the turn's already-read sources (``_candidate_ids``)
+        mine = set(_candidate_ids(batch, ws).get(i, []))
+        wrong = [s for s in named if not (s in shown or s in mine) or not _EVIDENCE_ID.fullmatch(s)]
         if wrong:
             out[i] = v.model_copy(update={"verdict": "unsupported", "supported_by": [], "reason": (
                 f"הטענה אינה מצטטת מקור, והמקור שצוין כתומך בה ({', '.join(wrong)}) לא הוצג לבדיקה; צטט את המקור "
@@ -2741,6 +2936,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     ``request``: the request as resolved in context (the question itself when there is none). ``cache``: the turn's verdicts (KTD10) — a unit judged
     before in the turn, unchanged, is not judged again. Raises ``VerificationUnavailable``."""
     units = split_units(answer.answer_markdown)
+    assign_ids(units, ws.claim_salt)
     report = VerifyReport(units, pending_parameters=pending_parameters(ws, requirements) if requirements is not None
                           else {})
     coverage = None
@@ -2820,25 +3016,46 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     if to_judge:
         report.judged, report.judge_status = True, "ok"
         report.verdicts = {u.index: verdicts[u.index].verdict for u in to_judge if u.index in verdicts}
-        report.claims = {u.index: unit_claims(u, verdicts[u.index], ws) for u in to_judge if u.index in verdicts}
+        report.claims = {u.index: claim_records(u, unit_claims(u, verdicts[u.index], ws))
+                         for u in to_judge if u.index in verdicts}
         for u in to_judge:
             v = verdicts.get(u.index)
             if v is None:
-                # never judged: only neutral navigation text passes; anything else is not checked, never wrong
+                # never judged: only neutral navigation text passes; anything else is not checked, never wrong. The
+                # judge's call failing (after its retry) and the judge leaving the unit out twice are two causes (R14)
                 if not exempt_without_verdict(u):
-                    reason = (NOT_CHECKED_FAILED.format(status=unchecked[u.index]) if u.index in unchecked
-                              else NOT_CHECKED)
-                    report.problems.append(Problem(u, reason, failure_kind="not_checked", check="judge"))
+                    check_failed = u.index in unchecked
+                    reason = NOT_CHECKED_FAILED.format(status=unchecked[u.index]) if check_failed else NOT_CHECKED
+                    report.problems.append(Problem(u, reason, failure_kind="not_checked", check="judge",
+                                                   cause="check_failed" if check_failed else "omitted"))
                 continue
+            recs = report.claims[u.index]
+            failing = [r for r in recs if not r.whole_unit and r.verdict in ("unsupported", "contradicts", "partial")]
             if v.verdict in ("not_factual", "navigation"):
                 if not _non_claim_accepted(u, v.verdict):
-                    report.problems.append(Problem(u, NOT_CLASSIFIED, failure_kind="not_checked", check="judge"))
+                    report.problems.append(Problem(u, NOT_CLASSIFIED, failure_kind="not_checked", check="judge",
+                                                   cause="not_classified"))
             elif v.verdict in ("unsupported", "contradicts"):
-                report.problems.append(Problem(u, "לא נתמך במקורות: " + v.reason, failure_kind=_judged_failure(u, v, ws),
-                                               check="judge"))
-            elif v.verdict == "partial":
-                report.problems.append(Problem(u, "נתמך חלקית: " + v.reason, "partial", defect=v.defect,
-                                               failure_kind=DEFECT_FAILURES.get(v.defect), check="judge"))
+                failure = _judged_failure(u, v, ws)
+                reason = "לא נתמך במקורות: " + v.reason
+                if not u.ids and v.verdict == "unsupported" and failure == "absent_from_source" \
+                        and NOT_LINKED_REASON not in v.reason:
+                    # an uncited claim no read source supports: not linked to a source the turn read (R2) — said so
+                    # whatever else the judge wrote, never an external source and never "wrong"
+                    reason = f"לא נתמך במקורות: {NOT_LINKED_REASON}; {v.reason}"
+                report.problems.append(Problem(u, reason, failure_kind=failure, check="judge",
+                                               claim_id=next((r.id for r in recs if r.verdict in FAILING_VERDICTS),
+                                                             recs[0].id)))
+            elif v.verdict == "partial" or failing:
+                # a unit holding claims that differ: one problem per claim that fails, so each is linked to its claim
+                # by id (R5); the unit stays, marked, until the edit ladder cuts the claim (U4)
+                for r in failing or [None]:
+                    why = v.reason + (f" («{r.text}»)" if r is not None else "")
+                    kind = (r.failure_kind() if r is not None and r.verdict in ("unsupported", "contradicts")
+                            else DEFECT_FAILURES.get(v.defect))
+                    report.problems.append(Problem(u, "נתמך חלקית: " + why, "partial", defect=v.defect,
+                                                   failure_kind=kind, check="judge",
+                                                   claim_id=r.id if r is not None else recs[0].id))
             elif named := [s for s in dict.fromkeys(v.supported_by) if s not in u.ids]:
                 # supported by a shown source the unit does not cite: kept, and cited, only if the numbers agree
                 problem = _named_support(u, named, ws, question)
@@ -2847,6 +3064,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 else:
                     report.problems += [Problem(u, f"נתמך ב-{s}, שהתשובה לא ציטטה", kind="needs_citation", cite=s)
                                         for s in named]
+        complete_records(report)
         _remove_dependents(report, verdicts)
     if coverage:
         report.computed = computed_ids(ws)
@@ -2856,6 +3074,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         report.settle_parameters(ws)
         _check_requirements(report, ws, requirements)
         report.assign_components()
+    close_records(report, verdicts, ws, cache)
     return report
 
 
@@ -2930,6 +3149,219 @@ def unit_claims(u: Unit, v: JudgeVerdict, ws: Workspace | None = None) -> list[U
     return out
 
 
+# the claim verdicts of a record (round 8 R6) and the ones that fail it; "unchecked" is the check that could not complete
+RECORD_VERDICTS = ("supported", "partial", "unsupported", "contradicts", "unchecked")
+FAILING_VERDICTS = ("unsupported", "contradicts", "unchecked")
+CITATION_STATES = ("cited", "repaired", "missing", "not_needed")
+
+
+@dataclass
+class ClaimRecord:
+    """One claim of the answer as the report keeps it (round 8 R5, KTD2, KTD3): a stable ``id`` (content, not
+    position), the ``unit_id`` it belongs to and the unit's current index ``unit``, its offsets ``start``/``end`` in the
+    answer's Markdown, its ``text`` (the span; the unit's text for a whole-unit claim), ``kind``, ``verdict`` (``RECORD_VERDICTS``;
+    a unit that is no claim keeps the judge's ``not_factual`` or ``navigation``), the ``citation`` state
+    (``CITATION_STATES``), the ``action`` taken (``kept`` for a supported claim, ``pending`` otherwise until the edit
+    ladder decides), the sources it was checked against, and the claims it rests on (``depends_on``, ids).
+    ``failure`` is the judged failure kind of a failing claim, ``basis`` the claim whose removal took its basis away,
+    ``cause`` why a claim could not be checked, ``parent_id`` the claim a repair replaced, ``fallback`` why the unit's
+    one whole-unit claim stands in for the judge's claims."""
+
+    id: str
+    unit_id: str
+    unit: int
+    start: int
+    end: int
+    text: str
+    kind: str
+    verdict: str
+    failure: str = "none"
+    citation: str = "not_needed"
+    action: str = "kept"
+    sources_checked: list[str] = field(default_factory=list)
+    depends_on: list[str] = field(default_factory=list)
+    fallback: str = ""
+    needs_context: str = "none"
+    whole_unit: bool = False
+    parent_id: str = ""
+    basis: str = ""
+    cause: str = ""
+    refs: tuple[str, ...] = ()  # the dependencies as the judge gave them: spans, or unit indexes as strings
+    context_key: str = ""  # the unit's heading and table context, for matching a repaired claim to its parent
+
+    @property
+    def span(self) -> str:
+        return self.text
+
+    def failure_kind(self) -> str:
+        """The failure kind a failing claim is removed for (``FAILURE_KINDS``)."""
+        if self.verdict == "unchecked":
+            return "not_checked"
+        if self.verdict == "contradicts":
+            return "contradicts_source"
+        return self.failure if self.failure not in ("", "none") else "absent_from_source"
+
+    def as_dict(self) -> dict:
+        """The record without the model's words: ids, position, kinds and states (its text is the answer's own)."""
+        return {"id": self.id, "unit_id": self.unit_id, "unit": self.unit, "start": self.start, "end": self.end,
+                "text": self.text, "kind": self.kind, "verdict": self.verdict, "citation": self.citation,
+                "action": self.action, "sources_checked": list(self.sources_checked),
+                "depends_on": list(self.depends_on), "fallback": self.fallback, "parent_id": self.parent_id,
+                "failure": self.failure_kind() if self.verdict in FAILING_VERDICTS else "none",
+                "cause": self.cause}
+
+
+def _same_span(a: str, b: str) -> bool:
+    """Whether two spans name the same claim: equal once whitespace is normalised, or one holds the other (the judge
+    copies a span from the unit, and a requirement's or a dependency's span may be a part of it)."""
+    a, b = _norm(a), _norm(b)
+    return bool(a) and bool(b) and (a == b or a in b or b in a)
+
+
+def _text_to_raw(u: Unit) -> list[int] | None:
+    """For each character of the unit's text (citations stripped), its index in ``raw``; None when the unit's text is
+    not ``raw`` without its citations (a unit a composer changed)."""
+    skip: set[int] = set()
+    for m in _IDS.finditer(u.raw):
+        skip.update(range(m.start(), m.end()))
+    kept = [i for i in range(len(u.raw)) if i not in skip]
+    chars = "".join(u.raw[i] for i in kept)
+    lead = len(chars) - len(chars.lstrip())
+    kept = kept[lead:]
+    return kept if "".join(u.raw[i] for i in kept).startswith(u.text) else None
+
+
+def claim_records(u: Unit, claims: list[UnitClaim]) -> list[ClaimRecord]:
+    """A unit's validated claims as records with their ids and offsets in the answer's Markdown (the unit's span for a
+    whole-unit claim, the span's own place for a claim inside it). Two claims with the same span get the occurrence
+    of it in the unit as their ``occurrence``, so their ids differ."""
+    mapping = None
+    seen: dict[str, int] = {}
+    context = _digest(u.heading, u.context, u.table_header)
+    out = []
+    for c in claims:
+        n = seen[_norm(c.span)] = seen.get(_norm(c.span), -1) + 1
+        start, end = u.start, u.end
+        if not c.whole_unit:
+            at = -1
+            for _ in range(n + 1):
+                at = u.text.find(c.span, at + 1)
+                if at < 0:
+                    break
+            if at >= 0:
+                mapping = mapping or _text_to_raw(u)
+                if mapping is not None and at + len(c.span) <= len(mapping):
+                    start, end = u.start + mapping[at], u.start + mapping[at + len(c.span) - 1] + 1
+        out.append(ClaimRecord(
+            claim_id_of(u, c.span, n), u.id, u.index, start, end, c.span, c.kind, c.verdict, c.failure,
+            sources_checked=list(u.ids), fallback=c.fallback, needs_context=c.needs_context,
+            whole_unit=c.whole_unit, refs=c.depends_on, context_key=context))
+    return out
+
+
+def _whole_record(u: Unit, verdict: str, failure: str = "none", cause: str = "") -> ClaimRecord:
+    """The one whole-unit claim of a unit the judge did not judge: one the deterministic checks failed, or that could
+    not be checked."""
+    kind = "computed" if any(i.startswith("C") for i in u.ids) else "datum"
+    return ClaimRecord(claim_id_of(u, u.text), u.id, u.index, u.start, u.end, u.text, kind, verdict, failure,
+                       sources_checked=list(u.ids), whole_unit=True, cause=cause,
+                       context_key=_digest(u.heading, u.context, u.table_header))
+
+
+def complete_records(report: VerifyReport) -> None:
+    """Before the cascade: a record for every unit a problem removed without the judge's claims (a deterministic check,
+    a missing verdict, a unit the judge would not classify), and the claim id of every unit problem. A unit that could
+    not be checked has one ``unchecked`` claim — never a contradiction (R6, R14)."""
+    for p in report.removals():
+        u = p.unit
+        unchecked = p.failure_kind == "not_checked"
+        if u.index in report.claims and not (unchecked and report.claims[u.index][0].verdict != "unchecked"):
+            continue
+        if unchecked:
+            report.claims[u.index] = [_whole_record(u, "unchecked", cause=p.cause)]
+        else:
+            kind = p.failure_kind or "absent_from_source"
+            report.claims[u.index] = [_whole_record(u, "contradicts" if kind == "contradicts_source" else "unsupported",
+                                                    "none" if kind == "contradicts_source" else kind)]
+    for p in report.problems:
+        if p.claim_id or p.unit.index < 0 or p.unit.index not in report.claims:
+            continue
+        recs = report.claims[p.unit.index]
+        if p.kind == "claim":
+            p.claim_id = next((r.id for r in recs if r.verdict in FAILING_VERDICTS), recs[0].id)
+        else:
+            p.claim_id = next((r.id for r in recs if r.verdict not in FAILING_VERDICTS), recs[0].id)
+
+
+def close_records(report: VerifyReport, verdicts: dict[int, JudgeVerdict], ws: Workspace,
+                  cache: VerdictCache | None = None) -> None:
+    """After the cascade: the records agree with the problems (a unit removed for its dependencies fails its
+    claims), then each gets its sources, its dependencies as ids, its citation state (R2) and its action, and a claim a
+    repair changed gets the parent it replaced. The report's instruction plane is set from them."""
+    complete_records(report)  # the problems the requirement checks added since
+    for p in report.problems:  # a unit removed because it rested on another: its claims lost their basis
+        if p.check == "dependency" and p.severity == "error" and p.unit.index in report.claims:
+            for r in report.claims[p.unit.index]:
+                if r.verdict in RECORD_VERDICTS and r.verdict not in FAILING_VERDICTS:
+                    kind = p.failure_kind or "absent_from_source"
+                    r.verdict = "unchecked" if kind == "not_checked" else "unsupported"
+                    r.failure = "none" if kind == "not_checked" else kind
+                    r.basis, r.cause = p.basis, p.cause
+    removed = report.removed_units()
+    attached = {p.unit.index for p in report.problems if p.kind == "needs_citation"}
+    units = {u.index: u for u in report.units}
+    for idx, recs in report.claims.items():
+        u = units.get(idx)
+        if u is None:
+            continue
+        v = verdicts.get(idx)
+        shown = [] if u.ids else _unit_candidates(u, ws)
+        named = [x for x in (v.supported_by if v is not None else []) if x not in u.ids]
+        for r in recs:
+            r.sources_checked = list(dict.fromkeys([*u.ids, *shown, *named]))
+            r.depends_on = list(dict.fromkeys(
+                [x.id for ref in r.refs for x in (report.claims.get(int(ref), []) if ref.isdigit() else
+                                                   [t for t in [_ref_target(recs, ref, r)] if t is not None])]))
+            factual = r.verdict in RECORD_VERDICTS
+            if idx in attached and r.verdict in ("supported", "partial"):
+                r.citation = "repaired"  # the server attaches the support it found (``supported_by`` or the meaning check)
+            elif u.ids:
+                r.citation = "cited"
+            else:
+                r.citation = "missing" if factual and r.kind != "instruction" else "not_needed"
+            # a supported claim is kept; any other waits for the edit ladder to decide (U4), as does a supported claim
+            # of a unit that is removed whole
+            r.action = "kept" if not factual or (r.verdict == "supported" and idx not in removed) else "pending"
+    if cache is not None:
+        _link_parents(report, cache)
+    report.instructions = report.instruction_plane()
+
+
+def _link_parents(report: VerifyReport, cache: VerdictCache) -> None:
+    """A claim a repair or rewrite changed gets a new id; link it to the claim of an earlier round it replaced
+    (KTD2, best effort): one that is gone now, in the same context, whose text overlaps it. A claim that stands as it
+    was has its old id and no parent."""
+    now = {r.id for recs in report.claims.values() for r in recs}
+    for recs in report.claims.values():
+        for r in recs:
+            if r.id in cache.records or not r.text.strip():
+                continue
+            words = set(_norm(r.text).split())
+            best, score = None, 0.0
+            for old in cache.records.values():
+                if old.id in now or old.context_key != r.context_key:
+                    continue
+                theirs = set(_norm(old.text).split())
+                overlap = len(words & theirs) / max(1, len(words | theirs))
+                if overlap > score and (_same_span(old.text, r.text) or overlap >= 0.5):
+                    best, score = old, overlap
+            if best is not None:
+                r.parent_id = best.id
+    for recs in report.claims.values():
+        for r in recs:
+            cache.records.setdefault(r.id, r)
+
+
 def _judged_failure(u: Unit, v: JudgeVerdict, ws: Workspace) -> str:
     """The failure kind of a judge's ``unsupported`` or ``contradicts`` verdict (KTD5): ``contradicts_source`` for the
     latter; else the one it named; else, for a unit resting on a
@@ -2947,9 +3379,17 @@ def _judged_failure(u: Unit, v: JudgeVerdict, ws: Workspace) -> str:
     return "absent_from_source"
 
 
+def _primary_claim_id(report: VerifyReport, index: int) -> str:
+    """The claim a problem of the whole unit is about: its first failing claim, else its first."""
+    recs = report.claims.get(index, [])
+    return next((r.id for r in recs if r.verdict in FAILING_VERDICTS), recs[0].id if recs else "")
+
+
 def _remove_dependents(report: VerifyReport, verdicts: dict[int, JudgeVerdict]) -> None:
-    """A unit whose conclusion the judge said rests on a removed claim is removed too (KTD10, R15), with that claim's
-    failure kind (check ``dependency``), until nothing more rests on a removed one."""
+    """What rests on a removed claim is removed too (KTD10, R15; round 8 R11), with that claim's failure kind (check
+    ``dependency``), until nothing more rests on a removed one. At unit level: a unit whose verdict says it rests on a
+    removed unit. At claim level: a claim whose ``depends_on`` names a failing claim of its unit, or a removed unit
+    (``_claim_cascade``) — the unit goes only when no claim of it stands (U4 cuts the span)."""
     units = {u.index: u for u in report.units}
     while True:
         removed = {p.unit.index: p for p in reversed(report.removals())}
@@ -2959,11 +3399,72 @@ def _remove_dependents(report: VerifyReport, verdicts: dict[int, JudgeVerdict]) 
             if i in removed or i not in units or base is None:
                 continue
             report.problems.append(Problem(units[i], DEPENDS_ON_REMOVED.format(text=base.unit.text[:120]),
-                                           failure_kind=base.failure_kind, check="dependency"))
+                                           failure_kind=base.failure_kind, check="dependency",
+                                           claim_id=_primary_claim_id(report, i), basis=base.claim_id,
+                                           cause=base.cause))
             removed[i] = report.problems[-1]
             added = True
-        if not added:
+        if not (_claim_cascade(report) or added):
             return
+
+
+def _ref_target(recs: list[ClaimRecord], ref: str, own: ClaimRecord) -> ClaimRecord | None:
+    """The claim of the unit a dependency ``ref`` (a span the judge gave) names: the one with that span, else the one
+    whose text holds it or it holds (the longest)."""
+    found = [r for r in recs if r is not own and _same_span(r.text, ref)]
+    exact = [r for r in found if _norm(r.text) == _norm(ref)]
+    return (exact or sorted(found, key=lambda r: -len(r.text)) or [None])[0]
+
+
+def _claim_cascade(report: VerifyReport) -> bool:
+    """One pass of the claim-level cascade (R11, AE5): a claim that rests (``depends_on``) on a failing claim of its
+    unit, or on a unit removed, loses its basis and fails with that claim's failure kind (check ``dependency``). When
+    no claim of its unit stands the unit is removed; otherwise it stays, marked (a partial problem per such claim).
+    A computation over the turn's verified values rests on no claim, and stays. Whether anything was added."""
+    units = {u.index: u for u in report.units}
+    removed = {p.unit.index: p for p in report.removals()}
+    added = False
+    for idx in sorted(report.claims):
+        recs = report.claims[idx]
+        if idx in removed or idx not in units:
+            continue
+        fresh: list[tuple[ClaimRecord, ClaimRecord | None, Problem | None]] = []
+        changed = True
+        while changed:  # a claim that just failed can be the basis of another of the unit
+            changed = False
+            for r in recs:
+                if r.verdict in FAILING_VERDICTS or r.verdict not in RECORD_VERDICTS or not r.refs:
+                    continue
+                base = next((t for ref in r.refs if not ref.isdigit()
+                             for t in [_ref_target(recs, ref, r)] if t is not None and t.verdict in FAILING_VERDICTS),
+                            None)
+                gone = next((removed[int(ref)] for ref in r.refs if ref.isdigit() and int(ref) != idx
+                             and int(ref) in removed), None)
+                if base is None and gone is None:
+                    continue
+                kind = base.failure_kind() if base is not None else (gone.failure_kind or "absent_from_source")
+                cause = base.cause if base is not None else gone.cause
+                r.verdict = "unchecked" if kind == "not_checked" else "unsupported"
+                r.failure = "none" if kind == "not_checked" else kind
+                r.basis, r.cause, r.action = (base.id if base is not None else gone.claim_id), cause, "pending"
+                fresh.append((r, base, gone))
+                changed = True
+        if not fresh:
+            continue
+        added = True
+        standing = [r for r in recs if r.verdict in RECORD_VERDICTS and r.verdict not in FAILING_VERDICTS]
+        for n, (r, base, gone) in enumerate(fresh):
+            text = base.text if base is not None else gone.unit.text
+            reason = DEPENDS_ON_REMOVED.format(text=text[:120])
+            kind = r.failure_kind()
+            if not standing and n == 0:  # nothing of the unit stands: it is removed
+                report.problems.append(Problem(units[idx], reason, failure_kind=kind, check="dependency",
+                                               claim_id=r.id, basis=r.basis, cause=r.cause))
+            elif standing:  # the unit stays, marked; U4 cuts the claim's span
+                report.problems.append(Problem(units[idx], reason, "partial", defect="part", failure_kind=kind,
+                                               check="dependency", claim_id=r.id, basis=r.basis, cause=r.cause))
+        removed = {p.unit.index: p for p in report.removals()}
+    return added
 
 
 def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequirements) -> None:

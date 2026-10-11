@@ -94,7 +94,7 @@ from collections.abc import Callable, Container
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, text
 
@@ -366,6 +366,9 @@ class Workspace:
     tables: dict[tuple, tuple] = field(default_factory=dict)
     section_blocks: dict[tuple, list] = field(default_factory=dict)
     table_rows: dict[tuple, dict] = field(default_factory=dict)
+    # the turn's salt for claim and unit ids (round 8 KTD2, ``verify.assign_ids``): an id is a hash of the salt and the
+    # claim's context, so it is stable across the turn's rounds and reveals no text. Random per turn; a test sets it.
+    claim_salt: str = field(default_factory=lambda: uuid4().hex[:16])
 
     def spend(self, output: str) -> str:
         """Count a tool output sent to the model against the turn's budget; the output that reaches it is sent

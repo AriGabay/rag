@@ -462,11 +462,21 @@ def test_an_uncited_sentence_whose_number_is_not_in_the_named_source_is_removed(
 
 
 def test_supported_by_a_source_not_shown_in_the_batch_is_ignored_and_the_unit_removed():
-    md = "שלב א עבר עם סף 40 נקודות [S1].\nבשלב ג נקבע סף של 63 נקודות."
-    a = _answer(md)  # S2 states the 63, but no unit cites it, so the judge was never shown it
+    md = "שלב א עבר עם סף 40 נקודות [S1].\nבשלב ג נקבע סף של 40 נקודות."
+    a = _answer(md)  # S2 holds none of the unit's numbers: no unit cites it and it is no candidate, so it was never shown
     r = verify_answer(_supported_by(_named("S2")), a, _ws(TABLE, OTHER), "?", [])
     assert [p.unit.index for p in r.problems if p.removes_unit] == [1]
-    assert "63" not in r.apply(a).answer_markdown
+    assert "בשלב ג" not in r.apply(a).answer_markdown
+
+
+def test_a_source_the_turn_read_that_holds_the_number_is_shown_for_an_uncited_unit_and_its_named_support_is_accepted():
+    md = "שלב א עבר עם סף 40 נקודות [S1].\nבשלב ג נקבע סף של 63 נקודות."
+    a = _answer(md)  # S2 states the 63 and no unit cites it: the turn read it, so it is shown beside the uncited unit
+    p = _supported_by(_named("S2"))
+    r = verify_answer(p, a, _ws(TABLE, OTHER), "?", [])
+    assert '<source id="S2" excerpt="false" candidate="true"' in p.calls[0].input
+    assert not [x for x in r.problems if x.removes_unit]
+    assert r.apply(a).answer_markdown == "שלב א עבר עם סף 40 נקודות [S1].\nבשלב ג נקבע סף של 63 נקודות [S2]."
 
 
 @pytest.mark.parametrize("named", ["S7", "P1", "A1"])
@@ -477,13 +487,13 @@ def test_supported_by_an_id_that_is_no_evidence_of_the_turn_is_removed(named):
     assert [p.unit.index for p in r.problems if p.removes_unit] == [1]
 
 
-def test_an_uncited_claim_with_no_evidence_in_the_batch_stays_unsupported():
+def test_an_uncited_claim_no_shown_source_holds_stays_unsupported_though_the_judge_names_one():
     md = "שלב א עבר עם סף 40 נקודות.\nהנכס פנוי."
-    a = _answer(md)  # nothing is cited, so no source is shown; a source the judge names anyway is not accepted
+    a = _answer(md)  # S1 holds the first unit's 40, so it is shown for it; for "הנכס פנוי" nothing is, and naming S1 fails
     p = _supported_by(lambda t, c: ("supported", ["S1"]))
     r = verify_answer(p, a, _ws(TABLE), "?", [])
-    assert "<source id=" not in p.calls[0].input
-    assert sorted(x.unit.index for x in r.problems if x.removes_unit) == [0, 1]
+    assert '<source id="S1" excerpt="false" candidate="true"' in p.calls[0].input
+    assert sorted(x.unit.index for x in r.problems if x.removes_unit) == [1]
 
 
 def test_a_cited_unit_naming_its_own_source_is_unchanged():
@@ -710,8 +720,8 @@ def test_a_judge_timeout_on_one_batch_records_its_units_as_not_checked_never_as_
     assert (decision.unit.index, decision.failure_kind) == (1, "not_checked")
     assert len(usage) == 3  # the batch that timed out was tried twice, never a third time
     (summary,) = r.counts()["removals"]
-    assert summary == {"failure_kind": "not_checked", "component": None,
-                       "text": verify.REMOVAL_SENTENCES["not_checked"]}
+    assert summary == {"failure_kind": "not_checked", "component": None, "cause": "check_failed",
+                       "text": verify.CHECK_CAUSE_SENTENCES["check_failed"]}
     assert "שגוי" not in summary["text"].replace("לא נמצאה שגויה", "") and "תמיכה" not in summary["text"]
     out = r.apply(a).answer_markdown
     assert "פנוי" not in out and "לא נמצאה להן תמיכה" not in out and "לא ניתן היה לבדוק" in out

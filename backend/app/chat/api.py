@@ -243,10 +243,13 @@ def public_removals(items: list) -> list[dict]:
         if kind not in verify.REMOVAL_SENTENCES:
             continue
         component = r.get("component")
+        # a claim that could not be checked says why, in the server's sentence for the cause (round 8 R14)
+        cause = r.get("cause") if kind == "not_checked" and r.get("cause") in verify.CHECK_CAUSE_SENTENCES else None
         out.append({"failure_kind": kind,
                     "component": component if isinstance(component, str) and _COMPONENT_ID.fullmatch(component)
                     else None,
-                    "text": verify.REMOVAL_SENTENCES[kind]})
+                    "text": verify.CHECK_CAUSE_SENTENCES[cause] if cause else verify.REMOVAL_SENTENCES[kind]}
+                   | ({"cause": cause} if cause else {}))
     return out
 
 

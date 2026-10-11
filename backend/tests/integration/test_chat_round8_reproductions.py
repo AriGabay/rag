@@ -117,8 +117,6 @@ VALUE_SOURCE = "סיכום: השווי למ\"ר הוא 9,500 ₪."
 RENT_SOURCE = "נספח השכרה: דמי השכירות הם 55 ₪ למ\"ר לחודש."
 
 
-@pytest.mark.xfail(strict=True, reason="U2/U5 (R2): the judge is shown only sources that units cite, so an uncited "
-                                       "datum has no shown source to name (rule 9) and the unit is removed as unsupported")
 def test_ae2_an_uncited_datum_supported_by_a_source_read_in_the_turn_gets_its_citation_and_is_not_removed():
     def respond(input: str) -> dict:
         """What the real judge does: a cited unit is supported; an uncited one only by a shown source that states
@@ -150,9 +148,6 @@ MISCLASSIFIED = "דמי השכירות 55 ₪ הם, כך נראה, נתון חש
 CONTENT_FAILURES = set(verify.FAILURE_KINDS) - {"not_checked"}
 
 
-@pytest.mark.xfail(strict=True, reason="U2/U6 (R14): a judge call that failed twice, a unit the judge omitted and a unit "
-                                       "it did not classify all become the one failure kind 'not_checked' with one "
-                                       "sentence; the technical failure has no reason of its own")
 def test_ae3_a_judge_batch_failing_twice_is_withheld_with_its_own_reason_and_the_rest_stays_verified(monkeypatch):
     _one_unit_per_call(monkeypatch)
 

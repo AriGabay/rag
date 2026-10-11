@@ -851,3 +851,82 @@ def test_an_information_component_or_a_calculation_waiting_for_the_user_keeps_it
     assert r.pending_parameters == {"N1": ["שיעור העלייה"]}
     assert [o["status"] for o in r.requirement_outcomes()] == ["full"]
     assert not [p for p in r.problems if p.kind == "requirement"]
+
+
+# --- completeness from claims (round 8 U3, KTD9, R20, R21, AE7) -------------------------------------------------------
+
+AREAS_ONLY = "תא שטח 1: השטחים העיקריים הם 1,200 מ״ר. נתון נוסף: 300 מ״ר."  # the figure 300 is there, not as service areas
+MIXED_AREAS = "השטחים העיקריים בתא שטח 1 הם 1,200 מ״ר, ושטחי השירות בתא שטח 1 הם 300 מ״ר [S1]."
+MAIN_CLAIM, SERVICE_CLAIM = "השטחים העיקריים בתא שטח 1 הם 1,200 מ״ר", "ושטחי השירות בתא שטח 1 הם 300 מ״ר"
+
+
+def _mixed_areas_judge(score_claims: bool = True) -> ScriptedProvider:
+    """One sentence holds both areas; the source supports the main area only. The judge splits the unit into its two
+    claims and scores each component by the claim that gives it (``claims``)."""
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        frozen = re.findall(r'<requirement id="(N[\d.]+)"[^>]*>\n(.*?)\n</requirement>', input, re.S)
+        out = {"verdicts": [{"index": i, "verdict": "partial", "reason": "חלקי", "defect": "part", "claims": [
+            {"span": MAIN_CLAIM, "verdict": "supported"}, {"span": SERVICE_CLAIM, "verdict": "unsupported"}]}
+            for i in (int(x) for x in re.findall(r'<unit index="(\d+)"', input))]}
+        if "<requirements>" in input:
+            by_id = {"N1": ("missing", [], []), "N1.1": ("full", [0], [MAIN_CLAIM]),
+                     "N1.2": ("full", [0], [SERVICE_CLAIM] if score_claims else [])}
+            out["requirements"] = [{"id": rid, "text": "", "calculation": False, "status": by_id[rid][0],
+                                    "units": by_id[rid][1], "claims": by_id[rid][2], "related": [], "reason": "בדיקה"}
+                                   for rid, _ in frozen]
+        return out
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    return p
+
+
+def _areas_turn() -> TurnRequirements:
+    return _turn({"id": "1", "text": "השטחים בתא שטח 1"}, {"id": "1.1", "text": "השטחים העיקריים", "parent": "1"},
+                 {"id": "1.2", "text": "שטחי השירות", "parent": "1"})
+
+
+def test_ae7_a_component_given_only_by_a_failing_claim_is_the_one_missing_component_with_its_reason():
+    ws = _ws(AREAS_ONLY)
+    turn = _areas_turn()
+    a = _answer(MIXED_AREAS)
+    r = verify_answer(_mixed_areas_judge(), a, ws, "?", [], requirements=turn)
+    by_id = {o["id"]: o for o in r.requirement_outcomes()}
+    assert (by_id["N1.1"]["status"], by_id["N1.2"]["status"], by_id["N1"]["status"]) == (
+        "full", "not_answered", "partial")
+    assert by_id["N1.2"]["removal_kinds"] == ["absent_from_source"] and by_id["N1.2"]["removed_units"] == [0]
+    _, outcomes = _finish(ws, a, r, turn)
+    missing = coverage.completeness(outcomes)["missing"]
+    assert [m["id"] for m in missing] == ["N1.2"], missing  # the category and the main areas are not listed
+    assert missing[0]["reason"] == "removed"
+
+
+def test_a_vote_without_claim_spans_counts_the_unit_as_before():
+    ws = _ws(AREAS_ONLY)
+    r = verify_answer(_mixed_areas_judge(score_claims=False), _answer(MIXED_AREAS), ws, "?", [],
+                      requirements=_areas_turn())
+    assert {o["id"]: o["status"] for o in r.requirement_outcomes()}["N1.2"] == "full"  # unit-level, as in round 7
+
+
+def test_a_vote_naming_a_span_the_unit_does_not_hold_falls_back_to_the_unit():
+    ws = _ws(AREAS_ONLY)
+    judge = _mixed_areas_judge()
+    r = verify_answer(judge, _answer(MIXED_AREAS), ws, "?", [], requirements=_areas_turn())
+    r.requirement_votes["N1.2"][0].claims[:] = ["משפט שאינו ביחידה"]
+    assert {o["id"]: o["status"] for o in r.requirement_outcomes()}["N1.2"] == "full"
+
+
+def test_a_conditional_component_with_no_value_in_the_read_source_forces_nothing_and_is_not_repaired():
+    ws = _ws(AREAS_ONLY)
+    _opened(ws, "תא שטח 1")
+    turn = _turn({"id": "1", "text": "השטחים העיקריים"}, {"id": "2", "text": "תאריך האישור", "conditional": True})
+    a = _answer("השטחים העיקריים הם 1,200 מ״ר [S1].")
+    score = _scores({"N1": {"status": "full", "units": [0]}, "N2": {"status": "missing", "related": ["S1"]}})
+    r = verify_answer(_judge(score), a, ws, "?", [], requirements=turn)
+    assert r.ok and not [p for p in r.problems if p.kind in ("requirement", "instruction")]  # nothing is demanded
+    final, outcomes = _finish(ws, a, r, turn)
+    missing = r.completeness["missing"]
+    assert [(m["id"], m["conditional"]) for m in missing] == [("N2", True)]
+    assert "1,200" in final.answer_markdown and "תאריך האישור" in final.answer_markdown  # stated, never invented
+    assert not re.search(r"\d{1,2}\.\d{1,2}\.\d{2,4}", final.answer_markdown)

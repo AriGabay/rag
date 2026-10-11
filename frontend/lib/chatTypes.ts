@@ -368,6 +368,8 @@ export interface ChatRemoval {
   failure_kind: ChatFailureKind | string;
   component: string | null;
   text: string;
+  /** For `not_checked` only (round 8 R14): why — `check_failed`, `omitted` or `not_classified`; `text` says it. */
+  cause?: "check_failed" | "omitted" | "not_classified";
 }
 
 /** What verification did, in counts; what it removed, and why, is diagnostics (not on this path). */

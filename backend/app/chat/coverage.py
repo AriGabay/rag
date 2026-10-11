@@ -617,6 +617,8 @@ def state_components(ws: Workspace, answer: FinalAnswer, report,
     if outcomes and report.supersede(outcomes):
         final = report.apply(answer)
         outcomes = component_outcomes(ws, report, final, turn, answer.requested)
+    if outcomes:  # the instruction plane from the components as stated, beside the content and completeness planes
+        report.instructions = report.instruction_plane(outcomes)
     items = [o for o in outcomes if o["stated"]] + ([] if report.requirements else _unlinked_gaps(ws, answer.requested))
     groups = gap_groups(items)
     report.gaps = groups

@@ -548,3 +548,47 @@ def test_a_removal_with_no_repair_round_records_that_none_was_attempted(offline,
     out = _turn(agent)
     (decision,) = out.report.removals()
     assert decision.failure_kind == "wrong_subject" and decision.repair_attempted is False
+
+
+# --- reuse by stable id and context (round 8 U3, R18, KTD2, KTD7) ------------------------------------------------------
+
+def _salted(*texts: str) -> Workspace:
+    ws = _ws(*texts)
+    ws.claim_salt = "salt"
+    return ws
+
+
+def test_a_reused_verdict_keeps_the_claim_id_and_the_same_heading_is_not_judged_again():
+    seen: list[str] = []
+    cache, ws = VerdictCache(), _salted()
+    judge = _judge(seen=seen)
+    markdown = "## מצב מוצע\nהשווי למ\"ר הוא 9,500 ₪ [S1]."
+    first = verify_answer(judge, _answer(markdown), ws, "?", [], cache=cache)
+    calls = len(seen)
+    again = verify_answer(judge, _answer(markdown), ws, "?", [], cache=cache)
+    assert len(seen) == calls and again.reused == 2
+    assert [c.id for c in again.claims[1]] == [c.id for c in first.claims[1]]
+
+
+def test_the_same_sentence_under_another_heading_or_table_header_gets_a_new_verdict_and_a_new_claim_id():
+    seen: list[str] = []
+    cache, ws = VerdictCache(), _salted()
+    judge = _judge(seen=seen)
+    first = verify_answer(judge, _answer("## מצב מוצע\nהשווי למ\"ר הוא 9,500 ₪ [S1]."), ws, "?", [], cache=cache)
+    n = len(seen)
+    moved = verify_answer(judge, _answer("## מצב מאושר\nהשווי למ\"ר הוא 9,500 ₪ [S1]."), ws, "?", [], cache=cache)
+    assert len(seen) == n + 1 and moved.claims[1][0].id != first.claims[1][0].id
+    row = "| נכס | שווי |\n| --- | --- |\n| א | 9,500 |"
+    verify_answer(judge, _answer(row), ws, "?", [], cache=cache)
+    n = len(seen)
+    verify_answer(judge, _answer(row.replace("שווי", "שכירות")), ws, "?", [], cache=cache)
+    assert len(seen) == n + 1  # the row under other column headers is judged again
+
+
+def test_a_verdict_reused_after_a_reorder_maps_to_the_same_claim_ids():
+    cache, ws = VerdictCache(), _salted()
+    judge = _judge(lambda t: "unsupported" if "מושכר" in t else "supported")
+    one = verify_answer(judge, _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nהנכס מושכר [S1]."), ws, "?", [], cache=cache)
+    two = verify_answer(judge, _answer("הנכס מושכר [S1].\nהשווי למ\"ר הוא 9,500 ₪ [S1]."), ws, "?", [], cache=cache)
+    ids = lambda r: {c.text: (c.id, c.verdict) for cs in r.claims.values() for c in cs}  # noqa: E731
+    assert ids(one) == ids(two)
