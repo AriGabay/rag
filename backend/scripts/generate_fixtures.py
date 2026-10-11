@@ -5098,15 +5098,123 @@ def write_round7(out: Path, font_dir: Path) -> None:
     print(f"wrote {ROUND7_DIR}/{ROUND7_MANIFEST} ({len(text_):,} chars)")
 
 
+ROUND8_DIR = "round8"
+ROUND8_MANIFEST = "manifest.json"
+ROUND8_PLACE = "כפר הדמה"  # an invented town; every street, plan, block, parcel and amount below is invented too
+ROUND8_PROPOSED_HEADERS = ["תא שטח", "שטח עיקרי (מ״ר)", "תכסית (%)"]
+ROUND8_PROPOSED_ROWS = [["1", "1,500", "55"], ["2", "1,100", "45"]]
+# R8b: 36 plots whose main areas are listed in one table that runs over the page break; the total is on page 2
+ROUND8_AREA_ROWS = [[str(n), f"{700 + 17 * n + (n % 5) * 40:,}"] for n in range(1, 37)]
+ROUND8_AREA_HEADERS = ["תא שטח", "שטח עיקרי (מ״ר)"]
+ROUND8_AREA_TOTAL = sum(int(r[1].replace(",", "")) for r in ROUND8_AREA_ROWS)
+
+
+class Round8PdfRenderer(Round7PdfRenderer):
+    """The round-8 documents (claim-level verification): a plan with the same figures under a "מצב מאושר" and a
+    "מצב מוצע" heading, and a table whose header is on page 1 and whose total is on page 2. Every fact line is
+    recorded as it is drawn. Every name, address, plan, block, parcel and amount is invented."""
+
+    def render_plot_areas(self) -> bytes:
+        """R8a: plot areas of an approved and a proposed state. The sentences under the proposed heading do not say
+        "proposed" themselves (the heading does); plot 1 has no service area and nothing states an approval date."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.title_block("דוח שטחים לתכנית דמו/8800 — מתחם גבעת הרימון", f"רחוב הכלנית 3, {ROUND8_PLACE}", "30955",
+                         "8")
+        self.section_heading("1. מבוא")
+        self.fact("report_date", "תאריך עריכת הדוח: 05/06/2024 (מסמך סינתטי).", value="05/06/2024")
+        self.fact(None, "הדוח מפרט את שטחי הבנייה ואת התכסית בתאי השטח של המתחם.")
+        self.section_heading("2. מצב מאושר")
+        self.fact("approved_area_1", "תא שטח 1: השטח העיקרי הוא 1,200 מ״ר.", plot="1", value="1,200", status="approved")
+        self.fact("approved_area_2", "תא שטח 2: השטח העיקרי הוא 950 מ״ר.", plot="2", value="950", status="approved")
+        self.fact("approved_coverage_1", "תא שטח 1: התכסית היא 40%.", plot="1", value="40", status="approved")
+        self.fact("service_area_2", "תא שטח 2: שטחי השירות הם 310 מ״ר.", plot="2", value="310", status="approved")
+        self.section_heading("3. מצב מוצע")
+        self.fact(None, "הטבלה הבאה מפרטת את תאי השטח:")
+        widths = [40, 70, 50]
+        pdf.set_fill_color(225, 225, 225)
+        self.ruled_row(ROUND8_PROPOSED_HEADERS, widths, bold=True)
+        for row in ROUND8_PROPOSED_ROWS:
+            self.ruled_row(row, widths)
+        pdf.ln(3)
+        self.facts["proposed_table"] = {"page": pdf.page_no(), "section": self.section,
+                                        "headers": ROUND8_PROPOSED_HEADERS, "rows": ROUND8_PROPOSED_ROWS,
+                                        "area_1": "1,500", "coverage_1": "55", "area_2": "1,100", "coverage_2": "45"}
+        self.section_heading("4. סיכום")
+        self.fact(None, "הנתונים לתאי השטח מוצגים לפי המצב המאושר ולפי המצב המוצע (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+    def render_split_table(self) -> bytes:
+        """R8b: one table of main areas by plot that runs over the page break (its header is on page 1 only); its
+        total row is the last row, on page 2."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.title_block("טבלת שטחים עיקריים — מתחם גבעת הרימון", f"רחוב הכלנית 5, {ROUND8_PLACE}", "30956", "2")
+        self.section_heading("1. שטחים לפי תאי שטח")
+        self.fact(None, "הטבלה הבאה מפרטת את השטח העיקרי בכל אחד מתאי השטח (מסמך סינתטי):")
+        widths = [60, 80]
+        pdf.set_fill_color(225, 225, 225)
+        self.ruled_row(ROUND8_AREA_HEADERS, widths, bold=True)
+        header_page = pdf.page_no()
+        pages: dict[str, int] = {}
+        for row in [*ROUND8_AREA_ROWS, ["סה״כ", f"{ROUND8_AREA_TOTAL:,}"]]:
+            if pdf.get_y() + self.ROW_H > pdf.page_break_trigger:
+                pdf.add_page()  # the table goes on over the break without repeating its header
+            page, _ = self.ruled_row(row, widths, bold=row[0] == "סה״כ")
+            pages[row[0]] = page
+        pdf.ln(3)
+        self.facts["table"] = {"header_page": header_page, "total_page": pages["סה״כ"], "headers": ROUND8_AREA_HEADERS,
+                               "rows": ROUND8_AREA_ROWS, "total": f"{ROUND8_AREA_TOTAL:,}"}
+        self.section_heading("2. סיכום")
+        self.fact(None, "הנתונים בטבלה מתייחסים לשטח העיקרי בלבד (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+
+def write_round8(out: Path, font_dir: Path) -> None:
+    """Writes the round-8 fixtures and ``manifest.json`` (per document its file, title, pages, section headings and the
+    known facts the real-model acceptance asks about; never read back from the files)."""
+    from pypdf import PdfReader
+
+    rdir = out / ROUND8_DIR
+    rdir.mkdir(parents=True, exist_ok=True)
+    docs: dict[str, dict[str, Any]] = {}
+    specs = [
+        ("plot_areas", "R8a_synthetic_plot_areas_approved_and_proposed.pdf", Round8PdfRenderer.render_plot_areas),
+        ("split_table", "R8b_synthetic_area_table_total_on_page_2.pdf", Round8PdfRenderer.render_split_table),
+    ]
+    for key, name, render in specs:
+        r = Round8PdfRenderer(font_dir)
+        data = render(r)
+        (rdir / name).write_bytes(data)
+        print(f"wrote {ROUND8_DIR}/{name} ({len(data):,} bytes)")
+        facts = {k: {kk: ([round(x, 2) for x in vv] if kk == "box" else vv) for kk, vv in f.items()}
+                 for k, f in r.facts.items()}
+        docs[key] = {"file": f"{ROUND8_DIR}/{name}", "title": _title_of(name),
+                     "pages": len(PdfReader(io.BytesIO(data)).pages), "sections": r.sections, "facts": facts}
+    manifest = {
+        "about": f"{SYNTHETIC_MARKER}. Known contents of the round-8 fixtures (the same figures under an approved and "
+                 "a proposed heading; a table whose total is on its second page); generated by "
+                 "scripts/generate_fixtures.py --only round8 from the generator's own layout (never read back from "
+                 "the files) - do not edit by hand. Every name, address, plan number, block, parcel and amount is "
+                 "invented.",
+        "synthetic_marker": SYNTHETIC_MARKER,
+        "documents": docs,
+    }
+    text_ = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+    (rdir / ROUND8_MANIFEST).write_text(text_, encoding="utf-8")
+    print(f"wrote {ROUND8_DIR}/{ROUND8_MANIFEST} ({len(text_):,} chars)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--font-dir", default=DEFAULT_FONT_DIR)
     parser.add_argument("--out", default="tests/fixtures")
-    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7"], default="all",
+    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8"], default="all",
                         help="regions: write only the uncovered-region fixtures (tests/fixtures/regions/); "
                              "positions: only the page-position fixtures (tests/fixtures/positions/); "
                              "citations: only the citation fixtures and their manifest (tests/fixtures/citations/); "
-                             "round7: only the round-7 fixtures and their manifest (tests/fixtures/round7/)")
+                             "round7: only the round-7 fixtures and their manifest (tests/fixtures/round7/); "
+                             "round8: only the round-8 fixtures and their manifest (tests/fixtures/round8/)")
     args = parser.parse_args()
     font_dir = Path(args.font_dir)
     out = Path(args.out)
@@ -5122,6 +5230,9 @@ def main() -> None:
         return
     if args.only == "round7":
         write_round7(out, font_dir)
+        return
+    if args.only == "round8":
+        write_round8(out, font_dir)
         return
 
     docs: dict[str, dict[str, Any]] = {}
@@ -5170,6 +5281,7 @@ def main() -> None:
     write_positions(out, font_dir)
     write_citations(out, font_dir)
     write_round7(out, font_dir)
+    write_round8(out, font_dir)
 
 
 if __name__ == "__main__":
