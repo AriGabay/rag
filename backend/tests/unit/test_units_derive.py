@@ -476,3 +476,19 @@ def test_the_first_fifty_pages_of_the_thousand_page_file_derive_five_units():
     assert [(u.page_first, u.page_last) for u in found] == [(e["first_page"], e["last_page"]) for e in entry["units"][:5]]
     assert [u.title for u in found] == [e["title"] for e in entry["units"][:5]]
     assert all(set(e["aliases"]) <= set(u.aliases) for u, e in zip(found, entry["units"], strict=False))
+
+
+def test_a_picture_letterhead_opening_every_unit_is_no_title_and_does_not_stop_the_derivation():
+    # found on a real office compendium: every report opens with the same read logo picture and no prominent line;
+    # the picture is the letterhead, so no picture is left to title the unit (the derivation stopped on it)
+    d = Doc()
+    for first, name in ((1, "פרויקט שדרות האלון"), (3, "מתחם גבעת הרקפות")):
+        d.page(first, 1)
+        d.add("image", first, "שמאות דמו בע״מ", 20.0, h=40.0, content_hash=f"{first}" * 64)
+        d.add("paragraph", first, name, 70.0, h=11.0)
+        d.chapters(first, CHAPTERS[:3])
+        d.page(first + 1, 2)
+        d.chapters(first + 1, CHAPTERS[3:], top=54.0)
+    found = d.derive()
+    assert found
+    assert all("שמאות דמו" not in (u.title or "") for u in found)

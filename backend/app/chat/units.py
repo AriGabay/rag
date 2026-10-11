@@ -461,8 +461,8 @@ def _identity(c: _Ctx, run: list, letterhead: set) -> tuple[str | None, list[str
     if sized:
         _, i = max(sized, key=lambda x: (x[0], -x[1]))
         title, title_ev = _text(lines[i]), {"rule": "prominent_title_line", "block": lines[i].block_index}
-    elif any(_picture_line(r) for r in pictures):
-        pic = next(r for r in pictures if _picture_line(r) and _norm(_picture_line(r)) not in letterhead)
+    elif (pic := next((r for r in pictures if _picture_line(r) and _norm(_picture_line(r)) not in letterhead),
+                      None)) is not None:
         title, title_ev = _picture_line(pic), {"rule": "image_title", "block": pic.block_index, "weak": True}
     elif c.body is None and lines and _title_shaped(_text(lines[0])) and "\n" not in _text(lines[0]):
         title, title_ev = _text(lines[0]), {"rule": "first_short_line", "block": lines[0].block_index}
@@ -658,6 +658,17 @@ def derive_version(conn: Connection, version_id: UUID | str, reading: Reading | 
     return derive(rows, pages, str(version_id), reading.furniture_images if reading else ())
 
 
+def _derived_or_whole(conn: Connection, version_id: UUID | str, reading: Reading) -> tuple[Unit, ...]:
+    """The version's derived units, or its one undetermined unit when the derivation fails (logged): the same
+    fallback everywhere units are built, so neither publication, a chat turn nor the count script stops on it."""
+    try:
+        with conn.begin_nested():
+            return derive_version(conn, version_id, reading)
+    except Exception:  # noqa: BLE001
+        logger.exception("units of version %s could not be derived", version_id)
+        return _whole_file(conn, version_id, "derivation_failed")
+
+
 def _unit_of(r) -> Unit:
     return Unit(r.unit_no, r.kind, r.title, tuple(r.aliases or ()), r.identifiers or {}, r.page_first, r.page_last,
                 r.block_first, r.block_last, r.certainty, r.evidence or {})
@@ -680,7 +691,7 @@ def read_or_derive(conn: Connection, version_id: UUID | str) -> tuple[Unit, ...]
     reading = reading_of(conn, version_id)
     if reading is None:
         return ()
-    return stored(conn, version_id, reading) or derive_version(conn, version_id, reading)
+    return stored(conn, version_id, reading) or _derived_or_whole(conn, version_id, reading)
 
 
 _INSERT = (
@@ -717,12 +728,7 @@ def replace(conn: Connection, version_id: UUID | str) -> tuple[Unit, ...]:
     if reading is None:
         return ()
     conn.execute(text("DELETE FROM document_units WHERE version_id = :v"), {"v": UUID(str(version_id))})
-    try:
-        with conn.begin_nested():
-            units = derive_version(conn, version_id, reading)
-    except Exception:  # noqa: BLE001
-        logger.exception("units of version %s could not be derived", version_id)
-        units = _whole_file(conn, version_id, "derivation_failed")
+    units = _derived_or_whole(conn, version_id, reading)
     _insert(conn, version_id, reading, units)
     return units
 
@@ -770,7 +776,7 @@ def ensure(conn: Connection, version_id: UUID | str) -> tuple[Unit, ...]:
         with _GUARD:
             units = _MEMO.get(memo_key)
         if units is None:
-            units = derive_version(conn, version_id, reading)
+            units = _derived_or_whole(conn, version_id, reading)
             with _GUARD:
                 _MEMO[memo_key] = units
                 while len(_MEMO) > _MEMO_MAX:
