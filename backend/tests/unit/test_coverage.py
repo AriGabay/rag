@@ -372,7 +372,7 @@ def test_a_failed_calculation_is_stated_as_not_completed_never_as_not_found():
     # the completeness line names the gap and its status; the reason is said once, in the answer
     assert r.counts()["completeness"]["missing"] == [{
         "id": "N2", "text": "היחס לסף", "status": "not_answered", "reason": "calculation_incomplete", "parent": "",
-        "conditional": False}]
+        "conditional": False, "missing_part": ""}]
 
 
 def test_found_inputs_of_a_calculation_never_computed_say_the_calculation_was_not_completed():
@@ -932,3 +932,90 @@ def test_a_conditional_component_with_no_value_in_the_read_source_forces_nothing
     assert [(m["id"], m["conditional"]) for m in missing] == [("N2", True)]
     assert "1,200" in final.answer_markdown and "תאריך האישור" in final.answer_markdown  # stated, never invented
     assert not re.search(r"\d{1,2}\.\d{1,2}\.\d{2,4}", final.answer_markdown)
+
+
+# --- a partly given component names the part that is missing (round 8 R20, R21, AE7) ---------------------------------
+
+SERVICE_QUESTION = "מהם שטחי השירות של תא שטח 1 ושל תא שטח 2?"
+PLOT2_SERVICE = "שטחי השירות בתא שטח 2 הם 300 מ״ר [S1]."
+PLOT1_SERVICE = "שטחי השירות בתא שטח 1"
+
+
+def _partial_turn(component_text: str = "שטחי שירות", *, conditional: bool = False) -> TurnRequirements:
+    return _turn({"id": "1", "text": component_text, "conditional": conditional})
+
+
+def _partial_score(missing: str, *, absent=(), related=("H1",)):
+    """The judge scores every component ``partial`` (given by unit 0) and names ``missing`` as the part not given."""
+    def score(frozen, units):
+        return [_req("", "partial", [0], related, i, absent=absent) | {"missing": missing} for i, _ in frozen]
+    return score
+
+
+def _partial_case(missing: str, answer: str = PLOT2_SERVICE, *, turn: TurnRequirements | None = None, absent=()):
+    ws = _ws("תא שטח 2: שטחי השירות הם 300 מ״ר.")
+    ws.searches.append("שטחי שירות")
+    turn = turn or _partial_turn()
+    a = _answer(answer)
+    r = verify_answer(_judge(_partial_score(missing, absent=absent)), a, ws, SERVICE_QUESTION, [], requirements=turn)
+    final, outcomes = _finish(ws, a, r, turn)
+    return ws, a, r, final, outcomes
+
+
+def test_ae7_a_partial_component_with_a_missing_part_gets_one_gap_line_naming_it_with_its_reason():
+    _, a, r, final, outcomes = _partial_case(PLOT1_SERVICE)
+    (o,) = outcomes
+    assert o["status"] == "partial" and o["missing_part"] == PLOT1_SERVICE and o["stated"] is True
+    assert o["limitation"] == "not_located"
+    lines = _gap(final, a).split("\n")
+    assert lines == [f"**{PLOT1_SERVICE}** לא נמצא בחיפוש במסמכים שנבדקו."], lines  # the part and its reason, once
+    assert [g["texts"] for g in r.gaps] == [[PLOT1_SERVICE]]
+    missing = r.completeness["missing"]
+    assert [(m["id"], m["status"], m["missing_part"]) for m in missing] == [("N1", "partial", PLOT1_SERVICE)]
+    assert r.completeness["status"] == "partial" and final.status == "partial"
+    assert [c["missing_part"] for c in coverage.public_components(outcomes)] == [PLOT1_SERVICE]
+
+
+def test_a_missing_part_with_a_word_neither_the_request_nor_the_component_holds_is_dropped():
+    _, a, r, final, outcomes = _partial_case("שטחי השירות והמרפסות בתא שטח 3")
+    (o,) = outcomes
+    assert o["status"] == "partial" and o["missing_part"] == "" and o["stated"] is False  # today's behaviour
+    assert _gap(final, a) == "" and r.gaps == []
+    assert [m["missing_part"] for m in r.completeness["missing"]] == [""]  # the component is still listed in completeness
+
+
+def test_a_conditional_partial_component_states_no_missing_part():
+    _, a, r, final, outcomes = _partial_case(PLOT1_SERVICE, turn=_partial_turn(conditional=True))
+    (o,) = outcomes
+    assert o["status"] == "partial" and o["stated"] is False and o["missing_part"] == ""
+    assert _gap(final, a) == "" and r.gaps == []
+
+
+def test_a_model_sentence_stating_the_missing_part_absent_is_replaced_by_the_one_gap_line():
+    answer = PLOT2_SERVICE + "\n" + "שטחי השירות בתא שטח 1 לא נמצאו."
+    _, a, r, final, outcomes = _partial_case(PLOT1_SERVICE, answer, absent=[1])
+    line = f"**{PLOT1_SERVICE}** לא נמצא בחיפוש במסמכים שנבדקו."
+    assert final.answer_markdown.count(PLOT1_SERVICE) == 1, final.answer_markdown  # one owner of the gap
+    assert final.answer_markdown.split("\n\n")[-1] == line and "לא נמצאו" not in final.answer_markdown
+    assert PLOT2_SERVICE in final.answer_markdown and outcomes[0]["status"] == "partial"
+
+
+def test_the_missing_part_is_validated_word_by_word_against_the_component_and_the_request():
+    ok = verify.valid_missing
+    request = SERVICE_QUESTION
+    assert ok(PLOT1_SERVICE, "partial", "שטחי שירות", request) == PLOT1_SERVICE  # prefixes ה ב are ignored
+    assert ok("  שטחי   השירות\nבתא שטח 1 ", "partial", "שטחי שירות", request) == PLOT1_SERVICE
+    assert ok("שטחי שירות של תא שטח 2", "partial", "שטחי שירות", request) == "שטחי שירות של תא שטח 2"  # stop word
+    assert ok("שטחי שירות בתא שטח 3", "partial", "שטחי שירות", request) == ""  # 3 was never asked for
+    assert ok("הארנונה", "partial", "שטחי שירות", request) == ""  # a word of neither text
+    assert ok(PLOT1_SERVICE, "full", "שטחי שירות", request) == ""  # only a partial requirement has a missing part
+    assert ok("", "partial", "שטחי שירות", request) == ""
+    assert ok("של את", "partial", "שטחי שירות", request) == ""  # stop words only: nothing is named
+    assert ok(PLOT1_SERVICE + " " + "x" * 200, "partial", "שטחי שירות", request) == ""  # not a short noun phrase
+
+
+def test_the_judge_policy_and_schema_carry_the_missing_part():
+    assert "missing" in verify.JudgeRequirement.model_fields
+    assert verify.JudgeRequirement(status="partial").missing == ""
+    assert "missing" in verify.JUDGE_REQUIREMENTS_POLICY and "partial" in verify.JUDGE_REQUIREMENTS_POLICY
+    assert "missing_part" in coverage.PUBLIC_FIELDS

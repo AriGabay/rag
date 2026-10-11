@@ -529,8 +529,10 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
     with its S#), ``document``/``document_id``/``document_title``, ``searched`` (a search or reading the judge tied
     to it covered it), ``claimed`` (the model's own claim, before validation), ``detail`` (the parameters missing, the
     first unit without a citation); ``gap`` (its sentence alone) and ``stated`` — whether the server states it in the
-    gap paragraph (a leaf not answered or needing clarification, and an instruction not met; a partly given leaf is
-    listed in completeness only)."""
+    gap paragraph (a leaf not answered or needing clarification, and an instruction not met; a partly given leaf only
+    for its ``missing_part`` — the part the judge named as not given, validated against the request: its line names
+    that part with the component's reason (R20), the status staying partial, and a conditional requirement is never
+    stated (R21); a partly given leaf with none is listed in completeness only)."""
     opened = _openings(ws)  # the turn's openings, for every claim and component
     claims, _ = _claims_by_component(ws, requested, opened)
     outcomes = report.requirement_outcomes(applied)
@@ -547,9 +549,19 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
               "detail": why.get("detail") or "", "variant": why.get("variant") or ""}
         if o["document_id"]:
             o["document_title"] = (ws.activity.get(o["document_id"]) or {}).get("title")
-        o["stated"] = o["status"] != "partial" or o["kind"] == "instruction"
-        o["gap"] = gap_sentence(why["reason"], o["variant"], [o["text"]], o["place"], o["document"], o["detail"])
+        # a partly given leaf is stated only for the part the judge named missing (validated against the request,
+        # ``verify.valid_missing``): a conditional requirement (R21) or one that is no datum of the documents never is
+        if o["status"] != "partial" or o["conditional"] or o["kind"] not in ("information", "calculation"):
+            o["missing_part"] = ""
+        o["stated"] = o["status"] != "partial" or o["kind"] == "instruction" or bool(o["missing_part"])
+        o["gap"] = gap_sentence(why["reason"], o["variant"], [gap_text(o)], o["place"], o["document"], o["detail"])
     return outcomes
+
+
+def gap_text(o: dict) -> str:
+    """What a component's gap line names: the part of a partly given component the answer does not give (R20), else
+    the component."""
+    return (o.get("missing_part") if o.get("status") == "partial" else "") or o["text"]
 
 
 def gap_groups(items: list[dict]) -> list[dict]:
@@ -565,7 +577,7 @@ def gap_groups(items: list[dict]) -> list[dict]:
     out: list[dict] = []
     for key in sorted(groups, key=lambda k: _ORDER.index(k[0])):
         members = groups[key]
-        texts = list(dict.fromkeys(m["text"] for m in members))
+        texts = list(dict.fromkeys(gap_text(m) for m in members))
         line = gap_sentence(key[0], key[1], texts, members[0].get("place"), key[4], key[5])
         if any(g["text"] == line for g in out):
             continue
@@ -576,7 +588,7 @@ def gap_groups(items: list[dict]) -> list[dict]:
 
 # what the payload keeps of each component (the UI's per-component detail)
 PUBLIC_FIELDS = ("id", "text", "kind", "aspect", "parent", "conditional", "subject", "status", "evidence_state",
-                 "limitation", "limitation_text", "stated", "gap", "units", "removed_units", "removal_kinds",
+                 "limitation", "limitation_text", "stated", "gap", "missing_part", "units", "removed_units", "removal_kinds",
                  "absence_units",
                  "related", "place", "document", "document_id", "document_title", "searched", "claimed", "detail",
                  "uncited", "check", "pending_parameters")
@@ -673,7 +685,8 @@ def completeness(outcomes: list[dict]) -> dict | None:
         status = "missing"
     return {"status": status, "requirements": len(leaves),
             "missing": [{"id": o["id"], "text": o["text"], "status": o["status"], "reason": o["limitation"],
-                         "parent": o.get("parent") or "", "conditional": bool(o.get("conditional"))}
+                         "parent": o.get("parent") or "", "conditional": bool(o.get("conditional")),
+                         "missing_part": o.get("missing_part") or ""}
                         for o in leaves if o["status"] != "full"]}
 
 

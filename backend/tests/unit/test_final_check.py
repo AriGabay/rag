@@ -608,3 +608,57 @@ def test_the_focus_names_only_documents_the_surviving_text_cites(offline):
     step = lambda items: final(only_removed, focus=focus() | {"document_ids": [docs["S2"]]})  # noqa: E731
     again = _turn(ScriptedAgent([SEARCH, step, step, step], judge=Judge(rule)), "מה דמי השכירות?")
     assert again.answer.focus is None  # nothing it rested on survived
+
+
+# --- a partly given component names its missing part (round 8 R20, AE7): the line is a server span of the fixed point ----
+
+class PartialJudge(Judge):
+    """Scores the one component ``partial``, given by the units that hold ``keyword``, and names ``missing`` as the part
+    of it the answer does not give (the judge's own word, validated by the server against the request)."""
+
+    def __init__(self, rule, keyword: str, missing: str):
+        super().__init__(rule)
+        self.keyword, self.missing = keyword, missing
+
+    def __call__(self, input: str):
+        out = super().__call__(input)
+        if isinstance(out, dict) and "<requirements>" in input:
+            units = [i for i, t in _units(input).items() if self.keyword in t]
+            out["requirements"] = [{"id": r["id"], "text": "", "calculation": False, "status": "partial",
+                                    "units": units, "related": [], "reason": "בדיקה", "missing": self.missing}
+                                   for r in out["requirements"]]
+        return out
+
+
+SERVICE_Q = "מהם שטחי השירות של תא שטח 1 ושל תא שטח 2?"
+SERVICE_PART = "שטחי השירות בתא שטח 1"
+SERVICE_2 = "שטחי השירות בתא שטח 2 הם 300 מ״ר"
+
+
+def test_a_missing_part_of_a_partial_component_is_one_gap_line_that_is_a_fixed_point_of_the_final_state(offline):
+    offline.texts = [f"תא שטח 2: {SERVICE_2.split(' בתא')[0]} הם 300 מ״ר. {SOURCE}"]
+    judge = PartialJudge(lambda text, input, n: "supported", "300", SERVICE_PART)
+    out = _turn(ScriptedAgent([SEARCH, final(f"{SERVICE_2} [S1].")], judge=judge,
+                              request=[component("שטחי שירות")]), SERVICE_Q)
+    md = out.answer.answer_markdown
+    (o,) = out.ledger["requirements"]
+    assert (o["status"], o["missing_part"], o["stated"]) == ("partial", SERVICE_PART, True)
+    gap = [md[s.start:s.end].strip() for s in out.server_spans if s.kind == "gap_paragraph"]
+    assert len(gap) == 1 and gap[0].count(SERVICE_PART) == 1 and gap[0].startswith(f"**{SERVICE_PART}**"), gap
+    assert md.count(SERVICE_PART) == 1 and out.answer.status == "partial"
+    assert out.final_check["judge_calls"] == 0 and out.final_digest == text_digest(md)  # server text: no judge call
+    assert out.report.completeness["missing"][0]["missing_part"] == SERVICE_PART
+
+
+def test_the_missing_part_survives_the_final_checks_vote_replacement(offline):
+    """A cut of a unit that voted for the component: the votes are replaced by the final call's scores, the missing part
+    is validated again and the gap line follows from the new vote."""
+    judge = PartialJudge(_mixed_rule, "1,200", "השטח העיקרי בתא שטח 2")
+    out = _turn(ScriptedAgent([SEARCH, final(f"{MIXED}")], judge=judge, request=[component("השטח העיקרי")]),
+                "מהו השטח העיקרי בתא שטח 1 ובתא שטח 2?")
+    assert "<requirements>" in judge.inputs[-1] and out.final_check["judge_calls"] == 1
+    md = out.answer.answer_markdown
+    (o,) = out.ledger["requirements"]
+    assert (o["status"], o["missing_part"]) == ("partial", "השטח העיקרי בתא שטח 2")
+    gap = next(md[s.start:s.end] for s in out.server_spans if s.kind == "gap_paragraph")
+    assert "השטח העיקרי בתא שטח 2" in gap and out.final_digest == text_digest(md)

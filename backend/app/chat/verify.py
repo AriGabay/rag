@@ -225,7 +225,7 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # The judge contract's version (round 8 KTD7): part of every verdict key, bumped whenever the policy, the schema or what
 # a call renders changes what a verdict means, so a verdict of an older contract is never reused (cached readings are
 # versioned).
-JUDGE_VERSION = 4
+JUDGE_VERSION = 5
 # an uncited factual unit is judged against the sources the turn already read (round 8 KTD3, R2): the sources of the
 # turn whose text holds its numbers or content words are shown beside it as candidates, bounded so the call stays
 # within ``JUDGE_CALL_CHARS``. How many candidates a unit gets, how many characters one candidate may show, and how
@@ -375,7 +375,7 @@ JUDGE_REQUIREMENTS_POLICY = (
     "חישוב או כלי שנכשלו בדרך אליה, והחיפושים והקריאות שחיפשו אותה. יחידה שאומרת שנתון לא נמצא, כש-<workspace> "
     "מחזיק ערך, נתון או חישוב שלו — unsupported. יחידה מ-<removed_units> שנתנה דרישה — ציין אותה ב-units של "
     "הדרישה כרגיל (השרת יודע שהוסרה). claims: כשרק טענה אחת מתוך יחידה נותנת את הדרישה (ליחידה כמה טענות), ציין ב-claims "
-    "את ה-span של הטענה הנותנת אותה, כפי שהוא כתוב ביחידה; אחרת claims ריק והיחידה כולה נותנת אותה."
+    "את ה-span של הטענה הנותנת אותה, כפי שהוא כתוב ביחידה; אחרת claims ריק והיחידה כולה נותנת אותה. missing: בדרישה עם status partial — החלק שהתשובה אינה נותנת ממנה, כביטוי שמני קצר במילות הבקשה עצמה (למשל «שטחי השירות בתא שטח 1» כשדרישה אחת מכסה כמה פריטים והתשובה נתנה אחד מהם בלבד); בכל status אחר — ריק. לעולם אל תנקוב בחלק שהבקשה לא ביקשה, ואל תמציא מילים שאינן בבקשה."
 )
 # the judge's scores of a requirement in one call
 REQUIREMENT_STATUSES = ("full", "partial", "missing", "undeterminable")
@@ -599,12 +599,75 @@ class JudgeRequirement(_Strict):
     # component then stands or falls with those claims, not with the unit. Empty: the units give it whole.
     claims: list[str] = Field(default_factory=list)
     reason: str = ""
+    # for a ``partial`` requirement: the part of it the answer does not give, in the request's own words (a short noun
+    # phrase, "שטחי השירות בתא שטח 1"); empty otherwise. The server keeps it only when every content word of it is in
+    # the component's text or the user's request (``valid_missing``): it never invents a part (round 8 R20, R21).
+    missing: str = ""
 
 
 class JudgeCoverageOutput(JudgeOutput):
     """The judge's output when the turn's requirements are derived or scored: the verdicts, and each requirement."""
 
     requirements: list[JudgeRequirement] = Field(default_factory=list)
+
+
+MISSING_PART_CHARS = 100  # a missing part is a short noun phrase
+_MISSING_TOKEN = re.compile(r"[א-ת]+(?:[\"'״׳][א-ת]+)*|[A-Za-z]+|\d+(?:[.,]\d+)*")
+_MISSING_STOP = frozenset("של את עם על אל או גם כל מן כי לא זה זו זאת אשר הוא היא הם הן יש אין אם וגם בין לפי כפי the of "
+                          "and or in on for to a an".split())
+_MISSING_PREFIXES = "הבלומשכ"
+
+
+def _missing_forms(word: str) -> set[str]:
+    """A word's comparable forms: itself, without up to two prefix letters (ה ב ל ו מ ש כ), and without a plural or
+    construct ending (ים ות י) — so "בתא" and "תא", "השירות" and "שירות", "שטחי" and "שטח" meet."""
+    word = word.replace('"', "").replace("'", "").replace("״", "").replace("׳", "").casefold()
+    forms = {word}
+    if not word or not re.fullmatch(r"[א-ת]+", word):
+        return forms
+    for _ in range(2):
+        for w in list(forms):
+            if len(w) > 2 and w[0] in _MISSING_PREFIXES:
+                forms.add(w[1:])
+    for w in list(forms):
+        for end in ("ים", "ות", "י"):
+            if len(w) > len(end) + 2 and w.endswith(end):
+                forms.add(w[:-len(end)])
+    return forms
+
+
+def _missing_words(text: str) -> list[str]:
+    """The content words of a text: Hebrew and latin words and numbers, without the stop words."""
+    return [t for t in _MISSING_TOKEN.findall(text or "") if t.casefold() not in _MISSING_STOP]
+
+
+def valid_missing(missing: str, status: str, component: str, request: str) -> str:
+    """The part of a ``partial`` requirement the judge says the answer does not give (``JudgeRequirement.missing``) when
+    it names nothing the request did not ask for, else "" (round 8 R20, R21): every content word of it — a Hebrew or
+    latin word, or a number, prefixes and stop words ignored — is a word of the component's text or of the user's
+    request, and it is a short noun phrase. The server never writes a part the request does not hold."""
+    part = " ".join((missing or "").split())
+    if status != "partial" or not part or len(part) > MISSING_PART_CHARS:
+        return ""
+    words = _missing_words(part)
+    if not words:
+        return ""
+    known = [_missing_forms(w) for w in _missing_words(f"{component}\n{request}")]
+    for w in words:
+        if not any(_missing_forms(w) & k for k in known):
+            return ""
+    return part
+
+
+def _common_missing(votes: list[JudgeRequirement]) -> str:
+    """The missing part (already validated, ``valid_missing``) that every partial vote of a component names, in the
+    first vote's wording: the calls' units differ, so a part one call names and another does not (or names
+    differently) is not known to be missing."""
+    def key(v: JudgeRequirement) -> frozenset[str]:
+        return frozenset(min(_missing_forms(w), key=len) for w in _missing_words(v.missing))
+
+    keys = [key(v) for v in votes]
+    return votes[0].missing if votes and keys[0] and all(k == keys[0] for k in keys) else ""
 
 
 def requirement_item(id: str, text: str, kind: str = "information", parent: str = "", conditional: bool = False,
@@ -1286,7 +1349,7 @@ class VerifyReport:
                                          | {i for v in absent for i in v.units}),
                  "related": list(dict.fromkeys(x for v in votes for x in v.related)),
                  "evidence_state": "undeterminable" if any(v.status == "undeterminable" for v in votes) else None,
-                 "stated": False}
+                 "missing_part": "", "stated": False}
             if kind == "instruction" and o["aspect"] == "citation":
                 o |= {"check": "citation", "uncited": uncited, "status": "not_answered" if uncited else "full",
                       "reason": ""}
@@ -1299,6 +1362,8 @@ class VerifyReport:
                 best = min(given, key=lambda v: _RANK[v.status])
                 o |= {"status": best.status, "reason": best.reason,
                       "units": sorted({i for v in given if v.status == best.status for i in live[id(v)]})}
+                if best.status == "partial":
+                    o["missing_part"] = _common_missing([v for v in given if v.status == "partial"])
                 if (kind == "calculation" and best.status == "full" and not self.pending_parameters.get(r["id"])
                         and not self._computes({i for v in given for i in live[id(v)]})):
                     # explained, or said not to be computed, but no surviving unit shows a computation of the turn: at
@@ -2948,11 +3013,12 @@ class _Coverage:
         marked absent) are kept only when they are the call's units, related ids only when the workspace lists them."""
         if not self.turn.derived:
             scored = [r.model_copy(update={"id": item["id"]}) for r, item in self.turn.freeze(scored)]
-        ids = {r["id"] for r in self.turn.items}
+        texts = {r["id"]: r["text"] for r in self.turn.items}
         return [r.model_copy(update={"units": [i for i in r.units if i in indexes],
                                      "absent": [i for i in r.absent if i in indexes],
-                                     "related": [x for x in dict.fromkeys(r.related) if x in self.known]})
-                for r in scored if r.id in ids]
+                                     "related": [x for x in dict.fromkeys(r.related) if x in self.known],
+                                     "missing": valid_missing(r.missing, r.status, texts[r.id], self.request)})
+                for r in scored if r.id in texts]
 
 
 def _requirement_attrs(r: dict) -> str:
