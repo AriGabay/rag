@@ -537,6 +537,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     ws.requirements = turn  # the tools read what the request asks about and compares (round 7 U6, KTD7)
     # the turn's verdicts: a repair round judges only what changed (KTD10)
     verdicts = VerdictCache()
+    rereader = T.ContextReader(ws)  # a claim the judge lacked context for is read again once (round 8 U5)
     reused = 0
     checked = None  # the last verified answer with its report, kept when a repair round cannot finish
     repaired: set[str] = set()  # the units a repair prompt named (``verify.repair_key``)
@@ -728,7 +729,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                                    mismatch=resolve.mismatch(request, answer.focus),
                                    request=request.standalone_question if request is not None else None,
                                    requirements=turn if answer.status != "clarification" else None,
-                                   cache=verdicts)
+                                   cache=verdicts, reread=rereader)
         except VerificationUnavailable as exc:
             # the answer could not be checked against its sources: a failure with retry, never an unchecked answer
             if checked is not None:

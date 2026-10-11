@@ -169,10 +169,11 @@ import dataclasses
 import functools
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Literal, NamedTuple, get_args
+from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -183,12 +184,14 @@ from app.chat import meaning
 from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited
 from app.chat.evidence import select
 from app.chat.request import ID_PREFIX, Aspect, Kind
+from app.config import get_settings
 from app.measurements.extract import stance_label
 from app.providers.llm import (
     CallStatus,
     LLMProvider,
     Purpose,
     call_structured,
+    deadline_left,
     for_purpose,
     prompt_attr,
     prompt_text,
@@ -198,6 +201,8 @@ from app.providers.llm import (
 if TYPE_CHECKING:
     from app.chat.engine import FinalAnswer
     from app.chat.tools import Workspace
+
+logger = logging.getLogger(__name__)
 
 _IDS = re.compile(r"\[((?:[SMCPVA]\d+)(?:\s*[,،;]\s*[SMCPVA]\d+)*)\]")
 _ID = re.compile(r"[SMCPVA]\d+")
@@ -328,6 +333,20 @@ JUDGE_POLICY = (
     "(21) <unstated unit=\"N\">…</unstated> לפני יחידה מונה מספרים שהשרת בדק ומצא שאינם מופיעים באף מקור שהיחידה "
     "מצטטת. טענה שמכילה מספר כזה היא unsupported (failure absent_from_source) אלא אם מקור מוצג מציין אותו; החזר "
     "claims כך שהטענה עם המספר הזה היא span משלה, והטענות האחרות של היחידה נשפטות בנפרד."
+)
+
+
+# the second reading of claims that needed context (round 8 U5, KTD5): appended to the policy of the re-read call only
+JUDGE_REREAD_POLICY = (
+    "\nזו בדיקה חוזרת של טענות שבקריאה הקודמת אי אפשר היה להכריע בהן בלי הקשר (needs_context). השרת קרא את ההקשר "
+    "החסר מאותו מסמך שמור והוסיף אותו למקור המצוטט: <expanded_context kind=\"...\"> בתוך <source> הוא חלק מהמקור "
+    "הזה (כותרות, פסקאות סמוכות, המשך הסעיף, כותרות והערות של הטבלה, הערות שוליים, המשך הטבלה בעמוד הבא או הקריאה "
+    "השמורה של האזור), ו-<reread unit=\"N\" needs=\"...\" source=\"S#\"> לפני יחידה מציין איזו טענה (span) נבדקת "
+    "מחדש ואיזה הקשר חסר היה לה. שפוט את היחידה לפי המקור כולו, ההרחבה בכלל, ותן לכל טענה verdict סופי: supported, "
+    "partial, unsupported או contradicts. needs_context של טענה שנבדקה מחדש הוא none: אל תבקש הקשר נוסף. ההרחבה "
+    "היא ראיה רק במה שהיא אומרת בפועל (יחידות, כותרת, עמוד המשך, קריאת האזור); אל תשלים ממנה או מידע כללי מה שאינו "
+    "כתוב. אם גם עם ההרחבה אין תימוכין — unsupported, ולא contradicts אלא אם ההרחבה או המקור אומרים אחרת. כל "
+    "שאר הכללים בעינם."
 )
 
 
@@ -494,6 +513,34 @@ ClaimKind = Literal["datum", "computed", "inference", "absence", "instruction"]
 ClaimVerdict = Literal["supported", "partial", "unsupported", "contradicts"]
 # why a verdict's claims were replaced by its one whole-unit claim (``unit_claims``)
 CLAIM_FALLBACKS = ("span_not_in_unit", "empty_span")
+
+# the bounded re-read (round 8 U5, KTD5, R13-R15)
+REREAD_KINDS = tuple(k for k in get_args(NeedsContext) if k != "none")
+REREAD_TABLE_KINDS = ("table_headers", "units_note", "next_page", "region")  # contexts of a table or a picture
+REREAD_MIN_SECONDS = 10  # a re-read (an expansion and a judge call) does not start with less of the allowance left
+READ_IN_PART = "המקור נקרא בחלקו"  # R14: a claim whose source the bound kept the turn from reading further
+REREAD_OUTCOMES = ("supported", "partial", "unsupported", "contradicts", "check_failed", "no_context", "no_time",
+                   "bound", "found", "not_found")
+UNSTATED_EXPANSIONS = ("next_page", "continuation")  # where a number no cited passage states is looked for next
+
+
+@dataclass(frozen=True)
+class Expansion:
+    """A source's context as the fetcher read it: ``text`` (what the judge is shown, as part of the source) and a short
+    ``scope`` saying what it is, for the log."""
+
+    text: str
+    scope: str = ""
+
+
+class ContextFetcher(Protocol):
+    """Reads the context a claim needed and the judge was not shown (KTD5). ``expand`` takes the cited source's id and
+    the kind of context (``NeedsContext``) and returns it, or None when there is nothing more to read; a failure may
+    raise. It reads stored text only, never a new model reading, and only what the user may see. A fetcher may also
+    have ``adopt(sid, kind) -> str | None``: register the expansion it returned as a turn source (the new id), which
+    the verification calls for a claim the expansion made supported, so a citation can point to it."""
+
+    def expand(self, sid: str, kind: str) -> Expansion | str | None: ...
 
 
 class JudgeClaim(_Strict):
@@ -2405,13 +2452,14 @@ def _unknown_ids(u: Unit, ws: Workspace) -> list[str]:
 
 
 def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: set[str],
-              strict: bool = False, stated_by: dict[str, set[str]] | None = None) -> list[str]:
+              strict: bool = False, stated_by: dict[str, set[str]] | None = None, extra_text: str = "") -> list[str]:
     """The numbers of a unit that nothing it cites states (for a unit that cites nothing, nothing of the turn —
     unless ``strict``, which holds it to its citations too), that the question does not give and that show no
     result of a calculation it cites (any of the turn's, for a unit citing nothing, unless ``strict``) — and the
     numbers that write a scaled value or result of what it cites with a scale word that is not its scale
-    (``_wrong_scale``). ``stated_by``: the numbers each cited id states, kept across one verification's units."""
-    cited: set[str] = set()
+    (``_wrong_scale``). ``stated_by``: the numbers each cited id states, kept across one verification's units.
+    ``extra_text``: more text of a cited source (the context a re-read expanded it with), whose numbers it states too."""
+    cited: set[str] = set(numbers_in(extra_text, words=True)) if extra_text else set()
     for i, t in _texts(ws, u.ids):
         found = stated_by.get(i) if stated_by is not None else None
         if found is None:
@@ -2744,6 +2792,10 @@ class _Batch:
     removed: list[Unit] = field(default_factory=list)
     # unit index -> the turn's sources shown beside an uncited unit (``_candidate_ids``); filled on first use
     candidates: dict[int, list[str]] | None = None
+    # a re-read call (U5): the context read for a source (id -> [(kind, text)]), shown inside it, and for a unit the
+    # claims re-read (index -> [(span, kind, source id)])
+    expanded: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
+    rereads: dict[int, list[tuple[str, str, str]]] = field(default_factory=dict)
 
 
 _WORD = re.compile(r"[א-תA-Za-z]{3,}")
@@ -2909,6 +2961,12 @@ def _unstated_note(u: Unit) -> str:
     return f'<unstated unit="{u.index}">{prompt_text(", ".join(u.unstated))}</unstated>\n'
 
 
+def _reread_note(batch: _Batch, u: Unit) -> str:
+    """For a unit of a re-read call: the claims being read again and the context each lacked (beside the unit)."""
+    return "".join(f'<reread unit="{u.index}" needs="{prompt_attr(kind)}" source="{prompt_attr(sid)}">'
+                   f"{prompt_text(span)}</reread>\n" for span, kind, sid in batch.rereads.get(u.index, []))
+
+
 def _unit_text(u: Unit) -> str:
     """A unit's text for the judge, with its registered server spans marked ``<server>…</server>``: in place when the
     text holds the span, otherwise (an inserted citation) on a line after the text. The rest is escaped as any
@@ -2941,8 +2999,10 @@ def _render_batch(batch: _Batch, ws: Workspace, coverage: _Coverage | None = Non
             continue
         head, body, kind = parts
         text_, excerpt = select(claims, body, kind, narrow=batch.narrow)
+        more = "".join(f'\n<expanded_context kind="{prompt_attr(k)}">\n{prompt_text(t)}\n</expanded_context>'
+                       for k, t in batch.expanded.get(sid, []))
         blocks.append(f'<source id="{sid}" excerpt="{"true" if excerpt else "false"}" title="{prompt_attr(head)}">\n'
-                      f"{prompt_text(text_)}\n</source>")
+                      f"{prompt_text(text_)}{more}\n</source>")
     # an uncited unit also sees the turn's sources that hold its numbers or words (R2, KTD3): the judge decides
     wanted: dict[str, list[str]] = {}
     for u in batch.units:
@@ -2952,7 +3012,8 @@ def _render_batch(batch: _Batch, ws: Workspace, coverage: _Coverage | None = Non
     blocks += [b for sid, texts in wanted.items() if (b := _candidate_block(sid, texts, ws, batch.narrow))]
     # before a unit: the headings above it and its table row's header (R7); after a unit showing a result of a
     # conditional calculation: the qualifier the server writes next to it
-    units = [_unit_context(u) + _unstated_note(u) + f'<unit index="{u.index}" cites="{prompt_attr(",".join(u.ids))}">\n'
+    units = [_unit_context(u) + _unstated_note(u) + _reread_note(batch, u)
+             + f'<unit index="{u.index}" cites="{prompt_attr(",".join(u.ids))}">\n'
              f'{_unit_text(u)}\n</unit>'
              + "".join(f'\n<server_qualifier unit="{u.index}">({prompt_text(note)})</server_qualifier>'
                        for _, _, note in conditional_notes(u, ws))
@@ -2992,15 +3053,18 @@ def _pack(units: list[Unit], ws: Workspace) -> list[_Batch]:
 
 
 def judge(provider: LLMProvider, batch: _Batch, rendered: str, usage: list[dict], deadline: float | None = None,
-          coverage: _Coverage | None = None) -> tuple[dict[int, JudgeVerdict], str, list[JudgeRequirement]]:
+          coverage: _Coverage | None = None, *, policy: str = "", label: str = "verify"
+          ) -> tuple[dict[int, JudgeVerdict], str, list[JudgeRequirement]]:
     """One judge call on a rendered batch: the verdicts of the batch's units, the call's status, and — when the
     turn's requirements are in play — each requirement's score by the batch's units
-    (when the turn has no frozen requirements, its first call derives them and freezes them)."""
+    (when the turn has no frozen requirements, its first call derives them and freezes them). ``policy``: more rules
+    for this call (the re-read's); ``label``: the call's usage purpose (it is a ``verify`` call to the provider)."""
     provider = for_purpose(provider, Purpose.VERIFY)
-    r = call_structured(provider, Purpose.VERIFY, JUDGE_POLICY + (JUDGE_REQUIREMENTS_POLICY if coverage else ""),
+    r = call_structured(provider, Purpose.VERIFY,
+                        JUDGE_POLICY + (JUDGE_REQUIREMENTS_POLICY if coverage else "") + policy,
                         rendered, JudgeCoverageOutput if coverage else JudgeOutput, deadline=deadline,
                         max_output_tokens=6000)
-    usage.append(usage_entry("verify", r, provider.model))
+    usage.append(usage_entry(label, r, provider.model))
     if r.status != CallStatus.OK:
         return {}, r.status.value, []
     wanted = {u.index for u in batch.units}
@@ -3104,17 +3168,222 @@ def _judge_all(provider: LLMProvider, units: list[Unit], ws: Workspace, usage: l
     return verdicts, scores, unchecked
 
 
+def _read_in_part(recs: list[ClaimRecord]) -> str:
+    """"; the source was read in part" for claims the bound kept from a re-read (R14): their verdict stands as it was,
+    and says why more was not read."""
+    return f" ({READ_IN_PART})" if any(x.get("outcome") == "bound" for r in recs for x in r.rereads) else ""
+
+
+def _reread_source(u: Unit, kind: str, ws: Workspace) -> str | None:
+    """The cited source a claim's missing context is read from: the unit's first readable one (a passage, a table, a
+    visual reading, or the source a verified value was taken from); for the contexts of a table or a picture, the
+    first of them that is one."""
+    readable: list[str] = []
+    for i in u.ids:
+        if i in ws.values:
+            i = ws.values[i].source_id
+        s = ws.sources.get(i)
+        if s is not None and s.document_id is not None and s.version_id is not None and i not in readable:
+            readable.append(i)
+    if kind in REREAD_TABLE_KINDS:
+        for i in readable:
+            s = ws.sources[i]
+            if s.kind in ("table", "table_row", "image") or s.table_index is not None or s.vision:
+                return i
+    return readable[0] if readable else None
+
+
+def _log_reread(ws: Workspace, claim_id: str, **entry) -> None:
+    log = ws.reread_log.setdefault(claim_id, [])
+    if entry not in log:
+        log.append(entry)
+
+
+def _reread_time_left(deadline: float | None) -> bool:
+    left = deadline_left(deadline)
+    return left is None or left >= REREAD_MIN_SECONDS
+
+
+def _expand_unstated(report: VerifyReport, units: list[Unit], meanings: dict, ws: Workspace, question: str,
+                     deadline: float | None, fetcher: ContextFetcher, meaning_fetcher: meaning.Fetcher
+                     ) -> dict[int, str]:
+    """A unit failed only because no passage it cites states a number (``unstated_number``) may state it in the source's
+    next part (R13): the table's continuation on the next page, or the rest of the section. Before the unit is removed,
+    or set aside for the judge, each of ``UNSTATED_EXPANSIONS`` is read once through ``fetcher`` (one unit takes one
+    place of the turn's bound, ``chat_reread_claims``, and none starts without ``REREAD_MIN_SECONDS`` left); the first
+    whose text states every one of the unit's missing numbers — by the same number check — is registered as a turn
+    source and cited with the unit (the server attaches the citation), and the deterministic checks run again with it.
+    A unit no expansion helps keeps its problem, as before. Each attempt is on the unit's claims (``ws.reread_log``).
+    Returns the unit index -> the id of the source whose citation the server attaches."""
+    cites: dict[int, str] = {}
+    budget = max(0, get_settings().chat_reread_claims - len(ws.reread_done))
+    question_numbers = numbers_in(question)
+    for p in list(report.problems):
+        u = p.unit
+        if p.check != "unstated_number" or not p.unstated or not u.ids or u.index < 0:
+            continue
+        sid = _reread_source(u, "next_page", ws)
+        if sid is None:
+            continue
+        key = "unit:" + u.id
+        if key in ws.reread_done:
+            continue
+        if budget <= 0:
+            _log_reread(ws, key, source=sid, scope=UNSTATED_EXPANSIONS[0], outcome="bound", reason="source_read_in_part")
+            continue
+        ws.reread_done.add(key)
+        budget -= 1
+        everything = _all_numbers(ws)
+        for kind in UNSTATED_EXPANSIONS:
+            entry = {"source": sid, "scope": kind}
+            if not _reread_time_left(deadline):
+                _log_reread(ws, key, **entry, outcome="no_time")
+                break
+            try:
+                got = fetcher.expand(sid, kind)
+            except Exception:  # noqa: BLE001 - a read that failed is a check that did not complete
+                logger.warning("re-read of %s (%s) failed", sid, kind, exc_info=True)
+                _log_reread(ws, key, **entry, outcome="check_failed")
+                break
+            body = got.text if isinstance(got, Expansion) else got
+            if not body or _unstated(u, ws, question_numbers, everything, extra_text=body):
+                _log_reread(ws, key, **entry, outcome="not_found")
+                continue
+            adopt = getattr(fetcher, "adopt", None)
+            try:
+                new_sid = adopt(sid, kind) if callable(adopt) else None
+            except Exception:  # noqa: BLE001
+                logger.warning("registering the re-read of %s failed", sid, exc_info=True)
+                new_sid = None
+            if not new_sid or new_sid not in ws.sources:
+                _log_reread(ws, key, **entry, outcome="check_failed")
+                break
+            u.ids.append(new_sid)
+            meanings[u.index] = meaning.check(u, ws, meaning_fetcher)
+            again = deterministic([u], ws, question, meanings)
+            report.problems = [x for x in report.problems if x is not p] + again
+            cites[u.index] = new_sid
+            _log_reread(ws, key, **entry, outcome="found", expanded_source=new_sid)
+            break
+    return cites
+
+
+def _attach_rereads(report: VerifyReport, ws: Workspace) -> None:
+    """Each claim's re-reads from the turn's log: its own, and its unit's (a number looked for in the source's next
+    part belongs to every claim of the unit)."""
+    if not ws.reread_log:
+        return
+    for recs in report.claims.values():
+        for r in recs:
+            r.rereads = [dict(x) for x in [*ws.reread_log.get(r.id, []), *ws.reread_log.get("unit:" + r.unit_id, [])]]
+
+
+def _reread(provider: LLMProvider, report: VerifyReport, verdicts: dict[int, JudgeVerdict], ws: Workspace,
+            usage: list[dict], deadline: float | None, fetcher: ContextFetcher, cache: VerdictCache | None,
+            keys: dict[int, str]) -> None:
+    """The bounded re-read before a claim is given up (KTD5, R13-R15). A claim whose verdict is partial or unsupported,
+    that names the context it lacked (``needs_context``) and cites a readable source, has that source expanded once
+    through ``fetcher``; the units of the claims whose expansion came back are judged again in one call
+    (``verify_reread``), shown the expansion as part of the source. Bounds: one expansion per claim, at most
+    ``chat_reread_claims`` claims per turn (``ws.reread_done``), and none without ``REREAD_MIN_SECONDS`` of the
+    allowance left. The new verdict replaces the unit's. A read or a call that fails leaves the claims as they were
+    (R14: a technical failure is never a contradiction, and a claim the first check could not complete is not
+    re-read at all). Each attempt is on the claim (``ClaimRecord.rereads``) for the log."""
+    units = {u.index: u for u in report.units}
+    budget = max(0, get_settings().chat_reread_claims - len(ws.reread_done))
+    picked: list[tuple[Unit, ClaimRecord, str]] = []
+    for idx in sorted(report.claims):
+        u = units.get(idx)
+        for r in report.claims[idx]:
+            if (u is None or r.verdict not in ("partial", "unsupported") or r.needs_context == "none"
+                    or r.id in ws.reread_done):
+                continue
+            sid = _reread_source(u, r.needs_context, ws)
+            if sid is None:
+                continue
+            if len(picked) < budget:
+                picked.append((u, r, sid))
+            else:  # the bound: the verdict stands, the source was read in part
+                _log_reread(ws, r.id, source=sid, scope=r.needs_context, outcome="bound", reason="source_read_in_part")
+    if not picked:
+        return
+    expanded: list[tuple[Unit, ClaimRecord, str, str]] = []  # (unit, claim, source id, kind) of each expansion read
+    batch = _Batch([])
+    for u, r, sid in picked:
+        entry = {"source": sid, "scope": r.needs_context}
+        ws.reread_done.add(r.id)  # attempted: one expansion per claim, whatever came of it
+        if not _reread_time_left(deadline):
+            _log_reread(ws, r.id, **entry, outcome="no_time")
+            continue
+        try:
+            got = fetcher.expand(sid, r.needs_context)
+        except Exception:  # noqa: BLE001 - a read that failed is a check that did not complete, never a verdict
+            logger.warning("re-read of %s (%s) failed", sid, r.needs_context, exc_info=True)
+            _log_reread(ws, r.id, **entry, outcome="check_failed")
+            continue
+        text_ = got.text if isinstance(got, Expansion) else got
+        if not text_ or not text_.strip():
+            _log_reread(ws, r.id, **entry, outcome="no_context")
+            continue
+        shown = batch.expanded.setdefault(sid, [])
+        if (r.needs_context, text_) not in shown:
+            shown.append((r.needs_context, text_))
+        batch.rereads.setdefault(u.index, []).append((r.text, r.needs_context, sid))
+        expanded.append((u, r, sid, r.needs_context))
+    if not expanded:
+        return
+    batch.units = list(dict.fromkeys(u.index for u, *_ in expanded))
+    batch.units = [units[i] for i in batch.units]
+    rendered = _render_batch(batch, ws)
+    got, status, _ = judge(provider, batch, rendered, usage, deadline, policy=JUDGE_REREAD_POLICY, label="verify_reread")
+    if status in RETRYABLE:
+        got, status, _ = judge(provider, batch, rendered, usage, deadline, policy=JUDGE_REREAD_POLICY,
+                               label="verify_reread")
+    if status == "ok":
+        got = _shown_support(got, batch, ws)
+    else:
+        got = {}
+    adopt = getattr(fetcher, "adopt", None)
+    for u in batch.units:
+        mine = [(r, sid, kind) for v, r, sid, kind in expanded if v.index == u.index]
+        new = got.get(u.index)
+        if new is None:  # the call failed, or the judge left the unit out: the claims stay as they were
+            for r, sid, kind in mine:
+                _log_reread(ws, r.id, source=sid, scope=kind, outcome="check_failed")
+            continue
+        recs = claim_records(u, unit_claims(u, new, ws))
+        for r, sid, kind in mine:
+            now = next((x for x in recs if x.id == r.id or _same_span(x.text, r.text)), recs[0])
+            entry = {"source": sid, "scope": kind, "outcome": now.verdict if now.verdict in REREAD_OUTCOMES
+                     else new.verdict}
+            if now.verdict == "supported" and callable(adopt):
+                try:
+                    if new_sid := adopt(sid, kind):
+                        entry["expanded_source"] = new_sid
+                except Exception:  # noqa: BLE001 - registering the source is a convenience of the log, not a check
+                    logger.warning("registering the re-read of %s failed", sid, exc_info=True)
+            _log_reread(ws, now.id, **entry)
+        verdicts[u.index] = new
+        report.verdicts[u.index] = new.verdict
+        report.claims[u.index] = recs
+        if cache is not None and u.index in keys and not [s for s in new.supported_by if s not in u.ids] \
+                and not new.depends_on:
+            cache.verdicts[keys[u.index]] = new  # the next round reuses it, so the claim is not read or judged again
+
+
 def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, question: str,
                   usage: list[dict], deadline: float | None = None, mismatch: str | None = None,
                   request: str | None = None, requirements: TurnRequirements | None = None,
-                  cache: VerdictCache | None = None) -> VerifyReport:
+                  cache: VerdictCache | None = None, reread: ContextFetcher | None = None) -> VerifyReport:
     """Deterministic checks, then the judge on every remaining unit. ``mismatch`` says why the answer's datum is
     not the one the resolved request asked for (``app.chat.resolve.mismatch``): a problem of the whole answer,
     for the repair round, and a note on the final answer. ``requirements``: the turn's requirements — frozen from the
     request's components before the answer (KTD1), or, when the turn has none, derived by this call's first judge
     call (the fallback) — scored by id; without it (a check outside a turn) completeness is not judged.
     ``request``: the request as resolved in context (the question itself when there is none). ``cache``: the turn's verdicts (KTD10) — a unit judged
-    before in the turn, unchanged, is not judged again. Raises ``VerificationUnavailable``."""
+    before in the turn, unchanged, is not judged again. ``reread``: reads the context of a claim the judge could not settle
+    for lack of it (``needs_context``), once, before the claim is given up (KTD5); without it nothing is re-read.
+    Raises ``VerificationUnavailable``."""
     units = split_units(answer.answer_markdown)
     assign_ids(units, ws.claim_salt)
     report = VerifyReport(units, pending_parameters=pending_parameters(ws, requirements) if requirements is not None
@@ -3132,6 +3401,8 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     fetcher = meaning.Fetcher(ws)
     meanings = {u.index: meaning.check(u, ws, fetcher) for u in units}
     report.problems = deterministic(units, ws, question, meanings)
+    found_in = _expand_unstated(report, units, meanings, ws, question, deadline, reread, fetcher) \
+        if reread is not None else {}
     # a unit failed only for numbers no cited source states, that holds more than those numbers, is not removed up front:
     # the judge splits it into claims and the claim holding such a number fails (``_fail_unstated``)
     soft = {p.unit.index: p for p in report.problems if p.check == "unstated_number" and p.unstated
@@ -3145,6 +3416,9 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     for u in units:
         if u.index in failed:
             continue
+        if u.index in found_in:  # a number only the source's next part states: its citation is attached
+            report.problems.append(Problem(u, f"המספר מופיע ב-{found_in[u.index]} (המשך המקור); צטט אותו",
+                                           kind="needs_citation", cite=found_in[u.index]))
         report.problems += [Problem(u, f"תוצאת החישוב {cid} מוצגת בלי לצטט אותו", kind="needs_citation", cite=cid)
                             for cid in bound.get(u.index, [])]
         for m in meanings[u.index]:
@@ -3206,6 +3480,9 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         report.verdicts = {u.index: verdicts[u.index].verdict for u in to_judge if u.index in verdicts}
         report.claims = {u.index: claim_records(u, unit_claims(u, verdicts[u.index], ws))
                          for u in to_judge if u.index in verdicts}
+        if reread is not None:
+            _reread(provider, report, verdicts, ws, usage, deadline, reread, cache, keys)
+        _attach_rereads(report, ws)
         handled: set[int] = set()
         reasons: dict[str, str] = {}
         for idx, p in soft.items():
@@ -3243,6 +3520,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                     # an uncited claim no read source supports: not linked to a source the turn read (R2) — said so
                     # whatever else the judge wrote, never an external source and never "wrong"
                     reason = f"לא נתמך במקורות: {NOT_LINKED_REASON}; {v.reason}"
+                reason += _read_in_part(recs)
                 report.problems.append(Problem(u, reason, failure_kind=failure, check="judge",
                                                claim_id=next((r.id for r in recs if r.verdict in FAILING_VERDICTS),
                                                              recs[0].id)))
@@ -3252,6 +3530,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 for r in failing or [None]:
                     why = (reasons.get(r.id) if r is not None else None) or v.reason + (
                         f" («{r.text}»)" if r is not None else "")
+                    why += _read_in_part([r] if r is not None else [])
                     kind = (r.failure_kind() if r is not None and r.verdict in ("unsupported", "contradicts")
                             else DEFECT_FAILURES.get(v.defect))
                     report.problems.append(Problem(u, "נתמך חלקית: " + why, "partial", defect=v.defect,
@@ -3276,6 +3555,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         _check_requirements(report, ws, requirements)
         report.assign_components()
     close_records(report, verdicts, ws, cache)
+    _attach_rereads(report, ws)
     plan_edits(report)
     return report
 
@@ -3498,6 +3778,9 @@ class ClaimRecord:
     context_key: str = ""  # the unit's heading and table context, for matching a repaired claim to its parent
     exact: bool = False  # ``start``/``end`` are the span's own place in the answer (not the whole unit's)
     marker: int = 0  # for a cut claim: the ordinal of the marker that replaced it in the final text
+    # the bounded re-reads of the claim (U5, R13-R15): {"source", "scope", "outcome" (``REREAD_OUTCOMES``), and for
+    # the outcomes that have them "reason", "expanded_source"}, for the log
+    rereads: list[dict] = field(default_factory=list)
 
     @property
     def span(self) -> str:
@@ -3518,7 +3801,7 @@ class ClaimRecord:
                 "action": self.action, "sources_checked": list(self.sources_checked),
                 "depends_on": list(self.depends_on), "fallback": self.fallback, "parent_id": self.parent_id,
                 "failure": self.failure_kind() if self.verdict in FAILING_VERDICTS else "none",
-                "cause": self.cause, "marker": self.marker}
+                "cause": self.cause, "marker": self.marker, "rereads": [dict(x) for x in self.rereads]}
 
 
 def _same_span(a: str, b: str) -> bool:

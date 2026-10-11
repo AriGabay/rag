@@ -157,6 +157,9 @@ class Settings(BaseSettings):
     chat_repair_rounds: int = 2  # 1: a repair with tools; 2: then a rewrite from verified content only
     chat_verify_reserve_seconds: int = 40
     chat_verify_min_seconds: int = 15  # less time than this left for a verification fails the turn
+    # claims one turn may re-read before they are given up (round 8 KTD5): one expansion of the cited source and one
+    # re-judge for all of them; the rest keep their verdict, saying the source was read in part
+    chat_reread_claims: int = Field(default=4, ge=0)
     llm_timeout_agent_seconds: float = 90
     llm_timeout_measure_seconds: float = 90
 
