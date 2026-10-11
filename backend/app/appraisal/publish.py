@@ -1,4 +1,5 @@
-"""Publish a processed version (U6): facts, validation, dedup, status, data version — one transaction.
+"""Publish a processed version (U6): facts, validation, dedup, the version's appraisal units (round 9 U7), status, data
+version — one transaction.
 
 Runs under the worker's ``system`` context. Idempotent: prior facts of this version are removed
 first, so a retried job publishes exactly one set. The office advisory lock serializes dedup
@@ -187,6 +188,9 @@ def publish_version(conn: Connection, version_id: UUID, document_id: UUID, extra
         text("UPDATE document_versions SET is_current = true, processed_at = now(), status_reason = NULL WHERE id = :v"),
         {"v": version_id},
     )
+    from app.chat import units  # imported here: the chat package imports the appraisal package
+
+    units.replace(conn, version_id)  # a ready version always has units (round 9 U7, KTD4)
     status = refresh_version_status(conn, version_id)
     bump_data_version(conn)
     return status

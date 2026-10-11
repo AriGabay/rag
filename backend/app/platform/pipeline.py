@@ -103,7 +103,7 @@ def _delete_outputs(conn: Connection, version_id: UUID) -> None:
         text("DELETE FROM fact_values WHERE occurrence_id IN (SELECT id FROM occurrences WHERE version_id = :v)"),
         {"v": version_id},
     )
-    for table in ("occurrences", "chunks", "extracted_tables", "pages", "document_blocks"):
+    for table in ("occurrences", "document_units", "chunks", "extracted_tables", "pages", "document_blocks"):
         conn.execute(text(f"DELETE FROM {table} WHERE version_id = :v"), {"v": version_id})
 
 
@@ -535,7 +535,7 @@ def process_version(office_id: UUID, version_id: UUID) -> str | None:
 
 # --- reindexing and measurements ----------------------------------------------------------------------------
 
-_DERIVED_TEXT_TABLES = ("chunks", "extracted_tables", "pages", "document_blocks")
+_DERIVED_TEXT_TABLES = ("document_units", "chunks", "extracted_tables", "pages", "document_blocks")
 EMBED_BATCH = 64
 MISSING_SHOWN = 20  # missing numbers recorded per page
 MSG_REGRESSION = ("הקריאה החדשה איבדה מידע ביחס לקריאה הקיימת ({summary}), ולכן נשמרה הקריאה הקיימת והמסמך זמין"
@@ -692,11 +692,13 @@ def reindex_version(office_id: UUID, version_id: UUID, accept_regression: bool =
     (``accept_regression``) and the new one is within it (``regression_within``). A transient vision failure raises
     before the gate; the job's bounded attempts read again, regions already read coming from ``image_readings``.
     Otherwise one transaction replaces
-    the blocks, pictures, tables, pages and chunks (with their embeddings) under a new ``reading_id``, re-anchors
+    the blocks, pictures, tables, pages and chunks (with their embeddings) and the appraisal units derived from them
+    (``app.chat.units``) under a new ``reading_id``, re-anchors
     the version's measurements in the new reading, drops facts the earlier engine extracted from the old chunks
     and never reviewed (a reviewed fact stays), clears cached answers and moves the data version, so no answer
     built on the old reading is served again. Its records (and their reviews) are kept. Measurements are then
     re-extracted when the office allows the cloud model."""
+    from app.chat import units
     from app.measurements.store import measurement_anchors, reanchor_measurements
     from app.platform.jobs import enqueue_measurements
     from app.platform.storage import get_storage
@@ -734,6 +736,7 @@ def reindex_version(office_id: UUID, version_id: UUID, accept_regression: bool =
                                    {"v": info.id}).scalar_one()
             _insert_outputs(conn, info, result, embeddings,
                             {"accepted_regression": regression} if regression is not None else None)
+            units.replace(conn, info.id)  # the units of the replaced reading go with it (KTD4)
             anchored = reanchor_measurements(conn, info.id, anchors,
                                              ((result.fontmap or {}).get("corrections") or []))
             conn.execute(text("DELETE FROM facts WHERE version_id = :v AND status IN ('auto_validated',"
@@ -788,8 +791,10 @@ def backfill_positions(office_id: UUID, version_id: UUID) -> str | None:
     aligned (``ingestion.positions_backfill``). The ``reading_id``, the ingestion version, the block numbers and
     texts stay as they are, so no citation of the version becomes stale; a block or table that does not align gets
     nothing. Idempotent: a version that has the marker is left alone, and so is one read again (a new
-    ``reading_id``) while this ran. A stored file that is missing ends the job (``ExtractionError``, permanent) with
-    nothing written."""
+    ``reading_id``) while this ran. The pages' printed numbers are what the units' boundaries read, so the same
+    transaction derives the version's units again (their derivation key names the positions marker). A stored file
+    that is missing ends the job (``ExtractionError``, permanent) with nothing written."""
+    from app.chat import units
     from app.platform import positions
     from app.platform.storage import get_storage
 
@@ -853,6 +858,7 @@ def backfill_positions(office_id: UUID, version_id: UUID) -> str | None:
             " || jsonb_build_object('positions', CAST(:p AS text), 'positions_backfill', CAST(:r AS jsonb))"
             " WHERE id = :v"),
             {"v": version_id, "p": POSITIONS_VERSION, "r": json.dumps(record)})
+        units.rebuild_if_stale(conn, version_id)  # the pages' labels changed: the derivation key did too (KTD4)
     logger.info("positions for version %s: blocks %s, tables %s", version_id, found.counts["blocks"],
                 found.counts["tables"])
     return "positioned"
