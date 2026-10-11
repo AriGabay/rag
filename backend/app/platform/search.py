@@ -87,9 +87,9 @@ class _Sql:
 
     where: str = "v.is_current"
     params: dict = field(default_factory=dict)
-    # the conditions of ``where`` that name chunk columns only (``c.version_id``, ``c.document_id``): the trigram stage
-    # applies them before it reads any chunk text
-    chunk_where: str = ""
+    # the visible versions the scope resolves to (under row security, with the metadata filters applied), once the
+    # search has resolved them: the trigram stage passes them to ``trigram_candidates``
+    version_ids: list[UUID] | None = None
     joins: str = (" FROM chunks c JOIN document_versions v ON v.id = c.version_id"
                   " JOIN documents d ON d.id = c.document_id AND d.deleted_at IS NULL")
 
@@ -116,10 +116,7 @@ def _scope_sql(scope: SearchScope | None, allowed_versions: list[UUID] | None = 
     if allowed_versions is not None:
         params["scope_allowed"] = allowed_versions
         conds.append("c.version_id = ANY(:scope_allowed)")
-    chunk = [f"c.version_id = ANY(:{p})" for p in ("scope_v", "scope_allowed") if p in params]
-    if "scope_d" in params:
-        chunk.append("c.document_id = ANY(:scope_d)")
-    return _Sql(where=" AND ".join(conds), params=params, chunk_where=" AND ".join(chunk))
+    return _Sql(where=" AND ".join(conds), params=params)
 
 
 def _scoped_versions(conn: Connection, scope: SearchScope | None) -> list[tuple[UUID, UUID]]:
@@ -160,32 +157,26 @@ def _lexical(conn: Connection, tokens: list[str], scope: _Sql | None = None, n: 
     ).scalars())
 
 
-def _set_trigram_threshold(conn: Connection) -> None:
-    """The ``<%`` operator compares against ``pg_trgm.word_similarity_threshold``: set it for this transaction."""
-    conn.execute(text("SELECT set_config('pg_trgm.word_similarity_threshold', :th, true)"),
-                 {"th": str(TRIGRAM_THRESHOLD)})
-
-
 def _trigram_statement(scope: _Sql, n: int = CANDIDATES) -> tuple[str, dict]:
-    """The trigram stage's SQL and its parameters (add ``q``). The candidate chunks come from one scan of ``chunks``
-    that evaluates the similarity predicate once per chunk, inside the version/document ids the scope names; the
-    visible-version and document joins run on the few candidates, never on the chunks (R16, KTD3). Row-level security
-    makes the planner expect one row from ``documents`` and ``document_versions``, so a plain join put them first and
-    scanned ``chunks`` once per version x document, evaluating the predicate on each scan (10.8 s on the office)."""
-    chunk_where = f"{scope.chunk_where} AND " if scope.chunk_where else ""
+    """The trigram stage's SQL and its parameters (add ``q``). The candidates come from ``trigram_candidates`` (0017),
+    which scans the GIN trigram index inside the visible versions the search resolved under row security and returns
+    ids and similarity only; the ids are joined back to ``chunks``, ``document_versions`` and ``documents`` under row
+    security for scope and order, so no chunk text is read outside it. Row-level security keeps the planner from using
+    the index for ``<%`` on ``chunks`` itself, and made a plain join scan ``chunks`` once per version x document,
+    evaluating the predicate on each scan (10.8 s on the office; R16, KTD3)."""
     return (
-        "WITH cand AS MATERIALIZED ("
-        " SELECT c.id, c.version_id, c.document_id, word_similarity(:q, c.normalized_text) AS sim"
-        f" FROM chunks c WHERE {chunk_where}:q <% c.normalized_text)"
-        " SELECT c.id FROM cand c JOIN document_versions v ON v.id = c.version_id"
+        "WITH cand AS MATERIALIZED (SELECT t.chunk_id AS id, t.sim"
+        " FROM trigram_candidates(:q, CAST(:tv AS uuid[]), CAST(:th AS real), :n) t)"
+        " SELECT c.id FROM cand JOIN chunks c ON c.id = cand.id JOIN document_versions v ON v.id = c.version_id"
         " JOIN documents d ON d.id = c.document_id AND d.deleted_at IS NULL"
-        f" WHERE {scope.where} AND c.sim > :th ORDER BY c.sim DESC, c.id LIMIT :n",
-        scope.params | {"th": TRIGRAM_THRESHOLD, "n": n},
+        f" WHERE {scope.where} AND cand.sim > :th ORDER BY cand.sim DESC, c.id LIMIT :n",
+        scope.params | {"tv": list(scope.version_ids or []), "th": TRIGRAM_THRESHOLD, "n": n},
     )
 
 
 def _trigram(conn: Connection, normalized_query: str, scope: _Sql, n: int = CANDIDATES) -> list:
-    _set_trigram_threshold(conn)
+    if scope.version_ids is None:
+        raise ValueError("the trigram stage needs the scope's visible versions (_prepare resolves them)")
     statement, params = _trigram_statement(scope, n)
     return list(conn.execute(text(statement), params | {"q": normalized_query}).scalars())
 
@@ -252,7 +243,7 @@ def _prepare(conn: Connection, scope: SearchScope | None, filters: MetadataFilte
     caller narrowed the scope (``None`` for an open scope). ``None`` SQL means nothing can match."""
     narrowed = bool(scope and (scope.version_ids or scope.document_ids))
     if not narrowed and (filters is None or not filters.active):
-        return _scope_sql(scope), None, None
+        return _scope_sql(scope), None, None  # an open scope's versions are resolved by the search that needs them
     versions = _scoped_versions(conn, scope)
     report, allowed = None, None
     if filters is not None and filters.active:
@@ -262,7 +253,7 @@ def _prepare(conn: Connection, scope: SearchScope | None, filters: MetadataFilte
             return None, report, 0
         versions = [(v, d) for v, d in versions if v in set(allowed)]
     documents = len({d for _, d in versions}) if narrowed else None
-    return _scope_sql(scope, allowed), report, documents
+    return replace(_scope_sql(scope, allowed), version_ids=[v for v, _ in versions]), report, documents
 
 
 def _hit(r, score: float, supported: bool, tokens: list[str]) -> dict:
@@ -318,6 +309,8 @@ def search_evidence(conn: Connection, queries: Sequence[str], limit: int = 8, *,
     sql, report, documents = _prepare(conn, scope, filters)
     if sql is None:
         return SearchOutcome([], topic, report)
+    if sql.version_ids is None:
+        sql = replace(sql, version_ids=[v for v, _ in _scoped_versions(conn, scope)])
     small = documents is not None and documents <= SMALL_SCOPE_DOCUMENTS
     n = SMALL_SCOPE_CANDIDATES if small else CANDIDATES
     scores: dict = {}

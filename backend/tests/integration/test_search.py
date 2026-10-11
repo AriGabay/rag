@@ -1,5 +1,7 @@
 """Hybrid retrieval with Hebrew normalization and authorization (U9)."""
 
+from uuid import uuid4
+
 import pytest
 from sqlalchemy import text
 
@@ -781,16 +783,26 @@ def _legacy_trigram(conn, query, n=40):
                                                           {"q": query, "th": TRIGRAM_THRESHOLD, "n": n})]
 
 
+def _trigram_scope(conn, scope=None):
+    """The SQL scope of ``scope`` with its visible versions resolved under row security, as a search resolves them."""
+    from dataclasses import replace
+
+    from app.platform.search import _prepare, _scoped_versions
+
+    sql, _, _ = _prepare(conn, scope, None)
+    return sql if sql.version_ids is not None else replace(sql, version_ids=[v for v, _ in _scoped_versions(conn, scope)])
+
+
 def test_trigram_candidates_match_the_word_similarity_predicate(office):
     """The candidate chunks of the trigram stage are today's ``word_similarity > threshold`` rows (KTD3 parity)."""
-    from app.platform.search import _scope_sql, _trigram
+    from app.platform.search import _trigram
 
     a, *_ = office
     _many_reports(a, 5)
     with tenant_tx(a.ctx()) as conn:
         for q in TRIGRAM_QUERIES:
             expected = _legacy_trigram(conn, q)
-            got = _trigram(conn, q, _scope_sql(None), 40)
+            got = _trigram(conn, q, _trigram_scope(conn), 40)
             assert expected, q
             assert set(got) == {i for i, _ in expected}, q
             sims = dict(expected)
@@ -799,27 +811,26 @@ def test_trigram_candidates_match_the_word_similarity_predicate(office):
 
 
 def test_trigram_parity_holds_in_a_narrowed_scope(office):
-    from app.platform.search import SearchScope, _scope_sql, _trigram
+    from app.platform.search import SearchScope, _trigram
 
     a, *_ = office
     _many_reports(a, 4)
     with tenant_tx(a.ctx()) as conn:
         doc = conn.execute(text("SELECT id FROM documents ORDER BY title, id LIMIT 1")).scalar_one()
-        sql = _scope_sql(SearchScope(document_ids=(doc,)))
-        got = _trigram(conn, "היטל השבחה", sql, 40)
-        everything = _trigram(conn, "היטל השבחה", _scope_sql(None), 40)
+        got = _trigram(conn, "היטל השבחה", _trigram_scope(conn, SearchScope(document_ids=(doc,))), 40)
+        everything = _trigram(conn, "היטל השבחה", _trigram_scope(conn), 40)
         owners = {r.id: r.document_id for r in conn.execute(text("SELECT id, document_id FROM chunks"))}
         assert got and {owners[i] for i in got} == {doc}
         assert got == [i for i in everything if owners[i] == doc]
 
 
 def test_a_typo_still_matches_through_trigram(office):
-    from app.platform.search import _scope_sql, _trigram
+    from app.platform.search import _trigram
 
     a, *_ = office
     doc, _ = add_chunks(a, a.default_group_id, TEXTS, "5" * 64)
     with tenant_tx(a.ctx()) as conn:
-        ids = _trigram(conn, "היטל השבחא", _scope_sql(None), 40)  # one wrong letter
+        ids = _trigram(conn, "היטל השבחא", _trigram_scope(conn), 40)  # one wrong letter
         text_of = {r.id: r.normalized_text for r in conn.execute(text("SELECT id, normalized_text FROM chunks"))}
         assert ids and "השבחה" in text_of[ids[0]]
 
@@ -853,8 +864,9 @@ def _plan_nodes(plan):
 
 def test_trigram_reads_the_chunks_once_however_many_versions_are_visible(office, db):
     """RLS makes the planner expect one row from ``documents`` and ``document_versions``; the old join order then
-    scanned ``chunks`` once per version x document and evaluated the predicate on each scan. The candidate scan must
-    run exactly once, whatever the number of documents (measured on the office: 256 loops, 10.8 s)."""
+    scanned ``chunks`` once per version x document and evaluated the predicate on each scan. The candidates now come
+    from one ``trigram_candidates`` call, and ``chunks`` is read only by id for them (measured on the office: 256
+    loops of the predicate, 10.8 s)."""
     import json
 
     from app.platform import search as S
@@ -864,22 +876,92 @@ def test_trigram_reads_the_chunks_once_however_many_versions_are_visible(office,
     with db.begin() as owner:  # planner statistics, as the office has them
         owner.execute(text("ANALYZE chunks, documents, document_versions"))
     with tenant_tx(a.ctx()) as conn:
-        statement, params = S._trigram_statement(S._scope_sql(None), 40)
-        S._set_trigram_threshold(conn)
+        statement, params = S._trigram_statement(_trigram_scope(conn), 40)
 
-        def chunk_scans(sql, parameters):
+        def plan_of(sql, parameters):
             raw = conn.execute(text("EXPLAIN (ANALYZE, FORMAT JSON) " + sql), parameters | {"q": "היטל השבחה"}).scalar_one()
-            plan = (raw if isinstance(raw, list) else json.loads(raw))[0]["Plan"]
-            return sum(n["Actual Loops"] for n in _plan_nodes(plan) if n.get("Relation Name") == "chunks")
+            return list(_plan_nodes((raw if isinstance(raw, list) else json.loads(raw))[0]["Plan"]))
 
-        assert chunk_scans(LEGACY_TRIGRAM, {"th": S.TRIGRAM_THRESHOLD, "n": 40}) > 1  # the fixture shows the old plan
-        assert chunk_scans(statement, params) == 1
+        old = [n for n in plan_of(LEGACY_TRIGRAM, {"th": S.TRIGRAM_THRESHOLD, "n": 40}) if n.get("Relation Name") == "chunks"]
+        assert sum(n["Actual Loops"] for n in old) > 1  # the fixture shows the old plan
+        nodes = plan_of(statement, params)
+        calls = [n for n in nodes if n.get("Function Name") == "trigram_candidates"]
+        assert len(calls) == 1 and calls[0]["Actual Loops"] == 1
+        assert not any("word_similarity" in str(n.get("Filter", "")) for n in nodes)  # no chunk is tested in the query
 
 
-def test_the_trigram_index_exists_for_the_operator_the_stage_uses(office):
-    with tenant_tx(office[0].ctx()) as conn:
-        definition = conn.execute(text("SELECT indexdef FROM pg_indexes WHERE indexname = 'chunks_trgm_idx'")).scalar_one()
-    assert "gin" in definition and "gin_trgm_ops" in definition and "normalized_text" in definition
+def _inner_candidate_query(owner_conn):
+    """The ``RETURN QUERY`` statement of ``trigram_candidates``, with its parameters as bind names."""
+    import re
+
+    src = owner_conn.execute(text("SELECT prosrc FROM pg_proc WHERE proname = 'trigram_candidates'")).scalar_one()
+    body = re.search(r"RETURN QUERY\s+(.*?);\s*END", src, re.S).group(1)
+    for name in ("p_q", "p_versions", "p_th", "p_n"):
+        body = re.sub(rf"\b{name}\b", ":" + name, body)
+    return body
+
+
+def test_the_candidate_scan_uses_the_trigram_index(office, db):
+    """Inside the function (no row security on its scan) the planner reads ``<%`` through the GIN index; as
+    ``rag_app`` on ``chunks`` it never can (the operator is not leakproof). The function's own settings are applied."""
+    a, *_ = office
+    _many_reports(a, 8)
+    with db.begin() as owner:
+        owner.execute(text("ANALYZE chunks"))
+        config = owner.execute(text("SELECT proconfig FROM pg_proc WHERE proname = 'trigram_candidates'")).scalar_one()
+        assert "enable_seqscan=off" in config
+        owner.execute(text("SELECT set_config('app.office_id', :o, true)"), {"o": str(a.office_id)})
+        owner.execute(text("SET LOCAL ROLE rag_lookup"))  # BYPASSRLS, as the function runs
+        owner.execute(text("SET LOCAL enable_seqscan = off"))
+        owner.execute(text("SET LOCAL pg_trgm.word_similarity_threshold = 0.35"))
+        inner = _inner_candidate_query(owner)
+        plan = "\n".join(r[0] for r in owner.execute(text("EXPLAIN " + inner), {
+            "p_q": "היטל השבחה", "p_versions": [uuid4()], "p_th": 0.35, "p_n": 40}))
+    assert "chunks_trgm_idx" in plan, plan
+
+
+def test_trigram_candidates_carry_ids_and_similarity_only(office):
+    a, *_ = office
+    add_chunks(a, a.default_group_id, TEXTS, "7" * 64)
+    with tenant_tx(a.ctx()) as conn:
+        versions = [r.id for r in conn.execute(text("SELECT id FROM document_versions"))]
+        result = conn.execute(text("SELECT * FROM trigram_candidates(:q, :v, CAST(0.35 AS real), 40)"),
+                              {"q": "היטל השבחה", "v": versions})
+        assert list(result.keys()) == ["chunk_id", "sim"]
+        rows = result.all()
+    assert rows and all(0.35 < r.sim <= 1 for r in rows)
+
+
+def test_another_offices_version_ids_return_nothing(setup):
+    a, b, _, da, dg2, dbb = setup
+    with tenant_tx(b.ctx()) as conn:
+        b_versions = [r.id for r in conn.execute(text("SELECT id FROM document_versions"))]
+    assert b_versions
+    with tenant_tx(a.ctx()) as conn:
+        rows = conn.execute(text("SELECT * FROM trigram_candidates(:q, :v, CAST(0.35 AS real), 40)"),
+                            {"q": "השמאי המכריע קבע הפחתה", "v": b_versions}).all()
+    assert rows == []
+
+
+def test_a_version_the_user_cannot_see_yields_no_row_after_the_join_back(setup):
+    """The function reads inside the version ids it is given; the statement joins the ids back under row security,
+    so a version of a group the user may not see (passed explicitly) never reaches the result."""
+    from dataclasses import replace
+
+    from app.platform.search import _scope_sql, _trigram
+
+    a, _, emp, da, dg2, _ = setup
+    employee = TenantContext(a.office_id, emp, "employee")
+    with tenant_tx(a.ctx()) as conn:
+        secret = conn.execute(text("SELECT id FROM document_versions WHERE document_id = :d"), {"d": dg2}).scalar_one()
+        secret_chunk = conn.execute(text("SELECT id FROM chunks WHERE version_id = :v"), {"v": secret}).scalar_one()
+        mine = conn.execute(text("SELECT id FROM document_versions WHERE document_id = :d"), {"d": da}).scalar_one()
+        admin_hits = _trigram(conn, "השמאי המכריע בפרויקט אחר", replace(_scope_sql(None), version_ids=[secret, mine]), 40)
+    assert secret_chunk in admin_hits
+    with tenant_tx(employee) as conn:
+        hits = _trigram(conn, "השמאי המכריע בפרויקט אחר", replace(_scope_sql(None), version_ids=[secret, mine]), 40)
+        assert secret_chunk not in hits and hits  # the visible version's chunks still come back
+        assert secret not in {r.id for r in conn.execute(text("SELECT id FROM document_versions"))}
 
 
 def test_the_search_tool_repeats_no_search_for_an_identical_call_in_a_turn(office, monkeypatch):
