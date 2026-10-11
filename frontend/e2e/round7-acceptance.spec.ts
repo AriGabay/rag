@@ -131,6 +131,26 @@ async function checkGapSummary(reply: Locator, answer: Answer): Promise<void> {
   }
 }
 
+/**
+ * The items the chapter does not hold are stated once, precisely: by the server's gap line, or — for a request that
+ * asks only for what appears ("ככל שהם מופיעים", a conditional requirement, round 8 R21) — by one cited sentence of
+ * the answer that names them, its components answered and conditional. Never the whole category as "not found".
+ */
+async function checkAbsenceStated(reply: Locator, answer: Answer, absent: string[]): Promise<void> {
+  if ((answer.gaps ?? []).length > 0) return;
+  const comps = (answer.components ?? []) as { status?: string; conditional?: boolean }[];
+  expect(comps.length, "the request's components").toBeGreaterThan(0);
+  for (const c of comps) {
+    expect(c.conditional, "absent items left without a gap line only under a conditional request").toBe(true);
+    expect(c.status).toBe("full");
+  }
+  const lines = answer.markdown.split("\n").filter((l) => absent.filter((w) => l.includes(w)).length >= 2);
+  expect(lines.length, "one sentence names the absent items").toBe(1);
+  expect(lines[0], "the absence is cited").toMatch(/\[S\d+\]/);
+  const text = await reply.locator(".body").innerText();
+  for (const w of absent) expect(text.includes(w), `the answer names ${w}`).toBe(true);
+}
+
 /** The components in the details, and the removals: expanded when the answer had one, absent when it had none. */
 async function checkDetails(page: Page, reply: Locator, answer: Answer, name: string): Promise<void> {
   await openDetails(reply);
@@ -220,7 +240,7 @@ test.describe("round 7 acceptance with the real model (office B)", () => {
       `במסמך «${doc.title}»: פרט את נתוני התכנית — שימושים, יח״ד, שטחים, גובה, קומות וקווי בניין — ככל שהם מופיעים בפרק המצב התכנוני.`,
     );
     await expect(reply.locator(".body")).toContainText("84");
-    expect(answer.gaps?.length ?? 0, "the missing items are stated").toBeGreaterThan(0);
+    await checkAbsenceStated(reply, answer, ["שטח", "גובה", "קווי בניין"]);
     await checkGapSummary(reply, answer);
     await checkDetails(page, reply, answer, "partly found");
     await page.screenshot({ path: shot("round7-gaps.png"), fullPage: true });
