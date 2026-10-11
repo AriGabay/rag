@@ -772,9 +772,15 @@ def test_a_governing_note_is_the_farthest_context_and_never_scales_a_percent():
     ("הפרויקט במתחם הדגמה", "מתחם הדגמה", True),  # one is a narrower wording of the other
     ("דירה 3", "דירה 5", False),
     ("שלב א", "שלב ב", False),
+    ("מחיר הדירה", "מחיר דירה 5 עסקת השוואה", False),  # a generic wording against a numbered comparable
 ])
 def test_two_subjects_are_one_scope_without_the_metric_words(a, b, same):
     assert calc.same_subject(a, b) is same
+
+
+def test_only_a_whole_metric_word_leaves_a_subject():
+    assert len(calc._subject_words("שטחים מסחריים בפרויקט הדגמה")) == 4  # "שטחים" merely contains "שטח"
+    assert "עלויות" not in calc._subject_words("עלויות פרויקט הדגמה")
 
 
 def test_a_profit_less_a_cost_of_the_same_project_is_not_a_mix_of_subjects():
@@ -786,3 +792,40 @@ def test_a_profit_less_a_cost_of_the_same_project_is_not_a_mix_of_subjects():
     other = operand("V3", "9000", "ILS", kind="cost", role="cost", subject="פרויקט אחר", vat="excluded")
     with pytest.raises(CalcError):
         run("V1 - V3", ops(profit, other))
+
+
+@pytest.mark.parametrize("label", ['מחיר ליח״ד', 'שווי ליח״ד'])
+def test_a_price_per_unit_row_is_money_from_its_caption_not_a_count(label):
+    from types import SimpleNamespace
+
+    from app.chat import tools
+
+    src = SimpleNamespace(sid="S1", version_id="v1")
+    st = {"headers": ["פריט", "סכום"], "rows": [{"cells": [label, "1,850"]}],
+          "caption": "עסקאות השוואה (באלפי ₪)", "title": [], "notes": []}
+    taken = tools._cell_of(src, f'{label} | 1,850', {"row": label, "column": "סכום"}, st, 0, None)
+    assert taken["units"] == {"ILS"} and taken["scale"] == 1000
+
+
+def test_a_table_number_in_a_caption_is_not_a_count():
+    from app.chat.meaning import units_attested
+
+    assert units_attested("טבלה מספר 4: נתוני עסקאות") == set()
+
+
+@pytest.mark.parametrize("quote, number", [('תקופת הבנייה 36 חודשים', '36'),
+                                            ('מספר השנים שנותרו בחכירה 37', '37')])
+def test_a_duration_under_a_heading_in_thousands_takes_neither_its_currency_nor_its_scale(quote, number):
+    from types import SimpleNamespace
+
+    from app.chat import tools
+
+    src = SimpleNamespace(sid="S1", version_id="v1")
+    taken = tools._take_quote(src, quote, {"quote": quote, "number": number}, [(2, quote, 1)],
+                              lambda _: tools._ScaleNote(NOTE, 1, "read"))
+    assert taken["units"] == set() and taken["scale"] == 1
+    # an amount under the same heading still takes both
+    amount = 'רווח שוטף 13,250'
+    taken = tools._take_quote(src, amount, {"quote": amount, "number": "13,250"}, [(2, amount, 1)],
+                              lambda _: tools._ScaleNote(NOTE, 1, "read"))
+    assert taken["units"] == {"ILS"} and taken["scale"] == 1000

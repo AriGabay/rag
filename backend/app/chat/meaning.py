@@ -302,15 +302,15 @@ def _period_lines(lines: list[str], is_row: list[bool]):
             q.add("period", found[0][2], found[0][3])
         return q
 
-    def above(i: int) -> Qualifiers:
+    def above(i: int) -> list[tuple[str, Qualifiers]]:
         for k in range(i - 1, max(-1, i - 1 - NOTE_LINES), -1):
             if is_row[k] or _ENUMERATION.match(lines[k]):
                 break
             if has_num[k] or opening(k).found:
                 continue
             if stated[k].found:
-                return stated[k]
-        return Qualifiers()
+                return [(lines[k], stated[k])]
+        return []
 
     around = [i for i, row in enumerate(is_row) if not row]
     few = len(around) <= TABLE_AROUND
@@ -333,8 +333,9 @@ def _period_lines(lines: list[str], is_row: list[bool]):
     @cache
     def period(i: int, context: str = "") -> Qualifiers:
         if not is_row[i]:
-            q = Qualifiers().merge(stated[i]).merge(opening(i + 1)).merge(above(i))
-            return q
+            # the line above governs only a number of a compatible kind: a note on management fees "לחודש" gives
+            # no month to a market value in the next sentence
+            return Qualifiers().merge(stated[i]).merge(opening(i + 1)).merge(scoped(above(i), context or lines[i]))
         if few:
             return scoped(table, context)
         first, last = i, i
@@ -482,11 +483,38 @@ def units_attested(context: str) -> set[str]:
         return {"dunam"}
     if re.search(r"מ\"ר|מטר רבוע", c):
         return {"sqm"}
-    if kind_attested("coefficient", c):
+    if any(kind_attested(k, c) for k in MONEY_KINDS):
+        return set()  # "מחיר ליח״ד", "השווי לאחר מקדם התאמה": an amount, its currency stated elsewhere
+    label = _LABEL_NUMBER.sub(" ", c)
+    if kind_attested("coefficient", label):
         return {"ratio"}
-    if kind_attested("count", c) and not (kind_attested("duration", c) or re.search(r"חודש|(?<![א-ת])שנ(?:ים|ות|ה)", c)):
+    if kind_attested("count", label) and not (kind_attested("duration", label)
+                                              or re.search(r"חודש|(?<![א-ת])שנ(?:ים|ות|ה)", label)):
         return {"units"}  # "מספר השנים", "מספר חודשי הגרייס" count time: a duration, not units
     return set()
+
+
+MONEY_KINDS = ("value", "price", "rent", "management_fee", "cost", "income", "profit", "levy")
+# a label's number ("טבלה מספר 4", "מס' 7") counts nothing
+_LABEL_NUMBER = re.compile(r"(?:מספר|מס['\"]?)\s*\d+")
+
+
+def metric_word(token: str) -> bool:
+    """A word that is wholly a name of a kind of value ("שווי", "לשכירות", "הרווח": ``KIND_WORDS`` with up to two
+    prefix letters): it names the datum, never a property or a document. A name that merely contains its letters
+    ("שוויצר") is not one."""
+    word = _norm(token)
+    return any(re.fullmatch(rf"[והבלמשכ]{{0,2}}(?:{rx})", word) for rx in KIND_WORDS.values())
+
+
+def nonmonetary(context: str) -> bool:
+    """Whether the words around a number name a quantity that is not money — a duration, count, coefficient, area
+    or rate — and no amount: such a number never inherits the currency or the scale of a heading ("ממצאי הבדיקה
+    באלפי ₪" over "תקופת הבנייה 36 חודשים")."""
+    c = _LABEL_NUMBER.sub(" ", _norm(context))
+    if any(kind_attested(k, c) for k in MONEY_KINDS):
+        return False
+    return any(kind_attested(k, c) for k in ("duration", "count", "coefficient", "area", "rights_area", "rate"))
 
 
 # the words that name a kind of value in its row, column or sentence (professional vocabulary, R26)

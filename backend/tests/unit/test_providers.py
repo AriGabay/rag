@@ -587,3 +587,43 @@ def test_the_turns_final_answer_and_tool_schemas_are_valid_strict_structured_out
     for tool in T.TOOLS:
         if tool.get("strict"):
             assert _non_strict_objects(tool["parameters"]) == [], tool["name"]
+
+
+class Sequence(Transport):
+    """Answers the requests in turn with ``replies``."""
+
+    def __init__(self, *replies):
+        super().__init__(None)
+        self.replies = list(replies)
+
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        self.reply = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
+        return super().__call__(request)
+
+
+def _sequence_provider(*replies) -> tuple[OpenAIProvider, Sequence]:
+    transport = Sequence(*replies)
+    client = openai.OpenAI(api_key=FAKE_KEY, max_retries=0,
+                           http_client=httpx2.Client(transport=httpx2.MockTransport(transport)))
+    return OpenAIProvider(FAKE_KEY, "gpt-5.4-mini", client=client), transport
+
+
+@pytest.mark.parametrize("status, code", [(500, "server_error"), (429, "rate_limit_exceeded")])
+def test_a_fast_transient_agent_failure_is_retried_once_in_the_open(status, code):
+    ok = httpx2.Response(200, json=_response(_text('{"text": "שלום"}')))
+    provider, transport = _sequence_provider(httpx2.Response(status, json=_error(code)), ok)
+    step = provider.agent_step("הוראות", [], [], Echo.model_json_schema(), timeout=60)
+    assert step.ok and len(transport.requests) == 2 and step.detail == "retried"
+    # a second failure is not retried again
+    provider, transport = _sequence_provider(httpx2.Response(status, json=_error(code)))
+    step = provider.agent_step("הוראות", [], [], Echo.model_json_schema(), timeout=60)
+    assert not step.ok and len(transport.requests) == 2
+
+
+def test_a_timed_out_or_quota_agent_call_is_never_repeated():
+    provider, transport = _sequence_provider(httpx2.TimeoutException("slow"))
+    step = provider.agent_step("הוראות", [], [], Echo.model_json_schema(), timeout=60)
+    assert step.status == CallStatus.TIMEOUT and len(transport.requests) == 1
+    provider, transport = _sequence_provider(httpx2.Response(429, json=_error("insufficient_quota")))
+    step = provider.agent_step("הוראות", [], [], Echo.model_json_schema(), timeout=60)
+    assert step.status == CallStatus.QUOTA and len(transport.requests) == 1

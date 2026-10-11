@@ -859,26 +859,29 @@ _SUBJECT_PREFIX = re.compile(r"^[והבלמשכ]{1,2}(?=[א-ת]{3,})")
 
 
 def _subject_words(subject: str) -> set[str]:
-    """The words of a subject that name its scope: the metric's own words ("רווח", "עלויות" — the value's kind,
-    ``meaning.KIND_WORDS``) are left out, and each word is taken without its prefix letters."""
-    from app.chat.meaning import KIND_WORDS, _norm
+    """The words of a subject that name its scope: the metric's own words ("רווח", "עלויות" — whole words of the
+    value's kind vocabulary, ``meaning.metric_word``) are left out, and each word is taken without its prefix
+    letters."""
+    from app.chat.meaning import _norm, metric_word
 
-    words = set()
-    for w in re.findall(r"[\w\"']+", _norm(subject)):
-        if any(re.search(rx, w) for rx in KIND_WORDS.values()):
-            continue
-        words.add(_SUBJECT_PREFIX.sub("", w))
-    return words
+    return {_SUBJECT_PREFIX.sub("", w) for w in re.findall(r"[\w\"']+", _norm(subject)) if not metric_word(w)}
 
 
 def same_subject(a: str, b: str) -> bool:
-    """Whether two subjects name one scope: the same words once the metric is left out, or one of them a narrower
-    wording of the other ("רווח הפרויקט" and "עלויות הפרויקט" are one project). Wording that adds a scope the
-    other lacks on both sides stays two subjects."""
+    """Whether two subjects name one scope: the same words once the metric is left out ("רווח פרויקט X" and
+    "עלויות פרויקט X"), or one a narrower wording of the other that shares at least two of its words and adds no
+    number ("הפרויקט במתחם X" and "מתחם X"). A generic wording against a numbered one ("הדירה" and "דירה 5 עסקת
+    השוואה"), or two that each name something the other lacks, stay two subjects."""
     if a.strip() == b.strip():
         return True
     x, y = _subject_words(a), _subject_words(b)
-    return bool(x) and bool(y) and (x <= y or y <= x)
+    if not x or not y:
+        return False
+    if x == y:
+        return True
+    small, large = (x, y) if len(x) <= len(y) else (y, x)
+    return small <= large and len(small) >= 2 and not any(any(ch.isdigit() for ch in w) for w in large - small)
+
 
 def evaluate(node, operands: dict[str, Operand], justification: str | None = None,
              contexts: list[frozenset[str]] | None = None) -> Outcome:

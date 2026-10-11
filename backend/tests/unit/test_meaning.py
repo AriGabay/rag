@@ -451,3 +451,10 @@ def test_a_count_is_units_but_a_number_of_years_is_not(context, units):
     from app.chat.meaning import units_attested
 
     assert units_attested(context) == units
+
+
+def test_a_line_above_on_another_kind_gives_no_period_to_a_capital_value():
+    source = 'השוכר משלם בנוסף דמי ניהול לחודש.\nשווי השוק של הנכס הינו 3,200,000 ₪.'
+    assert _periods(source, '3,200,000', 'שווי השוק של הנכס הינו 3,200,000 ₪') == set()
+    noted = 'ההכנסות להלן הן לשנה\nהכנסות משכירות 480,000 ₪'
+    assert _periods(noted, '480,000', 'הכנסות משכירות 480,000 ₪') == {"year"}

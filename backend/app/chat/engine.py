@@ -672,6 +672,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                 last = True
                 final_notice(STEP_LIMIT if steps >= bound else TIME_LIMIT)
             progress("retry", "מכין מחדש את התשובה לאחר שנקטעה")
+            step_started = time.monotonic()  # the answer's time is the retry's: the truncated call is not a rewrite's
             step = call_agent(retry_timeout)
             output_limit = step.status == CallStatus.INCOMPLETE and step.detail == "max_output_tokens"
         failure = (None if step.ok and not (step.calls and last) else

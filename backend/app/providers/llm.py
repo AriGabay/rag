@@ -354,6 +354,10 @@ def _openai_error_status(exc: Exception) -> CallStatus:
 
 
 CONTENT_POLICY_CODES = frozenset({"content_policy_violation", "content_filter"})
+# an agent call that failed this way may succeed at once: a rate limit (not an exhausted quota), a server error or a
+# dropped connection — never a timeout, whose repeat would take the same time again
+AGENT_RETRY = frozenset({CallStatus.RATE_LIMITED, CallStatus.ERROR})
+AGENT_RETRY_MIN_SECONDS = 15.0
 
 
 def _refused(items: list[dict]) -> bool:
@@ -477,14 +481,26 @@ class OpenAIProvider(BaseProvider):
         if cache_key and caps is not None and caps.prompt_cache_key:
             kwargs["prompt_cache_key"] = cache_key
         started = time.perf_counter()
-        try:
-            # The turn owns retries and its deadline; SDK retries would silently repeat a timed-out call.
-            resp = self.client.with_options(timeout=timeout or timeout_for(Purpose.AGENT), max_retries=0).responses.create(**kwargs)
-        except openai.OpenAIError as exc:
-            status = _openai_error_status(exc)
-            logger.warning("provider %s agent step failed: %s (%s)", self.name, status, type(exc).__name__)
-            return AgentStep(status, [], [], None, latency_ms=_elapsed_ms(started), detail=type(exc).__name__,
-                             model=self.model)
+        budget = timeout or timeout_for(Purpose.AGENT)
+        retried = False
+        while True:
+            left = budget - (time.perf_counter() - started)
+            try:
+                # No hidden SDK retries: a timed-out call is never silently repeated. One retry in the open, below,
+                # for a transient failure that came back fast enough for a second call to fit the same timeout.
+                resp = self.client.with_options(timeout=left, max_retries=0).responses.create(**kwargs)
+                break
+            except openai.OpenAIError as exc:
+                status = _openai_error_status(exc)
+                left = budget - (time.perf_counter() - started)
+                if not retried and status in AGENT_RETRY and left >= AGENT_RETRY_MIN_SECONDS:
+                    retried = True
+                    logger.warning("provider %s agent step failed: %s (%s); retrying once", self.name, status,
+                                   type(exc).__name__)
+                    continue
+                logger.warning("provider %s agent step failed: %s (%s)", self.name, status, type(exc).__name__)
+                return AgentStep(status, [], [], None, latency_ms=_elapsed_ms(started), detail=type(exc).__name__,
+                                 model=self.model)
         usage = getattr(resp, "usage", None)
         details = getattr(usage, "input_tokens_details", None)
         step = AgentStep(CallStatus.OK, list(resp.output or []), [], None,
@@ -492,6 +508,8 @@ class OpenAIProvider(BaseProvider):
                          output_tokens=getattr(usage, "output_tokens", None), latency_ms=_elapsed_ms(started),
                          cached_input_tokens=getattr(details, "cached_tokens", None),
                          cache_write_tokens=getattr(details, "cache_write_tokens", None), model=self.model)
+        if retried:
+            step.detail = "retried"
         reason = getattr(getattr(resp, "incomplete_details", None), "reason", None)
         for item in step.output:
             kind = getattr(item, "type", None)

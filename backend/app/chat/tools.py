@@ -2537,14 +2537,16 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     # read from it), else the table's caption, title or notes
     unit_from = next((where for where, t in (("cell", near[0]), ("row", near[1]), ("header", near[2] + " " + near[3]))
                       if meaning.units_attested(t)), "table" if units else None)
-    if not units:
+    own_kind_not_money = meaning.nonmonetary(" ".join(near))
+    if not units and not own_kind_not_money:
         units = _note_units(governing)
         if units:
             unit_from = "governing_note"
     # the scale the table states it in (R14): the cell's own scale word, else a note of its cell, row or column
     # ("הכנסות (אלפי ₪)"), else of the table's caption, title or notes ("טבלה 4 (באלפי ₪)"), else of the heading-like
     # line above the table that governs it ("ממצאי הבדיקה באלפי ₪") — a table's own note is nearer than that line's
-    scale = (calc.stated_scale(meaning._norm(cell), *at_cell) if units and not units & {"ILS", "ILS_per_sqm"} else
+    scale = (calc.stated_scale(meaning._norm(cell), *at_cell)
+             if own_kind_not_money or units and not units & {"ILS", "ILS_per_sqm"} else
              _value_scale(meaning._norm(cell), *at_cell, meaning._norm(" ".join(near)),
                           meaning._norm(" ".join(x for x in table_text if x)), governing=governing))
     # who stated it: the column header, else the row label, else the table's caption, title or notes (KTD8)
@@ -2730,13 +2732,16 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
     # of the heading-like line above that governs its block ("ממצאי הבדיקה באלפי ₪" over one figure per paragraph)
     held = _value_blocks(anchor)
     notes = [governing(b) for b in sorted(held)] if governing is not None and held else [""]
-    scales = ({calc.stated_scale(text_, at + start, at + end)} if units and not units & {"ILS", "ILS_per_sqm"} else
+    # a duration, count, coefficient, area or rate takes neither the currency nor the scale of a heading
+    own_kind_not_money = meaning.nonmonetary(local) or (len(_numbers_of(quote)) == 1 and meaning.nonmonetary(quote))
+    scales = ({calc.stated_scale(text_, at + start, at + end)}
+              if own_kind_not_money or units and not units & {"ILS", "ILS_per_sqm"} else
               {_value_scale(text_, at + start, at + end, quote, line, governing=note) for note in notes})
     if len(scales) != 1:
         raise ToolError(MSG_QUOTE_AMBIGUOUS.format(sid=src.sid))
     scale = scales.pop()
     unit_from = "quote" if units else None
-    if not units:
+    if not units and not own_kind_not_money:
         inherited = {frozenset(_note_units(note)) for note in notes}
         if len(inherited) > 1:
             raise ToolError(MSG_QUOTE_AMBIGUOUS.format(sid=src.sid))
