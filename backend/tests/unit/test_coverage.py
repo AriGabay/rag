@@ -728,8 +728,10 @@ def test_ae3_a_claim_citing_another_propertys_value_is_removed_as_wrong_property
     (gap,) = [g for g in r.gaps if g["components"] == ["N2"]]
     assert gap["reason"] == "removed" and "**דמי השכירות**" in gap["text"] and "לנכס או לצד אחר" in gap["text"]
     assert gap["text"] in final.answer_markdown
+    # round 8 U7: the row also names its claim and the action taken
     assert r.counts()["removals"] == [{"failure_kind": "wrong_subject", "component": "N2",
-                                       "text": verify.REMOVAL_SENTENCES["wrong_subject"]}]
+                                        "text": verify.REMOVAL_SENTENCES["wrong_subject"],
+                                        "claim_id": decision.claim_id, "action": "removed"}]
 
 
 def test_a_claim_the_deterministic_checks_removed_is_shown_to_the_judge_so_its_component_is_known():

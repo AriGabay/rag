@@ -10,6 +10,7 @@ text below is unique to the revoked document, so its absence is checked literall
 from __future__ import annotations
 
 import json
+import uuid
 
 import pytest
 from sqlalchemy import text
@@ -289,9 +290,10 @@ def test_removed_claims_reach_the_owner_and_an_admin_only_through_diagnostics(cl
     assert d.status_code == 200 and any("41" in p["reason"] for p in d.json()["removed"]) and d.json()["rounds"]
     # round 7 U4 (KTD5, R12, R13): the normal path names each removal's kind with the server's fixed sentence only;
     # the draft text, the factual reason and the sources checked are diagnostics
-    assert v["removals"] == [{"failure_kind": "absent_from_source", "component": None,
-                              "text": verify.REMOVAL_SENTENCES["absent_from_source"]}]
     (decision,) = d.json()["removed"]
+    # round 8 U7 (KTD8): the row also names the claim it belongs to and what was done to it — and nothing of the draft
+    assert v["removals"] == [{"failure_kind": "absent_from_source", "component": None, "claim_id": decision["claim_id"],
+                              "action": "removed", "text": verify.REMOVAL_SENTENCES["absent_from_source"]}]
     assert "41" in decision["text"] and decision["failure_kind"] == "absent_from_source"
     assert decision["check"] == "unstated_number" and decision["checked_ids"] == ["S1"]
     assert [s["document_id"] for s in decision["sources"]] == [setup.public]
@@ -336,6 +338,47 @@ def test_revoking_a_document_only_a_removed_claim_checked_hides_the_message_and_
     assert m["status"] == "done" and "41" not in m["answer"]["markdown"], m
     (decision,) = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["removed"]
     assert decision["checked_ids"] == ["S2"] and [s["document_id"] for s in decision["sources"]] == [setup.secret]
+    with tenant_tx(setup.system) as conn:
+        docs = conn.execute(text("SELECT document_ids FROM message_diagnostics WHERE message_id = :m"),
+                            {"m": m["id"]}).scalar_one()
+    assert setup.secret in {str(x) for x in docs}
+    _revoke(setup, setup.secret)
+    assert client.get(f"/api/chat/messages/{m['id']}").json()["answer"].get("hidden") is True
+    assert client.get(f"/api/chat/messages/{m['id']}/diagnostics").status_code == 404
+
+
+def test_revoking_a_document_only_a_re_read_reached_hides_the_message_and_its_diagnostics(client, setup, monkeypatch):
+    """Round 8 U7 (KTD8, R24): the removed claim cites the public document; the re-read of its source reached a passage
+    of another (the secret one) that nothing else in the answer names. The expansion is behind the message and its
+    diagnostics like any document a removal was checked against."""
+    wrong = final("השווי למ\"ר בנוי הוא 9,500 ₪ [S1]. דמי הניהול הם 41 ₪ למ\"ר [S1].", documents=[setup.public])
+    agent = _agent([[call("search", query="שווי", document_ids=[setup.public], limit=None)], wrong, wrong, wrong])
+    cloud(monkeypatch, setup, agent)
+    with tenant_tx(setup.system) as conn:
+        version = conn.execute(text("SELECT id FROM document_versions WHERE document_id = :d"),
+                               {"d": setup.secret}).scalar_one()
+    real = chat_api.engine.run_turn
+
+    def run_turn(*args, **kwargs):
+        out = real(*args, **kwargs)
+        ws = out.workspace
+        expansion = ws.add_source(document_id=uuid.UUID(setup.secret), version_id=version, title="נספח", section="",
+                                  location="הרחבה", kind="context", text="הקשר נוסף")
+        removed = next(r for recs in out.report.claims.values() for r in recs if r.action == "removed")
+        removed.rereads.append({"source": "S1", "scope": "neighbours", "outcome": "unsupported",
+                                "expanded_source": expansion.sid})
+        return out
+
+    monkeypatch.setattr(chat_api.engine, "run_turn", run_turn)
+    login(client, "emp@example.test")
+    m = send(client, new_conversation(client), "מה השווי?")
+    assert m["status"] == "done" and "41" not in m["answer"]["markdown"], m
+    assert setup.secret not in json.dumps(m["answer"]["sources"]), "no cited source is the re-read one"
+    (decision,) = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["removed"]
+    assert decision["checked_ids"] == ["S1"] and decision["sources_checked"] == ["S1"]
+    assert {"source": "S1", "scope": "neighbours", "outcome": "unsupported", "expanded_source": "S2"} in decision["rereads"]
+    assert {s["document_id"] for s in decision["sources"]} == {setup.public, setup.secret}
+    assert setup.secret in m["answer"]["removal_documents"]
     with tenant_tx(setup.system) as conn:
         docs = conn.execute(text("SELECT document_ids FROM message_diagnostics WHERE message_id = :m"),
                             {"m": m["id"]}).scalar_one()

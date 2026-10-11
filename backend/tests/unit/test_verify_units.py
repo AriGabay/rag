@@ -721,7 +721,8 @@ def test_a_judge_timeout_on_one_batch_records_its_units_as_not_checked_never_as_
     assert len(usage) == 3  # the batch that timed out was tried twice, never a third time
     (summary,) = r.counts()["removals"]
     assert summary == {"failure_kind": "not_checked", "component": None, "cause": "check_failed",
-                       "text": verify.CHECK_CAUSE_SENTENCES["check_failed"]}
+                       "text": verify.CHECK_CAUSE_SENTENCES["check_failed"], "claim_id": decision.claim_id,
+                       "action": "withheld"}
     assert "שגוי" not in summary["text"].replace("לא נמצאה שגויה", "") and "תמיכה" not in summary["text"]
     out = r.apply(a).answer_markdown
     assert "פנוי" not in out and "לא נמצאה להן תמיכה" not in out and "לא ניתן היה לבדוק" in out
@@ -776,8 +777,10 @@ def test_the_public_removal_summary_has_the_kind_and_a_fixed_sentence_never_the_
     counts = r.counts()
     assert counts["removed"] == len(counts["removals"]) == 1
     (summary,) = counts["removals"]
+    (decision,) = r.removals()
     assert summary == {"failure_kind": "wrong_subject", "component": None,
-                       "text": verify.REMOVAL_SENTENCES["wrong_subject"]}
+                       "text": verify.REMOVAL_SENTENCES["wrong_subject"], "claim_id": decision.claim_id,
+                       "action": "removed"}
     shown = json.dumps(counts, ensure_ascii=False)
     assert "שכירות" not in shown and "השווי שייך לנכס אחר" not in shown
     assert set(verify.REMOVAL_SENTENCES) == set(verify.FAILURE_KINDS)

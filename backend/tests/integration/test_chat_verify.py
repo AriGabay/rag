@@ -4,12 +4,15 @@ logged. The model is scripted; synthetic text only."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
 import pytest
 from sqlalchemy import text
 
+from app.chat import verify
+from app.chat.compose import SERVER_SPANS_FIELD
 from app.db import tenant_tx
 from tests.conftest import login
 from tests.factories import make_group, make_office, make_user
@@ -125,7 +128,157 @@ def test_the_stored_diagnostics_hold_only_the_removed_units_each_with_its_decisi
     with tenant_tx(setup.system) as conn:
         row = conn.execute(text("SELECT removed, rounds FROM message_diagnostics WHERE message_id = :m"),
                            {"m": m["id"]}).one()
-    (decision,) = row.removed  # the marked sentence is not a removal
+    # round 8 U7 (R22): the marked sentence is logged too (qualified), before the removal — the log is in the text's order
+    marked, decision = row.removed
+    assert marked["action"] == "qualified" and decision["action"] == "removed"
     assert "812" in decision["text"] and decision["failure_kind"] == "absent_from_source"
     assert decision["checked_ids"] == ["S1"] and decision["repair_attempted"] is True
     assert any(p["severity"] == "partial" for p in row.rounds[-1])  # every problem stays in the rounds
+
+
+# --- round 8 U7 (R17, R22-R25, KTD8): the digest, the claim-linked rows and the full per-claim log -----------------------
+
+CLAUSE = "שנקבעו בוועדה"
+MIXED = f"דמי הניהול במגדל {MARKER} הם 33 ₪ למ\"ר לחודש"
+
+
+def _handled_judge(input: str) -> dict:
+    """The first sentence is partly supported with no concrete defect (marked); a clause of the mixed sentence is
+    unsupported (cut); the rest supported."""
+    out = []
+    for i, t in re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S):
+        if CLAUSE in t:
+            out.append({"index": int(i), "verdict": "partial", "reason": "הוועדה אינה במקור", "defect": "part",
+                        "claims": [{"span": MIXED, "verdict": "supported"},
+                                   {"span": CLAUSE, "verdict": "unsupported", "failure": "absent_from_source"}]})
+        else:
+            out.append({"index": int(i), "verdict": "partial" if "לחודש" in t else "supported", "reason": "בדיקה",
+                        "defect": "none"})
+    return {"verdicts": out}
+
+
+def _handled_turn(client, setup, monkeypatch, judge=_handled_judge) -> dict:
+    """One answer with a cut claim (first), a removed unit (second) and a marked one (third)."""
+    answer = final(f"{MIXED}, {CLAUSE} [S1]. השטח הוא 812 מ\"ר [S1]. דמי הניהול בנוסף הם 33 ₪ למ\"ר לחודש [S1].",
+                   documents=[setup.secret])
+    agent = ScriptedAgent([[call("search", query="דמי ניהול", document_ids=[setup.secret], limit=None)],
+                           answer, answer, answer], judge=judge)
+    cloud(monkeypatch, setup, agent)
+    login(client, "emp@example.test")
+    m = send(client, new_conversation(client), "מה דמי הניהול והשטח?")
+    assert m["status"] == "done", m
+    return m
+
+
+def _diagnostics_row(setup, message_id: str):
+    with tenant_tx(setup.system) as conn:
+        return conn.execute(text("SELECT removed, rounds, document_ids FROM message_diagnostics WHERE message_id = :m"),
+                            {"m": message_id}).one()
+
+
+def test_the_payload_digest_is_the_sha256_of_the_saved_text_and_the_actions_are_counted(client, setup, monkeypatch):
+    m = _handled_turn(client, setup, monkeypatch)
+    v = m["answer"]["verification"]
+    with tenant_tx(setup.system) as conn:
+        saved = conn.execute(text("SELECT content FROM messages WHERE id = :m"), {"m": m["id"]}).scalar_one()
+    assert saved == m["content"] == m["answer"]["markdown"]
+    assert v["final_digest"] == hashlib.sha256(saved.encode("utf-8")).hexdigest()
+    assert v["actions"] == {"removed": 1, "cut": 1, "rewritten": 0, "withheld": 0, "qualified": 1, "cited": 0}
+    # after a refresh: the same text, the same digest
+    again = client.get(f"/api/chat/messages/{m['id']}").json()
+    assert again["content"] == saved and again["answer"]["verification"]["final_digest"] == v["final_digest"]
+
+
+def test_the_rows_of_the_normal_payload_name_the_claim_the_action_and_the_marker_in_the_texts_order(
+        client, setup, monkeypatch):
+    m = _handled_turn(client, setup, monkeypatch)
+    rows = m["answer"]["verification"]["removals"]
+    # the cut claim stands before the removed unit in the answer, so its row does too
+    assert [(r["action"], r["failure_kind"]) for r in rows] == [("cut", "absent_from_source"),
+                                                              ("removed", "absent_from_source")]
+    assert rows[0]["ordinal"] == 1 and "ordinal" not in rows[1]
+    assert "«[1: חלק שלא אומת הושמט]»" in m["content"]
+    assert all(re.fullmatch(r"k[0-9a-f]{12}", r["claim_id"]) for r in rows) and rows[0]["claim_id"] != rows[1]["claim_id"]
+    # nothing but the fixed sentence of the kind reaches the normal path: not the draft, not a verdict, not an offset
+    assert {k for r in rows for k in r} == {"claim_id", "action", "ordinal", "failure_kind", "component", "text"}
+    assert [r["text"] for r in rows] == [verify.REMOVAL_SENTENCES["absent_from_source"]] * 2
+    assert set(m["answer"]["verification"]) <= {"judged", "judge_status", "removed", "partial", "annotated",
+                                                "request_mismatch", "conditional", "correctness", "completeness",
+                                                "removals", "final_digest", "actions"}
+
+
+def test_every_handled_claim_has_a_log_entry_with_the_whole_record_and_the_rows_pair_with_it_by_claim_id(
+        client, setup, monkeypatch):
+    m = _handled_turn(client, setup, monkeypatch)
+    rows = m["answer"]["verification"]["removals"]
+    log = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["removed"]
+    # the log is in the text's order: cut, removed, qualified
+    assert [e["action"] for e in log] == ["cut", "removed", "qualified"]
+    cut, removed, qualified = log
+    needed = {"claim_id", "action", "text", "remaining", "verdict", "reason", "failure_kind", "cause", "check",
+              "sources_checked", "sources", "rereads", "post_check"}
+    assert all(needed <= set(e) for e in log), [needed - set(e) for e in log]
+    assert cut["text"] == CLAUSE and cut["remaining"] == "«[1: חלק שלא אומת הושמט]»" and cut["ordinal"] == 1
+    assert cut["verdict"] == "unsupported" and cut["failure_kind"] == "absent_from_source"
+    assert "הוועדה אינה במקור" in cut["reason"]
+    assert "812" in removed["text"] and removed["remaining"] == "" and removed["check"] == "unstated_number"
+    assert removed["sources_checked"] == ["S1"] and [s["document_id"] for s in removed["sources"]] == [setup.secret]
+    assert removed["sources"][0]["id"] == "S1" and "anchor" in removed["sources"][0]
+    # the number was looked for in the rest of the source before the unit was given up (U5): both attempts are logged
+    assert [(x["source"], x["scope"], x["outcome"]) for x in removed["rereads"]] == [
+        ("S1", "next_page", "not_found"), ("S1", "continuation", "not_found")]
+    assert cut["rereads"] == [] and removed["post_check"] and cut["post_check"]
+    assert qualified["text"].startswith("דמי הניהול בנוסף") and qualified["remaining"] == qualified["text"]
+    # a summary finds its decision by claim id, whatever the order of the list
+    by_id = {e["claim_id"]: e for e in reversed(log)}
+    for r in rows:
+        assert by_id[r["claim_id"]]["failure_kind"] == r["failure_kind"] and by_id[r["claim_id"]]["action"] == r["action"]
+    # the same record is what is stored
+    assert [e["claim_id"] for e in _diagnostics_row(setup, m["id"]).removed] == [e["claim_id"] for e in log]
+
+
+def test_the_serialized_answer_holds_no_draft_text_and_its_registry_only_offsets_and_kinds(client, setup, monkeypatch):
+    m = _handled_turn(client, setup, monkeypatch)
+    spans = m["answer"][SERVER_SPANS_FIELD]
+    assert spans and all(set(s) == {"start", "end", "kind"} for s in spans)
+    assert {s["kind"] for s in spans} >= {"marker", "partial_mark", "removal_note"}
+    assert all(m["content"][s["start"]:s["end"]] for s in spans)
+    shown = json.dumps(m["answer"], ensure_ascii=False)
+    assert "812" not in shown and CLAUSE not in shown and CLAUSE not in m["content"]
+    # no claim list, no verdict, no offsets of claims
+    assert m["answer"]["claims"] == []
+    assert not {"claim_records", "verdict", "citation", "sources_checked", "rereads", "post_check"} & (
+        set(m["answer"]) | set(m["answer"]["verification"]))
+
+
+def test_claim_ids_of_two_messages_with_the_same_text_differ(client, setup, monkeypatch):
+    answer = final(f"{MIXED}, {CLAUSE} [S1]. השטח הוא 812 מ\"ר [S1].", documents=[setup.secret])
+    search = [call("search", query="דמי ניהול", document_ids=[setup.secret], limit=None)]
+    agent = ScriptedAgent([search, answer, answer, answer, search, answer, answer, answer], judge=_handled_judge)
+    cloud(monkeypatch, setup, agent)
+    login(client, "emp@example.test")
+    first = send(client, new_conversation(client), "מה דמי הניהול והשטח?")
+    second = send(client, new_conversation(client), "מה דמי הניהול והשטח?")
+    ids = [[r["claim_id"] for r in m["answer"]["verification"]["removals"]] for m in (first, second)]
+    assert len(ids[0]) == len(ids[1]) == 2 and not set(ids[0]) & set(ids[1])
+
+
+def test_a_message_stored_before_claim_rows_and_the_registry_still_serializes(client, setup, monkeypatch):
+    m = _handled_turn(client, setup, monkeypatch)
+    with tenant_tx(setup.system) as conn:
+        old = conn.execute(text("SELECT answer FROM messages WHERE id = :m"), {"m": m["id"]}).scalar_one()
+        old.pop(SERVER_SPANS_FIELD)
+        old["claims"] = [{"text": "דמי הניהול", "source_ids": ["S1"], "basis": "explicit"}]
+        old["verification"] = {"judged": True, "judge_status": "ok", "removed": 1, "removals": [
+            {"failure_kind": "absent_from_source", "component": None, "text": "x"}]}
+        conn.execute(text("UPDATE messages SET answer = CAST(:a AS jsonb) WHERE id = :m"),
+                     {"a": json.dumps(old, ensure_ascii=False), "m": m["id"]})
+        conn.execute(text("UPDATE message_diagnostics SET removed = CAST(:r AS jsonb) WHERE message_id = :m"),
+                     {"r": json.dumps([{"text": "השטח הוא 812", "reason": "r", "failure_kind": "absent_from_source"}]),
+                      "m": m["id"]})
+    shown = client.get(f"/api/chat/messages/{m['id']}").json()
+    v = shown["answer"]["verification"]
+    assert v["removals"] == [{"failure_kind": "absent_from_source", "component": None,
+                              "text": verify.REMOVAL_SENTENCES["absent_from_source"]}]
+    assert "final_digest" not in v and "actions" not in v and shown["answer"]["claims"]  # its own, as stored
+    assert client.get(f"/api/chat/messages/{m['id']}/diagnostics").status_code == 200

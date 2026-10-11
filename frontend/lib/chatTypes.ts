@@ -370,6 +370,23 @@ export interface ChatRemoval {
   text: string;
   /** For `not_checked` only (round 8 R14): why — `check_failed`, `omitted` or `not_classified`; `text` says it. */
   cause?: "check_failed" | "omitted" | "not_classified";
+  /** Round 8 U7 (KTD8): the claim this row belongs to, the same id as its `ChatRemovalDecision`. Absent on older answers. */
+  claim_id?: string;
+  /** What was done to the claim: a unit removed, a unit withheld (its check did not complete), or a span cut. */
+  action?: "removed" | "withheld" | "cut";
+  /** For a cut: the ordinal N of the marker «[N: …]» that replaced the claim in the answer's text. */
+  ordinal?: number;
+}
+
+/** How many claims each action touched (round 8 U7); `removed`, `cut`, `rewritten` and `withheld` change the text,
+ * `qualified` and `cited` add a qualifier or a citation. */
+export interface ChatVerificationActions {
+  removed: number;
+  cut: number;
+  rewritten: number;
+  withheld: number;
+  qualified: number;
+  cited: number;
 }
 
 /** What verification did, in counts; what it removed, and why, is diagnostics (not on this path). */
@@ -384,8 +401,12 @@ export interface ChatVerification {
   correctness?: ChatCorrectness;
   /** Absent when no requirements were judged (and on older answers). */
   completeness?: ChatCompleteness;
-  /** One summary per removed claim, in the answer's order (absent on answers stored before round 7). */
+  /** One summary per claim taken out of the text, in the answer's order (absent on answers stored before round 7). */
   removals?: ChatRemoval[];
+  /** sha256 (hex) of the saved Markdown — `Message.content` (round 8 U7, R17). Absent on older answers. */
+  final_digest?: string;
+  /** Absent on older answers. */
+  actions?: ChatVerificationActions;
   /** Results kept with the server's conditional qualifier (absent on older answers). */
   conditional?: number;
 }
@@ -451,8 +472,19 @@ export type ChatCheckedSource =
   | (ChatComputation & { type: "computations" })
   | (ChatAssumption & { type: "assumptions" });
 
-/** A removed claim's decision (diagnostics only): the draft text (never a fact), the factual reason and the sources
- * it was checked against. */
+/** One re-read of a claim's source (diagnostics only; round 8 U5): the source read, what was read, how it ended and,
+ * when it was registered as a source of the turn, which. */
+export interface ChatReread {
+  source: string;
+  scope?: string;
+  outcome?: string;
+  reason?: string;
+  expanded_source?: string;
+}
+
+/** A handled claim's log entry (diagnostics only): the draft text (never a fact), the factual reason and the sources
+ * it was checked against. Round 8 U7 (R22): one per claim removed, cut, rewritten, withheld, qualified or cited, in the
+ * text's order and linked to its summary by `claim_id`; the fields after `repair_attempted` are absent on older logs. */
 export interface ChatRemovalDecision {
   text: string;
   reason: string;
@@ -464,6 +496,19 @@ export interface ChatRemovalDecision {
   checked_ids: string[];
   repair_attempted: boolean;
   sources?: ChatCheckedSource[];
+  claim_id?: string;
+  action?: "removed" | "withheld" | "cut" | "rewritten" | "qualified" | "cited";
+  /** For a cut: the ordinal of the marker in the answer's text. */
+  ordinal?: number;
+  /** What remains of the claim in the answer: nothing for a removal, the marker for a cut, the claim otherwise. */
+  remaining?: string;
+  verdict?: string;
+  /** For `not_checked`: why the claim could not be checked. */
+  cause?: string;
+  sources_checked?: string[];
+  rereads?: ChatReread[];
+  /** The final check's result on the claim as saved (`n/a` when it was not judged again). */
+  post_check?: string;
 }
 
 /** GET /api/chat/messages/{id}/diagnostics: the owner's or an office admin's view of what verification removed. */

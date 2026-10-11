@@ -214,9 +214,10 @@ def test_f4_a_removal_is_recorded_with_its_failure_kind_and_the_sources_checked(
     counts = out.report.counts()
     assert counts["removed"] == 1 and "1,234" not in out.answer.answer_markdown  # the wrong number was removed
     removed = api._diagnostics(out, {})["removed"]
-    # the stored diagnostics hold the removal only (not the kept, marked sentence), with its structured decision
-    assert len(removed) == 1, removed
-    (decision,) = removed
+    # the stored diagnostics hold the removal with its structured decision; since round 8 U7 (R22) the kept, marked
+    # sentence is logged too, as qualified, after it in the text's order
+    assert [e["action"] for e in removed] == ["removed", "qualified"], removed
+    decision = removed[0]
     assert decision.get("failure_kind") and "S1" in (decision.get("checked_ids") or []), decision
     # the user's normal path names the removal's failure kind, not only a count
     shown = api.public_verification(counts)

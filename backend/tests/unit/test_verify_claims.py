@@ -378,6 +378,39 @@ def test_a_claim_changed_by_a_repair_gets_a_new_id_with_the_parent_it_replaced()
     assert kept.claims[0][0].parent_id == ""
 
 
+def test_a_rewritten_claim_keeps_its_draft_and_is_logged_as_rewritten_in_the_texts_order():
+    """Round 8 U7 (R22, KTD8): the log's original text for a claim a repair replaced is the earliest version, and the
+    counts say how many claims each action touched."""
+    cache, ws = VerdictCache(), _salted()
+    first = verify_answer(_judge(_mixed_judge), _answer("תכסית 40% מותרת, והנכס מושכר [S1]."), ws, "?", [], cache=cache)
+    assert first.counts()["actions"] == {"removed": 0, "cut": 1, "rewritten": 0, "withheld": 0, "qualified": 0,
+                                         "cited": 0}
+    second = verify_answer(_judge(_supported), _answer("תכסית 40% מותרת, והנכס מושכר ללא חוזה [S1]."), ws, "?", [],
+                           cache=cache)
+    (row,) = second.logged()
+    assert row.action == "rewritten" and row.claim_id == second.claims[0][0].id
+    assert row.record.draft == SPAN_BAD and row.record.text != SPAN_BAD
+    counts = second.counts()
+    assert counts["actions"]["rewritten"] == 1 and counts["removals"] == []  # a rewrite takes nothing out of the text
+
+
+def test_the_handled_claims_are_logged_in_the_texts_order_whatever_their_action():
+    def respond(input: str) -> dict:
+        out = []
+        for i, t in _units(input).items():
+            if "מושכר" in t:
+                out.append({"index": i, "verdict": "partial", "reason": "x", "defect": "part", "claims": [
+                    {"span": SPAN_OK, "verdict": "supported"}, {"span": SPAN_BAD, "verdict": "unsupported"}]})
+            else:
+                out.append({"index": i, "verdict": "unsupported" if "פנוי" in t else "supported", "reason": "y"})
+        return {"verdicts": out}
+
+    md = "הנכס פנוי [S1].\n" + SENTENCE
+    report = verify_answer(_judge(respond), _answer(md), _salted(), "?", [])
+    assert [(r.action, r.position) for r in report.logged()] == [("removed", 0), ("cut", md.index(SPAN_BAD))]
+    assert [r["action"] for r in report.counts()["removals"]] == ["removed", "cut"]
+
+
 def test_a_problem_carries_the_id_of_the_failing_claim_and_reports_it_in_diagnostics():
     def respond(input: str) -> dict:
         return {"verdicts": [{"index": i, "verdict": "unsupported", "reason": "x"} for i in _units(input)]}

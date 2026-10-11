@@ -142,6 +142,10 @@ def test_ae2_an_uncited_datum_supported_by_a_source_read_in_the_turn_gets_its_ci
     assert report.counts()["removed"] == 0, report.counts()
     assert "55" in final_text and "[S2]" in final_text, final_text  # kept, with the citation attached
     assert not [p for p in report.problems if p.removes_unit], [p.reason for p in report.problems]
+    # round 8 U7: the citation the server attached is logged as such, in the counts and with the claim's id
+    assert report.counts()["actions"]["cited"] == 1 and report.counts()["removals"] == []
+    (entry,) = [e for e in report.logged() if e.action == "cited"]
+    assert "55" in entry.record.text and entry.claim_id == entry.record.id
 
 
 # --- AE3 (R6, R14, R19): a technical failure of the check is never a removal for lack of support ----------------------
@@ -178,6 +182,9 @@ def test_ae3_a_judge_batch_failing_twice_is_withheld_with_its_own_reason_and_the
     # never called wrong: not contradicted, not absent from the source, not any content failure
     assert failed.failure_kind not in CONTENT_FAILURES, failed.failure_kind
     # the three causes stay distinct (R14): the failed call has a reason, and a sentence on the user's path, of its own
+    # each is withheld, not removed (U7): the counts and the rows say so, under the claim's own id
+    assert report.counts()["actions"]["withheld"] == 3 and report.counts()["actions"]["removed"] == 0
+    assert {r["action"] for r in report.counts()["removals"]} == {"withheld"}
     reasons = {(p.failure_kind, p.summary()["text"]) for p in by_text.values()}
     assert len(reasons) == 3, {t: (p.failure_kind, p.summary()["text"]) for t, p in by_text.items()}
 
@@ -276,9 +283,6 @@ AE6_ANSWER = "השווי למ\"ר הוא 9,500 ₪ [S1]."
 COMPONENT = "מספר החדרים בנכס"
 
 
-@pytest.mark.xfail(strict=True, reason="U7 (R17, KTD8): the saved text is the checked text and its digest is on the "
-                                       "outcome (U6: TurnOutcome.final_digest, tests/unit/test_final_check.py), but the "
-                                       "API payload has no verification.final_digest yet")
 def test_ae6_text_added_after_verification_is_saved_checked_and_recorded_with_a_digest(offline):
     offline.limits = [engine.STEP_LIMIT]
     offline.coverage = lambda answer: "**כיסוי:** לא כל המסמכים המתאימים נבדקו."
@@ -316,9 +320,6 @@ TWO_WRONG = ("השווי למ\"ר הוא 9,500 ₪ [S1].\n"
              "דמי הניהול הם 777 ₪ למ\"ר לחודש [S1].")
 
 
-@pytest.mark.xfail(strict=True, reason="U3/U7/U8 (R22, R23, KTD8): the removal summaries (verification.removals) and the "
-                                       "decisions (diagnostics.removed) carry no claim id; Message.tsx pairs them by "
-                                       "list position")
 def test_ae8_removal_summaries_and_decisions_are_paired_by_claim_id_not_by_position(offline):
     offline.text = SOURCE
     agent = ScriptedAgent([SEARCH, final(TWO_WRONG), CallStatus.ERROR])  # the repair round fails: the checked one stays

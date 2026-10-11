@@ -886,6 +886,15 @@ def repair_key(unit: Unit) -> str:
     return " ".join(unit.text.split())
 
 
+def removal_summary(kind: str, cause: str = "", component: str | None = None) -> dict:
+    """A removal on the user's normal path (KTD5): its kind, its component and the server's fixed sentence — a claim
+    that could not be checked says why (R14): each cause its own sentence, none a contradiction."""
+    cause = cause if kind == "not_checked" and cause in CHECK_CAUSE_SENTENCES else ""
+    return {"failure_kind": kind, "component": component,
+            "text": CHECK_CAUSE_SENTENCES[cause] if cause else REMOVAL_SENTENCES[kind]} | (
+        {"cause": cause} if cause else {})
+
+
 @dataclass
 class Problem:
     unit: Unit
@@ -974,12 +983,7 @@ class Problem:
 
     def summary(self) -> dict:
         """The removal on the user's normal path (KTD5): its kind, its component and the server's fixed sentence."""
-        kind = self.failure_kind or "absent_from_source"
-        # a claim that could not be checked says why (R14): each cause its own sentence, none a contradiction
-        cause = self.cause if kind == "not_checked" and self.cause in CHECK_CAUSE_SENTENCES else ""
-        return {"failure_kind": kind, "component": self.component,
-                "text": CHECK_CAUSE_SENTENCES[cause] if cause else REMOVAL_SENTENCES[kind]} | (
-            {"cause": cause} if cause else {})
+        return removal_summary(self.failure_kind or "absent_from_source", self.cause, self.component)
 
     def repair_note(self) -> str:
         """What the repair prompt says of the problem beside its reason (KTD10): its kind, the ids checked and how
@@ -1143,10 +1147,40 @@ class VerifyReport:
             return "partial"
         return "verified"
 
+    def logged(self) -> list[Logged]:
+        """Every claim the server handled, for the log and the user's rows (round 8 U7, R22, KTD8), in the text's
+        order: a unit removed or withheld (one entry for the unit, under its first failing claim), and each claim of a
+        unit that stays whose ``action`` is a cut, a rewrite, a qualifier or a citation. An absence the server
+        replaced is not one (``removals``)."""
+        gone = self.removed_units()
+        out: list[Logged] = []
+        for p in self.removals():
+            recs = self.claims.get(p.unit.index, [])
+            primary = next((r for r in recs if r.id == p.claim_id), None) or next(
+                (r for r in recs if r.verdict in FAILING_VERDICTS), recs[0] if recs else None)
+            action = primary.action if primary is not None and primary.action in ("removed", "withheld") else (
+                "withheld" if p.failure_kind == "not_checked" else "removed")
+            out.append(Logged(p.claim_id or (primary.id if primary is not None else ""), action, p.unit, recs, p))
+        units = {u.index: u for u in self.units}
+        for idx in sorted(self.claims):
+            if idx in gone or idx not in units:
+                continue
+            for r in self.claims[idx]:
+                if r.action not in LOG_ACTIONS or r.action in ("removed", "withheld"):
+                    continue
+                mine = [p for p in self.problems if p.claim_id == r.id]
+                if not mine and r.action in ("qualified", "cited"):
+                    mine = [p for p in self.problems if p.unit.index == idx
+                            and (p.annotatable or p.kind == "needs_citation" or p.severity == "partial")]
+                out.append(Logged(r.id, r.action, units[idx], [r], mine[0] if mine else None,
+                                  r.marker if r.action == "cut" else 0))
+        return sorted(out, key=lambda row: row.position)
+
     def counts(self) -> dict:
         """What the user's normal path shows of verification (the removed text is diagnostics): correctness and,
         apart from it, completeness against the request's requirements."""
         errors = self.failed_units()
+        logged = self.logged()
         out = {"judged": self.judged, "judge_status": self.judge_status, "removed": len(errors),
                "partial": len({p.unit.index for p in self.problems if p.severity == "partial"} - errors),
                # a qualifier written from the source; a result the server marked conditional is counted apart
@@ -1155,8 +1189,11 @@ class VerifyReport:
                "conditional": len(self.conditional_units()),
                "request_mismatch": any(p.kind == "request" for p in self.problems),
                "correctness": self.correctness(),
-               # each removal's kind, component and the server's fixed sentence (KTD5), as many as ``removed``
-               "removals": [p.summary() for p in self.removals()]}
+               # each claim taken out of the text — a unit removed or withheld, a span cut — with its kind, component and
+               # the server's fixed sentence (KTD5), its claim id, its action and, for a cut, its marker (KTD8), in the
+               # text's order; and how many claims each action touched
+               "removals": [row.summary() for row in logged if row.action in ROW_ACTIONS],
+               "actions": {a: sum(1 for row in logged if row.action == a) for a in LOG_ACTIONS}}
         if self.completeness is not None:
             out["completeness"] = self.completeness
         return out
@@ -3811,6 +3848,9 @@ class ClaimRecord:
     # the verdict the final check (round 8 U6) gave the claim's sentence as it stands in the saved text, when it
     # judged it again; "" — it did not (the sentence was unchanged, or was removed before)
     post_check: str = ""
+    # for a claim a repair or rewrite replaced (``parent_id``): the text of the earliest version it replaced, the draft the
+    # log keeps as the original (R22)
+    draft: str = ""
 
     @property
     def span(self) -> str:
@@ -3833,6 +3873,49 @@ class ClaimRecord:
                 "failure": self.failure_kind() if self.verdict in FAILING_VERDICTS else "none",
                 "cause": self.cause, "marker": self.marker, "rereads": [dict(x) for x in self.rereads],
                 "post_check": self.post_check or "n/a"}
+
+
+# the actions a claim's log entry can record (``ClaimRecord.action``, minus ``kept``), and those that take the claim out of the
+# text, which have a row on the user's normal path with their claim id (round 8 U7, KTD8)
+LOG_ACTIONS = ("removed", "cut", "rewritten", "withheld", "qualified", "cited")
+ROW_ACTIONS = ("removed", "withheld", "cut")
+
+
+@dataclass
+class Logged:
+    """One handled claim for the log and the user's rows (``VerifyReport.logged``): its ``claim_id`` (a removed unit's
+    first failing claim), its ``action`` (``LOG_ACTIONS``), the unit it is in, the claim records it covers (all of a
+    removed unit's, else the one), the ``problem`` that decided it (None for a rewrite) and, for a cut, the ordinal
+    of its marker in the final text."""
+
+    claim_id: str
+    action: str
+    unit: Unit
+    records: list[ClaimRecord]
+    problem: Problem | None = None
+    ordinal: int = 0
+
+    @property
+    def record(self) -> ClaimRecord | None:
+        return next((r for r in self.records if r.id == self.claim_id), self.records[0] if self.records else None)
+
+    @property
+    def position(self) -> int:
+        """Where it stands in the model's text (the final text keeps that order)."""
+        r = self.record
+        return self.unit.start if self.action in ("removed", "withheld") or r is None else r.start
+
+    def summary(self) -> dict:
+        """The row on the normal path: the fixed sentence of the kind, never the claim's text, and the ids that link it."""
+        r = self.record
+        if self.action == "cut" and r is not None:
+            row = removal_summary(r.failure_kind(), r.cause, self.problem.component if self.problem else None)
+        elif self.problem is not None:
+            row = self.problem.summary()
+        else:
+            row = removal_summary("absent_from_source")
+        return row | {"claim_id": self.claim_id, "action": self.action} | (
+            {"ordinal": self.ordinal} if self.action == "cut" and self.ordinal > 0 else {})
 
 
 def _same_span(a: str, b: str) -> bool:
@@ -3981,7 +4064,7 @@ def _link_parents(report: VerifyReport, cache: VerdictCache) -> None:
                 if overlap > score and (_same_span(old.text, r.text) or overlap >= 0.5):
                     best, score = old, overlap
             if best is not None:
-                r.parent_id = best.id
+                r.parent_id, r.draft = best.id, best.draft or best.text
     for recs in report.claims.values():
         for r in recs:
             cache.records.setdefault(r.id, r)

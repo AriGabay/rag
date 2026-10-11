@@ -12,12 +12,17 @@ turn's bound. Conversations and messages are per user (RLS ``user_isolation``) a
 What verification removed, and why, is kept for diagnosis in ``message_diagnostics``, not in the answer: the
 normal message API gives counts, and — round 7 U4 (KTD5, R12, R13) — one summary per removal: its failure kind, its
 component and the server's fixed sentence for that kind (``verify.REMOVAL_SENTENCES``), never the claim's text or a
-judge's words. ``message_diagnostics.removed`` keeps only the problems that removed a claim, each with its decision
-(the draft text, the factual reason, the check that fired, the failure kind, the component, the ids checked, whether a
-repair was attempted) and the sources it was checked against. ``GET /messages/{id}/diagnostics`` returns the detail
-to the message's owner and to an office admin (audited), and only while every document behind the answer — the
-documents every removal was checked against included — is visible to them; those documents are behind the message
-too (``removal_documents``), so revoking one hides both.
+judge's words. ``message_diagnostics.removed`` keeps one entry per claim the server handled — removed, cut, rewritten,
+withheld, qualified or cited (round 8 U7, R22, KTD8) — in the text's order, each with its claim id, its action, the original
+(draft) text and what remains of it, the verdict and the reason, the cause when it could not be checked, the sources it was
+checked against (with their anchors), the re-reads attempted and the result of the final check. The rows of the normal
+path (``verification.removals``) carry the same claim id, the action and a cut's marker ordinal, and the payload holds
+``verification.final_digest`` (the digest of the saved text) and ``verification.actions`` (counts); a claim's verdict,
+citation state and offsets stay in the log. ``GET /messages/{id}/diagnostics`` returns the detail to the message's owner and
+to an office admin (audited), and only while every document behind the answer — the documents every entry was checked
+against and every re-read reached included — is visible to them; those documents are behind the message too
+(``removal_documents``), so revoking one hides both. The registry of the spans the server wrote in the text is saved with
+the answer (``compose.SERVER_SPANS_FIELD``: offsets and a fixed kind, never text).
 
 A clarification that asks for a detail only the user can give (round 7 U7, KTD9, R25) keeps its found values and
 citations, and stores its pending parameter in the answer (``answer.pending``: the component, its parameters, the
@@ -45,7 +50,7 @@ from sqlalchemy import Connection, text
 
 from app.audit import audit
 from app.chat import anchors, coverage, engine, verify
-from app.chat.compose import SERVER_SPANS_FIELD, strip_server_spans
+from app.chat.compose import MARKER, SERVER_SPANS_FIELD, strip_server_spans, text_digest
 from app.config import get_settings
 from app.db import TenantContext, current_data_version, tenant_tx
 from app.deps import NOT_FOUND, get_ctx, parse_uuid
@@ -229,15 +234,23 @@ def public_verification(v: dict) -> dict:
         # claim correctness and answer completeness, shown apart (answers stored before them have neither)
         k: v[k] for k in ("correctness", "completeness") if k in v} | (
         # each removal's kind, component and the server's fixed sentence, rebuilt here from the kind (KTD5)
-        {"removals": public_removals(v["removals"])} if isinstance(v.get("removals"), list) else {})
+        {"removals": public_removals(v["removals"])} if isinstance(v.get("removals"), list) else {}) | (
+        # the digest of the saved text and how many claims each action touched (round 8 U7, R17; none on older answers)
+        {"final_digest": v["final_digest"]} if isinstance(v.get("final_digest"), str)
+        and _DIGEST.fullmatch(v["final_digest"]) else {}) | (
+        {"actions": {k: v["actions"][k] for k in verify.LOG_ACTIONS if type(v["actions"].get(k)) is int}}
+        if isinstance(v.get("actions"), dict) else {})
 
 
 _COMPONENT_ID = re.compile(r"N\d+(?:\.\d+)*")
+_CLAIM_ID = re.compile(r"k[0-9a-f]{12}")
+_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
 def public_removals(items: list) -> list[dict]:
     """The removal summaries the normal path shows: a known failure kind, a component id and the fixed sentence for
-    the kind — nothing else that was stored passes."""
+    the kind, with — on a row stored by round 8 — the claim id it belongs to, its action and a cut's marker ordinal;
+    nothing else that was stored passes."""
     out = []
     for r in items:
         kind = r.get("failure_kind") if isinstance(r, dict) else None
@@ -246,11 +259,17 @@ def public_removals(items: list) -> list[dict]:
         component = r.get("component")
         # a claim that could not be checked says why, in the server's sentence for the cause (round 8 R14)
         cause = r.get("cause") if kind == "not_checked" and r.get("cause") in verify.CHECK_CAUSE_SENTENCES else None
+        action = r.get("action") if r.get("action") in verify.ROW_ACTIONS else None
+        claim_id = r.get("claim_id")
+        ordinal = r.get("ordinal")
         out.append({"failure_kind": kind,
                     "component": component if isinstance(component, str) and _COMPONENT_ID.fullmatch(component)
                     else None,
                     "text": verify.CHECK_CAUSE_SENTENCES[cause] if cause else verify.REMOVAL_SENTENCES[kind]}
-                   | ({"cause": cause} if cause else {}))
+                   | ({"cause": cause} if cause else {})
+                   | ({"claim_id": claim_id} if isinstance(claim_id, str) and _CLAIM_ID.fullmatch(claim_id) else {})
+                   | ({"action": action} if action else {})
+                   | ({"ordinal": ordinal} if action == "cut" and type(ordinal) is int and ordinal > 0 else {}))
     return out
 
 
@@ -704,16 +723,25 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
             focus = None
     pending = outcome.pending
     missing = a.missing_info or ("; ".join(pending["parameters"]) if pending else "")
+    digest = text_digest(a.answer_markdown)
+    if outcome.final_digest and outcome.final_digest != digest:  # the text saved is not the text that was checked
+        logger.error("the saved text differs from the text the final check verified")
     payload = {
-        "kind": "rag", "status": a.status, "markdown": a.answer_markdown, "claims": [c.model_dump() for c in a.claims],
+        # the model's own claim list is no longer kept (round 8 U7): claims are records of the verification, whose
+        # handled ones are in the log; an older message keeps the list it was stored with
+        "kind": "rag", "status": a.status, "markdown": a.answer_markdown, "claims": [],
         "clarification": a.clarification_question or None, "missing": missing or None,
         # round 7 KTD9: the parameter a clarification asks for — {"component", "text", "subject", "parameters",
         # "question", "found": [{"id", "label", "value_text", "source_id"}]} — bound to the user's reply next turn
         "pending": pending,
         "sources": sources, "measurements": measurements, "computations": computations, "values": values,
         "assumptions": assumptions, "documents": [{"document_id": k, "title": v} for k, v in docs.items()],
-        # counts only; what was removed and why is diagnostics (``_diagnostics``)
-        "verification": outcome.report.counts(),
+        # counts and the rows that link to the log; what was removed and why is diagnostics (``_diagnostics``). The
+        # digest is the saved text's (``messages.content``), which the final check verified (R17)
+        "verification": outcome.report.counts() | {"final_digest": digest},
+        # where the server wrote in the text: offsets and a kind, never text (the history of a later turn reads it)
+        SERVER_SPANS_FIELD: [{"start": int(sp.start), "end": int(sp.end), "kind": str(sp.kind)}
+                             for sp in outcome.server_spans],
         "searches": ws.searches, "coverage": ws.coverage, "steps": outcome.steps,
         # the turn limits it reached (tool-output budget, steps, time, visual readings): the answer says so
         "limits_hit": list(ws.limits_hit),
@@ -772,43 +800,103 @@ def _record_documents(record: dict) -> set[str]:
 
 
 class _Removals(NamedTuple):
-    """The turn's removals (``VerifyReport.removals``) with what each was checked against, gathered once for the
-    payload and the diagnostics: ``closure``, each removal's ids (``_checked_ids``); ``records``, one record per id
+    """The turn's handled claims (``VerifyReport.logged``) with what each was checked against, gathered once for the
+    payload and the diagnostics: ``entries``, in the text's order; ``closure``, each entry's ids (``_checked_ids``) —
+    its sources checked and the sources its re-reads reached, with what they rest on; ``records``, one record per id
     checked (``_checked_record``) with its ``type``; ``grouped``, the same records by type."""
 
-    problems: list
+    entries: list[verify.Logged]
     closure: list[list[str]]
     records: dict[str, dict]
     grouped: dict[str, list[dict]]
 
 
+def _entry_ids(entry: verify.Logged) -> list[str]:
+    """The ids an entry was checked against: those its decision named, the sources its claims were checked against and the
+    sources its re-reads read and expanded (each once, in order)."""
+    ids = list(entry.problem.checked_ids or []) if entry.problem is not None else []
+    for r in entry.records:
+        ids += r.sources_checked
+        for x in r.rereads:
+            ids += [x.get("source"), x.get("expanded_source")]
+    return [i for i in dict.fromkeys(ids) if isinstance(i, str) and i]
+
+
 def _removals(ws, report) -> _Removals:
-    problems = report.removals()
-    closure = [_checked_ids(ws, p.checked_ids or []) for p in problems]
+    entries = report.logged()
+    closure = [_checked_ids(ws, _entry_ids(e)) for e in entries]
     records: dict[str, dict] = {}
     grouped: dict[str, list[dict]] = {}
     for i in dict.fromkeys(i for ids in closure for i in ids):
         key, record = _checked_record(ws, i)
         records[i] = record | {"type": key}
         grouped.setdefault(key, []).append(records[i])
-    return _Removals(problems, closure, records, grouped)
+    return _Removals(entries, closure, records, grouped)
 
 
 def _removal_documents(removals: _Removals) -> set[str]:
-    """The documents every removal was checked against (``_checked_ids``)."""
+    """The documents every entry was checked against or re-read (``_entry_ids``): behind the message together with it."""
     return {d for record in removals.records.values() for d in _record_documents(record)}
 
 
+# what the log says of an action that no check failed (a failing one has the problem's own reason)
+ACTION_REASONS = {
+    "rewritten": "הטענה נוסחה מחדש בסבב התיקון, והנוסח החדש נבדק",
+    "qualified": "הטענה נתמכה חלקית; השרת סימן אותה או הוסיף לה סייג מהמקור",
+    "cited": "המקור נמצא בבדיקה; השרת צירף אותו כציטוט",
+    "cut": "חלק מהמשפט לא נתמך במקורות; השרת הסיר רק אותו",
+    "removed": "הטענה הוסרה",
+    "withheld": "הטענה לא נבדקה והוצאה מהתשובה",
+}
+REREAD_KEYS = ("source", "scope", "outcome", "reason", "expanded_source")
+
+
+def _decision(entry: verify.Logged, sources: list[dict]) -> dict:
+    """One entry of the log (round 8 U7, R22): the claim id and the action; the original (draft) text and what remains of it
+    (``text`` and ``remaining``); the verdict and the reason; the failure kind, the check, the component and whether a
+    repair was asked (round 7); the cause when the claim could not be checked; the ids checked (``checked_ids``) and the
+    sources checked (``sources_checked``, with ``sources`` as the client opens them); the re-reads attempted; the result of
+    the final check on the text as saved."""
+    p, r, action = entry.problem, entry.record, entry.action
+    removed = action in ("removed", "withheld")
+    if p is not None:
+        base = p.as_dict()
+    else:
+        base = {"text": "", "reason": "", "severity": "partial", "kind": "claim", "failure_kind": None, "check": None,
+                "component": None, "checked_ids": list(entry.unit.ids), "repair_attempted": False, "claim_id": "",
+                "cause": "", "basis": "", "resolution": ""}
+    claim = r.text if r is not None else entry.unit.text
+    original = base["text"] if removed and p is not None else (r.draft or r.text if r is not None else claim)
+    if action == "cut" and r is not None:
+        base["failure_kind"] = r.failure_kind()
+    reread: list[dict] = []
+    for rec in entry.records:
+        for x in rec.rereads:
+            item = {k: x[k] for k in REREAD_KEYS if x.get(k) not in (None, "")}
+            if item not in reread:
+                reread.append(item)
+    return base | {
+        "claim_id": entry.claim_id, "action": action, "text": original,
+        "remaining": "" if removed else MARKER.format(n=entry.ordinal) if action == "cut" and entry.ordinal > 0
+        else "" if action == "cut" else claim,
+        "verdict": r.verdict if r is not None else "",
+        "reason": base["reason"] or ACTION_REASONS.get(action, ""),
+        "cause": base["cause"] or (r.cause if r is not None else ""),
+        "sources_checked": list(dict.fromkeys(i for rec in entry.records for i in rec.sources_checked)),
+        "sources": sources, "rereads": reread,
+        "post_check": next((rec.post_check for rec in entry.records if rec.post_check), "n/a"),
+    } | ({"ordinal": entry.ordinal} if action == "cut" and entry.ordinal > 0 else {})
+
+
 def _removal_decisions(ws, removals: _Removals) -> list[dict]:
-    """Each removal's decision (round 7 KTD5, R12): the unit's draft text, the factual reason, the check that fired,
-    the failure kind, the component, the ids checked and whether a repair was attempted, with ``sources`` — each id
-    it was checked against (and what that rests on) as the client opens it, with its anchor (``anchors.attach``,
-    resolved against the turn's pinned readings) and its ``type`` (``sources``, ``values``, ``measurements``,
-    ``computations``, ``assumptions``)."""
+    """The log of the turn (round 8 U7, R22): one ``_decision`` per handled claim, in the text's order, with ``sources`` —
+    each id it was checked against, and each source its re-reads reached (and what that rests on), as the client opens it,
+    with its anchor (``anchors.attach``, resolved against the turn's pinned readings) and its ``type`` (``sources``,
+    ``values``, ``measurements``, ``computations``, ``assumptions``)."""
     if removals.records:
         anchors.attach(ws, removals.grouped)
-    return [p.as_dict() | {"sources": [removals.records[i] for i in ids]}
-            for p, ids in zip(removals.problems, removals.closure, strict=True)]
+    return [_decision(e, [removals.records[i] for i in ids])
+            for e, ids in zip(removals.entries, removals.closure, strict=True)]
 
 
 def _diagnostics(outcome: engine.TurnOutcome, payload: dict, removals: _Removals | None = None) -> dict:
