@@ -752,11 +752,15 @@ def _unit_passages(conn: Connection, files: list, stored: dict, terms: list[list
 
 
 def _printed_labels(conn: Connection, matches: UnitMatches) -> None:
-    """Each candidate unit's first printed page label, the part of its anchor that survives a new reading: the page's
-    stored label, else — a report whose numbering restarts keeps none — the number its page-number line states."""
+    printed_labels(conn, [*matches.units, *matches.comparables])
+
+
+def printed_labels(conn: Connection, units: list[dict]) -> None:
+    """Sets ``first_label`` on each unit row (``version_id``, ``page_first``): its first printed page label, the part of
+    its anchor that survives a new reading: the page's stored label, else — a report whose numbering restarts keeps
+    none — the number its page-number line states."""
     from app.chat import units as unit_store
 
-    units = [*matches.units, *matches.comparables]
     firsts = [(u["version_id"], u["page_first"]) for u in units if u["page_first"] is not None]
     labels: dict[tuple, str | None] = {}
     if firsts:

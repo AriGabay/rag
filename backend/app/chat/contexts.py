@@ -386,6 +386,12 @@ class Reach:
         return bool(self.before or self.after)
 
 
+def split_unit_key(key: str) -> tuple[str, str | None, int]:
+    """(version id, reading id or None, number) of a ``Contexts.key``."""
+    parts = key.split("#")
+    return parts[0], parts[1] if len(parts) == 3 else None, int(parts[-1])
+
+
 def split_key(key: str) -> tuple[str, int]:
     """(version id, context number) of a ``Contexts.key``."""
     return key.partition("#")[0], int(key.rpartition("#")[2])

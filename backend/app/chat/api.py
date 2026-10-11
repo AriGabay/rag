@@ -287,6 +287,7 @@ def _answer_documents(answer: dict | None) -> set[str]:
     ids |= {d.get("document_id") for d in answer.get("documents") or []}
     ids |= coverage.ledger_documents(answer.get("ledger"))
     ids |= set((answer.get("focus") or {}).get("document_ids") or [])
+    ids |= {(answer.get(k) or {}).get("document_id") for k in ("unit",)}  # the unit the conversation is in (round 9 U10)
     ids |= set((answer.get("request") or {}).get("document_ids") or [])
     ids |= {c.get("document_id") for c in (answer.get("request") or {}).get("candidates") or []}
     ids |= {d for r in answer.get("requested") or [] for d in r.get("document_ids") or []}
@@ -623,7 +624,8 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
     candidates: list[dict] = []
     pending = None
     if last is not None:
-        last_focus = last.answer.get("focus") or _request_focus(last.answer.get("request"))
+        last_focus = _with_unit(last.answer.get("focus") or _request_focus(last.answer.get("request")),
+                                last.answer.get("unit"))
         if last.answer.get("status") == "clarification":
             # the documents a server clarification offered: the reply is resolved among them (the message is in
             # ``rows`` only while every one of them is visible)
@@ -668,6 +670,21 @@ def _request_focus(request: dict | None) -> dict | None:
             "period": request.get("period", "unknown"), "area_basis": request.get("area_basis", ""),
             "vat": request.get("vat", "unknown"), "subject": request.get("subject", ""), "value_role": "unknown",
             "document_ids": list(request.get("document_ids") or [])}
+
+
+def _with_unit(focus: dict | None, unit: dict | None) -> dict | None:
+    """The conversation's focus with the appraisal unit it is in (round 9 U10, KTD8: ``located_unit``, the anchor the
+    last answer left). A conversation that has a unit and no datum — the turn ended on a limit, or found nothing — has a
+    focus of that unit alone, so "continue" or "and the rent?" stays inside it. A unit of another document than the
+    focus's belongs to no focus."""
+    if not unit:
+        return focus
+    doc = str(unit.get("document_id"))
+    if focus is None:
+        return {"metric_as_written": "", "metric_kind": "unknown", "unit": "unknown", "period": "unknown",
+                "area_basis": "", "vat": "unknown", "subject": unit.get("display") or "", "value_role": "unknown",
+                "document_ids": [doc], "located_unit": unit}
+    return focus | {"located_unit": unit} if doc in (focus.get("document_ids") or []) else focus
 
 
 def _public_source(src) -> dict:
@@ -724,6 +741,20 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
         focus["document_ids"] = [d for d in focus["document_ids"] if d in known]
         if not focus["document_ids"] and a.status == "not_found":
             focus = None
+    # the appraisal unit the conversation is in after this answer (round 9 U10, KTD8): the focus carries it as
+    # ``located_unit`` (``unit`` there is the datum's measure unit); when the answer has no focus the unit alone is kept.
+    # A unit of a file the answer does not touch or cite is the request's own and is kept all the same: the next
+    # turn's permission check drops it when the file is no longer visible
+    unit = outcome.unit
+    if focus is not None and unit and str(unit["document_id"]) in focus["document_ids"]:
+        focus["located_unit"] = unit
+    request = outcome.request or {}
+    kept = request.get("located_unit") if request.get("unit_kept") else None
+    unit_scope = None
+    if kept:
+        file_id = str(kept["document_id"])
+        unit_scope = {"title": kept.get("display"), "pages": kept.get("pages") or [], "kept": True,
+                      "file_title": docs.get(file_id) or (ws.activity.get(file_id) or {}).get("title") or ""}
     pending = outcome.pending
     missing = a.missing_info or ("; ".join(pending["parameters"]) if pending else "")
     # the digest is the final check's own; the text saved must be the text it verified (R17, R19), never an unchecked one
@@ -751,6 +782,9 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
         # the turn limits it reached (tool-output budget, steps, time, visual readings): the answer says so
         "limits_hit": list(ws.limits_hit),
         "ledger": outcome.ledger or None, "scope_kind": a.scope_kind, "focus": focus, "request": outcome.request,
+        # the appraisal unit the conversation is about now, and — when the turn stayed in the unit of the turn before —
+        # the answer's scope line for it (round 9 U10)
+        "unit": unit, **({"unit_scope": unit_scope} if unit_scope else {}),
         # each requested datum with the status the turn's actions support (found, or how it was not found)
         "requested": coverage.validate_requested(ws, a.requested),
         # round 7 U3 (KTD3, KTD4): each component of the request with its status, reason and evidence (the detail

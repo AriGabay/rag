@@ -603,6 +603,16 @@ export interface ChatLedger {
   requirements?: ChatRequirement[];
 }
 
+/** The scope line of an answer that stayed in the appraisal unit of the turn before (a metric or computation change is no
+ * property change): the unit by its title and pages, in its file. Absent when the unit was not kept from the previous turn. */
+export interface ChatUnitScope {
+  title: string | null;
+  /** First and last page of the unit in the file; empty when unknown. */
+  pages: number[];
+  kept: true;
+  file_title: string;
+}
+
 export interface ChatAnswer {
   kind: "rag" | "search_only";
   status: "answered" | "partial" | "not_found" | "clarification";
@@ -635,6 +645,8 @@ export interface ChatAnswer {
   gaps?: ChatGap[];
   steps?: number;
   hidden?: boolean;
+  /** The answer's scope line when the unit was kept from the previous turn (absent otherwise, and on older answers). */
+  unit_scope?: ChatUnitScope | null;
 }
 
 export type ChatMessageStatus = "running" | "cancelling" | "cancelled" | "done" | "failed";

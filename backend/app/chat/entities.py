@@ -33,6 +33,14 @@ title, pages, identifiers and file. A reply is matched by an ordinal ("השני"
 identifier that only some candidates hold; a reply that fits none or several asks again; the unit chosen is the
 request's unit. The names of units join the vocabulary of identifying words (``titles_of``), so a project name that
 is in no file title still names a document in a follow-up.
+
+**The unit in the conversation** (round 9 U10, KTD8, R14): the conversation's focus carries the unit it is about as its
+anchor (``located_unit``), and a follow-up keeps it across a metric or computation change. Two anchors are the same unit
+(``same_unit``) in the same reading by number and across readings by names, never by number; a follow-up that names
+another unit of the same file therefore moves the conversation although the document is the same. When the file was
+read again, ``live_unit`` finds the anchor's unit in the current reading (``rematch``: the normalized title or an alias,
+else the first printed page label together with an identifier); a unit no longer there is dropped and the answer asks,
+listing the file's appraisals, so an old unit number never selects a different appraisal.
 """
 
 from __future__ import annotations
@@ -46,12 +54,14 @@ from uuid import UUID
 from sqlalchemy import text
 
 from app.chat import contexts
+from app.chat import units as unit_store
 from app.db import TenantContext, tenant_tx
 from app.extraction.normalize_text import base_normalize
 from app.platform.search import (
     UnitMatches,
     _scope_terms,
     _title_words,
+    printed_labels,
     units_matching,
     unread_documents,
     unread_matching,
@@ -122,6 +132,141 @@ def candidate_label(c: dict) -> str:
     parts = [p for p in (unit_pages(unit), " · ".join(unit.get("identifiers") or ())) if p]
     return (f"«{unit.get('display') or 'ללא כותרת'}» ({'; '.join(parts)}{'; ' if parts else ''}"
             f"בקובץ «{c.get('file_title') or c['title']}»)")
+
+
+def _names(x: dict) -> set[str]:
+    """A unit's normalized title and aliases: ``x`` is an anchor (already normalized) or a unit row."""
+    return {k for n in [x.get("title"), *(x.get("aliases") or ())] if (k := contexts.name_key(n))}
+
+
+def unit_names(anchor: dict | None) -> list[str]:
+    """The words a unit is named by, as written: its title and aliases (what a follow-up may repeat)."""
+    if not anchor:
+        return []
+    return [n for n in [anchor.get("display"), *(anchor.get("aliases") or ())] if n]
+
+
+def _identifiers(x: dict) -> set[str]:
+    return {" ".join(i.split()).lower() for i in x.get("identifiers") or () if i}
+
+
+def _label_and_identifier(anchor: dict, u: dict) -> bool:
+    """Whether a unit holds the anchor's first printed page label and one of its identifiers: what is left of a unit
+    that no name identifies."""
+    label = anchor.get("first_label")
+    return bool(label) and label == u.get("first_label") and bool(_identifiers(anchor) & _identifiers(u))
+
+
+def same_unit(a: dict | None, b: dict | None) -> bool:
+    """Whether two anchors are one unit. Within a reading its number says; across readings only its names (or, with none
+    in common to compare, its first page label and an identifier) do — the number of a unit is never reused across
+    readings (KTD8)."""
+    if not a or not b or str(a["document_id"]) != str(b["document_id"]):
+        return False
+    if (a.get("reading_id") or None) == (b.get("reading_id") or None):
+        return a.get("unit_no") == b.get("unit_no")
+    names, theirs = _names(a), _names(b)
+    return bool(names & theirs) if names and theirs else _label_and_identifier(a, b)
+
+
+def rematch(anchor: dict, units: list[dict]) -> dict | None:
+    """The unit of a new reading that an anchor stands for (``units``: its rows with ``first_label``, as the lookup
+    builds them), or None: the one unit whose normalized title or alias the anchor shares (several: the one that also
+    holds its first printed page label and an identifier), else the one that holds its first page label and an
+    identifier. An appendix or a comparables part is never the answer, and a number never is."""
+    subjects = [u for u in units if u.get("kind") not in contexts.NON_SUBJECT_KINDS]
+    names = _names(anchor)
+    pool = [u for u in subjects if names & _names(u)] if names else []
+    if not pool:
+        pool = [u for u in subjects if _label_and_identifier(anchor, u)]
+    elif len(pool) > 1:
+        pool = [u for u in pool if _label_and_identifier(anchor, u)]
+    return pool[0] if len(pool) == 1 else None
+
+
+def unit_candidate(u: dict, file_title: str) -> Candidate:
+    """A unit row as a candidate of a clarification: it carries its anchor."""
+    return Candidate(str(u["document_id"]), u.get("title") or file_title, file_title=file_title,
+                     unit=unit_anchor(u) | {"unit_id": u.get("unit_id"), "certainty": u.get("certainty")})
+
+
+@dataclass
+class LiveUnit:
+    """A focus unit against the current reading of its document. ``status``: ``current`` (the same reading, the same
+    unit), ``moved`` (the file was read again and the unit was found by its anchor: ``unit`` is the new anchor),
+    ``gone`` (no unit of the file stands for it: ``candidates`` are the file's appraisals to ask about), ``single`` (the
+    file is one unit now: the unit means nothing) or ``unreadable`` (the document is not readable now). ``version_id``:
+    the version the unit is in, for the turn's handle."""
+
+    status: Literal["current", "moved", "gone", "single", "unreadable"]
+    unit: dict | None = None
+    version_id: str | None = None
+    candidates: list[Candidate] = field(default_factory=list)
+
+
+def _current_units(conn, document_id: UUID) -> tuple[str, str, str, list[dict]] | None:
+    """(the document's title, its current version, that version's reading id, its units as rows with ``first_label``),
+    or None when the document is not readable now (deleted, or not visible to the user: row security decides). The
+    units of the current reading are stored on first use."""
+    row = conn.execute(text(
+        "SELECT d.title, v.id AS version_id, COALESCE(v.ingestion->>'reading_id', '') AS reading_id"
+        " FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
+        " WHERE d.id = :d AND d.deleted_at IS NULL"), {"d": document_id}).first()
+    if row is None:
+        return None
+    rows = [{"document_id": document_id, "version_id": row.version_id, "reading_id": row.reading_id,
+             "unit_no": u.unit_no, "unit_id": (f"{row.version_id}#{row.reading_id}#{u.unit_no}" if row.reading_id
+                                              else f"{row.version_id}#{u.unit_no}"),
+             "kind": u.kind, "title": u.title, "aliases": list(u.aliases),
+             "identifiers": list((u.identifiers or {}).get("shown") or ()), "page_first": u.page_first,
+             "page_last": u.page_last, "certainty": u.certainty} for u in unit_store.ensure(conn, row.version_id)]
+    if len(rows) > 1:
+        printed_labels(conn, rows)
+    return row.title, str(row.version_id), row.reading_id, rows
+
+
+def live_unit(ctx: TenantContext, anchor: dict) -> LiveUnit:
+    """The anchor's unit in the current reading of its document, under the user's permissions (see the module
+    docstring). Reads the stored units of the current version (built on first use)."""
+    try:
+        document_id = UUID(str(anchor["document_id"]))
+    except (KeyError, ValueError):
+        return LiveUnit("unreadable")
+    with tenant_tx(ctx) as conn:
+        current = _current_units(conn, document_id)
+    if current is None:
+        return LiveUnit("unreadable")
+    title, version, reading, rows = current
+    if len(rows) < 2:
+        return LiveUnit("single", version_id=version)
+    # the same reading: the unit with its number, if its names are still the anchor's (a derivation that changed under
+    # the same reading id would have renumbered it)
+    if (anchor.get("reading_id") or None) == (reading or None):
+        same = next((u for u in rows if u["unit_no"] == anchor.get("unit_no")
+                     and u["kind"] not in contexts.NON_SUBJECT_KINDS), None)
+        if same is not None and (not _names(anchor) or _names(anchor) & _names(same)):
+            return LiveUnit("current", unit_anchor(same), version)
+    found = rematch(anchor, rows)
+    if found is not None:
+        return LiveUnit("moved", unit_anchor(found), version)
+    subjects = [unit_candidate(u, title) for u in rows if u["kind"] not in contexts.NON_SUBJECT_KINDS]
+    return LiveUnit("gone", None, version, subjects) if subjects else LiveUnit("single", version_id=version)
+
+
+def anchor_of(ctx: TenantContext, document_id: str, reading_id: str | None, unit_no: int) -> dict | None:
+    """The anchor of a unit of a document's current reading, or None when the document is not readable, is one unit, or
+    has been read again since (``reading_id`` is the one the turn worked in). An appendix or a comparables part has no
+    anchor: it is never the subject of a conversation."""
+    try:
+        document_id = UUID(str(document_id))
+    except ValueError:
+        return None
+    with tenant_tx(ctx) as conn:
+        current = _current_units(conn, document_id)
+    if current is None or len(current[3]) < 2 or (reading_id or None) != (current[2] or None):
+        return None
+    found = next((u for u in current[3] if u["unit_no"] == unit_no and u["kind"] not in contexts.NON_SUBJECT_KINDS), None)
+    return unit_anchor(found) if found is not None else None
 
 
 def title_tokens(title: str) -> set[str]:

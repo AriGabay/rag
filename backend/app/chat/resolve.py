@@ -202,9 +202,12 @@ class Request:
     entity_changed: bool = False  # the documents are the ones the user's words named, not the focus's
     server_clarify: bool = False  # the clarification is the server's (titles the user may see, the user's words)
     candidates: list[dict] = field(default_factory=list)  # the documents a server clarification named
-    # the unit of a file of several that the user's words selected (``unit`` is the datum's measure unit here) (``entities.unit_anchor``: file, reading, normalized
-    # title and aliases, first printed page label, identifiers); U10 carries it in the conversation's focus
+    # the unit of a file of several appraisals the turn is about (``unit`` is the datum's measure unit here): the one
+    # the user's words selected, or the one the conversation was already in (``unit_kept``) — as its anchor
+    # (``entities.unit_anchor``: file, reading, normalized title and aliases, first printed page label, identifiers),
+    # which the conversation's focus carries to the next turn (round 9 U10, KTD8, R14)
     located_unit: dict | None = None
+    unit_kept: bool = False
     resolution: dict = field(default_factory=dict)  # the raw parse and the server's decisions (diagnostics)
     # the request's frozen components (``request.freeze``), or None, with why: ok, empty, invalid
     components: list[dict] | None = None
@@ -215,7 +218,8 @@ class Request:
                 "unit": self.unit, "period": self.period, "area_basis": self.area_basis, "vat": self.vat,
                 "subject": self.subject, "document_ids": list(self.document_ids), "changed": list(self.changed),
                 "rejected": list(self.rejected), "relation": self.relation, "scope": self.scope,
-                "approved": list(self.approved), "candidates": list(self.candidates), "located_unit": self.located_unit}
+                "approved": list(self.approved), "candidates": list(self.candidates), "located_unit": self.located_unit,
+                "unit_kept": self.unit_kept, "entity_changed": self.entity_changed}
 
     @property
     def per_area(self) -> bool | None:
@@ -290,6 +294,20 @@ def _clarify_titles(outcome: entities.Outcome, words: str) -> str:
                 "אפשר לענות במספר, או במילה שמבדילה ביניהן.")
     names = "; ".join(f"«{prompt_text(d.title)}»" for d in outcome.documents)
     return f"נמצאו כמה מסמכים שמתאימים ל\"{prompt_text(words)}\": {names}. לאיזה מהם התכוונת?"
+
+
+MSG_UNIT_GONE = ("הקובץ נקרא מחדש, והשומה שדיברנו עליה («{title}») כבר אינה בו כפי שנקראה. לאיזו מהשומות בקובץ "
+                 "התכוונת?")
+
+
+def clarify_gone_unit(gone: dict, shown: list[entities.Candidate], total: int) -> str:
+    """The server's question when the unit the conversation was in is not in the file's new reading: the file's
+    appraisals, each by title, pages, identifiers and file (the old number selects nothing). ``total``: how many the file
+    has, of which ``shown`` are listed."""
+    names = "\n".join(f"{n}. {prompt_text(entities.candidate_label(c.as_dict()))}" for n, c in enumerate(shown, 1))
+    more = f"\n(יש בקובץ עוד {total - len(shown)}; אפשר לנקוב בשם הפרויקט או הנכס.)" if total > len(shown) else ""
+    return (MSG_UNIT_GONE.format(title=prompt_text(gone.get("display") or "ללא כותרת")) + f"\n{names}{more}\n"
+            "אפשר לענות במספר, או במילה שמבדילה ביניהן.")
 
 
 MSG_SPLIT = ("המילים \"{words}\" מופיעות בקובץ «{title}» אך בשומות שונות שבו: אף שומה אחת אינה מכילה את כולן. לאיזו "
@@ -412,6 +430,7 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
         out.approved.append("scale")  # a correction keeps the scale of what it corrects
     # documents: the focus, unless the user's words name another entity, or the question is over a set
     focus_ids = list(f.get("document_ids") or [])
+    focus_unit = f.get("located_unit") or None
     keep_focus = bool(focus) and not new_question and resolved.scope != "set"
     seen = authorized(focus_ids) if keep_focus and focus_ids else set()
     out.document_ids = [d for d in focus_ids if d in seen]
@@ -438,7 +457,9 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
         if words and not switching and not entities.identifying(words, vocabulary, bare_numbers=False):
             decisions["subject"] = "kept the focus: the quoted words name no document"
             words = ""
-        focus_text = " ".join([f.get("subject") or "", *(focus_titles or [])])
+        # the names of the unit the conversation is in are the focus's own: naming it again is no new entity
+        focus_text = " ".join([f.get("subject") or "", *(focus_titles or []),
+                               *(entities.unit_names(focus_unit) if keep_focus else ())])
         focus_tokens, focus_norm = entities.title_tokens(focus_text), _norm(focus_text)
         # a word of the focus in any form ("בשומה") names the focus; a bare floor, year or duration names nothing
         named = entities.identifying(message, vocabulary, bare_numbers=False) if focus else []
@@ -446,12 +467,19 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
         # the user's words for the entity, with any word of theirs that names a title the focus does not hold
         query = " ".join(dict.fromkeys([*words.split(), *unnamed])) if words else " ".join(unnamed)
         if query:
-            _take(out, lookup(query), query, decisions, set(focus_ids))
+            _take(out, lookup(query), query, decisions, set(focus_ids), focus_unit if keep_focus else None)
             if out.entity_changed and out.document_ids:  # the new entity was found: the request is about it
                 out.subject = (resolved.subject.strip() or quotes["subject"]) if "subject" in ok else " ".join(unnamed)
     elif SUBJECT_FIELDS & ok:
         out.document_ids = []  # no lookup here: the tools find the documents the user named
         out.entity_changed = True
+    # the unit the conversation is in stays while the request stays in its file: a metric or a computation change is
+    # no property change (R14, AE5); a lookup that found another unit has set its own above
+    if (keep_focus and focus_unit and out.located_unit is None and not out.entity_changed
+            and out.document_ids == [str(focus_unit["document_id"])]):
+        out.located_unit, decisions["unit"] = focus_unit, "kept"
+    out.unit_kept = bool(out.located_unit and focus_unit and not out.entity_changed
+                         and entities.same_unit(focus_unit, out.located_unit))
     if "subject" in rejected and not out.entity_changed:
         decisions.setdefault("subject", "rejected")
     if resolved.ambiguity.strip() and relation == "correction" and not out.clarify:
@@ -468,15 +496,18 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
 
 
 def _take(out: Request, outcome: entities.Outcome, words: str, decisions: dict,
-          focus_ids: set[str] | None = None) -> None:
+          focus_ids: set[str] | None = None, focus_unit: dict | None = None) -> None:
     """The scope the lookup's outcome sets, or the clarification it needs. A lookup that lands on the focus's own
-    documents changes nothing: the conversation stays where it was."""
+    documents changes nothing: the conversation stays where it was. In a file of several appraisals it lands on a
+    unit, and the conversation stays only when that is the focus's own unit (``focus_unit``): another unit of the same
+    file is another property (KTD8)."""
     decisions["entity"] = outcome.kind
     out.resolution["lookup"] = outcome.as_dict()
     if outcome.kind == "resolved":
         out.document_ids = [d.document_id for d in outcome.documents]
-        out.entity_changed = set(out.document_ids) != set(focus_ids or ())
         out.located_unit = outcome.documents[0].unit if len(outcome.documents) == 1 else None  # the unit chosen (KTD8)
+        out.entity_changed = set(out.document_ids) != set(focus_ids or ()) or (
+            out.located_unit is not None and not entities.same_unit(focus_unit, out.located_unit))
         return
     out.entity_changed = True
     out.document_ids, out.server_clarify = [], True
@@ -505,7 +536,9 @@ def _input(focus: dict | None, history: list, message: str, documents: list[dict
             f"- metric_kind: {label(REQUEST_KINDS, 'metric_kind')}", f"- unit: {label(UNIT_LABELS, 'unit')}",
             f"- period: {label(PERIOD_LABELS, 'period')}", f"- area_basis: {prompt_text(focus.get('area_basis') or '')}",
             f"- vat: {label(VAT_LABELS, 'vat')}", f"- subject: {prompt_text(focus.get('subject') or '')}",
-            f"- document_ids: {', '.join(focus.get('document_ids') or [])}"]))
+            f"- document_ids: {', '.join(focus.get('document_ids') or [])}",
+            *([f"- שומה בתוך הקובץ: {prompt_text(focus['located_unit'].get('display') or 'ללא כותרת')}"]
+              if focus.get("located_unit") else [])]))
     if documents:
         parts.append("מסמכים שהשיחה עסקה בהם:\n" + "\n".join(
             f"- {d['document_id']} | {prompt_text(d['title'])}" for d in documents))
@@ -603,8 +636,9 @@ def pending_block(binding: dict) -> str:
             + "\n".join(lines))
 
 
-def requested_block(req: Request) -> str:
-    """The request as the answering model's task, in Hebrew labels."""
+def requested_block(req: Request, unit_handle: str | None = None) -> str:
+    """The request as the answering model's task, in Hebrew labels. ``unit_handle``: the turn's handle (U#) of the unit
+    the request is in, in a file of several appraisals."""
     def label(labels: dict, value: str) -> str:
         return labels.get(value, value) if value and value != "unknown" else "לא צוין"
 
@@ -614,6 +648,14 @@ def requested_block(req: Request) -> str:
              f"- נכס/נושא: {prompt_text(req.subject) or 'לא צוין'}"]
     if req.document_ids:
         lines.append(f"- מסמכים (document_id): {', '.join(req.document_ids)}")
+    if req.located_unit and unit_handle:
+        u = req.located_unit
+        where = "; ".join(x for x in (entities.unit_pages(u), " · ".join(u.get("identifiers") or ())) if x)
+        lines.append(f"- יחידה בקובץ: {unit_handle} «{prompt_text(u.get('display') or 'ללא כותרת')}»"
+                     + (f" ({prompt_text(where)})" if where else "")
+                     + (" — היחידה שהשיחה כבר עוסקת בה; שינוי מדד או חישוב אינו מעביר שומה" if req.unit_kept else "")
+                     + f". חפש וקרא בתוכה בלבד (search ו-outline עם unit={unit_handle}, read עם pages ו-document="
+                       f"{unit_handle}); ערך משומה אחרת בקובץ אינו של הנכס שנשאל")
     if req.entity_changed and req.scope == "set":
         lines.append("- השאלה על קבוצת מסמכים: מצא אותה (find_documents) ואל תסתמך על המסמכים הקודמים")
     elif req.entity_changed:

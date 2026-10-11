@@ -78,3 +78,21 @@ def units_table(units: list[dict], spans: list[tuple[int, int]], index: int) -> 
         if a <= index <= b:
             return u["blocks"][index - a].startswith("|")
     return False
+
+
+def reread(office, ver: str, reading: str, units: list[dict]) -> None:
+    """The file read again (round 9 U10): ``ver`` gets the new reading id ``reading``, and the units of that reading are
+    the given ones (``{"title", "aliases", "kind", "identifiers", "blocks": (first, last), "pages": (first, last)}``, in
+    order, numbered from 1) over the version's unchanged blocks. The units of the old reading stay stored, as they do
+    when a version is read again."""
+    with tenant_tx(office.system) as conn:
+        doc = conn.execute(text("SELECT document_id FROM document_versions WHERE id = :v"), {"v": ver}).scalar_one()
+        ingestion = {"reading_id": reading}
+        conn.execute(text("UPDATE document_versions SET ingestion = CAST(:i AS jsonb) WHERE id = :v"),
+                     {"i": json.dumps(ingestion), "v": ver})
+        stored = unit_store.Reading(UUID(str(doc)), reading, unit_store.derivation_key(ingestion), ())
+        rows = [unit_store.Unit(n, u.get("kind", "appraisal"), u.get("title"), tuple(u.get("aliases") or ()),
+                                {"shown": list(u.get("identifiers") or ())}, u["pages"][0], u["pages"][1],
+                                u["blocks"][0], u["blocks"][1], "certain", {})
+                for n, u in enumerate(units, 1)]
+        unit_store._insert(conn, ver, stored, rows)

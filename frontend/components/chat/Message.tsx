@@ -13,6 +13,7 @@ import type {
   ChatRemoval,
   ChatRequirement,
   ChatSource,
+  ChatUnitScope,
   ChatValue,
   ChatVerification,
   LedgerDocument,
@@ -467,6 +468,7 @@ function AnswerDetails({
         </div>
       )}
       {answer.computations.length > 0 && <CalculationsSection answer={answer} onCite={onCite} />}
+      {answer.unit_scope && <UnitScopeLine scope={answer.unit_scope} />}
       {answer.ledger && <LedgerSection ledger={answer.ledger} />}
       {coverage && (
         <div className="details-section">
@@ -847,6 +849,26 @@ export function UserMessage({ message, error, onResend }: { message: ChatMessage
   );
 }
 
+
+/** The answer's scope line when the conversation stayed in the same appraisal unit as the turn before: the unit by its
+ * title (or that it has none) and its pages, beside the file it is in. */
+function UnitScopeLine({ scope }: { scope: ChatUnitScope }) {
+  const label = unitLabel({ id: "", no: 0, title: scope.title, label: "", kind: "appraisal", pages: scope.pages });
+  return (
+    <div className="details-section" data-testid="unit-scope">
+      <h4>התחום</h4>
+      <p>
+        נשארתי באותה שומה: <bdi>{label}</bdi>
+        {scope.file_title ? (
+          <>
+            {" "}
+            · בקובץ <bdi>{scope.file_title}</bdi>
+          </>
+        ) : null}
+      </p>
+    </div>
+  );
+}
 
 function titles(docs: LedgerDocument[] | undefined): string {
   return (docs ?? []).map((d) => d.title ?? "").filter(Boolean).join("; ");

@@ -432,3 +432,128 @@ def test_a_metric_word_never_names_a_document_even_when_a_title_holds_it():
     req = validate(r, RENT_FOCUS, "התכוונתי לשווי, לא לשכירות", authorized, titles, lookup_in(focus_ids), None,
                    focus_titles=[CORPUS[DOC][0]])
     assert req.document_ids == [DOC] and not req.entity_changed and not req.clarify
+
+
+# --- the unit in the conversation's focus (round 9 U10: KTD8, R14, AE5) ----------------------------------------------
+# A file of several appraisals: the conversation is about one of its units (the focus carries the unit's anchor, not
+# its number, as ``located_unit``: ``unit`` is already the datum's measure unit). Names are invented.
+
+FILE, FILE_TITLE = "d-f", "קובץ שומות סינתטי"
+FILE_UNITS = {
+    2: {"title": "מתחם גבעת הרקפות", "aliases": ["גבעת הרקפות", "הרקפות"], "identifiers": ["רחוב הרקפת 8"],
+        "page_first": 3, "page_last": 4},
+    3: {"title": "פרויקט נחל הדס", "aliases": ["נחל הדס", "הדס"], "identifiers": ["רחוב הדס 3"],
+        "page_first": 5, "page_last": 6},
+}
+
+
+def _unit_dict(no: int, reading: str = "r1", like: int | None = None, **kw) -> dict:
+    """A unit of the file: number ``no`` in reading ``reading``, with the names of unit ``like`` (default: ``no``)."""
+    return {"document_id": FILE, "reading_id": reading, "unit_no": no, "unit_id": f"v#{reading}#{no}",
+            "kind": "appraisal", "first_label": "1", "certainty": "certain", "file_title": FILE_TITLE,
+            "name_extra": 0, **FILE_UNITS[like or no], **kw}
+
+
+def _anchor(no: int, reading: str = "r1", **kw) -> dict:
+    return entities.unit_anchor(_unit_dict(no, reading, **kw))
+
+
+def _unit_lookup(focus_ids: set[str]):
+    def lookup(words: str) -> entities.Outcome:
+        terms = _scope_terms(words)
+        rows = []
+        for no, u in FILE_UNITS.items():
+            names = set().union(*(entities.title_tokens(n) for n in [u["title"], *u["aliases"]]))
+            if terms and all(names & set(forms) for forms in terms):
+                rows.append({"document_id": FILE, "title": FILE_TITLE, "hits": 1, "multi": True,
+                             "unit": _unit_dict(no)})
+        return entities.choose(rows, words, focus_ids)
+    return lookup
+
+
+UNIT_TITLES = [FILE_TITLE, *(n for u in FILE_UNITS.values() for n in [u["title"], *u["aliases"]])]
+UNIT_FOCUS = VALUE_FOCUS | {"document_ids": [FILE], "subject": "מתחם גבעת הרקפות",
+                                         "located_unit": _anchor(2)}
+
+
+def _validate_unit(r, focus, message, visible=(FILE,)):
+    return validate(r, focus, message, lambda ids: {i for i in ids if i in visible}, UNIT_TITLES,
+                    _unit_lookup({FILE}), None, focus_titles=[FILE_TITLE])
+
+
+def test_a_metric_change_keeps_the_unit_the_conversation_is_in():
+    """AE5: the price, then "and the rent?" — a metric change is not a property change."""
+    r = _resolved(relation="metric_change", changed_fields=_changed(("metric_kind", "דמי השכירות")), metric_kind="rent")
+    req = _validate_unit(r, UNIT_FOCUS, "ומה דמי השכירות?")
+    assert req.document_ids == [FILE] and not req.entity_changed and not req.clarify
+    assert req.located_unit == UNIT_FOCUS["located_unit"] and req.unit_kept
+    assert req.as_dict()["located_unit"]["unit_no"] == 2
+
+
+@pytest.mark.parametrize("relation", ["same_datum", "scale_change", "correction"])
+def test_a_computation_or_a_scale_change_or_no_change_keeps_the_unit(relation):
+    req = _validate_unit(_resolved(relation=relation), UNIT_FOCUS, "ובמ״ר?")
+    assert req.located_unit == UNIT_FOCUS["located_unit"] and req.unit_kept and not req.entity_changed
+
+
+def test_a_follow_up_naming_another_unit_of_the_same_file_moves_to_it():
+    r = _resolved(relation="correction", changed_fields=_changed(("subject", "בפרויקט נחל הדס")),
+                  subject="פרויקט נחל הדס")
+    req = _validate_unit(r, UNIT_FOCUS, "ובפרויקט נחל הדס?")
+    assert req.document_ids == [FILE]  # the same document, another unit: only the units differ
+    assert req.entity_changed and not req.unit_kept
+    assert (req.located_unit["unit_no"], req.located_unit["display"]) == (3, "פרויקט נחל הדס")
+
+
+def test_a_unit_alias_in_a_follow_up_is_an_identifying_word_the_file_title_lacks():
+    assert entities.identifying("ומה השכירות בהדס?", [FILE_TITLE], bare_numbers=False) == []
+    assert entities.identifying("ומה השכירות בהדס?", UNIT_TITLES, bare_numbers=False) == ["בהדס"]
+    # the parse claimed no subject change: the alias alone moves the conversation to the unit it names
+    req = _validate_unit(_resolved(relation="same_datum"), UNIT_FOCUS, "ומה השכירות בהדס?")
+    assert req.entity_changed and req.located_unit["unit_no"] == 3
+
+
+def test_naming_the_unit_the_conversation_is_in_changes_nothing():
+    r = _resolved(relation="same_datum", changed_fields=_changed(("subject", "בהרקפות")), subject="הרקפות")
+    req = _validate_unit(r, UNIT_FOCUS | {"subject": ""}, "ומה השכירות בהרקפות?")
+    assert not req.entity_changed and req.unit_kept and req.located_unit["unit_no"] == 2
+
+
+def test_a_set_question_or_a_new_question_or_an_unseen_file_leaves_no_unit():
+    assert _validate_unit(_resolved(relation="same_datum", scope="set"), UNIT_FOCUS, "ובכל הקבצים?").located_unit is None
+    assert _validate_unit(_resolved(relation="new_question"), UNIT_FOCUS, "שאלה אחרת: מה הוצאות הניהול?"
+                          ).located_unit is None
+    # the file is no longer visible: the focus document goes, and the unit with it, silently
+    req = _validate_unit(_resolved(relation="same_datum"), UNIT_FOCUS, "ומה השכירות?", visible=())
+    assert req.document_ids == [] and req.located_unit is None and not req.unit_kept and not req.clarify
+
+
+def test_a_focus_with_no_unit_leaves_the_request_with_none():
+    req = _validate_unit(_resolved(relation="same_datum"), VALUE_FOCUS | {"document_ids": [FILE]}, "ובמ״ר?")
+    assert req.located_unit is None and not req.unit_kept
+
+
+def test_the_same_unit_across_readings_is_matched_by_its_anchor_never_by_its_number():
+    old = _anchor(2, "r1")
+    same_number_other_name = _anchor(2, "r2", title="פרויקט אחר", aliases=["אחר"], identifiers=["רחוב אחר 1"])
+    renumbered = _anchor(5, "r2", like=2)
+    assert entities.same_unit(old, _anchor(2, "r1"))
+    assert not entities.same_unit(old, _anchor(3, "r1"))
+    assert entities.same_unit(old, renumbered)  # a new reading, a new number, the same names
+    assert not entities.same_unit(old, same_number_other_name)  # the number alone proves nothing
+    assert not entities.same_unit(None, old) and not entities.same_unit(old, None)
+
+
+def test_a_new_reading_re_matches_by_title_or_alias_then_by_page_label_and_identifiers():
+    # the reading was redone: the same two appraisals under other numbers, with another one in front
+    current = [_unit_dict(1, "r2", like=2, title="פרויקט אחר", aliases=[], identifiers=[], page_first=1, page_last=2),
+               _unit_dict(4, "r2", like=2), _unit_dict(5, "r2", like=3)]
+    assert entities.rematch(_anchor(2, "r1"), current)["unit_no"] == 4
+    assert entities.rematch(_anchor(3, "r1"), current)["unit_no"] == 5
+    # no name in common: the first printed page label together with an identifier
+    renamed = _anchor(2, "r1", title="שם ישן", aliases=["ישן"])
+    assert entities.rematch(renamed, current)["unit_no"] == 4  # its identifier and page label survived
+    assert entities.rematch(renamed | {"identifiers": []}, current) is None
+    # a unit that is gone: nothing matches, and the old number selects nothing
+    assert entities.rematch(_anchor(2, "r1", title="נעלם", aliases=["נעלם"], identifiers=["רחוב נעלם 1"]), [
+        _unit_dict(2, "r2", title="נעלם לא", aliases=[], identifiers=[])]) is None

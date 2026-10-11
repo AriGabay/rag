@@ -96,7 +96,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from app.chat import coverage, entities, resolve
+from app.chat import contexts, coverage, entities, resolve
 from app.chat import request as request_analysis
 from app.chat import tools as T
 from app.chat.compose import ServerSpan, text_digest
@@ -144,7 +144,8 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
   את היחידות שמכילות את כל המונחים, עם כותרת, עמודים ומזהים), ואז חפש וקרא בתוכה בלבד — search עם unit=U#, outline עם
   unit=U#, read עם pages ו-document=U#. חיפוש ביחידה שלא מצא דבר אומר שהיחידה נחקרה ולא נמצא; כשגבול היחידה לא ודאי
   החיפוש מורחב פעם אחת לכל הקובץ והתוצאה אומרת זאת. כמה יחידות מתאימות ולא ברור איזו — שאל את המשתמש לאיזו התכוון
-  (כותרת, עמודים, מזהים); לעולם אל תבחר לפי מספר הקטעים. נכס שמופיע רק בטבלת השוואה אינו שומה של עצמו.
+  (כותרת, עמודים, מזהים); לעולם אל תבחר לפי מספר הקטעים. נכס שמופיע רק בטבלת השוואה אינו שומה של עצמו. כשהבקשה
+  שהובנה מציינת יחידה בקובץ (U#), זו השומה שהשיחה עוסקת בה: חפש וקרא בתוכה בלבד — שינוי מדד או חישוב אינו מעביר שומה.
 - מספר הצעדים בתור מוגבל, וצעד אחד יכול לכלול כמה קריאות לכלים. קריאות שאינן תלויות זו בזו — שלח באותו צעד: למשל
   take_value לכמה תאים של טבלה שקראת יחד עם assume, או search ו-read לכמה מקומות. רק מה שתלוי בתוצאה של קריאה
   אחרת — בצעד הבא (calculate על V#/A# שנרשמים עכשיו). קרא ל-calculate מיד כשכל הקלטים שלו רשומים.
@@ -442,6 +443,9 @@ class TurnOutcome:
     final_check: dict = field(default_factory=dict)
     # where the turn's time went (round 9 R16, KTD9: ``timing.StageClock.summary``); numbers and tool names only
     timing: dict = field(default_factory=dict)
+    # the unit the conversation is about after this answer (round 9 U10, KTD8): the anchor of the appraisal unit the turn
+    # worked in, which the next turn keeps across a metric change; None for a file of one unit or when no unit was
+    unit: dict | None = None
 
 
 def usage_summary(usage: list[dict], **extra) -> dict:
@@ -459,7 +463,8 @@ def usage_summary(usage: list[dict], **extra) -> dict:
             "latency_ms": sum(u.get("latency_ms") or 0 for u in usage), **extra}
 
 
-def _context_message(inp: TurnInput, request: resolve.Request | None = None, binding: dict | None = None) -> str:
+def _context_message(inp: TurnInput, request: resolve.Request | None = None, binding: dict | None = None,
+                     unit_handle: str | None = None) -> str:
     parts = []
     if inp.summary:
         parts.append("סיכום השיחה עד כה (לא מקור עובדתי):\n" + prompt_text(inp.summary))
@@ -484,6 +489,7 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None, bin
                   ("יחידה", label(UNIT_LABELS, "unit")), ("תקופה", label(PERIOD_LABELS, "period")),
                   ("בסיס שטח", f.get("area_basis")), ("מע\"מ", label(VAT_LABELS, "vat")),
                   ("נכס/נושא", f.get("subject")), ("תפקיד", label(T.ROLE_LABELS, "value_role")),
+                  ("שומה בתוך הקובץ", (f.get("located_unit") or {}).get("display")),
                   ("מסמכים (document_id)", ", ".join(f.get("document_ids") or []))]
         parts.append("הנתון שבמרכז השיחה (מהתור הקודם; לא מקור עובדתי):\n" + "\n".join(
             f"- {k}: {prompt_text(v)}" for k, v in fields if v)
@@ -503,7 +509,7 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None, bin
     if binding is not None:
         parts.append(resolve.pending_block(binding))
     if request is not None:
-        parts.append(resolve.requested_block(request))
+        parts.append(resolve.requested_block(request, unit_handle))
         if request.components:
             parts.append(request_analysis.block(request.components))
     return "\n\n".join(parts)
@@ -581,6 +587,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             lookup=lambda words: entities.lookup(ctx, words, focus_ids, titles), candidates=inp.candidates or None)
         if cancelled():
             raise TurnCancelled
+        if request is not None and request.located_unit:
+            _settle_unit(ctx, ws, request)
         if request is not None and request.relation == "new_question":
             binding = None  # a new question is no reply to the clarification, whatever number it holds
         elif request is None and binding is not None and not resolve.number_only_reply(inp.question):
@@ -627,6 +635,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         composed = done.composition
         final, outcomes, ledger = composed.answer, composed.outcomes, composed.ledger
         final = final.model_copy(update={"focus": _surviving_focus(ws, final)})
+        unit = _turn_unit(ctx, ws, final, request)
         report.completeness = coverage.completeness(outcomes)
         # the side effects, once, after the last pass: the documents the final text cites are marked verified
         if final.status != "clarification":
@@ -637,7 +646,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
                            request.as_dict() if request is not None else None,
                            request.resolution if request is not None else None, _summary(usage, rounds, reused, turn),
-                           _pending(ws, turn, final), composed.spans, done.digest, done.stats, ws.clock.summary())
+                           _pending(ws, turn, final), composed.spans, done.digest, done.stats, ws.clock.summary(),
+                           unit)
 
     pending: request_analysis.Pending | None = None
 
@@ -675,7 +685,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         return step
 
     ws.binding = binding  # an ``assume`` of the bound number records the parameter it fills (KTD9)
-    items: list = [{"role": "user", "content": _context_message(inp, request, binding)}]
+    items: list = [{"role": "user", "content": _context_message(
+        inp, request, binding, ws.unit_focus["handle"] if ws.unit_focus else None)}]
     if request is None and not (inp.history or inp.focus):
         # a first turn: the request is analysed beside the first step (no added latency), within the reading time
         pending = request_analysis.start(provider, inp.question, read_until)
@@ -855,6 +866,78 @@ def _summary(usage: list[dict], rounds: list, reused: int, turn: TurnRequirement
                             requirements_origin=origin["origin"], requirements_fallback=origin["fallback"])
     logger.info("chat turn: %s", json.dumps(summary))
     return summary
+
+
+def _settle_unit(ctx: TenantContext, ws: T.Workspace, request: resolve.Request) -> None:
+    """The request's unit against the current reading of its file (KTD8): the same unit, or — the file was read again —
+    the unit found by its anchor, never by its number. The conversation's unit gets its turn handle (U#), which a search
+    or outline that names no other document works inside (``tools.focus_unit_for``). A unit no longer in the file is
+    dropped and the answer asks which appraisal is meant; a file that is one unit now, or one the user cannot read, drops
+    it silently."""
+    live = entities.live_unit(ctx, request.located_unit)
+    decisions = request.resolution.setdefault("decisions", {})
+    if live.status in ("current", "moved"):
+        if live.status == "moved":
+            request.located_unit, decisions["unit"] = live.unit, "re-resolved"
+        u = request.located_unit
+        handle = T.unit_handle_of(ws, u["document_id"], live.version_id, u.get("reading_id"), u["unit_no"])
+        ws.unit_focus = {"handle": handle, "document_id": str(u["document_id"]), "unit_id": u.get("unit_id")}
+        return
+    gone = request.located_unit
+    request.located_unit, request.unit_kept = None, False
+    if live.status != "gone":
+        decisions["unit"] = f"dropped: {live.status}"
+        return
+    decisions["unit"] = "gone"
+    shown = live.candidates[:entities.CLARIFY_TITLES]
+    request.clarify = resolve.clarify_gone_unit(gone, shown, len(live.candidates))
+    request.candidates = [c.as_dict() for c in shown]
+    request.document_ids, request.entity_changed, request.server_clarify = [], True, True
+
+
+def _cited_units(ws: T.Workspace, markdown: str) -> dict[str, set[str | None]]:
+    """For each document the answer cites, the unit ids of the places it cites in it (None: a place outside any unit
+    label, as a file of one unit has), the appendix and comparables parts left out. Calculations count by the values and
+    measurements they rest on."""
+    ids = coverage.cited_ids(markdown)
+    todo = list(ids)
+    while todo:
+        i = todo.pop()
+        if i in ws.computations:
+            for leaf in ws.computations[i].leaves:
+                if leaf not in ids:
+                    ids.add(leaf)
+                    todo.append(leaf)
+    found: dict[str, set[str | None]] = {}
+    for i in ids:
+        if i in ws.sources and not ws.sources[i].is_listing:
+            s = ws.sources[i]
+            unit = s.unit if s.unit and s.unit.get("kind") not in contexts.NON_SUBJECT_KINDS else None
+            found.setdefault(str(s.document_id), set()).add(unit["id"] if unit else None)
+        elif i in ws.values or i in ws.measurements:
+            thing = ws.values.get(i) or ws.measurements.get(i)
+            ctx_ = thing.context if thing.context and thing.context.get("subject", True) else None
+            found.setdefault(str(thing.document_id), set()).add(ctx_["unit_id"] if ctx_ else None)
+    return found
+
+
+def _turn_unit(ctx: TenantContext, ws: T.Workspace, final: FinalAnswer, request: resolve.Request | None) -> dict | None:
+    """The unit the conversation is about after this answer (KTD8), as its anchor: the one the request is in (kept from
+    the turn before, or named by the user); else the one every place the answer cites in its (single) document lies in;
+    else, when the turn ended on a limit and its tools worked inside exactly one unit, that unit — a turn cut short
+    leaves the conversation where it was reading, so "continue" reads on inside it."""
+    if request is not None and request.located_unit:
+        return request.located_unit
+    cited = _cited_units(ws, final.answer_markdown)
+    focus_docs = list(final.focus.document_ids) if final.focus is not None else []
+    doc = focus_docs[0] if len(focus_docs) == 1 else next(iter(cited)) if len(cited) == 1 else None
+    if doc is not None and doc in cited and None not in cited[doc] and len(cited[doc]) == 1:
+        _, reading, number = contexts.split_unit_key(next(iter(cited[doc])))
+        return entities.anchor_of(ctx, doc, reading, number)
+    if ws.limits_hit and len(ws.unit_scopes) == 1:
+        (scope,) = ws.unit_scopes.values()
+        return entities.anchor_of(ctx, scope["document_id"], scope["reading_id"], scope["unit_no"])
+    return None
 
 
 def _surviving_focus(ws: T.Workspace, final: FinalAnswer) -> Focus | None:

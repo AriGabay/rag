@@ -86,6 +86,13 @@ then the chosen unit's sections only, so no section list is cut at ``OUTLINE_MAX
 value, measurement and citation anchor of such a file carries the unit (``unit_id``: version, reading, number; with
 title and pages for the answer's payload); a file with one unit shows and checks nothing new.
 
+**The unit in the conversation** (round 9 U10, KTD8): when the request is in a unit — kept from the previous turn across a
+metric change, or named by the user — the engine gives it a handle (``Workspace.unit_focus``) and a ``search``,
+``outline`` or ``read`` of pages that names no unit and no document but that unit's file works inside it
+(``focus_unit_for``); a call that names another document or a unit of its own is left as it is. The units a turn's tools
+worked in are kept (``Workspace.unit_scopes``), so a turn cut short by a limit leaves the conversation in the unit it
+was reading.
+
 A file holding several appraisals, or an appendix about a comparison property, is read as several appraisal contexts
 (round 7 U6: KTD7; R20–R22; ``app.chat.contexts``, derived from the stored reading and cached per reading): search
 hits, reads (with a marker where a context starts inside a part), the outline (each context's sections apart, a
@@ -409,6 +416,12 @@ class Workspace:
     lookups: dict = field(default_factory=dict)
     # the turn's time per stage and per tool call (round 9 R16, KTD9, ``app.chat.timing``), fed by ``run_tool`` and the engine
     clock: StageClock = field(default_factory=StageClock)
+    # the unit the conversation is in (round 9 U10, KTD8), set by the engine from the resolved request: {"handle": its
+    # U#, "document_id", "unit_id"}. A ``search`` or ``outline`` that names no unit and no other document works inside it
+    unit_focus: dict | None = None
+    # the units the turn's tools worked in through a unit handle: unit id -> {"document_id", "version_id", "reading_id",
+    # "unit_no"}; the unit a turn that ended on a limit leaves the conversation in when nothing it cited says
+    unit_scopes: dict[str, dict] = field(default_factory=dict)
     # the passages an identical search returned, kept for the turn (round 9 R16, KTD3, ``memoized_search``):
     # (query, scope, limit, the office's data version) -> hits
     search_memo: dict = field(default_factory=dict)
@@ -1010,7 +1023,24 @@ def _unit_of(conn: Connection, ws: Workspace, handle: str):
     if data["unit_no"] not in cx.numbers:
         raise ToolError(MSG_STALE_HANDLE.format(handle=handle))
     ws.readings.setdefault(str(v.version_id), v.reading_id)
+    if cx.multi:
+        ws.unit_scopes[cx.key(data["unit_no"])] = {"document_id": str(v.document_id), "version_id": str(v.version_id),
+                                                   "reading_id": v.reading_id, "unit_no": data["unit_no"]}
     return v, cx, data["unit_no"]
+
+
+MSG_UNIT_FOCUS = "(היחידה שהשיחה עוסקת בה: {unit})"
+
+
+def focus_unit_for(ws: Workspace, documents: list[str] | str | None) -> str | None:
+    """The handle of the conversation's unit (U#), when a call that names no unit asks for no document but the unit's
+    own: the search or outline then works inside it (KTD8) — the user named no other property, or the request would
+    have moved. A call that names any other document is left as it is."""
+    focus = ws.unit_focus
+    if not focus:
+        return None
+    named = {str(x).strip() for x in ([documents] if isinstance(documents, str) else documents or ()) if str(x).strip()}
+    return focus["handle"] if named <= {focus["document_id"], ws.doc_handle(focus["document_id"])} else None
 
 
 def _unit_pages(cx, number: int) -> str:
@@ -1061,10 +1091,16 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
     limit = max(3, min(int(limit or SEARCH_LIMIT), SEARCH_MAX))
     ws.searches.append(query)
     notes: list[str] = []
+    in_focus = not unit and (unit := focus_unit_for(ws, document_ids)) is not None  # the conversation's unit
     with tenant_tx(ws.ctx) as conn:
         if unit:
             hits, notes, nothing = _unit_search(ws, conn, unit, query, limit, document_ids)
-            if nothing:
+            if in_focus:
+                focus_note = MSG_UNIT_FOCUS.format(unit=unit)
+                if nothing:
+                    return f"{focus_note} {nothing}"
+                notes.insert(0, focus_note)
+            elif nothing:
                 return nothing
             scope = True  # a unit names its document: no unread document is looked up by title
         else:
@@ -1732,6 +1768,8 @@ def tool_read(ws: Workspace, target: dict) -> str:
             s = _read_source(ws, conn, value)
         elif kind == "pages":
             by_unit = str(value.get("document") or "").strip()
+            if by_unit and (ws.handles.get(by_unit) or {}).get("kind") != "U":
+                by_unit = focus_unit_for(ws, by_unit) or by_unit  # the file of the conversation's unit: its unit
             if (ws.handles.get(by_unit) or {}).get("kind") == "U":  # the pages of a unit (U#), within the unit
                 v, ucx, number = _unit_of(conn, ws, by_unit)
             else:
@@ -2006,6 +2044,9 @@ def tool_outline(ws: Workspace, document: str, unit: str | None = None) -> str:
     with tenant_tx(ws.ctx) as conn:
         ref = str(document or "").strip()
         by_unit = unit or (ref if (ws.handles.get(ref) or {}).get("kind") == "U" else None)
+        if by_unit is None and ref:  # the conversation's unit, when the document asked for is its file (KTD8)
+            by_unit = focus_unit_for(ws, ref)
+            ref = by_unit or ref
         if by_unit:
             v, cx, number = _unit_of(conn, ws, by_unit)
             named = (ws.handles.get(ref) or {}).get("document_id", ref) if ref and ref != by_unit else ""

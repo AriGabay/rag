@@ -28,13 +28,14 @@ from tests.helpers import upload
 from tests.integration.test_chat import cloud, new_conversation, send
 from tests.integration.test_chat_attribution import _meaning
 from tests.support.scripted_agent import ScriptedAgent, call, final
-from tests.support.unit_files import unit_file
+from tests.support.unit_files import reread, unit_file
 
 pytestmark = pytest.mark.db
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 MANIFEST = json.loads((FIXTURES / "round9" / "manifest.json").read_text(encoding="utf-8"))["documents"]
 R9A, R9B = FIXTURES / MANIFEST["compendium"]["file"], FIXTURES / MANIFEST["similar_names"]["file"]
+R9A_TITLE = MANIFEST["compendium"]["title"]
 FACTS = MANIFEST["compendium"]["facts"]
 UNITS = MANIFEST["compendium"]["units"]
 SECOND, FIRST, THIRD = FACTS["second_value"]["value"], FACTS["first_value"]["value"], FACTS["third_value"]["value"]
@@ -428,3 +429,273 @@ def test_a_unit_handle_that_was_never_issued_is_refused_and_one_of_a_deleted_fil
     gone = T.run_tool(ws, "search", json.dumps(args | {"unit": handle}))
     assert T.MSG_UNAVAILABLE in gone and SECOND not in gone
     assert T.MSG_UNAVAILABLE in T.run_tool(ws, "outline", json.dumps({"document": handle, "unit": None}))
+
+
+# --- the unit in the conversation's focus (round 9 U10: KTD8, R14, AE5) ----------------------------------------------
+
+
+def _parse(**kw) -> dict:
+    """The resolving model's parse of a follow-up."""
+    return {"relation": "metric_change", "scope": "entity", "standalone_question": "?", "changed_fields": [],
+            "metric_kind": "unknown", "unit": "unknown", "scale": "unknown", "period": "unknown", "area_basis": "",
+            "vat": "unknown", "subject": "", "document_ids": [], "ambiguity": ""} | kw
+
+
+def _datum(doc: str, subject: str) -> dict:
+    return {"metric_as_written": "שווי הנכס", "metric_kind": "value", "unit": "ILS", "period": "none", "area_basis": "",
+            "vat": "unknown", "subject": subject, "value_role": "appraiser_determination", "document_ids": [doc]}
+
+
+def _sid(items, needle: str) -> str:
+    outs = [i["output"] for i in items if isinstance(i, dict) and i.get("type") == "function_call_output"]
+    return next(m.group(1) for o in outs for m in re.finditer(r'<source id="(S\d+)"[^>]*>[^<]*?' + re.escape(needle), o))
+
+
+def _value_turn(client, office, monkeypatch, unit: int, value: str, steps_before=()) -> tuple[str, dict]:
+    """The first turn: the sale value of the appraisal ``UNITS[unit]``, found by its name and searched inside it."""
+    name = UNITS[unit]["aliases"][0]
+
+    def answer(items) -> dict:
+        sid = _sid(items, value)
+        return final(f"שווי הנכס הוא {value} ₪ [{sid}].", focus=_datum(office.doc, UNITS[unit]["title"]),
+                     claims=[{"text": f"שווי הנכס הוא {value} ₪", "source_ids": [sid], "basis": "explicit"}])
+
+    agent = ScriptedAgent([[call("find_documents", query=name, page=None)],
+                           [call("search", query="שווי הנכס", document_ids=None, limit=None, unit="U1")], answer])
+    cloud(monkeypatch, office, agent)
+    cid = new_conversation(office.client)
+    m = send(office.client, cid, f"מה שווי הנכס ב{name}?")
+    assert m["status"] == "done", m
+    return cid, m
+
+
+def _follow(client, cid: str, monkeypatch, message: str, steps: list, parse: dict) -> tuple[ScriptedAgent, dict]:
+    agent = ScriptedAgent(steps)
+    agent.on("resolve", parse)
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: agent)
+    m = send(client, cid, message)
+    assert m["status"] == "done", m
+    return agent, m
+
+
+def test_the_first_answer_leaves_the_unit_it_was_found_in_as_the_conversations_focus(client, r9a, monkeypatch):
+    _, m = _value_turn(client, r9a, monkeypatch, 1, SECOND)
+    a = m["answer"]
+    unit = a["unit"]
+    assert (unit["document_id"], unit["unit_no"], unit["display"]) == (r9a.doc, 2, UNITS[1]["title"])
+    assert unit["reading_id"] == _reading(r9a, r9a.ver) and unit["first_label"] == "1" and unit["pages"] == [3, 4]
+    assert unit["title"] == contexts.name_key(UNITS[1]["title"]) and "גבעת הרקפות" in unit["aliases"]
+    assert a["focus"]["located_unit"] == unit and "unit_scope" not in a  # the unit was not kept from a turn before
+
+
+def test_price_then_rent_stays_on_the_same_unit_without_a_clarification(client, r9a, monkeypatch):
+    """AE5. The rent of R9a is written in the third appraisal only: a search that left the unit would find it there."""
+    cid, first = _value_turn(client, r9a, monkeypatch, 1, SECOND)
+    agent, m = _follow(client, cid, monkeypatch, "ומה דמי השכירות?", [
+        [call("search", query="דמי השכירות החודשיים", document_ids=None, limit=None, unit=None)],
+        final("לא נמצאו דמי שכירות ביחידה שנשאלה.", "not_found")],
+        _parse(changed_fields=[{"field": "metric_kind", "user_words": "דמי השכירות"}], metric_kind="rent"))
+    task = agent.seen[0][0]["content"]
+    assert UNITS[1]["title"] in task and "U1" in task and UNITS[2]["title"] not in task
+    searched = agent.tool_outputs(1)[0]  # no unit named in the call: the conversation's unit is the scope
+    assert "חיפוש בתוך היחידה U1" in searched and "(היחידה שהשיחה עוסקת בה: U1)" in searched
+    assert "92" not in searched and set(re.findall(r'unit_id="[^"]*#(\d+)"', searched)) == {"2"}
+    a = m["answer"]
+    assert a["status"] != "clarification" and a["request"]["entity_changed"] is False
+    assert (a["request"]["located_unit"]["unit_no"], a["request"]["unit_kept"]) == (2, True)
+    assert a["unit_scope"] == {"title": UNITS[1]["title"], "pages": [3, 4], "kept": True, "file_title": R9A_TITLE}
+
+
+def test_naming_another_project_moves_the_conversation_to_its_unit(client, r9a, monkeypatch):
+    cid, _ = _value_turn(client, r9a, monkeypatch, 1, SECOND)
+
+    def answer(items) -> dict:
+        sid = _sid(items, "92")
+        return final(f"דמי השכירות החודשיים למ\"ר הם 92 ₪ [{sid}].", focus=_datum(r9a.doc, UNITS[2]["title"]),
+                     claims=[{"text": "דמי השכירות החודשיים למ\"ר הם 92 ₪", "source_ids": [sid], "basis": "explicit"}])
+
+    agent, m = _follow(client, cid, monkeypatch, "ובפרויקט נחל הדס?", [
+        [call("search", query="דמי השכירות החודשיים", document_ids=None, limit=None, unit=None)], answer],
+        _parse(relation="correction", changed_fields=[{"field": "subject", "user_words": "בפרויקט נחל הדס"}],
+               subject="פרויקט נחל הדס"))
+    a = m["answer"]
+    assert a["request"]["document_ids"] == [r9a.doc]  # the same file, another unit
+    assert a["request"]["entity_changed"] is True and a["request"]["unit_kept"] is False
+    assert a["request"]["located_unit"]["unit_no"] == 3 and a["request"]["located_unit"]["display"] == UNITS[2]["title"]
+    task = agent.seen[0][0]["content"]
+    assert UNITS[2]["title"] in task and UNITS[1]["title"] not in task and "הנתון שבמרכז השיחה" not in task
+    assert "92" in agent.tool_outputs(1)[0] and SECOND not in agent.tool_outputs(1)[0]
+    assert a["unit"]["unit_no"] == 3 and a["focus"]["located_unit"]["unit_no"] == 3 and "unit_scope" not in a
+    assert {s["unit"]["no"] for s in a["sources"] if s.get("unit")} == {3}
+
+
+def test_a_turn_that_ended_on_the_time_limit_keeps_the_unit_and_continue_reads_on_inside_it(client, r9a, monkeypatch):
+    from app.config import get_settings
+    from tests.integration.test_chat_inspect import Clock
+
+    for k, v in {"chat_turn_seconds": 150, "chat_verify_reserve_seconds": 40, "chat_verify_min_seconds": 15}.items():
+        monkeypatch.setattr(get_settings(), k, v)
+    clock = Clock(monkeypatch)
+    agent = ScriptedAgent([[call("find_documents", query=UNITS[1]["aliases"][0], page=None)],
+                           [call("search", query="שווי הנכס", document_ids=None, limit=None, unit="U1")],
+                           final("עצרתי במגבלת הזמן לפני שהספקתי לקרוא את הערכת השווי.", "partial")])
+    agent.on_step = lambda i: setattr(clock, "offset", 112) if i == 1 else None
+    cloud(monkeypatch, r9a, agent)
+    cid = new_conversation(client)
+    first = send(client, cid, f"מה שווי הנכס ב{UNITS[1]['aliases'][0]}?")
+    assert first["status"] == "done", first
+    a = first["answer"]
+    assert a["limits_hit"] == ["time_limit"] and a["focus"] is None  # nothing was cited: no datum is the focus...
+    assert a["unit"]["unit_no"] == 2  # ...and the unit the turn worked in is still the conversation's
+    clock.offset = 0
+
+    def answer(items) -> dict:
+        sid = _sid(items, SECOND)
+        return final(f"שווי הנכס הוא {SECOND} ₪ [{sid}].", focus=_datum(r9a.doc, UNITS[1]["title"]),
+                     claims=[{"text": f"שווי הנכס הוא {SECOND} ₪", "source_ids": [sid], "basis": "explicit"}])
+
+    agent2, m = _follow(client, cid, monkeypatch, "המשך", [
+        [call("search", query="שווי הנכס", document_ids=None, limit=None, unit=None)], answer],
+        _parse(relation="same_datum"))
+    assert UNITS[1]["title"] in agent2.seen[0][0]["content"]
+    out = agent2.tool_outputs(1)[0]
+    assert SECOND in out and FIRST not in out and THIRD not in out
+    assert m["answer"]["request"]["located_unit"]["unit_no"] == 2 and m["answer"]["unit_scope"]["kept"] is True
+
+
+# the file read again: a new reading id and, in the synthetic file, other numbers
+
+SYN = "קובץ שומות סינתטי"
+
+
+@pytest.fixture
+def syn(office):
+    office.doc, office.ver = unit_file(office, office.default_group_id, SYN, [
+        {"title": "פרויקט הארז", "aliases": ["הארז"], "identifiers": ["רחוב הארז 4"],
+         "blocks": ["פרויקט הארז", "שווי הנכס 1,000,000 ₪."]},
+        {"title": "מתחם האשל", "aliases": ["האשל"], "identifiers": ["רחוב האשל 9"],
+         "blocks": ["מתחם האשל", "שווי הנכס 2,000,000 ₪."]},
+        {"title": "פרויקט הברוש", "aliases": ["הברוש"], "identifiers": ["רחוב הברוש 2"],
+         "blocks": ["פרויקט הברוש", "שווי הנכס 3,000,000 ₪."]}])
+    return office
+
+
+def _syn_turn(client, office, monkeypatch) -> str:
+    def answer(items) -> dict:
+        sid = _sid(items, "2,000,000")
+        return final(f"שווי הנכס הוא 2,000,000 ₪ [{sid}].", focus=_datum(office.doc, "מתחם האשל"),
+                     claims=[{"text": "שווי הנכס הוא 2,000,000 ₪", "source_ids": [sid], "basis": "explicit"}])
+
+    agent = ScriptedAgent([[call("find_documents", query="האשל", page=None)],
+                           [call("search", query="שווי הנכס", document_ids=None, limit=None, unit="U1")], answer])
+    cloud(monkeypatch, office, agent)
+    cid = new_conversation(client)
+    m = send(client, cid, "מה שווי הנכס במתחם האשל?")
+    assert m["status"] == "done" and m["answer"]["unit"]["unit_no"] == 2, m
+    return cid
+
+
+def test_after_a_reindex_the_unit_is_found_again_by_its_anchor_and_never_by_its_number(client, syn, monkeypatch):
+    cid = _syn_turn(client, syn, monkeypatch)
+    # read again: a new front-matter unit shifts the numbers, so the old number 2 is now the first appraisal
+    reread(syn, syn.ver, "reading-units-2", [
+        {"kind": "front_matter", "title": None, "blocks": (0, 0), "pages": (1, 1)},
+        {"title": "פרויקט הארז", "aliases": ["הארז"], "identifiers": ["רחוב הארז 4"], "blocks": (1, 1), "pages": (1, 1)},
+        {"title": "מתחם האשל", "aliases": ["האשל"], "identifiers": ["רחוב האשל 9"], "blocks": (2, 3), "pages": (2, 2)},
+        {"title": "פרויקט הברוש", "aliases": ["הברוש"], "identifiers": ["רחוב הברוש 2"], "blocks": (4, 5),
+         "pages": (3, 3)}])
+    contexts._CACHE.clear()
+    agent, m = _follow(client, cid, monkeypatch, "ומה דמי השכירות?", [
+        [call("search", query="שווי הנכס", document_ids=None, limit=None, unit=None)],
+        final("לא נמצאו דמי שכירות.", "not_found")],
+        _parse(changed_fields=[{"field": "metric_kind", "user_words": "דמי השכירות"}], metric_kind="rent"))
+    located = m["answer"]["request"]["located_unit"]
+    assert (located["unit_no"], located["reading_id"], located["display"]) == (3, "reading-units-2", "מתחם האשל")
+    out = agent.tool_outputs(1)[0]
+    assert "2,000,000" in out and "1,000,000" not in out and "3,000,000" not in out  # inside the unit now numbered 3
+    d = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["resolution"]
+    assert d["decisions"]["unit"] == "re-resolved"
+    assert m["answer"]["unit"]["unit_no"] == 3 and m["answer"]["unit"]["reading_id"] == "reading-units-2"
+
+
+def test_a_unit_that_is_gone_after_a_reindex_asks_and_the_old_number_selects_nothing(client, syn, monkeypatch):
+    cid = _syn_turn(client, syn, monkeypatch)
+    # read again with no appraisal of that name: the old number 2 is now the third appraisal
+    reread(syn, syn.ver, "reading-units-3", [
+        {"title": "פרויקט הארז", "aliases": ["הארז"], "identifiers": ["רחוב הארז 4"], "blocks": (0, 1), "pages": (1, 1)},
+        {"title": "פרויקט הברוש", "aliases": ["הברוש"], "identifiers": ["רחוב הברוש 2"], "blocks": (2, 5),
+         "pages": (2, 3)}])
+    contexts._CACHE.clear()
+    agent, m = _follow(client, cid, monkeypatch, "ומה דמי השכירות?", [],
+                       _parse(changed_fields=[{"field": "metric_kind", "user_words": "דמי השכירות"}],
+                              metric_kind="rent"))
+    a = m["answer"]
+    assert a["status"] == "clarification" and agent.seen == []  # asked, and no answering step
+    assert "מתחם האשל" in a["markdown"] and "פרויקט הארז" in a["markdown"] and "פרויקט הברוש" in a["markdown"]
+    assert a["request"]["located_unit"] is None and a["request"]["document_ids"] == []
+    assert {c["unit"]["display"] for c in a["request"]["candidates"]} == {"פרויקט הארז", "פרויקט הברוש"}
+    assert "unit" not in a or a["unit"] is None
+    # the reply picks among the units named; the chosen one becomes the conversation's
+    agent3, m3 = _follow(client, cid, monkeypatch, "השני", [
+        [call("search", query="שווי הנכס", document_ids=None, limit=None, unit=None)],
+        final("לא נמצא.", "not_found")], _parse(relation="clarification_answer"))
+    assert m3["answer"]["request"]["located_unit"]["display"] == "פרויקט הברוש"
+    assert "3,000,000" in agent3.tool_outputs(1)[0] and "1,000,000" not in agent3.tool_outputs(1)[0]
+
+
+def test_a_unit_of_a_file_the_user_can_no_longer_see_is_dropped_silently(client, r9a, monkeypatch):
+    cid, _ = _value_turn(client, r9a, monkeypatch, 1, SECOND)
+    with tenant_tx(r9a.system) as conn:
+        conn.execute(text("UPDATE documents SET deleted_at = now() WHERE id = :d"), {"d": r9a.doc})
+    agent, m = _follow(client, cid, monkeypatch, "ומה דמי השכירות?", [final("אין לי גישה לנתון הזה.", "not_found")],
+                       _parse(changed_fields=[{"field": "metric_kind", "user_words": "דמי השכירות"}],
+                              metric_kind="rent"))
+    a = m["answer"]
+    assert a["request"] is None or a["request"]["located_unit"] is None
+    assert SECOND not in a["markdown"] and "unit_scope" not in a
+
+
+def test_the_conversations_unit_is_the_default_scope_of_a_search_or_outline_that_names_no_other_document(r9a):
+    ws = T.Workspace(ctx=r9a.ctx())
+    handle = T.unit_handle_of(ws, r9a.doc, r9a.ver, _reading(r9a, r9a.ver), 2)
+    ws.unit_focus = {"handle": handle, "document_id": r9a.doc, "unit_id": None}
+    searched = T.tool_search(ws, "שווי הנכס", None, 12)
+    assert SECOND in searched and FIRST not in searched and THIRD not in searched
+    assert f"(היחידה שהשיחה עוסקת בה: {handle})" in searched
+    # the document asked for by its id or its handle is the unit's file: still inside the unit
+    assert FIRST not in T.tool_search(ws, "שווי הנכס", [r9a.doc], 12)
+    assert FIRST not in T.tool_search(ws, "שווי הנכס", [ws.doc_handle(r9a.doc)], 12)
+    outline = T.tool_outline(ws, r9a.doc)
+    assert f"סעיפי היחידה {handle} בלבד" in outline and "8. תיאור הנכס" in outline and "13. מבוא" not in outline
+    # another document is not the conversation's unit: the call is left as it is
+    other = "00000000-0000-0000-0000-000000000000"
+    assert T.focus_unit_for(ws, [other]) is None and T.focus_unit_for(ws, [r9a.doc, other]) is None
+    assert T.focus_unit_for(T.Workspace(ctx=r9a.ctx()), None) is None  # no unit in the conversation: nothing changes
+    # an explicit unit of the call wins over the default
+    first = _unit_handle(T.tool_find_documents(ws, UNITS[0]["aliases"][0]), UNITS[0]["title"])
+    assert FIRST in T.tool_search(ws, "שווי הנכס", None, 12, first)
+
+
+def test_the_unit_of_an_answer_is_a_document_the_answer_rests_on_for_the_permission_check():
+    from app.chat import api
+
+    assert api._answer_documents({"unit": {"document_id": "d-7"}}) == {"d-7"}
+    assert api._answer_documents({"unit": None}) == set()
+    focus = api._with_unit({"document_ids": ["d-1"], "metric_kind": "value"}, {"document_id": "d-1", "unit_no": 2})
+    assert focus["located_unit"]["unit_no"] == 2 and focus["metric_kind"] == "value"
+    assert "located_unit" not in api._with_unit({"document_ids": ["d-1"]}, {"document_id": "d-9", "unit_no": 2})
+    bare = api._with_unit(None, {"document_id": "d-1", "unit_no": 2, "display": "פרויקט הארז"})
+    assert bare["document_ids"] == ["d-1"] and bare["metric_kind"] == "unknown" and bare["subject"] == "פרויקט הארז"
+    assert api._with_unit(None, None) is None
+
+
+def test_pages_of_the_conversations_file_are_read_within_its_unit(r9a):
+    ws = T.Workspace(ctx=r9a.ctx())
+    handle = T.unit_handle_of(ws, r9a.doc, r9a.ver, _reading(r9a, r9a.ver), 2)
+    ws.unit_focus = {"handle": handle, "document_id": r9a.doc, "unit_id": None}
+    out = T.tool_read(ws, {"pages": {"document": r9a.doc, "from_page": 1, "to_page": 8}})
+    assert SECOND in out and FIRST not in out and THIRD not in out and "הטווח נחתך לעמודי היחידה" in out
+    refused = T._run_tool(ws, "read", json.dumps({"target": {"pages": {"document": r9a.doc, "from_page": 6, "to_page": 7},
+                                                              "source": None, "section": None, "table": None,
+                                                              "cursor": None}}))
+    assert "אינם ביחידה" in refused and "לא נפתח דבר" in refused
