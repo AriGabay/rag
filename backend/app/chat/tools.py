@@ -100,6 +100,7 @@ from sqlalchemy import Connection, text
 
 from app.answering.verify import numbers_in
 from app.chat import anchors, calc, contexts, meaning, reader
+from app.chat import unread as unread_text
 from app.chat.evidence import TABLE_SIZE_PREFIX
 from app.chat.timing import StageClock
 from app.config import get_settings
@@ -118,7 +119,7 @@ from app.measurements.extract import (
     stance_label,
 )
 from app.platform.documents import coverage_of, display_box_of, reading_notes
-from app.platform.search import SearchScope, search_passages
+from app.platform.search import SearchScope, search_passages, unread_documents, unread_matching, unread_named
 
 logger = logging.getLogger(__name__)
 
@@ -358,6 +359,10 @@ class Workspace:
     # about, and the subjects a calculation component compares
     requirements: Any = None
     context_notes: set = field(default_factory=set)  # documents whose contexts a read or a search already listed
+    # documents the turn's lookups matched by title whose latest version was not read (round 9 U6, KTD11): document id
+    # -> its state (``search.unread_documents``). Never located or retrieved: nothing was searched in them
+    unread_named: dict[str, dict] = field(default_factory=dict)
+    _unread_files: list[dict] | None = None
     # the reply's binding to the pending parameter of the previous turn's clarification (``resolve.bind_pending``),
     # set by the engine: an ``assume`` of the bound number from the current message records that parameter (KTD9)
     binding: dict | None = None
@@ -466,6 +471,21 @@ class Workspace:
         a["partial"] = a["partial"] or partial
         if opening is not None:
             a["openings"].append(opening)
+
+    def name_unread(self, files: list[dict]) -> None:
+        """Keep the unread documents a lookup of the turn matched by title (the gap line of a component says so)."""
+        for d in files:
+            self.unread_named[str(d["document_id"])] = d | {"document_id": str(d["document_id"])}
+
+    def unread_files(self) -> list[dict]:
+        """Every visible file that was not read, read once per turn (none outside a database: no context)."""
+        if self._unread_files is None:
+            if self.ctx is None:
+                self._unread_files = []
+            else:
+                with tenant_tx(self.ctx) as conn:
+                    self._unread_files = unread_documents(conn)
+        return self._unread_files
 
     def _sid(self) -> str:
         return f"S{len(self.sources) + 1}"
@@ -931,6 +951,9 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
         docs = _visible_documents(conn, document_ids or [])
         scope = SearchScope(document_ids=tuple(docs)) if docs else None
         hits = memoized_search(ws, conn, query, limit, scope)
+        # a document the query names by its title that was not read has no passages: say so, never "not found" (KTD11)
+        named = unread_named(conn, query) if scope is None else []
+        ws.name_unread(named)
         ids = [h["chunk_id"] for h in hits]
         extra = {r.id: r for r in conn.execute(text(
             "SELECT id, block_start, block_end FROM chunks WHERE id = ANY(:i)"), {"i": ids})} if ids else {}
@@ -975,9 +998,11 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
             out.append(ws.once(src, ("chunk", h["chunk_id"])))
             # the document as a whole: a datum not found may be in a part of it that was not read
             ws.touch(h["document_id"], h["title"], "retrieved", gaps.get(h["version_id"], whole).partial)
+    block = unread_text.tool_block(named)
     if not out:
-        return f'לא נמצאו קטעים עבור "{query}". אפשר לנסות ניסוח אחר, מונחים נרדפים או חיפוש בתוך מסמך מסוים.'
-    hints = [MSG_ROWS_NOT_SHOWN.format(handle=t, n=n) for t, n in capped]
+        return (f'לא נמצאו קטעים עבור "{query}". אפשר לנסות ניסוח אחר, מונחים נרדפים או חיפוש בתוך מסמך מסוים.'
+                + (f"\n\n{block}" if block else ""))
+    hints = [MSG_ROWS_NOT_SHOWN.format(handle=t, n=n) for t, n in capped] + ([block] if block else [])
     hints += [f"{ws.doc_handle(d)}: {note}" for d, cx in noted.items() if (note := _note_once(ws, d, cx))]
     return "\n\n".join([*(_render_source(s) for s in out), *hints])
 
@@ -1690,7 +1715,7 @@ def tool_list_documents(ws: Workspace, query: str | None = None, page: int | Non
             if ws.scope["query"] == "":
                 ws.scope["pages_read"].add(page)
     if not rows:
-        return "לא נמצאו מסמכים" + (f' שכותרתם כוללת "{query}"' if query else "") + "."
+        return ("לא נמצאו מסמכים" + (f' שכותרתם כוללת "{query}"' if query else "") + "." + _unread_listing(ws, words))
     criterion = (f'מסמכים שכותרתם כוללת את אחת המילים "{_txt(query)}"' if words
                  else "המסמכים שהמשתמש מורשה לראות")
     lines = [f"תחום: {criterion}", _page_line(page, pages, total, "מסמכים")]
@@ -1702,7 +1727,23 @@ def tool_list_documents(ws: Workspace, query: str | None = None, page: int | Non
         lines.append(f'- {ws.doc_handle(r.id)} document_id={r.id} | "{_txt(r.title)}" | עיבוד: {r.status} | קריאה: {status}'
                      + (f" ({'; '.join(details)})" if details else "") + f" | נתונים כמותיים: {mstate}")
     return _listing(ws, "רשימת מסמכים", lines, [(r.id, r.title) for r in rows], key=("list_documents", " ".join(words)),
-                    criterion=criterion, total=total, page=page, pages=pages)
+                    criterion=criterion, total=total, page=page, pages=pages) + _unread_listing(ws, words)
+
+
+def _unread_listing(ws: Workspace, words: list[str]) -> str:
+    """For the model, after a listing: the visible documents whose latest version was not read, outside the listing (a
+    count or a list over the set never includes them) — those whose title holds one of the words, or all of them for
+    the whole repository. They are kept as the turn's named unread documents (KTD11)."""
+    with tenant_tx(ws.ctx) as conn:
+        files = unread_documents(conn)
+        # a document is named by the query only when its title holds all the words; the whole repository names none
+        named = unread_matching(conn, " ".join(words)) if words else []
+    if words:
+        lowered = [w.lower() for w in words]
+        files = [d for d in files if any(w in d["title"].lower() for w in lowered)]
+        ws.name_unread(named)
+    block = unread_text.tool_block(files[:LIST_MAX])
+    return f"\n\n{block}" if block else ""
 
 
 def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> str:
@@ -1715,6 +1756,9 @@ def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> s
         raise ToolError("שאילתת תחום ריקה")
     with tenant_tx(ws.ctx) as conn:
         found = documents_matching(conn, query)
+        files = unread_matching(conn, query)
+    ws.name_unread(files)
+    block = unread_text.tool_block(files)
     total = len(found)
     page, pages = _paginate(page, total, SCOPE_PAGE)
     if ws.scope is None or ws.scope.get("query") != query:
@@ -1724,7 +1768,8 @@ def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> s
     for d in shown:
         ws.touch(d["document_id"], d["title"], "located")
     if not found:
-        return f'לא נמצאו מסמכים שמכילים את כל המונחים של "{query}". אפשר לנסות מונחים אחרים או פחות מונחים.'
+        return (f'לא נמצאו מסמכים שמכילים את כל המונחים של "{query}". אפשר לנסות מונחים אחרים או פחות מונחים.'
+                + (f"\n\n{block}" if block else ""))
     n_terms = len(_scope_terms(query))
     in_title = sum(1 for d in found if len(d["in_title"]) == n_terms)
     lines = [f'תחום: מסמכים שמכילים את כל המונחים "{_txt(query)}" (בכותרת או בתוכן)',
@@ -1743,7 +1788,7 @@ def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> s
         lines.append(f"הרשימה חלקית: זה עמוד {page} מתוך {pages}.")
     return _listing(ws, f'מסמכים בתחום "{query}"', lines, [(d["document_id"], d["title"]) for d in shown],
                     key=("find_documents", query), criterion=f'מסמכים שמכילים את כל המונחים "{query}"', total=total,
-                    page=page, pages=pages)
+                    page=page, pages=pages) + (f"\n\n{block}" if block else "")
 
 
 OUTLINE_MAX = 150  # sections listed in one outline

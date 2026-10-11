@@ -215,10 +215,10 @@ def test_the_policy_and_schema_carry_the_scores_the_related_ids_and_the_absence_
     assert {"id", "text", "status", "units", "related", "calculation", "absent", "aspect"} <= set(fields)
     assert "undeterminable" in verify.JUDGE_REQUIREMENTS_POLICY and "related" in verify.JUDGE_REQUIREMENTS_POLICY
     assert "absent" in verify.JUDGE_REQUIREMENTS_POLICY
-    # one reason vocabulary (R8): ten reasons, the server's only gap words
+    # one reason vocabulary (R8): eleven reasons, the server's only gap words (``document_not_read``: round 9 U6)
     assert set(coverage.REASONS) == {"not_located", "not_in_part_read", "region_not_read", "not_verifiable",
                                      "sources_conflict", "detail_missing", "calculation_incomplete", "tool_failure",
-                                     "instruction_not_met", "removed"}
+                                     "instruction_not_met", "removed", "document_not_read"}
     assert not hasattr(coverage, "LIMITATIONS") and not hasattr(coverage, "ABSENCE_KINDS")
 
 

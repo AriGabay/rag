@@ -14,7 +14,11 @@ title or its text), and the outcome decides the scope:
   a word that every report holds);
 - several otherwise → a clarification that names them;
 - none, even with only the identifying words (a number, Latin letters, a word of some title) → a clarification that
-  says no such document was found. The previous property is never the answer instead.
+  says no such document was found. The previous property is never the answer instead;
+- a document the words name by more of its title than any readable document does, whose latest version was not read
+  (failed, waiting or being processed: ``unread_matching``, KTD11) → ``not_read``: the document with its state and
+  reason, never a search over it. When nothing is located and the user may see files that were not read, the outcome
+  carries them, so the message does not say the data is absent (R5).
 
 A reply to such a clarification is resolved among the documents it named, and only among them.
 """
@@ -31,7 +35,13 @@ from sqlalchemy import text
 
 from app.db import TenantContext, tenant_tx
 from app.extraction.normalize_text import base_normalize
-from app.platform.search import _scope_terms, _title_words, documents_matching
+from app.platform.search import (
+    _scope_terms,
+    _title_words,
+    documents_matching,
+    unread_documents,
+    unread_matching,
+)
 
 CLARIFY_TITLES = 5
 _TOKEN = re.compile(r"[\w\"״׳'/-]+")
@@ -45,6 +55,7 @@ class Candidate:
     title: str
     title_terms: int = 0
     hits: int = 0
+    unread: dict | None = None  # a document that was not read: its state (``search.unread_documents``)
 
     def as_dict(self) -> dict:
         return {"document_id": self.document_id, "title": self.title}
@@ -52,9 +63,12 @@ class Candidate:
 
 @dataclass
 class Outcome:
-    kind: Literal["resolved", "ambiguous", "not_found"]
+    kind: Literal["resolved", "ambiguous", "not_found", "not_read"]
     documents: list[Candidate] = field(default_factory=list)
     query: str = ""
+    # a ``not_found`` outcome: the visible files that were not read (``search.unread_documents``), so what is said
+    # does not claim the data is absent
+    unread: list[dict] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {"kind": self.kind, "query": self.query, "documents": [d.as_dict() for d in self.documents]}
@@ -174,9 +188,10 @@ def among(candidates: list[dict], reply: str, authorized: set[str]) -> Outcome:
 
 
 def _visible_titles(conn) -> list[str]:
+    """Every title the user may see: the readable documents' and those whose latest version was not read."""
     return [r.title for r in conn.execute(text(
         "SELECT d.title FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
-        " WHERE d.deleted_at IS NULL"))]
+        " WHERE d.deleted_at IS NULL"))] + [d["title"] for d in unread_documents(conn)]
 
 
 def lookup(ctx: TenantContext, words: str, focus_ids: set[str],
@@ -184,19 +199,31 @@ def lookup(ctx: TenantContext, words: str, focus_ids: set[str],
     """The documents the user's words name, under the user's permissions (see the module docstring). ``titles``:
     every title the user may see, when the caller already holds them."""
     with tenant_tx(ctx) as conn:
-        found = documents_matching(conn, words) if _scope_terms(words) else []
+        searchable = bool(_scope_terms(words))
+        found = documents_matching(conn, words) if searchable else []
+        unread = unread_matching(conn, words) if searchable else []
         query = words
-        if not found:
+        if not found and not unread:
             # relaxed: the words that can name a document, then only the address or label among them
             vocabulary = titles() if titles else _visible_titles(conn)
             for relaxed in (" ".join(identifying(words, vocabulary)),
                             " ".join(identifying(words, vocabulary, pairs_only=True))):
                 if relaxed and relaxed != query:
                     query = relaxed
-                    found = documents_matching(conn, relaxed)
-                    if found:
+                    found, unread = documents_matching(conn, relaxed), unread_matching(conn, relaxed)
+                    if found or unread:
                         break
-    return choose(found, query, focus_ids)
+        outcome = choose(found, query, focus_ids)
+        named = choose(unread, query, set()) if unread else None
+        best = max((c.title_terms for c in outcome.documents), default=-1)
+        if named is not None and named.documents and named.documents[0].title_terms > best:
+            # the words name an unread document by more of its title than any readable one: it is the answer
+            for c in named.documents:
+                c.unread = next(d for d in unread if str(d["document_id"]) == c.document_id)
+            return Outcome("not_read", named.documents[:CLARIFY_TITLES], query)
+        if outcome.kind == "not_found":
+            outcome.unread = unread_documents(conn)
+    return outcome
 
 
 def authorized(ctx: TenantContext, ids) -> set[str]:

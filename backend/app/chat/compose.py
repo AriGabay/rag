@@ -21,7 +21,9 @@ The spans a kind covers:
 - ``removal_note``: the note that says how many claims were removed; ``replacement``: the sentence that replaces an
   answer nothing of which was supported; ``request_note``: the note that the datum is not the one requested;
 - ``gap_paragraph``: the lines that state each component not given; ``limit_sentence``: what a limit the turn reached
-  means for the answer; ``coverage_note`` and ``membership_note``: the coverage ledger's note.
+  means for the answer; ``coverage_note`` and ``membership_note``: the coverage ledger's note; ``unread_notice``: the
+  one notice of the files the user may see that were not read, written after the gap paragraph when the turn located
+  no document (round 9 U6, KTD11).
 
 ``Doc`` also keeps, for every character of the model's own text, the offset it had in the text the model wrote (``origin``;
 -1 for a server span), so the final check (round 8 U6, ``app.chat.final_check``) can tell which sentence of the answer a
@@ -39,7 +41,7 @@ if TYPE_CHECKING:
     from app.chat.engine import FinalAnswer
 
 SERVER_KINDS = ("marker", "partial_mark", "qualifier", "citation", "removal_note", "request_note", "gap_paragraph",
-                "limit_sentence", "coverage_note", "membership_note", "replacement")
+                "limit_sentence", "coverage_note", "membership_note", "replacement", "unread_notice")
 # the marker a cut span leaves: an ordinal, so the log entry of the claim it replaced is found by it
 MARKER = "«[{n}: חלק שלא אומת הושמט]»"
 PARTIAL_MARK = " *(אומת חלקית)*"
@@ -220,7 +222,7 @@ def compose(ws, answer: FinalAnswer, report, turn, *, question: str, limit_sente
     """Every edit after the model's answer and its verification, in one pass (KTD6), in the order the engine always
     made them: the report's cuts, marks, qualifiers and citations, the removal note or the replacement sentence and
     the request-mismatch note; the units stating an absence the server states removed and the report applied again; the
-    gap paragraph and the tidying; the limit sentences of the limits the turn reached; and the coverage ledger's note.
+    gap paragraph and the tidying; the notice of the files that were not read; the limit sentences of the limits the turn reached; and the coverage ledger's note.
     Returns the answer, the registry of the server's spans in it, the components as stated and the ledger (empty for a
     clarification, which asks and states nothing). The side effects of the ledger — a cited document is ``verified`` —
     are not made here (``coverage.touch_verified``): the engine makes them once, for the documents the final text cites."""
@@ -228,6 +230,9 @@ def compose(ws, answer: FinalAnswer, report, turn, *, question: str, limit_sente
 
     edited, outcomes = coverage.compose_components(ws, answer, report, turn)
     doc = edited.doc
+    unread_shown = _unread_notice(ws, doc, report, question) if edited.status != "clarification" else []
+    if unread_shown and edited.status == "answered":
+        edited.status = "partial"  # files were not checked: never an answer that looks complete
     if limit_sentences and edited.status != "clarification":
         body = doc.text.strip()
         doc.append(("\n\n" if body else "") + " ".join(limit_sentences), "limit_sentence")
@@ -236,10 +241,29 @@ def compose(ws, answer: FinalAnswer, report, turn, *, question: str, limit_sente
     if edited.status != "clarification":
         before = edited.answer(answer)
         ledger, built = coverage.build(ws, before, question)
+        if unread_shown:
+            ledger["unread_documents"] = [{"document_id": str(d["document_id"]), "title": d["title"]}
+                                          for d in unread_shown]
         edited.status = built.status
         _take_appended(doc, built.answer_markdown, "membership_note" if ledger.get("membership") else "coverage_note")
     report.mark_markers(doc.renumber("marker", MARKER))
     return Composition(edited.answer(answer), doc.spans(), outcomes, ledger, doc.origins())
+
+
+def _unread_notice(ws, doc: Doc, report, question: str) -> list[dict]:
+    """The one notice of the visible files that were not read (KTD11, R5), appended to ``doc`` as a server span: when the
+    turn tried to locate a document (it searched or listed) and the saved text cites none. A document a gap line already
+    states is not listed again. Returns the files the notice names (at most ``unread.NOTICE_FILES``)."""
+    from app.chat import coverage, unread
+
+    if not (ws.searches or ws.scope is not None or ws.unread_named) or coverage.cited_documents(ws, doc.text):
+        return []
+    stated = ws.unread_named if any(g["reason"] == "document_not_read" for g in report.gaps or ()) else {}
+    files = [d for d in ws.unread_files() if str(d["document_id"]) not in stated]
+    notice, shown = unread.notice(files, question)
+    if notice:
+        doc.append(("\n\n" if doc.text.strip() else "") + notice, "unread_notice")
+    return shown
 
 
 def _take_appended(doc: Doc, built: str, kind: str) -> None:

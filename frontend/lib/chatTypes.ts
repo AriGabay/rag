@@ -325,6 +325,7 @@ export type ChatRequirementStatus = ChatComponentStatus | "missing" | "undetermi
 export type ChatGapReason =
   | "not_located"
   | "not_in_part_read"
+  | "document_not_read"
   | "region_not_read"
   | "not_verifiable"
   | "sources_conflict"

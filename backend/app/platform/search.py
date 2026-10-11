@@ -564,6 +564,83 @@ def documents_sharing_title_words(conn: Connection, question: str) -> dict[str, 
     return out
 
 
+# --- documents whose latest version was not read (round 9 U6, KTD11) ------------------------------------
+
+# A version in one of these states holds nothing the search can reach. Only a document with no current version at
+# all is "not read" here: one whose older version is current is answered from that version, as before.
+UNREAD_STATUSES = ("failed", "pending", "processing")
+_UNREAD_FROM = (
+    " FROM documents d JOIN LATERAL (SELECT v.id, v.version_no, v.status, v.status_reason, v.ingestion, v.created_at"
+    " FROM document_versions v WHERE v.document_id = d.id ORDER BY v.version_no DESC LIMIT 1) lv ON true"
+    " WHERE d.deleted_at IS NULL AND lv.status = ANY(:unread)"
+    " AND NOT EXISTS (SELECT 1 FROM document_versions c WHERE c.document_id = d.id AND c.is_current)")
+
+
+def unread_documents(conn: Connection) -> list[dict]:
+    """The visible documents whose latest version (by ``version_no``, as the documents screen shows it) is failed,
+    waiting or being processed and that have no current version, whatever the reason: [{document_id, title, status,
+    reason, progress, uploaded_at}], most recently uploaded first. The same visibility as the current-version lookups
+    (RLS, deleted documents excluded): a file of a group the user cannot see is not here. ``progress``: the pages
+    read and in the file of a version being processed (None otherwise)."""
+    from types import SimpleNamespace
+
+    from app.platform.documents import _progress
+
+    rows = conn.execute(text(
+        "SELECT d.id, d.title, lv.status, lv.status_reason, lv.ingestion, lv.created_at" + _UNREAD_FROM
+        + " ORDER BY lv.created_at DESC, d.title, d.id"), {"unread": list(UNREAD_STATUSES)}).all()
+    return [{"document_id": r.id, "title": r.title, "status": r.status, "reason": r.status_reason,
+             "progress": _progress(SimpleNamespace(status=r.status, ingestion=r.ingestion)),
+             "uploaded_at": r.created_at} for r in rows]
+
+
+def unread_matching(conn: Connection, query: str) -> list[dict]:
+    """The unread documents (``unread_documents``) whose **title** holds every term of ``query``, each term in any of
+    its forms: a document that was not read has no text to match. Rows as ``documents_matching`` gives them (no
+    passages: ``hits`` 0), with the state of the version."""
+    terms = [set(t) for t in _scope_terms(query)]
+    if not terms:
+        return []
+    out = []
+    for d in unread_documents(conn):
+        title = _title_words(d["title"]) | _numbers_of(d["title"])
+        if all(title & ts for ts in terms):
+            out.append(d | {"in_title": [sorted(title & ts)[0] for ts in terms], "in_text": [], "hits": 0})
+    return out
+
+
+def unread_named(conn: Connection, query: str) -> list[dict]:
+    """The unread documents a search query names by their title, as ``documents_named`` names current ones: at least
+    two query words in the title, one of them a number or both distinctive (in no more than two visible titles,
+    current ones and unread ones together)."""
+    unread = unread_documents(conn)
+    if not unread:
+        return []
+    titles = [r.title for r in conn.execute(text(
+        "SELECT d.title FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
+        " WHERE d.deleted_at IS NULL"))] + [d["title"] for d in unread]
+    df: dict[str, int] = {}
+    for t in titles:
+        for w in _title_words(t) | _numbers_of(t):
+            df[w] = df.get(w, 0) + 1
+    forms: dict[str, set[str]] = {}
+    for raw in _TITLE_WORD.findall(base_normalize(query)):
+        w = raw.strip("-'״׳\"")
+        if len(w) >= 2 or w.isdigit():
+            forms.setdefault(w, set()).update({w, *prefix_variants(w)} & set(df))
+    forms = {w: f for w, f in forms.items() if f}
+    many = max(2, NAMING_DF_SHARE * len(titles))
+    out = []
+    for d in unread:
+        words = _title_words(d["title"]) | _numbers_of(d["title"])
+        hit = {w for w, f in forms.items() if f & words and max(df[x] for x in f) <= many}
+        distinctive = {w for w in hit if min(df[x] for x in forms[w] & words) <= 2}
+        if len(hit) >= 2 and any(not w.isdigit() for w in hit) and (
+                any(w.isdigit() for w in hit) or len(distinctive) >= 2):
+            out.append(d)
+    return out
+
+
 def question_words_in_title(question: str, title: str) -> frozenset[str]:
     """The words of ``question`` that ``title`` carries (in any prefixed form), as the question writes them."""
     in_title = _title_words(title)

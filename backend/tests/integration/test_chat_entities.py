@@ -14,6 +14,7 @@ from tests.conftest import login
 from tests.factories import make_office
 from tests.integration.test_chat import cloud, new_conversation, send
 from tests.integration.test_chat_coverage import add_doc
+from tests.integration.test_chat_unread_documents import TOO_LONG, add_unread
 from tests.support.scripted_agent import ScriptedAgent, call, final
 
 pytestmark = pytest.mark.db
@@ -142,3 +143,30 @@ def test_the_resolution_is_diagnostics_only_and_follows_the_documents_it_names(c
     with tenant_tx(setup.system) as conn:
         conn.execute(text("UPDATE documents SET deleted_at = now() WHERE id = :d"), {"d": setup.narkis_b})
     assert client.get(f"/api/chat/messages/{m['id']}/diagnostics").status_code == 404
+
+
+# --- documents that were not read (round 9 U6, KTD11; AE1) -------------------------------------------------------------
+
+
+def test_a_follow_up_naming_a_failed_document_says_it_was_not_read_and_why(client, setup, monkeypatch):
+    cid = _first_turn(client, setup, monkeypatch)
+    add_unread(setup, setup.default_group_id, "שומה - הזית 9 נווה ים")
+    agent = _turn(monkeypatch, [], _resolution(relation="new_question",
+                                               changed_fields=[{"field": "subject", "user_words": "בהזית 9"}]))
+    a = send(client, cid, "ובהזית 9?")["answer"]
+    assert a["status"] == "clarification" and agent.seen == []  # no answering step, no search over the file
+    assert "שומה - הזית 9 נווה ים" in a["markdown"] and TOO_LONG in a["markdown"]
+    assert "לא נקרא" in a["markdown"] or "העיבוד נכשל" in a["markdown"]
+    assert "לא מצאתי" not in a["markdown"] and "13,700" not in a["markdown"]
+    assert a["request"]["candidates"] == []  # nothing to choose between: a reply is a new question
+
+
+def test_a_follow_up_that_names_nothing_lists_the_files_that_were_not_read(client, setup, monkeypatch):
+    cid = _first_turn(client, setup, monkeypatch)
+    add_unread(setup, setup.default_group_id, "קובץ מרוכז - מתחם הרצל")
+    _turn(monkeypatch, [], _resolution(relation="new_question",
+                                       changed_fields=[{"field": "subject", "user_words": "בהיסמין 3"}]))
+    a = send(client, cid, "ובהיסמין 3?")["answer"]
+    assert a["status"] == "clarification" and "לא מצאתי" in a["markdown"]
+    assert "קבצים שאתה רשאי לראות לא נקראו, ולכן לא נבדקו" in a["markdown"]
+    assert "קובץ מרוכז - מתחם הרצל" in a["markdown"] and TOO_LONG in a["markdown"]

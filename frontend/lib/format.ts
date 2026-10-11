@@ -368,6 +368,7 @@ export function valueStatusText(s: ValueStatus): string {
 export const GAP_REASON_LABEL: Record<string, string> = {
   not_located: "לא אותר בחיפושים שבוצעו",
   not_in_part_read: "לא מופיע בחלק שנקרא ונבדק",
+  document_not_read: "המסמך שנשאל עליו לא נקרא",
   region_not_read: "האזור הרלוונטי לא נקרא במלואו",
   not_verifiable: "נמצא, אך לא ניתן לאמת או להכריע",
   sources_conflict: "המקורות סותרים",

@@ -50,7 +50,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from app.chat import entities
+from app.chat import entities, unread
 from app.chat import request as request_analysis
 from app.chat import tools as T
 from app.measurements.extract import PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
@@ -282,9 +282,14 @@ def _clarify_titles(outcome: entities.Outcome, words: str) -> str:
     return f"נמצאו כמה מסמכים שמתאימים ל\"{prompt_text(words)}\": {names}. לאיזה מהם התכוונת?"
 
 
-def _clarify_missing(words: str) -> str:
-    return (f"לא מצאתי במסמכים שאתה מורשה לראות מסמך על \"{prompt_text(words)}\". לאיזה נכס או מסמך התכוונת?"
-            if words.strip() else "לא מצאתי במסמכים שאתה מורשה לראות את הנכס שציינת. לאיזה נכס או מסמך התכוונת?")
+def _clarify_missing(words: str, files: list[dict] | None = None) -> str:
+    """The server's question when no readable document is named. Files the user may see that were not read are listed
+    as not checked (R5): the words may name something held only in them, so the message never says it is absent."""
+    asked = (f"לא מצאתי במסמכים שאתה מורשה לראות מסמך על \"{prompt_text(words)}\". לאיזה נכס או מסמך התכוונת?"
+             if words.strip() else
+             "לא מצאתי במסמכים שאתה מורשה לראות את הנכס שציינת. לאיזה נכס או מסמך התכוונת?")
+    listing, _ = unread.notice(files or [], words)
+    return f"{asked}\n\n{listing}" if listing else asked
 
 
 def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
@@ -458,8 +463,14 @@ def _take(out: Request, outcome: entities.Outcome, words: str, decisions: dict,
         return
     out.entity_changed = True
     out.document_ids, out.server_clarify = [], True
+    if outcome.kind == "not_read":
+        # the words name a document that was not read: its state is the answer, and nothing is searched in it. The
+        # clarification offers no candidates — a reply to it is a new question
+        out.clarify = unread.message([d.unread for d in outcome.documents], prompt_text(words))
+        return
     out.candidates = [d.as_dict() for d in outcome.documents]
-    out.clarify = _clarify_titles(outcome, words) if outcome.kind == "ambiguous" else _clarify_missing(words)
+    out.clarify = (_clarify_titles(outcome, words) if outcome.kind == "ambiguous"
+                   else _clarify_missing(words, outcome.unread))
     if outcome.kind == "not_found":
         out.subject = ""
 

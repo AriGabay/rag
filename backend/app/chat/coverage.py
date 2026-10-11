@@ -116,7 +116,8 @@ def cited_documents(ws: Workspace, markdown: str) -> dict[str, str]:
 
 
 LEDGER_DOCUMENT_KEYS = ("cited", "matching", "read", "retrieved_only", "with_data", "not_checked", "unused",
-                        "partially_read", "omitted", "also_matching", "tables", "requirements", "gap_documents")
+                        "partially_read", "omitted", "also_matching", "tables", "requirements", "gap_documents",
+                        "unread_documents")
 
 
 def ledger_documents(ledger: dict | None) -> set[str]:
@@ -166,6 +167,7 @@ REASONS = {
     "detail_missing": "חסר פרט בבקשה",
     "not_verifiable": "נמצא, אך לא ניתן לאמת או להכריע",
     "sources_conflict": "המקורות סותרים",
+    "document_not_read": "המסמך שנשאל עליו לא נקרא",
     "region_not_read": "האזור הרלוונטי לא נקרא במלואו",
     "not_in_part_read": "לא מופיע בחלק שנקרא ונבדק",
     "not_located": "לא אותר בחיפושים שבוצעו",
@@ -320,6 +322,12 @@ def gap_sentence(reason: str, variant: str, texts: list[str], place: dict | None
     if reason == "sources_conflict":
         return f"{who}: המקורות סותרים — הם נותנים {'להם' if many else 'לנתון'} ערכים שונים, ולכן אין " \
                f"{'להם' if many else 'לו'} ערך אחד."
+    if reason == "document_not_read":
+        # a document the user may see whose latest version was not read (KTD11): what the turn could not do, never
+        # that the datum is not in it (R18)
+        if variant == "many":
+            return f"{who}: המסמכים \"{document}\" לא נקראו ({detail}), ולכן לא נבדק אם הנתון מופיע בהם."
+        return f"{who}: המסמך \"{document}\" לא נקרא ({detail}), ולכן לא נבדק אם הנתון מופיע בו."
     if reason == "region_not_read" and variant == "clipped":
         return (f"{who} לא {'נמצאו' if many else 'נמצא'} בחלק שנקרא {of_it}: {what} נקרא רק בחלקו, ולכן ייתכן "
                 "שהנתון מופיע בחלק שלא נקרא.")
@@ -492,6 +500,8 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
                           "document_id": doc}
     if gap is not None and gap["reason"] == "not_in_part_read":
         return out | gap | {"searched": True}
+    if ws.unread_named:  # the documents the turn's lookups matched by title were not read: nothing was searched in them
+        return out | _not_read_gap(ws)
     documents = list(dict.fromkeys(ev["documents"] + ((claim or {}).get("document_ids") or [])))
     for doc in documents:
         a = ws.activity.get(doc) or {}
@@ -502,6 +512,18 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
     if out["searched"]:
         return out | {"reason": "not_located", "variant": "searched"}
     return out | {"reason": "not_located"}
+
+
+def _not_read_gap(ws: Workspace) -> dict:
+    """The gap of a component whose named document was not read (``document_not_read``): the documents the turn's
+    lookups matched by title, with their state and reason (``unread.gap_detail``)."""
+    from app.chat import unread
+
+    files = list(ws.unread_named.values())
+    one = len(files) == 1
+    return {"reason": "document_not_read", "variant": "" if one else "many", "searched": True,
+            "document": "; ".join(unread.title_of(d) for d in files), "detail": unread.gap_detail(files),
+            "document_id": files[0]["document_id"] if one else None}
 
 
 def _claims_by_component(ws: Workspace, requested, opened: dict[str, tuple[str, dict]] | None = None
@@ -549,7 +571,8 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
               "document": why.get("document"), "document_id": why.get("document_id"), "searched": why["searched"],
               "detail": why.get("detail") or "", "variant": why.get("variant") or ""}
         if o["document_id"]:
-            o["document_title"] = (ws.activity.get(o["document_id"]) or {}).get("title")
+            o["document_title"] = ((ws.activity.get(o["document_id"]) or ws.unread_named.get(o["document_id"]) or {})
+                                   .get("title"))
         # a partly given leaf is stated only for the part the judge named missing (validated against the request,
         # ``verify.valid_missing``): a conditional requirement (R21) or one that is no datum of the documents never is
         if o["status"] != "partial" or o["conditional"] or o["kind"] not in ("information", "calculation"):
@@ -606,8 +629,10 @@ def _unlinked_gaps(ws: Workspace, requested) -> list[dict]:
     out = []
     for r in unlinked:
         gap = _claim_gap(r)
+        if gap["reason"] == "not_located" and ws.unread_named:  # the named document was not read: not "not found"
+            gap = _not_read_gap(ws) | {"place": None}
         out.append({"text": r["label"], "limitation": gap["reason"], "variant": gap["variant"],
-                    "place": gap["place"], "document": gap["document"], "detail": ""})
+                    "place": gap["place"], "document": gap["document"], "detail": gap.get("detail") or ""})
     return out
 
 
