@@ -1,7 +1,7 @@
 """Count the appraisal contexts of each document's current reading (round 7 U6, KTD7: "measured before enforced").
 
 For every document of an office (or of every office), the current version's reading is derived into appraisal
-contexts with the same code the chat tools use (``app.chat.contexts.of_version``), and one line is printed per
+contexts (one per stored unit, ``app.chat.contexts.of_version``, the code the chat tools use), and one line is printed per
 document: its id, its page count, the number of contexts, and for each context its page range and the KINDS of
 identifiers that define it (``address``, ``block_parcel``) — never an identifier's value, a title or any other text
 of the document. A summary counts the single- and multi-context documents. The enforcement setting
@@ -46,7 +46,7 @@ def count_office(ctx: TenantContext) -> list[dict]:
             found = []
             for n in cx.numbers:
                 first, last = cx.pages(n)
-                found.append({"number": n, "pages": (first, last), "kinds": sorted(cx.identity(n).kinds)})
+                found.append({"number": n, "pages": (first, last), "kinds": sorted(cx.identity(n).kinds - {contexts.NAMES})})
             out.append({"document_id": str(v.document_id), "pages": v.page_count, "contexts": found})
     return out
 

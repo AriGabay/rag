@@ -844,7 +844,9 @@ MSG_CONTEXTS = ("החישוב משלב ערכים מכמה שומות או נכ�
 
 def _check_contexts(out: Operand, allowed: list[frozenset[str]] | None) -> None:
     """A calculation over inputs of several appraisal contexts (KTD7) is refused unless one of ``allowed`` — the
-    contexts a frozen comparison component names — holds them all; ``allowed`` None: not enforced."""
+    contexts a frozen comparison component names — holds them all; ``allowed`` None: not enforced. A value of an
+    appendix or a comparables part carries no context (``Value.operand``, ``tools._operand``): it belongs to the
+    appraisal it serves, so combining it with that appraisal's values is ordinary practice."""
     if allowed is None:
         return
     mixed = dict.fromkeys(lf.context for lf in out.leaves if lf.context is not None)
@@ -1159,7 +1161,7 @@ class Value:
                        kind=self.kind, role=self.role, subject=self.subject, total=self.total, table=self.table,
                        approx=self.approx,
                        context=(self.context["key"], self.context.get("described") or self.context["label"])
-                       if self.context else None, scale=self.scale)
+                       if self.context and self.context.get("subject", True) else None, scale=self.scale)
 
     def public(self) -> dict:
         return {"id": self.vid, "value": str(self.value), "value_text": self.written, "label": self.label,

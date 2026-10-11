@@ -744,7 +744,7 @@ def _context_note(ws: Workspace, cx) -> str:
         if not from_components:
             lines.append(MSG_ASKED_ONE.format(asked=_txt(_clip(" · ".join(cx.label(n) for n in named), 120)),
                                               which=", ".join(f"הקשר {n}" for n in named))
-                         if len(named) == 1 else MSG_ASKED_UNNAMED)
+                         if len(named) == 1 else MSG_ASKED_UNNAMED if len(cx.subjects) > 1 else "")
         elif len(named) == 1:
             lines.append(MSG_ASKED_ONE.format(asked=_txt(_clip(subject, 120)), which=cx.describe(named[0])))
         elif not named:
@@ -752,7 +752,7 @@ def _context_note(ws: Workspace, cx) -> str:
         else:
             lines.append(MSG_ASKED_MANY.format(asked=_txt(_clip(subject, 120)),
                                                which=", ".join(f"הקשר {n}" for n in named)))
-    return "\n".join(dict.fromkeys(lines))
+    return "\n".join(dict.fromkeys(x for x in lines if x))
 
 
 def _note_once(ws: Workspace, document_id, cx) -> str | None:
@@ -911,7 +911,7 @@ def value_context(cx, number: int | None) -> dict | None:
         return None
     first, last = cx.pages(number)
     return {"key": cx.key(number), "number": number, "label": cx.label(number), "described": cx.describe(number),
-            "pages": [first, last] if first else []}
+            "pages": [first, last] if first else [], "subject": cx.is_subject(number)}
 
 
 def subject_from(cx, number: int | None, subject: str) -> str:
@@ -3438,7 +3438,8 @@ def _operand(ws: Workspace, i: str) -> calc.Operand:
                             total=bool(calc.TOTAL_WORDS.search(meaning._norm(r.metric or ""))),
                             table=(str(m.version_id), r.table_index) if r.table_index is not None else None,
                             group=r.value_role, same=str(m.id), approx=r.value_form != "exact",
-                            context=(m.context["key"], m.context["described"]) if m.context else None)
+                            context=(m.context["key"], m.context["described"])
+                            if m.context and m.context.get("subject", True) else None)
     raise ToolError(f"מזהה לא מוכר: {i}. אפשר להשתמש רק במזהים שנרשמו בתור הזה: V# (take_value), A# (assume), "
                     "M# (find_measurements), C# (calculate)")
 

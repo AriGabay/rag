@@ -298,3 +298,176 @@ def test_a_page_without_usable_geometry_keeps_its_stored_block_top():
     for geometry in (None, dict(TURNED, geometry_issue="frame_mismatch"), dict(TURNED, rotation=None)):
         cx = contexts.derive(turned_two(geometry), "v")
         assert cx.segments[1].start == (2, 260.0), geometry
+
+
+# --- contexts built from stored units (round 9 U8: KTD6; R6, R10) ---------------------------------------------------------
+
+def _unit(no: int, kind: str, title: str | None, aliases: tuple = (), shown: tuple = (), first: int = 0, last: int = 0,
+          pages: tuple = (1, 1), identifiers: dict | None = None):
+    from app.chat import units
+
+    return units.Unit(no, kind, title, aliases, identifiers if identifiers is not None else {"shown": list(shown)},
+                      pages[0], pages[1], first, last, "certain")
+
+
+def _units_contexts(reading: str | None = "r1") -> contexts.Contexts:
+    parts = [_unit(1, "front_matter", None, first=0, last=1, pages=(1, 1)),
+             _unit(2, "appraisal", "פרויקט שדרות האלון", ("שדרות האלון", "האלון"), first=2, last=5, pages=(2, 3)),
+             _unit(3, "appraisal", "מתחם גבעת הרקפות", ("גבעת הרקפות", "הרקפות"), ("גוש 31140 חלקה 22",),
+                   first=6, last=9, pages=(4, 5),
+                   identifiers={"addresses": [], "parcels": [["31140", "22"]], "shown": ["גוש 31140 חלקה 22"]}),
+             _unit(4, "appendix", "נספח: עסקאות השוואה", first=10, last=12, pages=(6, 7))]
+    first = {n: SimpleNamespace(block_index=n, page=p, bbox=[50.0, 40.0, 500.0, 52.0])
+             for n, p in ((2, 2), (6, 4), (10, 6))}
+    return contexts.from_units(parts, first, [3, 7, 11], "v", reading)
+
+
+def test_a_units_name_is_found_in_free_text_with_the_hebrew_prefix_letters():
+    cx = _units_contexts()
+    assert cx.multi and cx.numbers == [1, 2, 3, 4]
+    assert cx.named("מה שווי הנכס בגבעת הרקפות?") == [3]
+    assert cx.named("השווי של מתחם גבעת הרקפות") == [3] and cx.named("והרקפות") == [3]
+    assert cx.named("מה השטח בפרויקט שדרות האלון") == [2] and cx.named("שדרות האלון") == [2]
+    assert cx.named("מה הכנסה נטו בנכס בפרויקט הדס") == []  # a name that is in no unit
+    assert cx.named("גוש 31140 חלקה 22") == [3]  # its identifiers still name it
+    assert cx.named("שווי הרקפות והאלון") == [2, 3]
+    assert cx.named("") == [] and cx.named(None) == []
+
+
+def test_an_appendix_or_comparables_unit_is_labelled_as_such_and_is_never_a_subject():
+    cx = _units_contexts()
+    assert cx.named("נספח: עסקאות השוואה") == [] and cx.named("הנספח עסקאות השוואה") == []
+    assert cx.kind(4) == "appendix" and cx.subjects == [1, 2, 3]
+    assert cx.describe(4) == "הקשר 4: נספח: עסקאות השוואה (עמודים 6–7)"
+    assert cx.describe(3) == "הקשר 3: מתחם גבעת הרקפות · גוש 31140 חלקה 22 (עמודים 4–5)"
+    assert cx.describe(1) == "הקשר 1: פתיח (עמוד 1)"  # front matter is a subject candidate, labelled as what it is
+    assert 1 in cx.subjects
+    comparables = contexts.from_units([_unit(1, "appraisal", "שומה א", first=0, last=3),
+                                       _unit(2, "comparables", None, first=4, last=6)], {}, [], "v")
+    assert comparables.label(2) == "עסקאות השוואה" and comparables.subjects == [1]
+    assert comparables.named("עסקאות השוואה") == []
+    nameless = contexts.from_units([_unit(1, "document", None, first=0, last=3)], {}, [], "v")
+    assert nameless.label(1) == contexts.MSG_UNNAMED
+
+
+def test_a_name_inside_a_longer_name_does_not_name_its_unit_where_the_longer_one_is_written():
+    cx = contexts.from_units([_unit(1, "appraisal", "מתחם הגפן", ("הגפן",), first=0, last=2),
+                              _unit(2, "appraisal", "מתחם הגפן הצפוני", ("הגפן הצפוני",), first=3, last=5)], {}, [], "v")
+    assert cx.named("הגפן") == [1] and cx.named("שווי מתחם הגפן הצפוני") == [2]
+    assert cx.named("השווה בין הגפן לבין הגפן הצפוני") == [1, 2]  # both are written, one of them alone
+
+
+def test_a_context_segments_follow_its_units_with_their_leads_and_starts():
+    cx = _units_contexts()
+    assert [s.number for s in cx.segments] == [1, 2, 3, 4] and cx.at_block(7) == 3 and cx.at_block(11) == 4
+    assert [s.lead for s in cx.segments] == [None, 3, 7, 11]
+    assert cx.segments[0].start is None and cx.segments[2].start == (4, 40.0)
+    assert cx.at_position(5, 100.0) == 3 and cx.at_position(6, 50.0) == 4 and cx.at_position(1, 10.0) == 1
+    assert cx.pages(2) == (2, 3)
+
+
+def test_a_key_carries_the_reading_so_it_is_never_reused_across_readings():
+    one, two = _units_contexts("r1"), _units_contexts("r2")
+    assert one.key(2) != two.key(2) and one.key(2) != one.key(3)
+    assert contexts.split_key(one.key(2)) == ("v", 2) == contexts.split_key(contexts.Contexts("v", ()).key(2))
+    assert contexts.derive(TWO, "v").key(2) == "v#2"  # the derivation from blocks keeps its key
+
+
+def test_calculate_refuses_values_of_two_appraisal_units_unless_the_request_compares_them():
+    cx = _units_contexts()
+    a, b = (cx.key(2), cx.describe(2)), (cx.key(3), cx.describe(3))
+    operands = {"V1": _value("V1", "21400", a), "V2": _value("V2", "22100", b)}
+    with pytest.raises(calc.CalcError):
+        calc.evaluate(calc.parse("V2 - V1"), operands, contexts=[])
+    assert calc.evaluate(calc.parse("V2 - V1"), operands, contexts=[frozenset({cx.key(2), cx.key(3)})]).value == 700
+
+
+def test_the_unit_kinds_a_context_ignores_are_those_of_the_unit_store():
+    from app.chat import units
+
+    assert contexts.NON_SUBJECT_KINDS == {units.APPENDIX, units.COMPARABLES} and set(contexts.UNIT_KIND_MARKS) <= set(
+        units.KINDS)
+
+
+# --- an appendix or comparables part serves the appraisal before it: it is evidence, never "another property" ----------
+
+def _real_value(cx: contexts.Contexts, number: int, vid: str, amount: str) -> calc.Value:
+    from uuid import uuid4
+
+    from app.chat import tools
+
+    return calc.Value(vid, Decimal(amount), amount, "S1", uuid4(), uuid4(), "r1", "t", "loc", "l", "value_per_area",
+                      "ILS_per_sqm", "none", "unknown", "", "הנכס", "appraised_property", {}, {}, "q",
+                      context=tools.value_context(cx, number))
+
+
+def test_calculate_combines_an_appraisals_value_with_a_comparables_average_but_not_two_appraisals():
+    cx = _units_contexts()
+    one, three, appendix = (_real_value(cx, 2, "V1", "21400"), _real_value(cx, 3, "V2", "18400"),
+                            _real_value(cx, 4, "V3", "9000"))
+    assert appendix.context["subject"] is False and one.context["subject"] is True and appendix.operand().leaves[0].context is None
+    out = calc.evaluate(calc.parse("V1 + V3"), {"V1": one.operand(), "V3": appendix.operand()}, contexts=[])
+    assert out.value == Decimal("30400")
+    with pytest.raises(calc.CalcError):  # two appraisals are still two properties
+        calc.evaluate(calc.parse("V1 + V2"), {"V1": one.operand(), "V2": three.operand()}, contexts=[])
+    # the appendix average does not make a second appraisal's value combinable with the first's
+    with pytest.raises(calc.CalcError):
+        calc.evaluate(calc.parse("V1 + V2 + V3"),
+                      {"V1": one.operand(), "V2": three.operand(), "V3": appendix.operand()}, contexts=[])
+    # a request that compares the two appraisals allows it
+    assert calc.evaluate(calc.parse("V1 + V2 + V3"), {"V1": one.operand(), "V2": three.operand(),
+                         "V3": appendix.operand()}, contexts=[frozenset({cx.key(2), cx.key(3)})]).value == Decimal("48800")
+
+
+def _claim_ws(cx: contexts.Contexts, cited: dict[str, int], asked: str) -> SimpleNamespace:
+    values = {vid: SimpleNamespace(context=_real_value(cx, n, vid, "1").context, written="14,850,000", version_id="v",
+                                   subject_from="", subject="הנכס") for vid, n in cited.items()}
+    return SimpleNamespace(requirement_items=[], user_messages=[{"text": asked, "current": True}], values=values,
+                           measurements={}, computations={}, sources={}, contexts={"v": cx})
+
+
+def test_a_claim_about_appraisal_one_citing_a_comparables_row_is_not_removed_as_wrong_subject(monkeypatch):
+    from app.chat import verify
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+    cx = _units_contexts()
+    asked = "מה שווי שדרות האלון?"
+    unit = verify.Unit(0, "שווי הנכס 14,850,000 ₪ [V1].", "שווי הנכס 14,850,000 ₪", ["V1"])
+    assert verify._wrong_context(unit, _claim_ws(cx, {"V1": 4}, asked), asked) is None  # the appendix row
+    assert verify._wrong_context(unit, _claim_ws(cx, {"V1": 2}, asked), asked) is None  # its own value
+    elsewhere = verify._wrong_context(unit, _claim_ws(cx, {"V1": 3}, asked), asked)  # appraisal 3's value
+    assert elsewhere and cx.describe(3) in elsewhere
+
+
+def test_an_appendix_value_is_no_second_answer_for_the_subjects_datum(monkeypatch):
+    from app.config import get_settings
+
+    cx = _units_contexts()
+
+    def value(vid: str, n: int, amount: str):
+        return SimpleNamespace(vid=vid, document_id="d", kind="value_per_area", unit="ILS_per_sqm", period="none",
+                               area_basis="", subject="הנכס", scenario="", stance="unknown", value=Decimal(amount),
+                               context=_real_value(cx, n, vid, "1").context)
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+    ws = SimpleNamespace(values={"V1": value("V1", 2, "21400"), "V2": value("V2", 4, "9000")}, measurements={})
+    assert not coverage.conflicting(ws)
+
+
+def test_only_a_contradicted_appendix_value_is_removed_and_a_calculation_from_appendix_values_never_is(monkeypatch):
+    from app.chat import verify
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+    cx = _units_contexts()
+    asked = "מה שווי שדרות האלון?"
+    unit = verify.Unit(0, "שווי הנכס 14,850,000 ₪ [V1].", "שווי הנכס 14,850,000 ₪", ["V1"])
+    ws = _claim_ws(cx, {"V1": 4}, asked)
+    assert verify._wrong_context(unit, ws, asked) is None  # an appendix row, its subject not contradicted
+    ws.values["V1"].subject_from = "contradicted"  # the source places it on another property
+    assert cx.describe(4) in verify._wrong_context(unit, ws, asked)
+    calc_unit = verify.Unit(0, "הממוצע 14,850,000 ₪ [C1].", "הממוצע 14,850,000 ₪", ["C1"])
+    leaves = [SimpleNamespace(context=_real_value(cx, 4, "V1", "1").operand().leaves[0].context)]
+    ws.computations = {"C1": SimpleNamespace(outcome=SimpleNamespace(leaves=leaves))}
+    assert verify._wrong_context(calc_unit, ws, asked) is None

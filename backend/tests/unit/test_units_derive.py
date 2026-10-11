@@ -406,6 +406,45 @@ def test_a_table_dominant_part_is_comparables_and_a_cover_before_the_first_appra
     assert tables.evidence["kind"]["rule"] == "table_dominant"
 
 
+def test_only_a_short_unit_before_the_first_appraisal_is_front_matter_a_long_one_is_a_document():
+    d = Doc()
+    for n in range(1, 6):  # five pages of preface: no chapters of its own, too long to be a cover
+        d.page(n, n)
+        if n == 1:
+            d.title_block(1, "אוסף שומות של משרד דמו")
+        d.add("paragraph", n, "טקסט פתיחה כללי שאינו שומה.", 200.0)
+    d.appraisal(6, "פרויקט שדרות האלון", "שדרות האלון 14", "31102", "7", label=1)
+    d.appraisal(8, "מתחם גבעת הרקפות", "רחוב הרקפת 8", "31140", "22", label=1)
+    preface, a, b = d.derive()
+    assert (preface.page_first, preface.page_last) == (1, 5)
+    assert (preface.kind, a.kind, b.kind) == (DOCUMENT, APPRAISAL, APPRAISAL)
+    assert preface.evidence["kind"]["rule"] == "no_kind_evidence"
+    short = Doc()
+    for n in range(1, units.FRONT_MATTER_PAGES_MAX + 1):  # the longest cover that is still front matter
+        short.page(n, n)
+        short.add("paragraph", n, "טקסט פתיחה כללי שאינו שומה.", 200.0)
+    short.appraisal(units.FRONT_MATTER_PAGES_MAX + 1, "פרויקט שדרות האלון", "שדרות האלון 14", "31102", "7", label=1)
+    short.appraisal(units.FRONT_MATTER_PAGES_MAX + 3, "מתחם גבעת הרקפות", "רחוב הרקפת 8", "31140", "22", label=1)
+    assert short.derive()[0].kind == FRONT_MATTER
+
+
+def test_spaced_letters_and_accessibility_boilerplate_are_no_alias_and_no_title():
+    d = Doc()
+    d.page(1, 1)
+    d.add("paragraph", 1, "מסמך PDF נגיש", 48.0, h=15.0)
+    d.add("paragraph", 1, "״ב ס ר״ — ״מסמך PDF נגיש״ — ״גני הצבעוני״", 72.0, h=10.0)
+    d.add("paragraph", 1, "מתחם הדקל הצפוני, שדרות הדקל 9", 90.0, h=10.0)
+    d.chapters(1, CHAPTERS[:2], top=120.0)
+    (only,) = d.derive()
+    assert "גני הצבעוני" in only.aliases and "הדקל הצפוני" in only.aliases
+    assert not [a for a in only.aliases if "pdf" in a.lower() or "ב ס ר" in a or a == "מסמך"]
+    assert only.title is None  # the boilerplate line was the most prominent: it is no title
+    for junk in ("ב ס ר", "ד ר", "ו ל ט", "מסמך", "מסמך pdf נגיש", "PDF"):
+        assert units.is_boilerplate(junk), junk
+    for name in ("גבעת הרקפות", "נחל הדס", "מתחם ב", "שדרות האלון 14", "בית א ב"):
+        assert not units.is_boilerplate(name), name
+
+
 def test_evidence_holds_block_indexes_and_rule_names_only():
     allowed = {"file_start", "prominent_title_line", "project_phrase", "address", "numbered_chapters",
                "appendix_marker", "image_title", "quoted_name", "number_drop", *units.SIGNALS}

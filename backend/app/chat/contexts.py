@@ -27,13 +27,23 @@ migration:
   had continues there (its next top-level number is above its last one): a context may be several ranges
   (``Segment``) with one number.
 
+**Units** (round 9 U8, KTD6; R6, R10): ``of_version`` builds its segments from the reading's stored appraisal units
+(``units.ensure``: stored, or built once on first use), one segment per unit, numbered by the unit's number, so every
+caller keeps this one API. A unit's identity holds its labelled identifiers and, as the ``names`` kind, its title and
+its document-grounded aliases, which ``named`` matches in free text like an identifier (normalized, the Hebrew prefix
+letters before a name allowed). A unit of kind ``appendix`` or ``comparables`` is labelled as such and is never a
+subject: ``named`` never returns it, so no check takes it for the asked property. Front matter and undetermined
+document units are candidates like an appraisal. The derivation above stays as the fallback when the units cannot be
+obtained (no reading).
+
 A file with one identifier set is a single context (``Contexts.multi`` false): every tool then behaves exactly as
 before and shows no context label. A row of a table that the extraction merged across two appraisals (a table
 continued on the next page under the same headers) belongs to the context of its own position (page and top), so a
 table is split by context at query time, never re-extracted.
 
 **Caching** (``of_version``): the result is cached per version and reading (a version read again is a new key), in
-process; the caller has already resolved the version under the user's permissions.
+process; the caller has already resolved the version under the user's permissions. ``Contexts.key`` carries the
+reading too, so a key is never reused across readings.
 
 **Enforcement** (``enforced``, the ``chat_appraisal_context_enforced`` setting, on by default — enabled once the
 contexts were counted per report on the regression reports by ``scripts/count_appraisal_contexts.py``: every
@@ -47,8 +57,10 @@ are always shown.
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
+from bisect import bisect_left
 from collections import OrderedDict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -61,9 +73,20 @@ from app.answering.entities import _BP_LABELED, _PREFIXES, STREET_LABELS, _canon
 from app.extraction.base import PageGeometry
 from app.extraction.geometry import geometry_box
 
+logger = logging.getLogger(__name__)
+
 ADDRESS = "address"
 PARCEL = "block_parcel"
-KIND_LABELS = {ADDRESS: "כתובת", PARCEL: "גוש/חלקה"}
+NAMES = "names"
+KIND_LABELS = {ADDRESS: "כתובת", PARCEL: "גוש/חלקה", NAMES: "שם"}
+
+# the kinds of a unit (``units.KINDS``) that are never a subject: a part of a file about other properties
+NON_SUBJECT_KINDS = frozenset({"appendix", "comparables"})
+# how a unit that is not an appraisal is called in a label (the one place that words them)
+UNIT_KIND_MARKS = {"appendix": "נספח", "comparables": "עסקאות השוואה", "front_matter": "פתיח"}
+MSG_UNNAMED = "ללא שם מזהה"
+# punctuation that separates the words of a name (the aliases of a unit are normalized with it)
+NAME_PUNCT = re.compile(r"[\"“”‘’,.:;(){}\[\]<>!?|/\\—–_*•]")
 
 # a street label (with up to two prefix letters: "ברחוב"), one to three street words, an optional "מס׳", and a house
 # number of up to three digits (with an optional letter) that is not a measure ("120 מ״ר")
@@ -82,31 +105,34 @@ CACHE_MAX = 256
 @dataclass(frozen=True)
 class Identity:
     """A labelled identifier set: addresses as ``(street core, house number)`` and parcels as ``(block, parcel)``,
-    with how each was written (``shown``) and the street words as written (for matching a subject)."""
+    with how each was written (``shown``) and the street words as written (for matching a subject); a unit's
+    ``names`` (its title and aliases, ``name_key``) are the third kind."""
 
     addresses: frozenset = frozenset()
     parcels: frozenset = frozenset()
     shown: tuple[str, ...] = ()
     streets: tuple[tuple[tuple[str, ...], str, str], ...] = ()  # (street words, number, letter)
+    names: tuple[str, ...] = ()  # a unit's title and aliases, normalized (``name_key``)
 
     @property
     def kinds(self) -> frozenset[str]:
-        return frozenset(k for k, v in ((ADDRESS, self.addresses), (PARCEL, self.parcels)) if v)
+        return frozenset(k for k, v in ((ADDRESS, self.addresses), (PARCEL, self.parcels), (NAMES, self.names)) if v)
 
     @property
     def empty(self) -> bool:
-        return not self.addresses and not self.parcels
+        return not self.addresses and not self.parcels and not self.names
 
     @property
     def label(self) -> str:
         return " · ".join(self.shown)
 
     def count(self, kind: str) -> int:
-        return len(self.addresses if kind == ADDRESS else self.parcels)
+        return len({ADDRESS: self.addresses, PARCEL: self.parcels, NAMES: self.names}[kind])
 
     def shares(self, other: Identity) -> bool:
-        """Whether the two sets name a common identifier."""
-        return bool(self.addresses & other.addresses or self.parcels & other.parcels)
+        """Whether the two sets name a common identifier or name."""
+        return bool(self.addresses & other.addresses or self.parcels & other.parcels
+                    or set(self.names) & set(other.names))
 
     def restates_other(self, current: Identity) -> bool:
         """Whether this set opens a new context after ``current``: it has every kind ``current`` has, one value of
@@ -117,16 +143,26 @@ class Identity:
             return False
         return not self.shares(current)
 
-    def named_in(self, words: str) -> bool:
+    def identifier_in(self, words: str) -> bool:
         """Whether a free text (a subject, a request component, a claim) names one of the identifiers: a street and
         house number (the label optional), or a block and parcel (labelled, or as ``block/parcel``)."""
         norm = _canon(words or "")
         return any(p.search(norm) for p in _patterns(self))
 
+    def name_spans(self, words: str) -> list[tuple[int, int]]:
+        """Where a free text names the unit's title or an alias (the spans in ``name_key(words)``)."""
+        norm = name_key(words)
+        return [m.span() for p in _name_patterns(self.names) for m in p.finditer(norm)]
+
+    def named_in(self, words: str) -> bool:
+        """Whether a free text names one of the identifiers or one of the names."""
+        return self.identifier_in(words) or bool(self.name_spans(words))
+
     def __or__(self, other: Identity) -> Identity:
         shown = tuple(dict.fromkeys(self.shown + other.shown))
         streets = tuple(dict.fromkeys(self.streets + other.streets))
-        return Identity(self.addresses | other.addresses, self.parcels | other.parcels, shown, streets)
+        names = tuple(dict.fromkeys(self.names + other.names))
+        return Identity(self.addresses | other.addresses, self.parcels | other.parcels, shown, streets, names)
 
 
 @lru_cache(maxsize=1024)
@@ -137,6 +173,26 @@ def _patterns(identity: Identity) -> tuple[re.Pattern, ...]:
     for b, p in identity.parcels:
         out.append(re.compile(rf"גוש\D{{0,6}}?0*{b}\D{{0,20}}?חלק(?:ה|ות)?\D{{0,6}}?0*{p}(?!\d)"
                               rf"|(?<![\d/])0*{b}\s*/\s*0*{p}(?!\d)"))
+    return tuple(out)
+
+
+def name_key(raw: str | None) -> str:
+    """A name as it is compared: normalized, gershayim unified, punctuation and the spacing around it dropped."""
+    return " ".join(NAME_PUNCT.sub(" ", _canon(raw or "")).split())
+
+
+@lru_cache(maxsize=1024)
+def _name_patterns(names: tuple[str, ...]) -> tuple[re.Pattern, ...]:
+    """One pattern per name over ``name_key`` text: the prefix letters before its first word (and the article) are
+    allowed, as for a street, and the name must end where a word ends."""
+    out = []
+    for name in names:
+        words = name.split()
+        if not words:
+            continue
+        core = _strip_prefix(words[0], 2 if len(words) > 1 else 3)
+        body = r"[\s\-]+".join([rf"(?<![\w״׳])[{_PREFIXES}]{{0,3}}ה?{re.escape(core)}", *(re.escape(w) for w in words[1:])])
+        out.append(re.compile(body + r"(?![\w״׳])"))
     return tuple(out)
 
 
@@ -186,18 +242,34 @@ class Segment:
     start: tuple[int, float] | None
     first_page: int | None
     last_page: int | None
+    kind: str = "appraisal"  # a unit's kind (``units.KINDS``); the derivation below only finds appraisals
+    certainty: str = "certain"  # the certainty of the boundary that opens it
+    title: str | None = None  # a unit's title
 
 
 @dataclass(frozen=True)
 class Contexts:
-    """A version's contexts: its segments in reading order (one segment, number 1, for a single-context file)."""
+    """A version's contexts: its segments in reading order (one segment, number 1, for a single-context file).
+    ``reading_id``: the reading they were built from (None: not known), part of ``key``."""
 
     version_id: str
     segments: tuple[Segment, ...]
+    reading_id: str | None = None
 
     @property
     def multi(self) -> bool:
         return len({s.number for s in self.segments}) > 1
+
+    @property
+    def subjects(self) -> list[int]:
+        """The contexts that can be the asked property: every one but an appendix and a comparables part."""
+        return [n for n in self.numbers if self.is_subject(n)]
+
+    def is_subject(self, number: int) -> bool:
+        return self.kind(number) not in NON_SUBJECT_KINDS
+
+    def kind(self, number: int) -> str:
+        return next(s.kind for s in self.segments if s.number == number)
 
     @property
     def numbers(self) -> list[int]:
@@ -207,10 +279,19 @@ class Contexts:
         return next(s.identity for s in self.segments if s.number == number)
 
     def key(self, number: int) -> str:
-        return f"{self.version_id}#{number}"
+        """A context across the reading: version, reading and number (``split_key`` reads it back)."""
+        return f"{self.version_id}#{self.reading_id}#{number}" if self.reading_id else f"{self.version_id}#{number}"
 
     def label(self, number: int) -> str:
-        return self.identity(number).label
+        """What names a context: a unit's title, then its identifiers; a part that is not an appraisal says so."""
+        seg = next(s for s in self.segments if s.number == number)
+        # a title that restates one of the unit's identifiers adds nothing to them: the identifiers label it
+        parts = [seg.title] if seg.title and not any(x in seg.title for x in seg.identity.shown) else []
+        parts += seg.identity.shown
+        mark = UNIT_KIND_MARKS.get(seg.kind)
+        if mark and not any(mark in p for p in parts):
+            parts.insert(0, mark)
+        return " · ".join(parts) or MSG_UNNAMED
 
     def pages(self, number: int) -> tuple[int | None, int | None]:
         own = [s for s in self.segments if s.number == number]
@@ -253,10 +334,23 @@ class Contexts:
         return list(dict.fromkeys(s.number for s in self.segments if s.first <= last and s.last >= first))
 
     def named(self, words: str | None) -> list[int]:
-        """The contexts whose identifiers a free text names."""
+        """The subject contexts whose identifiers or names a free text names (never an appendix or a comparables
+        part). A name that lies inside a longer name of another context in the text ("מגדלי הים" inside "מגדלי הים
+        הצפוני") does not name its own context there."""
         if not words or not self.multi:
             return []
-        return [n for n in self.numbers if self.identity(n).named_in(words)]
+        by_id = [n for n in self.subjects if self.identity(n).identifier_in(words)]
+        spans = {n: self.identity(n).name_spans(words) for n in self.subjects if n not in by_id}
+        spans = {n: sp for n, sp in spans.items() if sp}
+        every = [x for sp in spans.values() for x in sp]
+        by_name = [n for n, sp in spans.items()
+                   if not all(any(o[0] <= a and b <= o[1] and (a, b) != o for o in every) for a, b in sp)]
+        return [n for n in self.numbers if n in by_id or n in by_name]
+
+
+def split_key(key: str) -> tuple[str, int]:
+    """(version id, context number) of a ``Contexts.key``."""
+    return key.partition("#")[0], int(key.rpartition("#")[2])
 
 
 # a numbered top-level heading: "1. מבוא", "12 סיכום" — never a sub-section ("2.1") or a lettered one
@@ -393,27 +487,89 @@ def derive(blocks: Iterable, version_id: str = "") -> Contexts:
 _CACHE: OrderedDict[tuple[str, str | None], Contexts] = OrderedDict()
 _LOCK = threading.Lock()
 
+_FIRST_BLOCKS_SQL = (
+    "SELECT b.block_index, b.page, b.bbox, p.mediabox, p.cropbox, p.rotation, p.display_width, p.display_height,"
+    " p.geometry_issue FROM document_blocks b LEFT JOIN pages p ON p.version_id = b.version_id AND p.page_no = b.page"
+    " WHERE b.version_id = :v AND b.block_index = ANY(:b)")
+_HEADINGS_SQL = "SELECT block_index FROM document_blocks WHERE kind = 'heading' AND version_id = :v ORDER BY block_index"
+
+
+def _unit_identity(u) -> Identity:
+    """A unit's identity: its labelled identifiers (stored with how they were written, which read again give the
+    street words the matching needs) and its title and aliases as names."""
+    stored = u.identifiers or {}
+    shown = tuple(stored.get("shown") or ())
+    ident = identifiers("\n".join(shown))
+    if ident.addresses != {tuple(a) for a in stored.get("addresses") or ()} or ident.parcels != {
+            tuple(p) for p in stored.get("parcels") or ()}:
+        ident = Identity(frozenset(tuple(a) for a in stored.get("addresses") or ()),
+                         frozenset(tuple(p) for p in stored.get("parcels") or ()), shown)
+    names = tuple(dict.fromkeys(k for x in ([u.title] if u.title else []) + list(u.aliases) if (k := name_key(x))))
+    return Identity(ident.addresses, ident.parcels, shown, ident.streets, names)
+
+
+def from_units(units: Sequence, first_blocks: dict, headings: Sequence[int], version_id: str,
+               reading_id: str | None = None) -> Contexts:
+    """The contexts of a reading's units, one segment per unit in reading order. ``first_blocks``: each unit's first
+    block by index (``block_index``, ``page``, ``bbox`` and its page's geometry, for ``top_of``); ``headings``: the
+    indexes of the file's heading blocks, in order (a segment's ``lead`` is the first one inside its unit)."""
+    segments = []
+    for n, u in enumerate(units):
+        at = bisect_left(headings, u.block_first)
+        lead = headings[at] if at < len(headings) and headings[at] <= u.block_last else None
+        b = first_blocks.get(u.block_first)
+        start = (b.page or 0, top_of(b)) if n > 0 and b is not None else None
+        segments.append(Segment(u.unit_no, _unit_identity(u), u.block_first, u.block_last, lead, start,
+                                u.page_first, u.page_last, u.kind, u.certainty, u.title))
+    return Contexts(version_id, tuple(segments), reading_id)
+
+
+def _of_units(conn: Connection, version_id: str, reading_id: str | None) -> Contexts | None:
+    """The contexts of the reading's stored units (built on first use: ``units.ensure``); None when the version has
+    none (no reading) or they cannot be had."""
+    from app.chat import units as unit_store  # units derives with this module's helpers
+
+    try:
+        with conn.begin_nested():
+            found = unit_store.ensure(conn, version_id)
+            if not found:
+                return None
+            v = UUID(version_id)
+            if reading_id is None:
+                reading = unit_store.reading_of(conn, v)
+                reading_id = reading.reading_id if reading is not None else None
+            first = {r.block_index: r for r in conn.execute(
+                text(_FIRST_BLOCKS_SQL), {"v": v, "b": [u.block_first for u in found[1:]]})}
+            headings = [r.block_index for r in conn.execute(text(_HEADINGS_SQL), {"v": v})]
+    except Exception:  # noqa: BLE001 - the contexts of the blocks serve instead
+        logger.exception("contexts of version %s could not be built from its units", version_id)
+        return None
+    return from_units(found, first, headings, version_id, reading_id)
+
 
 def of_version(conn: Connection, version_id: UUID | str, reading_id: str | None) -> Contexts:
-    """The contexts of a version's reading, derived once per reading (the caller resolved the version under the
-    user's permissions, in ``conn``). Only headings and blocks that may hold a labelled identifier bring their text,
-    never a table's or a picture's (``derive`` never reads those for identifiers). Each block comes with its page's
-    stored geometry, in the same query, so a segment's start is placed on the rendered page (``top_of``)."""
+    """The contexts of a version's reading, built once per reading (the caller resolved the version under the user's
+    permissions, in ``conn``): from its stored units (``from_units``), else — a version with no reading — derived
+    from its blocks. In the fallback only headings and blocks that may hold a labelled identifier bring their text,
+    never a table's or a picture's (``derive`` never reads those for identifiers), each block with its page's stored
+    geometry in the same query, so a segment's start is placed on the rendered page (``top_of``)."""
     key = (str(version_id), reading_id)
     with _LOCK:
         found = _CACHE.get(key)
         if found is not None:
             _CACHE.move_to_end(key)
             return found
-    rows = conn.execute(text(
-        "SELECT b.block_index, b.kind, b.page, b.bbox, b.status, b.table_index,"
-        " CASE WHEN b.kind NOT IN ('table', 'image') AND b.table_index IS NULL AND (b.kind = 'heading' OR b.text ~ :pat)"
-        " THEN b.text END AS text,"
-        " p.mediabox, p.cropbox, p.rotation, p.display_width, p.display_height, p.geometry_issue"
-        " FROM document_blocks b LEFT JOIN pages p ON p.version_id = b.version_id AND p.page_no = b.page"
-        " WHERE b.version_id = :v ORDER BY b.block_index"),
-        {"v": UUID(str(version_id)), "pat": _CANDIDATE_SQL}).all()
-    found = derive(rows, str(version_id))
+    found = _of_units(conn, str(version_id), reading_id)
+    if found is None:
+        rows = conn.execute(text(
+            "SELECT b.block_index, b.kind, b.page, b.bbox, b.status, b.table_index,"
+            " CASE WHEN b.kind NOT IN ('table', 'image') AND b.table_index IS NULL"
+            " AND (b.kind = 'heading' OR b.text ~ :pat) THEN b.text END AS text,"
+            " p.mediabox, p.cropbox, p.rotation, p.display_width, p.display_height, p.geometry_issue"
+            " FROM document_blocks b LEFT JOIN pages p ON p.version_id = b.version_id AND p.page_no = b.page"
+            " WHERE b.version_id = :v ORDER BY b.block_index"),
+            {"v": UUID(str(version_id)), "pat": _CANDIDATE_SQL}).all()
+        found = derive(rows, str(version_id))
     with _LOCK:
         _CACHE[key] = found
         while len(_CACHE) > CACHE_MAX:

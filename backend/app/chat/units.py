@@ -31,10 +31,12 @@ is the most prominent line; aliases are quoted names, named-project phrases (a w
 words after it) and addresses; identifiers are the labelled addresses and block/parcel pairs (``contexts.
 identifiers``). A picture at the top that was read (``read``, ``read_uncertain``) is title evidence too, marked weak.
 Lines that repeat as the letterhead of several units, running headers and footers (text on half the pages) and a
-repeated picture (page furniture) never become a title, an alias or a boundary.
+repeated picture (page furniture) never become a title, an alias or a boundary; neither does boilerplate that names
+nothing (``is_boilerplate``: spaced single letters, an accessibility tag).
 
 **Kind**: ``appendix`` (an appendix word opens the unit), ``comparables`` (mostly tables, or a comparables heading
-without chapters of its own), ``front_matter`` (before the first appraisal, without chapters), ``appraisal`` (own
+without chapters of its own), ``front_matter`` (before the first appraisal, without chapters of its own, and short: at
+most ``FRONT_MATTER_PAGES_MAX`` pages — a long part before the first appraisal is ``document``), ``appraisal`` (own
 numbered chapters or a valuation heading), otherwise ``document``. The vocabulary below is the one place that names
 words of a report's structure; it never holds question words.
 
@@ -68,7 +70,7 @@ from app.extraction.normalize_text import base_normalize
 
 logger = logging.getLogger(__name__)
 
-UNITS_VERSION = "units-v3"
+UNITS_VERSION = "units-v4"
 
 # --- kinds, certainty, rule names --------------------------------------------------------------------------------
 
@@ -101,6 +103,11 @@ APPENDIX_WORDS = ("נספח", "נספחים", "תוספת")
 COMPARABLES_WORDS = ("עסקאות השוואה", "עסקאות להשוואה", "נכסים להשוואה", "נתוני השוואה", "נכסי השוואה")
 VALUATION_WORDS = ("הערכת שווי", "תחשיב", "חוות דעת", "שומה")
 TOC_WORDS = ("תוכן", "תוכן עניינים", "תוכן העניינים", "תוכן הענינים")
+# text that is no name: an accessibility tag of a PDF ("מסמך PDF נגיש"), the word "document" alone, and letters spaced
+# apart by the typesetting ("ב ס ר": a run of single-letter tokens)
+BOILERPLATE_ANYWHERE = ("pdf",)
+BOILERPLATE_ALONE = frozenset({"מסמך"})
+LETTER_RUN_MIN = 3  # single-letter tokens in a row that make a line spaced letters (all tokens, from two)
 
 # --- thresholds ----------------------------------------------------------------------------------------------------
 
@@ -109,6 +116,7 @@ TITLE_WORDS_MAX = 14
 LAYOUT_TOP_TOLERANCE = 6.0  # points: tops of two title blocks that "repeat" a layout
 LAYOUT_HEIGHT_TOLERANCE = 1.5  # points: their line heights
 RUN_MAX = 8  # blocks of a title run
+FRONT_MATTER_PAGES_MAX = 4  # a part before the first appraisal longer than this is a document, not a cover
 FURNITURE_MIN_PAGES = 3
 FURNITURE_SHARE = 0.5  # a text on this share of the pages (and at least FURNITURE_MIN_PAGES) is a running header
 TOC_PAGES = 4  # pages after the TOC heading read for entries
@@ -123,7 +131,7 @@ TEXT_KEPT = 600  # characters of a block's text read for the derivation
 
 _TEXT_KINDS = ("paragraph", "textbox")
 _READ = ("read", "read_uncertain")
-_PUNCT = re.compile(r"[\"“”‘’,.:;(){}\[\]<>!?|/\\—–_*•]")
+_PUNCT = contexts.NAME_PUNCT  # the one punctuation set names are compared with
 _QUOTED = re.compile(r"(?<![\wא-ת])[\"“״]([^\"“”״\n]{2,60}?)[\"”״](?![א-ת\w])")
 _TOC_ENTRY = re.compile(r"^(?P<title>.{3,}?)(?:\s*[.·…_\-–—]{2,}\s*|\s{3,}|\s*\|\s*)(?P<page>\d{1,4})\s*$")
 _NUMBERING = re.compile(r"^\s*\d{1,3}(?:\.\d+)*[.)]?\s+")
@@ -336,6 +344,26 @@ def _toc_entries(rows: Sequence) -> list[tuple[str, int]]:
     return entries
 
 
+def is_boilerplate(name: str) -> bool:
+    """Whether a title or an alias names nothing: spaced single letters, a PDF accessibility tag, "מסמך" alone."""
+    tokens = _norm(name).split()
+    if not tokens:
+        return True
+    if len(tokens) == 1 and tokens[0] in BOILERPLATE_ALONE:
+        return True
+    if any(w in t for t in tokens for w in BOILERPLATE_ANYWHERE):
+        return True
+    single = [len(t) == 1 and t.isalpha() for t in tokens]
+    if len(tokens) >= 2 and all(single):
+        return True
+    run = 0
+    for one in single:
+        run = run + 1 if one else 0
+        if run >= LETTER_RUN_MIN:
+            return True
+    return False
+
+
 def _same_title(a: str, b: str) -> bool:
     return bool(a and b) and (a == b or (min(len(a), len(b)) >= 4 and (a in b or b in a)))
 
@@ -542,13 +570,15 @@ def _identity(c: _Ctx, run: list, letterhead: set) -> tuple[str | None, list[str
         title, title_ev = _picture_line(pic), {"rule": "image_title", "block": pic.block_index, "weak": True}
     elif c.body is None and lines and _title_shaped(_text(lines[0])) and "\n" not in _text(lines[0]):
         title, title_ev = _text(lines[0]), {"rule": "first_short_line", "block": lines[0].block_index}
+    if title is not None and is_boilerplate(title):
+        title, title_ev = None, {"rule": "none"}
     aliases: list[str] = []
     evidence: list[dict] = []
     ident = contexts.Identity()
 
     def keep(raw: str, rule: str, block: int, weak: bool) -> None:
         alias = _norm(raw)
-        if len(alias) >= 3 and not alias.replace(" ", "").isdigit() and alias not in aliases:
+        if len(alias) >= 3 and not alias.replace(" ", "").isdigit() and alias not in aliases and not is_boilerplate(alias):
             aliases.append(alias)
             evidence.append({"block": block, "rule": rule} | ({"weak": True} if weak else {}))
 
@@ -655,9 +685,15 @@ def derive(blocks: Iterable, pages: Iterable = (), version_id: str = "", furnitu
                 {"page": page} if page is not None else {}) | ({"detail": detail} if detail else {})
         units.append(Unit(n, kind, title, tuple(aliases), identifiers, None, None, first, last, certainty,
                           {"boundary": boundary, "title": title_ev, "aliases": alias_ev, "kind": kind_ev}))
-    # a first unit of a compendium that holds no chapters of its own is front matter
-    if len(units) > 1 and units[0].kind == DOCUMENT and any(u.kind == APPRAISAL for u in units[1:]):
-        units[0] = _with(units[0], kind=FRONT_MATTER, evidence=units[0].evidence | {"kind": {"rule": "before_first_appraisal"}})
+    # a short part before the first appraisal that holds no chapters of its own is front matter; a long one stays a
+    # document (it may hold anything)
+    first_appraisal = next((n for n, u in enumerate(units) if u.kind == APPRAISAL), None)
+    for n in range(first_appraisal or 0):
+        u = units[n]
+        pgs = [r.page for r in rows[bisect_left(indexes, u.block_first):bisect_right(indexes, u.block_last)]
+               if r.page is not None]
+        if u.kind == DOCUMENT and (not pgs or max(pgs) - min(pgs) + 1 <= FRONT_MATTER_PAGES_MAX):
+            units[n] = _with(u, kind=FRONT_MATTER, evidence=u.evidence | {"kind": {"rule": "before_first_appraisal"}})
     first_on_page: dict[int, int] = {}
     for r in rows:
         if r.page is not None:

@@ -2770,6 +2770,8 @@ def _evidence_contexts(u: Unit, ws: Workspace) -> list[tuple[str, set[int], str,
     """What a unit's numbers rest on, by appraisal context (KTD7): ``(version id, its contexts, what, id)`` for each cited
     value or measurement whose number the unit shows, each cited source of one context that writes a number the unit
     shows, and each cited calculation (the contexts of its inputs). Files with one context give nothing."""
+    from app.chat import contexts
+
     shown = numbers_in(u.text)
     out: list[tuple[str, set[int], str, str]] = []
     for i in u.ids:
@@ -2785,8 +2787,8 @@ def _evidence_contexts(u: Unit, ws: Workspace) -> list[tuple[str, set[int], str,
             by_version: dict[str, set[int]] = {}
             for lf in ws.computations[i].outcome.leaves:
                 if lf.context is not None:
-                    version, _, n = lf.context[0].rpartition("#")
-                    by_version.setdefault(version, set()).add(int(n))
+                    version, n = contexts.split_key(lf.context[0])
+                    by_version.setdefault(version, set()).add(n)
             out += [(version, numbers, i, i) for version, numbers in by_version.items()]
         elif i in ws.sources:
             src = ws.sources[i]
@@ -2801,8 +2803,10 @@ def _wrong_context(u: Unit, ws: Workspace, question: str) -> str | None:
     request's components name (their subjects), else the one the question names, else the one the value's own subject
     names; a value, measurement or source of another context, or a calculation none of whose inputs is of the asked
     context, is another property's figure — the file, its title or the conversation's focus never prove otherwise.
-    Only when the context checks are enforced (``contexts.enforced``); None when nothing is asked or nothing is
-    elsewhere."""
+    Only a subject context counts as elsewhere: evidence in an appendix or a comparables part belongs to the
+    appraisal it serves and is left to the judge — except a value there whose recorded subject is ``contradicted``
+    (the source places it on another property), and never a calculation built from such values. Only when the context checks are enforced (``contexts.enforced``);
+    None when nothing is asked or nothing is elsewhere."""
     from app.chat import contexts
     from app.chat.tools import asked_subjects
 
@@ -2812,6 +2816,12 @@ def _wrong_context(u: Unit, ws: Workspace, question: str) -> str | None:
     for version, numbers, what, i in _evidence_contexts(u, ws):
         cx = ws.contexts.get(version)
         if cx is None or not cx.multi:
+            continue
+        # evidence in an appendix or comparables part is the judge's, unless it is a value whose recorded subject the
+        # source places on another property (``contradicted``): that one is presented as the asked property's own
+        if not (i in ws.values and ws.values[i].subject_from == "contradicted"):
+            numbers = {n for n in numbers if cx.is_subject(n)}
+        if not numbers:
             continue
         asked = set(cx.named(u.text))
         if not asked:
