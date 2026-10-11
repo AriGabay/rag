@@ -276,9 +276,9 @@ AE6_ANSWER = "השווי למ\"ר הוא 9,500 ₪ [S1]."
 COMPONENT = "מספר החדרים בנכס"
 
 
-@pytest.mark.xfail(strict=True, reason="U6/U7 (R16, R17): the gap paragraph, the limit sentence and the coverage note "
-                                       "are added after the last verification and nothing checks or records the result: "
-                                       "the payload has no verification.final_digest")
+@pytest.mark.xfail(strict=True, reason="U7 (R17, KTD8): the saved text is the checked text and its digest is on the "
+                                       "outcome (U6: TurnOutcome.final_digest, tests/unit/test_final_check.py), but the "
+                                       "API payload has no verification.final_digest yet")
 def test_ae6_text_added_after_verification_is_saved_checked_and_recorded_with_a_digest(offline):
     offline.limits = [engine.STEP_LIMIT]
     offline.coverage = lambda answer: "**כיסוי:** לא כל המסמכים המתאימים נבדקו."

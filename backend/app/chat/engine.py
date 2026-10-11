@@ -34,7 +34,11 @@ One turn:
    reason per component not given, grouped by reason (``coverage.state_components``) — the model writes no absence
    sentence, it declares each component's status in ``requested``. Then the limits it reached and the coverage
    ledger. Correctness and completeness are reported apart (``VerifyReport.counts``; each component, with its
-   status, reason and evidence, in the ledger's ``requirements``).
+   status, reason and evidence, in the ledger's ``requirements``). Round 8 (U6): the composed text is then checked as a
+   whole before it is saved (``app.chat.final_check``) — a sentence the server changed is judged again as saved
+   (``verify_final``), what the server wrote is checked by recomputation, what still fails is withheld — and its
+   digest goes with it. Every path that returns an answer comes through ``finish``, the fallbacks to an earlier round's
+   answer included.
 
 Inputs and missing assumptions (round 7 U7, KTD8, KTD9, R23–R25). The policy has one rule on assumptions: a
 material parameter the user did not give is never assumed; a rate the report itself states (a sensitivity scenario,
@@ -95,7 +99,8 @@ from pydantic import BaseModel, ConfigDict
 from app.chat import coverage, entities, resolve
 from app.chat import request as request_analysis
 from app.chat import tools as T
-from app.chat.compose import ServerSpan, compose
+from app.chat.compose import ServerSpan, text_digest
+from app.chat.final_check import FinalCheckError, finalize
 from app.chat.verify import (
     VERIFY_ALLOWANCE_SECONDS,
     TurnRequirements,
@@ -422,6 +427,10 @@ class TurnOutcome:
     # the spans of the final Markdown the server wrote (round 8 U4: ``compose.ServerSpan``, offsets and a fixed kind, never
     # text), for the final check, the saved message and the history of a later turn
     server_spans: list[ServerSpan] = field(default_factory=list)
+    # the digest (sha256) of the saved Markdown, which is the text the final check verified (round 8 U6, R17), and that
+    # check's counts (``final_check.Finalized.stats``; numbers only, no content)
+    final_digest: str = ""
+    final_check: dict = field(default_factory=dict)
 
 
 def usage_summary(usage: list[dict], **extra) -> dict:
@@ -580,18 +589,29 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                                  clarification_question=request.clarify, missing_info="", referenced_document_ids=[],
                                  scope_kind="focused", scope_query="", omitted=[], focus=None, requested=[],
                                  parts=[])
+            # the server's own words, asking: nothing of the model's to check, so no judge call; saved with its digest
             return TurnOutcome(answer, ws, VerifyReport([], judged=True, judge_status="no_claims"), steps, usage, {},
-                               rounds, request.as_dict(), request.resolution, _summary(usage, rounds, reused, turn))
+                               rounds, request.as_dict(), request.resolution, _summary(usage, rounds, reused, turn),
+                               final_digest=text_digest(answer.answer_markdown))
     def finish(answer: FinalAnswer, report: VerifyReport) -> TurnOutcome:
         # removals; each component recomputed from the surviving units; the absences the server states removed; one
         # gap paragraph after the answer (round 7 U3) — then the limits reached and the coverage ledger. Each decision
         # records whether a repair round was asked to fix its unit (round 7 U4, KTD5)
         report.mark_repairs(repaired)
-        # all of it in one composer (round 8 U4, KTD6), which records every span the server wrote; the cited documents
-        # are marked verified once, from the final text
-        composed = compose(ws, answer, report, turn, question=inp.question, limit_sentences=_limit_sentences(limits))
+        # all of it in one composer (round 8 U4, KTD6), which records every span the server wrote — and the composed
+        # text is checked as the whole it is, in the verification allowance, before anything is saved (U6): every path
+        # that returns an answer comes through here, the fallbacks to an earlier round's answer included
+        try:
+            done = finalize(provider, ws, answer, report, turn, question=inp.question,
+                            request=request.standalone_question if request is not None else None, usage=usage,
+                            deadline=deadline + VERIFY_ALLOWANCE_SECONDS, limit_sentences=_limit_sentences(limits))
+        except FinalCheckError as exc:  # never an unchecked text (R19)
+            raise ProviderFailure("verify_unavailable", "final_text") from exc
+        composed = done.composition
         final, outcomes, ledger = composed.answer, composed.outcomes, composed.ledger
+        final = final.model_copy(update={"focus": _surviving_focus(ws, final)})
         report.completeness = coverage.completeness(outcomes)
+        # the side effects, once, after the last pass: the documents the final text cites are marked verified
         if final.status != "clarification":
             coverage.touch_verified(ws, final.answer_markdown)
             ledger["requirements"] = outcomes
@@ -600,7 +620,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
                            request.as_dict() if request is not None else None,
                            request.resolution if request is not None else None, _summary(usage, rounds, reused, turn),
-                           _pending(ws, turn, final), composed.spans)
+                           _pending(ws, turn, final), composed.spans, done.digest, done.stats)
 
     pending: request_analysis.Pending | None = None
 
@@ -802,6 +822,21 @@ def _summary(usage: list[dict], rounds: list, reused: int, turn: TurnRequirement
                             requirements_origin=origin["origin"], requirements_fallback=origin["fallback"])
     logger.info("chat turn: %s", json.dumps(summary))
     return summary
+
+
+def _surviving_focus(ws: T.Workspace, final: FinalAnswer) -> Focus | None:
+    """The conversation's focus after this answer, from the claims that survived (round 8 R28): the datum the model put at
+    the centre, kept only for the documents the saved text still cites — a document that only a removed claim rested on
+    is not what the conversation is about, and a focus left with none is no focus. A clarification keeps its focus (it
+    asks, and cites the values it kept)."""
+    focus = final.focus
+    if focus is None or final.status == "clarification" or not focus.document_ids:
+        return focus
+    cited = set(coverage.cited_documents(ws, final.answer_markdown))
+    kept = [d for d in focus.document_ids if d in cited]
+    if not kept:
+        return None
+    return focus if kept == focus.document_ids else focus.model_copy(update={"document_ids": kept})
 
 
 def _limit_sentences(limits: list[str]) -> list[str]:

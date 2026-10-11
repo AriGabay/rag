@@ -45,6 +45,7 @@ from sqlalchemy import Connection, text
 
 from app.audit import audit
 from app.chat import anchors, coverage, engine, verify
+from app.chat.compose import SERVER_SPANS_FIELD, strip_server_spans
 from app.config import get_settings
 from app.db import TenantContext, current_data_version, tenant_tx
 from app.deps import NOT_FOUND, get_ctx, parse_uuid
@@ -535,6 +536,16 @@ def _summary_usable(conn: Connection, ctx: TenantContext, conv) -> bool:
     return docs <= _visible_ids(conn, docs)
 
 
+def _history_text(r) -> str:
+    """A stored message's text as a later turn reads it (round 8 R28): an assistant answer without the spans the server
+    wrote in it — a removal note, a partial mark, a gap line, a coverage note — by the registry saved with it
+    (``compose.SERVER_SPANS_FIELD``), so the model never copies a server marker as a fact or takes a removed datum as
+    context. A message without a registry (an older one) is read as it is."""
+    content = r.content or ""
+    spans = (r.answer or {}).get(SERVER_SPANS_FIELD) if r.role == "assistant" and isinstance(r.answer, dict) else None
+    return strip_server_spans(content, spans) if spans else content
+
+
 def summary_digest(summary: str | None) -> str:
     return hashlib.sha256((summary or "").encode("utf-8")).hexdigest()
 
@@ -559,7 +570,7 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
     visible = _visible_documents(conn, rows)
     # an answer resting on a document the user can no longer see is not carried into the model's context
     rows = [r for r in rows if not (r.role == "assistant" and _hidden(r, visible))]
-    history = [engine.HistoryMessage(r.role, r.content) for r in rows if r.content]
+    history = [engine.HistoryMessage(r.role, t) for r in rows if r.content for t in [_history_text(r)] if t]
     focus: dict[str, str] = {}
     prior: dict[str, dict] = {}
     prior_ids: dict[str, str] = {}  # the last answer's source id -> the P# that reopens it
@@ -964,7 +975,7 @@ def _maybe_summarize(ctx: TenantContext, conversation_id: UUID, message_id: UUID
         dv = current_data_version(conn)
     previous = "אין" if rebuild or not conv.summary else prompt_text(conv.summary)
     body = ("סיכום קודם:\n" + previous + "\n\nהודעות נוספות:\n"
-            + "\n".join(f"{'משתמש' if r.role == 'user' else 'עוזר'}: {prompt_text((r.content or '')[:1500])}"
+            + "\n".join(f"{'משתמש' if r.role == 'user' else 'עוזר'}: {prompt_text(_history_text(r)[:1500])}"
                         for r in rows))
     summarizer = for_purpose(provider, Purpose.SUMMARY)
     r = summarizer.structured(Purpose.SUMMARY, SUMMARY_POLICY, body, _Summary, max_output_tokens=1200)

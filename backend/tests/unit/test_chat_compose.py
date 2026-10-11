@@ -213,3 +213,80 @@ def test_the_ledger_marks_a_cited_document_verified_only_when_the_engine_asks(mo
     assert doc not in ws.activity and ledger["cited"][0]["document_id"] == doc and built.answer_markdown == a.answer_markdown
     coverage.touch_verified(ws, built.answer_markdown)  # the engine's step, once, for the final text's documents
     assert ws.activity[doc]["level"] == "verified"
+
+
+# --- round 8 U6: where each character came from, and the answer without the server's words ---------------------------
+
+def test_a_doc_knows_the_draft_offset_of_every_character_the_model_wrote_and_marks_the_servers_with_minus_one():
+    d = Doc("  א ב ג\n\n\n\nד ה  ")
+    assert d.origins() == list(range(len("  א ב ג\n\n\n\nד ה  ")))
+    d.splice(4, 5, "[X]", "citation")  # ב -> the server's [X]
+    d.delete([(0, 2)])
+    d.append("\n\nסוף", "limit_sentence")
+    d.tidy_blank_lines()
+    assert d.text == "א [X] ג\n\nד ה  \n\nסוף"
+    origins = d.origins()
+    assert len(origins) == len(d.text)
+    assert [d.text[i] for i, o in enumerate(origins) if o < 0] == list("[X]") + list("\n\nסוף")
+    # a character of the model's own text keeps the place it had in what the model wrote
+    original = "  א ב ג\n\n\n\nד ה  "
+    assert all(original[o] == d.text[i] for i, o in enumerate(origins) if o >= 0)
+
+
+def test_compose_hands_the_origin_of_every_character_of_the_final_text(monkeypatch):
+    note = "> **כיסוי:** לא כל המסמכים המתאימים נבדקו."
+    monkeypatch.setattr(coverage, "build", lambda ws, answer, question: (
+        {"note": note}, answer.model_copy(update={"answer_markdown": answer.answer_markdown + "\n\n" + note})))
+    a, r = _kinds_report()
+    out = compose(_ws(), a, r, TurnRequirements(), question="?")
+    text = out.answer.answer_markdown
+    assert len(out.origin) == len(text)
+    servers = {i for s in out.spans for i in range(s.start, s.end)}
+    assert {i for i, o in enumerate(out.origin) if o < 0} == servers
+    assert all(a.answer_markdown[o] == text[i] for i, o in enumerate(out.origin) if o >= 0)
+
+
+def test_the_answer_without_the_servers_spans_for_a_later_turn(monkeypatch):
+    from app.chat.compose import ServerSpan, strip_server_spans
+
+    monkeypatch.setattr(coverage, "build", lambda ws, answer, question: ({}, answer))
+    a, r = _kinds_report()
+    out = compose(_ws(), a, r, TurnRequirements(), question="?")
+    text = out.answer.answer_markdown
+    stripped = strip_server_spans(text, [s.as_dict() for s in out.spans])  # as the saved message holds them
+    assert stripped == strip_server_spans(text, out.spans)
+    assert "הוסרו מהתשובה" not in stripped and "חלק שלא אומת" not in stripped and "אומת חלקית" not in stripped
+    assert "שימו לב" not in stripped
+    assert "הנכס פנוי," in stripped and "דמי השכירות הם 55 ₪ למ\"ר לחודש [S1]." in stripped
+    assert "  " not in stripped and "\n\n\n" not in stripped
+    # an older message has no registry, a registry that does not index its text is not trusted: the text as it is
+    assert strip_server_spans(text, None) == text and strip_server_spans(text, []) == text
+    assert strip_server_spans("שלום", [{"start": 2, "end": 99, "kind": "marker"}]) == "שלום"
+    assert strip_server_spans("א ב ג", [ServerSpan(1, 3, "marker")]) == "א ג"
+
+
+# --- round 8 R29: a clarification keeps its question and its status through every edit ----------------------------------
+
+QUESTION = "מהו שיעור ההיוון שברצונך להשתמש בו?"
+
+
+def test_a_clarification_whose_claims_all_fail_keeps_its_question_and_its_status_through_the_edit():
+    a = _answer(f"הנכס מושכר [S1].\n{QUESTION}", "clarification")
+    a = a.model_copy(update={"clarification_question": QUESTION})
+    r = verify_answer(_judge(lambda t: {"verdict": "unsupported", "failure": "absent_from_source"}
+                             if "מושכר" in t else {"verdict": "not_factual"}), a, _ws(), "?", [])
+    edited = r.edit(a)
+    assert edited.status == "clarification"
+    assert edited.doc.text.startswith(QUESTION) and "מושכר" not in edited.doc.text
+    assert "לא הצלחתי" not in edited.doc.text and [s.kind for s in edited.doc.spans()] == ["removal_note"]
+
+
+def test_the_unit_that_holds_the_question_is_never_removed_even_when_a_check_fails_it():
+    question = "האם להשתמש בשיעור 40% [S1] כשיעור ההיוון?"
+    a = _answer(f"הנכס מושכר [S1].\n{question}", "clarification").model_copy(update={"clarification_question": question})
+    r = verify_answer(_judge(lambda t: {"verdict": "unsupported", "failure": "absent_from_source"}), a, _ws(), "?", [])
+    assert r.protected == {1} and r.removed_units() == {0}
+    assert "האם להשתמש בשיעור 40%" in r.edit(a).doc.text
+    # a draft that is not a clarification has no protected unit
+    plain = verify_answer(_judge(lambda t: {"verdict": "supported"}), _answer("הנכס פנוי [S1]."), _ws(), "?", [])
+    assert plain.protected == set()

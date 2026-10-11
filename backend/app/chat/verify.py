@@ -1026,6 +1026,11 @@ class VerifyReport:
     computed: dict[str, set[str]] | None = None
     # the spans the edit ladder cuts, by unit index (``plan_edits``): each a range of the answer and the claims in it
     cuts: dict[int, list[CutGroup]] = field(default_factory=dict)
+    # the judge's verdict on each unit it judged, by index (after a re-read), whole: the final check (round 8 U6) needs
+    # the dependencies a verdict named to remove what rests on a unit it removes
+    unit_verdicts: dict[int, JudgeVerdict] = field(default_factory=dict)
+    # the units that hold a clarification's question line (R29): never removed, whatever a check says of them
+    protected: set[int] = field(default_factory=set)
 
     @property
     def ok(self) -> bool:
@@ -1039,6 +1044,22 @@ class VerifyReport:
     def failed_units(self) -> set[int]:
         """The units removed as claims that failed their check (what the user is told was removed)."""
         return {p.unit.index for p in self.problems if p.fails_claim}
+
+    def protect_question(self, answer: FinalAnswer) -> None:
+        """A clarification keeps its question line through every edit (round 8 R29): the unit(s) holding
+        ``clarification_question`` are never removed or cut — a check that failed one is dropped, and its claims are
+        recorded as no claim (a question states nothing). Whatever surrounds the question goes through the ladder."""
+        question = _norm(_IDS.sub("", answer.clarification_question or ""))
+        if answer.status != "clarification" or not question:
+            return
+        self.protected = {u.index for u in self.units
+                          if question in _norm(u.text) or (len(_norm(u.text)) >= 12 and _norm(u.text) in question)}
+        if not self.protected:
+            return
+        self.problems = [p for p in self.problems if p.unit.index not in self.protected]
+        for u in self.units:
+            if u.index in self.protected:
+                self.claims[u.index] = [_whole_record(u, "not_factual")]
 
     def removals(self) -> list[Problem]:
         """One decision per unit removed as a claim (round 7 KTD5, R12), in the answer's order: the first problem that
@@ -1446,7 +1467,10 @@ class VerifyReport:
             lines = ([f"> הוסרו מהתשובה {removed - unchecked} טענות שלא נמצאה להן תמיכה במקורות."]
                      if removed > unchecked else [])
             lines += [f"> הוסרו מהתשובה {unchecked} טענות שלא ניתן היה לבדוק מול המקורות."] if unchecked else []
-            if not doc.text or not _IDS.search(doc.text):
+            if answer.status == "clarification" and doc.text.strip():
+                # the question stays and so does the status (R29): only the note says what went from around it
+                doc.append("\n\n" + "\n>\n".join(lines), "removal_note")
+            elif not doc.text or not _IDS.search(doc.text):
                 # the model's own words on what is missing are not added: the server states each gap (KTD4)
                 doc.clear()
                 doc.append("לא הצלחתי לבסס תשובה על המקורות.", "replacement")
@@ -3080,22 +3104,22 @@ def judge(provider: LLMProvider, batch: _Batch, rendered: str, usage: list[dict]
 
 
 def _judge_batch(provider: LLMProvider, batch: _Batch, ws: Workspace, usage: list[dict],
-                 deadline: float | None, coverage: _Coverage | None = None
+                 deadline: float | None, coverage: _Coverage | None = None, label: str = "verify"
                  ) -> tuple[dict[int, JudgeVerdict], list[JudgeRequirement]]:
     """One batch to verdicts (and requirement scores): a call that timed out, was rate-limited or came back invalid is
     made once more; a truncated (``incomplete``) reply is split in half instead of resent. Raises
-    ``VerificationUnavailable`` when the judge cannot answer."""
+    ``VerificationUnavailable`` when the judge cannot answer. ``label``: the calls' usage purpose (``judge``)."""
     rendered = _render_batch(batch, ws, coverage)
-    got, status, scores = judge(provider, batch, rendered, usage, deadline, coverage)
+    got, status, scores = judge(provider, batch, rendered, usage, deadline, coverage, label=label)
     if status == "incomplete" and len(batch.units) > 1:
         half = len(batch.units) // 2
         first, p1 = _judge_batch(provider, _Batch(batch.units[:half], batch.narrow, batch.removed), ws, usage,
-                                 deadline, coverage)
+                                 deadline, coverage, label)
         second, p2 = _judge_batch(provider, _Batch(batch.units[half:], batch.narrow, batch.removed), ws, usage,
-                                  deadline, coverage)
+                                  deadline, coverage, label)
         return first | second, p1 + p2
     if status in RETRYABLE:
-        got, status, scores = judge(provider, batch, rendered, usage, deadline, coverage)
+        got, status, scores = judge(provider, batch, rendered, usage, deadline, coverage, label=label)
     if status != "ok":
         raise VerificationUnavailable(status)
     return _shown_support(got, batch, ws), scores
@@ -3138,12 +3162,13 @@ def _named_support(unit: Unit, named: list[str], ws: Workspace, question: str) -
 
 
 def _judge_all(provider: LLMProvider, units: list[Unit], ws: Workspace, usage: list[dict],
-               deadline: float | None = None, coverage: _Coverage | None = None, removed: list[Unit] | None = None
-               ) -> tuple[dict[int, JudgeVerdict], list[JudgeRequirement], dict[int, str]]:
+               deadline: float | None = None, coverage: _Coverage | None = None, removed: list[Unit] | None = None,
+               label: str = "verify") -> tuple[dict[int, JudgeVerdict], list[JudgeRequirement], dict[int, str]]:
     """Every unit judged; a unit the judge left out is asked about once more. With the turn's requirements, every
     call also scores them by id (a requirement may be given in any batch). A call the judge cannot answer (after its
     retry) leaves its units not checked (round 7 KTD5: returned with the call's status, and removed as not checked,
-    never as wrong) while other calls answered; when no call answers, ``VerificationUnavailable`` is raised."""
+    never as wrong) while other calls answered; when no call answers, ``VerificationUnavailable`` is raised. ``label``:
+    the calls' usage purpose (``judge``): the final check's are ``verify_final`` (round 8 U6)."""
     verdicts: dict[int, JudgeVerdict] = {}
     scores: list[JudgeRequirement] = []
     unchecked: dict[int, str] = {}
@@ -3153,7 +3178,7 @@ def _judge_all(provider: LLMProvider, units: list[Unit], ws: Workspace, usage: l
         nonlocal failure, scores
         for batch in batches:
             try:
-                got, p = _judge_batch(provider, batch, ws, usage, deadline, coverage)
+                got, p = _judge_batch(provider, batch, ws, usage, deadline, coverage, label)
             except VerificationUnavailable as exc:
                 failure = exc
                 unchecked.update({u.index: exc.status for u in batch.units})
@@ -3482,6 +3507,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                          for u in to_judge if u.index in verdicts}
         if reread is not None:
             _reread(provider, report, verdicts, ws, usage, deadline, reread, cache, keys)
+        report.unit_verdicts = dict(verdicts)
         _attach_rereads(report, ws)
         handled: set[int] = set()
         reasons: dict[str, str] = {}
@@ -3546,6 +3572,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                                         for s in named]
         complete_records(report)
         _remove_dependents(report, verdicts)
+    report.protect_question(answer)
     if coverage:
         report.computed = computed_ids(ws)
         report.requirements = [dict(r) for r in requirements.items]
@@ -3781,6 +3808,9 @@ class ClaimRecord:
     # the bounded re-reads of the claim (U5, R13-R15): {"source", "scope", "outcome" (``REREAD_OUTCOMES``), and for
     # the outcomes that have them "reason", "expanded_source"}, for the log
     rereads: list[dict] = field(default_factory=list)
+    # the verdict the final check (round 8 U6) gave the claim's sentence as it stands in the saved text, when it
+    # judged it again; "" — it did not (the sentence was unchanged, or was removed before)
+    post_check: str = ""
 
     @property
     def span(self) -> str:
@@ -3801,7 +3831,8 @@ class ClaimRecord:
                 "action": self.action, "sources_checked": list(self.sources_checked),
                 "depends_on": list(self.depends_on), "fallback": self.fallback, "parent_id": self.parent_id,
                 "failure": self.failure_kind() if self.verdict in FAILING_VERDICTS else "none",
-                "cause": self.cause, "marker": self.marker, "rereads": [dict(x) for x in self.rereads]}
+                "cause": self.cause, "marker": self.marker, "rereads": [dict(x) for x in self.rereads],
+                "post_check": self.post_check or "n/a"}
 
 
 def _same_span(a: str, b: str) -> bool:

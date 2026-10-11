@@ -370,9 +370,10 @@ def test_ae1_a_mixed_sentence_finishes_with_one_agent_call_one_verify_call_and_n
     sentence = f"{AREA_CLAUSE}, {UNAPPROVED} [S1]."
     agent = ScriptedAgent([SEARCH, final(sentence), final("לא אמור לקרות.")], judge=_mixed_area_judge)
     out = _turn(agent, "מה השטח העיקרי בתא שטח 1?")
-    # the failing clause is the server's to cut: no rewrite round, no second judge call (the final check is U6's)
-    assert [u["purpose"] for u in out.usage] == ["agent", "request", "agent", "verify"]
-    assert out.summary["rounds"] == 1 and len(_verify_inputs(agent)) == 1 and out.report.ok
+    # the failing clause is the server's to cut: no rewrite round, and one judge call more — the sentence as it is saved,
+    # with the cut in it, is a changed model-written unit, checked once (round 8 U6, ``verify_final``)
+    assert [u["purpose"] for u in out.usage] == ["agent", "request", "agent", "verify", "verify_final"]
+    assert out.summary["rounds"] == 1 and len(_verify_inputs(agent)) == 2 and out.report.ok
     marker = "«[1: חלק שלא אומת הושמט]»"
     assert out.answer.answer_markdown == f"{AREA_CLAUSE}, {marker} [S1]." and out.answer.status == "partial"
     # the registry travels with the outcome, indexing the saved text
@@ -618,3 +619,93 @@ def test_a_verdict_reused_after_a_reorder_maps_to_the_same_claim_ids():
     two = verify_answer(judge, _answer("הנכס מושכר [S1].\nהשווי למ\"ר הוא 9,500 ₪ [S1]."), ws, "?", [], cache=cache)
     ids = lambda r: {c.text: (c.id, c.verdict) for cs in r.claims.values() for c in cs}  # noqa: E731
     assert ids(one) == ids(two)
+
+
+# --- the final check's reuse key (round 8 U6, KTD7): the model-written text, the server's spans excluded ------------------
+
+def _final(monkeypatch, markdown: str, rule,
+           texts: tuple[str, ...] = ("תכסית 40% מותרת. השווי למ\"ר הוא 9,500 ₪.",)):
+    """The draft's report, its composition and the final check's view of both: ``(final, units, keys of the draft)``."""
+    from app.chat import compose as compose_module
+    from app.chat import coverage
+    from app.chat.final_check import _Final
+    from app.chat.verify import TurnRequirements, verify_answer
+
+    monkeypatch.setattr(coverage, "build", lambda ws, answer, question: ({}, answer))  # no lookups: no database
+    ws = Workspace(ctx=None)
+    for t in texts:
+        ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="דוח בדיקה", section="סיכום",
+                      location="סעיף \"סיכום\"", kind="context", text=t)
+    from tests.unit.test_chat_compose import _answer, _judge
+
+    answer = _answer(markdown)
+    report = verify_answer(_judge(rule), answer, ws, "?", [])
+    turn = TurnRequirements()
+    final = _Final(None, ws, answer, report, turn, question="?", request=None, usage=[], deadline=None,
+                   limit_sentences=None)
+    comp = compose_module.compose(ws, answer, report, turn, question="?")
+    units = final.split(comp)
+    return final, units, {d.index: final.draft_key(d) for d in report.units}, report
+
+
+def test_the_server_spans_in_a_sentence_do_not_change_its_key(monkeypatch):
+    markdown = "תכסית 40% [S1].\nהשווי למ\"ר הוא 9,500 ₪.\nדמי הניהול הם 12 ₪ למ\"ר [S1]."
+
+    def rule(t):  # a partial mark; a citation the server attaches; a sentence removed (a removal note follows)
+        if "9,500" in t:
+            return {"verdict": "supported", "supported_by": ["S1"]}
+        return {"verdict": "partial", "defect": "none"} if "תכסית" in t else {"verdict": "unsupported",
+                                                                                 "failure": "absent_from_source"}
+
+    final, units, draft, report = _final(monkeypatch, markdown, rule)
+    model = [u for u in units if u.model]
+    assert [u.drafts for u in model] == [[0], [1]]
+    assert [u.key for u in model] == [draft[0], draft[1]]  # the key of the draft sentence: its verdict is reused
+    # the partial mark and the removal note are units of the server's alone; the citation it attached sits inside the
+    # sentence it cites, shown to the judge as the server's and left out of the key
+    assert [u.model for u in units] == [True, False, True, False]
+    assert [u.unit.server for u in units] == [[], ["*(אומת חלקית)*"], [" [S1]"], [units[3].unit.server[0]]]
+
+
+def test_a_span_cut_out_of_a_sentence_changes_its_key_and_the_others_keep_theirs(monkeypatch):
+    cut = "השטח העיקרי הוא 1,200 מ״ר, שאושר בוועדה המחוזית [S1]."
+    markdown = f"{cut}\nהשווי למ\"ר הוא 9,500 ₪ [S1]."
+
+    def rule(t):
+        if "שאושר" in t:
+            return {"verdict": "partial", "defect": "part", "claims": [
+                {"span": "השטח העיקרי הוא 1,200 מ״ר", "verdict": "supported"},
+                {"span": "שאושר בוועדה המחוזית", "verdict": "unsupported"}]}
+        return {"verdict": "supported"}
+
+    final, units, draft, report = _final(monkeypatch, markdown, rule, ("השטח העיקרי הוא 1,200 מ״ר. השווי למ\"ר הוא 9,500 ₪.",))
+    first, second = [u for u in units if u.model]
+    assert first.drafts == [0] and first.key != draft[0]  # as saved it is another text: it is judged again
+    assert second.drafts == [1] and second.key == draft[1]
+
+
+def test_removing_a_heading_line_changes_the_key_of_the_sentence_below_it(monkeypatch):
+    markdown = "## מצב מוצע\nתכסית 40% [S1]."
+
+    def heading_goes(t):
+        return {"verdict": "unsupported", "failure": "absent_from_source"} if "מצב מוצע" in t else {"verdict": "supported"}
+
+    final, units, draft, report = _final(monkeypatch, markdown, heading_goes)
+    (below,) = [u for u in units if u.model]
+    assert below.drafts == [1] and below.key != draft[1]  # the same words under another heading are another claim
+    assert below.unit.heading == "" and report.units[1].heading == "מצב מוצע"
+    # the heading line staying: the sentence keeps its key
+    kept, units2, draft2, _ = _final(monkeypatch, markdown, lambda t: {"verdict": "supported"})
+    assert [u.key for u in units2 if u.model] == [draft2[0], draft2[1]]
+
+
+def test_a_sentence_that_moves_to_the_front_of_its_line_keeps_its_key(monkeypatch):
+    """"- A. B." without A is "- B.": the list marker is markup, not part of what was judged."""
+    markdown = "- הנכס מושכר. השווי למ\"ר הוא 9,500 ₪ [S1]."
+
+    def rule(t):
+        return {"verdict": "unsupported", "failure": "absent_from_source"} if "מושכר" in t else {"verdict": "supported"}
+
+    final, units, draft, report = _final(monkeypatch, markdown, rule)
+    (value,) = [u for u in units if u.model]
+    assert value.drafts == [1] and value.key == draft[1], value.unit.text

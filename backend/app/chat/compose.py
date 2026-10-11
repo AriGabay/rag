@@ -22,10 +22,16 @@ The spans a kind covers:
 - ``removal_note``: the note that says how many claims were removed; ``replacement``: the sentence that replaces an
   answer nothing of which was supported; ``request_note``: the note that the datum is not the one requested;
 - ``gap_paragraph``: the lines that state each component not given; ``limit_sentence``: what a limit the turn reached
-  means for the answer; ``coverage_note`` and ``membership_note``: the coverage ledger's note."""
+  means for the answer; ``coverage_note`` and ``membership_note``: the coverage ledger's note.
+
+``Doc`` also keeps, for every character of the model's own text, the offset it had in the text the model wrote (``origin``;
+-1 for a server span), so the final check (round 8 U6, ``app.chat.final_check``) can tell which sentence of the answer a
+sentence of the saved text came from, whatever was cut around it. The registry is what is saved with the message
+(``SERVER_SPANS_FIELD``); ``strip_server_spans`` gives a later turn the earlier answer without the server's words (R28)."""
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -38,6 +44,36 @@ SERVER_KINDS = ("marker", "partial_mark", "qualifier", "citation", "removal_note
 # the marker a cut span leaves: an ordinal, so the log entry of the claim it replaced is found by it
 MARKER = "«[{n}: חלק שלא אומת הושמט]»"
 PARTIAL_MARK = " *(אומת חלקית)*"
+SERVER_SPANS_FIELD = "server_spans"  # the key under which a stored answer holds its registry (``ServerSpan.as_dict``)
+
+
+def text_digest(markdown: str) -> str:
+    """The digest of the saved Markdown (R17): sha256 of its UTF-8 bytes, as the checked text is recorded."""
+    return hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+
+
+def strip_server_spans(markdown: str, spans) -> str:
+    """The answer without the spans the server wrote in it (R28): ``spans`` are the registry as saved with the message
+    (``ServerSpan`` or the dicts ``ServerSpan.as_dict`` gives; offsets into ``markdown``). What a removal note, a partial
+    mark, a gap line or a coverage note said is not something the earlier answer stated, so a later turn is not shown it.
+    Spaces left around a removed span are closed and the blank lines it leaves are collapsed. Without a registry (an older
+    message), or with one that does not index this text, the text is returned as it is."""
+    ranges: list[tuple[int, int]] = []
+    for s in spans or ():
+        a, b = (s.start, s.end) if isinstance(s, ServerSpan) else (s.get("start"), s.get("end"))
+        if not (isinstance(a, int) and isinstance(b, int)) or not 0 <= a <= b <= len(markdown):
+            return markdown
+        ranges.append((a, b))
+    if not ranges:
+        return markdown
+    out, pos = [], 0
+    for a, b in sorted(ranges):
+        out.append(markdown[pos:max(pos, a)])
+        pos = max(pos, b)
+    out.append(markdown[pos:])
+    text = re.sub(r"[ \t]{2,}", " ", "".join(out))
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 @dataclass(frozen=True)
@@ -58,6 +94,7 @@ class Doc:
     def __init__(self, text: str = ""):
         self.text = text
         self._tag = [0] * len(text)
+        self._origin = list(range(len(text)))
         self._kind: dict[int, str] = {}
         self._ref: dict[int, tuple] = {}
         self._count = 0
@@ -73,6 +110,7 @@ class Doc:
             self._kind[tag], self._ref[tag] = kind, ref
         self.text = self.text[:start] + insert + self.text[end:]
         self._tag[start:end] = [tag] * len(insert)
+        self._origin[start:end] = [-1] * len(insert)
 
     def append(self, text: str, kind: str) -> None:
         self.splice(len(self.text), len(self.text), text, kind)
@@ -126,6 +164,10 @@ class Doc:
     def spans(self) -> list[ServerSpan]:
         return [s for s, _ in self.refs()]
 
+    def origins(self) -> list[int]:
+        """For each character of the text, its offset in the text the model wrote; -1 for a character the server wrote."""
+        return list(self._origin)
+
     def masked(self) -> str:
         """The model's own text: what is left when every server span is removed."""
         return "".join(c for c, t in zip(self.text, self._tag, strict=True) if not t)
@@ -163,6 +205,9 @@ class Composition:
     spans: list[ServerSpan]
     outcomes: list[dict] = field(default_factory=list)
     ledger: dict = field(default_factory=dict)
+    # for each character of the final Markdown, its offset in the model's draft (-1: the server's); transient — it is
+    # not saved, the final check reads it (``Doc.origins``)
+    origin: list[int] = field(default_factory=list)
 
 
 def compose(ws, answer: FinalAnswer, report, turn, *, question: str, limit_sentences: list[str] | None = None
@@ -189,7 +234,7 @@ def compose(ws, answer: FinalAnswer, report, turn, *, question: str, limit_sente
         edited.status = built.status
         _take_appended(doc, built.answer_markdown, "membership_note" if ledger.get("membership") else "coverage_note")
     report.mark_markers(doc.renumber("marker", MARKER))
-    return Composition(edited.answer(answer), doc.spans(), outcomes, ledger)
+    return Composition(edited.answer(answer), doc.spans(), outcomes, ledger, doc.origins())
 
 
 def _take_appended(doc: Doc, built: str, kind: str) -> None:
