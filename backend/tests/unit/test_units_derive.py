@@ -325,6 +325,28 @@ def test_a_page_number_block_by_position_is_read_even_when_other_lines_follow_it
     assert units.page_numbers(d.pages) == {1: 12}
 
 
+def test_the_page_number_is_the_one_after_the_page_word_not_the_digits_of_a_file_path_in_the_footer():
+    footers = {1: "\\DOC123\\DATA\\:abc.docx 30996.902. עמוד 3", 2: "\\DOC30100\\DATA\\:abc.docx30996.902. עמוד 20",
+               3: "עמ׳ 4", 4: "Page 5", 5: "מסמך | עמוד 6 מתוך 20", 6: "\u200fעמוד 7", 7: "- 8 -"}
+    d = Doc()
+    for n, footer in footers.items():
+        d.page(n, None)
+        d.add("paragraph", n, "הנכס נבדק בסיור שנערך לצורך ההערכה.", 100.0)
+        d.add("paragraph", n, footer, 709.0, h=9.0)  # a footer of up to 90 characters, in the bottom band
+        d.add("paragraph", n, "כתובת המשרד: רחוב הדמיון 3, כפר הדמה", 742.0, h=9.0)
+        d.pages[-1].edge = "שורה\nשורה\n" + footer + "\nשורה\nשורה"
+    want = {1: 3, 2: 20, 3: 4, 4: 5, 5: 6, 6: 7, 7: 8}
+    assert units.page_numbers(d.pages, d.blocks) == want  # by position
+    assert units.page_numbers(d.pages) == want  # from the text edge: the same rule
+    assert len(footers[2]) > units.PAGE_NUMBER_CHARS - 50
+    # a line that only mentions a page, or a path with no page word, states no page number
+    for line in ("ראו עמוד 5 לעיל", "\\DOC30100\\DATA\\:abc.docx30996.902.", "שטח 120 מ״ר בקומה 3", "עמוד 3 " + "א" * 90):
+        assert units.line_page_number(line) is None, line
+    d.pages[0].edge = "ראו עמוד 5 לעיל\nשורה"
+    d.blocks[1].bbox = None
+    assert 1 not in units.page_numbers(d.pages[:1], d.blocks[:3])
+
+
 def test_a_numbering_that_drops_places_the_boundary_at_the_first_unnumbered_page_after_the_old_sequence():
     # pages 1-4 are numbered 1-4, pages 5-6 are the next report's cover, page 7 is numbered 3, page 8 numbered 4
     found = units.label_restarts({1: 1, 2: 2, 3: 3, 4: 4, 7: 3, 8: 4})

@@ -64,13 +64,11 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from app.chat import contexts
-from app.extraction.chunking import is_footer
 from app.extraction.normalize_text import base_normalize
-from app.extraction.pdf import _PRINTED_NO
 
 logger = logging.getLogger(__name__)
 
-UNITS_VERSION = "units-v2"
+UNITS_VERSION = "units-v3"
 
 # --- kinds, certainty, rule names --------------------------------------------------------------------------------
 
@@ -119,7 +117,7 @@ TABLE_DOMINANT = 0.5
 CHAPTERS_MIN = 2
 LABEL_RESTART_AT = 1
 PAGE_NUMBER_ZONE = 0.15  # share of the page height, at its top and bottom, where a page-number block may sit
-PAGE_NUMBER_CHARS = 40  # a page-number block is short
+PAGE_NUMBER_CHARS = 90  # a page-number block is short (a file path may precede the number)
 EDGE_LINES = (3, 8)  # lines read at the start and at the end of a page's stored text for a page-number line
 TEXT_KEPT = 600  # characters of a block's text read for the derivation
 
@@ -130,6 +128,14 @@ _QUOTED = re.compile(r"(?<![\wא-ת])[\"“״]([^\"“”״\n]{2,60}?)[\"”״](
 _TOC_ENTRY = re.compile(r"^(?P<title>.{3,}?)(?:\s*[.·…_\-–—]{2,}\s*|\s{3,}|\s*\|\s*)(?P<page>\d{1,4})\s*$")
 _NUMBERING = re.compile(r"^\s*\d{1,3}(?:\.\d+)*[.)]?\s+")
 _LABEL_NUMBER = re.compile(r"(\d{1,4})\s*$")
+# a page-number line: a bare number ("12", "- 12 -"), or the page word and its number at the END of the line, after
+# anything (a footer may open with a file path whose digits are not the page): "עמוד 3", "עמוד 3 מתוך 10", "עמ׳ 3",
+# "Page 3", or the number before the word alone on the line ("3 עמוד")
+_PAGE_WORD_THEN_NUMBER = re.compile(
+    r"(?:עמוד|עמ['׳’]?|page)\s*[:.]?\s*(\d{1,4})(?:\s*(?:מתוך|מ-|of|/)\s*\d{1,4})?[\s.\-–—]*$", re.IGNORECASE)
+_NUMBER_THEN_PAGE_WORD = re.compile(r"^[\s\-–—]*(\d{1,4})\s*(?:עמוד|עמ['׳’]?|page)[\s.\-–—]*$", re.IGNORECASE)
+_BARE_NUMBER = re.compile(r"^[\s\-–—]*(\d{1,4})[\s\-–—]*$")
+_BIDI_MARKS = re.compile("[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 _NAME_CUT = re.compile(r"[,:;()|—–]|\s-\s")
 
 # --- the unit ------------------------------------------------------------------------------------------------------
@@ -217,14 +223,24 @@ def _picture_title(r, furniture_images: frozenset) -> bool:
 # --- page numbers ---------------------------------------------------------------------------------------------------
 
 
+def line_page_number(line: str) -> int | None:
+    """The page number a line states: a bare number, or the number that ends the line after the page word, whatever
+    stands before it (the digits of a file path in a footer are not the page). None for any other line."""
+    t = _BIDI_MARKS.sub("", line).strip()
+    if not t or len(t) > PAGE_NUMBER_CHARS:
+        return None
+    for pattern in (_BARE_NUMBER, _NUMBER_THEN_PAGE_WORD, _PAGE_WORD_THEN_NUMBER):
+        m = pattern.search(t)
+        if m:
+            return int(m.group(1))
+    return None
+
+
 def _footer_number(edge: str) -> int | None:
     """The number of the page-number line among the first and last lines of a page's stored text (``EDGE_LINES``:
     other lines may follow the number line)."""
     lines = [ln.strip() for ln in edge.splitlines() if ln.strip()]
-    found = set()
-    for ln in [*lines[:EDGE_LINES[0]], *lines[-EDGE_LINES[1]:]]:
-        if is_footer(ln) and (m := _PRINTED_NO.search(ln)):
-            found.add(int(m.group(1) or m.group(2)))
+    found = {n for ln in [*lines[:EDGE_LINES[0]], *lines[-EDGE_LINES[1]:]] if (n := line_page_number(ln)) is not None}
     return found.pop() if len(found) == 1 else None
 
 
@@ -246,11 +262,11 @@ def _block_numbers(blocks: Iterable) -> dict[int, int]:
     found: dict[int, set[int]] = defaultdict(set)
     for r in rows:
         t = _text(r)
-        if not t or "\n" in t or len(t) > PAGE_NUMBER_CHARS or not is_footer(t) or not (m := _PRINTED_NO.search(t)):
+        if not t or "\n" in t or (n := line_page_number(t)) is None:
             continue
         top = _top(r)
         if top is not None and (top <= PAGE_NUMBER_ZONE * height or top >= (1 - PAGE_NUMBER_ZONE) * height):
-            found[r.page].add(int(m.group(1) or m.group(2)))
+            found[r.page].add(n)
     return {page: next(iter(ns)) for page, ns in found.items() if len(ns) == 1}
 
 
