@@ -87,6 +87,9 @@ class _Sql:
 
     where: str = "v.is_current"
     params: dict = field(default_factory=dict)
+    # the conditions of ``where`` that name chunk columns only (``c.version_id``, ``c.document_id``): the trigram stage
+    # applies them before it reads any chunk text
+    chunk_where: str = ""
     joins: str = (" FROM chunks c JOIN document_versions v ON v.id = c.version_id"
                   " JOIN documents d ON d.id = c.document_id AND d.deleted_at IS NULL")
 
@@ -113,7 +116,10 @@ def _scope_sql(scope: SearchScope | None, allowed_versions: list[UUID] | None = 
     if allowed_versions is not None:
         params["scope_allowed"] = allowed_versions
         conds.append("c.version_id = ANY(:scope_allowed)")
-    return _Sql(where=" AND ".join(conds), params=params)
+    chunk = [f"c.version_id = ANY(:{p})" for p in ("scope_v", "scope_allowed") if p in params]
+    if "scope_d" in params:
+        chunk.append("c.document_id = ANY(:scope_d)")
+    return _Sql(where=" AND ".join(conds), params=params, chunk_where=" AND ".join(chunk))
 
 
 def _scoped_versions(conn: Connection, scope: SearchScope | None) -> list[tuple[UUID, UUID]]:
@@ -154,12 +160,34 @@ def _lexical(conn: Connection, tokens: list[str], scope: _Sql | None = None, n: 
     ).scalars())
 
 
+def _set_trigram_threshold(conn: Connection) -> None:
+    """The ``<%`` operator compares against ``pg_trgm.word_similarity_threshold``: set it for this transaction."""
+    conn.execute(text("SELECT set_config('pg_trgm.word_similarity_threshold', :th, true)"),
+                 {"th": str(TRIGRAM_THRESHOLD)})
+
+
+def _trigram_statement(scope: _Sql, n: int = CANDIDATES) -> tuple[str, dict]:
+    """The trigram stage's SQL and its parameters (add ``q``). The candidate chunks come from one scan of ``chunks``
+    that evaluates the similarity predicate once per chunk, inside the version/document ids the scope names; the
+    visible-version and document joins run on the few candidates, never on the chunks (R16, KTD3). Row-level security
+    makes the planner expect one row from ``documents`` and ``document_versions``, so a plain join put them first and
+    scanned ``chunks`` once per version x document, evaluating the predicate on each scan (10.8 s on the office)."""
+    chunk_where = f"{scope.chunk_where} AND " if scope.chunk_where else ""
+    return (
+        "WITH cand AS MATERIALIZED ("
+        " SELECT c.id, c.version_id, c.document_id, word_similarity(:q, c.normalized_text) AS sim"
+        f" FROM chunks c WHERE {chunk_where}:q <% c.normalized_text)"
+        " SELECT c.id FROM cand c JOIN document_versions v ON v.id = c.version_id"
+        " JOIN documents d ON d.id = c.document_id AND d.deleted_at IS NULL"
+        f" WHERE {scope.where} AND c.sim > :th ORDER BY c.sim DESC, c.id LIMIT :n",
+        scope.params | {"th": TRIGRAM_THRESHOLD, "n": n},
+    )
+
+
 def _trigram(conn: Connection, normalized_query: str, scope: _Sql, n: int = CANDIDATES) -> list:
-    return list(conn.execute(
-        text(f"SELECT c.id{scope.joins} WHERE {scope.where} AND word_similarity(:q, c.normalized_text) > :th"
-             " ORDER BY word_similarity(:q, c.normalized_text) DESC LIMIT :n"),
-        scope.params | {"q": normalized_query, "th": TRIGRAM_THRESHOLD, "n": n},
-    ).scalars())
+    _set_trigram_threshold(conn)
+    statement, params = _trigram_statement(scope, n)
+    return list(conn.execute(text(statement), params | {"q": normalized_query}).scalars())
 
 
 def _semantic(conn: Connection, query: str, scope: _Sql, n: int = CANDIDATES) -> list:
@@ -295,6 +323,7 @@ def search_evidence(conn: Connection, queries: Sequence[str], limit: int = 8, *,
     scores: dict = {}
     all_tokens: list[str] = []
     guaranteed: list = []
+    fuzzy_of: dict[str, list] = {}
     for qi, q in enumerate(queries):
         tokens = query_tokens(q)
         all_tokens.extend(t for t in tokens if t not in all_tokens)
@@ -302,7 +331,10 @@ def search_evidence(conn: Connection, queries: Sequence[str], limit: int = 8, *,
         ranking = (query_tokens(_strip_places(base_normalize(q), [*place_terms, *KNOWN_CITIES])) if small
                    else tokens) or tokens
         lexical = _lexical(conn, ranking, sql, n)
-        fuzzy = _trigram(conn, _alpha(ranking), sql, n) if ranking else []
+        alpha = _alpha(ranking) if ranking else ""
+        if alpha and alpha not in fuzzy_of:  # variants that spell the same letters read the chunks once
+            fuzzy_of[alpha] = _trigram(conn, alpha, sql, n)
+        fuzzy = fuzzy_of.get(alpha, [])
         if qi == 0:
             guaranteed = lexical[:LEXICAL_GUARANTEE]
         for weight, ranked in zip(RRF_WEIGHTS, [lexical, fuzzy, _semantic(conn, q, sql, n)], strict=True):

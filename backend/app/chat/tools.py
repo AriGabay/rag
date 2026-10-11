@@ -103,7 +103,7 @@ from app.chat import anchors, calc, contexts, meaning, reader
 from app.chat.evidence import TABLE_SIZE_PREFIX
 from app.chat.timing import StageClock
 from app.config import get_settings
-from app.db import TenantContext, tenant_tx
+from app.db import TenantContext, current_data_version, tenant_tx
 from app.measurements.extract import (
     EXTRACTION_VERSION,
     PERIOD_LABELS,
@@ -383,6 +383,9 @@ class Workspace:
     lookups: dict = field(default_factory=dict)
     # the turn's time per stage and per tool call (round 9 R16, KTD9, ``app.chat.timing``), fed by ``run_tool`` and the engine
     clock: StageClock = field(default_factory=StageClock)
+    # the passages an identical search returned, kept for the turn (round 9 R16, KTD3, ``memoized_search``):
+    # (query, scope, limit, the office's data version) -> hits
+    search_memo: dict = field(default_factory=dict)
 
     def spend(self, output: str) -> str:
         """Count a tool output sent to the model against the turn's budget; the output that reaches it is sent
@@ -904,6 +907,20 @@ def subject_from(cx, number: int | None, subject: str) -> str:
 
 # --- tools -----------------------------------------------------------------------------------------------
 
+def memoized_search(ws: Workspace, conn: Connection, query: str, limit: int, scope: SearchScope | None) -> list[dict]:
+    """``search_passages`` once per (query, scope, limit) in a turn (R16, KTD3): an identical second search runs no
+    search SQL and no embedding. The office's data version is part of the key — read in the caller's transaction, one
+    indexed row — so a document processed, deleted or republished mid-turn is never answered from before it."""
+    scope_key = None if scope is None else (
+        tuple(sorted(map(str, scope.document_ids))), tuple(sorted(map(str, scope.version_ids))),
+        scope.include_noncurrent)
+    key = (query, scope_key, limit, current_data_version(conn))
+    hits = ws.search_memo.get(key)
+    if hits is None:
+        hits = ws.search_memo[key] = search_passages(conn, query, limit, scope=scope)
+    return [dict(h) for h in hits]
+
+
 def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None, limit: int | None = None) -> str:
     query = (query or "").strip()
     if len(query) < 2:
@@ -913,7 +930,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
     with tenant_tx(ws.ctx) as conn:
         docs = _visible_documents(conn, document_ids or [])
         scope = SearchScope(document_ids=tuple(docs)) if docs else None
-        hits = search_passages(conn, query, limit, scope=scope)
+        hits = memoized_search(ws, conn, query, limit, scope)
         ids = [h["chunk_id"] for h in hits]
         extra = {r.id: r for r in conn.execute(text(
             "SELECT id, block_start, block_end FROM chunks WHERE id = ANY(:i)"), {"i": ids})} if ids else {}

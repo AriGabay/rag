@@ -755,3 +755,149 @@ def test_rows_capped_by_the_diversity_cap_keep_the_table_and_name_its_handle(off
     assert 'kind="table"' in out and "להלן פירוט היחידות בבניין:" in out
     hint = out.split("</source>")[-1]
     assert handle in hint and "read" in hint and "table=" in hint
+
+
+# --- search latency (round 9 U2, R16, KTD3): the trigram stage reads each chunk once -----------------------------
+
+TRIGRAM_QUERIES = ["שמאי מכריע", "היטל השבחה", "גוש חלקה", "פארק לאומי", "חזית לרחוב שקט", "עסקאות השוואה"]
+LEGACY_TRIGRAM = ("SELECT c.id, word_similarity(:q, c.normalized_text) AS sim"
+                  " FROM chunks c JOIN document_versions v ON v.id = c.version_id"
+                  " JOIN documents d ON d.id = c.document_id AND d.deleted_at IS NULL"
+                  " WHERE v.is_current AND word_similarity(:q, c.normalized_text) > :th"
+                  " ORDER BY sim DESC LIMIT :n")
+
+
+def _many_reports(a, count):
+    """``count`` current documents of one version each, every one carrying the trigram stage's words."""
+    for i in range(count):
+        add_chunks(a, a.default_group_id, [f"{TEXTS[0]} מספר {i}", f"{TEXTS[1]} מספר {i}", f"{TEXTS[2]} מספר {i}"],
+                   f"{i + 10:064d}")
+
+
+def _legacy_trigram(conn, query, n=40):
+    from app.platform.search import TRIGRAM_THRESHOLD
+
+    return [(r.id, round(r.sim, 6)) for r in conn.execute(text(LEGACY_TRIGRAM),
+                                                          {"q": query, "th": TRIGRAM_THRESHOLD, "n": n})]
+
+
+def test_trigram_candidates_match_the_word_similarity_predicate(office):
+    """The candidate chunks of the trigram stage are today's ``word_similarity > threshold`` rows (KTD3 parity)."""
+    from app.platform.search import _scope_sql, _trigram
+
+    a, *_ = office
+    _many_reports(a, 5)
+    with tenant_tx(a.ctx()) as conn:
+        for q in TRIGRAM_QUERIES:
+            expected = _legacy_trigram(conn, q)
+            got = _trigram(conn, q, _scope_sql(None), 40)
+            assert expected, q
+            assert set(got) == {i for i, _ in expected}, q
+            sims = dict(expected)
+            ordered = [sims[i] for i in got]
+            assert ordered == sorted(ordered, reverse=True), q  # the same similarity order, ties aside
+
+
+def test_trigram_parity_holds_in_a_narrowed_scope(office):
+    from app.platform.search import SearchScope, _scope_sql, _trigram
+
+    a, *_ = office
+    _many_reports(a, 4)
+    with tenant_tx(a.ctx()) as conn:
+        doc = conn.execute(text("SELECT id FROM documents ORDER BY title, id LIMIT 1")).scalar_one()
+        sql = _scope_sql(SearchScope(document_ids=(doc,)))
+        got = _trigram(conn, "היטל השבחה", sql, 40)
+        everything = _trigram(conn, "היטל השבחה", _scope_sql(None), 40)
+        owners = {r.id: r.document_id for r in conn.execute(text("SELECT id, document_id FROM chunks"))}
+        assert got and {owners[i] for i in got} == {doc}
+        assert got == [i for i in everything if owners[i] == doc]
+
+
+def test_a_typo_still_matches_through_trigram(office):
+    from app.platform.search import _scope_sql, _trigram
+
+    a, *_ = office
+    doc, _ = add_chunks(a, a.default_group_id, TEXTS, "5" * 64)
+    with tenant_tx(a.ctx()) as conn:
+        ids = _trigram(conn, "היטל השבחא", _scope_sql(None), 40)  # one wrong letter
+        text_of = {r.id: r.normalized_text for r in conn.execute(text("SELECT id, normalized_text FROM chunks"))}
+        assert ids and "השבחה" in text_of[ids[0]]
+
+
+def test_fused_order_is_the_order_the_legacy_trigram_gives(office, monkeypatch):
+    """Swapping only the trigram stage back to the old predicate leaves the fused top-k order unchanged (KTD3)."""
+    from app.platform import search as S
+
+    a, *_ = office
+    _many_reports(a, 5)
+
+    def legacy(conn, normalized_query, scope, n=S.CANDIDATES):
+        return list(conn.execute(
+            text(f"SELECT c.id{scope.joins} WHERE {scope.where} AND word_similarity(:q, c.normalized_text) > :th"
+                 " ORDER BY word_similarity(:q, c.normalized_text) DESC, c.id LIMIT :n"),
+            scope.params | {"q": normalized_query, "th": S.TRIGRAM_THRESHOLD, "n": n}).scalars())
+
+    queries = [["שמאי מכריע"], ["היטל השבחה בגוש"], ["פארק לאומי", "חזית לרחוב"], ["השבחא"]]
+    with tenant_tx(a.ctx()) as conn:
+        now = [[h["chunk_id"] for h in S.search_evidence(conn, q, 8).hits] for q in queries]
+        monkeypatch.setattr(S, "_trigram", legacy)
+        before = [[h["chunk_id"] for h in S.search_evidence(conn, q, 8).hits] for q in queries]
+    assert now == before and all(now)
+
+
+def _plan_nodes(plan):
+    yield plan
+    for child in plan.get("Plans", []):
+        yield from _plan_nodes(child)
+
+
+def test_trigram_reads_the_chunks_once_however_many_versions_are_visible(office, db):
+    """RLS makes the planner expect one row from ``documents`` and ``document_versions``; the old join order then
+    scanned ``chunks`` once per version x document and evaluated the predicate on each scan. The candidate scan must
+    run exactly once, whatever the number of documents (measured on the office: 256 loops, 10.8 s)."""
+    import json
+
+    from app.platform import search as S
+
+    a, *_ = office
+    _many_reports(a, 16)
+    with db.begin() as owner:  # planner statistics, as the office has them
+        owner.execute(text("ANALYZE chunks, documents, document_versions"))
+    with tenant_tx(a.ctx()) as conn:
+        statement, params = S._trigram_statement(S._scope_sql(None), 40)
+        S._set_trigram_threshold(conn)
+
+        def chunk_scans(sql, parameters):
+            raw = conn.execute(text("EXPLAIN (ANALYZE, FORMAT JSON) " + sql), parameters | {"q": "היטל השבחה"}).scalar_one()
+            plan = (raw if isinstance(raw, list) else json.loads(raw))[0]["Plan"]
+            return sum(n["Actual Loops"] for n in _plan_nodes(plan) if n.get("Relation Name") == "chunks")
+
+        assert chunk_scans(LEGACY_TRIGRAM, {"th": S.TRIGRAM_THRESHOLD, "n": 40}) > 1  # the fixture shows the old plan
+        assert chunk_scans(statement, params) == 1
+
+
+def test_the_trigram_index_exists_for_the_operator_the_stage_uses(office):
+    with tenant_tx(office[0].ctx()) as conn:
+        definition = conn.execute(text("SELECT indexdef FROM pg_indexes WHERE indexname = 'chunks_trgm_idx'")).scalar_one()
+    assert "gin" in definition and "gin_trgm_ops" in definition and "normalized_text" in definition
+
+
+def test_the_search_tool_repeats_no_search_for_an_identical_call_in_a_turn(office, monkeypatch):
+    """An identical second ``search`` call of a turn reads the memo; a data-version bump (a document changed
+    mid-turn) makes the next one search again (R16, KTD3)."""
+    from app.chat import tools as T
+    from app.db import bump_data_version
+
+    a, *_ = office
+    add_chunks(a, a.default_group_id, TEXTS, "6" * 64)
+    searched = []
+    real = T.search_passages
+    monkeypatch.setattr(T, "search_passages", lambda *args, **kw: (searched.append(args[1]), real(*args, **kw))[1])
+    ws = T.Workspace(ctx=a.ctx())
+    first = T.tool_search(ws, "היטל השבחה", None, 4)
+    again = T.tool_search(ws, "היטל השבחה", None, 4)
+    assert searched == ["היטל השבחה"] and "היטל השבחה" in first and again
+    with tenant_tx(a.ctx()) as conn:
+        bump_data_version(conn)
+    T.tool_search(ws, "היטל השבחה", None, 4)
+    assert searched == ["היטל השבחה"] * 2
