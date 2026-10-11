@@ -822,9 +822,9 @@ def build(ws: Workspace, answer: FinalAnswer, question: str) -> tuple[dict, Fina
     (``_level``) before the engine records it (``touch_verified``)."""
     from app.chat.tools import LEVELS, new_scope
     from app.platform.search import (
-        documents_matching,
         documents_named,
         documents_sharing_title_words,
+        units_matching,
     )
 
     cited = cited_documents(ws, answer.answer_markdown)
@@ -843,7 +843,7 @@ def build(ws: Workspace, answer: FinalAnswer, question: str) -> tuple[dict, Fina
             query = ledger["scope_query"] or question
             if ("matching", query) not in ws.lookups:  # the same query reads the same documents all turn
                 with tenant_tx(ws.ctx) as conn:
-                    ws.lookups["matching", query] = documents_matching(conn, query)
+                    ws.lookups["matching", query] = units_matching(conn, query).documents  # by unit in a file of several (R11)
             found = ws.lookups["matching", query]
             scope = new_scope(query, [(d["document_id"], d["title"]) for d in found], 1)
         matching = scope["matching"]

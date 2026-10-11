@@ -36,7 +36,9 @@ original place after a reprocess replaced its blocks (R11):
                            "highlight": [start, end] | None,  # in "text"
                            "cell": None | {"table_index", "row_number", "column_number", "row_label",
                                            "column_header", "text"}},
-     "truncated": bool}
+     "truncated": bool,
+     "unit": only in a file of several appraisals: {"id": version#reading#number, "no", "title", "label", "kind",
+             "pages": [first, last]}, the unit the cited place is in}
 
 Precision rules: a cell is highlighted only with its stored cell box; otherwise the table (or picture) region is
 highlighted and labelled as table level (R6). A vision cell is highlighted at cell precision only with its
@@ -115,6 +117,8 @@ def source_stub(s) -> dict | None:
         out["table_index"] = s.table_index
         if getattr(s, "row_index", None) is not None:
             out["row"] = s.row_index
+    if getattr(s, "unit", None):  # the unit it is in, in a file of several (round 9 U9)
+        out["unit"] = s.unit
     return out
 
 
@@ -124,12 +128,17 @@ def measurement_stub(m) -> dict:
     r = m.row
     block = getattr(r, "block_index", None)
     value = getattr(r, "value", None)
-    return {"kind": "measurement", "document_id": str(m.document_id), "version_id": str(m.version_id),
-            "reading_id": getattr(r, "reading_id", None), "block_start": block, "block_end": block,
-            "table_index": getattr(r, "table_index", None), "row": getattr(r, "row_index", None),
-            "quote": getattr(r, "quote", None) or "", "value": str(value) if value is not None else None,
-            "anchor_lost": getattr(r, "anchor_lost", None) is not None, "pages": [],
-            "section": getattr(r, "section", None)}
+    out = {"kind": "measurement", "document_id": str(m.document_id), "version_id": str(m.version_id),
+           "reading_id": getattr(r, "reading_id", None), "block_start": block, "block_end": block,
+           "table_index": getattr(r, "table_index", None), "row": getattr(r, "row_index", None),
+           "quote": getattr(r, "quote", None) or "", "value": str(value) if value is not None else None,
+           "anchor_lost": getattr(r, "anchor_lost", None) is not None, "pages": [],
+           "section": getattr(r, "section", None)}
+    ctx = getattr(m, "context", None)
+    if ctx and ctx.get("unit_id"):  # the unit its block is in, in a file of several (round 9 U9)
+        out["unit"] = {"id": ctx["unit_id"], "no": ctx["number"], "title": ctx.get("title"), "label": ctx["label"],
+                       "pages": ctx["pages"]}
+    return out
 
 
 # --- KTD4: a quote inside the cited range ------------------------------------------------------------------------
@@ -444,6 +453,13 @@ def _page_entry(reading: Reading | None, n: int, rects=(), focus=()) -> dict:
 
 
 def _base(stub: dict, pinned: str | None) -> dict:
+    out = _base_fields(stub, pinned)
+    if stub.get("unit"):  # the unit of a file of several appraisals the place is in (round 9 U9, R10): id, title, pages
+        out["unit"] = stub["unit"]
+    return out
+
+
+def _base_fields(stub: dict, pinned: str | None) -> dict:
     return {"v": SNAPSHOT_VERSION, "precision": None, "precision_label": None, "region": None, "degraded": None,
             "document_id": stub["document_id"], "version_id": stub["version_id"],
             "reading_id": pinned if pinned is not None else stub.get("reading_id"),

@@ -32,6 +32,7 @@ import {
   gapReasonText,
   measurementValueStatus,
   rowChangeAction,
+  unitLabel,
   valueStatusText,
 } from "@/lib/format";
 import { type CitationTarget, Markdown, citationOrder, plainAnswer } from "./Markdown";
@@ -104,7 +105,7 @@ function citationTargets(answer: ChatAnswer): Map<string, CitationTarget> {
     const v = answer.values?.find((x) => x.id === id);
     const a = answer.assumptions?.find((x) => x.id === id);
     let title = KIND_LABEL[id[0]] ?? "מקור";
-    if (s) title = `${s.title} — ${s.location}`;
+    if (s) title = `${s.title}${s.unit ? ` (${unitLabel(s.unit)})` : ""} — ${s.location}`;
     else if (m) title = `${m.title} — ${m.metric}: ${m.value_text}`;
     else if (v) title = `${v.label}: ${v.value_text} — ${v.title}`;
     else if (a) title = `הנחה שלך: ${a.label} = ${assumptionText(a)}`;

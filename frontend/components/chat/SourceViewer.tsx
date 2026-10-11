@@ -33,7 +33,7 @@ import type {
   ViewerNav,
   ViewerTarget,
 } from "@/lib/chatTypes";
-import { VALUE_STATUS, valueStatusText } from "@/lib/format";
+import { VALUE_STATUS, unitLabel, valueStatusText } from "@/lib/format";
 import { SourceRevoked, SourceTextView, TableView } from "./SourcePanel";
 import "./chat.css";
 
@@ -311,6 +311,8 @@ function ViewerHeader({
   const title = anchor ? loc?.title ?? loc?.label ?? TITLE_FALLBACK : target.source.title;
   const subtitle = anchor ? (loc?.title ? loc.label : null) : target.source.location;
   const status = target.valueStatus ?? null;
+  // a file of several appraisals: the unit beside the file name, from the snapshot first (it outlives the reading)
+  const unit = anchor?.unit ?? target.source.unit ?? null;
   const structured = anchor ? viewKind(anchor) === "structured" : false;
   const statusLine = status && (
     <li data-testid="viewer-value-status" title={VALUE_STATUS[status].description}>
@@ -321,6 +323,11 @@ function ViewerHeader({
     <header>
       <div className="t">
         <strong data-testid="viewer-title">{title}</strong>
+        {!revoked && unit && (
+          <span data-testid="viewer-unit">
+            <bdi>{unitLabel(unit)}</bdi>
+          </span>
+        )}
         {!revoked && subtitle && <span data-testid="viewer-location">{subtitle}</span>}
         {!revoked && anchor && (
           <ul className="viewer-meta" aria-label="פרטי המיקום">

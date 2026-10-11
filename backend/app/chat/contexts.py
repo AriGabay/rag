@@ -333,6 +333,23 @@ class Contexts:
         last = first if last is None else last
         return list(dict.fromkeys(s.number for s in self.segments if s.first <= last and s.last >= first))
 
+    def reach(self, number: int) -> Reach:
+        """The scope of a unit: its blocks, extended over the neighbouring unit while the edge that opens (or closes)
+        it is only ``probable`` — the edge that opens unit k carries k's ``certainty`` — until an edge that is
+        ``certain``, or the file's edge (R8). A file with one unit, or a unit whose edges are certain, reaches
+        exactly its own blocks."""
+        segs = [s for s in self.segments]
+        at = next(i for i, s in enumerate(segs) if s.number == number)
+        lo = hi = at
+        while lo > 0 and segs[lo].certainty == "probable":
+            lo -= 1
+        while hi + 1 < len(segs) and segs[hi + 1].certainty == "probable":
+            hi += 1
+        pages = [p for s in segs[lo:hi + 1] for p in (s.first_page, s.last_page) if p]
+        return Reach(number, segs[lo].first, segs[hi].last, min(pages) if pages else None,
+                     max(pages) if pages else None, tuple(s.number for s in segs[lo:at]),
+                     tuple(s.number for s in segs[at + 1:hi + 1]))
+
     def named(self, words: str | None) -> list[int]:
         """The subject contexts whose identifiers or names a free text names (never an appendix or a comparables
         part). A name that lies inside a longer name of another context in the text ("מגדלי הים" inside "מגדלי הים
@@ -346,6 +363,27 @@ class Contexts:
         by_name = [n for n, sp in spans.items()
                    if not all(any(o[0] <= a and b <= o[1] and (a, b) != o for o in every) for a, b in sp)]
         return [n for n in self.numbers if n in by_id or n in by_name]
+
+
+@dataclass(frozen=True)
+class Reach:
+    """The blocks and pages a unit-scoped search or read covers (round 9 U9, KTD7): the unit's own, and — where an edge
+    of it is only ``probable`` — the neighbouring unit up to its next ``certain`` edge, or the file's edge.
+    ``before``/``after``: the numbers of the units the scope was extended over."""
+
+    number: int
+    first: int
+    last: int
+    first_page: int | None
+    last_page: int | None
+    before: tuple[int, ...] = ()
+    after: tuple[int, ...] = ()
+
+    @property
+    def extended(self) -> bool:
+        """Whether an edge of the unit is uncertain: the scope reaches over a neighbour, and a search that finds
+        nothing in it may widen once to the whole file."""
+        return bool(self.before or self.after)
 
 
 def split_key(key: str) -> tuple[str, int]:

@@ -798,6 +798,24 @@ def stored(conn: Connection, version_id: UUID | str, reading: Reading | None = N
     return tuple(_unit_of(r) for r in rows) or None
 
 
+def stored_many(conn: Connection, version_ids: Sequence[UUID | str]) -> dict[UUID, tuple[Unit, ...]]:
+    """The stored units of many versions in one query (those of their current reading and derivation key, as
+    ``stored`` has them); a version without any is not in the result (``ensure`` builds those)."""
+    if not version_ids:
+        return {}
+    out: dict[UUID, list[Unit]] = defaultdict(list)
+    for r in conn.execute(text(
+            "SELECT u.version_id, u.unit_no, u.kind, u.title, u.aliases, u.identifiers, u.page_first, u.page_last,"
+            " u.block_first, u.block_last, u.certainty, u.evidence FROM document_units u"
+            " JOIN document_versions v ON v.id = u.version_id WHERE u.version_id = ANY(:v)"
+            " AND u.reading_id = COALESCE(v.ingestion->>'reading_id', :none)"
+            " AND u.derivation_key = :uv || '|' || COALESCE(NULLIF(v.ingestion->>'positions', ''), '-')"
+            " ORDER BY u.version_id, u.unit_no"),
+            {"v": [UUID(str(v)) for v in version_ids], "none": NO_READING, "uv": UNITS_VERSION}):
+        out[r.version_id].append(_unit_of(r))
+    return {v: tuple(units) for v, units in out.items()}
+
+
 def read_or_derive(conn: Connection, version_id: UUID | str) -> tuple[Unit, ...]:
     """Stored units when they are current, else derived in memory; writes nothing (the count script)."""
     reading = reading_of(conn, version_id)

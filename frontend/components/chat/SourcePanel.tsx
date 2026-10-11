@@ -3,7 +3,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { ApiError, chatApi, errorMessage, isAbortError, safeApiUrl } from "@/lib/api";
 import type { ChatSource, SourceBlock, SourceBlocks } from "@/lib/chatTypes";
-import { BLOCK_KIND_LABEL } from "@/lib/format";
+import { BLOCK_KIND_LABEL, unitLabel } from "@/lib/format";
 import "./chat.css";
 
 const WINDOW = 10;
@@ -67,6 +67,11 @@ export function SourcePanel({ source, onClose }: { source: ChatSource; onClose: 
       <header>
         <div className="t">
           <strong>{source.title}</strong>
+          {!revoked && source.unit && (
+            <span data-testid="source-unit">
+              <bdi>{unitLabel(source.unit)}</bdi>
+            </span>
+          )}
           {!revoked && <span>{source.location}</span>}
         </div>
         <button ref={closeRef} type="button" className="icon-btn" onClick={onClose} aria-label="סגירת תצוגת המקור">

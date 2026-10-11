@@ -84,6 +84,19 @@ export interface ChatAnchorStructured {
   } | null;
 }
 
+/** The appraisal unit a source, value or citation is in, in a file that holds more than one (absent for a file with
+ * one unit). `id` is stable across turns: version, reading and unit number. */
+export interface ChatUnit {
+  id: string;
+  no: number;
+  /** The title the document states for the unit; null when it states none. */
+  title: string | null;
+  label: string;
+  kind: string;
+  /** First and last page of the unit in the file; empty when unknown. */
+  pages: number[];
+}
+
 export interface ChatAnchor {
   v: number;
   precision: ChatAnchorPrecision;
@@ -114,6 +127,8 @@ export interface ChatAnchor {
   structured: ChatAnchorStructured | null;
   /** Pages or rectangles were cut to keep the snapshot bounded. */
   truncated: boolean;
+  /** The unit the cited place is in, in a file of several appraisals. */
+  unit?: ChatUnit | null;
 }
 
 /** A computed result (C#) anchors to its inputs, never to a place in a document. */
@@ -155,6 +170,8 @@ export interface ChatSource {
   row_index?: number | null;
   /** Where the citation points (absent on older answers). */
   anchor?: ChatAnchor | null;
+  /** The unit it is in, when its file holds more than one (the file name alone does not say which appraisal). */
+  unit?: ChatUnit | null;
 }
 
 export interface ChatMeasurement {

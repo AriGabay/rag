@@ -64,6 +64,7 @@ MAX_QUERIES = 3
 SMALL_SCOPE_DOCUMENTS = 3
 SMALL_SCOPE_CANDIDATES = 200
 PER_VERSION_GUARANTEE = 2
+UNIT_TRIGRAM_CANDIDATES = 1000
 _YEAR = re.compile(r"(?:19|20)\d{2}")
 
 
@@ -72,6 +73,11 @@ class SearchScope:
     version_ids: tuple[UUID, ...] = ()
     document_ids: tuple[UUID, ...] = ()
     include_noncurrent: bool = False  # honored only together with explicit version_ids
+    # a unit scope (round 9 U9, KTD7): only chunks that begin inside the blocks (first, last) of the one version in
+    # ``version_ids`` — an appraisal unit of a file holding several. A chunk is a section of a chapter, so the one that
+    # closes a unit may run on into the next unit's title block; it belongs to the unit it begins in (the next unit's
+    # own scope never holds the previous unit's closing chapter, whose figures are not its)
+    blocks: tuple[int, int] | None = None
 
 
 @dataclass
@@ -113,6 +119,9 @@ def _scope_conditions(scope: SearchScope | None, version_col: str, document_col:
 
 def _scope_sql(scope: SearchScope | None, allowed_versions: list[UUID] | None = None) -> _Sql:
     conds, params = _scope_conditions(scope, "c.version_id", "c.document_id")
+    if scope and scope.blocks:
+        params |= {"scope_blk_lo": scope.blocks[0], "scope_blk_hi": scope.blocks[1]}
+        conds.append("c.block_start BETWEEN :scope_blk_lo AND :scope_blk_hi")
     if allowed_versions is not None:
         params["scope_allowed"] = allowed_versions
         conds.append("c.version_id = ANY(:scope_allowed)")
@@ -166,11 +175,14 @@ def _trigram_statement(scope: _Sql, n: int = CANDIDATES) -> tuple[str, dict]:
     evaluating the predicate on each scan (10.8 s on the office; R16, KTD3)."""
     return (
         "WITH cand AS MATERIALIZED (SELECT t.chunk_id AS id, t.sim"
-        " FROM trigram_candidates(:q, CAST(:tv AS uuid[]), CAST(:th AS real), :n) t)"
+        " FROM trigram_candidates(:q, CAST(:tv AS uuid[]), CAST(:th AS real), :n_in) t)"
         " SELECT c.id FROM cand JOIN chunks c ON c.id = cand.id JOIN document_versions v ON v.id = c.version_id"
         " JOIN documents d ON d.id = c.document_id AND d.deleted_at IS NULL"
         f" WHERE {scope.where} AND cand.sim > :th ORDER BY cand.sim DESC, c.id LIMIT :n",
-        scope.params | {"tv": list(scope.version_ids or []), "th": TRIGRAM_THRESHOLD, "n": n},
+        scope.params | {"tv": list(scope.version_ids or []), "th": TRIGRAM_THRESHOLD, "n": n,
+                        # the candidates are the best of the whole version, a unit's block range is cut afterwards:
+                        # a unit scope asks for more of them
+                        "n_in": max(n, UNIT_TRIGRAM_CANDIDATES) if "scope_blk_lo" in scope.params else n},
     )
 
 
@@ -541,6 +553,224 @@ def documents_matching(conn: Connection, query: str) -> list[dict]:
     return out
 
 
+# --- units: the second level of retrieval (round 9 U9: KTD7; R10–R13) ------------------------------------------
+
+@dataclass
+class UnitMatches:
+    """What ``units_matching`` found. ``documents``: ``documents_matching`` rows of the files that hold the terms — for
+    a file of several units, the units that hold **all** of them (``units``, subject candidates only); ``comparables``:
+    units where the terms appear only as a comparable (an appendix, a comparables part, or a property that only the
+    comparison tables of an appraisal name); ``split``: files holding every term, but in different units, so that no
+    single unit is a match (R11)."""
+
+    documents: list[dict] = field(default_factory=list)
+    comparables: list[dict] = field(default_factory=list)
+    split: list[dict] = field(default_factory=list)
+
+    @property
+    def units(self) -> list[dict]:
+        return [u for d in self.documents for u in d.get("units") or ()]
+
+
+_FILE_SQL = (
+    "SELECT d.id, d.title, v.id AS version_id, COALESCE(v.ingestion->>'reading_id', '') AS reading_id, {counts}"
+    " FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
+    " LEFT JOIN chunks c ON c.version_id = v.id WHERE d.deleted_at IS NULL GROUP BY d.id, d.title, v.id")
+
+
+def _tsquery(forms: Sequence[str], prefix: str, params: dict) -> str:
+    params |= {f"{prefix}_{j}": f for j, f in enumerate(forms)}
+    return " || ".join(f"plainto_tsquery('simple', :{prefix}_{j})" for j in range(len(forms)))
+
+
+def _term_regexes(terms: list[list[str]]) -> list[re.Pattern]:
+    """One pattern per term over normalized text: any of its forms as a whole word."""
+    return [re.compile(r"(?<![\w])(?:" + "|".join(re.escape(f) for f in sorted(forms, key=len, reverse=True))
+                       + r")(?![\w])") for forms in terms]
+
+
+def _name_fit(names: Sequence[str], term_sets: list[set[str]]) -> tuple[set[int], int]:
+    """The terms a unit's title and aliases hold (indexes), and how many words of the best-fitting name the question
+    does not use (0: the question says the whole name). The name that holds the most terms, then the shortest, is
+    the one that counts."""
+    best: tuple[int, int] = (0, 0)
+    held: set[int] = set()
+    for name in names:
+        words = _title_words(name) | _numbers_of(name)
+        got = {i for i, ts in enumerate(term_sets) if words & ts}
+        held |= got
+        size = len(_TITLE_WORD.findall(base_normalize(name)))
+        extra = max(0, size - len(got))
+        if got and (len(got), -extra) > (best[0], -best[1]):
+            best = (len(got), extra)
+    return held, best[1]
+
+
+def units_matching(conn: Connection, query: str) -> UnitMatches:
+    """The visible current files, and the units within them, that hold **every** term of ``query`` (the terms of
+    ``documents_matching``: a title word, or a term in any of its forms). For a file with one unit the file is its
+    unit and the match is the file-level AND, as before. For a file of several units the AND is per unit (R11): a
+    term is satisfied in a unit by its title or an alias (a name the document itself states), by a chunk whose
+    blocks lie inside the unit, or by a block of the unit inside a chunk that runs across the unit's start (the last
+    chapter of one report runs on into the next one's title block, whose words are the next unit's); the file's
+    title satisfies every unit. Terms split between two units match neither, whatever the file holds. An appendix or
+    comparables unit, and a unit whose only mentions of the terms are cells of its comparison tables, is reported
+    as a comparable and is never a candidate for the asked subject. Under row security: a unit of a file the user
+    cannot see is not here."""
+    from app.chat import contexts as unit_contexts
+    from app.chat import units as unit_store
+
+    terms = _scope_terms(query)
+    if not terms:
+        return UnitMatches()
+    params: dict = {}
+    counts = []
+    queries = []
+    for i, forms in enumerate(terms):
+        q = _tsquery(forms, f"t{i}", params)
+        queries.append(q)
+        counts.append(f"count(c.id) FILTER (WHERE c.tsv @@ ({q})) AS h{i}")
+    term_sets = [set(t) for t in terms]
+    out = UnitMatches()
+    passing = []
+    for r in conn.execute(text(_FILE_SQL.format(counts=", ".join(counts))), params).all():
+        title = _title_words(r.title)
+        if all(title & ts or getattr(r, f"h{i}") for i, ts in enumerate(term_sets)):
+            passing.append(r)
+    stored: dict[UUID, tuple] = unit_store.stored_many(conn, [r.version_id for r in passing])
+    for r in passing:
+        if r.version_id in stored:
+            continue
+        try:  # a version published before units were stored: built on first use
+            stored[r.version_id] = tuple(unit_store.ensure(conn, r.version_id))
+        except Exception:  # noqa: BLE001 - units that cannot be had: the file is its own unit
+            stored[r.version_id] = ()
+    multi = [r for r in passing if len(stored[r.version_id]) > 1]
+    multi_ids = {r.version_id for r in multi}
+    per_unit = _unit_passages(conn, multi, stored, terms, queries, params) if multi else {}
+    for r in passing:
+        title = _title_words(r.title)
+        in_title = [t[0] for t, ts in zip(terms, term_sets, strict=True) if title & ts]
+        in_text = [t[0] for i, t in enumerate(terms) if getattr(r, f"h{i}")]
+        total = sum(getattr(r, f"h{i}") for i in range(len(terms)))
+        row = {"document_id": r.id, "title": r.title, "in_title": in_title, "in_text": in_text, "hits": total,
+               "version_id": r.version_id, "reading_id": r.reading_id}
+        if r.version_id not in multi_ids:
+            out.documents.append(row | {"units": [], "multi": False})
+            continue
+        row |= {"multi": True, "units": []}
+        in_file_title = {i for i, ts in enumerate(term_sets) if title & ts}
+        matched = False
+        for u in stored[r.version_id]:
+            names = ([u.title] if u.title else []) + list(u.aliases)
+            named, extra = _name_fit(names, term_sets)
+            prose, tabular = per_unit[(r.version_id, u.unit_no)]
+            by_name = named | in_file_title
+            if len(by_name | prose | tabular) < len(terms):
+                continue
+            matched = True
+            unit = {"document_id": r.id, "version_id": r.version_id, "reading_id": r.reading_id, "unit_no": u.unit_no,
+                    "unit_id": (f"{r.version_id}#{r.reading_id}#{u.unit_no}" if r.reading_id
+                                else f"{r.version_id}#{u.unit_no}"), "kind": u.kind, "title": u.title,
+                    "aliases": list(u.aliases), "identifiers": list((u.identifiers or {}).get("shown") or ()),
+                    "page_first": u.page_first, "page_last": u.page_last, "certainty": u.certainty,
+                    "block_first": u.block_first, "block_last": u.block_last, "file_title": r.title,
+                    "matched_by": ("alias" if len(by_name) == len(terms) and named else
+                                   "file_title" if len(by_name) == len(terms) else "passage"),
+                    "name_terms": len(named), "name_extra": extra, "hits": len(prose) + len(tabular),
+                    "in_name": [terms[i][0] for i in sorted(named | in_file_title)]}
+            # a unit is the asked subject when its name and its prose hold every term; one that needs cells of its
+            # comparison tables to hold them has the property as a comparable, not as its own subject
+            comparable = u.kind in unit_contexts.NON_SUBJECT_KINDS or len(by_name | prose) < len(terms)
+            if comparable:
+                out.comparables.append(unit)
+            else:
+                row["units"].append(unit)
+        if row["units"]:
+            out.documents.append(row)
+        elif not matched:
+            out.split.append({"document_id": r.id, "title": r.title, "units": len(stored[r.version_id])})
+    _printed_labels(conn, out)
+    out.documents.sort(key=lambda d: (-len(d["in_title"]), -d["hits"], d["title"], str(d["document_id"])))
+    return out
+
+
+def _unit_passages(conn: Connection, files: list, stored: dict, terms: list[list[str]], queries: list[str],
+                   params: dict) -> dict[tuple, tuple[set[int], set[int]]]:
+    """For each unit of the given multi-unit files: (terms found in a prose passage of it, terms found only in a
+    table passage of it), by the chunks inside it and the blocks of the chunks that run across its start."""
+    vs, ns, los, his = [], [], [], []
+    for r in files:
+        for u in stored[r.version_id]:
+            vs.append(r.version_id)
+            ns.append(u.unit_no)
+            los.append(u.block_first)
+            his.append(u.block_last)
+    ranges = {"vs": vs, "ns": ns, "los": los, "his": his}
+    ranges_sql = ("unnest(CAST(:vs AS uuid[]), CAST(:ns AS int[]), CAST(:los AS int[]), CAST(:his AS int[]))"
+                  " AS u(version_id, unit_no, lo, hi)")
+    cols = ", ".join(f"count(c.id) FILTER (WHERE c.tsv @@ ({q})) AS h{i}, count(c.id) FILTER (WHERE c.tsv @@ ({q})"
+                     f" AND c.kind NOT IN ('table', 'table_row')) AS p{i}" for i, q in enumerate(queries))
+    found: dict[tuple, tuple[set[int], set[int]]] = {(v, n): (set(), set()) for v, n in zip(vs, ns, strict=True)}
+    for r in conn.execute(text(
+            f"SELECT u.version_id, u.unit_no, {cols} FROM {ranges_sql} JOIN chunks c ON c.version_id = u.version_id"
+            " AND c.block_start >= u.lo AND c.block_end <= u.hi GROUP BY u.version_id, u.unit_no"),
+            params | ranges):
+        prose = {i for i in range(len(terms)) if getattr(r, f"p{i}")}
+        every = {i for i in range(len(terms)) if getattr(r, f"h{i}")}
+        found[(r.version_id, r.unit_no)] = (prose, every - prose)
+    # chunks that run across the start of a unit: the blocks of the unit they hold decide
+    any_term = " OR ".join(f"c.tsv @@ ({q})" for q in queries)
+    across = conn.execute(text(
+        f"SELECT DISTINCT c.id, c.version_id, c.block_start, c.block_end FROM {ranges_sql} JOIN chunks c"
+        " ON c.version_id = u.version_id AND c.block_start < u.lo AND c.block_end >= u.lo"
+        f" WHERE {any_term}"), params | ranges).all()
+    if not across:
+        return found
+    patterns = _term_regexes(terms)
+    by_version: dict[UUID, list] = {}
+    for r in across:
+        by_version.setdefault(r.version_id, []).append(r)
+    units_of = {r.version_id: stored[r.version_id] for r in files}
+    for version_id, chunks in by_version.items():
+        # only the blocks of the chunks that run across a unit start (a few blocks each), not the span between them
+        for b in conn.execute(text(
+                "SELECT DISTINCT b.block_index, b.kind, b.text FROM document_blocks b JOIN unnest(CAST(:los AS int[]),"
+                " CAST(:his AS int[])) AS r(lo, hi) ON b.block_index BETWEEN r.lo AND r.hi WHERE b.version_id = :v"
+                " AND b.text IS NOT NULL"),
+                {"v": version_id, "los": [c.block_start for c in chunks], "his": [c.block_end for c in chunks]}):
+            unit = next((u for u in units_of[version_id] if u.block_first <= b.block_index <= u.block_last), None)
+            if unit is None:
+                continue
+            norm = base_normalize(b.text)
+            held = {i for i, p in enumerate(patterns) if p.search(norm)}
+            if held:
+                prose, tabular = found[(version_id, unit.unit_no)]
+                (tabular if b.kind == "table" else prose).update(held)
+                found[(version_id, unit.unit_no)] = (prose, tabular - prose)
+    return found
+
+
+def _printed_labels(conn: Connection, matches: UnitMatches) -> None:
+    """Each candidate unit's first printed page label, the part of its anchor that survives a new reading: the page's
+    stored label, else — a report whose numbering restarts keeps none — the number its page-number line states."""
+    from app.chat import units as unit_store
+
+    units = [*matches.units, *matches.comparables]
+    firsts = [(u["version_id"], u["page_first"]) for u in units if u["page_first"] is not None]
+    labels: dict[tuple, str | None] = {}
+    if firsts:
+        for r in conn.execute(text(
+                "SELECT p.version_id, p.page_no, p.printed_label, left(p.text, 600) || E'\\n' || right(p.text, 600)"
+                " AS edge FROM pages p JOIN unnest(CAST(:v AS uuid[]), CAST(:n AS int[])) AS w(version_id, page_no)"
+                " ON p.version_id = w.version_id AND p.page_no = w.page_no"),
+                {"v": [v for v, _ in firsts], "n": [n for _, n in firsts]}):
+            number = unit_store._footer_number(r.edge or "") if not r.printed_label else None
+            labels[(r.version_id, r.page_no)] = r.printed_label or (str(number) if number is not None else None)
+    for u in units:
+        u["first_label"] = labels.get((u["version_id"], u["page_first"]))
+
+
 def documents_sharing_title_words(conn: Connection, question: str) -> dict[str, list[tuple[UUID, str]]]:
     """Question words that appear in the titles of several visible documents, but not in most titles: word ->
     [(document id, title)]. Between 2 and min(8, 40% of the titles) documents, so a word every title carries
@@ -661,6 +891,8 @@ def search_passages(conn: Connection, query: str, limit: int = 8, *, scope: Sear
 
     queries = [query, *variants(query)]
     hits = search_evidence(conn, queries, limit * 2, scope=scope).hits
+    if scope is not None and scope.blocks:  # inside a unit already: a document's title names nothing further
+        return diversify_rows(hits, limit)
     named = documents_named(conn, query, scope)
     if named:
         inside = SearchScope(document_ids=tuple(i for i, _ in named))

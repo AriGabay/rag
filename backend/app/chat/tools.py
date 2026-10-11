@@ -72,6 +72,20 @@ Tools:
   (``stated_amount_differs``), to be shown beside the result. The literals stay structural (``calc``): a rate nobody
   gave is refused, never applied.
 
+**Two levels** (round 9 U9: KTD7, KTD8; R10–R13, R15): a file holding several appraisals is also searched in two steps.
+``find_documents`` matches by *unit* (``platform.search.units_matching``: all the terms inside one unit — in its title or
+a stated alias, or in its passages — so terms split between two appraisals match neither, and an appendix, or a property
+named only in a comparison table, is reported as a comparable, never as an appraisal) and lists the units that match
+(title or that it has none, pages, identifiers) with turn handles (``U#``, bound to the version and the reading like
+``§#``). ``search`` (``unit=``), ``read`` (``pages`` with ``document=U#``) and ``outline`` (``unit=``) work inside one unit:
+the scope is the unit's blocks, extended over the neighbouring unit up to the next *certain* edge where an edge of it is
+only ``probable`` (``contexts.Contexts.reach``, R8); a unit search that finds no passage holding the query's words says
+the unit was searched and nothing found, and — only next to a probable edge — widens once to the whole file, every hit
+labelled by its unit, and says so. The outline of a file of more than ``OUTLINE_INLINE_UNITS`` units lists its units and
+then the chosen unit's sections only, so no section list is cut at ``OUTLINE_MAX``. Every search hit, read source,
+value, measurement and citation anchor of such a file carries the unit (``unit_id``: version, reading, number; with
+title and pages for the answer's payload); a file with one unit shows and checks nothing new.
+
 A file holding several appraisals, or an appendix about a comparison property, is read as several appraisal contexts
 (round 7 U6: KTD7; R20–R22; ``app.chat.contexts``, derived from the stored reading and cached per reading): search
 hits, reads (with a marker where a context starts inside a part), the outline (each context's sections apart, a
@@ -227,6 +241,9 @@ class Source:
     # the appraisal contexts it is in, in a file holding several (round 7 U6, KTD7): their numbers, and as shown
     contexts: list[int] = field(default_factory=list)
     context: str | None = None
+    # the unit it is in, in a file holding several (round 9 U9, KTD7, R10): {"id": version#reading#number, "no", "title",
+    # "label", "kind", "pages": [first, last]}; the stable id outlives the turn, the unit handle (U#) does not
+    unit: dict | None = None
 
     @property
     def is_listing(self) -> bool:
@@ -242,6 +259,8 @@ class Source:
                "more": self.resume, "method": self.method, "row_index": self.row_index}
         if self.context:
             out["context"] = self.context
+        if self.unit:
+            out["unit"] = self.unit
         if self.is_listing:
             out["listed_document_ids"] = list(self.listed)
         return out
@@ -268,7 +287,9 @@ class Measurement:
                 "table_index": r.table_index, "anchor_lost": anchor_lost(r),
                 "reading_id": getattr(r, "reading_id", None),
                 # optional (KTD8): who stated it and how, only as its text attested at extraction
-                "stated_by": getattr(r, "stated_by", None), "stance": getattr(r, "stance", None)}
+                "stated_by": getattr(r, "stated_by", None), "stance": getattr(r, "stance", None),
+                # the unit its block is in, in a file holding several (round 9 U9, R10)
+                "unit_id": self.context["unit_id"] if self.context else None}
 
 
 def anchor_lost(row) -> bool:
@@ -667,6 +688,8 @@ def _render_source(s: Source) -> str:
     tags = "".join(f' {k}="{v}"' for k, v in s.tags.items())
     if s.context:  # the appraisal context it is in, in a file holding several (KTD7)
         tags += f' context="{_attr(s.context)}"'
+    if s.unit:  # its stable unit id (version, reading, number), beside the turn's handle in the tags (round 9 U9)
+        tags += f' unit_id="{_attr(s.unit["id"])}"'
     if s.status:  # a reading: how complete it is, the reading it is of, and how to read on
         tags += (f' status="{s.status}" version_id="{s.version_id}" reading_id="{_attr(s.reading_id)}"'
                  + (f' more="{s.more}"' if s.more else ""))
@@ -763,11 +786,38 @@ def _note_once(ws: Workspace, document_id, cx) -> str | None:
     return _context_note(ws, cx)
 
 
-def _mark(s: Source, cx, numbers) -> Source:
-    """A source of a file holding several contexts says the ones it is in."""
+def unit_info(cx, number: int) -> dict:
+    """A unit as a source, a value and the answer's payload carry it (round 9 U9, R10): its stable id, number, title,
+    label, kind and pages."""
+    seg = next(x for x in cx.segments if x.number == number)
+    first, last = cx.pages(number)
+    return {"id": cx.key(number), "no": number, "title": seg.title, "label": cx.label(number), "kind": seg.kind,
+            "pages": [first, last] if first else []}
+
+
+def unit_handle_of(ws: Workspace, document_id, version_id, reading_id: str | None, number: int) -> str:
+    """The turn's handle (U#) for a unit: bound to the version and the reading it was issued for, and the same for
+    the same unit whichever tool names it."""
+    return ws.handle("U", (str(version_id), reading_id or None, number), document_id=str(document_id),
+                     version_id=str(version_id), reading_id=reading_id or None, unit_no=number)
+
+
+def unit_handle(ws: Workspace, cx, number: int, document_id) -> str:
+    """The handle (U#) of a unit of a version's contexts."""
+    return unit_handle_of(ws, document_id, cx.version_id, cx.reading_id, number)
+
+
+def _mark(s: Source, cx, numbers, ws: Workspace | None = None) -> Source:
+    """A source of a file holding several contexts says the ones it is in, and the unit it begins in (the stable id,
+    and — with ``ws`` — the handle ``search``, ``read`` and ``outline`` take)."""
     if cx is not None and cx.multi and numbers:
         s.contexts = list(dict.fromkeys(numbers))
         s.context = "; ".join(cx.describe(n) for n in s.contexts)
+        s.unit = unit_info(cx, s.contexts[0])
+        if ws is not None and s.document_id is not None:
+            s.tags["unit"] = unit_handle(ws, cx, s.contexts[0], s.document_id)
+            if s.sid in ws.anchors:  # the citation's anchor says the unit too (``anchors.snapshot``)
+                ws.anchors[s.sid]["unit"] = s.unit
     return s
 
 
@@ -910,8 +960,9 @@ def value_context(cx, number: int | None) -> dict | None:
     if cx is None or not cx.multi or number is None:
         return None
     first, last = cx.pages(number)
-    return {"key": cx.key(number), "number": number, "label": cx.label(number), "described": cx.describe(number),
-            "pages": [first, last] if first else [], "subject": cx.is_subject(number)}
+    return {"key": cx.key(number), "unit_id": cx.key(number), "number": number, "label": cx.label(number),
+            "described": cx.describe(number), "pages": [first, last] if first else [],
+            "subject": cx.is_subject(number), "title": next(s.title for s in cx.segments if s.number == number)}
 
 
 def subject_from(cx, number: int | None, subject: str) -> str:
@@ -933,7 +984,7 @@ def memoized_search(ws: Workspace, conn: Connection, query: str, limit: int, sco
     indexed row — so a document processed, deleted or republished mid-turn is never answered from before it."""
     scope_key = None if scope is None else (
         tuple(sorted(map(str, scope.document_ids))), tuple(sorted(map(str, scope.version_ids))),
-        scope.include_noncurrent)
+        scope.include_noncurrent, scope.blocks)
     key = (query, scope_key, limit, current_data_version(conn))
     hits = ws.search_memo.get(key)
     if hits is None:
@@ -941,16 +992,85 @@ def memoized_search(ws: Workspace, conn: Connection, query: str, limit: int, sco
     return [dict(h) for h in hits]
 
 
-def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None, limit: int | None = None) -> str:
+MSG_UNIT_SEARCHED = ("חיפשתי ביחידה {unit} ({pages}) {extended}ולא נמצא קטע שמכיל את מילות החיפוש \"{query}\". היחידה "
+                     "נחקרה; לא חיפשתי בשאר הקובץ. אפשר לנסות ניסוח אחר או מונחים נרדפים.")
+MSG_UNIT_EXTENDED = ("גבול היחידה אינו ודאי (נקבע על סמך סימן אחד): החיפוש כלל גם את {which} עד הגבול הוודאי הבא.")
+MSG_UNIT_WIDENED = ("בגבולות היחידה {unit} לא נמצא דבר, וגבול שלה אינו ודאי: הרחבתי פעם אחת את החיפוש לכל הקובץ. כל תוצאה "
+                    "מסומנת ביחידה שהיא בה (unit) — אין להניח שתוצאה היא של היחידה שנשאלה.")
+MSG_UNIT_ARGS = "היחידה (unit) והמסמך שנבחר אינם של אותו קובץ: היחידה קובעת את המסמך — בחר רק אחד מהם"
+
+
+def _unit_of(conn: Connection, ws: Workspace, handle: str):
+    """(the version, its contexts, the unit's number) of a unit handle (U#), under the current permissions and only
+    while its reading is the current one."""
+    handle = str(handle or "").strip()
+    data = _handle(ws, handle, "U")
+    v = _bound(conn, ws, handle, data)
+    cx = contexts_of(ws, conn, v.version_id, v.reading_id)
+    if data["unit_no"] not in cx.numbers:
+        raise ToolError(MSG_STALE_HANDLE.format(handle=handle))
+    ws.readings.setdefault(str(v.version_id), v.reading_id)
+    return v, cx, data["unit_no"]
+
+
+def _unit_pages(cx, number: int) -> str:
+    first, last = cx.pages(number)
+    return "עמוד ?" if first is None else f"עמוד {first}" if first == last else f"עמודים {first}–{last}"
+
+
+def _unit_search(ws: Workspace, conn: Connection, handle: str, query: str, limit: int,
+                 document_ids: list[str] | None) -> tuple[list[dict], list[str], str | None]:
+    """A search inside one unit (KTD7): the chunks that begin in its blocks, and in the neighbouring unit up to the next
+    certain edge where an edge of it is only probable. With no hit in such a unit the search widens once to the whole
+    file, every hit labelled by its unit, and says so; with no hit in a unit whose edges are certain it says the unit
+    was searched and found nothing. Returns (hits, notes for the model, the answer when nothing was found)."""
+    v, cx, number = _unit_of(conn, ws, handle)
+    if document_ids and {str(x) for x in document_ids} - {str(v.document_id), ws.doc_handle(v.document_id)}:
+        raise ToolError(MSG_UNIT_ARGS)
+    if cx.multi:
+        reach = cx.reach(number)
+        scope = SearchScope(version_ids=(v.version_id,), blocks=(reach.first, reach.last))
+        unit = f"{handle} «{_txt(cx.label(number))}»"
+    else:  # a file with one unit: the file is its unit
+        reach, scope, unit = None, SearchScope(version_ids=(v.version_id,)), f"{handle} (כל הקובץ)"
+    notes = []
+    extended = ""
+    if reach is not None and reach.extended:
+        which = ", ".join(unit_handle(ws, cx, n, v.document_id) for n in (*reach.before, *reach.after))
+        extended = MSG_UNIT_EXTENDED.format(which=which) + " "
+        notes.append(extended.strip())
+    # "a hit" of a unit search is a passage that holds the query's words (exactly or nearly): the passages nearest
+    # by meaning exist in any unit, and are no answer to "is it in this unit"
+    hits = memoized_search(ws, conn, query, limit, scope)
+    if any(h.get("lexical_support") for h in hits):
+        return hits, [f"חיפוש בתוך היחידה {unit} ({_unit_pages(cx, number)})", *notes], None
+    if reach is not None and reach.extended:
+        hits = memoized_search(ws, conn, query, limit, SearchScope(version_ids=(v.version_id,)))
+        if any(h.get("lexical_support") for h in hits):
+            return hits, [MSG_UNIT_WIDENED.format(unit=unit), *notes], None
+        return [], [], (MSG_UNIT_SEARCHED.format(unit=unit, pages=_unit_pages(cx, number), extended=extended,
+                                                 query=_txt(query)) + " גם הרחבה לכל הקובץ לא מצאה דבר.")
+    return [], [], MSG_UNIT_SEARCHED.format(unit=unit, pages=_unit_pages(cx, number), extended="", query=_txt(query))
+
+
+def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None, limit: int | None = None,
+                unit: str | None = None) -> str:
     query = (query or "").strip()
     if len(query) < 2:
         raise ToolError("שאילתת חיפוש ריקה")
     limit = max(3, min(int(limit or SEARCH_LIMIT), SEARCH_MAX))
     ws.searches.append(query)
+    notes: list[str] = []
     with tenant_tx(ws.ctx) as conn:
-        docs = _visible_documents(conn, document_ids or [])
-        scope = SearchScope(document_ids=tuple(docs)) if docs else None
-        hits = memoized_search(ws, conn, query, limit, scope)
+        if unit:
+            hits, notes, nothing = _unit_search(ws, conn, unit, query, limit, document_ids)
+            if nothing:
+                return nothing
+            scope = True  # a unit names its document: no unread document is looked up by title
+        else:
+            docs = _visible_documents(conn, document_ids or [])
+            scope = SearchScope(document_ids=tuple(docs)) if docs else None
+            hits = memoized_search(ws, conn, query, limit, scope)
         # a document the query names by its title that was not read has no passages: say so, never "not found" (KTD11)
         named = unread_named(conn, query) if scope is None else []
         ws.name_unread(named)
@@ -994,7 +1114,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 # read in part only when the page or section it cites has an unread region (R28)
                 partial_document=gaps.get(h["version_id"], whole).cites(h["page_list"], h["section"]), tags=tags,
                 row_index=h.get("row_index") if h["kind"] == "table_row" else None),
-                cx, _hit_contexts(ws, conn, cx, h, bs, be) if cx.multi else [])
+                cx, _hit_contexts(ws, conn, cx, h, bs, be) if cx.multi else [], ws)
             out.append(ws.once(src, ("chunk", h["chunk_id"])))
             # the document as a whole: a datum not found may be in a part of it that was not read
             ws.touch(h["document_id"], h["title"], "retrieved", gaps.get(h["version_id"], whole).partial)
@@ -1004,7 +1124,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 + (f"\n\n{block}" if block else ""))
     hints = [MSG_ROWS_NOT_SHOWN.format(handle=t, n=n) for t, n in capped] + ([block] if block else [])
     hints += [f"{ws.doc_handle(d)}: {note}" for d, cx in noted.items() if (note := _note_once(ws, d, cx))]
-    return "\n\n".join([*(_render_source(s) for s in out), *hints])
+    return "\n\n".join([*notes, *(_render_source(s) for s in out), *hints])
 
 
 MSG_ROWS_NOT_SHOWN = ("בטבלה {handle} התאימו לחיפוש עוד {n} שורות שלא הוצגו כאן. לקריאת הטבלה כולה, עם הכותרות "
@@ -1171,7 +1291,8 @@ def _pages_label(pages: list[int]) -> str:
 def _handle(ws: Workspace, value: str, kind: str) -> dict:
     data = ws.handles.get(value)
     if data is None or data["kind"] != kind:
-        what = {"§": "סעיף (§# מ-outline)", "T": "טבלה (T# מ-outline או מתוצאת חיפוש)", "K": "המשך (K# מ-more)"}[kind]
+        what = {"§": "סעיף (§# מ-outline)", "T": "טבלה (T# מ-outline או מתוצאת חיפוש)", "K": "המשך (K# מ-more)",
+                "U": "יחידה (U# מ-find_documents, outline או תוצאת חיפוש)"}[kind]
         raise ToolError(f"מזהה לא מוכר: {value}. נדרש מזהה {what} שהוחזר בתור הזה.")
     return data
 
@@ -1312,7 +1433,7 @@ def _emit(ws: Workspace, v: reader.Version, target: tuple, pos, part: reader.Par
                       resume=_target_json(target, part.next), body="\n".join(head + lines + body),
                       tags={"document": ws.doc_handle(v.document_id)})
     if cx is not None and cx.multi:
-        _mark(s, cx, cx.spanned(min(indexes), max(indexes)))
+        _mark(s, cx, cx.spanned(min(indexes), max(indexes)), ws)
         note = _note_once(ws, v.document_id, cx)
         if note:
             s.body = "\n".join([s.body.split("\n", 1)[0], note, *s.body.split("\n", 1)[1:]])
@@ -1489,7 +1610,7 @@ def _read_table(ws: Workspace, conn: Connection, v: reader.Version, table_index:
                       body="\n".join(head) + "\n" + sent,
                       tags={"document": ws.doc_handle(v.document_id),
                             "table": _table_handle(ws, v.document_id, vid, v.reading_id, table_index)})
-    _mark(s, cx, numbers)
+    _mark(s, cx, numbers, ws)
     ws.once(s, ("read", target, row0))
     ws.touch(v.document_id, v.title, "read", v.partial, {"sid": s.sid, "scope": "table", "name": name,
                                                          "target": target})
@@ -1605,11 +1726,16 @@ def tool_read(ws: Workspace, target: dict) -> str:
             raise ToolError(f"{value} הוא מסמך: את המבנה שלו פותחים ב-outline, ועמודים ב-pages")
     elif not isinstance(value, dict):
         raise ToolError("pages חייב לכלול document, from_page ו-to_page")
+    note = ""
     with tenant_tx(ws.ctx) as conn:
         if kind == "source":
             s = _read_source(ws, conn, value)
         elif kind == "pages":
-            v = _document(conn, ws, value.get("document"))
+            by_unit = str(value.get("document") or "").strip()
+            if (ws.handles.get(by_unit) or {}).get("kind") == "U":  # the pages of a unit (U#), within the unit
+                v, ucx, number = _unit_of(conn, ws, by_unit)
+            else:
+                v, ucx, number = _document(conn, ws, value.get("document")), None, None
             try:
                 first, last = int(value["from_page"]), int(value["to_page"])
             except (KeyError, TypeError, ValueError):
@@ -1620,6 +1746,8 @@ def tool_read(ws: Workspace, target: dict) -> str:
                 raise ToolError("למסמך הזה אין עמודים (DOCX): פותחים בו סעיף מתוך outline")
             if v.page_count and first > v.page_count:
                 raise ToolError(f"למסמך יש {v.page_count} עמודים")
+            if ucx is not None and ucx.multi:
+                first, last, note = _within_unit(ucx, number, by_unit, first, last)
             last = min(last, v.page_count or last, first + PAGES_MAX - 1)
             s = _read_window(ws, conn, v, ("pages", str(v.version_id), first, last), None)
         elif kind == "section":
@@ -1639,7 +1767,26 @@ def tool_read(ws: Workspace, target: dict) -> str:
                 s = _read_table(ws, conn, v, data["target"][2], data["pos"])
             else:
                 s = _read_window(ws, conn, v, data["target"], data["pos"])
-    return _render_source(s)
+    return _render_source(s) + (f"\n\n{note}" if note else "")
+
+
+MSG_PAGES_OUTSIDE = "העמודים {first}–{last} אינם ביחידה {unit} ({pages}): לא נפתח דבר. פתח עמודים ביחידה, או את המסמך (D#)."
+MSG_PAGES_CLAMPED = "הטווח נחתך לעמודי היחידה {unit} ({pages}): העמודים שמחוץ לה לא נפתחו."
+
+
+def _within_unit(cx, number: int, handle: str, first: int, last: int) -> tuple[int, int, str]:
+    """A page range cut to the pages of a unit (with the neighbour its probable edge reaches over), and what to say
+    when it was cut; a range wholly outside it is refused."""
+    reach = cx.reach(number)
+    lo, hi = reach.first_page, reach.last_page
+    if lo is None or hi is None:
+        return first, last, ""
+    pages = _pages_label(list(range(lo, hi + 1)))
+    unit = f"{handle} «{_txt(cx.label(number))}»"
+    if last < lo or first > hi:
+        raise ToolError(MSG_PAGES_OUTSIDE.format(first=first, last=last, unit=unit, pages=pages))
+    cut = (max(first, lo), min(last, hi))
+    return cut[0], cut[1], MSG_PAGES_CLAMPED.format(unit=unit, pages=pages) if cut != (first, last) else ""
 
 
 def _paginate(page, total: int, size: int) -> tuple[int, int]:
@@ -1746,19 +1893,46 @@ def _unread_listing(ws: Workspace, words: list[str]) -> str:
     return f"\n\n{block}" if block else ""
 
 
+MSG_UNITS_LISTED = "יחידות שמכילות את כל המונחים בקבצים של כמה שומות (U# נבחר ב-search, outline ו-read):"
+MSG_SEVERAL_UNITS = ("כמה יחידות מתאימות. אם השאלה אינה מכריעה ביניהן — שאל את המשתמש לאיזו התכוון, ופרט כותרת, עמודים "
+                     "ומזהים; אל תבחר לפי מספר הקטעים שבהם המונחים מופיעים.")
+MSG_SPLIT_TERMS = ("המונחים מופיעים בקובץ «{title}» ({n} יחידות) אך ביחידות שונות: אין בו יחידה אחת שמכילה את כולם, "
+                   "ולכן אין בו התאמה. אפשר לשאול את המשתמש לאיזו שומה התכוון.")
+MSG_ONLY_COMPARABLE = ("בקובץ «{title}» המונחים מופיעים רק כנכס השוואה ב{label} ({pages}): זו אינה שומה של הנכס שנשאל "
+                       "עליו.")
+
+
+def _unit_detail(ws: Workspace, u: dict) -> str:
+    """A unit found by ``find_documents``: handle, title (or that it has none), kind, pages, identifiers, and why it
+    matched (a name the document states, or passages)."""
+    h = unit_handle_of(ws, u["document_id"], u["version_id"], u["reading_id"], u["unit_no"])
+    why = {"alias": "שם שכתוב במסמך", "file_title": "כותרת הקובץ"}.get(u["matched_by"], "קטעים ביחידה")
+    return (f'  - {h} | «{_txt(u["title"]) if u["title"] else MSG_NO_TITLE}» | {UNIT_KIND_WORDS.get(u["kind"], u["kind"])}'
+            f' | {_unit_page_text(u)}' + (f' | {_txt(" · ".join(u["identifiers"]))}' if u["identifiers"] else "")
+            + f" | קובץ: «{_txt(u['file_title'])}» | התאמה: {why}"
+            + (" | גבול לא ודאי" if u["certainty"] == "probable" else ""))
+
+
 def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> str:
     """The set a question is about: every visible document containing all the terms that define it (in its title
-    or text). The server keeps the whole set as the turn's scope; the model reads it a page at a time."""
-    from app.platform.search import _scope_terms, documents_matching
+    or text). The server keeps the whole set as the turn's scope; the model reads it a page at a time. A file of
+    several units matches by unit (KTD7, R11): the terms must all be inside one unit of it; its units that match are
+    listed with their pages and identifiers, and a property that appears only as a comparable is said to be one."""
+    from app.platform.search import _scope_terms, units_matching
 
     query = (query or "").strip()
     if len(query) < 2:
         raise ToolError("שאילתת תחום ריקה")
     with tenant_tx(ws.ctx) as conn:
-        found = documents_matching(conn, query)
+        matches = units_matching(conn, query)
         files = unread_matching(conn, query)
+    found = matches.documents
     ws.name_unread(files)
     block = unread_text.tool_block(files)
+    notes = [MSG_SPLIT_TERMS.format(title=_txt(d["title"]), n=d["units"]) for d in matches.split]
+    notes += [MSG_ONLY_COMPARABLE.format(title=_txt(u["file_title"]), label=_txt(u["title"] or MSG_NO_TITLE),
+                                         pages=_unit_page_text(u)) for u in matches.comparables]
+    extra = "".join(f"\n\n{n}" for n in notes) + (f"\n\n{block}" if block else "")
     total = len(found)
     page, pages = _paginate(page, total, SCOPE_PAGE)
     if ws.scope is None or ws.scope.get("query") != query:
@@ -1768,8 +1942,7 @@ def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> s
     for d in shown:
         ws.touch(d["document_id"], d["title"], "located")
     if not found:
-        return (f'לא נמצאו מסמכים שמכילים את כל המונחים של "{query}". אפשר לנסות מונחים אחרים או פחות מונחים.'
-                + (f"\n\n{block}" if block else ""))
+        return f'לא נמצאו מסמכים שמכילים את כל המונחים של "{query}". אפשר לנסות מונחים אחרים או פחות מונחים.' + extra
     n_terms = len(_scope_terms(query))
     in_title = sum(1 for d in found if len(d["in_title"]) == n_terms)
     lines = [f'תחום: מסמכים שמכילים את כל המונחים "{_txt(query)}" (בכותרת או בתוכן)',
@@ -1786,28 +1959,79 @@ def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> s
                      + "; ".join(why))
     if page < pages:
         lines.append(f"הרשימה חלקית: זה עמוד {page} מתוך {pages}.")
-    return _listing(ws, f'מסמכים בתחום "{query}"', lines, [(d["document_id"], d["title"]) for d in shown],
-                    key=("find_documents", query), criterion=f'מסמכים שמכילים את כל המונחים "{query}"', total=total,
-                    page=page, pages=pages) + (f"\n\n{block}" if block else "")
+    out = _listing(ws, f'מסמכים בתחום "{query}"', lines, [(d["document_id"], d["title"]) for d in shown],
+                   key=("find_documents", query), criterion=f'מסמכים שמכילים את כל המונחים "{query}"', total=total,
+                   page=page, pages=pages)
+    # the units are beside the listing, not in it: a count over the set cites the documents, never a page number
+    units = [u for d in shown for u in d["units"]]
+    if units:
+        out += "\n\n" + "\n".join([MSG_UNITS_LISTED, *(_unit_detail(ws, u) for u in units)]
+                                    + ([MSG_SEVERAL_UNITS] if len(units) > 1 else []))
+    return out + extra
+
+
+def _unit_page_text(u: dict) -> str:
+    first, last = u["page_first"], u["page_last"]
+    return "עמוד ?" if first is None else f"עמוד {first}" if first == last else f"עמודים {first}–{last}"
 
 
 OUTLINE_MAX = 150  # sections listed in one outline
+OUTLINE_INLINE_UNITS = 3  # a file of at most this many units is outlined whole; a larger one by unit (R15)
+UNIT_KIND_WORDS = {"appraisal": "שומה", "appendix": "נספח", "comparables": "עסקאות השוואה", "front_matter": "פתיח",
+                   "document": "מסמך"}
+MSG_UNITS_HEAD = "יחידות בקובץ (כל שומה או נספח הם יחידה; סעיפים נפתחים לפי יחידה):"
+MSG_UNITS_CHOOSE = ("הקובץ כולל {n} יחידות: סעיפי יחידה ממפה את outline עם unit=U# (או document=U#); חיפוש ביחידה — "
+                    "search עם unit=U#; עמודים ביחידה — read עם pages ו-document=U#.")
+MSG_UNIT_EDGE = "גבול לא ודאי (נקבע על סמך סימן אחד): קריאה וחיפוש ביחידה מגיעים עד הגבול הוודאי הבא"
 
 
-def tool_outline(ws: Workspace, document: str) -> str:
+def _unit_line(ws: Workspace, cx, number: int, document_id) -> str:
+    """One line per unit for the outline: the context as everywhere else (number, label, pages), its handle and stable
+    id, its kind, and whether its opening edge is certain."""
+    seg = next(x for x in cx.segments if x.number == number)
+    edge = f" | {MSG_UNIT_EDGE}" if seg.certainty == "probable" else ""
+    title = "" if seg.title else f" ({MSG_NO_TITLE})"
+    return (f"{cx.describe(number)}{title} | {unit_handle(ws, cx, number, document_id)} unit_id={cx.key(number)} | "
+            f"{UNIT_KIND_WORDS.get(seg.kind, seg.kind)}{edge}")
+
+
+MSG_NO_TITLE = "ללא כותרת"
+
+
+def tool_outline(ws: Workspace, document: str, unit: str | None = None) -> str:
     """A document's sections (sub-sections included) and tables as handles ``read`` opens, each with its pages,
-    its size and its unread regions."""
+    its size and its unread regions. A file of several units lists them (U#) first; with ``unit`` (or a U# as the
+    document) only that unit's sections and tables are listed (KTD7, R15), so a long file is never cut at
+    ``OUTLINE_MAX``; a file of more than ``OUTLINE_INLINE_UNITS`` units lists only its units until one is chosen."""
     with tenant_tx(ws.ctx) as conn:
-        v = _document(conn, ws, document)
-        cx = contexts_of(ws, conn, v.version_id, v.reading_id)
-        sections, tables = reader.outline(conn, v.version_id, cx)
+        ref = str(document or "").strip()
+        by_unit = unit or (ref if (ws.handles.get(ref) or {}).get("kind") == "U" else None)
+        if by_unit:
+            v, cx, number = _unit_of(conn, ws, by_unit)
+            named = (ws.handles.get(ref) or {}).get("document_id", ref) if ref and ref != by_unit else ""
+            if named and named != str(v.document_id):  # a document and a unit of another one
+                raise ToolError(MSG_UNIT_ARGS)
+        else:
+            v = _document(conn, ws, document)
+            cx, number = contexts_of(ws, conn, v.version_id, v.reading_id), None
+        whole_units = cx.multi and number is None
+        sections, tables = reader.outline(conn, v.version_id, cx) if not (
+            whole_units and len(cx.numbers) > OUTLINE_INLINE_UNITS) else ([], [])
+    if number is not None and cx.multi:
+        sections = [e for e in sections if e.context == number]
+        tables = [t for t in tables if any(g["context"] == number for g in t["contexts"])]
     ws.touch(v.document_id, v.title, "located", v.partial)
     d = ws.doc_handle(v.document_id)
     head = (f'מבנה המסמך "{_txt(v.title)}" ({d}; ' + (f"{v.page_count} עמודים; " if v.page_count else "")
             + f"גרסה {v.version_id}; קריאה {_txt(v.reading_id or '')}):")
-    if not sections:
-        return head + "\nלמסמך לא נשמרו קטעים לפי מבנה; אפשר לחפש בו (search עם document_ids)."
     out = [head]
+    if cx.multi and number is not None:
+        out.append(f"סעיפי היחידה {unit_handle(ws, cx, number, v.document_id)} בלבד:")
+    elif whole_units and len(cx.numbers) > OUTLINE_INLINE_UNITS:
+        return "\n".join([*out, MSG_UNITS_HEAD, *(_unit_line(ws, cx, n, v.document_id) for n in cx.numbers),
+                          MSG_UNITS_CHOOSE.format(n=len(cx.numbers))])
+    if not sections:
+        return "\n".join(out) + "\nלמסמך לא נשמרו קטעים לפי מבנה; אפשר לחפש בו (search עם document_ids)."
     if v.partial:
         out.append("המסמך נקרא חלקית: בסעיפים שמסומנים בהם אזורים שלא נקראו ייתכן מידע שלא נקרא.")
     if cx.multi:  # a file holding several appraisals: each context's sections apart (KTD7)
@@ -1817,7 +2041,7 @@ def tool_outline(ws: Workspace, document: str) -> str:
     for e in sections[:OUTLINE_MAX]:
         seg = cx.segment_at(e.first) if e.context is not None else None
         if seg is not None and seg is not shown:
-            out.append(cx.describe(e.context))
+            out.append(_unit_line(ws, cx, e.context, v.document_id))  # the context as before, with its handle
             shown = seg
         h = _section_handle(ws, v, e.path, e.window)
         extra = (f", {e.unread} אזורים שלא נקראו" if e.unread else "") + (
@@ -3364,7 +3588,8 @@ def _take_cached(ws: Workspace, handle: str, data: dict, loc: dict, given: dict,
     _mark(src, cx, [number] if number else [])
     stub = doc.get("anchor")
     if stub:
-        ws.anchors[value.vid] = dict(stub) | {"reading_id": value.reading_id}
+        ws.anchors[value.vid] = dict(stub) | {"reading_id": value.reading_id} | (
+            {"unit": src.unit} if src.unit else {})
     return _value_report(ws, value, settled[3], MSG_CACHED_TAKEN.format(handle=handle), _context_lines(ws, cx, value))
 
 
@@ -3794,11 +4019,16 @@ def _fn(name: str, description: str, properties: dict, required: list[str]) -> d
 _NULLABLE_IDS = {"type": ["array", "null"], "items": {"type": "string"}}
 
 TOOLS = [
-    _fn("search", "חיפוש קטעים במסמכי המשרד (טקסט, טבלאות, שורות טבלה וטקסט מתוך תמונות). מחזיר מקורות S#.",
+    _fn("search",
+        "חיפוש קטעים במסמכי המשרד (טקסט, טבלאות, שורות טבלה וטקסט מתוך תמונות). מחזיר מקורות S#. קובץ אחד יכול להכיל "
+        "כמה שומות או נספחים — יחידות (U#, מ-find_documents או outline): כשהשאלה על יחידה אחת, חפש בתוכה עם unit, ולא "
+        "בכל הקובץ. תוצאה בקובץ של כמה יחידות מציינת את היחידה שהיא בה (unit_id).",
         {"query": {"type": "string", "description": "שאילתה בעברית, במילים שעשויות להופיע במסמך"},
          "document_ids": {**_NULLABLE_IDS, "description": "הגבלה למסמכים מסוימים, או null לכל המאגר"},
-         "limit": {"type": ["integer", "null"], "description": "מספר תוצאות (3-12), null לברירת מחדל"}},
-        ["query", "document_ids", "limit"]),
+         "limit": {"type": ["integer", "null"], "description": "מספר תוצאות (3-12), null לברירת מחדל"},
+         "unit": {"type": ["string", "null"],
+                  "description": "U# של יחידה: חיפוש רק בתוכה (ללא document_ids), או null"}},
+        ["query", "document_ids", "limit", "unit"]),
     _fn("read",
         "פתיחת מקום במסמך בלי צורך בחיפוש קודם. בוחרים מיקום אחד בדיוק ב-target (השאר null): source — S# מהתור הזה "
         "או P# מתור קודם (הפסקאות סביבו; קטע מטבלה — הטבלה כולה); pages — עמודים של מסמך PDF; section — סעיף §# "
@@ -3811,7 +4041,9 @@ TOOLS = [
                         "source": {"type": ["string", "null"], "description": "S# או P#"},
                         "pages": {"type": ["object", "null"], "additionalProperties": False,
                                   "required": ["document", "from_page", "to_page"],
-                                  "properties": {"document": {"type": "string", "description": "D# או document_id"},
+                                  "properties": {"document": {"type": "string",
+                                                              "description": "D# או document_id; U# של יחידה — "
+                                                                             "העמודים בתוכה בלבד"},
                                                  "from_page": {"type": "integer"}, "to_page": {"type": "integer"}}},
                         "section": {"type": ["string", "null"], "description": "§# מ-outline"},
                         "table": {"type": ["string", "null"], "description": "T# מ-outline או מתוצאת חיפוש"},
@@ -3819,15 +4051,21 @@ TOOLS = [
         ["target"]),
     _fn("find_documents",
         "התחום של שאלה על קבוצת מסמכים (סקירה, השוואה, רשימה או חישוב על כמה מסמכים; שאלה \"בעיר/באזור X\"): כל "
-        "המסמכים שמכילים את כל המונחים שמגדירים את הקבוצה, בכותרת או בתוכן. מחזיר את כולם בעמודים, עם הסך הכול.",
+        "המסמכים שמכילים את כל המונחים שמגדירים את הקבוצה, בכותרת או בתוכן. מחזיר את כולם בעמודים, עם הסך הכול. בקובץ "
+        "של כמה שומות ההתאמה היא ליחידה אחת: המונחים כולם חייבים להיות באותה שומה, והיחידות שמתאימות מוחזרות (U#) עם "
+        "כותרת, עמודים ומזהים; נכס שמופיע רק כנכס השוואה מוגדר ככזה ואינו שומה.",
         {"query": {"type": "string", "description": "רק המונחים שמגדירים את הקבוצה (מקום, סוג מסמך) — לא המדד"},
          "page": {"type": ["integer", "null"], "description": "מספר עמוד, null לראשון"}},
         ["query", "page"]),
     _fn("list_documents", "רשימת המסמכים הזמינים למשתמש, עם מצב הקריאה שלהם, בעמודים. אפשר לסנן לפי מילים בכותרת.",
         {"query": {"type": ["string", "null"], "description": "מילים בכותרת, או null לכל המסמכים"},
          "page": {"type": ["integer", "null"], "description": "מספר עמוד, null לראשון"}}, ["query", "page"]),
-    _fn("outline", "מבנה מסמך: סעיפים (§#) וטבלאות (T#) שאפשר לפתוח ב-read, עם עמודים, גודל ואזורים שלא נקראו.",
-        {"document": {"type": "string", "description": "D# או document_id"}}, ["document"]),
+    _fn("outline",
+        "מבנה מסמך: סעיפים (§#) וטבלאות (T#) שאפשר לפתוח ב-read, עם עמודים, גודל ואזורים שלא נקראו. קובץ של כמה "
+        "שומות מציג קודם את יחידותיו (U#, עם כותרת, עמודים ומזהים); את הסעיפים של יחידה אחת מקבלים עם unit.",
+        {"document": {"type": "string", "description": "D# או document_id (או U# של יחידה)"},
+         "unit": {"type": ["string", "null"], "description": "U# של יחידה: הסעיפים והטבלאות שלה בלבד, או null"}},
+        ["document", "unit"]),
     _fn("find_measurements",
         "נתונים כמותיים שחולצו מהמסמכים עם משמעותם (סוג מדד, יחידה, תקופה, בסיס שטח, מע\"מ, תפקיד, נושא), מקובצים "
         "לפי מה שניתן להשוות, עם כיסוי המסמכים. מחזיר מזהי M# לחישוב, ולצדם ערכים שאומתו בתורות קודמים (Q#) "
@@ -3909,11 +4147,12 @@ TOOLS = [
 ]
 
 HANDLERS = {
-    "search": lambda ws, a: tool_search(ws, a["query"], a.get("document_ids"), a.get("limit")),
+    "search": lambda ws, a: tool_search(ws, a["query"], a.get("document_ids"), a.get("limit"), a.get("unit")),
     "read": lambda ws, a: tool_read(ws, a["target"]),
     "find_documents": lambda ws, a: tool_find_documents(ws, a["query"], a.get("page")),
     "list_documents": lambda ws, a: tool_list_documents(ws, a.get("query"), a.get("page")),
-    "outline": lambda ws, a: tool_outline(ws, a.get("document") or a.get("document_id")),
+    "outline": lambda ws, a: tool_outline(ws, a.get("document") or a.get("document_id") or a.get("unit"),
+                                          a.get("unit")),
     "find_measurements": lambda ws, a: tool_find_measurements(ws, a["query"], a.get("metric_kinds"),
                                                               a.get("document_ids"), a.get("value_roles"),
                                                               a.get("page")),

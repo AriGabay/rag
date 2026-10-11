@@ -1,6 +1,7 @@
 // Display formatting. Decimal strings are formatted directly (Intl accepts exact numeric strings),
 // so no float arithmetic touches money or area. Nothing here aggregates values.
 
+import type { ChatUnit } from "./chatTypes";
 import type {
   AbstentionKind,
   ClaimKind,
@@ -11,6 +12,14 @@ import type {
   ProviderStatus,
   VersionStatus,
 } from "./types";
+
+/** A unit beside its file name: its title (or that it has none) and its pages, e.g. "מתחם הגפן א · עמוד 1". */
+export function unitLabel(unit: ChatUnit | null | undefined): string {
+  if (!unit) return "";
+  const [first, last] = unit.pages;
+  const pages = first == null ? "" : first === last || last == null ? `עמוד ${first}` : `עמודים ${first}–${last}`;
+  return [unit.title || "ללא כותרת", pages].filter(Boolean).join(" · ");
+}
 
 const DECIMAL_RE = /^[-+]?\d+(\.\d+)?$/;
 

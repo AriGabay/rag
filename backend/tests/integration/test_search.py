@@ -1,6 +1,6 @@
 """Hybrid retrieval with Hebrew normalization and authorization (U9)."""
 
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import text
@@ -983,3 +983,113 @@ def test_the_search_tool_repeats_no_search_for_an_identical_call_in_a_turn(offic
         bump_data_version(conn)
     T.tool_search(ws, "היטל השבחה", None, 4)
     assert searched == ["היטל השבחה"] * 2
+
+
+# --- round 9 U9: units, the second level of retrieval (KTD7; R10–R13; AE2, AE3) ----------------------------------------
+
+def _compendium(office, group, **kw):
+    """Three appraisals and an appendix of comparables in one file; the second appraisal states no name (its
+    project is named only in its passages); a property that is a comparable in the third appraisal's table is the
+    second appraisal's project. Every name and figure is invented."""
+    from tests.support.unit_files import unit_file
+
+    return unit_file(office, group, "קובץ מרוכז סינתטי", [
+        {"title": "פרויקט שדרות האלון", "aliases": ["שדרות האלון", "האלון"], "identifiers": ["שדרות האלון 14"],
+         "blocks": ["פרויקט שדרות האלון", "הנכס הוא בניין משרדים בשטח 5,200 מ״ר.", "שווי הנכס הוא 14,850,000 ₪."]},
+        {"kind": "appraisal", "certainty": kw.get("second_certainty", "certain"),
+         "blocks": ["שומת מגדל הים", "הנכס מגדל הים הוא בניין מגורים בשטח 640 מ״ר.", "שווי מגדל הים הוא 11,776,000 ₪.",
+                    "מגדל הים נמצא בסמוך לים."]},
+        {"title": "פרויקט נחל הדס", "aliases": ["נחל הדס", "הדס"],
+         "blocks": ["פרויקט נחל הדס", "שווי הנכס הוא 9,430,000 ₪.", "|עסקת השוואה: מגדל הים 6,900,000 ₪"]},
+        {"kind": "appendix", "title": "נספח: עסקאות השוואה",
+         "blocks": ["נספח: עסקאות השוואה", "|בית השקד 4,413,000 ₪", "|מגדל הים 6,900,000 ₪"]},
+    ], sha=kw.get("sha", "c" * 64), chunks=kw.get("chunks"))
+
+
+@pytest.fixture
+def compendium(db):
+    a = make_office(db, "משרד א", "a@example.test")
+    a.doc, a.ver = _compendium(a, a.default_group_id)
+    return a
+
+
+def _matches(office, query):
+    from app.platform.search import units_matching
+
+    with tenant_tx(office.ctx()) as conn:
+        return units_matching(conn, query)
+
+
+def test_a_unit_is_found_by_the_name_the_document_states_and_nothing_else_is_a_candidate(compendium):
+    m = _matches(compendium, "נחל הדס")
+    (doc,) = m.documents
+    assert [u["unit_no"] for u in doc["units"]] == [3] and doc["units"][0]["matched_by"] == "alias"
+    assert doc["units"][0]["identifiers"] == [] and doc["units"][0]["page_first"] == 3
+    assert m.split == [] and m.comparables == []
+
+
+def test_terms_split_between_two_units_match_no_unit(compendium):
+    """AE3: one term in the first appraisal, the other in the third; the file holds both, no appraisal does."""
+    from app.platform.search import documents_matching
+
+    m = _matches(compendium, "האלון נחל הדס")
+    assert m.documents == [] and [s["title"] for s in m.split] == ["קובץ מרוכז סינתטי"]
+    with tenant_tx(compendium.ctx()) as conn:
+        assert [str(d["document_id"]) for d in documents_matching(conn, "האלון נחל הדס")] == [compendium.doc]
+
+
+def test_a_unit_that_states_no_name_is_found_by_its_passages_inside_its_blocks(compendium):
+    m = _matches(compendium, "מגדל הים שווי")
+    (doc,) = m.documents
+    assert [(u["unit_no"], u["matched_by"]) for u in doc["units"]] == [(2, "passage")]
+
+
+def test_a_property_named_only_in_a_comparison_table_is_a_comparable_never_an_appraisal(compendium):
+    # the appendix names "בית השקד"; the third appraisal's table names "מגדל הים" beside prose of the second
+    m = _matches(compendium, "בית השקד")
+    assert m.documents == [] and [(u["unit_no"], u["kind"]) for u in m.comparables] == [(4, "appendix")]
+    m = _matches(compendium, "מגדל הים עסקת השוואה")
+    assert {u["unit_no"] for d in m.documents for u in d["units"]} == set()
+    assert {u["unit_no"] for u in m.comparables} == {3}  # a comparable in the third appraisal; the second is no table
+    both = _matches(compendium, "מגדל הים")
+    assert [u["unit_no"] for u in both.units] == [2]  # the prose of the second appraisal holds it
+    assert {u["unit_no"] for u in both.comparables} == {3, 4}
+
+
+def test_a_chunk_that_runs_into_the_next_unit_gives_the_next_unit_only_its_own_blocks(db):
+    """The closing chapter of the first appraisal runs on into the second's title block (blocks 2-4 are one chunk):
+    the title is the second appraisal's, the chapter's words are the first's."""
+    a = make_office(db, "משרד א", "a@example.test")
+    _compendium(a, a.default_group_id, chunks=[(2, 3)])  # block 2 closes unit 1; block 3 opens unit 2
+    m = _matches(a, "האלון שומת")
+    assert m.documents == [] and len(m.split) == 1
+    m = _matches(a, "שווי הנכס 14,850,000")
+    assert [u["unit_no"] for u in m.units] == [1]  # the chunk begins in, and holds a block of, the first unit
+
+
+def test_a_unit_scope_searches_only_the_chunks_that_begin_inside_its_blocks(compendium):
+    from app.platform.search import SearchScope
+
+    with tenant_tx(compendium.ctx()) as conn:
+        from app.chat import units as unit_store
+
+        u2 = unit_store.ensure(conn, compendium.ver)[1]
+        scoped = hybrid_search(conn, "שווי", 12, scope=SearchScope(version_ids=(UUID(compendium.ver),),
+                                                                    blocks=(u2.block_first, u2.block_last)))
+        whole = hybrid_search(conn, "שווי", 12, scope=SearchScope(version_ids=(UUID(compendium.ver),)))
+    assert scoped and {h["page_list"][0] for h in scoped} == {2}  # each unit is a page of its own here
+    assert {h["page_list"][0] for h in whole} > {2}
+
+
+def test_units_of_a_group_the_user_cannot_see_are_never_candidates(db):
+    a = make_office(db, "משרד א", "a@example.test")
+    g2 = make_group(a, "קבוצה 2")
+    emp = make_user(a, "e@example.test", [a.default_group_id])
+    _compendium(a, g2)
+    ctx = TenantContext(a.office_id, emp, "employee")
+    with tenant_tx(ctx) as conn:
+        from app.platform.search import units_matching
+
+        m = units_matching(conn, "נחל הדס")
+    assert m.documents == [] and m.comparables == [] and m.split == []
+    assert [d for d in _matches(a, "נחל הדס").documents] != []

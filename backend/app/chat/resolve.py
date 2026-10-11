@@ -202,6 +202,9 @@ class Request:
     entity_changed: bool = False  # the documents are the ones the user's words named, not the focus's
     server_clarify: bool = False  # the clarification is the server's (titles the user may see, the user's words)
     candidates: list[dict] = field(default_factory=list)  # the documents a server clarification named
+    # the unit of a file of several that the user's words selected (``unit`` is the datum's measure unit here) (``entities.unit_anchor``: file, reading, normalized
+    # title and aliases, first printed page label, identifiers); U10 carries it in the conversation's focus
+    located_unit: dict | None = None
     resolution: dict = field(default_factory=dict)  # the raw parse and the server's decisions (diagnostics)
     # the request's frozen components (``request.freeze``), or None, with why: ok, empty, invalid
     components: list[dict] | None = None
@@ -212,7 +215,7 @@ class Request:
                 "unit": self.unit, "period": self.period, "area_basis": self.area_basis, "vat": self.vat,
                 "subject": self.subject, "document_ids": list(self.document_ids), "changed": list(self.changed),
                 "rejected": list(self.rejected), "relation": self.relation, "scope": self.scope,
-                "approved": list(self.approved), "candidates": list(self.candidates)}
+                "approved": list(self.approved), "candidates": list(self.candidates), "located_unit": self.located_unit}
 
     @property
     def per_area(self) -> bool | None:
@@ -278,16 +281,29 @@ def _scale_of(resolved: ResolvedRequest) -> bool | None:
 
 
 def _clarify_titles(outcome: entities.Outcome, words: str) -> str:
+    """The server's question between candidates: documents by title; units by title, pages, identifiers and file, in the
+    order of how well their names fit the words (round 9 U9, R13)."""
+    if any(d.unit for d in outcome.documents):
+        names = "\n".join(f"{n}. {prompt_text(entities.candidate_label(d.as_dict()))}"
+                          for n, d in enumerate(outcome.documents, 1))
+        return (f"נמצאו כמה שומות שמתאימות ל\"{prompt_text(words)}\":\n{names}\nלאיזו מהן התכוונת? "
+                "אפשר לענות במספר, או במילה שמבדילה ביניהן.")
     names = "; ".join(f"«{prompt_text(d.title)}»" for d in outcome.documents)
     return f"נמצאו כמה מסמכים שמתאימים ל\"{prompt_text(words)}\": {names}. לאיזה מהם התכוונת?"
 
 
-def _clarify_missing(words: str, files: list[dict] | None = None) -> str:
+MSG_SPLIT = ("המילים \"{words}\" מופיעות בקובץ «{title}» אך בשומות שונות שבו: אף שומה אחת אינה מכילה את כולן. לאיזו "
+             "שומה התכוונת?")
+
+
+def _clarify_missing(words: str, files: list[dict] | None = None, split: list[dict] | None = None) -> str:
     """The server's question when no readable document is named. Files the user may see that were not read are listed
     as not checked (R5): the words may name something held only in them, so the message never says it is absent."""
     asked = (f"לא מצאתי במסמכים שאתה מורשה לראות מסמך על \"{prompt_text(words)}\". לאיזה נכס או מסמך התכוונת?"
              if words.strip() else
              "לא מצאתי במסמכים שאתה מורשה לראות את הנכס שציינת. לאיזה נכס או מסמך התכוונת?")
+    if split:  # the words are in one file, in different appraisals: nothing was found that holds them together (R11)
+        asked = "\n".join(MSG_SPLIT.format(words=prompt_text(words), title=prompt_text(d["title"])) for d in split)
     listing, _ = unread.notice(files or [], words)
     return f"{asked}\n\n{listing}" if listing else asked
 
@@ -460,6 +476,7 @@ def _take(out: Request, outcome: entities.Outcome, words: str, decisions: dict,
     if outcome.kind == "resolved":
         out.document_ids = [d.document_id for d in outcome.documents]
         out.entity_changed = set(out.document_ids) != set(focus_ids or ())
+        out.located_unit = outcome.documents[0].unit if len(outcome.documents) == 1 else None  # the unit chosen (KTD8)
         return
     out.entity_changed = True
     out.document_ids, out.server_clarify = [], True
@@ -470,7 +487,7 @@ def _take(out: Request, outcome: entities.Outcome, words: str, decisions: dict,
         return
     out.candidates = [d.as_dict() for d in outcome.documents]
     out.clarify = (_clarify_titles(outcome, words) if outcome.kind == "ambiguous"
-                   else _clarify_missing(words, outcome.unread))
+                   else _clarify_missing(words, outcome.unread, outcome.split))
     if outcome.kind == "not_found":
         out.subject = ""
 
@@ -494,7 +511,7 @@ def _input(focus: dict | None, history: list, message: str, documents: list[dict
             f"- {d['document_id']} | {prompt_text(d['title'])}" for d in documents))
     if candidates:
         parts.append("בתור הקודם נשאלה שאלת הבהרה בין המסמכים האלה:\n" + "\n".join(
-            f"- {prompt_text(c['title'])}" for c in candidates))
+            f"- {prompt_text(entities.candidate_label(c))}" for c in candidates))
     if history:
         lines = [f"{'משתמש' if m.role == 'user' else 'עוזר'}: {prompt_text(m.content[:400])}" for m in history[-4:]]
         parts.append("ההודעות האחרונות:\n" + "\n".join(lines))
