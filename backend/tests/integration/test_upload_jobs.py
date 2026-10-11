@@ -249,3 +249,76 @@ def test_exhausted_job_with_dead_worker_fails_instead_of_looping(client, office)
         version = conn.execute(text("SELECT status, status_reason FROM document_versions WHERE id = :v"),
                                {"v": res["version_id"]}).one()
     assert version.status == "failed" and "מחדש" in version.status_reason
+
+
+# --- a reading that stops at a boundary because its time is spent (KTD2, U4) -------------------------------------
+
+def _version_and_job(a, version_id):
+    with tenant_tx(a.ctx()) as conn:
+        v = conn.execute(text("SELECT status, status_reason FROM document_versions WHERE id = :v"),
+                         {"v": version_id}).one()
+        j = conn.execute(text("SELECT status, attempts, last_error FROM jobs WHERE version_id = :v"),
+                         {"v": version_id}).one()
+    return v, j
+
+
+def test_a_paused_job_is_queued_again_and_only_one_that_made_progress_keeps_its_attempt(client, office, monkeypatch):
+    from app.extraction.base import ExtractionPaused
+
+    a, _ = office
+    login(client, "admin-a@example.test")
+    res = upload(client, [("long.pdf", tiny_pdf("long"))], group_id=a.default_group_id).json()["results"][0]
+    pauses = [True, False]  # the first run finished a window, the second finished none
+
+    class Pausing(FakeExtractor):
+        def extract(self, data, mime_type, deadline):
+            if pauses:
+                raise ExtractionPaused(pauses.pop(0))
+            return super().extract(data, mime_type, deadline)
+
+    monkeypatch.setattr("app.extraction.pipeline.get_extractor", lambda: Pausing(), raising=False)
+    worker.run_one("w")
+    v, j = _version_and_job(a, res["version_id"])
+    assert (j.status, j.attempts, v.status) == ("queued", 0, "processing")  # not a failure, no attempt used
+    worker.run_one("w")
+    v, j = _version_and_job(a, res["version_id"])
+    assert (j.status, j.attempts, v.status) == ("queued", 1, "pending")  # no progress: it counts
+    with tenant_tx(a.ctx()) as conn:
+        conn.execute(text("UPDATE jobs SET run_after = now()"))
+    worker.run_one("w")
+    v, j = _version_and_job(a, res["version_id"])
+    assert (j.status, j.attempts, v.status) == ("done", 2, "ready")
+
+
+def test_a_reading_that_never_advances_ends_failed_with_the_time_limit_as_its_reason(client, office, monkeypatch):
+    from app.extraction.base import MSG_DEADLINE, ExtractionPaused
+
+    a, _ = office
+    login(client, "admin-a@example.test")
+    res = upload(client, [("stuck.pdf", tiny_pdf("stuck"))], group_id=a.default_group_id).json()["results"][0]
+
+    class Stuck(FakeExtractor):
+        def extract(self, data, mime_type, deadline):
+            raise ExtractionPaused(False)
+
+    monkeypatch.setattr("app.extraction.pipeline.get_extractor", lambda: Stuck(), raising=False)
+    for _ in range(3):
+        worker.run_one("w")
+        with tenant_tx(a.ctx()) as conn:
+            conn.execute(text("UPDATE jobs SET run_after = now()"))
+    v, j = _version_and_job(a, res["version_id"])
+    assert (j.status, j.attempts) == ("failed", 3) and v.status == "failed" and v.status_reason == MSG_DEADLINE
+    assert worker.run_one("w") is False
+
+
+def test_only_the_time_limit_and_a_page_limit_the_file_now_fits_are_retriable():
+    from app.extraction.base import MSG_DEADLINE, MSG_TOO_MANY_PAGES
+    from app.platform.jobs import retriable_failure
+
+    assert retriable_failure(MSG_DEADLINE, 2000)
+    assert retriable_failure(MSG_TOO_MANY_PAGES.format(n=412, limit=300), 2000)
+    assert retriable_failure(MSG_TOO_MANY_PAGES.format(n=719, limit=300), 2000)
+    assert not retriable_failure(MSG_TOO_MANY_PAGES.format(n=2500, limit=2000), 2000)  # still over the ceiling
+    for reason in (None, "", "הקובץ פגום או שאינו PDF תקין", "הקובץ מוגן בסיסמה ולא ניתן לעבד אותו",
+                   "העיבוד נכשל (3 ניסיונות). ניתן להעלות את הקובץ מחדש"):
+        assert not retriable_failure(reason, 2000)

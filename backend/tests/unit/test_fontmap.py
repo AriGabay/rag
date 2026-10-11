@@ -382,3 +382,34 @@ def test_extract_pdf_leaves_english_with_eth_and_clean_hebrew_unchanged(monkeypa
         assert comp["partial"] is False and "fontmap" not in comp and "uncertain" not in comp
     assert reader.calls == 0
     assert "Garðabær" in "\n".join(b.text for b in _extract(ENGLISH).blocks)
+
+
+# --- the same reading through a staging area (U4) --------------------------------------------------------------
+
+@pytest.mark.parametrize("path", [BROKEN, INCONSISTENT], ids=["repaired", "unverifiable"])
+def test_a_font_map_reading_through_the_staging_area_is_the_same_reading(path, monkeypatch, tmp_path):
+    """The corrected lines keep what the orientation step reads of them (their original text) across the staging
+    area, and the fix itself survives it: the staged reading equals the in-memory one."""
+    import dataclasses
+    import json
+    import time
+    import uuid
+
+    from app.config import get_settings
+    from app.extraction import pdf_windows
+    from app.platform.storage import LocalStorage
+
+    def canon(r):
+        return json.dumps([[dataclasses.asdict(x) for x in part] for part in (r.pages, r.blocks, r.tables, r.chunks)]
+                          + [r.fontmap, r.uncertain, r.components], ensure_ascii=False, sort_keys=True, default=str)
+
+    real = fontmap.detect_and_repair
+    monkeypatch.setattr(fontmap, "detect_and_repair",
+                        lambda words, pdf_doc=None, config=None, reader_=None: real(
+                            words, pdf_doc, config, CleanTwinReader(CLEAN)))
+    direct = _extract(path)
+    stage = pdf_windows.StorageStage(LocalStorage(tmp_path), uuid.uuid4(), uuid.uuid4(), "a" * 64)
+    staged = pdf_windows.read_pdf(path.read_bytes(), time.monotonic() + 600, get_settings(), stage=stage)
+    assert canon(staged) == canon(direct)
+    assert staged.fontmap and (staged.fontmap["corrections"] if path is BROKEN else staged.fontmap["unresolved"])
+    assert stage.state["reread_next"] == 1 and stage.state["fix"]["pages"] == [0]  # the page was read again

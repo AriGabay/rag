@@ -68,6 +68,29 @@ export const VERSION_STATUS_LABEL: Record<VersionStatus, string> = {
   superseded: "הוחלף בגרסה חדשה",
 };
 
+/** The stages of reading a document (``pdf_windows.STAGE_*``, ``pipeline.STAGE_*``), by the key the server reports. */
+export const INGEST_STAGE_LABEL: Record<string, string> = {
+  reading_pages: "קריאת עמודים",
+  checking_fonts: "בדיקת גופנים",
+  layout: "סידור כיווני הטקסט ומספרי העמודים",
+  reading_regions: "קריאת תמונות ואזורים",
+  assembling: "בניית מבנה המסמך",
+  saving: "שמירת הקריאה",
+  embedding: "בניית אינדקס החיפוש",
+  publishing: "פרסום המסמך",
+};
+
+/** What a version being processed shows (R3): nothing before it reports; the stage alone before the pages in the file
+ * are known; "pages read N of M" while pages are read; the stage name during the steps over the whole document. */
+export function ingestProgressText(p: { stage: string; pages_done: number | null; pages_total: number | null } | null | undefined): string | null {
+  if (!p || !p.stage) return null;
+  const stage = INGEST_STAGE_LABEL[p.stage] ?? p.stage;
+  if (p.stage === "reading_pages" && p.pages_total != null && p.pages_done != null) {
+    return `נקראו ${p.pages_done} מתוך ${p.pages_total} עמודים`;
+  }
+  return stage;
+}
+
 export function versionStatusLabel(status: string | null | undefined): string {
   if (!status) return "—";
   return VERSION_STATUS_LABEL[status as VersionStatus] ?? status;

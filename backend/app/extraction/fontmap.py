@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import NamedTuple, Protocol
 
@@ -210,7 +211,8 @@ def words_of_page(page, page_index: int) -> list[WordSample]:
     return out
 
 
-def detect(words: list[WordSample], config: FontMapConfig) -> Detection:
+def detect(words: Iterable[WordSample], config: FontMapConfig) -> Detection:
+    """Suspect pairs over a document's words, read once in order (a generator over a long file's windows works)."""
     fonts: dict[str, FontStats] = {}
     suspects: Counter = Counter()
     holding: dict[tuple[str, str], list[WordSample]] = {}
@@ -425,6 +427,26 @@ class FontMapFix:
         # moves them alike
         return visual_to_logical(raw_original)
 
+    def to_json(self) -> dict:
+        """Everything ``correct_page`` and ``report`` read, as JSON-able data (a staged reading keeps the fix between
+        job attempts). Order is kept: the report lists fonts, corrections and unresolved pairs in it."""
+        return {
+            "corrections": [[c.font, c.char, c.letter, c.final_letter, c.samples, c.agreement, c.occurrences,
+                             c.visual] for c in self.corrections.values()],
+            "unresolved": [[u.font, u.char, u.occurrences, u.samples, u.agreement, u.votes, u.reason]
+                           for u in self.unresolved.values()],
+            "fonts": [[f.font, f.hebrew_letters, dict(f.letters), dict(f.suspects), f.absent]
+                      for f in self.fonts.values()],
+            "pages": sorted(self.pages),
+        }
+
+    @classmethod
+    def from_json(cls, data: dict) -> FontMapFix:
+        corrections = {(c[0], c[1]): Correction(*c) for c in data["corrections"]}
+        unresolved = {(u[0], u[1]): Unresolved(*u) for u in data["unresolved"]}
+        fonts = {f[0]: FontStats(f[0], f[1], Counter(f[2]), Counter(f[3]), list(f[4])) for f in data["fonts"]}
+        return cls(corrections, unresolved, fonts, set(data["pages"]))
+
     def report(self) -> dict:
         """The record kept in the ingestion report: suspect fonts, accepted corrections, unresolved pairs."""
         return {
@@ -440,13 +462,13 @@ class FontMapFix:
         }
 
 
-def detect_and_repair(words: list[WordSample], pdf_doc=None, config: FontMapConfig | None = None,
+def detect_and_repair(words: Iterable[WordSample], pdf_doc=None, config: FontMapConfig | None = None,
                       reader: WordReader | None = None) -> FontMapFix:
     """Detect suspect ``font × character`` pairs in a document's words and verify each against its glyphs.
     ``reader`` reads a word from its glyphs; by default pdfium + Tesseract on ``pdf_doc`` when Tesseract has the
     configured languages. Without a reader every suspect pair stays unresolved."""
     config = config or FontMapConfig()
-    found = detect(list(words), config)
+    found = detect(words, config)
     if found.suspects and reader is None and pdf_doc is not None and ocr.ocr_available(config.ocr_languages):
         reader = OcrWordReader(pdf_doc, config)
     corrections: dict[tuple[str, str], Correction] = {}

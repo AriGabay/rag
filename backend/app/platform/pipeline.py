@@ -14,6 +14,13 @@ Stages run in the worker under the job's office with role ``system``:
 Every stage is idempotent, so a crashed job whose lease expired simply runs again. The version
 becomes ``ready``/``needs_review`` only in the publish transaction, never in between.
 
+A PDF is read in page windows through a staging area in file storage (KTD2, ``app.extraction.pdf_windows``), keyed by
+the version and a reading-attempt key (a hash of the file, the reader version and the window size) recorded in the
+version's ingestion report together with its progress (``pages_done``, ``pages_total``, ``stage``). Every job
+attempt of the same reading finds what the earlier ones finished. A job whose time is spent stops at a window or
+batch boundary (``ExtractionPaused``) and the worker queues it again; the staged files are deleted when the version
+is published, fails for good, is read under another key, or its document is deleted.
+
 Reprocessing a published version (``reindex_version``, KTD7) reads and embeds before any write, keeps the current
 reading when the new one is worse (``reading_regression``), and otherwise swaps the whole reading, with its
 embeddings and a new ``reading_id``, in one transaction. A reprocess that keeps the current reading ends its job as
@@ -23,6 +30,7 @@ action is needed.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import logging
@@ -42,7 +50,7 @@ from app.db import (  # noqa: F401 - system_ctx re-exported
     system_ctx,
     tenant_tx,
 )
-from app.extraction.base import Block, ExtractionError, ExtractionResult, check_deadline
+from app.extraction.base import Block, ExtractionError, ExtractionPaused, ExtractionResult, check_deadline
 from app.extraction.default import PDF_MIME
 from app.extraction.geometry import POSITIONS_VERSION
 from app.extraction.normalize_text import normalize_for_search, undouble_word
@@ -187,9 +195,10 @@ def _blocks_of(result: ExtractionResult) -> list[Block]:
     return blocks
 
 
-def persist_extraction(conn: Connection, info: VersionInfo, result: ExtractionResult) -> None:
+def persist_extraction(conn: Connection, info: VersionInfo, result: ExtractionResult,
+                       report_extra: dict | None = None) -> None:
     _delete_outputs(conn, info.id)
-    _insert_outputs(conn, info, result)
+    _insert_outputs(conn, info, result, report_extra=report_extra)
 
 
 def _page_params(g, printed_label: str | None) -> dict:
@@ -279,23 +288,108 @@ def _insert_outputs(conn: Connection, info: VersionInfo, result: ExtractionResul
     )
 
 
-def extract_stage(ctx: TenantContext, info: VersionInfo, deadline: float) -> None:
+STAGE_EMBEDDING = "embedding"
+STAGE_SAVING = "saving"
+STAGE_PUBLISHING = "publishing"
+
+
+def reading_attempt_key(info: VersionInfo) -> str:
+    """The key of one reading of a version's file: a hash of the file's sha256, the reader version and the window
+    size. Staged outputs are valid for exactly this key; a changed file, reader or window size starts a clean set."""
+    sha = info.storage_key.partition("/")[2]
+    return hashlib.sha256(f"{sha}:{PDF_INGESTION_VERSION}:{get_settings().ingest_window_pages}".encode()).hexdigest()
+
+
+def purge_staging(office_id: UUID, version_id: UUID) -> None:
+    """Delete everything staged for a version (a published, failed or deleted one). Best effort: staged files are
+    scratch, and a failure to delete them must not fail the job that is done with them."""
+    from app.platform.storage import get_storage, staging_prefix
+
+    try:
+        get_storage().delete_prefix(staging_prefix(office_id, version_id))
+    except (OSError, ValueError):
+        logger.warning("staged files of version %s were not deleted", version_id, exc_info=True)
+
+
+def record_progress(ctx: TenantContext, version_id: UUID, pages_done: int | None, pages_total: int | None,
+                    stage: str) -> None:
+    """Write the reading's progress to the version's ingestion report (what the documents screen shows)."""
+    values = {"stage": stage}
+    if pages_total is not None:
+        values |= {"pages_done": pages_done, "pages_total": pages_total}
+    with tenant_tx(ctx) as conn:
+        conn.execute(text("UPDATE document_versions SET ingestion = COALESCE(ingestion, '{}'::jsonb)"
+                          " || CAST(:p AS jsonb) WHERE id = :v"), {"p": json.dumps(values), "v": version_id})
+
+
+def _begin_reading(ctx: TenantContext, info: VersionInfo, key: str) -> dict:
+    """Record this reading's attempt key on the version and return its ingestion report. A report of another key
+    (a different file, reader or window size read before) is dropped with the files staged under that key."""
+    with tenant_tx(ctx) as conn:
+        row = conn.execute(text("SELECT ingestion FROM document_versions WHERE id = :v FOR UPDATE"),
+                           {"v": info.id}).first()
+        ing = (row.ingestion if row is not None else None) or {}
+        if ing.get("reading_attempt") == key:
+            return ing
+        conn.execute(text("UPDATE document_versions SET ingestion = jsonb_build_object('reading_attempt', CAST(:k AS"
+                          " text)) WHERE id = :v"), {"k": key, "v": info.id})
+    old = ing.get("reading_attempt")
+    if isinstance(old, str):
+        from app.platform.storage import get_storage, staging_prefix
+
+        try:
+            get_storage().delete_prefix(staging_prefix(ctx.office_id, info.id, old))
+        except (OSError, ValueError):
+            logger.warning("staged files of version %s under a superseded key were not deleted", info.id)
+    return {"reading_attempt": key}
+
+
+def extract_stage(ctx: TenantContext, info: VersionInfo, deadline: float) -> bool:
+    """Read the version and write its reading. Returns whether this call did the reading (False: it was already
+    written, by an earlier attempt that died before the embedding or publishing finished). A PDF is read in windows
+    through the staging area and raises ``ExtractionPaused`` when the time is spent before it is read."""
     with tenant_tx(ctx) as conn:
         if info.cloned_from and _source_has_outputs(conn, info.cloned_from):
             clone_outputs(conn, info)
-            return
+            return True
     from app.platform.storage import get_storage
 
     data = get_storage().get(info.storage_key)
-    result = _extract(data, info.mime_type, deadline, vision_reader(ctx), ImageReadingStore(ctx))
+    if info.mime_type != PDF_MIME or "stage" not in inspect.signature(_extract).parameters:
+        result = _extract(data, info.mime_type, deadline, vision_reader(ctx), ImageReadingStore(ctx))
+        with tenant_tx(ctx) as conn:
+            persist_extraction(conn, info, result)
+        return True
+    from app.extraction.pdf_windows import StorageStage
+
+    key = reading_attempt_key(info)
+    if _begin_reading(ctx, info, key).get("reading_id"):  # written already: only embedding or publishing is left
+        return False
+    shown: list = []
+
+    def progress(done: int, total: int, stage_name: str) -> None:
+        if shown != [done, total, stage_name]:
+            shown[:] = [done, total, stage_name]
+            record_progress(ctx, info.id, done, total, stage_name)
+
+    result = _extract(data, info.mime_type, deadline, vision_reader(ctx), ImageReadingStore(ctx),
+                      StorageStage(get_storage(), ctx.office_id, info.id, key), progress)
+    record_progress(ctx, info.id, result.page_count, result.page_count, STAGE_SAVING)
     with tenant_tx(ctx) as conn:
-        persist_extraction(conn, info, result)
+        persist_extraction(conn, info, result, {"reading_attempt": key, "pages_done": result.page_count,
+                                                "pages_total": result.page_count, "stage": STAGE_EMBEDDING})
+    return True
 
 
-def _extract(data: bytes, mime_type: str, deadline: float, vision, readings=None) -> ExtractionResult:
+def _extract(data: bytes, mime_type: str, deadline: float, vision, readings=None, stage=None,
+             progress=None) -> ExtractionResult:
+    """Read a file. ``stage`` (a PDF's staging area) lets an extractor that reads in windows continue where an earlier
+    attempt stopped and report ``progress``; any other extractor reads the file in one call."""
     from app.extraction.pipeline import get_extractor
 
     extractor = get_extractor()
+    if stage is not None and hasattr(extractor, "extract_staged"):
+        return extractor.extract_staged(data, mime_type, deadline, vision, readings, stage, progress)
     kwargs = {}
     if vision is not None:  # extractors written before pictures were read by the vision model take no reader
         kwargs["vision"] = vision
@@ -349,10 +443,14 @@ def vision_reader(ctx: TenantContext):
 
 # --- stage 2 ---------------------------------------------------------------------------------------
 
-def embed_stage(ctx: TenantContext, info: VersionInfo, deadline: float) -> None:
+def embed_stage(ctx: TenantContext, info: VersionInfo, deadline: float) -> int:
+    """Embed the chunks that have no vector yet, 64 at a time, committing each batch. Returns the batches done. When
+    the time is spent between batches the job stops (``ExtractionPaused``) and continues from the next chunk without
+    a vector in its next attempt."""
     from app.providers.embeddings import get_embedding_provider, to_pgvector
 
     provider = get_embedding_provider()
+    batches = 0
     while True:
         with tenant_tx(ctx) as conn:
             rows = conn.execute(
@@ -363,8 +461,9 @@ def embed_stage(ctx: TenantContext, info: VersionInfo, deadline: float) -> None:
                 {"v": info.id, "m": provider.model_id},
             ).all()
         if not rows:
-            return
-        check_deadline(deadline)
+            return batches
+        if time.monotonic() > deadline:
+            raise ExtractionPaused(batches > 0)
         vectors = provider.embed_passages([r.text for r in rows])
         with tenant_tx(ctx) as conn:
             for r, vec in zip(rows, vectors, strict=True):
@@ -372,6 +471,7 @@ def embed_stage(ctx: TenantContext, info: VersionInfo, deadline: float) -> None:
                     text("UPDATE chunks SET embedding = CAST(:e AS vector), embedding_model = :m WHERE id = :id"),
                     {"e": to_pgvector(vec), "m": provider.model_id, "id": r.id},
                 )
+        batches += 1
 
 
 # --- stage 3 ---------------------------------------------------------------------------------------
@@ -380,7 +480,10 @@ def publish_stage(ctx: TenantContext, info: VersionInfo) -> str:
     from app.appraisal.publish import publish_version
 
     with tenant_tx(ctx) as conn:
-        return publish_version(conn, info.id, info.document_id, EXTRACTION_VERSION)
+        outcome = publish_version(conn, info.id, info.document_id, EXTRACTION_VERSION)
+        conn.execute(text("UPDATE document_versions SET ingestion = ingestion - 'stage' WHERE id = :v"),
+                     {"v": info.id})  # the reading is done: its report keeps pages_done and pages_total
+        return outcome
 
 
 # --- orchestration -----------------------------------------------------------------------------------
@@ -392,6 +495,7 @@ def mark_failed(ctx: TenantContext, version_id: UUID, reason: str) -> None:
                  " WHERE id = :v"),
             {"r": reason, "v": version_id},
         )
+    purge_staging(ctx.office_id, version_id)  # nothing is read from the staged outputs of a failed version again
 
 
 def mark_retry(ctx: TenantContext, version_id: UUID) -> None:
@@ -403,15 +507,23 @@ def mark_retry(ctx: TenantContext, version_id: UUID) -> None:
 
 
 def process_version(office_id: UUID, version_id: UUID) -> str | None:
-    """Run all stages. Raises ExtractionError or other exceptions to the worker loop."""
+    """Run all stages. Raises ExtractionError or other exceptions to the worker loop; ``ExtractionPaused`` when the
+    job's time is spent at a window or batch boundary (what is done stays, the worker queues the job again)."""
     ctx = system_ctx(office_id)
     deadline = time.monotonic() + get_settings().job_timeout_seconds
     info = start_processing(ctx, version_id)
     if info is None:
+        purge_staging(office_id, version_id)
         return None  # deleted, superseded, or already published: nothing to do
-    extract_stage(ctx, info, deadline)
-    embed_stage(ctx, info, deadline)
+    progressed = False
+    try:
+        progressed = extract_stage(ctx, info, deadline)
+        progressed = bool(embed_stage(ctx, info, deadline)) or progressed
+    except ExtractionPaused as paused:
+        raise ExtractionPaused(progressed or paused.progressed) from None
+    record_progress(ctx, info.id, None, None, STAGE_PUBLISHING)
     outcome = publish_stage(ctx, info)
+    purge_staging(office_id, version_id)
     if vision_reader(ctx) is not None:
         from app.measurements.extract import EXTRACTION_VERSION as MEASURE_VERSION
         from app.platform.jobs import enqueue_measurements

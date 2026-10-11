@@ -10,6 +10,7 @@ import { useApi, useInterval } from "@/lib/useApi";
 import {
   BLOCK_KIND_LABEL,
   formatTimestamp,
+  ingestProgressText,
   KEPT_PREVIOUS_TITLE,
   keptPreviousText,
   type KeptPrevious,
@@ -222,14 +223,54 @@ function DataCell({ v }: { v: Version | null }) {
   );
 }
 
-function StatusCell({ v }: { v: Version | null }) {
+/** The status of a version (R2, R3): while it is read, how far it has got (the stage alone before the pages in the file
+ * are known, "pages read N of M" while pages are read, the stage's name during the steps over the whole document); when
+ * it failed, the reason, with a retry control only for an admin and only when reading the file again can cure it (the
+ * time limit, an old page limit); a pending state while the retry is queued. */
+function StatusCell({ v, docId, onChanged }: { v: Version | null; docId: string; onChanged: () => void }) {
+  const me = useSession();
+  const [busy, setBusy] = useState(false);
+  const [queued, setQueued] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   if (!v) return <span className="muted">—</span>;
+  const isAdmin = me?.user.role === "admin";
+  const progress = isActive(v) ? ingestProgressText(v.progress) : null;
+
+  async function retry() {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.retryProcessing(docId);
+      setQueued(true);
+      onChanged();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div>
       <StatusBadge status={v.status} />
+      {progress && (
+        <div className="small muted" aria-live="polite">
+          {progress}
+        </div>
+      )}
       {v.status_reason && (v.status === "failed" || v.status === "needs_review") && (
         <div className="small" style={{ color: v.status === "failed" ? "var(--danger)" : "var(--warn)" }}>
           {v.status_reason}
+        </div>
+      )}
+      {v.status === "failed" && v.retriable && isAdmin && (
+        <button type="button" className="btn" disabled={busy || queued} onClick={() => void retry()}>
+          {queued ? "העיבוד המחודש ממתין בתור" : "עיבוד מחדש"}
+        </button>
+      )}
+      {error && (
+        <div className="small" role="alert" style={{ color: "var(--danger)" }}>
+          {error}
         </div>
       )}
       <KeptPreviousNote v={v} />
@@ -344,7 +385,7 @@ function DocumentPanel({
                       </a>
                     </td>
                     <td>
-                      <StatusCell v={v} />
+                      <StatusCell v={v} docId={doc.id} onChanged={() => { reload(); onChanged(); }} />
                     </td>
                     <td>
                       {v.page_count != null ? <B>{v.page_count}</B> : <span className="small muted">DOCX (ללא עמודים)</span>}
@@ -495,7 +536,7 @@ function DocumentsTab({
                     </td>
                     <td>{d.group.name}</td>
                     <td>
-                      <StatusCell v={v} />
+                      <StatusCell v={v} docId={d.id} onChanged={reload} />
                     </td>
                     <td>
                       <B>{v?.version_no ?? "—"}</B>

@@ -232,6 +232,28 @@ class ReprocessBody(BaseModel):
     # one (``ingestion.reprocess_regression``), accepting that regression (KTD7). Those versions never wait for it:
     # they keep their current reading and stay available (KTD9)
     accept_regression: bool = False
+    # process again, without a re-upload, the latest version of each document that failed for a reason reading the
+    # file again can cure (the time limit, or a page limit it now fits; R2)
+    retry_failed: bool = True
+    # only this document: its failed version is retried and nothing else is queued
+    document_id: str | None = None
+
+
+def retry_failed_versions(conn: Connection, document_id: UUID | None = None) -> list[UUID]:
+    """Queue the retriable failed versions the caller may see (the connection's row-level policies decide: another
+    office's or group's document is not found): the latest version of a document that is not deleted, failed for a
+    reason ``retriable_failure`` accepts. Idempotent: a version already pending is not failed, so a second call
+    changes nothing."""
+    from app.config import get_settings
+    from app.platform.jobs import enqueue_retry, retriable_failure
+
+    rows = conn.execute(text(
+        "SELECT v.id, v.status_reason FROM document_versions v JOIN documents d ON d.id = v.document_id"
+        " AND d.deleted_at IS NULL WHERE v.status = 'failed' AND (CAST(:doc AS uuid) IS NULL OR d.id = CAST(:doc AS"
+        " uuid)) AND v.version_no = (SELECT max(x.version_no) FROM document_versions x WHERE x.document_id = d.id)"
+        " ORDER BY v.created_at, v.id"), {"doc": document_id}).all()
+    ceiling = get_settings().max_pages
+    return [r.id for r in rows if retriable_failure(r.status_reason, ceiling) and enqueue_retry(conn, r.id)]
 
 
 @router.post("/reprocess")
@@ -240,12 +262,19 @@ def reprocess(body: ReprocessBody, ctx: TenantContext = Depends(require_admin)) 
     reviewed decisions kept). Without ``all``, only versions read by an older reader; a version whose new reading
     was held back as worse than its current one keeps its current reading (reading it again would read the same):
     ``accept_regression``, an optional admin override, reads exactly those again and lets the new reading replace
-    the current one despite the recorded regression. A ``kept_previous`` job is re-queued for it."""
+    the current one despite the recorded regression. A ``kept_previous`` job is re-queued for it. Versions that
+    failed for the time limit or an old page limit are processed again (``retry_failed``, on by default); with
+    ``document_id`` only that document's failed version is, after the same visibility check as everywhere."""
     from app.platform.jobs import enqueue_reindex
     from app.platform.pipeline import INGESTION_VERSION, PDF_INGESTION_VERSION, ingestion_version
 
+    document = parse_uuid(body.document_id) if body.document_id else None
     with tenant_tx(ctx) as conn:
-        rows = conn.execute(text(
+        if document is not None and conn.execute(text(
+                "SELECT 1 FROM documents WHERE id = :d AND deleted_at IS NULL"), {"d": document}).first() is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
+        retried = [str(v) for v in retry_failed_versions(conn, document)] if body.retry_failed or document else []
+        rows = [] if document is not None else conn.execute(text(
             "SELECT v.id, v.mime_type, v.ingestion->>'ingestion_version' AS iv,"
             " (v.ingestion ? 'reprocess_regression') AS held FROM document_versions v JOIN"
             " documents d ON d.id = v.document_id AND d.deleted_at IS NULL WHERE v.is_current AND v.status IN"
@@ -256,8 +285,10 @@ def reprocess(body: ReprocessBody, ctx: TenantContext = Depends(require_admin)) 
             wanted = [r for r in rows if body.all or (r.iv != ingestion_version(r.mime_type) and not r.held)]
         queued = [str(r.id) for r in wanted
                   if enqueue_reindex(conn, r.id, ingestion_version(r.mime_type), body.accept_regression)]
-        audit(conn, "reprocess", ctx.user_id, "office", ctx.office_id, accept_regression=body.accept_regression)
-    return {"queued": len(queued), "versions": queued, "ingestion_version": INGESTION_VERSION,
+        audit(conn, "reprocess", ctx.user_id, "office", ctx.office_id, accept_regression=body.accept_regression,
+              retried=len(retried))
+    return {"queued": len(queued) + len(retried), "versions": retried + queued, "retried": retried,
+            "ingestion_version": INGESTION_VERSION,
             "ingestion_versions": {"docx": INGESTION_VERSION, "pdf": PDF_INGESTION_VERSION},
             "held": sum(1 for r in rows if r.held)}
 

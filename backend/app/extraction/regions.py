@@ -27,6 +27,11 @@ occurrence the text layer does not cover, with its reading (repeated is not deco
 text). Two occurrences on two pages are kept (a table or a signature repeated in two sections); two on one page are
 one block.
 
+A long file's regions are read in steps that can stop and continue (``index_regions`` per window of pages,
+``read_contents`` per batch of distinct contents, ``apply_results`` per window; ``pdf_windows``): ``index_regions``
+accumulates every content's lowest resolution and largest share of a page over the whole document before anything is
+read, so a content reads the same whatever the window size, and ``read_regions`` is the same steps in one go.
+
 pdfium is not thread-safe: every render and image decode happens on the calling thread; the OCR and model calls
 run in a small worker pool. A vision configuration error raises ``images.VisionUnavailable`` out of the pool at once
 and fails the job. A transient vision failure (KTD9) lets every other region finish reading, so those readings reach
@@ -87,6 +92,7 @@ COVER_SPAN = 0.4  # ... with the characters spread over this share of it (not on
 REPEAT_MIN = 3  # a content occurring this often in a document (on any pages) is page furniture
 HASH_SHOWN = 12  # characters of a content hash shown in the ingestion report
 REGION_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
+REGION_BATCH = 12  # distinct contents read (and kept) together: their pixels are in memory at once
 IMAGE_CROP = f"native<={VISION_MAX_SIDE}"
 NOTE_NO_PIXELS = "לא ניתן היה לחלץ את התמונה מהקובץ"
 
@@ -389,38 +395,6 @@ def _effective_dpi(r: Region) -> float | None:
     return min(r.srcsize[0] / (w_pt / 72), r.srcsize[1] / (h_pt / 72))
 
 
-def _contents(doc, layers: list[PageLayer]) -> list[_Content]:
-    contents: dict[str, _Content] = {}
-    wanted = {r.content_hash for layer in layers for r in layer.regions if r.kind == "image" and r.content_hash}
-    pixels = _image_pixels(doc, layers, wanted)
-    for layer in layers:
-        page_area = max(1.0, layer.width * layer.height)
-        for r in layer.regions:
-            if r.kind == "ink":
-                try:
-                    gray, dpi = _render_crop(doc, layer, r.bbox)
-                except Exception:  # noqa: BLE001
-                    log.warning("region render failed on page %s", r.page)
-                    r.reading = PictureReading("unread", "none", note=NOTE_NO_PIXELS)
-                    continue
-                r.content_hash = "ink:" + hashlib.sha256(f"{gray.size}".encode() + gray.tobytes()).hexdigest()
-                c = contents.setdefault(r.content_hash, _Content(r.content_hash, gray, f"ink@{dpi}dpi"))
-                c.dpi = float(dpi)
-            else:
-                gray = pixels.get(r.content_hash or "")
-                if gray is None:
-                    r.reading = PictureReading("unread", "none", note=NOTE_NO_PIXELS)
-                    continue
-                c = contents.setdefault(r.content_hash, _Content(r.content_hash, gray, IMAGE_CROP))
-                dpi = _effective_dpi(r)
-                if dpi is not None:
-                    c.dpi = dpi if c.dpi is None else min(c.dpi, dpi)
-            area = (r.bbox[2] - r.bbox[0]) * (r.bbox[3] - r.bbox[1])
-            c.large = c.large or area / page_area >= LARGE_SHARE
-            c.occurrences.append(r)
-    return list(contents.values())
-
-
 def _read_content(c: _Content, settings: Settings, vision: VisionReader | None, cache: ReadingCache | None,
                   deadline: float) -> tuple[dict[int, bool], PictureReading | None]:
     """Coverage of each occurrence and the content's reading (None when every occurrence is covered)."""
@@ -457,38 +431,169 @@ def _read_content(c: _Content, settings: Settings, vision: VisionReader | None, 
     return covered, reading
 
 
-def read_regions(doc, data: bytes, layers: list[PageLayer], settings: Settings, vision: VisionReader | None,
-                 cache: ReadingCache | None, deadline: float) -> None:
-    """Find, check and read every region of ``layers`` (their ``regions`` hold the image objects already). Fills
-    each region's ``covered`` and ``reading``."""
-    check_deadline(deadline)
+@dataclass
+class Occurrence:
+    """One place a content occurs, with what the text layer holds there (filled before reading) and the page size the
+    region is rendered against. JSON-able: a staged reading keeps these between job attempts."""
+
+    page_index: int  # 0-based
+    region: int  # the region's index in its page's ``regions``
+    page: int
+    bbox: list[float]
+    layer_chars: int
+    layer_density: float
+    layer_span: float
+    layer_text: str
+    width: float
+    height: float
+
+
+@dataclass
+class ContentInfo:
+    """One distinct content before it is read: its kind (``image`` or ``ink``), the crop scale it is read at, the
+    lowest effective resolution and largest share of a page over all its occurrences (what a reading depends on),
+    and every occurrence in document order. Pixels are not kept: they are decoded or rendered again when the content
+    is read."""
+
+    content_hash: str
+    kind: str
+    crop_scale: str
+    dpi: float | None = None
+    large: bool = False
+    occurrences: list[Occurrence] = field(default_factory=list)
+
+
+@dataclass
+class ContentResult:
+    """What reading one content gave: whether each occurrence (in ``ContentInfo.occurrences`` order) is covered by the
+    text layer, and the reading (None when every occurrence is covered)."""
+
+    covered: list[bool]
+    reading: PictureReading | None
+
+
+def index_regions(doc, data: bytes, layers: list[PageLayer], contents: dict[str, ContentInfo]) -> None:
+    """Find the ink regions of ``layers`` (their ``regions`` hold the image objects already), fill what the text layer
+    holds inside each region, give ink regions their content hash and add every region to ``contents`` (keyed by
+    content hash, in order of first occurrence). A region whose pixels cannot be had is set ``unread`` and added to
+    no content. Run over a document's pages in windows, ``contents`` accumulates the whole document's, so the
+    resolution and size a content is read with do not depend on the window."""
     find_ink_regions(data, layers)
     for layer in layers:
         _fill_layer(layer)
-    contents = _contents(doc, layers)
-    if not contents:
-        return
-    pool = ThreadPoolExecutor(max_workers=REGION_WORKERS)
+    wanted = {r.content_hash for layer in layers for r in layer.regions if r.kind == "image" and r.content_hash}
+    pixels = _image_pixels(doc, layers, wanted)
+    for layer in layers:
+        page_area = max(1.0, layer.width * layer.height)
+        for ri, r in enumerate(layer.regions):
+            if r.kind == "ink":
+                try:
+                    gray, dpi = _render_crop(doc, layer, r.bbox)
+                except Exception:  # noqa: BLE001
+                    log.warning("region render failed on page %s", r.page)
+                    r.reading = PictureReading("unread", "none", note=NOTE_NO_PIXELS)
+                    continue
+                r.content_hash = "ink:" + hashlib.sha256(f"{gray.size}".encode() + gray.tobytes()).hexdigest()
+                info = contents.setdefault(r.content_hash, ContentInfo(r.content_hash, "ink", f"ink@{dpi}dpi"))
+                info.dpi = float(dpi)
+            else:
+                gray = pixels.get(r.content_hash or "")
+                if gray is None:
+                    r.reading = PictureReading("unread", "none", note=NOTE_NO_PIXELS)
+                    continue
+                info = contents.setdefault(r.content_hash, ContentInfo(r.content_hash, "image", IMAGE_CROP))
+                dpi = _effective_dpi(r)
+                if dpi is not None:
+                    info.dpi = dpi if info.dpi is None else min(info.dpi, dpi)
+            area = (r.bbox[2] - r.bbox[0]) * (r.bbox[3] - r.bbox[1])
+            info.large = info.large or area / page_area >= LARGE_SHARE
+            info.occurrences.append(Occurrence(layer.index, ri, r.page, list(r.bbox), r.layer_chars, r.layer_density,
+                                               r.layer_span, r.layer_text, layer.width, layer.height))
+
+
+def _pixels_of(doc, info: ContentInfo) -> Image.Image | None:
+    """The content's grayscale pixels: the image decoded from the first page that yields it, or the ink region
+    rendered from its first occurrence."""
+    first = info.occurrences[0]
+    if info.kind == "ink":
+        try:
+            return _render_crop(doc, PageLayer(first.page_index, first.width, first.height, [], []), first.bbox)[0]
+        except Exception:  # noqa: BLE001
+            log.warning("region render failed on page %s", first.page)
+            return None
+    layers = [PageLayer(o.page_index, o.width, o.height, [], [], [Region(o.page, o.bbox, "image", info.content_hash)])
+              for o in info.occurrences]
+    return _image_pixels(doc, layers, {info.content_hash}).get(info.content_hash)
+
+
+def read_contents(doc, infos: list[ContentInfo], settings: Settings, vision: VisionReader | None,
+                  cache: ReadingCache | None, deadline: float) -> tuple[dict[str, ContentResult], VisionUnavailable | None]:
+    """Read each content once (``_read_content``: OCR, the cache, the vision model). A configuration error raises
+    at once. A transient vision failure (KTD9) lets every other content finish, so their readings reach the cache
+    and the result, and is returned (not raised) with those that did read: the caller raises it once nothing else is
+    left, and the next attempt reads only the contents that failed."""
+    contents = []
+    results: dict[str, ContentResult] = {}
+    for info in infos:
+        gray = _pixels_of(doc, info)
+        if gray is None:
+            results[info.content_hash] = ContentResult(
+                [False] * len(info.occurrences), PictureReading("unread", "none", note=NOTE_NO_PIXELS))
+            continue
+        stubs = [Region(o.page, o.bbox, info.kind, info.content_hash, layer_text=o.layer_text,
+                        layer_chars=o.layer_chars, layer_density=o.layer_density, layer_span=o.layer_span)
+                 for o in info.occurrences]
+        contents.append((info, _Content(info.content_hash, gray, info.crop_scale, stubs, info.dpi, info.large)))
     transient: VisionUnavailable | None = None
+    pool = ThreadPoolExecutor(max_workers=REGION_WORKERS)
     try:
-        futures = [(c, pool.submit(_read_content, c, settings, vision, cache, deadline)) for c in contents]
-        for c, future in futures:
+        futures = [(info, c, pool.submit(_read_content, c, settings, vision, cache, deadline))
+                   for info, c in contents]
+        for info, c, future in futures:
             try:
                 covered, reading = future.result()
             except VisionUnavailable as exc:
                 if exc.permanent:
                     raise  # a configuration error: every other call would fail the same way
-                # transient (KTD9): the other regions are still read, so their readings reach the cache and the
-                # job's next attempt reads only the regions that failed
                 transient = transient or exc
                 continue
-            for r in c.occurrences:
-                r.covered = covered[id(r)]
-                r.reading = None if r.covered else reading
+            results[info.content_hash] = ContentResult([covered[id(r)] for r in c.occurrences], reading)
     except BaseException:
         pool.shutdown(wait=True, cancel_futures=True)
         raise
     pool.shutdown(wait=True)
+    return results, transient
+
+
+def occurrence_places(contents: dict[str, ContentInfo]) -> dict[tuple[int, int], tuple[str, int]]:
+    """Where each region sits in its content: (page index, region index) -> (content hash, occurrence number)."""
+    return {(o.page_index, o.region): (digest, k)
+            for digest, info in contents.items() for k, o in enumerate(info.occurrences)}
+
+
+def apply_results(layers: list[PageLayer], places: dict[tuple[int, int], tuple[str, int]],
+                  results: dict[str, ContentResult]) -> None:
+    """Set each region's ``covered`` and ``reading`` from the readings of its content (``occurrence_places``)."""
+    for layer in layers:
+        for ri, r in enumerate(layer.regions):
+            found = places.get((layer.index, ri))
+            result = results.get(found[0]) if found else None
+            if result is None:
+                continue
+            r.covered = result.covered[found[1]]
+            r.reading = None if r.covered else result.reading
+
+
+def read_regions(doc, data: bytes, layers: list[PageLayer], settings: Settings, vision: VisionReader | None,
+                 cache: ReadingCache | None, deadline: float) -> None:
+    """Find, check and read every region of ``layers`` in one go (a document held in memory). Fills each region's
+    ``covered`` and ``reading``. The ingestion reads a long file's regions in resumable batches instead
+    (``app.extraction.pdf_windows``), with the same steps."""
+    check_deadline(deadline)
+    contents: dict[str, ContentInfo] = {}
+    index_regions(doc, data, layers, contents)
+    results, transient = read_contents(doc, list(contents.values()), settings, vision, cache, deadline)
+    apply_results(layers, occurrence_places(contents), results)
     if transient is not None:
         raise transient
 

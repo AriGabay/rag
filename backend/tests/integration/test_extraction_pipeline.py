@@ -358,3 +358,139 @@ def test_ocr_timeout_fails_the_page_not_the_job(monkeypatch):
     result = DefaultExtractor().extract(data, "application/pdf", time.monotonic() + 60)
     assert all(p.method == "failed" and not p.ok for p in result.pages)
     assert result.pages_incomplete == len(result.pages)
+
+
+# --- page windows (KTD2, U4) ------------------------------------------------------------------------------------
+# A PDF is read in page windows whose outputs go through a staging area in file storage. A reading must not depend on
+# the window size: pages, blocks (kind, page, section path, label, status, text, box), tables and chunks read in one
+# window are the ones read in two-page and one-page windows. A table continuing over a window border is one table.
+
+WINDOW_FIXTURES = sorted(p for p in FIXTURES.rglob("*.pdf") if not p.name.startswith("R9d"))
+
+
+def _snapshot(read) -> str:
+    """Everything a reading holds, as canonical JSON; a rejected file is its reason."""
+    import dataclasses
+    import json
+
+    try:
+        r = read()
+    except ExtractionError as err:
+        return f"rejected: {err.reason}"
+    return json.dumps({
+        "page_count": r.page_count, "pages": [dataclasses.asdict(p) for p in r.pages],
+        "blocks": [dataclasses.asdict(b) for b in r.blocks], "tables": [dataclasses.asdict(t) for t in r.tables],
+        "chunks": [dataclasses.asdict(c) for c in r.chunks], "warnings": r.warnings, "fontmap": r.fontmap,
+        "uncertain": r.uncertain, "repeated": r.repeated, "components": r.components,
+    }, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _staged_read(data: bytes, window: int, root, monkeypatch, *, soft: bool = False):
+    """The file read through a staging area in ``root`` with windows of ``window`` pages."""
+    import uuid
+
+    from app.config import get_settings
+    from app.extraction import pdf_windows
+    from app.platform.storage import LocalStorage
+
+    monkeypatch.setattr(get_settings(), "ingest_window_pages", window)
+    stage = pdf_windows.StorageStage(LocalStorage(root), uuid.uuid4(), uuid.uuid4(), "a" * 64)
+    return pdf_windows.read_pdf(data, time.monotonic() + 600, get_settings(), stage=stage, soft=soft), stage
+
+
+@pytest.mark.parametrize("path", WINDOW_FIXTURES, ids=lambda p: str(p.relative_to(FIXTURES)))
+def test_every_fixture_reads_the_same_in_one_window_and_in_small_windows(path, monkeypatch, tmp_path):
+    from app.config import get_settings
+
+    data = path.read_bytes()
+    monkeypatch.setattr(get_settings(), "ingest_window_pages", 10_000)
+    one_window = _snapshot(lambda: DefaultExtractor().extract(data, PDF, time.monotonic() + 600))
+    for window in (2, 1):
+        got = _snapshot(lambda w=window: _staged_read(data, w, tmp_path / f"w{w}", monkeypatch)[0])
+        assert got == one_window, f"{path.name} differs with {window}-page windows"
+
+
+def test_the_fixtures_compared_hold_what_the_golden_test_must_cover():
+    """The comparison above is only worth something if the fixtures hold multi-page text, a table over a page break,
+    repeated pictures, a font map and a rejected file."""
+    names = {p.name for p in WINDOW_FIXTURES}
+    assert len(WINDOW_FIXTURES) >= 60
+    assert {"D3_synthetic_harozim_table_across_pages.pdf", "R7_synthetic_repeated_pictures.pdf",
+            "BAD_synthetic_encrypted.pdf", "R9a_synthetic_compendium_three_appraisals.pdf"} <= names
+    assert any(p.parent.name == "fontmap" for p in WINDOW_FIXTURES)
+
+
+def test_a_table_over_a_window_border_is_one_table(monkeypatch, tmp_path):
+    data = (FIXTURES / DOCS["D3"]["filename"]).read_bytes()
+    result, stage = _staged_read(data, 1, tmp_path, monkeypatch)  # the table's rows are on page 1 and page 2
+    assert stage.state["windows_done"] == 2
+    tables = [t for t in result.tables if t.page_end != t.page_start]
+    assert len(tables) == 1 and (tables[0].page_start, tables[0].page_end) == (1, 2)
+    assert len(result.tables) == len(DOCS["D3"]["tables"])
+    assert [r.page for r in tables[0].rows] == [r["page"] for r in DOCS["D3"]["tables"][0]["rows"]]
+
+
+def test_staged_outputs_are_plain_json_never_pickle(monkeypatch, tmp_path):
+    import gzip
+    import json
+
+    data = (FIXTURES / DOCS["D3"]["filename"]).read_bytes()
+    _staged_read(data, 1, tmp_path, monkeypatch)
+    files = [p for p in tmp_path.rglob("*") if p.is_file()]
+    assert files
+    for p in files:
+        raw = p.read_bytes()
+        json.loads(gzip.decompress(raw) if p.name.endswith(".gz") else raw)
+
+
+def test_the_page_ceiling_is_two_thousand_and_a_file_over_it_still_fails_with_its_reason(monkeypatch):
+    from app.config import Settings, get_settings
+
+    assert Settings().max_pages == 2000 and Settings().ingest_window_pages == 50
+    monkeypatch.setattr(get_settings(), "max_pages", 2)
+    data = (FIXTURES / "round9" / "R9a_synthetic_compendium_three_appraisals.pdf").read_bytes()  # 8 pages
+    with pytest.raises(ExtractionError) as info:
+        DefaultExtractor().extract(data, PDF, time.monotonic() + 60)
+    assert info.value.permanent and info.value.reason == "המסמך ארוך מהמותר: 8 עמודים (המקסימום הוא 2 עמודים)"
+
+
+def test_a_reading_resumes_from_its_stage_and_starts_again_when_the_stage_is_damaged(monkeypatch, tmp_path):
+    """A run that dies after two windows is continued from window 3 by the next one; if a staged file it counts on is
+    gone, the reading begins again instead of failing on it for ever."""
+    import uuid
+
+    from app.config import get_settings
+    from app.extraction import pdf, pdf_windows
+    from app.platform.storage import LocalStorage
+
+    data = (FIXTURES / "round9" / "R9a_synthetic_compendium_three_appraisals.pdf").read_bytes()  # 8 pages
+    monkeypatch.setattr(get_settings(), "ingest_window_pages", 10_000)
+    whole = _snapshot(lambda: DefaultExtractor().extract(data, PDF, time.monotonic() + 600))
+    monkeypatch.setattr(get_settings(), "ingest_window_pages", 2)
+    store, office, version = LocalStorage(tmp_path), uuid.uuid4(), uuid.uuid4()
+    starts: list[int] = []
+    died: list[int] = []
+    real = pdf.read_window
+
+    def dying(doc, data_, start, end, settings, deadline, fix=None, only=None):
+        if only is None:
+            starts.append(start)
+            if start == 4 and not died:
+                died.append(start)
+                raise RuntimeError("worker died")
+        return real(doc, data_, start, end, settings, deadline, fix, only)
+
+    monkeypatch.setattr(pdf, "read_window", dying)
+    with pytest.raises(RuntimeError):
+        pdf_windows.read_pdf(data, time.monotonic() + 600, get_settings(),
+                             stage=pdf_windows.StorageStage(store, office, version, "a" * 64))
+    resumed = pdf_windows.StorageStage(store, office, version, "a" * 64)
+    assert resumed.state["windows_done"] == 2
+    got = _snapshot(lambda: pdf_windows.read_pdf(data, time.monotonic() + 600, get_settings(), stage=resumed))
+    assert starts == [0, 2, 4, 4, 6] and got == whole  # window 3 was read again, windows 1-2 were not
+
+    starts.clear()
+    (tmp_path / str(office) / "staging" / str(version) / ("a" * 64) / "w000001.json.gz").unlink()
+    damaged = pdf_windows.StorageStage(store, office, version, "a" * 64)
+    got = _snapshot(lambda: pdf_windows.read_pdf(data, time.monotonic() + 600, get_settings(), stage=damaged))
+    assert got == whole  # the fully staged reading lost a window: it was read again from the start

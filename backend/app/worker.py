@@ -4,7 +4,8 @@
 version (KTD8); ``positions`` jobs give a version read before positions existed its page geometry, word spans and
 cell boxes from its stored file, keeping its reading (KTD3). Run with ``python -m app.worker``. Several workers may run; ``jobs_claim`` uses
 FOR UPDATE SKIP LOCKED so a job is never processed twice concurrently, and an expired lease
-lets another worker resume a crashed job."""
+lets another worker resume a crashed job. A long PDF's job that runs out of time at a window or batch boundary
+(``ExtractionPaused``) is queued again at once, without using an attempt when it finished a unit of work (KTD2)."""
 
 from __future__ import annotations
 
@@ -24,9 +25,9 @@ from app.answering import facts
 from app.answering.attributes import bump_facts_version
 from app.config import get_settings
 from app.db import TenantContext, anonymous_tx, tenant_tx
-from app.extraction.base import ExtractionError
+from app.extraction.base import MSG_DEADLINE, ExtractionError, ExtractionPaused
 from app.platform import pipeline
-from app.platform.jobs import fail_job, finish_job, is_reindex, renew_lease
+from app.platform.jobs import fail_job, finish_job, is_reindex, renew_lease, requeue_paused
 
 logger = logging.getLogger("app.worker")
 
@@ -154,6 +155,14 @@ def run_one(worker_id: str) -> bool:
             pipeline.process_version(job.office_id, job.version_id)
         finally:
             keeper.stop_event.set()  # always stop renewing before recording the outcome
+    except ExtractionPaused as paused:  # a long file's time for this attempt is spent: continue where it stopped
+        with tenant_tx(ctx) as conn:
+            terminal = requeue_paused(conn, job.job_id, paused.progressed, job.attempts, job.max_attempts)
+        if terminal:
+            pipeline.mark_failed(ctx, job.version_id, MSG_DEADLINE)
+        elif not paused.progressed:
+            pipeline.mark_retry(ctx, job.version_id)
+        logger.info("job %s paused at a boundary (progressed=%s, terminal=%s)", job.job_id, paused.progressed, terminal)
     except ExtractionError as exc:
         with tenant_tx(ctx) as conn:
             terminal = fail_job(conn, job.job_id, exc.reason, exc.permanent, job.attempts, job.max_attempts)

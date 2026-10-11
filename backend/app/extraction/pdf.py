@@ -40,6 +40,12 @@ rendered page, taken from the same read that produced the text (the corrected re
 from the text layer keep each cell's box. Boxes go through ``app.extraction.geometry``; a page it cannot convert
 keeps block boxes only. OCR and vision content get no word or cell positions.
 
+Windows (KTD2): this module reads pages (``read_window``) and builds the document from the pages' outputs
+(``assemble_result``); ``app.extraction.pdf_windows`` runs them over a long file one window of pages at a time, keeps
+each window's output in a staging area and runs the document-level steps (font maps, orientation, printed labels,
+region reading) over it, so memory holds a window and a job can stop at a window and continue. A file under one
+window reads exactly as before, and the window size changes no block, table or chunk.
+
 Validation errors (encrypted, corrupt, too many pages, deadline) raise ``ExtractionError`` with a Hebrew reason.
 Document text is content only: nothing in it changes processing (R29).
 """
@@ -59,6 +65,7 @@ import pypdfium2 as pdfium
 from app.config import Settings
 from app.extraction import fontmap, geometry, ocr
 from app.extraction.base import (
+    MSG_TOO_MANY_PAGES,
     Block,
     ExtractionError,
     ExtractionResult,
@@ -69,16 +76,17 @@ from app.extraction.base import (
     check_deadline,
 )
 from app.extraction.chunking import chunk_blocks, heading_label, is_footer
-from app.extraction.fontmap import FontMapConfig, FontMapFix, WordSample
+from app.extraction.fontmap import FontMapFix, WordSample
 from app.extraction.hebrew import (
     QUALITY_THRESHOLD,
-    document_is_visual,
     fix_text_lines,
+    orientation_evidence,
     page_is_visual,
     quality_score,
+    visual_from_evidence,
 )
 from app.extraction.images import PictureReading, VisionReader
-from app.extraction.regions import PageLayer, ReadingCache, Region, mark_repeated, read_regions
+from app.extraction.regions import PageLayer, ReadingCache, Region
 from app.extraction.tables import RawTable, assemble_tables, logical_boxes, logical_row, units_for
 
 log = logging.getLogger(__name__)
@@ -88,7 +96,6 @@ READER_VERSION = "pdf-blocks-v5"
 
 MSG_ENCRYPTED = "הקובץ מוגן בסיסמה ולא ניתן לעבד אותו"
 MSG_CORRUPT = "הקובץ פגום או שאינו PDF תקין"
-MSG_TOO_MANY_PAGES = "המסמך ארוך מהמותר: {n} עמודים (המקסימום הוא {limit} עמודים)"
 WARN_NO_OCR = "זיהוי טקסט (OCR) אינו זמין בשרת; עמודים ללא שכבת טקסט תקינה סומנו כלא מעובדים"
 WARN_PLUMBER = "שכבת הטקסט של הקובץ לא נקראה; כל העמודים עברו זיהוי טקסט (OCR)"
 WARN_PAGE_FAILED = "עמוד {page}: לא ניתן היה לחלץ טקסט באיכות מספקת"
@@ -381,10 +388,20 @@ def _process_page(doc, plumber, index: int, settings: Settings, warnings: list[s
     return _PageOut(PageResult(page_no, best_text, "failed", best_q, False), [], [], words=layer.words)
 
 
-def _orient_undecided_pages(outs: list[_PageOut]) -> None:
-    """Pages whose own words did not decide their orientation take the document's."""
-    decided = [o.raw_texts for o in outs if o.raw_undecided is None and o.raw_texts]
-    visual = document_is_visual(decided)
+def decided_evidence(outs: list[_PageOut]) -> tuple[int, int]:
+    """The orientation evidence (logical, visual) of the pages whose own words decided their orientation. Evidence
+    adds up over words, so a document's counts are the sum over its windows."""
+    logical = visual = 0
+    for o in outs:
+        if o.raw_undecided is None and o.raw_texts:
+            lg, vs = orientation_evidence("\n".join(o.raw_texts))
+            logical += lg
+            visual += vs
+    return logical, visual
+
+
+def orient_pages(outs: list[_PageOut], visual: bool | None) -> None:
+    """Pages whose own words did not decide their orientation take the document's (``visual``; None: no decision)."""
     if visual is None:
         return
     for o in outs:
@@ -396,6 +413,11 @@ def _orient_undecided_pages(outs: list[_PageOut]) -> None:
                 ln.original = FontMapFix.original_line(ln.raw, t, ln.fm_chars)
         o.page.text = "\n".join(ln.text for ln in o.lines)
         o.page.quality = quality_score(o.page.text, corruption=o.corruption)
+
+
+def _orient_undecided_pages(outs: list[_PageOut]) -> None:
+    """Pages whose own words did not decide their orientation take the document's."""
+    orient_pages(outs, visual_from_evidence(*decided_evidence(outs)))
 
 
 # --- blocks ----------------------------------------------------------------------------------------------------
@@ -606,10 +628,11 @@ def _breaks(prev: _Line, ln: _Line, para: list[_Line]) -> bool:
     return abs(prev.size - ln.size) > 0.2 * max(prev.size, ln.size, 1.0)
 
 
-def _layers(outs: list[_PageOut]) -> list[PageLayer]:
-    """The pages read from their text layer, with their pictures, for region reading."""
+def _layers(outs: list[_PageOut], start: int = 0) -> list[PageLayer]:
+    """The pages read from their text layer (``outs`` from file page index ``start``), with their pictures, for
+    region reading."""
     layers = []
-    for k, o in enumerate(outs):
+    for k, o in enumerate(outs, start):
         if o.page.method != "text_layer" or not o.page.ok:
             continue
         for pic in o.pictures:
@@ -712,82 +735,88 @@ def _page_number_line(out: _PageOut) -> int | None:
     return found.pop() if len(found) == 1 else None
 
 
-def _printed_labels(doc, outs: list[_PageOut]) -> None:
-    """Each page's printed page number (R8): the document's ``/PageLabels`` when it has them; otherwise the number
-    of a page-number line, kept only when at least two pages have one and every such number differs from its file
-    page by the same amount (a numbering that skips or restarts says nothing reliable)."""
+def document_labels(doc, count: int) -> list[str]:
+    """The document's ``/PageLabels`` of each of its ``count`` pages ("" for a page without one)."""
     labels: list[str] = []
-    for index in range(len(outs)):
+    for index in range(count):
         try:
             labels.append(doc.get_page_label(index) or "")
         except Exception:  # noqa: BLE001 - an unreadable label tree is no label
             labels.append("")
+    return labels
+
+
+def page_numbers(outs: list[_PageOut]) -> dict[int, int]:
+    """The printed number of each page of ``outs`` that has exactly one page-number line, by file page."""
+    return {out.page.page_no: n for out in outs
+            if out.page.ok and out.lines and (n := _page_number_line(out)) is not None}
+
+
+def consistent_numbers(numbers: dict[int, int]) -> bool:
+    """Whether printed page numbers say something reliable: at least two, every one differing from its file page by
+    the same amount (a numbering that skips or restarts says nothing)."""
+    return len(numbers) >= 2 and len({n - page for page, n in numbers.items()}) == 1
+
+
+def _printed_labels(doc, outs: list[_PageOut]) -> None:
+    """Each page's printed page number (R8): the document's ``/PageLabels`` when it has them; otherwise the number
+    of a page-number line, kept only when at least two pages have one and every such number differs from its file
+    page by the same amount (a numbering that skips or restarts says nothing reliable)."""
+    labels = document_labels(doc, len(outs))
     if any(labels):
         for out, label in zip(outs, labels, strict=True):
             out.page.printed_label = label or None
         return
-    numbers = {out.page.page_no: n for out in outs
-               if out.page.ok and out.lines and (n := _page_number_line(out)) is not None}
-    if len(numbers) < 2 or len({n - page for page, n in numbers.items()}) != 1:
+    numbers = page_numbers(outs)
+    if not consistent_numbers(numbers):
         return
     for out in outs:
         if out.page.page_no in numbers:
             out.page.printed_label = str(numbers[out.page.page_no])
 
 
-def extract_pdf(data: bytes, deadline: float, settings: Settings, vision: VisionReader | None = None,
-                readings: ReadingCache | None = None) -> ExtractionResult:
-    """``vision``: the office's vision reader (None: OCR only). ``readings``: the office's earlier readings of
-    region content (``image_readings``), consulted and filled by region reading."""
-    doc = open_pdf(data, settings.max_pages)
-    warnings: list[str] = []
+def read_window(doc, data: bytes, start: int, end: int, settings: Settings, deadline: float,
+                fix: FontMapFix | None = None, only: list[int] | None = None) -> tuple[list[_PageOut], bool]:
+    """Pass 1 over the pages ``start`` .. ``end`` - 1 (0-based), each from the text layer (OCR when it fails the
+    quality gate), with its geometry placed. ``only``: just these pages of the range (the font-map re-read of the
+    pages holding a suspect character, with ``fix``). Returns the pages' outputs and whether the text layer could
+    not be opened (every page then goes to OCR). The text layer is opened for this range alone, so what pdfminer
+    caches is released with it."""
     try:
-        try:
-            plumber = pdfplumber.open(io.BytesIO(data))
-        except Exception:  # noqa: BLE001 - pdfium opened it; pdfminer did not
-            plumber = None
-            warnings.append(WARN_PLUMBER)
-        try:
-            outs: list[_PageOut] = []
-            for index in range(len(doc)):
-                check_deadline(deadline)
-                outs.append(_read_page(doc, plumber, index, settings))
-            # broken font maps: detected over the whole document, verified against the glyphs; only the pages
-            # holding a suspect character are read again, from their corrected text layer
-            fix = fontmap.detect_and_repair([w for o in outs for w in o.words], doc,
-                                            FontMapConfig.from_settings(settings))
-            for index in sorted(fix.pages):
-                check_deadline(deadline)
-                outs[index] = _read_page(doc, plumber, index, settings, fix)
-        finally:
-            if plumber is not None:
-                plumber.close()
+        plumber = pdfplumber.open(io.BytesIO(data))
+    except Exception:  # noqa: BLE001 - pdfium opened it; pdfminer did not
+        plumber = None
+    try:
+        outs = []
+        for index in (range(start, end) if only is None else only):
+            check_deadline(deadline)
+            outs.append(_read_page(doc, plumber, index, settings, fix))
+    finally:
+        if plumber is not None:
+            plumber.close()
+    return outs, plumber is None
+
+
+def assemble_result(windows, page_count: int, warnings: list[str], fix: FontMapFix, repeated: list[dict]
+                    ) -> ExtractionResult:
+    """The document from its pages' outputs, ``windows`` yielding them in page order in lists: the block walker
+    (tables continuing over a window border are assembled by ``Walker.finish`` over all pieces), chunking and the
+    reading report."""
+    walker = _Walker()
+    pages: list[PageResult] = []
+    for outs in windows:
         for o in outs:
-            o.words = []
             for w in o.warnings:
                 if w not in warnings:
                     warnings.append(w)
-        page_count = len(doc)
-        _orient_undecided_pages(outs)
-        _printed_labels(doc, outs)
-        layers = _layers(outs)
-        read_regions(doc, data, layers, settings, vision, readings, deadline)
-        repeated = mark_repeated(layers)
-        for o in outs:
-            o.chars = []  # the character boxes served region reading only
-        del layers
-    finally:
-        doc.close()
-
-    walker = _Walker()
-    for out in outs:
-        for k, raw in enumerate(sorted(out.tables, key=lambda t: t.top)):
-            raw.first_on_page = k == 0
-        if out.page.ok:
-            _merge_region_text(out)
-            walker.page(out)
+        for out in outs:
+            for k, raw in enumerate(sorted(out.tables, key=lambda t: t.top)):
+                raw.first_on_page = k == 0
+            if out.page.ok:
+                _merge_region_text(out)
+                walker.page(out)
+        pages += [o.page for o in outs]
     blocks, tables = walker.finish()
-    pages = [o.page for o in outs]
     chunks = chunk_blocks(blocks, tables)
     report = fix.report()
     result = ExtractionResult(page_count=page_count, pages=pages, tables=tables, chunks=chunks, warnings=warnings,
@@ -799,3 +828,15 @@ def extract_pdf(data: bytes, deadline: float, settings: Settings, vision: Vision
     if walker.uncertain:
         warnings.append(WARN_FONTMAP.format(n=len(walker.uncertain)))
     return result
+
+
+def extract_pdf(data: bytes, deadline: float, settings: Settings, vision: VisionReader | None = None,
+                readings: ReadingCache | None = None) -> ExtractionResult:
+    """``vision``: the office's vision reader (None: OCR only). ``readings``: the office's earlier readings of
+    region content (``image_readings``), consulted and filled by region reading. The whole file is read in this
+    call, in page windows of ``settings.ingest_window_pages`` (``app.extraction.pdf_windows``); a deadline is a
+    permanent error. The ingestion job reads a long file through ``pdf_windows.read_pdf`` with a staging area
+    instead, so it can stop at a window and continue in its next attempt (KTD2)."""
+    from app.extraction import pdf_windows
+
+    return pdf_windows.read_pdf(data, deadline, settings, vision, readings)

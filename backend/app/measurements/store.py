@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
@@ -61,17 +62,21 @@ def _kinds(m) -> set[str]:
 
 
 def store_rows(conn: Connection, document_id: UUID, version_id: UUID, rows: list[Row], extraction_version: str,
-               model: str | None, read: tuple[set, set] | None = None) -> int:
+               model: str | None, read: tuple[set, set] | None = None, before: datetime | None = None) -> int:
+    """Store ``rows``, replacing the unreviewed measurements of what was read (``read``: the blocks and tables; None:
+    the whole version). ``before``: replace only measurements created before it, so a run that stores its batches
+    one by one (``extract_version``) never replaces what an earlier batch of the same run stored."""
+    older = "" if before is None else " AND created_at < :before"
     if read is None:
-        conn.execute(text("DELETE FROM measurements WHERE version_id = :v AND NOT (status = ANY(:r))"),
-                     {"v": version_id, "r": list(REVIEWED)})
+        conn.execute(text("DELETE FROM measurements WHERE version_id = :v AND NOT (status = ANY(:r))" + older),
+                     {"v": version_id, "r": list(REVIEWED), "before": before})
     else:
         blocks, tables = read
         conn.execute(text(
             "DELETE FROM measurements WHERE version_id = :v AND NOT (status = ANY(:r)) AND ((table_index IS NULL AND"
-            " block_index = ANY(:b)) OR table_index = ANY(:t))"),
+            " block_index = ANY(:b)) OR table_index = ANY(:t))" + older),
             {"v": version_id, "r": list(REVIEWED), "b": [b for b in blocks if b is not None],
-             "t": [t for t in tables if t is not None]})
+             "t": [t for t in tables if t is not None], "before": before})
     reviewed = conn.execute(text(
         "SELECT id, statement_key, metric_kind, value, value_low, value_high, table_index, quote, previous, status"
         " FROM measurements WHERE version_id = :v AND status = ANY(:r)"), {"v": version_id, "r": list(REVIEWED)}).all()

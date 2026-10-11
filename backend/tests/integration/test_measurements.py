@@ -232,3 +232,62 @@ def test_finding_the_same_value_twice_does_not_count_it_twice(office):
              if m.row.metric_kind == "rent_per_area" and m.row.table_index is not None]
     assert set(table) == first
     assert json.loads(T.tool_calculate(ws, f"count({', '.join(table + table)})", "ספירה"))["n"] == 4
+
+
+# --- a run is stored batch by batch and continued after it died (U4) ---------------------------------------------
+
+def _keys(office) -> list[tuple]:
+    return sorted((m.statement_key, m.metric_kind, str(m.value)) for m in rows(office))
+
+
+def test_each_batch_is_stored_as_it_is_read_and_a_dead_run_continues_from_its_last_batch(office, monkeypatch):
+    from app.measurements import extract as M
+
+    real = M.batches
+    monkeypatch.setattr(M, "batches", lambda passages, limit=300: real(passages, limit))  # several batches
+    first = run(office)
+    reference = _keys(office)
+    with tenant_tx(office.system) as conn:
+        n_batches = len(M.batches(M.load_passages(conn, office.ver)))
+    assert first.state == "done" and n_batches >= 3 and reference
+
+    calls = {"n": 0}
+
+    def dying(instructions, input):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("worker died")
+        return _model(instructions, input)
+
+    monkeypatch.setattr(M, "WORKERS", 1)  # the third call is the third batch
+    with pytest.raises(RuntimeError):
+        extract_version(office.system, office.ver, ScriptedProvider().on(Purpose.MEASURE, dying, repeat=True))
+    with tenant_tx(office.system) as conn:
+        r = conn.execute(text("SELECT state, passages_total, passages_done, found, detail FROM measurement_runs"
+                              " WHERE extraction_version = :e"), {"e": EXTRACTION_VERSION}).one()
+        passages = M.load_passages(conn, office.ver)
+    sizes = [len(b) for b in M.batches(passages)]
+    assert r.state == "pending" and r.passages_total == len(passages)
+    assert r.detail["done_batches"] == [0, 1] and r.passages_done == sizes[0] + sizes[1]  # progress as it went
+
+    resumed = ScriptedProvider().on(Purpose.MEASURE, _model, repeat=True)
+    result = extract_version(office.system, office.ver, resumed)
+    assert len(resumed.calls) == n_batches - 2  # the two stored batches were not read again
+    assert result.state == "done" and _keys(office) == reference
+    with tenant_tx(office.system) as conn:
+        done = conn.execute(text("SELECT state, passages_done, passages_total FROM measurement_runs")).one()
+    assert (done.state, done.passages_done) == ("done", len(passages))
+
+
+def test_a_new_run_replaces_the_old_ones_unreviewed_measurements_and_leaves_no_duplicates(office, monkeypatch):
+    from app.measurements import extract as M
+
+    real = M.batches
+    monkeypatch.setattr(M, "batches", lambda passages, limit=300: real(passages, limit))
+    run(office)
+    before = _keys(office)
+    with tenant_tx(office.system) as conn:  # a stale row no passage will replace
+        conn.execute(text("UPDATE measurements SET block_index = 99999, table_index = NULL, statement_key = 'stale'"
+                          " WHERE id = (SELECT id FROM measurements ORDER BY id LIMIT 1)"))
+    run(office)
+    assert _keys(office) == before  # replaced batch by batch, the stale one removed at the end

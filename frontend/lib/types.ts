@@ -36,6 +36,17 @@ export interface Version {
   processed_at: string | null;
   mime_type: string;
   reading?: VersionReading;
+  /** How far a version being processed has read; null before it reports or once it is done. */
+  progress?: VersionProgress | null;
+  /** Failed for a reason reading the file again can cure (the time limit, an old page limit): an admin may retry. */
+  retriable?: boolean;
+}
+
+/** A version being processed: the stage (``INGEST_STAGE_LABEL``) and, once the file is open, pages read of total. */
+export interface VersionProgress {
+  stage: string;
+  pages_done: number | null;
+  pages_total: number | null;
 }
 
 /** What was read of a version, kept apart (searchable passages are not structured records). */

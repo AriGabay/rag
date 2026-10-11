@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 MSG_DEADLINE = "חריגה מזמן העיבוד המותר למסמך"
+MSG_TOO_MANY_PAGES = "המסמך ארוך מהמותר: {n} עמודים (המקסימום הוא {limit} עמודים)"
 COVERAGE_REGIONS_MAX = 40  # regions listed per page in the reading report (the rest are counted)
 
 
@@ -19,6 +20,17 @@ class ExtractionError(Exception):
         super().__init__(reason)
         self.reason = reason
         self.permanent = permanent
+
+
+class ExtractionPaused(Exception):
+    """A staged reading (KTD2) stopped cleanly at a window or batch boundary because the job's time was spent. What it
+    finished is kept; the next job attempt continues from there. ``progressed``: whether this run finished a unit of
+    work (a window or a batch) before stopping. A run that did not counts as a failed attempt, so a reading that
+    cannot advance ends instead of looping."""
+
+    def __init__(self, progressed: bool):
+        super().__init__("paused")
+        self.progressed = progressed
 
 
 def check_deadline(deadline: float) -> None:

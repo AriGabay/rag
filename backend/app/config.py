@@ -170,7 +170,8 @@ class Settings(BaseSettings):
     extract_doc_char_budget: int = 60_000
 
     max_upload_mb: int = 50
-    max_pages: int = 300
+    max_pages: int = 2000  # a ceiling: a PDF is read in windows of ``ingest_window_pages``, each within the job's time
+    ingest_window_pages: int = Field(default=50, ge=1)
     max_batch_files: int = 20
     max_render_pixels: int = 40_000_000
     max_docx_uncompressed_mb: int = 100

@@ -33,8 +33,8 @@ from app.extraction.render import (  # noqa: F401 - the view's scales
     render_page,
     render_png,
 )
-from app.platform.jobs import enqueue_positions, enqueue_processing, positions_job_key
-from app.platform.storage import get_storage, storage_key
+from app.platform.jobs import enqueue_positions, enqueue_processing, positions_job_key, retriable_failure
+from app.platform.storage import get_storage, staging_prefix, storage_key
 
 logger = logging.getLogger(__name__)
 
@@ -218,8 +218,21 @@ def _version_json(row) -> dict:
         "records_total": row.records_total, "records_needing_review": row.records_needing_review,
         "is_current": row.is_current, "created_at": row.created_at.isoformat(),
         "processed_at": row.processed_at.isoformat() if row.processed_at else None, "mime_type": row.mime_type,
-        "reading": _reading(row),
+        "reading": _reading(row), "progress": _progress(row),
+        # an admin may process a version again without a re-upload when it failed for the time limit or a page limit
+        # it now fits (R2)
+        "retriable": row.status == "failed" and retriable_failure(row.status_reason, get_settings().max_pages),
     }
+
+
+def _progress(row) -> dict | None:
+    """How far a version being processed has read (R3): the pages read and the pages in the file once the file is
+    open, and the stage (``pdf_windows.STAGE_*``, ``pipeline.STAGE_*``); None when it is not being processed or has
+    not reported yet. A long file reports every window."""
+    ing = getattr(row, "ingestion", None) or {}
+    if row.status not in ("pending", "processing") or not ing.get("stage"):
+        return None
+    return {"stage": ing["stage"], "pages_done": ing.get("pages_done"), "pages_total": ing.get("pages_total")}
 
 
 def coverage_of(ing: dict) -> list[dict]:
@@ -364,8 +377,15 @@ def delete_document(document_id: str, ctx: TenantContext = Depends(get_ctx)) -> 
             text("UPDATE documents SET deleted_at = now(), deleted_by = :u WHERE id = :d"),
             {"u": ctx.user_id, "d": doc_uuid},
         )
+        versions = conn.execute(text("SELECT id FROM document_versions WHERE document_id = :d"),
+                                {"d": doc_uuid}).scalars().all()
         bump_data_version(conn)
         audit(conn, "document_delete", ctx.user_id, "document", doc_uuid)
+    for version in versions:  # a reading still in progress leaves nothing staged behind
+        try:
+            get_storage().delete_prefix(staging_prefix(ctx.office_id, version))
+        except (OSError, ValueError):
+            logger.warning("staged files of version %s were not deleted", version, exc_info=True)
     return {"ok": True}
 
 

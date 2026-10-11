@@ -4,6 +4,9 @@ error stops at once. Synthetic fixtures and a scripted reader only; no model is 
 
 from __future__ import annotations
 
+import time
+import uuid
+
 import pytest
 
 from app.extraction import regions
@@ -62,3 +65,53 @@ def test_a_configuration_error_stops_without_reading_the_rest():
     with pytest.raises(ExtractionError) as exc:
         extract(R1, first, MemoryCache())
     assert exc.value.permanent is True
+
+
+# --- the same, with the file read in windows through a staging area (U4) ------------------------------------------
+
+OFFICE, VERSION = uuid.uuid4(), uuid.uuid4()
+
+
+def _staged(path, vision, cache, tmp_path, window):
+    """The file read through the staging area under ``tmp_path`` (a second call continues the first's)."""
+    from app.config import get_settings
+    from app.extraction import pdf_windows
+    from app.platform.storage import LocalStorage
+
+    get_settings().ingest_window_pages = window
+    stage = pdf_windows.StorageStage(LocalStorage(tmp_path), OFFICE, VERSION, "a" * 64)
+    return pdf_windows.read_pdf(path.read_bytes(), time.monotonic() + 600, get_settings(), vision, cache, stage), stage
+
+
+@pytest.fixture
+def windows():
+    from app.config import get_settings
+
+    before = get_settings().ingest_window_pages
+    yield
+    get_settings().ingest_window_pages = before
+
+
+@pytest.mark.parametrize("path", [R1, R7], ids=["raster_table", "repeated_pictures"])
+def test_regions_read_through_windows_give_the_same_reading_and_the_same_model_calls(path, tmp_path, windows):
+    direct_vision, staged_vision = ScriptedVision(), ScriptedVision()
+    direct = extract(path, direct_vision, MemoryCache())
+    staged, _ = _staged(path, staged_vision, MemoryCache(), tmp_path, 1)
+    assert [(b.kind, b.page, b.status, b.text, b.bbox, b.content_hash) for b in staged.blocks] == [
+        (b.kind, b.page, b.status, b.text, b.bbox, b.content_hash) for b in direct.blocks]
+    assert staged.tables == direct.tables and staged.repeated == direct.repeated
+    assert sorted(staged_vision.calls) == sorted(direct_vision.calls)  # each distinct content read once, as in one go
+
+
+def test_a_transient_failure_through_windows_is_continued_by_the_next_attempt_which_reads_only_the_failed_region(
+        tmp_path, windows):
+    cache = MemoryCache()
+    first = ScriptedVision(fail={TABLE: "timeout"})
+    with pytest.raises(VisionUnavailable) as exc:
+        _staged(R1, first, cache, tmp_path, 1)
+    assert exc.value.permanent is False and LOGO in first.calls
+    retry = ScriptedVision()
+    result, stage = _staged(R1, retry, cache, tmp_path, 1)
+    assert stage.state["windows_done"] == 10  # the windows and the regions that were read stayed: not read again
+    assert set(retry.calls) == {TABLE}  # only the failed region is read again
+    assert result.tables == extract(R1, ScriptedVision()).tables

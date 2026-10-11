@@ -8,11 +8,16 @@ ingestion.
 A reindex never writes before its gate, so a reindex job that ends without replacing the reading (a regression,
 or a transient failure after its bounded attempts) ends as ``kept_previous``, not ``failed`` (KTD9): the version keeps
 its current reading and stays available, and its ingestion report records why (``reprocess_kept``). No admin action
-is needed; an admin may still re-queue it (``_requeue`` resets ``kept_previous`` jobs too)."""
+is needed; an admin may still re-queue it (``_requeue`` resets ``kept_previous`` jobs too).
+
+A long PDF's ingestion job that stops at a window or batch boundary because its time is spent is queued again by
+``requeue_paused``; the claim's attempt is given back when the run finished a unit of work, and counts when it did not.
+``enqueue_retry`` processes a failed version again (its time limit or an old page limit) without a re-upload."""
 
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -21,6 +26,7 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from app.config import get_settings
+from app.extraction.base import MSG_DEADLINE, MSG_TOO_MANY_PAGES
 from app.extraction.default import PDF_MIME
 from app.extraction.geometry import POSITIONS_VERSION
 
@@ -169,6 +175,50 @@ def fail_job(conn: Connection, job_id: UUID, error: str, permanent: bool, attemp
     if status == "kept_previous" and job.version_id is not None:
         record_kept_previous(conn, job.version_id, error, attempts)
     return terminal
+
+
+def requeue_paused(conn: Connection, job_id: UUID, progressed: bool, attempts: int, max_attempts: int) -> bool:
+    """A staged reading stopped at a window or batch boundary because the job's time was spent (KTD2). One that
+    finished a unit of work is queued again at once and does not consume an attempt (the claim counted one; it is
+    given back). One that finished none counts as a failed attempt with the deadline as its reason, so a reading
+    that cannot advance ends after ``max_attempts`` instead of looping. True when the job is now terminal."""
+    if not progressed:
+        return fail_job(conn, job_id, MSG_DEADLINE, False, attempts, max_attempts)
+    conn.execute(
+        text("UPDATE jobs SET status = 'queued', attempts = GREATEST(attempts - 1, 0), locked_by = NULL,"
+             " lease_until = NULL, run_after = now(), last_error = NULL, updated_at = now() WHERE id = :j"),
+        {"j": job_id},
+    )
+    return False
+
+
+# a failure that reading the file again can cure: it ran out of time, or it was over a page limit that has since been
+# raised (the reason names the file's pages)
+_PAGE_LIMIT = re.compile(re.escape(MSG_TOO_MANY_PAGES).replace(re.escape("{n}"), r"(\d+)")
+                         .replace(re.escape("{limit}"), r"\d+"))
+
+
+def retriable_failure(reason: str | None, max_pages: int | None = None) -> bool:
+    """Whether a version that failed with ``reason`` can be processed again without a re-upload: the time limit, or a
+    page limit the file now fits (``max_pages``, the current ceiling)."""
+    if not reason:
+        return False
+    if reason == MSG_DEADLINE:
+        return True
+    found = _PAGE_LIMIT.fullmatch(reason)
+    return bool(found) and int(found.group(1)) <= (max_pages if max_pages is not None else get_settings().max_pages)
+
+
+def enqueue_retry(conn: Connection, version_id: UUID) -> bool:
+    """Process a failed version again, keeping its document and version rows. The version goes back to ``pending``
+    (the documents screen shows it queued) and its ingestion job, one per version, is reset to queued. Idempotent: a
+    version that is not failed or whose job is queued or running is left alone. True when it was queued."""
+    queued = _requeue(conn, version_id, "process", f"process:{version_id}", {"mode": "retry"})
+    if queued:
+        conn.execute(text("UPDATE document_versions SET status = 'pending', status_reason = NULL, processed_at = NULL,"
+                          " ingestion = COALESCE(ingestion, '{}'::jsonb) - 'stage' - 'pages_done' - 'pages_total'"
+                          " WHERE id = :v AND status = 'failed'"), {"v": version_id})
+    return queued
 
 
 def _requeue(conn: Connection, version_id: UUID, kind: str, key: str, payload: dict) -> bool:

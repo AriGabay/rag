@@ -311,6 +311,13 @@ export const api = {
   document: (id: string) => request<DocumentDetail>(`/api/documents/${encodeURIComponent(id)}`),
   deleteDocument: (id: string) =>
     request<{ ok: true }>(`/api/documents/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  /** Admin: process the document's failed version again without a re-upload (a version failed by the time limit or an
+   * old page limit). Idempotent: a second call while it is queued queues nothing. */
+  retryProcessing: (documentId: string) =>
+    request<{ queued: number; retried: string[] }>("/api/admin/reprocess", {
+      method: "POST",
+      body: { document_id: documentId, retry_failed: true },
+    }),
   search: (q: string, limit = 20) => request<{ results: SearchResult[] }>(`/api/search${qs({ q, limit })}`),
 
   // Review

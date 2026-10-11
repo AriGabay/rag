@@ -28,6 +28,7 @@ import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 from uuid import UUID
@@ -681,11 +682,50 @@ def _call(provider: LLMProvider, batch: list[Passage]) -> list[tuple[list[Passag
     return [(batch, (result.parsed if result.status == CallStatus.OK else None), result)]
 
 
+@dataclass
+class _Run:
+    """The state of a version's measurement run, kept in ``measurement_runs`` between job attempts."""
+
+    started: datetime  # measurements created before it are the earlier run's, replaced as the new run reads
+    done_batches: list[int]
+    passages_done: int = 0
+    found: int = 0
+
+
+def _begin_run(conn: Connection, document_id: UUID, version_id: UUID, passages: list[Passage],
+               n_batches: int) -> _Run:
+    """Start the run, or continue the one an earlier attempt left ``pending`` on the same reading and batches: its
+    finished batches are kept (their measurements are stored) and only the rest are read."""
+    reading = conn.execute(text("SELECT ingestion->>'reading_id' FROM document_versions WHERE id = :v"),
+                           {"v": version_id}).scalar_one_or_none()
+    prior = conn.execute(text(
+        "SELECT state, passages_total, passages_done, found, detail FROM measurement_runs WHERE version_id = :v"
+        " AND extraction_version = :e FOR UPDATE"), {"v": version_id, "e": EXTRACTION_VERSION}).first()
+    detail = (prior.detail or {}) if prior is not None else {}
+    if (prior is not None and prior.state == "pending" and prior.passages_total == len(passages)
+            and detail.get("reading_id") == reading and detail.get("batches") == n_batches and detail.get("started")):
+        return _Run(datetime.fromisoformat(detail["started"]), list(detail.get("done_batches") or []),
+                    prior.passages_done, prior.found)
+    started = conn.execute(text("SELECT now()")).scalar_one()
+    fresh = json.dumps({"reading_id": reading, "batches": n_batches, "started": started.isoformat(),
+                        "done_batches": []})
+    conn.execute(text(
+        "INSERT INTO measurement_runs (office_id, document_id, version_id, extraction_version, state,"
+        " passages_total, detail) VALUES (app_office(), :d, :v, :e, 'pending', :n, CAST(:j AS jsonb)) ON CONFLICT"
+        " (version_id, extraction_version) DO UPDATE SET state = 'pending', passages_total = :n, passages_done = 0,"
+        " found = 0, detail = CAST(:j AS jsonb), updated_at = now()"),
+        {"d": document_id, "v": version_id, "e": EXTRACTION_VERSION, "n": len(passages), "j": fresh})
+    return _Run(started, [])
+
+
 def extract_version(ctx: TenantContext, version_id: UUID, provider: LLMProvider) -> RunResult:
     """Read one version's passages through the model and store its measurements (replacing this extraction
-    version's unreviewed ones, keeping reviewed decisions; see ``store``)."""
+    version's unreviewed ones, keeping reviewed decisions; see ``store``). Each batch is stored as it is read, and
+    ``passages_done`` moves with it: a run that dies is continued by the next attempt from its last stored batch
+    (``_begin_run``). The measurements of an earlier run are replaced as the new run reads their passages, and, when
+    every batch was read, the ones no passage replaced are removed at the end."""
     from app.answering.content import log_usage
-    from app.measurements.store import store_rows
+    from app.measurements.store import REVIEWED, store_rows
     from app.providers.llm import for_purpose
 
     provider = for_purpose(provider, Purpose.MEASURE)
@@ -696,48 +736,65 @@ def extract_version(ctx: TenantContext, version_id: UUID, provider: LLMProvider)
             return RunResult("failed", 0, 0, 0)
         document_id = row.document_id
         passages = load_passages(conn, version_id)
-        conn.execute(text(
-            "INSERT INTO measurement_runs (office_id, document_id, version_id, extraction_version, state,"
-            " passages_total) VALUES (app_office(), :d, :v, :e, 'pending', :n) ON CONFLICT (version_id,"
-            " extraction_version) DO UPDATE SET state = 'pending', passages_total = :n, passages_done = 0,"
-            " updated_at = now()"), {"d": document_id, "v": version_id, "e": EXTRACTION_VERSION, "n": len(passages)})
+        groups = batches(passages)
+        run = _begin_run(conn, document_id, version_id, passages, len(groups))
     by_id = {p.pid: p for p in passages}
-    rows: list[Row] = []
+    todo = [i for i in range(len(groups)) if i not in run.done_batches]
     failed = 0
-    done = 0
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        results = [r for rs in pool.map(lambda b: _call(provider, b), batches(passages)) for r in rs]
-    with tenant_tx(ctx) as conn:  # its own transaction: a run that fails below was still billed for its calls
-        for _, out, result in results:
-            log_usage(conn, provider, Purpose.MEASURE.value, result, out is not None)
-    with tenant_tx(ctx) as conn:
-        for batch, out, result in results:
-            if out is None:
-                if result.status != CallStatus.INCOMPLETE or len(batch) == 1:
-                    failed += 1  # a split batch is accounted for by its halves
+    pool = ThreadPoolExecutor(max_workers=WORKERS)
+    try:
+        for i, results in zip(todo, pool.map(lambda i: _call(provider, groups[i]), todo), strict=True):
+            with tenant_tx(ctx) as conn:  # its own transaction: a run that fails below was still billed for its calls
+                for _, out, result in results:
+                    log_usage(conn, provider, Purpose.MEASURE.value, result, out is not None)
+            rows: list[Row] = []
+            ok: list[Passage] = []
+            lost = 0
+            for batch, out, result in results:
+                if out is None:
+                    if result.status != CallStatus.INCOMPLETE or len(batch) == 1:
+                        lost += 1  # a split batch is accounted for by its halves
+                    continue
+                ok += batch
+                rows.extend(validate_text(out.measurements, by_id))
+                for a in out.tables:
+                    p = by_id.get(a.passage_id)
+                    if p is not None and p.kind == "table":
+                        rows.extend(expand_table(a, p))
+            failed += lost
+            if not ok:
                 continue
-            done += len(batch)
-            rows.extend(validate_text(out.measurements, by_id))
-            for a in out.tables:
-                p = by_id.get(a.passage_id)
-                if p is not None and p.kind == "table":
-                    rows.extend(expand_table(a, p))
-        if not done and failed:
+            read = ({p.block_index for p in ok if p.kind == "text"}, {p.table_index for p in ok if p.kind == "table"})
+            with tenant_tx(ctx) as conn:
+                run.found += store_rows(conn, document_id, version_id, rows, EXTRACTION_VERSION, provider.model,
+                                        read=read, before=run.started)
+                run.passages_done += len(ok)
+                if not lost:
+                    run.done_batches.append(i)
+                conn.execute(text(
+                    "UPDATE measurement_runs SET passages_done = :d, found = :f, detail = detail ||"
+                    " jsonb_build_object('done_batches', CAST(:b AS jsonb)), updated_at = now() WHERE version_id = :v"
+                    " AND extraction_version = :e"),
+                    {"d": run.passages_done, "f": run.found, "b": json.dumps(run.done_batches), "v": version_id,
+                     "e": EXTRACTION_VERSION})
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True)
+    with tenant_tx(ctx) as conn:
+        if not run.passages_done and failed:
             # nothing was read: the earlier measurements stay, and the job fails so it is tried again
             conn.execute(text(
-                "UPDATE measurement_runs SET state = 'failed', detail = CAST(:j AS jsonb), updated_at = now()"
+                "UPDATE measurement_runs SET state = 'failed', detail = detail || CAST(:j AS jsonb), updated_at = now()"
                 " WHERE version_id = :v AND extraction_version = :e"),
                 {"v": version_id, "e": EXTRACTION_VERSION, "j": json.dumps({"failed_batches": failed})})
             raise MeasurementRunFailed(f"{failed} batches failed")
-        read = None
-        if failed:  # a partial run replaces only what it read again
-            ok = [p for batch, out, _ in results if out is not None for p in batch]
-            read = ({p.block_index for p in ok if p.kind == "text"}, {p.table_index for p in ok if p.kind == "table"})
-        stored = store_rows(conn, document_id, version_id, rows, EXTRACTION_VERSION, provider.model, read=read)
-        state = "done" if failed == 0 else "partial"
+        if not failed:  # every passage was read: what no passage replaced is gone
+            conn.execute(text("DELETE FROM measurements WHERE version_id = :v AND NOT (status = ANY(:r))"
+                              " AND created_at < :b"), {"v": version_id, "r": list(REVIEWED), "b": run.started})
         conn.execute(text(
-            "UPDATE measurement_runs SET state = :s, passages_done = :d, found = :f, detail = CAST(:j AS jsonb),"
-            " updated_at = now() WHERE version_id = :v AND extraction_version = :e"),
-            {"s": state, "d": done, "f": stored, "v": version_id, "e": EXTRACTION_VERSION,
-             "j": json.dumps({"failed_batches": failed})})
-    return RunResult(state, stored, len(passages), failed)
+            "UPDATE measurement_runs SET state = :s, passages_done = :d, found = :f, detail = detail ||"
+            " CAST(:j AS jsonb), updated_at = now() WHERE version_id = :v AND extraction_version = :e"),
+            {"s": "done" if not failed else "partial", "d": run.passages_done, "f": run.found,
+             "v": version_id, "e": EXTRACTION_VERSION, "j": json.dumps({"failed_batches": failed})})
+    return RunResult("done" if not failed else "partial", run.found, len(passages), failed)

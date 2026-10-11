@@ -25,3 +25,14 @@ class DefaultExtractor:
 
             return extract_docx(data, deadline, settings, vision, readings)
         raise ExtractionError(MSG_UNSUPPORTED, True)
+
+    def extract_staged(self, data: bytes, mime_type: str, deadline: float, vision, readings, stage,
+                       progress=None) -> ExtractionResult:
+        """A PDF read in page windows through ``stage`` (KTD2): what an earlier attempt of the same reading finished is
+        kept, ``progress`` hears (pages read, pages in the file, stage), and the time running out stops the call at a
+        window or batch boundary (``ExtractionPaused``) instead of failing it. Only PDFs have windows."""
+        if mime_type != PDF_MIME:
+            raise ExtractionError(MSG_UNSUPPORTED, True)
+        from app.extraction.pdf_windows import read_pdf
+
+        return read_pdf(data, deadline, get_settings(), vision, readings, stage, progress, soft=True)

@@ -69,14 +69,19 @@ def orientation_evidence(text: str) -> tuple[int, int]:
     return logical, visual
 
 
-def looks_visual(text: str, margin: int = 1) -> bool | None:
-    """True = visual order, False = logical, None = no decision at this margin."""
-    logical, visual = orientation_evidence(text)
+def visual_from_evidence(logical: int, visual: int, margin: int = 1) -> bool | None:
+    """True = visual order, False = logical, None = no decision at this margin. Evidence adds up over words, so a
+    document's counts are the sum of its pages' counts."""
     if visual - logical >= margin:
         return True
     if logical - visual >= margin:
         return False
     return None
+
+
+def looks_visual(text: str, margin: int = 1) -> bool | None:
+    """True = visual order, False = logical, None = no decision at this margin."""
+    return visual_from_evidence(*orientation_evidence(text), margin)
 
 
 def _balanced(s: str) -> bool:
