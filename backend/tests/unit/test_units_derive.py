@@ -299,8 +299,66 @@ def test_page_numbers_come_from_the_label_or_the_page_number_line():
     pages = [page(1, 1), page(2, 2), page(3, 1), page(4, None, printed="4"), page(5, None, printed="iv"),
              SimpleNamespace(page_no=6, printed_label=None, edge="נתונים\nעוד שורה\nטבלה\n12")]
     assert units.page_numbers(pages) == {1: 1, 2: 2, 3: 1, 4: 4, 6: 12}
-    assert units.label_restarts({1: 1, 2: 2, 3: 1, 4: 2}) == {3}
-    assert units.label_restarts({2: 1, 3: 2}) == set()  # the first numbered page is not a restart
+    assert set(units.label_restarts({1: 1, 2: 2, 3: 1, 4: 2})) == {3}
+    assert set(units.label_restarts({2: 1, 3: 2})) == set()  # the first numbered page is not a restart
+
+
+def test_a_page_number_block_by_position_is_read_even_when_other_lines_follow_it():
+    d = Doc()
+    d.page(1, None)
+    d.add("paragraph", 1, "הנכס נבדק בסיור שנערך לצורך ההערכה.", 100.0)
+    d.add("paragraph", 1, "מסמך סינתטי לדמו | עמוד 7", 709.0, h=9.0)  # the footer, then more lines in reading order
+    d.add("paragraph", 1, "כתובת המשרד: רחוב הדמיון 3, כפר הדמה", 735.0, h=9.0)
+    d.add("paragraph", 1, "טלפון 03-0000000", 748.0, h=9.0)
+    d.pages[0].edge = "הנכס נבדק בסיור\nשורה\nשורה\nשורה\nשורה\nשורה\nשורה\nשורה\nשורה\nשורה"  # no number in the edge
+    assert units.page_numbers(d.pages, d.blocks) == {1: 7}
+    assert units.page_numbers(d.pages) == {}  # without the blocks, nothing in the text edge says it
+    d.pages[0].printed_label = "9"
+    assert units.page_numbers(d.pages, d.blocks) == {1: 9}  # a stored label comes first
+    # a body line that merely mentions a page is not a page-number block, nor is a short block in the middle
+    d.pages[0].printed_label = None
+    d.blocks[1].bbox = [300.0, 400.0, 550.0, 409.0]
+    assert units.page_numbers(d.pages, d.blocks) == {}
+    # the text edge reaches past the last lines: the number line is the 6th from the end
+    lines = ["שורה"] * 4 + ["מסמך סינתטי לדמו | עמוד 12"] + ["שורה"] * 5
+    d.pages[0].edge = "\n".join(lines)
+    assert units.page_numbers(d.pages) == {1: 12}
+
+
+def test_a_numbering_that_drops_places_the_boundary_at_the_first_unnumbered_page_after_the_old_sequence():
+    # pages 1-4 are numbered 1-4, pages 5-6 are the next report's cover, page 7 is numbered 3, page 8 numbered 4
+    found = units.label_restarts({1: 1, 2: 2, 3: 3, 4: 4, 7: 3, 8: 4})
+    assert found == {5: {"rule": "number_drop", "previous_page": 4, "numbered_page": 7}}
+    assert units.label_restarts({1: 1, 2: 2, 3: 1}) == {3: {"rule": "number_drop", "previous_page": 2,
+                                                            "numbered_page": 3}}
+    assert units.label_restarts({1: 5, 2: 6, 4: 2}) .keys() == {3}  # one unnumbered page, then a drop
+    d = Doc()
+    for n in range(1, 9):
+        d.page(n, {1: 1, 2: 2, 3: 3, 4: 4, 7: 3, 8: 4}.get(n))
+        d.chapters(n, [CHAPTERS[(n - 1) % 6]], top=60.0)
+    first, second = d.derive()
+    assert second.page_first == 5 and first.page_last == 4  # the cover pages open the second unit
+    assert second.certainty == PROBABLE and second.evidence["boundary"]["signals"] == [units.LABEL_RESTART]
+    assert second.evidence["boundary"]["detail"] == {
+        "label_restart": {"rule": "number_drop", "previous_page": 4, "numbered_page": 7}}
+
+
+def test_a_repeated_title_layout_alone_never_cuts_but_with_a_strong_signal_the_cut_is_certain():
+    def report(labels: dict[int, int | None]) -> Doc:
+        d = Doc()
+        for n in range(1, 5):
+            d.page(n, labels.get(n))
+            d.title_block(n, "פרק " + CHAPTERS[n - 1], letterhead=False)  # every page opens with a title block
+            d.add("paragraph", n, f"המועד הקובע לפרק: 0{n}/04/2025", 72.0, h=10.0)
+            d.chapters(n, [CHAPTERS[n - 1]], top=150.0)
+        return d
+
+    (only,) = report({}).derive()
+    assert (only.kind, only.certainty) == (DOCUMENT, UNSPLIT)
+    first, second = report({1: 1, 2: 2, 3: 1, 4: 2}).derive()
+    assert second.page_first == 3
+    assert second.evidence["boundary"]["signals"] == [units.LABEL_RESTART, units.TITLE_BLOCK_REPEAT]
+    assert second.certainty == CERTAIN
 
 
 # --- kind --------------------------------------------------------------------------------------------------------------
@@ -311,6 +369,8 @@ def test_a_table_dominant_part_is_comparables_and_a_cover_before_the_first_appra
     d.page(1, None)
     d.title_block(1, "אוסף שומות של משרד דמו")
     d.add("paragraph", 1, "המסמך כולל שלוש שומות ונספח.", 119.0)
+    d.add("paragraph", 1, "תוכן עניינים", 135.0, h=12.0)
+    d.add("paragraph", 1, "פרויקט שדרות האלון ........ 2", 150.0)  # the cover names where the first appraisal starts
     d.appraisal(2, "פרויקט שדרות האלון", "שדרות האלון 14", "31102", "7", label=1)
     d.appraisal(4, "מתחם גבעת הרקפות", "רחוב הרקפת 8", "31140", "22", label=1)
     d.page(6, 1)
@@ -326,7 +386,7 @@ def test_a_table_dominant_part_is_comparables_and_a_cover_before_the_first_appra
 
 def test_evidence_holds_block_indexes_and_rule_names_only():
     allowed = {"file_start", "prominent_title_line", "project_phrase", "address", "numbered_chapters",
-               "appendix_marker", "image_title", "quoted_name", *units.SIGNALS}
+               "appendix_marker", "image_title", "quoted_name", "number_drop", *units.SIGNALS}
 
     def strings(node):
         if isinstance(node, dict):
@@ -341,7 +401,8 @@ def test_evidence_holds_block_indexes_and_rule_names_only():
 
     for u in compendium().derive():
         assert not {s for s in strings(u.evidence)} - allowed - {
-            "boundary", "rule", "signals", "block", "page", "title", "aliases", "kind", "blocks", "weak"}
+            "boundary", "rule", "signals", "block", "page", "title", "aliases", "kind", "blocks", "weak", "detail",
+            "previous_page", "numbered_page"}
         assert json.dumps(u.evidence, ensure_ascii=False)
 
 

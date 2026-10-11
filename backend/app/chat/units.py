@@ -10,18 +10,21 @@ blocks it was read from, and a comparable property named in a table or in the te
 model call (R9). A boundary opens before a page (or, for the identifier rule, before a title block) where independent
 signals say a new part starts; each signal is recorded as evidence by name:
 
-- ``label_restart`` — the printed page number goes back to 1 (``pages.printed_label``; when the reading kept no label
-  because the numbering restarts, which ``_printed_labels`` takes for unreliable, the page-number line of the page's
-  stored text);
+- ``label_restart`` — the printed page number drops below the previous numbered page's (``pages.printed_label``; when
+  the reading kept no label because the numbering restarts, which ``_printed_labels`` takes for unreliable, the
+  page-number block in the top or bottom band of the page, then the page-number line of the page's stored text). The
+  boundary is the first page after the old sequence's last numbered page, so a new report's unnumbered cover pages
+  belong to it; the evidence records the pages that show the drop;
 - ``title_block_repeat`` — the page opens with a title block (a prominent single line followed by more lines before
   the first heading) whose layout repeats the file's first title block: same top, same line height (the stored
-  ``bbox`` is pdfplumber's frame; positions are compared within the one document, never rendered);
+  ``bbox`` is pdfplumber's frame; positions are compared within the one document, never rendered). A weak signal:
+  pages of one report share a layout, so it never cuts alone;
 - ``toc_entry`` — a table-of-contents entry maps the title the page opens with to that page;
 - ``identifier_numbering_restart`` — the restated-identifier rule of ``contexts.derive``, reused as is.
 
-Two signals or more make the cut ``certain``, one makes it ``probable`` (R8: it stays marked, and reading may extend
-across it), none: no cut. A file with no cut is one unit of kind ``document`` and certainty ``unsplit``: it is not
-presented as an appraisal on the strength of a first heading (R8).
+Two signals or more make the cut ``certain``, one strong signal makes it ``probable`` (R8: it stays marked, and
+reading may extend across it), none, or the weak signal alone: no cut. A file with no cut is one unit of kind ``document`` and certainty
+``unsplit``: it is not presented as an appraisal on the strength of a first heading (R8).
 
 **Identity** is the unit's own title block, the lines at the top of its first page up to the first heading: the title
 is the most prominent line; aliases are quoted names, named-project phrases (a word of ``PROJECT_WORDS`` and the
@@ -67,7 +70,7 @@ from app.extraction.pdf import _PRINTED_NO
 
 logger = logging.getLogger(__name__)
 
-UNITS_VERSION = "units-v1"
+UNITS_VERSION = "units-v2"
 
 # --- kinds, certainty, rule names --------------------------------------------------------------------------------
 
@@ -82,6 +85,9 @@ TOC_ENTRY = "toc_entry"
 IDENTIFIER_RESTART = "identifier_numbering_restart"
 SIGNALS = (LABEL_RESTART, TITLE_BLOCK_REPEAT, TOC_ENTRY, IDENTIFIER_RESTART)
 CERTAIN_SIGNALS = 2  # independent signals that make a cut certain
+# a repeated layout is weak evidence: many pages of one report may share a title block's layout, so it never cuts
+# alone; with a strong signal it makes the cut certain
+WEAK_SIGNALS = frozenset({TITLE_BLOCK_REPEAT})
 
 # --- the vocabulary of a report's structure (never question words) -------------------------------------------------
 
@@ -112,6 +118,9 @@ TOC_TABLE_PAGES = 15  # tables on these first pages bring their text (a TOC set 
 TABLE_DOMINANT = 0.5
 CHAPTERS_MIN = 2
 LABEL_RESTART_AT = 1
+PAGE_NUMBER_ZONE = 0.15  # share of the page height, at its top and bottom, where a page-number block may sit
+PAGE_NUMBER_CHARS = 40  # a page-number block is short
+EDGE_LINES = (3, 8)  # lines read at the start and at the end of a page's stored text for a page-number line
 TEXT_KEPT = 600  # characters of a block's text read for the derivation
 
 _TEXT_KINDS = ("paragraph", "textbox")
@@ -209,35 +218,77 @@ def _picture_title(r, furniture_images: frozenset) -> bool:
 
 
 def _footer_number(edge: str) -> int | None:
-    """The number of the page-number line among the first and last lines of a page's stored text."""
+    """The number of the page-number line among the first and last lines of a page's stored text (``EDGE_LINES``:
+    other lines may follow the number line)."""
     lines = [ln.strip() for ln in edge.splitlines() if ln.strip()]
     found = set()
-    for ln in [*lines[:2], *lines[-2:]]:
+    for ln in [*lines[:EDGE_LINES[0]], *lines[-EDGE_LINES[1]:]]:
         if is_footer(ln) and (m := _PRINTED_NO.search(ln)):
             found.add(int(m.group(1) or m.group(2)))
     return found.pop() if len(found) == 1 else None
 
 
-def page_numbers(pages: Iterable) -> dict[int, int]:
-    """The printed number of each page: its stored label when it ends in a number, else its page-number line."""
+def _block_numbers(blocks: Iterable) -> dict[int, int]:
+    """The printed number of each page from its blocks, by position: a short one-line block in the top or bottom band
+    of the page that is a page-number line ("עמוד 7", "- 7 -"), wherever it falls in the reading order. The page
+    height is that of the lowest block of the file (the stored boxes are in one frame)."""
+    rows = [r for r in blocks if r.page is not None and r.kind in _TEXT_KINDS and getattr(r, "bbox", None)
+            and getattr(r, "table_index", None) is None]
+    bottoms = []
+    for r in rows:
+        try:
+            bottoms.append(float(r.bbox[3]))
+        except (TypeError, ValueError, IndexError):
+            pass
+    if not bottoms:
+        return {}
+    height = max(bottoms)
+    found: dict[int, set[int]] = defaultdict(set)
+    for r in rows:
+        t = _text(r)
+        if not t or "\n" in t or len(t) > PAGE_NUMBER_CHARS or not is_footer(t) or not (m := _PRINTED_NO.search(t)):
+            continue
+        top = _top(r)
+        if top is not None and (top <= PAGE_NUMBER_ZONE * height or top >= (1 - PAGE_NUMBER_ZONE) * height):
+            found[r.page].add(int(m.group(1) or m.group(2)))
+    return {page: next(iter(ns)) for page, ns in found.items() if len(ns) == 1}
+
+
+def page_numbers(pages: Iterable, blocks: Iterable = ()) -> dict[int, int]:
+    """The printed number of each page: its stored label when it ends in a number; else the page-number block in the
+    top or bottom band of the page; else the page-number line among the first and last lines of its stored text."""
+    by_block = _block_numbers(blocks)
     out: dict[int, int] = {}
     for p in pages:
         label = (getattr(p, "printed_label", None) or "").strip()
         m = _LABEL_NUMBER.search(label) if label else None
-        n = int(m.group(1)) if m else (None if label else _footer_number(getattr(p, "edge", None) or ""))
+        if m:
+            n = int(m.group(1))
+        elif label:
+            n = None  # a label that is not a number (roman, lettered) says nothing here
+        else:
+            n = by_block.get(p.page_no)
+            if n is None:
+                n = _footer_number(getattr(p, "edge", None) or "")
         if n is not None:
             out[p.page_no] = n
     return out
 
 
-def label_restarts(numbers: dict[int, int]) -> set[int]:
-    """File pages whose printed number is back to 1 after an earlier numbered page."""
-    out: set[int] = set()
-    seen = False
+def label_restarts(numbers: dict[int, int]) -> dict[int, dict]:
+    """File pages where a new numbering starts, with the pages that show it. A numbered page whose number is below the
+    previous numbered page's (any drop; a second page numbered 1 too) ends the old sequence: the boundary is the
+    first page after the old sequence's last numbered page, which is the numbered page itself or, when unnumbered
+    pages (a cover) lie between, the first of them — a new report's cover pages come before its first printed
+    number."""
+    out: dict[int, dict] = {}
+    prev_page = prev_n = None
     for page in sorted(numbers):
-        if seen and numbers[page] == LABEL_RESTART_AT:
-            out.add(page)
-        seen = True
+        n = numbers[page]
+        if prev_n is not None and (n < prev_n or (n == prev_n == LABEL_RESTART_AT)):
+            out[prev_page + 1 if prev_page + 1 < page else page] = {
+                "rule": "number_drop", "previous_page": prev_page, "numbered_page": page}
+        prev_page, prev_n = page, n
     return out
 
 
@@ -342,6 +393,7 @@ class _Cut:
     block: int
     page: int | None
     signals: set = field(default_factory=set)
+    detail: dict = field(default_factory=dict)
 
 
 def _cuts(c: _Ctx, pages: Sequence, version_id: str) -> list[_Cut]:
@@ -352,13 +404,20 @@ def _cuts(c: _Ctx, pages: Sequence, version_id: str) -> list[_Cut]:
     for i, r in enumerate(rows):
         if r.page is not None:
             lead_at.setdefault(r.page, i)
-    numbers = page_numbers(pages)
-    restarts = label_restarts(numbers)
+    numbers = page_numbers(pages, rows)
+    restart_at: dict[int, dict] = {}  # page that has blocks -> the pages that show the restart
+    for page, detail in label_restarts(numbers).items():
+        resolved = next((q for q in sorted(lead_at) if q >= page), None)
+        if resolved is not None:
+            restart_at.setdefault(resolved, detail)
     toc = _toc_entries(rows)
     cuts: dict[int, _Cut] = {}  # by block
 
-    def add(block: int, page: int | None, signal: str) -> None:
-        cuts.setdefault(block, _Cut(block, page)).signals.add(signal)
+    def add(block: int, page: int | None, signal: str, detail: dict | None = None) -> None:
+        cut = cuts.setdefault(block, _Cut(block, page))
+        cut.signals.add(signal)
+        if detail:
+            cut.detail[signal] = detail
 
     ref = None  # the file's first title block (its lead line)
     for page in sorted(lead_at):
@@ -370,8 +429,8 @@ def _cuts(c: _Ctx, pages: Sequence, version_id: str) -> list[_Cut]:
         block = rows[pos].block_index
         run = _run(c, pos)
         lead = _lead(c, run)
-        if page in restarts:
-            add(block, page, LABEL_RESTART)
+        if page in restart_at:
+            add(block, page, LABEL_RESTART, restart_at[page])
         if lead is not None and ref is not None and _same_layout(lead, ref):
             add(block, page, TITLE_BLOCK_REPEAT)
         if lead is not None and toc:
@@ -389,7 +448,8 @@ def _cuts(c: _Ctx, pages: Sequence, version_id: str) -> list[_Cut]:
             s = rows[lead_pos].block_index  # the title block starts at the page's top (a picture may precede it)
         if s > first_block:
             add(s, page, IDENTIFIER_RESTART)
-    return [cuts[b] for b in sorted(cuts)]
+    # a repeated layout alone cuts nothing
+    return [cuts[b] for b in sorted(cuts) if cuts[b].signals - WEAK_SIGNALS]
 
 
 # --- identity ------------------------------------------------------------------------------------------------------
@@ -549,14 +609,14 @@ def derive(blocks: Iterable, pages: Iterable = (), version_id: str = "", furnitu
     furniture = frozenset(t for t, ps in per_text.items() if t and len(ps) >= need)
     c = _Ctx(rows, body, furniture, frozenset(furniture_images), {})
     cuts = _cuts(c, pages, version_id)
-    starts = [(rows[0].block_index, None, None)] + [(x.block, x.page, x.signals) for x in cuts]
+    starts = [(rows[0].block_index, None, None, {})] + [(x.block, x.page, x.signals, x.detail) for x in cuts]
     ranges = []
-    for n, (first, page, signals) in enumerate(starts):
+    for n, (first, page, signals, detail) in enumerate(starts):
         last = starts[n + 1][0] - 1 if n + 1 < len(starts) else rows[-1].block_index
-        ranges.append((first, last, page, signals))
+        ranges.append((first, last, page, signals, detail))
     indexes = [r.block_index for r in rows]
     position = {b: i for i, b in enumerate(indexes)}
-    runs = [_run(c, position[first]) for first, _, _, _ in ranges]
+    runs = [_run(c, position[first]) for first, _, _, _, _ in ranges]
     # lines that open several units alike are a letterhead, never a title or an alias
     seen: dict[str, int] = defaultdict(int)
     for run in runs:
@@ -564,7 +624,7 @@ def derive(blocks: Iterable, pages: Iterable = (), version_id: str = "", furnitu
             seen[t] += 1
     letterhead = {t for t, k in seen.items() if k >= 2 and len(runs) >= 2} if len(runs) >= 2 else set()
     units: list[Unit] = []
-    for n, ((first, last, page, signals), run) in enumerate(zip(ranges, runs, strict=True), start=1):
+    for n, ((first, last, page, signals, detail), run) in enumerate(zip(ranges, runs, strict=True), start=1):
         own = rows[bisect_left(indexes, first):bisect_right(indexes, last)]
         title, aliases, alias_ev, identifiers, title_ev = _identity(c, run, letterhead)
         kind, kind_ev = _kind(own, run, title, letterhead)
@@ -576,7 +636,7 @@ def derive(blocks: Iterable, pages: Iterable = (), version_id: str = "", furnitu
         else:
             certainty = CERTAIN if len(signals) >= CERTAIN_SIGNALS else PROBABLE
             boundary = {"block": first, "signals": [s for s in SIGNALS if s in signals]} | (
-                {"page": page} if page is not None else {})
+                {"page": page} if page is not None else {}) | ({"detail": detail} if detail else {})
         units.append(Unit(n, kind, title, tuple(aliases), identifiers, None, None, first, last, certainty,
                           {"boundary": boundary, "title": title_ev, "aliases": alias_ev, "kind": kind_ev}))
     # a first unit of a compendium that holds no chapters of its own is front matter
@@ -617,7 +677,7 @@ _ROWS_SQL = (
     " FROM document_blocks b LEFT JOIN pages p ON p.version_id = b.version_id AND p.page_no = b.page"
     " LEFT JOIN extracted_tables t ON t.version_id = b.version_id AND t.table_index = b.table_index"
     " WHERE b.version_id = :v ORDER BY b.block_index")
-_PAGES_SQL = ("SELECT page_no, printed_label, left(text, 300) || E'\\n' || right(text, 300) AS edge FROM pages"
+_PAGES_SQL = ("SELECT page_no, printed_label, left(text, 600) || E'\\n' || right(text, 600) AS edge FROM pages"
               " WHERE version_id = :v ORDER BY page_no")
 NO_READING = ""  # the reading id of a version whose report names none
 
