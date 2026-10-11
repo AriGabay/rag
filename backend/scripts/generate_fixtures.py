@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import random
 import zipfile
 from dataclasses import dataclass, field
@@ -1157,6 +1158,7 @@ class Layout:
         self.paragraphs: list[tuple[str, int | None, int | None]] = []
         self.header_page: int | None = None
         self.table: dict[str, Any] | None = None
+        self.gtables: list[int | None] = []  # held-out documents: physical page of each table
 
 
 def make_pdf_class():
@@ -1166,9 +1168,12 @@ def make_pdf_class():
         visual = False
 
         def footer(self) -> None:  # noqa: D401 - fpdf hook
+            if self.page_no() in getattr(self, "no_footer_pages", ()):
+                return
             self.set_y(-12)
             self.set_font("DejaVu", "", 8)
-            text = f"{SYNTHETIC_MARKER} | עמוד {self.page_no()}"
+            # a printed page number may differ from the file page (a report bound after its cover pages)
+            text = f"{SYNTHETIC_MARKER} | עמוד {self.page_no() + getattr(self, 'page_label_offset', 0)}"
             if self.visual:
                 text = to_visual(text)
             self.cell(0, 6, text, align="C")
@@ -1689,21 +1694,3441 @@ def dedup_section(docs: dict[str, dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------------------- held-out general corpus (U12, KTD16)
+#
+# Appraisal-like documents about attributes the application code never names (safe room, balconies,
+# parking, storage, ceiling height, building age, elevator, planning, building rights, renovation,
+# permits). They go to their own group and `tests/fixtures/general/`. They deliberately produce NO
+# records: the header has no "שווי הנכס:" label (the value is stated in prose only) and no table has a
+# price column, so the existing record counts, dedup pairs and the 77-item evaluation stay unchanged.
+# Their true values live in the `general_facts` section of ground_truth.yaml.
+
+GENERAL_DIR = "general"
+GENERAL_GROUP = {"code": "G3", "name": "ידע כללי"}
+GENERAL_ATTRIBUTES = {
+    "safe_room_area": {"label_he": "שטח ממ״ד", "unit": "m2"},
+    "safe_room_present": {"label_he": "קיום ממ״ד", "unit": None},
+    "balcony_count": {"label_he": "מספר מרפסות", "unit": "count"},
+    "balcony_area": {"label_he": "שטח מרפסות (סך הכול)", "unit": "m2"},
+    "parking_spaces": {"label_he": "מספר חניות", "unit": "count"},
+    "storage_area": {"label_he": "שטח מחסן", "unit": "m2"},
+    "storage_present": {"label_he": "קיום מחסן", "unit": None},
+    "ceiling_height": {"label_he": "גובה תקרה", "unit": "m"},
+    "year_built": {"label_he": "שנת בנייה", "unit": "year"},
+    "floors_in_building": {"label_he": "מספר קומות בבניין", "unit": "count"},
+    "elevator_count": {"label_he": "מספר מעליות", "unit": "count"},
+    "elevator_present": {"label_he": "קיום מעלית", "unit": None},
+    "zoning": {"label_he": "ייעוד המגרש", "unit": None},
+    "planning_status": {"label_he": "מצב תכנוני", "unit": None},
+    "unused_rights": {"label_he": "יתרת זכויות בנייה", "unit": None},
+    "renovation": {"label_he": "שיפוץ", "unit": None},
+    "building_permit": {"label_he": "היתר בנייה", "unit": None},
+    "yard_area": {"label_he": "שטח חצר", "unit": "m2"},
+    "adjustment_rate": {"label_he": "שיעור התאמה", "unit": "percent"},
+}
+# Terms scanned in the EXISTING fixtures so answers over all documents know what they already say.
+EXISTING_MENTION_TERMS = {
+    "safe_room": ("ממ״ד", "מרחב מוגן"),
+    "balcony": ("מרפסת", "מרפסות"),
+    "parking": ("חניה", "חנייה", "חניות"),
+    "storage": ("מחסן",),
+    "ceiling_height": ("תקרה",),
+    "year_built": ("נבנה", "שנות ה"),
+    "elevator": ("מעלית", "מעליות"),
+    "building_permit": ("היתר",),
+    "renovation": ("שיפוץ", "משופצת", "שופצה"),
+    "zoning": ("ייעוד",),
+    "unused_rights": ("זכויות בנייה",),
+}
+
+
+@dataclass
+class GFact:
+    attribute: str
+    value: Any
+    quote: str  # verbatim text of the paragraph (or the exact table cell) that states the value
+    unit: str | None = None
+    entity: str = "subject"  # subject (the appraised unit) | building | plot
+    normalized: dict[str, Any] | None = None  # canonical value when the document uses another unit
+    cell: tuple[int, int] | None = None  # (row, column) for table facts
+    note: str | None = None
+
+
+@dataclass
+class GPara:
+    text: str
+    facts: list[GFact] = field(default_factory=list)
+
+
+@dataclass
+class GTable:
+    title: str
+    headers: list[str]
+    widths: list[int]
+    rows: list[list[str]]
+    facts: list[GFact] = field(default_factory=list)
+
+
+@dataclass
+class GeneralDoc:
+    id: str
+    filename: str
+    kind: str  # pdf_digital | docx
+    title_place: str
+    city: str
+    neighborhood: str
+    address: str
+    block: int
+    parcel: int
+    sub_parcel: int | None
+    ptype: str
+    area: Decimal
+    valuation_date: date
+    report_date: date
+    purpose: str
+    value: Decimal
+    sections: list[tuple[str, list[GPara | GTable]]]
+    subject_key: str
+    environment: list[str] = field(default_factory=list)  # narrative only: pushes later facts to page 2
+    visit: str | None = None  # adds an information-sources section (narrative only)
+    version_of: str | None = None
+    notes: str | None = None
+
+    def header_lines(self) -> list[str]:
+        gp = f"גוש: {self.block} חלקה: {self.parcel}"
+        if self.sub_parcel is not None:
+            gp += f" תת חלקה: {self.sub_parcel}"
+        return [
+            f"עיר: {self.city}",
+            f"שכונה: {self.neighborhood}",
+            f"כתובת הנכס: {self.address}",
+            gp,
+            f"סוג נכס: {PROPERTY_TYPES[self.ptype]}",
+            f"המועד הקובע: {fmt_date(self.valuation_date)}",
+            f"תאריך עריכת השומה: {fmt_date(self.report_date)}",
+            f"שטח הנכס: {dstr(self.area)} מ״ר נטו",
+        ]
+
+    def all_sections(self) -> list[tuple[str, list[GPara | GTable]]]:
+        intro = GPara(
+            f"חוות דעת זו נערכה לבקשת הלקוח לצורך {self.purpose}, על בסיס ביקור בנכס ועיון במסמכים. "
+            f"{SYNTHETIC_MARKER}: כל השמות, הכתובות והמספרים בדויים."
+        )
+        summary = [
+            GPara(
+                "לאור כל האמור לעיל, שווי השוק של הזכויות בנכס נאמד בסך של "
+                f"{fmt_int(self.value)} ₪, נכון למועד הקובע."
+            ),
+            GPara(f"השמאית: רונית לוי (שם בדוי), שמאית מקרקעין. {SYNTHETIC_MARKER} — אין להסתמך עליו."),
+        ]
+        environment = [("תיאור הסביבה", [GPara(t) for t in self.environment])] if self.environment else []
+        if self.visit:
+            environment.append((
+                "מקורות המידע",
+                [
+                    GPara(f"ביקור בנכס נערך בתאריך {self.visit}."),
+                    GPara("נסח רישום מקרקעין שהופק מלשכת רישום המקרקעין, ובו פרטי הבעלות וההערות הרשומות על הנכס."),
+                    GPara("תשריט הבית המשותף ותקנון הבית המשותף, ככל שנמצאו ברשומות."),
+                    GPara("מידע תכנוני שנאסף מאתר הוועדה המקומית לתכנון ולבנייה ומשיחה עם עובדי הוועדה."),
+                    GPara("סקירה כללית של שוק הדירות באזור, על בסיס מאגרי מידע ציבוריים."),
+                ],
+            ))
+        return [("מטרת חוות הדעת", [intro]), *environment, *self.sections, ("סיכום", summary)]
+
+
+def build_general_docs() -> list[GeneralDoc]:
+    def doc(**kw: Any) -> GeneralDoc:
+        return GeneralDoc(kind=kw.pop("kind", "pdf_digital"), ptype=kw.pop("ptype", "apartment"), **kw)
+
+    h1 = doc(
+        id="H1",
+        filename="H1_synthetic_ramatgan_irusim.pdf",
+        title_place="האירוסים 12, רמת גן",
+        city="רמת גן",
+        neighborhood="מרום נווה",
+        address="האירוסים 12",
+        block=6210,
+        parcel=31,
+        sub_parcel=14,
+        area=dec(104),
+        valuation_date=date(2023, 2, 14),
+        report_date=date(2023, 2, 20),
+        purpose="מימון בנקאי",
+        value=dec(3450000),
+        subject_key="רמת גן|6210/31/14",
+        visit="10/02/2023 בנוכחות בעלי הדירה",
+        environment=[
+            "שכונת מרום נווה ממוקמת בחלקה הצפוני-מזרחי של רמת גן, וגובלת בפארק הלאומי ובשטחי ספורט פתוחים. השכונה מאופיינת בבנייה רוויה מגוונת, בחלקה חדשה, ובמבני ציבור רבים.",
+            "ברחוב האירוסים ובסביבתו פועלים גני ילדים, בית ספר יסודי ומרכז קהילתי. בטווח הליכה נמצא מרכז מסחרי שכונתי ובו סופרמרקט, בית מרקחת ובתי קפה.",
+            "הנגישות לצירי התנועה הראשיים טובה, וקווי אוטובוס רבים עוברים ברחובות הסמוכים ומקשרים את השכונה למרכז העיר ולתל אביב.",
+            "השכונה נחשבת מבוקשת בשל השקט והקרבה לשטחים הירוקים, ומספר הדירות החדשות המוצעות בה למכירה קטן.",
+            "בסביבה הקרובה לא אותרו שימושים מטרדיים, ורמת התחזוקה של המרחב הציבורי טובה.",
+        ],
+        notes="Ramat Gan, new building. Safe room stated in a sentence (12 m²); building data in a key/value table.",
+        sections=[
+            (
+                "תיאור הנכס והבניין",
+                [
+                    GPara(
+                        "הנכס הנישום הוא דירת 4.5 חדרים בקומה השישית בבניין מגורים בן תשע קומות ברחוב האירוסים, "
+                        "בשכונת מרום נווה ברמת גן. הדירה כוללת סלון, מטבח פתוח, שלושה חדרי שינה וממ״ד בשטח 12 מ״ר.",
+                        [GFact("safe_room_area", "12", "ממ״ד בשטח 12 מ״ר", unit="m2")],
+                    ),
+                    GPara(
+                        "לדירה מרפסת סלון אחת בשטח 14 מ״ר הפונה לנוף פתוח. לדירה צמודות שתי חניות תת-קרקעיות "
+                        "ומחסן בשטח 5 מ״ר בקומת המרתף.",
+                        [
+                            GFact("balcony_count", 1, "מרפסת סלון אחת בשטח 14 מ״ר", unit="count"),
+                            GFact("balcony_area", "14", "מרפסת סלון אחת בשטח 14 מ״ר", unit="m2"),
+                            GFact("parking_spaces", 2, "שתי חניות תת-קרקעיות", unit="count"),
+                            GFact("storage_area", "5", "מחסן בשטח 5 מ״ר", unit="m2"),
+                        ],
+                    ),
+                    GPara(
+                        "גובה התקרה בדירה 2.75 מ׳. הדירה במצב חדש ולא בוצעו בה שינויים מאז האכלוס.",
+                        [
+                            GFact("ceiling_height", "2.75", "גובה התקרה בדירה 2.75 מ׳", unit="m"),
+                            GFact("renovation", "none", "לא בוצעו בה שינויים מאז האכלוס",
+                                  note="explicitly not renovated since occupancy"),
+                        ],
+                    ),
+                    GTable(
+                        "נתוני הבניין",
+                        ["נתון", "ערך"],
+                        [70, 110],
+                        [
+                            ["שנת סיום הבנייה", "2017"],
+                            ["מספר קומות", "9"],
+                            ["מספר מעליות", "2 (אחת מהן מעלית שבת)"],
+                            ["חניון", "תת-קרקעי, שתי קומות"],
+                        ],
+                        [
+                            GFact("year_built", 2017, "2017", unit="year", entity="building", cell=(0, 1)),
+                            GFact("floors_in_building", 9, "9", unit="count", entity="building", cell=(1, 1)),
+                            GFact("elevator_count", 2, "2 (אחת מהן מעלית שבת)", unit="count", entity="building",
+                                  cell=(2, 1)),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "מצב תכנוני וזכויות",
+                [
+                    GPara(
+                        "על המגרש חלה תכנית רג/מק/2510 (בדויה), וייעוד המגרש הוא מגורים ג׳. לפי בדיקת השמאית, "
+                        "הזכויות במגרש מומשו במלואן ואין יתרה לניצול.",
+                        [
+                            GFact("zoning", "מגורים ג׳", "וייעוד המגרש הוא מגורים ג׳", entity="plot"),
+                            GFact("unused_rights", "none", "הזכויות במגרש מומשו במלואן", entity="plot",
+                                  note="explicitly no unused rights"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "שיקולי השמאית",
+                [
+                    GPara(
+                        "בקביעת השווי הובאו בחשבון גודל הדירה, הקומה הגבוהה, הנוף הפתוח, הצמדת שתי החניות "
+                        "וגיל הבניין הצעיר."
+                    )
+                ],
+            ),
+        ],
+    )
+
+    h2 = doc(
+        id="H2",
+        filename="H2_synthetic_ramatgan_hamaagal.pdf",
+        title_place="המעגל 7, רמת גן",
+        city="רמת גן",
+        neighborhood="תל בנימין",
+        address="המעגל 7",
+        block=6215,
+        parcel=8,
+        sub_parcel=22,
+        area=dec(92),
+        valuation_date=date(2023, 5, 3),
+        report_date=date(2023, 5, 10),
+        purpose="מכירת הנכס",
+        value=dec(2780000),
+        subject_key="רמת גן|6215/8/22",
+        notes="Ramat Gan. Unit data table with the column 'שטח ממ״ד (מ״ר)' (9.5); permit number; unused rights "
+        "of about 60 m²; no ceiling height.",
+        sections=[
+            (
+                "תיאור הנכס והבניין",
+                [
+                    GPara(
+                        "דירת 4 חדרים בקומה השלישית בבניין בן שש קומות ברחוב המעגל בשכונת תל בנימין ברמת גן. "
+                        "נתוני היחידה מרוכזים בטבלה שלהלן."
+                    ),
+                    GTable(
+                        "נתוני היחידה",
+                        ["קומה", "חדרים", "שטח דירה (מ״ר)", "שטח ממ״ד (מ״ר)", "מספר מרפסות", "שטח מרפסות (מ״ר)",
+                         "חניות", "מחסן"],
+                        [16, 16, 26, 26, 24, 28, 18, 26],
+                        [["3", "4", "92", "9.5", "2", "11", "1", "אין"]],
+                        [
+                            GFact("safe_room_area", "9.5", "9.5", unit="m2", cell=(0, 3)),
+                            GFact("balcony_count", 2, "2", unit="count", cell=(0, 4)),
+                            GFact("balcony_area", "11", "11", unit="m2", cell=(0, 5)),
+                            GFact("parking_spaces", 1, "1", unit="count", cell=(0, 6)),
+                            GFact("storage_present", False, "אין", cell=(0, 7)),
+                        ],
+                    ),
+                    GPara(
+                        "הבניין הוקם על פי היתר בנייה מס׳ 2013-0417 (בדוי) ואוכלס בשנת 2015. בבניין פועלת מעלית "
+                        "אחת ולובי כניסה מרווח.",
+                        [
+                            GFact("building_permit", "היתר בנייה מס׳ 2013-0417", "היתר בנייה מס׳ 2013-0417",
+                                  entity="building"),
+                            GFact("year_built", 2015, "ואוכלס בשנת 2015", unit="year", entity="building",
+                                  note="year of occupancy; the permit dates from 2013"),
+                            GFact("elevator_count", 1, "בבניין פועלת מעלית אחת", unit="count", entity="building"),
+                        ],
+                    ),
+                    GPara(
+                        "בשנת 2022 שופץ המטבח והוחלפו הארונות והמשטחים; יתר חלקי הדירה במצבם המקורי.",
+                        [GFact("renovation", "2022: kitchen", "בשנת 2022 שופץ המטבח", note="partial: kitchen only")],
+                    ),
+                ],
+            ),
+            (
+                "מצב תכנוני וזכויות",
+                [
+                    GPara(
+                        "המגרש מצוי בייעוד מגורים ב׳ לפי תכנית רג/340 (בדויה). לפי בדיקת השמאית קיימת במגרש יתרה "
+                        "של כ-60 מ״ר שטח עיקרי שטרם מומשה, והיא שייכת לכלל בעלי הדירות בבניין.",
+                        [
+                            GFact("zoning", "מגורים ב׳", "המגרש מצוי בייעוד מגורים ב׳", entity="plot"),
+                            GFact("unused_rights", "60 m2 main area", "60 מ״ר שטח עיקרי שטרם מומשה",
+                                  entity="plot", normalized={"value": "60", "unit": "m2"},
+                                  note="belongs to all owners in the building"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "שיקולי השמאית",
+                [
+                    GPara(
+                        "השמאית התחשבה בכך שהיתרה שייכת לכלל בעלי הדירות, ולכן ייחסה לה תרומה מוגבלת בלבד "
+                        "לשווי הדירה."
+                    )
+                ],
+            ),
+        ],
+    )
+
+    h3 = doc(
+        id="H3",
+        filename="H3_synthetic_ramatgan_arlozorov.pdf",
+        title_place="ארלוזורוב 88, רמת גן",
+        city="רמת גן",
+        neighborhood="שיכון ותיקים",
+        address="ארלוזורוב 88",
+        block=6218,
+        parcel=12,
+        sub_parcel=5,
+        area=dec(81),
+        valuation_date=date(2023, 7, 19),
+        report_date=date(2023, 7, 25),
+        purpose="פירוק שותפות",
+        value=dec(2640000),
+        subject_key="רמת גן|6218/12/5",
+        visit="17/07/2023 בנוכחות בעלי הדירה",
+        environment=[
+            "שכונת שיכון ותיקים היא שכונת מגורים ותיקה במזרח רמת גן, שעוברת בשנים האחרונות תהליך הדרגתי של בנייה חדשה לצד המבנים המקוריים.",
+            "בשכונה פזורים גנים ציבוריים קטנים, ובקרבת הנכס פועלים בית ספר תיכון, מתנ״ס ובית כנסת. רחוב ארלוזורוב משמש ציר מסחרי מקומי עם חנויות ובתי עסק קטנים.",
+            "התחבורה הציבורית בסביבה זמינה, וקווי אוטובוס מקשרים את השכונה לבני ברק, לגבעתיים ולמרכז רמת גן.",
+            "האוכלוסייה בשכונה מגוונת, והביקוש לדירות בינוניות בה יציב לאורך זמן.",
+            "בסמיכות לנכס לא אותרו מפגעים סביבתיים חריגים, ורמת התחזוקה של המרחב הציבורי סבירה.",
+        ],
+        notes="Ramat Gan. Safe room given as inner dimensions in cm (300 x 350 = 10.5 m²), spelled out "
+        "'מרחב מוגן דירתי'; no parking; storage not stated.",
+        sections=[
+            (
+                "תיאור הנכס והבניין",
+                [
+                    GPara(
+                        "דירת 3.5 חדרים בקומה הרביעית בבניין בן שבע קומות ברחוב ארלוזורוב, בשכונת שיכון ותיקים "
+                        "ברמת גן. הבניין הושלם בשנת 2004, ובו מעלית אחת.",
+                        [
+                            GFact("year_built", 2004, "הבניין הושלם בשנת 2004", unit="year", entity="building"),
+                            GFact("floors_in_building", 7, "בבניין בן שבע קומות", unit="count", entity="building"),
+                            GFact("elevator_count", 1, "ובו מעלית אחת", unit="count", entity="building"),
+                        ],
+                    ),
+                    GPara(
+                        "בדירה מרחב מוגן דירתי במידות פנים של 300 על 350 ס״מ, המשמש כחדר עבודה.",
+                        [
+                            GFact("safe_room_area", "300x350", "מרחב מוגן דירתי במידות פנים של 300 על 350 ס״מ",
+                                  unit="cm", normalized={"value": "10.5", "unit": "m2"},
+                                  note="inner dimensions; 3.00 m x 3.50 m = 10.5 m²"),
+                        ],
+                    ),
+                    GPara(
+                        "לדירה שתי מרפסות: מרפסת פתוחה בשטח 8 מ״ר ומרפסת שירות בשטח 3 מ״ר. גובה תקרה של 2.60 מטר.",
+                        [
+                            GFact("balcony_count", 2, "לדירה שתי מרפסות", unit="count"),
+                            GFact("balcony_area", "11", "מרפסת פתוחה בשטח 8 מ״ר ומרפסת שירות בשטח 3 מ״ר",
+                                  unit="m2", note="8 + 3"),
+                            GFact("ceiling_height", "2.6", "גובה תקרה של 2.60 מטר", unit="m"),
+                        ],
+                    ),
+                    GPara(
+                        "לדירה אין חניה צמודה, והחניה באזור היא בכחול-לבן ברחוב.",
+                        [GFact("parking_spaces", 0, "לדירה אין חניה צמודה", unit="count")],
+                    ),
+                    GPara(
+                        "הדירה שופצה ברמה גבוהה בשנת 2020, כולל החלפת ריצוף וחלונות.",
+                        [GFact("renovation", "2020: full", "הדירה שופצה ברמה גבוהה בשנת 2020")],
+                    ),
+                ],
+            ),
+            (
+                "מצב תכנוני וזכויות",
+                [
+                    GPara(
+                        "לפי בדיקה במערכת המידע התכנוני של הוועדה המקומית, ייעוד המגרש הוא מגורים ב׳ ולא נמצאו "
+                        "תכניות בהליך החלות עליו.",
+                        [
+                            GFact("zoning", "מגורים ב׳", "ייעוד המגרש הוא מגורים ב׳", entity="plot"),
+                            GFact("planning_status", "no pending plans", "ולא נמצאו תכניות בהליך החלות עליו",
+                                  entity="plot"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "שיקולי השמאית",
+                [
+                    GPara(
+                        "המרחב המוגן והשדרוג שבוצע בדירה מוסיפים לסחירותה ביחס לדירות דומות בבניין שלא שודרגו."
+                    )
+                ],
+            ),
+        ],
+    )
+
+    h8 = doc(
+        id="H8",
+        filename="H8_synthetic_ramatgan_hayarden.pdf",
+        title_place="הירדן 30, רמת גן",
+        city="רמת גן",
+        neighborhood="רמת עמידר",
+        address="הירדן 30",
+        block=6222,
+        parcel=40,
+        sub_parcel=1,
+        ptype="garden_apartment",
+        area=dec(95),
+        valuation_date=date(2022, 11, 8),
+        report_date=date(2022, 11, 15),
+        purpose="מכירת הנכס",
+        value=dec(3020000),
+        subject_key="רמת גן|6222/40/1",
+        notes="Ramat Gan garden apartment, 1972 building without elevator. Permit for an added room (2019). "
+        "States no safe room, balcony, parking, storage or ceiling height (absent data).",
+        sections=[
+            (
+                "תיאור הנכס והבניין",
+                [
+                    GPara(
+                        "דירת גן בת 4 חדרים בקומת הקרקע של בניין בן ארבע קומות ברחוב הירדן, בשכונת רמת עמידר "
+                        "ברמת גן. הבניין נבנה בשנת 1972 ואינו כולל מעלית.",
+                        [
+                            GFact("year_built", 1972, "הבניין נבנה בשנת 1972", unit="year", entity="building"),
+                            GFact("floors_in_building", 4, "בניין בן ארבע קומות", unit="count", entity="building"),
+                            GFact("elevator_present", False, "ואינו כולל מעלית", entity="building"),
+                        ],
+                    ),
+                    GPara(
+                        "לדירה צמודה חצר בשטח 85 מ״ר. בשנת 2019 ניתן היתר בנייה לתוספת חדר בשטח 22 מ״ר בתחום החצר, "
+                        "והתוספת בוצעה בהתאם להיתר.",
+                        [
+                            GFact("yard_area", "85", "חצר בשטח 85 מ״ר", unit="m2"),
+                            GFact("building_permit", "2019: added room of 22 m2",
+                                  "בשנת 2019 ניתן היתר בנייה לתוספת חדר בשטח 22 מ״ר"),
+                        ],
+                    ),
+                    GTable(
+                        "פירוט שטחים",
+                        ["חלל", "שטח (מ״ר)", "הערה"],
+                        [50, 40, 90],
+                        [
+                            ["דירה", "73", "שטח עיקרי מקורי"],
+                            ["חדר נוסף", "22", "נבנה לפי היתר משנת 2019"],
+                            ["חצר", "85", "בהצמדה בלעדית"],
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "מצב תכנוני וזכויות",
+                [
+                    GPara(
+                        "על המגרש חלה תכנית רג/מק/4020 (בדויה) המאפשרת תוספת של שתי קומות לבניין. זכויות אלה "
+                        "טרם נוצלו, ומימושן מחייב הסכמה של בעלי הדירות.",
+                        [
+                            GFact("unused_rights", "2 additional floors", "המאפשרת תוספת של שתי קומות לבניין",
+                                  entity="plot", normalized={"value": "2", "unit": "floor"},
+                                  note="the paragraph adds: זכויות אלה טרם נוצלו"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "שיקולי השמאית",
+                [
+                    GPara(
+                        "החצר הגדולה והחדר הנוסף שנבנה כדין מהווים יתרון משמעותי; מנגד, גיל הבניין ומצבו מצדיקים "
+                        "התאמה כלפי מטה."
+                    )
+                ],
+            ),
+        ],
+    )
+
+    def h4(v2: bool) -> GeneralDoc:
+        if v2:
+            status = GPara(
+                "תכנית גב/600 (בדויה), המאפשרת תוספת קומה אחת לבניין, אושרה למתן תוקף במאי 2023.",
+                [
+                    GFact("planning_status", "approved (May 2023)", "אושרה למתן תוקף במאי 2023", entity="plot"),
+                    GFact("unused_rights", "1 additional floor", "המאפשרת תוספת קומה אחת לבניין", entity="plot",
+                          normalized={"value": "1", "unit": "floor"}),
+                ],
+            )
+            reasoning = GPara(
+                "לאחר אישור התכנית, הובאה בחשבון התאמה בשיעור 10% בגין פוטנציאל התוספת. גרסה זו מחליפה את גרסת "
+                "חוות הדעת מחודש מרץ 2023.",
+                [GFact("adjustment_rate", "10", "התאמה בשיעור 10%", unit="percent")],
+            )
+        else:
+            status = GPara(
+                "תכנית גב/600 (בדויה), המאפשרת תוספת קומה אחת לבניין, נמצאת בשלב הפקדה וטרם אושרה.",
+                [
+                    GFact("planning_status", "deposited, not yet approved", "נמצאת בשלב הפקדה וטרם אושרה",
+                          entity="plot"),
+                    GFact("unused_rights", "1 additional floor", "המאפשרת תוספת קומה אחת לבניין", entity="plot",
+                          normalized={"value": "1", "unit": "floor"}),
+                ],
+            )
+            reasoning = GPara(
+                "בשל אי הוודאות לגבי אישור התכנית, הובאה בחשבון התאמה בשיעור 6% בלבד בגין פוטנציאל התוספת.",
+                [GFact("adjustment_rate", "6", "התאמה בשיעור 6%", unit="percent")],
+            )
+        return doc(
+            id="H4v2" if v2 else "H4",
+            filename="H4v2_synthetic_givatayim_shenkin_v2.pdf" if v2 else "H4_synthetic_givatayim_shenkin.pdf",
+            title_place="שינקין 18, גבעתיים",
+            city="גבעתיים",
+            neighborhood="גבעת רמב״ם",
+            address="שינקין 18",
+            block=6230,
+            parcel=44,
+            sub_parcel=3,
+            area=dec(120),
+            valuation_date=date(2023, 6, 1) if v2 else date(2023, 3, 1),
+            report_date=date(2023, 6, 8) if v2 else date(2023, 3, 12),
+            purpose="מימון בנקאי",
+            value=dec(4050000) if v2 else dec(3900000),
+            subject_key="גבעתיים|6230/44/3",
+            visit="26/02/2023 בנוכחות הלווים",
+            environment=[
+                "שכונת גבעת רמב״ם ממוקמת בצפון גבעתיים, בסמוך לגבול עם רמת גן, ומאופיינת בבנייה רוויה ובמגוון מוסדות ציבור.",
+                "רחוב שינקין בגבעתיים הוא רחוב מגורים שקט יחסית, הסמוך לרחוב ויצמן ולמרכז המסחרי של העיר.",
+                "בקרבת הנכס פועלים בית ספר יסודי, גני ילדים, ספרייה עירונית ומרכז קהילתי, והגישה לתחבורה ציבורית טובה.",
+                "השכונה מבוקשת בקרב משפחות בשל איכות מוסדות החינוך בה.",
+                "לא נמצאו בסביבה הקרובה שימושים מטרדיים.",
+            ],
+            version_of="H4" if v2 else None,
+            notes=(
+                "Second version of H4: planning status deposited -> approved, adjustment rate 6% -> 10%, value "
+                "3,900,000 -> 4,050,000, new dates. Everything else is identical."
+                if v2
+                else "Givatayim. Safe room written with ASCII quotes (ממ\"ד ... מ\"ר); two balconies; first version."
+            ),
+            sections=[
+                (
+                    "תיאור הנכס והבניין",
+                    [
+                        GPara(
+                            "דירת 5 חדרים בקומה השנייה בבניין בן חמש קומות ברחוב שינקין בשכונת גבעת רמב״ם "
+                            "בגבעתיים. הבניין נבנה בשנת 2012 ובו מעלית.",
+                            [
+                                GFact("year_built", 2012, "הבניין נבנה בשנת 2012", unit="year", entity="building"),
+                                GFact("floors_in_building", 5, "בבניין בן חמש קומות", unit="count",
+                                      entity="building"),
+                                GFact("elevator_present", True, "ובו מעלית", entity="building"),
+                            ],
+                        ),
+                        GPara(
+                            'בדירה ממ"ד בשטח של כ-11 מ"ר.',
+                            [GFact("safe_room_area", "11", 'ממ"ד בשטח של כ-11 מ"ר', unit="m2",
+                                   note="ASCII double quotes instead of gershayim; 'about 11'")],
+                        ),
+                        GPara(
+                            "בדירה שתי מרפסות: מרפסת סלון בשטח 12 מ״ר ומרפסת חדר שינה בשטח 6 מ״ר.",
+                            [
+                                GFact("balcony_count", 2, "בדירה שתי מרפסות", unit="count"),
+                                GFact("balcony_area", "18", "מרפסת סלון בשטח 12 מ״ר ומרפסת חדר שינה בשטח 6 מ״ר",
+                                      unit="m2", note="12 + 6"),
+                            ],
+                        ),
+                        GPara(
+                            "לדירה צמודים מקום חניה אחד בחניון הבניין ומחסן בשטח 7 מ״ר.",
+                            [
+                                GFact("parking_spaces", 1, "מקום חניה אחד בחניון הבניין", unit="count"),
+                                GFact("storage_area", "7", "מחסן בשטח 7 מ״ר", unit="m2"),
+                            ],
+                        ),
+                    ],
+                ),
+                ("מצב תכנוני וזכויות", [status]),
+                ("שיקולי השמאית", [reasoning]),
+            ],
+        )
+
+    h5 = doc(
+        id="H5",
+        filename="H5_synthetic_givatayim_hamaavak.pdf",
+        title_place="המאבק 25, גבעתיים",
+        city="גבעתיים",
+        neighborhood="גבעת קוזלובסקי",
+        address="המאבק 25",
+        block=6233,
+        parcel=7,
+        sub_parcel=11,
+        area=dec(68),
+        valuation_date=date(2022, 6, 20),
+        report_date=date(2022, 6, 27),
+        purpose="התנגדות לשומת מס רכישה",
+        value=dec(2350000),
+        subject_key="גבעתיים|6233/7/11",
+        visit="16/06/2022 בנוכחות אחת היורשות",
+        environment=[
+            "שכונת גבעת קוזלובסקי שוכנת בחלקה הדרומי של גבעתיים, על מדרון מתון הצופה לכיוון תל אביב.",
+            "הבנייה בשכונה ותיקה ברובה: מבנים בני שלוש עד ארבע קומות, ולצדם מספר מבנים חדשים שהוקמו במקום מבנים שנהרסו.",
+            "בקרבת הנכס פועלים בתי ספר, גני ילדים ומרכז מסחרי קטן, ובמרחק הליכה קצר נמצא רחוב כצנלסון, הציר המסחרי המרכזי של העיר.",
+            "הרחוב שקט יחסית ומשמש בעיקר את תושביו, ואינו משמש ציר לתנועה עוברת.",
+            "גבעתיים מאופיינת בצפיפות בנייה גבוהה ובביקוש עקבי לדירות מגורים, בשל קרבתה למרכז תל אביב.",
+        ],
+        notes="Givatayim, 1968 building. States that there is NO safe room; balcony enclosed without a permit; "
+        "ceiling height, year built, parking and storage in a key/value table.",
+        sections=[
+            (
+                "תיאור הנכס והבניין",
+                [
+                    GPara(
+                        "דירת 3 חדרים בקומה השנייה מתוך ארבע בבניין ותיק ברחוב המאבק בגבעתיים. בבניין הותקנה "
+                        "מעלית בשנת 2019 ביוזמת הדיירים.",
+                        [GFact("elevator_present", True, "בבניין הותקנה מעלית בשנת 2019", entity="building",
+                               note="installed in 2019")],
+                    ),
+                    GPara(
+                        "אין בדירה ממ״ד, והמקלט המשותף נמצא בקומת הקרקע של הבניין.",
+                        [GFact("safe_room_present", False, "אין בדירה ממ״ד")],
+                    ),
+                    GPara(
+                        "לדירה מרפסת חזית בשטח 7 מ״ר, שנסגרה בתריסים ללא היתר בנייה.",
+                        [
+                            GFact("balcony_count", 1, "מרפסת חזית בשטח 7 מ״ר", unit="count"),
+                            GFact("balcony_area", "7", "מרפסת חזית בשטח 7 מ״ר", unit="m2"),
+                            GFact("building_permit", "balcony enclosed without a permit",
+                                  "שנסגרה בתריסים ללא היתר בנייה"),
+                        ],
+                    ),
+                    GPara(
+                        "בשנת 2018 בוצע שיפוץ חלקי של חדר הרחצה.",
+                        [GFact("renovation", "2018: bathroom", "בשנת 2018 בוצע שיפוץ חלקי של חדר הרחצה",
+                               note="partial")],
+                    ),
+                    GTable(
+                        "מאפייני הנכס",
+                        ["מאפיין", "פירוט"],
+                        [80, 100],
+                        [
+                            ["קומה", "2 מתוך 4"],
+                            ["גובה תקרה", "2.80 מ׳"],
+                            ["שנת בנייה", "1968"],
+                            ["חניה", "אין"],
+                            ["מחסן", "אין"],
+                        ],
+                        [
+                            GFact("floors_in_building", 4, "2 מתוך 4", unit="count", entity="building", cell=(0, 1)),
+                            GFact("ceiling_height", "2.8", "2.80 מ׳", unit="m", cell=(1, 1)),
+                            GFact("year_built", 1968, "1968", unit="year", entity="building", cell=(2, 1)),
+                            GFact("parking_spaces", 0, "אין", unit="count", cell=(3, 1)),
+                            GFact("storage_present", False, "אין", cell=(4, 1)),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "מצב תכנוני וזכויות",
+                [
+                    GPara(
+                        "ייעוד המגרש לפי התכנית החלה הוא מגורים א׳. השמאית לא בדקה את היתכנות הרחבת הדירה.",
+                        [GFact("zoning", "מגורים א׳", "ייעוד המגרש לפי התכנית החלה הוא מגורים א׳", entity="plot")],
+                    ),
+                ],
+            ),
+            (
+                "שיקולי השמאית",
+                [
+                    GPara(
+                        "סגירת המרפסת ללא היתר עלולה לחייב הריסה או הסדרה, ולכן הובאה בחשבון הפחתה בגין הסיכון."
+                    )
+                ],
+            ),
+        ],
+    )
+
+    h6 = doc(
+        id="H6",
+        filename="H6_synthetic_telaviv_benyehuda.pdf",
+        title_place="בן יהודה 140, תל אביב-יפו",
+        city="תל אביב-יפו",
+        neighborhood="הצפון הישן",
+        address="בן יהודה 140",
+        block=6960,
+        parcel=52,
+        sub_parcel=8,
+        area=dec(70),
+        valuation_date=date(2022, 9, 5),
+        report_date=date(2022, 9, 12),
+        purpose="מכירת הנכס",
+        value=dec(3100000),
+        subject_key="תל אביב-יפו|6960/52/8",
+        environment=[
+            "הצפון הישן של תל אביב הוא אזור מגורים מבוקש, הסמוך לחוף הים, לנמל תל אביב ולפארק הירקון.",
+            "הבנייה באזור כוללת בעיקר מבני מגורים בני שלוש עד חמש קומות על עמודים, לצד מבנים חדשים ומבנים שעברו הרחבה.",
+            "רחוב בן יהודה הוא רחוב עירוני סואן עם חזית מסחרית רציפה של חנויות, בתי קפה ומסעדות, ובו קווי אוטובוס רבים.",
+            "בקרבת הנכס פועלים בתי ספר, גני ילדים, קופות חולים ומוסדות תרבות, ותשתיות האזור מפותחות.",
+            "הביקוש לדירות באזור גבוה מצד זוגות צעירים ומשקיעים, והיצע הדירות להשכרה בו רב.",
+        ],
+        notes="Tel Aviv, first appraisal of בן יהודה 140. Says the building was built in 1958 (H7 says 1962: "
+        "conflict). No elevator; no safe room stated.",
+        sections=[
+            (
+                "תיאור הנכס והבניין",
+                [
+                    GPara(
+                        "דירת 3 חדרים בקומה השלישית בבניין בן ארבע קומות ללא מעלית, ברחוב בן יהודה בצפון הישן של "
+                        "תל אביב. לפי תיק הבניין, הבניין נבנה בשנת 1958.",
+                        [
+                            GFact("year_built", 1958, "הבניין נבנה בשנת 1958", unit="year", entity="building"),
+                            GFact("floors_in_building", 4, "בבניין בן ארבע קומות ללא מעלית", unit="count",
+                                  entity="building"),
+                            GFact("elevator_present", False, "בבניין בן ארבע קומות ללא מעלית", entity="building"),
+                        ],
+                    ),
+                    GPara(
+                        "גובה התקרה בדירה 3.05 מ׳, כמקובל בבנייה של התקופה. לדירה מרפסת רחוב בשטח 6 מ״ר.",
+                        [
+                            GFact("ceiling_height", "3.05", "גובה התקרה בדירה 3.05 מ׳", unit="m"),
+                            GFact("balcony_count", 1, "מרפסת רחוב בשטח 6 מ״ר", unit="count"),
+                            GFact("balcony_area", "6", "מרפסת רחוב בשטח 6 מ״ר", unit="m2"),
+                        ],
+                    ),
+                    GPara(
+                        "לדירה אין מקום חניה. בקומת הקרקע צמוד לדירה מחסן בשטח 4 מ״ר.",
+                        [
+                            GFact("parking_spaces", 0, "לדירה אין מקום חניה", unit="count"),
+                            GFact("storage_area", "4", "מחסן בשטח 4 מ״ר", unit="m2"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "מצב תכנוני וזכויות",
+                [
+                    GPara(
+                        "על המגרש חלה תכנית תא/3616א (בדויה לצורך הדמו) המאפשרת תוספת של 2.5 קומות לבניין, "
+                        "וזכויות אלה טרם מומשו.",
+                        [GFact("unused_rights", "2.5 additional floors", "תוספת של 2.5 קומות לבניין",
+                               entity="plot", normalized={"value": "2.5", "unit": "floor"})],
+                    ),
+                ],
+            ),
+            (
+                "שיקולי השמאית",
+                [
+                    GPara(
+                        "המיקום המבוקש בצפון הישן ופוטנציאל התוספת מאזנים את גיל הבניין ואת הצורך בהשקעה בדירה."
+                    )
+                ],
+            ),
+        ],
+    )
+
+    h7 = doc(
+        id="H7",
+        filename="H7_synthetic_telaviv_benyehuda_2023.docx",
+        kind="docx",
+        title_place="בן יהודה 140, תל אביב-יפו",
+        city="תל אביב-יפו",
+        neighborhood="הצפון הישן",
+        address="בן יהודה 140",
+        block=6960,
+        parcel=52,
+        sub_parcel=8,
+        area=dec(70),
+        valuation_date=date(2023, 11, 2),
+        report_date=date(2023, 11, 9),
+        purpose="מימון בנקאי",
+        value=dec(3350000),
+        subject_key="תל אביב-יפו|6960/52/8",
+        notes="DOCX (page fields are null). Second appraisal of the same subject as H6; its building table says "
+        "1962 (conflicts with H6's 1958). Renovated in 2023; no ceiling height, parking, storage or elevator.",
+        sections=[
+            (
+                "תיאור הנכס והבניין",
+                [
+                    GPara(
+                        "חוות הדעת נערכת לדירה ברחוב בן יהודה 140 בתל אביב, שנישומה בעבר על ידי המשרד בספטמבר "
+                        "2022. נתוני הבניין מרוכזים בטבלה שלהלן."
+                    ),
+                    GTable(
+                        "נתוני הבניין",
+                        ["נתון", "ערך"],
+                        [70, 110],
+                        [["שנת בנייה", "1962"], ["מספר קומות", "4"], ["קומת הדירה", "3"]],
+                        [
+                            GFact("year_built", 1962, "1962", unit="year", entity="building", cell=(0, 1)),
+                            GFact("floors_in_building", 4, "4", unit="count", entity="building", cell=(1, 1)),
+                        ],
+                    ),
+                    GPara(
+                        "מאז חוות הדעת הקודמת שופצה הדירה בשנת 2023: הוחלפו מערכות החשמל והאינסטלציה ושודרג חדר "
+                        "הרחצה.",
+                        [GFact("renovation", "2023: electrical, plumbing, bathroom", "שופצה הדירה בשנת 2023")],
+                    ),
+                    GPara(
+                        "לדירה מרפסת רחוב בשטח 6 מ״ר.",
+                        [
+                            GFact("balcony_count", 1, "מרפסת רחוב בשטח 6 מ״ר", unit="count"),
+                            GFact("balcony_area", "6", "מרפסת רחוב בשטח 6 מ״ר", unit="m2"),
+                        ],
+                    ),
+                ],
+            ),
+            ("מצב תכנוני וזכויות", [GPara("לא חל שינוי במצב התכנוני מאז חוות הדעת הקודמת.")]),
+            (
+                "שיקולי השמאית",
+                [GPara("השדרוג שבוצע ב-2023 מצדיק התאמה כלפי מעלה ביחס לחוות הדעת הקודמת.")],
+            ),
+        ],
+    )
+    return [h1, h2, h3, h8, h4(False), h5, h6, h7, h4(True)]
+
+
+class GeneralPdfRenderer(PdfRenderer):
+    """Renders a held-out document: free section titles and tables with their own columns."""
+
+    def __init__(self, font_dir: Path) -> None:
+        super().__init__(font_dir, visual=False)
+
+    def gheading(self, title: str, number: int) -> None:
+        pdf = self.pdf
+        if pdf.get_y() + 30 > pdf.page_break_trigger:
+            pdf.add_page()
+        pdf.ln(2)
+        self._line(title, size=12.5, bold=True, h=8)
+        self.layout.sections.append({"number": number, "title": title, "page": pdf.page_no()})
+
+    def _grow(self, cells: list[str], widths: list[int], bold: bool = False) -> None:
+        pdf = self.pdf
+        y = pdf.get_y()
+        x_right = pdf.w - pdf.r_margin
+        for text, width in zip(cells, widths, strict=True):
+            x_right -= width
+            pdf.set_xy(x_right, y)
+            self._cell_text_fit(text, width, bold)
+            pdf.cell(width, self.ROW_H, text, border=1, align="C", fill=bold)
+        pdf.set_xy(pdf.l_margin, y + self.ROW_H)
+
+    def gtable(self, table: GTable) -> None:
+        pdf = self.pdf
+        assert sum(table.widths) == 180, table.title
+        pdf.set_fill_color(225, 225, 225)
+        if pdf.get_y() + self.LINE_H + (len(table.rows) + 1) * self.ROW_H + 4 > pdf.page_break_trigger:
+            pdf.add_page()  # a held-out table never splits, so every cell has one page
+        self._line(table.title, bold=True)
+        page = pdf.page_no()
+        self._grow(table.headers, table.widths, bold=True)
+        for row in table.rows:
+            self._grow(row, table.widths)
+        assert pdf.page_no() == page, table.title
+        pdf.ln(3)
+        self.layout.gtables.append(page)
+
+    def render_general(self, doc: GeneralDoc) -> bytes:
+        pdf = self.pdf
+        pdf.add_page()
+        self._line(f"שומת מקרקעין — {doc.title_place}", size=15, bold=True, h=9)
+        self._line(f"{SYNTHETIC_MARKER} — כל הנתונים בדויים", size=10, bold=True)
+        self._line("משרד: שמאות דמו א׳ (סינתטי)", size=9.5)
+        pdf.ln(2)
+        self.layout.header_page = pdf.page_no()
+        for line in doc.header_lines():
+            self._line(line)
+        for number, (title, blocks) in enumerate(doc.all_sections(), start=1):
+            self.gheading(f"{number}. {title}", number)
+            for block in blocks:
+                if isinstance(block, GTable):
+                    self.gtable(block)
+                else:
+                    self.paragraph(block.text)
+        self.layout.page_count = pdf.page_no()
+        return bytes(pdf.output())
+
+
+def render_general_docx(doc: GeneralDoc) -> tuple[bytes, Layout]:
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+
+    layout = Layout()
+    document = Document()
+    cp = document.core_properties
+    cp.title = f"{SYNTHETIC_MARKER} - שומת מקרקעין"
+    cp.author = "synthetic fixture generator"
+    cp.last_modified_by = "synthetic fixture generator"
+    cp.created = FIXED_TS.replace(tzinfo=None)
+    cp.modified = FIXED_TS.replace(tzinfo=None)
+    cp.revision = 1
+
+    def para(text: str) -> None:
+        p = document.add_paragraph(text)
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        _rtl_paragraph(p)
+
+    def heading(text: str, level: int) -> None:
+        p = document.add_heading(text, level=level)
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        _rtl_paragraph(p)
+
+    heading(f"שומת מקרקעין — {doc.title_place}", 0)
+    para(f"{SYNTHETIC_MARKER} — כל הנתונים בדויים")
+    para("משרד: שמאות דמו א׳ (סינתטי)")
+    for line in doc.header_lines():
+        para(line)
+    for number, (title, blocks) in enumerate(doc.all_sections(), start=1):
+        heading(f"{number}. {title}", 1)
+        layout.sections.append({"number": number, "title": f"{number}. {title}", "page": None})
+        for block in blocks:
+            if isinstance(block, GPara):
+                para(block.text)
+                layout.paragraphs.append((block.text, None, None))
+                continue
+            para(block.title)
+            table = document.add_table(rows=1 + len(block.rows), cols=len(block.headers))
+            table.style = "Table Grid"
+            table._tbl.tblPr.append(OxmlElement("w:bidiVisual"))
+            for r, cells in enumerate([block.headers, *block.rows]):
+                for c, text in enumerate(cells):
+                    cell = table.cell(r, c)
+                    cell.text = text
+                    for p in cell.paragraphs:
+                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        _rtl_paragraph(p)
+                        if r == 0:
+                            for run in p.runs:
+                                run.bold = True
+            layout.gtables.append(None)
+    buf = io.BytesIO()
+    document.save(buf)
+    return normalize_zip(buf.getvalue()), layout
+
+
+def _general_facts_of(doc: GeneralDoc, layout: Layout) -> list[dict[str, Any]]:
+    """Every fact with its physical page, located by its verbatim quote (text) or cell (table)."""
+    out: list[dict[str, Any]] = []
+    paragraphs = [(t, s, e) for t, s, e in layout.paragraphs]
+    tables = [b for _, blocks in doc.all_sections() for b in blocks if isinstance(b, GTable)]
+    gpages = layout.gtables
+    assert len(tables) == len(gpages), doc.id
+    for _, blocks in doc.all_sections():
+        for block in blocks:
+            for fact in block.facts:
+                entry: dict[str, Any] = {
+                    "id": f"{doc.id}-F{len(out) + 1:02d}",
+                    "document": doc.id,
+                    "attribute": fact.attribute,
+                    "entity": fact.entity,
+                    "value": fact.value,
+                    "unit": fact.unit,
+                }
+                if fact.normalized:
+                    entry["normalized"] = dict(fact.normalized)
+                if isinstance(block, GTable):
+                    assert fact.cell is not None, (doc.id, fact.attribute)
+                    r, c = fact.cell
+                    assert block.rows[r][c] == fact.quote, (doc.id, fact.attribute, block.rows[r][c])
+                    t_index = tables.index(block)
+                    entry |= {
+                        "page": gpages[t_index],
+                        "quote": fact.quote,
+                        "source": {"kind": "table", "table_index": t_index, "row_index": r,
+                                   "column": block.headers[c], "row_label": block.rows[r][0]},
+                    }
+                else:
+                    hits = [(s, e) for t, s, e in paragraphs if fact.quote in t]
+                    assert len(hits) == 1 and fact.quote in block.text, (doc.id, fact.quote, hits)
+                    assert hits[0][0] == hits[0][1], (doc.id, fact.quote)
+                    entry |= {"page": hits[0][0], "quote": fact.quote, "source": {"kind": "text"}}
+                if fact.note:
+                    entry["note"] = fact.note
+                out.append(entry)
+    return out
+
+
+def _existing_mentions(reports: list[Report], layouts: dict[str, Layout]) -> list[dict[str, Any]]:
+    """Where the original fixtures already touch the held-out topics (full sentences, physical pages)."""
+    out = []
+    for rep in reports:
+        if rep.kind in ("encrypted", "truncated"):
+            continue
+        for text, start, _end in layouts[rep.id].paragraphs:
+            for sentence in [s.strip() for s in text.replace("; ", ". ").split(". ") if s.strip()]:
+                for topic, terms in EXISTING_MENTION_TERMS.items():
+                    found = [t for t in terms if t in sentence]
+                    if not found:
+                        continue
+                    item = {"document": rep.id, "topic": topic, "term": found[0], "page": start,
+                            "sentence": sentence.rstrip(".")}
+                    if found[0] == "היתר" and "בין היתר" in sentence:
+                        item["false_friend"] = "'בין היתר' means 'among other things', not a building permit"
+                    out.append(item)
+    return out
+
+
+def general_section(
+    docs: list[GeneralDoc], entries: dict[str, dict[str, Any]], facts: list[dict[str, Any]],
+    mentions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    replaced = {d.version_of for d in docs if d.version_of}
+    current = [d.id for d in docs if d.id not in replaced]
+    stated = {(f["document"], f["attribute"]) for f in facts}
+    not_stated = {
+        attr: [d.id for d in docs if (d.id, attr) not in stated] for attr in GENERAL_ATTRIBUTES
+    }
+
+    def fact(doc_id: str, attribute: str) -> dict[str, Any]:
+        found = [f for f in facts if f["document"] == doc_id and f["attribute"] == attribute]
+        assert len(found) == 1, (doc_id, attribute, found)
+        return found[0]
+
+    def side(doc_id: str, attribute: str) -> dict[str, Any]:
+        f = fact(doc_id, attribute)
+        return {"document": doc_id, "value": f["value"], "page": f["page"], "quote": f["quote"]}
+
+    old, new = "H4", "H4v2"
+    changed = []
+    for attribute in ("planning_status", "adjustment_rate"):
+        a, b = fact(old, attribute), fact(new, attribute)
+        assert a["value"] != b["value"], attribute
+        changed.append({"attribute": attribute, "old": side(old, attribute), "new": side(new, attribute)})
+    for attribute in GENERAL_ATTRIBUTES:
+        if attribute in ("planning_status", "adjustment_rate"):
+            continue
+        a = [f["value"] for f in facts if f["document"] == old and f["attribute"] == attribute]
+        b = [f["value"] for f in facts if f["document"] == new and f["attribute"] == attribute]
+        assert a == b, (attribute, a, b)  # nothing else differs between the versions
+    by_id = {d.id: d for d in docs}
+    return {
+        "about": f"{SYNTHETIC_MARKER}. Held-out corpus (U12, KTD16): appraisal-like documents about attributes the "
+        "application code never names. Files live in tests/fixtures/general/. The documents produce no records "
+        "(no 'שווי הנכס:' header label, no price column), so `documents`, `dedup` and the 77-item evaluation "
+        "are unaffected. Values are as the document states them; `normalized` gives the canonical unit when the "
+        "document uses another one. `*_present` facts record explicit statements only (a stated area or count "
+        "implies presence); `not_stated` lists, per attribute, the documents with no fact for it. Generated by "
+        "scripts/generate_fixtures.py - do not edit by hand.",
+        "directory": GENERAL_DIR,
+        "group": {
+            "code": GENERAL_GROUP["code"],
+            "name": GENERAL_GROUP["name"],
+            "office": "A",
+            "visible_to": ["admin-a@demo.test", "dana@demo.test"],
+            "hidden_from": ["yossi@demo.test", "admin-b@demo.test"],
+        },
+        "attributes": GENERAL_ATTRIBUTES,
+        "documents": list(entries.values()),
+        "current_documents": current,
+        "facts": facts,
+        "not_stated": not_stated,
+        "conflicts": [
+            {
+                "subject_key": by_id["H6"].subject_key,
+                "address": "בן יהודה 140, תל אביב-יפו",
+                "attribute": "year_built",
+                "statements": [side("H6", "year_built"), side("H7", "year_built")],
+                "note": "two appraisals of the same unit disagree; an answer must show both, never pick one silently",
+            }
+        ],
+        "versions": [
+            {
+                "document": new,
+                "replaces": old,
+                "changed": changed,
+                "value_in_text": {"old": str(by_id[old].value), "new": str(by_id[new].value)},
+                "dates": {
+                    "old": {"valuation_date": by_id[old].valuation_date.isoformat(),
+                            "report_date": by_id[old].report_date.isoformat()},
+                    "new": {"valuation_date": by_id[new].valuation_date.isoformat(),
+                            "report_date": by_id[new].report_date.isoformat()},
+                },
+                "unchanged": "every other attribute and sentence",
+            }
+        ],
+        "same_subject": [
+            {"subject_key": by_id["H6"].subject_key, "documents": ["H6", "H7"],
+             "note": "the same unit appraised twice (2022 and 2023); different documents, not versions"},
+            {"subject_key": by_id["H4"].subject_key, "documents": ["H4", "H4v2"],
+             "note": "two versions of one document; only H4v2 is current"},
+        ],
+        "existing_mentions": mentions,
+    }
+
+
+def write_general(out: Path, font_dir: Path, reports: list[Report], layouts: dict[str, Layout]) -> dict[str, Any]:
+    gdir = out / GENERAL_DIR
+    gdir.mkdir(parents=True, exist_ok=True)
+    docs = build_general_docs()
+    entries: dict[str, dict[str, Any]] = {}
+    facts: list[dict[str, Any]] = []
+    for gdoc in docs:
+        assert "synthetic" in gdoc.filename
+        if gdoc.kind == "docx":
+            data, layout = render_general_docx(gdoc)
+        else:
+            renderer = GeneralPdfRenderer(font_dir)
+            data = renderer.render_general(gdoc)
+            layout = renderer.layout
+        (gdir / gdoc.filename).write_bytes(data)
+        gtables = [b for _, blocks in gdoc.all_sections() for b in blocks if isinstance(b, GTable)]
+        for table in gtables:  # no price column: the rules extractor never sees a comparables table
+            assert not any("מחיר" in h or "שווי" in h for h in table.headers), table.headers
+        entries[gdoc.id] = {
+            "id": gdoc.id,
+            "filename": gdoc.filename,
+            "office": "A",
+            "group": GENERAL_GROUP["code"],
+            "kind": gdoc.kind,
+            "version_of": gdoc.version_of,
+            "notes": gdoc.notes,
+            "city": gdoc.city,
+            "neighborhood": gdoc.neighborhood,
+            "address": gdoc.address,
+            "block": gdoc.block,
+            "parcel": gdoc.parcel,
+            "sub_parcel": gdoc.sub_parcel,
+            "subject_key": gdoc.subject_key,
+            "property_type": gdoc.ptype,
+            "valuation_date": gdoc.valuation_date.isoformat(),
+            "report_date": gdoc.report_date.isoformat(),
+            "value_in_text": str(gdoc.value),
+            "page_count": layout.page_count,
+            "header_page": layout.header_page,
+            "sections": [{"number": s["number"], "title": s["title"], "page": s["page"]} for s in layout.sections],
+            "tables": [
+                {"index": i, "title": t.title, "page": p, "headers": FlowList(t.headers),
+                 "rows": [FlowList(r) for r in t.rows]}
+                for i, (t, p) in enumerate(zip(gtables, layout.gtables, strict=True))
+            ],
+            "records": [],
+        }
+        facts.extend(_general_facts_of(gdoc, layout))
+        print(f"wrote {GENERAL_DIR}/{gdoc.filename} ({len(data):,} bytes, pages={layout.page_count})")
+    return general_section(docs, entries, facts, _existing_mentions(reports, layouts))
+
+
+# --------------------------------------------------------------------------- held-out general corpus v2 (U12)
+#
+# A second, separate held-out set written after the first improvement rounds, on topics none of the earlier
+# fixtures, questions or fixes covered: income-producing and land appraisals (rent, lease term, CPI
+# indexation, capitalization rate, vacancy allowance, occupancy), plot data (plot area, coverage, setback
+# lines, access road width), registry entries (warning notes, easements), condition (maintenance score,
+# energy rating, noise), and the cost approach (construction cost per m2, depreciation). Office A, group G4
+# "ידע כללי ב", directory tests/fixtures/holdout_v2/. Like the first held-out corpus the documents produce NO
+# records (no "שווי הנכס:" label, no table with a price or value column). The answer key is written to its
+# own file, tests/fixtures/holdout_v2_truth.yaml, so ground_truth.yaml and every existing fixture stay
+# byte-identical.
+
+HOLDOUT_V2_DIR = "holdout_v2"
+HOLDOUT_V2_TRUTH = "holdout_v2_truth.yaml"
+HOLDOUT_V2_GROUP = {"code": "G4", "name": "ידע כללי ב"}
+HOLDOUT_V2_ATTRIBUTES = {
+    "monthly_rent": {"label_he": "דמי שכירות חודשיים", "unit": "ILS/month"},
+    "rent_per_sqm": {"label_he": "דמי שכירות למ״ר לחודש", "unit": "ILS/m2/month"},
+    "lease_term": {"label_he": "תקופת השכירות", "unit": "year"},
+    "indexation": {"label_he": "הצמדה למדד המחירים לצרכן", "unit": None},
+    "leased": {"label_he": "הנכס מושכר", "unit": None},
+    "occupancy_rate": {"label_he": "שיעור תפוסה", "unit": "percent"},
+    "cap_rate": {"label_he": "שיעור היוון", "unit": "percent"},
+    "vacancy_allowance": {"label_he": "ניכוי בגין אובדן הכנסות", "unit": "percent"},
+    "plot_area": {"label_he": "שטח המגרש", "unit": "m2"},
+    "building_coverage": {"label_he": "תכסית", "unit": "percent"},
+    "setback_front": {"label_he": "קו בניין קדמי", "unit": "m"},
+    "setback_side": {"label_he": "קו בניין צדדי", "unit": "m"},
+    "setback_rear": {"label_he": "קו בניין אחורי", "unit": "m"},
+    "access_road_width": {"label_he": "רוחב דרך הגישה", "unit": "m"},
+    "warning_notes": {"label_he": "מספר הערות אזהרה רשומות", "unit": "count"},
+    "easement": {"label_he": "זיקת הנאה רשומה", "unit": None},
+    "maintenance_score": {"label_he": "ציון תחזוקה (1 עד 5)", "unit": "score"},
+    "energy_rating": {"label_he": "דירוג אנרגטי", "unit": None},
+    "noise_level": {"label_he": "מפלס רעש", "unit": "dB"},
+    "units_in_building": {"label_he": "מספר יחידות בבניין", "unit": "count"},
+    "construction_cost": {"label_he": "עלות בנייה למ״ר", "unit": "ILS/m2"},
+    "depreciation_rate": {"label_he": "שיעור פחת", "unit": "percent"},
+}
+# Terms scanned in every earlier fixture (D*, DB1, H*) so answers over all documents know what they say.
+V2_MENTION_PATTERNS = {
+    "maintenance": (r"תחזוק",),
+    "noise": (r"רעש",),
+    "nuisance": (r"מטרד",),
+    "plot": (r"מגרש",),
+    "indexation": (r"הצמדה", r"צמוד"),
+    "rent": (r"שכירות", r"שוכר", r"מושכר", r"השכר"),
+    "cap_rate": (r"היוון", r"הוונ", r"תשואה"),
+    "registry": (r"הערות", r"הערת", r"שעבוד", r"זיקת", r"זיקות"),
+    "depreciation": (r"(?<![א-ת])[והבלמש]?פחת(?![א-ת])", r"בלאי"),
+    "construction_cost": (r"(?<![א-ת])[והבלמש]?(?:עלות|עלויות)(?![א-ת])",),  # not "הבעלות" (ownership)
+    "occupancy": (r"תפוסה",),
+    "energy": (r"אנרגטי",),
+    "road_width": (r"רוחב", r"דרך גישה"),
+    "units": (r"יחידות דיור", r"יח״ד"),
+    "coverage": (r"תכסית",),
+    "setback": (r"קו בניין", r"קווי בניין"),
+}
+V2_FALSE_FRIENDS = {
+    "הצמדה בלעדית": "exclusive attachment of a yard to a unit, not CPI indexation",
+    "צמוד": "'attached' (a parking space or storage room attached to a unit), not CPI indexation",
+    "המרחב הציבורי": "maintenance of the public space around the property, not the property's maintenance score",
+    "מטרדיים": "a general statement that no nuisance uses were found, without a measured noise level",
+    "ההערות הרשומות": "the generic list of information sources (a registry extract), not a warning note",
+}
+
+
+@dataclass
+class V2Doc(GeneralDoc):
+    """A v2 held-out document: free property-type label, optional area line, own opening and summary."""
+
+    ptype_label: str = ""
+    area_line: str | None = None
+    client: str = ""
+    appraiser: str = "אורי כהן (שם בדוי)"
+
+    def header_lines(self) -> list[str]:
+        gp = f"גוש: {self.block} חלקה: {self.parcel}"
+        if self.sub_parcel is not None:
+            gp += f" תת חלקה: {self.sub_parcel}"
+        lines = [
+            f"עיר: {self.city}",
+            f"שכונה: {self.neighborhood}",
+            f"כתובת הנכס: {self.address}",
+            gp,
+            f"סוג נכס: {self.ptype_label}",
+            f"המועד הקובע: {fmt_date(self.valuation_date)}",
+            f"תאריך עריכת השומה: {fmt_date(self.report_date)}",
+        ]
+        if self.area_line:
+            lines.append(f"שטח הנכס: {self.area_line}")
+        return lines
+
+    def all_sections(self) -> list[tuple[str, list[GPara | GTable]]]:
+        intro = GPara(
+            f"חוות דעת זו נערכה לבקשת {self.client} לצורך {self.purpose}. "
+            f"{SYNTHETIC_MARKER}: השמות, החברות, הכתובות והמספרים בדויים."
+        )
+        summary = [
+            GPara(f"בהתחשב בכל האמור, שווי הזכויות בנכס הוערך ב-{fmt_int(self.value)} ₪ נכון למועד הקובע."),
+            GPara(f"השמאי: {self.appraiser}, שמאי מקרקעין. {SYNTHETIC_MARKER} — אין להסתמך עליו."),
+        ]
+        environment = [("הסביבה", [GPara(t) for t in self.environment])] if self.environment else []
+        return [("כללי", [intro]), *environment, *self.sections, ("סיכום", summary)]
+
+
+def build_holdout_v2_docs() -> list[V2Doc]:
+    def doc(**kw: Any) -> V2Doc:
+        return V2Doc(kind=kw.pop("kind", "pdf_digital"), **kw)
+
+    k1 = doc(
+        id="K1",
+        filename="K1_synthetic_telaviv_habarzel_office.pdf",
+        title_place="הברזל 31, תל אביב-יפו",
+        city="תל אביב-יפו",
+        neighborhood="רמת החייל",
+        address="הברזל 31",
+        block=6638,
+        parcel=112,
+        sub_parcel=9,
+        ptype="office",
+        ptype_label="משרדים",
+        area=dec(420),
+        area_line="420 מ״ר ברוטו",
+        valuation_date=date(2024, 5, 12),
+        report_date=date(2024, 5, 20),
+        client="חברת אחזקות דמו בע״מ (בדויה)",
+        purpose="בחינת שווי לצורך מימון",
+        value=dec(6590000),
+        subject_key="תל אביב-יפו|6638/112/9",
+        environment=[
+            "אזור התעסוקה רמת החייל ממוקם בצפון-מזרח תל אביב-יפו, ובו בנייני משרדים רבים של חברות טכנולוגיה, "
+            "מסעדות ושירותים עסקיים.",
+            "הנגישות לאזור טובה: דרך נמיר ונתיבי איילון סמוכים, וקווי אוטובוס רבים עוברים ברחובות הסמוכים.",
+            "הביקוש לשטחי משרדים באזור יציב, אך היצע השטחים הפנויים גדל בשנים האחרונות.",
+        ],
+        notes="Tel Aviv office floor, income approach. Lease 5 years, 85 per m2, CPI-linked; key/value table "
+        "(monthly rent 35,700, occupancy 92%, 36 office units, maintenance 4, energy B); cap rate 6.5%; no vacancy "
+        "allowance. States no plot data, road width, noise or registry entries.",
+        sections=[
+            (
+                "תיאור הנכס",
+                [
+                    GPara(
+                        "הנכס הנישום הוא קומת משרדים שלמה (קומה 11) בבניין משרדים בן 16 קומות ברחוב הברזל. "
+                        "הקומה מחולקת לחדרי עבודה, חדר ישיבות ומטבחון."
+                    ),
+                    GPara(
+                        "הקומה מושכרת לשוכר יחיד, חברת טכנולוגיה (בדויה), לתקופה של 5 שנים עם אופציה להארכה "
+                        "ב-5 שנים נוספות. דמי השכירות עומדים על 85 ₪ למ״ר לחודש וצמודים למדד המחירים לצרכן.",
+                        [
+                            GFact("leased", True, "הקומה מושכרת לשוכר יחיד"),
+                            GFact("lease_term", 5, "לתקופה של 5 שנים", unit="year",
+                                  note="plus an option for 5 more years"),
+                            GFact("rent_per_sqm", "85", "85 ₪ למ״ר לחודש", unit="ILS/m2/month"),
+                            GFact("indexation", True, "וצמודים למדד המחירים לצרכן"),
+                        ],
+                    ),
+                    GTable(
+                        "נתוני הבניין והשכירות",
+                        ["נתון", "ערך"],
+                        [100, 80],
+                        [
+                            ["דמי שכירות חודשיים לקומה (₪)", "35,700"],
+                            ["שיעור תפוסה בבניין", "92%"],
+                            ["מספר יחידות משרד בבניין", "36"],
+                            ["ציון תחזוקה (1 עד 5)", "4"],
+                            ["דירוג אנרגטי של הבניין", "B"],
+                        ],
+                        [
+                            GFact("monthly_rent", "35700", "35,700", unit="ILS/month", cell=(0, 1)),
+                            GFact("occupancy_rate", "92", "92%", unit="percent", entity="building", cell=(1, 1)),
+                            GFact("units_in_building", 36, "36", unit="count", entity="building", cell=(2, 1),
+                                  note="office units"),
+                            GFact("maintenance_score", 4, "4", unit="score", entity="building", cell=(3, 1)),
+                            GFact("energy_rating", "B", "B", entity="building", cell=(4, 1)),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "גישת השומה והנחות",
+                [
+                    GPara(
+                        "השומה נערכה בגישת היוון ההכנסות. ההכנסה השנתית מהקומה הוונה בשיעור היוון של 6.5%, "
+                        "המשקף את מיקום הבניין, את איכות השוכר ואת יתרת תקופת השכירות.",
+                        [GFact("cap_rate", "6.5", "בשיעור היוון של 6.5%", unit="percent")],
+                    ),
+                    GPara(
+                        "בשל התפוסה הגבוהה בבניין ואיכות השוכר לא הובא בחשבון ניכוי בגין אובדן הכנסות.",
+                        [GFact("vacancy_allowance", "0", "לא הובא בחשבון ניכוי בגין אובדן הכנסות", unit="percent",
+                               note="explicitly none")],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    k2 = doc(
+        id="K2",
+        filename="K2_synthetic_petahtikva_hasivim_offices.pdf",
+        title_place="הסיבים 40, פתח תקווה",
+        city="פתח תקווה",
+        neighborhood="קריית מטלון",
+        address="הסיבים 40",
+        block=6371,
+        parcel=84,
+        sub_parcel=None,
+        ptype="office",
+        ptype_label="בניין משרדים",
+        area=dec(2600),
+        area_line="2,600 מ״ר ברוטו",
+        valuation_date=date(2024, 2, 1),
+        report_date=date(2024, 2, 15),
+        client="בנק דמו בע״מ (בדוי)",
+        purpose="מימון בנקאי",
+        value=dec(24000000),
+        subject_key="פתח תקווה|6371/84",
+        notes="Petah Tikva office building. Plot 3,050 m2, coverage 40%, road 20 m, one warning note; income "
+        "table (occupancy 75%, 62 per m2, vacancy allowance 10%, maintenance 3, energy C); rent stated per YEAR "
+        "(1,450,800 = 120,900 a month); cap rate 7.25%. No lease term, indexation or units count.",
+        sections=[
+            (
+                "תיאור הנכס",
+                [
+                    GPara(
+                        "הנכס הנישום הוא בניין משרדים בן שש קומות מעל קומת קרקע מסחרית, על מגרש בשטח 3,050 מ״ר. "
+                        "הבניין תוכנן כבניין משרדים להשכרה ומנוהל על ידי חברת ניהול (בדויה).",
+                        [GFact("plot_area", "3050", "מגרש בשטח 3,050 מ״ר", unit="m2", entity="plot")],
+                    ),
+                    GPara(
+                        "הגישה לבניין היא מרחוב הסיבים, דרך עירונית ברוחב 20 מ׳ הכוללת מדרכות רחבות.",
+                        [GFact("access_road_width", "20", "ברוחב 20 מ׳", unit="m", entity="plot")],
+                    ),
+                    GPara(
+                        "התכסית הקיימת של הבניין היא 40% משטח המגרש.",
+                        [GFact("building_coverage", "40", "התכסית הקיימת של הבניין היא 40%", unit="percent",
+                               entity="plot", note="existing coverage")],
+                    ),
+                ],
+            ),
+            (
+                "מצב משפטי",
+                [
+                    GPara(
+                        "על פי נסח הרישום רשומה על החלקה הערת אזהרה אחת לטובת בנק דמו בע״מ (בדוי), בגין "
+                        "התחייבות לרישום משכנתה.",
+                        [GFact("warning_notes", 1, "רשומה על החלקה הערת אזהרה אחת", unit="count", entity="plot")],
+                    ),
+                ],
+            ),
+            (
+                "נתוני ההכנסה",
+                [
+                    GTable(
+                        "ריכוז נתוני ההכנסה",
+                        ["פרמטר", "ערך", "הערה"],
+                        [70, 40, 70],
+                        [
+                            ["שטח להשכרה (מ״ר ברוטו)", "2,600", "לפי תשריט הבניין"],
+                            ["שיעור תפוסה", "75%", "נכון למועד הביקור"],
+                            ["דמי שכירות למ״ר לחודש (₪)", "62", "ממוצע משוקלל"],
+                            ["ניכוי בגין אובדן הכנסות", "10%", "הנחת השמאי"],
+                            ["ציון תחזוקה (1 עד 5)", "3", "נדרשת החלפת מערכות מיזוג"],
+                            ["דירוג אנרגטי", "C", "לפי תעודה משנת 2021"],
+                        ],
+                        [
+                            GFact("occupancy_rate", "75", "75%", unit="percent", entity="building", cell=(1, 1)),
+                            GFact("rent_per_sqm", "62", "62", unit="ILS/m2/month", cell=(2, 1)),
+                            GFact("vacancy_allowance", "10", "10%", unit="percent", cell=(3, 1)),
+                            GFact("maintenance_score", 3, "3", unit="score", entity="building", cell=(4, 1)),
+                            GFact("energy_rating", "C", "C", entity="building", cell=(5, 1)),
+                        ],
+                    ),
+                    GPara(
+                        "ההכנסה השנתית בפועל מדמי השכירות בבניין מסתכמת ב-1,450,800 ₪ לשנה.",
+                        [GFact("monthly_rent", "1450800", "1,450,800 ₪ לשנה", unit="ILS/year",
+                               normalized={"value": "120900", "unit": "ILS/month"},
+                               note="stated per year for the whole building")],
+                    ),
+                ],
+            ),
+            (
+                "גישת השומה",
+                [
+                    GPara(
+                        "ההכנסה הפוטנציאלית, בניכוי אובדן הכנסות, הוונה בשיעור של 7.25%, בהתחשב בגיל הבניין "
+                        "ובמצב מערכותיו.",
+                        [GFact("cap_rate", "7.25", "הוונה בשיעור של 7.25%", unit="percent")],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    def k3(v2: bool) -> V2Doc:
+        if v2:
+            assumptions = GPara(
+                "לאחר שהשוכר הודיע על כוונתו לצמצם את פעילותו בסניף, הובא בחשבון ניכוי של 5% בגין אובדן "
+                "הכנסות, וההכנסה הוונה בשיעור של 7.25%. גרסה זו מחליפה את גרסת חוות הדעת מחודש יולי 2024.",
+                [
+                    GFact("vacancy_allowance", "5", "ניכוי של 5% בגין אובדן הכנסות", unit="percent"),
+                    GFact("cap_rate", "7.25", "הוונה בשיעור של 7.25%", unit="percent"),
+                ],
+            )
+        else:
+            assumptions = GPara(
+                "בהתחשב ביציבות השוכר וביתרת תקופת השכירות, לא הובא בחשבון ניכוי בגין אובדן הכנסות, "
+                "וההכנסה הוונה בשיעור של 6.75%.",
+                [
+                    GFact("vacancy_allowance", "0", "לא הובא בחשבון ניכוי בגין אובדן הכנסות", unit="percent",
+                          note="explicitly none"),
+                    GFact("cap_rate", "6.75", "הוונה בשיעור של 6.75%", unit="percent"),
+                ],
+            )
+        return doc(
+            id="K3v2" if v2 else "K3",
+            filename="K3v2_synthetic_herzliya_sokolov_retail_v2.pdf" if v2 else "K3_synthetic_herzliya_sokolov_retail.pdf",
+            title_place="סוקולוב 60, הרצליה",
+            city="הרצליה",
+            neighborhood="מרכז העיר",
+            address="סוקולוב 60",
+            block=6526,
+            parcel=210,
+            sub_parcel=4,
+            ptype="retail",
+            ptype_label="חנות",
+            area=dec(180),
+            area_line="180 מ״ר נטו",
+            valuation_date=date(2024, 9, 15) if v2 else date(2024, 7, 1),
+            report_date=date(2024, 9, 22) if v2 else date(2024, 7, 8),
+            client="בעלי הנכס",
+            purpose="בחינת שווי לקראת מכירה",
+            value=dec(4250000) if v2 else dec(4800000),
+            subject_key="הרצליה|6526/210/4",
+            environment=[
+                "רחוב סוקולוב הוא רחוב המסחר המרכזי של הרצליה, ולאורכו חנויות, בתי קפה וסניפי בנקים.",
+                "תנועת הולכי הרגל ברחוב ערה במיוחד בשעות הערב ובסופי השבוע.",
+            ],
+            version_of="K3" if v2 else None,
+            notes=(
+                "Second version of K3: tenant notice -> vacancy allowance 0% -> 5% and cap rate 6.75% -> 7.25%; new "
+                "value and dates. Everything else is identical."
+                if v2
+                else "Herzliya shop, first version. Lease term stated only in words (עשר שנים); monthly rent 27,000, "
+                "CPI-linked; no vacancy allowance, cap rate 6.75%."
+            ),
+            sections=[
+                (
+                    "תיאור הנכס",
+                    [
+                        GPara(
+                            "הנכס הנישום הוא חנות בקומת הקרקע בבניין מגורים ומסחר ברחוב סוקולוב, בחזית רחוב "
+                            "פעילה. לחנות חלון ראווה רחב לרחוב ומחסן סחורה פנימי."
+                        ),
+                        GPara(
+                            "החנות מושכרת לרשת אופנה (בדויה) לתקופה של עשר שנים, החל מינואר 2022. דמי השכירות "
+                            "החודשיים הם 27,000 ₪, והם צמודים למדד המחירים לצרכן.",
+                            [
+                                GFact("leased", True, "החנות מושכרת לרשת אופנה"),
+                                GFact("lease_term", 10, "לתקופה של עשר שנים", unit="year",
+                                      note="stated only in words"),
+                                GFact("monthly_rent", "27000", "דמי השכירות החודשיים הם 27,000 ₪", unit="ILS/month"),
+                                GFact("indexation", True, "והם צמודים למדד המחירים לצרכן"),
+                            ],
+                        ),
+                    ],
+                ),
+                ("הנחות השומה", [assumptions]),
+            ],
+        )
+
+    k4 = doc(
+        id="K4",
+        filename="K4_synthetic_ramatgan_bialik_retail.pdf",
+        title_place="ביאליק 70, רמת גן",
+        city="רמת גן",
+        neighborhood="מרכז העיר",
+        address="ביאליק 70",
+        block=6143,
+        parcel=377,
+        sub_parcel=2,
+        ptype="retail",
+        ptype_label="חנות",
+        area=dec(95),
+        area_line="95 מ״ר נטו",
+        valuation_date=date(2024, 3, 10),
+        report_date=date(2024, 3, 18),
+        client="שני הבעלים במשותף",
+        purpose="הסכם פירוק שיתוף בין בעלים",
+        value=dec(3750000),
+        subject_key="רמת גן|6143/377/2",
+        notes="Ramat Gan shop on a main road. Noise 68 dB; maintenance 4 of 5 in a sentence; lease table "
+        "(21,850 a month, 230 per m2, 3 years, occupancy 100%); rent NOT indexed; cap rate '7 אחוזים'. "
+        "No energy rating, plot data or registry entries.",
+        sections=[
+            (
+                "תיאור הנכס",
+                [
+                    GPara(
+                        "החנות ממוקמת בקומת הקרקע בחזית רחוב ביאליק, ציר תנועה ראשי. מדידה שנערכה בעת הביקור "
+                        "העלתה מפלס רעש של 68 דציבל בשעות היום בחזית החנות.",
+                        [GFact("noise_level", "68", "מפלס רעש של 68 דציבל", unit="dB")],
+                    ),
+                    GPara(
+                        "מצב התחזוקה של החנות טוב, והשמאי העניק לה ציון 4 מתוך 5.",
+                        [GFact("maintenance_score", 4, "ציון 4 מתוך 5", unit="score")],
+                    ),
+                ],
+            ),
+            (
+                "השכירות",
+                [
+                    GTable(
+                        "נתוני השכירות",
+                        ["פרמטר", "ערך"],
+                        [100, 80],
+                        [
+                            ["דמי שכירות חודשיים (₪)", "21,850"],
+                            ["דמי שכירות למ״ר לחודש (₪)", "230"],
+                            ["תקופת השכירות", "3 שנים"],
+                            ["שיעור תפוסה", "100%"],
+                        ],
+                        [
+                            GFact("monthly_rent", "21850", "21,850", unit="ILS/month", cell=(0, 1)),
+                            GFact("rent_per_sqm", "230", "230", unit="ILS/m2/month", cell=(1, 1)),
+                            GFact("lease_term", 3, "3 שנים", unit="year", cell=(2, 1)),
+                            GFact("occupancy_rate", "100", "100%", unit="percent", cell=(3, 1)),
+                        ],
+                    ),
+                    GPara(
+                        "דמי השכירות אינם צמודים למדד, ולכן הובאה בחשבון שחיקה ריאלית של ההכנסה לאורך תקופת "
+                        "השכירות.",
+                        [GFact("indexation", False, "דמי השכירות אינם צמודים למדד")],
+                    ),
+                ],
+            ),
+            (
+                "גישת השומה",
+                [
+                    GPara(
+                        "ההכנסה השנתית הוונה בשיעור של 7 אחוזים, בדומה לחנויות ברחובות מסחריים ראשיים בעיר.",
+                        [GFact("cap_rate", "7", "בשיעור של 7 אחוזים", unit="percent", note="written '7 אחוזים'")],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    k5 = doc(
+        id="K5",
+        filename="K5_synthetic_holon_haplada_industrial_2023.pdf",
+        title_place="הפלדה 12, חולון",
+        city="חולון",
+        neighborhood="אזור התעשייה",
+        address="הפלדה 12",
+        block=7140,
+        parcel=21,
+        sub_parcel=None,
+        ptype="industrial",
+        ptype_label="מבנה תעשייה",
+        area=dec(1500),
+        area_line="1,500 מ״ר ברוטו",
+        valuation_date=date(2023, 4, 20),
+        report_date=date(2023, 5, 2),
+        client="בעלי המפעל",
+        purpose="מימון בנקאי",
+        value=dec(9600000),
+        subject_key="חולון|7140/21",
+        environment=[
+            "אזור התעשייה של חולון משלב מבני תעשייה ותיקים לצד מבני מסחר ומשרדים חדשים יותר.",
+            "הגישה לאזור נוחה מכביש 4 ומדרך ההגנה, ותנועת המשאיות בו ערה בשעות היום.",
+        ],
+        notes="Holon industrial building in 2023, owner-occupied (NOT leased), cost approach. Table: plot "
+        "2,400 m2 (conflicts with K6's 2,450), coverage 60%, road 12 m, maintenance 3. Construction cost "
+        "4,200 per m2, depreciation 30%, easement in favour of the neighbouring parcel.",
+        sections=[
+            (
+                "תיאור הנכס",
+                [
+                    GPara(
+                        "הנכס הנישום הוא מבנה תעשייה דו-קומתי המשמש את בעליו כמפעל לייצור רהיטים. המבנה אינו "
+                        "מושכר, ולכן לא נערך לו תחשיב הכנסות.",
+                        [GFact("leased", False, "המבנה אינו מושכר", note="owner-occupied in 2023")],
+                    ),
+                    GTable(
+                        "נתוני המגרש והמבנה",
+                        ["נתון", "ערך"],
+                        [100, 80],
+                        [
+                            ["שטח המגרש (מ״ר)", "2,400"],
+                            ["תכסית קיימת", "60%"],
+                            ["רוחב דרך הגישה (מ׳)", "12"],
+                            ["ציון תחזוקה (1 עד 5)", "3"],
+                        ],
+                        [
+                            GFact("plot_area", "2400", "2,400", unit="m2", entity="plot", cell=(0, 1)),
+                            GFact("building_coverage", "60", "60%", unit="percent", entity="plot", cell=(1, 1),
+                                  note="existing coverage"),
+                            GFact("access_road_width", "12", "12", unit="m", entity="plot", cell=(2, 1)),
+                            GFact("maintenance_score", 3, "3", unit="score", entity="building", cell=(3, 1)),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "מצב משפטי",
+                [
+                    GPara(
+                        "בנסח הרישום רשומה זיקת הנאה למעבר כלי רכב לטובת חלקה 22 השכנה, לאורך הגבול המזרחי של "
+                        "המגרש.",
+                        [GFact("easement", True, "רשומה זיקת הנאה למעבר כלי רכב לטובת חלקה 22", entity="plot")],
+                    ),
+                ],
+            ),
+            (
+                "גישת העלות",
+                [
+                    GPara(
+                        "עלות הבנייה של מבנה חדש דומה הוערכה ב-4,200 ₪ למ״ר בנוי, כולל עבודות פיתוח.",
+                        [GFact("construction_cost", "4200", "4,200 ₪ למ״ר בנוי", unit="ILS/m2")],
+                    ),
+                    GPara(
+                        "בשל גיל המבנה ומצב מערכותיו הובא בחשבון פחת בשיעור 30% מעלות ההקמה.",
+                        [GFact("depreciation_rate", "30", "פחת בשיעור 30%", unit="percent")],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    k6 = doc(
+        id="K6",
+        filename="K6_synthetic_holon_haplada_industrial_2024.docx",
+        kind="docx",
+        title_place="הפלדה 12, חולון",
+        city="חולון",
+        neighborhood="אזור התעשייה",
+        address="הפלדה 12",
+        block=7140,
+        parcel=21,
+        sub_parcel=None,
+        ptype="industrial",
+        ptype_label="מבנה תעשייה",
+        area=dec(1500),
+        area_line="1,500 מ״ר ברוטו",
+        valuation_date=date(2024, 8, 5),
+        report_date=date(2024, 8, 14),
+        client="בעלי המבנה",
+        purpose="בחינת שווי לאחר השכרת המבנה",
+        value=dec(11150000),
+        subject_key="חולון|7140/21",
+        notes="DOCX (page fields are null). Second appraisal of K5's subject, now leased: plot table says 2,450 m2 "
+        "(conflict with K5's 2,400); rent 72,000 a month = 48 per m2, 7 years, CPI-linked, fully let; cap rate "
+        "7.75%. No maintenance score, road width, depreciation or registry entries.",
+        sections=[
+            (
+                "תיאור הנכס",
+                [
+                    GPara(
+                        "חוות הדעת נערכת למבנה התעשייה ברחוב הפלדה 12 בחולון, שנישום בעבר על ידי המשרד באפריל "
+                        "2023. מאז השומה הקודמת פינו הבעלים את המפעל והשכירו את המבנה."
+                    ),
+                    GTable(
+                        "נתוני המגרש",
+                        ["נתון", "ערך"],
+                        [100, 80],
+                        [["שטח המגרש לפי מדידה עדכנית (מ״ר)", "2,450"], ["שטח בנוי (מ״ר)", "1,500"]],
+                        [GFact("plot_area", "2450", "2,450", unit="m2", entity="plot", cell=(0, 1))],
+                    ),
+                ],
+            ),
+            (
+                "השכירות",
+                [
+                    GPara(
+                        "המבנה הושכר במלואו לחברת לוגיסטיקה (בדויה) לתקופה של 7 שנים. דמי השכירות החודשיים הם "
+                        "72,000 ₪, כלומר 48 ₪ למ״ר לחודש, והם צמודים למדד המחירים לצרכן.",
+                        [
+                            GFact("leased", True, "המבנה הושכר במלואו"),
+                            GFact("occupancy_rate", "100", "המבנה הושכר במלואו", unit="percent",
+                                  note="fully let, no number written"),
+                            GFact("lease_term", 7, "לתקופה של 7 שנים", unit="year"),
+                            GFact("monthly_rent", "72000", "דמי השכירות החודשיים הם 72,000 ₪", unit="ILS/month"),
+                            GFact("rent_per_sqm", "48", "48 ₪ למ״ר לחודש", unit="ILS/m2/month"),
+                            GFact("indexation", True, "והם צמודים למדד המחירים לצרכן"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "גישת השומה",
+                [
+                    GPara(
+                        "ההכנסה השנתית הוונה בשיעור של 7.75%, המשקף שוכר יחיד בחוזה ארוך.",
+                        [GFact("cap_rate", "7.75", "הוונה בשיעור של 7.75%", unit="percent")],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    k7 = doc(
+        id="K7",
+        filename="K7_synthetic_petahtikva_herzl_building.pdf",
+        title_place="הרצל 15, פתח תקווה",
+        city="פתח תקווה",
+        neighborhood="מרכז העיר",
+        address="הרצל 15",
+        block=6393,
+        parcel=155,
+        sub_parcel=None,
+        ptype="residential_building",
+        ptype_label="בניין מגורים",
+        area=dec(2350),
+        area_line="2,350 מ״ר ברוטו",
+        valuation_date=date(2024, 6, 3),
+        report_date=date(2024, 6, 10),
+        client="נציגות הבית המשותף",
+        purpose="קביעת סכום ביטוח למבנה",
+        value=dec(12780000),
+        subject_key="פתח תקווה|6393/155",
+        notes="Petah Tikva residential building at הרצל 15 (same address as K8 in Holon: the ambiguous referent). "
+        "24 dwelling units, plot 1,150 m2, coverage 35%, energy A, noise 55 dB, setbacks table (4/3/5), "
+        "maintenance 4, no warning notes, public-passage easement, construction cost 6,800 per m2, depreciation 20%.",
+        sections=[
+            (
+                "תיאור הבניין",
+                [
+                    GPara(
+                        "בניין מגורים בן שש קומות מעל קומת עמודים, ובו 24 יחידות דיור. הבניין בנוי על מגרש בשטח "
+                        "1,150 מ״ר, בתכסית של 35%.",
+                        [
+                            GFact("units_in_building", 24, "ובו 24 יחידות דיור", unit="count", entity="building"),
+                            GFact("plot_area", "1150", "מגרש בשטח 1,150 מ״ר", unit="m2", entity="plot"),
+                            GFact("building_coverage", "35", "בתכסית של 35%", unit="percent", entity="plot",
+                                  note="existing coverage"),
+                        ],
+                    ),
+                    GPara(
+                        "לבניין דירוג אנרגטי A לפי תעודה שהוצגה לשמאי. ציון התחזוקה הכולל שניתן לבניין הוא 4 "
+                        "מתוך 5.",
+                        [
+                            GFact("energy_rating", "A", "דירוג אנרגטי A", entity="building"),
+                            GFact("maintenance_score", 4, "ציון התחזוקה הכולל שניתן לבניין הוא 4", unit="score",
+                                  entity="building"),
+                        ],
+                    ),
+                    GPara(
+                        "הבניין פונה לרחוב שקט יחסית; מפלס הרעש שנמדד בחזית הוא 55 דציבל.",
+                        [GFact("noise_level", "55", "מפלס הרעש שנמדד בחזית הוא 55 דציבל", unit="dB")],
+                    ),
+                    GTable(
+                        "קווי בניין",
+                        ["כיוון", "מרחק מגבול המגרש (מ׳)"],
+                        [90, 90],
+                        [["קדמי", "4"], ["צדדי", "3"], ["אחורי", "5"]],
+                        [
+                            GFact("setback_front", "4", "4", unit="m", entity="plot", cell=(0, 1)),
+                            GFact("setback_side", "3", "3", unit="m", entity="plot", cell=(1, 1)),
+                            GFact("setback_rear", "5", "5", unit="m", entity="plot", cell=(2, 1)),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "מצב משפטי",
+                [
+                    GPara(
+                        "על פי נסח הרישום לא רשומות על החלקה הערות אזהרה. רשומה זיקת הנאה למעבר הציבור ברצועה "
+                        "ברוחב 2 מ׳ לאורך הגבול הצפוני של המגרש.",
+                        [
+                            GFact("warning_notes", 0, "לא רשומות על החלקה הערות אזהרה", unit="count", entity="plot",
+                                  note="explicitly none"),
+                            GFact("easement", True, "זיקת הנאה למעבר הציבור", entity="plot",
+                                  note="the 2 m is the width of the easement strip, not of an access road"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "גישת העלות",
+                [
+                    GPara(
+                        "עלות ההקמה של בניין חלופי בסטנדרט דומה הוערכה ב-6,800 ₪ למ״ר בנוי.",
+                        [GFact("construction_cost", "6800", "6,800 ₪ למ״ר בנוי", unit="ILS/m2")],
+                    ),
+                    GPara(
+                        "בהתחשב בגיל הבניין ובמצב תחזוקתו הובא בחשבון פחת מצטבר בשיעור 20%.",
+                        [GFact("depreciation_rate", "20", "פחת מצטבר בשיעור 20%", unit="percent")],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    k8 = doc(
+        id="K8",
+        filename="K8_synthetic_holon_herzl_land.pdf",
+        title_place="הרצל 15, חולון",
+        city="חולון",
+        neighborhood="קריית שרת",
+        address="הרצל 15",
+        block=7155,
+        parcel=40,
+        sub_parcel=None,
+        ptype="land",
+        ptype_label="קרקע פנויה",
+        area=dec(1800),
+        area_line=None,
+        valuation_date=date(2024, 1, 22),
+        report_date=date(2024, 1, 30),
+        client="חברת יזמות דמו בע״מ (בדויה)",
+        purpose="בחינת כדאיות לרכישה",
+        value=dec(8900000),
+        subject_key="חולון|7155/40",
+        environment=[
+            "שכונת קריית שרת ממוקמת בצפון חולון, ומאופיינת בבנייה רוויה ותיקה לצד פרויקטים חדשים.",
+            "בקרבת המגרש פועלים מרכז מסחרי שכונתי, בתי ספר ופארק עירוני.",
+        ],
+        notes="Holon vacant land at הרצל 15 (same address as K7 in Petah Tikva). Plot 1.8 dunam (= 1,800 m2); "
+        "access road width only in words (שישה מטרים); noise 72 dB; maximum permitted coverage 45%, setbacks "
+        "5 / 3 m; two warning notes; no easements; residual method with construction cost '7.2 אלף ₪' per m2.",
+        sections=[
+            (
+                "תיאור המגרש",
+                [
+                    GPara(
+                        "המגרש הנישום הוא קרקע פנויה בשטח 1.8 דונם, בצורת מלבן, ברחוב הרצל בחולון.",
+                        [GFact("plot_area", "1.8", "קרקע פנויה בשטח 1.8 דונם", unit="dunam", entity="plot",
+                               normalized={"value": "1800", "unit": "m2"})],
+                    ),
+                    GPara(
+                        "הגישה למגרש היא בדרך סלולה ברוחב שישה מטרים, המשותפת למגרש ולחלקה השכנה.",
+                        [GFact("access_road_width", 6, "בדרך סלולה ברוחב שישה מטרים", unit="m", entity="plot",
+                               note="stated only in words")],
+                    ),
+                    GPara(
+                        "המגרש סמוך לכביש מהיר; לפי סקר אקוסטי שצורף לתיק, מפלס הרעש בגבול המגרש מגיע ל-72 דציבל.",
+                        [GFact("noise_level", "72", "מפלס הרעש בגבול המגרש מגיע ל-72 דציבל", unit="dB")],
+                    ),
+                ],
+            ),
+            (
+                "הוראות הבנייה החלות על המגרש",
+                [
+                    GPara(
+                        "לפי ההוראות החלות על המגרש, התכסית המרבית המותרת היא 45%, וקו הבניין הקדמי הוא 5 מטרים. "
+                        "קווי הבניין הצדדיים הם 3 מטרים.",
+                        [
+                            GFact("building_coverage", "45", "התכסית המרבית המותרת היא 45%", unit="percent",
+                                  entity="plot", note="maximum permitted coverage, not an existing one"),
+                            GFact("setback_front", "5", "קו הבניין הקדמי הוא 5 מטרים", unit="m", entity="plot"),
+                            GFact("setback_side", "3", "קווי הבניין הצדדיים הם 3 מטרים", unit="m", entity="plot"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "מצב משפטי",
+                [
+                    GPara(
+                        "על פי נסח הרישום רשומות על המגרש שתי הערות אזהרה לטובת רוכשים (בדויים). לא רשומות על "
+                        "המגרש זיקות הנאה.",
+                        [
+                            GFact("warning_notes", 2, "שתי הערות אזהרה", unit="count", entity="plot"),
+                            GFact("easement", False, "לא רשומות על המגרש זיקות הנאה", entity="plot"),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "גישת השומה",
+                [
+                    GPara(
+                        "השומה נערכה בשיטה השיורית. עלות הבנייה של הפרויקט המתוכנן הונחה בסך 7.2 אלף ₪ למ״ר בנוי.",
+                        [GFact("construction_cost", "7.2", "7.2 אלף ₪ למ״ר בנוי", unit="thousand ILS/m2",
+                               normalized={"value": "7200", "unit": "ILS/m2"})],
+                    ),
+                ],
+            ),
+        ],
+    )
+    return [k1, k2, k3(False), k4, k5, k6, k7, k8, k3(True)]
+
+
+def _v2_existing_mentions(paragraphs: list[tuple[str, str, int | None]]) -> list[dict[str, Any]]:
+    """Sentences of the earlier fixtures that touch the v2 topics, with any false-friend note."""
+    import re
+
+    out = []
+    for doc_id, text, page in paragraphs:
+        for sentence in [s.strip() for s in text.replace("; ", ". ").split(". ") if s.strip()]:
+            for topic, patterns in V2_MENTION_PATTERNS.items():
+                hit = next((m.group(0) for p in patterns if (m := re.search(p, sentence))), None)
+                if hit is None:
+                    continue
+                item = {"document": doc_id, "topic": topic, "term": hit, "page": page,
+                        "sentence": sentence.rstrip(".")}
+                friend = next((note for phrase, note in V2_FALSE_FRIENDS.items() if phrase in sentence), None)
+                if friend:
+                    item["false_friend"] = friend
+                out.append(item)
+    return out
+
+
+def _earlier_paragraphs(font_dir: Path, reports: list[Report], layouts: dict[str, Layout]):
+    """(document id, paragraph, physical page) of the original reports and the first held-out corpus; the
+    held-out documents are rendered again in memory (deterministic) and nothing is written."""
+    out = [(rep.id, t, s) for rep in reports if rep.kind not in ("encrypted", "truncated")
+           for t, s, _e in layouts[rep.id].paragraphs]
+    for gdoc in build_general_docs():
+        if gdoc.kind == "docx":
+            _, layout = render_general_docx(gdoc)
+        else:
+            renderer = GeneralPdfRenderer(font_dir)
+            renderer.render_general(gdoc)
+            layout = renderer.layout
+        out += [(gdoc.id, t, s) for t, s, _e in layout.paragraphs]
+    return out
+
+
+def holdout_v2_section(
+    docs: list[V2Doc], entries: dict[str, dict[str, Any]], facts: list[dict[str, Any]],
+    mentions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    replaced = {d.version_of for d in docs if d.version_of}
+    current = [d.id for d in docs if d.id not in replaced]
+    stated = {(f["document"], f["attribute"]) for f in facts}
+    not_stated = {attr: [d.id for d in docs if (d.id, attr) not in stated] for attr in HOLDOUT_V2_ATTRIBUTES}
+
+    def fact(doc_id: str, attribute: str) -> dict[str, Any]:
+        found = [f for f in facts if f["document"] == doc_id and f["attribute"] == attribute]
+        assert len(found) == 1, (doc_id, attribute, found)
+        return found[0]
+
+    def side(doc_id: str, attribute: str) -> dict[str, Any]:
+        f = fact(doc_id, attribute)
+        return {"document": doc_id, "fact": f["id"], "value": f["value"], "page": f["page"], "quote": f["quote"]}
+
+    old, new = "K3", "K3v2"
+    changed_attributes = ("vacancy_allowance", "cap_rate")
+    changed = []
+    for attribute in changed_attributes:
+        assert fact(old, attribute)["value"] != fact(new, attribute)["value"], attribute
+        changed.append({"attribute": attribute, "old": side(old, attribute), "new": side(new, attribute)})
+    for attribute in HOLDOUT_V2_ATTRIBUTES:
+        if attribute in changed_attributes:
+            continue
+        a = [f["value"] for f in facts if f["document"] == old and f["attribute"] == attribute]
+        b = [f["value"] for f in facts if f["document"] == new and f["attribute"] == attribute]
+        assert a == b, (attribute, a, b)  # nothing else differs between the versions
+    conflict = [side("K5", "plot_area"), side("K6", "plot_area")]
+    assert conflict[0]["value"] != conflict[1]["value"]
+    by_id = {d.id: d for d in docs}
+    assert by_id["K5"].subject_key == by_id["K6"].subject_key
+    assert by_id["K7"].address == by_id["K8"].address and by_id["K7"].city != by_id["K8"].city
+    return {
+        "about": f"{SYNTHETIC_MARKER}. Held-out corpus v2: appraisal-like documents on topics that none of the "
+        "earlier fixtures, question sets or fixes covered. Files live in tests/fixtures/holdout_v2/. The documents "
+        "produce no records (no 'שווי הנכס:' header label, no price or value column), so ground_truth.yaml, the "
+        "record counts and the 77-item evaluation are unaffected. Same schema as ground_truth.yaml "
+        "`general_facts`. Values are as the document states them; `normalized` gives the canonical unit when the "
+        "document uses another one. Boolean facts record explicit statements only; `not_stated` lists, per "
+        "attribute, the documents with no fact for it. Generated by scripts/generate_fixtures.py - do not edit by "
+        "hand.",
+        "directory": HOLDOUT_V2_DIR,
+        "group": {
+            "code": HOLDOUT_V2_GROUP["code"],
+            "name": HOLDOUT_V2_GROUP["name"],
+            "office": "A",
+            "visible_to": ["admin-a@demo.test", "dana@demo.test"],
+            "hidden_from": ["yossi@demo.test", "admin-b@demo.test"],
+        },
+        "attributes": HOLDOUT_V2_ATTRIBUTES,
+        "documents": list(entries.values()),
+        "current_documents": current,
+        "facts": facts,
+        "not_stated": not_stated,
+        "conflicts": [
+            {
+                "subject_key": by_id["K5"].subject_key,
+                "address": "הפלדה 12, חולון",
+                "attribute": "plot_area",
+                "statements": conflict,
+                "note": "two appraisals of the same property (2023 and 2024) state different plot areas; an answer "
+                "must show both, never pick one silently",
+            }
+        ],
+        "versions": [
+            {
+                "document": new,
+                "replaces": old,
+                "changed": changed,
+                "value_in_text": {"old": str(by_id[old].value), "new": str(by_id[new].value)},
+                "dates": {
+                    "old": {"valuation_date": by_id[old].valuation_date.isoformat(),
+                            "report_date": by_id[old].report_date.isoformat()},
+                    "new": {"valuation_date": by_id[new].valuation_date.isoformat(),
+                            "report_date": by_id[new].report_date.isoformat()},
+                },
+                "unchanged": "every other attribute and sentence",
+            }
+        ],
+        "same_subject": [
+            {"subject_key": by_id["K5"].subject_key, "documents": ["K5", "K6"],
+             "note": "the same industrial building appraised twice (2023 owner-occupied, 2024 leased); different "
+             "documents, not versions"},
+            {"subject_key": by_id["K3"].subject_key, "documents": ["K3", "K3v2"],
+             "note": "two versions of one document; only K3v2 is current"},
+        ],
+        "ambiguous_referents": [
+            {"phrase": "הרצל 15", "documents": ["K7", "K8"],
+             "note": "the same street address in two cities (פתח תקווה and חולון); both documents state plot area, "
+             "coverage, front setback, noise, warning notes and easements, with different values"},
+        ],
+        "stated_in_words": [
+            {"document": f["document"], "fact": f["id"], "attribute": f["attribute"], "value": f["value"],
+             "quote": f["quote"]}
+            for f in facts if f.get("note") == "stated only in words"
+        ],
+        "existing_mentions": mentions,
+    }
+
+
+def write_holdout_v2(out: Path, font_dir: Path, reports: list[Report], layouts: dict[str, Layout]) -> None:
+    vdir = out / HOLDOUT_V2_DIR
+    vdir.mkdir(parents=True, exist_ok=True)
+    docs = build_holdout_v2_docs()
+    entries: dict[str, dict[str, Any]] = {}
+    facts: list[dict[str, Any]] = []
+    for vdoc in docs:
+        assert "synthetic" in vdoc.filename
+        if vdoc.kind == "docx":
+            data, layout = render_general_docx(vdoc)
+        else:
+            renderer = GeneralPdfRenderer(font_dir)
+            data = renderer.render_general(vdoc)
+            layout = renderer.layout
+        (vdir / vdoc.filename).write_bytes(data)
+        vtables = [b for _, blocks in vdoc.all_sections() for b in blocks if isinstance(b, GTable)]
+        for table in vtables:  # no price or value column: the rules extractor never sees a comparables table
+            assert not any("מחיר" in h or "שווי" in h for h in table.headers), table.headers
+        for _, blocks in vdoc.all_sections():  # no "שווי הנכס:" label anywhere, so no appraised-value record
+            for block in blocks:
+                if isinstance(block, GPara):
+                    assert "שווי הנכס:" not in block.text, block.text
+        entries[vdoc.id] = {
+            "id": vdoc.id,
+            "filename": vdoc.filename,
+            "office": "A",
+            "group": HOLDOUT_V2_GROUP["code"],
+            "kind": vdoc.kind,
+            "version_of": vdoc.version_of,
+            "notes": vdoc.notes,
+            "city": vdoc.city,
+            "neighborhood": vdoc.neighborhood,
+            "address": vdoc.address,
+            "block": vdoc.block,
+            "parcel": vdoc.parcel,
+            "sub_parcel": vdoc.sub_parcel,
+            "subject_key": vdoc.subject_key,
+            "property_type": vdoc.ptype,
+            "property_type_he": vdoc.ptype_label,
+            "valuation_date": vdoc.valuation_date.isoformat(),
+            "report_date": vdoc.report_date.isoformat(),
+            "value_in_text": str(vdoc.value),
+            "page_count": layout.page_count,
+            "header_page": layout.header_page,
+            "sections": [{"number": s["number"], "title": s["title"], "page": s["page"]} for s in layout.sections],
+            "tables": [
+                {"index": i, "title": t.title, "page": p, "headers": FlowList(t.headers),
+                 "rows": [FlowList(r) for r in t.rows]}
+                for i, (t, p) in enumerate(zip(vtables, layout.gtables, strict=True))
+            ],
+            "records": [],
+        }
+        facts.extend(_general_facts_of(vdoc, layout))
+        print(f"wrote {HOLDOUT_V2_DIR}/{vdoc.filename} ({len(data):,} bytes, pages={layout.page_count})")
+    mentions = _v2_existing_mentions(_earlier_paragraphs(font_dir, reports, layouts))
+    section = holdout_v2_section(docs, entries, facts, mentions)
+    text = yaml.safe_dump(section, allow_unicode=True, sort_keys=False, width=1000)
+    (out / HOLDOUT_V2_TRUTH).write_text(text, encoding="utf-8")
+    print(f"wrote {HOLDOUT_V2_TRUTH} ({len(text):,} chars)")
+
+
 # --------------------------------------------------------------------------- main
+
+
+# --------------------------------------------------------------------------- reading-order fixtures (blocks/)
+
+BLOCKS_DIR = "blocks"
+
+
+class BlocksPdfRenderer(GeneralPdfRenderer):
+    """Synthetic reproductions of PDF producer quirks the block reader must undo. Nothing here comes from a real
+    document: the layouts imitate the defects only (bold drawn twice, a title page without orientation evidence, a
+    heading whose last letter sits on its own baseline, tables between paragraphs and across a page break)."""
+
+    WIDTHS = [80, 50, 50]
+
+    def bold_twice(self, text: str, size: float = 12.5, h: float = 8) -> None:
+        """Fake bold the way some producers draw it: the same glyphs twice, the second copy 0.15 mm to the right."""
+        pdf = self.pdf
+        y = pdf.get_y()
+        pdf.set_font("DejaVu", "B", size)
+        pdf.set_xy(pdf.l_margin + 0.15, y)
+        pdf.cell(pdf.w - pdf.l_margin - pdf.r_margin, h, text, align="R")
+        pdf.set_xy(pdf.l_margin, y)
+        pdf.cell(0, h, text, align="R", new_x=self.XPos.LMARGIN, new_y=self.YPos.NEXT)
+
+    def split_heading(self, head: str, tail: str, size: float = 12.5, h: float = 8) -> None:
+        """A heading whose last letters are a separate run 1.8 mm lower (a text-layer line break inside a word)."""
+        pdf = self.pdf
+        y = pdf.get_y()
+        pdf.set_font("DejaVu", "B", size)
+        right = pdf.w - pdf.r_margin
+        head_w = pdf.get_string_width(head)
+        pdf.set_xy(right - head_w - 0.5, y)
+        pdf.cell(head_w + 0.5, h, head, align="R")
+        tail_w = pdf.get_string_width(tail)
+        pdf.set_xy(right - head_w - 0.5 - tail_w - 0.2, y + 1.8)
+        pdf.cell(tail_w + 0.2, h, tail, align="R")
+        pdf.set_xy(pdf.l_margin, y + h)
+
+    def note(self, text: str) -> None:
+        self._line(text, size=9)
+
+    def btable(self, headers: list[str], rows: list[list[str]]) -> list[int]:
+        """A ruled table that continues on the next page without repeating its header; returns each row's page."""
+        pdf = self.pdf
+        pdf.set_fill_color(225, 225, 225)
+        self._grow(headers, self.WIDTHS, bold=True)
+        pages = []
+        for row in rows:
+            if pdf.get_y() + self.ROW_H > pdf.page_break_trigger:
+                pdf.add_page()
+            self._grow(row, self.WIDTHS)
+            pages.append(pdf.page_no())
+        pdf.ln(2)
+        return pages
+
+    def render_reading_order(self) -> tuple[bytes, list[int]]:
+        pdf = self.pdf
+        pdf.no_footer_pages = {1}
+        pdf.add_page()  # title page: no word carries orientation evidence, so only the document can decide it
+        pdf.ln(60)
+        self._line("חוות דעת שמאית", size=22, bold=True, h=14)
+        self._line("גבעת התאנה", size=15, h=10)
+        pdf.add_page()
+        self.bold_twice("1. מטרת חוות הדעת")
+        self.paragraph("חוות דעת זו נערכה לצורך הדגמה בלבד ואינה מתייחסת לנכס אמיתי. כל השמות והמספרים בה בדויים.")
+        self.bold_twice("2. נתוני השוואה")
+        self.paragraph("להלן עסקאות שנמצאו בסביבת הנכס:")
+        self.btable(["כתובת", "שטח (מ״ר)", "מחיר (₪)"],
+                    [["התאנה 3", "82", "1,640,000"], ["התאנה 9", "95", "1,910,000"], ["הרימון 4", "77", "1,520,000"]])
+        self.note("(*) המחירים כוללים מע״מ.")
+        pdf.ln(2)
+        self.paragraph("העסקאות מלמדות על מחיר ממוצע של כ-20,000 ₪ למ״ר בנוי.")
+        self.bold_twice("3. תיאור הנכס")
+        self.bold_twice("3.1 הבניין", size=11)
+        self.paragraph("הבניין בן ארבע קומות ונבנה בשנת 1995.")
+        self.bold_twice("3.2 הדירה", size=11)
+        self.paragraph("הדירה בקומה השנייה ושטחה 88 מ״ר.")
+        self.split_heading("4. התחשי", "ב")
+        self.paragraph("טבלת התחשיב לפי רכיבים:")
+        rows = [[f"רכיב {i}", str(10 + i), f"{(10 + i) * 20_000:,}"] for i in range(1, 25)]
+        pages = self.btable(["רכיב", "שטח (מ״ר)", "שווי (₪)"], rows)
+        assert pages[0] == 2 and pages[-1] == 3, pages
+        self.paragraph("סך שווי הרכיבים מופיע בשורה האחרונה של הטבלה.")
+        self._line("5. סיכום", size=12.5, bold=True, h=8)
+        self.paragraph("שווי הנכס המוערך הוא 1,760,000 ₪.")
+        return bytes(pdf.output()), pages
+
+    def render_pictures(self) -> bytes:
+        from PIL import Image, ImageDraw
+
+        logo = Image.new("RGB", (60, 60), (255, 255, 255))
+        ImageDraw.Draw(logo).ellipse((6, 6, 54, 54), fill=(30, 90, 160))
+        photo = Image.new("RGB", (120, 80), (200, 220, 200))
+        ImageDraw.Draw(photo).rectangle((20, 20, 100, 60), fill=(120, 80, 40))
+        pdf = self.pdf
+        pdf.add_page()
+        pdf.image(logo, x=pdf.l_margin, y=pdf.get_y(), w=15)
+        pdf.ln(18)
+        self._line("1. תמונות הנכס", size=12.5, bold=True, h=8)
+        self.paragraph("להלן צילום חזית הבניין:")
+        pdf.image(photo, x=pdf.w - pdf.r_margin - 60, y=pdf.get_y(), w=60)
+        pdf.ln(44)
+        self.paragraph("הצילום מתאר את חזית הבניין בלבד.")
+        pdf.add_page()
+        pdf.image(logo, x=pdf.l_margin, y=pdf.get_y(), w=15)
+        pdf.ln(18)
+        self._line("2. סיכום", size=12.5, bold=True, h=8)
+        self.paragraph("שווי הנכס המוערך הוא 990,000 ₪.")
+        return bytes(pdf.output())
+
+
+def write_blocks(out: Path, font_dir: Path) -> None:
+    bdir = out / BLOCKS_DIR
+    bdir.mkdir(parents=True, exist_ok=True)
+    data, _ = BlocksPdfRenderer(font_dir).render_reading_order()
+    (bdir / "B1_synthetic_reading_order.pdf").write_bytes(data)
+    print(f"wrote {BLOCKS_DIR}/B1_synthetic_reading_order.pdf ({len(data):,} bytes)")
+    data = BlocksPdfRenderer(font_dir).render_pictures()
+    (bdir / "B2_synthetic_pictures.pdf").write_bytes(data)
+    print(f"wrote {BLOCKS_DIR}/B2_synthetic_pictures.pdf ({len(data):,} bytes)")
+
+
+# --------------------------------------------------------------------------- positions (positions/)
+
+POSITIONS_DIR = "positions"
+# An invented valuation line: Hebrew around numbers, the sentence the position tests locate on every page variant.
+POSITIONS_SENTENCE = "שטח הדירה הוא 88 מ״ר ושוויה 1,760,000 ₪ לפי ההערכה."
+POSITIONS_EMPTY_ROWS = (3, 37)  # body rows drawn with empty cells: one on each page of the table
+POSITIONS_LABEL_OFFSET = 4  # the footer prints "עמוד 5" on file page 1
+# (rotation, MediaBox shift, CropBox insets left/bottom/right/top) in points: every variant shows the same upright page
+POSITIONS_VARIANTS = {
+    "P1_synthetic_upright.pdf": (0, (0, 0), (0, 0, 0, 0)),
+    "P2_synthetic_rotated_90_cropped.pdf": (90, (36, 24), (10, 8, 12, 6)),
+    "P3_synthetic_rotated_180_cropped.pdf": (180, (36, 24), (10, 8, 12, 6)),
+    "P4_synthetic_rotated_270_cropped.pdf": (270, (36, 24), (10, 8, 12, 6)),
+    "P6_synthetic_cropped.pdf": (0, (36, 24), (10, 8, 12, 6)),
+}
+POSITIONS_UNSUPPORTED = "P5_synthetic_rotate_45.pdf"  # /Rotate 45 on page 1: no reader agrees on such a page
+
+
+class PositionsPdfRenderer(BlocksPdfRenderer):
+    """A page with a Hebrew sentence around numbers and a ruled table with empty rows that continues on the next page
+    without repeating its header; the footer's page number is offset from the file page. Every value is invented."""
+
+    def render_positions(self) -> tuple[bytes, list[int]]:
+        pdf = self.pdf
+        pdf.page_label_offset = POSITIONS_LABEL_OFFSET
+        pdf.add_page()
+        self._line("1. נתוני הנכס", size=12.5, bold=True, h=8)
+        self._line(POSITIONS_SENTENCE)
+        pdf.ln(2)
+        self.paragraph("טבלת הרכיבים:")
+        rows = [["", "", ""] if i in POSITIONS_EMPTY_ROWS else [f"רכיב {i}", str(10 + i), f"{(10 + i) * 21_000:,}"]
+                for i in range(1, 41)]
+        pages = self.btable(["רכיב", "שטח (מ״ר)", "שווי (₪)"], rows)
+        assert pages[0] == 1 and pages[-1] == 2, pages
+        assert pages[POSITIONS_EMPTY_ROWS[0] - 1] == 1 and pages[POSITIONS_EMPTY_ROWS[1] - 1] == 2, pages
+        self.paragraph("סך שווי הרכיבים מופיע בטבלה.")
+        return bytes(pdf.output()), pages
+
+
+def turn_pdf(data: bytes, rotation: int, shift: tuple[float, float], insets: tuple[float, float, float, float]
+             ) -> bytes:
+    """The same pages shown upright under ``/Rotate rotation``: the content is turned the other way first. The
+    MediaBox then moves by ``shift`` (its origin is no longer 0, 0) and the CropBox is inset from it."""
+    from pypdf import PdfReader, PdfWriter, Transformation
+    from pypdf.generic import RectangleObject
+
+    reader = PdfReader(io.BytesIO(data))
+    writer = PdfWriter()
+    for page in reader.pages:
+        if rotation:
+            page.rotate((360 - rotation) % 360)
+            page.transfer_rotation_to_content()
+            page.rotate(rotation)
+        x0, y0 = float(page.mediabox.left), float(page.mediabox.bottom)
+        x1, y1 = float(page.mediabox.right), float(page.mediabox.top)
+        dx, dy = shift
+        if dx or dy:
+            page.add_transformation(Transformation().translate(dx, dy))
+        page.mediabox = RectangleObject([x0 + dx, y0 + dy, x1 + dx, y1 + dy])
+        left, bottom, right, top = insets
+        page.cropbox = RectangleObject([x0 + dx + left, y0 + dy + bottom, x1 + dx - right, y1 + dy - top])
+        writer.add_page(page)
+    writer.add_metadata({"/Title": f"{SYNTHETIC_MARKER} - positions", "/Producer": "generate_fixtures.py",
+                         "/CreationDate": "D:20240101000000Z"})
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def rotate_45(data: bytes) -> bytes:
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import NameObject, NumberObject
+
+    reader = PdfReader(io.BytesIO(data))
+    writer = PdfWriter()
+    for k, page in enumerate(reader.pages):
+        if k == 0:
+            page[NameObject("/Rotate")] = NumberObject(45)
+        writer.add_page(page)
+    writer.add_metadata({"/Title": f"{SYNTHETIC_MARKER} - positions", "/Producer": "generate_fixtures.py",
+                         "/CreationDate": "D:20240101000000Z"})
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def write_positions(out: Path, font_dir: Path) -> None:
+    pdir = out / POSITIONS_DIR
+    pdir.mkdir(parents=True, exist_ok=True)
+    base, _ = PositionsPdfRenderer(font_dir).render_positions()
+    for name, (rotation, shift, insets) in POSITIONS_VARIANTS.items():
+        data = turn_pdf(base, rotation, shift, insets) if rotation or any(shift) or any(insets) else base
+        (pdir / name).write_bytes(data)
+        print(f"wrote {POSITIONS_DIR}/{name} ({len(data):,} bytes)")
+    data = rotate_45(base)
+    (pdir / POSITIONS_UNSUPPORTED).write_bytes(data)
+    print(f"wrote {POSITIONS_DIR}/{POSITIONS_UNSUPPORTED} ({len(data):,} bytes)")
+
+
+# --------------------------------------------------------------------------- uncovered regions (regions/)
+
+REGIONS_DIR = "regions"
+# An invented rent survey: drawn into pictures, never into the text layer.
+REGION_TABLE_HEADERS = ["אזור", "שטח (מ״ר)", "דמי שכירות (₪)", "תפוסה"]
+REGION_TABLE_ROWS = [
+    ["צפון", "1,250", "48,600", "92.5%"],
+    ["מרכז", "2,340", "97,350", "88.0%"],
+    ["דרום", "1,880", "61,420", "95.5%"],
+    ["מערב", "960", "33,780", "79.5%"],
+]
+REGION_TABLE_NOTE = "(*) הנתונים בדויים ולצורך הדגמה בלבד."
+VECTOR_TEXT_LINES = ["שטח המגרש 1,450 מ״ר", "שווי הקרקע 3,780,000 ₪"]
+
+
+def _pil_font(font_dir: Path, px: int, bold: bool = False):
+    from PIL import ImageFont
+
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    return ImageFont.truetype(str(font_dir / name), px, layout_engine=ImageFont.Layout.BASIC)
+
+
+def _draw_centered(draw, box: tuple[int, int, int, int], text: str, font, fill=(0, 0, 0)) -> None:
+    visual = to_visual(text)
+    x0, y0, x1, y1 = box
+    left, top, right, bottom = draw.textbbox((0, 0), visual, font=font)
+    draw.text(((x0 + x1 - (right - left)) / 2 - left, (y0 + y1 - (bottom - top)) / 2 - top), visual, font=font,
+              fill=fill)
+
+
+def raster_table(font_dir: Path, size: tuple[int, int], font_px: int, line: int):
+    """A ruled table drawn as a picture: header row shaded, columns right to left (logical order)."""
+    from PIL import Image, ImageDraw
+
+    w, h = size
+    img = Image.new("RGB", (w, h), "white")
+    draw = ImageDraw.Draw(img)
+    rows = [REGION_TABLE_HEADERS, *REGION_TABLE_ROWS]
+    row_h = h // len(rows)
+    col_w = w // len(REGION_TABLE_HEADERS)
+    draw.rectangle((0, 0, w - 1, row_h), fill=(225, 225, 225))
+    for r, cells in enumerate(rows):
+        font = _pil_font(font_dir, font_px, bold=r == 0)
+        for c, cell in enumerate(cells):
+            x1 = w - c * col_w
+            _draw_centered(draw, (x1 - col_w, r * row_h, x1, (r + 1) * row_h), cell, font)
+    for r in range(len(rows) + 1):
+        y = min(r * row_h, h - line)
+        draw.rectangle((0, y, w - 1, y + line - 1), fill="black")
+    for c in range(len(REGION_TABLE_HEADERS) + 1):
+        x = min(c * col_w, w - line)
+        draw.rectangle((x, 0, x + line - 1, h - 1), fill="black")
+    return img
+
+
+def raster_logo(font_dir: Path):
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (440, 66), "white")
+    draw = ImageDraw.Draw(img)
+    draw.ellipse((376, 5, 432, 61), fill=(30, 90, 160))
+    _draw_centered(draw, (8, 0, 368, 66), "משרד שמאות לדוגמה", _pil_font(font_dir, 30, bold=True), (30, 90, 160))
+    return img
+
+
+def raster_watermark():
+    """A light emblem drawn without text, tiled under the body text the way some producers stamp every page."""
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (200, 250), "white")
+    draw = ImageDraw.Draw(img)
+    draw.ellipse((20, 45, 180, 205), outline=(200, 200, 200), width=6)
+    draw.polygon([(100, 70), (122, 135), (178, 135), (132, 168), (150, 230), (100, 192), (50, 230), (68, 168),
+                  (22, 135), (78, 135)], outline=(205, 205, 205), width=4)
+    return img
+
+
+def raster_text_tile(font_dir: Path):
+    """A small watermark tile carrying text, the kind some producers tile over every page."""
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (180, 90), "white")
+    _draw_centered(ImageDraw.Draw(img), (6, 6, 174, 84), "עותק לדוגמה", _pil_font(font_dir, 26, bold=True),
+                   (205, 205, 205))
+    return img
+
+
+def raster_stamp(font_dir: Path):
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (240, 110), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((3, 3, 236, 106), outline=(20, 40, 150), width=4)
+    _draw_centered(draw, (8, 8, 232, 56), "שמאי מקרקעין", _pil_font(font_dir, 24, bold=True), (20, 40, 150))
+    _draw_centered(draw, (8, 56, 232, 102), "רישיון 4821", _pil_font(font_dir, 22), (20, 40, 150))
+    return img
+
+
+def raster_photo(seed: int):
+    """A continuous-tone picture without text (a stand-in for a photograph of a building)."""
+    from PIL import Image
+
+    rng = random.Random(seed)
+    img = Image.new("RGB", (300, 200))
+    px = img.load()
+    for y in range(200):
+        for x in range(300):
+            base = 90 + (x * 120) // 300 + (y * 40) // 200
+            n = rng.randrange(-25, 26)
+            px[x, y] = (min(255, base + n), min(255, base // 2 + 60 + n), max(0, 200 - base // 2 + n))
+    return img
+
+
+class _GlyphPen:
+    """fontTools pen drawing a glyph outline into an fpdf2 path (points, y down)."""
+
+    def __init__(self, path, scale: float, x: float, baseline: float):
+        from fontTools.pens.basePen import BasePen
+
+        outer = self
+
+        class Pen(BasePen):
+            def _moveTo(self, pt):
+                outer.path.move_to(*outer.at(pt))
+
+            def _lineTo(self, pt):
+                outer.path.line_to(*outer.at(pt))
+
+            def _curveToOne(self, p1, p2, p3):
+                outer.path.curve_to(*outer.at(p1), *outer.at(p2), *outer.at(p3))
+
+            def _qCurveToOne(self, p1, p2):
+                outer.path.quadratic_curve_to(*outer.at(p1), *outer.at(p2))
+
+            def _closePath(self):
+                outer.path.close()
+
+        self.path, self.scale, self.x, self.baseline = path, scale, x, baseline
+        self.pen_class = Pen
+
+    def at(self, pt) -> tuple[float, float]:
+        return self.x + pt[0] * self.scale, self.baseline - pt[1] * self.scale
+
+
+class RegionsPdfRenderer(BlocksPdfRenderer):
+    """Synthetic reproductions of page content the text layer does not cover: a raster table under a valid text
+    layer, a low-resolution raster table, a logo and a watermark repeated on every page, a searchable scan (a page
+    image with an invisible text layer), a ruled vector table with a dark header, vector text drawn as outlines
+    (no text layer), a small stamp next to a photograph, and page furniture (a logo and tiled watermark with text on
+    every page). Every value is invented."""
+
+    def __init__(self, font_dir: Path) -> None:
+        super().__init__(font_dir)
+        self.font_dir = font_dir
+
+    def picture(self, img, w_mm: float, h_mm: float | None = None, x: float | None = None) -> None:
+        pdf = self.pdf
+        h_mm = h_mm if h_mm is not None else w_mm * img.size[1] / img.size[0]
+        x = pdf.w - pdf.r_margin - w_mm if x is None else x
+        pdf.image(img, x=x, y=pdf.get_y(), w=w_mm, h=h_mm)
+        pdf.set_y(pdf.get_y() + h_mm + 3)
+
+    def render_raster_table(self) -> bytes:
+        """R1: ten pages, each with the same logo and two watermark tiles under the text; page 1 also holds a raster
+        table between two paragraphs."""
+        logo, mark = raster_logo(self.font_dir), raster_watermark()
+        table = raster_table(self.font_dir, (1400, 420), 30, 3)
+        pdf = self.pdf
+        for page in range(1, 11):
+            pdf.add_page()
+            pdf.image(logo, x=pdf.w - pdf.r_margin - 60, y=10, w=60)
+            pdf.image(mark, x=40, y=120, w=50)
+            pdf.image(mark, x=120, y=120, w=50)
+            pdf.set_y(28)
+            if page == 1:
+                self._line("1. סקר דמי שכירות", size=12.5, bold=True, h=8)
+                self.paragraph("להלן נתוני דמי השכירות שנאספו באזורי העיר:")
+                self.picture(table, 170)
+                self.note(REGION_TABLE_NOTE)
+                pdf.ln(2)
+                self.paragraph("הנתונים מלמדים על ביקוש יציב לשטחי מסחר בכל אזורי העיר.")
+            else:
+                self._line(f"{page}. פרק לדוגמה {page}", size=12.5, bold=True, h=8)
+                pdf.set_y(125)
+                for _ in range(3):
+                    self.paragraph("פסקה זו נכתבה לצורך הדגמה בלבד ואינה מתייחסת לנכס אמיתי. כל השמות והמספרים בה "
+                                   "בדויים, והיא מודפסת מעל סימן מים שחוזר בכל עמוד.")
+        return bytes(pdf.output())
+
+    def render_lowres_table(self) -> bytes:
+        """R2: the same logo, and a raster table drawn at about 90 dpi over most of the page width."""
+        pdf = self.pdf
+        pdf.add_page()
+        pdf.image(raster_logo(self.font_dir), x=pdf.w - pdf.r_margin - 60, y=10, w=60)
+        pdf.set_y(28)
+        self._line("1. נתוני שוק", size=12.5, bold=True, h=8)
+        self.paragraph("להלן סיכום נתוני השוק כפי שהתקבל מהלקוח:")
+        self.picture(raster_table(self.font_dir, (600, 300), 13, 1), 170, 85)
+        self.paragraph("הטבלה צורפה כתמונה ברזולוציה נמוכה.")
+        return bytes(pdf.output())
+
+    def _scan_text(self) -> None:
+        self._line("1. תיאור הסביבה", size=12.5, bold=True, h=8)
+        for _ in range(4):
+            self.paragraph("הנכס ממוקם ברחוב שקט באזור מגורים ותיק. בסביבה מבני מגורים בני ארבע קומות, גני ילדים "
+                           "ומרכז מסחרי קטן במרחק הליכה.")
+
+    def render_searchable_scan(self) -> bytes:
+        """R3: a page image (the page rendered at 200 dpi) with the same text laid over it invisibly."""
+        import pypdfium2 as pdfium
+        from fpdf.enums import TextMode
+
+        plain = RegionsPdfRenderer(self.font_dir)
+        plain.pdf.add_page()
+        plain._scan_text()
+        doc = pdfium.PdfDocument(bytes(plain.pdf.output()))
+        image = doc[0].render(scale=200 / 72, grayscale=True).to_pil().convert("L")
+        doc.close()
+        pdf = self.pdf
+        pdf.add_page()
+        pdf.image(image, x=0, y=0, w=pdf.w, h=pdf.h)
+        pdf.text_mode = TextMode.INVISIBLE
+        pdf.set_y(pdf.t_margin)
+        self._scan_text()
+        pdf.text_mode = TextMode.FILL
+        return bytes(pdf.output())
+
+    def render_vector_table(self) -> bytes:
+        """R4: a ruled table with a dark header row (white text), a heading underline and bullet marks."""
+        pdf = self.pdf
+        pdf.add_page()
+        self._line("1. פירוט השטחים", size=12.5, bold=True, h=8)
+        pdf.set_draw_color(0, 0, 0)
+        pdf.line(pdf.w - pdf.r_margin - 45, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
+        pdf.ln(3)
+        for item in ("קומת קרקע: מסחר", "קומות עליונות: משרדים"):
+            pdf.circle(x=pdf.w - pdf.r_margin - 1.5, y=pdf.get_y() + 3, radius=0.8, style="F")
+            self._line(item + "   ")
+        self.paragraph("להלן פירוט השטחים לפי קומות:")
+        pdf.set_fill_color(60, 60, 60)
+        pdf.set_text_color(255, 255, 255)
+        self._grow(["קומה", "שימוש", "שטח (מ״ר)"], self.WIDTHS, bold=True)
+        pdf.set_text_color(0, 0, 0)
+        for row in (["קרקע", "מסחר", "420"], ["1", "משרדים", "380"], ["2", "משרדים", "380"]):
+            self._grow(row, self.WIDTHS)
+        pdf.ln(2)
+        self.paragraph("סך השטחים הבנויים הוא 1,180 מ״ר.")
+        return bytes(pdf.output())
+
+    def outline_text(self, text: str, size_pt: float, right_mm: float, baseline_mm: float) -> None:
+        """Draw ``text`` as filled glyph outlines (no text object), right-aligned at ``right_mm``."""
+        from fontTools.ttLib import TTFont
+        from fpdf.drawing import PaintedPath
+
+        font = TTFont(str(self.font_dir / "DejaVuSans.ttf"))
+        cmap, glyphs, hmtx = font.getBestCmap(), font.getGlyphSet(), font["hmtx"]
+        scale = (size_pt * 25.4 / 72) / font["head"].unitsPerEm
+        visual = to_visual(text)
+        width = sum(hmtx[cmap[ord(ch)]][0] for ch in visual) * scale
+        x = right_mm - width
+        pdf = self.pdf
+        with pdf.drawing_context() as ctx:
+            path = PaintedPath()
+            path.style.fill_color = "#000000"
+            path.style.stroke_color = None
+            for ch in visual:
+                name = cmap[ord(ch)]
+                pen = _GlyphPen(path, scale, x, baseline_mm)
+                glyphs[name].draw(pen.pen_class(glyphs))
+                x += hmtx[name][0] * scale
+            ctx.add_item(path)
+
+    def render_vector_text(self) -> bytes:
+        """R5: a paragraph with a text layer, then two lines drawn as outlines without any text layer."""
+        pdf = self.pdf
+        pdf.add_page()
+        self._line("1. נתוני המגרש", size=12.5, bold=True, h=8)
+        self.paragraph("נתוני המגרש שלהלן הודפסו כקווי מתאר בלבד, ללא שכבת טקסט:")
+        y = pdf.get_y() + 8
+        for k, line in enumerate(VECTOR_TEXT_LINES):
+            self.outline_text(line, 14, pdf.w - pdf.r_margin, y + k * 9)
+        pdf.set_y(y + len(VECTOR_TEXT_LINES) * 9 + 4)
+        self.paragraph("הנתונים נמסרו על ידי הלקוח.")
+        return bytes(pdf.output())
+
+    def render_stamp_and_photo(self) -> bytes:
+        """R6: a small stamp with text and a photograph without text."""
+        pdf = self.pdf
+        pdf.add_page()
+        self._line("1. חתימה", size=12.5, bold=True, h=8)
+        self.paragraph("חוות הדעת נחתמה כמפורט להלן:")
+        self.picture(raster_stamp(self.font_dir), 30)
+        self._line("2. צילום הנכס", size=12.5, bold=True, h=8)
+        self.picture(raster_photo(5), 60)
+        self.paragraph("הצילום מתאר את חזית הבניין.")
+        return bytes(pdf.output())
+
+    def render_repeated_pictures(self) -> bytes:
+        """R7: page furniture. Four pages, each with the same logo and a grid of 25 identical watermark tiles that
+        carry text; page 2 also holds a raster table, and the same stamp signs pages 3 and 4."""
+        logo, tile, stamp = raster_logo(self.font_dir), raster_text_tile(self.font_dir), raster_stamp(self.font_dir)
+        pdf = self.pdf
+        for page in range(1, 5):
+            pdf.add_page()
+            pdf.image(logo, x=pdf.w - pdf.r_margin - 60, y=10, w=60)
+            for row in range(5):
+                for col in range(5):
+                    pdf.image(tile, x=12 + col * 38, y=60 + row * 42, w=30, h=15)
+            pdf.set_y(28)
+            self._line(f"{page}. פרק לדוגמה {page}", size=12.5, bold=True, h=8)
+            self.paragraph("פסקה קצרה זו נכתבה לצורך הדגמה בלבד, וכל הנתונים בה בדויים.")
+            if page == 2:
+                self.picture(raster_table(self.font_dir, (1400, 420), 30, 3), 170)
+            if page >= 3:
+                pdf.image(stamp, x=pdf.w - pdf.r_margin - 30, y=262, w=30)
+        return bytes(pdf.output())
+
+
+REGION_FIXTURES = {
+    "R1_synthetic_raster_table.pdf": "render_raster_table",
+    "R2_synthetic_lowres_table.pdf": "render_lowres_table",
+    "R3_synthetic_searchable_scan.pdf": "render_searchable_scan",
+    "R4_synthetic_vector_table.pdf": "render_vector_table",
+    "R5_synthetic_vector_text.pdf": "render_vector_text",
+    "R6_synthetic_stamp_and_photo.pdf": "render_stamp_and_photo",
+    "R7_synthetic_repeated_pictures.pdf": "render_repeated_pictures",
+}
+
+
+def write_regions(out: Path, font_dir: Path) -> None:
+    rdir = out / REGIONS_DIR
+    rdir.mkdir(parents=True, exist_ok=True)
+    for name, method in REGION_FIXTURES.items():
+        data = getattr(RegionsPdfRenderer(font_dir), method)()
+        (rdir / name).write_bytes(data)
+        print(f"wrote {REGIONS_DIR}/{name} ({len(data):,} bytes)")
+
+
+# --------------------------------------------------------------------------- citations (citations/)
+
+CITATIONS_DIR = "citations"
+CITATIONS_MANIFEST = "manifest.json"
+PT_PER_MM = 72 / 25.4
+# A line's box as a text reader reports it: the advance width of its glyphs, and from the baseline the font's ascent
+# above and descent below. fpdf2 puts a cell's baseline at ``top + h / 2 + 0.3 * font size``. DejaVu Sans: ascent 0.76
+# and descent 0.24 of the font size (the em box the PDF readers use for a character's height).
+CITATIONS_ASCENT = 0.76
+CITATIONS_DESCENT = 0.24
+CITATIONS_TOLERANCE = 0.02  # of the page's display width (x) and height (y), per edge, for the browser test
+# (rotation, MediaBox shift, CropBox insets left/bottom/right/top) in points, as the positions set turns its pages
+CITATIONS_TURN = (90, (36, 24), (10, 8, 12, 6))
+CITATIONS_PICTURE_HEADERS = ["מרכז מסחרי", "שטח (מ״ר)", "תפוסה"]
+CITATIONS_PICTURE_ROWS = [
+    ["מרכז הכרכום", "4,150", "91.5%"],
+    ["מרכז החצב", "2,780", "86.0%"],
+    ["מרכז הרקפת", "3,320", "94.5%"],
+]
+CITATIONS_DOCX_HEADERS = ["יחידה", "שטח (מ״ר)", "מחיר למ״ר (₪)"]
+CITATIONS_DOCX_ROWS = [
+    ["חנות השחף", "48", "21,500"],
+    ["חנות הנשר", "62", "19,800"],
+    ["חנות העפרוני", "35", "24,300"],
+]
+
+
+def _title_of(name: str) -> str:
+    """The title the application gives an uploaded file: its name without the extension, underscores as spaces."""
+    return Path(name).stem.replace("_", " ")
+
+
+def _frac_box(box: list[float], width: float, height: float) -> list[float]:
+    return [round(box[0] / width, 4), round(box[1] / height, 4), round(box[2] / width, 4), round(box[3] / height, 4)]
+
+
+def _union_box(boxes: list[list[float]]) -> list[float]:
+    return [min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)]
+
+
+def turned_box(box: list[float], rotation: int, insets: tuple[float, float, float, float]) -> list[float]:
+    """Where a box of the upright page (points, origin top-left) is shown once ``turn_pdf`` turned the page under
+    ``/Rotate rotation`` and inset its CropBox: the MediaBox shift moves content and box together, so only the insets
+    move the content on the shown page. Under /Rotate 90 the user space's bottom edge is the shown page's left edge
+    and its left edge the shown top."""
+    left, bottom, right, top = insets
+    dx, dy = {0: (left, top), 90: (bottom, left)}[rotation]
+    return [box[0] - dx, box[1] - dy, box[2] - dx, box[3] - dy]
+
+
+def turned_size(width: float, height: float, rotation: int, insets: tuple[float, float, float, float]
+                ) -> tuple[float, float]:
+    left, bottom, right, top = insets
+    return {0: (width - left - right, height - bottom - top), 90: (width - bottom - top, height - left - right)}[rotation]
+
+
+class CitationsPdfRenderer(RegionsPdfRenderer):
+    """Synthetic appraisal-like pages whose every cited place is recorded as it is drawn: a line's box from fpdf2's
+    own placement (right margin, string width, baseline) and a table cell's box from its ruled rectangle, in points on
+    the upright page. Nothing is read back from the PDF. Every name and value is invented."""
+
+    def __init__(self, font_dir: Path) -> None:
+        super().__init__(font_dir)
+        self.boxes: dict[str, dict[str, Any]] = {}
+
+    def _page_box(self) -> tuple[float, float]:
+        return self.pdf.w * PT_PER_MM, self.pdf.h * PT_PER_MM
+
+    def placed(self, key: str | None, text: str, size: float = 10.5, bold: bool = False, h: float | None = None
+               ) -> list[float]:
+        """Draws one right-aligned line and returns (and records under ``key``) its box in points."""
+        pdf = self.pdf
+        h = h or self.LINE_H
+        if pdf.get_y() + h > pdf.page_break_trigger:
+            pdf.add_page()
+        pdf.set_font("DejaVu", "B" if bold else "", size)
+        y = pdf.get_y()
+        right = pdf.w - pdf.r_margin - pdf.c_margin
+        width = pdf.get_string_width(text)
+        baseline = y + 0.5 * h + 0.3 * pdf.font_size
+        box = [(right - width) * PT_PER_MM, (baseline - CITATIONS_ASCENT * pdf.font_size) * PT_PER_MM,
+               right * PT_PER_MM, (baseline + CITATIONS_DESCENT * pdf.font_size) * PT_PER_MM]
+        self._line(text, size=size, bold=bold, h=h)
+        if key is not None:
+            self.boxes[key] = {"page": pdf.page_no(), "box": box, "text": text}
+        return box
+
+    def heading_line(self, key: str | None, text: str) -> list[float]:
+        self.pdf.ln(2)
+        return self.placed(key, text, size=12.5, bold=True, h=8)
+
+    def body_line(self, key: str | None, text: str) -> list[float]:
+        box = self.placed(key, text)
+        self.pdf.ln(2)
+        return box
+
+    def ruled_row(self, cells: list[str], widths: list[int], bold: bool = False) -> tuple[int, list[list[float]]]:
+        """One ruled table row (``_grow``); returns its page and each cell's rectangle in points, in cell order (the
+        first cell is the rightmost)."""
+        pdf = self.pdf
+        y = pdf.get_y()
+        x_right = pdf.w - pdf.r_margin
+        boxes = []
+        for width in widths:
+            x_right -= width
+            boxes.append([x_right * PT_PER_MM, y * PT_PER_MM, (x_right + width) * PT_PER_MM,
+                          (y + self.ROW_H) * PT_PER_MM])
+        self._grow(cells, widths, bold=bold)
+        return pdf.page_no(), boxes
+
+    def header(self, title: str) -> None:
+        self.placed(None, title, size=15, bold=True, h=9)
+        self.placed(None, f"{SYNTHETIC_MARKER} — כל הנתונים בדויים", size=10, bold=True)
+        self.placed(None, "משרד: שמאות דמו ב׳ (סינתטי)", size=9.5)
+        self.pdf.ln(2)
+
+    # --- the documents ------------------------------------------------------------------------------------------
+
+    def render_digital(self) -> bytes:
+        """C1: two text-layer pages; the cited sentence is the only line of section 3, on page 2."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.header("חוות דעת לדוגמה — מתחם גבעת הסנונית")
+        self.heading_line(None, "1. מטרת חוות הדעת")
+        self.body_line(None, "חוות דעת זו נערכה לצורך הדגמה בלבד ואינה מתייחסת לנכס אמיתי.")
+        self.heading_line(None, "2. תיאור הסביבה")
+        for line in ("הסביבה כוללת בנייה רוויה בת ארבע עד שש קומות, מבני ציבור ושטחים פתוחים.",
+                     "הגישה לנכס היא מרחוב ראשי ברוחב של כ-20 מטרים."):
+            self.placed(None, line)
+        pdf.add_page()
+        self.heading_line("heading", "3. ממצאי הביקור")
+        self.body_line("target", "חזית הבניין מצופה אבן בגוון ענבר טורקיזי ונמצאה במצב תחזוקה טוב.")
+        self.heading_line(None, "4. סיכום")
+        self.body_line(None, "השווי המוערך של הנכס הוא 2,480,000 ₪ (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+    def render_scan_source(self) -> bytes:
+        """C2 before rasterizing: large type, so a Hebrew OCR reads the cited line."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.header("חוות דעת לדוגמה — סריקה של רחוב הנחליאלי")
+        self.heading_line("heading", "1. מצב הגג")
+        self.placed("target", "הגג מצופה ברעפי חרס בגוון סגלגל ונמצא תקין.", size=14, h=9)
+        pdf.ln(2)
+        self.heading_line(None, "2. סיכום")
+        self.placed(None, "השווי המוערך הוא 1,930,000 ₪.", size=14, h=9)
+        return bytes(pdf.output())
+
+    def render_mixed(self) -> bytes:
+        """C3: text-layer paragraphs around a table drawn as a picture (its values are in no text layer)."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.header("סקר תפוסה לדוגמה — מרכזי מסחר")
+        self.heading_line("heading", "1. סקר תפוסה")
+        self.body_line("intro", "להלן נתוני התפוסה שנאספו במרכזי המסחר של העיר:")
+        img = raster_rows_table(self.font_dir, (1200, 360), 34, 3, CITATIONS_PICTURE_HEADERS, CITATIONS_PICTURE_ROWS)
+        w_mm = 150.0
+        h_mm = w_mm * img.size[1] / img.size[0]
+        x_mm = pdf.w - pdf.r_margin - w_mm
+        y_mm = pdf.get_y()
+        self.picture(img, w_mm, h_mm, x_mm)
+        self.boxes["picture"] = {"page": pdf.page_no(), "text": "",
+                                 "box": [x_mm * PT_PER_MM, y_mm * PT_PER_MM, (x_mm + w_mm) * PT_PER_MM,
+                                         (y_mm + h_mm) * PT_PER_MM]}
+        self.note("(*) הנתונים בדויים ולצורך הדגמה בלבד.")
+        self.heading_line(None, "2. סיכום")
+        self.body_line(None, "התפוסה הממוצעת במרכזים שנסקרו גבוהה מ-85%.")
+        return bytes(pdf.output())
+
+    def render_rotated_source(self) -> bytes:
+        """C4 before turning: one upright page whose cited sentence is the only line of section 1."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.header("חוות דעת לדוגמה — רחוב הצופית 11")
+        self.heading_line("heading", "1. נתוני המבנה")
+        self.body_line("target", "המבנה בנוי מבלוקי איטונג בגוון חרדלי וכולל שלוש קומות מגורים.")
+        self.heading_line(None, "2. סיכום")
+        self.body_line(None, "השווי המוערך של הדירה הוא 1,615,000 ₪.")
+        return bytes(pdf.output())
+
+    def render_repeated(self) -> bytes:
+        """C5: the same number in a summary sentence and in a table cell, each a separate citable place."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.header("חוות דעת לדוגמה — מתחם המחסנים בעמק השקמים")
+        self.heading_line("heading", "1. סיכום השטחים")
+        self.body_line("paragraph", "סך שטח מחסן הדולפין במתחם הוא 1,375 מ״ר לפי המדידה.")
+        self.heading_line(None, "2. פירוט השטחים")
+        self.body_line(None, "טבלת שטחי המחסנים:")
+        widths = [80, 50, 50]
+        pdf.set_fill_color(225, 225, 225)
+        headers = ["מבנה", "שטח (מ״ר)", "שווי (₪)"]
+        _, header = self.ruled_row(headers, widths, bold=True)
+        rows = [["מחסן האלמוג", "860", "1,720,000"], ["מחסן הדולפין", "1,375", "2,750,000"],
+                ["מחסן הצדפה", "640", "1,280,000"]]
+        for i, cells in enumerate(rows):
+            page, boxes = self.ruled_row(cells, widths)
+            if cells[0] == "מחסן הדולפין":
+                self.boxes["row"] = {"page": page, "box": _union_box(boxes), "text": " | ".join(cells),
+                                     "row_index": i}
+                self.boxes["cell"] = {"page": page, "box": boxes[1], "text": cells[1], "row_index": i, "column": 1}
+        self.boxes["table_header"] = {"page": 1, "box": _union_box(header), "text": " | ".join(headers)}
+        pdf.ln(3)
+        self.heading_line(None, "3. סיכום")
+        self.body_line(None, "שטחי המחסנים נמדדו בביקור במקום (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+    def render_cross_page(self) -> bytes:
+        """C6: a ruled table that continues on page 2 without repeating its header; the cited row is on page 2."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.header("חוות דעת לדוגמה — בניין היחידות בכרם הגפן")
+        self.heading_line(None, "1. רשימת היחידות")
+        self.body_line(None, "פירוט שטחי היחידות ושוויין:")
+        widths = [80, 50, 50]
+        pdf.set_fill_color(225, 225, 225)
+        headers = ["יחידה", "שטח (מ״ר)", "שווי (₪)"]
+        _, header = self.ruled_row(headers, widths, bold=True)
+        self.boxes["table_header"] = {"page": pdf.page_no(), "box": _union_box(header), "text": " | ".join(headers)}
+        for i in range(1, 37):
+            cells = ["יחידת הנחליאלי", "143", "3,146,000"] if i == 34 else [f"יחידה {i}", str(40 + i),
+                                                                               f"{(40 + i) * 22_000:,}"]
+            if pdf.get_y() + self.ROW_H > pdf.page_break_trigger:
+                pdf.add_page()
+            page, boxes = self.ruled_row(cells, widths)
+            if i == 34:
+                self.boxes["row"] = {"page": page, "box": _union_box(boxes), "text": " | ".join(cells),
+                                     "row_index": i - 1}
+                self.boxes["cell"] = {"page": page, "box": boxes[1], "text": cells[1], "row_index": i - 1,
+                                      "column": 1}
+        assert self.boxes["table_header"]["page"] == 1 and self.boxes["row"]["page"] == 2, self.boxes
+        pdf.ln(3)
+        self.heading_line(None, "2. סיכום")
+        self.body_line(None, "סך השטחים מופיע בטבלה (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+    def render_replaced(self, second: bool) -> bytes:
+        """C8: a version and its replacement; the replacement adds a line above the cited one and changes its year,
+        so the cited sentence sits lower on the replacement's page."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.header("חוות דעת לדוגמה — רחוב הדוכיפת 5")
+        if second:
+            self.body_line(None, "גרסה מעודכנת של חוות הדעת (מסמך סינתטי).")
+        self.heading_line("heading", "1. שימוש בנכס")
+        year = 2014 if second else 2011
+        self.body_line("target", f"המחסן ברחוב הדוכיפת 5 משמש לאחסון ציוד חקלאי מאז שנת {year}.")
+        self.heading_line(None, "2. סיכום")
+        self.body_line(None, "השווי המוערך של המחסן הוא 940,000 ₪.")
+        return bytes(pdf.output())
+
+
+def raster_rows_table(font_dir: Path, size: tuple[int, int], font_px: int, line: int, headers: list[str],
+                      rows: list[list[str]]):
+    """A ruled table drawn as a picture (``raster_table``'s drawing, with the given header and rows)."""
+    from PIL import Image, ImageDraw
+
+    w, h = size
+    img = Image.new("RGB", (w, h), "white")
+    draw = ImageDraw.Draw(img)
+    all_rows = [headers, *rows]
+    row_h = h // len(all_rows)
+    col_w = w // len(headers)
+    draw.rectangle((0, 0, w - 1, row_h), fill=(225, 225, 225))
+    for r, cells in enumerate(all_rows):
+        font = _pil_font(font_dir, font_px, bold=r == 0)
+        for c, cell in enumerate(cells):
+            x1 = w - c * col_w
+            _draw_centered(draw, (x1 - col_w, r * row_h, x1, (r + 1) * row_h), cell, font)
+    for r in range(len(all_rows) + 1):
+        y = min(r * row_h, h - line)
+        draw.rectangle((0, y, w - 1, y + line - 1), fill="black")
+    for c in range(len(headers) + 1):
+        x = min(c * col_w, w - line)
+        draw.rectangle((x, 0, x + line - 1, h - 1), fill="black")
+    return img
+
+
+def render_citations_docx() -> bytes:
+    """C7: a DOCX with sections, a paragraph and a table of shops; its citations have no pages (structured)."""
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+
+    document = Document()
+    cp = document.core_properties
+    cp.title = f"{SYNTHETIC_MARKER} - חוות דעת לדוגמה"
+    cp.author = "synthetic fixture generator"
+    cp.last_modified_by = "synthetic fixture generator"
+    cp.created = FIXED_TS.replace(tzinfo=None)
+    cp.modified = FIXED_TS.replace(tzinfo=None)
+    cp.revision = 1
+
+    def para(text: str) -> None:
+        p = document.add_paragraph(text)
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        _rtl_paragraph(p)
+
+    def heading(text: str, level: int) -> None:
+        p = document.add_heading(text, level=level)
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        _rtl_paragraph(p)
+
+    heading("חוות דעת לדוגמה — מרכז המסחר בשדרות האירוסים", 0)
+    para(f"{SYNTHETIC_MARKER} — כל הנתונים בדויים")
+    para("משרד: שמאות דמו ב׳ (סינתטי)")
+    heading("1. כללי", 1)
+    para("חוות דעת זו נערכה לצורך הדגמה בלבד ואינה מתייחסת לנכס אמיתי.")
+    heading("2. טבלת היחידות", 1)
+    para("פירוט יחידות המסחר בבניין:")
+    table = document.add_table(rows=1 + len(CITATIONS_DOCX_ROWS), cols=len(CITATIONS_DOCX_HEADERS))
+    table.style = "Table Grid"
+    table._tbl.tblPr.append(OxmlElement("w:bidiVisual"))
+    for r, cells in enumerate([CITATIONS_DOCX_HEADERS, *CITATIONS_DOCX_ROWS]):
+        for c, text in enumerate(cells):
+            cell = table.cell(r, c)
+            cell.text = text
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                _rtl_paragraph(p)
+                if r == 0:
+                    for run in p.runs:
+                        run.bold = True
+    heading("3. סיכום", 1)
+    para("המחירים למ״ר אינם כוללים מע״מ (מסמך סינתטי).")
+    buf = io.BytesIO()
+    document.save(buf)
+    return normalize_zip(buf.getvalue())
+
+
+def _pdf_entry(name: str, kind: str, boxes: dict[str, dict[str, Any]], pages: int, size: tuple[float, float],
+               rotation: int = 0, insets: tuple[float, float, float, float] = (0, 0, 0, 0), **extra: Any
+               ) -> dict[str, Any]:
+    """A PDF's manifest entry: each recorded place on the shown page, as fractions of the shown page's size."""
+    width, height = turned_size(size[0], size[1], rotation, insets)
+    places = {}
+    for key, rec in boxes.items():
+        shown = turned_box(rec["box"], rotation, insets)
+        places[key] = {k: v for k, v in rec.items() if k != "box"} | {
+            "box": _frac_box(shown, width, height), "box_points": [round(v, 2) for v in shown]}
+    return {"file": f"{CITATIONS_DIR}/{name}", "title": _title_of(name), "kind": kind, "pages": pages,
+            "display": {"width": round(width, 2), "height": round(height, 2), "rotation": rotation},
+            "places": places} | extra
+
+
+def write_citations(out: Path, font_dir: Path) -> None:
+    """Writes the citation fixtures and ``manifest.json``: what each browser scenario asks, which passage it should
+    cite and where that passage is on the shown page (fractions of its display width and height, origin top-left)."""
+    from pypdf import PdfReader
+
+    cdir = out / CITATIONS_DIR
+    cdir.mkdir(parents=True, exist_ok=True)
+    docs: dict[str, dict[str, Any]] = {}
+
+    def save(name: str, data: bytes) -> None:
+        (cdir / name).write_bytes(data)
+        print(f"wrote {CITATIONS_DIR}/{name} ({len(data):,} bytes)")
+
+    def pages_of(data: bytes) -> int:
+        return len(PdfReader(io.BytesIO(data)).pages)
+
+    r = CitationsPdfRenderer(font_dir)
+    data = r.render_digital()
+    save(name := "C1_synthetic_citations_digital.pdf", data)
+    docs["digital"] = _pdf_entry(
+        name, "pdf_digital", r.boxes, pages_of(data), r._page_box(), query="חזית בגוון ענבר טורקיזי",
+        expect={"precision": "block", "target": "target", "also": ["heading"], "pick": {"kind": "text",
+                                                                                         "contains": "ענבר טורקיזי"}})
+
+    r = CitationsPdfRenderer(font_dir)
+    data = rasterize_to_scan(r.render_scan_source(), seed=7)
+    save(name := "C2_synthetic_citations_scanned.pdf", data)
+    # the page image only: OCR lines carry no position, so the citation is page level (no rectangle); the boxes are
+    # where the text was drawn before rasterizing (turned by at most 0.4 degrees there)
+    docs["scanned"] = _pdf_entry(
+        name, "pdf_scanned", r.boxes, pages_of(data), r._page_box(), query="רעפי חרס בגוון סגלגל",
+        expect={"precision": "page", "target": "target", "page": 1, "pick": {"kind": "text", "contains": "רעפי"}})
+
+    r = CitationsPdfRenderer(font_dir)
+    data = r.render_mixed()
+    save(name := "C3_synthetic_citations_mixed_table_image.pdf", data)
+    # read by the vision model only in cloud mode: a row of a table read from a picture is marked at table level, on
+    # the picture's region
+    docs["mixed"] = _pdf_entry(
+        name, "pdf_mixed", r.boxes, pages_of(data), r._page_box(), query="תפוסה מרכז הכרכום",
+        picture_table={"headers": CITATIONS_PICTURE_HEADERS, "rows": CITATIONS_PICTURE_ROWS},
+        expect={"precision": "region", "region": "table", "target": "picture",
+                "pick": {"kind": "table_row", "contains": "הכרכום"}})
+
+    r = CitationsPdfRenderer(font_dir)
+    rotation, shift, insets = CITATIONS_TURN
+    data = turn_pdf(r.render_rotated_source(), rotation, shift, insets)
+    save(name := "C4_synthetic_citations_rotated_90_cropped.pdf", data)
+    docs["rotated"] = _pdf_entry(
+        name, "pdf_rotated", r.boxes, pages_of(data), r._page_box(), rotation, insets,
+        query="בלוקי איטונג בגוון חרדלי",
+        expect={"precision": "block", "target": "target", "also": ["heading"],
+                "pick": {"kind": "text", "contains": "איטונג"}})
+
+    r = CitationsPdfRenderer(font_dir)
+    data = r.render_repeated()
+    save(name := "C5_synthetic_citations_repeated_number.pdf", data)
+    docs["repeated"] = _pdf_entry(
+        name, "pdf_digital", r.boxes, pages_of(data), r._page_box(), query="שטח מחסן הדולפין", number="1,375",
+        expect={"row": {"precision": "region", "region": "row", "target": "row", "contains": "cell",
+                        "avoid": "paragraph", "pick": {"kind": "table_row", "contains": "הדולפין"}},
+                "paragraph": {"precision": "block", "target": "paragraph", "also": ["heading"], "avoid": "cell",
+                              "pick": {"kind": "text", "contains": "הדולפין"}}})
+
+    r = CitationsPdfRenderer(font_dir)
+    data = r.render_cross_page()
+    save(name := "C6_synthetic_citations_cross_page_table.pdf", data)
+    docs["cross_page"] = _pdf_entry(
+        name, "pdf_digital", r.boxes, pages_of(data), r._page_box(), query="יחידת הנחליאלי",
+        expect={"precision": "region", "region": "row", "target": "row", "contains": "cell", "header": "table_header",
+                "pick": {"kind": "table_row", "contains": "הנחליאלי"}})
+
+    data = render_citations_docx()
+    save(name := "C7_synthetic_citations_docx_table.docx", data)
+    docs["docx"] = {
+        "file": f"{CITATIONS_DIR}/{name}", "title": _title_of(name), "kind": "docx", "query": "חנות העפרוני",
+        "headers": CITATIONS_DOCX_HEADERS, "rows": CITATIONS_DOCX_ROWS, "section": "2. טבלת היחידות",
+        "expect": {"precision": "structured", "pick": {"kind": "table_row", "contains": "העפרוני"}},
+        # the real-model scenario: a value computed from two cells of one row (35 x 24,300 = 850,500)
+        "computation": {"row": "חנות העפרוני", "inputs": ["35", "24,300"], "result": "850,500"}}
+
+    first = CitationsPdfRenderer(font_dir)
+    data = first.render_replaced(second=False)
+    save(name := "C8_synthetic_citations_replaced.pdf", data)
+    second = CitationsPdfRenderer(font_dir)
+    data2 = second.render_replaced(second=True)
+    save(name2 := "C8v2_synthetic_citations_replaced_v2.pdf", data2)
+    docs["replaced"] = _pdf_entry(
+        name, "pdf_digital", first.boxes, pages_of(data), first._page_box(), query="ציוד חקלאי ברחוב הדוכיפת",
+        expect={"precision": "block", "target": "target", "also": ["heading"],
+                "pick": {"kind": "text", "contains": "ציוד חקלאי"}},
+        replacement=_pdf_entry(name2, "pdf_digital", second.boxes, pages_of(data2), second._page_box()))
+
+    manifest = {
+        "about": f"{SYNTHETIC_MARKER}. Expected citation places for the browser test frontend/e2e/citations.spec.ts; "
+                 "generated by scripts/generate_fixtures.py --only citations from the generator's own layout (never "
+                 "read back from the files) - do not edit by hand. Boxes: [x0, y0, x1, y1] as fractions of the shown "
+                 "page's display width and height, origin top-left (box_points: the same in points).",
+        "tolerance": CITATIONS_TOLERANCE,
+        "documents": docs,
+    }
+    text_ = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+    (cdir / CITATIONS_MANIFEST).write_text(text_, encoding="utf-8")
+    print(f"wrote {CITATIONS_DIR}/{CITATIONS_MANIFEST} ({len(text_):,} chars)")
+
+
+# --------------------------------------------------------------------------- round 7 (request components, gaps,
+# removals, in-turn tables, appraisal context, input choice)
+
+ROUND7_DIR = "round7"
+ROUND7_MANIFEST = "manifest.json"
+ROUND7_PLACE = "כפר הדמה"  # an invented town; every street, plan, block and parcel below is invented too
+ROUND7_COST_HEADERS = ["רכיב", "שטח (מ״ר)", "עלות למ״ר (₪)", "עלות (₪)"]
+ROUND7_COST_ROWS = [
+    ["בנייה עילית", "2,400", "6,500", "15,600,000"],
+    ["חניון תת-קרקעי", "1,100", "4,200", "4,620,000"],
+    ["פיתוח השטח", "800", "650", "520,000"],
+    ["סה״כ", "", "", "20,740,000"],
+]
+ROUND7_COST_NOTE = "(*) הסכומים בש״ח, ללא מע״מ. הנתונים בדויים."
+ROUND7_COMPARABLE_HEADERS = ["גוש/חלקה", "כתובת", "שטח (מ״ר)", "מחיר למ״ר (₪)"]
+ROUND7_APPRAISALS = [
+    {"key": "first", "street": "רחוב הדמומית 12", "block": "30871", "parcel": "15", "rooms": "4", "floor": "3",
+     "area": "120", "per_sqm": "21,400", "value": "2,568,000", "approved_plan": "דמו/5110", "proposed_plan": "דמו/5112",
+     "comparables": [["30871/22", "רחוב הדמומית 4", "105", "20,900"], ["30871/31", "רחוב הסחלב 9", "130", "21,800"],
+                     ["30874/40", "רחוב הצפצפה 15", "115", "22,300"]]},
+    {"key": "second", "street": "רחוב הצפצפה 7", "block": "30874", "parcel": "9", "rooms": "3", "floor": "2",
+     "area": "110", "per_sqm": "22,100", "value": "2,431,000", "approved_plan": "דמו/5110", "proposed_plan": "דמו/5140",
+     "comparables": [["30874/12", "רחוב הצפצפה 3", "98", "22,500"], ["30875/3", "רחוב הלוטם 21", "112", "21,950"],
+                     ["30871/27", "רחוב הסחלב 2", "125", "21,600"]]},
+]
+
+
+def raster_cost_table(font_dir: Path):
+    """R7c's cost table drawn as a picture: header, rows, a total row and the unit note, all inside the image (no
+    text layer for any of it)."""
+    from PIL import Image, ImageDraw
+
+    table = raster_rows_table(font_dir, (1400, 450), 32, 3, ROUND7_COST_HEADERS, ROUND7_COST_ROWS)
+    img = Image.new("RGB", (1400, 520), "white")
+    img.paste(table, (0, 0))
+    draw = ImageDraw.Draw(img)
+    _draw_centered(draw, (700, 455, 1390, 515), ROUND7_COST_NOTE, _pil_font(font_dir, 26))
+    return img
+
+
+class Round7PdfRenderer(CitationsPdfRenderer):
+    """The round-7 documents. Every fact line is recorded as it is drawn (page, section, text and box in points), so
+    the manifest holds what each test asks about without reading the files back. Every name, address, plan number,
+    block, parcel and amount is invented."""
+
+    def __init__(self, font_dir: Path) -> None:
+        super().__init__(font_dir)
+        self.section: str | None = None
+        self.sections: list[dict[str, Any]] = []
+        self.facts: dict[str, dict[str, Any]] = {}
+
+    def title_block(self, title: str, address: str, block: str, parcel: str, extra: list[str] = ()) -> None:
+        self.header(title)
+        self.placed(None, f"כתובת הנכס: {address}")
+        self.placed(None, f"גוש: {block} חלקה: {parcel}")
+        for line in extra:
+            self.placed(None, line)
+        self.pdf.ln(2)
+
+    def section_heading(self, title: str) -> None:
+        self.heading_line(None, title)
+        self.section = title
+        self.sections.append({"title": title, "page": self.pdf.page_no()})
+
+    def fact(self, key: str | None, text: str, **known: Any) -> None:
+        """One body line; with a key, recorded with its page, section and what it states (``known``)."""
+        box = self.body_line(None, text)
+        if key is not None:
+            assert key not in self.facts, key
+            self.facts[key] = {"page": self.pdf.page_no(), "section": self.section, "text": text, "box": box} | known
+
+    # --- the documents ------------------------------------------------------------------------------------------
+
+    def render_plan_status(self) -> bytes:
+        """R7a: a planning-status chapter: an approved plan and a proposed one, each with uses, housing units and
+        floors; height, building areas and building lines are deliberately absent."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.title_block("פרק מצב תכנוני — מתחם שדרות הצבעוני", f"שדרות הצבעוני 18, {ROUND7_PLACE}", "30902", "6")
+        self.section_heading("1. מבוא")
+        self.fact(None, "פרק זה מפרט את המצב התכנוני החל על המתחם (מסמך סינתטי).")
+        self.section_heading("2. מצב תכנוני")
+        self.fact("approved_plan", "תכנית דמו/4521 — תכנית מאושרת, פורסמה למתן תוקף ביום 12/05/2019.",
+                  plan="דמו/4521", status="approved")
+        self.fact("approved_uses", "לפי תכנית דמו/4521: ייעוד הקרקע מגורים, עם מסחר בקומת הקרקע.",
+                  plan="דמו/4521", status="approved", item="uses", value="מגורים, מסחר בקומת הקרקע")
+        self.fact("approved_units", "לפי תכנית דמו/4521: מספר יחידות הדיור המותר הוא 84 יח״ד.",
+                  plan="דמו/4521", status="approved", item="housing_units", value="84")
+        self.fact("approved_floors", "לפי תכנית דמו/4521: מספר הקומות המותר הוא 9 קומות מעל קומת הקרקע.",
+                  plan="דמו/4521", status="approved", item="floors", value="9")
+        self.fact("proposed_plan", "תכנית דמו/4630 — תכנית מוצעת, הופקדה ביום 03/02/2024 וטרם אושרה.",
+                  plan="דמו/4630", status="proposed")
+        self.fact("proposed_units", "לפי תכנית דמו/4630 המוצעת: תוספת של 22 יח״ד ושימוש נוסף למבני ציבור.",
+                  plan="דמו/4630", status="proposed", item="housing_units", value="22")
+        self.fact("proposed_floors", "לפי תכנית דמו/4630 המוצעת: מספר הקומות יגדל ל-12 קומות.",
+                  plan="דמו/4630", status="proposed", item="floors", value="12")
+        self.section_heading("3. סיכום")
+        self.fact(None, "המתחם מיועד למגורים; התוספת המוצעת טרם אושרה (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+    def render_two_appraisals(self) -> bytes:
+        """R7b: one file holding two appraisals of two invented properties, each with its own title block (labelled
+        address and block/parcel), the same numbered sections, a planning chapter naming plans, a comparison table of
+        other parcels, and similar but different values."""
+        pdf = self.pdf
+        for n, a in enumerate(ROUND7_APPRAISALS):
+            pdf.add_page()
+            k = a["key"]
+            self.title_block(f"שומת מקרקעין — {a['street']}, {ROUND7_PLACE}", f"{a['street']}, {ROUND7_PLACE}",
+                             a["block"], a["parcel"], [f"המועד הקובע: 0{n + 1}/03/2025"])
+            self.facts[f"{k}_title"] = {"page": pdf.page_no(), "section": None, "street": a["street"],
+                                        "block": a["block"], "parcel": a["parcel"]}
+            self.section_heading("1. מבוא")
+            self.fact(None, "שומה זו נערכה לבקשת הבעלים לצורך מכירה (מסמך סינתטי).")
+            self.section_heading("2. תיאור הנכס")
+            self.fact(f"{k}_area",
+                      f"הנכס הוא דירת מגורים בת {a['rooms']} חדרים בשטח {a['area']} מ״ר, בקומה {a['floor']}.",
+                      value=a["area"])
+            self.section_heading("3. מצב תכנוני")
+            self.fact(f"{k}_plans", f"על המקרקעין חלות תכנית {a['approved_plan']} (מאושרת) ותכנית "
+                                    f"{a['proposed_plan']} (מוצעת).", plans=[a["approved_plan"], a["proposed_plan"]])
+            self.section_heading("4. נתוני השוואה")
+            self.fact(None, "עסקאות להשוואה בסביבת הנכס:")
+            widths = [40, 60, 35, 45]
+            pdf.set_fill_color(225, 225, 225)
+            self.ruled_row(ROUND7_COMPARABLE_HEADERS, widths, bold=True)
+            for row in a["comparables"]:
+                self.ruled_row(row, widths)
+            pdf.ln(3)
+            self.facts[f"{k}_comparables"] = {"page": pdf.page_no(), "section": self.section,
+                                              "headers": ROUND7_COMPARABLE_HEADERS, "rows": a["comparables"]}
+            self.section_heading("5. תחשיב השווי")
+            self.fact(f"{k}_per_sqm", f"השווי למ״ר שנקבע לנכס: {a['per_sqm']} ₪.", value=a["per_sqm"])
+            self.fact(f"{k}_value", f"שווי הנכס: {a['area']} מ״ר × {a['per_sqm']} ₪ = {a['value']} ₪.",
+                      value=a["value"])
+            self.section_heading("6. סיכום")
+            self.fact(None, f"שווי השוק של הנכס ב{a['street']} נאמד ב-{a['value']} ₪ (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+    def render_cost_table_image(self) -> bytes:
+        """R7c: a report whose cost table is a picture (rows, columns, headers and the unit note in no text layer),
+        with a text-layer sentence giving its context."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.title_block("תחשיב עלויות לדוגמה — פרויקט שדרות הדובדבן", f"שדרות הדובדבן 40, {ROUND7_PLACE}", "30911",
+                         "21")
+        self.section_heading("1. כללי")
+        self.fact(None, "פרק זה מציג את עלויות הבנייה שהוערכו לפרויקט (מסמך סינתטי).")
+        self.section_heading("2. עלויות הבנייה")
+        self.fact("context", "טבלת עלויות הבנייה של הפרויקט, לפי רכיבים, מוצגת להלן:")
+        img = raster_cost_table(self.font_dir)
+        w_mm = 160.0
+        h_mm = w_mm * img.size[1] / img.size[0]
+        x_mm = pdf.w - pdf.r_margin - w_mm
+        y_mm = pdf.get_y()
+        self.picture(img, w_mm, h_mm, x_mm)
+        self.facts["picture"] = {"page": pdf.page_no(), "section": self.section,
+                                 "box": [x_mm * PT_PER_MM, y_mm * PT_PER_MM, (x_mm + w_mm) * PT_PER_MM,
+                                         (y_mm + h_mm) * PT_PER_MM],
+                                 "headers": ROUND7_COST_HEADERS, "rows": ROUND7_COST_ROWS, "note": ROUND7_COST_NOTE}
+        self.section_heading("3. סיכום")
+        self.fact(None, "העלויות משמשות לתחשיב הכדאיות של הפרויקט (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+    def render_residual(self) -> bytes:
+        """R7d: a residual-method calculation stating developer profit both as an explicit amount and, in another
+        line of the same section, as a rounded rate of cost (cost x the rounded rate is not the amount); a minimal
+        profit threshold; and a sensitivity section stating a cost-increase rate."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.title_block("שומת קרקע בשיטת השייר — מגרש ברחוב התאנה 30", f"רחוב התאנה 30, {ROUND7_PLACE}", "30920", "4")
+        self.section_heading("1. מבוא")
+        self.fact(None, "שומה זו מעריכה את שווי המגרש בשיטת השייר (מסמך סינתטי).")
+        self.section_heading("2. תחשיב בשיטת השייר")
+        self.fact("income", "סך ההכנסות הצפויות מהפרויקט: 24,600,000 ₪.", value="24,600,000")
+        self.fact("cost", "סך עלויות הבנייה והפיתוח: 18,350,000 ₪.", value="18,350,000")
+        self.fact("profit_rate", "הרווח היזמי נקבע בשיעור של כ-17% מסך העלויות.", value="17%")
+        self.fact("profit_amount", "סכום הרווח היזמי בתחשיב: 3,210,000 ₪.", value="3,210,000")
+        self.fact("land_value", "שווי הקרקע בשיטת השייר: 3,040,000 ₪.", value="3,040,000")
+        self.section_heading("3. בדיקת כדאיות")
+        self.fact("threshold", "הרווח היזמי המינימלי הנדרש לכדאיות הפרויקט: 2,800,000 ₪.", value="2,800,000")
+        self.section_heading("4. ניתוח רגישות")
+        self.fact("sensitivity_rate", "בתרחיש הרגישות נבחנה עלייה של 6% בעלויות הבנייה והפיתוח.", value="6%")
+        self.section_heading("5. סיכום")
+        self.fact(None, "הפרויקט כדאי בתנאים שנבחנו (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+    def render_decision(self) -> bytes:
+        """R7e: a decision between two parties: the applicant's figure, the respondent's figure and the adopted
+        figure, which differs from both."""
+        pdf = self.pdf
+        pdf.add_page()
+        self.title_block("הכרעת שמאי מכריע — היטל השבחה, רחוב הרימון 5", f"רחוב הרימון 5, {ROUND7_PLACE}", "30933",
+                         "11", ["המבקש: דמו נכסים בע״מ (שם בדוי)", f"המשיב: הוועדה המקומית {ROUND7_PLACE} (בדויה)"])
+        self.section_heading("1. רקע")
+        self.fact(None, "ההכרעה עוסקת בשומת היטל השבחה לנכס (מסמך סינתטי).")
+        self.section_heading("2. עמדת המבקש")
+        self.fact("applicant", "שמאי המבקש העריך את השווי למ״ר במצב החדש ב-14,200 ₪.", value="14,200",
+                  stated_by="applicant")
+        self.section_heading("3. עמדת המשיב")
+        self.fact("respondent", "שמאי המשיב העריך את השווי למ״ר במצב החדש ב-16,800 ₪.", value="16,800",
+                  stated_by="respondent")
+        self.section_heading("4. ההכרעה")
+        self.fact("adopted", "לאחר בחינת הטענות, אני קובע את השווי למ״ר במצב החדש ב-15,350 ₪.", value="15,350",
+                  stated_by="decision")
+        self.section_heading("5. סיכום")
+        self.fact(None, "השווי שנקבע משמש לחישוב ההיטל (מסמך סינתטי).")
+        return bytes(pdf.output())
+
+
+def write_round7(out: Path, font_dir: Path) -> None:
+    """Writes the round-7 fixtures and ``manifest.json``: per document its file, title, pages, section headings
+    with their pages, and the known facts (text, page, section, value, box in points) the reproductions and the
+    real-model tests ask about."""
+    from pypdf import PdfReader
+
+    rdir = out / ROUND7_DIR
+    rdir.mkdir(parents=True, exist_ok=True)
+    docs: dict[str, dict[str, Any]] = {}
+    specs = [
+        ("plan_status", "R7a_synthetic_plan_status_chapter.pdf", Round7PdfRenderer.render_plan_status,
+         {"absent": {"items": ["גובה", "שטחי בנייה", "קווי בניין"], "section": "2. מצב תכנוני"}}),
+        ("two_appraisals", "R7b_synthetic_two_appraisals_one_file.pdf", Round7PdfRenderer.render_two_appraisals, {}),
+        ("cost_table_image", "R7c_synthetic_cost_table_image.pdf", Round7PdfRenderer.render_cost_table_image,
+         {"question_total": {"rows": ["בנייה עילית", "חניון תת-קרקעי"], "column": "עלות (₪)",
+                             "inputs": ["15,600,000", "4,620,000"], "result": "20,220,000"}}),
+        ("residual", "R7d_synthetic_residual_explicit_profit.pdf", Round7PdfRenderer.render_residual,
+         {"gap_to_threshold": {"right": "410,000", "from_rounded_rate": "319,500", "cost_times_rate": "3,119,500"}}),
+        ("decision", "R7e_synthetic_decision_two_parties.pdf", Round7PdfRenderer.render_decision, {}),
+    ]
+    for key, name, render, extra in specs:
+        r = Round7PdfRenderer(font_dir)
+        data = render(r)
+        (rdir / name).write_bytes(data)
+        print(f"wrote {ROUND7_DIR}/{name} ({len(data):,} bytes)")
+        facts = {k: {kk: ([round(x, 2) for x in vv] if kk == "box" else vv) for kk, vv in f.items()}
+                 for k, f in r.facts.items()}
+        docs[key] = {"file": f"{ROUND7_DIR}/{name}", "title": _title_of(name),
+                     "pages": len(PdfReader(io.BytesIO(data)).pages), "sections": r.sections, "facts": facts} | extra
+    manifest = {
+        "about": f"{SYNTHETIC_MARKER}. Known contents of the round-7 fixtures (request components, precise gaps, "
+                 "removals, tables read in the turn, appraisal context inside one file, input choice); generated by "
+                 "scripts/generate_fixtures.py --only round7 from the generator's own layout (never read back from "
+                 "the files) - do not edit by hand. Pages are file pages from 1; box: [x0, y0, x1, y1] in points on "
+                 "the upright page, origin top-left. Every name, address, plan number, block, parcel and amount is "
+                 "invented.",
+        "synthetic_marker": SYNTHETIC_MARKER,
+        "documents": docs,
+    }
+    text_ = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+    (rdir / ROUND7_MANIFEST).write_text(text_, encoding="utf-8")
+    print(f"wrote {ROUND7_DIR}/{ROUND7_MANIFEST} ({len(text_):,} chars)")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--font-dir", default=DEFAULT_FONT_DIR)
     parser.add_argument("--out", default="tests/fixtures")
+    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7"], default="all",
+                        help="regions: write only the uncovered-region fixtures (tests/fixtures/regions/); "
+                             "positions: only the page-position fixtures (tests/fixtures/positions/); "
+                             "citations: only the citation fixtures and their manifest (tests/fixtures/citations/); "
+                             "round7: only the round-7 fixtures and their manifest (tests/fixtures/round7/)")
     args = parser.parse_args()
     font_dir = Path(args.font_dir)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    if args.only == "regions":
+        write_regions(out, font_dir)
+        return
+    if args.only == "positions":
+        write_positions(out, font_dir)
+        return
+    if args.only == "citations":
+        write_citations(out, font_dir)
+        return
+    if args.only == "round7":
+        write_round7(out, font_dir)
+        return
 
     docs: dict[str, dict[str, Any]] = {}
     facts: list[dict[str, Any]] = []
-    for rep in build_reports():
+    reports = build_reports()
+    layouts: dict[str, Layout] = {}
+    for rep in reports:
         assert "synthetic" in rep.filename
         if rep.kind == "docx":
             data, layout = render_docx(rep)
@@ -1723,6 +5148,7 @@ def main() -> None:
             )
         (out / rep.filename).write_bytes(data)
         docs[rep.id] = doc_entry(rep, layout)
+        layouts[rep.id] = layout
         facts.extend(find_fact_pages(rep, layout))
         print(f"wrote {rep.filename} ({len(data):,} bytes, pages={layout.page_count})")
 
@@ -1733,10 +5159,17 @@ def main() -> None:
         "documents": list(docs.values()),
         "dedup": dedup_section(docs),
         "content_facts": facts,
+        "general_facts": write_general(out, font_dir, reports, layouts),
     }
     text = yaml.safe_dump(truth, allow_unicode=True, sort_keys=False, width=1000)
     (out / "ground_truth.yaml").write_text(text, encoding="utf-8")
     print(f"wrote ground_truth.yaml ({len(text):,} chars)")
+    write_holdout_v2(out, font_dir, reports, layouts)
+    write_blocks(out, font_dir)
+    write_regions(out, font_dir)
+    write_positions(out, font_dir)
+    write_citations(out, font_dir)
+    write_round7(out, font_dir)
 
 
 if __name__ == "__main__":

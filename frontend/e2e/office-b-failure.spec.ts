@@ -24,7 +24,7 @@ test.describe("failed processing status (office B)", () => {
   test("password-protected PDF is accepted, then shows 'נכשל' with the Hebrew reason", async ({ page }) => {
     test.setTimeout(180_000);
     await login(page, USERS.adminB);
-    await page.getByRole("navigation", { name: "ניווט ראשי" }).getByRole("link", { name: "מסמכים" }).click();
+    await page.getByRole("complementary", { name: "היסטוריית שיחות" }).getByRole("link", { name: "מסמכים" }).click();
 
     await page.getByLabel("בחירת קבצים להעלאה").setInputFiles(fixture(FILE));
     await expect(page.getByText("נבחרו")).toContainText("1");

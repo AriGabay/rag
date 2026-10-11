@@ -7,7 +7,12 @@ through the public API exactly like a user would (upload -> worker -> review app
     # or from the host: BACKEND_URL=http://localhost:8000 OWNER_DATABASE_URL=... uv run python scripts/seed_demo.py
 
 Records are approved only when every key field equals the synthetic ground truth, so the demo
-also shows which extractions a human would still need to check. All data is synthetic.
+also shows which extractions a human would still need to check. Each office also gets the
+structured attribute registry entries (KTD7), written with the owner role inside that office's
+context. The held-out corpus (U12, KTD16; tests/fixtures/general/) goes into its own office A group,
+visible to admin-a and dana but not yossi; it produces no records. The second held-out corpus
+(tests/fixtures/holdout_v2/, answer key tests/fixtures/holdout_v2_truth.yaml) goes the same way into its own
+group "ידע כללי ב". All data is synthetic.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ from sqlalchemy import create_engine, text
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from app.answering.attributes import STRUCTURED_ATTRIBUTES  # noqa: E402  (single source of truth, KTD7)
 from app.security import hash_password  # noqa: E402
 
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -53,9 +59,13 @@ def client_for(email: str) -> httpx.Client:
     return c
 
 
-def bootstrap_offices() -> None:
+def owner_engine():
     owner_url = os.environ.get("OWNER_DATABASE_URL")
-    engine = create_engine(owner_url) if owner_url else None
+    return create_engine(owner_url) if owner_url else None
+
+
+def bootstrap_offices() -> None:
+    engine = owner_engine()
     for key, office in OFFICES.items():
         probe = httpx.post(f"{BACKEND}/api/auth/login", json={"email": office["admin"], "password": PASSWORD})
         if probe.status_code == 200:
@@ -68,6 +78,25 @@ def bootstrap_offices() -> None:
                          {"n": office["name"], "e": office["admin"], "fn": f"מנהל/ת {office['name']}",
                           "h": hash_password(PASSWORD)})
         log(f"office {key} created")
+
+
+def seed_structured_attributes(clients: dict[str, httpx.Client]) -> None:
+    """Idempotent: existing definitions (same office and key) are left untouched."""
+    engine = owner_engine()
+    if engine is None:
+        raise SystemExit("OWNER_DATABASE_URL is required to seed the attribute registry")
+    for key, c in clients.items():
+        office_id = c.get("/api/auth/me").json()["office"]["id"]
+        with engine.begin() as conn:  # the owner is bound by FORCE RLS too: act inside the office context
+            conn.execute(text("SELECT set_config('app.office_id', :o, true)"), {"o": office_id})
+            added = sum(conn.execute(
+                text("INSERT INTO attribute_definitions (office_id, key, label_he, aliases, value_type, unit_dimension,"
+                     " canonical_unit, source, structured_column, status) VALUES (app_office(), :k, :l, :a, 'numeric',"
+                     " :d, :u, 'structured', :c, 'active') ON CONFLICT (office_id, key) DO NOTHING"),
+                {"k": a["key"], "l": a["label_he"], "a": a["aliases"], "d": a["unit_dimension"],
+                 "u": a["canonical_unit"], "c": a["column"]},
+            ).rowcount for a in STRUCTURED_ATTRIBUTES)
+        log(f"office {key}: {added} structured attributes added")
 
 
 def ensure_groups_and_users(admin: httpx.Client) -> dict[str, str]:
@@ -110,6 +139,49 @@ def upload_all(clients: dict[str, httpx.Client], group_ids: dict[str, dict[str, 
                                         files=[("files", (path.name, path.read_bytes(), "application/octet-stream"))])
         log(f"upload {doc['id']} as new version of {doc['version_of']}: {r.json()['results'][0]['status']}")
     wait_for_processing(clients)
+
+
+def seed_general_corpus(admin: httpx.Client, general: dict) -> None:
+    """Held-out documents in their own group (`general_facts` in ground_truth.yaml, or the v2 answer key
+    holdout_v2_truth.yaml, which has the same shape). Idempotent: the group, the members and the uploads are
+    each created only when missing."""
+    spec = general["group"]
+    groups = {g["name"]: g for g in admin.get("/api/admin/groups").json()["groups"]}
+    if spec["name"] in groups:
+        group_id = groups[spec["name"]]["id"]
+    else:
+        r = admin.post("/api/admin/groups", json={"name": spec["name"]})
+        r.raise_for_status()
+        group_id = r.json()["id"]
+    for user in admin.get("/api/admin/users").json()["users"]:
+        if user["email"] in spec["visible_to"] and user["role"] != "admin" and group_id not in user["group_ids"]:
+            admin.patch(f"/api/admin/users/{user['id']}",
+                        json={"group_ids": [*user["group_ids"], group_id]}).raise_for_status()
+            log(f"{user['email']} added to group {spec['name']}")
+    if groups.get(spec["name"], {}).get("document_count"):
+        log("held-out documents already uploaded; skipping")
+        return
+    folder = FIXTURES / general["directory"]
+    by_id: dict[str, str] = {}
+    for doc in [d for d in general["documents"] if not d.get("version_of")]:
+        path = folder / doc["filename"]
+        r = admin.post("/api/documents", data={"group_id": group_id},
+                       files=[("files", (path.name, path.read_bytes(), "application/octet-stream"))])
+        r.raise_for_status()
+        res = r.json()["results"][0]
+        log(f"upload {doc['id']}: {res['status']} {res.get('reason', '')}")
+        if res.get("document_id"):
+            by_id[doc["id"]] = res["document_id"]
+    wait_for_processing({"A": admin})
+    for doc in [d for d in general["documents"] if d.get("version_of")]:
+        target = by_id.get(doc["version_of"])
+        if not target:
+            continue
+        path = folder / doc["filename"]
+        r = admin.post("/api/documents", data={"document_id": target},
+                       files=[("files", (path.name, path.read_bytes(), "application/octet-stream"))])
+        log(f"upload {doc['id']} as new version of {doc['version_of']}: {r.json()['results'][0]['status']}")
+    wait_for_processing({"A": admin})
 
 
 def wait_for_processing(clients: dict[str, httpx.Client], timeout: float = 900) -> None:
@@ -164,6 +236,7 @@ def main() -> None:
     docs = truth["documents"]
     bootstrap_offices()
     clients = {k: client_for(o["admin"]) for k, o in OFFICES.items()}
+    seed_structured_attributes(clients)
     group_ids = {"A": ensure_groups_and_users(clients["A"])}
     group_ids["A"]["default"] = group_ids["A"]["G1"]
     group_ids["B"] = {"default": clients["B"].get("/api/admin/groups").json()["groups"][0]["id"]}
@@ -171,6 +244,9 @@ def main() -> None:
         upload_all(clients, group_ids, docs)
     else:
         log("documents already uploaded; skipping uploads")
+    seed_general_corpus(clients["A"], truth["general_facts"])
+    holdout_v2 = yaml.safe_load((FIXTURES / "holdout_v2_truth.yaml").read_text(encoding="utf-8"))
+    seed_general_corpus(clients["A"], holdout_v2)
     for key, c in clients.items():
         approved, left = approve_matching(c, docs)
         log(f"office {key}: approved {approved} records matching ground truth; {left} items left for review")

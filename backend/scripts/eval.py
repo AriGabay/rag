@@ -3,6 +3,18 @@
     cd backend && uv run python scripts/eval.py
     # options: --questions eval/questions.yaml --out ../docs/evaluation/eval-results.md --only N01,T04 --json out.json
 
+The first held-out general set (U12; eval/questions_general.yaml, scored by eval/general.py) is now the
+REGRESSION set and runs with ``--set general``; the separate held-out v2 set (eval/questions_holdout_v2.yaml,
+answer key tests/fixtures/holdout_v2_truth.yaml, documents K1-K8 seeded by scripts/seed_demo.py into group
+"ידע כללי ב") runs with ``--set holdout_v2``. ``--real-sample`` additionally requires office A in cloud mode (it
+refuses otherwise and never changes settings) and writes docs/evaluation/real-model-sample.md (regression) or
+docs/evaluation/real-model-sample-holdout-v2.md (held-out v2). Items whose extraction was still running in
+background jobs are asked again once the job queue drains; both runs are recorded. ``--rescore results.json``
+scores stored answers again without asking anything.
+
+    cd backend && uv run python scripts/eval.py --set general --real-sample --json /tmp/general.json
+    cd backend && uv run python scripts/eval.py --set holdout_v2 --real-sample --json /tmp/holdout_v2.json
+
 Needs the Compose stack seeded with scripts/seed_demo.py (BACKEND_URL, default http://localhost:8000;
 demo password from DEMO_PASSWORD, default demo1234). Expected values are computed from
 tests/fixtures/ground_truth.yaml (eval/truth.py) for each item's conditions, the asking user's groups,
@@ -12,8 +24,8 @@ Table-extraction and field metrics read the live database read-only through the 
 office's system context (EVAL_DATABASE_URL, default built from the repository .env). They are
 reported separately from answer quality.
 
-The answering provider of the demo stack is the deterministic mock (or the extractive fallback). These
-numbers are NOT a benchmark of a cloud model and the latencies are not cloud-provider latencies.
+The report states which providers answered: with an office in demo mode content answers come from the
+deterministic mock (not a cloud-model benchmark); with an office in cloud mode they come from the real model.
 """
 
 from __future__ import annotations
@@ -26,6 +38,7 @@ import platform
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
@@ -59,7 +72,8 @@ from eval.truth import (  # noqa: E402
 BACKEND = os.environ.get("BACKEND_URL", "http://localhost:8000")
 PASSWORD = os.environ.get("DEMO_PASSWORD", "demo1234")
 REPO = ROOT.parent
-GROUP_NAMES = {"שומות רמת גן וגבעתיים": "G1", "שומות פרויקטים": "G2"}  # scripts/seed_demo.py
+GROUP_NAMES = {"שומות רמת גן וגבעתיים": "G1", "שומות פרויקטים": "G2", "ידע כללי": "G3",
+               "ידע כללי ב": "G4"}  # scripts/seed_demo.py
 ANSWERED = ("numeric", "combined", "content")
 NUMERIC_FIELDS = ("record_count", "mean_price_per_sqm", "weighted_price_per_sqm", "median_price_per_sqm",
                   "min_price_per_sqm", "max_price_per_sqm")
@@ -292,19 +306,27 @@ def run_item(live: Live, item: dict) -> list[dict]:
     return results
 
 
-def extraction_metrics(live: Live) -> dict:
+def runtime_db_url() -> str | None:
+    """The live database through the runtime role (RLS applies): EVAL_DATABASE_URL, else built from .env."""
     url = os.environ.get("EVAL_DATABASE_URL")
+    if url:
+        return url
+    env = {}
+    env_file = REPO / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip()
+    if not env.get("RAG_APP_PASSWORD"):
+        return None
+    return f"postgresql+psycopg://rag_app:{env['RAG_APP_PASSWORD']}@localhost:5433/rag"
+
+
+def extraction_metrics(live: Live) -> dict:
+    url = runtime_db_url()
     if not url:
-        env = {}
-        env_file = REPO / ".env"
-        if env_file.exists():
-            for line in env_file.read_text().splitlines():
-                if "=" in line and not line.lstrip().startswith("#"):
-                    k, v = line.split("=", 1)
-                    env[k.strip()] = v.strip()
-        if not env.get("RAG_APP_PASSWORD"):
-            return {"error": "no EVAL_DATABASE_URL and no RAG_APP_PASSWORD in .env"}
-        url = f"postgresql+psycopg://rag_app:{env['RAG_APP_PASSWORD']}@localhost:5433/rag"
+        return {"error": "no EVAL_DATABASE_URL and no RAG_APP_PASSWORD in .env"}
     from sqlalchemy import create_engine, text
 
     tables, occurrences, models = [], [], Counter()
@@ -348,7 +370,8 @@ def environment(live: Live) -> dict:
     env["health"] = live.client("admin-a@demo.test").get("/api/health").json()
     for key, email in (("A", "admin-a@demo.test"), ("B", "admin-b@demo.test")):
         s = live.client(email).get("/api/admin/settings").json()
-        env[f"provider_{key}"] = s.get("effective_provider")
+        env[f"provider_{key}"] = s.get("mode")
+        env[f"model_{key}"] = s.get("model")
     env["demo_mode"] = live.client("admin-a@demo.test").get("/api/auth/me").json().get("demo_mode")
     return env
 
@@ -391,6 +414,25 @@ def summarize(results: list[dict]) -> dict:
     return m
 
 
+def provider_note(env: dict, m: dict) -> str:
+    """Which providers answered, stated honestly: a mock/extractive run is not a cloud-model benchmark."""
+    modes = f"office A mode `{env.get('provider_A')}`, office B mode `{env.get('provider_B')}`"
+    seen = dict(m["providers"])
+    if "cloud" in seen:
+        model = env.get("model_A") or "n/a"
+        return (f"> **Mixed providers.** {modes}; model `{model}`; providers seen in answers: {seen}. Office A "
+                "questions the rules do not fully explain are interpreted and composed by the real cloud model; "
+                "fully explained price questions stay SQL + templates with no model call. Office B answers come "
+                "from the labeled demo mock. Latencies include real network/model time for cloud turns. All data "
+                "is synthetic (R36); quality on real appraisal reports is **pending** until authorized real "
+                "documents are supplied.")
+    return (f"> **Not a cloud-model benchmark.** The demo stack answers content questions with the deterministic "
+            f"mock provider ({modes}; providers seen in answers: {seen}). Numeric answers are SQL + templates with "
+            "no model call. Latencies below are local mock latencies, not cloud-provider latencies. All data is "
+            "synthetic (R36); quality on real appraisal reports is **pending** until authorized real documents are "
+            "supplied.")
+
+
 def fmt_ms(v: float | None) -> str:
     return "n/a" if v is None else f"{v:.0f} ms"
 
@@ -404,11 +446,7 @@ def write_report(path: Path, env: dict, m: dict, results: list[dict], extraction
         f"Generated by `cd backend && uv run python scripts/eval.py` on {env['date']} against the live demo "
         f"stack ({env['backend']}), commit `{env.get('commit') or 'n/a'}`. Run time {elapsed:.0f} s.",
         "",
-        "> **Not a cloud-model benchmark.** The demo stack answers content questions with the deterministic "
-        f"mock provider (effective provider: office A `{env.get('provider_A')}`, office B `{env.get('provider_B')}`; "
-        f"providers seen in answers: {dict(m['providers'])}). Numeric answers are SQL + templates with no model "
-        "call. Latencies below are local mock latencies, not cloud-provider latencies. All data is synthetic "
-        "(R36); quality on real appraisal reports is **pending** until authorized real documents are supplied.",
+        provider_note(env, m),
         "",
         "## Environment",
         "",
@@ -417,7 +455,8 @@ def write_report(path: Path, env: dict, m: dict, results: list[dict], extraction
         f"| machine | {env.get('cpu', 'n/a')}, {env.get('cores', '?')} cores, {env.get('memory', '?')} RAM ({env['os']}) |",
         f"| Docker | {env.get('docker', 'n/a')} |",
         f"| embedding model in the stack (chunks.embedding_model) | {', '.join(f'`{k}` ({v} chunks)' for k, v in (extraction.get('embedding_models') or {}).items()) or 'n/a'} |",
-        f"| answer provider | `{env.get('provider_A')}` (demo mode: {env.get('demo_mode')}) |",
+        f"| answer provider (mode) | office A `{env.get('provider_A')}` (`{env.get('model_A')}`), office B "
+        f"`{env.get('provider_B')}` (demo mode: {env.get('demo_mode')}) |",
         f"| database role / RLS bypass | `{env['health'].get('db_role')}` / {env['health'].get('db_bypass_rls')} |",
         f"| evaluation set | {m['items']} items, {m['turns']} scored turns (`backend/eval/questions.yaml`) |",
         f"| verification state | {len(live.unverified)} answer-key records still in the review queue and excluded "
@@ -510,13 +549,305 @@ def write_report(path: Path, env: dict, m: dict, results: list[dict], extraction
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+# --- the held-out general set (U12, KTD16) ------------------------------------------------------------
+
+class LiveReader:
+    """Read-only access to stored turns, provider usage and the job queue through the runtime role, in each
+    office's system context (rag_app cannot read another user's questions otherwise)."""
+
+    def __init__(self, live: Live):
+        from sqlalchemy import create_engine
+
+        url = runtime_db_url()
+        if not url:
+            raise SystemExit("--set general needs EVAL_DATABASE_URL or RAG_APP_PASSWORD in .env to read stored plans")
+        self.engine = create_engine(url)
+        self.office_ids = live.office_ids
+
+    def _rows(self, office: str, sql: str, **params) -> list[dict]:
+        from sqlalchemy import text
+
+        with self.engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.office_id', :o, true), set_config('app.user_id', '', true),"
+                              " set_config('app.role', 'system', true)"), {"o": self.office_ids[office]})
+            return [dict(r._mapping) for r in conn.execute(text(sql), params)]
+
+    def plan_of(self, question_id: str) -> dict | None:
+        for office in ("A", "B"):
+            rows = self._rows(office, "SELECT plan, steps, parse_route FROM questions WHERE id = CAST(:q AS uuid)",
+                              q=question_id)
+            if rows:
+                return rows[0]
+        return None
+
+    def usage_since(self, office: str, since: datetime) -> list[dict]:
+        return self._rows(office, "SELECT provider, model, purpose, status, ok, count(*) AS calls,"
+                          " coalesce(sum(input_tokens), 0) AS input_tokens,"
+                          " coalesce(sum(output_tokens), 0) AS output_tokens, round(avg(latency_ms)) AS avg_ms"
+                          " FROM provider_usage WHERE created_at >= :t GROUP BY 1, 2, 3, 4, 5 ORDER BY 3, 4",
+                          t=since)
+
+    def open_extract_jobs(self, office: str = "A") -> int:
+        return self._rows(office, "SELECT count(*) AS n FROM jobs WHERE kind = 'extract_facts'"
+                          " AND status IN ('queued', 'running')")[0]["n"]
+
+
+def general_hooks(live: Live, reader: LiveReader, cloud_off: bool = False):
+    from eval.general import Hooks, filename_to_doc
+
+    admin = live.client("admin-a@demo.test")
+
+    def doc_of(source: dict) -> str | None:
+        name = live.filename(admin, source["document_id"], source["version_id"])
+        return filename_to_doc().get(name or "")
+
+    return Hooks(client=live.client, doc_of=doc_of, plan_of=reader.plan_of, forbidden=live.forbidden,
+                 unverified=live.unverified, cloud_off=cloud_off)
+
+
+def wait_for_extraction(reader: LiveReader, timeout: float = 600) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if reader.open_extract_jobs() == 0:
+            return True
+        time.sleep(5)
+    return False
+
+
+def print_general_line(r: dict) -> None:
+    if r.get("not_run"):
+        print(f"skip {r['id']}    {r['not_run']}", flush=True)
+        return
+    mark = "ok " if r["ok"] else "FAIL"
+    print(f"{mark} {r['id']}.{r['turn']:<2} {r['expected']:>13} -> {r['got'] or '-':<13} task {r['task_type']}"
+          f" {r['total_ms']:6.0f} ms" + ("" if r["ok"] else "  " + "; ".join(r["reasons"])[:300]), flush=True)
+
+
+def run_general(args) -> int:
+    from eval.general import SET_LABELS, load_items, rescore, run_and_score, summarize
+
+    label = SET_LABELS[args.set]
+    questions = args.questions_general if args.set == "general" else args.questions_holdout_v2
+
+    live = Live()
+    live.load()
+    settings_a = live.client("admin-a@demo.test").get("/api/admin/settings").json()
+    if args.real_sample and not args.rescore and settings_a.get("mode") != "cloud":
+        print(f"REFUSED: --real-sample needs office A in cloud mode; it is in `{settings_a.get('mode')}` "
+              f"(status {settings_a.get('mode_status')}). Enable cloud use for office A in the admin screen and run "
+              "the connection test first; this script never changes office settings.", file=sys.stderr)
+        return 2
+    if args.set == "holdout_v2" and not args.rescore:  # the K* corpus must be seeded (scripts/seed_demo.py)
+        from eval.truth import holdout_v2
+
+        key = holdout_v2()
+        new_versions = {v["document"] for v in key.get("versions") or []}
+        want = {Path(d["filename"]).stem.replace("_", " ") for d in key["documents"] if d["id"] not in new_versions}
+        missing = sorted(want - set(live.by_title["A"]))
+        if missing:
+            print(f"REFUSED: the held-out v2 documents are not in office A ({len(missing)} missing, e.g. "
+                  f"{missing[0]!r}); seed them first with `uv run python scripts/seed_demo.py`.", file=sys.stderr)
+            return 2
+    reader = LiveReader(live)
+    items = load_items(questions)
+    if args.only:
+        wanted = set(args.only.split(","))
+        items = [i for i in items if i["id"] in wanted]
+    hooks = general_hooks(live, reader)
+    if args.rescore:  # score stored answers again with the current scorer; nothing is asked
+        data = json.loads(Path(args.rescore).read_text(encoding="utf-8"))
+        env, elapsed, usage = data["env"], data["elapsed_s"], data["usage"]
+        settings_a = data.get("settings_a") or settings_a
+        wanted_ids = {i["id"] for i in items}
+        final = rescore(hooks, items, [r for r in data["results"] if r["id"] in wanted_ids])
+        first_runs = {k: rescore(hooks, items, v) for k, v in data.get("first_runs", {}).items() if k in wanted_ids}
+        for r in final:
+            print_general_line(r)
+    else:
+        env = environment(live)
+        since = datetime.now(UTC)
+        started = time.perf_counter()
+        results = run_and_score(hooks, items, on_turn=print_general_line)
+        # an item whose extraction was still running in background jobs is asked again once the worker drains
+        pending = sorted({r["id"] for r in results if not r.get("not_run") and (r.get("pending_extraction") or 0) > 0})
+        reruns: dict[str, list[dict]] = {}
+        if pending:
+            print(f"\n{len(pending)} items reported pending extraction: {', '.join(pending)}; waiting for the worker")
+            drained = wait_for_extraction(reader)
+            print("worker drained" if drained else "worker still busy after the timeout; asking again anyway")
+            again = run_and_score(hooks, [i for i in items if i["id"] in pending], on_turn=print_general_line)
+            for r in again:
+                reruns.setdefault(r["id"], []).append(r)
+        order = [i["id"] for i in items]
+        final = [r for r in results if r["id"] not in reruns] + [r for v in reruns.values() for r in v]
+        final.sort(key=lambda r: (order.index(r["id"]), r["turn"]))
+        first_runs = {k: [r for r in results if r["id"] == k] for k in reruns}
+        elapsed = time.perf_counter() - started
+        usage = {o: reader.usage_since(o, since) for o in ("A", "B")}
+    m = summarize(final)
+    m["set"], m["label"] = args.set, label
+    m["questions"] = str(Path(questions).resolve().relative_to(REPO))
+    print_general_summary(m)
+    out_json = Path(args.json or (Path(tempfile.gettempdir()) / "rag-eval-general.json"))
+    out_json.write_text(json.dumps({"env": env, "settings_a": {k: settings_a.get(k) for k in (
+        "provider", "provider_name", "model", "mode", "mode_status", "untested")}, "summary": m,
+        "results": final, "first_runs": first_runs, "usage": usage, "elapsed_s": elapsed},
+        ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+    print(f"results: {out_json}")
+    if args.real_sample:
+        out = Path(args.out_sample or (REPO / "docs" / "evaluation" / (
+            "real-model-sample.md" if args.set == "general" else "real-model-sample-holdout-v2.md")))
+        write_real_sample(out, env, settings_a, m, final, first_runs, usage, elapsed)
+        print(f"report: {out}")
+        gate = real_sample_gate(m)
+        print("REAL-MODEL GATE: " + ("PASS" if gate["pass"] else "FAIL") + f" ({gate['reason']})")
+        return 0 if gate["pass"] else 1
+    return 0
+
+
+def print_general_summary(m: dict) -> None:
+    ok, n = m["held_out"]
+    label = m.get("label", "regression")
+    print(f"\n[{label} set] items passed {m['passed']}/{m['run']} (not run: {', '.join(m['not_run']) or 'none'}) | "
+          f"{label} held-out items {rate(ok, n)} | turns {rate(*m['turns'])} | task type {rate(*m['task_type'])} | "
+          f"cache hits {m['cached']}")
+    print("\ncategory               passed")
+    for cat, (p, total) in m["by_category"].items():
+        print(f"{cat:<22} {p}/{total}")
+    for tag, v in m["ae"].items():
+        print(f"{tag}: passed {v['passed']} of {v['items']}" + (f", not run {v['not_run']}" if v["not_run"] else ""))
+
+
+def real_sample_gate(m: dict) -> dict:
+    """R27: every AE1-AE6 item that ran passes and the held-out pass rate is at least 80%."""
+    ok, n = m["held_out"]
+    ae_fail = sorted(i for tag, v in m["ae"].items() if tag in {f"AE{k}" for k in range(1, 7)}
+                     for i in v["items"] if i not in v["passed"] and i not in v["not_run"])
+    held = ok / n if n else 0.0
+    reasons = []
+    if ae_fail:
+        reasons.append(f"AE items failed: {', '.join(ae_fail)}")
+    if held < 0.8:
+        reasons.append(f"held-out pass rate {100 * held:.1f}% < 80%")
+    return {"pass": not reasons, "reason": "; ".join(reasons) or f"held-out {100 * held:.1f}%, all AE items that ran "
+            "passed", "ae_failed": ae_fail, "held_out_rate": held}
+
+
+def _cell(s) -> str:
+    return str(s if s is not None else "—").replace("|", "\\|").replace("\n", " ")
+
+
+def write_real_sample(path: Path, env: dict, settings: dict, m: dict, results: list[dict], first_runs: dict,
+                      usage: dict, elapsed: float) -> None:
+    gate = real_sample_gate(m)
+    ok, n = m["held_out"]
+    set_name, label = m.get("set", "general"), m.get("label", "regression")
+    questions = m.get("questions", "backend/eval/questions_general.yaml")
+    lines = [
+        f"# Real-model sample (U12, R27): {label} set",
+        "",
+        f"Generated by `cd backend && uv run python scripts/eval.py --set {set_name} --real-sample` on {env['date']} "
+        f"against the live stack ({env['backend']}), commit `{env.get('commit') or 'n/a'}`. Run time {elapsed:.0f} s.",
+        "",
+        "| item | value |",
+        "|---|---|",
+        f"| provider / model | {settings.get('provider_name')} / `{settings.get('model')}` |",
+        f"| office A mode | `{settings.get('mode')}` (connection test pending: {settings.get('untested')}) |",
+        "| documents sent to the model | synthetic fixtures only (`backend/tests/fixtures/`, `general/`); no real "
+        "appraisal content, no key or secret in this report |",
+        f"| question set | `{questions}` ({label} set; written before any prompt tuning; answer-key changes are "
+        "listed with their requirement in `docs/evaluation/scorer-changes.md`) |",
+        f"| items | {m['items']} ({m['run']} run; not run: {', '.join(m['not_run']) or 'none'}) |",
+        "",
+        "## Gate",
+        "",
+        f"**{'PASS' if gate['pass'] else 'FAIL'}** — {gate['reason']}.",
+        "",
+        f"- Held-out items passed ({label} set): {rate(ok, n)} (threshold 80%, an assumption of the plan).",
+        f"- All items passed: {m['passed']}/{m['run']}; scored turns {rate(*m['turns'])}; plan task type as expected "
+        f"{rate(*m['task_type'])}; answers served from cache: {m['cached']}.",
+        "",
+        "| acceptance example | items | passed | not run |",
+        "|---|---|---|---|",
+    ]
+    lines += [f"| {tag} | {', '.join(v['items'])} | {', '.join(v['passed']) or '—'} | {', '.join(v['not_run']) or '—'} |"
+              for tag, v in m["ae"].items()]
+    lines += ["", "## Failures by scored facet", "",
+              "Items failing each facet of the question-file rules (an item can fail several). Items that fail "
+              f"only on citation precision: {', '.join(m['only_precision']) or 'none'}.", "",
+              "| facet | items failing |", "|---|---|"]
+    lines += [f"| {facet} | {n} |" for facet, n in m["facet_failures"].items()]
+    lines += ["", "## By category", "", "| category | passed |", "|---|---|"]
+    lines += [f"| {cat} | {p}/{t} |" for cat, (p, t) in m["by_category"].items()]
+    lines += ["", "## Per item", "",
+              "| id | turn | category | held-out | expected | got | task type (expected) | tools | pass |",
+              "|---|---|---|---|---|---|---|---|---|"]
+    for r in results:
+        if r.get("not_run"):
+            lines.append(f"| {r['id']} | 1 | {r['category']} | {'yes' if r['held_out'] else 'no'} | {r['expected']} |"
+                         f" — | — | — | not run |")
+            continue
+        lines.append(f"| {r['id']} | {r['turn']} | {r['category']} | {'yes' if r['held_out'] else 'no'} | "
+                     f"{r['expected']} | {r['got']}{' (cache)' if r['cached'] else ''} | {r['task_type']} "
+                     f"({r.get('expected_task_type') or '—'}) | {', '.join(t for t in r['tools'] if t) or '—'} | "
+                     f"{'yes' if r['ok'] else '**no**'} |")
+    failures = [r for r in results if r.get("ok") is False]
+    lines += ["", f"## Failures ({len({r['id'] for r in failures})} items)", ""]
+    for r in failures:
+        lines.append(f"- **{r['id']}** turn {r['turn']} ({r['category']}): «{r['question']}» — expected "
+                     f"`{r['expected']}`, got `{r['got']}`. " + "; ".join(_cell(x) for x in r["reasons"]))
+    if first_runs:
+        lines += ["", "## Re-asked after background extraction", "",
+                  "These items reported documents still pending extraction; they were asked again once the worker "
+                  "drained. The table above holds the second run; the first run was:", ""]
+        for k, rs in first_runs.items():
+            lines += [f"- {k} turn {r['turn']}: got `{r['got']}`, pending extraction {r.get('pending_extraction')}, "
+                      f"{'pass' if r['ok'] else 'fail: ' + '; '.join(r['reasons'])[:300]}" for r in rs]
+    lines += ["", "## Provider calls during the run", "",
+              "| office | provider | model | purpose | status | calls | input tokens | output tokens | avg ms |",
+              "|---|---|---|---|---|---|---|---|---|"]
+    for office, rows in usage.items():
+        lines += [f"| {office} | {u['provider']} | {u['model']} | {u['purpose']} | {u['status'] or ('ok' if u['ok'] else '?')}"
+                  f" | {u['calls']} | {u['input_tokens']} | {u['output_tokens']} | {u['avg_ms']} |" for u in rows]
+    lines += [
+        "",
+        "## How this is scored",
+        "",
+        "Scoring follows the header of `backend/eval/questions_general.yaml` (implemented in "
+        "`backend/eval/general.py`; changes in `docs/evaluation/scorer-changes.md`); wording is never scored. The plan facets (task type, relation, tool) come "
+        "from the stored turn. A computed figure counts the reviewed figure, else the separately labeled "
+        "preliminary figure (model-extracted values stay preliminary until a person reviews them). Items that "
+        "need cloud use off (AE2) cannot run against an office in cloud mode; they are proven by the scripted "
+        "gate 8 and the U9 tests instead.",
+        "",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--questions", default=str(ROOT / "eval" / "questions.yaml"))
     ap.add_argument("--out", default=str(REPO / "docs" / "evaluation" / "eval-results.md"))
     ap.add_argument("--only", default="")
     ap.add_argument("--json", default="")
+    ap.add_argument("--set", default="existing", choices=("existing", "general", "holdout_v2"),
+                    help="existing: eval/questions.yaml (77 turns); general: eval/questions_general.yaml (the "
+                         "regression set); holdout_v2: eval/questions_holdout_v2.yaml (the held-out v2 set)")
+    ap.add_argument("--questions-general", default=str(ROOT / "eval" / "questions_general.yaml"))
+    ap.add_argument("--questions-holdout-v2", default=str(ROOT / "eval" / "questions_holdout_v2.yaml"))
+    ap.add_argument("--real-sample", action="store_true",
+                    help="with --set general|holdout_v2: require office A in cloud mode and write the real-model "
+                         "sample report")
+    ap.add_argument("--out-sample", default="", help="report path (default docs/evaluation/real-model-sample.md, "
+                    "or real-model-sample-holdout-v2.md with --set holdout_v2)")
+    ap.add_argument("--rescore", default="", help="with --set general|holdout_v2: score a stored results JSON "
+                    "again (no questions)")
     args = ap.parse_args(argv)
+    if args.real_sample and args.set not in ("general", "holdout_v2"):
+        ap.error("--real-sample runs a general set: add --set general or --set holdout_v2")
+    if args.set in ("general", "holdout_v2"):
+        return run_general(args)
 
     items = yaml.safe_load(Path(args.questions).read_text(encoding="utf-8"))["items"]
     if args.only:

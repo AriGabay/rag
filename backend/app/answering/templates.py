@@ -12,9 +12,12 @@ from app.answering.conditions import (
     VAT_LABELS,
     QueryConditions,
 )
-from app.appraisal.query import Stats
+from app.appraisal.query import RecordResult, Stats
 
-TEMPLATE_VERSION = "t1"
+# The answer logic and wording the server applies after the model: bump it whenever a server rule changes what an
+# answer says (completeness, validation, locate rules), so answers cached by earlier logic are not served after a
+# deploy. t2: per-document audit and completeness, meaning-bound fact validation, structured absence claims. t3: final-review rules (ordinals, qualified zeros, rival nouns, place spelling, locate existence). t4: only the user's own words count as absent in locate. t5: the question decides locate polarity. t6: narrative reports without records (places from text, text twin).
+TEMPLATE_VERSION = "t6"
 
 
 def money(value: Decimal | None) -> str:
@@ -61,6 +64,54 @@ def numeric_text(c: QueryConditions, s: Stats, uncertain: int, conflict_count: i
         limitations.append(f"{uncertain} זוגות רשומות חשודים ככפילות שלא אושרה; הם נספרו כרשומות נפרדות.")
     if conflict_count:
         limitations.append(f"ב-{conflict_count} רשומות המחיר למ״ר שהופיע במסמך שונה מהמחושב; החישוב משתמש במחיר ובשטח.")
+    return "\n".join(lines), limitations
+
+
+OPERATION_LABELS = {
+    "count": "מספר העסקאות", "sum": "סכום", "mean": "ממוצע", "weighted_mean": "ממוצע משוקלל",
+    "median": "חציון", "min": "ערך מינימלי", "max": "ערך מקסימלי", "range": "טווח", "values": "ערכים",
+}
+UNIT_LABELS = {"sqm": "מ״ר", "ILS": "₪", "ILS/sqm": "₪ למ״ר", "room": "חדרים", "m": "מ׳", "m3": "מ״ק",
+               "percent": "%", "month": "חודשים"}
+VALUES_SHOWN = 5
+
+
+def number(value: Decimal | int | None) -> str:
+    """Thousands separators, at most two decimals, no trailing zeros (3.5 rather than 3.50)."""
+    if value is None:
+        return "—"
+    q = Decimal(value).quantize(Decimal("0.01"))
+    if q == q.to_integral_value():
+        return f"{q:,.0f}"
+    return f"{q:,.2f}".rstrip("0")
+
+
+def _with_unit(value: str, unit: str | None) -> str:
+    label = UNIT_LABELS.get(unit or "", "")
+    return f"{value} {label}" if label else value
+
+
+def structured_text(c: QueryConditions, label: str, operation: str, r: RecordResult, canonical_unit: str | None,
+                    uncertain: int = 0) -> tuple[str, list[str]]:
+    """A structured attribute (area, rooms, price, ...) computed over unique verified records."""
+    kind = DATA_KIND_LABELS[c.data_kind] if c.data_kind else "כל סוגי הנתונים"
+    noun = "עסקאות ייחודיות" if c.data_kind == "transaction_price" else "רשומות ייחודיות"
+    cond = _conditions_sentence(c)
+    lines = [f"מתוך הרשומות המאומתות שנקלטו במאגר המשרד ({kind}): נמצאו {r.count} {noun} עם ערך {label}"
+             f"{' — ' + cond if cond else ''}."]
+    if operation == "count":
+        lines.append(f"{OPERATION_LABELS['count']} שבהן מופיע {label}: {r.count}.")
+    elif operation == "range":
+        lines.append(f"טווח {label}: {_with_unit(f'{number(r.minimum)}–{number(r.maximum)}', canonical_unit)}"
+                     f" (הפרש {_with_unit(number(r.value), canonical_unit)}).")
+    elif operation != "values":
+        lines.append(f"{OPERATION_LABELS[operation]} {label}: {_with_unit(number(r.value), canonical_unit)}.")
+    if r.values and (r.count <= VALUES_SHOWN or operation == "values"):
+        shown = ", ".join(number(v) for v in r.values)
+        lines.append(f"הערכים: {_with_unit(shown, canonical_unit)}.")
+    limitations = ["הנתון מבוסס רק על רשומות מאגר המשרד שאושרו, ואינו אומדן של כלל השוק."]
+    if uncertain:
+        limitations.append(f"{uncertain} זוגות רשומות חשודים ככפילות שלא אושרה; הם נספרו כרשומות נפרדות.")
     return "\n".join(lines), limitations
 
 

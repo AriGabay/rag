@@ -7,8 +7,23 @@ import { B, Dialog, ErrorAlert, Notice, StatusBadge } from "@/components/ui";
 import { UploadPanel, UploadResults } from "@/components/UploadPanel";
 import { api, errorMessage, fileUrl } from "@/lib/api";
 import { useApi, useInterval } from "@/lib/useApi";
-import { formatTimestamp, VERSION_STATUS_LABEL } from "@/lib/format";
-import type { DocumentDetail, DocumentSummary, SearchResult, UploadResult, Version } from "@/lib/types";
+import {
+  BLOCK_KIND_LABEL,
+  formatTimestamp,
+  KEPT_PREVIOUS_TITLE,
+  keptPreviousText,
+  type KeptPrevious,
+  VERSION_STATUS_LABEL,
+} from "@/lib/format";
+import type {
+  DocumentDetail,
+  DocumentSummary,
+  PageCoverage,
+  RegionStatus,
+  SearchResult,
+  UploadResult,
+  Version,
+} from "@/lib/types";
 
 const POLL_MS = 3000;
 
@@ -37,6 +52,176 @@ function incompletePages(v: Version): React.ReactNode {
   );
 }
 
+const MEASURE_STATE: Record<string, string> = {
+  done: "חולצו",
+  partial: "חולצו חלקית",
+  failed: "החילוץ נכשל",
+  pending: "בתהליך",
+};
+
+const REGION_STATUS: Record<RegionStatus, string> = {
+  unread: "לא נקרא",
+  read_uncertain: "נקרא בקריאה לא ודאית",
+};
+
+/** One page's line in the reading details: its unread or uncertain regions with their reasons, a page that was not
+ * read, and text that was corrected. */
+function PageCoverageItem({ p }: { p: PageCoverage }) {
+  return (
+    <li>
+      <strong>{p.page != null ? <>עמוד <B>{p.page}</B></> : "במסמך (ללא עמודים)"}</strong>
+      {!p.ok && <span> · העמוד לא נקרא</span>}
+      {p.corrected > 0 && (
+        <span>
+          {" "}
+          · טקסט תוקן (<B>{p.corrected}</B>)
+        </span>
+      )}
+      {p.regions.length > 0 && (
+        <ul>
+          {p.regions.map((g, i) => (
+            <li key={g.block ?? `r${i}`}>
+              {BLOCK_KIND_LABEL[g.kind] ?? g.kind} – {REGION_STATUS[g.status] ?? g.status}
+              {g.section && (
+                <span className="muted">
+                  {" "}
+                  (סעיף <bdi>{g.section}</bdi>)
+                </span>
+              )}
+              : <bdi>{g.reason || "לא נרשמה סיבה"}</bdi>
+            </li>
+          ))}
+        </ul>
+      )}
+      {p.more ? (
+        <div className="muted">
+          ועוד <B>{p.more}</B> אזורים בעמוד זה
+        </div>
+      ) : null}
+    </li>
+  );
+}
+
+/** The reading per page, opened on demand with a button (keyboard-operable, its state announced). */
+function ReadingDetails({ coverage }: { coverage: PageCoverage[] }) {
+  const [open, setOpen] = useState(false);
+  const listId = useId();
+  if (coverage.length === 0) return null;
+  return (
+    <div>
+      <button
+        type="button"
+        className="btn-link"
+        aria-expanded={open}
+        aria-controls={listId}
+        onClick={() => setOpen((o) => !o)}
+      >
+        פירוט לפי עמוד
+      </button>
+      <ul id={listId} className="coverage-list" aria-label="פירוט הקריאה לפי עמוד" hidden={!open}>
+        {coverage.map((p) => (
+          <PageCoverageItem key={p.page ?? "document"} p={p} />
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** Why the last reprocess of a version kept its current reading (KTD9): the document stays available, nothing waits
+ * for an admin. Read from the version's reading report when the server includes it. */
+function keptPrevious(v: Version): KeptPrevious | null {
+  const r = v.reading as (Version["reading"] & { kept_previous?: KeptPrevious | null }) | undefined;
+  return r?.kept_previous ?? null;
+}
+
+function KeptPreviousNote({ v }: { v: Version }) {
+  const kept = keptPrevious(v);
+  if (!kept) return null;
+  return (
+    <div className="small" role="note" style={{ color: "var(--warn)" }}>
+      <span aria-hidden="true">↺ </span>
+      {KEPT_PREVIOUS_TITLE}: <bdi>{keptPreviousText(kept)}</bdi>
+      {kept.at && (
+        <span className="muted">
+          {" "}
+          (<bdi>{formatTimestamp(kept.at)}</bdi>)
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** What was read: searchable passages and tables, pictures by status, measurements and structured records — each
+ * counted on its own, so zero structured records never reads as "nothing searchable". A partly read version lists,
+ * per page, what was not read and why. */
+function ReadingCell({ v }: { v: Version | null }) {
+  const r = v?.reading;
+  if (!v || !r || v.status === "pending" || v.status === "processing") return <span className="muted">—</span>;
+  const img = r.images;
+  const details = [
+    `${img.read ?? 0} נקראו`,
+    img.read_uncertain ? `${img.read_uncertain} בקריאה לא ודאית` : null,
+    img.unread ? `${img.unread} לא נקראו` : null,
+    img.no_text ? `${img.no_text} ללא טקסט (תצלומים, תשריטים)` : null,
+  ].filter(Boolean);
+  const corrected = r.corrected_blocks ?? 0;
+  return (
+    <div className="small">
+      <div className="row" style={{ gap: 4 }}>
+        {r.partial ? (
+          <span className="badge badge-warn">נקרא חלקית</span>
+        ) : (
+          <span className="badge badge-ok">נקרא במלואו</span>
+        )}
+        {corrected > 0 && (
+          <span className="badge badge-info">
+            טקסט תוקן (<B>{corrected}</B>)
+          </span>
+        )}
+      </div>
+      <div>
+        <B>{r.passages}</B> קטעים · <B>{r.tables}</B> טבלאות
+      </div>
+      {r.images_total > 0 && (
+        <div className="muted">
+          תמונות ({r.images_total}): {details.join(", ")}
+        </div>
+      )}
+      {(r.uncertain_blocks ?? 0) > 0 && (
+        <div className="muted">
+          <B>{r.uncertain_blocks}</B> קטעי טקסט בקריאה לא ודאית (מיפוי גופן פגום)
+        </div>
+      )}
+      {(r.repeated_images ?? 0) > 0 && (
+        <div className="muted">
+          <B>{r.repeated_images}</B> תמונות חוזרות (לוגו, חותמת) נקראו פעם אחת
+        </div>
+      )}
+      <ReadingDetails coverage={r.coverage ?? []} />
+    </div>
+  );
+}
+
+function DataCell({ v }: { v: Version | null }) {
+  const r = v?.reading;
+  if (!v || !r) return <span className="muted">—</span>;
+  return (
+    <div className="small">
+      <div>
+        נתונים כמותיים: <B>{r.measurements}</B>
+        {r.measurements_state && r.measurements_state !== "done" && (
+          <span className="muted"> ({MEASURE_STATE[r.measurements_state] ?? r.measurements_state})</span>
+        )}
+        {!r.measurements_state && <span className="muted"> (טרם חולצו)</span>}
+      </div>
+      <div className="muted">
+        רשומות עסקאות: <B>{v.records_total ?? 0}</B>
+        {v.records_needing_review ? ` (${v.records_needing_review} לבדיקה)` : ""}
+      </div>
+    </div>
+  );
+}
+
 function StatusCell({ v }: { v: Version | null }) {
   if (!v) return <span className="muted">—</span>;
   return (
@@ -47,6 +232,7 @@ function StatusCell({ v }: { v: Version | null }) {
           {v.status_reason}
         </div>
       )}
+      <KeptPreviousNote v={v} />
     </div>
   );
 }
@@ -139,8 +325,8 @@ function DocumentPanel({
                   <th scope="col">קובץ</th>
                   <th scope="col">סטטוס</th>
                   <th scope="col">עמודים</th>
-                  <th scope="col">רשומות</th>
-                  <th scope="col">לבדיקה</th>
+                  <th scope="col">קריאה</th>
+                  <th scope="col">נתונים</th>
                   <th scope="col">הועלה</th>
                   <th scope="col">עובד</th>
                 </tr>
@@ -161,14 +347,14 @@ function DocumentPanel({
                       <StatusCell v={v} />
                     </td>
                     <td>
-                      <B>{v.page_count ?? "—"}</B>
+                      {v.page_count != null ? <B>{v.page_count}</B> : <span className="small muted">DOCX (ללא עמודים)</span>}
                       {incompletePages(v)}
                     </td>
                     <td>
-                      <B>{v.records_total ?? "—"}</B>
+                      <ReadingCell v={v} />
                     </td>
                     <td>
-                      <B>{v.records_needing_review ?? "—"}</B>
+                      <DataCell v={v} />
                     </td>
                     <td>
                       <B>{formatTimestamp(v.created_at)}</B>
@@ -291,9 +477,8 @@ function DocumentsTab({
                 <th scope="col">קבוצה</th>
                 <th scope="col">סטטוס</th>
                 <th scope="col">גרסה</th>
-                <th scope="col">עמודים</th>
-                <th scope="col">רשומות</th>
-                <th scope="col">לבדיקה</th>
+                <th scope="col">קריאה</th>
+                <th scope="col">נתונים</th>
                 <th scope="col">נוצר</th>
               </tr>
             </thead>
@@ -322,13 +507,10 @@ function DocumentsTab({
                       )}
                     </td>
                     <td>
-                      <B>{v?.page_count ?? "—"}</B>
+                      <ReadingCell v={v} />
                     </td>
                     <td>
-                      <B>{v?.records_total ?? "—"}</B>
-                    </td>
-                    <td>
-                      <B>{v?.records_needing_review ?? "—"}</B>
+                      <DataCell v={v} />
                     </td>
                     <td>
                       <B>{formatTimestamp(d.created_at)}</B>

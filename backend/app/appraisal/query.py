@@ -91,6 +91,75 @@ def compute_stats(conn: Connection, c: QueryConditions) -> Stats:
     return Stats(row.n, row.mean, row.weighted, row.median, row.mn, row.mx, list(row.ids or []))
 
 
+# Structured attribute columns (KTD7): the only SQL fragments compute_records may interpolate. Keys
+# mirror the attribute_definitions.structured_column CHECK in migration 0004.
+STRUCTURED_COLUMNS = {
+    "transactions.price_per_sqm": "t.price_per_sqm",
+    "transactions.price": "t.price",
+    "transactions.area": "t.area",
+    "occurrences.rooms": "o.rooms",
+}
+OPERATIONS = ("count", "sum", "mean", "weighted_mean", "median", "min", "max", "range", "values")
+
+
+class UnsupportedColumn(ValueError):
+    """A plan named a column outside the structured whitelist."""
+
+
+@dataclass
+class RecordResult:
+    column: str
+    operation: str
+    count: int
+    value: Decimal | int | None = None  # the requested figure; for range, maximum - minimum
+    minimum: Decimal | None = None
+    maximum: Decimal | None = None
+    values: list[Decimal] = field(default_factory=list)  # ascending, one per unique transaction
+    transaction_ids: list[UUID] = field(default_factory=list)
+
+
+def compute_records(conn: Connection, c: QueryConditions, column: str, operation: str) -> RecordResult:
+    """One operation over a whitelisted structured column, one value per matching unique verified transaction.
+
+    price_per_sqm keeps compute_stats' eligibility (a price and a positive area) and rounding, so its
+    figures equal the existing answers. rooms lives on occurrences: each transaction takes the value of
+    its most recent matching occurrence. weighted_mean (sum of prices over sum of areas) is defined
+    only for price_per_sqm."""
+    if column not in STRUCTURED_COLUMNS:
+        raise UnsupportedColumn(f"{column!r} is not a structured attribute column")
+    if operation not in OPERATIONS:
+        raise ValueError(f"unknown operation {operation!r}")
+    if operation == "weighted_mean" and column != "transactions.price_per_sqm":
+        raise ValueError("weighted_mean is defined only for transactions.price_per_sqm")
+    col = STRUCTURED_COLUMNS[column]
+    where, params = _filters(c, VERIFIED)
+    if column == "occurrences.rooms":
+        eligible = (f"SELECT DISTINCT ON (t.id) t.id, {col} AS v{_BASE} WHERE {where} AND {col} IS NOT NULL"
+                    " ORDER BY t.id, o.created_at DESC, o.id")
+    else:
+        extra = " AND t.price IS NOT NULL AND t.area > 0" if column == "transactions.price_per_sqm" else ""
+        eligible = f"SELECT DISTINCT t.id, {col} AS v, t.price, t.area{_BASE} WHERE {where} AND {col} IS NOT NULL{extra}"
+    weighted = ("round(sum(price) / NULLIF(sum(area), 0), 2)" if column == "transactions.price_per_sqm"
+                else "CAST(NULL AS numeric)")
+    row = conn.execute(
+        text(
+            f"WITH eligible AS ({eligible})"
+            " SELECT count(*) AS n, sum(v) AS total, round(avg(v), 2) AS mean, "
+            f"{weighted} AS weighted,"
+            " round(CAST(percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS numeric), 2) AS median,"
+            " min(v) AS mn, max(v) AS mx, array_agg(v ORDER BY v, id) AS vals, array_agg(id ORDER BY v, id) AS ids"
+            " FROM eligible"
+        ),
+        params,
+    ).one()
+    picked = {
+        "count": row.n, "sum": row.total, "mean": row.mean, "weighted_mean": row.weighted, "median": row.median,
+        "min": row.mn, "max": row.mx, "values": None,
+        "range": None if row.mn is None else row.mx - row.mn,
+    }[operation]
+    return RecordResult(column, operation, row.n, picked, row.mn, row.mx, list(row.vals or []), list(row.ids or []))
+
+
 def distinct_values(conn: Connection, c: QueryConditions, column: str) -> list[tuple[str, int]]:
     """Distinct values of a result-changing attribute among matching verified records."""
     allowed = {"area_type": "t.area_type", "property_type": "o.property_type", "vat_basis": "o.vat_basis"}

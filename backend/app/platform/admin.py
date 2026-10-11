@@ -1,4 +1,4 @@
-"""Office administration: users, groups, cloud-provider setting, coverage (U12, R31, R34)."""
+"""Office administration: users, groups, cloud-provider setting and status, coverage (U12, U2, R8, R31, R34)."""
 
 from __future__ import annotations
 
@@ -9,12 +9,19 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 from sqlalchemy.exc import IntegrityError
 
-from app.answering.content import effective_provider
+from app.answering.content import log_usage
 from app.audit import audit
-from app.config import get_settings
 from app.db import TenantContext, bump_data_version, tenant_tx
 from app.deps import NOT_FOUND, parse_uuid, require_admin
 from app.platform.documents import latest_status_counts
+from app.providers.status import (
+    RETENTION_NOTES,
+    office_provider_state,
+    purpose_models,
+    record_test,
+    run_connection_test,
+    selected_provider_and_model,
+)
 from app.security import hash_password
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -140,11 +147,20 @@ def create_group(body: NewGroup, ctx: TenantContext = Depends(require_admin)) ->
 
 
 def _settings_json(conn: Connection) -> dict:
-    row = conn.execute(text("SELECT * FROM office_settings")).one()
-    s = get_settings()
-    return {"cloud_llm_enabled": row.cloud_llm_enabled, "provider_name": "Anthropic (Claude)", "model": s.anthropic_model,
-            "effective_provider": effective_provider(conn),
-            "acknowledged_at": row.acknowledged_at.isoformat() if row.acknowledged_at else None}
+    """Provider, model, key presence (never the key or any part of it), last test and derived mode (KTD5)."""
+    row = conn.execute(text("SELECT cloud_llm_enabled, acknowledged_at FROM office_settings")).one()
+    state = office_provider_state(conn)
+    last = state.last_test
+    return {
+        "cloud_llm_enabled": row.cloud_llm_enabled, "provider": state.provider, "provider_name": state.provider_name,
+        "model": state.model, "purposes": purpose_models(), "key_present": state.key_present,
+        "mode": state.mode.value,
+        "mode_status": state.status, "untested": state.untested,
+        "last_test": {"provider": last.provider, "model": last.model, "ok": last.ok, "status": last.status,
+                      "tested_at": last.tested_at.isoformat() if last.tested_at else None} if last else None,
+        "retention_note": RETENTION_NOTES.get(state.provider),
+        "acknowledged_at": row.acknowledged_at.isoformat() if row.acknowledged_at else None,
+    }
 
 
 @router.get("/settings")
@@ -157,15 +173,36 @@ def get_office_settings(ctx: TenantContext = Depends(require_admin)) -> dict:
 def put_office_settings(body: SettingsBody, ctx: TenantContext = Depends(require_admin)) -> dict:
     if body.cloud_llm_enabled and not body.acknowledge:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, MSG_ACK)
+    provider, _ = selected_provider_and_model()
     with tenant_tx(ctx) as conn:
         conn.execute(
             text("UPDATE office_settings SET cloud_llm_enabled = :e, cloud_provider = :p,"
                  " acknowledged_by = CASE WHEN :e THEN :u ELSE acknowledged_by END,"
                  " acknowledged_at = CASE WHEN :e THEN now() ELSE acknowledged_at END,"
                  " settings_version = settings_version + 1"),
-            {"e": body.cloud_llm_enabled, "p": "anthropic" if body.cloud_llm_enabled else None, "u": ctx.user_id},
+            {"e": body.cloud_llm_enabled, "p": provider if body.cloud_llm_enabled else None, "u": ctx.user_id},
         )
-        audit(conn, "provider_setting", ctx.user_id, "office_settings", ctx.office_id, enabled=body.cloud_llm_enabled)
+        audit(conn, "provider_setting", ctx.user_id, "office_settings", ctx.office_id, enabled=body.cloud_llm_enabled,
+              provider=provider)
+        return _settings_json(conn)
+
+
+@router.post("/provider/test")
+def test_provider(ctx: TenantContext = Depends(require_admin)) -> dict:
+    """Connection test (KTD5): a synthetic prompt with no office content, so it runs even while cloud use is off.
+    The call runs outside any transaction; a result that changes the mode bumps ``settings_version`` so no
+    answer cached under the previous mode is served."""
+    with tenant_tx(ctx) as conn:
+        before = office_provider_state(conn).mode
+    outcome = run_connection_test()
+    with tenant_tx(ctx) as conn:
+        record_test(conn, outcome)
+        if outcome.client is not None:
+            log_usage(conn, outcome.client, "test", outcome.result, outcome.ok)
+        if office_provider_state(conn).mode != before:
+            conn.execute(text("UPDATE office_settings SET settings_version = settings_version + 1"))
+        audit(conn, "provider_test", ctx.user_id, "office_settings", ctx.office_id, provider=outcome.provider,
+              model=outcome.model, status=outcome.status)
         return _settings_json(conn)
 
 
@@ -185,3 +222,127 @@ def coverage_summary(ctx: TenantContext = Depends(require_admin)) -> dict:
             "records": {"total": rec.total, "verified": rec.verified, "awaiting_verification": rec.awaiting,
                         "needs_review": rec.review},
             "open_dedup_candidates": open_dedup, "review_queue_count": rec.awaiting + rec.review + open_dedup}
+
+
+# --- reprocessing ------------------------------------------------------------------------------------------
+
+class ReprocessBody(BaseModel):
+    all: bool = False  # False: only versions read by an older reader / not yet measured
+    # reprocess only, optional: read again the versions whose last reading was held back as worse than the current
+    # one (``ingestion.reprocess_regression``), accepting that regression (KTD7). Those versions never wait for it:
+    # they keep their current reading and stay available (KTD9)
+    accept_regression: bool = False
+
+
+@router.post("/reprocess")
+def reprocess(body: ReprocessBody, ctx: TenantContext = Depends(require_admin)) -> dict:
+    """Queue a fresh reading of the office's current documents (blocks, pictures, chunks, embeddings; records and
+    reviewed decisions kept). Without ``all``, only versions read by an older reader; a version whose new reading
+    was held back as worse than its current one keeps its current reading (reading it again would read the same):
+    ``accept_regression``, an optional admin override, reads exactly those again and lets the new reading replace
+    the current one despite the recorded regression. A ``kept_previous`` job is re-queued for it."""
+    from app.platform.jobs import enqueue_reindex
+    from app.platform.pipeline import INGESTION_VERSION, PDF_INGESTION_VERSION, ingestion_version
+
+    with tenant_tx(ctx) as conn:
+        rows = conn.execute(text(
+            "SELECT v.id, v.mime_type, v.ingestion->>'ingestion_version' AS iv,"
+            " (v.ingestion ? 'reprocess_regression') AS held FROM document_versions v JOIN"
+            " documents d ON d.id = v.document_id AND d.deleted_at IS NULL WHERE v.is_current AND v.status IN"
+            " ('ready', 'needs_review')")).all()
+        if body.accept_regression:
+            wanted = [r for r in rows if r.held]
+        else:
+            wanted = [r for r in rows if body.all or (r.iv != ingestion_version(r.mime_type) and not r.held)]
+        queued = [str(r.id) for r in wanted
+                  if enqueue_reindex(conn, r.id, ingestion_version(r.mime_type), body.accept_regression)]
+        audit(conn, "reprocess", ctx.user_id, "office", ctx.office_id, accept_regression=body.accept_regression)
+    return {"queued": len(queued), "versions": queued, "ingestion_version": INGESTION_VERSION,
+            "ingestion_versions": {"docx": INGESTION_VERSION, "pdf": PDF_INGESTION_VERSION},
+            "held": sum(1 for r in rows if r.held)}
+
+
+@router.post("/measurements")
+def extract_measurements(body: ReprocessBody, ctx: TenantContext = Depends(require_admin)) -> dict:
+    """Queue measurement extraction for current versions without a completed run of the current extraction
+    version (or all of them). Requires the office's cloud mode; the jobs are skipped otherwise."""
+    from app.measurements.extract import EXTRACTION_VERSION
+    from app.platform.jobs import enqueue_measurements
+
+    with tenant_tx(ctx) as conn:
+        rows = conn.execute(text(
+            "SELECT v.id, r.state FROM document_versions v JOIN documents d ON d.id = v.document_id AND d.deleted_at"
+            " IS NULL LEFT JOIN measurement_runs r ON r.version_id = v.id AND r.extraction_version = :e"
+            " WHERE v.is_current AND v.status IN ('ready', 'needs_review')"), {"e": EXTRACTION_VERSION}).all()
+        queued = [str(r.id) for r in rows if (body.all or r.state != "done")
+                  and enqueue_measurements(conn, r.id, EXTRACTION_VERSION)]
+    return {"queued": len(queued), "extraction_version": EXTRACTION_VERSION}
+
+
+@router.post("/positions")
+def backfill_positions(ctx: TenantContext = Depends(require_admin)) -> dict:
+    """Queue the geometry-only backfill (KTD3) for the office's current PDF versions read before positions existed:
+    their pages, words and table cells gain positions from the stored file, their reading (and every citation of it)
+    stays. It runs after ingestion; versions already queued are left alone."""
+    from app.extraction.geometry import POSITIONS_VERSION
+    from app.platform.jobs import enqueue_missing_positions
+
+    with tenant_tx(ctx) as conn:
+        queued = [str(v) for v in enqueue_missing_positions(conn)]
+        audit(conn, "positions_backfill", ctx.user_id, "office", ctx.office_id, queued=len(queued))
+    return {"queued": len(queued), "versions": queued, "positions_version": POSITIONS_VERSION}
+
+
+def _positions_progress(conn: Connection) -> dict:
+    """How far the geometry backfill is (KTD3): the office's current PDF versions, how many store positions, and over
+    the backfilled ones the blocks and tables that aligned, did not align, or sit on pages that cannot be converted."""
+    from app.extraction.default import PDF_MIME
+    from app.extraction.geometry import POSITIONS_VERSION
+
+    def total(kind: str, state: str) -> str:
+        return (f"COALESCE(sum((v.ingestion->'positions_backfill'->'{kind}'->>'{state}')::int), 0)"
+                f" AS {kind}_{state}")
+
+    states = ("aligned", "unaligned", "no_positions")
+    r = conn.execute(text(
+        "SELECT count(*) AS total, count(*) FILTER (WHERE v.ingestion->>'positions' = :pv) AS positioned,"
+        " count(*) FILTER (WHERE v.ingestion ? 'positions_backfill') AS backfilled, "
+        + ", ".join(total(k, s) for k in ("blocks", "tables") for s in states)
+        + " FROM document_versions v JOIN documents d ON d.id = v.document_id AND d.deleted_at IS NULL"
+        " WHERE v.is_current AND v.status IN ('ready', 'needs_review') AND v.mime_type = :pdf"),
+        {"pv": POSITIONS_VERSION, "pdf": PDF_MIME}).one()
+    return {"pdf_versions": r.total, "with_positions": r.positioned, "without_positions": r.total - r.positioned,
+            "backfilled": r.backfilled,
+            "blocks": {s: getattr(r, f"blocks_{s}") for s in states},
+            "tables": {s: getattr(r, f"tables_{s}") for s in states}}
+
+
+@router.get("/jobs")
+def jobs_summary(ctx: TenantContext = Depends(require_admin)) -> dict:
+    from app.platform.pipeline import regression_summary
+
+    with tenant_tx(ctx) as conn:
+        positions = _positions_progress(conn)
+        rows = conn.execute(text(
+            "SELECT kind, COALESCE(payload->>'mode', '') AS mode, status, count(*) AS n FROM jobs"
+            " GROUP BY 1, 2, 3 ORDER BY 1, 2, 3")).all()
+        held = conn.execute(text(
+            "SELECT v.id, d.title, v.ingestion->'reprocess_regression' AS r FROM document_versions v JOIN documents d"
+            " ON d.id = v.document_id AND d.deleted_at IS NULL WHERE v.is_current AND v.ingestion ?"
+            " 'reprocess_regression' ORDER BY d.title")).all()
+        kept = conn.execute(text(
+            "SELECT v.id, d.title, v.ingestion->'reprocess_kept' AS k, (v.ingestion ? 'reprocess_regression') AS held"
+            " FROM document_versions v JOIN documents d ON d.id = v.document_id AND d.deleted_at IS NULL"
+            " WHERE v.is_current AND v.ingestion ? 'reprocess_kept' ORDER BY d.title")).all()
+    # new readings held back as worse than the current one: the current reading stays and the document is available;
+    # an admin may still apply the new one (KTD7, KTD9)
+    return {"jobs": [{"kind": r.kind + (f":{r.mode}" if r.mode else ""), "status": r.status, "count": r.n}
+                     for r in rows],
+            "regressions": [{"version_id": str(r.id), "title": r.title, "summary": regression_summary(r.r),
+                             "regression": r.r} for r in held],
+            # every version whose last reprocess kept its current reading, with why (KTD9); ``can_accept`` when the
+            # kept reading was a regression an admin may apply
+            "kept_previous": [{"version_id": str(r.id), "title": r.title, "reason": (r.k or {}).get("reason"),
+                               "attempts": (r.k or {}).get("attempts"), "at": (r.k or {}).get("at"),
+                               "can_accept": bool(r.held)} for r in kept],
+            "positions": positions}

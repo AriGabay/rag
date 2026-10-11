@@ -90,3 +90,668 @@ def test_search_endpoint(client, setup):
     login(client, "a@example.test")
     r = client.get("/api/search", params={"q": "קרבה לפארק"}).json()
     assert r["results"] and "לפארק" in r["results"][0]["snippet"]
+
+
+# --- U5: search generalization ------------------------------------------------------------------
+
+def _search(ctx, queries, limit=8, **kw):
+    from app.platform.search import search_evidence
+
+    with tenant_tx(ctx) as conn:
+        return search_evidence(conn, queries, limit, **kw)
+
+
+def _add_occurrence(office, doc, ver, *, city=None, neighborhood=None, valuation_date=None, header=True,
+                    data_kind="appraised_value", record_index=0):
+    """One occurrence with its city/neighborhood facts; ``header`` marks them as report-header facts."""
+    import json
+
+    with tenant_tx(office.system) as conn:
+        txn = conn.execute(text("INSERT INTO transactions (office_id, data_kind) VALUES (app_office(), :k)"
+                                " RETURNING id"), {"k": data_kind}).scalar_one()
+        occ = conn.execute(
+            text("INSERT INTO occurrences (office_id, transaction_id, document_id, version_id, record_index,"
+                 " extraction_version, data_kind, city, neighborhood, valuation_date)"
+                 " VALUES (app_office(), :t, :d, :v, :i, 'rules-v1', :k, :c, :n, :vd) RETURNING id"),
+            {"t": txn, "d": doc, "v": ver, "i": record_index, "k": data_kind, "c": city, "n": neighborhood,
+             "vd": valuation_date},
+        ).scalar_one()
+        for field, value in (("city", city), ("neighborhood", neighborhood)):
+            if value is None:
+                continue
+            source = {"page": 1, "label": "עיר" if field == "city" else "שכונה"} if header else {"page": 1, "col": 0}
+            conn.execute(
+                text("INSERT INTO fact_values (office_id, document_id, occurrence_id, field, original_text,"
+                     " normalized_value, source_path, extraction_version)"
+                     " VALUES (app_office(), :d, :o, :f, :v, :v, CAST(:sp AS jsonb), 'rules-v1')"),
+                {"d": doc, "o": occ, "f": field, "v": value, "sp": json.dumps(source, ensure_ascii=False)},
+            )
+
+
+def _add_version(office, doc, texts, version_no=2):
+    """A new current version of ``doc``; the previous one becomes superseded."""
+    with tenant_tx(office.ctx()) as conn:
+        conn.execute(text("UPDATE document_versions SET is_current = false, status = 'superseded'"
+                          " WHERE document_id = :d"), {"d": doc})
+        ver = conn.execute(
+            text("INSERT INTO document_versions (office_id, document_id, version_no, sha256, filename, mime_type,"
+                 " size_bytes, storage_key, status, is_current) VALUES (app_office(), :d, :n, :s, 'f.pdf',"
+                 " 'application/pdf', 10, 'k', 'ready', true) RETURNING id"),
+            {"d": doc, "n": version_no, "s": str(version_no) * 64},
+        ).scalar_one()
+    info = pipeline.VersionInfo(ver, doc, "k", "application/pdf", None)
+    result = ExtractionResult(1, [PageResult(1, "\n".join(texts), "text_layer", 1.0, True)], [],
+                              [ChunkResult(i, "text", [1], None, t) for i, t in enumerate(texts)])
+    with tenant_tx(office.system) as conn:
+        pipeline.persist_extraction(conn, info, result)
+    pipeline.embed_stage(office.system, info, 1e18)
+    return ver
+
+
+@pytest.fixture
+def office(db):
+    a = make_office(db, "משרד ג", "c@example.test")
+    hidden = make_group(a, "נסתר")
+    emp = make_user(a, "emp@example.test", [a.default_group_id])
+    return a, hidden, emp
+
+
+def test_plural_question_finds_singular_passage(office):
+    a, *_ = office
+    doc, _ = add_chunks(a, a.default_group_id, ["לדירה מרפסת שמש פתוחה לכיוון מערב."], "4" * 64)
+    hits = _search(a.ctx(), ["אילו מרפסות יש בדירות?"]).hits
+    assert hits and hits[0]["document_id"] == doc and hits[0]["lexical_support"]
+
+
+def test_construct_plural_question_finds_definite_plural_passage(office):
+    # "שיקולי" (construct of "שיקולים") finds "השיקולים"; the passage shares no other word with the question.
+    a, *_ = office
+    doc, _ = add_chunks(a, a.default_group_id, ["השיקולים שנבחנו כללו את מצב התחזוקה של הבניין."], "7" * 64)
+    hits = _search(a.ctx(), ["מה היו שיקולי הוועדה?"]).hits
+    assert hits and hits[0]["document_id"] == doc and hits[0]["lexical_support"]
+
+
+def test_shared_place_name_alone_is_not_evidence(office):
+    a, *_ = office
+    place_doc, _ = add_chunks(a, a.default_group_id, ["הנכס ממוקם ברמת גן, ברחוב ביאליק."], "5" * 64)
+    topic_doc, _ = add_chunks(a, a.default_group_id, ["לדירה מרפסת שמש גדולה."], "6" * 64)
+    out = _search(a.ctx(), ["מה נכתב על מרפסות ברמת גן?"], place_terms=["רמת גן"])
+    support = {h["document_id"]: h["lexical_support"] for h in out.hits}
+    assert support[topic_doc] is True
+    assert support[place_doc] is False  # retrieved (shares the place), but not admitted as evidence
+    # The unchanged three-argument call uses the gazetteer for the same rule.
+    with tenant_tx(a.ctx()) as conn:
+        legacy = {h["document_id"]: h["lexical_support"] for h in hybrid_search(conn, "מרפסות ברמת גן", 8)}
+    assert legacy[topic_doc] is True and legacy[place_doc] is False
+
+
+def test_table_row_renders_units_and_is_found_by_header_term(office):
+    from app.extraction.base import TableResult, TableRow
+    from app.extraction.chunking import chunk_document
+
+    a, *_ = office
+    doc, ver = make_document(a, a.default_group_id, "דוח טבלה", sha="7" * 64)
+    table = TableResult(0, ["כתובת", "שטח ממ״ד", "מחיר (₪)"], [None, "מ״ר", "₪"],
+                        [TableRow(1, ["הרצל 5", "12", "2,000,000"])], 1, 1)
+    chunks = chunk_document([(1, "3. עסקאות השוואה")], [table])
+    row = next(c for c in chunks if c.kind == "table_row")
+    assert "שטח ממ״ד (מ״ר): 12" in row.text and "מחיר (₪): 2,000,000" in row.text
+    assert "(₪) (₪)" not in row.text
+    info = pipeline.VersionInfo(ver, doc, "k", "application/pdf", None)
+    with tenant_tx(a.system) as conn:
+        pipeline.persist_extraction(conn, info, ExtractionResult(1, [PageResult(1, "x", "text_layer", 1.0, True)],
+                                                                 [table], chunks))
+    pipeline.embed_stage(a.system, info, 1e18)
+    hits = _search(a.ctx(), ["מה שטח הממ״ד?"]).hits
+    assert hits and hits[0]["kind"] == "table_row" and hits[0]["lexical_support"]
+    assert (hits[0]["table_index"], hits[0]["row_index"]) == (0, 0)
+
+
+def test_city_filter_excludes_other_city_and_reports_unknown(office):
+    from app.answering.metadata import MetadataFilters
+
+    a, *_ = office
+    rg, rg_v = add_chunks(a, a.default_group_id, ["מרפסת שמש בדירה ברחוב ביאליק."], "8" * 64)
+    hf, hf_v = add_chunks(a, a.default_group_id, ["מרפסת שמש בדירה ברחוב הנביאים."], "9" * 64)
+    unk, unk_v = add_chunks(a, a.default_group_id, ["מרפסת שמש בדירה ללא פרטי מיקום."], "a" * 64)
+    _add_occurrence(a, rg, rg_v, city="רמת גן")
+    _add_occurrence(a, hf, hf_v, city="חיפה")
+    out = _search(a.ctx(), ["מרפסת"], filters=MetadataFilters(city="רמת גן"))
+    assert {h["document_id"] for h in out.hits} == {rg}
+    report = out.filter_report
+    assert report.matched == [rg_v] and report.excluded == [hf_v]
+    assert report.unknown == {"city": [unk_v]}
+    assert unk not in {h["document_id"] for h in out.hits}
+
+
+def test_year_filter_uses_date_field_and_unknown_never_matches(office):
+    from datetime import date
+
+    from app.answering.metadata import MetadataFilters
+
+    a, *_ = office
+    new, new_v = add_chunks(a, a.default_group_id, ["מרפסת שמש בשומה חדשה."], "b" * 64)
+    old, old_v = add_chunks(a, a.default_group_id, ["מרפסת שמש בשומה ישנה."], "c" * 64)
+    nod, nod_v = add_chunks(a, a.default_group_id, ["מרפסת שמש בשומה ללא תאריך."], "d" * 64)
+    _add_occurrence(a, new, new_v, city="חיפה", valuation_date=date(2024, 3, 1))
+    _add_occurrence(a, old, old_v, city="חיפה", valuation_date=date(2019, 3, 1))
+    _add_occurrence(a, nod, nod_v, city="חיפה")
+    out = _search(a.ctx(), ["מרפסת"], filters=MetadataFilters(year_from=2023, year_to=2025))
+    assert {h["document_id"] for h in out.hits} == {new}
+    assert out.filter_report.unknown == {"valuation_date": [nod_v]}
+
+
+def test_include_noncurrent_only_for_explicit_visible_versions(office):
+    from app.platform.search import SearchScope
+
+    a, hidden, emp = office
+    doc, old_v = add_chunks(a, a.default_group_id, ["שיעור ההתאמה לגודל הוא 5%."], "e" * 64)
+    new_v = _add_version(a, doc, ["שיעור ההתאמה לגודל הוא 7%."])
+    current = _search(a.ctx(), ["שיעור ההתאמה לגודל"]).hits
+    assert current and {h["version_id"] for h in current} == {new_v}
+    # include_noncurrent without explicit ids changes nothing
+    assert {h["version_id"] for h in _search(a.ctx(), ["שיעור ההתאמה לגודל"],
+                                             scope=SearchScope(include_noncurrent=True)).hits} == {new_v}
+    both = _search(a.ctx(), ["שיעור ההתאמה לגודל"],
+                   scope=SearchScope(version_ids=(old_v, new_v), include_noncurrent=True)).hits
+    assert {h["version_id"] for h in both} == {old_v, new_v}
+    # explicit old id without include_noncurrent: old versions never appear
+    assert _search(a.ctx(), ["שיעור ההתאמה לגודל"], scope=SearchScope(version_ids=(old_v,))).hits == []
+    # visible to the employee through the default group
+    emp_ctx = TenantContext(a.office_id, emp, "employee")
+    assert {h["version_id"] for h in _search(emp_ctx, ["שיעור ההתאמה לגודל"], scope=SearchScope(
+        version_ids=(old_v,), include_noncurrent=True)).hits} == {old_v}
+
+
+def test_employee_never_sees_hidden_group_even_with_explicit_scope(office):
+    from app.platform.search import SearchScope
+
+    a, hidden, emp = office
+    secret, secret_v = add_chunks(a, hidden, ["סודי: מרפסת שמש בפרויקט מוגן."], "f" * 64)
+    secret_new = _add_version(a, secret, ["סודי: מרפסת שמש בפרויקט מוגן, גרסה 2."])
+    emp_ctx = TenantContext(a.office_id, emp, "employee")
+    for kw in ({}, {"scope": SearchScope(document_ids=(secret,))},
+               {"scope": SearchScope(version_ids=(secret_v, secret_new), include_noncurrent=True)}):
+        assert all(h["document_id"] != secret for h in _search(emp_ctx, ["מרפסת שמש בפרויקט מוגן"], **kw).hits)
+    assert any(h["document_id"] == secret for h in _search(a.ctx(), ["מרפסת שמש בפרויקט מוגן"]).hits)
+
+
+def test_multi_query_fusion_finds_what_any_variant_finds(office):
+    a, *_ = office
+    doc, _ = add_chunks(a, a.default_group_id, ["השמאי קבע הפחתה בשל היטל השבחה."], "1a" * 32)
+    hits = _search(a.ctx(), ["זריחה כחולה מעל הים", "היטל השבחה"]).hits
+    assert any(h["document_id"] == doc and h["lexical_support"] for h in hits)
+
+
+def _load_reindex():
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "reindex_text_for_tests", Path(__file__).resolve().parents[2] / "scripts" / "reindex_text.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_reindex_updates_table_rows_idempotently(office):
+    import json
+
+    a, *_ = office
+    doc, ver = make_document(a, a.default_group_id, "דוח ישן", sha="2b" * 32)
+    structure = {"headers": ["כתובת", "שטח ממ״ד"], "units": [None, "מ״ר"], "ocr": False, "section": None,
+                 "rows": [{"page": 1, "cells": ["הרצל 5", "12"]}, {"page": 1, "cells": ["", ""]},
+                          {"page": 2, "cells": ["ביאליק 3", "9"]}]}
+    old_rows = ["כתובת: הרצל 5 | שטח ממ״ד: 12", "כתובת: ביאליק 3 | שטח ממ״ד: 9"]
+    with tenant_tx(a.system) as conn:
+        conn.execute(text("INSERT INTO extracted_tables (office_id, document_id, version_id, table_index,"
+                          " page_start, page_end, structure) VALUES (app_office(), :d, :v, 0, 1, 2,"
+                          " CAST(:s AS jsonb))"), {"d": doc, "v": ver, "s": json.dumps(structure, ensure_ascii=False)})
+        # Pre-U5 rows: no units, no table/row index, and the old normalization (no inflection variants).
+        for i, t in enumerate(["3. עסקאות השוואה: מרפסות", *old_rows]):
+            conn.execute(text("INSERT INTO chunks (office_id, document_id, version_id, chunk_index, kind, page_list,"
+                              " text, normalized_text) VALUES (app_office(), :d, :v, :i, :k, :p, :t, :t)"),
+                         {"d": doc, "v": ver, "i": i, "k": "text" if i == 0 else "table_row", "p": [1], "t": t})
+    pipeline.embed_stage(a.system, pipeline.VersionInfo(ver, doc, "k", "application/pdf", None), 1e18)
+    reindex = _load_reindex()
+    first = reindex.reindex_office(a.system)
+    assert first["rows_rewritten"] == 2 and first["normalized"] == 3
+    with tenant_tx(a.system) as conn:
+        rows = conn.execute(text("SELECT text, normalized_text, table_index, row_index, embedding IS NOT NULL AS e"
+                                 " FROM chunks WHERE kind = 'table_row' ORDER BY chunk_index")).all()
+        head = conn.execute(text("SELECT normalized_text FROM chunks WHERE kind = 'text'")).scalar_one()
+    assert [r.text for r in rows] == ["כתובת: הרצל 5 | שטח ממ״ד (מ״ר): 12", "כתובת: ביאליק 3 | שטח ממ״ד (מ״ר): 9"]
+    assert [(r.table_index, r.row_index) for r in rows] == [(0, 0), (0, 2)]
+    assert all(r.e for r in rows) and "מרפסת" in head.split()
+    second = reindex.reindex_office(a.system)
+    assert second == {"rows_rewritten": 0, "normalized": 0, "reembedded": 0, "versions_skipped": 0}
+
+
+def test_records_less_report_takes_place_and_date_from_its_header(office):
+    """A narrative report with no records still has a city, neighborhood and valuation date for
+    filters, read from its own "label: value" header lines; the gazetteer learns those places too."""
+    from datetime import date
+
+    from app.answering.metadata import MetadataFilters, header_places
+
+    a, *_ = office
+    header = "עיר: רמת גן\nשכונה: הבורסה\nהמועד הקובע: 15/03/2024"
+    doc, ver = add_chunks(a, a.default_group_id, [header, "תיאור הנכס: דירה בבניין משותף."], "c" * 64)
+    other, other_v = add_chunks(a, a.default_group_id, ["עיר: חיפה", "תיאור הנכס: דירה בבניין משותף."], "d" * 64)
+    out = _search(a.ctx(), ["דירה בבניין"], filters=MetadataFilters(city="רמת גן"))
+    assert out.filter_report.matched == [ver] and out.filter_report.excluded == [other_v]
+    out = _search(a.ctx(), ["דירה בבניין"],
+                  filters=MetadataFilters(neighborhood="הבורסה", year_from=2024, year_to=2024))
+    assert out.filter_report.matched == [ver]
+    with tenant_tx(a.ctx()) as conn:
+        from app.answering.metadata import version_metadata
+
+        assert version_metadata(conn, [ver])[ver].dates["valuation_date"] == frozenset({date(2024, 3, 15)})
+        places = header_places(conn)
+    assert {(None, "רמת גן"), ("רמת גן", "הבורסה"), (None, "חיפה")} <= places
+
+
+# --- Retrieval round 2: small scopes keep every page, locate ranks documents ---------------------------
+
+def _doc(office, chunks, title="מסמך", group=None):
+    from tests.integration.test_entities import add_doc
+
+    return add_doc(office, group or office.default_group_id, chunks, title)
+
+
+def test_small_scope_keeps_the_best_passage_of_every_page(office):
+    """A narrow scope (the documents an address resolved to) returns each page's best supported passage,
+    even when the address words fill page 1 and global ranking would cut page 2."""
+    from app.platform.search import SearchScope
+
+    a, *_ = office
+    page1 = [(f"כתובת הנכס: הדקלים 7. סעיף {i}: הדירה ברחוב הדקלים 7 בקומה {i}.", [1]) for i in range(10)]
+    doc, _ = _doc(a, [*page1, ("סוג הקרקע לפי התכנית החלה: חקלאית.", [2])])
+    other, _ = _doc(a, [("סוג הקרקע: מגורים. הנכס ברחוב אחר.", [1])])
+    for i in range(12):  # the topic words are common in the office, the address words are rare
+        _doc(a, [(f"סוג הקרקע: מגורים {i}.", [1])])
+    out = _search(a.ctx(), ["מה סוג הקרקע ברחוב הדקלים 7?"], 4, scope=SearchScope(document_ids=(doc,)),
+                  place_terms=["רחוב הדקלים 7"])
+    assert all(h["document_id"] == doc for h in out.hits)
+    supported = [h for h in out.hits if h["lexical_support"]]
+    assert supported and supported[0]["page_list"] == [2] and "חקלאית" in supported[0]["text"]
+    assert other not in {h["document_id"] for h in out.hits}
+
+
+def test_small_scope_returns_each_documents_pages(office):
+    from app.platform.search import SearchScope
+
+    a, *_ = office
+    filler = [(f"הערה כללית {i} על הבניין ועל הסביבה.", [1]) for i in range(8)]
+    one, _ = _doc(a, [*filler, ("שיעור ההיוון שנקבע: 5%.", [2]), ("שיעור ההיוון אושר בוועדה.", [3])])
+    two, _ = _doc(a, [*filler, ("שיעור ההיוון שנקבע: 6%.", [2])])
+    hits = _search(a.ctx(), ["שיעור ההיוון"], 2, scope=SearchScope(document_ids=(one, two))).hits
+    pages = {(h["document_id"], h["page_list"][0]) for h in hits if h["lexical_support"]}
+    assert pages == {(one, 2), (one, 3), (two, 2)}
+
+
+def _locate(ctx, queries, **kw):
+    from app.platform.search import locate_documents
+
+    with tenant_tx(ctx) as conn:
+        return locate_documents(conn, queries, **kw)
+
+
+def test_locate_keeps_only_documents_with_full_topic_support(office):
+    a, *_ = office
+    exact, _ = _doc(a, [("רקע כללי.", [1]), ("ניתן אישור חריגה לתוספת הקומה.", [2])])
+    inflected, _ = _doc(a, [("האישור לחריגה התקבל בשנת 2019.", [1])])
+    approval_only, _ = _doc(a, [("אישור הוועדה המקומית לתוכנית.", [1])])
+    deviation_only, _ = _doc(a, [("קיימת חריגה מקו הבניין.", [1])])
+    far_apart, _ = _doc(a, [("אישור המשכנתא התקבל. בדירה נמצאה גם חריגה קלה בחלון.", [1])])
+    _doc(a, [("שומות קודמות בבניין.", [1])])
+    ranked = _locate(a.ctx(), ["באילו שומות מוזכר אישור חריגה?"])
+    assert {d.document_id for d in ranked} == {exact, inflected}
+    first = next(d for d in ranked if d.document_id == exact)
+    assert first.full_support and first.pages == [2]
+    assert first.passages and "אישור חריגה" in first.passages[0]["text"]
+    assert first.passages[0]["lexical_support"] and first.passages[0]["document_id"] == exact
+    assert {approval_only, deviation_only, far_apart}.isdisjoint({d.document_id for d in ranked})
+
+
+def test_locate_negation_question_finds_the_negated_passage(office):
+    a, *_ = office
+    none_word, _ = _doc(a, [("בבניין אין גינה משותפת.", [1])])
+    without, _ = _doc(a, [("דירה ללא גינה, בקומה שנייה.", [1])])
+    not_incl, _ = _doc(a, [("הבניין נבנה בשנת 1972 ואינו כולל גינה.", [1])])
+    has_it, _ = _doc(a, [("לבניין גינה מטופחת.", [1])])
+    other_sentence, _ = _doc(a, [("הגינה מטופחת ומוארת. אין חניה.", [1])])
+    for question in ("באילו שומות כתוב שאין גינה?", "איפה מצוין שאין גינה בכלל?"):
+        ranked = _locate(a.ctx(), [question])
+        assert {d.document_id for d in ranked} == {none_word, without, not_incl}, question
+        for d in ranked:
+            assert any(w in d.passages[0]["text"] for w in ("אין", "ללא", "אינו")), question
+    assert {has_it, other_sentence}.isdisjoint({d.document_id for d in _locate(a.ctx(), ["שאין גינה"])})
+
+
+def test_locate_partial_support_keeps_the_best_within_a_relative_threshold(office):
+    a, *_ = office
+    strong, _ = _doc(a, [("חוות הדעת מתייחסת לפיצול הדירה לשתי יחידות.", [1])])
+    weak, _ = _doc(a, [("הדירה בקומה שלישית.", [1])])
+    ranked = _locate(a.ctx(), ["איפה מוזכר פיצול של נכס מסחרי?"])
+    assert [d.document_id for d in ranked] == [strong]
+    assert not ranked[0].full_support and "פיצול" in ranked[0].matched_terms
+    assert weak not in {d.document_id for d in ranked}
+
+
+def test_locate_word_present_in_every_document_does_not_count(office):
+    a, *_ = office
+    docs = [_doc(a, [(f"הדירה בקומה {i}.", [1])])[0] for i in range(4)]
+    sukkah, _ = _doc(a, [("לדירה מרפסת סוכה פתוחה.", [1])])
+    ranked = _locate(a.ctx(), ["באילו דירות יש סוכה?"])
+    assert [d.document_id for d in ranked] == [sukkah]
+    assert set(docs).isdisjoint({d.document_id for d in ranked})
+
+
+def test_locate_table_question_prefers_a_table_row(office):
+    a, *_ = office
+    table, _ = _doc(a, [("נתוני היחידה", [1]), ("כתובת: הנרקיס 2 | שטח מרתף (מ״ר): 30", [1], "table_row")])
+    prose, _ = _doc(a, [("למרתף שטח של 30 מ״ר.", [1])])
+    ranked = _locate(a.ctx(), ["באיזו שומה יש טבלה עם עמודה של שטח מרתף?"])
+    assert [d.document_id for d in ranked] == [table]
+    assert ranked[0].passages[0]["kind"] == "table_row"
+    assert prose not in {d.document_id for d in ranked}
+
+
+def test_locate_respects_scope_and_groups(office):
+    from app.platform.search import SearchScope
+
+    a, hidden, emp = office
+    one, _ = _doc(a, [("הוגשה התנגדות לתוכנית.", [1])])
+    two, _ = _doc(a, [("הוגשה התנגדות נוספת.", [1])])
+    secret, _ = _doc(a, [("סודי: הוגשה התנגדות.", [1])], group=hidden)
+    assert {d.document_id for d in _locate(a.ctx(), ["התנגדות"])} == {one, two, secret}
+    assert [d.document_id for d in _locate(a.ctx(), ["התנגדות"], scope=SearchScope(document_ids=(two,)))] == [two]
+    emp_ctx = TenantContext(a.office_id, emp, "employee")
+    assert {d.document_id for d in _locate(emp_ctx, ["התנגדות"])} == {one, two}
+    assert _locate(a.ctx(), ["מילה שאינה קיימת בשום מקום"]) == []
+
+
+def test_locate_treats_query_variants_as_alternatives(office):
+    """Found with the real model: a rephrasing that added a word no document uses ("לא קיימת") pooled into
+    the question and pushed out documents another variant named exactly."""
+    from app.platform.search import locate_evidence
+
+    a, *_ = office
+    d1, _ = add_chunks(a, a.default_group_id, ["בבניין אין מעלית ויש מדרגות בלבד."], "e1" * 32)
+    d2, _ = add_chunks(a, a.default_group_id, ["הבניין ללא מעלית."], "e2" * 32)
+    add_chunks(a, a.default_group_id, ["בבניין מעלית חדשה."], "e3" * 32)
+    with tenant_tx(a.ctx()) as conn:
+        out = locate_evidence(conn, ["מעלית בבניין לא קיימת", "ללא מעלית", "אין מעלית בבניין"])
+    assert {d.document_id for d in out.documents} == {d1, d2}
+
+
+def _locate_out(ctx, queries, **kw):
+    from app.platform.search import locate_evidence
+
+    with tenant_tx(ctx) as conn:
+        return locate_evidence(conn, queries, **kw)
+
+
+def test_locate_keeps_every_fully_supported_document_despite_a_phrase_bonus(office):
+    """GQ50: the document whose words stood next to each other scored 1.25, two others that fully said "no
+    elevator" scored 1.0, and the relative threshold (0.9 x 1.25) dropped them."""
+    a, *_ = office
+    adjacent, _ = _doc(a, [("בדירה אין מעלית בבניין ישן.", [1])])
+    far, _ = _doc(a, [("הדירה בקומה השלישית בבניין בן ארבע קומות ללא מעלית.", [1])])
+    other_sentence, _ = _doc(a, [("הדירה בקומה שנייה. הבניין ישן, ללא מעלית.", [2])])
+    has_it, _ = _doc(a, [("לבניין יש מעלית ואין חניה.", [1])])
+    for queries in (["אין מעלית בבניין"], ["אין מעלית בבניין", "ללא מעלית בבניין"]):
+        out = _locate_out(a.ctx(), queries)
+        assert {d.document_id for d in out.documents} == {adjacent, far, other_sentence}, queries
+        assert all(d.full_support for d in out.documents) and out.documents[0].document_id == adjacent
+        assert out.absent_terms == []
+
+
+def test_locate_negation_must_govern_the_topic_term(office):
+    """Testing review P2: a negation of another term in the same sentence is not "no elevator"."""
+    a, *_ = office
+    no_parking, _ = _doc(a, [("לבניין יש מעלית ואין חניה.", [1])])
+    but, _ = _doc(a, [("אין חניה, אך הבניין כולל מעלית.", [1])])
+    without, _ = _doc(a, [("בבניין ללא מעלית.", [1])])
+    not_incl, _ = _doc(a, [("הבניין אינו כולל מעלית.", [1])])
+    out = _locate_out(a.ctx(), ["באילו שומות אין מעלית"])
+    assert {d.document_id for d in out.documents} == {without, not_incl}
+    assert {no_parking, but}.isdisjoint({d.document_id for d in out.documents})
+
+
+def test_locate_question_word_found_nowhere_lists_nothing(office):
+    """GQ43: "pool" occurs in no document, so "building" alone made a passage complete and an unrelated
+    document was listed as relevant. Nothing is listed, and the absent word is reported."""
+    from app.platform.search import SearchScope
+
+    a, *_ = office
+    docs = [_doc(a, [(f"שומת מקרקעין — הדקלים {i}. תיאור הנכס והבניין: דירה בבניין בן {i + 3} קומות.", [1])])[0]
+              for i in range(4)]
+    _doc(a, [("עסקאות השוואה באזור.", [1])])
+    out = _locate_out(a.ctx(), ["באילו שומות יש בריכה בבניין"])
+    assert out.documents == [] and out.absent_terms == ["בריכה"]
+    scoped = _locate_out(a.ctx(), ["הדקלים 1 בריכה בניין", "בריכה ברחוב הדקלים 1", "הדקלים 1 יש בריכה"],
+                         scope=SearchScope(document_ids=(docs[1],)))
+    assert scoped.documents == [] and "בריכה" in scoped.absent_terms
+
+
+def test_locate_absent_word_in_one_variant_does_not_block_another(office):
+    """Counter-test: variants are alternatives. A word only one rephrasing adds, found nowhere, does not hide
+    the documents another variant fully supports."""
+    a, *_ = office
+    sukkah, _ = _doc(a, [("לדירה מרפסת סוכה פתוחה.", [1])])
+    _doc(a, [("הדירה בקומה שנייה.", [1])])
+    out = _locate_out(a.ctx(), ["באילו שומות יש סוכה מפוארת", "מרפסת סוכה"])
+    assert [d.document_id for d in out.documents] == [sukkah] and out.documents[0].full_support
+    assert out.absent_terms == []
+
+
+def test_locate_absent_word_keeps_partial_documents_with_a_distinctive_word(office):
+    """Counter-test: a document naming a word that tells documents apart is still listed (partially), and
+    the word found nowhere is reported for the caller."""
+    a, *_ = office
+    strong, _ = _doc(a, [("חוות הדעת מתייחסת לפיצול הדירה לשתי יחידות.", [1])])
+    for i in range(3):
+        _doc(a, [(f"הדירה בקומה {i + 1}.", [1])])
+    out = _locate_out(a.ctx(), ["איפה מוזכר פיצול של נכס מסחרי?"])
+    assert [d.document_id for d in out.documents] == [strong] and not out.documents[0].full_support
+    assert set(out.absent_terms) == {"נכס", "מסחרי"}
+
+
+def test_locate_document_keeps_the_passages_of_every_supporting_variant(office):
+    """GQ57 (regression from d405ae2): only the best variant's passages were kept, so the page-1 passage that
+    another variant fully supported was lost."""
+    a, *_ = office
+    doc, _ = _doc(a, [("המרפסת הפונה לחזית נסגרה בתריסים ללא היתר בנייה.", [1]),
+                      ("סגירת המרפסת ללא היתר עלולה לחייב הריסה.", [2])])
+    _doc(a, [("הדירה בקומה שנייה.", [1])])
+    out = _locate_out(a.ctx(), ["מרפסת נסגרה בלי היתר", "סגירת מרפסת ללא היתר"])
+    [found] = out.documents
+    assert found.document_id == doc and found.full_support and found.pages == [1, 2]
+    texts = [p["text"] for p in found.passages]
+    assert texts[0].startswith("סגירת") and any("נסגרה" in t for t in texts)
+
+
+def test_an_unnegated_or_quoted_variant_cannot_list_documents_stating_the_opposite(setup):
+    """Round 7 (GQ50, HV64): the interpreter added a bare variant ("X") next to "אין X", and quoted another; the bare
+    one listed every document that has X. Only the negated variants count, and quotes do not hide the negation."""
+    from app.platform.search import locate_evidence
+
+    a = setup[0]
+    add_chunks(a, a.default_group_id, ["בבניין יש מעלית חדשה ומרווחת."], "7" * 64)
+    add_chunks(a, a.default_group_id, ["הבניין בן ארבע קומות ללא מעלית."], "8" * 64)
+    with tenant_tx(a.ctx()) as conn:
+        out = locate_evidence(conn, ["אין מעלית בבניין", "\"בניין ללא מעלית\"", "מעלית"])
+    titles = [d.title for d in out.documents if d.full_support]
+    assert titles == ["דוח 888"]
+
+
+def test_a_negated_variant_added_to_a_question_about_presence_is_dropped(setup):
+    """Final run (GQ12): for "which appraisals mention X", the rephrasing added "ללא X"; keeping only negated
+    variants listed only the document without X. The user's question decides the polarity."""
+    from app.platform.search import locate_evidence
+
+    a = setup[0]
+    add_chunks(a, a.default_group_id, ["בבניין יש מעלית חדשה ומרווחת."], "7" * 64)
+    add_chunks(a, a.default_group_id, ["הבניין בן ארבע קומות ללא מעלית."], "8" * 64)
+    with tenant_tx(a.ctx()) as conn:
+        positive = locate_evidence(conn, ["מעלית", "יש מעלית", "ללא מעלית"], question="אילו שומות מזכירות מעלית?")
+        negative = locate_evidence(conn, ["מעלית", "אין מעלית"], question="באילו שומות אין מעלית?")
+    assert "דוח 777" in [d.title for d in positive.documents if d.full_support]
+    assert [d.title for d in negative.documents if d.full_support] == ["דוח 888"]
+
+
+# --- U12: search on corrected content, abbreviations, table hints and title naming -------------------------------
+
+def _passages(ctx, query, limit=8, **kw):
+    from app.platform.search import search_passages
+
+    with tenant_tx(ctx) as conn:
+        return search_passages(conn, query, limit, **kw)
+
+
+def _named(ctx, query):
+    from app.platform.search import documents_named
+
+    with tenant_tx(ctx) as conn:
+        return [d for d, _ in documents_named(conn, query)]
+
+
+_STREETS = ("האלון", "הברוש", "האורן", "הדולב", "התאנה", "הזית")
+
+
+def _reports_sharing_professional_words(a, n=6):
+    """Reports whose text carries the office's common professional words ("השווי", "מצב התחזוקה")."""
+    return [_doc(a, [(f"השווי של הנכס נקבע בגישת ההשוואה. מצב התחזוקה של הבניין טוב. הדירה בקומה {i + 1}.", [1])],
+                 title=f"שומה — רחוב {_STREETS[i]} {i + 10}")[0] for i in range(n)]
+
+
+def _generic_title_report(a):
+    """A long report whose title holds the generic word "שווי" next to its address."""
+    return _doc(a, [(f"סעיף {i}: שווי השוק של הנכס נבחן מול עסקאות באזור, והשווי נקבע בהתאם לנתוני הסביבה.", [i + 1])
+                    for i in range(12)] + [("מצב התחזוקה של הבניין סביר.", [13])],
+                title="שומה שווי שוק — רחוב התמר 5, כפר הדר")[0]
+
+
+def test_a_generic_word_in_one_title_does_not_capture_the_results(office):
+    """Real content: every top result of a value question came from the one report whose title happened to hold the
+    generic word "שווי"; the passage that answered it, in another report, was pushed out. A word most documents'
+    text carries names no document, and one word never names a document twice through its prefix-stripped form."""
+    a, *_ = office
+    _reports_sharing_professional_words(a)
+    generic = _generic_title_report(a)
+    answer, _ = _doc(a, [("רקע כללי על הסביבה.", [1]), ('שווי מ"ר מבונה בשפ"פ נקבע ל-4,000 ₪.', [2])],
+                     title="שומה — רחוב הדקל 3")
+    for query in ('שווי מ"ר מבונה שפ"פ', 'שווי מ"ר מבונה', "שווי מטר מרובע מבונה"):
+        assert _named(a.ctx(), query) == [], query
+        hits = _passages(a.ctx(), query)
+        assert any(h["document_id"] == answer and "4,000" in h["text"] for h in hits), query
+        assert {h["document_id"] for h in hits} != {generic}, query
+
+
+def test_a_distinctive_name_or_address_in_the_query_still_leads_with_its_document(office):
+    a, *_ = office
+    reports = _reports_sharing_professional_words(a)
+    generic = _generic_title_report(a)
+    towers, _ = _doc(a, [("מצב התחזוקה של הבניין טעון שיפוץ.", [1])], title="חוות דעת — מגדלי הנחל")
+    # an address: a title word with its house number, though the title also holds a generic word
+    assert _named(a.ctx(), "מה מצב התחזוקה בהתמר 5?") == [generic]
+    hits = _passages(a.ctx(), "מה מצב התחזוקה בהתמר 5?")
+    assert hits[0]["document_id"] == generic and "סביר" in hits[0]["text"]
+    # a name: two words no other title and few documents hold
+    assert _named(a.ctx(), "מה מצב התחזוקה במגדלי הנחל?") == [towers]
+    assert _passages(a.ctx(), "מה מצב התחזוקה במגדלי הנחל?")[0]["document_id"] == towers
+    # a word most titles hold, with a number, names nothing ("שומה 12" is any report's number)
+    assert _named(a.ctx(), "שומה 12") == []
+    assert _named(a.ctx(), "מה השווי בהאורן 12?") == [reports[2]]
+
+
+def test_an_abbreviation_and_its_spelled_out_form_retrieve_the_same_passage(office):
+    """Each spelling finds the passage written in the other, as lexical evidence, among reports that share the other
+    words of the question."""
+    a, *_ = office
+    for i in range(4):
+        _doc(a, [(f"שטח הדירה {80 + i} מ\"ר. הדירה כוללת מחסן ושכירות החניה כלולה.", [1])],
+             title=f"שומה — רחוב האלה {i + 1}")
+    rent, _ = _doc(a, [("דמ\"ש ראויים לנכס: 60 ₪ למ\"ר לחודש.", [1])], title="שומה — רחוב הרימון 4")
+    open_space, _ = _doc(a, [('לדירה צמוד שפ"פ מגונן.', [1])], title="שומה — רחוב השקד 8")
+    planning, _ = _doc(a, [("לפי תכנית בניין עיר החלה, ייעוד המגרש למגורים.", [1])], title="שומה — רחוב הארז 6")
+    for short, full, doc in (('מה הדמ"ש הראויים?', "מה דמי השכירות הראויים?", rent),
+                             ('מה שטח השפ"פ?', "מה השטח הפרטי הפתוח?", open_space),
+                             ('מה קובעת התב"ע?', "מה קובעת תכנית בניין עיר?", planning)):
+        for query in (short, full):
+            assert any(h["document_id"] == doc and h["lexical_support"] for h in _passages(a.ctx(), query)), query
+
+
+def test_corrected_text_is_what_lexical_and_semantic_search_index(office):
+    """A block whose font map was repaired keeps its original text for audit only: the corrected text is indexed
+    for lexical search and embedded, and the broken form finds nothing."""
+    from app.extraction.base import Block
+    from app.extraction.chunking import chunk_blocks
+    from app.platform.search import _lexical, _scope_sql, _semantic
+    from app.providers.embeddings import get_embedding_provider, to_pgvector
+
+    a, *_ = office
+    _reports_sharing_professional_words(a, 3)
+    doc, ver = make_document(a, a.default_group_id, "שומה — רחוב הערבה 2", sha="5c" * 32)
+    corrected, original = "הנכס נמצא בשכונה שקטה ומבוקשת.", "הðכס ðמצא בשכוðה שקטה ומבוקשת."
+    blocks = [Block(0, "heading", "1. תיאור הסביבה", section="1. תיאור הסביבה", page=1),
+              Block(1, "paragraph", corrected, section="1. תיאור הסביבה", page=1, original_text=original)]
+    result = ExtractionResult(1, [PageResult(1, corrected, "text_layer", 1.0, True)], [],
+                              chunk_blocks(blocks, []), blocks=blocks)
+    info = pipeline.VersionInfo(ver, doc, "k", "application/pdf", None)
+    with tenant_tx(a.system) as conn:
+        pipeline.persist_extraction(conn, info, result)
+    pipeline.embed_stage(a.system, info, 1e18)
+    with tenant_tx(a.ctx()) as conn:
+        [chunk] = conn.execute(text("SELECT id, normalized_text, embedding::text AS e FROM chunks WHERE version_id = :v"),
+                               {"v": ver}).all()
+        assert "ð" not in chunk.normalized_text and "שכונה" in chunk.normalized_text.split()
+        assert _lexical(conn, ["שכונה"], _scope_sql(None))[0] == chunk.id
+        assert _lexical(conn, ["בשכוðה"], _scope_sql(None)) == []
+        assert _semantic(conn, "שכונה שקטה ומבוקשת", _scope_sql(None))[0] == chunk.id
+    expected = to_pgvector(get_embedding_provider().embed_passages([chunk_blocks(blocks, [])[0].text])[0])
+    assert [round(float(x), 4) for x in chunk.e.strip("[]").split(",")] == [
+        round(float(x), 4) for x in expected.strip("[]").split(",")]
+
+
+def _table_report(a, title="שומה — רחוב הברוש 9"):
+    from app.extraction.base import Block, TableResult, TableRow
+    from app.extraction.chunking import chunk_blocks
+
+    doc, ver = make_document(a, a.default_group_id, title, sha="7d" * 32)
+    rows = [["חנות 1", "40", "קרקע"], ["חנות 2", "35", "קרקע"], ["חנות 3", "50", "קרקע"], ["משרד 4", "80", "א"],
+            ["משרד 5", "90", "ב"]]
+    table = TableResult(0, ["יחידה", "שטח", "קומה"], [None, "מ״ר", None], [TableRow(1, r) for r in rows], 1, 1,
+                        section="3. פירוט היחידות", caption="להלן פירוט היחידות בבניין:", block_index=2)
+    blocks = [Block(0, "heading", "3. פירוט היחידות", section="3. פירוט היחידות", page=1),
+              Block(1, "paragraph", "להלן פירוט היחידות בבניין:", section="3. פירוט היחידות", page=1),
+              Block(2, "table", "\n".join(" | ".join(r) for r in rows), section="3. פירוט היחידות", page=1,
+                    table_index=0)]
+    result = ExtractionResult(1, [PageResult(1, "x", "text_layer", 1.0, True)], [table], chunk_blocks(blocks, [table]),
+                              blocks=blocks)
+    info = pipeline.VersionInfo(ver, doc, "k", "application/pdf", None)
+    with tenant_tx(a.system) as conn:
+        pipeline.persist_extraction(conn, info, result)
+    pipeline.embed_stage(a.system, info, 1e18)
+    return doc, ver
+
+
+def test_rows_capped_by_the_diversity_cap_keep_the_table_and_name_its_handle(office):
+    """A query matching three rows of one table: the row cap shows two of them, the table passage stands in for the
+    rest, and the search result names the table's handle so the whole table can be opened."""
+    from app.chat import tools as T
+
+    a, *_ = office
+    _reports_sharing_professional_words(a, 3)
+    doc, ver = _table_report(a)
+    hits = _passages(a.ctx(), "חנות בקומת קרקע", 3)
+    assert sum(h["kind"] == "table_row" for h in hits) == 2
+    assert any(h["kind"] == "table" and h["table_index"] == 0 for h in hits)
+    ws = T.Workspace(ctx=a.ctx())
+    out = T.tool_search(ws, "חנות בקומת קרקע", None, 3)
+    handle = next(h for h, v in ws.handles.items() if v["kind"] == "T" and v["table_index"] == 0)
+    assert 'kind="table"' in out and "להלן פירוט היחידות בבניין:" in out
+    hint = out.split("</source>")[-1]
+    assert handle in hint and "read" in hint and "table=" in hint

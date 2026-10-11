@@ -28,7 +28,9 @@ from app.db import reset_engine  # noqa: E402
 _TABLES = (
     "answer_cache, answer_sources, questions, conversations, dedup_candidates, fact_values, occurrences, "
     "transactions, provider_usage, audit_events, jobs, chunks, extracted_tables, pages, document_versions, "
-    "documents, sessions, user_groups, document_groups, users, office_data_versions, office_settings, offices"
+    "documents, sessions, user_groups, document_groups, users, office_data_versions, office_settings, offices, "
+    "attribute_definitions, facts, fact_extraction_ledger, messages, document_blocks, measurements, measurement_runs, "
+    "image_readings, region_readings, verified_values"
 )
 
 
@@ -43,18 +45,39 @@ def _db_available() -> bool:
         return False
 
 
-@pytest.fixture(scope="session")
-def owner_engine():
-    if not _db_available():
-        pytest.skip("Postgres test database not reachable (start: docker compose up -d db)")
+def alembic_config():
+    """Alembic config bound to the test database (owner role)."""
+    _assert_test_database()
     from alembic.config import Config
-
-    from alembic import command
 
     cfg = Config(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
     cfg.set_main_option("script_location", os.path.join(os.path.dirname(__file__), "..", "alembic"))
     cfg.attributes["url"] = get_settings().owner_database_url
-    command.upgrade(cfg, "head")
+    return cfg
+
+
+TEST_DATABASE = "rag_test"
+
+
+def _assert_test_database() -> None:
+    """Tests migrate and truncate every table: refuse any database but the test one. Inside a Compose container the
+    service environment points at the office database, and ``setdefault`` above does not override it."""
+    from sqlalchemy.engine import make_url
+
+    s = get_settings()
+    for name, url in (("DATABASE_URL", s.database_url), ("OWNER_DATABASE_URL", s.owner_database_url)):
+        if make_url(url).database != TEST_DATABASE:
+            pytest.exit(f"refusing to run database tests: {name} is not the '{TEST_DATABASE}' database", returncode=2)
+
+
+@pytest.fixture(scope="session")
+def owner_engine():
+    _assert_test_database()
+    if not _db_available():
+        pytest.skip("Postgres test database not reachable (start: docker compose up -d db)")
+    from alembic import command
+
+    command.upgrade(alembic_config(), "head")
     engine = create_engine(get_settings().owner_database_url)
     yield engine
     engine.dispose()
@@ -63,6 +86,7 @@ def owner_engine():
 @pytest.fixture
 def db(owner_engine):
     """Clean database for one test. Yields the owner engine (for bootstrap/inspection only)."""
+    _assert_test_database()
     with owner_engine.begin() as conn:
         conn.execute(text(f"TRUNCATE {_TABLES} CASCADE"))
     reset_engine()

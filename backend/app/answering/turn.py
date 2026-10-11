@@ -1,0 +1,1606 @@
+"""The turn orchestrator (U9; KTD1, KTD2, KTD12-KTD14; R1, R3, R17-R21, R25, R26).
+
+One user turn, called by ``api.ask`` after it reserved the turn in a short transaction (``load`` runs there):
+
+1. ``interpret_turn``, outside any transaction: a clarification button, an edit of the context chips, or
+   free text through ``interpret`` (rules fast path; the model only in cloud mode; limited mode otherwise).
+   Explicit condition edits (``filters``, ``remove``) join the plan's delta, and a relative year is resolved
+   against the state the turn started from, so a retried turn can never apply it twice.
+2. ``execute_turn``: ``apply_turn`` to the state, then the cache (KTD14), then at most four tool steps and
+   at most one replan. Every tool opens its own short ``tenant_tx`` under the user's context; model calls
+   (interpretation, extraction, answer, judge) never run inside a transaction.
+3. ``api.ask`` completes the reserved row, sources, state and cache in one final transaction guarded by
+   ``state_version``.
+
+Results that are never cached: clarifications, meta-turns, partial or deadline results, fallbacks, turns
+with a non-ok provider status, and error mode.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import time
+from dataclasses import dataclass, field
+from decimal import Decimal
+from uuid import UUID
+
+from pydantic import ValidationError
+from sqlalchemy import Connection, text
+
+from app.answering import facts
+from app.answering.attributes import (
+    AttributeDef,
+    adopt_names,
+    canonical_unit_for,
+    handle_map,
+    list_attribute_handles,
+    resolve_attribute,
+)
+from app.answering.compare import CompareSide, compose_comparison, gather_sides
+from app.answering.compose import (
+    ABSTENTION_TEXT,
+    COMPOSE_PROMPTS,
+    ComputedValue,
+    answer_fields,
+    combined_abstention_kind,
+    compose_answer,
+    computed_from_numeric,
+    dedupe_units,
+    no_evidence_kind,
+    source_json,
+    sources_still_authorized,
+)
+from app.answering.conditions import DATE_FIELD_LABELS, QueryConditions
+from app.answering.content import EVIDENCE_LIMIT, evidence_from_hits, log_usage, log_usages, select_provider
+from app.answering.coverage import coverage
+from app.answering.entities import MatchedDocument, resolve_entities
+from app.answering.interpret import (
+    INTERPRET_INSTRUCTIONS,
+    LIMITED_MODE_NOTE,
+    PROMPT_VERSION,
+    RECORD_CLARIFY_KEYS,
+    answer_plan,
+    build_interpret_input,
+    interpret,
+)
+from app.answering.metadata import MetadataFilters, place_in_documents, place_matches
+from app.answering.parser import Gazetteer, missing_conditions, parse_question
+from app.answering.plan import (
+    MAX_STEPS,
+    ClarifyOption,
+    ConditionDelta,
+    ProposedClarification,
+    Step,
+    TurnPlan,
+    ValueFilterSpec,
+    continuation_form,
+    normalize_model_plan,
+)
+from app.answering.plan import validate_plan as _validate_plan
+from app.answering.service import (
+    CLARIFY_QUESTIONS,
+    clarification_answer,
+    clarification_options,
+    load_gazetteer,
+    mixed_basis,
+    numeric_answer,
+    records_abstention_kind,
+    source_json_rows,
+)
+from app.answering.state import (
+    REFERENT_COMPARE_SECOND,
+    REFERENT_COMPARE_SIDES,
+    AttributeRef,
+    ConversationState,
+    PendingClarification,
+    SourceRef,
+    apply_turn,
+    remember_sources,
+)
+from app.answering.templates import (
+    OPERATION_LABELS,
+    TEMPLATE_VERSION,
+    UNIT_LABELS,
+    abstain_text,
+    number,
+    structured_text,
+)
+from app.appraisal.query import compute_records, sources_for, uncertain_duplicates
+from app.config import get_settings
+from app.db import TenantContext, current_data_version, tenant_tx
+from app.extraction.normalize_text import base_normalize, prefix_variants
+from app.platform.documents import source_file_url
+from app.platform.search import SearchScope, locate_evidence, search_evidence
+from app.providers.embeddings import get_embedding_provider
+from app.providers.llm import (
+    SYSTEM_POLICY,
+    CallStatus,
+    LLMProvider,
+    Purpose,
+    StructuredResult,
+    call_structured,
+)
+from app.providers.status import FAILURE_REASONS, Mode, ProviderState
+
+FILTER_CONFLICT = "filter_conflict"
+EDIT_KEYS = ("city", "neighborhood", "year_from", "year_to", "date_field", "data_kind", "property_type", "area_type",
+             "vat_basis")
+# Chip keys a client may remove -> the delta's clear key (None: cleared on the state after the turn).
+REMOVE_KEYS = {"city": "city", "neighborhood": "neighborhood", "years": "years", "year_from": "years",
+               "year_to": "years", "date_field": "date_field", "data_kind": "data_kind",
+               "property_type": "property_type", "area_type": "area_type", "vat_basis": "vat_basis",
+               "attribute": None, "metric": None}
+COMPUTE_TOOLS = ("compute_records", "extract_and_compute")
+CONTENT_TOOLS = ("search", "locate", "compare")
+META_RELATIONS = ("meta_why", "meta_sources")
+MONETARY_DIMENSIONS = ("currency", "currency_per_area")
+DEFAULT_ATTRIBUTE_LABEL = "מחיר למ״ר"
+CACHEABLE_KINDS = ("numeric", "content", "combined", "abstain")
+PER_TURN_FIELDS = ("interpretation_note", "cleared", "cached")
+DEADLINE_MARGIN_SECONDS = 3.0
+# Answers and judge prompts are part of the cache key: a prompt change never serves an old answer.
+ANSWER_PROMPT_VERSION = PROMPT_VERSION + ":" + hashlib.sha256(
+    (SYSTEM_POLICY + COMPOSE_PROMPTS + INTERPRET_INSTRUCTIONS).encode()).hexdigest()[:10]
+
+NO_PENDING = "אין שאלת הבהרה פתוחה בשיחה זו. כתבו שאלה חדשה"
+NEED_QUESTION = "יש לכתוב שאלה"
+STATE_CONFLICT = "השיחה עודכנה בבקשה אחרת באותו זמן. נסו לשאול שוב."
+BAD_YEARS = "טווח השנים שנבחר אינו תקין: שנת הסיום מוקדמת משנת ההתחלה. לאיזו שנה הכוונה?"
+PARTIAL_NOTE = "הזמן שהוקצב לשאלה הסתיים לפני שכל הצעדים הושלמו; מוצגת תוצאה חלקית."
+FACT_SCOPE_NOTE = "הנתון מחושב רק מהמסמכים שבתחום שבהם נמצא ערך, ואינו מתאר את כלל המאגר."
+TOOL_LABELS = {
+    "search": "חיפוש בתוכן המסמכים המורשים", "compute_records": "חישוב SQL על רשומות מאומתות",
+    "extract_and_compute": "חילוץ הנתון מהמסמכים עם ציטוט מדויק וחישוב בקוד", "compare": "השוואה בין מקורות",
+    "locate": "איתור מסמכים", "explain_previous": "הסבר התשובה הקודמת", "show_sources": "הצגת מקורות",
+}
+CONTEXT_LABELS = {"attribute": "נתון", "metric": "מדד", "city": "עיר", "neighborhood": "שכונה", "years": "שנים",
+                  "date_field": "שדה תאריך", "data_kind": "סוג הנתון", "property_type": "סוג נכס",
+                  "area_type": "בסיס שטח", "vat_basis": "בסיס מע״מ"}
+_FACT_OPS = {"weighted_mean": "mean", "none": "values"}
+_FACT_LABELS = dict(OPERATION_LABELS, count="מספר הערכים")
+FILTER_LABEL = "תנאי על הערך"
+FILTER_OPS_HE = {"<": "קטן מ-", "<=": "עד ", ">": "גדול מ-", ">=": "לפחות ", "=": "שווה ל-", "!=": "שונה מ-"}
+MAX_COMPARE_SIDES = 3
+# Conditions of the structured records (prices, areas) that document metadata cannot filter on.
+RECORD_ONLY_CONDITIONS = ("property_type", "area_type", "data_kind", "vat_basis")
+LIST_SOURCES_MAX = 12  # a values or filtered answer lists the documents behind each value up to this many
+TWO_SIDED_MAX_DOCUMENTS = 3  # one entity named by this many documents: each document's statement is shown
+_DIGIT = re.compile(r"\d")
+AMBIGUOUS_NOTE = "השאלה מתאימה ל-{n} מסמכים ({titles}); מוצג מה שנאמר בכל אחד מהם."
+UNMATCHED_NOTE = "לא נמצא במסמכים שאתם מורשים לראות מסמך שעוסק ב\"{entity}\"."
+UNSCOPED_NOTE = "החיפוש בוצע בכל המסמכים המורשים."
+
+
+class TurnError(Exception):
+    """A turn the client must change or retry (mapped to an HTTP status by the API)."""
+
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(detail)
+        self.status_code, self.detail = status_code, detail
+
+
+@dataclass
+class TurnRequest:
+    question: str | None
+    clarification: dict | None = None
+    filters: dict | None = None
+    remove: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Loaded:
+    """Inputs of a turn, read in one short transaction."""
+
+    conversation_id: UUID
+    state: ConversationState
+    state_version: int
+    gazetteer: Gazetteer
+    attributes: list[dict]
+    provider: LLMProvider | None  # the answering provider of the office's mode (cloud, demo mock or none)
+    pstate: ProviderState
+    conflict_pending: dict | None
+    previous: dict | None  # the last answered question: text and turn plan (for chip edits)
+    data_version: int
+    settings_version: int
+
+    @property
+    def cloud_provider(self) -> LLMProvider | None:
+        return self.provider if self.pstate.mode == Mode.CLOUD else None
+
+
+@dataclass
+class Interpreted:
+    plan: TurnPlan | None
+    mode: str  # rules | model | limited | button | edit
+    question: str
+    status: str | None = None  # provider status of the interpretation call
+    limitation: str | None = None
+    unknown_place: str | None = None
+    free_text: bool = False
+    answer: dict | None = None  # a direct answer that changes no state (re-asked conflict, invalid range)
+    conflict: dict | None = None  # the filter conflict to keep open
+    removed: list[str] = field(default_factory=list)  # removed chips outside the delta (attribute, metric)
+
+
+@dataclass
+class Part:
+    answer: dict
+    computed: list[ComputedValue] = field(default_factory=list)
+
+
+@dataclass
+class TurnResult:
+    answer: dict
+    state: ConversationState | None  # None: the state is unchanged
+    plan_record: dict | None
+    steps: list[dict]
+    facts_versions: dict[str, int]
+    intent: str | None
+    route: str
+    conditions: dict | None
+    conflict_pending: dict | None = None
+    cache_key: str | None = None
+    cache_payload: dict | None = None
+
+
+@dataclass
+class EntityScope:
+    """The documents the question's entities (addresses, block/parcel, titles) name, under the user's RLS."""
+
+    documents: list[MatchedDocument]
+    terms: list[str]  # surface forms of the matched entities: place terms, not topic terms, in a search
+    ambiguous: bool  # one entity is the subject of several documents (e.g. one property appraised twice)
+    unmatched: list[str]  # address-like entities that name no visible document
+    entities: list[str]
+
+    @property
+    def document_ids(self) -> tuple[UUID, ...]:
+        return tuple(d.document_id for d in self.documents)
+
+    @property
+    def active(self) -> bool:
+        return bool(self.documents)
+
+    def search(self) -> SearchScope:
+        return SearchScope(document_ids=self.document_ids)
+
+    def describe(self) -> str:
+        return ", ".join(self.entities)
+
+
+@dataclass
+class _Run:
+    ctx: TenantContext
+    L: Loaded
+    it: Interpreted
+    plan: TurnPlan
+    state: ConversationState
+    question_id: UUID
+    deadline: float
+    attribute: AttributeDef | None = None
+    steps: list[dict] = field(default_factory=list)
+    statuses: list[str] = field(default_factory=list)
+    facts_versions: dict[str, int] = field(default_factory=dict)
+    limitations: list[str] = field(default_factory=list)
+    clarification: ProposedClarification | None = None
+    known_sides: list[str] = field(default_factory=list)  # a comparison's sides already chosen (referent)
+    cacheable: bool = True
+    partial: bool = False  # the turn deadline cut a step short
+    incomplete: bool = False  # versions in scope are not yet extracted (async jobs, cap)
+    search_fallback: bool = False
+    scope: EntityScope | None = None
+
+    @property
+    def scoped(self) -> bool:
+        return self.scope is not None and self.scope.active
+
+    @property
+    def question(self) -> str:
+        return self.it.question
+
+    def step(self, tool: str, args: dict, result: dict, summary: str, statuses: list[str] | None = None) -> None:
+        self.steps.append({"tool": tool, "args": args, "result": result, "summary": summary,
+                           "provider_statuses": statuses or []})
+
+    def ask(self, key: str, question: str, options: list[dict]) -> None:
+        self.clarification = ProposedClarification(key=key, question=question,
+                                                   options=[ClarifyOption(**o) for o in options])
+
+
+# --- loading ----------------------------------------------------------------------------------------------
+
+def load(conn: Connection, conv) -> Loaded:
+    """Everything the turn reads before any model call (inside the reservation transaction)."""
+    try:
+        state = ConversationState.model_validate(dict(conv.state or {}) | {"version": conv.state_version})
+    except ValidationError:
+        state = ConversationState(version=conv.state_version)
+    provider, pstate = select_provider(conn)
+    prev = conn.execute(text(
+        "SELECT question_text, plan FROM questions WHERE conversation_id = :c AND status = 'done'"
+        " AND answer_kind <> 'clarification' AND NOT coalesce((plan->>'meta')::boolean, false)"
+        " AND plan ? 'turn_plan' ORDER BY created_at DESC LIMIT 1"), {"c": conv.id}).first()
+    legacy = conv.pending_clarification or {}
+    return Loaded(
+        conversation_id=conv.id, state=state, state_version=conv.state_version, gazetteer=load_gazetteer(conn),
+        attributes=list_attribute_handles(conn, useful_only=True), provider=provider, pstate=pstate,
+        conflict_pending=legacy if legacy.get("key") == FILTER_CONFLICT else None,
+        previous={"question": prev.question_text, "turn_plan": prev.plan["turn_plan"]} if prev else None,
+        data_version=current_data_version(conn),
+        settings_version=conn.execute(text("SELECT settings_version FROM office_settings")).scalar_one(),
+    )
+
+
+def check_request(req: TurnRequest, L: Loaded) -> None:
+    """Reject a request that cannot run, before the turn is reserved."""
+    if any(key not in REMOVE_KEYS for key in req.remove):
+        raise TurnError(422, "לא ניתן להסיר את התנאי המבוקש")
+    if req.question:
+        return
+    if req.clarification:
+        key = req.clarification.get("key")
+        if key == FILTER_CONFLICT:
+            if L.conflict_pending is None:
+                raise TurnError(409, NO_PENDING)
+        elif L.state.pending is None or L.state.pending.key != key:
+            raise TurnError(409, NO_PENDING)
+        return
+    if not (_edits(req.filters) or req.remove) or (L.previous is None and L.state.pending is None):
+        raise TurnError(422, NEED_QUESTION)
+
+
+# --- interpretation ---------------------------------------------------------------------------------------
+
+def _absolute(plan: TurnPlan, state: ConversationState) -> TurnPlan:
+    """Resolve a relative year against the state the turn started from (KTD13 step 4)."""
+    offset = plan.conditions.relative_year_offset
+    if offset is None:
+        return plan
+    base = state.conditions
+    if plan.turn_relation in ("answer_to_clarification", "change_clarification") and state.pending is not None:
+        base = state.pending.conditions
+    if base.year_from is None:
+        return plan  # apply_turn asks which year
+    delta = plan.conditions.model_copy(update={
+        "relative_year_offset": None, "year_from": base.year_from + offset,
+        "year_to": base.year_to + offset if base.year_to is not None else None})
+    return plan.model_copy(update={"conditions": delta})
+
+
+def _button(req: TurnRequest, L: Loaded) -> Interpreted:
+    key, value = req.clarification.get("key"), req.clarification.get("value")
+    if key == FILTER_CONFLICT:
+        cp = L.conflict_pending
+        if value not in {o["value"] for o in cp["options"]}:
+            return Interpreted(None, "button", cp["question_text"], conflict=cp,
+                               answer=clarification_answer(FILTER_CONFLICT, cp["question"], cp["options"]))
+        name, chosen = value.split(":", 1)
+        plan = TurnPlan.model_validate(cp["plan"])
+        delta = plan.conditions.model_copy(update={name: int(chosen) if name.startswith("year") else chosen})
+        return Interpreted(plan.model_copy(update={"conditions": delta}), "button", cp["question_text"])
+    pending = L.state.pending
+    question = pending.original_question or ""
+    if value not in {o.value for o in pending.options}:  # re-ask in the same context
+        return Interpreted(TurnPlan.build(task_type=pending.task_type or "compute",
+                                          turn_relation="change_clarification"), "button", question)
+    return Interpreted(answer_plan(pending, value), "button", question)
+
+
+def _edit(L: Loaded) -> Interpreted:
+    """Chip edits with no new question: re-run the last answered task with the edited conditions. Before any
+    answer (only a clarification was asked), the edit changes the open clarification's context and re-asks it."""
+    if L.previous is None and L.state.pending is not None:
+        pending = L.state.pending
+        plan = TurnPlan.build(task_type=pending.task_type or "answer", turn_relation="change_clarification")
+        return Interpreted(plan, "edit", pending.original_question or "")
+    prev = TurnPlan.model_validate(L.previous["turn_plan"])
+    task = prev.task_type if prev.task_type not in ("clarify", "abstain") else "answer"
+    plan = TurnPlan.build(task_type=task, turn_relation="follow_up", metric=prev.metric, unit=prev.unit,
+                          search_queries=prev.search_queries, steps=[s.model_dump() for s in prev.steps])
+    return Interpreted(plan, "edit", L.previous["question"])
+
+
+def _with_edits(it: Interpreted, req: TurnRequest) -> Interpreted:
+    """Explicit condition edits join the plan's delta; one that contradicts what the question states asks."""
+    if it.plan is None or not (_edits(req.filters) or req.remove):
+        return it
+    delta = it.plan.conditions.model_dump()
+    for key, value in (req.filters or {}).items():
+        if key not in EDIT_KEYS or value in (None, ""):  # anything else (an office id, say) is ignored
+            continue
+        if key in ("year_from", "year_to"):
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                raise TurnError(422, "ערך מסנן לא תקין") from None
+        stated = delta.get(key)
+        if stated is not None and stated != value:
+            options = [{"value": f"{key}:{stated}", "label": f"לפי השאלה: {stated}"},
+                       {"value": f"{key}:{value}", "label": f"לפי הסינון: {value}"}]
+            question = CLARIFY_QUESTIONS[FILTER_CONFLICT]
+            plan = it.plan.model_copy(update={"conditions": _delta(delta)})
+            conflict = {"key": FILTER_CONFLICT, "question": question, "options": options,
+                        "plan": plan.model_dump(mode="json"), "question_text": it.question}
+            return Interpreted(None, it.mode, it.question, it.status, it.limitation, conflict=conflict,
+                               answer=clarification_answer(FILTER_CONFLICT, question, options))
+        delta[key] = value
+        if key in ("year_from", "year_to"):
+            delta["relative_year_offset"] = None
+    for key in req.remove:
+        clear = REMOVE_KEYS[key]
+        if clear is None:
+            continue
+        delta["clear"] = list(dict.fromkeys([*delta["clear"], clear]))
+        for k in (("year_from", "year_to", "relative_year_offset") if clear == "years" else (clear,)):
+            delta[k] = None
+    if delta["year_from"] is not None and delta["year_to"] is not None and delta["year_to"] < delta["year_from"]:
+        return Interpreted(None, it.mode, it.question, it.status,
+                           answer=clarification_answer("referent", BAD_YEARS, []))
+    return Interpreted(it.plan.model_copy(update={"conditions": _delta(delta)}), it.mode, it.question,
+                       it.status, it.limitation, it.unknown_place, it.free_text,
+                       removed=[k for k in req.remove if REMOVE_KEYS[k] is None])
+
+
+def _edits(filters: dict | None) -> dict:
+    return {k: v for k, v in (filters or {}).items() if k in EDIT_KEYS and v not in (None, "")}
+
+
+def _delta(delta: dict) -> ConditionDelta:
+    try:
+        return ConditionDelta.model_validate(delta)
+    except ValidationError:
+        raise TurnError(422, "ערך מסנן לא תקין") from None
+
+
+def _with_document_places(ctx: TenantContext, question: str, gaz: Gazetteer) -> Gazetteer:
+    """The gazetteer plus a place the question names that no record or header lists but an authorized document
+    does name in its title or text: a narrative report states its city in prose, so the place is known to the
+    repository and the question is answered from the documents instead of "no records for this place"."""
+    place = parse_question(question, gaz, None).unknown_place
+    if not place:
+        return gaz
+    with tenant_tx(ctx) as conn:
+        if not place_in_documents(conn, place):
+            return gaz
+    if re.search(r"(^|\s)ב?שכונת\s+" + re.escape(place), question):
+        return Gazetteer(cities=gaz.cities, neighborhoods=[*gaz.neighborhoods, (None, place)])
+    return Gazetteer(cities=sorted({*gaz.cities, place}), neighborhoods=gaz.neighborhoods)
+
+
+def interpret_turn(ctx: TenantContext, req: TurnRequest, L: Loaded) -> Interpreted:
+    """The validated plan of this turn (no transaction is open while the model interprets)."""
+    question = (req.question or "").strip()
+    if req.clarification and not question:
+        it = _button(req, L)
+    elif not question:
+        it = _edit(L)
+    else:
+        L.gazetteer = _with_document_places(ctx, question, L.gazetteer)
+        result = interpret(question, L.state, L.gazetteer, L.attributes, L.cloud_provider)
+        if result.status is not None:
+            with tenant_tx(ctx) as conn:
+                log_usage(conn, L.cloud_provider, Purpose.INTERPRET.value, result, result.ok, result.status)
+        limitation = result.limitation
+        if result.mode == "limited" and (L.pstate.mode == Mode.ERROR or L.pstate.status is not None):
+            limitation = L.pstate.limitation()
+        plan = result.plan
+        if (plan is not None and result.mode == "model" and plan.clarification is not None and plan.steps
+                and plan.clarification.key in RECORD_CLARIFY_KEYS):
+            # Record clarifications are asked by the server only when they change the result (R20).
+            plan = plan.model_copy(update={"clarification": None, "task_type": plan.task_type
+                                           if plan.task_type != "clarify" else "compute"})
+        it = Interpreted(plan, result.mode, question, str(result.status) if result.status else None, limitation,
+                         result.unknown_place, free_text=True)
+    it = _with_edits(it, req)
+    if it.plan is not None:
+        it.plan = _absolute(it.plan, L.state)
+    return it
+
+
+# --- execution --------------------------------------------------------------------------------------------
+
+def _expand_versions(ctx: TenantContext, plan: TurnPlan,
+                     state: ConversationState) -> tuple[TurnPlan, ConversationState]:
+    """A comparison that names one source of a document with several versions compares its two latest
+    visible versions (AE6); the older one gets its own handle."""
+    steps = list(plan.steps)
+    for i, step in enumerate(steps):
+        handles = list(dict.fromkeys(step.source_handles))
+        if step.tool != "compare" or len(handles) != 1 or handles[0] not in state.sources:
+            continue
+        ref = state.sources[handles[0]]
+        with tenant_tx(ctx) as conn:
+            versions = conn.execute(text(
+                "SELECT v.id FROM document_versions v JOIN documents d ON d.id = v.document_id"
+                " AND d.deleted_at IS NULL WHERE v.document_id = :d ORDER BY v.version_no DESC LIMIT 2"),
+                {"d": ref.document_id}).scalars().all()
+        if len(versions) < 2:
+            continue
+        refs = [SourceRef(document_id=ref.document_id, version_id=str(v)) for v in reversed(versions)]
+        state, new = remember_sources(state, refs)
+        steps[i] = step.model_copy(update={"source_handles": new})
+    return plan.model_copy(update={"steps": steps}), state
+
+
+ADDRESS_KINDS = ("address", "block_parcel", "street")
+FRESH_RELATIONS = ("new_question", "topic_change")
+
+
+def _entity_strings(entities: list[str], gazetteer: Gazetteer) -> list[str]:
+    """Entities that can name a document: with a number (an address, block/parcel) or of several words (a
+    title); a bare place name or a generic word ("הדירה") names no document."""
+    places = set(gazetteer.cities) | {n for _, n in gazetteer.neighborhoods}
+    out: list[str] = []
+    for e in entities:
+        e = " ".join((e or "").split())
+        bare = e[1:] if len(e) > 2 and e[0] in "בלמהו" else e
+        if not e or e in out or e in places or bare in places:
+            continue
+        if _DIGIT.search(e) or len(e.split()) >= 2:
+            out.append(e)
+    return out
+
+
+def resolve_scope(ctx: TenantContext, entities: list[str], question: str,
+                  gazetteer: Gazetteer) -> EntityScope | None:
+    """The visible documents the entities name (or, with no usable entity, the addresses written in the
+    question); None when nothing names a document."""
+    with tenant_tx(ctx) as conn:
+        m = resolve_entities(conn, _entity_strings(entities, gazetteer), question=question)
+    docs: list[MatchedDocument] = []
+    ambiguous, unmatched, names = False, [], []
+    for r in m.resolutions:
+        if r.kind == "title" and len(r.documents) > TWO_SIDED_MAX_DOCUMENTS:
+            continue  # a title fragment many documents share names none of them
+        if not r.documents:
+            if r.kind in ADDRESS_KINDS:
+                unmatched.append(r.entity)
+            continue
+        names.append(r.entity)
+        ambiguous = ambiguous or len(r.documents) > 1
+        docs += [d for d in r.documents if d.document_id not in {x.document_id for x in docs}]
+    if not docs and not unmatched:
+        return None
+    return EntityScope(docs, list(m.terms) if docs else [], ambiguous, unmatched, names)
+
+
+def _scope_turn(ctx: TenantContext, it: Interpreted, plan: TurnPlan, start: ConversationState,
+                L: Loaded) -> tuple[TurnPlan, EntityScope | None]:
+    """Entity scoping of a turn that runs tools (KTD10): the plan's entities, else those the turn inherits
+    (as ``apply_turn`` does), else the addresses in the question, which then join the plan's entities."""
+    if it.mode == "rules" or plan.turn_relation in META_RELATIONS or plan.task_type in ("abstain", "clarify"):
+        return plan, None
+    if plan.entities:
+        entities = list(plan.entities)
+    elif plan.turn_relation in FRESH_RELATIONS:
+        entities = []
+    elif plan.turn_relation in ("answer_to_clarification", "change_clarification") and start.pending is not None:
+        entities = list(start.pending.entities)
+    else:
+        entities = list(start.entities)
+    scope = resolve_scope(ctx, entities, it.question, L.gazetteer)
+    if scope is not None and scope.active and not entities:
+        plan = plan.model_copy(update={"entities": scope.entities})
+    return plan, scope
+
+
+def _plan_attribute(run: _Run) -> AttributeDef | None:
+    """The attribute of the plan's computation: the model's handle or description, else the state's, else
+    the price per m² of the rules path."""
+    step = next((s for s in run.plan.steps if s.tool in COMPUTE_TOOLS), None)
+    if step is None:
+        return None
+    ref = run.plan.attribute
+    handle = step.attribute_handle or (ref.handle if ref else None)
+    description = ref.description if ref else None
+    dimension = ref.unit_dimension if ref else None
+    value_type = ref.value_type if ref else None
+    if not handle and not description and run.state.attribute is not None:
+        st = run.state.attribute
+        handle, description, dimension, value_type = st.handle, st.description, st.unit_dimension, st.value_type
+    with tenant_tx(run.ctx) as conn:
+        try:
+            # the plan's own description checks the handle; the rules path's default applies only to a plan
+            # that names neither
+            attr = resolve_attribute(conn, handle=handle,
+                                     description=description or (None if handle else DEFAULT_ATTRIBUTE_LABEL),
+                                     unit_dimension=dimension, value_type=value_type,
+                                     handles=handle_map(run.L.attributes))
+        except ValueError:
+            return None
+    shown = next((a["handle"] for a in run.L.attributes if a["id"] == attr.id), None)
+    run.state = run.state.model_copy(update={"attribute": AttributeRef(
+        handle=shown, description=attr.label, unit_dimension=attr.unit_dimension, value_type=attr.value_type)})
+    return attr
+
+
+def _filters(run: _Run) -> MetadataFilters | None:
+    s = run.state.conditions
+    f = MetadataFilters(city=s.city, neighborhood=s.neighborhood, year_from=s.year_from, year_to=s.year_to,
+                        date_field=s.date_field or "valuation_date")
+    return f if f.active else None
+
+
+NO_RECORDS_FROM_TEXT = ("במאגר אין רשומות מובנות (עסקאות או שווי) למקום הזה, ולכן הערכים חולצו מטקסט המסמכים, כל"
+                        " אחד עם ציטוט ועמוד, כפי שנכתבו בהם: מחיר עסקה ושווי שמאי מובחנים רק לפי הציטוט.")
+
+
+def _records_cover(ctx: TenantContext, c: QueryConditions) -> bool:
+    """Whether any visible structured record lies in the question's place (or any record at all without one)."""
+    with tenant_tx(ctx) as conn:
+        rows = conn.execute(text(
+            "SELECT DISTINCT o.city, o.neighborhood FROM occurrences o JOIN document_versions v ON v.id = o.version_id"
+            " AND v.is_current JOIN documents d ON d.id = o.document_id AND d.deleted_at IS NULL"
+            " WHERE o.verification_status <> 'rejected'")).all()
+    if not rows:
+        return False
+    if c.city and not any(r.city and place_matches(c.city, frozenset({base_normalize(r.city)})) for r in rows):
+        return False
+    if c.neighborhood and not any(r.neighborhood and place_matches(
+            c.neighborhood, frozenset({base_normalize(r.neighborhood)})) for r in rows):
+        return False
+    return True
+
+
+def _records(run: _Run, attr: AttributeDef) -> Part | None:
+    """A structured attribute over unique verified records (parametric SQL, no model call). When no record
+    covers the question's place (narrative reports produce none), the same datum is extracted from the
+    documents' text with quotes instead (``_facts``), and the answer says so."""
+    c = run.state.query_conditions("calculation")
+    if not _records_cover(run.ctx, c):
+        with tenant_tx(run.ctx) as conn:
+            twin = resolve_attribute(conn, handle=None, description=attr.label, unit_dimension=attr.unit_dimension,
+                                     value_type="numeric", extracted_only=True)
+            twin = adopt_names(conn, twin, attr.aliases)
+        run.attribute = twin
+        run.limitations.append(NO_RECORDS_FROM_TEXT)
+        return _facts(run, twin)
+    monetary = attr.unit_dimension in MONETARY_DIMENSIONS
+    metric = run.state.metric or "mean"
+    op = metric if metric != "none" else "mean"
+    if op == "weighted_mean" and attr.structured_column != "transactions.price_per_sqm":
+        op = "mean"
+    with tenant_tx(run.ctx) as conn:
+        if monetary:
+            missing = missing_conditions(c)
+            key = missing[0] if missing else mixed_basis(conn, c)
+            if key:
+                run.ask(key, CLARIFY_QUESTIONS[key], clarification_options(conn, key, c))
+                return None
+        else:
+            c, key = _record_gap(conn, c, attr, op)
+            if key:
+                run.ask(key, CLARIFY_QUESTIONS[key], clarification_options(conn, key, c, monetary=False))
+                return None
+        args = {"attribute": attr.key, "operation": op, "conditions": c.normalized_key()}
+        if attr.structured_column == "transactions.price_per_sqm" and op in ("mean", "weighted_mean", "median"):
+            answer, _rows = numeric_answer(conn, c)
+            n = (answer.get("numeric") or {}).get("record_count", 0)
+            computed = computed_from_numeric(answer["numeric"], [s["evidence_id"] for s in answer["sources"]]) \
+                if answer["numeric"] else []
+            run.step("compute_records", args, {"count": n}, f"{n} רשומות מאומתות ייחודיות")
+            return Part(answer, computed)
+        r = compute_records(conn, c, attr.structured_column, op)
+        cov = coverage(conn, c)
+        if r.count == 0:
+            run.step("compute_records", args, {"count": 0}, "לא נמצאו רשומות מאומתות תואמות")
+            return Part({"kind": "abstain", "text": abstain_text(c, cov["records_awaiting_verification"]),
+                         "provider": "template", "demo": False, "numeric": None, "sources": [], "coverage": cov,
+                         "abstention_kind": records_abstention_kind(cov),
+                         "limitations": ["לא קיים בסיס מספיק במאגר המשרד; לא הוצג מספר."]})
+        rows = sources_for(conn, r.transaction_ids)
+        body, limitations = structured_text(c, attr.label, op, r, attr.canonical_unit,
+                                            uncertain_duplicates(conn, r.transaction_ids))
+    sources = source_json_rows(rows)
+    ids = [s["evidence_id"] for s in sources]
+    shown = r.values if (r.count <= 5 or op == "values") else None
+    numeric = {"conditions": c.describe(), "attribute": attr.label, "operation": op, "value": _str(r.value),
+               "unit": attr.canonical_unit, "record_count": r.count, "minimum": _str(r.minimum),
+               "maximum": _str(r.maximum), "values": [str(v) for v in shown] if shown is not None else None}
+    computed = [ComputedValue("C1", "מספר הרשומות בחישוב", number(r.count), ids)]
+    if r.value is not None and op not in ("count", "values"):
+        computed.append(ComputedValue("C2", f"{OPERATION_LABELS[op]} {attr.label}",
+                                      _with_unit(r.value, attr.canonical_unit), ids))
+    run.step("compute_records", args, {"count": r.count, "value": _str(r.value)},
+             f"{OPERATION_LABELS[op]} {attr.label} על {r.count} רשומות מאומתות ייחודיות")
+    return Part({"kind": "numeric", "text": body, "provider": "template", "demo": False, "numeric": numeric,
+                 "sources": sources, "coverage": cov, "limitations": limitations}, computed)
+
+
+def _record_gap(conn: Connection, c: QueryConditions, attr: AttributeDef,
+                op: str) -> tuple[QueryConditions, str | None]:
+    """For a record attribute that is not money: ask which records or which date only when the choice
+    changes the result; otherwise take the only choice that has records (R20)."""
+    col = attr.structured_column
+    if c.data_kind is None:
+        kinds = [k for k in ("transaction_price", "appraised_value")
+                 if compute_records(conn, c.model_copy(update={"data_kind": k}), col, "count").count]
+        if len(kinds) > 1:
+            return c, "data_kind"
+        c = c.model_copy(update={"data_kind": kinds[0] if kinds else "transaction_price"})
+    if c.year_from is not None and c.date_field is None:
+        results = set()
+        for f in ("transaction_date", "valuation_date", "report_date"):
+            r = compute_records(conn, c.model_copy(update={"date_field": f}), col, op)
+            results.add((r.count, r.value))
+        if len(results) > 1:
+            return c, "date_field"
+        c = c.model_copy(update={"date_field": "transaction_date" if c.data_kind == "transaction_price"
+                                 else "valuation_date"})
+    return c, None
+
+
+def _value_filter(run: _Run, attr: AttributeDef) -> facts.ValueFilter | None:
+    """The state's condition on the attribute's value; one that cannot apply to it is dropped and said."""
+    spec = run.state.value_filter
+    if spec is None:
+        return None
+    vf = facts.ValueFilter(spec.op, spec.value)
+    try:
+        facts.value_predicate(vf, attr)
+    except ValueError:
+        run.limitations.append(f"התנאי \"{_filter_text(spec, None)}\" אינו מתאים לנתון {attr.label}, ולכן החישוב"
+                               " בוצע בלי התנאי.")
+        run.state = run.state.model_copy(update={"value_filter": None})
+        return None
+    return vf
+
+
+def _facts(run: _Run, attr: AttributeDef) -> Part | None:
+    """An attribute nobody anticipated: extracted with verbatim provenance, computed in code (KTD8, KTD9).
+    A question about named documents (entity scope) computes over those documents only, never across the
+    repository; a condition on the value filters the cases (a count then reports how many of all observed
+    cases meet it)."""
+    vf = _value_filter(run, attr)
+    op = _FACT_OPS.get(run.state.metric or "none", run.state.metric or "mean")
+    if op not in facts.OPERATIONS:
+        op = "mean"
+    if vf is not None and op == "values":
+        op = "count"
+    filters = None if run.scoped else _filters(run)
+    doc_ids = run.scope.document_ids if run.scoped else None
+    comp = facts.extract_and_compute(None, run.ctx, attr, filters, op, provider=run.L.cloud_provider,
+                                     deadline=run.deadline, value_filter=vf, document_ids=doc_ids)
+    total = None
+    if vf is not None:
+        with tenant_tx(run.ctx) as conn:
+            total = facts.compute_facts(conn, attr, filters, comp.operation, document_ids=doc_ids,
+                                        trusted_only=comp.extraction_unavailable is not None)
+    if comp.facts_version is not None:
+        run.facts_versions[str(attr.id)] = comp.facts_version
+    run.statuses += comp.provider_statuses
+    run.cacheable = run.cacheable and comp.cacheable
+    run.partial = run.partial or comp.deadline_reached
+    run.incomplete = run.incomplete or comp.partial
+    cov = comp.coverage
+    where = f" (מוגבל ל{run.scope.describe()})" if run.scoped else ""
+    if comp.value_filter:
+        where += f"; {FILTER_LABEL}: {_filter_text(comp.value_filter, comp.unit)}"
+    run.step("extract_and_compute", {"attribute": attr.key, "operation": comp.operation,
+                                     "filters": filters.__dict__ if filters else None,
+                                     "value_filter": comp.value_filter,
+                                     "documents": [str(d) for d in doc_ids] if doc_ids else None},
+             {"coverage": cov, "main_n": comp.main.n, "preliminary_n": comp.preliminary.n if comp.preliminary else 0,
+              "extraction_unavailable": comp.extraction_unavailable},
+             f"{cov['in_scope']} מסמכים בתחום{where}, ערך נמצא ב-{cov['found']}", comp.provider_statuses)
+    if comp.extraction_unavailable and comp.main.n == 0 and (total is None or total.main.n == 0):
+        # computing a new attribute needs the cloud model or reviewed data: show relevant passages (AE2)
+        run.search_fallback = True
+        run.limitations.append(run.L.pstate.limitation() if run.L.pstate.mode == Mode.ERROR
+                               or run.L.pstate.status is not None else LIMITED_MODE_NOTE)
+        return None
+    with tenant_tx(run.ctx) as conn:
+        general = coverage(conn, None)
+    part = _fact_part(comp, run.state.query_conditions(), general, total, run.state.value_filter)
+    unapplied = [CONTEXT_LABELS.get(k, k) for k in RECORD_ONLY_CONDITIONS
+                 if getattr(run.state.conditions, k, None) is not None]
+    if unapplied and not run.scoped:
+        # a condition the extracted-facts path cannot filter on is said, never silently dropped (GQ38)
+        part.answer["limitations"].append(
+            f"התנאים {', '.join(unapplied)} אינם משמשים לסינון בחישוב על נתונים שחולצו מהמסמכים; החישוב כולל את "
+            "כל המסמכים שבתחום לפי עיר, שכונה ושנים בלבד.")
+    return part
+
+
+def _filter_text(spec: ValueFilterSpec | dict | None, unit: str | None) -> str:
+    if spec is None:
+        return ""
+    op, value = (spec["op"], spec["value"]) if isinstance(spec, dict) else (spec.op, spec.value)
+    label = UNIT_LABELS.get(unit or "", "")
+    return f"{FILTER_OPS_HE.get(op, op)}{value}{' ' + label if label else ''}"
+
+
+def _tier_values(fig, textual: bool) -> list[str] | None:
+    if textual:
+        return [t["value"] for t in fig.text_values or []]
+    return [str(v) for v in fig.values] if fig.values is not None else None
+
+
+def _tier_text(fig, op: str, unit: str | None, textual: bool) -> str:
+    if textual and op == "values":
+        return ", ".join(f"{t['value']} ({t['count']})" if t["count"] > 1 else t["value"]
+                         for t in fig.text_values or []) or "—"
+    return _figure(fig, op, unit)
+
+
+def _fact_part(comp, c: QueryConditions, general: dict, total=None, spec: ValueFilterSpec | None = None) -> Part:
+    op, unit, textual = comp.operation, comp.unit, comp.value_type != "numeric"
+    sources = []
+    for i, s in enumerate(comp.sources, start=1):
+        page = s.get("page")
+        sources.append({"evidence_id": f"E{i}", "document_id": str(s["document_id"]),
+                        "version_id": str(s["version_id"]), "title": s["title"], "page_list": [page] if page else [],
+                        "section": None, "row": None, "snippet": s["quote"], "value": _str(s["value"]),
+                        "tier": s["tier"], "url": source_file_url(s["document_id"], s["version_id"], page)})
+    by_tier = {t: [x["evidence_id"] for x in sources if x["tier"] == t] for t in ("verified", "preliminary")}
+    label = _FACT_LABELS[op]
+    places = ", ".join(x["value"] for x in c.describe() if x["label"] in ("עיר", "שכונה"))
+    condition = _filter_text(spec, unit) if spec is not None and comp.value_filter else ""
+    what = f"{label} {comp.attribute_label}" + (f" שעומדים בתנאי {condition}" if condition else "")
+    counted = op == "count" and total is not None  # a filtered count: of all observed cases, how many pass
+    main_n = total.main.n if counted else comp.main.n
+    pre_n = total.preliminary.n if counted and total.preliminary is not None else (
+        comp.preliminary.n if comp.preliminary is not None else 0)
+
+    cov = comp.coverage
+    audit = comp.audit or {}
+    full = audit.get("completeness", "complete")
+    base = total if total is not None else comp
+    observed = bool(base.main.n or base.preliminary is not None)
+    gaps = _gap_text(cov)
+    # A figure stands for the document set only when nothing in it is unknown; otherwise it is stated over the
+    # observations found (named as such), or not at all when the gaps leave it without meaning (R14, R15).
+    insufficient = observed and full == "insufficient"
+    over = "" if full == "complete" else " בלבד"
+
+    def basis(n: int) -> str:
+        where = f", {places}" if places else ""
+        if counted:
+            return f" (מתוך {n} תצפיות{over}{where})"
+        return f" (מבוסס על {n} תצפיות{over}{where})"
+
+    lines, computed = [], []
+    if not insufficient and main_n:
+        shown = _tier_text(comp.main, op, unit, textual)
+        lines.append(f"{what} לפי ערכים שאומתו: {shown}{basis(main_n)}.")
+        computed.append(ComputedValue("C1", f"{what} (ערכים שאומתו)", shown, by_tier["verified"]))
+    if not insufficient and comp.preliminary is not None and pre_n:
+        shown = _tier_text(comp.preliminary, op, unit, textual)
+        lines.append(f"נתון ראשוני, כולל ערכים שחולצו אוטומטית וטרם נבדקו בידי אדם: {what} {shown}{basis(pre_n)}.")
+        computed.append(ComputedValue(f"C{len(computed) + 1}", f"{what} (נתון ראשוני)", shown,
+                                      by_tier["verified"] + by_tier["preliminary"]))
+    kind = None
+    if not observed:
+        kind = ("not_extracted_or_verified" if cov["not_yet_extracted"] or cov["awaiting_review"]
+                or cov["partial_scan"] else "not_found" if cov["in_scope"] == 0 else "not_stated")
+        lines.append(ABSTENTION_TEXT[kind])
+    elif insufficient:
+        kind = "not_extracted_or_verified"
+        held = [x for x in comp.conflicts if not x.get("included")]
+        reason = gaps or ("לנכס אחד או יותר נמצאו ערכים סותרים שעשויים לקבוע את התוצאה" if held else "")
+        lines.append(f"לא ניתן לחשב {what} שמייצג את המסמכים שבתחום: {reason}. "
+                     f"להלן הערכים שנמצאו עד כה, ללא חישוב כולל.")
+        for conflict in held[:LIST_SOURCES_MAX]:
+            shown_values = " / ".join(
+                f"{_with_unit(v['value'], unit) if isinstance(v['value'], Decimal) else v['value']}"
+                f" ({v.get('title') or ''})" for v in conflict["values"])
+            lines.append(f"• ערכים סותרים לאותו נכס: {shown_values}")
+    elif not counted and not (comp.main.n or pre_n):  # values were observed, none meets the condition
+        lines = [f"אף ערך של {comp.attribute_label} אינו עומד בתנאי {condition}."]
+    if insufficient or op in ("values", "min", "max") or counted:
+        listed = sources if len(sources) <= LIST_SOURCES_MAX else []
+    else:
+        listed = []
+    if op in ("min", "max") and not insufficient:
+        best = comp.main if comp.main.n else comp.preliminary
+        listed = [x for x in listed if best is not None and x["value"] is not None and best.value is not None
+                  and Decimal(x["value"]) == Decimal(str(best.value))]
+    for x in listed:
+        value = x["value"] if textual or x["value"] is None else _with_unit(Decimal(x["value"]), unit)
+        lines.append(f"• {x['title']}: {value} [{x['evidence_id']}]")
+    lines.append(facts.coverage_text(cov))
+    limitations = [FACT_SCOPE_NOTE]
+    if cov.get("place_by_text"):
+        limitations.append(f"{cov['place_by_text']} מסמכים שויכו למקום המבוקש לפי הכותרת או הפתיח שלהם, כי אין בהם"
+                           " נתוני מקום מובנים.")
+    if full == "subset" and observed:
+        limitations.append(f"התוצאה מחושבת רק על התצפיות שנמצאו ואינה מייצגת את כל המסמכים שבתחום: {gaps}.")
+    elif comp.partial:
+        limitations.append("חלק מהמסמכים שבתחום טרם חולצו, ולכן התוצאה חלקית.")
+    if comp.pending_jobs:
+        limitations.append(f"{comp.pending_jobs} מסמכים ממתינים לחילוץ ברקע; שאלו שוב מאוחר יותר.")
+    if any(not x.get("included") for x in comp.conflicts):
+        limitations.append("נמצאו ערכים סותרים לאותו נכס במסמכים שונים; הם הועברו לבדיקה ולא נכללו.")
+    if any(x.get("included") for x in comp.conflicts):
+        limitations.append("לאותו נכס נמצאו ערכים שונים במסמכים שונים; נכלל הערך שאושר בידי אדם, והשאר הועברו "
+                           "לבדיקה.")
+    figure = comp.main if main_n and not insufficient else None
+    numeric = {"conditions": c.describe(), "attribute": comp.attribute_label, "operation": op, "unit": unit,
+               "value": _str(figure.value) if figure else None, "record_count": main_n if figure else 0,
+               "values": _tier_values(figure, textual) if figure else None,
+               "value_filter": comp.value_filter, "value_type": comp.value_type, "completeness": full}
+    pre = comp.preliminary if not insufficient else None
+    shown_numeric = observed and not insufficient
+    answer = {
+        "kind": "numeric" if shown_numeric else "abstain", "text": "\n".join(lines), "provider": "template",
+        "demo": False, "numeric": numeric if shown_numeric else None, "sources": sources,
+        "coverage": general | {"facts": cov}, "limitations": limitations, "abstention_kind": kind,
+        "preliminary": {"value": _str(pre.value), "record_count": pre_n,
+                        "values": _tier_values(pre, textual)} if pre else None,
+        "pending_extraction": cov["not_yet_extracted"], "audit": audit,
+    }
+    return Part(answer, computed)
+
+
+def _gap_text(cov: dict) -> str:
+    """The documents in scope whose value is unknown, in words ("" when there are none)."""
+    parts = []
+    for key, label in (("not_yet_extracted", "{n} מסמכים טרם חולצו"), ("partial_scan", "{n} מסמכים נקראו חלקית"),
+                       ("awaiting_review", "{n} ערכים ממתינים לבדיקה"),
+                       ("unknown_metadata", "{n} מסמכים ללא נתוני סינון")):
+        if cov.get(key):
+            parts.append(label.format(n=cov[key]))
+    return "; ".join(parts)
+
+
+def _search_queries(run: _Run, combined: bool) -> tuple[list[str], list[str], MetadataFilters | None]:
+    """Queries, place terms (never topic terms) and metadata filters of a content search. Named documents
+    (entity scope) replace the place filters: they are narrower, and their names are place terms."""
+    s = run.state.conditions
+    places = [p for p in (s.city, s.neighborhood) if p]
+    queries = [q for q in run.plan.search_queries if q and q.strip()] or [run.question]
+    if run.search_fallback and run.attribute is not None:
+        queries = [run.question, run.attribute.label]
+    if run.scoped:
+        return queries, [*places, *run.scope.terms], None
+    # The model's places and years scope a content search; the rules' places only rank (as before).
+    scoped = run.it.mode == "model" and not combined
+    if combined and places:
+        queries = [f"{q} {' '.join(places)}" for q in queries]
+    return queries, places, _filters(run) if scoped else None
+
+
+def _two_sided(run: _Run) -> bool:
+    """A comparison or conflict question, or one entity that several documents name: every document's
+    statement is shown, never one silently chosen (R10, R22)."""
+    return run.plan.task_type == "compare" or (
+        run.scoped and run.scope.ambiguous and len(run.scope.documents) <= TWO_SIDED_MAX_DOCUMENTS)
+
+
+def _search(run: _Run, base: Part | None) -> dict:
+    """Search authorized content and compose an answer from verified claims; with ``base`` (a computation)
+    the result is the combined answer and the model sees the computed values by handle only."""
+    queries, places, filters = _search_queries(run, base is not None)
+    base_sources = base.answer["sources"] if base else []
+    scope = run.scope.search() if run.scoped else None
+    with tenant_tx(run.ctx) as conn:
+        out = search_evidence(conn, queries, EVIDENCE_LIMIT * 2, scope=scope, filters=filters, place_terms=places)
+        hits = [h for h in out.hits if h["lexical_support"]][:EVIDENCE_LIMIT]
+        evidence = evidence_from_hits(hits, len(base_sources) + 1)
+        cov = base.answer["coverage"] if base else coverage(conn, None)
+    unknown = out.filter_report.unknown_count if out.filter_report else 0
+    args = {"queries": queries, "filters": filters.__dict__ if filters else None,
+            "documents": [str(d) for d in scope.document_ids] if scope else None}
+    limitations = list(base.answer["limitations"]) if base else []
+    if unknown:
+        limitations.append(f"{unknown} מסמכים ללא נתוני מקום או תאריך לא נכללו בחיפוש.")
+    kind = no_evidence_kind(run.ctx)
+    if not evidence:
+        run.step("search", args, {"evidence": 0}, "לא נמצאו קטעים רלוונטיים")
+        if base:
+            answer = dict(base.answer)
+            answer["kind"] = "combined"
+            answer["limitations"] = limitations + ["לא נמצאו קטעי הסבר רלוונטיים במסמכים המורשים."]
+            return answer
+        return {"kind": "abstain", "provider": "template", "demo": False, "sources": [], "coverage": cov,
+                "text": ABSTENTION_TEXT[kind], "numeric": None,
+                "limitations": limitations + ["החיפוש בוצע רק במסמכי המשרד שעובדו ושאתם מורשים לראות."],
+                "claims": [], "abstention_kind": kind, "dropped_claims": 0}
+    provider = run.L.provider
+    if provider is not None and time.monotonic() >= run.deadline:
+        provider, run.partial = None, True
+    comp = compose_answer(provider, run.question, evidence, computed=base.computed if base else [],
+                          deadline=run.deadline,
+                          cited_extra={s["evidence_id"]: s.get("snippet") or "" for s in base_sources},
+                          two_sided=_two_sided(run), no_evidence_kind=kind)
+    statuses = [str(u.status) for u in comp.usage]
+    if comp.usage:
+        with tenant_tx(run.ctx) as conn:
+            log_usages(conn, provider, comp.usage)
+    run.statuses += statuses
+    run.cacheable = run.cacheable and comp.cacheable
+    run.step("search", args, {"evidence": len(evidence), "claims": len(comp.claims), "provider": comp.provider},
+             f"{len(evidence)} קטעי ראיה מתוך המסמכים המורשים", statuses)
+    limitations += comp.limitations
+    sources = base_sources + source_json(evidence)
+    fields = answer_fields(comp, run.L.pstate.mode.value)
+    if base:
+        answer = dict(base.answer)
+        answer.update({"kind": "combined", "text": base.answer["text"] + "\n\n" + comp.text,
+                       "provider": comp.provider if comp.provider != "extractive" else "template",
+                       "demo": comp.demo, "sources": sources, "limitations": limitations, **fields,
+                       "abstention_kind": combined_abstention_kind(base.answer, comp)})
+        return answer
+    return {"kind": "content", "text": comp.text, "provider": comp.provider, "demo": comp.demo, "sources": sources,
+            "coverage": cov, "limitations": limitations, "numeric": None, **fields}
+
+
+def _locate(run: _Run) -> dict:
+    """The documents where the subject appears, ranked, with the pages of their supporting passages (no model
+    call). Only documents whose passages carry the question's topic are listed (``locate_evidence``)."""
+    queries, places, filters = _search_queries(run, False)
+    scope = run.scope.search() if run.scoped else None
+    with tenant_tx(run.ctx) as conn:
+        out = locate_evidence(conn, queries, scope=scope, filters=filters, place_terms=places, question=run.question)
+        cov = coverage(conn, None)
+    evidence: list[dict] = []
+    docs = []
+    for d in out.documents:
+        found = evidence_from_hits(d.passages, len(evidence) + 1)
+        evidence += found
+        docs.append((d, found))
+    run.step("locate", {"queries": queries, "filters": filters.__dict__ if filters else None,
+                        "documents": [str(x) for x in scope.document_ids] if scope else None},
+             {"evidence": len(evidence), "documents": len(docs)}, f"{len(docs)} מסמכים")
+    # only the user's own words can be "absent": a word the interpreter's rephrasing added ("מיליון" for "מ׳")
+    # that occurs in no document says nothing about the question
+    words = [w.strip(".,:;?!\"'") for w in base_normalize(run.question).split()]
+    asked = {f for w in words if w for f in (w, *prefix_variants(w))}
+    absent = [t for t in (getattr(out, "absent_terms", None) or []) if t in asked]
+    absent_note = f"המילים {', '.join('«' + t + '»' for t in absent)} לא נמצאו באף מסמך בתחום." if absent else ""
+    if not evidence:
+        kind = no_evidence_kind(run.ctx)
+        return {"kind": "abstain", "provider": "template", "demo": False, "sources": [], "coverage": cov,
+                "text": ABSTENTION_TEXT[kind] + (f" {absent_note}" if absent_note else ""), "numeric": None,
+                "claims": [], "abstention_kind": kind,
+                "limitations": ["החיפוש בוצע רק במסמכי המשרד שעובדו ושאתם מורשים לראות."]}
+    if absent and not any(d.full_support for d, _ in docs):
+        # A document that lacks only the words found nowhere (a word misread in a scanned report, or spelled
+        # otherwise) is listed, with the absent words named; weaker partial matches are near sources, never
+        # the answer (R22).
+        # strong: the words found carry the question (at least two, twice as many as the words found nowhere);
+        # a qualifier found nowhere next to one common word ("X מוצף") lists nothing
+        strong = [(d, found) for d, found in docs if set(d.missing_terms) <= set(absent)
+                  and _topic_matches(d) >= max(2, 2 * len(absent))]
+        if strong:
+            docs = strong
+            evidence = [e for _, found in strong for e in found]
+    if absent and not any(d.full_support for d, _ in docs) and not any(
+            set(d.missing_terms) <= set(absent) and _topic_matches(d) >= max(2, 2 * len(absent))
+            for d, _ in docs):
+        kind = no_evidence_kind(run.ctx)
+        lines = [ABSTENTION_TEXT[kind], absent_note, "מסמכים שבהם נמצאו רק חלק ממילות השאלה:"]
+        for d, found in docs:
+            lines.append(f"• {d.title} " + " ".join("[" + e["evidence_id"] + "]" for e in found))
+        return {"kind": "abstain", "provider": "template", "demo": False, "sources": source_json(evidence),
+                "coverage": cov, "text": "\n".join(lines), "numeric": None, "claims": [], "abstention_kind": kind,
+                "limitations": ["החיפוש בוצע רק במסמכי המשרד שעובדו ושאתם מורשים לראות."]}
+    lines = ["המסמכים שבהם נמצאו קטעים רלוונטיים:"]
+    for d, found in docs:
+        pages = f" — עמ׳ {', '.join(map(str, d.pages))}" if d.pages else ""
+        cites = " ".join("[" + e["evidence_id"] + "]" for e in found)
+        lines.append(f"• {d.title}{pages} {cites}")
+    limitations = ["רשימת המסמכים מבוססת על חיפוש בתוכן המסמכים המורשים."]
+    if any(not d.full_support for d, _ in docs):
+        limitations.append("בחלק מהמסמכים נמצאו רק חלק ממילות השאלה.")
+    if absent_note:
+        limitations.append(absent_note)
+    return {"kind": "content", "text": "\n".join(lines), "provider": "template", "demo": False,
+            "sources": source_json(evidence), "coverage": cov, "numeric": None, "claims": [],
+            "abstention_kind": None, "limitations": limitations}
+
+
+def _topic_matches(d) -> int:
+    """Matched words that can carry a topic: a number (a house number, a plan number) only places it."""
+    return sum(1 for w in d.matched_terms if not any(ch.isdigit() for ch in w))
+
+
+def _compare_sides(run: _Run, step: Step) -> list[CompareSide]:
+    """The sides of a comparison: the conversation's source handles, then the documents the entities name.
+    One document with several versions compares its two latest visible versions (R11)."""
+    refs = [run.state.sources[h] for h in dict.fromkeys(step.source_handles) if h in run.state.sources]
+    if len({r.document_id for r in refs}) == 1 and len({r.version_id for r in refs}) > 1:
+        return [CompareSide(version_id=UUID(r.version_id)) for r in {r.version_id: r for r in refs}.values()]
+    docs = list(dict.fromkeys(UUID(r.document_id) for r in refs))
+    entity_docs = run.scope.documents if run.scoped else []
+    docs += [d.document_id for d in entity_docs if d.document_id not in docs]
+    if len(docs) >= 2:
+        return [CompareSide(document_id=d) for d in docs[:MAX_COMPARE_SIDES]]
+    matched = next((d for d in entity_docs if docs and d.document_id == docs[0]), None)
+    if matched is not None and len(matched.versions) >= 2:
+        return [CompareSide(version_id=v.version_id) for v in reversed(matched.versions[:2])]
+    return [CompareSide(document_id=d) for d in docs]
+
+
+def _compare(run: _Run, step: Step) -> dict | None:
+    """Two sides from the conversation's source handles or the named documents (R10, R11); a referent
+    clarification only when they do not give two sides."""
+    sides = _compare_sides(run, step)
+    if len(sides) < 2:
+        others = [h for h in run.state.sources if h not in step.source_handles]
+        run.known_sides = list(dict.fromkeys(step.source_handles))
+        if sides or step.source_handles:
+            run.ask("referent", REFERENT_COMPARE_SECOND, [{"value": h, "label": f"מקור {h}"} for h in others])
+        else:
+            run.ask("referent", REFERENT_COMPARE_SIDES, [])
+        return None
+    # Gather per-side evidence in a short transaction, compose (answer and judge calls) with no connection,
+    # then log the calls in a final short transaction (R26, KTD13).
+    with tenant_tx(run.ctx) as conn:
+        gathered = gather_sides(conn, run.question, sides, queries=run.plan.search_queries)
+    provider = run.L.provider
+    if provider is not None and not gathered.missing and time.monotonic() >= run.deadline:
+        provider, run.partial = None, True
+    out = compose_comparison(gathered, provider, run.L.pstate, deadline=run.deadline)
+    if out.usage:
+        with tenant_tx(run.ctx) as conn:
+            log_usages(conn, provider, out.usage)
+    statuses = [str(u.status) for u in out.usage]
+    run.statuses += statuses
+    run.cacheable = run.cacheable and out.cacheable
+    info = out.answer.get("compare", {})
+    run.step("compare", {"sides": [str(s.version_id or s.document_id) for s in sides]},
+             {"incomplete": info.get("incomplete"), "sides": [s["evidence_count"] for s in info.get("sides", [])]},
+             "השוואה בין " + " ו-".join(s["label"] for s in info.get("sides", [])), statuses)
+    return out.answer
+
+
+def _previous_answer(run: _Run):
+    with tenant_tx(run.ctx) as conn:
+        return conn.execute(text(
+            "SELECT question_text, plan, steps, answer, conditions FROM questions WHERE conversation_id = :c"
+            " AND status = 'done' AND id <> :q AND answer_kind <> 'clarification'"
+            " AND NOT coalesce((plan->>'meta')::boolean, false) ORDER BY created_at DESC LIMIT 1"),
+            {"c": run.L.conversation_id, "q": run.question_id}).first()
+
+
+def _reauthorized(run: _Run, sources: list[dict]) -> tuple[list[dict], int]:
+    with tenant_tx(run.ctx) as conn:
+        ok = [s for s in sources if sources_still_authorized(conn, [s])]
+    return ok, len(sources) - len(ok)
+
+
+def _meta(run: _Run, why: bool) -> dict:
+    """"למה?" and "תראה לי את המקור": the previous answer's method and sources, re-authorized now; no
+    model call and never a previous answer as a factual source (R19)."""
+    prev = _previous_answer(run)
+    tool = "explain_previous" if why else "show_sources"
+    base = {"provider": "template", "demo": False, "coverage": None, "numeric": None, "claims": [],
+            "abstention_kind": None, "meta": tool}
+    if prev is None:
+        run.step(tool, {}, {"previous": False}, "אין תשובה קודמת")
+        return base | {"kind": "abstain", "text": "אין בשיחה זו תשובה קודמת.", "sources": [], "limitations": []}
+    sources, gone = _reauthorized(run, (prev.answer or {}).get("sources", []))
+    run.step(tool, {}, {"sources": len(sources), "unavailable": gone}, f"{len(sources)} מקורות זמינים")
+    gone_note = (f"{gone} מקורות של התשובה הקודמת כבר אינם זמינים: המסמך נמחק, הוחלף בגרסה חדשה או שאין לכם"
+                 " עוד הרשאה לראותו.") if gone else None
+    if why:
+        lines = [f"כך התקבלה התשובה לשאלה \"{prev.question_text}\":"]
+        for st in prev.steps or []:
+            lines.append(f"• {TOOL_LABELS.get(st.get('tool'), st.get('tool'))}: {st.get('summary') or ''}".rstrip(": "))
+        conds = QueryConditions.model_validate(prev.conditions).describe() if prev.conditions else []
+        if conds:
+            lines.append("תנאים: " + "; ".join(f"{x['label']}: {x['value']}" for x in conds) + ".")
+        lines.append(f"מקורות שנבדקו מחדש וזמינים: {len(sources)}." + (f" {gone_note}" if gone_note else ""))
+        limitations = ["ההסבר מתאר את השיטה ואת המקורות של התשובה הקודמת; הוא אינו מקור עובדתי בפני עצמו."]
+        return base | {"kind": "content", "text": "\n".join(lines), "sources": sources, "limitations": limitations}
+    if not sources:
+        text_ = "המקור של התשובה הקודמת כבר אינו זמין." + (f" {gone_note}" if gone_note else "")
+        return base | {"kind": "abstain", "text": text_, "sources": [], "limitations": []}
+    lines = ["המקורות של התשובה הקודמת:"]
+    for s in sources:
+        pages = f", עמ׳ {', '.join(map(str, s['page_list']))}" if s.get("page_list") else ""
+        lines.append(f"• {s['title']}{pages} [{s['evidence_id']}]")
+    if gone_note:
+        lines.append(gone_note)
+    return base | {"kind": "content", "text": "\n".join(lines), "sources": sources, "limitations": []}
+
+
+def _unknown_place(run: _Run) -> dict:
+    with tenant_tx(run.ctx) as conn:
+        cov = coverage(conn, None)
+    name = run.it.unknown_place
+    body = (f"אין במאגר המשרד רשומות עבור \"{name}\". לא חושב מספר." if name
+            else "לא ניתן לענות על השאלה על סמך מסמכי המשרד.")
+    run.step("abstain", {}, {"unknown_place": name}, "מקום שאינו במאגר המשרד" if name else "אין דרך לענות")
+    return {"kind": "abstain", "provider": "template", "demo": False, "sources": [], "coverage": cov, "text": body,
+            "numeric": None, "abstention_kind": "not_found",
+            "limitations": ["המערכת עונה רק על סמך מסמכי המשרד ואינה משלימה מידע ממקורות אחרים."]}
+
+
+FOLLOW_UP_WITHOUT_CONTEXT = "לאיזה נושא מתייחסת שאלת ההמשך? בשיחה זו אין עדיין שאלה קודמת; כתבו את השאלה המלאה."
+
+
+def _has_context(state) -> bool:
+    """A follow-up needs something to follow: an earlier task, topic, attribute or stated condition."""
+    c = state.conditions
+    return bool(state.task_type or state.topic or state.attribute or state.recent_questions
+                or any(getattr(c, k, None) is not None for k in type(c).model_fields))
+
+
+def _default_steps(plan: TurnPlan) -> list[Step]:
+    if plan.steps:
+        return list(plan.steps)
+    tool = {"compute": "compute_records", "compute_explain": "compute_records", "locate": "locate",
+            "compare": "compare"}.get(plan.task_type, "search")
+    steps = [Step(tool=tool, attribute_handle=None, source_handles=[])]
+    if plan.task_type == "compute_explain":
+        steps.append(Step(tool="search", attribute_handle=None, source_handles=[]))
+    return steps
+
+
+def _execute_steps(run: _Run, steps: list[Step]) -> dict | None:
+    """At most four steps; the first computation runs first so a search can explain it (combined)."""
+    steps = sorted(steps[:MAX_STEPS], key=lambda s: s.tool not in COMPUTE_TOOLS)
+    tools = {s.tool for s in steps}
+    if "compare" in tools:  # the comparison reads each side's evidence itself and is the presentation
+        steps = [s for s in steps if s.tool not in ("search", "locate")]
+    elif {"search", "locate"} <= tools:  # one presentation: a document list only when documents were asked for
+        drop = "search" if run.plan.task_type == "locate" else "locate"
+        steps = [s for s in steps if s.tool != drop]
+    base: Part | None = None
+    answer: dict | None = None
+    computed = searched = False
+    for step in steps:
+        if step.tool in COMPUTE_TOOLS:
+            if computed:
+                continue
+            computed = True
+            attr = run.attribute
+            if attr is None:
+                continue
+            base = _records(run, attr) if attr.source == "structured" else _facts(run, attr)
+            if run.clarification is not None:
+                return None
+            if base is not None:
+                answer = base.answer
+        elif step.tool == "search":
+            if not searched:
+                searched = True
+                answer = _search(run, base)
+        elif step.tool == "locate":
+            answer = _locate(run)
+        elif step.tool == "compare":
+            answer = _compare(run, step)
+            if run.clarification is not None:
+                return None
+    if answer is None and (run.search_fallback or not searched):
+        answer = _search(run, None)
+    return answer
+
+
+def _empty(answer: dict | None) -> bool:
+    return answer is None or (answer["kind"] == "abstain" and not answer.get("sources") and not answer.get("numeric"))
+
+
+def _replan(run: _Run) -> TurnPlan | None:
+    """One replan in cloud mode when the steps returned nothing; the model sees step summaries only."""
+    provider = run.L.cloud_provider
+    if provider is None or time.monotonic() >= run.deadline:
+        return None
+    summaries = [{"tool": s["tool"], "summary": s["summary"]} for s in run.steps]
+    payload = json.loads(build_interpret_input(run.question, run.state, run.L.gazetteer, run.L.attributes))
+    payload["previous_steps"] = summaries
+    payload["replan_note"] = "הצעדים הקודמים לא החזירו תוצאה. הצע ניסוח חיפוש או צעדים אחרים."
+    try:
+        result = call_structured(provider, Purpose.INTERPRET, INTERPRET_INSTRUCTIONS,
+                                 json.dumps(payload, ensure_ascii=False), TurnPlan, deadline=run.deadline)
+    except Exception as exc:  # noqa: BLE001 - a failed replan keeps the answer already computed
+        result = StructuredResult(CallStatus.ERROR, detail=type(exc).__name__)
+    with tenant_tx(run.ctx) as conn:
+        log_usage(conn, provider, Purpose.INTERPRET.value, result, result.ok)
+    run.statuses.append(str(result.status))
+    if not result.ok:
+        return None
+    check = _validate_plan(result.parsed, gazetteer=run.L.gazetteer, attributes=run.L.attributes,
+                           source_handles=run.state.sources)
+    return check.plan if check.ok and check.plan.steps else None
+
+
+# --- cache ------------------------------------------------------------------------------------------------
+
+def scope_hash(ctx: TenantContext) -> str:
+    scope = "admin" if ctx.is_admin else "employee:" + ",".join(sorted(str(g) for g in ctx.group_ids))
+    return hashlib.sha256(scope.encode()).hexdigest()[:32]
+
+
+def cache_key(run: _Run, facts_version: int | None) -> str:
+    """The canonical validated task plus every version it depends on (KTD14)."""
+    plan, s, attr, L = run.plan, run.state, run.attribute, run.L
+    tools = sorted({st.tool for st in _default_steps(plan)})
+    content = any(t in CONTENT_TOOLS for t in tools)
+    extracted = attr is not None and attr.source != "structured"
+    payload = {
+        "office": str(run.ctx.office_id), "scope": scope_hash(run.ctx), "task": plan.task_type, "tools": tools,
+        "attribute": [attr.key, facts.extraction_version(attr) if extracted else None] if attr else None,
+        "facts_version": facts_version if extracted else None,
+        "metric": s.metric, "unit": s.unit, "conditions": s.conditions.model_dump(),
+        "value_filter": s.value_filter.model_dump() if s.value_filter else None,
+        "value_type": attr.value_type if attr else None,
+        "documents": sorted(str(d) for d in run.scope.document_ids) if run.scoped else None,
+        "query": [" ".join(q.split()) for q in (plan.search_queries or [run.question])] if content else None,
+        "sources": sorted(s.sources[h].version_id for st in plan.steps for h in st.source_handles
+                          if h in s.sources),
+        "data_version": L.data_version, "settings_version": L.settings_version,
+        "provider": [L.pstate.mode.value, L.provider.name, L.provider.model] if L.provider else [L.pstate.mode.value],
+        "prompt": ANSWER_PROMPT_VERSION, "embedding": get_embedding_provider().model_id, "template": TEMPLATE_VERSION,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+
+
+def _cached(run: _Run) -> dict | None:
+    """A cached answer whose sources are all still authorized, with coverage recomputed (R21)."""
+    attr = run.attribute
+    with tenant_tx(run.ctx) as conn:
+        fv = conn.execute(text("SELECT facts_version FROM attribute_definitions WHERE id = :a"),
+                          {"a": attr.id}).scalar() if attr is not None else None
+        payload = conn.execute(text("SELECT payload FROM answer_cache WHERE cache_key = :k"),
+                               {"k": cache_key(run, fv)}).scalar()
+        if not payload or "answer" not in payload:
+            return None
+        answer = payload["answer"]
+        if answer.get("kind") == "clarification" or not sources_still_authorized(conn, answer.get("sources", [])):
+            return None
+        c = run.state.query_conditions()
+        cov = coverage(conn, c if c.data_kind else None)
+        if attr is not None and attr.source != "structured" and (answer.get("coverage") or {}).get("facts"):
+            op = (answer.get("numeric") or {}).get("operation") or "mean"
+            cov["facts"] = facts.compute_facts(
+                conn, attr, None if run.scoped else _filters(run), op if op in facts.OPERATIONS else "mean",
+                document_ids=run.scope.document_ids if run.scoped else None).coverage
+    run.steps = list(payload.get("steps") or [])
+    run.facts_versions = dict(payload.get("facts_versions") or {})
+    return answer | {"coverage": cov, "cached": True}
+
+
+# --- the turn ---------------------------------------------------------------------------------------------
+
+def _intent(task: str | None) -> str | None:
+    return {"compute": "calculation", "compute_explain": "combined", "answer": "explanation", "compare": "explanation",
+            "locate": "document_lookup"}.get(task or "")
+
+
+def _str(value) -> str | None:
+    return None if value is None else str(value)
+
+
+def _with_unit(value, unit: str | None) -> str:
+    label = UNIT_LABELS.get(unit or "", "")
+    if unit == "year":  # a calendar year is never written with a thousands separator
+        year = Decimal(str(value))
+        return str(int(year)) if year == year.to_integral_value() else str(year)
+    shown = number(Decimal(str(value)) if not isinstance(value, int) else value)
+    return f"{shown} {label}" if label else shown
+
+
+def _figure(fig, op: str, unit: str | None) -> str:
+    if op == "values":
+        return ", ".join(_with_unit(v, unit) for v in fig.values or []) or "—"
+    if op == "count":
+        return number(fig.value)
+    if op == "range" and fig.minimum is not None:
+        return f"{_with_unit(fig.minimum, unit)}–{_with_unit(fig.maximum, unit)}"
+    return "—" if fig.value is None else _with_unit(fig.value, unit)
+
+
+def context_items(state: ConversationState) -> list[dict]:
+    """The state's context as chips: key (what ``remove`` takes), Hebrew label and display value."""
+    out = []
+    if state.attribute is not None and (state.attribute.description or state.attribute.handle):
+        out.append({"key": "attribute", "label": CONTEXT_LABELS["attribute"],
+                    "value": state.attribute.description or state.attribute.handle})
+    if state.metric and state.metric != "none":
+        out.append({"key": "metric", "label": CONTEXT_LABELS["metric"],
+                    "value": OPERATION_LABELS.get(state.metric, state.metric)})
+    described = {d["label"]: d["value"] for d in state.query_conditions().describe()}
+    c = state.conditions
+    for key, value in (("data_kind", c.data_kind), ("city", c.city), ("neighborhood", c.neighborhood)):
+        if value:
+            out.append({"key": key, "label": CONTEXT_LABELS[key],
+                        "value": described.get(CONTEXT_LABELS[key], value) if key != "data_kind"
+                        else described.get("סוג הנתון", value)})
+    if c.year_from is not None:
+        years = str(c.year_from) if c.year_to in (None, c.year_from) else f"{c.year_from}–{c.year_to}"
+        out.append({"key": "years", "label": CONTEXT_LABELS["years"], "value": years})
+    if c.date_field:
+        out.append({"key": "date_field", "label": CONTEXT_LABELS["date_field"], "value": DATE_FIELD_LABELS[c.date_field]})
+    for key in ("property_type", "area_type", "vat_basis"):
+        if getattr(c, key):
+            label = CONTEXT_LABELS[key]
+            out.append({"key": key, "label": label, "value": described.get(label, getattr(c, key))})
+    return out
+
+
+def _cleared_items(before: ConversationState, keys: list[str]) -> list[dict]:
+    items = {i["key"]: i for i in context_items(before)}
+    out = []
+    for key in keys:
+        k = "years" if key in ("year_from", "year_to") else key
+        if k in items and items[k] not in out:
+            out.append(items[k])
+    return out
+
+
+def _method(steps: list[dict]) -> str | None:
+    lines = [f"{TOOL_LABELS.get(s['tool'], s['tool'])}: {s.get('summary') or ''}".rstrip(": ") for s in steps
+             if s.get("tool") in TOOL_LABELS]
+    return "; ".join(lines) or None
+
+
+def _note(L: Loaded, it: Interpreted, state: ConversationState, resolved) -> str | None:
+    """A one-line interpretation note for the UI: how a typed reply was read, or that a clarification is
+    still open."""
+    before = L.state.pending
+    if before is None or not it.free_text:
+        return None
+    if resolved is not None:
+        label = next((o.label for o in before.options if o.value == resolved[1]), resolved[1])
+        return f"התשובה הובנה כמענה לשאלת ההבהרה: {label}."
+    if state.pending is not None and state.pending.key == before.key and state.pending.question == before.question:
+        return f"שאלת ההבהרה הקודמת עדיין פתוחה: {before.question}"
+    return None
+
+
+def execute_turn(ctx: TenantContext, it: Interpreted, L: Loaded, question_id: UUID, started: float) -> TurnResult:
+    """Apply the interpreted plan to ``L.state`` and execute it (each tool in its own short transaction)."""
+    route = it.mode
+    plan_record = {"mode": it.mode, "status": it.status, "meta": False,
+                   "turn_plan": it.plan.model_dump(mode="json") if it.plan else None}
+    if it.mode == "model" and it.plan is not None:
+        plan_record["model_plan"] = plan_record["turn_plan"]  # as the model returned it, before the server policy
+    if it.answer is not None:  # a direct clarification that changes no state
+        answer = _finish(it.answer, L, it, [], None, [], False)
+        return TurnResult(answer, None, None, [], {}, None, route, None, conflict_pending=it.conflict)
+
+    if it.mode == "model" and it.plan is not None:
+        it.plan = normalize_model_plan(it.plan, L.state, it.question)
+        if not _has_context(L.state) and (it.plan.turn_relation == "follow_up" or (
+                continuation_form(it.question) and it.plan.task_type == "clarify")):
+            it.plan = it.plan.model_copy(update={"task_type": "clarify", "steps": [], "clarification": (
+                ProposedClarification(key="referent", question=FOLLOW_UP_WITHOUT_CONTEXT, options=[]))})
+    plan, start = _expand_versions(ctx, it.plan, L.state)
+    plan, scope = _scope_turn(ctx, it, plan, start, L)
+    new_state, effects = apply_turn(start, plan, question=it.question if it.mode not in ("button", "edit") else None)
+    cleared = list(effects.cleared)
+    deadline = started + get_settings().turn_deadline_seconds - DEADLINE_MARGIN_SECONDS
+    run = _Run(ctx, L, it, plan, new_state, question_id, deadline, scope=scope)
+    if it.status is not None:
+        run.statuses.append(it.status)
+    try:
+        run.state.query_conditions()
+    except ValidationError:
+        answer = _finish(clarification_answer("referent", BAD_YEARS, []), L, it, [], None, [], False)
+        return TurnResult(answer, None, None, [], {}, None, route, None)
+
+    answer: dict | None = None
+    cached = False
+    if effects.clarification is None and plan.turn_relation in META_RELATIONS:
+        plan_record["meta"] = True
+        answer = _meta(run, plan.turn_relation == "meta_why")
+    elif effects.clarification is None and plan.task_type == "abstain":
+        answer = _unknown_place(run)
+    elif effects.clarification is None:
+        run.attribute = _plan_attribute(run)
+        answer = _cached(run)
+        cached = answer is not None
+        if not cached:
+            answer = _execute_steps(run, _default_steps(plan))
+            if (run.clarification is None and it.mode == "model" and _empty(answer)
+                    and len(run.steps) < MAX_STEPS and (replanned := _replan(run)) is not None):
+                run.plan = plan.model_copy(update={"search_queries": replanned.search_queries or plan.search_queries})
+                retry = _execute_steps(run, replanned.steps[:MAX_STEPS - len(run.steps)])
+                answer = retry if not _empty(retry) else answer
+                plan_record["replan"] = replanned.model_dump(mode="json")
+    clarification = effects.clarification or run.clarification
+    if clarification is not None:
+        state = run.state
+        if run.clarification is not None:  # a tool found a result-changing gap
+            state = state.model_copy(update={"task_type": "clarify", "pending": PendingClarification(
+                key=clarification.key, question=clarification.question, options=clarification.options,
+                original_question=it.question, task_type=plan.task_type, topic=state.topic,
+                entities=state.entities, conditions=state.conditions, attribute=state.attribute,
+                metric=state.metric, unit=state.unit, value_filter=state.value_filter,
+                source_handles=run.known_sides if clarification.key == "referent" else [],
+                search_queries=list(plan.search_queries))})
+        answer = clarification_answer(clarification.key, clarification.question,
+                                      [o.model_dump() for o in clarification.options])
+        run.state = state
+    if answer is None:
+        answer = _unknown_place(run)
+    refs = [SourceRef(document_id=str(s["document_id"]), version_id=str(s["version_id"]),
+                      page=(s.get("page_list") or [None])[0]) for s in answer.get("sources", [])]
+    run.state, _handles = remember_sources(run.state, refs)
+    for key in it.removed:  # chip removals the condition delta cannot express
+        if getattr(run.state, key) is not None:
+            run.state = run.state.model_copy(update={key: None})
+            cleared.append(key)
+        if key == "attribute" and run.state.value_filter is not None:  # the condition was on that attribute
+            run.state = run.state.model_copy(update={"value_filter": None})
+    note = _note(L, it, run.state, effects.resolved)
+    if clarification is None and not plan_record["meta"]:
+        run.limitations += _scope_notes(run)
+    # the task the server ran; a turn the server turned into a question before any tool ran is a clarification
+    # (a tool's question keeps the planned task: the computation waits on the choice)
+    plan_record["turn_plan"] = (plan.model_copy(update={"task_type": "clarify"}) if effects.clarification is not None
+                                else plan).model_dump(mode="json")
+    answer = _finish(answer, L, it, run.steps, note, _cleared_items(L.state, cleared), run.partial,
+                     run.state, run.limitations + _failure_notes(run.statuses, L.pstate), run.incomplete)
+    meta = plan_record["meta"]
+    key = payload = None
+    if (not cached and not meta and clarification is None and plan.task_type != "abstain"
+            and answer["kind"] in CACHEABLE_KINDS and run.cacheable and not run.partial and not run.incomplete
+            and all(s == CallStatus.OK.value for s in run.statuses) and it.status in (None, CallStatus.OK.value)
+            and L.pstate.mode != Mode.ERROR):
+        fv = run.facts_versions.get(str(run.attribute.id)) if run.attribute is not None else None
+        key = cache_key(run, fv)
+        payload = {"answer": {k: v for k, v in answer.items() if k not in PER_TURN_FIELDS},
+                   "steps": run.steps, "facts_versions": run.facts_versions}
+    conditions = run.state.query_conditions(_intent(plan.task_type) or "calculation")
+    return TurnResult(answer, run.state, plan_record, run.steps, run.facts_versions,
+                      _intent(plan.task_type), route + ("+cache" if cached else ""),
+                      conditions.model_dump(), cache_key=key, cache_payload=payload)
+
+
+def _scope_notes(run: _Run) -> list[str]:
+    """What the entity scope means for the answer: named addresses that match no visible document, and one
+    entity that several documents name (each document's statement is shown)."""
+    scope = run.scope
+    if scope is None:
+        return []
+    notes = [UNMATCHED_NOTE.format(entity=e) for e in scope.unmatched]
+    if notes and not scope.active:
+        notes.append(UNSCOPED_NOTE)
+    if scope.ambiguous and run.plan.task_type != "compare":
+        notes.append(AMBIGUOUS_NOTE.format(n=len(scope.documents), titles="; ".join(d.title for d in scope.documents)))
+    return notes
+
+
+def _failure_notes(statuses: list[str], pstate: ProviderState) -> list[str]:
+    """A visible limitation per distinct provider failure in this turn (never hidden behind a demo answer)."""
+    out = []
+    for st in dict.fromkeys(statuses):
+        if st in (CallStatus.OK.value, CallStatus.UNSUPPORTED.value):
+            continue
+        reason = FAILURE_REASONS.get(st, FAILURE_REASONS[CallStatus.ERROR])
+        out.append(f"{reason} ({pstate.provider_name}); חלק מהתשובה הורכב ללא המודל.")
+    return out
+
+
+def _conditions(state: ConversationState | None) -> list[dict]:
+    """The confirmed conditions of the answer, including a condition on the attribute's value."""
+    if state is None:
+        return []
+    out = state.query_conditions().describe()
+    if state.value_filter is not None:
+        unit = canonical_unit_for(state.attribute.unit_dimension) if state.attribute else None
+        out.append({"label": FILTER_LABEL, "value": _filter_text(state.value_filter, unit)})
+    return out
+
+
+def _finish(answer: dict, L: Loaded, it: Interpreted, steps: list[dict], note: str | None, cleared: list[dict],
+            partial: bool, state: ConversationState | None = None, extra: list[str] | None = None,
+            incomplete: bool = False) -> dict:
+    """Every answer carries the same keys (docs/api-contract.md)."""
+    out = dict(answer)
+    limitations = list(out.get("limitations") or [])
+    for lim in [*(extra or []), it.limitation, PARTIAL_NOTE if partial else None]:
+        if lim and lim not in limitations:
+            limitations.append(lim)
+    out["limitations"] = limitations
+    if isinstance(out.get("text"), str):
+        out["text"] = dedupe_units(out["text"])
+    out.setdefault("numeric", None)
+    out.setdefault("claims", [])
+    out.setdefault("abstention_kind", None)
+    out.setdefault("dropped_claims", 0)
+    out.setdefault("preliminary", None)
+    out.setdefault("pending_extraction", 0)
+    out["mode"] = L.pstate.mode.value
+    out["partial"] = partial or incomplete
+    out["method"] = out.get("method") or _method(steps)
+    out["conditions"] = _conditions(state)
+    out["interpretation_note"] = note
+    out["cleared"] = cleared
+    return out

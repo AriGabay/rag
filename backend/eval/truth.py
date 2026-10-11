@@ -31,10 +31,12 @@ DEDUP_KINDS = ("transaction_price", "asking_price", "adjusted_comparable")
 MIXED_KEYS = ("area_type", "property_type", "vat_basis")  # the order the product asks about them
 SEED_CHECK_FIELDS = ("price", "area", "area_type", "transaction_date", "valuation_date")
 
-# demo users (scripts/seed_demo.py): office and visible document groups (None = admin, all groups)
+# demo users (scripts/seed_demo.py): office and visible document groups (None = admin, all groups).
+# G3 is the held-out group "ידע כללי" (ground_truth.yaml general_facts.group) and G4 the held-out v2 group
+# "ידע כללי ב" (holdout_v2_truth.yaml group): dana sees both, yossi neither.
 USERS = {
     "admin-a@demo.test": ("A", None),
-    "dana@demo.test": ("A", frozenset({"G1"})),
+    "dana@demo.test": ("A", frozenset({"G1", "G3", "G4"})),
     "yossi@demo.test": ("A", frozenset({"G2"})),
     "admin-b@demo.test": ("B", None),
 }
@@ -57,6 +59,12 @@ def q2(value: Decimal) -> Decimal:
 @cache
 def truth() -> dict:
     return yaml.safe_load((FIXTURES / "ground_truth.yaml").read_text(encoding="utf-8"))
+
+
+@cache
+def holdout_v2() -> dict:
+    """The held-out v2 answer key (documents K1..K8, K3v2; same schema as ``general_facts``)."""
+    return yaml.safe_load((FIXTURES / "holdout_v2_truth.yaml").read_text(encoding="utf-8"))
 
 
 @cache
