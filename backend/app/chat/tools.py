@@ -20,7 +20,11 @@ Every result has a bounded size (``chat_read_chars``, ``chat_table_rows``, ``cha
 output sent to the model counts against the turn's tool-output budget (``chat_tool_output_chars``, KTD12). Once it
 is spent, the reading tools (``READING_TOOLS``) return a header with the call that would read on and no body —
 nothing is read or counted as read — and ``Workspace.limits_hit`` records ``tool_budget``; registering values and
-calculating over what was already read still work.
+calculating over what was already read still work. The reading deadline (``Workspace.read_until``) is checked the same
+way before a tool starts (``DEADLINE_TOOLS``; ``inspect`` has its own check): one that starts after it does no work,
+returns the same kind of header with ``time_limit``, and records ``time_limit`` (round 9 U11, R16, R18, KTD9). An
+identical read in one turn (the same window of the same reading) is not fetched again: it returns a new citable source
+that points at the first (``Workspace.read_memo``).
 
 Tools:
 
@@ -425,6 +429,9 @@ class Workspace:
     # the passages an identical search returned, kept for the turn (round 9 R16, KTD3, ``memoized_search``):
     # (query, scope, limit, the office's data version) -> hits
     search_memo: dict = field(default_factory=dict)
+    # the windows an identical read returned, kept for the turn (round 9 R16, KTD9, ``_memoized_read``): (a page range,
+    # section or cursor window, or a table part; the reading; the office's data version) -> the source it returned
+    read_memo: dict = field(default_factory=dict)
 
     def spend(self, output: str) -> str:
         """Count a tool output sent to the model against the turn's budget; the output that reaches it is sent
@@ -1486,8 +1493,27 @@ def _emit(ws: Workspace, v: reader.Version, target: tuple, pos, part: reader.Par
     return s
 
 
+def _memoized_read(ws: Workspace, conn: Connection, key: tuple, v: reader.Version) -> tuple[tuple, Source | None]:
+    """The memo key of a read of this turn and, when an identical read (the same window of the same reading, the office's
+    data unchanged) was made before, a new source that points at the first: the window is not fetched or cut again, and
+    the model is told it already has it (R16, KTD9). The new source is citable all the same."""
+    key = (*key, v.reading_id, current_data_version(conn))
+    earlier = ws.read_memo.get(key)
+    if earlier is None:
+        return key, None
+    return key, ws.adopt(replace(earlier, sid="", same_as=earlier.same_as or earlier.sid))
+
+
 def _read_window(ws: Workspace, conn: Connection, v: reader.Version, target: tuple, pos) -> Source:
     """A part of a section (its sub-sections included) or of a page range, from ``pos`` (None: its beginning)."""
+    key, again = _memoized_read(ws, conn, ("window", target, pos), v)
+    if again is not None:
+        return again
+    ws.read_memo[key] = s = _read_window_once(ws, conn, v, target, pos)
+    return s
+
+
+def _read_window_once(ws: Workspace, conn: Connection, v: reader.Version, target: tuple, pos) -> Source:
     vid = v.version_id
     unread_pages = None
     from_block = pos[0] if pos else None  # ``take`` starts at ``pos``: the blocks before it are not loaded
@@ -1604,7 +1630,15 @@ def _table_rows(ws: Workspace, conn: Connection, v: reader.Version) -> dict[int,
 
 def _read_table(ws: Workspace, conn: Connection, v: reader.Version, table_index: int, row0: int = 0) -> Source:
     """``table_rows()`` rows of a table from ``row0``, each part with the table's caption, size, headers and
-    notes."""
+    notes (a continuation keeps the headers and the notes that carry the units)."""
+    key, again = _memoized_read(ws, conn, ("table", str(v.version_id), table_index, row0), v)
+    if again is not None:
+        return again
+    ws.read_memo[key] = s = _read_table_once(ws, conn, v, table_index, row0)
+    return s
+
+
+def _read_table_once(ws: Workspace, conn: Connection, v: reader.Version, table_index: int, row0: int = 0) -> Source:
     st = reader.table_structure(conn, v.version_id, table_index)
     if st is None:
         raise ToolError("הטבלה לא נמצאה")
@@ -4210,6 +4244,21 @@ READING_TOOLS = frozenset({"search", "read", "outline", "find_documents", "list_
 MSG_BUDGET = ("מגבלת היקף הקריאה לשאלה אחת הגיעה לסופה: זה לא נקרא ולא נשלח דבר מתוכו (more — הקריאה שהייתה פותחת "
               "אותו). אל תציג את התשובה כמלאה. רישום ערכים וחישוב (take_value, assume, calculate) על מה שכבר נקרא "
               "עדיין אפשריים.")
+# the reading tools that check the turn's reading deadline before they start (``inspect`` keeps its own check, which also
+# cuts a vision call to the time left)
+DEADLINE_TOOLS = frozenset({"search", "read", "outline", "find_documents", "list_documents", "find_measurements"})
+# the tools that register or compute on what was already read: they stay open when the reading is over (the tool budget)
+COMPUTE_TOOLS = ("calculate", "take_value", "assume")
+TIME_STATUS = "time_limit"
+MSG_TIME = ("מגבלת הזמן לקריאה בשאלה אחת הגיעה לסופה: זה לא נקרא ולא נשלח דבר מתוכו (more — הקריאה שהייתה פותחת "
+            "אותו). אל תציג את התשובה כמלאה, וחלק שלא נקרא לא נבדק — לא נמצא שהוא חסר במסמך. רישום ערכים וחישוב "
+            "(take_value, assume, calculate) על מה שכבר נקרא עדיין אפשריים.")
+
+
+def compute_tool_choice() -> dict:
+    """A ``tool_choice`` that lets the model call the compute tools and nothing else. The tools sent stay the same, so
+    the cached prefix survives (KTD12)."""
+    return {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": n} for n in COMPUTE_TOOLS]}
 
 
 def _call_text(name: str, args: dict) -> str:
@@ -4227,20 +4276,26 @@ def _call_text(name: str, args: dict) -> str:
     return f"{name}({', '.join(parts)})"
 
 
-def _withheld(name: str, args: dict) -> str:
-    """What a reading tool returns once the budget is spent: a header and how to read on, no body — nothing is
-    read, registered or counted as read."""
-    return (f'<not_read tool="{name}" status="{TOOL_BUDGET}" more="{_attr(_call_text(name, args))}"/>\n'
-            + MSG_BUDGET)
+def _withheld(name: str, args: dict, status: str = TOOL_BUDGET) -> str:
+    """What a reading tool returns once the budget is spent or the reading time is up: a header and how to read on, no
+    body — nothing is read, registered or counted as read."""
+    return (f'<not_read tool="{name}" status="{status}" more="{_attr(_call_text(name, args))}"/>\n'
+            + (MSG_TIME if status == TIME_STATUS else MSG_BUDGET))
+
+
+PAGE_TOOLS = frozenset({"read", "inspect"})  # the tools whose record on the stage clock says which pages they returned
 
 
 def run_tool(ws: Workspace, name: str, arguments: str) -> str:
     """Run one tool call and return what is sent to the model, counted against the turn's tool-output budget. The
-    call is timed on the turn's stage clock (a tool that does not exist is not a stage's time)."""
+    call is timed on the turn's stage clock (a tool that does not exist is not a stage's time); a read or an
+    inspection records the first and last page of the sources it returned (numbers only)."""
     started = ws.clock.now()
+    before = len(ws.sources)
     output = ws.spend(_run_tool(ws, name, arguments))
     if name in HANDLERS:
-        ws.clock.tool(name, ws.clock.now() - started, len(output))
+        pages = {p for s in list(ws.sources.values())[before:] for p in s.page_list or ()} if name in PAGE_TOOLS else None
+        ws.clock.tool(name, ws.clock.now() - started, len(output), (min(pages), max(pages)) if pages else None)
     return output
 
 
@@ -4256,6 +4311,11 @@ def _run_tool(ws: Workspace, name: str, arguments: str) -> str:
         return "ארגומנטים לא תקינים (JSON)"
     if name in READING_TOOLS and ws.budget_spent:
         return _withheld(name, args)
+    if name in DEADLINE_TOOLS and ws.read_until is not None and time.monotonic() >= ws.read_until:
+        # the loop checks the clock only between steps: a tool that starts after the reading deadline does no work
+        if TIME_LIMIT not in ws.limits_hit:
+            ws.limits_hit.append(TIME_LIMIT)
+        return _withheld(name, args, TIME_STATUS)
     try:
         return handler(ws, args)
     except ToolError as e:

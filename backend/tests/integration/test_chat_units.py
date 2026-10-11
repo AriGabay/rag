@@ -539,7 +539,14 @@ def test_a_turn_that_ended_on_the_time_limit_keeps_the_unit_and_continue_reads_o
     agent = ScriptedAgent([[call("find_documents", query=UNITS[1]["aliases"][0], page=None)],
                            [call("search", query="שווי הנכס", document_ids=None, limit=None, unit="U1")],
                            final("עצרתי במגבלת הזמן לפני שהספקתי לקרוא את הערכת השווי.", "partial")])
-    agent.on_step = lambda i: setattr(clock, "offset", 112) if i == 1 else None
+    real_search = T.HANDLERS["search"]
+
+    def slow_search(ws, args):  # the unit search runs; it takes the turn past its reading deadline (110 s)
+        out = real_search(ws, args)
+        clock.offset = 112
+        return out
+
+    monkeypatch.setitem(T.HANDLERS, "search", slow_search)
     cloud(monkeypatch, r9a, agent)
     cid = new_conversation(client)
     first = send(client, cid, f"מה שווי הנכס ב{UNITS[1]['aliases'][0]}?")

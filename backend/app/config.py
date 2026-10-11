@@ -157,6 +157,10 @@ class Settings(BaseSettings):
     chat_repair_rounds: int = 2  # 1: a repair with tools; 2: then a rewrite from verified content only
     chat_verify_reserve_seconds: int = 40
     chat_verify_min_seconds: int = 15  # less time than this left for a verification fails the turn
+    # The final check of the saved text (round 9 R16, KTD9) keeps this much of the verification allowance for itself: the
+    # verification of the answer (with its re-reads) ends this long before the allowance does, the final check runs to
+    # the allowance's end. The turn's own limit, ``chat_turn_seconds``, is not raised by it.
+    chat_final_reserve_seconds: int = Field(default=15, ge=0)
     # claims one turn may re-read before they are given up (round 8 KTD5): one expansion of the cited source and one
     # re-judge for all of them; the rest keep their verdict, saying the source was read in part
     chat_reread_claims: int = Field(default=4, ge=0)

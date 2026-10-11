@@ -163,6 +163,19 @@ def test_a_last_agent_step_keeps_its_tools_and_only_sets_the_tool_choice():
     assert last["tools"] == free["tools"] == tools and last["prompt_cache_key"] == free["prompt_cache_key"]
 
 
+def test_an_agent_step_may_allow_only_some_tools_with_the_same_tools_sent():
+    """After the tool budget (round 9 U11): the compute tools stay callable, and the tools sent do not change."""
+    tools = [{"type": "function", "name": n, "description": "x", "strict": True,
+              "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}}
+             for n in ("read", "calculate")]
+    choice = {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "calculate"}]}
+    provider, transport = openai_provider(_ok(), "gpt-6-luna", "low")
+    provider.agent_step("הוראות", [], tools, Echo.model_json_schema(), cache_key=llm.office_cache_key("x"))
+    provider.agent_step("הוראות", [], tools, Echo.model_json_schema(), cache_key=llm.office_cache_key("x"),
+                        tool_choice=choice)
+    assert _sent(transport, 1)["tool_choice"] == choice and _sent(transport, 1)["tools"] == _sent(transport, 0)["tools"]
+
+
 def test_mini_is_sent_no_cache_options():
     provider, transport = openai_provider(_ok(), "gpt-5.4-mini", "low")
     call(provider, Purpose.VERIFY)

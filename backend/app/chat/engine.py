@@ -71,8 +71,11 @@ reached while reading — the tool-output budget, the step bound or the time res
 it keeps the same tools in the same order with ``tool_choice`` "none", and an item appended to the conversation
 tells the model it ran out and must not present the answer as complete. The answer is still verified; it is then
 ``partial``, a sentence names the limit, and ``limits_hit`` goes to diagnostics. When less time is left than a
-verification needs, the turn fails with its own message (its calls are still logged). Two tool steps before the
-step bound, an appended item tells the model to register what it still needs and calculate, or answer, now.
+verification needs, the turn fails with its own message (its calls are still logged). When the tool budget is what
+ran out, the last step may still call the compute tools (``take_value``, ``assume``, ``calculate``) on what was read —
+a few steps at most, while there is time; reading stays refused. Verification ends ``chat_final_reserve_seconds`` before
+the verification allowance does, so the final check of the saved text keeps its slice (round 9 U11, KTD9). Two tool
+steps before the step bound, an appended item tells the model to register what it still needs and calculate, or answer, now.
 
 Prompt caching. The policy, the tools and the turn's first message are the same at every step and carry nothing
 of the moment the turn runs; each step only appends to the items the previous step sent, and a tool output is
@@ -283,6 +286,12 @@ NEAR_LIMIT_NOTICE = """נותרו שני צעדים אחרונים עם כלים
 חישוב: רשום עכשיו, באותו צעד, את כל הערכים וההנחות שעוד חסרים (take_value, assume), וקרא ל-calculate לכל המאוחר
 בצעד הבא. אם כבר יש בידך מה שצריך — ענה עכשיו."""
 NEAR_LIMIT_STEPS = 2  # tool steps left (this one included) when ``NEAR_LIMIT_NOTICE`` is appended
+# the step after the tool budget was spent may still register values and compute on what was read (not read on): the
+# diagnosed lock-out, where the notice allowed computing but the step forbade every tool. Bounded, and only while there is
+# time to read (round 9 U11, KTD9)
+COMPUTE_AFTER_BUDGET = """הקריאה במסמכים נגמרה — אי אפשר לקרוא עוד. עדיין אפשר לרשום ערכים והנחות ולחשב על מה שכבר קראת
+(take_value, assume, calculate); עשה זאת עכשיו אם התשובה דורשת חישוב, ואחר כך ענה."""
+COMPUTE_STEPS_AFTER_BUDGET = 3  # compute steps one turn may take after its tool budget is spent
 STEP_LIMIT, TIME_LIMIT = "step_limit", T.TIME_LIMIT
 LIMIT_WHY = {
     T.TOOL_BUDGET: "הגעת למגבלת היקף הקריאה לשאלה אחת (כמות הטקסט שהכלים מחזירים)",
@@ -545,6 +554,10 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         raise ProviderFailure("unsupported", "provider has no tool loop")
     cache_key = office_cache_key(ctx.office_id)
     deadline = time.monotonic() + settings.chat_turn_seconds
+    # the verification allowance ends at ``allowance_end``; the answer's verification (re-reads included) ends the final
+    # check's reserve earlier, and the final check of the saved text runs to the allowance's end (R16, KTD9)
+    allowance_end = deadline + VERIFY_ALLOWANCE_SECONDS
+    verify_deadline = allowance_end - max(0, settings.chat_final_reserve_seconds)
     # reading stops this early, so the answer, its verification and the repair rounds still fit (KTD12)
     read_until = deadline - settings.chat_verify_reserve_seconds
     repairs = max(0, min(2, settings.chat_repair_rounds))
@@ -559,6 +572,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     output_retried = False  # at most one retry in the whole turn, including its repair rounds
     attempt = 0  # 0: first answer, 1: repaired with tools, 2: rewritten from verified content only
     limits = ws.limits_hit
+    compute_ok = False  # the step may call the compute tools only (the tool budget is spent, there is time left)
+    compute_steps = 0  # such steps taken so far
     rounds: list[list[dict]] = []
     # the request's requirements, frozen for the turn (the request's components, or the judge's derivation when there
     # are none), and its tool failures
@@ -627,7 +642,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         try:
             done = finalize(provider, ws, answer, report, turn, question=inp.question,
                             request=request.standalone_question if request is not None else None, usage=usage,
-                            deadline=deadline + VERIFY_ALLOWANCE_SECONDS, limit_sentences=_limit_sentences(limits))
+                            deadline=allowance_end, limit_sentences=_limit_sentences(limits))
         except FinalCheckError as exc:  # never an unchecked text (R19)
             raise ProviderFailure("verify_unavailable", "final_text") from exc
         finally:
@@ -671,14 +686,17 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             assert reason is not None
             if reason not in limits:
                 limits.append(reason)
-            items.append({"role": "user", "content": LIMIT_NOTICE.format(why=LIMIT_WHY[reason])})
+            if compute_ok and compute_steps > 0:
+                return  # the model was told when the first compute step was offered
+            notice = LIMIT_NOTICE.format(why=LIMIT_WHY[reason]) + ("\n" + COMPUTE_AFTER_BUDGET if compute_ok else "")
+            items.append({"role": "user", "content": notice})
         elif attempt == 1:
             items.append({"role": "user", "content": REPAIR_LAST})
 
     def call_agent(timeout: float) -> AgentStep:
         step = agent.agent_step(POLICY, items, T.TOOLS, FINAL_SCHEMA, cache_key=cache_key,
                                 max_output_tokens=output_tokens, timeout=timeout,
-                                tool_choice="none" if last else None)
+                                tool_choice=(T.compute_tool_choice() if compute_ok else "none") if last else None)
         usage.append(usage_entry("agent", step, agent.model))
         if cancelled():
             raise TurnCancelled  # discard the result of the call that was in flight
@@ -706,6 +724,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                   else TIME_LIMIT if ((now >= read_until or TIME_LIMIT in limits) if attempt == 0
                                       else left < FINAL_STEP_SECONDS) else None)
         last = reason is not None or attempt == 2
+        compute_ok = (reason == T.TOOL_BUDGET and attempt == 0 and steps < bound and now < read_until
+                      and compute_steps < COMPUTE_STEPS_AFTER_BUDGET)
         if last:
             final_notice(reason)
         elif attempt == 0 and steps == bound - NEAR_LIMIT_STEPS:
@@ -732,7 +752,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             step_started = time.monotonic()  # the answer's time is the retry's: the truncated call is not a rewrite's
             step = call_agent(retry_timeout)
             output_limit = step.status == CallStatus.INCOMPLETE and step.detail == "max_output_tokens"
-        failure = (None if step.ok and not (step.calls and last) else
+        failure = (None if step.ok and not (step.calls and last and not compute_ok) else
                    ("output_limit" if output_limit else step.status.value, step.detail) if not step.ok else
                    (CallStatus.INVALID.value, "tool call on the last step"))
         if failure is not None and checked is not None:
@@ -744,6 +764,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             raise ProviderFailure(*failure)
         items.extend(step.output)
         if step.calls:
+            compute_steps += 1 if compute_ok else 0
             for call in step.calls:
                 started_step = _announce(progress, call)
                 output = T.run_tool(ws, call.name, call.arguments)
@@ -775,7 +796,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                                    check="repair_lost_supported", claim_id=claim.id).as_dict()
                            for unit, claim in lost])
             return finish(*checked)
-        if deadline + VERIFY_ALLOWANCE_SECONDS - time.monotonic() < settings.chat_verify_min_seconds:
+        if verify_deadline - time.monotonic() < settings.chat_verify_min_seconds:
             # an answer that cannot be checked is never shown: a repaired one gives way to the answer already
             # verified, a first one fails the turn, saying why
             if checked is not None:
@@ -787,7 +808,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             # the judge scores each component of the request against the answer (the instructions as a list of
             # their own); what is still not given is stated by the server after verification, once
             report = verify_answer(provider, answer, ws, inp.question, usage,
-                                   deadline=deadline + VERIFY_ALLOWANCE_SECONDS,
+                                   deadline=verify_deadline,
                                    mismatch=resolve.mismatch(request, answer.focus),
                                    request=request.standalone_question if request is not None else None,
                                    requirements=turn if answer.status != "clarification" else None,

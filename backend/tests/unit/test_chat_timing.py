@@ -69,6 +69,40 @@ def test_a_failing_tool_is_still_timed_and_an_unknown_tool_is_not(monkeypatch):
     assert [r["tool"] for r in ws.clock.tools] == ["search"] and ws.clock.seconds["locate"] == 1.0
 
 
+def _reads_pages(monkeypatch, ticker: Ticker, **pages_by_tool: list[int]) -> None:
+    """Handlers that register one source on the given pages, as ``read`` and ``inspect`` do."""
+    def make(pages: list[int]):
+        def handler(ws, args):
+            ticker.t += 1.0
+            ws.add_source(document_id="d1", version_id="v1", title="א", section=None, location="ב", kind="context",
+                          text="טקסט", page_list=pages or None)
+            return "טקסט"
+        return handler
+
+    monkeypatch.setattr(T, "HANDLERS", {k: make(v) for k, v in pages_by_tool.items()})
+
+
+def test_a_read_and_an_inspection_record_the_first_and_last_page_they_returned(monkeypatch):
+    ticker = Ticker()
+    ws = _ws(ticker)
+    _reads_pages(monkeypatch, ticker, read=[7, 9, 8], inspect=[12], search=[3, 4], outline=[])
+    for name in ("read", "inspect", "search", "outline"):
+        T.run_tool(ws, name, "{}")
+    records = {r["tool"]: r for r in ws.clock.tools}
+    assert records["read"]["pages"] == [7, 9] and records["inspect"]["pages"] == [12, 12]
+    # only a reading tool carries pages (numbers only), and one that returned none carries none
+    assert "pages" not in records["search"] and "pages" not in records["outline"]
+    assert ws.clock.summary()["tools"][0]["pages"] == [7, 9]
+
+
+def test_a_read_that_returned_nothing_new_records_no_pages(monkeypatch):
+    ticker = Ticker()
+    ws = _ws(ticker)
+    monkeypatch.setattr(T, "HANDLERS", {"read": lambda ws_, args: "שגיאה: אין"})
+    T.run_tool(ws, "read", "{}")
+    assert "pages" not in ws.clock.tools[0]
+
+
 def test_the_engines_stages_join_the_tools_in_one_summary():
     ticker = Ticker()
     clock = StageClock(now=ticker)
@@ -115,3 +149,10 @@ def test_a_listing_says_how_many_documents_and_a_failure_or_a_stop_says_so():
     assert done_label("list_documents", {}, "לא נמצאו מסמכים.") == "לא נמצאו מסמכים"
     assert done_label("read", {}, "שגיאה: המקור אינו זמין") == "הפעולה לא הושלמה"
     assert "מגבלת" in done_label("search", {}, '<not_read tool="search" status="tool_budget" more="x"/>\nטקסט')
+
+
+def test_a_tool_stopped_by_the_time_limit_says_so_and_a_budget_stop_keeps_its_own_words():
+    stopped = '<not_read tool="read" status="time_limit" more="read(pages=3)"/>\nטקסט'
+    assert done_label("read", {}, stopped) == "נעצר: מגבלת הזמן"
+    assert done_label("search", {}, stopped.replace('tool="read"', 'tool="search"')) == "נעצר: מגבלת הזמן"
+    assert done_label("read", {}, stopped.replace("time_limit", "tool_budget")) == "הקריאה נעצרה: מגבלת היקף הקריאה"

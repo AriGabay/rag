@@ -61,9 +61,10 @@ class Reader(ScriptedAgent):
     sent with ``tool_choice`` "none" (or its reads run out). Every step records a deep copy of its items, its
     instructions, its tools and its tool choice."""
 
-    def __init__(self, reads: list, answer: dict, **kw) -> None:
+    def __init__(self, reads: list, answer: dict, compute: list | None = None, **kw) -> None:
         super().__init__([], **kw)
         self.reads, self.answer = list(reads), answer
+        self.compute = list(compute or [])  # the steps taken while only the compute tools are allowed
         self.snapshots: list[list] = []
         self.instructions: list[str] = []
         self.tools: list[str] = []
@@ -73,9 +74,13 @@ class Reader(ScriptedAgent):
         self.snapshots.append(copy.deepcopy(items))
         self.instructions.append(instructions)
         self.tools.append(json.dumps(tools, ensure_ascii=False))
-        self.choices.append(kw.get("tool_choice"))
-        forced = kw.get("tool_choice") == "none" or not self.reads
-        self.steps = [self.answer if forced else self.reads.pop(0)]
+        choice = kw.get("tool_choice")
+        self.choices.append(choice)
+        forced = choice == "none" or not self.reads
+        if isinstance(choice, dict):  # only some tools are allowed: the next compute step, else the answer
+            self.steps = [self.compute.pop(0) if self.compute else self.answer]
+        else:
+            self.steps = [self.answer if forced else self.reads.pop(0)]
         return super().agent_step(instructions, items, tools, final_schema, **kw)
 
 
@@ -94,10 +99,20 @@ def diagnostics(client, m: dict) -> dict:
 TOOLS = json.dumps(T.TOOLS, ensure_ascii=False)
 
 
-def assert_forced_final(agent: Reader, limit_words: str) -> None:
-    """The last step kept every tool in its order, could not call one, and was told why."""
+COMPUTE = {"calculate", "take_value", "assume"}
+
+
+def compute_only(choice) -> bool:
+    """A tool choice that allows the compute tools and nothing else (the step after the tool budget was spent)."""
+    return (isinstance(choice, dict) and choice["type"] == "allowed_tools" and choice["mode"] == "auto"
+            and {t["name"] for t in choice["tools"]} == COMPUTE)
+
+
+def assert_forced_final(agent: Reader, limit_words: str, compute: bool = False) -> None:
+    """The last step kept every tool in its order, could not call one (``compute``: but a compute tool), and was told why."""
     assert agent.tools == [TOOLS] * len(agent.tools)  # never an empty list: the cached prefix stays the same
-    assert agent.choices[:-1] == [None] * (len(agent.choices) - 1) and agent.choices[-1] == "none"
+    assert agent.choices[:-1] == [None] * (len(agent.choices) - 1)
+    assert compute_only(agent.choices[-1]) if compute else agent.choices[-1] == "none"
     notice = agent.snapshots[-1][-1]
     assert notice["role"] == "user" and limit_words in notice["content"] and "partial" in notice["content"]
 
@@ -113,7 +128,7 @@ def test_a_model_that_keeps_reading_exhausts_the_budget_and_gets_a_verified_part
     a = m["answer"]
     # page 2 crossed the budget: nothing more was read, and the next step had to answer
     assert len(agent.snapshots) == 3 and "הבניין בן חמש קומות" not in str(agent.snapshots[-1])
-    assert_forced_final(agent, "מגבלת היקף הקריאה")
+    assert_forced_final(agent, "מגבלת היקף הקריאה", compute=True)
     # verified, partial, and the limit is named in plain words; the claim it supports stays
     assert a["verification"]["judged"] and a["verification"]["removed"] == 0
     assert a["status"] == "partial" and "812" in a["markdown"] and "[S2]" in a["markdown"]
@@ -138,6 +153,50 @@ def test_after_the_budget_reading_tools_return_only_a_header_and_how_to_read_on(
     # what does not read the documents still works: a user's scenario number is registered
     assert T.run_tool(ws, "assume", json.dumps({"value": "5%", "quote": "יעלה ב-5%", "label": "עלייה"})).startswith("A1")
     assert ws.limits_hit == ["tool_budget"]
+
+
+SCENARIO_QUESTION = "ומה אם השווי יעלה ב-5%?"
+SCENARIO = [call("assume", value="5%", quote="יעלה ב-5%", label="עלייה בשווי")]
+
+
+def test_with_the_budget_spent_the_last_step_may_still_register_and_compute_on_what_was_read(client, office, monkeypatch):
+    """The diagnosed lock-out: the notice said computing was still possible, but the step was sent with every tool
+    forbidden, so a scenario was never computed although its inputs were read. Reading stays refused."""
+    setting(monkeypatch, chat_tool_output_chars=1500)
+    agent = Reader([[pages(office.doc, 1)], [pages(office.doc, 2)]], ANSWER, compute=[SCENARIO])
+    m = ask(client, office, monkeypatch, agent, SCENARIO_QUESTION)
+    assert m["status"] == "done", m
+    # the budget was spent by page 2; the next step could compute (and did), and the one after it answered
+    assert len(agent.snapshots) == 4 and agent.choices[:2] == [None, None]
+    assert compute_only(agent.choices[2]) and compute_only(agent.choices[3])
+    assert agent.tools == [TOOLS] * 4  # the same tools in the same order: the cached prefix survives
+    assert agent.tool_outputs(3)[-1].startswith("A1")  # the assumption was registered
+    notice = agent.snapshots[2][-1]
+    assert notice["role"] == "user" and "מגבלת היקף הקריאה" in notice["content"] and "partial" in notice["content"]
+    assert "calculate" in notice["content"] and "אי אפשר לקרוא" in notice["content"]
+    assert m["answer"]["status"] == "partial" and m["answer"]["limits_hit"] == ["tool_budget"]
+    assert m["answer"]["verification"]["judged"] and "812" in m["answer"]["markdown"]
+
+
+def test_after_the_budget_a_reading_tool_called_in_a_compute_step_is_still_refused(client, office, monkeypatch):
+    setting(monkeypatch, chat_tool_output_chars=1500)
+    agent = Reader([[pages(office.doc, 1)], [pages(office.doc, 2)]], ANSWER, compute=[[pages(office.doc, 3)]])
+    m = ask(client, office, monkeypatch, agent)
+    assert m["status"] == "done", m
+    assert agent.tool_outputs(3)[-1].startswith('<not_read tool="read" status="tool_budget"')
+    assert "הבניין בן חמש קומות" not in str(agent.snapshots[-1])
+
+
+def test_compute_steps_after_the_budget_are_bounded_and_the_step_after_them_must_answer(client, office, monkeypatch):
+    setting(monkeypatch, chat_tool_output_chars=1500)
+    agent = Reader([[pages(office.doc, 1)], [pages(office.doc, 2)]], ANSWER, compute=[SCENARIO] * 10)
+    m = ask(client, office, monkeypatch, agent)
+    assert m["status"] == "done", m
+    allowed = [compute_only(c) for c in agent.choices]
+    assert allowed == [False, False] + [True] * engine.COMPUTE_STEPS_AFTER_BUDGET + [False]
+    assert agent.choices[-1] == "none" and m["answer"]["limits_hit"] == ["tool_budget"]
+    # the final step is told once more that it answers now
+    assert "אין עוד קריאה לכלים" in agent.snapshots[-1][-1]["content"]
 
 
 def test_parallel_reads_of_one_step_stop_at_the_budget(client, office, monkeypatch):
@@ -247,6 +306,62 @@ def test_a_turn_that_cannot_be_verified_in_time_fails_with_its_message_and_logs_
     with tenant_tx(office.system) as conn:
         assert [r.purpose for r in conn.execute(text("SELECT purpose FROM provider_usage ORDER BY id"))] == [
             "agent", "request", "agent"]
+
+
+# --- a deadline inside the tools (round 9 U11, R16, R18, KTD9) --------------------------------------------------------
+
+READING_BY_DEADLINE = ["search", "read", "outline", "find_documents", "list_documents", "find_measurements"]
+
+
+@pytest.mark.parametrize("name", READING_BY_DEADLINE)
+def test_a_reading_tool_started_after_the_reading_deadline_is_refused_without_running(monkeypatch, name):
+    import time
+
+    ran = []
+    monkeypatch.setattr(T, "HANDLERS", {n: (lambda ws, a, n=n: ran.append(n) or "תוצאה") for n in
+                                        [*READING_BY_DEADLINE, "inspect", "calculate", "take_value", "assume"]})
+    ws = T.Workspace(ctx=None, read_until=time.monotonic() + 100)
+    assert T.run_tool(ws, name, "{}") == "תוצאה" and ran == [name] and ws.limits_hit == []  # before the deadline
+    ran.clear()
+    ws.read_until = time.monotonic() - 1
+    out = T.run_tool(ws, name, "{}")
+    assert out.startswith(f'<not_read tool="{name}" status="time_limit"') and "הזמן" in out
+    assert ran == [] and ws.limits_hit == ["time_limit"]
+    T.run_tool(ws, name, "{}")
+    assert ws.limits_hit == ["time_limit"]  # recorded once
+    # what is not reading goes on (a vision call keeps its own check, inside the tool)
+    for other in ("inspect", "calculate", "take_value", "assume"):
+        assert T.run_tool(ws, other, "{}") == "תוצאה"
+    assert ran == ["inspect", "calculate", "take_value", "assume"]
+
+
+def test_a_slow_read_makes_the_next_one_of_the_step_refuse_with_a_limit_notice_and_the_turn_names_the_time_limit(
+        client, office, monkeypatch):
+    from tests.integration.test_chat_inspect import Clock
+
+    setting(monkeypatch, chat_turn_seconds=150, chat_verify_reserve_seconds=40, chat_verify_min_seconds=15)
+    clock = Clock(monkeypatch)
+    real = T.HANDLERS["read"]
+
+    def slow(ws, args):
+        clock.offset += 120  # one slow read takes the turn past its reading deadline (110 s)
+        return real(ws, args)
+
+    monkeypatch.setitem(T.HANDLERS, "read", slow)
+    agent = Reader([[pages(office.doc, 2), pages(office.doc, 3)]],
+                   final(PLOT.replace("S2", "S1"), claims=[{"text": "שטח המגרש הוא 812 מ\"ר", "source_ids": ["S1"],
+                                                            "basis": "explicit"}]))
+    m = ask(client, office, monkeypatch, agent)
+    assert m["status"] == "done", m
+    first, second = agent.tool_outputs(1)
+    assert "שטח המגרש 812" in first
+    assert second.startswith('<not_read tool="read" status="time_limit"') and "הבניין בן חמש קומות" not in second
+    assert agent.choices == [None, "none"]
+    a = m["answer"]
+    assert a["status"] == "partial" and a["limits_hit"] == ["time_limit"] and "מגבלת הזמן לשאלה אחת" in a["markdown"]
+    # the user sees that the second read was stopped by the time limit, not that nothing was found
+    done = [p["label"] for p in m["progress"] if p["step"] == "read" and p.get("done")]
+    assert done == ["נקראו עמודים 2–2", "נעצר: מגבלת הזמן"]
 
 
 # --- the stage clock and the progress events (round 9 U1, R16, R17, KTD9) ------------------------------------------

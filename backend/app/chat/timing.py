@@ -7,8 +7,12 @@ choosing the next tool, the request analysis) is not any stage's: it is reported
 stage totals never exceed the turn's total. Numbers and tool names only: no content, so the summary is safe to keep in
 the diagnostics (``message_diagnostics.resolution["timing"]``; no column of its own).
 
+A read or an inspection also records the first and last page of the sources it returned (``pages``, numbers only), which
+the evaluation's reading-completeness measure uses.
+
 A tool call's progress label once it is done (``done_label``) reads what the result holds — passages found, pages
-read — from the tool's own output, so the user sees what was found and not only what was started.
+read — from the tool's own output, so the user sees what was found and not only what was started; a call a limit
+stopped says so (the time limit, or the reading budget).
 """
 
 from __future__ import annotations
@@ -44,12 +48,16 @@ class StageClock:
         self.seconds[stage] += max(0.0, seconds)
         self.calls[stage] += 1
 
-    def tool(self, name: str, seconds: float, chars: int) -> None:
-        """One tool call: counted to the tool's stage, and kept as a record."""
+    def tool(self, name: str, seconds: float, chars: int, pages: tuple[int, int] | None = None) -> None:
+        """One tool call: counted to the tool's stage, and kept as a record. ``pages``: the first and last page a read
+        or an inspection returned (R16: the eval's reading-completeness measure reads them)."""
         stage = TOOL_STAGE.get(name, "read")
         self.add(stage, seconds)
         if len(self.tools) < TOOLS_KEPT:
-            self.tools.append({"tool": name, "stage": stage, "seconds": round(max(0.0, seconds), 3), "chars": chars})
+            record = {"tool": name, "stage": stage, "seconds": round(max(0.0, seconds), 3), "chars": chars}
+            if pages is not None:
+                record["pages"] = [pages[0], pages[1]]
+            self.tools.append(record)
 
     def summary(self) -> dict:
         """The turn so far: every stage with its seconds and calls, the tool records, the turn's seconds and the part
@@ -64,6 +72,7 @@ class StageClock:
 
 _SOURCE = re.compile(r'<source id="S\d+"(?! same_as)([^>]*)>')
 _DOCUMENT = re.compile(r'\bdocument_id="([^"]+)"')
+_TIME_STOP = re.compile(r'<not_read [^>]*status="time_limit"')
 _LISTED = re.compile(r'סה"כ (\d+) מסמכים')
 
 
@@ -71,7 +80,7 @@ def done_label(name: str, args: dict, output: str) -> str:
     """The progress label of a finished tool call: what its result holds. Counts come from the output the model got
     (passages returned, the page range asked for, the documents listed); a call that failed or was withheld says so."""
     if output.startswith("<not_read"):
-        return "הקריאה נעצרה: מגבלת היקף הקריאה"
+        return "נעצר: מגבלת הזמן" if _TIME_STOP.match(output) else "הקריאה נעצרה: מגבלת היקף הקריאה"
     if output.startswith("שגיאה"):
         return "הפעולה לא הושלמה"
     sources = [m.group(1) for m in _SOURCE.finditer(output)]

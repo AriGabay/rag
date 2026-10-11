@@ -278,6 +278,74 @@ def test_a_table_is_read_forty_rows_at_a_time_with_its_headers_and_notes(office)
     assert "כתובת | שטח במ\"ר | מחיר למ\"ר" in rest
 
 
+def test_a_continued_table_part_keeps_the_caption_the_headers_the_size_and_the_notes_that_carry_the_units(office):
+    """Every part of a table, the continuation included, is read with what gives its numbers their meaning (R15)."""
+    ws = T.Workspace(ctx=office.ctx())
+    out = T.tool_outline(ws, office.doc)
+    first = T.tool_read(ws, {"table": handle_of(out, "טבלת עסקאות השוואה")})
+    rest = T.tool_read(ws, {"cursor": tag(first, "more")})
+    body = rest.split("\n", 2)[2]
+    lines = body.splitlines()
+    caption, size = lines.index("טבלת עסקאות השוואה"), next(i for i, x in enumerate(lines) if "45 שורות" in x)
+    header = lines.index("כתובת | שטח במ\"ר | מחיר למ\"ר")
+    assert caption < size < header < lines.index("רחוב הערבה 41 | 121 | 9410")
+    assert lines[-2] == "המחירים ללא מע\"מ."  # the notes close every part (then the source tag ends)
+    assert "שורות 41–45 מתוך 45" in rest
+
+
+# --- the turn's memo of identical reads (round 9 R16, KTD9) ---------------------------------------------------------
+
+def _pages(office, first: int, last: int) -> dict:
+    return {"pages": {"document": office.doc, "from_page": first, "to_page": last}}
+
+
+def test_an_identical_read_in_one_turn_returns_the_window_it_already_read_without_reading_again(office, monkeypatch):
+    fetched = []
+    real = T.reader.blocks_on_pages
+    monkeypatch.setattr(T.reader, "blocks_on_pages", lambda *a, **kw: (fetched.append(a[2:4]), real(*a, **kw))[1])
+    ws = T.Workspace(ctx=office.ctx())
+    first = T.tool_read(ws, _pages(office, 2, 3))
+    again = T.tool_read(ws, _pages(office, 2, 3))
+    assert fetched == [(2, 3)] and "פסקה 1: שטח המגרש 812" in first
+    # marked as already read: a reference to the first source, not its text again; the new id is citable all the same
+    assert 'same_as="S1"' in again and "(אותו טקסט כמו S1, שכבר הוחזר בתור הזה)" in again and "פסקה 1" not in again
+    assert ws.sources["S2"].text == ws.sources["S1"].text and ws.sources["S2"].page_list == ws.sources["S1"].page_list
+    assert ws.sources["S2"].block_start == ws.sources["S1"].block_start and ws.sources["S2"].more == ws.sources["S1"].more
+    # another window is another read
+    T.tool_read(ws, _pages(office, 3, 3))
+    assert fetched == [(2, 3), (3, 3)]
+
+
+def test_an_identical_cursor_or_table_read_is_answered_from_the_memo_too(office, monkeypatch):
+    structures = []
+    real = T.reader.table_structure
+    monkeypatch.setattr(T.reader, "table_structure", lambda *a, **kw: (structures.append(a[2]), real(*a, **kw))[1])
+    ws = T.Workspace(ctx=office.ctx())
+    handle = handle_of(T.tool_outline(ws, office.doc), "טבלת עסקאות השוואה")
+    first = T.tool_read(ws, {"table": handle})
+    structures.clear()
+    cursor = tag(first, "more")
+    T.tool_read(ws, {"cursor": cursor})
+    T.tool_read(ws, {"cursor": cursor})
+    assert structures == [0]  # the second identical continuation reads no table
+    T.tool_read(ws, {"table": handle})  # the table from its beginning was read before
+    assert structures == [0]
+
+
+def test_a_read_after_the_offices_data_changed_reads_again(office, monkeypatch):
+    from app.db import bump_data_version
+
+    fetched = []
+    real = T.reader.blocks_on_pages
+    monkeypatch.setattr(T.reader, "blocks_on_pages", lambda *a, **kw: (fetched.append(a[2:4]), real(*a, **kw))[1])
+    ws = T.Workspace(ctx=office.ctx())
+    T.tool_read(ws, _pages(office, 2, 3))
+    with tenant_tx(office.ctx()) as conn:
+        bump_data_version(conn)
+    T.tool_read(ws, _pages(office, 2, 3))
+    assert fetched == [(2, 3), (2, 3)]
+
+
 # --- block-level dedupe ------------------------------------------------------------------------------------------
 
 def test_a_section_read_after_its_neighbors_sends_only_the_new_blocks(office):

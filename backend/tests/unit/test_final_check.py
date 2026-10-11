@@ -285,6 +285,81 @@ def test_without_time_the_changed_sentence_is_withheld_with_no_judge_call(offlin
     assert p.failure_kind == "not_checked" and p.cause == "check_failed"
 
 
+# --- the final check's reserve (round 9 R16, KTD9) ---------------------------------------------------------------------
+
+class _Clock:
+    """``time.monotonic`` moved forward by hand."""
+
+    def __init__(self, monkeypatch) -> None:
+        import time
+
+        self.offset, real = 0.0, time.monotonic
+        monkeypatch.setattr(time, "monotonic", lambda: real() + self.offset)
+
+
+def _record_deadlines(monkeypatch, clock: _Clock, *, use_up: bool) -> dict:
+    """The deadlines the engine hands the verification and the final check; ``use_up``: the verification runs until its
+    own deadline, as a slow judge or a re-read would."""
+    import time
+
+    seen: dict = {}
+    verify_answer, finalize = engine.verify_answer, engine.finalize
+
+    def verifying(*args, **kwargs):
+        seen["verify"] = kwargs["deadline"]
+        report = verify_answer(*args, **kwargs)
+        if use_up:
+            clock.offset += max(0.0, kwargs["deadline"] - time.monotonic())
+        return report
+
+    def finalizing(*args, **kwargs):
+        seen["final"] = kwargs["deadline"]
+        return finalize(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "verify_answer", verifying)
+    monkeypatch.setattr(engine, "finalize", finalizing)
+    return seen
+
+
+def test_the_verification_ends_a_reserve_before_the_final_check_and_the_allowance_end_is_the_final_checks(
+        offline, monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_final_reserve_seconds", 15)
+    seen = _record_deadlines(monkeypatch, _Clock(monkeypatch), use_up=False)
+    _turn(ScriptedAgent([SEARCH, final(VALUE)], judge=Judge(_mixed_rule)))
+    assert seen["final"] - seen["verify"] == pytest.approx(15, abs=0.5)
+    assert get_settings().chat_turn_seconds == 150  # the turn's total time is not raised
+
+
+def test_a_verification_that_used_all_of_its_time_leaves_the_final_check_its_reserve_to_judge_the_cut_sentence(
+        offline, monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_final_reserve_seconds", 15)
+    _record_deadlines(monkeypatch, _Clock(monkeypatch), use_up=True)
+    out = _turn(ScriptedAgent([SEARCH, final(MIXED)], judge=Judge(_mixed_rule)))
+    md = out.answer.answer_markdown
+    # the final check still had its reserve: it judged the sentence as saved, and what it supports is kept
+    assert "verify_final" in _purposes(out) and "1,200" in md and MARKER in md
+
+
+def test_a_verification_with_less_than_its_minimum_before_its_own_deadline_fails_the_turn_though_the_allowance_goes_on(
+        offline, monkeypatch):
+    from app.config import get_settings
+
+    for k, v in {"chat_final_reserve_seconds": 15, "chat_verify_min_seconds": 15}.items():
+        monkeypatch.setattr(get_settings(), k, v)
+    clock = _Clock(monkeypatch)
+    agent = ScriptedAgent([SEARCH, final(VALUE)], judge=Judge(_mixed_rule))
+    # the answer is written at 182 s: the allowance ends at 210 s (28 s left) but the verification's own deadline at 195 s
+    agent.on_step = lambda i: setattr(clock, "offset", 182.0) if i == 1 else None
+    with pytest.raises(engine.ProviderFailure) as exc:
+        _turn(agent)
+    assert exc.value.status == "verify_no_time"
+    assert "verify" not in [c.purpose.value for c in agent.calls]
+
+
 # --- the fixed point (KTD6) -----------------------------------------------------------------------------------------------
 
 def test_a_removal_in_the_final_pass_changes_a_components_status_and_the_gap_paragraph_follows(offline):
