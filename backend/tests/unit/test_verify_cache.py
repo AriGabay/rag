@@ -608,13 +608,92 @@ def test_a_repair_that_keeps_the_supported_numbers_rephrased_is_adopted(offline)
     assert out.summary["rounds"] == 2 and out.report.ok
 
 
-def test_a_supported_claim_without_numbers_does_not_hold_back_a_repair(offline):
+def test_a_supported_claim_without_numbers_gives_way_to_the_checked_answer_when_the_repair_drops_it(offline):
+    """Round 9 U15 (R20). This test used to pin the opposite — ``..._does_not_hold_back_a_repair``: a supported sentence
+    with no number could be dropped by a repair round, because only numbers were protected. Verified non-numeric
+    information (a status, a date, a caveat, a plain fact) is now protected by its salient words: the repair that drops
+    "הנכס פנוי" is not adopted, and the checked answer — with its failing sentence removed — is composed instead."""
     first = "הנכס פנוי [S1].\nהנכס מושכר [S1]."
     repaired = "השווי למ\"ר הוא 9,500 ₪ [S1]."  # drops the supported sentence, which carries no number
     agent = ScriptedAgent([SEARCH, final(first), final(repaired)], judge=_judge_wrong_management)
     out = _turn(agent)
+    md = out.answer.answer_markdown
+    assert "הנכס פנוי" in md and "מושכר" not in md and "9,500" not in md
+    (lost,) = [p for r in out.rounds for p in r if p["check"] == "repair_lost_supported"]
+    assert lost["claim_id"] and "פנוי" in lost["text"]
+    assert [u["purpose"] for u in out.usage].count("agent") == 3  # no model call beyond the one repair round
+
+
+def test_a_repair_that_rephrases_a_supported_claim_with_the_same_salient_words_is_adopted(offline):
+    first = "הנכס פנוי [S1].\nהנכס מושכר [S1]."
+    repaired = "הנכס עצמו פנוי [S1]."
+    out = _turn(ScriptedAgent([SEARCH, final(first), final(repaired)], judge=_judge_wrong_management))
     assert out.answer.answer_markdown == repaired
     assert not [p for r in out.rounds for p in r if p["check"] == "repair_lost_supported"]
+
+
+def test_a_repair_that_drops_a_supported_date_only_claim_gives_way_to_the_checked_answer(offline):
+    """A date is verified information too: the month name is a qualifier word, so the repair must keep it."""
+    offline.texts = [SOURCE + " הנכס נבדק במרץ."]
+    first = "הנכס נבדק במרץ [S1].\nהנכס מושכר [S1]."
+    repaired = "הנכס פנוי [S1]."
+    out = _turn(ScriptedAgent([SEARCH, final(first), final(repaired)], judge=_judge_wrong_management))
+    assert "במרץ" in out.answer.answer_markdown and "פנוי" not in out.answer.answer_markdown
+    assert [p["check"] for r in out.rounds for p in r].count("repair_lost_supported") == 1
+
+
+def test_a_repair_that_rephrases_a_supported_caveat_with_the_same_salient_words_is_adopted(offline):
+    offline.texts = [SOURCE + " הנכס פנוי בכפוף לאישור הוועדה."]
+    first = "הנכס פנוי בכפוף לאישור הוועדה [S1].\nהנכס מושכר [S1]."
+    repaired = "הנכס פנוי, וזאת בכפוף לאישור של הוועדה [S1]."
+    out = _turn(ScriptedAgent([SEARCH, final(first), final(repaired)], judge=_judge_wrong_management))
+    assert out.answer.answer_markdown == repaired
+    assert not [p for r in out.rounds for p in r if p["check"] == "repair_lost_supported"]
+
+
+def test_a_repair_that_loses_the_caveat_of_a_supported_claim_gives_way_to_the_checked_answer(offline):
+    """The sentence is still there with its facts, but the condition it was verified with is gone."""
+    offline.texts = [SOURCE + " הנכס פנוי בכפוף לאישור הוועדה."]
+    first = "הנכס פנוי בכפוף לאישור הוועדה [S1].\nהנכס מושכר [S1]."
+    repaired = "הנכס פנוי [S1]."
+    out = _turn(ScriptedAgent([SEARCH, final(first), final(repaired)], judge=_judge_wrong_management))
+    assert "בכפוף" in out.answer.answer_markdown
+    assert [p["check"] for r in out.rounds for p in r].count("repair_lost_supported") == 1
+
+
+def test_a_repair_that_turns_a_supported_negation_into_its_opposite_gives_way_to_the_checked_answer(offline):
+    offline.texts = [SOURCE + " אין היתר בנייה."]
+    first = "אין היתר בנייה [S1].\nהנכס מושכר [S1]."
+    out = _turn(ScriptedAgent([SEARCH, final(first), final("יש היתר בנייה [S1].")], judge=_judge_wrong_management))
+    assert "אין היתר" in out.answer.answer_markdown
+    assert [p["check"] for r in out.rounds for p in r].count("repair_lost_supported") == 1
+
+
+def test_a_repair_that_cites_none_of_the_sources_a_supported_sentence_cited_gives_way(offline):
+    offline.texts = [SOURCE, OTHER]
+    first = "הנכס פנוי [S1].\nהנכס מושכר [S1]."
+    repaired = "הנכס פנוי [S2]."  # the same words, but its source is gone from the answer
+    out = _turn(ScriptedAgent([SEARCH, final(first), final(repaired)], judge=_judge_wrong_management))
+    assert "[S1]" in out.answer.answer_markdown
+    assert [p["check"] for r in out.rounds for p in r].count("repair_lost_supported") == 1
+
+
+def test_a_qualified_or_cited_supported_claim_is_protected_like_a_kept_one():
+    ws = _ws()
+    report = verify_answer(_judge(), _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nהנכס פנוי."), ws, "?", [])
+    for recs in report.claims.values():
+        for r in recs:
+            r.action = "cited"
+    assert report.lost_supported("הנכס מושכר [S1].") and not report.lost_supported(
+        "השווי למ\"ר הוא 9,500 ₪ [S1].\nהנכס פנוי [S1].")
+    for recs in report.claims.values():
+        for r in recs:
+            r.action = "qualified"
+    assert len(report.lost_supported("הנכס מושכר [S1].")) == 2
+    for recs in report.claims.values():
+        for r in recs:
+            r.action = "cut"  # a cut claim failed: its loss is no loss
+    assert not report.lost_supported("הנכס מושכר [S1].")
 
 
 # --- reuse by stable id and context (round 8 U3, R18, KTD2, KTD7) ------------------------------------------------------
@@ -737,6 +816,29 @@ def test_removing_a_heading_line_changes_the_key_of_the_sentence_below_it(monkey
     # the heading line staying: the sentence keeps its key
     kept, units2, draft2, _ = _final(monkeypatch, markdown, lambda t: {"verdict": "supported"})
     assert [u.key for u in units2 if u.model] == [draft2[0], draft2[1]]
+
+
+_MEANING_CHANGES = [
+    ("הנכס מושכר [S1].", "הנכס אינו מושכר [S1]."),  # a negation added
+    ("הנכס אינו מושכר [S1].", "הנכס מושכר [S1]."),  # a negation removed
+    ("הנכס פנוי [S1].", "הנכס פנוי בכפוף לאישור הוועדה [S1]."),  # a condition added
+    ("דמי הניהול הם 12 ₪ למ\"ר, אם יאושרו [S1].", "דמי הניהול הם 12 ₪ למ\"ר [S1]."),  # a condition removed
+    ("הנכס פנוי [S1].", "הנכס מוצע להיות פנוי [S1]."),  # a status word added
+]
+
+
+@pytest.mark.parametrize(("before", "after"), _MEANING_CHANGES)
+def test_a_negation_or_condition_added_or_removed_in_an_otherwise_identical_claim_is_another_key(before, after):
+    """Round 9 U15 (R21): the key is the normalised text of the sentence, so a change of its meaning is never a reused
+    verdict — in the key and in the cache of a repair round."""
+    ws, request = _ws(), "?"
+    key = lambda md: verify.unit_key(verify.split_units(md)[0], ws, request, "", {})  # noqa: E731
+    assert key(before) != key(after) and key(before) == key(before)
+    cache, seen = VerdictCache(), []
+    judge = _judge(seen=seen)
+    verify_answer(judge, _answer(before), ws, request, [], cache=cache)
+    again = verify_answer(judge, _answer(after), ws, request, [], cache=cache)
+    assert len(seen) == 2 and again.reused == 0  # judged again, not reused
 
 
 def test_a_sentence_that_moves_to_the_front_of_its_line_keeps_its_key(monkeypatch):

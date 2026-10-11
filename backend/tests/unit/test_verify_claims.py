@@ -657,7 +657,7 @@ def test_a_dependency_on_a_unit_that_is_kept_removes_nothing_at_claim_level_eith
     assert report.ok and [r.verdict for r in report.claims[0]] == ["supported", "supported"]
 
 
-# --- "not checked" has three causes, none a contradiction (R6, R14, AE3) ---------------------------------------------
+# --- "not checked" has three causes here (and a fourth, the final check's time limit), none a contradiction (R6, R14, AE3) ---------------------------------------------
 
 def test_the_three_causes_of_not_checked_are_recorded_and_each_has_its_own_sentence(monkeypatch):
     monkeypatch.setattr(verify, "JUDGE_MAX_UNITS", 1)
@@ -685,7 +685,8 @@ def test_the_three_causes_of_not_checked_are_recorded_and_each_has_its_own_sente
     assert all(r.failure_kind == "not_checked" for r in removals.values())
     sentences = {r.summary()["text"] for r in removals.values()}
     assert len(sentences) == 3 and all(s in verify.CHECK_CAUSE_SENTENCES.values() for s in sentences)
-    assert {r.summary()["cause"] for r in removals.values()} == set(verify.NOT_CHECKED_CAUSES)
+    # ``time_limit`` is the final check's own cause (round 9 R19): the verification has the other three
+    assert {r.summary()["cause"] for r in removals.values()} == set(verify.NOT_CHECKED_CAUSES) - {"time_limit"}
     # their records say "unchecked", never contradicts or unsupported
     verdicts = {r.text: r.verdict for rs in report.claims.values() for r in rs if r.cause}
     assert set(verdicts.values()) == {"unchecked"} and len(verdicts) == 3

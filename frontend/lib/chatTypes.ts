@@ -390,8 +390,9 @@ export interface ChatRemoval {
   failure_kind: ChatFailureKind | string;
   component: string | null;
   text: string;
-  /** For `not_checked` only (round 8 R14): why — `check_failed`, `omitted` or `not_classified`; `text` says it. */
-  cause?: "check_failed" | "omitted" | "not_classified";
+  /** For `not_checked` only (round 8 R14): why — `check_failed`, `omitted`, `not_classified`, or (round 9 R19)
+   * `time_limit`: the final check ran out of time; `text` says it. */
+  cause?: "check_failed" | "omitted" | "not_classified" | "time_limit";
   /** Round 8 U7 (KTD8): the claim this row belongs to, the same id as its `ChatRemovalDecision`. Absent on older answers. */
   claim_id?: string;
   /** What was done to the claim: a unit removed, a unit withheld (its check did not complete), or a span cut. */

@@ -147,7 +147,7 @@ salt and the content, never a position or a verdict) and the report keeps one ``
 citation state (the instruction plane, ``VerifyReport.instructions``), action — apart from completeness. An uncited
 factual unit is judged against the turn's already-read sources that hold its numbers or words (``_unit_candidates``);
 a failing claim is a ``Problem`` carrying its ``claim_id``; a claim resting on a failing claim fails with it
-(``_claim_cascade``); a claim that could not be checked has one of three causes (``NOT_CHECKED_CAUSES``).
+(``_claim_cascade``); a claim that could not be checked has one of four causes (``NOT_CHECKED_CAUSES``).
 
 The edit ladder (round 8 U4, KTD4, R8–R12): a unit with a failing claim is never removed whole while a supported claim
 of it can stay. The first step that applies wins: (1) attach — a missing citation is attached, a qualifier written
@@ -483,12 +483,14 @@ KIND_HINTS = {"input_choice": "קח את הסכום שהמקור מציין (tak
                             "ממוקדת (status=clarification)"}
 # why a claim was "not checked" (round 8 R6, R14): the three causes stay distinct, and none is a contradiction or a
 # claim found wrong. ``check_failed``: the judge call failed after its retry; ``omitted``: the judge left the unit out
-# twice; ``not_classified``: the judge called it not factual or navigation, but its shape is a claim.
-NOT_CHECKED_CAUSES = ("check_failed", "omitted", "not_classified")
+# twice; ``not_classified``: the judge called it not factual or navigation, but its shape is a claim; ``time_limit``
+# (round 9 R19): the final check had no time left to judge the changed sentence — a time limit, never a technical failure.
+NOT_CHECKED_CAUSES = ("check_failed", "omitted", "not_classified", "time_limit")
 CHECK_CAUSE_SENTENCES = {
     "check_failed": "הוסרה טענה שבדיקתה לא הושלמה בגלל תקלה בבדיקה; היא לא נמצאה שגויה ולא נמצאה חסרה.",
     "omitted": "הוסרה טענה שהבדיקה לא החזירה לה תשובה; היא לא נמצאה שגויה.",
     "not_classified": "הוסרה טענה שהבדיקה לא סיווגה כטענה לבדיקה, ולכן לא אומתה; היא לא נמצאה שגויה.",
+    "time_limit": "הוסרה טענה שבדיקתה לא הושלמה במגבלת הזמן; היא לא נמצאה שגויה ולא נמצאה חסרה.",
 }
 NOT_CHECKED = "הטענה לא נבדקה מול המקורות"
 NOT_CHECKED_FAILED = "הטענה לא נבדקה מול המקורות: הבדיקה לא הושלמה ({status})"
@@ -645,6 +647,55 @@ def _missing_forms(word: str) -> set[str]:
 def _missing_words(text: str) -> list[str]:
     """The content words of a text: Hebrew and latin words and numbers, without the stop words."""
     return [t for t in _MISSING_TOKEN.findall(text or "") if t.casefold() not in _MISSING_STOP]
+
+
+# What qualifies a claim (round 9 KTD10, R19–R21): one lexicon, used twice — a cut span holding any of it is never dropped
+# unseen when the final check has no time to judge the remainder (``final_check``), and a supported claim that holds
+# any of it is lost with it from a repair round's answer (``VerifyReport.lost_supported``). Words are compared by their
+# ``_missing_forms`` (prefix letters and plural endings ignored). Negations and conditions; status (approved or
+# proposed, in force, deposited, in procedure); assumptions, estimates and other caveats; the names of the months.
+# A wide list errs toward keeping the checked text: a word it holds that qualifies nothing only costs a re-check.
+QUALIFIER_LEXICON = frozenset("""
+לא אין אינו אינה אינם אינן איננו איננה ללא בלי לבלתי
+אם אלא בכפוף כפוף כפופה בתנאי תנאי תנאים מותנה מותנית למעט מלבד פרט רק אולם במידה ככל
+מאושר מאושרת אושר אושרה אושרו אישור מוצע מוצעת הוצע הוצעה הצעה בתוקף תוקף הופקד הופקדה הפקדה טרם בהליך תלוי תלויה
+מתוכנן מתוכננת עתידי עתידית בוטל בוטלה בטל זמני זמנית
+הנחה בהנחה הניח הנחות משוער משוערת הערכה בקירוב בערך לערך כמעט לכאורה כנראה ייתכן יתכן אפשרי עשוי עשויה
+ינואר פברואר מרץ אפריל מאי יוני יולי אוגוסט ספטמבר אוקטובר נובמבר דצמבר
+תשרי חשוון חשון כסלו טבת שבט אדר ניסן אייר סיוון תמוז אלול
+תאריך מתאריך שנת בשנת מיום
+""".split())
+# a digit date, a year, and an approximation sign before a number ("כ-15", "כ־15")
+_QUALIFIER_PATTERN = re.compile(
+    r"\d{1,2}\s*[./-]\s*\d{1,2}\s*[./-]\s*\d{2,4}|\d{1,2}\s*[./]\s*(?:19|20)\d{2}|(?<!\d)(?:19|20)\d{2}(?!\d)"
+    r"|(?<![א-ת])כ\s?[־\-–]?\s?\d")
+
+
+def qualifier_words(text: str) -> list[str]:
+    """The words of ``text`` that qualify a claim (``QUALIFIER_LEXICON``), as written."""
+    return [t for t in _MISSING_TOKEN.findall(text or "") if _missing_forms(t) & QUALIFIER_LEXICON]
+
+
+def has_qualifier(text: str) -> bool:
+    """Whether ``text`` holds a negation, a condition, a status, an assumption or caveat word, or a date: the span that
+    must not be dropped from a sentence without the sentence being judged again."""
+    return bool(qualifier_words(text) or _QUALIFIER_PATTERN.search(text or ""))
+
+
+LOST_WORD_SHARE = 0.75  # the share of a number-free claim's content words a rephrasing must keep (``lost_supported``)
+
+
+def _covers(forms: set[str], claim: str, heading: str, numeric: bool) -> bool:
+    """Whether a unit of a repair's answer (``forms``: the comparable forms of its words and of its heading chain's)
+    still says a supported claim (``lost_supported``): all its qualifier words, and, for a claim with no number, at least
+    ``LOST_WORD_SHARE`` of its other content words — the heading chain it was written under is part of its context."""
+    context = f"{claim}\n{heading}"
+    if any(not _missing_forms(w) & forms for w in qualifier_words(context)):
+        return False
+    if numeric:
+        return True
+    words = [w for w in _missing_words(context) if not w[0].isdigit() and not _missing_forms(w) & QUALIFIER_LEXICON]
+    return not words or sum(bool(_missing_forms(w) & forms) for w in words) >= LOST_WORD_SHARE * len(words)
 
 
 def valid_missing(missing: str, status: str, component: str, request: str) -> str:
@@ -1208,14 +1259,35 @@ class VerifyReport:
                 p.repair_attempted = repair_key(p.unit) in attempted
 
     def lost_supported(self, text: str) -> list[tuple[Unit, ClaimRecord]]:
-        """The claims this report judged supported, in units that stay, that carry numbers and whose numbers are not
-        all in ``text`` (a repair round's answer): supported information the new answer lost. A claim with no number
-        is not checked; numbers compare in their normalised forms (9,500 and 9500 are one)."""
+        """The claims this report judged supported (kept, qualified or cited), in units that stay, that ``text`` — a
+        repair round's answer — no longer holds (round 9 R20, KTD10): supported information the new answer lost. A claim
+        is lost when (1) a number of it is nowhere in ``text`` (numbers compare in their normalised forms: 9,500 and
+        9500 are one), (2) the sentence cited sources (``S#``) and none of them is cited any more, or (3) no unit of
+        ``text`` — its heading chain counted as its context — holds the claim's qualifier words (``QUALIFIER_LEXICON``:
+        a negation, condition, status, date or caveat) and, for a claim with no number, ``LOST_WORD_SHARE`` of its other
+        content words (stemmed, ``_missing_forms``; stop words ignored) and those of the heading chain it sat under. A
+        rephrasing that keeps its salient words is not a loss."""
         shown = numbers_in(text)
+        new_units = split_units(text)
+        chains = _headings_above(text, new_units)
+        covers = [{f for w in _MISSING_TOKEN.findall(f"{u.text}\n{chains[u.index]}") for f in _missing_forms(w)}
+                  for u in new_units]
+        cited = set(ids_in(text))
         units = {u.index: u for u in self.units}
-        return [(units[idx], r) for idx, recs in self.claims.items() if idx in units
-                for r in recs if r.verdict == "supported" and r.action == "kept"
-                and (needed := numbers_in(r.text)) and not needed <= shown]
+        lost = []
+        for idx, recs in self.claims.items():
+            u = units.get(idx)
+            if u is None:
+                continue
+            sources = {i for i in u.ids if i.startswith("S")}
+            for r in recs:
+                if r.verdict != "supported" or r.action not in ("kept", "qualified", "cited"):
+                    continue
+                needed = numbers_in(r.text)
+                if (needed and not needed <= shown) or (sources and not sources & cited) or not any(
+                        _covers(c, r.text, u.heading, bool(needed)) for c in covers):
+                    lost.append((u, r))
+        return lost
 
     def repair_keys(self, claims_only: bool = False) -> set[str]:
         """The units the repair prompt (``problems_text``) names: not one whose failing claim the server cuts."""

@@ -27,7 +27,11 @@ as a whole, within the verification allowance, and returns it with its digest. T
    point is asserted once more, and only that text, with the digest of its bytes, is returned.
 
 The check costs no judge call when ``compose`` changed only server spans. A technical failure of the check is never a
-contradiction (R14): the unit is withheld with the cause ``check_failed``."""
+contradiction (R14): the unit is withheld with the cause ``check_failed``. A check with no time left to judge (round 9
+R19, KTD10) keeps what the draft judged and the cut left standing — a cut sentence whose supported remainder is its
+draft's words with the cut spans removed, the cut spans holding no negation, condition, status, date or caveat word
+(``verify.QUALIFIER_LEXICON``) and the heading and table header above it unchanged (``remainder_stands``) — and
+withholds the rest with the cause ``time_limit``: the claim was not found wrong, the check ran out of time."""
 
 from __future__ import annotations
 
@@ -40,6 +44,7 @@ from dataclasses import dataclass, field
 from app.chat.compose import Composition, compose, text_digest
 from app.chat.verify import (
     _IDS,
+    _MISSING_TOKEN,
     DEFECT_FAILURES,
     GONE_ACTIONS,
     NOT_CLASSIFIED,
@@ -62,6 +67,7 @@ from app.chat.verify import (
     _workspace_listing,
     clarification_question,
     exempt_without_verdict,
+    has_qualifier,
     ids_in,
     rescued_expansions,
     split_units,
@@ -100,6 +106,7 @@ class FinalUnit:
     key: str = ""
     protected: bool = False
     exempt: bool = False  # neutral navigation text, which needs no verdict (``exempt_without_verdict``)
+    text: str = ""  # the model-written text the key stands for: no citations, no server span, no list marker
 
 
 @dataclass
@@ -162,7 +169,7 @@ class _Final:
         self.digests: dict[str, str] = {}
         self.passed: set[str] = set()  # the reuse keys that have a verdict: the draft's, and the final check's own
         self.stats = {"passes": 0, "units": 0, "reused": 0, "judged": 0, "removed": 0, "withheld": 0,
-                      "unavailable": False}
+                      "unjudged_kept": 0, "unavailable": False}
         self.drafts = {d.index: d for d in report.units}
         self.draft_starts = [d.start for d in report.units]
 
@@ -211,7 +218,7 @@ class _Final:
             # behind belongs to the sentence that was cut, not to the one that stays
             drafts = sorted({self.draft_at(comp.origin[i]) for i in model_at if md[i].isalnum()} - {-1})
             keyed = _keyed(u, _IDS.sub("", model_raw).strip(), ids_in(model_raw))
-            f = FinalUnit(u, True, drafts, self.key_of(keyed), exempt=exempt_without_verdict(keyed))
+            f = FinalUnit(u, True, drafts, self.key_of(keyed), exempt=exempt_without_verdict(keyed), text=keyed.text)
             f.protected = bool(question) and (question in _norm(u.text) or any(
                 d in self.report.protected for d in drafts))
             out.append(f)
@@ -240,7 +247,16 @@ class _Final:
         if not todo:
             return res
         if not may_judge:
-            res.failures = [self.unchecked(f, "check_failed", "unavailable") for f in todo]
+            # no judge call: a cut sentence whose remainder the draft judged supported stays; the rest is not checked
+            # (``time_limit`` when the time ran out; ``check_failed`` when the judge was down or the passes were used)
+            cause = "check_failed" if self.stats["unavailable"] or self.time_left() else "time_limit"
+            status = "unavailable" if cause == "check_failed" else "time_limit"
+            for f in todo:
+                if self.remainder_stands(f):
+                    self.passed.add(f.key)
+                    self.stats["unjudged_kept"] += 1
+                else:
+                    res.failures.append(self.unchecked(f, cause, status))
             return res
         changed = todo
         todo = self.with_votes(todo, units)
@@ -270,6 +286,35 @@ class _Final:
             res.mutated |= self.rescore(scored, {bi: (f.drafts[0] if f.drafts else -1) for bi, f in index_of.items()},
                                         {d for f in todo for d in f.drafts})
         return res
+
+    def remainder_stands(self, f: FinalUnit) -> bool:
+        """Whether a changed unit needs no judge call (round 9 R19, KTD10, AE6): it is a draft unit whose edit was a cut
+        (``report.cuts``), its words are the draft's with the cut spans removed, every claim that stands was judged
+        supported, the cut spans hold no word that qualifies what stays (``has_qualifier``), and the heading chain and
+        the table header and context above it are the draft's — a heading or a header that went changes what the
+        sentence says ("proposed" read as approved), and that needs a judge."""
+        if len(f.drafts) != 1 or not f.text:
+            return False
+        d, groups = self.drafts.get(f.drafts[0]), self.report.cuts.get(f.drafts[0])
+        if d is None or not groups:
+            return False
+        cut = {cid for g in groups for cid in g.claims}
+        standing = [r for r in self.report.claims.get(d.index, []) if r.id not in cut]
+        if not standing or any(r.verdict != "supported" for r in standing):
+            return False
+        u = f.unit
+        if u.heading != d.heading or u.table_header != d.table_header or _norm(u.context) != _norm(d.context):
+            return False
+        spans = [(g.start - d.start, g.end - d.start) for g in groups]
+        if any(has_qualifier(d.raw[a:b]) for a, b in spans):
+            return False
+        left, at = [], 0
+        for a, b in spans:
+            left.append(d.raw[at:a])
+            at = b
+        left.append(d.raw[at:])
+        words = lambda text: _MISSING_TOKEN.findall(_IDS.sub("", text))  # noqa: E731
+        return words("".join(left)) == words(f.text)
 
     def with_votes(self, todo: list[FinalUnit], units: list[FinalUnit]) -> list[FinalUnit]:
         """A unit that voted for a component and changed is judged with the units it voted with (KTD9, as

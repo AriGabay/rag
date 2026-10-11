@@ -274,7 +274,9 @@ def test_when_the_final_check_judge_fails_the_changed_sentence_is_withheld_and_t
     assert out.final_digest == text_digest(md)
 
 
-def test_without_time_the_changed_sentence_is_withheld_with_no_judge_call(offline, monkeypatch):
+def test_without_time_a_cut_that_carried_an_approval_withholds_the_sentence_with_a_time_limit_cause(offline, monkeypatch):
+    """Round 9 U15 (R19, AE6): the cut clause ("שאושר בוועדה המחוזית") is a status word, so the supported remainder is not
+    kept unjudged; the unit is withheld and the removal says the check ran out of time — not a technical failure."""
     answer = _two_sentences(offline)
     monkeypatch.setattr(final_check, "FINAL_MIN_SECONDS", 10**6)
     out = _turn(ScriptedAgent([SEARCH, final(answer)], judge=Judge(_mixed_rule)))
@@ -282,7 +284,109 @@ def test_without_time_the_changed_sentence_is_withheld_with_no_judge_call(offlin
     assert "9,500" in md and "1,200" not in md
     assert "verify_final" not in _purposes(out)
     (p,) = out.report.removals()
-    assert p.failure_kind == "not_checked" and p.cause == "check_failed"
+    assert p.failure_kind == "not_checked" and p.cause == "time_limit" and p.check == "final"
+    sentence = p.summary()["text"]
+    assert sentence == verify.CHECK_CAUSE_SENTENCES["time_limit"] and "מגבלת הזמן" in sentence
+    assert "תקלה" not in sentence and "סותר" not in sentence
+    assert {r.action for r in out.report.claims[0]} == {"withheld"}
+    assert out.final_check["withheld"] == 1 and out.final_digest == text_digest(md)
+
+
+PLAIN_CUT = "והנכס מושכר לדייר מסחרי"  # a clause that qualifies nothing: no negation, condition, status, date or caveat
+
+
+def _plain_cut_rule(text, input, n):
+    if n == 1 and PLAIN_CUT in text:
+        return {"verdict": "partial", "defect": "part", "claims": [
+            {"span": AREA, "verdict": "supported"},
+            {"span": PLAIN_CUT, "verdict": "unsupported", "failure": "absent_from_source"}]}
+    return "supported"
+
+
+def test_without_time_the_supported_remainder_of_a_cut_sentence_is_kept_when_the_cut_clause_qualified_nothing(
+        offline, monkeypatch):
+    """AE6: the draft judged the area supported and cut a clause that holds no qualifier; the final check has no time to
+    judge the sentence as saved, so it keeps the remainder with no judge call, and nothing is withheld."""
+    offline.texts = [SOURCE]
+    monkeypatch.setattr(final_check, "FINAL_MIN_SECONDS", 10**6)
+    out = _turn(ScriptedAgent([SEARCH, final(f"{AREA}, {PLAIN_CUT} [S1].\n{VALUE}")], judge=Judge(_plain_cut_rule)))
+    md = out.answer.answer_markdown
+    assert "1,200" in md and "9,500" in md and PLAIN_CUT not in md and MARKER in md
+    assert "verify_final" not in _purposes(out)
+    assert not out.report.removals() and out.final_check["withheld"] == 0 and out.final_check["unjudged_kept"] == 1
+    assert {r.action for r in out.report.claims[0] if r.verdict == "supported"} == {"kept"}
+    assert out.final_digest == text_digest(md)
+
+
+@pytest.mark.parametrize("clause", [
+    "וזהו מצב מוצע", "ואין לו היתר", "בכפוף לאישור הוועדה", "ללא היתר בנייה", "בהנחה שהשטח לא ישתנה", "והוא הופקד במרץ",
+    "כ-15 יחידות דיור", "עד 12.03.2024", "וטרם אושר"])
+def test_without_time_a_cut_clause_with_a_qualifier_word_withholds_the_unit(offline, monkeypatch, clause):
+    """The lexicon (``verify.QUALIFIER_LEXICON``): a negation, a condition, a status, an assumption, a date or an
+    approximation in the cut span — the remainder could read as stronger than the draft, so it is withheld."""
+    offline.texts = [SOURCE]
+    monkeypatch.setattr(final_check, "FINAL_MIN_SECONDS", 10**6)
+
+    def rule(text, input, n):
+        if n == 1 and clause in text:
+            return {"verdict": "partial", "defect": "part", "claims": [
+                {"span": AREA, "verdict": "supported"}, {"span": clause, "verdict": "unsupported"}]}
+        return "supported"
+
+    out = _turn(ScriptedAgent([SEARCH, final(f"{AREA}, {clause} [S1].\n{VALUE}")], judge=Judge(rule)))
+    md = out.answer.answer_markdown
+    assert "1,200" not in md and "9,500" in md and "verify_final" not in _purposes(out)
+    (p,) = out.report.removals()
+    assert p.cause == "time_limit" and out.final_check["unjudged_kept"] == 0
+
+
+def test_without_time_a_remainder_is_not_kept_when_a_standing_claim_was_only_partly_supported(offline, monkeypatch):
+    offline.texts = [SOURCE]
+    monkeypatch.setattr(final_check, "FINAL_MIN_SECONDS", 10**6)
+
+    def rule(text, input, n):
+        if n == 1 and PLAIN_CUT in text:
+            return {"verdict": "partial", "defect": "part", "claims": [
+                {"span": AREA, "verdict": "partial"}, {"span": PLAIN_CUT, "verdict": "unsupported"}]}
+        return "supported"
+
+    out = _turn(ScriptedAgent([SEARCH, final(f"{AREA}, {PLAIN_CUT} [S1].\n{VALUE}")], judge=Judge(rule)))
+    assert "1,200" not in out.answer.answer_markdown
+    assert [p.cause for p in out.report.removals()] == ["time_limit"]
+
+
+def test_without_time_a_cut_heading_never_lets_the_sentence_below_it_stay_unjudged(offline, monkeypatch):
+    """The safety case of the heading-removal test, with no time to judge again: the heading line is cut ("ושטח 900 דונם"
+    holds no qualifier, so it stays), but the heading the sentence below was judged under changed — so the sentence is
+    withheld with the time-limit cause and "proposed" is never read as approved."""
+    offline.texts = ["נתוני תכנון: מצב מוצע. תכסית 40% מותרת. שטח 900 דונם."]
+    monkeypatch.setattr(final_check, "FINAL_MIN_SECONDS", 10**6)
+    heading = "## נתוני תכנון: מצב מוצע ושטח 900 דונם"
+
+    def rule(text, input, n):
+        if text.startswith("## נתוני תכנון") and n == 1:
+            return {"verdict": "partial", "defect": "part", "claims": [
+                {"span": "נתוני תכנון: מצב מוצע", "verdict": "supported"},
+                {"span": "ושטח 900 דונם", "verdict": "unsupported", "failure": "absent_from_source"}]}
+        return "supported"
+
+    judge = Judge(rule)
+    out = _turn(ScriptedAgent([SEARCH, final(f"{heading} [S1]\nתכסית 40% [S1].")], judge=judge), "מה התכסית?")
+    md = out.answer.answer_markdown
+    assert "תכסית" not in md and "verify_final" not in _purposes(out)
+    assert out.final_check["unjudged_kept"] == 1  # the heading line's own remainder: its cut span qualified nothing
+    (p,) = out.report.removals()
+    assert p.unit.text.startswith("תכסית") and p.cause == "time_limit"
+    assert out.final_digest == text_digest(md)
+
+
+def test_when_the_judge_fails_with_time_left_the_cause_stays_a_technical_failure(offline):
+    """``time_limit`` is for a check with no time; a judge that fails is still ``check_failed`` (the existing test above
+    pins the sentence)."""
+    answer = _two_sentences(offline)
+    judge = Judge(_mixed_rule, fail=lambda n, input: CallStatus.ERROR if n > 1 else None)
+    out = _turn(ScriptedAgent([SEARCH, final(answer)], judge=judge))
+    assert [p.cause for p in out.report.removals()] == ["check_failed"]
 
 
 # --- the final check's reserve (round 9 R16, KTD9) ---------------------------------------------------------------------
