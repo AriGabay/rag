@@ -41,7 +41,8 @@ if TYPE_CHECKING:
     from app.chat.engine import FinalAnswer
 
 SERVER_KINDS = ("marker", "partial_mark", "qualifier", "citation", "removal_note", "request_note", "gap_paragraph",
-                "limit_sentence", "coverage_note", "membership_note", "replacement", "unread_notice")
+                "limit_sentence", "coverage_note", "membership_note", "replacement", "unread_notice",
+                "conditional_note")
 # the marker a cut span leaves: an ordinal, so the log entry of the claim it replaced is found by it
 MARKER = "«[{n}: חלק שלא אומת הושמט]»"
 PARTIAL_MARK = " *(אומת חלקית)*"
@@ -222,7 +223,7 @@ def compose(ws, answer: FinalAnswer, report, turn, *, question: str, limit_sente
     """Every edit after the model's answer and its verification, in one pass (KTD6), in the order the engine always
     made them: the report's cuts, marks, qualifiers and citations, the removal note or the replacement sentence and
     the request-mismatch note; the units stating an absence the server states removed and the report applied again; the
-    gap paragraph and the tidying; the notice of the files that were not read; the limit sentences of the limits the turn reached; and the coverage ledger's note.
+    conditional note (one caveat per calculation, round 9 R23), the gap paragraph and the tidying; the notice of the files that were not read; the limit sentences of the limits the turn reached; and the coverage ledger's note.
     Returns the answer, the registry of the server's spans in it, the components as stated and the ledger (empty for a
     clarification, which asks and states nothing). The side effects of the ledger — a cited document is ``verified`` —
     are not made here (``coverage.touch_verified``): the engine makes them once, for the documents the final text cites."""

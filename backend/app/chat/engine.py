@@ -902,7 +902,8 @@ def _settle_unit(ctx: TenantContext, ws: T.Workspace, request: resolve.Request) 
             request.located_unit, decisions["unit"] = live.unit, "re-resolved"
         u = request.located_unit
         handle = T.unit_handle_of(ws, u["document_id"], live.version_id, u.get("reading_id"), u["unit_no"])
-        ws.unit_focus = {"handle": handle, "document_id": str(u["document_id"]), "unit_id": u.get("unit_id")}
+        ws.unit_focus = {"handle": handle, "document_id": str(u["document_id"]), "unit_id": u.get("unit_id"),
+                         "display": _focus_text(u)}
         return
     gone = request.located_unit
     request.located_unit, request.unit_kept = None, False
@@ -914,6 +915,12 @@ def _settle_unit(ctx: TenantContext, ws: T.Workspace, request: resolve.Request) 
     request.clarify = resolve.clarify_gone_unit(gone, shown, len(live.candidates))
     request.candidates = [c.as_dict() for c in shown]
     request.document_ids, request.entity_changed, request.server_clarify = [], True, True
+
+
+def _focus_text(unit: dict) -> str:
+    """How a gap line names the conversation's unit when the turn read nothing in it: «title» and its pages."""
+    pages = entities.unit_pages(unit)
+    return f"«{unit.get('display') or 'ללא כותרת'}»" + (f" ({pages})" if pages else "")
 
 
 def _cited_units(ws: T.Workspace, markdown: str) -> dict[str, set[str | None]]:

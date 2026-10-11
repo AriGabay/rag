@@ -328,8 +328,9 @@ def test_a_conditional_total_shown_without_a_hedge_is_kept_with_the_servers_cond
     a = m["answer"]
     (c,) = a["computations"]
     assert c["value"] == "20220000" and c["conditional"] is True, c
-    # the total is in the answer, with the server's conditional qualifier next to it
-    assert (f"{q['result']} ₪ (תוצאה מותנית: הערכים V1, V2 אינם ודאיים) [C1]" in a["markdown"]), a["markdown"]
+    # the total is in the answer, with the short conditional tag next to it and the reason said once, after the body
+    assert f"{q['result']} ₪ (תוצאה מותנית) [C1]" in a["markdown"], a["markdown"]
+    assert a["markdown"].count("הערכים V1, V2 אינם ודאיים") == 1 and "התוצאה C1 מותנית: הערכים V1, V2" in a["markdown"]
     assert "החישוב לא הושלם" not in a["markdown"] and "כפי שנכתב במקור" not in a["markdown"]
     v = a["verification"]
     assert v["removed"] == 0 and v["removals"] == [] and v["conditional"] == 1, v

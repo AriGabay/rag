@@ -215,10 +215,12 @@ def test_the_policy_and_schema_carry_the_scores_the_related_ids_and_the_absence_
     assert {"id", "text", "status", "units", "related", "calculation", "absent", "aspect"} <= set(fields)
     assert "undeterminable" in verify.JUDGE_REQUIREMENTS_POLICY and "related" in verify.JUDGE_REQUIREMENTS_POLICY
     assert "absent" in verify.JUDGE_REQUIREMENTS_POLICY
-    # one reason vocabulary (R8): eleven reasons, the server's only gap words (``document_not_read``: round 9 U6)
+    # one reason vocabulary (R8): thirteen reasons, the server's only gap words (``document_not_read``: round 9
+    # U6; ``limit_reached`` and ``unit_not_located``: round 9 U16)
     assert set(coverage.REASONS) == {"not_located", "not_in_part_read", "region_not_read", "not_verifiable",
                                      "sources_conflict", "detail_missing", "calculation_incomplete", "tool_failure",
-                                     "instruction_not_met", "removed", "document_not_read"}
+                                     "instruction_not_met", "removed", "document_not_read", "limit_reached",
+                                     "unit_not_located"}
     assert not hasattr(coverage, "LIMITATIONS") and not hasattr(coverage, "ABSENCE_KINDS")
 
 
@@ -1019,3 +1021,190 @@ def test_the_judge_policy_and_schema_carry_the_missing_part():
     assert verify.JudgeRequirement(status="partial").missing == ""
     assert "missing" in verify.JUDGE_REQUIREMENTS_POLICY and "partial" in verify.JUDGE_REQUIREMENTS_POLICY
     assert "missing_part" in coverage.PUBLIC_FIELDS
+
+
+# --- U16 (R18, R24; AE8): a gap names a short noun phrase and its true cause --------------------------------------------
+
+UNIT_TITLES = {1: ("שומה א", 1, 4), 2: ("שומה ב", 5, 9)}
+
+
+def _in_units(ws: Workspace, *, located: tuple[int, ...] = (), read_in: int | None = None) -> None:
+    """S1's file holds two appraisal units (``tools.unit_info``); the turn worked inside ``located`` through a unit
+    handle (``unit_scopes``); S1 lies in unit ``read_in``."""
+    from app.chat.contexts import Contexts, Identity, Segment
+    from app.chat.tools import unit_info
+
+    source = ws.sources["S1"]
+    cx = Contexts(str(source.version_id), tuple(
+        Segment(n, Identity(), n * 10, n * 10 + 9, n * 10, None, first, last, "appraisal", "certain", title)
+        for n, (title, first, last) in UNIT_TITLES.items()), "r1")
+    ws.contexts[str(source.version_id)] = cx
+    for n in located:
+        ws.unit_scopes[cx.key(n)] = {"document_id": str(source.document_id), "version_id": str(source.version_id),
+                                     "reading_id": "r1", "unit_no": n}
+    if read_in is not None:
+        source.contexts, source.unit = [read_in], unit_info(cx, read_in)
+
+
+def _stopped_on(ws: Workspace, *limits: str) -> None:
+    ws.limits_hit.extend(limits)
+
+
+def _only_missing(ws: Workspace, related: list[str] | None = None, *, turn: TurnRequirements | None = None):
+    final, outcomes, gap = _missing_with(ws, turn or TurnRequirements(), related if related is not None else ["H1"])
+    return outcomes[1], gap
+
+
+def test_ae8_a_turn_that_ran_out_of_time_before_locating_the_unit_says_not_located_within_the_time_limit():
+    ws = _ws()
+    ws.searches.append("דמי ניהול")
+    _in_units(ws)
+    _stopped_on(ws, "time_limit")
+    o, gap = _only_missing(ws)
+    assert (o["limitation"], o["variant"]) == ("limit_reached", "time_limit")
+    assert gap == "**דמי הניהול** לא אותר במסגרת מגבלת הזמן של השאלה."
+    assert "לא נמצא" not in gap and "לא מופיע" not in gap  # R18: never "not in the document"
+
+
+def test_a_turn_that_spent_its_reading_budget_or_steps_says_so_not_that_the_datum_is_absent():
+    for limit, sentence in (("tool_budget", "במסגרת מגבלת היקף הקריאה של השאלה"),
+                            ("step_limit", "במסגרת מספר הצעדים המרבי של השאלה")):
+        ws = _ws()
+        ws.searches.append("דמי ניהול")
+        _stopped_on(ws, limit)
+        o, gap = _only_missing(ws)
+        assert o["limitation"] == "limit_reached" and o["variant"] == limit, (limit, o["limitation"])
+        assert gap == f"**דמי הניהול** לא אותר {sentence}.", gap
+
+
+def test_a_complete_read_inside_the_unit_beats_the_limit_and_a_partial_or_no_read_does_not():
+    # a section read to its end in a one-unit file, then the time ran out: the limit did not cause the absence
+    whole = _ws()
+    _opened(whole)
+    _stopped_on(whole, "time_limit")
+    o, gap = _only_missing(whole, ["S1"])
+    assert o["limitation"] == "not_in_part_read" and gap == "**דמי הניהול** לא מופיע בסעיף \"תיאור הנכס\" שנבדק [S1]."
+    # the same inside the located unit of a file of several
+    inside = _ws()
+    _opened(inside)
+    _in_units(inside, located=(1,), read_in=1)
+    _stopped_on(inside, "time_limit")
+    assert _only_missing(inside, ["S1"])[0]["limitation"] == "not_in_part_read"
+    # a complete read of another unit than the located one proves nothing about it
+    other = _ws()
+    _opened(other)
+    _in_units(other, located=(2,), read_in=1)
+    _stopped_on(other, "time_limit")
+    assert _only_missing(other, ["S1"])[0]["limitation"] == "limit_reached"
+    # a partial read, and no read at all
+    part = _ws()
+    _opened(part, complete=False)
+    _stopped_on(part, "time_limit")
+    o, gap = _only_missing(part, ["S1"])
+    assert o["limitation"] == "limit_reached" and "במסגרת מגבלת הזמן" in gap and "לא מופיע" not in gap
+    none = _ws()
+    none.searches.append("דמי ניהול")
+    _stopped_on(none, "time_limit")
+    assert _only_missing(none)[0]["limitation"] == "limit_reached"
+
+
+def test_the_time_limit_line_says_which_unit_stays_in_focus_when_one_was_located():
+    ws = _ws()
+    ws.searches.append("דמי ניהול")
+    _in_units(ws, located=(2,))
+    _stopped_on(ws, "time_limit")
+    o, gap = _only_missing(ws)
+    assert o["limitation"] == "limit_reached"
+    assert gap == ("**דמי הניהול** לא אותר במסגרת מגבלת הזמן של השאלה. «שומה ב» (עמודים 5–9) נשאר בפוקוס; "
+                   "אפשר לבקש להמשיך לקרוא.")
+
+
+def test_a_file_that_is_one_unit_gets_the_limit_line_without_a_unit_suffix():
+    ws = _ws()
+    ws.searches.append("דמי ניהול")
+    _stopped_on(ws, "time_limit")
+    _, gap = _only_missing(ws)
+    assert gap == "**דמי הניהול** לא אותר במסגרת מגבלת הזמן של השאלה."
+
+
+def test_a_file_of_several_units_with_none_located_gives_unit_not_located_never_not_found():
+    ws = _ws()
+    ws.searches.append("דמי ניהול")
+    _in_units(ws)
+    o, gap = _only_missing(ws)
+    assert o["limitation"] == "unit_not_located" and o["limitation_text"] == coverage.REASONS["unit_not_located"]
+    assert gap == "**דמי הניהול**: השומה (היחידה בקובץ) שהשאלה מתייחסת אליה לא אותרה, ולכן לא נבדק אם הנתון מופיע בה."
+    assert "לא נמצא" not in gap and "לא מופיע" not in gap
+
+
+def test_not_in_part_read_needs_the_read_section_to_lie_inside_the_located_unit():
+    inside = _ws()
+    _opened(inside)
+    _in_units(inside, located=(1,), read_in=1)
+    o, gap = _only_missing(inside, ["S1"])
+    assert o["limitation"] == "not_in_part_read" and gap == "**דמי הניהול** לא מופיע בסעיף \"תיאור הנכס\" שנבדק [S1]."
+    outside = _ws()
+    _opened(outside)
+    _in_units(outside, located=(2,), read_in=1)  # the unit the turn is in is another one than the section read
+    o, gap = _only_missing(outside, ["S1"])
+    assert o["limitation"] != "not_in_part_read" and "לא מופיע" not in gap, gap
+    assert o["limitation"] == "not_located" and "אף חיפוש או קריאה לא כיסו" in gap
+
+
+def test_a_complete_read_of_a_one_unit_file_is_still_not_present_in_that_section():
+    ws = _ws()
+    _opened(ws)
+    o, _ = _only_missing(ws, ["S1"])
+    assert o["limitation"] == "not_in_part_read"
+
+
+def test_the_new_reasons_come_before_not_in_part_read_and_not_located_in_the_gap_paragraph():
+    keys = list(coverage.REASONS)
+    assert keys.index("region_not_read") < keys.index("limit_reached") < keys.index("unit_not_located") \
+        < keys.index("not_in_part_read") < keys.index("not_located")
+
+
+def test_a_component_that_is_the_whole_question_gets_its_subject_as_the_gap_label():
+    question = "מהו מספר היתר הבנייה של הבניין ומתי ניתן, ומהו תאריך הנפקת טופס 4 שלו?"
+    ws = _ws()
+    ws.searches.append("היתר")
+    turn = _turn({"id": "1", "text": question, "subject": "פרויקט הדגמה"})
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].")
+    p = _judge(_scores({"N1": {"status": "missing", "related": ["H1"]}}))
+    r = verify_answer(p, a, ws, question, [], requirements=turn)
+    final, _ = _finish(ws, a, r, turn)
+    gap = _gap(final, a)
+    assert gap == "**הנתון המבוקש (פרויקט הדגמה)** לא נמצא בחיפוש במסמכים שנבדקו.", gap
+    assert "?" not in gap and "מהו" not in gap and "ומתי" not in gap
+
+
+def test_a_single_question_component_is_named_by_its_noun_phrase_and_a_clause_without_subject_by_a_generic_label():
+    label = coverage.gap_label
+    assert label({"text": "מהו מספר היתר הבנייה?", "subject": ""}) == "מספר היתר הבנייה"
+    assert label({"text": "מספר היתר הבנייה", "subject": "בניין"}) == "מספר היתר הבנייה"
+    assert label({"text": "מהו מספר ההיתר ומתי ניתן?", "subject": ""}) == "הנתון המבוקש"
+    assert label({"text": "כמה עולה, והאם כולל מע\"מ?", "subject": "הנכס"}) == "הנתון המבוקש (הנכס)"
+    assert label({"text": "האם הנכס מושכר", "status": "partial", "missing_part": "", "subject": ""}) == "הנתון המבוקש"
+    assert label({"text": "שטחי שירות", "status": "partial", "missing_part": PLOT1_SERVICE}) == PLOT1_SERVICE
+
+
+def test_a_missing_part_that_is_a_request_clause_is_rejected():
+    ok = verify.valid_missing
+    request = "מהו מספר היתר הבנייה ומתי ניתן? ומהו תאריך הנפקת טופס 4?"
+    component = "מספר היתר הבנייה ומתי ניתן"
+    assert ok("מספר היתר הבנייה", "partial", component, request) == "מספר היתר הבנייה"
+    assert ok("מהו מספר היתר הבנייה", "partial", component, request) == ""  # a question word: a clause
+    assert ok("מספר היתר הבנייה ומתי ניתן", "partial", component, request) == ""
+    assert ok("תאריך הנפקת טופס 4?", "partial", component, request) == ""  # ends with a question mark
+    assert ok("האם ניתן היתר", "partial", component, request) == ""
+    assert ok("תאריך הנפקת טופס 4", "partial", component, request) == "תאריך הנפקת טופס 4"
+
+
+def test_an_unlinked_model_claim_whose_label_is_a_clause_gets_the_generic_label():
+    ws = _ws()
+    ws.searches.append("היתר")
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].", requested=[Requested(
+        label="מהו מספר היתר הבנייה ומתי ניתן?", status="not_found_search", document_ids=[], component="",
+        checked_where="")])
+    items = coverage._unlinked_gaps(ws, a.requested)
+    assert [i["text"] for i in items] == ["הנתון המבוקש"]

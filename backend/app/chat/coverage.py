@@ -49,6 +49,10 @@ table, first match wins (``reason_of``):
 10. data found that the verified answer does not present — found, not verifiable;
 11. a reading of the section, table or pages it concerns that was clipped or has an unread region, or a model claim
     validated as "read in part" — the relevant region was not fully read;
+11a. the turn was stopped by a limit (time, reading budget, steps) before the datum was located — not located within
+    the limit, saying which, and — for the time limit, when one unit was located — that the unit stays in focus (round 9
+    R18, KTD10: ``limit_reached``); a file of several units where the turn located none — the appraisal was not located
+    (``unit_not_located``). Both come before 12 and 14: a failure to look is never "not present";
 12. a section, table or pages read to the end without it — not present in the part read (naming it, with its S#); a
     read of paragraphs or pages that returned every block of a section counts as reading that section (``_openings``);
 13. a document it concerns read only in part — the relevant region was not fully read;
@@ -74,7 +78,7 @@ from collections.abc import Collection
 from typing import TYPE_CHECKING
 
 from app.chat.compose import line_cut
-from app.chat.tools import READ_TO_END, value_uncertain
+from app.chat.tools import READ_TO_END, TIME_LIMIT, TOOL_BUDGET, value_uncertain
 from app.db import tenant_tx
 
 if TYPE_CHECKING:
@@ -169,6 +173,8 @@ REASONS = {
     "sources_conflict": "המקורות סותרים",
     "document_not_read": "המסמך שנשאל עליו לא נקרא",
     "region_not_read": "האזור הרלוונטי לא נקרא במלואו",
+    "limit_reached": "לא אותר במסגרת מגבלות השאלה",
+    "unit_not_located": "השומה שנשאלה עליה לא אותרה",
     "not_in_part_read": "לא מופיע בחלק שנקרא ונבדק",
     "not_located": "לא אותר בחיפושים שבוצעו",
 }
@@ -185,6 +191,16 @@ REMOVED_BECAUSE = {
     "invalid_citation": "כי הוא ציטט מקור שלא נבדק בתור הזה.",
     "not_checked": "כי לא ניתן היה לבדוק אותו מול המקורות (הוא לא נמצא שגוי).",
 }
+# the limits of a turn that stop it before the datum is located (R18), in the order the sentence prefers; INSPECT_LIMIT
+# stops only the visual readings and is no reason by itself
+STEP_LIMIT = "step_limit"  # ``engine.STEP_LIMIT``
+LIMITS = (TIME_LIMIT, TOOL_BUDGET, STEP_LIMIT)
+LIMIT_WHERE = {TIME_LIMIT: "מגבלת הזמן של השאלה", TOOL_BUDGET: "מגבלת היקף הקריאה של השאלה",
+               STEP_LIMIT: "מספר הצעדים המרבי של השאלה"}
+# what a gap line adds after a time limit when one unit was located: the conversation stays in it (design lens, R18)
+UNIT_IN_FOCUS = "{unit} נשאר בפוקוס; אפשר לבקש להמשיך לקרוא."
+# a component whose text is a clause of the request, with no noun phrase to name it: the datum asked for
+GENERIC_LABEL = "הנתון המבוקש"
 # a model claim's status -> the reason it supports, once validated
 _KIND_OF_STATUS = {"not_found_search": "not_located", "source_partial": "region_not_read",
                    "section_checked_absent": "not_in_part_read", "sources_conflict": "sources_conflict"}
@@ -339,6 +355,14 @@ def gap_sentence(reason: str, variant: str, texts: list[str], place: dict | None
                 "מופיע בחלק שלא נקרא.")
     if reason == "region_not_read":
         return f"{who}: המסמך \"{document}\" נקרא רק בחלקו, ולכן ייתכן שהנתון מופיע בחלק שלא נקרא."
+    if reason == "limit_reached":
+        # the turn was stopped before it located the datum: what it could not do, never that the datum is absent (R18)
+        where = LIMIT_WHERE.get(variant, LIMIT_WHERE[TIME_LIMIT])
+        return (f"{who} לא {'אותרו' if many else 'אותר'} במסגרת {where}."
+                + (" " + UNIT_IN_FOCUS.format(unit=detail) if detail and variant == TIME_LIMIT else ""))
+    if reason == "unit_not_located":
+        return (f"{who}: השומה (היחידה בקובץ) שהשאלה מתייחסת אליה לא אותרה, ולכן לא נבדק אם "
+                f"{'הם מופיעים' if many else 'הנתון מופיע'} בה.")
     if reason == "not_in_part_read":
         return f"{who} לא {'מופיעים' if many else 'מופיע'} {in_it} שנבדק" + (f" [{sid}]" if sid else "") + "."
     if variant == "searched":  # not_located
@@ -350,7 +374,8 @@ def gap_sentence(reason: str, variant: str, texts: list[str], place: dict | None
 def absence_sentence(r: dict) -> str | None:
     """The server's sentence for one validated model claim (``validate_requested``), None when it was found."""
     gap = _claim_gap(r)
-    return gap_sentence(gap["reason"], gap["variant"], [r["label"]], gap["place"], gap["document"]) if gap else None
+    return gap_sentence(gap["reason"], gap["variant"], [gap_label({"text": r["label"]})], gap["place"],
+                        gap["document"]) if gap else None
 
 
 def _claim_gap(r: dict, ws: Workspace | None = None) -> dict | None:
@@ -430,6 +455,77 @@ def _openings(ws: Workspace, documents: Collection[str] | None = None) -> dict[s
     return out
 
 
+def _unit_key(data: dict) -> str:
+    """The stable id of the unit a handle's data names (``Contexts.key``: version, reading and number)."""
+    version, reading, number = data["version_id"], data.get("reading_id"), data["unit_no"]
+    return f"{version}#{reading}#{number}" if reading else f"{version}#{number}"
+
+
+def _unit_text(ws: Workspace, key: str, fallback: str = "") -> str:
+    """How a gap line names a unit: «title» and its pages. The titles come from the contexts the turn read; a unit the
+    turn only held in focus has the text the engine gave it (``Workspace.unit_focus``)."""
+    from app.chat import contexts
+    from app.chat.tools import unit_info
+
+    version, _, number = contexts.split_unit_key(key)
+    cx = ws.contexts.get(version)
+    if cx is None or number not in cx.numbers:
+        return fallback
+    info = unit_info(cx, number)
+    first, last = info["pages"] or (None, None)
+    pages = "" if first is None else f"עמוד {first}" if first == last else f"עמודים {first}–{last}"
+    name = info["title"] or info["label"]
+    return f"«{name}»" + (f" ({pages})" if pages else "")
+
+
+def unit_signal(ws: Workspace) -> dict:
+    """What the turn knows of the appraisal unit (round 9 U9, U10): ``multi`` — the documents it saw to hold several
+    units (a source or a unit handle of theirs); ``located`` — the units it was in, as {unit id: how a line names it}:
+    the conversation's unit (``Workspace.unit_focus``), a unit its tools worked in through a handle
+    (``unit_scopes``), the one unit a request that names a property matches in a file, and the one unit
+    ``find_documents`` listed when it listed no other. A turn that touched a file of several units and was in none of
+    them has located nothing (R18)."""
+    from app.chat.tools import asked_contexts
+
+    several = {v for v, cx in ws.contexts.items() if cx.multi}
+    multi = {str(s.document_id) for s in ws.sources.values()
+             if s.document_id is not None and (s.unit or str(s.version_id) in several)}
+    multi |= {d["document_id"] for d in ws.handles.values() if d["kind"] == "U"}
+    multi |= {x["document_id"] for x in ws.unit_scopes.values()}
+    found: dict[str, str] = {}
+    focus = ws.unit_focus
+    if focus and focus.get("handle") in ws.handles:
+        multi.add(str(focus["document_id"]))
+        key = _unit_key(ws.handles[focus["handle"]])
+        found[key] = _unit_text(ws, key, focus.get("display") or "")
+    for key in ws.unit_scopes:
+        found.setdefault(key, _unit_text(ws, key))
+    for cx in ws.contexts.values():
+        if cx.multi:
+            named = [n for n in asked_contexts(ws, cx) if cx.is_subject(n)]
+            if len(named) == 1:
+                found.setdefault(cx.key(named[0]), _unit_text(ws, cx.key(named[0])))
+    listed = [d for d in ws.handles.values() if d["kind"] == "U"]
+    if not found and len(listed) == 1:
+        key = _unit_key(listed[0])
+        found[key] = _unit_text(ws, key)
+    return {"multi": multi, "located": found}
+
+
+def _limit_of(ws: Workspace) -> str | None:
+    """The limit that stopped the turn before it finished looking, when it reached one (``LIMITS``)."""
+    return next((k for k in LIMITS if k in ws.limits_hit), None)
+
+
+def _inside_unit(ws: Workspace, sid: str, signal: dict) -> bool:
+    """Whether the source ``sid`` lies in a unit the turn located, or in a file that is one unit: only a section read
+    inside the appraisal asked about says "not present in the part read"."""
+    source = ws.sources.get(sid)
+    if source is None or source.document_id is None or str(source.document_id) not in signal["multi"]:
+        return True
+    return bool(source.unit) and source.unit["id"] in signal["located"]
+
+
 def _missing_parameters(ws: Workspace, o: dict, ev: dict) -> list[str]:
     """The parameters of a calculation the user did not give that the workspace does not fill — with a user
     assumption (A#), a document value applied as a rate (a rate the report states in a sensitivity section), or a
@@ -483,6 +579,18 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
     if opened is None:
         opened = _openings(ws)
     readings = [(sid, *opened[sid]) for sid in ev["checks"] if sid in opened]
+    gap = _claim_gap(claim) if claim is not None else None
+    signal = unit_signal(ws)
+    # a turn stopped by a limit says so (R18; AE8) — unless a section read to its end inside the located unit (or in a
+    # file that is one unit) ties the component: the limit did not cause that absence, and "not present in the section
+    # checked" is the accurate statement. A file named but not read is the better statement of what was not done
+    proven = any(ws.read_complete(o_.get("target")) is True and _inside_unit(ws, sid, signal)
+                 for sid, _, o_ in readings) or (
+        gap is not None and gap["reason"] == "not_in_part_read" and _inside_unit(ws, gap["place"]["sid"], signal))
+    if (limit := _limit_of(ws)) is not None and not proven and not (ws.unread_named and not readings):
+        located = [t for t in signal["located"].values() if t]
+        return out | {"reason": "limit_reached", "variant": limit,
+                      "detail": located[0] if limit == TIME_LIMIT and len(signal["located"]) == 1 and located else ""}
     for sid, doc, o_ in readings:
         st = ws.reads.get(o_.get("target")) if o_.get("target") is not None else None
         if ws.read_complete(o_.get("target")) is False:
@@ -490,15 +598,20 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
             return out | {"reason": "region_not_read", "variant": variant, "searched": True,
                           "place": {"sid": sid, "scope": o_.get("scope"), "name": o_.get("name")},
                           "document_id": doc}
-    gap = _claim_gap(claim) if claim is not None else None
     if gap is not None and gap["reason"] == "region_not_read":
         return out | gap | {"searched": True}
+    # a turn that never located the appraisal asked about did not look in the right place: it says so, before any "not
+    # present"
+    if not (ws.unread_named and not readings):
+        docs = set(ev["documents"]) | set((claim or {}).get("document_ids") or [])
+        if signal["multi"] and (not docs or docs & signal["multi"]) and not signal["located"]:
+            return out | {"reason": "unit_not_located"}
     for sid, doc, o_ in readings:
-        if ws.read_complete(o_.get("target")) is True:
+        if ws.read_complete(o_.get("target")) is True and _inside_unit(ws, sid, signal):
             return out | {"reason": "not_in_part_read", "searched": True,
                           "place": {"sid": sid, "scope": o_.get("scope"), "name": o_.get("name")},
                           "document_id": doc}
-    if gap is not None and gap["reason"] == "not_in_part_read":
+    if gap is not None and gap["reason"] == "not_in_part_read" and _inside_unit(ws, gap["place"]["sid"], signal):
         return out | gap | {"searched": True}
     if ws.unread_named:  # the documents the turn's lookups matched by title were not read: nothing was searched in them
         return out | _not_read_gap(ws)
@@ -509,9 +622,11 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
             return out | {"reason": "region_not_read", "searched": True,
                           "variant": "document_read_in_part" if a.get("read_partial") else "document_partial",
                           "document": a.get("title"), "document_id": doc}
-    if out["searched"]:
+    # a reading outside the located unit searched nothing of the appraisal asked about
+    outside = [sid for sid in ev["checks"] if sid in ws.sources and not _inside_unit(ws, sid, signal)]
+    if out["searched"] and len(outside) < len(ev["checks"]):
         return out | {"reason": "not_located", "variant": "searched"}
-    return out | {"reason": "not_located"}
+    return out | {"reason": "not_located", "searched": False}
 
 
 def _not_read_gap(ws: Workspace) -> dict:
@@ -578,14 +693,32 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
         if o["status"] != "partial" or o["conditional"] or o["kind"] not in ("information", "calculation"):
             o["missing_part"] = ""
         o["stated"] = o["status"] != "partial" or o["kind"] == "instruction" or bool(o["missing_part"])
-        o["gap"] = gap_sentence(why["reason"], o["variant"], [gap_text(o)], o["place"], o["document"], o["detail"])
+        o["gap"] = gap_sentence(why["reason"], o["variant"], [gap_label(o)], o["place"], o["document"], o["detail"])
     return outcomes
 
 
-def gap_text(o: dict) -> str:
-    """What a component's gap line names: the part of a partly given component the answer does not give (R20), else
-    the component."""
-    return (o.get("missing_part") if o.get("status") == "partial" else "") or o["text"]
+_LEADING_QUESTION = re.compile(r"^\s*(?:מהו|מהי|מהם|מהן|מה|איזה|איזו|אילו)\s+(?:הוא\s+|היא\s+|הם\s+|הן\s+)?")
+
+
+def gap_label(o: dict) -> str:
+    """What a component's gap line names (R24): a short noun phrase, never the request or a clause of it. The part of a
+    partly given component the answer does not give (R20; validated, so a noun phrase), else the component's own words
+    when they are a noun phrase, else those words without a leading question word ("מהו תאריך הטופס?" ->
+    "תאריך הטופס") when what remains is one, else the datum asked for, with the component's subject."""
+    from app.chat.verify import MISSING_PART_CHARS, is_request_clause
+
+    if o.get("status") == "partial" and o.get("missing_part"):
+        return o["missing_part"]
+    text = " ".join((o.get("text") or "").split())
+    if text and not is_request_clause(text) and len(text) <= MISSING_PART_CHARS:
+        return text
+    rest = _LEADING_QUESTION.sub("", text).strip(" ?")
+    if rest and rest != text and not is_request_clause(rest) and len(rest) <= MISSING_PART_CHARS:
+        return rest
+    subject = " ".join((o.get("subject") or "").split())
+    if subject and not is_request_clause(subject) and len(subject) <= MISSING_PART_CHARS:
+        return f"{GENERIC_LABEL} ({subject})"
+    return GENERIC_LABEL
 
 
 def gap_groups(items: list[dict]) -> list[dict]:
@@ -601,7 +734,7 @@ def gap_groups(items: list[dict]) -> list[dict]:
     out: list[dict] = []
     for key in sorted(groups, key=lambda k: _ORDER.index(k[0])):
         members = groups[key]
-        texts = list(dict.fromkeys(gap_text(m) for m in members))
+        texts = list(dict.fromkeys(gap_label(m) for m in members))
         line = gap_sentence(key[0], key[1], texts, members[0].get("place"), key[4], key[5])
         if any(g["text"] == line for g in out):
             continue
@@ -631,7 +764,7 @@ def _unlinked_gaps(ws: Workspace, requested) -> list[dict]:
         gap = _claim_gap(r)
         if gap["reason"] == "not_located" and ws.unread_named:  # the named document was not read: not "not found"
             gap = _not_read_gap(ws) | {"place": None}
-        out.append({"text": r["label"], "limitation": gap["reason"], "variant": gap["variant"],
+        out.append({"text": gap_label({"text": r["label"]}), "limitation": gap["reason"], "variant": gap["variant"],
                     "place": gap["place"], "document": gap["document"], "detail": gap.get("detail") or ""})
     return out
 
@@ -659,6 +792,9 @@ def compose_components(ws: Workspace, answer: FinalAnswer, report,
     report.gaps = groups
     lines = [g["text"] for g in groups]
     doc = edited.doc
+    if note := report.conditional_note():  # one caveat per calculation, after the body and before the gaps (R23)
+        doc.tidy_blank_lines()
+        doc.append(("\n\n" if doc.text else "") + note, "conditional_note")
     if lines:
         doc.tidy_blank_lines()
         doc.append(("\n\n" if doc.text else "") + "\n".join(lines), "gap_paragraph")

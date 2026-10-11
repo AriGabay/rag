@@ -432,6 +432,26 @@ def _qualified(ws: Workspace, markdown: str, seen: list | None = None, rule=lamb
     return _verify(ws, markdown, rule=rule, seen=seen, question=COST_QUESTION)
 
 
+def _composed(ws: Workspace, markdown: str, rule=lambda text: "supported"):
+    """The answer as the composer finishes it: the body with its short tags, then the conditional note (R23, KTD10)."""
+    from app.chat import coverage
+
+    answer = _answer(markdown)
+    report = verify_answer(_judge(rule), answer, ws, COST_QUESTION, [])
+    edited, _ = coverage.compose_components(ws, answer, report)
+    return report, edited.doc.text, [(edited.doc.text[s.start:s.end], s.kind) for s in edited.doc.spans()]
+
+
+def _second_conditional(ws: Workspace, expression: str = "V1 - V2", note: str | None = None) -> str:
+    """A second calculation conditional on the same inputs, as ``tool_calculate`` records it."""
+    from app.chat.tools import MSG_UNCERTAIN_INPUTS
+
+    c = _compute(ws, expression, "הפרש העלויות")
+    c.outcome.conditional.append(note or MSG_UNCERTAIN_INPUTS.format(ids="V1, V2") + " (V1: התא לא אושר)")
+    c.uncertain = ["V1", "V2"]
+    return c.cid
+
+
 def test_a_result_of_a_conditional_calculation_shown_without_a_hedge_is_kept_with_the_servers_qualifier():
     ws = _conditional_sum()
     seen: list = []
@@ -440,8 +460,9 @@ def test_a_result_of_a_conditional_calculation_shown_without_a_hedge_is_kept_wit
     assert report.ok  # the server writes the qualifier itself: no repair round for it alone
     (p,) = [p for p in report.problems if p.annotatable]
     assert p.conditional and p.cite == "C1" and p.number == "20,220,000"
-    assert ("20,220,000 ₪ (תוצאה מותנית: הערכים V1, V2 אינם ודאיים) [C1]."
-            in applied.answer_markdown), applied.answer_markdown
+    # only the short tag stays by the number; the reason is said once, in the note (R23)
+    assert "20,220,000 ₪ (תוצאה מותנית) [C1]." in applied.answer_markdown, applied.answer_markdown
+    assert "אינם ודאיים" not in applied.answer_markdown
     assert "כפי שנכתב במקור" not in applied.answer_markdown  # the server's, never presented as the source's
     # shown as conditional, never as verified certainty; not a removal and not a source qualifier
     counts = report.counts()
@@ -454,27 +475,36 @@ def test_a_result_of_a_conditional_calculation_shown_without_a_hedge_is_kept_wit
 
 
 def test_a_conditional_qualifier_names_one_uncertain_input_in_the_singular():
-    _, applied = _qualified(_conditional_sum(("V2",)), "סך העלות הוא 20,220,000 ₪ [C1].")
-    assert "20,220,000 ₪ (תוצאה מותנית: הערך V2 אינו ודאי) [C1]" in applied.answer_markdown
+    _, text, _ = _composed(_conditional_sum(("V2",)), "סך העלות הוא 20,220,000 ₪ [C1].")
+    assert "20,220,000 ₪ (תוצאה מותנית) [C1]" in text
+    assert "התוצאה C1 מותנית: הערך V2 אינו ודאי." in text
 
 
 def test_a_conditional_calculation_on_a_justified_mix_is_qualified_with_the_mix_it_rests_on():
     ws = _scenario(cost_vat="unknown")
-    report, applied = _verify(ws, "לפי הנחתך [A1], הרווח בתרחיש יהיה 1,530,000 ₪ [C1].")
+    answer = _answer("לפי הנחתך [A1], הרווח בתרחיש יהיה 1,530,000 ₪ [C1].")
+    report = verify_answer(_judge(), answer, ws, QUESTION, [])
     assert not report.removed_units(), report.problems_text()
-    assert "1,530,000 ₪ (תוצאה מותנית: לפי הצדקה לערבוב נתונים שאינם תואמים — מע״מ:" in applied.answer_markdown
+    from app.chat import coverage
+
+    text = coverage.compose_components(ws, answer, report)[0].doc.text
+    body, note = text.split("\n\n")
+    assert "1,530,000 ₪ (תוצאה מותנית) [C1]." in body and "לפי הצדקה" not in body
+    assert note.startswith("התוצאה C1 מותנית: לפי הצדקה לערבוב נתונים שאינם תואמים — מע״מ:"), note
 
 
 def test_a_unit_that_already_says_its_result_is_conditional_gets_only_the_short_reason():
-    _, applied = _qualified(_conditional_sum(), "בכפוף לאימות הקלטים, התוצאה מותנית: 20,220,000 ₪ [C1].")
-    assert "20,220,000 ₪ (הערכים V1, V2 אינם ודאיים) [C1]" in applied.answer_markdown
-    assert applied.answer_markdown.count("מותנית") == 1
+    _, body, _ = _composed(_conditional_sum(), "בכפוף לאימות הקלטים, התוצאה מותנית: 20,220,000 ₪ [C1].")
+    first, note = body.split("\n\n")
+    assert first == "בכפוף לאימות הקלטים, התוצאה מותנית: 20,220,000 ₪ [C1]."  # the unit says it: no tag, no copy
+    assert note == "התוצאה C1 מותנית: הערכים V1, V2 אינם ודאיים."
 
 
 def test_a_wrong_number_for_a_conditional_calculation_is_still_removed_as_a_wrong_calculation():
     report, applied = _qualified(_conditional_sum(), "עלות הבנייה העילית והחניון יחד היא 20,230,000 ₪ [C1].")
     assert [(d.failure_kind, d.check) for d in report.removals()] == [("wrong_calculation", "computation_mismatch")]
     assert "תוצאה מותנית" not in applied.answer_markdown
+    assert report.conditional_note() == ""  # a removed result is covered by no note
 
 
 def test_a_conditional_result_the_judge_finds_wrong_is_still_removed_and_not_qualified():
@@ -488,11 +518,83 @@ def test_a_result_of_a_calculation_that_is_not_conditional_gets_no_qualifier():
     report, applied = _qualified(_conditional_sum(()), "עלות הבנייה העילית והחניון יחד היא 20,220,000 ₪ [C1].")
     assert not report.problems, report.problems_text()
     assert "מותנית" not in applied.answer_markdown and report.counts()["correctness"] == "verified"
+    assert report.conditional_note() == ""
 
 
 def test_a_conditional_result_bound_to_a_unit_that_cites_only_its_inputs_is_qualified_too():
-    _, applied = _qualified(_conditional_sum(), "סך העלות הוא 20,220,000 ₪ [V1][V2].")
-    assert "20,220,000 ₪ (תוצאה מותנית: הערכים V1, V2 אינם ודאיים) [V1][V2][C1]" in applied.answer_markdown
+    _, text, _ = _composed(_conditional_sum(), "סך העלות הוא 20,220,000 ₪ [V1][V2].")
+    assert "20,220,000 ₪ (תוצאה מותנית) [V1][V2][C1]" in text
+    assert text.endswith("התוצאה C1 מותנית: הערכים V1, V2 אינם ודאיים.")
+
+
+def test_r23_two_results_of_one_calculation_carry_a_short_tag_each_and_one_caveat_names_them():
+    """The long justification is said once, after the body (R23, AE: it was repeated after every number)."""
+    ws = _conditional_sum()
+    markdown = ("עלות הבנייה העילית והחניון יחד היא 20,220,000 ₪ [C1].\n"
+                "כלומר סך העלות הכולל הוא 20,220,000 ₪ [C1], ובמיליונים 20.22 מיליון ₪ [C1].")
+    report, text, spans = _composed(ws, markdown)
+    body, note = text.split("\n\n")
+    # a tag by the result of each sentence that shows it (nothing looks certain), and the reason is not repeated
+    assert body.count("(תוצאה מותנית)") == 2 and "אינם ודאיים" not in body
+    assert text.count("אינם ודאיים") == 1 and text.count("התוצאה C1 מותנית") == 1
+    assert note == "התוצאה C1 מותנית: הערכים V1, V2 אינם ודאיים."
+    assert [k for t, k in spans if k == "conditional_note"] == ["conditional_note"]
+    assert [t for t, k in spans if k == "conditional_note"] == ["\n\n" + note]
+    assert report.counts()["conditional"] == 2  # the units are still counted as conditional
+
+
+def test_r23_calculations_with_the_same_reason_share_one_line_that_names_all_their_results():
+    ws = _conditional_sum()
+    other = _second_conditional(ws)
+    assert other == "C2"
+    markdown = "העלות הכוללת היא 20,220,000 ₪ [C1].\nההפרש בין העלויות הוא 10,980,000 ₪ [C2]."
+    _, text, spans = _composed(ws, markdown)
+    body, note = text.split("\n\n")
+    assert note == "התוצאות C1 ו־C2 מותנות: הערכים V1, V2 אינם ודאיים."
+    assert body.count("(תוצאה מותנית)") == 2 and text.count("אינם ודאיים") == 1
+
+
+def test_r23_calculations_with_different_reasons_get_a_line_each():
+    ws = _conditional_sum()
+    _second_conditional(ws, note="בסיס שטח: «עיקרי» מול «פלדלת»")
+    ws.computations["C2"].uncertain = []  # its reason is the mix alone
+    markdown = "העלות הכוללת היא 20,220,000 ₪ [C1].\nההפרש בין העלויות הוא 10,980,000 ₪ [C2]."
+    _, text, _ = _composed(ws, markdown)
+    note = text.split("\n\n")[1]
+    assert note.split("\n")[0] == "התוצאה C1 מותנית: הערכים V1, V2 אינם ודאיים."
+    assert note.split("\n")[1].startswith("התוצאה C2 מותנית: ") and "בסיס שטח" in note.split("\n")[1]
+
+
+def test_r23_a_conditional_note_is_after_the_body_and_before_the_gap_paragraph():
+    """Order: body, conditional note, gap paragraph (R23)."""
+    from app.chat import coverage
+    from app.chat.verify import TurnRequirements
+
+    ws = _conditional_sum()
+    ws.searches.append("עלות")
+    turn = TurnRequirements()
+    from app.chat import request as request_analysis
+
+    items, _ = request_analysis.freeze([request_analysis.Component(text="עלות הבנייה והחניון", kind="calculation"),
+                                        request_analysis.Component(text="דמי הניהול", kind="information")], ["?"])
+    turn.adopt(items, "analysis")
+    answer = _answer("עלות הבנייה העילית והחניון יחד היא 20,220,000 ₪ [C1].")
+
+    def judge(input: str) -> dict:
+        units = {int(i) for i in re.findall(r'<unit index="(\d+)"', input)}
+        reqs = [{"id": rid, "text": "", "calculation": False, "status": "full" if rid == "N1" else "missing",
+                 "units": [0] if rid == "N1" else [], "related": ["C1"] if rid == "N1" else ["H1"], "reason": "בדיקה",
+                 "absent": []} for rid in re.findall(r'<requirement id="(N[\d.]+)"', input)]
+        return {"verdicts": [{"index": i, "verdict": "supported", "reason": "בדיקה"} for i in units],
+                "requirements": reqs}
+
+    p = ScriptedProvider()
+    p.on(Purpose.VERIFY, lambda instructions, input: judge(input), repeat=True)
+    report = verify_answer(p, answer, ws, COST_QUESTION, [], requirements=turn)
+    final, _ = coverage.state_components(ws, answer, report, turn)
+    parts = final.answer_markdown.split("\n\n")
+    assert len(parts) == 3, parts
+    assert "(תוצאה מותנית)" in parts[0] and parts[1].startswith("התוצאה C1 מותנית") and "דמי הניהול" in parts[2]
 
 
 # --- amounts a source states in a scale (R14): "באלפי ₪" -------------------------------------------------------------
@@ -595,7 +697,7 @@ def test_a_sum_of_an_amount_in_thousands_and_an_amount_in_units_is_computed_in_u
 
 def test_the_servers_qualifier_follows_a_result_shown_with_a_scale_word_after_the_word():
     _, applied = _qualified(_conditional_sum(), "סך העלות הוא 20.22 מיליון ₪ [C1].")
-    assert "20.22 מיליון ₪ (תוצאה מותנית: הערכים V1, V2 אינם ודאיים) [C1]" in applied.answer_markdown
+    assert "20.22 מיליון ₪ (תוצאה מותנית) [C1]" in applied.answer_markdown
 
 
 @pytest.mark.parametrize("raw, number, after", [

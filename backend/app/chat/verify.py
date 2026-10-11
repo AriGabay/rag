@@ -507,6 +507,11 @@ CONDITIONAL_UNCERTAIN_ONE = "הערך {ids} אינו ודאי"
 CONDITIONAL_UNCERTAIN_MANY = "הערכים {ids} אינם ודאיים"
 CONDITIONAL_MIX = "לפי הצדקה לערבוב נתונים שאינם תואמים — {needs}"
 CONDITIONAL_UNSTATED = "תוצאת החישוב {cid} מותנית ({why}): השרת כותב זאת ליד התוצאה"
+# a conditional result keeps only this short tag by its number; the reason is said once per calculation, in one server
+# line after the answer body (R23, KTD10: ``VerifyReport.conditional_note``) — nothing looks certain, nothing repeats
+CONDITIONAL_TAG = "תוצאה מותנית"
+CONDITIONAL_NOTE_ONE = "התוצאה {ids} מותנית: {reason}"
+CONDITIONAL_NOTE_MANY = "התוצאות {ids} מותנות: {reason}"
 # a unit that already says its result is conditional or rests on values not certain: the server's qualifier then
 # gives only the reason, not "conditional result" again
 _SAYS_CONDITIONAL = re.compile(r"(?<![א-ת])(?:ב?מותנ(?:ה|ית|ים|ות)|בכפוף|בהסתייגות|אינ(?:ו|ה|ם|ן)\s+ודאי(?:ים|ות|ת)?|"
@@ -698,13 +703,24 @@ def _covers(forms: set[str], claim: str, heading: str, numeric: bool) -> bool:
     return not words or sum(bool(_missing_forms(w) & forms) for w in words) >= LOST_WORD_SHARE * len(words)
 
 
+# a request clause is a question: it ends with "?" or holds a question word (with a "ו" or "ש" prefix at most). A gap
+# line names a short noun phrase, never a clause of the request (round 9 R24, KTD10)
+_QUESTION_WORD = re.compile(r"(?<![א-ת])[וש]?(?:מהו|מהי|מהם|מהן|מה|כמה|מתי|האם|איזה|איזו|אילו|היכן|איפה)(?![א-ת])")
+
+
+def is_request_clause(text: str) -> bool:
+    """Whether ``text`` is a clause of a request rather than a noun phrase: a question mark or a question word in it."""
+    return "?" in (text or "") or bool(_QUESTION_WORD.search(text or ""))
+
+
 def valid_missing(missing: str, status: str, component: str, request: str) -> str:
     """The part of a ``partial`` requirement the judge says the answer does not give (``JudgeRequirement.missing``) when
     it names nothing the request did not ask for, else "" (round 8 R20, R21): every content word of it — a Hebrew or
     latin word, or a number, prefixes and stop words ignored — is a word of the component's text or of the user's
-    request, and it is a short noun phrase. The server never writes a part the request does not hold."""
+    request, and it is a short noun phrase — not a clause of the request: no question word, no question mark (round 9
+    R24). The server never writes a part the request does not hold."""
     part = _norm(missing or "")
-    if status != "partial" or not part or len(part) > MISSING_PART_CHARS:
+    if status != "partial" or not part or len(part) > MISSING_PART_CHARS or is_request_clause(part):
         return ""
     words = _missing_words(part)
     if not words:
@@ -1300,6 +1316,24 @@ class VerifyReport:
         errors = self.failed_units()
         return {p.unit.index for p in self.problems if p.annotatable and p.conditional and p.unit.index not in errors}
 
+    def conditional_note(self) -> str:
+        """The one caveat of the conditional calculations whose results the surviving text shows (R23, KTD10): a line
+        per distinct reason — "התוצאות C3 ו־C4 מותנות: <reason>" — naming the calculations that share it, in the order
+        the text shows them; "" when there is none. A result removed with its unit is covered by none."""
+        errors = self.removed_units()
+        reasons: dict[str, list[str]] = {}
+        for p in self.problems:
+            if p.annotatable and p.conditional and p.cite and p.unit.index not in errors:
+                ids = reasons.setdefault(p.annotation.removeprefix(CONDITIONAL_LEAD), [])
+                if p.cite not in ids:
+                    ids.append(p.cite)
+        lines = []
+        for reason, ids in reasons.items():
+            named = ids[0] if len(ids) == 1 else ", ".join(ids[:-1]) + " ו־" + ids[-1]
+            line = (CONDITIONAL_NOTE_ONE if len(ids) == 1 else CONDITIONAL_NOTE_MANY).format(ids=named, reason=reason)
+            lines.append(line if line.endswith((".", "!", "?")) else line + ".")
+        return "\n".join(lines)
+
     def correctness(self) -> str:
         """``verified`` (every claim supported), ``partial`` (claims removed or only partly supported, or a result
         shown only as conditional on inputs that are not certain) or ``unverified`` (no claim survived) — apart from
@@ -1633,13 +1667,18 @@ class VerifyReport:
         # a qualifier still missing after the repair rounds is written next to its number, marked as the source's;
         # a result of a conditional calculation gets the server's own qualifier, after its number (or, when the
         # unit shows no number of it, where a citation would join the unit)
+        tagged: set[tuple[int, int]] = set()
         for p in notes:
             at = _after_number(p.unit, p.number or "") if p.number else None
             if at is None and p.conditional:
                 at = _citation_point(markdown, p.unit)
             if at is not None and not any(a <= at < b for a, b in blocked):
                 if p.conditional:
-                    edits.append((at, at, f" ({p.annotation})", "qualifier", ()))
+                    # the reason is said once, in the conditional note; by the number stays a short tag — none when
+                    # the unit already says its result is conditional, and one per place however many calculations
+                    if (at, p.unit.index) not in tagged and not _SAYS_CONDITIONAL.search(p.unit.text):
+                        edits.append((at, at, f" ({CONDITIONAL_TAG})", "qualifier", ()))
+                        tagged.add((at, p.unit.index))
                     continue
                 cite = f" [{p.cite}]" if p.uncited else ""
                 edits.append((at, at, f" ({p.annotation}, כפי שנכתב במקור{cite})", "qualifier", ()))

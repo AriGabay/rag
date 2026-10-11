@@ -762,6 +762,35 @@ def test_a_computation_that_uses_a_value_the_user_gave_earlier_survives_the_fina
     assert "verify_final" not in _purposes(out) and out.final_digest == text_digest(md)
 
 
+# --- R23: one caveat per calculation is server text, a fixed point of the final state ----------------------------------------
+
+def test_the_conditional_note_is_server_text_that_is_a_fixed_point_and_costs_no_judge_call(offline):
+    """A result of a conditional calculation keeps a short tag; its reason is one server line after the body. Both are
+    spans the final check takes by construction: no judge call, the digest of the saved bytes (R23, KTD6)."""
+    def setup(ws):
+        ws.values.clear()
+        _value(ws, "15,600,000", "בנייה עילית", "cost", "cost")
+        _value(ws, "4,620,000", "חניון תת-קרקעי", "cost", "cost")
+        c = _compute(ws, "V1 + V2", "עלות הבנייה והחניון")
+        c.outcome.conditional.append(T.MSG_UNCERTAIN_INPUTS.format(ids="V1, V2") + " (V1: התא לא אושר)")
+        c.uncertain = ["V1", "V2"]
+
+    offline.setup = setup
+    answer = "עלות הבנייה העילית והחניון יחד היא 20,220,000 ₪ [C1].\nכלומר סך העלות הוא 20,220,000 ₪ [C1]."
+    out = _turn(ScriptedAgent([SEARCH, final(answer), final(answer)], judge=Judge(lambda t, i, n: "supported")),
+                "מה עלות הבנייה העילית והחניון יחד?")
+    md = out.answer.answer_markdown
+    note = "התוצאה C1 מותנית: הערכים V1, V2 אינם ודאיים."
+    assert md.endswith("\n\n" + note) and md.count("אינם ודאיים") == 1, md
+    assert md.count("(תוצאה מותנית)") == 2
+    kinds = _kinds(out)
+    assert kinds == ["qualifier", "qualifier", "conditional_note"], kinds  # in the order of the text
+    assert out.final_check["judge_calls"] == 0 and "verify_final" not in _purposes(out)
+    assert out.final_digest == text_digest(md) == hashlib.sha256(md.encode()).hexdigest()
+    (span,) = [s for s in out.server_spans if s.kind == "conditional_note"]
+    assert md[span.start:span.end] == "\n\n" + note
+
+
 # --- R28: the conversation's focus comes from the claims that survived -----------------------------------------------------
 
 def test_the_focus_names_only_documents_the_surviving_text_cites(offline):

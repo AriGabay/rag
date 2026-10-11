@@ -65,7 +65,7 @@ test.describe("gap summary", () => {
     page,
   }) => {
     const answer = answerWith({
-      status: "answered", markdown: "סך העלויות הוא 20,220,000 ₪ (תוצאה מותנית: הערכים V1, V2 אינם ודאיים) [C1].",
+      status: "answered", markdown: "סך העלויות הוא 20,220,000 ₪ (תוצאה מותנית) [C1].\n\nהתוצאה C1 מותנית: הערכים V1, V2 אינם ודאיים.",
       gaps: [], components: [component("N1", "סך העלויות", "full", { units: [0], related: ["C1"] })],
     }, { correctness: "partial", conditional: 1, completeness: { status: "full", requirements: 1, missing: [] } });
     const { id, reply } = await openAnswer(page, answer);
