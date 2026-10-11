@@ -430,6 +430,11 @@ export const WITHHELD_DEFAULT_TEXT = "הבדיקה לא הושלמה. הטענה
 /** The cut marker the server writes in the answer's text: «[N: חלק שלא אומת הושמט]». */
 export const CUT_MARKER = /«\[(\d+): חלק שלא אומת הושמט\]»/g;
 
+/** The cut marker for the Nth cut, exactly as the server writes it: «[N: חלק שלא אומת הושמט]». */
+export function cutMarkerText(n: number | string): string {
+  return `«[${n}: חלק שלא אומת הושמט]»`;
+}
+
 /** The default notice's sentence for the content-affecting actions it counts (`counts` by action), without the verb
  * "removed" when nothing was removed. Empty when none was. */
 export function contentActionsText(counts: Partial<Record<ChangeAction, number>>): string {

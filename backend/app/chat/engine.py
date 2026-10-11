@@ -101,6 +101,7 @@ from app.chat import request as request_analysis
 from app.chat import tools as T
 from app.chat.compose import ServerSpan, text_digest
 from app.chat.final_check import FinalCheckError, finalize
+from app.chat.rereader import ContextReader
 from app.chat.verify import (
     VERIFY_ALLOWANCE_SECONDS,
     TurnRequirements,
@@ -546,7 +547,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     ws.requirements = turn  # the tools read what the request asks about and compares (round 7 U6, KTD7)
     # the turn's verdicts: a repair round judges only what changed (KTD10)
     verdicts = VerdictCache()
-    rereader = T.ContextReader(ws)  # a claim the judge lacked context for is read again once (round 8 U5)
+    rereader = ContextReader(ws)  # a claim the judge lacked context for is read again once (round 8 U5)
     reused = 0
     checked = None  # the last verified answer with its report, kept when a repair round cannot finish
     repaired: set[str] = set()  # the units a repair prompt named (``verify.repair_key``)

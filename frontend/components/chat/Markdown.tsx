@@ -3,7 +3,7 @@
 import { memo, useMemo } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { CUT_MARKER } from "@/lib/format";
+import { CUT_MARKER, cutMarkerText } from "@/lib/format";
 
 /** Citation ids an answer may carry: passages (S), measurements (M), values (V), user assumptions (A),
  * calculations (C). */
@@ -45,7 +45,7 @@ function withCitationLinks(markdown: string): string {
 /** The server's cut markers «[N: חלק שלא אומת הושמט]» become links to `#cut-N`, keeping the marker's own words as the
  * link text, so the displayed text stays the saved text; `components.a` renders them apart from the model's words. */
 function withCutLinks(markdown: string): string {
-  return markdown.replace(CUT_MARKER, (_all, n: string) => `[«\\[${n}: חלק שלא אומת הושמט\\]»](#cut-${n})`);
+  return markdown.replace(CUT_MARKER, (_all, n: string) => `[${cutMarkerText(n).replace(/[[\]]/g, "\\$&")}](#cut-${n})`);
 }
 
 interface Props {

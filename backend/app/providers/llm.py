@@ -231,6 +231,12 @@ def deadline_left(deadline: float | None) -> float | None:
     return None if deadline is None else deadline - time.monotonic()
 
 
+def has_time(deadline: float | None, minimum: float) -> bool:
+    """Whether a call may start: no ``deadline``, or at least ``minimum`` seconds left before it."""
+    left = deadline_left(deadline)
+    return left is None or left >= minimum
+
+
 def client_options(purpose: Purpose, deadline: float | None) -> dict[str, Any] | None:
     """SDK ``with_options`` for one call: the purpose's timeout; with a deadline, the timeout cut to what
     remains and no SDK retry. None when less than ``DEADLINE_FLOOR_SECONDS`` remains (no call is made)."""

@@ -39,9 +39,9 @@ from dataclasses import dataclass, field
 
 from app.chat.compose import Composition, compose, text_digest
 from app.chat.verify import (
-    _ID,
     _IDS,
     DEFECT_FAILURES,
+    GONE_ACTIONS,
     NOT_CLASSIFIED,
     JudgeRequirement,
     JudgeVerdict,
@@ -56,15 +56,19 @@ from app.chat.verify import (
     _judged_failure,
     _named_support,
     _non_claim_accepted,
+    _norm,
     _primary_claim_id,
     _remove_dependents,
     _workspace_listing,
+    clarification_question,
     exempt_without_verdict,
+    ids_in,
+    rescued_expansions,
     split_units,
     unit_claims,
     unit_key,
 )
-from app.providers.llm import deadline_left
+from app.providers.llm import has_time
 
 logger = logging.getLogger(__name__)
 
@@ -140,10 +144,6 @@ def assert_fixed_point(saved: Composition, again: Composition) -> None:
         raise FinalCheckError("the server's spans are not a fixed point of the final state")
 
 
-def _model_ids(raw: str) -> list[str]:
-    return list(dict.fromkeys(i for m in _IDS.finditer(raw) for i in _ID.findall(m.group(1))))
-
-
 def _keyed(unit: Unit, text: str, ids: list[str]) -> Unit:
     """The unit as its reuse key sees it: the model's text without its citations (and without a list marker), and the
     ids the model cited — a citation the server attached is not part of what was judged."""
@@ -176,7 +176,7 @@ class _Final:
         return unit_key(unit, self.ws, self.request or self.question, unit.heading, self.digests)
 
     def draft_key(self, d: Unit) -> str:
-        return self.key_of(_keyed(d, d.text, _model_ids(d.raw)))
+        return self.key_of(_keyed(d, d.text, ids_in(d.raw)))
 
     def split(self, comp: Composition) -> list[FinalUnit]:
         """The composed text's units, each told apart as the server's or the model's, with the draft units it comes from,
@@ -189,7 +189,7 @@ class _Final:
         # the heading chain is the model's own words: a mark or a marker on a heading is not a new heading
         blank = "".join(" " if s and c != "\n" else c for c, s in zip(md, server, strict=True))
         chains = _headings_above(blank, units)
-        question = _norm_question(self.answer)
+        question = clarification_question(self.answer)
         out: list[FinalUnit] = []
         for u in units:
             u.heading = chains[u.index]
@@ -210,9 +210,9 @@ class _Final:
             # the draft units its words come from — letters and digits only: a list marker or a full stop a cut left
             # behind belongs to the sentence that was cut, not to the one that stays
             drafts = sorted({self.draft_at(comp.origin[i]) for i in model_at if md[i].isalnum()} - {-1})
-            keyed = _keyed(u, _IDS.sub("", model_raw).strip(), _model_ids(model_raw))
+            keyed = _keyed(u, _IDS.sub("", model_raw).strip(), ids_in(model_raw))
             f = FinalUnit(u, True, drafts, self.key_of(keyed), exempt=exempt_without_verdict(keyed))
-            f.protected = bool(question) and (question in " ".join(u.text.split()) or any(
+            f.protected = bool(question) and (question in _norm(u.text) or any(
                 d in self.report.protected for d in drafts))
             out.append(f)
         return out
@@ -227,8 +227,7 @@ class _Final:
     # --- the check ---------------------------------------------------------------------------------------------------
 
     def time_left(self) -> bool:
-        left = deadline_left(self.deadline)
-        return left is None or left >= FINAL_MIN_SECONDS
+        return has_time(self.deadline, FINAL_MIN_SECONDS)
 
     def check(self, comp: Composition, may_judge: bool) -> Checked:
         """The model's units of ``comp`` against what is known: a unit whose key has a verdict passes; the rest are judged
@@ -247,8 +246,10 @@ class _Final:
         todo = self.with_votes(todo, units)
         batch, index_of, coverage = self.batch(todo)
         try:
+            # the context a re-read read for a claim of these sentences is shown again in the source it expanded
+            shown = rescued_expansions(self.report, self.ws, sorted({d for f in todo for d in f.drafts}))
             verdicts, scored, unchecked = _judge_all(self.provider, batch, self.ws, self.usage, self.deadline, coverage,
-                                                     [], FINAL_LABEL)
+                                                     [], FINAL_LABEL, shown)
         except VerificationUnavailable as exc:
             logger.warning("final check: the judge could not be reached (%s)", exc.status)
             self.stats["unavailable"], res.unavailable = True, True
@@ -330,10 +331,9 @@ class _Final:
         such): supported — it passes; partly supported with no concrete defect — it passes, marked; supported by a source it
         does not cite — the citation is attached (the draft's rule, ``_named_support``); anything else fails."""
         u = f.unit
-        post = v.verdict
         if v.verdict in ("not_factual", "navigation"):
             if _non_claim_accepted(u, v.verdict):
-                return self.accept(f, post)
+                return self.accept(f, v.verdict)
             res.failures.append(Failure(f.drafts, "not_checked", NOT_CLASSIFIED, "not_classified", "unchecked"))
             return
         if v.verdict in ("unsupported", "contradicts"):
@@ -348,9 +348,9 @@ class _Final:
                                         FINAL_UNSUPPORTED.format(reason=v.reason), record="partial"))
             return
         if v.verdict == "partial":
-            self.accept(f, post)
-            res.mutated |= self.mark(f, Problem(self.drafts[f.drafts[0]], FINAL_PARTIAL, "partial", defect="none",
-                                                check="final")) if len(f.drafts) == 1 else False
+            self.accept(f, v.verdict)
+            res.mutated |= self.mark(Problem(self.drafts[f.drafts[0]], FINAL_PARTIAL, "partial", defect="none",
+                                             check="final")) if len(f.drafts) == 1 else False
             return
         named = [s for s in dict.fromkeys(v.supported_by) if s not in u.ids]
         if named:
@@ -362,11 +362,11 @@ class _Final:
             if len(f.drafts) == 1:
                 d = self.drafts[f.drafts[0]]
                 for s in named:
-                    res.mutated |= self.mark(f, Problem(d, FINAL_ATTACH.format(source=s), kind="needs_citation",
-                                                        cite=s, check="final"))
-        self.accept(f, post)
+                    res.mutated |= self.mark(Problem(d, FINAL_ATTACH.format(source=s), kind="needs_citation",
+                                                     cite=s, check="final"))
+        self.accept(f, v.verdict)
 
-    def mark(self, f: FinalUnit, problem: Problem) -> bool:
+    def mark(self, problem: Problem) -> bool:
         """Add a problem the composer turns into a server span (a partial mark, an attached citation), once."""
         problems = self.report.problems
         if any(p.unit is problem.unit and p.check == "final" and p.kind == problem.kind and p.cite == problem.cite
@@ -394,6 +394,10 @@ class _Final:
         before = report.removed_units()
         gone = set(before)
         for fail in failures:
+            def mark_claims(i: int, record: str = fail.record) -> None:
+                for r in report.claims.get(i, []):
+                    r.action, r.post_check = action, record
+
             for di in fail.drafts:
                 d = self.drafts.get(di)
                 if d is None or di in gone or di in report.protected:
@@ -402,8 +406,7 @@ class _Final:
                 head = Problem(d, fail.reason, failure_kind=fail.kind, check="final", cause=fail.cause,
                                claim_id=_primary_claim_id(report, di))
                 report.problems.append(head)
-                for r in report.claims.get(di, []):
-                    r.action, r.post_check = action, fail.record
+                mark_claims(di)
                 if d.table_header and d.table_span is not None:
                     # a table left without its header goes with it: its rows are removed on the same ground (R12)
                     for row in report.units:
@@ -413,15 +416,14 @@ class _Final:
                                 row, "השורה שייכת לטבלה שכותרתה הוסרה בבדיקה הסופית", failure_kind=fail.kind,
                                 check="dependency", cause=fail.cause, claim_id=_primary_claim_id(report, row.index),
                                 basis=head.claim_id))
-                            for r in report.claims.get(row.index, []):
-                                r.action, r.post_check = action, fail.record
+                            mark_claims(row.index)
         if gone != before:
             _remove_dependents(report, report.unit_verdicts)
             report.assign_components()
         after = report.removed_units()
         for di in after - before:
             for r in report.claims.get(di, []):
-                r.action = r.action if r.action in ("removed", "withheld") else action
+                r.action = r.action if r.action in GONE_ACTIONS else action
         went = len(after - before)
         self.stats["withheld" if action == "withheld" else "removed"] += went
         return went
@@ -470,11 +472,6 @@ class _Final:
             if res.failures and not self.apply(res.failures, "withheld"):
                 raise FinalCheckError("a unit that could not be checked could not be withheld")
         raise FinalCheckError("the withholding did not settle")
-
-
-def _norm_question(answer) -> str:
-    return " ".join(_IDS.sub("", getattr(answer, "clarification_question", "") or "").split()) \
-        if getattr(answer, "status", "") == "clarification" else ""
 
 
 def finalize(provider, ws, answer, report: VerifyReport, turn: TurnRequirements, *, question: str,

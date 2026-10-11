@@ -310,7 +310,8 @@ def test_ae6_text_added_after_verification_is_saved_checked_and_recorded_with_a_
     assert "**כיסוי:**" in markdown, markdown  # the coverage note
     assert COMPONENT in markdown, markdown  # the gap paragraph
     verification = _payload(out)["verification"]
-    assert verification.get("final_digest") == hashlib.sha256(markdown.encode()).hexdigest(), verification
+    assert verification.get("final_digest") == out.final_digest, verification  # the final check's own digest
+    assert out.final_digest == hashlib.sha256(markdown.encode()).hexdigest()  # which is the saved text's
 
 
 # --- AE8 (R22, R23): a removal detail is linked to its claim by id, not by position ---------------------------------

@@ -11,6 +11,7 @@ import re
 import pytest
 from sqlalchemy import text
 
+from app.chat import api as chat_api
 from app.chat import verify
 from app.chat.compose import SERVER_SPANS_FIELD
 from app.db import tenant_tx
@@ -176,17 +177,55 @@ def _diagnostics_row(setup, message_id: str):
                             {"m": message_id}).one()
 
 
-def test_the_payload_digest_is_the_sha256_of_the_saved_text_and_the_actions_are_counted(client, setup, monkeypatch):
+def _spy_outcomes(monkeypatch) -> list:
+    """The turn's outcomes, as ``run_turn`` returned them (the digest in them is the final check's own)."""
+    real, seen = chat_api.engine.run_turn, []
+
+    def run_turn(*args, **kwargs):
+        seen.append(real(*args, **kwargs))
+        return seen[-1]
+
+    monkeypatch.setattr(chat_api.engine, "run_turn", run_turn)
+    return seen
+
+
+def test_the_payload_digest_is_the_one_the_final_check_returned_for_the_saved_text_and_the_actions_are_counted(
+        client, setup, monkeypatch):
+    seen = _spy_outcomes(monkeypatch)
     m = _handled_turn(client, setup, monkeypatch)
     v = m["answer"]["verification"]
     with tenant_tx(setup.system) as conn:
         saved = conn.execute(text("SELECT content FROM messages WHERE id = :m"), {"m": m["id"]}).scalar_one()
     assert saved == m["content"] == m["answer"]["markdown"]
-    assert v["final_digest"] == hashlib.sha256(saved.encode("utf-8")).hexdigest()
+    (outcome,) = seen
+    assert v["final_digest"] == outcome.final_digest  # stored from the final check, not recomputed from the saved text
+    assert outcome.final_digest == hashlib.sha256(saved.encode("utf-8")).hexdigest()  # and it is the saved text's
     assert v["actions"] == {"removed": 1, "cut": 1, "rewritten": 0, "withheld": 0, "qualified": 1, "cited": 0}
     # after a refresh: the same text, the same digest
     again = client.get(f"/api/chat/messages/{m['id']}").json()
     assert again["content"] == saved and again["answer"]["verification"]["final_digest"] == v["final_digest"]
+
+
+def test_a_text_that_is_not_the_one_the_final_check_verified_is_never_saved_as_an_answer(client, setup, monkeypatch):
+    real = chat_api.engine.run_turn
+
+    def run_turn(*args, **kwargs):
+        out = real(*args, **kwargs)
+        out.answer = out.answer.model_copy(update={"answer_markdown": out.answer.answer_markdown + " טענה שלא נבדקה."})
+        return out
+
+    monkeypatch.setattr(chat_api.engine, "run_turn", run_turn)
+    answer = final(MIXED + " [S1].", documents=[setup.secret])
+    agent = ScriptedAgent([[call("search", query="דמי ניהול", document_ids=[setup.secret], limit=None)], answer, answer,
+                           answer])
+    cloud(monkeypatch, setup, agent)
+    login(client, "emp@example.test")
+    m = send(client, new_conversation(client), "מה דמי הניהול?")
+    assert m["status"] == "failed" and m["error"] == chat_api.FAILURE_TEXT["verify_unavailable"] + " אפשר לנסות שוב.", m
+    assert not m.get("answer") and "שלא נבדקה" not in json.dumps(m, ensure_ascii=False)
+    with tenant_tx(setup.system) as conn:
+        row = conn.execute(text("SELECT status, content, answer FROM messages WHERE id = :m"), {"m": m["id"]}).one()
+    assert row.status == "failed" and row.answer is None and not row.content
 
 
 def test_the_rows_of_the_normal_payload_name_the_claim_the_action_and_the_marker_in_the_texts_order(

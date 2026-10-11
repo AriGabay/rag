@@ -73,6 +73,7 @@ import re
 from collections.abc import Collection
 from typing import TYPE_CHECKING
 
+from app.chat.compose import line_cut
 from app.chat.tools import READ_TO_END, value_uncertain
 from app.db import tenant_tx
 
@@ -610,13 +611,6 @@ def _unlinked_gaps(ws: Workspace, requested) -> list[dict]:
     return out
 
 
-def _append(answer: FinalAnswer, lines: list[str]) -> FinalAnswer:
-    body = answer.answer_markdown.strip()
-    status = "partial" if answer.status == "answered" else answer.status
-    return answer.model_copy(update={"answer_markdown": (body + "\n\n" if body else "") + "\n".join(lines),
-                                     "status": status})
-
-
 def compose_components(ws: Workspace, answer: FinalAnswer, report,
                        turn: TurnRequirements | None = None) -> tuple[Edited, list[dict]]:
     """The verified answer as the server finishes it (round 7 U3, ``engine.finish``), in order, through one ``Doc``
@@ -711,7 +705,7 @@ def tidy_cuts(markdown: str) -> list[tuple[int, int]]:
                 drop = s in seen
                 seen.add(s)
             if drop:
-                out.append((start, end + 1) if n + 1 < len(lines) else (max(start - 1, 0), end))
+                out.append(line_cut(start, end, n + 1 == len(lines)))
     return out
 
 
@@ -822,8 +816,10 @@ def build(ws: Workspace, answer: FinalAnswer, question: str) -> tuple[dict, Fina
         scope = ws.scope
         if scope is None:  # the model did not look the set up: the server does, with the terms it declared
             query = ledger["scope_query"] or question
-            with tenant_tx(ws.ctx) as conn:
-                found = documents_matching(conn, query)
+            if ("matching", query) not in ws.lookups:  # the same query reads the same documents all turn
+                with tenant_tx(ws.ctx) as conn:
+                    ws.lookups["matching", query] = documents_matching(conn, query)
+            found = ws.lookups["matching", query]
             scope = new_scope(query, [(d["document_id"], d["title"]) for d in found], 1)
         matching = scope["matching"]
         omitted = []
@@ -868,9 +864,16 @@ def build(ws: Workspace, answer: FinalAnswer, question: str) -> tuple[dict, Fina
             note = "**כיסוי:** " + " ".join(f"מהטבלה ב\"{t['title']}\" הוצגו ערכים מ-{t['presented']} מתוך "
                                              f"{t['rows']} שורות." for t in short)
     elif cited:  # a focused answer that cites nothing has no documents to compare titles with
-        with tenant_tx(ws.ctx) as conn:
-            named = documents_named(conn, question)
-            shared = {} if named else documents_sharing_title_words(conn, question)
+        # the documents the question names, and when none, those sharing title words with it: read once per turn
+        look = ws.lookups
+        if ("named", question) not in look or (not look["named", question] and ("shared", question) not in look):
+            with tenant_tx(ws.ctx) as conn:
+                if ("named", question) not in look:
+                    look["named", question] = documents_named(conn, question)
+                if not look["named", question] and ("shared", question) not in look:
+                    look["shared", question] = documents_sharing_title_words(conn, question)
+        named = look["named", question]
+        shared = {} if named else look["shared", question]
         others: dict[str, str] = {}
         cited_titles: dict[str, str] = {}
         for docs in shared.values():

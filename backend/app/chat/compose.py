@@ -1,17 +1,16 @@
 """One composer for every edit the server makes to an answer after the model wrote it (round 8 U4, KTD4, KTD6).
 
-Until now six editors changed the answer's Markdown after the last verification — the cuts, partial marks, qualifiers
-and inserted citations of ``VerifyReport.apply``, the removal note or replacement sentence, the request-mismatch note,
-the second ``apply`` after the absences were superseded, the gap paragraph, ``tidy``, the limit sentence and the
-coverage or membership note — and none of them recorded which characters it wrote. A later check could not tell the
-server's words from the model's, so it would judge its own sentences, and a follow-up turn would read a removal note as
-a fact.
+The server edits the answer's Markdown after the last verification: the cuts, partial marks, qualifiers and inserted
+citations of ``VerifyReport.apply``, the removal note or replacement sentence, the request-mismatch note, the second
+``apply`` after the absences were superseded, the gap paragraph, ``tidy``, the limit sentence and the coverage or
+membership note. Whatever it writes must stay told apart from what the model wrote: a later check that could not tell
+them apart would judge the server's own sentences, and a follow-up turn would read a removal note as a fact.
 
 ``Doc`` is the text with a tag per character: 0 for what the model wrote, a span number for what the server inserted.
 Every edit goes through ``Doc`` (a splice, a deletion), so the tags move with the text and the registry — the list of
 ``ServerSpan`` (offsets and a fixed kind, never text) — indexes the FINAL Markdown exactly, whatever was cut, collapsed
-or appended after it. ``compose`` runs the editors in the order ``engine.finish`` always ran them and returns the final
-answer with its registry; the editors keep their logic, and only the way they write changed.
+or appended after it. ``compose`` runs the editors in the order ``engine.finish`` runs them and returns the final
+answer with its registry; the editors keep their own logic and write through ``Doc``.
 
 The spans a kind covers:
 
@@ -50,6 +49,12 @@ SERVER_SPANS_FIELD = "server_spans"  # the key under which a stored answer holds
 def text_digest(markdown: str) -> str:
     """The digest of the saved Markdown (R17): sha256 of its UTF-8 bytes, as the checked text is recorded."""
     return hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+
+
+def line_cut(start: int, end: int, is_last: bool) -> tuple[int, int]:
+    """The range that removes the line ``text[start:end]`` with one newline: its own, or the one before it when the line
+    is the last (it has none after it)."""
+    return (max(start - 1, 0), end) if is_last else (start, end + 1)
 
 
 def strip_server_spans(markdown: str, spans) -> str:

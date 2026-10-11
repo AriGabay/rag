@@ -363,6 +363,16 @@ def test_the_same_text_under_another_heading_or_table_header_is_another_claim_bu
     assert ids_of(tables[0])[1] != ids_of(tables[1])[1]
 
 
+def test_a_cut_only_report_counts_no_partial_unit_though_the_answer_is_partial():
+    """A cut resolves its partial problem (the text carries a marker, no partial mark): ``counts`` leaves it out of
+    ``partial`` exactly as ``edit`` does, while the answer is still ``partial`` (a cut is a loss)."""
+    report = verify_answer(_judge(_mixed_judge), _answer("תכסית 40% מותרת, והנכס מושכר [S1]."), _salted(), "?", [])
+    assert [p.resolution for p in report.problems if p.severity == "partial"] == ["cut"]
+    counts = report.counts()
+    assert counts["actions"]["cut"] == 1 and counts["removed"] == 0
+    assert counts["partial"] == 0 and counts["correctness"] == "partial"
+
+
 def test_a_claim_changed_by_a_repair_gets_a_new_id_with_the_parent_it_replaced():
     cache, ws = VerdictCache(), _salted()
     judge = _judge(_mixed_judge)

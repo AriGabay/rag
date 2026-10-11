@@ -181,7 +181,7 @@ from app.answering.verify import _DATE as _DATE_AT
 from app.answering.verify import _NUMBER as _NUM_AT  # one reading of numbers for both checks
 from app.answering.verify import numbers_in
 from app.chat import meaning
-from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited
+from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited, line_cut
 from app.chat.evidence import select
 from app.chat.request import ID_PREFIX, Aspect, Kind
 from app.config import get_settings
@@ -191,8 +191,8 @@ from app.providers.llm import (
     LLMProvider,
     Purpose,
     call_structured,
-    deadline_left,
     for_purpose,
+    has_time,
     prompt_attr,
     prompt_text,
     usage_entry,
@@ -347,6 +347,15 @@ JUDGE_REREAD_POLICY = (
     "היא ראיה רק במה שהיא אומרת בפועל (יחידות, כותרת, עמוד המשך, קריאת האזור); אל תשלים ממנה או מידע כללי מה שאינו "
     "כתוב. אם גם עם ההרחבה אין תימוכין — unsupported, ולא contradicts אלא אם ההרחבה או המקור אומרים אחרת. כל "
     "שאר הכללים בעינם."
+)
+
+
+# the final check of the saved text (round 8 U6) shows a source with the context a re-read read for it (U5)
+JUDGE_EXPANDED_POLICY = (
+    "\nבמקור שמוצג עם <expanded_context kind=\"...\"> ההרחבה היא הקשר שהשרת קרא מאותו מסמך שמור בבדיקה חוזרת של טענה "
+    "שבלעדיו אי אפשר היה להכריע בה (כותרות, יחידות, פסקאות סמוכות, המשך הסעיף או הטבלה, הערות שוליים או הקריאה השמורה "
+    "של האזור), והיא חלק מהמקור הזה. שפוט לפי המקור כולו, ההרחבה בכלל; היא ראיה רק במה שהיא אומרת בפועל, ואל תשלים "
+    "ממנה או מידע כללי מה שאינו כתוב. כל שאר הכללים בעינם."
 )
 
 
@@ -511,11 +520,8 @@ NeedsContext = Literal["none", "heading", "neighbours", "continuation", "table_h
                        "next_page", "region"]
 ClaimKind = Literal["datum", "computed", "inference", "absence", "instruction"]
 ClaimVerdict = Literal["supported", "partial", "unsupported", "contradicts"]
-# why a verdict's claims were replaced by its one whole-unit claim (``unit_claims``)
-CLAIM_FALLBACKS = ("span_not_in_unit", "empty_span")
 
 # the bounded re-read (round 8 U5, KTD5, R13-R15)
-REREAD_KINDS = tuple(k for k in get_args(NeedsContext) if k != "none")
 REREAD_TABLE_KINDS = ("table_headers", "units_note", "next_page", "region")  # contexts of a table or a picture
 REREAD_MIN_SECONDS = 10  # a re-read (an expansion and a judge call) does not start with less of the allowance left
 READ_IN_PART = "המקור נקרא בחלקו"  # R14: a claim whose source the bound kept the turn from reading further
@@ -646,7 +652,7 @@ def valid_missing(missing: str, status: str, component: str, request: str) -> st
     it names nothing the request did not ask for, else "" (round 8 R20, R21): every content word of it — a Hebrew or
     latin word, or a number, prefixes and stop words ignored — is a word of the component's text or of the user's
     request, and it is a short noun phrase. The server never writes a part the request does not hold."""
-    part = " ".join((missing or "").split())
+    part = _norm(missing or "")
     if status != "partial" or not part or len(part) > MISSING_PART_CHARS:
         return ""
     words = _missing_words(part)
@@ -875,7 +881,7 @@ def unit_key(unit: Unit, ws: Workspace, request: str, heading: str, digests: dic
             digests["*"] = hashlib.sha256("\x1f".join(
                 f"{sid}\x1e" + "\x1f".join(_source_parts(ws, sid) or ()) for sid in ws.sources).encode()).hexdigest()
         evidence.append(("*", digests["*"]))
-    raw = json.dumps([" ".join(unit.text.split()), evidence, unit.context, heading, unit.table_header, request,
+    raw = json.dumps([_norm(unit.text), evidence, unit.context, heading, unit.table_header, request,
                       JUDGE_VERSION], ensure_ascii=False)
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -913,6 +919,13 @@ def _norm(text: str) -> str:
     return " ".join(text.split())
 
 
+def clarification_question(answer) -> str:
+    """The question line of a clarification, without citations and with the spaces normalised; "" for any other answer."""
+    if getattr(answer, "status", "") != "clarification":
+        return ""
+    return _norm(_IDS.sub("", getattr(answer, "clarification_question", "") or ""))
+
+
 def _digest(*parts) -> str:
     return hashlib.sha256(json.dumps(parts, ensure_ascii=False).encode()).hexdigest()[:12]
 
@@ -946,7 +959,7 @@ def claim_id_of(unit: Unit, span: str, occurrence: int = 0) -> str:
 
 def repair_key(unit: Unit) -> str:
     """A unit as a repair prompt names it, so a later round's same sentence is known (``mark_repairs``)."""
-    return " ".join(unit.text.split())
+    return _norm(unit.text)
 
 
 def removal_summary(kind: str, cause: str = "", component: str | None = None) -> dict:
@@ -1044,6 +1057,12 @@ class Problem:
                 "claim_id": self.claim_id, "cause": self.cause, "basis": self.basis,
                 "resolution": self.resolution}
 
+    @staticmethod
+    def undecided_dict(unit: Unit) -> dict:
+        """``as_dict`` of a claim no check failed (a cut, a rewrite, a citation the server attached): the same keys,
+        with nothing decided and no text of its own — built from a ``Problem`` so the two never drift apart."""
+        return Problem(unit, "", severity="partial").as_dict() | {"text": ""}
+
     def summary(self) -> dict:
         """The removal on the user's normal path (KTD5): its kind, its component and the server's fixed sentence."""
         return removal_summary(self.failure_kind or "absent_from_source", self.cause, self.component)
@@ -1116,8 +1135,8 @@ class VerifyReport:
         """A clarification keeps its question line through every edit (round 8 R29): the unit(s) holding
         ``clarification_question`` are never removed or cut — a check that failed one is dropped, and its claims are
         recorded as no claim (a question states nothing). Whatever surrounds the question goes through the ladder."""
-        question = _norm(_IDS.sub("", answer.clarification_question or ""))
-        if answer.status != "clarification" or not question:
+        question = clarification_question(answer)
+        if not question:
             return
         self.protected = {u.index for u in self.units
                           if question in _norm(u.text) or (len(_norm(u.text)) >= 12 and _norm(u.text) in question)}
@@ -1221,7 +1240,7 @@ class VerifyReport:
             recs = self.claims.get(p.unit.index, [])
             primary = next((r for r in recs if r.id == p.claim_id), None) or next(
                 (r for r in recs if r.verdict in FAILING_VERDICTS), recs[0] if recs else None)
-            action = primary.action if primary is not None and primary.action in ("removed", "withheld") else (
+            action = primary.action if primary is not None and primary.action in GONE_ACTIONS else (
                 "withheld" if p.failure_kind == "not_checked" else "removed")
             out.append(Logged(p.claim_id or (primary.id if primary is not None else ""), action, p.unit, recs, p))
         units = {u.index: u for u in self.units}
@@ -1229,7 +1248,7 @@ class VerifyReport:
             if idx in gone or idx not in units:
                 continue
             for r in self.claims[idx]:
-                if r.action not in LOG_ACTIONS or r.action in ("removed", "withheld"):
+                if r.action not in LOG_ACTIONS or r.action in GONE_ACTIONS:
                     continue
                 mine = [p for p in self.problems if p.claim_id == r.id]
                 if not mine and r.action in ("qualified", "cited"):
@@ -1245,7 +1264,9 @@ class VerifyReport:
         errors = self.failed_units()
         logged = self.logged()
         out = {"judged": self.judged, "judge_status": self.judge_status, "removed": len(errors),
-               "partial": len({p.unit.index for p in self.problems if p.severity == "partial"} - errors),
+               # a cut resolves its partial problem: the text carries a marker, not a partial mark (as in ``edit``)
+               "partial": len({p.unit.index for p in self.problems
+                               if p.severity == "partial" and p.resolution != "cut"} - errors),
                # a qualifier written from the source; a result the server marked conditional is counted apart
                "annotated": sum(1 for p in self.problems if p.annotatable and not p.conditional
                                 and p.unit.index not in errors),
@@ -1277,7 +1298,7 @@ class VerifyReport:
         """For a unit holding claims that differ, which the repair or the rewrite keeps verbatim and which it fixes
         (KTD4 step 3, R9): the supported claims' spans, and the failing ones'."""
         recs = self.claims.get(index) or []
-        keep = [r.text for r in recs if r.verdict in ("supported", "partial") and not r.whole_unit]
+        keep = [r.text for r in recs if r.verdict in STANDING_VERDICTS and not r.whole_unit]
         fix = [r.text for r in recs if r.verdict in FAILING_VERDICTS and not r.whole_unit]
         if not keep or not fix:
             return ""
@@ -1412,10 +1433,6 @@ class VerifyReport:
         found = [r for r in self.claims.get(index, []) if any(_same_span(r.text, s) for s in vote.claims)]
         return not found or any(r.verdict not in FAILING_VERDICTS for r in found)
 
-    def failing_claims(self) -> list[ClaimRecord]:
-        """The claims that failed their check, in the answer's order (an unchecked one among them)."""
-        return [r for i in sorted(self.claims) for r in self.claims[i] if r.verdict in FAILING_VERDICTS]
-
     def instruction_plane(self, outcomes: list[dict] | None = None) -> dict:
         """The instruction plane, apart from content and completeness (round 8 KTD3, R2): the citation state of every
         claim (``cited``, ``repaired``, ``missing``, ``not_needed``) and the instruction components of the request
@@ -1431,7 +1448,7 @@ class VerifyReport:
                       for o in outcomes if o.get("kind") == "instruction"]
         return {"citations": citations, "components": components,
                 "counts": {k: sum(1 for c in citations if c["state"] == k)
-                           for k in ("cited", "repaired", "missing", "not_needed")}}
+                           for k in CITATION_STATES}}
 
     def _computes(self, indexes: set[int]) -> bool:
         """Whether one of the units ``indexes`` shows a computation of the turn: it cites a successful ``C#``, or a
@@ -1466,7 +1483,7 @@ class VerifyReport:
             kind = structural_kind(u)
             if kind == "table_header" or exempt_without_verdict(u):
                 continue
-            if numbers_in(_stated_text(u)) or self.verdicts.get(u.index) in ("supported", "partial"):
+            if numbers_in(_stated_text(u)) or self.verdicts.get(u.index) in STANDING_VERDICTS:
                 out.append(u.index)
         return out
 
@@ -1702,7 +1719,7 @@ def _orphan_cuts(original: str, text: str) -> list[tuple[int, int]]:
         pos = end + 1
         if ln.strip() in gone:
             gone.remove(ln.strip())
-            out.append((start, end + 1) if n + 1 < len(lines) else (max(start - 1, 0), end))
+            out.append(line_cut(start, end, n + 1 == len(lines)))
     return out
 
 
@@ -1788,6 +1805,11 @@ def _after_number(unit: Unit, written: str) -> int | None:
     return unit.start + (tail.end() if tail else m.end())
 
 
+def ids_in(text: str) -> list[str]:
+    """The source ids a text cites, in the order they are first written."""
+    return list(dict.fromkeys(i for m in _IDS.finditer(text) for i in _ID.findall(m.group(1))))
+
+
 def split_units(markdown: str) -> list[Unit]:
     """Every statement of the answer with its character span: lines; long lines split into sentences; a Markdown
     table row is one unit. Citations written after a sentence's full stop ("... 55 ₪. [S2]") belong to it. A
@@ -1846,11 +1868,10 @@ def split_units(markdown: str) -> list[Unit]:
             spans = _attach_bare_answers(stripped, spans)
         for a, b in spans:
             part = stripped[a:b].rstrip()
-            ids = [i for m in _IDS.finditer(part) for i in _ID.findall(m.group(1))]
             clean = _IDS.sub("", part).strip()
             if not re.search(r"[א-תA-Za-z0-9]", clean):
                 continue
-            units.append(Unit(len(units), part, clean, list(dict.fromkeys(ids)), base + a, base + a + len(part),
+            units.append(Unit(len(units), part, clean, ids_in(part), base + a, base + a + len(part),
                               header_row, table_span, context))
     units = _attach_bare_lines(markdown, units)
     chains = _headings_above(markdown, units)
@@ -2927,6 +2948,15 @@ class _Batch:
 _WORD = re.compile(r"[א-תA-Za-z]{3,}")
 
 
+def _source_terms(ws: Workspace, sid: str, body: str) -> tuple[set[str], set[str]]:
+    """The numbers and the words of a source's text, worked out once per source for the turn (and again if its text
+    changed)."""
+    cached = ws.source_terms.get(sid)
+    if cached is None or cached[0] != body:
+        cached = ws.source_terms[sid] = (body, numbers_in(body), set(_WORD.findall(body)))
+    return cached[1], cached[2]
+
+
 def _unit_candidates(u: Unit, ws: Workspace) -> list[str]:
     """The sources of the turn an uncited factual unit is judged against too (round 8 KTD3, R2): at most
     ``CANDIDATE_SOURCES`` sources already read in the turn (``ws.sources``) whose text holds the unit's numbers — a
@@ -2943,9 +2973,9 @@ def _unit_candidates(u: Unit, ws: Workspace) -> list[str]:
         parts = _source_parts(ws, sid)
         if parts is None:
             continue
-        body = parts[1]
-        shared_numbers = len(numbers & numbers_in(body)) if numbers else 0
-        shared_words = len(words & set(_WORD.findall(body)))
+        body_numbers, body_words = _source_terms(ws, sid, parts[1])
+        shared_numbers = len(numbers & body_numbers) if numbers else 0
+        shared_words = len(words & body_words)
         if (numbers and not shared_numbers) or (not numbers and shared_words < 2):
             continue
         scored.append((-shared_numbers, -shared_words, n, sid))
@@ -3152,30 +3182,33 @@ def _render_batch(batch: _Batch, ws: Workspace, coverage: _Coverage | None = Non
             + (coverage.render() if coverage else ""))
 
 
-def _batches(units: list[Unit], ws: Workspace, removed: list[Unit] | None = None) -> list[_Batch]:
+def _batches(units: list[Unit], ws: Workspace, removed: list[Unit] | None = None,
+             expanded: dict[str, list[tuple[str, str]]] | None = None) -> list[_Batch]:
     """Units packed into judge calls by the size of their evidence; a unit too big for one call alone is
-    judged on its narrow evidence (numbers and table headers). Every call shows the ``removed`` units."""
-    out = _pack(units, ws)
+    judged on its narrow evidence (numbers and table headers). Every call shows the ``removed`` units, and the
+    ``expanded`` context of the sources it cites."""
+    out = _pack(units, ws, expanded)
     for b in out:
         b.removed = list(removed or [])
     return out
 
 
-def _pack(units: list[Unit], ws: Workspace) -> list[_Batch]:
+def _pack(units: list[Unit], ws: Workspace, expanded: dict[str, list[tuple[str, str]]] | None = None) -> list[_Batch]:
+    shown = expanded or {}
     out: list[_Batch] = []
     current: list[Unit] = []
     for u in units:
-        trial = _Batch([*current, u])
+        trial = _Batch([*current, u], expanded=shown)
         if current and (len(current) >= JUDGE_MAX_UNITS or len(_render_batch(trial, ws)) > JUDGE_CALL_CHARS):
-            out.append(_Batch(current))
+            out.append(_Batch(current, expanded=shown))
             current = [u]
         else:
             current.append(u)
-        if len(current) == 1 and len(_render_batch(_Batch(current), ws)) > JUDGE_CALL_CHARS:
-            out.append(_Batch(current, narrow=True))
+        if len(current) == 1 and len(_render_batch(_Batch(current, expanded=shown), ws)) > JUDGE_CALL_CHARS:
+            out.append(_Batch(current, narrow=True, expanded=shown))
             current = []
     if current:
-        out.append(_Batch(current))
+        out.append(_Batch(current, expanded=shown))
     return out
 
 
@@ -3207,22 +3240,24 @@ def judge(provider: LLMProvider, batch: _Batch, rendered: str, usage: list[dict]
 
 
 def _judge_batch(provider: LLMProvider, batch: _Batch, ws: Workspace, usage: list[dict],
-                 deadline: float | None, coverage: _Coverage | None = None, label: str = "verify"
+                 deadline: float | None, coverage: _Coverage | None = None, label: str = "verify", policy: str = ""
                  ) -> tuple[dict[int, JudgeVerdict], list[JudgeRequirement]]:
     """One batch to verdicts (and requirement scores): a call that timed out, was rate-limited or came back invalid is
     made once more; a truncated (``incomplete``) reply is split in half instead of resent. Raises
-    ``VerificationUnavailable`` when the judge cannot answer. ``label``: the calls' usage purpose (``judge``)."""
+    ``VerificationUnavailable`` when the judge cannot answer. ``label``: the calls' usage purpose (``judge``);
+    ``policy``: more rules for these calls."""
     rendered = _render_batch(batch, ws, coverage)
-    got, status, scores = judge(provider, batch, rendered, usage, deadline, coverage, label=label)
+    got, status, scores = judge(provider, batch, rendered, usage, deadline, coverage, label=label, policy=policy)
     if status == "incomplete" and len(batch.units) > 1:
         half = len(batch.units) // 2
-        first, p1 = _judge_batch(provider, _Batch(batch.units[:half], batch.narrow, batch.removed), ws, usage,
-                                 deadline, coverage, label)
-        second, p2 = _judge_batch(provider, _Batch(batch.units[half:], batch.narrow, batch.removed), ws, usage,
-                                  deadline, coverage, label)
+        first, p1 = _judge_batch(provider, _Batch(batch.units[:half], batch.narrow, batch.removed,
+                                                  expanded=batch.expanded), ws, usage, deadline, coverage, label, policy)
+        second, p2 = _judge_batch(provider, _Batch(batch.units[half:], batch.narrow, batch.removed,
+                                                   expanded=batch.expanded), ws, usage, deadline, coverage, label,
+                                  policy)
         return first | second, p1 + p2
     if status in RETRYABLE:
-        got, status, scores = judge(provider, batch, rendered, usage, deadline, coverage, label=label)
+        got, status, scores = judge(provider, batch, rendered, usage, deadline, coverage, label=label, policy=policy)
     if status != "ok":
         raise VerificationUnavailable(status)
     return _shown_support(got, batch, ws), scores
@@ -3266,12 +3301,16 @@ def _named_support(unit: Unit, named: list[str], ws: Workspace, question: str) -
 
 def _judge_all(provider: LLMProvider, units: list[Unit], ws: Workspace, usage: list[dict],
                deadline: float | None = None, coverage: _Coverage | None = None, removed: list[Unit] | None = None,
-               label: str = "verify") -> tuple[dict[int, JudgeVerdict], list[JudgeRequirement], dict[int, str]]:
+               label: str = "verify", expanded: dict[str, list[tuple[str, str]]] | None = None
+               ) -> tuple[dict[int, JudgeVerdict], list[JudgeRequirement], dict[int, str]]:
     """Every unit judged; a unit the judge left out is asked about once more. With the turn's requirements, every
     call also scores them by id (a requirement may be given in any batch). A call the judge cannot answer (after its
     retry) leaves its units not checked (round 7 KTD5: returned with the call's status, and removed as not checked,
     never as wrong) while other calls answered; when no call answers, ``VerificationUnavailable`` is raised. ``label``:
-    the calls' usage purpose (``judge``): the final check's are ``verify_final`` (round 8 U6)."""
+    the calls' usage purpose (``judge``): the final check's are ``verify_final`` (round 8 U6). ``expanded``: the context
+    a re-read read for a source (id -> [(kind, text)]), shown inside it where the units cite it — the final check judges
+    again, as saved, a sentence whose claim that context supported."""
+    policy = JUDGE_EXPANDED_POLICY if expanded else ""
     verdicts: dict[int, JudgeVerdict] = {}
     scores: list[JudgeRequirement] = []
     unchecked: dict[int, str] = {}
@@ -3281,7 +3320,7 @@ def _judge_all(provider: LLMProvider, units: list[Unit], ws: Workspace, usage: l
         nonlocal failure, scores
         for batch in batches:
             try:
-                got, p = _judge_batch(provider, batch, ws, usage, deadline, coverage, label)
+                got, p = _judge_batch(provider, batch, ws, usage, deadline, coverage, label, policy)
             except VerificationUnavailable as exc:
                 failure = exc
                 unchecked.update({u.index: exc.status for u in batch.units})
@@ -3289,8 +3328,8 @@ def _judge_all(provider: LLMProvider, units: list[Unit], ws: Workspace, usage: l
             verdicts.update(got)
             scores += p
 
-    run(_batches(units, ws, removed))
-    run(_batches([u for u in units if u.index not in verdicts and u.index not in unchecked], ws, removed))
+    run(_batches(units, ws, removed, expanded))
+    run(_batches([u for u in units if u.index not in verdicts and u.index not in unchecked], ws, removed, expanded))
     if failure is not None and not verdicts:
         raise failure
     return verdicts, scores, unchecked
@@ -3328,8 +3367,25 @@ def _log_reread(ws: Workspace, claim_id: str, **entry) -> None:
 
 
 def _reread_time_left(deadline: float | None) -> bool:
-    left = deadline_left(deadline)
-    return left is None or left >= REREAD_MIN_SECONDS
+    return has_time(deadline, REREAD_MIN_SECONDS)
+
+
+def _expansion_text(got: Expansion | str | None) -> str | None:
+    """The text of what a fetcher gave back (an ``Expansion`` or the bare text)."""
+    return got.text if isinstance(got, Expansion) else got
+
+
+def _adopt_expansion(fetcher: ContextFetcher, sid: str, kind: str) -> str | None:
+    """Register the expansion of ``sid`` of ``kind`` as a turn source through the fetcher's ``adopt`` and give its id;
+    None when the fetcher cannot, or registering failed (logged: a convenience of the log, not a check)."""
+    adopt = getattr(fetcher, "adopt", None)
+    if not callable(adopt):
+        return None
+    try:
+        return adopt(sid, kind)
+    except Exception:  # noqa: BLE001
+        logger.warning("registering the re-read of %s failed", sid, exc_info=True)
+        return None
 
 
 def _expand_unstated(report: VerifyReport, units: list[Unit], meanings: dict, ws: Workspace, question: str,
@@ -3346,6 +3402,7 @@ def _expand_unstated(report: VerifyReport, units: list[Unit], meanings: dict, ws
     cites: dict[int, str] = {}
     budget = max(0, get_settings().chat_reread_claims - len(ws.reread_done))
     question_numbers = numbers_in(question)
+    everything: set[str] | None = None  # the turn's numbers, read once a body is there to check; again after an adopt
     for p in list(report.problems):
         u = p.unit
         if p.check != "unstated_number" or not p.unstated or not u.ids or u.index < 0:
@@ -3361,7 +3418,6 @@ def _expand_unstated(report: VerifyReport, units: list[Unit], meanings: dict, ws
             continue
         ws.reread_done.add(key)
         budget -= 1
-        everything = _all_numbers(ws)
         for kind in UNSTATED_EXPANSIONS:
             entry = {"source": sid, "scope": kind}
             if not _reread_time_left(deadline):
@@ -3373,20 +3429,18 @@ def _expand_unstated(report: VerifyReport, units: list[Unit], meanings: dict, ws
                 logger.warning("re-read of %s (%s) failed", sid, kind, exc_info=True)
                 _log_reread(ws, key, **entry, outcome="check_failed")
                 break
-            body = got.text if isinstance(got, Expansion) else got
+            body = _expansion_text(got)
+            if body and everything is None:
+                everything = _all_numbers(ws)
             if not body or _unstated(u, ws, question_numbers, everything, extra_text=body):
                 _log_reread(ws, key, **entry, outcome="not_found")
                 continue
-            adopt = getattr(fetcher, "adopt", None)
-            try:
-                new_sid = adopt(sid, kind) if callable(adopt) else None
-            except Exception:  # noqa: BLE001
-                logger.warning("registering the re-read of %s failed", sid, exc_info=True)
-                new_sid = None
+            new_sid = _adopt_expansion(fetcher, sid, kind)
             if not new_sid or new_sid not in ws.sources:
                 _log_reread(ws, key, **entry, outcome="check_failed")
                 break
             u.ids.append(new_sid)
+            everything = None  # the source just registered adds to the turn's numbers
             meanings[u.index] = meaning.check(u, ws, meaning_fetcher)
             again = deterministic([u], ws, question, meanings)
             report.problems = [x for x in report.problems if x is not p] + again
@@ -3404,6 +3458,23 @@ def _attach_rereads(report: VerifyReport, ws: Workspace) -> None:
     for recs in report.claims.values():
         for r in recs:
             r.rereads = [dict(x) for x in [*ws.reread_log.get(r.id, []), *ws.reread_log.get("unit:" + r.unit_id, [])]]
+
+
+def rescued_expansions(report: VerifyReport, ws: Workspace, indexes: list[int]) -> dict[str, list[tuple[str, str]]]:
+    """The context a re-read read for the claims of the draft units ``indexes`` and found them supported by (the log
+    entries with an ``expanded_source``, ``ws.reread_log``): cited source id -> [(kind, text)], as ``_reread`` showed it
+    to the judge. The final check shows it again when it judges those claims as saved (R13, KTD5): the expansion is never
+    cited in the answer, so the cited sources alone would not support them. The text is the registered source's, which is
+    the expansion itself, bounded as it was read."""
+    out: dict[str, list[tuple[str, str]]] = {}
+    for i in indexes:
+        for r in report.claims.get(i, []):
+            for x in [*ws.reread_log.get(r.id, []), *ws.reread_log.get("unit:" + r.unit_id, [])]:
+                src = ws.sources.get(x.get("expanded_source") or "")
+                sid, pair = x.get("source"), (x.get("scope") or "", src.text if src is not None else "")
+                if sid and src is not None and pair[1].strip() and pair not in out.setdefault(sid, []):
+                    out[sid].append(pair)
+    return {sid: pairs for sid, pairs in out.items() if pairs}
 
 
 def _reread(provider: LLMProvider, report: VerifyReport, verdicts: dict[int, JudgeVerdict], ws: Workspace,
@@ -3449,7 +3520,7 @@ def _reread(provider: LLMProvider, report: VerifyReport, verdicts: dict[int, Jud
             logger.warning("re-read of %s (%s) failed", sid, r.needs_context, exc_info=True)
             _log_reread(ws, r.id, **entry, outcome="check_failed")
             continue
-        text_ = got.text if isinstance(got, Expansion) else got
+        text_ = _expansion_text(got)
         if not text_ or not text_.strip():
             _log_reread(ws, r.id, **entry, outcome="no_context")
             continue
@@ -3460,8 +3531,7 @@ def _reread(provider: LLMProvider, report: VerifyReport, verdicts: dict[int, Jud
         expanded.append((u, r, sid, r.needs_context))
     if not expanded:
         return
-    batch.units = list(dict.fromkeys(u.index for u, *_ in expanded))
-    batch.units = [units[i] for i in batch.units]
+    batch.units = [units[i] for i in dict.fromkeys(u.index for u, *_ in expanded)]
     rendered = _render_batch(batch, ws)
     got, status, _ = judge(provider, batch, rendered, usage, deadline, policy=JUDGE_REREAD_POLICY, label="verify_reread")
     if status in RETRYABLE:
@@ -3471,7 +3541,6 @@ def _reread(provider: LLMProvider, report: VerifyReport, verdicts: dict[int, Jud
         got = _shown_support(got, batch, ws)
     else:
         got = {}
-    adopt = getattr(fetcher, "adopt", None)
     for u in batch.units:
         mine = [(r, sid, kind) for v, r, sid, kind in expanded if v.index == u.index]
         new = got.get(u.index)
@@ -3484,12 +3553,8 @@ def _reread(provider: LLMProvider, report: VerifyReport, verdicts: dict[int, Jud
             now = next((x for x in recs if x.id == r.id or _same_span(x.text, r.text)), recs[0])
             entry = {"source": sid, "scope": kind, "outcome": now.verdict if now.verdict in REREAD_OUTCOMES
                      else new.verdict}
-            if now.verdict == "supported" and callable(adopt):
-                try:
-                    if new_sid := adopt(sid, kind):
-                        entry["expanded_source"] = new_sid
-                except Exception:  # noqa: BLE001 - registering the source is a convenience of the log, not a check
-                    logger.warning("registering the re-read of %s failed", sid, exc_info=True)
+            if now.verdict == "supported" and (new_sid := _adopt_expansion(fetcher, sid, kind)):
+                entry["expanded_source"] = new_sid
             _log_reread(ws, now.id, **entry)
         verdicts[u.index] = new
         report.verdicts[u.index] = new.verdict
@@ -3721,7 +3786,7 @@ def _cut_groups(u: Unit, recs: list[ClaimRecord]) -> list[CutGroup] | None:
     unit keeps no supported claim, a claim has no exact span, or a standing claim overlaps a failing claim's span or
     rests on it (the claim cascade already failed what rests on a failing claim)."""
     failing = [r for r in recs if r.verdict in FAILING_VERDICTS]
-    standing = [r for r in recs if r.verdict in ("supported", "partial")]
+    standing = [r for r in recs if r.verdict in STANDING_VERDICTS]
     if not failing or not standing:
         return None
     found: list[tuple[int, int, ClaimRecord]] = []
@@ -3752,10 +3817,11 @@ def plan_edits(report: VerifyReport) -> None:
     partly verified, or a qualifier is written), ``cited`` (the server attached a citation) or ``kept``."""
     units = {u.index: u for u in report.units}
     report.cuts = {}
+    removed = report.removed_units()  # a loop step changes only its own unit's problems: this holds at each top test
     for idx, recs in sorted(report.claims.items()):
         u = units.get(idx)
         failing = {r.id: r for r in recs if r.verdict in FAILING_VERDICTS}
-        if u is None or not failing or idx in report.removed_units():
+        if u is None or not failing or idx in removed:
             continue
         groups = _cut_groups(u, recs)
         mine = [p for p in report.problems if p.unit.index == idx and p.claim_id in failing]
@@ -3783,7 +3849,7 @@ def plan_edits(report: VerifyReport) -> None:
         for r in recs:
             if idx in gone:
                 r.action = "withheld" if gone[idx].failure_kind == "not_checked" else "removed"
-            elif r.action == "cut" or r.verdict not in ("supported", "partial"):
+            elif r.action == "cut" or r.verdict not in STANDING_VERDICTS:
                 continue
             elif r.parent_id:
                 r.action = "rewritten"
@@ -3823,6 +3889,16 @@ class UnitClaim:
     fallback: str = ""
 
 
+def _claim_kind(u: Unit) -> str:
+    """The kind of a unit's whole-unit claim: a computed result when the unit cites a calculation (``C#``), else a datum."""
+    return "computed" if any(i.startswith("C") for i in u.ids) else "datum"
+
+
+def _context_key(u: Unit) -> str:
+    """The unit's heading and table context, for matching a repaired claim to its parent (``ClaimRecord.context_key``)."""
+    return _digest(u.heading, u.context, u.table_header)
+
+
 def _whole_unit_claim(u: Unit, v: JudgeVerdict, ws: Workspace | None, fallback: str = "") -> UnitClaim:
     """The unit's single claim, carrying the unit's verdict: a computed result when the unit cites a calculation
     (``C#``), else a datum."""
@@ -3831,8 +3907,7 @@ def _whole_unit_claim(u: Unit, v: JudgeVerdict, ws: Workspace | None, fallback: 
         failure = _judged_failure(u, v, ws) if ws is not None else (
             "contradicts_source" if v.verdict == "contradicts" else v.failure if v.failure != "none"
             else "absent_from_source")
-    kind = "computed" if any(i.startswith("C") for i in u.ids) else "datum"
-    return UnitClaim(u.text, kind, v.verdict, failure, whole_unit=True, fallback=fallback)
+    return UnitClaim(u.text, _claim_kind(u), v.verdict, failure, whole_unit=True, fallback=fallback)
 
 
 def _claim_span(u: Unit, span: str) -> str | None:
@@ -3869,6 +3944,7 @@ def unit_claims(u: Unit, v: JudgeVerdict, ws: Workspace | None = None) -> list[U
 
 # the claim verdicts of a record (round 8 R6) and the ones that fail it; "unchecked" is the check that could not complete
 RECORD_VERDICTS = ("supported", "partial", "unsupported", "contradicts", "unchecked")
+STANDING_VERDICTS = ("supported", "partial")  # the verdicts of a claim that stands in the answer
 FAILING_VERDICTS = ("unsupported", "contradicts", "unchecked")
 CITATION_STATES = ("cited", "repaired", "missing", "not_needed")
 
@@ -3922,6 +3998,12 @@ class ClaimRecord:
     def span(self) -> str:
         return self.text
 
+    def fail_as(self, kind: str) -> None:
+        """The claim fails with the failure ``kind``: ``not_checked`` is an unchecked claim, any other kind an
+        unsupported one."""
+        self.verdict = "unchecked" if kind == "not_checked" else "unsupported"
+        self.failure = "none" if kind == "not_checked" else kind
+
     def failure_kind(self) -> str:
         """The failure kind a failing claim is removed for (``FAILURE_KINDS``)."""
         if self.verdict == "unchecked":
@@ -3930,21 +4012,12 @@ class ClaimRecord:
             return "contradicts_source"
         return self.failure if self.failure not in ("", "none") else "absent_from_source"
 
-    def as_dict(self) -> dict:
-        """The record without the model's words: ids, position, kinds and states (its text is the answer's own)."""
-        return {"id": self.id, "unit_id": self.unit_id, "unit": self.unit, "start": self.start, "end": self.end,
-                "text": self.text, "kind": self.kind, "verdict": self.verdict, "citation": self.citation,
-                "action": self.action, "sources_checked": list(self.sources_checked),
-                "depends_on": list(self.depends_on), "fallback": self.fallback, "parent_id": self.parent_id,
-                "failure": self.failure_kind() if self.verdict in FAILING_VERDICTS else "none",
-                "cause": self.cause, "marker": self.marker, "rereads": [dict(x) for x in self.rereads],
-                "post_check": self.post_check or "n/a"}
-
 
 # the actions a claim's log entry can record (``ClaimRecord.action``, minus ``kept``), and those that take the claim out of the
 # text, which have a row on the user's normal path with their claim id (round 8 U7, KTD8)
 LOG_ACTIONS = ("removed", "cut", "rewritten", "withheld", "qualified", "cited")
-ROW_ACTIONS = ("removed", "withheld", "cut")
+GONE_ACTIONS = ("removed", "withheld")  # the actions that take a whole unit out of the answer
+ROW_ACTIONS = (*GONE_ACTIONS, "cut")
 
 
 @dataclass
@@ -3969,7 +4042,7 @@ class Logged:
     def position(self) -> int:
         """Where it stands in the model's text (the final text keeps that order)."""
         r = self.record
-        return self.unit.start if self.action in ("removed", "withheld") or r is None else r.start
+        return self.unit.start if self.action in GONE_ACTIONS or r is None else r.start
 
     def summary(self) -> dict:
         """The row on the normal path: the fixed sentence of the kind, never the claim's text, and the ids that link it."""
@@ -4008,9 +4081,9 @@ def claim_records(u: Unit, claims: list[UnitClaim]) -> list[ClaimRecord]:
     """A unit's validated claims as records with their ids and offsets in the answer's Markdown (the unit's span for a
     whole-unit claim, the span's own place for a claim inside it). Two claims with the same span get the occurrence
     of it in the unit as their ``occurrence``, so their ids differ."""
-    mapping = None
+    mapping, mapped = None, False  # ``_text_to_raw`` runs once, when a claim first needs it (it may give None)
     seen: dict[str, int] = {}
-    context = _digest(u.heading, u.context, u.table_header)
+    context = _context_key(u)
     out = []
     for c in claims:
         n = seen[_norm(c.span)] = seen.get(_norm(c.span), -1) + 1
@@ -4022,7 +4095,8 @@ def claim_records(u: Unit, claims: list[UnitClaim]) -> list[ClaimRecord]:
                 if at < 0:
                     break
             if at >= 0:
-                mapping = mapping or _text_to_raw(u)
+                if not mapped:
+                    mapping, mapped = _text_to_raw(u), True
                 if mapping is not None and at + len(c.span) <= len(mapping):
                     start, end = u.start + mapping[at], u.start + mapping[at + len(c.span) - 1] + 1
                     exact = True
@@ -4036,10 +4110,8 @@ def claim_records(u: Unit, claims: list[UnitClaim]) -> list[ClaimRecord]:
 def _whole_record(u: Unit, verdict: str, failure: str = "none", cause: str = "") -> ClaimRecord:
     """The one whole-unit claim of a unit the judge did not judge: one the deterministic checks failed, or that could
     not be checked."""
-    kind = "computed" if any(i.startswith("C") for i in u.ids) else "datum"
-    return ClaimRecord(claim_id_of(u, u.text), u.id, u.index, u.start, u.end, u.text, kind, verdict, failure,
-                       sources_checked=list(u.ids), whole_unit=True, cause=cause,
-                       context_key=_digest(u.heading, u.context, u.table_header))
+    return ClaimRecord(claim_id_of(u, u.text), u.id, u.index, u.start, u.end, u.text, _claim_kind(u), verdict, failure,
+                       sources_checked=list(u.ids), whole_unit=True, cause=cause, context_key=_context_key(u))
 
 
 def complete_records(report: VerifyReport) -> None:
@@ -4078,8 +4150,7 @@ def close_records(report: VerifyReport, verdicts: dict[int, JudgeVerdict], ws: W
             for r in report.claims[p.unit.index]:
                 if r.verdict in RECORD_VERDICTS and r.verdict not in FAILING_VERDICTS:
                     kind = p.failure_kind or "absent_from_source"
-                    r.verdict = "unchecked" if kind == "not_checked" else "unsupported"
-                    r.failure = "none" if kind == "not_checked" else kind
+                    r.fail_as(kind)
                     r.basis, r.cause = p.basis, p.cause
     removed = report.removed_units()
     attached = {p.unit.index for p in report.problems if p.kind == "needs_citation"}
@@ -4097,7 +4168,7 @@ def close_records(report: VerifyReport, verdicts: dict[int, JudgeVerdict], ws: W
                 [x.id for ref in r.refs for x in (report.claims.get(int(ref), []) if ref.isdigit() else
                                                    [t for t in [_ref_target(recs, ref, r)] if t is not None])]))
             factual = r.verdict in RECORD_VERDICTS
-            if idx in attached and r.verdict in ("supported", "partial"):
+            if idx in attached and r.verdict in STANDING_VERDICTS:
                 r.citation = "repaired"  # the server attaches the support it found (``supported_by`` or the meaning check)
             elif u.ids:
                 r.citation = "cited"
@@ -4218,8 +4289,7 @@ def _claim_cascade(report: VerifyReport) -> bool:
                     continue
                 kind = base.failure_kind() if base is not None else (gone.failure_kind or "absent_from_source")
                 cause = base.cause if base is not None else gone.cause
-                r.verdict = "unchecked" if kind == "not_checked" else "unsupported"
-                r.failure = "none" if kind == "not_checked" else kind
+                r.fail_as(kind)
                 r.basis, r.cause, r.action = (base.id if base is not None else gone.claim_id), cause, "pending"
                 fresh.append((r, base, gone))
                 changed = True

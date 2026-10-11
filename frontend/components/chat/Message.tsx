@@ -1,39 +1,31 @@
 "use client";
 
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   ChatAnswer,
   ChatAssumption,
-  ChatCheckedSource,
   ChatComponent,
   ChatComputation,
   ChatComputationInput,
-  ChatDiagnostics,
   ChatLedger,
   ChatMessage,
   ChatRemoval,
-  ChatRemovalDecision,
   ChatRequirement,
   ChatSource,
   ChatValue,
   ChatVerification,
-  ChatVerificationActions,
   LedgerDocument,
   LedgerTable,
   ViewerNav,
   ViewerTarget,
 } from "@/lib/chatTypes";
-import { ApiError, chatApi, isAbortError } from "@/lib/api";
 import {
-  CHANGE_ACTION_LABEL,
   COMPONENT_KIND_LABEL,
   COMPONENT_STATUS_LABEL,
+  CONTENT_ACTIONS,
   VALUE_STATUS,
-  WITHHELD_CAUSE_TEXT,
-  WITHHELD_DEFAULT_TEXT,
   type ChangeAction,
   type ValueStatus,
-  chatValueStatus,
   contentActionsText,
   failureKindText,
   gapReasonText,
@@ -42,7 +34,8 @@ import {
   valueStatusText,
 } from "@/lib/format";
 import { type CitationTarget, Markdown, citationOrder, plainAnswer } from "./Markdown";
-import { documentAnchor } from "./SourceViewer";
+import { assumptionText, citedTarget, valueStatusOf } from "./cited";
+import { ActionLines, type CutFocus, RemovalsSection } from "./Changes";
 
 export interface CitedItem {
   /** A passage, or the document passage behind a measurement or computation input. */
@@ -70,76 +63,6 @@ const CORRECTNESS_LINE: Record<string, string> = {
 };
 // the only reason the answer is not verified: a result shown with the server's conditional qualifier
 const CONDITIONAL_LINE = "חלק מהתוצאות מחושבות מערכים שלא אומתו מול המקור, ומוצגות כמותנות (ההסתייגות כתובה ליד המספר).";
-
-/** What a citation is looked up in: an answer, or the records the diagnostics route returned for a removal. */
-type CitedRecords = Pick<ChatAnswer, "sources" | "values" | "measurements">;
-
-// an answer's source is bound to the reading it was read from (null: an answer from before reading ids)
-function withReading(src: ChatSource): ChatSource {
-  return { ...src, reading_id: src.reading_id ?? null };
-}
-
-/** The source a citation opens: a passage itself, or the passage of the value or measurement it cites; null for a
- * calculation (C#) or an assumption (A#), which have no place in a document (`citedView` opens their own views). */
-export function citedSource(answer: CitedRecords, id: string): ChatSource | null {
-  const direct = answer.sources.find((s) => s.id === id);
-  if (direct) return withReading(direct);
-  // a value opens the passage it was verified in
-  const v = answer.values?.find((x) => x.id === id);
-  if (v) {
-    const src = answer.sources.find((s) => s.id === v.source_id);
-    return src ? withReading(src) : null;
-  }
-  const m = answer.measurements.find((x) => x.id === id);
-  if (m) {
-    return {
-      id: m.id,
-      document_id: m.document_id,
-      version_id: m.version_id,
-      title: m.title,
-      section: m.section,
-      location: m.section ? `סעיף "${m.section}"` : "נתון כמותי",
-      kind: "measurement",
-      text: m.quote,
-      block_start: m.block_index,
-      block_end: m.block_index,
-      table_index: m.table_index,
-      page_list: null,
-      chunk_id: null,
-      reading_id: m.reading_id ?? null,
-    };
-  }
-  return null;
-}
-
-/** A value's status (V#): checked automatically in its passage, uncertain, or unread (never a person's decision). */
-function valueStatusOf(answer: CitedRecords, v: ChatValue): ValueStatus {
-  const src = answer.sources.find((s) => s.id === v.source_id);
-  return chatValueStatus(v.certainty, src?.status, v.reading);
-}
-
-/** What the source viewer opens for a citation: its passage (the text view) and its anchor (the page or structured
- * view), with a value's or measurement's status; null for an id with no place in a document (C#, A#). */
-export function citedTarget(answer: CitedRecords, id: string): ViewerTarget | null {
-  const source = citedSource(answer, id);
-  if (!source) return null;
-  const s = answer.sources.find((x) => x.id === id);
-  if (s) return { id, source, anchor: documentAnchor(s.anchor) };
-  const v = answer.values?.find((x) => x.id === id);
-  if (v) {
-    // the cell or quoted words it was taken from; else the passage it was verified in
-    const passage = answer.sources.find((x) => x.id === v.source_id);
-    return {
-      id,
-      source,
-      anchor: documentAnchor(v.anchor) ?? documentAnchor(passage?.anchor),
-      valueStatus: valueStatusOf(answer, v),
-    };
-  }
-  const m = answer.measurements.find((x) => x.id === id);
-  if (m) return { id, source, anchor: documentAnchor(m.anchor), valueStatus: measurementValueStatus(m) };
-  return null;
-}
 
 /** The viewer's targets for a chip: the answer's citations in answer order (those with a place in a document), the
  * clicked one current. */
@@ -326,12 +249,6 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
   );
 }
 
-/** The marker the user clicked in the answer's body: which cut, and a counter so that clicking it again opens it again. */
-interface CutFocus {
-  ordinal: number;
-  tick: number;
-}
-
 /** The summary rows of cuts that carry the ordinal of their marker in the text. */
 function cutRows(rows: ChatRemoval[] | undefined): ChatRemoval[] {
   return (rows ?? []).filter((r) => r.action === "cut" && typeof r.ordinal === "number");
@@ -347,7 +264,8 @@ function hasComponents(answer: ChatAnswer): boolean {
 function contentCounts(v: ChatVerification | null | undefined): Partial<Record<ChangeAction, number>> {
   if (!v) return {};
   if (v.actions) {
-    return { removed: v.actions.removed, cut: v.actions.cut, rewritten: v.actions.rewritten, withheld: v.actions.withheld };
+    const actions = v.actions;
+    return Object.fromEntries(CONTENT_ACTIONS.map((a) => [a, actions[a]]));
   }
   const out: Partial<Record<ChangeAction, number>> = {};
   for (const r of v.removals ?? []) {
@@ -480,9 +398,9 @@ function AnswerDetails({
   const verification = answer.verification;
   const actions = verification?.actions;
   const changed = verification
-    ? verification.removed + verification.partial + verification.annotated +
-      (actions ? actions.removed + actions.cut + actions.rewritten + actions.withheld + actions.qualified + actions.cited : 0)
+    ? verification.removed + verification.partial + verification.annotated + (actions ? sum(actions) : 0)
     : 0;
+  const otherChanges = actions ? actions.rewritten + actions.qualified + actions.cited : 0;
   const coverage = answer.coverage.at(-1);
   // a cut marker clicked in the body opens the details, then its own entry (`RemovalItem`)
   const detailsRef = useRef<HTMLDetailsElement>(null);
@@ -569,10 +487,10 @@ function AnswerDetails({
             )}
           </ul>
           {((verification.removals && verification.removals.length > 0) ||
-            (actions && actions.rewritten + actions.qualified + actions.cited > 0)) && (
+            otherChanges > 0) && (
             <RemovalsSection
               removals={verification.removals ?? []}
-              otherChanges={actions ? actions.rewritten + actions.qualified + actions.cited : 0}
+              otherChanges={otherChanges}
               components={answer.components ?? []}
               messageId={messageId}
               focus={focus}
@@ -606,50 +524,6 @@ function AnswerDetails({
         </div>
       )}
     </details>
-  );
-}
-
-/** One line per action that touched a claim (round 8 U8): what changed in the text first, then the qualifiers and
- * the citations it added. */
-function ActionLines({ actions }: { actions: ChatVerificationActions }) {
-  const n = (k: keyof ChatVerificationActions) => actions[k];
-  return (
-    <>
-      {n("removed") > 0 && (
-        <li>{n("removed") === 1 ? "האימות הסיר טענה אחת מהתשובה." : `האימות הסיר ${n("removed")} טענות מהתשובה.`}</li>
-      )}
-      {n("cut") > 0 && (
-        <li>
-          {n("cut") === 1
-            ? "הושמט חלק שלא אומת ממשפט אחד (מסומן בתשובה)."
-            : `הושמטו חלקים שלא אומתו מ-${n("cut")} משפטים (מסומנים בתשובה).`}
-        </li>
-      )}
-      {n("rewritten") > 0 && (
-        <li>{n("rewritten") === 1 ? "טענה אחת נוסחה מחדש ונבדקה שוב." : `${n("rewritten")} טענות נוסחו מחדש ונבדקו שוב.`}</li>
-      )}
-      {n("withheld") > 0 && (
-        <li>
-          {n("withheld") === 1
-            ? "טענה אחת לא הוצגה כי בדיקתה לא הושלמה."
-            : `${n("withheld")} טענות לא הוצגו כי בדיקתן לא הושלמה.`}
-        </li>
-      )}
-      {n("qualified") > 0 && (
-        <li>
-          {n("qualified") === 1
-            ? "טענה אחת נשארה בתשובה עם סייג מהמקור."
-            : `${n("qualified")} טענות נשארו בתשובה עם סייג מהמקור.`}
-        </li>
-      )}
-      {n("cited") > 0 && (
-        <li>
-          {n("cited") === 1
-            ? "לטענה אחת צורף ציטוט מהמקור שנבדק."
-            : `ל-${n("cited")} טענות צורף ציטוט מהמקור שנבדק.`}
-        </li>
-      )}
-    </>
   );
 }
 
@@ -790,514 +664,6 @@ function ComponentsSection({
   );
 }
 
-/** A diagnostics request shared by the entries of one message while it is in flight (`RemovalsSection`): `waiting`
- * counts the expanded entries still waiting for it; the last one to stop waiting aborts it. */
-type SharedDiagnostics = {
-  messageId: string;
-  promise: Promise<ChatDiagnostics>;
-  ctrl: AbortController;
-  waiting: number;
-};
-
-type Diagnostics = (signal: AbortSignal) => Promise<ChatDiagnostics>;
-
-/** The row's decision in the diagnostics: by claim id (round 8 U7); only a row of an older message, which has no
- * claim id, is paired by its position and kind (the old log held the removals alone, in the rows' order). */
-function pairDecision(d: ChatDiagnostics, row: ChatRemoval, index: number): ChatRemovalDecision | undefined {
-  if (!Array.isArray(d.removed)) return undefined;
-  if (row.claim_id) return d.removed.find((x) => x.claim_id === row.claim_id);
-  const item = d.removed[index];
-  return item && !item.claim_id && (item.failure_kind || "absent_from_source") === row.failure_kind ? item : undefined;
-}
-
-/** The claims verification took out of or changed in the text: each row's kind, action and the server's fixed
- * sentence; expanded, its draft, reason and checked sources from the diagnostics route (`RemovalItem`), paired by claim
- * id. Entries expanded while a request is in flight share it; it is dropped once it settles, so every later expand
- * asks the route again (nothing is cached). Claims rewritten, qualified or cited have no row on the normal path; their
- * count leads to the same details (`OtherChanges`). */
-function RemovalsSection({
-  removals,
-  otherChanges,
-  components,
-  messageId,
-  focus,
-  onOpenSource,
-}: {
-  removals: ChatRemoval[];
-  otherChanges: number;
-  components: ChatComponent[];
-  messageId: string;
-  focus: CutFocus | null;
-  onOpenSource?: (nav: ViewerNav) => void;
-}) {
-  const byId = new Map(components.map((c) => [c.id, c]));
-  const shared = useRef<SharedDiagnostics | null>(null);
-  const diagnostics = useCallback(
-    (signal: AbortSignal): Promise<ChatDiagnostics> => {
-      let entry = shared.current;
-      if (!entry || entry.messageId !== messageId) {
-        const ctrl = new AbortController();
-        const created: SharedDiagnostics = {
-          messageId,
-          promise: chatApi.diagnostics(messageId, ctrl.signal),
-          ctrl,
-          waiting: 0,
-        };
-        const drop = () => {
-          if (shared.current === created) shared.current = null;
-        };
-        created.promise.then(drop, drop);
-        shared.current = created;
-        entry = created;
-      }
-      const mine = entry;
-      mine.waiting += 1;
-      signal.addEventListener(
-        "abort",
-        () => {
-          mine.waiting -= 1;
-          if (mine.waiting === 0) {
-            mine.ctrl.abort();
-            if (shared.current === mine) shared.current = null;
-          }
-        },
-        { once: true },
-      );
-      return mine.promise;
-    },
-    [messageId],
-  );
-  // an entry is keyed by its claim id (an older row, which has none, by its position)
-  const seen = new Map<string, number>();
-  const keyed = removals.map((r, i) => {
-    const base = r.claim_id ?? `row-${i}`;
-    const n = seen.get(base) ?? 0;
-    seen.set(base, n + 1);
-    return { row: r, index: i, key: n ? `${base}#${n}` : base };
-  });
-  return (
-    <>
-      {keyed.length > 0 && (
-        <ul className="removals" data-testid="removals">
-          {keyed.map(({ row, index, key }) => (
-            <RemovalItem
-              key={key}
-              removal={row}
-              index={index}
-              component={row.component ? byId.get(row.component) : undefined}
-              diagnostics={diagnostics}
-              focus={focus}
-              onOpenSource={onOpenSource}
-            />
-          ))}
-        </ul>
-      )}
-      {otherChanges > 0 && (
-        <OtherChanges
-          count={otherChanges}
-          rowIds={new Set(removals.map((r) => r.claim_id).filter((x): x is string => !!x))}
-          diagnostics={diagnostics}
-          onOpenSource={onOpenSource}
-        />
-      )}
-    </>
-  );
-}
-
-type Loaded<T> =
-  | { phase: "idle" }
-  | { phase: "loading" }
-  | { phase: "error" }
-  /** The route answered 404 (a document behind the answer is no longer visible), or it has no matching entry. */
-  | { phase: "gone" }
-  | { phase: "ready"; value: T };
-
-/** An expandable entry whose content comes from the diagnostics route on every expand (`diagnostics`: the section's
- * request, shared while in flight) and is dropped on collapse: nothing is cached, so a draft is never shown once the
- * route no longer serves it. `pick` takes the entry's part of the response (undefined: no matching entry). */
-function useExpandable<T>(diagnostics: Diagnostics, pick: (d: ChatDiagnostics) => T | undefined) {
-  const [open, setOpen] = useState(false);
-  const [state, setState] = useState<Loaded<T>>({ phase: "idle" });
-  const ctrl = useRef<AbortController | null>(null);
-  const isOpen = useRef(false);
-  useEffect(() => () => ctrl.current?.abort(), []);
-
-  const load = useCallback(() => {
-    ctrl.current?.abort();
-    const c = new AbortController();
-    ctrl.current = c;
-    setState({ phase: "loading" });
-    diagnostics(c.signal)
-      .then((d) => {
-        if (c.signal.aborted) return;
-        const value = pick(d);
-        setState(value !== undefined ? { phase: "ready", value } : { phase: "gone" });
-      })
-      .catch((err: unknown) => {
-        if (c.signal.aborted || isAbortError(err)) return;
-        setState(err instanceof ApiError && err.status === 404 ? { phase: "gone" } : { phase: "error" });
-      });
-  }, [diagnostics, pick]);
-
-  const expand = useCallback(() => {
-    if (isOpen.current) return;
-    isOpen.current = true;
-    setOpen(true);
-    load();
-  }, [load]);
-
-  const toggle = useCallback(() => {
-    if (isOpen.current) {
-      ctrl.current?.abort();
-      isOpen.current = false;
-      setOpen(false);
-      setState({ phase: "idle" });
-      return;
-    }
-    expand();
-  }, [expand]);
-
-  return { open, state, load, expand, toggle };
-}
-
-/** What an expanded entry shows while its content loads, fails or is gone. */
-function ExpandedState<T>({
-  state,
-  load,
-  children,
-}: {
-  state: Loaded<T>;
-  load: () => void;
-  children: (value: T) => React.ReactNode;
-}) {
-  return (
-    <>
-      {state.phase === "loading" && (
-        <span className="removal-loading" role="status" data-testid="removal-loading">
-          <span className="dot-pulse" aria-hidden="true" /> טוען את פירוט הטענה…
-        </span>
-      )}
-      {state.phase === "error" && (
-        <p className="removal-error" role="alert" data-testid="removal-error">
-          טעינת הפירוט נכשלה.{" "}
-          <button type="button" className="source-link" onClick={load}>
-            ניסיון חוזר
-          </button>
-        </p>
-      )}
-      {state.phase === "gone" && (
-        <p className="muted" data-testid="removal-unavailable">
-          אין פירוט נוסף להצגה.
-        </p>
-      )}
-      {state.phase === "ready" && children(state.value)}
-    </>
-  );
-}
-
-/** The action's label, the same wherever an entry is shown. */
-function ChangeBadge({ action, ordinal }: { action: ChangeAction; ordinal?: number }) {
-  return (
-    <span className="change-action" data-testid="change-action" data-action={action}>
-      {CHANGE_ACTION_LABEL[action]}
-      {action === "cut" && ordinal ? ` · סימון ${ordinal}` : ""}
-    </span>
-  );
-}
-
-/** The sentence a row shows: the server's fixed sentence for a claim taken out or withheld; for a cut, that part of the
- * sentence was left out (the server's sentence says "removed a claim"). */
-function rowSentence(row: ChatRemoval, action: ChangeAction): string {
-  return action === "cut" ? `הושמט חלק מהמשפט שלא אומת: ${failureKindText(row.failure_kind)}.` : row.text;
-}
-
-/** One row. Its draft text and reason are loaded from the diagnostics route on every expand and dropped on collapse.
- * While loading the kind stays visible; a failure offers a retry; a 404 leaves the kind only. A cut's marker in the
- * answer's body opens its own entry (`focus`, matched by the marker's ordinal). */
-function RemovalItem({
-  removal,
-  index,
-  component,
-  diagnostics,
-  focus,
-  onOpenSource,
-}: {
-  removal: ChatRemoval;
-  index: number;
-  component: ChatComponent | undefined;
-  diagnostics: Diagnostics;
-  focus: CutFocus | null;
-  onOpenSource?: (nav: ViewerNav) => void;
-}) {
-  const action = rowChangeAction(removal);
-  const pick = useCallback((d: ChatDiagnostics) => pairDecision(d, removal, index), [removal, index]);
-  const { open, state, load, expand, toggle } = useExpandable(diagnostics, pick);
-  const panelId = useId();
-  const li = useRef<HTMLLIElement>(null);
-  const handled = useRef(0);
-  const focused = !!focus && action === "cut" && removal.ordinal === focus.ordinal;
-  const tick = focused ? focus.tick : 0;
-  useEffect(() => {
-    if (!tick || tick === handled.current) return;
-    handled.current = tick;
-    expand();
-    // the details were opened by the parent in this same commit; scroll once they are laid out
-    const raf = window.requestAnimationFrame(() => li.current?.scrollIntoView({ block: "nearest" }));
-    return () => window.cancelAnimationFrame(raf);
-  }, [tick, expand]);
-
-  return (
-    <li
-      ref={li}
-      className="removal"
-      data-testid="removal"
-      data-kind={removal.failure_kind}
-      data-action={action}
-      data-claim-id={removal.claim_id}
-      data-ordinal={action === "cut" ? removal.ordinal : undefined}
-      data-focused={focused ? "true" : undefined}
-    >
-      <div>
-        <strong data-testid="removal-kind">{failureKindText(removal.failure_kind)}</strong>{" "}
-        <ChangeBadge action={action} ordinal={removal.ordinal} />
-        {component && (
-          <span className="muted">
-            {" "}
-            · רכיב: <bdi>{component.text}</bdi>
-          </span>
-        )}
-      </div>
-      <div data-testid="removal-sentence">{rowSentence(removal, action)}</div>
-      <button type="button" className="source-link" aria-expanded={open} aria-controls={panelId} onClick={toggle}>
-        {action === "cut"
-          ? open ? "הסתרת פרטי השינוי" : "פרטי השינוי"
-          : open ? "הסתרת פירוט הטענה" : "פירוט הטענה שהוסרה"}
-      </button>
-      {open && (
-        <div id={panelId} className="removal-detail" aria-busy={state.phase === "loading"}>
-          <ExpandedState state={state} load={load}>
-            {(decision) => <ChangeDetail action={action} decision={decision} row={removal} onOpenSource={onOpenSource} />}
-          </ExpandedState>
-        </div>
-      )}
-    </li>
-  );
-}
-
-const OTHER_ACTIONS = ["rewritten", "qualified", "cited"];
-
-/** Claims rewritten, kept with a qualifier or given a citation: no row on the normal path (they changed no claim out
- * of the text), so one toggle loads their entries from the diagnostics route, each under its own claim id. */
-function OtherChanges({
-  count,
-  rowIds,
-  diagnostics,
-  onOpenSource,
-}: {
-  count: number;
-  rowIds: Set<string>;
-  diagnostics: Diagnostics;
-  onOpenSource?: (nav: ViewerNav) => void;
-}) {
-  const pick = useCallback(
-    (d: ChatDiagnostics) =>
-      Array.isArray(d.removed)
-        ? d.removed.filter(
-            (x) => !!x.claim_id && !!x.action && OTHER_ACTIONS.includes(x.action) && !rowIds.has(x.claim_id),
-          )
-        : undefined,
-    [rowIds],
-  );
-  const { open, state, load, toggle } = useExpandable(diagnostics, pick);
-  const panelId = useId();
-  return (
-    <div className="other-changes" data-testid="other-changes">
-      <button type="button" className="source-link" aria-expanded={open} aria-controls={panelId} onClick={toggle}>
-        {open ? "הסתרת פרטי השינויים" : `פרטי השינויים בטענות שנשארו בתשובה (${count})`}
-      </button>
-      {open && (
-        <div id={panelId} className="removal-detail" aria-busy={state.phase === "loading"}>
-          <ExpandedState state={state} load={load}>
-            {(entries) =>
-              entries.length === 0 ? (
-                <p className="muted" data-testid="removal-unavailable">
-                  אין פירוט נוסף להצגה.
-                </p>
-              ) : (
-                <ul className="removals" data-testid="changes">
-                  {entries.map((x) => (
-                    <li
-                      key={x.claim_id}
-                      className="removal"
-                      data-testid="change"
-                      data-action={x.action}
-                      data-claim-id={x.claim_id}
-                    >
-                      <ChangeBadge action={x.action as ChangeAction} />
-                      <ChangeDetail action={x.action as ChangeAction} decision={x} onOpenSource={onOpenSource} />
-                    </li>
-                  ))}
-                </ul>
-              )
-            }
-          </ExpandedState>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** A checked source's line: what it is and where, from its own record. */
-function checkedLabel(s: ChatCheckedSource): string {
-  switch (s.type) {
-    case "sources":
-      return `${s.title} — ${s.location}`;
-    case "values":
-      return `${s.label}: ${s.value_text} — ${s.title}`;
-    case "measurements":
-      return `${s.metric}: ${s.value_text} — ${s.title}`;
-    case "computations":
-      return `חישוב ${s.id}${s.label ? `: ${s.label}` : ""}`;
-    case "assumptions":
-      return `הנחה שלך: ${s.label} = ${assumptionText(s)}`;
-  }
-}
-
-const MARKER_ONLY = /^«\[\d+: חלק שלא אומת הושמט\]»$/;
-
-/** What an entry shows when expanded, by its action (round 8 U8, R23):
- * - removed: the reason, and the original under "rejected draft";
- * - withheld: that the check could not complete (never a fault of the claim), and the original under "unverified draft";
- * - cut: the original with the part that was not supported marked, and what stays in the answer;
- * - rewritten: the original, and the wording that stays;
- * - qualified: what stays and the qualifier's reason — no draft;
- * - cited: only the source that was attached — no draft.
- * The sources it was checked against open the viewer at their place, only as the route returned them. Draft text
- * appears nowhere else. */
-function ChangeDetail({
-  action,
-  decision,
-  row,
-  onOpenSource,
-}: {
-  action: ChangeAction;
-  decision: ChatRemovalDecision;
-  row?: ChatRemoval;
-  onOpenSource?: (nav: ViewerNav) => void;
-}) {
-  const checked = (decision.sources ?? []).filter((s) => s && typeof s === "object" && typeof s.id === "string");
-  const records: CitedRecords = {
-    sources: checked.filter((s): s is ChatSource & { type: "sources" } => s.type === "sources"),
-    values: checked.filter((s): s is ChatValue & { type: "values" } => s.type === "values"),
-    measurements: checked.filter((s) => s.type === "measurements") as ChatAnswer["measurements"],
-  };
-  const openable = ["sources", "values", "measurements"];
-  const items: ViewerTarget[] = [];
-  const targetIndex = new Map<ChatCheckedSource, number>();
-  for (const s of checked) {
-    const t = openable.includes(s.type) ? citedTarget(records, s.id) : null;
-    if (t) {
-      targetIndex.set(s, items.length);
-      items.push(t);
-    }
-  }
-  const cause = decision.cause || row?.cause || "";
-  const remaining = (decision.remaining ?? "").trim();
-  const reason = decision.reason?.trim();
-  return (
-    <div data-testid="removal-detail" data-action={action}>
-      {action === "removed" && reason && (
-        <p data-testid="removal-reason">
-          <strong>סיבת ההסרה:</strong> <bdi>{reason}</bdi>
-        </p>
-      )}
-      {action === "withheld" && (
-        <p data-testid="removal-reason">
-          <strong>הבדיקה לא הושלמה:</strong> {WITHHELD_CAUSE_TEXT[cause] ?? WITHHELD_DEFAULT_TEXT}
-        </p>
-      )}
-      {action === "cut" && reason && (
-        <p data-testid="removal-reason">
-          <strong>סיבת ההשמטה:</strong> <bdi>{reason}</bdi>
-        </p>
-      )}
-      {action === "rewritten" && reason && (
-        <p data-testid="removal-reason">
-          <strong>סיבת הניסוח מחדש:</strong> <bdi>{reason}</bdi>
-        </p>
-      )}
-      {action === "qualified" && reason && (
-        <p data-testid="removal-reason">
-          <strong>הסייג:</strong> <bdi>{reason}</bdi>
-        </p>
-      )}
-      {action === "cited" && <p className="muted">צורף ציטוט מהמקור שנבדק.</p>}
-      {action === "removed" && decision.repair_attempted && <p className="muted">לפני ההסרה נוסה תיקון, והוא לא אומת.</p>}
-      {(action === "removed" || action === "withheld") && (
-        <div className="removal-draft" data-testid="removal-draft" data-label={action === "removed" ? "rejected" : "unverified"}>
-          <span className="removal-draft-label">{action === "removed" ? "טיוטה שנפסלה" : "טיוטה שלא אומתה"}</span>
-          <blockquote dir="auto">{decision.text}</blockquote>
-        </div>
-      )}
-      {(action === "cut" || action === "rewritten") && (
-        <div className="removal-draft" data-testid="removal-draft" data-label="original">
-          <span className="removal-draft-label">
-            {action === "cut" ? "הנוסח המקורי — החלק שלא נתמך מסומן" : "הנוסח המקורי"}
-          </span>
-          <blockquote dir="auto">
-            {action === "cut" ? (
-              <mark className="change-unsupported" data-testid="change-unsupported">
-                {decision.text}
-              </mark>
-            ) : (
-              decision.text
-            )}
-          </blockquote>
-        </div>
-      )}
-      {action === "cut" && remaining && MARKER_ONLY.test(remaining) && (
-        <p className="change-kept" data-testid="change-kept">
-          <strong>מה שנשאר בתשובה:</strong> במקום החלק שהושמט מופיע הסימון <bdi>{remaining}</bdi>; שאר המשפט נשאר כפי
-          שנבדק.
-        </p>
-      )}
-      {action !== "removed" && action !== "withheld" && action !== "cited" && remaining &&
-        !(action === "cut" && MARKER_ONLY.test(remaining)) && (
-          <div className="change-kept" data-testid="change-kept">
-            <strong>{action === "rewritten" ? "הנוסח שנשאר בתשובה (נבדק מחדש):" : "הטקסט שנשאר בתשובה:"}</strong>
-            <blockquote dir="auto">{remaining}</blockquote>
-          </div>
-        )}
-      {checked.length > 0 && (
-        <div className="removal-sources">
-          <span>{action === "cited" ? "המקור שצורף:" : "נבדק מול:"}</span>
-          <ul>
-            {checked.map((s, i) => {
-              const at = targetIndex.get(s);
-              return (
-                <li key={`${s.type}-${s.id}-${i}`}>
-                  {at !== undefined && onOpenSource ? (
-                    <button
-                      type="button"
-                      className="source-link"
-                      data-testid="removal-source"
-                      onClick={() => onOpenSource({ items, index: at })}
-                    >
-                      {checkedLabel(s)}
-                    </button>
-                  ) : (
-                    <bdi>{checkedLabel(s)}</bdi>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-      )}
-    </div>
-  );
-}
-
 /** A value's status with its icon and words, and its meaning on hover (R25). */
 function ValueStatusBadge({ status }: { status: ValueStatus }) {
   return (
@@ -1305,10 +671,6 @@ function ValueStatusBadge({ status }: { status: ValueStatus }) {
       ({valueStatusText(status)})
     </span>
   );
-}
-
-export function assumptionText(a: ChatAssumption): string {
-  return a.unit === "percent" && !a.value_text.includes("%") ? `${a.value_text}%` : a.value_text;
 }
 
 export function resultText(c: ChatComputation): string {

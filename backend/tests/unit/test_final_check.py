@@ -6,6 +6,7 @@ check costs (``verify_final``) and what is saved, not the judge's judgement. Eve
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import re
 import uuid
@@ -15,12 +16,15 @@ import pytest
 
 from app.chat import api, calc, engine, final_check, resolve, verify
 from app.chat import tools as T
-from app.chat.compose import text_digest
+from app.chat.compose import Composition, ServerSpan, text_digest
+from app.chat.engine import FinalAnswer
+from app.chat.verify import Expansion
 from app.db import TenantContext
 from app.providers.llm import CallStatus
 from tests.support.scripted_agent import ScriptedAgent, call, component, final
 from tests.unit.test_verify_computed import QUESTION as RATE_QUESTION
 from tests.unit.test_verify_computed import _compute, _value
+from tests.unit.test_verify_reread import FakeFetcher
 
 AREA = "השטח העיקרי בתא שטח 1 הוא 1,200 מ״ר"
 CLAUSE = "שאושר בוועדה המחוזית"
@@ -662,3 +666,203 @@ def test_the_missing_part_survives_the_final_checks_vote_replacement(offline):
     assert (o["status"], o["missing_part"]) == ("partial", "השטח העיקרי בתא שטח 2")
     gap = next(md[s.start:s.end] for s in out.server_spans if s.kind == "gap_paragraph")
     assert "השטח העיקרי בתא שטח 2" in gap and out.final_digest == text_digest(md)
+
+
+# --- R13, KTD5: what a re-read supplied is shown again where the sentence is judged as saved --------------------------
+
+UNITS_NOTE = "הטבלה מוצגת במ״ר"
+
+
+def test_a_claim_a_re_read_rescued_survives_the_cut_of_the_claim_beside_it_when_the_sentence_is_judged_as_saved(
+        offline, monkeypatch):
+    """The area is partly supported until the table's units note is read (``needs_context``); the approval is not
+    supported at all and is cut. The sentence as saved holds the area and the marker, so its key is new and it is judged
+    again — with the expansion that supported the area shown in its source, else the rescued claim would be lost with the
+    cut one."""
+    fetchers: list[FakeFetcher] = []  # the turn's fetcher, registering the expansion in the turn's own workspace
+    monkeypatch.setattr(engine, "ContextReader", lambda ws: fetchers.append(
+        FakeFetcher({("S1", "units_note"): Expansion(UNITS_NOTE, "יחידות")}, ws=ws)) or fetchers[-1])
+
+    def rule(text, input, n):
+        if "<server>" in input:  # the sentence as saved: supported only when the units note is shown
+            return "supported" if UNITS_NOTE in input else {"verdict": "unsupported", "failure": "absent_from_source"}
+        clause = {"span": CLAUSE, "verdict": "unsupported", "failure": "absent_from_source"}
+        area = {"span": AREA, "verdict": "supported"} if UNITS_NOTE in input else {
+            "span": AREA, "verdict": "partial", "needs_context": "units_note"}
+        return {"verdict": "partial", "defect": "part", "claims": [area, clause]}
+
+    judge = Judge(rule)
+    out = _turn(ScriptedAgent([SEARCH, final(MIXED)], judge=judge))
+    md = out.answer.answer_markdown
+    assert _purposes(out) == ["agent", "request", "agent", "verify", "verify_reread", "verify_final"]
+    (fetcher,) = fetchers
+    assert fetcher.calls == [("S1", "units_note")] and fetcher.adopted == [("S1", "units_note")]
+    assert "1,200" in md and CLAUSE not in md and MARKER in md, md  # only the cut part is gone
+    assert out.final_check["removed"] == 0 and out.final_check["judge_calls"] == 1
+    assert out.report.removals() == [] and out.final_digest == text_digest(md)
+    shown = judge.inputs[-1]
+    assert re.search(r'<source id="S1"[^>]*>.*<expanded_context kind="units_note">\n' + UNITS_NOTE, shown, re.S), shown
+    assert [r.post_check for r in out.report.claims[0] if r.verdict == "supported"] == ["supported"]
+
+
+
+# --- R19: nothing unchecked is returned — the failures of the final check end the turn as a retryable failure ------------
+
+def _fails_closed(agent) -> engine.ProviderFailure:
+    with pytest.raises(engine.ProviderFailure) as raised:
+        _turn(agent)
+    assert (raised.value.status, raised.value.detail) == ("verify_unavailable", "final_text")
+    assert isinstance(raised.value.__cause__, final_check.FinalCheckError)
+    return raised.value
+
+
+def test_a_final_text_that_is_not_a_fixed_point_of_its_state_fails_the_turn_instead_of_saving_it(offline, monkeypatch):
+    real, calls = final_check.compose, []
+
+    def unstable(*args, **kwargs):  # the recomposition from the final state differs from the text that was checked
+        comp = real(*args, **kwargs)
+        calls.append(comp)
+        return dataclasses.replace(comp, answer=comp.answer.model_copy(
+            update={"status": "partial" if len(calls) % 2 == 0 else comp.answer.status}))
+
+    monkeypatch.setattr(final_check, "compose", unstable)
+    failure = _fails_closed(ScriptedAgent([SEARCH, final(VALUE)], judge=Judge(lambda t, i, n: "supported")))
+    assert "fixed point" in str(failure.__cause__) and len(calls) >= 2
+
+
+def test_a_unit_that_fails_and_cannot_be_removed_fails_the_turn_instead_of_saving_it(offline, monkeypatch):
+    monkeypatch.setattr(final_check._Final, "apply", lambda self, failures, action: 0)
+
+    def rule(text, input, n):  # the cut sentence fails as saved
+        return {"verdict": "unsupported", "failure": "absent_from_source"} if MARKER in text else _mixed_rule(text, input, n)
+
+    failure = _fails_closed(ScriptedAgent([SEARCH, final(MIXED)], judge=Judge(rule)))
+    assert "could not be removed" in str(failure.__cause__)
+
+
+def test_a_composition_that_does_not_index_its_text_fails_the_turn_instead_of_saving_it(offline, monkeypatch):
+    real = final_check.compose
+    monkeypatch.setattr(final_check, "compose", lambda *a, **kw: dataclasses.replace(real(*a, **kw), origin=[]))
+    failure = _fails_closed(ScriptedAgent([SEARCH, final(VALUE)], judge=Judge(lambda t, i, n: "supported")))
+    assert "does not index" in str(failure.__cause__)
+
+
+# --- assert_fixed_point: the answer, the spans and the status must all be reproduced -----------------------------------
+
+LIMIT_SPAN = (0, 4, "limit_sentence")
+
+
+def _composition(markdown: str = VALUE, status: str = "answered", spans: list[ServerSpan] | None = None) -> Composition:
+    answer = FinalAnswer(status=status, answer_markdown=markdown, claims=[], clarification_question="", missing_info="",
+                         referenced_document_ids=[], scope_kind="focused", scope_query="", omitted=[], focus=None,
+                         requested=[], parts=[])
+    return Composition(answer, spans or [])
+
+
+def test_a_recomposition_that_reproduces_the_text_its_spans_and_its_status_is_a_fixed_point():
+    final_check.assert_fixed_point(_composition(spans=[ServerSpan(*LIMIT_SPAN)]),
+                                   _composition(spans=[ServerSpan(*LIMIT_SPAN)]))
+
+
+@pytest.mark.parametrize(("saved", "again"), [
+    (_composition(), _composition(VALUE + " עוד")),
+    (_composition(spans=[ServerSpan(*LIMIT_SPAN)]), _composition()),
+    (_composition(spans=[ServerSpan(*LIMIT_SPAN)]), _composition(spans=[ServerSpan(0, 5, "limit_sentence")])),
+    (_composition(spans=[ServerSpan(*LIMIT_SPAN)]), _composition(spans=[ServerSpan(0, 4, "coverage_note")])),
+    (_composition(), _composition(status="partial")),
+], ids=["answer", "span-missing", "span-offsets", "span-kind", "status"])
+def test_a_recomposition_that_differs_in_text_spans_or_status_raises(saved, again):
+    with pytest.raises(final_check.FinalCheckError):
+        final_check.assert_fixed_point(saved, again)
+
+
+# --- what the final judge's answer on the sentence as saved means (``decide``) ------------------------------------------
+
+def _as_saved(reply):
+    """A judge whose first answer cuts the clause of the mixed sentence and whose answer on the sentence as saved (the
+    marker in it, shown as the server's) is ``reply``; ``reply`` None leaves the unit out of the reply."""
+
+    def rule(text, input, n):
+        return _mixed_rule(text, input, n) if "<server>" not in input else reply or "supported"
+
+    class Omitting(Judge):
+        def __call__(self, input: str):
+            out = super().__call__(input)
+            if "<server>" in input and reply is None:
+                out["verdicts"] = []
+            return out
+
+    return (Omitting if reply is None else Judge)(rule)
+
+
+UNSUPPORTED_PART = {"verdict": "partial", "defect": "part", "claims": [
+    {"span": AREA, "verdict": "unsupported", "failure": "absent_from_source"}]}
+
+
+@pytest.mark.parametrize(("reply", "kind", "cause", "check"), [
+    ({"verdict": "not_factual"}, "not_checked", "not_classified", "final"),
+    (None, "not_checked", "omitted", "final"),
+    ({"verdict": "unsupported", "failure": "wrong_unit"}, "wrong_unit", "", "final"),
+    ({"verdict": "contradicts"}, "contradicts_source", "", "final"),
+    (UNSUPPORTED_PART, "absent_from_source", "", "final"),
+    ({"verdict": "supported", "supported_by": ["S2"]}, "absent_from_source", "", "final"),
+], ids=["not-factual", "no-verdict", "unsupported", "contradicts", "partial-with-unsupported-span", "unshown-support"])
+def test_a_cut_sentence_the_final_judge_does_not_accept_is_removed_with_the_kind_and_cause_of_the_ruling(
+        offline, reply, kind, cause, check):
+    out = _turn(ScriptedAgent([SEARCH, final(f"{MIXED}\n{VALUE}")], judge=_as_saved(reply)))
+    md = out.answer.answer_markdown
+    assert "1,200" not in md and "9,500" in md and MARKER not in md, md  # the cut sentence went whole; the rest stays
+    (p,) = out.report.removals()
+    assert (p.failure_kind, p.cause, p.check) == (kind, cause, check), p
+    assert {r.action for r in out.report.claims[0]} <= {"removed", "withheld"}
+    assert out.final_check["removed"] + out.final_check["withheld"] == 1
+    assert out.final_digest == text_digest(md)
+
+
+def test_a_cut_sentence_judged_partly_supported_with_no_defect_passes_marked_as_partly_verified(offline):
+    judge = _as_saved({"verdict": "partial", "defect": "none"})
+    out = _turn(ScriptedAgent([SEARCH, final(MIXED)], judge=judge))
+    md = out.answer.answer_markdown
+    assert "1,200" in md and MARKER in md and "אומת חלקית" in md, md
+    assert _kinds(out).count("partial_mark") == 1 and out.report.removals() == []
+    assert any(p.check == "final" and p.reason == final_check.FINAL_PARTIAL for p in out.report.problems)
+    assert _purposes(out).count("verify_final") == 1 and out.final_digest == text_digest(md)
+
+
+def test_a_cut_sentence_supported_by_a_source_it_does_not_cite_gets_the_citation_attached(offline):
+    offline.texts = [SOURCE, "נספח: השטח העיקרי בתא שטח 1 הוא 1,200 מ״ר."]
+    uncited = f"{AREA}, {CLAUSE}."
+
+    def rule(text, input, n):
+        if "<server>" in input:  # as saved: supported by the second source, which the sentence does not cite
+            return {"verdict": "supported", "supported_by": ["S2"]}
+        return {"verdict": "partial", "defect": "part", "claims": [
+            {"span": AREA, "verdict": "supported"}, {"span": CLAUSE, "verdict": "unsupported",
+                                                     "failure": "absent_from_source"}]}
+
+    out = _turn(ScriptedAgent([SEARCH, final(uncited)], judge=Judge(rule)))
+    md = out.answer.answer_markdown
+    assert "1,200" in md and MARKER in md and "[S2]" in md, md
+    assert _kinds(out).count("citation") == 1 and out.report.removals() == []
+    attached = [p for p in out.report.problems if p.check == "final" and p.kind == "needs_citation"]
+    assert [(p.cite, p.reason) for p in attached] == [("S2", final_check.FINAL_ATTACH.format(source="S2"))]
+    assert out.final_digest == text_digest(md)
+
+
+def test_support_named_in_a_source_the_sentence_does_not_cite_is_refused_when_the_source_does_not_state_its_number(offline):
+    offline.texts = [SOURCE, "נספח: השטח העיקרי בתא שטח 1 הוא 900 מ״ר."]
+
+    def rule(text, input, n):
+        if "<server>" in input:
+            return {"verdict": "supported", "supported_by": ["S2"]}
+        return {"verdict": "partial", "defect": "part", "claims": [
+            {"span": AREA, "verdict": "supported"}, {"span": CLAUSE, "verdict": "unsupported",
+                                                     "failure": "absent_from_source"}]}
+
+    out = _turn(ScriptedAgent([SEARCH, final(f"{AREA}, {CLAUSE}.\n{VALUE}")], judge=Judge(rule)))
+    md = out.answer.answer_markdown
+    assert "1,200" not in md and "9,500" in md and "[S2]" not in md, md
+    (p,) = out.report.removals()
+    assert (p.check, p.failure_kind, p.cause) == ("final", "absent_from_source", "")
+    assert p.reason.startswith(final_check.FINAL_UNSUPPORTED.format(reason="")) and "S2" in p.reason, p.reason
+    assert out.final_digest == text_digest(md)

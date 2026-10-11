@@ -1,6 +1,6 @@
 // Types of the conversational chat API (/api/chat). Kept apart from the earlier /api/ask types.
 
-import type { ValueStatus } from "./format";
+import type { ChangeAction, ValueStatus } from "./format";
 
 export interface ChatConversation {
   id: string;
@@ -380,14 +380,7 @@ export interface ChatRemoval {
 
 /** How many claims each action touched (round 8 U7); `removed`, `cut`, `rewritten` and `withheld` change the text,
  * `qualified` and `cited` add a qualifier or a citation. */
-export interface ChatVerificationActions {
-  removed: number;
-  cut: number;
-  rewritten: number;
-  withheld: number;
-  qualified: number;
-  cited: number;
-}
+export type ChatVerificationActions = Record<ChangeAction, number>;
 
 /** What verification did, in counts; what it removed, and why, is diagnostics (not on this path). */
 export interface ChatVerification {
@@ -497,7 +490,7 @@ export interface ChatRemovalDecision {
   repair_attempted: boolean;
   sources?: ChatCheckedSource[];
   claim_id?: string;
-  action?: "removed" | "withheld" | "cut" | "rewritten" | "qualified" | "cited";
+  action?: ChangeAction;
   /** For a cut: the ordinal of the marker in the answer's text. */
   ordinal?: number;
   /** What remains of the claim in the answer: nothing for a removal, the marker for a cut, the claim otherwise. */

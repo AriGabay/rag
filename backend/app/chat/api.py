@@ -33,7 +33,6 @@ reopens its passage (``_pending_refs``), so the reply is bound to the parameter 
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
@@ -49,8 +48,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
 from app.audit import audit
-from app.chat import anchors, coverage, engine, verify
-from app.chat.compose import MARKER, SERVER_SPANS_FIELD, strip_server_spans, text_digest
+from app.chat import anchors, coverage, decisions, engine, verify
+from app.chat.compose import SERVER_SPANS_FIELD, strip_server_spans, text_digest
 from app.config import get_settings
 from app.db import TenantContext, current_data_version, tenant_tx
 from app.deps import NOT_FOUND, get_ctx, parse_uuid
@@ -262,11 +261,8 @@ def public_removals(items: list) -> list[dict]:
         action = r.get("action") if r.get("action") in verify.ROW_ACTIONS else None
         claim_id = r.get("claim_id")
         ordinal = r.get("ordinal")
-        out.append({"failure_kind": kind,
-                    "component": component if isinstance(component, str) and _COMPONENT_ID.fullmatch(component)
-                    else None,
-                    "text": verify.CHECK_CAUSE_SENTENCES[cause] if cause else verify.REMOVAL_SENTENCES[kind]}
-                   | ({"cause": cause} if cause else {})
+        valid = component if isinstance(component, str) and _COMPONENT_ID.fullmatch(component) else None
+        out.append(verify.removal_summary(kind, cause or "", valid)
                    | ({"claim_id": claim_id} if isinstance(claim_id, str) and _CLAIM_ID.fullmatch(claim_id) else {})
                    | ({"action": action} if action else {})
                    | ({"ordinal": ordinal} if action == "cut" and type(ordinal) is int and ordinal > 0 else {}))
@@ -566,7 +562,7 @@ def _history_text(r) -> str:
 
 
 def summary_digest(summary: str | None) -> str:
-    return hashlib.sha256((summary or "").encode("utf-8")).hexdigest()
+    return text_digest(summary or "")
 
 
 def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
@@ -589,7 +585,7 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
     visible = _visible_documents(conn, rows)
     # an answer resting on a document the user can no longer see is not carried into the model's context
     rows = [r for r in rows if not (r.role == "assistant" and _hidden(r, visible))]
-    history = [engine.HistoryMessage(r.role, t) for r in rows if r.content for t in [_history_text(r)] if t]
+    history = [engine.HistoryMessage(r.role, said) for r in rows if r.content and (said := _history_text(r))]
     focus: dict[str, str] = {}
     prior: dict[str, dict] = {}
     prior_ids: dict[str, str] = {}  # the last answer's source id -> the P# that reopens it
@@ -723,9 +719,11 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
             focus = None
     pending = outcome.pending
     missing = a.missing_info or ("; ".join(pending["parameters"]) if pending else "")
-    digest = text_digest(a.answer_markdown)
-    if outcome.final_digest and outcome.final_digest != digest:  # the text saved is not the text that was checked
+    # the digest is the final check's own; the text saved must be the text it verified (R17, R19), never an unchecked one
+    digest = outcome.final_digest
+    if not digest or digest != text_digest(a.answer_markdown):
         logger.error("the saved text differs from the text the final check verified")
+        raise engine.ProviderFailure("verify_unavailable", "final_text")
     payload = {
         # the model's own claim list is no longer kept (round 8 U7): claims are records of the verification, whose
         # handled ones are in the log; an older message keeps the list it was stored with
@@ -737,7 +735,7 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
         "sources": sources, "measurements": measurements, "computations": computations, "values": values,
         "assumptions": assumptions, "documents": [{"document_id": k, "title": v} for k, v in docs.items()],
         # counts and the rows that link to the log; what was removed and why is diagnostics (``_diagnostics``). The
-        # digest is the saved text's (``messages.content``), which the final check verified (R17)
+        # digest is the one the final check returned for the text it verified, which is the saved one (R17)
         "verification": outcome.report.counts() | {"final_digest": digest},
         # where the server wrote in the text: offsets and a kind, never text (the history of a later turn reads it)
         SERVER_SPANS_FIELD: [{"start": int(sp.start), "end": int(sp.end), "kind": str(sp.kind)}
@@ -811,20 +809,9 @@ class _Removals(NamedTuple):
     grouped: dict[str, list[dict]]
 
 
-def _entry_ids(entry: verify.Logged) -> list[str]:
-    """The ids an entry was checked against: those its decision named, the sources its claims were checked against and the
-    sources its re-reads read and expanded (each once, in order)."""
-    ids = list(entry.problem.checked_ids or []) if entry.problem is not None else []
-    for r in entry.records:
-        ids += r.sources_checked
-        for x in r.rereads:
-            ids += [x.get("source"), x.get("expanded_source")]
-    return [i for i in dict.fromkeys(ids) if isinstance(i, str) and i]
-
-
 def _removals(ws, report) -> _Removals:
     entries = report.logged()
-    closure = [_checked_ids(ws, _entry_ids(e)) for e in entries]
+    closure = [_checked_ids(ws, decisions.entry_ids(e)) for e in entries]
     records: dict[str, dict] = {}
     grouped: dict[str, list[dict]] = {}
     for i in dict.fromkeys(i for ids in closure for i in ids):
@@ -835,67 +822,18 @@ def _removals(ws, report) -> _Removals:
 
 
 def _removal_documents(removals: _Removals) -> set[str]:
-    """The documents every entry was checked against or re-read (``_entry_ids``): behind the message together with it."""
+    """The documents every entry was checked against or re-read (``decisions.entry_ids``): behind the message together with it."""
     return {d for record in removals.records.values() for d in _record_documents(record)}
 
 
-# what the log says of an action that no check failed (a failing one has the problem's own reason)
-ACTION_REASONS = {
-    "rewritten": "הטענה נוסחה מחדש בסבב התיקון, והנוסח החדש נבדק",
-    "qualified": "הטענה נתמכה חלקית; השרת סימן אותה או הוסיף לה סייג מהמקור",
-    "cited": "המקור נמצא בבדיקה; השרת צירף אותו כציטוט",
-    "cut": "חלק מהמשפט לא נתמך במקורות; השרת הסיר רק אותו",
-    "removed": "הטענה הוסרה",
-    "withheld": "הטענה לא נבדקה והוצאה מהתשובה",
-}
-REREAD_KEYS = ("source", "scope", "outcome", "reason", "expanded_source")
-
-
-def _decision(entry: verify.Logged, sources: list[dict]) -> dict:
-    """One entry of the log (round 8 U7, R22): the claim id and the action; the original (draft) text and what remains of it
-    (``text`` and ``remaining``); the verdict and the reason; the failure kind, the check, the component and whether a
-    repair was asked (round 7); the cause when the claim could not be checked; the ids checked (``checked_ids``) and the
-    sources checked (``sources_checked``, with ``sources`` as the client opens them); the re-reads attempted; the result of
-    the final check on the text as saved."""
-    p, r, action = entry.problem, entry.record, entry.action
-    removed = action in ("removed", "withheld")
-    if p is not None:
-        base = p.as_dict()
-    else:
-        base = {"text": "", "reason": "", "severity": "partial", "kind": "claim", "failure_kind": None, "check": None,
-                "component": None, "checked_ids": list(entry.unit.ids), "repair_attempted": False, "claim_id": "",
-                "cause": "", "basis": "", "resolution": ""}
-    claim = r.text if r is not None else entry.unit.text
-    original = base["text"] if removed and p is not None else (r.draft or r.text if r is not None else claim)
-    if action == "cut" and r is not None:
-        base["failure_kind"] = r.failure_kind()
-    reread: list[dict] = []
-    for rec in entry.records:
-        for x in rec.rereads:
-            item = {k: x[k] for k in REREAD_KEYS if x.get(k) not in (None, "")}
-            if item not in reread:
-                reread.append(item)
-    return base | {
-        "claim_id": entry.claim_id, "action": action, "text": original,
-        "remaining": "" if removed else MARKER.format(n=entry.ordinal) if action == "cut" and entry.ordinal > 0
-        else "" if action == "cut" else claim,
-        "verdict": r.verdict if r is not None else "",
-        "reason": base["reason"] or ACTION_REASONS.get(action, ""),
-        "cause": base["cause"] or (r.cause if r is not None else ""),
-        "sources_checked": list(dict.fromkeys(i for rec in entry.records for i in rec.sources_checked)),
-        "sources": sources, "rereads": reread,
-        "post_check": next((rec.post_check for rec in entry.records if rec.post_check), "n/a"),
-    } | ({"ordinal": entry.ordinal} if action == "cut" and entry.ordinal > 0 else {})
-
-
 def _removal_decisions(ws, removals: _Removals) -> list[dict]:
-    """The log of the turn (round 8 U7, R22): one ``_decision`` per handled claim, in the text's order, with ``sources`` —
+    """The log of the turn (round 8 U7, R22): one ``decisions.decision`` per handled claim, in the text's order, with ``sources`` —
     each id it was checked against, and each source its re-reads reached (and what that rests on), as the client opens it,
     with its anchor (``anchors.attach``, resolved against the turn's pinned readings) and its ``type`` (``sources``,
     ``values``, ``measurements``, ``computations``, ``assumptions``)."""
     if removals.records:
         anchors.attach(ws, removals.grouped)
-    return [_decision(e, [removals.records[i] for i in ids])
+    return [decisions.decision(e, [removals.records[i] for i in ids])
             for e, ids in zip(removals.entries, removals.closure, strict=True)]
 
 

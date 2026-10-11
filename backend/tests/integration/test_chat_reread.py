@@ -15,6 +15,7 @@ from sqlalchemy import text
 
 from app.chat import tools as T
 from app.chat.engine import FinalAnswer
+from app.chat.rereader import ContextReader
 from app.chat.verify import verify_answer
 from app.db import tenant_tx
 from app.extraction.images import PictureReading, PictureTable
@@ -94,7 +95,7 @@ def report(office):
 def test_heading_gives_the_chain_of_the_cited_block_and_is_registered_with_the_cited_anchor(office, report):
     doc, ver = report
     ws = _ws(office.ctx(), doc, ver, text="סך כל הנכסים בקבוצה: 25,742", block_start=2, block_end=2)
-    fetcher = T.ContextReader(ws)
+    fetcher = ContextReader(ws)
     got = fetcher.expand("S1", "heading")
     assert got is not None and NOTE in got.text and "מעל המקור" in got.text
     assert len(ws.sources) == 1  # reading is not registering
@@ -108,14 +109,14 @@ def test_heading_gives_the_chain_of_the_cited_block_and_is_registered_with_the_c
 def test_neighbours_are_the_blocks_around_the_cited_range(office, report):
     doc, ver = report
     ws = _ws(office.ctx(), doc, ver, text="סך כל הנכסים בקבוצה: 25,742", block_start=2, block_end=2)
-    got = T.ContextReader(ws).expand("S1", "neighbours")
+    got = ContextReader(ws).expand("S1", "neighbours")
     assert got is not None and "הטבלה שלהלן מפרטת" in got.text and "הנתונים נכונים למועד הקובע" in got.text
 
 
 def test_continuation_is_the_rest_of_the_section_not_another_section(office, report):
     doc, ver = report
     ws = _ws(office.ctx(), doc, ver, text="הטבלה שלהלן מפרטת את הנכסים בקבוצה.", block_start=1, block_end=1)
-    fetcher = T.ContextReader(ws)
+    fetcher = ContextReader(ws)
     got = fetcher.expand("S1", "continuation")
     assert got is not None and "(1) הסכומים אינם כוללים" in got.text and "סעיף אחר" not in got.text
     s = ws.sources[fetcher.adopt("S1", "continuation")]
@@ -125,13 +126,13 @@ def test_continuation_is_the_rest_of_the_section_not_another_section(office, rep
 def test_the_end_of_a_section_has_no_continuation(office, report):
     doc, ver = report
     ws = _ws(office.ctx(), doc, ver, text="(1) הסכומים אינם כוללים מע\"מ.", block_start=4, block_end=4)
-    assert T.ContextReader(ws).expand("S1", "continuation") is None
+    assert ContextReader(ws).expand("S1", "continuation") is None
 
 
 def test_a_tables_headers_units_and_notes(office, report):
     doc, ver = report
     ws = _ws(office.ctx(), doc, ver, kind="table", text="נכס ב | 7,000", table_index=0, block_start=2, block_end=2)
-    fetcher = T.ContextReader(ws)
+    fetcher = ContextReader(ws)
     for kind in ("table_headers", "units_note"):
         got = fetcher.expand("S1", kind)
         assert got is not None, kind
@@ -143,7 +144,7 @@ def test_a_tables_headers_units_and_notes(office, report):
 def test_a_passages_units_note_is_the_heading_and_the_paragraphs_around_it(office, report):
     doc, ver = report
     ws = _ws(office.ctx(), doc, ver, text="סך כל הנכסים בקבוצה: 25,742", block_start=2, block_end=2)
-    got = T.ContextReader(ws).expand("S1", "units_note")
+    got = ContextReader(ws).expand("S1", "units_note")
     assert got is not None and NOTE in got.text and "הטבלה שלהלן מפרטת" in got.text
 
 
@@ -151,7 +152,7 @@ def test_footnotes_are_the_notes_of_the_table_and_of_the_page(office, report):
     doc, ver = report
     ws = _ws(office.ctx(), doc, ver, kind="table", text="נכס ב | 7,000", table_index=0, block_start=2, block_end=2,
              page_list=[3])
-    got = T.ContextReader(ws).expand("S1", "footnotes")
+    got = ContextReader(ws).expand("S1", "footnotes")
     assert got is not None and "(*) לא כולל מע\"מ" in got.text and "(1) הסכומים אינם כוללים מע\"מ" in got.text
     assert "הנתונים נכונים" not in got.text  # a note's start marks it, not any paragraph of the page
 
@@ -159,7 +160,7 @@ def test_footnotes_are_the_notes_of_the_table_and_of_the_page(office, report):
 def test_next_page_is_the_stored_table_with_its_continuation(office, report):
     doc, ver = report
     ws = _ws(office.ctx(), doc, ver, kind="table", text="נכס ב | 7,000", table_index=0, block_start=2, block_end=2)
-    fetcher = T.ContextReader(ws)
+    fetcher = ContextReader(ws)
     got = fetcher.expand("S1", "next_page")
     assert got is not None
     assert "[עמוד 3]" in got.text and "[עמוד 4]" in got.text and "סה\"כ | 25,742" in got.text
@@ -174,13 +175,13 @@ def test_a_table_on_one_page_has_no_next_page(office):
                                  "rows": [{"page": 3, "cells": ["נכס א"]}]})
     ws = _ws(office.ctx(), doc, ver, kind="table", text="נכס א", table_index=0, block_start=0,
              block_end=0)
-    assert T.ContextReader(ws).expand("S1", "next_page") is None
+    assert ContextReader(ws).expand("S1", "next_page") is None
 
 
 def test_a_passages_next_page_is_the_start_of_the_next_page(office, report):
     doc, ver = report
     ws = _ws(office.ctx(), doc, ver, text="(1) הסכומים אינם כוללים מע\"מ.", block_start=4, block_end=4, page_list=[3])
-    got = T.ContextReader(ws).expand("S1", "next_page")
+    got = ContextReader(ws).expand("S1", "next_page")
     assert got is not None and "טקסט מסעיף אחר" in got.text
 
 
@@ -191,7 +192,7 @@ def test_region_is_the_stored_reading_of_a_pictures_table(office):
                                  "caption": "טבלה מתוך תמונה", "notes": ["הערה: השכירות לחודש"],
                                  "rows": [{"page": 6, "cells": ["חנות", "55"]}]})
     ws = _ws(office.ctx(), doc, ver, kind="table", text="חנות | 55", table_index=0, block_start=0, block_end=0)
-    got = T.ContextReader(ws).expand("S1", "region")
+    got = ContextReader(ws).expand("S1", "region")
     assert got is not None and "קריאה חזותית" in got.text and "השכירות לחודש" in got.text and "חנות | 55" in got.text
 
 
@@ -210,7 +211,7 @@ def test_region_of_an_inspected_picture_is_its_stored_reading_and_makes_no_model
     ws = _ws(office.ctx(), doc, ver, kind="image", text="מחסן 31", method="vision",
              vision={"region": "page:6", "page": 6, "reading": PictureReading("read_uncertain", "vision"), "tables": []})
     before = _count(office, "region_readings")
-    got = T.ContextReader(ws).expand("S1", "region")
+    got = ContextReader(ws).expand("S1", "region")
     assert got is not None and "שכירות באלפי ₪" in got.text and "ללא מע\"מ" in got.text  # the stored one
     assert _count(office, "region_readings") == before and ws.inspections == 0
 
@@ -218,7 +219,7 @@ def test_region_of_an_inspected_picture_is_its_stored_reading_and_makes_no_model
 def test_a_text_passage_has_no_region_and_nothing_unknown_is_read(office, report):
     doc, ver = report
     ws = _ws(office.ctx(), doc, ver, text="סך כל הנכסים בקבוצה: 25,742", block_start=2, block_end=2)
-    fetcher = T.ContextReader(ws)
+    fetcher = ContextReader(ws)
     assert fetcher.expand("S1", "region") is None and fetcher.expand("S1", "nonsense") is None
     assert fetcher.expand("S9", "heading") is None and fetcher.adopt("S1", "region") is None
 
@@ -226,7 +227,7 @@ def test_a_text_passage_has_no_region_and_nothing_unknown_is_read(office, report
 def test_a_listing_has_nothing_to_read(office, report):
     ws = T.Workspace(ctx=office.ctx())
     ws.add_source(document_id=None, version_id=None, title="רשימה", section=None, location="", kind="listing", text="x")
-    assert T.ContextReader(ws).expand("S1", "heading") is None
+    assert ContextReader(ws).expand("S1", "heading") is None
 
 
 # --- permissions (R24) ----------------------------------------------------------------------------------------------
@@ -250,13 +251,13 @@ def test_it_never_reads_a_document_the_user_cannot_see(office):
         # the revoked one: a source the turn held before the document moved out of the user's groups
         ws = _ws(ctx, secret_doc, secret_ver, kind="table", text="1", table_index=0, block_start=1, block_end=1,
                  page_list=[1])
-        fetcher = T.ContextReader(ws)
+        fetcher = ContextReader(ws)
         assert fetcher.expand("S1", kind) is None, kind
         assert fetcher.adopt("S1", kind) is None and len(ws.sources) == 1
         # the same reader does read the visible one
         ok = _ws(ctx, open_doc, open_ver, kind="table", text="1", table_index=0, block_start=1, block_end=1,
                  page_list=[1])
-        got = T.ContextReader(ok).expand("S1", kind)
+        got = ContextReader(ok).expand("S1", kind)
         assert got is None or "סוד-האלון" not in got.text, kind
 
 
@@ -266,22 +267,22 @@ def test_a_document_of_another_office_or_a_deleted_one_is_never_read(office, db)
     _blocks(other, doc, ver, [{"kind": "heading", "path": ["כותרת-זרה (באלפי ₪)"], "text": "כותרת", "page": 1},
                               {"path": ["כותרת-זרה (באלפי ₪)"], "text": "פסקה", "page": 1}])
     ws = _ws(office.ctx(), doc, ver, text="פסקה", block_start=1, block_end=1)
-    assert T.ContextReader(ws).expand("S1", "heading") is None  # row-level security: another office's version is absent
+    assert ContextReader(ws).expand("S1", "heading") is None  # row-level security: another office's version is absent
     mine, mine_ver = make_document(office, office.default_group_id, TITLE, sha="2" * 64)
     _blocks(office, mine, mine_ver, [{"kind": "heading", "path": ["כותרת (באלפי ₪)"], "text": "כותרת"},
                                      {"path": ["כותרת (באלפי ₪)"], "text": "פסקה"}])
     ws = _ws(office.ctx(), mine, mine_ver, text="פסקה", block_start=1, block_end=1)
-    assert T.ContextReader(ws).expand("S1", "heading") is not None
+    assert ContextReader(ws).expand("S1", "heading") is not None
     with tenant_tx(office.system) as conn:
         conn.execute(text("UPDATE documents SET deleted_at = now() WHERE id = :d"), {"d": mine})
-    assert T.ContextReader(ws).expand("S1", "heading") is None
+    assert ContextReader(ws).expand("S1", "heading") is None
 
 
 def test_a_document_read_again_since_is_not_expanded(office, report):
     doc, ver = report
     ws = _ws(office.ctx(), doc, ver, text="סך כל הנכסים בקבוצה: 25,742", block_start=2, block_end=2)
     ws.sources["S1"].reading_id = "an-earlier-reading"  # the block numbers of that reading mean other text now
-    assert T.ContextReader(ws).expand("S1", "heading") is None
+    assert ContextReader(ws).expand("S1", "heading") is None
 
 
 # --- in a verification -----------------------------------------------------------------------------------------------
@@ -311,7 +312,7 @@ def test_a_claim_whose_units_are_in_the_heading_is_supported_after_a_database_re
     judge = ScriptedProvider().on(Purpose.VERIFY, respond, repeat=True)
     usage: list = []
     md = "סך כל הנכסים בקבוצה הוא 25,742 [S1]."
-    rep = verify_answer(judge, _answer(md), ws, "?", usage, reread=T.ContextReader(ws))
+    rep = verify_answer(judge, _answer(md), ws, "?", usage, reread=ContextReader(ws))
     assert rep.ok and rep.claims[0][0].verdict == "supported"
     assert [u["purpose"] for u in usage] == ["verify", "verify_reread"]
     (log,) = rep.claims[0][0].rereads
@@ -332,7 +333,7 @@ def test_a_total_only_the_tables_second_page_states_is_kept_and_cited_to_the_exp
              block_start=2, block_end=2, page_list=[3])
     md = "סך הנכסים בטבלה הוא 25,742 [S1]."
     usage: list = []
-    rep = verify_answer(_judge_supported(), _answer(md), ws, "?", usage, reread=T.ContextReader(ws))
+    rep = verify_answer(_judge_supported(), _answer(md), ws, "?", usage, reread=ContextReader(ws))
     assert rep.ok and not rep.removed_units()
     final = rep.apply(_answer(md)).answer_markdown
     assert "25,742" in final and "[S1][S2]" in final
@@ -350,6 +351,6 @@ def test_a_total_no_page_of_the_table_states_is_still_removed(office, report):
     ws = _ws(office.ctx(), doc, ver, kind="table", text="נכס א | 10,000\nנכס ב | 7,000", table_index=0,
              block_start=2, block_end=2, page_list=[3])
     md = "סך הנכסים בטבלה הוא 99,999 [S1]."
-    rep = verify_answer(_judge_supported(), _answer(md), ws, "?", [], reread=T.ContextReader(ws))
+    rep = verify_answer(_judge_supported(), _answer(md), ws, "?", [], reread=ContextReader(ws))
     assert rep.removed_units() == {0} and list(ws.sources) == ["S1"]
     assert [x["outcome"] for x in rep.claims[0][0].rereads] == ["not_found", "not_found"]  # next_page, continuation

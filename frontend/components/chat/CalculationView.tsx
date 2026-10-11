@@ -10,7 +10,8 @@ import type {
   ViewerTarget,
 } from "@/lib/chatTypes";
 import { VALUE_STATUS, valueStatusText } from "@/lib/format";
-import { assumptionText, citedTarget, resultText } from "./Message";
+import { assumptionText, citedTarget } from "./cited";
+import { resultText } from "./Message";
 import { useInitialFocus } from "./SourceViewer";
 import "./chat.css";
 
