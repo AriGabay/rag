@@ -102,6 +102,7 @@ from app.chat import tools as T
 from app.chat.compose import ServerSpan, text_digest
 from app.chat.final_check import FinalCheckError, finalize
 from app.chat.rereader import ContextReader
+from app.chat.timing import done_label
 from app.chat.verify import (
     VERIFY_ALLOWANCE_SECONDS,
     Problem,
@@ -433,6 +434,8 @@ class TurnOutcome:
     # check's counts (``final_check.Finalized.stats``; numbers only, no content)
     final_digest: str = ""
     final_check: dict = field(default_factory=dict)
+    # where the turn's time went (round 9 R16, KTD9: ``timing.StageClock.summary``); numbers and tool names only
+    timing: dict = field(default_factory=dict)
 
 
 def usage_summary(usage: list[dict], **extra) -> dict:
@@ -501,8 +504,11 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None, bin
 
 
 def run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput,
-             progress: Callable[[str, str], None], cancelled: Callable[[], bool]) -> TurnOutcome:
+             progress: Callable[..., None], cancelled: Callable[[], bool]) -> TurnOutcome:
     """Run one turn to a verified answer. Raises ``TurnCancelled`` or ``ProviderFailure``.
+
+    ``progress(step, label)`` says what starts; ``progress(step, label, True)`` says a tool call is done and what it
+    found (round 9 R17). The turn's time per stage is on ``TurnOutcome.timing`` (R16, KTD9).
 
     The turn's usage records travel with it: on the outcome, and on any exception it raises (``usage``), so the
     calls made before a stop, a failure or a crash are still logged and billed."""
@@ -519,7 +525,7 @@ def run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput,
         raise
 
 
-def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progress: Callable[[str, str], None],
+def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progress: Callable[..., None],
               cancelled: Callable[[], bool], usage: list[dict], started: list) -> TurnOutcome:
     settings = get_settings()
     agent = for_purpose(provider, Purpose.AGENT)
@@ -594,7 +600,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             # the server's own words, asking: nothing of the model's to check, so no judge call; saved with its digest
             return TurnOutcome(answer, ws, VerifyReport([], judged=True, judge_status="no_claims"), steps, usage, {},
                                rounds, request.as_dict(), request.resolution, _summary(usage, rounds, reused, turn),
-                               final_digest=text_digest(answer.answer_markdown))
+                               final_digest=text_digest(answer.answer_markdown), timing=ws.clock.summary())
     def finish(answer: FinalAnswer, report: VerifyReport) -> TurnOutcome:
         # removals; each component recomputed from the surviving units; the absences the server states removed; one
         # gap paragraph after the answer (round 7 U3) — then the limits reached and the coverage ledger. Each decision
@@ -603,12 +609,15 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         # all of it in one composer (round 8 U4, KTD6), which records every span the server wrote — and the composed
         # text is checked as the whole it is, in the verification allowance, before anything is saved (U6): every path
         # that returns an answer comes through here, the fallbacks to an earlier round's answer included
+        final_started = time.monotonic()
         try:
             done = finalize(provider, ws, answer, report, turn, question=inp.question,
                             request=request.standalone_question if request is not None else None, usage=usage,
                             deadline=deadline + VERIFY_ALLOWANCE_SECONDS, limit_sentences=_limit_sentences(limits))
         except FinalCheckError as exc:  # never an unchecked text (R19)
             raise ProviderFailure("verify_unavailable", "final_text") from exc
+        finally:
+            ws.clock.add("final", time.monotonic() - final_started)
         composed = done.composition
         final, outcomes, ledger = composed.answer, composed.outcomes, composed.ledger
         final = final.model_copy(update={"focus": _surviving_focus(ws, final)})
@@ -622,7 +631,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
                            request.as_dict() if request is not None else None,
                            request.resolution if request is not None else None, _summary(usage, rounds, reused, turn),
-                           _pending(ws, turn, final), composed.spans, done.digest, done.stats)
+                           _pending(ws, turn, final), composed.spans, done.digest, done.stats, ws.clock.summary())
 
     pending: request_analysis.Pending | None = None
 
@@ -719,8 +728,10 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         items.extend(step.output)
         if step.calls:
             for call in step.calls:
-                _announce(progress, call)
+                started_step = _announce(progress, call)
                 output = T.run_tool(ws, call.name, call.arguments)
+                if started_step is not None:  # what the call found, said once it is done (R17)
+                    progress(started_step, done_label(call.name, _arguments(call), output), True)
                 turn.record(call.name, call.arguments, output)
                 items.append({"type": "function_call_output", "call_id": call.call_id, "output": output})
             continue
@@ -732,6 +743,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                 return finish(*checked)
             raise ProviderFailure(CallStatus.INVALID.value, "final schema") from exc
         answer_seconds = time.monotonic() - step_started
+        ws.clock.add("compose", answer_seconds)
         if pending is not None:
             settle_analysis()  # the first step answered: the requirements are frozen before verification
         if answer.status == "clarification" and answer.clarification_question.strip() and not answer.answer_markdown.strip():
@@ -753,6 +765,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                 return finish(*checked)
             raise ProviderFailure("verify_no_time")
         progress("verify", "מאמת את הטענות מול המקורות")
+        verify_started = time.monotonic()
         try:
             # the judge scores each component of the request against the answer (the instructions as a list of
             # their own); what is still not given is stated by the server after verification, once
@@ -767,6 +780,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             if checked is not None:
                 return finish(*checked)
             raise ProviderFailure("verify_unavailable", exc.status) from exc
+        finally:
+            ws.clock.add("verify", time.monotonic() - verify_started)
         if cancelled():
             raise TurnCancelled
         rounds.append([p.as_dict() for p in report.problems])
@@ -857,36 +872,52 @@ def _limit_sentences(limits: list[str]) -> list[str]:
     return [LIMIT_SENTENCES[k] for k in LIMIT_SENTENCES if k in limits]
 
 
-def _announce(progress: Callable[[str, str], None], call) -> None:
+def _arguments(call) -> dict:
+    """A tool call's arguments as a dict (empty when they are not JSON)."""
     try:
         args = json.loads(call.arguments or "{}")
     except ValueError:
-        args = {}
-    if call.name == "search":
-        progress("search", f"מחפש: {str(args.get('query', ''))[:80]}")
-    elif call.name == "read":
+        return {}
+    return args if isinstance(args, dict) else {}
+
+
+def _start_label(name: str, args: dict) -> tuple[str, str] | None:
+    """The progress step and label of a tool that is starting: what it was asked to do."""
+    if name == "search":
+        return "search", f"מחפש: {str(args.get('query', ''))[:80]}"
+    if name == "read":
         target = args.get("target") if isinstance(args.get("target"), dict) else {}
         pages = target.get("pages") if isinstance(target.get("pages"), dict) else None
         if pages:
-            progress("read", f"קורא עמודים {pages.get('from_page')}–{pages.get('to_page')}")
-        else:
-            label = {"source": "קורא את ההקשר", "section": "קורא את הסעיף", "table": "קורא את הטבלה",
-                     "cursor": "ממשיך לקרוא"}
-            progress("read", next((v for k, v in label.items() if target.get(k)), "קורא מקור"))
-    elif call.name == "list_documents":
-        progress("documents", "בודק אילו מסמכים זמינים")
-    elif call.name == "find_documents":
-        progress("documents", f"מאתר את המסמכים בתחום: {str(args.get('query', ''))[:60]}")
-    elif call.name == "outline":
-        progress("read", "קורא את מבנה המסמך")
-    elif call.name == "find_measurements":
-        progress("measure", f"מאתר נתונים: {str(args.get('query', ''))[:60]}")
-    elif call.name == "take_value":
-        progress("compute", "רושם ערך מהמקור ומאמת אותו")
-    elif call.name == "assume":
-        progress("compute", "רושם את הנחת המשתמש")
-    elif call.name == "inspect":
+            return "read", f"קורא עמודים {pages.get('from_page')}–{pages.get('to_page')}"
+        label = {"source": "קורא את ההקשר", "section": "קורא את הסעיף", "table": "קורא את הטבלה",
+                 "cursor": "ממשיך לקרוא"}
+        return "read", next((v for k, v in label.items() if target.get(k)), "קורא מקור")
+    if name == "list_documents":
+        return "documents", "בודק אילו מסמכים זמינים"
+    if name == "find_documents":
+        return "documents", f"מאתר את המסמכים בתחום: {str(args.get('query', ''))[:60]}"
+    if name == "outline":
+        return "read", "קורא את מבנה המסמך"
+    if name == "find_measurements":
+        return "measure", f"מאתר נתונים: {str(args.get('query', ''))[:60]}"
+    if name == "take_value":
+        return "compute", "רושם ערך מהמקור ומאמת אותו"
+    if name == "assume":
+        return "compute", "רושם את הנחת המשתמש"
+    if name == "inspect":
         target = args.get("target") if isinstance(args.get("target"), dict) else {}
-        progress("read", f"קורא חזותית את עמוד {target.get('page')}" if target.get("page") else "קורא חזותית אזור שלא נקרא")
-    elif call.name == "calculate":
-        progress("compute", f"מחשב בקוד: {str(args.get('label') or '')[:60]}".rstrip(": "))
+        return "read", (f"קורא חזותית את עמוד {target.get('page')}" if target.get("page")
+                        else "קורא חזותית אזור שלא נקרא")
+    if name == "calculate":
+        return "compute", f"מחשב בקוד: {str(args.get('label') or '')[:60]}".rstrip(": ")
+    return None
+
+
+def _announce(progress: Callable[..., None], call) -> str | None:
+    """Say which tool is starting, and return the step it was announced under (the done event that follows the call
+    uses it); None for a tool that is not announced."""
+    started = _start_label(call.name, _arguments(call))
+    if started is not None:
+        progress(*started)
+    return started[0] if started else None

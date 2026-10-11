@@ -101,6 +101,7 @@ from sqlalchemy import Connection, text
 from app.answering.verify import numbers_in
 from app.chat import anchors, calc, contexts, meaning, reader
 from app.chat.evidence import TABLE_SIZE_PREFIX
+from app.chat.timing import StageClock
 from app.config import get_settings
 from app.db import TenantContext, tenant_tx
 from app.measurements.extract import (
@@ -380,6 +381,8 @@ class Workspace:
     # the document lookups of the coverage ledger that depend only on the question or the scope query, read once per
     # turn (``coverage.build``): ("named", question), ("shared", question) or ("matching", query) -> the rows
     lookups: dict = field(default_factory=dict)
+    # the turn's time per stage and per tool call (round 9 R16, KTD9, ``app.chat.timing``), fed by ``run_tool`` and the engine
+    clock: StageClock = field(default_factory=StageClock)
 
     def spend(self, output: str) -> str:
         """Count a tool output sent to the model against the turn's budget; the output that reaches it is sent
@@ -3889,8 +3892,13 @@ def _withheld(name: str, args: dict) -> str:
 
 
 def run_tool(ws: Workspace, name: str, arguments: str) -> str:
-    """Run one tool call and return what is sent to the model, counted against the turn's tool-output budget."""
-    return ws.spend(_run_tool(ws, name, arguments))
+    """Run one tool call and return what is sent to the model, counted against the turn's tool-output budget. The
+    call is timed on the turn's stage clock (a tool that does not exist is not a stage's time)."""
+    started = ws.clock.now()
+    output = ws.spend(_run_tool(ws, name, arguments))
+    if name in HANDLERS:
+        ws.clock.tool(name, ws.clock.now() - started, len(output))
+    return output
 
 
 def _run_tool(ws: Workspace, name: str, arguments: str) -> str:

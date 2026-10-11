@@ -14,6 +14,10 @@ export interface ChatConversation {
 export interface ChatProgressStep {
   step: string;
   label: string;
+  /** When the event happened (epoch seconds); absent on steps stored before round 9. Not shown. */
+  at?: number;
+  /** A finished tool call: its label says what it found. Absent on a start event. */
+  done?: boolean;
 }
 
 /** Where a citation points (backend `app/chat/anchors.py`), snapshotted into the answer when it was stored, so an old

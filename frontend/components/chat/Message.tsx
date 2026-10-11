@@ -9,6 +9,7 @@ import type {
   ChatComputationInput,
   ChatLedger,
   ChatMessage,
+  ChatProgressStep,
   ChatRemoval,
   ChatRequirement,
   ChatSource,
@@ -128,6 +129,19 @@ interface AssistantProps {
   onOpenSource?: (nav: ViewerNav) => void;
 }
 
+/** The lines the progress list shows: a tool's finished event (round 9: what it found) replaces its start event, so a
+ * call is one line; the timestamps are kept in the data and not shown. */
+export function progressLines(progress: ChatProgressStep[]): ChatProgressStep[] {
+  const lines: ChatProgressStep[] = [];
+  for (const p of progress) {
+    if (p.step === "queued") continue;
+    const prev = lines[lines.length - 1];
+    if (p.done && prev && !prev.done && prev.step === p.step) lines[lines.length - 1] = p;
+    else lines.push(p);
+  }
+  return lines;
+}
+
 export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onOpenSource }: AssistantProps) {
   const [copied, setCopied] = useState(false);
   const answer = message.answer;
@@ -143,13 +157,20 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
   const openCut = useCallback((ordinal: number) => setFocus((f) => ({ ordinal, tick: (f?.tick ?? 0) + 1 })), []);
 
   if (message.status === "running" || message.status === "cancelling") {
-    const steps = message.progress.filter((p) => p.step !== "queued");
-    const last = steps.length ? steps[steps.length - 1].label : "מעבד את הבקשה";
+    const steps = progressLines(message.progress);
+    const lastStep = steps.length ? steps[steps.length - 1] : null;
+    const last = lastStep ? lastStep.label : "מעבד את הבקשה";
     return (
       <div className="msg msg-assistant" aria-live="polite">
         <div className="status-line">
           <span className="dot-pulse" aria-hidden="true" />
-          <span>{message.status === "cancelling" ? "עוצר… (ממתין לסיום שלב שכבר נשלח למודל)" : `${last}…`}</span>
+          <span>
+            {message.status === "cancelling"
+              ? "עוצר… (ממתין לסיום שלב שכבר נשלח למודל)"
+              : lastStep?.done
+                ? last
+                : `${last}…`}
+          </span>
           {message.status === "running" && (
             <button type="button" className="btn btn-small" onClick={() => onStop(message)}>
               עצירה

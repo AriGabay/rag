@@ -18,7 +18,8 @@ withheld, qualified or cited (round 8 U7, R22, KTD8) — in the text's order, ea
 checked against (with their anchors), the re-reads attempted and the result of the final check. The rows of the normal
 path (``verification.removals``) carry the same claim id, the action and a cut's marker ordinal, and the payload holds
 ``verification.final_digest`` (the digest of the saved text) and ``verification.actions`` (counts); a claim's verdict,
-citation state and offsets stay in the log. ``GET /messages/{id}/diagnostics`` returns the detail to the message's owner and
+citation state and offsets stay in the log. The turn's time per stage and per tool call (round 9 R16, KTD9;
+``timing.StageClock``) is kept with it, as ``timing`` (stored in the resolution's jsonb, which has no other use on a first turn). ``GET /messages/{id}/diagnostics`` returns the detail to the message's owner and
 to an office admin (audited), and only while every document behind the answer — the documents every entry was checked
 against and every re-read reached included — is visible to them; those documents are behind the message too
 (``removal_documents``), so revoking one hides both. The registry of the spans the server wrote in the text is saved with
@@ -37,6 +38,7 @@ import json
 import logging
 import re
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -370,8 +372,10 @@ def get_diagnostics(message_id: str, ctx: TenantContext = Depends(get_ctx)) -> d
             raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
         if row.user_id != ctx.user_id:
             audit(conn, "chat.diagnostics.read", ctx.user_id, "message", mid, owner=str(row.user_id))
-    return {"message_id": str(mid), "rounds": row.rounds, "removed": row.removed, "resolution": row.resolution,
-            "limits_hit": row.limits_hit or []}
+    resolution = dict(row.resolution) if row.resolution else {}
+    timing = resolution.pop("timing", None)  # the stage clock (round 9 KTD9) is stored beside the resolution
+    return {"message_id": str(mid), "rounds": row.rounds, "removed": row.removed, "resolution": resolution or None,
+            "timing": timing, "limits_hit": row.limits_hit or []}
 
 
 @router.post("/conversations/{conversation_id}/messages")
@@ -466,11 +470,14 @@ def _start(ctx: TenantContext, conversation_id: UUID, assistant_id: UUID, user_m
         _executor().submit(run_message, ctx, conversation_id, assistant_id, user_message_id)
 
 
-def _progress(ctx: TenantContext, message_id: UUID, step: str, label: str) -> None:
+def _progress(ctx: TenantContext, message_id: UUID, step: str, label: str, done: bool = False) -> None:
+    """One progress event: the step, its label, when it happened (``at``, epoch seconds) and — for a tool call that
+    finished — ``done``, with a label that says what it found (round 9 R17). Events written before had neither."""
+    event = {"step": step, "label": label, "at": round(time.time(), 3)} | ({"done": True} if done else {})
     with tenant_tx(ctx) as conn:
         conn.execute(text(
             "UPDATE messages SET progress = progress || CAST(:p AS jsonb), updated_at = now() WHERE id = :m"),
-            {"m": message_id, "p": json.dumps([{"step": step, "label": label}], ensure_ascii=False)})
+            {"m": message_id, "p": json.dumps([event], ensure_ascii=False)})
 
 
 def _cancel_requested(ctx: TenantContext, message_id: UUID) -> bool:
@@ -850,7 +857,10 @@ def _diagnostics(outcome: engine.TurnOutcome, payload: dict, removals: _Removals
     removed = _removal_decisions(outcome.workspace, removals)
     checked = {d for r in removed for s in r["sources"] for d in _record_documents(s)}
     checked |= {d for r in removed for s in r["sources"] for d in anchors.anchored_documents({s["type"]: [s]})}
-    return {"rounds": outcome.rounds, "removed": removed, "resolution": resolution,
+    # the stage clock (round 9 KTD9) travels in the resolution's jsonb under ``timing``: numbers and tool names, no
+    # column of its own; ``get_diagnostics`` serves it apart from the resolution
+    timing = outcome.timing or outcome.workspace.clock.summary()
+    return {"rounds": outcome.rounds, "removed": removed, "resolution": (resolution or {}) | {"timing": timing},
             "document_ids": _answer_documents(payload) | found | checked,
             "limits_hit": list(outcome.workspace.limits_hit)}
 
@@ -903,7 +913,7 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
             _finish(ctx, message_id, "done", content="", answer=answer)
             return
         provider = get_selected_provider()
-        outcome = engine.run_turn(ctx, provider, inp, lambda step, label: _progress(ctx, message_id, step, label),
+        outcome = engine.run_turn(ctx, provider, inp, lambda step, label, done=False: _progress(ctx, message_id, step, label, done),
                                   lambda: _cancel_requested(ctx, message_id))
         _log_turn_usage(ctx, provider, outcome.usage)
         removals = _removals(outcome.workspace, outcome.report)  # the payload's documents and the diagnostics' decisions

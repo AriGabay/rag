@@ -23,9 +23,10 @@ from app.chat import tools as T
 from app.db import tenant_tx
 from app.providers.llm import CallStatus, Purpose
 from tests.conftest import login
-from tests.factories import make_office
+from tests.factories import make_office, make_user
 from tests.integration.test_chat import cloud, new_conversation, send
 from tests.integration.test_chat_reading_tools import add_document
+from tests.integration.test_search import add_chunks
 from tests.support.scripted_agent import ScriptedAgent, call, final, read
 
 pytestmark = pytest.mark.db
@@ -246,6 +247,68 @@ def test_a_turn_that_cannot_be_verified_in_time_fails_with_its_message_and_logs_
     with tenant_tx(office.system) as conn:
         assert [r.purpose for r in conn.execute(text("SELECT purpose FROM provider_usage ORDER BY id"))] == [
             "agent", "request", "agent"]
+
+
+# --- the stage clock and the progress events (round 9 U1, R16, R17, KTD9) ------------------------------------------
+
+VALUE = "סיכום: השווי למ\"ר בנוי במבנה הגפן הוא 9,500 ₪."
+VALUE_ANSWER = final("השווי למ\"ר בנוי הוא 9,500 ₪ [S1].")
+
+
+def timed_turn(client, office, monkeypatch) -> dict:
+    """Two searches in one step, then a read of pages, then a verified answer from the first search."""
+    add_chunks(office, office.default_group_id, [VALUE], "9" * 64)
+    searches = [call("search", query="שווי למ\"ר", document_ids=None, limit=None),
+                call("search", query="מבנה הגפן", document_ids=None, limit=None)]
+    m = ask(client, office, monkeypatch, Reader([searches, [pages(office.doc, 2)]], VALUE_ANSWER))
+    assert m["status"] == "done", m
+    return m
+
+
+def test_a_turn_records_its_tool_timings_and_stage_totals_in_the_diagnostics(client, office, monkeypatch):
+    m = timed_turn(client, office, monkeypatch)
+    timing = diagnostics(client, m)["timing"]
+    assert [(t["tool"], t["stage"]) for t in timing["tools"]] == [("search", "locate"), ("search", "locate"),
+                                                                  ("read", "read")]
+    assert all(t["seconds"] >= 0 and t["chars"] > 0 for t in timing["tools"])
+    stages = timing["stages"]  # a jsonb object: the keys come back in its own order
+    assert {k for k, v in stages.items() if v["calls"]} == {"locate", "read", "compose", "verify", "final"}
+    assert set(stages) == {"locate", "read", "compute", "compose", "verify", "final"}
+    assert stages["locate"]["calls"] == 2 and stages["read"]["calls"] == 1 and stages["compute"]["calls"] == 0
+    # the stages are disjoint parts of the turn; what no stage holds is reported, never hidden
+    held = sum(v["seconds"] for v in stages.values())
+    assert held <= timing["total_seconds"] and timing["unattributed_seconds"] >= 0
+    assert abs(timing["total_seconds"] - held - timing["unattributed_seconds"]) < 0.01
+    # no content: tool names, stages and numbers only
+    assert "9,500" not in json.dumps(timing, ensure_ascii=False)
+    # the same row, the same gate: another employee of the office reads nothing, and the answer carries none of it
+    make_user(office, "emp2@example.test", [])
+    login(client, "emp2@example.test")
+    assert client.get(f"/api/chat/messages/{m['id']}/diagnostics").status_code == 404
+    assert "timing" not in json.dumps(m["answer"])
+
+
+def test_a_first_turn_keeps_the_resolution_empty_beside_its_timing(client, office, monkeypatch):
+    m = ask(client, office, monkeypatch, Reader([], ANSWER))
+    d = diagnostics(client, m)
+    assert d["resolution"] is None and d["timing"]["stages"]["compose"]["calls"] >= 1
+
+
+def test_every_tool_gets_a_timestamped_start_and_a_done_event_that_says_what_it_found(client, office, monkeypatch):
+    m = timed_turn(client, office, monkeypatch)
+    events = [p for p in m["progress"] if p["step"] != "queued"]
+    stamps = [p["at"] for p in events]
+    assert stamps == sorted(stamps) and all(isinstance(t, float) for t in stamps)
+    tools = [(p["step"], bool(p.get("done"))) for p in events if p["step"] in ("search", "read")]
+    assert tools == [("search", False), ("search", True), ("search", False), ("search", True), ("read", False),
+                     ("read", True)]
+    done = [p["label"] for p in events if p.get("done")]
+    assert done[0].startswith("נמצאו ") and "קטעים" in done[0] and done[2] == "נקראו עמודים 2–2"
+    # the start labels stay as they were
+    assert [p["label"] for p in events if p["step"] == "search" and not p.get("done")] == [
+        'מחפש: שווי למ"ר', "מחפש: מבנה הגפן"]
+    # the verification step has no done event: its end is the answer
+    assert events[-1]["step"] == "verify" and "done" not in events[-1]
 
 
 # --- truncated model output ------------------------------------------------------------------------------------
