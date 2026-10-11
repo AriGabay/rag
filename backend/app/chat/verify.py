@@ -145,6 +145,8 @@ unit is still marked as partly verified.
 
 from __future__ import annotations
 
+import bisect
+import dataclasses
 import functools
 import hashlib
 import json
@@ -194,12 +196,20 @@ JUDGE_CALL_CHARS = 30_000  # evidence per judge call; more units go to further c
 JUDGE_MAX_UNITS = 40  # units per judge call (the verdicts must fit the output)
 VERIFY_ALLOWANCE_SECONDS = 60  # verification may run this long past the turn's deadline
 RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures worth one more call
+# The judge contract's version (round 8 KTD7): part of every verdict key, bumped whenever the policy, the schema or what
+# a call renders changes what a verdict means, so a verdict of an older contract is never reused (cached readings are
+# versioned).
+JUDGE_VERSION = 2
+# the reason of a factual claim that cites nothing and that no source shown in the call supports (rule 9, KTD3):
+# neither an external source nor wrong, only not linked to anything the turn read
+NOT_LINKED_REASON = "לא מקושר למקור שנקרא"
 
 JUDGE_POLICY = (
     "אתה בודק עובדות במשרד שמאות. ליחידות הממוספרות מתשובה מצורפים רק המקורות שהן מצטטות (<sources>). קבע לכל "
     "יחידה:\n"
-    "supported — המקורות תומכים בה במלואה; partial — רק בחלקה; unsupported — אינם תומכים, סותרים, או שאין לה "
-    "מקורות למרות שהיא טענה עובדתית (ראה כלל 9); not_factual — אינה טענה עובדתית (פתיח, מעבר, הסתייגות, הצעה, שאלה); "
+    "supported — המקורות תומכים בה במלואה; partial — רק בחלקה; unsupported — המקור שנבדק אינו תומך בה, או שאין "
+    "לה מקורות למרות שהיא טענה עובדתית (ראה כלל 9); contradicts — המקור שנבדק אומר אחרת (ערך, שלילה, תאריך או "
+    "יחידה אחרים; ראה כלל 17); not_factual — אינה טענה עובדתית (פתיח, מעבר, הסתייגות, הצעה, שאלה); "
     "navigation — כותרת, תווית או שורת כותרות של טבלה שרק מכריזה מה בא אחריה (שם נכס, מסמך, נושא או עמודה) ואינה "
     "קובעת דבר. כותרת או תווית שקובעת משהו על נכס, מסמך או ערך (\"הנכס פנוי\", \"השווי נקבע לפי גישת ההשוואה\") "
     "היא טענה ונבדקת ככל טענה; עיצוב, הדגשה או נקודתיים אינם הופכים טענה ללא-עובדתית.\n"
@@ -228,10 +238,12 @@ JUDGE_POLICY = (
     "בו כמה ערכים מאותו סוג לאותה שאלה (למשל שורה אחת מטבלה בת כמה שורות) כאילו הוא הערך היחיד או המייצג, בלי לומר "
     "שהוא דוגמה ובלי היקף הטבלה — partial, עם הסיבה \"ריבוי ערכים\". (7) מסקנה מסומנת (\"מכאן עולה\", \"מכך "
     "נובע\") נבדקת לפי האם היא נובעת מהתוכן המצוטט; אם כן — supported. (8) נתון קרוב שמוצג כאילו הוא הנתון "
-    "שהתבקש (למשל שטח בנוי כתשובה לשאלה על שטח המגרש, בלי לומר שזה נתון אחר) — unsupported. (9) supported_by: "
-    "יחידה שאינה מצטטת דבר, או מצטטת מזהה שאינו תומך בה, ואחד המקורות המוצגים ב-<sources> תומך בה במלואה — "
-    "supported, וב-supported_by ציין את מזהה (id) המקור המוצג שתומך בה; השרת יבדוק ויוסיף את הציטוט. אל תציין "
-    "מקור שלא הוצג. בכל מקרה אחר supported_by ריק. "
+    "שהתבקש (למשל שטח בנוי כתשובה לשאלה על שטח המגרש, בלי לומר שזה נתון אחר) — unsupported. "
+    "(9) supported_by: יחידה שאינה מצטטת דבר, או מצטטת מזהה שאינו תומך בה, והיא טענה עובדתית — שפוט אותה מול כל "
+    "המקורות המוצגים ב-<sources> בקריאה הזו, ולא רק מול מה שציטטה. מקור מוצג תומך בה במלואה — supported, וב-supported_by "
+    "ציין את מזהה (id) המקור המוצג שתומך בה (השרת יבדוק ויוסיף את הציטוט; ציטוט חסר הוא פגם בציטוט ולא בתוכן). אף "
+    "מקור מוצג אינו תומך בה — unsupported, failure absent_from_source, ובסיבה כתוב \"לא מקושר למקור שנקרא\" (לא מקור "
+    "חיצוני, ולא טענה שגויה). אל תציין מקור שלא הוצג. בכל מקרה אחר supported_by ריק. "
     "(10) טענה שמציגה תוצאת חישוב (C#) נבדקת כחישוב ולא כנתון מהמסמך: התוצאה אינה צריכה להופיע במסמך. בדוק את "
     "הקלטים — כל קלט הוא הנתון הנכון לבקשה: אותו נכס או פרויקט, אותו שלב, אותו תרחיש ואותה תקופה (עלות של שלב אחר, "
     "או נתון של נכס השוואה, כקלט של חישוב על הפרויקט כולו — unsupported); את ההנחות — כל הנחה A# היא מה שהמשתמש "
@@ -260,7 +272,29 @@ JUDGE_POLICY = (
     "ביחידה אחרת) — ציין את מספרי ה-index של היחידות שהיא נשענת עליהן, גם יחידות מ-<removed_units>; אחרת ריק. "
     "<removed_units> הן יחידות שהשרת כבר הסיר מהתשובה בבדיקה שלו: אל תשפוט אותן ואל תיתן להן verdict. "
     "(15) כתיבה של אותו מספר במילת סדר גודל (1.53 מיליון ל-1,530,000 במקור) ועיגול נכון שהתשובה מסמנת כמקורב "
-    "(\"כ-14 אלף\" ל-14,250) אינם סיבה לפסול."
+    "(\"כ-14 אלף\" ל-14,250) אינם סיבה לפסול. "
+    "(16) claims: החזר רשימת claims רק ליחידה שיש בה שתי טענות או יותר ש-verdict שלהן שונה, או טענה שאי אפשר להכריע "
+    "בה בלי הקשר שלא הוצג (needs_context, כלל 19). בכל יחידה אחרת claims ריק: ה-verdict של היחידה הוא הטענה היחידה "
+    "שלה, והשרת בונה אותה. ביחידה שטענותיה נבדלות ה-verdict של היחידה הוא partial, עם defect part. "
+    "(17) span: כל טענה ב-claims ניתנת כ-span שהוא תת-מחרוזת מדויקת של טקסט היחידה, תו בתו, בלי שכתוב ובלי קיצור, "
+    "וכולל את השלילה, התנאי, התאריך, היחידה וההסתייגות שמשנים אותה (\"לא הופקד\", \"בכפוף לאישור\", \"ביום 1.1.2020\", "
+    "\"למ\"ר לחודש\"). אל תפצל בפסיק באופן עיוור: מה שנקשר לטענה נשאר בתוכה. kind: datum (נתון מהמקור), computed "
+    "(תוצאת חישוב), inference (מסקנה), absence (טענת היעדר), instruction (טענה שנושאת הוראה או הסתייגות). "
+    "verdict של טענה: supported, partial, unsupported או contradicts. contradicts — המקור שנבדק אומר אחרת (ערך אחר, "
+    "שלילה, תאריך או יחידה אחרים; נתון תחת כותרת \"מצב מוצע\" שהיחידה מציגה כמאושר, כשהמקור אומר מוצע); "
+    "unsupported — המקור שנבדק פשוט אינו תומך בה. ל-contradicts אין צורך ב-failure (השרת רושם contradicts_source); "
+    "ל-unsupported failure כבכלל 13. depends_on של טענה: ה-span של טענה אחרת באותה יחידה, או מספר ה-index של "
+    "יחידה אחרת (כמחרוזת), שהטענה נשענת עליה. "
+    "(18) הקשר: לפני יחידה עשוי להופיע <unit_context unit=\"N\"> עם <heading> (שרשרת הכותרות מעליה, מהחיצונית "
+    "לפנימית), <table_header> (שורת הכותרות של הטבלה שהיחידה שורה בה) ו-<table_intro> (השורה שלפני הטבלה). שפוט את "
+    "היחידה בתוך ההקשר הזה: נתון תחת כותרת \"מצב מוצע\" או \"מוצע\" אינו מאושר או קיים, ושורת טבלה נקראת לפי כותרות "
+    "העמודות שלה. ההקשר אינו טענה ואין בו span. "
+    "(19) needs_context: כשאי אפשר להכריע בלי הקשר שלא הוצג, ה-verdict של הטענה הוא partial (לא unsupported ולא "
+    "contradicts), ו-needs_context אומר מה חסר: heading (כותרת הסעיף), neighbours (פסקאות סמוכות), continuation "
+    "(המשך הסעיף), table_headers (כותרות שורה או עמודה), units_note (הערת יחידות או קנה מידה), footnotes (הערות "
+    "שוליים), next_page (טבלה שממשיכה בעמוד הבא), region (אזור של תמונה או טבלה); אחרת none. "
+    "(20) <server>…</server> בתוך יחידה הוא טקסט שהשרת כתב (סימון של חלק שהושמט, סימון חלקי, הסתייגות, ציטוט שהוסף): "
+    "הוא אינו טענה, אינו נכלל באף span ואינו עילה ל-verdict, לא לטובה ולא לרעה — שפוט את שאר היחידה כאילו היה חסר."
 )
 
 
@@ -406,9 +440,33 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+# the context a claim needs and the judge did not see (KTD1, KTD5): what a bounded re-read would fetch
+NeedsContext = Literal["none", "heading", "neighbours", "continuation", "table_headers", "units_note", "footnotes",
+                       "next_page", "region"]
+ClaimKind = Literal["datum", "computed", "inference", "absence", "instruction"]
+ClaimVerdict = Literal["supported", "partial", "unsupported", "contradicts"]
+# why a verdict's claims were replaced by its one whole-unit claim (``unit_claims``)
+CLAIM_FALLBACKS = ("span_not_in_unit", "empty_span")
+
+
+class JudgeClaim(_Strict):
+    """One claim of a unit with its own verdict (round 8 KTD1, R4, R6): ``span`` is an exact substring of the unit's
+    text, with the negation, condition, date, unit and caveat that qualify it (R9). Every field but ``span`` has a
+    default, so a reply that leaves one out stays valid; the strict schema still requires them all."""
+
+    span: str
+    kind: ClaimKind = "datum"
+    verdict: ClaimVerdict = "supported"
+    failure: JudgeFailure = "none"
+    needs_context: NeedsContext = "none"
+    # the spans of other claims of the unit, or the indexes of other units (as strings), this claim rests on
+    depends_on: list[str] = Field(default_factory=list)
+
+
 class JudgeVerdict(_Strict):
     index: int
-    verdict: Literal["supported", "partial", "unsupported", "not_factual", "navigation"]
+    # ``contradicts``: the checked source says otherwise; ``unsupported``: it does not support the unit (round 8 R6)
+    verdict: Literal["supported", "partial", "unsupported", "contradicts", "not_factual", "navigation"]
     reason: str
     # for a supported unit that does not cite its support: the shown sources that support it (the server checks
     # them and cites them). A factory default: optional for a reply, still required by the strict schema.
@@ -419,6 +477,9 @@ class JudgeVerdict(_Strict):
     failure: JudgeFailure = "none"
     # the units of this call (removed ones included) whose claims this unit's conclusion rests on (KTD10, R15)
     depends_on: list[int] = Field(default_factory=list)
+    # only for a unit holding two or more claims with different verdicts, or a claim that needs context (round 8
+    # KTD1); empty otherwise, and the server builds the unit's single whole-unit claim (``unit_claims``)
+    claims: list[JudgeClaim] = Field(default_factory=list)
 
 
 class JudgeOutput(_Strict):
@@ -607,27 +668,46 @@ def _match(old: list[str], new: list[tuple[int, str]]) -> dict[int, int]:
 
 
 def _headings_above(markdown: str, units: list[Unit]) -> dict[int, str]:
-    """For each unit, the nearest heading or label line above its line (without citations): what it is about."""
-    out: dict[int, str] = {}
-    for u in units:
-        line_start = markdown.rfind("\n", 0, u.start) + 1
-        above = markdown[:line_start].split("\n")
-        out[u.index] = next((" ".join(_IDS.sub("", ln).split()) for ln in reversed(above) if _heading_line(ln)), "")
-    return out
+    """For each unit, the chain of headings above its line (without citations), outermost first, joined by " › ":
+    the Markdown headings that enclose it by level, then the nearest label or numbered heading under them. What it is
+    about (R7): "מצב מוצע" under "נתוני תכנון" is another context than the same sentence under "מצב מאושר"."""
+    lines = markdown.split("\n")
+    starts = [0]
+    for line in lines:
+        starts.append(starts[-1] + len(line) + 1)
+    stack: list[tuple[int, str]] = []  # the Markdown headings open at this line: (level, text)
+    label = ""  # the nearest label or numbered heading since the last Markdown heading
+    chains: list[str] = []  # the chain above each line
+    for line in lines:
+        if not _heading_line(line):
+            chains.append(" › ".join([t for _, t in stack] + ([label] if label else [])))
+            continue
+        text = " ".join(_IDS.sub("", line).replace("**", "").split())
+        m = re.match(r"\s*(#{1,6})\s+", line)
+        if m:  # a heading closes its siblings and everything deeper, and the label under them
+            while stack and stack[-1][0] >= len(m.group(1)):
+                stack.pop()
+            label = ""
+        chains.append(" › ".join(t for _, t in stack))  # a heading's own chain: the headings it sits under
+        if m:
+            stack.append((len(m.group(1)), text[len(m.group(1)):].strip()))
+        else:
+            label = text
+    return {u.index: chains[min(max(bisect.bisect_right(starts, u.start) - 1, 0), len(lines) - 1)] for u in units}
 
 
 def unit_key(unit: Unit, ws: Workspace, request: str, heading: str, digests: dict[str, str]) -> str:
     """What a unit's verdict depends on: its text, the ids it cites with the content of each (``digests``, filled
-    per id), its context (a table row's header row and the line before its table; the heading above it) and the
-    request."""
+    per id), its context (a table row's header row and the line before its table; the heading chain above it), the
+    request and the judge contract's version (``JUDGE_VERSION``)."""
     evidence = []
     for i in sorted(set(unit.ids)):
         if i not in digests:
             parts = _source_parts(ws, i)
             digests[i] = hashlib.sha256("\x1f".join(parts).encode()).hexdigest() if parts else "unknown"
         evidence.append((i, digests[i]))
-    raw = json.dumps([" ".join(unit.text.split()), evidence, unit.context, heading, unit.table_header, request],
-                     ensure_ascii=False)
+    raw = json.dumps([" ".join(unit.text.split()), evidence, unit.context, heading, unit.table_header, request,
+                      JUDGE_VERSION], ensure_ascii=False)
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -650,6 +730,10 @@ class Unit:
     table_header: bool = False  # a Markdown table's header row (column names — or a claim, judged as one)
     table_span: tuple[int, int] | None = None  # for a table row: the span of its whole table (with separator)
     context: str = ""  # for a table row: the table's header row and the line before the table
+    heading: str = ""  # the heading chain above the unit (``_headings_above``), set by ``split_units``
+    # server-written spans inside the unit (a marker, a qualifier, an inserted citation), shown to the judge as
+    # ``<server>`` elements: never claims and never grounds for a verdict (round 8 KTD1). None until a composer sets them.
+    server: list[str] = field(default_factory=list)
 
 
 def repair_key(unit: Unit) -> str:
@@ -761,6 +845,9 @@ class VerifyReport:
     completeness: dict | None = None
     reused: int = 0  # units whose verdict came from an earlier round of the turn (``VerdictCache``)
     verdicts: dict[int, str] = field(default_factory=dict)  # the judge's verdict on each unit it judged, by index
+    # the validated claims of each judged unit, by index (round 8 KTD1, ``unit_claims``): informational until the
+    # claim records and the edit ladder (U3, U4) act on them
+    claims: dict[int, list[UnitClaim]] = field(default_factory=dict)
     # the server's gap paragraph, grouped by reason (``coverage.gap_groups``), set once the final answer is stated
     gaps: list[dict] = field(default_factory=list)
     # calculation components waiting for a detail only the user can give (round 7 KTD9): id -> the parameters no
@@ -1338,7 +1425,11 @@ def split_units(markdown: str) -> list[Unit]:
                 continue
             units.append(Unit(len(units), part, clean, list(dict.fromkeys(ids)), base + a, base + a + len(part),
                               header_row, table_span, context))
-    return _attach_bare_lines(markdown, units)
+    units = _attach_bare_lines(markdown, units)
+    chains = _headings_above(markdown, units)
+    for u in units:
+        u.heading = chains[u.index]
+    return units
 
 
 # a bare answer to a yes/no question ("לא.", "**כן**", "נכון חלקית") — a conclusion verified with the sentence that
@@ -2254,8 +2345,7 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
                 chosen.append(best.cid)
         if not chosen:
             continue
-        trial = Unit(u.index, u.raw, u.text, [*u.ids, *chosen], u.start, u.end, u.table_header, u.table_span,
-                     u.context)
+        trial = dataclasses.replace(u, ids=[*u.ids, *chosen])
         if _unstated(trial, ws, question_numbers, set(), stated_by=stated_by) or _framed_result(trial, ws):
             continue
         u.ids.extend(chosen)
@@ -2440,6 +2530,37 @@ def _workspace_listing(ws: Workspace, turn: TurnRequirements) -> tuple[str, set[
     return text, {i for i, _ in lines}
 
 
+def _unit_context(u: Unit) -> str:
+    """What stands above a unit, for the judge (R7): the chain of headings above it, and for a table row the table's
+    header row and the line before the table. Beside the unit, never in its text, so a span is judged on the text
+    alone; empty (nothing rendered) for a unit with neither."""
+    header, _, intro = u.context.partition("\n")
+    parts = [(tag, value.strip()) for tag, value in (("heading", u.heading), ("table_header", header),
+                                                     ("table_intro", intro)) if value.strip()]
+    if not parts:
+        return ""
+    return (f'<unit_context unit="{u.index}">\n'
+            + "".join(f"<{tag}>{prompt_text(value)}</{tag}>\n" for tag, value in parts) + "</unit_context>\n")
+
+
+def _unit_text(u: Unit) -> str:
+    """A unit's text for the judge, with its registered server spans marked ``<server>…</server>``: in place when the
+    text holds the span, otherwise (an inserted citation) on a line after the text. The rest is escaped as any
+    document text."""
+    text = u.text
+    out, appended = [], []
+    pos = 0
+    for span in u.server:
+        at = text.find(span, pos) if span else -1
+        if at < 0:
+            appended.append(span)
+            continue
+        out.append(prompt_text(text[pos:at]) + f"<server>{prompt_text(span)}</server>")
+        pos = at + len(span)
+    out.append(prompt_text(text[pos:]))
+    return "".join(out) + "".join(f"\n<server>{prompt_text(span)}</server>" for span in appended if span)
+
+
 def _render_batch(batch: _Batch, ws: Workspace, coverage: _Coverage | None = None) -> str:
     """The judge input: every cited source once (its evidence for this batch's units), then the units, then — in a
     turn — the request, its requirements (to derive or to score) and its instructions, and the workspace."""
@@ -2456,8 +2577,10 @@ def _render_batch(batch: _Batch, ws: Workspace, coverage: _Coverage | None = Non
         text_, excerpt = select(claims, body, kind, narrow=batch.narrow)
         blocks.append(f'<source id="{sid}" excerpt="{"true" if excerpt else "false"}" title="{prompt_attr(head)}">\n'
                       f"{prompt_text(text_)}\n</source>")
-    # after a unit showing a result of a conditional calculation: the qualifier the server writes next to it
-    units = [f'<unit index="{u.index}" cites="{prompt_attr(",".join(u.ids))}">\n{prompt_text(u.text)}\n</unit>'
+    # before a unit: the headings above it and its table row's header (R7); after a unit showing a result of a
+    # conditional calculation: the qualifier the server writes next to it
+    units = [_unit_context(u) + f'<unit index="{u.index}" cites="{prompt_attr(",".join(u.ids))}">\n'
+             f'{_unit_text(u)}\n</unit>'
              + "".join(f'\n<server_qualifier unit="{u.index}">({prompt_text(note)})</server_qualifier>'
                        for _, _, note in conditional_notes(u, ws))
              for u in batch.units]
@@ -2567,8 +2690,7 @@ def _named_support(unit: Unit, named: list[str], ws: Workspace, question: str) -
     """The deterministic checks of a unit that cites ``named`` too (numbers, VAT, the meaning of each number,
     against their full text): the judge's naming of a support is accepted only if the unit, cited so, passes them.
     None when it does; otherwise the problem, on the unit itself."""
-    cited = Unit(unit.index, unit.raw, unit.text, [*unit.ids, *named], unit.start, unit.end, unit.table_header,
-                 unit.table_span, unit.context)
+    cited = dataclasses.replace(unit, ids=[*unit.ids, *named])
     failed = deterministic([cited], ws, question, {unit.index: meaning.check(cited, ws)})
     if not failed:
         return None
@@ -2698,6 +2820,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     if to_judge:
         report.judged, report.judge_status = True, "ok"
         report.verdicts = {u.index: verdicts[u.index].verdict for u in to_judge if u.index in verdicts}
+        report.claims = {u.index: unit_claims(u, verdicts[u.index], ws) for u in to_judge if u.index in verdicts}
         for u in to_judge:
             v = verdicts.get(u.index)
             if v is None:
@@ -2710,7 +2833,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
             if v.verdict in ("not_factual", "navigation"):
                 if not _non_claim_accepted(u, v.verdict):
                     report.problems.append(Problem(u, NOT_CLASSIFIED, failure_kind="not_checked", check="judge"))
-            elif v.verdict == "unsupported":
+            elif v.verdict in ("unsupported", "contradicts"):
                 report.problems.append(Problem(u, "לא נתמך במקורות: " + v.reason, failure_kind=_judged_failure(u, v, ws),
                                                check="judge"))
             elif v.verdict == "partial":
@@ -2746,10 +2869,74 @@ def computed_ids(ws: Workspace) -> dict[str, set[str]]:
     return out
 
 
+@dataclass(frozen=True)
+class UnitClaim:
+    """A claim of a judged unit as the server validated it (round 8 KTD1): ``span`` is an exact substring of the unit's
+    text, or the whole text (``whole_unit``) — the judge's only claim for a unit it returned none for, or the
+    fallback (``fallback`` names why) when a span it returned did not hold. ``verdict`` is the judge's claim verdict
+    (or, for a whole-unit claim, the unit's own, ``not_factual`` and ``navigation`` included)."""
+
+    span: str
+    kind: str
+    verdict: str
+    failure: str = "none"
+    needs_context: str = "none"
+    depends_on: tuple[str, ...] = ()
+    whole_unit: bool = False
+    fallback: str = ""
+
+
+def _whole_unit_claim(u: Unit, v: JudgeVerdict, ws: Workspace | None, fallback: str = "") -> UnitClaim:
+    """The unit's single claim, carrying the unit's verdict: a computed result when the unit cites a calculation
+    (``C#``), else a datum."""
+    failure = "none"
+    if v.verdict in ("unsupported", "contradicts"):
+        failure = _judged_failure(u, v, ws) if ws is not None else (
+            "contradicts_source" if v.verdict == "contradicts" else v.failure if v.failure != "none"
+            else "absent_from_source")
+    kind = "computed" if any(i.startswith("C") for i in u.ids) else "datum"
+    return UnitClaim(u.text, kind, v.verdict, failure, whole_unit=True, fallback=fallback)
+
+
+def _claim_span(u: Unit, span: str) -> str | None:
+    """The span as it stands in the unit's text, or None. The judge sees the text through ``prompt_text`` (angle
+    brackets as ‹ ›), so a span is also read back into the unit's own characters; nothing else is normalised."""
+    if not span.strip():
+        return None
+    if span in u.text:
+        return span
+    back = span.replace("‹", "<").replace("›", ">")
+    return back if back in u.text else None
+
+
+def unit_claims(u: Unit, v: JudgeVerdict, ws: Workspace | None = None) -> list[UnitClaim]:
+    """A unit's verdict as claims (KTD1, R4, R9): the judge's ``claims``, each with a span that is an exact substring
+    of the unit's text; a verdict with no claims is one whole-unit claim carrying the unit's verdict. When any span is
+    empty or not in the unit, the judge's claims cannot be trusted to divide the unit, and the verdict falls back to
+    the one whole-unit claim with the reason recorded (``UnitClaim.fallback``): the unit then stands or falls as a
+    whole, as before, never on a span the server could not find."""
+    if not v.claims:
+        return [_whole_unit_claim(u, v, ws)]
+    out: list[UnitClaim] = []
+    for c in v.claims:
+        span = _claim_span(u, c.span)
+        if span is None:
+            return [_whole_unit_claim(u, v, ws, "empty_span" if not c.span.strip() else "span_not_in_unit")]
+        failure = "contradicts_source" if c.verdict == "contradicts" else c.failure
+        if c.verdict == "unsupported" and failure == "none":
+            failure = "absent_from_source"
+        out.append(UnitClaim(span, c.kind, c.verdict, failure, c.needs_context,
+                             tuple(d for d in dict.fromkeys(x.strip() for x in c.depends_on) if d and d != span)))
+    return out
+
+
 def _judged_failure(u: Unit, v: JudgeVerdict, ws: Workspace) -> str:
-    """The failure kind of a judge's ``unsupported`` verdict (KTD5): the one it named; else, for a unit resting on a
+    """The failure kind of a judge's ``unsupported`` or ``contradicts`` verdict (KTD5): ``contradicts_source`` for the
+    latter; else the one it named; else, for a unit resting on a
     calculation, a wrong calculation, on a value read uncertainly, an uncertain reading, and otherwise absent from
     the source."""
+    if v.verdict == "contradicts":
+        return "contradicts_source"  # the checked source says otherwise: the one failure kind for it
     if v.failure != "none":
         return v.failure
     if any(i in ws.computations for i in u.ids):

@@ -197,8 +197,6 @@ def _recording_judge(seen: list[str]) -> ScriptedProvider:
     return _scripted(respond)
 
 
-@pytest.mark.xfail(strict=True, reason="U2 (R7): _render_batch renders only the unit's text, so the judge never sees "
-                                       "the heading ('מצב מוצע') above 'תכסית 40%'")
 def test_ae4_the_judge_input_for_a_sentence_carries_the_heading_above_it(monkeypatch):
     _one_unit_per_call(monkeypatch)  # the heading is judged in a call of its own: the sentence's call is only its own
     seen: list[str] = []
