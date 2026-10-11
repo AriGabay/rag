@@ -95,6 +95,7 @@ from pydantic import BaseModel, ConfigDict
 from app.chat import coverage, entities, resolve
 from app.chat import request as request_analysis
 from app.chat import tools as T
+from app.chat.compose import ServerSpan, compose
 from app.chat.verify import (
     VERIFY_ALLOWANCE_SECONDS,
     TurnRequirements,
@@ -240,7 +241,9 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
 
 REPAIR = """בדיקת האימות של התשובה מצאה בעיות (ליד כל טענה: סוג הכשל, המזהים שנבדקו ואיך לתקן):
 {problems}
-תקן את התשובה: הסר או נסח מחדש כל טענה שאינה נתמכת במקורות, וצטט רק מזהים שקיבלת. אפשר להשתמש בכלים לבדיקה נוספת
+תקן את התשובה: הסר או נסח מחדש כל טענה שאינה נתמכת במקורות, וצטט רק מזהים שקיבלת. משפט שליד הבעיה שלו כתוב
+"לשמור כלשונם" ו"לתקן": העתק את הטענות לשמירה בלי שינוי (עם השלילה, התנאי, התאריך והיחידה שלהן), ותקן או הסר רק
+את הטענות לתיקון — אל תנסח מחדש את הטענה שנתמכה. אפשר להשתמש בכלים לבדיקה נוספת
 (למשל לפתוח את הקטע שבו הנתון כתוב). שמור את המידע וההבחנות שכבר נתמכו במקורות. כשמשפט משווה שני נתונים ורק
 מראה המקום של אחד מהם חסר או שגוי, תקן את ההפניה לאותו נתון מתוך המקורות שקראת (או פתח את המקור שלו), בלי להשמיט
 את ההבחנה שהמשתמש ביקש. השמט תוכן רק אם אין לו תמיכה גם לאחר הבדיקה. חלק של הבקשה שהתשובה לא נתנה — השלם אותו: מהנתונים שכבר נמצאו (וחשב ב-calculate
@@ -251,7 +254,8 @@ REPAIR = """בדיקת האימות של התשובה מצאה בעיות (לי�
 
 REWRITE = """גם התשובה המתוקנת לא אומתה במלואה. אלה המשפטים שלא נמצאה להם תמיכה:
 {problems}
-כתוב תשובה סופית קוהרנטית שמשתמשת רק בתוכן שאומת ובמראי המקום שלו. אל תוסיף טענות חדשות. אם נקודה חשובה לשאלה לא
+כתוב תשובה סופית קוהרנטית שמשתמשת רק בתוכן שאומת ובמראי המקום שלו. משפט שליד הבעיה שלו כתוב "לשמור כלשונם" ו"לתקן":
+השאר את הטענות לשמירה כלשונן, והשמט את הטענות לתיקון אם אי אפשר לתמוך בהן. אל תוסיף טענות חדשות. אם נקודה חשובה לשאלה לא
 אומתה, השמט אותה — השרת יציין אחרי התשובה מה לא ניתן ולמה. החזר באותו מבנה."""
 
 
@@ -415,6 +419,9 @@ class TurnOutcome:
     summary: dict = field(default_factory=dict)  # the turn's totals (``usage_summary``), no content
     # a clarification's pending parameter (round 7 KTD9), stored on the message so the next reply is bound to it
     pending: dict | None = None
+    # the spans of the final Markdown the server wrote (round 8 U4: ``compose.ServerSpan``, offsets and a fixed kind, never
+    # text), for the final check, the saved message and the history of a later turn
+    server_spans: list[ServerSpan] = field(default_factory=list)
 
 
 def usage_summary(usage: list[dict], **extra) -> dict:
@@ -579,19 +586,20 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         # gap paragraph after the answer (round 7 U3) — then the limits reached and the coverage ledger. Each decision
         # records whether a repair round was asked to fix its unit (round 7 U4, KTD5)
         report.mark_repairs(repaired)
-        final, outcomes = coverage.state_components(ws, answer, report, turn)
+        # all of it in one composer (round 8 U4, KTD6), which records every span the server wrote; the cited documents
+        # are marked verified once, from the final text
+        composed = compose(ws, answer, report, turn, question=inp.question, limit_sentences=_limit_sentences(limits))
+        final, outcomes, ledger = composed.answer, composed.outcomes, composed.ledger
         report.completeness = coverage.completeness(outcomes)
-        final = _state_limits(final, limits)
-        ledger: dict = {}
         if final.status != "clarification":
-            ledger, final = coverage.build(ws, final, inp.question)
+            coverage.touch_verified(ws, final.answer_markdown)
             ledger["requirements"] = outcomes
             ledger["gap_documents"] = coverage.gap_documents(outcomes)
             ledger["requirements_origin"] = turn.record_origin()
         return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
                            request.as_dict() if request is not None else None,
                            request.resolution if request is not None else None, _summary(usage, rounds, reused, turn),
-                           _pending(ws, turn, final))
+                           _pending(ws, turn, final), composed.spans)
 
     pending: request_analysis.Pending | None = None
 
@@ -795,15 +803,10 @@ def _summary(usage: list[dict], rounds: list, reused: int, turn: TurnRequirement
     return summary
 
 
-def _state_limits(answer: FinalAnswer, limits: list[str]) -> FinalAnswer:
-    """The verified answer of a turn that reached a limit: a sentence naming each limit after it, and a status of
-    at most ``partial`` — never an answer that looks complete (R30). A clarification asks; it claims nothing."""
-    sentences = [LIMIT_SENTENCES[k] for k in LIMIT_SENTENCES if k in limits]
-    if not sentences or answer.status == "clarification":
-        return answer
-    body = answer.answer_markdown.strip()
-    return answer.model_copy(update={"answer_markdown": (body + "\n\n" if body else "") + " ".join(sentences),
-                                     "status": "partial"})
+def _limit_sentences(limits: list[str]) -> list[str]:
+    """The sentence of each limit the turn reached, in the order of ``LIMIT_SENTENCES``: the composer writes them after
+    the verified answer and caps its status at ``partial`` — never an answer that looks complete (R30)."""
+    return [LIMIT_SENTENCES[k] for k in LIMIT_SENTENCES if k in limits]
 
 
 def _announce(progress: Callable[[str, str], None], call) -> None:

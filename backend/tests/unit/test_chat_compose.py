@@ -1,0 +1,215 @@
+"""One composer for every edit after the model's answer (round 8 U4, KTD6): the server's words are recorded as spans of
+the final Markdown — offsets and a fixed kind, never text — and the registry indexes the FINAL text exactly, whatever was
+cut, collapsed or appended after the span was written. The judge and the model are scripted; synthetic text only."""
+
+from __future__ import annotations
+
+import re
+import uuid
+
+from app.chat import coverage
+from app.chat.compose import MARKER, SERVER_KINDS, Doc, compose
+from app.chat.engine import FinalAnswer
+from app.chat.tools import Workspace
+from app.chat.verify import TurnRequirements, verify_answer
+from app.providers.llm import Purpose
+from tests.support.scripted_provider import ScriptedProvider
+from tests.unit.test_coverage import _by_words
+from tests.unit.test_coverage import _judge as _scored_judge
+
+SOURCE = ("סיכום: השווי למ\"ר הוא 9,500 ₪. דמי השכירות הם 55 ₪ למ\"ר לחודש. דמי הניהול הם 12 ₪ למ\"ר. "
+          "הנכס פנוי.")
+
+
+def _ws(*texts: str) -> Workspace:
+    ws = Workspace(ctx=None)
+    for t in texts or (SOURCE,):
+        ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="דוח בדיקה", section="סיכום",
+                      location="סעיף \"סיכום\"", kind="context", text=t)
+    return ws
+
+
+def _answer(markdown: str, status: str = "answered") -> FinalAnswer:
+    return FinalAnswer(status=status, answer_markdown=markdown, claims=[], clarification_question="",
+                       missing_info="", referenced_document_ids=[], scope_kind="focused", scope_query="", omitted=[],
+                       focus=None, requested=[], parts=[])
+
+
+def _judge(respond) -> ScriptedProvider:
+    """``respond(text) -> verdict dict fields`` per unit (the index is added)."""
+    p = ScriptedProvider()
+
+    def answer(instructions: str, input: str) -> dict:
+        return {"verdicts": [{"index": int(i), "reason": "בדיקה"} | respond(t)
+                             for i, t in re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S)]}
+
+    p.on(Purpose.VERIFY, answer, repeat=True)
+    return p
+
+
+def _texts(markdown: str, spans) -> list[tuple[str, str]]:
+    return [(s.kind, markdown[s.start:s.end]) for s in spans]
+
+
+# --- the span-tracking text -------------------------------------------------------------------------------------------
+
+def test_a_doc_keeps_its_spans_exact_through_splices_deletions_and_whitespace_clean_up():
+    d = Doc("  א ב ג\n\n\n\nד ה  ")
+    d.splice(4, 5, "[X]", "citation")  # ב -> the server's [X]
+    d.delete([(0, 2)])
+    d.append("\n\nסוף", "limit_sentence")
+    d.tidy_blank_lines()
+    assert d.text == "א [X] ג\n\nד ה  \n\nסוף"
+    assert _texts(d.text, d.spans()) == [("citation", "[X]"), ("limit_sentence", "\n\nסוף")]
+    assert d.masked() == "א  ג\n\nד ה  "
+
+
+def test_the_ordinal_of_a_marker_follows_its_place_after_an_earlier_one_is_removed():
+    d = Doc("א ב ג")
+    d.splice(0, 1, MARKER.format(n=7), "marker", ("c1",))
+    d.splice(len(d.text) - 1, len(d.text), MARKER.format(n=9), "marker", ("c2",))
+    first = d.spans()[0]
+    d.delete([(first.start, first.end)])  # the first marker goes (its unit was removed)
+    assert d.renumber("marker", MARKER) == [(1, ("c2",))]
+    assert d.text == " ב " + MARKER.format(n=1)
+    assert _texts(d.text, d.spans()) == [("marker", MARKER.format(n=1))]
+
+
+def test_every_server_kind_is_a_fixed_word_and_a_span_of_an_unknown_kind_is_refused():
+    assert len(set(SERVER_KINDS)) == len(SERVER_KINDS) == 11
+    try:
+        Doc("x").splice(0, 0, "y", "free text")
+    except AssertionError:
+        return
+    raise AssertionError("a kind outside SERVER_KINDS was accepted")
+
+
+# --- the report's own edits: markers, partial marks, qualifiers, citations, notes, the replacement ------------------
+
+def _kinds_report():
+    """One answer with a span cut, a citation the server inserts, a partly supported sentence, a removed sentence and
+    a request that does not match: every kind ``VerifyReport.edit`` writes but the replacement."""
+    a = _answer("הנכס פנוי, והוא מושכר [S1].\nהשווי למ\"ר הוא 9,500 ₪.\nדמי השכירות הם 55 ₪ למ\"ר לחודש [S1].\n"
+                "דמי הניהול הם 12 ₪ למ\"ר [S1].")
+
+    def respond(text: str) -> dict:
+        if "מושכר" in text:
+            return {"verdict": "partial", "defect": "part", "claims": [{"span": "הנכס פנוי", "verdict": "supported"},
+                                                                       {"span": "והוא מושכר", "verdict": "unsupported"}]}
+        if text.startswith("השווי"):
+            return {"verdict": "supported", "supported_by": ["S1"]}
+        if "דמי השכירות" in text:
+            return {"verdict": "partial", "defect": "none"}
+        return {"verdict": "unsupported", "failure": "absent_from_source"}
+
+    r = verify_answer(_judge(respond), a, _ws(), "?", [], mismatch="שווי במקום שכירות")
+    return a, r
+
+
+def test_the_registry_of_a_reports_edits_indexes_the_final_text_exactly_for_every_kind_it_writes():
+    a, r = _kinds_report()
+    edited = r.edit(a)
+    text, spans = edited.doc.text, edited.doc.spans()
+    assert [k for k, _ in _texts(text, spans)] == ["marker", "citation", "partial_mark", "removal_note", "request_note"]
+    assert dict(_texts(text, spans)) == {
+        "marker": MARKER.format(n=1), "citation": " [S1]", "partial_mark": " *(אומת חלקית)*",
+        "removal_note": "\n\n> הוסרו מהתשובה 1 טענות שלא נמצאה להן תמיכה במקורות.",
+        "request_note": "\n\n> **שימו לב:** התשובה אינה מציגה את הנתון שהתבקש: שווי במקום שכירות."}
+    # nothing but those spans is the server's: with them masked, what is left is the model's text, minus the cuts
+    assert edited.doc.masked() == ("הנכס פנוי,  [S1].\nהשווי למ\"ר הוא 9,500 ₪.\n"
+                                   "דמי השכירות הם 55 ₪ למ\"ר לחודש [S1].")
+    assert text.startswith("הנכס פנוי, " + MARKER.format(n=1))
+
+
+def test_a_qualifier_written_from_the_source_is_a_span_and_the_model_text_around_it_is_untouched():
+    qualified = "בפרק התחשיב: השווי למ\"ר אקוו' לנכס ברחוב הצאלון 7 נקבע ל-14,250 ₪, ללא מע\"מ."
+    a = _answer("השווי למ\"ר בצאלון 7 הוא 14,250 ₪ [S1].")
+    r = verify_answer(_judge(lambda t: {"verdict": "supported"}), a, _ws(qualified), "?", [])
+    edited = r.edit(a)
+    assert edited.doc.text == "השווי למ\"ר בצאלון 7 הוא 14,250 ₪ (מ״ר אקוו׳, כפי שנכתב במקור) [S1]."
+    assert _texts(edited.doc.text, edited.doc.spans()) == [("qualifier", " (מ״ר אקוו׳, כפי שנכתב במקור)")]
+    assert edited.doc.masked() == a.answer_markdown
+
+
+def test_an_answer_nothing_of_which_is_supported_is_replaced_and_the_replacement_is_one_span():
+    a = _answer("הנכס מושכר [S1].")
+    r = verify_answer(_judge(lambda t: {"verdict": "unsupported", "failure": "absent_from_source"}), a, _ws(), "?", [])
+    edited = r.edit(a)
+    assert edited.doc.text == "לא הצלחתי לבסס תשובה על המקורות." and edited.status == "partial"
+    assert _texts(edited.doc.text, edited.doc.spans()) == [("replacement", edited.doc.text)]
+    assert edited.doc.masked() == ""
+
+
+def test_an_answer_with_nothing_to_edit_has_no_server_span():
+    a = _answer("הנכס פנוי [S1].")
+    r = verify_answer(_judge(lambda t: {"verdict": "supported"}), a, _ws(), "?", [])
+    edited = r.edit(a)
+    assert edited.doc.text == a.answer_markdown and edited.doc.spans() == [] and r.apply(a).answer_markdown == a.answer_markdown
+
+
+# --- compose: the gap paragraph, the limit sentence and the coverage note join the same registry -----------------------
+
+def test_compose_registers_the_gap_paragraph_the_limit_sentence_and_the_coverage_note_with_exact_offsets(monkeypatch):
+    note = "> **כיסוי:** לא כל המסמכים המתאימים נבדקו."
+    monkeypatch.setattr(coverage, "build", lambda ws, answer, question: (
+        {"note": note}, answer.model_copy(update={"answer_markdown": answer.answer_markdown + "\n\n" + note})))
+    ws = _ws()
+    ws.searches.append("דמי ניהול")
+    turn = TurnRequirements()
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nדמי השכירות הם 55 ₪ למ\"ר לחודש [S1].\nהנכס מושכר [S1].")
+    p = _scored_judge(_by_words({"השווי למ\"ר": {}, "דמי הניהול": {"related": ["H1"]}}),
+                      rule=lambda t: "unsupported" if "מושכר" in t else "supported")
+    r = verify_answer(p, a, ws, "מה השווי למ\"ר ומה דמי הניהול?", [], requirements=turn)
+    limit = "החיפוש והקריאה נעצרו במספר הצעדים המרבי."
+    out = compose(ws, a, r, turn, question="?", limit_sentences=[limit])
+    text = out.answer.answer_markdown
+    got = _texts(text, out.spans)
+    assert [k for k, _ in got] == ["removal_note", "gap_paragraph", "limit_sentence", "coverage_note"], got
+    by_kind = dict(got)
+    assert by_kind["gap_paragraph"].strip() == "**דמי הניהול** לא נמצא בחיפוש במסמכים שנבדקו."
+    assert by_kind["limit_sentence"].strip() == limit and by_kind["coverage_note"].strip() == note
+    assert by_kind["removal_note"].strip().startswith("> הוסרו מהתשובה 1 טענות")
+    # every span lies inside the text and none overlaps another
+    ends = [0] + [x for s in out.spans for x in (s.start, s.end)]
+    assert ends == sorted(ends) and out.spans[-1].end == len(text)
+    # the model's text is all that is left outside the spans
+    model = "".join(text[a_:b_] for a_, b_ in zip([0] + [s.end for s in out.spans], [s.start for s in out.spans] + [len(text)],
+                                                    strict=True))
+    assert model == "השווי למ\"ר הוא 9,500 ₪ [S1].\nדמי השכירות הם 55 ₪ למ\"ר לחודש [S1]."
+    assert out.answer.status == "partial" and out.outcomes and out.ledger == {"note": note}
+
+
+def test_a_membership_note_is_its_own_kind(monkeypatch):
+    note = "> **כיסוי:** רשימת 3 מסמכים נבדקה."
+    monkeypatch.setattr(coverage, "build", lambda ws, answer, question: (
+        {"membership": True}, answer.model_copy(update={"answer_markdown": answer.answer_markdown + "\n\n" + note})))
+    a = _answer("הנכס פנוי [S1].")
+    r = verify_answer(_judge(lambda t: {"verdict": "supported"}), a, _ws(), "?", [])
+    out = compose(_ws(), a, r, TurnRequirements(), question="?")
+    assert _texts(out.answer.answer_markdown, out.spans) == [("membership_note", "\n\n" + note)]
+
+
+def test_a_clarification_keeps_its_question_and_gets_no_ledger_or_span(monkeypatch):
+    monkeypatch.setattr(coverage, "build", lambda *a: (_ for _ in ()).throw(AssertionError("no ledger for a question")))
+    a = _answer("מהו שיעור ההיוון שברצונך להשתמש בו?", "clarification")
+    r = verify_answer(_judge(lambda t: {"verdict": "not_factual"}), a, _ws(), "?", [])
+    out = compose(_ws(), a, r, TurnRequirements(), question="?", limit_sentences=["משפט מגבלה"])
+    assert out.answer.answer_markdown == a.answer_markdown and out.answer.status == "clarification"
+    assert out.spans == [] and out.ledger == {}
+
+
+def test_the_ledger_marks_a_cited_document_verified_only_when_the_engine_asks(monkeypatch):
+    import contextlib
+
+    from app.platform import search
+
+    monkeypatch.setattr(coverage, "tenant_tx", lambda ctx: contextlib.nullcontext(None))
+    monkeypatch.setattr(search, "documents_named", lambda conn, q: {})
+    monkeypatch.setattr(search, "documents_sharing_title_words", lambda conn, q: {})
+    ws = _ws()
+    doc = str(ws.sources["S1"].document_id)
+    a = _answer("הנכס פנוי [S1].")
+    ledger, built = coverage.build(ws, a, "?")  # the real ledger: it no longer touches the workspace
+    assert doc not in ws.activity and ledger["cited"][0]["document_id"] == doc and built.answer_markdown == a.answer_markdown
+    coverage.touch_verified(ws, built.answer_markdown)  # the engine's step, once, for the final text's documents
+    assert ws.activity[doc]["level"] == "verified"

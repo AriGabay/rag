@@ -91,24 +91,28 @@ AREA = "השטח העיקרי בתא שטח 1 הוא 1,200 מ״ר"
 AREA_SOURCE = "תא שטח 1: השטח העיקרי הוא 1,200 מ״ר."
 
 
-@pytest.mark.xfail(strict=True, reason="U4 (R8, R10): VerifyReport.apply cuts the whole sentence of a failed unit "
-                                       "(_sentence_cuts), so the supported 1,200 m² goes with the unsupported clause")
 @pytest.mark.parametrize("sentence, unsupported", [
-    # the approval date is a number the source never states: the deterministic number check fails the unit
+    # the approval date is a number the source never states: the deterministic number check finds it, the judge splits
+    # the unit (it is shown the number as <unstated>), and only the clause holding it is cut
     (f"{AREA}, שאושר ביום 1.1.2020 [S1].", "1.1.2020"),
-    # the clause carries no number: the judge fails the unit (the source has no approval at all)
-    (f"{AREA}, שאושר בוועדה המחוזית [S1].", "שאושר"),
+    # the clause carries no number: the judge fails it (the source has no approval at all)
+    (f"{AREA}, שאושר בוועדה המחוזית [S1].", "שאושר בוועדה"),
 ], ids=["number_clause", "judge_clause"])
 def test_ae1_a_mixed_sentence_keeps_its_supported_claim_and_cuts_only_the_failing_part(sentence, unsupported):
-    def respond(input: str) -> dict:  # the real judge finds the area supported and the approval absent: unit fails
-        return {"verdicts": [_verdict(i, "unsupported", "תאריך האישור אינו במקור", failure="absent_from_source")
+    clause = sentence.removeprefix(AREA + ", ").removesuffix(" [S1].")
+
+    def respond(input: str) -> dict:  # the real judge finds the area supported and the approval absent: a mixed unit
+        return {"verdicts": [{"index": i, "verdict": "partial", "reason": "תאריך האישור אינו במקור", "defect": "part",
+                              "claims": [{"span": AREA, "verdict": "supported"},
+                                         {"span": clause, "verdict": "unsupported", "failure": "absent_from_source"}]}
                              for i in _units(input)]}
 
     answer = _answer(sentence)
     report = verify_answer(_scripted(respond), answer, _ws(AREA_SOURCE), "מה השטח העיקרי בתא שטח 1?", [])
     final_text = report.apply(answer).answer_markdown
     assert "1,200" in final_text and "תא שטח 1" in final_text and "מ״ר" in final_text, final_text
-    assert unsupported not in final_text, final_text
+    assert unsupported not in final_text and "חלק שלא אומת הושמט" in final_text, final_text
+    assert report.ok  # nothing for a repair round: the cut is the server's
 
 
 # --- AE2 (R2): a supported but uncited datum is repaired with a citation, never removed ----------------------------

@@ -77,6 +77,7 @@ from app.chat.tools import READ_TO_END, value_uncertain
 from app.db import tenant_tx
 
 if TYPE_CHECKING:
+    from app.chat.compose import Edited
     from app.chat.engine import FinalAnswer
     from app.chat.tools import Workspace
     from app.chat.verify import TurnRequirements
@@ -126,10 +127,12 @@ def ledger_documents(ledger: dict | None) -> set[str]:
     return ids
 
 
-def _level(ws: Workspace, document_id: str) -> str:
+def _level(ws: Workspace, document_id: str, verified: Collection[str] = ()) -> str:
+    """The deepest level the turn reached in a document; one in ``verified`` (the documents the final text cites) is
+    ``verified`` whether or not the engine has recorded it yet (``touch_verified``)."""
     from app.chat.tools import NOT_REACHED
 
-    return (ws.activity.get(document_id) or {}).get("level", NOT_REACHED)
+    return "verified" if document_id in verified else (ws.activity.get(document_id) or {}).get("level", NOT_REACHED)
 
 
 def _read(ws: Workspace, document_id: str) -> bool:
@@ -602,32 +605,45 @@ def _append(answer: FinalAnswer, lines: list[str]) -> FinalAnswer:
                                      "status": status})
 
 
-def state_components(ws: Workspace, answer: FinalAnswer, report,
-                     turn: TurnRequirements | None = None) -> tuple[FinalAnswer, list[dict]]:
-    """The verified answer as the server finishes it (round 7 U3, ``engine.finish``), in order: the units that failed
-    removed (``VerifyReport.apply``); each component's outcome recomputed from the surviving units with its reason
-    (``component_outcomes``); the units stating an absence of a component the server states removed
-    (``VerifyReport.supersede``, then applied again); and one gap paragraph after the answer (``gap_groups``). A
-    component not given makes the answer at most ``partial``. Returns the answer, tidied, and the outcomes (none
-    for a clarification, which asks and states nothing)."""
-    final = report.apply(answer)
+def compose_components(ws: Workspace, answer: FinalAnswer, report,
+                       turn: TurnRequirements | None = None) -> tuple[Edited, list[dict]]:
+    """The verified answer as the server finishes it (round 7 U3, ``engine.finish``), in order, through one ``Doc``
+    that records what the server writes (round 8 U4): the units that failed cut or removed (``VerifyReport.edit``);
+    each component's outcome recomputed from the surviving units with its reason (``component_outcomes``); the units
+    stating an absence of a component the server states removed (``VerifyReport.supersede``, then edited again from the
+    original); and one gap paragraph after the answer (``gap_groups``). A component not given makes the answer at most
+    ``partial``. Returns the edits, tidied, and the outcomes (none for a clarification, which asks and states
+    nothing)."""
+    edited = report.edit(answer)
     if answer.status == "clarification":
-        return final, []
-    outcomes = component_outcomes(ws, report, final, turn, answer.requested) if report.requirements else []
+        return edited, []
+    outcomes = component_outcomes(ws, report, edited.answer(answer), turn, answer.requested) if report.requirements else []
     if outcomes and report.supersede(outcomes):
-        final = report.apply(answer)
-        outcomes = component_outcomes(ws, report, final, turn, answer.requested)
+        edited = report.edit(answer)
+        outcomes = component_outcomes(ws, report, edited.answer(answer), turn, answer.requested)
     if outcomes:  # the instruction plane from the components as stated, beside the content and completeness planes
         report.instructions = report.instruction_plane(outcomes)
     items = [o for o in outcomes if o["stated"]] + ([] if report.requirements else _unlinked_gaps(ws, answer.requested))
     groups = gap_groups(items)
     report.gaps = groups
     lines = [g["text"] for g in groups]
+    doc = edited.doc
     if lines:
-        final = _append(final, lines)
-    elif any(not o["children"] and o["status"] in UNMET for o in outcomes) and final.status == "answered":
-        final = final.model_copy(update={"status": "partial"})
-    return final.model_copy(update={"answer_markdown": tidy(final.answer_markdown)}), outcomes
+        doc.tidy_blank_lines()
+        doc.append(("\n\n" if doc.text else "") + "\n".join(lines), "gap_paragraph")
+        edited.status = "partial" if edited.status == "answered" else edited.status
+    elif any(not o["children"] and o["status"] in UNMET for o in outcomes) and edited.status == "answered":
+        edited.status = "partial"
+    doc.delete(tidy_cuts(doc.text))
+    doc.tidy_blank_lines()
+    return edited, outcomes
+
+
+def state_components(ws: Workspace, answer: FinalAnswer, report,
+                     turn: TurnRequirements | None = None) -> tuple[FinalAnswer, list[dict]]:
+    """``compose_components`` as the answer and the outcomes, without the registry of the server's spans."""
+    edited, outcomes = compose_components(ws, answer, report, turn)
+    return edited.answer(answer), outcomes
 
 
 def gap_documents(outcomes: list[dict]) -> list[dict]:
@@ -665,22 +681,36 @@ def completeness(outcomes: list[dict]) -> dict | None:
 _ORPHAN_LINE = re.compile(r"(?:[-*+]|\d{1,3}[.)]|>)?\s*(?:\*\*|__)?\s*(?:\*\*|__)?")
 
 
+def tidy_cuts(markdown: str) -> list[tuple[int, int]]:
+    """The lines ``tidy`` drops, as ranges (each with its newline): a line left with nothing but markup, and a prose
+    line repeated; tables are kept as they are."""
+    out: list[tuple[int, int]] = []
+    seen: set[str] = set()
+    lines = markdown.split("\n")
+    pos = 0
+    for n, line in enumerate(lines):
+        start, end = pos, pos + len(line)
+        pos = end + 1
+        s = line.strip()
+        if s and not s.startswith("|"):
+            drop = bool(_ORPHAN_LINE.fullmatch(s))
+            if not drop and re.search(r"[א-תA-Za-z0-9]", s):
+                drop = s in seen
+                seen.add(s)
+            if drop:
+                out.append((start, end + 1) if n + 1 < len(lines) else (max(start - 1, 0), end))
+    return out
+
+
 def tidy(markdown: str) -> str:
     """The answer without the remnants of removals and additions (R22): a line left with nothing but markup, and a
     prose line repeated (an absence sentence said twice); tables are kept as they are."""
-    out: list[str] = []
-    seen: set[str] = set()
-    for line in markdown.split("\n"):
-        s = line.strip()
-        if s and not s.startswith("|"):
-            if _ORPHAN_LINE.fullmatch(s):
-                continue
-            if re.search(r"[א-תA-Za-z0-9]", s):
-                if s in seen:
-                    continue
-                seen.add(s)
-        out.append(line)
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+    from app.chat.compose import Doc
+
+    doc = Doc(markdown)
+    doc.delete(tidy_cuts(markdown))
+    doc.tidy_blank_lines()
+    return doc.text
 
 
 def tables_presented(ws: Workspace, markdown: str) -> list[dict]:
@@ -746,8 +776,18 @@ def _membership(ws: Workspace, answer: FinalAnswer, ids: set[str]) -> tuple[dict
         "answer_markdown": (answer.answer_markdown.rstrip() + "\n\n> " + note).strip(), "status": status})
 
 
+def touch_verified(ws: Workspace, markdown: str) -> None:
+    """A document whose datum the final text cites is ``verified`` (its datum passed verification: what failed was
+    removed before this). The one side effect the coverage ledger had: made once, by the engine, after the answer is
+    composed (``build`` only reads), so the final check (round 8 U6) can run first."""
+    for doc, title in cited_documents(ws, markdown).items():
+        ws.touch(doc, title, "verified")
+
+
 def build(ws: Workspace, answer: FinalAnswer, question: str) -> tuple[dict, FinalAnswer]:
-    """The coverage ledger of the answer, and the answer with the coverage note and status cap when needed."""
+    """The coverage ledger of the answer, and the answer with the coverage note and status cap when needed. It reads
+    the workspace and changes nothing in it: the documents the answer cites count as ``verified`` in the ledger
+    (``_level``) before the engine records it (``touch_verified``)."""
     from app.chat.tools import LEVELS, new_scope
     from app.platform.search import (
         documents_matching,
@@ -756,8 +796,7 @@ def build(ws: Workspace, answer: FinalAnswer, question: str) -> tuple[dict, Fina
     )
 
     cited = cited_documents(ws, answer.answer_markdown)
-    for doc, title in cited.items():  # its datum passed verification (what failed was removed before this)
-        ws.touch(doc, title, "verified")
+    verified = set(cited)  # the documents whose datum the final text cites; ``touch_verified`` records them, once
     ids = cited_ids(answer.answer_markdown)
     if ids and all(i in ws.sources and ws.sources[i].is_listing for i in ids):
         return _membership(ws, answer, ids)
@@ -781,7 +820,7 @@ def build(ws: Workspace, answer: FinalAnswer, question: str) -> tuple[dict, Fina
                          (ws.activity.get(doc) or {}).get("title"))
             omitted.append({"document_id": doc if title else None, "title": title, "what": o.what, "why": o.why})
         explained = {o["document_id"] for o in omitted if o["document_id"]}
-        levels = {m["document_id"]: _level(ws, m["document_id"]) for m in matching}
+        levels = {m["document_id"]: _level(ws, m["document_id"], verified) for m in matching}
         reached = [m for m in matching if levels[m["document_id"]] in LEVELS[1:]]
         reached_ids = {m["document_id"] for m in reached}
         with_data = [m for m in matching if m["document_id"] in cited]
@@ -789,7 +828,7 @@ def build(ws: Workspace, answer: FinalAnswer, question: str) -> tuple[dict, Fina
         retrieved_only = [m for m in reached if not _read(ws, m["document_id"])]
         not_checked = [m for m in matching if m["document_id"] not in reached_ids]
         unused = [m for m in reached if m["document_id"] not in cited and m["document_id"] not in explained]
-        partially = [m for m in reached if ws.activity[m["document_id"]]["partial"]]
+        partially = [m for m in reached if (ws.activity.get(m["document_id"]) or {}).get("partial")]
         # document coverage: a verified datum (or an explained omission) from every document of the set
         complete = bool(matching) and not not_checked and not unused and not partially
         ledger |= {"scope_query": scope["query"], "matching": matching, "levels": levels, "read": read,

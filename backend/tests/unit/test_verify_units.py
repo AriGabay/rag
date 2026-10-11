@@ -849,3 +849,231 @@ def test_a_bare_answer_goes_with_its_supporting_sentence_when_that_sentence_fail
     applied = r.apply(a)
     assert applied.answer_markdown.startswith("הסף שנקבע הוא 15% [S1].")
     assert "כן" not in applied.answer_markdown.split("\n")[0]
+
+
+# --- the edit ladder (round 8 U4: KTD4; R8, R9, R10, R12) ------------------------------------------------------------
+# A sentence is never removed whole when only part of it fails: a missing citation is attached, a failing claim's span
+# is cut (a server marker in its place), a unit that cannot be cut is rewritten (the repair rounds), and only a unit
+# nothing of which stands is removed — as the logged last resort.
+
+AREA_SOURCE = "תא שטח 1: השטח העיקרי הוא 1,200 מ״ר. הנכס פנוי."
+AREA = "השטח העיקרי בתא שטח 1 הוא 1,200 מ״ר"
+MARKER_1 = "«[1: חלק שלא אומת הושמט]»"
+MARKER_2 = "«[2: חלק שלא אומת הושמט]»"
+
+
+def _claims_judge(verdicts) -> ScriptedProvider:
+    """A judge that answers each unit by ``verdicts(text)``: None (supported), or the claims of a mixed unit as
+    [(span, verdict, extra)], the unit's verdict ``partial`` with defect ``part`` (rule 16)."""
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        out = []
+        for m in re.finditer(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S):
+            claims = verdicts(m.group(2))
+            if claims is None:
+                out.append({"index": int(m.group(1)), "verdict": "supported", "reason": "בדיקה"})
+            else:
+                out.append({"index": int(m.group(1)), "verdict": "partial", "reason": "חלקי", "defect": "part",
+                            "claims": [{"span": s, "verdict": v} | extra for s, v, *rest in claims
+                                       for extra in [rest[0] if rest else {}]]})
+        return {"verdicts": out}
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    return p
+
+
+def _mixed_area(sentence: str, bad: str):
+    return lambda text: [(AREA, "supported"), (bad, "unsupported")] if bad in text else None
+
+
+def test_ae1_a_failing_clause_is_cut_to_a_marker_and_the_supported_claim_stays_with_its_plot_and_unit():
+    bad = "שאושר בוועדה המחוזית"
+    a = _answer(f"{AREA}, {bad} [S1].")
+    r = verify_answer(_claims_judge(_mixed_area(a.answer_markdown, bad)), a, _ws(AREA_SOURCE), "?", [])
+    # the cut is the server's: it neither fails the report nor starts a repair round
+    assert r.ok and not r.removed_units() and not any(p.repairable for p in r.problems)
+    assert r.repair_keys() == set() and r.problems_text() == ""  # a repair prompt would have nothing to say of it
+    out = r.apply(a).answer_markdown
+    assert out == f"{AREA}, {MARKER_1} [S1]."
+    assert [(c.text, c.action) for c in r.claims[0]] == [(AREA, "kept"), (bad, "cut")]
+    assert r.claims[0][1].marker == 1 and r.claims[0][0].marker == 0
+    # the marker is a registered server span, and nothing else is
+    edited = r.edit(a)
+    assert [(s.kind, edited.doc.text[s.start:s.end]) for s in edited.doc.spans()] == [("marker", MARKER_1)]
+    assert r.correctness() == "partial" and "אומת חלקית" not in out  # claims were cut, the rest is whole
+
+
+def test_a_failing_span_that_holds_a_negation_is_cut_whole_and_the_supported_claim_is_intact():
+    a = _answer("הנכס פנוי, והוא לא מושכר לטווח ארוך [S1].")
+    judge = _claims_judge(lambda t: [("הנכס פנוי", "supported"), ("והוא לא מושכר לטווח ארוך", "unsupported")])
+    r = verify_answer(judge, a, _ws(AREA_SOURCE), "?", [])
+    out = r.apply(a).answer_markdown
+    assert out == f"הנכס פנוי, {MARKER_1} [S1]."
+    assert "מושכר" not in out  # no negated remainder is left to read as a different claim
+
+
+def test_a_unit_with_only_failing_claims_is_removed_whole_as_the_last_resort_and_the_actions_say_so():
+    a = _answer("הנכס פנוי [S1].\nהנכס מושכר, והשכירות גבוהה [S1].")
+    judge = _claims_judge(lambda t: [("הנכס מושכר", "unsupported"), ("והשכירות גבוהה", "unsupported")]
+                          if "מושכר" in t else None)
+    r = verify_answer(judge, a, _ws(AREA_SOURCE), "?", [])
+    assert r.removed_units() == {1} and not r.ok  # a rewrite is still tried first (repairable), then it goes
+    out = r.apply(a).answer_markdown
+    assert "מושכר" not in out and "«" not in out and out.startswith("הנכס פנוי [S1].\n\n> הוסרו")
+    assert [c.action for c in r.claims[1]] == ["removed", "removed"] and r.claims[0][0].action == "kept"
+
+
+def test_a_failing_claim_that_cannot_be_cut_alone_takes_the_unit_with_it():
+    # the supported claim contains the failing one: a cut of the failing span would cut into the supported claim
+    a = _answer("הנכס פנוי ומושכר לטווח ארוך [S1].")
+    judge = _claims_judge(lambda t: [("הנכס פנוי ומושכר לטווח ארוך", "supported"), ("מושכר", "unsupported")])
+    r = verify_answer(judge, a, _ws(AREA_SOURCE), "?", [])
+    assert r.removed_units() == {0} and not r.ok
+    assert r.apply(a).answer_markdown == "לא הצלחתי לבסס תשובה על המקורות."
+    # …and the rewrite round is told which claims to keep verbatim and which to fix
+    text = r.problems_text()
+    assert "לשמור כלשונם: «הנכס פנוי ומושכר לטווח ארוך»" in text and "לתקן: «מושכר»" in text
+
+
+def test_a_claim_resting_on_the_cut_claim_goes_with_it_in_one_marker():
+    sentence = "שטח הנכס הוא 1,000 מ\"ר, ולכן חורג מהסף, והנכס פנוי [S1]."
+
+    def respond(text):
+        return [("שטח הנכס הוא 1,000 מ\"ר", "contradicts"), ("ולכן חורג מהסף", "supported", {"depends_on": [
+            "שטח הנכס הוא 1,000 מ\"ר"]}), ("והנכס פנוי", "supported")]
+
+    a = _answer(sentence)
+    r = verify_answer(_claims_judge(respond), a, _ws("שטח הנכס 1,200 מ\"ר. הסף 1,000 מ\"ר. הנכס פנוי."), "?", [])
+    assert r.ok and not r.removed_units()
+    assert r.apply(a).answer_markdown == f"{MARKER_1}, והנכס פנוי [S1]."
+    assert [c.marker for c in r.claims[0]] == [1, 1, 0]
+
+
+def test_markers_are_numbered_in_the_order_of_their_place_in_the_final_text():
+    a = _answer("הנכס פנוי, והוא מושכר [S1].\nהשווי למ\"ר הוא 9,500 ₪ [S1].\nדמי הניהול הם 12 ₪ למ\"ר, והם כוללים מע\"מ [S1].")
+    judge = _claims_judge(lambda t: [("הנכס פנוי", "supported"), ("והוא מושכר", "unsupported")] if "מושכר" in t
+                          else [("דמי הניהול הם 12 ₪ למ\"ר", "supported"), ("והם כוללים מע\"מ", "unsupported")]
+                          if "כוללים" in t else None)
+    r = verify_answer(judge, a, _ws(SOURCE + " דמי הניהול הם 12 ₪ למ\"ר."), "?", [])
+    out = r.apply(a).answer_markdown
+    assert out.index(MARKER_1) < out.index(MARKER_2) and out.count("חלק שלא אומת הושמט") == 2
+    assert [c.marker for u in (0, 2) for c in r.claims[u] if c.action == "cut"] == [1, 2]
+
+
+def test_a_cut_does_not_remove_a_citation_inside_the_sentence():
+    a = _answer("הנכס פנוי [S1], והוא מושכר [S2].")
+    judge = _claims_judge(lambda t: [("הנכס פנוי", "supported"), ("והוא מושכר", "unsupported")])
+    r = verify_answer(judge, a, _ws(SOURCE, SOURCE), "?", [])
+    assert r.apply(a).answer_markdown == f"הנכס פנוי [S1], {MARKER_1} [S2]."
+
+
+def test_a_span_inside_a_table_row_is_cut_only_within_one_cell():
+    md = "| נכס | הערה |\n|---|---|\n| הגפן | פנוי ומושכר [S1] |"
+    a = _answer(md)
+    r = verify_answer(_claims_judge(lambda t: [("פנוי", "supported"), ("ומושכר", "unsupported")] if "הגפן" in t
+                                    else None), a, _ws(SOURCE), "?", [])
+    assert r.apply(a).answer_markdown == f"| נכס | הערה |\n|---|---|\n| הגפן | פנוי {MARKER_1} [S1] |"
+    across = _answer("| נכס | הערה |\n|---|---|\n| הגפן | פנוי | מושכר [S1] |")
+    r = verify_answer(_claims_judge(lambda t: [("הגפן", "supported"), ("פנוי | מושכר", "unsupported")] if "הגפן" in t
+                                    else None), across, _ws(SOURCE), "?", [])
+    assert r.removed_units() == {1}  # a span across cells would break the table: the row is rewritten, then removed
+
+
+# --- tables and headings after edits (R12) --------------------------------------------------------------------------
+
+PARTS_SOURCE = "טבלת רכיבים: רכיב א 100 ₪, רכיב ב 200 ₪, רכיב ג 50 ₪, סה״כ 350 ₪."
+PARTS = ("| רכיב | סכום |\n|---|---|\n| רכיב א | 100 ₪ [S1] |\n| רכיב ב | 200 ₪ [S1] |\n| רכיב ג | 50 ₪ [S1] |\n"
+         "| סה״כ | 350 ₪ [S1] |")
+
+
+def test_a_removed_row_under_a_total_row_qualifies_the_total():
+    a = _answer(PARTS)
+    r = verify_answer(_judge(lambda t: "unsupported" if "רכיב ב" in t else "supported"), a, _ws(PARTS_SOURCE), "?", [])
+    edited = r.edit(a)
+    assert edited.doc.text == (
+        "| רכיב | סכום |\n|---|---|\n| רכיב א | 100 ₪ [S1] |\n| רכיב ג | 50 ₪ [S1] |\n"
+        "| סה״כ (הסכום כולל שורה שהוסרה) | 350 ₪ [S1] |\n\n> הוסרו מהתשובה 1 טענות שלא נמצאה להן תמיכה במקורות.")
+    assert [s.kind for s in edited.doc.spans()] == ["qualifier", "removal_note"]
+
+
+def test_a_cut_inside_a_component_row_qualifies_the_total_too():
+    a = _answer(PARTS)
+    r = verify_answer(_claims_judge(lambda t: [("רכיב ב", "supported"), ("200 ₪", "unsupported")] if "רכיב ב" in t
+                                    else None), a, _ws(PARTS_SOURCE), "?", [])
+    out = r.apply(a).answer_markdown
+    assert f"| רכיב ב | {MARKER_1} [S1] |" in out and "| סה״כ (הסכום כולל שורה שחלק ממנה הושמט) | 350 ₪" in out
+
+
+def test_a_total_row_is_left_alone_when_every_component_row_stands():
+    a = _answer(PARTS)
+    r = verify_answer(_judge(lambda t: "supported"), a, _ws(PARTS_SOURCE), "?", [])
+    assert r.apply(a).answer_markdown == PARTS
+
+
+def test_a_table_left_with_its_header_only_is_removed_with_its_header_and_the_heading_over_it():
+    md = "הנכס פנוי [S1].\n\n## הרכיבים\n\n| רכיב | סכום |\n|---|---|\n| רכיב א | 100 ₪ [S1] |\n| רכיב ב | 200 ₪ [S1] |"
+    a = _answer(md)
+    r = verify_answer(_judge(lambda t: "unsupported" if "רכיב" in t and "|" in t and "סכום" not in t else "supported"),
+                      a, _ws(PARTS_SOURCE, AREA_SOURCE), "?", [])
+    out = r.apply(a).answer_markdown
+    assert "|" not in out and "הרכיבים" not in out and out.startswith("הנכס פנוי [S1].\n\n> הוסרו מהתשובה 2 טענות")
+
+
+# --- a unit failed only for numbers no cited source states is split by the judge, not removed up front -------------------
+
+DATE_CLAUSE = "שאושר ביום 1.1.2020"
+AREA_AND_DATE = f"{AREA}, {DATE_CLAUSE} [S1]."
+
+
+def _recording_judge(claims) -> tuple[ScriptedProvider, list[str]]:
+    seen: list[str] = []
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        seen.append(input)
+        return {"verdicts": [{"index": int(i), "verdict": "partial", "reason": "חלקי", "defect": "part",
+                              "claims": claims} for i in re.findall(r'<unit index="(\d+)"', input)]}
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    return p, seen
+
+
+def test_an_unstated_number_is_named_to_the_judge_and_only_its_claim_is_cut():
+    a = _answer(AREA_AND_DATE)
+    judge, seen = _recording_judge([{"span": AREA, "verdict": "supported"}, {"span": DATE_CLAUSE, "verdict": "unsupported"}])
+    r = verify_answer(judge, a, _ws(AREA_SOURCE), "?", [])
+    assert '<unstated unit="0">1.1.2020</unstated>' in seen[0] and "<unstated" in verify.JUDGE_POLICY
+    assert r.ok and not r.removed_units()
+    assert r.apply(a).answer_markdown == f"{AREA}, {MARKER_1} [S1]."
+
+
+def test_the_claim_holding_an_unstated_number_fails_even_when_the_judge_calls_it_supported():
+    a = _answer(AREA_AND_DATE)
+    judge, _ = _recording_judge([{"span": AREA, "verdict": "supported"}, {"span": DATE_CLAUSE, "verdict": "supported"}])
+    r = verify_answer(judge, a, _ws(AREA_SOURCE), "?", [])
+    ok, bad = r.claims[0]
+    assert (ok.verdict, bad.verdict, bad.failure_kind(), bad.action) == ("supported", "unsupported", "absent_from_source", "cut")
+    assert "1.1.2020" in r.problems[0].reason and "מספרים שאינם מופיעים במקורות המצוטטים" in r.problems[0].reason
+    assert r.apply(a).answer_markdown == f"{AREA}, {MARKER_1} [S1]."
+
+
+@pytest.mark.parametrize("claims", [
+    [],  # the judge did not split the unit
+    [{"span": AREA_AND_DATE.removesuffix(" [S1]."), "verdict": "supported"}],  # its only claim holds the number
+    [{"span": AREA, "verdict": "supported"}, {"span": "שאושר", "verdict": "unsupported"}],  # no claim holds it
+], ids=["no_claims", "only_claim", "none_holds_it"])
+def test_a_unit_the_judge_does_not_split_around_the_unstated_number_fails_whole(claims):
+    a = _answer(AREA_AND_DATE)
+    judge, _ = _recording_judge(claims)
+    r = verify_answer(judge, a, _ws(AREA_SOURCE), "?", [])
+    (removal,) = r.removals()
+    assert removal.check == "unstated_number" and removal.failure_kind == "absent_from_source"
+    assert r.removed_units() == {0} and [c.action for c in r.claims[0]] == ["removed"]
+
+
+def test_a_unit_that_is_only_the_unstated_number_is_removed_whole_without_a_judge_call():
+    usage: list = []
+    a = _answer("גובה הבניין 99 מטר [S1].")
+    r = verify_answer(_judge(lambda t: "supported"), a, _ws(AREA_SOURCE), "?", usage)
+    assert usage == [] and r.removed_units() == {0} and r.removals()[0].check == "unstated_number"

@@ -361,6 +361,14 @@ def test_a_computed_claim_that_fails_a_deterministic_check_is_a_wrong_calculatio
     assert "C1" in decision.checked_ids
 
 
+def test_a_computation_mismatch_is_removed_up_front_even_when_the_unit_holds_more_content():
+    # only a number no source states is left to the judge to split; a result that is not the computation's is not
+    report, _ = _verify(_scenario(), "הרווח בתרחיש יהיה 1,600,000 ₪ [C1], וכל הנתונים האלה נבדקו מול המסמכים שנקראו בתור הזה.")
+    (decision,) = report.removals()
+    assert (decision.failure_kind, decision.check) == ("wrong_calculation", "computation_mismatch")
+    assert 0 not in report.verdicts and report.units[0].unstated == []
+
+
 def test_a_judges_unsupported_computed_claim_is_a_wrong_calculation_unless_it_names_another_kind():
     question = "מה יהיה שיעור הרווח מהעלויות אם העלויות יעלו ב-5%?"
     report, _ = _verify(_scenario(), "הרווח בתרחיש הוא 12.3% מהעלויות [C2].", rule=lambda text: "unsupported",

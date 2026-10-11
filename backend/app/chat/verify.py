@@ -148,6 +148,18 @@ citation state (the instruction plane, ``VerifyReport.instructions``), action �
 factual unit is judged against the turn's already-read sources that hold its numbers or words (``_unit_candidates``);
 a failing claim is a ``Problem`` carrying its ``claim_id``; a claim resting on a failing claim fails with it
 (``_claim_cascade``); a claim that could not be checked has one of three causes (``NOT_CHECKED_CAUSES``).
+
+The edit ladder (round 8 U4, KTD4, R8–R12): a unit with a failing claim is never removed whole while a supported claim
+of it can stay. The first step that applies wins: (1) attach — a missing citation is attached, a qualifier written
+(``needs_citation``, ``annotatable``); (2) cut a span — the failing claim's span, an exact range of the answer, is
+replaced by a server marker «[N: חלק שלא אומת הושמט]», only when it is one claim, the unit keeps a supported claim, and
+no standing claim overlaps or rests on it (``plan_edits``); (3) rewrite — the repair and rewrite rounds, whose prompts
+name the claims to keep verbatim and the ones to fix, for a unit that needs one; (4) remove the unit — the logged last
+resort, for a unit nothing of which stands or whose failing claim cannot be cut. What steps 1 and 2 resolve is not
+``repairable``: it neither fails ``report.ok`` nor starts a repair round. Each claim's ``action`` records which step
+touched it. Tables and headings are checked after the edits (R12): a table left with its header only goes, a total row
+whose component row went or was cut is qualified, an orphan heading goes. All of it is written through one composer
+(``app.chat.compose``) that records every server-written span.
 """
 
 from __future__ import annotations
@@ -164,9 +176,11 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.answering.verify import _DATE as _DATE_AT
 from app.answering.verify import _NUMBER as _NUM_AT  # one reading of numbers for both checks
 from app.answering.verify import numbers_in
 from app.chat import meaning
+from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited
 from app.chat.evidence import select
 from app.chat.request import ID_PREFIX, Aspect, Kind
 from app.measurements.extract import stance_label
@@ -206,7 +220,7 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # The judge contract's version (round 8 KTD7): part of every verdict key, bumped whenever the policy, the schema or what
 # a call renders changes what a verdict means, so a verdict of an older contract is never reused (cached readings are
 # versioned).
-JUDGE_VERSION = 3
+JUDGE_VERSION = 4
 # an uncited factual unit is judged against the sources the turn already read (round 8 KTD3, R2): the sources of the
 # turn whose text holds its numbers or content words are shown beside it as candidates, bounded so the call stays
 # within ``JUDGE_CALL_CHARS``. How many candidates a unit gets, how many characters one candidate may show, and how
@@ -310,7 +324,10 @@ JUDGE_POLICY = (
     "(המשך הסעיף), table_headers (כותרות שורה או עמודה), units_note (הערת יחידות או קנה מידה), footnotes (הערות "
     "שוליים), next_page (טבלה שממשיכה בעמוד הבא), region (אזור של תמונה או טבלה); אחרת none. "
     "(20) <server>…</server> בתוך יחידה הוא טקסט שהשרת כתב (סימון של חלק שהושמט, סימון חלקי, הסתייגות, ציטוט שהוסף): "
-    "הוא אינו טענה, אינו נכלל באף span ואינו עילה ל-verdict, לא לטובה ולא לרעה — שפוט את שאר היחידה כאילו היה חסר."
+    "הוא אינו טענה, אינו נכלל באף span ואינו עילה ל-verdict, לא לטובה ולא לרעה — שפוט את שאר היחידה כאילו היה חסר. "
+    "(21) <unstated unit=\"N\">…</unstated> לפני יחידה מונה מספרים שהשרת בדק ומצא שאינם מופיעים באף מקור שהיחידה "
+    "מצטטת. טענה שמכילה מספר כזה היא unsupported (failure absent_from_source) אלא אם מקור מוצג מציין אותו; החזר "
+    "claims כך שהטענה עם המספר הזה היא span משלה, והטענות האחרות של היחידה נשפטות בנפרד."
 )
 
 
@@ -449,6 +466,10 @@ NOT_CHECKED = "הטענה לא נבדקה מול המקורות"
 NOT_CHECKED_FAILED = "הטענה לא נבדקה מול המקורות: הבדיקה לא הושלמה ({status})"
 NOT_CLASSIFIED = "טענה סווגה כלא-עובדתית או ככותרת; לא אומתה"
 DEPENDS_ON_REMOVED = "מסקנה שנשענת על טענה שהוסרה באימות (\"{text}\")"
+# the server's qualifier after a total row whose component row went, or lost a claim (round 8 R12): the total was
+# computed over what the table showed before the edit, and says so
+TOTAL_ROW_REMOVED = " (הסכום כולל שורה שהוסרה)"
+TOTAL_ROW_CUT = " (הסכום כולל שורה שחלק ממנה הושמט)"
 # the server's qualifier next to a result of a conditional calculation (R18, R24, R28): built from the calculation's
 # own record — the uncertain inputs it was computed from, the mix its justification covered — and never more
 CONDITIONAL_LEAD = "תוצאה מותנית: "
@@ -773,6 +794,9 @@ class Unit:
     # ``<server>`` elements: never claims and never grounds for a verdict (round 8 KTD1). None until a composer sets them.
     server: list[str] = field(default_factory=list)
     id: str = ""  # a stable id from the unit's content, not its position (``assign_ids``, round 8 KTD2)
+    # numbers no cited source states, found by the deterministic check in a unit that also holds other content: the
+    # unit goes to the judge with them named (``<unstated>``), and the claim holding one fails (``fail_unstated``)
+    unstated: list[str] = field(default_factory=list)
 
 
 def _norm(text: str) -> str:
@@ -853,6 +877,11 @@ class Problem:
     claim_id: str = ""
     cause: str = ""
     basis: str = ""  # for a dependency: the id of the claim whose removal took this one's basis away
+    # the step of the edit ladder that resolves it without a rewrite (``plan_edits``): "cut" — the failing claim's span
+    # is replaced by a marker; "" — not resolved by the server
+    resolution: str = ""
+    # for ``unstated_number``: every number of the unit that no cited source states (the reason names five at most)
+    unstated: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.checked_ids is None:
@@ -872,8 +901,8 @@ class Problem:
     @property
     def repairable(self) -> bool:
         """Whether it takes a repair round (KTD10): not a citation the server attaches or a qualifier it writes in
-        from the source, nor a partly supported unit whose judge named no concrete defect (it stays marked)."""
-        if self.kind in ("needs_citation", "absence") or self.annotatable:
+        from the source, a claim whose span it cuts (``resolution``), nor a partly supported unit whose judge named no concrete defect (it stays marked)."""
+        if self.kind in ("needs_citation", "absence") or self.annotatable or self.resolution == "cut":
             return False
         return not (self.severity == "partial" and self.defect == "none")
 
@@ -893,7 +922,8 @@ class Problem:
         return {"text": self.unit.raw[:300], "reason": self.reason, "severity": self.severity, "kind": self.kind,
                 "failure_kind": self.failure_kind, "check": self.check, "component": self.component,
                 "checked_ids": list(self.checked_ids or []), "repair_attempted": self.repair_attempted,
-                "claim_id": self.claim_id, "cause": self.cause, "basis": self.basis}
+                "claim_id": self.claim_id, "cause": self.cause, "basis": self.basis,
+                "resolution": self.resolution}
 
     def summary(self) -> dict:
         """The removal on the user's normal path (KTD5): its kind, its component and the server's fixed sentence."""
@@ -947,6 +977,8 @@ class VerifyReport:
     # the numbers a unit citing it must show (empty: none needed); None outside a turn's verification, where it is
     # not known
     computed: dict[str, set[str]] | None = None
+    # the spans the edit ladder cuts, by unit index (``plan_edits``): each a range of the answer and the claims in it
+    cuts: dict[int, list[CutGroup]] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -1022,8 +1054,8 @@ class VerifyReport:
                 p.repair_attempted = repair_key(p.unit) in attempted
 
     def repair_keys(self, claims_only: bool = False) -> set[str]:
-        """The units the repair prompt (``problems_text``) names."""
-        return {repair_key(p.unit) for p in self.problems if p.unit.index >= 0
+        """The units the repair prompt (``problems_text``) names: not one whose failing claim the server cuts."""
+        return {repair_key(p.unit) for p in self.problems if p.unit.index >= 0 and p.resolution != "cut"
                 and not (claims_only and p.kind == "requirement")}
 
     def conditional_units(self) -> set[int]:
@@ -1064,8 +1096,35 @@ class VerifyReport:
     def problems_text(self, claims_only: bool = False) -> str:
         """The problems for the repair prompt; ``claims_only``: without the requirements to complete (a rewrite
         from verified content cannot add them; it can still meet an instruction)."""
-        return "\n".join("- " + (f"\"{p.unit.raw[:200]}\": " if p.unit.raw else "") + p.reason + p.repair_note()
-                         for p in self.problems if not (claims_only and p.kind == "requirement"))
+        lines, told = [], set()
+        for p in self.problems:
+            if (claims_only and p.kind == "requirement") or p.resolution == "cut":
+                continue  # a requirement a rewrite cannot complete; a span the server cuts needs no fix
+            note = "" if p.unit.index in told else self._claims_note(p.unit.index)
+            told.add(p.unit.index)
+            lines.append("- " + (f"\"{p.unit.raw[:200]}\": " if p.unit.raw else "") + p.reason + p.repair_note() + note)
+        return "\n".join(lines)
+
+    def _claims_note(self, index: int) -> str:
+        """For a unit holding claims that differ, which the repair or the rewrite keeps verbatim and which it fixes
+        (KTD4 step 3, R9): the supported claims' spans, and the failing ones'."""
+        recs = self.claims.get(index) or []
+        keep = [r.text for r in recs if r.verdict in ("supported", "partial") and not r.whole_unit]
+        fix = [r.text for r in recs if r.verdict in FAILING_VERDICTS and not r.whole_unit]
+        if not keep or not fix:
+            return ""
+        return (" (לשמור כלשונם: " + ", ".join(f"«{t}»" for t in keep)
+                + "; לתקן: " + ", ".join(f"«{t}»" for t in fix) + ")")
+
+    def mark_markers(self, ordinals: list[tuple[int, tuple]]) -> None:
+        """Record on each cut claim the ordinal of the marker that replaced it in the final text (``Doc.renumber``)."""
+        by_id = {r.id: r for recs in self.claims.values() for r in recs}
+        for r in by_id.values():
+            r.marker = 0
+        for n, ref in ordinals:
+            for cid in ref:
+                if cid in by_id:
+                    by_id[cid].marker = n
 
     def requirement_outcomes(self, applied: FinalAnswer | None = None) -> list[dict]:
         """Each component with its status in the verified answer (KTD3, R6, R7), merged by id across the judge
@@ -1266,24 +1325,42 @@ class VerifyReport:
                 continue
             component = next((o["id"] for o in outcomes if o["id"] in stated and u.index in o["absence_units"]), None)
             self.problems.append(Problem(u, reason, kind="absence", check="absence", component=component))
+            for r in self.claims.get(u.index, []):
+                r.action = "removed"  # replaced by the server's statement of the gap
             added = True
         return added
 
     def apply(self, answer: FinalAnswer) -> FinalAnswer:
-        """The answer with failing units removed and partly supported units marked; a note says what was removed.
-        Removal is by whole sentence: a bullet, list item or heading whose content went goes with it."""
+        """The answer with failing units removed and partly supported units marked; a note says what was removed
+        (``edit``, without the registry of the server's spans)."""
+        return self.edit(answer).answer(answer)
+
+    def edit(self, answer: FinalAnswer) -> Edited:
+        """The answer after the edit ladder (KTD4), as a ``Doc`` that records every span the server wrote: a failing
+        claim's span replaced by a marker, a partly supported sentence marked, a qualifier written next to its
+        number, a citation inserted, a unit that failed removed (a bullet, list item or heading whose content went
+        goes with it; a table left with its header only goes whole), a total row whose component went qualified, an
+        orphan heading removed, and a note that says what was removed — or, when nothing cited survived, the
+        sentence that says the answer could not be based on the sources."""
         errors = self.removed_units()
-        partial = {p.unit.index for p in self.problems if p.severity == "partial"}
+        planned = {i: groups for i, groups in self.cuts.items() if i not in errors}
+        partial = {p.unit.index for p in self.problems if p.severity == "partial" and p.resolution != "cut"}
         notes = [p for p in self.problems if p.annotatable and p.unit.index not in errors]
         requests = [p.reason for p in self.problems if p.kind == "request"]
         cites = [p for p in self.problems if p.kind == "needs_citation" and p.uncited and p.unit.index not in errors]
-        if not errors and not partial and not notes and not requests and not cites:
-            return answer
         markdown = answer.answer_markdown
         cuts = _sentence_cuts(markdown, self.units, errors)
-        edits = [(a, b, "") for a, b in cuts]
-        edits += [(u.end, u.end, " *(אומת חלקית)*") for u in self.units if u.index in partial
+        totals = _total_qualifiers(markdown, self.units, errors, set(planned), cuts)
+        if not (errors or partial or notes or requests or cites or planned or totals):
+            return Edited(Doc(markdown), answer.status, answer.claims)
+        spans = [(g.start, g.end) for groups in planned.values() for g in groups]
+        blocked = cuts + spans  # a qualifier or a citation never lands inside a removed or replaced span
+        edits: list[tuple[int, int, str, str | None, tuple]] = [(a, b, "", None, ()) for a, b in cuts]
+        edits += [(u.end, u.end, PARTIAL_MARK, "partial_mark", ()) for u in self.units if u.index in partial
                   and not any(a <= u.start < b for a, b in cuts)]
+        edits += [(g.start, g.end, MARKER.format(n=0), "marker", g.claims) for groups in planned.values()
+                  for g in groups if not any(a <= g.start < b for a, b in cuts)]
+        edits += totals
         # a qualifier still missing after the repair rounds is written next to its number, marked as the source's;
         # a result of a conditional calculation gets the server's own qualifier, after its number (or, when the
         # unit shows no number of it, where a citation would join the unit)
@@ -1291,30 +1368,24 @@ class VerifyReport:
             at = _after_number(p.unit, p.number or "") if p.number else None
             if at is None and p.conditional:
                 at = _citation_point(markdown, p.unit)
-            if at is not None and not any(a <= at < b for a, b in cuts):
+            if at is not None and not any(a <= at < b for a, b in blocked):
                 if p.conditional:
-                    edits.append((at, at, f" ({p.annotation})"))
+                    edits.append((at, at, f" ({p.annotation})", "qualifier", ()))
                     continue
                 cite = f" [{p.cite}]" if p.uncited else ""
-                edits.append((at, at, f" ({p.annotation}, כפי שנכתב במקור{cite})"))
+                edits.append((at, at, f" ({p.annotation}, כפי שנכתב במקור{cite})", "qualifier", ()))
         # evidence the server found in the same calculation is cited with the unit it supports
         for u, ids in _cites_by_unit(cites):
             at = _citation_point(markdown, u)
-            if not any(a <= at < b for a, b in cuts):
+            if not any(a <= at < b for a, b in blocked):
                 space = "" if at > 0 and markdown[at - 1] in "] " else " "
-                edits.append((at, at, space + "".join(f"[{i}]" for i in ids)))
-        # edit by span, last first, so earlier spans stay valid and no edit depends on matching text again
-        text = markdown
-        done_from = len(text) + 1
-        for a, b, insert in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
-            if b > done_from:  # inside a span already removed (a row of a removed table)
-                continue
-            text = text[:a] + insert + text[b:]
-            if b > a:
-                done_from = a
+                edits.append((at, at, space + "".join(f"[{i}]" for i in ids), "citation", ()))
+        doc = Doc(markdown)
+        doc.edit(edits)
         if cuts:
-            text = _drop_orphan_headings(markdown, text)
-        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+            doc.delete(_orphan_cuts(markdown, doc.text))
+        doc.tidy_blank_lines()
+        self.mark_markers(doc.renumber("marker", MARKER))
         # an absence the server replaced is not a claim that failed; a claim not checked is not called unsupported
         kinds = [p.failure_kind for p in self.removals()]
         removed = len(kinds)
@@ -1322,24 +1393,26 @@ class VerifyReport:
         claims = [c for c in answer.claims if not any(
             c.text.strip() and c.text.strip()[:40] in u.raw for u in self.units if u.index in errors)]
         status = answer.status
+        if any(s.kind == "marker" for s in doc.spans()) and status == "answered":
+            status = "partial"  # part of the answer was left out
         if removed:
             lines = ([f"> הוסרו מהתשובה {removed - unchecked} טענות שלא נמצאה להן תמיכה במקורות."]
                      if removed > unchecked else [])
             lines += [f"> הוסרו מהתשובה {unchecked} טענות שלא ניתן היה לבדוק מול המקורות."] if unchecked else []
-            note = "\n\n" + "\n>\n".join(lines) if text else ""
-            if not text or not _IDS.search(text):
+            if not doc.text or not _IDS.search(doc.text):
                 # the model's own words on what is missing are not added: the server states each gap (KTD4)
-                text = "לא הצלחתי לבסס תשובה על המקורות."
+                doc.clear()
+                doc.append("לא הצלחתי לבסס תשובה על המקורות.", "replacement")
                 status = "partial"
             else:
-                text += note
+                doc.append("\n\n" + "\n>\n".join(lines), "removal_note")
                 if status == "answered":
                     status = "partial"
-        if requests and text:
+        if requests and doc.text:
             # the answer is about another datum than the one requested: said plainly, never passed off as it
-            text += "\n\n> **שימו לב:** " + requests[0] + "."
+            doc.append("\n\n> **שימו לב:** " + requests[0] + ".", "request_note")
             status = "partial" if status == "answered" else status
-        return answer.model_copy(update={"answer_markdown": text, "claims": claims, "status": status})
+        return Edited(doc, status, claims)
 
 
 def _line_bounds(markdown: str, at: int) -> tuple[int, int]:
@@ -1359,11 +1432,21 @@ def _sentence_cuts(markdown: str, units: list[Unit], errors: set[int]) -> list[t
     for u in units:
         if u.table_span is None:
             lines.setdefault(_line_bounds(markdown, u.start)[0], []).append(u)
+    # a table whose every data row went is a header over nothing: it goes whole, header and separator with it (R12)
+    rows: dict[tuple[int, int], list[Unit]] = {}
+    for u in units:
+        if u.table_span is not None:
+            rows.setdefault(u.table_span, []).append(u)
+    errors = errors | {h.index for span, us in rows.items() for h in us if h.table_header
+                       and all(u.index in errors for u in us if not u.table_header)
+                       and any(u.index in errors for u in us if not u.table_header)}
     for u in units:
         if u.index not in errors:
             continue
         if u.table_span:
-            cuts.append(u.table_span if u.table_header else (u.start, u.end))
+            # a row goes with its line, so the rows that stay are still one table
+            cuts.append(u.table_span if u.table_header else (_line_bounds(markdown, u.start)[0],
+                                                             min(_line_bounds(markdown, u.start)[1] + 1, len(markdown))))
             continue
         line_start, line_end = _line_bounds(markdown, u.start)
         a, b = u.start, u.end
@@ -1431,20 +1514,65 @@ def _orphans(markdown: str) -> list[str]:
             if _heading_line(ln) and (n + 1 == len(lines) or _heading_line(lines[n + 1]))]
 
 
-def _drop_orphan_headings(original: str, text: str) -> str:
-    """Remove the headings whose whole content was removed (orphaned now, not in the original answer)."""
+def _orphan_cuts(original: str, text: str) -> list[tuple[int, int]]:
+    """The lines to remove from ``text`` (the original after its edits): the headings whose whole content was removed
+    (orphaned now, not in the original answer), each with its newline."""
     before = _orphans(original)
     after = _orphans(text)
     gone = [h for h in after if before.count(h) < after.count(h)]
     if not gone:
-        return text
-    out = []
-    for ln in text.split("\n"):
+        return []
+    out, pos = [], 0
+    lines = text.split("\n")
+    for n, ln in enumerate(lines):
+        start, end = pos, pos + len(ln)
+        pos = end + 1
         if ln.strip() in gone:
             gone.remove(ln.strip())
-            continue
-        out.append(ln)
-    return "\n".join(out)
+            out.append((start, end + 1) if n + 1 < len(lines) else (max(start - 1, 0), end))
+    return out
+
+
+def _first_cell_end(u: Unit) -> int | None:
+    """Where the first cell of a table row ends in the answer (before the spaces that pad it), and None for a row
+    with one cell."""
+    raw = u.raw
+    lead = len(raw) - len(raw.lstrip())
+    first = lead + 1 if raw[lead:lead + 1] == "|" else lead
+    end = raw.find("|", first)
+    if end < 0:
+        return None
+    while end > first and raw[end - 1] in " \t":
+        end -= 1
+    return u.start + end
+
+
+def _total_qualifiers(markdown: str, units: list[Unit], errors: set[int], cut: set[int],
+                      cuts: list[tuple[int, int]]) -> list[tuple[int, int, str, str | None, tuple]]:
+    """The qualifier a total or summary row gets when a row of its table went or lost a claim (R12): the total was
+    written over what the table showed, so it says it includes a row the answer no longer shows. A total is a row whose
+    first cell holds ``calc.TOTAL_WORDS``; one that was itself removed or cut gets nothing."""
+    from app.chat import calc
+
+    tables: dict[tuple[int, int], list[Unit]] = {}
+    for u in units:
+        if u.table_span is not None and not u.table_header:
+            tables.setdefault(u.table_span, []).append(u)
+    out = []
+    for rows in tables.values():
+        for total in rows:
+            at = _first_cell_end(total)
+            if at is None or total.index in errors or total.index in cut or any(a <= at < b for a, b in cuts):
+                continue
+            cell = total.raw[:at - total.start].strip().lstrip("|")
+            if not calc.TOTAL_WORDS.search(meaning._norm(cell)):
+                continue
+            others = [u for u in rows if u is not total]
+            if any(u.index in errors for u in others):
+                out.append((at, at, TOTAL_ROW_REMOVED, "qualifier", ()))
+            elif any(u.index in cut for u in others):
+                out.append((at, at, TOTAL_ROW_CUT, "qualifier", ()))
+    return out
 
 
 def _cites_by_unit(problems: list[Problem]) -> list[tuple[Unit, list[str]]]:
@@ -2197,7 +2325,8 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
                       if not u.ids and not computed else "מספרים שאינם מופיעים במקורות המצוטטים: " + numbers)
             problems.append(Problem(u, reason,
                                     failure_kind="wrong_calculation" if computed else "absent_from_source",
-                                    check="computation_mismatch" if computed else "unstated_number"))
+                                    check="computation_mismatch" if computed else "unstated_number",
+                                    unstated=[] if computed else sorted(missing)))
             continue
         choice = _input_choice(u, ws)
         if choice is not None:
@@ -2224,6 +2353,50 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
             problems.append(Problem(u, "; ".join(m.reason for m in blocking), failure_kind="wrong_unit",
                                     check="meaning"))
     return problems
+
+
+def _holds_more(u: Unit, numbers: list[str]) -> bool:
+    """Whether a unit failed for ``numbers`` holds content besides them: another number (the cited sources state it),
+    or a clause of words with the numbers taken out. A unit that is only the number — "גובה הבניין 99 מטר" — is
+    removed up front, with no judge call."""
+    if numbers_in(_stated_text(u)) - set(numbers):
+        return True
+    return len(re.findall(r"[א-תA-Za-z]{2,}", re.sub(r"\d[\d,.]*", " ", u.text))) >= 6
+
+
+def _written_forms(text: str, numbers: set[str]) -> list[str]:
+    """The numbers of ``text`` among ``numbers`` (normalized, as ``numbers_in`` reads them) as they are written: a date
+    whole ("1.1.2020"), not the parts the check reads in it."""
+    forms = [m.group(0) for m in _DATE_AT.finditer(text) if numbers_in(m.group(0)) & numbers]
+    forms += [m.group(0) for m in _NUM_AT.finditer(_DATE_AT.sub(" ", text)) if numbers_in(m.group(0)) & numbers]
+    return list(dict.fromkeys(forms))
+
+
+def _has_number(text: str, numbers: list[str]) -> bool:
+    here = numbers_in(text)
+    return any(n in here or re.search(rf"(?<![\d,.]){re.escape(n)}(?![\d])", text) for n in numbers)
+
+
+def _fail_unstated(report: VerifyReport, p: Problem, v: JudgeVerdict, reasons: dict[str, str]) -> bool:
+    """The judge's claims of a unit the deterministic check found numbers in that no cited source states (rule 21):
+    every claim whose span holds such a number fails — unsupported, absent from the source, whatever the judge said of
+    it. When the judge split the unit and some claim does not hold the number, the other claims stand and the edit
+    ladder cuts only that span. Otherwise (no claims, one claim, the number in none or in every claim, a verdict that
+    is no claim) the unit fails whole, with the deterministic problem it would have had. Whether it fails whole."""
+    idx = p.unit.index
+    recs = report.claims[idx]
+    hit = [r for r in recs if not r.whole_unit and _has_number(r.text, p.unstated)]
+    if len(recs) > 1 and hit and len(hit) < len(recs) and v.verdict not in ("not_factual", "navigation"):
+        for r in hit:
+            r.verdict, r.failure = "unsupported", "absent_from_source"
+            reasons[r.id] = ("לא נתמך במקורות: מספרים שאינם מופיעים במקורות המצוטטים: "
+                             + ", ".join(p.unit.unstated))
+        return False
+    record = _whole_record(p.unit, "unsupported", "absent_from_source")
+    report.claims[idx] = [record]
+    p.claim_id = record.id
+    report.problems.append(p)
+    return True
 
 
 def _unknown_ids(u: Unit, ws: Workspace) -> list[str]:
@@ -2729,6 +2902,13 @@ def _unit_context(u: Unit) -> str:
             + "".join(f"<{tag}>{prompt_text(value)}</{tag}>\n" for tag, value in parts) + "</unit_context>\n")
 
 
+def _unstated_note(u: Unit) -> str:
+    """The numbers the server found in no cited source, beside the unit (rule 21): never in its text."""
+    if not u.unstated:
+        return ""
+    return f'<unstated unit="{u.index}">{prompt_text(", ".join(u.unstated))}</unstated>\n'
+
+
 def _unit_text(u: Unit) -> str:
     """A unit's text for the judge, with its registered server spans marked ``<server>…</server>``: in place when the
     text holds the span, otherwise (an inserted citation) on a line after the text. The rest is escaped as any
@@ -2772,7 +2952,7 @@ def _render_batch(batch: _Batch, ws: Workspace, coverage: _Coverage | None = Non
     blocks += [b for sid, texts in wanted.items() if (b := _candidate_block(sid, texts, ws, batch.narrow))]
     # before a unit: the headings above it and its table row's header (R7); after a unit showing a result of a
     # conditional calculation: the qualifier the server writes next to it
-    units = [_unit_context(u) + f'<unit index="{u.index}" cites="{prompt_attr(",".join(u.ids))}">\n'
+    units = [_unit_context(u) + _unstated_note(u) + f'<unit index="{u.index}" cites="{prompt_attr(",".join(u.ids))}">\n'
              f'{_unit_text(u)}\n</unit>'
              + "".join(f'\n<server_qualifier unit="{u.index}">({prompt_text(note)})</server_qualifier>'
                        for _, _, note in conditional_notes(u, ws))
@@ -2952,6 +3132,14 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     fetcher = meaning.Fetcher(ws)
     meanings = {u.index: meaning.check(u, ws, fetcher) for u in units}
     report.problems = deterministic(units, ws, question, meanings)
+    # a unit failed only for numbers no cited source states, that holds more than those numbers, is not removed up front:
+    # the judge splits it into claims and the claim holding such a number fails (``_fail_unstated``)
+    soft = {p.unit.index: p for p in report.problems if p.check == "unstated_number" and p.unstated
+            and _holds_more(p.unit, p.unstated)}
+    if soft:
+        report.problems = [p for p in report.problems if p.unit.index not in soft]
+        for p in soft.values():
+            p.unit.unstated = _written_forms(p.unit.text, set(p.unstated)) or list(p.unstated)
     failed = {p.unit.index for p in report.problems}
     # a missing qualifier does not keep the unit from the judge: it is annotated only if the unit is supported
     for u in units:
@@ -3018,7 +3206,19 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         report.verdicts = {u.index: verdicts[u.index].verdict for u in to_judge if u.index in verdicts}
         report.claims = {u.index: claim_records(u, unit_claims(u, verdicts[u.index], ws))
                          for u in to_judge if u.index in verdicts}
+        handled: set[int] = set()
+        reasons: dict[str, str] = {}
+        for idx, p in soft.items():
+            if idx not in verdicts:  # never judged: it fails for the number, as a unit that is not judged does
+                report.problems.append(p)
+                handled.add(idx)
+            elif verdicts[idx].verdict in ("unsupported", "contradicts"):
+                continue
+            elif _fail_unstated(report, p, verdicts[idx], reasons):
+                handled.add(idx)
         for u in to_judge:
+            if u.index in handled:
+                continue
             v = verdicts.get(u.index)
             if v is None:
                 # never judged: only neutral navigation text passes; anything else is not checked, never wrong. The
@@ -3050,7 +3250,8 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 # a unit holding claims that differ: one problem per claim that fails, so each is linked to its claim
                 # by id (R5); the unit stays, marked, until the edit ladder cuts the claim (U4)
                 for r in failing or [None]:
-                    why = v.reason + (f" («{r.text}»)" if r is not None else "")
+                    why = (reasons.get(r.id) if r is not None else None) or v.reason + (
+                        f" («{r.text}»)" if r is not None else "")
                     kind = (r.failure_kind() if r is not None and r.verdict in ("unsupported", "contradicts")
                             else DEFECT_FAILURES.get(v.defect))
                     report.problems.append(Problem(u, "נתמך חלקית: " + why, "partial", defect=v.defect,
@@ -3075,7 +3276,114 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         _check_requirements(report, ws, requirements)
         report.assign_components()
     close_records(report, verdicts, ws, cache)
+    plan_edits(report)
     return report
+
+
+@dataclass(frozen=True)
+class CutGroup:
+    """A range of the answer the edit ladder replaces by one marker, and the claims in it (ids): failing claims that
+    touch or sit side by side, with nothing but a separator between them, share one marker."""
+
+    start: int
+    end: int
+    claims: tuple[str, ...]
+
+
+_SEPARATOR = re.compile(r"[\s,;،]*")
+
+
+def _cut_range(u: Unit, r: ClaimRecord) -> tuple[int, int] | None:
+    """The exact range of the answer a failing claim's cut removes, or None when no span edit is safe (KTD4 step 2): the
+    claim's own place must be known, hold no citation (the claims that stay may rest on it), and, in a table row, stay
+    inside one cell."""
+    if r.whole_unit or r.fallback or not r.exact:
+        return None
+    raw = u.raw[r.start - u.start:r.end - u.start]
+    if _IDS.search(raw) or (u.table_span is not None and "|" in raw):
+        return None
+    lead, trail = len(raw) - len(raw.lstrip()), len(raw) - len(raw.rstrip())
+    return (r.start + lead, r.end - trail) if raw.strip() else None
+
+
+def _cut_groups(u: Unit, recs: list[ClaimRecord]) -> list[CutGroup] | None:
+    """The cuts that remove every failing claim of the unit and nothing else, or None when one cannot be made: the
+    unit keeps no supported claim, a claim has no exact span, or a standing claim overlaps a failing claim's span or
+    rests on it (the claim cascade already failed what rests on a failing claim)."""
+    failing = [r for r in recs if r.verdict in FAILING_VERDICTS]
+    standing = [r for r in recs if r.verdict in ("supported", "partial")]
+    if not failing or not standing:
+        return None
+    found: list[tuple[int, int, ClaimRecord]] = []
+    for r in failing:
+        span = _cut_range(u, r)
+        if span is None or any(span[0] < s.end and s.start < span[1] for s in standing) \
+                or any(r.id in s.depends_on for s in standing):
+            return None
+        found.append((*span, r))
+    found.sort(key=lambda f: (f[0], f[1]))
+    groups: list[list] = []
+    for a, b, r in found:
+        if groups and (a <= groups[-1][1] or _SEPARATOR.fullmatch(u.raw[groups[-1][1] - u.start:a - u.start])):
+            groups[-1][1] = max(groups[-1][1], b)
+            groups[-1][2].append(r.id)
+        else:
+            groups.append([a, b, [r.id]])
+    return [CutGroup(a, b, tuple(ids)) for a, b, ids in groups]
+
+
+def plan_edits(report: VerifyReport) -> None:
+    """The edit ladder, decided once the verdicts are settled (round 8 KTD4, R8–R10): for every unit that has a failing
+    claim and is not removed, step 2 (cut the span, ``report.cuts``; the problems of those claims are resolved by the
+    server, not repairable) or, when no span edit is safe, the unit's failing claims become a removal (step 4, the
+    logged last resort) after the rewrite round (step 3) that its repairable problem still asks for. Then each claim's
+    ``action``: ``cut`` (its span is replaced by a marker), ``removed`` or ``withheld`` (its unit goes; withheld when
+    the check could not complete), ``rewritten`` (a repair replaced its parent), ``qualified`` (the sentence is marked
+    partly verified, or a qualifier is written), ``cited`` (the server attached a citation) or ``kept``."""
+    units = {u.index: u for u in report.units}
+    report.cuts = {}
+    for idx, recs in sorted(report.claims.items()):
+        u = units.get(idx)
+        failing = {r.id: r for r in recs if r.verdict in FAILING_VERDICTS}
+        if u is None or not failing or idx in report.removed_units():
+            continue
+        groups = _cut_groups(u, recs)
+        mine = [p for p in report.problems if p.unit.index == idx and p.claim_id in failing]
+        if groups is not None:
+            report.cuts[idx] = groups
+            for p in mine:
+                p.resolution = "cut"
+            for r in failing.values():
+                r.action = "cut"
+            continue
+        for p in mine:  # nothing of the unit can stay: it is removed whole, after the rewrite round
+            rec = failing[p.claim_id]
+            p.severity, p.failure_kind, p.cause = "error", rec.failure_kind(), p.cause or rec.cause
+        if idx not in report.removed_units():
+            first = next(iter(failing.values()))
+            report.problems.append(Problem(u, NOT_CHECKED if first.verdict == "unchecked" else
+                                           "לא נתמך במקורות: " + first.text[:120], failure_kind=first.failure_kind(),
+                                           check="judge", claim_id=first.id, cause=first.cause))
+    gone: dict[int, Problem] = {}
+    for p in report.problems:
+        if p.removes_unit:
+            gone.setdefault(p.unit.index, p)
+    for idx, recs in report.claims.items():
+        mine = [p for p in report.problems if p.unit.index == idx]
+        for r in recs:
+            if idx in gone:
+                r.action = "withheld" if gone[idx].failure_kind == "not_checked" else "removed"
+            elif r.action == "cut" or r.verdict not in ("supported", "partial"):
+                continue
+            elif r.parent_id:
+                r.action = "rewritten"
+            elif any(p.annotatable for p in mine) or (r.verdict == "partial" and any(
+                    p.severity == "partial" and p.resolution != "cut" for p in mine)):
+                r.action = "qualified"
+            elif any(p.kind == "needs_citation" and p.uncited for p in mine):
+                r.action = "cited"
+            else:
+                r.action = "kept"
 
 
 def computed_ids(ws: Workspace) -> dict[str, set[str]]:
@@ -3188,6 +3496,8 @@ class ClaimRecord:
     cause: str = ""
     refs: tuple[str, ...] = ()  # the dependencies as the judge gave them: spans, or unit indexes as strings
     context_key: str = ""  # the unit's heading and table context, for matching a repaired claim to its parent
+    exact: bool = False  # ``start``/``end`` are the span's own place in the answer (not the whole unit's)
+    marker: int = 0  # for a cut claim: the ordinal of the marker that replaced it in the final text
 
     @property
     def span(self) -> str:
@@ -3208,7 +3518,7 @@ class ClaimRecord:
                 "action": self.action, "sources_checked": list(self.sources_checked),
                 "depends_on": list(self.depends_on), "fallback": self.fallback, "parent_id": self.parent_id,
                 "failure": self.failure_kind() if self.verdict in FAILING_VERDICTS else "none",
-                "cause": self.cause}
+                "cause": self.cause, "marker": self.marker}
 
 
 def _same_span(a: str, b: str) -> bool:
@@ -3241,7 +3551,7 @@ def claim_records(u: Unit, claims: list[UnitClaim]) -> list[ClaimRecord]:
     out = []
     for c in claims:
         n = seen[_norm(c.span)] = seen.get(_norm(c.span), -1) + 1
-        start, end = u.start, u.end
+        start, end, exact = u.start, u.end, False
         if not c.whole_unit:
             at = -1
             for _ in range(n + 1):
@@ -3252,10 +3562,11 @@ def claim_records(u: Unit, claims: list[UnitClaim]) -> list[ClaimRecord]:
                 mapping = mapping or _text_to_raw(u)
                 if mapping is not None and at + len(c.span) <= len(mapping):
                     start, end = u.start + mapping[at], u.start + mapping[at + len(c.span) - 1] + 1
+                    exact = True
         out.append(ClaimRecord(
             claim_id_of(u, c.span, n), u.id, u.index, start, end, c.span, c.kind, c.verdict, c.failure,
             sources_checked=list(u.ids), fallback=c.fallback, needs_context=c.needs_context,
-            whole_unit=c.whole_unit, refs=c.depends_on, context_key=context))
+            whole_unit=c.whole_unit, refs=c.depends_on, context_key=context, exact=exact))
     return out
 
 

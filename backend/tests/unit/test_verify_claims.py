@@ -293,7 +293,8 @@ def test_a_report_gives_every_claim_a_record_with_its_position_kind_citation_and
     first, second = report.claims[1], report.claims[2]
     ok, bad = first
     assert (ok.text, ok.verdict, ok.action, ok.citation) == (SPAN_OK, "supported", "kept", "cited")
-    assert (bad.text, bad.verdict, bad.action, bad.kind) == (SPAN_BAD, "unsupported", "pending", "datum")
+    # U4: the failing claim is the ladder's to cut (its span is replaced by a marker), no longer left pending
+    assert (bad.text, bad.verdict, bad.action, bad.kind) == (SPAN_BAD, "unsupported", "cut", "datum")
     md = answer.answer_markdown
     assert md[ok.start:ok.end] == SPAN_OK and md[bad.start:bad.end] == SPAN_BAD  # offsets in the answer's markdown
     assert ok.unit_id == bad.unit_id != second[0].unit_id and ok.unit == bad.unit == 1
@@ -389,7 +390,8 @@ def test_a_problem_carries_the_id_of_the_failing_claim_and_reports_it_in_diagnos
     (p,) = report.removals()
     (record,) = report.claims[0]
     assert (p.claim_id, record.id, record.verdict) == (record.id, p.claim_id, "unsupported")
-    assert record.action == "pending" and p.as_dict()["claim_id"] == record.id
+    # U4: its unit goes whole (the ladder's last resort), and the record says so
+    assert record.action == "removed" and p.as_dict()["claim_id"] == record.id
 
 
 def test_each_failing_claim_of_a_mixed_unit_is_its_own_problem_with_its_claim_id_and_the_unit_is_kept():
@@ -443,7 +445,8 @@ def test_ae2_an_uncited_datum_a_read_source_supports_gets_its_citation_and_nothi
     report = verify_answer(_citing_judge(seen), answer, _salted(VALUE, RENT, UNRELATED), "?", [])
     assert not [p for p in report.problems if p.removes_unit] and report.counts()["removed"] == 0
     (record,) = report.claims[1]
-    assert (record.verdict, record.citation, record.action) == ("supported", "repaired", "kept")
+    # U4: the server attaches the citation, and the record's action says it was cited
+    assert (record.verdict, record.citation, record.action) == ("supported", "repaired", "cited")
     assert "[S2]" in report.apply(answer).answer_markdown
     # the judge was shown the read source that holds the unit's number, and not the one that holds nothing of it
     assert "S2" in _shown(seen[0]) and "S3" not in _shown(seen[0])

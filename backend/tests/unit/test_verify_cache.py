@@ -354,6 +354,32 @@ def test_a_partial_verdict_starts_a_repair_round_only_with_a_concrete_defect(off
     assert "אומת חלקית" in out.answer.answer_markdown
 
 
+AREA_CLAUSE = "השטח העיקרי בתא שטח 1 הוא 1,200 מ״ר"
+UNAPPROVED = "שאושר בוועדה המחוזית"
+
+
+def _mixed_area_judge(input: str) -> dict:
+    """The area is supported by the source and the approval is not: the unit is mixed (judge rule 16)."""
+    return {"verdicts": [{"index": i, "verdict": "partial", "reason": "חלקי", "defect": "part", "claims": [
+        {"span": AREA_CLAUSE, "verdict": "supported"}, {"span": UNAPPROVED, "verdict": "unsupported"}]}
+        if UNAPPROVED in t else {"index": i, "verdict": "supported", "reason": "בדיקה"} for i, t in _units(input).items()]}
+
+
+def test_ae1_a_mixed_sentence_finishes_with_one_agent_call_one_verify_call_and_no_repair_round(offline):
+    offline.text = "תא שטח 1: השטח העיקרי הוא 1,200 מ״ר."
+    sentence = f"{AREA_CLAUSE}, {UNAPPROVED} [S1]."
+    agent = ScriptedAgent([SEARCH, final(sentence), final("לא אמור לקרות.")], judge=_mixed_area_judge)
+    out = _turn(agent, "מה השטח העיקרי בתא שטח 1?")
+    # the failing clause is the server's to cut: no rewrite round, no second judge call (the final check is U6's)
+    assert [u["purpose"] for u in out.usage] == ["agent", "request", "agent", "verify"]
+    assert out.summary["rounds"] == 1 and len(_verify_inputs(agent)) == 1 and out.report.ok
+    marker = "«[1: חלק שלא אומת הושמט]»"
+    assert out.answer.answer_markdown == f"{AREA_CLAUSE}, {marker} [S1]." and out.answer.status == "partial"
+    # the registry travels with the outcome, indexing the saved text
+    assert [(s.kind, out.answer.answer_markdown[s.start:s.end]) for s in out.server_spans] == [("marker", marker)]
+    assert [(c.text, c.action) for c in out.report.claims[0]] == [(AREA_CLAUSE, "kept"), (UNAPPROVED, "cut")]
+
+
 def test_usage_summary_adds_up_the_calls_of_a_turn():
     usage = [{"purpose": "agent", "input_tokens": 100, "cached_input_tokens": 80, "cache_write_tokens": None,
               "output_tokens": 10, "latency_ms": 900, "cost_usd": 0.001},
