@@ -1207,6 +1207,16 @@ class VerifyReport:
             if p.unit.index >= 0:
                 p.repair_attempted = repair_key(p.unit) in attempted
 
+    def lost_supported(self, text: str) -> list[tuple[Unit, ClaimRecord]]:
+        """The claims this report judged supported, in units that stay, that carry numbers and whose numbers are not
+        all in ``text`` (a repair round's answer): supported information the new answer lost. A claim with no number
+        is not checked; numbers compare in their normalised forms (9,500 and 9500 are one)."""
+        shown = numbers_in(text)
+        units = {u.index: u for u in self.units}
+        return [(units[idx], r) for idx, recs in self.claims.items() if idx in units
+                for r in recs if r.verdict == "supported" and r.action == "kept"
+                and (needed := numbers_in(r.text)) and not needed <= shown]
+
     def repair_keys(self, claims_only: bool = False) -> set[str]:
         """The units the repair prompt (``problems_text``) names: not one whose failing claim the server cuts."""
         return {repair_key(p.unit) for p in self.problems if p.unit.index >= 0 and p.resolution != "cut"

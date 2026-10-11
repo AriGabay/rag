@@ -104,6 +104,7 @@ from app.chat.final_check import FinalCheckError, finalize
 from app.chat.rereader import ContextReader
 from app.chat.verify import (
     VERIFY_ALLOWANCE_SECONDS,
+    Problem,
     TurnRequirements,
     VerdictCache,
     VerificationUnavailable,
@@ -735,6 +736,16 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             settle_analysis()  # the first step answered: the requirements are frozen before verification
         if answer.status == "clarification" and answer.clarification_question.strip() and not answer.answer_markdown.strip():
             answer.answer_markdown = answer.clarification_question
+        if checked is not None and (lost := checked[1].lost_supported(answer.answer_markdown)):
+            # a repair round rewrote the answer and lost what the last round judged supported (R8, R10): its answer is
+            # not adopted — the checked one is composed instead, its failing claims cut or removed. Decided before the
+            # judge call, so it costs nothing and adds no model call
+            logger.info("chat repair round dropped %d supported claim(s) with numbers; the verified answer is kept",
+                        len(lost))
+            rounds.append([Problem(unit, "טענה שאומתה בסבב הקודם נעלמה מהתשובה המתוקנת", severity="partial",
+                                   check="repair_lost_supported", claim_id=claim.id).as_dict()
+                           for unit, claim in lost])
+            return finish(*checked)
         if deadline + VERIFY_ALLOWANCE_SECONDS - time.monotonic() < settings.chat_verify_min_seconds:
             # an answer that cannot be checked is never shown: a repaired one gives way to the answer already
             # verified, a first one fails the turn, saying why

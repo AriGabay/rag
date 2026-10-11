@@ -577,6 +577,46 @@ def test_a_removal_with_no_repair_round_records_that_none_was_attempted(offline,
     assert decision.failure_kind == "wrong_subject" and decision.repair_attempted is False
 
 
+# --- a repair round never drops a supported numeric claim (R8, R10, KTD4, KTD6) -----------------------------------------
+
+LOST = ("דמי השכירות הם 55 ₪ למ\"ר לחודש [S1].\n"
+        "הנכס פנוי [S1].")  # the repair fixes the failing sentence but drops the supported "9,500 ₪" one
+
+
+def test_a_repair_that_drops_a_supported_numeric_sentence_gives_way_to_the_checked_answer(offline):
+    agent = ScriptedAgent([SEARCH, final(THREE), final(LOST)], judge=_judge_wrong_management)
+    out = _turn(agent)
+    md = out.answer.answer_markdown
+    assert "9,500" in md and "55" in md  # the supported parts survive
+    assert "מושכר" not in md and "הנכס פנוי" not in md  # the failing part is cut or removed, not rewritten in
+    assert len(agent.seen) == 3  # no model call beyond the one repair round
+    assert [u["purpose"] for u in out.usage].count("agent") == 3  # search step, answer, repair: nothing added
+    # recorded: a round of its own, checked "repair_lost_supported", one entry per lost claim
+    lost = [p for r in out.rounds for p in r if p["check"] == "repair_lost_supported"]
+    assert len(lost) == 1 and lost[0]["claim_id"] and "9,500" in lost[0]["text"]
+    assert out.report.ok is False and out.report.counts()["removed"] >= 1
+
+
+def test_a_repair_that_keeps_the_supported_numbers_rephrased_is_adopted(offline):
+    rephrased = ("ערך המ\"ר הוא 9500 ₪ [S1].\n"
+                 "דמי השכירות הם 55 ₪ למ\"ר לחודש [S1].\n"
+                 "הנכס פנוי [S1].")
+    agent = ScriptedAgent([SEARCH, final(THREE), final(rephrased)], judge=_judge_wrong_management)
+    out = _turn(agent)
+    assert out.answer.answer_markdown == rephrased
+    assert not [p for r in out.rounds for p in r if p["check"] == "repair_lost_supported"]
+    assert out.summary["rounds"] == 2 and out.report.ok
+
+
+def test_a_supported_claim_without_numbers_does_not_hold_back_a_repair(offline):
+    first = "הנכס פנוי [S1].\nהנכס מושכר [S1]."
+    repaired = "השווי למ\"ר הוא 9,500 ₪ [S1]."  # drops the supported sentence, which carries no number
+    agent = ScriptedAgent([SEARCH, final(first), final(repaired)], judge=_judge_wrong_management)
+    out = _turn(agent)
+    assert out.answer.answer_markdown == repaired
+    assert not [p for r in out.rounds for p in r if p["check"] == "repair_lost_supported"]
+
+
 # --- reuse by stable id and context (round 8 U3, R18, KTD2, KTD7) ------------------------------------------------------
 
 def _salted(*texts: str) -> Workspace:
