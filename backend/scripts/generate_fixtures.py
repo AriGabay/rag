@@ -1173,7 +1173,10 @@ def make_pdf_class():
             self.set_y(-12)
             self.set_font("DejaVu", "", 8)
             # a printed page number may differ from the file page (a report bound after its cover pages)
-            text = f"{SYNTHETIC_MARKER} | עמוד {self.page_no() + getattr(self, 'page_label_offset', 0)}"
+            label = getattr(self, "page_labels", {}).get(self.page_no())  # a label that restarts inside the file
+            if label is None:
+                label = self.page_no() + getattr(self, "page_label_offset", 0)
+            text = f"{SYNTHETIC_MARKER} | עמוד {label}"
             if self.visual:
                 text = to_visual(text)
             self.cell(0, 6, text, align="C")
@@ -5205,16 +5208,392 @@ def write_round8(out: Path, font_dir: Path) -> None:
     print(f"wrote {ROUND8_DIR}/{ROUND8_MANIFEST} ({len(text_):,} chars)")
 
 
+# --------------------------------------------------------------------------- round 9 (appraisal units inside one
+# file, similar names, a picture title, a 1,000-page file, a letter-spaced text layer)
+
+ROUND9_DIR = "round9"
+ROUND9_MANIFEST = "manifest.json"
+ROUND9_PLACE = "כפר הדמה"  # an invented town; every project, street, block, parcel and amount below is invented too
+ROUND9_CHAPTERS = ["מבוא", "תיאור הנכס", "מצב תכנוני", "נתוני שוק", "הערכת שווי", "סיכום ומסקנות"]
+# R9a: three appraisals told apart only by the project name on their first page; the chapter numbers run on across
+# them (1..18) and the printed page labels restart in each. A cap rate is stated in the first appraisal only and a
+# rent per m^2 in the third only, so a question that names one of them can be matched to the wrong appraisal.
+ROUND9_COMPENDIUM = [
+    {"key": "first", "name": "פרויקט שדרות האלון", "aliases": ["שדרות האלון", "האלון"], "street": "שדרות האלון 14",
+     "block": "31102", "parcel": "7", "use": "בניין משרדים", "area": "5,200", "date": "01/04/2025",
+     "plan": "דמו/6101", "value": "14,850,000", "cap_rate": "6.5%", "noi": "965,250"},
+    {"key": "second", "name": "מתחם גבעת הרקפות", "aliases": ["גבעת הרקפות", "הרקפות"], "street": "רחוב הרקפת 8",
+     "block": "31140", "parcel": "22", "use": "בניין מגורים", "area": "640", "date": "15/05/2025",
+     "plan": "דמו/6230", "value": "11,776,000", "per_sqm": "18,400"},
+    {"key": "third", "name": "פרויקט נחל הדס", "aliases": ["נחל הדס", "הדס"], "street": "דרך נחל הדס 3",
+     "block": "31188", "parcel": "3", "use": "מרכז מסחרי", "area": "3,100", "date": "30/06/2025",
+     "plan": "דמו/6377", "value": "9,430,000", "rent_sqm": "92"},
+]
+ROUND9_APPENDIX_TITLE = "נספח: עסקאות השוואה"
+ROUND9_APPENDIX_HEADERS = ["נכס", "שטח (מ״ר)", "מחיר (₪)", "מחיר למ״ר (₪)"]
+_ROUND9_OTHERS = ["מתחם רכס הצבעוני", "בית השקד", "פרויקט גבעת הלוטם", "מגדלי הנרקיס", "בית הכלנית", "מתחם נחל השיטה",
+                  "פרויקט רמת הגדילן", "בית האירוס", "מתחם גבעת הסתוונית", "מגדל הזוהר"]
+ROUND9_APPENDIX_ROWS = [
+    [f"{_ROUND9_OTHERS[n % len(_ROUND9_OTHERS)]}{'' if n < len(_ROUND9_OTHERS) else ' ב'}",
+     f"{300 + 47 * n:,}", f"{4_100_000 + 313_000 * n:,}", f"{(4_100_000 + 313_000 * n) // (300 + 47 * n):,}"]
+    for n in range(34)
+]
+# R9b: two appraisals whose names differ by one word
+ROUND9_SIMILAR = [
+    {"key": "alef", "name": "מתחם הגפן א", "aliases": ["הגפן א"], "street": "רחוב הגפן 5", "block": "31201",
+     "parcel": "14", "area": "420", "value": "7,980,000", "rent": "21,500"},
+    {"key": "bet", "name": "מתחם הגפן ב", "aliases": ["הגפן ב"], "street": "רחוב הגפן 9", "block": "31201",
+     "parcel": "16", "area": "455", "value": "8,645,000", "rent": "23,100"},
+]
+# R9c: the title is a picture; one table of units runs over the page break and its total is on page 2
+ROUND9_PICTURE_TITLE = "פרויקט גבעת השקמים"
+ROUND9_UNIT_HEADERS = ["יחידה", "קומה", "שטח (מ״ר)"]
+ROUND9_UNIT_ROWS = [[str(n), str(1 + (n - 1) // 6), str(61 + (n * 7) % 23)] for n in range(1, 49)]
+ROUND9_UNIT_TOTAL = sum(int(r[2]) for r in ROUND9_UNIT_ROWS)
+# R9d: 100 appraisals of 10 pages each
+ROUND9_LONG_COPIES = 100
+ROUND9_LONG_PAGES = 10
+ROUND9_LONG_LINES = 7  # filler lines per page; the file stays a few MB
+_ROUND9_KINDS = ["פרויקט", "מתחם", "בית", "מגדל"]
+_ROUND9_TREES = ["הדולב", "הלוטם", "האלמוג", "הצבר", "השקד", "הרימון", "התאנה", "הברוש", "האורן", "הכרמל"]
+_ROUND9_SIDES = ["הצפוני", "הדרומי", "המזרחי", "המערבי", "הישן", "החדש", "העליון", "התחתון", "המרכזי", "הקטן"]
+_ROUND9_FILLER = [
+    "בסקר שנערך בשטח נמצא כי מצב התחזוקה של המבנה תקין ותואם את גילו.",
+    "הסביבה הקרובה כוללת מבני מגורים, מוסדות חינוך ושטחים פתוחים בהיקף מצומצם.",
+    "נבדקו נתוני עסקאות בסביבה בשנתיים האחרונות, ונשקלו התאמות לגודל ולמיקום.",
+    "הגישה לנכס היא מרחוב מקומי, ויש חניה ציבורית במרחק הליכה קצר.",
+    "התכנית החלה על המקרקעין מאפשרת ניצול קרקע בהתאם למפורט בפרק התכנוני.",
+    "לא נמצאו מגבלות רישום או שעבודים שיש בהם כדי להשפיע על ההערכה.",
+]
+# R9e: a table whose text layer holds single glyphs far apart, and a heading with a right-to-left mark
+ROUND9_SPACED_HEADERS = ["מספר תכנית", "תאריך אישור", "שם התכנית"]
+ROUND9_SPACED_ROWS = [["4242", "21/06/2021", "תכנית מתאר"], ["4317", "03/11/2022", "תכנית מפורטת"]]
+ROUND9_RLM = "‏"
+
+
+def raster_title(font_dir: Path, text: str):
+    """R9c's title as a picture: the text exists only as pixels, in no text layer."""
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (1600, 220), "white")
+    draw = ImageDraw.Draw(img)
+    _draw_centered(draw, (0, 0, 1600, 220), text, _pil_font(font_dir, 110, bold=True))
+    return img
+
+
+class Round9PdfRenderer(Round8PdfRenderer):
+    """The round-9 documents (appraisal units, long files, text quality). The layout records, as it draws, each
+    appraisal's page range, printed page labels, title and aliases, and every fact line's page and section. Every
+    project, street, block, parcel and amount is invented."""
+
+    def __init__(self, font_dir: Path) -> None:
+        super().__init__(font_dir)
+        self.pdf.page_labels = {}
+        self.units: list[dict[str, Any]] = []
+        self.unit: dict[str, Any] | None = None
+        self.chapter = 0
+
+    # --- pages and units ------------------------------------------------------------------------------------
+
+    def _page(self, label: int) -> None:
+        self.pdf.add_page()
+        self.pdf.page_labels[self.pdf.page_no()] = label
+
+    def begin_unit(self, uid: str, kind: str, title: str, aliases: list[str]) -> None:
+        """Starts a new page for a new appraisal (or appendix): printed labels restart at 1."""
+        self.end_unit()
+        self._page(1)
+        self.unit = {"id": uid, "kind": kind, "title": title, "aliases": aliases, "first_page": self.pdf.page_no(),
+                     "first_label": 1}
+
+    def next_page(self) -> None:
+        self._page(self.pdf.page_labels[self.pdf.page_no()] + 1)
+
+    def end_unit(self) -> None:
+        if self.unit is not None:
+            page = self.pdf.page_no()
+            self.units.append(self.unit | {"last_page": page, "last_label": self.pdf.page_labels[page]})
+            self.unit = None
+
+    def section_heading(self, title: str) -> None:
+        super().section_heading(title)
+        self.sections[-1]["unit"] = self.unit["id"] if self.unit else None
+
+    def fact(self, key: str | None, text: str, **known: Any) -> None:
+        super().fact(key, text, **({"unit": self.unit["id"] if self.unit else None} | known))
+
+    def chapter_heading(self, name: str, restart: bool = False) -> int:
+        """A numbered chapter heading; the numbering runs on across appraisals unless ``restart``."""
+        self.chapter = 1 if restart else self.chapter + 1
+        self.section_heading(f"{self.chapter}. {name}")
+        return self.chapter
+
+    # --- R9a / R9b: an appraisal --------------------------------------------------------------------------------
+
+    def appraisal(self, a: dict[str, Any], restart_numbers: bool, second_page_at: int = 3) -> None:
+        """Six chapters over two pages: the first page holds the title block and chapters 1-3, the second chapters 4-6.
+        The title is the project name alone."""
+        k = a["key"]
+        self.begin_unit(k, "appraisal", a["name"], a["aliases"])
+        self.title_block(a["name"], f"{a['street']}, {ROUND9_PLACE}", a["block"], a["parcel"],
+                         [f"המועד הקובע: {a['date']}"])
+        self.facts[f"{k}_title"] = {"page": self.pdf.page_no(), "section": None, "unit": k, "text": a["name"]}
+        self.chapter_heading(ROUND9_CHAPTERS[0], restart_numbers)
+        self.fact(None, "שומה זו נערכה לבקשת הבעלים לצורך קביעת שווי השוק של הנכס (מסמך סינתטי).")
+        self.chapter_heading(ROUND9_CHAPTERS[1])
+        self.fact(f"{k}_area", f"הנכס הוא {a['use']} בשטח כולל של {a['area']} מ״ר.", value=a["area"])
+        self.chapter_heading(ROUND9_CHAPTERS[2])
+        self.fact(f"{k}_plan", f"על המקרקעין חלה תכנית {a['plan']} (מאושרת).", value=a["plan"])
+        self.next_page()
+        self.chapter_heading(ROUND9_CHAPTERS[3])
+        self.fact(None, "נתוני השוק נאספו מעסקאות בסביבת הנכס ומנתוני דמי שכירות באזור (מסמך סינתטי).")
+        self.chapter_heading(ROUND9_CHAPTERS[4])
+        if "cap_rate" in a:
+            self.fact(f"{k}_noi", f"הכנסה נטו שנתית מהנכס: {a['noi']} ₪.", value=a["noi"])
+            self.fact(f"{k}_cap_rate", f"שיעור ההיוון שנקבע לנכס: {a['cap_rate']}.", value=a["cap_rate"])
+        elif "per_sqm" in a:
+            self.fact(f"{k}_per_sqm", f"השווי למ״ר שנקבע לנכס בגישת ההשוואה: {a['per_sqm']} ₪.", value=a["per_sqm"])
+        elif "rent_sqm" in a:
+            self.fact(f"{k}_rent_sqm", f"דמי השכירות החודשיים למ״ר בנכס: {a['rent_sqm']} ₪.", value=a["rent_sqm"])
+        self.fact(f"{k}_value", f"שווי הנכס: {a['value']} ₪.", value=a["value"])
+        self.chapter_heading(ROUND9_CHAPTERS[5])
+        self.fact(None, f"שווי השוק של {a['name']} נאמד כאמור בפרק הערכת השווי (מסמך סינתטי).")
+        self.end_unit()
+
+    def render_compendium(self) -> bytes:
+        """R9a: three appraisals (pages 1-2, 3-4, 5-6; chapters 1-6, 7-12, 13-18; labels 1-2 in each) and a comparables
+        appendix (pages 7-8) of other invented properties."""
+        self.chapter = 0
+        for a in ROUND9_COMPENDIUM:
+            self.appraisal(a, restart_numbers=False)
+        pdf = self.pdf
+        self.begin_unit("appendix", "appendix", ROUND9_APPENDIX_TITLE, [])
+        self.header(ROUND9_APPENDIX_TITLE)
+        self.section_heading(ROUND9_APPENDIX_TITLE)
+        self.fact(None, "העסקאות הבאות נאספו להשוואה ואינן מתייחסות לנכסי השומות שלעיל (מסמך סינתטי):")
+        widths = [70, 35, 40, 40]
+        pdf.set_fill_color(225, 225, 225)
+        self.ruled_row(ROUND9_APPENDIX_HEADERS, widths, bold=True)
+        pages: list[int] = []
+        for row in ROUND9_APPENDIX_ROWS:
+            if pdf.get_y() + self.ROW_H > pdf.page_break_trigger - 12:
+                self.next_page()
+            pages.append(self.ruled_row(row, widths)[0])
+        pdf.ln(3)
+        self.facts["appendix_table"] = {"page": pages[0], "section": self.section, "unit": "appendix",
+                                        "headers": ROUND9_APPENDIX_HEADERS, "rows": ROUND9_APPENDIX_ROWS,
+                                        "row_pages": pages}
+        self.end_unit()
+        return bytes(pdf.output())
+
+    def render_similar_names(self) -> bytes:
+        """R9b: two one-page appraisals of "מתחם הגפן א" and "מתחם הגפן ב" with close values."""
+        pdf = self.pdf
+        for a in ROUND9_SIMILAR:
+            k = a["key"]
+            self.begin_unit(k, "appraisal", a["name"], a["aliases"])
+            self.title_block(a["name"], f"{a['street']}, {ROUND9_PLACE}", a["block"], a["parcel"])
+            self.facts[f"{k}_title"] = {"page": pdf.page_no(), "section": None, "unit": k, "text": a["name"]}
+            self.chapter_heading("מבוא", restart=True)
+            self.fact(None, "שומה זו נערכה לבקשת הבעלים לצורך מכירה (מסמך סינתטי).")
+            self.chapter_heading("תיאור הנכס")
+            self.fact(f"{k}_area", f"הנכס הוא בניין משרדים בשטח {a['area']} מ״ר.", value=a["area"])
+            self.chapter_heading("הערכת שווי")
+            self.fact(f"{k}_rent", f"דמי השכירות החודשיים בנכס: {a['rent']} ₪.", value=a["rent"])
+            self.fact(f"{k}_value", f"שווי הנכס: {a['value']} ₪.", value=a["value"])
+            self.chapter_heading("סיכום")
+            self.fact(None, f"שווי השוק של {a['name']} נאמד כאמור לעיל (מסמך סינתטי).")
+            self.end_unit()
+        return bytes(pdf.output())
+
+    # --- R9c: a picture title and a table over the page break -----------------------------------------------
+
+    def render_picture_title(self) -> bytes:
+        """R9c: the project name exists only as an image on page 1 (the text layer never states it); a table of
+        units runs from page 1 over the break and its total row is on page 2."""
+        pdf = self.pdf
+        self.begin_unit("picture", "appraisal", ROUND9_PICTURE_TITLE, ["גבעת השקמים", "השקמים"])
+        img = raster_title(self.font_dir, ROUND9_PICTURE_TITLE)
+        w_mm = 150.0
+        h_mm = w_mm * img.size[1] / img.size[0]
+        x_mm = pdf.w - pdf.r_margin - w_mm
+        y_mm = pdf.get_y()
+        self.picture(img, w_mm, h_mm, x_mm)
+        self.facts["title_picture"] = {"page": pdf.page_no(), "section": None, "unit": "picture",
+                                       "text": ROUND9_PICTURE_TITLE,
+                                       "box": [round(v, 2) for v in (x_mm * PT_PER_MM, y_mm * PT_PER_MM,
+                                                                      (x_mm + w_mm) * PT_PER_MM,
+                                                                      (y_mm + h_mm) * PT_PER_MM)]}
+        self.placed(None, f"{SYNTHETIC_MARKER} — כל הנתונים בדויים", size=10, bold=True)
+        self.placed(None, "משרד: שמאות דמו ב׳ (סינתטי)", size=9.5)
+        pdf.ln(2)
+        self.placed(None, f"כתובת הנכס: רחוב השקמה 11, {ROUND9_PLACE}")
+        self.placed(None, "גוש: 31260 חלקה: 5")
+        self.chapter_heading("מבוא", restart=True)
+        self.fact(None, "שומה זו מעריכה את שווי יחידות הדיור בבניין (מסמך סינתטי).")
+        self.chapter_heading("טבלת יחידות")
+        self.fact(None, "הטבלה הבאה מפרטת את השטח של כל יחידה בבניין:")
+        widths = [40, 40, 60]
+        pdf.set_fill_color(225, 225, 225)
+        self.ruled_row(ROUND9_UNIT_HEADERS, widths, bold=True)
+        header_page = pdf.page_no()
+        pages: dict[str, int] = {}
+        for row in [*ROUND9_UNIT_ROWS, ["סה״כ", "", f"{ROUND9_UNIT_TOTAL:,}"]]:
+            if pdf.get_y() + self.ROW_H > pdf.page_break_trigger:
+                self.next_page()  # the table goes on over the break without repeating its header
+            pages[row[0]] = self.ruled_row(row, widths, bold=row[0] == "סה״כ")[0]
+        pdf.ln(3)
+        assert header_page < pages["סה״כ"]
+        self.facts["table"] = {"header_page": header_page, "total_page": pages["סה״כ"], "section": self.section,
+                               "unit": "picture", "headers": ROUND9_UNIT_HEADERS, "rows": ROUND9_UNIT_ROWS,
+                               "total": f"{ROUND9_UNIT_TOTAL:,}"}
+        self.chapter_heading("סיכום")
+        self.fact(None, "שטחי היחידות משמשים לחישוב השווי הכולל (מסמך סינתטי).")
+        self.end_unit()
+        return bytes(pdf.output())
+
+    # --- R9d: a long file ---------------------------------------------------------------------------------------
+
+    def fill_page(self, n: int, seed: int, lines: int = ROUND9_LONG_LINES) -> None:
+        """A few plain text lines (no images; keeps a 1,000-page file small)."""
+        pdf = self.pdf
+        i = 0
+        while i < lines and pdf.get_y() + self.LINE_H + 2 <= pdf.page_break_trigger - 8:
+            self.body_line(None, f"{_ROUND9_FILLER[(seed + n + i) % len(_ROUND9_FILLER)]} ({(seed * 7 + n * 3 + i) % 90 + 10})")
+            i += 1
+
+    def render_long(self) -> bytes:
+        """R9d: ROUND9_LONG_COPIES appraisals of ROUND9_LONG_PAGES pages (1,000 pages). Each copy has its own project
+        name, block, parcel and value, its own numbered chapters 1..6 and printed page labels 1..10."""
+        for c in range(ROUND9_LONG_COPIES):
+            name = f"{_ROUND9_KINDS[c % 4]} {_ROUND9_TREES[c % 10]} {_ROUND9_SIDES[c // 10]}"
+            block, parcel = 32000 + 3 * c, 1 + (c * 7) % 40
+            value = f"{3_000_000 + ((c * 7919) % 997) * 10_000:,}"
+            uid = f"copy{c + 1:03d}"
+            self.begin_unit(uid, "appraisal", name, [name.split(" ", 1)[1]])
+            self.title_block(name, f"רחוב הדמיון {c + 1}, {ROUND9_PLACE}", str(block), str(parcel))
+            self.facts[f"{uid}_title"] = {"page": self.pdf.page_no(), "section": None, "unit": uid, "text": name}
+            self.chapter_heading("מבוא", restart=True)
+            self.fact(None, "שומה זו נערכה לצורך הדגמה בלבד (מסמך סינתטי).")
+            self.chapter_heading("תיאור הנכס")
+            self.fill_page(0, c)
+            for p in range(1, ROUND9_LONG_PAGES):
+                self.next_page()
+                if p == 2:
+                    self.chapter_heading("מצב תכנוני")
+                elif p == 4:
+                    self.chapter_heading("נתוני שוק")
+                elif p == 7:
+                    self.chapter_heading("הערכת שווי")
+                    self.fact(f"{uid}_value", f"שווי הנכס: {value} ₪.", value=value)
+                elif p == ROUND9_LONG_PAGES - 1:
+                    self.chapter_heading("סיכום")
+                self.fill_page(p, c)
+            self.end_unit()
+        return bytes(self.pdf.output())
+
+    # --- R9e: a letter-spaced table -------------------------------------------------------------------------
+
+    def spaced(self, x_right: float, y_base: float, text: str, step: float = 4.0, size: float = 10.5) -> None:
+        """Draws ``text`` one glyph at a time, ``step`` mm apart, so the text layer holds single characters. Words are
+        placed from the right and each word's first glyph is its rightmost, so that after the extractor reverses the
+        line (as it does for this producer's Hebrew) a number reads "4 2 4 2" and a date "2 1 / 0 6 / 2 0 2 1"; the
+        picture shows such digits mirrored, which is irrelevant to a text-layer fixture."""
+        pdf = self.pdf
+        pdf.set_font("DejaVu", "", size)
+        x = x_right
+        for token in text.split(" "):
+            for k, ch in enumerate(token):
+                pdf.text(x - step * (k + 1), y_base, ch)
+            x -= step * (len(token) + 1.5)
+
+    def render_letter_spaced(self) -> bytes:
+        """R9e: a plan table whose cells are drawn glyph by glyph ("4 2 4 2", "2 1 / 0 6 / 2 0 2 1") and a numbered
+        heading whose text layer starts with a right-to-left mark."""
+        pdf = self.pdf
+        self.begin_unit("spaced", "appraisal", "טבלת תכניות — מתחם גבעת החצב", ["גבעת החצב"])
+        self.title_block("טבלת תכניות — מתחם גבעת החצב", f"רחוב החצב 6, {ROUND9_PLACE}", "31300", "12")
+        self.chapter_heading("מבוא", restart=True)
+        self.fact(None, "הטבלה הבאה מפרטת את התכניות החלות על המקרקעין (מסמך סינתטי).")
+        pdf.ln(2)
+        widths = [45, 55, 65]
+        pdf.set_fill_color(225, 225, 225)
+        y0 = pdf.get_y()
+        page = pdf.page_no()
+        for r, cells in enumerate([ROUND9_SPACED_HEADERS, *ROUND9_SPACED_ROWS]):
+            y = y0 + r * 10
+            x_right = pdf.w - pdf.r_margin
+            for cell, width in zip(cells, widths, strict=True):
+                pdf.rect(x_right - width, y, width, 10, style="DF" if r == 0 else "D")
+                self.spaced(x_right - 2, y + 6.5, cell, size=10.5)
+                x_right -= width
+        pdf.set_y(y0 + 10 * (1 + len(ROUND9_SPACED_ROWS)) + 4)
+        self.facts["table"] = {"page": page, "section": self.section, "unit": "spaced", "letter_spaced": True,
+                               "headers": ROUND9_SPACED_HEADERS, "rows": ROUND9_SPACED_ROWS,
+                               "plan_number": ROUND9_SPACED_ROWS[0][0], "date": ROUND9_SPACED_ROWS[0][1]}
+        heading = f"{ROUND9_RLM}2. מצב תכנוני"
+        self.heading_line(None, heading)
+        self.section = heading
+        self.sections.append({"title": heading, "page": pdf.page_no(), "unit": "spaced"})
+        self.facts["bidi_heading"] = {"page": pdf.page_no(), "section": heading, "unit": "spaced",
+                                      "text": heading, "rlm_prefix": True}
+        self.fact(None, "התכניות שלעיל מאושרות ותקפות (מסמך סינתטי).")
+        self.end_unit()
+        return bytes(pdf.output())
+
+
+def write_round9(out: Path, font_dir: Path) -> None:
+    """Writes the round-9 fixtures and ``manifest.json``: per document its file, title, pages, the appraisal units
+    (id, kind, title, aliases, page range, printed label range), section headings with their units, and the known
+    facts (text, page, section, unit, value). Built from the generator's own layout, never read back from the files."""
+    from pypdf import PdfReader
+
+    rdir = out / ROUND9_DIR
+    rdir.mkdir(parents=True, exist_ok=True)
+    docs: dict[str, dict[str, Any]] = {}
+    specs = [
+        ("compendium", "R9a_synthetic_compendium_three_appraisals.pdf", Round9PdfRenderer.render_compendium),
+        ("similar_names", "R9b_synthetic_two_similar_names.pdf", Round9PdfRenderer.render_similar_names),
+        ("picture_title", "R9c_synthetic_picture_title_split_table.pdf", Round9PdfRenderer.render_picture_title),
+        ("long_file", "R9d_synthetic_long_file_1000_pages.pdf", Round9PdfRenderer.render_long),
+        ("letter_spaced", "R9e_synthetic_letter_spaced_table.pdf", Round9PdfRenderer.render_letter_spaced),
+    ]
+    for key, name, render in specs:
+        r = Round9PdfRenderer(font_dir)
+        data = render(r)
+        (rdir / name).write_bytes(data)
+        print(f"wrote {ROUND9_DIR}/{name} ({len(data):,} bytes)")
+        pages = len(PdfReader(io.BytesIO(data)).pages)
+        facts = {k: {kk: ([round(x, 2) for x in vv] if kk == "box" else vv) for kk, vv in f.items()}
+                 for k, f in r.facts.items()}
+        docs[key] = {"file": f"{ROUND9_DIR}/{name}", "title": _title_of(name), "pages": pages, "units": r.units,
+                     "sections": r.sections, "facts": facts}
+    manifest = {
+        "about": f"{SYNTHETIC_MARKER}. Known contents of the round-9 fixtures (a compendium of three appraisals with "
+                 "a continuing chapter numbering and restarting page labels, similar names, a picture title with a "
+                 "table over a page break, a 1,000-page file, a letter-spaced text layer); generated by "
+                 "scripts/generate_fixtures.py --only round9 from the generator's own layout (never read back from "
+                 "the files) - do not edit by hand. Pages are file pages from 1; labels are the printed page numbers. "
+                 "Every project, street, block, parcel and amount is invented.",
+        "synthetic_marker": SYNTHETIC_MARKER,
+        "documents": docs,
+    }
+    text_ = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+    (rdir / ROUND9_MANIFEST).write_text(text_, encoding="utf-8")
+    print(f"wrote {ROUND9_DIR}/{ROUND9_MANIFEST} ({len(text_):,} chars)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--font-dir", default=DEFAULT_FONT_DIR)
     parser.add_argument("--out", default="tests/fixtures")
-    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8"], default="all",
+    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9"], default="all",
                         help="regions: write only the uncovered-region fixtures (tests/fixtures/regions/); "
                              "positions: only the page-position fixtures (tests/fixtures/positions/); "
                              "citations: only the citation fixtures and their manifest (tests/fixtures/citations/); "
                              "round7: only the round-7 fixtures and their manifest (tests/fixtures/round7/); "
-                             "round8: only the round-8 fixtures and their manifest (tests/fixtures/round8/)")
+                             "round8: only the round-8 fixtures and their manifest (tests/fixtures/round8/); "
+                             "round9: only the round-9 fixtures and their manifest (tests/fixtures/round9/)")
     args = parser.parse_args()
     font_dir = Path(args.font_dir)
     out = Path(args.out)
@@ -5233,6 +5612,9 @@ def main() -> None:
         return
     if args.only == "round8":
         write_round8(out, font_dir)
+        return
+    if args.only == "round9":
+        write_round9(out, font_dir)
         return
 
     docs: dict[str, dict[str, Any]] = {}
@@ -5282,6 +5664,7 @@ def main() -> None:
     write_citations(out, font_dir)
     write_round7(out, font_dir)
     write_round8(out, font_dir)
+    write_round9(out, font_dir)
 
 
 if __name__ == "__main__":

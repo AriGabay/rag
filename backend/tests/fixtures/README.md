@@ -298,3 +298,25 @@ never read back from the files.
 | `round7/R7c_synthetic_cost_table_image.pdf` | A cost table drawn as a picture (header, rows, total row and the unit note, none in the text layer) under a text sentence giving its context | A table read visually in the turn feeds `take_value` and `calculate` (F5): 15,600,000 + 4,620,000 = 20,220,000 |
 | `round7/R7d_synthetic_residual_explicit_profit.pdf` | A residual-method calculation: cost 18,350,000, profit stated as "כ-17%" of cost and, on another line of the same section, as 3,210,000 (cost × 17% = 3,119,500); a minimal-profit threshold of 2,800,000; a sensitivity section with a 6% cost increase | The explicit amount over the rounded rate (F7: gap 410,000, not 319,500); a cost-increase question with no rate (F8, without the sensitivity section) |
 | `round7/R7e_synthetic_decision_two_parties.pdf` | A decision: the applicant's figure (14,200), the respondent's (16,800) and the adopted one (15,350) | Who stated a value and whether it was adopted, within the right context (R22) |
+
+## Round-9 fixtures (`round9/`)
+
+Synthetic files for appraisal units inside one file, long-file ingestion and text quality. Every project name, street,
+block, parcel and amount is invented. Regenerate only this set in the backend image:
+
+```bash
+docker run --rm -v "$PWD/backend:/app" -w /app appraisal-rag-backend python scripts/generate_fixtures.py --only round9
+```
+
+The output is byte-identical on a second run. `round9/manifest.json` records, per document, its file, title, page
+count, the appraisal `units` (id, kind, title, aliases, file-page range and printed page-label range), the section
+headings with their pages and units, and the known facts (text, page, section, unit, value), written from the
+generator's own layout, never read back from the files.
+
+| file | what it holds |
+|---|---|
+| `round9/R9a_synthetic_compendium_three_appraisals.pdf` | Three appraisals titled by project name only (pages 1-2, 3-4, 5-6), chapters numbered 1-18 without a restart, printed page labels restarting at each appraisal, a cap rate in the first appraisal only and a rent per m² in the third only; then a comparables appendix (pages 7-8) naming other invented properties |
+| `round9/R9b_synthetic_two_similar_names.pdf` | Two one-page appraisals, "מתחם הגפן א" and "מתחם הגפן ב", with close values |
+| `round9/R9c_synthetic_picture_title_split_table.pdf` | The project title exists only as a picture; a table of units runs from page 1 over the break and its total row is on page 2 |
+| `round9/R9d_synthetic_long_file_1000_pages.pdf` | 1,000 text pages: 100 appraisals of 10 pages, each with its own name, block, parcel and value, chapters 1-6 and printed labels 1-10 (about 4 MB) |
+| `round9/R9e_synthetic_letter_spaced_table.pdf` | A plan table drawn glyph by glyph (the extractor yields "4 2 4 2", "2 1 / 0 6 / 2 0 2 1"), and a numbered heading whose text layer starts with U+200F |
