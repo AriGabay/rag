@@ -330,6 +330,34 @@ def test_vat_skips_a_year_an_area_or_a_parenthesized_number(claim):
     assert _deterministic(claim, source) == []
 
 
+PERMIT_FEE = "אגרת היתר מס׳ 638 מיום 01.11.1966: 70 ₪, לא כולל מע\"מ."
+
+
+def test_vat_is_not_given_to_a_permit_number_or_a_date():
+    # the nearest "number" before the VAT phrase is the date's day and month, not the fee
+    claim = "האגרה, 70 ₪, נקבעה בהיתר מס׳ 638 מיום 01.11.1966, ללא מע\"מ [S1]."
+    assert _deterministic(claim, PERMIT_FEE) == []
+
+
+def test_an_absence_sentence_gets_no_vat_check():
+    for claim in ("לא צוין אם הסכום של 70 ₪ כולל מע\"מ [S1].", "לא צוין אם 70 ₪ לא כולל מע\"מ [S1].",
+                  "לא נמצא במסמך אם 70 ₪ כולל מע\"מ [S1]."):
+        assert _deterministic(claim, "הסכום הוא 70 ₪ לחודש.") == [], claim
+
+
+def test_a_claimed_vat_after_an_absence_clause_is_still_checked():
+    problems = _deterministic("לא צוין היטל נוסף; הסכום 70 ₪ כולל מע\"מ [S1].", "הסכום הוא 70 ₪ לחודש.")
+    assert problems and problems[0].check == "vat"
+
+
+def test_a_date_with_a_closing_period_is_stated_by_a_source_with_a_comma():
+    # AE7: the source writes "01.11.1966," and the answer "01.11.1966." — same date, the claim stays
+    source = "היתר הבנייה הוא מס׳ 638, מיום 01.11.1966, ממנו נגזרות הזכויות."
+    for claim in ("היתר הבנייה הוא מס׳ 638, מיום 01.11.1966. [S1]", "היתר הבנייה בתוקף מיום 01.11.1966, [S1]"):
+        assert _deterministic(claim, source) == [], claim
+    assert _deterministic("ההיתר בתוקף עד 28.12.2022. [S1]", "ההיתר בתוקף עד 28.12.2022, ללא הארכה.") == []
+
+
 def test_a_failed_header_and_a_failed_row_remove_the_whole_table():
     md = "השווי למ\"ר הוא 9,500 ₪ [S1].\n\n| הנכס פנוי | כן |\n|---|---|\n| הגפן | 9,500 ₪ [S1] |\n| הזית | 7 [S1] |"
     a = _answer(md)

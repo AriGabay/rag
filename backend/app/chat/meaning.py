@@ -31,6 +31,10 @@ Two kinds of problem:
   it ("לחודש" where the source says nothing about a period, or says "לשנה"). Nothing is added that the evidence
   lacks; unknown stays unknown.
 
+Round 9 (U12, KTD10, R22): a number that is no quantity — an identifier after מס׳ / מספר / No. / #, a date's day, month
+or year, a bare year — gets no check, and neither does a clause saying the source does not state something ("לא צוין
+אם הסכום כולל מע״מ"): it claims no basis, period or VAT.
+
 Only the turn's own evidence is read: cited passages and measurements. No answer field is fixed in advance; the
 model still writes the answer.
 
@@ -49,7 +53,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 from app.answering.verify import _NUMBER as _NUM_AT
-from app.answering.verify import numbers_in
+from app.answering.verify import not_an_amount, numbers_in
 from app.chat.evidence import _content_words
 from app.measurements.extract import PERIOD_LABELS
 
@@ -79,6 +83,13 @@ _AMOUNT_AFTER = re.compile(r"\s*(?:₪|ש\"ח|מ\"ר|דונם|%|אלף|מילי�
 _APPROX_WORDS = re.compile(r"(?<![א-ת])(?:מקורב|בקירוב|בערך|בסביבות)(?![א-ת])")
 _CLAUSE_END = re.compile(r"[.;\n](?!\d)")
 _ROW = " | "
+# a clause saying the source does not state / does not show something ("לא צוין אם הסכום כולל מע״מ", "אינו מופיע"): it
+# claims no basis, period or VAT for the numbers it names, so no number-meaning check applies to it (round 9 U12)
+ABSENCE_SENTENCE = re.compile(
+    r"(?<![א-ת])(?:לא|אינו|אינה|אינם|אינן)\s+(?:צוין|צוינה|צוינו|מצוין|מצוינת|מצוינים|מצוינות|ציין|ציינה|ציינו|נכתב|"
+    r"נכתבה|נכתבו|נאמר|נאמרה|פורט|פורטה|פורטו|מפורט|מפורטת|הוזכר|הוזכרה|הוזכרו|מוזכר|מוזכרת|נמסר|נמסרה|ידוע|ידועה|"
+    r"ברור|ברורה|נמצא|נמצאה|נמצאו|נמצאים|אותר|אותרה|אותרו|מופיע|מופיעה|מופיעים|מופיעות)(?![א-ת])"
+    r"|(?<![א-ת])אין\s+(?:ציון|פירוט|אזכור|התייחסות|מידע|נתון)(?![א-ת])")
 # a period word right after a rate's noun ("ריבית שנתית", "שיעור היוון שנתי", "תשואה לשנה") is that rate's: it
 # qualifies a percent of its own clause ("בריבית שנתית של 6%") and never an amount, and it states nothing for the
 # source's other numbers
@@ -204,6 +215,17 @@ def _all(text: str, rates: bool = True) -> Qualifiers:
 def _only(q: Qualifiers, kind: str, keep: bool = True) -> Qualifiers:
     """The qualifiers of one kind (``keep``), or all but that kind."""
     return Qualifiers({k: dict(v) for k, v in q.found.items() if (k == kind) == keep})
+
+
+def absence_spans(text: str) -> list[tuple[int, int]]:
+    """The spans of the clauses of ``text`` (split as ``attached`` splits them) that state something is not stated."""
+    out, start = [], 0
+    for end_m in [*_CLAUSE_END.finditer(text), None]:
+        end = end_m.end() if end_m else len(text)
+        if ABSENCE_SENTENCE.search(text[start:end]):
+            out.append((start, end))
+        start = end
+    return out
 
 
 @dataclass
@@ -802,10 +824,15 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
     words = _content_words(text)
     problems: list[MeaningProblem] = []
     in_unit, _ = attached(text)
+    absent = absence_spans(text)
     for forms, pos, claimed in in_unit:
         if not forms:
             continue
         written = _NUM_AT.match(text, pos).group(0)
+        # an identifier, a date's part or a year is no amount; a number in a clause saying the source does not state
+        # something claims no meaning (round 9 U12)
+        if not_an_amount(text, pos, pos + len(written)) or any(a <= pos < b for a, b in absent):
+            continue
         occurrences, general = _evidence(unit, ws, forms)
         if not occurrences:
             continue  # not a number of the cited evidence: the number check owns it

@@ -150,6 +150,31 @@ def test_a_unit_whose_other_numbers_are_not_the_calculations_stays_unbound():
     assert units[0].ids == ["V1", "V2"]
 
 
+def test_an_intermediate_step_of_a_calculation_whose_input_the_unit_cites_is_not_an_unstated_number():
+    # round 9 U12: "1.05" (1 + A1%) is a step of C1 whose inputs the unit cites; it is C1's, not a missing source number
+    ws = _scenario()
+    md = "העלויות הוגדלו במקדם 1.05 [V2][A1]."
+    units = split_units(md)
+    assert verify.bind_computations(units, ws, QUESTION) == {0: ["C1"]}
+    assert units[0].ids == ["V2", "A1", "C1"]
+    assert _numbers_only(ws, md) == []
+
+
+def test_an_intermediate_step_with_no_input_of_its_calculation_cited_stays_unstated():
+    ws = _scenario()
+    _value(ws, "7,000", "שטח", "area", "income", unit="ILS")
+    units = split_units("העלויות הוגדלו במקדם 1.05 [V3].")
+    assert verify.bind_computations(units, ws, QUESTION) == {}
+    (problem,) = deterministic(units, ws, QUESTION, meanings={0: []})
+    assert problem.check == "unstated_number" and "1.05" in problem.reason
+
+
+def test_a_wrong_step_is_not_bound_even_when_an_input_is_cited():
+    ws = _scenario()
+    units = split_units("העלויות הוגדלו במקדם 1.07 [V2][A1].")
+    assert verify.bind_computations(units, ws, QUESTION) == {}
+
+
 # --- scale words -------------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("shown, ok", [

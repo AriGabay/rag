@@ -458,3 +458,46 @@ def test_a_line_above_on_another_kind_gives_no_period_to_a_capital_value():
     assert _periods(source, '3,200,000', 'שווי השוק של הנכס הינו 3,200,000 ₪') == set()
     noted = 'ההכנסות להלן הן לשנה\nהכנסות משכירות 480,000 ₪'
     assert _periods(noted, '480,000', 'הכנסות משכירות 480,000 ₪') == {"year"}
+
+
+# --- identifiers, years and absence sentences are not amounts (round 9 U12, KTD10, R22) -----------------------------
+
+PERMIT = "היתר בנייה מס׳ 638 מיום 01.11.1966, בתוקף לשנה. דמי האגרה 70 ₪ לחודש."
+
+
+@pytest.mark.parametrize("answer", [
+    "היתר הבנייה הוא מס׳ 638, מיום 01.11.1966 [S1].",
+    "היתר הבנייה הוא מס׳ 638, מיום 01.11.1966. [S1]",
+    "היתר מספר 638 מיום 01.11.1966 [S1].",
+    "ההיתר הוא No 638 [S1].",
+    "ההיתר הוא #638 [S1].",
+])
+def test_a_permit_number_and_the_year_of_its_date_are_not_amounts(answer):
+    # the source puts "לשנה" near them: neither the number nor the year is an amount that needs (or lacks) a period
+    assert _problems(answer, _ws(PERMIT)) == []
+
+
+def test_a_year_alone_is_not_an_amount_but_a_year_with_a_currency_is():
+    ws = _ws("השומה נכונה לשנת 2019, לחודש. דמי השכירות 2019 ₪ לחודש.")
+    assert _problems("השומה נכונה לשנת 2019 [S1].", ws) == []
+    (p,) = _problems("דמי השכירות הם 2019 ₪ [S1].", ws)
+    assert p.kind == "period" and p.annotation == "לחודש"
+
+
+def test_the_amount_next_to_an_identifier_is_still_checked():
+    (p,) = _problems("דמי האגרה לפי היתר מס׳ 638 הם 70 ₪ [S1].", _ws(PERMIT))
+    assert p.kind == "period" and p.annotation == "לחודש" and p.number == "70"
+
+
+@pytest.mark.parametrize("answer", [
+    "לא צוין אם הסכום של 70 ₪ כולל מע\"מ [S1].",
+    "לא צוינה תקופה לסכום של 70 ₪ [S1].",
+    "הסכום 70 ₪ אינו מופיע במסמך [S1].",
+])
+def test_an_absence_sentence_gets_no_number_meaning_check(answer):
+    assert _problems(answer, _ws(PERMIT)) == []
+
+
+def test_only_the_absence_clause_is_exempt():
+    (p,) = _problems("דמי האגרה 70 ₪; לא צוין אם יש היטל נוסף [S1].", _ws(PERMIT))
+    assert p.kind == "period" and p.annotation == "לחודש"

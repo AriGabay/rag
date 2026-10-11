@@ -179,7 +179,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.answering.verify import _DATE as _DATE_AT
 from app.answering.verify import _NUMBER as _NUM_AT  # one reading of numbers for both checks
-from app.answering.verify import numbers_in
+from app.answering.verify import not_an_amount, numbers_in
 from app.chat import meaning
 from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited, line_cut
 from app.chat.evidence import select
@@ -2281,6 +2281,8 @@ def _vat_bearing(clause: str, m: re.Match) -> bool:
     value = m.group(0).replace(",", "")
     if re.fullmatch(r"(19|20)\d\d", value) and "₪" not in clause[m.end():m.end() + 3]:
         return False
+    if not_an_amount(clause, m.start(), m.end(), years=False):  # a permit number, a date's part (round 9 U12)
+        return False
     if _NOT_A_PRICE_AFTER.match(clause, m.end()):
         return False
     before = clause[:m.start()]
@@ -2292,10 +2294,12 @@ def _vat_polarity(m: re.Match) -> str:
     return "excluded" if m.group("neg") else ("included" if "כולל" in text else "")
 
 
-def vat_attachments(text: str) -> tuple[set[tuple[str, str]], set[str]]:
+def vat_attachments(text: str, *, skip_absence: bool = False) -> tuple[set[tuple[str, str]], set[str]]:
     """(number, VAT status) pairs as written — a VAT phrase belongs to the nearest number before it in the same
     sentence ("9,500 ₪, ללא מע״מ ודמ״ש ... 55 ₪": the VAT is the 9,500's) — and the VAT statuses stated with no
-    number before them in their sentence (a note such as "המחירים אינם כוללים מע״מ", which covers the source)."""
+    number before them in their sentence (a note such as "המחירים אינם כוללים מע״מ", which covers the source).
+    ``skip_absence``: a clause saying the text does not state something ("לא צוין אם הסכום כולל מע״מ") gives nothing
+    a VAT status (for an answer's unit; a source's own note is read as it is)."""
     pairs: set[tuple[str, str]] = set()
     general: set[str] = set()
     start = 0
@@ -2303,7 +2307,7 @@ def vat_attachments(text: str) -> tuple[set[tuple[str, str]], set[str]]:
         end = end_m.end() if end_m else len(text)
         clause = text[start:end]
         nums = [(n.start(), numbers_in(n.group(0))) for n in _NUM_AT.finditer(clause) if _vat_bearing(clause, n)]
-        for v in _VAT.finditer(clause):
+        for v in [] if skip_absence and meaning.ABSENCE_SENTENCE.search(clause) else _VAT.finditer(clause):
             polarity = _vat_polarity(v)
             if not polarity:
                 continue
@@ -2334,7 +2338,7 @@ def _computation_vat(unit: Unit, ws: Workspace, c) -> set[tuple[str, str]]:
 
 def _vat_problems(unit: Unit, ws: Workspace) -> list[str]:
     """VAT the unit gives a number that its cited sources do not give that number."""
-    claimed, _ = vat_attachments(unit.text)
+    claimed, _ = vat_attachments(unit.text, skip_absence=True)
     if not claimed:
         return []
     backed: set[tuple[str, str]] = set()
@@ -2827,9 +2831,9 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
     """Bind each unit that shows a result of the turn's calculations without citing it (citing only its inputs, or
     nothing) to that calculation: the C# joins the unit's citations, so the number check, the VAT check and the
     judge read the unit with it, and the server cites it in the answer. A number binds when it is the result at the
-    precision and scale it is shown in (a calculation whose inputs the unit cites first) and is not presented as
-    written by a document or said by a party; the unit binds only when, with the calculations, every number of it
-    is stated. Returns {unit index: the C# ids bound}."""
+    precision and scale it is shown in (a calculation whose inputs the unit cites first; an intermediate step of
+    one counts only when the unit cites an input of it) and is not presented as written by a document or said by a
+    party; the unit binds only when, with the calculations, every number of it is stated. Returns {unit index: the C# ids bound}."""
     if not ws.computations:
         return {}
     question_numbers = numbers_in(question)
@@ -2845,8 +2849,10 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
         for n in _shown(u.text):
             if not numbers_in(n.written) & loose or _stated_as_written(u.text, n.start):
                 continue
+            # a result of a calculation; or an intermediate step of one whose inputs the unit cites (round 9 U12:
+            # "1.05" of 1 + 5%, shown beside the inputs it was made of)
             matches = [c for cid, c in ws.computations.items() if cid not in u.ids and cid not in chosen
-                       and _shows(c, n.written, n.percent, n.scale, steps=False)]
+                       and _shows(c, n.written, n.percent, n.scale, steps=bool(set(c.leaves) & set(u.ids)))]
             if matches:
                 order = list(ws.computations)
                 best = max(matches, key=lambda c: (len(set(c.leaves) & set(u.ids)), -order.index(c.cid)))

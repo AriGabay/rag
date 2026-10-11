@@ -29,7 +29,12 @@ from app.providers.llm import (
 CITE = re.compile(r"\[(E\d+)\]")
 # A number may follow a Hebrew prefix letter ("ב2019"), but not a Latin letter, digit or underscore.
 _NUMBER = re.compile(r"(?<![0-9A-Za-z_])\d[\d,]*(?:\.\d+)?")
-_DATE = re.compile(r"(?<![\d.,/])(\d{1,2})[./-](\d{1,2})[./-](\d{4}|\d{2})(?![\d./])")
+# a date ends where no digit continues it: sentence punctuation after it ("01.11.1966." / "…,") is not a decimal
+# part, while a further "./" and digit ("1.2.2020.5") makes it a longer chain, which is no date
+_DATE = re.compile(r"(?<![\d.,/])(\d{1,2})[./-](\d{1,2})[./-](\d{4}|\d{2})(?!\d)(?![./]\d)")
+# a number right after "מס׳ / מספר / No. / #" names a document or a case, not a quantity
+_IDENTIFIER_BEFORE = re.compile(r"(?:(?<![א-ת])(?:מס|מספר|מס\"ד)[׳'’.]?|\bNo\.?|\bNr\.?|#)\s*:?\s*$")
+_YEAR = re.compile(r"(?:19|20)\d\d")
 # Counts written as words ("שתי קומות"); used on the evidence side only, so a claim's digit can match them.
 _NUMBER_WORDS = {
     "אחד": 1, "אחת": 1, "שניים": 2, "שתיים": 2, "שני": 2, "שתי": 2, "שלוש": 3, "שלושה": 3, "שלושת": 3,
@@ -87,6 +92,19 @@ def numbers_in(text: str, *, words: bool = False) -> set[str]:
                 if form in _NUMBER_WORDS:
                     out.add(str(_NUMBER_WORDS[form]))
     return out
+
+
+def not_an_amount(text: str, start: int, end: int, *, years: bool = True) -> bool:
+    """Whether the number at ``text[start:end]`` is no quantity: an identifier (a number right after מס׳, מספר, No.
+    or #), a part of a date, or — with ``years`` — a bare year (1900-2099, no currency, unit or percent after it).
+    The period, basis and VAT checks give a number a meaning only when it is a quantity (round 9 U12, R22)."""
+    if _IDENTIFIER_BEFORE.search(text[max(0, start - 12):start]):
+        return True
+    if any(d.start() <= start and end <= d.end() for d in _DATE.finditer(text)):
+        return True
+    if years and _YEAR.fullmatch(text[start:end]):
+        return not re.match(r"\s*(?:₪|ש[\"״]ח|מ[\"״]ר|דונם|%|אלף|מיליון)", text[end:end + 8])
+    return False
 
 
 def _anchor_pairs(text: str, m: re.Match) -> set[tuple[str, str]]:
