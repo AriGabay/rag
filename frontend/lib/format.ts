@@ -458,3 +458,9 @@ export function contentActionsText(counts: Partial<Record<ChangeAction, number>>
   }
   return parts.join("; ");
 }
+
+/** A claim's draft or remaining text as plain words for the details view: Markdown emphasis and code marks
+ * (`**`, `__`, backticks) are dropped, the words themselves are kept exactly. */
+export function plainClaimText(text: string): string {
+  return text.replace(/\*\*|__|`/g, "");
+}

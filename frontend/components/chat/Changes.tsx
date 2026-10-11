@@ -23,6 +23,7 @@ import {
   type ChangeAction,
   failureKindText,
   rowChangeAction,
+  plainClaimText,
 } from "@/lib/format";
 import { type CitedRecords, assumptionText, citedTarget } from "./cited";
 
@@ -514,7 +515,7 @@ function ChangeDetail({
       {(action === "removed" || action === "withheld") && (
         <div className="removal-draft" data-testid="removal-draft" data-label={action === "removed" ? "rejected" : "unverified"}>
           <span className="removal-draft-label">{action === "removed" ? "טיוטה שנפסלה" : "טיוטה שלא אומתה"}</span>
-          <blockquote dir="auto">{decision.text}</blockquote>
+          <blockquote dir="auto">{plainClaimText(decision.text)}</blockquote>
         </div>
       )}
       {(action === "cut" || action === "rewritten") && (
@@ -525,10 +526,10 @@ function ChangeDetail({
           <blockquote dir="auto">
             {action === "cut" ? (
               <mark className="change-unsupported" data-testid="change-unsupported">
-                {decision.text}
+                {plainClaimText(decision.text)}
               </mark>
             ) : (
-              decision.text
+              plainClaimText(decision.text)
             )}
           </blockquote>
         </div>
@@ -542,7 +543,7 @@ function ChangeDetail({
       {action !== "removed" && action !== "withheld" && action !== "cited" && remaining && !markerOnly && (
           <div className="change-kept" data-testid="change-kept">
             <strong>{action === "rewritten" ? "הנוסח שנשאר בתשובה (נבדק מחדש):" : "הטקסט שנשאר בתשובה:"}</strong>
-            <blockquote dir="auto">{remaining}</blockquote>
+            <blockquote dir="auto">{plainClaimText(remaining)}</blockquote>
           </div>
         )}
       {checked.length > 0 && (
