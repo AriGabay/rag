@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass
 
 from app.extraction.base import ChunkResult, TableResult
+from app.extraction.hebrew import strip_bidi_controls
 
 MAX_CHARS = 1200
 _HEADING = re.compile(r"^\s*(\d{1,2})\.\s+\S")
@@ -24,7 +25,7 @@ _PAGE_NO_ONLY = re.compile(r"^[\s\-–—]*\d{1,4}[\s\-–—]*$")
 
 
 def is_heading(line: str) -> bool:
-    s = line.strip()
+    s = strip_bidi_controls(line).strip()  # a right-to-left mark before the number does not make it no heading
     if not _HEADING.match(s) or not _HEB.search(s) or len(s) > 80:
         return False
     if s.endswith((".", ":", ",")) or len(s.split()) > 9:
@@ -36,7 +37,7 @@ def heading_label(line: str) -> str | None:
     """The numbering label of a section heading line ("9", "9.1", "2.1.3"), or None. A top-level heading follows
     ``is_heading``; a sub-section heading has the same shape with a dotted label. A dotted label alone is weak
     evidence ("2.5 חדרים בקומה" has one), so callers accept a sub-section only under its parent."""
-    s = line.strip()
+    s = strip_bidi_controls(line).strip()
     if is_heading(s):
         return _HEADING.match(s).group(1)
     m = _SUB_HEADING.match(s)

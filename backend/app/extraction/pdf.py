@@ -11,7 +11,12 @@ The text layer is cleaned before anything reads it:
 
 - glyphs drawn twice at (almost) the same place, the way some producers fake bold, are kept once;
 - a line whose last letters were drawn on a slightly different baseline is joined back into one line;
-- a page whose words carry no orientation evidence (a title page) takes the orientation of the document.
+- a page whose words carry no orientation evidence (a title page) takes the orientation of the document;
+- a line drawn glyph by glyph, far apart (``'2 1 / 0 6 / 2 0 2 1'``), is checked against its glyph spacing
+  (``app.extraction.letterspacing``, KTD12): when the spacing is uniform and clearly smaller than the gaps between
+  words its characters are joined into the words, in a table's cells too; otherwise its block is ``read_uncertain``;
+- bidi control characters (``U+200E``, ``U+200F``, ``U+202A`` - ``U+202E``, ``U+2066`` - ``U+2069``) are dropped from the
+  text layer before anything reads it, so a numbered heading preceded by a mark is a heading with its label.
 
 Content the text layer does not cover is found and read by ``app.extraction.regions`` (KTD4, KTD5): image
 objects and vector ink outside the text layer, each read once per content (OCR, or the vision model on a crop at
@@ -63,7 +68,7 @@ import pdfplumber
 import pypdfium2 as pdfium
 
 from app.config import Settings
-from app.extraction import fontmap, geometry, ocr
+from app.extraction import fontmap, geometry, letterspacing, ocr
 from app.extraction.base import (
     MSG_TOO_MANY_PAGES,
     Block,
@@ -83,16 +88,17 @@ from app.extraction.hebrew import (
     orientation_evidence,
     page_is_visual,
     quality_score,
+    strip_bidi_controls,
     visual_from_evidence,
 )
 from app.extraction.images import PictureReading, VisionReader
 from app.extraction.regions import PageLayer, ReadingCache, Region
-from app.extraction.tables import RawTable, assemble_tables, logical_boxes, logical_row, units_for
+from app.extraction.tables import RawTable, assemble_tables, clean_cell, logical_boxes, logical_row, units_for
 
 log = logging.getLogger(__name__)
 
 # The reader that produced a PDF's blocks; a version read by an older one is reprocessed.
-READER_VERSION = "pdf-blocks-v5"
+READER_VERSION = "pdf-blocks-v6"  # v6: letter-spaced runs joined or uncertain, no bidi controls in text
 
 MSG_ENCRYPTED = "הקובץ מוגן בסיסמה ולא ניתן לעבד אותו"
 MSG_CORRUPT = "הקובץ פגום או שאינו PDF תקין"
@@ -101,6 +107,7 @@ WARN_PLUMBER = "שכבת הטקסט של הקובץ לא נקראה; כל העמ
 WARN_PAGE_FAILED = "עמוד {page}: לא ניתן היה לחלץ טקסט באיכות מספקת"
 WARN_PICTURES = "{n} תמונות לא נקראו"
 WARN_FONTMAP = "{n} קטעי טקסט נקראו עם תווים שגויים שלא ניתן היה לתקן (מיפוי גופן פגום)"
+WARN_SPACING = "{n} קטעי טקסט נקראו כאותיות בודדות ברווחים לא סדירים ולא ניתן היה לשחזר את המילים"
 NOTE_NOT_READ = "התמונה עדיין לא נקראה"
 
 DEDUPE_TOLERANCE = 1.0  # points: a glyph repeated closer than this (same font and size) is one glyph
@@ -132,6 +139,7 @@ class _Line:
     fm_chars: list[dict] | None = None
     layer_text: str | None = None  # the line as the text layer read it (visual order when the producer wrote so)
     glyphs: list[list[float] | None] | None = None  # per character of ``layer_text``: its glyph's box (None: a gap)
+    flips: list[list[int]] | None = None  # letter-spaced words of ``layer_text`` to read in the order they were drawn
 
     @property
     def bbox(self) -> list[float] | None:
@@ -155,6 +163,7 @@ class _PageOut:
     corruption: float = 0.0  # share of the page's Hebrew words with an unrepaired font-map corruption
     warnings: list[str] = field(default_factory=list)
     frame: tuple | None = None  # the (MediaBox, CropBox, rotation) the text layer was read with (pdfminer)
+    spaced: list[int] = field(default_factory=lambda: [0, 0])  # letter-spaced lines joined, lines left uncertain
 
 
 @dataclass
@@ -168,6 +177,7 @@ class _TextLayer:
     chars: list[tuple[float, float, float, float]] = field(default_factory=list)
     words: list[WordSample] = field(default_factory=list)
     corruption: float = 0.0
+    spaced: list[int] = field(default_factory=lambda: [0, 0])
 
 
 def open_pdf(data: bytes, max_pages: int) -> pdfium.PdfDocument:
@@ -271,6 +281,101 @@ def _uncertain_in(chars: list[dict], bbox) -> str | None:
                  and x0 <= (c["x0"] + c["x1"]) / 2 <= x1 and top <= (c["top"] + c["bottom"]) / 2 <= bottom), None)
 
 
+def _without_bidi(line: dict) -> dict:
+    """The raw line without bidi control characters, in its text and in the glyphs behind it."""
+    text = line["text"]
+    if strip_bidi_controls(text) == text:
+        return line
+    keep = [k for k, ch in enumerate(text) if strip_bidi_controls(ch)]
+    out = line | {"text": "".join(text[k] for k in keep)}
+    if "slots" in line:
+        out["slots"] = [line["slots"][k] for k in keep]
+    return out
+
+
+@dataclass
+class _Joined:
+    joined: letterspacing.Joined
+    glyphs: list  # one glyph (or None) per character of the joined raw text
+
+
+class _SpacedPage:
+    """The letter-spaced lines of one page (KTD12): reads each candidate line against its glyph spacing, and keeps
+    what table cells need: the words of every joined line with their boxes, and the boxes of the runs left uncertain."""
+
+    def __init__(self, page) -> None:
+        self.page = page
+        self._seq: dict[int, int] | None = None
+        self.lines: list[tuple[float, float, list[letterspacing.Word]]] = []  # joined lines: top, bottom, words
+        self.uncertain: list[tuple[tuple[float, float, float, float], str]] = []
+        self.counts = [0, 0]  # joined lines, uncertain lines
+
+    def _seq_of(self, char: dict) -> int:
+        if self._seq is None:
+            self._seq = {id(c): k for k, c in enumerate(self.page.chars)}
+        return self._seq.get(id(char), -1)
+
+    def read(self, ln: dict) -> tuple[dict, _Joined | letterspacing.Verdict | None]:
+        """The line (joined when it was letter-spaced) and what was found: a ``_Joined``, an ``uncertain`` verdict,
+        or None for a line left as read."""
+        raw, slots = ln["text"], ln.get("slots")
+        if slots is None or len(slots) != len(raw) or not letterspacing.is_candidate(raw):
+            return ln, None
+        glyphs = [None if c is None else letterspacing.Glyph(raw[k], float(c["x0"]), float(c["x1"]), float(c["top"]),
+                                                             float(c["bottom"]), self._seq_of(c))
+                  for k, c in enumerate(slots)]
+        verdict = letterspacing.read_line(raw, glyphs, _line_size(ln))
+        if verdict.state == letterspacing.UNCERTAIN:
+            return ln, verdict
+        if verdict.state != letterspacing.JOINED:
+            return ln, None
+        joined = letterspacing.join_line(raw, glyphs, verdict)
+        return (ln | {"text": joined.raw, "slots": [slots[k] for k in joined.keep]},
+                _Joined(joined, [glyphs[k] for k in joined.keep]))
+
+    def add_joined(self, line: _Line, fixed: str, found: _Joined) -> None:
+        self.counts[0] += 1
+        words = letterspacing.line_words(line.layer_text or "", fixed, line.text, found.glyphs, found.joined.ranges)
+        if words is not None and line.bbox is not None:
+            self.lines.append((line.top, line.bottom or line.top, words))
+
+    def add_uncertain(self, verdict: letterspacing.Verdict) -> None:
+        self.counts[1] += 1
+        if verdict.box is not None:
+            self.uncertain.append((verdict.box, verdict.note or letterspacing.NOTE_UNEVEN))
+
+    def cell(self, box, cell_text: str | None) -> tuple[str | None, str | None] | None:
+        """For a table cell with box ``box`` (pdfplumber frame) and the text pdfplumber read from it: its text from the
+        joined lines when it holds joined words, else None. The second part is a note when the cell cannot be told."""
+        x0, top, x1, bottom = box
+        found = []
+        for line_top, line_bottom, words in self.lines:
+            if top <= (line_top + line_bottom) / 2 <= bottom:
+                inside = [w for w in words if x0 <= (w.x0 + w.x1) / 2 <= x1]
+                if inside:
+                    found.append(inside)
+        if not any(w.joined for ws in found for w in ws):
+            return None
+        if len(found) != len([x for x in (cell_text or "").splitlines() if x.strip()]):
+            return None, letterspacing.NOTE_ORDER  # some of the cell's lines were not read from their glyphs
+        return " ".join(w.text for ws in found for w in ws), None
+
+    def table_note(self, bbox) -> str | None:
+        x0, top, x1, bottom = bbox
+        return next((note for (a, b, c, d), note in self.uncertain
+                     if x0 <= (a + c) / 2 <= x1 and top <= (b + d) / 2 <= bottom), None)
+
+
+def _read_flips(line: _Line, fixed: str) -> None:
+    """``line.text`` from the orientation fix of its joined raw text: the words flagged as drawn right to left are
+    reversed back; a fix that cannot be traced leaves the line uncertain."""
+    text = letterspacing.apply_flips(line.layer_text or "", fixed, [(s, e) for s, e in line.flips or []])
+    if text is None:
+        line.text, line.uncertain = fixed, line.uncertain or letterspacing.NOTE_ORDER
+    else:
+        line.text = text
+
+
 def _text_layer(page, index: int, fix: FontMapFix | None = None) -> _TextLayer:
     """The page's text layer. Without ``fix`` it also collects the page's words for font-map detection; with it
     the page is read from its corrected text layer (``FontMapFix.correct_page``)."""
@@ -281,11 +386,18 @@ def _text_layer(page, index: int, fix: FontMapFix | None = None) -> _TextLayer:
     else:
         corrected = fix.correct_page(page)
         page, out.corruption = corrected.page, corrected.corruption
-    raw_lines = _rejoin(_text_lines(page))
+    spacing = _SpacedPage(page)
+    found: list = []
+    raw_lines = []
+    for ln in (_without_bidi(x) for x in _rejoin(_text_lines(page))):
+        if ln["text"].strip():
+            ln, what = spacing.read(ln)
+            raw_lines.append(ln)
+            found.append(what)
     out.raw_texts = raw_texts = [ln["text"] for ln in raw_lines]
     out.visual = visual = page_is_visual(raw_texts)
     fixed = fix_text_lines(raw_texts, default_visual=visual)
-    for ln, t in zip(raw_lines, fixed, strict=True):
+    for ln, t, what in zip(raw_lines, fixed, found, strict=True):
         chars = ln.get("chars") or []
         bold = sum(1 for c in chars if _BOLD.search(c.get("fontname") or "")) * 2 > len(chars) if chars else False
         line = _Line(float(ln["top"]), t, float(ln["bottom"]), float(ln["x0"]), float(ln["x1"]), _line_size(ln),
@@ -295,16 +407,35 @@ def _text_layer(page, index: int, fix: FontMapFix | None = None) -> _TextLayer:
             line.original = fix.original_line(ln["text"], t, chars)
             if line.original is not None:
                 line.raw, line.fm_chars = ln["text"], chars
+        if isinstance(what, _Joined):
+            if what.joined.flips:
+                line.flips = [list(f) for f in what.joined.flips]
+                _read_flips(line, t)
+            spacing.add_joined(line, t, what)
+        elif what is not None:
+            line.uncertain = line.uncertain or what.note
+            spacing.add_uncertain(what)
         out.lines.append(line)
+    out.spaced = spacing.counts
     for t in page.find_tables():
         grid = t.extract()
         if not grid or max(len(r) for r in grid) < 2:
             continue
+        grid = [[strip_bidi_controls(c) if c else c for c in row] for row in grid]
         # pdfplumber returns columns left -> right: reverse to logical order, fix each cell's text.
         rows = [logical_row(r, visual_default=True if visual is None else visual) for r in grid]
         reason = _uncertain_in(page.chars, t.bbox) if fix is not None else None
         # ``extract`` reads ``t.rows`` cell by cell, so its grid and the cell boxes line up (None: a merged cell)
         boxes = [logical_boxes([list(c) if c is not None else None for c in row.cells]) for row in t.rows]
+        if spacing.lines and len(grid) == len(t.rows):
+            for r, (trow, cells) in enumerate(zip(t.rows, grid, strict=True)):
+                for c, cell_box in enumerate(trow.cells if len(trow.cells) == len(cells) else []):
+                    read = spacing.cell(cell_box, cells[c]) if cell_box is not None else None
+                    if read is not None:
+                        if read[0] is not None:
+                            rows[r][len(cells) - 1 - c] = clean_cell(read[0])
+                        reason = reason or read[1]
+        reason = reason or spacing.table_note(t.bbox)
         out.tables.append(([round(float(x), 1) for x in t.bbox], rows, reason, boxes))
     for img in page.images:
         bbox = [round(float(img[k]), 1) for k in ("x0", "top", "x1", "bottom")]
@@ -364,7 +495,7 @@ def _process_page(doc, plumber, index: int, settings: Settings, warnings: list[s
         _mark_table_lines(lines, raws)
         return _PageOut(PageResult(page_no, text, "text_layer", quality, True), lines, raws, layer.pictures,
                         layer.chars, layer.raw_texts if layer.visual is None else None, layer.raw_texts,
-                        words=layer.words, corruption=layer.corruption)
+                        words=layer.words, corruption=layer.corruption, spaced=layer.spaced)
 
     if not ocr.ocr_available(settings.ocr_languages):
         if WARN_NO_OCR not in warnings:
@@ -409,6 +540,8 @@ def orient_pages(outs: list[_PageOut], visual: bool | None) -> None:
             continue
         for ln, t in zip(o.lines, fix_text_lines(o.raw_undecided, default_visual=visual), strict=True):
             ln.text = t
+            if ln.flips:
+                _read_flips(ln, t)
             if ln.fm_chars is not None:
                 ln.original = FontMapFix.original_line(ln.raw, t, ln.fm_chars)
         o.page.text = "\n".join(ln.text for ln in o.lines)
@@ -804,11 +937,14 @@ def assemble_result(windows, page_count: int, warnings: list[str], fix: FontMapF
     reading report."""
     walker = _Walker()
     pages: list[PageResult] = []
+    spaced: list[dict] = []
     for outs in windows:
         for o in outs:
             for w in o.warnings:
                 if w not in warnings:
                     warnings.append(w)
+            if any(o.spaced):
+                spaced.append({"page": o.page.page_no, "joined": o.spaced[0], "uncertain": o.spaced[1]})
         for out in outs:
             for k, raw in enumerate(sorted(out.tables, key=lambda t: t.top)):
                 raw.first_on_page = k == 0
@@ -821,12 +957,18 @@ def assemble_result(windows, page_count: int, warnings: list[str], fix: FontMapF
     report = fix.report()
     result = ExtractionResult(page_count=page_count, pages=pages, tables=tables, chunks=chunks, warnings=warnings,
                               blocks=blocks, uncertain=_uncertain_report(walker.uncertain),
-                              fontmap=report if any(report.values()) else None, repeated=repeated)
+                              fontmap=report if any(report.values()) else None, repeated=repeated,
+                              letter_spaced={"joined": sum(e["joined"] for e in spaced),
+                                             "uncertain": sum(e["uncertain"] for e in spaced), "pages": spaced}
+                              if spaced else None)
     unread = result.components["unread"]
     if unread:
         warnings.append(WARN_PICTURES.format(n=len(unread)))
-    if walker.uncertain:
-        warnings.append(WARN_FONTMAP.format(n=len(walker.uncertain)))
+    spacing = [b for b in walker.uncertain if b.note in letterspacing.NOTES]
+    if len(walker.uncertain) > len(spacing):
+        warnings.append(WARN_FONTMAP.format(n=len(walker.uncertain) - len(spacing)))
+    if spacing:
+        warnings.append(WARN_SPACING.format(n=len(spacing)))
     return result
 
 

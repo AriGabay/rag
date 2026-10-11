@@ -168,6 +168,10 @@ class ExtractionResult:
     # PDF page furniture: each picture repeated through the document and shown as one block
     # ({"hash", "occurrences", "pages", "first_page", "status"}; ``regions.mark_repeated``)
     repeated: list[dict] = field(default_factory=list)
+    # PDF letter-spaced text layers (``app.extraction.letterspacing``): lines joined into words and lines left
+    # uncertain, in all and per page ({"joined", "uncertain", "pages": [{"page", "joined", "uncertain"}]}); None when
+    # no line was letter-spaced
+    letter_spaced: dict | None = None
 
     @property
     def components(self) -> dict:
@@ -197,6 +201,8 @@ class ExtractionResult:
             out["fontmap"] = self.fontmap
         if self.repeated:
             out["repeated_images"] = self.repeated
+        if self.letter_spaced:
+            out["letter_spaced"] = self.letter_spaced
         coverage = self.coverage
         if coverage:
             out["coverage"] = coverage

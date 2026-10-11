@@ -494,3 +494,165 @@ def test_a_reading_resumes_from_its_stage_and_starts_again_when_the_stage_is_dam
     damaged = pdf_windows.StorageStage(store, office, version, "a" * 64)
     got = _snapshot(lambda: pdf_windows.read_pdf(data, time.monotonic() + 600, get_settings(), stage=damaged))
     assert got == whole  # the fully staged reading lost a window: it was read again from the start
+
+
+# --- letter-spaced text layers and bidi marks (U5, KTD12, R4) --------------------------------------------------------
+# R9e draws a plan table glyph by glyph, 4 mm apart, and a numbered heading whose text layer starts with a right-to-left
+# mark. The table's plan number and date must be whole tokens, the heading a heading with its label, and no mark may
+# reach stored text. A run of single characters whose spacing says nothing about words is read_uncertain.
+
+R9E = FIXTURES / "round9" / "R9e_synthetic_letter_spaced_table.pdf"
+BIDI = "[‎‏‪-‮⁦-⁩]"
+
+
+@cache
+def _read_r9e() -> ExtractionResult:
+    return DefaultExtractor().extract(R9E.read_bytes(), PDF, time.monotonic() + 600)
+
+
+def test_r9e_plan_number_and_date_are_whole_tokens():
+    result = _read_r9e()
+    (table,) = result.tables
+    assert [r.cells for r in table.rows] == [["מספר תכנית", "תאריך אישור", "שם התכנית"],
+                                            ["4242", "21/06/2021", "תכנית מתאר"],
+                                            ["4317", "03/11/2022", "תכנית מפורטת"]]
+    chunk_text = "\n".join(c.text for c in result.chunks)
+    assert "4242" in chunk_text and "21/06/2021" in chunk_text
+    assert "4 2 4 2" not in chunk_text and "2 1 /" not in chunk_text
+    page = result.pages[0].text
+    assert "4242 21/06/2021 תכנית מתאר" in page and "4317 03/11/2022 תכנית מפורטת" in page
+
+
+def test_r9e_repaired_text_is_read_and_the_repair_is_in_the_reading_report():
+    result = _read_r9e()
+    table_block = next(b for b in result.blocks if b.kind == "table")
+    assert table_block.status == "read" and table_block.note is None
+    assert result.components["partial"] is False
+    assert result.components["letter_spaced"]["joined"] >= 3 and result.components["letter_spaced"]["uncertain"] == 0
+
+
+def test_r9e_numbered_heading_with_a_mark_is_a_heading_with_its_label():
+    result = _read_r9e()
+    heading = next(b for b in result.blocks if b.kind == "heading" and "מצב תכנוני" in b.text)
+    assert heading.text == "2. מצב תכנוני" and heading.label == "2" and heading.section == "2. מצב תכנוני"
+    after = next(b for b in result.blocks if "התכניות שלעיל" in b.text)
+    assert after.section == "2. מצב תכנוני"
+
+
+def test_no_bidi_control_reaches_stored_text_in_any_fixture():
+    result = _read_r9e()
+    stored = [p.text for p in result.pages] + [b.text for b in result.blocks] + [c.text for c in result.chunks]
+    assert not [t for t in stored if re.search(BIDI, t)]
+    assert not [c for c in result.chunks if re.search(BIDI, c.section or "")]
+
+
+def _spaced_page(rows: list[tuple[float, list[tuple[float, str]]]]) -> bytes:
+    """A page of ordinary Latin text and, below it, glyph-by-glyph rows: (y, [(x, char), ...])."""
+    from fpdf import FPDF
+
+    pdf = FPDF(unit="pt", format="A4")
+    pdf.add_page()
+    pdf.set_font("Helvetica", size=11)
+    for k in range(6):
+        pdf.text(40, 60 + 16 * k, f"Ordinary running text of the synthetic page, written in plain words, line {k}.")
+    for y, glyphs in rows:
+        for x, ch in glyphs:
+            pdf.text(x, y, ch)
+    return bytes(pdf.output())
+
+
+def _row(text: str, x0: float, step: float, word_gap: float = 0.0) -> list[tuple[float, str]]:
+    out, x = [], x0
+    for ch in text:
+        if ch == " ":
+            x += word_gap
+            continue
+        out.append((x, ch))
+        x += step
+    return out
+
+
+def test_a_left_to_right_spaced_word_keeps_its_digit_order():
+    """Glyphs drawn left to right ("T O T A L   1 2 3 4") join into the words in the order drawn."""
+    data = _spaced_page([(200, _row("TOTAL 1234 NET", 60, 16, word_gap=32))])
+    result = DefaultExtractor().extract(data, PDF, time.monotonic() + 60)
+    assert "TOTAL 1234 NET" in result.pages[0].text and "T O T" not in result.pages[0].text
+    block = next(b for b in result.blocks if "TOTAL" in b.text)
+    assert block.status == "read" and block.text == "TOTAL 1234 NET"
+
+
+def test_an_irregular_run_of_single_characters_is_read_uncertain_with_a_note():
+    xs = [60, 75, 97, 114, 140, 171, 190, 230, 254]
+    data = _spaced_page([(200, [(x, ch) for x, ch in zip(xs, "ABCDEFGHI", strict=True)])])
+    result = DefaultExtractor().extract(data, PDF, time.monotonic() + 60)
+    block = next(b for b in result.blocks if "A B C" in b.text)
+    assert block.status == "read_uncertain" and block.note
+    assert result.components["partial"] is True and result.components["letter_spaced"]["uncertain"] == 1
+    from app.extraction import pdf
+
+    assert pdf.WARN_SPACING.format(n=1) in result.warnings and not any("מיפוי גופן" in w for w in result.warnings)
+
+
+def test_a_uniform_spaced_run_with_no_break_between_words_is_read_uncertain():
+    data = _spaced_page([(200, _row("ABCDEFGH", 60, 18))])
+    result = DefaultExtractor().extract(data, PDF, time.monotonic() + 60)
+    block = next(b for b in result.blocks if "A B C" in b.text)
+    assert block.status == "read_uncertain" and block.text == "A B C D E F G H"
+
+
+def test_ordinary_single_letter_words_and_numbers_are_unchanged():
+    from fpdf import FPDF
+
+    pdf = FPDF(unit="pt", format="A4")
+    pdf.add_page()
+    pdf.set_font("Helvetica", size=11)
+    lines = ["Ordinary running text of the synthetic page, written in plain words, line one.",
+             "Items 1 2 3 4 5 6 7 8 9 are listed in the table, and a b c d are the notes.",
+             "Plan A B C D E has a single letter apart from the rest, as an ordinary list."]
+    for k, line in enumerate(lines):
+        pdf.text(40, 60 + 16 * k, line)
+    result = DefaultExtractor().extract(bytes(pdf.output()), PDF, time.monotonic() + 60)
+    assert result.pages[0].text.splitlines() == lines
+    assert all(b.status == "read" and b.original_text is None for b in result.blocks)
+    assert "letter_spaced" not in result.components
+
+
+@pytest.mark.db
+def test_r9e_plan_number_and_date_are_found_by_search(db, monkeypatch):
+    import hashlib
+
+    from sqlalchemy import text
+
+    from app.db import tenant_tx
+    from app.platform import pipeline
+    from app.platform.search import hybrid_search
+    from app.platform.storage import get_storage, storage_key
+    from tests.factories import make_office
+
+    office = make_office(db, "משרד ב", "admin-b@example.test")
+    monkeypatch.setattr("app.extraction.ocr.ocr_available", lambda languages: False)
+    monkeypatch.setattr(pipeline, "vision_reader", lambda ctx: None)
+    monkeypatch.setattr(pipeline, "run_measurements", lambda office_id, version_id: "skipped")
+    data = R9E.read_bytes()
+    sha = hashlib.sha256(data).hexdigest()
+    key = storage_key(office.office_id, sha)
+    get_storage().put(key, data)
+    with tenant_tx(office.ctx()) as conn:
+        doc = conn.execute(text("INSERT INTO documents (office_id, group_id, title) VALUES (app_office(), :g, :t)"
+                                " RETURNING id"), {"g": office.default_group_id, "t": "טבלת תכניות"}).scalar_one()
+        ver = conn.execute(text(
+            "INSERT INTO document_versions (office_id, document_id, version_no, sha256, filename, mime_type,"
+            " size_bytes, storage_key, uploaded_by) VALUES (app_office(), :d, 1, :s, :f, 'application/pdf', :b, :k,"
+            " :u) RETURNING id"),
+            {"d": doc, "s": sha, "f": R9E.name, "b": len(data), "k": key, "u": office.admin_id}).scalar_one()
+    pipeline.process_version(office.office_id, ver)
+
+    with tenant_tx(office.ctx()) as conn:
+        plan = hybrid_search(conn, "4242", 5)
+        date = hybrid_search(conn, "21/06/2021", 5)
+        stored = conn.execute(text("SELECT text FROM chunks WHERE version_id = :v"), {"v": ver}).scalars().all()
+        ing = conn.execute(text("SELECT ingestion FROM document_versions WHERE id = :v"), {"v": ver}).scalar_one()
+    assert plan and "4242" in plan[0]["text"] and date and "21/06/2021" in date[0]["text"]
+    assert not [t for t in stored if re.search(BIDI, t)]
+    assert ing["ingestion_version"] == pipeline.PDF_INGESTION_VERSION
+    assert ing["letter_spaced"]["joined"] >= 3 and ing["letter_spaced"]["uncertain"] == 0 and ing["partial"] is False

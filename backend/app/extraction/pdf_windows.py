@@ -257,7 +257,7 @@ def _enc_line(ln: _Line) -> list:
         {"text": c.get("text")} | ({"fontmap_from": c["fontmap_from"]} if "fontmap_from" in c else {})
         for c in ln.fm_chars]
     return [ln.top, ln.text, ln.bottom, ln.x0, ln.x1, ln.size, ln.bold, ln.in_table, ln.original, ln.uncertain,
-            ln.raw, fm, ln.layer_text, ln.glyphs]
+            ln.raw, fm, ln.layer_text, ln.glyphs, ln.flips]
 
 
 def _enc_table(t: RawTable) -> list:
@@ -283,17 +283,17 @@ def _enc_page_out(o: _PageOut) -> list:
     return [[p.page_no, p.text, p.method, p.quality, p.ok, _enc_geometry(p.geometry), p.printed_label],
             [_enc_line(ln) for ln in o.lines], [_enc_table(t) for t in o.tables],
             [_enc_region(r) for r in o.pictures], o.raw_undecided is not None, o.raw_texts, o.width, o.height,
-            o.corruption, o.warnings, o.frame]
+            o.corruption, o.warnings, o.frame, o.spaced]
 
 
 def _dec_page_out(d: list) -> _PageOut:
-    page, lines, tables, pictures, undecided, raw_texts, width, height, corruption, warnings, frame = d
+    page, lines, tables, pictures, undecided, raw_texts, width, height, corruption, warnings, frame, spaced = d
     geometry = None if page[5] is None else PageGeometry(*page[5])
     return _PageOut(
         PageResult(page[0], page[1], page[2], page[3], page[4], geometry, page[6]),
         [_Line(*ln) for ln in lines], [RawTable(*t) for t in tables], [_dec_region(r) for r in pictures], [],
         raw_texts if undecided else None, raw_texts, width, height, [], corruption, warnings,
-        None if frame is None else tuple(frame))
+        None if frame is None else tuple(frame), spaced)
 
 
 def _enc_content(c: ContentInfo) -> dict:
