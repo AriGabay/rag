@@ -24,6 +24,18 @@ Beside the answer checks, the other layers' pure checks live here too, so a resc
 evidence: ``structure_check`` (a value in a named table row and column, or in a paragraph under a heading),
 ``retrieval_check`` (every required text among the top passages) and ``calc_check`` (a calculation result shown
 at a stated precision).
+
+Round 9 (R29, KTD13) adds measures kept apart from the answer checks and from each other, each reported only when
+the turn names its expectation (``expect_document``: a title fragment; ``expect_unit_pages``: ``[first, last]`` file
+pages; ``expect_source_pages`` and ``expect_read_pages``: lists of pages): unit identification (every cited page of
+the document inside the unit's range), source location (the fraction of the expected pages cited) and reading
+completeness (the fraction of the expected pages read), and the per-stage time of the turns' diagnostics. They are
+never folded into the pass of a conversation or into one number.
+
+The pages a turn read are known from its cited sources only: a source's ``page_list``, else its ``page``, else the
+pages its location text names. The tool records of the turn's timing (``diagnostics.timing.tools``) hold the tool,
+stage, seconds and size of each call, not pages, so a page that was read and not cited is not seen; the read-call
+count is reported beside the measure.
 """
 
 from __future__ import annotations
@@ -353,3 +365,117 @@ def calc_check(answer: dict | None, expect: dict) -> list[str]:
             problems.append(f"תוצאת החישוב {_plain(value)} (בדיוק של {p} ספרות אחרי הנקודה) לא מוצגת"
                             + (f"; מספרים בתשובה: {', '.join(shown[:8])}" if shown else ""))
     return problems
+
+
+# --- round 9 measures: unit identification, source location, reading completeness, time per stage -------------------
+
+STAGES = ("locate", "read", "compute", "compose", "verify", "final")
+_PAGES_TEXT = re.compile(r"עמוד(?:ים)?\s*(\d+)(?:\s*[–-]\s*(\d+))?")
+
+
+def source_pages(source: dict) -> set[int]:
+    """The file pages a cited source stands on: its ``page_list``, else ``page`` (to ``page_end``), else the pages its
+    location text names (an answer stored before the payload carried them)."""
+    pages = {int(p) for p in source.get("page_list") or [] if isinstance(p, int)}
+    if pages:
+        return pages
+    if isinstance(source.get("page"), int):
+        end = source.get("page_end")
+        return set(range(source["page"], (end if isinstance(end, int) and end >= source["page"] else source["page"]) + 1))
+    for m in _PAGES_TEXT.finditer(source.get("location") or ""):
+        pages |= set(range(int(m.group(1)), int(m.group(2) or m.group(1)) + 1))
+    return pages
+
+
+def cited_pages(answer: dict | None, document: str | None = None) -> set[int]:
+    """The pages of the answer's cited sources, those of the documents whose title holds ``document`` when given."""
+    out: set[int] = set()
+    for s in (answer or {}).get("sources") or []:
+        if s.get("kind") == "listing" or (document and norm(document) not in norm(s.get("title") or "")):
+            continue
+        out |= source_pages(s)
+    return out
+
+
+def _read_calls(timing: dict | None) -> int | None:
+    stage = ((timing or {}).get("stages") or {}).get("read")
+    return stage.get("calls") if isinstance(stage, dict) else None
+
+
+def unit_identification(answer: dict | None, expect: dict) -> dict | None:
+    """``expect_unit_pages: [first, last]`` (with ``expect_document``): passed when the document's cited pages are all
+    inside the range and at least one is cited; a failure names the cited pages outside it."""
+    if not expect.get("expect_unit_pages"):
+        return None
+    first, last = (int(p) for p in expect["expect_unit_pages"])
+    cited = sorted(cited_pages(answer, expect.get("expect_document")))
+    outside = [p for p in cited if not first <= p <= last]
+    problems = []
+    if not cited:
+        problems.append("אין מקור מצוטט של המסמך עם עמוד")
+    if outside:
+        problems.append(f"עמודים מצוטטים מחוץ ליחידה ({first}–{last}): {', '.join(map(str, outside))}")
+    return {"passed": not problems, "range": [first, last], "cited": cited, "outside": outside, "problems": problems}
+
+
+def _fraction(expected, have: set[int]) -> dict:
+    want = sorted({int(p) for p in expected})
+    found = [p for p in want if p in have]
+    return {"found": len(found), "of": len(want), "fraction": len(found) / len(want) if want else None,
+            "missing": [p for p in want if p not in have]}
+
+
+def source_location(answer: dict | None, expect: dict) -> dict | None:
+    """``expect_source_pages``: the fraction of those pages the answer cites (of ``expect_document``)."""
+    if not expect.get("expect_source_pages"):
+        return None
+    have = cited_pages(answer, expect.get("expect_document"))
+    return _fraction(expect["expect_source_pages"], have) | {"cited": sorted(have)}
+
+
+def reading_completeness(answer: dict | None, expect: dict, timing: dict | None = None) -> dict | None:
+    """``expect_read_pages``: the fraction of those pages the turn read, known from its cited sources (``signal``)."""
+    if not expect.get("expect_read_pages"):
+        return None
+    have = cited_pages(answer, expect.get("expect_document"))
+    return _fraction(expect["expect_read_pages"], have) | {"signal": "sources", "read_calls": _read_calls(timing)}
+
+
+def turn_measures(answer: dict | None, expect: dict, timing: dict | None = None) -> dict[str, dict]:
+    """The round 9 measures a turn names an expectation for, each under its own key (unit, location, reading)."""
+    found = {"unit": unit_identification(answer, expect), "location": source_location(answer, expect),
+             "reading": reading_completeness(answer, expect, timing)}
+    return {k: v for k, v in found.items() if v is not None}
+
+
+def percentile(xs: list[float], q: float) -> float:
+    """The nearest-rank value at ``q`` of a non-empty list (0.5: the median, as the report has always shown it)."""
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(q * len(xs)))]
+
+
+def turn_timing(turn: dict) -> dict | None:
+    """The stage timing a stored turn's diagnostics hold; None for a turn run before it was recorded."""
+    timing = (turn.get("diagnostics") or {}).get("timing")
+    return timing if isinstance(timing, dict) and isinstance(timing.get("stages"), dict) else None
+
+
+def stage_time_stats(turns: list[dict]) -> dict[str, dict]:
+    """Median, p90 and maximum seconds per stage over the turns that ran the stage (a stage with no calls in a turn is
+    not a measurement of that turn), the turns counted (``n``) and the mean calls; plus the turn's unattributed
+    seconds and total. A stage no turn ran has ``n`` 0 and no values."""
+    timings = [t for turn in turns if (t := turn_timing(turn))]
+
+    def row(xs: list[float], calls: list[int] | None = None) -> dict:
+        if not xs:
+            return {"n": 0, "median": None, "p90": None, "max": None, "calls": None}
+        return {"n": len(xs), "median": percentile(xs, 0.5), "p90": percentile(xs, 0.9), "max": max(xs),
+                "calls": sum(calls) / len(calls) if calls else None}
+
+    out = {}
+    for stage in STAGES:
+        ran = [s for t in timings if (s := t["stages"].get(stage)) and s.get("calls")]
+        out[stage] = row([s["seconds"] for s in ran], [s["calls"] for s in ran])
+    out["unattributed"] = row([t["unattributed_seconds"] for t in timings if "unattributed_seconds" in t])
+    out["total"] = row([t["total_seconds"] for t in timings if "total_seconds" in t])
+    return out

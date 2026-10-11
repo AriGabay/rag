@@ -22,7 +22,13 @@ Separate measures, never folded into one number:
   layer (``must`` / ``must_not`` regular expressions, allowed answer statuses, the documents its sources must and
   must not come from), the structured layer (``eval.scoring``: required documents, value sets, the meaning
   and attribution of values, coverage and hedging), which fails answers that only contain the right words, and
-  the calculation layer (``calc: [{value, precision}]``: a result shown at the stated precision).
+  the calculation layer (``calc: [{value, precision}]``: a result shown at the stated precision);
+- per-turn measures of round 9 (R29), each beside the others and never folded into the conversation's pass or one
+  number, each only for a turn that names its expectation in ``expect`` (or beside it): unit identification
+  (``expect_unit_pages: [first, last]`` file pages, with ``expect_document``, a title fragment), source location
+  (``expect_source_pages``), reading completeness (``expect_read_pages``), and per stage time (median and p90 per
+  stage from the diagnostics' ``timing``) with the cost per turn. The pages read come from the cited sources (the
+  stage clock's tool records hold no pages); the report says so.
 
 Every run records what it ran against (a ``run`` record first in the results): the checkout's commit (``git
 rev-parse``, with whether the tree had changes) or the ``--build`` given, the backend image id given with
@@ -58,7 +64,16 @@ from pathlib import Path
 import httpx
 import yaml
 
-from eval.scoring import calc_check, norm, retrieval_check, structure_check
+from eval.scoring import (
+    calc_check,
+    norm,
+    percentile,
+    retrieval_check,
+    stage_time_stats,
+    structure_check,
+    turn_measures,
+    turn_timing,
+)
 from eval.scoring import check as structured_check
 
 POLL_SECONDS = 1.5
@@ -250,12 +265,13 @@ def check_answers(c: httpx.Client, docs: dict, items: list[dict]) -> list[Result
             expect = t.get("expect") or {}
             problems, structured, calc, lines = grade(m, expect, docs, i + 1)
             original = original_grade(m, t, docs)
+            measures = turn_measures(m.get("answer"), measure_expect(t), turn_timing({"diagnostics": m["_diagnostics"]}))
             ok = ok and not problems and not structured and not calc
             detail += lines
             a = m.get("answer") or {}
             turns.append({"ask": t["ask"], "status": m["status"], "answer_status": a.get("status"),
                           "structured_problems": structured, "passed_original_reference": original,
-                          "calc_problems": calc, "calc_checked": bool(expect.get("calc")),
+                          "calc_problems": calc, "calc_checked": bool(expect.get("calc")), "measures": measures,
                           "markdown": a.get("markdown"), "seconds": m["_seconds"], "problems": problems,
                           "sources": [f"{s['id']} {s['title']} — {s['location']}" for s in a.get("sources") or []],
                           "searches": a.get("searches"), "verification": a.get("verification"),
@@ -267,6 +283,14 @@ def check_answers(c: httpx.Client, docs: dict, items: list[dict]) -> list[Result
                                                             "conversation_id": cid,
                                                             "corrections": corrections_of(it["turns"])}))
     return out
+
+
+MEASURE_KEYS = ("expect_document", "expect_unit_pages", "expect_source_pages", "expect_read_pages")
+
+
+def measure_expect(spec_turn: dict) -> dict:
+    """The round 9 measure expectations of a turn: in its ``expect``, or named beside it."""
+    return {k: spec_turn[k] for k in MEASURE_KEYS if k in spec_turn} | (spec_turn.get("expect") or {})
 
 
 def grade(m: dict, expect: dict, docs: dict, turn: int) -> tuple[list[str], list[str], list[str], list[str]]:
@@ -326,11 +350,13 @@ def rescore(spec: dict, stored: list[dict]) -> list[Result]:
         for i, (t, spec_turn) in enumerate(zip(turns, items[r["id"]]["turns"], strict=False)):
             m = {"status": t["status"], "error": t.get("error"), "answer": t.get("answer") or {
                 "markdown": t.get("markdown"), "status": t.get("answer_status"),
-                "sources": [{"title": s.split(" ", 1)[1].rsplit(" — ", 1)[0]} for s in t.get("sources") or []]}}
+                "sources": [{"title": s.split(" ", 1)[1].rsplit(" — ", 1)[0], "location": s.rsplit(" — ", 1)[-1]}
+                            for s in t.get("sources") or []]}}
             expect = spec_turn.get("expect") or {}
             problems, structured, calc, lines = grade(m, expect, {}, i + 1)
             t["problems"], t["structured_problems"], t["calc_problems"] = problems, structured, calc
             t["calc_checked"] = bool(expect.get("calc"))
+            t["measures"] = turn_measures(m["answer"], measure_expect(spec_turn), turn_timing(t))
             t["passed_original_reference"] = original_grade(m, spec_turn, {})
             ok = ok and not problems and not structured and not calc
             detail += lines
@@ -425,9 +451,7 @@ def usage_summary(results: list[Result]) -> list[str]:
     def mean(xs) -> float:
         return sum(xs) / len(xs)
 
-    def pct(xs, q) -> float:
-        xs = sorted(xs)
-        return xs[min(len(xs) - 1, int(q * len(xs)))]
+    pct = percentile
 
     by_purpose: dict[str, int] = {}
     for u in calls:
@@ -498,10 +522,94 @@ def resolution_lines(turn: dict) -> list[str]:
     return out
 
 
+def stage_time_lines(results: list[Result]) -> list[str]:
+    """Time per stage (R29): median, p90 and maximum seconds over the turns that ran the stage, with the turns counted
+    and the mean calls; a stage no stored turn has a timing for shows "—" (results from before it was recorded)."""
+    turns = [t for r in results if r.kind == "answers" for t in r.data.get("turns", [])]
+    if not turns:
+        return []
+
+    def cell(x, fmt: str = "{:.2f}") -> str:
+        return fmt.format(x) if x is not None else "—"
+
+    stats = stage_time_stats(turns)
+    with_timing = stats["total"]["n"]
+    lines = ["## זמן לפי שלב", "",
+             f"תורות עם תזמון: {with_timing} מתוך {len(turns)}; שניות, רק תורות שהשלב רץ בהן.", "",
+             "| שלב | תורות | חציון | p90 | מקסימום | קריאות לתור |", "|---|---|---|---|---|---|"]
+    for stage, st in stats.items():
+        lines.append(f"| {stage} | {st['n']} | {cell(st['median'])} | {cell(st['p90'])} | {cell(st['max'])} | "
+                     f"{cell(st['calls'], '{:.1f}')} |")
+    return lines + [""]
+
+
+def turn_cost(t: dict) -> float | None:
+    """A turn's cost from its calls' usage; None without usage (calls of unknown price count as nothing)."""
+    return sum(c for u in t["usage"] if (c := call_cost(u)) is not None) if t.get("usage") else None
+
+
+def _mark(ok: bool | None, detail: str = "") -> str:
+    return "—" if ok is None else ("✓" if ok else "✗") + (f" {detail}" if detail else "")
+
+
+def _pages(xs: list[int]) -> str:
+    return ", ".join(map(str, xs))
+
+
+def measure_cells(t: dict) -> list[str]:
+    """One turn's cell per measure, each apart: unit identification, source location, reading completeness,
+    calculation, completeness after verification (the structured layer), then time and cost."""
+    m = t.get("measures") or {}
+    unit, loc, read = m.get("unit"), m.get("location"), m.get("reading")
+    done = t.get("status") == "done"
+    cost = turn_cost(t)
+
+    def fraction(x: dict | None) -> str:
+        if x is None:
+            return "—"
+        return f"{x['found']}/{x['of']}" + (f" (חסרים: {_pages(x['missing'])})" if x["missing"] else "")
+
+    return [
+        _mark(unit["passed"], f"(מחוץ ליחידה: {_pages(unit['outside'])})" if unit['outside'] else
+              ("" if unit["passed"] else "(אין מקור)")) if unit else "—",
+        fraction(loc), fraction(read),
+        _mark(not t.get("calc_problems") if t.get("calc_checked") else None),
+        _mark(not t.get("structured_problems") if done else None),
+        f"{t['seconds']}" if t.get("seconds") is not None else "—",
+        f"{cost:.4f}$" if cost is not None else "—"]
+
+
+def measure_lines(rs: list[Result]) -> list[str]:
+    """The separate measures per turn (R29), one column each, and their totals over the turns that name them."""
+    rows = [(r.id, n, t) for r in rs for n, t in enumerate(r.data.get("turns", []), 1)]
+    if not rows:
+        return []
+    named = {k: [t["measures"][k] for _, _, t in rows if k in (t.get("measures") or {})]
+             for k in ("unit", "location", "reading")}
+    totals = []
+    if named["unit"]:
+        totals.append(f"זיהוי יחידה: {sum(u['passed'] for u in named['unit'])}/{len(named['unit'])} תורות")
+    for key, name in (("location", "מיקום מקורות"), ("reading", "שלמות קריאה")):
+        if named[key]:
+            totals.append(f"{name}: ממוצע {sum(x['fraction'] for x in named[key]) / len(named[key]):.0%} "
+                          f"({len(named[key])} תורות)")
+    lines = ["", "מדדים נפרדים לתור (אינם נספרים בציון השיחה):"]
+    if totals:
+        lines += ["", "- " + "; ".join(totals)]
+    if named["reading"]:
+        lines.append("- שלמות הקריאה נמדדת לפי עמודי המקורות המצוטטים; רשומות הקריאה בתזמון אינן נושאות עמודים, "
+                     "ועמוד שנקרא ולא צוטט אינו נראה")
+    lines += ["", "| שיחה | תור | זיהוי יחידה | מיקום מקורות | שלמות קריאה | חישוב | שלמות אחרי אימות | זמן (שנ׳) | עלות |",
+              "|---|---|---|---|---|---|---|---|---|"]
+    lines += [f"| {cid} | {n} | " + " | ".join(measure_cells(t)) + " |" for cid, n, t in rows]
+    return lines
+
+
 def report(results: list[Result], path: Path, title: str) -> str:
     lines = [f"# {title}", ""]
     lines += run_lines(results)
     lines += usage_summary(results)
+    lines += stage_time_lines(results)
     for kind in ("ingestion", "ingestion_text", "retrieval", "meaning", "answers"):
         rs = [r for r in results if r.kind == kind]
         if not rs:
@@ -533,6 +641,7 @@ def report(results: list[Result], path: Path, title: str) -> str:
             secs = [t["seconds"] for r in rs for t in r.data.get("turns", [])]
             if secs:
                 lines.append(f"\nזמן לתור: חציון {sorted(secs)[len(secs) // 2]} שנ׳, מקסימום {max(secs)} שנ׳")
+            lines += measure_lines(rs)
         lines.append("")
         for r in rs:
             mark = "✓" if r.ok else "✗"
