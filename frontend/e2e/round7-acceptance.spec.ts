@@ -71,7 +71,11 @@ interface Answer {
   computations: Item[];
   components?: { id: string; status: string }[];
   gaps?: { reason: string; text: string; components: string[] }[];
-  verification: { removed: number; removals?: { failure_kind: string }[] } | null;
+  verification: {
+    removed: number;
+    removals?: { failure_kind: string }[];
+    actions?: { removed: number; cut: number; rewritten: number; withheld: number };
+  } | null;
 }
 
 let docs: Record<string, OfficeBDoc> | null = null;
@@ -157,10 +161,14 @@ async function checkDetails(page: Page, reply: Locator, answer: Answer, name: st
   const comps = answer.components ?? [];
   if (comps.length) await expect(reply.getByTestId("components")).toBeVisible();
   const removals = answer.verification?.removals ?? [];
+  // round 8: the notice names every action that changed the shown text (removed, cut, rewritten, withheld); a
+  // rewrite has no removal row, so the notice and the rows are counted apart
+  const acts = answer.verification?.actions;
+  const changed = acts ? acts.removed + acts.cut + acts.rewritten + acts.withheld : removals.length;
+  await expect(reply.getByTestId("removal-notice")).toHaveCount(changed > 0 ? 1 : 0);
   if (!removals.length) {
-    test.info().annotations.push({ type: "removals", description: `${name}: the model's answer had no removal` });
+    test.info().annotations.push({ type: "removals", description: `${name}: the model's answer had no removal row` });
     await expect(reply.getByTestId("removals")).toHaveCount(0);
-    await expect(reply.getByTestId("removal-notice")).toHaveCount(0);
     return;
   }
   test.info().annotations.push({ type: "removals", description: `${name}: ${removals.map((r) => r.failure_kind)}` });
