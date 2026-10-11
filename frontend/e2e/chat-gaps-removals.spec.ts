@@ -1,150 +1,30 @@
-import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
+import { expect, test, type Route } from "@playwright/test";
+import {
+  answerWith,
+  component,
+  cid,
+  count,
+  decision,
+  diagnostics,
+  DRAFT,
+  GAP_LINE,
+  legacyRemoval,
+  message,
+  openAnswer,
+  openDetails,
+  REASON,
+  REMOVAL_SENTENCE,
+  removal,
+  thread,
+  TITLE,
+  DOC,
+  type Json,
+} from "./answer-fixtures";
 import { assistantMessages, composer, login, USERS } from "./helpers";
 
 // Gaps and removals in the answer (round 7 U8, R11, R13, R29). The conversation is real (office B), but its messages,
 // the diagnostics route and the cited document are fixed synthetic payloads: the test checks how the server's gap
 // paragraph, component outcomes and removal decisions are shown, not a model's choices.
-
-const NOW = new Date().toISOString();
-const DOC = "00000000-0000-0000-0000-0000000000d7";
-const VER = "00000000-0000-0000-0000-0000000000a7";
-const BASE = `/api/documents/${DOC}/versions/${VER}`;
-const TITLE = "שומה סינתטית לבדיקת פערים";
-const READING = "reading-synthetic-7";
-const GAP_LINE = "לא אותר בחיפושים שבוצעו: שיעור ההיוון.";
-const DRAFT = "שיעור ההיוון בשומה הוא 7% לשנה.";
-const REASON = "המקור מציין שיעור חודשי, לא שנתי.";
-
-// a 1×1 white PNG: the viewer only needs an image that decodes
-const PNG = Buffer.from(
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC",
-  "base64",
-);
-
-type Json = Record<string, unknown>;
-
-function anchor(): Json {
-  return {
-    v: 1, precision: "span", precision_label: "המקום המצוטט מסומן בעמוד", region: null, degraded: null,
-    document_id: DOC, version_id: VER, reading_id: READING, block_start: 0, block_end: 0,
-    pages: [{ page: 3, printed_label: null, width: 600, height: 900, rects: [[0.1, 0.2, 0.6, 0.25]], focus: [] }],
-    location: { title: TITLE, label: "עמוד 3, סעיף «4. שיטת ההיוון»", page: 3, page_end: null, printed_page: null,
-      section: "4. שיטת ההיוון" },
-    table: null, structured: null, truncated: false,
-  };
-}
-
-function source(id: string, extra: Json = {}): Json {
-  return {
-    id, document_id: DOC, version_id: VER, title: TITLE, section: "4. שיטת ההיוון", location: "עמוד 3", kind: "text",
-    text: "שיעור ההיוון החודשי הוא 0.6%.", block_start: 0, block_end: 0, table_index: null, page_list: [3],
-    chunk_id: null, reading_id: READING, status: "complete", anchor: anchor(), ...extra,
-  };
-}
-
-function component(id: string, text: string, status: string, extra: Json = {}): Json {
-  return {
-    id, text, kind: "information", aspect: "", parent: "", conditional: false, subject: "", status,
-    evidence_state: null, limitation: null, limitation_text: null, stated: false, gap: null, units: [],
-    removed_units: [], absence_units: [], related: [], place: null, document: null, document_id: null,
-    document_title: null, searched: null, claimed: null, detail: "", removal_kinds: [], ...extra,
-  };
-}
-
-const REMOVAL_SENTENCE: Record<string, string> = {
-  wrong_unit: "הוסרה טענה שהציגה נתון ביחידה, בתקופה, בבסיס שטח או במע\"מ שאינם כבמקור.",
-  absent_from_source: "הוסרה טענה שהמקורות שנבדקו אינם מציינים.",
-  not_checked: "הוסרה טענה שלא ניתן היה לבדוק מול המקורות; היא לא נמצאה שגויה.",
-};
-
-function removal(kind: string, componentId: string | null = null): Json {
-  return { failure_kind: kind, component: componentId, text: REMOVAL_SENTENCE[kind] };
-}
-
-/** A round-7 answer: the server's gap paragraph ends the markdown, with its groups, components and removals. */
-function answerWith(extra: Json = {}, verification: Json = {}): Json {
-  const doc = { document_id: DOC, title: TITLE };
-  const markdown = `השווי למ״ר בשומה הוא 9,500 ₪ [S1].\n\n${GAP_LINE}`;
-  return {
-    kind: "rag", status: "partial", markdown, claims: [], clarification: null, missing: null,
-    sources: [source("S1")], measurements: [], computations: [], values: [], assumptions: [], documents: [doc],
-    verification: { judged: true, judge_status: "ok", removed: 0, partial: 0, annotated: 0, correctness: "verified",
-      request_mismatch: false, removals: [],
-      completeness: { status: "partial", requirements: 2, missing: [
-        { id: "N2", text: "שיעור ההיוון", status: "not_answered", reason: "not_located", parent: "", conditional: false },
-      ] }, ...verification },
-    searches: ["שיעור היוון"], coverage: [],
-    ledger: { cited: [doc], scope_kind: "focused", scope_query: "", complete: true },
-    components: [
-      component("N1", "השווי למ״ר", "full", { units: [0], related: ["S1"] }),
-      component("N2", "שיעור ההיוון", "not_answered", { limitation: "not_located",
-        limitation_text: "לא אותר בחיפושים שבוצעו", stated: true, gap: GAP_LINE, searched: true }),
-    ],
-    gaps: [{ reason: "not_located", reason_text: "לא אותר בחיפושים שבוצעו", components: ["N2"], texts: ["שיעור ההיוון"],
-      text: GAP_LINE }],
-    ...extra,
-  };
-}
-
-function message(id: string, role: "user" | "assistant", content: string, answer: Json | null, extra: Json = {}): Json {
-  return { id, role, content, status: "done", error: null, progress: [], answer, reply_to: role === "assistant" ? "m1" : null,
-    client_id: null, created_at: NOW, stale: false, cancel_requested: false, usage: [], ...extra };
-}
-
-function thread(conversationId: string, items: Json[]) {
-  return {
-    conversation: { id: conversationId, title: "בדיקת פערים והסרות", updated_at: NOW, created_at: NOW, archived: false,
-      engine: "rag" },
-    has_more: false, messages: items,
-  };
-}
-
-/** The diagnostics of m2: each removal's draft, factual reason and the sources it was checked against. */
-function diagnostics(removed: Json[]): Json {
-  return { message_id: "m2", rounds: [], removed, resolution: null, limits_hit: [] };
-}
-
-function decision(kind: string, extra: Json = {}): Json {
-  return {
-    text: DRAFT, reason: REASON, severity: "error", kind: "unit", failure_kind: kind, check: "judge", component: "N2",
-    checked_ids: ["S9"], repair_attempted: true,
-    sources: [{ ...source("S9"), type: "sources" }], ...extra,
-  };
-}
-
-/** Logs in, serves `answer` as the reply to one question, and opens the conversation. */
-async function openAnswer(page: Page, answer: Json): Promise<{ id: string; reply: Locator }> {
-  await login(page, USERS.adminB);
-  const { id } = await (await page.request.post("/api/chat/conversations")).json();
-  await page.route(`**/api/chat/conversations/${id}/messages*`, (route) =>
-    route.fulfill({ json: thread(id, [message("m1", "user", "מה השווי למ״ר ומה שיעור ההיוון?", null),
-      message("m2", "assistant", String(answer.markdown), answer)]) }));
-  await page.route("**/api/documents/**/pages/*/image*", (route) =>
-    route.fulfill({ status: 200, contentType: "image/png", body: PNG,
-      headers: { "X-Display-Width": "600", "X-Display-Height": "900", "X-Render-Scale": "1", "X-Scale-Tier": "normal",
-        "X-Reading-State": "current", "Cache-Control": "private, no-store" } }));
-  await page.route("**/api/documents/**/blocks*", (route) =>
-    route.fulfill({ json: { document_id: DOC, version_id: VER, title: TITLE, is_current: true,
-      mime_type: "application/pdf", total: 1, file_url: `${BASE}/file`, reading_id: READING,
-      blocks: [{ index: 0, kind: "paragraph", section: "4. שיטת ההיוון", section_path: ["4. שיטת ההיוון"],
-        paragraph_no: null, page: 3, media: null, source: "text", status: "read", note: null,
-        text: "שיעור ההיוון החודשי הוא 0.6%.", bbox: [60, 100, 540, 160], method: "text_layer",
-        reader_version: "pdf-test", content_hash: null, original_text: null, page_url: `${BASE}/pages/3/image`,
-        region_url: `${BASE}/regions/0/image?reading_id=${READING}` }] } }));
-  await page.goto(`/chat?c=${id}`);
-  const reply = assistantMessages(page).last();
-  await expect(reply).toBeVisible();
-  return { id, reply };
-}
-
-function count(text: string, part: string): number {
-  return text.split(part).length - 1;
-}
-
-async function openDetails(reply: Locator): Promise<void> {
-  await reply.locator("details.msg-details > summary").click();
-  await expect(reply.locator("details.msg-details")).toHaveAttribute("open", "");
-}
 
 // --- the gap summary above the details --------------------------------------------------------------------------
 
@@ -217,7 +97,7 @@ test.describe("removals", () => {
     await page.request.delete(`/api/chat/conversations/${id}`);
   });
 
-  test("expanding a removal shows its kind, the reason and the draft under an unverified label; its source opens the viewer", async ({
+  test("expanding a removal shows its kind, the reason and the draft under a rejected-draft label; its source opens the viewer", async ({
     page,
   }) => {
     const answer = answerWith({}, { removed: 1, correctness: "partial", removals: [removal("wrong_unit", "N2")] });
@@ -249,7 +129,8 @@ test.describe("removals", () => {
     await expect(item.getByTestId("removal-kind")).toBeVisible();
     release();
     const draft = item.getByTestId("removal-draft");
-    await expect(draft).toContainText("טיוטה שלא אומתה");
+    await expect(draft).toContainText("טיוטה שנפסלה");
+    await expect(draft).not.toContainText("טיוטה שלא אומתה");
     await expect(draft).toContainText(DRAFT);
     await expect(item.getByTestId("removal-reason")).toContainText(REASON);
     await expect(item.getByTestId("removal-loading")).toHaveCount(0);
@@ -311,6 +192,47 @@ test.describe("removals", () => {
     await expect(item.getByTestId("removal-error")).toHaveCount(0);
     await expect(item.getByTestId("removal-source")).toHaveCount(0);
     await expect(reply).not.toContainText(DRAFT);
+    await page.request.delete(`/api/chat/conversations/${id}`);
+  });
+
+  test("a message stored before claim ids pairs its rows with the log by position and kind", async ({ page }) => {
+    const old = { claim_id: undefined, action: undefined, verdict: undefined };
+    const answer = answerWith({}, { removed: 2, correctness: "partial", actions: undefined,
+      removals: [legacyRemoval("wrong_unit", "N2"), legacyRemoval("absent_from_source")] });
+    const { id, reply } = await openAnswer(page, answer);
+    await page.route("**/api/chat/messages/m2/diagnostics", (route) =>
+      route.fulfill({ json: diagnostics([decision("wrong_unit", old),
+        decision("absent_from_source", { ...old, text: "טענה שנייה בלי מקור.", reason: "אין במקור." })]) }));
+    // the notice is worded from the rows
+    await expect(reply.getByTestId("removal-notice")).toContainText("האימות הסיר 2 טענות");
+    await openDetails(reply);
+    const items = reply.getByTestId("removal");
+    await expect(items).toHaveCount(2);
+    await items.nth(1).getByRole("button", { name: /פירוט/ }).click();
+    await expect(items.nth(1).getByTestId("removal-draft")).toContainText("טענה שנייה בלי מקור.");
+    await expect(items.nth(1).getByTestId("removal-draft")).not.toContainText(DRAFT);
+    // a position that holds another kind is not this row's entry
+    await items.nth(0).getByRole("button", { name: /פירוט/ }).click();
+    await expect(items.nth(0).getByTestId("removal-draft")).toContainText(DRAFT);
+    await page.request.delete(`/api/chat/conversations/${id}`);
+  });
+
+  test("a row opens the entry of its claim id, whatever else the log holds before it", async ({ page }) => {
+    const answer = answerWith({}, { removed: 1, correctness: "partial",
+      actions: { removed: 1, cut: 0, rewritten: 0, withheld: 0, qualified: 1, cited: 0 },
+      removals: [removal("wrong_unit", "N2", { claim_id: cid(2) })] });
+    const { id, reply } = await openAnswer(page, answer);
+    await page.route("**/api/chat/messages/m2/diagnostics", (route) =>
+      route.fulfill({ json: diagnostics([
+        decision("absent_from_source", { claim_id: cid(1), action: "qualified", text: "טענה שנשארה עם סייג.",
+          remaining: "טענה שנשארה עם סייג.", reason: "המקור מציין זאת רק בחלקו.", severity: "partial" }),
+        decision("wrong_unit", { claim_id: cid(2) }),
+      ]) }));
+    await openDetails(reply);
+    const item = reply.getByTestId("removal").first();
+    await item.getByRole("button", { name: /פירוט/ }).click();
+    await expect(item.getByTestId("removal-draft")).toContainText(DRAFT);
+    await expect(item).not.toContainText("טענה שנשארה עם סייג.");
     await page.request.delete(`/api/chat/conversations/${id}`);
   });
 

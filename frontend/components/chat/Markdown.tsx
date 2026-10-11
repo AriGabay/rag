@@ -3,6 +3,7 @@
 import { memo, useMemo } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { CUT_MARKER } from "@/lib/format";
 
 /** Citation ids an answer may carry: passages (S), measurements (M), values (V), user assumptions (A),
  * calculations (C). */
@@ -41,13 +42,22 @@ function withCitationLinks(markdown: string): string {
   );
 }
 
+/** The server's cut markers «[N: חלק שלא אומת הושמט]» become links to `#cut-N`, keeping the marker's own words as the
+ * link text, so the displayed text stays the saved text; `components.a` renders them apart from the model's words. */
+function withCutLinks(markdown: string): string {
+  return markdown.replace(CUT_MARKER, (_all, n: string) => `[«\\[${n}: חלק שלא אומת הושמט\\]»](#cut-${n})`);
+}
+
 interface Props {
   markdown: string;
   citations: Map<string, CitationTarget>;
   onCite: (id: string) => void;
+  /** The ordinals of the markers that have an entry in the details (round 8 U8); the others are shown, not linked. */
+  cuts?: ReadonlySet<number>;
+  onCut?: (ordinal: number) => void;
 }
 
-function MarkdownImpl({ markdown, citations, onCite }: Props) {
+function MarkdownImpl({ markdown, citations, onCite, cuts, onCut }: Props) {
   const components = useMemo<Components>(
     () => ({
       a({ href, children }) {
@@ -67,6 +77,28 @@ function MarkdownImpl({ markdown, citations, onCite }: Props) {
             </button>
           );
         }
+        if (href && href.startsWith("#cut-")) {
+          const n = Number(href.slice(5));
+          if (cuts?.has(n) && onCut) {
+            return (
+              <button
+                type="button"
+                className="cut-marker"
+                data-testid="cut-marker"
+                data-ordinal={n}
+                aria-label={`חלק שלא אומת הושמט ${n}: פתיחת הפירוט`}
+                onClick={() => onCut(n)}
+              >
+                {children}
+              </button>
+            );
+          }
+          return (
+            <span className="cut-marker" data-testid="cut-marker" data-ordinal={n}>
+              {children}
+            </span>
+          );
+        }
         // Answers carry no outside links: any other link is shown as its text only.
         return <>{children}</>;
       },
@@ -81,11 +113,11 @@ function MarkdownImpl({ markdown, citations, onCite }: Props) {
         return null;
       },
     }),
-    [citations, onCite],
+    [citations, onCite, cuts, onCut],
   );
   return (
     <ReactMarkdown remarkPlugins={[remarkGfm]} components={components} skipHtml>
-      {withCitationLinks(markdown)}
+      {withCutLinks(withCitationLinks(markdown))}
     </ReactMarkdown>
   );
 }

@@ -393,3 +393,63 @@ export function gapReasonText(reason: string | null | undefined): string {
 export function failureKindText(kind: string | null | undefined): string {
   return (kind && FAILURE_KIND_LABEL[kind]) || "הוסרה באימות";
 }
+
+// --- what verification did to a claim (round 8 U8, R23): the action, in words --------------------------------------
+
+/** What was done to a claim: taken out of the text (`removed`), held back because its check did not complete
+ * (`withheld`), a part of its sentence cut (`cut`), rewritten, kept with a qualifier, or given a citation. */
+export type ChangeAction = "removed" | "withheld" | "cut" | "rewritten" | "qualified" | "cited";
+
+/** The actions that change what the answer says; the notice above the details counts only these. */
+export const CONTENT_ACTIONS: readonly ChangeAction[] = ["removed", "cut", "rewritten", "withheld"];
+
+export const CHANGE_ACTION_LABEL: Record<ChangeAction, string> = {
+  removed: "הוסרה",
+  withheld: "לא נבדקה עד הסוף",
+  cut: "חלק מהמשפט הושמט",
+  rewritten: "נוסחה מחדש",
+  qualified: "נשארה עם סייג",
+  cited: "צורף ציטוט",
+};
+
+/** The action of a summary row: its own, else (a row stored before round 8) a claim the check could not complete was
+ * withheld and any other was removed. */
+export function rowChangeAction(row: { action?: string; failure_kind: string }): ChangeAction {
+  if (row.action === "removed" || row.action === "withheld" || row.action === "cut") return row.action;
+  return row.failure_kind === "not_checked" ? "withheld" : "removed";
+}
+
+/** Why a withheld claim is not in the answer: the check did not complete — never that the claim was wrong or absent. */
+export const WITHHELD_CAUSE_TEXT: Record<string, string> = {
+  check_failed: "הבדיקה לא הושלמה בגלל תקלה בבדיקה. הטענה לא נמצאה שגויה ולא נמצאה חסרה.",
+  omitted: "הבדיקה לא החזירה תשובה לטענה זו, ולכן לא ניתן היה להשלים אותה. הטענה לא נמצאה שגויה.",
+  not_classified: "הבדיקה לא סיווגה את הטענה כטענה לבדיקה, ולכן היא לא אומתה. הטענה לא נמצאה שגויה.",
+};
+export const WITHHELD_DEFAULT_TEXT = "הבדיקה לא הושלמה. הטענה לא נמצאה שגויה ולא נמצאה חסרה.";
+
+/** The cut marker the server writes in the answer's text: «[N: חלק שלא אומת הושמט]». */
+export const CUT_MARKER = /«\[(\d+): חלק שלא אומת הושמט\]»/g;
+
+/** The default notice's sentence for the content-affecting actions it counts (`counts` by action), without the verb
+ * "removed" when nothing was removed. Empty when none was. */
+export function contentActionsText(counts: Partial<Record<ChangeAction, number>>): string {
+  const n = (a: ChangeAction) => counts[a] ?? 0;
+  const parts: string[] = [];
+  if (n("removed")) parts.push(n("removed") === 1 ? "האימות הסיר טענה אחת" : `האימות הסיר ${n("removed")} טענות`);
+  if (n("cut")) {
+    parts.push(
+      n("cut") === 1
+        ? "הושמט חלק שלא אומת ממשפט אחד"
+        : `הושמטו חלקים שלא אומתו מ-${n("cut")} משפטים`,
+    );
+  }
+  if (n("rewritten")) parts.push(n("rewritten") === 1 ? "טענה אחת נוסחה מחדש" : `${n("rewritten")} טענות נוסחו מחדש`);
+  if (n("withheld")) {
+    parts.push(
+      n("withheld") === 1
+        ? "טענה אחת לא הוצגה כי בדיקתה לא הושלמה"
+        : `${n("withheld")} טענות לא הוצגו כי בדיקתן לא הושלמה`,
+    );
+  }
+  return parts.join("; ");
+}

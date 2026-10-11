@@ -1137,6 +1137,79 @@ details.msg-details[open] {
   padding-inline-start: 18px;
 }
 
+/* --- what verification did to a claim, linked to its entry by claim id (round 8 U8) -------------------------- */
+
+.change-action {
+  display: inline-block;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--warn);
+  background: var(--warn-soft);
+}
+
+.change-action[data-action="qualified"],
+.change-action[data-action="cited"] {
+  color: var(--chat-text);
+  background: var(--primary-soft);
+}
+
+/* the failing part of a sentence inside the original wording: marked, not struck out, and only inside the draft block */
+.change-unsupported {
+  padding: 0 2px;
+  border-radius: 3px;
+  background: var(--warn-soft);
+  color: inherit;
+}
+
+.change-kept {
+  margin: 6px 0;
+}
+
+.change-kept blockquote {
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+}
+
+.other-changes {
+  margin-top: 6px;
+}
+
+.removal[data-focused="true"] {
+  outline: 2px solid var(--chat-accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* the server's marker for a part it left out of a sentence: set apart from the model's words, and linked to its entry */
+.cut-marker {
+  display: inline;
+  margin: 0 2px;
+  padding: 0 6px;
+  border: 1px dashed var(--warn);
+  border-radius: 6px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font: inherit;
+  font-size: 0.88em;
+  font-weight: 600;
+  line-height: 1.6;
+  text-align: start;
+  unicode-bidi: isolate;
+  overflow-wrap: anywhere;
+}
+
+button.cut-marker {
+  cursor: pointer;
+}
+
+button.cut-marker:hover,
+button.cut-marker:focus-visible {
+  outline: 2px solid var(--chat-accent);
+  outline-offset: 1px;
+}
+
 .chat-scrim {
   display: none;
 }

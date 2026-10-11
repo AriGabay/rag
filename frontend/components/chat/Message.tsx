@@ -17,6 +17,7 @@ import type {
   ChatSource,
   ChatValue,
   ChatVerification,
+  ChatVerificationActions,
   LedgerDocument,
   LedgerTable,
   ViewerNav,
@@ -24,14 +25,20 @@ import type {
 } from "@/lib/chatTypes";
 import { ApiError, chatApi, isAbortError } from "@/lib/api";
 import {
+  CHANGE_ACTION_LABEL,
   COMPONENT_KIND_LABEL,
   COMPONENT_STATUS_LABEL,
   VALUE_STATUS,
+  WITHHELD_CAUSE_TEXT,
+  WITHHELD_DEFAULT_TEXT,
+  type ChangeAction,
   type ValueStatus,
   chatValueStatus,
+  contentActionsText,
   failureKindText,
   gapReasonText,
   measurementValueStatus,
+  rowChangeAction,
   valueStatusText,
 } from "@/lib/format";
 import { type CitationTarget, Markdown, citationOrder, plainAnswer } from "./Markdown";
@@ -204,6 +211,13 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
   // a hidden answer keeps only its kind: it has no text or sources to cite
   const citations = useMemo(() => (answer && !answer.hidden ? citationTargets(answer) : new Map()), [answer]);
   const cite = useCallback((id: string) => answer && onCite(answer, id, message), [answer, onCite, message]);
+  // a cut marker in the body opens its own entry in the details (round 8 U8); `tick` makes a second click count
+  const [focus, setFocus] = useState<CutFocus | null>(null);
+  const cutOrdinals = useMemo(
+    () => new Set(cutRows(answer?.verification?.removals).map((r) => r.ordinal as number)),
+    [answer],
+  );
+  const openCut = useCallback((ordinal: number) => setFocus((f) => ({ ordinal, tick: (f?.tick ?? 0) + 1 })), []);
 
   if (message.status === "running" || message.status === "cancelling") {
     const steps = message.progress.filter((p) => p.step !== "queued");
@@ -285,7 +299,7 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
         <div className="stale-note">המסמכים או ההרשאות השתנו מאז התשובה. מומלץ לשאול שוב לקבלת תשובה עדכנית.</div>
       )}
       <div className="body" dir="rtl">
-        <Markdown markdown={answer.markdown} citations={citations} onCite={cite} />
+        <Markdown markdown={answer.markdown} citations={citations} onCite={cite} cuts={cutOrdinals} onCut={openCut} />
       </div>
       <AnswerQuality answer={answer} />
       <div className="msg-actions">
@@ -305,15 +319,46 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
         messageId={message.id}
         citations={citations}
         onCite={cite}
+        focus={focus}
         onOpenSource={onOpenSource}
       />
     </div>
   );
 }
 
+/** The marker the user clicked in the answer's body: which cut, and a counter so that clicking it again opens it again. */
+interface CutFocus {
+  ordinal: number;
+  tick: number;
+}
+
+/** The summary rows of cuts that carry the ordinal of their marker in the text. */
+function cutRows(rows: ChatRemoval[] | undefined): ChatRemoval[] {
+  return (rows ?? []).filter((r) => r.action === "cut" && typeof r.ordinal === "number");
+}
+
 /** An answer stored with round 7's component outcomes: its markdown ends with the server's gap paragraph (KTD4). */
 function hasComponents(answer: ChatAnswer): boolean {
   return answer.components !== undefined || answer.gaps !== undefined;
+}
+
+/** How many claims each content-affecting action touched (removed, cut, rewritten, withheld): the payload's counts; for
+ * an answer stored without them, its rows. Qualified and cited claims change no content and are not counted. */
+function contentCounts(v: ChatVerification | null | undefined): Partial<Record<ChangeAction, number>> {
+  if (!v) return {};
+  if (v.actions) {
+    return { removed: v.actions.removed, cut: v.actions.cut, rewritten: v.actions.rewritten, withheld: v.actions.withheld };
+  }
+  const out: Partial<Record<ChangeAction, number>> = {};
+  for (const r of v.removals ?? []) {
+    const a = rowChangeAction(r);
+    out[a] = (out[a] ?? 0) + 1;
+  }
+  return out;
+}
+
+function sum(counts: Partial<Record<ChangeAction, number>>): number {
+  return Object.values(counts).reduce((a, b) => a + (b ?? 0), 0);
 }
 
 /** The most frequent failure kind of the removals (the first one on a tie). */
@@ -342,16 +387,18 @@ function AnswerQuality({ answer }: { answer: ChatAnswer }) {
   const completeness = verification?.completeness;
   const correctness = verification?.correctness;
   const removals = verification?.removals ?? [];
+  // what changed the text (removed, cut, rewritten, withheld); qualified and cited claims appear in the details only
+  const affected = sum(contentCounts(verification));
   const incomplete = !clarification && completeness && completeness.status !== "full";
   // claims only removed (none partly supported): the removal notice says it, with its kind, instead of the
   // generic correctness line
-  const onlyRemoved = correctness === "partial" && removals.length > 0 && !verification?.partial;
+  const onlyRemoved = correctness === "partial" && affected > 0 && !verification?.partial;
   // results kept with the server's conditional qualifier, and nothing else partial or removed
   const onlyConditional =
-    correctness === "partial" && (verification?.conditional ?? 0) > 0 && removals.length === 0 &&
+    correctness === "partial" && (verification?.conditional ?? 0) > 0 && affected === 0 &&
     !verification?.partial && !verification?.removed;
   const doubtful = correctness && correctness !== "verified" && !onlyRemoved;
-  if (!clarification && !incomplete && !doubtful && removals.length === 0) return null;
+  if (!clarification && !incomplete && !doubtful && affected === 0) return null;
   const structured = hasComponents(answer);
   const pending = clarification ? pendingDetail(answer) : "";
   return (
@@ -382,9 +429,9 @@ function AnswerQuality({ answer }: { answer: ChatAnswer }) {
           ))}
         </p>
       )}
-      {removals.length > 0 && (
+      {affected > 0 && (
         <p className="removal-line" data-testid="removal-notice" data-kind={dominantKind(removals)}>
-          {removalNotice(removals)}
+          {verification?.actions ? changesNotice(contentCounts(verification), removals) : removalNotice(removals)}
         </p>
       )}
       {doubtful && (
@@ -396,7 +443,17 @@ function AnswerQuality({ answer }: { answer: ChatAnswer }) {
   );
 }
 
-/** "Verification removed 2 claims; mostly: …" — the count and the dominant kind's label, never a claim's words. */
+/** What verification did to the text, counted by action — "הושמטו חלקים שלא אומתו מ-2 משפטים" when nothing was removed
+ * — with the dominant kind's label of the rows that name one, never a claim's words (round 8 U8). */
+function changesNotice(counts: Partial<Record<ChangeAction, number>>, rows: ChatRemoval[]): string {
+  const head = contentActionsText(counts);
+  if (rows.length === 0) return `${head}. הפירוט בפרטים שמתחת לתשובה.`;
+  const mixed = new Set(rows.map((r) => r.failure_kind)).size > 1;
+  return `${head}; ${mixed ? "הסיבה העיקרית" : "הסיבה"}: ${failureKindText(dominantKind(rows))}. הפירוט בפרטים שמתחת לתשובה.`;
+}
+
+/** "Verification removed 2 claims; mostly: …" — the count and the dominant kind's label, never a claim's words (an
+ * answer stored before round 8 has no per-action counts). */
 function removalNotice(removals: ChatRemoval[]): string {
   const kind = failureKindText(dominantKind(removals));
   const mixed = new Set(removals.map((r) => r.failure_kind)).size > 1;
@@ -409,20 +466,32 @@ function AnswerDetails({
   messageId,
   citations,
   onCite,
+  focus,
   onOpenSource,
 }: {
   answer: ChatAnswer;
   messageId: string;
   citations: Map<string, CitationTarget>;
   onCite: (id: string) => void;
+  focus: CutFocus | null;
   onOpenSource?: (nav: ViewerNav) => void;
 }) {
   const ordered = [...citations.values()];
   const verification = answer.verification;
-  const changed = verification ? verification.removed + verification.partial + verification.annotated : 0;
+  const actions = verification?.actions;
+  const changed = verification
+    ? verification.removed + verification.partial + verification.annotated +
+      (actions ? actions.removed + actions.cut + actions.rewritten + actions.withheld + actions.qualified + actions.cited : 0)
+    : 0;
   const coverage = answer.coverage.at(-1);
+  // a cut marker clicked in the body opens the details, then its own entry (`RemovalItem`)
+  const detailsRef = useRef<HTMLDetailsElement>(null);
+  const focusTick = focus?.tick;
+  useEffect(() => {
+    if (focusTick && detailsRef.current) detailsRef.current.open = true;
+  }, [focusTick]);
   return (
-    <details className="msg-details">
+    <details className="msg-details" ref={detailsRef}>
       <summary>מקורות ופרטים ({ordered.length})</summary>
       {ordered.length > 0 && (
         <div className="details-section">
@@ -482,23 +551,31 @@ function AnswerDetails({
             {verification.removed > 0 && !verification.removals && (
               <li>הוסרו {verification.removed} טענות שלא נמצאה להן תמיכה במקורות.</li>
             )}
-            {verification.removals && verification.removals.length > 0 && (
-              <li>
-                {verification.removals.length === 1
-                  ? "האימות הסיר טענה אחת מהתשובה."
-                  : `האימות הסיר ${verification.removals.length} טענות מהתשובה.`}
-              </li>
+            {actions ? (
+              <ActionLines actions={actions} />
+            ) : (
+              verification.removals &&
+              verification.removals.length > 0 && (
+                <li>
+                  {verification.removals.length === 1
+                    ? "האימות הסיר טענה אחת מהתשובה."
+                    : `האימות הסיר ${verification.removals.length} טענות מהתשובה.`}
+                </li>
+              )
             )}
             {verification.partial > 0 && <li>{verification.partial} טענות אומתו חלקית (מסומנות בתשובה).</li>}
             {verification.annotated > 0 && (
               <li>ל-{verification.annotated} נתונים נוסף ליד המספר תיאור שנכתב במקור (מסומן «כפי שנכתב במקור»).</li>
             )}
           </ul>
-          {verification.removals && verification.removals.length > 0 && (
+          {((verification.removals && verification.removals.length > 0) ||
+            (actions && actions.rewritten + actions.qualified + actions.cited > 0)) && (
             <RemovalsSection
-              removals={verification.removals}
+              removals={verification.removals ?? []}
+              otherChanges={actions ? actions.rewritten + actions.qualified + actions.cited : 0}
               components={answer.components ?? []}
               messageId={messageId}
+              focus={focus}
               onOpenSource={onOpenSource}
             />
           )}
@@ -529,6 +606,50 @@ function AnswerDetails({
         </div>
       )}
     </details>
+  );
+}
+
+/** One line per action that touched a claim (round 8 U8): what changed in the text first, then the qualifiers and
+ * the citations it added. */
+function ActionLines({ actions }: { actions: ChatVerificationActions }) {
+  const n = (k: keyof ChatVerificationActions) => actions[k];
+  return (
+    <>
+      {n("removed") > 0 && (
+        <li>{n("removed") === 1 ? "האימות הסיר טענה אחת מהתשובה." : `האימות הסיר ${n("removed")} טענות מהתשובה.`}</li>
+      )}
+      {n("cut") > 0 && (
+        <li>
+          {n("cut") === 1
+            ? "הושמט חלק שלא אומת ממשפט אחד (מסומן בתשובה)."
+            : `הושמטו חלקים שלא אומתו מ-${n("cut")} משפטים (מסומנים בתשובה).`}
+        </li>
+      )}
+      {n("rewritten") > 0 && (
+        <li>{n("rewritten") === 1 ? "טענה אחת נוסחה מחדש ונבדקה שוב." : `${n("rewritten")} טענות נוסחו מחדש ונבדקו שוב.`}</li>
+      )}
+      {n("withheld") > 0 && (
+        <li>
+          {n("withheld") === 1
+            ? "טענה אחת לא הוצגה כי בדיקתה לא הושלמה."
+            : `${n("withheld")} טענות לא הוצגו כי בדיקתן לא הושלמה.`}
+        </li>
+      )}
+      {n("qualified") > 0 && (
+        <li>
+          {n("qualified") === 1
+            ? "טענה אחת נשארה בתשובה עם סייג מהמקור."
+            : `${n("qualified")} טענות נשארו בתשובה עם סייג מהמקור.`}
+        </li>
+      )}
+      {n("cited") > 0 && (
+        <li>
+          {n("cited") === 1
+            ? "לטענה אחת צורף ציטוט מהמקור שנבדק."
+            : `ל-${n("cited")} טענות צורף ציטוט מהמקור שנבדק.`}
+        </li>
+      )}
+    </>
   );
 }
 
@@ -669,8 +790,8 @@ function ComponentsSection({
   );
 }
 
-/** A diagnostics request shared by the removals of one message while it is in flight (`RemovalsSection`): `waiting`
- * counts the expanded removals still waiting for it; the last one to stop waiting aborts it. */
+/** A diagnostics request shared by the entries of one message while it is in flight (`RemovalsSection`): `waiting`
+ * counts the expanded entries still waiting for it; the last one to stop waiting aborts it. */
 type SharedDiagnostics = {
   messageId: string;
   promise: Promise<ChatDiagnostics>;
@@ -678,18 +799,35 @@ type SharedDiagnostics = {
   waiting: number;
 };
 
-/** Each claim verification removed: its kind and the server's fixed sentence; expanded, its draft and factual reason
- * from the diagnostics route (`RemovalItem`). Removals expanded while a request is in flight share it; it is dropped
- * once it settles, so every later expand asks the route again (nothing is cached). */
+type Diagnostics = (signal: AbortSignal) => Promise<ChatDiagnostics>;
+
+/** The row's decision in the diagnostics: by claim id (round 8 U7); only a row of an older message, which has no
+ * claim id, is paired by its position and kind (the old log held the removals alone, in the rows' order). */
+function pairDecision(d: ChatDiagnostics, row: ChatRemoval, index: number): ChatRemovalDecision | undefined {
+  if (!Array.isArray(d.removed)) return undefined;
+  if (row.claim_id) return d.removed.find((x) => x.claim_id === row.claim_id);
+  const item = d.removed[index];
+  return item && !item.claim_id && (item.failure_kind || "absent_from_source") === row.failure_kind ? item : undefined;
+}
+
+/** The claims verification took out of or changed in the text: each row's kind, action and the server's fixed
+ * sentence; expanded, its draft, reason and checked sources from the diagnostics route (`RemovalItem`), paired by claim
+ * id. Entries expanded while a request is in flight share it; it is dropped once it settles, so every later expand
+ * asks the route again (nothing is cached). Claims rewritten, qualified or cited have no row on the normal path; their
+ * count leads to the same details (`OtherChanges`). */
 function RemovalsSection({
   removals,
+  otherChanges,
   components,
   messageId,
+  focus,
   onOpenSource,
 }: {
   removals: ChatRemoval[];
+  otherChanges: number;
   components: ChatComponent[];
   messageId: string;
+  focus: CutFocus | null;
   onOpenSource?: (nav: ViewerNav) => void;
 }) {
   const byId = new Map(components.map((c) => [c.id, c]));
@@ -729,54 +867,62 @@ function RemovalsSection({
     },
     [messageId],
   );
+  // an entry is keyed by its claim id (an older row, which has none, by its position)
+  const seen = new Map<string, number>();
+  const keyed = removals.map((r, i) => {
+    const base = r.claim_id ?? `row-${i}`;
+    const n = seen.get(base) ?? 0;
+    seen.set(base, n + 1);
+    return { row: r, index: i, key: n ? `${base}#${n}` : base };
+  });
   return (
-    <ul className="removals" data-testid="removals">
-      {removals.map((r, i) => (
-        <RemovalItem
-          key={i}
-          removal={r}
-          index={i}
-          component={r.component ? byId.get(r.component) : undefined}
+    <>
+      {keyed.length > 0 && (
+        <ul className="removals" data-testid="removals">
+          {keyed.map(({ row, index, key }) => (
+            <RemovalItem
+              key={key}
+              removal={row}
+              index={index}
+              component={row.component ? byId.get(row.component) : undefined}
+              diagnostics={diagnostics}
+              focus={focus}
+              onOpenSource={onOpenSource}
+            />
+          ))}
+        </ul>
+      )}
+      {otherChanges > 0 && (
+        <OtherChanges
+          count={otherChanges}
+          rowIds={new Set(removals.map((r) => r.claim_id).filter((x): x is string => !!x))}
           diagnostics={diagnostics}
           onOpenSource={onOpenSource}
         />
-      ))}
-    </ul>
+      )}
+    </>
   );
 }
 
-type RemovalState =
+type Loaded<T> =
   | { phase: "idle" }
   | { phase: "loading" }
   | { phase: "error" }
-  /** The route answered 404 (a document behind the answer is no longer visible), or it has no matching decision. */
+  /** The route answered 404 (a document behind the answer is no longer visible), or it has no matching entry. */
   | { phase: "gone" }
-  | { phase: "ready"; decision: ChatRemovalDecision };
+  | { phase: "ready"; value: T };
 
-/** One removed claim. Its draft text and reason are loaded from the diagnostics route on every expand (`diagnostics`:
- * the section's request, shared while in flight) and dropped on collapse: nothing is cached, so a draft is never shown
- * once the route no longer serves it. While loading the kind stays visible; a failure offers a retry; a 404 leaves
- * the kind only. */
-function RemovalItem({
-  removal,
-  index,
-  component,
-  diagnostics,
-  onOpenSource,
-}: {
-  removal: ChatRemoval;
-  index: number;
-  component: ChatComponent | undefined;
-  diagnostics: (signal: AbortSignal) => Promise<ChatDiagnostics>;
-  onOpenSource?: (nav: ViewerNav) => void;
-}) {
+/** An expandable entry whose content comes from the diagnostics route on every expand (`diagnostics`: the section's
+ * request, shared while in flight) and is dropped on collapse: nothing is cached, so a draft is never shown once the
+ * route no longer serves it. `pick` takes the entry's part of the response (undefined: no matching entry). */
+function useExpandable<T>(diagnostics: Diagnostics, pick: (d: ChatDiagnostics) => T | undefined) {
   const [open, setOpen] = useState(false);
-  const [state, setState] = useState<RemovalState>({ phase: "idle" });
+  const [state, setState] = useState<Loaded<T>>({ phase: "idle" });
   const ctrl = useRef<AbortController | null>(null);
-  const panelId = useId();
+  const isOpen = useRef(false);
   useEffect(() => () => ctrl.current?.abort(), []);
 
-  const load = () => {
+  const load = useCallback(() => {
     ctrl.current?.abort();
     const c = new AbortController();
     ctrl.current = c;
@@ -784,32 +930,136 @@ function RemovalItem({
     diagnostics(c.signal)
       .then((d) => {
         if (c.signal.aborted) return;
-        const item = Array.isArray(d.removed) ? d.removed[index] : undefined;
-        // the decisions come in the order of the summaries; one of another kind is not this claim's
-        const same = item && (item.failure_kind || "absent_from_source") === removal.failure_kind;
-        setState(same ? { phase: "ready", decision: item } : { phase: "gone" });
+        const value = pick(d);
+        setState(value !== undefined ? { phase: "ready", value } : { phase: "gone" });
       })
       .catch((err: unknown) => {
         if (c.signal.aborted || isAbortError(err)) return;
         setState(err instanceof ApiError && err.status === 404 ? { phase: "gone" } : { phase: "error" });
       });
-  };
+  }, [diagnostics, pick]);
 
-  const toggle = () => {
-    if (open) {
+  const expand = useCallback(() => {
+    if (isOpen.current) return;
+    isOpen.current = true;
+    setOpen(true);
+    load();
+  }, [load]);
+
+  const toggle = useCallback(() => {
+    if (isOpen.current) {
       ctrl.current?.abort();
+      isOpen.current = false;
       setOpen(false);
       setState({ phase: "idle" });
       return;
     }
-    setOpen(true);
-    load();
-  };
+    expand();
+  }, [expand]);
+
+  return { open, state, load, expand, toggle };
+}
+
+/** What an expanded entry shows while its content loads, fails or is gone. */
+function ExpandedState<T>({
+  state,
+  load,
+  children,
+}: {
+  state: Loaded<T>;
+  load: () => void;
+  children: (value: T) => React.ReactNode;
+}) {
+  return (
+    <>
+      {state.phase === "loading" && (
+        <span className="removal-loading" role="status" data-testid="removal-loading">
+          <span className="dot-pulse" aria-hidden="true" /> טוען את פירוט הטענה…
+        </span>
+      )}
+      {state.phase === "error" && (
+        <p className="removal-error" role="alert" data-testid="removal-error">
+          טעינת הפירוט נכשלה.{" "}
+          <button type="button" className="source-link" onClick={load}>
+            ניסיון חוזר
+          </button>
+        </p>
+      )}
+      {state.phase === "gone" && (
+        <p className="muted" data-testid="removal-unavailable">
+          אין פירוט נוסף להצגה.
+        </p>
+      )}
+      {state.phase === "ready" && children(state.value)}
+    </>
+  );
+}
+
+/** The action's label, the same wherever an entry is shown. */
+function ChangeBadge({ action, ordinal }: { action: ChangeAction; ordinal?: number }) {
+  return (
+    <span className="change-action" data-testid="change-action" data-action={action}>
+      {CHANGE_ACTION_LABEL[action]}
+      {action === "cut" && ordinal ? ` · סימון ${ordinal}` : ""}
+    </span>
+  );
+}
+
+/** The sentence a row shows: the server's fixed sentence for a claim taken out or withheld; for a cut, that part of the
+ * sentence was left out (the server's sentence says "removed a claim"). */
+function rowSentence(row: ChatRemoval, action: ChangeAction): string {
+  return action === "cut" ? `הושמט חלק מהמשפט שלא אומת: ${failureKindText(row.failure_kind)}.` : row.text;
+}
+
+/** One row. Its draft text and reason are loaded from the diagnostics route on every expand and dropped on collapse.
+ * While loading the kind stays visible; a failure offers a retry; a 404 leaves the kind only. A cut's marker in the
+ * answer's body opens its own entry (`focus`, matched by the marker's ordinal). */
+function RemovalItem({
+  removal,
+  index,
+  component,
+  diagnostics,
+  focus,
+  onOpenSource,
+}: {
+  removal: ChatRemoval;
+  index: number;
+  component: ChatComponent | undefined;
+  diagnostics: Diagnostics;
+  focus: CutFocus | null;
+  onOpenSource?: (nav: ViewerNav) => void;
+}) {
+  const action = rowChangeAction(removal);
+  const pick = useCallback((d: ChatDiagnostics) => pairDecision(d, removal, index), [removal, index]);
+  const { open, state, load, expand, toggle } = useExpandable(diagnostics, pick);
+  const panelId = useId();
+  const li = useRef<HTMLLIElement>(null);
+  const handled = useRef(0);
+  const focused = !!focus && action === "cut" && removal.ordinal === focus.ordinal;
+  const tick = focused ? focus.tick : 0;
+  useEffect(() => {
+    if (!tick || tick === handled.current) return;
+    handled.current = tick;
+    expand();
+    // the details were opened by the parent in this same commit; scroll once they are laid out
+    const raf = window.requestAnimationFrame(() => li.current?.scrollIntoView({ block: "nearest" }));
+    return () => window.cancelAnimationFrame(raf);
+  }, [tick, expand]);
 
   return (
-    <li className="removal" data-testid="removal" data-kind={removal.failure_kind}>
+    <li
+      ref={li}
+      className="removal"
+      data-testid="removal"
+      data-kind={removal.failure_kind}
+      data-action={action}
+      data-claim-id={removal.claim_id}
+      data-ordinal={action === "cut" ? removal.ordinal : undefined}
+      data-focused={focused ? "true" : undefined}
+    >
       <div>
-        <strong data-testid="removal-kind">{failureKindText(removal.failure_kind)}</strong>
+        <strong data-testid="removal-kind">{failureKindText(removal.failure_kind)}</strong>{" "}
+        <ChangeBadge action={action} ordinal={removal.ordinal} />
         {component && (
           <span className="muted">
             {" "}
@@ -817,34 +1067,83 @@ function RemovalItem({
           </span>
         )}
       </div>
-      <div data-testid="removal-sentence">{removal.text}</div>
+      <div data-testid="removal-sentence">{rowSentence(removal, action)}</div>
       <button type="button" className="source-link" aria-expanded={open} aria-controls={panelId} onClick={toggle}>
-        {open ? "הסתרת פירוט הטענה" : "פירוט הטענה שהוסרה"}
+        {action === "cut"
+          ? open ? "הסתרת פרטי השינוי" : "פרטי השינוי"
+          : open ? "הסתרת פירוט הטענה" : "פירוט הטענה שהוסרה"}
       </button>
       {open && (
         <div id={panelId} className="removal-detail" aria-busy={state.phase === "loading"}>
-          {state.phase === "loading" && (
-            <span className="removal-loading" role="status" data-testid="removal-loading">
-              <span className="dot-pulse" aria-hidden="true" /> טוען את פירוט הטענה…
-            </span>
-          )}
-          {state.phase === "error" && (
-            <p className="removal-error" role="alert" data-testid="removal-error">
-              טעינת הפירוט נכשלה.{" "}
-              <button type="button" className="source-link" onClick={load}>
-                ניסיון חוזר
-              </button>
-            </p>
-          )}
-          {state.phase === "gone" && (
-            <p className="muted" data-testid="removal-unavailable">
-              אין פירוט נוסף להצגה.
-            </p>
-          )}
-          {state.phase === "ready" && <RemovalDetail decision={state.decision} onOpenSource={onOpenSource} />}
+          <ExpandedState state={state} load={load}>
+            {(decision) => <ChangeDetail action={action} decision={decision} row={removal} onOpenSource={onOpenSource} />}
+          </ExpandedState>
         </div>
       )}
     </li>
+  );
+}
+
+const OTHER_ACTIONS = ["rewritten", "qualified", "cited"];
+
+/** Claims rewritten, kept with a qualifier or given a citation: no row on the normal path (they changed no claim out
+ * of the text), so one toggle loads their entries from the diagnostics route, each under its own claim id. */
+function OtherChanges({
+  count,
+  rowIds,
+  diagnostics,
+  onOpenSource,
+}: {
+  count: number;
+  rowIds: Set<string>;
+  diagnostics: Diagnostics;
+  onOpenSource?: (nav: ViewerNav) => void;
+}) {
+  const pick = useCallback(
+    (d: ChatDiagnostics) =>
+      Array.isArray(d.removed)
+        ? d.removed.filter(
+            (x) => !!x.claim_id && !!x.action && OTHER_ACTIONS.includes(x.action) && !rowIds.has(x.claim_id),
+          )
+        : undefined,
+    [rowIds],
+  );
+  const { open, state, load, toggle } = useExpandable(diagnostics, pick);
+  const panelId = useId();
+  return (
+    <div className="other-changes" data-testid="other-changes">
+      <button type="button" className="source-link" aria-expanded={open} aria-controls={panelId} onClick={toggle}>
+        {open ? "הסתרת פרטי השינויים" : `פרטי השינויים בטענות שנשארו בתשובה (${count})`}
+      </button>
+      {open && (
+        <div id={panelId} className="removal-detail" aria-busy={state.phase === "loading"}>
+          <ExpandedState state={state} load={load}>
+            {(entries) =>
+              entries.length === 0 ? (
+                <p className="muted" data-testid="removal-unavailable">
+                  אין פירוט נוסף להצגה.
+                </p>
+              ) : (
+                <ul className="removals" data-testid="changes">
+                  {entries.map((x) => (
+                    <li
+                      key={x.claim_id}
+                      className="removal"
+                      data-testid="change"
+                      data-action={x.action}
+                      data-claim-id={x.claim_id}
+                    >
+                      <ChangeBadge action={x.action as ChangeAction} />
+                      <ChangeDetail action={x.action as ChangeAction} decision={x} onOpenSource={onOpenSource} />
+                    </li>
+                  ))}
+                </ul>
+              )
+            }
+          </ExpandedState>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -864,14 +1163,26 @@ function checkedLabel(s: ChatCheckedSource): string {
   }
 }
 
-/** The removed claim's decision: the factual reason, the draft under its "unverified draft" label (never beside the
- * verified answer as fact), and the sources it was checked against — a passage, value or measurement opening the
- * viewer at its place, only as the route returned it. */
-function RemovalDetail({
+const MARKER_ONLY = /^«\[\d+: חלק שלא אומת הושמט\]»$/;
+
+/** What an entry shows when expanded, by its action (round 8 U8, R23):
+ * - removed: the reason, and the original under "rejected draft";
+ * - withheld: that the check could not complete (never a fault of the claim), and the original under "unverified draft";
+ * - cut: the original with the part that was not supported marked, and what stays in the answer;
+ * - rewritten: the original, and the wording that stays;
+ * - qualified: what stays and the qualifier's reason — no draft;
+ * - cited: only the source that was attached — no draft.
+ * The sources it was checked against open the viewer at their place, only as the route returned them. Draft text
+ * appears nowhere else. */
+function ChangeDetail({
+  action,
   decision,
+  row,
   onOpenSource,
 }: {
+  action: ChangeAction;
   decision: ChatRemovalDecision;
+  row?: ChatRemoval;
   onOpenSource?: (nav: ViewerNav) => void;
 }) {
   const checked = (decision.sources ?? []).filter((s) => s && typeof s === "object" && typeof s.id === "string");
@@ -890,21 +1201,76 @@ function RemovalDetail({
       items.push(t);
     }
   }
+  const cause = decision.cause || row?.cause || "";
+  const remaining = (decision.remaining ?? "").trim();
+  const reason = decision.reason?.trim();
   return (
-    <div data-testid="removal-detail">
-      {decision.reason && (
+    <div data-testid="removal-detail" data-action={action}>
+      {action === "removed" && reason && (
         <p data-testid="removal-reason">
-          <strong>סיבת ההסרה:</strong> <bdi>{decision.reason}</bdi>
+          <strong>סיבת ההסרה:</strong> <bdi>{reason}</bdi>
         </p>
       )}
-      {decision.repair_attempted && <p className="muted">לפני ההסרה נוסה תיקון, והוא לא אומת.</p>}
-      <div className="removal-draft" data-testid="removal-draft">
-        <span className="removal-draft-label">טיוטה שלא אומתה</span>
-        <blockquote dir="auto">{decision.text}</blockquote>
-      </div>
+      {action === "withheld" && (
+        <p data-testid="removal-reason">
+          <strong>הבדיקה לא הושלמה:</strong> {WITHHELD_CAUSE_TEXT[cause] ?? WITHHELD_DEFAULT_TEXT}
+        </p>
+      )}
+      {action === "cut" && reason && (
+        <p data-testid="removal-reason">
+          <strong>סיבת ההשמטה:</strong> <bdi>{reason}</bdi>
+        </p>
+      )}
+      {action === "rewritten" && reason && (
+        <p data-testid="removal-reason">
+          <strong>סיבת הניסוח מחדש:</strong> <bdi>{reason}</bdi>
+        </p>
+      )}
+      {action === "qualified" && reason && (
+        <p data-testid="removal-reason">
+          <strong>הסייג:</strong> <bdi>{reason}</bdi>
+        </p>
+      )}
+      {action === "cited" && <p className="muted">צורף ציטוט מהמקור שנבדק.</p>}
+      {action === "removed" && decision.repair_attempted && <p className="muted">לפני ההסרה נוסה תיקון, והוא לא אומת.</p>}
+      {(action === "removed" || action === "withheld") && (
+        <div className="removal-draft" data-testid="removal-draft" data-label={action === "removed" ? "rejected" : "unverified"}>
+          <span className="removal-draft-label">{action === "removed" ? "טיוטה שנפסלה" : "טיוטה שלא אומתה"}</span>
+          <blockquote dir="auto">{decision.text}</blockquote>
+        </div>
+      )}
+      {(action === "cut" || action === "rewritten") && (
+        <div className="removal-draft" data-testid="removal-draft" data-label="original">
+          <span className="removal-draft-label">
+            {action === "cut" ? "הנוסח המקורי — החלק שלא נתמך מסומן" : "הנוסח המקורי"}
+          </span>
+          <blockquote dir="auto">
+            {action === "cut" ? (
+              <mark className="change-unsupported" data-testid="change-unsupported">
+                {decision.text}
+              </mark>
+            ) : (
+              decision.text
+            )}
+          </blockquote>
+        </div>
+      )}
+      {action === "cut" && remaining && MARKER_ONLY.test(remaining) && (
+        <p className="change-kept" data-testid="change-kept">
+          <strong>מה שנשאר בתשובה:</strong> במקום החלק שהושמט מופיע הסימון <bdi>{remaining}</bdi>; שאר המשפט נשאר כפי
+          שנבדק.
+        </p>
+      )}
+      {action !== "removed" && action !== "withheld" && action !== "cited" && remaining &&
+        !(action === "cut" && MARKER_ONLY.test(remaining)) && (
+          <div className="change-kept" data-testid="change-kept">
+            <strong>{action === "rewritten" ? "הנוסח שנשאר בתשובה (נבדק מחדש):" : "הטקסט שנשאר בתשובה:"}</strong>
+            <blockquote dir="auto">{remaining}</blockquote>
+          </div>
+        )}
       {checked.length > 0 && (
         <div className="removal-sources">
-          <span>נבדק מול:</span>
+          <span>{action === "cited" ? "המקור שצורף:" : "נבדק מול:"}</span>
           <ul>
             {checked.map((s, i) => {
               const at = targetIndex.get(s);
