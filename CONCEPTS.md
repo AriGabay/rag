@@ -43,3 +43,9 @@ Every highlight, crop or cited place shown to a person or a model is expressed i
 Content that repeats across a document's pages, such as a logo, a letterhead, a footer or a watermark, recognised by its content rather than its size and stored and read once for the whole document.
 
 Its text counts as present on every page it appears on, so it is not mistaken for content lost between two readings. A small picture that does not repeat is never treated as furniture and is read like any other region.
+
+### Appraisal unit
+
+A part of a stored document that the system treats as one appraisal or one internal document, kept apart from the physical file, because a single file may bind several appraisals together with their appendices. Each unit has a stable identity, a title and aliases taken only from the document's own words, identifying details such as the address, block and parcel, or project name, the page or block range it covers, and the evidence that set its identity and boundaries. A unit is of kind appraisal, appendix, comparables, front matter, or a whole unsplit document; comparable properties and appendices are never treated as appraisals.
+
+Boundaries carry a certainty (certain, probable, or unsplit). When a boundary is uncertain, the reader may read past it, and nothing is invented to fill a missing name or boundary. The chat first locates a unit and then searches and reads inside it; passages and cited sources carry the unit they belong to. When several units fit a name, the user is asked, with the details that tell them apart, rather than one being picked by how many passages it has. A follow-up that changes only the metric keeps the same unit.
