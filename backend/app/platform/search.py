@@ -593,6 +593,12 @@ def _name_fit(names: Sequence[str], term_sets: list[set[str]]) -> tuple[set[int]
     """The terms a unit's title and aliases hold (indexes), and how many words of the best-fitting name the question
     does not use (0: the question says the whole name). The name that holds the most terms, then the shortest, is
     the one that counts."""
+    held, _, extra = _best_name_fit(names, term_sets)
+    return held, extra
+
+
+def _best_name_fit(names: Sequence[str], term_sets: list[set[str]]) -> tuple[set[int], int, int]:
+    """``_name_fit`` with the number of terms the best-fitting name itself holds, before the words it leaves unsaid."""
     best: tuple[int, int] = (0, 0)
     held: set[int] = set()
     for name in names:
@@ -603,7 +609,7 @@ def _name_fit(names: Sequence[str], term_sets: list[set[str]]) -> tuple[set[int]
         extra = max(0, size - len(got))
         if got and (len(got), -extra) > (best[0], -best[1]):
             best = (len(got), extra)
-    return held, best[1]
+    return held, best[0], best[1]
 
 
 def units_matching(conn: Connection, query: str) -> UnitMatches:
@@ -768,6 +774,27 @@ def unit_term_holders(conn: Connection, terms: list[list[str]], units: Sequence)
     for u in units:
         named, _ = _name_fit(([u.title] if u.title else []) + list(u.aliases or ()), term_sets)
         out[(u.version_id, u.unit_no)] = named | per_unit[(u.version_id, u.unit_no)][0]
+    return out
+
+
+def document_term_holders(conn: Connection, terms: list[list[str]]) -> dict[UUID, set[int]]:
+    """For each visible current document that is not split into several units (one unit, or none): the terms (their
+    indexes) it holds as ``documents_matching`` reads them — in its title or in any chunk of its current text, each in
+    any of its forms. One query; a document that holds none is not in the result."""
+    params: dict = {}
+    counts = ", ".join(f"count(c.id) FILTER (WHERE c.tsv @@ ({_tsquery(forms, f't{i}', params)})) AS h{i}"
+                       for i, forms in enumerate(terms))
+    term_sets = [set(t) for t in terms]
+    out: dict[UUID, set[int]] = {}
+    for r in conn.execute(text(
+            f"SELECT d.id, d.title, {counts} FROM documents d JOIN document_versions v ON v.document_id = d.id"
+            " AND v.is_current LEFT JOIN chunks c ON c.version_id = v.id WHERE d.deleted_at IS NULL AND NOT EXISTS"
+            " (SELECT 1 FROM document_units u WHERE u.version_id = v.id AND u.reading_id = COALESCE("
+            "v.ingestion->>'reading_id', '') OFFSET 1) GROUP BY d.id, d.title"), params):
+        title = _title_words(r.title)
+        held = {i for i, ts in enumerate(term_sets) if title & ts or getattr(r, f"h{i}")}
+        if held:
+            out[r.id] = held
     return out
 
 

@@ -1029,6 +1029,72 @@ def test_a_first_message_prefers_the_name_a_unit_states_and_a_tie_is_still_the_s
         "מתחם הגפן א", "מתחם הגפן ב"]
 
 
+LONG_NAMES = ["בית הדקל הירוק", "בית האלון הישן", "בית השקד הלבן"]
+
+
+@pytest.fixture
+def long_named(office):
+    """Three appraisals whose names are three words long and share one word; a town word only the second one's prose holds."""
+    office.doc, office.ver = unit_file(office, office.default_group_id, "קובץ שומות בשמות ארוכים סינתטי", [
+        {"title": LONG_NAMES[0], "aliases": [LONG_NAMES[0]], "blocks": [LONG_NAMES[0], "הנכס ברחוב הרימון, שווי 1,100,000 ₪."]},
+        {"title": LONG_NAMES[1], "aliases": [LONG_NAMES[1]], "blocks": [LONG_NAMES[1], "הנכס בכפר ורדון, שווי 2,200,000 ₪."]},
+        {"title": LONG_NAMES[2], "aliases": [LONG_NAMES[2]], "blocks": [LONG_NAMES[2], "הנכס ברחוב התמר, שווי 3,300,000 ₪."]}])
+    return office
+
+
+def test_one_shared_word_of_long_names_is_no_ambiguity_and_the_passages_locate_the_unit(long_named):
+    ctx = long_named.ctx()
+    question = "מה פרטי הרישום של הדירה בכפר ורדון לפי נסח הבית המשותף?"
+    assert entities.first_message_ambiguity(ctx, question) is None
+    found = entities.first_message(ctx, question, passages=True)
+    assert found is not None and found.ambiguity is None and found.unit["unit_no"] == 2
+    # the same word with a second word of the name stated is still a name
+    named = entities.first_message(ctx, "מה השווי של בית הדקל?")
+    assert named.ambiguity is None and named.unit["unit_no"] == 1
+
+
+def test_two_words_of_names_that_differ_by_one_word_still_get_the_clarification(office, r9a):
+    ingest(office, R9B)
+    tie = entities.first_message(office.ctx(), SIMILAR_QUESTION)  # "מתחם הגפן": 2 words stated, 1 unsaid
+    assert tie.unit is None and [d.title for d in tie.ambiguity[0].documents] == ["מתחם הגפן א", "מתחם הגפן ב"]
+
+
+@pytest.fixture
+def town_words(office):
+    """Three untitled appraisals; a town word held by one unit each, and a word that the first and third prose hold."""
+    office.doc, office.ver = unit_file(office, office.default_group_id, "קובץ שומות בלי כותרות סינתטי", [
+        {"blocks": ["שומת מקרקעין, העיר אילנית", "התפוסה יורדת בתרחיש הרגישות."]},
+        {"blocks": ["שומת מקרקעין, העיר ורדית", "התפוסה נשארת בתרחיש הרגישות."]},
+        {"blocks": ["שומת מקרקעין, העיר תמרית", "התפוסה יורדת בתרחיש הרגישות."]}])
+    return office
+
+
+def test_a_unique_word_locates_its_unit_though_an_incidental_word_is_held_by_other_units(town_words):
+    ctx = town_words.ctx()
+    found = entities.first_message(ctx, "בניתוח הרגישות בשומת ורדית, מה השווי כשהתפוסה יורדת?")
+    assert found is not None and found.unit["unit_no"] == 2  # no unit holds both; the town word is held by one only
+    assert entities.first_message(ctx, "בניתוח הרגישות בשומת ורדית, מה השווי?").unit["unit_no"] == 2
+    assert entities.first_message(ctx, "בשומת אילנית, מה השווי כשהתפוסה יורדת?").unit["unit_no"] == 1  # the first rule
+
+
+def test_unique_words_of_two_different_units_locate_nothing(town_words):
+    ctx = town_words.ctx()
+    assert entities.first_message(ctx, "בניתוח הרגישות בשומת ורדית ובשומת תמרית, מה השווי?") is None
+    assert entities.first_message(ctx, "בשומת ורדית, מה השווי כשהתפוסה נשארת, העיר אילנית?") is None
+
+
+def test_a_unique_word_of_one_unit_locates_nothing_when_the_questions_other_words_are_a_single_appraisal_files(town_words):
+    unit_file(town_words, town_words.default_group_id, "שומה בודדת סינתטית", [
+        {"blocks": ["שומת מקרקעין, רחוב הסביון, שכונת הגבעה", "הנכס ברחוב הסביון בשכונת הגבעה."]}], sha="s" * 64)
+    ctx = town_words.ctx()
+    # "ורדית" (an incidental word here) is held by one unit only, and no unit holds it with "יורדת"; the street and the neighbourhood are the single file's
+    assert entities.first_message(ctx, "בניתוח הרגישות ברחוב הסביון שכונת הגבעה, מה השווי כשהתפוסה יורדת, העיר ורדית?") is None
+    # the word of the unit alone, without the single file's words, still locates it
+    assert entities.first_message(ctx, "בניתוח הרגישות בשומת ורדית, מה השווי?").unit["unit_no"] == 2
+    # a word that only the single file holds is no unit's
+    assert entities.first_message(ctx, "בניתוח הרגישות ברחוב הסביון, מה השווי?") is None
+
+
 def test_a_unit_kept_from_the_conversation_is_never_replaced_by_one_the_turn_locates(untitled):
     ws = T.Workspace(ctx=untitled.ctx())
     handle = T.unit_handle_of(ws, untitled.doc, untitled.ver, _reading(untitled, untitled.ver), 3)
