@@ -98,13 +98,23 @@ def _run_background(ctx: TenantContext, job, worker_id: str, work: Callable[[], 
             outcome = work()
         finally:
             keeper.stop_event.set()
+    except ExtractionPaused as paused:  # a long file's reindex ran out of time at a boundary: continue where it stopped
+        with tenant_tx(ctx) as conn:
+            terminal = requeue_paused(conn, job.job_id, paused.progressed, job.attempts, job.max_attempts)
+        if terminal:
+            pipeline.purge_staging(job.office_id, job.version_id)  # kept_previous: nothing reads the staged files again
+        logger.info("%s job %s paused at a boundary (progressed=%s, terminal=%s)", job.kind, job.job_id,
+                    paused.progressed, terminal)
+        return
     except Exception as exc:  # noqa: BLE001
         logger.error("%s job %s failed: %s", job.kind, job.job_id, type(exc).__name__)
         logger.debug("%s", traceback.format_exc())
         reason = exc.reason if isinstance(exc, ExtractionError) else type(exc).__name__
         permanent = isinstance(exc, ExtractionError) and exc.permanent
         with tenant_tx(ctx) as conn:
-            fail_job(conn, job.job_id, reason, permanent, job.attempts, job.max_attempts)
+            terminal = fail_job(conn, job.job_id, reason, permanent, job.attempts, job.max_attempts)
+        if terminal and is_reindex(job.kind, job.payload):
+            pipeline.purge_staging(job.office_id, job.version_id)
         return
     with tenant_tx(ctx) as conn:
         finish_job(conn, job.job_id)

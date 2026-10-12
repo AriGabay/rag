@@ -290,6 +290,7 @@ def _answer_documents(answer: dict | None) -> set[str]:
     ids.add((answer.get("unit") or {}).get("document_id"))  # the unit the conversation is in (round 9 U10)
     ids |= set((answer.get("request") or {}).get("document_ids") or [])
     ids |= {c.get("document_id") for c in (answer.get("request") or {}).get("candidates") or []}
+    ids |= set((answer.get("request") or {}).get("named_document_ids") or [])  # the files a clarification names
     ids |= {d for r in answer.get("requested") or [] for d in r.get("document_ids") or []}
     ids |= set(answer.get("touched_documents") or [])
     ids |= set(answer.get("removal_documents") or [])  # what each removal was checked against (round 7 KTD5)

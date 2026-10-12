@@ -232,6 +232,13 @@ function StatusCell({ v, docId, onChanged }: { v: Version | null; docId: string;
   const [busy, setBusy] = useState(false);
   const [queued, setQueued] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const status = v?.status;
+  // queued only until the version's status changes: a retry that fails again is retriable again
+  const [seen, setSeen] = useState(status);
+  if (seen !== status) {
+    setSeen(status);
+    setQueued(false);
+  }
   if (!v) return <span className="muted">—</span>;
   const isAdmin = me?.user.role === "admin";
   const progress = isActive(v) ? ingestProgressText(v.progress) : null;
@@ -240,8 +247,8 @@ function StatusCell({ v, docId, onChanged }: { v: Version | null; docId: string;
     setBusy(true);
     setError(null);
     try {
-      await api.retryProcessing(docId);
-      setQueued(true);
+      const res = await api.retryProcessing(docId);
+      setQueued(res.queued > 0);
       onChanged();
     } catch (err) {
       setError(errorMessage(err));

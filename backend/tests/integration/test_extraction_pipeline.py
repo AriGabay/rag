@@ -496,6 +496,41 @@ def test_a_reading_resumes_from_its_stage_and_starts_again_when_the_stage_is_dam
     assert got == whole  # the fully staged reading lost a window: it was read again from the start
 
 
+def test_a_staged_file_with_a_corrupt_deflate_body_starts_the_reading_again(monkeypatch, tmp_path):
+    """A flipped byte inside a window file's compressed body is a zlib error, not an OSError: it must be the same
+    lost stage as a missing file, so the reading begins again and gives the same result."""
+    import gzip
+    import uuid
+    import zlib
+
+    from app.config import get_settings
+    from app.extraction import pdf_windows
+    from app.platform.storage import LocalStorage
+
+    data = (FIXTURES / "round9" / "R9a_synthetic_compendium_three_appraisals.pdf").read_bytes()
+    monkeypatch.setattr(get_settings(), "ingest_window_pages", 10_000)
+    whole = _snapshot(lambda: DefaultExtractor().extract(data, PDF, time.monotonic() + 600))
+    monkeypatch.setattr(get_settings(), "ingest_window_pages", 2)
+    store, office, version = LocalStorage(tmp_path), uuid.uuid4(), uuid.uuid4()
+    pdf_windows.read_pdf(data, time.monotonic() + 600, get_settings(),
+                         stage=pdf_windows.StorageStage(store, office, version, "a" * 64))
+    path = tmp_path / str(office) / "staging" / str(version) / ("a" * 64) / "w000001.json.gz"
+    raw = bytearray(path.read_bytes())
+    for at in range(12, len(raw) - 8):  # a byte of the deflate stream whose change deflate itself rejects
+        broken = bytearray(raw)
+        broken[at] ^= 0xFF
+        try:
+            gzip.decompress(bytes(broken))
+        except zlib.error:
+            path.write_bytes(bytes(broken))
+            break
+    else:
+        pytest.fail("no byte flip gave a zlib error")
+    damaged = pdf_windows.StorageStage(store, office, version, "a" * 64)
+    got = _snapshot(lambda: pdf_windows.read_pdf(data, time.monotonic() + 600, get_settings(), stage=damaged))
+    assert got == whole
+
+
 # --- letter-spaced text layers and bidi marks (U5, KTD12, R4) --------------------------------------------------------
 # R9e draws a plan table glyph by glyph, 4 mm apart, and a numbered heading whose text layer starts with a right-to-left
 # mark. The table's plan number and date must be whole tokens, the heading a heading with its label, and no mark may

@@ -290,6 +290,32 @@ def test_a_paused_job_is_queued_again_and_only_one_that_made_progress_keeps_its_
     assert (j.status, j.attempts, v.status) == ("done", 2, "ready")
 
 
+def test_a_paused_long_file_goes_behind_the_uploads_that_came_while_it_was_being_read(client, office, monkeypatch):
+    """A progressed pause re-queues the job at the back of the process queue: the files uploaded meanwhile are claimed
+    first, so a long reading never holds every newer upload back."""
+    from app.extraction.base import ExtractionPaused
+
+    a, _ = office
+    login(client, "admin-a@example.test")
+    long = upload(client, [("long.pdf", tiny_pdf("long"))], group_id=a.default_group_id).json()["results"][0]
+    pauses = [True]
+
+    class Pausing(FakeExtractor):
+        def extract(self, data, mime_type, deadline):
+            if pauses:
+                raise ExtractionPaused(pauses.pop(0))
+            return super().extract(data, mime_type, deadline)
+
+    monkeypatch.setattr("app.extraction.pipeline.get_extractor", lambda: Pausing(), raising=False)
+    short = upload(client, [("short.pdf", tiny_pdf("short"))], group_id=a.default_group_id).json()["results"][0]
+    worker.run_one("w")  # the oldest job, the long file, finishes a window and pauses: queued again at once
+    worker.run_one("w")
+    assert _version_and_job(a, short["version_id"])[1].status == "done"  # the newer upload was claimed first
+    assert _version_and_job(a, long["version_id"])[1].status == "queued"
+    worker.run_one("w")
+    assert _version_and_job(a, long["version_id"])[1].status == "done"
+
+
 def test_a_reading_that_never_advances_ends_failed_with_the_time_limit_as_its_reason(client, office, monkeypatch):
     from app.extraction.base import MSG_DEADLINE, ExtractionPaused
 

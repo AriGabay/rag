@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import re
+import time
 import uuid
 from decimal import Decimal
 
@@ -378,6 +379,81 @@ def test_without_time_a_cut_heading_never_lets_the_sentence_below_it_stay_unjudg
     (p,) = out.report.removals()
     assert p.unit.text.startswith("תכסית") and p.cause == "time_limit"
     assert out.final_digest == text_digest(md)
+
+
+# --- ``remainder_stands`` itself: each guard that keeps a cut sentence unjudged fails closed -----------------------------------
+
+class _Remainder:
+    """A final check with one draft unit whose plain clause was cut (``PLAIN_CUT``, which qualifies nothing) and one unit
+    of the saved text that says what is left; ``saved`` and the draft's fields are changed by each case. No time to judge."""
+
+    DRAFT = f"{AREA}, {PLAIN_CUT} [S1]."
+    SAVED = f"{AREA}."
+
+    def __init__(self, monkeypatch, *, saved: str | None = None, drafts: list[int] | None = None, **draft_fields):
+        from types import SimpleNamespace
+
+        cut_from = self.DRAFT.index(f", {PLAIN_CUT}")
+        draft = verify.Unit(0, self.DRAFT, self.DRAFT.replace(" [S1]", ""), ["S1"], 0, len(self.DRAFT))
+        for name, value in draft_fields.items():
+            setattr(draft, name, value)
+        self.draft = draft
+        report = SimpleNamespace(
+            cuts={0: [verify.CutGroup(cut_from, cut_from + len(f", {PLAIN_CUT}"), ("c2",))]},
+            claims={0: [SimpleNamespace(id="c1", verdict="supported"), SimpleNamespace(id="c2", verdict="unsupported")]})
+        self.final = object.__new__(final_check._Final)
+        self.final.report, self.final.drafts = report, {0: draft}
+        self.final.stats = {"passes": 0, "units": 0, "reused": 0, "judged": 0, "removed": 0, "withheld": 0,
+                            "unjudged_kept": 0, "unavailable": False}
+        self.final.passed = set()
+        self.final.deadline = time.monotonic() + 5  # less than the final check's reserve: no time to judge the saved text
+        monkeypatch.setattr(final_check, "FINAL_MIN_SECONDS", 10**6)
+        text = self.SAVED if saved is None else saved
+        unit = verify.Unit(0, text, text, [], 0, len(text))
+        unit.heading, unit.table_header, unit.context = draft.heading, draft.table_header, draft.context
+        self.unit = final_check.FinalUnit(unit, True, [0] if drafts is None else drafts, "k", text=text)
+
+    def check(self):
+        self.final.split = lambda comp: [self.unit]
+        return self.final.check(None, may_judge=False)
+
+
+def test_a_cut_sentence_with_nothing_else_changed_is_kept_unjudged(monkeypatch):
+    case = _Remainder(monkeypatch)
+    assert case.final.remainder_stands(case.unit)
+    assert case.check().failures == [] and case.final.stats["unjudged_kept"] == 1
+
+
+@pytest.mark.parametrize("field, draft_value, saved_value", [
+    ("context", "| שטח | ערך |\n|---|---|", "| שטח | שווי |\n|---|---|"),  # the table's header row changed
+    ("context", "הטבלה מציגה את המצב הקיים", "הטבלה מציגה את המצב המוצע"),  # the line above the table changed
+    ("table_header", False, True),  # the sentence became (or stopped being) a header row
+    ("heading", "מצב קיים", "מצב מוצע"),
+])
+def test_a_changed_table_header_or_context_is_withheld_with_the_time_limit_cause(monkeypatch, field, draft_value, saved_value):
+    """The cut clause qualifies nothing, yet the row means something else under another header or context: it must be
+    judged, and with no time it is withheld — never kept unjudged."""
+    case = _Remainder(monkeypatch, **{field: draft_value})
+    setattr(case.unit.unit, field, saved_value)
+    assert not case.final.remainder_stands(case.unit)
+    out = case.check()
+    assert [(f.kind, f.cause) for f in out.failures] == [("not_checked", "time_limit")]
+    assert case.final.stats["unjudged_kept"] == 0
+
+
+@pytest.mark.parametrize("saved, drafts, why", [
+    (f"{AREA} והיא סופית.", [0], "a word added beyond the cut"),
+    ("השטח העיקרי בתא שטח 1 הוא 1,300 מ״ר.", [0], "a number changed beyond the cut"),
+    ("השטח הכולל בתא שטח 1 הוא 1,200 מ״ר.", [0], "a rewording beyond the cut"),
+    (f"{AREA}.", [0, 1], "two drafts merged into one sentence"),
+    (f"{AREA}.", [], "no draft behind it"),
+])
+def test_a_saved_sentence_that_differs_from_the_draft_by_more_than_the_cut_is_withheld(monkeypatch, saved, drafts, why):
+    case = _Remainder(monkeypatch, saved=saved, drafts=drafts)
+    assert not case.final.remainder_stands(case.unit), why
+    out = case.check()
+    assert [(f.kind, f.cause) for f in out.failures] == [("not_checked", "time_limit")], why
+    assert case.final.stats["unjudged_kept"] == 0
 
 
 def test_when_the_judge_fails_with_time_left_the_cause_stays_a_technical_failure(offline):

@@ -180,13 +180,15 @@ def fail_job(conn: Connection, job_id: UUID, error: str, permanent: bool, attemp
 def requeue_paused(conn: Connection, job_id: UUID, progressed: bool, attempts: int, max_attempts: int) -> bool:
     """A staged reading stopped at a window or batch boundary because the job's time was spent (KTD2). One that
     finished a unit of work is queued again at once and does not consume an attempt (the claim counted one; it is
-    given back). One that finished none counts as a failed attempt with the deadline as its reason, so a reading
+    given back), behind the uploads that came meanwhile (``jobs_claim`` serves the oldest ``created_at`` first; nothing
+    else reads it). One that finished none counts as a failed attempt with the deadline as its reason, so a reading
     that cannot advance ends after ``max_attempts`` instead of looping. True when the job is now terminal."""
     if not progressed:
         return fail_job(conn, job_id, MSG_DEADLINE, False, attempts, max_attempts)
     conn.execute(
         text("UPDATE jobs SET status = 'queued', attempts = GREATEST(attempts - 1, 0), locked_by = NULL,"
-             " lease_until = NULL, run_after = now(), last_error = NULL, updated_at = now() WHERE id = :j"),
+             " lease_until = NULL, run_after = now(), last_error = NULL, updated_at = now(),"
+             " created_at = now() WHERE id = :j"),  # ``jobs_claim`` serves the oldest first: back of the queue
         {"j": job_id},
     )
     return False
@@ -231,7 +233,7 @@ def _requeue(conn: Connection, version_id: UUID, kind: str, key: str, payload: d
             " VALUES (app_office(), :v, :kind, CAST(:p AS jsonb), :k, :m)"
             " ON CONFLICT (idempotency_key) DO UPDATE SET status = 'queued', attempts = 0, run_after = now(),"
             " locked_by = NULL, lease_until = NULL, last_error = NULL, payload = EXCLUDED.payload,"
-            " updated_at = now() WHERE jobs.status IN ('failed', 'done', 'kept_previous') RETURNING id"
+            " updated_at = now(), created_at = now() WHERE jobs.status IN ('failed', 'done', 'kept_previous') RETURNING id"
         ),
         {"v": version_id, "kind": kind, "p": json.dumps(payload), "k": key, "m": get_settings().job_max_attempts},
     ).first() is not None

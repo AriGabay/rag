@@ -31,6 +31,7 @@ import json
 import logging
 import math
 import time
+import zlib
 from collections.abc import Callable
 from dataclasses import asdict
 from uuid import UUID
@@ -166,7 +167,7 @@ class StorageStage:
     def _get(self, name: str) -> object:
         try:
             return json.loads(gzip.decompress(self.storage.get(self._key(name))))
-        except (OSError, ValueError, EOFError) as exc:  # gone, truncated or not JSON
+        except (OSError, ValueError, EOFError, zlib.error) as exc:  # gone, truncated, corrupt or not JSON
             raise StageLost(name) from exc
 
     def reset(self) -> None:
@@ -508,7 +509,9 @@ class _Reading:
             st["read_batches"] += 1
             st["read_done"] += list(results)
             transient = transient or failed
-            self.done()
+            self.stage.commit()
+            if results:  # a batch that read nothing changed no durable reading: it is no progress (``requeue_paused``)
+                self.run.end()
         if transient is not None:
             raise transient  # the contents that failed are read again by the next attempt, the rest are kept
         if "repeated" not in st:

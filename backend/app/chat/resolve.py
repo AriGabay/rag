@@ -203,6 +203,9 @@ class Request:
     entity_changed: bool = False  # the documents are the ones the user's words named, not the focus's
     server_clarify: bool = False  # the clarification is the server's (titles the user may see, the user's words)
     candidates: list[dict] = field(default_factory=list)  # the documents a server clarification named
+    # the other files a server clarification names — not read, listed as not checked, or holding the words in different
+    # units — bound to the message like candidates, so it is hidden once the user loses access to one of them
+    named_documents: list[str] = field(default_factory=list)
     # the unit of a file of several appraisals the turn is about (``unit`` is the datum's measure unit here): the one
     # the user's words selected, or the one the conversation was already in (``unit_kept``) — as its anchor
     # (``entities.unit_anchor``: file, reading, normalized title and aliases, first printed page label, identifiers),
@@ -220,7 +223,8 @@ class Request:
                 "subject": self.subject, "document_ids": list(self.document_ids), "changed": list(self.changed),
                 "rejected": list(self.rejected), "relation": self.relation, "scope": self.scope,
                 "approved": list(self.approved), "candidates": list(self.candidates), "located_unit": self.located_unit,
-                "unit_kept": self.unit_kept, "entity_changed": self.entity_changed}
+                "unit_kept": self.unit_kept, "entity_changed": self.entity_changed,
+                "named_document_ids": list(self.named_documents)}
 
     @property
     def per_area(self) -> bool | None:
@@ -322,16 +326,19 @@ MSG_SPLIT = ("המילים \"{words}\" מופיעות בקובץ «{title}» א�
              "שומה התכוונת?")
 
 
-def _clarify_missing(words: str, files: list[dict] | None = None, split: list[dict] | None = None) -> str:
-    """The server's question when no readable document is named. Files the user may see that were not read are listed
-    as not checked (R5): the words may name something held only in them, so the message never says it is absent."""
+def _clarify_missing(words: str, files: list[dict] | None = None,
+                     split: list[dict] | None = None) -> tuple[str, list[str]]:
+    """The server's question when no readable document is named, and the ids of the files it names. Files the user may
+    see that were not read are listed as not checked (R5): the words may name something held only in them, so the
+    message never says it is absent."""
     asked = (f"לא מצאתי במסמכים שאתה מורשה לראות מסמך על \"{prompt_text(words)}\". לאיזה נכס או מסמך התכוונת?"
              if words.strip() else
              "לא מצאתי במסמכים שאתה מורשה לראות את הנכס שציינת. לאיזה נכס או מסמך התכוונת?")
     if split:  # the words are in one file, in different appraisals: nothing was found that holds them together (R11)
         asked = "\n".join(MSG_SPLIT.format(words=prompt_text(words), title=prompt_text(d["title"])) for d in split)
-    listing, _ = unread.notice(files or [], words)
-    return f"{asked}\n\n{listing}" if listing else asked
+    listing, shown = unread.notice(files or [], words)
+    named = [str(d["document_id"]) for d in [*(split or []), *shown]]
+    return (f"{asked}\n\n{listing}" if listing else asked), named
 
 
 def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
@@ -523,10 +530,13 @@ def _take(out: Request, outcome: entities.Outcome, words: str, decisions: dict,
         # the words name a document that was not read: its state is the answer, and nothing is searched in it. The
         # clarification offers no candidates — a reply to it is a new question
         out.clarify = unread.message([d.unread for d in outcome.documents], prompt_text(words))
+        out.named_documents = [d.document_id for d in outcome.documents]
         return
     out.candidates = [d.as_dict() for d in outcome.documents]
-    out.clarify = (_clarify_titles(outcome, words) if outcome.kind == "ambiguous"
-                   else _clarify_missing(words, outcome.unread, outcome.split))
+    if outcome.kind == "ambiguous":
+        out.clarify = _clarify_titles(outcome, words)
+    else:
+        out.clarify, out.named_documents = _clarify_missing(words, outcome.unread, outcome.split)
     if outcome.kind == "not_found":
         out.subject = ""
 

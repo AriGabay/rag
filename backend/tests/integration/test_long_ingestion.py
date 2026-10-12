@@ -431,3 +431,56 @@ def test_a_failure_reading_again_cannot_cure_is_not_retried_and_another_offices_
     assert r["retried"] == [] and version(other, over).status == "failed"
     assert client.post("/api/admin/reprocess", json={"document_id": doc}).status_code == 404  # office A's document
     _ = (ver, odoc)
+
+
+# --- a long ready file can be read again: the reindex reads in the same resumable windows --------------------------
+
+def reindex_job(office, version_id) -> object:
+    with tenant_tx(office.system) as conn:
+        return conn.execute(text("SELECT status, attempts, last_error FROM jobs WHERE version_id = :v"
+                                 " AND payload->>'mode' = 'reindex'"), {"v": version_id}).one()
+
+
+def _reindex(office, ver) -> None:
+    from app.platform.jobs import enqueue_reindex
+
+    with tenant_tx(office.system) as conn:
+        assert enqueue_reindex(conn, ver, pipeline.PDF_INGESTION_VERSION)
+
+
+def test_a_reindex_of_a_long_file_pauses_at_a_window_boundary_and_swaps_only_when_the_reading_is_complete(
+        client, office, monkeypatch):
+    monkeypatch.setattr(get_settings(), "job_timeout_seconds", 900)
+    _, ver = add(client, office, first_pages(PAGES))
+    run_all()
+    before, ing = reading(office, ver), version(office, ver).ingestion
+    clock = Clock(monkeypatch)  # 300 s per window: the job's budget is spent after three
+    _reindex(office, ver)
+    worker.run_one("w")
+    j = reindex_job(office, ver)
+    assert (j.status, j.attempts) == ("queued", 0)  # paused at a boundary: not failed, no attempt used
+    assert staged(office, ver)  # what was read stays for the next attempt
+    assert reading(office, ver) == before and version(office, ver).ingestion == ing  # the current reading is untouched
+    clock.stop()
+    run_all()
+    assert reindex_job(office, ver).status == "done" and staged(office, ver) == []
+    now = version(office, ver).ingestion
+    assert now["reading_id"] != ing["reading_id"]
+    assert reading(office, ver) == before  # the same reader reads the same file the same way
+    assert version(office, ver).status in ("ready", "needs_review")
+
+
+def test_a_reindex_that_cannot_advance_keeps_the_previous_reading_and_leaves_nothing_staged(client, office, monkeypatch):
+    monkeypatch.setattr(get_settings(), "job_timeout_seconds", 900)
+    _, ver = add(client, office, first_pages(PAGES))
+    run_all()
+    before = reading(office, ver)
+    Clock(monkeypatch, start=10_000.0)  # the budget is spent before the first window, every time
+    _reindex(office, ver)
+    for _ in range(get_settings().job_max_attempts):
+        worker.run_one("w")
+        release_backoff(office)
+    assert reindex_job(office, ver).status == "kept_previous"
+    v = version(office, ver)
+    assert v.status in ("ready", "needs_review") and v.ingestion["reprocess_kept"]["reason"] == MSG_DEADLINE
+    assert reading(office, ver) == before and staged(office, ver) == []

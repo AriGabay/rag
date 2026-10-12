@@ -301,6 +301,12 @@ def reading_attempt_key(info: VersionInfo) -> str:
     return hashlib.sha256(f"{sha}:{PDF_INGESTION_VERSION}:{get_settings().ingest_window_pages}".encode()).hexdigest()
 
 
+def reindex_attempt_key(info: VersionInfo) -> str:
+    """The key of one reindex reading of a ready version's file: ``reading_attempt_key`` under a name of its own, so a
+    reindex never shares staged outputs with the ingestion of the same file."""
+    return hashlib.sha256(f"reindex:{reading_attempt_key(info)}".encode()).hexdigest()
+
+
 def record_progress(ctx: TenantContext, version_id: UUID, pages_done: int | None, pages_total: int | None,
                     stage: str) -> None:
     """Write the reading's progress to the version's ingestion report (what the documents screen shows)."""
@@ -674,7 +680,9 @@ def reindex_version(office_id: UUID, version_id: UUID, accept_regression: bool =
     write; a gate then compares the new reading with the current one (``reading_regression``). A worse reading is
     recorded on the version and ends the job as ``kept_previous`` (``ReadingRegression``, KTD9), leaving the current
     reading in place and the document available, unless an admin chose to accept the recorded regression
-    (``accept_regression``) and the new one is within it (``regression_within``). A transient vision failure raises
+    (``accept_regression``) and the new one is within it (``regression_within``). A PDF is read in the ingestion's
+    resumable windows (``reindex_attempt_key``): the time running out raises ``ExtractionPaused`` and the worker
+    queues the job again, so a long file is read over several attempts and the gate and the swap run once. A transient vision failure raises
     before the gate; the job's bounded attempts read again, regions already read coming from ``image_readings``.
     Otherwise one transaction replaces
     the blocks, pictures, tables, pages and chunks (with their embeddings) and the appraisal units derived from them
@@ -698,8 +706,17 @@ def reindex_version(office_id: UUID, version_id: UUID, accept_regression: bool =
     if row is None:
         return None
     info = VersionInfo(row.id, row.document_id, row.storage_key, row.mime_type, None)
-    result = _extract(get_storage().get(info.storage_key), info.mime_type, deadline, vision_reader(ctx),
-                      ImageReadingStore(ctx))
+    data = get_storage().get(info.storage_key)
+    if info.mime_type == PDF_MIME and "stage" in inspect.signature(_extract).parameters:
+        # a PDF is read in the ingestion's resumable windows, under the reindex's own key: it never touches the live
+        # version's ingestion report, and the gate and the swap below run only once the whole file is read. The
+        # time running out raises ``ExtractionPaused``; the worker queues the job again and what was read stays
+        from app.extraction.pdf_windows import StorageStage
+
+        result = _extract(data, info.mime_type, deadline, vision_reader(ctx), ImageReadingStore(ctx),
+                          StorageStage(get_storage(), ctx.office_id, info.id, reindex_attempt_key(info)))
+    else:
+        result = _extract(data, info.mime_type, deadline, vision_reader(ctx), ImageReadingStore(ctx))
     embeddings = _embed_reading(ctx, info, result, deadline)
     with tenant_tx(ctx) as conn:
         current = conn.execute(text(
@@ -732,6 +749,7 @@ def reindex_version(office_id: UUID, version_id: UUID, accept_regression: bool =
             logger.info("reindexed version %s (%d records kept; measurements %s%s)", info.id, records, anchored,
                         "; regression accepted" if regression is not None else "")
             regression = None
+    purge_staging(office_id, version_id)  # the reading is done with: nothing is read from the staged outputs again
     if regression is not None:
         with tenant_tx(ctx) as conn:
             conn.execute(text(

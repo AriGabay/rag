@@ -557,3 +557,34 @@ def test_a_new_reading_re_matches_by_title_or_alias_then_by_page_label_and_ident
     # a unit that is gone: nothing matches, and the old number selects nothing
     assert entities.rematch(_anchor(2, "r1", title="נעלם", aliases=["נעלם"], identifiers=["רחוב נעלם 1"]), [
         _unit_dict(2, "r2", title="נעלם לא", aliases=[], identifiers=[])]) is None
+
+
+# --- the files a server clarification names are bound to the message (authorization) ---
+
+def _named(outcome: entities.Outcome) -> list[str]:
+    r = _resolved(relation="new_question", changed_fields=_changed(("subject", "היסמין 3")), subject="היסמין 3")
+    req = validate(r, RENT_FOCUS, "ובהיסמין 3?", authorized, TITLES, lambda words: outcome, None,
+                   focus_titles=[CORPUS[DOC][0]])
+    assert req.server_clarify
+    return req.as_dict()["named_document_ids"]
+
+
+def test_a_clarification_names_the_ids_of_the_split_files_and_the_shown_unread_files():
+    unread = [{"document_id": f"u-{i}", "title": f"תיק {i}", "status": "failed", "reason": "", "progress": None,
+               "uploaded_at": None} for i in range(unread_notice_limit() + 2)]
+    split = [{"document_id": "s-1", "title": "קובץ מפוצל", "units": 3}]
+    named = _named(entities.Outcome("not_found", unread=unread, split=split))
+    assert named[0] == "s-1" and len(named) == 1 + unread_notice_limit()  # the unread files beyond the notice are not named
+    assert set(named[1:]) <= {d["document_id"] for d in unread}
+
+
+def test_a_not_read_clarification_names_the_unread_documents():
+    unread = {"document_id": "u-1", "title": "תיק 1", "status": "failed", "reason": "", "progress": None}
+    named = _named(entities.Outcome("not_read", documents=[entities.Candidate("u-1", "תיק 1", unread=unread)]))
+    assert named == ["u-1"]
+
+
+def unread_notice_limit() -> int:
+    from app.chat import unread
+
+    return unread.NOTICE_FILES

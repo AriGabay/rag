@@ -11,7 +11,7 @@ from sqlalchemy import text
 from app.chat import contexts, entities
 from app.db import tenant_tx
 from tests.conftest import login
-from tests.factories import make_office
+from tests.factories import make_group, make_office, make_user
 from tests.integration.test_chat import cloud, new_conversation, send
 from tests.integration.test_chat_coverage import add_doc
 from tests.integration.test_chat_unread_documents import TOO_LONG, add_unread
@@ -160,6 +160,54 @@ def test_a_follow_up_naming_a_failed_document_says_it_was_not_read_and_why(clien
     assert "לא נקרא" in a["markdown"] or "העיבוד נכשל" in a["markdown"]
     assert "לא מצאתי" not in a["markdown"] and "13,700" not in a["markdown"]
     assert a["request"]["candidates"] == []  # nothing to choose between: a reply is a new question
+
+
+def _revoked_after(client, setup, monkeypatch, user_words: str, question: str, add) -> tuple[str, dict, ScriptedAgent]:
+    """An employee's first answer, a follow-up that the server answers with a clarification naming files that were not
+    read, and then the group of those files is taken away from the employee. Returns the conversation, the clarification
+    message and the agent of the next turn (whose resolve input is what the model is given of the history)."""
+    make_user(setup, "emp@example.test", [setup.default_group_id])
+    first = ScriptedAgent([[call("search", query="שווי למ\"ר", document_ids=[setup.dror], limit=None)],
+                           final("השווי למ\"ר אקוו' נקבע ל-13,700 ₪ [S1].", focus=_focus(setup.dror, "הדרור 5"))])
+    cloud(monkeypatch, setup, first)
+    login(client, "emp@example.test")
+    cid = new_conversation(client)
+    assert send(client, cid, "מה השווי למ״ר בהדרור 5?")["status"] == "done"
+    other = make_group(setup, "קבוצה אחרת")
+    named = add(setup)
+    _turn(monkeypatch, [], _resolution(relation="new_question",
+                                       changed_fields=[{"field": "subject", "user_words": user_words}]))
+    shown = send(client, cid, question)
+    assert shown["answer"]["status"] == "clarification"
+    with tenant_tx(setup.system) as conn:  # the employee loses access to every file the message named
+        conn.execute(text("UPDATE documents SET group_id = :g WHERE id = ANY(:d)"),
+                     {"g": other, "d": [str(d) for d in named]})
+    agent = _turn(monkeypatch, [], _resolution(relation="new_question",
+                                               changed_fields=[{"field": "subject", "user_words": "בהיסמין 3"}]))
+    return cid, shown, agent
+
+
+def _assert_hidden_everywhere(client, cid: str, shown: dict, agent: ScriptedAgent, title: str) -> None:
+    assert title in shown["answer"]["markdown"]
+    msgs = client.get(f"/api/chat/conversations/{cid}/messages").json()["messages"]
+    assert title not in str(msgs)  # the list shows nothing of the file
+    assert client.get(f"/api/chat/messages/{shown['id']}").json()["answer"].get("hidden") is True
+    send(client, cid, "ובהיסמין 3?")
+    assert title not in "\n".join(c.input for c in agent.calls)  # and the next turn's history does not carry it
+
+
+def test_a_clarification_about_an_unread_file_is_hidden_once_the_user_loses_access_to_it(client, setup, monkeypatch):
+    title = "שומה - הזית 9 נווה ים"
+    cid, shown, agent = _revoked_after(client, setup, monkeypatch, "בהזית 9", "ובהזית 9?",
+                                       lambda s: [add_unread(s, s.default_group_id, title)])
+    _assert_hidden_everywhere(client, cid, shown, agent, title)
+
+
+def test_a_clarification_listing_unread_files_is_hidden_once_the_user_loses_access_to_one(client, setup, monkeypatch):
+    title = "קובץ מרוכז - מתחם הרצל"
+    cid, shown, agent = _revoked_after(client, setup, monkeypatch, "בהיסמין 3", "ובהיסמין 3?",
+                                       lambda s: [add_unread(s, s.default_group_id, title)])
+    _assert_hidden_everywhere(client, cid, shown, agent, title)
 
 
 def test_a_follow_up_that_names_nothing_lists_the_files_that_were_not_read(client, setup, monkeypatch):

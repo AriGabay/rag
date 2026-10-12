@@ -4,14 +4,16 @@ error stops at once. Synthetic fixtures and a scripted reader only; no model is 
 
 from __future__ import annotations
 
+import io
 import time
 import uuid
 
 import pytest
+from PIL import Image
 
 from app.extraction import regions
 from app.extraction.base import ExtractionError
-from app.extraction.images import VisionUnavailable
+from app.extraction.images import VisionCallFailed, VisionUnavailable
 from tests.unit.test_regions import (  # noqa: F401
     LOGO,
     R1,
@@ -115,3 +117,62 @@ def test_a_transient_failure_through_windows_is_continued_by_the_next_attempt_wh
     assert stage.state["windows_done"] == 10  # the windows and the regions that were read stayed: not read again
     assert set(retry.calls) == {TABLE}  # only the failed region is read again
     assert result.tables == extract(R1, ScriptedVision()).tables
+
+
+# --- a batch that read nothing is no progress (round 9 review) ---------------------------------------------------------
+
+class ClockedVision(ScriptedVision):
+    """Every call takes ``cost`` seconds of a fake clock; the calls of the sizes in ``fail`` (``everything``: all of
+    them) fail transiently."""
+
+    def __init__(self, clock: list[float], cost: float = 0.0, fail=None, everything: bool = False):
+        super().__init__(fail=fail)
+        self.clock, self.cost, self.everything = clock, cost, everything
+
+    def read(self, png, context, careful=False):
+        self.clock[0] += self.cost
+        if self.everything:
+            self.calls.append(Image.open(io.BytesIO(png)).size)
+            raise VisionCallFailed("timeout")
+        return super().read(png, context, careful)
+
+
+def _paused_read(tmp_path, vision, clock, monkeypatch):
+    from app.config import get_settings
+    from app.extraction import pdf_windows
+    from app.platform.storage import LocalStorage
+
+    monkeypatch.setattr(pdf_windows, "_now", lambda: clock[0])
+    monkeypatch.setattr(pdf_windows, "REGION_BATCH", 1)  # one distinct content per batch
+    get_settings().ingest_window_pages = 1
+    stage = pdf_windows.StorageStage(LocalStorage(tmp_path), OFFICE, VERSION, "a" * 64)
+    return pdf_windows.read_pdf(R7.read_bytes(), clock[1], get_settings(), vision, MemoryCache(), stage, soft=True)
+
+
+def _clock() -> list[float]:
+    now = time.monotonic()
+    return [now, now + 100.0]  # the fake clock and the job's deadline
+
+
+def test_a_pause_after_batches_that_all_failed_transiently_is_no_progress(tmp_path, windows, monkeypatch):
+    from app.extraction.base import ExtractionPaused
+
+    clock = _clock()
+    with pytest.raises(VisionUnavailable):  # the first attempt finds the regions and every batch fails fast
+        _paused_read(tmp_path, ClockedVision(clock, everything=True), clock, monkeypatch)
+    slow = ClockedVision(clock, cost=200.0, everything=True)  # now the provider is slow: a batch spends the job
+    with pytest.raises(ExtractionPaused) as stopped:
+        _paused_read(tmp_path, slow, clock, monkeypatch)
+    assert len(slow.calls) == 1 and stopped.value.progressed is False  # a failed batch commits state, it is no progress
+
+
+def test_a_pause_after_a_batch_that_read_something_is_progress(tmp_path, windows, monkeypatch):
+    from app.extraction.base import ExtractionPaused
+
+    clock = _clock()
+    with pytest.raises(VisionUnavailable):
+        _paused_read(tmp_path, ClockedVision(clock, fail={LOGO: "timeout"}), clock, monkeypatch)
+    slow = ClockedVision(clock, cost=200.0)  # the one content that failed is read now, and takes the rest of the time
+    with pytest.raises(ExtractionPaused) as stopped:
+        _paused_read(tmp_path, slow, clock, monkeypatch)
+    assert stopped.value.progressed is True
