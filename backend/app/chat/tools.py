@@ -730,6 +730,8 @@ def _render_source(s: Source) -> str:
     tags = "".join(f' {k}="{v}"' for k, v in s.tags.items())
     if s.context:  # the appraisal context it is in, in a file holding several (KTD7)
         tags += f' context="{_attr(s.context)}"'
+    elif s.subject:  # the identity a file of one subject unit states for itself
+        tags += f' subject="{_attr(s.subject)}"'
     if s.unit:  # its stable unit id (version, reading, number), beside the turn's handle in the tags (round 9 U9)
         tags += f' unit_id="{_attr(s.unit["id"])}"'
     if s.status:  # a reading: how complete it is, the reading it is of, and how to read on

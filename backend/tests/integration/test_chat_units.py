@@ -1050,7 +1050,7 @@ def test_a_question_with_no_word_that_can_tell_appraisals_apart_is_looked_up_in_
 ONE_LABEL = "שומת מקרקעין מלאה · רחוב הצבר 5"
 
 
-def test_the_sources_of_a_single_appraisal_file_carry_its_label_as_subject_and_no_context_or_unit(office):
+def test_the_sources_of_a_single_appraisal_file_carry_its_label_as_subject_shown_to_the_model_and_no_context_or_unit(office):
     office.doc, office.ver = unit_file(office, office.default_group_id, "דוח שומה בודד סינתטי", [
         {"title": "שומת מקרקעין מלאה", "kind": "appraisal", "identifiers": ["רחוב הצבר 5"],
          "blocks": ["שומת מקרקעין מלאה", "הננו שמים את שווי הנכס ב-4,200,000 ₪ ללא מע\"מ."]}])
@@ -1064,7 +1064,9 @@ def test_the_sources_of_a_single_appraisal_file_carry_its_label_as_subject_and_n
         assert s.subject == ONE_LABEL
         assert s.context is None and not s.contexts and s.unit is None and "unit" not in s.tags
         assert "context" not in s.public() and "unit" not in s.public()
-    assert ONE_LABEL not in T._render_source(read) and 'context="' not in T._render_source(read)
+    for s in [*found, read]:  # the model sees the identity too, as the file's subject, never as a context
+        rendered = T._render_source(s)
+        assert f'subject="{ONE_LABEL}"' in rendered and 'context="' not in rendered
 
 
 def contexts_label(office) -> str:
