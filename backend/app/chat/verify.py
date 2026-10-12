@@ -690,6 +690,26 @@ def has_qualifier(text: str) -> bool:
 LOST_WORD_SHARE = 0.75  # the share of a number-free claim's content words a rephrasing must keep (``lost_supported``)
 
 
+# a clause saying something was not computed or not determined ("הסכום החדש לא חושב כאן", "לא נקבע"): with ``ABSENCE`` and
+# ``meaning.ABSENCE_SENTENCE`` the statements of an absence, which a repair round fills and never has to keep
+_NOT_DETERMINED = re.compile(
+    r"(?<![א-ת])(?:לא|אינו|אינה|אינם|אינן)\s+(?:חושב|חושבה|חושבו|חושבים|נחשב|נחשבה|נקבע|נקבעה|נקבעו|נקבעים|הוגדר|"
+    r"הוגדרה|הוגדרו|נבדק|נבדקה|נבדקו)(?![א-ת])|(?<![א-ת])לא\s+ניתן\s+(?:לחשב|לקבוע|לדעת|לברר)(?![א-ת])"
+    r"|(?<![א-ת])אין\s+(?:אפשרות|דרך)\s+ל")
+
+
+def states_absence(clause: str) -> bool:
+    """Whether a clause says that a datum is not stated, not found, not computed or not determined."""
+    return bool(ABSENCE.search(clause) or meaning.ABSENCE_SENTENCE.search(clause) or _NOT_DETERMINED.search(clause))
+
+
+def _without_absence(text: str) -> str:
+    """``text`` without its clauses that state an absence. The repair guard does not protect them (``lost_supported``):
+    filling an absence is what a repair is for, and an absence it drops without the datum is reported as a gap by the
+    completeness check. A negation that qualifies a positive claim ("אינו כולל מע״מ") stays."""
+    return "".join(c for c in re.split(r"(?<=[.;\n])", text or "") if not states_absence(c))
+
+
 def _covers(forms: set[str], claim: str, heading: str, numeric: bool) -> bool:
     """Whether a unit of a repair's answer (``forms``: the comparable forms of its words and of its heading chain's)
     still says a supported claim (``lost_supported``): all its qualifier words, and, for a claim with no number, at least
@@ -1282,7 +1302,8 @@ class VerifyReport:
         ``text`` — its heading chain counted as its context — holds the claim's qualifier words (``QUALIFIER_LEXICON``:
         a negation, condition, status, date or caveat) and, for a claim with no number, ``LOST_WORD_SHARE`` of its other
         content words (stemmed, ``_missing_forms``; stop words ignored) and those of the heading chain it sat under. A
-        rephrasing that keeps its salient words is not a loss."""
+        rephrasing that keeps its salient words is not a loss. A claim of kind ``absence``, and a clause saying a datum is
+        not stated, found, computed or determined, is not protected (``_without_absence``): the repair fills it."""
         shown = numbers_in(text)
         new_units = split_units(text)
         chains = _headings_above(text, new_units)
@@ -1299,9 +1320,12 @@ class VerifyReport:
             for r in recs:
                 if r.verdict != "supported" or r.action not in ("kept", "qualified", "cited"):
                     continue
-                needed = numbers_in(r.text)
+                claim = "" if r.kind == "absence" else _without_absence(r.text)
+                if not claim.strip():
+                    continue  # a statement of an absence is not protected
+                needed = numbers_in(claim)
                 if (needed and not needed <= shown) or (sources and not sources & cited) or not any(
-                        _covers(c, r.text, u.heading, bool(needed)) for c in covers):
+                        _covers(c, claim, u.heading, bool(needed)) for c in covers):
                     lost.append((u, r))
         return lost
 

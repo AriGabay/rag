@@ -678,6 +678,27 @@ def test_a_repair_that_cites_none_of_the_sources_a_supported_sentence_cited_give
     assert [p["check"] for r in out.rounds for p in r].count("repair_lost_supported") == 1
 
 
+def test_a_repair_that_replaces_a_supported_absence_statement_with_the_value_is_adopted(offline):
+    """An absence ("לא חושב כאן") is what a repair fills: its loss is no loss, though the sentence holds "לא"."""
+    offline.texts = [SOURCE + " הסכום החדש לא חושב כאן."]
+    first = "הסכום החדש לא חושב כאן [S1].\nהנכס מושכר [S1]."
+    repaired = "השווי למ\"ר הוא 9,500 ₪ [S1]."
+    out = _turn(ScriptedAgent([SEARCH, final(first), final(repaired)], judge=_judge_wrong_management))
+    assert out.answer.answer_markdown == repaired
+    assert not [p for r in out.rounds for p in r if p["check"] == "repair_lost_supported"]
+
+
+def test_a_negation_that_qualifies_a_positive_claim_is_protected_but_an_absence_statement_is_not():
+    ws = _ws(SOURCE + " המחיר הוא 55 ₪ ואינו כולל מע״מ. הסכום לא חושב.")
+    report = verify_answer(_judge(), _answer("המחיר הוא 55 ₪ ואינו כולל מע״מ [S1].\nהסכום לא חושב [S1]."), ws, "?", [])
+    assert not report.lost_supported("המחיר הוא 55 ₪ ואינו כולל מע״מ [S1].")  # nothing lost: the absence is free
+    (lost,) = report.lost_supported("המחיר הוא 55 ₪ [S1].")
+    assert "מע״מ" in lost[1].text  # dropping "אינו כולל מע״מ" from a supported price claim is a loss
+    assert not report.lost_supported("המחיר הוא 55 ₪ ואינו כולל מע״מ [S1].\nהסכום חושב והוא 3 ₪ [S1].")
+    for text in ("הקומה אינה כלולה בשטח", "אין אפשרות לחשב את הסכום", "לא ניתן לקבוע את השווי", "לא נמצא שטח"):
+        assert verify.states_absence(text) == (text != "הקומה אינה כלולה בשטח")
+
+
 def test_a_qualified_or_cited_supported_claim_is_protected_like_a_kept_one():
     ws = _ws()
     report = verify_answer(_judge(), _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nהנכס פנוי."), ws, "?", [])

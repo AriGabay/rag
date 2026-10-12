@@ -700,17 +700,26 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
 _LEADING_QUESTION = re.compile(r"^\s*(?:מהו|מהי|מהם|מהן|מה|איזה|איזו|אילו)\s+(?:הוא\s+|היא\s+|הם\s+|הן\s+)?")
 
 
+SHORT_COMPONENT_WORDS = 8  # a component of at most this many words, in one clause, is its own label
+
+
 def gap_label(o: dict) -> str:
-    """What a component's gap line names (R24): a short noun phrase, never the request or a clause of it. The part of a
-    partly given component the answer does not give (R20; validated, so a noun phrase), else the component's own words
-    when they are a noun phrase, else those words without a leading question word ("מהו תאריך הטופס?" ->
-    "תאריך הטופס") when what remains is one, else the datum asked for, with the component's subject."""
-    from app.chat.verify import MISSING_PART_CHARS, is_request_clause
+    """What a component's gap line names (R24): never the whole request or a long or multi-clause question. In order:
+    the part of a partly given component the answer does not give (R20; validated, so a noun phrase); the component's
+    own words when they are a noun phrase; a short component (``SHORT_COMPONENT_WORDS`` words, one clause, no "?") as
+    the user wrote it, a yes/no "האם …" one included; the words without a leading interrogative pronoun ("מהו תאריך
+    הטופס?" -> "תאריך הטופס") when what remains is a noun phrase; the datum asked for, with the component's subject;
+    "הנתון המבוקש" alone as the last resort."""
+    from app.chat.verify import _QUESTION_WORD, MISSING_PART_CHARS, is_request_clause
 
     if o.get("status") == "partial" and o.get("missing_part"):
         return o["missing_part"]
     text = " ".join((o.get("text") or "").split())
     if text and not is_request_clause(text) and len(text) <= MISSING_PART_CHARS:
+        return text
+    asked = len(_QUESTION_WORD.findall(text))
+    if (text and "?" not in text and "," not in text and len(text.split()) <= SHORT_COMPONENT_WORDS
+            and asked == 1 and text.startswith("האם ")):
         return text
     rest = _LEADING_QUESTION.sub("", text).strip(" ?")
     if rest and rest != text and not is_request_clause(rest) and len(rest) <= MISSING_PART_CHARS:

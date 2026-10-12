@@ -1184,7 +1184,14 @@ def test_a_single_question_component_is_named_by_its_noun_phrase_and_a_clause_wi
     assert label({"text": "מספר היתר הבנייה", "subject": "בניין"}) == "מספר היתר הבנייה"
     assert label({"text": "מהו מספר ההיתר ומתי ניתן?", "subject": ""}) == "הנתון המבוקש"
     assert label({"text": "כמה עולה, והאם כולל מע\"מ?", "subject": "הנכס"}) == "הנתון המבוקש (הנכס)"
-    assert label({"text": "האם הנכס מושכר", "status": "partial", "missing_part": "", "subject": ""}) == "הנתון המבוקש"
+    # a short component the user wrote keeps its wording, a yes/no "האם …" one included (R24 is about long questions)
+    assert label({"text": "האם הפרויקט כדאי", "subject": ""}) == "האם הפרויקט כדאי"
+    assert label({"text": "האם הנכס מושכר", "status": "partial", "missing_part": "", "subject": "נכס"}) == "האם הנכס מושכר"
+    # a long or multi-clause yes/no question gets the subject label
+    assert label({"text": "האם הפרויקט כדאי כלכלית ומתי כדאי להתחיל לבנות", "subject": "פרויקט"}) == "הנתון המבוקש (פרויקט)"
+    assert label({"text": "האם הפרויקט כדאי כלכלית לאור כל העלויות והתמורות שנקבעו בדוח השמאי של הנכס", "subject": "הנכס"}) \
+        == "הנתון המבוקש (הנכס)"
+    assert label({"text": "האם הפרויקט כדאי?", "subject": ""}) == "הנתון המבוקש"
     assert label({"text": "שטחי שירות", "status": "partial", "missing_part": PLOT1_SERVICE}) == PLOT1_SERVICE
 
 
