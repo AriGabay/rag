@@ -345,11 +345,12 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
              authorized: Callable[[Iterable[str]], set[str]], titles: list[str] | Callable[[], list[str]],
              lookup: Callable[[str], entities.Outcome] | None = None,
              candidates: list[dict] | None = None, focus_titles: list[str] | None = None,
-             user_texts: list[str] | None = None) -> Request:
+             user_texts: list[str] | None = None, prior_units: list[dict] | None = None) -> Request:
     """``titles``: every title the user may see (the words that can name a document), or a provider of them, read
     only when needed; ``focus_titles``: the titles of the documents the conversation was about; ``user_texts``: what
     the user wrote in the conversation (the message alone when not given), which a parameter given by the user
-    quotes."""
+    quotes; ``prior_units``: the units of the files the previous turn touched, when that turn was the model's own
+    question between appraisals (it left no candidates): a reply that states one's complete name selects it."""
     decisions: dict[str, str] = {}
     ok: set[str] = set()
     claimed = {c.field for c in resolved.changed_fields}
@@ -449,12 +450,22 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
     keep_focus = bool(focus) and not new_question and resolved.scope != "set"
     seen = authorized(focus_ids) if keep_focus and focus_ids else set()
     out.document_ids = [d for d in focus_ids if d in seen]
+    # a reply to a clarification: the candidate it names — by the model's reading of it as an answer, or whatever the
+    # reading, by stating one's complete title or alias (R13); the units of the files a model's own question offered
+    # are matched by the complete name alone
+    picked = None
+    if resolved.scope != "set" and (pool := candidates or prior_units):
+        allowed = authorized([c["document_id"] for c in pool])
+        if candidates and relation == "clarification_answer":
+            picked = entities.among(candidates, message, allowed)
+        else:
+            picked = entities.named_unit(pool, message, allowed)
     if resolved.scope == "set":
         out.document_ids = []
         out.entity_changed = bool(focus)
         decisions["documents"] = "set: left to the tools"
-    elif candidates and relation == "clarification_answer":
-        outcome = entities.among(candidates, message, authorized([c["document_id"] for c in candidates]))
+    elif picked is not None:
+        outcome = picked
         _take(out, outcome, message, decisions)
         if outcome.kind == "resolved":
             # the chosen document is the subject now: nothing of the previous property's (a unit, an address) stays
@@ -541,6 +552,16 @@ def _take(out: Request, outcome: entities.Outcome, words: str, decisions: dict,
         out.subject = ""
 
 
+def first_message_clarification(question: str, outcome: entities.Outcome, words: str) -> Request:
+    """The request of a conversation's first message that names several units alike (``entities.first_message_ambiguity``):
+    the server's question between them, with the candidates the reply will be resolved among (R13, AE4)."""
+    out = Request(KIND_OF_RELATION["new_question"], question, relation="new_question")
+    decisions = {"first_message": "the words fit several units of a file equally well"}
+    _take(out, outcome, words, decisions)
+    out.resolution.update(parse=None, decisions=decisions)
+    return out
+
+
 def _input(focus: dict | None, history: list, message: str, documents: list[dict],
            candidates: list[dict] | None = None) -> str:
     parts = []
@@ -574,10 +595,11 @@ def resolve(provider: LLMProvider, focus: dict | None, history: list, message: s
             authorized: Callable[[Iterable[str]], set[str]], titles: list[str] | Callable[[], list[str]],
             usage: list[dict],
             deadline: float | None = None, lookup: Callable[[str], entities.Outcome] | None = None,
-            candidates: list[dict] | None = None) -> Request | None:
+            candidates: list[dict] | None = None, prior_units: list[dict] | None = None) -> Request | None:
     """The validated request of a follow-up, or None when the call failed (the turn then goes on as before).
     ``documents``: the documents the conversation was about; ``authorized`` and ``titles``: what the user may see;
-    ``lookup``: the documents the user's words name; ``candidates``: what the previous clarification offered."""
+    ``lookup``: the documents the user's words name; ``candidates``: what the previous clarification offered;
+    ``prior_units``: the units the model's own previous question may have been between (see ``validate``)."""
     provider = for_purpose(provider, Purpose.RESOLVE)
     r = call_structured(provider, Purpose.RESOLVE, POLICY, _input(focus, history, message, documents, candidates),
                         ResolvedRequest, max_output_tokens=RESOLVE_OUTPUT_TOKENS, deadline=deadline)
@@ -586,7 +608,8 @@ def resolve(provider: LLMProvider, focus: dict | None, history: list, message: s
         return None
     users = [m.content for m in history if getattr(m, "role", None) == "user"]
     return validate(r.parsed, focus, message, authorized, titles, lookup, candidates,
-                    focus_titles=[d["title"] for d in documents], user_texts=[*users, message])
+                    focus_titles=[d["title"] for d in documents], user_texts=[*users, message],
+                    prior_units=prior_units)
 
 
 _REPLY_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")

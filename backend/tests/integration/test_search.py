@@ -1067,6 +1067,17 @@ def test_a_chunk_that_runs_into_the_next_unit_gives_the_next_unit_only_its_own_b
     assert [u["unit_no"] for u in m.units] == [1]  # the chunk begins in, and holds a block of, the first unit
 
 
+def test_a_chunk_that_begins_in_a_unit_and_runs_into_the_next_title_gives_the_next_unit_none_of_its_words(db):
+    """The second appraisal's last block and the third's title block (6 and 7) are one chunk: the title's words are the
+    third's, the closing line's ("בסמוך") the second's, so no appraisal holds both (R10, R11)."""
+    a = make_office(db, "משרד א", "a@example.test")
+    _compendium(a, a.default_group_id, chunks=[(6, 7)])
+    m = _matches(a, "נחל הדס בסמוך")
+    assert m.documents == [] and len(m.split) == 1
+    m = _matches(a, "בסמוך לים")
+    assert [u["unit_no"] for u in m.units] == [2]  # the closing line is the second's, the chunk begins in it
+
+
 def test_a_unit_scope_searches_only_the_chunks_that_begin_inside_its_blocks(compendium):
     from app.platform.search import SearchScope
 

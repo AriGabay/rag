@@ -88,7 +88,10 @@ the unit was searched and nothing found, and — only next to a probable edge �
 labelled by its unit, and says so. The outline of a file of more than ``OUTLINE_INLINE_UNITS`` units lists its units and
 then the chosen unit's sections only, so no section list is cut at ``OUTLINE_MAX``. Every search hit, read source,
 value, measurement and citation anchor of such a file carries the unit (``unit_id``: version, reading, number; with
-title and pages for the answer's payload); a file with one unit shows and checks nothing new.
+title and pages for the answer's payload); a file with one unit shows and checks nothing new. A text hit that begins in a
+unit and runs on into the next unit's blocks is cut at the unit's last block (``_clip_to_unit``: its text, last block
+and pages), and a read through a unit handle reads no block outside the unit's reach, so a cited passage never holds
+another unit's text (R10).
 
 **The unit in the conversation** (round 9 U10, KTD8): when the request is in a unit — kept from the previous turn across a
 metric change, or named by the user — the engine gives it a handle (``Workspace.unit_focus``) and a ``search``,
@@ -1096,6 +1099,32 @@ def _unit_search(ws: Workspace, conn: Connection, handle: str, query: str, limit
     return [], [], MSG_UNIT_SEARCHED.format(unit=unit, pages=_unit_pages(*cx.pages(number)), extended="", query=_txt(query))
 
 
+def _clip_to_unit(conn: Connection, version_id, cx, kind: str, bs, be, body: str,
+                  pages: list[int] | None) -> tuple[str, int | None, list[int] | None]:
+    """A text passage of a file of several units, cut at the last block of the unit it begins in (round 9 R10): a chunk
+    that runs on into the next unit's title block is labelled with the unit it begins in, so its text is that unit's
+    blocks only (the chunk's text without the blocks past the unit, else the unit's own blocks joined), its last block
+    the unit's, and its pages the pages of the blocks left. Returns (text, last block, pages); unchanged for a table
+    (its rows are placed by ``_row_contexts``), a passage inside its unit, and a file with one unit."""
+    if not cx.multi or bs is None or be is None or kind in ("table", "table_row"):
+        return body, be, pages
+    seg = cx.segment_at(bs)
+    if seg is None or be <= seg.last:
+        return body, be, pages
+    rows = conn.execute(text(
+        "SELECT block_index, kind, text, page FROM document_blocks WHERE version_id = :v AND block_index BETWEEN :a"
+        " AND :b ORDER BY block_index"), {"v": version_id, "a": bs, "b": be}).all()
+    inside = [r for r in rows if r.block_index <= seg.last]
+    prose = ("heading", "paragraph", "textbox")
+    past = "\n".join(r.text for r in rows if r.block_index > seg.last and r.text and r.kind in prose)
+    own = body[:-len(past)].rstrip("\n") if past and body.endswith(past) else "\n".join(
+        r.text for r in inside if r.text and r.kind in prose)
+    if not own.strip():
+        return body, be, pages
+    held = sorted({r.page for r in inside if r.page})
+    return own, seg.last, [p for p in pages or [] if p in held] or held or pages
+
+
 def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None, limit: int | None = None,
                 unit: str | None = None) -> str:
     query = (query or "").strip()
@@ -1150,22 +1179,24 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 continue
             e = extra.get(h["chunk_id"])
             bs, be = (e.block_start, e.block_end) if e else (None, None)
+            cx = contexts_of(ws, conn, h["version_id"])
+            if cx.multi:
+                noted[str(h["document_id"])] = cx
+            # a passage that runs into the next unit is that of the unit it begins in (R10): cut there
+            passage, be, page_list = _clip_to_unit(conn, h["version_id"], cx, h["kind"], bs, be, h["text"], h["page_list"])
             paragraphs, media = _block_info(conn, h["version_id"], bs, be)
             tags = {"document": ws.doc_handle(h["document_id"])}
             if h.get("table_index") is not None:  # a matched row opens its whole table
                 tags["table"] = _table_handle(ws, h["document_id"], h["version_id"],
                                               ws.readings.get(str(h["version_id"])), h["table_index"])
-            cx = contexts_of(ws, conn, h["version_id"])
-            if cx.multi:
-                noted[str(h["document_id"])] = cx
             src = _mark(ws.add_source(
                 document_id=h["document_id"], version_id=h["version_id"], title=h["title"], section=h["section"],
-                location=_location(h["section"], h["kind"], h["page_list"], bs, be, paragraphs, media),
+                location=_location(h["section"], h["kind"], page_list, bs, be, paragraphs, media),
                 kind=h["kind"], text=_with_size(sizes.get((h["version_id"], h.get("table_index"))),
-                                                _clip(h["text"], get_settings().chat_passage_chars)), block_start=bs, block_end=be,
-                table_index=h.get("table_index"), chunk_id=h["chunk_id"], page_list=h["page_list"] or None,
+                                                _clip(passage, get_settings().chat_passage_chars)), block_start=bs, block_end=be,
+                table_index=h.get("table_index"), chunk_id=h["chunk_id"], page_list=page_list or None,
                 # read in part only when the page or section it cites has an unread region (R28)
-                partial_document=gaps.get(h["version_id"], whole).cites(h["page_list"], h["section"]), tags=tags,
+                partial_document=gaps.get(h["version_id"], whole).cites(page_list, h["section"]), tags=tags,
                 row_index=h.get("row_index") if h["kind"] == "table_row" else None),
                 cx, _hit_contexts(ws, conn, cx, h, bs, be) if cx.multi else [], ws)
             out.append(ws.once(src, ("chunk", h["chunk_id"])))
@@ -1405,14 +1436,17 @@ def _target_from_json(resume, version_id: str) -> tuple[tuple, object] | None:
     return None
 
 
-def _cursor(ws: Workspace, v: reader.Version, target: tuple, pos) -> str:
-    return ws.handle("K", (target, pos), document_id=str(v.document_id), version_id=str(v.version_id),
-                     reading_id=v.reading_id, target=target, pos=pos)
+def _cursor(ws: Workspace, v: reader.Version, target: tuple, pos, within: tuple[int, int] | None = None) -> str:
+    """The handle that reads on from ``pos``; ``within``: the blocks (first, last) of the unit the read is scoped to,
+    which its continuation keeps."""
+    return ws.handle("K", (target, pos, within), document_id=str(v.document_id), version_id=str(v.version_id),
+                     reading_id=v.reading_id, target=target, pos=pos, within=within)
 
 
 def _emit(ws: Workspace, v: reader.Version, target: tuple, pos, part: reader.Part, *, name: str, scope: str,
           location: str, section: str | None, lines: list[str], read: bool, more: str | None = None,
-          cut: bool = False, unread_pages: list[int] | None = None, cx=None) -> Source:
+          cut: bool = False, unread_pages: list[int] | None = None, cx=None,
+          within: tuple[int, int] | None = None) -> Source:
     """A part of a window as a source of the turn. Its ``text`` is the part's full text (what the verifier
     checks); what is sent leaves out blocks the turn already returned whole, as a pointer to the source that
     returned them, and marks unread and uncertain regions where they are in reading order with their R#."""
@@ -1468,7 +1502,7 @@ def _emit(ws: Workspace, v: reader.Version, target: tuple, pos, part: reader.Par
             body.append(f"[טבלה {t}: כל השורות, הכותרות וההערות — read(table={t})]")
     flush()
     if part.next is not None:
-        more = _cursor(ws, v, target, part.next)
+        more = _cursor(ws, v, target, part.next, within)
     clipped = part.next is not None or cut
     status = ("clipped" if clipped else "has_unread_regions" if unread
               else "uncertain_reading" if uncertain else "complete")
@@ -1517,12 +1551,16 @@ def _memoized_read(ws: Workspace, conn: Connection, key: tuple, v: reader.Versio
     return s
 
 
-def _read_window(ws: Workspace, conn: Connection, v: reader.Version, target: tuple, pos) -> Source:
-    """A part of a section (its sub-sections included) or of a page range, from ``pos`` (None: its beginning)."""
-    return _memoized_read(ws, conn, ("window", target, pos), v, lambda: _read_window_once(ws, conn, v, target, pos))
+def _read_window(ws: Workspace, conn: Connection, v: reader.Version, target: tuple, pos,
+                 within: tuple[int, int] | None = None) -> Source:
+    """A part of a section (its sub-sections included) or of a page range, from ``pos`` (None: its beginning).
+    ``within``: the blocks (first, last) of the unit it is scoped to (R10): no block outside them is read."""
+    return _memoized_read(ws, conn, ("window", target, pos, within), v,
+                          lambda: _read_window_once(ws, conn, v, target, pos, within))
 
 
-def _read_window_once(ws: Workspace, conn: Connection, v: reader.Version, target: tuple, pos) -> Source:
+def _read_window_once(ws: Workspace, conn: Connection, v: reader.Version, target: tuple, pos,
+                      within: tuple[int, int] | None = None) -> Source:
     vid = v.version_id
     unread_pages = None
     from_block = pos[0] if pos else None  # ``take`` starts at ``pos``: the blocks before it are not loaded
@@ -1536,6 +1574,8 @@ def _read_window_once(ws: Workspace, conn: Connection, v: reader.Version, target
     else:
         first, last = target[2], target[3]
         rows = reader.blocks_on_pages(conn, vid, first, last, from_block)
+        if within is not None:  # a page shared with the next unit: only the unit's own blocks
+            rows = [r for r in rows if within[0] <= r.block_index <= within[1]]
         unread_pages = reader.unread_pages(conn, vid, first, last)
         name = _pages_label([first, last])
         lines = []
@@ -1558,7 +1598,7 @@ def _read_window_once(ws: Workspace, conn: Connection, v: reader.Version, target
             lines.append("סעיפים בעמודים האלה: " + "; ".join(
                 f"{_section_handle(ws, v, p, w)} «{_section_name(p)}»" for p, w in list(paths)[:SECTIONS_LISTED]))
     s = _emit(ws, v, target, pos, part, name=name, scope=target[0], location=location, section=section,
-              lines=lines, read=True, unread_pages=unread_pages if pos is None else None, cx=cx)
+              lines=lines, read=True, unread_pages=unread_pages if pos is None else None, cx=cx, within=within)
     if target[0] == "pages":  # a section opened by name is its own opening
         _whole_sections(ws, conn, v, cx, part, s)
     return s
@@ -1827,7 +1867,9 @@ def tool_read(ws: Workspace, target: dict) -> str:
             if ucx is not None and ucx.multi:
                 first, last, note = _within_unit(ucx, number, by_unit, first, last)
             last = min(last, v.page_count or last, first + PAGES_MAX - 1)
-            s = _read_window(ws, conn, v, ("pages", str(v.version_id), first, last), None)
+            reach = ucx.reach(number) if ucx is not None and ucx.multi else None
+            s = _read_window(ws, conn, v, ("pages", str(v.version_id), first, last), None,
+                             (reach.first, reach.last) if reach is not None else None)
         elif kind == "section":
             data = _handle(ws, value, "§")
             v = _bound(conn, ws, value, data)
@@ -1844,7 +1886,7 @@ def tool_read(ws: Workspace, target: dict) -> str:
             if data["target"][0] == "table":
                 s = _read_table(ws, conn, v, data["target"][2], data["pos"])
             else:
-                s = _read_window(ws, conn, v, data["target"], data["pos"])
+                s = _read_window(ws, conn, v, data["target"], data["pos"], data.get("within"))
     return _render_source(s) + (f"\n\n{note}" if note else "")
 
 

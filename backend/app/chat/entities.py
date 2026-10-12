@@ -34,6 +34,13 @@ identifier that only some candidates hold; a reply that fits none or several ask
 request's unit. The names of units join the vocabulary of identifying words (``titles_of``), so a project name that
 is in no file title still names a document in a follow-up.
 
+A reply that states a candidate's complete title or alias as a whole phrase ("מתחם הגפן ב": the one letter that tells it
+apart is dropped as a word) selects it when no other candidate's name is stated (``named_unit``); after the model's own
+question between appraisals, which offered no candidates, the reply is matched the same way against the units of the files
+that turn touched (``units_of_documents``). A conversation's first message is checked once, from the unit names alone
+(``first_message_ambiguity``): when its words fit two or more units equally well by name, the server asks as it does for a
+follow-up and the model is not called.
+
 **The unit in the conversation** (round 9 U10, KTD8, R14): the conversation's focus carries the unit it is about as its
 anchor (``located_unit``), and a follow-up keeps it across a metric or computation change. Two anchors are the same unit
 (``same_unit``) in the same reading by number and across readings by names, never by number; a follow-up that names
@@ -59,6 +66,7 @@ from app.db import TenantContext, tenant_tx
 from app.extraction.normalize_text import base_normalize
 from app.platform.search import (
     UnitMatches,
+    _name_fit,
     _scope_terms,
     _title_words,
     printed_labels,
@@ -392,10 +400,41 @@ def _candidate_words(c: Candidate) -> set[str]:
     return words
 
 
+def _full_names(c: Candidate) -> tuple[str, ...]:
+    """A candidate's complete names, normalized (``contexts.name_key``): its title and, for a unit, its display title
+    and aliases. A one-character name is no name."""
+    raw = [c.title] + ([c.unit.get("display"), c.unit.get("title"), *(c.unit.get("aliases") or ())] if c.unit else [])
+    return tuple(dict.fromkeys(k for x in raw if len(k := contexts.name_key(x)) >= 2))
+
+
+def _named_by_phrase(cands: list[Candidate], reply: str) -> list[Candidate]:
+    """The candidates whose complete title or alias the reply holds as a whole phrase ("מתחם הגפן ב", with the prefix
+    letters of its first word allowed): the one-letter tail the tokenizer drops is part of the phrase. A candidate
+    whose phrase lies inside the longer phrase another candidate's name matched ("מגדל הים" in "מגדל הים הצפוני")
+    is not named by it."""
+    spans: dict[int, tuple[int, int]] = {}
+    for n, c in enumerate(cands):
+        found = contexts.Identity(names=_full_names(c)).name_spans(reply)
+        if found:
+            spans[n] = max(found, key=lambda sp: sp[1] - sp[0])
+    return [cands[n] for n, (a, b) in spans.items()
+            if not any(o != n and x <= a and b <= y and (y - x) > (b - a) for o, (x, y) in spans.items())]
+
+
+def named_unit(candidates: list[dict], reply: str, authorized: set[str]) -> Outcome | None:
+    """The one candidate (a document or a unit, as a clarification's ``as_dict`` or ``unit_candidate`` gives it) whose
+    complete title or alias the reply states as a whole phrase, as a resolved outcome; None when the reply states none
+    of them or several (the words of a name that several share name none)."""
+    cands = [Candidate(str(c["document_id"]), c["title"], unit=c.get("unit"), file_title=c.get("file_title") or "")
+             for c in candidates if str(c["document_id"]) in authorized]
+    named = _named_by_phrase(cands, reply)
+    return Outcome("resolved", named, reply) if len(named) == 1 else None
+
+
 def among(candidates: list[dict], reply: str, authorized: set[str]) -> Outcome:
     """A reply to a clarification that named ``candidates``: the one candidate the reply names (by an ordinal word, by
-    a word of its name or identifiers that the other candidates lack, or by its number in the list), else the
-    clarification again."""
+    its complete title or alias, by a word of its name or identifiers that the other candidates lack, or by its number
+    in the list), else the clarification again."""
     cands = [Candidate(str(c["document_id"]), c["title"], unit=c.get("unit"), file_title=c.get("file_title") or "")
              for c in candidates if str(c["document_id"]) in authorized]
     if not cands:
@@ -404,6 +443,9 @@ def among(candidates: list[dict], reply: str, authorized: set[str]) -> Outcome:
     for w in words:
         if w in _ORDINALS and _ORDINALS[w] < len(cands):
             return Outcome("resolved", [cands[_ORDINALS[w]]], reply)
+    named = _named_by_phrase(cands, reply)  # "מתחם הגפן ב": the letter the tokenizer drops is part of the name
+    if len(named) == 1:
+        return Outcome("resolved", named, reply)
     vocab = {id(c): _candidate_words(c) for c in cands}
     # a word of the reply that some candidates hold and others lack ("בכפר גפן", "ב", not "הנרקיס")
     letters = [{w} for w in words if len(w) == 1 and w.isalnum()]  # the letter or digit that tells "הגפן א" from "הגפן ב"
@@ -491,6 +533,92 @@ def candidate_rows(matches: UnitMatches) -> list[dict]:
         else:
             rows.append(d)
     return rows
+
+
+def units_of_documents(ctx: TenantContext, ids) -> list[dict]:
+    """The subject units of the given documents that hold several units, as clarification candidates (``Candidate.as_dict``),
+    in reading order: what the model's own question between appraisals offered, when it left no candidates. Under the
+    user's permissions; a document that is not readable, or is one unit, gives none."""
+    uuids = []
+    for i in ids or ():
+        try:
+            uuids.append(UUID(str(i)))
+        except ValueError:
+            continue
+    if not uuids:
+        return []
+    with tenant_tx(ctx) as conn:
+        files = {r.version_id: r for r in conn.execute(text(
+            "SELECT d.id, d.title, v.id AS version_id, COALESCE(v.ingestion->>'reading_id', '') AS reading_id"
+            " FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
+            " WHERE d.id = ANY(:i) AND d.deleted_at IS NULL"), {"i": uuids})}
+        stored = unit_store.stored_many(conn, list(files))
+        rows = []
+        for version_id, units in stored.items():
+            f = files[version_id]
+            if len(units) < 2:
+                continue
+            rows += [{"document_id": f.id, "version_id": version_id, "reading_id": f.reading_id, "unit_no": u.unit_no,
+                      "unit_id": contexts.unit_key(version_id, f.reading_id, u.unit_no), "kind": u.kind,
+                      "title": u.title, "aliases": list(u.aliases),
+                      "identifiers": list((u.identifiers or {}).get("shown") or ()), "page_first": u.page_first,
+                      "page_last": u.page_last, "certainty": u.certainty, "file_title": f.title}
+                     for u in units if u.kind not in contexts.NON_SUBJECT_KINDS]
+        if rows:
+            printed_labels(conn, rows)
+    return [unit_candidate(u, u["file_title"]).as_dict() for u in rows]
+
+
+# the words of the trade that name a kind of property or report, never one of them: a first message that holds only
+# these (with the words of a unit's name) asks which appraisal, though no appraisal was named
+GENERIC_NAME_WORDS = frozenset({"שומה", "שומת", "שומות", "נכס", "נכסים", "פרויקט", "פרויקטים", "מתחם", "מתחמים",
+                                "בניין", "בניינים", "דוח", "דו\"ח", "חוות", "דעת", "הערכה", "שמאות", "דירה", "מגרש"})
+_UNIT_NAMES_SQL = (
+    "SELECT u.document_id, u.unit_no, u.kind, u.title, u.aliases, count(*) OVER (PARTITION BY u.version_id) AS units"
+    " FROM document_units u JOIN document_versions v ON v.id = u.version_id AND v.is_current"
+    " AND u.reading_id = COALESCE(v.ingestion->>'reading_id', '')"
+    " JOIN documents d ON d.id = u.document_id AND d.deleted_at IS NULL")
+
+
+def first_message_ambiguity(ctx: TenantContext, question: str) -> tuple[Outcome, str] | None:
+    """The unit clarification a conversation's first message needs, with the words it was looked up by, or None (round 9
+    R13, AE4). Follow-ups resolve names before anything is searched; a first message does not, so a question whose
+    words fit two units of a file of several equally well ("מה דמי השכירות במתחם הגפן?" over "מתחם הגפן א" and "מתחם
+    הגפן ב") went to the model, which answered both or asked in its own words. Only that case is decided here, from
+    the names alone and in one query (the unit lookup runs only when it holds): the identifying words of the question
+    are words of some unit's name, at least one of them no generic word of the trade; two or more subject units of
+    files of several hold all of them in their names, and none fits strictly better (the words of a name it holds,
+    then the fewest words of that name left unsaid); no unit's complete title or alias is stated in the question. The
+    outcome is the lookup's, so it is the ambiguity the follow-up would have got: candidates ordered by name fit."""
+    with tenant_tx(ctx) as conn:
+        units = [r for r in conn.execute(text(_UNIT_NAMES_SQL)) if r.units > 1 and r.kind not in contexts.NON_SUBJECT_KINDS]
+    names = {(r.document_id, r.unit_no): ([r.title] if r.title else []) + list(r.aliases or ()) for r in units}
+    if len(names) < 2:
+        return None
+    words = identifying(question, [n for ns in names.values() for n in ns], bare_numbers=False)
+    if not words or all(forms(w) & GENERIC_NAME_WORDS for w in words):
+        return None
+    query = " ".join(words)
+    term_sets = [set(f) for f in _scope_terms(query)]
+    fits = {}  # the units whose names hold every word, by how many words of the best name the question leaves unsaid
+    for key, ns in names.items():
+        held, extra = _name_fit(ns, term_sets)
+        if len(held) == len(term_sets):
+            fits[key] = -extra
+    if len(fits) < 2:
+        return None
+    best = max(fits.values())
+    tied = [k for k, v in fits.items() if v == best]
+    if len(tied) < 2:
+        return None
+    # a unit whose complete name the question states is the one asked about, however alike the others are
+    if any(contexts.Identity(names=tuple(k for n in names[key] if (k := contexts.name_key(n)))).name_spans(question)
+           for key in tied):
+        return None
+    outcome = lookup(ctx, query, set())
+    if outcome.kind != "ambiguous" or not any(d.unit for d in outcome.documents):
+        return None
+    return outcome, query
 
 
 def authorized(ctx: TenantContext, ids) -> set[str]:

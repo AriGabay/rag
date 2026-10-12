@@ -307,6 +307,145 @@ def test_replying_the_second_or_a_letter_only_one_unit_holds_picks_that_unit(off
     assert req.located_unit["title"] == "מתחם הגפן ב"
 
 
+# --- the first message of a conversation (R13, AE4) ------------------------------------------------------------------
+
+R9B_TITLE = MANIFEST["similar_names"]["title"]
+SIMILAR_QUESTION = "מה דמי השכירות החודשיים במתחם הגפן?"
+
+
+@pytest.fixture
+def statements():
+    """The SELECTs executed while the test runs (the connection setup of ``tenant_tx`` excluded)."""
+    from sqlalchemy import event
+
+    from app.db import get_engine
+
+    seen: list[str] = []
+
+    def record(conn, cursor, statement, *args):  # noqa: ARG001
+        if statement.lstrip().upper().startswith(("SELECT", "WITH")) and "set_config" not in statement:
+            seen.append(statement)
+
+    engine = get_engine()
+    event.listen(engine, "before_cursor_execute", record)
+    yield seen
+    event.remove(engine, "before_cursor_execute", record)
+
+
+def test_a_first_message_whose_words_fit_two_units_equally_gets_the_servers_clarification_with_no_model_call(
+        client, office, monkeypatch):
+    doc, _ = ingest(office, R9B)
+    agent = ScriptedAgent([])
+    cloud(monkeypatch, office, agent)
+    m = send(client, new_conversation(client), SIMILAR_QUESTION)
+    assert m["status"] == "done", m
+    a = m["answer"]
+    assert a["status"] == "clarification" and a["status"] != "answered", a["markdown"]
+    md = a["markdown"]
+    assert "1. «מתחם הגפן א» (עמוד 1;" in md and "2. «מתחם הגפן ב» (עמוד 2;" in md and R9B_TITLE in md
+    assert [(c["document_id"], c["unit"]["unit_no"]) for c in a["request"]["candidates"]] == [(doc, 1), (doc, 2)]
+    assert agent.seen == [] and agent.calls == []  # nothing was asked of any model: not the agent, not the analysis
+
+
+def test_a_first_message_is_left_to_the_model_unless_it_names_two_or_more_units_without_a_better_fit(
+        office, r9a, monkeypatch):
+    ingest(office, R9B)
+    ctx = office.ctx()
+    tie = entities.first_message_ambiguity(ctx, SIMILAR_QUESTION)
+    assert tie is not None and [d.title for d in tie[0].documents] == ["מתחם הגפן א", "מתחם הגפן ב"]
+    for question in ["מה דמי השכירות החודשיים במתחם הגפן ב?",  # the whole name of one unit
+                     "מה דמי השכירות החודשיים?",  # no unit named
+                     "מה שווי הנכס בשומה?",  # a word of the trade, in no name alone
+                     f"מה שווי הנכס ב{UNITS[1]['aliases'][0]}?",  # a name only one unit holds
+                     "כמה שומות יש בקובץ?"]:
+        assert entities.first_message_ambiguity(ctx, question) is None, question
+
+
+def test_a_first_message_naming_files_of_one_unit_each_is_left_to_the_model(db):
+    a = make_office(db, "משרד א", "a@example.test")
+    for n, name in enumerate(["מתחם הגפן א", "מתחם הגפן ב"]):
+        unit_file(a, a.default_group_id, f"קובץ {name}", [{"title": name, "aliases": [name], "blocks": [name, "שווי 1 ₪"]}],
+                  sha=str(n) * 64)
+    assert entities.first_message_ambiguity(a.ctx(), SIMILAR_QUESTION) is None
+
+
+def test_the_first_message_check_is_one_query_when_nothing_is_named(office, r9a, statements):
+    ingest(office, R9B)
+    statements.clear()
+    assert entities.first_message_ambiguity(office.ctx(), "מה דמי השכירות החודשיים?") is None
+    assert len(statements) == 1, statements
+
+
+# --- the reply that is a unit's full name (R13) ------------------------------------------------------------------------
+
+
+def _task_unit(agent: ScriptedAgent) -> str:
+    """The unit the agent's task says the request is in (its «title» on the line `requested_block` writes)."""
+    return re.search(r"- יחידה בקובץ: U\d+ «([^»]*)»", agent.seen[0][0]["content"]).group(1)
+
+
+def _reply_turn(client, monkeypatch, cid: str, message: str, relation: str) -> tuple[ScriptedAgent, dict]:
+    """The reply ``message`` as the resolving model parses it (``relation``, the words as a new subject), then the
+    agent's turn; nothing the agent says matters here: the request is what the server resolved."""
+    agent = ScriptedAgent([[call("search", query="דמי שכירות", document_ids=None, limit=None, unit=None)],
+                           final("בדיקה.", "not_found")])
+    agent.on("resolve", _parse(relation=relation, changed_fields=[{"field": "subject", "user_words": message}],
+                               subject=message))
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: agent)
+    m = send(client, cid, message)
+    assert m["status"] == "done", m
+    return agent, m
+
+
+@pytest.mark.parametrize("relation", ["clarification_answer", "new_question"])
+def test_after_the_servers_clarification_the_reply_that_is_the_full_name_selects_that_unit_whatever_the_parse(
+        client, office, monkeypatch, relation):
+    doc, _ = ingest(office, R9B)
+    cloud(monkeypatch, office, ScriptedAgent([]))
+    cid = new_conversation(client)
+    assert send(client, cid, SIMILAR_QUESTION)["answer"]["status"] == "clarification"
+    agent, m = _reply_turn(client, monkeypatch, cid, "מתחם הגפן ב", relation)
+    req = m["answer"]["request"]
+    assert m["answer"]["status"] != "clarification"
+    assert req["document_ids"] == [doc] and req["located_unit"]["display"] == "מתחם הגפן ב"
+    assert req["located_unit"]["unit_no"] == 2 and req["entity_changed"] is True
+    assert _task_unit(agent) == "מתחם הגפן ב"
+
+
+def test_after_the_models_own_clarification_the_reply_is_matched_against_the_units_of_the_files_that_turn_touched(
+        client, office, monkeypatch):
+    doc, _ = ingest(office, R9B)
+    asked = "בקובץ שני מתחמים: מתחם הגפן א ומתחם הגפן ב. לאיזה התכוונת?"
+    first = ScriptedAgent([[call("search", query="דמי שכירות", document_ids=None, limit=None)],
+                           final(asked, "clarification", clarification=asked)])
+    cloud(monkeypatch, office, first)
+    cid = new_conversation(client)
+    m = send(client, cid, "מה דמי השכירות החודשיים?")
+    assert m["answer"]["status"] == "clarification" and not (m["answer"].get("request") or {}).get("candidates")
+    agent, m = _reply_turn(client, monkeypatch, cid, "מתחם הגפן ב", "new_question")
+    req = m["answer"]["request"]
+    assert m["answer"]["status"] != "clarification"
+    assert req["located_unit"]["display"] == "מתחם הגפן ב" and req["located_unit"]["unit_no"] == 2
+    assert req["document_ids"] == [doc]
+    assert _task_unit(agent) == "מתחם הגפן ב"
+
+
+def test_a_reply_after_the_models_clarification_that_names_no_unit_in_full_is_left_to_the_lookup(
+        client, office, monkeypatch):
+    ingest(office, R9B)
+    asked = "בקובץ שני מתחמים: מתחם הגפן א ומתחם הגפן ב. לאיזה התכוונת?"
+    cloud(monkeypatch, office, ScriptedAgent([[call("search", query="דמי שכירות", document_ids=None, limit=None)],
+                                              final(asked, "clarification", clarification=asked)]))
+    cid = new_conversation(client)
+    send(client, cid, "מה דמי השכירות החודשיים?")
+    agent = ScriptedAgent([])
+    agent.on("resolve", _parse(relation="clarification_answer", changed_fields=[{"field": "subject", "user_words": "הגפן"}],
+                               subject="הגפן"))
+    monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: agent)
+    m = send(client, cid, "הגפן")
+    assert m["answer"]["status"] == "clarification"  # "הגפן" is both: the server's question between the two
+
+
 # --- name fit, never passage counts (R13) ------------------------------------------------------------------------------
 
 G = "משרד א"
@@ -706,3 +845,56 @@ def test_pages_of_the_conversations_file_are_read_within_its_unit(r9a):
                                                               "source": None, "section": None, "table": None,
                                                               "cursor": None}}))
     assert "אינם ביחידה" in refused and "לא נפתח דבר" in refused
+
+
+# --- a source labelled with a unit never carries the next unit's blocks (round 9 R10) -----------------------------------
+
+CROSS = "קובץ שומות חוצה סינתטי"
+NEXT_TITLE = "פרויקט הברוש"
+
+
+@pytest.fixture
+def cross(office):
+    """Three appraisals, a page each; one chunk begins in the second (its rent block 3) and runs on into the third's
+    title block (4, on the third's page): its pages are [2, 3] and the second appraisal is page 2."""
+    office.doc, office.ver = unit_file(office, office.default_group_id, CROSS, [
+        {"title": "פרויקט הארז", "aliases": ["הארז"], "blocks": ["פרויקט הארז", "שווי הנכס 1,000,000 ₪."]},
+        {"title": "מתחם האשל", "aliases": ["האשל"], "blocks": ["מתחם האשל", "דמי שכירות חודשיים 5,400 ₪."]},
+        {"title": NEXT_TITLE, "aliases": ["הברוש"], "blocks": [NEXT_TITLE, "שווי הנכס 3,000,000 ₪."]}],
+        chunks=[(3, 4)])
+    return office
+
+
+def _rent_hit(ws, out: str):
+    sid = next(s for s in _sources(out) if "5,400" in ws.sources[s].text)
+    return ws.sources[sid]
+
+
+def test_a_unit_scoped_hit_is_cut_at_its_units_last_block_and_its_pages_stay_inside_the_unit(cross):
+    ws = T.Workspace(ctx=cross.ctx())
+    handle = _unit_handle(T.tool_find_documents(ws, "האשל"), "מתחם האשל")
+    out = T.tool_search(ws, "דמי שכירות חודשיים", None, None, handle)
+    s = _rent_hit(ws, out)
+    assert s.unit["no"] == 2 and s.unit["pages"] == [2, 2]
+    assert NEXT_TITLE not in s.text and "5,400" in s.text  # (the file's contexts note in `out` names every unit)
+    assert s.block_start == 3 and s.block_end == 3 and s.page_list == [2]
+    assert ws.anchors[s.sid]["pages"] == [2] and ws.anchors[s.sid]["block_end"] == 3
+
+
+def test_the_same_hit_found_by_a_search_over_the_file_is_cut_the_same_way(cross):
+    ws = T.Workspace(ctx=cross.ctx())
+    s = _rent_hit(ws, T.tool_search(ws, "דמי שכירות חודשיים", None, 12))
+    assert s.unit["no"] == 2 and NEXT_TITLE not in s.text and s.block_end == 3 and s.page_list == [2]
+
+
+def test_a_unit_scoped_read_stops_at_the_units_last_block_though_the_next_title_is_on_its_last_page(cross):
+    with tenant_tx(cross.system) as conn:  # the third's title follows the second's last paragraph on the same page
+        conn.execute(text("UPDATE document_blocks SET page = 2 WHERE version_id = :v AND block_index = 4"),
+                     {"v": cross.ver})
+    ws = T.Workspace(ctx=cross.ctx())
+    handle = _unit_handle(T.tool_find_documents(ws, "האשל"), "מתחם האשל")
+    out = T.tool_read(ws, {"pages": {"document": handle, "from_page": 2, "to_page": 2}})
+    s = ws.sources[_sources(out)[0]]
+    assert "5,400" in s.text and NEXT_TITLE not in s.text
+    assert s.unit["no"] == 2 and s.block_end == 3 and s.contexts == [2]
+    assert ws.anchors[s.sid]["block_end"] == 3 and ws.anchors[s.sid]["pages"] == [2]

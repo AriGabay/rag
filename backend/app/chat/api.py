@@ -623,6 +623,7 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
     # message is in ``rows`` only while every document it names is visible
     last_focus = None
     candidates: list[dict] = []
+    clarified: list[str] = []
     pending = None
     if last is not None:
         last_focus = _with_unit(last.answer.get("focus") or _request_focus(last.answer.get("request")),
@@ -631,13 +632,19 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
             # the documents a server clarification offered: the reply is resolved among them (the message is in
             # ``rows`` only while every one of them is visible)
             candidates = list((last.answer.get("request") or {}).get("candidates") or [])
+            if not candidates:
+                # the model's own question between appraisals offered none: the files that turn touched are where a reply
+                # that states a unit's complete name is looked for (round 9 R13)
+                clarified = list(dict.fromkeys(
+                    [*(d.get("document_id") for d in last.answer.get("documents") or []),
+                     *(last.answer.get("touched_documents") or []), *((last.answer.get("focus") or {}).get("document_ids") or [])]))
             # the parameter a clarification asked for (round 7 KTD9): the reply is bound to it, and the values it
             # kept are reopened through the references above
             if isinstance(last.answer.get("pending"), dict):
                 pending = _pending_refs(last.answer["pending"], prior_ids)
     return engine.TurnInput(question=user.content, history=history, summary=summary, focus=last_focus,
                             focus_documents=[{"document_id": k, "title": v} for k, v in list(focus.items())[-8:]],
-                            prior_refs=prior, candidates=candidates,
+                            prior_refs=prior, candidates=candidates, clarified_documents=clarified,
                             pending=pending), _user_message_ids(rows, user_message_id)
 
 

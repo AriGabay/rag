@@ -114,3 +114,36 @@ def test_unit_names_in_the_vocabulary_make_a_project_name_an_identifying_word():
     titles = ["שומה - הנרקיס 4 עין ורד", "גבעת הרקפות", "הרקפות"]
     assert entities.identifying("ומה השכירות בהרקפות?", titles, bare_numbers=False) == ["בהרקפות"]
     assert entities.identifying("ומה השכירות בהרקפות?", titles[:1], bare_numbers=False) == []
+
+
+# --- a reply that is a unit's full name (round 9 R13) -------------------------------------------------------------------
+
+
+def _nested() -> list[dict]:
+    """Two units whose names are one inside the other: the shorter name's words are in the longer one too."""
+    return [c.as_dict() for c in entities.choose(
+        [unit(1, "מגדל הים", ["מגדל הים"], pages=(1, 1)),
+         unit(2, "מגדל הים הצפוני", ["הים הצפוני"], pages=(2, 2))], "מגדל", set()).documents]
+
+
+def test_a_reply_that_is_one_units_full_name_selects_it_though_the_other_name_holds_the_same_words():
+    cands = _nested()
+    for reply, no in [("מגדל הים", 1), ("מגדל הים.", 1), ("במגדל הים", 1), ("מגדל הים הצפוני", 2), ("הים הצפוני", 2),
+                      ("תכוון למגדל הים הצפוני בבקשה", 2)]:
+        out = entities.among(cands, reply, {"d1"})
+        assert out.kind == "resolved" and out.documents[0].unit["unit_no"] == no, reply
+
+
+def test_a_full_name_that_both_candidates_state_or_a_part_of_a_name_selects_nothing():
+    a, b = _two()
+    both = [a | {"unit": a["unit"] | {"aliases": ["הגפן"]}}, b | {"unit": b["unit"] | {"aliases": ["הגפן"]}}]
+    assert entities.among(both, "הגפן", {"d1"}).kind == "ambiguous"  # the same alias on both: no one is named
+    assert entities.named_unit(_two(), "מתחם", {"d1"}) is None and entities.named_unit(_two(), "מה דעתך", {"d1"}) is None
+
+
+def test_a_full_title_is_found_as_a_whole_phrase_in_a_longer_reply_and_never_inside_a_word():
+    cands = _two()
+    named = entities.named_unit(cands, "אני מתכוון למתחם הגפן ב, תודה", {"d1"})
+    assert named is not None and named.kind == "resolved" and named.documents[0].unit["unit_no"] == 2
+    assert entities.named_unit(cands, "מתחם הגפן בן", {"d1"}) is None  # "ב" is not a word of this reply
+    assert entities.named_unit(cands, "מתחם הגפן ב", set()) is None  # none of them is visible any more

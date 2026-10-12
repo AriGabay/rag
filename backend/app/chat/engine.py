@@ -424,6 +424,9 @@ class TurnInput:
     prior_refs: dict[str, dict]  # P# -> {version_id, block_start, block_end, table_index, chunk_id, title, location}
     focus: dict | None = None  # the previous answer's focus, when its documents are all still visible
     candidates: list[dict] = field(default_factory=list)  # the documents a previous server clarification offered
+    # the documents the previous turn touched, when it was the model's own clarification (it offered no candidates): a
+    # reply that states the complete name of one of their units selects it (``entities.units_of_documents``, R13)
+    clarified_documents: list[str] = field(default_factory=list)
     # the parameter the previous answer's clarification asked for (round 7 KTD9): {"component", "text",
     # "parameters", "question", "found": [{"id", "label", "value_text", "source_id", "prior"}]}
     pending: dict | None = None
@@ -589,6 +592,18 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     answer_seconds = 0.0  # how long the step that wrote the last answer took
     progress("understand", "מבין את הבקשה")
     request = None
+
+    def asked_by_server(asking: resolve.Request) -> TurnOutcome:
+        """The turn that ends in the clarification ``asking`` carries: the server's own words, nothing of the model's to
+        check, so no judge call; saved with its digest."""
+        answer = FinalAnswer(status="clarification", answer_markdown=asking.clarify, claims=[],
+                             clarification_question=asking.clarify, missing_info="", referenced_document_ids=[],
+                             scope_kind="focused", scope_query="", omitted=[], focus=None, requested=[],
+                             parts=[])
+        return TurnOutcome(answer, ws, VerifyReport([], judged=True, judge_status="no_claims"), steps, usage, {},
+                           rounds, asking.as_dict(), asking.resolution, _summary(usage, rounds, reused, turn),
+                           final_digest=text_digest(answer.answer_markdown), timing=ws.clock.summary())
+
     # a reply to a clarification that asked for a parameter: bound to it before anything else (round 7 KTD9)
     binding = resolve.bind_pending(inp.pending, inp.question)
     if inp.history or inp.focus:
@@ -597,10 +612,12 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         # under the user's permissions) and the documents the new request names (looked up the same way)
         focus_ids = {d["document_id"] for d in inp.focus_documents} | set((inp.focus or {}).get("document_ids") or [])
         titles = functools.cache(lambda: entities.titles_of(ctx))  # read once, and only when needed
+        prior_units = entities.units_of_documents(ctx, inp.clarified_documents) if not inp.candidates else []
         request = resolve.resolve(
             provider, inp.focus, inp.history, inp.question, inp.focus_documents,
             lambda ids: entities.authorized(ctx, ids), titles, usage, deadline,
-            lookup=lambda words: entities.lookup(ctx, words, focus_ids, titles), candidates=inp.candidates or None)
+            lookup=lambda words: entities.lookup(ctx, words, focus_ids, titles), candidates=inp.candidates or None,
+            prior_units=prior_units or None)
         if cancelled():
             raise TurnCancelled
         if request is not None and request.located_unit:
@@ -623,14 +640,13 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         # a model's clarification has nothing to verify against, so one that states a figure is not used; the
         # server's names only titles the user may see and the user's own words
         if request is not None and request.clarify and (request.server_clarify or not re.search(r"\d", request.clarify)):
-            answer = FinalAnswer(status="clarification", answer_markdown=request.clarify, claims=[],
-                                 clarification_question=request.clarify, missing_info="", referenced_document_ids=[],
-                                 scope_kind="focused", scope_query="", omitted=[], focus=None, requested=[],
-                                 parts=[])
-            # the server's own words, asking: nothing of the model's to check, so no judge call; saved with its digest
-            return TurnOutcome(answer, ws, VerifyReport([], judged=True, judge_status="no_claims"), steps, usage, {},
-                               rounds, request.as_dict(), request.resolution, _summary(usage, rounds, reused, turn),
-                               final_digest=text_digest(answer.answer_markdown), timing=ws.clock.summary())
+            return asked_by_server(request)
+    elif (found := entities.first_message_ambiguity(ctx, inp.question)) is not None:
+        # a first message whose words fit several units of a file alike: the question between them is the server's, as
+        # it is for a follow-up, and no model is called (R13, AE4)
+        request = resolve.first_message_clarification(inp.question, *found)
+        return asked_by_server(request)
+
     def finish(answer: FinalAnswer, report: VerifyReport) -> TurnOutcome:
         # removals; each component recomputed from the surviving units; the absences the server states removed; one
         # gap paragraph after the answer (round 7 U3) — then the limits reached and the coverage ledger. Each decision
