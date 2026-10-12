@@ -2952,7 +2952,7 @@ def _wrong_context(u: Unit, ws: Workspace, question: str) -> str | None:
     (the source places it on another property), and never a calculation built from such values. Only when the context checks are enforced (``contexts.enforced``);
     None when nothing is asked or nothing is elsewhere."""
     from app.chat import contexts
-    from app.chat.tools import asked_subjects
+    from app.chat.tools import asked_subjects, located_contexts
 
     if not contexts.enforced():
         return None
@@ -2974,6 +2974,8 @@ def _wrong_context(u: Unit, ws: Workspace, question: str) -> str | None:
             asked = set(cx.named(question))
         if not asked and i in ws.values and ws.values[i].subject_from == "contradicted":
             asked = set(cx.named(ws.values[i].subject))
+        if not asked:  # no title or alias names the asked property: the unit the turn located for the question is it
+            asked = located_contexts(ws, cx)
         if asked and not numbers & asked:
             return (f"{what} כתוב ב" + ", ".join(cx.describe(n) for n in sorted(numbers)) + ", והטענה עוסקת ב"
                     + ", ".join(cx.describe(n) for n in sorted(asked)) + ": זה נתון של נכס אחר באותו קובץ. קח את "

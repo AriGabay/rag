@@ -39,7 +39,9 @@ apart is dropped as a word) selects it when no other candidate's name is stated 
 question between appraisals, which offered no candidates, the reply is matched the same way against the units of the files
 that turn touched (``units_of_documents``). A conversation's first message is checked once, from the unit names alone
 (``first_message_ambiguity``): when its words fit two or more units equally well by name, the server asks as it does for a
-follow-up and the model is not called.
+follow-up and the model is not called; a first message (or a new question with no unit kept) that names exactly one unit —
+by its name, else, in a file whose units state none, by the words only that unit holds in its passages — makes that unit
+the turn's (``first_message``, ``tools.locate_unit``).
 
 **The unit in the conversation** (round 9 U10, KTD8, R14): the conversation's focus carries the unit it is about as its
 anchor (``located_unit``), and a follow-up keeps it across a metric or computation change. Two anchors are the same unit
@@ -70,6 +72,7 @@ from app.platform.search import (
     _scope_terms,
     _title_words,
     printed_labels,
+    unit_term_holders,
     units_matching,
     unread_documents,
     unread_matching,
@@ -129,6 +132,12 @@ def unit_anchor(u: dict) -> dict:
 def unit_pages(anchor: dict) -> str:
     first, last = (anchor.get("pages") or [None, None])[:2]
     return contexts.pages_text(first, last)
+
+
+def focus_text(anchor: dict) -> str:
+    """How a gap line names a unit the turn is in when it read nothing in it: «title» and its pages."""
+    pages = unit_pages(anchor)
+    return f"«{anchor.get('display') or contexts.MSG_NO_TITLE}»" + (f" ({pages})" if pages else "")
 
 
 def candidate_label(c: dict) -> str:
@@ -192,14 +201,14 @@ def rematch(anchor: dict, units: list[dict]) -> dict | None:
     return pool[0] if len(pool) == 1 else None
 
 
-def _anchor_with_id(u: dict) -> dict:
+def anchor_with_id(u: dict) -> dict:
     """The anchor of a unit row with its stable id and the certainty of its opening edge, as a candidate carries it."""
     return unit_anchor(u) | {"unit_id": u.get("unit_id"), "certainty": u.get("certainty")}
 
 
 def unit_candidate(u: dict, file_title: str) -> Candidate:
     """A unit row as a candidate of a clarification: it carries its anchor."""
-    return Candidate(str(u["document_id"]), u.get("title") or file_title, file_title=file_title, unit=_anchor_with_id(u))
+    return Candidate(str(u["document_id"]), u.get("title") or file_title, file_title=file_title, unit=anchor_with_id(u))
 
 
 @dataclass
@@ -369,7 +378,7 @@ def choose(found: list[dict], query: str, focus_ids: set[str]) -> Outcome:
         c = Candidate(str(d["document_id"]), (unit or {}).get("title") or d["title"], terms, int(d.get("hits") or 0),
                       file_title=d["title"], name_extra=int(unit.get("name_extra") or 0) if unit else 0)
         if unit:
-            c.unit = _anchor_with_id(unit)
+            c.unit = anchor_with_id(unit)
         cands.append(c)
     if not cands:
         return Outcome("not_found", query=query)
@@ -574,10 +583,22 @@ def units_of_documents(ctx: TenantContext, ids) -> list[dict]:
 GENERIC_NAME_WORDS = frozenset({"שומה", "שומת", "שומות", "נכס", "נכסים", "פרויקט", "פרויקטים", "מתחם", "מתחמים",
                                 "בניין", "בניינים", "דוח", "דו\"ח", "חוות", "דעת", "הערכה", "שמאות", "דירה", "מגרש"})
 _UNIT_NAMES_SQL = (
-    "SELECT u.document_id, u.unit_no, u.kind, u.title, u.aliases, count(*) OVER (PARTITION BY u.version_id) AS units"
+    "SELECT u.document_id, u.version_id, u.reading_id, u.unit_no, u.kind, u.title, u.aliases, u.block_first,"
+    " u.block_last, count(*) OVER (PARTITION BY u.version_id) AS units"
     " FROM document_units u JOIN document_versions v ON v.id = u.version_id AND v.is_current"
     " AND u.reading_id = COALESCE(v.ingestion->>'reading_id', '')"
     " JOIN documents d ON d.id = u.document_id AND d.deleted_at IS NULL")
+
+
+@dataclass
+class FirstMessage:
+    """What a turn's first look at its question found among the units (``first_message``): ``ambiguity`` — the unit
+    clarification and the words it was looked up by; or ``unit`` — the one subject unit the question names, as its anchor
+    (``anchor_with_id``) with ``version_id``, the version it is in."""
+
+    ambiguity: tuple[Outcome, str] | None = None
+    unit: dict | None = None
+    version_id: str | None = None
 
 
 def first_message_ambiguity(ctx: TenantContext, question: str) -> tuple[Outcome, str] | None:
@@ -590,35 +611,84 @@ def first_message_ambiguity(ctx: TenantContext, question: str) -> tuple[Outcome,
     files of several hold all of them in their names, and none fits strictly better (the words of a name it holds,
     then the fewest words of that name left unsaid); no unit's complete title or alias is stated in the question. The
     outcome is the lookup's, so it is the ambiguity the follow-up would have got: candidates ordered by name fit."""
+    found = first_message(ctx, question, passages=False)
+    return found.ambiguity if found else None
+
+
+def _distinguishing(forms_of_term: list[str]) -> bool:
+    """Whether a term of the question can tell one appraisal from another by its passages: no number, no word of the
+    trade (``GENERIC_NAME_WORDS``) and no name of a kind of value."""
+    from app.chat.meaning import metric_word
+
+    return not (forms_of_term[0].isdigit() or set(forms_of_term) & GENERIC_NAME_WORDS or metric_word(forms_of_term[0]))
+
+
+def first_message(ctx: TenantContext, question: str, passages: bool = True) -> FirstMessage | None:
+    """The unit a question names before anything is searched (round 9: R13, AE4; the unit located at the turn's start),
+    or None. In the order of trust, from the names the stored units state (one query):
+
+    - the words of the question that are words of some unit's name fit two or more subject units equally well → the
+      clarification (``first_message_ambiguity``);
+    - they fit exactly one unit, or one of those they fit has its complete name stated → that unit;
+    - no name decides (a file whose units state none: the title text was not recognised) and ``passages`` → the words
+      that can tell appraisals apart (no number, no word of the trade, no name of a kind of value) and that some units
+      hold in their prose and others do not: the one subject unit that holds every one of them, else nothing. A word no
+      unit holds, or that every unit holds, tells nothing; a tie by passages is no clarification.
+
+    Only the subject units of files of several count; a question with no word to decide by returns None."""
     with tenant_tx(ctx) as conn:
         units = [r for r in conn.execute(text(_UNIT_NAMES_SQL)) if r.units > 1 and r.kind not in contexts.NON_SUBJECT_KINDS]
     names = {(r.document_id, r.unit_no): ([r.title] if r.title else []) + list(r.aliases or ()) for r in units}
     if len(names) < 2:
         return None
     words = identifying(question, [n for ns in names.values() for n in ns], bare_numbers=False)
-    if not words or all(forms(w) & GENERIC_NAME_WORDS for w in words):
+    if words and not all(forms(w) & GENERIC_NAME_WORDS for w in words):
+        query = " ".join(words)
+        term_sets = [set(f) for f in _scope_terms(query)]
+        fits = {}  # the units whose names hold every word, by how many words of the best name the question leaves unsaid
+        for key, ns in names.items():
+            held, extra = _name_fit(ns, term_sets)
+            if len(held) == len(term_sets):
+                fits[key] = -extra
+        if fits:
+            best = max(fits.values())
+            tied = [k for k, v in fits.items() if v == best]
+            # a unit whose complete name the question states is the one asked about, however alike the others are
+            stated = [key for key in tied if contexts.Identity(
+                names=tuple(k for n in names[key] if (k := contexts.name_key(n)))).name_spans(question)]
+            if len(tied) == 1 or len(stated) == 1:
+                return _unit_found(ctx, (stated or tied)[0])
+            if len(tied) > 1 and not stated:
+                outcome = lookup(ctx, query, set())
+                if outcome.kind == "ambiguous" and any(d.unit for d in outcome.documents):
+                    return FirstMessage(ambiguity=(outcome, query))
+            return None
+    if not passages:
         return None
-    query = " ".join(words)
-    term_sets = [set(f) for f in _scope_terms(query)]
-    fits = {}  # the units whose names hold every word, by how many words of the best name the question leaves unsaid
-    for key, ns in names.items():
-        held, extra = _name_fit(ns, term_sets)
-        if len(held) == len(term_sets):
-            fits[key] = -extra
-    if len(fits) < 2:
+    key = _unit_by_passages(ctx, question, units)
+    return _unit_found(ctx, key) if key is not None else None
+
+
+def _unit_by_passages(ctx: TenantContext, question: str, units: list) -> tuple | None:
+    """The (document id, unit number) of the one subject unit that holds every word of the question that tells units
+    apart, or None (see ``first_message``)."""
+    terms = [t for t in _scope_terms(_AMOUNT.sub(" ", question)) if _distinguishing(t)]
+    if not terms:
         return None
-    best = max(fits.values())
-    tied = [k for k, v in fits.items() if v == best]
-    if len(tied) < 2:
-        return None
-    # a unit whose complete name the question states is the one asked about, however alike the others are
-    if any(contexts.Identity(names=tuple(k for n in names[key] if (k := contexts.name_key(n)))).name_spans(question)
-           for key in tied):
-        return None
-    outcome = lookup(ctx, query, set())
-    if outcome.kind != "ambiguous" or not any(d.unit for d in outcome.documents):
-        return None
-    return outcome, query
+    with tenant_tx(ctx) as conn:
+        held = unit_term_holders(conn, terms, units)
+    deciding = [i for i in range(len(terms)) if 0 < sum(i in h for h in held.values()) < len(held)]
+    holders = [u for u in units if deciding and all(i in held[(u.version_id, u.unit_no)] for i in deciding)]
+    return (holders[0].document_id, holders[0].unit_no) if len(holders) == 1 else None
+
+
+def _unit_found(ctx: TenantContext, key: tuple) -> FirstMessage | None:
+    """The unit ``key`` (document id, unit number) of the document's current reading, as the turn's located unit."""
+    document_id, unit_no = key
+    with tenant_tx(ctx) as conn:
+        current = _current_units(conn, document_id)
+    found = next((u for u in current[3] if u["unit_no"] == unit_no), None) if current else None
+    return FirstMessage(unit=anchor_with_id(found), version_id=current[1]) if found is not None else None
 
 
 def authorized(ctx: TenantContext, ids) -> set[str]:

@@ -898,3 +898,148 @@ def test_a_unit_scoped_read_stops_at_the_units_last_block_though_the_next_title_
     assert "5,400" in s.text and NEXT_TITLE not in s.text
     assert s.unit["no"] == 2 and s.block_end == 3 and s.contexts == [2]
     assert ws.anchors[s.sid]["block_end"] == 3 and ws.anchors[s.sid]["pages"] == [2]
+
+
+# --- a unit located in the turn is the turn's unit, in a file whose units state no title (round 9, wrong-property fix) --
+
+UNTITLED = "קובץ שומות ללא כותרות סינתטי"
+U1_VALUE, U2_VALUE, U3_VALUE = "1,100,000", "2,200,000", "3,300,000"
+
+
+@pytest.fixture
+def untitled(office):
+    """Three appraisals whose stored units carry no title and no alias: the project names are only in their passages
+    (a word of the trade — «מתחם», «שומת מקרקעין» — is in every one). A page each."""
+    office.doc, office.ver = unit_file(office, office.default_group_id, UNTITLED, [
+        {"blocks": ["מתחם הנרקיס, שומת מקרקעין", f"שווי הנכס {U1_VALUE} ₪."]},
+        {"blocks": ["מתחם הצפצפה, שומת מקרקעין", f"שווי הנכס {U2_VALUE} ₪."]},
+        {"blocks": ["מתחם הדולב, שומת מקרקעין", f"שווי הנכס {U3_VALUE} ₪."]}])
+    return office
+
+
+def _values_in(out: str) -> set[str]:
+    return {v for v in (U1_VALUE, U2_VALUE, U3_VALUE) if v in out}
+
+
+def test_a_unit_found_by_find_documents_is_the_default_scope_of_the_searches_that_name_no_unit(untitled):
+    ws = T.Workspace(ctx=untitled.ctx())
+    found = T.tool_find_documents(ws, "הצפצפה")
+    handle = _unit_handle(found, "ללא כותרת")
+    assert ws.unit_focus and ws.unit_focus["handle"] == handle and ws.located_unit["anchor"]["unit_no"] == 2
+    assert handle in found and "עמוד 2" in found and "מוגבלים ליחידה" in found  # the model is told
+    searched = T.tool_search(ws, "שווי הנכס", None, 12)  # no unit argument: the search stays in the unit found
+    assert _values_in(searched) == {U2_VALUE} and f"(היחידה שהשיחה עוסקת בה: {handle})" in searched
+    again = T.tool_search(ws, "הנכס שווי", [untitled.doc], 12)  # its own file: still inside
+    assert f"חיפוש בתוך היחידה {handle}" in again and not _values_in(again) - {U2_VALUE}
+    assert f"סעיפי היחידה {handle} בלבד" in T.tool_outline(ws, untitled.doc)
+    assert "הטווח נחתך לעמודי היחידה" in T.tool_read(ws, {"pages": {"document": untitled.doc, "from_page": 1, "to_page": 3}})
+    # the call that names a unit of its own is left as it is
+    other = T.unit_handle_of(ws, untitled.doc, untitled.ver, _reading(untitled, untitled.ver), 3)
+    assert _values_in(T.tool_search(ws, "שווי הנכס", None, 12, other)) == {U3_VALUE}
+
+
+def test_a_find_documents_that_lists_several_units_or_a_second_unit_leaves_no_default_scope(untitled):
+    ws = T.Workspace(ctx=untitled.ctx())
+    T.tool_find_documents(ws, "מתחם")  # the word of every unit
+    assert ws.unit_focus is None and ws.located_unit is None
+    assert _values_in(T.tool_search(ws, "שווי הנכס", None, 12)) == {U1_VALUE, U2_VALUE, U3_VALUE}
+    ws = T.Workspace(ctx=untitled.ctx())
+    T.tool_find_documents(ws, "הצפצפה")
+    assert ws.unit_focus is not None
+    T.tool_find_documents(ws, "הדולב")  # two units in one turn: a comparison, not one property
+    assert ws.unit_focus is None and ws.located_unit is None
+    assert _values_in(T.tool_search(ws, "שווי הנכס", None, 12)) == {U1_VALUE, U2_VALUE, U3_VALUE}
+
+
+def test_a_first_message_is_looked_up_by_the_passages_when_the_units_state_no_name(untitled):
+    ctx = untitled.ctx()
+    found = entities.first_message(ctx, "מה שווי הנכס בפרויקט הצפצפה?")
+    assert found is not None and found.ambiguity is None and found.unit["unit_no"] == 2
+    assert found.unit["document_id"] == untitled.doc and found.unit["pages"] == [2, 2]
+    assert entities.first_message(ctx, "מה שווי הנכס בפרויקט הדולב?").unit["unit_no"] == 3
+    # no unit word: a question about the file; a word no unit holds; words held by different units
+    for question in ["מה שווי הנכס?", "מה שווי הנכס בפרויקט האלון?", "מה שווי הנכס בפרויקט הצפצפה והדולב?",
+                     "כמה שומות יש בקובץ?"]:
+        assert entities.first_message(ctx, question) is None, question
+
+
+def test_a_first_message_naming_a_word_of_one_unit_only_works_inside_that_unit(client, untitled, monkeypatch):
+    def answer(items) -> dict:
+        sid = _sid(items, U2_VALUE)
+        return final(f"שווי הנכס הוא {U2_VALUE} ₪ [{sid}].", claims=[
+            {"text": f"שווי הנכס הוא {U2_VALUE} ₪", "source_ids": [sid], "basis": "explicit"}])
+
+    agent = ScriptedAgent([[call("search", query="שווי הנכס פרויקט הצפצפה", document_ids=None, limit=None, unit=None)],
+                           answer])
+    cloud(monkeypatch, untitled, agent)
+    m = send(client, new_conversation(client), "מה שווי הנכס בפרויקט הצפצפה?")
+    assert m["status"] == "done", m
+    task = agent.seen[0][0]["content"]  # the model is told which unit the turn is in, and that searches stay in it
+    assert "U1" in task and "עמוד 2" in task and "unit=U1" in task and "אלא אם המשתמש מזכיר" in task
+    searched = agent.tool_outputs(1)[0]
+    assert _values_in(searched) == {U2_VALUE} and "חיפוש בתוך היחידה U1" in searched
+    a = m["answer"]
+    assert a["status"] == "answered" and U2_VALUE in a["markdown"]
+    assert a["unit"]["unit_no"] == 2 and a["unit"]["document_id"] == untitled.doc
+
+
+def test_a_general_question_over_an_untitled_file_is_not_scoped_to_a_unit(client, untitled, monkeypatch):
+    agent = ScriptedAgent([[call("search", query="שווי הנכס", document_ids=None, limit=None, unit=None)],
+                           final("לא נבחרה שומה.", "not_found")])
+    cloud(monkeypatch, untitled, agent)
+    m = send(client, new_conversation(client), "מה שווי הנכס?")
+    assert m["status"] == "done", m
+    assert "unit=U" not in agent.seen[0][0]["content"] and "אלא אם המשתמש מזכיר" not in agent.seen[0][0]["content"]
+    assert _values_in(agent.tool_outputs(1)[0]) == {U1_VALUE, U2_VALUE, U3_VALUE}
+
+
+def test_a_claim_about_the_located_unit_resting_on_another_units_value_is_removed_as_wrong_subject(untitled):
+    from app.chat import verify
+
+    ws = T.Workspace(ctx=untitled.ctx())
+    ws.requirements = verify.TurnRequirements()
+    T.tool_find_documents(ws, "הצפצפה")  # the turn's unit: the second
+    sids = {}
+    for n, value in ((2, U2_VALUE), (3, U3_VALUE)):  # each read through its own unit handle
+        handle = T.unit_handle_of(ws, untitled.doc, untitled.ver, _reading(untitled, untitled.ver), n)
+        sids[n] = next(s for s in _sources(T.tool_search(ws, "שווי הנכס", None, 12, handle)) if value in ws.sources[s].text)
+    answer = (f"שווי הנכס הוא {U2_VALUE} ₪ [{sids[2]}].\n\nשווי הנכס הוא {U3_VALUE} ₪ [{sids[3]}].")
+    units = verify.split_units(answer)
+    problems = verify.deterministic(units, ws, "מה שווי הנכס בפרויקט הצפצפה?")
+    flagged = {p.unit.index: p for p in problems if p.failure_kind == "wrong_subject"}
+    assert set(flagged) == {units[1].index} and flagged[units[1].index].removes_unit, [p.as_dict() for p in problems]
+    # without a located unit nothing says which of the two is the asked property's: neither is removed here
+    bare = T.Workspace(ctx=untitled.ctx())
+    bare.requirements = verify.TurnRequirements()
+    bare.sources, bare.contexts = ws.sources, ws.contexts
+    assert not [p for p in verify.deterministic(units, bare, "מה שווי הנכס בפרויקט הצפצפה?")
+                if p.failure_kind == "wrong_subject"]
+
+
+def test_a_first_message_prefers_the_name_a_unit_states_and_a_tie_is_still_the_servers_clarification(office, r9a):
+    ingest(office, R9B)
+    ctx = office.ctx()
+    named = entities.first_message(ctx, f"מה שווי הנכס ב{UNITS[1]['aliases'][0]}?")  # a name only one unit holds
+    assert named.ambiguity is None and (named.unit["document_id"], named.unit["unit_no"]) == (r9a.doc, 2)
+    whole = entities.first_message(ctx, "מה דמי השכירות החודשיים במתחם הגפן ב?")  # the whole name of one unit
+    assert whole.ambiguity is None and whole.unit["title"] == contexts.name_key("מתחם הגפן ב")
+    tie = entities.first_message(ctx, SIMILAR_QUESTION)  # two units alike: the question between them
+    assert tie.unit is None and [d.title for d in tie.ambiguity[0].documents] == ["מתחם הגפן א", "מתחם הגפן ב"]
+    assert [d.title for d in entities.first_message_ambiguity(ctx, SIMILAR_QUESTION)[0].documents] == [
+        "מתחם הגפן א", "מתחם הגפן ב"]
+
+
+def test_a_unit_kept_from_the_conversation_is_never_replaced_by_one_the_turn_locates(untitled):
+    ws = T.Workspace(ctx=untitled.ctx())
+    handle = T.unit_handle_of(ws, untitled.doc, untitled.ver, _reading(untitled, untitled.ver), 3)
+    kept = {"handle": handle, "document_id": untitled.doc, "display": "x"}
+    ws.unit_focus = dict(kept)
+    out = T.tool_find_documents(ws, "הצפצפה")
+    assert ws.unit_focus == kept and ws.located_unit is None and "נמצאה יחידה אחת" not in out
+    assert _values_in(T.tool_search(ws, "שווי הנכס", None, 12)) == {U3_VALUE}
+
+
+def test_a_question_with_no_word_that_can_tell_appraisals_apart_is_looked_up_in_one_query(untitled, statements):
+    statements.clear()
+    assert entities.first_message(untitled.ctx(), "מה שווי הנכס?") is None  # a kind of value, nothing to name a unit by
+    assert len(statements) == 1, statements

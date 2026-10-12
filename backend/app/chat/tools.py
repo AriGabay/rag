@@ -98,7 +98,11 @@ metric change, or named by the user — the engine gives it a handle (``Workspac
 ``outline`` or ``read`` of pages that names no unit and no document but that unit's file works inside it
 (``focus_unit_for``); a call that names another document or a unit of its own is left as it is. The units a turn's tools
 worked in are kept (``Workspace.unit_scopes``), so a turn cut short by a limit leaves the conversation in the unit it
-was reading.
+was reading. A unit the turn itself locates for the question is the turn's unit the same way (``locate_unit``): the one
+subject unit ``find_documents`` lists, or the one the engine finds at a first message or a new question by the unit names
+or, where the units state none, by their passages (``entities.first_message``) — a second unit located in the turn is a
+comparison and drops that default. It is also the asked property when no title or alias names one
+(``located_contexts``): a claim about it resting only on another unit's value is removed as ``wrong_subject``.
 
 A file holding several appraisals, or an appendix about a comparison property, is read as several appraisal contexts
 (round 7 U6: KTD7; R20–R22; ``app.chat.contexts``, derived from the stored reading and cached per reading): search
@@ -429,6 +433,11 @@ class Workspace:
     # the unit the conversation is in (round 9 U10, KTD8), set by the engine from the resolved request: {"handle": its
     # U#, "document_id", "display"}. A ``search`` or ``outline`` that names no unit and no other document works inside it
     unit_focus: dict | None = None
+    # the unit this turn's own lookup located for the question (``locate_unit``: ``find_documents`` listing exactly one
+    # subject unit, or the engine's look at a first message): {"key": its unit id, "anchor"}; ``unit_focus`` is then its
+    # handle. ``turn_located``: every unit so located (unit id -> anchor) — a second one is a comparison, not one property
+    located_unit: dict | None = None
+    turn_located: dict[str, dict] = field(default_factory=dict)
     # the units the turn's tools worked in through a unit handle: unit id -> {"document_id", "version_id", "reading_id",
     # "unit_no"}; the unit a turn that ended on a limit leaves the conversation in when nothing it cited says
     unit_scopes: dict[str, dict] = field(default_factory=dict)
@@ -781,10 +790,18 @@ def asked_subjects(ws: Workspace) -> tuple[list[str], bool]:
     return ([current] if current else []), False
 
 
+def located_contexts(ws: Workspace, cx) -> set[int]:
+    """The context of ``cx`` that is the unit the turn located for the question (``locate_unit``), when it is in this
+    file: the asked property of a question whose words name no unit's title (a file whose units state none)."""
+    located = ws.located_unit
+    return {n for n in cx.numbers if located and cx.is_subject(n) and cx.key(n) == located["key"]} if cx.multi else set()
+
+
 def asked_contexts(ws: Workspace, cx) -> set[int]:
-    """The contexts of a file the request names (its components' subjects, else its question)."""
+    """The contexts of a file the request names (its components' subjects, else its question); when no title or alias
+    names one, the unit the turn located."""
     subjects, _ = asked_subjects(ws)
-    return {n for x in subjects for n in cx.named(x)}
+    return {n for x in subjects for n in cx.named(x)} or located_contexts(ws, cx)
 
 
 def _context_note(ws: Workspace, cx) -> str:
@@ -1057,6 +1074,33 @@ def focus_unit_for(ws: Workspace, documents: list[str] | str | None) -> str | No
         return None
     named = {str(x).strip() for x in ([documents] if isinstance(documents, str) else documents or ()) if str(x).strip()}
     return focus["handle"] if named <= {focus["document_id"], ws.doc_handle(focus["document_id"])} else None
+
+
+MSG_UNIT_LOCATED = ("נמצאה יחידה אחת לשאלה: {unit} ({pages}). מעתה search, outline ו-read (עמודים) שאינם מציינים יחידה או "
+                    "מסמך אחר מוגבלים ליחידה הזו (הכל בתוכה בלבד; ערך משומה אחרת בקובץ אינו של הנכס שנשאל); כדי לעבוד "
+                    "ביחידה אחרת ציין אותה (unit=U#).")
+
+
+def locate_unit(ws: Workspace, anchor: dict, version_id) -> bool:
+    """The turn's lookup located a unit for the question (``find_documents`` listed exactly one subject unit, or the
+    engine found the one the question names at the turn's start): it becomes the turn's working unit, as a unit kept from
+    the turn before would be (``unit_focus``, so ``focus_unit_for`` scopes the calls that name no unit and no other
+    document to it). A second unit located in the turn is a comparison, not one property: the turn's own default scope is
+    dropped; a unit kept from the conversation is never replaced. Returns whether the turn's unit is now ``anchor``."""
+    from app.chat import entities
+
+    key = contexts.unit_key(version_id, anchor.get("reading_id"), anchor["unit_no"])
+    ws.turn_located[key] = anchor
+    if len(ws.turn_located) > 1:
+        if ws.located_unit is not None:
+            ws.unit_focus = ws.located_unit = None
+        return False
+    if ws.unit_focus is not None:
+        return False
+    handle = unit_handle_of(ws, anchor["document_id"], version_id, anchor.get("reading_id"), anchor["unit_no"])
+    ws.unit_focus = {"handle": handle, "document_id": str(anchor["document_id"]), "display": entities.focus_text(anchor)}
+    ws.located_unit = {"key": key, "anchor": anchor}
+    return True
 
 
 def _unit_pages(first: int | None, last: int | None) -> str:
@@ -2086,6 +2130,15 @@ def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> s
     if units:
         out += "\n\n" + "\n".join([MSG_UNITS_LISTED, *(_unit_detail(ws, u) for u in units)]
                                     + ([MSG_SEVERAL_UNITS] if len(units) > 1 else []))
+    # exactly one subject unit in the whole set (not only on this page): the turn's working unit
+    only = [u for d in found for u in d["units"]]
+    if len(only) == 1:
+        from app.chat import entities
+
+        u = only[0]
+        if locate_unit(ws, entities.anchor_with_id(u), u["version_id"]):
+            out += "\n\n" + MSG_UNIT_LOCATED.format(unit=ws.unit_focus["handle"],
+                                                    pages=_unit_pages(u["page_first"], u["page_last"]))
     return out + extra
 
 

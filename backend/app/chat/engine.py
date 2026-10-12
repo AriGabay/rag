@@ -477,7 +477,7 @@ def usage_summary(usage: list[dict], **extra) -> dict:
 
 
 def _context_message(inp: TurnInput, request: resolve.Request | None = None, binding: dict | None = None,
-                     unit_handle: str | None = None) -> str:
+                     unit_handle: str | None = None, located: dict | None = None) -> str:
     parts = []
     if inp.summary:
         parts.append("סיכום השיחה עד כה (לא מקור עובדתי):\n" + prompt_text(inp.summary))
@@ -525,6 +525,8 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None, bin
         parts.append(resolve.requested_block(request, unit_handle))
         if request.components:
             parts.append(request_analysis.block(request.components))
+    if located is not None and unit_handle:  # the unit the server found for the question at the turn's start
+        parts.append(resolve.located_block(located["anchor"], unit_handle))
     return "\n\n".join(parts)
 
 
@@ -641,11 +643,20 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         # server's names only titles the user may see and the user's own words
         if request is not None and request.clarify and (request.server_clarify or not re.search(r"\d", request.clarify)):
             return asked_by_server(request)
-    elif (found := entities.first_message_ambiguity(ctx, inp.question)) is not None:
-        # a first message whose words fit several units of a file alike: the question between them is the server's, as
-        # it is for a follow-up, and no model is called (R13, AE4)
-        request = resolve.first_message_clarification(inp.question, *found)
-        return asked_by_server(request)
+        if (request is not None and request.relation == "new_question" and ws.unit_focus is None
+                and not request.document_ids and (found := entities.first_message(ctx, inp.question)) is not None):
+            # a new question that no unit is kept for is looked up as a first message is
+            if found.ambiguity is not None:
+                request = resolve.first_message_clarification(inp.question, *found.ambiguity)
+                return asked_by_server(request)
+            T.locate_unit(ws, found.unit, found.version_id)
+    elif (found := entities.first_message(ctx, inp.question)) is not None:
+        if found.ambiguity is not None:
+            # a first message whose words fit several units of a file alike: the question between them is the server's,
+            # as it is for a follow-up, and no model is called (R13, AE4)
+            request = resolve.first_message_clarification(inp.question, *found.ambiguity)
+            return asked_by_server(request)
+        T.locate_unit(ws, found.unit, found.version_id)  # the one unit the question names: the turn's working unit
 
     def finish(answer: FinalAnswer, report: VerifyReport) -> TurnOutcome:
         # removals; each component recomputed from the surviving units; the absences the server states removed; one
@@ -721,7 +732,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
 
     ws.binding = binding  # an ``assume`` of the bound number records the parameter it fills (KTD9)
     items: list = [{"role": "user", "content": _context_message(
-        inp, request, binding, ws.unit_focus["handle"] if ws.unit_focus else None)}]
+        inp, request, binding, ws.unit_focus["handle"] if ws.unit_focus else None, ws.located_unit)}]
     if request is None and not (inp.history or inp.focus):
         # a first turn: the request is analysed beside the first step (no added latency), within the reading time
         pending = request_analysis.start(provider, inp.question, read_until)
@@ -936,8 +947,7 @@ def _settle_unit(ctx: TenantContext, ws: T.Workspace, request: resolve.Request) 
 
 def _focus_text(unit: dict) -> str:
     """How a gap line names the conversation's unit when the turn read nothing in it: «title» and its pages."""
-    pages = entities.unit_pages(unit)
-    return f"«{unit.get('display') or contexts.MSG_NO_TITLE}»" + (f" ({pages})" if pages else "")
+    return entities.focus_text(unit)
 
 
 def _cited_units(ws: T.Workspace, markdown: str) -> dict[str, set[str | None]]:
@@ -973,6 +983,8 @@ def _turn_unit(ctx: TenantContext, ws: T.Workspace, final: FinalAnswer, request:
     leaves the conversation where it was reading, so "continue" reads on inside it."""
     if request is not None and request.located_unit:
         return request.located_unit
+    if ws.located_unit is not None:  # the unit the turn's own lookup located for the question (``tools.locate_unit``)
+        return ws.located_unit["anchor"]
     cited = _cited_units(ws, final.answer_markdown)
     focus_docs = list(final.focus.document_ids) if final.focus is not None else []
     doc = focus_docs[0] if len(focus_docs) == 1 else next(iter(cited)) if len(cited) == 1 else None

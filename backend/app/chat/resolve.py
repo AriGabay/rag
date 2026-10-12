@@ -707,6 +707,18 @@ def requested_block(req: Request, unit_handle: str | None = None) -> str:
     return head + "\n" + "\n".join(lines)
 
 
+def located_block(unit: dict, unit_handle: str) -> str:
+    """The unit the server located for a question that named it (a first message, or a new question, with no unit kept
+    from the turn before), as the answering model's task: where it is, and that the calls that name no other unit or
+    document work inside it."""
+    where = "; ".join(x for x in (entities.unit_pages(unit), " · ".join(unit.get("identifiers") or ())) if x)
+    return ("היחידה שהשרת איתר לשאלה בקובץ של כמה שומות (לא מקור עובדתי):\n"
+            f"- {unit_handle} «{prompt_text(unit.get('display') or MSG_NO_TITLE)}»" + (f" ({prompt_text(where)})" if where else "")
+            + f". החיפושים והקריאות מוגבלים ליחידה הזו: search ו-outline עם unit={unit_handle}, read עם pages ו-document="
+              f"{unit_handle}; כך גם כשלא ציינת יחידה, אלא אם המשתמש מזכיר שומה או מסמך אחר. ערך משומה אחרת בקובץ אינו "
+              "של הנכס שנשאל")
+
+
 def family(kind: str) -> str:
     """The datum a kind names, whatever its scale: value and value per area are one family, as are a ratio and a
     rate; income, cost and profit are each their own."""

@@ -750,6 +750,27 @@ def _unit_passages(conn: Connection, files: list, stored: dict, terms: list[list
     return found
 
 
+def unit_term_holders(conn: Connection, terms: list[list[str]], units: Sequence) -> dict[tuple, set[int]]:
+    """For each unit row (``version_id``, ``unit_no``, ``block_first``, ``block_last``, ``title``, ``aliases``): the
+    terms (their indexes) it holds as a subject does in ``units_matching`` — in its title or an alias, or in a prose
+    passage of its blocks (a table cell alone does not make a unit the subject). One passage query for all the units
+    of all the given files; keyed by (version id, unit number)."""
+    from types import SimpleNamespace
+
+    params: dict = {}
+    queries = [_tsquery(forms, f"t{i}", params) for i, forms in enumerate(terms)]
+    stored: dict[UUID, list] = {}
+    for u in units:
+        stored.setdefault(u.version_id, []).append(u)
+    per_unit = _unit_passages(conn, [SimpleNamespace(version_id=v) for v in stored], stored, terms, queries, params)
+    term_sets = [set(t) for t in terms]
+    out: dict[tuple, set[int]] = {}
+    for u in units:
+        named, _ = _name_fit(([u.title] if u.title else []) + list(u.aliases or ()), term_sets)
+        out[(u.version_id, u.unit_no)] = named | per_unit[(u.version_id, u.unit_no)][0]
+    return out
+
+
 def printed_labels(conn: Connection, units: list[dict]) -> None:
     """Sets ``first_label`` on each unit row (``version_id``, ``page_first``): its first printed page label, the part of
     its anchor that survives a new reading: the page's stored label, else — a report whose numbering restarts keeps
