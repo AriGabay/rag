@@ -798,6 +798,17 @@ def document_term_holders(conn: Connection, terms: list[list[str]]) -> dict[UUID
     return out
 
 
+def unit_opening_text(conn: Connection, version_id: UUID, block_first: int, block_last: int) -> str:
+    """The normalized text of a unit's opening: its blocks on the page of its first block (where an appraisal states
+    what it is about). One query."""
+    rows = conn.execute(text(
+        "SELECT b.text FROM document_blocks b WHERE b.version_id = :v AND b.block_index BETWEEN :a AND :z"
+        " AND b.text IS NOT NULL AND b.page IS NOT DISTINCT FROM (SELECT f.page FROM document_blocks f"
+        " WHERE f.version_id = :v AND f.block_index = :a) ORDER BY b.block_index"),
+        {"v": version_id, "a": block_first, "z": block_last}).all()
+    return "\n".join(base_normalize(r.text) for r in rows)
+
+
 def printed_labels(conn: Connection, units: list[dict]) -> None:
     """Sets ``first_label`` on each unit row (``version_id``, ``page_first``): its first printed page label, the part of
     its anchor that survives a new reading: the page's stored label, else — a report whose numbering restarts keeps

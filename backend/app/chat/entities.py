@@ -70,9 +70,11 @@ from app.platform.search import (
     UnitMatches,
     _best_name_fit,
     _scope_terms,
+    _term_regexes,
     _title_words,
     document_term_holders,
     printed_labels,
+    unit_opening_text,
     unit_term_holders,
     units_matching,
     unread_documents,
@@ -582,7 +584,7 @@ def units_of_documents(ctx: TenantContext, ids) -> list[dict]:
 # the words of the trade that name a kind of property or report, never one of them: a first message that holds only
 # these (with the words of a unit's name) asks which appraisal, though no appraisal was named
 GENERIC_NAME_WORDS = frozenset({"שומה", "שומת", "שומות", "נכס", "נכסים", "פרויקט", "פרויקטים", "מתחם", "מתחמים",
-                                "בניין", "בניינים", "דוח", "דו\"ח", "חוות", "דעת", "הערכה", "שמאות", "דירה", "מגרש"})
+                                "בניין", "בניינים", "דוח", "דו\"ח", "חוות", "דעת", "הערכה", "שמאות", "דירה", "מגרש", "דיור"})
 _UNIT_NAMES_SQL = (
     "SELECT u.document_id, u.version_id, u.reading_id, u.unit_no, u.kind, u.title, u.aliases, u.block_first,"
     " u.block_last, count(*) OVER (PARTITION BY u.version_id) AS units"
@@ -634,12 +636,15 @@ def first_message(ctx: TenantContext, question: str, passages: bool = True) -> F
       תל אביב"), and when no unit fits the passages decide;
     - they fit exactly one unit, or one of those they fit has its complete name stated → that unit;
     - no name decides (a file whose units state none: the title text was not recognised) and ``passages`` → the words
-      that can tell appraisals apart (no number, no word of the trade, no name of a kind of value) and that some units
-      hold in their prose and others do not: the one subject unit that holds every one of them, else nothing. A word no
-      unit holds, or that every unit holds, tells nothing; a tie by passages is no clarification. When no unit holds
-      them all (an incidental word of another unit), the one unit that holds every word that only one holder in the
-      office holds (a unit, or a document of one unit); unique words of two holders, or of a document of one unit,
-      nothing. Never chosen by counts of passages or of words held.
+      that can tell appraisals apart (no number, no word of the trade, no name of a kind of value). Their holders are
+      the subject units and the documents of the office that are not split into units. The words some holders hold
+      and others do not: the one holder that holds every one of them, if it is a unit, else nothing. A word no holder
+      has, or that every holder has, tells nothing; a tie by passages is no clarification. When no holder holds them
+      all (an incidental word of another unit), the one holder of every word that only one holder in the office
+      holds, if it is a unit that states every one of them in its opening (its title, aliases and first page); unique
+      words of two holders, nothing. A document of one unit that holds the deciding words as well, or is the only
+      holder, is the property's report as likely as a unit: nothing. Never chosen by counts of passages or of words
+      held.
 
     Only the subject units of files of several count; a question with no word to decide by returns None."""
     with tenant_tx(ctx) as conn:
@@ -677,29 +682,36 @@ def first_message(ctx: TenantContext, question: str, passages: bool = True) -> F
 
 def _unit_by_passages(ctx: TenantContext, question: str, units: list) -> tuple | None:
     """The (document id, unit number) of the one subject unit located by the words of the question that tell units
-    apart, or None (see ``first_message``). First rule: the one unit that holds every such word some units hold and
-    others do not. When none does: the unique words, those held by exactly one holder among the units of ``units`` and
-    the documents of the office that are not split into units; if there is one and a single holder has them all, and it
-    is a unit, that unit. Unique words of two holders, or of a document of one unit, None: that property's report may
-    be the other file."""
+    apart, or None (see ``first_message``). The holders of a word are the units of ``units`` and the documents of the
+    office that are not split into units. First rule: the words some holders hold and others do not; the one holder
+    that has them all, if it is a unit. When none does: the unique words, those held by exactly one holder; if there is
+    one and a single holder has them all, and it is a unit, and every unique word is in its opening (its title, its
+    aliases, the blocks of its first page), that unit: a word deep in a unit's body is no name. A document of one unit that has all
+    the deciding words, or all the unique ones, or two holders of the unique ones, None: that property's report may be
+    the other file."""
     terms = [t for t in _scope_terms(_AMOUNT.sub(" ", question)) if _distinguishing(t)]
     if not terms:
         return None
     with tenant_tx(ctx) as conn:
-        held = unit_term_holders(conn, terms, units)
+        by_unit = unit_term_holders(conn, terms, units)
+        docs = document_term_holders(conn, terms)
+    held = {(u.document_id, u.unit_no): by_unit[(u.version_id, u.unit_no)] for u in units}
+    held |= {(d, None): h for d, h in docs.items()}  # a document of one unit (or none) has no unit number
     deciding = [i for i in range(len(terms)) if 0 < sum(i in h for h in held.values()) < len(held)]
-    holders = [u for u in units if deciding and all(i in held[(u.version_id, u.unit_no)] for i in deciding)]
+    holders = [k for k, h in held.items() if deciding and all(i in h for i in deciding)]
     if len(holders) == 1:
-        return holders[0].document_id, holders[0].unit_no
+        return holders[0] if holders[0][1] is not None else None
+    owners = [[k for k, h in held.items() if i in h] for i in range(len(terms))]
+    sole = {o[0] for o in owners if len(o) == 1}  # the one holder of each unique word
+    if len(sole) != 1 or next(iter(sole))[1] is None:
+        return None
+    key = next(iter(sole))
+    unit = next(u for u in units if (u.document_id, u.unit_no) == key)
+    patterns = _term_regexes([terms[i] for i, o in enumerate(owners) if len(o) == 1])
     with tenant_tx(ctx) as conn:
-        whole = document_term_holders(conn, terms)
-    sole = set()  # the one holder of each unique term, over every document of the office
-    for i in range(len(terms)):
-        owners = [(u.document_id, u.unit_no) for u in units if i in held[(u.version_id, u.unit_no)]]
-        owners += [(d, None) for d, h in whole.items() if i in h]
-        if len(owners) == 1:
-            sole.add(owners[0])
-    return next(iter(sole)) if len(sole) == 1 and next(iter(sole))[1] is not None else None
+        opening = base_normalize(" ".join([unit.title or "", *(unit.aliases or ())])) + "\n" + unit_opening_text(
+            conn, unit.version_id, unit.block_first, unit.block_last)
+    return key if all(p.search(opening) for p in patterns) else None  # a unit names itself where it opens
 
 
 def _unit_found(ctx: TenantContext, key: tuple) -> FirstMessage | None:

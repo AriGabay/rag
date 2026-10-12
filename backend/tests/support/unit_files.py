@@ -4,7 +4,8 @@ a title the document does not state, a comparable named only in a table. Every t
 
 ``unit_file(office, group, title, units)``: ``units`` are dicts ``{"title", "aliases", "kind", "certainty", "blocks":
 [text...], "identifiers": [shown...]}`` in reading order. Each unit's blocks sit on a page of their own (the unit's
-number); a text starting with ``"|"`` is a table cell block (its chunk a ``table_row``). Chunks are one per block, plus
+number; a unit with ``"deep"`` blocks has them on a second page of its own); a text starting with ``"|"`` is a table
+cell block (its chunk a ``table_row``). Chunks are one per block, plus
 the ``chunks`` given as ``(first block, last block)`` over the whole file, which replace the per-block chunk of the
 blocks they cover (a chunk that runs across a unit boundary)."""
 
@@ -29,14 +30,24 @@ def unit_file(office, group, title: str, units: list[dict], chunks: list[tuple[i
     doc, ver = make_document(office, group, title, sha=sha)
     blocks: list[Block] = []
     spans: list[tuple[int, int]] = []
-    for n, u in enumerate(units, 1):
+    pages_of: list[tuple[int, int]] = []  # the first and last page of each unit
+    page = 0
+    for u in units:
         first = len(blocks)
+        page += 1
+        first_page = page
         for body in u["blocks"]:
             table = body.startswith("|")
-            blocks.append(Block(len(blocks), "table" if table else "paragraph", body.lstrip("|"), page=n,
+            blocks.append(Block(len(blocks), "table" if table else "paragraph", body.lstrip("|"), page=page,
                                 section=None, section_path=[], status="read",
                                 table_index=None))
+        if u.get("deep"):  # blocks on a second page of the unit
+            page += 1
+            for body in u["deep"]:
+                blocks.append(Block(len(blocks), "paragraph", body, page=page, section=None, section_path=[],
+                                    status="read", table_index=None))
         spans.append((first, len(blocks) - 1))
+        pages_of.append((first_page, page))
     covered = set()
     for a, b in chunks or []:
         covered |= set(range(a, b + 1))
@@ -48,24 +59,24 @@ def unit_file(office, group, title: str, units: list[dict], chunks: list[tuple[i
             result_chunks.append(("table" if units_table(units, spans, b.index) else "text", b.index, b.index))
     result_chunks.sort(key=lambda c: (c[1], c[2]))
     pages = [PageResult(n, "\n".join(b.text for b in blocks if b.page == n), "text_layer", 1.0, True)
-             for n in range(1, len(units) + 1)]
+             for n in range(1, page + 1)]
     chunk_rows = [ChunkResult(i, kind, sorted({blocks[x].page for x in range(a, b + 1)}), None,
                               "\n".join(blocks[x].text for x in range(a, b + 1)), block_start=a, block_end=b)
                   for i, (kind, a, b) in enumerate(result_chunks)]
-    result = ExtractionResult(len(units), pages, [], chunk_rows, blocks=blocks)
+    result = ExtractionResult(page, pages, [], chunk_rows, blocks=blocks)
     info = pipeline.VersionInfo(ver, doc, "k", "application/pdf", None)
     with tenant_tx(office.system) as conn:
         pipeline.persist_extraction(conn, info, result)
         ingestion = {"reading_id": READING}
         conn.execute(text("UPDATE document_versions SET page_count = :n, ingestion = CAST(:i AS jsonb) WHERE id = :v"),
-                     {"n": len(units), "i": json.dumps(ingestion), "v": ver})
+                     {"n": page, "i": json.dumps(ingestion), "v": ver})
         reading = unit_store.Reading(UUID(str(doc)), READING, unit_store.derivation_key(ingestion), ())
         rows = []
-        for n, (u, (a, b)) in enumerate(zip(units, spans, strict=True), 1):
+        for n, (u, (a, b), (p1, p2)) in enumerate(zip(units, spans, pages_of, strict=True), 1):
             kind = u.get("kind", "appraisal")
             rows.append(unit_store.Unit(
                 n, kind, u.get("title"), tuple(u.get("aliases") or ()),
-                {"shown": list(u.get("identifiers") or ())}, n, n, a, b,
+                {"shown": list(u.get("identifiers") or ())}, p1, p2, a, b,
                 u.get("certainty", "certain" if n == 1 else "certain"), {}))
         unit_store._insert(conn, ver, reading, rows)
     pipeline.embed_stage(office.system, info, 1e18)
@@ -76,7 +87,8 @@ def units_table(units: list[dict], spans: list[tuple[int, int]], index: int) -> 
     """Whether block ``index`` is a table cell block (its text started with ``|``)."""
     for u, (a, b) in zip(units, spans, strict=True):
         if a <= index <= b:
-            return u["blocks"][index - a].startswith("|")
+            body = [*u["blocks"], *u.get("deep", ())][index - a]
+            return body.startswith("|")
     return False
 
 

@@ -963,6 +963,17 @@ def test_a_first_message_is_looked_up_by_the_passages_when_the_units_state_no_na
         assert entities.first_message(ctx, question) is None, question
 
 
+def test_a_single_appraisal_file_that_holds_the_deciding_words_too_is_a_competitor_of_the_unit(untitled):
+    ctx = untitled.ctx()
+    question = "מה שווי הנכס בפרויקט הצפצפה?"
+    assert entities.first_message(ctx, question).unit["unit_no"] == 2  # alone, the second unit holds the word
+    unit_file(untitled, untitled.default_group_id, "שומה בודדת סינתטית", [
+        {"blocks": ["שומת מקרקעין, פרויקט הצפצפה", f"שווי הנכס {U1_VALUE} ₪."]}], sha="s" * 64)
+    assert entities.first_message(ctx, question) is None  # the question may be about that file
+    # a word of another unit only: the single file does not hold it
+    assert entities.first_message(ctx, "מה שווי הנכס בפרויקט הדולב?").unit["unit_no"] == 3
+
+
 def test_a_first_message_naming_a_word_of_one_unit_only_works_inside_that_unit(client, untitled, monkeypatch):
     def answer(items) -> dict:
         sid = _sid(items, U2_VALUE)
@@ -1081,6 +1092,34 @@ def test_unique_words_of_two_different_units_locate_nothing(town_words):
     ctx = town_words.ctx()
     assert entities.first_message(ctx, "בניתוח הרגישות בשומת ורדית ובשומת תמרית, מה השווי?") is None
     assert entities.first_message(ctx, "בשומת ורדית, מה השווי כשהתפוסה נשארת, העיר אילנית?") is None
+
+
+@pytest.fixture
+def deep_words(office):
+    """Three untitled appraisals of two pages each; the town word of each is on its second page only (deep in its body);
+    a word held by the first and third units opens the first page."""
+    office.doc, office.ver = unit_file(office, office.default_group_id, "קובץ שומות עמוקות סינתטי", [
+        {"blocks": ["שומת מקרקעין, התפוסה יורדת"], "deep": ["סיכום, העיר אילנית"]},
+        {"blocks": ["שומת מקרקעין, התפוסה נשארת"], "deep": ["סיכום, העיר ורדית"]},
+        {"blocks": ["שומת מקרקעין, התפוסה יורדת"], "deep": ["סיכום, העיר תמרית"]}])
+    return office
+
+
+def test_a_unique_word_that_is_only_deep_in_a_units_body_locates_nothing(deep_words):
+    # no unit holds both words: the unique one decides, and it is not in the unit's opening
+    assert entities.first_message(deep_words.ctx(), "מה השווי כשהתפוסה יורדת, העיר ורדית?") is None
+
+
+def test_a_unique_word_on_the_opening_page_of_a_unit_locates_it(town_words):
+    found = entities.first_message(town_words.ctx(), "מה השווי כשהתפוסה יורדת, העיר ורדית?")
+    assert found is not None and found.unit["unit_no"] == 2
+
+
+def test_a_word_that_is_in_no_name_but_a_word_of_the_trade_asks_no_clarification(office):
+    unit_file(office, office.default_group_id, "קובץ שומות דיור סינתטי", [
+        {"title": "דיור מוגן", "aliases": ["דיור מוגן"], "blocks": ["דיור מוגן", "הנכס ברחוב הרימון."]},
+        {"title": "דיור צעיר", "aliases": ["דיור צעיר"], "blocks": ["דיור צעיר", "הנכס ברחוב התמר."]}])
+    assert entities.first_message_ambiguity(office.ctx(), "מה השווי של יחידת דיור ברחוב הרימון?") is None
 
 
 def test_a_unique_word_of_one_unit_locates_nothing_when_the_questions_other_words_are_a_single_appraisal_files(town_words):
