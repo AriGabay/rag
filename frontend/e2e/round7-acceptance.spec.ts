@@ -119,11 +119,13 @@ function shownGap(markdown: string): string {
   return markdown.replace(/\*\*/g, "").split(/\s*\[(?:[SMCVA]\d+)/)[0].trim();
 }
 
-/** The gap summary: the completeness line once (for a partial answer), each gap line once, and the last gap line is
- * the last line of the answer's body. */
+/** The gap summary: the completeness line once (for an answer whose components are not all given — a partial status
+ * that comes only from a removed claim is claim correctness, shown apart, round 8 R19), each gap line once, and the
+ * last gap line is the last line of the answer's body. */
 async function checkGapSummary(reply: Locator, answer: Answer): Promise<void> {
   const gaps = answer.gaps ?? [];
-  if (answer.status === "partial") {
+  const completeness = (answer.verification as { completeness?: { status?: string } } | undefined)?.completeness;
+  if (completeness ? completeness.status === "partial" : answer.status === "partial") {
     await expect(reply.getByTestId("completeness")).toHaveCount(1);
     await expect(reply.getByTestId("completeness")).toHaveAttribute("data-status", "partial");
   }
