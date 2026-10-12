@@ -428,3 +428,21 @@ def test_a_scenario_the_source_does_not_name_tells_the_model_to_take_it_again_wi
     assert decision.ws.values["V1"].certainty == "model_asserted" and T.MSG_SCENARIO_UNSTATED in out
     again = T.tool_take_value(decision.ws, decision.sid, _quote(PLAIN_TEXT, "210"), _meaning(), "שווי")
     assert decision.ws.values["V2"].certainty == "verified" and T.MSG_SCENARIO_UNSTATED not in again
+
+
+# --- the identity a file of one subject unit states for itself, shown to the judge --------------------------------
+
+def _heading(**kw) -> str:
+    src = T.Source(sid="S1", document_id=uuid.UUID(int=1), version_id=uuid.UUID(int=2), title="דוח סינתטי",
+                   section="השומה", location="עמוד 2", kind="context", text="השווי 1,000 ₪.", **kw)
+    return verify._source_parts(SimpleNamespace(sources={"S1": src}), "S1")[0]
+
+
+def test_a_source_of_a_single_subject_file_shows_the_judge_the_identity_the_document_states():
+    label = "שומת מקרקעין מלאה · רחוב הדס 3"
+    assert _heading(subject=label) == f"דוח סינתטי — עמוד 2 — זיהוי מתוך המסמך: {label}"
+    assert _heading() == "דוח סינתטי — עמוד 2"
+
+
+def test_a_source_with_a_context_keeps_the_context_heading_and_no_subject():
+    assert _heading(context="הקשר 2: רחוב הדס 3", subject="רחוב הדס 3") == "דוח סינתטי — עמוד 2 — הקשר 2: רחוב הדס 3"

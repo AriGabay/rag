@@ -28,7 +28,7 @@ from tests.helpers import upload
 from tests.integration.test_chat import cloud, new_conversation, send
 from tests.integration.test_chat_attribution import _meaning
 from tests.support.scripted_agent import ScriptedAgent, call, final
-from tests.support.unit_files import reread, unit_file
+from tests.support.unit_files import READING, reread, unit_file
 
 pytestmark = pytest.mark.db
 
@@ -1043,3 +1043,41 @@ def test_a_question_with_no_word_that_can_tell_appraisals_apart_is_looked_up_in_
     statements.clear()
     assert entities.first_message(untitled.ctx(), "מה שווי הנכס?") is None  # a kind of value, nothing to name a unit by
     assert len(statements) == 1, statements
+
+
+# --- a file of one subject unit states its identity for the judge, and nothing else about it changes ----------------
+
+ONE_LABEL = "שומת מקרקעין מלאה · רחוב הצבר 5"
+
+
+def test_the_sources_of_a_single_appraisal_file_carry_its_label_as_subject_and_no_context_or_unit(office):
+    office.doc, office.ver = unit_file(office, office.default_group_id, "דוח שומה בודד סינתטי", [
+        {"title": "שומת מקרקעין מלאה", "kind": "appraisal", "identifiers": ["רחוב הצבר 5"],
+         "blocks": ["שומת מקרקעין מלאה", "הננו שמים את שווי הנכס ב-4,200,000 ₪ ללא מע\"מ."]}])
+    assert contexts_label(office) == ONE_LABEL
+    ws = T.Workspace(ctx=office.ctx())
+    found = [ws.sources[s] for s in _sources(T.tool_search(ws, "שווי הנכס", None, 5))]
+    assert found
+    read = ws.sources[_sources(T.tool_read(ws, {"pages": {"document": office.doc, "from_page": 1, "to_page": 1}}))[0]]
+    assert read.kind == "context"
+    for s in [*found, read]:
+        assert s.subject == ONE_LABEL
+        assert s.context is None and not s.contexts and s.unit is None and "unit" not in s.tags
+        assert "context" not in s.public() and "unit" not in s.public()
+    assert ONE_LABEL not in T._render_source(read) and 'context="' not in T._render_source(read)
+
+
+def contexts_label(office) -> str:
+    with tenant_tx(office.system) as conn:
+        cx = contexts.of_version(conn, office.ver, READING)
+    assert not cx.multi and cx.subjects == [1]
+    return cx.label(1)
+
+
+def test_the_sources_of_a_file_of_several_appraisals_keep_their_context_and_no_subject(cross):
+    ws = T.Workspace(ctx=cross.ctx())
+    found = [ws.sources[s] for s in _sources(T.tool_search(ws, "שווי הנכס", None, 5))]
+    read = ws.sources[_sources(T.tool_read(ws, {"pages": {"document": cross.doc, "from_page": 1, "to_page": 3}}))[0]]
+    assert found and read.context
+    for s in [*found, read]:
+        assert s.subject == "" and s.context and s.unit is not None

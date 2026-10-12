@@ -265,6 +265,10 @@ class Source:
     # the unit it is in, in a file holding several (round 9 U9, KTD7, R10): {"id": version#reading#number, "no", "title",
     # "label", "kind", "pages": [first, last]}; the stable id outlives the turn, the unit handle (U#) does not
     unit: dict | None = None
+    # the identity a file of one subject unit states for itself (its unit's label: the title and identifiers read from
+    # the document), shown to the judge beside the source; empty in a file of several contexts, whose sources say
+    # their context instead
+    subject: str = ""
 
     @property
     def is_listing(self) -> bool:
@@ -855,7 +859,8 @@ def unit_handle(ws: Workspace, cx, number: int, document_id) -> str:
 
 def _mark(s: Source, cx, numbers, ws: Workspace | None = None) -> Source:
     """A source of a file holding several contexts says the ones it is in, and the unit it begins in (the stable id,
-    and — with ``ws`` — the handle ``search``, ``read`` and ``outline`` take)."""
+    and — with ``ws`` — the handle ``search``, ``read`` and ``outline`` take); one of a file of a single subject unit
+    carries that unit's label as its ``subject``."""
     if cx is not None and cx.multi and numbers:
         s.contexts = list(dict.fromkeys(numbers))
         s.context = "; ".join(cx.describe(n) for n in s.contexts)
@@ -864,6 +869,9 @@ def _mark(s: Source, cx, numbers, ws: Workspace | None = None) -> Source:
             s.tags["unit"] = unit_handle(ws, cx, s.contexts[0], s.document_id)
             if s.sid in ws.anchors:  # the citation's anchor says the unit too (``anchors.snapshot``)
                 ws.anchors[s.sid]["unit"] = s.unit
+    elif cx is not None and not cx.multi and len(cx.subjects) == 1:
+        # a file of one subject unit: its label is the identity the judge is shown (no context, unit, tag or anchor)
+        s.subject = cx.label(cx.subjects[0]).strip()
     return s
 
 
@@ -1563,8 +1571,9 @@ def _emit(ws: Workspace, v: reader.Version, target: tuple, pos, part: reader.Par
                       clipped=clipped, unread_regions=regions, more=more,
                       resume=_target_json(target, part.next), body="\n".join(head + lines + body),
                       tags={"document": ws.doc_handle(v.document_id)})
+    if cx is not None:
+        _mark(s, cx, cx.spanned(min(indexes), max(indexes)) if cx.multi else [], ws)
     if cx is not None and cx.multi:
-        _mark(s, cx, cx.spanned(min(indexes), max(indexes)), ws)
         note = _note_once(ws, v.document_id, cx)
         if note:
             s.body = "\n".join([s.body.split("\n", 1)[0], note, *s.body.split("\n", 1)[1:]])

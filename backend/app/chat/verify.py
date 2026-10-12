@@ -2118,8 +2118,14 @@ def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
     computation as one short statement of its meaning."""
     if sid in ws.sources:
         src = ws.sources[sid]
-        # in a file holding several appraisals, the context the passage is in (round 7 U6, KTD7)
-        return f"{src.title} — {src.location}" + (f" — {src.context}" if src.context else ""), src.text, src.kind
+        # in a file holding several appraisals, the context the passage is in (round 7 U6, KTD7); in a file of one
+        # subject unit, the identity the document states for itself, which a section need not repeat
+        head = f"{src.title} — {src.location}"
+        if src.context:
+            head += f" — {src.context}"
+        elif src.subject:
+            head += f" — זיהוי מתוך המסמך: {src.subject}"
+        return head, src.text, src.kind
     if sid in ws.measurements:
         m = ws.measurements[sid].public()
         return (m["title"], f"נתון: {m['metric']} = {m['value_text']} (סוג: {m['metric_kind']}, יחידה: {m['unit']},"
