@@ -710,6 +710,15 @@ def _without_absence(text: str) -> str:
     return "".join(c for c in re.split(r"(?<=[.;\n])", text or "") if not states_absence(c))
 
 
+def _supported_claim(r: ClaimRecord) -> str:
+    """The words of a claim the report judged supported and kept (kept, qualified or cited) that are not a statement
+    of an absence — the supported information ``lost_supported`` protects and ``supersede`` keeps; "" for any other."""
+    if r.verdict != "supported" or r.action not in ("kept", "qualified", "cited") or r.kind == "absence":
+        return ""
+    claim = _without_absence(r.text)
+    return claim if claim.strip() else ""
+
+
 def _covers_any(covers: list[set[str]], claim: str, heading: str, numeric: bool) -> bool:
     """Whether a unit of a repair's answer still says a supported claim (``lost_supported``; ``covers``: the comparable
     forms of each unit's words and of its heading chain's): all the claim's qualifier words, and, for a claim with no
@@ -1327,10 +1336,8 @@ class VerifyReport:
                 continue
             sources = {i for i in u.ids if i.startswith("S")}
             for r in recs:
-                if r.verdict != "supported" or r.action not in ("kept", "qualified", "cited"):
-                    continue
-                claim = "" if r.kind == "absence" else _without_absence(r.text)
-                if not claim.strip():
+                claim = _supported_claim(r)
+                if not claim:
                     continue  # a statement of an absence is not protected
                 needed = numbers_in(claim)
                 if (needed and not needed <= shown) or (sources and not sources & cited) or not _covers_any(
@@ -1640,7 +1647,8 @@ class VerifyReport:
         """Remove the units that state the absence of a component the server states (``stated``, R9, KTD4): a unit
         the judge marked as saying that component is missing (``absence_units``) and — the backstop, when the judge
         judged the answer — an uncited unit it marked for no component that states an absence (``ABSENCE``). A unit
-        that gives a component is kept (removing it would take the data with it). Each removal is a problem of kind
+        that gives a component, or holds a claim judged supported that is not an absence (``_supported_claim``), is
+        kept (removing it would take the data with it). Each removal is a problem of kind
         ``absence``: replaced by the server's statement, not counted as a claim that failed. Whether any was added."""
         stated = {o["id"] for o in outcomes if o.get("stated")}
         if not stated:
@@ -1651,7 +1659,7 @@ class VerifyReport:
         marked = {i for o in outcomes if o["id"] in stated for i in o["absence_units"]}
         added = False
         for u in self.units:
-            if u.index in removed or u.index in fillers:
+            if u.index in removed or u.index in fillers or any(_supported_claim(r) for r in self.claims.get(u.index, [])):
                 continue
             if u.index in marked:
                 reason = ABSENCE_REPLACED

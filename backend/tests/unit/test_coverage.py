@@ -426,6 +426,22 @@ def test_ae4_found_values_with_a_failed_calculation_replace_the_models_not_found
     assert r.counts()["removed"] == 0  # replaced by the server's statement, not a claim that failed
 
 
+def test_an_undeterminable_component_keeps_the_cited_value_the_hedging_answer_gave():
+    ws = _ws()
+    turn = _turn({"id": "1", "text": "השווי למ\"ר"})
+    a = _answer("בסיכום נכתב כי השווי למ\"ר הוא 9,500 ₪ [S1].\nאין במקורות הבהרה אם סכום זה אומץ כקביעה הסופית.")
+    # the judge names both the value and the hedge as the units of an undeterminable component
+    p = _judge(_scores({"N1": {"status": "undeterminable", "units": [0, 1]}}),
+               rule=lambda t: "not_factual" if "אין במקורות" in t else "supported")
+    r = verify_answer(p, a, ws, "?", [], requirements=turn)
+    final, outcomes = _finish(ws, a, r, turn)
+    md = final.answer_markdown
+    assert 0 not in r.removed_units()  # the supported value is not an absence statement: it stays
+    assert "9,500" in md and "[S1]" in md
+    assert outcomes[0]["evidence_state"] == "undeterminable"
+    assert "**השווי למ\"ר**: המסמכים אינם מספיקים כדי להכריע בכך." in md
+
+
 def test_the_backstop_removes_an_unmarked_uncited_not_found_sentence_about_a_component_the_server_states():
     ws = _ws("סיכום: השווי למ\"ר הוא 9,500 ₪. סף ההשוואה הוא 8,000 ₪ למ\"ר.")
     v1, v2 = _value(ws, "9,500", "השווי למ\"ר"), _value(ws, "8,000", "סף ההשוואה")
