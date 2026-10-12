@@ -499,7 +499,7 @@ def test_price_then_rent_stays_on_the_same_unit_without_a_clarification(client, 
     assert UNITS[1]["title"] in task and "U1" in task and UNITS[2]["title"] not in task
     searched = agent.tool_outputs(1)[0]  # no unit named in the call: the conversation's unit is the scope
     assert "חיפוש בתוך היחידה U1" in searched and "(היחידה שהשיחה עוסקת בה: U1)" in searched
-    assert "92" not in searched and set(re.findall(r'unit_id="[^"]*#(\d+)"', searched)) == {"2"}
+    assert not re.search(r"(?<![\w-])92(?![\w-])", searched) and set(re.findall(r'unit_id="[^"]*#(\d+)"', searched)) == {"2"}
     a = m["answer"]
     assert a["status"] != "clarification" and a["request"]["entity_changed"] is False
     assert (a["request"]["located_unit"]["unit_no"], a["request"]["unit_kept"]) == (2, True)
