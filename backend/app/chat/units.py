@@ -61,11 +61,14 @@ from bisect import bisect_left, bisect_right
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from dataclasses import replace as dc_replace
+from itertools import islice
 from uuid import UUID
 
 from sqlalchemy import Connection, text
 
 from app.chat import contexts
+from app.extraction import hebrew
 from app.extraction.normalize_text import base_normalize
 
 logger = logging.getLogger(__name__)
@@ -77,7 +80,6 @@ UNITS_VERSION = "units-v4"
 APPRAISAL, APPENDIX, COMPARABLES, FRONT_MATTER, DOCUMENT = "appraisal", "appendix", "comparables", "front_matter", "document"
 KINDS = (APPRAISAL, APPENDIX, COMPARABLES, FRONT_MATTER, DOCUMENT)
 CERTAIN, PROBABLE, UNSPLIT = "certain", "probable", "unsplit"
-CERTAINTIES = (CERTAIN, PROBABLE, UNSPLIT)
 
 LABEL_RESTART = "label_restart"
 TITLE_BLOCK_REPEAT = "title_block_repeat"
@@ -143,7 +145,6 @@ _PAGE_WORD_THEN_NUMBER = re.compile(
     r"(?:עמוד|עמ['׳’]?|page)\s*[:.]?\s*(\d{1,4})(?:\s*(?:מתוך|מ-|of|/)\s*\d{1,4})?[\s.\-–—]*$", re.IGNORECASE)
 _NUMBER_THEN_PAGE_WORD = re.compile(r"^[\s\-–—]*(\d{1,4})\s*(?:עמוד|עמ['׳’]?|page)[\s.\-–—]*$", re.IGNORECASE)
 _BARE_NUMBER = re.compile(r"^[\s\-–—]*(\d{1,4})[\s\-–—]*$")
-_BIDI_MARKS = re.compile("[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 _NAME_CUT = re.compile(r"[,:;()|—–]|\s-\s")
 
 # --- the unit ------------------------------------------------------------------------------------------------------
@@ -234,7 +235,7 @@ def _picture_title(r, furniture_images: frozenset) -> bool:
 def line_page_number(line: str) -> int | None:
     """The page number a line states: a bare number, or the number that ends the line after the page word, whatever
     stands before it (the digits of a file path in a footer are not the page). None for any other line."""
-    t = _BIDI_MARKS.sub("", line).strip()
+    t = hebrew.strip_bidi_controls(line).strip()
     if not t or len(t) > PAGE_NUMBER_CHARS:
         return None
     for pattern in (_BARE_NUMBER, _NUMBER_THEN_PAGE_WORD, _PAGE_WORD_THEN_NUMBER):
@@ -244,7 +245,7 @@ def line_page_number(line: str) -> int | None:
     return None
 
 
-def _footer_number(edge: str) -> int | None:
+def footer_number(edge: str) -> int | None:
     """The number of the page-number line among the first and last lines of a page's stored text (``EDGE_LINES``:
     other lines may follow the number line)."""
     lines = [ln.strip() for ln in edge.splitlines() if ln.strip()]
@@ -269,12 +270,13 @@ def _block_numbers(blocks: Iterable) -> dict[int, int]:
     height = max(bottoms)
     found: dict[int, set[int]] = defaultdict(set)
     for r in rows:
+        top = _top(r)
+        if top is None or not (top <= PAGE_NUMBER_ZONE * height or top >= (1 - PAGE_NUMBER_ZONE) * height):
+            continue
         t = _text(r)
         if not t or "\n" in t or (n := line_page_number(t)) is None:
             continue
-        top = _top(r)
-        if top is not None and (top <= PAGE_NUMBER_ZONE * height or top >= (1 - PAGE_NUMBER_ZONE) * height):
-            found[r.page].add(n)
+        found[r.page].add(n)
     return {page: next(iter(ns)) for page, ns in found.items() if len(ns) == 1}
 
 
@@ -293,7 +295,7 @@ def page_numbers(pages: Iterable, blocks: Iterable = ()) -> dict[int, int]:
         else:
             n = by_block.get(p.page_no)
             if n is None:
-                n = _footer_number(getattr(p, "edge", None) or "")
+                n = footer_number(getattr(p, "edge", None) or "")
         if n is not None:
             out[p.page_no] = n
     return out
@@ -379,7 +381,6 @@ class _Ctx:
     body: float | None  # the median line height of one-line paragraphs
     furniture: frozenset  # normalized texts of running headers
     furniture_images: frozenset
-    by_page: dict
 
 
 def _run(c: _Ctx, start: int) -> list:
@@ -388,7 +389,7 @@ def _run(c: _Ctx, start: int) -> list:
     skipped."""
     first = c.rows[start]
     out: list = []
-    for r in c.rows[start:]:
+    for r in islice(c.rows, start, None):
         if first.page is not None and r.page != first.page:
             break
         if r.kind in ("heading", "table") or getattr(r, "table_index", None) is not None:
@@ -653,7 +654,7 @@ def derive(blocks: Iterable, pages: Iterable = (), version_id: str = "", furnitu
     pages_seen = len({r.page for r in rows if r.page is not None})
     need = max(FURNITURE_MIN_PAGES, math.ceil(FURNITURE_SHARE * pages_seen))
     furniture = frozenset(t for t, ps in per_text.items() if t and len(ps) >= need)
-    c = _Ctx(rows, body, furniture, frozenset(furniture_images), {})
+    c = _Ctx(rows, body, furniture, frozenset(furniture_images))
     cuts = _cuts(c, pages, version_id)
     starts = [(rows[0].block_index, None, None, {})] + [(x.block, x.page, x.signals, x.detail) for x in cuts]
     ranges = []
@@ -668,7 +669,7 @@ def derive(blocks: Iterable, pages: Iterable = (), version_id: str = "", furnitu
     for run in runs:
         for t in {_norm(_picture_line(r) or "") if r.kind == "image" else _norm(_text(r)) for r in run} - {""}:
             seen[t] += 1
-    letterhead = {t for t, k in seen.items() if k >= 2 and len(runs) >= 2} if len(runs) >= 2 else set()
+    letterhead = {t for t, k in seen.items() if k >= 2} if len(runs) >= 2 else set()
     units: list[Unit] = []
     for n, ((first, last, page, signals, detail), run) in enumerate(zip(ranges, runs, strict=True), start=1):
         own = rows[bisect_left(indexes, first):bisect_right(indexes, last)]
@@ -693,7 +694,8 @@ def derive(blocks: Iterable, pages: Iterable = (), version_id: str = "", furnitu
         pgs = [r.page for r in rows[bisect_left(indexes, u.block_first):bisect_right(indexes, u.block_last)]
                if r.page is not None]
         if u.kind == DOCUMENT and (not pgs or max(pgs) - min(pgs) + 1 <= FRONT_MATTER_PAGES_MAX):
-            units[n] = _with(u, kind=FRONT_MATTER, evidence=u.evidence | {"kind": {"rule": "before_first_appraisal"}})
+            units[n] = dc_replace(u, kind=FRONT_MATTER,
+                                  evidence=u.evidence | {"kind": {"rule": "before_first_appraisal"}})
     first_on_page: dict[int, int] = {}
     for r in rows:
         if r.page is not None:
@@ -710,12 +712,8 @@ def derive(blocks: Iterable, pages: Iterable = (), version_id: str = "", furnitu
             if nxt.page is not None:
                 top_of_page = first_on_page.get(nxt.page) == nxt.block_index
                 last = max(first or 0, min(last, nxt.page - 1 if top_of_page else nxt.page))
-        out.append(_with(u, page_first=first, page_last=last))
+        out.append(dc_replace(u, page_first=first, page_last=last))
     return tuple(out)
-
-
-def _with(u: Unit, **changes) -> Unit:
-    return Unit(**({f: getattr(u, f) for f in u.__dataclass_fields__} | changes))
 
 
 # --- the stored reading ---------------------------------------------------------------------------------------------------
@@ -887,6 +885,14 @@ def _flight(version_id: str, reading_id: str) -> threading.Lock:
         return _LOCKS.setdefault((version_id, reading_id), threading.Lock())
 
 
+def _landed(version_id: str, reading_id: str, lock: threading.Lock) -> None:
+    """Forget a build's lock once it is done, so ``_LOCKS`` holds only the builds in flight (a caller that arrives
+    later finds the units stored, or in ``_MEMO``)."""
+    with _GUARD:
+        if _LOCKS.get((version_id, reading_id)) is lock:
+            del _LOCKS[(version_id, reading_id)]
+
+
 def ensure(conn: Connection, version_id: UUID | str) -> tuple[Unit, ...]:
     """The version's units for use in a chat turn (the caller resolved the version under the user's permissions): the
     stored ones when current; otherwise built here, once per version and reading in the process, and stored in the
@@ -898,25 +904,29 @@ def ensure(conn: Connection, version_id: UUID | str) -> tuple[Unit, ...]:
     if found is not None:
         return found
     vid = str(version_id)
-    with _flight(vid, reading.reading_id):
-        found = stored(conn, version_id, reading)
-        if found is not None:
-            return found
-        memo_key = (vid, reading.reading_id, reading.key)
-        with _GUARD:
-            units = _MEMO.get(memo_key)
-        if units is None:
-            units = _derived_or_whole(conn, version_id, reading)
+    lock = _flight(vid, reading.reading_id)
+    try:
+        with lock:
+            found = stored(conn, version_id, reading)
+            if found is not None:
+                return found
+            memo_key = (vid, reading.reading_id, reading.key)
             with _GUARD:
-                _MEMO[memo_key] = units
-                while len(_MEMO) > _MEMO_MAX:
-                    _MEMO.popitem(last=False)
-        try:
-            with conn.begin_nested():
-                conn.execute(text("DELETE FROM document_units WHERE version_id = :v AND (reading_id <> :r"
-                                  " OR derivation_key <> :k)"),
-                             {"v": UUID(vid), "r": reading.reading_id, "k": reading.key})
-                _insert(conn, version_id, reading, units)
-        except Exception:  # noqa: BLE001 - a read-only transaction or a vanished version: the units still serve
-            logger.info("units of version %s not stored", vid, exc_info=True)
-    return units
+                units = _MEMO.get(memo_key)
+            if units is None:
+                units = _derived_or_whole(conn, version_id, reading)
+                with _GUARD:
+                    _MEMO[memo_key] = units
+                    while len(_MEMO) > _MEMO_MAX:
+                        _MEMO.popitem(last=False)
+            try:
+                with conn.begin_nested():
+                    conn.execute(text("DELETE FROM document_units WHERE version_id = :v AND (reading_id <> :r"
+                                      " OR derivation_key <> :k)"),
+                                 {"v": UUID(vid), "r": reading.reading_id, "k": reading.key})
+                    _insert(conn, version_id, reading, units)
+            except Exception:  # noqa: BLE001 - a read-only transaction or a vanished version: the units still serve
+                logger.info("units of version %s not stored", vid, exc_info=True)
+        return units
+    finally:
+        _landed(vid, reading.reading_id, lock)

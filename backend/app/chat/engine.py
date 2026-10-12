@@ -292,7 +292,7 @@ NEAR_LIMIT_STEPS = 2  # tool steps left (this one included) when ``NEAR_LIMIT_NO
 COMPUTE_AFTER_BUDGET = """הקריאה במסמכים נגמרה — אי אפשר לקרוא עוד. עדיין אפשר לרשום ערכים והנחות ולחשב על מה שכבר קראת
 (take_value, assume, calculate); עשה זאת עכשיו אם התשובה דורשת חישוב, ואחר כך ענה."""
 COMPUTE_STEPS_AFTER_BUDGET = 3  # compute steps one turn may take after its tool budget is spent
-STEP_LIMIT, TIME_LIMIT = "step_limit", T.TIME_LIMIT
+STEP_LIMIT, TIME_LIMIT = T.STEP_LIMIT, T.TIME_LIMIT
 LIMIT_WHY = {
     T.TOOL_BUDGET: "הגעת למגבלת היקף הקריאה לשאלה אחת (כמות הטקסט שהכלים מחזירים)",
     STEP_LIMIT: "הגעת למספר הצעדים המרבי לשאלה אחת",
@@ -454,6 +454,7 @@ class TurnOutcome:
     timing: dict = field(default_factory=dict)
     # the unit the conversation is about after this answer (round 9 U10, KTD8): the anchor of the appraisal unit the turn
     # worked in, which the next turn keeps across a metric change; None for a file of one unit or when no unit was
+    # named, cited or worked in
     unit: dict | None = None
 
 
@@ -764,12 +765,13 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             raise ProviderFailure(*failure)
         items.extend(step.output)
         if step.calls:
-            compute_steps += 1 if compute_ok else 0
+            if compute_ok:
+                compute_steps += 1
             for call in step.calls:
-                started_step = _announce(progress, call)
+                started_step, arguments = _announce(progress, call)
                 output = T.run_tool(ws, call.name, call.arguments)
                 if started_step is not None:  # what the call found, said once it is done (R17)
-                    progress(started_step, done_label(call.name, _arguments(call), output), True)
+                    progress(started_step, done_label(call.name, arguments, output), True)
                 turn.record(call.name, call.arguments, output)
                 items.append({"type": "function_call_output", "call_id": call.call_id, "output": output})
             continue
@@ -902,8 +904,7 @@ def _settle_unit(ctx: TenantContext, ws: T.Workspace, request: resolve.Request) 
             request.located_unit, decisions["unit"] = live.unit, "re-resolved"
         u = request.located_unit
         handle = T.unit_handle_of(ws, u["document_id"], live.version_id, u.get("reading_id"), u["unit_no"])
-        ws.unit_focus = {"handle": handle, "document_id": str(u["document_id"]), "unit_id": u.get("unit_id"),
-                         "display": _focus_text(u)}
+        ws.unit_focus = {"handle": handle, "document_id": str(u["document_id"]), "display": _focus_text(u)}
         return
     gone = request.located_unit
     request.located_unit, request.unit_kept = None, False
@@ -920,7 +921,7 @@ def _settle_unit(ctx: TenantContext, ws: T.Workspace, request: resolve.Request) 
 def _focus_text(unit: dict) -> str:
     """How a gap line names the conversation's unit when the turn read nothing in it: «title» and its pages."""
     pages = entities.unit_pages(unit)
-    return f"«{unit.get('display') or 'ללא כותרת'}»" + (f" ({pages})" if pages else "")
+    return f"«{unit.get('display') or contexts.MSG_NO_TITLE}»" + (f" ({pages})" if pages else "")
 
 
 def _cited_units(ws: T.Workspace, markdown: str) -> dict[str, set[str | None]]:
@@ -944,7 +945,7 @@ def _cited_units(ws: T.Workspace, markdown: str) -> dict[str, set[str | None]]:
             found.setdefault(str(s.document_id), set()).add(unit["id"] if unit else None)
         elif i in ws.values or i in ws.measurements:
             thing = ws.values.get(i) or ws.measurements.get(i)
-            ctx_ = thing.context if thing.context and thing.context.get("subject", True) else None
+            ctx_ = contexts.context_subject(thing.context)
             found.setdefault(str(thing.document_id), set()).add(ctx_["unit_id"] if ctx_ else None)
     return found
 
@@ -1031,10 +1032,11 @@ def _start_label(name: str, args: dict) -> tuple[str, str] | None:
     return None
 
 
-def _announce(progress: Callable[..., None], call) -> str | None:
+def _announce(progress: Callable[..., None], call) -> tuple[str | None, dict]:
     """Say which tool is starting, and return the step it was announced under (the done event that follows the call
-    uses it); None for a tool that is not announced."""
-    started = _start_label(call.name, _arguments(call))
+    uses it; None for a tool that is not announced) with the call's parsed arguments."""
+    arguments = _arguments(call)
+    started = _start_label(call.name, arguments)
     if started is not None:
         progress(*started)
-    return started[0] if started else None
+    return (started[0] if started else None), arguments

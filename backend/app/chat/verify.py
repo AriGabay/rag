@@ -710,17 +710,26 @@ def _without_absence(text: str) -> str:
     return "".join(c for c in re.split(r"(?<=[.;\n])", text or "") if not states_absence(c))
 
 
-def _covers(forms: set[str], claim: str, heading: str, numeric: bool) -> bool:
-    """Whether a unit of a repair's answer (``forms``: the comparable forms of its words and of its heading chain's)
-    still says a supported claim (``lost_supported``): all its qualifier words, and, for a claim with no number, at least
-    ``LOST_WORD_SHARE`` of its other content words — the heading chain it was written under is part of its context."""
+def _covers_any(covers: list[set[str]], claim: str, heading: str, numeric: bool) -> bool:
+    """Whether a unit of a repair's answer still says a supported claim (``lost_supported``; ``covers``: the comparable
+    forms of each unit's words and of its heading chain's): all the claim's qualifier words, and, for a claim with no
+    number, at least ``LOST_WORD_SHARE`` of its other content words — the heading chain it was written under is part
+    of its context. The claim's own forms are taken once, not once per unit."""
     context = f"{claim}\n{heading}"
-    if any(not _missing_forms(w) & forms for w in qualifier_words(context)):
-        return False
-    if numeric:
-        return True
-    words = [w for w in _missing_words(context) if not w[0].isdigit() and not _missing_forms(w) & QUALIFIER_LEXICON]
-    return not words or sum(bool(_missing_forms(w) & forms) for w in words) >= LOST_WORD_SHARE * len(words)
+    qualifiers = [_missing_forms(w) for w in qualifier_words(context)]
+    words = []
+    if not numeric:
+        for w in _missing_words(context):
+            forms = _missing_forms(w)
+            if not w[0].isdigit() and not forms & QUALIFIER_LEXICON:
+                words.append(forms)
+
+    def covers_it(unit_forms: set[str]) -> bool:
+        if any(not q & unit_forms for q in qualifiers):
+            return False
+        return not words or sum(bool(w & unit_forms) for w in words) >= LOST_WORD_SHARE * len(words)
+
+    return any(covers_it(c) for c in covers)
 
 
 # a request clause is a question: it ends with "?" or holds a question word (with a "ו" or "ש" prefix at most). A gap
@@ -1324,8 +1333,8 @@ class VerifyReport:
                 if not claim.strip():
                     continue  # a statement of an absence is not protected
                 needed = numbers_in(claim)
-                if (needed and not needed <= shown) or (sources and not sources & cited) or not any(
-                        _covers(c, claim, u.heading, bool(needed)) for c in covers):
+                if (needed and not needed <= shown) or (sources and not sources & cited) or not _covers_any(
+                        covers, claim, u.heading, bool(needed)):
                     lost.append((u, r))
         return lost
 

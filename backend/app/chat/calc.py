@@ -70,6 +70,7 @@ from fractions import Fraction
 from typing import Any
 from uuid import UUID
 
+from app.chat.contexts import context_subject
 from app.measurements.extract import PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
 
 MAX_EXPRESSION = 4000  # characters (an aggregate may name a few hundred measurements)
@@ -1161,7 +1162,7 @@ class Value:
                        kind=self.kind, role=self.role, subject=self.subject, total=self.total, table=self.table,
                        approx=self.approx,
                        context=(self.context["key"], self.context.get("described") or self.context["label"])
-                       if self.context and self.context.get("subject", True) else None, scale=self.scale)
+                       if context_subject(self.context) else None, scale=self.scale)
 
     def public(self) -> dict:
         return {"id": self.vid, "value": str(self.value), "value_text": self.written, "label": self.label,

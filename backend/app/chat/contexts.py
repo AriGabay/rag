@@ -85,6 +85,7 @@ NON_SUBJECT_KINDS = frozenset({"appendix", "comparables"})
 # how a unit that is not an appraisal is called in a label (the one place that words them)
 UNIT_KIND_MARKS = {"appendix": "נספח", "comparables": "עסקאות השוואה", "front_matter": "פתיח"}
 MSG_UNNAMED = "ללא שם מזהה"
+MSG_NO_TITLE = "ללא כותרת"  # a unit with no title of its own, named in a line that shows it
 # punctuation that separates the words of a name (the aliases of a unit are normalized with it)
 NAME_PUNCT = re.compile(r"[\"“”‘’,.:;(){}\[\]<>!?|/\\—–_*•]")
 
@@ -268,23 +269,27 @@ class Contexts:
     def is_subject(self, number: int) -> bool:
         return self.kind(number) not in NON_SUBJECT_KINDS
 
+    def segment(self, number: int) -> Segment:
+        """The first segment of a context (StopIteration for a number no segment has)."""
+        return next(s for s in self.segments if s.number == number)
+
     def kind(self, number: int) -> str:
-        return next(s.kind for s in self.segments if s.number == number)
+        return self.segment(number).kind
 
     @property
     def numbers(self) -> list[int]:
         return sorted({s.number for s in self.segments})
 
     def identity(self, number: int) -> Identity:
-        return next(s.identity for s in self.segments if s.number == number)
+        return self.segment(number).identity
 
     def key(self, number: int) -> str:
         """A context across the reading: version, reading and number (``split_key`` reads it back)."""
-        return f"{self.version_id}#{self.reading_id}#{number}" if self.reading_id else f"{self.version_id}#{number}"
+        return unit_key(self.version_id, self.reading_id, number)
 
     def label(self, number: int) -> str:
         """What names a context: a unit's title, then its identifiers; a part that is not an appraisal says so."""
-        seg = next(s for s in self.segments if s.number == number)
+        seg = self.segment(number)
         # a title that restates one of the unit's identifiers adds nothing to them: the identifiers label it
         parts = [seg.title] if seg.title and not any(x in seg.title for x in seg.identity.shown) else []
         parts += seg.identity.shown
@@ -338,7 +343,7 @@ class Contexts:
         it is only ``probable`` — the edge that opens unit k carries k's ``certainty`` — until an edge that is
         ``certain``, or the file's edge (R8). A file with one unit, or a unit whose edges are certain, reaches
         exactly its own blocks."""
-        segs = [s for s in self.segments]
+        segs = self.segments
         at = next(i for i, s in enumerate(segs) if s.number == number)
         lo = hi = at
         while lo > 0 and segs[lo].certainty == "probable":
@@ -386,6 +391,23 @@ class Reach:
         return bool(self.before or self.after)
 
 
+def unit_key(version_id: str, reading_id: str | None, number: int) -> str:
+    """The id of a unit across readings: version, reading (when known) and number (``split_unit_key`` reads it
+    back)."""
+    return f"{version_id}#{reading_id}#{number}" if reading_id else f"{version_id}#{number}"
+
+
+def context_subject(context: dict | None) -> dict | None:
+    """A value's or measurement's context record (``tools.value_context``) when it can be the asked property (an
+    appendix or a comparables part is not); None otherwise."""
+    return context if context and context.get("subject", True) else None
+
+
+def pages_text(first: int | None, last: int | None, unknown: str = "") -> str:
+    """"עמוד 3" or "עמודים 3–5" for a page range; ``unknown`` when the first page is not known."""
+    return unknown if first is None else f"עמוד {first}" if first == last else f"עמודים {first}–{last}"
+
+
 def split_unit_key(key: str) -> tuple[str, str | None, int]:
     """(version id, reading id or None, number) of a ``Contexts.key``."""
     parts = key.split("#")
@@ -394,7 +416,8 @@ def split_unit_key(key: str) -> tuple[str, str | None, int]:
 
 def split_key(key: str) -> tuple[str, int]:
     """(version id, context number) of a ``Contexts.key``."""
-    return key.partition("#")[0], int(key.rpartition("#")[2])
+    version, _, number = split_unit_key(key)
+    return version, number
 
 
 # a numbered top-level heading: "1. מבוא", "12 סיכום" — never a sub-section ("2.1") or a lettered one

@@ -13,6 +13,7 @@ Two kinds of key:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -23,6 +24,8 @@ from typing import Protocol
 from uuid import UUID
 
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 STAGING = "staging"
 _STAGED_NAME = re.compile(r"[a-z]{1,8}[0-9]{0,6}(?:\.json(?:\.gz)?)?")
@@ -152,3 +155,13 @@ class LocalStorage:
 @lru_cache
 def get_storage() -> Storage:
     return LocalStorage(get_settings().file_storage_root)
+
+
+def purge_staging(office_id: UUID, version_id: UUID, attempt: str | None = None) -> None:
+    """Delete everything staged for a version (a published, failed or deleted one), or only one reading attempt's files
+    (``attempt``: a superseded reading's key). Best effort: staged files are scratch, and a failure to delete them
+    must not fail the job that is done with them."""
+    try:
+        get_storage().delete_prefix(staging_prefix(office_id, version_id, attempt))
+    except (OSError, ValueError):
+        logger.warning("staged files of version %s were not deleted", version_id, exc_info=True)

@@ -10,11 +10,12 @@ import type {
   Provider,
   ProviderMode,
   ProviderStatus,
+  VersionProgress,
   VersionStatus,
 } from "./types";
 
 /** A unit beside its file name: its title (or that it has none) and its pages, e.g. "מתחם הגפן א · עמוד 1". */
-export function unitLabel(unit: ChatUnit | null | undefined): string {
+export function unitLabel(unit: Pick<ChatUnit, "title" | "pages"> | null | undefined): string {
   if (!unit) return "";
   const [first, last] = unit.pages;
   const pages = first == null ? "" : first === last || last == null ? `עמוד ${first}` : `עמודים ${first}–${last}`;
@@ -91,7 +92,7 @@ export const INGEST_STAGE_LABEL: Record<string, string> = {
 
 /** What a version being processed shows (R3): nothing before it reports; the stage alone before the pages in the file
  * are known; "pages read N of M" while pages are read; the stage name during the steps over the whole document. */
-export function ingestProgressText(p: { stage: string; pages_done: number | null; pages_total: number | null } | null | undefined): string | null {
+export function ingestProgressText(p: VersionProgress | null | undefined): string | null {
   if (!p || !p.stage) return null;
   const stage = INGEST_STAGE_LABEL[p.stage] ?? p.stage;
   if (p.stage === "reading_pages" && p.pages_total != null && p.pages_done != null) {

@@ -287,7 +287,7 @@ def _answer_documents(answer: dict | None) -> set[str]:
     ids |= {d.get("document_id") for d in answer.get("documents") or []}
     ids |= coverage.ledger_documents(answer.get("ledger"))
     ids |= set((answer.get("focus") or {}).get("document_ids") or [])
-    ids |= {(answer.get(k) or {}).get("document_id") for k in ("unit",)}  # the unit the conversation is in (round 9 U10)
+    ids.add((answer.get("unit") or {}).get("document_id"))  # the unit the conversation is in (round 9 U10)
     ids |= set((answer.get("request") or {}).get("document_ids") or [])
     ids |= {c.get("document_id") for c in (answer.get("request") or {}).get("candidates") or []}
     ids |= {d for r in answer.get("requested") or [] for d in r.get("document_ids") or []}

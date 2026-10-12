@@ -44,6 +44,7 @@ import re
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from app.answering.verify import numbers_in
+from app.chat.timing import STAGES
 from app.chat.verify import split_units
 
 EXAMPLE_WORDS = r"לדוגמה|לדוגמא|למשל|דוגמה|דוגמא|כגון"
@@ -369,7 +370,6 @@ def calc_check(answer: dict | None, expect: dict) -> list[str]:
 
 # --- round 9 measures: unit identification, source location, reading completeness, time per stage -------------------
 
-STAGES = ("locate", "read", "compute", "compose", "verify", "final")
 _PAGES_TEXT = re.compile(r"עמוד(?:ים)?\s*(\d+)(?:\s*[–-]\s*(\d+))?")
 
 

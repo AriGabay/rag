@@ -120,7 +120,7 @@ def unit_anchor(u: dict) -> dict:
 
 def unit_pages(anchor: dict) -> str:
     first, last = (anchor.get("pages") or [None, None])[:2]
-    return "" if first is None else f"עמוד {first}" if first == last else f"עמודים {first}–{last}"
+    return contexts.pages_text(first, last)
 
 
 def candidate_label(c: dict) -> str:
@@ -130,7 +130,7 @@ def candidate_label(c: dict) -> str:
     if not unit:
         return f"«{c['title']}»"
     parts = [p for p in (unit_pages(unit), " · ".join(unit.get("identifiers") or ())) if p]
-    return (f"«{unit.get('display') or 'ללא כותרת'}» ({'; '.join(parts)}{'; ' if parts else ''}"
+    return (f"«{unit.get('display') or contexts.MSG_NO_TITLE}» ({'; '.join(parts)}{'; ' if parts else ''}"
             f"בקובץ «{c.get('file_title') or c['title']}»)")
 
 
@@ -184,10 +184,14 @@ def rematch(anchor: dict, units: list[dict]) -> dict | None:
     return pool[0] if len(pool) == 1 else None
 
 
+def _anchor_with_id(u: dict) -> dict:
+    """The anchor of a unit row with its stable id and the certainty of its opening edge, as a candidate carries it."""
+    return unit_anchor(u) | {"unit_id": u.get("unit_id"), "certainty": u.get("certainty")}
+
+
 def unit_candidate(u: dict, file_title: str) -> Candidate:
     """A unit row as a candidate of a clarification: it carries its anchor."""
-    return Candidate(str(u["document_id"]), u.get("title") or file_title, file_title=file_title,
-                     unit=unit_anchor(u) | {"unit_id": u.get("unit_id"), "certainty": u.get("certainty")})
+    return Candidate(str(u["document_id"]), u.get("title") or file_title, file_title=file_title, unit=_anchor_with_id(u))
 
 
 @dataclass
@@ -215,8 +219,7 @@ def _current_units(conn, document_id: UUID) -> tuple[str, str, str, list[dict]] 
     if row is None:
         return None
     rows = [{"document_id": document_id, "version_id": row.version_id, "reading_id": row.reading_id,
-             "unit_no": u.unit_no, "unit_id": (f"{row.version_id}#{row.reading_id}#{u.unit_no}" if row.reading_id
-                                              else f"{row.version_id}#{u.unit_no}"),
+             "unit_no": u.unit_no, "unit_id": contexts.unit_key(row.version_id, row.reading_id, u.unit_no),
              "kind": u.kind, "title": u.title, "aliases": list(u.aliases),
              "identifiers": list((u.identifiers or {}).get("shown") or ()), "page_first": u.page_first,
              "page_last": u.page_last, "certainty": u.certainty} for u in unit_store.ensure(conn, row.version_id)]
@@ -358,7 +361,7 @@ def choose(found: list[dict], query: str, focus_ids: set[str]) -> Outcome:
         c = Candidate(str(d["document_id"]), (unit or {}).get("title") or d["title"], terms, int(d.get("hits") or 0),
                       file_title=d["title"], name_extra=int(unit.get("name_extra") or 0) if unit else 0)
         if unit:
-            c.unit = unit_anchor(unit) | {"unit_id": unit.get("unit_id"), "certainty": unit.get("certainty")}
+            c.unit = _anchor_with_id(unit)
         cands.append(c)
     if not cands:
         return Outcome("not_found", query=query)
@@ -430,12 +433,15 @@ def _unit_names(conn) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-def _visible_titles(conn) -> list[str]:
+def _visible_titles(conn, unread: list[dict] | None = None) -> list[str]:
     """Every name that can name a document the user may see: the readable documents' titles, the names of their
-    units (round 9 U9: an alias is an identifying word) and the titles of those whose latest version was not read."""
+    units (round 9 U9: an alias is an identifying word) and the titles of those whose latest version was not read
+    (``unread``: those documents, when the caller has them already)."""
+    if unread is None:
+        unread = unread_documents(conn)
     return [r.title for r in conn.execute(text(
         "SELECT d.title FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
-        " WHERE d.deleted_at IS NULL"))] + _unit_names(conn) + [d["title"] for d in unread_documents(conn)]
+        " WHERE d.deleted_at IS NULL"))] + _unit_names(conn) + [d["title"] for d in unread]
 
 
 def lookup(ctx: TenantContext, words: str, focus_ids: set[str],
@@ -443,20 +449,21 @@ def lookup(ctx: TenantContext, words: str, focus_ids: set[str],
     """The documents the user's words name, under the user's permissions (see the module docstring). ``titles``:
     every title the user may see, when the caller already holds them."""
     with tenant_tx(ctx) as conn:
+        files = unread_documents(conn)  # read once: the lookups below match it, and name it when nothing is found
         searchable = bool(_scope_terms(words))
         matches = units_matching(conn, words) if searchable else UnitMatches()
         found = candidate_rows(matches)
-        unread = unread_matching(conn, words) if searchable else []
+        unread = unread_matching(conn, words, files) if searchable else []
         query = words
         if not found and not unread:
             # relaxed: the words that can name a document, then only the address or label among them
-            vocabulary = titles() if titles else _visible_titles(conn)
+            vocabulary = titles() if titles else _visible_titles(conn, files)
             for relaxed in (" ".join(identifying(words, vocabulary)),
                             " ".join(identifying(words, vocabulary, pairs_only=True))):
                 if relaxed and relaxed != query:
                     query = relaxed
                     matches = units_matching(conn, relaxed)
-                    found, unread = candidate_rows(matches), unread_matching(conn, relaxed)
+                    found, unread = candidate_rows(matches), unread_matching(conn, relaxed, files)
                     if found or unread:
                         break
         outcome = choose(found, query, focus_ids)
@@ -468,7 +475,7 @@ def lookup(ctx: TenantContext, words: str, focus_ids: set[str],
                 c.unread = next(d for d in unread if str(d["document_id"]) == c.document_id)
             return Outcome("not_read", named.documents[:CLARIFY_TITLES], query)
         if outcome.kind == "not_found":
-            outcome.unread = unread_documents(conn)
+            outcome.unread = files
             outcome.split = matches.split
     return outcome
 

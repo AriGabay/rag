@@ -56,6 +56,7 @@ from app.extraction.geometry import POSITIONS_VERSION
 from app.extraction.normalize_text import normalize_for_search, undouble_word
 from app.extraction.pdf import READER_VERSION as PDF_READER_VERSION
 from app.extraction.regions import shown_hash
+from app.platform.storage import purge_staging
 
 logger = logging.getLogger(__name__)
 
@@ -300,17 +301,6 @@ def reading_attempt_key(info: VersionInfo) -> str:
     return hashlib.sha256(f"{sha}:{PDF_INGESTION_VERSION}:{get_settings().ingest_window_pages}".encode()).hexdigest()
 
 
-def purge_staging(office_id: UUID, version_id: UUID) -> None:
-    """Delete everything staged for a version (a published, failed or deleted one). Best effort: staged files are
-    scratch, and a failure to delete them must not fail the job that is done with them."""
-    from app.platform.storage import get_storage, staging_prefix
-
-    try:
-        get_storage().delete_prefix(staging_prefix(office_id, version_id))
-    except (OSError, ValueError):
-        logger.warning("staged files of version %s were not deleted", version_id, exc_info=True)
-
-
 def record_progress(ctx: TenantContext, version_id: UUID, pages_done: int | None, pages_total: int | None,
                     stage: str) -> None:
     """Write the reading's progress to the version's ingestion report (what the documents screen shows)."""
@@ -335,12 +325,7 @@ def _begin_reading(ctx: TenantContext, info: VersionInfo, key: str) -> dict:
                           " text)) WHERE id = :v"), {"k": key, "v": info.id})
     old = ing.get("reading_attempt")
     if isinstance(old, str):
-        from app.platform.storage import get_storage, staging_prefix
-
-        try:
-            get_storage().delete_prefix(staging_prefix(ctx.office_id, info.id, old))
-        except (OSError, ValueError):
-            logger.warning("staged files of version %s under a superseded key were not deleted", info.id)
+        purge_staging(ctx.office_id, info.id, old)
     return {"reading_attempt": key}
 
 

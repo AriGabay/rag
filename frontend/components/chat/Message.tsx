@@ -853,7 +853,7 @@ export function UserMessage({ message, error, onResend }: { message: ChatMessage
 /** The answer's scope line when the conversation stayed in the same appraisal unit as the turn before: the unit by its
  * title (or that it has none) and its pages, beside the file it is in. */
 function UnitScopeLine({ scope }: { scope: ChatUnitScope }) {
-  const label = unitLabel({ id: "", no: 0, title: scope.title, label: "", kind: "appraisal", pages: scope.pages });
+  const label = unitLabel(scope);
   return (
     <div className="details-section" data-testid="unit-scope">
       <h4>התחום</h4>

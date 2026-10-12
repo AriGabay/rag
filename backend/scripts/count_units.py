@@ -31,8 +31,8 @@ from app.db import TenantContext, system_ctx, tenant_tx  # noqa: E402
 
 
 def count_office(ctx: TenantContext) -> list[dict]:
-    """Per current document version of the office: ``{"document_id", "pages", "units": [{"number", "pages", "kind",
-    "certainty"}]}`` — ids, numbers, kinds and certainty only."""
+    """Per current document version of the office: ``{"document_id", "pages", "units": [{"number", "pages",
+    "pages_label", "kind", "certainty"}]}`` — ids, numbers, page ranges, kinds and certainty only."""
     out = []
     with tenant_tx(ctx) as conn:
         conn.execute(text("SET TRANSACTION READ ONLY"))
@@ -41,24 +41,17 @@ def count_office(ctx: TenantContext) -> list[dict]:
             " FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
             " WHERE d.deleted_at IS NULL ORDER BY d.created_at, d.id")).all()
         for v in versions:
-            found = [{"number": u.unit_no, "pages": (u.page_first, u.page_last), "kind": u.kind,
-                      "certainty": u.certainty} for u in units.read_or_derive(conn, v.version_id)]
+            found = [{"number": u.unit_no, "pages": (u.page_first, u.page_last), "pages_label": u.pages_label(),
+                      "kind": u.kind, "certainty": u.certainty} for u in units.read_or_derive(conn, v.version_id)]
             out.append({"document_id": str(v.document_id), "pages": v.page_count, "units": found})
     return out
-
-
-def _pages(pages: tuple) -> str:
-    first, last = pages
-    if first is None:
-        return "pages ?"
-    return f"page {first}" if first == last else f"pages {first}-{last}"
 
 
 def report(rows: list[dict]) -> str:
     """The lines to print: one per document, then the summary. Ids, counts, page numbers, kinds and certainty only."""
     lines = []
     for r in rows:
-        parts = [f"[{u['number']}: {_pages(u['pages'])}, {u['kind']}, {u['certainty']}]" for u in r["units"]]
+        parts = [f"[{u['number']}: {u['pages_label']}, {u['kind']}, {u['certainty']}]" for u in r["units"]]
         lines.append(f"{r['document_id']}  pages={r['pages'] if r['pages'] is not None else '?'}"
                      f"  units={len(r['units'])}  " + " ".join(parts))
     single = sum(1 for r in rows if len(r["units"]) <= 1)

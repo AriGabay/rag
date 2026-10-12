@@ -118,6 +118,7 @@ import time
 from collections.abc import Callable, Container
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
+from itertools import islice
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -126,6 +127,7 @@ from sqlalchemy import Connection, text
 from app.answering.verify import numbers_in
 from app.chat import anchors, calc, contexts, meaning, reader
 from app.chat import unread as unread_text
+from app.chat.contexts import MSG_NO_TITLE
 from app.chat.evidence import TABLE_SIZE_PREFIX
 from app.chat.timing import StageClock
 from app.config import get_settings
@@ -191,6 +193,7 @@ NOT_REACHED = "not_reached"  # a document of the set the turn never touched
 READ_TO_END = "end"  # a read target read from its beginning to its end (``Workspace.read_progress``)
 TOOL_BUDGET = "tool_budget"  # ``Workspace.limits_hit``: the turn's tool-output budget is spent
 TIME_LIMIT = "time_limit"  # ``Workspace.limits_hit``: the turn's reading time is up (``inspect``, or the loop's clock)
+STEP_LIMIT = "step_limit"  # ``Workspace.limits_hit``: the turn took the most steps it may (``engine``)
 
 
 def read_chars() -> int:
@@ -421,7 +424,7 @@ class Workspace:
     # the turn's time per stage and per tool call (round 9 R16, KTD9, ``app.chat.timing``), fed by ``run_tool`` and the engine
     clock: StageClock = field(default_factory=StageClock)
     # the unit the conversation is in (round 9 U10, KTD8), set by the engine from the resolved request: {"handle": its
-    # U#, "document_id", "unit_id"}. A ``search`` or ``outline`` that names no unit and no other document works inside it
+    # U#, "document_id", "display"}. A ``search`` or ``outline`` that names no unit and no other document works inside it
     unit_focus: dict | None = None
     # the units the turn's tools worked in through a unit handle: unit id -> {"document_id", "version_id", "reading_id",
     # "unit_no"}; the unit a turn that ended on a limit leaves the conversation in when nothing it cited says
@@ -518,14 +521,17 @@ class Workspace:
         for d in files:
             self.unread_named[str(d["document_id"])] = d | {"document_id": str(d["document_id"])}
 
-    def unread_files(self) -> list[dict]:
-        """Every visible file that was not read, read once per turn (none outside a database: no context)."""
+    def unread_files(self, conn: Connection | None = None) -> list[dict]:
+        """Every visible file that was not read, read once per turn (none outside a database: no context); a caller
+        that holds a transaction passes it, so the first read does not open another."""
         if self._unread_files is None:
             if self.ctx is None:
                 self._unread_files = []
+            elif conn is not None:
+                self._unread_files = unread_documents(conn)
             else:
-                with tenant_tx(self.ctx) as conn:
-                    self._unread_files = unread_documents(conn)
+                with tenant_tx(self.ctx) as tx:
+                    self._unread_files = unread_documents(tx)
         return self._unread_files
 
     def _sid(self) -> str:
@@ -809,7 +815,7 @@ def _note_once(ws: Workspace, document_id, cx) -> str | None:
 def unit_info(cx, number: int) -> dict:
     """A unit as a source, a value and the answer's payload carry it (round 9 U9, R10): its stable id, number, title,
     label, kind and pages."""
-    seg = next(x for x in cx.segments if x.number == number)
+    seg = cx.segment(number)
     first, last = cx.pages(number)
     return {"id": cx.key(number), "no": number, "title": seg.title, "label": cx.label(number), "kind": seg.kind,
             "pages": [first, last] if first else []}
@@ -982,7 +988,7 @@ def value_context(cx, number: int | None) -> dict | None:
     first, last = cx.pages(number)
     return {"key": cx.key(number), "unit_id": cx.key(number), "number": number, "label": cx.label(number),
             "described": cx.describe(number), "pages": [first, last] if first else [],
-            "subject": cx.is_subject(number), "title": next(s.title for s in cx.segments if s.number == number)}
+            "subject": cx.is_subject(number), "title": cx.segment(number).title}
 
 
 def subject_from(cx, number: int | None, subject: str) -> str:
@@ -1050,9 +1056,9 @@ def focus_unit_for(ws: Workspace, documents: list[str] | str | None) -> str | No
     return focus["handle"] if named <= {focus["document_id"], ws.doc_handle(focus["document_id"])} else None
 
 
-def _unit_pages(cx, number: int) -> str:
-    first, last = cx.pages(number)
-    return "עמוד ?" if first is None else f"עמוד {first}" if first == last else f"עמודים {first}–{last}"
+def _unit_pages(first: int | None, last: int | None) -> str:
+    """A unit's pages as the tools show them ("עמוד ?" when its first page is not known)."""
+    return contexts.pages_text(first, last, "עמוד ?")
 
 
 def _unit_search(ws: Workspace, conn: Connection, handle: str, query: str, limit: int,
@@ -1080,14 +1086,14 @@ def _unit_search(ws: Workspace, conn: Connection, handle: str, query: str, limit
     # by meaning exist in any unit, and are no answer to "is it in this unit"
     hits = memoized_search(ws, conn, query, limit, scope)
     if any(h.get("lexical_support") for h in hits):
-        return hits, [f"חיפוש בתוך היחידה {unit} ({_unit_pages(cx, number)})", *notes], None
+        return hits, [f"חיפוש בתוך היחידה {unit} ({_unit_pages(*cx.pages(number))})", *notes], None
     if reach is not None and reach.extended:
         hits = memoized_search(ws, conn, query, limit, SearchScope(version_ids=(v.version_id,)))
         if any(h.get("lexical_support") for h in hits):
             return hits, [MSG_UNIT_WIDENED.format(unit=unit), *notes], None
-        return [], [], (MSG_UNIT_SEARCHED.format(unit=unit, pages=_unit_pages(cx, number), extended=extended,
+        return [], [], (MSG_UNIT_SEARCHED.format(unit=unit, pages=_unit_pages(*cx.pages(number)), extended=extended,
                                                  query=_txt(query)) + " גם הרחבה לכל הקובץ לא מצאה דבר.")
-    return [], [], MSG_UNIT_SEARCHED.format(unit=unit, pages=_unit_pages(cx, number), extended="", query=_txt(query))
+    return [], [], MSG_UNIT_SEARCHED.format(unit=unit, pages=_unit_pages(*cx.pages(number)), extended="", query=_txt(query))
 
 
 def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None, limit: int | None = None,
@@ -1098,7 +1104,10 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
     limit = max(3, min(int(limit or SEARCH_LIMIT), SEARCH_MAX))
     ws.searches.append(query)
     notes: list[str] = []
-    in_focus = not unit and (unit := focus_unit_for(ws, document_ids)) is not None  # the conversation's unit
+    in_focus = False
+    if not unit:
+        unit = focus_unit_for(ws, document_ids)  # the conversation's unit
+        in_focus = unit is not None
     with tenant_tx(ws.ctx) as conn:
         if unit:
             hits, notes, nothing = _unit_search(ws, conn, unit, query, limit, document_ids)
@@ -1109,13 +1118,14 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 notes.insert(0, focus_note)
             elif nothing:
                 return nothing
-            scope = True  # a unit names its document: no unread document is looked up by title
+            lookup_unread = False  # a unit names its document: no unread document is looked up by title
         else:
             docs = _visible_documents(conn, document_ids or [])
             scope = SearchScope(document_ids=tuple(docs)) if docs else None
             hits = memoized_search(ws, conn, query, limit, scope)
+            lookup_unread = scope is None
         # a document the query names by its title that was not read has no passages: say so, never "not found" (KTD11)
-        named = unread_named(conn, query) if scope is None else []
+        named = unread_named(conn, query, ws.unread_files(conn)) if lookup_unread else []
         ws.name_unread(named)
         ids = [h["chunk_id"] for h in hits]
         extra = {r.id: r for r in conn.execute(text(
@@ -1493,24 +1503,23 @@ def _emit(ws: Workspace, v: reader.Version, target: tuple, pos, part: reader.Par
     return s
 
 
-def _memoized_read(ws: Workspace, conn: Connection, key: tuple, v: reader.Version) -> tuple[tuple, Source | None]:
-    """The memo key of a read of this turn and, when an identical read (the same window of the same reading, the office's
-    data unchanged) was made before, a new source that points at the first: the window is not fetched or cut again, and
-    the model is told it already has it (R16, KTD9). The new source is citable all the same."""
+def _memoized_read(ws: Workspace, conn: Connection, key: tuple, v: reader.Version,
+                   build: Callable[[], Source]) -> Source:
+    """The source of a read of this turn: when an identical read (the same window of the same reading, the office's
+    data unchanged) was made before, a new source that points at the first — the window is not fetched or cut again,
+    and the model is told it already has it (R16, KTD9); the new source is citable all the same. Otherwise
+    ``build()`` reads it, and the turn keeps it."""
     key = (*key, v.reading_id, current_data_version(conn))
     earlier = ws.read_memo.get(key)
-    if earlier is None:
-        return key, None
-    return key, ws.adopt(replace(earlier, sid="", same_as=earlier.same_as or earlier.sid))
+    if earlier is not None:
+        return ws.adopt(replace(earlier, sid="", same_as=earlier.same_as or earlier.sid))
+    ws.read_memo[key] = s = build()
+    return s
 
 
 def _read_window(ws: Workspace, conn: Connection, v: reader.Version, target: tuple, pos) -> Source:
     """A part of a section (its sub-sections included) or of a page range, from ``pos`` (None: its beginning)."""
-    key, again = _memoized_read(ws, conn, ("window", target, pos), v)
-    if again is not None:
-        return again
-    ws.read_memo[key] = s = _read_window_once(ws, conn, v, target, pos)
-    return s
+    return _memoized_read(ws, conn, ("window", target, pos), v, lambda: _read_window_once(ws, conn, v, target, pos))
 
 
 def _read_window_once(ws: Workspace, conn: Connection, v: reader.Version, target: tuple, pos) -> Source:
@@ -1631,11 +1640,8 @@ def _table_rows(ws: Workspace, conn: Connection, v: reader.Version) -> dict[int,
 def _read_table(ws: Workspace, conn: Connection, v: reader.Version, table_index: int, row0: int = 0) -> Source:
     """``table_rows()`` rows of a table from ``row0``, each part with the table's caption, size, headers and
     notes (a continuation keeps the headers and the notes that carry the units)."""
-    key, again = _memoized_read(ws, conn, ("table", str(v.version_id), table_index, row0), v)
-    if again is not None:
-        return again
-    ws.read_memo[key] = s = _read_table_once(ws, conn, v, table_index, row0)
-    return s
+    return _memoized_read(ws, conn, ("table", str(v.version_id), table_index, row0), v,
+                          lambda: _read_table_once(ws, conn, v, table_index, row0))
 
 
 def _read_table_once(ws: Workspace, conn: Connection, v: reader.Version, table_index: int, row0: int = 0) -> Source:
@@ -1953,11 +1959,10 @@ def _unread_listing(ws: Workspace, words: list[str]) -> str:
     """For the model, after a listing: the visible documents whose latest version was not read, outside the listing (a
     count or a list over the set never includes them) — those whose title holds one of the words, or all of them for
     the whole repository. They are kept as the turn's named unread documents (KTD11)."""
-    with tenant_tx(ws.ctx) as conn:
-        files = unread_documents(conn)
-        # a document is named by the query only when its title holds all the words; the whole repository names none
-        named = unread_matching(conn, " ".join(words)) if words else []
+    files = ws.unread_files()
     if words:
+        # a document is named by the query only when its title holds all the words; the whole repository names none
+        named = unread_matching(None, " ".join(words), files)
         lowered = [w.lower() for w in words]
         files = [d for d in files if any(w in d["title"].lower() for w in lowered)]
         ws.name_unread(named)
@@ -1980,7 +1985,7 @@ def _unit_detail(ws: Workspace, u: dict) -> str:
     h = unit_handle_of(ws, u["document_id"], u["version_id"], u["reading_id"], u["unit_no"])
     why = {"alias": "שם שכתוב במסמך", "file_title": "כותרת הקובץ"}.get(u["matched_by"], "קטעים ביחידה")
     return (f'  - {h} | «{_txt(u["title"]) if u["title"] else MSG_NO_TITLE}» | {UNIT_KIND_WORDS.get(u["kind"], u["kind"])}'
-            f' | {_unit_page_text(u)}' + (f' | {_txt(" · ".join(u["identifiers"]))}' if u["identifiers"] else "")
+            f' | {_unit_pages(u["page_first"], u["page_last"])}' + (f' | {_txt(" · ".join(u["identifiers"]))}' if u["identifiers"] else "")
             + f" | קובץ: «{_txt(u['file_title'])}» | התאמה: {why}"
             + (" | גבול לא ודאי" if u["certainty"] == "probable" else ""))
 
@@ -2003,7 +2008,7 @@ def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> s
     block = unread_text.tool_block(files)
     notes = [MSG_SPLIT_TERMS.format(title=_txt(d["title"]), n=d["units"]) for d in matches.split]
     notes += [MSG_ONLY_COMPARABLE.format(title=_txt(u["file_title"]), label=_txt(u["title"] or MSG_NO_TITLE),
-                                         pages=_unit_page_text(u)) for u in matches.comparables]
+                                         pages=_unit_pages(u["page_first"], u["page_last"])) for u in matches.comparables]
     extra = "".join(f"\n\n{n}" for n in notes) + (f"\n\n{block}" if block else "")
     total = len(found)
     page, pages = _paginate(page, total, SCOPE_PAGE)
@@ -2042,15 +2047,9 @@ def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> s
     return out + extra
 
 
-def _unit_page_text(u: dict) -> str:
-    first, last = u["page_first"], u["page_last"]
-    return "עמוד ?" if first is None else f"עמוד {first}" if first == last else f"עמודים {first}–{last}"
-
-
 OUTLINE_MAX = 150  # sections listed in one outline
 OUTLINE_INLINE_UNITS = 3  # a file of at most this many units is outlined whole; a larger one by unit (R15)
-UNIT_KIND_WORDS = {"appraisal": "שומה", "appendix": "נספח", "comparables": "עסקאות השוואה", "front_matter": "פתיח",
-                   "document": "מסמך"}
+UNIT_KIND_WORDS = {**contexts.UNIT_KIND_MARKS, "appraisal": "שומה", "document": "מסמך"}
 MSG_UNITS_HEAD = "יחידות בקובץ (כל שומה או נספח הם יחידה; סעיפים נפתחים לפי יחידה):"
 MSG_UNITS_CHOOSE = ("הקובץ כולל {n} יחידות: סעיפי יחידה ממפה את outline עם unit=U# (או document=U#); חיפוש ביחידה — "
                     "search עם unit=U#; עמודים ביחידה — read עם pages ו-document=U#.")
@@ -2060,14 +2059,11 @@ MSG_UNIT_EDGE = "גבול לא ודאי (נקבע על סמך סימן אחד): 
 def _unit_line(ws: Workspace, cx, number: int, document_id) -> str:
     """One line per unit for the outline: the context as everywhere else (number, label, pages), its handle and stable
     id, its kind, and whether its opening edge is certain."""
-    seg = next(x for x in cx.segments if x.number == number)
+    seg = cx.segment(number)
     edge = f" | {MSG_UNIT_EDGE}" if seg.certainty == "probable" else ""
     title = "" if seg.title else f" ({MSG_NO_TITLE})"
     return (f"{cx.describe(number)}{title} | {unit_handle(ws, cx, number, document_id)} unit_id={cx.key(number)} | "
             f"{UNIT_KIND_WORDS.get(seg.kind, seg.kind)}{edge}")
-
-
-MSG_NO_TITLE = "ללא כותרת"
 
 
 def tool_outline(ws: Workspace, document: str, unit: str | None = None) -> str:
@@ -3739,7 +3735,7 @@ def _operand(ws: Workspace, i: str) -> calc.Operand:
                             table=(str(m.version_id), r.table_index) if r.table_index is not None else None,
                             group=r.value_role, same=str(m.id), approx=r.value_form != "exact",
                             context=(m.context["key"], m.context["described"])
-                            if m.context and m.context.get("subject", True) else None)
+                            if contexts.context_subject(m.context) else None)
     raise ToolError(f"מזהה לא מוכר: {i}. אפשר להשתמש רק במזהים שנרשמו בתור הזה: V# (take_value), A# (assume), "
                     "M# (find_measurements), C# (calculate)")
 
@@ -4249,7 +4245,6 @@ MSG_BUDGET = ("מגבלת היקף הקריאה לשאלה אחת הגיעה ל�
 DEADLINE_TOOLS = frozenset({"search", "read", "outline", "find_documents", "list_documents", "find_measurements"})
 # the tools that register or compute on what was already read: they stay open when the reading is over (the tool budget)
 COMPUTE_TOOLS = ("calculate", "take_value", "assume")
-TIME_STATUS = "time_limit"
 MSG_TIME = ("מגבלת הזמן לקריאה בשאלה אחת הגיעה לסופה: זה לא נקרא ולא נשלח דבר מתוכו (more — הקריאה שהייתה פותחת "
             "אותו). אל תציג את התשובה כמלאה, וחלק שלא נקרא לא נבדק — לא נמצא שהוא חסר במסמך. רישום ערכים וחישוב "
             "(take_value, assume, calculate) על מה שכבר נקרא עדיין אפשריים.")
@@ -4280,7 +4275,7 @@ def _withheld(name: str, args: dict, status: str = TOOL_BUDGET) -> str:
     """What a reading tool returns once the budget is spent or the reading time is up: a header and how to read on, no
     body — nothing is read, registered or counted as read."""
     return (f'<not_read tool="{name}" status="{status}" more="{_attr(_call_text(name, args))}"/>\n'
-            + (MSG_TIME if status == TIME_STATUS else MSG_BUDGET))
+            + (MSG_TIME if status == TIME_LIMIT else MSG_BUDGET))
 
 
 PAGE_TOOLS = frozenset({"read", "inspect"})  # the tools whose record on the stage clock says which pages they returned
@@ -4294,7 +4289,8 @@ def run_tool(ws: Workspace, name: str, arguments: str) -> str:
     before = len(ws.sources)
     output = ws.spend(_run_tool(ws, name, arguments))
     if name in HANDLERS:
-        pages = {p for s in list(ws.sources.values())[before:] for p in s.page_list or ()} if name in PAGE_TOOLS else None
+        pages = ({p for s in islice(ws.sources.values(), before, None) for p in s.page_list or ()}
+                 if name in PAGE_TOOLS else None)
         ws.clock.tool(name, ws.clock.now() - started, len(output), (min(pages), max(pages)) if pages else None)
     return output
 
@@ -4315,7 +4311,7 @@ def _run_tool(ws: Workspace, name: str, arguments: str) -> str:
         # the loop checks the clock only between steps: a tool that starts after the reading deadline does no work
         if TIME_LIMIT not in ws.limits_hit:
             ws.limits_hit.append(TIME_LIMIT)
-        return _withheld(name, args, TIME_STATUS)
+        return _withheld(name, args, TIME_LIMIT)
     try:
         return handler(ws, args)
     except ToolError as e:

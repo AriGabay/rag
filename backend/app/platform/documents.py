@@ -34,7 +34,7 @@ from app.extraction.render import (  # noqa: F401 - the view's scales
     render_png,
 )
 from app.platform.jobs import enqueue_positions, enqueue_processing, positions_job_key, retriable_failure
-from app.platform.storage import get_storage, staging_prefix, storage_key
+from app.platform.storage import get_storage, purge_staging, storage_key
 
 logger = logging.getLogger(__name__)
 
@@ -382,10 +382,7 @@ def delete_document(document_id: str, ctx: TenantContext = Depends(get_ctx)) -> 
         bump_data_version(conn)
         audit(conn, "document_delete", ctx.user_id, "document", doc_uuid)
     for version in versions:  # a reading still in progress leaves nothing staged behind
-        try:
-            get_storage().delete_prefix(staging_prefix(ctx.office_id, version))
-        except (OSError, ValueError):
-            logger.warning("staged files of version %s were not deleted", version, exc_info=True)
+        purge_staging(ctx.office_id, version)
     return {"ok": True}
 
 

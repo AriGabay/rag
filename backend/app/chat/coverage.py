@@ -77,8 +77,9 @@ import re
 from collections.abc import Collection
 from typing import TYPE_CHECKING
 
+from app.chat import contexts
 from app.chat.compose import line_cut
-from app.chat.tools import READ_TO_END, TIME_LIMIT, TOOL_BUDGET, value_uncertain
+from app.chat.tools import READ_TO_END, STEP_LIMIT, TIME_LIMIT, TOOL_BUDGET, value_uncertain
 from app.db import tenant_tx
 
 if TYPE_CHECKING:
@@ -193,7 +194,6 @@ REMOVED_BECAUSE = {
 }
 # the limits of a turn that stop it before the datum is located (R18), in the order the sentence prefers; INSPECT_LIMIT
 # stops only the visual readings and is no reason by itself
-STEP_LIMIT = "step_limit"  # ``engine.STEP_LIMIT``
 LIMITS = (TIME_LIMIT, TOOL_BUDGET, STEP_LIMIT)
 LIMIT_WHERE = {TIME_LIMIT: "מגבלת הזמן של השאלה", TOOL_BUDGET: "מגבלת היקף הקריאה של השאלה",
                STEP_LIMIT: "מספר הצעדים המרבי של השאלה"}
@@ -457,14 +457,12 @@ def _openings(ws: Workspace, documents: Collection[str] | None = None) -> dict[s
 
 def _unit_key(data: dict) -> str:
     """The stable id of the unit a handle's data names (``Contexts.key``: version, reading and number)."""
-    version, reading, number = data["version_id"], data.get("reading_id"), data["unit_no"]
-    return f"{version}#{reading}#{number}" if reading else f"{version}#{number}"
+    return contexts.unit_key(data["version_id"], data.get("reading_id"), data["unit_no"])
 
 
 def _unit_text(ws: Workspace, key: str, fallback: str = "") -> str:
     """How a gap line names a unit: «title» and its pages. The titles come from the contexts the turn read; a unit the
     turn only held in focus has the text the engine gave it (``Workspace.unit_focus``)."""
-    from app.chat import contexts
     from app.chat.tools import unit_info
 
     version, _, number = contexts.split_unit_key(key)
@@ -472,8 +470,7 @@ def _unit_text(ws: Workspace, key: str, fallback: str = "") -> str:
     if cx is None or number not in cx.numbers:
         return fallback
     info = unit_info(cx, number)
-    first, last = info["pages"] or (None, None)
-    pages = "" if first is None else f"עמוד {first}" if first == last else f"עמודים {first}–{last}"
+    pages = contexts.pages_text(*(info["pages"] or (None, None)))
     name = info["title"] or info["label"]
     return f"«{name}»" + (f" ({pages})" if pages else "")
 
@@ -540,11 +537,11 @@ def _missing_parameters(ws: Workspace, o: dict, ev: dict) -> list[str]:
 
 
 def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict | None = None,
-              opened: dict[str, tuple[str, dict]] | None = None) -> dict:
+              opened: dict[str, tuple[str, dict]] | None = None, signal: dict | None = None) -> dict:
     """Why a component is not given, chosen from the turn's evidence by the reason table (first match wins; the
     module docstring lists it): {"reason", "variant", "place", "document", "searched", "detail"}. ``claim``: the
     model's validated claim about it, which adds evidence and never upgrades. ``opened``: the turn's openings
-    (``_openings``), when the caller already has them."""
+    (``_openings``), and ``signal``: the turn's unit signal (``unit_signal``), when the caller already has them."""
     ev = related_evidence(ws, o, turn)
     kinds = {f["kind"] for f in ev["failures"]}
     # covered only by a search or reading the judge tied to it: a model's "not found in the search" proves none
@@ -580,7 +577,8 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
         opened = _openings(ws)
     readings = [(sid, *opened[sid]) for sid in ev["checks"] if sid in opened]
     gap = _claim_gap(claim) if claim is not None else None
-    signal = unit_signal(ws)
+    if signal is None:
+        signal = unit_signal(ws)
     # a turn stopped by a limit says so (R18; AE8) — unless a section read to its end inside the located unit (or in a
     # file that is one unit) ties the component: the limit did not cause that absence, and "not present in the section
     # checked" is the accurate statement. A file named but not read is the better statement of what was not done
@@ -674,6 +672,7 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
     opened = _openings(ws)  # the turn's openings, for every claim and component
     claims, _ = _claims_by_component(ws, requested, opened)
     outcomes = report.requirement_outcomes(applied)
+    signal = None  # the turn's unit signal, computed once for the first component that needs a reason
     for o in outcomes:
         o |= {"limitation": None, "limitation_text": None, "place": None, "document": None, "document_id": None,
               "document_title": None,
@@ -681,7 +680,9 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
               "gap": None}
         if o["children"] or o["status"] not in UNMET:
             continue
-        why = reason_of(ws, o, turn, claims.get(o["id"]), opened)
+        if signal is None:
+            signal = unit_signal(ws)
+        why = reason_of(ws, o, turn, claims.get(o["id"]), opened, signal)
         o |= {"limitation": why["reason"], "limitation_text": REASONS[why["reason"]], "place": why.get("place"),
               "document": why.get("document"), "document_id": why.get("document_id"), "searched": why["searched"],
               "detail": why.get("detail") or "", "variant": why.get("variant") or ""}

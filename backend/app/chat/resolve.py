@@ -53,6 +53,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from app.chat import entities, unread
 from app.chat import request as request_analysis
 from app.chat import tools as T
+from app.chat.contexts import MSG_NO_TITLE
 from app.measurements.extract import PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
 from app.providers.llm import (
     CallStatus,
@@ -284,14 +285,21 @@ def _scale_of(resolved: ResolvedRequest) -> bool | None:
     return None
 
 
+MSG_ANSWER_BY_NUMBER = "אפשר לענות במספר, או במילה שמבדילה ביניהן."
+
+
+def _numbered_candidates(cands: list[entities.Candidate]) -> str:
+    """The candidates of a clarification as a numbered list, one per line, each as ``candidate_label`` names it."""
+    return "\n".join(f"{n}. {prompt_text(entities.candidate_label(c.as_dict()))}" for n, c in enumerate(cands, 1))
+
+
 def _clarify_titles(outcome: entities.Outcome, words: str) -> str:
     """The server's question between candidates: documents by title; units by title, pages, identifiers and file, in the
     order of how well their names fit the words (round 9 U9, R13)."""
     if any(d.unit for d in outcome.documents):
-        names = "\n".join(f"{n}. {prompt_text(entities.candidate_label(d.as_dict()))}"
-                          for n, d in enumerate(outcome.documents, 1))
+        names = _numbered_candidates(outcome.documents)
         return (f"נמצאו כמה שומות שמתאימות ל\"{prompt_text(words)}\":\n{names}\nלאיזו מהן התכוונת? "
-                "אפשר לענות במספר, או במילה שמבדילה ביניהן.")
+                + MSG_ANSWER_BY_NUMBER)
     names = "; ".join(f"«{prompt_text(d.title)}»" for d in outcome.documents)
     return f"נמצאו כמה מסמכים שמתאימים ל\"{prompt_text(words)}\": {names}. לאיזה מהם התכוונת?"
 
@@ -304,10 +312,10 @@ def clarify_gone_unit(gone: dict, shown: list[entities.Candidate], total: int) -
     """The server's question when the unit the conversation was in is not in the file's new reading: the file's
     appraisals, each by title, pages, identifiers and file (the old number selects nothing). ``total``: how many the file
     has, of which ``shown`` are listed."""
-    names = "\n".join(f"{n}. {prompt_text(entities.candidate_label(c.as_dict()))}" for n, c in enumerate(shown, 1))
+    names = _numbered_candidates(shown)
     more = f"\n(יש בקובץ עוד {total - len(shown)}; אפשר לנקוב בשם הפרויקט או הנכס.)" if total > len(shown) else ""
-    return (MSG_UNIT_GONE.format(title=prompt_text(gone.get("display") or "ללא כותרת")) + f"\n{names}{more}\n"
-            "אפשר לענות במספר, או במילה שמבדילה ביניהן.")
+    return (MSG_UNIT_GONE.format(title=prompt_text(gone.get("display") or MSG_NO_TITLE)) + f"\n{names}{more}\n"
+            + MSG_ANSWER_BY_NUMBER)
 
 
 MSG_SPLIT = ("המילים \"{words}\" מופיעות בקובץ «{title}» אך בשומות שונות שבו: אף שומה אחת אינה מכילה את כולן. לאיזו "
@@ -537,7 +545,7 @@ def _input(focus: dict | None, history: list, message: str, documents: list[dict
             f"- period: {label(PERIOD_LABELS, 'period')}", f"- area_basis: {prompt_text(focus.get('area_basis') or '')}",
             f"- vat: {label(VAT_LABELS, 'vat')}", f"- subject: {prompt_text(focus.get('subject') or '')}",
             f"- document_ids: {', '.join(focus.get('document_ids') or [])}",
-            *([f"- שומה בתוך הקובץ: {prompt_text(focus['located_unit'].get('display') or 'ללא כותרת')}"]
+            *([f"- שומה בתוך הקובץ: {prompt_text(focus['located_unit'].get('display') or MSG_NO_TITLE)}"]
               if focus.get("located_unit") else [])]))
     if documents:
         parts.append("מסמכים שהשיחה עסקה בהם:\n" + "\n".join(
@@ -651,7 +659,7 @@ def requested_block(req: Request, unit_handle: str | None = None) -> str:
     if req.located_unit and unit_handle:
         u = req.located_unit
         where = "; ".join(x for x in (entities.unit_pages(u), " · ".join(u.get("identifiers") or ())) if x)
-        lines.append(f"- יחידה בקובץ: {unit_handle} «{prompt_text(u.get('display') or 'ללא כותרת')}»"
+        lines.append(f"- יחידה בקובץ: {unit_handle} «{prompt_text(u.get('display') or MSG_NO_TITLE)}»"
                      + (f" ({prompt_text(where)})" if where else "")
                      + (" — היחידה שהשיחה כבר עוסקת בה; שינוי מדד או חישוב אינו מעביר שומה" if req.unit_kept else "")
                      + f". חפש וקרא בתוכה בלבד (search ו-outline עם unit={unit_handle}, read עם pages ו-document="

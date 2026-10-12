@@ -781,6 +781,7 @@ def extract_version(ctx: TenantContext, version_id: UUID, provider: LLMProvider)
         pool.shutdown(wait=False, cancel_futures=True)
         raise
     pool.shutdown(wait=True)
+    state = "done" if not failed else "partial"
     with tenant_tx(ctx) as conn:
         if not run.passages_done and failed:
             # nothing was read: the earlier measurements stay, and the job fails so it is tried again
@@ -795,6 +796,6 @@ def extract_version(ctx: TenantContext, version_id: UUID, provider: LLMProvider)
         conn.execute(text(
             "UPDATE measurement_runs SET state = :s, passages_done = :d, found = :f, detail = detail ||"
             " CAST(:j AS jsonb), updated_at = now() WHERE version_id = :v AND extraction_version = :e"),
-            {"s": "done" if not failed else "partial", "d": run.passages_done, "f": run.found,
+            {"s": state, "d": run.passages_done, "f": run.found,
              "v": version_id, "e": EXTRACTION_VERSION, "j": json.dumps({"failed_batches": failed})})
-    return RunResult("done" if not failed else "partial", run.found, len(passages), failed)
+    return RunResult(state, run.found, len(passages), failed)

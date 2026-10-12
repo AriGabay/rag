@@ -670,8 +670,7 @@ def units_matching(conn: Connection, query: str) -> UnitMatches:
                 continue
             matched = True
             unit = {"document_id": r.id, "version_id": r.version_id, "reading_id": r.reading_id, "unit_no": u.unit_no,
-                    "unit_id": (f"{r.version_id}#{r.reading_id}#{u.unit_no}" if r.reading_id
-                                else f"{r.version_id}#{u.unit_no}"), "kind": u.kind, "title": u.title,
+                    "unit_id": unit_contexts.unit_key(r.version_id, r.reading_id, u.unit_no), "kind": u.kind, "title": u.title,
                     "aliases": list(u.aliases), "identifiers": list((u.identifiers or {}).get("shown") or ()),
                     "page_first": u.page_first, "page_last": u.page_last, "certainty": u.certainty,
                     "block_first": u.block_first, "block_last": u.block_last, "file_title": r.title,
@@ -690,7 +689,7 @@ def units_matching(conn: Connection, query: str) -> UnitMatches:
             out.documents.append(row)
         elif not matched:
             out.split.append({"document_id": r.id, "title": r.title, "units": len(stored[r.version_id])})
-    _printed_labels(conn, out)
+    printed_labels(conn, [*out.units, *out.comparables])
     out.documents.sort(key=lambda d: (-len(d["in_title"]), -d["hits"], d["title"], str(d["document_id"])))
     return out
 
@@ -751,10 +750,6 @@ def _unit_passages(conn: Connection, files: list, stored: dict, terms: list[list
     return found
 
 
-def _printed_labels(conn: Connection, matches: UnitMatches) -> None:
-    printed_labels(conn, [*matches.units, *matches.comparables])
-
-
 def printed_labels(conn: Connection, units: list[dict]) -> None:
     """Sets ``first_label`` on each unit row (``version_id``, ``page_first``): its first printed page label, the part of
     its anchor that survives a new reading: the page's stored label, else — a report whose numbering restarts keeps
@@ -769,7 +764,7 @@ def printed_labels(conn: Connection, units: list[dict]) -> None:
                 " AS edge FROM pages p JOIN unnest(CAST(:v AS uuid[]), CAST(:n AS int[])) AS w(version_id, page_no)"
                 " ON p.version_id = w.version_id AND p.page_no = w.page_no"),
                 {"v": [v for v, _ in firsts], "n": [n for _, n in firsts]}):
-            number = unit_store._footer_number(r.edge or "") if not r.printed_label else None
+            number = unit_store.footer_number(r.edge or "") if not r.printed_label else None
             labels[(r.version_id, r.page_no)] = r.printed_label or (str(number) if number is not None else None)
     for u in units:
         u["first_label"] = labels.get((u["version_id"], u["page_first"]))
@@ -828,26 +823,27 @@ def unread_documents(conn: Connection) -> list[dict]:
              "uploaded_at": r.created_at} for r in rows]
 
 
-def unread_matching(conn: Connection, query: str) -> list[dict]:
+def unread_matching(conn: Connection | None, query: str, files: list[dict] | None = None) -> list[dict]:
     """The unread documents (``unread_documents``) whose **title** holds every term of ``query``, each term in any of
     its forms: a document that was not read has no text to match. Rows as ``documents_matching`` gives them (no
-    passages: ``hits`` 0), with the state of the version."""
+    passages: ``hits`` 0), with the state of the version. ``files``: the unread documents, when the caller has them
+    already (then ``conn`` is not used and may be None)."""
     terms = [set(t) for t in _scope_terms(query)]
     if not terms:
         return []
     out = []
-    for d in unread_documents(conn):
+    for d in (unread_documents(conn) if files is None else files):
         title = _title_words(d["title"]) | _numbers_of(d["title"])
         if all(title & ts for ts in terms):
             out.append(d | {"in_title": [sorted(title & ts)[0] for ts in terms], "in_text": [], "hits": 0})
     return out
 
 
-def unread_named(conn: Connection, query: str) -> list[dict]:
+def unread_named(conn: Connection, query: str, files: list[dict] | None = None) -> list[dict]:
     """The unread documents a search query names by their title, as ``documents_named`` names current ones: at least
     two query words in the title, one of them a number or both distinctive (in no more than two visible titles,
-    current ones and unread ones together)."""
-    unread = unread_documents(conn)
+    current ones and unread ones together). ``files``: the unread documents, when the caller has them already."""
+    unread = unread_documents(conn) if files is None else files
     if not unread:
         return []
     titles = [r.title for r in conn.execute(text(

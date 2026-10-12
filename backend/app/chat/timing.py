@@ -72,7 +72,7 @@ class StageClock:
 
 _SOURCE = re.compile(r'<source id="S\d+"(?! same_as)([^>]*)>')
 _DOCUMENT = re.compile(r'\bdocument_id="([^"]+)"')
-_TIME_STOP = re.compile(r'<not_read [^>]*status="time_limit"')
+_TIME_STOP = re.compile(r'<not_read [^>]*status="time_limit"')  # ``tools.TIME_LIMIT``: tools imports this module
 _LISTED = re.compile(r'סה"כ (\d+) מסמכים')
 
 

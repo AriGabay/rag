@@ -313,7 +313,9 @@ class _Final:
             left.append(d.raw[at:a])
             at = b
         left.append(d.raw[at:])
-        words = lambda text: _MISSING_TOKEN.findall(_IDS.sub("", text))  # noqa: E731
+        def words(text: str) -> list[str]:
+            return _MISSING_TOKEN.findall(_IDS.sub("", text))
+
         return words("".join(left)) == words(f.text)
 
     def with_votes(self, todo: list[FinalUnit], units: list[FinalUnit]) -> list[FinalUnit]:

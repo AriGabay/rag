@@ -451,8 +451,6 @@ def usage_summary(results: list[Result]) -> list[str]:
     def mean(xs) -> float:
         return sum(xs) / len(xs)
 
-    pct = percentile
-
     by_purpose: dict[str, int] = {}
     for u in calls:
         by_purpose[u.get("purpose") or "-"] = by_purpose.get(u.get("purpose") or "-", 0) + 1
@@ -469,7 +467,7 @@ def usage_summary(results: list[Result]) -> list[str]:
              f"- טוקני פלט לתור: ממוצע {mean([tok(t['usage'], 'output_tokens') for t in turns]):,.0f}",
              f"- עלות לתור (לפי מחירון המודל של כל קריאה): ממוצע {total / len(turns):.4f}$, סה\"כ {total:.3f}$"
              + (f" — בלי {unpriced} קריאות שעלותן לא ידועה (מודל לא מתומחר או ללא דיווח טוקנים)" if unpriced else ""),
-             f"- זמן לתור: חציון {pct(secs, 0.5)} שנ׳, p90 {pct(secs, 0.9)} שנ׳, מקסימום {max(secs)} שנ׳",
+             f"- זמן לתור: חציון {percentile(secs, 0.5)} שנ׳, p90 {percentile(secs, 0.9)} שנ׳, מקסימום {max(secs)} שנ׳",
              f"- עלות לשיחה שעברה: {cost_per_pass(results, total)}", "",
              "| מטרה | מודל | קריאות | קלט | מ-cache | כתיבה ל-cache | פלט | עלות | עלות לתור |",
              "|---|---|---|---|---|---|---|---|---|"]
