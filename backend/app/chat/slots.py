@@ -100,13 +100,27 @@ def extract_items(markdown: str) -> list[str]:
 _BOLD = re.compile(r"(\*\*|__)(?P<b>[^*_\n]{2,80}?)\1")
 
 
+def _split_enumeration(bold: str) -> list[str]:
+    """A bold span that enumerates several items in one ("גישת ההשוואה, גישת ההכנסות וגישת העלות") as its items: split at
+    the commas, and the last at its "ו" when the parts share their first word ("וגישת" of "גישת"); any other span is one
+    item."""
+    text = _EDGE_MARKUP.sub("", bold)
+    parts = [p.strip(" \t:.;-–—") for p in re.split(r"\s*,\s*", text)]
+    if len(parts) >= 2:
+        first = parts[0].split()[0] if parts[0].split() else ""
+        last = re.split(r"\s+ו(?=" + re.escape(first) + r")", parts[-1], maxsplit=1) if first else [parts[-1]]
+        parts = parts[:-1] + [p.strip() for p in last]
+        parts = [p[1:] if p.startswith("ו" + first) else p for p in parts]
+    return [clip(p, ITEM_CHARS) for p in parts if p]
+
+
 def _bold_items(markdown: str) -> list[str]:
     """The items of an answer that enumerated them in prose, with no list (the real model's usual shape for "what are
     the three approaches"): the bold terms of the first paragraph that holds two or more of them, or — when no paragraph
     does — the bold leads of consecutive paragraphs. A bold heading line on its own is a heading, not an item."""
     paragraphs = [p for p in re.split(r"\n\s*\n", _CITATION.sub("", markdown or "")) if p.strip()]
     for para in paragraphs:
-        terms = [clip(_EDGE_MARKUP.sub("", m.group("b")), ITEM_CHARS).strip(" \t:.,;-–—") for m in _BOLD.finditer(para)]
+        terms = [t for m in _BOLD.finditer(para) for t in _split_enumeration(m.group("b"))]
         terms = list(dict.fromkeys(t for t in terms if t))
         if len(terms) >= 2:
             return terms[:MAX_ITEMS]

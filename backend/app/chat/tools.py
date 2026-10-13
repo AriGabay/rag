@@ -1556,6 +1556,10 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                         and not _has_professional(conn):
                     ws.standards_absent = absent = True  # the office holds none: a stated gap, not a failed search (KTD15)
                     notes.append(MSG_NO_STANDARD_POOL)
+                    if not any(q.pool == APPRAISAL_POOL for q in passes) and APPRAISAL_POOL in ws.pools:
+                        # the call asked for the professional pool by name, and there is none: the office's other
+                        # documents are read in its place (R29), in the role the intent gives them
+                        passes.append(_Pass(APPRAISAL_POOL, ws.pools[APPRAISAL_POOL], limit))
                     continue
                 # with no standard to answer from, the office's other documents are read in full, not as a few examples:
                 # a glossary or a general explanation stored as an appraisal still explains a concept, labelled by its

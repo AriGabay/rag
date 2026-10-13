@@ -362,3 +362,12 @@ def test_an_answer_that_enumerates_in_prose_gives_its_bold_terms_as_items():
     assert slots.extract_items(leads) == ["גישת ההשוואה", "גישת העלות"]
     assert slots.extract_items("**כותרת**\n\nטקסט רגיל.") == []
     assert slots.extract_items("1. אחת\n2. שתיים\n\n**א** ו**ב**") == ["אחת", "שתיים"]  # a list comes first
+
+
+def test_one_bold_span_that_enumerates_gives_its_items():
+    # round 10 real-model run on 044fda4: "**גישת ההשוואה, גישת ההכנסות וגישת העלות**" in one bold span
+    from app.chat import slots
+
+    assert slots.extract_items("הגישות הן **גישת ההשוואה, גישת ההכנסות וגישת העלות** [S1].") == [
+        "גישת ההשוואה", "גישת ההכנסות", "גישת העלות"]
+    assert slots.extract_items("**שווי שוק** הוא המחיר.") == []

@@ -366,7 +366,10 @@ def test_a_property_question_then_how_to_apply_the_approach_to_it_is_mixed_three
             assert t2.status != "clarification" and not t2.request.get("candidates"), t2.markdown[:300]
             assert t2.intent == "mixed", (t2.intent, t2.settled.get("claimed"), t2.settled.get("reasons"))
             assert t2.request.get("document_ids") == [o.d5], t2.request.get("document_ids")
-            assert t2.cited_of(STANDARD_KINDS, o.std), ("no standard is cited", [(s.get("source_kind"), s.get("title")) for s in t2.cited])
+            # a professional source of the standard's family — the standard or the clarification of it — beside the property's
+            # appraisal: R27 separates the requirement from the data, either professional document carries the requirement
+            assert t2.cited_of(STANDARD_KINDS), ("no professional source is cited",
+                                                 [(s.get("source_kind"), s.get("title")) for s in t2.cited])
             assert t2.cited_of(("appraisal",), o.d5), ("the property's appraisal is not cited",
                                                       [(s.get("source_kind"), s.get("title")) for s in t2.cited])
 

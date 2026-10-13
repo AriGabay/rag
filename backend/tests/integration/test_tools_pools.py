@@ -341,6 +341,14 @@ def test_with_no_standard_the_offices_other_documents_answer_in_full_not_as_thre
     assert T.LABEL_APPRAISAL_KIND in out  # no property stated: labelled by its kind, not as a property's example
 
 
+def test_asking_for_the_professional_pool_by_name_in_an_office_with_none_reads_the_other_documents(office):
+    # office-A real-model run on 044fda4: the model called search(pool="professional") and got the gap note alone
+    doc, _ = appraisal(office, text_=GLOSSARY, title="מילון (סינתטי)", opening="מילון מונחים")
+    ws = workspace(office, "professional")
+    out = run(ws, "search", query=QUERY, pool="professional")
+    assert T.MSG_NO_STANDARD_POOL in out and {s["document_id"] for s in sources_of(out)} == {doc}
+
+
 def test_find_standards_in_an_office_with_none_says_the_repository_holds_none(office):
     appraisal(office)
     ws = workspace(office, "professional")
