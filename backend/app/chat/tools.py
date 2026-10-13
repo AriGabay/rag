@@ -1352,6 +1352,10 @@ def _plan(ws: Workspace, conn: Connection, pool: str | None, limit: int) -> tupl
     if pool not in (None, "") and not named:
         notes.append(MSG_POOL_CLIPPED)
     chosen = [pool] if named else [p for p in default if p in allowed]
+    if named and allowed[pool] != PRIMARY:
+        # a pool the intent allows only beside its primary one (examples, a method) is read beside it, never instead
+        # of it: a professional question naming the appraisals still reads the standards first (KTD12)
+        chosen = [p for p in default if allowed.get(p) == PRIMARY and p != pool] + chosen
     if named and allowed[pool] == EXAMPLE:
         notes.append(MSG_POOL_EXAMPLES)
     primaries = [p for p in chosen if allowed[p] == PRIMARY]

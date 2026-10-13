@@ -1159,7 +1159,7 @@ def test_a_professional_question_whose_pool_was_empty_gets_the_standard_absent_g
     ws.intent, ws.standards_absent = "professional", True
     o, gap = _only_missing(ws)
     assert o["limitation"] == "standard_absent" and o["limitation_text"] == "נוסח התקן אינו במאגר"
-    assert gap == "**דמי הניהול**: נוסח התקן אינו במאגר, ולכן לא ניתן לענות על כך ממה שהתקן קובע."
+    assert gap == "**דמי הניהול**: נוסח התקן אינו במאגר, ולכן לא נבדק מה התקן עצמו קובע בעניין הזה."
     assert "לא אותר" not in gap and "לא נמצא" not in gap
     # a gap of the repository, stated before a limit of the turn: it is why nothing was read in a standard
     _stopped_on(ws, "time_limit")

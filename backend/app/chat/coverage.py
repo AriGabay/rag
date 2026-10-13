@@ -349,7 +349,7 @@ def gap_sentence(reason: str, variant: str, texts: list[str], place: dict | None
             return f"{who}: המסמכים \"{document}\" לא נקראו ({detail}), ולכן לא נבדק אם הנתון מופיע בהם."
         return f"{who}: המסמך \"{document}\" לא נקרא ({detail}), ולכן לא נבדק אם הנתון מופיע בו."
     if reason == "standard_absent":
-        return f"{who}: נוסח התקן אינו במאגר, ולכן לא ניתן לענות על כך ממה שהתקן קובע."
+        return f"{who}: נוסח התקן אינו במאגר, ולכן לא נבדק מה התקן עצמו קובע בעניין הזה."
     if reason == "region_not_read" and variant == "clipped":
         return (f"{who} לא {'נמצאו' if many else 'נמצא'} בחלק שנקרא {of_it}: {what} נקרא רק בחלקו, ולכן ייתכן "
                 "שהנתון מופיע בחלק שלא נקרא.")

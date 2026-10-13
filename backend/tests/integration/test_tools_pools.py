@@ -125,9 +125,9 @@ def test_the_model_cannot_widen_the_pool_the_server_chose(office):
     std, _ = standard(office)
     prop, _ = appraisal(office)
     ws = workspace(office, "professional")
-    out = run(ws, "search", query=QUERY, pool="appraisal")  # appraisals under a professional question: examples only
-    docs = {s["document_id"] for s in sources_of(out)}
-    assert docs == {prop} and T.MSG_POOL_EXAMPLES in out
+    out = run(ws, "search", query=QUERY, pool="appraisal")  # appraisals under a professional question: examples only,
+    docs = {s["document_id"] for s in sources_of(out)}  # read beside the standards, never instead of them (real-model run)
+    assert docs == {std, prop} and T.MSG_POOL_EXAMPLES in out
     ws = workspace(office, "set")
     out = run(ws, "search", query=QUERY, pool="professional")  # a set question has no professional pool: clipped
     assert {s["document_id"] for s in sources_of(out)} == {prop} and T.MSG_POOL_CLIPPED in out
