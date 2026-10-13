@@ -167,7 +167,7 @@ export function UploadPanel({
       </div>
       <div className="field" role="radiogroup" aria-labelledby={`${inputId}-kind`} aria-describedby={`${inputId}-kind-hint`}>
         <span id={`${inputId}-kind`} className="field-label">
-          סוג המסמכים (חל על כל הקבצים שנבחרו)
+          סוג המסמכים (חל על כל הקבצים בהעלאה)
         </span>
         <div className="row kind-choices">
           {KIND_CHOICES.map((value) => (
