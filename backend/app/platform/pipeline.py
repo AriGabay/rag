@@ -516,8 +516,21 @@ def process_version(office_id: UUID, version_id: UUID) -> str | None:
     record_progress(ctx, info.id, None, None, STAGE_PUBLISHING)
     outcome = publish_stage(ctx, info)
     purge_staging(office_id, version_id)
+    derive_professional(ctx, info.id, outcome)
     queue_measurements(ctx, info)
     return outcome
+
+
+def derive_professional(ctx: TenantContext, version_id: UUID, outcome: str | None) -> None:
+    """After a version of a standard or a professional document is published, derive its structure and metadata
+    (``app.professional``, round 10 U4, U5: KTD9, KTD10). It never fails the job: a failing derivation is recorded on
+    the version and derived again on first use. An appraisal and a version that lost its place to a later one are
+    left alone."""
+    if outcome in (None, "superseded"):
+        return
+    from app import professional
+
+    professional.after_publish(ctx, version_id)
 
 
 def is_appraisal(ctx: TenantContext, document_id: UUID) -> bool:
@@ -542,7 +555,8 @@ def queue_measurements(ctx: TenantContext, info: VersionInfo) -> bool:
 
 # --- reindexing and measurements ----------------------------------------------------------------------------
 
-_DERIVED_TEXT_TABLES = ("document_units", "chunks", "extracted_tables", "pages", "document_blocks")
+_DERIVED_TEXT_TABLES = ("document_units", "document_sections", "standard_profiles", "chunks", "extracted_tables",
+                        "pages", "document_blocks")
 EMBED_BATCH = 64
 MISSING_SHOWN = 20  # missing numbers recorded per page
 MSG_REGRESSION = ("הקריאה החדשה איבדה מידע ביחס לקריאה הקיימת ({summary}), ולכן נשמרה הקריאה הקיימת והמסמך זמין"
@@ -776,6 +790,7 @@ def reindex_version(office_id: UUID, version_id: UUID, accept_regression: bool =
                 {"v": info.id, "r": json.dumps(regression, ensure_ascii=False)})
         logger.info("reindex of version %s kept the current reading: %s", info.id, regression_summary(regression))
         raise ReadingRegression(regression)
+    derive_professional(ctx, info.id, "reindexed")
     queue_measurements(ctx, info)
     return "reindexed"
 

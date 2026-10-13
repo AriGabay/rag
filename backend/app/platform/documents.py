@@ -410,7 +410,8 @@ def change_kind(document_id: str, body: KindBody, ctx: TenantContext = Depends(r
 
     - To ``standard`` or ``professional``: the appraisal derivations (units, records, measurements) stay stored and the
       kind filters of the appraisal surfaces stop reading them. Sections and the standard's profile are derived
-      lazily from the stored blocks on first use (U4, U5), so there is nothing to derive here.
+      lazily from the stored blocks on first use (``app.professional.sections.ensure``, ``profile.ensure_profile``:
+      round 10 U4, U5), so there is nothing to derive here and a derivation that fails cannot fail the change.
     - To ``appraisal`` from another kind: the appraisal stages the document skipped run now, from the stored reading
       (``publish.run_skipped_stages``: records, transactions and units from stored pages, tables and blocks), and
       measurement extraction is queued when the office allows the model. Each of these works on stored rows, so none
