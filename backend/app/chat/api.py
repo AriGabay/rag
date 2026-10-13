@@ -318,14 +318,20 @@ def _visible_documents(conn: Connection, rows) -> set[str]:
     return _visible_ids(conn, {d for r in rows for d in _answer_documents(r.answer)})
 
 
-def _visible_ids(conn: Connection, ids) -> set[str]:
-    """The given document ids the user sees now (RLS on documents decides; deleted documents are not seen)."""
+def _uuids(ids) -> list[UUID]:
+    """The ids that parse as UUIDs, in order; one that does not is dropped."""
     uuids = []
     for i in ids or ():
         try:
             uuids.append(UUID(str(i)))
         except ValueError:
             continue
+    return uuids
+
+
+def _visible_ids(conn: Connection, ids) -> set[str]:
+    """The given document ids the user sees now (RLS on documents decides; deleted documents are not seen)."""
+    uuids = _uuids(ids)
     if not uuids:
         return set()
     return {str(x.id) for x in conn.execute(text("SELECT id FROM documents WHERE id = ANY(:i) AND deleted_at IS NULL"),
@@ -730,14 +736,8 @@ def _listing(conn: Connection, answer: dict) -> list[dict]:
                              for d in s.get("listed_document_ids") or []))
     if not ids:
         return []
-    uuids = []
-    for i in ids:
-        try:
-            uuids.append(UUID(str(i)))
-        except ValueError:
-            continue
     titles = {str(r.id): r.title for r in conn.execute(
-        text("SELECT id, title FROM documents WHERE id = ANY(:i) AND deleted_at IS NULL"), {"i": uuids})}
+        text("SELECT id, title FROM documents WHERE id = ANY(:i) AND deleted_at IS NULL"), {"i": _uuids(ids)})}
     # only what the answer showed the user is a list an ordinal can name: a listing the model read but did not present
     # (find_standards before a professional answer) is no second reading of "השנייה" (round 10 real-model run)
     shown = " ".join((answer.get("markdown") or "").split())

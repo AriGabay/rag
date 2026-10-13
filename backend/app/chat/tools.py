@@ -152,6 +152,7 @@ from app.chat import anchors, calc, contexts, meaning, reader
 from app.chat import unread as unread_text
 from app.chat.contexts import MSG_NO_TITLE
 from app.chat.evidence import TABLE_SIZE_PREFIX
+from app.chat.intent import MIXED, PROFESSIONAL
 from app.chat.timing import StageClock
 from app.config import get_settings
 from app.db import TenantContext, current_data_version, tenant_tx
@@ -171,7 +172,7 @@ from app.measurements.extract import (
 from app.platform import source_kinds
 from app.platform.documents import coverage_of, display_box_of, reading_notes
 from app.platform.search import SearchScope, search_passages, unread_documents, unread_matching, unread_named
-from app.platform.source_kinds import APPRAISALS_SQL
+from app.platform.source_kinds import APPRAISALS_SQL, PROFESSIONALS_SQL
 from app.professional import catalog, profile, sections
 
 logger = logging.getLogger(__name__)
@@ -422,6 +423,12 @@ class Workspace:
     profiled: bool = False  # the turn derived the profiles that were missing (``profiles``)
     # the copies of professional text the pool leaves out, read once per data version: (version, excluded versions)
     copies: tuple | None = None
+    # read once per data version: the visible professional documents' editions (``profiles``) and whether any exists
+    # (``_has_professional``), each as (data version, value); a professional version's sections, by (version id, data
+    # version) (``sections_in``)
+    profile_memo: tuple | None = None
+    professional_memo: tuple | None = None
+    section_cache: dict[tuple, tuple] = field(default_factory=dict)
     inspections: int = 0  # vision model calls ``inspect`` made in the turn (capped by ``chat_max_inspections``)
     # the turn's reading deadline (``time.monotonic()``; None outside a turn): a vision call of ``inspect`` is cut to
     # it, and none starts with less than ``chat_inspect_reserve_seconds`` left
@@ -1101,19 +1108,19 @@ POOL_KINDS = {PROFESSIONAL_POOL: (source_kinds.STANDARD, source_kinds.PROFESSION
 PRIMARY, EXAMPLE, METHOD = "primary", "example", "method"
 # the role of each pool the intent allows (``Workspace.pools``); `document` reads the named documents of either pool
 INTENT_POOLS = {
-    "professional": {PROFESSIONAL_POOL: PRIMARY, APPRAISAL_POOL: EXAMPLE},
+    PROFESSIONAL: {PROFESSIONAL_POOL: PRIMARY, APPRAISAL_POOL: EXAMPLE},
     "property": {APPRAISAL_POOL: PRIMARY, PROFESSIONAL_POOL: METHOD},
     "document": {APPRAISAL_POOL: PRIMARY, PROFESSIONAL_POOL: PRIMARY},
-    "mixed": {APPRAISAL_POOL: PRIMARY, PROFESSIONAL_POOL: PRIMARY},
+    MIXED: {APPRAISAL_POOL: PRIMARY, PROFESSIONAL_POOL: PRIMARY},
     "unknown": {PROFESSIONAL_POOL: PRIMARY, APPRAISAL_POOL: EXAMPLE},
     "set": {APPRAISAL_POOL: PRIMARY},
 }
 # the pools a search reads when the call names none, in the order its hits come
 DEFAULT_POOLS = {
-    "professional": (PROFESSIONAL_POOL, APPRAISAL_POOL),
+    PROFESSIONAL: (PROFESSIONAL_POOL, APPRAISAL_POOL),
     "property": (APPRAISAL_POOL,),
     "document": (APPRAISAL_POOL, PROFESSIONAL_POOL),
-    "mixed": (APPRAISAL_POOL, PROFESSIONAL_POOL),
+    MIXED: (APPRAISAL_POOL, PROFESSIONAL_POOL),
     "unknown": (PROFESSIONAL_POOL, APPRAISAL_POOL),
     "set": (APPRAISAL_POOL,),
 }
@@ -1141,23 +1148,40 @@ UNKNOWN = "לא ידוע"
 RELATIONS = {"clarifies": "מבהיר", "amends": "מתקן", "replaces": "מחליף", "appendix_of": "נספח של"}
 
 
-def _has_professional(conn: Connection) -> bool:
-    """Whether the user may see a ready professional document at all."""
-    return bool(conn.execute(text(
-        "SELECT EXISTS (SELECT 1 FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
-        " AND v.status IN ('ready', 'needs_review') WHERE d.deleted_at IS NULL AND d.source_kind <> :a)"),
-        {"a": source_kinds.APPRAISAL}).scalar_one())
+def _has_professional(ws: Workspace, conn: Connection) -> bool:
+    """Whether the user may see a ready professional document at all, read once per data version."""
+    version = current_data_version(conn)
+    if ws.professional_memo is None or ws.professional_memo[0] != version:
+        ws.professional_memo = (version, bool(conn.execute(text(
+            "SELECT EXISTS (SELECT 1 FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
+            f" AND v.status IN ('ready', 'needs_review') WHERE d.deleted_at IS NULL AND {PROFESSIONALS_SQL})"
+        )).scalar_one()))
+    return ws.professional_memo[1]
 
 
 def profiles(ws: Workspace, conn: Connection) -> tuple[list, int]:
     """The visible professional documents' editions (``profile.visible_editions``), after the profiles that were not
-    derived yet are — once per turn, for documents ingested before profiles existed (``ingest`` derives them)."""
-    loaded = profile.visible_editions(conn)
-    if loaded[1] and not ws.profiled:
-        ws.profiled = True
-        profile.ensure_all(ws.ctx)
+    derived yet are — once per turn, for documents ingested before profiles existed (``ingest`` derives them). Read
+    once per data version."""
+    version = current_data_version(conn)
+    if ws.profile_memo is None or ws.profile_memo[0] != version:
         loaded = profile.visible_editions(conn)
-    return loaded
+        if loaded[1] and not ws.profiled:
+            ws.profiled = True
+            profile.ensure_all(ws.ctx)
+            loaded = profile.visible_editions(conn)
+        ws.profile_memo = (version, loaded)
+    return ws.profile_memo[1]
+
+
+def sections_in(ws: Workspace, conn: Connection, version_id) -> tuple[sections.Section, ...]:
+    """The sections of a version (``sections.sections_of``: derived on first use), loaded once per version and data
+    version in the turn."""
+    key = (str(version_id), current_data_version(conn))
+    found = ws.section_cache.get(key)
+    if found is None:
+        found = ws.section_cache[key] = sections.sections_of(conn, version_id)
+    return found
 
 
 def copies_left_out(ws: Workspace, conn: Connection) -> tuple:
@@ -1190,15 +1214,18 @@ def _base_identity(ws: Workspace, conn: Connection, version_id) -> tuple[str, di
     return found or None
 
 
-def standard_for(ws: Workspace, conn: Connection, version_id, block_index: int | None) -> tuple[str, dict] | None:
+def standard_for(ws: Workspace, conn: Connection, version_id, block_index: int | None,
+                 secs: tuple[sections.Section, ...] | None = None) -> tuple[str, dict] | None:
     """The identity of a passage of a professional version at ``block_index``: its source kind and ``{number, title,
     edition, effective, section, section_title}`` — what the document states about itself and the section the block is
-    in. None for an appraisal."""
+    in. None for an appraisal. ``secs``: the version's sections when the caller holds them (``sections_in``)."""
     base = _base_identity(ws, conn, version_id)
     if base is None:
         return None
     kind, std = base
-    sec = sections.section_of(conn, version_id, block_index) if block_index is not None else None
+    sec = None
+    if block_index is not None:
+        sec = sections.innermost(sections_in(ws, conn, version_id) if secs is None else secs, block_index)
     return kind, std | ({"section": sec.label, "section_title": sec.title} if sec is not None else {})
 
 
@@ -1298,12 +1325,13 @@ def section_rules(secs: tuple, first: int | None, last: int | None) -> dict | No
     return {"limits": ordered[:RULES_LIMITS], "modality": modality, "more": max(0, len(ordered) - RULES_LIMITS)}
 
 
-def _rules_of_part(conn: Connection, version_id, part: reader.Part) -> dict | None:
+def _rules_of_part(ws: Workspace, conn: Connection, version_id, part: reader.Part,
+                   secs: tuple[sections.Section, ...] | None = None) -> dict | None:
     """``section_rules`` of the blocks of a part read from a professional version."""
     if not part.items:
         return None
     indexes = [r.block_index for r, _, _ in part.items]
-    return section_rules(sections.sections_of(conn, version_id), min(indexes), max(indexes))
+    return section_rules(sections_in(ws, conn, version_id) if secs is None else secs, min(indexes), max(indexes))
 
 
 def _identified(s: Source, cx) -> str | None:
@@ -1326,11 +1354,11 @@ def _label_of(s: Source, cx, pool: str, role: str, intent: str) -> str | None:
     a property is an example of a property's choice only when the passage belongs to an identified property; otherwise it
     is named by its stored kind and nothing more."""
     if pool == PROFESSIONAL_POOL:
-        return LABEL_METHOD if role == METHOD else LABEL_PROFESSIONAL if intent in ("mixed", "unknown") else None
+        return LABEL_METHOD if role == METHOD else LABEL_PROFESSIONAL if intent in (MIXED, "unknown") else None
     if role == EXAMPLE:
         who = _identified(s, cx)
         return f"{LABEL_EXAMPLE}: {who}" if who else LABEL_APPRAISAL_KIND
-    return LABEL_APPRAISAL_DATA if intent == "mixed" else None
+    return LABEL_APPRAISAL_DATA if intent == MIXED else None
 
 
 @dataclass
@@ -1346,7 +1374,7 @@ def _plan(ws: Workspace, conn: Connection, pool: str | None, limit: int) -> tupl
     an office that holds no standard is the appraisal search it always was: appraisals alone, in no role."""
     allowed, notes = ws.pools, []
     default = DEFAULT_POOLS.get(ws.intent, DEFAULT_POOLS["unknown"])
-    if ws.intent == "unknown" and not _has_professional(conn):
+    if ws.intent == "unknown" and not _has_professional(ws, conn):
         allowed, default = {APPRAISAL_POOL: PRIMARY, PROFESSIONAL_POOL: allowed[PROFESSIONAL_POOL]}, (APPRAISAL_POOL,)
     named = pool not in (None, "") and pool in allowed
     if pool not in (None, "") and not named:
@@ -1556,8 +1584,8 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
             hits = []
             absent = False
             for p in passes:
-                if p.pool == PROFESSIONAL_POOL and (ws.intent in ("professional", "mixed") or asked) \
-                        and not _has_professional(conn):
+                if p.pool == PROFESSIONAL_POOL and (ws.intent in (PROFESSIONAL, MIXED) or asked) \
+                        and not _has_professional(ws, conn):
                     ws.standards_absent = absent = True  # the office holds none: a stated gap, not a failed search (KTD15)
                     notes.append(MSG_NO_STANDARD_POOL)
                     if not any(q.pool == APPRAISAL_POOL for q in passes) and APPRAISAL_POOL in ws.pools:
@@ -1645,8 +1673,8 @@ def _professional_hit(ws: Workspace, conn: Connection, h: dict, bs, be, sizes: d
     call that reads the whole section. A document that states nothing is named by its own title."""
     vid = h["version_id"]
     kind, std = standard_for(ws, conn, vid, bs)
-    secs = sections.sections_of(conn, vid)
-    sec = sections.section_of(conn, vid, bs) if bs is not None else None
+    secs = sections_in(ws, conn, vid)
+    sec = sections.innermost(secs, bs) if bs is not None else None
     body = _with_size(sizes.get((vid, h.get("table_index"))), _clip(h["text"], get_settings().chat_passage_chars))
     notes = []
     if sec is not None:
@@ -1973,16 +2001,20 @@ def _emit(ws: Workspace, v: reader.Version, target: tuple, pos, part: reader.Par
         head.append("עמודים שלא נקראו בעיבוד המסמך: " + ", ".join(str(p) for p in unread_pages))
     indexes = [r.block_index for r, _, _ in part.items]
     pages = sorted({r.page for r, _, _ in part.items if r.page})
-    identity = {} if standard is None else {
-        "title": standard_title(standard[1], v.title), "source_kind": standard[0], "standard": standard[1],
-        "section": section_string(standard[1]), "location": standard_location(standard[1], pages), "rules": rules}
-    s = ws.add_source(**{"document_id": v.document_id, "version_id": v.version_id, "title": v.title,
-                         "section": section, "location": location or _pages_label(pages), "kind": "context",
-                         "text": "\n".join(content), "block_start": min(indexes), "block_end": max(indexes),
-                         "page_list": pages or None, "partial_document": v.partial, "reading_id": v.reading_id,
-                         "status": status, "clipped": clipped, "unread_regions": regions, "more": more,
-                         "resume": _target_json(target, part.next), "body": "\n".join(head + lines + body),
-                         "tags": {"document": ws.doc_handle(v.document_id)}} | identity)
+    if standard is None:  # an appraisal (or any document that states no identity) is named as it always was
+        title, shown_section, shown_location = v.title, section, location or _pages_label(pages)
+        source_kind, identity, source_rules = source_kinds.APPRAISAL, None, None
+    else:
+        title, shown_section = standard_title(standard[1], v.title), section_string(standard[1])
+        shown_location = standard_location(standard[1], pages)
+        source_kind, identity, source_rules = standard[0], standard[1], rules
+    s = ws.add_source(document_id=v.document_id, version_id=v.version_id, title=title, section=shown_section,
+                      location=shown_location, kind="context", text="\n".join(content), block_start=min(indexes),
+                      block_end=max(indexes), page_list=pages or None, partial_document=v.partial,
+                      reading_id=v.reading_id, status=status, clipped=clipped, unread_regions=regions, more=more,
+                      resume=_target_json(target, part.next), body="\n".join(head + lines + body),
+                      tags={"document": ws.doc_handle(v.document_id)}, source_kind=source_kind, standard=identity,
+                      rules=source_rules)
     if cx is not None:
         _mark(s, cx, cx.spanned(min(indexes), max(indexes)) if cx.multi else [], ws)
     if cx is not None and cx.multi:
@@ -2067,7 +2099,7 @@ def _read_window_once(ws: Workspace, conn: Connection, v: reader.Version, target
     std = standard_for(ws, conn, vid, part.items[0][0].block_index)
     s = _emit(ws, v, target, pos, part, name=name, scope=target[0], location=location, section=section,
               lines=lines, read=True, unread_pages=unread_pages if pos is None else None, cx=cx, within=within,
-              standard=std, rules=_rules_of_part(conn, vid, part) if std else None)
+              standard=std, rules=_rules_of_part(ws, conn, vid, part) if std else None)
     if target[0] == "pages":  # a section opened by name is its own opening
         _whole_sections(ws, conn, v, cx, part, s)
     return s
@@ -2087,10 +2119,11 @@ def _read_professional_section(ws: Workspace, conn: Connection, v: reader.Versio
     names (a handle), or that it names a section the document does not hold, or a standard that no visible document
     carries (a gap, never filled in)."""
     vid = v.version_id
-    st = sections.section_text(conn, vid, int(target[2]))
+    secs = sections_in(ws, conn, vid)
+    st = sections.section_text(conn, vid, int(target[2]), secs=secs, structure_only=True)  # its blocks are read below
     if st is None:
         raise ToolError(MSG_SECTION_GONE)
-    sec, secs = st.section, sections.sections_of(conn, vid)
+    sec = st.section
     by_no = {x.section_no: x for x in secs}
 
     def handle(x: sections.Section) -> str:
@@ -2112,9 +2145,11 @@ def _read_professional_section(ws: Workspace, conn: Connection, v: reader.Versio
                      + (f" ועוד {len(children) - SUBSECTIONS_LISTED}" if len(children) > SUBSECTIONS_LISTED else ""))
     if pos is None:  # the references of the whole section, once, at its head
         lines += _reference_lines(ws, conn, st, by_no, handle)
-    rows = reader.blocks_between(conn, vid, sec.block_first, sec.block_last, limit=None)
+    # ``take`` starts at ``pos``: the blocks before it are not loaded (as for the appraisal windows)
+    rows = reader.blocks_between(conn, vid, max(sec.block_first, pos[0]) if pos else sec.block_first, sec.block_last,
+                                 limit=None)
     part = reader.take(rows, pos, read_chars(), ws.sent.get(str(vid), {}))
-    std = standard_for(ws, conn, vid, part.items[0][0].block_index if part.items else sec.block_first)
+    std = standard_for(ws, conn, vid, part.items[0][0].block_index if part.items else sec.block_first, secs)
     name = called(sec)
     return _emit(ws, v, target, pos, part, name=name, scope="section", location="", section=name, lines=lines,
                  read=True, standard=std, rules=section_rules(secs, sec.block_first, sec.block_last) if std else None)
@@ -2124,7 +2159,7 @@ def _reference_lines(ws: Workspace, conn: Connection, st, by_no: dict, handle) -
     """What each reference of a section names (R23): a section of this document (its handle), a section it does not hold,
     or a standard — held by a visible document (which), or not in the repository."""
     out, seen = [], set()
-    loaded = None
+    loaded = keyed = None
     for r in st.refs:
         ref = f"«{_txt(r['text'])}»"
         if ref in seen:
@@ -2136,8 +2171,10 @@ def _reference_lines(ws: Workspace, conn: Connection, st, by_no: dict, handle) -
         elif r["status"] == "unresolved":
             out.append("הפניה " + MSG_REF_UNRESOLVED.format(ref=ref))
         else:
-            loaded = loaded or profiles(ws, conn)
-            group = profile.group_of(loaded, r["standard"])
+            if loaded is None:
+                loaded = profiles(ws, conn)
+                keyed = profile.by_key(loaded[0])
+            group = profile.group_of(loaded, r["standard"], keyed)
             if group.editions:
                 held = "; ".join(f"{ws.doc_handle(e.document_id)} document_id={e.document_id} «{_txt(e.title)}»"
                                  + (f" ({_txt(e.edition)})" if e.edition else "") for e in group.editions)
@@ -2363,7 +2400,7 @@ def _read_source(ws: Workspace, conn: Connection, sid: str) -> Source:
     s = _emit(ws, v, ("neighbors", vid, start, end), None, part, name=section or "", scope="neighbors",
               location=_location(section, "text", pages, None, None, (None, None), None), section=section,
               lines=lines, read=False, more=_section_handle(ws, v, path, window(path)) if cut and path else None,
-              cut=cut, cx=cx, standard=std, rules=_rules_of_part(conn, v.version_id, part) if std else None)
+              cut=cut, cx=cx, standard=std, rules=_rules_of_part(ws, conn, v.version_id, part) if std else None)
     _whole_sections(ws, conn, v, cx, part, s)
     return s
 
@@ -2600,11 +2637,12 @@ def tool_find_standards(ws: Workspace, query: str | None = None, page: int | Non
 
             shown = [e for e in shown if all(w in haystack(e) for w in words)]
         head_loaded = ([ed for ed in loaded[0] if heads[ed.version_id].version_id == ed.version_id], loaded[1])
+        head_keyed, keyed = profile.by_key(head_loaded[0]), profile.by_key(loaded[0])  # built once for every group, link
         groups = {}
         for e in shown:
             ed = by_version.get(e.version_id)
             if ed is not None and ed.key and ed.key not in groups:
-                groups[ed.key] = profile.group_of(head_loaded, ed.key)
+                groups[ed.key] = profile.group_of(head_loaded, ed.key, head_keyed)
         # by number, the editions of one number oldest first when their order is known; documents with no number last
         place = {x.version_id: (n, k) for n, g in enumerate(sorted(groups.values(), key=lambda g: g.number or ""))
                  for k, x in enumerate(g.editions)}
@@ -2627,7 +2665,7 @@ def tool_find_standards(ws: Workspace, query: str | None = None, page: int | Non
                       f"בתוקף מ: {_stated(ed.effective_text if ed else None)}",
                       f"גוף מפרסם: {_stated(ed.issuer if ed else None)}", f"תחולה: {_stated(ed.scope if ed else None)}"]
             if ed is not None and ed.amends is not None:
-                link = profile.linked(loaded, ed).amends
+                link = profile.linked(loaded, ed, keyed).amends
                 held = (f"במאגר: {names[link['link']['version_id']]}" if link.get("link") else
                         "כמה מהדורות במאגר — לא נקשר לאחת" if link.get("ambiguous") else "התקן אינו במאגר")
                 fields.append(f"{RELATIONS.get(link['relation'], link['relation'])} תקן {_txt(link['standard'])} ({held})")
@@ -2638,8 +2676,9 @@ def tool_find_standards(ws: Workspace, query: str | None = None, page: int | Non
                 lines.append(f'  - {names[c.version_id]} document_id={c.document_id} | "{_txt(c.title)}" — אותו נוסח '
                              f'כמו {names[e.version_id]} «{_txt(e.title)}»')
                 listed.append((c.document_id, c.title))
+        on_page = {e.version_id for e in page_rows}
         for g in groups.values():
-            if any(e.version_id in {x.version_id for x in g.editions} for e in page_rows):
+            if any(x.version_id in on_page for x in g.editions):
                 lines += _edition_lines(ws, g, names)
     return _listing(ws, "תקנים ומסמכים מקצועיים", lines, listed, key=("find_standards", " ".join(words)),
                     criterion="תקנים ומסמכים מקצועיים שהמשתמש מורשה לראות", total=total, page=page, pages=pages)

@@ -420,7 +420,7 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
     said = " ".join(quotes[n] for n in ("subject", "documents") if n in quotes)  # the model's words for a new entity
     settled = intent_mod.settle(resolved.intent, message, vocabulary, scope=resolved.scope, has_property=bool(focus),
                                 quoted=said, items=items or (), topic=topic)
-    professional = settled.value == "professional"
+    professional = settled.professional
     decisions["intent"] = settled.value
     if settled.reasons:
         decisions["intent_why"] = "; ".join(settled.reasons)
@@ -506,7 +506,7 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
     names_other = bool([e for e in settled.evidence if not (focus and e.held_by(own_names))]) or bool(
         said and intent_mod.evidence(said, vocabulary, quoted=True))
     reinstate = (bool(focus) and new_question and resolved.scope != "set" and not names_other
-                 and (settled.value == "mixed" or (settled.value == "property" and settled.bound == "property")))
+                 and (settled.value == intent_mod.MIXED or (settled.value == "property" and settled.bound == "property")))
     keep_focus = bool(focus) and (not new_question or reinstate) and resolved.scope != "set" and not professional
     seen = authorized(focus_ids) if keep_focus and focus_ids else set()
     out.document_ids = [d for d in focus_ids if d in seen]
@@ -657,9 +657,7 @@ def _bind_references(out: Request, resolved: ResolvedRequest, settled: intent_mo
                 out.standalone_question = f"{out.standalone_question.rstrip('?. ')} — הכוונה ל«{settled.item_label}»"
                 decisions["item"] += "; the standalone question now names it"
         else:
-            why = next((r.removeprefix("prior_answer_item rejected: ") for r in settled.reasons
-                        if r.startswith("prior_answer_item rejected")), "")
-            decisions["item"] = "rejected: " + why
+            decisions["item"] = "rejected: " + settled.item_rejected
     if settled.bound == "item":
         out.topic = settled.item_label
     elif settled.bound == "topic":
@@ -816,7 +814,7 @@ def reply_binds(request: Request | None, message: str) -> bool:
     unit. A new question that holds one number ("ומה היה השווי ב-2024?") is no answer."""
     if number_only_reply(message):
         return True
-    return request is not None and request.relation == "clarification_answer" and request.intent.value != "professional"
+    return request is not None and request.relation == "clarification_answer" and not request.intent.professional
 
 
 def pending_block(binding: dict) -> str:
@@ -862,7 +860,7 @@ def requested_block(req: Request, unit_handle: str | None = None) -> str:
                      + (" — היחידה שהשיחה כבר עוסקת בה; שינוי מדד או חישוב אינו מעביר שומה" if req.unit_kept else "")
                      + f". חפש וקרא בתוכה בלבד (search ו-outline עם unit={unit_handle}, read עם pages ו-document="
                        f"{unit_handle}); ערך משומה אחרת בקובץ אינו של הנכס שנשאל")
-    professional = req.intent.value == "professional"
+    professional = req.intent.professional
     if professional:
         lines.append(PROFESSIONAL_NOTE)
     if req.intent.bound == "item":

@@ -29,6 +29,10 @@ export const SOURCE_KIND_LABEL: Record<SourceKind, string> = {
   professional: "מסמך מקצועי",
 };
 
+/** The kinds a document can have, in the order they are offered; the first is the default (R16, KD6). */
+export const SOURCE_KINDS: SourceKind[] = ["appraisal", "standard", "professional"];
+export const DEFAULT_KIND: SourceKind = SOURCE_KINDS[0];
+
 /** "סעיף 2.1", "נספח א'" or "סעיף «הגדרות»": where in the document, in the words a reader cites it (as the server
  * words a standard's location). */
 export function standardSection(std: Pick<ChatStandard, "section" | "section_title">): string | null {

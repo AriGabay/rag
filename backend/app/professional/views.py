@@ -13,7 +13,7 @@ from typing import Literal
 
 from sqlalchemy import Connection, text
 
-from app.platform.source_kinds import APPRAISAL
+from app.platform.source_kinds import PROFESSIONALS_SQL
 from app.professional import catalog, profile, sections
 
 State = Literal["pending", "ready", "failed"]
@@ -24,7 +24,7 @@ _SQL = (
     " JOIN document_versions v ON v.document_id = d.id AND v.is_current"
     " LEFT JOIN standard_profiles p ON p.version_id = v.id AND p.reading_id = COALESCE(v.ingestion->>'reading_id', '')"
     f" AND p.profile_version = '{profile.PROFILE_VERSION}'"
-    f" WHERE d.id = ANY(:ids) AND d.deleted_at IS NULL AND d.source_kind <> '{APPRAISAL}'")
+    f" WHERE d.id = ANY(:ids) AND d.deleted_at IS NULL AND {PROFESSIONALS_SQL}")
 
 
 def field_summary(field: dict | None) -> dict:
@@ -56,7 +56,7 @@ def summaries(conn: Connection, document_ids: list) -> dict[str, dict]:
     among ``document_ids`` (appraisals and documents the caller may not see have no entry)."""
     if not document_ids:
         return {}
-    rows = conn.execute(text(_SQL), {"ids": [d for d in document_ids]}).all()
+    rows = conn.execute(text(_SQL), {"ids": list(document_ids)}).all()
     if not rows:
         return {}
     found = catalog.entries(conn, derive=False)
@@ -65,6 +65,7 @@ def summaries(conn: Connection, document_ids: list) -> dict[str, dict]:
     head_loaded = ([e for e in loaded[0] if e.version_id not in heads or heads[e.version_id].version_id == e.version_id],
                    loaded[1])
     by_version = {e.version_id: e for e in found}
+    keyed = profile.by_key(head_loaded[0])  # every row's group is read from the same editions
     out: dict[str, dict] = {}
     for r in rows:
         ing = r.ingestion or {}
@@ -72,7 +73,7 @@ def summaries(conn: Connection, document_ids: list) -> dict[str, dict]:
         own = by_version.get(r.version_id)
         head = heads.get(r.version_id)
         key = profile.normalize_number((fields.get("number") or {}).get("value")) if fields else None
-        group = profile.group_of(head_loaded, key) if key else None
+        group = profile.group_of(head_loaded, key, keyed) if key else None
         out[str(r.document_id)] = {
             "state": derivation_state(ing, r.fields is not None),
             "profile": {name: field_summary(fields.get(name)) for name in SUMMARY_FIELDS} if r.fields is not None else None,

@@ -35,7 +35,14 @@ from app.extraction.render import (  # noqa: F401 - the view's scales
     render_png,
 )
 from app.platform.jobs import enqueue_positions, enqueue_processing, positions_job_key, retriable_failure
-from app.platform.source_kinds import APPRAISAL, MSG_BAD_KIND, PROFESSIONAL, SOURCE_KINDS, STANDARD
+from app.platform.source_kinds import (
+    APPRAISAL,
+    MSG_BAD_KIND,
+    PROFESSIONAL,
+    STANDARD,
+    is_valid,
+    source_kind_of,
+)
 from app.platform.storage import get_storage, purge_staging, storage_key
 from app.professional import views
 
@@ -164,7 +171,7 @@ def _store_one(ctx: TenantContext, filename: str, data: bytes, group_id: UUID, d
              "u": ctx.user_id, "c": clone_from},
         ).scalar_one()
         enqueue_processing(conn, version_id)
-        kind = conn.execute(text("SELECT source_kind FROM documents WHERE id = :d"), {"d": document_id}).scalar_one()
+        kind = source_kind_of(conn, document_id)
         audit(conn, "upload", ctx.user_id, "document_version", version_id, document_id=document_id,
               version_no=version_no, size=len(data), source_kind=kind)
     return result | {"status": "accepted", "document_id": str(document_id), "version_id": str(version_id)}
@@ -182,7 +189,7 @@ def upload(
     if not ctx.can_upload:
         raise HTTPException(status.HTTP_403_FORBIDDEN, FORBIDDEN)
     kind = (source_kind or "").strip() or APPRAISAL  # none or empty: the default; the kind is never read from a name
-    if kind not in SOURCE_KINDS:
+    if not is_valid(kind):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, MSG_BAD_KIND)
     if len(files) > settings.max_batch_files:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, MSG_BATCH.format(n=settings.max_batch_files))
@@ -431,8 +438,7 @@ def change_kind(document_id: str, body: KindBody, ctx: TenantContext = Depends(r
 
     doc_uuid = parse_uuid(document_id)
     with tenant_tx(ctx) as conn:  # the admin's own view decides whether the document exists for them (404 otherwise)
-        if conn.execute(text("SELECT 1 FROM documents WHERE id = :d AND deleted_at IS NULL"),
-                        {"d": doc_uuid}).first() is None:
+        if not _visible_document(conn, doc_uuid):
             raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
     converting = body.source_kind == APPRAISAL
     cloud = converting and pipeline.vision_reader(ctx) is not None  # read outside the transaction

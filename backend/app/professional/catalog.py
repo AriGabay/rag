@@ -18,7 +18,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
-from app.platform.source_kinds import APPRAISAL
+from app.platform.source_kinds import PROFESSIONALS_SQL
 from app.professional import sections
 from app.professional.profile import PROFILE_VERSION
 
@@ -28,7 +28,7 @@ _SQL = (
     " JOIN document_versions v ON v.document_id = d.id AND v.is_current AND v.status IN ('ready', 'needs_review')"
     " LEFT JOIN standard_profiles p ON p.version_id = v.id AND p.reading_id = COALESCE(v.ingestion->>'reading_id', '')"
     f" AND p.profile_version = '{PROFILE_VERSION}'"
-    f" WHERE d.deleted_at IS NULL AND d.source_kind <> '{APPRAISAL}' ORDER BY v.created_at, v.id")
+    f" WHERE d.deleted_at IS NULL AND {PROFESSIONALS_SQL} ORDER BY v.created_at, v.id")
 
 
 @dataclass(frozen=True)

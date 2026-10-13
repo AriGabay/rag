@@ -67,7 +67,7 @@ from app.db import TenantContext, tenant_tx
 from app.extraction.chunking import heading_label, is_footer
 from app.extraction.hebrew import strip_bidi_controls
 from app.extraction.normalize_text import base_normalize
-from app.platform.source_kinds import APPRAISAL
+from app.platform.source_kinds import PROFESSIONALS_SQL
 
 logger = logging.getLogger(__name__)
 
@@ -438,7 +438,7 @@ def version_of(conn: Connection, version_id: UUID | str) -> Version | None:
     appraisal, a version that does not exist or one the caller may not see."""
     row = conn.execute(text(
         "SELECT v.document_id, v.ingestion FROM document_versions v JOIN documents d ON d.id = v.document_id"
-        " WHERE v.id = :v AND d.source_kind <> :a"), {"v": UUID(str(version_id)), "a": APPRAISAL}).first()
+        f" WHERE v.id = :v AND {PROFESSIONALS_SQL}"), {"v": UUID(str(version_id))}).first()
     if row is None:
         return None
     ing = row.ingestion or {}
@@ -497,20 +497,22 @@ def _write(conn: Connection, version_id: UUID | str, version: Version, sections:
 # in ``ensure_in`` makes a second writer wait for the first and find its rows
 _MEMO_MAX = 64
 _MEMO: OrderedDict[tuple[str, str, str], tuple[tuple[Section, ...], str]] = OrderedDict()
-_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+_LOCKS: dict[tuple[str, str, str], threading.Lock] = {}
 _GUARD = threading.Lock()
 
 
-def _flight(version_id: str, reading_id: str) -> threading.Lock:
+def flight(kind: str, version_id: str, reading_id: str) -> threading.Lock:
+    """The lock of one build (``kind``: "sections", "profile", "units"…) of one version and reading in this process: a
+    second caller of the same build waits for the first. Builds of different kinds never share a lock."""
     with _GUARD:
-        return _LOCKS.setdefault((version_id, reading_id), threading.Lock())
+        return _LOCKS.setdefault((kind, version_id, reading_id), threading.Lock())
 
 
-def _landed(version_id: str, reading_id: str, lock: threading.Lock) -> None:
+def landed(kind: str, version_id: str, reading_id: str, lock: threading.Lock) -> None:
     """Forget a build's lock once it is done, so ``_LOCKS`` holds only the builds in flight."""
     with _GUARD:
-        if _LOCKS.get((version_id, reading_id)) is lock:
-            del _LOCKS[(version_id, reading_id)]
+        if _LOCKS.get((kind, version_id, reading_id)) is lock:
+            del _LOCKS[(kind, version_id, reading_id)]
 
 
 def ensure_in(conn: Connection, version_id: UUID | str) -> tuple[Section, ...]:
@@ -525,7 +527,7 @@ def ensure_in(conn: Connection, version_id: UUID | str) -> tuple[Section, ...]:
     if found is not None:
         return found
     vid = str(version_id)
-    lock = _flight(vid, version.reading_id)
+    lock = flight("sections", vid, version.reading_id)
     try:
         with lock:
             found = stored(conn, version_id, version_of(conn, version_id))
@@ -553,7 +555,7 @@ def ensure_in(conn: Connection, version_id: UUID | str) -> tuple[Section, ...]:
                 logger.info("sections of version %s not stored", vid, exc_info=True)
             return sections
     finally:
-        _landed(vid, version.reading_id, lock)
+        landed("sections", vid, version.reading_id, lock)
 
 
 def ensure(ctx: TenantContext, version_id: UUID | str) -> tuple[Section, ...]:
@@ -572,7 +574,13 @@ def sections_of(conn: Connection, version_id: UUID | str) -> tuple[Section, ...]
 
 def section_of(conn: Connection, version_id: UUID | str, block_index: int) -> Section | None:
     """The innermost section holding a block (the one a search hit in that block belongs to), or None."""
-    holding = [s for s in ensure_in(conn, version_id) if s.block_first <= block_index <= s.block_last]
+    return innermost(ensure_in(conn, version_id), block_index)
+
+
+def innermost(secs: Iterable[Section], block_index: int) -> Section | None:
+    """The innermost of ``secs`` holding a block (the deepest, the later of equals), or None; pure, for a caller that
+    already holds the version's sections."""
+    holding = [s for s in secs if s.block_first <= block_index <= s.block_last]
     return max(holding, key=lambda s: (s.depth, s.section_no), default=None)
 
 
@@ -602,17 +610,20 @@ def _find(sections: tuple[Section, ...], ref: int | str) -> Section | None:
     return next((s for s in sections if s.label == label), None)
 
 
-def section_text(conn: Connection, version_id: UUID | str, ref: int | str) -> SectionText | None:
+def section_text(conn: Connection, version_id: UUID | str, ref: int | str, *, secs: tuple[Section, ...] | None = None,
+                 structure_only: bool = False) -> SectionText | None:
     """The section named by its number or label ("2.1", "נספח א'") with its subsections, limits and references; None
-    when the version has no such section."""
-    sections = ensure_in(conn, version_id)
+    when the version has no such section. ``secs``: the version's sections when the caller already holds them.
+    ``structure_only``: the section, its subsections and its references without its blocks (``blocks`` empty, ``text``
+    ""), for a caller that reads the blocks itself."""
+    sections = ensure_in(conn, version_id) if secs is None else secs
     section = _find(sections, ref)
     if section is None:
         return None
     inside = tuple(s for s in sections if s.section_no != section.section_no
                    and section.block_first <= s.block_first and s.block_last <= section.block_last
                    and s.depth > section.depth)
-    blocks = tuple((r.block_index, r.kind, r.page, r.text) for r in conn.execute(text(
+    blocks = () if structure_only else tuple((r.block_index, r.kind, r.page, r.text) for r in conn.execute(text(
         "SELECT block_index, kind, page, text FROM document_blocks WHERE version_id = :v AND block_index BETWEEN :a"
         " AND :b ORDER BY block_index"), {"v": UUID(str(version_id)), "a": section.block_first,
                                           "b": section.block_last}) if (r.text or "").strip())

@@ -71,6 +71,7 @@ from app.chat import contexts
 from app.extraction import hebrew
 from app.extraction.normalize_text import base_normalize
 from app.platform.source_kinds import APPRAISALS_SQL
+from app.professional.sections import flight, landed
 
 logger = logging.getLogger(__name__)
 
@@ -881,21 +882,7 @@ def rebuild_if_stale(conn: Connection, version_id: UUID | str) -> bool:
 # key and ``ON CONFLICT DO NOTHING`` make a second write harmless
 _MEMO_MAX = 64
 _MEMO: OrderedDict[tuple[str, str, str], tuple[Unit, ...]] = OrderedDict()
-_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 _GUARD = threading.Lock()
-
-
-def _flight(version_id: str, reading_id: str) -> threading.Lock:
-    with _GUARD:
-        return _LOCKS.setdefault((version_id, reading_id), threading.Lock())
-
-
-def _landed(version_id: str, reading_id: str, lock: threading.Lock) -> None:
-    """Forget a build's lock once it is done, so ``_LOCKS`` holds only the builds in flight (a caller that arrives
-    later finds the units stored, or in ``_MEMO``)."""
-    with _GUARD:
-        if _LOCKS.get((version_id, reading_id)) is lock:
-            del _LOCKS[(version_id, reading_id)]
 
 
 def ensure(conn: Connection, version_id: UUID | str) -> tuple[Unit, ...]:
@@ -909,7 +896,7 @@ def ensure(conn: Connection, version_id: UUID | str) -> tuple[Unit, ...]:
     if found is not None:
         return found
     vid = str(version_id)
-    lock = _flight(vid, reading.reading_id)
+    lock = flight("units", vid, reading.reading_id)
     try:
         with lock:
             found = stored(conn, version_id, reading)
@@ -934,4 +921,4 @@ def ensure(conn: Connection, version_id: UUID | str) -> tuple[Unit, ...]:
                 logger.info("units of version %s not stored", vid, exc_info=True)
         return units
     finally:
-        _landed(vid, reading.reading_id, lock)
+        landed("units", vid, reading.reading_id, lock)

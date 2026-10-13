@@ -460,7 +460,7 @@ def among(candidates: list[dict], reply: str, authorized: set[str]) -> Outcome:
     if len(named) == 1:
         return Outcome("resolved", named, reply)
     if ordinal_reply(reply):  # "את השנייה", "לשלישית": an ordinal word with the prefix letters Hebrew puts before it
-        forms = {len(cands) if f == -1 else f for f in slots.ordinal_forms(reply)}
+        forms = slots.ordinal_numbers(reply, len(cands))
         if len(forms) == 1 and 1 <= (n := next(iter(forms))) <= len(cands):
             return Outcome("resolved", [cands[n - 1]], reply)
     vocab = {id(c): _candidate_words(c) for c in cands}

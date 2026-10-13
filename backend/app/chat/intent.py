@@ -42,14 +42,17 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
 from app.chat import contexts, entities, slots
+from app.chat.slots import MIXED, PROFESSIONAL
 from app.extraction.normalize_text import base_normalize
 from app.platform.search import _scope_terms
 
+# PROFESSIONAL and MIXED (the intents about the trade) are defined in ``slots``, which this module imports
 Value = Literal["professional", "property", "document", "mixed", "set", "unknown"]
 Reference = Literal["none", "conversation_property", "named_entity", "prior_answer_item", "topic", "clarification"]
 # the intents that refer to a property or a document: the only ones a lookup can run for, and then only on evidence
@@ -131,7 +134,8 @@ class Intent:
     invalid one); ``evidence``: the hard evidence the message holds; ``reasons``: why the value is not the claim.
     ``item`` and ``item_label``: the item of the previous answer's list the message names, once the server accepted it;
     ``bound``: what the reference bound to (``item``, ``topic``, ``property``) and "" when it bound to nothing;
-    ``no_list``: an ordinal was written and the previous answer gave no list."""
+    ``no_list``: an ordinal was written and the previous answer gave no list; ``item_rejected``: why the server did not
+    accept the ordinal the parse claimed ("" when it was accepted or none was claimed)."""
 
     value: str = "unknown"
     claimed: str = ""
@@ -144,6 +148,12 @@ class Intent:
     item_label: str = ""
     bound: str = ""
     no_list: bool = False
+    item_rejected: str = ""
+
+    @property
+    def professional(self) -> bool:
+        """Whether the request is a general question of the trade (no property in it; ``mixed`` is not)."""
+        return self.value == PROFESSIONAL
 
     @property
     def refers(self) -> bool:
@@ -187,7 +197,7 @@ def _parcels(text: str) -> list[Evidence]:
     return [Evidence("parcel", f"גוש {b} חלקה {p}", ("גוש", b, "חלקה", p))]
 
 
-def _addresses(text: str, vocabulary: set[str], any_word: bool = False) -> list[Evidence]:
+def _addresses(text: str, vocabulary: frozenset[str], any_word: bool = False) -> list[Evidence]:
     """Latin unit labels and addresses in the text left after the non-names were masked: a title word with the house
     number after it, a label of a letter and digits, a single Latin letter after a title word ("בניין B"). With
     ``any_word`` (the words the model quoted as the new subject) a word that is no title word counts too when the house
@@ -220,6 +230,33 @@ def _addresses(text: str, vocabulary: set[str], any_word: bool = False) -> list[
     return out
 
 
+@dataclass(frozen=True)
+class VocabularyIndex:
+    """What the evidence reads of a vocabulary, built once per vocabulary (``index_of``): ``title_words`` — every title's
+    tokens (``entities.title_tokens``); ``names`` — the complete names a message may state (a name key of two words or
+    more, or of one word that names one thing); ``partial_keys`` — the name keys of three words or more, whose parts a
+    message may share."""
+
+    title_words: frozenset[str]
+    names: tuple[str, ...]
+    partial_keys: tuple[str, ...]
+
+
+@lru_cache(maxsize=8)
+def _build_index(vocabulary: tuple[str, ...]) -> VocabularyIndex:
+    words: set[str] = set().union(*(entities.title_tokens(t) for t in vocabulary)) if vocabulary else set()
+    keys = list(dict.fromkeys(k for t in vocabulary if len(k := contexts.name_key(t)) >= 2))
+    names = tuple(k for k in keys if len(k.split()) > 1 or _names_one(k, keys))
+    partial = tuple(dict.fromkeys(k for t in vocabulary if len((k := contexts.name_key(t)).split()) > 2))
+    return VocabularyIndex(frozenset(words), names, partial)
+
+
+def index_of(vocabulary: list[str] | tuple[str, ...]) -> VocabularyIndex:
+    """The index of a vocabulary (every title the user may see), kept for the last few vocabularies: a turn settles its
+    intent from the same titles more than once."""
+    return _build_index(tuple(vocabulary))
+
+
 def _names_one(word: str, keys: list[str]) -> bool:
     """Whether a name of one word names one thing: every longer name that holds the word is a longer form of one name
     (a unit's title and its aliases: "נחל הדס", "פרויקט נחל הדס"), not the names of several documents that share it."""
@@ -228,11 +265,10 @@ def _names_one(word: str, keys: list[str]) -> bool:
     return all(f" {k} " in f" {longest} " for k in holders)
 
 
-def _complete_names(text: str, vocabulary: list[str]) -> list[Evidence]:
+def _complete_names(text: str, index: VocabularyIndex) -> list[Evidence]:
     """The complete document or unit names the text states as a phrase. A name of one word counts only when no other
     name holds that word; of two names where one lies inside the other's phrase, the longer one."""
-    keys = list(dict.fromkeys(k for t in vocabulary if len(k := contexts.name_key(t)) >= 2))
-    names = tuple(k for k in keys if len(k.split()) > 1 or _names_one(k, keys))
+    names = index.names
     if not names:
         return []
     norm = contexts.name_key(text)
@@ -246,12 +282,12 @@ def _complete_names(text: str, vocabulary: list[str]) -> list[Evidence]:
 PARTIAL_HOLDERS = 3  # the names a partial phrase may be part of and still refer to them
 
 
-def _partial_names(text: str, vocabulary: list[str], whole: list[Evidence]) -> list[Evidence]:
+def _partial_names(text: str, index: VocabularyIndex, whole: list[Evidence]) -> list[Evidence]:
     """The phrases of two words or more that the text shares with a name without stating all of it ("מתחם הגפן" of
     "מתחם הגפן א" and "מתחם הגפן ב"): a phrase that only names can hold, so the user refers to a named thing even when it
     fits several — which the lookup then asks about (round 9 AE4) — never one word, which titles share ("השומה"), and
     never a phrase of words of the trade alone. A phrase inside a complete name the text states is that name's."""
-    keys = list(dict.fromkeys(k for t in vocabulary if len((k := contexts.name_key(t)).split()) > 2))
+    keys = index.partial_keys
     norm = f" {contexts.name_key(text)} "
     phrases: dict[str, None] = {}
     for key in keys:
@@ -279,14 +315,14 @@ def evidence(message: str, vocabulary: list[str], quoted: bool = False) -> list[
     ``vocabulary``: every title the user may see, the names of units included. ``quoted``: the text is the words the
     model quoted as the user's new subject, not a whole message (see ``_addresses``)."""
     text = base_normalize(message or "")
-    words: set[str] = set().union(*(entities.title_tokens(t) for t in vocabulary)) if vocabulary else set()
+    index = index_of(vocabulary)
     out = _parcels(text)
     rest = _mask(text, _BLOCK, _PARCEL, _PROFESSIONAL_REF, _YEAR, _FLOOR, _DURATION, _NUMBER_WORD)
-    out += _addresses(rest, words, quoted)
-    names = _complete_names(text, vocabulary)
+    out += _addresses(rest, index.title_words, quoted)
+    names = _complete_names(text, index)
     # a part of a name is the weakest evidence: read only when nothing more specific (an address, a parcel, a label,
     # a complete name) is there
-    out += names or (_partial_names(text, vocabulary, names) if not out else [])
+    out += names or (_partial_names(text, index, names) if not out else [])
     seen: set[tuple[str, str]] = set()
     return [e for e in out if not ((e.kind, e.text) in seen or seen.add((e.kind, e.text)))]
 
@@ -318,8 +354,8 @@ def settle(claim: IntentClaim | None, message: str, vocabulary: list[str], scope
         value = "property" if found else "unknown"
         why.append("no valid intent part: " + ("the message holds evidence of a property" if found
                                             else "no evidence, no lookup"))
-    elif claimed == "professional" and found:
-        value = "mixed"
+    elif claimed == PROFESSIONAL and found:
+        value = MIXED
         why.append("professional claim, but the message names a property or a document")
     elif claimed in ("unknown", "set"):
         value = "property" if found else "unknown"
@@ -330,7 +366,7 @@ def settle(claim: IntentClaim | None, message: str, vocabulary: list[str], scope
         if claimed in LOOKUP_VALUES and not found:
             why.append("no hard evidence in the message: no lookup" + ("" if has_property else ", no property in the conversation"))
     reference = claim.reference if claim else "none"
-    item, label, bound, no_list = None, "", "", False
+    item, label, bound, no_list, item_rejected = None, "", "", False, ""
     if reference == "prior_answer_item":
         # an ordinal binds only to an item the previous answer printed, on the message's own words (KTD6)
         rejected = slots.check_item(claim.item, message, list(items))
@@ -338,7 +374,7 @@ def settle(claim: IntentClaim | None, message: str, vocabulary: list[str], scope
             item, label, bound = claim.item, items[claim.item - 1], "item"
             why.append(f"ordinal {item} bound to the previous answer's item «{label}»")
         else:
-            reference, no_list = "none", not items and bool(slots.ordinal_forms(message))
+            reference, no_list, item_rejected = "none", not items and bool(slots.ordinal_forms(message)), rejected
             why.append("prior_answer_item rejected: " + rejected)
     elif reference == "topic":
         bound = "topic" if topic else ""
@@ -351,4 +387,5 @@ def settle(claim: IntentClaim | None, message: str, vocabulary: list[str], scope
     return Intent(value=value, claimed=claimed, reference=reference, item=item,
                   topic=" ".join(claim.topic.split()) if claim else "",
                   standard_refs=tuple(r.model_dump() for r in claim.standard_refs) if claim else (),
-                  evidence=found, reasons=tuple(why), item_label=label, bound=bound, no_list=no_list)
+                  evidence=found, reasons=tuple(why), item_label=label, bound=bound, no_list=no_list,
+                  item_rejected=item_rejected)

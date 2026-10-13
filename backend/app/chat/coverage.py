@@ -82,6 +82,7 @@ from typing import TYPE_CHECKING
 
 from app.chat import contexts
 from app.chat.compose import line_cut
+from app.chat.intent import PROFESSIONAL
 from app.chat.tools import READ_TO_END, STEP_LIMIT, TIME_LIMIT, TOOL_BUDGET, value_uncertain
 from app.db import tenant_tx
 
@@ -581,7 +582,7 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
         return out | {"reason": "not_verifiable", "variant": "not_presented"}
     # a professional question whose pool was empty: the repository holds no standard or professional document (U8, KTD15,
     # R29). It says what the repository lacks — never that a search found nothing in a standard
-    if ws.intent == "professional" and ws.standards_absent:
+    if ws.intent == PROFESSIONAL and ws.standards_absent:
         return out | {"reason": "standard_absent", "searched": True}
     if opened is None:
         opened = _openings(ws)
@@ -611,7 +612,7 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
     # a turn that never located the appraisal asked about did not look in the right place: it says so, before any "not
     # present"
     # (a professional question asks about no property: an appraisal it read is an example, so no property is "not located")
-    if not (ws.unread_named and not readings) and ws.intent != "professional":
+    if not (ws.unread_named and not readings) and ws.intent != PROFESSIONAL:
         docs = set(ev["documents"]) | set((claim or {}).get("document_ids") or [])
         if signal["multi"] and (not docs or docs & signal["multi"]) and not signal["located"]:
             return out | {"reason": "unit_not_located"}

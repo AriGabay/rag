@@ -2153,8 +2153,9 @@ def _professional_head(src) -> str:
     rules = src.rules
     if rules:
         limits = rules.get("limits") or []
-        parts.append("תנאים וחריגים בסעיף: " + "; ".join(f"«{x}»" for x in limits)
-                     + (f"; ועוד {rules['more']} שלא הוצגו" if rules.get("more") else "") if limits else RULES_NO_LIMITS)
+        parts.append(("תנאים וחריגים בסעיף: " + "; ".join(f"«{x}»" for x in limits)
+                      + (f"; ועוד {rules['more']} שלא הוצגו" if rules.get("more") else "")) if limits
+                     else RULES_NO_LIMITS)
         parts.append(_wording_text(rules.get("modality") or {}))
     return " | ".join(parts)
 
@@ -3121,13 +3122,14 @@ def _wrong_context(u: Unit, ws: Workspace, question: str) -> str | None:
     (the source places it on another property), and never a calculation built from such values. Only when the context checks are enforced (``contexts.enforced``);
     None when nothing is asked or nothing is elsewhere."""
     from app.chat import contexts
+    from app.chat import intent as intent_mod
     from app.chat.tools import asked_subjects, located_contexts
 
     if not contexts.enforced():
         return None
     # a professional question is not about the property of a file: an appraisal read there is one property's example, and
     # a supported sentence of a general answer is never removed because no appraisal was located (round 10 U9, R35)
-    if getattr(ws, "intent", None) == "professional":
+    if getattr(ws, "intent", None) == intent_mod.PROFESSIONAL:
         return None
     subjects, from_components = asked_subjects(ws)
     for version, numbers, what, i in _evidence_contexts(u, ws):

@@ -9,12 +9,14 @@ import { api, errorMessage, fileUrl } from "@/lib/api";
 import { useApi, useInterval } from "@/lib/useApi";
 import {
   BLOCK_KIND_LABEL,
+  DEFAULT_KIND,
   formatTimestamp,
   ingestProgressText,
   KEPT_PREVIOUS_TITLE,
   keptPreviousText,
   type KeptPrevious,
   SOURCE_KIND_LABEL,
+  SOURCE_KINDS,
   VERSION_STATUS_LABEL,
 } from "@/lib/format";
 import type {
@@ -290,11 +292,9 @@ function StatusCell({ v, docId, onChanged }: { v: Version | null; docId: string;
   );
 }
 
-const KINDS: SourceKind[] = ["appraisal", "standard", "professional"];
-
 /** A document without a kind (a response from before round 10) is an appraisal. */
 function kindOf(d: Pick<DocumentSummary, "source_kind">): SourceKind {
-  return d.source_kind ?? "appraisal";
+  return d.source_kind ?? DEFAULT_KIND;
 }
 
 function KindBadge({ kind }: { kind: SourceKind }) {
@@ -489,7 +489,7 @@ function ProfessionalSummary({
  * the control is busy; a refusal (the server's reason) is shown here and the badge stays as it was. */
 function KindControl({ doc, onChanged }: { doc: DocumentDetail; onChanged: () => void }) {
   const current = kindOf(doc);
-  const options = KINDS.filter((k) => k !== current);
+  const options = SOURCE_KINDS.filter((k) => k !== current);
   const [target, setTarget] = useState<SourceKind>(options[0]);
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -793,7 +793,7 @@ function DocumentsTab({
           onChange={(e) => setKind(e.target.value as "" | SourceKind)}
         >
           <option value="">כל הסוגים</option>
-          {KINDS.map((k) => (
+          {SOURCE_KINDS.map((k) => (
             <option key={k} value={k}>
               {SOURCE_KIND_LABEL[k]}
             </option>

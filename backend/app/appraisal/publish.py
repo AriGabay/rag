@@ -18,7 +18,7 @@ from app.appraisal.dedup import TxnFacts, attach_transaction, delete_orphans, fi
 from app.appraisal.extract import RecordDraft, as_date, as_decimal, extract_records
 from app.appraisal.validate import Validation, validate
 from app.db import bump_data_version
-from app.platform.source_kinds import APPRAISAL
+from app.platform.source_kinds import APPRAISAL, source_kind_of
 
 OCC_FIELDS = (
     "city", "neighborhood", "address", "block", "parcel", "sub_parcel", "property_type", "rooms",
@@ -141,15 +141,6 @@ def refresh_version_status(conn: Connection, version_id: UUID) -> str:
         {"t": row.total, "r": row.review, "s": status, "v": version_id},
     )
     return status
-
-
-def source_kind_of(conn: Connection, document_id: UUID, lock: bool = False) -> str:
-    """The document's source kind. ``lock``: a shared row lock, held to the end of the transaction, so a kind change
-    committing meanwhile (``documents.change_kind`` locks the row for update) is either seen here or waits for this
-    transaction and finds the version published."""
-    return conn.execute(
-        text("SELECT source_kind FROM documents WHERE id = :d" + (" FOR SHARE" if lock else "")), {"d": document_id}
-    ).scalar_one()
 
 
 def derive_records(conn: Connection, version_id: UUID, document_id: UUID, extraction_version: str) -> int:

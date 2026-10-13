@@ -529,7 +529,7 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None, bin
             lines.append(f"{who}: {prompt_text(content[:limit] + ('…' if len(content) > limit else ''))}")
         parts.append("ההודעות האחרונות בשיחה (תשובות העוזר אינן מקור עובדתי):\n" + "\n\n".join(lines))
     settled = request.intent if request is not None else intent
-    professional = settled is not None and settled.value == "professional"
+    professional = settled is not None and settled.professional
     moved = professional or (request is not None and (request.kind == "new_topic" or request.entity_changed))
     if inp.focus and not moved:
         f = inp.focus
@@ -620,6 +620,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     attempt = 0  # 0: first answer, 1: repaired with tools, 2: rewritten from verified content only
     limits = ws.limits_hit
     intent_waited = False  # the first step's tools waited (a bounded time) for the request analysis' intent
+    intent_wait_spent = False  # a bounded wait for the intent already ran out: the first step's tools wait no more
     compute_ok = False  # the step may call the compute tools only (the tool budget is spent, there is time left)
     compute_steps = 0  # such steps taken so far
     rounds: list[list[dict]] = []
@@ -665,13 +666,14 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         """Collect the analysis, waiting at most ``limit`` seconds (None: until its own bound); whether it was collected.
         The wait is recorded in the turn's timing. Its usage is recorded and its intent settled here; its components
         are adopted later (``adopt_analysis``), after the tool outputs they must follow."""
-        nonlocal pending, held
+        nonlocal pending, held, intent_wait_spent
         if pending is None:
             return held is not None
         waited = time.monotonic()
         analysis = pending.wait(cancelled, limit)
         ws.clock.wait("intent", time.monotonic() - waited)
         if analysis is None:  # still running past the bound: the intent stays unknown for now
+            intent_wait_spent = intent_wait_spent or limit is not None
             if turn_intent is None:
                 note_intent(None)
                 first_decisions["intent_why"] = "the request analysis did not finish within the wait: intent unknown"
@@ -920,7 +922,9 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                 # the intent is read before the first step's tools run, so every tool sees it (round 10 KTD3); the
                 # components are appended after the tool outputs, as before
                 intent_waited = True
-                collect_analysis(settings.chat_intent_wait_seconds)
+                # an analysis that already made the first message wait out the bound is only collected if it has
+                # finished since: the turn does not wait for the same intent twice
+                collect_analysis(0.0 if intent_wait_spent else settings.chat_intent_wait_seconds)
             if compute_ok:
                 compute_steps += 1
             for call in step.calls:

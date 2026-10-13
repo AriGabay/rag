@@ -2,16 +2,13 @@
 
 import { useEffect, useId, useRef, useState } from "react";
 import { api, errorMessage, fileUrl } from "@/lib/api";
-import { SOURCE_KIND_LABEL } from "@/lib/format";
+import { DEFAULT_KIND, SOURCE_KIND_LABEL, SOURCE_KINDS } from "@/lib/format";
 import type { Group, SourceKind, UploadResult } from "@/lib/types";
 import { useSession } from "./AppShell";
 import { ErrorAlert } from "./ui";
 
 const MAX_FILES = 20;
 const ACCEPT = ".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-
-// the kinds a file can be uploaded as, in the order they are offered; the first is the default (R16, KD6)
-const KIND_CHOICES: SourceKind[] = ["appraisal", "standard", "professional"];
 
 const RESULT_LABEL: Record<UploadResult["status"], string> = {
   accepted: "התקבל לעיבוד",
@@ -81,7 +78,7 @@ export function UploadPanel({
   const inputRef = useRef<HTMLInputElement>(null);
   const [groups, setGroups] = useState<Group[]>(me?.groups ?? []);
   const [groupId, setGroupId] = useState<string>(me?.groups[0]?.id ?? "");
-  const [kind, setKind] = useState<SourceKind>("appraisal");
+  const [kind, setKind] = useState<SourceKind>(DEFAULT_KIND);
   const kindName = useId();
   const [files, setFiles] = useState<File[]>([]);
   const [dragging, setDragging] = useState(false);
@@ -170,7 +167,7 @@ export function UploadPanel({
           סוג המסמכים (חל על כל הקבצים בהעלאה)
         </span>
         <div className="row kind-choices">
-          {KIND_CHOICES.map((value) => (
+          {SOURCE_KINDS.map((value) => (
             <label key={value} className="checkbox">
               <input
                 type="radio"

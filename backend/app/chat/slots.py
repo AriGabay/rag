@@ -32,8 +32,12 @@ MAX_ITEMS = 10
 ITEM_CHARS = 80
 TOPIC_CHARS = 200
 MAX_SOURCES = 30
+# the intents that are about the trade (``intent.Value``); defined here, the leaf ``intent`` imports, so that
+# ``TOPIC_INTENTS`` below can name them
+PROFESSIONAL = "professional"
+MIXED = "mixed"
 # the intents whose answer is about a topic of the trade: they write the topic slot
-TOPIC_INTENTS = ("professional", "mixed")
+TOPIC_INTENTS = (PROFESSIONAL, MIXED)
 # the task parameters of the datum a property turn answered (the focus fields that are not the property itself)
 PARAM_KEYS = ("metric_as_written", "metric_kind", "unit", "period", "vat", "area_basis", "value_role")
 _UNKNOWN_FOCUS = {"metric_as_written": "", "metric_kind": "unknown", "unit": "unknown", "period": "unknown",
@@ -154,18 +158,24 @@ def ordinal_forms(message: str) -> set[int]:
     return found | {int(m.group(1)) for m in _DIGIT.finditer(message or "")}
 
 
+def ordinal_numbers(message: str, length: int) -> set[int]:
+    """The item numbers a message writes (``ordinal_forms``) with "the last" resolved to ``length``, the number of items
+    of the list it is read against."""
+    return {length if f == -1 else f for f in ordinal_forms(message)}
+
+
 def check_item(item: int | None, message: str, items: list[str]) -> str | None:
     """Why an item claimed for an ordinal cannot be accepted, or None when it can (KTD6): a list was given, the
     message holds an ordinal form (an ordinal word, a digit, "the last"), the item exists and it is the one the words
     name."""
     if not items:
         return "no list was given in the previous answer"
-    forms = ordinal_forms(message)
+    forms = ordinal_numbers(message, len(items))
     if not forms:
         return "no ordinal or number in the message"
     if item is None or not 1 <= item <= len(items):
         return f"item {item} does not exist in the list of {len(items)}"
-    if item not in {len(items) if f == -1 else f for f in forms}:
+    if item not in forms:
         return f"item {item} contradicts the ordinal the message writes"
     return None
 
@@ -215,7 +225,7 @@ def carry(previous: dict | None, *, intent: str, property: dict | None = None, p
     items persist until an answer lists new ones; its text is replaced by a professional or mixed turn that has one.
     Only this turn's pending clarification is kept (it lives one message)."""
     prev = previous or {}
-    professional = intent == "professional"
+    professional = intent == PROFESSIONAL
     prop = prev.get("property") if professional else property
     prm = (prev.get("params") if professional else params) if prop else None
     old = prev.get("topic") or {}

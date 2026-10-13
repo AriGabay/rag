@@ -1,6 +1,7 @@
 // Types of the conversational chat API (/api/chat). Kept apart from the earlier /api/ask types.
 
 import type { ChangeAction, ValueStatus } from "./format";
+import type { SourceKind } from "./types";
 
 export interface ChatConversation {
   id: string;
@@ -187,7 +188,7 @@ export interface ChatSource {
   /** The unit it is in, when its file holds more than one (the file name alone does not say which appraisal). */
   unit?: ChatUnit | null;
   /** The kind of document it is from (absent on answers from before round 10: an appraisal). */
-  source_kind?: "appraisal" | "standard" | "professional";
+  source_kind?: SourceKind;
   /** For a standard or another professional document: its identity and the section the passage is in. */
   standard?: ChatStandard | null;
 }

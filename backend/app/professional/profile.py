@@ -36,7 +36,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
@@ -49,7 +48,7 @@ from sqlalchemy import Connection, text
 from app.db import TenantContext, tenant_tx
 from app.extraction.hebrew import strip_bidi_controls
 from app.extraction.normalize_text import base_normalize
-from app.platform.source_kinds import APPRAISAL
+from app.platform.source_kinds import PROFESSIONALS_SQL
 from app.professional import sections
 from app.providers.llm import LLMProvider, Purpose, call_structured, for_purpose, prompt_attr, prompt_text
 
@@ -522,21 +521,6 @@ def _wants_model(found: Profile, ctx: TenantContext) -> bool:
     return cloud_allowed(ctx)
 
 
-_LOCKS: dict[tuple[str, str], threading.Lock] = {}
-_GUARD = threading.Lock()
-
-
-def _flight(version_id: str, reading_id: str) -> threading.Lock:
-    with _GUARD:
-        return _LOCKS.setdefault((version_id, reading_id), threading.Lock())
-
-
-def _landed(version_id: str, reading_id: str, lock: threading.Lock) -> None:
-    with _GUARD:
-        if _LOCKS.get((version_id, reading_id)) is lock:
-            del _LOCKS[(version_id, reading_id)]
-
-
 def _write(conn: Connection, version: sections.Version, version_id: UUID, fields: dict,
            update: bool) -> Profile:
     conn.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
@@ -575,7 +559,7 @@ def ensure_profile(ctx: TenantContext, version_id: UUID | str, provider: LLMProv
         return None
     if found is not None and not _wants_model(found, ctx):
         return found
-    lock = _flight(str(vid), version.reading_id)
+    lock = sections.flight("profile", str(vid), version.reading_id)
     try:
         with lock:
             with tenant_tx(ctx) as conn:  # another caller may have finished while this one waited
@@ -598,7 +582,7 @@ def ensure_profile(ctx: TenantContext, version_id: UUID | str, provider: LLMProv
             with tenant_tx(ctx) as conn:
                 return _write(conn, version, vid, merge(fields, model), update=found is not None)
     finally:
-        _landed(str(vid), version.reading_id, lock)
+        sections.landed("profile", str(vid), version.reading_id, lock)
 
 
 def ensure_all(ctx: TenantContext, provider: LLMProvider | None = None) -> int:
@@ -620,7 +604,7 @@ _VISIBLE_SQL = (
     " JOIN document_versions v ON v.document_id = d.id AND v.is_current AND v.status IN ('ready', 'needs_review')"
     " LEFT JOIN standard_profiles p ON p.version_id = v.id AND p.reading_id = COALESCE(v.ingestion->>'reading_id', '')"
     f" AND p.profile_version = '{PROFILE_VERSION}'"
-    f" WHERE d.deleted_at IS NULL AND d.source_kind <> '{APPRAISAL}'")
+    f" WHERE d.deleted_at IS NULL AND {PROFESSIONALS_SQL}")
 
 
 @dataclass(frozen=True)
@@ -714,29 +698,34 @@ def editions(conn: Connection, number: str) -> EditionGroup:
     return group_of(visible_editions(conn), number)
 
 
-def _by_key(all_editions: list[Edition]) -> dict[str, list[Edition]]:
-    by_key: dict[str, list[Edition]] = {}
+def by_key(all_editions: list[Edition]) -> dict[str, list[Edition]]:
+    """``all_editions`` grouped by the normalized number they state; built once for several ``linked`` / ``group_of``
+    calls over the same editions."""
+    grouped: dict[str, list[Edition]] = {}
     for e in all_editions:
         if e.key:
-            by_key.setdefault(e.key, []).append(e)
-    return by_key
+            grouped.setdefault(e.key, []).append(e)
+    return grouped
 
 
-def linked(loaded: tuple[list[Edition], int], edition: Edition) -> Edition:
-    """``edition`` with the document it amends resolved among ``loaded`` (``_link``)."""
-    return _link(edition, _by_key(loaded[0]))
+def linked(loaded: tuple[list[Edition], int], edition: Edition, keyed: dict[str, list[Edition]] | None = None) -> Edition:
+    """``edition`` with the document it amends resolved among ``loaded`` (``_link``); ``keyed``: ``by_key(loaded[0])``
+    when the caller built it already."""
+    return _link(edition, by_key(loaded[0]) if keyed is None else keyed)
 
 
-def group_of(loaded: tuple[list[Edition], int], number: str | None) -> EditionGroup:
-    """The group of ``number`` among ``loaded`` (``visible_editions``)."""
+def group_of(loaded: tuple[list[Edition], int], number: str | None,
+             keyed: dict[str, list[Edition]] | None = None) -> EditionGroup:
+    """The group of ``number`` among ``loaded`` (``visible_editions``); ``keyed``: ``by_key(loaded[0])`` when the caller
+    built it already."""
     key = normalize_number(number)
     all_editions, unprofiled = loaded
-    by_key = _by_key(all_editions)
+    keyed = by_key(all_editions) if keyed is None else keyed
     if key is None:
         return EditionGroup(None, (), True, (), unprofiled)
-    ordered, known = _ordered(by_key.get(key, []))
+    ordered, known = _ordered(keyed.get(key, []))
     members = {e.document_id for e in ordered}
-    related = [_link(e, by_key) for e in all_editions
+    related = [_link(e, keyed) for e in all_editions
                if e.amends is not None and normalize_number(e.amends["standard"]) == key and e.document_id not in members]
     related.sort(key=lambda e: (e.effective or "", e.published or "", e.title, str(e.document_id)))
-    return EditionGroup(key, tuple(_link(e, by_key) for e in ordered), known, tuple(related), unprofiled)
+    return EditionGroup(key, tuple(_link(e, keyed) for e in ordered), known, tuple(related), unprofiled)

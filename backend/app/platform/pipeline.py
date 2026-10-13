@@ -42,6 +42,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, text
+from sqlalchemy.exc import NoResultFound
 
 from app.config import get_settings
 from app.db import (  # noqa: F401 - system_ctx re-exported
@@ -56,7 +57,7 @@ from app.extraction.geometry import POSITIONS_VERSION
 from app.extraction.normalize_text import normalize_for_search, undouble_word
 from app.extraction.pdf import READER_VERSION as PDF_READER_VERSION
 from app.extraction.regions import shown_hash
-from app.platform.source_kinds import APPRAISAL
+from app.platform.source_kinds import APPRAISAL, source_kind_of
 from app.platform.storage import purge_staging
 
 logger = logging.getLogger(__name__)
@@ -538,8 +539,11 @@ def is_appraisal(ctx: TenantContext, document_id: UUID) -> bool:
     units, measurement extraction) run for appraisals alone; a standard or a professional document is read, chunked,
     embedded and published as any document (round 10 U3: R3, KTD9). A document that cannot be read counts as one."""
     with tenant_tx(ctx) as conn:
-        kind = conn.execute(text("SELECT source_kind FROM documents WHERE id = :d"), {"d": document_id}).scalar_one_or_none()
-    return kind in (None, APPRAISAL)
+        try:
+            kind = source_kind_of(conn, document_id)
+        except NoResultFound:
+            return True
+    return kind == APPRAISAL
 
 
 def queue_measurements(ctx: TenantContext, info: VersionInfo) -> bool:
@@ -721,7 +725,6 @@ def reindex_version(office_id: UUID, version_id: UUID, accept_regression: bool =
     and never reviewed (a reviewed fact stays), clears cached answers and moves the data version, so no answer
     built on the old reading is served again. Its records (and their reviews) are kept. Measurements are then
     re-extracted when the office allows the cloud model."""
-    from app.appraisal.publish import source_kind_of
     from app.chat import units
     from app.measurements.store import measurement_anchors, reanchor_measurements
     from app.platform.storage import get_storage
