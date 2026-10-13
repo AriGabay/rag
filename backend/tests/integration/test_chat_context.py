@@ -295,7 +295,9 @@ def test_items_persist_the_second_and_then_the_third_bind_to_the_same_list(world
 
 
 def test_an_ordinal_that_fits_a_numbered_answer_and_a_listing_of_the_previous_turn_gets_one_focused_question(world):
-    listed = ("השומות שלנו ברשימה [S1]. הגישות שהן משתמשות בהן:\n1. **גישת ההשוואה**\n2. **גישת ההכנסות**\n"
+    # the answer shows the documents of the listing as well as the approaches: two lists the user saw
+    listed = ("השומות שלנו ברשימה [S1]: דירת מגורים רחוב התמר 9 עיר-ב (סינתטי); מדריך שמאות כללי (סינתטי); דירה "
+              "ברחוב היסמין 3 עיר-ג (סינתטי). הגישות שהן משתמשות בהן:\n1. **גישת ההשוואה**\n2. **גישת ההכנסות**\n"
               "3. **גישת העלות**")
     first, _ = _turn(world, "אילו שומות יש לנו ואילו גישות הן משתמשות בהן?", [
         [call("list_documents", query="סינתטי", page=None)],
@@ -308,6 +310,19 @@ def test_an_ordinal_that_fits_a_numbered_answer_and_a_listing_of_the_previous_tu
     assert "גישת ההכנסות" in a["markdown"] and "ברשימת המסמכים" in a["markdown"]
     assert _decisions(world, m)["item"].startswith("ambiguous")
     assert _context(world, m)["pending"] is None  # the reply is a new message, not a bound answer
+
+
+def test_a_listing_the_answer_did_not_show_is_no_second_reading_of_an_ordinal(world):
+    # round 10 real-model run on 8548fb2: find_standards' listing, read but not presented, made "השנייה" ask between the
+    # second approach and a document the user never saw
+    first, _ = _turn(world, "אילו גישות יש?", [
+        [call("list_documents", query="סינתטי", page=None)],
+        final("הגישות:\n1. **גישת ההשוואה**\n2. **גישת ההכנסות**\n3. **גישת העלות** [S1]", scope="set",
+              scope_query="סינתטי")], None, intent="set")
+    m, _ = _turn(world, "השנייה", [final("גישת ההכנסות מהוונת הכנסה.", "not_found")], _resolution(
+        standalone_question="השנייה", intent=intent_part("professional", "prior_answer_item", item=2)))
+    assert m["answer"]["status"] != "clarification"
+    assert _decisions(world, m)["item"].startswith("bound")
 
 
 # --- a pending clarification lives one message (AE6, AE7, KTD5, bugs 2, 3) ----------------------------------------------

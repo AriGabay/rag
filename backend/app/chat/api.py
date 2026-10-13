@@ -738,7 +738,12 @@ def _listing(conn: Connection, answer: dict) -> list[dict]:
             continue
     titles = {str(r.id): r.title for r in conn.execute(
         text("SELECT id, title FROM documents WHERE id = ANY(:i) AND deleted_at IS NULL"), {"i": uuids})}
-    return [{"document_id": d, "title": titles[d]} for d in ids if d in titles]
+    # only what the answer showed the user is a list an ordinal can name: a listing the model read but did not present
+    # (find_standards before a professional answer) is no second reading of "השנייה" (round 10 real-model run)
+    shown = " ".join((answer.get("markdown") or "").split())
+    listed = [{"document_id": d, "title": titles[d]} for d in ids
+              if d in titles and " ".join(titles[d].split()) in shown]
+    return listed if len(listed) >= 2 else []
 
 
 def _pending_refs(pending: dict, prior_ids: dict[str, str]) -> dict:
