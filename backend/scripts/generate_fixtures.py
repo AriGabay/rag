@@ -5583,17 +5583,264 @@ def write_round9(out: Path, font_dir: Path) -> None:
     print(f"wrote {ROUND9_DIR}/{ROUND9_MANIFEST} ({len(text_):,} chars)")
 
 
+# --------------------------------------------------------------------------- round 10 (professional sources: a synthetic
+# standard in two editions, a clarification of it, an appraisal titled with a standard number, and appraisals whose titles
+# hold "שומה")
+#
+# All DOCX: no font is needed, so the set can be regenerated on a host without DejaVu. The text of every document is invented
+# and says it is a test: the first paragraph of each is the mark, and so are the header and the footer of each page. Nothing
+# here is, or paraphrases, a real standard.
+
+ROUND10_DIR = "round10"
+ROUND10_MANIFEST = "manifest.json"
+ROUND10_MARK = "תקן בדיקה סינתטי — אינו תקן אמיתי"
+ROUND10_NUMBER = "98.1"
+ROUND10_PLACE = "עיר-סינתטית"
+# a block of a document: (kind, text); kind is one of mark, title, h1, h2, p, table (text is then a list of rows)
+Round10Block = tuple[str, Any]
+
+# the provision of section 2.1 in each edition: the material difference (three transactions, then five shown one by one)
+ROUND10_PROVISION_1 = "על השמאי להסתמך על שלוש עסקאות השוואה לפחות."
+ROUND10_PROVISION_2 = "על השמאי להסתמך על חמש עסקאות השוואה לפחות, ולהציג כל אחת מהן בנפרד."
+ROUND10_CONDITION = "בתנאי שהעסקאות נעשו בתוך שנה מהמועד הקובע."
+ROUND10_EXCEPTION = "הוראה זו חלה על כל הנכסים למעט נכסים חריגים שאין להם נכסי השוואה."
+ROUND10_RECOMMENDATION = "מומלץ להוון את ההכנסה הנקייה של הנכס לפי שיעור היוון שנקבע לפי השוק."
+ROUND10_EXAMPLE = "לדוגמה: נכס מניב שהכנסתו השנתית הנקייה ידועה."
+ROUND10_ALTERNATIVE = "גישה זו משמשת לנכסים שאין להם שוק פעיל, ולחלופין רשאי השמאי להשתמש בה כבדיקת סבירות."
+ROUND10_NOTE = "הערה: ההגדרות בתקן זה בדויות ונועדו לבדיקת המערכת בלבד."
+ROUND10_DEFINITIONS = [
+    ("דמי שכירות ראויים (דמ״ש)", "דמי השכירות החודשיים שהיו משולמים בשוק עבור הנכס בתנאים רגילים, כשהוא פנוי ומוכן להשכרה."),
+    ("היוון הכנסות", "המרת הכנסה שנתית נקייה לשווי נכס, על ידי חלוקתה בשיעור היוון."),
+    ("שיעור היוון", "היחס בין ההכנסה השנתית הנקייה של נכס לבין שוויו."),
+    ("שווי שוק", "המחיר המשוער שבו היה נמכר נכס בשוק הבדוי ביום הקובע, בין קונה מרצון למוכר מרצון."),
+    ("נכס השוואה", "נכס דומה לנכס המוערך שנמכר או הושכר סמוך למועד הקובע."),
+]
+ROUND10_APPENDIX = [["מקדם", "ערך"], ["קומה", "1.02"], ["מעלית", "1.05"]]
+
+
+def round10_standard(edition: str, published: str, effective: str, provision: str) -> list[Round10Block]:
+    """The blocks of the synthetic standard 98.1 in one edition: its number, edition and dates stated up front, a general
+    chapter with an internal and an external reference, the three basic approaches (2.1 with a condition and an exception,
+    2.2 with a recommendation and an example, 2.3 with an alternative), the definitions with a note, and an appendix."""
+    blocks: list[Round10Block] = [
+        ("mark", ROUND10_MARK),
+        ("title", f"תקן מס' {ROUND10_NUMBER} — הערכת שווי מקרקעין בדויה"),
+        ("p", edition),
+        ("p", f"פורסם ביום {published}."),
+        ("p", f"תחילתו ביום {effective}."),
+        ("p", "תקן זה חל על הערכת שווי של מקרקעין בדויים לצורכי בדיקות מערכת בלבד."),
+        ("h1", "1. כללי"),
+        ("p", "תקן זה מפרט כללים בדויים להערכת שווי. לפירוט שיטות ההערכה ראו סעיף 2. לעניין מקדמי ההמרה ראו תקן 97."),
+        ("h1", "2. שלוש גישות השומה הבסיסיות"),
+        ("p", "בתקן זה שלוש גישות בסיסיות להערכת שווי: גישת ההשוואה, גישת ההכנסות וגישת העלות. "
+              "על השמאי לציין באיזו גישה נקבע השווי ומדוע."),
+        ("h2", "2.1 גישת ההשוואה"),
+        ("p", f"{provision} {ROUND10_CONDITION}"),
+        ("p", ROUND10_EXCEPTION),
+        ("h2", "2.2 גישת ההכנסות"),
+        ("p", ROUND10_RECOMMENDATION),
+        ("p", ROUND10_EXAMPLE),
+        ("h2", "2.3 גישת העלות"),
+        ("p", ROUND10_ALTERNATIVE),
+        ("h1", "3. הגדרות"),
+    ]
+    blocks += [("p", f"{term} – {body}") for term, body in ROUND10_DEFINITIONS]
+    return blocks + [
+        ("p", ROUND10_NOTE),
+        ("h1", "נספח א' – טבלת מקדמים סינתטית"),
+        ("p", "הטבלה שלהלן בדויה ואינה משמשת לשום חישוב אמיתי."),
+        ("table", ROUND10_APPENDIX),
+    ]
+
+
+def round10_clarification() -> list[Round10Block]:
+    """A document that clarifies section 2.1 of the standard: it names the standard it clarifies and states no number of
+    its own."""
+    return [
+        ("mark", ROUND10_MARK),
+        ("title", f"הבהרה מס' 1 לתקן {ROUND10_NUMBER}"),
+        ("p", "פורסמה ביום 15.11.2025."),
+        ("h1", "1. הבהרה לעניין גישת ההשוואה"),
+        ("p", f"הבהרה זו מסבירה את סעיף 2.1 של תקן {ROUND10_NUMBER}: המונח עסקאות השוואה כולל גם עסקאות שנעשו בנכס סמוך "
+              "באותו רחוב."),
+        ("p", "אין בהבהרה כדי לשנות את הדרישה לבסס את ההערכה על עסקאות השוואה."),
+    ]
+
+
+def round10_appraisal(street: str, number: str, block: str, parcel: str, value: str, rent: str, approach: str,
+                      closing: str = "") -> list[Round10Block]:
+    """A synthetic appraisal of one invented property, in the report layout the extractor reads (a header of ``label:
+    value`` lines, numbered sections) with a stated value and a stated proper rent."""
+    blocks: list[Round10Block] = [
+        ("mark", ROUND10_MARK),
+        ("p", SYNTHETIC_MARKER),
+        ("title", f"שומת מקרקעין — רחוב {street} {number}, {ROUND10_PLACE}"),
+        ("p", f"עיר: {ROUND10_PLACE}"),
+        ("p", f"כתובת הנכס: {street} {number}"),
+        ("p", f"גוש: {block} חלקה: {parcel}"),
+        ("p", "סוג נכס: דירה"),
+        ("p", "המועד הקובע: 15/04/2026"),
+        ("p", "תאריך עריכת השומה: 22/04/2026"),
+        ("p", "שטח הנכס: 80 מ״ר נטו"),
+        ("p", f"שווי הנכס: {value} ₪"),
+        ("p", "בסיס מע״מ: כולל מע״מ"),
+        ("h1", "1. מטרת השומה"),
+        ("p", f"שומה לנכס בדוי ברחוב {street} {number} ב{ROUND10_PLACE}, לצורכי בדיקות מערכת בלבד."),
+        ("h1", "2. שיקולי השמאי"),
+        ("p", approach),
+        ("p", f"דמי השכירות הראויים לנכס נקבעו בשומה זו בסך {rent} ₪ לחודש."),
+        ("h1", "3. תחשיב ושומה"),
+        ("p", f"הוערך הנכס ב-{value} ₪."),
+    ]
+    return blocks + ([("p", closing)] if closing else [])
+
+
+ROUND10_APPROACH = ("השווי נקבע לפי גישת ההשוואה, על סמך ארבע עסקאות השוואה בדירות דומות ברחוב ובסביבתו. "
+                    "ההכנסה לא הוונה, ולכן גישת ההכנסות לא שימשה לקביעת השווי.")
+
+
+def round10_documents() -> list[dict[str, Any]]:
+    """Every round-10 fixture: its file (the title the application gives it is the name without the extension, underscores
+    as spaces), the kind it is uploaded as, what it states about itself (for the manifest) and its blocks."""
+    ed1 = ("גרסה 1.0", "01.09.2025", "05.10.2025")
+    ed2 = ("גרסה 2.0", "01.03.2026", "01.04.2026")
+    appraisals = [("התמר", "9", "7002", "7", "1,980,000", "5,400"), ("היסמין", "3", "7003", "21", "2,150,000", "5,900"),
+                  ("הברוש", "12", "7004", "41", "3,020,000", "7,300")]
+    shape_titles = [f"שומה רחוב התמר 9 {ROUND10_PLACE}", f"דוח שומה רחוב היסמין 3 {ROUND10_PLACE}",
+                    f"{ROUND10_PLACE} רחוב הברוש 12 שומה"]
+    docs: list[dict[str, Any]] = [
+        {"key": "standard_ed1", "file": "R10a_synthetic_standard_98_1_edition_1.docx", "kind": "standard",
+         "blocks": round10_standard(*ed1, ROUND10_PROVISION_1),
+         "states": {"number": ROUND10_NUMBER, "edition": ed1[0], "published": ed1[1], "effective": ed1[2],
+                    "provision_2_1": ROUND10_PROVISION_1}},
+        {"key": "standard_ed2", "file": "R10b_synthetic_standard_98_1_edition_2.docx", "kind": "standard",
+         "blocks": round10_standard(*ed2, ROUND10_PROVISION_2),
+         "states": {"number": ROUND10_NUMBER, "edition": ed2[0], "published": ed2[1], "effective": ed2[2],
+                    "provision_2_1": ROUND10_PROVISION_2}},
+        {"key": "clarification", "file": "R10c_synthetic_clarification_of_98_1.docx", "kind": "professional",
+         "blocks": round10_clarification(), "states": {"number": None, "clarifies": ROUND10_NUMBER}},
+        {"key": "appraisal_titled_as_standard", "file": f"תקן_98_-_רחוב_הדקל_5_{ROUND10_PLACE}.docx", "kind": "appraisal",
+         "blocks": round10_appraisal("הדקל", "5", "7001", "12", "2,450,000", "6,200", ROUND10_APPROACH,
+                                     "מסמך זה הוא שומה לנכס אחד, ואינו תקן."),
+         "states": {"value": "2,450,000", "rent": "6,200", "approach": "גישת ההשוואה", "block": "7001",
+                    "parcel": "12"}},
+    ]
+    for n, (street, number, block, parcel, value, rent), title in zip(range(1, 4), appraisals, shape_titles, strict=True):
+        docs.append({"key": f"appraisal_shape_{n}", "file": title.replace(" ", "_") + ".docx", "kind": "appraisal",
+                     "blocks": round10_appraisal(street, number, block, parcel, value, rent, ROUND10_APPROACH),
+                     "states": {"value": value, "rent": rent, "block": block, "parcel": parcel}})
+    for d in docs:
+        d["title"] = _title_of(d["file"])
+    return docs
+
+
+def render_round10_docx(blocks: list[Round10Block], title: str) -> bytes:
+    """A DOCX of the blocks: Word heading styles (so the reader finds the structure), right-to-left paragraphs, the test
+    mark in the header and the footer of every page, fixed properties (byte-stable output)."""
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+
+    doc = Document()
+    cp = doc.core_properties
+    cp.title = f"{ROUND10_MARK} - {title}"
+    cp.author = "synthetic fixture generator"
+    cp.last_modified_by = "synthetic fixture generator"
+    cp.created = FIXED_TS.replace(tzinfo=None)
+    cp.modified = FIXED_TS.replace(tzinfo=None)
+    cp.revision = 1
+    section = doc.sections[0]
+    for part in (section.header, section.footer):
+        p = part.paragraphs[0]
+        p.text = ROUND10_MARK
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _rtl_paragraph(p)
+
+    def para(text: str):
+        p = doc.add_paragraph(text)
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        _rtl_paragraph(p)
+
+    def heading(text: str, level: int):
+        p = doc.add_heading(text, level=level)
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        _rtl_paragraph(p)
+
+    for kind, text in blocks:
+        if kind == "title":
+            heading(text, 0)
+        elif kind in ("h1", "h2"):
+            heading(text, int(kind[1]))
+        elif kind == "table":
+            table = doc.add_table(rows=len(text), cols=len(text[0]))
+            table.style = "Table Grid"
+            table._tbl.tblPr.append(OxmlElement("w:bidiVisual"))
+            for r, cells in enumerate(text):
+                for c, value in enumerate(cells):
+                    cell = table.cell(r, c)
+                    cell.text = value
+                    for p in cell.paragraphs:
+                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        _rtl_paragraph(p)
+        else:
+            para(text)
+    buf = io.BytesIO()
+    doc.save(buf)
+    return normalize_zip(buf.getvalue())
+
+
+def _round10_sections(blocks: list[Round10Block]) -> list[dict[str, str]]:
+    """The numbered headings of a document's blocks, as the manifest records them (label, title)."""
+    out = []
+    for kind, text in blocks:
+        if kind in ("h1", "h2"):
+            label, _, title = text.partition(" ")
+            out.append({"label": label.rstrip("."), "title": title} if label[0].isdigit() else {"label": None, "title": text})
+    return out
+
+
+def write_round10(out: Path) -> None:
+    """Writes the round-10 fixtures and ``manifest.json``: per document its file, title, the kind it is uploaded as, what it
+    states, its headings and the sentences the tests assert on, all from the generator's own text (never read back)."""
+    rdir = out / ROUND10_DIR
+    rdir.mkdir(parents=True, exist_ok=True)
+    docs: dict[str, dict[str, Any]] = {}
+    for d in round10_documents():
+        data = render_round10_docx(d["blocks"], d["title"])
+        (rdir / d["file"]).write_bytes(data)
+        print(f"wrote {ROUND10_DIR}/{d['file']} ({len(data):,} bytes)")
+        docs[d["key"]] = {"file": f"{ROUND10_DIR}/{d['file']}", "title": d["title"], "source_kind": d["kind"],
+                          "states": d["states"], "sections": _round10_sections(d["blocks"]),
+                          "paragraphs": [t for k, t in d["blocks"] if k in ("mark", "p")]}
+    manifest = {
+        "about": f"{ROUND10_MARK}. Known contents of the round-10 fixtures (a synthetic standard numbered {ROUND10_NUMBER} "
+                 "in two editions whose section 2.1 differs, a clarification of it, an appraisal titled with a standard "
+                 "number, and three appraisals whose titles hold \"שומה\"); generated by scripts/generate_fixtures.py "
+                 "--only round10 from the generator's own text (never read back from the files) - do not edit by hand. "
+                 "Every name, address, block, parcel and amount is invented; no text is, or paraphrases, a real standard.",
+        "synthetic_marker": ROUND10_MARK,
+        "difference": {"section": "2.1", "edition_1": ROUND10_PROVISION_1, "edition_2": ROUND10_PROVISION_2},
+        "documents": docs,
+    }
+    text_ = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+    (rdir / ROUND10_MANIFEST).write_text(text_, encoding="utf-8")
+    print(f"wrote {ROUND10_DIR}/{ROUND10_MANIFEST} ({len(text_):,} chars)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--font-dir", default=DEFAULT_FONT_DIR)
     parser.add_argument("--out", default="tests/fixtures")
-    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9"], default="all",
+    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9", "round10"],
+                        default="all",
                         help="regions: write only the uncovered-region fixtures (tests/fixtures/regions/); "
                              "positions: only the page-position fixtures (tests/fixtures/positions/); "
                              "citations: only the citation fixtures and their manifest (tests/fixtures/citations/); "
                              "round7: only the round-7 fixtures and their manifest (tests/fixtures/round7/); "
                              "round8: only the round-8 fixtures and their manifest (tests/fixtures/round8/); "
-                             "round9: only the round-9 fixtures and their manifest (tests/fixtures/round9/)")
+                             "round9: only the round-9 fixtures and their manifest (tests/fixtures/round9/); "
+                             "round10: only the round-10 fixtures (DOCX, no font needed) and their manifest "
+                             "(tests/fixtures/round10/)")
     args = parser.parse_args()
     font_dir = Path(args.font_dir)
     out = Path(args.out)
@@ -5615,6 +5862,9 @@ def main() -> None:
         return
     if args.only == "round9":
         write_round9(out, font_dir)
+        return
+    if args.only == "round10":
+        write_round10(out)
         return
 
     docs: dict[str, dict[str, Any]] = {}
@@ -5665,6 +5915,7 @@ def main() -> None:
     write_round7(out, font_dir)
     write_round8(out, font_dir)
     write_round9(out, font_dir)
+    write_round10(out)
 
 
 if __name__ == "__main__":

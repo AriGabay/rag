@@ -320,3 +320,35 @@ generator's own layout, never read back from the files.
 | `round9/R9c_synthetic_picture_title_split_table.pdf` | The project title exists only as a picture; a table of units runs from page 1 over the break and its total row is on page 2 |
 | `round9/R9d_synthetic_long_file_1000_pages.pdf` | 1,000 text pages: 100 appraisals of 10 pages, each with its own name, block, parcel and value, chapters 1-6 and printed labels 1-10 (about 4 MB) |
 | `round9/R9e_synthetic_letter_spaced_table.pdf` | A plan table drawn glyph by glyph (the extractor yields "4 2 4 2", "2 1 / 0 6 / 2 0 2 1"), and a numbered heading whose text layer starts with U+200F |
+
+## Round-10 fixtures (`round10/`)
+
+Synthetic professional-source files for the round-10 sequences (`tests/integration/test_round10_sequences.py`), the real-model
+acceptance (`tests/integration/test_round10_real_model.py`) and the browser spec (`frontend/e2e/round10-professional.spec.ts`).
+Every text says it is a test: the first paragraph of each file is "תקן בדיקה סינתטי — אינו תקן אמיתי", which also fills the
+header and the footer of every page. All content is invented and none of it is, or paraphrases, a real standard; every street,
+block, parcel and amount is invented too (the town is "עיר-סינתטית"). All files are **DOCX**, so no font is needed and the set
+can be regenerated on a host without DejaVu:
+
+```bash
+cd backend && .venv/bin/python scripts/generate_fixtures.py --only round10
+```
+
+The output is byte-identical on a second run (fixed document properties, fixed zip timestamps). `round10/manifest.json` records,
+per document, its file, the title the application gives it (the file name without the extension, underscores as spaces), the
+kind it is uploaded as (`source_kind`), what it states about itself, its numbered headings and its paragraphs, written from the
+generator's own text (never read back from the files). The files that are uploaded to a real stack are uploaded **as that
+kind**: the kind is never read from a name or a title.
+
+| key | file | uploaded as | what it exercises |
+|---|---|---|---|
+| `standard_ed1` | `round10/R10a_synthetic_standard_98_1_edition_1.docx` | `standard` | Standard 98.1, "גרסה 1.0", published 01.09.2025, effective 05.10.2025; no issuer (unknown). Chapter 2 "שלוש גישות השומה הבסיסיות" with 2.1 (a provision with a condition "בתנאי ש" and an exception "למעט"), 2.2 (a recommendation and an example), 2.3 (an alternative); chapter 3 definitions (דמי שכירות ראויים, היוון הכנסות, שיעור היוון, שווי שוק, נכס השוואה) and a note; an internal reference ("סעיף 2"), an external one to a standard that is not in the set ("תקן 97"), and appendix א' with a table |
+| `standard_ed2` | `round10/R10b_synthetic_standard_98_1_edition_2.docx` | `standard` | The second edition of 98.1: "גרסה 2.0", published 01.03.2026, effective 01.04.2026. Section 2.1 differs materially (three transactions become five, each shown on its own); everything else is the same text |
+| `clarification` | `round10/R10c_synthetic_clarification_of_98_1.docx` | `professional` | "הבהרה מס' 1 לתקן 98.1": names the standard it clarifies, states no number of its own |
+| `appraisal_titled_as_standard` | `round10/תקן_98_-_רחוב_הדקל_5_עיר-סינתטית.docx` | `appraisal` | An appraisal of רחוב הדקל 5 (block 7001, parcel 12, value 2,450,000, proper rent 6,200) whose **title** is "תקן 98 - רחוב הדקל 5 עיר-סינתטית": it is an appraisal, not the standard |
+| `appraisal_shape_1..3` | `round10/שומה_רחוב_התמר_9_עיר-סינתטית.docx`, `round10/דוח_שומה_רחוב_היסמין_3_עיר-סינתטית.docx`, `round10/עיר-סינתטית_רחוב_הברוש_12_שומה.docx` | `appraisal` | Three appraisals whose titles hold "שומה" (at the start, after "דוח", at the end): the shape of the reported conversation, where a general question using that word listed the three as a choice. Blocks 7002/7003/7004, parcels 7/21/41 (a one-digit parcel is avoided on purpose: `entities.choose` reads a one-digit number of a lookup as a house number), values 1,980,000 / 2,150,000 / 3,020,000, proper rents 5,400 / 5,900 / 7,300 |
+
+The appraisals use the report layout of the earlier fixtures (a header of `label: value` lines, numbered sections), so the
+worker derives their units, identifiers (address and block/parcel) and records as for any appraisal. The documents are read
+by the worker like any upload: the sections, the text digest and the profile of a standard are derived at publication
+(`professional.after_publish`).
