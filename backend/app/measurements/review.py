@@ -23,6 +23,7 @@ from app.db import TenantContext, bump_data_version, tenant_tx
 from app.deps import NOT_FOUND, get_ctx, parse_uuid
 from app.measurements.extract import PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
 from app.measurements.values import parse_amount
+from app.platform.source_kinds import APPRAISALS_SQL
 
 router = APIRouter(prefix="/api/review/measurements", tags=["review"])
 
@@ -35,7 +36,7 @@ MSG_VALUE = "יש להזין ערך כפי שנכתב במסמך, עם מספר"
 PAGE = 100
 
 _SELECT = ("SELECT m.*, d.title FROM measurements m JOIN document_versions v ON v.id = m.version_id"
-           " JOIN documents d ON d.id = m.document_id AND d.deleted_at IS NULL")
+           f" JOIN documents d ON d.id = m.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL}")
 
 
 def _json(r) -> dict:
@@ -86,11 +87,13 @@ def list_measurements(document_id: str | None = None, status_filter: str | None 
                                  " d.title, m.block_index, m.row_index NULLS FIRST, m.created_at OFFSET :o LIMIT :lim"),
                             params).all()
         total = conn.execute(text("SELECT count(*) FROM measurements m JOIN document_versions v ON v.id = m.version_id"
-                                  " JOIN documents d ON d.id = m.document_id AND d.deleted_at IS NULL" + where),
+                                  f" JOIN documents d ON d.id = m.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"
+                                  + where),
                              params).scalar_one()
         counts = dict(conn.execute(text(
             "SELECT m.status, count(*) FROM measurements m JOIN document_versions v ON v.id = m.version_id"
-            " JOIN documents d ON d.id = m.document_id AND d.deleted_at IS NULL WHERE v.is_current GROUP BY 1")).all())
+            f" JOIN documents d ON d.id = m.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"
+            " WHERE v.is_current GROUP BY 1")).all())
     return {"items": [_json(r) for r in rows], "total": total, "counts": counts,
             "kinds": KIND_LABELS, "units": UNIT_LABELS, "periods": PERIOD_LABELS, "vats": VAT_LABELS}
 

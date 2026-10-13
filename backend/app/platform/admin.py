@@ -217,8 +217,13 @@ def coverage_summary(ctx: TenantContext = Depends(require_admin)) -> dict:
             " count(*) FILTER (WHERE o.verification_status = 'auto_extracted') AS awaiting,"
             " count(*) FILTER (WHERE o.verification_status = 'needs_review') AS review"
             " FROM occurrences o JOIN document_versions v ON v.id = o.version_id AND v.is_current"
-            " JOIN documents d ON d.id = o.document_id AND d.deleted_at IS NULL")).one()
-        open_dedup = conn.execute(text("SELECT count(*) FROM dedup_candidates WHERE status = 'open'")).scalar_one()
+            f" JOIN documents d ON d.id = o.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL}")).one()
+        open_dedup = conn.execute(text(
+            "SELECT count(*) FROM dedup_candidates c WHERE c.status = 'open'"
+            f" AND EXISTS (SELECT 1 FROM occurrences o JOIN documents d ON d.id = o.document_id AND {APPRAISALS_SQL}"
+            "   WHERE o.transaction_id = c.transaction_a)"
+            f" AND EXISTS (SELECT 1 FROM occurrences o JOIN documents d ON d.id = o.document_id AND {APPRAISALS_SQL}"
+            "   WHERE o.transaction_id = c.transaction_b)")).scalar_one()
     return {"documents_by_status": by_status,
             "records": {"total": rec.total, "verified": rec.verified, "awaiting_verification": rec.awaiting,
                         "needs_review": rec.review},

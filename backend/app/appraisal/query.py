@@ -13,6 +13,7 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from app.answering.conditions import QueryConditions
+from app.platform.source_kinds import APPRAISALS_SQL
 
 VERIFIED = ("human_verified", "corrected")
 AWAITING = ("auto_extracted", "needs_review")
@@ -37,6 +38,7 @@ def _filters(c: QueryConditions, statuses: tuple[str, ...]) -> tuple[str, dict]:
         "o.data_kind = :kind",
         "v.is_current",
         "d.deleted_at IS NULL",
+        APPRAISALS_SQL,  # a document changed to a standard keeps its records, which no statistic reads (R28)
     ]
     params: dict = {"statuses": list(statuses), "kind": c.data_kind}
     if c.city:
@@ -181,7 +183,7 @@ def sources_for(conn: Connection, txn_ids: list[UUID]) -> list[dict]:
             "SELECT o.id AS occurrence_id, o.transaction_id, o.document_id, o.version_id, o.page_no, o.row_index,"
             " o.text_span, o.address, o.conflict_flag, d.title, v.mime_type"
             " FROM occurrences o JOIN document_versions v ON v.id = o.version_id AND v.is_current"
-            " JOIN documents d ON d.id = o.document_id AND d.deleted_at IS NULL"
+            f" JOIN documents d ON d.id = o.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"
             " WHERE o.transaction_id = ANY(:ids) ORDER BY d.title, o.page_no, o.row_index"
         ),
         {"ids": txn_ids},

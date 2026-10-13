@@ -113,6 +113,7 @@ from app.db import TenantContext, current_data_version, tenant_tx
 from app.extraction.normalize_text import base_normalize, prefix_variants
 from app.platform.documents import source_file_url
 from app.platform.search import SearchScope, locate_evidence, search_evidence
+from app.platform.source_kinds import APPRAISALS_SQL
 from app.providers.embeddings import get_embedding_provider
 from app.providers.llm import (
     SYSTEM_POLICY,
@@ -632,7 +633,7 @@ def _records_cover(ctx: TenantContext, c: QueryConditions) -> bool:
     with tenant_tx(ctx) as conn:
         rows = conn.execute(text(
             "SELECT DISTINCT o.city, o.neighborhood FROM occurrences o JOIN document_versions v ON v.id = o.version_id"
-            " AND v.is_current JOIN documents d ON d.id = o.document_id AND d.deleted_at IS NULL"
+            f" AND v.is_current JOIN documents d ON d.id = o.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"
             " WHERE o.verification_status <> 'rejected'")).all()
     if not rows:
         return False

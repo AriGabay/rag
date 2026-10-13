@@ -31,6 +31,7 @@ from app.db import TenantContext, tenant_tx
 from app.deps import NOT_FOUND, get_ctx, parse_uuid
 from app.extraction.normalize_text import base_normalize
 from app.platform.documents import source_file_url
+from app.platform.source_kinds import APPRAISALS_SQL
 
 router = APIRouter(prefix="/api/review/facts", tags=["review"])
 
@@ -60,7 +61,7 @@ _SELECT = (
     " f.reviewed_at, f.previous, f.created_at, d.title, a.label_he, a.value_type, a.unit_dimension,"
     " a.canonical_unit, a.facts_version FROM facts f"
     " JOIN document_versions v ON v.id = f.version_id AND v.is_current"
-    " JOIN documents d ON d.id = f.document_id AND d.deleted_at IS NULL"
+    f" JOIN documents d ON d.id = f.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"
     " JOIN attribute_definitions a ON a.id = f.attribute_id"
     " WHERE f.extraction_version = COALESCE(a.extraction_prompt_version, :ev)"
 )

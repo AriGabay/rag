@@ -19,6 +19,7 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from app.extraction.normalize_text import base_normalize
+from app.platform.source_kinds import APPRAISALS_SQL
 
 HEADER_PAGES = 2  # report headers sit on the first pages
 
@@ -150,7 +151,8 @@ def header_places(conn: Connection) -> set[tuple[str | None, str]]:
     narrative reports (versions without records), so the gazetteer knows places those reports cover."""
     ids = [r.id for r in conn.execute(text(
         "SELECT v.id FROM document_versions v JOIN documents d ON d.id = v.document_id AND d.deleted_at IS NULL"
-        " WHERE v.is_current AND NOT EXISTS (SELECT 1 FROM occurrences o WHERE o.version_id = v.id)")).all()]
+        f" AND {APPRAISALS_SQL} WHERE v.is_current"
+        " AND NOT EXISTS (SELECT 1 FROM occurrences o WHERE o.version_id = v.id)")).all()]
     places: set[tuple[str | None, str]] = set()
     for header in _page_headers(conn, ids).values():
         city, hood = header.get("city"), header.get("neighborhood")

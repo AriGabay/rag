@@ -25,6 +25,7 @@ from app.answering.parser import Gazetteer
 from app.answering.templates import abstain_text, numeric_text
 from app.appraisal.query import compute_stats, conflicts, distinct_values, sources_for, uncertain_duplicates
 from app.platform.documents import source_file_url
+from app.platform.source_kinds import APPRAISALS_SQL
 
 CLARIFY_QUESTIONS = {
     "data_kind": "לאיזה נתון הכוונה?",
@@ -46,7 +47,7 @@ def load_gazetteer(conn: Connection) -> Gazetteer:
         text(
             "SELECT DISTINCT o.city, o.neighborhood FROM occurrences o"
             " JOIN document_versions v ON v.id = o.version_id AND v.is_current"
-            " JOIN documents d ON d.id = o.document_id AND d.deleted_at IS NULL"
+            f" JOIN documents d ON d.id = o.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"
             " WHERE o.verification_status <> 'rejected'"
         )
     ).all()

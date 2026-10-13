@@ -18,6 +18,8 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from app.platform.source_kinds import APPRAISALS_SQL
+
 DEDUP_KINDS = ("transaction_price", "asking_price", "adjusted_comparable")
 
 
@@ -128,7 +130,7 @@ def find_uncertain(conn: Connection, txn_id: UUID, f: TxnFacts, version_id: UUID
         text(
             "SELECT DISTINCT o.transaction_id FROM occurrences o"
             " JOIN document_versions v ON v.id = o.version_id"
-            " JOIN documents d ON d.id = o.document_id AND d.deleted_at IS NULL"
+            f" JOIN documents d ON d.id = o.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"
             f" WHERE {where} AND o.data_kind = :k AND o.transaction_id <> :t"
             " AND (v.is_current OR v.id = :v)"
             " AND (o.transaction_date = :td OR o.price = :pr)"

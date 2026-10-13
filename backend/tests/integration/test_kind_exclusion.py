@@ -21,6 +21,10 @@ import pytest
 from sqlalchemy import text
 
 from app import worker
+from app.answering.conditions import QueryConditions
+from app.answering.service import load_gazetteer
+from app.answering.turn import _records_cover
+from app.appraisal.query import AWAITING, VERIFIED, compute_records, compute_stats, eligible_ids, sources_for
 from app.chat import contexts, entities
 from app.chat import tools as T
 from app.chat import units as unit_store
@@ -154,7 +158,7 @@ def test_the_units_of_a_professional_version_are_not_built(office):
 # --- the tools ---------------------------------------------------------------------------------------------
 
 def test_find_documents_and_list_documents_count_appraisals_only(office):
-    block_pair(office, "standard")
+    (appraisal, _), _ = block_pair(office, "standard")
     professional_file(office, office.default_group_id, [("paragraph", None, [], "מסמך מקצועי", 1)],
                       title="שומה חוזר מקצועי", source_kind="professional")
     ws = T.Workspace(ctx=office.ctx())
@@ -164,8 +168,8 @@ def test_find_documents_and_list_documents_count_appraisals_only(office):
     assert APPRAISAL_TITLE in listed and 'סה"כ 1 מסמכים' in listed
     assert "גישת" not in listed and "חוזר" not in listed
     assert "תקן" not in T.tool_list_documents(T.Workspace(ctx=office.ctx()), "גישת")  # a title query finds none
-    scope = ws.scope["documents"] if isinstance(ws.scope, dict) and "documents" in ws.scope else None
-    assert scope is None or [d["title"] for d in scope] == [t for t in (d["title"] for d in scope) if APPRAISAL_TITLE in t]
+    scope = ws.scope["matching"]  # the key ``tools.new_scope`` creates
+    assert [d["document_id"] for d in scope] == [appraisal], scope  # non-empty, and the appraisal alone
 
 
 def test_an_appraisal_titled_like_a_standard_is_still_found(office):
@@ -337,3 +341,70 @@ def test_a_change_to_appraisal_of_a_version_not_yet_read_runs_nothing_and_the_pu
     assert counts(office)["occurrences"] == 0  # nothing was read yet: nothing to run
     run_all()
     assert counts(office)["occurrences"] > 0  # the publish saw the appraisal
+
+
+def _records_seen(office, client) -> dict:
+    """What every record-reading surface sees for the office now: the statistics and the eligible transactions (over
+    every status, so the synthetic file's unreviewed records count), the admin coverage summary and review queue, the
+    place gazetteer and the places-cover test."""
+    all_statuses = VERIFIED + AWAITING
+    cond = QueryConditions(data_kind="transaction_price")
+    with tenant_tx(office.ctx()) as conn:
+        stats = compute_stats(conn, cond)
+        eligible = eligible_ids(conn, cond, all_statuses)
+        records = compute_records(conn, cond, "transactions.price", "count")
+        sources = sources_for(conn, list(conn.execute(text("SELECT id FROM transactions")).scalars()))
+        gazetteer = load_gazetteer(conn)
+    coverage = client.get("/api/admin/coverage").json()
+    queue = client.get("/api/review/queue").json()["items"]
+    reviewed = client.get("/api/review/measurements").json()
+    measurements = reviewed["total"] + sum(reviewed["counts"].values()) + len(reviewed["items"])
+    return {"stats": stats.count, "eligible": len(eligible), "records": records.count, "sources": len(sources),
+            "places": gazetteer.cities + [n for _, n in gazetteer.neighborhoods],
+            "coverage_total": coverage["records"]["total"], "queue_records": [i for i in queue if i["kind"] == "record"],
+            "review_queue_count": coverage["review_queue_count"],
+            "covered": _records_cover(office.ctx(), QueryConditions()), "measurements": measurements}
+
+
+def test_a_flipped_documents_records_stay_stored_but_feed_no_statistics_coverage_queue_or_gazetteer(client, office):
+    """Round 10 review finding #1 (R28): the occurrence-based surfaces test the document's kind. The stored rows are
+    counted before and after (R1); a change back to ``appraisal`` makes the same rows count again."""
+    login(client, "admin-a@example.test")
+    doc, ver = ingest(client, office, "flip1", None, name="שומה הגפן 12.pdf")
+    with tenant_tx(office.system) as conn:  # the statistics read verified records only
+        conn.execute(text("UPDATE occurrences SET verification_status = 'human_verified'"
+                          " WHERE id IN (SELECT id FROM occurrences ORDER BY id LIMIT 3)"))
+    with tenant_tx(office.system) as conn:  # a stored measurement of the document, for the measurement review
+        conn.execute(text(
+            "INSERT INTO measurements (office_id, document_id, version_id, block_index, statement_key, metric,"
+            " metric_kind, value, value_form, value_text, unit, period, vat, subject_role, value_role, quote,"
+            " extraction_version, model, status, issues) VALUES (app_office(), :d, :v, 1, 'b1:x', 'שווי קרקע',"
+            " 'value_per_area', 9500, 'exact', '9,500 ₪', 'ILS_per_sqm', 'none', 'unknown', 'general', 'other',"
+            " 'השווי למ\"ר בנוי הוא 9,500 ₪', :e, 'test', 'needs_review', '[]'::jsonb)"),
+            {"d": doc, "v": ver, "e": EXTRACTION_VERSION})
+    before = counts(office)
+    seen = _records_seen(office, client)
+    assert before["occurrences"] > 0 and before["transactions"] > 0
+    assert seen["measurements"] == 3  # total, per-status counts and items: one row each
+    assert seen["stats"] > 0 and seen["eligible"] > 0 and seen["records"] > 0 and seen["sources"] > 0, seen
+    assert seen["coverage_total"] == before["occurrences"] and seen["queue_records"] and seen["places"]
+    assert seen["covered"] is True
+    assert client.patch(f"/api/documents/{doc}", json={"source_kind": "standard"}).status_code == 200
+    assert counts(office) == before  # the rows stay stored (R1)
+    flipped = _records_seen(office, client)
+    assert (flipped["stats"], flipped["eligible"], flipped["records"], flipped["sources"]) == (0, 0, 0, 0), flipped
+    assert flipped["coverage_total"] == 0 and flipped["review_queue_count"] == 0, flipped
+    assert flipped["queue_records"] == [] and flipped["places"] == [] and flipped["covered"] is False, flipped
+    assert flipped["measurements"] == 0, flipped  # the measurement review lists none of the standard's rows
+    with tenant_tx(office.ctx()) as conn:
+        assert conn.execute(text("SELECT count(*) FROM measurements")).scalar_one() == 1  # and the row stays
+    one = client.get("/api/review/records/" + str(_first_occurrence(office)))
+    assert one.status_code == 404  # an explicitly named record of a standard is not an appraisal record either
+    assert client.patch(f"/api/documents/{doc}", json={"source_kind": "appraisal"}).status_code == 200
+    assert counts(office) == before
+    assert _records_seen(office, client) == seen  # the same rows count again
+
+
+def _first_occurrence(office) -> UUID:
+    with tenant_tx(office.ctx()) as conn:
+        return conn.execute(text("SELECT id FROM occurrences ORDER BY id LIMIT 1")).scalar_one()
