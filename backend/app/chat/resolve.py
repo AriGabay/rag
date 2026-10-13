@@ -30,6 +30,16 @@ metric, unit, scale, period and area basis. The server then validates the parse:
   beyond what the focus holds. A word that titles share is none, so a general question of the trade ("professional")
   names nothing: it inherits no document, unit or measure from the conversation and the conversation's property is left
   as it was;
+- **references** (round 10 U7; KTD5-KTD7; ``app.chat.slots``): the conversation's slots are given to the call — the items of
+  the list the previous answer printed and the professional topic — and a reference binds only to what the slots hold. An
+  ordinal the model reads as ``prior_answer_item`` binds only on an ordinal form in the message and an item that exists;
+  the standalone question then names the item, and an ordinal that also fits the clarification's candidates or a listing
+  of the previous turn gets one focused question from the server. A pronoun with ``reference: topic`` takes the topic
+  slot's words, and a question that points at the conversation's property (or mixes the trade with it) restores the
+  property even as a new question, unless it names another. A pending clarification binds only the message that refers to
+  it: a candidate named by the model's reading of the reply as an answer, by an ordinal or a number alone, or by a complete
+  name; any other message is a new question, the clarification expires (``decisions["pending"]``), and it is asked again
+  only when the model called the reply an answer and the reply names two or more candidates;
 - a correction the model finds genuinely ambiguous gets one short clarification question, without tools;
 - **a pending parameter** (round 7 KTD9, R25): when the previous answer asked for a detail only the user can give,
   the reply is bound to it deterministically (``bind_pending``), apart from the call: the calculation component is
@@ -57,7 +67,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from app.chat import entities, unread
+from app.chat import entities, slots, unread
 from app.chat import intent as intent_mod
 from app.chat import request as request_analysis
 from app.chat import tools as T
@@ -230,6 +240,9 @@ class Request:
     components_status: str = "empty"
     # what the request is about, as the server settled it (``intent.settle``): ``professional`` carries no property
     intent: intent_mod.Intent = field(default_factory=intent_mod.Intent)
+    # the professional subject of the request (round 10 U7): the item of the previous answer's list an ordinal named, else
+    # the conversation's topic slot a pronoun was bound to, else the model's own words for it
+    topic: str = ""
 
     def as_dict(self) -> dict:
         return {"kind": self.kind, "standalone_question": self.standalone_question, "metric_kind": self.metric_kind,
@@ -238,7 +251,7 @@ class Request:
                 "rejected": list(self.rejected), "relation": self.relation, "scope": self.scope,
                 "approved": list(self.approved), "candidates": list(self.candidates), "located_unit": self.located_unit,
                 "unit_kept": self.unit_kept, "entity_changed": self.entity_changed,
-                "named_document_ids": list(self.named_documents), "intent": self.intent.as_dict()}
+                "named_document_ids": list(self.named_documents), "intent": self.intent.as_dict(), "topic": self.topic}
 
     @property
     def per_area(self) -> bool | None:
@@ -369,12 +382,16 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
              authorized: Callable[[Iterable[str]], set[str]], titles: list[str] | Callable[[], list[str]],
              lookup: Callable[[str], entities.Outcome] | None = None,
              candidates: list[dict] | None = None, focus_titles: list[str] | None = None,
-             user_texts: list[str] | None = None, prior_units: list[dict] | None = None) -> Request:
+             user_texts: list[str] | None = None, prior_units: list[dict] | None = None,
+             items: list[str] | None = None, listing: list[dict] | None = None, topic: str = "") -> Request:
     """``titles``: every title the user may see (the words that can name a document), or a provider of them, read
     only when needed; ``focus_titles``: the titles of the documents the conversation was about; ``user_texts``: what
     the user wrote in the conversation (the message alone when not given), which a parameter given by the user
     quotes; ``prior_units``: the units of the files the previous turn touched, when that turn was the model's own
-    question between appraisals (it left no candidates): a reply that states one's complete name selects it."""
+    question between appraisals (it left no candidates): a reply that states one's complete name selects it;
+    ``items``: the labels of the list the previous answer printed (an ordinal can name one), ``listing``: the documents a
+    listing of the previous turn offered, in order ({document_id, title}), ``topic``: the conversation's topic slot (a
+    pronoun can bind to it) — round 10 U7, KTD6."""
     decisions: dict[str, str] = {}
     ok: set[str] = set()
     claimed = {c.field for c in resolved.changed_fields}
@@ -402,7 +419,7 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
     vocabulary = titles() if callable(titles) else titles
     said = " ".join(quotes[n] for n in ("subject", "documents") if n in quotes)  # the model's words for a new entity
     settled = intent_mod.settle(resolved.intent, message, vocabulary, scope=resolved.scope, has_property=bool(focus),
-                                quoted=said)
+                                quoted=said, items=items or (), topic=topic)
     professional = settled.value == "professional"
     decisions["intent"] = settled.value
     if settled.reasons:
@@ -413,6 +430,7 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
     new_question = relation == "new_question"
     out = Request(kind, resolved.standalone_question, relation=relation, scope=resolved.scope, changed=sorted(ok),
                   rejected=rejected, intent=settled)
+    _bind_references(out, resolved, settled, topic, decisions)
     f = focus or {}
     if new_question or not focus or professional:
         # a new question is read from the user's words: what the parse says, except claims without evidence. A
@@ -481,19 +499,42 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
     # documents: the focus, unless the user's words name another entity, or the question is over a set
     focus_ids = list(f.get("document_ids") or [])
     focus_unit = f.get("located_unit") or None
-    keep_focus = bool(focus) and not new_question and resolved.scope != "set" and not professional
+    # a question that points at the conversation's property ("בנכס הזה", "שם") or mixes the trade with it restores the
+    # property slot even as a new question, unless it names another property: evidence the property's own names (its
+    # subject, its files' titles, its unit's names) do not hold (round 10 KTD7, AE3, AE4)
+    own_names = " ".join([f.get("subject") or "", *(focus_titles or []), *entities.unit_names(focus_unit)])
+    names_other = bool([e for e in settled.evidence if not (focus and e.held_by(own_names))]) or bool(
+        said and intent_mod.evidence(said, vocabulary, quoted=True))
+    reinstate = (bool(focus) and new_question and resolved.scope != "set" and not names_other
+                 and (settled.value == "mixed" or (settled.value == "property" and settled.bound == "property")))
+    keep_focus = bool(focus) and (not new_question or reinstate) and resolved.scope != "set" and not professional
     seen = authorized(focus_ids) if keep_focus and focus_ids else set()
     out.document_ids = [d for d in focus_ids if d in seen]
+    if reinstate and out.document_ids:
+        out.subject = out.subject or (f.get("subject") or "").strip()
+        decisions["documents"] = "reinstated the conversation's property: the question points at it and names no other"
     # a reply to a clarification: the candidate it names — by the model's reading of it as an answer, or whatever the
     # reading, by stating one's complete title or alias (R13); the units of the files a model's own question offered
     # are matched by the complete name alone
     picked = None
-    if resolved.scope != "set" and not professional and (pool := candidates or prior_units):
-        allowed = authorized([c["document_id"] for c in pool])
-        if candidates and relation == "clarification_answer":
-            picked = entities.among(candidates, message, allowed)
+    if pool := candidates or prior_units:
+        # a pending clarification binds only the message that answers it (round 10 KTD5, R13): a candidate named by
+        # the model's reading of the reply as an answer, by an ordinal or a number alone, or by a complete name. Any
+        # other message is a new question, and the clarification expires with it, never asked again unless the model
+        # called the reply an answer and the reply names two or more candidates
+        if resolved.scope == "set" or professional:
+            decisions["pending"] = f"expired: the message is a {'set' if resolved.scope == 'set' else 'professional'} question"
         else:
-            picked = entities.named_unit(pool, message, allowed)
+            allowed = authorized([c["document_id"] for c in pool])
+            if candidates and (relation == "clarification_answer" or entities.ordinal_reply(message)):
+                got = entities.among(candidates, message, allowed)
+                if got.kind == "resolved" or (relation == "clarification_answer"
+                                              and entities.names_several(candidates, message, allowed)):
+                    picked = got
+            else:
+                picked = entities.named_unit(pool, message, allowed)
+            decisions["pending"] = ("bound: candidate" if picked is not None
+                                    else "expired: the message names none of the candidates")
     if resolved.scope == "set":
         out.document_ids = []
         out.entity_changed = bool(focus)
@@ -554,6 +595,7 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
         decisions.setdefault("subject", "rejected")
     if resolved.ambiguity.strip() and relation == "correction" and not out.clarify:
         out.clarify = resolved.ambiguity.strip()
+    _ask_which_list(out, settled, candidates, listing, decisions)
     # the components apart from the rest: what is wrong with them never undoes the resolution
     analysis = request_analysis.settle(resolved.components, user_texts if user_texts is not None else [message])
     out.components, out.components_status = analysis.items, analysis.status
@@ -597,6 +639,60 @@ def _take(out: Request, outcome: entities.Outcome, words: str, decisions: dict,
         out.subject = ""
 
 
+MSG_TWO_LISTS = ("ההפניה למספר {n} מתאימה ליותר מדבר אחד: פריט {n} ברשימה שבתשובה הקודמת («{item}») ו{other}. "
+                 "לאיזה מהם התכוונת? אפשר לענות בשם.")
+
+
+def _bind_references(out: Request, resolved: ResolvedRequest, settled: intent_mod.Intent, topic: str,
+                     decisions: dict) -> None:
+    """What the references of the message bound to (round 10 U7; KTD6): an ordinal accepted for an item of the previous
+    answer's list names that item in the standalone question and is the request's topic; a pronoun bound to the topic slot
+    takes the slot's words; a rejected ordinal is recorded with its reason. The property slot is restored (or not) with the
+    documents."""
+    claim = resolved.intent
+    if claim is not None and claim.reference == "prior_answer_item":
+        if settled.bound == "item":
+            decisions["item"] = f"bound: {settled.item} «{settled.item_label}»"
+            if _norm(settled.item_label) not in _norm(out.standalone_question):
+                out.standalone_question = f"{out.standalone_question.rstrip('?. ')} — הכוונה ל«{settled.item_label}»"
+                decisions["item"] += "; the standalone question now names it"
+        else:
+            why = next((r.removeprefix("prior_answer_item rejected: ") for r in settled.reasons
+                        if r.startswith("prior_answer_item rejected")), "")
+            decisions["item"] = "rejected: " + why
+    if settled.bound == "item":
+        out.topic = settled.item_label
+    elif settled.bound == "topic":
+        out.topic = topic
+        decisions["topic"] = f"bound to the topic slot «{topic}»"
+    else:
+        out.topic = settled.topic
+        if settled.reference == "topic":
+            decisions["topic"] = "no topic in the conversation: the model's own words stand"
+
+
+def _ask_which_list(out: Request, settled: intent_mod.Intent, candidates: list[dict] | None, listing: list[dict] | None,
+                    decisions: dict) -> None:
+    """An ordinal that names an item of the previous answer's list and also fits the candidates of a clarification or
+    a listing of documents the previous turn offered has two substantive readings: one focused question, from the
+    server (round 10 KTD6). A listing that names the same thing as the item is one reading."""
+    if settled.bound != "item":
+        return
+    n, rivals = settled.item, []
+    if candidates and len(candidates) >= n:
+        rivals.append(f"אפשרות {n} מבין המסמכים ששאלתי עליהם ({prompt_text(entities.candidate_label(candidates[n - 1]))})")
+    if listing and len(listing) >= n:
+        title = listing[n - 1].get("title") or ""
+        if not (_norm(title) and (_norm(settled.item_label) in _norm(title) or _norm(title) in _norm(settled.item_label))):
+            rivals.append(f"מסמך {n} ברשימת המסמכים שהוצגה («{prompt_text(title)}»)")
+    if not rivals:
+        return
+    out.clarify = MSG_TWO_LISTS.format(n=n, item=prompt_text(settled.item_label), other=" ו".join(rivals))
+    out.server_clarify, out.candidates, out.named_documents = True, [], []
+    decisions["item"] = f"ambiguous: ordinal {n} fits the list «{settled.item_label}» and " + ("the candidates" if candidates
+                                                                                              and len(candidates) >= n else "the listing")
+
+
 def first_message_clarification(question: str, outcome: entities.Outcome, words: str) -> Request:
     """The request of a conversation's first message that names several units alike (``entities.first_message_ambiguity``):
     the server's question between them, with the candidates the reply will be resolved among (R13, AE4)."""
@@ -608,7 +704,7 @@ def first_message_clarification(question: str, outcome: entities.Outcome, words:
 
 
 def _input(focus: dict | None, history: list, message: str, documents: list[dict],
-           candidates: list[dict] | None = None) -> str:
+           candidates: list[dict] | None = None, items: list[str] | None = None, topic: str = "") -> str:
     parts = []
     if focus:
         def label(labels: dict, key: str) -> str:
@@ -629,6 +725,11 @@ def _input(focus: dict | None, history: list, message: str, documents: list[dict
     if candidates:
         parts.append("בתור הקודם נשאלה שאלת הבהרה בין המסמכים האלה:\n" + "\n".join(
             f"- {prompt_text(entities.candidate_label(c))}" for c in candidates))
+    if topic:
+        parts.append("הנושא המקצועי שהשיחה עסקה בו:\n" + prompt_text(topic))
+    if items:
+        parts.append("פריטי הרשימה האחרונה שתשובה נתנה (השרת חילץ אותם מהתשובה; reference prior_answer_item ו-item מצביעים "
+                     "על המספר שלהם):\n" + "\n".join(f"{n}. {prompt_text(label)}" for n, label in enumerate(items, 1)))
     if history:
         lines = [f"{'משתמש' if m.role == 'user' else 'עוזר'}: {prompt_text(m.content[:400])}" for m in history[-4:]]
         parts.append("ההודעות האחרונות:\n" + "\n".join(lines))
@@ -640,13 +741,16 @@ def resolve(provider: LLMProvider, focus: dict | None, history: list, message: s
             authorized: Callable[[Iterable[str]], set[str]], titles: list[str] | Callable[[], list[str]],
             usage: list[dict],
             deadline: float | None = None, lookup: Callable[[str], entities.Outcome] | None = None,
-            candidates: list[dict] | None = None, prior_units: list[dict] | None = None) -> Request | None:
+            candidates: list[dict] | None = None, prior_units: list[dict] | None = None,
+            items: list[str] | None = None, listing: list[dict] | None = None, topic: str = "") -> Request | None:
     """The validated request of a follow-up, or None when the call failed (the turn then goes on as before).
     ``documents``: the documents the conversation was about; ``authorized`` and ``titles``: what the user may see;
     ``lookup``: the documents the user's words name; ``candidates``: what the previous clarification offered;
-    ``prior_units``: the units the model's own previous question may have been between (see ``validate``)."""
+    ``prior_units``: the units the model's own previous question may have been between (see ``validate``);
+    ``items``, ``listing`` and ``topic``: the conversation's slots a reference can bind to (see ``validate``)."""
     provider = for_purpose(provider, Purpose.RESOLVE)
-    r = call_structured(provider, Purpose.RESOLVE, POLICY, _input(focus, history, message, documents, candidates),
+    r = call_structured(provider, Purpose.RESOLVE, POLICY,
+                        _input(focus, history, message, documents, candidates, items, topic),
                         ResolvedRequest, max_output_tokens=RESOLVE_OUTPUT_TOKENS, deadline=deadline)
     usage.append(usage_entry("resolve", r, provider.model))
     if r.status != CallStatus.OK or r.parsed is None:
@@ -654,7 +758,7 @@ def resolve(provider: LLMProvider, focus: dict | None, history: list, message: s
     users = [m.content for m in history if getattr(m, "role", None) == "user"]
     return validate(r.parsed, focus, message, authorized, titles, lookup, candidates,
                     focus_titles=[d["title"] for d in documents], user_texts=[*users, message],
-                    prior_units=prior_units)
+                    prior_units=prior_units, items=items, listing=listing, topic=topic)
 
 
 _REPLY_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
@@ -697,14 +801,22 @@ def bind_pending(pending: dict | None, message: str) -> dict | None:
 # a reply of a number alone: the number, with an approximation mark, a sign, a percent or currency unit and a closing
 # mark at most ("8%", "כ-8 אחוז", "1,500,000 ₪")
 _NUMBER_ONLY = re.compile(r"(?:כ-?\s*)?[-+]?\d[\d,]*(?:\.\d+)?\s*(?:%|אחוז(?:ים)?|₪|ש\"ח|שקל(?:ים)?)?\s*[.!]?")
-NUMBER_ONLY_CHARS = 24
 
 
 def number_only_reply(message: str) -> bool:
-    """Whether a message is a short reply of one number alone — the reply to a clarification the engine binds even
-    when the follow-up's resolution call fails, since no other reading of it exists."""
-    text_ = _norm(message)
-    return len(text_) <= NUMBER_ONLY_CHARS and bool(_NUMBER_ONLY.fullmatch(text_))
+    """Whether a message is one number alone, with at most a unit — the reply to a clarification the engine binds
+    whether or not the follow-up's resolution call succeeded, since no other reading of it exists. A form test: the
+    message's length plays no part (round 10 KTD5)."""
+    return bool(_NUMBER_ONLY.fullmatch(_norm(message)))
+
+
+def reply_binds(request: Request | None, message: str) -> bool:
+    """Whether a message answers the parameter a clarification asked for (round 10 KTD5, R13): the model read it as an
+    answer to the clarification and the intent is not professional, or the whole message is a number with at most a
+    unit. A new question that holds one number ("ומה היה השווי ב-2024?") is no answer."""
+    if number_only_reply(message):
+        return True
+    return request is not None and request.relation == "clarification_answer" and request.intent.value != "professional"
 
 
 def pending_block(binding: dict) -> str:
@@ -725,6 +837,9 @@ def pending_block(binding: dict) -> str:
 # the one line a professional request adds to the answering model's task (round 10 KTD7): it is about the trade, not
 # about the property the conversation was in
 PROFESSIONAL_NOTE = "- זו שאלה מקצועית כללית, לא על נכס או מסמך מסוים: אל תניח נכס מהשיחה ואל תשתמש בנתוניו"
+# the user pointed at an item of a list ("הגישה השנייה") and the previous answer printed none (round 10 KTD6)
+MSG_NO_LIST = ("- המשתמש הפנה לפריט ברשימה, אך בתשובה הקודמת לא ניתנה רשימה: ענה על הנושא כפי שנשאל, ואמור במפורש שלא "
+               "ניתנה רשימה שאפשר להפנות אליה")
 
 
 def requested_block(req: Request, unit_handle: str | None = None) -> str:
@@ -750,6 +865,12 @@ def requested_block(req: Request, unit_handle: str | None = None) -> str:
     professional = req.intent.value == "professional"
     if professional:
         lines.append(PROFESSIONAL_NOTE)
+    if req.intent.bound == "item":
+        lines.append(f"- ההודעה מפנה לפריט {req.intent.item} ברשימה שבתשובה הקודמת: «{prompt_text(req.intent.item_label)}»")
+    if req.topic and req.intent.value in slots.TOPIC_INTENTS:
+        lines.append(f"- נושא מקצועי: {prompt_text(req.topic)}")
+    if req.intent.no_list:
+        lines.append(MSG_NO_LIST)
     if req.entity_changed and req.scope == "set":
         lines.append("- השאלה על קבוצת מסמכים: מצא אותה (find_documents) ואל תסתמך על המסמכים הקודמים")
     elif req.entity_changed:

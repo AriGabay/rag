@@ -30,6 +30,12 @@ duration are non-names, an amount is none either. A number is a house number onl
 ``document`` keep their value, and whether a lookup runs is the evidence's decision, not the claim's; a missing,
 invalid or ``unknown`` claim is ``property`` when the message holds evidence (the request is about that property) and
 ``unknown`` otherwise — ``unknown`` runs no lookup and no selection. ``set`` mirrors ``scope``.
+
+A reference to the conversation is settled the same way (round 10 U7; KTD6): ``prior_answer_item`` with ``item: n`` binds
+only when the message holds an ordinal form (an ordinal word, a digit, "האחרון/ה") and the previous answer's item n
+exists (``slots.check_item``); otherwise the reference becomes ``none`` and the reason is recorded — with ``no_list`` when
+an ordinal was written and the previous answer gave no list. ``topic`` and ``conversation_property`` bind to the topic or
+the property slot when it exists.
 """
 
 from __future__ import annotations
@@ -40,7 +46,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from app.chat import contexts, entities
+from app.chat import contexts, entities, slots
 from app.extraction.normalize_text import base_normalize
 from app.platform.search import _scope_terms
 
@@ -84,14 +90,18 @@ POLICY = """intent — על מה הבקשה, לפי משמעות ההודעה ב
 - reference — במה ההודעה נשענת: none — בלי הפניה; conversation_property — הנכס שבמרכז השיחה ("הנכס הזה", "שם");
   named_entity — נכס או מסמך שההודעה נוקבת בו; prior_answer_item — פריט ברשימה שהתשובה הקודמת נתנה; topic — נושא
   מקצועי שהשיחה עסקה בו; clarification — תשובה לשאלת הבהרה.
-- item — המספר הסידורי של הפריט שההודעה מצביעה עליו ברשימה ("השני", "3"); אחרת null.
+- item — המספר הסידורי של הפריט שההודעה מצביעה עליו ברשימה שהתשובות נתנו ("השני", "3", "האחרון" — מספרו של הפריט האחרון);
+  אחרת null. prior_answer_item רק כשההודעה כוללת מילת סדר או ספרה, והרשימה ניתנה.
 - topic — הנושא המקצועי במילות המשתמש כשהבקשה professional או mixed; אחרת ריק.
 - standard_refs — הפניות לתקן ולסעיף כפי שנכתבו (standard, section; חלק שלא נכתב — ריק). מספר שאחרי "תקן" או "סעיף" הוא
   הפניה מקצועית, לא כתובת ולא מספר בית."""
 
 # the follow-up's own addition: the conversation's property does not decide the intent of a general question
 FOLLOW_UP_POLICY = ("- intent בהקשר שיחה: הנכס שבמרכז השיחה אינו קובע את ה-intent. שאלה מקצועית כללית באמצע שיחה על נכס "
-                    "היא professional, ו-reference שלה topic או none; הנכס מוזכר רק כשההודעה נשענת עליו.")
+                    "היא professional, ו-reference שלה topic או none; הנכס מוזכר רק כשההודעה נשענת עליו. כינוי (\"אותה\", "
+                    "\"זה\") מפנה ל-topic (הנושא המקצועי שבקלט) או ל-conversation_property (הנכס שבמרכז השיחה). מילת סדר "
+                    "או ספרה (\"השנייה\", \"3\", \"האחרון\") שמפנה לרשימה שתשובה נתנה היא reference=prior_answer_item עם "
+                    "item=מספר הפריט ברשימת הפריטים שבקלט; גם כשאין רשימה בקלט — סמן אותה והשרת יאמר שלא ניתנה רשימה.")
 
 
 @dataclass(frozen=True)
@@ -118,7 +128,10 @@ class Evidence:
 @dataclass(frozen=True)
 class Intent:
     """The turn's intent after the server's settling. ``claimed``: what the parse said ("" when it gave none or an
-    invalid one); ``evidence``: the hard evidence the message holds; ``reasons``: why the value is not the claim."""
+    invalid one); ``evidence``: the hard evidence the message holds; ``reasons``: why the value is not the claim.
+    ``item`` and ``item_label``: the item of the previous answer's list the message names, once the server accepted it;
+    ``bound``: what the reference bound to (``item``, ``topic``, ``property``) and "" when it bound to nothing;
+    ``no_list``: an ordinal was written and the previous answer gave no list."""
 
     value: str = "unknown"
     claimed: str = ""
@@ -128,6 +141,9 @@ class Intent:
     standard_refs: tuple[dict, ...] = ()
     evidence: tuple[Evidence, ...] = ()
     reasons: tuple[str, ...] = ()
+    item_label: str = ""
+    bound: str = ""
+    no_list: bool = False
 
     @property
     def refers(self) -> bool:
@@ -136,7 +152,8 @@ class Intent:
 
     def as_dict(self) -> dict:
         return {"value": self.value, "claimed": self.claimed, "reference": self.reference, "item": self.item,
-                "topic": self.topic, "standard_refs": [dict(r) for r in self.standard_refs],
+                "item_label": self.item_label, "bound": self.bound, "topic": self.topic,
+                "standard_refs": [dict(r) for r in self.standard_refs],
                 "evidence": [e.as_dict() for e in self.evidence], "reasons": list(self.reasons)}
 
 
@@ -248,11 +265,14 @@ def query_of(items: list[Evidence]) -> str:
 # --- settling ---------------------------------------------------------------------------------------------------------
 
 def settle(claim: IntentClaim | None, message: str, vocabulary: list[str], scope: str = "entity",
-           has_property: bool = False, quoted: str = "") -> Intent:
+           has_property: bool = False, quoted: str = "", items: list[str] | tuple[str, ...] = (),
+           topic: str = "") -> Intent:
     """The turn's intent from the model's claim and the message (see the module docstring). ``scope``: the parse's
     scope (``set`` decides intent ``set``); ``has_property``: the conversation has a property in its centre (only said
     in the reasons: a claim about a property without evidence and without one runs no lookup); ``quoted``: the words
-    the model quoted for a change of subject, whose evidence counts beside the message's."""
+    the model quoted for a change of subject, whose evidence counts beside the message's; ``items``: the labels of the
+    list the previous answer printed, which an ordinal can name; ``topic``: the conversation's topic slot, which a
+    pronoun can bind to."""
     found = tuple(dict.fromkeys([*evidence(message, vocabulary), *(evidence(quoted, vocabulary, quoted=True) if quoted else ())]))
     why: list[str] = []
     claimed = claim.intent if claim is not None else ""
@@ -275,7 +295,26 @@ def settle(claim: IntentClaim | None, message: str, vocabulary: list[str], scope
         value = claimed
         if claimed in LOOKUP_VALUES and not found:
             why.append("no hard evidence in the message: no lookup" + ("" if has_property else ", no property in the conversation"))
-    return Intent(value=value, claimed=claimed, reference=claim.reference if claim else "none",
-                  item=claim.item if claim else None, topic=" ".join(claim.topic.split()) if claim else "",
+    reference = claim.reference if claim else "none"
+    item, label, bound, no_list = None, "", "", False
+    if reference == "prior_answer_item":
+        # an ordinal binds only to an item the previous answer printed, on the message's own words (KTD6)
+        rejected = slots.check_item(claim.item, message, list(items))
+        if rejected is None:
+            item, label, bound = claim.item, items[claim.item - 1], "item"
+            why.append(f"ordinal {item} bound to the previous answer's item «{label}»")
+        else:
+            reference, no_list = "none", not items and bool(slots.ordinal_forms(message))
+            why.append("prior_answer_item rejected: " + rejected)
+    elif reference == "topic":
+        bound = "topic" if topic else ""
+        if not topic:
+            why.append("topic reference: no topic in the conversation")
+    elif reference == "conversation_property":
+        bound = "property" if has_property else ""
+        if not has_property:
+            why.append("conversation_property reference: no property in the conversation")
+    return Intent(value=value, claimed=claimed, reference=reference, item=item,
+                  topic=" ".join(claim.topic.split()) if claim else "",
                   standard_refs=tuple(r.model_dump() for r in claim.standard_refs) if claim else (),
-                  evidence=found, reasons=tuple(why))
+                  evidence=found, reasons=tuple(why), item_label=label, bound=bound, no_list=no_list)

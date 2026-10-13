@@ -30,6 +30,15 @@ citations, and stores its pending parameter in the answer (``answer.pending``: t
 question and the values kept, each with the passage it was verified in; ``answer.missing`` names the parameters). No
 migration: ``messages.answer`` is JSON. The next turn's input carries it with each value pointed at the ``P#`` that
 reopens its passage (``_pending_refs``), so the reply is bound to the parameter and nothing is searched again.
+
+The conversation's slots (round 10 U7; KTD4-KTD7, R10-R15) are stored beside it, in ``answer.context`` (``app.chat.slots``;
+schema version 1, no migration): the topic with the items the answer listed, the property with its task parameters, the
+sources cited and the clarification asked. ``_turn_input`` reads them back from the **latest** assistant message, chosen
+before the hidden-message filter: when that message is hidden the turn has no slot at all, so an older message's pending
+clarification is never revived. The property slot is re-authorized each turn and dropped whole (its subject text included)
+when a document of it is no longer visible; it is not a document of the message, so a professional answer that carries it
+is not hidden by it. ``context`` is server-only: ``_message_json`` never sends it. A message stored before the slots is
+read from the fields it had (``_legacy_context``), so older conversations behave as before.
 """
 
 from __future__ import annotations
@@ -41,7 +50,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import NamedTuple
 from uuid import UUID
 
@@ -50,7 +59,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
 from app.audit import audit
-from app.chat import anchors, coverage, decisions, engine, verify
+from app.chat import anchors, coverage, decisions, engine, slots, verify
 from app.chat.compose import SERVER_SPANS_FIELD, strip_server_spans, text_digest
 from app.config import get_settings
 from app.db import TenantContext, current_data_version, tenant_tx
@@ -205,6 +214,8 @@ def _message_json(r, dv: int | None = None, sh: str | None = None, visible: set 
     answer = r.answer
     content = r.content
     stale = False
+    if answer and "context" in answer:  # the slots are the server's: nothing of them reaches the client (KTD4)
+        answer = {k: v for k, v in answer.items() if k != "context"}
     if answer and isinstance(answer.get("verification"), dict):
         answer = answer | {"verification": public_verification(answer["verification"])}
     if answer and r.role == "assistant" and status_ == "done":
@@ -592,6 +603,11 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
         {"c": conversation_id, "t": user.created_at, "n": HISTORY_MESSAGES}).all()
     rows = list(reversed(rows))
     visible = _visible_documents(conn, rows)
+    # the slots come from the latest assistant answer, chosen BEFORE the hidden filter: when it is hidden the turn gets no
+    # slot at all (no pending clarification, topic, property, parameters or sources), and an older message's are never
+    # revived (R15, KTD4)
+    latest = next((r for r in reversed(rows) if r.role == "assistant" and r.answer), None)
+    slot_hidden = latest is not None and _hidden(latest, visible)
     # an answer resting on a document the user can no longer see is not carried into the model's context
     rows = [r for r in rows if not (r.role == "assistant" and _hidden(r, visible))]
     history = [engine.HistoryMessage(r.role, said) for r in rows if r.content and (said := _history_text(r))]
@@ -603,7 +619,7 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
             continue
         for d in r.answer.get("documents") or []:
             focus[d["document_id"]] = d["title"]
-    last = next((r for r in reversed(rows) if r.role == "assistant" and r.answer), None)
+    last = None if slot_hidden else latest
     if last is not None:
         for s in (last.answer.get("sources") or [])[:12]:
             if not s.get("version_id"):  # a listing names documents; there is no place in one to reopen
@@ -619,33 +635,110 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
                           # where a source read only in part continues (``tools._target_json``): reopening it
                           # offers the continuation, checked against the same reading
                           "resume": s.get("more") if isinstance(s.get("more"), dict) else None}
-    # the last answer's focus, or, when it named no datum, the request it answered (``app.chat.resolve``); its
-    # message is in ``rows`` only while every document it names is visible
-    last_focus = None
+    # the conversation's slots as the last answer left them: the focus is its property and parameters, the candidates and
+    # the pending parameter the clarification it asked (its message is in ``rows`` only while every document it names is
+    # visible); the property slot is checked again here, under the user's permissions as they are now
+    context: dict | None = None
+    notes: dict[str, str] = {}
     candidates: list[dict] = []
     clarified: list[str] = []
     pending = None
+    listing: list[dict] = []
     if last is not None:
-        last_focus = _with_unit(last.answer.get("focus") or _request_focus(last.answer.get("request")),
-                                last.answer.get("unit"))
-        if last.answer.get("status") == "clarification":
-            # the documents a server clarification offered: the reply is resolved among them (the message is in
-            # ``rows`` only while every one of them is visible)
-            candidates = list((last.answer.get("request") or {}).get("candidates") or [])
+        context, notes = _authorize_property(conn, _read_context(last.answer))
+        if (asked := context.get("pending")) is not None:
+            payload = asked.get("payload") or {}
+            # the documents a server clarification offered: the reply is resolved among them
+            candidates = list(payload.get("candidates") or [])
             if not candidates:
                 # the model's own question between appraisals offered none: the files that turn touched are where a reply
                 # that states a unit's complete name is looked for (round 9 R13)
-                clarified = list(dict.fromkeys(
-                    [*(d.get("document_id") for d in last.answer.get("documents") or []),
-                     *(last.answer.get("touched_documents") or []), *((last.answer.get("focus") or {}).get("document_ids") or [])]))
+                clarified = list(payload.get("clarified") or [])
             # the parameter a clarification asked for (round 7 KTD9): the reply is bound to it, and the values it
             # kept are reopened through the references above
-            if isinstance(last.answer.get("pending"), dict):
-                pending = _pending_refs(last.answer["pending"], prior_ids)
-    return engine.TurnInput(question=user.content, history=history, summary=summary, focus=last_focus,
+            if asked.get("kind") == "parameter" and isinstance(payload.get("parameter"), dict):
+                pending = _pending_refs(payload["parameter"], prior_ids)
+        listing = _listing(conn, last.answer)
+    return engine.TurnInput(question=user.content, history=history, summary=summary, focus=slots.join_focus(context),
                             focus_documents=[{"document_id": k, "title": v} for k, v in list(focus.items())[-8:]],
                             prior_refs=prior, candidates=candidates, clarified_documents=clarified,
-                            pending=pending), _user_message_ids(rows, user_message_id)
+                            pending=pending, slots=context, listing=listing, slot_notes=notes), \
+        _user_message_ids(rows, user_message_id)
+
+
+def _read_context(answer: dict) -> dict:
+    """The slots an answer left: its stored context, or — for a message written before the slots — the same slots read from
+    the fields it had (``_legacy_context``)."""
+    stored = answer.get("context")
+    if isinstance(stored, dict) and stored.get("version") == slots.VERSION:
+        return stored
+    return _legacy_context(answer)
+
+
+def _legacy_context(answer: dict) -> dict:
+    """The slots of an answer stored before ``answer.context``, so an older conversation behaves exactly as it did: the
+    focus (or, when it named no datum, the request it answered) with the unit, the candidates a server clarification
+    offered (or, for the model's own question, the files that turn touched) and the parameter a clarification asked for."""
+    prop, params = slots.split_focus(_with_unit(answer.get("focus") or _request_focus(answer.get("request")),
+                                                answer.get("unit")))
+    pending = None
+    if answer.get("status") == "clarification":
+        pending = _pending_slot(answer.get("pending") if isinstance(answer.get("pending"), dict) else None,
+                                (answer.get("request") or {}).get("candidates") or [],
+                                (answer.get("request") or {}).get("named_document_ids") or [], _clarified_documents(answer),
+                                None)
+    return {"version": slots.VERSION, "topic": None, "property": prop, "params": params,
+            "sources": [], "pending": pending}
+
+
+def _clarified_documents(answer: dict) -> list[str]:
+    """The files a model's own clarification turn touched: where a reply that states a unit's complete name is looked for."""
+    return list(dict.fromkeys(
+        [*(d.get("document_id") for d in answer.get("documents") or []), *(answer.get("touched_documents") or []),
+         *((answer.get("focus") or {}).get("document_ids") or [])]))
+
+
+def _pending_slot(parameter: dict | None, candidates: list[dict], named: list[str], clarified: list[str],
+                  asked_at: str | None) -> dict | None:
+    """The pending slot of a clarification: the parameter it asked for, else the candidates it offered (or, with none,
+    the files it touched). None when it offered nothing a reply could bind to (the server's question between two lists)."""
+    if parameter is None and not (candidates or named or clarified):
+        return None
+    if parameter is not None:
+        payload = {"parameter": parameter, "clarified": clarified}
+    else:
+        payload = {"candidates": list(candidates), "named_document_ids": list(named),
+                   "clarified": [] if candidates else clarified}
+    return {"kind": "parameter" if parameter is not None else "candidates", "payload": payload, "asked_at": asked_at}
+
+
+def _authorize_property(conn: Connection, context: dict) -> tuple[dict, dict[str, str]]:
+    """The context with its property slot checked against what the user sees now (KTD4): a slot with any document no
+    longer visible is dropped whole — the subject text and the task parameters with it — and the drop is recorded. The
+    slot is not a document of the message, so this check is its only gate."""
+    ids = slots.property_documents(context)
+    if ids and not ids <= _visible_ids(conn, ids):
+        return context | {"property": None, "params": None}, {"property": "dropped: a document of the property slot is "
+                                                                          "no longer visible"}
+    return context, {}
+
+
+def _listing(conn: Connection, answer: dict) -> list[dict]:
+    """The documents a listing source of the answer offered (``find_documents``, ``list_documents``), in order, with the
+    titles the user sees now: what an ordinal such as "השנייה" may name besides an item of the answer's text."""
+    ids = list(dict.fromkeys(d for s in answer.get("sources") or [] if s.get("kind") == "listing"
+                             for d in s.get("listed_document_ids") or []))
+    if not ids:
+        return []
+    uuids = []
+    for i in ids:
+        try:
+            uuids.append(UUID(str(i)))
+        except ValueError:
+            continue
+    titles = {str(r.id): r.title for r in conn.execute(
+        text("SELECT id, title FROM documents WHERE id = ANY(:i) AND deleted_at IS NULL"), {"i": uuids})}
+    return [{"document_id": d, "title": titles[d]} for d in ids if d in titles]
 
 
 def _pending_refs(pending: dict, prior_ids: dict[str, str]) -> dict:
@@ -701,7 +794,10 @@ def _public_source(src) -> dict:
 
 
 def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = None,
-                    removals: _Removals | None = None) -> dict:
+                    removals: _Removals | None = None, previous: dict | None = None,
+                    message_id: str | None = None) -> dict:
+    """The stored answer. ``previous``: the conversation's slots as this turn read them (``TurnInput.slots``), which the
+    answer's own ``context`` carries forward; ``message_id``: this message, the one the topic's items come from."""
     ws, a = outcome.workspace, outcome.answer
     cited = coverage.cited_ids(a.answer_markdown)
     sources = [_public_source(ws.sources[i]) for i in ws.sources if i in cited]
@@ -807,7 +903,59 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
     # every cited source, value and measurement keeps where it points, resolved against the turn's pinned readings
     # (KTD1); a computation keeps its inputs
     anchors.attach(ws, payload)
+    payload["context"] = _context(outcome, payload, previous, message_id)
     return payload
+
+
+def _context(outcome: engine.TurnOutcome, payload: dict, previous: dict | None, message_id: str | None) -> dict:
+    """The conversation's slots after this answer (``slots.carry``; KTD4): the property and its parameters this turn left
+    (a professional turn leaves the previous ones unchanged, dormant), the topic with the items the answer's text listed,
+    the sources it cited and the clarification it asks. The property slot is not registered in ``_answer_documents``:
+    ``_turn_input`` checks it again every turn."""
+    ws, a = outcome.workspace, outcome.answer
+    request = payload.get("request") or {}
+    intent = ws.intent
+    prop, params = slots.split_focus(_property_focus(payload, previous))
+    if prop is None and previous and not request.get("entity_changed"):
+        # a turn that found no datum and moved nowhere (its parse failed, the model asked, a limit was reached) leaves
+        # the conversation's property where it was: dormant, as a professional turn leaves it
+        prop, params = previous.get("property"), previous.get("params") if previous.get("property") else None
+    topic = ""
+    if intent in slots.TOPIC_INTENTS:
+        said = ((outcome.resolution or {}).get("intent") or {}).get("topic") or ""
+        current = next((m["text"] for m in ws.user_messages if m.get("current")), "")
+        topic = request.get("topic") or said or request.get("standalone_question") or current
+    items = [] if outcome.server_asked else slots.extract_items(
+        strip_server_spans(a.answer_markdown, payload.get(SERVER_SPANS_FIELD)))
+    seen: set[tuple] = set()
+    cited = []
+    for src in payload["sources"]:
+        # the kind of document is `appraisal` until the professional kinds are stored; a listing names no document
+        if src.get("document_id") and (key := (src["document_id"], src.get("section"))) not in seen:
+            seen.add(key)
+            cited.append({"document_id": src["document_id"], "source_kind": "appraisal", "standard": None,
+                          "section": src.get("section")})
+    asked = None
+    if a.status == "clarification":
+        asked = _pending_slot(payload.get("pending"), request.get("candidates") or [], request.get("named_document_ids") or [],
+                              _clarified_documents(payload), datetime.now(UTC).isoformat(timespec="seconds"))
+    return slots.carry(previous, intent=intent, property=prop, params=params, topic=topic, items=items,
+                       message_id=message_id, sources=cited, pending=asked)
+
+
+def _property_focus(payload: dict, previous: dict | None) -> dict | None:
+    """The focus a property turn leaves: the answer's own (or the datum its request named) with the unit it is in. A turn
+    whose request reinstated the conversation's property without naming a datum ("איך מיישמים אותה בנכס הזה?") has no
+    datum: its property is the request's, with the parameters it had when the previous slot was the same property."""
+    request = payload.get("request") or {}
+    focus = payload.get("focus") or _request_focus(request)
+    if focus is None and request.get("document_ids"):
+        same = set(request["document_ids"]) == set(((previous or {}).get("property") or {}).get("document_ids") or [])
+        focus = slots.join_focus({
+            "property": {"document_ids": list(request["document_ids"]), "located_unit": request.get("located_unit"),
+                         "subject": request.get("subject") or ""},
+            "params": (previous or {}).get("params") if same else None})
+    return _with_unit(focus, payload.get("unit"))
 
 
 def _checked_ids(ws, ids: list[str]) -> list[str]:
@@ -959,7 +1107,7 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
                                   lambda: _cancel_requested(ctx, message_id))
         _log_turn_usage(ctx, provider, outcome.usage)
         removals = _removals(outcome.workspace, outcome.report)  # the payload's documents and the diagnostics' decisions
-        payload = _answer_payload(outcome, user_ids, removals)
+        payload = _answer_payload(outcome, user_ids, removals, previous=inp.slots, message_id=str(message_id))
         recorded = _finish(ctx, message_id, "done", content=outcome.answer.answer_markdown, answer=payload,
                            usage=outcome.usage, model=provider.model,
                            diagnostics=_diagnostics(outcome, payload, removals))

@@ -51,8 +51,10 @@ clarification stores its pending parameter on the message (``TurnOutcome.pending
 the reply to it before anything else (``resolve.bind_pending``: the parameter the question asked, else the first
 still waiting), freezes the component with that parameter given by the user and the others still not given, and
 tells the model to register it with ``assume`` (the ``A#`` records the parameter it fills) and to reopen the values
-already found through their ``P#`` — no new search. When the follow-up's resolution call fails, only a reply of a
-number alone stays bound (``resolve.number_only_reply``).
+already found through their ``P#`` — no new search. The reply binds only when it answers the parameter (round 10 KTD5,
+``resolve.reply_binds``): the resolution reads it as an answer to the clarification and its intent is not professional, or
+the whole message is a number with at most a unit (``resolve.number_only_reply``, whether or not the resolution call
+succeeded). A new question that holds one number is no answer, and the pending clarification expires with it.
 
 Every removal is a structured decision (round 7 U4, KTD5, KTD10): the repair prompt gives each problem's failure kind,
 the ids it was checked against and how a repair of that kind goes, within the same repair-round budget and
@@ -433,6 +435,15 @@ class TurnInput:
     # the parameter the previous answer's clarification asked for (round 7 KTD9): {"component", "text",
     # "parameters", "question", "found": [{"id", "label", "value_text", "source_id", "prior"}]}
     pending: dict | None = None
+    # the conversation's slots as the previous answer left them (``app.chat.slots``; round 10 U7), after the property
+    # slot was re-authorized: None when the latest answer is hidden (the turn has no slot at all). The topic's items and
+    # text reach the resolution; the whole is what this turn's answer carries forward
+    slots: dict | None = None
+    # the documents a listing of the previous turn offered, in order ({document_id, title}): an ordinal may fit one
+    listing: list[dict] = field(default_factory=list)
+    # what the server decided about the slots before the turn (a property slot dropped because a document is no longer
+    # visible), for the resolution's decisions
+    slot_notes: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -462,6 +473,8 @@ class TurnOutcome:
     # worked in, which the next turn keeps across a metric change; None for a file of one unit or when no unit was
     # named, cited or worked in
     unit: dict | None = None
+    # the turn ended in the server's own question (``asked_by_server``): its text is the server's, not a list of items
+    server_asked: bool = False
 
 
 def usage_summary(usage: list[dict], **extra) -> dict:
@@ -654,6 +667,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         note_intent(analysis, late=turn_intent is not None)
         return True
 
+    notes: dict[str, str] = dict(inp.slot_notes)  # what the server decided about the slots, for the decisions
+
     def asked_by_server(asking: resolve.Request) -> TurnOutcome:
         """The turn that ends in the clarification ``asking`` carries: the server's own words, nothing of the model's to
         check, so no judge call; saved with its digest."""
@@ -662,10 +677,12 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                              scope_kind="focused", scope_query="", omitted=[], focus=None, requested=[],
                              parts=[])
         return TurnOutcome(answer, ws, VerifyReport([], judged=True, judge_status="no_claims"), steps, usage, {},
-                           rounds, asking.as_dict(), asking.resolution, _summary(usage, rounds, reused, turn),
-                           final_digest=text_digest(answer.answer_markdown), timing=ws.clock.summary())
+                           rounds, asking.as_dict(), _with_notes(asking.resolution, notes),
+                           _summary(usage, rounds, reused, turn), final_digest=text_digest(answer.answer_markdown),
+                           timing=ws.clock.summary(), server_asked=True)
 
-    # a reply to a clarification that asked for a parameter: bound to it before anything else (round 7 KTD9)
+    # a reply to a clarification that asked for a parameter: bound to it before anything else (round 7 KTD9) — and kept
+    # only when the reply answers it (below)
     binding = resolve.bind_pending(inp.pending, inp.question)
     if inp.history or inp.focus:
         # a follow-up is resolved in its context, and validated, before anything is searched. Three document sets
@@ -673,23 +690,28 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         # under the user's permissions) and the documents the new request names (looked up the same way)
         focus_ids = {d["document_id"] for d in inp.focus_documents} | set((inp.focus or {}).get("document_ids") or [])
         prior_units = entities.units_of_documents(ctx, inp.clarified_documents) if not inp.candidates else []
+        topic_slot = (inp.slots or {}).get("topic") or {}
         request = resolve.resolve(
             provider, inp.focus, inp.history, inp.question, inp.focus_documents,
             lambda ids: entities.authorized(ctx, ids), titles, usage, deadline,
             lookup=lambda words: entities.lookup(ctx, words, focus_ids, titles), candidates=inp.candidates or None,
-            prior_units=prior_units or None)
+            prior_units=prior_units or None, items=topic_slot.get("items") or None, listing=inp.listing or None,
+            topic=topic_slot.get("text") or "")
         if cancelled():
             raise TurnCancelled
         if request is not None:
             ws.intent = request.intent.value
         if request is not None and request.located_unit:
             _settle_unit(ctx, ws, request)
-        if request is not None and request.relation == "new_question":
-            binding = None  # a new question is no reply to the clarification, whatever number it holds
-        elif request is None and binding is not None and not resolve.number_only_reply(inp.question):
-            # the resolution failed: only a reply of a number alone is surely the clarification's answer; a message
-            # with words around its number may be a new question, never forced into the old calculation
+        if binding is not None and not resolve.reply_binds(request, inp.question):
+            # a message that is not the answer is a new question, whatever number it holds: never forced into the old
+            # calculation (the resolution failed: only a number alone is surely the answer)
             binding = None
+        if inp.pending:  # a pending parameter lives one message (KTD5): bound by this reply, or expired with it
+            notes["pending"] = ("bound: parameter" if binding is not None
+                                else "expired: the message does not answer the parameter asked")
+        elif request is None and (inp.candidates or inp.clarified_documents):
+            notes["pending"] = "expired: the resolution failed, so nothing was bound to the clarification"
         # the components came with the resolution; a failed resolution or an invalid component part leaves them to
         # the judge, and the rest of the resolution still stands
         if request is not None and request.components:
@@ -769,7 +791,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             ledger["requirements_origin"] = turn.record_origin()
         return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
                            request.as_dict() if request is not None else None,
-                           request.resolution if request is not None else _first_resolution(turn_intent, first_decisions),
+                           _with_notes(request.resolution if request is not None
+                                       else _first_resolution(turn_intent, first_decisions), notes),
                            _summary(usage, rounds, reused, turn),
                            _pending(ws, turn, final), composed.spans, done.digest, done.stats, ws.clock.summary(),
                            unit)
@@ -966,6 +989,18 @@ def _record_intent(resolution: dict, settled: intent_mod.Intent, decisions: dict
     """The settled intent, and the decisions taken on it, in a resolution kept for the diagnostics."""
     resolution["intent"] = settled.as_dict()
     resolution.setdefault("decisions", {}).update({"intent": settled.value, **(decisions or {})})
+
+
+def _with_notes(resolution: dict | None, notes: dict[str, str]) -> dict | None:
+    """The resolution with the server's decisions about the slots (``notes``) among its decisions; a decision the
+    resolution already holds under the same name stands."""
+    if not notes:
+        return resolution
+    out = resolution if resolution is not None else {}
+    decisions = out.setdefault("decisions", {})
+    for key, note in notes.items():
+        decisions.setdefault(key, note)
+    return out
 
 
 def _first_resolution(settled: intent_mod.Intent | None, decisions: dict) -> dict | None:

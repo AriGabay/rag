@@ -62,7 +62,7 @@ from uuid import UUID
 
 from sqlalchemy import text
 
-from app.chat import contexts
+from app.chat import contexts, slots
 from app.chat import units as unit_store
 from app.db import TenantContext, tenant_tx
 from app.extraction.normalize_text import base_normalize
@@ -458,6 +458,10 @@ def among(candidates: list[dict], reply: str, authorized: set[str]) -> Outcome:
     named = _named_by_phrase(cands, reply)  # "מתחם הגפן ב": the letter the tokenizer drops is part of the name
     if len(named) == 1:
         return Outcome("resolved", named, reply)
+    if ordinal_reply(reply):  # "את השנייה", "לשלישית": an ordinal word with the prefix letters Hebrew puts before it
+        forms = {len(cands) if f == -1 else f for f in slots.ordinal_forms(reply)}
+        if len(forms) == 1 and 1 <= (n := next(iter(forms))) <= len(cands):
+            return Outcome("resolved", [cands[n - 1]], reply)
     vocab = {id(c): _candidate_words(c) for c in cands}
     # a word of the reply that some candidates hold and others lack ("בכפר גפן", "ב", not "הנרקיס")
     letters = [{w} for w in words if len(w) == 1 and w.isalnum()]  # the letter or digit that tells "הגפן א" from "הגפן ב"
@@ -471,6 +475,30 @@ def among(candidates: list[dict], reply: str, authorized: set[str]) -> Outcome:
     if count and not telling and 1 <= int(count.group(1)) <= len(cands):
         return Outcome("resolved", [cands[int(count.group(1)) - 1]], reply)
     return Outcome("ambiguous", cands, reply)
+
+
+_ORDINAL_REPLY = re.compile(
+    r"(?:(?:אני\s+)?(?:מתכוון|מתכוונת|התכוונתי|בחרתי|רוצה)\s+)?(?:(?:ל|את|ב)\s*)?"
+    r"(?:ה?(?:" + "|".join(sorted(slots.ORDINAL_WORDS, key=len, reverse=True)) + r")|(?:מספר|אפשרות|#)?\s*\d{1,2})"
+    r"(?:\s+(?:בבקשה|תודה))?[.!]?")
+
+
+def ordinal_reply(reply: str) -> bool:
+    """Whether a reply is an ordinal or a list number and nothing more ("השנייה", "את השלישית", "2", "מספר 2",
+    "התכוונתי לראשון"): the reply to a numbered question that needs no word of the model to be one (round 10 KTD5)."""
+    return bool(_ORDINAL_REPLY.fullmatch(" ".join(base_normalize(reply or "").split()).strip()))
+
+
+def names_several(candidates: list[dict], reply: str, authorized: set[str]) -> bool:
+    """Whether a reply that picked no single candidate still names two or more of them — by a word of its own that
+    several candidates hold ("הגפן" for "מתחם הגפן א" and "מתחם הגפן ב"). Only such a reply, called an answer by the model,
+    is asked about again; a reply that names none ("כולן") is a new question (round 10 KTD5)."""
+    cands = [Candidate(str(c["document_id"]), c["title"], unit=c.get("unit"), file_title=c.get("file_title") or "")
+             for c in candidates if str(c["document_id"]) in authorized]
+    if not cands or among(candidates, reply, authorized).kind == "resolved":
+        return False
+    vocab = [_candidate_words(c) for c in cands]
+    return any(sum(1 for v in vocab if v & set(forms)) >= 2 for forms in _scope_terms(reply))
 
 
 def _unit_names(conn) -> list[str]:
