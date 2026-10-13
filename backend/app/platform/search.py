@@ -50,6 +50,7 @@ from app.extraction.normalize_text import (
     prefix_variants,
     query_tokens,
 )
+from app.platform.source_kinds import APPRAISALS_SQL
 from app.providers.embeddings import get_embedding_provider, to_pgvector
 
 router = APIRouter(prefix="/api/search", tags=["search"])
@@ -454,7 +455,7 @@ def documents_named(conn: Connection, query: str, scope: SearchScope | None = No
     frequencies are over every visible document; ``scope`` only limits which of them may be named."""
     docs = [(r.id, r.title) for r in conn.execute(text(
         "SELECT d.id, d.title FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
-        " WHERE d.deleted_at IS NULL"))]
+        f" WHERE d.deleted_at IS NULL AND {APPRAISALS_SQL}"))]
     # a title's words, and its numbers however short (the house number of "התמר 5")
     words_of = {i: _title_words(t) | _numbers_of(t) for i, t in docs}
     df: dict[str, int] = {}
@@ -539,7 +540,7 @@ def documents_matching(conn: Connection, query: str) -> list[dict]:
     rows = conn.execute(text(
         "SELECT d.id, d.title, " + ", ".join(filters) + " FROM documents d JOIN document_versions v"
         " ON v.document_id = d.id AND v.is_current LEFT JOIN chunks c ON c.version_id = v.id"
-        " WHERE d.deleted_at IS NULL GROUP BY d.id, d.title"), params).all()
+        f" WHERE d.deleted_at IS NULL AND {APPRAISALS_SQL} GROUP BY d.id, d.title"), params).all()
     out = []
     term_sets = [set(t) for t in terms]
     for r in rows:
@@ -575,7 +576,8 @@ class UnitMatches:
 _FILE_SQL = (
     "SELECT d.id, d.title, v.id AS version_id, COALESCE(v.ingestion->>'reading_id', '') AS reading_id, {counts}"
     " FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
-    " LEFT JOIN chunks c ON c.version_id = v.id WHERE d.deleted_at IS NULL GROUP BY d.id, d.title, v.id")
+    f" LEFT JOIN chunks c ON c.version_id = v.id WHERE d.deleted_at IS NULL AND {APPRAISALS_SQL}"
+    " GROUP BY d.id, d.title, v.id")
 
 
 def _tsquery(forms: Sequence[str], prefix: str, params: dict) -> str:
@@ -788,7 +790,8 @@ def document_term_holders(conn: Connection, terms: list[list[str]]) -> dict[UUID
     out: dict[UUID, set[int]] = {}
     for r in conn.execute(text(
             f"SELECT d.id, d.title, {counts} FROM documents d JOIN document_versions v ON v.document_id = d.id"
-            " AND v.is_current LEFT JOIN chunks c ON c.version_id = v.id WHERE d.deleted_at IS NULL AND NOT EXISTS"
+            f" AND v.is_current LEFT JOIN chunks c ON c.version_id = v.id WHERE d.deleted_at IS NULL AND {APPRAISALS_SQL}"
+            " AND NOT EXISTS"
             " (SELECT 1 FROM document_units u WHERE u.version_id = v.id AND u.reading_id = COALESCE("
             "v.ingestion->>'reading_id', '') OFFSET 1) GROUP BY d.id, d.title"), params):
         title = _title_words(r.title)
@@ -835,7 +838,7 @@ def documents_sharing_title_words(conn: Connection, question: str) -> dict[str, 
     ("תקן", "שומה") never counts."""
     docs = [(r.id, r.title) for r in conn.execute(text(
         "SELECT d.id, d.title FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
-        " WHERE d.deleted_at IS NULL ORDER BY d.title, d.id"))]
+        f" WHERE d.deleted_at IS NULL AND {APPRAISALS_SQL} ORDER BY d.title, d.id"))]
     if len(docs) < 2:
         return {}
     ceiling = min(8, max(2, int(0.4 * len(docs))))
@@ -860,7 +863,7 @@ UNREAD_STATUSES = ("failed", "pending", "processing")
 _UNREAD_FROM = (
     " FROM documents d JOIN LATERAL (SELECT v.id, v.version_no, v.status, v.status_reason, v.ingestion, v.created_at"
     " FROM document_versions v WHERE v.document_id = d.id ORDER BY v.version_no DESC LIMIT 1) lv ON true"
-    " WHERE d.deleted_at IS NULL AND lv.status = ANY(:unread)"
+    f" WHERE d.deleted_at IS NULL AND {APPRAISALS_SQL} AND lv.status = ANY(:unread)"
     " AND NOT EXISTS (SELECT 1 FROM document_versions c WHERE c.document_id = d.id AND c.is_current)")
 
 
@@ -907,7 +910,7 @@ def unread_named(conn: Connection, query: str, files: list[dict] | None = None) 
         return []
     titles = [r.title for r in conn.execute(text(
         "SELECT d.title FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
-        " WHERE d.deleted_at IS NULL"))] + [d["title"] for d in unread]
+        f" WHERE d.deleted_at IS NULL AND {APPRAISALS_SQL}"))] + [d["title"] for d in unread]
     df: dict[str, int] = {}
     for t in titles:
         for w in _title_words(t) | _numbers_of(t):

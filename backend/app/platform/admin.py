@@ -14,6 +14,7 @@ from app.audit import audit
 from app.db import TenantContext, bump_data_version, tenant_tx
 from app.deps import NOT_FOUND, parse_uuid, require_admin
 from app.platform.documents import latest_status_counts
+from app.platform.source_kinds import APPRAISALS_SQL
 from app.providers.status import (
     RETENTION_NOTES,
     office_provider_state,
@@ -296,7 +297,8 @@ def reprocess(body: ReprocessBody, ctx: TenantContext = Depends(require_admin)) 
 @router.post("/measurements")
 def extract_measurements(body: ReprocessBody, ctx: TenantContext = Depends(require_admin)) -> dict:
     """Queue measurement extraction for current versions without a completed run of the current extraction
-    version (or all of them). Requires the office's cloud mode; the jobs are skipped otherwise."""
+    version (or all of them). Requires the office's cloud mode; the jobs are skipped otherwise. Appraisals only:
+    measurements are an appraisal stage (round 10 U3)."""
     from app.measurements.extract import EXTRACTION_VERSION
     from app.platform.jobs import enqueue_measurements
 
@@ -304,7 +306,8 @@ def extract_measurements(body: ReprocessBody, ctx: TenantContext = Depends(requi
         rows = conn.execute(text(
             "SELECT v.id, r.state FROM document_versions v JOIN documents d ON d.id = v.document_id AND d.deleted_at"
             " IS NULL LEFT JOIN measurement_runs r ON r.version_id = v.id AND r.extraction_version = :e"
-            " WHERE v.is_current AND v.status IN ('ready', 'needs_review')"), {"e": EXTRACTION_VERSION}).all()
+            f" WHERE v.is_current AND v.status IN ('ready', 'needs_review') AND {APPRAISALS_SQL}"),
+            {"e": EXTRACTION_VERSION}).all()
         queued = [str(r.id) for r in rows if (body.all or r.state != "done")
                   and enqueue_measurements(conn, r.id, EXTRACTION_VERSION)]
     return {"queued": len(queued), "extraction_version": EXTRACTION_VERSION}

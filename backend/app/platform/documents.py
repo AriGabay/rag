@@ -14,13 +14,14 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Connection, text
 
 from app.audit import audit
 from app.chat import reader
 from app.config import get_settings
 from app.db import TenantContext, bump_data_version, tenant_tx
-from app.deps import FORBIDDEN, NOT_FOUND, get_ctx, parse_uuid
+from app.deps import FORBIDDEN, NOT_FOUND, get_ctx, parse_uuid, require_admin
 from app.extraction.base import PageGeometry
 from app.extraction.geometry import POSITIONS_VERSION, geometry_box
 from app.extraction.render import (  # noqa: F401 - the view's scales
@@ -34,6 +35,7 @@ from app.extraction.render import (  # noqa: F401 - the view's scales
     render_png,
 )
 from app.platform.jobs import enqueue_positions, enqueue_processing, positions_job_key, retriable_failure
+from app.platform.source_kinds import APPRAISAL, MSG_BAD_KIND, SOURCE_KINDS
 from app.platform.storage import get_storage, purge_staging, storage_key
 
 logger = logging.getLogger(__name__)
@@ -49,6 +51,7 @@ MSG_EMPTY = "הקובץ ריק"
 MSG_ZIP = "קובץ DOCX פגום או חורג ממגבלות הגודל"
 MSG_BATCH = "ניתן להעלות עד {n} קבצים בבת אחת"
 MSG_DUP = "הקובץ כבר הועלה למאגר"
+MSG_KIND_STAGES = "לא ניתן להשלים את עיבוד השומה מהקריאה השמורה של המסמך, ולכן סוג המקור לא שונה"
 
 
 def source_file_url(document_id, version_id, page: int | None = None) -> str:
@@ -98,7 +101,11 @@ def _visible_document(conn: Connection, document_id: UUID) -> bool:
     ).first() is not None
 
 
-def _store_one(ctx: TenantContext, filename: str, data: bytes, group_id: UUID, document_id: UUID | None) -> dict:
+def _store_one(ctx: TenantContext, filename: str, data: bytes, group_id: UUID, document_id: UUID | None,
+               source_kind: str = APPRAISAL) -> dict:
+    """Store one file as a new version. ``source_kind`` is the kind of a document created here: a version of an
+    existing document (``document_id``) keeps that document's kind, and a clone of a file held where the user cannot
+    see it gets the kind asked of its own new document (R16)."""
     settings = get_settings()
     result: dict = {"filename": filename}
     if not data:
@@ -137,10 +144,10 @@ def _store_one(ctx: TenantContext, filename: str, data: bytes, group_id: UUID, d
             title = PurePath(filename).stem.replace("_", " ")[:200]
             document_id = conn.execute(
                 text(
-                    "INSERT INTO documents (office_id, group_id, title, created_by)"
-                    " VALUES (app_office(), :g, :t, :u) RETURNING id"
+                    "INSERT INTO documents (office_id, group_id, title, created_by, source_kind)"
+                    " VALUES (app_office(), :g, :t, :u, :k) RETURNING id"
                 ),
-                {"g": group_id, "t": title, "u": ctx.user_id},
+                {"g": group_id, "t": title, "u": ctx.user_id, "k": source_kind},
             ).scalar_one()
         version_no = conn.execute(
             text("SELECT COALESCE(max(version_no), 0) + 1 FROM document_versions WHERE document_id = :d"),
@@ -156,8 +163,9 @@ def _store_one(ctx: TenantContext, filename: str, data: bytes, group_id: UUID, d
              "u": ctx.user_id, "c": clone_from},
         ).scalar_one()
         enqueue_processing(conn, version_id)
+        kind = conn.execute(text("SELECT source_kind FROM documents WHERE id = :d"), {"d": document_id}).scalar_one()
         audit(conn, "upload", ctx.user_id, "document_version", version_id, document_id=document_id,
-              version_no=version_no, size=len(data))
+              version_no=version_no, size=len(data), source_kind=kind)
     return result | {"status": "accepted", "document_id": str(document_id), "version_id": str(version_id)}
 
 
@@ -166,11 +174,15 @@ def upload(
     files: list[UploadFile] = File(...),
     group_id: str | None = Form(None),
     document_id: str | None = Form(None),
+    source_kind: str | None = Form(None),
     ctx: TenantContext = Depends(get_ctx),
 ) -> dict:
     settings = get_settings()
     if not ctx.can_upload:
         raise HTTPException(status.HTTP_403_FORBIDDEN, FORBIDDEN)
+    kind = (source_kind or "").strip() or APPRAISAL  # none or empty: the default; the kind is never read from a name
+    if kind not in SOURCE_KINDS:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, MSG_BAD_KIND)
     if len(files) > settings.max_batch_files:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, MSG_BATCH.format(n=settings.max_batch_files))
     doc_uuid = parse_uuid(document_id) if document_id else None
@@ -188,7 +200,7 @@ def upload(
     limit = settings.max_upload_mb * 1024 * 1024
     for f in files:
         data = f.file.read(limit + 1)
-        results.append(_store_one(ctx, f.filename or "file", data, group_uuid, doc_uuid))
+        results.append(_store_one(ctx, f.filename or "file", data, group_uuid, doc_uuid, kind))
     return {"results": results}
 
 
@@ -315,7 +327,7 @@ def _list_documents(conn: Connection, ctx: TenantContext, q: str | None, status_
     latest_cols = ", ".join(f"lv.{n} AS lv_{n}" for n in names)
     rows = conn.execute(
         text(
-            "SELECT d.id, d.title, d.created_at, d.deleted_at, g.id AS group_id, g.name AS group_name,"
+            "SELECT d.id, d.title, d.source_kind, d.created_at, d.deleted_at, g.id AS group_id, g.name AS group_name,"
             " (SELECT count(*) FROM document_versions vc WHERE vc.document_id = d.id) AS versions_count,"
             f" {latest_cols}"
             " FROM documents d JOIN document_groups g ON g.id = d.group_id"
@@ -334,7 +346,7 @@ def _list_documents(conn: Connection, ctx: TenantContext, q: str | None, status_
         m = r._mapping
         ver = SimpleNamespace(**{k[3:]: v for k, v in m.items() if k.startswith("lv_")}) if m["lv_id"] else None
         out.append({
-            "id": str(r.id), "title": r.title, "group": {"id": str(r.group_id), "name": r.group_name},
+            "id": str(r.id), "title": r.title, "source_kind": r.source_kind, "group": {"id": str(r.group_id), "name": r.group_name},
             "deleted": r.deleted_at is not None, "created_at": r.created_at.isoformat(),
             "current_version": _version_json(ver) if ver else None, "versions_count": r.versions_count,
         })
@@ -384,6 +396,65 @@ def delete_document(document_id: str, ctx: TenantContext = Depends(get_ctx)) -> 
     for version in versions:  # a reading still in progress leaves nothing staged behind
         purge_staging(ctx.office_id, version)
     return {"ok": True}
+
+
+class KindBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_kind: Literal["appraisal", "standard", "professional"]
+
+
+@router.patch("/{document_id}")
+def change_kind(document_id: str, body: KindBody, ctx: TenantContext = Depends(require_admin)) -> dict:
+    """Change a document's source kind (R16, KTD8): admin only, audited, and the data version moves so no cached
+    answer outlives the change. Nothing is deleted or read again (R1, R3).
+
+    - To ``standard`` or ``professional``: the appraisal derivations (units, records, measurements) stay stored and the
+      kind filters of the appraisal surfaces stop reading them. Sections and the standard's profile are derived
+      lazily from the stored blocks on first use (U4, U5), so there is nothing to derive here.
+    - To ``appraisal`` from another kind: the appraisal stages the document skipped run now, from the stored reading
+      (``publish.run_skipped_stages``: records, transactions and units from stored pages, tables and blocks), and
+      measurement extraction is queued when the office allows the model. Each of these works on stored rows, so none
+      needs the file; if one fails the change is refused (409) and the kind stays as it was, the whole change being
+      one transaction."""
+    from app.appraisal import publish
+    from app.platform import pipeline
+
+    doc_uuid = parse_uuid(document_id)
+    with tenant_tx(ctx) as conn:  # the admin's own view decides whether the document exists for them (404 otherwise)
+        if conn.execute(text("SELECT 1 FROM documents WHERE id = :d AND deleted_at IS NULL"),
+                        {"d": doc_uuid}).first() is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
+    converting = body.source_kind == APPRAISAL
+    cloud = converting and pipeline.vision_reader(ctx) is not None  # read outside the transaction
+    # transactions (the records' shared rows) are written by the system role only, as in publishing, so a change to
+    # appraisal runs as the system for the office; the admin's identity is what the audit entry records
+    with tenant_tx(pipeline.system_ctx(ctx.office_id) if converting else ctx) as conn:
+        row = conn.execute(text("SELECT source_kind FROM documents WHERE id = :d AND deleted_at IS NULL FOR UPDATE"),
+                           {"d": doc_uuid}).first()
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
+        if row.source_kind == body.source_kind:
+            return {"id": str(doc_uuid), "source_kind": body.source_kind}
+        conn.execute(text("UPDATE documents SET source_kind = :k WHERE id = :d"),
+                     {"k": body.source_kind, "d": doc_uuid})
+        details: dict = {"from": row.source_kind, "to": body.source_kind}
+        if converting:
+            try:
+                with conn.begin_nested():
+                    versions = publish.run_skipped_stages(conn, doc_uuid, pipeline.EXTRACTION_VERSION)
+            except Exception:
+                logger.exception("the appraisal stages of document %s could not run from its stored reading", doc_uuid)
+                raise HTTPException(status.HTTP_409_CONFLICT, MSG_KIND_STAGES) from None
+            if cloud:
+                from app.measurements.extract import EXTRACTION_VERSION as MEASURE_VERSION
+                from app.platform.jobs import enqueue_measurements
+
+                for version in versions:
+                    enqueue_measurements(conn, version, MEASURE_VERSION)
+            details["versions"] = len(versions)
+        audit(conn, "document_kind_change", ctx.user_id, "document", doc_uuid, **details)
+        bump_data_version(conn)
+    return {"id": str(doc_uuid), "source_kind": body.source_kind}
 
 
 # --- typed source states ---------------------------------------------------------------------------------------

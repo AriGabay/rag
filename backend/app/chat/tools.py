@@ -154,6 +154,7 @@ from app.measurements.extract import (
 )
 from app.platform.documents import coverage_of, display_box_of, reading_notes
 from app.platform.search import SearchScope, search_passages, unread_documents, unread_matching, unread_named
+from app.platform.source_kinds import APPRAISALS_SQL
 
 logger = logging.getLogger(__name__)
 
@@ -2022,20 +2023,21 @@ def tool_list_documents(ws: Workspace, query: str | None = None, page: int | Non
             params["p"] = [f"%{w.lower()}%" for w in words]
             cond = " AND lower(d.title) LIKE ANY(:p)"
         total = conn.execute(text("SELECT count(*) FROM documents d JOIN document_versions v ON v.document_id = d.id"
-                                  f" AND v.is_current WHERE d.deleted_at IS NULL{cond}"), params).scalar_one()
+                                  f" AND v.is_current WHERE d.deleted_at IS NULL AND {APPRAISALS_SQL}{cond}"),
+                             params).scalar_one()
         page, pages = _paginate(page, total, LIST_MAX)
         rows = conn.execute(text(
             "SELECT d.id, d.title, v.id AS vid, v.status, v.page_count, v.pages_incomplete, v.ingestion,"
             " v.created_at, r.state AS mstate FROM documents d JOIN document_versions v ON v.document_id = d.id"
             " AND v.is_current LEFT JOIN measurement_runs r ON r.version_id = v.id AND r.extraction_version = :e"
-            f" WHERE d.deleted_at IS NULL{cond} ORDER BY d.title, d.id LIMIT {LIST_MAX} OFFSET :o"),
+            f" WHERE d.deleted_at IS NULL AND {APPRAISALS_SQL}{cond} ORDER BY d.title, d.id LIMIT {LIST_MAX} OFFSET :o"),
             params | {"o": (page - 1) * LIST_MAX}).all()
         if not words:
             # the whole repository is the scope only when no set was looked up (find_documents keeps precedence)
             if ws.scope is None:
                 everything = conn.execute(text(
                     "SELECT d.id, d.title FROM documents d JOIN document_versions v ON v.document_id = d.id"
-                    " AND v.is_current WHERE d.deleted_at IS NULL ORDER BY d.title, d.id")).all()
+                    f" AND v.is_current WHERE d.deleted_at IS NULL AND {APPRAISALS_SQL} ORDER BY d.title, d.id")).all()
                 ws.scope = new_scope("", [(r.id, r.title) for r in everything], pages)
             if ws.scope["query"] == "":
                 ws.scope["pages_read"].add(page)
@@ -2673,7 +2675,7 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
     with tenant_tx(ws.ctx) as conn:
         docs = _visible_documents(conn, document_ids or [])
         params: dict = {"e": EXTRACTION_VERSION}
-        conds = ["v.is_current", "d.deleted_at IS NULL", "m.status <> 'rejected'"]
+        conds = ["v.is_current", "d.deleted_at IS NULL", APPRAISALS_SQL, "m.status <> 'rejected'"]
         if docs:
             params["d"] = docs
             conds.append("m.document_id = ANY(:d)")
@@ -2699,7 +2701,8 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
             "SELECT d.id, d.title, v.id AS vid, r.state, COALESCE((v.ingestion->>'partial')::boolean, false) AS partial"
             " FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
             " LEFT JOIN measurement_runs r ON r.version_id = v.id AND r.extraction_version = :e"
-            " WHERE d.deleted_at IS NULL" + (" AND d.id = ANY(:d)" if docs else "")), params).all()
+            f" WHERE d.deleted_at IS NULL AND {APPRAISALS_SQL}" + (" AND d.id = ANY(:d)" if docs else "")),
+            params).all()
         cached, cached_total = _cached_listing(conn, docs, metric_kinds, words)
         for vid, reading in {(str(r.version_id), r.reading_id) for r in rows}:
             contexts_of(ws, conn, vid, reading)  # a measurement records its appraisal context (KTD7)
@@ -2757,7 +2760,7 @@ def _cached_listing(conn: Connection, docs: list, metric_kinds: list[str] | None
     the same filters as the measurements: the documents, the kinds their source attests, else words of their quote,
     section or column. At most ``CACHED_MAX``, with the total."""
     params: dict = {"verifier_version": VALUE_VERIFIER_VERSION}
-    conds = ["d.deleted_at IS NULL", "c.value->>'verifier_version' = :verifier_version"]
+    conds = ["d.deleted_at IS NULL", APPRAISALS_SQL, "c.value->>'verifier_version' = :verifier_version"]
     if docs:
         params["d"] = docs
         conds.append("c.document_id = ANY(:d)")

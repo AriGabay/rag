@@ -70,6 +70,7 @@ from sqlalchemy import Connection, text
 from app.chat import contexts
 from app.extraction import hebrew
 from app.extraction.normalize_text import base_normalize
+from app.platform.source_kinds import APPRAISALS_SQL
 
 logger = logging.getLogger(__name__)
 
@@ -749,8 +750,12 @@ def derivation_key(ingestion: dict | None) -> str:
 
 
 def reading_of(conn: Connection, version_id: UUID | str) -> Reading | None:
-    row = conn.execute(text("SELECT document_id, ingestion FROM document_versions WHERE id = :v"),
-                       {"v": UUID(str(version_id))}).first()
+    """The version's reading, or None for a version that does not exist (to the caller) or whose document is not an
+    appraisal: units are an appraisal notion, so a standard or a professional document gets none, built or stored
+    (round 10 U3, KTD9). Every builder (``ensure``, ``replace``, ``rebuild_if_stale``) starts here."""
+    row = conn.execute(text(
+        "SELECT v.document_id, v.ingestion FROM document_versions v JOIN documents d ON d.id = v.document_id"
+        f" WHERE v.id = :v AND {APPRAISALS_SQL}"), {"v": UUID(str(version_id))}).first()
     if row is None:
         return None
     ing = row.ingestion or {}

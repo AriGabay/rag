@@ -80,6 +80,7 @@ from app.platform.search import (
     unread_documents,
     unread_matching,
 )
+from app.platform.source_kinds import APPRAISALS_SQL
 
 CLARIFY_TITLES = 5
 _TOKEN = re.compile(r"[\w\"״׳'/-]+")
@@ -235,7 +236,7 @@ def _current_units(conn, document_id: UUID) -> tuple[str, str, str, list[dict]] 
     row = conn.execute(text(
         "SELECT d.title, v.id AS version_id, COALESCE(v.ingestion->>'reading_id', '') AS reading_id"
         " FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
-        " WHERE d.id = :d AND d.deleted_at IS NULL"), {"d": document_id}).first()
+        f" WHERE d.id = :d AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"), {"d": document_id}).first()
     if row is None:
         return None
     rows = [{"document_id": document_id, "version_id": row.version_id, "reading_id": row.reading_id,
@@ -509,7 +510,7 @@ def _unit_names(conn) -> list[str]:
     for r in conn.execute(text(
             "SELECT u.title, u.aliases FROM document_units u JOIN document_versions v ON v.id = u.version_id"
             " AND v.is_current AND u.reading_id = COALESCE(v.ingestion->>'reading_id', '')"
-            " JOIN documents d ON d.id = u.document_id AND d.deleted_at IS NULL"
+            f" JOIN documents d ON d.id = u.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"
             " WHERE u.kind NOT IN ('appendix', 'comparables')")):
         names += ([r.title] if r.title else []) + list(r.aliases or ())
     return list(dict.fromkeys(names))
@@ -523,7 +524,7 @@ def _visible_titles(conn, unread: list[dict] | None = None) -> list[str]:
         unread = unread_documents(conn)
     return [r.title for r in conn.execute(text(
         "SELECT d.title FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
-        " WHERE d.deleted_at IS NULL"))] + _unit_names(conn) + [d["title"] for d in unread]
+        f" WHERE d.deleted_at IS NULL AND {APPRAISALS_SQL}"))] + _unit_names(conn) + [d["title"] for d in unread]
 
 
 def lookup(ctx: TenantContext, words: str, focus_ids: set[str],
@@ -591,7 +592,7 @@ def units_of_documents(ctx: TenantContext, ids) -> list[dict]:
         files = {r.version_id: r for r in conn.execute(text(
             "SELECT d.id, d.title, v.id AS version_id, COALESCE(v.ingestion->>'reading_id', '') AS reading_id"
             " FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
-            " WHERE d.id = ANY(:i) AND d.deleted_at IS NULL"), {"i": uuids})}
+            f" WHERE d.id = ANY(:i) AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"), {"i": uuids})}
         stored = unit_store.stored_many(conn, list(files))
         rows = []
         for version_id, units in stored.items():
@@ -618,7 +619,7 @@ _UNIT_NAMES_SQL = (
     " u.block_last, count(*) OVER (PARTITION BY u.version_id) AS units"
     " FROM document_units u JOIN document_versions v ON v.id = u.version_id AND v.is_current"
     " AND u.reading_id = COALESCE(v.ingestion->>'reading_id', '')"
-    " JOIN documents d ON d.id = u.document_id AND d.deleted_at IS NULL")
+    f" JOIN documents d ON d.id = u.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL}")
 
 
 @dataclass

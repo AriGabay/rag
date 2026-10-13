@@ -56,6 +56,7 @@ from app.extraction.geometry import POSITIONS_VERSION
 from app.extraction.normalize_text import normalize_for_search, undouble_word
 from app.extraction.pdf import READER_VERSION as PDF_READER_VERSION
 from app.extraction.regions import shown_hash
+from app.platform.source_kinds import APPRAISAL
 from app.platform.storage import purge_staging
 
 logger = logging.getLogger(__name__)
@@ -515,13 +516,28 @@ def process_version(office_id: UUID, version_id: UUID) -> str | None:
     record_progress(ctx, info.id, None, None, STAGE_PUBLISHING)
     outcome = publish_stage(ctx, info)
     purge_staging(office_id, version_id)
-    if vision_reader(ctx) is not None:
-        from app.measurements.extract import EXTRACTION_VERSION as MEASURE_VERSION
-        from app.platform.jobs import enqueue_measurements
-
-        with tenant_tx(ctx) as conn:
-            enqueue_measurements(conn, info.id, MEASURE_VERSION)
+    queue_measurements(ctx, info)
     return outcome
+
+
+def is_appraisal(ctx: TenantContext, document_id: UUID) -> bool:
+    """Whether the document is an appraisal. The appraisal-only stages of ingestion (facts and records, transactions,
+    units, measurement extraction) run for appraisals alone; a standard or a professional document is read, chunked,
+    embedded and published as any document (round 10 U3: R3, KTD9). A document that cannot be read counts as one."""
+    with tenant_tx(ctx) as conn:
+        kind = conn.execute(text("SELECT source_kind FROM documents WHERE id = :d"), {"d": document_id}).scalar_one_or_none()
+    return kind in (None, APPRAISAL)
+
+
+def queue_measurements(ctx: TenantContext, info: VersionInfo) -> bool:
+    """Queue the version's measurement extraction when the office allows the model and the document is an appraisal."""
+    if not is_appraisal(ctx, info.document_id) or vision_reader(ctx) is None:
+        return False
+    from app.measurements.extract import EXTRACTION_VERSION as MEASURE_VERSION
+    from app.platform.jobs import enqueue_measurements
+
+    with tenant_tx(ctx) as conn:
+        return enqueue_measurements(conn, info.id, MEASURE_VERSION)
 
 
 # --- reindexing and measurements ----------------------------------------------------------------------------
@@ -691,9 +707,9 @@ def reindex_version(office_id: UUID, version_id: UUID, accept_regression: bool =
     and never reviewed (a reviewed fact stays), clears cached answers and moves the data version, so no answer
     built on the old reading is served again. Its records (and their reviews) are kept. Measurements are then
     re-extracted when the office allows the cloud model."""
+    from app.appraisal.publish import source_kind_of
     from app.chat import units
     from app.measurements.store import measurement_anchors, reanchor_measurements
-    from app.platform.jobs import enqueue_measurements
     from app.platform.storage import get_storage
 
     ctx = system_ctx(office_id)
@@ -731,6 +747,7 @@ def reindex_version(office_id: UUID, version_id: UUID, accept_regression: bool =
         if regression is not None and not (accept_regression and regression_within(regression, recorded)):
             regression["current_reading_id"] = (current.ingestion or {}).get("reading_id")
         else:
+            appraisal = source_kind_of(conn, info.document_id) == APPRAISAL
             anchors = measurement_anchors(conn, info.id)  # where each measurement sits, before the old reading goes
             for table in _DERIVED_TEXT_TABLES:
                 conn.execute(text(f"DELETE FROM {table} WHERE version_id = :v"), {"v": info.id})
@@ -738,7 +755,8 @@ def reindex_version(office_id: UUID, version_id: UUID, accept_regression: bool =
                                    {"v": info.id}).scalar_one()
             _insert_outputs(conn, info, result, embeddings,
                             {"accepted_regression": regression} if regression is not None else None)
-            units.replace(conn, info.id)  # the units of the replaced reading go with it (KTD4)
+            if appraisal:  # a standard or a professional document has no units (round 10 U3)
+                units.replace(conn, info.id)  # the units of the replaced reading go with it (KTD4)
             anchored = reanchor_measurements(conn, info.id, anchors,
                                              ((result.fontmap or {}).get("corrections") or []))
             conn.execute(text("DELETE FROM facts WHERE version_id = :v AND status IN ('auto_validated',"
@@ -758,11 +776,7 @@ def reindex_version(office_id: UUID, version_id: UUID, accept_regression: bool =
                 {"v": info.id, "r": json.dumps(regression, ensure_ascii=False)})
         logger.info("reindex of version %s kept the current reading: %s", info.id, regression_summary(regression))
         raise ReadingRegression(regression)
-    if vision_reader(ctx) is not None:
-        from app.measurements.extract import EXTRACTION_VERSION as MEASURE_VERSION
-
-        with tenant_tx(ctx) as conn:
-            enqueue_measurements(conn, info.id, MEASURE_VERSION)
+    queue_measurements(ctx, info)
     return "reindexed"
 
 
@@ -772,6 +786,11 @@ def run_measurements(office_id: UUID, version_id: UUID) -> str:
 
     ctx = system_ctx(office_id)
     if vision_reader(ctx) is None:  # same consent: the office's cloud mode
+        return "skipped"
+    with tenant_tx(ctx) as conn:  # a queued job outlives a kind change: measurements are an appraisal stage
+        document = conn.execute(text("SELECT document_id FROM document_versions WHERE id = :v"),
+                                {"v": version_id}).scalar_one_or_none()
+    if document is not None and not is_appraisal(ctx, document):
         return "skipped"
     result = extract_version(ctx, version_id, get_selected_provider())
     with tenant_tx(ctx) as conn:
