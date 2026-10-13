@@ -412,9 +412,11 @@ textarea.input {
   padding-inline-start: 16px;
 }
 
-/* What a standard states about itself (documents screen): kept narrow so a listing row stays readable. */
+/* What a standard states about itself (documents screen): kept narrow so a listing row stays readable, but wide
+   enough that a field's source quote does not wrap every few letters in the title column. */
 .professional {
   margin-block-start: 6px;
+  min-width: 30ch;
   max-width: 42ch;
 }
 
