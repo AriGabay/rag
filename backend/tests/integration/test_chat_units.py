@@ -335,8 +335,8 @@ def statements():
 def test_a_first_message_whose_words_fit_two_units_equally_gets_the_servers_clarification_with_no_model_call(
         client, office, monkeypatch):
     doc, _ = ingest(office, R9B)
-    # the question holds no complete name: the pin waits for the request analysis (round 10 KTD3), which says the
-    # question is about a property; no agent step is taken
+    # the question names a phrase both units' names hold ("מתחם הגפן"): hard evidence of a reference (round 10, the
+    # partial name), so the server asks between them at once, with no model call at all — as round 9 did
     agent = ScriptedAgent([], intent="property")
     cloud(monkeypatch, office, agent)
     m = send(client, new_conversation(client), SIMILAR_QUESTION)
@@ -346,8 +346,8 @@ def test_a_first_message_whose_words_fit_two_units_equally_gets_the_servers_clar
     md = a["markdown"]
     assert "1. «מתחם הגפן א» (עמוד 1;" in md and "2. «מתחם הגפן ב» (עמוד 2;" in md and R9B_TITLE in md
     assert [(c["document_id"], c["unit"]["unit_no"]) for c in a["request"]["candidates"]] == [(doc, 1), (doc, 2)]
-    # no agent step; the only model call is the request analysis that settled the intent
-    assert agent.seen == [] and [c.schema.__name__ for c in agent.calls] == ["RequestAnalysis"]
+    # no agent step and no request analysis: the evidence decided
+    assert agent.seen == [] and agent.calls == []
 
 
 def test_a_first_message_is_left_to_the_model_unless_it_names_two_or_more_units_without_a_better_fit(

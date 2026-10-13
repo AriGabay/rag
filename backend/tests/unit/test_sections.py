@@ -353,3 +353,15 @@ def test_a_number_that_opens_a_paragraph_without_a_list_mark_is_text():
 
 def test_an_empty_document_has_the_digest_of_no_text():
     assert S.text_digest([]) == S.text_digest(doc(P("  "), P("")))
+
+
+def test_a_term_that_holds_the_word_proper_is_no_recommendation():
+    # round 10 U11 finding: "דמי שכירות ראויים" is a term of the trade, not the wording of a recommendation
+    from app.professional.sections import _MODALITY_RE
+
+    def recommends(text: str) -> bool:
+        return any(p.search(text) for p in _MODALITY_RE["recommendation"])
+
+    assert not recommends("יש לקבוע את דמי השכירות הראויים לנכס.")
+    assert not recommends("דמי שכירות ראויים הם המחיר הסביר.")
+    assert recommends("ראוי לבחון עסקאות נוספות.") and recommends("מומלץ לצרף תשריט.")

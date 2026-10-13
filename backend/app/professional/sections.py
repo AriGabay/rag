@@ -71,7 +71,7 @@ from app.platform.source_kinds import APPRAISAL
 
 logger = logging.getLogger(__name__)
 
-SECTIONS_VERSION = "sections-v1"
+SECTIONS_VERSION = "sections-v2"  # v2: "ראוי" alone is no recommendation (a term: "דמי שכירות ראויים")
 NO_READING = ""  # the reading id of a version whose ingestion report names none
 
 CHAPTER, SECTION, DEFINITIONS, DEFINITION, APPENDIX, NOTE, PREAMBLE = (
@@ -80,7 +80,7 @@ LIMIT_SENTENCE_MAX = 400  # characters of a limit sentence kept
 
 # --- the marker lists: they classify standard text, not user questions --------------------------------------------
 REQUIREMENT_MARKERS = ("חייב", "יש ל", "נדרש", "על השמאי ל", "חובה")
-RECOMMENDATION_MARKERS = ("מומלץ", "רצוי", "ראוי")
+RECOMMENDATION_MARKERS = ("מומלץ", "רצוי", "ראוי ל", "ראוי ש")  # not "ראויים" of "דמי שכירות ראויים"
 EXAMPLE_MARKERS = ("לדוגמה", "למשל")
 ALTERNATIVE_MARKERS = ("לחלופין", "רשאי")
 EXCEPTION_MARKERS = ("למעט", "אלא אם", "בכפוף ל", "על אף האמור", "בתנאי ש", "חריג", "לא יחול")

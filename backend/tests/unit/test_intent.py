@@ -134,3 +134,15 @@ def test_an_invalid_intent_part_is_dropped_and_the_rest_of_the_parse_stands():
 def test_the_claim_schema_is_strict():
     with pytest.raises(ValueError):
         IntentClaim(intent="property", reference="none", item=None, topic="", standard_refs=[], extra=1)
+
+
+def test_a_phrase_that_only_names_hold_refers_to_them_even_when_it_fits_two():
+    # round 9 AE4 after round 10: "מתחם הגפן" of "מתחם הגפן א" and "מתחם הגפן ב" is a reference to be asked about, while
+    # one word that titles share, or a phrase at the head of many reports, is none
+    from app.chat import intent
+
+    names = ["מתחם הגפן א", "מתחם הגפן ב"] + [f"שומה מקרקעין רחוב {n} 5" for n in ("הדקל", "האלה", "השקד", "הגפן")]
+    assert [e.text for e in intent.evidence("ובמתחם הגפן?", names)] == ["מתחם הגפן"]
+    assert [e.text for e in intent.evidence("מה השווי במתחם הגפן ב", names)] == ["מתחם הגפן ב"]
+    assert intent.evidence("מה זו שומה מקרקעין כללית?", names) == []
+    assert intent.evidence("מה הן שלוש גישות השומה הבסיסיות?", names) == []

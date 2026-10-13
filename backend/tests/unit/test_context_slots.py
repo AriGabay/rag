@@ -350,3 +350,15 @@ def test_the_requested_block_carries_the_topic_and_the_item():
     req = _validate(r, "הסבר את הגישה השנייה", items=ITEMS)
     block = resolve.requested_block(req)
     assert "פריט 2" in block and "«גישת ההכנסות»" in block
+
+
+def test_an_answer_that_enumerates_in_prose_gives_its_bold_terms_as_items():
+    # round 10 real-model finding: the approaches came as one paragraph of bold terms, not a list
+    from app.chat import slots
+
+    prose = "שלוש גישות השומה הבסיסיות הן **גישת ההשוואה** [S1], **גישת היוון ההכנסות** [S2] ו**גישת העלות** [S3]."
+    assert slots.extract_items(prose) == ["גישת ההשוואה", "גישת היוון ההכנסות", "גישת העלות"]
+    leads = "**גישת ההשוואה**: לפי עסקאות.\n\n**גישת העלות**: לפי עלות.\n\nסיכום."
+    assert slots.extract_items(leads) == ["גישת ההשוואה", "גישת העלות"]
+    assert slots.extract_items("**כותרת**\n\nטקסט רגיל.") == []
+    assert slots.extract_items("1. אחת\n2. שתיים\n\n**א** ו**ב**") == ["אחת", "שתיים"]  # a list comes first

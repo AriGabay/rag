@@ -243,6 +243,37 @@ def _complete_names(text: str, vocabulary: list[str]) -> list[Evidence]:
             if not any(x <= a and b <= y and (y - x) > (b - a) for x, y, _ in found)]
 
 
+PARTIAL_HOLDERS = 3  # the names a partial phrase may be part of and still refer to them
+
+
+def _partial_names(text: str, vocabulary: list[str], whole: list[Evidence]) -> list[Evidence]:
+    """The phrases of two words or more that the text shares with a name without stating all of it ("מתחם הגפן" of
+    "מתחם הגפן א" and "מתחם הגפן ב"): a phrase that only names can hold, so the user refers to a named thing even when it
+    fits several — which the lookup then asks about (round 9 AE4) — never one word, which titles share ("השומה"), and
+    never a phrase of words of the trade alone. A phrase inside a complete name the text states is that name's."""
+    keys = list(dict.fromkeys(k for t in vocabulary if len((k := contexts.name_key(t)).split()) > 2))
+    norm = f" {contexts.name_key(text)} "
+    phrases: dict[str, None] = {}
+    for key in keys:
+        words = key.split()
+        for size in range(len(words) - 1, 1, -1):  # the longest part first
+            for i in range(len(words) - size + 1):
+                part = words[i:i + size]
+                # words only: a number belongs to an address, a parcel or a standard, which are read apart
+                if any(any(c.isdigit() for c in w) for w in part) or all(
+                        entities.forms(w) & entities.GENERIC_NAME_WORDS or len(w) < 2 for w in part):
+                    continue
+                phrase = " ".join(part)
+                if f" {phrase} " in norm or any(f" {p}{phrase} " in norm for p in ("ב", "ה", "ו", "ל", "מ", "וב", "וה")):
+                    phrases[phrase] = None
+    # a phrase that many names share names none of them ("שומה מקרקעין" at the head of every report): a few at most
+    phrases = {p: None for p in phrases if sum(f" {p} " in f" {k} " for k in keys) <= PARTIAL_HOLDERS}
+    stated = [contexts.name_key(e.text) for e in whole]
+    kept = [p for p in phrases if not any(p in s for s in stated)]
+    kept = [p for p in kept if not any(p != q and f" {p} " in f" {q} " for q in kept)]  # the longest phrase only
+    return [Evidence("name", p, tuple(p.split())) for p in kept]
+
+
 def evidence(message: str, vocabulary: list[str], quoted: bool = False) -> list[Evidence]:
     """The hard evidence of a message (see the module docstring), in the order address/label, parcel, name, each once.
     ``vocabulary``: every title the user may see, the names of units included. ``quoted``: the text is the words the
@@ -252,7 +283,10 @@ def evidence(message: str, vocabulary: list[str], quoted: bool = False) -> list[
     out = _parcels(text)
     rest = _mask(text, _BLOCK, _PARCEL, _PROFESSIONAL_REF, _YEAR, _FLOOR, _DURATION, _NUMBER_WORD)
     out += _addresses(rest, words, quoted)
-    out += _complete_names(text, vocabulary)
+    names = _complete_names(text, vocabulary)
+    # a part of a name is the weakest evidence: read only when nothing more specific (an address, a parcel, a label,
+    # a complete name) is there
+    out += names or (_partial_names(text, vocabulary, names) if not out else [])
     seen: set[tuple[str, str]] = set()
     return [e for e in out if not ((e.kind, e.text) in seen or seen.add((e.kind, e.text)))]
 

@@ -328,6 +328,19 @@ def test_a_professional_search_with_no_standard_in_the_office_says_so_and_still_
     assert T.MSG_NO_STANDARD_POOL in out and ws2.standards_absent is True
 
 
+def test_with_no_standard_the_offices_other_documents_answer_in_full_not_as_three_examples(office):
+    # round 10 R29, office-A real-model run on f43430d: a glossary stored as an appraisal is the only professional text
+    # until standards are uploaded; a professional question must still be able to answer from it, labelled by its kind
+    docs = [appraisal(office, text_=f"{GLOSSARY} מונח {i}.", title=f"מילון {i} (סינתטי)", opening=f"מילון מונחים {i}")[0]
+            for i in range(5)]
+    ws = workspace(office, "professional")
+    out = run(ws, "search", query=QUERY, limit=8)
+    found = {s["document_id"] for s in sources_of(out)}
+    assert len(found) > T.EXAMPLE_HITS and found <= set(docs)
+    assert T.MSG_NO_STANDARD_POOL in out and "ענה מהמקורות האחרים" in out
+    assert T.LABEL_APPRAISAL_KIND in out  # no property stated: labelled by its kind, not as a property's example
+
+
 def test_find_standards_in_an_office_with_none_says_the_repository_holds_none(office):
     appraisal(office)
     ws = workspace(office, "professional")

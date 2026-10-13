@@ -1128,8 +1128,10 @@ LABEL_PROFESSIONAL = "מקור מקצועי (תקן או מסמך מקצועי)"
 MSG_POOL_CLIPPED = "המאגר שביקשת אינו מותר לשאלה מהסוג הזה: החיפוש הוגבל למאגרים שהשרת קבע לה."
 MSG_POOL_EXAMPLES = ("שאלה מקצועית: שומות מוצגות כדוגמה לבחירה של נכס מסוים בלבד, ולא ככלל מקצועי; כלל מקצועי נלקח "
                      "ממקור מקצועי.")
-MSG_NO_STANDARD_POOL = ("במאגר שהמשתמש מורשה לראות אין תקן או מסמך מקצועי: נוסח התקן אינו במאגר. אל תענה ממה שהתקן קובע "
-                        "לפי הזיכרון, ואמור שהנוסח אינו במאגר; אפשר להשתמש במקורות האחרים שהוחזרו.")
+MSG_NO_STANDARD_POOL = ("במאגר שהמשתמש מורשה לראות אין תקן או מסמך מקצועי מסווג, ולכן נוסח התקן אינו במאגר: אל "
+                        "תשלים מהזיכרון מה שתקן קובע. ענה מהמקורות האחרים שהוחזרו כשהם מסבירים את המושג או השיטה "
+                        "(למשל מילון מונחים או הסבר כללי), ציין שהם מסמכים מסוג שומה ושנוסח התקן אינו במאגר. ערך, "
+                        "מקדם או הנחה שנבחרו לנכס מסוים (מסומנים כדוגמה) אינם כלל מקצועי.")
 MSG_NO_STANDARDS = "אין במאגר תקן או מסמך מקצועי שהמשתמש מורשה לראות."
 MSG_STANDARDS_UNUSED = "שאלה על קבוצת מסמכים משתמשת בשומות בלבד: רשימת תקנים אינה חלק ממנה."
 MSG_LIMITS = "תנאים וחריגים בסעיף (הכלל נקרא יחד איתם, לא בלעדיהם):"
@@ -1548,15 +1550,20 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
             passes, pool_notes, asked = _plan(ws, conn, pool, limit)
             notes += pool_notes
             hits = []
+            absent = False
             for p in passes:
                 if p.pool == PROFESSIONAL_POOL and (ws.intent in ("professional", "mixed") or asked) \
                         and not _has_professional(conn):
-                    ws.standards_absent = True  # the office holds none: a stated gap, not a failed search (KTD15)
+                    ws.standards_absent = absent = True  # the office holds none: a stated gap, not a failed search (KTD15)
                     notes.append(MSG_NO_STANDARD_POOL)
                     continue
+                # with no standard to answer from, the office's other documents are read in full, not as a few examples:
+                # a glossary or a general explanation stored as an appraisal still explains a concept, labelled by its
+                # kind (R29: until standards are uploaded the existing sources keep answering)
+                n = limit if absent and p.pool == APPRAISAL_POOL else p.limit
                 left_out = copies_left_out(ws, conn) if p.pool == PROFESSIONAL_POOL and not docs else ()
                 scope = SearchScope(document_ids=tuple(docs), source_kinds=POOL_KINDS[p.pool], exclude_versions=left_out)
-                hits += [h | {"pool": p.pool, "role": p.role} for h in memoized_search(ws, conn, query, p.limit, scope)]
+                hits += [h | {"pool": p.pool, "role": p.role} for h in memoized_search(ws, conn, query, n, scope)]
             lookup_unread = not docs
         # a document the query names by its title that was not read has no passages: say so, never "not found" (KTD11)
         named = unread_named(conn, query, ws.unread_files(conn)) if lookup_unread else []
