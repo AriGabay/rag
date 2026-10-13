@@ -105,10 +105,11 @@ test.describe("professional sources in the chat (office B)", () => {
     // a live copy exists now, so this only waits until the worker has read it
     await ensureOfficeBDocuments(request, [{ file: fixture(STANDARD.file), title: STANDARD.title }], { groupId });
     await page.reload();
+    // the row whose own title is the standard's: another live edition lists this title among its editions
     const row = page
       .getByRole("table", { name: "רשימת מסמכים" })
       .getByRole("row")
-      .filter({ hasText: STANDARD.title })
+      .filter({ has: page.getByRole("button", { name: STANDARD.title, exact: true }) })
       .filter({ hasNotText: "נמחק" });
     await expect(row).toHaveCount(1);
     await expect(row.getByTestId("kind-badge")).toHaveText("תקן שמאות");
