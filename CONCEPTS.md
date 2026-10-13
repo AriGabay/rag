@@ -24,6 +24,14 @@ The datum and documents a conversation is about after its last answer: what a fo
 
 The focus is context, not a filter. When the user names another property, unit or document, the focus documents are dropped and the newly named documents — found only among those the user may see — replace them; when nothing or several documents match, the user is asked which one, never answered from the focus.
 
+### Question intent
+
+What a request is about, decided for every message and checked by the server against the message: a professional question (a concept, a method or a standard's requirement, answered without any particular property), a property question, a question about a specific document, a mixed question (professional knowledge applied to a named property), a question over a set of documents, or unknown. A property or document is looked up only for an intent that refers to one, and only on identifying evidence in the message: an address, a block and parcel, a unit label, or a name of a document or unit stated as a phrase. A word that document titles share is never evidence, and a standard or section number is never a house number.
+
+### Conversation slots
+
+The parts of a conversation's state that are kept apart from one another after each answer: the professional topic with the items the answer listed, the selected property with its task parameters (metric, unit, period), the sources cited, and a pending clarification. A professional question leaves the property slot dormant, not dropped, so a later "in this property" returns to it. A pending clarification lives for one message and binds only a reply that refers to it. An ordinal such as "the second" binds to the previous answer's list. The slots are stored with the answer, survive a reload, and are checked against the user's permissions every turn.
+
 ## Documents
 
 ### Reading status
@@ -43,6 +51,12 @@ Every highlight, crop or cited place shown to a person or a model is expressed i
 Content that repeats across a document's pages, such as a logo, a letterhead, a footer or a watermark, recognised by its content rather than its size and stored and read once for the whole document.
 
 Its text counts as present on every page it appears on, so it is not mistaken for content lost between two readings. A small picture that does not repeat is never treated as furniture and is read like any other region.
+
+### Source kind
+
+What a stored document is, chosen when it is uploaded and changeable only by an admin: an appraisal (the default), an appraisal standard, or another professional document (a guideline, a clarification, a glossary). The kind is never inferred from a file name or title, so an appraisal named after the standard it follows stays an appraisal. Appraisals alone take part in property lookup, appraisal counts and unit locating. Standards and professional documents form the professional pool that professional questions search, and are never a source for a property's area, rent or value.
+
+A standard keeps its structure — sections, definitions, the conditions and exceptions that limit each provision, notes, appendices and references — and its stated metadata (number, name, issuer, edition, publication and effective dates, scope, the document it amends), each value with the page and quote it came from or marked unknown. Editions are ordered only by the dates they state, never by upload date, and identical text stored twice is counted once.
 
 ### Appraisal unit
 
