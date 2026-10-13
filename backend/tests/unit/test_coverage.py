@@ -215,12 +215,12 @@ def test_the_policy_and_schema_carry_the_scores_the_related_ids_and_the_absence_
     assert {"id", "text", "status", "units", "related", "calculation", "absent", "aspect"} <= set(fields)
     assert "undeterminable" in verify.JUDGE_REQUIREMENTS_POLICY and "related" in verify.JUDGE_REQUIREMENTS_POLICY
     assert "absent" in verify.JUDGE_REQUIREMENTS_POLICY
-    # one reason vocabulary (R8): thirteen reasons, the server's only gap words (``document_not_read``: round 9
-    # U6; ``limit_reached`` and ``unit_not_located``: round 9 U16)
+    # one reason vocabulary (R8): fourteen reasons, the server's only gap words (``document_not_read``: round 9
+    # U6; ``limit_reached`` and ``unit_not_located``: round 9 U16; ``standard_absent``: round 10 U8)
     assert set(coverage.REASONS) == {"not_located", "not_in_part_read", "region_not_read", "not_verifiable",
                                      "sources_conflict", "detail_missing", "calculation_incomplete", "tool_failure",
                                      "instruction_not_met", "removed", "document_not_read", "limit_reached",
-                                     "unit_not_located"}
+                                     "unit_not_located", "standard_absent"}
     assert not hasattr(coverage, "LIMITATIONS") and not hasattr(coverage, "ABSENCE_KINDS")
 
 
@@ -1151,6 +1151,25 @@ def test_a_file_of_several_units_with_none_located_gives_unit_not_located_never_
     assert o["limitation"] == "unit_not_located" and o["limitation_text"] == coverage.REASONS["unit_not_located"]
     assert gap == "**דמי הניהול**: השומה (היחידה בקובץ) שהשאלה מתייחסת אליה לא אותרה, ולכן לא נבדק אם הנתון מופיע בה."
     assert "לא נמצא" not in gap and "לא מופיע" not in gap
+
+
+def test_a_professional_question_whose_pool_was_empty_gets_the_standard_absent_gap_not_a_search_that_found_nothing():
+    ws = _ws()
+    ws.searches.append("דמי ניהול")
+    ws.intent, ws.standards_absent = "professional", True
+    o, gap = _only_missing(ws)
+    assert o["limitation"] == "standard_absent" and o["limitation_text"] == "נוסח התקן אינו במאגר"
+    assert gap == "**דמי הניהול**: נוסח התקן אינו במאגר, ולכן לא ניתן לענות על כך ממה שהתקן קובע."
+    assert "לא אותר" not in gap and "לא נמצא" not in gap
+    # a gap of the repository, stated before a limit of the turn: it is why nothing was read in a standard
+    _stopped_on(ws, "time_limit")
+    assert _only_missing(ws)[0]["limitation"] == "standard_absent"
+    # another question type, or a pool that was not empty, says what it always said
+    for intent, absent in (("property", True), ("professional", False)):
+        other = _ws()
+        other.searches.append("דמי ניהול")
+        other.intent, other.standards_absent = intent, absent
+        assert _only_missing(other)[0]["limitation"] != "standard_absent"
 
 
 def test_not_in_part_read_needs_the_read_section_to_lie_inside_the_located_unit():

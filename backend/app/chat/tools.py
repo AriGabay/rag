@@ -29,12 +29,15 @@ that points at the first (``Workspace.read_memo``).
 Tools:
 
 - ``search``: hybrid retrieval (lexical, trigram, semantic) over text, tables, table rows and picture text,
-  optionally within named documents;
+  optionally within named documents, in the pools the turn's intent allows (``pool``; see **Pools** below);
 - ``read``: one locator — a source (``S#``/``P#``: the paragraphs around it, or its whole table), a page range of
   a document, a section (``§#``, its sub-sections included), a table (``T#``) or the continuation of an earlier
   read (``K#``). A result is a part of bounded size whose header states whether it is complete, clipped (and the
   ``K#`` that continues it), has unread regions (marked in place with their ``R#``) or uncertain reading; blocks
   the turn already returned are sent as a pointer to the source that returned them (``app.chat.reader``);
+- ``find_standards``: the standards and professional documents the user may see, with what each states about itself
+  ("לא ידוע" where it states nothing), the editions of a number with whether their order is known, the document an
+  amending one amends, and the copies of one text; a listing source;
 - ``find_documents``: every document that contains all the terms that define a set (a place, a document type),
   in its title or text — the scope of a question about a set of documents, paged, with the total;
 - ``list_documents``: visible documents with their reading status (fully read, partial: what was not read), paged;
@@ -75,6 +78,19 @@ Tools:
   unless the user asked for the rate, and nothing is substituted; one outside the interval is recorded as differing
   (``stated_amount_differs``), to be shown beside the result. The literals stay structural (``calc``): a rate nobody
   gave is refused, never applied.
+
+**Pools** (round 10 U8: KTD11–KTD13, KTD15; R22–R32): what a search reads is decided by the server from the turn's settled
+intent (``Workspace.pools``), never by the model. A professional question reads the standards and professional documents
+(the professional pool) and sees appraisals only as labelled examples of one property's choice; a property question reads
+appraisals, and a standard only on request and labelled as method, never as a property's datum; a mixed question reads
+both; a set question appraisals; a document question the documents it names. The ``pool`` argument chooses among the
+pools the intent allows; one it may not read is clipped with a note. A hit of a standard carries the document's identity
+(``Source.standard``: number, name, edition, effective date, and the section it is in), rendered in its title and location
+("תקן 98.1 (גרסה 2.0, בתוקף מ-…) — סעיף 2.1, עמוד 4"), the conditions and exceptions that limit its provision, and the call
+that reads the whole section (``read(section=§#)``: the section with its subsections, the sections its references name and
+the standards it names that no visible document carries, stated as absent). Identical text is counted once: the later
+copies of one text and edition are left out of the pool (``professional.catalog``) and named in ``find_standards``. An
+office that holds no standard says so, and the turn records the gap (``Workspace.standards_absent``).
 
 **Two levels** (round 9 U9: KTD7, KTD8; R10–R13, R15): a file holding several appraisals is also searched in two steps.
 ``find_documents`` matches by *unit* (``platform.search.units_matching``: all the terms inside one unit — in its title or
@@ -152,9 +168,11 @@ from app.measurements.extract import (
     names_match,
     stance_label,
 )
+from app.platform import source_kinds
 from app.platform.documents import coverage_of, display_box_of, reading_notes
 from app.platform.search import SearchScope, search_passages, unread_documents, unread_matching, unread_named
 from app.platform.source_kinds import APPRAISALS_SQL
+from app.professional import catalog, profile, sections
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +288,13 @@ class Source:
     # the document), shown to the judge beside the source; empty in a file of several contexts, whose sources say
     # their context instead
     subject: str = ""
+    # the kind of document it is from, and — for a standard or another professional document — what identifies the
+    # passage (round 10 U8, KTD13): {number, title, edition, effective, section, section_title}, each None where the
+    # document states nothing; title and location render it. ``label``: how the pool labels the hit for the model (an
+    # appraisal's example under a professional question, a standard's method under a property question)
+    source_kind: str = source_kinds.APPRAISAL
+    standard: dict | None = None
+    label: str | None = None
 
     @property
     def is_listing(self) -> bool:
@@ -282,7 +307,8 @@ class Source:
                "text": self.text, "block_start": self.block_start, "block_end": self.block_end,
                "table_index": self.table_index, "page_list": self.page_list, "reading_id": self.reading_id,
                "status": self.status, "clipped": self.clipped, "unread_regions": len(self.unread_regions),
-               "more": self.resume, "method": self.method, "row_index": self.row_index}
+               "more": self.resume, "method": self.method, "row_index": self.row_index,
+               "source_kind": self.source_kind, "standard": self.standard}
         if self.context:
             out["context"] = self.context
         if self.unit:
@@ -381,6 +407,16 @@ class Workspace:
     # the turn's settled intent (round 10 U6; ``intent.Intent.value``): what the tools' pools are set from; ``unknown``
     # until the request is read, and when it is not known
     intent: str = "unknown"
+    # a document question's named documents (round 10 U8): the only documents its searches read (``tool_search``)
+    named_documents: tuple[str, ...] = ()
+    # version id -> (source kind, what its profile states) for a professional version, False for an appraisal (the
+    # identity ``standard_for`` gives a source); True once a professional pool search or listing found the office holds
+    # no standard or professional document (the coverage gap "נוסח התקן אינו במאגר", KTD15)
+    standards: dict[str, Any] = field(default_factory=dict)
+    standards_absent: bool = False
+    profiled: bool = False  # the turn derived the profiles that were missing (``profiles``)
+    # the copies of professional text the pool leaves out, read once per data version: (version, excluded versions)
+    copies: tuple | None = None
     inspections: int = 0  # vision model calls ``inspect`` made in the turn (capped by ``chat_max_inspections``)
     # the turn's reading deadline (``time.monotonic()``; None outside a turn): a vision call of ``inspect`` is cut to
     # it, and none starts with less than ``chat_inspect_reserve_seconds`` left
@@ -455,6 +491,14 @@ class Workspace:
     # the windows an identical read returned, kept for the turn (round 9 R16, KTD9, ``_memoized_read``): (a page range,
     # section or cursor window, or a table part; the reading; the office's data version) -> the source it returned
     read_memo: dict = field(default_factory=dict)
+
+    @property
+    def pools(self) -> dict[str, str]:
+        """The pools the turn's tools may read and the role of each (round 10 U8, KTD12), from the settled intent — the one
+        place the intent decides them, so they can never disagree with it: ``primary`` answers the question, ``example``
+        shows an appraisal only as one property's choice, ``method`` shows a standard only for the method it explains,
+        never as a property's datum."""
+        return dict(INTENT_POOLS.get(self.intent, INTENT_POOLS["unknown"]))
 
     def spend(self, output: str) -> str:
         """Count a tool output sent to the model against the turn's budget; the output that reaches it is sent
@@ -741,8 +785,11 @@ def _render_source(s: Source) -> str:
     if s.status:  # a reading: how complete it is, the reading it is of, and how to read on
         tags += (f' status="{s.status}" version_id="{s.version_id}" reading_id="{_attr(s.reading_id)}"'
                  + (f' more="{s.more}"' if s.more else ""))
+    # what kind of document it is, when that is not an appraisal, and how its pool labels it (round 10 U8)
+    pool = "" if s.source_kind == source_kinds.APPRAISAL else f' source_kind="{s.source_kind}"'
+    pool += f' label="{_attr(s.label)}"' if s.label else ""
     return (f'<source id="{s.sid}" document_id="{s.document_id}"{tags} title="{_attr(s.title)}"'
-            f' location="{_attr(s.location)}" kind="{s.kind}">{flag}\n{_txt(s.body if s.body is not None else s.text)}'
+            f' location="{_attr(s.location)}" kind="{s.kind}"{pool}>{flag}\n{_txt(s.body if s.body is not None else s.text)}'
             "\n</source>")
 
 
@@ -1036,6 +1083,242 @@ def subject_from(cx, number: int | None, subject: str) -> str:
     return "contradicted" if named else "asserted"
 
 
+# --- pools and professional sources (round 10 U8: KTD11-KTD13, KTD15; R22-R32) -------------------------------------------
+#
+# What a search may read is decided by the server from the turn's settled intent (``Workspace.pools``), never by the model:
+# the ``pool`` argument of ``search`` only chooses among the pools the intent allows, and a pool it may not read is clipped
+# with a note. A hit of the professional pool carries its section, the limits that bind its provision and the call that
+# reads the whole section; an appraisal hit under a question that is not about a property is labelled for what it is.
+
+PROFESSIONAL_POOL, APPRAISAL_POOL = "professional", "appraisal"
+POOL_KINDS = {PROFESSIONAL_POOL: (source_kinds.STANDARD, source_kinds.PROFESSIONAL),
+              APPRAISAL_POOL: (source_kinds.APPRAISAL,)}
+PRIMARY, EXAMPLE, METHOD = "primary", "example", "method"
+# the role of each pool the intent allows (``Workspace.pools``); `document` reads the named documents of either pool
+INTENT_POOLS = {
+    "professional": {PROFESSIONAL_POOL: PRIMARY, APPRAISAL_POOL: EXAMPLE},
+    "property": {APPRAISAL_POOL: PRIMARY, PROFESSIONAL_POOL: METHOD},
+    "document": {APPRAISAL_POOL: PRIMARY, PROFESSIONAL_POOL: PRIMARY},
+    "mixed": {APPRAISAL_POOL: PRIMARY, PROFESSIONAL_POOL: PRIMARY},
+    "unknown": {PROFESSIONAL_POOL: PRIMARY, APPRAISAL_POOL: EXAMPLE},
+    "set": {APPRAISAL_POOL: PRIMARY},
+}
+# the pools a search reads when the call names none, in the order its hits come
+DEFAULT_POOLS = {
+    "professional": (PROFESSIONAL_POOL, APPRAISAL_POOL),
+    "property": (APPRAISAL_POOL,),
+    "document": (APPRAISAL_POOL, PROFESSIONAL_POOL),
+    "mixed": (APPRAISAL_POOL, PROFESSIONAL_POOL),
+    "unknown": (PROFESSIONAL_POOL, APPRAISAL_POOL),
+    "set": (APPRAISAL_POOL,),
+}
+EXAMPLE_HITS = 3  # appraisal hits (or a method's) beside the pool that answers
+LIMIT_SHOWN = 6  # limits shown with one hit
+
+LABEL_EXAMPLE = "דוגמה לבחירה של נכס מסוים — אינה כלל מקצועי"
+LABEL_APPRAISAL_KIND = "מסמך מסוג שומה"
+LABEL_APPRAISAL_DATA = "נתוני נכס מתוך שומה"
+LABEL_METHOD = "שיטה — לא נתון של נכס"
+LABEL_PROFESSIONAL = "מקור מקצועי (תקן או מסמך מקצועי)"
+MSG_POOL_CLIPPED = "המאגר שביקשת אינו מותר לשאלה מהסוג הזה: החיפוש הוגבל למאגרים שהשרת קבע לה."
+MSG_POOL_EXAMPLES = ("שאלה מקצועית: שומות מוצגות כדוגמה לבחירה של נכס מסוים בלבד, ולא ככלל מקצועי; כלל מקצועי נלקח "
+                     "ממקור מקצועי.")
+MSG_NO_STANDARD_POOL = ("במאגר שהמשתמש מורשה לראות אין תקן או מסמך מקצועי: נוסח התקן אינו במאגר. אל תענה ממה שהתקן קובע "
+                        "לפי הזיכרון, ואמור שהנוסח אינו במאגר; אפשר להשתמש במקורות האחרים שהוחזרו.")
+MSG_NO_STANDARDS = "אין במאגר תקן או מסמך מקצועי שהמשתמש מורשה לראות."
+MSG_STANDARDS_UNUSED = "שאלה על קבוצת מסמכים משתמשת בשומות בלבד: רשימת תקנים אינה חלק ממנה."
+MSG_LIMITS = "תנאים וחריגים בסעיף (הכלל נקרא יחד איתם, לא בלעדיהם):"
+MSG_ORDER_UNKNOWN = ("סדר המהדורות אינו ידוע: התאריכים שנכתבו במסמכים אינם מסדרים אותן, ותאריך ההעלאה אינו קובע איזו "
+                     "מהן בתוקף. אין לקבוע איזו מהן עדכנית.")
+UNKNOWN = "לא ידוע"
+RELATIONS = {"clarifies": "מבהיר", "amends": "מתקן", "replaces": "מחליף", "appendix_of": "נספח של"}
+
+
+def _has_professional(conn: Connection) -> bool:
+    """Whether the user may see a ready professional document at all."""
+    return bool(conn.execute(text(
+        "SELECT EXISTS (SELECT 1 FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
+        " AND v.status IN ('ready', 'needs_review') WHERE d.deleted_at IS NULL AND d.source_kind <> :a)"),
+        {"a": source_kinds.APPRAISAL}).scalar_one())
+
+
+def profiles(ws: Workspace, conn: Connection) -> tuple[list, int]:
+    """The visible professional documents' editions (``profile.visible_editions``), after the profiles that were not
+    derived yet are — once per turn, for documents ingested before profiles existed (``ingest`` derives them)."""
+    loaded = profile.visible_editions(conn)
+    if loaded[1] and not ws.profiled:
+        ws.profiled = True
+        profile.ensure_all(ws.ctx)
+        loaded = profile.visible_editions(conn)
+    return loaded
+
+
+def copies_left_out(ws: Workspace, conn: Connection) -> tuple:
+    """The versions of professional text the pool leaves out because the same text, with the same stated edition, is
+    stored earlier (KTD11), read once per data version."""
+    version = current_data_version(conn)
+    if ws.copies is None or ws.copies[0] != version:
+        profiles(ws, conn)  # the stated editions that tell copies from editions
+        ws.copies = (version, catalog.excluded(catalog.entries(conn)))
+    return ws.copies[1]
+
+
+def _base_identity(ws: Workspace, conn: Connection, version_id) -> tuple[str, dict] | None:
+    """(source kind, what the document's profile states) of a professional version, None for an appraisal."""
+    key = str(version_id)
+    found = ws.standards.get(key)
+    if found is None:
+        kind = conn.execute(text("SELECT d.source_kind FROM documents d JOIN document_versions v ON v.document_id = d.id"
+                                 " WHERE v.id = :v"), {"v": UUID(key)}).scalar_one_or_none()
+        if kind is None or kind == source_kinds.APPRAISAL:
+            found = False
+        else:
+            stored = profile.profile_of(conn, UUID(key)) or profile.ensure_profile(ws.ctx, UUID(key))
+            found = (kind, {"number": stored.stated("number") if stored else None,
+                            "title": stored.stated("title") if stored else None,
+                            "edition": stored.stated("edition") if stored else None,
+                            "effective": stored.stated("effective") if stored else None,
+                            "section": None, "section_title": None})
+        ws.standards[key] = found
+    return found or None
+
+
+def standard_for(ws: Workspace, conn: Connection, version_id, block_index: int | None) -> tuple[str, dict] | None:
+    """The identity of a passage of a professional version at ``block_index``: its source kind and ``{number, title,
+    edition, effective, section, section_title}`` — what the document states about itself and the section the block is
+    in. None for an appraisal."""
+    base = _base_identity(ws, conn, version_id)
+    if base is None:
+        return None
+    kind, std = base
+    sec = sections.section_of(conn, version_id, block_index) if block_index is not None else None
+    return kind, std | ({"section": sec.label, "section_title": sec.title} if sec is not None else {})
+
+
+def standard_title(std: dict, document_title: str) -> str:
+    """"תקן 98.1 (גרסה 2.0, בתוקף מ-05.10.2025)": the number, else the stated name, else the document's own title, with
+    the edition and the effective date when it states them."""
+    detail = ", ".join(x for x in (std["edition"], f"בתוקף מ-{std['effective']}" if std["effective"] else None) if x)
+    head = f"תקן {std['number']}" if std["number"] else (std["title"] or document_title)
+    return head + (f" ({detail})" if detail else "")
+
+
+def section_phrase(std: dict) -> str | None:
+    """"סעיף 2.1", "נספח א'" or "סעיף «הגדרות»": where in the document, in the words a reader cites it."""
+    label, title = std.get("section"), std.get("section_title")
+    if label and label.startswith("נספח"):
+        return label
+    if label and re.fullmatch(r"\d+(?:\.\d+)*", label):
+        return f"סעיף {label}"
+    return f"סעיף «{title or label}»" if title or label else None
+
+
+def standard_location(std: dict, page_list, kind: str = "text") -> str:
+    parts = [section_phrase(std)]
+    if kind in ("table", "table_row"):
+        parts.append("טבלה")
+    if page_list:
+        parts.append(f"עמוד {page_list[0]}" if len(page_list) == 1 else f"עמודים {page_list[0]}–{page_list[-1]}")
+    return ", ".join(p for p in parts if p) or "המסמך"
+
+
+def section_string(std: dict) -> str | None:
+    """The section as a source names it: "2.1 גישת ההשוואה" (its label and its title, whichever the document states)."""
+    label, title = std.get("section"), std.get("section_title")
+    return f"{label} {title}" if label and title and title != label else label or title
+
+
+def _psection_handle(ws: Workspace, document_id, version_id, reading_id, section_no: int) -> str:
+    """The handle (§#) of a section of a professional document, read whole by ``read(section=§#)``."""
+    return ws.handle("§", (str(version_id), "psection", section_no), document_id=str(document_id),
+                     version_id=str(version_id), reading_id=reading_id, psection=section_no)
+
+
+def _limits_of(secs: tuple, sec: sections.Section) -> list[tuple[dict, sections.Section]]:
+    """The limits that bind a provision of ``sec``: its own, then those of the sections around it (a chapter's
+    exception reaches the sections it holds), each with the section it was written in."""
+    by_no = {x.section_no: x for x in secs}
+    out, at = [], sec
+    while at is not None:
+        out += [(lim, at) for lim in at.limits]
+        at = by_no.get(at.parent_no) if at.parent_no is not None else None
+    return out
+
+
+def limit_lines(secs: tuple, sec: sections.Section) -> list[str]:
+    limits = _limits_of(secs, sec)
+    if not limits:
+        return []
+    lines = [MSG_LIMITS]
+    for lim, at in limits[:LIMIT_SHOWN]:
+        where = "" if at.section_no == sec.section_no else f" (בסעיף {at.label or at.title})"
+        lines.append(f"- «{_txt(lim['sentence'])}»{where}")
+    if len(limits) > LIMIT_SHOWN:
+        lines.append(f"- ועוד {len(limits) - LIMIT_SHOWN} תנאים וחריגים: read עם הסעיף כולו")
+    return lines
+
+
+def _identified(s: Source, cx) -> str | None:
+    """The property an appraisal passage belongs to, or None. A passage in a file of several units belongs to the unit it
+    begins in when that is an appraisal (not an appendix or a comparables part) with a title or identifiers; a passage of
+    a file of one subject unit belongs to the property whose address or block and parcel the document states. A document
+    that names no property (a glossary stored as an appraisal, a file with a title and no address) names none."""
+    if s.unit:
+        label = s.unit.get("label") or ""
+        subject = s.unit.get("kind") not in contexts.NON_SUBJECT_KINDS
+        return label if subject and (s.unit.get("title") or label) and label != contexts.MSG_UNNAMED else None
+    if cx is not None and not cx.multi and len(cx.subjects) == 1:
+        ident = cx.identity(cx.subjects[0])
+        return " · ".join(ident.shown) if not ident.empty else None
+    return None
+
+
+def _label_of(s: Source, cx, pool: str, role: str, intent: str) -> str | None:
+    """How a hit of a pool is labelled for the model (None: not at all). An appraisal under a question that is not about
+    a property is an example of a property's choice only when the passage belongs to an identified property; otherwise it
+    is named by its stored kind and nothing more."""
+    if pool == PROFESSIONAL_POOL:
+        return LABEL_METHOD if role == METHOD else LABEL_PROFESSIONAL if intent in ("mixed", "unknown") else None
+    if role == EXAMPLE:
+        who = _identified(s, cx)
+        return f"{LABEL_EXAMPLE}: {who}" if who else LABEL_APPRAISAL_KIND
+    return LABEL_APPRAISAL_DATA if intent == "mixed" else None
+
+
+@dataclass
+class _Pass:
+    pool: str
+    role: str
+    limit: int
+
+
+def _plan(ws: Workspace, conn: Connection, pool: str | None, limit: int) -> tuple[list[_Pass], list[str], bool]:
+    """The passes of a search — which pools, in what role, with how many hits each — from the intent and the call's
+    ``pool`` (clipped to the allowed ones, with a note), and whether the call names the pool it reads. An unknown intent in
+    an office that holds no standard is the appraisal search it always was: appraisals alone, in no role."""
+    allowed, notes = ws.pools, []
+    default = DEFAULT_POOLS.get(ws.intent, DEFAULT_POOLS["unknown"])
+    if ws.intent == "unknown" and not _has_professional(conn):
+        allowed, default = {APPRAISAL_POOL: PRIMARY, PROFESSIONAL_POOL: allowed[PROFESSIONAL_POOL]}, (APPRAISAL_POOL,)
+    named = pool not in (None, "") and pool in allowed
+    if pool not in (None, "") and not named:
+        notes.append(MSG_POOL_CLIPPED)
+    chosen = [pool] if named else [p for p in default if p in allowed]
+    if named and allowed[pool] == EXAMPLE:
+        notes.append(MSG_POOL_EXAMPLES)
+    primaries = [p for p in chosen if allowed[p] == PRIMARY]
+    passes = []
+    for p in chosen:
+        if len(chosen) == 1 or (allowed[p] == PRIMARY and len(primaries) == 1):
+            n = limit
+        elif allowed[p] == PRIMARY:
+            n = max(3, (limit + 1) // 2)
+        else:
+            n = min(limit, EXAMPLE_HITS)
+        passes.append(_Pass(p, allowed[p], n))
+    return passes, notes, named
+
+
 # --- tools -----------------------------------------------------------------------------------------------
 
 def memoized_search(ws: Workspace, conn: Connection, query: str, limit: int, scope: SearchScope | None) -> list[dict]:
@@ -1044,7 +1327,8 @@ def memoized_search(ws: Workspace, conn: Connection, query: str, limit: int, sco
     indexed row — so a document processed, deleted or republished mid-turn is never answered from before it."""
     scope_key = None if scope is None else (
         tuple(sorted(map(str, scope.document_ids))), tuple(sorted(map(str, scope.version_ids))),
-        scope.include_noncurrent, scope.blocks)
+        scope.include_noncurrent, scope.blocks, tuple(sorted(scope.source_kinds)),
+        tuple(sorted(map(str, scope.exclude_versions))))
     key = (query, scope_key, limit, current_data_version(conn))
     hits = ws.search_memo.get(key)
     if hits is None:
@@ -1184,7 +1468,7 @@ def _clip_to_unit(conn: Connection, version_id, cx, kind: str, bs, be, body: str
 
 
 def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None, limit: int | None = None,
-                unit: str | None = None) -> str:
+                unit: str | None = None, pool: str | None = None) -> str:
     query = (query or "").strip()
     if len(query) < 2:
         raise ToolError("שאילתת חיפוש ריקה")
@@ -1206,11 +1490,28 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
             elif nothing:
                 return nothing
             lookup_unread = False  # a unit names its document: no unread document is looked up by title
+            hits = [h | {"pool": APPRAISAL_POOL, "role": PRIMARY} for h in hits]
         else:
             docs = _visible_documents(conn, document_ids or [])
-            scope = SearchScope(document_ids=tuple(docs)) if docs else None
-            hits = memoized_search(ws, conn, query, limit, scope)
-            lookup_unread = scope is None
+            if ws.intent == "document" and ws.named_documents:  # a document question reads the named documents only
+                named = [UUID(d) for d in ws.named_documents]
+                kept = [d for d in docs if d in named]
+                if docs and len(kept) != len(docs):
+                    notes.append(MSG_POOL_CLIPPED)
+                docs = kept or named
+            passes, pool_notes, asked = _plan(ws, conn, pool, limit)
+            notes += pool_notes
+            hits = []
+            for p in passes:
+                if p.pool == PROFESSIONAL_POOL and (ws.intent in ("professional", "mixed") or asked) \
+                        and not _has_professional(conn):
+                    ws.standards_absent = True  # the office holds none: a stated gap, not a failed search (KTD15)
+                    notes.append(MSG_NO_STANDARD_POOL)
+                    continue
+                left_out = copies_left_out(ws, conn) if p.pool == PROFESSIONAL_POOL and not docs else ()
+                scope = SearchScope(document_ids=tuple(docs), source_kinds=POOL_KINDS[p.pool], exclude_versions=left_out)
+                hits += [h | {"pool": p.pool, "role": p.role} for h in memoized_search(ws, conn, query, p.limit, scope)]
+            lookup_unread = not docs
         # a document the query names by its title that was not read has no passages: say so, never "not found" (KTD11)
         named = unread_named(conn, query, ws.unread_files(conn)) if lookup_unread else []
         ws.name_unread(named)
@@ -1237,6 +1538,11 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 continue
             e = extra.get(h["chunk_id"])
             bs, be = (e.block_start, e.block_end) if e else (None, None)
+            if h["pool"] == PROFESSIONAL_POOL:
+                src = _professional_hit(ws, conn, h, bs, be, sizes, gaps.get(h["version_id"], whole), h["role"])
+                out.append(ws.once(src, ("chunk", h["chunk_id"])))
+                ws.touch(h["document_id"], h["title"], "retrieved", gaps.get(h["version_id"], whole).partial)
+                continue
             cx = contexts_of(ws, conn, h["version_id"])
             if cx.multi:
                 noted[str(h["document_id"])] = cx
@@ -1257,16 +1563,48 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 partial_document=gaps.get(h["version_id"], whole).cites(page_list, h["section"]), tags=tags,
                 row_index=h.get("row_index") if h["kind"] == "table_row" else None),
                 cx, _hit_contexts(ws, conn, cx, h, bs, be) if cx.multi else [], ws)
+            src.label = _label_of(src, cx, h["pool"], h["role"], ws.intent)
             out.append(ws.once(src, ("chunk", h["chunk_id"])))
             # the document as a whole: a datum not found may be in a part of it that was not read
             ws.touch(h["document_id"], h["title"], "retrieved", gaps.get(h["version_id"], whole).partial)
     block = unread_text.tool_block(named)
+    lead = "\n\n".join(notes)
     if not out:
         return (f'לא נמצאו קטעים עבור "{query}". אפשר לנסות ניסוח אחר, מונחים נרדפים או חיפוש בתוך מסמך מסוים.'
-                + (f"\n\n{block}" if block else ""))
+                + (f"\n\n{lead}" if lead else "") + (f"\n\n{block}" if block else ""))
     hints = [MSG_ROWS_NOT_SHOWN.format(handle=t, n=n) for t, n in capped] + ([block] if block else [])
     hints += [f"{ws.doc_handle(d)}: {note}" for d, cx in noted.items() if (note := _note_once(ws, d, cx))]
     return "\n\n".join([*notes, *(_render_source(s) for s in out), *hints])
+
+
+def _professional_hit(ws: Workspace, conn: Connection, h: dict, bs, be, sizes: dict, gaps: ReadingGaps,
+                      role: str) -> Source:
+    """A hit of the professional pool (KTD13, R22): the passage under the identity of its standard — the number, the
+    edition and the effective date it states, the section it is in — with the limits that bind its provision, and the
+    call that reads the whole section. A document that states nothing is named by its own title."""
+    vid = h["version_id"]
+    kind, std = standard_for(ws, conn, vid, bs)
+    secs = sections.sections_of(conn, vid)
+    sec = sections.section_of(conn, vid, bs) if bs is not None else None
+    body = _with_size(sizes.get((vid, h.get("table_index"))), _clip(h["text"], get_settings().chat_passage_chars))
+    notes = []
+    if sec is not None:
+        handle = _psection_handle(ws, h["document_id"], vid, ws.readings.get(str(vid)), sec.section_no)
+        where = " ".join(x for x in (section_phrase(std), f"«{_txt(sec.title)}»" if sec.title and sec.label else None) if x)
+        notes.append(f"[{where}: read(section={handle}) קורא את הסעיף כולו, עם תתי-הסעיפים שלו]")
+        notes += limit_lines(secs, sec)
+    tags = {"document": ws.doc_handle(h["document_id"])}
+    if h.get("table_index") is not None:
+        tags["table"] = _table_handle(ws, h["document_id"], vid, ws.readings.get(str(vid)), h["table_index"])
+    src = ws.add_source(
+        document_id=h["document_id"], version_id=vid, title=standard_title(std, h["title"]), section=section_string(std),
+        location=standard_location(std, h["page_list"], h["kind"]), kind=h["kind"], text=body,
+        body="\n".join([body, *notes]), block_start=bs, block_end=be, table_index=h.get("table_index"),
+        chunk_id=h["chunk_id"], page_list=h["page_list"] or None, tags=tags,
+        partial_document=gaps.cites(h["page_list"], h["section"]), source_kind=kind, standard=std,
+        row_index=h.get("row_index") if h["kind"] == "table_row" else None)
+    src.label = _label_of(src, None, PROFESSIONAL_POOL, role, ws.intent)
+    return src
 
 
 MSG_ROWS_NOT_SHOWN = ("בטבלה {handle} התאימו לחיפוש עוד {n} שורות שלא הוצגו כאן. לקריאת הטבלה כולה, עם הכותרות "
@@ -1504,10 +1842,11 @@ def _cursor(ws: Workspace, v: reader.Version, target: tuple, pos, within: tuple[
 def _emit(ws: Workspace, v: reader.Version, target: tuple, pos, part: reader.Part, *, name: str, scope: str,
           location: str, section: str | None, lines: list[str], read: bool, more: str | None = None,
           cut: bool = False, unread_pages: list[int] | None = None, cx=None,
-          within: tuple[int, int] | None = None) -> Source:
+          within: tuple[int, int] | None = None, standard: tuple[str, dict] | None = None) -> Source:
     """A part of a window as a source of the turn. Its ``text`` is the part's full text (what the verifier
     checks); what is sent leaves out blocks the turn already returned whole, as a pointer to the source that
-    returned them, and marks unread and uncertain regions where they are in reading order with their R#."""
+    returned them, and marks unread and uncertain regions where they are in reading order with their R#.
+    ``standard``: (kind, identity) of a part of a professional document (``standard_for``), which names the source."""
     vid = str(v.version_id)
     sent = ws.sent.setdefault(vid, {})
     content, body, regions, run = [], [], [], []
@@ -1570,13 +1909,16 @@ def _emit(ws: Workspace, v: reader.Version, target: tuple, pos, part: reader.Par
         head.append("עמודים שלא נקראו בעיבוד המסמך: " + ", ".join(str(p) for p in unread_pages))
     indexes = [r.block_index for r, _, _ in part.items]
     pages = sorted({r.page for r, _, _ in part.items if r.page})
-    s = ws.add_source(document_id=v.document_id, version_id=v.version_id, title=v.title, section=section,
-                      location=location or _pages_label(pages), kind="context", text="\n".join(content),
-                      block_start=min(indexes), block_end=max(indexes), page_list=pages or None,
-                      partial_document=v.partial, reading_id=v.reading_id, status=status,
-                      clipped=clipped, unread_regions=regions, more=more,
-                      resume=_target_json(target, part.next), body="\n".join(head + lines + body),
-                      tags={"document": ws.doc_handle(v.document_id)})
+    identity = {} if standard is None else {
+        "title": standard_title(standard[1], v.title), "source_kind": standard[0], "standard": standard[1],
+        "section": section_string(standard[1]), "location": standard_location(standard[1], pages)}
+    s = ws.add_source(**{"document_id": v.document_id, "version_id": v.version_id, "title": v.title,
+                         "section": section, "location": location or _pages_label(pages), "kind": "context",
+                         "text": "\n".join(content), "block_start": min(indexes), "block_end": max(indexes),
+                         "page_list": pages or None, "partial_document": v.partial, "reading_id": v.reading_id,
+                         "status": status, "clipped": clipped, "unread_regions": regions, "more": more,
+                         "resume": _target_json(target, part.next), "body": "\n".join(head + lines + body),
+                         "tags": {"document": ws.doc_handle(v.document_id)}} | identity)
     if cx is not None:
         _mark(s, cx, cx.spanned(min(indexes), max(indexes)) if cx.multi else [], ws)
     if cx is not None and cx.multi:
@@ -1623,6 +1965,8 @@ def _read_window_once(ws: Workspace, conn: Connection, v: reader.Version, target
     vid = v.version_id
     unread_pages = None
     from_block = pos[0] if pos else None  # ``take`` starts at ``pos``: the blocks before it are not loaded
+    if target[0] == "psection":
+        return _read_professional_section(ws, conn, v, target, pos)
     cx = contexts_of(ws, conn, vid, v.reading_id)
     if target[0] == "section":
         path = target[2]
@@ -1657,10 +2001,85 @@ def _read_window_once(ws: Workspace, conn: Connection, v: reader.Version, target
             lines.append("סעיפים בעמודים האלה: " + "; ".join(
                 f"{_section_handle(ws, v, p, w)} «{_section_name(p)}»" for p, w in list(paths)[:SECTIONS_LISTED]))
     s = _emit(ws, v, target, pos, part, name=name, scope=target[0], location=location, section=section,
-              lines=lines, read=True, unread_pages=unread_pages if pos is None else None, cx=cx, within=within)
+              lines=lines, read=True, unread_pages=unread_pages if pos is None else None, cx=cx, within=within,
+              standard=standard_for(ws, conn, vid, part.items[0][0].block_index))
     if target[0] == "pages":  # a section opened by name is its own opening
         _whole_sections(ws, conn, v, cx, part, s)
     return s
+
+
+MSG_SECTION_GONE = "הסעיף אינו קיים בקריאה הנוכחית של המסמך"
+MSG_REF_UNRESOLVED = "{ref} — הסעיף אינו במסמך"
+MSG_REF_EXTERNAL_ABSENT = "{ref} — תקן {number}: לא במאגר — התוכן אינו זמין. אל תמלא את תוכנו מהזיכרון."
+MSG_REF_EXTERNAL_HELD = "{ref} — תקן {number} במאגר: {held}"
+SUBSECTIONS_LISTED = 12
+
+
+def _read_professional_section(ws: Workspace, conn: Connection, v: reader.Version, target: tuple, pos) -> Source:
+    """A whole section of a standard (``sections.section_text``, R22, R23): every block from the section's first to its last,
+    its subsections' included, in bounded parts that continue with a cursor. The header names the section above it, the
+    subsections below it as handles that read each of them, and — for each reference the section makes — the section it
+    names (a handle), or that it names a section the document does not hold, or a standard that no visible document
+    carries (a gap, never filled in)."""
+    vid = v.version_id
+    st = sections.section_text(conn, vid, int(target[2]))
+    if st is None:
+        raise ToolError(MSG_SECTION_GONE)
+    sec, secs = st.section, sections.sections_of(conn, vid)
+    by_no = {x.section_no: x for x in secs}
+
+    def handle(x: sections.Section) -> str:
+        return _psection_handle(ws, v.document_id, vid, v.reading_id, x.section_no)
+
+    def called(x: sections.Section) -> str:
+        return section_string({"section": x.label, "section_title": x.title}) or ""
+
+    def named(x: sections.Section) -> str:
+        return f"{handle(x)} «{_txt(called(x))}»"
+
+    lines = []
+    if sec.parent_no is not None and sec.parent_no in by_no:
+        lines.append(f"סעיף אב: {named(by_no[sec.parent_no])}")
+    children = [x for x in st.subsections if x.parent_no == sec.section_no]
+    if children:
+        lines.append("תתי-סעיפים (הטקסט שלהם כלול בקריאה הזו; כל אחד נקרא גם לבדו): "
+                     + "; ".join(named(x) for x in children[:SUBSECTIONS_LISTED])
+                     + (f" ועוד {len(children) - SUBSECTIONS_LISTED}" if len(children) > SUBSECTIONS_LISTED else ""))
+    if pos is None:  # the references of the whole section, once, at its head
+        lines += _reference_lines(ws, conn, st, by_no, handle)
+    rows = reader.blocks_between(conn, vid, sec.block_first, sec.block_last, limit=None)
+    part = reader.take(rows, pos, read_chars(), ws.sent.get(str(vid), {}))
+    std = standard_for(ws, conn, vid, part.items[0][0].block_index if part.items else sec.block_first)
+    name = called(sec)
+    return _emit(ws, v, target, pos, part, name=name, scope="section", location="", section=name, lines=lines,
+                 read=True, standard=std)
+
+
+def _reference_lines(ws: Workspace, conn: Connection, st, by_no: dict, handle) -> list[str]:
+    """What each reference of a section names (R23): a section of this document (its handle), a section it does not hold,
+    or a standard — held by a visible document (which), or not in the repository."""
+    out, seen = [], set()
+    loaded = None
+    for r in st.refs:
+        ref = f"«{_txt(r['text'])}»"
+        if ref in seen:
+            continue
+        seen.add(ref)
+        if r["status"] == "resolved":
+            target = by_no[r["target"]]
+            out.append(f"הפניה {ref} → {handle(target)} «{_txt(target.label or target.title)}» (read(section={handle(target)}))")
+        elif r["status"] == "unresolved":
+            out.append("הפניה " + MSG_REF_UNRESOLVED.format(ref=ref))
+        else:
+            loaded = loaded or profiles(ws, conn)
+            group = profile.group_of(loaded, r["standard"])
+            if group.editions:
+                held = "; ".join(f"{ws.doc_handle(e.document_id)} document_id={e.document_id} «{_txt(e.title)}»"
+                                 + (f" ({_txt(e.edition)})" if e.edition else "") for e in group.editions)
+                out.append("הפניה " + MSG_REF_EXTERNAL_HELD.format(ref=ref, number=r["standard"], held=held))
+            else:
+                out.append("הפניה " + MSG_REF_EXTERNAL_ABSENT.format(ref=ref, number=r["standard"]))
+    return out
 
 
 def _whole_sections(ws: Workspace, conn: Connection, v: reader.Version, cx, part: reader.Part, s: Source) -> None:
@@ -1878,7 +2297,7 @@ def _read_source(ws: Workspace, conn: Connection, sid: str) -> Source:
     s = _emit(ws, v, ("neighbors", vid, start, end), None, part, name=section or "", scope="neighbors",
               location=_location(section, "text", pages, None, None, (None, None), None), section=section,
               lines=lines, read=False, more=_section_handle(ws, v, path, window(path)) if cut and path else None,
-              cut=cut, cx=cx)
+              cut=cut, cx=cx, standard=standard_for(ws, conn, v.version_id, start))
     _whole_sections(ws, conn, v, cx, part, s)
     return s
 
@@ -1932,7 +2351,10 @@ def tool_read(ws: Workspace, target: dict) -> str:
         elif kind == "section":
             data = _handle(ws, value, "§")
             v = _bound(conn, ws, value, data)
-            s = _read_window(ws, conn, v, _section_target(v, data["path"], data.get("window")), None)
+            if data.get("psection") is not None:  # a section of a standard, read whole with its subsections (R22)
+                s = _read_window(ws, conn, v, ("psection", str(v.version_id), data["psection"]), None)
+            else:
+                s = _read_window(ws, conn, v, _section_target(v, data["path"], data.get("window")), None)
         elif kind == "table":
             data = _handle(ws, value, "T")
             if data.get("vision"):  # read whole by inspect: nothing more to read, its cells are taken from its source
@@ -2055,6 +2477,106 @@ def tool_list_documents(ws: Workspace, query: str | None = None, page: int | Non
                      + (f" ({'; '.join(details)})" if details else "") + f" | נתונים כמותיים: {mstate}")
     return _listing(ws, "רשימת מסמכים", lines, [(r.id, r.title) for r in rows], key=("list_documents", " ".join(words)),
                     criterion=criterion, total=total, page=page, pages=pages) + _unread_listing(ws, words)
+
+
+STANDARD_KIND_WORDS = {source_kinds.STANDARD: "תקן שמאות", source_kinds.PROFESSIONAL: "מסמך מקצועי"}
+
+
+def _edition_lines(ws: Workspace, group, names: dict) -> list[str]:
+    """The editions of one standard number with whether their order is known (KD12): the latest is named only when the
+    dates the documents state order them, and then only among the editions the repository holds."""
+    if len(group.editions) < 2 and not group.related:
+        return []
+    out = []
+    if group.editions:
+        out.append(f"מהדורות של תקן {group.number}: " + "; ".join(
+            f"{names[e.version_id]} «{_txt(e.edition) if e.edition else UNKNOWN}» בתוקף מ: "
+            f"{_txt(e.effective_text) if e.effective_text else UNKNOWN}" for e in group.editions))
+    if len(group.editions) >= 2:
+        if group.order_known:
+            last = group.editions[-1]
+            basis = "תאריך התחילה" if all(e.effective for e in group.editions) else "תאריך הפרסום"
+            out.append(f"סדר המהדורות: ידוע — לפי {basis} שנכתב בכל אחת. המאוחרת מבין המהדורות שבמאגר: "
+                       f"{names[last.version_id]} (בתוקף מ-{last.effective_text or last.published_text}); ייתכנו מהדורות "
+                       "שאינן במאגר.")
+        else:
+            out.append(f"סדר המהדורות: אינו ידוע. {MSG_ORDER_UNKNOWN}")
+    return out
+
+
+def _stated(value: str | None) -> str:
+    return _txt(value) if value else UNKNOWN
+
+
+def tool_find_standards(ws: Workspace, query: str | None = None, page: int | None = None) -> str:
+    """The standards and professional documents the user may see, a page at a time (KTD12, R24, R30): each with what it
+    states about itself — number, name, edition, the two dates, issuer, scope — or "לא ידוע", the document it amends, the
+    editions of its number with whether their order is known, and the later copies of its text ("אותו נוסח כמו …"). A
+    listing source the answer may cite. An office with none says so, and the turn records the gap."""
+    if PROFESSIONAL_POOL not in ws.pools:
+        return MSG_STANDARDS_UNUSED
+    words = [w.lower() for w in re.findall(r"[\w\"״׳'.-]+", query or "")][:6]
+    with tenant_tx(ws.ctx) as conn:
+        loaded = profiles(ws, conn)
+        found = catalog.entries(conn)
+        if not found:
+            ws.standards_absent = True
+            return MSG_NO_STANDARDS
+        heads = catalog.canonical(found)
+        later = catalog.copies(found)
+        by_version = {ed.version_id: ed for ed in loaded[0]}
+        shown = [e for e in found if heads[e.version_id].version_id == e.version_id]
+        if words:
+            def haystack(e) -> str:
+                ed = by_version.get(e.version_id)
+                return " ".join(x for x in (e.title, ed.number if ed else None, ed.name if ed else None,
+                                            ed.edition if ed else None) if x).lower()
+
+            shown = [e for e in shown if all(w in haystack(e) for w in words)]
+        head_loaded = ([ed for ed in loaded[0] if heads[ed.version_id].version_id == ed.version_id], loaded[1])
+        groups = {}
+        for e in shown:
+            ed = by_version.get(e.version_id)
+            if ed is not None and ed.key and ed.key not in groups:
+                groups[ed.key] = profile.group_of(head_loaded, ed.key)
+        # by number, the editions of one number oldest first when their order is known; documents with no number last
+        place = {x.version_id: (n, k) for n, g in enumerate(sorted(groups.values(), key=lambda g: g.number or ""))
+                 for k, x in enumerate(g.editions)}
+        shown.sort(key=lambda e: (*place.get(e.version_id, (len(groups), 0)), e.title, str(e.document_id)))
+        total = len(shown)
+        if not total:
+            return f'לא נמצא תקן או מסמך מקצועי שמתאים ל"{_txt(query)}".'
+        page, pages = _paginate(page, total, LIST_MAX)
+        page_rows = shown[(page - 1) * LIST_MAX:page * LIST_MAX]
+        names = {e.version_id: ws.doc_handle(e.document_id) for e in found}
+        lines = ["תחום: תקנים ומסמכים מקצועיים שהמשתמש מורשה לראות (טקסט זהה נספר פעם אחת; כל הקבצים נשמרים)",
+                 _page_line(page, pages, total, "תקנים ומסמכים מקצועיים")]
+        listed: list[tuple] = []
+        for e in page_rows:
+            ed = by_version.get(e.version_id)
+            fields = [f"סוג: {STANDARD_KIND_WORDS.get(e.source_kind, e.source_kind)}",
+                      f"מספר: {_stated(ed.number if ed else None)}", f"שם: {_stated(ed.name if ed else None)}",
+                      f"מהדורה: {_stated(ed.edition if ed else None)}",
+                      f"פורסם: {_stated(ed.published_text if ed else None)}",
+                      f"בתוקף מ: {_stated(ed.effective_text if ed else None)}",
+                      f"גוף מפרסם: {_stated(ed.issuer if ed else None)}", f"תחולה: {_stated(ed.scope if ed else None)}"]
+            if ed is not None and ed.amends is not None:
+                link = profile.linked(loaded, ed).amends
+                held = (f"במאגר: {names[link['link']['version_id']]}" if link.get("link") else
+                        "כמה מהדורות במאגר — לא נקשר לאחת" if link.get("ambiguous") else "התקן אינו במאגר")
+                fields.append(f"{RELATIONS.get(link['relation'], link['relation'])} תקן {_txt(link['standard'])} ({held})")
+            lines.append(f'- {names[e.version_id]} document_id={e.document_id} | "{_txt(e.title)}" | '
+                         + " | ".join(fields))
+            listed.append((e.document_id, e.title))
+            for c in later.get(e.version_id, []):
+                lines.append(f'  - {names[c.version_id]} document_id={c.document_id} | "{_txt(c.title)}" — אותו נוסח '
+                             f'כמו {names[e.version_id]} «{_txt(e.title)}»')
+                listed.append((c.document_id, c.title))
+        for g in groups.values():
+            if any(e.version_id in {x.version_id for x in g.editions} for e in page_rows):
+                lines += _edition_lines(ws, g, names)
+    return _listing(ws, "תקנים ומסמכים מקצועיים", lines, listed, key=("find_standards", " ".join(words)),
+                    criterion="תקנים ומסמכים מקצועיים שהמשתמש מורשה לראות", total=total, page=page, pages=pages)
 
 
 def _unread_listing(ws: Workspace, words: list[str]) -> str:
@@ -4210,8 +4732,13 @@ TOOLS = [
          "document_ids": {**_NULLABLE_IDS, "description": "הגבלה למסמכים מסוימים, או null לכל המאגר"},
          "limit": {"type": ["integer", "null"], "description": "מספר תוצאות (3-12), null לברירת מחדל"},
          "unit": {"type": ["string", "null"],
-                  "description": "U# של יחידה: חיפוש רק בתוכה (ללא document_ids), או null"}},
-        ["query", "document_ids", "limit", "unit"]),
+                  "description": "U# של יחידה: חיפוש רק בתוכה (ללא document_ids), או null"},
+         "pool": {"type": ["string", "null"],
+                  "description": "המאגר שמחפשים בו: professional — תקנים ומסמכים מקצועיים; appraisal — שומות; או null "
+                                 "למאגרים שמתאימים לסוג השאלה. השרת קובע אילו מאגרים מותרים לשאלה (שומה בשאלה מקצועית "
+                                 "היא דוגמה לבחירה של נכס מסוים, ותקן בשאלה על נכס הוא הסבר שיטה) ומגביל בקשה שחורגת "
+                                 "מהם"}},
+        ["query", "document_ids", "limit", "unit", "pool"]),
     _fn("read",
         "פתיחת מקום במסמך בלי צורך בחיפוש קודם. בוחרים מיקום אחד בדיוק ב-target (השאר null): source — S# מהתור הזה "
         "או P# מתור קודם (הפסקאות סביבו; קטע מטבלה — הטבלה כולה); pages — עמודים של מסמך PDF; section — סעיף §# "
@@ -4240,6 +4767,13 @@ TOOLS = [
         {"query": {"type": "string", "description": "רק המונחים שמגדירים את הקבוצה (מקום, סוג מסמך) — לא המדד"},
          "page": {"type": ["integer", "null"], "description": "מספר עמוד, null לראשון"}},
         ["query", "page"]),
+    _fn("find_standards",
+        "רשימת התקנים והמסמכים המקצועיים (לא שומות) שהמשתמש מורשה לראות, בעמודים: לכל אחד מה שהוא עצמו מציין — מספר, "
+        "שם, מהדורה, תאריך פרסום ותאריך תחילה, גוף מפרסם ותחולה (\"לא ידוע\" כשאינו מציין) — המסמך שהוא מבהיר או מתקן, "
+        "המהדורות של אותו מספר ואם סדרן ידוע, וקבצים עם אותו נוסח. מחזיר מקור S# של הרשימה. מהדורה לא נקראת האחרונה "
+        "אלא אם הרשימה אומרת שסדר המהדורות ידוע. מסמך מקצועי נקרא אחר כך עם search (pool=professional) ו-read.",
+        {"query": {"type": ["string", "null"], "description": "מילים מהמספר, השם או הכותרת, או null לכל התקנים"},
+         "page": {"type": ["integer", "null"], "description": "מספר עמוד, null לראשון"}}, ["query", "page"]),
     _fn("list_documents", "רשימת המסמכים הזמינים למשתמש, עם מצב הקריאה שלהם, בעמודים. אפשר לסנן לפי מילים בכותרת.",
         {"query": {"type": ["string", "null"], "description": "מילים בכותרת, או null לכל המסמכים"},
          "page": {"type": ["integer", "null"], "description": "מספר עמוד, null לראשון"}}, ["query", "page"]),
@@ -4330,10 +4864,12 @@ TOOLS = [
 ]
 
 HANDLERS = {
-    "search": lambda ws, a: tool_search(ws, a["query"], a.get("document_ids"), a.get("limit"), a.get("unit")),
+    "search": lambda ws, a: tool_search(ws, a["query"], a.get("document_ids"), a.get("limit"), a.get("unit"),
+                                        a.get("pool")),
     "read": lambda ws, a: tool_read(ws, a["target"]),
     "find_documents": lambda ws, a: tool_find_documents(ws, a["query"], a.get("page")),
     "list_documents": lambda ws, a: tool_list_documents(ws, a.get("query"), a.get("page")),
+    "find_standards": lambda ws, a: tool_find_standards(ws, a.get("query"), a.get("page")),
     "outline": lambda ws, a: tool_outline(ws, a.get("document") or a.get("document_id") or a.get("unit"),
                                           a.get("unit")),
     "find_measurements": lambda ws, a: tool_find_measurements(ws, a["query"], a.get("metric_kinds"),
@@ -4347,14 +4883,15 @@ HANDLERS = {
 
 
 # the tools whose results carry document content: once the turn's tool-output budget is spent they are not run
-READING_TOOLS = frozenset({"search", "read", "outline", "find_documents", "list_documents", "find_measurements",
-                           "inspect"})
+READING_TOOLS = frozenset({"search", "read", "outline", "find_documents", "list_documents", "find_standards",
+                           "find_measurements", "inspect"})
 MSG_BUDGET = ("מגבלת היקף הקריאה לשאלה אחת הגיעה לסופה: זה לא נקרא ולא נשלח דבר מתוכו (more — הקריאה שהייתה פותחת "
               "אותו). אל תציג את התשובה כמלאה. רישום ערכים וחישוב (take_value, assume, calculate) על מה שכבר נקרא "
               "עדיין אפשריים.")
 # the reading tools that check the turn's reading deadline before they start (``inspect`` keeps its own check, which also
 # cuts a vision call to the time left)
-DEADLINE_TOOLS = frozenset({"search", "read", "outline", "find_documents", "list_documents", "find_measurements"})
+DEADLINE_TOOLS = frozenset({"search", "read", "outline", "find_documents", "list_documents", "find_standards",
+                            "find_measurements"})
 # the tools that register or compute on what was already read: they stay open when the reading is over (the tool budget)
 COMPUTE_TOOLS = ("calculate", "take_value", "assume")
 MSG_TIME = ("מגבלת הזמן לקריאה בשאלה אחת הגיעה לסופה: זה לא נקרא ולא נשלח דבר מתוכו (more — הקריאה שהייתה פותחת "

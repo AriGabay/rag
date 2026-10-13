@@ -24,7 +24,8 @@ from dataclasses import dataclass, field
 
 STAGES = ("locate", "read", "compute", "compose", "verify", "final")
 # the stage of each tool (KTD9); a tool not listed is counted as reading
-TOOL_STAGE = {"search": "locate", "find_documents": "locate", "list_documents": "locate", "outline": "locate",
+TOOL_STAGE = {"search": "locate", "find_documents": "locate", "list_documents": "locate", "find_standards": "locate",
+              "outline": "locate",
               "read": "read", "inspect": "read",
               "find_measurements": "compute", "take_value": "compute", "assume": "compute", "calculate": "compute"}
 TOOLS_KEPT = 200  # tool records kept for a turn's summary (a turn makes a few dozen at most)
@@ -83,6 +84,7 @@ _SOURCE = re.compile(r'<source id="S\d+"(?! same_as)([^>]*)>')
 _DOCUMENT = re.compile(r'\bdocument_id="([^"]+)"')
 _TIME_STOP = re.compile(r'<not_read [^>]*status="time_limit"')  # ``tools.TIME_LIMIT``: tools imports this module
 _LISTED = re.compile(r'סה"כ (\d+) מסמכים')
+_STANDARDS = re.compile(r'סה"כ (\d+) תקנים')
 
 
 def done_label(name: str, args: dict, output: str) -> str:
@@ -104,6 +106,9 @@ def done_label(name: str, args: dict, output: str) -> str:
         if pages:
             return f"נקראו עמודים {pages.get('from_page')}–{pages.get('to_page')}"
         return f"נקרא קטע ({len(sources)} מקורות)" if len(sources) > 1 else "נקרא קטע"
+    if name == "find_standards":
+        m = _STANDARDS.search(output)
+        return f"נמצאו {m.group(1)} תקנים ומסמכים מקצועיים" if m else "לא נמצאו תקנים ומסמכים מקצועיים"
     if name in ("find_documents", "list_documents"):
         m = _LISTED.search(output)
         return f"נמצאו {m.group(1)} מסמכים" if m else "לא נמצאו מסמכים"

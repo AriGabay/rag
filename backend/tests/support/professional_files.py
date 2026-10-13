@@ -58,3 +58,34 @@ def professional_file(office, group, blocks: list[Row], title: str = "פרק א"
                      {"n": pages_n, "i": json.dumps({"reading_id": reading}), "v": ver})
     pipeline.embed_stage(office.system, info, 1e18)
     return str(doc), str(ver)
+
+
+# the names a synthetic standard's sections carry (round 10 U8): searched by words of its own text
+APPROACH = "על השמאי לבסס את הערכתו על עסקאות השוואה בנכסים דומים."
+EXCEPTION = "הוראה זו חלה על כל הנכסים למעט נכסים חריגים שאין להם נכסי השוואה."
+RECOMMENDATION = "מומלץ להוון את ההכנסה לפי שיעור שוק."
+
+
+def standard_blocks(number: str = "98.1", edition: str | None = "גרסה 2.0", effective: str | None = "05.10.2025",
+                    approach: str = APPROACH) -> list[Row]:
+    """A synthetic standard stating its number, edition and effective date, with an internal and an external
+    reference, a section whose provision has an exception (2.1), a recommendation (2.2) and an appendix. ``approach``
+    is the provision of section 2.1, which two editions may state differently."""
+    path = ["2. שיטות", "2.1 גישת ההשוואה"]
+    out: list[Row] = [("paragraph", None, [], MARK, 1), ("heading", None, [], f"תקן מס' {number} — מדידת שטחים סינתטית", 1)]
+    if edition:
+        out.append(("paragraph", None, [], edition, 1))
+    if effective:
+        out.append(("paragraph", None, [], f"תחילתו ביום {effective}.", 1))
+    return out + [
+        ("heading", "1", ["1. כללי"], "1. כללי", 1),
+        ("paragraph", None, ["1. כללי"], "לפירוט שיטות ההערכה ראו סעיף 2. לעניין מקדמי ההמרה ראו תקן 97.", 1),
+        ("heading", "2", ["2. שיטות"], "2. שיטות", 2),
+        ("heading", "2.1", path, "2.1 גישת ההשוואה", 3),
+        ("paragraph", None, path, approach, 3),
+        ("paragraph", None, path, EXCEPTION, 4),
+        ("heading", "2.2", ["2. שיטות", "2.2 גישת ההכנסות"], "2.2 גישת ההכנסות", 4),
+        ("paragraph", None, ["2. שיטות", "2.2 גישת ההכנסות"], RECOMMENDATION, 4),
+        ("heading", None, ["נספח א'"], "נספח א'", 5),
+        ("paragraph", None, ["נספח א'"], "טבלת מקדמים סינתטית.", 5),
+    ]

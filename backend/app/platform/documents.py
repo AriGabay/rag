@@ -37,6 +37,7 @@ from app.extraction.render import (  # noqa: F401 - the view's scales
 from app.platform.jobs import enqueue_positions, enqueue_processing, positions_job_key, retriable_failure
 from app.platform.source_kinds import APPRAISAL, MSG_BAD_KIND, SOURCE_KINDS
 from app.platform.storage import get_storage, purge_staging, storage_key
+from app.professional import views
 
 logger = logging.getLogger(__name__)
 
@@ -350,6 +351,14 @@ def _list_documents(conn: Connection, ctx: TenantContext, q: str | None, status_
             "deleted": r.deleted_at is not None, "created_at": r.created_at.isoformat(),
             "current_version": _version_json(ver) if ver else None, "versions_count": r.versions_count,
         })
+    # a standard or a professional document also says what it states about itself, how far its derivations are, its
+    # editions and its copies (round 10 U8; the document screens render it) — read under the caller's own permissions
+    professional = [r.id for r in rows if r.source_kind != APPRAISAL and r.deleted_at is None]
+    if professional:
+        shown = views.summaries(conn, professional)
+        for doc in out:
+            if doc["id"] in shown:
+                doc["professional"] = shown[doc["id"]]
     return out
 
 

@@ -346,6 +346,7 @@ export type ChatGapReason =
   | "region_not_read"
   | "limit_reached"
   | "unit_not_located"
+  | "standard_absent"
   | "not_verifiable"
   | "sources_conflict"
   | "detail_missing"

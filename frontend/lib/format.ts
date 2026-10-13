@@ -380,6 +380,7 @@ export const GAP_REASON_LABEL: Record<string, string> = {
   not_in_part_read: "לא מופיע בחלק שנקרא ונבדק",
   document_not_read: "המסמך שנשאל עליו לא נקרא",
   region_not_read: "האזור הרלוונטי לא נקרא במלואו",
+  standard_absent: "נוסח התקן אינו במאגר",
   limit_reached: "לא אותר במסגרת מגבלות השאלה",
   unit_not_located: "השומה שנשאלה עליה לא אותרה",
   not_verifiable: "נמצא, אך לא ניתן לאמת או להכריע",

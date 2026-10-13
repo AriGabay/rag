@@ -47,6 +47,9 @@ table, first match wins (``reason_of``):
    context: two appraisals' values never conflict — round 7 U6, KTD7);
 9. the judge's "undeterminable" (an evidence state, not a status) — found, not verifiable (or sources conflict, 8);
 10. data found that the verified answer does not present — found, not verifiable;
+10a. a professional question whose pool was empty — the office holds no standard or professional document (round 10 U8,
+    KTD15, R29): the standard text is not in the repository — standard text absent (stated as the repository's gap, and
+    the other permitted sources still answer);
 11. a reading of the section, table or pages it concerns that was clipped or has an unread region, or a model claim
     validated as "read in part" — the relevant region was not fully read;
 11a. the turn was stopped by a limit (time, reading budget, steps) before the datum was located — not located within
@@ -174,6 +177,7 @@ REASONS = {
     "sources_conflict": "המקורות סותרים",
     "document_not_read": "המסמך שנשאל עליו לא נקרא",
     "region_not_read": "האזור הרלוונטי לא נקרא במלואו",
+    "standard_absent": "נוסח התקן אינו במאגר",
     "limit_reached": "לא אותר במסגרת מגבלות השאלה",
     "unit_not_located": "השומה שנשאלה עליה לא אותרה",
     "not_in_part_read": "לא מופיע בחלק שנקרא ונבדק",
@@ -344,6 +348,8 @@ def gap_sentence(reason: str, variant: str, texts: list[str], place: dict | None
         if variant == "many":
             return f"{who}: המסמכים \"{document}\" לא נקראו ({detail}), ולכן לא נבדק אם הנתון מופיע בהם."
         return f"{who}: המסמך \"{document}\" לא נקרא ({detail}), ולכן לא נבדק אם הנתון מופיע בו."
+    if reason == "standard_absent":
+        return f"{who}: נוסח התקן אינו במאגר, ולכן לא ניתן לענות על כך ממה שהתקן קובע."
     if reason == "region_not_read" and variant == "clipped":
         return (f"{who} לא {'נמצאו' if many else 'נמצא'} בחלק שנקרא {of_it}: {what} נקרא רק בחלקו, ולכן ייתכן "
                 "שהנתון מופיע בחלק שלא נקרא.")
@@ -573,6 +579,10 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
         return out | {"reason": "not_verifiable", "variant": "undeterminable"}
     if ev["data"]:
         return out | {"reason": "not_verifiable", "variant": "not_presented"}
+    # a professional question whose pool was empty: the repository holds no standard or professional document (U8, KTD15,
+    # R29). It says what the repository lacks — never that a search found nothing in a standard
+    if ws.intent == "professional" and ws.standards_absent:
+        return out | {"reason": "standard_absent", "searched": True}
     if opened is None:
         opened = _openings(ws)
     readings = [(sid, *opened[sid]) for sid in ev["checks"] if sid in opened]

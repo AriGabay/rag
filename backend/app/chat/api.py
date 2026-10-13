@@ -930,11 +930,11 @@ def _context(outcome: engine.TurnOutcome, payload: dict, previous: dict | None, 
     seen: set[tuple] = set()
     cited = []
     for src in payload["sources"]:
-        # the kind of document is `appraisal` until the professional kinds are stored; a listing names no document
+        # the kind and the identity come from the source itself (U8); a listing names no document
         if src.get("document_id") and (key := (src["document_id"], src.get("section"))) not in seen:
             seen.add(key)
-            cited.append({"document_id": src["document_id"], "source_kind": "appraisal", "standard": None,
-                          "section": src.get("section")})
+            cited.append({"document_id": src["document_id"], "source_kind": src.get("source_kind") or "appraisal",
+                          "standard": src.get("standard"), "section": src.get("section")})
     asked = None
     if a.status == "clarification":
         asked = _pending_slot(payload.get("pending"), request.get("candidates") or [], request.get("named_document_ids") or [],

@@ -10,6 +10,10 @@ version ids. Older versions appear only when the caller names their ids and asks
 filters (city, neighborhood, year range) keep only versions whose stated value matches; versions that
 state nothing are reported as unknown and never searched.
 
+A scope may also name the pool it reads (``source_kinds``: round 10 U8, KTD12) and the versions it leaves out
+(``exclude_versions``: the later copies of one text): both apply to every stage — the version resolution that feeds the
+trigram stage, the lexical weights and the semantic stage — and to the document naming a search does by title.
+
 Lexical support (evidence admission) counts only topic terms: place names, years and stopwords are
 excluded, so a passage that only shares "רמת גן" with the question is not evidence.
 
@@ -79,6 +83,12 @@ class SearchScope:
     # closes a unit may run on into the next unit's title block; it belongs to the unit it begins in (the next unit's
     # own scope never holds the previous unit's closing chapter, whose figures are not its)
     blocks: tuple[int, int] | None = None
+    # the pool (round 10 U8, KTD12): only documents of these source kinds (``app.platform.source_kinds``); empty: every
+    # kind, as the legacy answering path and the search screen search. The chat tools always name one pool
+    source_kinds: tuple[str, ...] = ()
+    # versions left out of the scope: the second and later copies of one text (``professional.catalog``, KTD11), so that
+    # identical text is counted once. Not applied to a scope that names its versions or documents
+    exclude_versions: tuple[UUID, ...] = ()
 
 
 @dataclass
@@ -97,6 +107,8 @@ class _Sql:
     # the visible versions the scope resolves to (under row security, with the metadata filters applied), once the
     # search has resolved them: the trigram stage passes them to ``trigram_candidates``
     version_ids: list[UUID] | None = None
+    # the pool's source kinds: the lexical stage weighs a term by its frequency in the pool, not in the whole office
+    source_kinds: tuple[str, ...] = ()
     joins: str = (" FROM chunks c JOIN document_versions v ON v.id = c.version_id"
                   " JOIN documents d ON d.id = c.document_id AND d.deleted_at IS NULL")
 
@@ -115,6 +127,12 @@ def _scope_conditions(scope: SearchScope | None, version_col: str, document_col:
     if scope and scope.document_ids:
         params["scope_d"] = list(scope.document_ids)
         conds.append(f"{document_col} = ANY(:scope_d)")
+    if scope and scope.source_kinds:
+        params["scope_k"] = list(scope.source_kinds)
+        conds.append("d.source_kind = ANY(:scope_k)")
+    if scope and scope.exclude_versions:
+        params["scope_x"] = list(scope.exclude_versions)
+        conds.append(f"NOT ({version_col} = ANY(:scope_x))")
     return conds, params
 
 
@@ -126,7 +144,7 @@ def _scope_sql(scope: SearchScope | None, allowed_versions: list[UUID] | None = 
     if allowed_versions is not None:
         params["scope_allowed"] = allowed_versions
         conds.append("c.version_id = ANY(:scope_allowed)")
-    return _Sql(where=" AND ".join(conds), params=params)
+    return _Sql(where=" AND ".join(conds), params=params, source_kinds=scope.source_kinds if scope else ())
 
 
 def _scoped_versions(conn: Connection, scope: SearchScope | None) -> list[tuple[UUID, UUID]]:
@@ -143,17 +161,21 @@ def _scoped_versions(conn: Connection, scope: SearchScope | None) -> list[tuple[
 def _lexical(conn: Connection, tokens: list[str], scope: _Sql | None = None, n: int = CANDIDATES) -> list:
     """OR over query terms, ranked by IDF-weighted matched terms (rare terms such as a price or a
     block/parcel outweigh generic words), then ts_rank_cd within ties. IDF comes from all current
-    visible chunks, so a narrow scope does not flatten the weights."""
+    visible chunks of the scope's pool (every kind for an open scope), so a narrow scope does not flatten the weights
+    and a term common in appraisals weighs nothing less in a pool of standards."""
     if not tokens:
         return []
     scope = scope or _Sql()
-    base = _Sql()
+    base = _Sql(source_kinds=scope.source_kinds)
+    if base.source_kinds:
+        base = replace(base, where="v.is_current AND d.source_kind = ANY(:idf_k)",
+                       params={"idf_k": list(base.source_kinds)})
     params = {f"t{i}": t for i, t in enumerate(tokens)}
     match = [f"(c.tsv @@ plainto_tsquery('simple', :t{i}))" for i in range(len(tokens))]
     stats = conn.execute(
         text("SELECT count(*) AS n, " + ", ".join(f"count(*) FILTER (WHERE {m}) AS d{i}" for i, m in enumerate(match))
              + base.joins + " WHERE " + base.where),
-        params,
+        params | base.params,
     ).one()
     n = max(stats.n, 1)
     weights = {f"w{i}": math.log((n + 1) / (getattr(stats, f"d{i}") + 0.5)) for i in range(len(tokens))}
@@ -433,16 +455,19 @@ def _numbers_of(title: str) -> set[str]:
     return {w for w in (raw.strip("-'״׳\"") for raw in _TITLE_WORD.findall(base_normalize(title))) if w.isdigit()}
 
 
-def _text_document_frequency(conn: Connection, forms: dict[str, set[str]]) -> tuple[int, dict[str, int]]:
-    """The number of visible current documents, and for each word the number whose current text holds it in any of
-    its forms."""
+def _text_document_frequency(conn: Connection, forms: dict[str, set[str]], kinds: tuple[str, ...] = ()
+                             ) -> tuple[int, dict[str, int]]:
+    """The number of visible current documents (of ``kinds`` when given), and for each word the number whose current
+    text holds it in any of its forms."""
     words = [w for w in forms if forms[w]]
     params: dict = {}
     cols = ["count(DISTINCT c.document_id) AS n"]
     for i, w in enumerate(words):
         cols.append(f"count(DISTINCT c.document_id) FILTER (WHERE {_any_form(forms[w], f'f{i}', params)}) AS f{i}")
     base = _Sql()
-    row = conn.execute(text("SELECT " + ", ".join(cols) + base.joins + " WHERE " + base.where), params).one()
+    where = base.where + (" AND d.source_kind = ANY(:df_k)" if kinds else "")
+    row = conn.execute(text("SELECT " + ", ".join(cols) + base.joins + " WHERE " + where),
+                       params | ({"df_k": list(kinds)} if kinds else {})).one()
     return row.n, {w: getattr(row, f"f{i}") for i, w in enumerate(words)}
 
 
@@ -452,10 +477,14 @@ def documents_named(conn: Connection, query: str, scope: SearchScope | None = No
     more than two titles). A word of the trade never counts, however few titles hold it: one in more than
     ``NAMING_DF_SHARE`` of the visible documents' text or titles ("שווי" in a title like "שומה שווי שוק ..."). Returns
     (document id, the query words that named it), best first; empty when the query names none or too many. Word
-    frequencies are over every visible document; ``scope`` only limits which of them may be named."""
+    frequencies are over every visible document of the pool; ``scope`` only limits which of them may be named. The pool is
+    the scope's source kinds — a search of the professional pool names a standard by its title as a search of the
+    appraisals names an appraisal (round 10 U8) — and the appraisals when the scope names none."""
+    kinds = list(scope.source_kinds) if scope and scope.source_kinds else None
     docs = [(r.id, r.title) for r in conn.execute(text(
         "SELECT d.id, d.title FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
-        f" WHERE d.deleted_at IS NULL AND {APPRAISALS_SQL}"))]
+        " WHERE d.deleted_at IS NULL AND " + ("d.source_kind = ANY(:k)" if kinds else APPRAISALS_SQL)),
+        {"k": kinds} if kinds else {})]
     # a title's words, and its numbers however short (the house number of "התמר 5")
     words_of = {i: _title_words(t) | _numbers_of(t) for i, t in docs}
     df: dict[str, int] = {}
@@ -492,7 +521,7 @@ def documents_named(conn: Connection, query: str, scope: SearchScope | None = No
     if not candidates:
         return []
     alpha = {w: forms[w] for _, _, _, hit in candidates for w in hit if not w.isdigit()}
-    n, text_df = _text_document_frequency(conn, alpha)
+    n, text_df = _text_document_frequency(conn, alpha, tuple(kinds or ()))
     trade |= {w for w in alpha if text_df.get(w, 0) > NAMING_DF_SHARE * n}
     named = naming(trade, [i for _, _, i, _ in candidates])
     named.sort(key=lambda x: (-x[0], -x[1]))
@@ -957,7 +986,8 @@ def search_passages(conn: Connection, query: str, limit: int = 8, *, scope: Sear
         return diversify_rows(hits, limit)
     named = documents_named(conn, query, scope)
     if named:
-        inside = SearchScope(document_ids=tuple(i for i, _ in named))
+        inside = SearchScope(document_ids=tuple(i for i, _ in named), source_kinds=scope.source_kinds if scope else (),
+                             exclude_versions=scope.exclude_versions if scope else ())
         focused = search_evidence(conn, queries, limit * 2, scope=inside).hits
         seen = {h["chunk_id"] for h in focused}
         hits = focused[: max(3, limit // 2) * 2] + [h for h in hits if h["chunk_id"] not in seen] + focused[

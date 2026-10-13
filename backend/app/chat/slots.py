@@ -13,8 +13,8 @@ carries):
   ``params``: the task parameters of its datum (metric, unit, period, VAT, area basis, and the wording and role the
   focus carried). A professional answer leaves both **unchanged**: they are dormant, not dropped, and a later "בנכס הזה"
   restores them together;
-- ``sources``: what the answer cited — ``{document_id, source_kind, standard, section}``. The kind is ``appraisal``
-  until the professional sources add the others;
+- ``sources``: what the answer cited — ``{document_id, source_kind, standard, section}``, the kind and the identity
+  (number, name, edition, effective date, section) as the cited source carried them (round 10 U8);
 - ``pending``: ``{kind, payload, asked_at}`` — the clarification this answer asked (``candidates`` or ``parameter``). It
   lives exactly one message: each turn writes only its own, so a pending one that the next message did not answer is
   simply not carried.

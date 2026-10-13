@@ -17,7 +17,7 @@ stored pages, blocks and tables in one transaction) and stores a self-contained 
 (``snapshot``). A snapshot keeps what a viewer needs without the reading it came from, so an old conversation keeps its
 original place after a reprocess replaced its blocks (R11):
 
-    {"v": 1,
+    {"v": 2,
      "precision": "span" | "cell" | "block" | "region" | "page" | "structured",
      "precision_label": Hebrew text for the viewer's header,
      "region": "table" | "row" | None,           # what a "region" covers
@@ -37,6 +37,7 @@ original place after a reprocess replaced its blocks (R11):
                            "cell": None | {"table_index", "row_number", "column_number", "row_label",
                                            "column_header", "text"}},
      "truncated": bool,
+     "standard": None | {"number", "title", "edition", "effective", "section", "section_title"},  # a standard's identity
      "unit": only in a file of several appraisals: {"id": version#reading#number, "no", "title", "label", "kind",
              "pages": [first, last]}, the unit the cited place is in}
 
@@ -69,7 +70,9 @@ from app.extraction.geometry import Span, geometry_box
 
 logger = logging.getLogger(__name__)
 
-SNAPSHOT_VERSION = 1
+# 2 (round 10 U8): a citation of a standard also keeps the identity it was read under (``standard``); a version-1 snapshot
+# has none and is read as a citation of an appraisal (``standard_of``)
+SNAPSHOT_VERSION = 2
 COMPUTED = "computed"
 
 READING_CHANGED = "reading_changed"
@@ -117,6 +120,8 @@ def source_stub(s) -> dict | None:
         out["table_index"] = s.table_index
         if getattr(s, "row_index", None) is not None:
             out["row"] = s.row_index
+    if getattr(s, "standard", None):  # the identity of a standard's passage: its number, edition and section (U8, KTD13)
+        out["standard"] = dict(s.standard)
     if getattr(s, "unit", None):  # the unit it is in, in a file of several (round 9 U9)
         out["unit"] = s.unit
     return out
@@ -452,6 +457,12 @@ def _page_entry(reading: Reading | None, n: int, rects=(), focus=()) -> dict:
             "rects": list(rects), "focus": list(focus)}
 
 
+def standard_of(anchor: dict | None) -> dict | None:
+    """The identity of the standard an anchor cites, or None: a version-1 snapshot has no such field and an appraisal's
+    anchor has it empty."""
+    return (anchor or {}).get("standard") or None
+
+
 def _base(stub: dict, pinned: str | None) -> dict:
     out = _base_fields(stub, pinned)
     if stub.get("unit"):  # the unit of a file of several appraisals the place is in (round 9 U9, R10): id, title, pages
@@ -464,7 +475,8 @@ def _base_fields(stub: dict, pinned: str | None) -> dict:
             "document_id": stub["document_id"], "version_id": stub["version_id"],
             "reading_id": pinned if pinned is not None else stub.get("reading_id"),
             "block_start": stub.get("block_start"), "block_end": stub.get("block_end"), "pages": [],
-            "location": None, "table": None, "structured": None, "truncated": False}
+            "location": None, "table": None, "structured": None, "truncated": False,
+            "standard": stub.get("standard")}
 
 
 def _finish(out: dict, reading: Reading | None, precision: str, pages: dict[int, dict] | None = None, *,

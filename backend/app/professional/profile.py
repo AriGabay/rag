@@ -640,6 +640,11 @@ class Edition:
     published: str | None
     effective: str | None
     amends: dict | None
+    # what the document says in its own words, for a listing: the name, the scope and the two dates as written
+    name: str | None = None
+    scope: str | None = None
+    published_text: str | None = None
+    effective_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -667,7 +672,8 @@ def _edition_of(r) -> Edition:
     number = stated("number")
     return Edition(r.document_id, r.version_id, r.title, r.source_kind, number, normalize_number(number),
                    stated("edition"), stated("issuer"), stated("published", "normalized"),
-                   stated("effective", "normalized"), raw)
+                   stated("effective", "normalized"), raw, stated("title"), stated("scope"), stated("published"),
+                   stated("effective"))
 
 
 def _ordered(editions: list[Edition]) -> tuple[tuple[Edition, ...], bool]:
@@ -695,17 +701,37 @@ def _link(edition: Edition, by_key: dict[str, list[Edition]]) -> Edition:
     return replace(edition, amends=amends)
 
 
+def visible_editions(conn: Connection) -> tuple[list[Edition], int]:
+    """Every visible current professional document with a stored profile, and the number of those without one: what
+    ``group_of`` groups, read once for a listing of several numbers."""
+    rows = conn.execute(text(_VISIBLE_SQL)).all()
+    return [_edition_of(r) for r in rows if r.fields is not None], sum(1 for r in rows if r.fields is None)
+
+
 def editions(conn: Connection, number: str) -> EditionGroup:
     """The visible current professional documents stating ``number`` (see the module docstring), ordered, with the
     visible documents that amend it. Reads stored profiles only."""
-    key = normalize_number(number)
-    rows = conn.execute(text(_VISIBLE_SQL)).all()
-    unprofiled = sum(1 for r in rows if r.fields is None)
-    all_editions = [_edition_of(r) for r in rows if r.fields is not None]
+    return group_of(visible_editions(conn), number)
+
+
+def _by_key(all_editions: list[Edition]) -> dict[str, list[Edition]]:
     by_key: dict[str, list[Edition]] = {}
     for e in all_editions:
         if e.key:
             by_key.setdefault(e.key, []).append(e)
+    return by_key
+
+
+def linked(loaded: tuple[list[Edition], int], edition: Edition) -> Edition:
+    """``edition`` with the document it amends resolved among ``loaded`` (``_link``)."""
+    return _link(edition, _by_key(loaded[0]))
+
+
+def group_of(loaded: tuple[list[Edition], int], number: str | None) -> EditionGroup:
+    """The group of ``number`` among ``loaded`` (``visible_editions``)."""
+    key = normalize_number(number)
+    all_editions, unprofiled = loaded
+    by_key = _by_key(all_editions)
     if key is None:
         return EditionGroup(None, (), True, (), unprofiled)
     ordered, known = _ordered(by_key.get(key, []))
