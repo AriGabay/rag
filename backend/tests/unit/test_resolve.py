@@ -64,10 +64,15 @@ PERCENT_FOCUS = RENT_FOCUS | {"metric_as_written": "שיעור אכלוס", "met
 
 
 def _resolved(**kw) -> ResolvedRequest:
+    # no ``intent`` part by default: an old script, which settles from the evidence the message holds (round 10 U6)
     base = dict(relation="correction", scope="entity", standalone_question="?", changed_fields=[],
                 metric_kind="unknown", unit="unknown", scale="unknown", period="unknown", area_basis="", vat="unknown",
                 subject="", document_ids=[], ambiguity="")
     return ResolvedRequest(**(base | kw))
+
+
+def _intent(value: str, **kw) -> dict:
+    return {"intent": value, "reference": "none", "item": None, "topic": "", "standard_refs": []} | kw
 
 
 def _changed(*pairs: tuple[str, str]) -> list[ChangedField]:
@@ -139,7 +144,8 @@ def test_a_bare_reply_to_the_clarification_is_resolved_among_its_candidates():
 
 
 def test_nothing_found_asks_and_never_falls_back_to_the_focus():
-    for words in ("היסמין 3", "בית האגם הצפוני"):
+    # an address no title holds (a word and its house number), a title word with a number no title has, a parcel
+    for words in ("היסמין 3", "הסנונית 99", "גוש 9999 חלקה 8"):
         r = _resolved(changed_fields=_changed(("subject", words)), subject=words)
         req = _validate(r, RENT_FOCUS, f"התכוונתי ל{words}")
         assert req.server_clarify and req.document_ids == [] and "לא מצאתי" in req.clarify, words
@@ -366,10 +372,21 @@ def test_a_pronoun_or_a_generic_word_quoted_as_the_subject_keeps_the_focus():
         assert req.document_ids == [DOC] and not req.clarify and not req.entity_changed, message
 
 
-def test_a_correction_to_a_property_without_a_title_word_still_asks():
+def test_a_correction_whose_words_hold_no_hard_evidence_releases_the_old_property_without_a_lookup():
+    # round 10 R8, KTD2(b): no address, parcel, label or complete name in the words: nothing is looked up or selected by a
+    # title word, and the old property is not silently kept either: its documents are no filter, the tools search
     r = _resolved(changed_fields=_changed(("subject", "בית האגם הצפוני")), subject="בית האגם הצפוני")
     req = _validate(r, RENT_FOCUS, "טעיתי, התכוונתי לבית האגם הצפוני")
-    assert req.server_clarify and req.document_ids == []
+    assert not req.server_clarify and "lookup" not in req.resolution
+    assert req.document_ids == [] and req.entity_changed and req.subject == "בית האגם הצפוני"
+    assert req.resolution["decisions"]["subject"].startswith("released the focus")
+
+
+def test_a_correction_to_a_pronoun_or_a_word_of_the_trade_keeps_the_property():
+    for words in ("בזה", "השומה"):
+        r = _resolved(relation="correction", changed_fields=_changed(("subject", words)), subject=words)
+        req = _validate(r, RENT_FOCUS, f"לא, התכוונתי ל{words}")
+        assert req.document_ids == [DOC] and not req.entity_changed and "lookup" not in req.resolution
 
 
 # --- calculation terms are request kinds of their own (R22: no wrong-metric notice) ---
@@ -588,3 +605,136 @@ def unread_notice_limit() -> int:
     from app.chat import unread
 
     return unread.NOTICE_FILES
+
+
+# --- round 10 U6: intent and evidence-gated lookup (the reported "השומה" failure, on synthetic titles) ---
+
+SYN_FOCUS, SYN_A, SYN_B, SYN_C, SYN_STD = "s-0", "s-1", "s-2", "s-3", "s-4"
+SYN = {
+    SYN_FOCUS: ("דירת מגורים רחוב התמר 9 עיר-ב (סינתטי)", "דמי שכירות ראויים למ\"ר. הנכס בקומה 3."),
+    SYN_A: ("שומה מקרקעין רחוב הדקל 5 עיר-א (סינתטי)", "שומה לפי גישת ההשוואה. הדקל 5."),
+    SYN_B: ("תל-סינתטי שומה", "שומה לפי גישת ההכנסות."),
+    SYN_C: ("חלקה 7 בגוש שומה 1234 (סינתטי)", "שומה לפי גישת העלות. גוש 1234 חלקה 7."),
+    SYN_STD: ("תקן 19 - נכס סינתטי רחוב האלון 3", "תקן 19 סעיף 3 מגדיר את מבנה הדוח. האלון 3."),
+}
+SYN_TITLES = [t for t, _ in SYN.values()]
+SYN_FOCUS_DATUM = RENT_FOCUS | {"subject": "התמר 9", "document_ids": [SYN_FOCUS]}
+APPROACHES = "מה הן שלושת גישות השומה הבסיסיות ?"
+
+
+def _syn_lookup(focus_ids: set[str], calls: list):
+    def lookup(words: str) -> entities.Outcome:
+        calls.append(words)
+        terms = _scope_terms(words)
+        found = []
+        for doc_id, (title, body) in SYN.items():
+            tokens = _tokens(title) | _tokens(body) | entities.title_tokens(title)
+            if terms and all(tokens & set(forms) for forms in terms):
+                found.append({"document_id": doc_id, "title": title, "hits": 1})
+        return entities.choose(found, words, focus_ids)
+    return lookup
+
+
+def _syn_validate(r, message, focus=SYN_FOCUS_DATUM):
+    calls: list = []
+    ids = set(focus.get("document_ids") or [])
+    req = validate(r, focus, message, lambda xs: {i for i in xs if i in SYN}, SYN_TITLES, _syn_lookup(ids, calls), None,
+                   focus_titles=[SYN[d][0] for d in ids if d in SYN])
+    return req, calls
+
+
+def _approaches_parse(**kw):
+    return _resolved(relation="new_question", changed_fields=[], **kw)
+
+
+def test_repro_a_general_word_that_titles_share_never_lists_properties():
+    # the parse says a new professional question, or says nothing about the intent: either way "השומה" names nothing
+    for parsed in (_approaches_parse(intent=_intent("professional", topic="גישות השומה")), _approaches_parse(),
+                   _approaches_parse(intent=_intent("unknown"))):
+        req, calls = _syn_validate(parsed, APPROACHES)
+        assert calls == [] and "lookup" not in req.resolution, parsed.intent
+        assert not req.server_clarify and not req.clarify and req.candidates == []
+        assert req.intent.value in ("professional", "unknown") and not req.entity_changed
+
+
+def test_a_professional_question_inherits_no_property_and_no_measure():
+    parsed = _approaches_parse(intent=_intent("professional", topic="גישות השומה"))
+    req, calls = _syn_validate(parsed, APPROACHES)
+    assert req.intent.value == "professional" and req.resolution["decisions"]["intent"] == "professional"
+    assert req.document_ids == [] and req.located_unit is None and req.entity_changed is False
+    # the measure comes from the parse alone: nothing of the focus's rent, period, VAT, area basis or subject
+    assert (req.metric_kind, req.unit, req.period, req.vat, req.area_basis, req.subject) == (
+        "unknown", "unknown", "unknown", "unknown", "", "")
+    assert req.as_dict()["intent"]["value"] == "professional"
+    # the same holds when the parse calls the turn "the same datum"
+    req, _ = _syn_validate(_resolved(relation="same_datum", intent=_intent("professional")), APPROACHES)
+    assert req.metric_kind == "unknown" and req.document_ids == [] and req.subject == ""
+
+
+def test_a_property_parse_without_evidence_runs_no_lookup_and_keeps_the_focus():
+    req, calls = _syn_validate(_approaches_parse(intent=_intent("property")), APPROACHES)
+    assert calls == [] and "lookup" not in req.resolution
+    assert req.intent.value == "property"
+    # a new question reads the user's words: the focus is context, not a filter, and nothing is searched in it
+    assert not req.server_clarify
+    parsed = _resolved(relation="same_datum", intent=_intent("property"))
+    req, calls = _syn_validate(parsed, "ומה עוד כתוב על זה?")
+    assert calls == [] and req.document_ids == [SYN_FOCUS] and not req.entity_changed
+
+
+def test_a_professional_parse_that_names_an_address_is_mixed_and_looks_it_up():
+    parsed = _approaches_parse(intent=_intent("professional", topic="גישות השומה"))
+    req, calls = _syn_validate(parsed, "מה דורשת גישת ההשוואה לגבי הדקל 5?")
+    assert req.intent.value == "mixed" and calls == ["הדקל 5"]
+    assert req.document_ids == [SYN_A] and req.entity_changed and req.resolution["decisions"]["intent"] == "mixed"
+
+
+def test_a_standard_number_is_not_an_address_and_names_no_appraisal():
+    for parsed in (_approaches_parse(intent=_intent("professional", standard_refs=[
+            {"standard": "19", "section": "3"}])), _approaches_parse(intent=_intent("property")),
+            _approaches_parse()):
+        req, calls = _syn_validate(parsed, "מה דורש תקן 19 בסעיף 3?")
+        assert calls == [] and req.document_ids in ([], [SYN_FOCUS]) and not req.server_clarify
+        assert not req.entity_changed
+
+
+def test_a_year_and_a_floor_beside_a_title_word_are_no_evidence_and_a_parcel_pair_is():
+    for message in ("מה היה בשומה ב-2024?", "מה יש בקומה 3 בשומה?"):
+        req, calls = _syn_validate(_approaches_parse(intent=_intent("property")), message)
+        assert calls == [], message
+    req, calls = _syn_validate(_approaches_parse(intent=_intent("property")), "מה כתוב על גוש 1234 חלקה 7?")
+    assert calls == ["גוש 1234 חלקה 7"] and req.document_ids == [SYN_C]
+
+
+def test_a_quoted_subject_of_a_title_word_is_rejected_as_evidence():
+    for words in ("בזה", "השומה"):
+        parsed = _resolved(relation="new_question", changed_fields=_changed(("subject", words)), subject=words,
+                           intent=_intent("property", reference="named_entity"))
+        req, calls = _syn_validate(parsed, f"ומה לגבי {words}?")
+        assert calls == [] and req.document_ids in ([], [SYN_FOCUS]) and not req.server_clarify, words
+
+
+def test_a_failed_parse_with_an_address_is_a_property_and_without_one_runs_no_lookup():
+    req, calls = _syn_validate(_resolved(relation="same_datum"), "ובהדקל 5?")
+    assert req.intent.value == "property" and req.intent.claimed == "" and calls == ["הדקל 5"]
+    assert req.document_ids == [SYN_A]
+    req, calls = _syn_validate(_resolved(relation="same_datum"), "ומה לגבי השומה?")
+    assert req.intent.value == "unknown" and calls == []
+
+
+def test_a_correction_runs_a_lookup_only_on_evidence():
+    parsed = _resolved(relation="correction", changed_fields=_changed(("subject", "השומה")), subject="השומה",
+                       intent=_intent("property", reference="named_entity"))
+    req, calls = _syn_validate(parsed, "לא, התכוונתי לשומה")
+    assert calls == [] and not req.server_clarify
+    parsed = _resolved(relation="correction", changed_fields=_changed(("subject", "הדקל 5")), subject="הדקל 5",
+                       intent=_intent("property", reference="named_entity"))
+    req, calls = _syn_validate(parsed, "לא, התכוונתי להדקל 5")
+    assert calls == ["הדקל 5"] and req.document_ids == [SYN_A]
+
+
+def test_the_focus_own_name_is_no_new_evidence():
+    focus = SYN_FOCUS_DATUM | {"document_ids": [SYN_A], "subject": "הדקל 5"}
+    parsed = _resolved(relation="same_datum", intent=_intent("property", reference="conversation_property"))
+    req, calls = _syn_validate(parsed, "ומה עוד כתוב על הדקל 5?", focus=focus)
+    assert calls == [] and req.document_ids == [SYN_A] and not req.entity_changed

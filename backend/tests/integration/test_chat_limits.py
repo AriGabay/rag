@@ -403,10 +403,12 @@ def test_a_turn_records_its_tool_timings_and_stage_totals_in_the_diagnostics(cli
     assert "timing" not in json.dumps(m["answer"])
 
 
-def test_a_first_turn_keeps_the_resolution_empty_beside_its_timing(client, office, monkeypatch):
+def test_a_first_turn_keeps_the_resolution_to_its_intent_beside_its_timing(client, office, monkeypatch):
     m = ask(client, office, monkeypatch, Reader([], ANSWER))
     d = diagnostics(client, m)
-    assert d["resolution"] is None and d["timing"]["stages"]["compose"]["calls"] >= 1
+    # no resolve call on a first turn (no parse, no lookup): only the intent the request analysis settled (round 10)
+    assert set(d["resolution"]) == {"intent", "decisions"} and d["resolution"]["intent"]["value"] == "unknown"
+    assert d["timing"]["stages"]["compose"]["calls"] >= 1
 
 
 def test_every_tool_gets_a_timestamped_start_and_a_done_event_that_says_what_it_found(client, office, monkeypatch):

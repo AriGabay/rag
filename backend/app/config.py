@@ -164,6 +164,10 @@ class Settings(BaseSettings):
     # claims one turn may re-read before they are given up (round 8 KTD5): one expansion of the cited source and one
     # re-judge for all of them; the rest keep their verdict, saying the source was read in part
     chat_reread_claims: int = Field(default=4, ge=0)
+    # How long a first turn waits for its request analysis (which carries the question's intent, round 10 KTD3) before a
+    # weaker unit pin or clarification is applied, and before the first step's tools run. Shorter than the reading
+    # window; past it the intent is unknown, a provisional pin is dropped and the tools run with both pools labelled.
+    chat_intent_wait_seconds: float = Field(default=8.0, ge=0)
     llm_timeout_agent_seconds: float = 90
     llm_timeout_measure_seconds: float = 90
 

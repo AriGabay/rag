@@ -100,6 +100,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from app.chat import contexts, coverage, entities, resolve
+from app.chat import intent as intent_mod
 from app.chat import request as request_analysis
 from app.chat import tools as T
 from app.chat.compose import ServerSpan, text_digest
@@ -479,7 +480,11 @@ def usage_summary(usage: list[dict], **extra) -> dict:
 
 
 def _context_message(inp: TurnInput, request: resolve.Request | None = None, binding: dict | None = None,
-                     unit_handle: str | None = None, located: dict | None = None) -> str:
+                     unit_handle: str | None = None, located: dict | None = None,
+                     intent: intent_mod.Intent | None = None) -> str:
+    """The turn's first message. ``intent``: a first turn's settled intent, when it is known by now (a follow-up's is on
+    its ``request``). A professional request carries no focus block: the conversation's property is not its subject
+    (round 10 KTD7)."""
     parts = []
     if inp.summary:
         parts.append("סיכום השיחה עד כה (לא מקור עובדתי):\n" + prompt_text(inp.summary))
@@ -493,7 +498,9 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None, bin
             limit = HISTORY_USER_CHARS if m.role == "user" else HISTORY_ANSWER_CHARS
             lines.append(f"{who}: {prompt_text(content[:limit] + ('…' if len(content) > limit else ''))}")
         parts.append("ההודעות האחרונות בשיחה (תשובות העוזר אינן מקור עובדתי):\n" + "\n\n".join(lines))
-    moved = request is not None and (request.kind == "new_topic" or request.entity_changed)
+    settled = request.intent if request is not None else intent
+    professional = settled is not None and settled.value == "professional"
+    moved = professional or (request is not None and (request.kind == "new_topic" or request.entity_changed))
     if inp.focus and not moved:
         f = inp.focus
         def label(labels: dict, key: str) -> str:
@@ -527,6 +534,8 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None, bin
         parts.append(resolve.requested_block(request, unit_handle))
         if request.components:
             parts.append(request_analysis.block(request.components))
+    elif professional:  # a first turn that read its intent: the one line a follow-up's requested block carries
+        parts.append("הבקשה כפי שהובנה:\n" + resolve.PROFESSIONAL_NOTE)
     if located is not None and unit_handle:  # the unit the server found for the question at the turn's start
         parts.append(resolve.located_block(located["anchor"], unit_handle))
     return "\n\n".join(parts)
@@ -580,6 +589,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     output_retried = False  # at most one retry in the whole turn, including its repair rounds
     attempt = 0  # 0: first answer, 1: repaired with tools, 2: rewritten from verified content only
     limits = ws.limits_hit
+    intent_waited = False  # the first step's tools waited (a bounded time) for the request analysis' intent
     compute_ok = False  # the step may call the compute tools only (the tool budget is spent, there is time left)
     compute_steps = 0  # such steps taken so far
     rounds: list[list[dict]] = []
@@ -596,6 +606,53 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     answer_seconds = 0.0  # how long the step that wrote the last answer took
     progress("understand", "מבין את הבקשה")
     request = None
+    titles = functools.cache(lambda: entities.titles_of(ctx))  # every title the user may see: read once, when needed
+    first_turn = not (inp.history or inp.focus)
+    # a first turn's request analysis (it carries the intent, round 10 KTD3): running in a worker thread (``pending``),
+    # or collected and not yet adopted as the turn's requirements (``held``); its settled intent and the decisions on it
+    pending: request_analysis.Pending | None = None
+    held: request_analysis.Analysis | None = None
+    turn_intent: intent_mod.Intent | None = None
+    first_decisions: dict[str, str] = {}
+
+    def start_analysis() -> None:
+        nonlocal pending
+        if pending is None and held is None:
+            pending = request_analysis.start(provider, inp.question, read_until)
+            started.append(pending)
+
+    def note_intent(analysis: request_analysis.Analysis | None, late: bool = False) -> None:
+        """The first turn's intent from the analysis (None: it gave none in time), settled against the question, with
+        the decisions kept for the diagnostics."""
+        nonlocal turn_intent
+        turn_intent = intent_mod.settle(analysis.intent if analysis is not None else None, inp.question, titles())
+        ws.intent = turn_intent.value
+        first_decisions["intent"] = turn_intent.value + (" (late)" if late else "")
+        if turn_intent.reasons:
+            first_decisions["intent_why"] = "; ".join(turn_intent.reasons)
+
+    def collect_analysis(limit: float | None) -> bool:
+        """Collect the analysis, waiting at most ``limit`` seconds (None: until its own bound); whether it was collected.
+        The wait is recorded in the turn's timing. Its usage is recorded and its intent settled here; its components
+        are adopted later (``adopt_analysis``), after the tool outputs they must follow."""
+        nonlocal pending, held
+        if pending is None:
+            return held is not None
+        waited = time.monotonic()
+        analysis = pending.wait(cancelled, limit)
+        ws.clock.wait("intent", time.monotonic() - waited)
+        if analysis is None:  # still running past the bound: the intent stays unknown for now
+            if turn_intent is None:
+                note_intent(None)
+                first_decisions["intent_why"] = "the request analysis did not finish within the wait: intent unknown"
+            return False
+        pending, held = None, analysis
+        if analysis.usage is not None:
+            usage.append(analysis.usage)
+        if analysis.status == "cancelled":
+            raise TurnCancelled
+        note_intent(analysis, late=turn_intent is not None)
+        return True
 
     def asked_by_server(asking: resolve.Request) -> TurnOutcome:
         """The turn that ends in the clarification ``asking`` carries: the server's own words, nothing of the model's to
@@ -615,7 +672,6 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         # stay apart: the conversation's documents (context), the documents the user may see (the database decides,
         # under the user's permissions) and the documents the new request names (looked up the same way)
         focus_ids = {d["document_id"] for d in inp.focus_documents} | set((inp.focus or {}).get("document_ids") or [])
-        titles = functools.cache(lambda: entities.titles_of(ctx))  # read once, and only when needed
         prior_units = entities.units_of_documents(ctx, inp.clarified_documents) if not inp.candidates else []
         request = resolve.resolve(
             provider, inp.focus, inp.history, inp.question, inp.focus_documents,
@@ -624,6 +680,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             prior_units=prior_units or None)
         if cancelled():
             raise TurnCancelled
+        if request is not None:
+            ws.intent = request.intent.value
         if request is not None and request.located_unit:
             _settle_unit(ctx, ws, request)
         if request is not None and request.relation == "new_question":
@@ -645,20 +703,41 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         # server's names only titles the user may see and the user's own words
         if request is not None and request.clarify and (request.server_clarify or not re.search(r"\d", request.clarify)):
             return asked_by_server(request)
+        # a new question that no unit is kept for is looked up as a first message is — but never a professional one, and
+        # for an intent that refers to a property only when the question holds hard evidence of it (round 10 KTD3, R8):
+        # a pin from passages or a name word shared by units is no evidence
         if (request is not None and request.relation == "new_question" and ws.unit_focus is None
-                and not request.document_ids and (found := entities.first_message(ctx, inp.question)) is not None):
-            # a new question that no unit is kept for is looked up as a first message is
+                and not request.document_ids and request.intent.refers and request.intent.evidence
+                and (found := entities.first_message(ctx, inp.question)) is not None):
             if found.ambiguity is not None:
+                settled = request.intent
                 request = resolve.first_message_clarification(inp.question, *found.ambiguity)
+                request.intent = settled
+                _record_intent(request.resolution, settled)
                 return asked_by_server(request)
             T.locate_unit(ws, found.unit, found.version_id)
     elif (found := entities.first_message(ctx, inp.question)) is not None:
-        if found.ambiguity is not None:
+        # Hard evidence in the question (a complete unit name, an address, a parcel or a label) applies at once. A pin
+        # from passages, or name words several units share without a complete name, is provisional: it waits for the
+        # request analysis, within ``chat_intent_wait_seconds``, and is dropped for a professional question, for an
+        # unknown intent and when the analysis is late (round 10 KTD3, R8)
+        keep = bool(intent_mod.evidence(inp.question, titles()))
+        if not keep:
+            start_analysis()
+            collect_analysis(settings.chat_intent_wait_seconds)
+            keep = held is not None and turn_intent is not None and turn_intent.refers
+            first_decisions["first_message"] = ("provisional, applied: intent " + turn_intent.value if keep else
+                                                "provisional, dropped: " + (f"intent {turn_intent.value}" if turn_intent
+                                                                            else "no intent"))
+        if keep and found.ambiguity is not None:
             # a first message whose words fit several units of a file alike: the question between them is the server's,
             # as it is for a follow-up, and no model is called (R13, AE4)
             request = resolve.first_message_clarification(inp.question, *found.ambiguity)
+            request.intent = turn_intent or intent_mod.settle(None, inp.question, titles())
+            _record_intent(request.resolution, request.intent, first_decisions)
             return asked_by_server(request)
-        T.locate_unit(ws, found.unit, found.version_id)  # the one unit the question names: the turn's working unit
+        if keep:
+            T.locate_unit(ws, found.unit, found.version_id)  # the one unit the question names: the turn's working unit
 
     def finish(answer: FinalAnswer, report: VerifyReport) -> TurnOutcome:
         # removals; each component recomputed from the surviving units; the absences the server states removed; one
@@ -690,26 +769,28 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             ledger["requirements_origin"] = turn.record_origin()
         return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
                            request.as_dict() if request is not None else None,
-                           request.resolution if request is not None else None, _summary(usage, rounds, reused, turn),
+                           request.resolution if request is not None else _first_resolution(turn_intent, first_decisions),
+                           _summary(usage, rounds, reused, turn),
                            _pending(ws, turn, final), composed.spans, done.digest, done.stats, ws.clock.summary(),
                            unit)
 
-    pending: request_analysis.Pending | None = None
-
-    def settle_analysis() -> None:
-        """The first turn's request analysis, collected once: its components frozen as the turn's requirements and
-        appended as one item, or the fallback recorded. Waiting stops when the turn is cancelled."""
-        nonlocal pending
-        analysis, pending = pending.wait(cancelled), None
-        if analysis.usage is not None:
-            usage.append(analysis.usage)
-        if analysis.status == "cancelled":
-            raise TurnCancelled
+    def adopt_analysis() -> None:
+        """The collected analysis as the turn's requirements: its components frozen and appended as one item, or the
+        fallback recorded."""
+        nonlocal held
+        analysis, held = held, None
         if analysis.items:
             turn.adopt(analysis.items, "analysis", analysis.decisions)
             items.append({"role": "user", "content": request_analysis.block(analysis.items)})
         else:
             turn.fall_back(analysis.status)
+
+    def settle_analysis() -> None:
+        """The first turn's request analysis, collected once (waiting stops when the turn is cancelled) and adopted."""
+        if pending is not None:
+            collect_analysis(None)
+        if held is not None:
+            adopt_analysis()
 
     def final_notice(reason: str | None) -> None:
         if attempt == 0:
@@ -734,15 +815,14 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
 
     ws.binding = binding  # an ``assume`` of the bound number records the parameter it fills (KTD9)
     items: list = [{"role": "user", "content": _context_message(
-        inp, request, binding, ws.unit_focus["handle"] if ws.unit_focus else None, ws.located_unit)}]
-    if request is None and not (inp.history or inp.focus):
+        inp, request, binding, ws.unit_focus["handle"] if ws.unit_focus else None, ws.located_unit, turn_intent)}]
+    if request is None and first_turn:
         # a first turn: the request is analysed beside the first step (no added latency), within the reading time
-        pending = request_analysis.start(provider, inp.question, read_until)
-        started.append(pending)
+        start_analysis()
     while True:
         if cancelled():
             raise TurnCancelled
-        if pending is not None and steps >= 1:
+        if (pending is not None or held is not None) and steps >= 1:
             settle_analysis()  # before the second step: appended after the first step's items
         steps += 1
         now = time.monotonic()
@@ -794,6 +874,11 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             raise ProviderFailure(*failure)
         items.extend(step.output)
         if step.calls:
+            if pending is not None and not intent_waited:
+                # the intent is read before the first step's tools run, so every tool sees it (round 10 KTD3); the
+                # components are appended after the tool outputs, as before
+                intent_waited = True
+                collect_analysis(settings.chat_intent_wait_seconds)
             if compute_ok:
                 compute_steps += 1
             for call in step.calls:
@@ -813,7 +898,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             raise ProviderFailure(CallStatus.INVALID.value, "final schema") from exc
         answer_seconds = time.monotonic() - step_started
         ws.clock.add("compose", answer_seconds)
-        if pending is not None:
+        if pending is not None or held is not None:
             settle_analysis()  # the first step answered: the requirements are frozen before verification
         if answer.status == "clarification" and answer.clarification_question.strip() and not answer.answer_markdown.strip():
             answer.answer_markdown = answer.clarification_question
@@ -875,6 +960,21 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             # a rewrite from verified content cannot complete a requirement: only the claims are its problems
             items.append({"role": "user", "content": REWRITE.format(problems=report.problems_text(claims_only=True))})
             repaired |= report.repair_keys(claims_only=True)
+
+
+def _record_intent(resolution: dict, settled: intent_mod.Intent, decisions: dict | None = None) -> None:
+    """The settled intent, and the decisions taken on it, in a resolution kept for the diagnostics."""
+    resolution["intent"] = settled.as_dict()
+    resolution.setdefault("decisions", {}).update({"intent": settled.value, **(decisions or {})})
+
+
+def _first_resolution(settled: intent_mod.Intent | None, decisions: dict) -> dict | None:
+    """A first turn's resolution for the diagnostics (it has no resolve call): its intent and the decisions on it."""
+    if settled is None:
+        return None
+    out: dict = {}
+    _record_intent(out, settled, decisions)
+    return out
 
 
 def _with_binding(components: list[dict], binding: dict | None) -> list[dict]:

@@ -39,6 +39,7 @@ class StageClock:
     seconds: dict[str, float] = field(default_factory=lambda: dict.fromkeys(STAGES, 0.0))
     calls: dict[str, int] = field(default_factory=lambda: dict.fromkeys(STAGES, 0))
     tools: list[dict] = field(default_factory=list)
+    waits: dict[str, float] = field(default_factory=dict)  # waits that are no stage's (``wait``): the intent's
 
     def __post_init__(self) -> None:
         self.started = self.now()
@@ -47,6 +48,11 @@ class StageClock:
         """Count ``seconds`` (never negative) to ``stage``."""
         self.seconds[stage] += max(0.0, seconds)
         self.calls[stage] += 1
+
+    def wait(self, name: str, seconds: float) -> None:
+        """Seconds the turn waited for something that is no stage (round 10: the request analysis that settles the
+        question's intent); they stay in the turn's unattributed time and are also reported by name."""
+        self.waits[name] = self.waits.get(name, 0.0) + max(0.0, seconds)
 
     def tool(self, name: str, seconds: float, chars: int, pages: tuple[int, int] | None = None) -> None:
         """One tool call: counted to the tool's stage, and kept as a record. ``pages``: the first and last page a read
@@ -66,8 +72,11 @@ class StageClock:
         stages = {k: {"seconds": round(self.seconds[k], 3), "calls": self.calls[k]} for k in STAGES}
         held = round(sum(s["seconds"] for s in stages.values()), 3)
         total = max(round(self.now() - self.started, 3), held)
-        return {"total_seconds": total, "stages": stages, "unattributed_seconds": round(total - held, 3),
-                "tools": list(self.tools)}
+        out = {"total_seconds": total, "stages": stages, "unattributed_seconds": round(total - held, 3),
+               "tools": list(self.tools)}
+        if self.waits:
+            out["waits"] = {k: round(v, 3) for k, v in self.waits.items()}
+        return out
 
 
 _SOURCE = re.compile(r'<source id="S\d+"(?! same_as)([^>]*)>')

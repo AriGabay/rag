@@ -5,7 +5,11 @@ input items it received, so tests can check what the model was shown (history, p
 The request analysis answers with the components a test gives (``request=``: a list of ``component(...)``, a
 ``CallStatus`` for a failed call, or a callable ``(input) -> one of those or a dict``); by default with one
 information component per part the first scripted final answer declares, and with none when it declares none —
-an empty analysis, so the judge derives the requirements as before the analysis existed (the fallback)."""
+an empty analysis, so the judge derives the requirements as before the analysis existed (the fallback).
+
+The analysis also carries the question's intent (round 10): by default ``unknown`` — which, on a first turn, drops a
+provisional unit pin (a pin from passages) and runs no lookup; a test that wants the pin gives ``intent="property"``
+(a value of ``app.chat.intent.Value``, or a dict of the whole part, or a callable ``(input) -> either``)."""
 
 from __future__ import annotations
 
@@ -52,6 +56,13 @@ def requirement(text: str = "", status: str = "full", units: list | None = None,
             "related": related or [], "reason": "בדיקה"}
 
 
+def intent_part(value: str = "unknown", reference: str = "none", item: int | None = None, topic: str = "",
+                standard_refs: list | None = None) -> dict:
+    """The intent part of an analysis or of a resolution, as the model returns it."""
+    return {"intent": value, "reference": reference, "item": item, "topic": topic,
+            "standard_refs": standard_refs or []}
+
+
 def component(text: str, kind: str = "information", id: str = "", parent: str = "", conditional: bool = False,
               subject: str = "", parameters: list | None = None, compares: list | None = None,
               aspect: str = "") -> dict:
@@ -70,10 +81,12 @@ class ScriptedAgent(ScriptedProvider):
     model = "scripted-agent"
 
     def __init__(self, steps: list, judge: str | Callable[[str], dict] = "supported",
-                 request: list | CallStatus | Callable[[str], Any] | None = None) -> None:
+                 request: list | CallStatus | Callable[[str], Any] | None = None,
+                 intent: str | dict | Callable[[str], Any] = "unknown") -> None:
         super().__init__()
         self.steps = list(steps)
         self.request = request
+        self.intent = intent
         # read now: the analysis runs while the first step is being taken from ``steps``
         self._first_final = next((s["final"] for s in self.steps if isinstance(s, dict) and "final" in s), None)
         self.seen: list[list] = []
@@ -102,7 +115,10 @@ class ScriptedAgent(ScriptedProvider):
         response = self.request(input) if callable(self.request) else self.request
         if response is None:  # the default: the parts the first scripted final answer declares
             response = [component(p["ask"]) for p in (self._first_final or {}).get("parts") or []]
-        return {"components": response} if isinstance(response, list) else response
+        if not isinstance(response, list):
+            return response
+        said = self.intent(input) if callable(self.intent) else self.intent
+        return {"components": response, "intent": intent_part(said) if isinstance(said, str) else said}
 
     def structured(self, purpose: Purpose, instructions: str, input: str, schema, **kw: Any):
         if schema is not RequestAnalysis:

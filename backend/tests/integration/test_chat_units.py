@@ -335,7 +335,9 @@ def statements():
 def test_a_first_message_whose_words_fit_two_units_equally_gets_the_servers_clarification_with_no_model_call(
         client, office, monkeypatch):
     doc, _ = ingest(office, R9B)
-    agent = ScriptedAgent([])
+    # the question holds no complete name: the pin waits for the request analysis (round 10 KTD3), which says the
+    # question is about a property; no agent step is taken
+    agent = ScriptedAgent([], intent="property")
     cloud(monkeypatch, office, agent)
     m = send(client, new_conversation(client), SIMILAR_QUESTION)
     assert m["status"] == "done", m
@@ -344,7 +346,8 @@ def test_a_first_message_whose_words_fit_two_units_equally_gets_the_servers_clar
     md = a["markdown"]
     assert "1. «מתחם הגפן א» (עמוד 1;" in md and "2. «מתחם הגפן ב» (עמוד 2;" in md and R9B_TITLE in md
     assert [(c["document_id"], c["unit"]["unit_no"]) for c in a["request"]["candidates"]] == [(doc, 1), (doc, 2)]
-    assert agent.seen == [] and agent.calls == []  # nothing was asked of any model: not the agent, not the analysis
+    # no agent step; the only model call is the request analysis that settled the intent
+    assert agent.seen == [] and [c.schema.__name__ for c in agent.calls] == ["RequestAnalysis"]
 
 
 def test_a_first_message_is_left_to_the_model_unless_it_names_two_or_more_units_without_a_better_fit(
@@ -401,7 +404,7 @@ def _reply_turn(client, monkeypatch, cid: str, message: str, relation: str) -> t
 def test_after_the_servers_clarification_the_reply_that_is_the_full_name_selects_that_unit_whatever_the_parse(
         client, office, monkeypatch, relation):
     doc, _ = ingest(office, R9B)
-    cloud(monkeypatch, office, ScriptedAgent([]))
+    cloud(monkeypatch, office, ScriptedAgent([], intent="property"))
     cid = new_conversation(client)
     assert send(client, cid, SIMILAR_QUESTION)["answer"]["status"] == "clarification"
     agent, m = _reply_turn(client, monkeypatch, cid, "מתחם הגפן ב", relation)
@@ -430,7 +433,7 @@ def test_after_the_models_own_clarification_the_reply_is_matched_against_the_uni
     assert _task_unit(agent) == "מתחם הגפן ב"
 
 
-def test_a_reply_after_the_models_clarification_that_names_no_unit_in_full_is_left_to_the_lookup(
+def test_a_reply_after_the_models_clarification_that_names_no_unit_in_full_is_not_looked_up(
         client, office, monkeypatch):
     ingest(office, R9B)
     asked = "בקובץ שני מתחמים: מתחם הגפן א ומתחם הגפן ב. לאיזה התכוונת?"
@@ -438,12 +441,16 @@ def test_a_reply_after_the_models_clarification_that_names_no_unit_in_full_is_le
                                               final(asked, "clarification", clarification=asked)]))
     cid = new_conversation(client)
     send(client, cid, "מה דמי השכירות החודשיים?")
-    agent = ScriptedAgent([])
+    # "הגפן" is a word both units share: no evidence of either (round 10 R8), so the server looks nothing up and asks
+    # nothing; the model, which asked the question, asks it again
+    again = "לאיזה מהמתחמים התכוונת: מתחם הגפן א או מתחם הגפן ב?"
+    agent = ScriptedAgent([final(again, "clarification", clarification=again)])
     agent.on("resolve", _parse(relation="clarification_answer", changed_fields=[{"field": "subject", "user_words": "הגפן"}],
                                subject="הגפן"))
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: agent)
     m = send(client, cid, "הגפן")
-    assert m["answer"]["status"] == "clarification"  # "הגפן" is both: the server's question between the two
+    assert m["answer"]["status"] == "clarification" and m["answer"]["markdown"] == again
+    assert not m["answer"]["request"]["candidates"] and len(agent.seen) == 1
 
 
 # --- name fit, never passage counts (R13) ------------------------------------------------------------------------------
@@ -980,8 +987,9 @@ def test_a_first_message_naming_a_word_of_one_unit_only_works_inside_that_unit(c
         return final(f"שווי הנכס הוא {U2_VALUE} ₪ [{sid}].", claims=[
             {"text": f"שווי הנכס הוא {U2_VALUE} ₪", "source_ids": [sid], "basis": "explicit"}])
 
+    # a pin from the passages is provisional: it applies when the request analysis says the question is about a property
     agent = ScriptedAgent([[call("search", query="שווי הנכס פרויקט הצפצפה", document_ids=None, limit=None, unit=None)],
-                           answer])
+                           answer], intent="property")
     cloud(monkeypatch, untitled, agent)
     m = send(client, new_conversation(client), "מה שווי הנכס בפרויקט הצפצפה?")
     assert m["status"] == "done", m

@@ -377,6 +377,9 @@ class Workspace:
     # contiguously from its beginning (``READ_TO_END`` at its end), "unread": a region of it was not read,
     # "document_id"}
     reads: dict[tuple, dict] = field(default_factory=dict)
+    # the turn's settled intent (round 10 U6; ``intent.Intent.value``): what the tools' pools are set from; ``unknown``
+    # until the request is read, and when it is not known
+    intent: str = "unknown"
     inspections: int = 0  # vision model calls ``inspect`` made in the turn (capped by ``chat_max_inspections``)
     # the turn's reading deadline (``time.monotonic()``; None outside a turn): a vision call of ``inspect`` is cut to
     # it, and none starts with less than ``chat_inspect_reserve_seconds`` left
