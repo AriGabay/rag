@@ -314,6 +314,11 @@ textarea.input {
   font-size: 0.9rem;
 }
 
+.field-label {
+  font-weight: 500;
+  font-size: 0.9rem;
+}
+
 .field-error {
   color: var(--danger);
   font-size: 0.85rem;
@@ -405,6 +410,27 @@ textarea.input {
 .coverage-list ul {
   margin: 2px 0 4px;
   padding-inline-start: 16px;
+}
+
+/* What a standard states about itself (documents screen): kept narrow so a listing row stays readable. */
+.professional {
+  margin-block-start: 6px;
+  max-width: 42ch;
+}
+
+.professional dl.kv {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+.professional ul {
+  margin: 2px 0 0;
+  padding-inline-start: 18px;
+}
+
+.source-quote {
+  margin-block: 2px 4px;
+  padding-inline-start: 8px;
+  border-inline-start: 2px solid var(--border);
 }
 
 /* ---------- Tables ---------- */

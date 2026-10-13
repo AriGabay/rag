@@ -35,7 +35,7 @@ from app.extraction.render import (  # noqa: F401 - the view's scales
     render_png,
 )
 from app.platform.jobs import enqueue_positions, enqueue_processing, positions_job_key, retriable_failure
-from app.platform.source_kinds import APPRAISAL, MSG_BAD_KIND, SOURCE_KINDS
+from app.platform.source_kinds import APPRAISAL, MSG_BAD_KIND, PROFESSIONAL, SOURCE_KINDS, STANDARD
 from app.platform.storage import get_storage, purge_staging, storage_key
 from app.professional import views
 
@@ -418,9 +418,9 @@ def change_kind(document_id: str, body: KindBody, ctx: TenantContext = Depends(r
     answer outlives the change. Nothing is deleted or read again (R1, R3).
 
     - To ``standard`` or ``professional``: the appraisal derivations (units, records, measurements) stay stored and the
-      kind filters of the appraisal surfaces stop reading them. Sections and the standard's profile are derived
-      lazily from the stored blocks on first use (``app.professional.sections.ensure``, ``profile.ensure_profile``:
-      round 10 U4, U5), so there is nothing to derive here and a derivation that fails cannot fail the change.
+      kind filters of the appraisal surfaces stop reading them. Sections and the standard's profile of the current
+      version are derived right after the change, from the stored blocks (``app.professional.after_publish``: round 10
+      U4, U5); a derivation that fails is recorded on the version and cannot fail the change.
     - To ``appraisal`` from another kind: the appraisal stages the document skipped run now, from the stored reading
       (``publish.run_skipped_stages``: records, transactions and units from stored pages, tables and blocks), and
       measurement extraction is queued when the office allows the model. Each of these works on stored rows, so none
@@ -464,6 +464,14 @@ def change_kind(document_id: str, body: KindBody, ctx: TenantContext = Depends(r
             details["versions"] = len(versions)
         audit(conn, "document_kind_change", ctx.user_id, "document", doc_uuid, **details)
         bump_data_version(conn)
+        current = conn.execute(text("SELECT id FROM document_versions WHERE document_id = :d AND is_current"),
+                               {"d": doc_uuid}).scalar() if body.source_kind in (STANDARD, PROFESSIONAL) else None
+    if current is not None:
+        # the sections and the profile are derived now, from the stored blocks, so the documents screen shows them
+        # instead of a derivation still pending; a failure is recorded on the version and never undoes the change
+        from app import professional
+
+        professional.after_publish(ctx, current)
     return {"id": str(doc_uuid), "source_kind": body.source_kind}
 
 

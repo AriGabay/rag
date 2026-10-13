@@ -16,6 +16,7 @@ import type {
   RecordDetail,
   ReviewItem,
   SearchResult,
+  SourceKind,
   UploadResult,
 } from "./types";
 import type { ChatConversation, ChatDiagnostics, ChatMessage, SourceBlocks } from "./chatTypes";
@@ -288,13 +289,15 @@ export const api = {
   // Documents
   // One request per file: a request never carries more than one file (the /api proxy buffers each request
   // body up to `proxyClientMaxBodySize`), and one file's failure never loses the others' results.
-  upload: async (files: File[], groupId: string, documentId?: string) => {
+  upload: async (files: File[], groupId: string, documentId?: string, sourceKind?: SourceKind) => {
     const results: UploadResult[] = [];
     for (const f of files) {
       const fd = new FormData();
       fd.append("files", f, f.name);
       fd.append("group_id", groupId);
       if (documentId) fd.append("document_id", documentId);
+      // the kind of a new document, for the whole batch; a new version keeps its document's kind (server side)
+      if (sourceKind) fd.append("source_kind", sourceKind);
       try {
         const res = await request<{ results: UploadResult[] }>("/api/documents", { method: "POST", body: fd });
         results.push(...res.results);
@@ -309,6 +312,13 @@ export const api = {
   documents: (q?: string, status?: string) =>
     request<{ documents: DocumentSummary[] }>(`/api/documents${qs({ q, status })}`),
   document: (id: string) => request<DocumentDetail>(`/api/documents/${encodeURIComponent(id)}`),
+  /** Admin: change a document's kind. Nothing is deleted or read again; the server refuses (409, with its reason) a
+   * change back to an appraisal whose appraisal stages cannot run from the stored reading. */
+  changeKind: (id: string, sourceKind: SourceKind) =>
+    request<{ id: string; source_kind: SourceKind }>(`/api/documents/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: { source_kind: sourceKind },
+    }),
   deleteDocument: (id: string) =>
     request<{ ok: true }>(`/api/documents/${encodeURIComponent(id)}`, { method: "DELETE" }),
   /** Admin: process the document's failed version again without a re-upload (a version failed by the time limit or an

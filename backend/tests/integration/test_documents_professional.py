@@ -119,3 +119,16 @@ def test_a_user_outside_the_group_is_shown_neither_the_document_nor_a_link_to_it
     assert [e["document_id"] for e in editions["editions"]] == [open_doc]
     assert secret not in json.dumps(docs, ensure_ascii=False)
     assert client.get(f"/api/documents/{secret}").status_code == 404
+
+
+def test_a_document_changed_to_a_standard_is_derived_at_once_from_its_stored_blocks(client, office):
+    # round 10 U10 review: the documents screen shows the standard's metadata right after an admin changes the kind,
+    # not a derivation left pending until a chat tool happens to touch the document
+    doc, ver = professional_file(office, office.default_group_id, standard_blocks("97.0"), title="הועלה כשומה",
+                                 source_kind="appraisal")
+    login(client, "admin-a@example.test")
+    assert "professional" not in listed(client)["הועלה כשומה"] or not listed(client)["הועלה כשומה"]["professional"]
+    r = client.patch(f"/api/documents/{doc}", json={"source_kind": "standard"})
+    assert r.status_code == 200
+    shown = listed(client)["הועלה כשומה"]["professional"]
+    assert shown["state"] == "ready" and shown["profile"]["number"]["value"] == "97.0"

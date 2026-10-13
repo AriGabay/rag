@@ -14,14 +14,19 @@ import {
   KEPT_PREVIOUS_TITLE,
   keptPreviousText,
   type KeptPrevious,
+  SOURCE_KIND_LABEL,
   VERSION_STATUS_LABEL,
 } from "@/lib/format";
 import type {
   DocumentDetail,
   DocumentSummary,
   PageCoverage,
+  ProfessionalField,
+  ProfessionalFieldName,
+  ProfessionalInfo,
   RegionStatus,
   SearchResult,
+  SourceKind,
   UploadResult,
   Version,
 } from "@/lib/types";
@@ -285,17 +290,282 @@ function StatusCell({ v, docId, onChanged }: { v: Version | null; docId: string;
   );
 }
 
+const KINDS: SourceKind[] = ["appraisal", "standard", "professional"];
+
+/** A document without a kind (a response from before round 10) is an appraisal. */
+function kindOf(d: Pick<DocumentSummary, "source_kind">): SourceKind {
+  return d.source_kind ?? "appraisal";
+}
+
+function KindBadge({ kind }: { kind: SourceKind }) {
+  return (
+    <span className={`badge ${kind === "appraisal" ? "" : "badge-info"}`} data-testid="kind-badge" data-kind={kind}>
+      {SOURCE_KIND_LABEL[kind]}
+    </span>
+  );
+}
+
+const MSG_PENDING = "הנתונים בחילוץ";
+const MSG_FAILED = "חילוץ הנתונים נכשל";
+const UNKNOWN = "לא ידוע";
+
+const FIELD_LABEL: Record<ProfessionalFieldName, string> = {
+  number: "מספר",
+  title: "שם",
+  edition: "נוסח",
+  published: "תאריך פרסום",
+  effective: "תאריך תחילה",
+  issuer: "גוף מפרסם",
+  scope: "תחולה",
+  amends: "מתייחס ל",
+};
+
+// the rows every listing shows, then the rest of the document's screen
+const CORE_FIELDS: ProfessionalFieldName[] = ["number", "edition", "published", "effective"];
+const MORE_FIELDS: ProfessionalFieldName[] = ["title", "issuer", "scope"];
+
+const RELATION_LABEL: Record<string, string> = {
+  clarifies: "הבהרה",
+  amends: "תיקון",
+  replaces: "מחליף",
+  appendix_of: "נספח",
+};
+
+/** Where a stated value is stated: a button (focusable, Enter or Space, tap) that opens its page and quote, never a
+ * hover-only tooltip. */
+function SourceDisclosure({ label, field }: { label: string; field: ProfessionalField }) {
+  const [open, setOpen] = useState(false);
+  const panelId = useId();
+  if (!field.quote && field.page == null) return null;
+  return (
+    <>
+      <button
+        type="button"
+        className="btn-link small"
+        aria-expanded={open}
+        aria-controls={panelId}
+        aria-label={`מקור ${label}`}
+        onClick={() => setOpen((o) => !o)}
+      >
+        מקור
+      </button>
+      <div id={panelId} className="source-quote small" hidden={!open}>
+        <div>{field.page != null ? <>עמוד <B>{field.page}</B></> : "במסמך (ללא עמודים)"}</div>
+        {field.quote && <q>{field.quote}</q>}
+      </div>
+    </>
+  );
+}
+
+function fieldValue(name: ProfessionalFieldName, f: ProfessionalField): string {
+  if (name !== "amends") return f.value ?? "";
+  const rel = f.relation ? RELATION_LABEL[f.relation] : null;
+  const target = `תקן ${f.standard ?? f.value ?? ""}`.trim();
+  return rel ? `${target} (${rel})` : target;
+}
+
+/** What a standard or a professional document states about itself, with each value's source; the state of its
+ * extraction apart from the values (an unknown value is "לא ידוע" only after a finished extraction), its editions and
+ * its copies. `compact` is the listing's: the number, edition and dates. */
+function ProfessionalSummary({
+  info,
+  compact,
+  onOpen,
+}: {
+  info: ProfessionalInfo;
+  compact?: boolean;
+  onOpen?: (id: string) => void;
+}) {
+  const ready = info.state === "ready";
+  const names = [...CORE_FIELDS, ...(compact ? [] : MORE_FIELDS), "amends" as const];
+  // unknown fields are listed only once the extraction finished; the amended standard only when the document states it
+  const rows = info.profile
+    ? names.filter((n) => {
+        const f = info.profile?.[n];
+        return f?.status === "stated" || (ready && n !== "amends");
+      })
+    : [];
+  const open = (id: string, title: string) =>
+    onOpen ? (
+      <button type="button" className="btn-link" onClick={() => onOpen(id)}>
+        {title}
+      </button>
+    ) : (
+      <bdi>{title}</bdi>
+    );
+  const ed = info.editions;
+  const same = info.duplicates.same_text_as;
+  const copies = info.duplicates.copies;
+  return (
+    <div className="professional small stack" data-testid="professional">
+      {info.state === "pending" && (
+        <div className="muted" role="status" data-testid="professional-pending">
+          {MSG_PENDING}
+        </div>
+      )}
+      {info.state === "failed" && (
+        <div role="alert" style={{ color: "var(--danger)" }} data-testid="professional-failed">
+          {MSG_FAILED}
+        </div>
+      )}
+      {rows.length > 0 && info.profile && (
+        <dl className="kv">
+          {rows.map((n) => {
+            const f = info.profile![n];
+            return (
+              <div key={n} style={{ display: "contents" }} data-testid={`professional-${n}`}>
+                <dt>{FIELD_LABEL[n]}</dt>
+                <dd>
+                  {f.status === "stated" ? (
+                    <>
+                      <bdi>{fieldValue(n, f)}</bdi> <SourceDisclosure label={FIELD_LABEL[n]} field={f} />
+                    </>
+                  ) : (
+                    <span className="muted">{UNKNOWN}</span>
+                  )}
+                </dd>
+              </div>
+            );
+          })}
+        </dl>
+      )}
+      {same && (
+        <div data-testid="professional-same-text">
+          אותו נוסח כמו {open(same.document_id, same.title)}
+        </div>
+      )}
+      {copies.length > 0 && (
+        <div data-testid="professional-copies">
+          עותקים נוספים של אותו נוסח:{" "}
+          {copies.map((c, i) => (
+            <span key={c.document_id}>
+              {i > 0 && ", "}
+              {open(c.document_id, c.title)}
+            </span>
+          ))}
+        </div>
+      )}
+      {ed && ed.editions.length > 1 && (
+        <div data-testid="professional-editions">
+          <strong>
+            נוסחים של תקן <B>{ed.number}</B>
+          </strong>
+          <ul>
+            {ed.editions.map((e) => (
+              <li key={e.document_id}>
+                {e.current ? <strong><bdi>{e.title}</bdi></strong> : open(e.document_id, e.title)}
+                {e.current && " (המסמך הזה)"}
+                {[e.edition, e.effective ? `בתוקף מ-${e.effective}` : null, e.published ? `פורסם ${e.published}` : null]
+                  .filter(Boolean)
+                  .map((x, i) => (
+                    <span key={i} className="muted">
+                      {" · "}
+                      <bdi>{x}</bdi>
+                    </span>
+                  ))}
+              </li>
+            ))}
+          </ul>
+          {!ed.order_known && <div className="muted">סדר הנוסחים לא ידוע: התאריכים שצוינו במסמכים אינם קובעים אותו.</div>}
+        </div>
+      )}
+      {ed && ed.related.length > 0 && (
+        <div data-testid="professional-related">
+          מסמכים הקשורים לתקן:{" "}
+          {ed.related.map((r, i) => (
+            <span key={r.document_id}>
+              {i > 0 && ", "}
+              {open(r.document_id, r.title)}
+              {r.relation && RELATION_LABEL[r.relation] ? ` (${RELATION_LABEL[r.relation]})` : ""}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** An admin changes a document's kind. The confirmation says nothing is deleted or read again; while the change runs
+ * the control is busy; a refusal (the server's reason) is shown here and the badge stays as it was. */
+function KindControl({ doc, onChanged }: { doc: DocumentDetail; onChanged: () => void }) {
+  const current = kindOf(doc);
+  const options = KINDS.filter((k) => k !== current);
+  const [target, setTarget] = useState<SourceKind>(options[0]);
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const selectId = useId();
+
+  async function change() {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.changeKind(doc.id, target);
+      setConfirming(false);
+      onChanged();
+    } catch (err) {
+      setConfirming(false);
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="stack" data-testid="kind-control">
+      <div className="row">
+        <label htmlFor={selectId}>שינוי סוג המסמך:</label>
+        <select
+          id={selectId}
+          className="input"
+          value={target}
+          disabled={busy}
+          onChange={(e) => setTarget(e.target.value as SourceKind)}
+        >
+          {options.map((k) => (
+            <option key={k} value={k}>
+              {SOURCE_KIND_LABEL[k]}
+            </option>
+          ))}
+        </select>
+        <button type="button" className="btn" disabled={busy} onClick={() => { setError(null); setConfirming(true); }}>
+          {busy ? "משנה..." : "שינוי סוג"}
+        </button>
+      </div>
+      <ErrorAlert message={error} />
+      <Dialog open={confirming} title="שינוי סוג המסמך" onClose={() => setConfirming(false)}>
+        <p>
+          סוג המסמך ישונה מ«{SOURCE_KIND_LABEL[current]}» ל«{SOURCE_KIND_LABEL[target]}». לא יימחק דבר והמסמך לא ייקרא
+          מחדש.
+        </p>
+        <div className="row">
+          <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void change()}>
+            {busy ? "משנה..." : "אישור השינוי"}
+          </button>
+          <button type="button" className="btn" disabled={busy} onClick={() => setConfirming(false)}>
+            ביטול
+          </button>
+        </div>
+      </Dialog>
+    </div>
+  );
+}
+
 function DocumentPanel({
   id,
   onClose,
   onChanged,
+  onOpenDocument,
 }: {
   id: string;
   onClose: () => void;
   onChanged: () => void;
+  /** Another document the screen names (an edition, a copy). */
+  onOpenDocument: (id: string) => void;
 }) {
   const me = useSession();
   const canUpload = !!me && (me.user.role === "admin" || me.user.can_upload);
+  const isAdmin = me?.user.role === "admin";
   const inputId = useId();
   const versionInput = useRef<HTMLInputElement>(null);
   const fetchDoc = useCallback(() => api.document(id), [id]);
@@ -361,9 +631,12 @@ function DocumentPanel({
             <span>
               נוצר: <B>{formatTimestamp(doc.created_at)}</B>
             </span>
+            <KindBadge kind={kindOf(doc)} />
             {doc.deleted && <span className="badge badge-danger">נמחק</span>}
             {polling && <span className="muted">מתעדכן אוטומטית...</span>}
           </div>
+          {doc.professional && <ProfessionalSummary info={doc.professional} onOpen={onOpenDocument} />}
+          {isAdmin && !doc.deleted && <KindControl key={kindOf(doc)} doc={doc} onChanged={() => { reload(); onChanged(); }} />}
           <div className="table-wrap">
             <table className="table">
               <caption className="visually-hidden">גרסאות המסמך</caption>
@@ -473,7 +746,10 @@ function DocumentsTab({
 }) {
   const [q, setQ] = useState("");
   const [status, setStatus] = useState("");
+  const [kind, setKind] = useState<"" | SourceKind>("");
   const polling = !!docs && docs.some((d) => isActive(d.current_version));
+  // the kind filter works on the listed documents (a list holds one office's documents, not pages of them)
+  const shown = docs ? docs.filter((d) => !kind || kindOf(d) === kind) : null;
   useInterval(reload, POLL_MS, polling);
 
   return (
@@ -507,6 +783,22 @@ function DocumentsTab({
             </option>
           ))}
         </select>
+        <label htmlFor="doc-kind" className="visually-hidden">
+          סינון לפי סוג
+        </label>
+        <select
+          id="doc-kind"
+          className="input"
+          value={kind}
+          onChange={(e) => setKind(e.target.value as "" | SourceKind)}
+        >
+          <option value="">כל הסוגים</option>
+          {KINDS.map((k) => (
+            <option key={k} value={k}>
+              {SOURCE_KIND_LABEL[k]}
+            </option>
+          ))}
+        </select>
         <button type="submit" className="btn">
           חיפוש
         </button>
@@ -514,8 +806,8 @@ function DocumentsTab({
       </form>
       <ErrorAlert message={error} onRetry={reload} />
       {docs === null && !error && <p className="muted">טוען...</p>}
-      {docs && docs.length === 0 && <p className="muted">לא נמצאו מסמכים.</p>}
-      {docs && docs.length > 0 && (
+      {shown && shown.length === 0 && <p className="muted">לא נמצאו מסמכים.</p>}
+      {shown && shown.length > 0 && (
         <div className="table-wrap">
           <table className="table">
             <caption className="visually-hidden">רשימת מסמכים</caption>
@@ -531,7 +823,7 @@ function DocumentsTab({
               </tr>
             </thead>
             <tbody>
-              {docs.map((d) => {
+              {shown.map((d) => {
                 const v = d.current_version;
                 return (
                   <tr key={d.id} className={d.id === selected ? "selected" : undefined}>
@@ -539,7 +831,10 @@ function DocumentsTab({
                       <button type="button" className="btn-link" onClick={() => onSelect(d.id)}>
                         {d.title}
                       </button>
+                      {" "}
+                      <KindBadge kind={kindOf(d)} />
                       {d.deleted && <span className="badge badge-danger"> נמחק</span>}
+                      {d.professional && <ProfessionalSummary info={d.professional} compact onOpen={onSelect} />}
                     </td>
                     <td>{d.group.name}</td>
                     <td>
@@ -671,7 +966,13 @@ export default function DocumentsPage() {
         />
       )}
       {selected && (
-        <DocumentPanel key={selected} id={selected} onClose={() => setSelected(null)} onChanged={refresh} />
+        <DocumentPanel
+          key={selected}
+          id={selected}
+          onClose={() => setSelected(null)}
+          onChanged={refresh}
+          onOpenDocument={setSelected}
+        />
       )}
       <section className="card">
         <div className="tabs" role="tablist" aria-label="תצוגת מסמכים">

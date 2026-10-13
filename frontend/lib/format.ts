@@ -1,7 +1,7 @@
 // Display formatting. Decimal strings are formatted directly (Intl accepts exact numeric strings),
 // so no float arithmetic touches money or area. Nothing here aggregates values.
 
-import type { ChatUnit } from "./chatTypes";
+import type { ChatStandard, ChatUnit } from "./chatTypes";
 import type {
   AbstentionKind,
   ClaimKind,
@@ -10,6 +10,7 @@ import type {
   Provider,
   ProviderMode,
   ProviderStatus,
+  SourceKind,
   VersionProgress,
   VersionStatus,
 } from "./types";
@@ -20,6 +21,34 @@ export function unitLabel(unit: Pick<ChatUnit, "title" | "pages"> | null | undef
   const [first, last] = unit.pages;
   const pages = first == null ? "" : first === last || last == null ? `עמוד ${first}` : `עמודים ${first}–${last}`;
   return [unit.title || "ללא כותרת", pages].filter(Boolean).join(" · ");
+}
+
+export const SOURCE_KIND_LABEL: Record<SourceKind, string> = {
+  appraisal: "שומה",
+  standard: "תקן שמאות",
+  professional: "מסמך מקצועי",
+};
+
+/** "סעיף 2.1", "נספח א'" or "סעיף «הגדרות»": where in the document, in the words a reader cites it (as the server
+ * words a standard's location). */
+export function standardSection(std: Pick<ChatStandard, "section" | "section_title">): string | null {
+  const label = std.section || null;
+  const title = std.section_title || null;
+  if (label?.startsWith("נספח")) return label;
+  if (label && /^\d+(\.\d+)*$/.test(label)) return `סעיף ${label}`;
+  const name = title || label;
+  return name ? `סעיף «${name}»` : null;
+}
+
+/** A standard citation's identity as one phrase: "תקן 98.1 (גרסה 2.0) — סעיף 2.1". Without a stated number the
+ * document's stated name leads; null when the document states neither (the source's own title then says it). */
+export function standardLabel(std: ChatStandard | null | undefined): string | null {
+  if (!std) return null;
+  const head = std.number ? `תקן ${std.number}` : std.title || null;
+  const edition = std.edition ? ` (${std.edition})` : "";
+  const section = standardSection(std);
+  if (!head) return section;
+  return `${head}${edition}${section ? ` — ${section}` : ""}`;
 }
 
 const DECIMAL_RE = /^[-+]?\d+(\.\d+)?$/;

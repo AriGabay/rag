@@ -33,7 +33,7 @@ import type {
   ViewerNav,
   ViewerTarget,
 } from "@/lib/chatTypes";
-import { VALUE_STATUS, unitLabel, valueStatusText } from "@/lib/format";
+import { VALUE_STATUS, standardLabel, unitLabel, valueStatusText } from "@/lib/format";
 import { SourceRevoked, SourceTextView, TableView } from "./SourcePanel";
 import "./chat.css";
 
@@ -313,6 +313,8 @@ function ViewerHeader({
   const status = target.valueStatus ?? null;
   // a file of several appraisals: the unit beside the file name, from the snapshot first (it outlives the reading)
   const unit = anchor?.unit ?? target.source.unit ?? null;
+  // a standard: its number, edition and section beside the title, from the snapshot first
+  const standard = standardLabel(anchor?.standard ?? target.source.standard);
   const structured = anchor ? viewKind(anchor) === "structured" : false;
   const statusLine = status && (
     <li data-testid="viewer-value-status" title={VALUE_STATUS[status].description}>
@@ -326,6 +328,11 @@ function ViewerHeader({
         {!revoked && unit && (
           <span data-testid="viewer-unit">
             <bdi>{unitLabel(unit)}</bdi>
+          </span>
+        )}
+        {!revoked && standard && (
+          <span data-testid="viewer-standard">
+            <bdi>{standard}</bdi>
           </span>
         )}
         {!revoked && subtitle && <span data-testid="viewer-location">{subtitle}</span>}

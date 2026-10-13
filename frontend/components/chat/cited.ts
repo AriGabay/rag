@@ -1,5 +1,5 @@
-import type { ChatAnswer, ChatAssumption, ChatSource, ChatValue, ViewerTarget } from "@/lib/chatTypes";
-import { type ValueStatus, chatValueStatus, measurementValueStatus } from "@/lib/format";
+import type { ChatAnswer, ChatAssumption, ChatSource, ChatStandard, ChatValue, ViewerTarget } from "@/lib/chatTypes";
+import { type ValueStatus, chatValueStatus, measurementValueStatus, standardLabel } from "@/lib/format";
 import { documentAnchor } from "./SourceViewer";
 
 /** What a citation is looked up in: an answer, or the records the diagnostics route returned for a removal. */
@@ -41,6 +41,27 @@ export function citedSource(answer: CitedRecords, id: string): ChatSource | null
     };
   }
   return null;
+}
+
+/** The standard a source cites, from the snapshot first (it outlives the reading), else the source itself; null for an
+ * appraisal and for answers from before round 10. */
+export function sourceStandard(src: Pick<ChatSource, "anchor" | "standard">): ChatStandard | null {
+  return src.anchor?.standard ?? src.standard ?? null;
+}
+
+/** What a standard's citation says of its identity beside the title: "תקן 98.1 (גרסה 2.0) — סעיף 2.1"; null for an
+ * appraisal's source. */
+export function sourceStandardLabel(src: Pick<ChatSource, "anchor" | "standard">): string | null {
+  return standardLabel(sourceStandard(src));
+}
+
+/** A standard's chip title and sources-list entry: its identity ("תקן 98.1 (גרסה 2.0) — סעיף 2.1"); the document's own
+ * title leads only when it states neither a number nor a name. Null for an appraisal's source. */
+export function standardChipTitle(src: ChatSource): string | null {
+  const label = sourceStandardLabel(src);
+  if (!label) return null;
+  const std = sourceStandard(src);
+  return std?.number || std?.title ? label : `${src.title} — ${label}`;
 }
 
 /** A value's status (V#): checked automatically in its passage, uncertain, or unread (never a person's decision). */

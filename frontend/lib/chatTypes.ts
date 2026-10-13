@@ -97,6 +97,18 @@ export interface ChatUnit {
   pages: number[];
 }
 
+/** What identifies the standard (or other professional document) a citation is from, each part null where the document
+ * states nothing (backend `Source.standard`, `anchors.standard_of`; snapshot version 2). */
+export interface ChatStandard {
+  number: string | null;
+  title: string | null;
+  edition: string | null;
+  effective: string | null;
+  /** The section the cited place is in: its number ("2.1"), an appendix ("נספח א'") or its heading. */
+  section: string | null;
+  section_title: string | null;
+}
+
 export interface ChatAnchor {
   v: number;
   precision: ChatAnchorPrecision;
@@ -129,6 +141,8 @@ export interface ChatAnchor {
   truncated: boolean;
   /** The unit the cited place is in, in a file of several appraisals. */
   unit?: ChatUnit | null;
+  /** The standard it cites; null for an appraisal and for a snapshot from before round 10 (version 1). */
+  standard?: ChatStandard | null;
 }
 
 /** A computed result (C#) anchors to its inputs, never to a place in a document. */
@@ -172,6 +186,10 @@ export interface ChatSource {
   anchor?: ChatAnchor | null;
   /** The unit it is in, when its file holds more than one (the file name alone does not say which appraisal). */
   unit?: ChatUnit | null;
+  /** The kind of document it is from (absent on answers from before round 10: an appraisal). */
+  source_kind?: "appraisal" | "standard" | "professional";
+  /** For a standard or another professional document: its identity and the section the passage is in. */
+  standard?: ChatStandard | null;
 }
 
 export interface ChatMeasurement {

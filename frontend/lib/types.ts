@@ -94,9 +94,78 @@ export interface PageCoverage {
   more?: number;
 }
 
+/** What a document is (round 10): chosen at upload, never inferred from the file name; an admin may change it. */
+export type SourceKind = "appraisal" | "standard" | "professional";
+
+/** One value a standard or professional document states about itself, with where it states it. `status: "unknown"`:
+ * the finished extraction found nothing (value and source are null). */
+export interface ProfessionalField {
+  value: string | null;
+  status: "stated" | "unknown";
+  /** How it was found: "pattern" or "model"; null for an unknown field. */
+  method: string | null;
+  page: number | null;
+  block: number | null;
+  quote: string | null;
+  /** Dates: ISO text as precise as the document is; numbers: the normalized key. */
+  normalized?: string | null;
+  /** The amended standard's relation ("clarifies", "amends", "replaces", "appendix_of") and its number. */
+  relation?: string | null;
+  standard?: string | null;
+}
+
+export type ProfessionalFieldName =
+  | "number"
+  | "title"
+  | "issuer"
+  | "edition"
+  | "published"
+  | "effective"
+  | "scope"
+  | "amends";
+
+/** pending: sections or profile not derived yet (an unknown field then means "not read yet"); ready: both stored (an
+ * unknown field means the document does not state it); failed: a derivation failed. */
+export type ProfessionalState = "pending" | "ready" | "failed";
+
+export interface ProfessionalEdition {
+  document_id: string;
+  title: string;
+  edition: string | null;
+  published: string | null;
+  effective: string | null;
+  /** This is the document the row belongs to. */
+  current: boolean;
+}
+
+/** `GET /api/documents` item block for a standard or a professional document (backend `app/professional/views.py`). */
+export interface ProfessionalInfo {
+  state: ProfessionalState;
+  /** null while the profile is not stored. */
+  profile: Record<ProfessionalFieldName, ProfessionalField> | null;
+  /** The editions that share the document's number; null when the number is unknown or not derived. */
+  editions: {
+    number: string;
+    /** The stated dates order the editions (never the upload date). */
+    order_known: boolean;
+    editions: ProfessionalEdition[];
+    related: { document_id: string; title: string; relation: string | null }[];
+  } | null;
+  duplicates: {
+    /** The document this one has the same text as (it is a later copy); null for the first copy. */
+    same_text_as: { document_id: string; title: string } | null;
+    /** Later copies of this document's text. */
+    copies: { document_id: string; title: string }[];
+  };
+}
+
 export interface DocumentSummary {
   id: string;
   title: string;
+  /** Absent only in a response from before round 10: read as an appraisal. */
+  source_kind?: SourceKind;
+  /** Only for a standard or a professional document the caller may see. */
+  professional?: ProfessionalInfo;
   group: Group;
   deleted: boolean;
   created_at: string;
