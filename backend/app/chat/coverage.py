@@ -610,7 +610,8 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
         return out | gap | {"searched": True}
     # a turn that never located the appraisal asked about did not look in the right place: it says so, before any "not
     # present"
-    if not (ws.unread_named and not readings):
+    # (a professional question asks about no property: an appraisal it read is an example, so no property is "not located")
+    if not (ws.unread_named and not readings) and ws.intent != "professional":
         docs = set(ev["documents"]) | set((claim or {}).get("document_ids") or [])
         if signal["multi"] and (not docs or docs & signal["multi"]) and not signal["located"]:
             return out | {"reason": "unit_not_located"}

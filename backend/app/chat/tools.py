@@ -295,6 +295,11 @@ class Source:
     source_kind: str = source_kinds.APPRAISAL
     standard: dict | None = None
     label: str | None = None
+    # what the sections of a professional passage say about how binding they are (round 10 U9, KTD14): {"limits": the
+    # condition and exception sentences that bind the provision, "modality": the counts of requirement, recommendation,
+    # example, alternative and exception wording}, read from the stored section structure when the passage was
+    # returned; the verifier's evidence for it. None for an appraisal and for a passage in no section
+    rules: dict | None = None
 
     @property
     def is_listing(self) -> bool:
@@ -1258,6 +1263,47 @@ def limit_lines(secs: tuple, sec: sections.Section) -> list[str]:
     return lines
 
 
+RULES_LIMITS = 20  # limits kept on a source for the verifier (it needs every one a provision has; a few sections have more)
+
+
+def section_rules(secs: tuple, first: int | None, last: int | None) -> dict | None:
+    """What the sections of the blocks ``first``..``last`` say about how binding they are, for the verifier (round 10 U9,
+    KTD14, R33): ``limits`` — the condition and exception sentences that bind a provision there (its section's and those
+    of the sections around it, ``_limits_of``), ``modality`` — the counts of requirement, recommendation, example,
+    alternative and exception wording in those sections, ``more`` — limits beyond ``RULES_LIMITS``. The innermost section
+    of a block changes only where a section starts or ends, so only those blocks are looked at. None for a passage in no
+    section."""
+    if first is None:
+        return None
+    last = first if last is None else max(first, last)
+    marks = {first, last} | {n for s in secs for n in (s.block_first, s.block_last + 1) if first <= n <= last}
+    held: dict[int, sections.Section] = {}
+    for block in marks:
+        holding = [s for s in secs if s.block_first <= block <= s.block_last]
+        if holding:
+            inner = max(holding, key=lambda s: (s.depth, s.section_no))
+            held[inner.section_no] = inner
+    if not held:
+        return None
+    limits: dict[tuple, str] = {}
+    modality = dict.fromkeys(sections.MODALITY_CLASSES, 0)
+    for sec in sorted(held.values(), key=lambda s: s.section_no):
+        for lim, _ in _limits_of(secs, sec):
+            limits.setdefault((lim["block"], lim["sentence"]), lim["sentence"])
+        for cls, n in sec.modality.items():
+            modality[cls] = modality.get(cls, 0) + n
+    ordered = [sentence for _, sentence in sorted(limits.items())]
+    return {"limits": ordered[:RULES_LIMITS], "modality": modality, "more": max(0, len(ordered) - RULES_LIMITS)}
+
+
+def _rules_of_part(conn: Connection, version_id, part: reader.Part) -> dict | None:
+    """``section_rules`` of the blocks of a part read from a professional version."""
+    if not part.items:
+        return None
+    indexes = [r.block_index for r, _, _ in part.items]
+    return section_rules(sections.sections_of(conn, version_id), min(indexes), max(indexes))
+
+
 def _identified(s: Source, cx) -> str | None:
     """The property an appraisal passage belongs to, or None. A passage in a file of several units belongs to the unit it
     begins in when that is an appraisal (not an appendix or a comparables part) with a title or identifiers; a passage of
@@ -1602,6 +1648,7 @@ def _professional_hit(ws: Workspace, conn: Connection, h: dict, bs, be, sizes: d
         body="\n".join([body, *notes]), block_start=bs, block_end=be, table_index=h.get("table_index"),
         chunk_id=h["chunk_id"], page_list=h["page_list"] or None, tags=tags,
         partial_document=gaps.cites(h["page_list"], h["section"]), source_kind=kind, standard=std,
+        rules=section_rules(secs, bs, be),
         row_index=h.get("row_index") if h["kind"] == "table_row" else None)
     src.label = _label_of(src, None, PROFESSIONAL_POOL, role, ws.intent)
     return src
@@ -1842,11 +1889,13 @@ def _cursor(ws: Workspace, v: reader.Version, target: tuple, pos, within: tuple[
 def _emit(ws: Workspace, v: reader.Version, target: tuple, pos, part: reader.Part, *, name: str, scope: str,
           location: str, section: str | None, lines: list[str], read: bool, more: str | None = None,
           cut: bool = False, unread_pages: list[int] | None = None, cx=None,
-          within: tuple[int, int] | None = None, standard: tuple[str, dict] | None = None) -> Source:
+          within: tuple[int, int] | None = None, standard: tuple[str, dict] | None = None,
+          rules: dict | None = None) -> Source:
     """A part of a window as a source of the turn. Its ``text`` is the part's full text (what the verifier
     checks); what is sent leaves out blocks the turn already returned whole, as a pointer to the source that
     returned them, and marks unread and uncertain regions where they are in reading order with their R#.
-    ``standard``: (kind, identity) of a part of a professional document (``standard_for``), which names the source."""
+    ``standard``: (kind, identity) of a part of a professional document (``standard_for``), which names the source;
+    ``rules``: the limits and wording of the sections it is in (``section_rules``), for the verifier."""
     vid = str(v.version_id)
     sent = ws.sent.setdefault(vid, {})
     content, body, regions, run = [], [], [], []
@@ -1911,7 +1960,7 @@ def _emit(ws: Workspace, v: reader.Version, target: tuple, pos, part: reader.Par
     pages = sorted({r.page for r, _, _ in part.items if r.page})
     identity = {} if standard is None else {
         "title": standard_title(standard[1], v.title), "source_kind": standard[0], "standard": standard[1],
-        "section": section_string(standard[1]), "location": standard_location(standard[1], pages)}
+        "section": section_string(standard[1]), "location": standard_location(standard[1], pages), "rules": rules}
     s = ws.add_source(**{"document_id": v.document_id, "version_id": v.version_id, "title": v.title,
                          "section": section, "location": location or _pages_label(pages), "kind": "context",
                          "text": "\n".join(content), "block_start": min(indexes), "block_end": max(indexes),
@@ -2000,9 +2049,10 @@ def _read_window_once(ws: Workspace, conn: Connection, v: reader.Version, target
         if paths:
             lines.append("סעיפים בעמודים האלה: " + "; ".join(
                 f"{_section_handle(ws, v, p, w)} «{_section_name(p)}»" for p, w in list(paths)[:SECTIONS_LISTED]))
+    std = standard_for(ws, conn, vid, part.items[0][0].block_index)
     s = _emit(ws, v, target, pos, part, name=name, scope=target[0], location=location, section=section,
               lines=lines, read=True, unread_pages=unread_pages if pos is None else None, cx=cx, within=within,
-              standard=standard_for(ws, conn, vid, part.items[0][0].block_index))
+              standard=std, rules=_rules_of_part(conn, vid, part) if std else None)
     if target[0] == "pages":  # a section opened by name is its own opening
         _whole_sections(ws, conn, v, cx, part, s)
     return s
@@ -2052,7 +2102,7 @@ def _read_professional_section(ws: Workspace, conn: Connection, v: reader.Versio
     std = standard_for(ws, conn, vid, part.items[0][0].block_index if part.items else sec.block_first)
     name = called(sec)
     return _emit(ws, v, target, pos, part, name=name, scope="section", location="", section=name, lines=lines,
-                 read=True, standard=std)
+                 read=True, standard=std, rules=section_rules(secs, sec.block_first, sec.block_last) if std else None)
 
 
 def _reference_lines(ws: Workspace, conn: Connection, st, by_no: dict, handle) -> list[str]:
@@ -2294,10 +2344,11 @@ def _read_source(ws: Workspace, conn: Connection, sid: str) -> Source:
     part = reader.Part([(r, r.text or "", True) for r in chosen], None)
     pages = sorted({r.page for r in chosen if r.page})
     section = path[-1] if path else None
+    std = standard_for(ws, conn, v.version_id, start)
     s = _emit(ws, v, ("neighbors", vid, start, end), None, part, name=section or "", scope="neighbors",
               location=_location(section, "text", pages, None, None, (None, None), None), section=section,
               lines=lines, read=False, more=_section_handle(ws, v, path, window(path)) if cut and path else None,
-              cut=cut, cx=cx, standard=standard_for(ws, conn, v.version_id, start))
+              cut=cut, cx=cx, standard=std, rules=_rules_of_part(conn, v.version_id, part) if std else None)
     _whole_sections(ws, conn, v, cx, part, s)
     return s
 

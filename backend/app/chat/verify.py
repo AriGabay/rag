@@ -186,6 +186,8 @@ from app.chat.evidence import select
 from app.chat.request import ID_PREFIX, Aspect, Kind
 from app.config import get_settings
 from app.measurements.extract import stance_label
+from app.platform import source_kinds
+from app.professional.sections import MODALITY_CLASSES
 from app.providers.llm import (
     CallStatus,
     LLMProvider,
@@ -224,8 +226,9 @@ VERIFY_ALLOWANCE_SECONDS = 60  # verification may run this long past the turn's 
 RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures worth one more call
 # The judge contract's version (round 8 KTD7): part of every verdict key, bumped whenever the policy, the schema or what
 # a call renders changes what a verdict means, so a verdict of an older contract is never reused (cached readings are
-# versioned).
-JUDGE_VERSION = 5
+# versioned). 6 (round 10 U9, KTD14): the evidence header of a standard carries its kind, limits and wording, and the policy
+# the rules that need them.
+JUDGE_VERSION = 6
 # an uncited factual unit is judged against the sources the turn already read (round 8 KTD3, R2): the sources of the
 # turn whose text holds its numbers or content words are shown beside it as candidates, bounded so the call stays
 # within ``JUDGE_CALL_CHARS``. How many candidates a unit gets, how many characters one candidate may show, and how
@@ -332,7 +335,17 @@ JUDGE_POLICY = (
     "הוא אינו טענה, אינו נכלל באף span ואינו עילה ל-verdict, לא לטובה ולא לרעה — שפוט את שאר היחידה כאילו היה חסר. "
     "(21) <unstated unit=\"N\">…</unstated> לפני יחידה מונה מספרים שהשרת בדק ומצא שאינם מופיעים באף מקור שהיחידה "
     "מצטטת. טענה שמכילה מספר כזה היא unsupported (failure absent_from_source) אלא אם מקור מוצג מציין אותו; החזר "
-    "claims כך שהטענה עם המספר הזה היא span משלה, והטענות האחרות של היחידה נשפטות בנפרד."
+    "claims כך שהטענה עם המספר הזה היא span משלה, והטענות האחרות של היחידה נשפטות בנפרד. "
+    "(22) מקורות מקצועיים: מקור שכותרתו אומרת \"סוג המקור: תקן\" או \"מסמך מקצועי\" אינו שומה ואינו מקור לנתון של נכס "
+    "מסוים. הכותרת שלו מציינת את מהדורת התקן ואת תחילת תוקפו (או שהם לא צוינו), את \"תנאים וחריגים\" שמגבילים את "
+    "ההוראה בסעיף שלה ואת \"ניסוח הסעיף\" (חובה, המלצה, דוגמה, חלופה, חריג). (23) כלל מקצועי שהיחידה מציגה רחב "
+    "מגבולותיו — בלי תנאי או חריג שהכותרת מציגה לאותה הוראה (\"למעט\", \"אלא אם\", \"בכפוף ל\", \"בתנאי ש\") — "
+    "unsupported. (24) המלצה, דוגמה, חלופה או חריג שהיחידה מציגה כדרישה מחייבת (\"חובה\", \"יש ל\", \"נדרש\", \"על "
+    "השמאי\") — unsupported; סעיף שניסוחו אינו כולל ניסוח חובה אינו תומך בדרישה מחייבת. (25) בחירה של שומה מסוימת "
+    "(מקדם, שיעור, הנחה או שיטה של נכס מסוים) שהיחידה מציגה ככלל מקצועי כללי — unsupported. (26) טענה ששומה אינה "
+    "עומדת בתקן או סותרת אותו נתמכת רק כשהראיה מציגה גם את השומה וגם את מהדורת התקן, ומראה שהתקן חל על מועד השומה "
+    "ועל מטרתה; בלי זה — unsupported. (27) תיאור של שיטה או נוסחה בתקן אינו מאמת את ערכי הקלט של חישוב: ערך של נכס "
+    "(שטח, שווי, שיעור) נתמך רק בשומה של אותו נכס, ומספר שמופיע רק בתקן (בדוגמה או בתיאור) אינו תומך בו."
 )
 
 
@@ -2113,6 +2126,39 @@ def _joined(markdown: str, first: Unit, second: Unit) -> Unit:
                 first.start, second.end, False, None, "")
 
 
+_KIND_NAMES = {source_kinds.STANDARD: "תקן", source_kinds.PROFESSIONAL: "מסמך מקצועי"}
+_WORDING = {"requirement": "ניסוח חובה", "recommendation": "ניסוח המלצה", "example": "ניסוח דוגמה",
+            "alternative": "ניסוח חלופה או רשות", "exception": "ניסוח חריג"}
+RULES_NO_LIMITS = "לא זוהו בסעיף תנאים או חריגים"
+
+
+def _wording_text(modality: dict) -> str:
+    """The wording of a section in words, never in counts (a count is a number the number check would read as stated by
+    the source): which kinds of wording it holds, and — when it holds no requirement wording — that it does not."""
+    present = [_WORDING[c] for c in MODALITY_CLASSES if modality.get(c)]
+    if not present:
+        return "ניסוח הסעיף: לא זוהה בו ניסוח של חובה, המלצה, דוגמה, חלופה או חריג"
+    return "ניסוח הסעיף: " + ", ".join(present) + ("" if modality.get("requirement") else "; אין בו ניסוח חובה")
+
+
+def _professional_head(src) -> str:
+    """What the judge is told of a standard or another professional document beside its title and location (round 10 U9,
+    KTD14): its kind (never a property's source), for a standard whether it states its edition and its date, the
+    conditions and exceptions that bind the provision of the passage's section, and the section's wording."""
+    parts = [f"סוג המקור: {_KIND_NAMES.get(src.source_kind, src.source_kind)} — אינו שומה ואינו מקור לנתון של נכס"]
+    std = src.standard or {}
+    if src.source_kind == source_kinds.STANDARD:
+        parts += [f"{label}: לא צוינה במסמך" for key, label in (("edition", "מהדורה"), ("effective", "תחילת תוקף"))
+                  if not std.get(key)]
+    rules = src.rules
+    if rules:
+        limits = rules.get("limits") or []
+        parts.append("תנאים וחריגים בסעיף: " + "; ".join(f"«{x}»" for x in limits)
+                     + (f"; ועוד {rules['more']} שלא הוצגו" if rules.get("more") else "") if limits else RULES_NO_LIMITS)
+        parts.append(_wording_text(rules.get("modality") or {}))
+    return " | ".join(parts)
+
+
 def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
     """(heading, body, kind) of a cited id: a passage's title and location and its text; a measurement or a
     computation as one short statement of its meaning."""
@@ -2125,6 +2171,8 @@ def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
             head += f" — {src.context}"
         elif src.subject:
             head += f" — זיהוי מתוך המסמך: {src.subject}"
+        if src.source_kind != source_kinds.APPRAISAL:  # an appraisal's header stays what it was
+            head += " — " + _professional_head(src)
         return head, src.text, src.kind
     if sid in ws.measurements:
         m = ws.measurements[sid].public()
@@ -2708,6 +2756,10 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
         if misattributed:
             problems.append(Problem(u, misattributed, failure_kind="wrong_subject", check="misattribution"))
             continue
+        from_standard = _datum_from_standard(u, ws)
+        if from_standard:
+            problems.append(Problem(u, from_standard, failure_kind="wrong_subject", check="property_datum_from_standard"))
+            continue
         elsewhere = _wrong_context(u, ws, question)
         if elsewhere:
             problems.append(Problem(u, elsewhere, failure_kind="wrong_subject", check="context"))
@@ -2779,12 +2831,14 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
     (``_wrong_scale``). ``stated_by``: the numbers each cited id states, kept across one verification's units.
     ``extra_text``: more text of a cited source (the context a re-read expanded it with), whose numbers it states too."""
     cited: set[str] = set(numbers_in(extra_text, words=True)) if extra_text else set()
+    by_id: dict[str, set[str]] = {}
     for i, t in _texts(ws, u.ids):
         found = stated_by.get(i) if stated_by is not None else None
         if found is None:
             found = numbers_in(t, words=True)
             if stated_by is not None:
                 stated_by[i] = found
+        by_id[i] = found
         cited |= found
     computations = [ws.computations[i] for i in u.ids if i in ws.computations]
     for c in computations:
@@ -2803,7 +2857,9 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
         restated = _restated(u.text, pool, {v.value * v.scale for v in values if v.scale != 1})
         missing = [n for n in missing if n not in restated]
     wrong = _wrong_scale(u, ws, values, computations if held else list(ws.computations.values()))
-    return missing + [n for n in wrong if n not in missing]
+    # a datum of the property that only the cited standard states, beside evidence that is not one (R34)
+    only = _standard_only(u, ws, by_id, question_numbers) if held and any(_professional(ws, i) for i in by_id) else []
+    return missing + [n for n in [*wrong, *only] if n not in missing]
 
 
 def _wrong_scale(u: Unit, ws: Workspace, values: list, computations: list) -> list[str]:
@@ -2924,6 +2980,105 @@ def _misattributed(u: Unit, ws: Workspace) -> str | None:
     return None
 
 
+# --- a datum of the property cited to a standard (round 10 U9, KTD14, R34) -------------------------------------------------
+# A standard supports a professional rule, never a datum of a property. A number is a datum of the property when it has a
+# money or area unit, or follows a measurement kind, in a sentence that is about the property: it names the property
+# (the request's subject, the unit the conversation is in, a unit label) or refers to it by a pronoun bound to it. A
+# sentence that gives the number to the standard — "לפי סעיף 4", "התקן קובע", a worked example — states what the
+# standard says, and the judge decides it.
+_DATUM_UNIT = re.compile(r"\s*(?:₪|ש[\"״']?ח|שקל|מיליון|אלף|מ[\"״']?ר|מטר|דונם|%|אחוז)")
+_DATUM_BEFORE = re.compile(r"₪\s*$")
+_MEASURE_KIND = re.compile(r"(?<![א-ת])[ובהלמש]{0,2}(?:שווי|מחיר|שכירות|שכר\s+דירה|שטח|תשואה|דמי\s+ניהול|היטל|ארנונה)"
+                           r"(?![א-ת])")
+_PROPERTY_PRONOUN = re.compile(r"(?<![א-ת])(?:[ובלמשכ]{0,2}ה|[וש]?[בל])(?:נכס|דירה)(?![א-ת])|(?<![א-ת])שם(?![א-ת])")
+_UNIT_LABEL = re.compile(r"(?<![א-ת])[ובהלמש]{0,2}(?:דירה|יחידה|חנות|חלקה|תת[\-־]?חלקה|גוש)\s+\d")
+_STANDARD_SAID = re.compile(
+    r"(?<![א-ת])(?:[ובלשכ]{0,2}ה?תקן|[ובלמשכ]{0,2}ה?סעיף|סעיפים|[ובלמשכ]{0,2}ה?נספח|לדוגמה|דוגמה|דוגמת|דוגמא|למשל)"
+    r"(?![א-ת])")
+_GENERIC_NAME = frozenset("רחוב שדרות שכונת שכונה דירה שומה נכס הנכס בית מגרש עיר תל".split())
+_NAME_WORD = re.compile(r"[א-ת]{3,}|\d+")
+
+
+def _property_names(ws: Workspace) -> list[str]:
+    """How the turn names the property: the subjects of the request's components, the unit the conversation is in and
+    the unit the turn located, with the title of that unit's document."""
+    from app.chat.tools import asked_subjects
+
+    subjects, from_components = asked_subjects(ws)
+    names = list(subjects) if from_components else []
+    focus, located = getattr(ws, "unit_focus", None), getattr(ws, "located_unit", None)
+    if focus and focus.get("display"):
+        names.append(focus["display"])
+        names += [src.title for src in ws.sources.values()
+                  if src.source_kind == source_kinds.APPRAISAL and str(src.document_id) == str(focus.get("document_id"))]
+    if located and (located.get("anchor") or {}).get("display"):
+        names.append(located["anchor"]["display"])
+    return names
+
+
+def _names_property(sentence: str, names: list[str]) -> bool:
+    """Whether the sentence names the property: two of the distinctive words of a name (one, when it has one), each as a
+    word of the sentence, with a prefix letter at most."""
+    for name in names:
+        words = [w for w in dict.fromkeys(_NAME_WORD.findall(name)) if w not in _GENERIC_NAME]
+        found = [w for w in words if re.search(rf"(?<![א-ת\d])[ובהכלמש]{{0,3}}{re.escape(w)}(?![א-ת\d])", sentence)]
+        if words and len(found) >= min(2, len(words)):
+            return True
+    return False
+
+
+def property_data(u: Unit, ws: Workspace) -> list[str]:
+    """The numbers of a unit (as written) that are a datum of the property: a number with a money or area unit, or after a
+    measurement kind, in a sentence about the property that does not give the number to a standard, a section or a worked
+    example. Empty for any other unit."""
+    text = u.text
+    if _STANDARD_SAID.search(text):
+        return []
+    if not (_PROPERTY_PRONOUN.search(text) or _UNIT_LABEL.search(text) or _names_property(text, _property_names(ws))):
+        return []
+    out = []
+    for n in _shown(text):
+        before = text[max(0, n.start - 30):n.start]
+        if _DATUM_UNIT.match(text, n.end) or _DATUM_BEFORE.search(before) or _MEASURE_KIND.search(before):
+            out.append(n.written)
+    return out
+
+
+def _professional(ws: Workspace, sid: str) -> bool:
+    """Whether ``sid`` is a standard or another professional document's passage (never an appraisal, a measurement, a
+    value, an assumption or a calculation)."""
+    src = ws.sources.get(sid)
+    return src is not None and src.source_kind != source_kinds.APPRAISAL
+
+
+def _datum_from_standard(u: Unit, ws: Workspace) -> str | None:
+    """A unit that states a datum of the property and cites only standards or professional documents (R34): nothing in
+    them is the property's, so it is unsupported whatever number they state. The reason, or None."""
+    if not u.ids or not all(_professional(ws, i) for i in u.ids):
+        return None
+    data = property_data(u, ws)
+    if not data:
+        return None
+    return (f"{', '.join(data[:3])} הוא נתון של הנכס, והתשובה מסתמכת עליו רק על תקן או על מסמך מקצועי, שאינם מקור "
+            "לנתון של נכס: נתון של נכס נלקח מהשומה שלו. ייחס את המספר לתקן (כדרישה או כדוגמה שלו), או צטט את השומה")
+
+
+def _standard_only(u: Unit, ws: Workspace, by_id: dict[str, set[str]], question_numbers: set[str]) -> list[str]:
+    """In a unit that cites a standard beside an appraisal or another evidence, the numbers of its property data that only
+    the standard states (a worked example's figures): a standard describing a method verifies no input of a calculation
+    (R34), so those are not stated for the property."""
+    standard = {i for i in by_id if _professional(ws, i)}
+    if not standard or len(standard) == len(by_id):
+        return []
+    outside: set[str] = set().union(*(by_id[i] for i in by_id if i not in standard))
+    missing: list[str] = []
+    for written in property_data(u, ws):
+        numbers = numbers_in(written)
+        if numbers and not numbers & outside and not numbers & question_numbers:
+            missing += sorted(numbers - set(missing))
+    return missing
+
+
 def _evidence_contexts(u: Unit, ws: Workspace) -> list[tuple[str, set[int], str, str]]:
     """What a unit's numbers rest on, by appraisal context (KTD7): ``(version id, its contexts, what, id)`` for each cited
     value or measurement whose number the unit shows, each cited source of one context that writes a number the unit
@@ -2969,6 +3124,10 @@ def _wrong_context(u: Unit, ws: Workspace, question: str) -> str | None:
     from app.chat.tools import asked_subjects, located_contexts
 
     if not contexts.enforced():
+        return None
+    # a professional question is not about the property of a file: an appraisal read there is one property's example, and
+    # a supported sentence of a general answer is never removed because no appraisal was located (round 10 U9, R35)
+    if getattr(ws, "intent", None) == "professional":
         return None
     subjects, from_components = asked_subjects(ws)
     for version, numbers, what, i in _evidence_contexts(u, ws):
