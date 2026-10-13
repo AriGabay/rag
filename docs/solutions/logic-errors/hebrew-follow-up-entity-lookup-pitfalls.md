@@ -1,6 +1,7 @@
 ---
 title: Finding the property a Hebrew follow-up names - numbers, prefixes and the resolver's own quotes
 date: 2026-10-07
+last_updated: 2026-10-14
 category: logic-errors
 module: backend chat follow-up resolution (app/chat/entities.py, app/chat/resolve.py)
 problem_type: logic_error
@@ -11,10 +12,11 @@ symptoms:
   - "A follow-up with a pronoun or generic word (\"בזה\", \"שלה\") lands on another report or asks a needless clarification"
   - "A floor, year or duration number in a follow-up switches the conversation to another property"
   - "After a clarification reply, the previous property's unit or address stays in the request"
+  - "A general professional question in an existing conversation gets a list of properties to choose from, because a word of it (\"השומה\") appears in document titles"
 root_cause: logic_error
 resolution_type: code_fix
 severity: high
-tags: [hebrew, entity-resolution, follow-up, house-number, prefix-stripping, clarification, rag, chat]
+tags: [hebrew, entity-resolution, follow-up, house-number, prefix-stripping, clarification, question-intent, rag, chat]
 ---
 
 # Finding the property a Hebrew follow-up names - numbers, prefixes and the resolver's own quotes
@@ -50,14 +52,45 @@ In `backend/app/chat/entities.py` and `backend/app/chat/resolve.py`:
   (`identifying(..., bare_numbers=False)`). A floor, a year or a duration names no property.
 - **Relaxation:** when the whole query matches nothing, try the identifying words, then **address pairs only**
   (`identifying(..., pairs_only=True)`: a title word with the number beside it, or a Latin label).
-- **The resolver's quotes:**
-  - the model's words for a new subject trigger a lookup only when they hold a word that can name a document,
-    when the user corrects the property, or when a new question names an address;
-  - otherwise the follow-up stays on the focus;
-  - when the model quoted only a generic word, the user's own title words that the focus lacks join the query.
+- **The resolver's quotes:** since round 10 the model's words for a new subject trigger a lookup only when they hold
+  hard evidence (see the intent gate below). A correction that names a place without evidence releases the old
+  property instead of keeping it silently; a pronoun or a word of the trade keeps the focus.
 - **Same documents:** a lookup that lands on the focus documents is no entity change, so the context stays.
 - **Clarification replies:** a reply resolved among the offered documents makes the chosen document's title the
   subject.
+
+### The intent gate (round 10)
+The fallback that looked up "the user's own title words that the focus lacks" was still the open class: a general
+question ("מה הן שלושת גישות השומה הבסיסיות ?") after two other questions made "השומה" the query, three appraisals
+whose titles hold "שומה" were offered, and the server asked which property was meant. A first message did not fail,
+because only the first-message path filtered `GENERIC_NAME_WORDS`. Rounds 4, 7 and 9 had each patched one word.
+
+The fix does not make the identifying-word test smarter; it gates every lookup behind a question intent the server
+validates (`backend/app/chat/intent.py`), carried by both parse paths — `resolve` for a follow-up, the request
+analysis for a first message:
+- `professional` looks nothing up and inherits no document, unit or measure; the property stays dormant in the
+  conversation's slots (`backend/app/chat/slots.py`) for a later "בנכס הזה".
+- `property`, `document`, `mixed` look up only on **hard evidence** (`intent.evidence`): an address (a title word with
+  its house number), a block and parcel pair, a Latin unit label, a complete name stated as a phrase, or a phrase of
+  two or more words that at most three names hold ("מתחם הגפן" of "מתחם הגפן א" and "ב" — without it round 9's
+  clarification between two units regressed into the model picking one). A single word titles share never counts; a
+  number after "תקן" or "סעיף" is never a house number; a failed parse with no evidence runs no lookup.
+- A first message's pin from passages is provisional until the request analysis settles the intent (bounded by
+  `chat_intent_wait_seconds`); a professional or late intent drops it.
+
+Five traps showed only on the real model, never in the scripted suites:
+1. With no standards uploaded, a professional search that read only professional documents refused to answer from
+   a glossary stored as an appraisal: the office's other documents must answer, labelled by their kind.
+2. The model names `pool="professional"` itself; a named but empty pool must still read the other permitted pool.
+3. The model enumerates in prose or inside one bold span, so "השנייה" needs items taken from bold terms, split at
+   commas and the conjunction "ו" (`slots.extract_items`).
+4. A listing the model read but did not show (`find_standards`) is no second list an ordinal may name.
+5. The partial-name evidence above.
+
+A document whose kind an admin changes keeps its stored derivations; every surface that reads records through
+`documents d` — chat vocabularies, statistics, coverage, review queues, the gazetteer — filters
+`APPRAISALS_SQL` (`backend/app/platform/source_kinds.py`). The first pass missed the statistics and queue surfaces;
+the code review found them.
 
 ## Why This Works
 The failures share one cause. The lookup treated the parse and the tokenizer as reliable signals of *which*
@@ -73,6 +106,12 @@ can actually name a document.
 - Before trusting a new lookup rule, run the follow-up regression set against the real model twice; read
   `message_diagnostics.resolution` (the raw parse, the server's decisions, the lookup) for every failure.
 
+- A new lookup trigger needs an intent and hard evidence, never a word list: test the same professional question
+  as a first message and after rent, value, property and calculation turns
+  (`backend/tests/integration/test_round10_sequences.py`), and run the reported sequence on the real model three
+  times (`backend/tests/integration/test_round10_real_model.py`).
+
 ## Related Issues
 - `docs/solutions/workflow-issues/real-model-before-after-eval-on-the-local-stack.md`
 - Plan: `docs/plans/2026-10-07-1643-fix-chat-request-context-plan.md` (KTD1, KTD2)
+- Plan: `docs/plans/2026-10-13-1906-feat-professional-sources-intent-context-plan.md` (KTD1–KTD7, KTD12)
