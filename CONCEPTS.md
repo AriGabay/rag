@@ -40,6 +40,14 @@ How a conversation orders data that changes over time. With the switch "העדף
 
 The date a datum refers to: the valuation date of the appraisal whose own conclusion it is, a date stated in the datum's own row, cell or sentence, or a range stated by its table. A report's writing date, the upload date and the processing date never date a datum. A date the sources do not give stays unknown, and a forecast is never treated as measured. Only data of the same property, metric, unit, periodicity, area basis, VAT basis and scenario form one timeline.
 
+### Property identity
+
+Which appraisals are of one property. Two appraisal units are linked only by proving evidence from their own identification text: a shared block and parcel with a compatible sub-parcel, or the same street, house number and city. Each link keeps its reason. A street and number without a city never links by itself; such an appraisal is an unlinked candidate.
+
+### Time coverage
+
+The record of which appraisals of a property a time answer checked: searched with a match, searched without one, not searched and why, undated, and unlinked candidates. When coverage is partial, the answer calls its datum the latest in the sources checked, never the latest in the repository.
+
 ## Documents
 
 ### Reading status
