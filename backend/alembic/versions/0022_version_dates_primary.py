@@ -6,7 +6,7 @@ and the unit's status is ``stated`` (``chat.dates``). The flag is stored with ea
 at read time from the stored rows, as the unit assignment already is.
 
 The column is added ``NOT NULL DEFAULT false``, so every row that exists now reads as not primary. Those rows belong to
-``dates-v1`` and ``dates-v2``, which the code keeps but never reads (``DATES_VERSION`` is ``dates-v3``); the dates are
+older ``DATES_VERSION`` values, which the code keeps but never reads (the current one is ``dates-v4``); the dates are
 derived again on first use, so no stored value is rewritten and none is lost.
 
 The revision is additive. Downgrade drops the column and nothing else.

@@ -288,17 +288,17 @@ def test_a_marker_row_stops_the_derivation_of_a_version_with_no_dates(office):
 def test_a_new_dates_version_derives_again_and_a_current_one_never_does(office, monkeypatch):
     _, ver = single(office, [HEADER, "המועד הקובע: 15/04/2024"])
     read(office, ver)
-    monkeypatch.setattr(D, "DATES_VERSION", "dates-v4")
+    monkeypatch.setattr(D, "DATES_VERSION", "dates-v5")
     assert len(read(office, ver)[UUID(ver)]) == 1
-    assert sorted(r.dates_version for r in rows(office, ver)) == ["dates-v3", "dates-v4"]  # the old rows are kept
+    assert sorted(r.dates_version for r in rows(office, ver)) == ["dates-v4", "dates-v5"]  # the old rows are kept
     with tenant_tx(office.system) as conn:
         again = inserts(conn)
         D.valuation_dates(conn, [ver])
         assert again == []
 
 
-def test_the_current_dates_version_is_v3(office):
-    assert D.DATES_VERSION == "dates-v3"
+def test_the_current_dates_version_is_v4(office):
+    assert D.DATES_VERSION == "dates-v4"
 
 
 def old_row(office, doc, version, dates_version: str, iso: str | None, block: int = 1) -> None:
@@ -316,7 +316,7 @@ def test_a_version_with_only_dates_v1_rows_derives_the_current_dates_on_first_re
     old_row(office, doc, ver, "dates-v1", None, D.MARKER_BLOCK)   # what v1 stored: it found nothing in this file
     got = read(office, ver)[UUID(ver)]
     assert [(d.iso, d.block_index) for d in got] == [("2024-02-28", 1)]
-    assert sorted((r.dates_version, r.iso) for r in rows(office, ver)) == [("dates-v1", None), ("dates-v3", "2024-02-28")]
+    assert sorted((r.dates_version, r.iso) for r in rows(office, ver)) == [("dates-v1", None), ("dates-v4", "2024-02-28")]
     with tenant_tx(office.system) as conn:   # the next read is served from the v2 rows, with no new write
         later = inserts(conn)
         assert [d.iso for d in D.valuation_dates(conn, [ver])[UUID(ver)]] == ["2024-02-28"]
@@ -327,7 +327,7 @@ def test_a_v1_row_is_never_read_as_a_date_of_the_current_version(office):
     doc, ver = single(office, [HEADER, "שווי 2,450,000 ₪"])
     old_row(office, doc, ver, "dates-v1", "2019-01-01")
     assert read(office, ver)[UUID(ver)] == ()
-    assert sorted((r.dates_version, r.iso) for r in rows(office, ver)) == [("dates-v1", "2019-01-01"), ("dates-v3", None)]
+    assert sorted((r.dates_version, r.iso) for r in rows(office, ver)) == [("dates-v1", "2019-01-01"), ("dates-v4", None)]
 
 
 def test_a_read_only_transaction_over_a_v1_only_version_still_gets_the_v2_dates_and_writes_nothing(office):
@@ -484,3 +484,22 @@ def test_an_empty_header_table_with_the_label_in_its_first_row_is_read_from_the_
     doc, ver = single(office, [HEADER, "|תוכנית | מועד קובע\n251-0479345 | 7.11.2020", "שווי 2,450,000 ₪"])
     as_table(office, doc, ver, 1, [], ["תוכנית", "מועד קובע"], ["251-0479345", "7.11.2020"])
     assert [(d.iso, d.block_index) for d in read(office, ver)[UUID(ver)]] == [("2020-11-07", 1)]
+
+
+def test_a_stored_dates_v3_row_is_never_read_and_the_current_version_derives_again(office):
+    """Round 12 U3b follow-up: v3 rows were derived without the restated-label and bullet readings."""
+    doc, ver = single(office, [HEADER, "\uf0b7 המועד הקובע לשומה – 31.12.2023."])
+    old_row(office, doc, ver, "dates-v3", "2019-01-01")
+    got = read(office, ver)[UUID(ver)]
+    assert [(d.iso, d.primary) for d in got] == [("2023-12-31", True)]
+    assert sorted((r.dates_version, r.iso) for r in rows(office, ver)) == [("dates-v3", "2019-01-01"),
+                                                                           (D.DATES_VERSION, "2023-12-31")]
+
+
+def test_a_restated_lead_label_and_a_bulleted_label_are_stored_primary(office):
+    _, ver = single(office, [
+        HEADER, "2. המועד הקובע לשומה: המועד הקובע לשומה הינו מועד הביקור בנכס 01/07/2020.",
+        "הערך נכון למועד הקובע – 30.12.2023 בלבד.", "8.1 עסקאות בנכס הנישום הסמוכות למועד הקובע : מכירה מיום 08.11.2018"])
+    got = read(office, ver)[UUID(ver)]
+    assert [(d.iso, d.primary, d.status) for d in got] == [("2020-07-01", True, "stated"), ("2023-12-30", False, "stated")]
+    assert primary_rows(office, ver) == [(1, "2020-07-01", True), (2, "2023-12-30", False)]

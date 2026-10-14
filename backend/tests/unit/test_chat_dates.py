@@ -882,3 +882,58 @@ def test_shape10_headers_that_are_present_keep_the_round_12_reading():
     tables = {0: table(["מועד קובע", "תוכנית"], ["7.11.2020", "251-0479345"])}
     assert found([block(5, "מועד קובע | תוכנית\n7.11.2020 | 251-0479345", "table", table_index=0)], tables) == [
         (5, "2020-11-07", "day")]
+
+
+# --- dates-v4 (round 12 U3b follow-up: A relational prefix forms, B restated lead label, C bullet glyphs) ------------
+
+@pytest.mark.parametrize("text", [
+    "8.1 עסקאות בנכס הנישום הסמוכות למועד הקובע : בהתאם לנסח הרישום מכירה מיום 08.11.2018",
+    "עסקאות שהסמוכות למועד הקובע 08.11.2018 נבדקו",
+    "העסקאות והסמוכות למועד הקובע 08.11.2018 נבדקו",
+    "העסקאות בסמוך למועד הקובע 08.11.2018 נבדקו",
+    "מחירים שפורסמו מלפני המועד הקובע 08.11.2018 נבדקו",
+    "מחירים עד למועד הקובע 08.11.2018 נבדקו",
+    "מחירים טרם המועד הקובע 08.11.2018 נבדקו",
+    "מחירים לפני המועד הקובע 08.11.2018 נבדקו",
+    "מחירים ולאחר המועד הקובע 08.11.2018 נבדקו",
+])
+def test_a_relational_word_with_its_own_prefix_or_the_labels_attached_prefix_takes_no_date(text):
+    assert found([block(0, text)]) == []
+
+
+def test_a_relational_label_in_a_listed_item_takes_no_date_from_the_next_block_either():
+    blocks = [block(0, "8.1 עסקאות בנכס הנישום הסמוכות למועד הקובע :"), block(1, "08.11.2018 – מכירה בבניין סמוך")]
+    assert found(blocks) == []
+
+
+def test_b_a_label_led_block_whose_first_label_took_no_date_restates_it_and_the_restated_label_is_primary():
+    text = "2. המועד הקובע לשומה: המועד הקובע לשומה הינו מועד הביקור בנכס 01/07/2020."
+    assert primary_of([block(0, text)]) == [(0, "2020-07-01", True)]
+
+
+def test_b_a_restated_label_outside_the_lead_sentence_or_after_a_dated_lead_is_not_primary():
+    later = "2. המועד הקובע לשומה: נקבע בהמשך. נערך ביקור. המועד הקובע לשומה הינו 01/07/2020."
+    assert primary_of([block(0, later)]) == [(0, "2020-07-01", False)]
+    dated = "2. המועד הקובע לשומה: 01/07/2020, כלומר המועד הקובע לשומה הינו 01/07/2020."
+    assert primary_of([block(0, dated)]) == [(0, "2020-07-01", True)]
+
+
+@pytest.mark.parametrize("lead", [" ", "  ", "• ", "- ", "* ", "– ", "·  "])
+def test_c_a_bullet_glyph_before_the_label_counts_like_an_enumeration(lead):
+    assert primary_of([block(0, lead + "המועד הקובע לשומה – 31.12.2023.")]) == [(0, "2023-12-31", True)]
+
+
+def test_c_a_bullet_then_an_enumeration_is_still_a_lead():
+    assert primary_of([block(0, " 2. המועד הקובע: 31.12.2023")]) == [(0, "2023-12-31", True)]
+
+
+def test_c_the_bulleted_primary_date_settles_the_unit_and_a_passing_mention_stays_a_reference():
+    found_ = D.derive([block(3, " המועד הקובע לשומה – 31.12.2023."),
+                       block(40, "הערך נכון למועד הקובע – 30.12.2023 בלבד.", section_path=("9. הערות",))])
+    uv = D.resolve_unit(D.assign(found_, ()), 0)
+    assert (uv.status, uv.date.iso) == ("stated", "2023-12-31")
+    assert sorted(d.iso for d in uv.dates) == ["2023-12-30", "2023-12-31"]
+
+
+def test_c_a_references_lead_behind_a_bullet_is_history():
+    assert D.is_history(" סימוכין: שומה מס' 7 (מועד קובע 26.05.2021)", ()) is True

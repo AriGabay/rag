@@ -80,7 +80,7 @@ from app.professional.sections import flight, landed
 
 logger = logging.getLogger(__name__)
 
-DATES_VERSION = "dates-v3"
+DATES_VERSION = "dates-v4"
 MARKER_BLOCK = -1       # the block index of the row that records "derived, none found"
 DOCUMENT_SCOPE = 0      # the unit number of a version that has no units: the document is the scope
 
@@ -269,7 +269,10 @@ _HISTORY_CUE = re.compile(
 _HISTORY_CUE_MORE = re.compile(
     r"שומ(?:ה|ת|ות)(?:\s+מקרקעין)?(?:\s+מקיפה)?\s+שנערכ(?:ה|ו)(?![א-ת])|(?<![א-ת])ה?רכיש(?:ה|ת)(?![א-ת])")
 _REFERENCES = r"סימוכין(?![א-ת])"
-_ENUMERATION = r"\s*(?:\(?(?:\d+(?:\.\d+)*|[א-ת])[.)]\s*)?"   # "2.", "2.1.", "(2)", "א." before a block's first word
+# what leads a block before its first word: a bullet glyph (a private-use bullet of a Word list, "•", "-", "*", "–") and/or
+# an enumeration ("2.", "2.1.", "(2)", "א.") (round 12 U3b)
+_ENUMERATION = (r"[\s\u00a0]*(?:[\uf000-\uf8ff•●▪◦·*\-–—]+[\s\u00a0]*)?"
+                r"(?:\(?(?:\d+(?:\.\d+)*|[א-ת])[.)][\s\u00a0]*)?")
 _REFERENCES_LEAD = re.compile(_ENUMERATION + _REFERENCES)
 _VALUED = re.compile(r"(?<![א-ת])ו?הוער(?:ך|כה|כו)(?![א-ת])")
 _PAST_CUE = re.compile(r"(?<![א-ת])(?:בעבר|קודם|קודמת|קודמות)(?![א-ת])")
@@ -310,7 +313,8 @@ def _sentence(body: str, start: int, end: int) -> str:
 
 # a label right after one of these words refers to the valuation date ("הסמוכות למועד הקובע", "טרם המועד הקובע"); it
 # never states it
-_RELATIONAL_TAIL = re.compile(r"(?<![א-ת])(?:ה?סמוכ(?:ה|ות|ים)|ה?סמוך|טרם|לפני|לאחר|מאז|עד)[\s(]*$")
+_RELATIONAL_TAIL = re.compile(
+    r"(?<![א-ת])[ושמבכל]{0,2}(?:ה?סמוכ(?:ה|ות|ים)|ה?סמוך|טרם|לפני|לאחר|מאז|עד)[\s\u00a0(]*$")
 _ENUMERATION_RE = re.compile(_ENUMERATION)
 
 
@@ -442,11 +446,18 @@ def derive(blocks: Iterable, tables: Mapping[int, Mapping] | None = None) -> lis
         report = {p.span for p in report_dates(body)}
         # (the date, its sentence's bounds, the text history is judged on, primary) of each label read in this block
         read: list[tuple[Parsed, tuple[int, int], str, bool]] = []
+        lead_sentence: tuple[int, int] | None = None   # the lead sentence of a label-led block whose lead took no date
         for m in labels:
             if _is_relational(body, m.start()):
                 continue
-            primary = section_primary or _begins_with(body, m.start())
+            leads = _begins_with(body, m.start())
+            # a label-led block that restates the label in its lead sentence ("2. המועד הקובע לשומה: המועד הקובע לשומה הינו
+            # ... 01/07/2020"): the restated label is the statement, so it is primary too
+            primary = (section_primary or leads
+                       or (lead_sentence is not None and lead_sentence[0] <= m.start() < lead_sentence[1]))
             p, only_gap = _date_after(body, m.end())
+            if leads and p is None and _date_before(body, m.start()) is None and not only_gap:
+                lead_sentence = _sentence_bounds(body, m.start(), m.end())
             if p is not None:
                 if p.span not in report:
                     read.append((p, _sentence_bounds(body, m.start(), p.span[1]), _sentence(body, m.start(), p.span[1]),
