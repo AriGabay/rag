@@ -21,7 +21,7 @@ import json
 import random
 import zipfile
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any
@@ -5772,6 +5772,8 @@ def render_round10_docx(blocks: list[Round10Block], title: str, mark: str = ROUN
             heading(text, 0)
         elif kind in ("h1", "h2"):
             heading(text, int(kind[1]))
+        elif kind == "pagebreak":
+            doc.add_page_break()
         elif kind == "table":
             table = doc.add_table(rows=len(text), cols=len(text[0]))
             table.style = "Table Grid"
@@ -6020,11 +6022,554 @@ def write_round11(out: Path) -> None:
     print(f"wrote {ROUND11_DIR}/{ROUND11_MANIFEST} ({len(text_):,} chars)")
 
 
+# --------------------------------------------------------------------------- round 12 (time-ranking reliability: property
+# identity, appraisal inventory and coverage, attribute provenance, dates-v2 and pairwise conflicts; plan
+# docs/plans/2026-10-14-1839-fix-time-ranking-reliability-plan.md, U1)
+#
+# All DOCX, rendered by ``render_round10_docx`` with the round-12 mark. Round-11 files and manifest stay as they are (v15-era
+# regression). Every name, street, city, block, parcel and amount is invented; the two cities are "עיר-סינתטית" and
+# "עיר-סינתטית-ב". Every fact below is stated once, in a unit spec, and both the document text and the manifest are derived
+# from it (never read back from the files). The relation of two units (KTD4) is computed here by ``round12_relation`` and
+# checked against the relations the design expects (``ROUND12_EXPECTED_RELATIONS``), so a spec that drifts fails the run.
+#
+# A *document* is a file; a *unit* is one appraisal inside it (one for an ordinary file, six for a compendium). The manifest
+# numbers units from 1 in reading order among the appraisal units; a compendium's cover (index table) is front matter that
+# the reader may count as a unit of its own (``front_matter_units``). A DOCX has no pages: with the round-11 reader a
+# compendium file derives as one unsplit unit (``units.derive``) and one context (``contexts.derive``), so the manifest's
+# units are the authored ones (found in the file by their ``title`` line), not what the reader derives today.
+
+ROUND12_DIR = "round12"
+ROUND12_MANIFEST = "manifest.json"
+ROUND12_MARK = "מסמך בדיקה סינתטי (סבב 12) — נתונים בדויים לבדיקת המערכת בלבד"
+ROUND12_CITY_A = ROUND10_PLACE
+ROUND12_CITY_B = f"{ROUND10_PLACE}-ב"
+_ROUND12_KTD11 = "KTD11"
+
+
+def _r12_text(iso: str) -> str:
+    """ISO date as a report writes it: day/month/year."""
+    y, m, d = iso.split("-")
+    return f"{d}/{m}/{y}"
+
+
+def _r12_report_iso(valuation_iso: str) -> str:
+    """A report date later than the valuation date by a fixed 20 days (never the unit's date)."""
+    return (date.fromisoformat(valuation_iso) + timedelta(days=20)).isoformat()
+
+
+def _r12_unit(street: str, number: str, city: str | None, block: str | None, parcels: list[str], valuation: str | None,
+              value: int | None = None, sub_parcel: str | None = None, **extra: Any) -> dict[str, Any]:
+    """One unit spec. ``valuation`` is an ISO date or None; ``extra`` carries the pattern-specific parts (see the
+    builders): ``valuation_blocks`` (replaces the default "המועד הקובע: ..." line), ``valuation_written`` (the date as the
+    document writes it, when not day/month/year), ``body`` (blocks appended after chapter 2), ``rents`` (list of
+    ``(sentence, fact)``), ``history`` (list of datum facts), ``negatives``, ``pattern``, ``identity_in_body``."""
+    u: dict[str, Any] = {"street": street, "number": number, "city": city, "block": block, "parcels": parcels,
+                         "sub_parcel": sub_parcel, "valuation": valuation, "value": value, "area": 90,
+                         "rents": [], "history": [], "negatives": [], "body": [], "pattern": None,
+                         "valuation_blocks": None, "valuation_written": None, "identity_in_body": False,
+                         "strong_words": False, "value_words": None, "report": None, "heading": "שומת מקרקעין",
+                         "title_suffix": "", "generic_title": None, "address_label": "כתובת הנכס"}
+    u.update(extra)
+    if u["report"] is None and valuation:
+        u["report"] = _r12_report_iso(valuation)
+    return u
+
+
+def _r12_doc(key: str, file: str, units: list[dict[str, Any]], group: str, front: list[Round10Block] | None = None,
+             note: str = "") -> dict[str, Any]:
+    return {"key": key, "file": file, "units": units, "group": group, "front": front or [], "note": note,
+            "kind": "appraisal", "title": _title_of(file)}
+
+
+def _r12_sub(u: dict[str, Any]) -> str:
+    return f"תת חלקה: {u['sub_parcel']}"
+
+
+def _r12_parcel_line(u: dict[str, Any]) -> str:
+    if len(u["parcels"]) == 1:
+        return f"גוש: {u['block']} חלקה: {u['parcels'][0]}"
+    return f"גוש: {u['block']} חלקות: {', '.join(u['parcels'])}"
+
+
+def round12_unit_blocks(u: dict[str, Any]) -> list[Round10Block]:
+    """The blocks of one unit, derived from its spec: a title and a header of ``label: value`` lines (identity lines only
+    when the identification is in the header, the valuation date as the spec writes it, always a later report date), the
+    value as the spec states it, the rents, two numbered chapters, and the spec's extra blocks."""
+    street, number, city = u["street"], u["number"], u["city"]
+    blocks: list[Round10Block] = []
+    if u["identity_in_body"]:
+        blocks.append(("title", f"{u['heading']} — {u['generic_title']}"))
+    else:
+        title = f"{u['heading']} — רחוב {street} {number}" + (f", {city}" if city else "") + u["title_suffix"]
+        blocks.append(("title", title))
+        if city:
+            blocks.append(("p", f"עיר: {city}"))
+        blocks.append(("p", f"{u['address_label']}: {street} {number}"))
+        if u["block"]:
+            blocks.append(("p", _r12_parcel_line(u)))
+        if u["sub_parcel"]:
+            blocks.append(("p", _r12_sub(u)))
+    blocks.append(("p", "סוג נכס: דירה"))
+    if u["valuation_blocks"] is not None:
+        blocks += u["valuation_blocks"]
+    elif u["valuation"]:
+        blocks.append(("p", f"המועד הקובע: {_r12_text(u['valuation'])}"))
+    if u["report"]:
+        blocks.append(("p", f"תאריך עריכת השומה: {_r12_text(u['report'])}"))
+    blocks.append(("p", f"שטח הנכס: {u['area']} מ״ר"))
+    if u["value"] is not None and u["value_words"] is None:
+        blocks.append(("p", f"שווי הנכס: {_round11_money(u['value'])} ₪"))
+    blocks += [("p", sentence) for sentence, _fact in u["rents"]]
+    purpose = ("מסמך לנכס בדוי, לצורכי בדיקות מערכת בלבד." if u["identity_in_body"]
+               else f"מסמך לנכס בדוי ברחוב {street} {number}" + (f" ב{city}" if city else "") + ", לצורכי בדיקות מערכת בלבד.")
+    blocks += [("h1", "1. מטרת השומה"), ("p", purpose), ("h1", "2. שיקולי השמאי")]
+    amount = _round11_money(u["value"]) if u["value"] is not None else None
+    if u["strong_words"]:
+        blocks.append(("p", f"שווי הנכס נקבע בסך {amount} ₪. שווי הנכס מבוסס על עסקאות השוואה בסביבת הנכס, "
+                            "ושווי הנכס נבדק מול נתוני שוק עדכניים."))
+    elif u["value_words"] is not None:
+        blocks.append(("p", u["value_words"]))
+    elif u["value"] is not None:
+        blocks.append(("p", f"השווי נקבע בסך {amount} ₪, לפי גישת ההשוואה."))
+    else:
+        blocks.append(("p", "השמאי בחן נתוני שוק בסביבת הנכס."))
+    blocks += u["body"]
+    return blocks
+
+
+def round12_document_blocks(doc: dict[str, Any]) -> list[Round10Block]:
+    """The blocks of a file: the mark, the synthetic marker, the front matter (a cover with an index table, for a
+    compendium) and each unit, a page break between them."""
+    blocks: list[Round10Block] = [("mark", ROUND12_MARK), ("p", SYNTHETIC_MARKER)]
+    if doc["front"]:
+        blocks += doc["front"]
+        blocks.append(("pagebreak", ""))
+    for n, u in enumerate(doc["units"]):
+        if n:
+            blocks.append(("pagebreak", ""))
+        blocks += round12_unit_blocks(u)
+    return blocks
+
+
+# --- KTD4: how two units relate, computed from the specs --------------------------------------------------------------
+
+def _r12_parcels(u: dict[str, Any]) -> set[tuple[str, str]]:
+    return {(u["block"], p) for p in u["parcels"]} if u["block"] else set()
+
+
+def round12_relation(a: dict[str, Any], b: dict[str, Any]) -> tuple[str, str | None]:
+    """The relation of two units' identity facts per the KTD4 table: (relation, reason). ``unrelated`` is the flowchart's
+    "different street/number and no shared parcel"; the table's last row is ``other``."""
+    ca, cb = a["city"], b["city"]
+    if ca and cb and ca != cb:
+        return "other", "ערים שונות"
+    pa, pb = _r12_parcels(a), _r12_parcels(b)
+    if pa and pb and not (pa & pb):
+        return "other", "קבוצות חלקות זרות"
+    sa, sb = a["sub_parcel"], b["sub_parcel"]
+    sub = "same" if sa == sb else "differ" if sa and sb else "one"
+    shared = sorted(pa & pb)
+    if shared:
+        if sub == "same":
+            return "parcel", f"parcel {shared[0][0]}/{shared[0][1]}"
+        return ("siblings", "תתי-חלקות שונות") if sub == "differ" else ("candidate", "אותה חלקה, תת-חלקה לא צוינה")
+    if (a["street"], a["number"]) != (b["street"], b["number"]):
+        return "unrelated", None
+    if ca and cb:
+        if sub == "same":
+            return "address_city", "כתובת ועיר זהות"
+        return ("siblings", "תתי-חלקות שונות") if sub == "differ" else ("candidate", "אותה חלקה, תת-חלקה לא צוינה")
+    return "candidate", "עיר לא צוינה"
+
+
+# --- the specs --------------------------------------------------------------------------------------------------------
+
+def _r12_hist(text: str, amount: int, date_iso: str | None, date_text: str | None, kind: str) -> dict[str, Any]:
+    """A history datum the document states with its own date (or none): ``expected_origin`` is the date origin the
+    history predicate (KTD12) must give it; the unit's valuation date never dates it."""
+    return {"text": text, "amount": amount, "date": date_iso, "date_text": date_text, "kind": kind,
+            "expected_origin": "history", "own_date": date_iso is not None}
+
+
+def _r12_rent(text: str, amount: int, period: str | None) -> tuple[str, dict[str, Any]]:
+    return text, {"amount": amount, "period": period, "vat": None, "text": text, "period_stated": period is not None}
+
+
+def _r12_cover(units: list[dict[str, Any]], title: str) -> list[Round10Block]:
+    """A cover with an index table that lists every address of the compendium (and its block and parcel): identity facts
+    in a table are never a unit's identification (KTD2)."""
+    rows = [["מס׳", "כתובת", "עיר", "גוש וחלקה"]]
+    for n, u in enumerate(units, start=1):
+        rows.append([str(n), f"רחוב {u['street']} {u['number']}", u["city"] or "", f"גוש {u['block']} חלקה {u['parcels'][0]}"])
+    return [("title", title), ("p", "תוכן עניינים — רשימת השומות בקובץ"), ("table", rows)]
+
+
+def round12_documents() -> list[dict[str, Any]]:
+    """Every round-12 file, in a fixed order."""
+    A, B = ROUND12_CITY_A, ROUND12_CITY_B
+    docs: list[dict[str, Any]] = []
+
+    # --- cities: the same street and number in two cities, and the same address with no city (AE1; KTD4 other/candidate)
+    docs += [
+        _r12_doc("cities_a", f"שומה_רחוב_הדולב_7_{A}.docx",
+                 [_r12_unit("הדולב", "7", A, "8201", ["11"], "2024-03-31", 2500000)], "cities"),
+        _r12_doc("cities_b", f"שומה_רחוב_הדולב_7_{B}.docx",
+                 [_r12_unit("הדולב", "7", B, "8302", ["22"], "2024-09-30", 1900000)], "cities"),
+        _r12_doc("cities_nocity", "שומה_רחוב_הדולב_7_ללא_עיר.docx",
+                 [_r12_unit("הדולב", "7", None, None, [], "2025-01-31", 2700000)], "cities",
+                 note="Names the street and number only: no city, no block, no parcel."),
+    ]
+
+    # --- parcels: a property over parcels {24, 40}, a later appraisal of parcel 40, a separate lot {42} (AE2; parcel/other)
+    docs += [
+        _r12_doc("parcels_ab", f"שומה_רחוב_הדס_3_{A}.docx",
+                 [_r12_unit("הדס", "3", A, "8401", ["24", "40"], "2023-06-30", 3200000)], "parcels",
+                 note="One property over parcels 24 and 40 of block 8401."),
+        _r12_doc("parcels_b", f"שומה_רחוב_הדס_5_{A}.docx",
+                 [_r12_unit("הדס", "5", A, "8401", ["40"], "2025-06-30", 3650000)], "parcels",
+                 note="A later appraisal of parcel 40 alone, under another house number."),
+        _r12_doc("parcels_c", f"שומה_רחוב_הדס_9_{A}.docx",
+                 [_r12_unit("הדס", "9", A, "8401", ["42"], "2024-12-31", 2100000)], "parcels",
+                 note="A separate lot, parcel 42 of the same block."),
+    ]
+
+    # --- apartments: sub-parcels 3 and 4 of one parcel, and an appraisal of the parcel with no sub-parcel (AE2; siblings,
+    # candidate)
+    docs += [
+        _r12_doc("apartments_3", f"שומה_רחוב_הנרקיס_12_דירה_3_{A}.docx",
+                 [_r12_unit("הנרקיס", "12", A, "8501", ["7"], "2024-02-29", 1750000, sub_parcel="3")], "apartments"),
+        _r12_doc("apartments_4", f"שומה_רחוב_הנרקיס_12_דירה_4_{A}.docx",
+                 [_r12_unit("הנרקיס", "12", A, "8501", ["7"], "2024-08-31", 1820000, sub_parcel="4")], "apartments"),
+        _r12_doc("apartments_none", f"שומה_רחוב_הנרקיס_12_{A}.docx",
+                 [_r12_unit("הנרקיס", "12", A, "8501", ["7"], "2025-02-28", 1900000)], "apartments",
+                 note="Same parcel and address, no sub-parcel stated."),
+    ]
+
+    # --- compendium of six units of two properties, interleaved by date, with a cover index table listing all addresses
+    two = [
+        ("P", "הברוש", "4", "5", "2022-12-31", 3100000), ("Q", "הברוש", "6", "6", "2022-06-30", 2000000),
+        ("P", "הברוש", "4", "5", "2023-12-31", 3250000), ("Q", "הברוש", "6", "6", "2023-06-30", 2100000),
+        ("P", "הברוש", "4", "5", "2024-12-31", 3400000), ("Q", "הברוש", "6", "6", "2024-06-30", 2250000),
+    ]
+    two_units = []
+    for n, (who, street, number, parcel, val, amount) in enumerate(two, start=1):
+        two_units.append(_r12_unit(street, number, A, "8601", [parcel], val, amount, title_suffix=f" (שומה {n} מתוך 6)",
+                                   property=who))
+    docs.append(_r12_doc("compendium_two", f"קובץ_שומות_הברוש_4_ו-6_{A}.docx", two_units, "compendium_two",
+                         front=_r12_cover(two_units, "קובץ שומות מקרקעין (סינתטי) — רחוב הברוש"),
+                         note="Six appraisal units of two properties (P = הברוש 4 parcel 5, Q = הברוש 6 parcel 6) "
+                              "interleaved by date; the cover's index table lists every address."))
+
+    # --- compendium of six units of ONE property at six valuation dates
+    one = ["2020-06-30", "2021-06-30", "2022-06-30", "2023-06-30", "2024-06-30", "2025-06-30"]
+    one_units = [_r12_unit("הגפן", "15", A, "8701", ["3"], val, 1900000 + 200000 * n,
+                           title_suffix=f" (שומה {n} מתוך 6)") for n, val in enumerate(one, start=1)]
+    docs.append(_r12_doc("compendium_one", f"קובץ_שומות_הגפן_15_{A}.docx", one_units, "compendium_one",
+                         note="Six appraisal units of one property at six valuation dates, in date order."))
+
+    # --- beyond the window: fifteen appraisals of one property; fourteen match the query words "שווי הנכס" strongly and the
+    # latest (2026) states its amount in other words (AE3, R20; more than the 12-document window)
+    old = [f"{y}-{md}" for y in range(2019, 2026) for md in ("03-31", "09-30")]
+    for n, val in enumerate(old, start=1):
+        docs.append(_r12_doc(f"window_{n:02d}", f"שומה_רחוב_הערבה_2_{A}_{n:02d}.docx",
+                             [_r12_unit("הערבה", "2", A, "8801", ["9"], val, 3000000 + 50000 * n, strong_words=True)],
+                             "beyond_window"))
+    latest = _r12_unit("הערבה", "2", A, "8801", ["9"], "2026-03-31", 4350000,
+                       value_words="סכום ההערכה הסופי לדירה עומד על 4,350,000 ₪, לפי גישת ההשוואה.")
+    docs.append(_r12_doc("window_latest", f"שומה_רחוב_הערבה_2_{A}_{len(old) + 1:02d}.docx", [latest], "beyond_window",
+                         note="The latest appraisal (valuation 2026-03-31): it never writes \"שווי\", so it matches the query "
+                              "words worse than the fourteen older ones."))
+
+    # --- identification only in the body, under "זיהוי הנכס", on a later page (R3; negatives: adjacent parcel, comparable)
+    ident_body = [
+        ("pagebreak", ""),
+        ("h1", "3. זיהוי הנכס"),
+        ("p", f"רחוב הלוטם 8, {B}"),
+        ("p", "גוש: 8901 חלקה: 14"),
+        ("h1", "4. סביבת הנכס"),
+        ("p", "החלקה גובלת בחלקה 15 בגוש 8901 ובחלקה 16 בגוש 8901."),
+        ("table", [["כתובת", "גוש וחלקה", "מחיר (₪)"], ["רחוב הצפצפה 21", "גוש 8902 חלקה 3", "1,640,000"]]),
+    ]
+    docs.append(_r12_doc(
+        "body_identification", f"חוות_דעת_שמאית_מסמך_17_{B}.docx",
+        [_r12_unit("הלוטם", "8", B, "8901", ["14"], "2025-09-30", 2380000, identity_in_body=True,
+                   generic_title="מסמך מספר 17 (סינתטי)", body=ident_body,
+                   negatives=[{"kind": "adjacent_parcel", "block": "8901", "parcels": ["15", "16"],
+                               "text": "החלקה גובלת בחלקה 15 בגוש 8901 ובחלקה 16 בגוש 8901."},
+                              {"kind": "comparables_table", "street": "הצפצפה", "number": "21", "block": "8902",
+                               "parcels": ["3"]}])],
+        "body_identification",
+        note="The header names neither address, city, block nor parcel; they appear only under the heading \"זיהוי הנכס\" "
+             "after a page break."))
+
+    # --- each missed date pattern (KTD11) and the history cases (KTD12; AE6), one file each with its own invented property
+    n_dp = iter(range(1, 100))
+
+    def dp(key: str, pattern: str, written: str | None, val_blocks: list[Round10Block] | None, valuation: str | None,
+           **extra: Any) -> None:
+        """One date-pattern file: its own invented property (street הרימון, the next number and parcel), a report date
+        later than every valuation date, and the pattern's blocks in place of the default valuation line."""
+        n = next(n_dp)
+        u = _r12_unit("הרימון", str(n), A, "9001", [str(n)], valuation, None, pattern=pattern,
+                      valuation_blocks=val_blocks, valuation_written=written, report="2026-01-20", **extra)
+        docs.append(_r12_doc(key, f"שומה_רחוב_הרימון_{n}_{A}_דפוס_{key}.docx", [u], "date_patterns"))
+
+    dp("dp_visit_phrase", "visit-phrase gap: \"זו הינו מועד הביקור בנכס – קרי\"", "15/03/2024",
+       [("p", "המועד הקובע לשומה זו הינו מועד הביקור בנכס – קרי 15/03/2024.")], "2024-03-15")
+    dp("dp_two_digit_year", "two-digit year after a valuation label, day-first (00-69 -> 20YY)", "31.12.23",
+       [("p", "המועד הקובע: 31.12.23")], "2023-12-31",
+       body=[("p", "ביקור בנכס נערך ב-05.07.24 בנוכחות בעל הנכס.")],
+       negatives=[{"kind": "unlabelled_two_digit_date", "text": "05.07.24", "must_not_be_read": True}])
+    dp("dp_two_digit_refused", "two-digit year 70-99 is refused", "31.12.85",
+       [("p", "המועד הקובע: 31.12.85")], None)
+    dp("dp_header_table", "header-label one-row table: the date sits in the label's column",
+       "31/12/2023", [("table", [["מועד קובע", "כתובת", "סוג נכס"], ["31/12/2023", "הרימון 4", "דירה"]])], "2023-12-31")
+    dp("dp_label_variant", "label variant \"התאריך הקובע\"", "28/02/2024",
+       [("p", "התאריך הקובע לשומה: 28/02/2024")], "2024-02-28")
+    dp("dp_date_before_label", "date before the label with a direct connector (\"שהינו גם\")", "31/12/2023",
+       [("p", "31/12/2023, שהינו גם התאריך הקובע להערכה.")], "2023-12-31")
+    dp("dp_heading_block", "label-only heading followed by a block that starts with the date", "30/06/2024",
+       [("h1", "המועד הקובע"), ("p", "30/06/2024 – תאריך הביקור בנכס והמועד שאליו מתייחסת השומה.")], "2024-06-30")
+
+    hist_rows = [["מועד קובע", "שווי (₪)"], ["31/12/2021", "2,050,000"], ["31/12/2023", "2,300,000"]]
+    dp("dp_history_table", "multi-row \"מועד קובע\" history table beside the unit's own stated date", "30/06/2025",
+       None, "2025-06-30",
+       ktd="KTD12",
+       body=[("h1", "3. ריכוז הערכות לנכס"), ("table", hist_rows)],
+       history=[_r12_hist("שווי 2,050,000 ₪ בשורת הטבלה לתאריך 31/12/2021", 2050000, "2021-12-31", "31/12/2021", "table_row"),
+                _r12_hist("שווי 2,300,000 ₪ בשורת הטבלה לתאריך 31/12/2023", 2300000, "2023-12-31", "31/12/2023", "table_row")])
+    dp("dp_history_table_only", "multi-row \"מועד קובע\" table is history: the unit has no stated date", None,
+       [], None,
+       ktd="KTD12",
+       body=[("h1", "3. ריכוז הערכות לנכס"), ("table", [["מועד קובע", "שווי (₪)"], ["31/12/2020", "1,950,000"],
+                                                         ["31/12/2022", "2,150,000"]])],
+       history=[_r12_hist("שווי 1,950,000 ₪ בשורת הטבלה לתאריך 31/12/2020", 1950000, "2020-12-31", "31/12/2020", "table_row"),
+                _r12_hist("שווי 2,150,000 ₪ בשורת הטבלה לתאריך 31/12/2022", 2150000, "2022-12-31", "31/12/2022", "table_row")])
+
+    # AE6: the unit's date is the header's; the sentences under "שומות קודמות" keep their own dates
+    dp("dp_prior_section_ae6", "\"שומות קודמות\" section with \"לתאריך הקובע\" (AE6, two-digit year as in the AE)", "31.12.23",
+       [("p", "המועד הקובע לשומה - 31.12.23")], "2023-12-31",
+       ktd="KTD12",
+       body=[("h1", "3. שומות קודמות"),
+             ("p", "לתאריך הקובע 31.12.19 הוערך הנכס ב-1,800,000 ₪."),
+             ("p", "בשומה קודמת, לתאריך הקובע 31.12.21, הוערך הנכס ב-2,000,000 ₪."),
+             ("p", "הנכס נרכש ביום 15/05/2017 תמורת 1,500,000 ₪.")],
+       history=[_r12_hist("לתאריך הקובע 31.12.19 הוערך הנכס ב-1,800,000 ₪.", 1800000, "2019-12-31", "31.12.19", "prior_appraisal"),
+                _r12_hist("בשומה קודמת, לתאריך הקובע 31.12.21, הוערך הנכס ב-2,000,000 ₪.", 2000000, "2021-12-31", "31.12.21",
+                          "prior_appraisal"),
+                _r12_hist("הנכס נרכש ביום 15/05/2017 תמורת 1,500,000 ₪.", 1500000, "2017-05-15", "15/05/2017", "purchase")])
+    dp("dp_prior_section_4digit", "\"שומות קודמות\" section with \"לתאריך הקובע\", four-digit years", "31/12/2023",
+       [("p", "המועד הקובע לשומה - 31/12/2023")], "2023-12-31",
+       ktd="KTD12",
+       body=[("h1", "3. שומות קודמות"),
+             ("p", "לתאריך הקובע 31/12/2019 הוערך הנכס ב-1,800,000 ₪.")],
+       history=[_r12_hist("לתאריך הקובע 31/12/2019 הוערך הנכס ב-1,800,000 ₪.", 1800000, "2019-12-31", "31/12/2019",
+                          "prior_appraisal")])
+    cur_text = "שווי הזכויות בנכס הוערך ב-2,640,000 ₪ נכון למועד הקובע."
+    past_text = "בעבר הוערך הנכס ב-2,100,000 ₪."
+    dp("dp_current_conclusion", "current conclusion \"הוערך ב-X ₪ נכון למועד הקובע\" keeps the unit's date", "31/12/2025",
+       None, "2025-12-31",
+       ktd="KTD12",
+       body=[("p", cur_text), ("p", past_text)],
+       current_conclusion={"text": cur_text, "amount": 2640000, "date": "2025-12-31", "expected_origin": "unit_valuation"},
+       history=[_r12_hist(past_text, 2100000, None, None, "past_cue")])
+
+    # --- a rent quote with no period (AE5: model-invented attributes), and a control that states its period
+    docs.append(_r12_doc(
+        "rent_no_period", f"שומה_רחוב_השקד_2_{A}.docx",
+        [_r12_unit("השקד", "2", A, "9101", ["2"], "2025-10-31", 2300000, rents=[_r12_rent("שכר דירה 5,000 ₪", 5000, None)])],
+        "rents", note="The only rent statement is \"שכר דירה 5,000 ₪\": no period and no VAT basis anywhere in the file."))
+    docs.append(_r12_doc(
+        "rent_yearly", f"שומה_רחוב_השקד_4_{A}.docx",
+        [_r12_unit("השקד", "4", A, "9101", ["4"], "2025-10-31", 2450000,
+                   rents=[_r12_rent("שכר דירה 60,000 ₪ לשנה", 60000, "year")])],
+        "rents", note="Control: the source states its period (per year)."))
+    return docs
+
+
+# the relations the design expects (KTD4), pinned so that a spec edit that changes one fails the run:
+# (group, a key, a unit, b key, b unit) -> relation
+ROUND12_EXPECTED_RELATIONS: dict[tuple[str, str, int, str, int], str] = {
+    ("cities", "cities_a", 1, "cities_b", 1): "other",
+    ("cities", "cities_a", 1, "cities_nocity", 1): "candidate",
+    ("cities", "cities_b", 1, "cities_nocity", 1): "candidate",
+    ("parcels", "parcels_ab", 1, "parcels_b", 1): "parcel",
+    ("parcels", "parcels_ab", 1, "parcels_c", 1): "other",
+    ("parcels", "parcels_b", 1, "parcels_c", 1): "other",
+    ("apartments", "apartments_3", 1, "apartments_4", 1): "siblings",
+    ("apartments", "apartments_3", 1, "apartments_none", 1): "candidate",
+    ("apartments", "apartments_4", 1, "apartments_none", 1): "candidate",
+    ("compendium_two", "compendium_two", 1, "compendium_two", 3): "parcel",
+    ("compendium_two", "compendium_two", 1, "compendium_two", 2): "other",
+    ("compendium_two", "compendium_two", 2, "compendium_two", 6): "parcel",
+    ("compendium_one", "compendium_one", 1, "compendium_one", 6): "parcel",
+    ("beyond_window", "window_01", 1, "window_latest", 1): "parcel",
+}
+_R12_RELATED_GROUPS = ("cities", "parcels", "apartments", "compendium_two", "compendium_one", "beyond_window")
+
+
+def _r12_identity(u: dict[str, Any]) -> dict[str, Any]:
+    city = u["city"]
+    return {"street": u["street"], "number": u["number"], "city": city,
+            "address": f"{u['street']} {u['number']}" + (f", {city}" if city else ""),
+            "block": u["block"], "parcels": list(u["parcels"]), "sub_parcel": u["sub_parcel"],
+            "identification_in": "body" if u["identity_in_body"] else "header" if (u["block"] or u["city"]) else "address_only"}
+
+
+def _r12_unit_facts(u: dict[str, Any], n: int) -> dict[str, Any]:
+    """What one unit states, for the manifest, derived from its spec: the ground truth the tests assert."""
+    out: dict[str, Any] = {
+        "unit_no": n,
+        "title": round12_unit_blocks(u)[0][1],
+        "identity": _r12_identity(u),
+        "valuation_date": u["valuation"],
+        "valuation_date_text": (u["valuation_written"] or (_r12_text(u["valuation"]) if u["valuation"] else None)),
+        "report_date": u["report"], "report_date_text": _r12_text(u["report"]) if u["report"] else None,
+        "value": None if u["value"] is None else {"amount": u["value"], "text": _round11_money(u["value"]),
+                                                  "stated_as": "other_words" if u["value_words"] else "label"},
+        "area": {"amount": u["area"], "unit": "מ״ר", "basis": None},
+        "rents": [fact for _sentence, fact in u["rents"]],
+        "history": u["history"],
+        "negatives": u["negatives"],
+    }
+    if u["pattern"]:
+        out["date_pattern"] = {"name": u["pattern"], "ktd": u.get("ktd", _ROUND12_KTD11),
+                               "written": u["valuation_written"], "expected_date": u["valuation"],
+                               "expected_status": "stated" if u["valuation"] else "none"}
+    if u.get("current_conclusion"):
+        out["current_conclusion"] = u["current_conclusion"]
+    if u.get("property"):
+        out["property_tag"] = u["property"]
+    return out
+
+
+def _r12_group_relations(group: str, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every unit pair of a group with its computed relation (KTD4), asserted against the pinned expectations. The
+    beyond-window group lists only the pairs with its latest appraisal (the fourteen others all relate by parcel)."""
+    entries = [(d["key"], n, u) for d in docs for n, u in enumerate(d["units"], start=1)]
+    out = []
+    for i, (ka, na, ua) in enumerate(entries):
+        for kb, nb, ub in entries[i + 1:]:
+            if group == "beyond_window" and "window_latest" not in (ka, kb):
+                continue
+            relation, reason = round12_relation(_r12_identity(ua), _r12_identity(ub))
+            pinned = ROUND12_EXPECTED_RELATIONS.get((group, ka, na, kb, nb))
+            assert pinned is None or pinned == relation, (group, ka, na, kb, nb, pinned, relation)
+            out.append({"a": {"document": ka, "unit": na}, "b": {"document": kb, "unit": nb}, "relation": relation,
+                        "reason": reason, "gathered": relation in ("parcel", "address_city")})
+    for key, expected in ROUND12_EXPECTED_RELATIONS.items():
+        if key[0] == group:
+            assert any(r["a"] == {"document": key[1], "unit": key[2]} and r["b"] == {"document": key[3], "unit": key[4]}
+                       and r["relation"] == expected for r in out), key
+    return out
+
+
+_ROUND12_SPEC_ROWS = [
+    ("same_street_number_two_cities", "same street and number in two synthetic cities", "AE1", "KTD4 other",
+     ["cities_a", "cities_b"]),
+    ("cityless_same_address", "the same address with no city", "AE1", "KTD4 candidate (עיר לא צוינה)",
+     ["cities_nocity", "cities_a", "cities_b"]),
+    ("parcel_pair_and_separate_lot", "a property over parcels {24, 40}, a later appraisal of parcel 40, a separate lot {42}",
+     "AE2", "KTD4 parcel / other", ["parcels_ab", "parcels_b", "parcels_c"]),
+    ("sub_parcels", "two apartments of one parcel (sub-parcels 3 and 4) and one with no sub-parcel", "AE2",
+     "KTD4 siblings / candidate (אותה חלקה, תת-חלקה לא צוינה)", ["apartments_3", "apartments_4", "apartments_none"]),
+    ("compendium_two_properties", "six units of two properties plus a cover index table listing all addresses", "R3, R8",
+     "KTD4 parcel / other inside one file; the index table is no identification", ["compendium_two"]),
+    ("compendium_one_property_six_dates", "six units of one property at six valuation dates", "KTD6", "per-unit dates",
+     ["compendium_one"]),
+    ("beyond_window", "fifteen appraisals of one property; fourteen match \"שווי הנכס\", the 2026 one states its amount in "
+                      "other words", "AE3, R20", "KTD7 / KTD8 (beyond the 12-document window)",
+     [f"window_{n:02d}" for n in range(1, 15)] + ["window_latest"]),
+    ("body_identification", "identification only in the body under \"זיהוי הנכס\" on a later page", "R3", "KTD2",
+     ["body_identification"]),
+    ("date_visit_phrase", "\"זו הינו מועד הביקור בנכס – קרי\"", "R15", "KTD11 gap words", ["dp_visit_phrase"]),
+    ("date_two_digit_year", "two-digit year after a label (and the refused 70-99 and unlabelled cases)", "R15",
+     "KTD11 two-digit years", ["dp_two_digit_year", "dp_two_digit_refused"]),
+    ("date_header_table", "header-label one-row table", "R15", "KTD11 tables", ["dp_header_table"]),
+    ("date_before_label", "date before \"התאריך הקובע\"", "R15", "KTD11 date before the label (label variant too)",
+     ["dp_date_before_label", "dp_label_variant"]),
+    ("date_heading_block", "label-only heading followed by a block starting with the date", "R15", "KTD11 heading then block",
+     ["dp_heading_block"]),
+    ("date_history_table", "multi-row \"מועד קובע\" history table", "R16", "KTD11 tables / KTD12",
+     ["dp_history_table", "dp_history_table_only"]),
+    ("history_section", "\"שומות קודמות\" section with \"לתאריך הקובע\"", "AE6", "KTD12 history predicate",
+     ["dp_prior_section_ae6", "dp_prior_section_4digit"]),
+    ("current_conclusion", "current conclusion \"הוערך ב-X ₪ נכון למועד הקובע\" (and a past-cue sentence)", "R16",
+     "KTD12 bare הוערך keeps the unit's date", ["dp_current_conclusion"]),
+    ("rent_quote_no_period", "a rent quote with no period (and a control with one)", "AE5", "attribute provenance",
+     ["rent_no_period", "rent_yearly"]),
+]
+
+
+def write_round12(out: Path) -> None:
+    """Writes the round-12 fixtures and ``manifest.json``: per document its file, title, group and units (identity facts,
+    valuation date, value, rents, history data, negatives, date pattern), per group the relation of every unit pair (KTD4),
+    and the spec rows that name the files covering each case - all from the generator's own spec (never read back)."""
+    rdir = out / ROUND12_DIR
+    rdir.mkdir(parents=True, exist_ok=True)
+    documents = round12_documents()
+    keys = [d["key"] for d in documents]
+    files = [d["file"] for d in documents]
+    assert len(set(keys)) == len(keys) and len(set(files)) == len(files), "duplicate key or file name"
+    docs: dict[str, dict[str, Any]] = {}
+    for d in documents:
+        blocks = round12_document_blocks(d)
+        data = render_round10_docx(blocks, d["title"], mark=ROUND12_MARK)
+        (rdir / d["file"]).write_bytes(data)
+        print(f"wrote {ROUND12_DIR}/{d['file']} ({len(data):,} bytes)")
+        docs[d["key"]] = {
+            "key": d["key"], "file": f"{ROUND12_DIR}/{d['file']}", "title": d["title"], "source_kind": d["kind"],
+            "group": d["group"], "note": d["note"],
+            "front_matter_units": 1 if d["front"] else 0,
+            "units": [_r12_unit_facts(u, n) for n, u in enumerate(d["units"], start=1)],
+            "paragraphs": [t for k, t in blocks if k in ("mark", "p")],
+        }
+    groups: dict[str, dict[str, Any]] = {}
+    for group in dict.fromkeys(d["group"] for d in documents):
+        members = [d for d in documents if d["group"] == group]
+        entry: dict[str, Any] = {"documents": [d["key"] for d in members]}
+        if group in _R12_RELATED_GROUPS:
+            entry["relations"] = _r12_group_relations(group, members)
+        groups[group] = entry
+    window = [d for d in documents if d["group"] == "beyond_window"]
+    assert len(window) == 15 and window[-1]["units"][0]["valuation"] == "2026-03-31"
+    groups["beyond_window"]["expected"] = {
+        "documents": 15, "window_documents": 12, "latest_document": "window_latest", "latest_valuation_date": "2026-03-31",
+        "latest_value": {"amount": 4350000, "text": "4,350,000"}, "query_words": "שווי הנכס",
+        "matching_documents": [d["key"] for d in window[:-1]],
+        "note": "the fourteen older appraisals state \"שווי הנכס\" three times each; the latest never writes \"שווי\""}
+    spec_rows = [{"id": i, "description": desc, "covers": cov, "design": ktd, "documents": dk}
+                 for i, desc, cov, ktd, dk in _ROUND12_SPEC_ROWS]
+    for row in spec_rows:
+        assert all(k in docs for k in row["documents"]), row["id"]
+    manifest = {
+        "about": f"{ROUND12_MARK}. Known contents of the round-12 fixtures (identity cases across two synthetic cities, "
+                 "parcel sets and sub-parcels; two compendia of six appraisal units; fifteen appraisals of one property "
+                 "for the beyond-window case; identification only in the body; every date pattern and history case of "
+                 "dates-v2; a rent quote with no period); generated by scripts/generate_fixtures.py --only round12 from "
+                 "the generator's own text (never read back from the files) - do not edit by hand. Every name, address, "
+                 "city, block, parcel and amount is invented. The round-11 files stay as regression fixtures.",
+        "synthetic_marker": ROUND12_MARK,
+        "cities": [ROUND12_CITY_A, ROUND12_CITY_B],
+        "relation_vocabulary": {
+            "parcel": "gathered (reason \"parcel BLOCK/PARCEL\")", "address_city": "gathered",
+            "siblings": "not gathered (different sub-parcels)", "candidate": "not gathered, counted in coverage",
+            "other": "not gathered (cities differ or stated parcel sets are disjoint)",
+            "unrelated": "no shared parcel and a different street and number"},
+        "spec_rows": spec_rows,
+        "groups": groups,
+        "documents": docs,
+    }
+    text_ = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+    (rdir / ROUND12_MANIFEST).write_text(text_, encoding="utf-8")
+    print(f"wrote {ROUND12_DIR}/{ROUND12_MANIFEST} ({len(text_):,} chars)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--font-dir", default=DEFAULT_FONT_DIR)
     parser.add_argument("--out", default="tests/fixtures")
-    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9", "round10", "round11"],
+    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9", "round10", "round11", "round12"],
                         default="all",
                         help="regions: write only the uncovered-region fixtures (tests/fixtures/regions/); "
                              "positions: only the page-position fixtures (tests/fixtures/positions/); "
@@ -6035,7 +6580,9 @@ def main() -> None:
                              "round10: only the round-10 fixtures (DOCX, no font needed) and their manifest "
                              "(tests/fixtures/round10/); "
                              "round11: only the round-11 multi-date fixtures (DOCX) and their manifest "
-                             "(tests/fixtures/round11/)")
+                             "(tests/fixtures/round11/); "
+                             "round12: only the round-12 identity, date and attribute fixtures (DOCX) and their manifest "
+                             "(tests/fixtures/round12/)")
     args = parser.parse_args()
     font_dir = Path(args.font_dir)
     out = Path(args.out)
@@ -6063,6 +6610,9 @@ def main() -> None:
         return
     if args.only == "round11":
         write_round11(out)
+        return
+    if args.only == "round12":
+        write_round12(out)
         return
 
     docs: dict[str, dict[str, Any]] = {}
@@ -6115,6 +6665,7 @@ def main() -> None:
     write_round9(out, font_dir)
     write_round10(out)
     write_round11(out)
+    write_round12(out)
 
 
 if __name__ == "__main__":
