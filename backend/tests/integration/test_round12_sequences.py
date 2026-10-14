@@ -639,12 +639,12 @@ def test_s3_a_scenario_that_is_the_values_own_resolved_date_is_no_assertion_of_t
     a = t.answer
     (v,) = a["values"]
     assert v["as_of"]["date"] == "2025-06-30" and v["as_of"]["provenance"] == "unit_valuation"
-    assert v["provenance"]["scenario"] == "source", "the server's own date is not the model's assertion"
+    assert v["provenance"]["scenario"] == "not_stated" and not v["scenario"], "the date is the record's, not a scenario"
     assert a["markdown"] == "השווי למועד הקובע 30/06/2025 הוא 3,100,000 ₪ [V1]." and a["verification"]["removed"] == 0
     assert a["verification"]["actions"]["cut"] == 0 and a["status"] == "answered"
-    judged = "\n".join(c.input for c in t.agent.calls if "תרחיש/מועד:" in c.input)
-    assert "תרחיש/מועד: למועד הקובע 30/06/2025" in judged
-    assert not re.search(r"תרחיש/מועד: [^;\n]*" + re.escape(MODEL_ASSERTED), judged), "the judge reads the date as resolved"
+    judged = "\n".join(c.input for c in t.agent.calls if "<unit index" in c.input)
+    assert "תרחיש/מועד:" not in judged, "the date is the record's (as_of), so no scenario reaches the judge"
+    assert not re.search(r"תרחיש/מועד: [^;\n]*" + re.escape(MODEL_ASSERTED), judged), "never read as the model's"
 
 
 def test_s3_a_scenario_that_is_not_the_values_resolved_date_stays_the_models_and_the_answer_is_not_verified_as_clean(
@@ -663,6 +663,35 @@ def test_s3_a_scenario_that_is_not_the_values_resolved_date_stays_the_models_and
                     headline_steps(gafen, "תרחיש אופטימי למועד הקובע 30/06/2025", "30/06/2025"), judge=date_in_record_judge)
     assert t2.answer["values"][0]["provenance"]["scenario"] == "model_asserted"
     assert t2.answer["verification"]["partial"] == 1
+
+
+def test_s3_two_appraisals_of_one_property_whose_scenarios_restate_their_own_dates_stay_one_timeline_group(
+        db, client, monkeypatch, calls):
+    """A scenario that is only the value's own date is the date (``as_of``), not a scenario: it must not split the property's
+    appraisals into one timeline group per date (review finding 1)."""
+    o = bare_world(db, client, monkeypatch, calls)
+    old = unit_appraisal(o, "own-date-2022", valuation="15/04/2022", amount=amount_of(2022), vat=True, **PROPERTY_X)
+    new = unit_appraisal(o, "own-date-2025", valuation="30/06/2025", amount=amount_of(2025), vat=True, **PROPERTY_X)
+    body = (f"השווי העדכני הוא {amount_of(2025)} ₪ כולל מע״מ [V1]. קודם לכן, ב-15/04/2022, השווי היה {amount_of(2022)} ₪ "
+            "כולל מע״מ [V2].")
+    answer = final(body, focus=_focus_of() | {"subject": "הגפן 15", "metric_as_written": "שווי הנכס"}, claims=[
+        {"text": f"השווי העדכני הוא {amount_of(2025)} ₪ כולל מע״מ", "source_ids": ["V1"], "basis": "explicit"},
+        {"text": f"קודם לכן, ב-15/04/2022, השווי היה {amount_of(2022)} ₪ כולל מע״מ", "source_ids": ["V2"], "basis": "explicit"}])
+
+    def register(items):
+        return [amount_take(sid_with(items, new, amount_of(2025)), amount_of(2025), sentence=UNIT_VAT,
+                            scenario="למועד הקובע 30/06/2025"),
+                amount_take(sid_with(items, old, amount_of(2022)), amount_of(2022), sentence=UNIT_VAT,
+                            scenario="למועד הקובע 15/04/2022")]
+
+    t = first_turn(o, new_conversation(client), VALUE_Q.format(street="הגפן 15"),
+                   [[call("search", query=VALUE_SEARCH, document_ids=[new, old], limit=None)], register, answer])
+    a = t.answer
+    assert [(v["as_of"]["date"], v["provenance"]["scenario"], v["scenario"]) for v in a["values"]] == [
+        ("2025-06-30", "not_stated", ""), ("2022-04-15", "not_stated", "")], "each scenario is just its own date"
+    groups = a["time"]["timeline"]
+    assert len(groups) == 1, "one property, one history"
+    assert [r["date"] for r in groups[0]["rows"]] == ["2025-06-30", "2022-04-15"]
 
 
 # =======================================================================================================================

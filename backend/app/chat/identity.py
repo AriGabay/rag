@@ -29,7 +29,7 @@ belongs to none and is dropped (it would be a guess).
 a street ("רחוב X 7, CITY", "... ב CITY") is stored as unlabelled and is accepted at read time only when it is in
 `answering.places.KNOWN_CITIES` or equals a labelled city of the same unit. "שדרות" is a street label before the street
 and a city only after the house number. A unit that states two different subject cities links as cityless (`link_city`
-None; `cities` keeps the raw set). A single-unit file may take the header city (`answering.metadata.report_header`) when
+None; `cities` keeps the raw set). A single-unit file may take the header city (`answering.metadata.report_headers`) when
 the body states none and it is exactly one city; a file with several subject units never donates one, and
 `VersionMetadata.cities` (whose fallback mixes in comparables' cities) is never used.
 
@@ -62,21 +62,25 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from app.answering.entities import _canon, _strip_prefix
-from app.answering.metadata import place_matches, report_header
+from app.answering.metadata import place_matches, report_headers
 from app.answering.places import KNOWN_CITIES
 from app.appraisal.normalize import normalize_place, parse_block_parcel
 from app.chat import contexts
 from app.chat import units as unit_store
-from app.chat.dates import is_comparables_table
+from app.chat.dates import (
+    DOCUMENT_SCOPE,
+    MARKER_BLOCK,
+    VISIBLE_SQL,
+    is_comparables_table,
+    owner_of_block,
+    units_of,
+)
 from app.extraction.hebrew import strip_bidi_controls
-from app.platform.source_kinds import APPRAISALS_SQL
 from app.professional.sections import flight, landed
 
 logger = logging.getLogger(__name__)
 
 IDENTITY_VERSION = "identity-v1"
-MARKER_BLOCK = -1       # the block index of the row that records "derived, none found"
-DOCUMENT_SCOPE = 0      # the unit number of a version that has no units: the document is the scope
 
 PARCEL, ADDRESS, CITY, APARTMENT, MARKER = "parcel", "address", "city", "apartment", "marker"
 TITLE, IDENTIFICATION, LABEL, TABLE = "title", "identification", "label", "table"
@@ -184,6 +188,11 @@ class UnitIdentity:
             return self.header_city
         groups = _collapse(self.cities)
         return max(groups[0], key=len) if len(groups) == 1 else None
+
+
+def unpad(number: str) -> str:
+    """A block, parcel, sub-parcel or house number without its leading zeros ("0" stays "0")."""
+    return number.lstrip("0") or "0"
 
 
 def same_place(a: str, b: str) -> bool:
@@ -303,7 +312,7 @@ def _street_matches(raw: str) -> tuple[list[tuple[str, str, str, int]], str]:
             words.pop()
         if not words or words[0] in contexts._NOT_STREET:
             continue
-        number, letter = m.group(2).lstrip("0") or "0", m.group(3) or ""
+        number, letter = unpad(m.group(2)), m.group(3) or ""
         keep = 2 if len(words) > 1 else 3
         core = " ".join([_strip_prefix(words[0], keep), *words[1:]])
         out.append((core, number + letter, m.group(0).strip(), m.end()))
@@ -368,7 +377,7 @@ class _Reader:
         group: list[int] = []     # indexes (in facts) of the parcels of the statement's last parcel clause
         for _, what, m in sorted(items, key=lambda x: x[0]):
             if what == "block":
-                self._block = (m.group(1).lstrip("0") or "0", self.row.index)
+                self._block = (unpad(m.group(1)), self.row.index)
             elif what == "parcel":
                 group = []
                 block = self._block if self._block and self.row.index - self._block[1] <= CARRY_BLOCKS else None
@@ -386,7 +395,7 @@ class _Reader:
             # next to several parcels, or with no parcel before it: dropped (a guess)
 
     def _set_sub(self, index: int, sub: str) -> None:
-        self.facts[index] = replace(self.facts[index], sub_parcel=sub.lstrip("0") or "0")
+        self.facts[index] = replace(self.facts[index], sub_parcel=unpad(sub))
 
     # addresses and cities
 
@@ -444,9 +453,9 @@ class _Reader:
             if len(self.facts) == before and (m := parse_block_parcel(_light(value))) != (None, None, None):
                 b, p, s = m
                 if b and p and not _ADJACENT.search(value):
-                    self._block = (b.lstrip("0") or "0", self.row.index)
-                    i = self.add(kind=PARCEL, block=b.lstrip("0") or "0", parcel=p.lstrip("0") or "0",
-                                 sub_parcel=(s.lstrip("0") or "0") if s else None, written=_light(value))
+                    self._block = (unpad(b), self.row.index)
+                    i = self.add(kind=PARCEL, block=unpad(b), parcel=unpad(p),
+                                 sub_parcel=unpad(s) if s else None, written=_light(value))
                     self._last_parcel = (i, self.row.index) if i is not None and not s else None
 
     def line(self, line: str, *, free: bool) -> None:
@@ -491,7 +500,7 @@ def _expand(listing: str) -> Iterable[str]:
         m = re.fullmatch(r"(\d+)\s*[-–־]\s*(\d+)", part)
         if m is None:
             if part.isdigit():
-                yield part.lstrip("0") or "0"
+                yield unpad(part)
             continue
         lo, hi = int(m.group(1)), int(m.group(2))
         if lo <= hi and hi - lo < MAX_PARCELS:
@@ -542,14 +551,6 @@ def derive(blocks: Iterable, units: Sequence = ()) -> list[Fact]:
 
 # --- the units: assignment and the unit's identity -----------------------------------------------------------------------
 
-def _owner(units: Sequence, block_index: int) -> int | None:
-    """The number of the unit that holds a block: `DOCUMENT_SCOPE` for a version with no units, None for a block outside
-    every unit."""
-    if not units:
-        return DOCUMENT_SCOPE
-    return next((u.unit_no for u in units if u.block_first <= block_index <= u.block_last), None)
-
-
 def is_subject(unit) -> bool:
     """Whether a unit is an appraisal of a property of the file (not an appendix, a comparables part or a cover)."""
     return unit.kind not in contexts.NON_SUBJECT_KINDS and unit.kind != unit_store.FRONT_MATTER
@@ -581,7 +582,7 @@ def assign(found: Iterable[Fact], units: Sequence) -> list[Fact]:
     by_no = {u.unit_no: u for u in units}
     out = []
     for f in sorted(found, key=lambda x: (x.block_index, x.kind, x.written)):
-        owner = _owner(units, f.block_index)
+        owner = owner_of_block(units, f.block_index)
         if owner is None or (units and not is_subject(by_no[owner])) or (units and _in_edge(ordered, owner, f)):
             continue
         out.append(replace(f, unit_no=owner))
@@ -634,8 +635,6 @@ def unit_identities(assigned: Sequence[Fact], units: Sequence, *, header_city: s
 
 # --- the store ---------------------------------------------------------------------------------------------------------------
 
-_VISIBLE_SQL = ("SELECT v.id AS version_id, v.document_id FROM document_versions v JOIN documents d"
-                f" ON d.id = v.document_id WHERE v.id = ANY(:v) AND {APPRAISALS_SQL}")
 _ROWS_SQL = ("SELECT version_id, block_index, page, kind, block, parcel, sub_parcel, apartment, street, number, city,"
              " labelled, written, section FROM version_identities WHERE version_id = ANY(:v) AND identity_version = :iv"
              " ORDER BY version_id, block_index, kind, written")
@@ -657,15 +656,8 @@ def _stored(conn: Connection, version_ids: Sequence[UUID]) -> dict[UUID, list[Fa
     return out
 
 
-def _units_of(conn: Connection, version_id: UUID, cache: dict) -> tuple:
-    key = ("units", version_id)
-    if key not in cache:
-        cache[key] = tuple(unit_store.ensure(conn, version_id))
-    return cache[key]
-
-
 def prime_units(conn: Connection, version_ids: Iterable[UUID | str], cache: dict) -> None:
-    """The stored units of many appraisal versions in one query, into the cache keys `_units_of` reads, before their
+    """The stored units of many appraisal versions in one query, into the cache keys `units_of` reads, before their
     identities are read together; a version whose units the cache holds, and one with none stored, is left alone."""
     todo = sorted((v for v in dict.fromkeys(UUID(str(v)) for v in version_ids) if ("units", v) not in cache), key=str)
     for v, units in unit_store.stored_many(conn, todo).items():
@@ -678,7 +670,7 @@ def _derive_and_store(conn: Connection, version_id: UUID, document_id: UUID, cac
     across processes the advisory lock makes the second writer find the first's rows. A transaction that cannot write
     still gets its facts."""
     blocks = conn.execute(text(_BLOCKS_SQL), {"v": version_id}).all()
-    units = _units_of(conn, version_id, cache)
+    units = units_of(conn, version_id, cache)
     derived = derive(blocks, units)
     lock = flight("identity", str(version_id), IDENTITY_VERSION)
     try:
@@ -712,7 +704,7 @@ def ensure(conn: Connection, version_id: UUID | str, document_id: UUID | str, *,
     v, d = UUID(str(version_id)), UUID(str(document_id))
     stored = _stored(conn, [v]).get(v)
     if stored is not None:
-        return tuple(assign(stored, _units_of(conn, v, cache)))
+        return tuple(assign(stored, units_of(conn, v, cache)))
     return _derive_and_store(conn, v, d, cache)
 
 
@@ -720,7 +712,8 @@ def derive_at_publish(conn: Connection, version_id: UUID | str, document_id: UUI
     """The publish hook, next to `units.replace` (KTD15): the version's identities are derived and stored in the publish
     transaction. They are a derived cache, so a failure here never fails the publish: the lazy read derives them again."""
     try:
-        ensure(conn, version_id, document_id)
+        with conn.begin_nested():  # a database error in the reads rolls back to here: the publish transaction stays usable
+            ensure(conn, version_id, document_id)
     except Exception:  # noqa: BLE001
         logger.warning("identities of version %s not derived at publish", version_id, exc_info=True)
 
@@ -735,7 +728,7 @@ def facts(conn: Connection, version_ids: Iterable[UUID | str], *, cache: dict | 
     # concurrent cold turns over overlapping versions must take them in the same order to never wait on each other
     missing = sorted((v for v in ids if ("identity", v) not in cache), key=str)
     if missing:
-        visible = {r.version_id: r.document_id for r in conn.execute(text(_VISIBLE_SQL), {"v": missing})}
+        visible = {r.version_id: r.document_id for r in conn.execute(text(VISIBLE_SQL), {"v": missing})}
         prime_units(conn, list(visible), cache)
         stored = _stored(conn, list(visible))
         for v in missing:
@@ -743,7 +736,7 @@ def facts(conn: Connection, version_ids: Iterable[UUID | str], *, cache: dict | 
                 cache[("identity", v)] = None
                 continue
             found = stored.get(v)
-            cache[("identity", v)] = (tuple(assign(found, _units_of(conn, v, cache))) if found is not None
+            cache[("identity", v)] = (tuple(assign(found, units_of(conn, v, cache))) if found is not None
                                       else _derive_and_store(conn, v, visible[v], cache))
     return {v: cache[("identity", v)] for v in ids if cache.get(("identity", v)) is not None}
 
@@ -751,19 +744,19 @@ def facts(conn: Connection, version_ids: Iterable[UUID | str], *, cache: dict | 
 def identities(conn: Connection, version_ids: Iterable[UUID | str], *,
                cache: dict | None = None) -> dict[UUID, dict[int, UnitIdentity]]:
     """The identity of each subject unit of each version (a version the caller cannot read is not in the result). The
-    header city of a one-unit file whose body names no city is looked up once per version."""
+    header city of the one-unit files whose body names no city is looked up for all of them in one query (round 12)."""
     cache = {} if cache is None else cache
     got = facts(conn, version_ids, cache=cache)
-    out: dict[UUID, dict[int, UnitIdentity]] = {}
+    bases: dict[UUID, tuple[dict[int, UnitIdentity], tuple]] = {}
     for v, assigned in got.items():
-        key = ("identities", v)
-        if key not in cache:
-            units = _units_of(conn, v, cache)
-            base = unit_identities(assigned, units)
-            header = None
-            if len(base) == 1 and not next(iter(base.values())).cities:
-                header = (report_header(conn, v) or {}).get("city")
-                header = header if isinstance(header, str) else None
-            cache[key] = unit_identities(assigned, units, header_city=header) if header else base
-        out[v] = cache[key]
-    return out
+        if ("identities", v) not in cache:
+            units = units_of(conn, v, cache)
+            bases[v] = (unit_identities(assigned, units), (assigned, units))
+    # the header city of every one-unit file whose body names none, read together (one query, however many such files)
+    needing = [v for v, (base, _) in bases.items() if len(base) == 1 and not next(iter(base.values())).cities]
+    headers = report_headers(conn, needing) if needing else {}
+    for v, (base, (assigned, units)) in bases.items():
+        header = (headers.get(v) or {}).get("city")
+        header = header if isinstance(header, str) else None
+        cache[("identities", v)] = unit_identities(assigned, units, header_city=header) if header else base
+    return {v: cache[("identities", v)] for v in got}

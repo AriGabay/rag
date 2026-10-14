@@ -472,3 +472,26 @@ def test_a_stop_after_the_answer_finished_leaves_it_done(client, setup, monkeypa
     assert m["status"] == "done"
     after = client.post(f"/api/chat/messages/{m['id']}/cancel").json()
     assert after["status"] == "done" and "9,500" in after["answer"]["markdown"]
+
+
+@pytest.mark.parametrize("where", ["units", "named"])
+def test_revoking_a_document_only_the_time_coverage_record_names_hides_the_message(client, setup, monkeypatch, where):
+    """Round 12 (review finding 3): the coverage record stored with a time answer lists every inventory unit and every named
+    candidate by title and date, though none was cited or touched (not searched, no hit, undated). The stored answer's
+    permission recheck covers those documents like any other it names."""
+    agent = _agent(_public_turn(setup.public))
+    cloud(monkeypatch, setup, agent)
+    login(client, "emp@example.test")
+    m = send(client, new_conversation(client), "מה השווי?")
+    assert m["status"] == "done", m
+    entry = {"document_id": setup.secret, "title": "שומה סינתטית שלא נבדקה", "date": None}
+    record = {"units": [entry]} if where == "units" else {"units": [], "candidates": {"named": [entry], "count": 1}}
+    with tenant_tx(setup.system) as conn:
+        stored = conn.execute(text("SELECT answer FROM messages WHERE id = :m"), {"m": m["id"]}).scalar_one()
+        stored["time"] = (stored.get("time") or {}) | {"coverage": record}
+        conn.execute(text("UPDATE messages SET answer = CAST(:a AS jsonb) WHERE id = :m"),
+                     {"a": json.dumps(stored), "m": m["id"]})
+    assert setup.secret in chat_api._answer_documents(stored)
+    assert client.get(f"/api/chat/messages/{m['id']}").json()["answer"].get("hidden") is not True
+    _revoke(setup, setup.secret)
+    assert client.get(f"/api/chat/messages/{m['id']}").json()["answer"].get("hidden") is True

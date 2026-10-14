@@ -240,7 +240,7 @@ def test_a_version_with_no_units_is_one_scope_the_document(office, monkeypatch):
 
 def test_a_single_unit_file_whose_body_names_no_city_takes_the_header_city(office, monkeypatch):
     _, ver = single(office, [HEADER, "כתובת הנכס: הדולב 7", "גוש: 8201 חלקה: 11"])
-    monkeypatch.setattr(I, "report_header", lambda conn, version_id: {"city": "עיר-סינתטית"})
+    monkeypatch.setattr(I, "report_headers", lambda conn, version_ids: {v: {"city": "עיר-סינתטית"} for v in version_ids})
     ident = read(office, ver)[UUID(ver)][1]
     assert ident.cities == frozenset() and ident.header_city == "עיר-סינתטית" and ident.link_city == "עיר-סינתטית"
 
@@ -249,7 +249,7 @@ def test_a_file_of_several_subject_units_never_donates_a_header_city(office, mon
     _, ver = appraisal(office, [
         {"title": "שומה א", "blocks": [HEADER, "כתובת הנכס: הברוש 4", "גוש: 8601 חלקה: 5"]},
         {"title": "שומה ב", "blocks": [HEADER, "כתובת הנכס: הברוש 6", "גוש: 8601 חלקה: 6"]}])
-    monkeypatch.setattr(I, "report_header", lambda conn, version_id: {"city": "עיר-סינתטית"})
+    monkeypatch.setattr(I, "report_headers", lambda conn, version_ids: {v: {"city": "עיר-סינתטית"} for v in version_ids})
     got = read(office, ver)[UUID(ver)]
     assert all(i.header_city is None and i.link_city is None for i in got.values())
 
@@ -257,11 +257,34 @@ def test_a_file_of_several_subject_units_never_donates_a_header_city(office, mon
 def test_the_header_is_not_asked_when_the_body_states_a_city(office, monkeypatch):
     _, ver = single(office, [HEADER, *IDENT])
 
-    def boom(conn, version_id):
+    def boom(conn, version_ids):
         raise AssertionError("the header must not be read")
 
-    monkeypatch.setattr(I, "report_header", boom)
+    monkeypatch.setattr(I, "report_headers", boom)
     assert read(office, ver)[UUID(ver)][1].link_city == "עיר-סינתטית"
+
+
+def test_the_header_cities_of_many_cityless_one_unit_versions_are_read_in_one_call(office, monkeypatch):
+    """Round 12 (review finding 5): the lookup is batched over every version that needs it, not one query per version."""
+    from app.answering import metadata
+
+    made = [single(office, [HEADER, f"כתובת הנכס: הדולב {n}", f"גוש: 82{n:02d} חלקה: 11"], sha=f"{n}" * 64)[1] for n in range(1, 5)]
+    reads: list[list] = []
+    real = metadata._page_headers
+
+    def spy(conn, version_ids):
+        reads.append(list(version_ids))
+        return real(conn, version_ids)
+
+    monkeypatch.setattr(metadata, "_page_headers", spy)
+    got = read(office, *made)
+    assert len(got) == 4 and len(reads) == 1 and {str(v) for v in reads[0]} == set(made), reads
+    # a version whose identities the turn's cache holds is not asked again
+    cache: dict = {}
+    reads.clear()
+    read(office, *made, cache=cache)
+    read(office, *made, cache=cache)
+    assert len(reads) == 1
 
 
 # --- the refresh path (KTD15) ---------------------------------------------------------------------------------------------
@@ -281,6 +304,30 @@ def test_publishing_a_version_derives_its_identities_next_to_the_units(office):
     assert rows(office, ver) == []
     with tenant_tx(office.system) as conn:
         publish_version(conn, UUID(ver), UUID(doc), "test")
+    assert {r.kind for r in rows(office, ver)} == {"city", "address", "parcel"}
+
+
+def test_a_database_error_in_the_identity_reads_at_publish_never_fails_the_publish_transaction(office, monkeypatch):
+    """Round 12 (review finding 4): the derivation's reads run in a savepoint, so a database error there (a timeout, a
+    table the code ran ahead of) rolls back to it and the publish goes on with the same transaction, for the publish
+    hook and for the skipped stages of a document that became an appraisal."""
+    from app.appraisal.publish import run_skipped_stages
+
+    doc, ver = single(office, [HEADER, *IDENT])
+
+    def broken(conn, version_ids):
+        conn.execute(text("SELECT * FROM table_that_does_not_exist_r12"))
+
+    monkeypatch.setattr(I, "_stored", broken)
+    with tenant_tx(office.system) as conn:
+        assert publish_version(conn, UUID(ver), UUID(doc), "test") == "ready"
+    assert rows(office, ver) == [], "nothing was derived"
+    with tenant_tx(office.system) as conn:
+        assert conn.execute(text("SELECT is_current, status FROM document_versions WHERE id = :v"),
+                            {"v": UUID(ver)}).one() == (True, "ready")
+        assert run_skipped_stages(conn, UUID(doc), "test") == [UUID(ver)]
+    monkeypatch.undo()
+    read(office, ver)   # the lazy read derives them afterwards
     assert {r.kind for r in rows(office, ver)} == {"city", "address", "parcel"}
 
 

@@ -51,7 +51,8 @@ from sqlalchemy import Connection, text
 
 from app.chat import contexts, identity
 from app.chat import units as unit_store
-from app.chat.identity import UnitIdentity, same_place
+from app.chat.dates import units_of
+from app.chat.identity import UnitIdentity, same_place, unpad
 from app.platform.source_kinds import APPRAISALS_SQL
 
 # the relations (see the module doc) and the sets they form
@@ -63,6 +64,7 @@ STRENGTH = {PARCEL: 0, ADDRESS_CITY: 1}  # the order a unit's gathered neighbour
 
 # the reasons, as the coverage record and the persisted answer carry them
 REASON_ADDRESS_CITY = "address_city"
+REASON_PARCEL_PREFIX = "parcel "   # a parcel link's reason: this prefix and the shared parcels ("parcel 8401/40")
 REASON_CITIES = "ערים שונות"
 REASON_PARCELS = "קבוצות חלקות זרות"
 REASON_SUB_PARCELS = "תתי-חלקות שונות"
@@ -124,12 +126,14 @@ def _name(parcels: Iterable[tuple[str, str]]) -> str:
     return ", ".join(f"{b}/{p}" for b, p in shown[:LABEL_PARCELS]) + more
 
 
-def relate(a: UnitIdentity, b: UnitIdentity) -> Link:
-    """The relation of two units' identities (KTD4's table, the module doc). Symmetric."""
+def relate(a: UnitIdentity, b: UnitIdentity, pa: dict | None = None, pb: dict | None = None) -> Link:
+    """The relation of two units' identities (KTD4's table, the module doc). Symmetric. ``pa`` and ``pb`` are the units'
+    ``_parcels`` when the caller already has them (the graph keeps them per node)."""
     city_a, city_b = a.link_city, b.link_city
     if city_a and city_b and not same_place(city_a, city_b):
         return Link(OTHER, REASON_CITIES)
-    pa, pb = _parcels(a), _parcels(b)
+    pa = _parcels(a) if pa is None else pa
+    pb = _parcels(b) if pb is None else pb
     shared = pa.keys() & pb.keys()
     if pa and pb and not shared:
         return Link(OTHER, REASON_PARCELS)
@@ -142,7 +146,7 @@ def relate(a: UnitIdentity, b: UnitIdentity) -> Link:
             return Link(SIBLINGS, REASON_APARTMENTS)
         if ONE_SIDED in subs or apartments == ONE_SIDED:
             return Link(CANDIDATE, REASON_SUB_MISSING)
-        return Link(PARCEL, f"parcel {_name(shared)}")
+        return Link(PARCEL, f"{REASON_PARCEL_PREFIX}{_name(shared)}")
     if a.addresses & b.addresses:
         subs = _stated({s for _, _, s in a.parcels if s}, {s for _, _, s in b.parcels if s})
         if DIFFER in (subs, apartments):
@@ -263,6 +267,7 @@ class PropertyGraph:
         self._by_key = {n.key: n for n in self.nodes}
         self._by_version = {(str(n.version_id), n.unit_no): n for n in self.nodes}
         self._links: dict[tuple[Key, Key], Link] = {}
+        self._parcel_maps = {n.key: _parcels(n.identity) for n in self.nodes}
         self._by_parcel: dict[tuple[str, str], list[Node]] = {}
         self._by_address: dict[tuple[str, str], list[Node]] = {}
         for n in self.nodes:
@@ -287,7 +292,8 @@ class PropertyGraph:
         pair = (a, b) if a <= b else (b, a)
         found = self._links.get(pair)
         if found is None:
-            found = self._links[pair] = relate(self._by_key[pair[0]].identity, self._by_key[pair[1]].identity)
+            found = self._links[pair] = relate(self._by_key[pair[0]].identity, self._by_key[pair[1]].identity,
+                                               self._parcel_maps[pair[0]], self._parcel_maps[pair[1]])
         return found
 
     def _neighbours(self, n: Node) -> list[tuple[Node, Link]]:
@@ -383,17 +389,21 @@ class PropertyGraph:
 
 # --- the visible units -----------------------------------------------------------------------------------------------
 
+def _unpadded(parcels: Iterable, addresses: Iterable) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    """Block/parcel pairs and street/number pairs without leading zeros and with the street's spaces collapsed."""
+    return ({(unpad(str(b)), unpad(str(p))) for b, p in parcels},
+            {(" ".join(str(s).split()), unpad(str(n).strip())) for s, n in addresses})
+
+
 def _stored_sets(identifiers: Mapping | None) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
     """(the block/parcel pairs, the street/number pairs) of a unit's stored identifiers (``document_units.identifiers``),
     normalized the way the identity reader writes them (no leading zeros). The stored lists win; a unit that has only its
     ``shown`` strings (an older row) is read from them."""
     stored = identifiers or {}
-    parcels = {(str(b).lstrip("0") or "0", str(p).lstrip("0") or "0") for b, p in stored.get("parcels") or ()}
-    addresses = {(" ".join(str(s).split()), str(n).strip().lstrip("0") or "0") for s, n in stored.get("addresses") or ()}
+    parcels, addresses = _unpadded(stored.get("parcels") or (), stored.get("addresses") or ())
     if not parcels and not addresses and stored.get("shown"):
         ident = contexts.identifiers("\n".join(str(x) for x in stored["shown"]))
-        parcels = {(str(b).lstrip("0") or "0", str(p).lstrip("0") or "0") for b, p in ident.parcels}
-        addresses = {(" ".join(str(s).split()), str(n).strip().lstrip("0") or "0") for s, n in ident.addresses}
+        parcels, addresses = _unpadded(ident.parcels, ident.addresses)
     return parcels, addresses
 
 
@@ -415,15 +425,18 @@ def current_appraisal_files(conn: Connection, document_ids: Iterable | None = No
         + " ORDER BY d.id"), {"d": list(document_ids)} if named else {}).all()
 
 
-def subject_units(conn: Connection, files: Sequence) -> list[tuple]:
+def subject_units(conn: Connection, files: Sequence, cache: dict | None = None) -> list[tuple]:
     """(file, unit) of every subject unit — never an appendix or a comparables part — of the given files, in file and unit
-    order. The stored units are read in one query; a file whose units were not stored yet is read through
+    order. The units ``cache`` (the turn's dict: the keys ``dates.units_of`` reads) already holds are not read again; the
+    stored units of the others are read in one query; a file whose units were not stored yet is read through
     ``units.ensure``, which stores them."""
-    stored = unit_store.stored_many(conn, [f.version_id for f in files])
+    cache = {} if cache is None else cache
+    unread = [f.version_id for f in files if ("units", f.version_id) not in cache]
+    for v, stored in unit_store.stored_many(conn, unread).items():
+        cache[("units", v)] = tuple(stored)
     found = []
     for f in files:
-        units = stored.get(f.version_id) or unit_store.ensure(conn, f.version_id)
-        found += [(f, u) for u in units if u.kind not in contexts.NON_SUBJECT_KINDS]
+        found += [(f, u) for u in units_of(conn, f.version_id, cache) if u.kind not in contexts.NON_SUBJECT_KINDS]
     return found
 
 
@@ -431,10 +444,11 @@ def build_graph(conn: Connection, *, cache: dict | None = None, document_ids: It
     """The graph of the visible, current subject units (of ``document_ids`` only when given), under the caller's
     permissions. Identities come from ``identity.identities`` (derived on first use, ``cache`` is the turn's dict); a
     unit the identity reader does not count as a subject (front matter) is not a node."""
+    cache = {} if cache is None else cache
     files = current_appraisal_files(conn, document_ids)
     found = identity.identities(conn, [f.version_id for f in files], cache=cache)
     nodes = []
-    for f, u in subject_units(conn, files):
+    for f, u in subject_units(conn, files, cache):
         who = found.get(f.version_id, {}).get(u.unit_no)
         if who is not None:
             nodes.append(Node(f.document_id, f.version_id, u.unit_no, with_stored(who, u.identifiers), u.title))

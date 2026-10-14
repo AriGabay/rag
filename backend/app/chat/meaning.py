@@ -437,7 +437,7 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
             for i, cell in enumerate(cells):
                 found, _ = attached(cell)
                 for f, _, q in found:
-                    q = Qualifiers().merge(q, "cell")
+                    q = _tagged(q, "cell")
                     if i > 0:
                         q.merge(_all(cells[0]), "row")  # the row's label
                     if i < len(heads):
@@ -615,6 +615,9 @@ def kind_written(kind: str, context: str) -> str:
     return found.group(0) if found else ""
 
 
+_PERIOD_WORDS = {"month": _MONTH_WORDS, "year": _YEAR_WORDS}   # the words that state each stored period
+
+
 def measurement_states(row, field_: str) -> bool:
     """Whether a stored measurement's period, area basis or VAT is the source's, so that it may back a claim (round 12
     U9, KTD9, R6): the extraction validated it (``timeline._record_states``) and its own words are in the measurement's
@@ -630,7 +633,8 @@ def measurement_states(row, field_: str) -> bool:
     text = _flat(" ".join(str(x) for x in (getattr(row, a, None) for a in ("quote", "caption", "header")) if x))
     value = getattr(row, field_)
     if field_ == "period":
-        return bool({"month": _MONTH_WORDS, "year": _YEAR_WORDS}.get(value, re.compile(r"(?!)")).search(text))
+        words = _PERIOD_WORDS.get(value)
+        return bool(words and words.search(text))
     if field_ == "area_basis":
         basis = _flat(value)
         return basis in text or bool(_all(basis).keys("basis") & _all(text).keys("basis"))

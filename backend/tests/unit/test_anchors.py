@@ -383,3 +383,14 @@ def test_a_source_registered_in_a_workspace_gets_a_stub_with_its_reading_and_row
     listing = ws.add_source(document_id=None, version_id=None, title="רשימה", section=None, location="",
                             kind="listing", text="")
     assert listing.sid not in ws.anchors
+
+
+def test_the_answer_documents_include_the_time_coverage_units_and_named_candidates():
+    from app.chat.api import _answer_documents
+
+    base = {"sources": [{"id": "S1", "document_id": "d1"}]}
+    record = {"units": [{"document_id": "d2", "title": "t", "status": "not_searched_cap"}, {"document_id": "d1"}],
+              "candidates": {"named": [{"document_id": "d3", "title": "u", "date": None}], "count": 2}}
+    assert _answer_documents(base | {"time": {"coverage": record}}) == {"d1", "d2", "d3"}
+    assert _answer_documents(base | {"time": {"coverage": None}}) == {"d1"}, "off mode / old answers: no record"
+    assert _answer_documents(base | {"time": {"coverage": {"units": [], "candidates": None}}}) == {"d1"}

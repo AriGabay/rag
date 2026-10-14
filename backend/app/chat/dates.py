@@ -12,7 +12,7 @@ first use from its stored blocks (`derive`: no file, no model call, no re-read) 
 taken only when it follows a valuation label ("המועד הקובע", "מועד קובע", also "למועד הקובע לשומה ליום ..." and a
 label alone in a cell with the date in the next one). The report-writing and signature labels ("תאריך עריכת השומה",
 "תאריך הדוח", "נחתם", "חתימה") are recognised (`report_dates`) only so that their dates are never taken as valuation
-dates; they are not stored. **Dates-v2** (round 12 U3, R15, KTD11, KTD12) reads further evidenced structures, all inside
+dates; they are not stored. **From dates-v2 on** (round 12 U3, R15, KTD11, KTD12; `DATES_VERSION` is the current one) the reader reads further evidenced structures, all inside
 `_date_after`/`_date_before` so `report_dates` shares them: the label "(ה)תאריך (ה)קובע", the gap words "זו", "קרי" ... and
 the visit phrase (a gap only, never a label), a label-anchored two-digit year (00-69 -> 20YY, day-first, never a range;
 70-99 refused), a date right before its label with a direct connector, a label-only heading followed by a block that starts
@@ -352,13 +352,18 @@ def _heading_is_label(path: Sequence) -> bool:
 
 # --- derivation ----------------------------------------------------------------------------------------------------------
 
+def _cells(row):
+    """The cells of a stored table row: a row is its list of cells or a dict that holds them under ``cells``."""
+    return row.get("cells") if isinstance(row, dict) else row
+
+
 def _table_dates(headers: Sequence, rows: Sequence) -> list[tuple[Parsed, str]]:
     """A table whose header cell holds a valuation label gives the date in the same column, only for a table with ONE
     data row (round 12 U3, KTD11); a table with more rows is a dated history, whose rows hold their own dates. Each date
     comes with the header and cell text it was read from, for the history predicate."""
     if len(rows) != 1:
         return []
-    row = rows[0].get("cells") if isinstance(rows[0], dict) else rows[0]
+    row = _cells(rows[0])
     out: list[tuple[Parsed, str]] = []
     for col, head in enumerate(headers):
         if not isinstance(head, str) or not _VALUATION.search(strip_bidi_controls(head)):
@@ -390,20 +395,13 @@ def _first_row_header(rows: Sequence) -> tuple[list[str], Sequence]:
     valuation label, with the rows left as the data rows (round 12 U3b, KTD11); otherwise no header."""
     if not rows:
         return [], rows
-    first = rows[0].get("cells") if isinstance(rows[0], dict) else rows[0]
+    first = _cells(rows[0])
     if not isinstance(first, Sequence) or isinstance(first, str):
         return [], rows
     cells = [c if isinstance(c, str) else "" for c in first]
     if any(_VALUATION.search(strip_bidi_controls(c)) for c in cells):
         return cells, rows[1:]
     return [], rows
-
-
-def _agree(isos: Iterable[str]) -> bool:
-    """Whether every ISO text is the finest one or a coarser form of it."""
-    values = list(isos)
-    finest = max(values, key=len)
-    return all(finest.startswith(v) for v in values)
 
 
 def derive(blocks: Iterable, tables: Mapping[int, Mapping] | None = None) -> list[Found]:
@@ -496,7 +494,7 @@ def derive(blocks: Iterable, tables: Mapping[int, Mapping] | None = None) -> lis
         for p, bounds, _, _ in read:
             by_sentence[bounds].append(p)
         for p, bounds, sentence, primary in read:
-            if not _agree(x.iso for x in by_sentence[bounds]):
+            if _agreeing(by_sentence[bounds]) is None:
                 continue   # two different labelled dates in one sentence: a comparison, none of them a statement
             if not lead_history and not is_history(sentence, path):
                 take(index, p, primary)
@@ -505,8 +503,9 @@ def derive(blocks: Iterable, tables: Mapping[int, Mapping] | None = None) -> lis
 
 # --- the units: assignment and the unit's valuation date ---------------------------------------------------------------
 
-def _agreeing(dates: Sequence[StatedDate]) -> StatedDate | None:
-    """The finest date when every date is that one or a coarser form of it (a month of the day's month), else None."""
+def _agreeing[D: (StatedDate, Parsed)](dates: Sequence[D]) -> D | None:
+    """The finest date when every date is that one or a coarser form of it (a month of the day's month), else None. A
+    date is a `StatedDate` or a parsed one (the labelled dates of one sentence): both carry the ISO text."""
     finest = max(dates, key=lambda d: len(d.iso))
     return finest if all(finest.iso.startswith(d.iso) for d in dates) else None
 
@@ -519,7 +518,7 @@ def _settled(dates: Sequence[StatedDate]) -> StatedDate | None:
     return _agreeing(primary or dates)
 
 
-def _owner(units: Sequence, block_index: int) -> int | None:
+def owner_of_block(units: Sequence, block_index: int) -> int | None:
     """The number of the unit that holds a block: `DOCUMENT_SCOPE` for a version with no units, None for a block outside
     every unit."""
     if not units:
@@ -530,7 +529,7 @@ def _owner(units: Sequence, block_index: int) -> int | None:
 def assign(found: Iterable[Found], units: Sequence) -> list[StatedDate]:
     """The dates with the unit that holds each block now and the status of that unit: `conflict` when its dates do not
     agree. A version with no units is one scope (`DOCUMENT_SCOPE`); a block outside every unit has no unit."""
-    owned = [(f, _owner(units, f.block_index)) for f in sorted(found, key=lambda x: (x.block_index, x.iso))]
+    owned = [(f, owner_of_block(units, f.block_index)) for f in sorted(found, key=lambda x: (x.block_index, x.iso))]
     plain = [StatedDate(f.block_index, f.iso, f.precision, f.written, "stated", owner, f.primary) for f, owner in owned]
     by_unit: dict[int, list[StatedDate]] = defaultdict(list)
     for d in plain:
@@ -553,7 +552,7 @@ def resolve_unit(dates: Sequence[StatedDate], unit_no: int | None) -> UnitValuat
 
 # --- the store -----------------------------------------------------------------------------------------------------------
 
-_VISIBLE_SQL = ("SELECT v.id AS version_id, v.document_id FROM document_versions v JOIN documents d"
+VISIBLE_SQL = ("SELECT v.id AS version_id, v.document_id FROM document_versions v JOIN documents d"
                 f" ON d.id = v.document_id WHERE v.id = ANY(:v) AND {APPRAISALS_SQL}")
 _ROWS_SQL = ("SELECT version_id, block_index, iso, precision, written, primary_section FROM version_dates"
              " WHERE version_id = ANY(:v) AND dates_version = :dv ORDER BY version_id, block_index, iso")
@@ -577,7 +576,7 @@ def _stored(conn: Connection, version_ids: Sequence[UUID]) -> dict[UUID, list[Fo
     return out
 
 
-def _units_of(conn: Connection, version_id: UUID, cache: dict) -> tuple:
+def units_of(conn: Connection, version_id: UUID, cache: dict) -> tuple:
     key = ("units", version_id)
     if key not in cache:
         cache[key] = tuple(unit_store.ensure(conn, version_id))
@@ -585,9 +584,9 @@ def _units_of(conn: Connection, version_id: UUID, cache: dict) -> tuple:
 
 
 def prime_units(conn: Connection, version_ids: Iterable[UUID | str], cache: dict) -> None:
-    """The stored units of many appraisal versions in one query, into the cache keys `_units_of` reads, before their
+    """The stored units of many appraisal versions in one query, into the cache keys `units_of` reads, before their
     dates are read together (`valuation_dates`); a version whose dates or units the cache holds, and one with no units
-    stored, is left alone (`_units_of`: `units.ensure` builds them)."""
+    stored, is left alone (`units_of`: `units.ensure` builds them)."""
     todo = sorted((v for v in dict.fromkeys(UUID(str(v)) for v in version_ids)
                    if ("dates", v) not in cache and ("units", v) not in cache), key=str)
     for v, units in unit_store.stored_many(conn, todo).items():
@@ -601,7 +600,7 @@ def _derive_and_store(conn: Connection, version_id: UUID, document_id: UUID, cac
     cannot write still gets its dates."""
     blocks = conn.execute(text(_BLOCKS_SQL), {"v": version_id}).all()
     tables = {b.table_index: b.structure for b in blocks if b.table_index is not None and b.structure}
-    units = _units_of(conn, version_id, cache)
+    units = units_of(conn, version_id, cache)
     assigned = tuple(assign(derive(blocks, tables), units))
     lock = flight("dates", str(version_id), DATES_VERSION)
     try:
@@ -636,14 +635,14 @@ def valuation_dates(conn: Connection, version_ids: Iterable[UUID | str], *,
     # concurrent cold turns over overlapping versions must take them in the same order to never wait on each other
     missing = sorted((v for v in ids if ("dates", v) not in cache), key=str)
     if missing:
-        visible = {r.version_id: r.document_id for r in conn.execute(text(_VISIBLE_SQL), {"v": missing})}
+        visible = {r.version_id: r.document_id for r in conn.execute(text(VISIBLE_SQL), {"v": missing})}
         stored = _stored(conn, list(visible))
         for v in missing:
             if v not in visible:
                 cache[("dates", v)] = None
                 continue
             found = stored.get(v)
-            cache[("dates", v)] = (tuple(assign(found, _units_of(conn, v, cache))) if found is not None
+            cache[("dates", v)] = (tuple(assign(found, units_of(conn, v, cache))) if found is not None
                                    else _derive_and_store(conn, v, visible[v], cache))
     return {v: cache[("dates", v)] for v in ids if cache.get(("dates", v)) is not None}
 
@@ -658,7 +657,7 @@ def unit_valuation(conn: Connection, version_id: UUID | str, block_index: int, *
     dates = valuation_dates(conn, [v], cache=cache).get(v)
     if dates is None:
         return UnitValuation("none", None, (), None)
-    unit_no = _owner(_units_of(conn, v, cache), block_index)
+    unit_no = owner_of_block(units_of(conn, v, cache), block_index)
     if unit_no is None:
         return UnitValuation("none", None, (), None)
     return resolve_unit([d for d in dates if d.unit_no == unit_no], unit_no)

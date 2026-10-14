@@ -213,6 +213,27 @@ def test_a_passage_only_latest_claim_is_held_to_the_coverage_of_the_passage():
     assert _check(f"הערך העדכני ביותר הוא 2,410,000 ₪ [{sid}].", other) == []
 
 
+def _passage_ws() -> tuple[Workspace, str]:
+    ws = _covered(_ws(*V), complete=False)
+    ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="שומה 2025", section="סיכום", location="סעיף 3",
+                  kind="context", text="השימוש הנוכחי בנכס הוא משרדים. השווי נקבע בסך 2,410,000 ₪")
+    sid = next(iter(ws.sources))
+    ws.time_calls[0].sids = [sid]
+    return ws, sid
+
+
+def test_a_passage_only_sentence_with_current_wording_that_states_no_amount_raises_no_problem_under_partial_coverage():
+    """Review finding 6: "the current use of the property" is no claim about the latest datum."""
+    ws, sid = _passage_ws()
+    assert _check(f"השימוש הנוכחי בנכס הוא משרדים [{sid}].", ws) == []
+    assert _check(f"המצב הנוכחי של הבניין תקין [{sid}]. השימוש האחרון בקומה 3 היה משרדים [{sid}].", ws) == [], \
+        "the citation marker and a floor number are no amount of a datum"
+    # the latest word and an amount in one clause is still a claim about a datum
+    assert len(_check(f"הערך העדכני ביותר הוא 2,410,000 ₪ [{sid}].", ws)) == 1
+    # a unit that cites a dated datum is held to the coverage whatever its wording
+    assert len(_check("השימוש הנוכחי בנכס הוא משרדים [V3].", _covered(_ws(*V), complete=False))) == 1
+
+
 def test_the_round_11_later_value_message_still_wins_when_a_later_value_exists_under_partial_coverage():
     (p,) = _check("השווי העדכני הוא 2,100,000 ₪ [V1].", _covered(_ws(*V), complete=False))
     assert "20/01/2025" in p.reason and "V3" in p.reason

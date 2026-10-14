@@ -10,6 +10,7 @@ the synthetic round-12 ones: single appraisals uploaded through the worker, and 
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import date
 
 import pytest
@@ -441,3 +442,41 @@ def test_s2_the_off_mode_search_adds_no_link_and_no_unit_line(office12):
     ws = focused(office12, NONE, ids["parcels_b"])
     out = run(ws, "search", query="שווי הנכס הדס", limit=6)
     assert not any("link" in s for s in sources_of(out)) and T.MSG_PROPERTY_UNITS_HEAD not in out
+
+
+# --- a document the user cannot see is no part of the property graph or the coverage record (review: privacy) --------------
+
+def test_a_user_who_cannot_see_one_of_two_linked_appraisals_gets_no_link_no_title_and_no_count_of_it(office):
+    """The graph, the link reasons, the candidates and the coverage record are built under the caller's permissions: the
+    appraisal of a closed group is neither linked, named as a candidate nor counted, for a user outside the group; a member
+    of the group sees both."""
+    from tests.factories import make_group, make_user
+    from tests.integration.test_tools_pools import workspace
+
+    private = make_group(office, "קבוצה סגורה סינתטית")
+    member = make_user(office, "member-r12i@example.test", [office.default_group_id, private])
+    outsider = make_user(office, "outsider-r12i@example.test", [office.default_group_id])
+    seen = appraisal(office, "visible-linked", "01/01/2022")
+    hidden = appraisal(office, "hidden-linked", "01/01/2025", group=private)
+    hidden_candidate = appraisal(office, "hidden-cityless", "01/01/2024", identification=[
+        "כתובת הנכס: הצאלון 7"], group=private)   # states no city: a candidate, not a link
+
+    def turn(user):
+        ws = workspace(office, "property", user=user)
+        ws.time = RECENT
+        ver, reading = version_of(office, seen)
+        ws.unit_focus = {"handle": T.unit_handle_of(ws, seen, ver, reading, 1), "document_id": seen, "unit_id": None}
+        return ws, run(ws, "search", query=QUERY, limit=6)
+
+    ws, out = turn(outsider)
+    record = json.dumps(ws.time_coverage, ensure_ascii=False)
+    for secret in (hidden, hidden_candidate, "hidden-linked", "hidden-cityless"):
+        assert secret not in out and secret not in record, secret
+    assert order(out) == [seen] and "link=" not in out and T.MSG_PROPERTY_UNITS_HEAD not in out
+    assert [u["document_id"] for u in ws.time_coverage["units"]] == [seen]
+    assert (ws.time_coverage.get("candidates") or {"count": 0})["count"] == 0
+    assert (ws.time_coverage.get("property") or {}).get("units", 1) == 1
+
+    ws, out = turn(member)    # the control: the member of the group sees what the outsider cannot
+    assert set(order(out)) >= {seen, hidden} and "link=" in out
+    assert {u["document_id"] for u in ws.time_coverage["units"]} == {seen, hidden}

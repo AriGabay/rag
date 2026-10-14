@@ -146,6 +146,12 @@ def report_header(conn: Connection, version_id: UUID) -> dict:
     return _page_headers(conn, [version_id]).get(version_id) or {}
 
 
+def report_headers(conn: Connection, version_ids: Sequence[UUID]) -> dict[UUID, dict]:
+    """The header fields of many versions in one query (a version with no stored pages is not in the result): what a caller
+    over a whole office reads instead of ``report_header`` once per version (round 12, identity.identities)."""
+    return _page_headers(conn, list(dict.fromkeys(version_ids)))
+
+
 def header_places(conn: Connection) -> set[tuple[str | None, str]]:
     """(city, neighborhood) pairs and (None, city) entries named by the headers of current, visible
     narrative reports (versions without records), so the gazetteer knows places those reports cover."""

@@ -41,22 +41,26 @@ def current_versions(conn: Connection) -> list[tuple[UUID, UUID]]:
     return [(r.version_id, r.document_id) for r in conn.execute(text(_CURRENT_SQL))]
 
 
+def _missing_identities(conn: Connection, versions: list[tuple[UUID, UUID]]) -> list[tuple[UUID, UUID]]:
+    """The (version, document) pairs that have no identity row of the current `IDENTITY_VERSION`."""
+    have = {r.version_id for r in conn.execute(text(_WITH_IDENTITIES_SQL), {"v": [v for v, _ in versions],
+                                                                             "iv": identity.IDENTITY_VERSION})}
+    return [(v, d) for v, d in versions if v not in have]
+
+
 def warm_identities(conn: Connection, versions: list[tuple[UUID, UUID]], cache: dict) -> int:
     """Derive the identity rows of the versions that have none of the current `IDENTITY_VERSION` (the lazy read does the
     writing, in a savepoint). Returns how many versions it derived."""
-    have = {r.version_id for r in conn.execute(text(_WITH_IDENTITIES_SQL), {"v": [v for v, _ in versions],
-                                                                             "iv": identity.IDENTITY_VERSION})}
-    todo = [(v, d) for v, d in versions if v not in have]
+    todo = _missing_identities(conn, versions)
     for v, d in todo:
         identity.ensure(conn, v, d, cache=cache)
     return len(todo)
 
 
 def warm_dates(conn: Connection, version_ids: list[UUID], cache: dict) -> int:
-    """THE DATES HOOK. Warm the valuation dates of the versions through the existing read, `chat.dates.valuation_dates`,
-    which derives and stores rows of whichever `DATES_VERSION` is current and returns the versions that are readable. When
-    the dates-v2 extraction (round 12 U3) lands, this same call warms dates-v2: nothing here changes. Returns how many
-    versions it read."""
+    """Warm the valuation dates of the versions through the existing read, `chat.dates.valuation_dates`, which derives and
+    stores rows of whichever `DATES_VERSION` is current (a new dates version needs no change here) and returns the
+    versions that are readable. Returns how many versions it read."""
     return len(dates.valuation_dates(conn, version_ids, cache=cache))
 
 
@@ -70,9 +74,7 @@ def warm_office(ctx: TenantContext, *, dry_run: bool = False, batch: int = BATCH
         chunk = versions[start:start + batch]
         with tenant_tx(ctx) as conn:
             if dry_run:
-                have = {r.version_id for r in conn.execute(text(_WITH_IDENTITIES_SQL), {
-                    "v": [v for v, _ in chunk], "iv": identity.IDENTITY_VERSION})}
-                counts["identities_derived"] += len([1 for v, _ in chunk if v not in have])
+                counts["identities_derived"] += len(_missing_identities(conn, chunk))
                 continue
             cache: dict = {}
             counts["identities_derived"] += warm_identities(conn, chunk, cache)

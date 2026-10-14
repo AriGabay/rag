@@ -650,3 +650,32 @@ def test_validate_requested_keeps_sources_conflict_exactly_when_the_timeline_sho
         o.value(o.doc(), "2,300,000", second)
         status, marked = claimed(o, v1)
         assert marked is expected and (status == "sources_conflict") is expected
+
+
+def test_a_property_graph_that_cannot_be_read_gives_every_datum_no_identity_and_the_conflict_check_no_key(monkeypatch):
+    """The timeline is an addition (round 12 U6): when ``property_partition`` raises, each datum keeps its own identity
+    (``Identity(None)``) and ``property_key`` is None, instead of the turn failing."""
+    from contextlib import contextmanager
+
+    o = Office()
+    v1 = o.value(o.doc(), "2,450,000", as_of("2025-03-31"))
+    v2 = o.value(o.doc(), "2,300,000", as_of("2024-03-31"))
+    ws = o.ws
+    ws.__dict__.pop(timeline._ATTR)   # the stand-in goes: the real reader runs, under a context
+    ws.ctx = object()
+
+    @contextmanager
+    def tx(ctx):
+        yield None
+
+    def broken(ws_, conn):
+        raise RuntimeError("the graph could not be built")
+
+    monkeypatch.setattr(timeline, "tenant_tx", tx)
+    monkeypatch.setattr(timeline, "property_partition", broken)
+    who = timeline._UnitIdentity(ws)
+    assert [who(d) for d in timeline.datums(ws)] == [timeline.Identity(None)] * 2
+    assert who.partition is False, "the failure is remembered: the graph is not read again"
+    for ref in (v1, v2):
+        value = ws.values[ref]
+        assert timeline.property_key(ws, ref, value.document_id, value.version_id, value.context) is None

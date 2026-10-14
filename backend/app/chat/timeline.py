@@ -42,6 +42,7 @@ timeline is an addition to an answer, never the reason to lose it."""
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 from datetime import date
@@ -341,16 +342,25 @@ def groups(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Id
     everything = datums(ws)
     wanted = [d for d in everything if d.ref in cited]
     cache: dict = {}
+    alone = {f for f, n in Counter(d.fields for d in everything if d.fields is not None).items() if n == 1}
+
+    def key_of(d: Datum) -> tuple:
+        # a datum whose fields no other datum has is alone in its group whatever its property is: the group is dropped by
+        # every reader (``build``, ``later_than``: no second dated value, no later one), so its property is never read
+        if d.fields in alone:
+            return ("alone", d.ref)
+        return _full_key(d, identity, cache)
+
     found: dict[tuple, list[Datum]] = {}
     for d in wanted:
-        found.setdefault(_full_key(d, identity, cache), [])
+        found.setdefault(key_of(d), [])
     # only a datum whose other fields match a cited one's could share its key: the rest never has its property read
     fields = {d.fields for d in wanted if d.fields is not None}
     for d in everything:
         if d.fields is None:
             if ("unknown", d.ref) in found:
                 found[("unknown", d.ref)].append(d)
-        elif d.fields in fields and (key := _full_key(d, identity, cache)) in found:
+        elif d.fields in fields and (key := key_of(d)) in found:
             found[key].append(d)
     return list(found.values())
 

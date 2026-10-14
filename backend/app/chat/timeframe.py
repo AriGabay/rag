@@ -224,7 +224,8 @@ def resolve(question: str, time_preference: dict | None) -> TimeMode:
 
 # the one phrase the answer uses for a datum when not every appraisal of the property was checked (round 12 U8, R12, KTD8;
 # session-settled): the latest datum in the sources checked, never the latest in the repository
-LATEST_CHECKED = "הנתון המאוחר ביותר במקורות שנבדקו"
+QUALIFIED = "במקורות שנבדקו"   # the words that qualify a "latest" claim (`verify` checks for them)
+LATEST_CHECKED = f"הנתון המאוחר ביותר {QUALIFIED}"
 PHRASE_RULE = (
     f"כשתוצאת החיפוש מציינת שכיסוי השומות חלקי, או שהנכס לא זוהה, אל תכתוב על נתון שהוא «העדכני ביותר» או «האחרון»: "
     f"כתוב «{LATEST_CHECKED}» וציין מה לא נבדק. גם כשהכיסוי מלא, אל תכתוב שזה הנתון האחרון במאגר — רק של השומות "
@@ -283,10 +284,21 @@ def block(time: TimeMode) -> str | None:
 # The server words the coverage record (``tools.coverage_record``; persisted as ``answer.time.coverage``) itself, from the
 # record alone: the same note is in the payload and the copy text whether or not the answer has timeline rows, and the model
 # never decides it. A message without a record reads as "not recorded": no note, never "complete". Statuses and blocking
-# reasons are the record's own strings (``tools.HIT``, ``B_NOT_IDENTIFIED``, ...: this module cannot import ``tools``).
+# reasons are the record's own strings, defined here once (this module is a leaf: ``tools`` imports them).
+
+HIT, NO_MATCH, NOT_SEARCHED_CAP = "hit", "no_match", "not_searched_cap"
+# a record built at answer time for a turn that ran no time-ranked search (``read_coverage``, round 12 U12b): a unit whose
+# source the answer cites was ``READ``; every other unit of the property is ``NOT_SEARCHED`` (no search ran at all)
+READ, NOT_SEARCHED = "read", "not_searched"
+PROPERTY, UNIT, WINDOW = "property", "unit", "window"  # what a record covers: a gathered property, one unit, a relevance window
+# why a record is not complete (``tools.assess_coverage``); a unit that causes one carries ``blocks``
+B_NEWER, B_NO_MATCH, B_RANGE = "newer_not_searched", "newer_no_match", "range_not_searched"
+B_UNDATED, B_CANDIDATES, B_UNDETERMINED = "undated", "candidates", "undetermined"
+B_NOT_IDENTIFIED, B_WINDOW, B_SEVERAL = "not_identified", "window", "several_scopes"
+B_NOT_SEARCHED = "not_searched"
 
 MSG_NOTE_RECENT = f"{LATEST_CHECKED}."
-MSG_NOTE_EXPLICIT = "הנתונים לתקופה שביקשת נמצאו רק במקורות שנבדקו."
+MSG_NOTE_EXPLICIT = f"הנתונים לתקופה שביקשת נמצאו רק {QUALIFIED}."
 MSG_NOTE_NOT_IDENTIFIED = "הנכס לא זוהה; נבדקה רק השומה שבמוקד."
 MSG_NOTE_COMPLETE = "נבדקו כל השומות של הנכס הזמינות לך ({n})."  # relative to the appraisals visible to the user
 MSG_GROUP_CAP = "לא נבדקו (מגבלת מספר השומות בחיפוש)"
@@ -341,21 +353,21 @@ def coverage_note(record: dict | None) -> str | None:
     blocking = record.get("blocking") or []
     if record.get("complete"):
         return MSG_NOTE_COMPLETE.format(n=len(units))
-    if "not_identified" in blocking:
+    if B_NOT_IDENTIFIED in blocking:
         return MSG_NOTE_NOT_IDENTIFIED
     lines = [MSG_NOTE_EXPLICIT if record["mode"] == "explicit" else MSG_NOTE_RECENT]
     dated = [u for u in units if not u.get("undated")]
     candidates = record.get("candidates") or {}
     undetermined = int(record.get("undetermined") or 0)
     lines += [ln for ln in (
-        _group(MSG_GROUP_CAP, [u for u in dated if u["status"] == "not_searched_cap" and u.get("blocks")]),
-        _group(MSG_GROUP_NO_MATCH, [u for u in dated if u["status"] == "no_match" and u.get("blocks")]),
-        _group(MSG_GROUP_READ_ONLY, [u for u in dated if u["status"] == "not_searched" and u.get("blocks")]),
+        _group(MSG_GROUP_CAP, [u for u in dated if u["status"] == NOT_SEARCHED_CAP and u.get("blocks")]),
+        _group(MSG_GROUP_NO_MATCH, [u for u in dated if u["status"] == NO_MATCH and u.get("blocks")]),
+        _group(MSG_GROUP_READ_ONLY, [u for u in dated if u["status"] == NOT_SEARCHED and u.get("blocks")]),
         _group(MSG_GROUP_UNDATED, [u for u in units if u.get("undated")], dated=False),
         _group(MSG_GROUP_CANDIDATES, list(candidates.get("named") or []), int(candidates.get("count") or 0)),
         f"{MSG_GROUP_UNDETERMINED}: {undetermined}." if undetermined else None,
-        MSG_GROUP_WINDOW if "window" in blocking else None,
-        MSG_GROUP_SEVERAL if "several_scopes" in blocking else None) if ln]
+        MSG_GROUP_WINDOW if B_WINDOW in blocking else None,
+        MSG_GROUP_SEVERAL if B_SEVERAL in blocking else None) if ln]
     return "\n".join(lines)
 
 

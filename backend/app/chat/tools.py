@@ -171,8 +171,36 @@ from app.chat import unread as unread_text
 from app.chat.contexts import MSG_NO_TITLE
 from app.chat.evidence import TABLE_SIZE_PREFIX
 from app.chat.intent import MIXED, PROFESSIONAL
-from app.chat.property import REASON_ADDRESS_CITY, Gathered, Partition, PropertyGraph, build_graph, label_of
-from app.chat.timeframe import TimeMode
+from app.chat.property import (
+    REASON_ADDRESS_CITY,
+    REASON_PARCEL_PREFIX,
+    Gathered,
+    Partition,
+    PropertyGraph,
+    build_graph,
+    label_of,
+)
+from app.chat.timeframe import (
+    B_CANDIDATES,
+    B_NEWER,
+    B_NO_MATCH,
+    B_NOT_IDENTIFIED,
+    B_NOT_SEARCHED,
+    B_RANGE,
+    B_SEVERAL,
+    B_UNDATED,
+    B_UNDETERMINED,
+    B_WINDOW,
+    HIT,
+    NO_MATCH,
+    NOT_SEARCHED,
+    NOT_SEARCHED_CAP,
+    PROPERTY,
+    READ,
+    UNIT,
+    WINDOW,
+    TimeMode,
+)
 from app.chat.timing import StageClock
 from app.config import get_settings
 from app.db import TenantContext, current_data_version, tenant_tx
@@ -1537,19 +1565,6 @@ def measurement_date(ws: Workspace, row, caption: str | None = None) -> dict | N
     return None if found is None else dict(found)
 
 
-def _captions(conn: Connection, rows: Iterable) -> dict[tuple, str | None]:
-    """The caption of each table the measurements are rows of — (version id, table index) -> caption, from one query over
-    the distinct tables; a measurement outside any table, or of a table with none, is not in it."""
-    tables = {(r.version_id, r.table_index) for r in rows if r.table_index is not None}
-    if not tables:
-        return {}
-    pairs = sorted(tables, key=lambda t: (str(t[0]), t[1]))
-    return {(r.version_id, r.table_index): r.caption for r in conn.execute(text(
-        "SELECT et.version_id, et.table_index, et.structure->>'caption' AS caption FROM extracted_tables et"
-        " JOIN unnest(CAST(:v AS uuid[]), CAST(:t AS integer[])) AS w(v, t) ON et.version_id = w.v"
-        " AND et.table_index = w.t"), {"v": [v for v, _ in pairs], "t": [t for _, t in pairs]})}
-
-
 def bounds(iso: str, precision: str) -> tuple[date, date]:
     """The first and the last day of the period an ISO date (in its precision) names."""
     parts = [int(x) for x in iso.split("-")]
@@ -1559,6 +1574,12 @@ def bounds(iso: str, precision: str) -> tuple[date, date]:
         return date(parts[0], parts[1], 1), date(parts[0], parts[1], calendar.monthrange(parts[0], parts[1])[1])
     day = date(*parts)
     return day, day
+
+
+def period_bounds(iso: str, precision: str, end: str | None = None) -> tuple[date, date]:
+    """The first day of the period an ISO date names and the last day of its end (a range runs to its end's last day; no
+    end: the date's own period)."""
+    return bounds(iso, precision)[0], bounds(end or iso, precision)[1]
 
 
 @functools.lru_cache(maxsize=256)
@@ -1571,6 +1592,13 @@ def _wanted(requested) -> tuple[tuple[date | None, date | None], ...]:
              bounds(requested.end, requested.precision)[1] if requested.end else None),)
 
 
+def _gap_to_requested(requested, first: date, last: date) -> int:
+    """The days between a period (first to last day) and the nearest period the question asks about: 0 when they overlap
+    or when the asked period is open on the side the datum lies."""
+    return min(((lo - last).days if lo and last < lo else (first - hi).days if hi and first > hi else 0)
+               for lo, hi in _wanted(requested))
+
+
 def time_key(time: TimeMode, dated: tuple[str, str, str | None] | None, forecast: bool = False) -> tuple:
     """The sort key of a datum under the turn's time mode (KTD6): smaller is first. ``dated``: (ISO date, precision, end of
     a range) or None for an unknown date. Equal keys are not ordered here: the caller's order (relevance, or the id) breaks
@@ -1579,9 +1607,7 @@ def time_key(time: TimeMode, dated: tuple[str, str, str | None] | None, forecast
         if dated is None:
             return (2, 0)
         iso, precision, end = dated
-        first, last = bounds(iso, precision)[0], bounds(end or iso, precision)[1]
-        gap = min(((lo - last).days if lo and last < lo else (first - hi).days if hi and first > hi else 0)
-                  for lo, hi in _wanted(time.requested))
+        gap = _gap_to_requested(time.requested, *period_bounds(iso, precision, end))
         return (0, 0) if gap == 0 else (1, gap)
     if dated is None:
         return (2, 0)
@@ -1664,16 +1690,18 @@ def ranked_by_time(ws: Workspace, conn: Connection, hits: list[dict], limit: int
 # --- tools -----------------------------------------------------------------------------------------------
 
 def memoized_search(ws: Workspace, conn: Connection, query: str, limit: int, scope: SearchScope | None,
-                    window: bool = False) -> list[dict]:
+                    window: bool = False, version: int | None = None) -> list[dict]:
     """``search_passages`` once per (query, scope, limit) in a turn (R16, KTD3): an identical second search runs no
     search SQL and no embedding. The office's data version is part of the key — read in the caller's transaction, one
     indexed row — so a document processed, deleted or republished mid-turn is never answered from before it. So are the
-    turn's time mode and requested time (round 11 KTD2), and whether the fused window was read whole (``window``)."""
+    turn's time mode and requested time (round 11 KTD2), and whether the fused window was read whole (``window``).
+    ``version`` is that data version when the caller already read it for a run of searches."""
     scope_key = None if scope is None else (
         tuple(sorted(map(str, scope.document_ids))), tuple(sorted(map(str, scope.version_ids))),
         scope.include_noncurrent, scope.blocks, tuple(sorted(scope.source_kinds)),
         tuple(sorted(map(str, scope.exclude_versions))))
-    key = (query, scope_key, limit, current_data_version(conn), _time_memo_key(ws.time), window)
+    key = (query, scope_key, limit, current_data_version(conn) if version is None else version,
+           _time_memo_key(ws.time), window)
     hits = ws.search_memo.get(key)
     if hits is None:
         hits = ws.search_memo[key] = (search_passages(conn, query, limit, scope=scope, window=True) if window
@@ -1706,8 +1734,8 @@ def link_phrase(reason: str | None) -> str | None:
     ("parcel 8401/40") or the same street, number and city ("address_city")."""
     if not reason:
         return None
-    if reason.startswith("parcel "):
-        return MSG_LINK_SAME_PROPERTY.format(why=MSG_LINK_PARCEL.format(parcels=reason[len("parcel "):]))
+    if reason.startswith(REASON_PARCEL_PREFIX):
+        return MSG_LINK_SAME_PROPERTY.format(why=MSG_LINK_PARCEL.format(parcels=reason.removeprefix(REASON_PARCEL_PREFIX)))
     if reason == REASON_ADDRESS_CITY:
         return MSG_LINK_SAME_PROPERTY.format(why=MSG_LINK_ADDRESS)
     return MSG_LINK_SAME_PROPERTY.format(why=reason)
@@ -1883,16 +1911,8 @@ CAP_UNITS = 8          # appraisal units one call reads (KTD6)
 CAP_UNDATED = 2        # of them, up to this many are kept for units with no valuation date, in document order
 NAMED_CANDIDATES = 3   # unlinked candidates the record names, newest first; the rest are counted
 COVERAGE_V = 1         # the record's version (``answer.time.coverage.v``)
-HIT, NO_MATCH, NOT_SEARCHED_CAP = "hit", "no_match", "not_searched_cap"
-# a record built at answer time for a turn that ran no time-ranked search (``read_coverage``, round 12 U12b): a unit whose
-# source the answer cites was ``READ``; every other unit of the property is ``NOT_SEARCHED`` (no search ran at all)
-READ, NOT_SEARCHED = "read", "not_searched"
-PROPERTY, UNIT, WINDOW = "property", "unit", "window"  # what a record covers: a gathered property, one unit, a relevance window
-# why a record is not complete (``assess_coverage``); a unit that causes one carries ``blocks``
-B_NEWER, B_NO_MATCH, B_RANGE = "newer_not_searched", "newer_no_match", "range_not_searched"
-B_UNDATED, B_CANDIDATES, B_UNDETERMINED = "undated", "candidates", "undetermined"
-B_NOT_IDENTIFIED, B_WINDOW, B_SEVERAL = "not_identified", "window", "several_scopes"
-B_NOT_SEARCHED = "not_searched"
+# the record's unit statuses, scopes and blocking reasons are the strings ``timeframe`` words the note from (one definition,
+# imported here: ``timeframe`` is a leaf and cannot import this module)
 
 
 @dataclass
@@ -1964,12 +1984,11 @@ def _inventory_key(time: TimeMode, dated: tuple[str, str, str | None] | None) ->
     if dated is None:
         return (2, 0)
     iso, precision, end = dated
-    first, last = bounds(iso, precision)[0], bounds(end or iso, precision)[1]
-    wanted = _wanted(time.requested)
-    gap = min(((lo - last).days if lo and last < lo else (first - hi).days if hi and first > hi else 0) for lo, hi in wanted)
+    first, last = period_bounds(iso, precision, end)
+    gap = _gap_to_requested(time.requested, first, last)
     if gap == 0:
         return (0, 0)
-    return (1, gap) if any(lo is None or last >= lo for lo, _ in wanted) else (3, gap)
+    return (1, gap) if any(lo is None or last >= lo for lo, _ in _wanted(time.requested)) else (3, gap)
 
 
 def property_inventory(ws: Workspace, conn: Connection, gathered: Gathered) -> list[InventoryUnit]:
@@ -2011,27 +2030,43 @@ def _unit_scope(ws: Workspace, conn: Connection, unit: InventoryUnit) -> SearchS
     return SearchScope(version_ids=(version,), source_kinds=kinds)
 
 
-def _titles(conn: Connection, document_ids: Iterable) -> dict[str, str]:
-    """document id -> title, for the documents a record names (under the caller's permissions)."""
+def _titles(ws: Workspace, conn: Connection, document_ids: Iterable) -> dict[str, str]:
+    """document id -> title, for the documents a record names (under the caller's permissions). The titles read are kept
+    per turn and data version in ``ws.property_memo``; only the ids not read yet are queried."""
     ids = sorted({str(d) for d in document_ids})
     if not ids:
         return {}
-    return {str(r.id): r.title for r in conn.execute(
-        text("SELECT id, title FROM documents WHERE id = ANY(CAST(:d AS uuid[]))"), {"d": ids})}
+    key = ("titles", current_data_version(conn))
+    known = ws.property_memo.get(key)
+    if known is None:
+        for old in [k for k in ws.property_memo if k[0] == "titles"]:
+            del ws.property_memo[old]  # a data version that moved on: those titles are never read again
+        known = ws.property_memo[key] = {}
+    missing = [i for i in ids if i not in known]
+    if missing:
+        known.update({str(r.id): r.title for r in conn.execute(
+            text("SELECT id, title FROM documents WHERE id = ANY(CAST(:d AS uuid[]))"), {"d": missing})})
+    return {i: known[i] for i in ids if i in known}
+
+
+def _no_candidates() -> dict:
+    """The record's candidates when the property has none to name: a fresh dict each time (the record is stored and
+    merged, never shared)."""
+    return {"named": [], "count": 0}
 
 
 def _candidates_of(ws: Workspace, conn: Connection, gathered: Gathered) -> dict:
     """The unlinked candidates of the property for the record (KTD7): up to ``NAMED_CANDIDATES`` named newest first with
     their dates and the reason they are not linked, the rest counted."""
     if not gathered.candidates:
-        return {"named": [], "count": 0}
+        return _no_candidates()
     prime_dates(ws, conn, [c.node.version_id for c in gathered.candidates])
     rows = []
     for c in gathered.candidates:
         date_, status = unit_dating(ws, conn, c.node.version_id, c.node.unit_no)
         rows.append((_inventory_key(ws.time, None if date_ is None else (*date_, None)), c.node.key, c, date_, status))
     rows.sort(key=lambda r: r[:2])
-    titles = _titles(conn, [r[2].node.document_id for r in rows[:NAMED_CANDIDATES]])
+    titles = _titles(ws, conn, [r[2].node.document_id for r in rows[:NAMED_CANDIDATES]])
     named = [{"document_id": str(c.node.document_id), "version_id": str(c.node.version_id), "unit_no": c.node.unit_no,
               "title": c.node.title or titles.get(str(c.node.document_id)), "date": d[0] if d else None,
               "precision": d[1] if d else None, "date_status": status, "reason": c.link.reason}
@@ -2047,7 +2082,7 @@ def coverage_record(ws: Workspace, conn: Connection, *, scope: str, via: str | N
     address or parcel); the property's label and link reasons; every inventory unit with its date, ``undated`` flag, search
     status, title, link reason and whether it keeps the answer from being complete; the unlinked candidates; the count of
     undetermined units. ``complete`` and ``blocking`` come from ``assess_coverage``."""
-    titles = _titles(conn, {u.document_id for u in units})
+    titles = _titles(ws, conn, {u.document_id for u in units})
     time = ws.time
     record = {
         "v": COVERAGE_V, "mode": time.mode, "requested": time.requested.as_dict() if time.requested else None,
@@ -2058,7 +2093,7 @@ def coverage_record(ws: Workspace, conn: Connection, *, scope: str, via: str | N
                    "title": u.title or titles.get(str(u.document_id)), "date": u.date[0] if u.date else None,
                    "precision": u.date[1] if u.date else None, "date_status": u.date_status, "undated": u.undated,
                    "status": u.status, "link": u.link, "focus": u.focus, "blocks": False} for u in units],
-        "candidates": _candidates_of(ws, conn, gathered) if gathered is not None else {"named": [], "count": 0},
+        "candidates": _candidates_of(ws, conn, gathered) if gathered is not None else _no_candidates(),
         "undetermined": len(gathered.undetermined) if gathered is not None else 0,
     }
     return assess_coverage(time, record)
@@ -2295,8 +2330,9 @@ def _property_hits(ws: Workspace, conn: Connection, gathered: Gathered, query: s
     for u in inventory:
         if u.key not in searched:
             u.status = NOT_SEARCHED_CAP
+    version = current_data_version(conn) if selected else None
     for u in selected:
-        found = memoized_search(ws, conn, query, limit, _unit_scope(ws, conn, u))
+        found = memoized_search(ws, conn, query, limit, _unit_scope(ws, conn, u), version=version)
         u.status = HIT if any(h.get("lexical_support") for h in found) else NO_MATCH
         if u.status == HIT:
             hits += found
@@ -2316,7 +2352,7 @@ def _units_line(ws: Workspace, conn: Connection, inventory: list[InventoryUnit])
     """The property line of a property-wide search (round 12 U12b, R3): the gathered units — the document's handle and title,
     the unit's valuation date, and why the server gathered it (the focus: that it is the focus) — in the inventory's order,
     so the model reads the link reasons with the hits and does not disown an appraisal at another house number."""
-    titles = _titles(conn, {u.document_id for u in inventory})
+    titles = _titles(ws, conn, {u.document_id for u in inventory})
     shown = []
     for u in inventory[:PROPERTY_UNITS_SHOWN]:
         when = shown_period(u.date[0], u.date[1], None) if u.date else MSG_DATE_UNKNOWN
@@ -2375,11 +2411,17 @@ def _named_gathered_uncached(ws: Workspace, conn: Connection, docs: list[UUID]) 
     named = [n for n in graph.nodes if str(n.document_id) in wanted]
     if {str(n.document_id) for n in named} != wanted or not all(n.identity.identified for n in named):
         return None
-    keys = {n.key for n in named}
-    for seed in named:
+    gathered = _covering_closure(graph, named, {n.key for n in named})
+    return gathered if gathered is not None and len(gathered.members) >= 2 else None
+
+
+def _covering_closure(graph: PropertyGraph, seeds: Iterable, keys: set) -> Gathered | None:
+    """The gathered set of the first seed (in the given order) whose compatible closure holds every one of ``keys`` (the
+    closure depends on its seed, so every seed is tried); None when no seed's set covers them."""
+    for seed in seeds:
         gathered = graph.gather(seed.key)
         if keys <= gathered.keys:
-            return gathered if len(gathered.members) >= 2 else None
+            return gathered
     return None
 
 
@@ -2398,12 +2440,7 @@ def _question_gathered(ws: Workspace, conn: Connection) -> Gathered | None:
     graph = property_graph(ws, conn)
     matched = [n for n in graph.nodes if n.identity.addresses & named.addresses
                or parcels & {(b, p) for b, p, _ in n.identity.parcels}]
-    keys = {n.key for n in matched}
-    for seed in matched:
-        gathered = graph.gather(seed.key)
-        if keys <= gathered.keys:
-            return gathered
-    return None
+    return _covering_closure(graph, matched, {n.key for n in matched})
 
 
 def _clip_to_unit(conn: Connection, version_id, cx, kind: str, bs, be, body: str,
@@ -4364,29 +4401,29 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
             conds.append("(m.metric ILIKE ANY(:w) OR m.quote ILIKE ANY(:w) OR m.subject ILIKE ANY(:w))")
         # the rows carry their table's caption and the header of their column (round 12 U4, KTD14): the caption dates an
         # adopted measurement and both are where a period the quote does not hold is read (`meaning.measurement_states`)
-        where = (" FROM measurements m JOIN document_versions v ON v.id = m.version_id"
-                 " JOIN documents d ON d.id = m.document_id" + meaning.TABLE_TEXT_JOIN + " WHERE " + " AND ".join(conds))
+        # (version, table index) is unique in the tables, so the left join adds no row: the count leaves it out
+        source = " FROM measurements m JOIN document_versions v ON v.id = m.version_id JOIN documents d ON d.id = m.document_id"
+        where = source + meaning.TABLE_TEXT_JOIN + " WHERE " + " AND ".join(conds)
         fields = "SELECT m.*, d.title, v.ingestion->>'reading_id' AS reading_id, " + meaning.TABLE_TEXT_COLUMNS
         if ws.time.mode == "none":
-            total = conn.execute(text("SELECT count(*)" + where), params).scalar_one()
+            total = conn.execute(text("SELECT count(*)" + source + " WHERE " + " AND ".join(conds)), params).scalar_one()
             page, pages = _paginate(page, total, MEASUREMENTS_MAX)
             # a total order (the id breaks ties), so no row falls between two pages
             rows = conn.execute(text(
                 fields + where + " ORDER BY d.title, d.id, m.block_index NULLS FIRST, m.row_index NULLS FIRST, m.id"
                 f" LIMIT {MEASUREMENTS_MAX} OFFSET :o"), params | {"o": (page - 1) * MEASUREMENTS_MAX}).all()
-            captions = _captions(conn, rows)
-            as_ofs = {r.id: measurement_date(ws, r, captions.get((r.version_id, r.table_index))) for r in rows}
+            as_ofs = {r.id: measurement_date(ws, r) for r in rows}
         else:
             # the time mode orders the WHOLE filtered set — ids, quotes and stored dates are read, dated and sorted by the
             # KTD6 order, then by id — and only then is the page cut and its rows fetched by id: the page boundary follows
             # the date order and no row is skipped (KTD7). The listing is the whole filtered set, so its length is the total,
-            # and the dates computed here are the page rows' dates (the table captions are read in one query)
+            # and the dates computed here are the page rows' dates (the table caption comes with each row)
             light = conn.execute(text(
-                "SELECT m.id, m.version_id, m.table_index, m.quote, m.effective_date" + where), params).all()
+                "SELECT m.id, m.version_id, m.table_index, m.quote, m.effective_date, et.structure->>'caption' AS caption"
+                + where), params).all()
             total = len(light)
             page, pages = _paginate(page, total, MEASUREMENTS_MAX)
-            captions = _captions(conn, light)
-            as_ofs = {r.id: measurement_date(ws, r, captions.get((r.version_id, r.table_index))) for r in light}
+            as_ofs = {r.id: measurement_date(ws, r) for r in light}
             keyed = sorted(((time_key(ws.time, dated(as_ofs[r.id]), bool(as_ofs[r.id] and as_ofs[r.id].get("forecast"))),
                              str(r.id), r.id) for r in light), key=lambda k: k[:2])
             wanted = [k[2] for k in keyed[(page - 1) * MEASUREMENTS_MAX:page * MEASUREMENTS_MAX]]
@@ -5194,14 +5231,15 @@ def _stamp_date(ws: Workspace, value: calc.Value, taken: dict, inputs: tuple, pa
 
 def _back_date_words(value: calc.Value) -> None:
     """A scenario that is nothing but the value's own date as the server resolved it ("למועד הקובע 30/06/2025" for a value
-    whose ``as_of`` is that date) is no assertion of the model (round 12 U12b, S3; `verify._date_backed` for the number check):
-    the record states the date, so wherever the model wrote it, at the precision the record has, it is backed. The judge then
-    reads the scenario as the record's, not as "קביעת המודל, לא נמצא במקור", and the value is not left uncertain for it. A
-    different date, or any word of the model's own, stays the model's. Set after the value is cached: the cache keeps only what
-    the source attests."""
+    whose ``as_of`` is that date) is no scenario at all (round 12 U12b, S3; `verify._date_backed` for the number check): the
+    record states the date in ``as_of``, so the scenario is cleared and recorded as not stated. The judge then never reads it as
+    "קביעת המודל, לא נמצא במקור", the value is not left uncertain for it, and the timeline's comparability key does not carry
+    the date, so two appraisals of one property still fall into one history. A different date, or any word of the model's own,
+    stays the model's. Set after the value is cached: the cache keeps only what the source attests."""
     if (value.provenance.get("scenario") == "model_asserted" and value.scenario
             and chat_dates.restates_as_of(value.scenario, value.as_of)):
-        value.provenance["scenario"] = "source"
+        value.scenario = ""
+        value.provenance["scenario"] = "not_stated"
 
 
 def _value_report(ws: Workspace, value: calc.Value, said: Attribution | None, note: str | None,

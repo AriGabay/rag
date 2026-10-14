@@ -2543,15 +2543,9 @@ def _texts(ws: Workspace, ids: list[str]) -> list[tuple[str, str]]:
     return out
 
 
-def _as_of_dates(as_of: dict | None) -> list[tuple[str, str]]:
-    """The (ISO, precision) dates a datum's ``as_of`` states from the source (``chat.dates.stated_dates``): its date and, for
-    a range, its end. Nothing for an unknown date, a forecast with no date, or a provenance that is not the source's."""
-    return chat_dates.stated_dates(as_of)
-
-
 def _as_of_forms(as_of: dict | None) -> list[str]:
     """The written forms of a datum's stated dates at their precision (DD/MM/YYYY, MM/YYYY, YYYY)."""
-    return [shared_dates.shown_date(iso, precision) for iso, precision in _as_of_dates(as_of)]
+    return [shared_dates.shown_date(iso, precision) for iso, precision in chat_dates.stated_dates(as_of)]
 
 
 def _date_backed(text: str, ws: Workspace, ids: list[str]) -> set[str]:
@@ -2560,14 +2554,13 @@ def _date_backed(text: str, ws: Workspace, ids: list[str]) -> set[str]:
     for the VAT): the date sits in the record the claim cites, though the cited passage may not hold the line. A date
     counts when it is, at its precision or coarser, one of the stated dates (a range: both ends); a date the record does
     not hold is not backed, and a token that is also written outside every backed date ("10 יחידות") is not either."""
-    stated = [d for i in ids for d in _as_of_dates(getattr(ws.values.get(i) or ws.measurements.get(i), "as_of", None))]
+    stated = [d for i in ids
+              for d in chat_dates.stated_dates(getattr(ws.values.get(i) or ws.measurements.get(i), "as_of", None))]
     if not stated:
         return set()
-
-    def holds(iso: str, precision: str) -> bool:
-        return chat_dates.holds_date(stated, iso, precision)
-
-    backed = [p for p in shared_dates.find_all(text) if holds(p.iso, p.precision) and (p.end is None or holds(p.end, p.precision))]
+    backed = [p for p in shared_dates.find_all(text)
+              if chat_dates.holds_date(stated, p.iso, p.precision)
+              and (p.end is None or chat_dates.holds_date(stated, p.end, p.precision))]
     if not backed:
         return set()
     rest = text
@@ -2624,14 +2617,11 @@ def _vat_polarity(m: re.Match) -> str:
     return "excluded" if m.group("neg") else ("included" if "כולל" in text else "")
 
 
-def vat_attachments(text: str, *, skip_absence: bool = False) -> tuple[set[tuple[str, str]], set[str]]:
-    """(number, VAT status) pairs as written — a VAT phrase belongs to the nearest number before it in the same
-    sentence ("9,500 ₪, ללא מע״מ ודמ״ש ... 55 ₪": the VAT is the 9,500's) — and the VAT statuses stated with no
-    number before them in their sentence (a note such as "המחירים אינם כוללים מע״מ", which covers the source).
-    ``skip_absence``: a clause saying the text does not state something ("לא צוין אם הסכום כולל מע״מ") gives nothing
-    a VAT status (for an answer's unit; a source's own note is read as it is)."""
-    pairs: set[tuple[str, str]] = set()
-    general: set[str] = set()
+def _vat_phrases(text: str, skip_absence: bool):
+    """Each VAT phrase of ``text`` that states a status, in order: (forms, polarity, start, end) where ``forms`` are the
+    forms of the nearest number before the phrase in its sentence (None when the sentence has none) and start and end
+    are the phrase's offsets in ``text``. ``skip_absence``: a clause saying the text does not state something gives
+    nothing. Shared by ``vat_attachments`` and ``_vat_spans``."""
     start = 0
     for end_m in [*_CLAUSE_END.finditer(text), None]:
         end = end_m.end() if end_m else len(text)
@@ -2642,11 +2632,23 @@ def vat_attachments(text: str, *, skip_absence: bool = False) -> tuple[set[tuple
             if not polarity:
                 continue
             before = [forms for pos, forms in nums if pos < v.start()]
-            if before:
-                pairs |= {(f, polarity) for f in before[-1]}
-            else:
-                general.add(polarity)
+            yield (before[-1] if before else None), polarity, start + v.start(), start + v.end()
         start = end
+
+
+def vat_attachments(text: str, *, skip_absence: bool = False) -> tuple[set[tuple[str, str]], set[str]]:
+    """(number, VAT status) pairs as written — a VAT phrase belongs to the nearest number before it in the same
+    sentence ("9,500 ₪, ללא מע״מ ודמ״ש ... 55 ₪": the VAT is the 9,500's) — and the VAT statuses stated with no
+    number before them in their sentence (a note such as "המחירים אינם כוללים מע״מ", which covers the source).
+    ``skip_absence``: a clause saying the text does not state something ("לא צוין אם הסכום כולל מע״מ") gives nothing
+    a VAT status (for an answer's unit; a source's own note is read as it is)."""
+    pairs: set[tuple[str, str]] = set()
+    general: set[str] = set()
+    for forms, polarity, _, _ in _vat_phrases(text, skip_absence):
+        if forms is not None:
+            pairs |= {(f, polarity) for f in forms}
+        else:
+            general.add(polarity)
     return pairs, general
 
 
@@ -2700,12 +2702,14 @@ def _vat_backing(unit: Unit, ws: Workspace) -> set[tuple[str, str]]:
     return backed
 
 
-def _wrong_vat(unit: Unit, ws: Workspace) -> list[tuple[str, str]]:
-    """The (number, VAT status) pairs the unit gives that its cited sources do not give that number."""
+def _wrong_vat(unit: Unit, ws: Workspace, backed: set[tuple[str, str]] | None = None) -> list[tuple[str, str]]:
+    """The (number, VAT status) pairs the unit gives that its cited sources do not give that number. ``backed`` is
+    ``_vat_backing(unit, ws)`` when the caller already has it."""
     claimed, _ = vat_attachments(unit.text, skip_absence=True)
     if not claimed:
         return []
-    backed = _vat_backing(unit, ws)
+    if backed is None:
+        backed = _vat_backing(unit, ws)
     return sorted((n, pol) for n, pol in claimed if (n, pol) not in backed and not n.isalpha())
 
 
@@ -2936,17 +2940,9 @@ def _asked_about(kind: str, question: str) -> bool:
 def _vat_spans(text: str, skip_absence: bool = True):
     """Each VAT phrase of ``text`` with the numbers it belongs to and its polarity, as ``vat_attachments`` reads them (the
     phrase belongs to the nearest number before it in its sentence): (forms, polarity, start, end) in ``text``."""
-    start = 0
-    for end_m in [*_CLAUSE_END.finditer(text), None]:
-        end = end_m.end() if end_m else len(text)
-        clause = text[start:end]
-        nums = [(n.start(), numbers_in(n.group(0))) for n in _NUM_AT.finditer(clause) if _vat_bearing(clause, n)]
-        for v in [] if skip_absence and meaning.ABSENCE_SENTENCE.search(clause) else _VAT.finditer(clause):
-            polarity = _vat_polarity(v)
-            before = [forms for pos, forms in nums if pos < v.start()]
-            if polarity and before:
-                yield before[-1], polarity, start + v.start(), start + v.end()
-        start = end
+    for forms, polarity, a, b in _vat_phrases(text, skip_absence):
+        if forms is not None:
+            yield forms, polarity, a, b
 
 
 def _qualifier_span(text: str, pos: int, number: str, kind: str, written: str) -> tuple[int, int] | None:
@@ -3014,12 +3010,13 @@ def _silent_qualifier_spans(u: Unit, ws: Workspace, text: str, entries: list, pr
 def _silent_vat_spans(u: Unit, ws: Workspace, text: str) -> list[tuple[int, int, str, str]] | None:
     """The spans of the VAT phrases the cited sources do not back, when they state no VAT status at all for that number
     (a source that states the other one keeps the removal path); None otherwise."""
-    wrong = _wrong_vat(u, ws)
     backed = _vat_backing(u, ws)
+    wrong = _wrong_vat(u, ws, backed)
     if not wrong or any((n, other) in backed for n, pol in wrong for other in ("included", "excluded") if other != pol):
         return None
+    wrong_set = set(wrong)
     out = [(a, b, "vat", text[a:b]) for forms, polarity, a, b in _vat_spans(text)
-           if any((f, polarity) in set(wrong) for f in forms)]
+           if any((f, polarity) in wrong_set for f in forms)]
     return out or None
 
 
@@ -3112,7 +3109,6 @@ MSG_NOT_LATEST = ("הטענה קוראת ל-{older} «העדכני», אבל ב�
                   "(מועד {when}, {title}). הצג את {newer} כערך העדכני ואת {older} כערך קודם, עם תאריכיהם ומראי המקום "
                   "של שניהם (אל תמחק ערך שנתמך), או השמט את הניסוח «העדכני» / «האחרון»")
 # under partial coverage (round 12 U8, KTD8): the qualified wording a "latest" claim may carry, and the repair's reason
-QUALIFIED = "במקורות שנבדקו"
 MSG_LATEST_UNQUALIFIED = ("הטענה קוראת לנתון «העדכני» / «האחרון», אבל לא נבדקו כל השומות של הנכס ({gap}). כתוב "
                           "«{phrase}» וציין מה לא נבדק (אל תמחק ערך שנתמך), או השמט את הניסוח «העדכני» / «האחרון»")
 
@@ -3128,6 +3124,16 @@ def _calls_latest(text: str) -> bool:
     return False
 
 
+_AMOUNT = re.compile(r"\d[\d,.]*\s*(?:₪|\$|€|ש[\"״']?ח|%)|(?<![\d,.])\d{1,3}(?:,\d{3})+(?![\d])|(?<![\d,.])\d{3,}(?![\d])")
+
+
+def _latest_amount(text: str) -> bool:
+    """Whether a clause of ``text`` calls something the latest and states an amount (a sum, a percentage or a number of three
+    digits or more; not a floor or a house number): the wording of a claim about a datum (round 12 review: a passage-only
+    unit about "the current use of the property" is not one)."""
+    return any(_calls_latest(c) and _AMOUNT.search(c) for c in _CLAUSE_END.split(text))
+
+
 def _recency_claim(u: Unit, ws: Workspace) -> Problem | None:
     """A unit that calls a value the latest while the turn registered a later-dated value comparable to the one it cites
     (``timeline.later_than``: the same property, metric family, unit, periodicity, area basis, VAT, scenario and stance; dated,
@@ -3137,11 +3143,12 @@ def _recency_claim(u: Unit, ws: Workspace) -> Problem | None:
 
     Round 12 U8 (R12, KTD8): a unit that calls data "the latest" when the time-ranked search that produced it did not check
     every appraisal of the property (partial coverage, or the property not identified) is the same kind of problem, unless it
-    already says so (``MSG_LATEST_UNQUALIFIED``; the qualified phrase is "הנתון המאוחר ביותר במקורות שנבדקו"). The later
-    value of a comparable group stays the more specific reason."""
+    already says so (``MSG_LATEST_UNQUALIFIED``; the qualified phrase is "הנתון המאוחר ביותר במקורות שנבדקו"). Only a unit that
+    cites a value or measurement (a dated datum), or whose "latest" shares a clause with an amount (``_latest_amount``), is held
+    to it: "השימוש הנוכחי בנכס הוא משרדים [S1]" is not. The later value of a comparable group stays the more specific reason."""
     if not _calls_latest(u.text):
         return None
-    from app.chat import timeline
+    from app.chat import timeframe, timeline
 
     cited = [i for i in u.ids if i in ws.values or i in ws.measurements]
     found = timeline.later_than(ws, cited) if cited else []
@@ -3149,10 +3156,10 @@ def _recency_claim(u: Unit, ws: Workspace) -> Problem | None:
         older, newer = found[0]
         reason = MSG_NOT_LATEST.format(older=older.ref, newer=newer.ref, when=timeline.shown(newer.as_of), title=newer.title)
         return Problem(u, reason, severity="partial", defect="recency", failure_kind="contradicts_source", check=RECENCY_CHECK)
-    if not u.ids or QUALIFIED in u.text or (record := timeline.partial_coverage(ws, u.ids)) is None:
+    if not u.ids or timeframe.QUALIFIED in u.text or (not cited and not _latest_amount(u.text)):
+        return None  # a passage-only unit counts only when its "latest" sits in a clause with an amount
+    if (record := timeline.partial_coverage(ws, u.ids)) is None:
         return None
-    from app.chat import timeframe
-
     gap = " ".join((timeframe.coverage_note(record) or "").splitlines()[1:]) or timeframe.MSG_NOTE_NOT_IDENTIFIED
     return Problem(u, MSG_LATEST_UNQUALIFIED.format(phrase=timeframe.LATEST_CHECKED, gap=gap), severity="partial",
                    defect="recency", failure_kind="contradicts_source", check=RECENCY_CHECK)

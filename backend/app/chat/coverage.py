@@ -88,7 +88,15 @@ from app.chat import contexts
 from app.chat.compose import line_cut
 from app.chat.dates import COMPARABLE_ORIGIN, HISTORY_ORIGIN
 from app.chat.intent import PROFESSIONAL
-from app.chat.tools import READ_TO_END, STEP_LIMIT, TIME_LIMIT, TOOL_BUDGET, bounds, dated, value_uncertain
+from app.chat.tools import (
+    READ_TO_END,
+    STEP_LIMIT,
+    TIME_LIMIT,
+    TOOL_BUDGET,
+    dated,
+    period_bounds,
+    value_uncertain,
+)
 from app.db import tenant_tx
 
 if TYPE_CHECKING:
@@ -238,10 +246,10 @@ def _span(as_of: dict | None) -> tuple[date, date] | None:
     if when is None:
         return None
     iso, precision, end = when
-    return bounds(iso, precision)[0], bounds(end or iso, precision)[1]
+    return period_bounds(iso, precision, end)
 
 
-def _withheld(as_of: dict | None) -> bool:
+def _undated_by_origin(as_of: dict | None) -> bool:
     """Undated only because it is history or a comparable (round 12 U4, KTD12): such a datum conflicts with nothing."""
     return bool(as_of) and not as_of.get("date") and as_of.get("date_origin") in (HISTORY_ORIGIN, COMPARABLE_ORIGIN)
 
@@ -258,13 +266,20 @@ def conflicting_pairs(items: Sequence[Comparable]) -> list[tuple[int, int]]:
     for i, item in enumerate(items):
         by_key.setdefault(item.key, []).append(i)
     pairs = []
+    spans: dict[int, tuple[date, date] | None] = {}
+
+    def span_of(k: int) -> tuple[date, date] | None:
+        if k not in spans:
+            spans[k] = _span(items[k].as_of)
+        return spans[k]
+
     for members in by_key.values():
         for n, i in enumerate(members):
             for j in members[n + 1:]:
                 a, b = items[i], items[j]
-                if a.amount == b.amount or _withheld(a.as_of) or _withheld(b.as_of):
+                if a.amount == b.amount or _undated_by_origin(a.as_of) or _undated_by_origin(b.as_of):
                     continue
-                first, second = _span(a.as_of), _span(b.as_of)
+                first, second = span_of(i), span_of(j)
                 if first is None or second is None or (first[0] <= second[1] and second[0] <= first[1]):
                     pairs.append((i, j))
     return sorted(pairs)
@@ -294,22 +309,33 @@ def conflicting(ws: Workspace, document_ids: list[str] | None = None, ids: Colle
 
     entries = [(v.kind, v.unit, v.period, v.area_basis, v.subject, v.scenario, v.stance, str(v.value),
                 (v.context or {}).get("key"), getattr(v, "as_of", None),
-                property_key(ws, i, v.document_id, getattr(v, "version_id", None), v.context))
+                (i, v.document_id, getattr(v, "version_id", None), v.context))
                for i, v in ws.values.items() if kept(i, str(v.document_id))]
     entries += [(m.row.metric_kind, m.row.unit, m.row.period, m.row.area_basis, m.row.subject,
                  getattr(m.row, "scenario", "") or "", getattr(m.row, "stance", "") or "",
                  frozenset(numbers_in(m.row.value_text or "")), (m.context or {}).get("key"),
-                 getattr(m, "as_of", None), property_key(ws, i, m.document_id, getattr(m, "version_id", None), m.context))
+                 getattr(m, "as_of", None), (i, m.document_id, getattr(m, "version_id", None), m.context))
                 for i, m in ws.measurements.items() if kept(i, str(m.document_id))]
-    items = []
-    for kind, unit, period, basis, subject, scenario, stance, amount, context, as_of, group in entries:
+    # the data are bucketed by everything but the property first: only a bucket that holds two different amounts can
+    # conflict, so the property of a datum (the office's property graph) is read only there
+    buckets: dict[tuple, list[tuple]] = {}
+    for kind, unit, period, basis, subject, scenario, stance, amount, context, as_of, ref in entries:
         if not (subject or "").strip() or kind in (None, "unknown", "other"):
             continue  # a datum of no named subject cannot be said to conflict with another
-        prop = (("group", group) if group else ("context", context) if by_context and context
-                else _norm_label(subject))
-        items.append(Comparable((family(kind), unit, period, _norm_label(basis or ""), prop, _norm_label(scenario),
-                                 stance_class(stance)), amount, as_of))
-    return bool(conflicting_pairs(items))
+        rest = (family(kind), unit, period, _norm_label(basis or ""), _norm_label(scenario), stance_class(stance))
+        buckets.setdefault(rest, []).append((amount, subject, context, as_of, ref))
+    for (fam, unit, period, basis, scenario, stance), members in buckets.items():
+        if len({amount for amount, *_ in members}) < 2:
+            continue
+        items = []
+        for amount, subject, context, as_of, ref in members:
+            group = property_key(ws, *ref)
+            prop = (("group", group) if group else ("context", context) if by_context and context
+                    else _norm_label(subject))
+            items.append(Comparable((fam, unit, period, basis, prop, scenario, stance), amount, as_of))
+        if conflicting_pairs(items):
+            return True
+    return False
 
 
 def validate_requested(ws: Workspace, requested, opened: dict[str, tuple[str, dict]] | None = None) -> list[dict]:

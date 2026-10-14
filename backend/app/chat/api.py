@@ -314,7 +314,8 @@ def public_removals(items: list) -> list[dict]:
 
 def _answer_documents(answer: dict | None) -> set[str]:
     """Every document an answer draws on or names: its sources, measurements, values and documents, the documents its
-    coverage ledger lists (in scope, checked or not), the documents of its focus, and every document the turn's
+    coverage ledger lists (in scope, checked or not), the documents its time coverage record names (every inventory unit and
+    every named candidate: the note prints their titles and dates), the documents of its focus, and every document the turn's
     tools touched (a claim removed in verification may have quoted one; its text is kept in
     message_diagnostics, whose document ids come from this set), and every document a citation's anchor points at
     (``app.chat.anchors``). A message is shown, and carried into the model's context, only while all of them are
@@ -327,6 +328,9 @@ def _answer_documents(answer: dict | None) -> set[str]:
     ids |= {v.get("document_id") for v in answer.get("values") or []}
     ids |= {d.get("document_id") for d in answer.get("documents") or []}
     ids |= coverage.ledger_documents(answer.get("ledger"))
+    record = (answer.get("time") or {}).get("coverage") or {}  # round 12: units not searched or without a hit are never cited
+    ids |= {u.get("document_id") for u in record.get("units") or [] if isinstance(u, dict)}
+    ids |= {c.get("document_id") for c in (record.get("candidates") or {}).get("named") or [] if isinstance(c, dict)}
     ids |= set((answer.get("focus") or {}).get("document_ids") or [])
     ids.add((answer.get("unit") or {}).get("document_id"))  # the unit the conversation is in (round 9 U10)
     ids |= set((answer.get("request") or {}).get("document_ids") or [])
