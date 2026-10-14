@@ -230,7 +230,7 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # a call renders changes what a verdict means, so a verdict of an older contract is never reused (cached readings are
 # versioned). 6 (round 10 U9, KTD14): the evidence header of a standard carries its kind, limits and wording, and the policy
 # the rules that need them.
-JUDGE_VERSION = 6
+JUDGE_VERSION = 7
 # an uncited factual unit is judged against the sources the turn already read (round 8 KTD3, R2): the sources of the
 # turn whose text holds its numbers or content words are shown beside it as candidates, bounded so the call stays
 # within ``JUDGE_CALL_CHARS``. How many candidates a unit gets, how many characters one candidate may show, and how
@@ -347,7 +347,9 @@ JUDGE_POLICY = (
     "(מקדם, שיעור, הנחה או שיטה של נכס מסוים) שהיחידה מציגה ככלל מקצועי כללי — unsupported. (26) טענה ששומה אינה "
     "עומדת בתקן או סותרת אותו נתמכת רק כשהראיה מציגה גם את השומה וגם את מהדורת התקן, ומראה שהתקן חל על מועד השומה "
     "ועל מטרתה; בלי זה — unsupported. (27) תיאור של שיטה או נוסחה בתקן אינו מאמת את ערכי הקלט של חישוב: ערך של נכס "
-    "(שטח, שווי, שיעור) נתמך רק בשומה של אותו נכס, ומספר שמופיע רק בתקן (בדוגמה או בתיאור) אינו תומך בו."
+    "(שטח, שווי, שיעור) נתמך רק בשומה של אותו נכס, ומספר שמופיע רק בתקן (בדוגמה או בתיאור) אינו תומך בו. (28) "
+    "\"העדכני\" או \"המאוחר ביותר\" נבחן מול הנתונים המתוארכים: נתון שמועדו לא ידוע אינו סותר אותו ואינו הופך אותו "
+    "לחלקי, כל עוד היחידה אינה טוענת שהיא מכסה גם אותו; נתון של נכס, מדד, יחידה, תקופתיות או מע\"מ אחרים אינו סותר אותו."
 )
 
 
