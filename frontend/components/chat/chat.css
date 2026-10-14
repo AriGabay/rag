@@ -631,6 +631,87 @@ details.msg-details[open] {
   cursor: default;
 }
 
+/* The time-preference switch (round 11 U10, KTD14): its own row above the pill, so the textarea keeps its width. */
+.recency-row {
+  max-width: var(--thread-width);
+  margin: 0 auto 4px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0 12px;
+}
+
+.recency-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--chat-text);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.recency-switch:focus-visible {
+  outline: 2px solid var(--chat-accent);
+  outline-offset: 2px;
+}
+
+.recency-switch:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.recency-track {
+  position: relative;
+  flex: 0 0 auto;
+  width: 38px;
+  height: 22px;
+  border: 1px solid var(--chat-muted);
+  border-radius: 999px;
+  background: var(--chat-bubble);
+  transition: background 0.15s;
+}
+
+.recency-thumb {
+  position: absolute;
+  top: 2px;
+  inset-inline-start: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--chat-muted);
+  transition: inset-inline-start 0.15s, background 0.15s;
+}
+
+.recency-switch[aria-checked="true"] .recency-track {
+  background: var(--chat-accent);
+  border-color: var(--chat-accent);
+}
+
+.recency-switch[aria-checked="true"] .recency-thumb {
+  inset-inline-start: 18px;
+  background: var(--chat-bg);
+}
+
+.recency-desc {
+  font-size: 12.5px;
+  color: var(--chat-muted);
+  padding-inline: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .recency-track,
+  .recency-thumb {
+    transition: none;
+  }
+}
+
 .composer-hint {
   max-width: var(--thread-width);
   margin: 6px auto 0;
@@ -1486,4 +1567,118 @@ button.cut-marker:focus-visible {
   outline: 2px solid var(--chat-accent);
   outline-offset: 2px;
   transition: outline-color 0.3s ease;
+}
+
+/* --- the answer's timeline (round 11 U10) -------------------------------------------------------------------- */
+
+.timeline {
+  margin-top: 10px;
+  font-size: 14px;
+}
+
+.timeline-heading {
+  margin: 0 0 4px;
+  font-size: 14px;
+  color: var(--chat-text);
+}
+
+.timeline-group {
+  margin-bottom: 10px;
+}
+
+.timeline-label {
+  margin-bottom: 4px;
+  font-weight: 600;
+  color: var(--chat-text);
+  overflow-wrap: anywhere;
+}
+
+.timeline-table {
+  width: 100%;
+  border-collapse: collapse;
+  border: 1px solid var(--chat-border);
+}
+
+.timeline-table th,
+.timeline-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--chat-border);
+  text-align: start;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.timeline-table th {
+  background: var(--chat-code);
+  font-weight: 600;
+  color: var(--chat-muted);
+  font-size: 12.5px;
+}
+
+.tl-kind,
+.tl-title {
+  display: inline-block;
+  margin-inline-start: 8px;
+  font-size: 12.5px;
+  color: var(--chat-muted);
+}
+
+.tl-title {
+  margin-inline-start: 6px;
+}
+
+.tl-marks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.tl-marks .badge {
+  white-space: normal;
+  border: 1px solid var(--chat-border);
+}
+
+.tl-cite {
+  margin: 0;
+  vertical-align: middle;
+}
+
+@media (max-width: 768px) {
+  /* stacked rows: date and its kind, then the value, then the citation, then the marks */
+  .timeline-table,
+  .timeline-table tbody,
+  .timeline-table tr,
+  .timeline-table td {
+    display: block;
+    width: 100%;
+  }
+  .timeline-table {
+    border: 0;
+  }
+  .timeline-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+  .timeline-table tr {
+    padding: 6px 10px;
+    margin-bottom: 6px;
+    border: 1px solid var(--chat-border);
+    border-radius: 8px;
+  }
+  .timeline-table td {
+    padding: 1px 0;
+    border: 0;
+  }
+  .timeline-table .tl-value {
+    font-weight: 600;
+  }
+  .tl-kind {
+    margin-inline-start: 8px;
+  }
+  .tl-marks:empty {
+    display: none;
+  }
 }

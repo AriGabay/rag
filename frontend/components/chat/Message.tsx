@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { B } from "@/components/ui";
 import type {
   ChatAnswer,
   ChatAssumption,
@@ -13,6 +14,9 @@ import type {
   ChatRemoval,
   ChatRequirement,
   ChatSource,
+  ChatTimelineGroup,
+  ChatTimelineMark,
+  ChatTimelineRow,
   ChatUnitScope,
   ChatValue,
   ChatVerification,
@@ -30,6 +34,7 @@ import {
   type ValueStatus,
   contentActionsText,
   failureKindText,
+  formatIsoDate,
   gapReasonText,
   measurementValueStatus,
   rowChangeAction,
@@ -226,9 +231,14 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
     );
   }
 
+  const timeNote = timePreferenceNote(message, answer);
+
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(plainAnswer(answer.markdown));
+      const timelineText = answer.time?.text;
+      await navigator.clipboard.writeText(
+        timelineText ? `${plainAnswer(answer.markdown)}\n\n${timelineText}` : plainAnswer(answer.markdown),
+      );
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
     } catch {
@@ -248,6 +258,7 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
         <Markdown markdown={answer.markdown} citations={citations} onCite={cite} cuts={cutOrdinals} onCut={openCut} />
       </div>
       <AnswerQuality answer={answer} />
+      <Timeline groups={answer.time?.timeline} onCite={cite} />
       <div className="msg-actions">
         <button type="button" className="icon-btn" onClick={copy} aria-label="העתקת התשובה" title="העתקה">
           {copied ? "✓" : "⧉"}
@@ -259,6 +270,11 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
         )}
         {answer.status === "partial" && <span className="note">תשובה חלקית</span>}
         {answer.status === "not_found" && <span className="note">לא נמצא במקורות</span>}
+        {timeNote && (
+          <span className="note" data-testid="time-note">
+            {timeNote}
+          </span>
+        )}
       </div>
       <AnswerDetails
         answer={answer}
@@ -269,6 +285,100 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
         onOpenSource={onOpenSource}
       />
     </div>
+  );
+}
+
+/** The time preference an answer was produced with, worded as the setting and not as a claim that ordering happened
+ * (round 11 U10, R15). The state is the one recorded on the message, never the conversation's current switch. An
+ * explicit period in the question overrides the switch; a message from before round 11 shows nothing. */
+export function timePreferenceNote(message: ChatMessage, answer: ChatAnswer): string | null {
+  if (answer.time?.mode === "explicit") return "לפי הזמן שביקשת";
+  const pref = message.time_preference;
+  if (!pref) return null;
+  return pref.prefer_recent ? "העדפת זמן: עדכני תחילה" : "העדפת זמן: ללא";
+}
+
+const DATE_KIND_LABEL: Record<string, string> = {
+  valuation: "מועד קובע",
+  transaction: "מועד עסקה",
+  stated: "מועד שצוין",
+  range: "תקופה",
+};
+const TIMELINE_MARK: Record<ChatTimelineMark, { label: string; cls: string }> = {
+  forecast: { label: "תחזית", cls: "badge-info" },
+  conflict: { label: "סתירה בין מקורות", cls: "badge-warn" },
+  outside_requested: { label: "מחוץ לזמן שביקשת", cls: "" },
+  unknown_date: { label: "מועד לא ידוע", cls: "" },
+};
+
+/** A timeline date at the precision the source gave: a month or a year is never shown as a day. */
+function timelineDate(row: ChatTimelineRow): string {
+  if (!row.date) return "ללא תאריך";
+  const m = /^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?/.exec(row.date);
+  if (!m) return row.date;
+  const precision = row.precision ?? (m[3] ? "day" : m[2] ? "month" : "year");
+  if (precision === "year" || !m[2]) return m[1];
+  if (precision === "month" || !m[3]) return `${m[2]}/${m[1]}`;
+  return formatIsoDate(row.date);
+}
+
+/** The server-built timeline of comparable dated values (round 11 U9, U10): groups and rows in the payload's order,
+ * never re-sorted here. A table at desktop width, stacked rows on a phone (CSS only, so the order and the roles stay
+ * the same); a mark is a text badge, never colour alone; the source chip opens the viewer like an answer citation. */
+function Timeline({ groups, onCite }: { groups: ChatTimelineGroup[] | undefined; onCite: (id: string) => void }) {
+  const shown = (groups ?? []).filter((g) => g.rows.length > 0);
+  if (shown.length === 0) return null;
+  return (
+    <section className="timeline" data-testid="timeline" aria-label="ציר זמן">
+      <h4 className="timeline-heading">ציר זמן</h4>
+      {shown.map((g, gi) => (
+        <div key={`${gi}-${g.label}`} className="timeline-group" data-testid="timeline-group">
+          <div className="timeline-label">{g.label}</div>
+          <table className="timeline-table" role="table" aria-label={`ציר זמן: ${g.label}`}>
+            <thead role="rowgroup">
+              <tr role="row">
+                <th role="columnheader" scope="col">תאריך</th>
+                <th role="columnheader" scope="col">ערך</th>
+                <th role="columnheader" scope="col">מקור</th>
+                <th role="columnheader" scope="col">סימון</th>
+              </tr>
+            </thead>
+            <tbody role="rowgroup">
+              {g.rows.map((r, ri) => (
+                <tr key={`${ri}-${r.sid}`} role="row" data-testid="timeline-row">
+                  <td role="cell" className="tl-date">
+                    <B>{timelineDate(r)}</B>
+                    {r.date_kind && DATE_KIND_LABEL[r.date_kind] && <span className="tl-kind">{DATE_KIND_LABEL[r.date_kind]}</span>}
+                  </td>
+                  <td role="cell" className="tl-value">
+                    <B>{r.value_text}</B>
+                  </td>
+                  <td role="cell" className="tl-source">
+                    <button
+                      type="button"
+                      className="cite tl-cite"
+                      onClick={() => onCite(r.sid)}
+                      title={[r.source.title, r.source.location].filter(Boolean).join(" — ")}
+                      aria-label={`מקור ${r.sid}: ${r.source.title}`}
+                    >
+                      {r.sid}
+                    </button>
+                    <span className="tl-title">{r.source.title}</span>
+                  </td>
+                  <td role="cell" className="tl-marks">
+                    {r.marks.map((k) => (
+                      <span key={k} className={`badge ${TIMELINE_MARK[k]?.cls ?? ""}`} data-mark={k}>
+                        {TIMELINE_MARK[k]?.label ?? k}
+                      </span>
+                    ))}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ))}
+    </section>
   );
 }
 

@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useSession } from "@/components/AppShell";
 import { api, ApiError, chatApi, errorMessage, isAbortError, newTurnId } from "@/lib/api";
 import type { ChatAnswer, ChatConversation, ChatMessage, ViewerNav } from "@/lib/chatTypes";
@@ -135,6 +135,18 @@ export default function ChatApp() {
   const [notice, setNotice] = useState<string | null>(null);
   const activeRef = useRef<string | null>(null);
   activeRef.current = activeId;
+  // The time-preference switch (round 11 U10, KTD14). A draft has no id yet, so its value lives here and travels in the
+  // first send body (no PATCH-then-send race). An existing conversation's shown value is `prefs[id]` (optimistic);
+  // `storedPrefs` holds what the server last confirmed, which a failed PATCH reverts to.
+  const [draftPrefer, setDraftPrefer] = useState(true);
+  const draftPreferRef = useRef(true);
+  draftPreferRef.current = draftPrefer;
+  const [prefs, setPrefs] = useState<Record<string, boolean>>({});
+  const prefsRef = useRef<Record<string, boolean>>({});
+  prefsRef.current = prefs;
+  const storedPrefs = useRef<Record<string, boolean>>({});
+  const toggleSeq = useRef<Record<string, number>>({});
+  const inflightPatch = useRef<Record<string, number>>({});
   // A conversation this tab just created holds only the message being sent: no history to load for it.
   const createdHere = useRef<string | null>(null);
 
@@ -148,6 +160,15 @@ export default function ChatApp() {
     if (initial) setActiveId(initial);
   }, []);
 
+  /** Records the switch value a conversation's JSON carries (a missing field is a pre-round-11 payload: off), unless a
+   * toggle of it is still being saved: that answer is newer than this payload. */
+  const recordPref = useCallback((c: ChatConversation) => {
+    const v = c.prefer_recent === true;
+    storedPrefs.current[c.id] = v;
+    if (inflightPatch.current[c.id]) return;
+    setPrefs((cur) => (cur[c.id] === v ? cur : { ...cur, [c.id]: v }));
+  }, []);
+
   // --- conversation list -----------------------------------------------------------------------------------
   const loadList = useCallback(
     async (append: boolean, signal?: AbortSignal) => {
@@ -157,13 +178,14 @@ export default function ChatApp() {
           signal,
         );
         setConversations((cur) => (append ? [...cur, ...res.conversations] : res.conversations));
+        res.conversations.forEach(recordPref);
         setListNext(res.next);
         setListError(null);
       } catch (err) {
         if (!isAbortError(err)) setListError(errorMessage(err));
       }
     },
-    [query, archived, listNext],
+    [query, archived, listNext, recordPref],
   );
 
   useEffect(() => {
@@ -176,9 +198,13 @@ export default function ChatApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [query, archived]);
 
-  const touchConversation = useCallback((c: ChatConversation) => {
-    setConversations((cur) => [c, ...cur.filter((x) => x.id !== c.id)]);
-  }, []);
+  const touchConversation = useCallback(
+    (c: ChatConversation) => {
+      setConversations((cur) => [c, ...cur.filter((x) => x.id !== c.id)]);
+      recordPref(c);
+    },
+    [recordPref],
+  );
 
   // --- active conversation's messages ------------------------------------------------------------------------
   const updateThread = useCallback((id: string, f: (t: Thread) => Thread) => {
@@ -306,6 +332,9 @@ export default function ChatApp() {
         client_id: null,
       };
       let conversationId = activeRef.current;
+      // every send carries the switch's current value; an existing conversation whose value is not loaded yet sends
+      // none, and the server falls back to the conversation's own
+      const preferRecent: boolean | undefined = conversationId ? prefsRef.current[conversationId] : draftPreferRef.current;
       try {
         if (!conversationId) {
           setDraftThread([optimistic, pending]);
@@ -313,6 +342,9 @@ export default function ChatApp() {
           conversationId = conv.id;
           createdHere.current = conv.id;
           touchConversation(conv);
+          // the draft's choice shows at once; the first send body stores it
+          const draftValue = preferRecent;
+          if (draftValue !== undefined) setPrefs((cur) => ({ ...cur, [conv.id]: draftValue }));
           setThreads((cur) => ({ ...cur, [conv.id]: { ...EMPTY_THREAD, messages: [optimistic, pending] } }));
           setActiveId(conv.id);
           setDraftThread([]);
@@ -324,8 +356,9 @@ export default function ChatApp() {
             sendErrors: Object.fromEntries(Object.entries(t.sendErrors).filter(([k]) => k !== clientId)),
           }));
         }
-        const res = await chatApi.send(conversationId, content, clientId);
+        const res = await chatApi.send(conversationId, content, clientId, preferRecent);
         const cid = conversationId;
+        if (preferRecent !== undefined) storedPrefs.current[cid] = preferRecent;
         updateThread(cid, (t) => ({
           ...t,
           messages: [
@@ -360,6 +393,35 @@ export default function ChatApp() {
     },
     [sending, touchConversation, updateThread],
   );
+
+  /** The switch: a draft only changes the draft; an existing conversation shows the new value at once and PATCHes it,
+   * reverting to the last stored value (with the notice) when that fails. */
+  const togglePrefer = useCallback(async () => {
+    const id = activeRef.current;
+    if (!id) {
+      setDraftPrefer((v) => !v);
+      return;
+    }
+    const current = prefsRef.current[id];
+    if (current === undefined) return;
+    const next = !current;
+    const seq = (toggleSeq.current[id] ?? 0) + 1;
+    toggleSeq.current[id] = seq;
+    inflightPatch.current[id] = (inflightPatch.current[id] ?? 0) + 1;
+    setPrefs((cur) => ({ ...cur, [id]: next }));
+    setNotice(null);
+    try {
+      const c = await chatApi.patch(id, { prefer_recent: next });
+      storedPrefs.current[id] = c.prefer_recent ?? next;
+      setConversations((cur) => cur.map((x) => (x.id === id ? { ...x, prefer_recent: c.prefer_recent ?? next } : x)));
+    } catch (err) {
+      // only the latest toggle decides what is shown; an older failure must not undo a newer choice
+      if (toggleSeq.current[id] === seq) setPrefs((cur) => ({ ...cur, [id]: storedPrefs.current[id] ?? current }));
+      setNotice(errorMessage(err));
+    } finally {
+      inflightPatch.current[id] -= 1;
+    }
+  }, []);
 
   const stop = useCallback(
     async (m: ChatMessage) => {
@@ -536,6 +598,7 @@ export default function ChatApp() {
     unwindPanels(() => {
       setActiveId(null);
       setDraftThread([]);
+      setDraftPrefer(true);
       setComposerText("");
       setNotice(null);
       writeLocal(LAST_KEY, null);
@@ -711,6 +774,9 @@ export default function ChatApp() {
           onChange={setComposerText}
           busy={busy}
           running={runningIds.length > 0}
+          prefer={activeId ? prefs[activeId] ?? null : draftPrefer}
+          preferLocked={sending}
+          onPrefer={() => void togglePrefer()}
           onSend={(t) => {
             setComposerText("");
             void send(t);
@@ -1034,6 +1100,9 @@ function Composer({
   onChange,
   busy,
   running,
+  prefer,
+  preferLocked,
+  onPrefer,
   onSend,
   onStop,
 }: {
@@ -1041,11 +1110,17 @@ function Composer({
   onChange: (v: string) => void;
   busy: boolean;
   running: boolean;
+  /** The time-preference switch: null while an existing conversation's value is not loaded yet. */
+  prefer: boolean | null;
+  /** Only the send request itself locks the switch; a running turn does not (KTD14). */
+  preferLocked: boolean;
+  onPrefer: () => void;
   onSend: (text: string) => void;
   onStop: () => void;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
   const composing = useRef(false);
+  const preferDesc = useId();
 
   useLayoutEffect(() => {
     const el = ref.current;
@@ -1065,6 +1140,25 @@ function Composer({
 
   return (
     <div className="chat-composer-wrap">
+      <div className="recency-row">
+        <button
+          type="button"
+          role="switch"
+          className="recency-switch"
+          aria-checked={prefer === true}
+          aria-describedby={preferDesc}
+          disabled={preferLocked || prefer === null}
+          onClick={onPrefer}
+        >
+          <span className="recency-track" aria-hidden="true">
+            <span className="recency-thumb" />
+          </span>
+          <span className="recency-label">העדף נתונים עדכניים</span>
+        </button>
+        <span id={preferDesc} className="recency-desc">
+          מציג תחילה נתונים עדכניים, לצד נתונים קודמים רלוונטיים
+        </span>
+      </div>
       <form
         className="chat-composer"
         onSubmit={(e) => {

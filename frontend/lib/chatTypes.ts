@@ -10,6 +10,8 @@ export interface ChatConversation {
   created_at: string;
   archived: boolean;
   engine: "legacy" | "rag";
+  /** The time-preference switch (round 11 U10); absent only on a payload from before round 11, which reads as off. */
+  prefer_recent?: boolean;
 }
 
 export interface ChatProgressStep {
@@ -636,6 +638,45 @@ export interface ChatUnitScope {
   file_title: string;
 }
 
+/** What marks a timeline row (round 11 U9); each is shown as a text badge, never by colour alone. */
+export type ChatTimelineMark = "forecast" | "conflict" | "outside_requested" | "unknown_date";
+
+export interface ChatTimelineRow {
+  /** ISO date at the row's own precision, null when the sources give none. */
+  date: string | null;
+  precision: "day" | "month" | "year" | null;
+  date_kind: "valuation" | "transaction" | "stated" | "range" | null;
+  value_text: string;
+  unit: string | null;
+  /** The citation id as shown in the answer (S#, V# or M#). */
+  sid: string;
+  source: { document_id: string; title: string; location: string | null };
+  marks: ChatTimelineMark[];
+}
+
+/** One comparable group, its rows already in display order (the server orders them; the screen never re-sorts). */
+export interface ChatTimelineGroup {
+  label: string;
+  rows: ChatTimelineRow[];
+}
+
+/** The time the answer was produced under, and its timeline (round 11 U9); absent on older answers. */
+export interface ChatAnswerTime {
+  mode: "none" | "recent" | "explicit";
+  prefer_recent: boolean;
+  requested: { kind: string; start: string | null; end: string | null; precision: string | null; text: string } | null;
+  timeline: ChatTimelineGroup[];
+  /** A plain-text copy of the whole timeline; not in `markdown`, so it is not shown twice. The copy button appends it. */
+  text?: string | null;
+}
+
+/** The switch state a message was produced with (round 11 KTD1); null on a message from before round 11. */
+export interface ChatTimePreference {
+  version: number;
+  prefer_recent: boolean;
+  anchor_date: string;
+}
+
 export interface ChatAnswer {
   kind: "rag" | "search_only";
   status: "answered" | "partial" | "not_found" | "clarification";
@@ -670,6 +711,8 @@ export interface ChatAnswer {
   hidden?: boolean;
   /** The answer's scope line when the unit was kept from the previous turn (absent otherwise, and on older answers). */
   unit_scope?: ChatUnitScope | null;
+  /** The time mode and the server-built timeline (round 11; absent on older answers). */
+  time?: ChatAnswerTime | null;
 }
 
 export type ChatMessageStatus = "running" | "cancelling" | "cancelled" | "done" | "failed";
@@ -687,6 +730,8 @@ export interface ChatMessage {
   created_at: string;
   stale: boolean;
   cancel_requested: boolean;
+  /** The switch state this message was sent or answered with (null: from before round 11). */
+  time_preference?: ChatTimePreference | null;
 }
 
 export interface SourceBlock {

@@ -242,7 +242,7 @@ export const chatApi = {
       { signal },
     ),
   create: () => request<ChatConversation>("/api/chat/conversations", { method: "POST" }),
-  patch: (id: string, body: { title?: string; archived?: boolean }) =>
+  patch: (id: string, body: { title?: string; archived?: boolean; prefer_recent?: boolean }) =>
     request<ChatConversation>(`/api/chat/conversations/${encodeURIComponent(id)}`, { method: "PATCH", body }),
   remove: (id: string) => request<{ ok: true }>(`/api/chat/conversations/${encodeURIComponent(id)}`, { method: "DELETE" }),
   messages: (id: string, before?: string | null, signal?: AbortSignal) =>
@@ -250,10 +250,15 @@ export const chatApi = {
       `/api/chat/conversations/${encodeURIComponent(id)}/messages${qs({ before })}`,
       { signal },
     ),
-  send: (id: string, content: string, clientId: string) =>
+  /** `preferRecent`: the switch's current value, recorded on the message (round 11); left out when unknown, so the
+   * server falls back to the conversation's own value. */
+  send: (id: string, content: string, clientId: string, preferRecent?: boolean) =>
     request<{ user: ChatMessage; assistant: ChatMessage | null }>(
       `/api/chat/conversations/${encodeURIComponent(id)}/messages`,
-      { method: "POST", body: { content, client_id: clientId } },
+      {
+        method: "POST",
+        body: preferRecent === undefined ? { content, client_id: clientId } : { content, client_id: clientId, prefer_recent: preferRecent },
+      },
     ),
   message: (id: string, signal?: AbortSignal) =>
     request<ChatMessage>(`/api/chat/messages/${encodeURIComponent(id)}`, { signal }),
