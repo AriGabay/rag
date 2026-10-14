@@ -193,6 +193,9 @@ export interface ChatSource {
   source_kind?: SourceKind;
   /** For a standard or another professional document: its identity and the section the passage is in. */
   standard?: ChatStandard | null;
+  /** On a source of an appraisal gathered into the conversation's property (round 12): the server's link wording, e.g.
+   * "שומה של אותו נכס: חלקה 8401/40 משותפת". Absent on the focus appraisal and in off mode. */
+  link?: string | null;
 }
 
 export interface ChatMeasurement {
@@ -674,8 +677,10 @@ export interface ChatCoverageUnit {
   precision: "day" | "month" | "year" | null;
   date_status: string;
   undated: boolean;
-  /** `hit`: searched with a match; `no_match`: searched without one; `not_searched_cap`: not searched (the cap). */
-  status: "hit" | "no_match" | "not_searched_cap";
+  /** `hit`: searched with a match; `no_match`: searched without one; `not_searched_cap`: not searched (the cap);
+   * `read` and `not_searched` appear only on a read-only record (`read_only`): read by the answer without a search, or
+   * not checked by a read-only turn. */
+  status: "hit" | "no_match" | "not_searched_cap" | "read" | "not_searched";
   link: string | null;
   focus: boolean;
   /** Whether this unit keeps the coverage from being complete. */
@@ -698,6 +703,9 @@ export interface ChatTimeCoverage {
   undetermined: number;
   complete: boolean;
   blocking: string[];
+  /** True on a record built for a timed turn that answered from read sources with no time-ranked search (round 12):
+   * such a record is partial unless every unit was read. Absent or false otherwise. */
+  read_only?: boolean;
   /** The visible note, lines separated by newlines; rendered as its own element, not part of `markdown`. */
   note?: string | null;
 }
