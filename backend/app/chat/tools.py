@@ -152,10 +152,12 @@ from sqlalchemy import Connection, text
 from app.answering.verify import numbers_in
 from app.chat import anchors, calc, contexts, meaning, reader
 from app.chat import dates as chat_dates
+from app.chat import units as unit_store
 from app.chat import unread as unread_text
 from app.chat.contexts import MSG_NO_TITLE
 from app.chat.evidence import TABLE_SIZE_PREFIX
 from app.chat.intent import MIXED, PROFESSIONAL
+from app.chat.property import property_key, same_property_units
 from app.chat.timeframe import TimeMode
 from app.chat.timing import StageClock
 from app.config import get_settings
@@ -520,6 +522,8 @@ class Workspace:
     # the passages an identical search returned, kept for the turn (round 9 R16, KTD3, ``memoized_search``):
     # (query, scope, limit, the office's data version) -> hits
     search_memo: dict = field(default_factory=dict)
+    # the units sharing a property key, per (key, the office's data version) (round 11 U14)
+    property_memo: dict = field(default_factory=dict)
     # the windows an identical read returned, kept for the turn (round 9 R16, KTD9, ``_memoized_read``): (a page range,
     # section or cursor window, or a table part; the reading; the office's data version) -> the source it returned
     read_memo: dict = field(default_factory=dict)
@@ -1603,6 +1607,10 @@ MSG_UNIT_EXTENDED = ("גבול היחידה אינו ודאי (נקבע על ס�
 MSG_UNIT_WIDENED = ("בגבולות היחידה {unit} לא נמצא דבר, וגבול שלה אינו ודאי: הרחבתי פעם אחת את החיפוש לכל הקובץ. כל תוצאה "
                     "מסומנת ביחידה שהיא בה (unit) — אין להניח שתוצאה היא של היחידה שנשאלה.")
 MSG_UNIT_ARGS = "היחידה (unit) והמסמך שנבחר אינם של אותו קובץ: היחידה קובעת את המסמך — בחר רק אחד מהם"
+MSG_PROPERTY_SEARCHED = ("(הנכס שהשיחה עוסקת בו: החיפוש כולל את כל השומות של הנכס הזה בארגון, לא רק את השומה שבמוקד. "
+                         "כל תוצאה מסומנת בתאריך הקובע של השומה שלה.)")
+MSG_PROPERTY_NOTHING = ("חיפשתי בכל השומות של הנכס שהשיחה עוסקת בו ({count} יחידות) ולא נמצא קטע שמכיל את מילות החיפוש "
+                        "\"{query}\". אפשר לנסות ניסוח אחר או מונחים נרדפים.")
 
 
 def _unit_of(conn: Connection, ws: Workspace, handle: str):
@@ -1702,6 +1710,44 @@ def _unit_search(ws: Workspace, conn: Connection, handle: str, query: str, limit
     return [], [], MSG_UNIT_SEARCHED.format(unit=unit, pages=_unit_pages(*cx.pages(number)), extended="", query=_txt(query))
 
 
+def _property_search(ws: Workspace, conn: Connection, handle: str, query: str,
+                     limit: int) -> tuple[list[dict], list[str], str | None] | None:
+    """The time search of the conversation's property (round 11 U14, R4, R11, R12, KTD6, KTD9): when the turn has a time
+    mode and the focus unit's property is appraised by other units too (``property.same_property_units``: one key from
+    the stored identifiers), the search reads all of them instead of the focus unit alone — a question about 2022 asked
+    in a conversation on the 2025 appraisal must read the 2022 one. A unit of a file of several is read inside its own
+    blocks (``contexts.reach``, as ``_unit_search`` does), so another property of that file stays out; a file of one unit
+    is read whole, all those files in one search. The fused windows are merged by score and the documents ordered by the
+    mode (``ranked_by_time``). None: the unit has no key, or is the only one with it — the unit search stands.
+    Returns (hits, notes for the model, the answer when nothing was found), as ``_unit_search`` does."""
+    v, cx, number = _unit_of(conn, ws, handle)
+    mine = next((u for u in unit_store.ensure(conn, v.version_id) if u.unit_no == number), None)
+    key = property_key(mine.identifiers) if mine is not None else None
+    if key is None:
+        return None
+    memo_key = (key, current_data_version(conn))
+    found = ws.property_memo.get(memo_key)
+    if found is None:
+        found = ws.property_memo[memo_key] = same_property_units(conn, key)
+    if len(found) < 2 or (v.document_id, v.version_id, number) not in found:
+        return None
+    shared = [(d, ver, n, contexts_of(ws, conn, ver)) for d, ver, n in found]
+    whole = [d for d, _, _, c in shared if not c.multi]
+    hits: list[dict] = []
+    if whole:
+        hits += memoized_search(ws, conn, query, limit, SearchScope(
+            document_ids=tuple(dict.fromkeys(whole)), source_kinds=POOL_KINDS[APPRAISAL_POOL]), window=True)
+    for _, ver, n, c in shared:
+        if c.multi:
+            reach = c.reach(n)
+            hits += memoized_search(ws, conn, query, limit, SearchScope(
+                version_ids=(ver,), blocks=(reach.first, reach.last), source_kinds=POOL_KINDS[APPRAISAL_POOL]), window=True)
+    hits = sorted(hits, key=lambda h: -h["score"])
+    if not any(h.get("lexical_support") for h in hits):
+        return [], [], MSG_PROPERTY_NOTHING.format(count=len(found), query=_txt(query))
+    return ranked_by_time(ws, conn, hits, limit), [MSG_PROPERTY_SEARCHED], None
+
+
 def _clip_to_unit(conn: Connection, version_id, cx, kind: str, bs, be, body: str,
                   pages: list[int] | None) -> tuple[str, int | None, list[int] | None]:
     """A text passage of a file of several units, cut at the last block of the unit it begins in (round 9 R10): a chunk
@@ -1742,7 +1788,9 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
         in_focus = unit is not None
     with tenant_tx(ws.ctx) as conn:
         if unit:
-            hits, notes, nothing = _unit_search(ws, conn, unit, query, limit, document_ids)
+            # the conversation's unit in a turn with a time mode: its property's other appraisals are read too (U14)
+            widened = _property_search(ws, conn, unit, query, limit) if in_focus and ws.time.mode != "none" else None
+            hits, notes, nothing = widened or _unit_search(ws, conn, unit, query, limit, document_ids)
             if in_focus:
                 focus_note = MSG_UNIT_FOCUS.format(unit=unit)
                 if nothing:
