@@ -8,6 +8,7 @@ invented."""
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from uuid import UUID
 
@@ -57,6 +58,25 @@ def inserts(conn) -> list[str]:
             seen.append(statement)
 
     return seen
+
+
+def mark(office, version, first_block: int, section_path: list[str]) -> None:
+    """The stored blocks from ``first_block`` on sit under a section (as the reader stores a heading's path)."""
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_blocks SET section_path = :p WHERE version_id = :v AND block_index >= :b"),
+                     {"p": section_path, "v": UUID(version), "b": first_block})
+
+
+def as_table(office, doc, version, block_index: int, headers: list[str], *rows: list[str]) -> None:
+    """A stored block becomes a table block with the structure the reader stores (`extracted_tables`)."""
+    structure = {"headers": headers, "caption": None, "title": [], "notes": [], "section": None,
+                 "block_index": block_index, "rows": [{"cells": r} for r in rows]}
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_blocks SET table_index = 0 WHERE version_id = :v AND block_index = :b"),
+                     {"v": UUID(version), "b": block_index})
+        conn.execute(text("INSERT INTO extracted_tables (office_id, document_id, version_id, table_index, page_start,"
+                          " page_end, structure) VALUES (app_office(), :d, :v, 0, 1, 1, CAST(:s AS jsonb))"),
+                     {"d": UUID(str(doc)), "v": UUID(version), "s": json.dumps(structure, ensure_ascii=False)})
 
 
 def single(office, blocks, **kw):
@@ -268,13 +288,103 @@ def test_a_marker_row_stops_the_derivation_of_a_version_with_no_dates(office):
 def test_a_new_dates_version_derives_again_and_a_current_one_never_does(office, monkeypatch):
     _, ver = single(office, [HEADER, "המועד הקובע: 15/04/2024"])
     read(office, ver)
-    monkeypatch.setattr(D, "DATES_VERSION", "dates-v2")
+    monkeypatch.setattr(D, "DATES_VERSION", "dates-v3")
     assert len(read(office, ver)[UUID(ver)]) == 1
-    assert sorted(r.dates_version for r in rows(office, ver)) == ["dates-v1", "dates-v2"]  # the old rows are kept
+    assert sorted(r.dates_version for r in rows(office, ver)) == ["dates-v2", "dates-v3"]  # the old rows are kept
     with tenant_tx(office.system) as conn:
         again = inserts(conn)
         D.valuation_dates(conn, [ver])
         assert again == []
+
+
+def test_the_current_dates_version_is_v2(office):
+    assert D.DATES_VERSION == "dates-v2"
+
+
+def old_row(office, doc, version, dates_version: str, iso: str | None, block: int = 1) -> None:
+    with tenant_tx(office.system) as conn:
+        conn.execute(text(
+            "INSERT INTO version_dates (office_id, document_id, version_id, dates_version, block_index, iso, precision,"
+            " written, status) VALUES (app_office(), :d, :v, :dv, :b, :i, :p, :w, 'stated')"),
+            {"d": UUID(str(doc)), "v": UUID(version), "dv": dates_version, "b": block, "i": iso,
+             "p": "day" if iso else None, "w": iso})
+
+
+def test_a_version_with_only_dates_v1_rows_derives_dates_v2_on_first_read_and_keeps_the_v1_rows_unread(office):
+    """Round 12 U3 (R21): the stored v1 rows are a derived cache of an older reading; they are neither deleted nor read."""
+    doc, ver = single(office, [HEADER, "התאריך הקובע לשומה: 28/02/2024", "שווי 2,450,000 ₪"])
+    old_row(office, doc, ver, "dates-v1", None, D.MARKER_BLOCK)   # what v1 stored: it found nothing in this file
+    got = read(office, ver)[UUID(ver)]
+    assert [(d.iso, d.block_index) for d in got] == [("2024-02-28", 1)]
+    assert sorted((r.dates_version, r.iso) for r in rows(office, ver)) == [("dates-v1", None), ("dates-v2", "2024-02-28")]
+    with tenant_tx(office.system) as conn:   # the next read is served from the v2 rows, with no new write
+        later = inserts(conn)
+        assert [d.iso for d in D.valuation_dates(conn, [ver])[UUID(ver)]] == ["2024-02-28"]
+        assert later == []
+
+
+def test_a_v1_row_is_never_read_as_a_date_of_the_current_version(office):
+    doc, ver = single(office, [HEADER, "שווי 2,450,000 ₪"])
+    old_row(office, doc, ver, "dates-v1", "2019-01-01")
+    assert read(office, ver)[UUID(ver)] == ()
+    assert sorted((r.dates_version, r.iso) for r in rows(office, ver)) == [("dates-v1", "2019-01-01"), ("dates-v2", None)]
+
+
+def test_a_read_only_transaction_over_a_v1_only_version_still_gets_the_v2_dates_and_writes_nothing(office):
+    doc, ver = single(office, [HEADER, "המועד הקובע: 31.12.23"])
+    old_row(office, doc, ver, "dates-v1", None, D.MARKER_BLOCK)
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("SET TRANSACTION READ ONLY"))
+        got = D.valuation_dates(conn, [ver])[UUID(ver)]
+    assert [d.iso for d in got] == ["2023-12-31"]
+    assert [(r.dates_version, r.iso) for r in rows(office, ver)] == [("dates-v1", None)]
+
+
+# --- dates-v2 from the stored blocks: the section path and the table structure (U3, KTD11, KTD12; AE6) -------------
+
+def test_ae6_a_prior_appraisals_label_under_a_history_section_never_becomes_the_units_date(office):
+    _, ver = single(office, [
+        HEADER, "המועד הקובע לשומה - 31.12.23", "3. שומות קודמות",
+        "לתאריך הקובע 31.12.19 הוערך הנכס ב-1,800,000 ₪.", "בשומה קודמת, לתאריך הקובע 31.12.21, הוערך הנכס ב-2,000,000 ₪."])
+    mark(office, ver, 2, ["3. שומות קודמות"])
+    got = read(office, ver)[UUID(ver)]
+    assert [(d.iso, d.block_index, d.status) for d in got] == [("2023-12-31", 1, "stated")]
+    with tenant_tx(office.system) as conn:
+        uv = D.unit_valuation(conn, ver, 3)
+    assert (uv.status, uv.date.iso) == ("stated", "2023-12-31")   # no conflict with 2019 or 2021
+    assert [(r.iso, r.status) for r in rows(office, ver)] == [("2023-12-31", "stated")]
+
+
+def test_a_round_11_label_under_a_history_heading_is_not_stored(office):
+    _, ver = single(office, [HEADER, "שומות מקרקעין קודמות", "המועד הקובע 30.6.22"])
+    mark(office, ver, 1, ["שומות מקרקעין קודמות"])
+    assert read(office, ver)[UUID(ver)] == ()
+    assert [(r.block_index, r.iso) for r in rows(office, ver)] == [(D.MARKER_BLOCK, None)]
+
+
+def test_a_one_row_table_header_label_is_read_from_the_stored_structure(office):
+    doc, ver = single(office, [HEADER, "|מועד קובע | כתובת | סוג נכס\n7.11.2020 | הרימון 4 | דירה", "שווי 2,450,000 ₪"])
+    as_table(office, doc, ver, 1, ["מועד קובע", "כתובת", "סוג נכס"], ["7.11.2020", "הרימון 4", "דירה"])
+    got = read(office, ver)[UUID(ver)]
+    assert [(d.iso, d.block_index, d.unit_no) for d in got] == [("2020-11-07", 1, 1)]
+
+
+def test_a_multi_row_header_label_table_is_history_and_stores_no_unit_date(office):
+    doc, ver = single(office, [
+        HEADER, "המועד הקובע: 30/06/2025",
+        "|מועד קובע | שווי (₪)\n31/12/2021 | 2,050,000\n31/12/2023 | 2,300,000"])
+    as_table(office, doc, ver, 2, ["מועד קובע", "שווי (₪)"], ["31/12/2021", "2,050,000"], ["31/12/2023", "2,300,000"])
+    assert [(d.iso, d.status) for d in read(office, ver)[UUID(ver)]] == [("2025-06-30", "stated")]
+    _, only = single(office, [HEADER, "|מועד קובע | שווי (₪)\n31/12/2020 | 1,950,000\n31/12/2022 | 2,150,000"],
+                     sha="e" * 64)
+    doc2 = rows(office, only, "SELECT document_id FROM document_blocks WHERE version_id = :v LIMIT 1")[0].document_id
+    as_table(office, doc2, only, 1, ["מועד קובע", "שווי (₪)"], ["31/12/2020", "1,950,000"], ["31/12/2022", "2,150,000"])
+    assert read(office, only)[UUID(only)] == ()
+
+
+def test_a_table_block_without_a_stored_structure_is_still_read_as_text(office):
+    _, ver = single(office, [HEADER, "|מועד קובע | 15/04/2024"])
+    assert [d.iso for d in read(office, ver)[UUID(ver)]] == ["2024-04-15"]
 
 
 def test_a_transaction_that_cannot_write_still_gets_the_dates(office):

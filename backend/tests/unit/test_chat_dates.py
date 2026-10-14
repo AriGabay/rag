@@ -14,12 +14,17 @@ from app.chat import dates as D
 ANCHOR = date(2026, 10, 14)
 
 
-def block(i: int, text: str, kind: str = "paragraph"):
-    return SimpleNamespace(block_index=i, kind=kind, text=text)
+def block(i: int, text: str, kind: str = "paragraph", section_path: tuple = (), table_index: int | None = None):
+    return SimpleNamespace(block_index=i, kind=kind, text=text, section_path=list(section_path), table_index=table_index)
 
 
-def found(blocks):
-    return [(f.block_index, f.iso, f.precision) for f in D.derive(blocks)]
+def found(blocks, tables=None):
+    return [(f.block_index, f.iso, f.precision) for f in D.derive(blocks, tables)]
+
+
+def table(headers: list[str], *rows: list[str]) -> dict:
+    """A table as `extracted_tables.structure` stores it (the parts `derive` reads)."""
+    return {"headers": headers, "rows": [{"cells": r} for r in rows]}
 
 
 def stated(i: int, iso: str, precision: str = "day", unit_no: int | None = 1) -> D.StatedDate:
@@ -56,7 +61,6 @@ def test_a_label_alone_in_a_cell_takes_the_date_of_the_next_cell():
     "נחתם ביום 22/04/2025",
     "חתימה: ____ תאריך חתימה 22/04/2025",
     "בתאריך 15/04/2024 נערכה בדיקה במקום",               # a date with no valuation label
-    "המועד הקובע: 15/04/24",                                # a two-digit year is no supported date
     "המועד הקובע הוא תשפ״ד",                                # a Hebrew-calendar year is unknown
     "המועד הקובע הרבעון הראשון Q1 2024",
     "המועד הקובע יקבע בהמשך. עסקה מיום 15/04/2024.",        # the date is not the label's
@@ -85,6 +89,206 @@ def test_a_picture_block_and_bidi_marks_are_handled():
 
 def test_the_same_date_twice_in_one_block_is_one_find():
     assert found([block(0, "המועד הקובע: 15/04/2024. שוב, המועד הקובע: 15/04/2024")]) == [(0, "2024-04-15", "day")]
+
+
+# --- dates-v2 (round 12 U3: R15, R16, R21; KTD11, KTD12; AE6) --------------------------------------------------------
+
+@pytest.mark.parametrize("text, iso, precision", [
+    # extra words between the label and the date (KTD11: "זו", "קרי", the visit phrase as a gap only)
+    ("המועד הקובע להערכה זו הינו מועד הביקור בנכס – קרי 16.08.2026", "2026-08-16", "day"),
+    ("המועד הקובע לשומה זו הינו מועד הביקור בנכס – קרי 15/03/2024.", "2024-03-15", "day"),
+    ("המועד הקובע לשומה זה, כלומר ליום 15/03/2024", "2024-03-15", "day"),
+    ("המועד הקובע דהיינו 15/03/2024", "2024-03-15", "day"),
+    # the label "תאריך הקובע"
+    ("התאריך הקובע לשומה: 28/02/2024", "2024-02-28", "day"),
+    ("לתאריך הקובע 31/12/2023 נקבע השווי", "2023-12-31", "day"),
+    # a label-anchored two-digit year: day-first, 00-69 -> 20YY
+    ("המועד הקובע: 15/04/24", "2024-04-15", "day"),
+    ("המועד הקובע לשומה - 31.12.23", "2023-12-31", "day"),
+    ("המועד הקובע 31.12.23, ועד 15/3/2024", "2023-12-31", "day"),
+    ("המועד הקובע: 1.2.00", "2000-02-01", "day"),
+    ("המועד הקובע: 1.2.69", "2069-02-01", "day"),
+    # a date right before its label, with a direct connector
+    ("17.08.2025, שהינו גם התאריך הקובע להערכה.", "2025-08-17", "day"),
+    ("31/12/2023 שהוא המועד הקובע", "2023-12-31", "day"),
+    ("הערכה זו נערכת ליום 31.3.2024 והוא המועד הקובע לשומה.", "2024-03-31", "day"),
+])
+def test_dates_v2_reads_the_further_evidenced_structures(text, iso, precision):
+    assert found([block(1, text)]) == [(1, iso, precision)]
+
+
+@pytest.mark.parametrize("text", [
+    "המועד הקובע 31.12.75",                        # 70-99 is refused
+    "המועד הקובע: 1.2.70",
+    "המועד הקובע: 12.31.23",                       # day-first only: month 31 is no date
+    "המועד הקובע: 31.02.23",                       # an impossible date
+    "המועד הקובע: 1.1.23-31.12.23",                # never a range
+    "המועד הקובע: 1.1.23 עד 31.12.23",
+    "מועד הביקור בנכס: 15/03/2023",                # the visit phrase is no label alone
+    "ביקור בנכס נערך ב-05.07.24",                  # a two-digit year with no label
+    "תאריך הפקה: 22/03/23",                        # a report date
+    "תאריך עריכת השומה: 22/04/23",
+    "נחתם ביום 05.01.2024, שהינו גם המועד הקובע",  # the date-before reading takes no report date
+    "נחתם ביום 05.01.2024. המועד הקובע ייקבע בהמשך.",
+    "05.01.2024 המועד הקובע",                      # no connector between the date and its label
+    "31/12/2023, וגם נערך סיור. המועד הקובע ייקבע",  # a connector must be direct
+])
+def test_dates_v2_refuses_what_it_does_not_evidence(text):
+    assert found([block(1, text)]) == []
+
+
+def test_a_signature_date_before_the_label_is_not_taken_but_the_valuation_date_after_it_is():
+    assert found([block(0, "נחתם ביום 05.01.2024. המועד הקובע: 31/03/2024")]) == [(0, "2024-03-31", "day")]
+
+
+def test_a_two_digit_report_date_is_recognised_as_one_and_never_taken_as_the_valuation_date():
+    assert [p.iso for p in D.report_dates("תאריך הפקה: 22/03/23")] == ["2023-03-22"]
+    assert [p.iso for p in D.report_dates("תאריך עריכת השומה: 22/04/23")] == ["2023-04-22"]
+    assert found([block(0, "תאריך הפקה: 22/03/23, המועד הקובע: 15/04/2024")]) == [(0, "2024-04-15", "day")]
+
+
+def test_the_shared_parser_still_refuses_two_digit_years_everywhere_else():
+    from app.platform import dates as shared
+    assert shared.find_all("המועד הקובע: 15/04/24") == []
+    assert D.resolve_as_of("שווי הנכס ב-15/04/24 הוא 2,000,000 ₪", anchor=ANCHOR) is None
+
+
+def test_a_heading_with_the_label_alone_takes_the_date_the_next_block_starts_with():
+    assert found([block(3, "המועד הקובע", "heading"), block(4, "31.5.2021.")]) == [(4, "2021-05-31", "day")]
+    assert found([block(3, "5. המועד הקובע", "heading"),
+                  block(4, "30/06/2024 – תאריך הביקור בנכס והמועד שאליו מתייחסת השומה.")]) == [(4, "2024-06-30", "day")]
+    assert found([block(3, "המועד הקובע", "heading"), block(4, "31.5.21")]) == [(4, "2021-05-31", "day")]
+
+
+def test_a_heading_with_the_label_alone_does_not_take_a_report_date_or_a_block_that_does_not_start_with_a_date():
+    assert found([block(3, "המועד הקובע", "heading"), block(4, "נחתם ביום 31.5.2021")]) == []
+    assert found([block(3, "המועד הקובע", "heading"), block(4, "ייקבע בהמשך. עסקה מיום 31.5.2021.")]) == []
+
+
+def test_a_header_label_of_a_one_row_table_gives_the_date_of_its_column():
+    tables = {0: table(["מועד קובע", "כתובת", "סוג נכס"], ["7.11.2020", "הרימון 4", "דירה"])}
+    blocks = [block(5, "מועד קובע | כתובת | סוג נכס\n7.11.2020 | הרימון 4 | דירה", "table", table_index=0)]
+    assert found(blocks, tables) == [(5, "2020-11-07", "day")]
+
+
+def test_the_label_may_be_in_any_column_and_the_date_comes_from_that_column_only():
+    tables = {0: table(["תאריך הפקה", "מועד קובע"], ["01/02/2026", "7.11.2020"])}
+    blocks = [block(5, "תאריך הפקה | מועד קובע\n01/02/2026 | 7.11.2020", "table", table_index=0)]
+    assert found(blocks, tables) == [(5, "2020-11-07", "day")]
+    # the label is the last cell of the header line and the first data cell is another column's date: not the label's
+    tables = {0: table(["תאריך הפקה", "מועד קובע"], ["01/02/2026", "ייקבע בהמשך"])}
+    blocks = [block(5, "תאריך הפקה | מועד קובע\n01/02/2026 | ייקבע בהמשך", "table", table_index=0)]
+    assert found(blocks, tables) == []
+
+
+def test_a_header_label_of_a_table_with_several_data_rows_is_history_and_gives_no_date():
+    tables = {0: table(["מועד קובע", "שווי (₪)"], ["31/12/2021", "2,050,000"], ["31/12/2023", "2,300,000"])}
+    text = "מועד קובע | שווי (₪)\n31/12/2021 | 2,050,000\n31/12/2023 | 2,300,000"
+    assert found([block(5, text, "table", table_index=0)], tables) == []
+    three = {0: table(["שווי (₪)", "מועד קובע"], ["2,050,000", "31/12/2021"], ["2,100,000", "31/12/2022"],
+                      ["2,300,000", "31/12/2023"])}
+    text3 = "שווי (₪) | מועד קובע\n2,050,000 | 31/12/2021\n2,100,000 | 31/12/2022\n2,300,000 | 31/12/2023"
+    assert found([block(5, text3, "table", table_index=0)], three) == []
+
+
+def test_a_one_row_table_keeps_the_other_dates_of_the_unit_and_a_multi_row_one_does_not_add_a_conflict():
+    tables = {0: table(["מועד קובע", "שווי (₪)"], ["31/12/2021", "2,050,000"], ["31/12/2023", "2,300,000"])}
+    blocks = [block(1, "המועד הקובע: 30/06/2025"),
+              block(5, "מועד קובע | שווי (₪)\n31/12/2021 | 2,050,000\n31/12/2023 | 2,300,000", "table", table_index=0)]
+    assert found(blocks, tables) == [(1, "2025-06-30", "day")]
+
+
+def test_a_table_title_line_before_the_header_line_does_not_hide_the_header_from_the_table_rule():
+    tables = {0: table(["כתובת", "מועד קובע"], ["הרימון 4", "ייקבע בהמשך"], ["הרימון 5", "31/12/2021"])}
+    text = "טבלת נכסים\nכתובת | מועד קובע\nהרימון 4 | ייקבע בהמשך\nהרימון 5 | 31/12/2021"
+    assert found([block(5, text, "table", table_index=0)], tables) == []
+    one = {0: table(["שם הטבלה", "מועד קובע"], ["הרימון 4", "ייקבע בהמשך"])}
+    # the header line is the last cell's label and the next line starts with a date of another column: not the label's
+    assert found([block(5, "פרטים\nשם הטבלה | מועד קובע\nהרימון 4 | ייקבע בהמשך", "table", table_index=0)], one) == []
+
+
+def test_a_table_block_without_a_structure_is_read_as_text_as_before():
+    assert found([block(5, "מועד קובע | 15/04/2024", "table", table_index=7)], {}) == [(5, "2024-04-15", "day")]
+    assert found([block(5, "מועד קובע | 15/04/2024", "table")]) == [(5, "2024-04-15", "day")]
+
+
+# --- the history guard in derive (KTD11, KTD12; AE6) ----------------------------------------------------------------
+
+PRIOR = ("3. שומות קודמות",)
+
+
+def test_ae6_a_prior_appraisals_date_never_becomes_the_units_date_or_a_conflict():
+    blocks = [
+        block(0, "המועד הקובע לשומה - 31.12.23"),
+        block(1, "3. שומות קודמות", "heading", section_path=PRIOR),
+        block(2, "לתאריך הקובע 31.12.19 הוערך הנכס ב-1,800,000 ₪.", section_path=PRIOR),
+        block(3, "בשומה קודמת, לתאריך הקובע 31.12.21, הוערך הנכס ב-2,000,000 ₪.", section_path=PRIOR),
+    ]
+    assert found(blocks) == [(0, "2023-12-31", "day")]
+    stated = D.assign(D.derive(blocks), ())
+    assert [(d.iso, d.status) for d in stated] == [("2023-12-31", "stated")]
+
+
+def test_a_round_11_label_under_a_history_heading_is_not_a_unit_date():
+    blocks = [block(1, "שומות מקרקעין קודמות", "heading", section_path=("שומות מקרקעין קודמות",)),
+              block(2, "המועד הקובע 30.6.22", section_path=("שומות מקרקעין קודמות",))]
+    assert found(blocks) == []
+    assert found([block(2, "המועד הקובע 30.6.2022", section_path=("3. היסטוריה",))]) == []
+
+
+def test_every_reading_is_guarded_the_new_ones_and_the_old_ones_alike():
+    path = ("2. רכישות קודמות", "2.1 פירוט")
+    for text in ("המועד הקובע: 15/04/2024", "המועד הקובע: 15/04/24", "17.08.2025, שהינו גם התאריך הקובע",
+                 "לתאריך הקובע 31/12/2019 הוערך הנכס"):
+        assert found([block(2, text, section_path=path)]) == [], text
+    assert found([block(1, "המועד הקובע", "heading", section_path=path), block(2, "31.5.2021.", section_path=path)]) == []
+    tables = {0: table(["מועד קובע", "שווי (₪)"], ["31/12/2021", "2,050,000"])}
+    assert found([block(5, "מועד קובע | שווי (₪)\n31/12/2021 | 2,050,000", "table", section_path=path, table_index=0)],
+                 tables) == []
+
+
+def test_a_history_cue_in_the_sentence_marks_it_whatever_the_section():
+    assert found([block(2, "הנכס נרכש ביום 15/05/2017, המועד הקובע ליום 15/05/2017.")]) == []
+    assert found([block(2, "בעבר הוערך הנכס, המועד הקובע 31.12.19.")]) == []
+
+
+def test_a_current_conclusion_sentence_keeps_the_units_date():
+    blocks = [block(1, "המועד הקובע: 31/12/2025"),
+              block(2, "שווי הזכויות בנכס הוערך ב-2,640,000 ₪ נכון למועד הקובע.")]
+    assert found(blocks) == [(1, "2025-12-31", "day")]
+    # the cue is in another sentence of the block: the label's sentence is the one that counts
+    assert found([block(1, "הנכס נרכש בשנת 2017. המועד הקובע: 31/12/2025")]) == [(1, "2025-12-31", "day")]
+
+
+# --- the date-pattern fixtures of round 12, read through the DOCX reader ------------------------------------------------
+
+def _fixture_blocks(name: str):
+    import time
+    from pathlib import Path
+
+    from app.config import get_settings
+    from app.extraction.docx import extract_docx
+    path = Path(__file__).resolve().parents[1] / "fixtures" / "round12" / name
+    result = extract_docx(path.read_bytes(), time.monotonic() + 60, get_settings())
+    tables = {t.index: {"headers": t.headers, "rows": [{"cells": r.cells} for r in t.rows]} for t in result.tables}
+    blocks = [SimpleNamespace(block_index=b.index, kind=b.kind, text=b.text, section_path=list(b.section_path),
+                              table_index=b.table_index) for b in result.blocks]
+    return blocks, tables
+
+
+def _date_pattern_documents():
+    import json
+    from pathlib import Path
+    manifest = json.loads((Path(__file__).resolve().parents[1] / "fixtures" / "round12" / "manifest.json").read_text())
+    return [(d["key"], d["file"].split("/")[-1], d["units"][0]["date_pattern"]["expected_date"])
+            for d in manifest["documents"].values() if d["units"] and "date_pattern" in d["units"][0]]
+
+
+@pytest.mark.parametrize("key, name, expected", _date_pattern_documents(), ids=lambda v: v if isinstance(v, str) else None)
+def test_each_date_pattern_fixture_derives_its_manifest_date(key, name, expected):
+    blocks, tables = _fixture_blocks(name)
+    got = {f.iso for f in D.derive(blocks, tables)}
+    assert got == ({expected} if expected else set()), key
 
 
 # --- the unit's valuation date ------------------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 """The dates of an appraisal and of its data: the lazily derived valuation-date record and a datum's own date (round 11
-U6b: R5, R6, R7, R10; KTD3, KTD4; AE2).
+U6b: R5, R6, R7, R10; KTD3, KTD4; AE2; round 12 U3: R15, R16, R21; KTD11, KTD12; AE6).
 
 **What a datum's date is** (R5): the date it refers to, never the upload, processing or report-writing date. Two
 things give it, both found by the server in the source, never typed by the model:
@@ -12,7 +12,13 @@ first use from its stored blocks (`derive`: no file, no model call, no re-read) 
 taken only when it follows a valuation label ("המועד הקובע", "מועד קובע", also "למועד הקובע לשומה ליום ..." and a
 label alone in a cell with the date in the next one). The report-writing and signature labels ("תאריך עריכת השומה",
 "תאריך הדוח", "נחתם", "חתימה") are recognised (`report_dates`) only so that their dates are never taken as valuation
-dates; they are not stored. A version where nothing is found gets one marker row (`block_index` -1, `iso` NULL) so it is
+dates; they are not stored. **Dates-v2** (round 12 U3, R15, KTD11, KTD12) reads further evidenced structures, all inside
+`_date_after`/`_date_before` so `report_dates` shares them: the label "(ה)תאריך (ה)קובע", the gap words "זו", "קרי" ... and
+the visit phrase (a gap only, never a label), a label-anchored two-digit year (00-69 -> 20YY, day-first, never a range;
+70-99 refused), a date right before its label with a direct connector, a label-only heading followed by a block that starts
+with a date, and a one-row table whose header cell holds the label (the date of its column; more rows are history). A
+labelled date that the shared history predicate (`is_history`) marks, of any reading, is never the unit's date. A version
+where nothing is found gets one marker row (`block_index` -1, `iso` NULL) so it is
 not derived again; a version with any row of the current `DATES_VERSION` never is. Older rows are kept, never read.
 Only appraisal-kind versions derive (`APPRAISALS_SQL`); a version changed to a professional kind keeps its rows
 unread. Every write goes through the caller's transaction (RLS: a user outside the document's group neither reads nor
@@ -53,7 +59,7 @@ from __future__ import annotations
 import logging
 import re
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from typing import TypedDict
@@ -70,7 +76,7 @@ from app.professional.sections import flight, landed
 
 logger = logging.getLogger(__name__)
 
-DATES_VERSION = "dates-v1"
+DATES_VERSION = "dates-v2"
 MARKER_BLOCK = -1       # the block index of the row that records "derived, none found"
 DOCUMENT_SCOPE = 0      # the unit number of a version that has no units: the document is the scope
 
@@ -123,26 +129,56 @@ class UnitValuation:
 # --- the labels ------------------------------------------------------------------------------------------------------
 
 _Q = '["״\'׳]'
-# "המועד הקובע", "מועד קובע", "למועד הקובע לשומה": at most two prefix letters
-_VALUATION = re.compile(r"(?<![א-ת])[בלוכמשה]{0,2}מועד\s+ה?קובע(?:\s+ל?(?:ה?שומה|ה?הערכה|ה?שווי))?(?![א-ת])")
+# "המועד הקובע", "מועד קובע", "(ה)תאריך (ה)קובע" (round 12 U3, KTD11), "למועד הקובע לשומה": at most two prefix letters
+_VALUATION = re.compile(r"(?<![א-ת])[בלוכמשה]{0,2}(?:מועד|תאריך)\s+ה?קובע(?:\s+ל?(?:ה?שומה|ה?הערכה|ה?שווי))?(?![א-ת])")
 # the report-writing and signature labels; they are recognised so their dates are never taken as valuation dates
 _REPORT = re.compile(
-    rf"(?<![א-ת])[בלוכמשה]{{0,2}}(?:תאריך\s+(?:עריכת\s+)?(?:ה?שומה|ה?דו{_Q}?ח|ה?חוות\s+דעת|חתימה|עריכה)"
+    rf"(?<![א-ת])[בלוכמשה]{{0,2}}(?:תאריך\s+(?:עריכת\s+)?(?:ה?שומה|ה?דו{_Q}?ח|ה?חוות\s+דעת|חתימה|עריכה|ה?הפקה)"
     r"|נחתם|נחתמ(?:ה|ו)|חתימה|ניתן)(?![א-ת])")
 # the words allowed between a label and its date: "ליום", "הוא", "הינו", signs and spaces; anything else (a word of
-# the sentence) ends the label's reach
+# the sentence) ends the label's reach. Round 12 U3 (KTD11) adds "זו", "זה", "קרי", "כלומר", "דהיינו" ...
 _GAP_WORDS = ("לשומה", "להערכה", "ליום", "ביום", "מיום", "יום", "הוא", "הינו", "הנו", "הנה", "הינה", "היה", "לתאריך",
-              "בתאריך", "תאריך", "של", "השומה", "הנדון")
-_GAP = re.compile(r"(?:[\s:|\-–—־,()\[\]]|(?<![א-ת])(?:" + "|".join(_GAP_WORDS) + r")(?![א-ת]))*")
+              "בתאריך", "תאריך", "של", "השומה", "הנדון", "זו", "זה", "קרי", "כלומר", "דהיינו")
+# ... and the visit phrase "מועד הביקור (בנכס)", which counts only here, between a label and its date: it is never a
+# label alone (a visit date is not a valuation date)
+_VISIT = r"(?<![א-ת])[בלה]?מועד\s+ה?ביקור(?:\s+ב?נכס)?(?![א-ת])"
+_GAP = re.compile(r"(?:[\s:|\-–—־,()\[\]]|(?<![א-ת])(?:" + "|".join(_GAP_WORDS) + r")(?![א-ת])|" + _VISIT + r")*")
 _REACH = 120   # characters after a label that are read for its date
 _PREFIX = re.compile(r"[א-ת\-־]{0,2}")
 _TEXT_KINDS_SKIPPED = ("image",)
 
+# a two-digit year, read only at the gap's end after a label (round 12 U3, KTD11): day-first, never a range, never cut
+# out of a longer number
+_TWO_DIGIT = re.compile(r"(?<![\d./,])(?P<d>\d{1,2})(?P<s>[./-])(?P<m>\d{1,2})(?P=s)(?P<y>\d{2})(?!\d)(?![./,]\d)")
+_RANGE_AFTER = re.compile(r"\s*(?:[\-–—־‐‑]|ו?עד(?![א-ת]))\s*\d")
+_TWO_DIGIT_LAST = 69   # 00-69 -> 20YY; 70-99 is refused, never read as 19YY (date-dependent guesses are no evidence)
+
+# a date right before its label needs a direct connector ("שהינו גם התאריך הקובע") and no report label before it
+_CONNECTOR = r"(?<![א-ת])(?:ש?הינו|ש?הוא|ש?הנו|והוא|גם)(?![א-ת])"
+_BEFORE_TAIL = re.compile(rf"[\s,;:\-–—()]*{_CONNECTOR}(?:[\s,]*{_CONNECTOR})*[\s,]*$")
+_BEFORE_WINDOW = 60   # characters before the date that are read for a report label
+
+
+def _two_digit_after(rest: str, gap: int) -> tuple[Parsed | None, bool]:
+    """(the two-digit-year date at the gap's end, whether one is written there at all): 00-69 -> 20YY, day-first, the
+    calendar checked; 70-99, an impossible date and a range are written there but refused."""
+    m = _TWO_DIGIT.match(rest, gap)
+    if m is None:
+        return None, False
+    year = int(m["y"])
+    if year > _TWO_DIGIT_LAST or _RANGE_AFTER.match(rest, m.end()):
+        return None, True
+    try:
+        iso = date(2000 + year, int(m["m"]), int(m["d"])).isoformat()
+    except ValueError:
+        return None, True
+    return Parsed(iso, "day", None, m.group(0), (m.start(), m.end())), True
+
 
 def _date_after(text_: str, pos: int) -> tuple[Parsed | None, bool]:
     """(the date that follows a label ending at ``pos``, whether only gap is left after it). The date comes right after
-    the gap (a Hebrew prefix letter of a month name may precede it); a range is no valuation date. The span is in
-    ``text_``'s offsets."""
+    the gap (a Hebrew prefix letter of a month name may precede it); a range is no valuation date. A date with a
+    two-digit year is read here too, and only here (round 12 U3, KTD11). The span is in ``text_``'s offsets."""
     rest = text_[pos:pos + _REACH]
     gap = _GAP.match(rest).end()
     if gap >= len(rest.rstrip()):
@@ -156,7 +192,30 @@ def _date_after(text_: str, pos: int) -> tuple[Parsed | None, bool]:
                 return None, False
             return Parsed(p.iso, p.precision, None, p.written, (p.span[0] + pos, p.span[1] + pos)), False
         break
-    return None, False
+    q, _ = _two_digit_after(rest, gap)
+    if q is None:
+        return None, False
+    return Parsed(q.iso, q.precision, None, q.written, (q.span[0] + pos, q.span[1] + pos)), False
+
+
+def _date_before(text_: str, label_start: int) -> Parsed | None:
+    """The date written right before a label that starts at ``label_start``, joined to it by a direct connector
+    ("17.08.2025, שהינו גם התאריך הקובע"), or None. A date beside a report or signature label in the words before it is
+    that label's, never the valuation date. Four-digit years only: the two-digit year is read at the gap's end alone."""
+    head = text_[:label_start]
+    tail = _BEFORE_TAIL.search(head)
+    if tail is None:
+        return None
+    before = head[:tail.start()]
+    dates = shared.find_all(before)
+    if not dates or dates[-1].end is not None or before[dates[-1].span[1]:].strip(" ,;:-–—()"):
+        return None
+    p = dates[-1]
+    window = before[max(0, p.span[0] - _BEFORE_WINDOW):p.span[0]]
+    cut = list(_SENTENCE_BREAK.finditer(window))
+    if _REPORT.search(window[cut[-1].end():] if cut else window):
+        return None
+    return p
 
 
 def report_dates(text_: str) -> list[Parsed]:
@@ -171,12 +230,94 @@ def report_dates(text_: str) -> list[Parsed]:
     return found
 
 
-def derive(blocks: Iterable) -> list[Found]:
-    """The labelled valuation dates of stored blocks (anything with ``block_index``, ``kind`` and ``text``), in block
-    order. Pure: no database, no model. A date is taken when it follows a valuation label in the block, or, for a label
-    alone in a cell, when the next block starts with a date."""
-    rows = [(int(b.block_index), strip_bidi_controls(b.text or "")) for b in blocks
-            if getattr(b, "kind", "paragraph") not in _TEXT_KINDS_SKIPPED]
+# --- history (round 12 U3, KTD12) --------------------------------------------------------------------------------------
+# one predicate for "this datum belongs to history, not to the appraisal's own valuation": `derive` withholds a labelled
+# date from the unit with it, and `resolve_as_of` (U4) withholds the unit's date from a datum with it
+
+_HISTORY_HEADING = re.compile(
+    r"שומ(?:ה|ות)(?:\s+מקרקעין)?\s+קודמ(?:ת|ות)|(?<![א-ת])היסטוריה(?![א-ת])|(?:רכישות|עסקאות)\s+קודמות")
+_HISTORY_CUE = re.compile(
+    r"(?<![א-ת])[שוכ]?נ(?:רכש|מכר)(?:ה|ו|ים)?(?![א-ת])|שומ(?:ה|ות)(?:\s+מקרקעין)?\s+קודמ(?:ת|ות)(?![א-ת])")
+_VALUED = re.compile(r"(?<![א-ת])ו?הוער(?:ך|כה|כו)(?![א-ת])")
+_PAST_CUE = re.compile(r"(?<![א-ת])(?:בעבר|קודם|קודמת|קודמות)(?![א-ת])")
+_SENTENCE_BREAK = re.compile(r"(?<=[.;!?])\s+|\n")
+
+
+def is_history(sentence: str, section_path: Iterable[str] = ()) -> bool:
+    """Whether a sentence is history (KTD12): it sits under a history or prior-appraisal heading ("שומות קודמות",
+    "שומות מקרקעין קודמות", "היסטוריה", "רכישות קודמות", "עסקאות קודמות"), or it carries "נרכש", "נמכר", "שומה קודמת" or
+    "שומות קודמות", or it carries "הוערך" together with an explicit past cue ("בעבר", "קודם", "קודמת"). A bare "הוערך"
+    outside history is not: current conclusions are written that way ("שווי הזכויות בנכס הוערך ב-X ₪ נכון למועד הקובע")."""
+    if any(_HISTORY_HEADING.search(strip_bidi_controls(h or "")) for h in section_path):
+        return True
+    s = strip_bidi_controls(sentence or "")
+    return bool(_HISTORY_CUE.search(s) or (_VALUED.search(s) and _PAST_CUE.search(s)))
+
+
+def _sentence(body: str, start: int, end: int) -> str:
+    """The sentence of ``body`` that holds the span: from the break before ``start`` to the break after ``end``."""
+    lo = 0
+    for m in _SENTENCE_BREAK.finditer(body, 0, start):
+        lo = m.end()
+    nxt = _SENTENCE_BREAK.search(body, end)
+    return body[lo:nxt.start() if nxt else len(body)]
+
+
+# --- derivation ----------------------------------------------------------------------------------------------------------
+
+def _table_dates(headers: Sequence, rows: Sequence) -> list[tuple[Parsed, str]]:
+    """A table whose header cell holds a valuation label gives the date in the same column, only for a table with ONE
+    data row (round 12 U3, KTD11); a table with more rows is a dated history, whose rows hold their own dates. Each date
+    comes with the header and cell text it was read from, for the history predicate."""
+    if len(rows) != 1:
+        return []
+    row = rows[0].get("cells") if isinstance(rows[0], dict) else rows[0]
+    out: list[tuple[Parsed, str]] = []
+    for col, head in enumerate(headers):
+        if not isinstance(head, str) or not _VALUATION.search(strip_bidi_controls(head)):
+            continue
+        if not isinstance(row, Sequence) or col >= len(row) or not isinstance(row[col], str):
+            continue
+        cell = strip_bidi_controls(row[col])
+        p, _ = _date_after(cell, 0)
+        if p is not None:
+            out.append((p, f"{strip_bidi_controls(head)} {cell}"))
+    return out
+
+
+def _without_header(body: str, headers: Sequence) -> str:
+    """A table block's text without its header line (after the title lines, if any), which `_table_dates` reads cell by
+    cell: a label in the header must not take the first cell of the next line as its date."""
+    line = " ".join(" | ".join(strip_bidi_controls(h) if isinstance(h, str) else "" for h in headers).split())
+    if not line.strip(" |"):
+        return body
+    lines = body.split("\n")
+    for k, candidate in enumerate(lines):
+        if " ".join(candidate.split()) == line:
+            return "\n".join(lines[:k] + lines[k + 1:])
+    return body
+
+
+def derive(blocks: Iterable, tables: Mapping[int, Mapping] | None = None) -> list[Found]:
+    """The labelled valuation dates of stored blocks (anything with ``block_index``, ``kind`` and ``text``, and
+    optionally ``section_path`` and ``table_index``), in block order. Pure: no database, no model. A date is taken when
+    it follows a valuation label in the block, when a direct connector joins it to the label that follows it, when the
+    label stands alone (a cell, a heading) and the next block starts with a date, or when a one-row table's header
+    cell holds the label (``tables``: `extracted_tables.structure` by table index). A date the history predicate
+    marks (`is_history`: its sentence or its section) is never taken, of any of these readings (round 12 U3, KTD11)."""
+    rows: list[tuple[int, str, tuple, list[tuple[Parsed, str]]]] = []
+    for b in blocks:
+        if getattr(b, "kind", "paragraph") in _TEXT_KINDS_SKIPPED:
+            continue
+        body = strip_bidi_controls(b.text or "")
+        path = tuple(getattr(b, "section_path", None) or ())
+        table_dates: list[tuple[Parsed, str]] = []
+        structure = (tables or {}).get(getattr(b, "table_index", None))
+        headers = (structure or {}).get("headers") or []
+        if structure and any(headers):
+            table_dates = _table_dates(headers, structure.get("rows") or [])
+            body = _without_header(body, headers)
+        rows.append((int(b.block_index), body, path, table_dates))
     out: list[Found] = []
     seen: set[tuple[int, str, str]] = set()
 
@@ -185,20 +326,32 @@ def derive(blocks: Iterable) -> list[Found]:
             seen.add((block, p.iso, p.precision))
             out.append(Found(block, p.iso, p.precision, p.written))
 
-    for i, (index, body) in enumerate(rows):
+    for i, (index, body, path, table_dates) in enumerate(rows):
+        for p, sentence in table_dates:
+            if not is_history(sentence, path):
+                take(index, p)
         labels = list(_VALUATION.finditer(body))
         if not labels:
             continue
         report = {p.span for p in report_dates(body)}
         for m in labels:
             p, only_gap = _date_after(body, m.end())
-            if p is not None and p.span not in report:
-                take(index, p)
-            elif only_gap and i + 1 < len(rows):
-                nxt_index, nxt = rows[i + 1]
-                q, _ = _date_after(nxt, 0)
-                if q is not None and not any(m2.start() < q.span[0] for m2 in _REPORT.finditer(nxt)):
-                    take(nxt_index, q)
+            if p is not None:
+                if p.span not in report and not is_history(_sentence(body, m.start(), p.span[1]), path):
+                    take(index, p)
+                continue
+            q = _date_before(body, m.start())
+            if q is not None:
+                if q.span not in report and not is_history(_sentence(body, q.span[0], m.end()), path):
+                    take(index, q)
+                continue
+            if only_gap and i + 1 < len(rows):
+                nxt_index, nxt, nxt_path, _ = rows[i + 1]
+                r, _ = _date_after(nxt, 0)
+                if r is not None and not any(m2.start() < r.span[0] for m2 in _REPORT.finditer(nxt)):
+                    sentence = f"{_sentence(body, m.start(), m.end())} {_sentence(nxt, r.span[0], r.span[1])}"
+                    if not is_history(sentence, path + nxt_path):
+                        take(nxt_index, r)
     return out
 
 
@@ -248,8 +401,11 @@ _VISIBLE_SQL = ("SELECT v.id AS version_id, v.document_id FROM document_versions
                 f" ON d.id = v.document_id WHERE v.id = ANY(:v) AND {APPRAISALS_SQL}")
 _ROWS_SQL = ("SELECT version_id, block_index, iso, precision, written FROM version_dates"
              " WHERE version_id = ANY(:v) AND dates_version = :dv ORDER BY version_id, block_index, iso")
-_BLOCKS_SQL = ("SELECT block_index, kind, text FROM document_blocks WHERE version_id = :v AND kind <> 'image'"
-               " ORDER BY block_index")
+# the blocks with their section path (the history predicate) and, for a table block, the table's stored structure
+# (a header label gives the date of its column: `derive`'s ``tables``)
+_BLOCKS_SQL = ("SELECT b.block_index, b.kind, b.text, b.section_path, b.table_index, t.structure FROM document_blocks b"
+               " LEFT JOIN extracted_tables t ON t.version_id = b.version_id AND t.table_index = b.table_index"
+               " WHERE b.version_id = :v AND b.kind <> 'image' ORDER BY b.block_index")
 _INSERT = ("INSERT INTO version_dates (office_id, document_id, version_id, dates_version, block_index, iso, precision,"
            " written, status) VALUES (app_office(), :d, :v, :dv, :b, :i, :p, :w, :s)")
 
@@ -287,8 +443,9 @@ def _derive_and_store(conn: Connection, version_id: UUID, document_id: UUID, cac
     first, and across processes the advisory lock makes the second writer find the first's rows. A transaction that
     cannot write still gets its dates."""
     blocks = conn.execute(text(_BLOCKS_SQL), {"v": version_id}).all()
+    tables = {b.table_index: b.structure for b in blocks if b.table_index is not None and b.structure}
     units = _units_of(conn, version_id, cache)
-    assigned = tuple(assign(derive(blocks), units))
+    assigned = tuple(assign(derive(blocks, tables), units))
     lock = flight("dates", str(version_id), DATES_VERSION)
     try:
         with lock:
