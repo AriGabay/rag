@@ -106,9 +106,10 @@ def _delete_outputs(conn: Connection, version_id: UUID) -> None:
         text("DELETE FROM fact_values WHERE occurrence_id IN (SELECT id FROM occurrences WHERE version_id = :v)"),
         {"v": version_id},
     )
-    # version_dates: a derived cache of the stored text, rebuilt lazily on the next read (round 11 review #1)
-    for table in ("occurrences", "document_units", "version_dates", "chunks", "extracted_tables", "pages",
-                  "document_blocks"):
+    # version_dates and version_identities: derived caches of the stored text, rebuilt lazily on the next read (round 11
+    # review #1; round 12 U5, KTD15)
+    for table in ("occurrences", "document_units", "version_dates", "version_identities", "chunks",
+                  "extracted_tables", "pages", "document_blocks"):
         conn.execute(text(f"DELETE FROM {table} WHERE version_id = :v"), {"v": version_id})
 
 
@@ -561,8 +562,8 @@ def queue_measurements(ctx: TenantContext, info: VersionInfo) -> bool:
 
 # --- reindexing and measurements ----------------------------------------------------------------------------
 
-_DERIVED_TEXT_TABLES = ("document_units", "document_sections", "version_dates", "standard_profiles", "chunks",
-                        "extracted_tables", "pages", "document_blocks")
+_DERIVED_TEXT_TABLES = ("document_units", "document_sections", "version_dates", "version_identities",
+                        "standard_profiles", "chunks", "extracted_tables", "pages", "document_blocks")
 EMBED_BATCH = 64
 MISSING_SHOWN = 20  # missing numbers recorded per page
 MSG_REGRESSION = ("הקריאה החדשה איבדה מידע ביחס לקריאה הקיימת ({summary}), ולכן נשמרה הקריאה הקיימת והמסמך זמין"

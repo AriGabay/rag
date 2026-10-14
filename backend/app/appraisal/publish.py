@@ -204,9 +204,10 @@ def publish_version(conn: Connection, version_id: UUID, document_id: UUID, extra
         {"v": version_id},
     )
     if appraisal:
-        from app.chat import units  # imported here: the chat package imports the appraisal package
+        from app.chat import identity, units  # imported here: the chat package imports the appraisal package
 
         units.replace(conn, version_id)  # a ready version always has units (round 9 U7, KTD4)
+        identity.derive_at_publish(conn, version_id, document_id)  # and its identification facts (round 12 U5, KTD15)
     status = refresh_version_status(conn, version_id)
     bump_data_version(conn)
     return status
@@ -220,7 +221,7 @@ def run_skipped_stages(conn: Connection, document_id: UUID, extraction_version: 
     keeps them, and units of the current reading stay (``units.ensure`` replaces only those of an older reading). The
     caller has already stored the new kind, which the unit builder checks. Returns the versions that now want
     measurement extraction, which the caller queues when the office allows the model."""
-    from app.chat import units  # imported here: the chat package imports the appraisal package
+    from app.chat import identity, units  # imported here: the chat package imports the appraisal package
 
     lock_office(conn)
     versions = conn.execute(
@@ -231,5 +232,6 @@ def run_skipped_stages(conn: Connection, document_id: UUID, extraction_version: 
                             {"v": version_id}).first():
             derive_records(conn, version_id, document_id, extraction_version)
         units.ensure(conn, version_id)
+        identity.derive_at_publish(conn, version_id, document_id)   # the identification facts (round 12 U5, KTD15)
         refresh_version_status(conn, version_id)
     return list(versions)
