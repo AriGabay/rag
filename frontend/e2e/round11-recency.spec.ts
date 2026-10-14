@@ -197,7 +197,7 @@ test.describe("the switch", () => {
     const id = await newConversation(page);
     await page.route(`**/api/chat/conversations/${id}`, (route) =>
       route.request().method() === "PATCH"
-        ? route.fulfill({ status: 500, json: { detail: "שמירת ההעדפה נכשלה (בדיקה סינתטית)" } })
+        ? route.fulfill({ status: 409, json: { detail: "שמירת ההעדפה נכשלה (בדיקה סינתטית)" } })
         : route.fallback());
     await page.goto(`/chat?c=${id}`);
     await expect(theSwitch(page)).toHaveAttribute("aria-checked", "true");
