@@ -1277,3 +1277,79 @@ def test_a_period_claim_on_a_registered_value_is_blocking_only_when_the_model_al
     problems = verify.deterministic(split_units("שכר הדירה הוא 5,000 ₪ לחודש [V1]."), ws, "?")
     assert [(p.check, p.failure_kind) for p in problems if p.check == "meaning"] == (
         [("meaning", "wrong_unit")] if blocking else [])
+
+
+def test_a_model_written_period_costs_the_claim_its_qualifier_and_not_its_number():
+    """Round 12 U10 (R7, AE5): the blocking meaning problem above stays the trigger; the sources back 5,000 ₪, so the
+    ladder removes the unsupported "לחודש" instead of the claim."""
+    ws = _registered("5,000", _RENT_QUOTE, period="month", provenance={"period": "model_asserted"})
+    a = _answer("שכר הדירה הוא 5,000 ₪ לחודש [V1].")
+    r = verify_answer(_judge(lambda t: "supported"), a, ws, "?", [])
+    assert r.removed_units() == set() and r.counts()["edited"] == 1
+    assert r.edit(a).doc.text.startswith("שכר הדירה הוא 5,000 ₪ [V1].")
+
+
+# --- a model-asserted VAT backs nothing, in a calculation or in a measurement (round 12 U10 follow-ups, R6, R8) ------
+
+@pytest.mark.parametrize("provenance,expected", [({"vat": "model_asserted"}, "unknown"), ({"vat": "not_stated"}, "unknown"),
+                                                 ({"vat": "source"}, "included")])
+def test_the_operand_of_a_value_carries_its_vat_only_when_the_source_gave_it(provenance, expected):
+    v = _registered("2,450,000", _VALUE_QUOTE, vat="included", provenance=provenance).values["V1"]
+    assert v.operand().vat == expected
+
+
+def _two_values(provenance: str):
+    from tests.unit.test_verify_computed import _compute, _value
+
+    ws = Workspace(ctx=None)
+    _value(ws, "12,450,000", "סה״כ הכנסות", "income", "income")
+    _value(ws, "10,400,000", "סה״כ עלויות", "cost", "cost")
+    for v in ws.values.values():
+        v.provenance["vat"] = provenance
+    return ws, _compute(ws, "V1 - V2", "הרווח", "בדיקה")
+
+
+def test_a_calculation_over_values_with_a_model_asserted_vat_has_no_vat_basis():
+    ws, c = _two_values("model_asserted")
+    assert c.vat is None
+    assert verify._computation_vat(split_units("הרווח 2,050,000 ₪ ללא מע\"מ [C1].")[0], ws, c) == set()
+    (problem,) = [p for p in verify.deterministic(split_units("הרווח הוא 2,050,000 ₪ ללא מע\"מ [C1]."), ws, "?")
+                  if p.check == "vat"]
+    assert problem.failure_kind == "wrong_unit"
+
+
+def test_a_calculation_over_values_with_a_source_vat_keeps_it():
+    ws, c = _two_values("source")
+    assert c.vat == "excluded"
+    assert [p for p in verify.deterministic(split_units("הרווח הוא 2,050,000 ₪ ללא מע\"מ [C1].")
+                                            , ws, "?") if p.check == "vat"] == []
+
+
+def test_the_vat_of_an_input_value_is_read_only_when_the_source_gave_it():
+    ws, c = _two_values("source")
+    unit = split_units("ההכנסות היו 12,450,000 ₪ ללא מע\"מ [C1].")[0]
+    assert ("12450000", "excluded") in verify._computation_vat(unit, ws, c)
+    ws.values["V1"].provenance["vat"] = "model_asserted"
+    assert ("12450000", "excluded") not in verify._computation_vat(unit, ws, c)
+
+
+def _measured(ws: Workspace, quote: str, vat: str = "excluded", **extra):
+    from types import SimpleNamespace
+
+    from app.chat.tools import Measurement
+
+    row = SimpleNamespace(value_text="58 ₪", quote=quote, vat=vat, metric="דמ\"ש", metric_kind="rent_per_area",
+                          unit="ILS_per_sqm", period="month", area_basis=None, subject=None,
+                          value_role="appraiser_determination", status="auto_validated", section=None,
+                          block_index=1, table_index=None, **extra)
+    ws.measurements["M1"] = Measurement("M1", uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), "דוח", row)
+
+
+def test_a_measurements_stored_vat_backs_a_claim_only_when_its_own_words_state_it():
+    ws = _ws(PAIR)
+    _measured(ws, "דמי השכירות למ\"ר נקבעו ל-58 ₪ לחודש.")  # the stored VAT is the model's: no words state it
+    (problem,) = verify.deterministic(split_units("דמי השכירות הם 58 ₪ ללא מע\"מ [M1]."), ws, "?")
+    assert problem.check == "vat"
+    ws = _ws(PAIR)
+    _measured(ws, "דמי השכירות למ\"ר נקבעו ל-58 ₪ לחודש.", caption="דמי שכירות, ללא מע\"מ", header="")
+    assert verify.deterministic(split_units("דמי השכירות הם 58 ₪ ללא מע\"מ [M1]."), ws, "?") == []

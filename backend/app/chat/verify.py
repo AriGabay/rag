@@ -51,6 +51,15 @@ sentences only: a numbered heading ("9. השומה", "9.1 שיטת השומה") 
 text, a bullet or heading whose content went goes with it, and a failed table header takes its whole table, so no
 fragment or broken table is left; a partly supported unit is kept and marked.
 
+A number the sources back is not lost for a qualifier they do not state (round 12 U10, KTD10, R7). When a unit's only removing
+problems are a blocking meaning problem (an area basis or period) and/or an unsupported VAT status, and the cited evidence is
+silent on that attribute — it states no basis, period or VAT for the number — the problem is still repairable, and after the
+repair rounds ``VerifyReport.edit`` takes the qualifier's own words out of the number's sentence (``plan_qualifier_edits``,
+located through ``meaning.attached``), or, when the question itself asked about that attribute, writes that the source does not
+state it (``QUALIFIER_UNSTATED``). The removal note records each edit (``MSG_QUALIFIER_EDITED``) and ``counts`` reports it as
+``edited``, never as a removal; the final check judges the edited sentence as saved, and an unsupported verdict removes it. A
+source that states a different value, and a unit with a number-level problem, keep the removal path.
+
 Every removal is a structured decision, made where its check fires (round 7 U4: KTD5, KTD10; R12–R15): the
 ``Problem`` carries its failure kind (``FAILURE_KINDS``), the check (``unknown_id`` — invalid citation;
 ``unstated_number`` — absent from the source; ``computation_mismatch`` and ``framed_result`` — wrong calculation;
@@ -477,6 +486,12 @@ REPAIR_HINTS = {
     "contradicts_source": "תקן לפי המקור או השמט",
     "invalid_citation": "צטט רק מזהים שהוחזרו בתור הזה",
 }
+# the qualifier edit (round 12 U10, KTD10, R7): the attribute each edit names in the removal note, and what is written in
+# place of a qualifier the source does not state when the question itself asked about that attribute
+QUALIFIER_LABELS = {"period": "התקופה", "basis": "בסיס השטח", "vat": "המע\"מ"}
+QUALIFIER_UNSTATED = {"period": " (התקופה לא צוינה במקור)", "basis": " (בסיס השטח לא צוין במקור)",
+                      "vat": " (המע\"מ לא צוין במקור)"}
+MSG_QUALIFIER_EDITED = "> הוסר ניסוח של {label} שלא נכתב במקור לגבי {n} נתונים; הנתונים עצמם נשארו בתשובה."
 # the server's fixed sentence for each removal on the user's normal path (KTD5): never the claim or a judge's words
 REMOVAL_SENTENCES = {
     "absent_from_source": "הוסרה טענה שהמקורות שנבדקו אינם מציינים.",
@@ -1133,7 +1148,9 @@ class Problem:
     cause: str = ""
     basis: str = ""  # for a dependency: the id of the claim whose removal took this one's basis away
     # the step of the edit ladder that resolves it without a rewrite (``plan_edits``): "cut" — the failing claim's span
-    # is replaced by a marker; "" — not resolved by the server
+    # is replaced by a marker; "qualifier" — the unsupported qualifier of a number the sources back is edited out
+    # (``plan_qualifier_edits``, round 12 U10; the problem stays repairable, the edit is the step after the repair
+    # rounds); "" — not resolved by the server
     resolution: str = ""
     # for ``unstated_number``: every number of the unit that no cited source states (the reason names five at most)
     unstated: list[str] = field(default_factory=list)
@@ -1163,8 +1180,9 @@ class Problem:
 
     @property
     def removes_unit(self) -> bool:
-        """The unit is removed for it (a qualifier the server can write in, or a request mismatch, is not)."""
-        return (self.severity == "error" and not self.annotatable
+        """The unit is removed for it (a qualifier the server can write in, a qualifier it edits out
+        (``resolution == "qualifier"``), or a request mismatch, is not)."""
+        return (self.severity == "error" and not self.annotatable and self.resolution != "qualifier"
                 and self.kind not in ("request", "needs_citation", "requirement", "instruction"))
 
     @property
@@ -1204,6 +1222,21 @@ class Problem:
         return " (" + "; ".join(parts) + ")"
 
 
+@dataclass(frozen=True)
+class QualifierEdit:
+    """One qualifier edit of a unit (round 12 U10, KTD10): the range ``start:end`` of the answer's Markdown — the
+    qualifier's own words and the space or comma beside it — replaced by ``marker`` (the server's "not stated in the
+    source", when the question asked about that attribute) or by nothing. ``kind``: ``period``, ``basis`` or ``vat``;
+    ``written``: the words that go."""
+
+    unit: int
+    kind: str
+    start: int
+    end: int
+    written: str
+    marker: str = ""
+
+
 @dataclass
 class VerifyReport:
     units: list[Unit]
@@ -1240,6 +1273,10 @@ class VerifyReport:
     unit_verdicts: dict[int, JudgeVerdict] = field(default_factory=dict)
     # the units that hold a clarification's question line (R29): never removed, whatever a check says of them
     protected: set[int] = field(default_factory=set)
+    # the qualifier edits, by unit index (round 12 U10, KTD10, R7): a number the sources back whose only fault is a period,
+    # an area basis or a VAT status its source does not state keeps the number; ``plan_qualifier_edits`` decides, ``edit``
+    # applies them after the repair rounds, and the final check judges the edited sentence again
+    qualifier_edits: dict[int, list[QualifierEdit]] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -1269,6 +1306,7 @@ class VerifyReport:
         for u in self.units:
             if u.index in self.protected:
                 self.claims[u.index] = [_whole_record(u, "not_factual")]
+                self.qualifier_edits.pop(u.index, None)
 
     def removals(self) -> list[Problem]:
         """One decision per unit removed as a claim (round 7 KTD5, R12), in the answer's order: the first problem that
@@ -1399,7 +1437,8 @@ class VerifyReport:
         errors = self.failed_units()
         if self.units and all(u.index in errors for u in self.units):
             return "unverified"
-        if errors or any(p.severity == "partial" for p in self.problems) or self.conditional_units():
+        if errors or any(p.severity == "partial" for p in self.problems) or self.conditional_units() \
+                or self.edits():
             return "partial"
         return "verified"
 
@@ -1445,6 +1484,8 @@ class VerifyReport:
                "annotated": sum(1 for p in self.problems if p.annotatable and not p.conditional
                                 and p.unit.index not in errors),
                "conditional": len(self.conditional_units()),
+               # a qualifier the sources do not state, edited out of a number they back (round 12 U10): an edit, not a removal
+               "edited": len(self.edits()),
                "request_mismatch": any(p.kind == "request" for p in self.problems),
                "correctness": self.correctness(),
                # each claim taken out of the text — a unit removed or withheld, a span cut — with its kind, component and
@@ -1661,6 +1702,12 @@ class VerifyReport:
                 out.append(u.index)
         return out
 
+    def edits(self) -> list[QualifierEdit]:
+        """The qualifier edits that apply: those of the units that stay (a unit the final check removed after the edit is
+        a removal)."""
+        gone = self.removed_units()
+        return [q for i, qs in sorted(self.qualifier_edits.items()) if i not in gone for q in qs]
+
     def supersede(self, outcomes: list[dict]) -> bool:
         """Remove the units that state the absence of a component the server states (``stated``, R9, KTD4): a unit
         the judge marked as saying that component is missing (``absence_units``) and — the backstop, when the judge
@@ -1710,10 +1757,11 @@ class VerifyReport:
         notes = [p for p in self.problems if p.annotatable and p.unit.index not in errors]
         requests = [p.reason for p in self.problems if p.kind == "request"]
         cites = [p for p in self.problems if p.kind == "needs_citation" and p.uncited and p.unit.index not in errors]
+        qualifiers = self.edits()
         markdown = answer.answer_markdown
         cuts = _sentence_cuts(markdown, self.units, errors)
         totals = _total_qualifiers(markdown, self.units, errors, set(planned), cuts)
-        if not (errors or partial or notes or requests or cites or planned or totals):
+        if not (errors or partial or notes or requests or cites or planned or totals or qualifiers):
             return Edited(Doc(markdown), answer.status, answer.claims)
         spans = [(g.start, g.end) for groups in planned.values() for g in groups]
         blocked = cuts + spans  # a qualifier or a citation never lands inside a removed or replaced span
@@ -1723,6 +1771,10 @@ class VerifyReport:
         edits += [(g.start, g.end, MARKER.format(n=0), "marker", g.claims) for groups in planned.values()
                   for g in groups if not any(a <= g.start < b for a, b in cuts)]
         edits += totals
+        # a qualifier of a number the sources back that they do not state goes (or is written as not stated): the number
+        # stays (round 12 U10, KTD10)
+        edits += [(q.start, q.end, q.marker, "qualifier" if q.marker else None, ()) for q in qualifiers
+                  if not any(a <= q.start < b for a, b in cuts)]
         # a qualifier still missing after the repair rounds is written next to its number, marked as the source's;
         # a result of a conditional calculation gets the server's own qualifier, after its number (or, when the
         # unit shows no number of it, where a citation would join the unit)
@@ -1762,10 +1814,13 @@ class VerifyReport:
         status = answer.status
         if any(s.kind == "marker" for s in doc.spans()) and status == "answered":
             status = "partial"  # part of the answer was left out
+        edited = [MSG_QUALIFIER_EDITED.format(label=QUALIFIER_LABELS[kind], n=n)
+                  for kind in QUALIFIER_LABELS if (n := sum(1 for q in qualifiers if q.kind == kind))]
         if removed:
             lines = ([f"> הוסרו מהתשובה {removed - unchecked} טענות שלא נמצאה להן תמיכה במקורות."]
                      if removed > unchecked else [])
             lines += [f"> הוסרו מהתשובה {unchecked} טענות שלא ניתן היה לבדוק מול המקורות."] if unchecked else []
+            lines += edited
             if answer.status == "clarification" and doc.text.strip():
                 # the question stays and so does the status (R29): only the note says what went from around it
                 doc.append("\n\n" + "\n>\n".join(lines), "removal_note")
@@ -1778,6 +1833,9 @@ class VerifyReport:
                 doc.append("\n\n" + "\n>\n".join(lines), "removal_note")
                 if status == "answered":
                     status = "partial"
+        elif edited and doc.text.strip():
+            # each qualifier edited out is recorded (KTD10), as an edit: the numbers stay and nothing is counted removed
+            doc.append("\n\n" + "\n>\n".join(edited), "removal_note")
         if requests and doc.text:
             # the answer is about another datum than the one requested: said plainly, never passed off as it
             doc.append("\n\n> **שימו לב:** " + requests[0] + ".", "request_note")
@@ -2597,16 +2655,17 @@ def _computation_vat(unit: Unit, ws: Workspace, c) -> set[tuple[str, str]]:
                 out |= {(f, c.vat) for f in numbers_in(n.written)}
     for x in c.inputs:
         v = ws.values.get(x["id"])
-        if v is not None and v.vat in ("included", "excluded"):
+        # a value's VAT backs a claim only when its source gave it, as in ``_vat_problems`` (round 12 U10, R6, R8)
+        if v is not None and v.vat in ("included", "excluded") and v.provenance.get("vat") == "source":
             out |= {(f, v.vat) for f in numbers_in(v.written)}
     return out
 
 
-def _vat_problems(unit: Unit, ws: Workspace) -> list[str]:
-    """VAT the unit gives a number that its cited sources do not give that number."""
-    claimed, _ = vat_attachments(unit.text, skip_absence=True)
-    if not claimed:
-        return []
+def _vat_backing(unit: Unit, ws: Workspace) -> set[tuple[str, str]]:
+    """The (number, VAT status) pairs the unit's cited sources give: a calculation's (``_computation_vat``), a measurement's
+    only when its own words state its VAT (``meaning.measurement_states``: a stored status no quote, caption or header
+    states is the model's, round 12 U10, R6), a registered value's only when its source gave it, and what the cited
+    passages and quotes write for each number."""
     backed: set[tuple[str, str]] = set()
     for i in unit.ids:
         if i in ws.computations:
@@ -2614,7 +2673,7 @@ def _vat_problems(unit: Unit, ws: Workspace) -> list[str]:
             continue
         if i in ws.measurements:
             r = ws.measurements[i].row
-            if r.vat in ("included", "excluded"):
+            if r.vat in ("included", "excluded") and meaning.measurement_states(r, "vat"):
                 backed |= {(f, r.vat) for f in numbers_in(r.value_text)}
             continue
         if i in ws.values:
@@ -2632,7 +2691,21 @@ def _vat_problems(unit: Unit, ws: Workspace) -> list[str]:
         backed |= pairs
         if general:
             backed |= {(f, g) for g in general for f in numbers_in(parts[1])}
-    wrong = sorted({n for n, pol in claimed if (n, pol) not in backed and not n.isalpha()})
+    return backed
+
+
+def _wrong_vat(unit: Unit, ws: Workspace) -> list[tuple[str, str]]:
+    """The (number, VAT status) pairs the unit gives that its cited sources do not give that number."""
+    claimed, _ = vat_attachments(unit.text, skip_absence=True)
+    if not claimed:
+        return []
+    backed = _vat_backing(unit, ws)
+    return sorted((n, pol) for n, pol in claimed if (n, pol) not in backed and not n.isalpha())
+
+
+def _vat_problems(unit: Unit, ws: Workspace) -> list[str]:
+    """VAT the unit gives a number that its cited sources do not give that number."""
+    wrong = sorted({n for n, _ in _wrong_vat(unit, ws)})
     shown = [m.group(0) for m in _NUM_AT.finditer(unit.text) if numbers_in(m.group(0)) & set(wrong)]
     return [f"מע\"מ שהתשובה מייחסת ל-{x} לא נכתב לגבי ערך זה במקור" for x in dict.fromkeys(shown)][:1]
 
@@ -2843,6 +2916,181 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
         if len(problems) == before and (late := _recency_claim(u, ws)) is not None:
             problems.append(late)
     return problems
+
+
+# --- a qualifier the source does not state (round 12 U10, KTD10, R7) ----------------------------------------------------
+
+def _asked_about(kind: str, question: str) -> bool:
+    """Whether the question itself asked about the attribute: a period word, an area basis or a VAT phrase in it."""
+    if kind == "vat":
+        return bool(_VAT.search(meaning._norm(question or "")))
+    return bool(meaning._all(question or "", rates=False).keys(kind))
+
+
+def _vat_spans(text: str, skip_absence: bool = True):
+    """Each VAT phrase of ``text`` with the numbers it belongs to and its polarity, as ``vat_attachments`` reads them (the
+    phrase belongs to the nearest number before it in its sentence): (forms, polarity, start, end) in ``text``."""
+    start = 0
+    for end_m in [*_CLAUSE_END.finditer(text), None]:
+        end = end_m.end() if end_m else len(text)
+        clause = text[start:end]
+        nums = [(n.start(), numbers_in(n.group(0))) for n in _NUM_AT.finditer(clause) if _vat_bearing(clause, n)]
+        for v in [] if skip_absence and meaning.ABSENCE_SENTENCE.search(clause) else _VAT.finditer(clause):
+            polarity = _vat_polarity(v)
+            before = [forms for pos, forms in nums if pos < v.start()]
+            if polarity and before:
+                yield before[-1], polarity, start + v.start(), start + v.end()
+        start = end
+
+
+def _qualifier_span(text: str, pos: int, number: str, kind: str, written: str) -> tuple[int, int] | None:
+    """Where the qualifier ``written`` that ``meaning.attached`` attached to the number at ``pos`` stands: its words in
+    the number's clause that belong to that number (``meaning._owner``), the nearest to it; an area basis without the
+    unit or the word for area it was read with ("מ״ר ברוטו" -> "ברוטו": the unit stays). None when no such words are found."""
+    start = 0
+    for end_m in [*meaning._CLAUSE_END.finditer(text), None]:
+        end = end_m.end() if end_m else len(text)
+        if start <= pos < end:
+            break
+        start = end
+    clause = text[start:end]
+    core = re.sub(r"^(?:מ\"ר|שטח)\s*", "", written) if kind == "basis" else written
+    nums = meaning._numbers(clause)
+    amounts = [i for i, (_, b, _) in enumerate(nums) if meaning._AMOUNT_AFTER.match(clause, b)]
+    mine = next((i for i, (a, _, _) in enumerate(nums) if start + a == pos), None)
+    if mine is None or not core:
+        return None
+    owned = [m for m in re.finditer(r"(?<![א-ת])" + re.escape(core) + r"(?![א-ת])", clause)
+             if meaning._owner(nums, amounts, m.start(), clause) == mine]
+    if not owned:
+        return None
+    here = pos - start
+
+    def distance(m: re.Match) -> int:
+        return 0 if here <= m.start() < here + len(number) else min(abs(m.start() - here - len(number)),
+                                                                     abs(here - m.end()))
+
+    best = min(owned, key=distance)
+    return start + best.start(), start + best.end()
+
+
+def _silent_qualifier_spans(u: Unit, ws: Workspace, text: str, entries: list, problem: meaning.MeaningProblem,
+                            absent: list[tuple[int, int]]) -> list[tuple[int, int, str, str]] | None:
+    """The spans (start, end, kind, written) of the qualifiers a blocking meaning problem names, when the cited evidence is
+    SILENT on that attribute for the number: it attaches no basis (or period) at all, so the qualifier is the model's. None
+    when the source states a different one (the existing correction or removal path), or a span is not found."""
+    out: list[tuple[int, int, str, str]] = []
+    kind = problem.kind
+    for forms, pos, claimed in entries:
+        written = _NUM_AT.match(text, pos).group(0)
+        if (written != problem.number or not forms or not_an_amount(text, pos, pos + len(written))
+                or any(a <= pos < b for a, b in absent)):
+            continue
+        occurrences, general = meaning._evidence(u, ws, frozenset(forms))
+        if not occurrences:
+            continue
+        attested = meaning.Qualifiers().merge(general)
+        for o in occurrences:
+            attested.merge(o.qualifiers).merge(meaning._all(o.context, rates=False))
+        extra = sorted(claimed.keys(kind) - attested.keys(kind))
+        if not extra:
+            continue
+        if attested.keys(kind):
+            return None  # the source states another value: not silent
+        for key in extra:
+            span = _qualifier_span(text, pos, written, kind, claimed.found[kind][key])
+            if span is None:
+                return None
+            out.append((*span, kind, claimed.found[kind][key]))
+    return out or None
+
+
+def _silent_vat_spans(u: Unit, ws: Workspace, text: str) -> list[tuple[int, int, str, str]] | None:
+    """The spans of the VAT phrases the cited sources do not back, when they state no VAT status at all for that number
+    (a source that states the other one keeps the removal path); None otherwise."""
+    wrong = _wrong_vat(u, ws)
+    backed = _vat_backing(u, ws)
+    if not wrong or any((n, other) in backed for n, pol in wrong for other in ("included", "excluded") if other != pol):
+        return None
+    out = [(a, b, "vat", text[a:b]) for forms, polarity, a, b in _vat_spans(text)
+           if any((f, polarity) in set(wrong) for f in forms)]
+    return out or None
+
+
+def _qualifier_edits(u: Unit, ws: Workspace, question: str, blocking: list, vat: bool) -> list[QualifierEdit] | None:
+    """The edits that remove from the unit every qualifier its blocking problems name (``blocking`` meaning problems; ``vat``:
+    the VAT check failed too) — or None when any of them is not an edit: the source states something else there, the
+    words cannot be placed exactly, or they touch a citation or a table cell's edge. Each edit takes its qualifier's own
+    words and the space (for a VAT phrase, the comma) beside them; the question that asked about the attribute gets
+    ``QUALIFIER_UNSTATED`` in the first one's place."""
+    text = meaning._norm(u.text)
+    to_raw = _text_to_raw(u)
+    if to_raw is None:
+        return None
+    found: list[tuple[int, int, str, str]] = []
+    if blocking:
+        entries, _ = meaning.attached(text)
+        absent = meaning.absence_spans(text)
+        for problem in blocking:
+            spans = _silent_qualifier_spans(u, ws, text, entries, problem, absent)
+            if spans is None:
+                return None
+            found += spans
+    if vat:
+        spans = _silent_vat_spans(u, ws, text)
+        if spans is None:
+            return None
+        found += spans
+    out: list[QualifierEdit] = []
+    marked: set[str] = set()
+    last = -1
+    for a, b, kind, written in sorted(set(found)):
+        lead = a
+        while a > 0 and text[a - 1] in " \t":
+            a -= 1
+        if kind == "vat" and a > 0 and text[a - 1] == ",":
+            a -= 1
+        elif a == lead:  # no space before it to take with it: the space after it goes
+            while b < len(text) and text[b] in " \t":
+                b += 1
+        if a < last or b > len(to_raw):
+            return None
+        raw_a, raw_b = to_raw[a], to_raw[b - 1] + 1
+        if _IDS.search(u.raw[raw_a:raw_b]) or any(c in u.raw[raw_a:raw_b] for c in "|\n"):
+            return None
+        marker = ""
+        if kind not in marked and _asked_about(kind, question):
+            marker = QUALIFIER_UNSTATED[kind]
+            marked.add(kind)
+        out.append(QualifierEdit(u.index, kind, u.start + raw_a, u.start + raw_b, written.strip(), marker))
+        last = b
+    return out or None
+
+
+def plan_qualifier_edits(report: VerifyReport, ws: Workspace, question: str,
+                         meanings: dict[int, list[meaning.MeaningProblem]]) -> None:
+    """The qualifier edit (round 12 U10, KTD10, R7), planned once the deterministic checks are settled: a unit whose only
+    removing problems are a blocking meaning problem (an area basis or period) and/or an unsupported VAT status — so its
+    numbers passed their number check — and whose cited sources are SILENT on each of those attributes is not removed. Its
+    problems take ``resolution == "qualifier"`` (still repairable: the repair rounds come first, the edit is the step after
+    them, ``VerifyReport.edit``); ``report.qualifier_edits`` holds the words that go. A source that states a different
+    value, a unit with any other failing check (a number-level problem included), or words that cannot be placed exactly
+    keep the removal path."""
+    report.qualifier_edits = {}
+    for u in report.units:
+        removing = [p for p in report.problems if p.unit.index == u.index and p.removes_unit]
+        if (not removing or u.index in report.protected or not u.ids
+                or any(p.kind != "claim" or p.check not in ("meaning", "vat") for p in removing)):
+            continue
+        mine = meanings.get(u.index, [])
+        if any(m.needs_citation for m in mine):  # evidence found elsewhere in the same calculation: its own path
+            continue
+        edits = _qualifier_edits(u, ws, question, [m for m in mine if m.blocking],
+                                 any(p.check == "vat" for p in removing))
+        if edits:
+            report.qualifier_edits[u.index] = edits
+            for p in removing:
+                p.resolution = "qualifier"
 
 
 # --- a claim that a value is the latest (round 11 U9, R13, KTD8) ---------------------------------------------------------
@@ -4062,6 +4310,8 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     report.problems = deterministic(units, ws, question, meanings)
     found_in = _expand_unstated(report, units, meanings, ws, question, deadline, reread, fetcher) \
         if reread is not None else {}
+    # a number the sources back whose only fault is a qualifier they do not state is edited, not removed (round 12 U10)
+    plan_qualifier_edits(report, ws, question, meanings)
     # a unit failed only for numbers no cited source states, that holds more than those numbers, is not removed up front:
     # the judge splits it into claims and the claim holding such a number fails (``_fail_unstated``)
     soft = {p.unit.index: p for p in report.problems if p.check == "unstated_number" and p.unstated
@@ -4099,7 +4349,9 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     # derived and scored (a coverage-only call). A unit they removed is shown as removed (KTD5, KTD10): the judge
     # names the component it gave and the conclusions resting on it
     to_judge = [u for u in units if u.index not in failed]
-    removed_shown = [u for u in units if u.index in {p.unit.index for p in report.problems if p.removes_unit}]
+    # (a unit whose qualifier the server edits out is shown too, so the judge names the component it gives: the unit stays)
+    removed_shown = [u for u in units if u.index in {p.unit.index for p in report.problems
+                                                     if p.removes_unit or p.resolution == "qualifier"}]
     unchecked: dict[int, str] = {}
     verdicts: dict[int, JudgeVerdict] = {}
     votes: list[JudgeRequirement] = []
@@ -4320,7 +4572,7 @@ def plan_edits(report: VerifyReport) -> None:
                 continue
             elif r.parent_id:
                 r.action = "rewritten"
-            elif any(p.annotatable for p in mine) or (r.verdict == "partial" and any(
+            elif any(p.annotatable or p.resolution == "qualifier" for p in mine) or (r.verdict == "partial" and any(
                     p.severity == "partial" and p.resolution != "cut" for p in mine)):
                 r.action = "qualified"
             elif any(p.kind == "needs_citation" and p.uncited for p in mine):
@@ -4584,7 +4836,13 @@ def _whole_record(u: Unit, verdict: str, failure: str = "none", cause: str = "")
 def complete_records(report: VerifyReport) -> None:
     """Before the cascade: a record for every unit a problem removed without the judge's claims (a deterministic check,
     a missing verdict, a unit the judge would not classify), and the claim id of every unit problem. A unit that could
-    not be checked has one ``unchecked`` claim — never a contradiction (R6, R14)."""
+    not be checked has one ``unchecked`` claim — never a contradiction (R6, R14). A unit whose qualifier the server edits
+    out (round 12 U10) has one whole-unit claim that stands, ``partial``: its number is the sources', its qualifier was
+    not, and the final check judges the sentence as edited."""
+    units = {u.index: u for u in report.units}
+    for idx in report.qualifier_edits:
+        if idx not in report.claims and idx in units:
+            report.claims[idx] = [_whole_record(units[idx], "partial")]
     for p in report.removals():
         u = p.unit
         unchecked = p.failure_kind == "not_checked"

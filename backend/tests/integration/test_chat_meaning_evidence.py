@@ -73,14 +73,16 @@ def test_a_period_stated_in_the_cited_passages_section_is_cited_and_kept(office)
     assert str(doc) not in ws.activity  # the server's own reading is not the turn's coverage
 
 
-def test_without_evidence_in_the_calculation_the_period_is_removed(office):
+def test_without_evidence_in_the_calculation_the_period_is_removed_and_the_number_stays(office):
     doc, ver = _doc(office, [("תחשיב", "דמי השכירות הראויים לנכס הם 70 ₪ למ\"ר."),
                              ("סקר שוק", "עסקת השוואה ברחוב הדולב: 70 ₪ למ\"ר לחודש.")], "2" * 64)
     ws = _ws(office, doc, ver, 0, "דמי השכירות הראויים לנכס הם 70 ₪ למ\"ר.")
     md = "דמי השכירות הראויים הם 70 ₪ למ\"ר לחודש [S1]."
     report = verify_answer(_judge(), _answer(md), ws, "?", [])
-    assert not report.ok and any(p.removes_unit for p in report.problems)
-    assert "לחודש" not in report.apply(_answer(md)).answer_markdown
+    # round 12 U10 (R7, KTD10): the cited calculation is silent on the period, so the period is edited out and 70 stays
+    assert not report.ok and report.qualifier_edits
+    out = report.apply(_answer(md)).answer_markdown
+    assert "לחודש" not in out and "70" in out
 
 
 def test_a_subject_measurement_with_the_period_is_cited(office):

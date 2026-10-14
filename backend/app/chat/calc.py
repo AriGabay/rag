@@ -1170,7 +1170,14 @@ class Value:
         period = self.period if self.period not in ("month", "year") or self.provenance.get("period") == "source" \
             else "unknown"
         basis = basis_key(self.area_basis) if self.provenance.get("area_basis") == "source" else ""
-        return operand(self.vid, self.value, self.unit, period=period, vat=self.vat, basis=basis,
+        # and a VAT status of an amount of money only when its source gave it (round 12 U10, R6, R8): one the model asserted
+        # is unknown, so a calculation never carries it as the result's VAT basis and mixes it with a stated one only
+        # through the existing conditional path
+        vat = self.vat
+        if vat in ("included", "excluded") and "ILS" in dict(dims_of(self.unit)) \
+                and self.provenance.get("vat") != "source":
+            vat = "unknown"
+        return operand(self.vid, self.value, self.unit, period=period, vat=vat, basis=basis,
                        kind=self.kind, role=self.role, subject=self.subject, total=self.total, table=self.table,
                        approx=self.approx,
                        context=(self.context["key"], self.context.get("described") or self.context["label"])

@@ -177,13 +177,16 @@ def test_a_missing_basis_on_an_unsupported_unit_is_removed_not_annotated():
     assert "כפי שנכתב במקור" not in out and "14,250" not in out
 
 
-def test_an_added_period_is_removed_without_judging_it():
+def test_an_added_period_is_removed_and_the_number_stays_without_judging_it():
+    # round 12 U10 (R7, KTD10): the source is silent on the period, so only the added "לחודש" goes; the number it
+    # states stays
     ws = _ws("שכ\"ד 63 ₪ למ\"ר לפי הסקר בשכונת רמת האלה.")
     a = _answer("דמי השכירות הם 63 ₪ למ\"ר לחודש [S1].")
     p = _judge("supported")
     r = verify_answer(p, a, ws, "?", [])
     assert [x.kind for x in r.problems] == ["claim"] and not p.calls
-    assert "63" not in r.apply(a).answer_markdown
+    out = r.apply(a).answer_markdown
+    assert "63" in out and "לחודש" not in out
 
 
 @pytest.mark.parametrize("source,answer", [
