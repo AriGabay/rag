@@ -105,6 +105,22 @@ class AsOf(TypedDict):
 
 
 HISTORY_ORIGIN, COMPARABLE_ORIGIN = "history", "comparable"
+# the provenances of a datum's date that the server read from the source (round 11 U15 B): never one the model typed
+STATED_BY_SOURCE = frozenset({SOURCE, SOURCE_TABLE, UNIT_VALUATION})
+
+
+def stated_dates(as_of: Mapping | None) -> list[tuple[str, str]]:
+    """The (ISO, precision) dates a datum's ``as_of`` states from the source: its date and, for a range, its end. Nothing for
+    an unknown date, a forecast with no date, or a provenance that is not the source's."""
+    if not as_of or not as_of.get("date") or as_of.get("provenance") not in STATED_BY_SOURCE:
+        return []
+    return [(d, as_of["precision"]) for d in (as_of["date"], as_of.get("end")) if d]
+
+
+def holds_date(stated: Iterable[tuple[str, str]], iso: str, precision: str) -> bool:
+    """Whether a written date is, at its precision or coarser, one of the stated dates (``stated_dates``)."""
+    return any(iso == day[:len(iso)] and shared.PRECISION_RANK[precision] <= shared.PRECISION_RANK[rank]
+               for day, rank in stated)
 
 
 @dataclass(frozen=True)
@@ -726,6 +742,49 @@ def _withheld(origin: str, sentence: str, anchor: date) -> AsOf:
                 locator=None, date_origin=origin)
 
 
+def _labelled_two_digit(sentence: str, own: Sequence[Parsed]) -> list[Parsed]:
+    """The dates a datum's own sentence writes with a two-digit year right after a valuation label ("לתאריך הקובע 31.12.19,
+    הוערך הנכס ..."), read by the same label-anchored helper the unit's valuation date uses (`_date_after`, round 12 U12b,
+    KTD11, AE6). The shared parser refuses a two-digit year (``own`` are the dates it found), so such a date is never found
+    anywhere else: an unlabelled "5.3.24" in a cell or a sentence, a report or signature label's date, a range, 70-99 and an
+    impossible date stay undated. Only the valuation labels count here: a report date is not the datum's date."""
+    held = {p.span for p in own}
+    out: list[Parsed] = []
+    for m in _VALUATION.finditer(sentence):
+        p, _ = _date_after(sentence, m.end())
+        if p is not None and p.span not in held and not any(_overlap(p.span, h) for h in held):
+            out.append(p)
+    return out
+
+
+# what a restated date may be written with besides the date: a valuation label ("למועד הקובע", "תאריך קובע"), the gap words
+# between a label and its date, "נכון ל" and signs
+_RESTATING = re.compile(r"(?:[\s:|\-–—־,;.()\[\]]|(?<![א-ת])(?:" + "|".join((*_GAP_WORDS, "נכון", "ל", "ב", "מ", "ה")) + r")(?![א-ת]))*")
+
+
+def restates_as_of(text_: str | None, as_of: Mapping | None) -> bool:
+    """Whether a text is nothing but the datum's own resolved date (round 12 U12b, S3): every date it writes is, at its
+    precision or coarser, a date the server read for the datum (``stated_dates``), and the rest of it is a valuation label
+    and gap words ("למועד הקובע 30/06/2025", "נכון ל-2025"). A different date, or a word of the writer's own ("תרחיש
+    אופטימי"), is not a restatement."""
+    t = strip_bidi_controls(text_ or "")
+    found = shared.find_all(t)
+    stated = stated_dates(as_of)
+    if not found or not stated:
+        return False
+    if not all(holds_date(stated, p.iso, p.precision) and (p.end is None or holds_date(stated, p.end, p.precision))
+               for p in found):
+        return False
+    rest = t
+    for p in sorted(found, key=lambda x: x.span, reverse=True):
+        rest = rest[:p.span[0]] + " " + rest[p.span[1]:]
+    return _RESTATING.fullmatch(_VALUATION.sub(" ", rest)) is not None
+
+
+def _overlap(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    return a[0] < b[1] and b[0] < a[1]
+
+
 def _is_unit_own(stance: str | None, role: str | None, stated_by: str | None, stated_by_provenance: str | None,
                  comparables: bool) -> bool:
     """Whether a value may take its unit's valuation date: not a party's position, not another party's, not a comparable
@@ -752,6 +811,11 @@ def resolve_as_of(text_: str, *, table_caption: str | None = None, stance: str |
     and its table's range still win (round 12 U4, R16, KTD12)."""
     sentence = strip_bidi_controls(text_ or "")
     own = shared.find_all(sentence)
+    labelled = _labelled_two_digit(sentence, own)
+    if labelled:   # a valuation label's own two-digit date is the datum's date, whatever other dates the sentence names
+        if len({p.iso for p in labelled}) > 1:
+            return None   # two labelled dates: ambiguous
+        return _build(labelled[0].iso, labelled[0].precision, None, SOURCE, locator, sentence, anchor)
     if len({(p.iso, p.precision, p.end) for p in own}) > 1:
         return None   # ambiguous: two different dates in the row or sentence
     if own:

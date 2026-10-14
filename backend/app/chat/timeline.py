@@ -59,6 +59,7 @@ from app.chat.tools import (
     dated,
     measurement_uncertain,
     property_partition,
+    read_coverage,
     time_key,
     value_uncertain,
 )
@@ -500,8 +501,10 @@ def sids_behind(ws: Workspace, ids: Iterable[str]) -> set[str]:
 
 def coverage_of(ws: Workspace, ids: Iterable[str]) -> dict | None:
     """The coverage record of the data the ids cite (KTD7): that of the time-ranked calls whose results they come from, else
-    of the turn's calls together; None when the turn made no time-ranked call (off mode, R14)."""
-    return coverage_for(ws, sids_behind(ws, ids))
+    of the turn's calls together; None when the turn made no time-ranked call (off mode, R14). A timed turn that made none
+    but read the sources it cites has the reads-only record (``read_coverage``, round 12 U12b)."""
+    record = coverage_for(ws, sids_behind(ws, ids))
+    return record if record is not None or ws.time_calls else read_coverage(ws, ids)
 
 
 def partial_coverage(ws: Workspace, ids: Iterable[str]) -> dict | None:
@@ -509,6 +512,9 @@ def partial_coverage(ws: Workspace, ids: Iterable[str]) -> dict | None:
     coverage or a property not identified); None for ids no time-ranked call produced, and for a complete record. The
     claim check reads it: a "latest" claim about data of a call that did not check every appraisal needs the qualified
     phrase (``verify._recency_claim``)."""
+    if not ws.time_calls:  # no time-ranked search: the reads-only record, when the cited sources identify the property
+        record = read_coverage(ws, ids)
+        return None if record is None or record.get("complete") else record
     behind = sids_behind(ws, ids)
     if not any(behind & set(c.sids) for c in ws.time_calls):
         return None

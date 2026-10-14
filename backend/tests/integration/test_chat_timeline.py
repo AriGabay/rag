@@ -320,7 +320,9 @@ def test_the_model_reads_the_coverage_and_the_phrase_rule_after_a_partial_time_s
     outputs = [i["output"] for i in steps.seen[-1] if isinstance(i, dict) and i.get("type") == "function_call_output"]
     search = outputs[0]
     assert UNDATED_TITLE in search and QUALIFIED in search, "the search result carries the coverage summary and the rule"
-    assert search.index("<source") < search.index(UNDATED_TITLE), "after the results, never before them"
+    # the property line (U12b) names the gathered units before the results; the coverage summary comes after them
+    summary = "כיסוי השומות בחיפוש הזה"
+    assert search.index("<source") < search.index(summary) < search.rindex(UNDATED_TITLE), "after the results, never before them"
     assert all(UNDATED_TITLE not in o for o in outputs[1:]), "only a time-ranked search says it"
 
 

@@ -191,3 +191,44 @@ def test_the_explicit_note_and_the_not_identified_note_reach_the_payload():
     assert out["coverage"]["note"].splitlines()[0] == TF.MSG_NOTE_EXPLICIT and "שומת 2024 סינתטית" in out["text"]
     lone = record(RECENT, [unit(1, "2025-03-31")], scope=T.UNIT, identified=False)
     assert timeline.payload(_ws(), set(), coverage=lone)["coverage"]["note"] == TF.MSG_NOTE_NOT_IDENTIFIED
+
+
+# --- a turn that read sources and ran no time-ranked search (round 12 U12b): only what was read counts ---------------------
+
+def test_a_record_of_reads_only_is_partial_and_the_note_names_the_units_that_were_not_checked():
+    rec = record(RECENT, [unit(1, "2025-03-31", T.READ), unit(2, "2024-06-15", T.NOT_SEARCHED, "שומה שנייה סינתטית"),
+                          unit(3, "2023-06-15", T.NOT_SEARCHED, "שומה שלישית סינתטית")])
+    assert not rec["complete"] and rec["blocking"] == [T.B_NOT_SEARCHED]
+    assert [u["blocks"] for u in rec["units"]] == [False, True, True]
+    lines = TF.coverage_note(rec).splitlines()
+    assert lines[0] == TF.MSG_NOTE_RECENT and LATEST_PHRASE in lines[0]
+    group = next(ln for ln in lines if ln.startswith(TF.MSG_GROUP_READ_ONLY))
+    assert "שומה שנייה סינתטית" in group and "שומה שלישית סינתטית" in group and "שומה סינתטית 1" not in group
+
+
+def test_reads_only_in_explicit_mode_use_the_explicit_sentence_and_still_name_the_unchecked():
+    rec = record(EXPLICIT, [unit(1, "2024-05-01", T.NOT_SEARCHED, "שומת 2024 סינתטית"), unit(2, "2022-03-01", T.READ)])
+    assert not rec["complete"] and rec["blocking"] == [T.B_NOT_SEARCHED]
+    note = TF.coverage_note(rec)
+    assert note.splitlines()[0] == TF.MSG_NOTE_EXPLICIT and "שומת 2024 סינתטית" in note
+
+
+def test_every_unit_of_the_property_read_is_complete_and_a_read_unit_counts_as_checked_for_the_newest_datum():
+    rec = record(RECENT, [unit(1, "2025-03-31", T.READ), unit(2, "2024-06-15", T.READ)])
+    assert rec["complete"] and rec["blocking"] == []
+    assert TF.coverage_note(rec) == TF.MSG_NOTE_COMPLETE.format(n=2)
+
+
+def test_a_dated_unit_not_searched_after_a_hit_blocks_only_for_reads_never_for_the_cap():
+    """The cap leaves older units out without harm (AE4); a unit nothing searched or read is a gap whatever its age."""
+    cap = record(RECENT, [unit(1, "2025-03-31"), unit(2, "2020-06-15", T.NOT_SEARCHED_CAP)])
+    assert cap["complete"]
+    reads = record(RECENT, [unit(1, "2025-03-31", T.READ), unit(2, "2020-06-15", T.NOT_SEARCHED)])
+    assert not reads["complete"] and reads["blocking"] == [T.B_NOT_SEARCHED]
+
+
+def test_an_undated_unit_not_searched_stays_in_the_undated_group_of_a_reads_only_record():
+    rec = record(RECENT, [unit(1, "2025-03-31", T.READ), unit(2, None, T.NOT_SEARCHED, "שומה ללא תאריך סינתטית")])
+    assert rec["blocking"] == [T.B_UNDATED]
+    note = TF.coverage_note(rec)
+    assert "שומה ללא תאריך סינתטית" in note and TF.MSG_GROUP_READ_ONLY not in note

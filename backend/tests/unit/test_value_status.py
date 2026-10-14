@@ -77,7 +77,9 @@ def _source(ws: T.Workspace, status: str = "complete") -> str:
 def _value(ws: T.Workspace, written: str, sid: str, *, asserted: bool = False, role: str = "other",
            vat: str = "excluded") -> str:
     vid = f"V{len(ws.values) + 1}"
-    prov = {"unit": "source", "vat": "model_asserted" if asserted else "source"}
+    # the model asserts the value's kind (an uncertain meaning that still computes); a model-asserted VAT is no VAT at
+    # all in a calculation since round 12 (R8, KTD9: see the test below)
+    prov = {"unit": "source", "vat": "source", "kind": "model_asserted" if asserted else "source"}
     ws.values[vid] = calc.Value(vid, Decimal(written.replace(",", "")), written, sid, uuid.uuid4(), uuid.uuid4(),
                                 None, "בדיקת כדאיות", "עמוד 1", f"ערך {vid}", "income", "ILS", "none", vat, "",
                                 SUBJECT, role, prov, {"quote": written}, written)
@@ -129,6 +131,17 @@ def test_an_uncertain_value_makes_the_result_conditional(calc_ws, case):
     out = json.loads(T.tool_calculate(calc_ws, f"{v1} - {v2}", "הפרש"))
     assert out["conditional"] is True and v2 in "; ".join(calc_ws.computations[out["id"]].outcome.conditional)
     assert f"{v1} {T.STATUS_AUTO}" in out["note"] and f"{v2} {T.STATUS_UNCERTAIN}" in out["note"]
+
+
+def test_a_model_asserted_vat_never_joins_a_source_vat_in_a_calculation(calc_ws):
+    # round 12 U10 (R8, KTD9): only a source-stated VAT enters a calculation, so a model-asserted "excluded" against a
+    # source "excluded" is a VAT the sources do not give — the calculation is refused, never computed as comparable
+    s = _source(calc_ws)
+    v1 = _value(calc_ws, "5,200,000", s, role="income")
+    v2 = _value(calc_ws, "4,300,000", s, role="other")
+    calc_ws.values[v2].provenance["vat"] = "model_asserted"
+    with pytest.raises(T.ToolError):
+        T.tool_calculate(calc_ws, f"{v1} - {v2}", "הפרש")
 
 
 def test_certain_values_give_a_certain_result(calc_ws):

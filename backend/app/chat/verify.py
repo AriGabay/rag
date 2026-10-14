@@ -191,6 +191,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.answering.verify import _DATE as _DATE_AT
 from app.answering.verify import _NUMBER as _NUM_AT  # one reading of numbers for both checks
 from app.answering.verify import not_an_amount, numbers_in
+from app.chat import dates as chat_dates
 from app.chat import meaning
 from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited, line_cut
 from app.chat.evidence import select
@@ -2239,6 +2240,8 @@ def _source_parts(ws: Workspace, sid: str, *, dated: bool = True) -> tuple[str, 
             head += f" — זיהוי מתוך המסמך: {src.subject}"
         if src.source_kind != source_kinds.APPRAISAL:  # an appraisal's header stays what it was
             head += " — " + _professional_head(src)
+        if src.link and dated:  # the server linked this appraisal to the property (round 12 U12b, R3): evidence for the
+            head += " — " + src.link  # judge; not for the number check, which a parcel's digits must not feed
         return head, src.text, src.kind
     if sid in ws.measurements:
         m = ws.measurements[sid].public()
@@ -2260,7 +2263,7 @@ def _source_parts(ws: Workspace, sid: str, *, dated: bool = True) -> tuple[str, 
                 f"מע\"מ: {v['vat']}, בסיס שטח: {v['area_basis'] or 'לא צוין'}, נושא: {v['subject'] or 'לא צוין'}, "
                 f"תפקיד: {v['role']}" + (f"; נקבעו ולא נמצאו במקור: {', '.join(asserted)}" if asserted else "")
                 + ")" + (f"\nסעיף: {v['section']}" if v.get("section") else "") + "\n" + _attribution_text(v)
-                + f"\nמקום: {where}" + (_date_text(v) if dated else "") + f"\nציטוט: {v['quote']}" + _context_text(v)
+                + f"\nמקום: {where}" + (_date_text(v) + _link_text(ws, v) if dated else "") + f"\nציטוט: {v['quote']}" + _context_text(v)
                 + _scale_text(ws.values[sid]), "value")
     if sid in ws.assumptions:
         a = ws.assumptions[sid]
@@ -2279,6 +2282,15 @@ def _date_text(record: dict) -> str:
     from app.chat.tools import datum_line
 
     return "\n" + datum_line(record["as_of"]) if record.get("as_of") else ""
+
+
+def _link_text(ws: Workspace, record: dict) -> str:
+    """The server's link of the appraisal a value was verified in, as one line of its record (round 12 U12b, S2, R3): "שומה של
+    אותו נכס: חלקה 8401/40 משותפת". A value of an appraisal at another house number that shares the property's parcel is the
+    property's value; the judge reads that beside the date line, so it does not mark the claim as another property's
+    (``wrong_subject``). Nothing for the focus appraisal and for a value no time search linked."""
+    src = ws.sources.get(record.get("source_id"))
+    return "\n" + src.link if src is not None and src.link else ""
 
 
 def _scale_text(v) -> str:
@@ -2531,16 +2543,10 @@ def _texts(ws: Workspace, ids: list[str]) -> list[tuple[str, str]]:
     return out
 
 
-# the provenances of a datum's date that the server read from the source (round 11 U15 B): never one the model typed
-_SOURCE_DATE = frozenset({"source", "source_table", "unit_valuation"})
-
-
 def _as_of_dates(as_of: dict | None) -> list[tuple[str, str]]:
-    """The (ISO, precision) dates a datum's ``as_of`` states from the source: its date and, for a range, its end. Nothing
-    for an unknown date, a forecast with no date, or a provenance that is not the source's."""
-    if not as_of or not as_of.get("date") or as_of.get("provenance") not in _SOURCE_DATE:
-        return []
-    return [(d, as_of["precision"]) for d in (as_of["date"], as_of.get("end")) if d]
+    """The (ISO, precision) dates a datum's ``as_of`` states from the source (``chat.dates.stated_dates``): its date and, for
+    a range, its end. Nothing for an unknown date, a forecast with no date, or a provenance that is not the source's."""
+    return chat_dates.stated_dates(as_of)
 
 
 def _as_of_forms(as_of: dict | None) -> list[str]:
@@ -2559,7 +2565,7 @@ def _date_backed(text: str, ws: Workspace, ids: list[str]) -> set[str]:
         return set()
 
     def holds(iso: str, precision: str) -> bool:
-        return any(iso == day[:len(iso)] and shared_dates.PRECISION_RANK[precision] <= shared_dates.PRECISION_RANK[rank] for day, rank in stated)
+        return chat_dates.holds_date(stated, iso, precision)
 
     backed = [p for p in shared_dates.find_all(text) if holds(p.iso, p.precision) and (p.end is None or holds(p.end, p.precision))]
     if not backed:

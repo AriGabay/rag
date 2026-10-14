@@ -14,7 +14,9 @@ qualifier edit - never wording. Every name, address and amount is invented.
 - (6) an invented attribute (AE5): a rent that states no period keeps its number and never carries one as the source's;
 - (7) history (AE6, R16, R17): prior values keep their own dates and never the report's valuation date;
 - (8) a conflict (AE7, R18): a dated and an undated value of one property conflict, a history value does not;
-- (9) off mode (R14): the search, the order and the time wording are round 11's; the meaning corrections still apply."""
+- (9) off mode (R14): the search, the order and the time wording are round 11's; the meaning corrections still apply;
+- (10) U12b: the link reason reaches the model and the judge (S2); a timed turn answered from a read source records a coverage
+  that says what was only read (S3, S2); a cited value's server-resolved date backs the same date wherever the model wrote it."""
 
 # ruff: noqa: F811 - the tests take the imported ``calls`` fixture by name, as the round-11 sequences do
 from __future__ import annotations
@@ -42,7 +44,7 @@ from tests.integration.test_round10_sequences import (
 from tests.integration.test_round10_sequences import (
     no_models as no_models,  # noqa: F401 - the autouse inline-run setup
 )
-from tests.support.scripted_agent import ScriptedAgent, call, final, intent_part
+from tests.support.scripted_agent import ScriptedAgent, call, final, intent_part, read
 from tests.support.unit_files import unit_file
 
 pytestmark = pytest.mark.db
@@ -123,8 +125,8 @@ def follow_up(o, cid: str, question: str, steps: list) -> Turn:
         relation="same_datum", standalone_question=question, intent=intent_part("property", "conversation_property")))
 
 
-def first_turn(o, cid: str, question: str, steps: list) -> Turn:
-    return turn(o, cid, question, steps, None, intent="property")
+def first_turn(o, cid: str, question: str, steps: list, **agent) -> Turn:
+    return turn(o, cid, question, steps, None, **({"intent": "property"} | agent))
 
 
 def answer_with(vid: str, amount: str, subject: str, text: str = "השווי העדכני", vat: bool = False) -> dict:
@@ -471,7 +473,8 @@ def test_a_history_table_gives_each_prior_value_its_own_date_never_the_reports_v
 def test_ae6_prior_appraisals_in_a_history_section_never_take_the_units_date_and_the_unit_keeps_its_own(
         db, client, monkeypatch, calls):
     """The fixture writes the prior dates with two-digit years ("31.12.19"). The shared parser reads a two-digit year only
-    at a valuation label's gap (KTD11), so such a prior value stays undated, as history; it never takes 2023-12-31."""
+    at a valuation label's gap (KTD11), and so does the datum's own-sentence reading (round 12 U12b): "לתאריך הקובע 31.12.19"
+    dates the prior value 2019-12-31 and never 2023-12-31, the unit's date."""
     o = world(db, client, monkeypatch, calls, ("dp_prior_section_ae6",))
     doc = o.ids["dp_prior_section_ae6"]
     sentences = {"1,800,000": "לתאריך הקובע 31.12.19 הוערך הנכס ב-{amount} ₪",
@@ -490,8 +493,9 @@ def test_ae6_prior_appraisals_in_a_history_section_never_take_the_units_date_and
     a = t.answer
     dates = {v["value_text"]: v["as_of"]["date"] for v in a["values"]}
     assert "2023-12-31" not in dates.values(), "a prior appraisal is never dated by the unit's valuation date"
-    assert dates["1,500,000"] == "2017-05-15", "a purchase keeps its own (four-digit) date"
-    assert {v["value_text"]: v["as_of"].get("date_origin") for v in a["values"]}["1,800,000"] in ("history", None)
+    assert dates == {"1,800,000": "2019-12-31", "2,000,000": "2021-12-31", "1,500,000": "2017-05-15"}, (
+        "each prior value is dated by its own sentence: the labelled two-digit dates and the purchase's four-digit date")
+    assert {v["value_text"]: v["as_of"]["provenance"] for v in a["values"]} == dict.fromkeys(dates, "source")
     assert a["time"]["coverage"]["units"][0]["date"] == "2023-12-31", "the unit's date is the labelled valuation date (AE6)"
     assert a["status"] == "answered"
 
@@ -597,3 +601,199 @@ def test_off_mode_reads_the_named_appraisal_only_orders_chronologically_and_carr
     assert [r["date"] for r in rows_of(off_three)] == ["2022-06-30", "2023-06-30", "2024-06-30"]
     assert "coverage" not in off_three.answer["time"] and off_three.answer["time"]["text"] is not None
     assert LATEST_CHECKED not in off_three.answer["time"]["text"]
+
+
+# =======================================================================================================================
+# (10) U12b: the date a cited value's record resolves backs the same date wherever the model wrote it (S3 trace)
+# =======================================================================================================================
+
+MODEL_ASSERTED = "(קביעת המודל, לא נמצא במקור)"
+
+
+def date_in_record_judge(input: str) -> dict:
+    """The judge of the round-12 S3 trace: shown a value whose scenario/date is marked as the model's assertion (not found in
+    the source), it supports the amount and cuts the date words ("the date is not in the quote and was recorded as the
+    model's"); shown a record that does not mark the date so, it supports the unit."""
+    indexes = [int(i) for i in re.findall(r'<unit index="(\d+)"', input)]
+    asserted = re.search(r"תרחיש/מועד: [^;\n]*" + re.escape(MODEL_ASSERTED), input) is not None
+    verdict = {"verdict": "partial", "defect": "part", "reason": "הסכום נתמך; התאריך אינו מופיע בציטוט המקור ונרשם בו כקביעת המודל"
+               } if asserted else {"verdict": "supported", "defect": "none", "reason": "בדיקה"}
+    return {"verdicts": [{"index": i, "supported_by": [], **verdict} for i in indexes]}
+
+
+def headline_steps(gafen: str, scenario: str, written: str) -> list:
+    """The headline value of the compendium (3,100,000, valued 30/06/2025), registered with ``scenario`` and given with the
+    date ``written`` in the answer."""
+    body = f"השווי למועד הקובע {written} הוא 3,100,000 ₪ [V1]."
+    answer = final(body, focus=_focus_of() | {"subject": "הגפן 15", "vat": "unknown", "metric_as_written": "שווי הנכס"},
+                   claims=[{"text": body.rsplit(" [", 1)[0], "source_ids": ["V1"], "basis": "explicit"}])
+    return steps_for([(gafen, "3,100,000")], answer, [gafen], sentence=UNIT_SENTENCE, scenario=scenario)
+
+
+def test_s3_a_scenario_that_is_the_values_own_resolved_date_is_no_assertion_of_the_model_and_the_headline_keeps_its_date(
+        db, client, monkeypatch, calls):
+    o = bare_world(db, client, monkeypatch, calls)
+    gafen, _ = compendium(o, "compendium_one")  # 3,100,000 valued 30/06/2025; the unit's quote holds no date
+    t = first_turn(o, new_conversation(client), VALUE_Q.format(street="הגפן 15"),
+                   headline_steps(gafen, "למועד הקובע 30/06/2025", "30/06/2025"), judge=date_in_record_judge)
+    a = t.answer
+    (v,) = a["values"]
+    assert v["as_of"]["date"] == "2025-06-30" and v["as_of"]["provenance"] == "unit_valuation"
+    assert v["provenance"]["scenario"] == "source", "the server's own date is not the model's assertion"
+    assert a["markdown"] == "השווי למועד הקובע 30/06/2025 הוא 3,100,000 ₪ [V1]." and a["verification"]["removed"] == 0
+    assert a["verification"]["actions"]["cut"] == 0 and a["status"] == "answered"
+    judged = "\n".join(c.input for c in t.agent.calls if "תרחיש/מועד:" in c.input)
+    assert "תרחיש/מועד: למועד הקובע 30/06/2025" in judged
+    assert not re.search(r"תרחיש/מועד: [^;\n]*" + re.escape(MODEL_ASSERTED), judged), "the judge reads the date as resolved"
+
+
+def test_s3_a_scenario_that_is_not_the_values_resolved_date_stays_the_models_and_the_answer_is_not_verified_as_clean(
+        db, client, monkeypatch, calls):
+    o = bare_world(db, client, monkeypatch, calls)
+    gafen, _ = compendium(o, "compendium_one")
+    # the model writes another unit's date for the headline value (valued 30/06/2025): the record does not back it, so the date
+    # stays the model's assertion and the judge still reads it as one
+    t = first_turn(o, new_conversation(client), VALUE_Q.format(street="הגפן 15"),
+                   headline_steps(gafen, "למועד הקובע 30/06/2024", "30/06/2024"), judge=date_in_record_judge)
+    (v,) = t.answer["values"]
+    assert v["as_of"]["date"] == "2025-06-30" and v["provenance"]["scenario"] == "model_asserted"
+    assert t.answer["verification"]["partial"] == 1 and t.answer["verification"]["correctness"] == "partial"
+    # the unit's date with a word of the model's own is an assertion too, not the date alone
+    t2 = first_turn(o, new_conversation(client), VALUE_Q.format(street="הגפן 15"),
+                    headline_steps(gafen, "תרחיש אופטימי למועד הקובע 30/06/2025", "30/06/2025"), judge=date_in_record_judge)
+    assert t2.answer["values"][0]["provenance"]["scenario"] == "model_asserted"
+    assert t2.answer["verification"]["partial"] == 1
+
+
+# =======================================================================================================================
+# (11) U12b (S2): the server's link reaches the judge, so a linked appraisal's value at another address is kept
+# =======================================================================================================================
+
+LINKED = "שומה של אותו נכס"
+
+
+def subject_judge(input: str) -> dict:
+    """The judge of the S2 trace: shown the value of the appraisal at another house number (הדס 3) for a question about הדס 5,
+    it marks the claim ``wrong_subject`` unless the record it is shown says the server linked that appraisal to the property
+    ("שומה של אותו נכס: ...")."""
+    out = []
+    for m in re.finditer(r'<unit index="(\d+)"[^>]*>(.*?)</unit>', input, re.S):
+        disowned = "3,200,000" in m[2] and LINKED not in input
+        out.append({"index": int(m[1]), "supported_by": [], "reason": "הערך שייך לנכס אחר (הדס 3)" if disowned else "בדיקה",
+                    **({"verdict": "unsupported", "failure": "wrong_subject"} if disowned else {"verdict": "supported"})})
+    return {"verdicts": out}
+
+
+def test_s2_the_linked_appraisal_at_another_house_number_carries_the_link_to_the_model_and_the_judge_and_its_value_is_kept(
+        db, client, monkeypatch, calls):
+    o = world(db, client, monkeypatch, calls, ("parcels_ab", "parcels_b", "parcels_c"))
+    a_doc, b_doc = o.ids["parcels_ab"], o.ids["parcels_b"]
+    focus = _focus_of() | {"subject": "הדס 5", "vat": "unknown", "metric_as_written": "שווי הנכס"}
+    body = "השווי העדכני הוא 3,650,000 ₪ [V1]. קודם לכן, ב-30/06/2023, השווי היה 3,200,000 ₪ [V2]."
+    answer = final(body, focus=focus, claims=[
+        {"text": "השווי העדכני הוא 3,650,000 ₪", "source_ids": ["V1"], "basis": "explicit"},
+        {"text": "קודם לכן, ב-30/06/2023, השווי היה 3,200,000 ₪", "source_ids": ["V2"], "basis": "explicit"}])
+    t = first_turn(o, new_conversation(client), VALUE_Q.format(street="הדס 5"), steps_for(
+        [(b_doc, "3,650,000"), (a_doc, "3,200,000")], answer, [b_doc]), judge=subject_judge)
+    a = t.answer
+    assert a["status"] == "answered" and "3,200,000" in a["markdown"] and a["verification"]["removed"] == 0, a["verification"]
+    # the model read the link in the search result: on the linked appraisal's sources and in the property line
+    search = t.agent.tool_outputs(1)[0]
+    want = T.MSG_LINK_SAME_PROPERTY.format(why=T.MSG_LINK_PARCEL.format(parcels="8401/40"))
+    assert f'link="{want}"' in search and T.MSG_PROPERTY_UNITS_HEAD in search
+    assert not re.search(rf'document_id="{b_doc}"[^>]*link=', search), "the focus appraisal has no link"
+    assert {s["link"] for s in a["sources"] if s["document_id"] == a_doc} == {want}
+    # the judge read it with that source's evidence (a V#'s source, a passage's header)
+    judged = "\n".join(c.input for c in t.agent.calls if "<unit index" in c.input)
+    assert want in judged
+
+
+# =======================================================================================================================
+# (12) U12b (S3): a timed turn answered from a read source records what was only read
+# =======================================================================================================================
+
+def read_steps(doc: str, amount: str, answer, sentence: str = UNIT_VAT) -> list:
+    """No time-ranked search: the model reads page 1 of the appraisal it already knows, registers the value and answers."""
+    def register(items):
+        return [amount_take(sid_with(items, doc, amount), amount, sentence=sentence)]
+
+    return [[read(pages={"document": doc, "from_page": 1, "to_page": 1})], register,
+            *(answer if isinstance(answer, list) else [answer])]
+
+
+def test_s3_a_property_named_by_the_documents_it_read_has_a_coverage_of_reads_only_that_is_partial_and_names_the_unchecked(
+        db, client, monkeypatch, calls):
+    o = bare_world(db, client, monkeypatch, calls)
+    docs = chain(o, range(2022, 2025), "ro")
+    t = first_turn(o, new_conversation(client), VALUE_Q.format(street="הגפן 15"),
+                   read_steps(docs[2024], amount_of(2024), latest_claim("V1", amount_of(2024), QUALIFIED)))
+    a = t.answer
+    assert [c.name for c in t.tools if c.name == "search"] == [], "the model read, it did not search"
+    cov = a["time"]["coverage"]
+    assert cov["scope"] == "property" and cov["identified"] and cov["via"] == "documents" and cov["read_only"] is True
+    assert {u["document_id"]: u["status"] for u in cov["units"]} == {
+        docs[2024]: T.READ, docs[2023]: T.NOT_SEARCHED, docs[2022]: T.NOT_SEARCHED}
+    assert [u["date"] for u in cov["units"]] == ["2024-06-30", "2023-06-30", "2022-06-30"]
+    assert not cov["complete"] and cov["blocking"] == [T.B_NOT_SEARCHED]
+    assert [u["document_id"] for u in cov["units"] if u["blocks"]] == [docs[2023], docs[2022]]
+    lines = cov["note"].splitlines()
+    assert lines[0] == QUALIFIED + "." and lines[1].startswith("נבדקו רק המקורות שנקראו; לא נבדקו")
+    assert "שומה סינתטית ro-2023" in lines[1] and "שומה סינתטית ro-2022" in lines[1] and "ro-2024" not in lines[1]
+    assert a["time"]["text"].endswith(cov["note"])
+    assert a["status"] == "answered" and a["markdown"].startswith(QUALIFIED)
+
+
+def test_s3_the_unqualified_latest_claim_of_a_reads_only_answer_is_repaired_like_any_partial_coverage(db, client, monkeypatch, calls):
+    o = bare_world(db, client, monkeypatch, calls)
+    docs = chain(o, range(2022, 2025), "rr")
+    t = first_turn(o, new_conversation(client), VALUE_Q.format(street="הגפן 15"), read_steps(
+        docs[2024], amount_of(2024), [latest_claim("V1", amount_of(2024), "השווי העדכני"),
+                                      latest_claim("V1", amount_of(2024), QUALIFIED)]))
+    assert t.answer["markdown"] == f"{QUALIFIED} הוא {amount_of(2024)} ₪ כולל מע״מ [V1]." and t.answer["verification"]["removed"] == 0
+    assert "recency" in json.dumps(m_diagnostics(client, t.message), ensure_ascii=False)
+
+
+def test_s3_a_follow_up_in_the_conversations_property_that_reads_one_appraisal_is_partial_and_off_mode_records_nothing(
+        db, client, monkeypatch, calls):
+    o = bare_world(db, client, monkeypatch, calls)
+    docs = chain(o, range(2022, 2025), "rf")
+    cid = new_conversation(client)
+    first = first_turn(o, cid, VALUE_Q.format(street="הגפן 15"), steps_for(
+        [(docs[2024], amount_of(2024))], answer_with("V1", amount_of(2024), "הגפן 15", vat=True), [docs[2024]], sentence=UNIT_VAT))
+    assert first.answer["time"]["coverage"]["complete"], "the search checked the property"
+    answer = final(f"השווי ב-2023 היה {amount_of(2023)} ₪ כולל מע״מ [V1].",
+                   focus=_focus_of() | {"subject": "הגפן 15", "metric_as_written": "שווי הנכס"},
+                   claims=[{"text": f"השווי ב-2023 היה {amount_of(2023)} ₪ כולל מע״מ", "source_ids": ["V1"], "basis": "explicit"}])
+    second = follow_up(o, cid, "ומה היה השווי ב-2023?", read_steps(docs[2023], amount_of(2023), answer))
+    cov = second.answer["time"]["coverage"]
+    assert second.answer["time"]["mode"] == "explicit" and [c.name for c in second.tools if c.name == "search"] == []
+    assert cov["read_only"] is True and cov["scope"] == "property"
+    assert {u["document_id"]: u["status"] for u in cov["units"]} == {
+        docs[2024]: T.NOT_SEARCHED, docs[2023]: T.READ, docs[2022]: T.NOT_SEARCHED}
+    assert not cov["complete"] and cov["note"].splitlines()[0] == "הנתונים לתקופה שביקשת נמצאו רק במקורות שנבדקו."
+    assert "נבדקו רק המקורות שנקראו; לא נבדקו" in cov["note"] and "ro" not in cov["note"]
+    # the switch off and no requested time: round 11's answer, no coverage record (R14)
+    off_cid = new_conversation(client)
+    set_switch(o, off_cid, False)
+    off = first_turn(o, off_cid, VALUE_Q.format(street="הגפן 15"), read_steps(
+        docs[2024], amount_of(2024), answer_with("V1", amount_of(2024), "הגפן 15", vat=True)))
+    assert off.answer["time"]["mode"] == "none" and "coverage" not in off.answer["time"]
+
+
+def test_s3_a_page_read_of_a_compendium_marks_only_the_unit_of_that_page_as_read(db, client, monkeypatch, calls):
+    """A file of six units of one property (one page each, the cover on page 1): the 2022 unit is page 4. The answer cites the
+    value taken from that page, so that unit is ``read`` and the five others are ``not_searched`` (R10: per unit, never per file)."""
+    o = bare_world(db, client, monkeypatch, calls)
+    gafen, _ = compendium(o, "compendium_one")
+    body = "השווי ב-2022 היה 2,500,000 ₪ [V1]."
+    answer = final(body, focus=_focus_of() | {"subject": "הגפן 15", "vat": "unknown", "metric_as_written": "שווי הנכס"},
+                   claims=[{"text": "השווי ב-2022 היה 2,500,000 ₪", "source_ids": ["V1"], "basis": "explicit"}])
+    steps = [[read(pages={"document": gafen, "from_page": 4, "to_page": 4})],
+             lambda items: [amount_take(sid_with(items, gafen, "2,500,000"), "2,500,000", sentence=UNIT_SENTENCE)], answer]
+    t = first_turn(o, new_conversation(client), "מה היה השווי ב-2022 של הנכס ברחוב הגפן 15?", steps)
+    cov = t.answer["time"]["coverage"]
+    assert t.answer["time"]["mode"] == "explicit" and cov["scope"] == "property" and cov["read_only"] is True
+    assert {u["date"]: u["status"] for u in cov["units"]} == {
+        "2025-06-30": T.NOT_SEARCHED, "2024-06-30": T.NOT_SEARCHED, "2023-06-30": T.NOT_SEARCHED, "2022-06-30": T.READ,
+        "2021-06-30": T.NOT_SEARCHED, "2020-06-30": T.NOT_SEARCHED}
+    assert not cov["complete"] and cov["blocking"] == [T.B_NOT_SEARCHED]

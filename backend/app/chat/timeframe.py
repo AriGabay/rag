@@ -291,6 +291,7 @@ MSG_NOTE_NOT_IDENTIFIED = "הנכס לא זוהה; נבדקה רק השומה ש
 MSG_NOTE_COMPLETE = "נבדקו כל השומות של הנכס הזמינות לך ({n})."  # relative to the appraisals visible to the user
 MSG_GROUP_CAP = "לא נבדקו (מגבלת מספר השומות בחיפוש)"
 MSG_GROUP_NO_MATCH = "נבדקו ללא התאמה לחיפוש"
+MSG_GROUP_READ_ONLY = "נבדקו רק המקורות שנקראו; לא נבדקו"  # a turn with no time-ranked search (round 12 U12b)
 MSG_GROUP_UNDATED = "ללא מועד קובע ברור"
 MSG_GROUP_CANDIDATES = "שומות שלא קושרו לנכס (אין הוכחה שהן שלו)"
 MSG_GROUP_UNDETERMINED = "שומות שלא ניתן לקבוע אם הן של הנכס"
@@ -331,7 +332,8 @@ def coverage_note(record: dict | None) -> str | None:
     or a turn with no time mode: nothing is claimed). Complete: the count of the appraisals checked, relative to those the
     user can see. Not identified: the property was not identified, only the focus appraisal was searched. Partial: the
     mode's sentence, then one line per reason group — the units that keep the datum from being called the latest (not
-    searched for the cap or searched without a match, only those that block), the undated ones, the unlinked candidates and
+    searched for the cap or searched without a match, only those that block), the units nothing searched when the answer
+    rests on reads alone ("נבדקו רק המקורות שנקראו; לא נבדקו", round 12 U12b), the undated ones, the unlinked candidates and
     the count of undetermined units. At most three units per group, newest first, then "ועוד N"."""
     if not record or record.get("mode") not in ("recent", "explicit"):
         return None
@@ -348,6 +350,7 @@ def coverage_note(record: dict | None) -> str | None:
     lines += [ln for ln in (
         _group(MSG_GROUP_CAP, [u for u in dated if u["status"] == "not_searched_cap" and u.get("blocks")]),
         _group(MSG_GROUP_NO_MATCH, [u for u in dated if u["status"] == "no_match" and u.get("blocks")]),
+        _group(MSG_GROUP_READ_ONLY, [u for u in dated if u["status"] == "not_searched" and u.get("blocks")]),
         _group(MSG_GROUP_UNDATED, [u for u in units if u.get("undated")], dated=False),
         _group(MSG_GROUP_CANDIDATES, list(candidates.get("named") or []), int(candidates.get("count") or 0)),
         f"{MSG_GROUP_UNDETERMINED}: {undetermined}." if undetermined else None,

@@ -129,6 +129,10 @@ coverage record (``coverage_record``: per unit hit, no match or not searched for
 unlinked candidates; undetermined units) kept in ``Workspace.time_calls`` with the S# the call returned; the answer's
 coverage is that of the calls that produced the data it cites (``coverage_for``, ``merge_coverage``). The server states
 nothing in words here: the wording and the payload are built from the record. Without a time mode none of this runs.
+Round 12 U12b: each source of a gathered unit other than the focus carries the server's link in its header (``link``:
+"שומה של אותו נכס: חלקה 8401/40 משותפת"), the search result lists the gathered units with their reasons, and the judge reads
+the link as part of that source's evidence. A timed turn answered from sources it only read (no time-ranked search) has the
+record ``read_coverage`` builds: the units the answer cites ``read``, the others ``not_searched``.
 
 A file holding several appraisals, or an appendix about a comparison property, is read as several appraisal contexts
 (round 7 U6: KTD7; R20–R22; ``app.chat.contexts``, derived from the stored reading and cached per reading): search
@@ -167,7 +171,7 @@ from app.chat import unread as unread_text
 from app.chat.contexts import MSG_NO_TITLE
 from app.chat.evidence import TABLE_SIZE_PREFIX
 from app.chat.intent import MIXED, PROFESSIONAL
-from app.chat.property import Gathered, Partition, PropertyGraph, build_graph, label_of
+from app.chat.property import REASON_ADDRESS_CITY, Gathered, Partition, PropertyGraph, build_graph, label_of
 from app.chat.timeframe import TimeMode
 from app.chat.timing import StageClock
 from app.config import get_settings
@@ -321,6 +325,10 @@ class Source:
     # the date line of a hit of an appraisal (round 11 U8, KTD6): "למועד הקובע 15/04/2025" — the valuation date of the unit
     # holding the passage — or "מועד לא ידוע"; shown in the source's header whatever the time mode
     date_line: str | None = None
+    # the server's link of a hit of a gathered appraisal other than the focus (round 12 U12b, R3): "שומה של אותו נכס: חלקה
+    # 8401/40 משותפת" — shown in the header beside the date line and to the judge as part of the source's evidence, so the
+    # appraisal at another house number is not disowned as another property's. None for the focus and outside a time search
+    link: str | None = None
 
     @property
     def is_listing(self) -> bool:
@@ -337,6 +345,8 @@ class Source:
                "source_kind": self.source_kind, "standard": self.standard, "date_line": self.date_line}
         if self.context:
             out["context"] = self.context
+        if self.link:
+            out["link"] = self.link
         if self.unit:
             out["unit"] = self.unit
         if self.is_listing:
@@ -841,6 +851,8 @@ def _render_source(s: Source) -> str:
         tags += f' unit_id="{_attr(s.unit["id"])}"'
     if s.date_line:  # the valuation date of the unit holding the passage, or that it is unknown (round 11 U8, KTD6)
         tags += f' date="{_attr(s.date_line)}"'
+    if s.link:  # why the server gathered this appraisal as the property's (round 12 U12b, R3)
+        tags += f' link="{_attr(s.link)}"'
     if s.status:  # a reading: how complete it is, the reading it is of, and how to read on
         tags += (f' status="{s.status}" version_id="{s.version_id}" reading_id="{_attr(s.reading_id)}"'
                  + (f' more="{s.more}"' if s.more else ""))
@@ -1677,6 +1689,30 @@ MSG_UNIT_WIDENED = ("בגבולות היחידה {unit} לא נמצא דבר, ו
 MSG_UNIT_ARGS = "היחידה (unit) והמסמך שנבחר אינם של אותו קובץ: היחידה קובעת את המסמך — בחר רק אחד מהם"
 MSG_PROPERTY_SEARCHED = ("(הנכס שהשיחה עוסקת בו: החיפוש כולל את כל השומות של הנכס הזה בארגון, לא רק את השומה שבמוקד. "
                          "כל תוצאה מסומנת בתאריך הקובע של השומה שלה.)")
+# round 12 U12b (S2, R3): the link of a gathered appraisal other than the focus, as the model and the judge read it. The
+# coverage record keeps the reason as property.py states it ("parcel B/P", "address_city"); these words say it
+MSG_LINK_SAME_PROPERTY = "שומה של אותו נכס: {why}"
+MSG_LINK_PARCEL = "חלקה {parcels} משותפת"
+MSG_LINK_ADDRESS = "אותם רחוב, מספר ועיר"
+MSG_LINK_FOCUS = "השומה שבמוקד"
+MSG_PROPERTY_UNITS_HEAD = "השומות שהשרת קישר לנכס"
+MSG_PROPERTY_UNITS = (MSG_PROPERTY_UNITS_HEAD + " ({count}): {units}. מספר בית או כתובת אחרים בשומה כזו אינם סיבה להחריג "
+                      "אותה: הקישור נקבע על ידי השרת, והיא שומה של הנכס שנשאלת עליו השאלה.")
+PROPERTY_UNITS_SHOWN = 10  # units the line names; the rest are counted
+
+
+def link_phrase(reason: str | None) -> str | None:
+    """A link reason of the property graph in the words the model and the judge read (None for no link): a shared parcel
+    ("parcel 8401/40") or the same street, number and city ("address_city")."""
+    if not reason:
+        return None
+    if reason.startswith("parcel "):
+        return MSG_LINK_SAME_PROPERTY.format(why=MSG_LINK_PARCEL.format(parcels=reason[len("parcel "):]))
+    if reason == REASON_ADDRESS_CITY:
+        return MSG_LINK_SAME_PROPERTY.format(why=MSG_LINK_ADDRESS)
+    return MSG_LINK_SAME_PROPERTY.format(why=reason)
+
+
 MSG_PROPERTY_NOTHING = ("חיפשתי בכל השומות של הנכס שהשיחה עוסקת בו ({count} יחידות) ולא נמצא קטע שמכיל את מילות החיפוש "
                         "\"{query}\". אפשר לנסות ניסוח אחר או מונחים נרדפים.")
 
@@ -1848,11 +1884,15 @@ CAP_UNDATED = 2        # of them, up to this many are kept for units with no val
 NAMED_CANDIDATES = 3   # unlinked candidates the record names, newest first; the rest are counted
 COVERAGE_V = 1         # the record's version (``answer.time.coverage.v``)
 HIT, NO_MATCH, NOT_SEARCHED_CAP = "hit", "no_match", "not_searched_cap"
+# a record built at answer time for a turn that ran no time-ranked search (``read_coverage``, round 12 U12b): a unit whose
+# source the answer cites was ``READ``; every other unit of the property is ``NOT_SEARCHED`` (no search ran at all)
+READ, NOT_SEARCHED = "read", "not_searched"
 PROPERTY, UNIT, WINDOW = "property", "unit", "window"  # what a record covers: a gathered property, one unit, a relevance window
 # why a record is not complete (``assess_coverage``); a unit that causes one carries ``blocks``
 B_NEWER, B_NO_MATCH, B_RANGE = "newer_not_searched", "newer_no_match", "range_not_searched"
 B_UNDATED, B_CANDIDATES, B_UNDETERMINED = "undated", "candidates", "undetermined"
 B_NOT_IDENTIFIED, B_WINDOW, B_SEVERAL = "not_identified", "window", "several_scopes"
+B_NOT_SEARCHED = "not_searched"
 
 
 @dataclass
@@ -1891,6 +1931,18 @@ class TimeCall:
     query: str
     record: dict | None = None
     sids: list[str] = field(default_factory=list)
+    # the link phrase of each gathered unit other than the focus, by (version id, unit number) — what the call's sources
+    # carry in their header (round 12 U12b); ``numbers`` the unit numbers the inventory holds per version
+    links: dict = field(default_factory=dict)
+    numbers: dict = field(default_factory=dict)
+
+    def link_of(self, version_id, unit_no: int | None) -> str | None:
+        """The link a hit in unit ``unit_no`` of a version carries; a version of one unit is that unit whatever number the
+        hit's date reading gives it (a DOCX has no units of its own)."""
+        known = self.numbers.get(str(version_id)) or []
+        if unit_no in known:
+            return self.links.get((str(version_id), unit_no))
+        return self.links.get((str(version_id), known[0])) if len(known) == 1 else None
 
 
 def unit_dating(ws: Workspace, conn: Connection, version_id, unit_no: int) -> tuple[tuple[str, str] | None, str]:
@@ -2025,23 +2077,27 @@ def assess_coverage(time: TimeMode, record: dict) -> dict:
     - **Explicit:** complete when every unit whose date can fall in or after the requested time (the first two classes of
       ``_inventory_key``) was searched.
     - **Undated units** (no stated date, or dates that disagree) always keep a record from being complete: their data
-      cannot be called the latest or placed in the range."""
+      cannot be called the latest or placed in the range.
+    - **Reads only** (round 12 U12b, ``read_coverage``): a unit the answer's sources were read from (``READ``) counts as
+      checked; a unit nothing searched or read (``NOT_SEARCHED``) keeps the record partial in both modes, whatever its date."""
     explicit = time.mode == "explicit" and time.requested is not None
     units = record["units"]
 
     def key_of(u: dict) -> tuple:
         return _inventory_key(time, None if u["date"] is None else (u["date"], u["precision"], None))
 
-    best = min((key_of(u) for u in units if u["status"] == HIT and not u["undated"]), default=None)
+    best = min((key_of(u) for u in units if u["status"] in (HIT, READ) and not u["undated"]), default=None)
     blocking: list[str] = []
     for u in units:
         reason = None
         if u["undated"]:
             reason = B_UNDATED
+        elif u["status"] == NOT_SEARCHED:  # the answer rests on reads: a unit nothing searched is a gap, whatever its age
+            reason = B_NOT_SEARCHED
         elif explicit:
             if u["status"] == NOT_SEARCHED_CAP and key_of(u)[0] in (0, 1):
                 reason = B_RANGE
-        elif u["status"] != HIT and (best is None or key_of(u) < best):
+        elif u["status"] not in (HIT, READ) and (best is None or key_of(u) < best):
             reason = B_NEWER if u["status"] == NOT_SEARCHED_CAP else B_NO_MATCH
         u["blocks"] = reason is not None
         if reason is not None:
@@ -2104,6 +2160,89 @@ def _register_call(ws: Workspace, call: TimeCall | None, sources: Iterable[Sourc
     ws.time_coverage = coverage_for(ws)
 
 
+def _cited_places(ws: Workspace, ids: Iterable[str]) -> list[tuple[str, list[int] | None]]:
+    """(version id, the numbers of the units) of the places the cited ids were read from (round 12 U12b): a cited passage's
+    own contexts, a value's or a measurement's unit; ``None`` for a place in no unit of a file of several (a version of one
+    unit is that unit). A listing and an id that names no document are no place."""
+    out: list[tuple[str, list[int] | None]] = []
+    for i in dict.fromkeys(ids):
+        if i in ws.values:
+            v = ws.values[i]
+            src = ws.sources.get(v.source_id)
+            nums = [v.context["number"]] if v.context else (list(src.contexts) if src is not None else [])
+            out.append((str(v.version_id), nums))
+        elif i in ws.measurements:
+            m = ws.measurements[i]
+            out.append((str(m.version_id), [m.context["number"]] if m.context else []))
+        elif i in ws.sources and not ws.sources[i].is_listing and ws.sources[i].version_id is not None:
+            out.append((str(ws.sources[i].version_id), list(ws.sources[i].contexts)))
+    return out
+
+
+def read_coverage(ws: Workspace, ids: Iterable[str]) -> dict | None:
+    """The coverage record of a timed turn that ran no time-ranked search (round 12 U12b, S3: the model answered from a
+    source it read, e.g. a source of the turn before), or None. The property is the conversation's focus, else the one the
+    cited documents name, else the one the question's address or parcel names (``unit_coverage`` and `tool_search` find it
+    the same ways); its inventory is the same snapshot a search would list, but nothing was searched: a unit whose source the
+    answer cites is ``READ``, every other unit ``NOT_SEARCHED``, so the record is partial (``B_NOT_SEARCHED``) unless every
+    unit was read, and the note says only the read sources were checked (KTD7, KTD8, R12). None for a turn with no time
+    mode (R14), for a turn that ran a time-ranked search (its calls' records stand), and for citations that are of no unit of
+    an identified property. Memoized per turn, the cited places and the office's data version."""
+    if ws.time.mode == "none" or ws.time_calls or ws.ctx is None:
+        return None
+    places = _cited_places(ws, ids)
+    if not places:
+        return None
+    with tenant_tx(ws.ctx) as conn:
+        key = ("read", tuple(sorted((v, tuple(n or ())) for v, n in places)), current_data_version(conn))
+        if key not in ws.property_memo:
+            ws.property_memo[key] = _read_coverage_uncached(ws, conn, places)
+        return ws.property_memo[key]
+
+
+def _read_coverage_uncached(ws: Workspace, conn: Connection, places: list[tuple[str, list[int] | None]]) -> dict | None:
+    for gathered, via in _answer_properties(ws, conn, places):
+        inventory = property_inventory(ws, conn, gathered)
+        by_version: dict[str, list[InventoryUnit]] = {}
+        for u in inventory:
+            by_version.setdefault(str(u.version_id), []).append(u)
+        read: set[tuple[str, int]] = set()
+        for version, numbers in places:
+            units = by_version.get(version, [])
+            read |= {u.key for u in units if (numbers and u.unit_no in numbers) or (not numbers and len(units) == 1)}
+        if not read:
+            continue
+        for u in inventory:
+            u.status = READ if u.key in read else NOT_SEARCHED
+        record = coverage_record(ws, conn, scope=PROPERTY, via=via, units=inventory, gathered=gathered)
+        record["read_only"] = True
+        return record
+    return None
+
+
+def _answer_properties(ws: Workspace, conn: Connection, places: list[tuple[str, list[int] | None]]):
+    """The gathered properties a reads-only answer may be about, most specific first, each with how it was identified
+    (``via``, as `coverage_record` says): the conversation's focus, the property the cited documents name, and the one the
+    question names."""
+    handle = (ws.unit_focus or {}).get("handle")
+    if handle:
+        try:
+            v, _, number = _unit_of(conn, ws, handle)
+        except ToolError:  # the focus unit's reading is no longer the current one
+            gathered = None
+        else:
+            gathered = property_gathered(ws, conn, v.version_id, number)
+        if gathered is not None and gathered.identified:
+            yield gathered, "focus"
+    cited = sorted({v for v, _ in places})
+    docs = [UUID(str(r.document_id)) for r in conn.execute(
+        text("SELECT DISTINCT document_id FROM document_versions WHERE id = ANY(CAST(:v AS uuid[]))"), {"v": cited})]
+    if (named := _named_gathered(ws, conn, docs)) is not None:
+        yield named, "documents"
+    if (asked := _question_gathered(ws, conn)) is not None:
+        yield asked, "question"
+
+
 def unit_coverage(ws: Workspace, conn: Connection, handle: str, found: bool, in_focus: bool) -> dict:
     """The record of a call that searched one unit only (the unit search stood): the property's inventory of one unit when
     the unit is the conversation's, is in the graph and states an identity (the property is appraised by no other unit, but
@@ -2163,10 +2302,29 @@ def _property_hits(ws: Workspace, conn: Connection, gathered: Gathered, query: s
             hits += found
     if call is not None:
         call.record = coverage_record(ws, conn, scope=PROPERTY, via=via, units=inventory, gathered=gathered)
+        for u in inventory:
+            call.numbers.setdefault(str(u.version_id), []).append(u.unit_no)
+            if u.link and not u.focus:
+                call.links[(str(u.version_id), u.unit_no)] = link_phrase(u.link)
     if not hits:
         return [], [], MSG_PROPERTY_NOTHING.format(count=len(selected), query=_txt(query))
     hits = sorted(hits, key=lambda h: -h["score"])
-    return ranked_by_time(ws, conn, hits, limit), [MSG_PROPERTY_SEARCHED], None
+    return ranked_by_time(ws, conn, hits, limit), [MSG_PROPERTY_SEARCHED, _units_line(ws, conn, inventory)], None
+
+
+def _units_line(ws: Workspace, conn: Connection, inventory: list[InventoryUnit]) -> str:
+    """The property line of a property-wide search (round 12 U12b, R3): the gathered units — the document's handle and title,
+    the unit's valuation date, and why the server gathered it (the focus: that it is the focus) — in the inventory's order,
+    so the model reads the link reasons with the hits and does not disown an appraisal at another house number."""
+    titles = _titles(conn, {u.document_id for u in inventory})
+    shown = []
+    for u in inventory[:PROPERTY_UNITS_SHOWN]:
+        when = shown_period(u.date[0], u.date[1], None) if u.date else MSG_DATE_UNKNOWN
+        why = MSG_LINK_FOCUS if u.focus else link_phrase(u.link) or ""
+        shown.append(f"{ws.doc_handle(u.document_id)} «{_txt(titles.get(str(u.document_id)) or u.title or '')}» ({when})"
+                     + (f" — {why}" if why else ""))
+    rest = len(inventory) - len(shown)
+    return MSG_PROPERTY_UNITS.format(count=len(inventory), units="; ".join(shown) + (f"; ועוד {rest}" if rest > 0 else ""))
 
 
 def _property_search(ws: Workspace, conn: Connection, handle: str, query: str, limit: int,
@@ -2413,7 +2571,10 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 row_index=h.get("row_index") if h["kind"] == "table_row" else None),
                 cx, _hit_contexts(ws, conn, cx, h, bs, be) if cx.multi else [], ws)
             src.label = _label_of(src, cx, h["pool"], h["role"], ws.intent)
-            src.date_line = valuation_line(valuation_of(ws, conn, h["version_id"], bs))
+            uv = valuation_of(ws, conn, h["version_id"], bs)
+            src.date_line = valuation_line(uv)
+            if call is not None:  # a hit of a gathered appraisal other than the focus says why it is the property's (U12b)
+                src.link = call.link_of(h["version_id"], uv.unit_no)
             out.append(ws.once(src, ("chunk", h["chunk_id"])))
             # the document as a whole: a datum not found may be in a part of it that was not read
             ws.touch(h["document_id"], h["title"], "retrieved", gaps.get(h["version_id"], whole).partial)
@@ -5031,6 +5192,18 @@ def _stamp_date(ws: Workspace, value: calc.Value, taken: dict, inputs: tuple, pa
     value.as_of = datum_as_of(ws, sentence, found)
 
 
+def _back_date_words(value: calc.Value) -> None:
+    """A scenario that is nothing but the value's own date as the server resolved it ("למועד הקובע 30/06/2025" for a value
+    whose ``as_of`` is that date) is no assertion of the model (round 12 U12b, S3; `verify._date_backed` for the number check):
+    the record states the date, so wherever the model wrote it, at the precision the record has, it is backed. The judge then
+    reads the scenario as the record's, not as "קביעת המודל, לא נמצא במקור", and the value is not left uncertain for it. A
+    different date, or any word of the model's own, stays the model's. Set after the value is cached: the cache keeps only what
+    the source attests."""
+    if (value.provenance.get("scenario") == "model_asserted" and value.scenario
+            and chat_dates.restates_as_of(value.scenario, value.as_of)):
+        value.provenance["scenario"] = "source"
+
+
 def _value_report(ws: Workspace, value: calc.Value, said: Attribution | None, note: str | None,
                   context: list[str] | None = None) -> str:
     """What ``take_value`` reports about the value it registered."""
@@ -5053,6 +5226,8 @@ def _value_report(ws: Workspace, value: calc.Value, said: Attribution | None, no
     if value.approx:
         lines.append("המקור כותב את הערך כמקורב.")
     lines.append(datum_line(value.as_of))
+    if (src := ws.sources.get(value.source_id)) is not None and src.link:  # the appraisal is the property's (U12b)
+        lines.append(src.link)
     lines.append("ודאות: " + ("כל התכונות שצוינו נמצאו במקור" if not asserted else
                               "נמוכה יותר — תכונות שהמודל קבע ולא נמצאו במקור: " + ", ".join(asserted)))
     if note:
@@ -5187,6 +5362,7 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
     if known is None and _cacheable(ws, value, src, reread):
         span = (min(r.block_index for r in region), max(r.block_index for r in region)) if region else None
         _store_verified(ws, value, _cache_doc(value, taken, path, ws.anchors.get(value.vid), src, span))
+    _back_date_words(value)
     return _value_report(ws, value, settled[3], note, _context_lines(ws, cx, value))
 
 
@@ -5417,6 +5593,7 @@ def _take_cached(ws: Workspace, handle: str, data: dict, loc: dict, given: dict,
     if stub:
         ws.anchors[value.vid] = dict(stub) | {"reading_id": value.reading_id} | (
             {"unit": src.unit} if src.unit else {})
+    _back_date_words(value)
     return _value_report(ws, value, settled[3], MSG_CACHED_TAKEN.format(handle=handle), _context_lines(ws, cx, value))
 
 

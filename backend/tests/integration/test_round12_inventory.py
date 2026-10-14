@@ -22,14 +22,16 @@ from tests.integration.test_property_scope import (
     DOCS12,
     FIXTURES,
     focused,
+    office12,  # noqa: F401 - the fixture of the round-12 relations (parcels, cities, apartments)
     order,
     unfocused,
     upload,
     version_of,
 )
-from tests.integration.test_tools_pools import run
+from tests.integration.test_tools_pools import run, sources_of
 from tests.support.unit_files import unit_file
 
+# ruff: noqa: F811 - the tests take the imported ``office12`` fixture by name
 pytestmark = pytest.mark.db
 
 ANCHOR = date(2026, 10, 14)
@@ -396,3 +398,46 @@ def test_merging_calls_counts_a_unit_as_searched_only_if_every_call_searched_it(
     assert [u["blocks"] for u in merged["units"]] == [True, False, False], "the second call never searched the newest unit"
     assert T.merge_coverage(RECENT, [one]) is one and T.merge_coverage(RECENT, []) is None
     assert one["units"][1]["status"] == T.HIT, "the merge does not change the calls' own records"
+
+
+# --- U12b (S2): the link reason reaches the model --------------------------------------------------------------------------
+
+def test_s2_every_source_of_a_linked_unit_carries_the_servers_link_and_the_search_lists_the_gathered_units_with_their_reasons(
+        office12):
+    """The property-wide search of the parcel-B appraisal (הדס 5) also returns the appraisal at another house number that shares
+    parcel 8401/40 (הדס 3). The model disowned it ("refers to הדס 3, not הדס 5") because the search said only that the search
+    covers the property's appraisals: every source of a gathered unit other than the focus now carries the link beside its date
+    line, and the search result's property line lists the gathered units with their reasons."""
+    ids = office12.ids
+    ws = focused(office12, RECENT, ids["parcels_b"])
+    out = run(ws, "search", query="שווי הנכס הדס", limit=6)
+    linked = [s for s in sources_of(out) if s.get("document_id") == ids["parcels_ab"]]
+    focus = [s for s in sources_of(out) if s.get("document_id") == ids["parcels_b"]]
+    assert linked and focus
+    want = T.MSG_LINK_SAME_PROPERTY.format(why=T.MSG_LINK_PARCEL.format(parcels="8401/40"))
+    assert all(s.get("link") == want and s.get("date") for s in linked), [(s.get("link"), s.get("date")) for s in linked]
+    assert not any("link" in s for s in focus), "the focus appraisal is the property itself: no link"
+    assert all(s.public()["link"] == want for s in ws.sources.values() if str(s.document_id) == ids["parcels_ab"])
+    # the property line: every gathered unit, its date and (but for the focus) its reason
+    line = next(x for x in out.split("\n\n") if x.startswith(T.MSG_PROPERTY_UNITS_HEAD))
+    assert want in line and line.count(want) == 1 and ws.doc_handle(ids["parcels_ab"]) in line and ws.doc_handle(ids["parcels_b"]) in line
+    assert "30/06/2023" in line and "30/06/2025" in line
+    assert T.MSG_PROPERTY_SEARCHED in out, "the round-11 sentence is kept"
+
+
+def test_s2_a_unit_gathered_by_address_and_city_says_so_and_a_search_that_gathers_nothing_adds_no_link(office12):
+    ids = office12.ids
+    assert T.link_phrase("address_city") == T.MSG_LINK_SAME_PROPERTY.format(why=T.MSG_LINK_ADDRESS)
+    assert T.link_phrase("parcel 8401/24, 8401/40") == T.MSG_LINK_SAME_PROPERTY.format(
+        why=T.MSG_LINK_PARCEL.format(parcels="8401/24, 8401/40"))
+    assert T.link_phrase(None) is None and T.link_phrase("") is None
+    ws = focused(office12, RECENT, ids["apartments_3"])
+    out = run(ws, "search", query="שווי הנכס הנרקיס", limit=6)  # the unit search stands: no gathered neighbour
+    assert not any("link" in s for s in sources_of(out)) and T.MSG_PROPERTY_UNITS_HEAD not in out
+
+
+def test_s2_the_off_mode_search_adds_no_link_and_no_unit_line(office12):
+    ids = office12.ids
+    ws = focused(office12, NONE, ids["parcels_b"])
+    out = run(ws, "search", query="שווי הנכס הדס", limit=6)
+    assert not any("link" in s for s in sources_of(out)) and T.MSG_PROPERTY_UNITS_HEAD not in out

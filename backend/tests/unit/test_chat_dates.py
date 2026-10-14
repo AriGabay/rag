@@ -559,6 +559,45 @@ def test_a_history_datum_with_its_own_date_is_dated_by_it_and_never_by_the_unit(
     assert (got["date"], got["provenance"]) == ("2019-12-31", "source") and got.get("date_origin") is None
 
 
+@pytest.mark.parametrize("sentence, iso", [
+    ("לתאריך הקובע 31.12.19 הוערך הנכס בשווי 1,800,000 ₪.", "2019-12-31"),
+    ("בשומה קודמת, לתאריך הקובע 31.12.21, הוערך הנכס ב-2,000,000 ₪.", "2021-12-31"),
+    # AE6: the prior appraisal's own sentence, the label's date in two digits (round 12 U12b, KTD11)
+    ("בהתאם לשומת מקרקעין מקיפה שנערכה ע\"י שמאי סינתטי, לתאריך הקובע 31.12.19, הוערך הנכס הנדון בשווי 2,000,000 ₪.",
+     "2019-12-31"),
+    # another (four-digit) date in the sentence is not the label's: the labelled two-digit date is the datum's
+    ("בשומה שנערכה ביום 05/03/2020, לתאריך הקובע 31.12.19, הוערך הנכס ב-1,800,000 ₪.", "2019-12-31"),
+])
+def test_ae6_a_history_datum_is_dated_by_the_labelled_two_digit_date_of_its_own_sentence(sentence, iso):
+    got = resolve(sentence, stance="unknown", unit_valuation=UV, section_path=HISTORY)
+    assert (got["date"], got["precision"], got["provenance"]) == (iso, "day", "source") and got.get("date_origin") is None, sentence
+    # the same outside a history section, and with a unit that states no date
+    assert resolve(sentence, stance="unknown", unit_valuation=None, section_path=("רקע",))["date"] == iso
+
+
+@pytest.mark.parametrize("sentence", [
+    "בעבר הוערך הנכס ב-5.3.24 בסך 1,800,000 ₪.",                          # an unlabelled two-digit date stays undated
+    "הנכס הוערך ב-5.3.24 בסך 1,800,000 ₪.",
+    "בשומה קודמת, לתאריך הקובע 31.12.75, הוערך הנכס ב-1,800,000 ₪.",        # 70-99 is refused
+    "בשומה קודמת, לתאריך הקובע 31.02.19, הוערך הנכס ב-1,800,000 ₪.",        # an impossible date
+    "בשומה קודמת, לתאריך הקובע 1.1.19-31.12.19, הוערך הנכס ב-1,800,000 ₪.",  # never a range
+    "בשומה קודמת, תאריך עריכת השומה 22.4.19, הוערך הנכס ב-1,800,000 ₪.",    # a report label dates nothing
+])
+def test_ae6_a_two_digit_date_that_no_valuation_label_anchors_dates_nothing(sentence):
+    got = resolve(sentence, stance="unknown", unit_valuation=UV, section_path=HISTORY)
+    assert got is not None and got["date"] is None and got["date_origin"] == "history", sentence
+
+
+def test_ae6_two_labelled_two_digit_dates_in_one_sentence_are_ambiguous_and_date_nothing():
+    sentence = "בשומה קודמת, לתאריך הקובע 31.12.19, ובשומה אחרת, לתאריך הקובע 31.12.21, הוערך הנכס."
+    assert resolve(sentence, stance="unknown", unit_valuation=UV, section_path=HISTORY) is None
+
+
+def test_ae6_an_unlabelled_two_digit_date_in_a_cell_is_still_undated():
+    assert resolve("שווי הנכס ב-15/04/24 הוא 2,000,000 ₪", unit_valuation=None) is None
+    assert resolve("5.3.24 | 2,000,000", unit_valuation=None) is None
+
+
 def test_a_history_datum_keeps_the_range_its_tables_caption_states():
     got = resolve("הוערך הנכס בשווי 2,300,000 ₪", table_caption="שומות קודמות 2019–2021", unit_valuation=UV,
                   section_path=HISTORY)
@@ -937,3 +976,32 @@ def test_c_the_bulleted_primary_date_settles_the_unit_and_a_passing_mention_stay
 
 def test_c_a_references_lead_behind_a_bullet_is_history():
     assert D.is_history(" סימוכין: שומה מס' 7 (מועד קובע 26.05.2021)", ()) is True
+
+
+# --- a text that only restates the datum's own resolved date (round 12 U12b, S3) -----------------------------------------
+
+UNIT_DAY = {"date": "2025-06-30", "precision": "day", "end": None, "provenance": "unit_valuation", "forecast": False,
+            "locator": "block 7"}
+
+
+@pytest.mark.parametrize("text", ["למועד הקובע 30/06/2025", "30/06/2025", "נכון ל-30.06.2025", "המועד הקובע: 30/06/2025",
+                                  "06/2025", "ליום 30/06/2025"])
+def test_a_text_that_is_the_resolved_date_alone_restates_it_at_any_precision_not_finer(text):
+    assert D.restates_as_of(text, UNIT_DAY) is True
+
+
+@pytest.mark.parametrize("text", ["למועד הקובע 30/06/2024",              # another date
+                                  "תרחיש אופטימי למועד הקובע 30/06/2025",  # a word of the writer's own
+                                  "שנת 2025 ו-2026",                       # a second date the record does not state
+                                  "למועד הקובע",                           # no date at all
+                                  ""])
+def test_a_text_with_another_date_or_words_of_its_own_restates_nothing(text):
+    assert D.restates_as_of(text, UNIT_DAY) is False
+
+
+def test_an_unknown_or_model_typed_date_backs_nothing():
+    assert D.restates_as_of("30/06/2025", None) is False
+    assert D.restates_as_of("30/06/2025", UNIT_DAY | {"date": None}) is False
+    assert D.restates_as_of("30/06/2025", UNIT_DAY | {"provenance": "model"}) is False
+    assert D.restates_as_of("06/2025", UNIT_DAY | {"date": "2025-06", "precision": "month"}) is True
+    assert D.restates_as_of("06/2025", UNIT_DAY | {"date": "2025", "precision": "year"}) is False, "finer than the record"
