@@ -56,7 +56,9 @@ Every removal is a structured decision, made where its check fires (round 7 U4: 
 ``unstated_number`` — absent from the source; ``computation_mismatch`` and ``framed_result`` — wrong calculation;
 ``misattribution`` — wrong property or party; ``context`` — a claim about the asked property that rests on another
 appraisal context of the same file (round 7 U6, KTD7, R21: ``_wrong_context``, only with
-``chat_appraisal_context_enforced``); ``vat`` and ``meaning`` — wrong unit; ``judge``, whose ``unsupported``
+``chat_appraisal_context_enforced``); ``recency_claim`` — a unit that calls a value the latest while the turn registered
+a later-dated comparable one (round 11 U9, R13, KTD8: a repairable partial problem, never a removal; see ``_recency_claim``);
+``vat`` and ``meaning`` — wrong unit; ``judge``, whose ``unsupported``
 verdict names a ``failure`` (defaulting from what the unit cites: a calculation, an uncertain reading, else absent
 from the source); ``dependency``), the component it gave (``N#``, from the judge's scores), the ids it was checked
 against and whether a repair round was asked to fix it. A check that did not finish — a judge call that failed
@@ -2720,6 +2722,7 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
     everything = _all_numbers(ws)
     stated_by: dict[str, set[str]] = {}  # the numbers each cited id states, read once for all units
     for u in units:
+        before = len(problems)
         unknown = _unknown_ids(u, ws)
         # a scenario's result nobody's number gave, for a detail only the user can give, is an unrequested assumption
         # even when it cites a calculation the calculator refused (KTD9): the repair asks rather than re-cites
@@ -2779,7 +2782,54 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
         if blocking:
             problems.append(Problem(u, "; ".join(m.reason for m in blocking), failure_kind="wrong_unit",
                                     check="meaning"))
+        # a unit nothing else failed is read for a false "latest" (it stays in the judge's hands: see ``RECENCY_CHECK``)
+        if len(problems) == before and (late := _recency_claim(u, ws)) is not None:
+            problems.append(late)
     return problems
+
+
+# --- a claim that a value is the latest (round 11 U9, R13, KTD8) ---------------------------------------------------------
+
+RECENCY_CHECK = "recency_claim"
+# the words that call a value the latest or the current one (singular: "בשנים האחרונות" is a period, not a value)
+_LATEST = re.compile(r"(?<![א-ת])(?:[וש]?ה)?(?:עדכני(?:ת|ים|ות)?|מעודכן|מעודכנת|אחרון|אחרונה|נוכחי|נוכחית"
+                     r"|חדש ביותר|חדשה ביותר)(?![א-ת])")
+# "the last year", "in the last month": a period of time, not the latest value
+_TIME_NOUNS = frozenset({"שנה", "שנים", "שנתיים", "חודש", "חודשים", "שבוע", "שבועות", "יום", "ימים", "רבעון", "רבעונים",
+                         "תקופה", "עשור", "עשורים", "עונה", "פעם"})
+MSG_NOT_LATEST = ("הטענה קוראת ל-{older} «העדכני», אבל בתור הזה נרשם ערך מאוחר יותר מאותו נתון של אותו נכס: {newer} "
+                  "(מועד {when}, {title}). הצג את {newer} כערך העדכני ואת {older} כערך קודם, עם תאריכיהם ומראי המקום "
+                  "של שניהם (אל תמחק ערך שנתמך), או השמט את הניסוח «העדכני» / «האחרון»")
+
+
+def _calls_latest(text: str) -> bool:
+    """Whether a unit's words call something the latest, apart from a period of time ("בשנה האחרונה")."""
+    for m in _LATEST.finditer(text):
+        before = re.findall(r"[א-ת]+", text[max(0, m.start() - 24):m.start()])
+        word = re.sub(r"^[בהלמוכש]{1,2}(?=[א-ת]{2,})", "", before[-1]) if before else ""
+        if before and (before[-1] in _TIME_NOUNS or word in _TIME_NOUNS):
+            continue
+        return True
+    return False
+
+
+def _recency_claim(u: Unit, ws: Workspace) -> Problem | None:
+    """A unit that calls a value the latest while the turn registered a later-dated value comparable to the one it cites
+    (``timeline.later_than``: the same property, metric family, unit, periodicity, area basis, VAT, scenario and stance; dated,
+    measured, not a forecast). The server cannot tell which value the unit means, so a unit that cites the group's latest
+    beside an older one passes. It is a repairable partial problem, never a removal: the number the unit states is supported;
+    only "the latest" is false. Whatever the mode of the turn (a false "latest" is wrong with the switch off too)."""
+    cited = [i for i in u.ids if i in ws.values or i in ws.measurements]
+    if not cited or not _calls_latest(u.text):
+        return None
+    from app.chat import timeline
+
+    found = timeline.later_than(ws, cited)
+    if not found:
+        return None
+    older, newer = found[0]
+    reason = MSG_NOT_LATEST.format(older=older.ref, newer=newer.ref, when=timeline.shown(newer.as_of), title=newer.title)
+    return Problem(u, reason, severity="partial", defect="recency", failure_kind="contradicts_source", check=RECENCY_CHECK)
 
 
 def _holds_more(u: Unit, numbers: list[str]) -> bool:
@@ -3647,7 +3697,8 @@ def _named_support(unit: Unit, named: list[str], ws: Workspace, question: str) -
     against their full text): the judge's naming of a support is accepted only if the unit, cited so, passes them.
     None when it does; otherwise the problem, on the unit itself."""
     cited = dataclasses.replace(unit, ids=[*unit.ids, *named])
-    failed = deterministic([cited], ws, question, {unit.index: meaning.check(cited, ws)})
+    failed = [p for p in deterministic([cited], ws, question, {unit.index: meaning.check(cited, ws)})
+              if p.check != RECENCY_CHECK]
     if not failed:
         return None
     return Problem(unit, f"לא נתמך במקורות: הטענה אינה מצטטת מקור, ולפי {', '.join(named)}: {failed[0].reason}",
@@ -3959,7 +4010,8 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         report.problems = [p for p in report.problems if p.unit.index not in soft]
         for p in soft.values():
             p.unit.unstated = _written_forms(p.unit.text, set(p.unstated)) or list(p.unstated)
-    failed = {p.unit.index for p in report.problems}
+    # a recency claim does not keep its unit from the judge: the number it states is supported, only "the latest" is not
+    failed = {p.unit.index for p in report.problems if p.check != RECENCY_CHECK}
     # a missing qualifier does not keep the unit from the judge: it is annotated only if the unit is supported
     for u in units:
         if u.index in failed:

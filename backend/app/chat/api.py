@@ -60,7 +60,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
 from app.audit import audit
-from app.chat import anchors, coverage, decisions, engine, slots, verify
+from app.chat import anchors, coverage, decisions, engine, slots, timeline, verify
 from app.chat.compose import SERVER_SPANS_FIELD, strip_server_spans, text_digest
 from app.config import get_settings
 from app.db import TenantContext, current_data_version, tenant_tx
@@ -863,6 +863,11 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
                 used.add(i)
                 if i in ws.computations:
                     todo.append(i)
+    # the timeline (round 11 U9, KTD8): every comparable group holding a value the answer rests on, filled from all the
+    # values the turn registered. Its rows open their sources like a citation does, so the uncited ones join the records
+    # (and the documents) the payload carries
+    answer_time = timeline.payload(ws, {i for i in used if i in ws.values or i in ws.measurements})
+    used |= timeline.row_ids(answer_time["timeline"])
     measurements = [ws.measurements[i].public() for i in ws.measurements if i in used]
     computations = [ws.computations[i].public() for i in ws.computations if i in used]
     values = [ws.values[i].public() for i in ws.values if i in used]
@@ -926,6 +931,9 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
         # "question", "found": [{"id", "label", "value_text", "source_id"}]} — bound to the user's reply next turn
         "pending": pending,
         "sources": sources, "measurements": measurements, "computations": computations, "values": values,
+        # round 11 U9: the time the answer was produced under and its timeline, with a plain-text copy for the copy button
+        # (not in ``markdown``: the block is on screen once)
+        "time": answer_time,
         "assumptions": assumptions, "documents": [{"document_id": k, "title": v} for k, v in docs.items()],
         # counts and the rows that link to the log; what was removed and why is diagnostics (``_diagnostics``). The
         # digest is the one the final check returned for the text it verified, which is the saved one (R17)
