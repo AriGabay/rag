@@ -461,6 +461,9 @@ class TurnInput:
     # what the server decided about the slots before the turn (a property slot dropped because a document is no longer
     # visible), for the resolution's decisions
     slot_notes: dict[str, str] = field(default_factory=dict)
+    # the time preference the user's message was recorded with (round 11 U5, KTD1): {"version", "prefer_recent",
+    # "anchor_date"}; a message from before round 11 arrives as the switch off. None: a caller that gives none (tests)
+    time_preference: dict | None = None
 
 
 @dataclass

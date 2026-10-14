@@ -53,6 +53,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import NamedTuple
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -117,6 +118,28 @@ def scope_hash(ctx: TenantContext) -> str:
 class ConversationPatch(BaseModel):
     title: str | None = Field(default=None, max_length=120)
     archived: bool | None = None
+    # the conversation's current recency switch (round 11 U5, KTD1): accepted on an archived conversation and while a turn
+    # runs, since a message keeps the state it was recorded with and a toggle never changes an old answer
+    prefer_recent: bool | None = None
+
+
+# the calendar the anchor date of a relative period ("last year") is read in: the office's, not the server's (KTD1)
+JERUSALEM = ZoneInfo("Asia/Jerusalem")
+TIME_PREFERENCE_VERSION = 1
+
+
+def _time_state(prefer_recent: bool, anchor: str | None = None) -> dict:
+    """The time preference recorded on a user message and copied to its answer (round 11 U5, KTD1)."""
+    return {"version": TIME_PREFERENCE_VERSION, "prefer_recent": bool(prefer_recent),
+            "anchor_date": anchor or datetime.now(JERUSALEM).date().isoformat()}
+
+
+def _recorded_state(recorded: dict | None, created_at: datetime) -> dict:
+    """The state a user message was produced with. A message from before round 11 has none: it reads as the switch off,
+    anchored on the day it was written, in Jerusalem (R14). The row itself is never rewritten."""
+    if recorded:
+        return recorded
+    return _time_state(False, created_at.astimezone(JERUSALEM).date().isoformat())
 
 
 def _conversation(conn: Connection, ctx: TenantContext, cid: str | UUID):
@@ -131,7 +154,7 @@ def _conversation(conn: Connection, ctx: TenantContext, cid: str | UUID):
 def _conv_json(r) -> dict:
     return {"id": str(r.id), "title": r.title or NEW_TITLE, "updated_at": r.updated_at.isoformat(),
             "created_at": r.created_at.isoformat(), "archived": r.archived_at is not None,
-            "engine": getattr(r, "engine", "rag")}
+            "engine": getattr(r, "engine", "rag"), "prefer_recent": bool(r.prefer_recent)}
 
 
 @router.get("/conversations")
@@ -181,6 +204,9 @@ def patch_conversation(conversation_id: str, body: ConversationPatch, ctx: Tenan
         if body.archived is not None:
             conn.execute(text("UPDATE conversations SET archived_at = CASE WHEN :a THEN now() ELSE NULL END"
                               " WHERE id = :c"), {"a": body.archived, "c": conv.id})
+        if body.prefer_recent is not None:
+            conn.execute(text("UPDATE conversations SET prefer_recent = :p WHERE id = :c"),
+                         {"p": body.prefer_recent, "c": conv.id})
         row = conn.execute(text("SELECT * FROM conversations WHERE id = :c"), {"c": conv.id}).one()
     return _conv_json(row)
 
@@ -200,6 +226,8 @@ def delete_conversation(conversation_id: str, ctx: TenantContext = Depends(get_c
 class SendBody(BaseModel):
     content: str = Field(min_length=1, max_length=4000)
     client_id: str | None = None
+    # absent: the conversation's value; present: recorded on this message and saved on the conversation (round 11 U5)
+    prefer_recent: bool | None = None
 
 
 def _stale_after() -> int:
@@ -228,6 +256,8 @@ def _message_json(r, dv: int | None = None, sh: str | None = None, visible: set 
             "progress": r.progress or [], "answer": answer, "reply_to": str(r.reply_to) if r.reply_to else None,
             "client_id": str(r.client_id) if r.client_id else None, "created_at": r.created_at.isoformat(),
             "stale": stale, "cancel_requested": r.cancel_requested,
+            # the time preference the message was produced with (both roles); None: a message from before round 11
+            "time_preference": r.time_preference,
             # token counts per model call (no content): the cost and latency of the turn
             "usage": [{k: u.get(k) for k in USAGE_FIELDS} for u in (getattr(r, "usage", None) or [])]}
 
@@ -425,26 +455,35 @@ def send_message(conversation_id: str, body: SendBody, ctx: TenantContext = Depe
                             {"c": conv.id, "s": _stale_after()}).first()
         if busy is not None:
             raise HTTPException(status.HTTP_409_CONFLICT, "התשובה הקודמת עדיין בעיבוד. אפשר לעצור אותה או להמתין.")
+        # the state this message is produced with: the body's value, else the conversation's (KTD1)
+        prefer_recent = conv.prefer_recent if body.prefer_recent is None else body.prefer_recent
+        time_state = _time_state(prefer_recent)
         user = conn.execute(text(
-            "INSERT INTO messages (office_id, conversation_id, user_id, role, content, status, client_id, created_at)"
-            " VALUES (app_office(), :c, :u, 'user', :t, 'done', :k, clock_timestamp()) RETURNING *, 0 AS age"),
-            {"c": conv.id, "u": ctx.user_id, "t": content, "k": client_id}).one()
-        assistant = _new_assistant(conn, ctx, conv.id, user.id)
+            "INSERT INTO messages (office_id, conversation_id, user_id, role, content, status, client_id, created_at,"
+            " time_preference) VALUES (app_office(), :c, :u, 'user', :t, 'done', :k, clock_timestamp(),"
+            " CAST(:tp AS jsonb)) RETURNING *, 0 AS age"),
+            {"c": conv.id, "u": ctx.user_id, "t": content, "k": client_id,
+             "tp": json.dumps(time_state)}).one()
+        assistant = _new_assistant(conn, ctx, conv.id, user.id, time_state)
         if conv.title in (None, NEW_TITLE):
             conn.execute(text("UPDATE conversations SET title = :t WHERE id = :c"),
                          {"t": " ".join(content.split())[:80], "c": conv.id})
-        conn.execute(text("UPDATE conversations SET updated_at = now(), engine = 'rag' WHERE id = :c"), {"c": conv.id})
+        conn.execute(text("UPDATE conversations SET updated_at = now(), engine = 'rag', prefer_recent = :p WHERE id = :c"),
+                     {"c": conv.id, "p": prefer_recent})
     _start(ctx, conv.id, assistant.id, user.id)
     return {"user": _message_json(user), "assistant": _message_json(assistant)}
 
 
-def _new_assistant(conn: Connection, ctx: TenantContext, conversation_id: UUID, user_message_id: UUID):
+def _new_assistant(conn: Connection, ctx: TenantContext, conversation_id: UUID, user_message_id: UUID,
+                   time_state: dict):
+    """The running answer row. It carries a copy of its user message's time preference, for display (KTD1)."""
     return conn.execute(text(
-        "INSERT INTO messages (office_id, conversation_id, user_id, role, status, reply_to, progress, created_at)"
-        " VALUES (app_office(), :c, :u, 'assistant', 'running', :r, CAST(:p AS jsonb), clock_timestamp())"
-        " RETURNING *, 0 AS age"),
+        "INSERT INTO messages (office_id, conversation_id, user_id, role, status, reply_to, progress, created_at,"
+        " time_preference) VALUES (app_office(), :c, :u, 'assistant', 'running', :r, CAST(:p AS jsonb),"
+        " clock_timestamp(), CAST(:tp AS jsonb)) RETURNING *, 0 AS age"),
         {"c": conversation_id, "u": ctx.user_id, "r": user_message_id,
-         "p": json.dumps([{"step": "queued", "label": "ממתין לעיבוד"}], ensure_ascii=False)}).one()
+         "p": json.dumps([{"step": "queued", "label": "ממתין לעיבוד"}], ensure_ascii=False),
+         "tp": json.dumps(time_state)}).one()
 
 
 @router.post("/messages/{message_id}/cancel")
@@ -473,8 +512,12 @@ def retry_message(message_id: str, ctx: TenantContext = Depends(get_ctx)) -> dic
                              {"c": r.conversation_id, "t": r.created_at}).first()
         if later is not None:
             raise HTTPException(status.HTTP_409_CONFLICT, "אפשר ליצור מחדש רק את התשובה האחרונה בשיחה")
+        # the user row is the durable home of the state (KTD1): the retry runs with what the message was sent with, never
+        # the conversation's current switch; a message from before round 11 retries with the switch off (R14)
+        asked = conn.execute(text("SELECT time_preference, created_at FROM messages WHERE id = :m"), {"m": r.reply_to}).one()
         conn.execute(text("DELETE FROM messages WHERE id = :m"), {"m": r.id})
-        assistant = _new_assistant(conn, ctx, r.conversation_id, r.reply_to)
+        assistant = _new_assistant(conn, ctx, r.conversation_id, r.reply_to,
+                                   _recorded_state(asked.time_preference, asked.created_at))
         conn.execute(text("UPDATE conversations SET updated_at = now() WHERE id = :c"), {"c": r.conversation_id})
     _start(ctx, r.conversation_id, assistant.id, r.reply_to)
     return _message_json(assistant)
@@ -602,7 +645,8 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
         # rebuilt after the turn from what the user may see now; the old text is never used again
         conn.execute(text("UPDATE conversations SET summary_meta = COALESCE(summary_meta, '{}'::jsonb)"
                           " || '{\"invalid\": true}'::jsonb WHERE id = :c"), {"c": conversation_id})
-    user = conn.execute(text("SELECT content, created_at FROM messages WHERE id = :m"), {"m": user_message_id}).one()
+    user = conn.execute(text("SELECT content, created_at, time_preference FROM messages WHERE id = :m"),
+                        {"m": user_message_id}).one()
     rows = conn.execute(text(
         "SELECT id, role, content, answer, status FROM messages WHERE conversation_id = :c AND created_at < :t"
         " AND status = 'done' ORDER BY created_at DESC, id DESC LIMIT :n"),
@@ -668,7 +712,9 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
     return engine.TurnInput(question=user.content, history=history, summary=summary, focus=slots.join_focus(context),
                             focus_documents=[{"document_id": k, "title": v} for k, v in list(focus.items())[-8:]],
                             prior_refs=prior, candidates=candidates, clarified_documents=clarified,
-                            pending=pending, slots=context, listing=listing, slot_notes=notes), \
+                            pending=pending, slots=context, listing=listing, slot_notes=notes,
+                            # the state recorded on the user row, never the conversation's current switch (R14, KTD1)
+                            time_preference=_recorded_state(user.time_preference, user.created_at)), \
         _user_message_ids(rows, user_message_id)
 
 
