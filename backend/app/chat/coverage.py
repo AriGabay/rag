@@ -42,10 +42,12 @@ table, first match wins (``reason_of``):
 6. a calculation whose inputs were found and never computed — calculation not completed (also a calculation component
    the judge scored full whose surviving units show no computation of the turn: it is partial, KTD3);
 7. a value found with an uncertain reading or meaning — found, not verifiable;
-8. values for the same property, kind, unit, period, basis, scenario, status and date that differ — sources conflict (in
-   a file holding several appraisals, with ``chat_appraisal_context_enforced``, the property is the value's appraisal
-   context: two appraisals' values never conflict — round 7 U6, KTD7; values of different known dates are a history,
-   never a conflict — round 11 U9, R10);
+8. values for the same property, kind, unit, period, basis, scenario and status that differ — sources conflict when their
+   periods overlap or one has no date (``conflicting_pairs``, round 12 U11, R18, KTD13: a datum undated only because it is
+   history or a comparable conflicts with nothing, and values of different non-overlapping dates are a history). The
+   property is the turn's property group (round 12 U6, KTD5); in a file holding several appraisals, with
+   ``chat_appraisal_context_enforced``, a value of no group has its appraisal context for property: two appraisals'
+   values never conflict — round 7 U6, KTD7;
 9. the judge's "undeterminable" (an evidence state, not a status) — found, not verifiable (or sources conflict, 8);
 10. data found that the verified answer does not present — found, not verifiable;
 10a. a professional question whose pool was empty — the office holds no standard or professional document (round 10 U8,
@@ -78,13 +80,15 @@ list marker and no repeated line is left by the removals and additions (R22).
 from __future__ import annotations
 
 import re
-from collections.abc import Collection
-from typing import TYPE_CHECKING
+from collections.abc import Collection, Hashable, Sequence
+from datetime import date
+from typing import TYPE_CHECKING, NamedTuple
 
 from app.chat import contexts
 from app.chat.compose import line_cut
+from app.chat.dates import COMPARABLE_ORIGIN, HISTORY_ORIGIN
 from app.chat.intent import PROFESSIONAL
-from app.chat.tools import READ_TO_END, STEP_LIMIT, TIME_LIMIT, TOOL_BUDGET, value_uncertain
+from app.chat.tools import READ_TO_END, STEP_LIMIT, TIME_LIMIT, TOOL_BUDGET, bounds, dated, value_uncertain
 from app.db import tenant_tx
 
 if TYPE_CHECKING:
@@ -219,44 +223,93 @@ def _norm_label(label: str) -> str:
     return " ".join(re.sub(r"[*_`]+", " ", label or "").split()).strip(" :.").casefold()
 
 
+class Comparable(NamedTuple):
+    """One datum as the conflict rule reads it: ``key`` (everything that must be equal for two data to be the same datum —
+    property group, family, unit, period, basis, scenario, stance class), its ``amount`` and its ``as_of``."""
+
+    key: Hashable
+    amount: object
+    as_of: dict | None
+
+
+def _span(as_of: dict | None) -> tuple[date, date] | None:
+    """The first and the last day of a datum's period (a range: up to the last day of its end); None when it has no date."""
+    when = dated(as_of)
+    if when is None:
+        return None
+    iso, precision, end = when
+    return bounds(iso, precision)[0], bounds(end or iso, precision)[1]
+
+
+def _withheld(as_of: dict | None) -> bool:
+    """Undated only because it is history or a comparable (round 12 U4, KTD12): such a datum conflicts with nothing."""
+    return bool(as_of) and not as_of.get("date") and as_of.get("date_origin") in (HISTORY_ORIGIN, COMPARABLE_ORIGIN)
+
+
+def conflicting_pairs(items: Sequence[Comparable]) -> list[tuple[int, int]]:
+    """The pairs (indexes into ``items``, ``i < j``) that conflict: the one conflict rule of the answer and its timeline
+    (round 12 U11, R18, KTD13; ``conflicting`` and ``timeline.build`` both read it, nothing else decides a conflict).
+
+    Two data of one ``key`` with different amounts conflict when their periods overlap (a year and a day inside it overlap;
+    a range runs to its end) or when either has no date, unless the one without a date is undated only because it is history
+    or a comparable (``date_origin``). Two dated data whose periods do not overlap are a history, not a conflict. Each pair
+    is decided on its own: a third value that differs from only one of them conflicts with that one only."""
+    by_key: dict[Hashable, list[int]] = {}
+    for i, item in enumerate(items):
+        by_key.setdefault(item.key, []).append(i)
+    pairs = []
+    for members in by_key.values():
+        for n, i in enumerate(members):
+            for j in members[n + 1:]:
+                a, b = items[i], items[j]
+                if a.amount == b.amount or _withheld(a.as_of) or _withheld(b.as_of):
+                    continue
+                first, second = _span(a.as_of), _span(b.as_of)
+                if first is None or second is None or (first[0] <= second[1] and second[0] <= first[1]):
+                    pairs.append((i, j))
+    return sorted(pairs)
+
+
 def conflicting(ws: Workspace, document_ids: list[str] | None = None, ids: Collection[str] | None = None) -> bool:
     """Whether values the turn registered (V#) or measurements it listed (M#) give one datum different amounts: the
-    same kind (by family), unit, period, area basis, named subject (the property), scenario and stance (status) **and
-    date**, and different numbers (R8: a conflict only after that check — two properties, two scenarios or a party's claim
-    and the decision are not one datum). Values with different known dates are a history, not a conflict (round 11 U9,
-    R10, KTD9: the date is the one the timeline reads, ``timeline.date_key``); a value with no known date is compared with
-    the other undated ones as before. Only documents in ``document_ids``, and only the ids in ``ids``, when given.
+    same kind (by family), unit, period, area basis, property, scenario and stance (status), and different numbers
+    whose periods overlap or one of which has no date (``conflicting_pairs``, round 12 U11, R18, KTD13: R8 — a conflict
+    only after that check; two properties, two scenarios or a party's claim and the decision are not one datum, and a
+    datum undated only because it is history or a comparable conflicts with nothing). Only documents in ``document_ids``,
+    and only the ids in ``ids``, when given.
 
-    In a file holding several appraisals, when the context checks are enforced (round 7 U6, KTD7), the property is the
-    value's appraisal context, never the subject's words: two appraisals' values are two properties' however the model
-    named their subject."""
+    The property is the value's group in the turn's property graph (``timeline.property_key``: appraisals of one property
+    in different documents are one property, whatever words the model gave the subject). A value the graph holds in no group
+    — and a turn with no graph — falls back to the old reading: in a file holding several appraisals, when the context checks
+    are enforced (round 7 U6, KTD7), its appraisal context, never the subject's words; else the subject's words."""
     from app.answering.verify import numbers_in
     from app.chat.contexts import enforced
     from app.chat.resolve import family
-    from app.chat.timeline import date_key, stance_class
+    from app.chat.timeline import property_key, stance_class
 
     by_context = enforced()
-    seen: dict[tuple, set] = {}
 
     def kept(i: str, doc: str) -> bool:
         return not ((document_ids and doc not in document_ids) or (ids is not None and i not in ids))
 
     entries = [(v.kind, v.unit, v.period, v.area_basis, v.subject, v.scenario, v.stance, str(v.value),
-                (v.context or {}).get("key"), date_key(getattr(v, "as_of", None)))
+                (v.context or {}).get("key"), getattr(v, "as_of", None),
+                property_key(ws, i, v.document_id, getattr(v, "version_id", None), v.context))
                for i, v in ws.values.items() if kept(i, str(v.document_id))]
     entries += [(m.row.metric_kind, m.row.unit, m.row.period, m.row.area_basis, m.row.subject,
                  getattr(m.row, "scenario", "") or "", getattr(m.row, "stance", "") or "",
                  frozenset(numbers_in(m.row.value_text or "")), (m.context or {}).get("key"),
-                 date_key(getattr(m, "as_of", None)))
+                 getattr(m, "as_of", None), property_key(ws, i, m.document_id, getattr(m, "version_id", None), m.context))
                 for i, m in ws.measurements.items() if kept(i, str(m.document_id))]
-    for kind, unit, period, basis, subject, scenario, stance, amount, context, dated in entries:
+    items = []
+    for kind, unit, period, basis, subject, scenario, stance, amount, context, as_of, group in entries:
         if not (subject or "").strip() or kind in (None, "unknown", "other"):
             continue  # a datum of no named subject cannot be said to conflict with another
-        prop = ("context", context) if by_context and context else _norm_label(subject)
-        key = (family(kind), unit, period, _norm_label(basis or ""), prop, _norm_label(scenario),
-               stance_class(stance), dated)
-        seen.setdefault(key, set()).add(amount)
-    return any(len(amounts) > 1 for amounts in seen.values())
+        prop = (("group", group) if group else ("context", context) if by_context and context
+                else _norm_label(subject))
+        items.append(Comparable((family(kind), unit, period, _norm_label(basis or ""), prop, _norm_label(scenario),
+                                 stance_class(stance)), amount, as_of))
+    return bool(conflicting_pairs(items))
 
 
 def validate_requested(ws: Workspace, requested, opened: dict[str, tuple[str, dict]] | None = None) -> list[dict]:

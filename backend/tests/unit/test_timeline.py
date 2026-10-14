@@ -301,11 +301,13 @@ def test_measurements_join_the_group_of_a_cited_value():
 
 # --- the order and the marks (R4, R7, R10, R11, KTD6) -----------------------------------------------------------------------
 
-def test_a_single_dated_value_gives_no_block_and_two_values_with_one_dated_give_none():
+def test_a_single_dated_value_gives_no_block_and_two_values_with_one_dated_give_none_unless_they_conflict():
+    """Round 12 U11 (R18): the undated second value is history here, so it conflicts with nothing and no block is built; an
+    undated value with no such origin and another amount is a conflict and does build one (``test_ae7_*``)."""
     o = Office()
     a = o.value(o.doc(), "2,000,000", as_of("2024-01-01"))
     assert o.blocks({a}) == []
-    o.value(o.doc(), "2,100,000", None)
+    o.value(o.doc(), "2,100,000", withheld("history"))
     assert o.blocks({a}) == []
 
 
@@ -313,7 +315,7 @@ def test_undated_values_follow_the_dated_ones_with_the_unknown_date_mark():
     o = Office()
     a = o.value(o.doc(), "2,000,000", as_of("2024-01-01"))
     b = o.value(o.doc(), "2,100,000", as_of("2025-01-01"))
-    u = o.value(o.doc(), "2,050,000", None)
+    u = o.value(o.doc(), "2,050,000", withheld("comparable"))  # round 12 U11: an unmarked undated value would conflict
     (g,) = o.blocks({a})
     assert [r["sid"] for r in g["rows"]] == [b, a, u]
     assert g["rows"][2]["date"] is None and g["rows"][2]["marks"] == ["unknown_date"] and g["rows"][2]["date_kind"] is None
@@ -337,7 +339,7 @@ def test_a_forecast_with_no_date_is_marked_forecast_and_unknown_and_listed_last(
     o = Office()
     a = o.value(o.doc(), "2,000,000", as_of("2024-01-01"))
     o.value(o.doc(), "2,100,000", as_of("2025-01-01"))
-    f = o.value(o.doc(), "3,000,000", as_of(None, forecast=True))
+    f = o.value(o.doc(), "3,000,000", withheld("comparable", forecast=True))  # round 12 U11: undated, but no conflict
     (g,) = o.blocks({a})
     assert g["rows"][-1]["sid"] == f and set(g["rows"][-1]["marks"]) == {"forecast", "unknown_date"}
 
@@ -365,7 +367,7 @@ def test_outside_requested_is_only_for_an_explicit_mode_and_an_undated_row_is_no
     o = Office(EXPLICIT_2022)
     a = o.value(o.doc(), "2,000,000", as_of("2022-05-01"))
     o.value(o.doc(), "2,100,000", as_of("2025-01-01"))
-    u = o.value(o.doc(), "2,050,000", None)
+    u = o.value(o.doc(), "2,050,000", withheld("history"))  # round 12 U11: an unmarked undated value would conflict
     (g,) = o.blocks({a})
     unknown = next(r for r in g["rows"] if r["sid"] == u)
     assert unknown["marks"] == ["unknown_date"]
@@ -526,3 +528,125 @@ def test_u6_values_of_gathered_units_share_one_group_and_values_of_candidates_ne
     assert o.ws.values[ref["c"]].document_id != o.ws.values[ref["e"]].document_id
     keys = {k: who(timeline.datums(o.ws)[i]).key for i, k in enumerate(ref)}
     assert keys["a"] == keys["b"] and len({keys["a"], keys["c"], keys["e"]}) == 3
+
+
+# --- pairwise conflicts (round 12 U11: R18, AE7; KTD13) ---------------------------------------------------------------------------
+
+def withheld(origin: str, forecast: bool = False) -> dict:
+    """The ``as_of`` of a datum undated only because it is history or a comparable (round 12 U4, KTD12)."""
+    return {"date": None, "precision": None, "end": None, "provenance": None, "forecast": forecast, "locator": None,
+            "date_origin": origin}
+
+
+def marks_of(g: dict) -> dict[str, list[str]]:
+    return {r["sid"]: r["marks"] for r in g["rows"]}
+
+
+def test_ae7_a_dated_and_an_undated_value_of_one_property_conflict_and_both_rows_carry_the_mark():
+    o = Office()
+    v1 = o.value(o.doc(), "2,450,000", as_of("2025-03-31"))
+    v2 = o.value(o.doc(), "2,300,000", None)
+    assert coverage.conflicting(o.ws)
+    (g,) = o.blocks({v1})  # one dated row only: the block exists so that the mark is visible
+    assert marks_of(g) == {v1: ["conflict"], v2: ["conflict", "unknown_date"]}
+    assert timeline.MARKS["conflict"] in timeline.plain_text([g])
+
+
+def test_ae7_an_undated_value_of_history_is_no_conflict():
+    o = Office()
+    v1 = o.value(o.doc(), "2,450,000", as_of("2025-03-31"))
+    o.value(o.doc(), "2,300,000", withheld("history"))
+    assert not coverage.conflicting(o.ws)
+    assert o.blocks({v1}) == []  # one dated value and no conflict: no timeline
+
+
+def test_an_undated_comparable_is_no_conflict_either():
+    o = Office()
+    v1 = o.value(o.doc(), "2,450,000", as_of("2025-03-31"))
+    o.value(o.doc(), "2,300,000", withheld("comparable"))
+    assert not coverage.conflicting(o.ws)
+    assert o.blocks({v1}) == []
+
+
+def test_two_dated_values_without_overlap_are_a_history_not_a_conflict():
+    o = Office()
+    a = o.value(o.doc(), "100", as_of("2023-06-01"))
+    b = o.value(o.doc(), "120", as_of("2024-06-01"))
+    assert not coverage.conflicting(o.ws)
+    (g,) = o.blocks({a})
+    assert marks_of(g) == {a: [], b: []}
+
+
+def test_a_year_and_a_day_inside_it_overlap_so_different_amounts_conflict():
+    o = Office()
+    a = o.value(o.doc(), "100", as_of("2023", "year", provenance="source"))
+    b = o.value(o.doc(), "120", as_of("2023-12-31"))
+    assert coverage.conflicting(o.ws)
+    (g,) = o.blocks({a})
+    assert marks_of(g) == {a: ["conflict"], b: ["conflict"]}
+
+
+def test_a_conflict_is_between_the_pair_not_the_group_an_undated_value_conflicts_with_the_amount_it_differs_from():
+    o = Office()
+    a = o.value(o.doc(), "100", as_of("2023-06-01"))
+    b = o.value(o.doc(), "120", as_of("2024-06-01"))
+    c = o.value(o.doc(), "100", None)
+    assert coverage.conflicting(o.ws)
+    (g,) = o.blocks({a})
+    assert marks_of(g) == {a: [], b: ["conflict"], c: ["conflict", "unknown_date"]}
+
+
+def test_values_of_different_gathered_properties_never_conflict_even_when_undated_or_overlapping():
+    o = Office()
+    a = o.value(o.doc("group:הצאלון 7"), "100", as_of("2025-03-31"))
+    b = o.value(o.doc("group:האלון 3"), "120", as_of("2025-03-31"))
+    o.value(o.doc("group:האלון 3"), "130", None)
+    assert [len(g) for g in timeline.groups(o.ws, {a, b})] == [1, 2]
+    assert not coverage.conflicting(o.ws, ids={a, b})
+    assert o.blocks({a}) == []
+
+
+def test_values_of_one_gathered_property_in_different_documents_conflict_whatever_subject_the_model_gave_them():
+    o = Office()
+    a = o.value(o.doc(), "100", as_of("2025-03-31"))
+    b = o.value(o.doc(), "120", as_of("2025-03-31"))
+    o.ws.values[b].subject = "הנכס הנדון"  # another wording of the same property: the graph decides, not the words
+    assert coverage.conflicting(o.ws)
+    (g,) = o.blocks({a})
+    assert marks_of(g) == {a: ["conflict"], b: ["conflict"]}
+
+
+def test_two_undated_values_with_different_amounts_still_conflict_and_make_a_block():
+    o = Office()
+    a = o.value(o.doc(), "100", None)
+    b = o.value(o.doc(), "120", None)
+    assert coverage.conflicting(o.ws)
+    (g,) = o.blocks({a})
+    assert marks_of(g) == {a: ["conflict", "unknown_date"], b: ["conflict", "unknown_date"]}
+
+
+def test_an_undated_history_value_and_an_undated_unmarked_one_do_not_conflict():
+    o = Office()
+    a = o.value(o.doc(), "100", withheld("history"))
+    o.value(o.doc(), "120", None)
+    assert not coverage.conflicting(o.ws)
+    assert o.blocks({a}) == []
+
+
+def test_validate_requested_keeps_sources_conflict_exactly_when_the_timeline_shows_a_conflict_mark():
+    def claimed(o: Office, cited: str) -> tuple[str, bool]:
+        docs = [str(d) for d in o.property]
+        for d in docs:
+            o.ws.activity[d] = {"title": "שומה סינתטית", "partial": False}
+        req = SimpleNamespace(document_ids=docs, status="sources_conflict", component="N1", label="שווי",
+                              checked_where=None)
+        (out,) = coverage.validate_requested(o.ws, [req])
+        marked = any("conflict" in r["marks"] for g in o.blocks({cited}) for r in g["rows"])
+        return out["status"], marked
+
+    for second, expected in ((None, True), (as_of("2024-03-31"), False), (withheld("history"), False)):
+        o = Office()
+        v1 = o.value(o.doc(), "2,450,000", as_of("2025-03-31"))
+        o.value(o.doc(), "2,300,000", second)
+        status, marked = claimed(o, v1)
+        assert marked is expected and (status == "sources_conflict") is expected

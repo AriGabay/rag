@@ -1250,3 +1250,61 @@ def test_an_unlinked_model_claim_whose_label_is_a_clause_gets_the_generic_label(
         checked_where="")])
     items = coverage._unlinked_gaps(ws, a.requested)
     assert [i["text"] for i in items] == ["הנתון המבוקש"]
+
+
+# --- pairwise conflicts (round 12 U11: R18, AE7; KTD13) -----------------------------------------------------------------------------
+
+def _when(iso: str | None, precision: str = "day", end: str | None = None, origin: str | None = None) -> dict:
+    out = {"date": iso, "precision": precision if iso else None, "end": end, "provenance": "source" if iso else None,
+           "forecast": False, "locator": None}
+    return out | ({"date_origin": origin} if origin else {})
+
+
+def _item(amount: str, when: dict | None, key: str = "k"):
+    return coverage.Comparable(key, Decimal(amount), when)
+
+
+def test_pairs_two_dated_periods_conflict_only_when_they_overlap():
+    items = [_item("100", _when("2023-06-01")), _item("120", _when("2023-06-01")), _item("130", _when("2024-06-01")),
+             _item("140", _when("2023", "year")), _item("150", _when("2022-01-01", end="2023-07-01"))]
+    # 2 (2024) overlaps none of the others; 4 is a range from 2022 into July 2023, so it overlaps the 2023 ones
+    assert coverage.conflicting_pairs(items) == [(0, 1), (0, 3), (0, 4), (1, 3), (1, 4), (3, 4)]
+
+
+def test_pairs_an_undated_member_conflicts_unless_it_is_history_or_a_comparable():
+    dated = _item("100", _when("2025-03-31"))
+    assert coverage.conflicting_pairs([dated, _item("90", None)]) == [(0, 1)]
+    assert coverage.conflicting_pairs([dated, _item("90", _when(None))]) == [(0, 1)]
+    assert coverage.conflicting_pairs([dated, _item("90", _when(None, origin="history"))]) == []
+    assert coverage.conflicting_pairs([dated, _item("90", _when(None, origin="comparable"))]) == []
+    assert coverage.conflicting_pairs([_item("90", None), _item("80", None)]) == [(0, 1)]
+    assert coverage.conflicting_pairs([_item("90", None), _item("80", _when(None, origin="history"))]) == []
+
+
+def test_pairs_the_same_amount_or_another_key_is_no_conflict():
+    assert coverage.conflicting_pairs([_item("100", None), _item("100", _when("2025-01-01"))]) == []
+    assert coverage.conflicting_pairs([_item("100", None, "a"), _item("90", _when("2025-01-01"), "b")]) == []
+
+
+def test_pairs_each_pair_is_decided_alone():
+    items = [_item("100", _when("2023-06-01")), _item("120", _when("2024-06-01")), _item("100", None)]
+    assert coverage.conflicting_pairs(items) == [(1, 2)]
+
+
+def _dated_value(ws: Workspace, written: str, when: dict | None, **kw) -> str:
+    vid = _value(ws, written, "השווי", "value", **kw)
+    ws.values[vid].as_of = when
+    return vid
+
+
+def test_conflicting_reads_a_dated_and_an_undated_value_as_one_conflict_unless_the_undated_is_history():
+    ws = _ws()
+    _dated_value(ws, "2,450,000", _when("2025-03-31"))
+    undated = _dated_value(ws, "2,300,000", None)
+    assert coverage.conflicting(ws)
+    ws.values[undated].as_of = _when(None, origin="history")
+    assert not coverage.conflicting(ws)
+    ws.values[undated].as_of = _when("2024-03-31")
+    assert not coverage.conflicting(ws)
+    ws.values[undated].as_of = _when("2025", "year")
+    assert coverage.conflicting(ws)

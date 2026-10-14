@@ -7,7 +7,8 @@ group as a block of ``answer.time.timeline`` when it holds two or more dated val
 order: the model is asked to open with the latest datum, the server asserts it. The block is part of the structured
 payload and of a plain-text copy (``answer.time.text``); it is not added to ``answer.markdown``.
 
-**The comparability key** (KTD9, R9) — the same key ``coverage.conflicting`` reads its date from, and ``recency_claim``:
+**The comparability key** (KTD9, R9) — the key ``recency_claim`` reads, and the one whose members ``coverage.conflicting_pairs``
+compares:
 
 - the *property group* of the appraisal unit the value is in (round 12 U6, KTD5): the turn's property graph
   (``property.PropertyGraph``), where appraisals are one property only through proving links (a shared parcel, or the same
@@ -26,7 +27,9 @@ payload and of a plain-text copy (``answer.time.text``); it is not added to ``an
 later than the anchor and not forecast, newest first, then the later or forecast ones, then the unknown; ``explicit`` —
 the requested time first, then the nearest, then the unknown (the rows outside it are marked); ``none`` — chronological,
 oldest first, a forecast after the measured, the unknown last. A forecast is marked and never first. A row's marks:
-``forecast``, ``conflict`` (another row of its group has the same date and a different amount, R10), ``outside_requested``
+``forecast``, ``conflict`` (another row of its group has a different amount and an overlapping period, or either has no date
+unless it is history or a comparable — ``coverage.conflicting_pairs``, round 12 U11, R18; a group with such a conflict
+gets a block even when it holds one dated row), ``outside_requested``
 (an explicit mode, a dated row outside the requested time), ``uncertain`` (the value's or measurement's reading cannot be
 presented as certain: ``tools.value_uncertain`` / ``measurement_uncertain``) and ``unknown_date``. A value cited twice from one document
 (same date and amount) is one row.
@@ -128,8 +131,8 @@ class Datum:
 
 
 # The identity of a datum's known date — (ISO date, precision, end) — or None when it has none (``tools.dated``: every
-# ``as_of`` that holds a date holds its precision). Two values of a group with the same known date and different amounts
-# conflict; with different known dates they are a history (R10).
+# ``as_of`` that holds a date holds its precision). Whether two values conflict is decided by their periods, not by this
+# identity (``coverage.conflicting_pairs``, round 12 U11).
 date_key = dated
 
 
@@ -289,6 +292,17 @@ def _own(d: Datum) -> Identity:
 _ATTR = "_timeline_identity"
 
 
+def property_key(ws: Workspace, ref: str, document_id, version_id, context: dict | None) -> str | None:
+    """The property group id of a registered value in the turn's graph — what ``coverage.conflicting`` takes for "the same
+    property" (round 12 U11, KTD13) — or None when the turn has no way to read one (no tenant context and no stand-in given:
+    the tests of the pure parts) or the value's unit is in no group. The same read as the timeline's (``identity_of``)."""
+    if getattr(ws, "ctx", None) is None and _ATTR not in vars(ws):
+        return None
+    number, subject = _context(context)
+    probe = Datum(ref, 0, str(document_id), str(version_id), "", "", number, subject, "", "", None, "", None, None)
+    return identity_of(ws)(probe).key
+
+
 def set_identity(ws: Workspace, fn: Callable[[Datum], Identity]) -> None:
     """Replace how the property of a datum is read (the tests of the pure parts give a stand-in)."""
     ws.__dict__[_ATTR] = fn
@@ -384,7 +398,7 @@ def _row(ws: Workspace, d: Datum, conflicts: set) -> dict:
     marks = []
     if d.forecast:
         marks.append("forecast")
-    if d.dated and d.date_key() in conflicts:
+    if d.ref in conflicts:
         marks.append("conflict")
     if _outside(ws, d):
         marks.append("outside_requested")
@@ -415,18 +429,20 @@ def _label(members: list[Datum], who: Identity) -> str:
 
 def build(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None) -> list[dict]:
     """The timeline: a ``{"label", "rows"}`` block for every comparability group of the ``cited`` ids that holds two or more
-    dated values, its rows ordered by the turn's time mode and marked (see the module doc)."""
+    dated values, or a conflict that involves a value with no date (round 12 U11, KTD13: the mark must be visible), its rows
+    ordered by the turn's time mode and marked (see the module doc). A row is marked ``conflict`` when
+    ``coverage.conflicting_pairs`` pairs it with another row of its group."""
+    from app.chat.coverage import Comparable, conflicting_pairs
+
     identity = identity or identity_of(ws)
     blocks = []
     for members in groups(ws, cited, identity):
         members = _dedupe(members)
-        if sum(1 for d in members if d.dated) < 2:
+        pairs = conflicting_pairs([Comparable(None, d.amount if d.amount is not None else d.written, d.as_of)
+                                   for d in members])
+        conflicts = {members[i].ref for pair in pairs for i in pair}
+        if sum(1 for d in members if d.dated) < 2 and not any(not d.dated and d.ref in conflicts for d in members):
             continue
-        amounts: dict[tuple, set] = {}
-        for d in members:
-            if d.dated:
-                amounts.setdefault(d.date_key(), set()).add(d.amount if d.amount is not None else d.written)
-        conflicts = {k for k, a in amounts.items() if len(a) > 1}
         ordered = sorted(members, key=lambda d: (_order(ws, d), d.index))
         blocks.append({"label": _label(ordered, identity(ordered[0])),
                        "rows": [_row(ws, d, conflicts) for d in ordered]})
