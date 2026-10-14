@@ -1464,8 +1464,9 @@ def valuation_line(uv: chat_dates.UnitValuation) -> str:
 
 
 def valuation_of(ws: Workspace, conn: Connection, version_id, block_index: int | None) -> chat_dates.UnitValuation:
-    """The valuation of the unit that holds a block (unknown for a block no chunk or row places)."""
-    if block_index is None:
+    """The valuation of the unit that holds a block (unknown for a block no chunk or row places, and with no connection
+    to read the dates record from: the date stays unknown rather than failing the value)."""
+    if block_index is None or conn is None:
         return NO_VALUATION
     return chat_dates.unit_valuation(conn, version_id, block_index, cache=ws.date_cache)
 
