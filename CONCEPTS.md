@@ -32,6 +32,14 @@ What a request is about, decided for every message and checked by the server aga
 
 The parts of a conversation's state that are kept apart from one another after each answer: the professional topic with the items the answer listed, the selected property with its task parameters (metric, unit, period), the sources cited, and a pending clarification. A professional question leaves the property slot dormant, not dropped, so a later "in this property" returns to it. A pending clarification lives for one message and binds only a reply that refers to it. An ordinal such as "the second" binds to the previous answer's list. The slots are stored with the answer, survive a reload, and are checked against the user's permissions every turn.
 
+### Time preference
+
+How a conversation orders data that changes over time. With the switch "העדף נתונים עדכניים" on, the default for new conversations, the latest relevant datum comes first and earlier relevant data follows, newest first, with dates and sources; nothing older is hidden. With it off, no time order is preferred and dates are still shown. A date or range the question states overrides the switch. Each user message records the preference it was sent with, so retrying or refreshing never changes an answer, and the preference never changes the question intent or the property in focus.
+
+### Datum date
+
+The date a datum refers to: the valuation date of the appraisal whose own conclusion it is, a date stated in the datum's own row, cell or sentence, or a range stated by its table. A report's writing date, the upload date and the processing date never date a datum. A date the sources do not give stays unknown, and a forecast is never treated as measured. Only data of the same property, metric, unit, periodicity, area basis, VAT basis and scenario form one timeline.
+
 ## Documents
 
 ### Reading status
