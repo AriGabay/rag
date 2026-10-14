@@ -2558,6 +2558,14 @@ def _vat_problems(unit: Unit, ws: Workspace) -> list[str]:
             if r.vat in ("included", "excluded"):
                 backed |= {(f, r.vat) for f in numbers_in(r.value_text)}
             continue
+        if i in ws.values:
+            # a registered value carries the VAT basis its source stated, which can sit on a line its quote leaves out
+            # ("שווי הנכס: 2,450,000 ₪" with the basis on the next line): the record backs it, as the measurement's
+            # row does, but only when the source gave it. A model-asserted or unstated basis backs nothing; the
+            # quote's own words are still read below (round 11 U2, KTD10)
+            v = ws.values[i]
+            if v.vat in ("included", "excluded") and v.provenance.get("vat") == "source":
+                backed |= {(f, v.vat) for f in numbers_in(v.written)}
         parts = _source_parts(ws, i)
         if parts is None:
             continue

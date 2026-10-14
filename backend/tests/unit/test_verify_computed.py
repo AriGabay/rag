@@ -241,6 +241,18 @@ def test_vat_phrasing_of_a_result_whose_inputs_disagree_is_removed():
     assert problems and "מע\"מ" in problems[0].reason
 
 
+@pytest.mark.parametrize("phrase, ok", [("1,530,000 ₪ ללא מע״מ", True), ("1,530,000 ₪ כולל מע״מ", False)])
+def test_a_calculation_over_values_with_model_asserted_vat_keeps_its_vat_outcome(phrase, ok):
+    """Pinned (round 11 U2, Scope Boundaries): ``_computation_vat`` reads the VAT recorded for the inputs and the VAT
+    basis they share whatever its provenance. Tightening it to source-given VAT only is deferred (no failure was
+    observed, and it risks removing calculation answers), so today's outcome is recorded, not changed."""
+    ws = _scenario()
+    for v in ws.values.values():
+        v.provenance["vat"] = "model_asserted"
+    problems = _numbers_only(ws, f"הרווח בתרחיש יהיה {phrase} [C1].")
+    assert (problems == []) is ok, problems
+
+
 # --- "the report states": a computed number is never framed as written in a document ---------------------------
 
 @pytest.mark.parametrize("framed", [

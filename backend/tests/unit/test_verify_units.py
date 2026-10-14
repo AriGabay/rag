@@ -302,6 +302,58 @@ def test_vat_claim_backed_by_a_measurement_record():
     assert verify.deterministic(split_units("דמי השכירות הם 58 ₪ ללא מע\"מ [M1]."), ws, "?") == []
 
 
+def _registered(written: str, quote: str, *, vat: str = "not_stated", area_basis: str = "", unit: str = "ILS",
+                period: str = "none", provenance: dict | None = None) -> Workspace:
+    """A workspace whose V1 is a registered value of the invented property: ``vat``, ``area_basis`` and ``period``
+    as the record holds them, each with the ``provenance`` entry given (default: all from the source)."""
+    from decimal import Decimal
+
+    from app.chat import calc
+
+    ws = Workspace(ctx=None)
+    prov = {"unit": "source", "vat": "source", "area_basis": "source", "period": "source"} | (provenance or {})
+    ws.values["V1"] = calc.Value("V1", Decimal(written.replace(",", "")), written, "S1", uuid.uuid4(), uuid.uuid4(),
+                                 None, "שומת הדגמה", "סעיף 3", "שווי הנכס", "value", unit, period, vat, area_basis,
+                                 "נכס הדגמה", "appraiser_determination", prov, {"quote": quote}, quote)
+    return ws
+
+
+# The quote carries no VAT words (the VAT basis is on the next source line); the record's own VAT is source-given.
+_VALUE_QUOTE = "שווי הנכס: 2,450,000 ₪"
+
+
+def test_vat_claim_backed_by_a_source_given_value_record():
+    """Round 11 U2, KTD10 (AE6): a cited V# backs the VAT its record holds when the source gave it."""
+    ws = _registered("2,450,000", _VALUE_QUOTE, vat="included")
+    assert verify.deterministic(split_units("שווי הנכס הוא 2,450,000 ₪, כולל מע\"מ [V1]."), ws, "?") == []
+
+
+def test_a_different_vat_than_the_source_given_one_is_still_removed():
+    ws = _registered("2,450,000", _VALUE_QUOTE, vat="included")
+    (problem,) = verify.deterministic(split_units("שווי הנכס הוא 2,450,000 ₪, לא כולל מע\"מ [V1]."), ws, "?")
+    assert problem.check == "vat" and problem.failure_kind == "wrong_unit"
+
+
+@pytest.mark.parametrize("vat,provenance", [
+    ("included", {"vat": "model_asserted"}),  # the model said so; the source did not
+    ("excluded", {"vat": "model_asserted"}),
+    ("not_stated", {"vat": "not_stated"}),
+    ("not_stated", {"vat": "source"}),
+])
+def test_a_value_record_without_a_source_given_vat_backs_no_vat_claim(vat, provenance):
+    ws = _registered("2,450,000", _VALUE_QUOTE, vat=vat, provenance=provenance)
+    for claim in ("כולל מע\"מ", "לא כולל מע\"מ"):
+        problems = verify.deterministic(split_units(f"שווי הנכס הוא 2,450,000 ₪, {claim} [V1]."), ws, "?")
+        assert [(p.check, p.failure_kind) for p in problems] == [("vat", "wrong_unit")], claim
+
+
+def test_a_source_given_area_basis_on_a_value_record_backs_the_matching_claim_only():
+    ws = _registered("9,500", "דמי השכירות: 9,500 ₪", unit="ILS_per_sqm", area_basis="נטו", period="month")
+    assert verify.deterministic(split_units("דמי השכירות הם 9,500 ₪ למ\"ר נטו לחודש [V1]."), ws, "?") == []
+    problems = verify.deterministic(split_units("דמי השכירות הם 9,500 ₪ למ\"ר ברוטו לחודש [V1]."), ws, "?")
+    assert any(p.check == "meaning" for p in problems), [(p.check, p.failure_kind) for p in problems]
+
+
 def test_a_numbered_heading_or_table_header_judged_navigation_or_not_factual_is_kept():
     def rule(t):
         if t.startswith("###"):
