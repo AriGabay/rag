@@ -64,7 +64,7 @@ import logging
 import re
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from typing import NotRequired, TypedDict
 from uuid import UUID
@@ -80,7 +80,7 @@ from app.professional.sections import flight, landed
 
 logger = logging.getLogger(__name__)
 
-DATES_VERSION = "dates-v2"
+DATES_VERSION = "dates-v3"
 MARKER_BLOCK = -1       # the block index of the row that records "derived, none found"
 DOCUMENT_SCOPE = 0      # the unit number of a version that has no units: the document is the scope
 
@@ -114,6 +114,7 @@ class Found:
     iso: str
     precision: str
     written: str
+    primary: bool = False   # read from the report's own valuation-date section (round 12 U3b, KTD11)
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,7 @@ class StatedDate:
     written: str
     status: str
     unit_no: int | None
+    primary: bool = False
 
 
 @dataclass(frozen=True)
@@ -141,8 +143,21 @@ class UnitValuation:
 # --- the labels ------------------------------------------------------------------------------------------------------
 
 _Q = '["״\'׳]'
+def _loose(word: str) -> str:
+    """A suffix word that tolerates one space inside it: the reader splits a word at a line wrap or a justified line
+    ("להערכ ה", "שומ ה"). Only the label's suffix words are loosened, never "מועד" or "קובע" (round 12 U3b, KTD11)."""
+    return r"\s?".join(word)
+
+
+# the suffix after "המועד הקובע": "לשומה", "להערכה", "לשווי", "לחוות (ה)דעת" (round 12 U3b)
+_SUFFIX = (r"\s+ל?\s?ה?(?:" + "|".join((_loose("שומה"), _loose("הערכה"), _loose("שווי"),
+                                         _loose("חוות") + r"\s+ה?\s?" + _loose("דעת"))) + ")")
+# a title that says what the valuation is as of: "הערכה ליום", "שומה ליום", "הערכת שווי (נכון) ליום" (round 12 U3b). The
+# noun is required ("ליום" alone is no label) and "תאריך הערכה ..." is the report label, never this one.
+_TITLE = (r"(?<!תאריך )(?<![א-ת])[בה]?(?:" + "|".join((_loose("שומה"), _loose("הערכה"), r"הערכת\s+שווי",
+                                                      r"שומת(?:\s+מקרקעין)?")) + r")\s+(?:נכון\s+)?ליום(?![א-ת])")
 # "המועד הקובע", "מועד קובע", "(ה)תאריך (ה)קובע" (round 12 U3, KTD11), "למועד הקובע לשומה": at most two prefix letters
-_VALUATION = re.compile(r"(?<![א-ת])[בלוכמשה]{0,2}(?:מועד|תאריך)\s+ה?קובע(?:\s+ל?(?:ה?שומה|ה?הערכה|ה?שווי))?(?![א-ת])")
+_VALUATION = re.compile(r"(?<![א-ת])[בלוכמשה]{0,2}(?:מועד|תאריך)\s+ה?קובע(?:" + _SUFFIX + r")?(?![א-ת])|" + _TITLE)
 # the report-writing and signature labels; they are recognised so their dates are never taken as valuation dates
 _REPORT = re.compile(
     rf"(?<![א-ת])[בלוכמשה]{{0,2}}(?:תאריך\s+(?:עריכת\s+)?(?:ה?שומה|ה?דו{_Q}?ח|ה?חוות\s+דעת|חתימה|עריכה|ה?הפקה)"
@@ -250,6 +265,12 @@ _HISTORY_HEADING = re.compile(
     r"שומ(?:ה|ות)(?:\s+מקרקעין)?\s+קודמ(?:ת|ות)|(?<![א-ת])היסטוריה(?![א-ת])|(?:רכישות|עסקאות)\s+קודמות")
 _HISTORY_CUE = re.compile(
     r"(?<![א-ת])[שוכ]?נ(?:רכש|מכר)(?:ה|ו|ים)?(?![א-ת])|שומ(?:ה|ות)(?:\s+מקרקעין)?\s+קודמ(?:ת|ות)(?![א-ת])")
+# further cues of round 12 U3b: a prior appraisal "that was prepared", a purchase, a references lead
+_HISTORY_CUE_MORE = re.compile(
+    r"שומ(?:ה|ת|ות)(?:\s+מקרקעין)?(?:\s+מקיפה)?\s+שנערכ(?:ה|ו)(?![א-ת])|(?<![א-ת])ה?רכיש(?:ה|ת)(?![א-ת])")
+_REFERENCES = r"סימוכין(?![א-ת])"
+_ENUMERATION = r"\s*(?:\(?(?:\d+(?:\.\d+)*|[א-ת])[.)]\s*)?"   # "2.", "2.1.", "(2)", "א." before a block's first word
+_REFERENCES_LEAD = re.compile(_ENUMERATION + _REFERENCES)
 _VALUED = re.compile(r"(?<![א-ת])ו?הוער(?:ך|כה|כו)(?![א-ת])")
 _PAST_CUE = re.compile(r"(?<![א-ת])(?:בעבר|קודם|קודמת|קודמות)(?![א-ת])")
 _SENTENCE_BREAK = re.compile(r"(?<=[.;!?])\s+|\n")
@@ -258,21 +279,55 @@ _SENTENCE_BREAK = re.compile(r"(?<=[.;!?])\s+|\n")
 def is_history(sentence: str, section_path: Iterable[str] = ()) -> bool:
     """Whether a sentence is history (KTD12): it sits under a history or prior-appraisal heading ("שומות קודמות",
     "שומות מקרקעין קודמות", "היסטוריה", "רכישות קודמות", "עסקאות קודמות"), or it carries "נרכש", "נמכר", "שומה קודמת" or
-    "שומות קודמות", or it carries "הוערך" together with an explicit past cue ("בעבר", "קודם", "קודמת"). A bare "הוערך"
+    "שומות קודמות", or it carries "הוערך" together with an explicit past cue ("בעבר", "קודם", "קודמת"). Round 12 U3b adds a
+    prior appraisal "that was prepared" ("שומת מקרקעין (מקיפה) שנערכה"), a purchase ("רכישה", "רכישת", "מחיר הרכישה") and
+    a sentence that leads with "סימוכין" (a list of references). A bare "הוערך"
     outside history is not: current conclusions are written that way ("שווי הזכויות בנכס הוערך ב-X ₪ נכון למועד הקובע")."""
     if any(_HISTORY_HEADING.search(strip_bidi_controls(h or "")) for h in section_path):
         return True
     s = strip_bidi_controls(sentence or "")
-    return bool(_HISTORY_CUE.search(s) or (_VALUED.search(s) and _PAST_CUE.search(s)))
+    return bool(_HISTORY_CUE.search(s) or _HISTORY_CUE_MORE.search(s) or _REFERENCES_LEAD.match(s)
+                or (_VALUED.search(s) and _PAST_CUE.search(s)))
 
 
-def _sentence(body: str, start: int, end: int) -> str:
-    """The sentence of ``body`` that holds the span: from the break before ``start`` to the break after ``end``."""
+def _sentence_bounds(body: str, start: int, end: int) -> tuple[int, int]:
+    """(from, to) of the sentence of ``body`` that holds the span: from the break before ``start`` to the break after
+    ``end``."""
     lo = 0
     for m in _SENTENCE_BREAK.finditer(body, 0, start):
         lo = m.end()
     nxt = _SENTENCE_BREAK.search(body, end)
-    return body[lo:nxt.start() if nxt else len(body)]
+    return lo, nxt.start() if nxt else len(body)
+
+
+def _sentence(body: str, start: int, end: int) -> str:
+    """The sentence of ``body`` that holds the span."""
+    lo, hi = _sentence_bounds(body, start, end)
+    return body[lo:hi]
+
+
+# --- what a label's position says (round 12 U3b, KTD11) ----------------------------------------------------------------
+
+# a label right after one of these words refers to the valuation date ("הסמוכות למועד הקובע", "טרם המועד הקובע"); it
+# never states it
+_RELATIONAL_TAIL = re.compile(r"(?<![א-ת])(?:ה?סמוכ(?:ה|ות|ים)|ה?סמוך|טרם|לפני|לאחר|מאז|עד)[\s(]*$")
+_ENUMERATION_RE = re.compile(_ENUMERATION)
+
+
+def _is_relational(body: str, label_start: int) -> bool:
+    """Whether the label at ``label_start`` follows a relational word directly: a reference to the valuation date."""
+    return _RELATIONAL_TAIL.search(body, max(0, label_start - 24), label_start) is not None
+
+
+def _begins_with(body: str, label_start: int) -> bool:
+    """Whether the block's text begins with the label at ``label_start``, after an enumeration like "2." or "(2)": the
+    block is the report's statement of its valuation date, not a passing mention."""
+    return _ENUMERATION_RE.match(body).end() == label_start
+
+
+def _heading_is_label(path: Sequence) -> bool:
+    """Whether the last section heading of a path is the valuation label ("2. המועד הקובע")."""
+    return bool(path) and _VALUATION.search(strip_bidi_controls(path[-1] or "")) is not None
 
 
 # --- derivation ----------------------------------------------------------------------------------------------------------
@@ -310,13 +365,44 @@ def _without_header(body: str, headers: Sequence) -> str:
     return body
 
 
+def _first_row_header(rows: Sequence) -> tuple[list[str], Sequence]:
+    """For a stored table whose ``headers`` are empty: the first row as the header when one of its cells holds the
+    valuation label, with the rows left as the data rows (round 12 U3b, KTD11); otherwise no header."""
+    if not rows:
+        return [], rows
+    first = rows[0].get("cells") if isinstance(rows[0], dict) else rows[0]
+    if not isinstance(first, Sequence) or isinstance(first, str):
+        return [], rows
+    cells = [c if isinstance(c, str) else "" for c in first]
+    if any(_VALUATION.search(strip_bidi_controls(c)) for c in cells):
+        return cells, rows[1:]
+    return [], rows
+
+
+def _agree(isos: Iterable[str]) -> bool:
+    """Whether every ISO text is the finest one or a coarser form of it."""
+    values = list(isos)
+    finest = max(values, key=len)
+    return all(finest.startswith(v) for v in values)
+
+
 def derive(blocks: Iterable, tables: Mapping[int, Mapping] | None = None) -> list[Found]:
     """The labelled valuation dates of stored blocks (anything with ``block_index``, ``kind`` and ``text``, and
     optionally ``section_path`` and ``table_index``), in block order. Pure: no database, no model. A date is taken when
     it follows a valuation label in the block, when a direct connector joins it to the label that follows it, when the
     label stands alone (a cell, a heading) and the next block starts with a date, or when a one-row table's header
-    cell holds the label (``tables``: `extracted_tables.structure` by table index). A date the history predicate
-    marks (`is_history`: its sentence or its section) is never taken, of any of these readings (round 12 U3, KTD11)."""
+    cell holds the label (``tables``: `extracted_tables.structure` by table index; a table with empty headers whose
+    first row holds the label is read with that row as the header). A date the history predicate marks (`is_history`:
+    its sentence or its section) is never taken, of any of these readings (round 12 U3, KTD11).
+
+    Round 12 U3b (KTD11) adds three position rules, none of which looks at the date itself:
+
+    - a label right after a relational word ("הסמוכות למועד", "טרם המועד") refers to the valuation date and takes no date
+      by any reading;
+    - a sentence that holds two or more different labelled dates compares or references them: none is a statement of
+      the unit's date;
+    - a date read from a block that begins with the label (after an enumeration), or from a block whose last section
+      heading is the label, is *primary*: the report's own statement of the date (`Found.primary`; `resolve_unit`)."""
     rows: list[tuple[int, str, tuple, list[tuple[Parsed, str]]]] = []
     for b in blocks:
         if getattr(b, "kind", "paragraph") in _TEXT_KINDS_SKIPPED:
@@ -326,44 +412,67 @@ def derive(blocks: Iterable, tables: Mapping[int, Mapping] | None = None) -> lis
         table_dates: list[tuple[Parsed, str]] = []
         structure = (tables or {}).get(getattr(b, "table_index", None))
         headers = (structure or {}).get("headers") or []
+        data_rows = (structure or {}).get("rows") or []
+        if structure and not any(headers):
+            headers, data_rows = _first_row_header(data_rows)
         if structure and any(headers):
-            table_dates = _table_dates(headers, structure.get("rows") or [])
+            table_dates = _table_dates(headers, data_rows)
             body = _without_header(body, headers)
         rows.append((int(b.block_index), body, path, table_dates))
     out: list[Found] = []
-    seen: set[tuple[int, str, str]] = set()
+    at: dict[tuple[int, str, str], int] = {}
 
-    def take(block: int, p: Parsed) -> None:
-        if (block, p.iso, p.precision) not in seen:
-            seen.add((block, p.iso, p.precision))
-            out.append(Found(block, p.iso, p.precision, p.written))
+    def take(block: int, p: Parsed, primary: bool) -> None:
+        key = (block, p.iso, p.precision)
+        if key not in at:
+            at[key] = len(out)
+            out.append(Found(block, p.iso, p.precision, p.written, primary))
+        elif primary and not out[at[key]].primary:
+            out[at[key]] = replace(out[at[key]], primary=True)
 
     for i, (index, body, path, table_dates) in enumerate(rows):
+        section_primary = _heading_is_label(path)
+        lead_history = _REFERENCES_LEAD.match(body) is not None   # a references block: all of it is history
         for p, sentence in table_dates:
-            if not is_history(sentence, path):
-                take(index, p)
+            if not lead_history and not is_history(sentence, path):
+                take(index, p, section_primary)
         labels = list(_VALUATION.finditer(body))
         if not labels:
             continue
         report = {p.span for p in report_dates(body)}
+        # (the date, its sentence's bounds, the text history is judged on, primary) of each label read in this block
+        read: list[tuple[Parsed, tuple[int, int], str, bool]] = []
         for m in labels:
+            if _is_relational(body, m.start()):
+                continue
+            primary = section_primary or _begins_with(body, m.start())
             p, only_gap = _date_after(body, m.end())
             if p is not None:
-                if p.span not in report and not is_history(_sentence(body, m.start(), p.span[1]), path):
-                    take(index, p)
+                if p.span not in report:
+                    read.append((p, _sentence_bounds(body, m.start(), p.span[1]), _sentence(body, m.start(), p.span[1]),
+                                 primary))
                 continue
             q = _date_before(body, m.start())
             if q is not None:
-                if q.span not in report and not is_history(_sentence(body, q.span[0], m.end()), path):
-                    take(index, q)
+                if q.span not in report:
+                    read.append((q, _sentence_bounds(body, q.span[0], m.end()), _sentence(body, q.span[0], m.end()),
+                                 primary))
                 continue
             if only_gap and i + 1 < len(rows):
                 nxt_index, nxt, nxt_path, _ = rows[i + 1]
                 r, _ = _date_after(nxt, 0)
                 if r is not None and not any(m2.start() < r.span[0] for m2 in _REPORT.finditer(nxt)):
                     sentence = f"{_sentence(body, m.start(), m.end())} {_sentence(nxt, r.span[0], r.span[1])}"
-                    if not is_history(sentence, path + nxt_path):
-                        take(nxt_index, r)
+                    if not lead_history and not is_history(sentence, path + nxt_path):
+                        take(nxt_index, r, primary or _heading_is_label(nxt_path))
+        by_sentence: dict[tuple[int, int], list[Parsed]] = defaultdict(list)
+        for p, bounds, _, _ in read:
+            by_sentence[bounds].append(p)
+        for p, bounds, sentence, primary in read:
+            if not _agree(x.iso for x in by_sentence[bounds]):
+                continue   # two different labelled dates in one sentence: a comparison, none of them a statement
+            if not lead_history and not is_history(sentence, path):
+                take(index, p, primary)
     return out
 
 
@@ -373,6 +482,14 @@ def _agreeing(dates: Sequence[StatedDate]) -> StatedDate | None:
     """The finest date when every date is that one or a coarser form of it (a month of the day's month), else None."""
     finest = max(dates, key=lambda d: len(d.iso))
     return finest if all(finest.iso.startswith(d.iso) for d in dates) else None
+
+
+def _settled(dates: Sequence[StatedDate]) -> StatedDate | None:
+    """The unit's date from its dates, or None when they conflict. Primary dates (the report's own valuation-date
+    section) decide when the unit has any: the other dates are references, listed but never in conflict with them; the
+    primary dates must agree among themselves. With none, every date counts (round 12 U3b, KTD11)."""
+    primary = [d for d in dates if d.primary]
+    return _agreeing(primary or dates)
 
 
 def _owner(units: Sequence, block_index: int) -> int | None:
@@ -387,21 +504,21 @@ def assign(found: Iterable[Found], units: Sequence) -> list[StatedDate]:
     """The dates with the unit that holds each block now and the status of that unit: `conflict` when its dates do not
     agree. A version with no units is one scope (`DOCUMENT_SCOPE`); a block outside every unit has no unit."""
     owned = [(f, _owner(units, f.block_index)) for f in sorted(found, key=lambda x: (x.block_index, x.iso))]
-    plain = [StatedDate(f.block_index, f.iso, f.precision, f.written, "stated", owner) for f, owner in owned]
+    plain = [StatedDate(f.block_index, f.iso, f.precision, f.written, "stated", owner, f.primary) for f, owner in owned]
     by_unit: dict[int, list[StatedDate]] = defaultdict(list)
     for d in plain:
         if d.unit_no is not None:
             by_unit[d.unit_no].append(d)
-    conflicted = {no for no, ds in by_unit.items() if _agreeing(ds) is None}
+    conflicted = {no for no, ds in by_unit.items() if _settled(ds) is None}
     return [StatedDate(d.block_index, d.iso, d.precision, d.written, "conflict" if d.unit_no in conflicted else "stated",
-                       d.unit_no) for d in plain]
+                       d.unit_no, d.primary) for d in plain]
 
 
 def resolve_unit(dates: Sequence[StatedDate], unit_no: int | None) -> UnitValuation:
     """The valuation date of one unit from its own dates (the caller passes only the unit's)."""
     if not dates:
         return UnitValuation("none", None, (), unit_no)
-    best = _agreeing(dates)
+    best = _settled(dates)
     if best is None:
         return UnitValuation("conflict", None, tuple(dates), unit_no)
     return UnitValuation("stated", best, tuple(dates), unit_no)
@@ -411,7 +528,7 @@ def resolve_unit(dates: Sequence[StatedDate], unit_no: int | None) -> UnitValuat
 
 _VISIBLE_SQL = ("SELECT v.id AS version_id, v.document_id FROM document_versions v JOIN documents d"
                 f" ON d.id = v.document_id WHERE v.id = ANY(:v) AND {APPRAISALS_SQL}")
-_ROWS_SQL = ("SELECT version_id, block_index, iso, precision, written FROM version_dates"
+_ROWS_SQL = ("SELECT version_id, block_index, iso, precision, written, primary_section FROM version_dates"
              " WHERE version_id = ANY(:v) AND dates_version = :dv ORDER BY version_id, block_index, iso")
 # the blocks with their section path (the history predicate) and, for a table block, the table's stored structure
 # (a header label gives the date of its column: `derive`'s ``tables``)
@@ -419,7 +536,7 @@ _BLOCKS_SQL = ("SELECT b.block_index, b.kind, b.text, b.section_path, b.table_in
                " LEFT JOIN extracted_tables t ON t.version_id = b.version_id AND t.table_index = b.table_index"
                " WHERE b.version_id = :v AND b.kind <> 'image' ORDER BY b.block_index")
 _INSERT = ("INSERT INTO version_dates (office_id, document_id, version_id, dates_version, block_index, iso, precision,"
-           " written, status) VALUES (app_office(), :d, :v, :dv, :b, :i, :p, :w, :s)")
+           " written, status, primary_section) VALUES (app_office(), :d, :v, :dv, :b, :i, :p, :w, :s, :pr)")
 
 
 def _stored(conn: Connection, version_ids: Sequence[UUID]) -> dict[UUID, list[Found]]:
@@ -428,7 +545,8 @@ def _stored(conn: Connection, version_ids: Sequence[UUID]) -> dict[UUID, list[Fo
     for r in conn.execute(text(_ROWS_SQL), {"v": list(version_ids), "dv": DATES_VERSION}):
         out.setdefault(r.version_id, [])
         if r.iso is not None and r.block_index != MARKER_BLOCK:
-            out[r.version_id].append(Found(r.block_index, r.iso, r.precision, r.written or r.iso))
+            out[r.version_id].append(Found(r.block_index, r.iso, r.precision, r.written or r.iso,
+                                           bool(r.primary_section)))
     return out
 
 
@@ -469,8 +587,9 @@ def _derive_and_store(conn: Connection, version_id: UUID, document_id: UUID, cac
                     if existing is not None:   # another process wrote them while this one waited for the lock
                         return tuple(assign(existing, units))
                     params = {"d": document_id, "v": version_id, "dv": DATES_VERSION}
-                    rows = [{"b": d.block_index, "i": d.iso, "p": d.precision, "w": d.written, "s": d.status}
-                            for d in assigned] or [{"b": MARKER_BLOCK, "i": None, "p": None, "w": None, "s": "stated"}]
+                    rows = [{"b": d.block_index, "i": d.iso, "p": d.precision, "w": d.written, "s": d.status,
+                             "pr": d.primary} for d in assigned] or [{"b": MARKER_BLOCK, "i": None, "p": None, "w": None,
+                                                                      "s": "stated", "pr": False}]
                     conn.execute(text(_INSERT), [params | row for row in rows])
             except Exception:  # noqa: BLE001 - a read-only transaction or a vanished version: the dates still serve
                 logger.info("dates of version %s not stored", version_id, exc_info=True)

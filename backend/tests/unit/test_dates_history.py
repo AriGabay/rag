@@ -43,3 +43,25 @@ def test_what_is_not_history(sentence, path):
 def test_the_past_cues_of_a_bare_valued_sentence_need_the_word_valued():
     assert is_history("בעבר שולם דמי חכירה של 20,000 ₪", ()) is False
     assert is_history("הוערך", ()) is False
+
+
+# --- round 12 U3b: further cues of the office's reports ---------------------------------------------------------------
+
+@pytest.mark.parametrize("sentence", [
+    "סימוכין: שומה מס' 7 מתאריך 03.05.2022",
+    "בהתאם לשומת מקרקעין מקיפה שנערכה ע\"י שמאי סינתטי, הוערך הנכס ב-2,000,000 ₪",
+    "שומה שנערכה לנכס בעבר",
+    "מחיר הרכישה משקף את השווי",
+    "עלות רכישת הנכס הייתה 1,500,000 ₪",
+])
+def test_further_history_cues(sentence):
+    assert is_history(sentence, ()) is True
+
+
+@pytest.mark.parametrize("sentence", [
+    "שומה זו נערכה למועד הקובע",
+    "הנכס מתאים לרכוש של משקיעים",
+    "המועד הקובע: 31/12/2025",
+])
+def test_the_further_cues_do_not_make_a_current_sentence_history(sentence):
+    assert is_history(sentence, ()) is False

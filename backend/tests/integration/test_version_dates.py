@@ -288,17 +288,17 @@ def test_a_marker_row_stops_the_derivation_of_a_version_with_no_dates(office):
 def test_a_new_dates_version_derives_again_and_a_current_one_never_does(office, monkeypatch):
     _, ver = single(office, [HEADER, "המועד הקובע: 15/04/2024"])
     read(office, ver)
-    monkeypatch.setattr(D, "DATES_VERSION", "dates-v3")
+    monkeypatch.setattr(D, "DATES_VERSION", "dates-v4")
     assert len(read(office, ver)[UUID(ver)]) == 1
-    assert sorted(r.dates_version for r in rows(office, ver)) == ["dates-v2", "dates-v3"]  # the old rows are kept
+    assert sorted(r.dates_version for r in rows(office, ver)) == ["dates-v3", "dates-v4"]  # the old rows are kept
     with tenant_tx(office.system) as conn:
         again = inserts(conn)
         D.valuation_dates(conn, [ver])
         assert again == []
 
 
-def test_the_current_dates_version_is_v2(office):
-    assert D.DATES_VERSION == "dates-v2"
+def test_the_current_dates_version_is_v3(office):
+    assert D.DATES_VERSION == "dates-v3"
 
 
 def old_row(office, doc, version, dates_version: str, iso: str | None, block: int = 1) -> None:
@@ -310,13 +310,13 @@ def old_row(office, doc, version, dates_version: str, iso: str | None, block: in
              "p": "day" if iso else None, "w": iso})
 
 
-def test_a_version_with_only_dates_v1_rows_derives_dates_v2_on_first_read_and_keeps_the_v1_rows_unread(office):
+def test_a_version_with_only_dates_v1_rows_derives_the_current_dates_on_first_read_and_keeps_the_v1_rows_unread(office):
     """Round 12 U3 (R21): the stored v1 rows are a derived cache of an older reading; they are neither deleted nor read."""
     doc, ver = single(office, [HEADER, "התאריך הקובע לשומה: 28/02/2024", "שווי 2,450,000 ₪"])
     old_row(office, doc, ver, "dates-v1", None, D.MARKER_BLOCK)   # what v1 stored: it found nothing in this file
     got = read(office, ver)[UUID(ver)]
     assert [(d.iso, d.block_index) for d in got] == [("2024-02-28", 1)]
-    assert sorted((r.dates_version, r.iso) for r in rows(office, ver)) == [("dates-v1", None), ("dates-v2", "2024-02-28")]
+    assert sorted((r.dates_version, r.iso) for r in rows(office, ver)) == [("dates-v1", None), ("dates-v3", "2024-02-28")]
     with tenant_tx(office.system) as conn:   # the next read is served from the v2 rows, with no new write
         later = inserts(conn)
         assert [d.iso for d in D.valuation_dates(conn, [ver])[UUID(ver)]] == ["2024-02-28"]
@@ -327,7 +327,7 @@ def test_a_v1_row_is_never_read_as_a_date_of_the_current_version(office):
     doc, ver = single(office, [HEADER, "שווי 2,450,000 ₪"])
     old_row(office, doc, ver, "dates-v1", "2019-01-01")
     assert read(office, ver)[UUID(ver)] == ()
-    assert sorted((r.dates_version, r.iso) for r in rows(office, ver)) == [("dates-v1", "2019-01-01"), ("dates-v2", None)]
+    assert sorted((r.dates_version, r.iso) for r in rows(office, ver)) == [("dates-v1", "2019-01-01"), ("dates-v3", None)]
 
 
 def test_a_read_only_transaction_over_a_v1_only_version_still_gets_the_v2_dates_and_writes_nothing(office):
@@ -411,3 +411,76 @@ def test_a_version_with_no_blocks_reads_empty_beside_one_with_a_date(office):
     with tenant_tx(office.system) as conn:
         got = D.valuation_dates(conn, [v1, v2])
     assert [d.iso for d in got[UUID(v1)]] == ["2024-04-15"] and got[UUID(str(v2))] == ()
+
+
+# --- dates-v3: the primary section is stored and settles the unit at read time (U3b, KTD11) -----------------------
+
+def primary_rows(office, ver):
+    return [(r.block_index, r.iso, r.primary_section) for r in rows(office, ver)]
+
+
+def test_a_date_from_the_valuation_section_is_stored_primary_and_decides_the_units_status(office):
+    _, ver = single(office, [
+        HEADER, "2. המועד הקובע לשומה: 01/07/2020", "16. נתונים נוספים",
+        "הנכס הוערך על ידנו לצורך הדוחות הכספיים, למועד קובע 31.12.2022 בסך 2,000,000 ₪."])
+    got = read(office, ver)[UUID(ver)]
+    assert [(d.iso, d.primary, d.status) for d in got] == [("2020-07-01", True, "stated"), ("2022-12-31", False, "stated")]
+    assert primary_rows(office, ver) == [(1, "2020-07-01", True), (3, "2022-12-31", False)]
+    with tenant_tx(office.system) as conn:
+        uv = D.unit_valuation(conn, ver, 3)
+    assert (uv.status, uv.date.iso) == ("stated", "2020-07-01")
+    assert [d.iso for d in uv.dates] == ["2020-07-01", "2022-12-31"]   # the reference is still listed
+
+
+def test_the_primary_flag_survives_a_second_read_from_the_stored_rows(office):
+    _, ver = single(office, [
+        HEADER, "המועד הקובע להערכה זו - הינו 31.12.2023.", "הנכס נבדק למועד קובע 31.12.2022 בלבד."])
+    read(office, ver)
+    with tenant_tx(office.system) as conn:   # stored rows only: nothing is derived or written
+        later = inserts(conn)
+        got = D.valuation_dates(conn, [ver])[UUID(ver)]
+        uv = D.unit_valuation(conn, ver, 1)
+        assert later == []
+    assert sorted((d.iso, d.primary, d.status) for d in got) == [("2022-12-31", False, "stated"),
+                                                                  ("2023-12-31", True, "stated")]
+    assert (uv.status, uv.date.iso) == ("stated", "2023-12-31")
+
+
+def test_the_genuine_discrepancy_with_no_primary_date_stays_a_conflict(office):
+    _, ver = single(office, [HEADER, "השווי נקבע למועד הקובע 31.12.2021.", "השווי מתייחס למועד הקובע 30.12.2021."])
+    got = read(office, ver)[UUID(ver)]
+    assert {d.status for d in got} == {"conflict"} and not any(d.primary for d in got)
+    with tenant_tx(office.system) as conn:
+        uv = D.unit_valuation(conn, ver, 1)
+    assert (uv.status, uv.date) == ("conflict", None)
+
+
+def test_primary_dates_that_disagree_are_a_conflict(office):
+    _, ver = single(office, [HEADER, "2. המועד הקובע: 01/07/2020", "3. המועד הקובע: 02/07/2020"])
+    assert {d.status for d in read(office, ver)[UUID(ver)]} == {"conflict"}
+
+
+def test_a_heading_that_is_the_label_makes_the_date_under_it_primary(office):
+    _, ver = single(office, [HEADER, "2. המועד הקובע", "31.5.2021.", "16. נתונים נוספים",
+                             "הנכס הוערך לצורך הדוחות הכספיים למועד קובע 31.12.2022."])
+    mark(office, ver, 1, ["2. המועד הקובע"])
+    mark(office, ver, 3, ["16. נתונים נוספים"])
+    got = read(office, ver)[UUID(ver)]
+    assert [(d.iso, d.primary, d.status) for d in got] == [("2021-05-31", True, "stated"), ("2022-12-31", False, "stated")]
+
+
+def test_a_comparison_a_reference_list_and_a_relational_label_state_no_date_in_a_stored_file(office):
+    _, ver = single(office, [
+        HEADER, "2. המועד הקובע לשומה: 31.12.2022",
+        "השינוי בין השומה למועד הקובע 31.12.2022 לשומה למועד הקובע 31.12.2019 נובע משינוי בשוק.",
+        "סימוכין: שומה מס' 1-98 מתאריך 23.06.2021 (מועד קובע 26.05.2021) שומה מס' 1.1-9 מתאריך 03.05.2022 "
+        "(מועד קובע 29.03.2022)",
+        "עסקאות בנכס הנישום הסמוכות למועד הקובע : 12.03.2022 מכירת דירה"])
+    got = read(office, ver)[UUID(ver)]
+    assert [(d.iso, d.status) for d in got] == [("2022-12-31", "stated")]
+
+
+def test_an_empty_header_table_with_the_label_in_its_first_row_is_read_from_the_stored_structure(office):
+    doc, ver = single(office, [HEADER, "|תוכנית | מועד קובע\n251-0479345 | 7.11.2020", "שווי 2,450,000 ₪"])
+    as_table(office, doc, ver, 1, [], ["תוכנית", "מועד קובע"], ["251-0479345", "7.11.2020"])
+    assert [(d.iso, d.block_index) for d in read(office, ver)[UUID(ver)]] == [("2020-11-07", 1)]
