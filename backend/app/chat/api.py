@@ -1060,21 +1060,68 @@ def _diagnostics(outcome: engine.TurnOutcome, payload: dict, removals: _Removals
             "limits_hit": list(outcome.workspace.limits_hit)}
 
 
-def _limited_answer(ctx: TenantContext, question: str, reason: str) -> dict:
-    """Without a cloud model: the best passages, plainly labelled as search results and not an analyzed answer."""
+SEARCH_ONLY_APPRAISALS, SEARCH_ONLY_PROFESSIONALS = 5, 3  # passages per group of a search-only answer (KTD11)
+
+
+def _search_only(ws, question: str) -> None:
+    """The deterministic part of a turn, with no model call (round 11 U3, KTD11, R19): the intent the server settles from
+    the question alone (``intent.settle`` with no claim: a property when the question holds hard evidence of one, else
+    unknown), the unit the question names (``entities.first_message``, applied only on evidence, as ``engine`` applies a
+    first message), and the pooled search under them. An unknown intent in an office that holds standards reads both
+    pools, each with its own number of passages; ``ws.intent`` stays unknown, so nothing claims an intent."""
+    from app.chat import entities
+    from app.chat import intent as intent_mod
     from app.chat import tools as T
 
-    ws = T.Workspace(ctx=ctx)
+    settled = intent_mod.settle(None, question, entities.titles_of(ws.ctx))
+    ws.intent = settled.value
+    if settled.evidence and settled.refers and (found := entities.first_message(ws.ctx, question)) is not None \
+            and found.ambiguity is None:  # an ambiguous name is no unit: nothing here asks, so nothing is narrowed
+        T.locate_unit(ws, found.unit, found.version_id)
+
+    def search(limit: int, pool: str | None = None) -> None:
+        try:
+            T.tool_search(ws, question, None, limit, None, pool)
+        except T.ToolError:
+            pass
+
+    with tenant_tx(ws.ctx) as conn:
+        both = ws.intent == "unknown" and ws.unit_focus is None and T._has_professional(ws, conn)
+    if not both:  # the pools the intent gives: a property question reads appraisals, and an office without standards too
+        search(SEARCH_ONLY_APPRAISALS)
+        return
+    # unknown, with standards in the office: each pool is asked by name under an intent that allows both as primary (the
+    # call's own limit decides the number of passages of each), and the turn's intent is put back
+    ws.intent = intent_mod.MIXED
     try:
-        T.tool_search(ws, question, None, 5)
-    except T.ToolError:
-        pass
+        search(SEARCH_ONLY_APPRAISALS, T.APPRAISAL_POOL)
+        search(SEARCH_ONLY_PROFESSIONALS, T.PROFESSIONAL_POOL)
+    finally:
+        ws.intent = settled.value
+    ws.searches = [question]
+
+
+def _limited_answer(ctx: TenantContext, question: str, reason: str) -> dict:
+    """Without a cloud model: the best passages, plainly labelled as search results and not an analyzed answer. They are
+    narrowed by the question's hard evidence as a model turn's are, and grouped by source kind under their own headings:
+    the appraisals, then the standards and professional documents, which are labelled as no source of a property's data
+    (round 11 U3, R19, R20). A group with no passage has no heading."""
+    from app.chat import tools as T
+    from app.platform import source_kinds
+
+    ws = T.Workspace(ctx=ctx)
+    _search_only(ws, question)
     sources = [_public_source(s) for s in ws.sources.values()]
     anchors.attach(ws, {"sources": sources})
     lines = [f"**{reason}** לכן לא נוסחה תשובה מנותחת. אלה הקטעים הקרובים ביותר שנמצאו בחיפוש — יש לקרוא אותם "
              "במקור:" if sources else f"**{reason}** וגם החיפוש לא העלה קטעים מתאימים."]
-    for s in ws.sources.values():
-        lines.append(f"- **{s.title}** — {s.location} [{s.sid}]")
+    shown = [s for s in ws.sources.values() if not s.is_listing]
+    for heading, group in ((f"**{T.LABEL_GROUP_APPRAISALS}**",
+                            [s for s in shown if s.source_kind == source_kinds.APPRAISAL]),
+                           (f"**{T.LABEL_GROUP_PROFESSIONAL}** — {T.LABEL_NOT_PROPERTY_DATA}",
+                            [s for s in shown if s.source_kind != source_kinds.APPRAISAL])):
+        if group:
+            lines += ["", heading, *(f"- **{s.title}** — {s.location} [{s.sid}]" for s in group)]
     return {"kind": "search_only", "status": "partial", "markdown": "\n".join(lines), "claims": [], "sources": sources,
             "measurements": [], "computations": [], "documents": [], "verification": None, "searches": ws.searches,
             "coverage": [], "clarification": None, "missing": None}

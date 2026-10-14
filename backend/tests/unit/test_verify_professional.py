@@ -324,3 +324,18 @@ def test_a_professional_question_never_removes_a_sentence_as_another_propertys_f
     assert verify._wrong_context(unit, other, asked)
     other.intent = "professional"
     assert verify._wrong_context(unit, other, asked) is None
+
+
+def _listing(ws: Workspace, kind: str, text: str = "מספר: 98.1 | שם: מדידת שטחים סינתטית") -> str:
+    """A listing source as ``_listing`` registers it (round 11 U4): it names no document, and has the kind of the
+    documents it lists."""
+    return ws.add_source(document_id=None, version_id=None, title="תקנים ומסמכים מקצועיים", section=None,
+                         location="רשימת מסמכים", kind="listing", text=text, source_kind=kind).sid
+
+
+def test_a_property_datum_citing_only_a_listing_of_standards_is_flagged_and_one_citing_a_listing_of_appraisals_is_not():
+    ws = _ws()
+    standards, appraisals = _listing(ws, "professional"), _listing(ws, "appraisal")
+    assert _checks(f"שטח הנכס 98.1 מ\"ר [{standards}].", ws) == [CHECK]
+    assert _checks(f"שטח הנכס 98.1 מ\"ר [{appraisals}].", ws) == []
+    assert _checks(f"שטח הנכס 98.1 מ\"ר [{standards}][{appraisals}].", ws) == []  # an appraisal listing beside it

@@ -363,6 +363,36 @@ def test_a_search_that_finds_nothing_in_an_office_that_holds_standards_is_not_an
     assert T.MSG_NO_STANDARD_POOL not in out and ws.standards_absent is False
 
 
+# --- a listing is a source of its kind (round 11 U4: R21, KTD12) -------------------------------------------------------
+
+def test_the_standards_listing_is_a_professional_source_and_the_appraisal_listings_stay_appraisals(office):
+    standard(office)
+    appraisal(office)
+    ws = workspace(office, "mixed")
+    standards = run(ws, "find_standards")
+    (listed,) = [s for s in ws.sources.values() if s.is_listing]
+    assert listed.source_kind == "professional" and listed.public()["source_kind"] == "professional"
+    assert sources_of(standards)[0]["kind"] == "listing"  # still a listing: only its source kind changed
+    run(ws, "find_documents", query="שומה")
+    run(ws, "list_documents", query="שומה")
+    others = [s for s in ws.sources.values() if s.is_listing and s is not listed]
+    assert len(others) == 2 and {s.source_kind for s in others} == {"appraisal"}
+
+
+def test_a_property_datum_resting_only_on_the_standards_listing_is_flagged_as_taken_from_a_standard(office):
+    from app.chat import verify
+
+    standard(office)
+    appraisal(office)
+    ws = workspace(office, "mixed")
+    run(ws, "find_standards")
+    (sid,) = [s.sid for s in ws.sources.values() if s.is_listing]
+    units = verify.split_units(f"שטח הנכס 98.1 מ\"ר [{sid}].")
+    verify.assign_ids(units, ws.claim_salt)
+    checks = [p.check for p in verify.deterministic(units, ws, "?")]
+    assert checks == ["property_datum_from_standard"]
+
+
 # --- permissions ---------------------------------------------------------------------------------------------------
 
 def test_an_employee_outside_the_group_sees_no_standard_in_any_tool(office):

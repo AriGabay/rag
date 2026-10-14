@@ -1132,6 +1132,10 @@ LABEL_APPRAISAL_KIND = "מסמך מסוג שומה"
 LABEL_APPRAISAL_DATA = "נתוני נכס מתוך שומה"
 LABEL_METHOD = "שיטה — לא נתון של נכס"
 LABEL_PROFESSIONAL = "מקור מקצועי (תקן או מסמך מקצועי)"
+# search-only mode's two groups of results (round 11 U3, KTD11): the headings, and what the second one is not
+LABEL_GROUP_APPRAISALS = "שומות"
+LABEL_GROUP_PROFESSIONAL = "תקנים ומסמכים מקצועיים"
+LABEL_NOT_PROPERTY_DATA = "אינם מקור לנתונים של נכס: להסבר מקצועי בלבד"
 MSG_POOL_CLIPPED = "המאגר שביקשת אינו מותר לשאלה מהסוג הזה: החיפוש הוגבל למאגרים שהשרת קבע לה."
 MSG_POOL_EXAMPLES = ("שאלה מקצועית: שומות מוצגות כדוגמה לבחירה של נכס מסוים בלבד, ולא ככלל מקצועי; כלל מקצועי נלקח "
                      "ממקור מקצועי.")
@@ -2510,19 +2514,22 @@ _LISTED_ID = re.compile(r"(?:D\d+\s+)?document_id=[0-9a-fA-F-]+\s*\|\s*")
 
 
 def _listing(ws: Workspace, title: str, lines: list[str], documents: list[tuple], *, key: tuple, criterion: str,
-             total: int, page: int, pages: int) -> str:
+             total: int, page: int, pages: int, source_kind: str = source_kinds.APPRAISAL) -> str:
     """A page of documents as a source of the turn: a count or a list over the set cites it (S#), and is
     checked against it like any passage. It has no document of its own; the documents it names are kept for the
     permission checks of the answer that cites it, and the set it is a page of (``key``: the tool and its query)
-    for the coverage of that answer."""
+    for the coverage of that answer. ``source_kind``: the kind of the documents it lists (round 11 U4, KTD12): a listing of
+    standards is a professional source, so a claim of a property datum resting only on it is the standard's, never the
+    property's (``verify._professional``); listings of appraisals stay appraisals."""
     # the source keeps the text without the document ids: their hex digits are no numbers of the set
     docs = [{"document_id": str(d), "title": t} for d, t in documents]
     s = ws.add_source(document_id=None, version_id=None, title=title, section=None, location="רשימת מסמכים",
                       kind="listing", text="\n".join(_LISTED_ID.sub("", ln) for ln in lines),
-                      listed=[d["document_id"] for d in docs],
+                      listed=[d["document_id"] for d in docs], source_kind=source_kind,
                       listing={"key": key, "criterion": criterion, "total": total, "page": page, "pages": pages,
                                "documents": docs})
-    return (f'<source id="{s.sid}" kind="listing" title="{_attr(title)}">\n' + "\n".join(_txt(ln) for ln in lines)
+    kind_tag = "" if source_kind == source_kinds.APPRAISAL else f' source_kind="{source_kind}"'
+    return (f'<source id="{s.sid}" kind="listing" title="{_attr(title)}"{kind_tag}>\n' + "\n".join(_txt(ln) for ln in lines)
             + f"\n</source>\nאפשר לצטט את הרשימה הזו ({s.sid}) לספירה או לרשימה של המסמכים בתחום.")
 
 
@@ -2681,7 +2688,8 @@ def tool_find_standards(ws: Workspace, query: str | None = None, page: int | Non
             if any(x.version_id in on_page for x in g.editions):
                 lines += _edition_lines(ws, g, names)
     return _listing(ws, "תקנים ומסמכים מקצועיים", lines, listed, key=("find_standards", " ".join(words)),
-                    criterion="תקנים ומסמכים מקצועיים שהמשתמש מורשה לראות", total=total, page=page, pages=pages)
+                    criterion="תקנים ומסמכים מקצועיים שהמשתמש מורשה לראות", total=total, page=page, pages=pages,
+                    source_kind=source_kinds.PROFESSIONAL)
 
 
 def _unread_listing(ws: Workspace, words: list[str]) -> str:
