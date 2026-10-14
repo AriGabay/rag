@@ -133,11 +133,12 @@ def test_a_different_property_on_the_same_street_is_never_included_and_a_lone_un
 
 
 def test_a_call_that_names_another_unit_or_another_document_is_left_as_it_is(office):
-    """Naming a different unit of the same property, or another document, is an explicit choice of that unit (U16)."""
+    """Naming a different unit of the same property is an explicit choice of that unit; naming another property's document
+    stays as asked (U16; a document of the same property with no unit is widened, see the tests below)."""
     ids = office.ids
     ws = focused(office, RECENT, ids["hatzalon7_c"])
-    out = run(ws, "search", query=QUERY, limit=6, document_ids=[ids["hatzalon7_a"]])
-    assert set(order(out)) == {ids["hatzalon7_a"]} and T.MSG_PROPERTY_SEARCHED not in out
+    out = run(ws, "search", query=QUERY, limit=6, document_ids=[ids["hatzalon11"]])  # another property's document
+    assert set(order(out)) == {ids["hatzalon11"]} and T.MSG_PROPERTY_SEARCHED not in out
     for time in (RECENT, EXPLICIT_2022):  # a fresh workspace each: a source already returned in a turn is not repeated
         ws = focused(office, time, ids["hatzalon7_c"])
         ver, reading = version_of(office, ids["hatzalon7_b"])
@@ -160,6 +161,62 @@ def test_a_call_naming_the_focus_unit_itself_is_the_focus_widened_in_a_time_mode
         assert T.MSG_UNIT_FOCUS.format(unit=ws.unit_focus["handle"]) in named
     ws = focused(office, NONE, ids["hatzalon7_c"])
     out = run(ws, "search", query=QUERY, limit=6, unit=ws.unit_focus["handle"])
+    assert set(order(out)) == {ids["hatzalon7_c"]} and T.MSG_PROPERTY_SEARCHED not in out
+
+
+# --- a call that names documents of one property and no unit (round 11 U16) -----------------------------------------------
+
+def unfocused(office, time: TimeMode) -> T.Workspace:
+    """A workspace on no unit: the model passes ``document_ids`` taken from the answer before."""
+    ws = workspace(office, "property")
+    ws.time = time
+    return ws
+
+
+@pytest.fixture
+def rent(office, monkeypatch):
+    """The office with a rent opinion of the same property (a current appraisal-pool document, same key)."""
+    m = MANIFEST["rent_monthly_with_vat"]
+    return upload(office, FIXTURES / m["file"], m["source_kind"], monkeypatch)
+
+
+def test_explicit_2022_naming_only_the_2025_appraisal_and_no_unit_reads_the_whole_property_2022_first(office):
+    ids = office.ids
+    out = run(unfocused(office, EXPLICIT_2022), "search", query=QUERY, limit=6, document_ids=[ids["hatzalon7_c"]])
+    got = order(out)
+    assert got[0] == ids["hatzalon7_a"], "the 2022 appraisal answers first"
+    assert set(got) == {ids[k] for k in KEYS[:4]} and ids["hatzalon11"] not in got
+    assert T.MSG_PROPERTY_SEARCHED in out
+
+
+def test_recent_naming_one_rent_opinion_of_the_property_reads_all_its_appraisals(office, rent):
+    ids = office.ids
+    out = run(unfocused(office, RECENT), "search", query=QUERY, limit=8, document_ids=[rent])
+    got = order(out)
+    assert {ids[k] for k in KEYS[:4]} <= set(got) and ids["hatzalon11"] not in got
+    assert got[0] == ids["hatzalon7_c"] and T.MSG_PROPERTY_SEARCHED in out
+
+
+def test_naming_documents_of_two_properties_is_left_as_it_is(office):
+    ids = office.ids
+    for time in (RECENT, EXPLICIT_2022):
+        out = run(unfocused(office, time), "search", query=QUERY, limit=6,
+                  document_ids=[ids["hatzalon7_c"], ids["hatzalon11"]])
+        assert set(order(out)) <= {ids["hatzalon7_c"], ids["hatzalon11"]} and T.MSG_PROPERTY_SEARCHED not in out
+
+
+def test_mode_none_naming_a_document_reads_that_document_only(office):
+    ids = office.ids
+    out = run(unfocused(office, NONE), "search", query=QUERY, limit=6, document_ids=[ids["hatzalon7_c"]])
+    assert set(order(out)) == {ids["hatzalon7_c"]} and T.MSG_PROPERTY_SEARCHED not in out
+
+
+def test_a_named_unit_is_never_widened_by_the_documents_it_comes_with(office):
+    ids = office.ids
+    ws = unfocused(office, EXPLICIT_2022)
+    ver, reading = version_of(office, ids["hatzalon7_c"])
+    own = T.unit_handle_of(ws, ids["hatzalon7_c"], ver, reading, 1)
+    out = run(ws, "search", query=QUERY, limit=6, unit=own, document_ids=[ids["hatzalon7_c"]])
     assert set(order(out)) == {ids["hatzalon7_c"]} and T.MSG_PROPERTY_SEARCHED not in out
 
 
@@ -225,3 +282,21 @@ def test_the_property_key_prefers_block_and_parcel_normalizes_and_is_none_withou
     assert P.property_key({"addresses": [["צאלון", "7"]], "parcels": []}) == P.property_key({"shown": ["רחוב הצאלון 7"]})
     assert P.property_key({"addresses": [["צאלון", "7"]]}) != P.property_key({"addresses": [["צאלון", "11"]]})
     assert P.property_key({}) is None and P.property_key(None) is None and P.property_key({"shown": []}) is None
+
+
+def test_a_named_document_with_no_key_or_a_file_of_two_properties_leaves_the_call_as_asked(bare):
+    a = plain(bare, "named-a", "01/01/2022", SEVEN)
+    b = plain(bare, "named-b", "01/01/2025", SEVEN)
+    nokey = plain(bare, "named-nokey", "01/01/2024", [])
+    units = [{"title": "שומה הצאלון 7 סינתטית", "blocks": ["המועד הקובע: 01/01/2023", "שווי הנכס ברחוב הצאלון 7 הוא 2,100,000 ₪ (סינתטי)."],
+              "identifiers": SEVEN},
+             {"title": "פרויקט האחר", "blocks": ["המועד הקובע: 01/01/2026", "שווי הנכס ברחוב הרקפות 3 הוא 9,999,000 ₪ (סינתטי)."],
+              "identifiers": ["רחוב הרקפות 3", "גוש 8000 חלקה 3"]}]
+    multi, _ = unit_file(bare, bare.default_group_id, "קובץ שומות סינתטי", units, sha="n" * 64)
+    for time in (RECENT, EXPLICIT_2022):
+        out = run(unfocused(bare, time), "search", query=QUERY, limit=6, document_ids=[a, nokey])
+        assert b not in order(out) and T.MSG_PROPERTY_SEARCHED not in out, "a document with no key"
+        out = run(unfocused(bare, time), "search", query=QUERY, limit=6, document_ids=[multi])
+        assert set(order(out)) <= {multi} and T.MSG_PROPERTY_SEARCHED not in out, "a file of two properties"
+    out = run(unfocused(bare, RECENT), "search", query=QUERY, limit=6, document_ids=[a])
+    assert set(order(out)) == {a, b, multi} and T.MSG_PROPERTY_SEARCHED in out, "the control: one keyed document is widened"

@@ -1727,27 +1727,21 @@ def _unit_search(ws: Workspace, conn: Connection, handle: str, query: str, limit
     return [], [], MSG_UNIT_SEARCHED.format(unit=unit, pages=_unit_pages(*cx.pages(number)), extended="", query=_txt(query))
 
 
-def _property_search(ws: Workspace, conn: Connection, handle: str, query: str,
-                     limit: int) -> tuple[list[dict], list[str], str | None] | None:
-    """The time search of the conversation's property (round 11 U14, R4, R11, R12, KTD6, KTD9): when the turn has a time
-    mode and the focus unit's property is appraised by other units too (``property.same_property_units``: one key from
-    the stored identifiers), the search reads all of them instead of the focus unit alone — a question about 2022 asked
-    in a conversation on the 2025 appraisal must read the 2022 one. A unit of a file of several is read inside its own
-    blocks (``contexts.reach``, as ``_unit_search`` does), so another property of that file stays out; a file of one unit
-    is read whole, all those files in one search. The fused windows are merged by score and the documents ordered by the
-    mode (``ranked_by_time``). None: the unit has no key, or is the only one with it — the unit search stands.
-    Returns (hits, notes for the model, the answer when nothing was found), as ``_unit_search`` does."""
-    v, cx, number = _unit_of(conn, ws, handle)
-    mine = next((u for u in unit_store.ensure(conn, v.version_id) if u.unit_no == number), None)
-    key = property_key(mine.identifiers) if mine is not None else None
-    if key is None:
-        return None
+def _property_found(ws: Workspace, conn: Connection, key: str) -> list[tuple]:
+    """(document, version, unit number) of every subject unit of the property ``key``, once per turn and data version."""
     memo_key = (key, current_data_version(conn))
     found = ws.property_memo.get(memo_key)
     if found is None:
         found = ws.property_memo[memo_key] = same_property_units(conn, key)
-    if len(found) < 2 or (v.document_id, v.version_id, number) not in found:
-        return None
+    return found
+
+
+def _property_hits(ws: Workspace, conn: Connection, found: list[tuple], query: str,
+                   limit: int) -> tuple[list[dict], list[str], str | None]:
+    """The time search over every unit of one property (round 11 U14, U16): a unit of a file of several is read inside its
+    own blocks (``contexts.reach``), so another property of that file stays out; a file of one unit is read whole, all
+    those files in one search. The fused windows are merged by score and the documents ordered by the mode
+    (``ranked_by_time``). Returns (hits, notes for the model, the answer when nothing was found)."""
     shared = [(d, ver, n, contexts_of(ws, conn, ver)) for d, ver, n in found]
     whole = [d for d, _, _, c in shared if not c.multi]
     hits: list[dict] = []
@@ -1763,6 +1757,50 @@ def _property_search(ws: Workspace, conn: Connection, handle: str, query: str,
     if not any(h.get("lexical_support") for h in hits):
         return [], [], MSG_PROPERTY_NOTHING.format(count=len(found), query=_txt(query))
     return ranked_by_time(ws, conn, hits, limit), [MSG_PROPERTY_SEARCHED], None
+
+
+def _property_search(ws: Workspace, conn: Connection, handle: str, query: str,
+                     limit: int) -> tuple[list[dict], list[str], str | None] | None:
+    """The time search of the conversation's property (round 11 U14, R4, R11, R12, KTD6, KTD9): when the turn has a time
+    mode and the focus unit's property is appraised by other units too (``property.same_property_units``: one key from
+    the stored identifiers), the search reads all of them instead of the focus unit alone — a question about 2022 asked
+    in a conversation on the 2025 appraisal must read the 2022 one (``_property_hits``). None: the unit has no key, or
+    is the only one with it — the unit search stands.
+    Returns (hits, notes for the model, the answer when nothing was found), as ``_unit_search`` does."""
+    v, cx, number = _unit_of(conn, ws, handle)
+    mine = next((u for u in unit_store.ensure(conn, v.version_id) if u.unit_no == number), None)
+    key = property_key(mine.identifiers) if mine is not None else None
+    if key is None:
+        return None
+    found = _property_found(ws, conn, key)
+    if len(found) < 2 or (v.document_id, v.version_id, number) not in found:
+        return None
+    return _property_hits(ws, conn, found, query, limit)
+
+
+def _named_property(ws: Workspace, conn: Connection, docs: list[UUID]) -> list[tuple] | None:
+    """The units of the one property the documents of a call name (round 11 U16, R4, R11): the model passes
+    ``document_ids`` (one appraisal of the property, from the answer before) where it passes no unit, so a time question
+    must widen from the documents too. Every named document must be a current appraisal whose subject units all state a
+    property key and share ONE key (a single-unit file, or the subject units of a file of several that are one property);
+    two keys, a document or a unit with no key, or a document that is not an appraisal leaves the call as asked. None, too,
+    when the property is appraised by no other unit. Returns ``same_property_units`` of that key."""
+    if not docs:
+        return None
+    files = conn.execute(text(
+        "SELECT d.id AS document_id, v.id AS version_id FROM documents d JOIN document_versions v ON v.document_id = d.id"
+        f" AND v.is_current WHERE d.id = ANY(:d) AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"), {"d": list(docs)}).all()
+    if {f.document_id for f in files} != set(docs):
+        return None
+    stored = unit_store.stored_many(conn, [f.version_id for f in files])
+    keys: set[str | None] = set()
+    for f in files:
+        units = stored.get(f.version_id) or unit_store.ensure(conn, f.version_id)
+        keys |= {property_key(u.identifiers) for u in units if u.kind not in contexts.NON_SUBJECT_KINDS}
+    if len(keys) != 1 or None in keys:
+        return None
+    found = _property_found(ws, conn, next(iter(keys)))
+    return found if len(found) >= 2 else None
 
 
 def _clip_to_unit(conn: Connection, version_id, cx, kind: str, bs, be, body: str,
@@ -1831,6 +1869,10 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
             notes += pool_notes
             hits = []
             absent = False
+            # a time question naming the documents of one property reads every appraisal of it (U16); a document question
+            # reads the named documents only
+            property_units = (_named_property(ws, conn, docs) if docs and ws.time.mode != "none"
+                              and not (ws.intent == "document" and ws.named_documents) else None)
             for p in passes:
                 if p.pool == PROFESSIONAL_POOL and (ws.intent in (PROFESSIONAL, MIXED) or asked) \
                         and not _has_professional(ws, conn):
@@ -1847,7 +1889,12 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 n = limit if absent and p.pool == APPRAISAL_POOL else p.limit
                 left_out = copies_left_out(ws, conn) if p.pool == PROFESSIONAL_POOL and not docs else ()
                 scope = SearchScope(document_ids=tuple(docs), source_kinds=POOL_KINDS[p.pool], exclude_versions=left_out)
-                if ws.time.mode != "none" and p.pool == APPRAISAL_POOL and p.role == PRIMARY:
+                wide = (_property_hits(ws, conn, property_units, query, n)
+                        if property_units and p.pool == APPRAISAL_POOL and p.role == PRIMARY else None)
+                if wide is not None and not wide[2]:
+                    found = wide[0]
+                    notes += wide[1]
+                elif ws.time.mode != "none" and p.pool == APPRAISAL_POOL and p.role == PRIMARY:
                     # the appraisals that answer: the fused window, its documents ordered by date, then cut (KTD6); the
                     # professional pool and the examples beside it are read as they always were (R16)
                     found = ranked_by_time(ws, conn, memoized_search(ws, conn, query, n, scope, window=True), n)
