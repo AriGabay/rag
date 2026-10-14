@@ -120,6 +120,16 @@ or, where the units state none, by their passages (``entities.first_message``) �
 comparison and drops that default. It is also the asked property when no title or alias names one
 (``located_contexts``): a claim about it resting only on another unit's value is removed as ``wrong_subject``.
 
+**Time search** (round 12 U7: KTD6, KTD7; R9-R14, R20): in a turn with a time mode (the switch, or a requested time) a
+``search`` about an identified property — the conversation's unit, a call naming it, the documents a call names, or the
+address or parcel the question itself names — lists the property's appraisal units and their valuation dates first
+(``property_inventory``, from the turn's property graph), selects up to ``CAP_UNITS`` of them in the mode's order, searches
+each on its own (``_property_hits``) and ranks the hits per (version, unit) (``ranked_by_time``). What each call checked is a
+coverage record (``coverage_record``: per unit hit, no match or not searched for the cap, with an ``undated`` flag;
+unlinked candidates; undetermined units) kept in ``Workspace.time_calls`` with the S# the call returned; the answer's
+coverage is that of the calls that produced the data it cites (``coverage_for``, ``merge_coverage``). The server states
+nothing in words here: the wording and the payload are built from the record. Without a time mode none of this runs.
+
 A file holding several appraisals, or an appendix about a comparison property, is read as several appraisal contexts
 (round 7 U6: KTD7; R20–R22; ``app.chat.contexts``, derived from the stored reading and cached per reading): search
 hits, reads (with a marker where a context starts inside a part), the outline (each context's sections apart, a
@@ -157,7 +167,7 @@ from app.chat import unread as unread_text
 from app.chat.contexts import MSG_NO_TITLE
 from app.chat.evidence import TABLE_SIZE_PREFIX
 from app.chat.intent import MIXED, PROFESSIONAL
-from app.chat.property import Gathered, Partition, PropertyGraph, build_graph
+from app.chat.property import Gathered, Partition, PropertyGraph, build_graph, label_of
 from app.chat.timeframe import TimeMode
 from app.chat.timing import StageClock
 from app.config import get_settings
@@ -527,6 +537,12 @@ class Workspace:
     # gathered sets and the partitions it computes); the property a call's named documents are of, per (the documents, the
     # data version) (round 11 U16)
     property_memo: dict = field(default_factory=dict)
+    # the time-ranked search calls of the turn (round 12 U7, KTD7; ``TimeCall``): each with the coverage record of its own
+    # inventory, built from the same graph snapshot, and the S# its results became. ``time_coverage`` is the record of all
+    # of them together (``merge_coverage``); U8 asks ``coverage_for`` for the calls that produced the cited data. Empty and
+    # None in a turn without a time mode (R14)
+    time_calls: list = field(default_factory=list)
+    time_coverage: dict | None = None
     # chunk id -> (first block, last block): what the ranking and the rendering of a search's hits read (``chunk_blocks``)
     chunk_memo: dict = field(default_factory=dict)
     # the windows an identical read returned, kept for the turn (round 9 R16, KTD9, ``_memoized_read``): (a page range,
@@ -1592,39 +1608,44 @@ def _time_memo_key(time: TimeMode) -> tuple:
 
 
 def ranked_by_time(ws: Workspace, conn: Connection, hits: list[dict], limit: int) -> list[dict]:
-    """The hits of the fused window, with the relevant documents ordered by the turn's time mode (KTD6, R4, R12). Relevance
-    comes first: the relevant set is the first ``SEARCH_MAX`` distinct documents by the rank of their best passage in the
-    window (the first ``limit`` for a workspace with ``exact_limit``), and only those are ordered by date — a barely relevant newer document is not lifted above them, and the
-    documents past the set keep their relevance order after it. A document is dated by the valuation date of the unit that
-    holds its best passage; an unknown or conflicting date ranks as unknown. The output covers the best hit of every document
-    of the ordered set (so a small ``limit`` never cuts a relevant dated document, and never more than ``SEARCH_MAX`` hits),
-    then, while room remains under ``max(limit, that count)`` (``limit`` itself for a workspace with ``exact_limit``), the remaining hits: the set's further hits in the same
-    document order (each document's in relevance order), then the hits past the set in relevance order."""
+    """The hits of the fused window, with the relevant appraisal units ordered by the turn's time mode (KTD6, R4, R12; round
+    12 U7, R10, KTD6). Hits are grouped by (version, unit), never by file: a file of several appraisals is not dated by one
+    date, each of its units is a group with its own valuation date. Relevance comes first: the relevant set is the first
+    ``SEARCH_MAX`` groups by the rank of their best passage in the window (the first ``limit`` for a workspace with
+    ``exact_limit``), and only those are ordered by date — a barely relevant newer unit is not lifted above them, and the
+    groups past the set keep their relevance order after it. A group is dated by the valuation date of its unit; an unknown
+    or conflicting date ranks as unknown. The output covers the best hit of every group of the ordered set (so a small
+    ``limit`` never cuts a relevant dated unit, and never more than ``SEARCH_MAX`` hits), then, while room remains under
+    ``max(limit, that count)`` (``limit`` itself for a workspace with ``exact_limit``), the remaining hits: the set's further
+    hits in the same group order (each group's in relevance order), then the hits past the set in relevance order. A hit
+    whose chunk has no block belongs to its version's undated group."""
     if not hits:
         return hits
-    by_document: dict[str, list[dict]] = {}
+    blocks = chunk_blocks(ws, conn, [h["chunk_id"] for h in hits])
+    starts = {h["chunk_id"]: blocks.get(h["chunk_id"], (None, None))[0] for h in hits}
+    # the units of every hit are needed to group them: the dates (and, with them, the units) of the versions are read
+    # together before the loop
+    prime_dates(ws, conn, [h["version_id"] for h in hits if starts[h["chunk_id"]] is not None])
+    by_unit: dict[tuple, list[dict]] = {}
+    valued: dict[tuple, chat_dates.UnitValuation] = {}
     for h in hits:
-        by_document.setdefault(str(h["document_id"]), []).append(h)
-    groups = list(by_document.values())
-    # a workspace with ``exact_limit`` (a search-only answer) shows ``limit`` documents: those are the relevant set, so the
-    # date order only permutes the documents relevance chose and never cuts the best older match (review #4)
+        uv = valuation_of(ws, conn, h["version_id"], starts[h["chunk_id"]])
+        key = (str(h["version_id"]), uv.unit_no)
+        by_unit.setdefault(key, []).append(h)
+        valued.setdefault(key, uv)
+    groups = list(by_unit.items())
+    # a workspace with ``exact_limit`` (a search-only answer) shows ``limit`` groups: those are the relevant set, so the
+    # date order only permutes the units relevance chose and never cuts the best older match (review #4)
     cut = min(SEARCH_MAX, limit) if ws.exact_limit else SEARCH_MAX
     relevant, past = groups[:cut], groups[cut:]
-    # only the best passage of each relevant document is dated: its block is the only one read, and its versions' dates
-    # (and units) are read together before the loop
-    bests = [group[0] for group in relevant]
-    blocks = chunk_blocks(ws, conn, [best["chunk_id"] for best in bests])
-    starts = {best["chunk_id"]: blocks.get(best["chunk_id"], (None, None))[0] for best in bests}
-    prime_dates(ws, conn, [best["version_id"] for best in bests if starts[best["chunk_id"]] is not None])
     keyed = []
-    for position, group in enumerate(relevant):
-        best = group[0]
-        uv = valuation_of(ws, conn, best["version_id"], starts[best["chunk_id"]])
+    for position, (key, group) in enumerate(relevant):
+        uv = valued[key]
         when = (uv.date.iso, uv.date.precision, None) if uv.status == "stated" and uv.date is not None else None
         keyed.append((time_key(ws.time, when), position, group))
     keyed.sort(key=lambda k: k[:2])
     firsts = [g[0] for *_, g in keyed]
-    further = [h for *_, g in keyed for h in g[1:]] + [h for g in past for h in g]
+    further = [h for *_, g in keyed for h in g[1:]] + [h for _, g in past for h in g]
     return (firsts + further)[:limit if ws.exact_limit else min(SEARCH_MAX, max(limit, len(firsts)))]
 
 
@@ -1776,7 +1797,7 @@ def _unit_search(ws: Workspace, conn: Connection, handle: str, query: str, limit
 
 def property_graph(ws: Workspace, conn: Connection) -> PropertyGraph:
     """The turn's property graph (round 12 U6, KTD5): the relation of every visible, current subject unit to every other,
-    built once per turn and data version and kept in ``ws.property_memo``. Retrieval (``_property_found``), the timeline
+    built once per turn and data version and kept in ``ws.property_memo``. Retrieval (``_property_search``, ``_named_gathered``, ``_question_gathered``), the timeline
     (``property_partition``) and the coverage read this one snapshot. Identities are derived on first use and cached in
     the turn's ``date_cache`` (``identity.identities``)."""
     key = ("graph", current_data_version(conn))
@@ -1812,50 +1833,356 @@ def property_partition(ws: Workspace, conn: Connection) -> Partition:
     return graph.partition(focus)
 
 
-def _property_found(ws: Workspace, conn: Connection, version_id, unit_no: int) -> list[tuple]:
-    """(document, version, unit number) of every unit of the focus unit's property — its gathered set (``property_gathered``),
-    in document and unit order. Empty when the unit is not in the graph."""
-    gathered = property_gathered(ws, conn, version_id, unit_no)
-    return [(n.document_id, n.version_id, n.unit_no) for n in gathered.members] if gathered is not None else []
+# --- round 12 U7: the inventory, the focused per-unit search and the coverage record ---------------------------------
+#
+# A time question about an identified property does not search a relevance window and hope the property's latest appraisal
+# is in it (a window of twelve documents cannot show that). The server lists the property's appraisals and their valuation
+# dates first (the *inventory*: the focus unit's gathered set in the turn's property graph), selects up to ``CAP_UNITS`` of
+# them in the order the turn's mode gives, searches each selected unit on its own, ranks the hits per (version, unit)
+# (``ranked_by_time``) and records, per unit, whether it was searched with a match, searched without one, or not searched
+# for the cap. The record is built from the graph snapshot the inventory came from and kept on the workspace for the answer's
+# wording and payload (U8): it states nothing in words.
+
+CAP_UNITS = 8          # appraisal units one call reads (KTD6)
+CAP_UNDATED = 2        # of them, up to this many are kept for units with no valuation date, in document order
+NAMED_CANDIDATES = 3   # unlinked candidates the record names, newest first; the rest are counted
+COVERAGE_V = 1         # the record's version (``answer.time.coverage.v``)
+HIT, NO_MATCH, NOT_SEARCHED_CAP = "hit", "no_match", "not_searched_cap"
+PROPERTY, UNIT, WINDOW = "property", "unit", "window"  # what a record covers: a gathered property, one unit, a relevance window
+# why a record is not complete (``assess_coverage``); a unit that causes one carries ``blocks``
+B_NEWER, B_NO_MATCH, B_RANGE = "newer_not_searched", "newer_no_match", "range_not_searched"
+B_UNDATED, B_CANDIDATES, B_UNDETERMINED = "undated", "candidates", "undetermined"
+B_NOT_IDENTIFIED, B_WINDOW, B_SEVERAL = "not_identified", "window", "several_scopes"
 
 
-def _property_hits(ws: Workspace, conn: Connection, found: list[tuple], query: str,
-                   limit: int) -> tuple[list[dict], list[str], str | None]:
-    """The time search over every unit of one property (round 11 U14, U16): a unit of a file of several is read inside its
-    own blocks (``contexts.reach``), so another property of that file stays out; a file of one unit is read whole, all
-    those files in one search. The fused windows are merged by score and the documents ordered by the mode
-    (``ranked_by_time``). Returns (hits, notes for the model, the answer when nothing was found)."""
-    shared = [(d, ver, n, contexts_of(ws, conn, ver)) for d, ver, n in found]
-    whole = [d for d, _, _, c in shared if not c.multi]
+@dataclass
+class InventoryUnit:
+    """One appraisal unit of the property's inventory: what it is, its stated valuation date (``date``: ISO date and
+    precision; None when the unit states none or several that disagree — ``date_status`` says which), the reason of the
+    link it joined by, and its search status (``HIT``, ``NO_MATCH`` or ``NOT_SEARCHED_CAP``). ``undated`` is a flag, not a
+    status: an undated unit is searched or not like any other."""
+    document_id: Any
+    version_id: Any
+    unit_no: int
+    title: str | None
+    date: tuple[str, str] | None
+    date_status: str
+    link: str | None = None
+    focus: bool = False
+    status: str = NOT_SEARCHED_CAP
+
+    @property
+    def key(self) -> tuple[str, int]:
+        return (str(self.document_id), self.unit_no)
+
+    @property
+    def undated(self) -> bool:
+        return self.date is None
+
+    @property
+    def dated(self) -> tuple[str, str, str | None] | None:
+        return None if self.date is None else (self.date[0], self.date[1], None)
+
+
+@dataclass
+class TimeCall:
+    """One time-ranked search call of a turn: its query, the coverage record of what it checked, and the S# its results
+    became (the sources the answer may cite), so the coverage of a datum is that of the call that produced it (KTD7)."""
+    query: str
+    record: dict | None = None
+    sids: list[str] = field(default_factory=list)
+
+
+def unit_dating(ws: Workspace, conn: Connection, version_id, unit_no: int) -> tuple[tuple[str, str] | None, str]:
+    """((date, precision) or None, the unit's date status) of one unit: its stated valuation date, ``conflict`` when its dates
+    disagree (the unit ranks as unknown), ``none`` when it states none. Read from the turn's date cache."""
+    dates = chat_dates.valuation_dates(conn, [version_id], cache=ws.date_cache).get(UUID(str(version_id)), ())
+    uv = chat_dates.resolve_unit([d for d in dates if d.unit_no == unit_no], unit_no)
+    return ((uv.date.iso, uv.date.precision) if uv.status == "stated" and uv.date is not None else None), uv.status
+
+
+def _inventory_key(time: TimeMode, dated: tuple[str, str, str | None] | None) -> tuple:
+    """The order key of an inventory unit under the turn's mode (KTD6; smaller is first). ``recent``: ``time_key`` (the
+    data not later than the anchor newest first, then the later-dated, then the undated). ``explicit``: the units dated in
+    the requested time first (0), then the units dated after it (1, nearest first: a later appraisal may list earlier
+    data), then the undated (2), then the units dated before it (3, which cannot hold data of the requested time and are
+    read only if the cap leaves room)."""
+    if time.mode != "explicit" or time.requested is None:
+        return time_key(time, dated)
+    if dated is None:
+        return (2, 0)
+    iso, precision, end = dated
+    first, last = bounds(iso, precision)[0], bounds(end or iso, precision)[1]
+    wanted = _wanted(time.requested)
+    gap = min(((lo - last).days if lo and last < lo else (first - hi).days if hi and first > hi else 0) for lo, hi in wanted)
+    if gap == 0:
+        return (0, 0)
+    return (1, gap) if any(lo is None or last >= lo for lo, _ in wanted) else (3, gap)
+
+
+def property_inventory(ws: Workspace, conn: Connection, gathered: Gathered) -> list[InventoryUnit]:
+    """The property's appraisal units with their valuation dates, ordered by the turn's mode (KTD6): the gathered set of the
+    focus unit, each member dated per unit (``chat.dates``, assigned by block range, so a file of several units is never
+    dated by one date). Ties break by document id and unit number, so the order is total."""
+    members = gathered.members
+    prime_dates(ws, conn, [n.version_id for n in members])
+    reasons = gathered.reasons()
+    out = []
+    for n in members:
+        date_, status = unit_dating(ws, conn, n.version_id, n.unit_no)
+        out.append(InventoryUnit(n.document_id, n.version_id, n.unit_no, n.title, date_, status, reasons.get(n.key),
+                                 n.key == gathered.seed))
+    return sorted(out, key=lambda u: (_inventory_key(ws.time, u.dated), u.key))
+
+
+def select_units(ordered: list[InventoryUnit]) -> list[InventoryUnit]:
+    """The units one call searches (KTD6): at most ``CAP_UNITS``, in the order they are given. Up to ``CAP_UNDATED`` slots
+    are kept for undated units (in document order) so a unit with no date is never silently left out behind a long dated
+    history; slots the dated units do not fill go to further undated ones."""
+    undated = [u for u in ordered if u.undated]
+    dated = [u for u in ordered if not u.undated]
+    chosen = dated[:CAP_UNITS - min(CAP_UNDATED, len(undated))]
+    chosen += undated[:CAP_UNITS - len(chosen)]
+    keys = {u.key for u in chosen}
+    return [u for u in ordered if u.key in keys]
+
+
+def _unit_scope(ws: Workspace, conn: Connection, unit: InventoryUnit) -> SearchScope:
+    """The search scope of one inventory unit: its version, and inside a file of several units its block range
+    (``contexts.reach``, extended over a neighbouring unit only up to the next certain edge)."""
+    version = UUID(str(unit.version_id))
+    kinds = POOL_KINDS[APPRAISAL_POOL]
+    cx = contexts_of(ws, conn, version)
+    if cx.multi:
+        reach = cx.reach(unit.unit_no)
+        return SearchScope(version_ids=(version,), blocks=(reach.first, reach.last), source_kinds=kinds)
+    return SearchScope(version_ids=(version,), source_kinds=kinds)
+
+
+def _titles(conn: Connection, document_ids: Iterable) -> dict[str, str]:
+    """document id -> title, for the documents a record names (under the caller's permissions)."""
+    ids = sorted({str(d) for d in document_ids})
+    if not ids:
+        return {}
+    return {str(r.id): r.title for r in conn.execute(
+        text("SELECT id, title FROM documents WHERE id = ANY(CAST(:d AS uuid[]))"), {"d": ids})}
+
+
+def _candidates_of(ws: Workspace, conn: Connection, gathered: Gathered) -> dict:
+    """The unlinked candidates of the property for the record (KTD7): up to ``NAMED_CANDIDATES`` named newest first with
+    their dates and the reason they are not linked, the rest counted."""
+    if not gathered.candidates:
+        return {"named": [], "count": 0}
+    prime_dates(ws, conn, [c.node.version_id for c in gathered.candidates])
+    rows = []
+    for c in gathered.candidates:
+        date_, status = unit_dating(ws, conn, c.node.version_id, c.node.unit_no)
+        rows.append((_inventory_key(ws.time, None if date_ is None else (*date_, None)), c.node.key, c, date_, status))
+    rows.sort(key=lambda r: r[:2])
+    titles = _titles(conn, [r[2].node.document_id for r in rows[:NAMED_CANDIDATES]])
+    named = [{"document_id": str(c.node.document_id), "version_id": str(c.node.version_id), "unit_no": c.node.unit_no,
+              "title": c.node.title or titles.get(str(c.node.document_id)), "date": d[0] if d else None,
+              "precision": d[1] if d else None, "date_status": status, "reason": c.link.reason}
+             for _, _, c, d, status in rows[:NAMED_CANDIDATES]]
+    return {"named": named, "count": len(rows)}
+
+
+def coverage_record(ws: Workspace, conn: Connection, *, scope: str, via: str | None, units: list[InventoryUnit],
+                    gathered: Gathered | None = None) -> dict:
+    """The coverage record of one call (KTD7), fully materialized (strings, numbers, no foreign keys): the mode and the
+    requested time; what it covers (``scope``: a gathered ``property``, one ``unit``, a relevance ``window``) and how the
+    property was identified (``via``: the conversation's ``focus``, the call's named ``documents``, the ``question``'s own
+    address or parcel); the property's label and link reasons; every inventory unit with its date, ``undated`` flag, search
+    status, title, link reason and whether it keeps the answer from being complete; the unlinked candidates; the count of
+    undetermined units. ``complete`` and ``blocking`` come from ``assess_coverage``."""
+    titles = _titles(conn, {u.document_id for u in units})
+    time = ws.time
+    record = {
+        "v": COVERAGE_V, "mode": time.mode, "requested": time.requested.as_dict() if time.requested else None,
+        "scope": scope, "via": via, "identified": gathered is not None and gathered.identified and scope == PROPERTY,
+        "property": ({"label": label_of(gathered.members), "reasons": list(dict.fromkeys(
+            j.link.reason for j in gathered.joined)), "units": len(gathered.members)} if gathered is not None else None),
+        "units": [{"document_id": str(u.document_id), "version_id": str(u.version_id), "unit_no": u.unit_no,
+                   "title": u.title or titles.get(str(u.document_id)), "date": u.date[0] if u.date else None,
+                   "precision": u.date[1] if u.date else None, "date_status": u.date_status, "undated": u.undated,
+                   "status": u.status, "link": u.link, "focus": u.focus, "blocks": False} for u in units],
+        "candidates": _candidates_of(ws, conn, gathered) if gathered is not None else {"named": [], "count": 0},
+        "undetermined": len(gathered.undetermined) if gathered is not None else 0,
+    }
+    return assess_coverage(time, record)
+
+
+def assess_coverage(time: TimeMode, record: dict) -> dict:
+    """Mark the units that keep a record from being complete, list why, and set ``complete`` (KTD7). Completeness is relative
+    to the appraisals visible to the user. A record is never complete for a turn with no identified property (its coverage is
+    the search window, or the one unit), when it merges calls of different scopes, or while an unlinked candidate or an
+    undetermined unit remains.
+
+    - **Recent:** complete only when the unit holding the newest datum found is the newest dated inventory unit (or ties
+      it): a dated unit that comes before the best hit in the mode's order (``time_key``) and was not searched, or was
+      searched without a match, is named (it may hold a newer datum phrased differently). Older units left unsearched do
+      not matter (AE4).
+    - **Explicit:** complete when every unit whose date can fall in or after the requested time (the first two classes of
+      ``_inventory_key``) was searched.
+    - **Undated units** (no stated date, or dates that disagree) always keep a record from being complete: their data
+      cannot be called the latest or placed in the range."""
+    explicit = time.mode == "explicit" and time.requested is not None
+    units = record["units"]
+
+    def key_of(u: dict) -> tuple:
+        return _inventory_key(time, None if u["date"] is None else (u["date"], u["precision"], None))
+
+    best = min((key_of(u) for u in units if u["status"] == HIT and not u["undated"]), default=None)
+    blocking: list[str] = []
+    for u in units:
+        reason = None
+        if u["undated"]:
+            reason = B_UNDATED
+        elif explicit:
+            if u["status"] == NOT_SEARCHED_CAP and key_of(u)[0] in (0, 1):
+                reason = B_RANGE
+        elif u["status"] != HIT and (best is None or key_of(u) < best):
+            reason = B_NEWER if u["status"] == NOT_SEARCHED_CAP else B_NO_MATCH
+        u["blocks"] = reason is not None
+        if reason is not None:
+            blocking.append(reason)
+    if record["candidates"]["count"]:
+        blocking.append(B_CANDIDATES)
+    if record["undetermined"]:
+        blocking.append(B_UNDETERMINED)
+    if record["scope"] == UNIT or (record["scope"] == PROPERTY and not record["identified"]):
+        blocking.append(B_NOT_IDENTIFIED)
+    if record["scope"] == WINDOW:
+        blocking.append(B_WINDOW)
+    record["blocking"] = list(dict.fromkeys(blocking))
+    record["complete"] = bool(record["identified"]) and record["scope"] == PROPERTY and not record["blocking"]
+    return record
+
+
+def merge_coverage(time: TimeMode, records: list[dict]) -> dict | None:
+    """The coverage of several calls of one turn (KTD7): for calls over the same gathered property a unit counts as
+    searched only if every call searched it (``not_searched_cap`` if any did not), and has a match if any call matched; the
+    completeness is assessed again over the merged statuses. Calls of different scopes or properties have no common
+    coverage: the first record stands, marked ``several_scopes`` and never complete."""
+    if not records:
+        return None
+    first = records[0]
+    if len(records) == 1:
+        return first
+    refs = [(u["document_id"], u["unit_no"]) for u in first["units"]]
+    same = all(r["scope"] == PROPERTY and first["scope"] == PROPERTY and
+               [(u["document_id"], u["unit_no"]) for u in r["units"]] == refs for r in records)
+    merged = json.loads(json.dumps(first))
+    merged["calls"] = len(records)
+    if not same:
+        merged["complete"] = False
+        merged["blocking"] = list(dict.fromkeys([*merged["blocking"], B_SEVERAL]))
+        return merged
+    for i, u in enumerate(merged["units"]):
+        seen = [r["units"][i]["status"] for r in records]
+        u["status"] = NOT_SEARCHED_CAP if NOT_SEARCHED_CAP in seen else HIT if HIT in seen else NO_MATCH
+    return assess_coverage(time, merged)
+
+
+def coverage_for(ws: Workspace, sids: Iterable[str] | None = None) -> dict | None:
+    """The turn's coverage for the data the answer cites (KTD7): the merged record of the calls whose results include one of
+    the cited ``sids``; of every call when none does, or when ``sids`` is None. None for a turn that made no time-ranked
+    call (off mode, R14)."""
+    calls = ws.time_calls
+    if sids is not None:
+        cited = set(sids)
+        calls = [c for c in calls if cited & set(c.sids)] or calls
+    return merge_coverage(ws.time, [c.record for c in calls if c.record is not None])
+
+
+def _register_call(ws: Workspace, call: TimeCall | None, sources: Iterable[Source] = ()) -> None:
+    """Keep a finished call and its results on the workspace, and refresh the turn's coverage (``Workspace.time_coverage``)."""
+    if call is None or call.record is None:
+        return
+    call.sids = [s.sid for s in sources]
+    ws.time_calls.append(call)
+    ws.time_coverage = coverage_for(ws)
+
+
+def unit_coverage(ws: Workspace, conn: Connection, handle: str, found: bool, in_focus: bool) -> dict:
+    """The record of a call that searched one unit only (the unit search stood): the property's inventory of one unit when
+    the unit is the conversation's, is in the graph and states an identity (the property is appraised by no other unit, but
+    its candidates and undetermined units still count); otherwise a ``unit`` record, which says the property was not
+    identified (R13) and is never complete. ``found``: the search matched."""
+    v, cx, number = _unit_of(conn, ws, handle)
+    gathered = property_gathered(ws, conn, v.version_id, number) if in_focus else None
+    if gathered is not None and gathered.identified:
+        units = property_inventory(ws, conn, gathered)
+        for u in units:
+            u.status = HIT if found else NO_MATCH
+        return coverage_record(ws, conn, scope=PROPERTY, via="focus", units=units, gathered=gathered)
+    prime_dates(ws, conn, [v.version_id])
+    date_, status = unit_dating(ws, conn, v.version_id, number)
+    title = cx.segment(number).title if cx.multi else None
+    unit = InventoryUnit(v.document_id, v.version_id, number, title, date_, status, None, True, HIT if found else NO_MATCH)
+    return coverage_record(ws, conn, scope=UNIT, via="focus" if in_focus else "unit", units=[unit], gathered=None)
+
+
+def window_coverage(ws: Workspace, conn: Connection, hits: list[dict]) -> dict:
+    """The record of a time-ranked relevance window (no identified property: KTD7, "its coverage is the search window"): the
+    (version, unit) groups the ranked hits are in, each searched with a match. Never complete."""
+    prime_dates(ws, conn, [h["version_id"] for h in hits])
+    blocks = chunk_blocks(ws, conn, [h["chunk_id"] for h in hits])
+    units: dict[tuple, InventoryUnit] = {}
+    for h in hits:
+        start = blocks.get(h["chunk_id"], (None, None))[0]
+        unit_no = valuation_of(ws, conn, h["version_id"], start).unit_no
+        if unit_no is None or (str(h["document_id"]), unit_no) in units:
+            continue
+        date_, status = unit_dating(ws, conn, h["version_id"], unit_no)
+        units[(str(h["document_id"]), unit_no)] = InventoryUnit(h["document_id"], h["version_id"], unit_no, h["title"],
+                                                                date_, status, None, False, HIT)
+    return coverage_record(ws, conn, scope=WINDOW, via=None, units=list(units.values()), gathered=None)
+
+
+def _property_hits(ws: Workspace, conn: Connection, gathered: Gathered, query: str, limit: int,
+                   call: TimeCall | None = None, via: str = "focus") -> tuple[list[dict], list[str], str | None]:
+    """The time search over the units of one property (round 11 U14, U16; round 12 U7, R9-R11, KTD6): the inventory (the
+    gathered set with the units' valuation dates, ordered by the turn's mode), the units it selects (the cap), and one
+    search per selected unit inside its own blocks — a unit of a file of several never reads another property of that file,
+    and a file of one unit is read whole. A unit counts as matched only when a hit holds the query's words (exactly or
+    nearly), as in ``_unit_search``; the hits of matched units are merged by score and ranked per (version, unit) by the
+    mode (``ranked_by_time``). The coverage record (what was matched, not matched and not searched) is set on ``call``.
+    Returns (hits, notes for the model, the answer when nothing was found)."""
+    inventory = property_inventory(ws, conn, gathered)
+    selected = select_units(inventory)
+    searched = {u.key for u in selected}
     hits: list[dict] = []
-    if whole:
-        hits += memoized_search(ws, conn, query, limit, SearchScope(
-            document_ids=tuple(dict.fromkeys(whole)), source_kinds=POOL_KINDS[APPRAISAL_POOL]), window=True)
-    for _, ver, n, c in shared:
-        if c.multi:
-            reach = c.reach(n)
-            hits += memoized_search(ws, conn, query, limit, SearchScope(
-                version_ids=(ver,), blocks=(reach.first, reach.last), source_kinds=POOL_KINDS[APPRAISAL_POOL]), window=True)
+    for u in inventory:
+        if u.key not in searched:
+            u.status = NOT_SEARCHED_CAP
+    for u in selected:
+        found = memoized_search(ws, conn, query, limit, _unit_scope(ws, conn, u))
+        u.status = HIT if any(h.get("lexical_support") for h in found) else NO_MATCH
+        if u.status == HIT:
+            hits += found
+    if call is not None:
+        call.record = coverage_record(ws, conn, scope=PROPERTY, via=via, units=inventory, gathered=gathered)
+    if not hits:
+        return [], [], MSG_PROPERTY_NOTHING.format(count=len(selected), query=_txt(query))
     hits = sorted(hits, key=lambda h: -h["score"])
-    if not any(h.get("lexical_support") for h in hits):
-        return [], [], MSG_PROPERTY_NOTHING.format(count=len(found), query=_txt(query))
     return ranked_by_time(ws, conn, hits, limit), [MSG_PROPERTY_SEARCHED], None
 
 
-def _property_search(ws: Workspace, conn: Connection, handle: str, query: str,
-                     limit: int) -> tuple[list[dict], list[str], str | None] | None:
-    """The time search of the conversation's property (round 11 U14, R4, R11, R12, KTD6, KTD9; round 12 U6, KTD4, KTD5): when
-    the turn has a time mode and the focus unit's property is appraised by other units too (its gathered set in the turn's
-    property graph: linked by a shared parcel, or by the same street, number and city, each link with its reason), the
-    search reads all of them instead of the focus unit alone — a question about 2022 asked in a conversation on the 2025
+def _property_search(ws: Workspace, conn: Connection, handle: str, query: str, limit: int,
+                     call: TimeCall | None = None) -> tuple[list[dict], list[str], str | None] | None:
+    """The time search of the conversation's property (round 11 U14, R4, R11, R12, KTD6, KTD9; round 12 U6, KTD4, KTD5; U7):
+    when the turn has a time mode and the focus unit's property is appraised by other units too (its gathered set in the
+    turn's property graph: linked by a shared parcel, or by the same street, number and city, each link with its reason),
+    the search reads all of them instead of the focus unit alone — a question about 2022 asked in a conversation on the 2025
     appraisal must read the 2022 one (``_property_hits``). None: the unit is gathered with no other unit (it states no
     identity, or nothing proves another appraisal is its property) — the unit search stands.
     Returns (hits, notes for the model, the answer when nothing was found), as ``_unit_search`` does."""
     v, cx, number = _unit_of(conn, ws, handle)
-    found = _property_found(ws, conn, v.version_id, number)
-    if len(found) < 2 or (str(v.document_id), str(v.version_id), number) not in {(str(d), str(x), n) for d, x, n in found}:
+    gathered = property_gathered(ws, conn, v.version_id, number)
+    if gathered is None or len(gathered.members) < 2:
         return None
-    return _property_hits(ws, conn, found, query, limit)
+    return _property_hits(ws, conn, gathered, query, limit, call)
 
 
 def _named_property(ws: Workspace, conn: Connection, docs: list[UUID]) -> list[tuple] | None:
@@ -1866,17 +2193,24 @@ def _named_property(ws: Workspace, conn: Connection, docs: list[UUID]) -> list[t
     that are one property); a document or a unit with no identity, a document that is not an appraisal, or units of two
     properties (a compendium of two) leave the call as asked. None, too, when the property is appraised by no other unit.
     Returns the units of that gathered set."""
+    gathered = _named_gathered(ws, conn, docs)
+    return [(n.document_id, n.version_id, n.unit_no) for n in gathered.members] if gathered is not None else None
+
+
+def _named_gathered(ws: Workspace, conn: Connection, docs: list[UUID]) -> Gathered | None:
+    """The gathered set ``_named_property`` reads (round 12 U7: the inventory needs the set with its reasons, candidates and
+    undetermined units, not only its units), once per turn and data version."""
     if not docs:
         return None
     version = current_data_version(conn)
     memo_key = ("named", tuple(sorted(map(str, docs))), version)  # the call's documents, once per turn and data version
     if memo_key not in ws.property_memo:
-        ws.property_memo[memo_key] = _named_property_units(ws, conn, docs, version)
+        ws.property_memo[memo_key] = _named_gathered_uncached(ws, conn, docs)
     return ws.property_memo[memo_key]
 
 
-def _named_property_units(ws: Workspace, conn: Connection, docs: list[UUID], version: int) -> list[tuple] | None:
-    """``_named_property`` without its memo: the first of the named units, in key order, whose gathered set holds all of
+def _named_gathered_uncached(ws: Workspace, conn: Connection, docs: list[UUID]) -> Gathered | None:
+    """``_named_gathered`` without its memo: the first of the named units, in key order, whose gathered set holds all of
     them (the closure depends on its seed, so every named unit is tried; the order makes the answer deterministic)."""
     graph = property_graph(ws, conn)
     wanted = {str(d) for d in docs}
@@ -1887,8 +2221,30 @@ def _named_property_units(ws: Workspace, conn: Connection, docs: list[UUID], ver
     for seed in named:
         gathered = graph.gather(seed.key)
         if keys <= gathered.keys:
-            found = [(n.document_id, n.version_id, n.unit_no) for n in gathered.members]
-            return found if len(found) >= 2 else None
+            return gathered if len(gathered.members) >= 2 else None
+    return None
+
+
+def _question_gathered(ws: Workspace, conn: Connection) -> Gathered | None:
+    """The property the current question names by an address or a parcel, when the entity lookup located no unit for it
+    (round 12 U7, KTD6): the question's identifiers (``contexts.identifiers``) are matched against the identity facts of the
+    turn's graph (``version_identities``: street core and number, block and parcel), and the matching units must all fall in
+    ONE gathered set — the same relation rules as everywhere (a street and number in two cities are two properties). None
+    when the question names no identifier, no unit matches, or the matches are of several properties. The graph is built
+    only when the question names an identifier."""
+    current = next((m["text"] for m in reversed(ws.user_messages) if m.get("current")), "")
+    named = contexts.identifiers(current)
+    if not named.addresses and not named.parcels:
+        return None
+    parcels = {(b, p) for b, p in named.parcels}
+    graph = property_graph(ws, conn)
+    matched = [n for n in graph.nodes if n.identity.addresses & named.addresses
+               or parcels & {(b, p) for b, p, _ in n.identity.parcels}]
+    keys = {n.key for n in matched}
+    for seed in matched:
+        gathered = graph.gather(seed.key)
+        if keys <= gathered.keys:
+            return gathered
     return None
 
 
@@ -1927,6 +2283,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
     ws.searches.append(query)
     notes: list[str] = []
     timed = ws.time.mode != "none"  # the turn has a time mode (the question's time, or the switch)
+    call = TimeCall(query) if timed else None  # what this call checked (round 12 U7); off mode records nothing (R14)
     in_focus = False
     if not unit:
         unit = focus_unit_for(ws, document_ids)  # the conversation's unit
@@ -1936,14 +2293,18 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
     with tenant_tx(ws.ctx) as conn:
         if unit:
             # the conversation's unit in a turn with a time mode: its property's other appraisals are read too (U14)
-            widened = _property_search(ws, conn, unit, query, limit) if in_focus and timed else None
+            widened = _property_search(ws, conn, unit, query, limit, call) if in_focus and timed else None
             hits, notes, nothing = widened or _unit_search(ws, conn, unit, query, limit, document_ids)
+            if call is not None and widened is None:  # the unit search stood: the coverage is that of the unit (R13)
+                call.record = unit_coverage(ws, conn, unit, bool(hits), in_focus)
             if in_focus:
                 focus_note = MSG_UNIT_FOCUS.format(unit=unit)
                 if nothing:
+                    _register_call(ws, call)
                     return f"{focus_note} {nothing}"
                 notes.insert(0, focus_note)
             elif nothing:
+                _register_call(ws, call)
                 return nothing
             lookup_unread = False  # a unit names its document: no unread document is looked up by title
             hits = [h | {"pool": APPRAISAL_POOL, "role": PRIMARY} for h in hits]
@@ -1961,8 +2322,12 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
             absent = False
             # a time question naming the documents of one property reads every appraisal of it (U16); a document question
             # reads the named documents only
-            property_units = (_named_property(ws, conn, docs) if docs and timed
-                              and not (ws.intent == "document" and ws.named_documents) else None)
+            # (and a question that names an address or a parcel no unit was located for reads the property its identity
+            # facts name, round 12 U7)
+            reads_property = timed and not (ws.intent == "document" and ws.named_documents)
+            property_set, via = (_named_gathered(ws, conn, docs), "documents") if docs and reads_property else (None, None)
+            if not docs and reads_property and any(q.pool == APPRAISAL_POOL and q.role == PRIMARY for q in passes):
+                property_set, via = _question_gathered(ws, conn), "question"
             for p in passes:
                 if p.pool == PROFESSIONAL_POOL and (ws.intent in (PROFESSIONAL, MIXED) or asked) \
                         and not has_professional(ws, conn):
@@ -1980,15 +2345,18 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 left_out = copies_left_out(ws, conn) if p.pool == PROFESSIONAL_POOL and not docs else ()
                 scope = SearchScope(document_ids=tuple(docs), source_kinds=POOL_KINDS[p.pool], exclude_versions=left_out)
                 wide_hits, wide_notes, wide_nothing = (
-                    _property_hits(ws, conn, property_units, query, n)
-                    if property_units and p.pool == APPRAISAL_POOL and p.role == PRIMARY else (None, [], None))
+                    _property_hits(ws, conn, property_set, query, n, call, via)
+                    if property_set is not None and p.pool == APPRAISAL_POOL and p.role == PRIMARY else (None, [], None))
                 if wide_hits is not None and not wide_nothing:
                     found = wide_hits
                     notes += wide_notes
                 elif timed and p.pool == APPRAISAL_POOL and p.role == PRIMARY:
-                    # the appraisals that answer: the fused window, its documents ordered by date, then cut (KTD6); the
-                    # professional pool and the examples beside it are read as they always were (R16)
+                    # the appraisals that answer: the fused window, its units ordered by date, then cut (KTD6); the
+                    # professional pool and the examples beside it are read as they always were (R16). A property the
+                    # inventory found nothing in falls back to the window, whose coverage is then that of the window
                     found = ranked_by_time(ws, conn, memoized_search(ws, conn, query, n, scope, window=True), n)
+                    if call is not None and (wide_hits is None or wide_nothing):
+                        call.record = window_coverage(ws, conn, found)
                 else:
                     found = memoized_search(ws, conn, query, n, scope)
                 hits += [h | {"pool": p.pool, "role": p.role} for h in found]
@@ -2049,6 +2417,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
             out.append(ws.once(src, ("chunk", h["chunk_id"])))
             # the document as a whole: a datum not found may be in a part of it that was not read
             ws.touch(h["document_id"], h["title"], "retrieved", gaps.get(h["version_id"], whole).partial)
+    _register_call(ws, call, out)
     block = unread_text.tool_block(named)
     lead = "\n\n".join(notes)
     if not out:

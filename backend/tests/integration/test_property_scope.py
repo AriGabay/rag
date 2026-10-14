@@ -398,8 +398,13 @@ def test_ae1_two_cities_never_rank_each_other_and_the_cityless_appraisal_is_an_u
     assert [str(m.document_id) for m in focus.members] == [ids["cities_a"]]
     assert [(str(c.node.document_id), c.link.reason) for c in focus.candidates] == [(ids["cities_nocity"], P.REASON_CITY_MISSING)]
     for time in (RECENT, EXPLICIT_2022):
-        out = run(focused(office12, time, ids["cities_a"]), "search", query="שווי הנכס הדולב 7", limit=6)
+        ws = focused(office12, time, ids["cities_a"])
+        out = run(ws, "search", query="שווי הנכס הדולב 7", limit=6)
         assert set(order(out)) == {ids["cities_a"]} and T.MSG_PROPERTY_SEARCHED not in out, time.mode
+        record = ws.time_coverage  # round 12 U7: the coverage counts the cityless one as a named unlinked candidate
+        assert [u["document_id"] for u in record["units"]] == [ids["cities_a"]] and not record["complete"], time.mode
+        assert [(c["document_id"], c["reason"]) for c in record["candidates"]["named"]] == [
+            (ids["cities_nocity"], P.REASON_CITY_MISSING)] and record["candidates"]["count"] == 1, time.mode
 
 
 def test_ae2_the_focus_on_the_parcel_b_gathers_the_two_parcel_property_with_its_reason_and_never_the_separate_lot(office12):
@@ -408,9 +413,13 @@ def test_ae2_the_focus_on_the_parcel_b_gathers_the_two_parcel_property_with_its_
     focus = graph.gather(node_of(office12, graph, "parcels_b").key)
     assert {str(m.document_id) for m in focus.members} == {ids["parcels_ab"], ids["parcels_b"]}
     assert set(focus.reasons().values()) == {"parcel 8401/40"}
-    out = run(focused(office12, RECENT, ids["parcels_b"]), "search", query="שווי הנכס הדס", limit=6)
+    ws = focused(office12, RECENT, ids["parcels_b"])
+    out = run(ws, "search", query="שווי הנכס הדס", limit=6)
     assert set(order(out)) == {ids["parcels_ab"], ids["parcels_b"]} and T.MSG_PROPERTY_SEARCHED in out
     assert ids["parcels_c"] not in order(out)
+    record = ws.time_coverage  # round 12 U7: the inventory is the gathered set, with the link reason; the lot is no candidate
+    assert {u["document_id"] for u in record["units"]} == {ids["parcels_ab"], ids["parcels_b"]}
+    assert record["property"]["reasons"] == ["parcel 8401/40"] and record["candidates"]["count"] == 0
 
 
 def test_ae2_two_sub_parcels_of_one_parcel_never_gather_each_other_and_the_unspecified_one_is_a_candidate(office12):
@@ -419,8 +428,11 @@ def test_ae2_two_sub_parcels_of_one_parcel_never_gather_each_other_and_the_unspe
     focus = graph.gather(node_of(office12, graph, "apartments_3").key)
     assert [str(m.document_id) for m in focus.members] == [ids["apartments_3"]]
     assert [(str(c.node.document_id), c.link.reason) for c in focus.candidates] == [(ids["apartments_none"], P.REASON_SUB_MISSING)]
-    out = run(focused(office12, RECENT, ids["apartments_3"]), "search", query="שווי הנכס הנרקיס", limit=6)
+    ws = focused(office12, RECENT, ids["apartments_3"])
+    out = run(ws, "search", query="שווי הנכס הנרקיס", limit=6)
     assert set(order(out)) == {ids["apartments_3"]} and T.MSG_PROPERTY_SEARCHED not in out, "the unit search stands"
+    record = ws.time_coverage
+    assert [c["reason"] for c in record["candidates"]["named"]] == [P.REASON_SUB_MISSING] and not record["complete"]
 
 
 # --- a file of several units; hidden units; the timeline groups -----------------------------------------------------------

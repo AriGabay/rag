@@ -163,6 +163,32 @@ def test_mode_none_keeps_relevance_order_and_adds_the_date_lines(office):
                           d22: T.MSG_DATE_VALUATION.format(date="20/05/2022"), unknown: T.MSG_DATE_UNKNOWN}
 
 
+def test_a_file_of_several_units_is_ranked_per_unit_never_dated_as_one_file(office):
+    """Round 12 R10 (U7, KTD6): the hits are grouped by (version, unit). The most relevant unit of the file is the oldest, and
+    the units of two other properties are not one property's history, so the file is three groups ordered by their own
+    valuation dates — not one group dated by the unit of its best passage."""
+    def unit(n: int, date_: str, amount: str, body: str) -> dict:
+        return {"title": f"שומה {n}", "blocks": [HEADER, f"רחוב הרקפות {n}", f"המועד הקובע: {date_}", body.format(amount=amount)],
+                "identifiers": [f"רחוב הרקפות {n}"]}
+    doc, _ = unit_file(office, office.default_group_id, "קובץ שומות", [
+        unit(1, "01/01/2020", "2,000,000", BODY + " שווי הנכס ברחוב הרקפות שווי הנכס."),
+        unit(2, "01/01/2025", "2,600,000", WEAK), unit(3, "01/01/2023", "2,300,000", WEAK)], sha=sha_of("several-units"))
+    ws = ws_for(office, RECENT)
+    search(ws, limit=6)
+    firsts = list(dict.fromkeys(s.date_line for s in ws.sources.values() if str(s.document_id) == doc))
+    assert firsts == [T.MSG_DATE_VALUATION.format(date=d) for d in ("01/01/2025", "01/01/2023", "01/01/2020")]
+
+
+def test_off_mode_records_no_coverage_and_a_time_mode_records_the_window(office):
+    dated(office, "a25", "15/04/2025")
+    off = ws_for(office, NONE)
+    search(off, limit=6)
+    assert off.time_calls == [] and off.time_coverage is None
+    on = ws_for(office, RECENT)
+    search(on, limit=6)
+    assert on.time_coverage["scope"] == "window" and not on.time_coverage["complete"]
+
+
 def test_an_explicit_year_puts_that_years_document_first_then_the_nearest(office):
     d22 = dated(office, "a22", "20/05/2022", amount="2,100,000")
     d24 = dated(office, "a24", "15/03/2024", amount="2,300,000")

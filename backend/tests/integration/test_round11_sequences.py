@@ -368,7 +368,9 @@ def test_an_undated_value_comes_last_marked_unknown_and_the_switch_off_orders_th
     on = ask_timeline(compact, steps())["answer"]["time"]
     (group,) = on["timeline"]
     assert [r["date"] for r in group["rows"]] == ["2025-01-20", "2024-06-15", "2022-03-10", None]
-    assert group["rows"][-1]["marks"] == ["unknown_date"] and group["rows"][-1]["date_kind"] is None
+    # round 12 U11 (R18, KTD13): an undated value of the same property with another amount may be of any date, so it
+    # conflicts with the dated ones and is marked so, beside its unknown date
+    assert group["rows"][-1]["marks"] == ["conflict", "unknown_date"] and group["rows"][-1]["date_kind"] is None
     assert group["rows"][-1]["source"]["document_id"] == compact.ids["hatzalon7_undated"]
     off = ask_timeline(compact, steps(), prefer_recent=False)["answer"]["time"]
     assert (off["mode"], off["prefer_recent"]) == ("none", False)
