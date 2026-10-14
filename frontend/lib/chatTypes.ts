@@ -639,14 +639,17 @@ export interface ChatUnitScope {
 }
 
 /** What marks a timeline row (round 11 U9); each is shown as a text badge, never by colour alone. */
-export type ChatTimelineMark = "forecast" | "conflict" | "outside_requested" | "unknown_date";
+export type ChatTimelineMark = "forecast" | "conflict" | "outside_requested" | "uncertain" | "unknown_date";
 
 export interface ChatTimelineRow {
   /** ISO date at the row's own precision, null when the sources give none. */
   date: string | null;
   precision: "day" | "month" | "year" | null;
+  /** The end of a period (a table caption's range) at the same precision; null for a single date. */
+  end: string | null;
   date_kind: "valuation" | "transaction" | "stated" | "range" | null;
   value_text: string;
+  /** The unit as display text ("₪", "מ״ר"), not a code; null when none. */
   unit: string | null;
   /** The citation id as shown in the answer (S#, V# or M#). */
   sid: string;

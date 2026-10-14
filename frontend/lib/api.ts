@@ -257,7 +257,7 @@ export const chatApi = {
       `/api/chat/conversations/${encodeURIComponent(id)}/messages`,
       {
         method: "POST",
-        body: preferRecent === undefined ? { content, client_id: clientId } : { content, client_id: clientId, prefer_recent: preferRecent },
+        body: { content, client_id: clientId, prefer_recent: preferRecent }, // undefined is left out of the JSON
       },
     ),
   message: (id: string, signal?: AbortSignal) =>

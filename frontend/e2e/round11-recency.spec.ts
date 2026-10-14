@@ -89,7 +89,7 @@ const TIMELINE_TEXT = "ציר זמן — שווי הנכס (סינתטי)\n15/03
 
 function timelineAnswer(): Json {
   const row = (extra: Json): Json => ({
-    date: "2025-03-15", precision: "day", date_kind: "valuation", value_text: "2,450,000 ₪", unit: "ILS", sid: "S1",
+    date: "2025-03-15", precision: "day", end: null, date_kind: "valuation", value_text: "2,450,000 ₪", unit: "₪", sid: "S1",
     source: { document_id: DOC, title: TITLE, location: "עמוד 3" }, marks: [], ...extra,
   });
   return answerWith({
@@ -109,6 +109,9 @@ function timelineAnswer(): Json {
             marks: ["forecast"] }),
           row({ date: null, precision: null, date_kind: null, value_text: "2,100,000 ₪", sid: "S3",
             marks: ["unknown_date", "outside_requested"] }),
+          // a table caption's period (2020-2023), its value without the unit in the text: the end and the unit are shown
+          row({ date: "2020", end: "2023", precision: "year", date_kind: "range", value_text: "1,900,000", sid: "S2",
+            marks: ["uncertain"] }),
         ],
       }],
     },
@@ -159,6 +162,33 @@ test.describe("the switch", () => {
     expect((await saved).ok()).toBeTruthy();
     expect((await saved).request().postDataJSON()).toEqual({ prefer_recent: false });
     await page.reload();
+    await expect(theSwitch(page)).toHaveAttribute("aria-checked", "false");
+  });
+
+  test("a messages response that was requested before the toggle and lands after the save does not undo it", async ({ page }) => {
+    await login(page, USERS.adminB);
+    const id = await newConversation(page);
+    // the conversation's messages request is held: it left before the toggle and lands after the PATCH has settled,
+    // carrying the value the server held before (on)
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    await page.route(`**/api/chat/conversations/${id}/messages*`, async (route) => {
+      if (route.request().method() !== "GET") return route.fallback();
+      await gate;
+      const t = thread(id, []);
+      return route.fulfill({ json: { ...t, conversation: { ...(t.conversation as Json), id, prefer_recent: true } } });
+    });
+    await page.goto(`/chat?c=${id}`);
+    await expect(theSwitch(page)).toHaveAttribute("aria-checked", "true"); // from the list, which is not held
+    const saved = page.waitForResponse((r) => r.url().endsWith(`/api/chat/conversations/${id}`) && r.request().method() === "PATCH");
+    await theSwitch(page).click();
+    await expect(theSwitch(page)).toHaveAttribute("aria-checked", "false");
+    expect((await saved).ok()).toBeTruthy();
+    const landed = page.waitForResponse((r) => r.url().includes(`/api/chat/conversations/${id}/messages`));
+    release();
+    await landed;
+    // let the stale payload be handled, then the switch must still hold the user's choice
+    await page.waitForTimeout(300);
     await expect(theSwitch(page)).toHaveAttribute("aria-checked", "false");
   });
 
@@ -322,9 +352,14 @@ test.describe("the timeline", () => {
     await expect(block.getByRole("heading", { name: "ציר זמן" })).toBeVisible();
     await expect(block.getByText("שווי הנכס (סינתטי)")).toBeVisible();
     const rows = block.getByTestId("timeline-row");
-    await expect(rows).toHaveCount(4);
-    expect(await rows.locator(".tl-date bdi").allInnerTexts()).toEqual(["15/03/2025", "20/06/2024", "05/2023", "ללא תאריך"]);
-    expect(await rows.locator(".tl-value bdi").allInnerTexts()).toEqual(["2,450,000 ₪", "2,300,000 ₪", "2,200,000 ₪", "2,100,000 ₪"]);
+    await expect(rows).toHaveCount(5);
+    expect(await rows.locator(".tl-date bdi").allInnerTexts()).toEqual([
+      "15/03/2025", "20/06/2024", "05/2023", "ללא תאריך", "2020–2023"]);
+    // the unit is added only where the value text does not carry it
+    expect(await rows.locator(".tl-value bdi").allInnerTexts()).toEqual([
+      "2,450,000 ₪", "2,300,000 ₪", "2,200,000 ₪", "2,100,000 ₪", "1,900,000 ₪"]);
+    await expect(rows.nth(4).locator(".tl-kind")).toHaveText("תקופה");
+    await expect(rows.nth(4).getByText("קריאה לא ודאית")).toBeVisible();
     await expect(rows.nth(0).locator(".tl-kind")).toHaveText("מועד קובע");
     await expect(rows.nth(2).locator(".tl-kind")).toHaveText("מועד עסקה");
     await expect(rows.nth(1).getByText("סתירה בין מקורות")).toBeVisible();

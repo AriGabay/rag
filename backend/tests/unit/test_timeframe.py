@@ -126,11 +126,30 @@ def test_a_leap_day_anchor_has_a_valid_start():
     "מה השווי של הנכס ברחוב הרצל 2024?",
     "מה אומר תקן ישראלי 2024 על שווי?",
     "הנכס בקומה 2022",
+    "מה השווי של הנכס שנבנה ב-1985?",
+    "מה שווי הנכס שנבנה בשנת 1985 ברחוב הרקפות?",
+    "מה שווי הנכס, בנייה משנת 1985?",
+    "הנכס נרכש בשנת 2010 - מה שוויו?",
+    "מה אומר חוק התכנון והבנייה 1965 על היתר?",
+    "מה השווי לפי תקנות התכנון והבנייה 2016?",
+    "האם היתר משנת 2008 קיים לנכס?",
+    "מה השווי של נכס שנת הקמה 1990?",
 ])
 @pytest.mark.parametrize("on, mode", [(True, "recent"), (False, "none")])
 def test_identifiers_prices_and_areas_are_not_time(question, on, mode):
     t = TF.resolve(question, pref(on))
     assert t.mode == mode and t.source == "switch" and t.requested is None, t
+
+
+@pytest.mark.parametrize("question, expected", [
+    ("מה שווי הנכס שנבנה ב-1985 נכון ל-2022?", ("point", "2022", "2022", "year")),
+    ("הנכס נרכש בשנת 2010; מה היה השווי ב-2022?", ("point", "2022", "2022", "year")),
+    ("נרכש לפני שנים, מה השווי ב-2022?", ("point", "2022", "2022", "year")),
+    ("מה השווי בשנת 2022?", ("point", "2022", "2022", "year")),
+    ("מה השווי ב-2022 לפי חוק התכנון והבנייה?", ("point", "2022", "2022", "year")),
+])
+def test_a_year_with_a_valuation_context_still_makes_the_turn_explicit_beside_a_build_year(question, expected):
+    assert shape(req(question)) == expected
 
 
 def test_a_standard_number_does_not_hide_a_real_year_beside_it():

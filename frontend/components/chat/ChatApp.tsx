@@ -160,9 +160,13 @@ export default function ChatApp() {
     if (initial) setActiveId(initial);
   }, []);
 
-  /** Records the switch value a conversation's JSON carries (a missing field is a pre-round-11 payload: off), unless a
-   * toggle of it is still being saved: that answer is newer than this payload. */
-  const recordPref = useCallback((c: ChatConversation) => {
+  /** Records the switch value a conversation's JSON carries (a missing field is a pre-round-11 payload: off), unless it is
+   * older than the user's choice: staleness is a property of the request, not of the moment it lands. `since` is the
+   * conversation's toggle sequence when the request STARTED; a payload whose request began before a later toggle is dropped
+   * whole (no stored value, no shown value), whenever it lands. While a toggle of it is still being saved the shown value is
+   * also kept: that answer is newer than this payload. */
+  const recordPref = useCallback((c: ChatConversation, since: number = toggleSeq.current[c.id] ?? 0) => {
+    if ((toggleSeq.current[c.id] ?? 0) !== since) return;
     const v = c.prefer_recent === true;
     storedPrefs.current[c.id] = v;
     if (inflightPatch.current[c.id]) return;
@@ -172,13 +176,14 @@ export default function ChatApp() {
   // --- conversation list -----------------------------------------------------------------------------------
   const loadList = useCallback(
     async (append: boolean, signal?: AbortSignal) => {
+      const started = { ...toggleSeq.current }; // the toggles each conversation had when this request began
       try {
         const res = await chatApi.conversations(
           { q: query.trim() || undefined, archived, before: append ? listNext : null },
           signal,
         );
         setConversations((cur) => (append ? [...cur, ...res.conversations] : res.conversations));
-        res.conversations.forEach(recordPref);
+        res.conversations.forEach((c) => recordPref(c, started[c.id] ?? 0));
         setListNext(res.next);
         setListError(null);
       } catch (err) {
@@ -199,9 +204,9 @@ export default function ChatApp() {
   }, [query, archived]);
 
   const touchConversation = useCallback(
-    (c: ChatConversation) => {
+    (c: ChatConversation, since?: number) => {
       setConversations((cur) => [c, ...cur.filter((x) => x.id !== c.id)]);
-      recordPref(c);
+      recordPref(c, since);
     },
     [recordPref],
   );
@@ -215,6 +220,7 @@ export default function ChatApp() {
     async (id: string, older: boolean, signal?: AbortSignal) => {
       const thread = threads[id];
       const before = older && thread?.messages.length ? thread.messages[0].id : null;
+      const since = toggleSeq.current[id] ?? 0; // the toggle sequence when this request began
       updateThread(id, (t) => ({ ...t, loading: true, error: null }));
       try {
         const res = await chatApi.messages(id, before, signal);
@@ -224,7 +230,7 @@ export default function ChatApp() {
           hasMore: res.has_more,
           messages: older ? [...res.messages, ...t.messages.filter((m) => !res.messages.some((r) => r.id === m.id))] : res.messages,
         }));
-        if (!older) touchConversation(res.conversation);
+        if (!older) touchConversation(res.conversation, since);
       } catch (err) {
         if (isAbortError(err)) return;
         if (err instanceof ApiError && err.status === 404) {
@@ -343,8 +349,7 @@ export default function ChatApp() {
           createdHere.current = conv.id;
           touchConversation(conv);
           // the draft's choice shows at once; the first send body stores it
-          const draftValue = preferRecent;
-          if (draftValue !== undefined) setPrefs((cur) => ({ ...cur, [conv.id]: draftValue }));
+          if (preferRecent !== undefined) setPrefs((cur) => ({ ...cur, [conv.id]: preferRecent }));
           setThreads((cur) => ({ ...cur, [conv.id]: { ...EMPTY_THREAD, messages: [optimistic, pending] } }));
           setActiveId(conv.id);
           setDraftThread([]);
@@ -412,8 +417,11 @@ export default function ChatApp() {
     setNotice(null);
     try {
       const c = await chatApi.patch(id, { prefer_recent: next });
-      storedPrefs.current[id] = c.prefer_recent ?? next;
-      setConversations((cur) => cur.map((x) => (x.id === id ? { ...x, prefer_recent: c.prefer_recent ?? next } : x)));
+      // only the latest toggle's answer is the stored value, like the failure below
+      if (toggleSeq.current[id] === seq) {
+        storedPrefs.current[id] = c.prefer_recent ?? next;
+        setConversations((cur) => cur.map((x) => (x.id === id ? { ...x, prefer_recent: c.prefer_recent ?? next } : x)));
+      }
     } catch (err) {
       // only the latest toggle decides what is shown; an older failure must not undo a newer choice
       if (toggleSeq.current[id] === seq) setPrefs((cur) => ({ ...cur, [id]: storedPrefs.current[id] ?? current }));

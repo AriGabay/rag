@@ -28,8 +28,36 @@ from app.professional.profile import _MONTH_NAMES, _MONTHS
 from app.professional.profile import parse_date as _profile_parse_date
 
 EXPLICIT_YEARS = (1900, 2100)   # the years a day or month date may have; a bare year is narrower (_BARE below)
-_RANK = {"year": 0, "month": 1, "day": 2}
+PRECISION_RANK = {"year": 0, "month": 1, "day": 2}   # coarser first: the order every consumer compares precisions by
 _CUT = {"year": 4, "month": 7, "day": 10}
+_PRECISION_OF_LENGTH = {4: "year", 7: "month"}   # any other length is a day
+
+
+def cut(iso: str, precision: str) -> str:
+    """``iso`` cut to ``precision`` (YYYY, YYYY-MM or YYYY-MM-DD); an unknown precision keeps the day."""
+    return iso[:_CUT.get(precision, 10)]
+
+
+def coarser(a: str, b: str) -> str:
+    """The coarser of two precisions."""
+    return min(a, b, key=PRECISION_RANK.__getitem__)
+
+
+def precision_of(iso: str) -> str:
+    """The precision an ISO text is written in, by its length."""
+    return _PRECISION_OF_LENGTH.get(len(iso), "day")
+
+
+def shown_date(iso: str, precision: str) -> str:
+    """A date in the precision it was given: DD/MM/YYYY, MM/YYYY or YYYY (a month is never shown as a day)."""
+    y, m, d = (iso.split("-") + [None, None])[:3]
+    return f"{d}/{m}/{y}" if precision == "day" else f"{m}/{y}" if precision == "month" else y
+
+
+def shown_period(iso: str, precision: str, end: str | None) -> str:
+    """A date, or a range ``first–end`` of dates in the same precision, as the reader sees it."""
+    first = shown_date(iso, precision)
+    return f"{first}–{shown_date(end, precision)}" if end else first
 
 
 @dataclass(frozen=True)
@@ -143,8 +171,8 @@ def _masked(text: str, first: _Atom, last: _Atom, *, word: bool) -> bool:
 
 
 def _coarse(a: _Atom, b: _Atom) -> tuple[str, str, str]:
-    precision = min(a.precision, b.precision, key=_RANK.__getitem__)
-    return a.iso[:_CUT[precision]], b.iso[:_CUT[precision]], precision  # type: ignore[index]
+    precision = coarser(a.precision, b.precision)
+    return cut(a.iso, precision), cut(b.iso, precision), precision  # type: ignore[arg-type]
 
 
 def _range_of(text: str, a: _Atom, b: _Atom) -> bool:

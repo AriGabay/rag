@@ -186,8 +186,11 @@ def derive(blocks: Iterable) -> list[Found]:
             out.append(Found(block, p.iso, p.precision, p.written))
 
     for i, (index, body) in enumerate(rows):
+        labels = list(_VALUATION.finditer(body))
+        if not labels:
+            continue
         report = {p.span for p in report_dates(body)}
-        for m in _VALUATION.finditer(body):
+        for m in labels:
             p, only_gap = _date_after(body, m.end())
             if p is not None and p.span not in report:
                 take(index, p)
@@ -207,16 +210,18 @@ def _agreeing(dates: Sequence[StatedDate]) -> StatedDate | None:
     return finest if all(finest.iso.startswith(d.iso) for d in dates) else None
 
 
+def _owner(units: Sequence, block_index: int) -> int | None:
+    """The number of the unit that holds a block: `DOCUMENT_SCOPE` for a version with no units, None for a block outside
+    every unit."""
+    if not units:
+        return DOCUMENT_SCOPE
+    return next((u.unit_no for u in units if u.block_first <= block_index <= u.block_last), None)
+
+
 def assign(found: Iterable[Found], units: Sequence) -> list[StatedDate]:
     """The dates with the unit that holds each block now and the status of that unit: `conflict` when its dates do not
     agree. A version with no units is one scope (`DOCUMENT_SCOPE`); a block outside every unit has no unit."""
-    owned: list[tuple[Found, int | None]] = []
-    for f in sorted(found, key=lambda x: (x.block_index, x.iso)):
-        if not units:
-            owner: int | None = DOCUMENT_SCOPE
-        else:
-            owner = next((u.unit_no for u in units if u.block_first <= f.block_index <= u.block_last), None)
-        owned.append((f, owner))
+    owned = [(f, _owner(units, f.block_index)) for f in sorted(found, key=lambda x: (x.block_index, x.iso))]
     plain = [StatedDate(f.block_index, f.iso, f.precision, f.written, "stated", owner) for f, owner in owned]
     by_unit: dict[int, list[StatedDate]] = defaultdict(list)
     for d in plain:
@@ -266,13 +271,24 @@ def _units_of(conn: Connection, version_id: UUID, cache: dict) -> tuple:
     return cache[key]
 
 
-def _derive_and_store(conn: Connection, version_id: UUID, document_id: UUID, cache: dict) -> list[Found]:
-    """Derive the version's valuation dates from its stored blocks and store them (or the marker row) once: a second
-    caller in the process waits for the first, and across processes the advisory lock makes the second writer find the
-    first's rows. A transaction that cannot write still gets its dates."""
+def prime_units(conn: Connection, version_ids: Iterable[UUID | str], cache: dict) -> None:
+    """The stored units of many appraisal versions in one query, into the cache keys `_units_of` reads, before their
+    dates are read together (`valuation_dates`); a version whose dates or units the cache holds, and one with no units
+    stored, is left alone (`_units_of`: `units.ensure` builds them)."""
+    todo = sorted((v for v in dict.fromkeys(UUID(str(v)) for v in version_ids)
+                   if ("dates", v) not in cache and ("units", v) not in cache), key=str)
+    for v, units in unit_store.stored_many(conn, todo).items():
+        cache[("units", v)] = tuple(units)
+
+
+def _derive_and_store(conn: Connection, version_id: UUID, document_id: UUID, cache: dict) -> tuple[StatedDate, ...]:
+    """Derive the version's valuation dates from its stored blocks and store them (or the marker row) once, and return
+    them assigned to the current units (what `valuation_dates` caches): a second caller in the process waits for the
+    first, and across processes the advisory lock makes the second writer find the first's rows. A transaction that
+    cannot write still gets its dates."""
     blocks = conn.execute(text(_BLOCKS_SQL), {"v": version_id}).all()
-    found = derive(blocks)
-    assigned = assign(found, _units_of(conn, version_id, cache))
+    units = _units_of(conn, version_id, cache)
+    assigned = tuple(assign(derive(blocks), units))
     lock = flight("dates", str(version_id), DATES_VERSION)
     try:
         with lock:
@@ -282,17 +298,14 @@ def _derive_and_store(conn: Connection, version_id: UUID, document_id: UUID, cac
                                  {"k": f"dates:{version_id}:{DATES_VERSION}"})
                     existing = _stored(conn, [version_id]).get(version_id)
                     if existing is not None:   # another process wrote them while this one waited for the lock
-                        return existing
+                        return tuple(assign(existing, units))
                     params = {"d": document_id, "v": version_id, "dv": DATES_VERSION}
-                    if not assigned:
-                        conn.execute(text(_INSERT), params | {"b": MARKER_BLOCK, "i": None, "p": None, "w": None,
-                                                              "s": "stated"})
-                    for d in assigned:
-                        conn.execute(text(_INSERT), params | {"b": d.block_index, "i": d.iso, "p": d.precision,
-                                                              "w": d.written, "s": d.status})
+                    rows = [{"b": d.block_index, "i": d.iso, "p": d.precision, "w": d.written, "s": d.status}
+                            for d in assigned] or [{"b": MARKER_BLOCK, "i": None, "p": None, "w": None, "s": "stated"}]
+                    conn.execute(text(_INSERT), [params | row for row in rows])
             except Exception:  # noqa: BLE001 - a read-only transaction or a vanished version: the dates still serve
                 logger.info("dates of version %s not stored", version_id, exc_info=True)
-            return found
+            return assigned
     finally:
         landed("dates", str(version_id), DATES_VERSION, lock)
 
@@ -304,7 +317,9 @@ def valuation_dates(conn: Connection, version_ids: Iterable[UUID | str], *,
     is the turn's dict: a version already in it costs no query."""
     cache = {} if cache is None else cache
     ids = list(dict.fromkeys(UUID(str(v)) for v in version_ids))
-    missing = [v for v in ids if ("dates", v) not in cache]
+    # derived in a stable order: each derivation holds its version's advisory lock until the transaction ends, so two
+    # concurrent cold turns over overlapping versions must take them in the same order to never wait on each other
+    missing = sorted((v for v in ids if ("dates", v) not in cache), key=str)
     if missing:
         visible = {r.version_id: r.document_id for r in conn.execute(text(_VISIBLE_SQL), {"v": missing})}
         stored = _stored(conn, list(visible))
@@ -313,9 +328,8 @@ def valuation_dates(conn: Connection, version_ids: Iterable[UUID | str], *,
                 cache[("dates", v)] = None
                 continue
             found = stored.get(v)
-            if found is None:
-                found = _derive_and_store(conn, v, visible[v], cache)
-            cache[("dates", v)] = tuple(assign(found, _units_of(conn, v, cache)))
+            cache[("dates", v)] = (tuple(assign(found, _units_of(conn, v, cache))) if found is not None
+                                   else _derive_and_store(conn, v, visible[v], cache))
     return {v: cache[("dates", v)] for v in ids if cache.get(("dates", v)) is not None}
 
 
@@ -329,11 +343,7 @@ def unit_valuation(conn: Connection, version_id: UUID | str, block_index: int, *
     dates = valuation_dates(conn, [v], cache=cache).get(v)
     if dates is None:
         return UnitValuation("none", None, (), None)
-    units = _units_of(conn, v, cache)
-    if not units:
-        unit_no: int | None = DOCUMENT_SCOPE
-    else:
-        unit_no = next((u.unit_no for u in units if u.block_first <= block_index <= u.block_last), None)
+    unit_no = _owner(_units_of(conn, v, cache), block_index)
     if unit_no is None:
         return UnitValuation("none", None, (), None)
     return resolve_unit([d for d in dates if d.unit_no == unit_no], unit_no)
@@ -345,12 +355,11 @@ _P = r"(?<![א-ת])[ובהכלמש]{0,2}"
 _FORECAST = re.compile(
     rf"{_P}(?:צפוי(?:ה|ים|ות)?|תחזית|יהיה|תהיה|יהיו|עתיד(?:י|יים|ית|יות)?)(?![א-ת])"
     rf"|{_P}הערכה\s+ל[\-־]?\s*(?:שנת\s*)?\d")   # "הערכה ל" is a forecast only before a date; "הערכה לשווי" is not
-_CUT = {"year": 4, "month": 7, "day": 10}
 
 
-def _later_than(iso: str, precision: str, anchor: date) -> bool:
-    cut = _CUT.get(precision, 10)
-    return iso[:cut] > anchor.isoformat()[:cut]
+def is_after_anchor(iso: str, precision: str, anchor: date) -> bool:
+    """Whether a date is later than the anchor date, by its precision (this month is not later than today)."""
+    return shared.cut(iso, precision) > shared.cut(anchor.isoformat(), precision)
 
 
 def is_forecast(sentence: str, as_of: AsOf | dict | None, anchor: date) -> bool:
@@ -360,7 +369,7 @@ def is_forecast(sentence: str, as_of: AsOf | dict | None, anchor: date) -> bool:
         return True
     if not as_of:
         return False
-    return _later_than(as_of.get("end") or as_of["date"], as_of["precision"], anchor)
+    return is_after_anchor(as_of.get("end") or as_of["date"], as_of["precision"], anchor)
 
 
 # --- as_of ----------------------------------------------------------------------------------------------------------------

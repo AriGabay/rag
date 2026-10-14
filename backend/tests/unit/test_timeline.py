@@ -407,6 +407,31 @@ def test_the_date_kind_follows_the_provenance_of_the_date():
     assert (ranged["date"], ranged["precision"]) == ("2022", "year")
 
 
+# --- a reading that is not certain (review #3) -------------------------------------------------------------------------------
+
+def test_a_value_whose_region_stayed_unclear_is_marked_uncertain_in_the_row_and_the_plain_text():
+    o = Office()
+    a, b, c = three(o)
+    o.ws.uncertain_values[a] = "synthetic note"
+    (g,) = o.blocks({c})
+    marks = {r["sid"]: r["marks"] for r in g["rows"]}
+    assert marks == {a: ["uncertain"], b: [], c: []}
+    assert timeline.MARKS["uncertain"] in timeline.plain_text([g])
+
+
+def test_a_measurement_whose_place_was_lost_or_that_awaits_review_is_marked_uncertain():
+    o = Office()
+    d = o.doc()
+    v = o.value(d, "4,000", as_of("2025-01-01"), kind="rent", period="month")
+    lost = o.measurement(d, "3,800", as_of("2023-01-01"))
+    flagged = o.measurement(d, "3,900", as_of("2024-01-01"))
+    o.ws.measurements[lost].row.anchor_lost = {"reason": "synthetic"}
+    o.ws.measurements[flagged].row.status = "needs_review"
+    (g,) = o.blocks({lost, flagged, v})
+    marks = {r["sid"]: r["marks"] for r in g["rows"]}
+    assert marks[lost] == ["uncertain"] and marks[flagged] == ["uncertain"] and "uncertain" not in marks.get(v, [])
+
+
 # --- the payload (R13) ---------------------------------------------------------------------------------------------------------
 
 def test_the_payload_carries_the_mode_the_request_the_timeline_and_a_plain_text_copy():

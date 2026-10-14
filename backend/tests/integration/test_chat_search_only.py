@@ -179,8 +179,16 @@ def test_with_the_switch_off_the_appraisal_group_keeps_relevance_order_and_the_d
     answer = ask_with(office, SO_QUESTION, False)
     with tenant_tx(office.ctx()) as conn:
         plain = search_passages(conn, SO_QUESTION, SEARCH_ONLY_APPRAISALS, scope=SearchScope(source_kinds=("appraisal",)))
-    relevance = list(dict.fromkeys(str(h["document_id"]) for h in plain))
-    assert appraisal_order(answer) == relevance and relevance[0] == docs["2022"]
+    best: dict[str, float] = {}  # each document's best score in the plain relevance search
+    for h in plain:
+        best[str(h["document_id"])] = max(best.get(str(h["document_id"]), 0.0), h["score"])
+    order = appraisal_order(answer)
+    # relevance order, not time: the group follows the documents' best scores, non-increasing (a near-tie may fall either
+    # way between two searches, so which document comes first is not asserted), and it is not the newest-first order
+    assert set(order) == set(best)
+    scores = [best[d] for d in order]
+    assert scores == sorted(scores, reverse=True), scores
+    assert order != [docs["2025"], docs["2024"], docs["2022"], docs["unknown"]]
     assert T.MSG_DATE_VALUATION.format(date="20/05/2022") in answer["markdown"]
     assert answer["markdown"].count(T.MSG_DATE_UNKNOWN) == 1
 
@@ -202,3 +210,18 @@ def test_the_professional_group_keeps_its_order_and_carries_no_date_whatever_the
     professional_lines = [ln for ln in on["markdown"].splitlines() if ln.startswith("- ")
                           and any(s["id"] in ln for s in found_on)]
     assert professional_lines and not any(T.MSG_DATE_UNKNOWN in ln or "למועד הקובע" in ln for ln in professional_lines)
+
+
+def test_the_date_order_only_permutes_the_documents_relevance_chose_so_the_best_old_match_stays(office):
+    """Review #4: with more matching appraisals than the group holds, the group is the best ``SEARCH_ONLY_APPRAISALS``
+    documents by relevance (ordered newest first), not the newest ones by date: the strongest match is the oldest."""
+    from tests.integration.test_tools_recency import BODY, WEAK, dated
+
+    oldest = dated(office, "cut18", "20/05/2018", body=BODY + " " + BODY, amount="2,000,000")
+    weak = [dated(office, f"cutw{n}", f"15/03/{2019 + n}", body=WEAK, amount="2,100,000") for n in range(2)]
+    strong = [dated(office, f"cuts{n}", f"15/03/{2021 + n}", body=BODY, amount="2,300,000") for n in range(4)]
+    assert SEARCH_ONLY_APPRAISALS < 1 + len(weak) + len(strong)
+    order = appraisal_order(ask_with(office, SO_QUESTION, True))
+    assert len(order) == SEARCH_ONLY_APPRAISALS and oldest in order
+    assert not set(weak) & set(order)  # the weakest matches are what the cut drops
+    assert order[-1] == oldest  # then newest first among them: the oldest comes last

@@ -338,3 +338,28 @@ def test_a_transient_failure_that_clears_on_a_later_attempt_swaps_the_reading(ga
     gated.reader["next"] = reading(NEW, CORRECTIONS)
     _drain_with_retries(gated)
     assert _job(gated).status == "done" and "reprocess_kept" not in _ingestion(gated)
+
+
+# --- the dates record follows the reading (round 11 review #1) -------------------------------------------------
+
+
+def test_the_valuation_dates_derived_from_the_old_reading_do_not_survive_a_reprocess(gated):
+    """`version_dates` is a derived cache of the stored text: replacing the reading drops it, so the next read derives
+    the date the new reading states (before: the old rows, or a 'none found' marker, were served for good)."""
+    from app.chat import dates as D
+
+    def stated(cache=None):
+        with tenant_tx(gated.system) as conn:
+            got = D.valuation_dates(conn, [gated.version], cache=cache)[gated.version]
+        return [d.iso for d in got]
+
+    gated.reader["next"] = reading({1: ["המועד הקובע: 15/04/2024", *OLD[1]], 2: OLD[2]})
+    _reprocess(gated)
+    assert stated() == ["2024-04-15"]
+    assert scalar(gated, "SELECT count(*) FROM version_dates WHERE version_id = :v", v=gated.version) == 1
+
+    gated.reader["next"] = reading({1: ["המועד הקובע: 01/02/2025", "שומה קודמת משנת 2024 (15/04).", *OLD[1]],
+                                    2: OLD[2]})
+    _reprocess(gated)
+    assert _job(gated).status == "done"
+    assert stated() == ["2025-02-01"]

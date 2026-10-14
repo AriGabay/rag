@@ -35,11 +35,10 @@ from app.platform import dates
 from app.providers.llm import prompt_text
 
 JERUSALEM = ZoneInfo("Asia/Jerusalem")
-MODES = ("none", "recent", "explicit")
-KINDS = ("point", "range", "open", "relative", "compare")
 
 
-def _today() -> date:
+def today() -> date:
+    """Today's date in the office's calendar (Asia/Jerusalem)."""
     return datetime.now(JERUSALEM).date()
 
 
@@ -64,7 +63,7 @@ class TimeMode:
     against it); ``prefer_recent``: the switch as the message was recorded with it."""
     mode: str = "none"
     source: str = "switch"
-    anchor: date = field(default_factory=_today)
+    anchor: date = field(default_factory=today)
     requested: Requested | None = None
     prefer_recent: bool = False
 
@@ -95,6 +94,15 @@ _FROM = re.compile(rf"(?<![א-ת])מ[{_HY}]?\s*$")
 _NEAR_WORD = re.compile(r"(?<![א-ת])(?:לפני|אחרי)(?=\s)")
 # a conjunction glued to a date word ("ובשנת 2024", "וב-2024") would hide the word from the parser
 _CONJUNCTION = re.compile(rf"(?<![א-ת])ו(?=(?:בשנת|לשנת|משנת|שנת|עד|בין|מאז|[בלמ][{_HY}]))")
+
+
+# A year that follows a building, purchase or legislation phrase ("נבנה ב-1985", "נרכשה בשנת 2010", "חוק התכנון והבנייה
+# 1965") describes the property or the law, not the valuation time asked about (review #2): masked like an identifier, so
+# it never makes the turn explicit. Within 25 characters, no digit, no sentence break and no valuation word between the
+# phrase and the year: "נרכש לפני שנים, מה השווי ב-2022" keeps its year.
+_NON_VALUATION_YEAR = re.compile(
+    r"(?<![א-ת])[והבלמכש]{0,3}(?:נבנ(?:ה|תה|ו)|בנייה|בניה|הקמה|נרכש(?:ה|ו)?|רכישה|חוקי|חוק|תקנות|תיקון|היתרי|היתר|צו)"
+    r"(?![א-ת])(?:(?!שווי|נכון|שומ|מחיר|הערכ)[^\d?.!,;:]){0,25}?(?:\d{1,2}[./]){0,2}(?:19|20)\d{2}(?!\d)")
 
 
 def _blank(text: str, span: tuple[int, int]) -> str:
@@ -145,19 +153,10 @@ def _relative(masked: str, anchor: date) -> tuple[list[tuple[int, Requested]], s
     return found, rest
 
 
-def _cut(iso: str, precision: str) -> str:
-    return iso[:{"year": 4, "month": 7, "day": 10}[precision]]
-
-
-def _coarser(a: str, b: str) -> str:
-    order = ("year", "month", "day")
-    return min(a, b, key=order.index)
-
-
 def _absolute(masked: str, rest: str) -> list[tuple[int, Requested]]:
     """The dates the question states, each classified by the word in front of it. ``masked``: the text with the
     identifier numbers masked (the words are read there); ``rest``: the same with the relative periods blanked."""
-    near = _NEAR_WORD.sub(lambda m: "בשנת", rest)  # same length ("לפני"/"אחרי" and "בשנת" are 4 letters)
+    near = _NEAR_WORD.sub("בשנת", rest)  # same length ("לפני"/"אחרי" and "בשנת" are 4 letters)
     near = _CONJUNCTION.sub(" ", near)
     out: list[tuple[int, Requested]] = []
     for p in dates.find_all(near):
@@ -182,13 +181,13 @@ def _absolute(masked: str, rest: str) -> list[tuple[int, Requested]]:
 
 
 def _compare(a: Requested, b: Requested) -> Requested:
-    precision = _coarser(a.precision, b.precision)
-    first, second = sorted((_cut(a.start, precision), _cut(b.start, precision)))  # type: ignore[arg-type]
+    precision = dates.coarser(a.precision, b.precision)
+    first, second = sorted((dates.cut(a.start, precision), dates.cut(b.start, precision)))  # type: ignore[arg-type]
     return Requested("compare", first, second, precision, f"{a.text} / {b.text}")
 
 
 def _requested(question: str, anchor: date) -> Requested | None:
-    masked = _mask(question or "", _BLOCK, _PARCEL, _PROFESSIONAL_REF)
+    masked = _mask(question or "", _BLOCK, _PARCEL, _PROFESSIONAL_REF, _NON_VALUATION_YEAR)
     relative, rest = _relative(masked, anchor)
     items = sorted(relative + _absolute(masked, rest), key=lambda item: item[0])
     if not items:
@@ -206,7 +205,7 @@ def _anchor_of(time_preference: dict | None) -> date:
     try:
         return date.fromisoformat(str((time_preference or {}).get("anchor_date")))
     except ValueError:
-        return _today()
+        return today()
 
 
 def resolve(question: str, time_preference: dict | None) -> TimeMode:

@@ -1675,9 +1675,6 @@ button.cut-marker:focus-visible {
   .timeline-table .tl-value {
     font-weight: 600;
   }
-  .tl-kind {
-    margin-inline-start: 8px;
-  }
   .tl-marks:empty {
     display: none;
   }

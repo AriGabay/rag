@@ -2475,7 +2475,6 @@ def _texts(ws: Workspace, ids: list[str]) -> list[tuple[str, str]]:
 
 # the provenances of a datum's date that the server read from the source (round 11 U15 B): never one the model typed
 _SOURCE_DATE = frozenset({"source", "source_table", "unit_valuation"})
-_PRECISION_RANK = {"year": 0, "month": 1, "day": 2}
 
 
 def _as_of_dates(as_of: dict | None) -> list[tuple[str, str]]:
@@ -2488,11 +2487,7 @@ def _as_of_dates(as_of: dict | None) -> list[tuple[str, str]]:
 
 def _as_of_forms(as_of: dict | None) -> list[str]:
     """The written forms of a datum's stated dates at their precision (DD/MM/YYYY, MM/YYYY, YYYY)."""
-    out = []
-    for iso, precision in _as_of_dates(as_of):
-        y, m, d = (iso.split("-") + [None, None])[:3]
-        out.append(f"{d}/{m}/{y}" if precision == "day" else f"{m}/{y}" if precision == "month" else y)
-    return out
+    return [shared_dates.shown_date(iso, precision) for iso, precision in _as_of_dates(as_of)]
 
 
 def _date_backed(text: str, ws: Workspace, ids: list[str]) -> set[str]:
@@ -2506,7 +2501,7 @@ def _date_backed(text: str, ws: Workspace, ids: list[str]) -> set[str]:
         return set()
 
     def holds(iso: str, precision: str) -> bool:
-        return any(iso == day[:len(iso)] and _PRECISION_RANK[precision] <= _PRECISION_RANK[rank] for day, rank in stated)
+        return any(iso == day[:len(iso)] and shared_dates.PRECISION_RANK[precision] <= shared_dates.PRECISION_RANK[rank] for day, rank in stated)
 
     backed = [p for p in shared_dates.find_all(text) if holds(p.iso, p.precision) and (p.end is None or holds(p.end, p.precision))]
     if not backed:

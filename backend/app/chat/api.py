@@ -53,15 +53,15 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import NamedTuple
 from uuid import UUID
-from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
 from app.audit import audit
-from app.chat import anchors, coverage, decisions, engine, slots, timeline, verify
+from app.chat import anchors, coverage, decisions, engine, slots, timeframe, timeline, verify
 from app.chat.compose import SERVER_SPANS_FIELD, strip_server_spans, text_digest
+from app.chat.timeframe import JERUSALEM
 from app.config import get_settings
 from app.db import TenantContext, current_data_version, tenant_tx
 from app.deps import NOT_FOUND, get_ctx, parse_uuid
@@ -123,8 +123,8 @@ class ConversationPatch(BaseModel):
     prefer_recent: bool | None = None
 
 
-# the calendar the anchor date of a relative period ("last year") is read in: the office's, not the server's (KTD1)
-JERUSALEM = ZoneInfo("Asia/Jerusalem")
+# the calendar the anchor date of a relative period ("last year") is read in is the office's, not the server's
+# (``timeframe.JERUSALEM``, KTD1)
 TIME_PREFERENCE_VERSION = 1
 
 
@@ -866,7 +866,7 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
     # the timeline (round 11 U9, KTD8): every comparable group holding a value the answer rests on, filled from all the
     # values the turn registered. Its rows open their sources like a citation does, so the uncited ones join the records
     # (and the documents) the payload carries
-    answer_time = timeline.payload(ws, {i for i in used if i in ws.values or i in ws.measurements})
+    answer_time = timeline.payload(ws, used)  # the ids that are no V# or M# match no value
     used |= timeline.row_ids(answer_time["timeline"])
     measurements = [ws.measurements[i].public() for i in ws.measurements if i in used]
     computations = [ws.computations[i].public() for i in ws.computations if i in used]
@@ -889,7 +889,7 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
     for m in measurements:  # a measurement's document is a source too: permission checks cover it
         if not any(s["document_id"] == m["document_id"] for s in sources):
             sources.append({"id": m["id"], "document_id": m["document_id"], "version_id": m["version_id"],
-                            "title": m["title"], "section": m["section"], "location": "נתון כמותי שחולץ",
+                            "title": m["title"], "section": m["section"], "location": timeline.MSG_NO_LOCATION,
                             "kind": "measurement", "text": m["quote"], "block_start": m["block_index"],
                             "block_end": m["block_index"], "table_index": m["table_index"], "page_list": None,
                             "chunk_id": None, "reading_id": m.get("reading_id")})
@@ -1140,7 +1140,7 @@ def _search_only(ws, question: str) -> None:
             pass
 
     with tenant_tx(ws.ctx) as conn:
-        both = ws.intent == "unknown" and ws.unit_focus is None and T._has_professional(ws, conn)
+        both = ws.intent == "unknown" and ws.unit_focus is None and T.has_professional(ws, conn)
     if not both:  # the pools the intent gives: a property question reads appraisals, and an office without standards too
         search(SEARCH_ONLY_APPRAISALS)
         return
@@ -1164,7 +1164,6 @@ def _limited_answer(ctx: TenantContext, question: str, reason: str, time_prefere
     the switch's order — newest first when it was on, relevance when off, the question's own time when it gives one — and
     every appraisal passage shows the valuation date of its unit or that it is unknown; the professional group keeps its
     order and carries no date."""
-    from app.chat import timeframe
     from app.chat import tools as T
     from app.platform import source_kinds
 

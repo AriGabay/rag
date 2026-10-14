@@ -236,9 +236,8 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
   const copy = async () => {
     try {
       const timelineText = answer.time?.text;
-      await navigator.clipboard.writeText(
-        timelineText ? `${plainAnswer(answer.markdown)}\n\n${timelineText}` : plainAnswer(answer.markdown),
-      );
+      const plain = plainAnswer(answer.markdown);
+      await navigator.clipboard.writeText(timelineText ? `${plain}\n\n${timelineText}` : plain);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
     } catch {
@@ -308,18 +307,32 @@ const TIMELINE_MARK: Record<ChatTimelineMark, { label: string; cls: string }> = 
   forecast: { label: "תחזית", cls: "badge-info" },
   conflict: { label: "סתירה בין מקורות", cls: "badge-warn" },
   outside_requested: { label: "מחוץ לזמן שביקשת", cls: "" },
+  uncertain: { label: "קריאה לא ודאית", cls: "badge-warn" },
   unknown_date: { label: "מועד לא ידוע", cls: "" },
 };
 
-/** A timeline date at the precision the source gave: a month or a year is never shown as a day. */
+/** One ISO date at the precision the source gave: a month or a year is never shown as a day. */
+function timelinePoint(iso: string, precision: ChatTimelineRow["precision"]): string {
+  const m = /^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?/.exec(iso);
+  if (!m) return iso;
+  const p = precision ?? (m[3] ? "day" : m[2] ? "month" : "year");
+  if (p === "year" || !m[2]) return m[1];
+  if (p === "month" || !m[3]) return `${m[2]}/${m[1]}`;
+  return formatIsoDate(iso);
+}
+
+/** A timeline row's date: the start, and for a period (a table caption's range) its end in the same precision, joined by an
+ * en dash like the server's plain-text copy (`shown_period`). */
 function timelineDate(row: ChatTimelineRow): string {
   if (!row.date) return "ללא תאריך";
-  const m = /^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?/.exec(row.date);
-  if (!m) return row.date;
-  const precision = row.precision ?? (m[3] ? "day" : m[2] ? "month" : "year");
-  if (precision === "year" || !m[2]) return m[1];
-  if (precision === "month" || !m[3]) return `${m[2]}/${m[1]}`;
-  return formatIsoDate(row.date);
+  const first = timelinePoint(row.date, row.precision);
+  return row.end ? `${first}–${timelinePoint(row.end, row.precision)}` : first;
+}
+
+/** The value as the row shows it: the server's `unit` is display text ("₪", "מ״ר"), appended only when the value text does
+ * not already carry it, as the plain-text copy does. */
+function timelineValue(row: ChatTimelineRow): string {
+  return row.unit && !row.value_text.includes(row.unit) ? `${row.value_text} ${row.unit}` : row.value_text;
 }
 
 /** The server-built timeline of comparable dated values (round 11 U9, U10): groups and rows in the payload's order,
@@ -351,7 +364,7 @@ function Timeline({ groups, onCite }: { groups: ChatTimelineGroup[] | undefined;
                     {r.date_kind && DATE_KIND_LABEL[r.date_kind] && <span className="tl-kind">{DATE_KIND_LABEL[r.date_kind]}</span>}
                   </td>
                   <td role="cell" className="tl-value">
-                    <B>{r.value_text}</B>
+                    <B>{timelineValue(r)}</B>
                   </td>
                   <td role="cell" className="tl-source">
                     <button

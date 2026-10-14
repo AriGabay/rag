@@ -134,12 +134,13 @@ calculation component compares them (``allowed_contexts``). A file with one cont
 from __future__ import annotations
 
 import calendar
+import functools
 import json
 import logging
 import math
 import re
 import time
-from collections.abc import Callable, Container
+from collections.abc import Callable, Container, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import date
 from decimal import Decimal
@@ -157,7 +158,7 @@ from app.chat import unread as unread_text
 from app.chat.contexts import MSG_NO_TITLE
 from app.chat.evidence import TABLE_SIZE_PREFIX
 from app.chat.intent import MIXED, PROFESSIONAL
-from app.chat.property import property_key, same_property_units
+from app.chat.property import current_appraisal_files, property_key, same_property_units, subject_units
 from app.chat.timeframe import TimeMode
 from app.chat.timing import StageClock
 from app.config import get_settings
@@ -176,6 +177,7 @@ from app.measurements.extract import (
     stance_label,
 )
 from app.platform import source_kinds
+from app.platform.dates import precision_of, shown_date, shown_period
 from app.platform.documents import coverage_of, display_box_of, reading_notes
 from app.platform.search import SearchScope, search_passages, unread_documents, unread_matching, unread_named
 from app.platform.source_kinds import APPRAISALS_SQL, PROFESSIONALS_SQL
@@ -446,7 +448,7 @@ class Workspace:
     # the copies of professional text the pool leaves out, read once per data version: (version, excluded versions)
     copies: tuple | None = None
     # read once per data version: the visible professional documents' editions (``profiles``) and whether any exists
-    # (``_has_professional``), each as (data version, value); a professional version's sections, by (version id, data
+    # (``has_professional``), each as (data version, value); a professional version's sections, by (version id, data
     # version) (``sections_in``)
     profile_memo: tuple | None = None
     professional_memo: tuple | None = None
@@ -522,8 +524,12 @@ class Workspace:
     # the passages an identical search returned, kept for the turn (round 9 R16, KTD3, ``memoized_search``):
     # (query, scope, limit, the office's data version) -> hits
     search_memo: dict = field(default_factory=dict)
-    # the units sharing a property key, per (key, the office's data version) (round 11 U14)
+    # the units sharing a property key, per (key, the office's data version) (round 11 U14); the property a call's named
+    # documents are of, per (the documents, the data version); a unit's property key, per (its version, unit number, the
+    # data version)
     property_memo: dict = field(default_factory=dict)
+    # chunk id -> (first block, last block): what the ranking and the rendering of a search's hits read (``chunk_blocks``)
+    chunk_memo: dict = field(default_factory=dict)
     # the windows an identical read returned, kept for the turn (round 9 R16, KTD9, ``_memoized_read``): (a page range,
     # section or cursor window, or a table part; the reading; the office's data version) -> the source it returned
     read_memo: dict = field(default_factory=dict)
@@ -1178,7 +1184,7 @@ UNKNOWN = "לא ידוע"
 RELATIONS = {"clarifies": "מבהיר", "amends": "מתקן", "replaces": "מחליף", "appendix_of": "נספח של"}
 
 
-def _has_professional(ws: Workspace, conn: Connection) -> bool:
+def has_professional(ws: Workspace, conn: Connection) -> bool:
     """Whether the user may see a ready professional document at all, read once per data version."""
     version = current_data_version(conn)
     if ws.professional_memo is None or ws.professional_memo[0] != version:
@@ -1404,7 +1410,7 @@ def _plan(ws: Workspace, conn: Connection, pool: str | None, limit: int) -> tupl
     an office that holds no standard is the appraisal search it always was: appraisals alone, in no role."""
     allowed, notes = ws.pools, []
     default = DEFAULT_POOLS.get(ws.intent, DEFAULT_POOLS["unknown"])
-    if ws.intent == "unknown" and not _has_professional(ws, conn):
+    if ws.intent == "unknown" and not has_professional(ws, conn):
         allowed, default = {APPRAISAL_POOL: PRIMARY, PROFESSIONAL_POOL: allowed[PROFESSIONAL_POOL]}, (APPRAISAL_POOL,)
     named = pool not in (None, "") and pool in allowed
     if pool not in (None, "") and not named:
@@ -1448,12 +1454,6 @@ DATUM_DATE_HOW = {chat_dates.SOURCE: "כתוב בשורה או במשפט של �
 NO_VALUATION = chat_dates.UnitValuation("none", None, (), None)
 
 
-def shown_date(iso: str, precision: str) -> str:
-    """A date in the precision it was given: DD/MM/YYYY, MM/YYYY or YYYY (a month is never shown as a day)."""
-    y, m, d = (iso.split("-") + [None, None])[:3]
-    return f"{d}/{m}/{y}" if precision == "day" else f"{m}/{y}" if precision == "month" else y
-
-
 def valuation_line(uv: chat_dates.UnitValuation) -> str:
     """The date line of a passage: its unit's valuation date, or that it is unknown (a conflict shows every date)."""
     if uv.status == "stated" and uv.date is not None:
@@ -1477,9 +1477,7 @@ def datum_line(as_of: dict | None) -> str:
     if as_of is None or as_of.get("date") is None:
         out = MSG_DATUM_DATE_UNKNOWN
     else:
-        shown = shown_date(as_of["date"], as_of["precision"])
-        if as_of.get("end"):
-            shown = f"{shown}–{shown_date(as_of['end'], as_of['precision'])}"
+        shown = shown_period(as_of["date"], as_of["precision"], as_of.get("end"))
         out = MSG_DATUM_DATE.format(date=shown, how=DATUM_DATE_HOW.get(as_of["provenance"], as_of["provenance"]))
     return out + (f" | {MSG_FORECAST}" if as_of and as_of.get("forecast") else "")
 
@@ -1494,19 +1492,38 @@ def datum_as_of(ws: Workspace, sentence: str, as_of: dict | None) -> dict | None
     return None
 
 
-def _dated(as_of: dict | None) -> tuple[str, str, str | None] | None:
+def dated(as_of: dict | None) -> tuple[str, str, str | None] | None:
     """(date, precision, end) of an ``as_of``, None when it holds no date (unknown, or a forecast with no date)."""
     return None if as_of is None or as_of.get("date") is None else (as_of["date"], as_of["precision"], as_of.get("end"))
 
 
-def measurement_date(ws: Workspace, row) -> dict | None:
+def measurement_date(ws: Workspace, row, caption: str | None = None) -> dict | None:
     """A stored measurement's ``as_of`` (KTD4): the stored date counts only when the quote holds it; else the date its quote
-    states, or its table's range; a forecast wording marks it even with no date."""
-    return datum_as_of(ws, row.quote, chat_dates.measurement_as_of(
-        row.quote, row.effective_date, table_caption=getattr(row, "caption", None), anchor=ws.time.anchor))
+    states, or its table's range (``caption``, else the row's own); a forecast wording marks it even with no date. Dated
+    once per measurement in a turn (the turn's date cache)."""
+    key = ("as_of", row.id)
+    if key not in ws.date_cache:
+        ws.date_cache[key] = datum_as_of(ws, row.quote, chat_dates.measurement_as_of(
+            row.quote, row.effective_date, table_caption=getattr(row, "caption", None) if caption is None else caption,
+            anchor=ws.time.anchor))
+    found = ws.date_cache[key]
+    return None if found is None else dict(found)
 
 
-def _bounds(iso: str, precision: str) -> tuple[date, date]:
+def _captions(conn: Connection, rows: Iterable) -> dict[tuple, str | None]:
+    """The caption of each table the measurements are rows of — (version id, table index) -> caption, from one query over
+    the distinct tables; a measurement outside any table, or of a table with none, is not in it."""
+    tables = {(r.version_id, r.table_index) for r in rows if r.table_index is not None}
+    if not tables:
+        return {}
+    pairs = sorted(tables, key=lambda t: (str(t[0]), t[1]))
+    return {(r.version_id, r.table_index): r.caption for r in conn.execute(text(
+        "SELECT et.version_id, et.table_index, et.structure->>'caption' AS caption FROM extracted_tables et"
+        " JOIN unnest(CAST(:v AS uuid[]), CAST(:t AS integer[])) AS w(v, t) ON et.version_id = w.v"
+        " AND et.table_index = w.t"), {"v": [v for v, _ in pairs], "t": [t for _, t in pairs]})}
+
+
+def bounds(iso: str, precision: str) -> tuple[date, date]:
     """The first and the last day of the period an ISO date (in its precision) names."""
     parts = [int(x) for x in iso.split("-")]
     if precision == "year":
@@ -1517,12 +1534,14 @@ def _bounds(iso: str, precision: str) -> tuple[date, date]:
     return day, day
 
 
-def _wanted(requested) -> list[tuple[date | None, date | None]]:
-    """The periods the question asks about, as inclusive day bounds (None: open). A comparison asks about two points."""
+@functools.lru_cache(maxsize=256)
+def _wanted(requested) -> tuple[tuple[date | None, date | None], ...]:
+    """The periods the question asks about, as inclusive day bounds (None: open). A comparison asks about two points.
+    ``Requested`` is frozen, so the turn's one requested time is read once, not once per hit."""
     if requested.kind == "compare":
-        return [_bounds(x, requested.precision) for x in (requested.start, requested.end)]
-    return [(_bounds(requested.start, requested.precision)[0] if requested.start else None,
-             _bounds(requested.end, requested.precision)[1] if requested.end else None)]
+        return tuple(bounds(x, requested.precision) for x in (requested.start, requested.end))
+    return ((bounds(requested.start, requested.precision)[0] if requested.start else None,
+             bounds(requested.end, requested.precision)[1] if requested.end else None),)
 
 
 def time_key(time: TimeMode, dated: tuple[str, str, str | None] | None, forecast: bool = False) -> tuple:
@@ -1533,17 +1552,38 @@ def time_key(time: TimeMode, dated: tuple[str, str, str | None] | None, forecast
         if dated is None:
             return (2, 0)
         iso, precision, end = dated
-        first, last = _bounds(iso, precision)[0], _bounds(end or iso, precision)[1]
+        first, last = bounds(iso, precision)[0], bounds(end or iso, precision)[1]
         gap = min(((lo - last).days if lo and last < lo else (first - hi).days if hi and first > hi else 0)
                   for lo, hi in _wanted(time.requested))
         return (0, 0) if gap == 0 else (1, gap)
     if dated is None:
         return (2, 0)
     iso, precision, end = dated
-    at = _bounds(end or iso, precision)[0].toordinal()
-    if forecast or chat_dates._later_than(end or iso, precision, time.anchor):
+    at = bounds(end or iso, precision)[0].toordinal()
+    if forecast or chat_dates.is_after_anchor(end or iso, precision, time.anchor):
         return (1, at)
     return (0, -at)
+
+
+def chunk_blocks(ws: Workspace, conn: Connection, chunk_ids: Iterable) -> dict:
+    """chunk id -> (first block, last block) of the chunks, read once per turn: the ranking of a time search and the
+    rendering of its hits ask for the same chunks. A chunk the database does not know is not in the result."""
+    wanted = list(dict.fromkeys(chunk_ids))
+    missing = [c for c in wanted if c not in ws.chunk_memo]
+    if missing:
+        for r in conn.execute(text("SELECT id, block_start, block_end FROM chunks WHERE id = ANY(:i)"), {"i": missing}):
+            ws.chunk_memo[r.id] = (r.block_start, r.block_end)
+    return {c: ws.chunk_memo[c] for c in wanted if c in ws.chunk_memo}
+
+
+def prime_dates(ws: Workspace, conn: Connection, version_ids: Iterable) -> None:
+    """Read the valuation dates (and, with them, the units) of many versions at once into the turn's date cache, so the
+    ``valuation_of`` of each hit that follows costs no query. Only versions that will be dated are given: reading the
+    dates of a version derives and stores them."""
+    ids = sorted(dict.fromkeys(version_ids), key=str)  # a stable order: derivations lock per version (chat.dates)
+    if ids:
+        chat_dates.prime_units(conn, ids, ws.date_cache)
+        chat_dates.valuation_dates(conn, ids, cache=ws.date_cache)
 
 
 def _time_memo_key(time: TimeMode) -> tuple:
@@ -1555,7 +1595,7 @@ def _time_memo_key(time: TimeMode) -> tuple:
 def ranked_by_time(ws: Workspace, conn: Connection, hits: list[dict], limit: int) -> list[dict]:
     """The hits of the fused window, with the relevant documents ordered by the turn's time mode (KTD6, R4, R12). Relevance
     comes first: the relevant set is the first ``SEARCH_MAX`` distinct documents by the rank of their best passage in the
-    window, and only those are ordered by date — a barely relevant newer document is not lifted above them, and the
+    window (the first ``limit`` for a workspace with ``exact_limit``), and only those are ordered by date — a barely relevant newer document is not lifted above them, and the
     documents past the set keep their relevance order after it. A document is dated by the valuation date of the unit that
     holds its best passage; an unknown or conflicting date ranks as unknown. The output covers the best hit of every document
     of the ordered set (so a small ``limit`` never cuts a relevant dated document, and never more than ``SEARCH_MAX`` hits),
@@ -1563,19 +1603,26 @@ def ranked_by_time(ws: Workspace, conn: Connection, hits: list[dict], limit: int
     document order (each document's in relevance order), then the hits past the set in relevance order."""
     if not hits:
         return hits
-    starts = {r.id: r.block_start for r in conn.execute(text("SELECT id, block_start FROM chunks WHERE id = ANY(:i)"),
-                                                        {"i": [h["chunk_id"] for h in hits]})}
     by_document: dict[str, list[dict]] = {}
     for h in hits:
         by_document.setdefault(str(h["document_id"]), []).append(h)
     groups = list(by_document.values())
-    relevant, past = groups[:SEARCH_MAX], groups[SEARCH_MAX:]
+    # a workspace with ``exact_limit`` (a search-only answer) shows ``limit`` documents: those are the relevant set, so the
+    # date order only permutes the documents relevance chose and never cuts the best older match (review #4)
+    cut = min(SEARCH_MAX, limit) if ws.exact_limit else SEARCH_MAX
+    relevant, past = groups[:cut], groups[cut:]
+    # only the best passage of each relevant document is dated: its block is the only one read, and its versions' dates
+    # (and units) are read together before the loop
+    bests = [group[0] for group in relevant]
+    blocks = chunk_blocks(ws, conn, [best["chunk_id"] for best in bests])
+    starts = {best["chunk_id"]: blocks.get(best["chunk_id"], (None, None))[0] for best in bests}
+    prime_dates(ws, conn, [best["version_id"] for best in bests if starts[best["chunk_id"]] is not None])
     keyed = []
     for position, group in enumerate(relevant):
         best = group[0]
-        uv = valuation_of(ws, conn, best["version_id"], starts.get(best["chunk_id"]))
-        dated = (uv.date.iso, uv.date.precision, None) if uv.status == "stated" and uv.date is not None else None
-        keyed.append((time_key(ws.time, dated), position, group))
+        uv = valuation_of(ws, conn, best["version_id"], starts[best["chunk_id"]])
+        when = (uv.date.iso, uv.date.precision, None) if uv.status == "stated" and uv.date is not None else None
+        keyed.append((time_key(ws.time, when), position, group))
     keyed.sort(key=lambda k: k[:2])
     firsts = [g[0] for *_, g in keyed]
     further = [h for *_, g in keyed for h in g[1:]] + [h for g in past for h in g]
@@ -1728,9 +1775,10 @@ def _unit_search(ws: Workspace, conn: Connection, handle: str, query: str, limit
     return [], [], MSG_UNIT_SEARCHED.format(unit=unit, pages=_unit_pages(*cx.pages(number)), extended="", query=_txt(query))
 
 
-def _property_found(ws: Workspace, conn: Connection, key: str) -> list[tuple]:
-    """(document, version, unit number) of every subject unit of the property ``key``, once per turn and data version."""
-    memo_key = (key, current_data_version(conn))
+def _property_found(ws: Workspace, conn: Connection, key: str, version: int | None = None) -> list[tuple]:
+    """(document, version, unit number) of every subject unit of the property ``key``, once per turn and data version
+    (``version``: the data version, when the caller has just read it)."""
+    memo_key = (key, current_data_version(conn) if version is None else version)
     found = ws.property_memo.get(memo_key)
     if found is None:
         found = ws.property_memo[memo_key] = same_property_units(conn, key)
@@ -1769,11 +1817,15 @@ def _property_search(ws: Workspace, conn: Connection, handle: str, query: str,
     is the only one with it — the unit search stands.
     Returns (hits, notes for the model, the answer when nothing was found), as ``_unit_search`` does."""
     v, cx, number = _unit_of(conn, ws, handle)
-    mine = next((u for u in unit_store.ensure(conn, v.version_id) if u.unit_no == number), None)
-    key = property_key(mine.identifiers) if mine is not None else None
+    version = current_data_version(conn)
+    unit_key = ("unit", str(v.version_id), number, version)  # the focus unit's key, read once per turn and data version
+    if unit_key not in ws.property_memo:
+        mine = next((u for u in unit_store.ensure(conn, v.version_id) if u.unit_no == number), None)
+        ws.property_memo[unit_key] = property_key(mine.identifiers) if mine is not None else None
+    key = ws.property_memo[unit_key]
     if key is None:
         return None
-    found = _property_found(ws, conn, key)
+    found = _property_found(ws, conn, key, version)
     if len(found) < 2 or (v.document_id, v.version_id, number) not in found:
         return None
     return _property_hits(ws, conn, found, query, limit)
@@ -1788,19 +1840,22 @@ def _named_property(ws: Workspace, conn: Connection, docs: list[UUID]) -> list[t
     when the property is appraised by no other unit. Returns ``same_property_units`` of that key."""
     if not docs:
         return None
-    files = conn.execute(text(
-        "SELECT d.id AS document_id, v.id AS version_id FROM documents d JOIN document_versions v ON v.document_id = d.id"
-        f" AND v.is_current WHERE d.id = ANY(:d) AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"), {"d": list(docs)}).all()
+    version = current_data_version(conn)
+    memo_key = ("named", tuple(sorted(map(str, docs))), version)  # the call's documents, once per turn and data version
+    if memo_key not in ws.property_memo:
+        ws.property_memo[memo_key] = _named_property_units(ws, conn, docs, version)
+    return ws.property_memo[memo_key]
+
+
+def _named_property_units(ws: Workspace, conn: Connection, docs: list[UUID], version: int) -> list[tuple] | None:
+    """``_named_property`` without its memo."""
+    files = current_appraisal_files(conn, docs)
     if {f.document_id for f in files} != set(docs):
         return None
-    stored = unit_store.stored_many(conn, [f.version_id for f in files])
-    keys: set[str | None] = set()
-    for f in files:
-        units = stored.get(f.version_id) or unit_store.ensure(conn, f.version_id)
-        keys |= {property_key(u.identifiers) for u in units if u.kind not in contexts.NON_SUBJECT_KINDS}
+    keys = {property_key(u.identifiers) for _, u in subject_units(conn, files)}
     if len(keys) != 1 or None in keys:
         return None
-    found = _property_found(ws, conn, next(iter(keys)))
+    found = _property_found(ws, conn, next(iter(keys)), version)
     return found if len(found) >= 2 else None
 
 
@@ -1838,16 +1893,17 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
     limit = max(3, min(int(limit or SEARCH_LIMIT), SEARCH_MAX))
     ws.searches.append(query)
     notes: list[str] = []
+    timed = ws.time.mode != "none"  # the turn has a time mode (the question's time, or the switch)
     in_focus = False
     if not unit:
         unit = focus_unit_for(ws, document_ids)  # the conversation's unit
         in_focus = unit is not None
-    elif ws.time.mode != "none" and names_focus_unit(ws, unit, document_ids):
+    elif timed and names_focus_unit(ws, unit, document_ids):
         in_focus = True  # the model names the focus unit it sees in the context: still the conversation's unit (U16)
     with tenant_tx(ws.ctx) as conn:
         if unit:
             # the conversation's unit in a turn with a time mode: its property's other appraisals are read too (U14)
-            widened = _property_search(ws, conn, unit, query, limit) if in_focus and ws.time.mode != "none" else None
+            widened = _property_search(ws, conn, unit, query, limit) if in_focus and timed else None
             hits, notes, nothing = widened or _unit_search(ws, conn, unit, query, limit, document_ids)
             if in_focus:
                 focus_note = MSG_UNIT_FOCUS.format(unit=unit)
@@ -1872,11 +1928,11 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
             absent = False
             # a time question naming the documents of one property reads every appraisal of it (U16); a document question
             # reads the named documents only
-            property_units = (_named_property(ws, conn, docs) if docs and ws.time.mode != "none"
+            property_units = (_named_property(ws, conn, docs) if docs and timed
                               and not (ws.intent == "document" and ws.named_documents) else None)
             for p in passes:
                 if p.pool == PROFESSIONAL_POOL and (ws.intent in (PROFESSIONAL, MIXED) or asked) \
-                        and not _has_professional(ws, conn):
+                        and not has_professional(ws, conn):
                     ws.standards_absent = absent = True  # the office holds none: a stated gap, not a failed search (KTD15)
                     notes.append(MSG_NO_STANDARD_POOL)
                     if not any(q.pool == APPRAISAL_POOL for q in passes) and APPRAISAL_POOL in ws.pools:
@@ -1890,12 +1946,13 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 n = limit if absent and p.pool == APPRAISAL_POOL else p.limit
                 left_out = copies_left_out(ws, conn) if p.pool == PROFESSIONAL_POOL and not docs else ()
                 scope = SearchScope(document_ids=tuple(docs), source_kinds=POOL_KINDS[p.pool], exclude_versions=left_out)
-                wide = (_property_hits(ws, conn, property_units, query, n)
-                        if property_units and p.pool == APPRAISAL_POOL and p.role == PRIMARY else None)
-                if wide is not None and not wide[2]:
-                    found = wide[0]
-                    notes += wide[1]
-                elif ws.time.mode != "none" and p.pool == APPRAISAL_POOL and p.role == PRIMARY:
+                wide_hits, wide_notes, wide_nothing = (
+                    _property_hits(ws, conn, property_units, query, n)
+                    if property_units and p.pool == APPRAISAL_POOL and p.role == PRIMARY else (None, [], None))
+                if wide_hits is not None and not wide_nothing:
+                    found = wide_hits
+                    notes += wide_notes
+                elif timed and p.pool == APPRAISAL_POOL and p.role == PRIMARY:
                     # the appraisals that answer: the fused window, its documents ordered by date, then cut (KTD6); the
                     # professional pool and the examples beside it are read as they always were (R16)
                     found = ranked_by_time(ws, conn, memoized_search(ws, conn, query, n, scope, window=True), n)
@@ -1906,9 +1963,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
         # a document the query names by its title that was not read has no passages: say so, never "not found" (KTD11)
         named = unread_named(conn, query, ws.unread_files(conn)) if lookup_unread else []
         ws.name_unread(named)
-        ids = [h["chunk_id"] for h in hits]
-        extra = {r.id: r for r in conn.execute(text(
-            "SELECT id, block_start, block_end FROM chunks WHERE id = ANY(:i)"), {"i": ids})} if ids else {}
+        extra = chunk_blocks(ws, conn, [h["chunk_id"] for h in hits])
         gaps = _reading_gaps(conn, list({h["version_id"] for h in hits}))
         whole = ReadingGaps(False)
         ws.note_readings(conn, {h["version_id"] for h in hits})
@@ -1922,15 +1977,17 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                   for h in hits if h.get("rows_not_shown") and h.get("table_index") is not None]
         out = []
         noted: dict[str, object] = {}  # the files holding several contexts the hits are in, not yet listed
-        for h in hits:
-            if h["kind"] == "table_row" and any(
-                    t["version_id"] == h["version_id"] and t.get("table_index") == h.get("table_index")
-                    and h["text"].split(": ", 1)[-1][:40] in t["text"] for t in tables):
-                continue
-            e = extra.get(h["chunk_id"])
-            bs, be = (e.block_start, e.block_end) if e else (None, None)
+        rendered = [h for h in hits if not (h["kind"] == "table_row" and any(
+            t["version_id"] == h["version_id"] and t.get("table_index") == h.get("table_index")
+            and h["text"].split(": ", 1)[-1][:40] in t["text"] for t in tables))]
+        # the valuation dates of the appraisal passages are read together before their date lines are written
+        prime_dates(ws, conn, [h["version_id"] for h in rendered if h["pool"] != PROFESSIONAL_POOL
+                               and extra.get(h["chunk_id"], (None, None))[0] is not None])
+        valuations = functools.partial(_hit_valuations, ws, conn, {})  # the property's dates, read when a hit needs them
+        for h in rendered:
+            bs, be = extra.get(h["chunk_id"], (None, None))
             if h["pool"] == PROFESSIONAL_POOL:
-                src = _professional_hit(ws, conn, h, bs, be, sizes, gaps.get(h["version_id"], whole), h["role"])
+                src = _professional_hit(ws, conn, h, bs, be, sizes, gaps.get(h["version_id"], whole), h["role"], valuations)
                 out.append(ws.once(src, ("chunk", h["chunk_id"])))
                 ws.touch(h["document_id"], h["title"], "retrieved", gaps.get(h["version_id"], whole).partial)
                 continue
@@ -1969,11 +2026,21 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
     return "\n\n".join([*notes, *(_render_source(s) for s in out), *hints])
 
 
+def _hit_valuations(ws: Workspace, conn: Connection, memo: dict) -> list:
+    """``property_valuations`` for the professional hits of one search: read once per set of appraisal passages the turn
+    holds, so a hit still sees the passages added before it in the loop and a hit after no new passage reuses the answer."""
+    held = sum(1 for src in ws.sources.values() if _dated_appraisal(src))
+    if memo.get("held") != held:
+        memo["held"], memo["valuations"] = held, property_valuations(ws, conn)
+    return memo["valuations"]
+
+
 def _professional_hit(ws: Workspace, conn: Connection, h: dict, bs, be, sizes: dict, gaps: ReadingGaps,
-                      role: str) -> Source:
+                      role: str, valuations: Callable[[], list] | None = None) -> Source:
     """A hit of the professional pool (KTD13, R22): the passage under the identity of its standard — the number, the
     edition and the effective date it states, the section it is in — with the limits that bind its provision, and the
-    call that reads the whole section. A document that states nothing is named by its own title."""
+    call that reads the whole section. A document that states nothing is named by its own title. ``valuations``: the
+    search's memo of the property's valuation dates (``_edition_note``)."""
     vid = h["version_id"]
     kind, std = standard_for(ws, conn, vid, bs)
     secs = sections_in(ws, conn, vid)
@@ -1985,7 +2052,7 @@ def _professional_hit(ws: Workspace, conn: Connection, h: dict, bs, be, sizes: d
         where = " ".join(x for x in (section_phrase(std), f"«{_txt(sec.title)}»" if sec.title and sec.label else None) if x)
         notes.append(f"[{where}: read(section={handle}) קורא את הסעיף כולו, עם תתי-הסעיפים שלו]")
         notes += limit_lines(secs, sec)
-    notes += _edition_note(ws, conn, vid, std)
+    notes += _edition_note(ws, conn, vid, std, valuations)
     tags = {"document": ws.doc_handle(h["document_id"])}
     if h.get("table_index") is not None:
         tags["table"] = _table_handle(ws, h["document_id"], vid, ws.readings.get(str(vid)), h["table_index"])
@@ -2908,6 +2975,12 @@ MSG_EDITION_THIS_IN_FORCE = "מהדורה זו היא זו שבתוקף למוע
 MSG_EDITION_THIS_NOT = "מהדורה זו אינה זו שבתוקף למועד הקובע {date} של הנכס; בתוקף אז: {edition}."
 
 
+def _dated_appraisal(src: Source) -> bool:
+    """Whether a source is a passage of an appraisal with a place in it: the sources whose unit's valuation date says what
+    the property's valuation date is."""
+    return src.version_id is not None and src.source_kind == source_kinds.APPRAISAL and src.block_start is not None
+
+
 def property_valuations(ws: Workspace, conn: Connection) -> list[chat_dates.StatedDate | None]:
     """The valuation dates of the property the question is about (R8): the located unit's when the turn has one, else those
     of the appraisal passages the turn returned — each distinct stated date once, then None if any is unknown. Empty for a
@@ -2921,9 +2994,8 @@ def property_valuations(ws: Workspace, conn: Connection) -> list[chat_dates.Stat
         stated = chat_dates.valuation_dates(conn, [v], cache=ws.date_cache).get(v, ())
         found.append(chat_dates.resolve_unit([d for d in stated if d.unit_no == focus["unit_no"]], focus["unit_no"]))
     else:
-        for src in ws.sources.values():
-            if src.version_id is not None and src.source_kind == source_kinds.APPRAISAL and src.block_start is not None:
-                found.append(valuation_of(ws, conn, src.version_id, src.block_start))
+        found += [valuation_of(ws, conn, src.version_id, src.block_start)
+                  for src in ws.sources.values() if _dated_appraisal(src)]
     stated_dates = sorted({(u.date.iso, u.date.precision): u.date for u in found if u.status == "stated"
                            and u.date is not None}.items())
     return [d for _, d in stated_dates] + ([None] if any(u.status != "stated" for u in found) else [])
@@ -2935,11 +3007,11 @@ def edition_in_force(group, valued: chat_dates.StatedDate) -> tuple[Any, str]:
     starts inside the period a month or year valuation names, so the date does not tell)."""
     if not group.order_known or any(not (e.effective or e.published) for e in group.editions):
         return None, "undetermined"
-    first, last = _bounds(valued.iso, valued.precision)
+    first, last = bounds(valued.iso, valued.precision)
     started = []
     for e in group.editions:
         since = e.effective or e.published
-        start = _bounds(since, {4: "year", 7: "month"}.get(len(since), "day"))[0]
+        start = bounds(since, precision_of(since))[0]
         if start <= first:
             started.append((start, e))
         elif start <= last:
@@ -2947,52 +3019,49 @@ def edition_in_force(group, valued: chat_dates.StatedDate) -> tuple[Any, str]:
     return (max(started, key=lambda x: x[0])[1], "found") if started else (None, "none_yet")
 
 
-def _edition_name(e, names: dict | None = None) -> str:
-    return (names[e.version_id] + " " if names else "") + f"«{_txt(e.edition) if e.edition else UNKNOWN}»"
+def _edition_line(group, valued: chat_dates.StatedDate | None, on_found: Callable[[Any, str], str]) -> str:
+    """The line for one valuation date of the property against the editions of ``group`` (KTD7): the date is unknown, no
+    edition was in force, the editions' dates do not tell — or, for the edition found in force, ``on_found(edition, the
+    date as shown)``, which is what differs between the search results and the note under a passage."""
+    if valued is None:
+        return MSG_EDITION_DATE_UNKNOWN
+    shown = shown_date(valued.iso, valued.precision)
+    e, how = edition_in_force(group, valued)
+    if how == "found":
+        return on_found(e, shown)
+    return MSG_EDITION_NONE_YET if how == "none_yet" else MSG_EDITION_UNDETERMINED.format(date=shown)
 
 
 def applicability_lines(group, valuations: list, names: dict) -> list[str]:
     """What the property's valuation date says about which edition of ``group`` applies (KTD7), one line per date."""
     if len(group.editions) < 2:
         return []
-    out = []
-    for valued in valuations:
-        if valued is None:
-            out.append(MSG_EDITION_DATE_UNKNOWN)
-            continue
-        shown = shown_date(valued.iso, valued.precision)
-        e, how = edition_in_force(group, valued)
-        if how == "found":
-            out.append(MSG_EDITION_IN_FORCE.format(
-                date=shown, number=_txt(group.number), name=names[e.version_id], edition=_txt(e.edition or UNKNOWN),
-                since=_txt(e.effective_text or e.published_text or UNKNOWN)))
-        else:
-            out.append(MSG_EDITION_NONE_YET if how == "none_yet" else MSG_EDITION_UNDETERMINED.format(date=shown))
-    return out
+    return [_edition_line(group, valued, lambda e, shown: MSG_EDITION_IN_FORCE.format(
+        date=shown, number=_txt(group.number), name=names[e.version_id], edition=_txt(e.edition or UNKNOWN),
+        since=_txt(e.effective_text or e.published_text or UNKNOWN))) for valued in valuations]
 
 
-def _edition_note(ws: Workspace, conn: Connection, version_id, std: dict) -> list[str]:
+def _edition_note(ws: Workspace, conn: Connection, version_id, std: dict,
+                  valuations: Callable[[], list] | None = None) -> list[str]:
     """For a property or mixed question: whether the edition a passage is of is the one in force at the property's valuation
-    date, or that the date is unknown (KTD7). Nothing for a standard with a single edition, and for any other question."""
+    date, or that the date is unknown (KTD7). Nothing for a standard with a single edition, for any other question, and
+    while the turn holds no valuation date to apply (``valuations``: the caller's memo of ``property_valuations``, read
+    first so that no profile is loaded for nothing)."""
     if ws.intent not in ("property", MIXED) or not std.get("number"):
+        return []
+    valued_at = valuations() if valuations is not None else property_valuations(ws, conn)
+    if not valued_at:
         return []
     group = profile.group_of(profiles(ws, conn), std["number"])
     if len(group.editions) < 2:
         return []
-    out = []
-    for valued in property_valuations(ws, conn):
-        if valued is None:
-            out.append(MSG_EDITION_DATE_UNKNOWN)
-            continue
-        shown = shown_date(valued.iso, valued.precision)
-        e, how = edition_in_force(group, valued)
-        if how != "found":
-            out.append(MSG_EDITION_NONE_YET if how == "none_yet" else MSG_EDITION_UNDETERMINED.format(date=shown))
-        elif e.version_id == UUID(str(version_id)):
-            out.append(MSG_EDITION_THIS_IN_FORCE.format(date=shown))
-        else:
-            out.append(MSG_EDITION_THIS_NOT.format(date=shown, edition=_txt(e.edition or UNKNOWN)))
-    return out
+
+    def on_found(e, shown: str) -> str:
+        if e.version_id == UUID(str(version_id)):
+            return MSG_EDITION_THIS_IN_FORCE.format(date=shown)
+        return MSG_EDITION_THIS_NOT.format(date=shown, edition=_txt(e.edition or UNKNOWN))
+
+    return [_edition_line(group, valued, on_found) for valued in valued_at]
 
 
 STANDARD_KIND_WORDS = {source_kinds.STANDARD: "תקן שמאות", source_kinds.PROFESSIONAL: "מסמך מקצועי"}
@@ -3730,26 +3799,31 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
         if words and not metric_kinds:
             params["w"] = [f"%{w}%" for w in words]
             conds.append("(m.metric ILIKE ANY(:w) OR m.quote ILIKE ANY(:w) OR m.subject ILIKE ANY(:w))")
-        # the table a measurement is a row of is joined for the range its caption may state (KTD4; one row per table)
         where = (" FROM measurements m JOIN document_versions v ON v.id = m.version_id"
-                 " JOIN documents d ON d.id = m.document_id LEFT JOIN extracted_tables et ON et.version_id = m.version_id"
-                 " AND et.table_index = m.table_index WHERE " + " AND ".join(conds))
-        total = conn.execute(text("SELECT count(*)" + where), params).scalar_one()
-        page, pages = _paginate(page, total, MEASUREMENTS_MAX)
-        fields = "SELECT m.*, d.title, v.ingestion->>'reading_id' AS reading_id, et.structure->>'caption' AS caption"
+                 " JOIN documents d ON d.id = m.document_id WHERE " + " AND ".join(conds))
+        fields = "SELECT m.*, d.title, v.ingestion->>'reading_id' AS reading_id"
         if ws.time.mode == "none":
+            total = conn.execute(text("SELECT count(*)" + where), params).scalar_one()
+            page, pages = _paginate(page, total, MEASUREMENTS_MAX)
             # a total order (the id breaks ties), so no row falls between two pages
             rows = conn.execute(text(
                 fields + where + " ORDER BY d.title, d.id, m.block_index NULLS FIRST, m.row_index NULLS FIRST, m.id"
                 f" LIMIT {MEASUREMENTS_MAX} OFFSET :o"), params | {"o": (page - 1) * MEASUREMENTS_MAX}).all()
+            captions = _captions(conn, rows)
+            as_ofs = {r.id: measurement_date(ws, r, captions.get((r.version_id, r.table_index))) for r in rows}
         else:
             # the time mode orders the WHOLE filtered set — ids, quotes and stored dates are read, dated and sorted by the
             # KTD6 order, then by id — and only then is the page cut and its rows fetched by id: the page boundary follows
-            # the date order and no row is skipped (KTD7)
+            # the date order and no row is skipped (KTD7). The listing is the whole filtered set, so its length is the total,
+            # and the dates computed here are the page rows' dates (the table captions are read in one query)
             light = conn.execute(text(
-                "SELECT m.id, m.quote, m.effective_date, et.structure->>'caption' AS caption" + where), params).all()
-            keyed = sorted(((time_key(ws.time, _dated(a), bool(a and a.get("forecast"))), str(r.id), r.id)
-                            for r in light for a in [measurement_date(ws, r)]), key=lambda k: k[:2])
+                "SELECT m.id, m.version_id, m.table_index, m.quote, m.effective_date" + where), params).all()
+            total = len(light)
+            page, pages = _paginate(page, total, MEASUREMENTS_MAX)
+            captions = _captions(conn, light)
+            as_ofs = {r.id: measurement_date(ws, r, captions.get((r.version_id, r.table_index))) for r in light}
+            keyed = sorted(((time_key(ws.time, dated(as_ofs[r.id]), bool(as_ofs[r.id] and as_ofs[r.id].get("forecast"))),
+                             str(r.id), r.id) for r in light), key=lambda k: k[:2])
             wanted = [k[2] for k in keyed[(page - 1) * MEASUREMENTS_MAX:page * MEASUREMENTS_MAX]]
             fetched = {r.id: r for r in conn.execute(text(fields + where + " AND m.id = ANY(:ids)"),
                                                      params | {"ids": wanted})}
@@ -3770,7 +3844,7 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
     groups: dict[tuple, list] = {}
     for r in rows:
         m = ws.add_measurement(r)
-        m.as_of = measurement_date(ws, r)
+        m.as_of = as_ofs[r.id]
         m.listings.add(key)
         ws.touch(r.document_id, r.title, "read")
         groups.setdefault(_compat_key(r), []).append(m)

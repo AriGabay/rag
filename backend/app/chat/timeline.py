@@ -25,7 +25,8 @@ later than the anchor and not forecast, newest first, then the later or forecast
 the requested time first, then the nearest, then the unknown (the rows outside it are marked); ``none`` — chronological,
 oldest first, a forecast after the measured, the unknown last. A forecast is marked and never first. A row's marks:
 ``forecast``, ``conflict`` (another row of its group has the same date and a different amount, R10), ``outside_requested``
-(an explicit mode, a dated row outside the requested time) and ``unknown_date``. A value cited twice from one document
+(an explicit mode, a dated row outside the requested time), ``uncertain`` (the value's or measurement's reading cannot be
+presented as certain: ``tools.value_uncertain`` / ``measurement_uncertain``) and ``unknown_date``. A value cited twice from one document
 (same date and amount) is one row.
 
 **The property of a value** is read from the stored units of its version (the value's context number, else the file's
@@ -38,6 +39,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 from uuid import UUID
 
@@ -45,18 +47,27 @@ from app.answering.verify import numbers_in
 from app.chat import contexts
 from app.chat import property as chat_property
 from app.chat import units as unit_store
-from app.chat.dates import _later_than
+from app.chat.dates import is_after_anchor
 from app.chat.meaning import basis_key
-from app.chat.tools import KIND_LABELS, Workspace, _bounds, _dated, shown_date, time_key
+from app.chat.tools import (
+    KIND_LABELS,
+    Workspace,
+    bounds,
+    dated,
+    measurement_uncertain,
+    time_key,
+    value_uncertain,
+)
 from app.db import tenant_tx
 from app.measurements.extract import PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
+from app.platform.dates import shown_period
 
 logger = logging.getLogger(__name__)
 
 HEADING = "ציר זמן"
 DATE_KINDS = {"valuation": "מועד קובע", "transaction": "מועד עסקה", "stated": "מועד שצוין", "range": "תקופה"}
 MARKS = {"forecast": "תחזית", "conflict": "סתירה בין מקורות", "outside_requested": "מחוץ לזמן שביקשת",
-         "unknown_date": "מועד לא ידוע"}
+         "uncertain": "קריאה לא ודאית", "unknown_date": "מועד לא ידוע"}
 MSG_UNKNOWN_DATE = MARKS["unknown_date"]
 MSG_NO_LOCATION = "נתון כמותי שחולץ"
 
@@ -66,7 +77,6 @@ AREA_BASIS_UNITS = frozenset({"ILS_per_sqm", "sqm", "dunam"})
 # the families whose amount repeats over a period: a rent per month and a rent per year are different timelines
 PERIODIC_FAMILIES = frozenset({"rent", "management_fee", "income"})
 UNSPECIFIC_KINDS = frozenset({"", "unknown", "other"})
-PRECISION_ORDER = ("year", "month", "day")
 # the stances that are the appraisal's own data (round 11 U16, KTD9): what it adopts, and what it states with no attribution
 # (a header line, a table row — stance "unknown" or none). A claim, a proposal, an estimate and "other" are each their own class.
 OWN_STANCES = frozenset({"adopted", "unknown", ""})
@@ -104,6 +114,7 @@ class Datum:
     period: str = ""
     vat: str = ""
     basis: str = ""
+    uncertain: bool = False  # its reading cannot be presented as certain (review #3): shown, and marked as such
 
     @property
     def dated(self) -> bool:
@@ -117,12 +128,10 @@ class Datum:
         return date_key(self.as_of)
 
 
-def date_key(as_of: dict | None) -> tuple | None:
-    """The identity of a datum's known date — (ISO date, precision, end) — or None when it has none. Two values of a group
-    with the same known date and different amounts conflict; with different known dates they are a history (R10)."""
-    if not as_of or not as_of.get("date"):
-        return None
-    return as_of["date"], as_of.get("precision"), as_of.get("end")
+# The identity of a datum's known date — (ISO date, precision, end) — or None when it has none (``tools.dated``: every
+# ``as_of`` that holds a date holds its precision). Two values of a group with the same known date and different amounts
+# conflict; with different known dates they are a history (R10).
+date_key = dated
 
 
 # --- reading the turn's values -------------------------------------------------------------------------------------------
@@ -189,42 +198,47 @@ def datums(ws: Workspace) -> list[Datum]:
     """Every value and measurement the turn registered, as the timeline reads it (values first, in registration order)."""
     out: list[Datum] = []
     for i, v in ws.values.items():
-        prov = getattr(v, "provenance", None) or {}
-        number, subject = _context(getattr(v, "context", None))
-        amount = v.value * (getattr(v, "scale", 1) or 1) if v.value is not None else None
+        prov = v.provenance or {}
+        number, subject = _context(v.context)
+        amount = v.value * (v.scale or 1) if v.value is not None else None
+        fam = family(v.kind)
         out.append(Datum(
-            i, len(out), str(v.document_id), str(v.version_id), v.title, v.location, number, subject,
-            family(v.kind) if v.kind else "", v.unit,
-            _fields(family(v.kind) if v.kind else "", v.unit, v.period, v.vat, v.area_basis or "",
-                    getattr(v, "scenario", "") or "", getattr(v, "stance", "") or "", lambda f, p=prov: _stated(p, f)),
-            v.written, amount, getattr(v, "as_of", None), getattr(v, "role", "") or "", v.kind, v.period, v.vat,
-            v.area_basis or ""))
+            i, len(out), str(v.document_id), str(v.version_id), v.title, v.location, number, subject, fam, v.unit,
+            _fields(fam, v.unit, v.period, v.vat, v.area_basis or "", v.scenario or "", v.stance or "",
+                    lambda f, p=prov: _stated(p, f)),
+            v.written, amount, v.as_of, v.role or "", v.kind, v.period, v.vat, v.area_basis or "",
+            value_uncertain(ws, i)))
     for i, m in ws.measurements.items():
         r = m.row
-        number, subject = _context(getattr(m, "context", None))
+        number, subject = _context(m.context)
         kind = getattr(r, "metric_kind", "") or ""
+        fam = family(kind)
         amount = getattr(r, "value", None)
         if amount is None:
             nums = sorted(numbers_in(r.value_text or ""))
             amount = Decimal(nums[0].replace(",", "")) if len(nums) == 1 and nums[0].replace(",", "").replace(".", "", 1).isdigit() else None
         out.append(Datum(
             i, len(out), str(m.document_id), str(m.version_id), m.title, _measurement_location(r), number, subject,
-            family(kind) if kind else "", r.unit or "",
-            _fields(family(kind) if kind else "", r.unit or "", r.period or "", r.vat or "", r.area_basis or "",
+            fam, r.unit or "",
+            _fields(fam, r.unit or "", r.period or "", r.vat or "", r.area_basis or "",
                     getattr(r, "scenario", "") or "", getattr(r, "stance", "") or "",
                     lambda f, r=r: _record_states(r, f)),
-            r.value_text or "", Decimal(str(amount)) if amount is not None else None, getattr(m, "as_of", None),
-            getattr(r, "value_role", "") or "", kind, r.period or "", r.vat or "", r.area_basis or ""))
+            r.value_text or "", Decimal(str(amount)) if amount is not None else None, m.as_of,
+            getattr(r, "value_role", "") or "", kind, r.period or "", r.vat or "", r.area_basis or "",
+            measurement_uncertain(r)))
     return out
+
+
+# the key's fields -> the attribute of a stored measurement that holds each
+_RECORD_FIELDS = {"kind": "metric_kind", "unit": "unit", "period": "period", "vat": "vat", "area_basis": "area_basis",
+                  "stance": "stance", "scenario": "scenario"}
 
 
 def _record_states(row, field: str) -> bool:
     """A stored measurement's field is the source's: the extraction validated it against the quote. An unknown or empty field
     is not stated (the key reads it as unknown); the stance and the scenario count when the row holds them."""
-    value = {"kind": getattr(row, "metric_kind", ""), "unit": getattr(row, "unit", ""),
-             "period": getattr(row, "period", ""), "vat": getattr(row, "vat", ""),
-             "area_basis": getattr(row, "area_basis", ""), "stance": getattr(row, "stance", ""),
-             "scenario": getattr(row, "scenario", "")}.get(field)
+    attribute = _RECORD_FIELDS.get(field)
+    value = getattr(row, attribute, "") if attribute else None
     return bool(value) and value not in ("unknown", "none")
 
 
@@ -303,10 +317,9 @@ def _full_key(d: Datum, identity: Callable[[Datum], Identity], cache: dict) -> t
     stated — a key only it has (a document's own identity for the property, the datum itself for an unknown field)."""
     if d.fields is None:
         return ("unknown", d.ref)
-    if d.ref not in cache:
-        who = identity(d)
-        cache[d.ref] = who
-    who = cache[d.ref]
+    who = cache.get(d.ref)
+    if who is None:
+        who = cache[d.ref] = identity(d)
     prop = ("property", who.key) if who.key else ("own", d.document_id, d.unit_no if d.unit_no is not None else 0)
     return (prop, *d.fields)
 
@@ -315,6 +328,8 @@ def groups(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Id
            ) -> list[list[Datum]]:
     """The comparability groups that hold at least one of the ``cited`` ids (V#/M#), each filled from everything the turn
     registered, in registration order; the groups in the order of their first cited datum."""
+    if not cited:
+        return []
     identity = identity or identity_of(ws)
     everything = datums(ws)
     wanted = [d for d in everything if d.ref in cited]
@@ -338,13 +353,13 @@ def groups(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Id
 def _order(ws: Workspace, d: Datum) -> tuple:
     """The sort key of a datum under the turn's time mode: ``tools.time_key`` (KTD6), with the chronological order of mode
     ``none`` (oldest first; a forecast after the measured; the unknown last)."""
-    dated = _dated(d.as_of)
+    when = dated(d.as_of)
     if ws.time.mode == "none":
-        if dated is None:
+        if when is None:
             return (2, 0)
-        iso, precision, end = dated
-        return (1 if d.forecast else 0, _bounds(end or iso, precision)[0].toordinal())
-    return time_key(ws.time, dated, d.forecast)
+        iso, precision, end = when
+        return (1 if d.forecast else 0, bounds(end or iso, precision)[0].toordinal())
+    return time_key(ws.time, when, d.forecast)
 
 
 def _dedupe(members: list[Datum]) -> list[Datum]:
@@ -383,6 +398,8 @@ def _row(ws: Workspace, d: Datum, conflicts: set) -> dict:
         marks.append("conflict")
     if _outside(ws, d):
         marks.append("outside_requested")
+    if d.uncertain:
+        marks.append("uncertain")
     if not d.dated:
         marks.append("unknown_date")
     return {"date": d.as_of["date"] if d.dated else None, "precision": d.as_of.get("precision") if d.dated else None,
@@ -438,8 +455,7 @@ def shown(row: dict | None) -> str:
     when it has none."""
     if not row or not row.get("date"):
         return MSG_UNKNOWN_DATE
-    first = shown_date(row["date"], row["precision"])
-    return f"{first}–{shown_date(row['end'], row['precision'])}" if row.get("end") else first
+    return shown_period(row["date"], row["precision"], row.get("end"))
 
 
 def plain_text(blocks: list[dict]) -> str:
@@ -461,7 +477,7 @@ def plain_text(blocks: list[dict]) -> str:
 def payload(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None) -> dict:
     """``answer.time`` (the round-11 contract): the mode and switch the answer was produced with, the requested time, the
     timeline and its plain-text copy (None without a timeline)."""
-    blocks = build(ws, cited, identity)
+    blocks = build(ws, cited, identity) if cited else []
     requested = ws.time.requested
     return {"mode": ws.time.mode, "prefer_recent": ws.time.prefer_recent,
             "requested": requested.as_dict() if requested is not None else None, "timeline": blocks,
@@ -470,9 +486,19 @@ def payload(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], I
 
 # --- the later comparable value of a cited one ---------------------------------------------------------------------------------
 
+def _end(d: Datum) -> date:
+    """The last day of a dated datum's period (a range: of its end)."""
+    return bounds(d.as_of.get("end") or d.as_of["date"], d.as_of["precision"])[1]
+
+
+def _start(d: Datum) -> date:
+    """The first day of a dated datum's period."""
+    return bounds(d.as_of["date"], d.as_of["precision"])[0]
+
+
 def _measured_before_anchor(ws: Workspace, d: Datum) -> bool:
     a = d.as_of
-    return d.dated and not d.forecast and not _later_than(a.get("end") or a["date"], a["precision"], ws.time.anchor)
+    return d.dated and not d.forecast and not is_after_anchor(a.get("end") or a["date"], a["precision"], ws.time.anchor)
 
 
 def later_than(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None
@@ -481,16 +507,16 @@ def later_than(ws: Workspace, cited: Collection[str], identity: Callable[[Datum]
     the turn registered — one dated, measured (not a forecast, not later than the anchor) and starting after the cited
     period ends — the pair (the latest cited value, the latest registered one). A group where a cited value is the latest
     gives nothing."""
+    if not cited:
+        return []
     identity = identity or identity_of(ws)
     out = []
-    for members in groups(ws, {c for c in cited if c in ws.values or c in ws.measurements}, identity):
+    for members in groups(ws, cited, identity):  # groups holds only the datums (V#, M#) among the cited ids
         mine = [d for d in members if d.ref in cited and _measured_before_anchor(ws, d)]
         if not mine:
             continue
-        end = lambda d: _bounds(d.as_of.get("end") or d.as_of["date"], d.as_of["precision"])[1]  # noqa: E731
-        start = lambda d: _bounds(d.as_of["date"], d.as_of["precision"])[0]  # noqa: E731
-        newest = max(mine, key=lambda d: (end(d), -d.index))
-        later = [d for d in members if _measured_before_anchor(ws, d) and start(d) > end(newest)]
+        newest = max(mine, key=lambda d: (_end(d), -d.index))
+        later = [d for d in members if _measured_before_anchor(ws, d) and _start(d) > _end(newest)]
         if later:
-            out.append((newest, max(later, key=lambda d: (end(d), -d.index))))
+            out.append((newest, max(later, key=lambda d: (_end(d), -d.index))))
     return out
