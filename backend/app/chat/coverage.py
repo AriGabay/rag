@@ -233,7 +233,7 @@ def conflicting(ws: Workspace, document_ids: list[str] | None = None, ids: Colle
     from app.answering.verify import numbers_in
     from app.chat.contexts import enforced
     from app.chat.resolve import family
-    from app.chat.timeline import date_key
+    from app.chat.timeline import date_key, stance_class
 
     by_context = enforced()
     seen: dict[tuple, set] = {}
@@ -254,7 +254,7 @@ def conflicting(ws: Workspace, document_ids: list[str] | None = None, ids: Colle
             continue  # a datum of no named subject cannot be said to conflict with another
         prop = ("context", context) if by_context and context else _norm_label(subject)
         key = (family(kind), unit, period, _norm_label(basis or ""), prop, _norm_label(scenario),
-               stance or "unknown", dated)
+               stance_class(stance), dated)
         seen.setdefault(key, set()).add(amount)
     return any(len(amounts) > 1 for amounts in seen.values())
 

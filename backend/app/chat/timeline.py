@@ -14,8 +14,10 @@ payload and of a plain-text copy (``answer.time.text``); it is not added to ``an
   it. A value whose unit states none keeps its own identity (its document and unit) and matches no other;
 - the metric family (``resolve.family``), the unit, the periodicity, the area basis, the VAT basis, the scenario and the
   stance. A field counts only with source provenance (a measurement's record is source-stated): one that is not stated,
-  or that the model only asserted, **never equals another** — such a value forms a group of its own. A field that does
-  not apply to the metric is left out of the key instead: the area basis of a total amount, the periodicity of a
+  or that the model only asserted, **never equals another** — such a value forms a group of its own. The stance is the
+  exception (round 11 U16): "adopted", "unknown" and no stance are one class, the appraisal's own data (``stance_class``),
+  so a value registered as adopted and one read from a header line are one timeline; a claim, a proposal, an estimate and
+  "other" each stay a class of their own. A field that does not apply to the metric is left out of the key instead: the area basis of a total amount, the periodicity of a
   one-time value or of a datum that does not repeat, the VAT of a figure that is not money.
 
 **Rows** are ordered by the turn's time mode with the ordering of ``tools.time_key`` (KTD6): ``recent`` — dated values not
@@ -65,6 +67,9 @@ AREA_BASIS_UNITS = frozenset({"ILS_per_sqm", "sqm", "dunam"})
 PERIODIC_FAMILIES = frozenset({"rent", "management_fee", "income"})
 UNSPECIFIC_KINDS = frozenset({"", "unknown", "other"})
 PRECISION_ORDER = ("year", "month", "day")
+# the stances that are the appraisal's own data (round 11 U16, KTD9): what it adopts, and what it states with no attribution
+# (a header line, a table row — stance "unknown" or none). A claim, a proposal, an estimate and "other" are each their own class.
+OWN_STANCES = frozenset({"adopted", "unknown", ""})
 
 
 @dataclass(frozen=True)
@@ -130,6 +135,14 @@ def family(kind: str) -> str:
     return _family(kind) if kind else ""
 
 
+def stance_class(stance: str | None) -> str:
+    """The stance as the comparability key reads it (KTD9): "adopted", "unknown" and no stance are one class — the appraisal's
+    own data, so a value registered as adopted and one registered from a header line are one timeline — and any other
+    stance (claim, proposal, estimate, other) is its own class. ``coverage.conflicting`` reads the same class."""
+    stance = (stance or "").strip()
+    return "adopted" if stance in OWN_STANCES else stance
+
+
 def _stated(provenance: dict, field: str) -> bool:
     return provenance.get(field) == "source"
 
@@ -162,7 +175,7 @@ def _fields(family_: str, unit: str, period: str, vat: str, basis: str, scenario
     if scenario and not provenance("scenario"):
         return None
     out.append(("scenario", scenario))
-    out.append(("stance", stance if stance and stance != "unknown" and provenance("stance") else "unknown"))
+    out.append(("stance", stance_class(stance if provenance("stance") else None)))
     return tuple(out)
 
 

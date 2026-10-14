@@ -227,6 +227,56 @@ def test_a_different_scenario_or_stance_is_another_group():
     assert [len(g) for g in timeline.groups(o.ws, {a})] == [1]
 
 
+def test_adopted_and_unknown_stance_values_of_one_property_form_one_group_in_date_order():
+    """The appraisal's own data is one class (round 11 U16, KTD9): a value registered as adopted ("השווי נקבע") and the ones
+    registered from header lines, whose stance is unknown, are one timeline — the newest row is not lost."""
+    o = Office()
+    old = o.value(o.doc(), "1,950,000", as_of("2022-03-10"))
+    mid = o.value(o.doc(), "2,280,000", as_of("2024-06-15"))
+    new = o.value(o.doc(), "2,410,000", as_of("2025-01-20"))
+    for ref in (old, mid):
+        o.ws.values[ref].stance = "unknown"
+    o.ws.values[mid].provenance = SOURCE | {"stance": "not_stated"}
+    (g,) = o.blocks({new})
+    assert [r["sid"] for r in g["rows"]] == [new, mid, old] and dates_of(g)[0] == "2025-01-20"
+    assert [len(x) for x in timeline.groups(o.ws, {old})] == [3]
+
+
+def test_a_claim_stays_apart_from_the_appraisals_own_data_even_next_to_unknown_stance_values():
+    o = Office()
+    a = o.value(o.doc(), "2,000,000", as_of("2024-01-01"))
+    o.ws.values[a].stance = "unknown"
+    o.value(o.doc(), "2,100,000", as_of("2025-01-01"))
+    c = o.value(o.doc(), "2,200,000", as_of("2025-02-01"))
+    o.ws.values[c].stance = "claim"
+    c2 = o.value(o.doc(), "2,300,000", as_of("2025-03-01"))
+    o.ws.values[c2].stance = "claim"
+    assert sorted(len(g) for g in timeline.groups(o.ws, {a, c})) == [2, 2]
+    for other in ("proposal", "estimate", "other"):
+        p = o.value(o.doc(), "2,400,000", as_of("2025-04-01"))
+        o.ws.values[p].stance = other
+        assert sorted(len(g) for g in timeline.groups(o.ws, {a, c, p})) == [1, 2, 2], other
+        del o.ws.values[p]
+
+
+def test_a_measurement_without_a_stance_joins_an_adopted_value():
+    o = Office()
+    v = o.value(o.doc(), "6,600", as_of("2024-07-01"), kind="rent", period="month", vat="included")
+    m = o.measurement(o.doc(), "6,900", as_of("2025-07-01", provenance="source"), stance="")
+    (g,) = o.blocks({v})
+    assert [r["sid"] for r in g["rows"]] == [m, v]
+
+
+def test_the_conflict_check_reads_the_same_stance_class_as_the_timeline():
+    o = Office()
+    o.value(o.doc(), "2,410,000", as_of("2025-01-20"))
+    u = o.value(o.doc(), "2,300,000", as_of("2025-01-20"))
+    o.ws.values[u].stance = "unknown"
+    assert coverage.conflicting(o.ws) is True  # adopted and unknown are one datum: the same date, two amounts
+    o.ws.values[u].stance = "claim"
+    assert coverage.conflicting(o.ws) is False  # a claim is another datum
+
+
 def test_measurements_join_the_group_of_a_cited_value():
     o = Office()
     doc = o.doc()

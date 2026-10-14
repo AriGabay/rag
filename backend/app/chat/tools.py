@@ -1643,6 +1643,23 @@ def focus_unit_for(ws: Workspace, documents: list[str] | str | None) -> str | No
     return focus["handle"] if named <= {focus["document_id"], ws.doc_handle(focus["document_id"])} else None
 
 
+def names_focus_unit(ws: Workspace, unit: str | None, documents: list[str] | str | None = None) -> bool:
+    """Whether a call's ``unit`` is the conversation's own unit (round 11 U16, R4, R11, KTD6): the model sees the focus
+    unit's handle in the context and passes it, which is no choice of another unit — such a call gets the same property
+    widening as a call that names no unit (``_property_search``). A handle is the same handle for the same unit
+    (``unit_handle_of``), but the version, reading and unit number are compared too. A different unit, even of the same
+    property, is an explicit choice and stays as asked; so does a call that names another document (``focus_unit_for``)."""
+    focus = ws.unit_focus
+    if not focus or not unit or focus_unit_for(ws, documents) is None:
+        return False
+    unit = str(unit).strip()
+    if unit == focus["handle"]:
+        return True
+    a, b = ws.handles.get(unit), ws.handles.get(focus["handle"])
+    return bool(a and b and a["kind"] == b["kind"] == "U" and (a["version_id"], a["reading_id"], a["unit_no"])
+                == (b["version_id"], b["reading_id"], b["unit_no"]))
+
+
 MSG_UNIT_LOCATED = ("נמצאה יחידה אחת לשאלה: {unit} ({pages}). מעתה search, outline ו-read (עמודים) שאינם מציינים יחידה או "
                     "מסמך אחר מוגבלים ליחידה הזו (הכל בתוכה בלבד; ערך משומה אחרת בקובץ אינו של הנכס שנשאל); כדי לעבוד "
                     "ביחידה אחרת ציין אותה (unit=U#).")
@@ -1786,6 +1803,8 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
     if not unit:
         unit = focus_unit_for(ws, document_ids)  # the conversation's unit
         in_focus = unit is not None
+    elif ws.time.mode != "none" and names_focus_unit(ws, unit, document_ids):
+        in_focus = True  # the model names the focus unit it sees in the context: still the conversation's unit (U16)
     with tenant_tx(ws.ctx) as conn:
         if unit:
             # the conversation's unit in a turn with a time mode: its property's other appraisals are read too (U14)

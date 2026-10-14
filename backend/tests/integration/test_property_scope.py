@@ -132,15 +132,35 @@ def test_a_different_property_on_the_same_street_is_never_included_and_a_lone_un
         assert ids["hatzalon11"] not in order(run(focused(office, time, ids["hatzalon7_b"]), "search", query=QUERY, limit=6))
 
 
-def test_a_call_that_names_a_unit_or_another_document_is_left_as_it_is(office):
+def test_a_call_that_names_another_unit_or_another_document_is_left_as_it_is(office):
+    """Naming a different unit of the same property, or another document, is an explicit choice of that unit (U16)."""
     ids = office.ids
     ws = focused(office, RECENT, ids["hatzalon7_c"])
     out = run(ws, "search", query=QUERY, limit=6, document_ids=[ids["hatzalon7_a"]])
     assert set(order(out)) == {ids["hatzalon7_a"]} and T.MSG_PROPERTY_SEARCHED not in out
-    ver, reading = version_of(office, ids["hatzalon7_b"])
-    own = T.unit_handle_of(ws, ids["hatzalon7_b"], ver, reading, 1)
-    out = run(ws, "search", query=QUERY, limit=6, unit=own)
-    assert set(order(out)) == {ids["hatzalon7_b"]} and T.MSG_PROPERTY_SEARCHED not in out
+    for time in (RECENT, EXPLICIT_2022):  # a fresh workspace each: a source already returned in a turn is not repeated
+        ws = focused(office, time, ids["hatzalon7_c"])
+        ver, reading = version_of(office, ids["hatzalon7_b"])
+        other = T.unit_handle_of(ws, ids["hatzalon7_b"], ver, reading, 1)
+        assert other != ws.unit_focus["handle"]
+        out = run(ws, "search", query=QUERY, limit=6, unit=other)
+        assert set(order(out)) == {ids["hatzalon7_b"]} and T.MSG_PROPERTY_SEARCHED not in out, (time.mode, out[:300])
+
+
+def test_a_call_naming_the_focus_unit_itself_is_the_focus_widened_in_a_time_mode_and_unchanged_without_one(office):
+    """The model sees the focus unit's handle in the context and names it (round 11 U16): that call is the conversation's
+    unit, so it reads the property exactly as a call that names no unit does; mode none keeps the unit search."""
+    ids = office.ids
+    for time, first in ((EXPLICIT_2022, ids["hatzalon7_a"]), (RECENT, ids["hatzalon7_c"])):
+        ws = focused(office, time, ids["hatzalon7_c"])
+        named = run(ws, "search", query=QUERY, limit=6, unit=ws.unit_focus["handle"])
+        unnamed = run(focused(office, time, ids["hatzalon7_c"]), "search", query=QUERY, limit=6)
+        assert T.MSG_PROPERTY_SEARCHED in named and order(named)[0] == first, time.mode
+        assert order(named) == order(unnamed) and set(order(named)) == {ids[k] for k in KEYS[:4]}, time.mode
+        assert T.MSG_UNIT_FOCUS.format(unit=ws.unit_focus["handle"]) in named
+    ws = focused(office, NONE, ids["hatzalon7_c"])
+    out = run(ws, "search", query=QUERY, limit=6, unit=ws.unit_focus["handle"])
+    assert set(order(out)) == {ids["hatzalon7_c"]} and T.MSG_PROPERTY_SEARCHED not in out
 
 
 # --- units without a shared key; a file of several properties ---------------------------------------------------------
