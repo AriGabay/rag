@@ -9,9 +9,11 @@ payload and of a plain-text copy (``answer.time.text``); it is not added to ``an
 
 **The comparability key** (KTD9, R9) — the same key ``coverage.conflicting`` reads its date from, and ``recency_claim``:
 
-- the *property identity*: the normalized block/parcel (else street and house number) of the identifiers of the
-  appraisal unit the value is in (``property.property_key``), so appraisals of one property in different documents share
-  it. A value whose unit states none keeps its own identity (its document and unit) and matches no other;
+- the *property group* of the appraisal unit the value is in (round 12 U6, KTD5): the turn's property graph
+  (``property.PropertyGraph``), where appraisals are one property only through proving links (a shared parcel, or the same
+  street, number and city) and the conversation's focus property is the compatible closure from the focus unit. Appraisals
+  of one property in different documents share a group; two candidates (a city or a sub-parcel not stated) do not. A value
+  whose unit states no identity keeps its own identity (its document and unit) and matches no other;
 - the metric family (``resolve.family``), the unit, the periodicity, the area basis, the VAT basis, the scenario and the
   stance. A field counts only with source provenance (a measurement's record is source-stated): one that is not stated,
   or that the model only asserted, **never equals another** — such a value forms a group of its own. The stance is the
@@ -29,10 +31,10 @@ oldest first, a forecast after the measured, the unknown last. A forecast is mar
 presented as certain: ``tools.value_uncertain`` / ``measurement_uncertain``) and ``unknown_date``. A value cited twice from one document
 (same date and amount) is one row.
 
-**The property of a value** is read from the stored units of its version (the value's context number, else the file's
-only subject identity). That read goes through the caller's permissions (``tenant_tx``) and is made only for values
-whose other key fields could group them; ``set_identity`` replaces it (the tests of the pure parts). A read that fails
-leaves the value with its own identity: a timeline is an addition to an answer, never the reason to lose it."""
+**The property of a value** is its unit's group in the turn's property graph (the value's context number, else the file's
+only subject group). That read goes through the caller's permissions (``tenant_tx``) and is made once per turn;
+``set_identity`` replaces it (the tests of the pure parts). A read that fails leaves the value with its own identity: a
+timeline is an addition to an answer, never the reason to lose it."""
 
 from __future__ import annotations
 
@@ -41,12 +43,8 @@ from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
-from uuid import UUID
 
 from app.answering.verify import numbers_in
-from app.chat import contexts
-from app.chat import property as chat_property
-from app.chat import units as unit_store
 from app.chat.dates import is_after_anchor
 from app.chat.meaning import basis_key
 from app.chat.tools import (
@@ -55,6 +53,7 @@ from app.chat.tools import (
     bounds,
     dated,
     measurement_uncertain,
+    property_partition,
     time_key,
     value_uncertain,
 )
@@ -84,8 +83,8 @@ OWN_STANCES = frozenset({"adopted", "unknown", ""})
 
 @dataclass(frozen=True)
 class Identity:
-    """The property a registered value is of: ``key`` (``property.property_key``; None when its unit states none) and the
-    short Hebrew description a group is labelled with."""
+    """The property a registered value is of: ``key`` (the group id in the turn's property graph, ``property.Group.id``;
+    None when its unit is not in a group) and the short Hebrew description a group is labelled with."""
 
     key: str | None
     label: str = ""
@@ -249,47 +248,38 @@ def _measurement_location(row) -> str:
 
 # --- the property of a value ---------------------------------------------------------------------------------------------
 
-def property_label(key: str | None) -> str:
-    """A short description of a property key: its address or its block and parcel."""
-    if not key:
-        return ""
-    if key.startswith("addr:"):
-        return " · ".join(x for x in key[5:].split(";") if x)
-    if key.startswith("bp:"):
-        return " · ".join("גוש {} חלקה {}".format(*pair.split("/", 1)) for pair in key[3:].split(";") if "/" in pair)
-    return key
-
-
 class _UnitIdentity:
-    """The property of a datum from the stored units of its version (round 9 units; ``property.property_key``). The units of a
-    version are read once per turn, under the caller's permissions."""
+    """The property of a datum from the turn's property graph (round 12 U6, KTD5; ``tools.property_partition``): a group id
+    and a label. For the conversation's focus property the group is the inventory's gathered set; the other units form a
+    group only when connected by gathered links and pairwise compatible, so two candidates stay in separate groups and the
+    grouping depends on neither the seed nor the document order. The graph is read once per turn, under the caller's
+    permissions. A datum of a unit the graph does not hold (an appendix, a comparables part, a unit with no identity read, a
+    file of units in several groups) keeps its own identity."""
 
-    def __init__(self, ctx) -> None:
-        self.ctx = ctx
-        self.units: dict[str, tuple] = {}
+    def __init__(self, ws: Workspace) -> None:
+        self.ws = ws
+        self.partition = None  # the turn's partition; False: it could not be built
 
-    def _of(self, version_id: str) -> tuple:
-        if version_id not in self.units:
+    def _partition(self):
+        if self.partition is None:
             try:
-                with tenant_tx(self.ctx) as conn:
-                    found = unit_store.stored_many(conn, [version_id]).get(UUID(version_id))
-                    self.units[version_id] = found or unit_store.read_or_derive(conn, version_id)
-            except Exception:  # noqa: BLE001 - a timeline is an addition: without its units a value keeps its own identity
-                logger.warning("the units of %s could not be read for the timeline", version_id, exc_info=True)
-                self.units[version_id] = ()
-        return self.units[version_id]
+                with tenant_tx(self.ws.ctx) as conn:
+                    self.partition = property_partition(self.ws, conn)
+            except Exception:  # noqa: BLE001 - a timeline is an addition: without its graph a value keeps its own identity
+                logger.warning("the property graph could not be read for the timeline", exc_info=True)
+                self.partition = False
+        return self.partition
 
     def __call__(self, d: Datum) -> Identity:
-        units = self._of(d.version_id)
+        partition = self._partition()
+        if not partition:
+            return Identity(None)
         if d.unit_no is not None:
-            unit = next((u for u in units if u.unit_no == d.unit_no), None)
-            keys = [chat_property.property_key(unit.identifiers)] if (
-                unit is not None and unit.kind not in contexts.NON_SUBJECT_KINDS and d.subject_unit) else []
-        else:
-            keys = list({chat_property.property_key(u.identifiers) for u in units
-                         if u.kind not in contexts.NON_SUBJECT_KINDS} - {None})
-        key = keys[0] if len(keys) == 1 else None
-        return Identity(key, property_label(key))
+            group = partition.group_of_unit(d.version_id, d.unit_no) if d.subject_unit else None
+        else:  # a datum of the file as a whole: the file's subject units must all be one property
+            held = partition.groups_of_version(d.version_id)
+            group = held[0] if len(held) == 1 else None
+        return Identity(group.id, group.label) if group is not None else Identity(None)
 
 
 def _own(d: Datum) -> Identity:
@@ -307,7 +297,7 @@ def set_identity(ws: Workspace, fn: Callable[[Datum], Identity]) -> None:
 def identity_of(ws: Workspace) -> Callable[[Datum], Identity]:
     fn = ws.__dict__.get(_ATTR)
     if fn is None:
-        fn = _UnitIdentity(ws.ctx) if getattr(ws, "ctx", None) is not None else _own
+        fn = _UnitIdentity(ws) if getattr(ws, "ctx", None) is not None else _own
         ws.__dict__[_ATTR] = fn
     return fn
 
@@ -419,7 +409,7 @@ def _label(members: list[Datum], who: Identity) -> str:
     if first.basis and first.unit in AREA_BASIS_UNITS:
         parts.append(f"בסיס שטח: {first.basis}")
     what = " ".join(p for p in parts if p)
-    where = who.label or property_label(who.key) or first.title
+    where = who.label or first.title
     return f"{what} — {where}" if what and where else what or where
 
 

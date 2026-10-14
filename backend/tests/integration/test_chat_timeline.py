@@ -49,7 +49,7 @@ def no_models(monkeypatch):
 def appraisal(office, key: str, valuation: str, amount: str, address: str = ADDRESS) -> str:
     doc, _ = unit_file(office, office.default_group_id, f"שומה סינתטית {address} {key}", [{
         "title": f"שומה סינתטית {key}", "identifiers": [f"כתובת הנכס: {address}"],
-        "blocks": ["מסמך בדיקה סינתטי — נתונים בדויים", f"כתובת הנכס: {address}", f"המועד הקובע: {valuation}",
+        "blocks": ["מסמך בדיקה סינתטי — נתונים בדויים", "עיר: עיר-סינתטית", f"כתובת הנכס: {address}", f"המועד הקובע: {valuation}",
                    f"השווי נקבע בסך {amount} ₪ כולל מע״מ, לפי גישת ההשוואה."]}], sha=(key * 20)[:64].ljust(64, "0"))
     return doc
 

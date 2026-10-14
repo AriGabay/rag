@@ -45,7 +45,7 @@ def _ws(*values: tuple[str, str, str], same_property: bool = True, **fields) -> 
                        quote, stance="adopted")
         v.as_of = _as_of(iso, forecast=fields.get("forecast", {}).get(vid, False))
         ws.values[vid] = v
-    timeline.set_identity(ws, lambda d: timeline.Identity("addr:הצאלון 7" if same_property else f"addr:{d.document_id}"))
+    timeline.set_identity(ws, lambda d: timeline.Identity("group:הצאלון 7" if same_property else f"group:{d.document_id}"))
     return ws
 
 

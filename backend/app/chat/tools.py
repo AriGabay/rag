@@ -153,12 +153,11 @@ from sqlalchemy import Connection, text
 from app.answering.verify import numbers_in
 from app.chat import anchors, calc, contexts, meaning, reader
 from app.chat import dates as chat_dates
-from app.chat import units as unit_store
 from app.chat import unread as unread_text
 from app.chat.contexts import MSG_NO_TITLE
 from app.chat.evidence import TABLE_SIZE_PREFIX
 from app.chat.intent import MIXED, PROFESSIONAL
-from app.chat.property import current_appraisal_files, property_key, same_property_units, subject_units
+from app.chat.property import Gathered, Partition, PropertyGraph, build_graph
 from app.chat.timeframe import TimeMode
 from app.chat.timing import StageClock
 from app.config import get_settings
@@ -524,9 +523,9 @@ class Workspace:
     # the passages an identical search returned, kept for the turn (round 9 R16, KTD3, ``memoized_search``):
     # (query, scope, limit, the office's data version) -> hits
     search_memo: dict = field(default_factory=dict)
-    # the units sharing a property key, per (key, the office's data version) (round 11 U14); the property a call's named
-    # documents are of, per (the documents, the data version); a unit's property key, per (its version, unit number, the
-    # data version)
+    # the turn's property graph, per the office's data version (round 12 U6, KTD5: ``property_graph``, which also keeps the
+    # gathered sets and the partitions it computes); the property a call's named documents are of, per (the documents, the
+    # data version) (round 11 U16)
     property_memo: dict = field(default_factory=dict)
     # chunk id -> (first block, last block): what the ranking and the rendering of a search's hits read (``chunk_blocks``)
     chunk_memo: dict = field(default_factory=dict)
@@ -1775,14 +1774,49 @@ def _unit_search(ws: Workspace, conn: Connection, handle: str, query: str, limit
     return [], [], MSG_UNIT_SEARCHED.format(unit=unit, pages=_unit_pages(*cx.pages(number)), extended="", query=_txt(query))
 
 
-def _property_found(ws: Workspace, conn: Connection, key: str, version: int | None = None) -> list[tuple]:
-    """(document, version, unit number) of every subject unit of the property ``key``, once per turn and data version
-    (``version``: the data version, when the caller has just read it)."""
-    memo_key = (key, current_data_version(conn) if version is None else version)
-    found = ws.property_memo.get(memo_key)
-    if found is None:
-        found = ws.property_memo[memo_key] = same_property_units(conn, key)
-    return found
+def property_graph(ws: Workspace, conn: Connection) -> PropertyGraph:
+    """The turn's property graph (round 12 U6, KTD5): the relation of every visible, current subject unit to every other,
+    built once per turn and data version and kept in ``ws.property_memo``. Retrieval (``_property_found``), the timeline
+    (``property_partition``) and the coverage read this one snapshot. Identities are derived on first use and cached in
+    the turn's ``date_cache`` (``identity.identities``)."""
+    key = ("graph", current_data_version(conn))
+    graph = ws.property_memo.get(key)
+    if graph is None:
+        for old in [k for k in ws.property_memo if k[0] == "graph"]:
+            del ws.property_memo[old]  # a data version that moved on: the old graph is never read again
+        graph = ws.property_memo[key] = build_graph(conn, cache=ws.date_cache)
+    return graph
+
+
+def property_gathered(ws: Workspace, conn: Connection, version_id, unit_no: int) -> Gathered | None:
+    """The focus property of a unit: its compatible closure in the turn's graph, with the link reasons, the named
+    candidates and the undetermined units (``property.Gathered``). None when the unit is not in the graph (not a visible
+    subject unit of a current appraisal)."""
+    graph = property_graph(ws, conn)
+    node = graph.find(version_id, unit_no)
+    return graph.gather(node.key) if node is not None else None
+
+
+def property_partition(ws: Workspace, conn: Connection) -> Partition:
+    """Every unit of the turn's graph in one group (round 12 U6, KTD5): the conversation's focus property as one group,
+    and the other units grouped without a seed (``property.PropertyGraph.partition``). The focus is the conversation's unit
+    (``ws.unit_focus``) while its handle's reading is still the current one; without one, no unit is the focus."""
+    graph = property_graph(ws, conn)
+    focus = None
+    handle = (ws.unit_focus or {}).get("handle")
+    data = ws.handles.get(handle) if handle else None
+    if data and data.get("kind") == "U":
+        head = reader.version(conn, UUID(data["version_id"]))
+        node = graph.find(data["version_id"], data["unit_no"]) if head is not None and head.reading_id == data["reading_id"] else None
+        focus = graph.gather(node.key) if node is not None else None
+    return graph.partition(focus)
+
+
+def _property_found(ws: Workspace, conn: Connection, version_id, unit_no: int) -> list[tuple]:
+    """(document, version, unit number) of every unit of the focus unit's property — its gathered set (``property_gathered``),
+    in document and unit order. Empty when the unit is not in the graph."""
+    gathered = property_gathered(ws, conn, version_id, unit_no)
+    return [(n.document_id, n.version_id, n.unit_no) for n in gathered.members] if gathered is not None else []
 
 
 def _property_hits(ws: Workspace, conn: Connection, found: list[tuple], query: str,
@@ -1810,34 +1844,28 @@ def _property_hits(ws: Workspace, conn: Connection, found: list[tuple], query: s
 
 def _property_search(ws: Workspace, conn: Connection, handle: str, query: str,
                      limit: int) -> tuple[list[dict], list[str], str | None] | None:
-    """The time search of the conversation's property (round 11 U14, R4, R11, R12, KTD6, KTD9): when the turn has a time
-    mode and the focus unit's property is appraised by other units too (``property.same_property_units``: one key from
-    the stored identifiers), the search reads all of them instead of the focus unit alone — a question about 2022 asked
-    in a conversation on the 2025 appraisal must read the 2022 one (``_property_hits``). None: the unit has no key, or
-    is the only one with it — the unit search stands.
+    """The time search of the conversation's property (round 11 U14, R4, R11, R12, KTD6, KTD9; round 12 U6, KTD4, KTD5): when
+    the turn has a time mode and the focus unit's property is appraised by other units too (its gathered set in the turn's
+    property graph: linked by a shared parcel, or by the same street, number and city, each link with its reason), the
+    search reads all of them instead of the focus unit alone — a question about 2022 asked in a conversation on the 2025
+    appraisal must read the 2022 one (``_property_hits``). None: the unit is gathered with no other unit (it states no
+    identity, or nothing proves another appraisal is its property) — the unit search stands.
     Returns (hits, notes for the model, the answer when nothing was found), as ``_unit_search`` does."""
     v, cx, number = _unit_of(conn, ws, handle)
-    version = current_data_version(conn)
-    unit_key = ("unit", str(v.version_id), number, version)  # the focus unit's key, read once per turn and data version
-    if unit_key not in ws.property_memo:
-        mine = next((u for u in unit_store.ensure(conn, v.version_id) if u.unit_no == number), None)
-        ws.property_memo[unit_key] = property_key(mine.identifiers) if mine is not None else None
-    key = ws.property_memo[unit_key]
-    if key is None:
-        return None
-    found = _property_found(ws, conn, key, version)
-    if len(found) < 2 or (v.document_id, v.version_id, number) not in found:
+    found = _property_found(ws, conn, v.version_id, number)
+    if len(found) < 2 or (str(v.document_id), str(v.version_id), number) not in {(str(d), str(x), n) for d, x, n in found}:
         return None
     return _property_hits(ws, conn, found, query, limit)
 
 
 def _named_property(ws: Workspace, conn: Connection, docs: list[UUID]) -> list[tuple] | None:
-    """The units of the one property the documents of a call name (round 11 U16, R4, R11): the model passes
-    ``document_ids`` (one appraisal of the property, from the answer before) where it passes no unit, so a time question
-    must widen from the documents too. Every named document must be a current appraisal whose subject units all state a
-    property key and share ONE key (a single-unit file, or the subject units of a file of several that are one property);
-    two keys, a document or a unit with no key, or a document that is not an appraisal leaves the call as asked. None, too,
-    when the property is appraised by no other unit. Returns ``same_property_units`` of that key."""
+    """The units of the one property the documents of a call name (round 11 U16, R4, R11; round 12 U6, KTD5): the model
+    passes ``document_ids`` (one appraisal of the property, from the answer before) where it passes no unit, so a time
+    question must widen from the documents too. Every named document must be a visible, current appraisal whose subject
+    units all state an identity and fall in ONE gathered set (a single-unit file, or the subject units of a file of several
+    that are one property); a document or a unit with no identity, a document that is not an appraisal, or units of two
+    properties (a compendium of two) leave the call as asked. None, too, when the property is appraised by no other unit.
+    Returns the units of that gathered set."""
     if not docs:
         return None
     version = current_data_version(conn)
@@ -1848,15 +1876,20 @@ def _named_property(ws: Workspace, conn: Connection, docs: list[UUID]) -> list[t
 
 
 def _named_property_units(ws: Workspace, conn: Connection, docs: list[UUID], version: int) -> list[tuple] | None:
-    """``_named_property`` without its memo."""
-    files = current_appraisal_files(conn, docs)
-    if {f.document_id for f in files} != set(docs):
+    """``_named_property`` without its memo: the first of the named units, in key order, whose gathered set holds all of
+    them (the closure depends on its seed, so every named unit is tried; the order makes the answer deterministic)."""
+    graph = property_graph(ws, conn)
+    wanted = {str(d) for d in docs}
+    named = [n for n in graph.nodes if str(n.document_id) in wanted]
+    if {str(n.document_id) for n in named} != wanted or not all(n.identity.identified for n in named):
         return None
-    keys = {property_key(u.identifiers) for _, u in subject_units(conn, files)}
-    if len(keys) != 1 or None in keys:
-        return None
-    found = _property_found(ws, conn, next(iter(keys)), version)
-    return found if len(found) >= 2 else None
+    keys = {n.key for n in named}
+    for seed in named:
+        gathered = graph.gather(seed.key)
+        if keys <= gathered.keys:
+            found = [(n.document_id, n.version_id, n.unit_no) for n in gathered.members]
+            return found if len(found) >= 2 else None
+    return None
 
 
 def _clip_to_unit(conn: Connection, version_id, cx, kind: str, bs, be, body: str,

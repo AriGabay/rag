@@ -14,6 +14,8 @@ from types import SimpleNamespace
 import pytest
 
 from app.chat import calc, coverage, timeline
+from app.chat import property as P
+from app.chat.identity import UnitIdentity
 from app.chat.timeframe import Requested, TimeMode
 from app.chat.tools import Measurement, Workspace
 
@@ -42,7 +44,7 @@ class Office:
         self.property: dict[str, str | None] = {}
         timeline.set_identity(self.ws, lambda d: timeline.Identity(self.property.get(d.document_id), d.title))
 
-    def doc(self, address: str | None = "addr:הצאלון 7", title: str = "שומה סינתטית") -> uuid.UUID:
+    def doc(self, address: str | None = "group:הצאלון 7", title: str = "שומה סינתטית") -> uuid.UUID:
         d = uuid.uuid4()
         self.property[str(d)] = address
         self.titles = getattr(self, "titles", {}) | {d: title}
@@ -118,7 +120,7 @@ def test_the_answer_cites_only_the_newest_while_the_older_were_registered_all_th
 def test_a_group_nobody_cited_has_no_block():
     o = Office()
     three(o)
-    stray = o.value(o.doc("addr:האלון 3"), "1,000,000", as_of("2023-01-01"))  # another property
+    stray = o.value(o.doc("group:האלון 3"), "1,000,000", as_of("2023-01-01"))  # another property
     assert o.blocks({stray}) == []
 
 
@@ -167,8 +169,8 @@ def test_ae4_a_monthly_rent_with_vat_and_a_yearly_rent_without_it_are_two_timeli
 
 def test_the_same_address_with_another_unit_or_floor_is_another_group():
     o = Office()
-    a = o.value(o.doc("addr:הצאלון 7"), "2,000,000", as_of("2024-01-01"))
-    o.value(o.doc("addr:הצאלון 7 קומה 2"), "2,100,000", as_of("2025-01-01"))
+    a = o.value(o.doc("group:הצאלון 7"), "2,000,000", as_of("2024-01-01"))
+    o.value(o.doc("group:הצאלון 7 קומה 2"), "2,100,000", as_of("2025-01-01"))
     assert [len(g) for g in timeline.groups(o.ws, {a})] == [1]
 
 
@@ -482,7 +484,7 @@ def test_a_later_forecast_or_undated_or_not_comparable_value_is_no_later_value()
     a = o.value(o.doc(), "2,000,000", as_of("2024-01-01"))
     o.value(o.doc(), "3,000,000", as_of("2027-01-01", provenance="source", forecast=True))
     o.value(o.doc(), "2,500,000", None)
-    o.value(o.doc("addr:האלון 3"), "2,600,000", as_of("2025-06-01"))
+    o.value(o.doc("group:האלון 3"), "2,600,000", as_of("2025-06-01"))
     o.value(o.doc(), "2,700,000", as_of("2025-06-01"), vat="excluded")
     assert timeline.later_than(o.ws, [a]) == []
 
@@ -494,3 +496,33 @@ def test_a_month_is_later_than_the_year_before_it_but_not_than_a_year_that_holds
     assert timeline.later_than(o.ws, [a]) == []
     b = o.value(o.doc(), "2,200,000", as_of("2025-02", "month", provenance="source"))
     assert [later.ref for _, later in timeline.later_than(o.ws, [a])] == [b]
+
+
+def test_u6_values_of_gathered_units_share_one_group_and_values_of_candidates_never_do():
+    """The property of a datum is its unit's group in the turn's graph (round 12 U6, KTD5): two units of one street, number
+    and city gather and form one block; two units of that street and number that state no city are candidates of the
+    focus, not of one another, so each stays a group of its own and there is no block."""
+    o = Office()
+    d1, d2, d3, d4 = (o.doc(None) for _ in range(4))
+    ref = {k: o.value(d, "2,000,000", as_of(when)) for k, d, when in (
+        ("a", d1, "2023-01-01"), ("b", d2, "2025-01-01"), ("c", d3, "2024-01-01"), ("e", d4, "2022-01-01"))}
+    ids = {k: o.ws.values[v] for k, v in ref.items()}
+
+    def unit(k: str, city: str | None) -> P.Node:
+        who = UnitIdentity(1, addresses=frozenset({("צאלון", "7")}), cities=frozenset({city} if city else ()))
+        return P.Node(ids[k].document_id, ids[k].version_id, 1, who, k)
+
+    nodes = {"a": unit("a", "עיר סינתטית"), "b": unit("b", "עיר סינתטית"), "c": unit("c", None), "e": unit("e", None)}
+    graph = P.PropertyGraph(nodes.values())
+    focus = graph.gather(nodes["a"].key)
+    assert [m.title for m in focus.members] == sorted(["a", "b"], key=lambda k: nodes[k].key)
+    assert {c.node.title for c in focus.candidates} == {"c", "e"}
+    who = timeline._UnitIdentity(o.ws)
+    who.partition = graph.partition(focus)
+    timeline.set_identity(o.ws, who)
+    blocks = o.blocks(set(ref.values()))
+    assert [[r["sid"] for r in b["rows"]] for b in blocks] == [[ref["b"], ref["a"]]], "the gathered units only, newest first"
+    assert "צאלון 7" in blocks[0]["label"]
+    assert o.ws.values[ref["c"]].document_id != o.ws.values[ref["e"]].document_id
+    keys = {k: who(timeline.datums(o.ws)[i]).key for i, k in enumerate(ref)}
+    assert keys["a"] == keys["b"] and len({keys["a"], keys["c"], keys["e"]}) == 3
