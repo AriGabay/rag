@@ -222,6 +222,14 @@ def resolve(question: str, time_preference: dict | None) -> TimeMode:
 
 # --- the model-facing block ---------------------------------------------------------------------------------------------
 
+# the one phrase the answer uses for a datum when not every appraisal of the property was checked (round 12 U8, R12, KTD8;
+# session-settled): the latest datum in the sources checked, never the latest in the repository
+LATEST_CHECKED = "הנתון המאוחר ביותר במקורות שנבדקו"
+PHRASE_RULE = (
+    f"כשתוצאת החיפוש מציינת שכיסוי השומות חלקי, או שהנכס לא זוהה, אל תכתוב על נתון שהוא «העדכני ביותר» או «האחרון»: "
+    f"כתוב «{LATEST_CHECKED}» וציין מה לא נבדק. גם כשהכיסוי מלא, אל תכתוב שזה הנתון האחרון במאגר — רק של השומות "
+    f"שנבדקו. השרת מוסיף לתשובה הערת כיסוי משלו, ואינו תלוי בניסוח שלך.")
+
 _GENERAL_RULES = (
     "- אל תשמיט נתון ישן שרלוונטי: העדפת הזמן קובעת סדר, לא סינון.\n"
     "- תאריך שהמקורות אינם נותנים נשאר \"מועד לא ידוע\" ומוצג אחרי הנתונים המתוארכים; אל תנחש אותו, ואל תתארך נתון "
@@ -230,7 +238,8 @@ _GENERAL_RULES = (
     "- נתונים של נכסים שונים, או של מדד, יחידה, תקופתיות, בסיס שטח או מע\"מ שונים, אינם היסטוריה אחת: הצג אותם "
     "כקבוצות נפרדות (למשל שכירות לחודש מול שכירות לשנה, כולל מע\"מ מול לא כולל), כל קבוצה מהחדש לישן.\n"
     "- רשום ב-take_value כל נתון מתוארך שאתה מציג, גם את הקודמים, וצטט אותו (V#): השרת בונה מהערכים הרשומים ציר זמן "
-    "מאומת עם המועד והמקור של כל אחד, ונתון שצוטט רק כקטע (S#) אינו נכנס אליו.")
+    "מאומת עם המועד והמקור של כל אחד, ונתון שצוטט רק כקטע (S#) אינו נכנס אליו.\n"
+    f"- {PHRASE_RULE}")
 
 BLOCK_RECENT = (
     "הנחיית זמן (המשתמש ביקש להעדיף נתונים עדכניים):\n"
@@ -267,3 +276,92 @@ def block(time: TimeMode) -> str | None:
             lines.append(f"- תאריך העוגן של התקופה היחסית: {time.anchor.isoformat()}.")
         return _EXPLICIT_HEAD + "\n".join(lines) + "\n" + _EXPLICIT_RULES
     return None
+
+
+# --- the coverage note (round 12 U8, R12, R13, KTD7, KTD8) ----------------------------------------------------------------
+#
+# The server words the coverage record (``tools.coverage_record``; persisted as ``answer.time.coverage``) itself, from the
+# record alone: the same note is in the payload and the copy text whether or not the answer has timeline rows, and the model
+# never decides it. A message without a record reads as "not recorded": no note, never "complete". Statuses and blocking
+# reasons are the record's own strings (``tools.HIT``, ``B_NOT_IDENTIFIED``, ...: this module cannot import ``tools``).
+
+MSG_NOTE_RECENT = f"{LATEST_CHECKED}."
+MSG_NOTE_EXPLICIT = "הנתונים לתקופה שביקשת נמצאו רק במקורות שנבדקו."
+MSG_NOTE_NOT_IDENTIFIED = "הנכס לא זוהה; נבדקה רק השומה שבמוקד."
+MSG_NOTE_COMPLETE = "נבדקו כל השומות של הנכס הזמינות לך ({n})."  # relative to the appraisals visible to the user
+MSG_GROUP_CAP = "לא נבדקו (מגבלת מספר השומות בחיפוש)"
+MSG_GROUP_NO_MATCH = "נבדקו ללא התאמה לחיפוש"
+MSG_GROUP_UNDATED = "ללא מועד קובע ברור"
+MSG_GROUP_CANDIDATES = "שומות שלא קושרו לנכס (אין הוכחה שהן שלו)"
+MSG_GROUP_UNDETERMINED = "שומות שלא ניתן לקבוע אם הן של הנכס"
+MSG_GROUP_WINDOW = "נבדקו רק השומות שעלו בחיפוש, בלי רשימה של כל שומות הנכס."
+MSG_GROUP_SEVERAL = "הנתונים הם מכמה חיפושים או נכסים, ולכן הכיסוי אינו אחיד."
+MSG_UNTITLED = "שומה ללא כותרת"
+MSG_MORE = "ועוד {n}"
+NAMED_PER_GROUP = 3  # units a reason group names; the rest are counted
+_SUMMARY_HEAD = "כיסוי השומות בחיפוש הזה (השרת מוסיף אותו לתשובה):\n"
+
+
+def _date_of(item: dict) -> str:
+    return item.get("date") or ""
+
+
+def _named(item: dict, dated: bool = True) -> str:
+    """A unit as the note names it: its title, and its valuation date (as the reader sees it) unless it has none."""
+    title = (item.get("title") or "").strip() or MSG_UNTITLED
+    if not dated or not item.get("date"):
+        return title
+    return f"{title} ({dates.shown_period(item['date'], item.get('precision') or 'day', None)})"
+
+
+def _group(label: str, items: list[dict], total: int | None = None, *, dated: bool = True) -> str | None:
+    """One reason line: the label, then at most ``NAMED_PER_GROUP`` units newest first (the dated before the undated, ties in
+    the record's order), then "ועוד N" for the rest of ``total`` (the record's own count of a group it only names in part)."""
+    if not items:
+        return None
+    ordered = sorted(items, key=_date_of, reverse=True)  # stable: undated ("") last, equal dates keep the record's order
+    shown = ordered[:NAMED_PER_GROUP]
+    rest = max((total if total is not None else len(items)) - len(shown), 0)
+    names = "; ".join(_named(i, dated) for i in shown)
+    return f"{label}: {names}" + (f" {MSG_MORE.format(n=rest)}" if rest else "") + "."
+
+
+def coverage_note(record: dict | None) -> str | None:
+    """The visible coverage note of a record (KTD8's state table), or None for a message with no record (an old message,
+    or a turn with no time mode: nothing is claimed). Complete: the count of the appraisals checked, relative to those the
+    user can see. Not identified: the property was not identified, only the focus appraisal was searched. Partial: the
+    mode's sentence, then one line per reason group — the units that keep the datum from being called the latest (not
+    searched for the cap or searched without a match, only those that block), the undated ones, the unlinked candidates and
+    the count of undetermined units. At most three units per group, newest first, then "ועוד N"."""
+    if not record or record.get("mode") not in ("recent", "explicit"):
+        return None
+    units = record.get("units") or []
+    blocking = record.get("blocking") or []
+    if record.get("complete"):
+        return MSG_NOTE_COMPLETE.format(n=len(units))
+    if "not_identified" in blocking:
+        return MSG_NOTE_NOT_IDENTIFIED
+    lines = [MSG_NOTE_EXPLICIT if record["mode"] == "explicit" else MSG_NOTE_RECENT]
+    dated = [u for u in units if not u.get("undated")]
+    candidates = record.get("candidates") or {}
+    undetermined = int(record.get("undetermined") or 0)
+    lines += [ln for ln in (
+        _group(MSG_GROUP_CAP, [u for u in dated if u["status"] == "not_searched_cap" and u.get("blocks")]),
+        _group(MSG_GROUP_NO_MATCH, [u for u in dated if u["status"] == "no_match" and u.get("blocks")]),
+        _group(MSG_GROUP_UNDATED, [u for u in units if u.get("undated")], dated=False),
+        _group(MSG_GROUP_CANDIDATES, list(candidates.get("named") or []), int(candidates.get("count") or 0)),
+        f"{MSG_GROUP_UNDETERMINED}: {undetermined}." if undetermined else None,
+        MSG_GROUP_WINDOW if "window" in blocking else None,
+        MSG_GROUP_SEVERAL if "several_scopes" in blocking else None) if ln]
+    return "\n".join(lines)
+
+
+def coverage_summary(record: dict | None) -> str | None:
+    """What the model reads after a time-ranked search (KTD8): the note the answer will carry, and — when the coverage is
+    partial or the property not identified — the rule for the phrase. None without a record."""
+    note = coverage_note(record)
+    if note is None:
+        return None
+    if record.get("complete"):
+        return _SUMMARY_HEAD + note
+    return f"{_SUMMARY_HEAD}{note}\n{PHRASE_RULE}"

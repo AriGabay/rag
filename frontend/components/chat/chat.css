@@ -1679,3 +1679,18 @@ button.cut-marker:focus-visible {
     display: none;
   }
 }
+
+/* --- the coverage note of a time answer (round 12 U8) ---------------------------------------------------------- */
+
+.coverage-note {
+  margin-top: 10px;
+  padding: 6px 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--chat-muted);
+  background: var(--chat-code);
+  border: 1px solid var(--chat-border);
+  border-radius: 8px;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}

@@ -156,3 +156,63 @@ def test_the_corrected_claim_passes_verification_clean():
                  location="סעיף 3", kind="context", text="השווי נקבע בסך 2,410,000 ₪")
     report = verify_answer(_supporting_judge(), _answer("השווי העדכני הוא 2,410,000 ₪ [V3]."), ws, "?", [])
     assert report.ok and report.problems == [] and report.correctness() == "verified"
+
+
+# --- under partial coverage "the latest" needs the qualified phrase (round 12 U8, R12, KTD8) -------------------------------
+
+from app.chat.tools import NO_MATCH, TimeCall  # noqa: E402
+from tests.unit.test_coverage_note import RECENT as RECENT_MODE  # noqa: E402
+from tests.unit.test_coverage_note import record, unit  # noqa: E402
+
+
+def _covered(ws: Workspace, complete: bool, sids: tuple[str, ...] = ("S1",)) -> Workspace:
+    """``ws`` after a time-ranked search call that produced ``sids`` and recorded complete or partial coverage."""
+    units = [unit(1, "2025-01-20"), unit(2, "2024-06-15")] if complete else [unit(1, "2025-01-20", NO_MATCH), unit(2, "2024-06-15")]
+    rec = record(RECENT_MODE, units)
+    assert rec["complete"] is complete
+    ws.time_calls.append(TimeCall("שווי הנכס", rec, list(sids)))
+    return ws
+
+
+def test_partial_coverage_and_a_latest_claim_is_a_repairable_partial_problem_that_never_removes():
+    ws = _covered(_ws(*V), complete=False)
+    (p,) = _check("הנתון העדכני ביותר הוא 2,410,000 ₪ [V3].", ws)  # V3 is the latest registered: the round-11 rule passes it
+    assert p.check == "recency_claim" and p.severity == "partial" and p.kind == "claim"
+    assert p.repairable and not p.removes_unit and not p.fails_claim
+    assert "הנתון המאוחר ביותר במקורות שנבדקו" in p.reason, "the repair names the phrase to write"
+    assert p.checked_ids == ["V3"] and p.failure_kind in verify.FAILURE_KINDS
+
+
+def test_the_same_claim_under_complete_coverage_is_no_problem():
+    assert _check("הנתון העדכני ביותר הוא 2,410,000 ₪ [V3].", _covered(_ws(*V), complete=True)) == []
+
+
+def test_a_claim_that_already_says_it_is_the_latest_in_the_sources_checked_is_not_flagged():
+    ws = _covered(_ws(*V), complete=False)
+    assert _check("הנתון העדכני ביותר במקורות שנבדקו הוא 2,410,000 ₪ [V3].", ws) == []
+    assert _check("הנתון המאוחר ביותר במקורות שנבדקו הוא 2,410,000 ₪ [V3].", ws) == []
+
+
+def test_a_turn_with_no_coverage_record_keeps_the_round_11_rule():
+    assert _check("הנתון העדכני ביותר הוא 2,410,000 ₪ [V3].", _ws(*V)) == []  # off mode: no record, no new check
+
+
+def test_a_value_the_search_did_not_produce_is_not_held_to_the_coverage():
+    ws = _covered(_ws(*V), complete=False, sids=("S9",))  # the call produced S9; V3 was verified in S1
+    assert _check("הנתון העדכני ביותר הוא 2,410,000 ₪ [V3].", ws) == []
+
+
+def test_a_passage_only_latest_claim_is_held_to_the_coverage_of_the_passage():
+    ws = _covered(_ws(*V), complete=False)
+    ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="שומה 2025", section="סיכום", location="סעיף 3",
+                  kind="context", text="השווי נקבע בסך 2,410,000 ₪")
+    sid = next(iter(ws.sources))
+    ws.time_calls[0].sids = [sid]
+    assert len(_check(f"הערך העדכני ביותר הוא 2,410,000 ₪ [{sid}].", ws)) == 1
+    other = _covered(_ws(*V), complete=False, sids=("S9",))
+    assert _check(f"הערך העדכני ביותר הוא 2,410,000 ₪ [{sid}].", other) == []
+
+
+def test_the_round_11_later_value_message_still_wins_when_a_later_value_exists_under_partial_coverage():
+    (p,) = _check("השווי העדכני הוא 2,100,000 ₪ [V1].", _covered(_ws(*V), complete=False))
+    assert "20/01/2025" in p.reason and "V3" in p.reason

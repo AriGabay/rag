@@ -3105,6 +3105,10 @@ _TIME_NOUNS = frozenset({"שנה", "שנים", "שנתיים", "חודש", "חו
 MSG_NOT_LATEST = ("הטענה קוראת ל-{older} «העדכני», אבל בתור הזה נרשם ערך מאוחר יותר מאותו נתון של אותו נכס: {newer} "
                   "(מועד {when}, {title}). הצג את {newer} כערך העדכני ואת {older} כערך קודם, עם תאריכיהם ומראי המקום "
                   "של שניהם (אל תמחק ערך שנתמך), או השמט את הניסוח «העדכני» / «האחרון»")
+# under partial coverage (round 12 U8, KTD8): the qualified wording a "latest" claim may carry, and the repair's reason
+QUALIFIED = "במקורות שנבדקו"
+MSG_LATEST_UNQUALIFIED = ("הטענה קוראת לנתון «העדכני» / «האחרון», אבל לא נבדקו כל השומות של הנכס ({gap}). כתוב "
+                          "«{phrase}» וציין מה לא נבדק (אל תמחק ערך שנתמך), או השמט את הניסוח «העדכני» / «האחרון»")
 
 
 def _calls_latest(text: str) -> bool:
@@ -3123,18 +3127,29 @@ def _recency_claim(u: Unit, ws: Workspace) -> Problem | None:
     (``timeline.later_than``: the same property, metric family, unit, periodicity, area basis, VAT, scenario and stance; dated,
     measured, not a forecast). The server cannot tell which value the unit means, so a unit that cites the group's latest
     beside an older one passes. It is a repairable partial problem, never a removal: the number the unit states is supported;
-    only "the latest" is false. Whatever the mode of the turn (a false "latest" is wrong with the switch off too)."""
-    cited = [i for i in u.ids if i in ws.values or i in ws.measurements]
-    if not cited or not _calls_latest(u.text):
+    only "the latest" is false. Whatever the mode of the turn (a false "latest" is wrong with the switch off too).
+
+    Round 12 U8 (R12, KTD8): a unit that calls data "the latest" when the time-ranked search that produced it did not check
+    every appraisal of the property (partial coverage, or the property not identified) is the same kind of problem, unless it
+    already says so (``MSG_LATEST_UNQUALIFIED``; the qualified phrase is "הנתון המאוחר ביותר במקורות שנבדקו"). The later
+    value of a comparable group stays the more specific reason."""
+    if not _calls_latest(u.text):
         return None
     from app.chat import timeline
 
-    found = timeline.later_than(ws, cited)
-    if not found:
+    cited = [i for i in u.ids if i in ws.values or i in ws.measurements]
+    found = timeline.later_than(ws, cited) if cited else []
+    if found:
+        older, newer = found[0]
+        reason = MSG_NOT_LATEST.format(older=older.ref, newer=newer.ref, when=timeline.shown(newer.as_of), title=newer.title)
+        return Problem(u, reason, severity="partial", defect="recency", failure_kind="contradicts_source", check=RECENCY_CHECK)
+    if not u.ids or QUALIFIED in u.text or (record := timeline.partial_coverage(ws, u.ids)) is None:
         return None
-    older, newer = found[0]
-    reason = MSG_NOT_LATEST.format(older=older.ref, newer=newer.ref, when=timeline.shown(newer.as_of), title=newer.title)
-    return Problem(u, reason, severity="partial", defect="recency", failure_kind="contradicts_source", check=RECENCY_CHECK)
+    from app.chat import timeframe
+
+    gap = " ".join((timeframe.coverage_note(record) or "").splitlines()[1:]) or timeframe.MSG_NOTE_NOT_IDENTIFIED
+    return Problem(u, MSG_LATEST_UNQUALIFIED.format(phrase=timeframe.LATEST_CHECKED, gap=gap), severity="partial",
+                   defect="recency", failure_kind="contradicts_source", check=RECENCY_CHECK)
 
 
 def _holds_more(u: Unit, numbers: list[str]) -> bool:

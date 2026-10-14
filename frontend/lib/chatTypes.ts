@@ -663,14 +663,56 @@ export interface ChatTimelineGroup {
   rows: ChatTimelineRow[];
 }
 
+/** One appraisal unit of a property's inventory in the coverage record (round 12 U7, U8). */
+export interface ChatCoverageUnit {
+  document_id: string;
+  version_id: string;
+  unit_no: number;
+  title: string | null;
+  /** ISO date at `precision`; null when the unit states no (single) valuation date. */
+  date: string | null;
+  precision: "day" | "month" | "year" | null;
+  date_status: string;
+  undated: boolean;
+  /** `hit`: searched with a match; `no_match`: searched without one; `not_searched_cap`: not searched (the cap). */
+  status: "hit" | "no_match" | "not_searched_cap";
+  link: string | null;
+  focus: boolean;
+  /** Whether this unit keeps the coverage from being complete. */
+  blocks: boolean;
+}
+
+/** What a time answer checked (round 12 U7, U8; R12): the appraisals searched, searched without a match, not searched,
+ * undated, and unlinked candidates, with the server-written `note` the screen shows. Absent on an answer from before
+ * round 12 and on a turn with no time mode: "not recorded", never "complete". */
+export interface ChatTimeCoverage {
+  v: number;
+  mode: "recent" | "explicit";
+  requested: ChatAnswerTime["requested"];
+  scope: "property" | "unit" | "window";
+  via: string | null;
+  identified: boolean;
+  property: { label: string; reasons: string[]; units: number } | null;
+  units: ChatCoverageUnit[];
+  candidates: { named: Record<string, unknown>[]; count: number };
+  undetermined: number;
+  complete: boolean;
+  blocking: string[];
+  /** The visible note, lines separated by newlines; rendered as its own element, not part of `markdown`. */
+  note?: string | null;
+}
+
 /** The time the answer was produced under, and its timeline (round 11 U9); absent on older answers. */
 export interface ChatAnswerTime {
   mode: "none" | "recent" | "explicit";
   prefer_recent: boolean;
   requested: { kind: string; start: string | null; end: string | null; precision: string | null; text: string } | null;
   timeline: ChatTimelineGroup[];
-  /** A plain-text copy of the whole timeline; not in `markdown`, so it is not shown twice. The copy button appends it. */
+  /** A plain-text copy of the whole timeline, ending with the coverage note when there is one; not in `markdown`, so it
+   * is not shown twice. The copy button appends it. */
   text?: string | null;
+  /** The coverage record with its note (round 12 U8); absent on older answers and with no time mode. */
+  coverage?: ChatTimeCoverage | null;
 }
 
 /** The switch state a message was produced with (round 11 KTD1); null on a message from before round 11. */

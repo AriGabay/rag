@@ -866,7 +866,9 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
     # the timeline (round 11 U9, KTD8): every comparable group holding a value the answer rests on, filled from all the
     # values the turn registered. Its rows open their sources like a citation does, so the uncited ones join the records
     # (and the documents) the payload carries
-    answer_time = timeline.payload(ws, used)  # the ids that are no V# or M# match no value
+    # round 12 U8 (R12, KTD7): the coverage of the time-ranked calls whose results the answer cites (a V# or M# is read
+    # through the passages behind it), else of the turn's calls together; no record in off mode, so no ``coverage`` key
+    answer_time = timeline.payload(ws, used, coverage=timeline.coverage_of(ws, used))  # ids that are no V# or M# match no value
     used |= timeline.row_ids(answer_time["timeline"])
     measurements = [ws.measurements[i].public() for i in ws.measurements if i in used]
     computations = [ws.computations[i].public() for i in ws.computations if i in used]

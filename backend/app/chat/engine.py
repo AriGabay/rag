@@ -939,7 +939,12 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                 compute_steps += 1
             for call in step.calls:
                 started_step, arguments = _announce(progress, call)
+                timed = len(ws.time_calls)
                 output = T.run_tool(ws, call.name, call.arguments)
+                if len(ws.time_calls) > timed and (summary := timeframe.coverage_summary(ws.time_coverage)):
+                    # a time-ranked search says what it checked, after its results (round 12 U8, KTD8): the time block
+                    # is written before any search, so only the result can carry the coverage and the phrase rule
+                    output = f"{output}\n\n{summary}"
                 if started_step is not None:  # what the call found, said once it is done (R17)
                     progress(started_step, done_label(call.name, arguments, output), True)
                 turn.record(call.name, call.arguments, output)

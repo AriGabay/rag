@@ -50,10 +50,12 @@ from decimal import Decimal
 from app.answering.verify import numbers_in
 from app.chat.dates import is_after_anchor
 from app.chat.meaning import basis_key
+from app.chat.timeframe import coverage_note
 from app.chat.tools import (
     KIND_LABELS,
     Workspace,
     bounds,
+    coverage_for,
     dated,
     measurement_uncertain,
     property_partition,
@@ -480,14 +482,57 @@ def plain_text(blocks: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def payload(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None) -> dict:
+def sids_behind(ws: Workspace, ids: Iterable[str]) -> set[str]:
+    """The passages (S#) behind cited ids (round 12 U8, KTD7): a cited S# itself; for a V# the passage it was verified in; for
+    a V# or M# every passage of the turn read from the same document version (a measurement names no passage)."""
+    sids: set[str] = set()
+    versions = set()
+    for i in ids:
+        if i in ws.sources:
+            sids.add(i)
+        elif i in ws.values:
+            sids.add(ws.values[i].source_id)
+            versions.add(str(ws.values[i].version_id))
+        elif i in ws.measurements:
+            versions.add(str(ws.measurements[i].version_id))
+    return sids | {s.sid for s in ws.sources.values() if s.version_id is not None and str(s.version_id) in versions}
+
+
+def coverage_of(ws: Workspace, ids: Iterable[str]) -> dict | None:
+    """The coverage record of the data the ids cite (KTD7): that of the time-ranked calls whose results they come from, else
+    of the turn's calls together; None when the turn made no time-ranked call (off mode, R14)."""
+    return coverage_for(ws, sids_behind(ws, ids))
+
+
+def partial_coverage(ws: Workspace, ids: Iterable[str]) -> dict | None:
+    """The record of a time-ranked call that produced the data ``ids`` cite, when that record is not complete (a partial
+    coverage or a property not identified); None for ids no time-ranked call produced, and for a complete record. The
+    claim check reads it: a "latest" claim about data of a call that did not check every appraisal needs the qualified
+    phrase (``verify._recency_claim``)."""
+    behind = sids_behind(ws, ids)
+    if not any(behind & set(c.sids) for c in ws.time_calls):
+        return None
+    record = coverage_for(ws, behind)
+    return None if record is None or record.get("complete") else record
+
+
+def payload(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None,
+            coverage: dict | None = None) -> dict:
     """``answer.time`` (the round-11 contract): the mode and switch the answer was produced with, the requested time, the
-    timeline and its plain-text copy (None without a timeline)."""
+    timeline and its plain-text copy (None without a timeline). Round 12 U8 (R12, KTD8): ``coverage`` — the coverage record
+    of the data the answer cites (``coverage_of``) — joins it as ``coverage`` with the server-written ``note``, and the copy
+    text ends with the note whether or not the timeline has rows. Without a record (off mode, R14) there is no ``coverage``
+    key, and an old message without one reads as "not recorded"."""
     blocks = build(ws, cited, identity) if cited else []
     requested = ws.time.requested
-    return {"mode": ws.time.mode, "prefer_recent": ws.time.prefer_recent,
-            "requested": requested.as_dict() if requested is not None else None, "timeline": blocks,
-            "text": plain_text(blocks) or None}
+    out = {"mode": ws.time.mode, "prefer_recent": ws.time.prefer_recent,
+           "requested": requested.as_dict() if requested is not None else None, "timeline": blocks,
+           "text": plain_text(blocks) or None}
+    if coverage is not None:
+        note = coverage_note(coverage)
+        out["coverage"] = coverage | {"note": note}
+        out["text"] = "\n\n".join(x for x in (out["text"], note) if x) or None
+    return out
 
 
 # --- the later comparable value of a cited one ---------------------------------------------------------------------------------

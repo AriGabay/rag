@@ -192,7 +192,9 @@ def test_an_explicit_year_puts_that_year_first_and_marks_the_later_ones_as_outsi
 
 def test_one_cited_value_of_a_single_document_gives_no_timeline(client, setup, monkeypatch):
     m = ask(client, setup, monkeypatch, agent(setup, ["y2025"], cited("V1")))
-    assert m["answer"]["time"]["timeline"] == [] and m["answer"]["time"]["text"] is None
+    t = m["answer"]["time"]
+    # no timeline text; the copy text is the coverage note alone (round 12 U8)
+    assert t["timeline"] == [] and t["text"] == t["coverage"]["note"]
 
 
 # --- the recency claim ----------------------------------------------------------------------------------------------------
@@ -231,3 +233,99 @@ def test_a_false_latest_claim_that_stays_is_kept_marked_and_the_timeline_still_t
     a = m["answer"]
     assert "1,950,000" in a["markdown"] and a["verification"]["removed"] == 0  # supported content is never removed for it
     assert [r["sid"] for r in rows(m)] == ["V1", "V2", "V3"]  # the block asserts the order whatever the prose said
+
+
+# --- the coverage note (round 12 U8: R12, R13, R14; KTD7, KTD8; AE4) ---------------------------------------------------------
+
+QUALIFIED = "הנתון המאוחר ביותר במקורות שנבדקו"
+UNDATED_TITLE = "שומה סינתטית ללא מועד קובע"
+
+
+@pytest.fixture
+def partial(setup):
+    """The three dated appraisals and a fourth of the same property that states no valuation date: coverage of the property
+    can never be complete while an undated unit remains (KTD7)."""
+    doc, _ = unit_file(setup, setup.default_group_id, UNDATED_TITLE, [{
+        "title": UNDATED_TITLE, "identifiers": [f"כתובת הנכס: {ADDRESS}"],
+        "blocks": ["מסמך בדיקה סינתטי — נתונים בדויים", "עיר: עיר-סינתטית", f"כתובת הנכס: {ADDRESS}",
+                   "השווי נקבע בסך 2,000,000 ₪ כולל מע״מ, לפי גישת ההשוואה."]}], sha="undated".ljust(64, "0"))
+    setup.docs = setup.docs | {"undated": doc}
+    return setup
+
+
+def qualified(vid: str) -> dict:
+    return final(f"{QUALIFIED} הוא 2,410,000 ₪ כולל מע״מ [{vid}].", focus=_focus_of(),
+                 claims=[{"text": f"{QUALIFIED} הוא 2,410,000 ₪ כולל מע״מ", "source_ids": [vid], "basis": "explicit"}])
+
+
+def test_complete_coverage_records_a_note_that_never_claims_the_latest_in_the_repository(client, setup, monkeypatch):
+    a = ask(client, setup, monkeypatch, agent(setup, ["y2025", "y2024", "y2022"], cited("V1")))["answer"]
+    cov = a["time"]["coverage"]
+    assert cov["v"] == 1 and cov["complete"] is True and cov["blocking"] == []
+    assert [u["status"] for u in cov["units"]] == ["hit", "hit", "hit"] and not any(u["undated"] for u in cov["units"])
+    assert cov["note"] == "נבדקו כל השומות של הנכס הזמינות לך (3)." and "במאגר" not in cov["note"]
+    assert a["time"]["text"].endswith(cov["note"]), "the copy text ends with the note, after the timeline"
+
+
+def test_ae4_an_undated_unit_makes_the_coverage_partial_and_the_note_names_it_in_the_payload_and_the_copy(client, partial, monkeypatch):
+    a = ask(client, partial, monkeypatch, agent(partial, ["y2025", "y2024", "y2022"], qualified("V1")))["answer"]
+    cov = a["time"]["coverage"]
+    assert cov["v"] == 1 and cov["complete"] is False and "undated" in cov["blocking"]
+    assert cov["note"].splitlines()[0] == QUALIFIED + "."
+    assert UNDATED_TITLE in cov["note"]
+    assert any(u["undated"] and u["blocks"] for u in cov["units"])
+    assert a["time"]["timeline"] and a["time"]["text"].endswith(cov["note"])
+    assert a["markdown"] == f"{QUALIFIED} הוא 2,410,000 ₪ כולל מע״מ [V1]."  # the note is not in the model's text
+
+
+def test_a_passage_only_answer_under_partial_coverage_still_carries_the_note(client, partial, monkeypatch):
+    def passage_answer(items):
+        sid = sids_by_document(items)[partial.docs["y2025"]]
+        return final(f"{QUALIFIED} הוא 2,410,000 ₪ כולל מע״מ [{sid}].", focus=_focus_of(),
+                     claims=[{"text": f"{QUALIFIED} הוא 2,410,000 ₪ כולל מע״מ", "source_ids": [sid], "basis": "explicit"}])
+
+    docs = list(partial.docs.values())
+    steps = ScriptedAgent([[call("search", query="השווי נקבע בסך כולל מע״מ לפי גישת ההשוואה", document_ids=docs, limit=None)],
+                           passage_answer], intent="property")
+    a = ask(client, partial, monkeypatch, steps)["answer"]
+    t = a["time"]
+    assert t["timeline"] == [], "an answer that cites a passage only has no timeline rows"
+    assert t["coverage"]["complete"] is False and UNDATED_TITLE in t["coverage"]["note"]
+    assert t["text"] == t["coverage"]["note"], "the copy text is the note even with no timeline"
+
+
+def test_a_false_latest_claim_under_partial_coverage_is_repaired_to_the_qualified_phrase_not_removed(client, partial, monkeypatch):
+    steps = agent(partial, ["y2025", "y2024", "y2022"], cited("V1"))  # "השווי העדכני" with no qualification
+    steps.steps.append(qualified("V1"))  # the repair round's answer
+    m = ask(client, partial, monkeypatch, steps)
+    a = m["answer"]
+    assert QUALIFIED in a["markdown"] and a["verification"]["removed"] == 0
+    assert "recency_claim" in json.dumps(m_diagnostics(client, m), ensure_ascii=False)
+
+
+def test_the_same_latest_claim_under_complete_coverage_is_no_problem(client, setup, monkeypatch):
+    m = ask(client, setup, monkeypatch, agent(setup, ["y2025", "y2024", "y2022"], cited("V1")))
+    assert "recency_claim" not in json.dumps(m_diagnostics(client, m), ensure_ascii=False)
+
+
+def test_with_the_switch_off_and_no_requested_time_there_is_no_coverage_key(client, setup, monkeypatch):
+    a = ask(client, setup, monkeypatch, agent(setup, ["y2025", "y2024", "y2022"], cited("V1", "השווי")), prefer_recent=False)["answer"]
+    assert "coverage" not in a["time"], "R14: no inventory, no record, no wording"
+    assert "במקורות שנבדקו" not in (a["time"]["text"] or "")
+
+
+def test_the_model_reads_the_coverage_and_the_phrase_rule_after_a_partial_time_search(client, partial, monkeypatch):
+    steps = agent(partial, ["y2025", "y2024", "y2022"], qualified("V1"))
+    ask(client, partial, monkeypatch, steps)
+    outputs = [i["output"] for i in steps.seen[-1] if isinstance(i, dict) and i.get("type") == "function_call_output"]
+    search = outputs[0]
+    assert UNDATED_TITLE in search and QUALIFIED in search, "the search result carries the coverage summary and the rule"
+    assert search.index("<source") < search.index(UNDATED_TITLE), "after the results, never before them"
+    assert all(UNDATED_TITLE not in o for o in outputs[1:]), "only a time-ranked search says it"
+
+
+def test_the_model_reads_no_coverage_in_off_mode(client, setup, monkeypatch):
+    steps = agent(setup, ["y2025", "y2024", "y2022"], cited("V1", "השווי"))
+    ask(client, setup, monkeypatch, steps, prefer_recent=False)
+    outputs = [i["output"] for i in steps.seen[-1] if isinstance(i, dict) and i.get("type") == "function_call_output"]
+    assert not any("כיסוי השומות" in o for o in outputs)

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { B } from "@/components/ui";
 import type {
   ChatAnswer,
+  ChatAnswerTime,
   ChatAssumption,
   ChatComponent,
   ChatComputation,
@@ -14,6 +15,7 @@ import type {
   ChatRemoval,
   ChatRequirement,
   ChatSource,
+  ChatTimeCoverage,
   ChatTimelineGroup,
   ChatTimelineMark,
   ChatTimelineRow,
@@ -235,9 +237,8 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
 
   const copy = async () => {
     try {
-      const timelineText = answer.time?.text;
       const plain = plainAnswer(answer.markdown);
-      await navigator.clipboard.writeText(timelineText ? `${plain}\n\n${timelineText}` : plain);
+      await navigator.clipboard.writeText([plain, ...copiedExtras(answer.time)].join("\n\n"));
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
     } catch {
@@ -258,6 +259,7 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
       </div>
       <AnswerQuality answer={answer} />
       <Timeline groups={answer.time?.timeline} onCite={cite} />
+      <CoverageNote coverage={answer.time?.coverage} />
       <div className="msg-actions">
         <button type="button" className="icon-btn" onClick={copy} aria-label="העתקת התשובה" title="העתקה">
           {copied ? "✓" : "⧉"}
@@ -333,6 +335,28 @@ function timelineDate(row: ChatTimelineRow): string {
  * not already carry it, as the plain-text copy does. */
 function timelineValue(row: ChatTimelineRow): string {
   return row.unit && !row.value_text.includes(row.unit) ? `${row.value_text} ${row.unit}` : row.value_text;
+}
+
+/** What the copy button adds after the answer's text: the server's plain-text copy of the timeline (which ends with the
+ * coverage note), and the note itself when a payload carries the note without it (round 12 U8). */
+function copiedExtras(time: ChatAnswerTime | null | undefined): string[] {
+  const text = time?.text || "";
+  const note = time?.coverage?.note || "";
+  return [text, note && !text.includes(note) ? note : ""].filter(Boolean);
+}
+
+/** The server-written coverage note (round 12 U8, R12): what the answer's time data checked and did not. Its own element
+ * after the answer body and the timeline slot, whether or not the timeline has rows. Plain text, not interactive (no tab
+ * stop); nothing when the answer has no coverage record (an older message or a turn with no time mode), and never a
+ * "complete" label of its own: the words are the server's. */
+function CoverageNote({ coverage }: { coverage: ChatTimeCoverage | null | undefined }) {
+  const note = coverage?.note;
+  if (!note) return null;
+  return (
+    <div className="coverage-note" role="note" data-testid="coverage-note" aria-label="כיסוי החיפוש" dir="rtl">
+      {note}
+    </div>
+  );
 }
 
 /** The server-built timeline of comparable dated values (round 11 U9, U10): groups and rows in the payload's order,
