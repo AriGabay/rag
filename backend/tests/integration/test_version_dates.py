@@ -82,7 +82,7 @@ def test_ae2_an_adopted_prose_value_takes_the_units_valuation_date(office):
     with tenant_tx(office.system) as conn:
         uv = D.unit_valuation(conn, ver, 3)
     assert (uv.status, uv.date.iso, uv.unit_no) == ("stated", "2024-04-15", 1)
-    got = D.resolve_as_of("שווי הנכס 2,450,000 ₪", stance="adopted", stance_provenance="source", unit_valuation=uv,
+    got = D.resolve_as_of("שווי הנכס 2,450,000 ₪", stance="adopted", unit_valuation=uv,
                           anchor=ANCHOR)
     assert (got["date"], got["provenance"], got["locator"]) == ("2024-04-15", "unit_valuation", "block 1")
 
@@ -91,8 +91,17 @@ def test_an_adopted_conclusion_in_a_summary_table_cell_of_the_same_unit_takes_it
     _, ver = single(office, [HEADER, "המועד הקובע: 15/04/2024", "|שווי הנכס | 2,450,000 ₪"])
     with tenant_tx(office.system) as conn:
         uv = D.unit_valuation(conn, ver, 2)
-    got = D.resolve_as_of("שווי הנכס | 2,450,000 ₪", stance="adopted", stance_provenance="source", unit_valuation=uv,
+    got = D.resolve_as_of("שווי הנכס | 2,450,000 ₪", stance="adopted", unit_valuation=uv,
                           anchor=ANCHOR)
+    assert (got["date"], got["provenance"]) == ("2024-04-15", "unit_valuation")
+
+
+def test_a_header_line_value_with_an_unknown_stance_takes_the_units_valuation_date(office):
+    """Round 11 U15 A: "שווי הנכס: 2,410,000 ₪" under the unit's header is registered with the stance unknown."""
+    _, ver = single(office, [HEADER, "המועד הקובע: 15/04/2024", "שווי הנכס: 2,410,000 ₪"])
+    with tenant_tx(office.system) as conn:
+        uv = D.unit_valuation(conn, ver, 2)
+    got = D.resolve_as_of("שווי הנכס: 2,410,000 ₪", stance="unknown", role="other", unit_valuation=uv, anchor=ANCHOR)
     assert (got["date"], got["provenance"]) == ("2024-04-15", "unit_valuation")
 
 
@@ -100,7 +109,7 @@ def test_a_party_claim_with_no_date_stays_unknown_even_in_a_unit_with_a_valuatio
     _, ver = single(office, [HEADER, "המועד הקובע: 15/04/2024", "לטענת המשיבה שווי הנכס 2,000,000 ₪"])
     with tenant_tx(office.system) as conn:
         uv = D.unit_valuation(conn, ver, 2)
-    assert D.resolve_as_of("לטענת המשיבה שווי הנכס 2,000,000 ₪", stance="claim", stance_provenance="source",
+    assert D.resolve_as_of("לטענת המשיבה שווי הנכס 2,000,000 ₪", stance="claim",
                            unit_valuation=uv, anchor=ANCHOR) is None
 
 
@@ -131,7 +140,7 @@ def test_two_differing_valuation_dates_in_one_unit_are_a_stored_conflict_and_unk
     with tenant_tx(office.system) as conn:
         uv = D.unit_valuation(conn, ver, 2)
     assert (uv.status, uv.date) == ("conflict", None) and {d.iso for d in uv.dates} == {"2024-04-15", "2024-06-01"}
-    assert D.resolve_as_of("שווי 2,450,000 ₪", stance="adopted", stance_provenance="source", unit_valuation=uv,
+    assert D.resolve_as_of("שווי 2,450,000 ₪", stance="adopted", unit_valuation=uv,
                            anchor=ANCHOR) is None
 
 

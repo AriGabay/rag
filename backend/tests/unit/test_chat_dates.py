@@ -170,7 +170,7 @@ def test_the_rows_own_date_wins_over_the_caption_range():
 
 def test_two_different_dates_in_a_sentence_are_ambiguous_and_never_fall_through():
     assert resolve("בין 03/2022 ל-05/2023 ו-12/2024 נמכרו שלוש דירות", table_caption="עסקאות 2021–2022",
-                   stance="adopted", stance_provenance="source", unit_valuation=UV) is None
+                   stance="adopted", unit_valuation=UV) is None
     assert resolve("ב-15/04/2022 וב-20/05/2023: 1,900,000 ₪", unit_valuation=UV) is None
 
 
@@ -179,36 +179,71 @@ def test_one_range_in_the_sentence_is_one_date_with_an_end():
     assert (got["date"], got["end"], got["precision"], got["provenance"]) == ("2021", "2022", "year", "source")
 
 
-def test_an_adopted_source_backed_conclusion_with_no_date_takes_the_units_valuation_date():
-    got = resolve("שווי הנכס 2,450,000 ₪", stance="adopted", stance_provenance="source", unit_valuation=UV)
+def test_an_adopted_conclusion_with_no_date_takes_the_units_valuation_date():
+    got = resolve("שווי הנכס 2,450,000 ₪", stance="adopted", unit_valuation=UV)
     assert got == {"date": "2024-04-15", "precision": "day", "end": None, "provenance": "unit_valuation",
                    "forecast": False, "locator": "block 2"}
 
 
-@pytest.mark.parametrize("stance, provenance", [
-    ("claim", "source"), ("estimate", "source"), ("proposal", "source"), ("unknown", "source"),
-    ("adopted", "model_asserted"), ("adopted", "not_stated"), ("adopted", None), (None, None),
+def test_a_header_line_value_whose_stance_is_unknown_is_dated_by_its_unit():
+    """Round 11 U15 A: the value of a header line ("שווי הנכס: 2,410,000 ₪") is registered with the stance unknown
+    (the source does not say who stated it); the unit's valuation date still dates it."""
+    for stance in ("unknown", None, "other"):
+        got = resolve("שווי הנכס: 2,410,000 ₪", stance=stance, role="other", unit_valuation=UV)
+        assert (got["date"], got["provenance"]) == ("2024-04-15", "unit_valuation"), stance
+
+
+@pytest.mark.parametrize("stance", ["claim", "proposal", "estimate"])
+def test_a_partys_claim_proposal_or_estimate_stays_unknown_whatever_its_provenance(stance):
+    assert resolve("שווי הנכס 2,450,000 ₪", stance=stance, unit_valuation=UV) is None
+
+
+def test_a_value_attributed_to_another_party_stays_unknown_but_the_appraiser_is_not_another_party():
+    kw = dict(stance="unknown", unit_valuation=UV, stated_by_provenance="source")
+    for who in ("המשיבה", "שמאי המשיבה", "העוררת", "היזם"):
+        assert resolve("שווי הנכס 2,450,000 ₪", stated_by=who, **kw) is None, who
+    for who in ("השמאי", "שמאי", "השמאי המכריע", ""):
+        assert resolve("שווי הנכס 2,450,000 ₪", stated_by=who, **kw)["provenance"] == "unit_valuation", who
+    # a speaker the model asserted and the source does not attest is not an attribution to another party
+    assert resolve("שווי הנכס 2,450,000 ₪", stance="unknown", stated_by="המשיבה", stated_by_provenance="model_asserted",
+                   unit_valuation=UV)["provenance"] == "unit_valuation"
+
+
+@pytest.mark.parametrize("role", ["comparison", "comparable", "transaction"])
+def test_a_value_whose_role_marks_a_comparable_or_a_transaction_stays_unknown(role):
+    assert resolve("נמכרה דירה סמוכה ב-1,900,000 ₪", stance="unknown", role=role, unit_valuation=UV) is None
+
+
+def test_a_row_of_a_comparables_table_without_a_date_of_its_own_stays_unknown():
+    assert resolve("רחוב הברוש 5 | | 2,000,000", stance="unknown", role="other", comparables=True,
+                   unit_valuation=UV) is None
+    # its own date still dates it, and a caption range
+    assert resolve("רחוב הדקל 3 | 01/03/2024 | 1,900,000", comparables=True, unit_valuation=UV)["provenance"] == "source"
+    assert resolve("x | 1,900,000", table_caption="עסקאות 2021–2022", comparables=True,
+                   unit_valuation=UV)["provenance"] == "source_table"
+
+
+@pytest.mark.parametrize("headers, caption, expected", [
+    (["נכס", "מועד", "מחיר"], None, True),                       # a date column
+    (["נכס", "תאריך עסקה", "מחיר"], "", True),
+    (["נכס", "מחיר"], "עסקאות בנכסים דומים", True),               # the caption marks transactions
+    (["נכס", "מחיר"], "נכסי השוואה", True),
+    (["נכס", "מחיר להשוואה"], None, True),                        # a header marks comparison
+    (["פרט", "ערך"], "סיכום השומה", False),                       # a summary table
+    (["שנת בנייה", "שטח"], None, False),                           # year built is not a date of the datum
 ])
-def test_a_value_that_is_not_a_source_backed_adopted_conclusion_stays_unknown(stance, provenance):
-    assert resolve("שווי הנכס 2,450,000 ₪", stance=stance, stance_provenance=provenance, unit_valuation=UV) is None
-
-
-def test_a_conflicting_or_missing_unit_valuation_is_unknown():
-    kw = dict(stance="adopted", stance_provenance="source")
-    assert resolve("שווי הנכס 2,450,000 ₪", unit_valuation=UV_CONFLICT, **kw) is None
-    assert resolve("שווי הנכס 2,450,000 ₪", unit_valuation=D.UnitValuation("none", None, (), 1), **kw) is None
-    assert resolve("שווי הנכס 2,450,000 ₪", unit_valuation=None, **kw) is None
+def test_a_table_is_a_comparables_table_by_a_date_column_or_a_comparables_caption(headers, caption, expected):
+    assert D.is_comparables_table(headers, caption) is expected
 
 
 def test_a_date_in_the_sentence_is_its_own_date_even_for_an_adopted_conclusion():
-    got = resolve("שווי הנכס ביום 01/02/2025 הוא 2,450,000 ₪", stance="adopted", stance_provenance="source",
+    got = resolve("שווי הנכס ביום 01/02/2025 הוא 2,450,000 ₪", stance="adopted",
                   unit_valuation=UV)
     assert (got["date"], got["provenance"]) == ("2025-02-01", "source")
 
 
 def test_a_price_a_parcel_and_an_area_in_the_sentence_are_no_date():
-    assert resolve("חלקה 2024 בגוש 6001, שטח 120 מ״ר, 2,024,000 ₪", stance="adopted", stance_provenance="source",
-                   unit_valuation=UV)["provenance"] == "unit_valuation"
+    assert resolve("חלקה 2024 בגוש 6001, שטח 120 מ״ר, 2,024,000 ₪", stance="adopted", unit_valuation=UV)["provenance"] == "unit_valuation"
 
 
 # --- forecast -----------------------------------------------------------------------------------------------------
@@ -247,7 +282,7 @@ def test_a_date_after_the_anchor_is_a_forecast_by_its_precision():
 def test_resolve_marks_a_future_date_as_a_forecast_with_no_marker_and_stance_plays_no_part():
     got = resolve("שכר הדירה ב-2027 הוא 6,000 ₪")
     assert (got["date"], got["forecast"]) == ("2027", True)
-    got = resolve("שכר הדירה ב-2022 הוא 5,000 ₪", stance="estimate", stance_provenance="source")
+    got = resolve("שכר הדירה ב-2022 הוא 5,000 ₪", stance="estimate")
     assert (got["date"], got["forecast"]) == ("2022", False)  # `estimate` is a party's estimate, not a forecast
 
 
@@ -257,7 +292,7 @@ def test_a_forecast_sentence_with_a_past_date_is_a_forecast():
 
 def test_the_unit_valuation_date_after_the_anchor_is_a_forecast_too():
     future = D.UnitValuation("stated", stated(2, "2027-01-01"), (stated(2, "2027-01-01"),), 1)
-    got = resolve("שווי הנכס 2,450,000 ₪", stance="adopted", stance_provenance="source", unit_valuation=future)
+    got = resolve("שווי הנכס 2,450,000 ₪", stance="adopted", unit_valuation=future)
     assert got["forecast"] is True
 
 

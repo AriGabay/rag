@@ -295,6 +295,40 @@ def test_a_value_that_is_not_the_units_conclusion_stays_undated(office):
     assert T.MSG_DATE_UNKNOWN in out
 
 
+def test_a_header_line_value_with_an_unknown_stance_is_dated_by_its_unit(office):
+    """Round 11 U15 A: on the real model the header line "שווי הנכס: 2,410,000 ₪" is registered with the stance unknown
+    (the source does not say who stated it); the unit's valuation date still dates it."""
+    doc = dated(office, "h", "15/04/2025", body="שווי הנכס: 2,410,000 ₪ (סינתטי).")
+    ws = ws_for(office, RECENT)
+    search(ws)
+    out = take(ws, first_source(ws, doc), "שווי הנכס: 2,410,000 ₪", "2,410,000", ADOPTED | {"stance": "unknown"})
+    assert out.startswith("V1 נרשם"), out
+    assert ws.values["V1"].stance == "unknown"
+    as_of = ws.values["V1"].as_of
+    assert (as_of["date"], as_of["provenance"]) == ("2025-04-15", "unit_valuation")
+    assert "15/04/2025" in out
+
+
+def test_a_value_whose_role_is_comparison_in_prose_stays_undated(office):
+    doc = dated(office, "c", "15/04/2025", body="שווי הנכס ברחוב הרקפות 7 לפי נכס דומה שנמכר ב-1,900,000 ₪ (סינתטי).")
+    ws = ws_for(office, RECENT)
+    search(ws)
+    out = take(ws, first_source(ws, doc), "נכס דומה שנמכר ב-1,900,000 ₪", "1,900,000",
+               ADOPTED | {"stance": "unknown", "role": "comparison"})
+    assert ws.values["V1"].as_of is None and T.MSG_DATE_UNKNOWN in out
+
+
+def test_a_value_attributed_to_another_party_stays_undated_whatever_its_stance(office):
+    doc = dated(office, "p", "15/04/2025", body="שמאי המשיבה: שווי הנכס 2,000,000 ₪ (סינתטי).")
+    ws = ws_for(office, RECENT)
+    search(ws)
+    take(ws, first_source(ws, doc), "שווי הנכס 2,000,000 ₪", "2,000,000",
+         ADOPTED | {"stance": "unknown", "stated_by": "שמאי המשיבה"})
+    assert ws.values["V1"].stated_by == "שמאי המשיבה"
+    assert ws.values["V1"].provenance.get("stated_by") == "source"
+    assert ws.values["V1"].as_of is None
+
+
 def test_a_forecast_is_marked_even_with_no_date(office):
     doc = dated(office, "a", None, body="שווי הנכס צפוי להגיע ל-3,000,000 ₪ (סינתטי).")
     ws = ws_for(office, RECENT)
@@ -309,13 +343,14 @@ TABLE_CAPTION = "עסקאות השוואה בנכסים דומים (סינתטי
 SECTION = "6. עסקאות השוואה"
 
 
-def table_doc(office, caption: str, rows: list[list[str]], valuation: str = "15/04/2025", sha: str = "t" * 64) -> str:
+def table_doc(office, caption: str, rows: list[list[str]], valuation: str = "15/04/2025", sha: str = "t" * 64,
+              headers: list[str] | None = None) -> str:
     """An appraisal of one unit: a heading, its valuation date and one table of comparable transactions (stored as the
     reader stores a table: its blocks, its structure)."""
     from tests.factories import make_document
 
     doc, ver = make_document(office, office.default_group_id, "שומה עם טבלה (סינתטי)", sha=sha)
-    structure = {"headers": ["נכס", "מועד", "מחיר (₪)"], "caption": caption, "title": [], "notes": [], "section": SECTION,
+    structure = {"headers": headers or ["נכס", "מועד", "מחיר (₪)"], "caption": caption, "title": [], "notes": [], "section": SECTION,
                  "block_index": 2, "rows": [{"cells": r} for r in rows]}
     blocks = [("heading", SECTION, None), ("paragraph", f"המועד הקובע: {valuation}", None), ("table", caption, 0)]
     with tenant_tx(office.system) as conn:
@@ -333,15 +368,15 @@ def table_doc(office, caption: str, rows: list[list[str]], valuation: str = "15/
     return str(doc)
 
 
-def take_cell(ws, doc: str, row: str) -> str:
-    handle = re.search(r"(T\d+) «" + re.escape(TABLE_CAPTION[:10]), T.tool_outline(ws, doc))
+def take_cell(ws, doc: str, row: str, role: str = "comparison", caption: str = TABLE_CAPTION) -> str:
+    handle = re.search(r"(T\d+) «" + re.escape(caption[:10]), T.tool_outline(ws, doc))
     assert handle, "the table is outlined"
     read = T.tool_read(ws, {"table": handle.group(1)})
     sid = re.search(r'<source id="(S\d+)"', read).group(1)
     locator = {"table": None, "row": row, "row_number": None, "column": "מחיר (₪)", "column_number": None, "quote": None,
                "number": None}
     meaning = {"kind": "price", "unit": "ILS", "period": "none", "vat": "unknown", "area_basis": "", "subject": "עסקה",
-               "role": "comparison"}
+               "role": role}
     return run(ws, "take_value", source=sid, locator=locator, meaning=meaning, label=row)
 
 
@@ -360,6 +395,25 @@ def test_a_comparable_row_with_no_date_of_its_own_stays_unknown_whatever_the_uni
     out = take_cell(ws, doc, "רחוב הברוש 5")
     assert out.startswith("V1 נרשם"), out
     assert ws.values["V1"].as_of is None and T.MSG_DATE_UNKNOWN in out
+
+
+def test_a_row_of_a_comparables_table_with_a_neutral_role_and_no_date_stays_unknown(office):
+    """Round 11 U15 A(c): the table's caption and its date column mark it as comparables; the role does not matter."""
+    doc = table_doc(office, TABLE_CAPTION, [["רחוב הברוש 5", "", "2,000,000"]])
+    ws = ws_for(office, RECENT)
+    out = take_cell(ws, doc, "רחוב הברוש 5", role="other")
+    assert out.startswith("V1 נרשם"), out
+    assert ws.values["V1"].role == "other" and ws.values["V1"].as_of is None and T.MSG_DATE_UNKNOWN in out
+
+
+def test_a_summary_table_cell_with_no_date_column_takes_the_units_valuation_date(office):
+    caption = "סיכום השומה (סינתטי)"
+    doc = table_doc(office, caption, [["שווי הנכס", "2,410,000"]], headers=["פרט", "מחיר (₪)"])
+    ws = ws_for(office, RECENT)
+    out = take_cell(ws, doc, "שווי הנכס", role="other", caption=caption)
+    assert out.startswith("V1 נרשם"), out
+    as_of = ws.values["V1"].as_of
+    assert (as_of["date"], as_of["provenance"]) == ("2025-04-15", "unit_valuation")
 
 
 def test_a_row_takes_the_range_its_tables_caption_states(office):

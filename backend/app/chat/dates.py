@@ -30,9 +30,13 @@ month and a day of the same month agree (the finer one is the unit's date); the 
 1. a single date in the datum's own row, cell or sentence: provenance `source`; two or more different dates there are
    ambiguous: unknown, nothing below is tried (a range is one date with an end);
 2. a range in the table's caption or header: `source_table`;
-3. the unit's valuation date, when the value is the unit's own conclusion (stance `adopted` with source provenance, prose,
-   heading or table cell alike) and its sentence or row holds no date at all: `unit_valuation`; a conflict, a unit with no
-   date or any other stance is unknown.
+3. the unit's valuation date, for a value of the appraisal unit whose own sentence or row holds no date at all:
+   `unit_valuation`, prose, heading or table cell alike (round 11 U15, KTD4 as decided after the real-model run: the
+   header line "שווי הנכס: ..." is registered with the stance *unknown*, so an adopted stance cannot be required). It
+   is withheld from a datum that is not the unit's own: a party's claim, proposal or estimate (any provenance), a value
+   attributed to another party (a speaker the source names, who is not the appraiser), a comparable or transaction (its
+   role), and a row of a comparables table (a date column, or a caption or header that marks comparables or
+   transactions). A conflict, or a unit with no date, is unknown.
 
 A date the sources do not give stays unknown (None), and a partial date keeps its precision. **Forecast** (R7,
 `is_forecast`) is a property of the wording and of the date, independent of whether a date was found, so it has its own
@@ -368,13 +372,47 @@ def _build(p_iso: str, precision: str, end: str | None, provenance: str, locator
                 forecast=is_forecast(sentence, partial, anchor), locator=locator)
 
 
-def resolve_as_of(text_: str, *, table_caption: str | None = None, stance: str | None = None,
-                  stance_provenance: str | None = None, unit_valuation: UnitValuation | None = None,
-                  anchor: date, locator: str = "text") -> AsOf | None:
+# the stances that are a party's own position, not the unit's conclusion (`extract.STANCES`); any provenance
+PARTY_STANCES = frozenset({"claim", "proposal", "estimate"})
+# the roles (`calc.ROLES`: "comparison"; the other two are defensive) that mark a datum as a comparable or a transaction
+COMPARABLE_ROLES = frozenset({"comparison", "comparable", "transaction"})
+# a speaker who is the unit's author or its decision maker: not "another party"
+_AUTHOR = re.compile(r"ה?(?:שמאי(?:ת)?(?:\s+ה?מכריע(?:ה)?)?|מעריך(?:ה)?|מכריע(?:ה)?|כותב(?:ת)?|ועדה(?:\s+ה?מקומית)?"
+                     r"|ועדת\s+ה?ערר|בית\s+ה?משפט)")
+# a table is a comparables table by its caption or headers ...
+_COMPARABLES = re.compile(r"עסקאות|עסקת|עסקה|השוואה|השוואת|השוואתי")
+# ... or by a date column of its own (a header that names a date of the row; "שנת בנייה" is not one)
+_DATE_HEADER = re.compile(r"תאריך|מועד|(?:חודש|שנת|שנה)\s+ה?(?:עסקה|מכירה|חוזה)")
+
+
+def is_comparables_table(headers: Iterable, *captions: str | None) -> bool:
+    """True for a table whose rows are comparables or transactions (round 11 U15, KTD4): a header that names a date, or a
+    caption or header that names transactions or a comparison. Such a row without a date of its own stays undated: it
+    is another property's datum, never the unit's conclusion."""
+    heads = [strip_bidi_controls(h) for h in headers if isinstance(h, str)]
+    caps = [strip_bidi_controls(c) for c in captions if c]
+    return (any(_DATE_HEADER.search(h) for h in heads)
+            or any(_COMPARABLES.search(x) for x in (*heads, *caps)))
+
+
+def _is_unit_own(stance: str | None, role: str | None, stated_by: str | None, stated_by_provenance: str | None,
+                 comparables: bool) -> bool:
+    """Whether a value may take its unit's valuation date: not a party's position, not another party's, not a comparable
+    or a transaction, not a row of a comparables table."""
+    if comparables or stance in PARTY_STANCES or role in COMPARABLE_ROLES:
+        return False
+    who = " ".join(strip_bidi_controls(stated_by or "").split())
+    return not (who and stated_by_provenance == "source" and not _AUTHOR.fullmatch(who))
+
+
+def resolve_as_of(text_: str, *, table_caption: str | None = None, stance: str | None = None, role: str | None = None,
+                  stated_by: str | None = None, stated_by_provenance: str | None = None, comparables: bool = False,
+                  unit_valuation: UnitValuation | None = None, anchor: date, locator: str = "text") -> AsOf | None:
     """The datum's date by the KTD4 order (see the module docstring), or None (unknown). ``text_`` is the datum's own row,
-    cell or sentence; ``table_caption`` the caption or header of its table; ``stance`` and ``stance_provenance`` the
-    value's stance and where its provenance says the stance came from; ``unit_valuation`` the valuation of the unit that
-    holds the datum (`unit_valuation`)."""
+    cell or sentence; ``table_caption`` the caption or header of its table; ``stance``, ``role``, ``stated_by`` (with
+    ``stated_by_provenance``: only a speaker the source names counts) and ``comparables`` (the datum is a row of a
+    comparables table, `is_comparables_table`) say whether it is the unit's own datum; ``unit_valuation`` the valuation
+    of the unit that holds the datum."""
     sentence = strip_bidi_controls(text_ or "")
     own = shared.find_all(sentence)
     if len({(p.iso, p.precision, p.end) for p in own}) > 1:
@@ -385,8 +423,8 @@ def resolve_as_of(text_: str, *, table_caption: str | None = None, stance: str |
     if len(caption) == 1 and caption[0].end is not None:
         c = caption[0]
         return _build(c.iso, c.precision, c.end, SOURCE_TABLE, "caption", sentence, anchor)
-    if (stance == "adopted" and stance_provenance == "source" and unit_valuation is not None
-            and unit_valuation.status == "stated" and unit_valuation.date is not None):
+    if (unit_valuation is not None and unit_valuation.status == "stated" and unit_valuation.date is not None
+            and _is_unit_own(stance, role, stated_by, stated_by_provenance, comparables)):
         d = unit_valuation.date
         return _build(d.iso, d.precision, None, UNIT_VALUATION, f"block {d.block_index}", sentence, anchor)
     return None

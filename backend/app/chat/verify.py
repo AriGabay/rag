@@ -188,6 +188,7 @@ from app.chat.evidence import select
 from app.chat.request import ID_PREFIX, Aspect, Kind
 from app.config import get_settings
 from app.measurements.extract import stance_label
+from app.platform import dates as shared_dates
 from app.platform import source_kinds
 from app.professional.sections import MODALITY_CLASSES
 from app.providers.llm import (
@@ -2164,9 +2165,11 @@ def _professional_head(src) -> str:
     return " | ".join(parts)
 
 
-def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
+def _source_parts(ws: Workspace, sid: str, *, dated: bool = True) -> tuple[str, str, str] | None:
     """(heading, body, kind) of a cited id: a passage's title and location and its text; a measurement or a
-    computation as one short statement of its meaning."""
+    computation as one short statement of its meaning. ``dated``: a value's or measurement's record carries the date the
+    server resolved for it (`_date_text`); the number check reads the record without it (`_date_backed` settles which
+    dates the record states), so that a date line never lends its digits to a number it does not state."""
     if sid in ws.sources:
         src = ws.sources[sid]
         # in a file holding several appraisals, the context the passage is in (round 7 U6, KTD7); in a file of one
@@ -2187,7 +2190,7 @@ def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
                 + (f"\nסעיף: {m['section']}" if m.get("section") else "")
                 + (f"\nייחוס (מהטקסט): {stance_label(m['stance'])}"
                    + (f" של {m['stated_by']}" if m.get("stated_by") else "") if m.get("stance") else "")
-                + f"\nציטוט: {m['quote']}", "measurement")
+                + (_date_text(m) if dated else "") + f"\nציטוט: {m['quote']}", "measurement")
     if sid in ws.values:
         v = ws.values[sid].public()
         p = v["provenance"]
@@ -2199,7 +2202,8 @@ def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
                 f"מע\"מ: {v['vat']}, בסיס שטח: {v['area_basis'] or 'לא צוין'}, נושא: {v['subject'] or 'לא צוין'}, "
                 f"תפקיד: {v['role']}" + (f"; נקבעו ולא נמצאו במקור: {', '.join(asserted)}" if asserted else "")
                 + ")" + (f"\nסעיף: {v['section']}" if v.get("section") else "") + "\n" + _attribution_text(v)
-                + f"\nמקום: {where}\nציטוט: {v['quote']}" + _context_text(v) + _scale_text(ws.values[sid]), "value")
+                + f"\nמקום: {where}" + (_date_text(v) if dated else "") + f"\nציטוט: {v['quote']}" + _context_text(v)
+                + _scale_text(ws.values[sid]), "value")
     if sid in ws.assumptions:
         a = ws.assumptions[sid]
         return ("הנחת המשתמש", f"הנחה שהמשתמש נתן (לא נתון מהמסמכים): {a.label} = {a.written}"
@@ -2207,6 +2211,16 @@ def _source_parts(ws: Workspace, sid: str) -> tuple[str, str, str] | None:
     if sid in ws.computations:
         return ("חישוב מערכת", computation_text(ws.computations[sid], ws), "computation")
     return None
+
+
+def _date_text(record: dict) -> str:
+    """The date the server resolved for a value or measurement and where it came from (round 11 U15 B), as one line of
+    its record: "מועד הנתון: 10/03/2022 (המועד הקובע של היחידה שהנתון הוא מסקנתה)". A claim that gives that date rests on
+    the record, though the cited passage itself does not hold the valuation-date line (`_date_backed`). Nothing when the
+    server resolved nothing."""
+    from app.chat.tools import datum_line
+
+    return "\n" + datum_line(record["as_of"]) if record.get("as_of") else ""
 
 
 def _scale_text(v) -> str:
@@ -2453,10 +2467,54 @@ def _texts(ws: Workspace, ids: list[str]) -> list[tuple[str, str]]:
     """The full text of each cited id (for the deterministic number check, which reads whole sources)."""
     out = []
     for i in ids:
-        parts = _source_parts(ws, i)
+        parts = _source_parts(ws, i, dated=False)
         if parts is not None:
             out.append((i, f"{parts[0]}\n{parts[1]}"))
     return out
+
+
+# the provenances of a datum's date that the server read from the source (round 11 U15 B): never one the model typed
+_SOURCE_DATE = frozenset({"source", "source_table", "unit_valuation"})
+_PRECISION_RANK = {"year": 0, "month": 1, "day": 2}
+
+
+def _as_of_dates(as_of: dict | None) -> list[tuple[str, str]]:
+    """The (ISO, precision) dates a datum's ``as_of`` states from the source: its date and, for a range, its end. Nothing
+    for an unknown date, a forecast with no date, or a provenance that is not the source's."""
+    if not as_of or not as_of.get("date") or as_of.get("provenance") not in _SOURCE_DATE:
+        return []
+    return [(d, as_of["precision"]) for d in (as_of["date"], as_of.get("end")) if d]
+
+
+def _as_of_forms(as_of: dict | None) -> list[str]:
+    """The written forms of a datum's stated dates at their precision (DD/MM/YYYY, MM/YYYY, YYYY)."""
+    out = []
+    for iso, precision in _as_of_dates(as_of):
+        y, m, d = (iso.split("-") + [None, None])[:3]
+        out.append(f"{d}/{m}/{y}" if precision == "day" else f"{m}/{y}" if precision == "month" else y)
+    return out
+
+
+def _date_backed(text: str, ws: Workspace, ids: list[str]) -> set[str]:
+    """The number tokens of the dates a unit's text gives that a cited value (V#) or measurement (M#) states as its own
+    date (``as_of``: read by the server from the source's date line, row, caption or unit; round 11 U15 B, as KTD10 does
+    for the VAT): the date sits in the record the claim cites, though the cited passage may not hold the line. A date
+    counts when it is, at its precision or coarser, one of the stated dates (a range: both ends); a date the record does
+    not hold is not backed, and a token that is also written outside every backed date ("10 יחידות") is not either."""
+    stated = [d for i in ids for d in _as_of_dates(getattr(ws.values.get(i) or ws.measurements.get(i), "as_of", None))]
+    if not stated:
+        return set()
+
+    def holds(iso: str, precision: str) -> bool:
+        return any(iso == day[:len(iso)] and _PRECISION_RANK[precision] <= _PRECISION_RANK[rank] for day, rank in stated)
+
+    backed = [p for p in shared_dates.find_all(text) if holds(p.iso, p.precision) and (p.end is None or holds(p.end, p.precision))]
+    if not backed:
+        return set()
+    rest = text
+    for p in sorted(backed, key=lambda x: x.span, reverse=True):
+        rest = rest[:p.span[0]] + " " + rest[p.span[1]:]
+    return set().union(*(numbers_in(text[p.span[0]:p.span[1]]) for p in backed)) - numbers_in(rest)
 
 
 def _all_numbers(ws: Workspace) -> set[str]:
@@ -2470,6 +2528,8 @@ def _all_numbers(ws: Workspace) -> set[str]:
         nums |= numbers_in(f"{m.row.value_text} {m.row.quote}", words=True)
     for v in ws.values.values():
         nums |= numbers_in(f"{v.written} {v.quote}", words=True)
+    for r in (*ws.values.values(), *ws.measurements.values()):
+        nums |= numbers_in(" ".join(_as_of_forms(r.as_of)))
     for a in ws.assumptions.values():
         nums |= numbers_in(a.written)
     for c in ws.computations.values():
@@ -2570,7 +2630,7 @@ def _vat_problems(unit: Unit, ws: Workspace) -> list[str]:
             v = ws.values[i]
             if v.vat in ("included", "excluded") and v.provenance.get("vat") == "source":
                 backed |= {(f, v.vat) for f in numbers_in(v.written)}
-        parts = _source_parts(ws, i)
+        parts = _source_parts(ws, i, dated=False)
         if parts is None:
             continue
         pairs, general = vat_attachments(parts[1])
@@ -2911,6 +2971,9 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
     # a numbered heading's own number ("9.1 שיטת השומה") is its place in the answer, not a fact
     missing = [n for n in numbers_in(_stated_text(u)) - question_numbers if n not in pool and not (
         _small_ordinal(n, u.text) and not _document_count(n, u.text))]
+    if missing and held:  # the date a cited value or measurement states for itself (round 11 U15 B)
+        backed = _date_backed(_stated_text(u), ws, u.ids)
+        missing = [n for n in missing if n not in backed]
     if missing:  # a calculation's result shown rounded to the precision and in the scale it is written in
         shown = _computed_numbers(u.text, computations if held else list(ws.computations.values()))
         missing = [n for n in missing if n not in shown]

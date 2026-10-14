@@ -347,6 +347,110 @@ def test_a_value_record_without_a_source_given_vat_backs_no_vat_claim(vat, prove
         assert [(p.check, p.failure_kind) for p in problems] == [("vat", "wrong_unit")], claim
 
 
+# --- the date a cited value or measurement states backs the same date in a claim (round 11 U15 B) --------------------
+
+_PASSAGE = "סיכום השומה: השווי נקבע לפי גישת ההשוואה בסך 1,950,000 ₪ כולל מע\"מ."   # the passage holds no date
+
+
+def _dated(as_of, *, passage: str = _PASSAGE, provenance: str = "unit_valuation"):
+    """A workspace with S1 (a passage without the valuation-date line) and V1, the registered value in it, whose
+    server-resolved ``as_of`` is ``as_of`` (a dict) or None."""
+    ws = _registered("1,950,000", "השווי נקבע בסך 1,950,000 ₪ כולל מע\"מ", vat="included")
+    ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="שומת הדגמה", section="סיכום",
+                  location="סעיף 3", kind="context", text=passage)
+    if as_of is not None:
+        ws.values["V1"].as_of = {"end": None, "forecast": False, "locator": "block 1", "provenance": provenance} | as_of
+    return ws
+
+
+def _numbers(markdown: str, ws: Workspace) -> list:
+    return [p for p in verify.deterministic(split_units(markdown), ws, "?") if p.check == "unstated_number"]
+
+
+CLAIM_DAY = "השווי נקבע ל-1,950,000 ₪ כולל מע\"מ, למועד הקובע 10/03/2022 [V1][S1]."
+
+
+@pytest.mark.parametrize("written", ["10/03/2022", "10.3.2022", "10.03.2022", "10/3/2022"])
+def test_a_date_the_cited_values_as_of_states_is_backed_in_any_written_form(written):
+    ws = _dated({"date": "2022-03-10", "precision": "day"})
+    assert _numbers(CLAIM_DAY.replace("10/03/2022", written), ws) == []
+
+
+@pytest.mark.parametrize("provenance", ["source", "source_table", "unit_valuation"])
+def test_every_server_provenance_of_the_as_of_backs_its_date(provenance):
+    ws = _dated({"date": "2022-03-10", "precision": "day"}, provenance=provenance)
+    assert _numbers(CLAIM_DAY, ws) == []
+
+
+def test_without_the_as_of_the_same_claim_is_cut_as_unstated():
+    """The red of the real-model run: S7 holds no valuation-date line, V2's as_of was never read."""
+    for ws in (_dated(None), _dated({"date": None, "precision": None, "forecast": True, "provenance": None})):
+        (problem,) = _numbers(CLAIM_DAY, ws)
+        assert "10/03/2022" in problem.reason or set(problem.unstated) >= {"2022"}
+
+
+def test_a_different_date_than_the_as_of_is_still_flagged():
+    ws = _dated({"date": "2022-03-10", "precision": "day"})
+    for other in ("11/03/2022", "10/04/2022", "10/03/2021", "03/10/2022"):
+        (problem,) = _numbers(CLAIM_DAY.replace("10/03/2022", other), ws)
+        assert problem.unstated, other
+
+
+def test_a_number_that_only_looks_like_a_part_of_the_date_is_not_backed():
+    ws = _dated({"date": "2022-03-10", "precision": "day"})
+    (problem,) = _numbers("השווי נקבע ל-1,950,000 ₪ כולל מע\"מ, בעבור 10 יחידות [V1][S1].", ws)
+    assert "10" in problem.unstated
+
+
+def test_a_month_as_of_backs_the_month_and_not_a_day_of_it():
+    ws = _dated({"date": "2022-03", "precision": "month"})
+    assert _numbers("השווי נקבע ל-1,950,000 ₪ כולל מע\"מ, נכון ל-03/2022 [V1][S1].", ws) == []
+    assert _numbers("השווי נקבע ל-1,950,000 ₪ כולל מע\"מ, נכון ל-10/03/2022 [V1][S1].", ws)
+
+
+def test_a_year_as_of_backs_the_year():
+    ws = _dated({"date": "2022", "precision": "year"})
+    assert _numbers("השווי נקבע ל-1,950,000 ₪ כולל מע\"מ, נכון לשנת 2022 [V1][S1].", ws) == []
+    assert _numbers("השווי נקבע ל-1,950,000 ₪ כולל מע\"מ, נכון לשנת 2023 [V1][S1].", ws)
+
+
+def test_a_range_as_of_backs_both_ends():
+    ws = _dated({"date": "2021", "precision": "year", "end": "2022"}, provenance="source_table")
+    assert _numbers("מחירי העסקאות בין 2021 ל-2022 הגיעו ל-1,950,000 ₪ כולל מע\"מ [V1][S1].", ws) == []
+    assert _numbers("מחירי העסקאות בין 2021 ל-2023 הגיעו ל-1,950,000 ₪ כולל מע\"מ [V1][S1].", ws)
+
+
+def test_the_as_of_of_a_value_the_unit_does_not_cite_backs_nothing():
+    ws = _dated({"date": "2022-03-10", "precision": "day"})
+    assert _numbers("השווי נקבע ל-1,950,000 ₪ כולל מע\"מ, למועד הקובע 10/03/2022 [S1].", ws)
+
+
+def test_a_measurements_as_of_backs_its_date_too():
+    from types import SimpleNamespace
+
+    from app.chat.tools import Measurement
+
+    ws = _ws("דמי השכירות הם 55 ₪ למ\"ר לחודש.")
+    row = SimpleNamespace(value_text="55 ₪", quote="דמי השכירות הם 55 ₪ למ\"ר לחודש", vat="unknown", metric="דמי שכירות",
+                          metric_kind="rent_per_area", unit="ILS_per_sqm", period="month", area_basis=None, subject=None,
+                          value_role="appraiser_determination", status="auto_validated", section=None, block_index=1,
+                          table_index=None)
+    m = Measurement("M1", uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), "דוח", row)
+    m.as_of = {"date": "2023-06-15", "precision": "day", "end": None, "provenance": "source", "forecast": False,
+               "locator": "quote"}
+    ws.measurements["M1"] = m
+    assert _numbers("דמי השכירות הם 55 ₪ למ\"ר לחודש נכון ל-15/06/2023 [M1][S1].", ws) == []
+    assert _numbers("דמי השכירות הם 55 ₪ למ\"ר לחודש נכון ל-16/06/2023 [M1][S1].", ws)
+
+
+def test_the_judge_reads_the_date_and_where_it_came_from_in_the_value_record():
+    ws = _dated({"date": "2022-03-10", "precision": "day"})
+    heading, body, kind = verify._source_parts(ws, "V1")
+    assert kind == "value" and "10/03/2022" in body and "המועד הקובע של היחידה" in body
+    unknown = _dated(None)
+    assert "10/03/2022" not in verify._source_parts(unknown, "V1")[1]
+
+
 def test_a_source_given_area_basis_on_a_value_record_backs_the_matching_claim_only():
     ws = _registered("9,500", "דמי השכירות: 9,500 ₪", unit="ILS_per_sqm", area_basis="נטו", period="month")
     assert verify.deterministic(split_units("דמי השכירות הם 9,500 ₪ למ\"ר נטו לחודש [V1]."), ws, "?") == []

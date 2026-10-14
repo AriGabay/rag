@@ -4408,26 +4408,34 @@ def _own_sentence(taken: dict) -> str:
 
 
 def _date_inputs(ws: Workspace, conn: Connection, version_id, taken: dict, block_index: int | None,
-                 vision: bool = False) -> tuple[chat_dates.UnitValuation, str | None]:
+                 vision: bool = False) -> tuple[chat_dates.UnitValuation, str | None, bool]:
     """What the value's date is resolved from beyond its own sentence (KTD4): the valuation of the unit holding its block,
-    and — for a cell of a stored table — the table's caption with the column's header, where a range may be stated."""
-    caption = None
-    if taken.get("table") and not vision:
-        st, _ = _table_at(ws, conn, version_id, taken["locator"]["table_index"])
+    for a cell of a stored table the table's caption with the column's header (where a range may be stated), and whether
+    the table holds comparables or transactions (round 11 U15: such a row never takes the unit's date). A table whose
+    structure is not stored (a visual read) cannot be shown to be anything else, so it counts as one."""
+    caption, comparables = None, False
+    if taken.get("table"):
+        st = None if vision else _table_at(ws, conn, version_id, taken["locator"]["table_index"])[0]
         if st:
             caption = " ".join(x for x in (st.get("caption"), taken["locator"].get("column")) if x) or None
-    return valuation_of(ws, conn, version_id, block_index), caption
+            comparables = chat_dates.is_comparables_table(st.get("headers") or [], st.get("caption"),
+                                                          *(st.get("title") or []))
+        else:
+            comparables = True
+    return valuation_of(ws, conn, version_id, block_index), caption, comparables
 
 
 def _stamp_date(ws: Workspace, value: calc.Value, taken: dict, inputs: tuple) -> None:
-    """Set ``value.as_of`` (round 11 U8, KTD4, R5-R7): the date the server finds in the value's own row or sentence, in its
-    table's range, or — for the unit's own conclusion, a source-backed adopted stance — the unit's valuation date; unknown
-    otherwise. A sentence worded as a forecast is marked even when no date is found."""
-    uv, caption = inputs
+    """Set ``value.as_of`` (round 11 U8, U15, KTD4, R5-R7): the date the server finds in the value's own row or sentence,
+    in its table's range, or — for a value of the appraisal unit that is not a party's claim, another party's, a
+    comparable, a transaction or a row of a comparables table — the unit's valuation date; unknown otherwise. A sentence
+    worded as a forecast is marked even when no date is found."""
+    uv, caption, comparables = inputs
     sentence = _own_sentence(taken)
-    found = chat_dates.resolve_as_of(sentence, table_caption=caption, stance=value.stance,
-                                     stance_provenance=value.provenance.get("stance"), unit_valuation=uv,
-                                     anchor=ws.time.anchor)
+    found = chat_dates.resolve_as_of(sentence, table_caption=caption, stance=value.stance, role=value.role,
+                                     stated_by=value.stated_by,
+                                     stated_by_provenance=value.provenance.get("stated_by"), comparables=comparables,
+                                     unit_valuation=uv, anchor=ws.time.anchor)
     value.as_of = datum_as_of(ws, sentence, found)
 
 
