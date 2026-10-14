@@ -49,13 +49,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from functools import cache, cached_property, lru_cache
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 from app.answering.verify import _NUMBER as _NUM_AT
 from app.answering.verify import not_an_amount, numbers_in
 from app.chat.evidence import _content_words
-from app.measurements.extract import PERIOD_LABELS
+from app.measurements.extract import _MONTH_WORDS, _YEAR_WORDS, PERIOD_LABELS
 
 if TYPE_CHECKING:
     from app.chat.tools import Workspace
@@ -116,20 +115,34 @@ def _norm(text: str) -> str:
     return (text or "").replace("״", '"').replace("׳", "'").replace("”", '"').replace("’", "'")
 
 
+PARTS = ("cell", "header", "caption", "note", "row", "sentence", "paragraph")
+
+
 @dataclass
 class Qualifiers:
-    """kind -> {key: as written}"""
+    """kind -> {key: as written}; ``parts``: kind -> {key: the part of the source that states it} (round 12 U9, KTD9:
+    one of ``PARTS``). A qualifier added without a part has none recorded."""
 
     found: dict[str, dict[str, str]] = field(default_factory=dict)
+    parts: dict[str, dict[str, str]] = field(default_factory=dict)
 
-    def add(self, kind: str, key: str, written: str) -> None:
+    def add(self, kind: str, key: str, written: str, part: str = "") -> None:
         self.found.setdefault(kind, {}).setdefault(key, written.strip())
+        known = self.parts.get(kind, {}).get(key)
+        # the first part recorded stays, except that "paragraph" (what the source states for all its numbers) gives way
+        # to the part of the number's own place ("header" for a table's column, not the table's size line echoing it)
+        if part and (known is None or (known == "paragraph" and part != "paragraph")):
+            self.parts.setdefault(kind, {})[key] = part
 
-    def merge(self, other: Qualifiers) -> Qualifiers:
+    def merge(self, other: Qualifiers, part: str = "") -> Qualifiers:
+        """``other``'s qualifiers, each in the part ``other`` recorded for it, else in ``part``."""
         for kind, values in other.found.items():
             for key, written in values.items():
-                self.add(kind, key, written)
+                self.add(kind, key, written, other.parts.get(kind, {}).get(key) or part)
         return self
+
+    def part_of(self, kind: str, key: str) -> str:
+        return self.parts.get(kind, {}).get(key, "")
 
     def keys(self, kind: str) -> set[str]:
         return set(self.found.get(kind, {}))
@@ -214,7 +227,8 @@ def _all(text: str, rates: bool = True) -> Qualifiers:
 
 def _only(q: Qualifiers, kind: str, keep: bool = True) -> Qualifiers:
     """The qualifiers of one kind (``keep``), or all but that kind."""
-    return Qualifiers({k: dict(v) for k, v in q.found.items() if (k == kind) == keep})
+    return Qualifiers({k: dict(v) for k, v in q.found.items() if (k == kind) == keep},
+                      {k: dict(v) for k, v in q.parts.items() if (k == kind) == keep})
 
 
 def absence_spans(text: str) -> list[tuple[int, int]]:
@@ -276,11 +290,12 @@ def _area_amount(text: str, pos: int, written: str, closest: list[Occurrence]) -
 TABLE_AROUND = 4  # lines around a table that are its own (caption, title, size, notes); more are a passage's
 
 
-def _table_definitions(lines: list[str], is_row: list[bool], heads: list[str]) -> dict[str, dict[str, str]]:
-    """What a calculation table states once for its per-area amounts, by kind -> {key: as written}: the area basis
-    of its area row ("סה״כ מ״ר אקווי׳ | 2,480") or of its title, caption or notes, and the period of its title,
-    caption or notes ("דמי השכירות בטבלה הם לחודש"). Text around a table in a longer passage is not the table's."""
-    found: dict[str, dict[str, str]] = {"basis": {}, "period": {}}
+def _table_definitions(lines: list[str], is_row: list[bool], heads: list[str]) -> Qualifiers:
+    """What a calculation table states once for its per-area amounts: the area basis of its area row ("סה״כ מ״ר
+    אקווי׳ | 2,480", the part "row") or of its title, caption or notes, and the period of its title, caption or notes
+    ("דמי השכירות בטבלה הם לחודש"; the part "caption" above the rows, "note" below them). Text around a table in a
+    longer passage is not the table's."""
+    found = Qualifiers()
     for line, row in zip(lines, is_row, strict=True):
         if not row:
             continue
@@ -289,13 +304,21 @@ def _table_definitions(lines: list[str], is_row: list[bool], heads: list[str]) -
         if 'מ"ר' in label or any('מ"ר' in h for h in heads[:1]):
             for _, kind, key, written in _scan(label):
                 if kind == "basis" and not _PER_AREA.search(label):
-                    found["basis"].setdefault(key, written.strip())
-    around = [ln for ln, row in zip(lines, is_row, strict=True) if not row]
-    if len(around) <= TABLE_AROUND:  # a caption, a title, a size line and notes; a longer passage is not the table's
-        for line in around:
-            for _, kind, key, written in _scan(line, rates=False):
-                found[kind].setdefault(key, written.strip())
+                    found.add("basis", key, written, "row")
+    # a caption, a title, a size line and notes; a longer passage is not the table's
+    if sum(1 for row in is_row if not row) <= TABLE_AROUND:
+        seen_row = False
+        for line, row in zip(lines, is_row, strict=True):
+            seen_row = seen_row or row
+            if not row:
+                for _, kind, key, written in _scan(line, rates=False):
+                    found.add(kind, key, written, "note" if seen_row else "caption")
     return found
+
+
+def _tagged(q: Qualifiers, part: str) -> Qualifiers:
+    """``q`` with ``part`` recorded for each qualifier that has none."""
+    return Qualifiers().merge(q, part)
 
 
 def _period_lines(lines: list[str], is_row: list[bool]):
@@ -336,10 +359,12 @@ def _period_lines(lines: list[str], is_row: list[bool]):
 
     around = [i for i, row in enumerate(is_row) if not row]
     few = len(around) <= TABLE_AROUND
+    first_row = next((i for i, row in enumerate(is_row) if row), len(lines))
     table = []
     if any(is_row) and few:
         for i in around:
-            table.append((lines[i], _only(_all(lines[i], rates=False), "period")))
+            table.append((lines[i], _tagged(_only(_all(lines[i], rates=False), "period"),
+                                            "note" if i > first_row else "caption")))
 
     def scoped(notes, context: str) -> Qualifiers:
         q = Qualifiers()
@@ -357,7 +382,8 @@ def _period_lines(lines: list[str], is_row: list[bool]):
         if not is_row[i]:
             # the line above governs only a number of a compatible kind: a note on management fees "לחודש" gives
             # no month to a market value in the next sentence
-            return Qualifiers().merge(stated[i]).merge(opening(i + 1)).merge(scoped(above(i), context or lines[i]))
+            return (Qualifiers().merge(stated[i], "sentence").merge(opening(i + 1), "sentence")
+                    .merge(scoped(above(i), context or lines[i]), "paragraph"))
         if few:
             return scoped(table, context)
         first, last = i, i
@@ -370,12 +396,12 @@ def _period_lines(lines: list[str], is_row: list[bool]):
             if is_row[k] or _ENUMERATION.match(lines[k]):
                 break
             if not has_num[k] and stated[k].found and not opening(k).found:
-                notes.append((lines[k], stated[k]))
+                notes.append((lines[k], _tagged(stated[k], "caption")))
                 break
         for j in range(last + 1, min(len(lines), last + 3)):
             if is_row[j] or has_num[j]:
                 break
-            notes.append((lines[j], stated[j]))
+            notes.append((lines[j], _tagged(stated[j], "note")))
         return scoped(notes, context)
 
     return period
@@ -399,7 +425,7 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
     rows = [ln for ln, row in zip(lines, is_row, strict=True) if row]
     header = next((r for r in rows if not re.search(r"\d", r)), None)
     heads = _row_cells(header) if header else []
-    table = _table_definitions(lines, is_row, heads) if rows else {"basis": {}, "period": {}}
+    table = _table_definitions(lines, is_row, heads) if rows else Qualifiers()
     period = _period_lines(lines, is_row)
     occurrences: list[tuple[frozenset[str], Occurrence]] = []
     general = Qualifiers()
@@ -411,16 +437,16 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
             for i, cell in enumerate(cells):
                 found, _ = attached(cell)
                 for f, _, q in found:
-                    q = Qualifiers().merge(q)
+                    q = Qualifiers().merge(q, "cell")
                     if i > 0:
-                        q.merge(_all(cells[0]))  # the row's label
+                        q.merge(_all(cells[0]), "row")  # the row's label
                     if i < len(heads):
-                        q.merge(_all(heads[i]))  # the column's header
+                        q.merge(_all(heads[i]), "header")  # the column's header
                     if _PER_AREA.search(cells[0] + " " + (heads[i] if i < len(heads) else "") + " " + cell):
-                        for kind, defined in table.items():
-                            if kind != "period" and len(defined) == 1 and not q.keys(kind):
-                                key, written = next(iter(defined.items()))
-                                q.add(kind, key, written)
+                        defined = table.found.get("basis", {})
+                        if len(defined) == 1 and not q.keys("basis"):
+                            key, written = next(iter(defined.items()))
+                            q.add("basis", key, written, table.part_of("basis", key))
                     # a per-area amount by its label, header or cell ("שווי למ״ר"); an area by its own label or cell —
                     # a column header of areas ("סה״כ מ״ר אקוו׳") also heads a calculation's totals and factors
                     own = cells[0] + " " + cell
@@ -440,16 +466,16 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
         found, gen = attached(line)
         # a clause with no number speaks for the source; a table's title, caption or notes for its numbers — an area
         # basis only: a period, for the numbers it governs (``_period_lines``)
-        general.merge(_only(_all(line) if rows else gen, "period", keep=False))
+        general.merge(_only(_all(line) if rows else gen, "period", keep=False), "paragraph")
         for i, (f, _, q) in enumerate(found):
-            q.merge(period(n))
+            q = _tagged(q, "sentence").merge(period(n))
             # A wrapped rate's period belongs solely to the percentage immediately following it.
             if i == 0 and n > 0 and not _SENTENCE_END.search(lines[n - 1]) \
                     and not _numbers(_ENUMERATION.sub("", lines[n - 1])) \
                     and re.match(r"\s*(?:של\s+)?[\d.,]+\s?%", line):
                 for pos, kind, key, written in _scan(lines[n - 1]):
                     if kind == "period" and _of_rate(lines[n - 1], pos):
-                        q.add(kind, key, written)
+                        q.add(kind, key, written, "sentence")
             occurrences.append((f, Occurrence(q, line)))
     return tuple(occurrences), general
 
@@ -571,19 +597,85 @@ def vat_attested(context: str, forms: frozenset[str], general_text: str = "") ->
     return out
 
 
-def measurement_qualifiers(row) -> Qualifiers:
+def vat_words(text: str) -> dict[str, str]:
+    """The VAT phrases a text writes, by status ("included" / "excluded") -> the first phrase as written."""
+    from app.chat.verify import _VAT, _vat_polarity
+
+    out: dict[str, str] = {}
+    for m in _VAT.finditer(_norm(text)):
+        if polarity := _vat_polarity(m):
+            out.setdefault(polarity, m.group(0).strip())
+    return out
+
+
+def kind_written(kind: str, context: str) -> str:
+    """The words of ``context`` that name the kind of value (``KIND_WORDS``), as written; empty when none do."""
+    words = KIND_WORDS.get(kind.removesuffix("_per_area"))
+    found = re.search(words, _norm(context)) if words else None
+    return found.group(0) if found else ""
+
+
+def measurement_states(row, field_: str) -> bool:
+    """Whether a stored measurement's period, area basis or VAT is the source's, so that it may back a claim (round 12
+    U9, KTD9, R6): the extraction validated it (``timeline._record_states``) and its own words are in the measurement's
+    quote, its table caption or its column header — the checks the extraction applied to the model's quote
+    (``measurements.extract``: ``period_quote`` is read with the month/year words, ``vat_quote`` with the VAT words, the
+    basis as written). A stored value no words state is the model's, however well the extraction validated it. The
+    caption and header are read when the row carries them (``caption``, ``header``); the quote of a table row carries
+    its header when the table is read by column."""
+    from app.chat.timeline import _record_states
+
+    if not _record_states(row, field_):
+        return False
+    text = _flat(" ".join(str(x) for x in (getattr(row, a, None) for a in ("quote", "caption", "header")) if x))
+    value = getattr(row, field_)
+    if field_ == "period":
+        return bool({"month": _MONTH_WORDS, "year": _YEAR_WORDS}.get(value, re.compile(r"(?!)")).search(text))
+    if field_ == "area_basis":
+        basis = _flat(value)
+        return basis in text or bool(_all(basis).keys("basis") & _all(text).keys("basis"))
+    if field_ == "vat":
+        from app.chat.verify import vat_attachments
+
+        pairs, general = vat_attachments(text)
+        return value in {polarity for _, polarity in pairs} | general
+    return False
+
+
+def _stored_qualifiers(area_basis: str | None, period: str | None, approx: bool) -> Qualifiers:
     q = Qualifiers()
-    basis = (getattr(row, "area_basis", None) or "").strip()
+    basis = (area_basis or "").strip()
     if basis:
         keys = _all(basis).keys("basis") or {basis}
         for key in keys:
             q.add("basis", key, basis)
-    period = getattr(row, "period", None)
     if period in MEASUREMENT_PERIODS:
         q.add("period", period, PERIOD_TEXT[period])
-    if getattr(row, "value_form", None) == "approx":
+    if approx:
         q.add("approx", "approx", "מקורב")
     return q
+
+
+def measurement_qualifiers(row) -> Qualifiers:
+    """What a stored measurement attaches to its number as evidence: its area basis and period only where its own words
+    are in what it quotes (``measurement_states``), and its approximation."""
+    return _stored_qualifiers(row.area_basis if measurement_states(row, "area_basis") else None,
+                              row.period if measurement_states(row, "period") else None,
+                              getattr(row, "value_form", None) == "approx")
+
+
+def value_qualifiers(v, forms: frozenset[str]) -> Qualifiers:
+    """What a registered value (V#) attaches to its number as evidence (round 12 U9, KTD9, R6): the area basis and the
+    period of its record only when their provenance is the source's — a field the model asserted is no evidence — and
+    otherwise only what the words of its own quote attach to the number."""
+    provenance = v.provenance or {}
+    own = number_qualifiers(v.quote, forms, v.quote)
+    stored = _stored_qualifiers(v.area_basis if provenance.get("area_basis") == "source" else None,
+                                v.period if provenance.get("period") == "source" else None, bool(v.approx))
+    q = Qualifiers()
+    for kind, field_ in (("basis", "area_basis"), ("period", "period")):
+        q.merge(_only(stored if provenance.get(field_) == "source" else own, kind))
+    return q.merge(_only(stored, "approx"))
 
 
 @dataclass
@@ -783,9 +875,7 @@ def _evidence(unit: Unit, ws: Workspace, forms: frozenset[str]) -> tuple[list[Oc
         if sid in ws.values:  # a value the server verified in its source, with the meaning recorded for it
             v = ws.values[sid]
             if forms & numbers_in(v.written):
-                row = SimpleNamespace(area_basis=v.area_basis, period=v.period,
-                                      value_form="approx" if v.approx else "exact")
-                occurrences.append(Occurrence(measurement_qualifiers(row), v.quote, measurement=True))
+                occurrences.append(Occurrence(value_qualifiers(v, frozenset(forms)), v.quote, measurement=True))
             continue
         src = ws.sources.get(sid)
         if src is None:

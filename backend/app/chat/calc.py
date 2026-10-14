@@ -1130,7 +1130,10 @@ class Value:
     stance: str = "unknown"
     scenario: str = ""
     attribution: str = ""  # the source's words that say who stated it or how ("לטענת המשיבה ..."), when found
-    meaning_from: dict = field(default_factory=dict)  # field -> where the source states it ("header", "cell", ...)
+    # where the source states each attribute it states (round 12 U9, KTD9): "unit" -> the part as a word ("header",
+    # "cell", "quote", ...); "period", "area_basis", "vat" and "kind" -> {"part", "written"} — one of
+    # ``meaning.PARTS`` and the source's own words — for those whose provenance is "source" only
+    meaning_from: dict = field(default_factory=dict)
     # how its own region was read (R28): "clear" (as ingested, or settled by a focused re-read), "uncertain" (still
     # unclear after the re-reads, or in an uncertain reading with no region of its own), "" (not known: the source's
     # reading status decides)
@@ -1162,7 +1165,12 @@ class Value:
     def operand(self) -> Operand:
         from app.chat.meaning import basis_key
 
-        return operand(self.vid, self.value, self.unit, period=self.period, vat=self.vat, basis=basis_key(self.area_basis),
+        # a calculation reads only the period and the area basis a source states (round 12 U9, KTD9, R8): a recurring
+        # period the model asserted counts as unknown (the existing assumption path), a basis it asserted as unstated
+        period = self.period if self.period not in ("month", "year") or self.provenance.get("period") == "source" \
+            else "unknown"
+        basis = basis_key(self.area_basis) if self.provenance.get("area_basis") == "source" else ""
+        return operand(self.vid, self.value, self.unit, period=period, vat=self.vat, basis=basis,
                        kind=self.kind, role=self.role, subject=self.subject, total=self.total, table=self.table,
                        approx=self.approx,
                        context=(self.context["key"], self.context.get("described") or self.context["label"])

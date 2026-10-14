@@ -4149,6 +4149,13 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     column_units = st.get("units") or []
     near = [cell, label, header, str(column_units[ci]) if ci < len(column_units) and column_units[ci] else ""]
     table_text = [st.get("caption") or "", *(st.get("title") or []), *(st.get("notes") or [])]
+    # the parts the source states the cell's meaning in, nearest first (round 12 U9, KTD9): the words of each attribute
+    # are anchored to the first that writes them
+    caption_text = " ".join(x for x in [st.get("caption") or "", *(st.get("title") or [])] if x)
+    notes_text = " ".join(x for x in st.get("notes") or [] if x)
+    vat_parts = [("cell", cell), ("row", label), ("header", header), ("header", near[3]), ("caption", caption_text),
+                 ("note", notes_text)]
+    vats = meaning.vat_attested("\n".join(near + table_text), forms)
     # the unit of the cell, its row or its column; the table's caption or notes only when those state none
     units = meaning.units_attested(" ".join(near)) or meaning.units_attested(" ".join(table_text))
     # where the source states the unit (R10): the cell, its row label, its column header (or the column's unit
@@ -4172,8 +4179,9 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
             or attribution_in(" ".join(x for x in table_text if x), adopted=True))
     return {"written": written, "value": value, "forms": forms, "quote": line,
             "qualifiers": meaning.number_qualifiers(_table_text(st, st.get("rows") or []), forms, line),
-            "units": units, "vat": meaning.vat_attested("\n".join(near + table_text), forms),
+            "units": units, "vat": vats, "vat_from": _vat_anchors(vats, vat_parts, "note"),
             "kind_context": " ".join([label, header, st.get("caption") or ""]),
+            "kind_parts": [("row", label), ("header", header), ("caption", st.get("caption") or "")],
             "locator": {"table_index": index, "row": cells[0] if cells else "", "row_number": ri + 1,
                         "column": header, "column_number": ci + 1},
             "total": bool(calc.TOTAL_WORDS.search(meaning._norm(cells[0] if cells else ""))),
@@ -4366,21 +4374,51 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
         units = set(inherited.pop())
         if units:
             unit_from = "governing_note"
+    vats = meaning.vat_attested(line, forms, full)
     return {"written": written, "value": sign * value, "forms": forms, "quote": loc["quote"].strip(),
             "qualifiers": meaning.number_qualifiers(full, forms, quote),
-            "units": units, "vat": meaning.vat_attested(line, forms, full),
-            "kind_context": quote, "locator": {"quote": loc["quote"].strip()}, "total": False, "table": None,
+            "units": units, "vat": vats,
+            "vat_from": _vat_anchors(vats, [("sentence", quote), ("paragraph", line), ("note", full)], "paragraph"),
+            "kind_context": quote, "kind_parts": [("sentence", quote)], "locator": {"quote": loc["quote"].strip()},
+            "total": False, "table": None,
             "anchor": anchor, "said": said, "context": f"{line}\n{quote}",
             "meaning_from": {"unit": unit_from} if unit_from else {}, "scale": scale}
 
 
-def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict]:
+def _vat_anchors(vats: set[str], parts: list[tuple[str, str]], fallback: str) -> dict[str, dict]:
+    """For each VAT status the source gives a number, the part (of ``parts``: ``(part, text)``, nearest first) that
+    writes it and the phrase as written (round 12 U9, KTD9). A status the number's own clause gave through the
+    nearest-number rule that no part's phrase shows is anchored to ``fallback`` with no words."""
+    out: dict[str, dict] = {}
+    for status in sorted(vats):
+        hit = next(({"part": part, "written": words[status]} for part, words_of in parts
+                    if (words := meaning.vat_words(words_of)) and status in words), None)
+        out[status] = hit or {"part": fallback, "written": ""}
+    return out
+
+
+def _kind_anchor(kind: str, parts: list[tuple[str, str]]) -> dict:
+    """The part whose words name the value's kind and those words: the first part that names it whole (a per-area kind
+    also needs its area words), else the first that has the kind's words at all."""
+    for part, words_of in parts:
+        if meaning.kind_attested(kind, words_of):
+            return {"part": part, "written": meaning.kind_written(kind, words_of)}
+    hit = next(({"part": part, "written": words} for part, words_of in parts
+                if (words := meaning.kind_written(kind, words_of))), None)
+    return hit or {"part": parts[0][0] if parts else "paragraph", "written": ""}
+
+
+def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict, dict]:
     """The value's meaning: what the source attests about the number is the source's (and fills what the model left
-    unknown); what it does not is the model's (``model_asserted``); a contradiction is refused."""
+    unknown); what it does not is the model's (``model_asserted``); a contradiction is refused. With the meaning and
+    its provenance, the anchor of each attribute that is the source's — ``{part, written}`` for the period, area
+    basis, VAT and kind (round 12 U9, KTD9): the part of the source that states it and its words; none for one the
+    model asserted."""
     written = taken["written"]
     q: meaning.Qualifiers = taken["qualifiers"]
     out = dict(given)
     prov: dict[str, str] = {}
+    anchors: dict[str, dict] = {}
     units = taken["units"]
     if units and given["unit"] not in units:
         raise ToolError(f"המקור נותן ל-{written} יחידה {', '.join(UNIT_LABELS.get(u, u) for u in sorted(units))}, "
@@ -4395,6 +4433,8 @@ def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict]:
                             + " / ".join(PERIOD_LABELS.get(p, p) for p in sorted(periods))
                             + f", לא {PERIOD_LABELS.get(given['period'], given['period']) or given['period']}")
         prov["period"] = "source"
+        anchors["period"] = {"part": q.part_of("period", out["period"]) or "paragraph",
+                             "written": q.found["period"][out["period"]]}
     else:
         prov["period"] = "model_asserted" if given["period"] in ("month", "year") else "not_stated"
     vats = taken["vat"]
@@ -4405,6 +4445,7 @@ def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict]:
             raise ToolError(f"המקור נותן ל-{written} " + " / ".join(VAT_LABELS[v] for v in sorted(vats))
                             + f", לא {VAT_LABELS.get(given['vat']) or given['vat']}")
         prov["vat"] = "source"
+        anchors["vat"] = (taken.get("vat_from") or {}).get(out["vat"]) or {"part": "paragraph", "written": ""}
     else:
         prov["vat"] = "model_asserted" if given["vat"] in ("included", "excluded") else "not_stated"
     bases = q.found.get("basis", {})
@@ -4420,10 +4461,14 @@ def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict]:
         else:
             out["area_basis"] = meaning.display(" ".join(bases.values()))
         prov["area_basis"] = "source"
+        anchors["area_basis"] = {"part": q.part_of("basis", next(iter(bases))) or "paragraph",
+                                 "written": out["area_basis"]}
     else:
         prov["area_basis"] = "model_asserted" if said else "not_stated"
     prov["kind"] = "source" if meaning.kind_attested(given["kind"], taken["kind_context"]) else "model_asserted"
-    return out, prov
+    if prov["kind"] == "source":
+        anchors["kind"] = _kind_anchor(given["kind"], taken.get("kind_parts") or [("paragraph", taken["kind_context"])])
+    return out, prov, anchors
 
 
 def _section_said(path: tuple) -> Attribution | None:
@@ -4508,20 +4553,20 @@ def _given_meaning(meaning_: dict | None) -> dict:
     return given
 
 
-def _settle(taken: dict, given: dict, path: tuple) -> tuple[dict, dict, dict, Attribution | None]:
+def _settle(taken: dict, given: dict, path: tuple) -> tuple[dict, dict, dict, Attribution | None, dict]:
     """The value's meaning and attribution from what its source gave (``taken``, with the section path of the block
-    holding it) and the model's meaning: ``(fields, provenance, who, said)``. The same for a fresh take and for a
+    holding it) and the model's meaning: ``(fields, provenance, who, said, anchors)``. The same for a fresh take and for a
     cached value's facts (KTD12), so a reused value is checked exactly as a fresh one."""
-    fields, prov = _settle_meaning(taken, given)
+    fields, prov, anchors = _settle_meaning(taken, given)
     said = taken.get("said") or _section_said(path)
     context = "\n".join([taken.get("context") or "", *path])
     who, prov_who = _settle_attribution(given, said, context)
-    return fields, prov | prov_who, who, said
+    return fields, prov | prov_who, who, said, anchors
 
 
 def _new_value(ws: Workspace, src: Source, sid: str, taken: dict, settled: tuple, given: dict, label: str,
                path: tuple, reading_id: str | None) -> calc.Value:
-    fields, prov, who, said = settled
+    fields, prov, who, said, anchors = settled
     where = taken["locator"]
     default = (f"{where['row']} — {where['column']}" if "row" in where
                else f"{VALUE_KINDS[fields['kind']]} {fields.get('subject') or ''}".strip())
@@ -4533,7 +4578,7 @@ def _new_value(ws: Workspace, src: Source, sid: str, taken: dict, settled: tuple
                        taken["table"], "approx" in taken["qualifiers"].keys("approx"),
                        section=" › ".join(path), stated_by=who["stated_by"], stance=who["stance"],
                        scenario=who["scenario"], attribution=said.evidence if said is not None else "",
-                       meaning_from=dict(taken.get("meaning_from") or {}), scale=int(taken.get("scale") or 1))
+                       meaning_from=dict(taken.get("meaning_from") or {}) | anchors, scale=int(taken.get("scale") or 1))
     ws.values[value.vid] = value
     return value
 
@@ -4729,7 +4774,7 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
         stub = {k: v for k, v in stub.items() if k != "row"} | extra | {
             "kind": "cell" if cell else "quote", "reading_id": value.reading_id}
         if value.meaning_from:  # where its meaning is stated: a cell's header is anchored with the cell (R10)
-            stub["context"] = dict(value.meaning_from)
+            stub["context"] = {k: (v["part"] if isinstance(v, dict) else v) for k, v in value.meaning_from.items()}
         if pages:
             stub["pages"] = pages
         ws.anchors[value.vid] = stub
@@ -4782,7 +4827,10 @@ def _facts_json(taken: dict, path: tuple) -> dict:
     said = taken.get("said")
     return {"written": taken["written"], "value": str(taken["value"]), "forms": sorted(taken["forms"]),
             "quote": taken["quote"], "qualifiers": {k: dict(v) for k, v in taken["qualifiers"].found.items()},
-            "units": sorted(taken["units"]), "vat": sorted(taken["vat"]), "kind_context": taken["kind_context"],
+            "qualifier_parts": {k: dict(v) for k, v in taken["qualifiers"].parts.items()},
+            "units": sorted(taken["units"]), "vat": sorted(taken["vat"]),
+            "vat_from": {k: dict(v) for k, v in (taken.get("vat_from") or {}).items()},
+            "kind_context": taken["kind_context"], "kind_parts": [list(x) for x in taken.get("kind_parts") or []],
             "locator": dict(taken["locator"]), "total": bool(taken["total"]),
             "table": list(taken["table"]) if taken.get("table") else None,
             "said": ({"stances": sorted(said.stances), "stated_by": said.stated_by, "evidence": said.evidence}
@@ -4795,8 +4843,12 @@ def _facts_from_json(d: dict) -> tuple[dict, tuple]:
     """The facts of ``_facts_json`` back as ``take_value``'s ``taken``, and the section path."""
     said = d.get("said")
     taken = {"written": d["written"], "value": Decimal(d["value"]), "forms": frozenset(d["forms"]),
-             "quote": d["quote"], "qualifiers": meaning.Qualifiers({k: dict(v) for k, v in d["qualifiers"].items()}),
-             "units": set(d["units"]), "vat": set(d["vat"]), "kind_context": d["kind_context"],
+             "quote": d["quote"],
+             "qualifiers": meaning.Qualifiers({k: dict(v) for k, v in d["qualifiers"].items()},
+                                              {k: dict(v) for k, v in (d.get("qualifier_parts") or {}).items()}),
+             "units": set(d["units"]), "vat": set(d["vat"]),
+             "vat_from": {k: dict(v) for k, v in (d.get("vat_from") or {}).items()},
+             "kind_context": d["kind_context"], "kind_parts": [tuple(x) for x in d.get("kind_parts") or []],
              "locator": dict(d["locator"]), "total": bool(d["total"]),
              "table": tuple(d["table"]) if d.get("table") else None,
              "said": (Attribution(frozenset(said["stances"]), said["stated_by"], said["evidence"])
@@ -4811,12 +4863,18 @@ def _cache_record(value: calc.Value) -> dict:
     provenance; a field the model asserted, and the label, subject and role it named, are left out."""
     pub = value.public()
     record = {k: pub[k] for k in RECORD_FIELDS}
+    # the anchors of the attributes the source states (round 12 U9): never one of a field the model asserted
+    record["meaning_from"] = {k: v for k, v in pub["meaning_from"].items()
+                              if not isinstance(v, dict) or value.provenance.get(k) == "source"}
     record |= {f: pub[f] for f in SOURCE_FIELDS if value.provenance.get(f) == "source"}
     record["provenance"] = {k: p for k, p in value.provenance.items() if p == "source"}
     return record
 
 
-VALUE_VERIFIER_VERSION = "value-v3"  # v3: scoped table periods and clearly read governing currency as well as scale
+# v3: scoped table periods and clearly read governing currency as well as scale; v4 (round 12 U9, KTD9): the anchor
+# {part, written} of each source attribute in the record and the part of each qualifier in the facts — a v3 row is
+# inert (neither listed nor reused), never deleted
+VALUE_VERIFIER_VERSION = "value-v4"
 
 
 def _cache_doc(value: calc.Value, taken: dict, path: tuple, stub: dict | None, src: Source,

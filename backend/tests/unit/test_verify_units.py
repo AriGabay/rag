@@ -1264,3 +1264,16 @@ def test_a_unit_that_is_only_the_unstated_number_is_removed_whole_without_a_judg
     a = _answer("גובה הבניין 99 מטר [S1].")
     r = verify_answer(_judge(lambda t: "supported"), a, _ws(AREA_SOURCE), "?", usage)
     assert usage == [] and r.removed_units() == {0} and r.removals()[0].check == "unstated_number"
+
+
+# --- a model-written period or basis of a registered value backs no claim (round 12 U9, AE5, R6) ------------------
+
+_RENT_QUOTE = "שכר דירה 5,000 ₪"
+
+
+@pytest.mark.parametrize("provenance,blocking", [({"period": "model_asserted"}, True), ({"period": "source"}, False)])
+def test_a_period_claim_on_a_registered_value_is_blocking_only_when_the_model_alone_gave_the_period(provenance, blocking):
+    ws = _registered("5,000", _RENT_QUOTE, period="month", provenance=provenance)
+    problems = verify.deterministic(split_units("שכר הדירה הוא 5,000 ₪ לחודש [V1]."), ws, "?")
+    assert [(p.check, p.failure_kind) for p in problems if p.check == "meaning"] == (
+        [("meaning", "wrong_unit")] if blocking else [])

@@ -137,6 +137,24 @@ def test_a_value_verified_by_older_rules_is_rechecked_before_reuse(office):
     assert "Q1" in T.tool_find_measurements(workspace(office, office.emp), "הכנסות")
 
 
+def test_a_value_v3_cache_row_is_inert_and_a_fresh_take_writes_value_v4(office):
+    """Round 12 U9, KTD9: the per-attribute anchors changed what a cached value records, so a row of the earlier
+    verifier is neither listed nor reused, is not deleted, and the next fresh take stores the value again as v4."""
+    _take_total_income(workspace(office, office.emp), office)
+    (row,) = _rows(office)
+    assert row.value["verifier_version"] == "value-v4" == T.VALUE_VERIFIER_VERSION
+    assert row.value["record"]["meaning_from"].get("vat", {}).get("part")  # the anchor of the table's VAT note
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE verified_values SET value = jsonb_set(value, '{verifier_version}', '\"value-v3\"')"))
+    stale = workspace(office, office.emp)
+    assert "Q1" not in T.tool_find_measurements(stale, "הכנסות")
+    assert len(_rows(office)) == 1 and _rows(office)[0].value["verifier_version"] == "value-v3"  # nothing deleted
+    assert _take_total_income(workspace(office, office.emp), office).startswith("V1 נרשם")
+    (row,) = _rows(office)
+    assert row.value["verifier_version"] == "value-v4"
+    assert "Q1" in T.tool_find_measurements(workspace(office, office.emp), "הכנסות")
+
+
 def test_a_cached_value_of_a_document_no_longer_visible_is_not_listed_or_used(office):
     _take_total_income(workspace(office, office.emp), office)
     ws = workspace(office, office.other)
