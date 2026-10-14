@@ -5734,16 +5734,17 @@ def round10_documents() -> list[dict[str, Any]]:
     return docs
 
 
-def render_round10_docx(blocks: list[Round10Block], title: str) -> bytes:
+def render_round10_docx(blocks: list[Round10Block], title: str, mark: str = ROUND10_MARK) -> bytes:
     """A DOCX of the blocks: Word heading styles (so the reader finds the structure), right-to-left paragraphs, the test
-    mark in the header and the footer of every page, fixed properties (byte-stable output)."""
+    mark in the header and the footer of every page, fixed properties (byte-stable output). Round 11 renders its documents
+    with the same function and its own ``mark``."""
     from docx import Document
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.oxml import OxmlElement
 
     doc = Document()
     cp = doc.core_properties
-    cp.title = f"{ROUND10_MARK} - {title}"
+    cp.title = f"{mark} - {title}"
     cp.author = "synthetic fixture generator"
     cp.last_modified_by = "synthetic fixture generator"
     cp.created = FIXED_TS.replace(tzinfo=None)
@@ -5752,7 +5753,7 @@ def render_round10_docx(blocks: list[Round10Block], title: str) -> bytes:
     section = doc.sections[0]
     for part in (section.header, section.footer):
         p = part.paragraphs[0]
-        p.text = ROUND10_MARK
+        p.text = mark
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         _rtl_paragraph(p)
 
@@ -5827,11 +5828,203 @@ def write_round10(out: Path) -> None:
     print(f"wrote {ROUND10_DIR}/{ROUND10_MANIFEST} ({len(text_):,} chars)")
 
 
+# --------------------------------------------------------------------------- round 11 (a recency preference: several
+# synthetic appraisals of one property at different valuation dates, each written on a later, different report date; a
+# comparables table with its own row dates and one without; a forecast sentence; an appraisal with no valuation date; a
+# different property on the same street; rents of one address that differ in period and VAT)
+#
+# All DOCX, rendered by ``render_round10_docx`` with the round-11 mark. The two synthetic standard editions are NOT
+# re-rendered: the manifest references the round-10 files (``reused_from: round10``), so their bytes and their text are
+# the round-10 ones. Every document's first line says it is a synthetic test document. Every fact below is stated once, in
+# a spec, and both the document text and the manifest are derived from that spec (never read back from the files).
+
+ROUND11_DIR = "round11"
+ROUND11_MANIFEST = "manifest.json"
+ROUND11_MARK = "מסמך בדיקה סינתטי — נתונים בדויים לבדיקת המערכת בלבד"
+ROUND11_PLACE = ROUND10_PLACE
+ROUND11_STREET = "הצאלון"
+ROUND11_BLOCK = "7101"
+
+# a spec: the facts one document states. dates are (text as written, ISO date or ISO month); amounts are ints (₪).
+ROUND11_APPRAISALS: list[dict[str, Any]] = [
+    {"key": "hatzalon7_a", "file": f"שומה_רחוב_הצאלון_7_{ROUND11_PLACE}_א.docx", "number": "7", "parcel": "15",
+     "valuation": ("10/03/2022", "2022-03-10"), "report": ("28/03/2022", "2022-03-28"),
+     "value": 1950000, "area": 95, "rents": [{"amount": 5200, "period": "month", "vat": "excluded"}]},
+    {"key": "hatzalon7_b", "file": f"שומה_רחוב_הצאלון_7_{ROUND11_PLACE}_ב.docx", "number": "7", "parcel": "15",
+     "valuation": ("15/06/2024", "2024-06-15"), "report": ("05/02/2025", "2025-02-05"),
+     "value": 2280000, "area": 95, "rents": [{"amount": 6100, "period": "month", "vat": "excluded"}],
+     "comparables": [
+         {"title": "עסקאות השוואה", "dated": True, "rows": [
+             {"address": "רחוב האלון 3", "date": ("11/2023", "2023-11"), "price": 1870000, "area": 90},
+             {"address": "רחוב הרימון 8", "date": ("02/2024", "2024-02"), "price": 2020000, "area": 92},
+             {"address": "רחוב הברושים 14", "date": ("04/2024", "2024-04"), "price": 2140000, "area": 97}]},
+         {"title": "נכסי השוואה נוספים", "dated": False, "rows": [
+             {"address": "רחוב התאנה 5", "date": None, "price": 1990000, "area": 93},
+             {"address": "רחוב השקד 21", "date": None, "price": 2110000, "area": 96}]}],
+     "forecast": {"year": 2027, "amount": 6900,
+                  "text": "דמי השכירות צפויים לעמוד ב-2027 על 6,900 ₪ לחודש."}},
+    {"key": "hatzalon7_c", "file": f"שומה_רחוב_הצאלון_7_{ROUND11_PLACE}_ג.docx", "number": "7", "parcel": "15",
+     "valuation": ("20/01/2025", "2025-01-20"), "report": ("10/03/2025", "2025-03-10"),
+     "value": 2410000, "area": 95, "rents": [{"amount": 6400, "period": "month", "vat": "excluded"}]},
+    {"key": "hatzalon7_undated", "file": f"שומה_רחוב_הצאלון_7_{ROUND11_PLACE}_ד.docx", "number": "7", "parcel": "15",
+     "valuation": None, "report": ("18/02/2025", "2025-02-18"),
+     "value": 2150000, "area": 95, "rents": [{"amount": 5700, "period": "month", "vat": "excluded"}]},
+    {"key": "hatzalon11", "file": f"שומה_רחוב_הצאלון_11_{ROUND11_PLACE}.docx", "number": "11", "parcel": "16",
+     "valuation": ("01/09/2024", "2024-09-01"), "report": ("20/09/2024", "2024-09-20"),
+     "value": 2730000, "area": 118, "rents": [{"amount": 7000, "period": "month", "vat": "excluded"}]},
+]
+
+# AE4: two opinions on the proper rent of the same address that differ in period and VAT (no value is stated in them)
+ROUND11_RENT_CASES: list[dict[str, Any]] = [
+    {"key": "rent_monthly_with_vat", "file": f"חוות_דעת_דמי_שכירות_רחוב_הצאלון_7_{ROUND11_PLACE}_א.docx", "number": "7",
+     "parcel": "15", "valuation": ("01/07/2024", "2024-07-01"), "report": ("14/07/2024", "2024-07-14"), "value": None,
+     "area": 95, "rents": [{"amount": 6600, "period": "month", "vat": "included"}]},
+    {"key": "rent_yearly_without_vat", "file": f"חוות_דעת_דמי_שכירות_רחוב_הצאלון_7_{ROUND11_PLACE}_ב.docx", "number": "7",
+     "parcel": "15", "valuation": ("01/09/2024", "2024-09-01"), "report": ("15/09/2024", "2024-09-15"), "value": None,
+     "area": 95, "rents": [{"amount": 75600, "period": "year", "vat": "excluded"}]},
+]
+
+_ROUND11_PERIOD = {"month": "לחודש", "year": "לשנה"}
+_ROUND11_VAT = {"included": "כולל מע״מ", "excluded": "לא כולל מע״מ"}
+
+
+def _round11_money(amount: int) -> str:
+    return f"{amount:,}"
+
+
+def round11_rent_line(rent: dict[str, Any]) -> str:
+    """The sentence a document states one rent in: amount, period and VAT basis, in the order the header lines use."""
+    return f"דמי שכירות ראויים: {_round11_money(rent['amount'])} ₪ {_ROUND11_PERIOD[rent['period']]}, {_ROUND11_VAT[rent['vat']]}"
+
+
+def round11_document_blocks(spec: dict[str, Any]) -> list[Round10Block]:
+    """The blocks of one round-11 document, derived from its spec: a header of ``label: value`` lines (the valuation date
+    only when the spec has one, always a later report date), a value stated as the appraiser's adopted conclusion (only
+    when the spec has one), the rents, and, when the spec has them, comparables tables and a forecast sentence."""
+    street, number = ROUND11_STREET, spec["number"]
+    is_rent_case = spec["value"] is None
+    heading = "חוות דעת בדבר דמי שכירות" if is_rent_case else "שומת מקרקעין"
+    blocks: list[Round10Block] = [
+        ("mark", ROUND11_MARK),
+        ("p", SYNTHETIC_MARKER),
+        ("title", f"{heading} — רחוב {street} {number}, {ROUND11_PLACE}"),
+        ("p", f"עיר: {ROUND11_PLACE}"),
+        ("p", f"כתובת הנכס: {street} {number}"),
+        ("p", f"גוש: {ROUND11_BLOCK} חלקה: {spec['parcel']}"),
+        ("p", "סוג נכס: דירה"),
+    ]
+    if spec["valuation"]:
+        blocks.append(("p", f"המועד הקובע: {spec['valuation'][0]}"))
+    blocks.append(("p", f"תאריך עריכת השומה: {spec['report'][0]}"))
+    blocks.append(("p", f"שטח הנכס: {spec['area']} מ״ר נטו"))
+    if spec["value"] is not None:
+        blocks.append(("p", f"שווי הנכס: {_round11_money(spec['value'])} ₪"))
+        blocks.append(("p", "בסיס מע״מ: כולל מע״מ"))
+    blocks += [("p", round11_rent_line(r)) for r in spec["rents"]]
+    blocks += [
+        ("h1", "1. מטרת השומה"),
+        ("p", f"מסמך לנכס בדוי ברחוב {street} {number} ב{ROUND11_PLACE}, לצורכי בדיקות מערכת בלבד."),
+        ("h1", "2. שיקולי השמאי"),
+    ]
+    if spec["value"] is not None:
+        blocks.append(("p", f"השווי נקבע בסך {_round11_money(spec['value'])} ₪ כולל מע״מ, לפי גישת ההשוואה."))
+    else:
+        blocks.append(("p", "דמי השכירות נקבעו לפי שכירויות דומות בסביבת הנכס."))
+    for n, table in enumerate(spec.get("comparables", []), start=1):
+        blocks.append(("h2", f"2.{n} {table['title']}"))
+        if table["dated"]:
+            rows = [["כתובת", "תאריך עסקה", "מחיר (₪)", "שטח (מ״ר)"]]
+            rows += [[r["address"], r["date"][0], _round11_money(r["price"]), str(r["area"])] for r in table["rows"]]
+        else:
+            rows = [["כתובת", "מחיר (₪)", "שטח (מ״ר)"]]
+            rows += [[r["address"], _round11_money(r["price"]), str(r["area"])] for r in table["rows"]]
+        blocks.append(("table", rows))
+    if spec.get("forecast"):
+        blocks.append(("h1", "3. תחזית"))
+        blocks.append(("p", spec["forecast"]["text"]))
+    return blocks
+
+
+def round11_documents() -> list[dict[str, Any]]:
+    """Every round-11 document that is rendered under round11/ (the standards are referenced, not rendered)."""
+    docs = []
+    for spec in ROUND11_APPRAISALS + ROUND11_RENT_CASES:
+        docs.append({**spec, "kind": "appraisal", "title": _title_of(spec["file"]),
+                     "blocks": round11_document_blocks(spec)})
+    return docs
+
+
+def _round11_facts(d: dict[str, Any]) -> dict[str, Any]:
+    """What one document states, for the manifest, derived from its spec: the ground truth the tests assert."""
+    value = None if d["value"] is None else {"amount": d["value"], "text": _round11_money(d["value"]),
+                                              "vat": "included", "adopted_conclusion": True}
+    comparables = []
+    for table in d.get("comparables", []):
+        comparables.append({"title": table["title"], "has_date_column": table["dated"], "rows": [
+            {"address": r["address"], "date_text": r["date"][0] if r["date"] else None,
+             "date": r["date"][1] if r["date"] else None, "precision": "month" if r["date"] else None,
+             "price": r["price"], "area": r["area"]} for r in table["rows"]]})
+    return {
+        "key": d["key"], "file": f"{ROUND11_DIR}/{d['file']}", "title": d["title"], "source_kind": d["kind"],
+        "property": {"street": ROUND11_STREET, "number": d["number"], "city": ROUND11_PLACE, "block": ROUND11_BLOCK,
+                     "parcel": d["parcel"], "address": f"{ROUND11_STREET} {d['number']}, {ROUND11_PLACE}"},
+        "valuation_date": d["valuation"][1] if d["valuation"] else None,
+        "valuation_date_text": d["valuation"][0] if d["valuation"] else None,
+        "report_date": d["report"][1], "report_date_text": d["report"][0],
+        "value": value,
+        "area": {"amount": d["area"], "unit": "מ״ר", "basis": "net"},
+        "rents": [{**r, "text": round11_rent_line(r)} for r in d["rents"]],
+        "comparables": comparables,
+        "forecast": d.get("forecast"),
+        "paragraphs": [t for k, t in d["blocks"] if k in ("mark", "p")],
+    }
+
+
+def _round11_reused_standards() -> dict[str, dict[str, Any]]:
+    """The two round-10 synthetic standard editions, referenced as they are (their files stay under round10/)."""
+    out = {}
+    for d in round10_documents():
+        if d["key"] in ("standard_ed1", "standard_ed2"):
+            out[d["key"]] = {"key": d["key"], "file": f"{ROUND10_DIR}/{d['file']}", "title": d["title"],
+                             "source_kind": d["kind"], "reused_from": ROUND10_DIR, "states": d["states"]}
+    return out
+
+
+def write_round11(out: Path) -> None:
+    """Writes the round-11 fixtures and ``manifest.json``: per document its file, title, source kind, valuation and report
+    dates, value, area, rents, comparables with their dates and forecast, all from the generator's own spec (never read
+    back). The two standards are referenced from round10/ and not re-rendered."""
+    rdir = out / ROUND11_DIR
+    rdir.mkdir(parents=True, exist_ok=True)
+    docs: dict[str, dict[str, Any]] = {}
+    for d in round11_documents():
+        data = render_round10_docx(d["blocks"], d["title"], mark=ROUND11_MARK)
+        (rdir / d["file"]).write_bytes(data)
+        print(f"wrote {ROUND11_DIR}/{d['file']} ({len(data):,} bytes)")
+        docs[d["key"]] = _round11_facts(d)
+    docs.update(_round11_reused_standards())
+    manifest = {
+        "about": f"{ROUND11_MARK}. Known contents of the round-11 fixtures (three appraisals of one invented property at "
+                 "three valuation dates, each written on a later report date; the 2024 one holds a dated and an undated "
+                 "comparables table and a forecast sentence; an appraisal with no valuation date; an appraisal of a "
+                 "different property on the same street; two rent opinions of the first property that differ in period "
+                 "and VAT); generated by scripts/generate_fixtures.py --only round11 from the generator's own text (never "
+                 "read back from the files) - do not edit by hand. The two synthetic standard editions are the round-10 "
+                 "files, referenced (reused_from). Every name, address, block, parcel and amount is invented.",
+        "synthetic_marker": ROUND11_MARK,
+        "property": f"{ROUND11_STREET} 7, {ROUND11_PLACE}",
+        "documents": docs,
+    }
+    text_ = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+    (rdir / ROUND11_MANIFEST).write_text(text_, encoding="utf-8")
+    print(f"wrote {ROUND11_DIR}/{ROUND11_MANIFEST} ({len(text_):,} chars)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--font-dir", default=DEFAULT_FONT_DIR)
     parser.add_argument("--out", default="tests/fixtures")
-    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9", "round10"],
+    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9", "round10", "round11"],
                         default="all",
                         help="regions: write only the uncovered-region fixtures (tests/fixtures/regions/); "
                              "positions: only the page-position fixtures (tests/fixtures/positions/); "
@@ -5840,7 +6033,9 @@ def main() -> None:
                              "round8: only the round-8 fixtures and their manifest (tests/fixtures/round8/); "
                              "round9: only the round-9 fixtures and their manifest (tests/fixtures/round9/); "
                              "round10: only the round-10 fixtures (DOCX, no font needed) and their manifest "
-                             "(tests/fixtures/round10/)")
+                             "(tests/fixtures/round10/); "
+                             "round11: only the round-11 multi-date fixtures (DOCX) and their manifest "
+                             "(tests/fixtures/round11/)")
     args = parser.parse_args()
     font_dir = Path(args.font_dir)
     out = Path(args.out)
@@ -5865,6 +6060,9 @@ def main() -> None:
         return
     if args.only == "round10":
         write_round10(out)
+        return
+    if args.only == "round11":
+        write_round11(out)
         return
 
     docs: dict[str, dict[str, Any]] = {}
@@ -5916,6 +6114,7 @@ def main() -> None:
     write_round8(out, font_dir)
     write_round9(out, font_dir)
     write_round10(out)
+    write_round11(out)
 
 
 if __name__ == "__main__":
