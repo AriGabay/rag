@@ -1104,3 +1104,20 @@ def test_units_of_a_group_the_user_cannot_see_are_never_candidates(db):
         m = units_matching(conn, "נחל הדס")
     assert m.documents == [] and m.comparables == [] and m.split == []
     assert [d for d in _matches(a, "נחל הדס").documents] != []
+
+
+# --- the opt-in window (round 11 U8, KTD6) ------------------------------------------------------------------------------
+
+def test_the_window_reads_the_fused_ranking_to_the_candidate_depth_and_default_callers_are_unchanged(db):
+    from app.platform.search import CANDIDATES, SearchScope, search_evidence, search_passages
+
+    a = make_office(db, "משרד א", "a@example.test")
+    for n in range(CANDIDATES + 5):  # more matching documents than the depth, so the depth is what limits the window
+        add_chunks(a, a.default_group_id, [f"עסקת השוואה מספר {n} נמכרה במחיר גבוה"], f"{n + 1:064x}")
+    scope = SearchScope(source_kinds=("appraisal",))
+    with tenant_tx(a.ctx()) as conn:
+        shown = search_passages(conn, "עסקת השוואה נמכרה", 6, scope=scope)
+        window = search_passages(conn, "עסקת השוואה נמכרה", 6, scope=scope, window=True)
+        evidence = search_evidence(conn, ["עסקת השוואה נמכרה"], 6, scope=scope)
+    assert len(shown) <= 6 and len(evidence.hits) <= 6, "a caller that does not ask gets the limit as it always did"
+    assert len(window) > 6 and len(window) <= CANDIDATES

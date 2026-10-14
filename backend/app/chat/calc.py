@@ -1146,6 +1146,10 @@ class Value:
     # the scale its source states it in (``stated_scale``, R14): 1,000 for a cell of a table "(באלפי ₪)" — the amount
     # is value × scale; 1 when the source states none
     scale: int = 1
+    # the date it refers to (round 11 U8, KTD4; ``dates.AsOf``): {date, precision, end, provenance, forecast, locator}, resolved by
+    # the server from the value's own row or sentence, its table's range, or its unit's valuation date; None when the
+    # sources give none. A forecast with no date is ``{"date": None, ..., "forecast": True}``: the wording alone marks it
+    as_of: dict | None = None
 
     @property
     def certainty(self) -> str:
@@ -1175,7 +1179,8 @@ class Value:
                 "stated_by": self.stated_by, "stance": self.stance, "scenario": self.scenario,
                 "attribution": self.attribution, "meaning_from": dict(self.meaning_from), "reading": self.reading,
                 "reading_note": self.reading_note, "context": dict(self.context) if self.context else None,
-                "subject_from": self.subject_from, "scale": self.scale}
+                "subject_from": self.subject_from, "scale": self.scale,
+                "as_of": dict(self.as_of) if self.as_of else None}
 
 
 @dataclass

@@ -133,6 +133,7 @@ calculation component compares them (``allowed_contexts``). A file with one cont
 
 from __future__ import annotations
 
+import calendar
 import json
 import logging
 import math
@@ -140,6 +141,7 @@ import re
 import time
 from collections.abc import Callable, Container
 from dataclasses import dataclass, field, replace
+from datetime import date
 from decimal import Decimal
 from itertools import islice
 from typing import Any
@@ -149,6 +151,7 @@ from sqlalchemy import Connection, text
 
 from app.answering.verify import numbers_in
 from app.chat import anchors, calc, contexts, meaning, reader
+from app.chat import dates as chat_dates
 from app.chat import unread as unread_text
 from app.chat.contexts import MSG_NO_TITLE
 from app.chat.evidence import TABLE_SIZE_PREFIX
@@ -302,6 +305,9 @@ class Source:
     # example, alternative and exception wording}, read from the stored section structure when the passage was
     # returned; the verifier's evidence for it. None for an appraisal and for a passage in no section
     rules: dict | None = None
+    # the date line of a hit of an appraisal (round 11 U8, KTD6): "למועד הקובע 15/04/2025" — the valuation date of the unit
+    # holding the passage — or "מועד לא ידוע"; shown in the source's header whatever the time mode
+    date_line: str | None = None
 
     @property
     def is_listing(self) -> bool:
@@ -315,7 +321,7 @@ class Source:
                "table_index": self.table_index, "page_list": self.page_list, "reading_id": self.reading_id,
                "status": self.status, "clipped": self.clipped, "unread_regions": len(self.unread_regions),
                "more": self.resume, "method": self.method, "row_index": self.row_index,
-               "source_kind": self.source_kind, "standard": self.standard}
+               "source_kind": self.source_kind, "standard": self.standard, "date_line": self.date_line}
         if self.context:
             out["context"] = self.context
         if self.unit:
@@ -335,6 +341,9 @@ class Measurement:
     row: Any
     listings: set = field(default_factory=set)  # the find_measurements listings that returned it
     context: dict | None = None  # its appraisal context in a file holding several (KTD7), from its block
+    # the date it refers to (round 11 U8, KTD4; ``dates.measurement_as_of``): the stored date counts only when the quote holds
+    # it; None when unknown. A forecast with no date is ``{"date": None, ..., "forecast": True}``
+    as_of: dict | None = None
 
     def public(self) -> dict:
         r = self.row
@@ -348,7 +357,8 @@ class Measurement:
                 # optional (KTD8): who stated it and how, only as its text attested at extraction
                 "stated_by": getattr(r, "stated_by", None), "stance": getattr(r, "stance", None),
                 # the unit its block is in, in a file holding several (round 9 U9, R10)
-                "unit_id": self.context["unit_id"] if self.context else None}
+                "unit_id": self.context["unit_id"] if self.context else None,
+                "as_of": dict(self.as_of) if self.as_of else None}
 
 
 def anchor_lost(row) -> bool:
@@ -418,6 +428,11 @@ class Workspace:
     # from the question and the user message's recorded state: what the tools' ranking reads (U8). It is the turn's own: no
     # slot, intent or pool is set from it (R16)
     time: TimeMode = field(default_factory=TimeMode)
+    # the valuation dates and units read for the turn's ranking and date lines (``dates.valuation_dates``'s ``cache``)
+    date_cache: dict = field(default_factory=dict)
+    # a caller whose group of results is capped by contract (search-only mode: at most 5 appraisal passages) keeps the pass
+    # limit exact: a time mode orders the relevant documents but never returns more hits than the limit (round 11 U8)
+    exact_limit: bool = False
     # a document question's named documents (round 10 U8): the only documents its searches read (``tool_search``)
     named_documents: tuple[str, ...] = ()
     # version id -> (source kind, what its profile states) for a professional version, False for an appraisal (the
@@ -799,6 +814,8 @@ def _render_source(s: Source) -> str:
         tags += f' subject="{_attr(s.subject)}"'
     if s.unit:  # its stable unit id (version, reading, number), beside the turn's handle in the tags (round 9 U9)
         tags += f' unit_id="{_attr(s.unit["id"])}"'
+    if s.date_line:  # the valuation date of the unit holding the passage, or that it is unknown (round 11 U8, KTD6)
+        tags += f' date="{_attr(s.date_line)}"'
     if s.status:  # a reading: how complete it is, the reading it is of, and how to read on
         tags += (f' status="{s.status}" version_id="{s.version_id}" reading_id="{_attr(s.reading_id)}"'
                  + (f' more="{s.more}"' if s.more else ""))
@@ -1408,20 +1425,175 @@ def _plan(ws: Workspace, conn: Connection, pool: str | None, limit: int) -> tupl
     return passes, notes, named
 
 
+# --- the date of a datum and the order of a time mode (round 11 U8: R4, R6, R7, R12; KTD6, KTD7) ------------------------------
+#
+# The turn's time mode (``Workspace.time``, set once per turn by the engine) decides how documents, values and measurements
+# are ordered. ``recent``: the data dated not later than the turn's anchor date, newest first; then what is later-dated or
+# worded as a forecast; then the unknown, in relevance order. ``explicit``: the data inside the requested time first (an
+# inclusive range, by the precision of both dates), then the nearest to it, then the unknown. ``none``: no preference —
+# today's order; the dates are still shown (R3). An unknown date is never guessed (R6), and ties keep their relevance order.
+
+MSG_DATE_VALUATION = "למועד הקובע {date}"
+MSG_DATE_UNKNOWN = "מועד לא ידוע"
+MSG_DATE_CONFLICT = "מועד לא ידוע (בחלק הזה של המסמך כמה מועדים קובעים שונים: {dates})"
+MSG_DATUM_DATE = "מועד הנתון: {date} ({how})"
+MSG_DATUM_DATE_UNKNOWN = "מועד הנתון: מועד לא ידוע (המקור אינו נותן אותו)"
+MSG_FORECAST = "תחזית או אומדן לעתיד — אינו נתון שנמדד ואינו הנתון העדכני"
+DATUM_DATE_HOW = {chat_dates.SOURCE: "כתוב בשורה או במשפט של הנתון", chat_dates.SOURCE_TABLE: "טווח שבכותרת הטבלה",
+                  chat_dates.UNIT_VALUATION: "המועד הקובע של היחידה שהנתון הוא מסקנתה"}
+NO_VALUATION = chat_dates.UnitValuation("none", None, (), None)
+
+
+def shown_date(iso: str, precision: str) -> str:
+    """A date in the precision it was given: DD/MM/YYYY, MM/YYYY or YYYY (a month is never shown as a day)."""
+    y, m, d = (iso.split("-") + [None, None])[:3]
+    return f"{d}/{m}/{y}" if precision == "day" else f"{m}/{y}" if precision == "month" else y
+
+
+def valuation_line(uv: chat_dates.UnitValuation) -> str:
+    """The date line of a passage: its unit's valuation date, or that it is unknown (a conflict shows every date)."""
+    if uv.status == "stated" and uv.date is not None:
+        return MSG_DATE_VALUATION.format(date=shown_date(uv.date.iso, uv.date.precision))
+    if uv.status == "conflict":
+        return MSG_DATE_CONFLICT.format(dates=", ".join(dict.fromkeys(shown_date(d.iso, d.precision) for d in uv.dates)))
+    return MSG_DATE_UNKNOWN
+
+
+def valuation_of(ws: Workspace, conn: Connection, version_id, block_index: int | None) -> chat_dates.UnitValuation:
+    """The valuation of the unit that holds a block (unknown for a block no chunk or row places)."""
+    if block_index is None:
+        return NO_VALUATION
+    return chat_dates.unit_valuation(conn, version_id, block_index, cache=ws.date_cache)
+
+
+def datum_line(as_of: dict | None) -> str:
+    """What a value or measurement reports about its date: the date and where it came from, or that it is unknown, and
+    that it is a forecast when it is worded as one (R7)."""
+    if as_of is None or as_of.get("date") is None:
+        out = MSG_DATUM_DATE_UNKNOWN
+    else:
+        shown = shown_date(as_of["date"], as_of["precision"])
+        if as_of.get("end"):
+            shown = f"{shown}–{shown_date(as_of['end'], as_of['precision'])}"
+        out = MSG_DATUM_DATE.format(date=shown, how=DATUM_DATE_HOW.get(as_of["provenance"], as_of["provenance"]))
+    return out + (f" | {MSG_FORECAST}" if as_of and as_of.get("forecast") else "")
+
+
+def datum_as_of(ws: Workspace, sentence: str, as_of: dict | None) -> dict | None:
+    """``as_of`` kept as the contract has it, plus the forecast that needs no date: a sentence worded as a forecast with no
+    date found is ``{"date": None, ..., "forecast": True}``, so a forecast is never ranked or shown as measured (R7)."""
+    if as_of is not None:
+        return dict(as_of)
+    if chat_dates.is_forecast(sentence, None, ws.time.anchor):
+        return {"date": None, "precision": None, "end": None, "provenance": None, "forecast": True, "locator": None}
+    return None
+
+
+def _dated(as_of: dict | None) -> tuple[str, str, str | None] | None:
+    """(date, precision, end) of an ``as_of``, None when it holds no date (unknown, or a forecast with no date)."""
+    return None if as_of is None or as_of.get("date") is None else (as_of["date"], as_of["precision"], as_of.get("end"))
+
+
+def measurement_date(ws: Workspace, row) -> dict | None:
+    """A stored measurement's ``as_of`` (KTD4): the stored date counts only when the quote holds it; else the date its quote
+    states, or its table's range; a forecast wording marks it even with no date."""
+    return datum_as_of(ws, row.quote, chat_dates.measurement_as_of(
+        row.quote, row.effective_date, table_caption=getattr(row, "caption", None), anchor=ws.time.anchor))
+
+
+def _bounds(iso: str, precision: str) -> tuple[date, date]:
+    """The first and the last day of the period an ISO date (in its precision) names."""
+    parts = [int(x) for x in iso.split("-")]
+    if precision == "year":
+        return date(parts[0], 1, 1), date(parts[0], 12, 31)
+    if precision == "month":
+        return date(parts[0], parts[1], 1), date(parts[0], parts[1], calendar.monthrange(parts[0], parts[1])[1])
+    day = date(*parts)
+    return day, day
+
+
+def _wanted(requested) -> list[tuple[date | None, date | None]]:
+    """The periods the question asks about, as inclusive day bounds (None: open). A comparison asks about two points."""
+    if requested.kind == "compare":
+        return [_bounds(x, requested.precision) for x in (requested.start, requested.end)]
+    return [(_bounds(requested.start, requested.precision)[0] if requested.start else None,
+             _bounds(requested.end, requested.precision)[1] if requested.end else None)]
+
+
+def time_key(time: TimeMode, dated: tuple[str, str, str | None] | None, forecast: bool = False) -> tuple:
+    """The sort key of a datum under the turn's time mode (KTD6): smaller is first. ``dated``: (ISO date, precision, end of
+    a range) or None for an unknown date. Equal keys are not ordered here: the caller's order (relevance, or the id) breaks
+    the tie. A date never makes a datum rank by more than it says: a year is its first day, a range its last period."""
+    if time.mode == "explicit" and time.requested is not None:
+        if dated is None:
+            return (2, 0)
+        iso, precision, end = dated
+        first, last = _bounds(iso, precision)[0], _bounds(end or iso, precision)[1]
+        gap = min(((lo - last).days if lo and last < lo else (first - hi).days if hi and first > hi else 0)
+                  for lo, hi in _wanted(time.requested))
+        return (0, 0) if gap == 0 else (1, gap)
+    if dated is None:
+        return (2, 0)
+    iso, precision, end = dated
+    at = _bounds(end or iso, precision)[0].toordinal()
+    if forecast or chat_dates._later_than(end or iso, precision, time.anchor):
+        return (1, at)
+    return (0, -at)
+
+
+def _time_memo_key(time: TimeMode) -> tuple:
+    """The part of a search memo key the time mode adds (KTD2): the mode and the requested time."""
+    r = time.requested
+    return (time.mode, None if r is None else (r.kind, r.start, r.end, r.precision))
+
+
+def ranked_by_time(ws: Workspace, conn: Connection, hits: list[dict], limit: int) -> list[dict]:
+    """The hits of the fused window, with the relevant documents ordered by the turn's time mode (KTD6, R4, R12). Relevance
+    comes first: the relevant set is the first ``SEARCH_MAX`` distinct documents by the rank of their best passage in the
+    window, and only those are ordered by date — a barely relevant newer document is not lifted above them, and the
+    documents past the set keep their relevance order after it. A document is dated by the valuation date of the unit that
+    holds its best passage; an unknown or conflicting date ranks as unknown. The output covers the best hit of every document
+    of the ordered set (so a small ``limit`` never cuts a relevant dated document, and never more than ``SEARCH_MAX`` hits),
+    then, while room remains under ``max(limit, that count)`` (``limit`` itself for a workspace with ``exact_limit``), the remaining hits: the set's further hits in the same
+    document order (each document's in relevance order), then the hits past the set in relevance order."""
+    if not hits:
+        return hits
+    starts = {r.id: r.block_start for r in conn.execute(text("SELECT id, block_start FROM chunks WHERE id = ANY(:i)"),
+                                                        {"i": [h["chunk_id"] for h in hits]})}
+    by_document: dict[str, list[dict]] = {}
+    for h in hits:
+        by_document.setdefault(str(h["document_id"]), []).append(h)
+    groups = list(by_document.values())
+    relevant, past = groups[:SEARCH_MAX], groups[SEARCH_MAX:]
+    keyed = []
+    for position, group in enumerate(relevant):
+        best = group[0]
+        uv = valuation_of(ws, conn, best["version_id"], starts.get(best["chunk_id"]))
+        dated = (uv.date.iso, uv.date.precision, None) if uv.status == "stated" and uv.date is not None else None
+        keyed.append((time_key(ws.time, dated), position, group))
+    keyed.sort(key=lambda k: k[:2])
+    firsts = [g[0] for *_, g in keyed]
+    further = [h for *_, g in keyed for h in g[1:]] + [h for g in past for h in g]
+    return (firsts + further)[:limit if ws.exact_limit else min(SEARCH_MAX, max(limit, len(firsts)))]
+
+
 # --- tools -----------------------------------------------------------------------------------------------
 
-def memoized_search(ws: Workspace, conn: Connection, query: str, limit: int, scope: SearchScope | None) -> list[dict]:
+def memoized_search(ws: Workspace, conn: Connection, query: str, limit: int, scope: SearchScope | None,
+                    window: bool = False) -> list[dict]:
     """``search_passages`` once per (query, scope, limit) in a turn (R16, KTD3): an identical second search runs no
     search SQL and no embedding. The office's data version is part of the key — read in the caller's transaction, one
-    indexed row — so a document processed, deleted or republished mid-turn is never answered from before it."""
+    indexed row — so a document processed, deleted or republished mid-turn is never answered from before it. So are the
+    turn's time mode and requested time (round 11 KTD2), and whether the fused window was read whole (``window``)."""
     scope_key = None if scope is None else (
         tuple(sorted(map(str, scope.document_ids))), tuple(sorted(map(str, scope.version_ids))),
         scope.include_noncurrent, scope.blocks, tuple(sorted(scope.source_kinds)),
         tuple(sorted(map(str, scope.exclude_versions))))
-    key = (query, scope_key, limit, current_data_version(conn))
+    key = (query, scope_key, limit, current_data_version(conn), _time_memo_key(ws.time), window)
     hits = ws.search_memo.get(key)
     if hits is None:
-        hits = ws.search_memo[key] = search_passages(conn, query, limit, scope=scope)
+        hits = ws.search_memo[key] = (search_passages(conn, query, limit, scope=scope, window=True) if window
+                                      else search_passages(conn, query, limit, scope=scope))
     return [dict(h) for h in hits]
 
 
@@ -1608,7 +1780,13 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 n = limit if absent and p.pool == APPRAISAL_POOL else p.limit
                 left_out = copies_left_out(ws, conn) if p.pool == PROFESSIONAL_POOL and not docs else ()
                 scope = SearchScope(document_ids=tuple(docs), source_kinds=POOL_KINDS[p.pool], exclude_versions=left_out)
-                hits += [h | {"pool": p.pool, "role": p.role} for h in memoized_search(ws, conn, query, n, scope)]
+                if ws.time.mode != "none" and p.pool == APPRAISAL_POOL and p.role == PRIMARY:
+                    # the appraisals that answer: the fused window, its documents ordered by date, then cut (KTD6); the
+                    # professional pool and the examples beside it are read as they always were (R16)
+                    found = ranked_by_time(ws, conn, memoized_search(ws, conn, query, n, scope, window=True), n)
+                else:
+                    found = memoized_search(ws, conn, query, n, scope)
+                hits += [h | {"pool": p.pool, "role": p.role} for h in found]
             lookup_unread = not docs
         # a document the query names by its title that was not read has no passages: say so, never "not found" (KTD11)
         named = unread_named(conn, query, ws.unread_files(conn)) if lookup_unread else []
@@ -1662,6 +1840,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 row_index=h.get("row_index") if h["kind"] == "table_row" else None),
                 cx, _hit_contexts(ws, conn, cx, h, bs, be) if cx.multi else [], ws)
             src.label = _label_of(src, cx, h["pool"], h["role"], ws.intent)
+            src.date_line = valuation_line(valuation_of(ws, conn, h["version_id"], bs))
             out.append(ws.once(src, ("chunk", h["chunk_id"])))
             # the document as a whole: a datum not found may be in a part of it that was not read
             ws.touch(h["document_id"], h["title"], "retrieved", gaps.get(h["version_id"], whole).partial)
@@ -1691,6 +1870,7 @@ def _professional_hit(ws: Workspace, conn: Connection, h: dict, bs, be, sizes: d
         where = " ".join(x for x in (section_phrase(std), f"«{_txt(sec.title)}»" if sec.title and sec.label else None) if x)
         notes.append(f"[{where}: read(section={handle}) קורא את הסעיף כולו, עם תתי-הסעיפים שלו]")
         notes += limit_lines(secs, sec)
+    notes += _edition_note(ws, conn, vid, std)
     tags = {"document": ws.doc_handle(h["document_id"])}
     if h.get("table_index") is not None:
         tags["table"] = _table_handle(ws, h["document_id"], vid, ws.readings.get(str(vid)), h["table_index"])
@@ -2594,6 +2774,112 @@ def tool_list_documents(ws: Workspace, query: str | None = None, page: int | Non
                     criterion=criterion, total=total, page=page, pages=pages) + _unread_listing(ws, words)
 
 
+# --- the edition in force at the property's valuation date (round 11 U8: R8; KTD7) -----------------------------------------
+#
+# For a property or mixed question, the edition of a standard that applies is the one in force at the property's valuation
+# date: the latest edition whose stated effective date, else published date, is on or before it. This is applicability, not
+# recency: it runs with the switch on or off, and it never touches ``profile._ordered`` (the order of the editions stays as
+# round 10 built it). With no valuation date the line says so and no edition — the newest included — is called applicable.
+
+MSG_EDITION_IN_FORCE = ("המהדורה בתוקף למועד הקובע {date} של הנכס, מתוך תקן {number}: {name} «{edition}» (בתוקף מ-{since}); "
+                        "זו המהדורה שחלה על הנכס, ולא המאוחרת שבמאגר.")
+MSG_EDITION_DATE_UNKNOWN = ("המועד הקובע של הנכס אינו ידוע (השומה אינה מציינת אותו, או שהיא מציינת כמה מועדים שונים): אי "
+                            "אפשר לקבוע איזו מהדורה של התקן חלה על הנכס, ואין לקרוא לאף מהדורה — גם למאוחרת — \"החלה\".")
+MSG_EDITION_NONE_YET = ("אף אחת מהמהדורות שבמאגר לא הייתה בתוקף במועד הקובע של הנכס: אין לקרוא לאף אחת מהן \"החלה\" "
+                        "עליו (ייתכנו מהדורות קודמות שאינן במאגר).")
+MSG_EDITION_UNDETERMINED = ("אי אפשר לקבוע מהתאריכים שנכתבו במהדורות איזו מהן הייתה בתוקף במועד הקובע {date} של הנכס "
+                            "(תאריך תחילה חסר, או שהוא נופל בתוך התקופה שהמועד הקובע מציין): אין לקרוא לאף מהדורה \"החלה\".")
+MSG_EDITION_THIS_IN_FORCE = "מהדורה זו היא זו שבתוקף למועד הקובע {date} של הנכס."
+MSG_EDITION_THIS_NOT = "מהדורה זו אינה זו שבתוקף למועד הקובע {date} של הנכס; בתוקף אז: {edition}."
+
+
+def property_valuations(ws: Workspace, conn: Connection) -> list[chat_dates.StatedDate | None]:
+    """The valuation dates of the property the question is about (R8): the located unit's when the turn has one, else those
+    of the appraisal passages the turn returned — each distinct stated date once, then None if any is unknown. Empty for a
+    question that is not about a property, and when the turn has not reached an appraisal yet (nothing to apply)."""
+    if ws.intent not in ("property", MIXED):
+        return []
+    found: list[chat_dates.UnitValuation] = []
+    focus = ws.handles.get((ws.unit_focus or {}).get("handle", ""))
+    if focus is not None and focus["kind"] == "U":
+        v = UUID(focus["version_id"])
+        stated = chat_dates.valuation_dates(conn, [v], cache=ws.date_cache).get(v, ())
+        found.append(chat_dates.resolve_unit([d for d in stated if d.unit_no == focus["unit_no"]], focus["unit_no"]))
+    else:
+        for src in ws.sources.values():
+            if src.version_id is not None and src.source_kind == source_kinds.APPRAISAL and src.block_start is not None:
+                found.append(valuation_of(ws, conn, src.version_id, src.block_start))
+    stated_dates = sorted({(u.date.iso, u.date.precision): u.date for u in found if u.status == "stated"
+                           and u.date is not None}.items())
+    return [d for _, d in stated_dates] + ([None] if any(u.status != "stated" for u in found) else [])
+
+
+def edition_in_force(group, valued: chat_dates.StatedDate) -> tuple[Any, str]:
+    """(the edition, how it was found) for one valuation date among the editions of a standard number: ``found``; ``none_yet``
+    (every edition starts after the date); ``undetermined`` (an edition states no date, the order is not known, or an edition
+    starts inside the period a month or year valuation names, so the date does not tell)."""
+    if not group.order_known or any(not (e.effective or e.published) for e in group.editions):
+        return None, "undetermined"
+    first, last = _bounds(valued.iso, valued.precision)
+    started = []
+    for e in group.editions:
+        since = e.effective or e.published
+        start = _bounds(since, {4: "year", 7: "month"}.get(len(since), "day"))[0]
+        if start <= first:
+            started.append((start, e))
+        elif start <= last:
+            return None, "undetermined"
+    return (max(started, key=lambda x: x[0])[1], "found") if started else (None, "none_yet")
+
+
+def _edition_name(e, names: dict | None = None) -> str:
+    return (names[e.version_id] + " " if names else "") + f"«{_txt(e.edition) if e.edition else UNKNOWN}»"
+
+
+def applicability_lines(group, valuations: list, names: dict) -> list[str]:
+    """What the property's valuation date says about which edition of ``group`` applies (KTD7), one line per date."""
+    if len(group.editions) < 2:
+        return []
+    out = []
+    for valued in valuations:
+        if valued is None:
+            out.append(MSG_EDITION_DATE_UNKNOWN)
+            continue
+        shown = shown_date(valued.iso, valued.precision)
+        e, how = edition_in_force(group, valued)
+        if how == "found":
+            out.append(MSG_EDITION_IN_FORCE.format(
+                date=shown, number=_txt(group.number), name=names[e.version_id], edition=_txt(e.edition or UNKNOWN),
+                since=_txt(e.effective_text or e.published_text or UNKNOWN)))
+        else:
+            out.append(MSG_EDITION_NONE_YET if how == "none_yet" else MSG_EDITION_UNDETERMINED.format(date=shown))
+    return out
+
+
+def _edition_note(ws: Workspace, conn: Connection, version_id, std: dict) -> list[str]:
+    """For a property or mixed question: whether the edition a passage is of is the one in force at the property's valuation
+    date, or that the date is unknown (KTD7). Nothing for a standard with a single edition, and for any other question."""
+    if ws.intent not in ("property", MIXED) or not std.get("number"):
+        return []
+    group = profile.group_of(profiles(ws, conn), std["number"])
+    if len(group.editions) < 2:
+        return []
+    out = []
+    for valued in property_valuations(ws, conn):
+        if valued is None:
+            out.append(MSG_EDITION_DATE_UNKNOWN)
+            continue
+        shown = shown_date(valued.iso, valued.precision)
+        e, how = edition_in_force(group, valued)
+        if how != "found":
+            out.append(MSG_EDITION_NONE_YET if how == "none_yet" else MSG_EDITION_UNDETERMINED.format(date=shown))
+        elif e.version_id == UUID(str(version_id)):
+            out.append(MSG_EDITION_THIS_IN_FORCE.format(date=shown))
+        else:
+            out.append(MSG_EDITION_THIS_NOT.format(date=shown, edition=_txt(e.edition or UNKNOWN)))
+    return out
+
+
 STANDARD_KIND_WORDS = {source_kinds.STANDARD: "תקן שמאות", source_kinds.PROFESSIONAL: "מסמך מקצועי"}
 
 
@@ -2689,9 +2975,10 @@ def tool_find_standards(ws: Workspace, query: str | None = None, page: int | Non
                              f'כמו {names[e.version_id]} «{_txt(e.title)}»')
                 listed.append((c.document_id, c.title))
         on_page = {e.version_id for e in page_rows}
+        valuations = property_valuations(ws, conn)  # R8: the edition in force at the property's valuation date
         for g in groups.values():
             if any(x.version_id in on_page for x in g.editions):
-                lines += _edition_lines(ws, g, names)
+                lines += _edition_lines(ws, g, names) + applicability_lines(g, valuations, names)
     return _listing(ws, "תקנים ומסמכים מקצועיים", lines, listed, key=("find_standards", " ".join(words)),
                     criterion="תקנים ומסמכים מקצועיים שהמשתמש מורשה לראות", total=total, page=page, pages=pages,
                     source_kind=source_kinds.PROFESSIONAL)
@@ -3328,15 +3615,30 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
         if words and not metric_kinds:
             params["w"] = [f"%{w}%" for w in words]
             conds.append("(m.metric ILIKE ANY(:w) OR m.quote ILIKE ANY(:w) OR m.subject ILIKE ANY(:w))")
+        # the table a measurement is a row of is joined for the range its caption may state (KTD4; one row per table)
         where = (" FROM measurements m JOIN document_versions v ON v.id = m.version_id"
-                 " JOIN documents d ON d.id = m.document_id WHERE " + " AND ".join(conds))
+                 " JOIN documents d ON d.id = m.document_id LEFT JOIN extracted_tables et ON et.version_id = m.version_id"
+                 " AND et.table_index = m.table_index WHERE " + " AND ".join(conds))
         total = conn.execute(text("SELECT count(*)" + where), params).scalar_one()
         page, pages = _paginate(page, total, MEASUREMENTS_MAX)
-        # a total order (the id breaks ties), so no row falls between two pages
-        rows = conn.execute(text(
-            "SELECT m.*, d.title, v.ingestion->>'reading_id' AS reading_id" + where + " ORDER BY d.title, d.id, m.block_index NULLS FIRST,"
-            f" m.row_index NULLS FIRST, m.id LIMIT {MEASUREMENTS_MAX} OFFSET :o"),
-            params | {"o": (page - 1) * MEASUREMENTS_MAX}).all()
+        fields = "SELECT m.*, d.title, v.ingestion->>'reading_id' AS reading_id, et.structure->>'caption' AS caption"
+        if ws.time.mode == "none":
+            # a total order (the id breaks ties), so no row falls between two pages
+            rows = conn.execute(text(
+                fields + where + " ORDER BY d.title, d.id, m.block_index NULLS FIRST, m.row_index NULLS FIRST, m.id"
+                f" LIMIT {MEASUREMENTS_MAX} OFFSET :o"), params | {"o": (page - 1) * MEASUREMENTS_MAX}).all()
+        else:
+            # the time mode orders the WHOLE filtered set — ids, quotes and stored dates are read, dated and sorted by the
+            # KTD6 order, then by id — and only then is the page cut and its rows fetched by id: the page boundary follows
+            # the date order and no row is skipped (KTD7)
+            light = conn.execute(text(
+                "SELECT m.id, m.quote, m.effective_date, et.structure->>'caption' AS caption" + where), params).all()
+            keyed = sorted(((time_key(ws.time, _dated(a), bool(a and a.get("forecast"))), str(r.id), r.id)
+                            for r in light for a in [measurement_date(ws, r)]), key=lambda k: k[:2])
+            wanted = [k[2] for k in keyed[(page - 1) * MEASUREMENTS_MAX:page * MEASUREMENTS_MAX]]
+            fetched = {r.id: r for r in conn.execute(text(fields + where + " AND m.id = ANY(:ids)"),
+                                                     params | {"ids": wanted})}
+            rows = [fetched[i] for i in wanted if i in fetched]
         scope_rows = conn.execute(text(
             "SELECT d.id, d.title, v.id AS vid, r.state, COALESCE((v.ingestion->>'partial')::boolean, false) AS partial"
             " FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
@@ -3353,6 +3655,7 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
     groups: dict[tuple, list] = {}
     for r in rows:
         m = ws.add_measurement(r)
+        m.as_of = measurement_date(ws, r)
         m.listings.add(key)
         ws.touch(r.document_id, r.title, "read")
         groups.setdefault(_compat_key(r), []).append(m)
@@ -3390,7 +3693,7 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
             if anchor_lost(r):
                 issues += " | המיקום במסמך אבד בעיבוד מחדש: הערך אינו מאומת מול הקריאה הנוכחית של המסמך"
             out.append(f'  {m.mid}: {_txt(r.metric)} = {_txt(r.value_text)} | מסמך: "{_txt(m.title)}"{extra}'
-                       f" | סטטוס: {status}{issues}\n    ציטוט: {_txt(_clip(r.quote, 300))}")
+                       f" | {datum_line(m.as_of)} | סטטוס: {status}{issues}\n    ציטוט: {_txt(_clip(r.quote, 300))}")
     out += _cached_lines(ws, cached, cached_total)
     return "\n".join(out)
 
@@ -4046,6 +4349,40 @@ def _new_value(ws: Workspace, src: Source, sid: str, taken: dict, settled: tuple
     return value
 
 
+def _own_sentence(taken: dict) -> str:
+    """The row or sentence a taken value is in: a table cell's row as read; for a quote, the sentence of its source line
+    that holds the quote (the quote itself when it spans sentences) — where a date of the value's own is looked for."""
+    if taken.get("table"):
+        return taken["quote"]
+    line = (taken.get("context") or "").split("\n")[0]
+    quote = meaning._flat(taken["quote"])
+    return next((x for x in sections.sentences(line) if quote in meaning._flat(x)), taken["quote"])
+
+
+def _date_inputs(ws: Workspace, conn: Connection, version_id, taken: dict, block_index: int | None,
+                 vision: bool = False) -> tuple[chat_dates.UnitValuation, str | None]:
+    """What the value's date is resolved from beyond its own sentence (KTD4): the valuation of the unit holding its block,
+    and — for a cell of a stored table — the table's caption with the column's header, where a range may be stated."""
+    caption = None
+    if taken.get("table") and not vision:
+        st, _ = _table_at(ws, conn, version_id, taken["locator"]["table_index"])
+        if st:
+            caption = " ".join(x for x in (st.get("caption"), taken["locator"].get("column")) if x) or None
+    return valuation_of(ws, conn, version_id, block_index), caption
+
+
+def _stamp_date(ws: Workspace, value: calc.Value, taken: dict, inputs: tuple) -> None:
+    """Set ``value.as_of`` (round 11 U8, KTD4, R5-R7): the date the server finds in the value's own row or sentence, in its
+    table's range, or — for the unit's own conclusion, a source-backed adopted stance — the unit's valuation date; unknown
+    otherwise. A sentence worded as a forecast is marked even when no date is found."""
+    uv, caption = inputs
+    sentence = _own_sentence(taken)
+    found = chat_dates.resolve_as_of(sentence, table_caption=caption, stance=value.stance,
+                                     stance_provenance=value.provenance.get("stance"), unit_valuation=uv,
+                                     anchor=ws.time.anchor)
+    value.as_of = datum_as_of(ws, sentence, found)
+
+
 def _value_report(ws: Workspace, value: calc.Value, said: Attribution | None, note: str | None,
                   context: list[str] | None = None) -> str:
     """What ``take_value`` reports about the value it registered."""
@@ -4067,6 +4404,7 @@ def _value_report(ws: Workspace, value: calc.Value, said: Attribution | None, no
                                             full=calc.fmt(value.value * value.scale)))
     if value.approx:
         lines.append("המקור כותב את הערך כמקורב.")
+    lines.append(datum_line(value.as_of))
     lines.append("ודאות: " + ("כל התכונות שצוינו נמצאו במקור" if not asserted else
                               "נמוכה יותר — תכונות שהמודל קבע ולא נמצאו במקור: " + ", ".join(asserted)))
     if note:
@@ -4135,6 +4473,7 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
         # REREADS_PER_VALUE times; the same region again is served from the stored readings)
         region = [r for r in rows if at is None or r.block_index in at]
         unclear = next((r for r in region if r.status == reader.UNCERTAIN), None)
+        dating = _date_inputs(ws, conn, src.version_id, taken, region[0].block_index if region else src.block_start, vision)
         cx = contexts_of(ws, conn, src.version_id, v.reading_id)
         here = None
         if cx.multi and not (cell and vision):
@@ -4156,6 +4495,7 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
             key = _locator_key(src.version_id, reading_id, taken["locator"])
             reread = _reread_value(ws, v, unclear, taken["forms"], key)
     value = _new_value(ws, src, sid, taken, settled, given, label, path, reading_id)
+    _stamp_date(ws, value, taken, dating)
     # the appraisal context of the value's own block or row (KTD7, R20), and its subject against it (R21)
     if vision:
         number = cx.at_block(src.block_start) if cx.multi else None
@@ -4388,6 +4728,8 @@ def _take_cached(ws: Workspace, handle: str, data: dict, loc: dict, given: dict,
         place = (doc or {}).get("source") or {}
         number = _context_number(ws, conn, cx, v.version_id, (doc or {}).get("anchor") or {},
                                  place.get("block_start")) if doc is not None else None
+        dating = (_date_inputs(ws, conn, v.version_id, _facts_from_json(doc["facts"])[0], place.get("block_start"))
+                  if doc is not None else None)
     if doc is None:
         raise ToolError(MSG_UNAVAILABLE)
     record = doc["record"]
@@ -4405,6 +4747,7 @@ def _take_cached(ws: Workspace, handle: str, data: dict, loc: dict, given: dict,
                         tags={"document": ws.doc_handle(v.document_id)})
     ws.touch(v.document_id, v.title, "retrieved", v.partial)
     value = _new_value(ws, src, src.sid, taken, settled, given, label, path, v.reading_id)
+    _stamp_date(ws, value, taken, dating)
     ws.settled_values.add(value.vid)  # cached only when its own region was read clearly
     value.reading = "clear"
     value.context, value.subject_from = value_context(cx, number), subject_from(cx, number, value.subject)

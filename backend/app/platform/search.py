@@ -332,10 +332,13 @@ def _small_scope_order(ranked: list, rows: dict, supported: set) -> tuple[list, 
 
 
 def search_evidence(conn: Connection, queries: Sequence[str], limit: int = 8, *, scope: SearchScope | None = None,
-                    filters: MetadataFilters | None = None, place_terms: Iterable[str] = ()) -> SearchOutcome:
+                    filters: MetadataFilters | None = None, place_terms: Iterable[str] = (),
+                    window: bool = False) -> SearchOutcome:
     """Fused search over up to ``MAX_QUERIES`` queries (the first is the primary question). In a small
     scope the result may hold more than ``limit`` hits (at most twice), so that every page's best
-    supported passage is in it; when the pages need more than that, the best ``limit`` lead."""
+    supported passage is in it; when the pages need more than that, the best ``limit`` lead. ``window`` (opt-in, round 11
+    U8, KTD6): the fused ranking is read down to the stage's candidate depth (``CANDIDATES``; ``SMALL_SCOPE_CANDIDATES``
+    in a small scope) whatever ``limit`` is, for a caller that re-orders documents itself before it cuts."""
     queries = [q for q in queries if q and q.strip()][:MAX_QUERIES]
     place_terms = list(place_terms)
     topic: list[str] = []
@@ -348,6 +351,8 @@ def search_evidence(conn: Connection, queries: Sequence[str], limit: int = 8, *,
         sql = replace(sql, version_ids=[v for v, _ in _scoped_versions(conn, scope)])
     small = documents is not None and documents <= SMALL_SCOPE_DOCUMENTS
     n = SMALL_SCOPE_CANDIDATES if small else CANDIDATES
+    if window:
+        limit = max(limit, n)
     scores: dict = {}
     all_tokens: list[str] = []
     guaranteed: list = []
@@ -973,26 +978,30 @@ def question_words_in_title(question: str, title: str) -> frozenset[str]:
     return frozenset(out)
 
 
-def search_passages(conn: Connection, query: str, limit: int = 8, *, scope: SearchScope | None = None) -> list[dict]:
+def search_passages(conn: Connection, query: str, limit: int = 8, *, scope: SearchScope | None = None,
+                    window: bool = False) -> list[dict]:
     """The search the answering tools and the search screen share: the query and its abbreviation variants over
     the scope, and — when the query names a document by its title — the same query inside that document, whose
     passages lead (a document's name is in its title, not in its passages, so a global search ranks other
-    documents' passages that share the name's words above it). Rows of one table never crowd out the rest."""
+    documents' passages that share the name's words above it). Rows of one table never crowd out the rest.
+    ``window`` (opt-in; the chat's ``search`` in a time mode, round 11 U8, KTD6): the fused ranking is returned down to
+    the candidate depth (``search_evidence``) instead of its best ``limit``, so the caller can order the documents of the
+    whole window by their dates before it cuts; every other caller is unchanged."""
     from app.extraction.abbreviations import variants
 
     queries = [query, *variants(query)]
-    hits = search_evidence(conn, queries, limit * 2, scope=scope).hits
+    hits = search_evidence(conn, queries, limit * 2, scope=scope, window=window).hits
     if scope is not None and scope.blocks:  # inside a unit already: a document's title names nothing further
-        return diversify_rows(hits, limit)
+        return diversify_rows(hits, max(limit, len(hits)) if window else limit)
     named = documents_named(conn, query, scope)
     if named:
         inside = SearchScope(document_ids=tuple(i for i, _ in named), source_kinds=scope.source_kinds if scope else (),
                              exclude_versions=scope.exclude_versions if scope else ())
-        focused = search_evidence(conn, queries, limit * 2, scope=inside).hits
+        focused = search_evidence(conn, queries, limit * 2, scope=inside, window=window).hits
         seen = {h["chunk_id"] for h in focused}
         hits = focused[: max(3, limit // 2) * 2] + [h for h in hits if h["chunk_id"] not in seen] + focused[
             max(3, limit // 2) * 2:]
-    return diversify_rows(hits, limit)
+    return diversify_rows(hits, max(limit, len(hits)) if window else limit)
 
 
 def hybrid_search(conn: Connection, query: str, limit: int = 8, *, scope: SearchScope | None = None,

@@ -1147,15 +1147,22 @@ def _search_only(ws, question: str) -> None:
     ws.searches = [question]
 
 
-def _limited_answer(ctx: TenantContext, question: str, reason: str) -> dict:
+def _limited_answer(ctx: TenantContext, question: str, reason: str, time_preference: dict | None = None) -> dict:
     """Without a cloud model: the best passages, plainly labelled as search results and not an analyzed answer. They are
     narrowed by the question's hard evidence as a model turn's are, and grouped by source kind under their own headings:
     the appraisals, then the standards and professional documents, which are labelled as no source of a property's data
-    (round 11 U3, R19, R20). A group with no passage has no heading."""
+    (round 11 U3, R19, R20). A group with no passage has no heading. There is no engine turn here, so the time mode is built
+    from the state the user message was recorded with (``time_preference``, round 11 U8, KTD11): the appraisal group follows
+    the switch's order — newest first when it was on, relevance when off, the question's own time when it gives one — and
+    every appraisal passage shows the valuation date of its unit or that it is unknown; the professional group keeps its
+    order and carries no date."""
+    from app.chat import timeframe
     from app.chat import tools as T
     from app.platform import source_kinds
 
     ws = T.Workspace(ctx=ctx)
+    ws.time = timeframe.resolve(question, time_preference)
+    ws.exact_limit = True  # each group is capped by contract (KTD11): the order never adds passages
     _search_only(ws, question)
     sources = [_public_source(s) for s in ws.sources.values()]
     anchors.attach(ws, {"sources": sources})
@@ -1167,7 +1174,8 @@ def _limited_answer(ctx: TenantContext, question: str, reason: str) -> dict:
                            (f"**{T.LABEL_GROUP_PROFESSIONAL}** — {T.LABEL_NOT_PROPERTY_DATA}",
                             [s for s in shown if s.source_kind != source_kinds.APPRAISAL])):
         if group:
-            lines += ["", heading, *(f"- **{s.title}** — {s.location} [{s.sid}]" for s in group)]
+            lines += ["", heading, *(f"- **{s.title}** — {s.location}" + (f" — {s.date_line}" if s.date_line else "")
+                                     + f" [{s.sid}]" for s in group)]
     return {"kind": "search_only", "status": "partial", "markdown": "\n".join(lines), "claims": [], "sources": sources,
             "measurements": [], "computations": [], "documents": [], "verification": None, "searches": ws.searches,
             "coverage": [], "clarification": None, "missing": None}
@@ -1195,7 +1203,7 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
         if state.mode != Mode.CLOUD:
             reason = state.limitation() or "שליחת קטעים לספק מודל ענן כבויה במשרד."
             reason = reason.split(";")[0].rstrip(".") + "."
-            answer = _limited_answer(ctx, inp.question, reason)
+            answer = _limited_answer(ctx, inp.question, reason, inp.time_preference)
             if _cancel_requested(ctx, message_id):
                 raise engine.TurnCancelled
             _finish(ctx, message_id, "done", content="", answer=answer)
