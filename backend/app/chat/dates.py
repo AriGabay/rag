@@ -35,14 +35,18 @@ month and a day of the same month agree (the finer one is the unit's date); the 
 
 1. a single date in the datum's own row, cell or sentence: provenance `source`; two or more different dates there are
    ambiguous: unknown, nothing below is tried (a range is one date with an end);
-2. a range in the table's caption or header: `source_table`;
+2. a range in the table's caption or header, or the one date a caption says the table is "for" ("לשנת 2023"; round 12
+   U4): `source_table`;
 3. the unit's valuation date, for a value of the appraisal unit whose own sentence or row holds no date at all:
    `unit_valuation`, prose, heading or table cell alike (round 11 U15, KTD4 as decided after the real-model run: the
    header line "שווי הנכס: ..." is registered with the stance *unknown*, so an adopted stance cannot be required). It
    is withheld from a datum that is not the unit's own: a party's claim, proposal or estimate (any provenance), a value
    attributed to another party (a speaker the source names, who is not the appraiser), a comparable or transaction (its
    role), and a row of a comparables table (a date column, or a caption or header that marks comparables or
-   transactions). A conflict, or a unit with no date, is unknown.
+   transactions). A conflict, or a unit with no date, is unknown. **History** (round 12 U4, R16, KTD12) is withheld too: a
+   datum whose sentence or section the history predicate marks (`is_history`) never takes the unit's date, and an
+   undated history datum, comparable or comparables-table row is returned as a date-less `AsOf` whose `date_origin`
+   ("history" first, else "comparable") says why it has no date (U11 reads it: such a datum conflicts with nothing).
 
 A date the sources do not give stays unknown (None), and a partial date keeps its precision. **Forecast** (R7,
 `is_forecast`) is a property of the wording and of the date, independent of whether a date was found, so it has its own
@@ -62,7 +66,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 from uuid import UUID
 
 from sqlalchemy import Connection, text
@@ -86,13 +90,21 @@ SOURCE, SOURCE_TABLE, UNIT_VALUATION = "source", "source_table", "unit_valuation
 class AsOf(TypedDict):
     """A datum's date (the contract of round 11): ISO text in `precision`, `end` for a range, where it came from, and
     whether it is a forecast. `locator` says where the date was read: "text" (the datum's row or sentence), "quote",
-    "caption" or "block N" (the unit's valuation date)."""
-    date: str
-    precision: str
+    "caption" or "block N" (the unit's valuation date).
+
+    A datum that stays undated because it is history or a comparable carries no date and the reason (round 12 U4,
+    KTD12): `date` None and `date_origin` "history" or "comparable" (the key is absent from every other `as_of`), so
+    the conflict rule (KTD13) can tell "undated only because it is history or a comparable" from "undated"."""
+    date: str | None
+    precision: str | None
     end: str | None
-    provenance: str
+    provenance: str | None
     forecast: bool
-    locator: str
+    locator: str | None
+    date_origin: NotRequired[str]
+
+
+HISTORY_ORIGIN, COMPARABLE_ORIGIN = "history", "comparable"
 
 
 @dataclass(frozen=True)
@@ -561,6 +573,29 @@ def is_comparables_table(headers: Iterable, *captions: str | None) -> bool:
             or any(_COMPARABLES.search(x) for x in (*heads, *caps)))
 
 
+# a caption that says what a table is "for" ("דמי שכירות לשנת 2023", "... לחודש 03/2023") states the period of its rows;
+# "עסקאות בשנת 2022" names when transactions happened and dates nothing (KTD4: only a range or a "for" period)
+_PERIOD_FOR = re.compile(r"(?<![א-ת])ל(?:שנת|חודש)\s*$")
+
+
+def _caption_date(caption: str, sentence: str, anchor: date) -> AsOf | None:
+    """The date a table caption (with its column header) gives its rows: the one range it states, or the one date that
+    follows "לשנת"/"לחודש" (round 12 U4, KTD14: an adopted measurement of a table "for 2023" is dated 2023)."""
+    found = shared.find_all(caption)
+    if len(found) != 1:
+        return None
+    c = found[0]
+    if c.end is None and not _PERIOD_FOR.search(caption[:c.span[0]]):
+        return None
+    return _build(c.iso, c.precision, c.end, SOURCE_TABLE, "caption", sentence, anchor)
+
+
+def _withheld(origin: str, sentence: str, anchor: date) -> AsOf:
+    """No date, and why (history or a comparable): the forecast wording of the sentence still marks it."""
+    return AsOf(date=None, precision=None, end=None, provenance=None, forecast=is_forecast(sentence, None, anchor),
+                locator=None, date_origin=origin)
+
+
 def _is_unit_own(stance: str | None, role: str | None, stated_by: str | None, stated_by_provenance: str | None,
                  comparables: bool) -> bool:
     """Whether a value may take its unit's valuation date: not a party's position, not another party's, not a comparable
@@ -573,26 +608,35 @@ def _is_unit_own(stance: str | None, role: str | None, stated_by: str | None, st
 
 def resolve_as_of(text_: str, *, table_caption: str | None = None, stance: str | None = None, role: str | None = None,
                   stated_by: str | None = None, stated_by_provenance: str | None = None, comparables: bool = False,
-                  unit_valuation: UnitValuation | None = None, anchor: date, locator: str = "text") -> AsOf | None:
+                  unit_valuation: UnitValuation | None = None, section_path: Iterable[str] = (), anchor: date,
+                  locator: str = "text") -> AsOf | None:
     """The datum's date by the KTD4 order (see the module docstring), or None (unknown). ``text_`` is the datum's own row,
     cell or sentence; ``table_caption`` the caption or header of its table; ``stance``, ``role``, ``stated_by`` (with
     ``stated_by_provenance``: only a speaker the source names counts) and ``comparables`` (the datum is a row of a
     comparables table, `is_comparables_table`) say whether it is the unit's own datum; ``unit_valuation`` the valuation
-    of the unit that holds the datum."""
+    of the unit that holds the datum; ``section_path`` the sections the datum sits under (the history predicate).
+
+    A datum that belongs to history (`is_history`: its sentence or its section) never takes the unit's valuation date,
+    and one that is a comparable or a row of a comparables table never does either; when they stay undated the result
+    is a date-less `AsOf` that says why (`date_origin`: "history" or "comparable"; history first). The datum's own date
+    and its table's range still win (round 12 U4, R16, KTD12)."""
     sentence = strip_bidi_controls(text_ or "")
     own = shared.find_all(sentence)
     if len({(p.iso, p.precision, p.end) for p in own}) > 1:
         return None   # ambiguous: two different dates in the row or sentence
     if own:
         return _build(own[0].iso, own[0].precision, own[0].end, SOURCE, locator, sentence, anchor)
-    caption = shared.find_all(strip_bidi_controls(table_caption or ""))
-    if len(caption) == 1 and caption[0].end is not None:
-        c = caption[0]
-        return _build(c.iso, c.precision, c.end, SOURCE_TABLE, "caption", sentence, anchor)
+    from_caption = _caption_date(strip_bidi_controls(table_caption or ""), sentence, anchor)
+    if from_caption is not None:
+        return from_caption
+    if is_history(sentence, section_path):
+        return _withheld(HISTORY_ORIGIN, sentence, anchor)
     if (unit_valuation is not None and unit_valuation.status == "stated" and unit_valuation.date is not None
             and _is_unit_own(stance, role, stated_by, stated_by_provenance, comparables)):
         d = unit_valuation.date
         return _build(d.iso, d.precision, None, UNIT_VALUATION, f"block {d.block_index}", sentence, anchor)
+    if comparables or role in COMPARABLE_ROLES:
+        return _withheld(COMPARABLE_ORIGIN, sentence, anchor)
     return None
 
 

@@ -3799,9 +3799,11 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
         if words and not metric_kinds:
             params["w"] = [f"%{w}%" for w in words]
             conds.append("(m.metric ILIKE ANY(:w) OR m.quote ILIKE ANY(:w) OR m.subject ILIKE ANY(:w))")
+        # the rows carry their table's caption and the header of their column (round 12 U4, KTD14): the caption dates an
+        # adopted measurement and both are where a period the quote does not hold is read (`meaning.measurement_states`)
         where = (" FROM measurements m JOIN document_versions v ON v.id = m.version_id"
-                 " JOIN documents d ON d.id = m.document_id WHERE " + " AND ".join(conds))
-        fields = "SELECT m.*, d.title, v.ingestion->>'reading_id' AS reading_id"
+                 " JOIN documents d ON d.id = m.document_id" + meaning.TABLE_TEXT_JOIN + " WHERE " + " AND ".join(conds))
+        fields = "SELECT m.*, d.title, v.ingestion->>'reading_id' AS reading_id, " + meaning.TABLE_TEXT_COLUMNS
         if ws.time.mode == "none":
             total = conn.execute(text("SELECT count(*)" + where), params).scalar_one()
             page, pages = _paginate(page, total, MEASUREMENTS_MAX)
@@ -4611,17 +4613,19 @@ def _date_inputs(ws: Workspace, conn: Connection, version_id, taken: dict, block
     return valuation_of(ws, conn, version_id, block_index), caption, comparables
 
 
-def _stamp_date(ws: Workspace, value: calc.Value, taken: dict, inputs: tuple) -> None:
+def _stamp_date(ws: Workspace, value: calc.Value, taken: dict, inputs: tuple, path: tuple = ()) -> None:
     """Set ``value.as_of`` (round 11 U8, U15, KTD4, R5-R7): the date the server finds in the value's own row or sentence,
     in its table's range, or — for a value of the appraisal unit that is not a party's claim, another party's, a
-    comparable, a transaction or a row of a comparables table — the unit's valuation date; unknown otherwise. A sentence
+    comparable, a transaction, a row of a comparables table or history — the unit's valuation date; unknown otherwise.
+    ``path`` is the value's section path: under a prior-appraisal heading, or in a sentence of the past, the value is
+    history and is never dated by the unit (round 12 U4, R16, KTD12); it then records why (`date_origin`). A sentence
     worded as a forecast is marked even when no date is found."""
     uv, caption, comparables = inputs
     sentence = _own_sentence(taken)
     found = chat_dates.resolve_as_of(sentence, table_caption=caption, stance=value.stance, role=value.role,
                                      stated_by=value.stated_by,
                                      stated_by_provenance=value.provenance.get("stated_by"), comparables=comparables,
-                                     unit_valuation=uv, anchor=ws.time.anchor)
+                                     unit_valuation=uv, section_path=path, anchor=ws.time.anchor)
     value.as_of = datum_as_of(ws, sentence, found)
 
 
@@ -4737,7 +4741,7 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
             key = _locator_key(src.version_id, reading_id, taken["locator"])
             reread = _reread_value(ws, v, unclear, taken["forms"], key)
     value = _new_value(ws, src, sid, taken, settled, given, label, path, reading_id)
-    _stamp_date(ws, value, taken, dating)
+    _stamp_date(ws, value, taken, dating, path)
     # the appraisal context of the value's own block or row (KTD7, R20), and its subject against it (R21)
     if vision:
         number = cx.at_block(src.block_start) if cx.multi else None
@@ -5002,7 +5006,7 @@ def _take_cached(ws: Workspace, handle: str, data: dict, loc: dict, given: dict,
                         tags={"document": ws.doc_handle(v.document_id)})
     ws.touch(v.document_id, v.title, "retrieved", v.partial)
     value = _new_value(ws, src, src.sid, taken, settled, given, label, path, v.reading_id)
-    _stamp_date(ws, value, taken, dating)
+    _stamp_date(ws, value, taken, dating, path)
     ws.settled_values.add(value.vid)  # cached only when its own region was read clearly
     value.reading = "clear"
     value.context, value.subject_from = value_context(cx, number), subject_from(cx, number, value.subject)

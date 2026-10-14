@@ -723,3 +723,62 @@ def test_a_sum_of_a_stated_and_an_asserted_month_goes_through_the_unknown_period
     other.vid = "V2"
     out = calc.evaluate(calc.parse("V1 + V2"), {"V1": stated.operand(), "V2": other.operand()}, None)
     assert not out.conditional and out.period == "month"
+
+
+# --- an adopted measurement carries its date (round 12 U4, KTD14, R17) ----------------------------------------------------
+
+def _stored(quote: str, **kw) -> SimpleNamespace:
+    """A stored measurement row of the subject property as the fetcher reads it (synthetic), with its table's caption and
+    column header as the fetcher's query adds them."""
+    base = dict(id=uuid.uuid4(), document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="שומת בדיקה", metric="דמי שכירות",
+                metric_kind="rent_per_area", value_text="55 ₪", quote=quote, effective_date=None, caption=None,
+                header=None, block_index=3, table_index=0, row_index=1, period="month", area_basis="", vat="unknown",
+                value_form="exact", section="תחשיב", status="auto_validated", anchor_lost=None, subject_role="appraised_property",
+                value_role="appraiser_determination", value=55)
+    return SimpleNamespace(**(base | kw))
+
+
+def test_a_measurement_adopted_from_a_table_whose_caption_states_its_year_is_dated_by_it():
+    ws = Workspace(ctx=None)
+    row = _stored("דמי שכירות: 55 ₪", caption="שכר דירה לשנת 2023")
+    mid = meaning.Fetcher(ws).adopt(row)
+    as_of = ws.measurements[mid].as_of
+    assert (as_of["date"], as_of["precision"], as_of["provenance"]) == ("2023", "year", "source_table")
+
+
+def test_a_measurement_adopted_with_a_date_in_its_quote_is_dated_by_the_quote():
+    ws = Workspace(ctx=None)
+    mid = meaning.Fetcher(ws).adopt(_stored("דמי השכירות הם 55 ₪ למ\"ר לחודש נכון ל-01/03/2023"))
+    as_of = ws.measurements[mid].as_of
+    assert (as_of["date"], as_of["provenance"]) == ("2023-03-01", "source")
+
+
+def test_a_measurement_adopted_with_no_date_anywhere_stays_unknown_and_is_shown_as_such():
+    from app.chat import timeline
+
+    ws = Workspace(ctx=None)
+    mid = meaning.Fetcher(ws).adopt(_stored("דמי שכירות: 55 ₪", caption="שכר דירה"))
+    assert ws.measurements[mid].as_of is None
+    assert timeline.shown(ws.measurements[mid].as_of) == timeline.MSG_UNKNOWN_DATE
+
+
+def test_a_measurement_found_again_keeps_the_date_it_was_stamped_with():
+    ws = Workspace(ctx=None)
+    row = _stored("דמי שכירות: 55 ₪", caption="שכר דירה לשנת 2023")
+    fetcher = meaning.Fetcher(ws)
+    mid = fetcher.adopt(row)
+    assert fetcher.adopt(row) == mid and ws.measurements[mid].as_of["date"] == "2023"
+
+
+def test_a_period_given_by_the_column_header_is_stated_for_the_measurement():
+    """The fetcher's query adds the column header, so a period the header states backs a claim (U9, `measurement_states`)."""
+    row = _stored("55 ₪", header="דמי שכירות לחודש")
+    assert meaning.measurement_states(row, "period")
+    assert not meaning.measurement_states(_stored("55 ₪", header="דמי שכירות"), "period")
+
+
+def test_the_fetcher_query_reads_each_rows_table_caption_and_column_header_with_the_row():
+    """The caption and the header come in the one subject-measurement query (no second read): the fragments the query is
+    built from name both columns."""
+    assert "AS caption" in meaning.TABLE_TEXT_COLUMNS and "AS header" in meaning.TABLE_TEXT_COLUMNS
+    assert "extracted_tables" in meaning.TABLE_TEXT_JOIN

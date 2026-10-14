@@ -315,7 +315,9 @@ def test_a_value_whose_role_is_comparison_in_prose_stays_undated(office):
     search(ws)
     out = take(ws, first_source(ws, doc), "נכס דומה שנמכר ב-1,900,000 ₪", "1,900,000",
                ADOPTED | {"stance": "unknown", "role": "comparison"})
-    assert ws.values["V1"].as_of is None and T.MSG_DATE_UNKNOWN in out
+    # "שנמכר" is a history cue (KTD12), which is named first; either reason leaves it undated and out of the conflicts
+    assert ws.values["V1"].as_of["date"] is None and ws.values["V1"].as_of["date_origin"] in ("history", "comparable")
+    assert T.MSG_DATE_UNKNOWN in out
 
 
 def test_a_value_attributed_to_another_party_stays_undated_whatever_its_stance(office):
@@ -337,6 +339,60 @@ def test_a_forecast_is_marked_even_with_no_date(office):
     as_of = ws.values["V1"].as_of
     assert as_of["date"] is None and as_of["forecast"] is True
     assert T.MSG_FORECAST in out
+
+
+def history_doc(office, key: str, body: str, path: tuple[str, ...], valuation: str = "15/04/2025") -> str:
+    """A one-unit appraisal whose last block (``body``) sits under the section ``path`` (round 12 U4: the history guard
+    reads the value's section path); the valuation date is stated under an ordinary heading."""
+    doc = dated(office, key, valuation, body=body)
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_blocks SET section_path = :p WHERE document_id = :d AND text LIKE :t"),
+                     {"p": list(path), "d": doc, "t": body.split("{")[0][:12] + "%"})
+        conn.execute(text("UPDATE document_blocks SET section_path = ARRAY['חוות דעת'] WHERE document_id = :d AND"
+                          " text LIKE 'המועד הקובע%'"), {"d": doc})
+    return doc
+
+
+def test_a_value_under_a_prior_appraisals_heading_never_takes_the_units_valuation_date(office):
+    """AE6, R16: the unit's date is 15/04/2025; a prior appraisal's value under "שומות קודמות" with no date of its own
+    stays unknown and records why."""
+    doc = history_doc(office, "h1", "שווי הנכס ברחוב הרקפות 5 הוערך ב-2,300,000 ₪ (סינתטי).", ("שומות קודמות",))
+    ws = ws_for(office, RECENT)
+    search(ws)
+    out = take(ws, first_source(ws, doc), "הוערך ב-2,300,000 ₪", "2,300,000", ADOPTED | {"stance": "unknown"})
+    assert out.startswith("V1 נרשם"), out
+    as_of = ws.values["V1"].as_of
+    assert as_of["date"] is None and as_of["date_origin"] == "history" and T.MSG_DATE_UNKNOWN in out
+    assert "15/04/2025" not in out
+
+
+def test_a_prior_appraisals_value_with_its_own_date_is_dated_by_it(office):
+    doc = history_doc(office, "h2", "שווי הנכס ברחוב הרקפות 5 לתאריך הקובע 31.12.2019 הוערך ב-2,300,000 ₪ (סינתטי).",
+                      ("שומות קודמות",))
+    ws = ws_for(office, RECENT)
+    search(ws)
+    take(ws, first_source(ws, doc), "הוערך ב-2,300,000 ₪", "2,300,000", ADOPTED | {"stance": "unknown"})
+    as_of = ws.values["V1"].as_of
+    assert (as_of["date"], as_of["provenance"]) == ("2019-12-31", "source")
+
+
+def test_a_past_valuation_sentence_outside_a_history_section_is_history_too(office):
+    doc = history_doc(office, "h3", "שווי הנכס ברחוב הרקפות 5: בעבר הוערך הנכס ב-2,300,000 ₪ (סינתטי).", ("רקע",))
+    ws = ws_for(office, RECENT)
+    search(ws)
+    take(ws, first_source(ws, doc), "הוערך הנכס ב-2,300,000 ₪", "2,300,000", ADOPTED | {"stance": "unknown"})
+    assert ws.values["V1"].as_of["date"] is None and ws.values["V1"].as_of["date_origin"] == "history"
+
+
+def test_a_current_conclusion_written_with_valued_outside_history_keeps_the_units_date(office):
+    doc = history_doc(office, "h4", "שווי הזכויות בנכס ברחוב הרקפות 5 הוערך ב-2,450,000 ₪ נכון למועד הקובע (סינתטי).",
+                      ("חוות דעת",))
+    ws = ws_for(office, RECENT)
+    search(ws)
+    take(ws, first_source(ws, doc), "הוערך ב-2,450,000 ₪", "2,450,000")
+    as_of = ws.values["V1"].as_of
+    assert (as_of["date"], as_of["provenance"]) == ("2025-04-15", "unit_valuation")
+    assert as_of.get("date_origin") != "history"
 
 
 TABLE_CAPTION = "עסקאות השוואה בנכסים דומים (סינתטי)"
@@ -394,7 +450,8 @@ def test_a_comparable_row_with_no_date_of_its_own_stays_unknown_whatever_the_uni
     ws = ws_for(office, RECENT)
     out = take_cell(ws, doc, "רחוב הברוש 5")
     assert out.startswith("V1 נרשם"), out
-    assert ws.values["V1"].as_of is None and T.MSG_DATE_UNKNOWN in out
+    assert ws.values["V1"].as_of["date"] is None and ws.values["V1"].as_of["date_origin"] == "comparable"
+    assert T.MSG_DATE_UNKNOWN in out
 
 
 def test_a_row_of_a_comparables_table_with_a_neutral_role_and_no_date_stays_unknown(office):
@@ -403,7 +460,8 @@ def test_a_row_of_a_comparables_table_with_a_neutral_role_and_no_date_stays_unkn
     ws = ws_for(office, RECENT)
     out = take_cell(ws, doc, "רחוב הברוש 5", role="other")
     assert out.startswith("V1 נרשם"), out
-    assert ws.values["V1"].role == "other" and ws.values["V1"].as_of is None and T.MSG_DATE_UNKNOWN in out
+    assert ws.values["V1"].role == "other" and ws.values["V1"].as_of["date"] is None
+    assert ws.values["V1"].as_of["date_origin"] == "comparable" and T.MSG_DATE_UNKNOWN in out
 
 
 def test_a_summary_table_cell_with_no_date_column_takes_the_units_valuation_date(office):
@@ -495,6 +553,74 @@ def test_explicit_time_orders_the_measurements_by_the_requested_year(office):
     out = run(ws_for(office, explicit("2022", "2022", "year")), "find_measurements", query="",
               metric_kinds=["rent_per_area"])
     assert listed(out) == ["55", "51", "54", "52", "53"]
+
+
+def add_table_measurement(office, doc: str, quote: str, value_text: str = "1,900,000", **kw) -> None:
+    """One subject-property measurement of the table of ``table_doc`` (table 0): its quote is the row rendered with the
+    headers, as the extraction stores it."""
+    with tenant_tx(office.system) as conn:
+        ver = conn.execute(text("SELECT id FROM document_versions WHERE document_id = :d"), {"d": doc}).scalar_one()
+        conn.execute(text(
+            "INSERT INTO measurements (office_id, document_id, version_id, block_index, table_index, row_index,"
+            " statement_key, metric, metric_kind, value, value_form, value_text, unit, period, area_basis, vat, subject,"
+            " subject_role, value_role, quote, section, extraction_version, model, status, issues) VALUES"
+            " (app_office(), :d, :v, 2, 0, 0, 't0:r0:price', 'מחיר', 'price', 1900000, 'exact', :t, 'ILS', 'none', '',"
+            " 'unknown', 'הנכס', 'appraised_property', 'appraiser_determination', :q, :s, 'test', 'test', 'auto_validated',"
+            " '[]'::jsonb)"), {"d": doc, "v": ver, "t": value_text, "q": quote, "s": SECTION})
+
+
+ROW_QUOTE = "נכס: רחוב הדקל 3 | מחיר (₪): 1,900,000"
+
+
+def test_the_subject_measurement_query_carries_the_tables_caption_and_the_cells_column_header(office):
+    from app.chat.meaning import Fetcher
+
+    doc = table_doc(office, "דמי שכירות לשנת 2023 (סינתטי)", [["רחוב הדקל 3", "", "1,900,000"]])
+    add_table_measurement(office, doc, ROW_QUOTE)
+    (row,) = Fetcher(ws_for(office, RECENT))._subject_rows({doc})
+    assert row.caption == "דמי שכירות לשנת 2023 (סינתטי)" and row.header == "מחיר (₪)"
+
+
+def test_a_subject_measurement_outside_any_table_has_no_caption_or_header(office):
+    from app.chat.meaning import Fetcher
+
+    doc = dated(office, "m", "15/04/2025")
+    add_measurements(office, doc, [("51 ₪", "דמי השכירות הם 51 ₪ למ\"ר לחודש", None)])
+    (row,) = Fetcher(ws_for(office, RECENT))._subject_rows({doc})
+    assert row.caption is None and row.header is None
+
+
+def test_a_measurement_adopted_by_the_meaning_check_is_dated_by_its_tables_caption(office):
+    from app.chat.meaning import Fetcher
+
+    doc = table_doc(office, "דמי שכירות לשנת 2023 (סינתטי)", [["רחוב הדקל 3", "", "1,900,000"]])
+    add_table_measurement(office, doc, ROW_QUOTE)
+    ws = ws_for(office, RECENT)
+    fetcher = Fetcher(ws)
+    (row,) = fetcher._subject_rows({doc})
+    mid = fetcher.adopt(row)
+    as_of = ws.measurements[mid].as_of
+    assert (as_of["date"], as_of["precision"], as_of["provenance"]) == ("2023", "year", "source_table")
+
+
+def test_a_measurement_adopted_from_a_table_with_no_date_anywhere_stays_unknown(office):
+    from app.chat.meaning import Fetcher
+
+    doc = table_doc(office, "דמי שכירות (סינתטי)", [["רחוב הדקל 3", "", "1,900,000"]])
+    add_table_measurement(office, doc, ROW_QUOTE)
+    ws = ws_for(office, RECENT)
+    fetcher = Fetcher(ws)
+    mid = fetcher.adopt(fetcher._subject_rows({doc})[0])
+    assert ws.measurements[mid].as_of is None
+
+
+def test_find_measurements_rows_carry_the_caption_and_header_the_period_check_reads(office):
+    doc = table_doc(office, "דמי שכירות (סינתטי)", [["רחוב הדקל 3", "", "1,900,000"]])
+    add_table_measurement(office, doc, ROW_QUOTE)
+    ws = ws_for(office, RECENT)
+    run(ws, "find_measurements", query="", metric_kinds=["price"])
+    row = ws.measurements["M1"].row
+    assert row.caption == "דמי שכירות (סינתטי)" and row.header == "מחיר (₪)"
 
 
 # --- standards: the edition in force at the valuation date ---------------------------------------------------------------

@@ -415,12 +415,17 @@ def test_a_value_attributed_to_another_party_stays_unknown_but_the_appraiser_is_
 
 @pytest.mark.parametrize("role", ["comparison", "comparable", "transaction"])
 def test_a_value_whose_role_marks_a_comparable_or_a_transaction_stays_unknown(role):
-    assert resolve("נמכרה דירה סמוכה ב-1,900,000 ₪", stance="unknown", role=role, unit_valuation=UV) is None
+    assert dateless(resolve("נמכרה דירה סמוכה ב-1,900,000 ₪", stance="unknown", role=role, unit_valuation=UV))
+
+
+def dateless(got) -> bool:
+    """No date: ``None``, or the date-less ``AsOf`` that carries the reason the date was withheld (round 12 U4)."""
+    return got is None or got["date"] is None
 
 
 def test_a_row_of_a_comparables_table_without_a_date_of_its_own_stays_unknown():
-    assert resolve("רחוב הברוש 5 | | 2,000,000", stance="unknown", role="other", comparables=True,
-                   unit_valuation=UV) is None
+    assert dateless(resolve("רחוב הברוש 5 | | 2,000,000", stance="unknown", role="other", comparables=True,
+                            unit_valuation=UV))
     # its own date still dates it, and a caption range
     assert resolve("רחוב הדקל 3 | 01/03/2024 | 1,900,000", comparables=True, unit_valuation=UV)["provenance"] == "source"
     assert resolve("x | 1,900,000", table_caption="עסקאות 2021–2022", comparables=True,
@@ -535,3 +540,97 @@ def test_a_quote_with_its_own_single_date_dates_the_measurement_with_no_stored_d
 def test_a_measurement_forecast_is_marked():
     got = D.measurement_as_of("בשנת 2029 צפוי שכר של 7,000 ₪", "2029", anchor=ANCHOR)
     assert got["forecast"] is True
+
+
+# --- history and comparables keep no date of the unit, and say why (round 12 U4: R16; KTD12; AE6) ------------------------
+
+HISTORY = ("שומות קודמות",)
+
+
+def test_a_datum_under_a_history_heading_is_not_dated_by_the_unit_and_is_marked_history():
+    got = resolve("הוערך הנכס בשווי 2,300,000 ₪", stance="unknown", unit_valuation=UV, section_path=HISTORY)
+    assert got is not None and got["date"] is None and got["precision"] is None and got["provenance"] is None
+    assert got["date_origin"] == "history" and got["forecast"] is False
+
+
+def test_a_history_datum_with_its_own_date_is_dated_by_it_and_never_by_the_unit():
+    got = resolve("לתאריך הקובע 31.12.2019 הוערך הנכס בשווי 2,300,000 ₪", stance="unknown", unit_valuation=UV,
+                  section_path=HISTORY)
+    assert (got["date"], got["provenance"]) == ("2019-12-31", "source") and got.get("date_origin") is None
+
+
+def test_a_history_datum_keeps_the_range_its_tables_caption_states():
+    got = resolve("הוערך הנכס בשווי 2,300,000 ₪", table_caption="שומות קודמות 2019–2021", unit_valuation=UV,
+                  section_path=HISTORY)
+    assert (got["date"], got["end"], got["provenance"]) == ("2019", "2021", "source_table")
+
+
+def test_a_header_line_value_outside_history_keeps_the_units_valuation_date():
+    got = resolve("שווי הנכס: 2,410,000 ₪", stance="unknown", role="other", unit_valuation=UV, section_path=("סיכום",))
+    assert (got["date"], got["provenance"]) == ("2024-04-15", "unit_valuation") and got.get("date_origin") is None
+
+
+def test_a_bare_valued_sentence_outside_history_keeps_the_units_date():
+    """KTD12: current conclusions are written "הוערך" ("שווי הזכויות בנכס הוערך ב-X ₪ נכון למועד הקובע")."""
+    got = resolve("שווי הזכויות בנכס הוערך ב-2,450,000 ₪ נכון למועד הקובע", stance="adopted", unit_valuation=UV,
+                  section_path=("חוות דעת",))
+    assert (got["date"], got["provenance"]) == ("2024-04-15", "unit_valuation")
+    assert got.get("date_origin") != "history"
+
+
+@pytest.mark.parametrize("sentence", [
+    "בעבר הוערך הנכס ב-2,300,000 ₪",
+    "הנכס נרכש בסכום של 1,800,000 ₪",
+    "בשומה קודמת נקבע שווי של 2,100,000 ₪",
+])
+def test_a_history_sentence_outside_a_history_section_is_not_dated_by_the_unit(sentence):
+    got = resolve(sentence, stance="unknown", unit_valuation=UV, section_path=("רקע",))
+    assert got is not None and got["date"] is None and got["date_origin"] == "history", sentence
+
+
+def test_a_history_datum_is_history_even_when_the_unit_states_no_date():
+    got = resolve("בעבר הוערך הנכס ב-2,300,000 ₪", stance="unknown", unit_valuation=None)
+    assert got is not None and got["date"] is None and got["date_origin"] == "history"
+
+
+def test_an_undated_comparables_table_row_is_marked_comparable():
+    got = resolve("רחוב הברוש 5 | | 2,000,000", stance="unknown", role="other", comparables=True, unit_valuation=UV)
+    assert got is not None and got["date"] is None and got["date_origin"] == "comparable"
+
+
+@pytest.mark.parametrize("role", ["comparison", "comparable", "transaction"])
+def test_an_undated_comparable_by_role_is_marked_comparable(role):
+    got = resolve("דירה סמוכה בסכום של 1,900,000 ₪", stance="unknown", role=role, unit_valuation=UV)
+    assert got is not None and got["date"] is None and got["date_origin"] == "comparable"
+
+
+def test_a_comparable_with_its_own_date_is_dated_without_an_origin_mark():
+    got = resolve("רחוב הדקל 3 | 01/03/2024 | 1,900,000", comparables=True, unit_valuation=UV)
+    assert got["provenance"] == "source" and got.get("date_origin") is None
+
+
+def test_history_wins_over_comparable_and_a_party_position_is_no_origin():
+    both = resolve("הנכס נמכר ב-1,900,000 ₪", role="transaction", comparables=True, unit_valuation=UV)
+    assert both["date_origin"] == "history"
+    assert resolve("שווי הנכס 2,450,000 ₪", stance="claim", unit_valuation=UV) is None
+
+
+def test_a_withheld_history_sentence_worded_as_a_forecast_stays_marked_as_one():
+    got = resolve("בעבר הוערך כי הנכס יהיה שווה 3,000,000 ₪", stance="unknown", unit_valuation=UV)
+    assert got["date"] is None and got["date_origin"] == "history" and got["forecast"] is True
+
+
+# --- a table caption stating the year the table is "for" dates its rows (round 12 U4, KTD14) -----------------------------
+
+def test_a_caption_stating_the_year_the_table_is_for_dates_the_measurement():
+    got = D.measurement_as_of("דמי שכירות 55 ₪ למ\"ר", None, table_caption="שכר דירה לשנת 2023", anchor=ANCHOR)
+    assert (got["date"], got["precision"], got["end"], got["provenance"], got["locator"]) == (
+        "2023", "year", None, "source_table", "caption")
+
+
+def test_a_caption_naming_the_year_of_transactions_still_dates_nothing():
+    assert D.measurement_as_of("55 ₪", None, table_caption="עסקאות בשנת 2022", anchor=ANCHOR) is None
+
+
+def test_a_measurement_with_no_date_anywhere_is_unknown():
+    assert D.measurement_as_of("דמי שכירות 55 ₪ למ\"ר", None, table_caption="שכר דירה", anchor=ANCHOR) is None

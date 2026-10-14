@@ -690,6 +690,16 @@ class MeaningProblem:
 
 
 SUBJECT_ROLES = ("appraiser_determination", "actual_contract", "calculation")
+
+# A stored measurement of a table cell, read together with the table's caption and the header of the cell's column (round 12
+# U4, KTD14, U9): the caption dates an adopted measurement, and the caption and the header are where `measurement_states`
+# looks for a period the quote does not hold. The column is the header the row's quote renders in front of the cell
+# ("header: cell", as the extraction stores a table row); a row outside a table, or quoted by row label, has no header.
+TABLE_TEXT_JOIN = (" LEFT JOIN extracted_tables et ON et.version_id = m.version_id AND et.table_index = m.table_index")
+TABLE_TEXT_COLUMNS = (
+    "et.structure->>'caption' AS caption, (SELECT h FROM jsonb_array_elements_text(CASE WHEN"
+    " jsonb_typeof(et.structure->'headers') = 'array' THEN et.structure->'headers' ELSE '[]'::jsonb END) AS h"
+    " WHERE h <> '' AND position(h || ': ' || m.value_text IN m.quote) > 0 ORDER BY length(h) DESC LIMIT 1) AS header")
 READS = 6  # database reads per verification for evidence beyond the cited passages
 
 
@@ -794,9 +804,10 @@ class Fetcher:
         def load():
             with tenant_tx(self.ws.ctx) as conn:
                 return conn.execute(sql(
-                    "SELECT m.*, d.title, v.ingestion->>'reading_id' AS reading_id FROM measurements m"
-                    " JOIN document_versions v ON v.id = m.version_id"
+                    "SELECT m.*, d.title, v.ingestion->>'reading_id' AS reading_id, " + TABLE_TEXT_COLUMNS
+                    + " FROM measurements m JOIN document_versions v ON v.id = m.version_id"
                     " AND v.is_current JOIN documents d ON d.id = m.document_id AND d.deleted_at IS NULL"
+                    + TABLE_TEXT_JOIN +
                     " WHERE m.document_id = ANY(:d) AND m.status <> 'rejected' AND m.anchor_lost IS NULL"
                     " AND m.subject_role ="
                     " 'appraised_property' AND m.value_role = ANY(:r) ORDER BY m.block_index NULLS FIRST, m.id"
@@ -804,14 +815,18 @@ class Fetcher:
         return self._read(("m", tuple(sorted(str(d) for d in document_ids))), load) or []
 
     def adopt(self, found) -> str:
-        """The id of a source or measurement the check uses: registered as the turn's, once."""
-        from app.chat.tools import Source
+        """The id of a source or measurement the check uses: registered as the turn's, once. A measurement is dated like
+        one `find_measurements` lists (the quote, else the table's caption its row carries: round 12 U4, R17, KTD14), so
+        none leaves verification with its date unset when its quote or caption gives one."""
+        from app.chat.tools import Source, measurement_date
 
         if isinstance(found, Source):
             if not found.sid or self.ws.sources.get(found.sid) is not found:
                 self.ws.adopt(found)
             return found.sid
-        return self.ws.add_measurement(found).mid
+        adopted = self.ws.add_measurement(found)
+        adopted.as_of = measurement_date(self.ws, found)
+        return adopted.mid
 
     def attesting(self, unit: Unit, forms: frozenset[str], kind: str, key: str, words: set[str]) -> str | None:
         """The id of evidence that states ``kind`` ``key`` for the number, beyond the unit's citations."""
