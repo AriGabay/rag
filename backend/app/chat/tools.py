@@ -153,6 +153,7 @@ from app.chat import unread as unread_text
 from app.chat.contexts import MSG_NO_TITLE
 from app.chat.evidence import TABLE_SIZE_PREFIX
 from app.chat.intent import MIXED, PROFESSIONAL
+from app.chat.timeframe import TimeMode
 from app.chat.timing import StageClock
 from app.config import get_settings
 from app.db import TenantContext, current_data_version, tenant_tx
@@ -413,6 +414,10 @@ class Workspace:
     # the turn's settled intent (round 10 U6; ``intent.Intent.value``): what the tools' pools are set from; ``unknown``
     # until the request is read, and when it is not known
     intent: str = "unknown"
+    # the turn's time mode and requested time (round 11 U7, KTD5; ``timeframe.resolve``), set once per turn by the engine
+    # from the question and the user message's recorded state: what the tools' ranking reads (U8). It is the turn's own: no
+    # slot, intent or pool is set from it (R16)
+    time: TimeMode = field(default_factory=TimeMode)
     # a document question's named documents (round 10 U8): the only documents its searches read (``tool_search``)
     named_documents: tuple[str, ...] = ()
     # version id -> (source kind, what its profile states) for a professional version, False for an appraisal (the

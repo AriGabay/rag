@@ -407,7 +407,8 @@ def test_a_first_turn_keeps_the_resolution_to_its_intent_beside_its_timing(clien
     m = ask(client, office, monkeypatch, Reader([], ANSWER))
     d = diagnostics(client, m)
     # no resolve call on a first turn (no parse, no lookup): only the intent the request analysis settled (round 10)
-    assert set(d["resolution"]) == {"intent", "decisions"} and d["resolution"]["intent"]["value"] == "unknown"
+    # and the turn's time mode (round 11 U7)
+    assert set(d["resolution"]) == {"intent", "decisions", "time"} and d["resolution"]["intent"]["value"] == "unknown"
     assert d["timing"]["stages"]["compose"]["calls"] >= 1
 
 

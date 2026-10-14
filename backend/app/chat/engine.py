@@ -101,7 +101,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from app.chat import contexts, coverage, entities, resolve
+from app.chat import contexts, coverage, entities, resolve, timeframe
 from app.chat import intent as intent_mod
 from app.chat import request as request_analysis
 from app.chat import tools as T
@@ -514,10 +514,11 @@ def usage_summary(usage: list[dict], **extra) -> dict:
 
 def _context_message(inp: TurnInput, request: resolve.Request | None = None, binding: dict | None = None,
                      unit_handle: str | None = None, located: dict | None = None,
-                     intent: intent_mod.Intent | None = None) -> str:
+                     intent: intent_mod.Intent | None = None, time_mode: timeframe.TimeMode | None = None) -> str:
     """The turn's first message. ``intent``: a first turn's settled intent, when it is known by now (a follow-up's is on
     its ``request``). A professional request carries no focus block: the conversation's property is not its subject
-    (round 10 KTD7)."""
+    (round 10 KTD7). ``time_mode``: the turn's time decision (round 11 U7, KTD2, KTD5); its block follows the request
+    block, only when the mode is ``recent`` or ``explicit`` (``none``: no block), and never touches the focus above."""
     parts = []
     if inp.summary:
         parts.append("סיכום השיחה עד כה (לא מקור עובדתי):\n" + prompt_text(inp.summary))
@@ -569,6 +570,8 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None, bin
             parts.append(request_analysis.block(request.components))
     elif professional:  # a first turn that read its intent: the one line a follow-up's requested block carries
         parts.append("הבקשה כפי שהובנה:\n" + resolve.PROFESSIONAL_NOTE)
+    if time_mode is not None and (time_block := timeframe.block(time_mode)):
+        parts.append(time_block)
     if located is not None and unit_handle:  # the unit the server found for the question at the turn's start
         parts.append(resolve.located_block(located["anchor"], unit_handle))
     return "\n\n".join(parts)
@@ -617,6 +620,9 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     users = [m.content for m in inp.history if m.role == "user"]
     ws.user_messages = [{"turn": n + 1, "text": t, "current": False} for n, t in enumerate(users)] + [
         {"turn": len(users) + 1, "text": inp.question, "current": True}]
+    # the turn's time mode, once: from the question and the state the user message was recorded with (round 11 U7, KTD5).
+    # Nothing else is set from it — not the intent, the named documents, the unit focus or the slots (R16)
+    ws.time = timeframe.resolve(inp.question, inp.time_preference)
     steps = 0
     output_tokens = settings.chat_agent_output_tokens
     output_retried = False  # at most one retry in the whole turn, including its repair rounds
@@ -699,7 +705,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                              scope_kind="focused", scope_query="", omitted=[], focus=None, requested=[],
                              parts=[])
         return TurnOutcome(answer, ws, VerifyReport([], judged=True, judge_status="no_claims"), steps, usage, {},
-                           rounds, asking.as_dict(), _with_notes(asking.resolution, notes),
+                           rounds, asking.as_dict(), _with_time(_with_notes(asking.resolution, notes), ws.time),
                            _summary(usage, rounds, reused, turn), final_digest=text_digest(answer.answer_markdown),
                            timing=ws.clock.summary(), server_asked=True)
 
@@ -815,8 +821,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             ledger["requirements_origin"] = turn.record_origin()
         return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
                            request.as_dict() if request is not None else None,
-                           _with_notes(request.resolution if request is not None
-                                       else _first_resolution(turn_intent, first_decisions), notes),
+                           _with_time(_with_notes(request.resolution if request is not None
+                                                  else _first_resolution(turn_intent, first_decisions), notes), ws.time),
                            _summary(usage, rounds, reused, turn),
                            _pending(ws, turn, final), composed.spans, done.digest, done.stats, ws.clock.summary(),
                            unit)
@@ -862,7 +868,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
 
     ws.binding = binding  # an ``assume`` of the bound number records the parameter it fills (KTD9)
     items: list = [{"role": "user", "content": _context_message(
-        inp, request, binding, ws.unit_focus["handle"] if ws.unit_focus else None, ws.located_unit, turn_intent)}]
+        inp, request, binding, ws.unit_focus["handle"] if ws.unit_focus else None, ws.located_unit, turn_intent,
+        ws.time)}]
     if request is None and first_turn:
         # a first turn: the request is analysed beside the first step (no added latency), within the reading time
         start_analysis()
@@ -1026,6 +1033,14 @@ def _with_notes(resolution: dict | None, notes: dict[str, str]) -> dict | None:
     decisions = out.setdefault("decisions", {})
     for key, note in notes.items():
         decisions.setdefault(key, note)
+    return out
+
+
+def _with_time(resolution: dict | None, time_mode: timeframe.TimeMode) -> dict:
+    """The resolution with the turn's time decision (``resolution["time"]``: mode, source, switch, anchor, requested time;
+    round 11 U7, R15), on a first message and on a follow-up alike — also when the turn has no other resolution."""
+    out = resolution if resolution is not None else {}
+    out["time"] = time_mode.as_dict()
     return out
 
 
