@@ -227,6 +227,16 @@ def test_a_different_scenario_or_stance_is_another_group():
     assert [len(g) for g in timeline.groups(o.ws, {a})] == [1]
 
 
+def test_a_scenario_only_the_model_asserted_neither_splits_nor_drops_the_history():
+    """Real model, round 11: the model wrote each value's date into its free-text scenario ("המועד הקובע 20/01/2025",
+    provenance model_asserted) and the rents fell out of every timeline. A scenario the source does not state is none."""
+    o = Office()
+    rows = [o.value(o.doc(), amount, as_of(date), scenario=f"המועד הקובע {date}",
+                    provenance={"scenario": "model_asserted"})
+            for amount, date in (("5,200", "2022-03-10"), ("6,100", "2024-06-15"), ("6,400", "2025-01-20"))]
+    assert [len(g) for g in timeline.groups(o.ws, {rows[0]})] == [3]
+
+
 def test_adopted_and_unknown_stance_values_of_one_property_form_one_group_in_date_order():
     """The appraisal's own data is one class (round 11 U16, KTD9): a value registered as adopted ("השווי נקבע") and the ones
     registered from header lines, whose stance is unknown, are one timeline — the newest row is not lost."""

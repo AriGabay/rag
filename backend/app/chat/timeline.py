@@ -171,9 +171,10 @@ def _fields(family_: str, unit: str, period: str, vat: str, basis: str, scenario
         if not (basis or "").strip() or not provenance("area_basis"):
             return None
         out.append(("basis", basis_key(basis)))
-    scenario = " ".join((scenario or "").split()).casefold()
-    if scenario and not provenance("scenario"):
-        return None
+    # a scenario counts only when the source states it; one the model asserted — on the real model often the datum's
+    # own date written as a label ("המועד הקובע 20/01/2025") — is no scenario: it neither splits a history nor drops the
+    # value from every timeline (round 11, found in the real-model run of the rent sequence)
+    scenario = " ".join((scenario or "").split()).casefold() if provenance("scenario") else ""
     out.append(("scenario", scenario))
     out.append(("stance", stance_class(stance if provenance("stance") else None)))
     return tuple(out)
