@@ -82,6 +82,7 @@ from app.platform import source_kinds
 from eval.scoring import (
     calc_check,
     norm,
+    norm_pattern,
     percentile,
     retrieval_check,
     stage_time_stats,
@@ -297,7 +298,7 @@ def professional_support(m: dict, expect: dict, needle: str | list[str]) -> list
     appraisal is seen only through ``professional_patterns``."""
     a = m.get("answer") or {}
     shown = " / ".join(fragments_of(needle))
-    patterns = [re.compile(norm(p)) for p in expect.get("professional_patterns", [])]
+    patterns = [re.compile(norm_pattern(p)) for p in expect.get("professional_patterns", [])]
     by_id = {s.get("id"): s for s in a.get("sources") or []}
     problems: list[str] = []
 
@@ -341,10 +342,10 @@ def grade_turn(m: dict, expect: dict, docs: dict) -> list[str]:
     if m["status"] != "done":
         return [f"סטטוס {m['status']}: {m.get('error')}"]
     for pat in expect.get("must", []):
-        if not re.search(norm(pat), text):
+        if not re.search(norm_pattern(pat), text):
             problems.append(f"חסר: /{pat}/")
     for pat in expect.get("must_not", []):
-        hit = re.search(norm(pat), text)
+        hit = re.search(norm_pattern(pat), text)
         if hit:
             problems.append(f"אסור: /{pat}/ ← «{hit.group(0)}»")
     if "status" in expect and a.get("status") not in expect["status"]:

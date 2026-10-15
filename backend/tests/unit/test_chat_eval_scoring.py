@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from eval.scoring import check
+from eval.scoring import check, norm, norm_pattern
 
 DOC_A, DOC_B = "שומה הגפן", "שומה הזית"
 
@@ -406,3 +406,21 @@ def test_if_needed_with_alternatives_judges_support_by_a_source_none_of_them_nam
     only_glossary_copy = _mixed_turn(f"{APPRAISAL_LINE}\n\nהמונח במילון [S3].", [SOURCES[0], _src("S3", "מים, |", "standard")])
     # a statement cited to one of the alternatives is the glossary itself: it is cited, so nothing more is asked
     assert grade_turn(only_glossary_copy, {"source_docs": [STORED_TWICE], "source_docs_mode": "if_needed"}, {}) == []
+
+
+def test_norm_pattern_keeps_a_character_class_with_a_maqaf_valid():
+    # `norm` would turn `[-־ ]` into the bad range `[-- ]`; the pattern form escapes the hyphen instead
+    pat = re.compile(norm_pattern("אי[-־ ]?ודאות"))
+    for text in ("אי־ודאות", "אי-ודאות", "אי ודאות"):
+        assert pat.search(norm(text))
+
+
+def test_norm_pattern_matches_the_normalized_text_for_a_maqaf_outside_a_class():
+    pat = re.compile(norm_pattern("אי־התאמה"))
+    assert pat.search(norm("אי־התאמה"))
+    assert pat.search(norm("אי-התאמה"))
+
+
+def test_norm_pattern_compiles_an_en_dash_class():
+    pat = re.compile(norm_pattern("[-–]"))
+    assert pat.search(norm("–")) and pat.search("-")

@@ -59,6 +59,13 @@ def norm(s: str) -> str:
     return (s or "").replace("״", '"').replace("׳", "'").replace("–", "-").replace("־", "-").replace("‏", "")
 
 
+def norm_pattern(p: str) -> str:
+    """`norm` for a regex pattern (round 13): the same mapping, except the maqaf and the en dash become an escaped hyphen
+    `\\-`, which is literal both inside and outside a character class, so `[-־ ]` does not turn into the bad range `[-- ]`
+    and the pattern matches the normalized text."""
+    return (p or "").replace("״", '"').replace("׳", "'").replace("–", "\\-").replace("־", "\\-").replace("‏", "")
+
+
 def _forms(value) -> set[str]:
     """The normalized forms of a number (9,500 and 9500 are the same)."""
     return numbers_in(str(value)) or {str(value)}
@@ -117,8 +124,8 @@ def check(answer: dict | None, expect: dict) -> list[str]:
         if not hits:
             problems.append(f"הערך {vm['value']} לא מופיע בתשובה")
             continue
-        ok = [t for t, _ in hits if all(re.search(norm(p), t) for p in vm.get("must_near", []))
-              and not any(re.search(norm(p), t) for p in vm.get("must_not_near", []))]
+        ok = [t for t, _ in hits if all(re.search(norm_pattern(p), t) for p in vm.get("must_near", []))
+              and not any(re.search(norm_pattern(p), t) for p in vm.get("must_not_near", []))]
         if not ok:
             problems.append(f"משמעות הערך {vm['value']} שגויה או חסרה: «{hits[0][0][:160]}»")
 
@@ -136,7 +143,7 @@ def check(answer: dict | None, expect: dict) -> list[str]:
     for at in expect.get("attribution", []):
         hits = _with_value(sents, at["value"])
         good = [t for t, ds in hits if any(at["document"] in d for d in ds)
-                and not any(re.search(norm(p), t) for p in at.get("must_not_near", []))]
+                and not any(re.search(norm_pattern(p), t) for p in at.get("must_not_near", []))]
         if not good:
             problems.append(f"הערך {at['value']} אינו מיוחס למסמך '{at['document']}'"
                             + (f": «{hits[0][0][:160]}»" if hits else " (לא מופיע)"))
