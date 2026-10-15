@@ -202,10 +202,19 @@ def unit_key(family_: str, unit: str) -> str:
     return "fraction" if unit in ("percent", "ratio") and D.needs_facet(family_) else unit
 
 
+def restates(scenario: str, family_: str, facet: dict | None) -> bool:
+    """Whether a scenario only restates the datum's own facet (round 13 follow-up): the model often registers the component
+    ("תזרים דמי שכירות ממשרדים") as the scenario. Its core (``datum.core``) is then equal to, or a subset of, the facet's core, and
+    the facet already carries it, so it is no part of the key; a scenario that names something the facet does not (a project
+    stage) still splits. A scenario with no content word of its own restates nothing."""
+    words = D.core(scenario, family_)
+    return bool(words) and words <= D.core_of(D.Site(family_, facet))
+
+
 def _fields(family_: str, unit: str, period: str, vat: str, basis: str, scenario: str, stance: str,
-            provenance: Callable[[str], bool]) -> tuple | None:
+            provenance: Callable[[str], bool], facet: dict | None = None) -> tuple | None:
     """The key fields after the property (see the module doc), or None when a field that applies is unknown. ``provenance``:
-    whether the source states a field."""
+    whether the source states a field; ``facet``: the datum's facet, which a scenario restating it does not add to the key."""
     if family_ in UNSPECIFIC_KINDS or not provenance("kind") or not unit or unit == "other" or not provenance("unit"):
         return None
     out: list = [family_, unit_key(family_, unit)]
@@ -230,6 +239,8 @@ def _fields(family_: str, unit: str, period: str, vat: str, basis: str, scenario
     # own date written as a label ("המועד הקובע 20/01/2025") — is no scenario: it neither splits a history nor drops the
     # value from every timeline (round 11, found in the real-model run of the rent sequence)
     scenario = " ".join((scenario or "").split()).casefold() if provenance("scenario") else ""
+    if scenario and restates(scenario, family_, facet):
+        scenario = ""  # the facet carries it (round 13 follow-up)
     out.append(("scenario", scenario))
     out.append(("stance", stance_class(stance if provenance("stance") else None)))
     return tuple(out)
@@ -250,7 +261,7 @@ def datums(ws: Workspace) -> list[Datum]:
         out.append(Datum(
             i, len(out), str(v.document_id), str(v.version_id), v.title, v.location, number, subject, fam, v.unit,
             _fields(fam, v.unit, v.period, v.vat, v.area_basis or "", v.scenario or "", v.stance or "",
-                    lambda f, p=prov: _stated(p, f)),
+                    lambda f, p=prov: _stated(p, f), v.facet),
             v.written, D.canonical_amount(v.value, scale=v.scale, unit=v.unit, family=fam), v.as_of, v.role or "",
             v.kind, v.period, v.vat, v.area_basis or "", value_uncertain(ws, i),
             v.facet, (str(v.version_id), number), tuple(v.table) if v.table else None, v.section or ""))
@@ -265,7 +276,7 @@ def datums(ws: Workspace) -> list[Datum]:
             fam, r.unit or "",
             _fields(fam, r.unit or "", r.period or "", r.vat or "", r.area_basis or "",
                     getattr(r, "scenario", "") or "", getattr(r, "stance", "") or "",
-                    lambda f, r=r: _record_states(r, f)),
+                    lambda f, r=r: _record_states(r, f), m.facet),
             r.value_text or "",
             D.canonical_measurement(getattr(r, "value", None), r.value_text or "", unit=r.unit or "", family=fam),
             m.as_of, getattr(r, "value_role", "") or "", kind, r.period or "", r.vat or "", r.area_basis or "",
@@ -543,18 +554,19 @@ def _order(ws: Workspace, d: Datum) -> tuple:
     return time_key(ws.time, when, d.forecast)
 
 
-def _dedupe(members: list[Datum]) -> list[Datum]:
+def _dedupe(members: list[Datum], cited: Collection[str] = ()) -> list[Datum]:
     """One row for a datum registered twice from one document (same date, amount and facet: round 13 U4, R10 — the same number
-    of two components is two rows)."""
-    seen: set[tuple] = set()
-    out = []
+    of two components is two rows). Of the duplicates the first cited one is kept (the model often registers a value again after
+    a note and cites the second: the answer's own id must be the row, round 13 follow-up), else the first registered; the rows
+    keep the order of their first registration."""
+    kept: dict[tuple, Datum] = {}
     for d in members:
         k = (d.document_id, d.date_key(), d.comparable, D.core_of(d))
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(d)
-    return out
+        if k not in kept:
+            kept[k] = d
+        elif d.ref in cited and kept[k].ref not in cited:
+            kept[k] = d
+    return list(kept.values())
 
 
 def _date_kind(d: Datum) -> str | None:
@@ -666,7 +678,7 @@ def compose(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], I
     components: list[tuple[tuple, dict]] = []
     for bucket in buckets(ws, cited, identity):
         undecided = bucket.undecided_with()
-        classes = [(cls, _dedupe(cls)) for cls in bucket.classes]
+        classes = [(cls, _dedupe(cls, cited)) for cls in bucket.classes]
         conflicts: dict[str, list[str]] = {}  # a datum -> the sids it conflicts with (its class's conflict pairs)
         for _, members in classes:
             for i, j in conflicting_pairs([Comparable(None, d.comparable, d.as_of) for d in members]):

@@ -933,7 +933,7 @@ def test_a_breakdown_of_four_own_facet_rates_in_two_sections_and_two_bare_rates_
         facet = datum.facet(written, "sentence", "own") if written else datum.none()
         return o.value(doc, amount, when, kind="rate", unit="percent", version=ver, facet=facet, section=section)
 
-    stated = [rate("6", "התזרים מדמי שכירות ממשרדים", "3. היוון"), rate("7", "התזרים מחניות", "3. היוון"),
+    stated = [rate("6", "התזרים דמי שכירות ממשרדים", "3. היוון"), rate("7", "התזרים מחניות", "3. היוון"),
               rate("8", "התזרים ממחסנים", "5. סיכום"), rate("9", "התזרים משלטי פרסום", "5. סיכום")]
     bare = [rate("10", None, "5. סיכום"), rate("11", None, "3. היוון")]
     (block,) = timeline.breakdown(o.ws, set(stated))
@@ -944,3 +944,49 @@ def test_a_breakdown_of_four_own_facet_rates_in_two_sections_and_two_bare_rates_
         assert rows[b]["marks"] == ["undecided"]
         assert set(rows[b]["undecided_with"]) >= set(stated)  # every stated rate; the other bare rate too (both unresolved)
     assert not coverage.conflicting(o.ws)
+
+
+def _rate(o: Office, doc, ver, amount: str, written: str, scenario: str, *, when: dict | None = None) -> str:
+    return o.value(doc, amount, when or as_of("2025-03-31"), kind="rate", unit="percent", version=ver,
+                   facet=datum.facet(written, "sentence", "own"), section="3. היוון", scenario=scenario,
+                   provenance={"scenario": "source"})
+
+
+def test_a_scenario_that_restates_the_facet_is_no_part_of_the_key_so_the_rates_form_one_components_block():
+    """Round 13 follow-up: the real model registers the cash-flow phrase as the scenario. It is in the quote (so stated), but the
+    facet already carries it: the base key must not split one rate per scenario."""
+    o = Office()
+    doc, ver = _unit(o)
+    a = _rate(o, doc, ver, "6", "התזרים דמי שכירות ממשרדים", "תזרים דמי שכירות ממשרדים")
+    b = _rate(o, doc, ver, "7", "התזרים מחניות", "תזרים מחניות")
+    assert all(("scenario", "") in d.fields for d in timeline.datums(o.ws)), "the restating scenario is not in the key"
+    (block,) = timeline.breakdown(o.ws, {a})
+    assert [r["sid"] for r in block["rows"]] == [a, b]
+    assert [r["facet"] for r in block["rows"]] == ["התזרים דמי שכירות ממשרדים", "התזרים מחניות"]
+
+
+def test_a_scenario_that_names_something_the_facet_does_not_still_splits_the_key():
+    o = Office()
+    doc, ver = _unit(o)
+    a = _rate(o, doc, ver, "6", "התזרים דמי שכירות ממשרדים", "תזרים דמי שכירות ממשרדים")
+    stage = _rate(o, doc, ver, "7", "התזרים מחניות", "תזרים מחניות בשלב ב")  # "שלב ב" names a stage the facet lacks
+    assert timeline.restates("תזרים דמי שכירות ממשרדים", "proportion", datum.facet("התזרים דמי שכירות ממשרדים", "row", "own"))
+    assert not timeline.restates("תזרים מחניות בשלב ב", "proportion", datum.facet("התזרים מחניות", "row", "own"))
+    assert not timeline.restates("שלב ב", "proportion", None) and not timeline.restates("", "proportion", datum.none())
+    assert timeline.breakdown(o.ws, {a}) == [] and timeline.breakdown(o.ws, {stage}) == []
+
+
+def test_of_duplicate_registrations_the_cited_one_is_the_row_and_the_block_is_built():
+    """Round 13 follow-up: V1 (uncited) and V3 (its cited duplicate, registered again after a note) are one row: V3's."""
+    o = Office()
+    doc, ver = _unit(o)
+    first, second = "מקדם הפחתה בשל מגבלות בנייה", "מקדם הפחתה בשל שיתוף במקרקעין"
+    v1 = _coefficient(o, doc, "0.8", as_of("2025-03-31"), first, version=ver)
+    v2 = _coefficient(o, doc, "0.9", as_of("2025-03-31"), second, version=ver)
+    v3 = _coefficient(o, doc, "0.8", as_of("2025-03-31"), first, version=ver)  # the same figure registered again
+    (block,) = timeline.breakdown(o.ws, {v3})
+    assert [r["sid"] for r in block["rows"]] == [v2, v3]  # registration order, with the cited duplicate
+    assert v1 not in {r["sid"] for r in block["rows"]}
+    (uncited,) = timeline.breakdown(o.ws, {v1})
+    assert v1 in {r["sid"] for r in uncited["rows"]} and v3 not in {r["sid"] for r in uncited["rows"]}
+    assert [d.ref for d in timeline._dedupe(timeline.datums(o.ws))] == [v1, v2]  # nothing cited: the first registration
