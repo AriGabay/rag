@@ -5596,7 +5596,7 @@ ROUND10_MANIFEST = "manifest.json"
 ROUND10_MARK = "תקן בדיקה סינתטי — אינו תקן אמיתי"
 ROUND10_NUMBER = "98.1"
 ROUND10_PLACE = "עיר-סינתטית"
-# a block of a document: (kind, text); kind is one of mark, title, h1, h2, p, table (text is then a list of rows)
+# a block of a document: (kind, text); kind is one of mark, title, h1, h2, p, li, table (text is then a list of rows)
 Round10Block = tuple[str, Any]
 
 # the provision of section 2.1 in each edition: the material difference (three transactions, then five shown one by one)
@@ -5774,6 +5774,10 @@ def render_round10_docx(blocks: list[Round10Block], title: str, mark: str = ROUN
             heading(text, int(kind[1]))
         elif kind == "pagebreak":
             doc.add_page_break()
+        elif kind == "li":  # a list item (round 13): a bulleted paragraph, so a lead-in has items under it
+            p = doc.add_paragraph(text, style="List Bullet")
+            p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            _rtl_paragraph(p)
         elif kind == "table":
             table = doc.add_table(rows=len(text), cols=len(text[0]))
             table.style = "Table Grid"
@@ -6565,11 +6569,529 @@ def write_round12(out: Path) -> None:
     print(f"wrote {ROUND12_DIR}/{ROUND12_MANIFEST} ({len(text_):,} chars)")
 
 
+# --------------------------------------------------------------------------- round 13 (datum meaning in verification,
+# conflicts and the timeline: source-grounded facets, one same/different/undecided decision, identity without party blocks,
+# coverage classes; plan docs/plans/2026-10-15-0851-fix-datum-meaning-verification-plan.md, U2)
+#
+# All DOCX, rendered by ``render_round10_docx`` with the round-13 mark (a bulleted list item is the block kind ``li``). Every
+# name, street, city, block, parcel, licence and amount is invented; the two cities are the round-12 ones. As in round 12,
+# each fact is stated once, in a spec, and both the document text and the manifest are derived from it (never read back from
+# the files); ``_r13_check`` asserts that every datum's quote or cell is in the text it points at, so a spec that drifts
+# fails the run. The manifest states per datum its facet (written text, part row / column / caption / sentence / lead_in /
+# heading, tier own / context, or status none), per case the expected pairwise decision (same / different / undecided) with
+# the conflict and undecided-mark consequence the plan's rules give it, and per document the expected identity.
+#
+# A DOCX is not split into units by the reader (see the round-12 note above), so the one office that needs several units
+# (AE9) is recorded as ``unit_file`` specs in the manifest (``office_ae9``): tests build it with
+# ``tests.support.unit_files.unit_file``. Every document also carries ``unit_blocks`` (its blocks as ``unit_file`` texts, a
+# table row flattened to a "|" block with no table structure) for tests that need one unit of it.
+
+ROUND13_DIR = "round13"
+ROUND13_MANIFEST = "manifest.json"
+ROUND13_MARK = "מסמך בדיקה סינתטי (סבב 13) — נתונים בדויים לבדיקת המערכת בלבד"
+ROUND13_APPRAISER = "דנה סינתטית-בדוי"
+ROUND13_LICENCE = "76543"
+ROUND13_OFFICE_ADDRESS = "הנחושת 3"
+_R13_NO_FACET = "רכיב לא צוין במקור"
+
+
+def _r13_frac(shown: str) -> str:
+    """A rate or coefficient as a fraction string: "6.5%" is 0.065, "0.80" and "80%" are both 0.8 (KTD5)."""
+    raw = shown.strip()
+    d = Decimal(raw.rstrip("%")) / (Decimal(100) if raw.endswith("%") else Decimal(1))
+    return format(d.normalize(), "f")
+
+
+def _r13_stated(written: str, part: str, tier: str) -> dict[str, Any]:
+    """A stated facet: the source's own words (without a leading preposition), the part it was read from and its tier."""
+    assert part in ("row", "column", "caption", "sentence", "lead_in", "heading") and tier in ("own", "context")
+    return {"status": "stated", "written": written, "part": part, "tier": tier}
+
+
+def _r13_none(reason: str) -> dict[str, Any]:
+    """Read, nothing stated: no facet (the displayed wording is "רכיב לא צוין במקור")."""
+    return {"status": "none", "written": None, "part": None, "tier": None, "why": reason}
+
+
+def _r13_datum(did: str, kind: str, unit: str, shown: str, facet: dict[str, Any], *, family: str, quote: str | None = None,
+               table: dict[str, Any] | None = None, note: str | None = None) -> dict[str, Any]:
+    """One datum the case is about. ``shown`` is the number as the document writes it; ``fraction`` is its canonical value
+    for a rate or coefficient; ``family`` is ``coefficient`` or ``proportion`` (a family whose datum needs a facet, KTD3) or
+    ``other``. ``quote`` is the sentence (a quote value) or ``table`` the cell (a table value)."""
+    assert (quote is None) != (table is None), did
+    out: dict[str, Any] = {"id": did, "kind": kind, "unit": unit, "shown": shown, "family": family,
+                           "fraction": _r13_frac(shown) if kind in ("rate", "coefficient") else None,
+                           "where": {"quote": quote} if quote else {"table": table}, "facet": facet}
+    if note:
+        out["note"] = note
+    return out
+
+
+def _r13_cell(blocks: list[Round10Block], caption: str | None, row_label: str, col: int, shown: str) -> dict[str, Any]:
+    """The table cell with ``shown`` in the row ``row_label`` of the table that follows the caption paragraph ``caption``:
+    its table position (from the blocks) and its row label and column header."""
+    for i, (kind, body) in enumerate(blocks):
+        if kind == "table" and (caption is None or (i and blocks[i - 1][1] == caption)):
+            headers = body[0]
+            for r, row in enumerate(body[1:], start=1):
+                if row[0] == row_label and row[col] == shown:
+                    return {"caption": blocks[i - 1][1] if blocks[i - 1][0] == "p" else None, "headers": headers,
+                            "row": r, "column": col, "row_label": row_label, "column_header": headers[col]}
+    raise AssertionError(f"no cell {shown!r} in row {row_label!r}")
+
+
+def _r13_unit_blocks(blocks: list[Round10Block]) -> list[str]:
+    """The blocks of a document as ``unit_file`` texts: paragraphs and headings as they are, a table row as a "|" block."""
+    out: list[str] = []
+    for kind, body in blocks:
+        if kind in ("title", "h1", "h2", "p", "li"):
+            out.append(body)
+        elif kind == "table":
+            out += ["|" + " | ".join(row) for row in body]
+    return out
+
+
+def _r13_doc(key: str, file: str, group: str, u: dict[str, Any], note: str, data: list[dict[str, Any]] | None = None,
+             blocks: list[Round10Block] | None = None, identity: dict[str, Any] | None = None) -> dict[str, Any]:
+    """A round-13 file: the mark, the synthetic marker, then the unit's blocks (``round12_unit_blocks`` of the spec, or the
+    given ``blocks`` for a document built by hand)."""
+    body = blocks if blocks is not None else round12_unit_blocks(u)
+    return {"key": key, "file": file, "title": _title_of(file), "group": group, "note": note, "unit": u, "data": data or [],
+            "blocks": [("mark", ROUND13_MARK), ("p", SYNTHETIC_MARKER), *body], "body": body,
+            "identity": identity if identity is not None else _r12_identity(u), "kind": "appraisal"}
+
+
+def _r13_check(doc: dict[str, Any]) -> None:
+    """Every datum's quote is a block's text (or in one), and its cell is the table cell it names."""
+    texts = [t for k, t in doc["blocks"] if k in ("p", "li", "h1", "h2", "title")]
+    tables = [t for k, t in doc["blocks"] if k == "table"]
+    for d in doc["data"]:
+        where = d["where"]
+        if "quote" in where:
+            assert any(where["quote"] in t for t in texts), (doc["key"], d["id"])
+            assert d["shown"] in where["quote"], (doc["key"], d["id"])
+        else:
+            cell = where["table"]
+            assert any(t[0] == cell["headers"] and t[cell["row"]][cell["column"]] == d["shown"]
+                       and t[cell["row"]][0] == cell["row_label"] for t in tables), (doc["key"], d["id"])
+
+
+def round13_documents() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Every round-13 file in a fixed order, and the AE9 office (``unit_file`` specs, no DOCX but the focus appraisal)."""
+    A, B = ROUND12_CITY_A, ROUND12_CITY_B
+    docs: list[dict[str, Any]] = []
+
+    # --- AE1: a land-valuation table, two reduction coefficients for two considerations, under a dated section ----------
+    u = _r12_unit("הצבעוני", "14", A, "9101", ["31"], "2023-03-01")
+    cap = "טבלת חישוב שווי הקרקע"
+    land_rows = [["רכיב", "ערך"], ["שטח קרקע", "620 מ״ר"], ["שווי למ״ר קרקע מלאה", "4,200 ₪ למ״ר"],
+                 ["מקדם הפחתה בשל זכויות בנייה חלקיות", "0.8"], ["מקדם הפחתה בשל שיתוף במקרקעין", "0.9"],
+                 ["שווי הקרקע", "1,874,880 ₪"]]
+    u["body"] = [("h1", "3. שווי הקרקע למועד הקובע"), ("p", "הערכת שווי הקרקע נערכה למועד הקובע, 01/03/2023."),
+                 ("p", cap), ("table", land_rows)]
+    b = round12_unit_blocks(u)
+    land = [
+        _r13_datum("land.area", "area", "sqm", "620 מ״ר", _r13_stated("שטח קרקע", "row", "own"), family="other",
+                   table=_r13_cell(b, cap, "שטח קרקע", 1, "620 מ״ר")),
+        _r13_datum("land.price_per_sqm", "value_per_area", "ILS_per_sqm", "4,200 ₪ למ״ר",
+                   _r13_stated("שווי למ״ר קרקע מלאה", "row", "own"), family="other",
+                   table=_r13_cell(b, cap, "שווי למ״ר קרקע מלאה", 1, "4,200 ₪ למ״ר")),
+        _r13_datum("land.coef_building", "coefficient", "ratio", "0.8",
+                   _r13_stated("מקדם הפחתה בשל זכויות בנייה חלקיות", "row", "own"), family="coefficient",
+                   table=_r13_cell(b, cap, "מקדם הפחתה בשל זכויות בנייה חלקיות", 1, "0.8"),
+                   note="the row names the consideration; the caption is a context facet only"),
+        _r13_datum("land.coef_sharing", "coefficient", "ratio", "0.9",
+                   _r13_stated("מקדם הפחתה בשל שיתוף במקרקעין", "row", "own"), family="coefficient",
+                   table=_r13_cell(b, cap, "מקדם הפחתה בשל שיתוף במקרקעין", 1, "0.9")),
+        _r13_datum("land.value", "value", "ILS", "1,874,880 ₪", _r13_stated("שווי הקרקע", "row", "own"), family="other",
+                   table=_r13_cell(b, cap, "שווי הקרקע", 1, "1,874,880 ₪")),
+    ]
+    assert 620 * 4200 * 8 * 9 == 1874880 * 100  # 620 × 4,200 × 0.8 × 0.9
+    docs.append(_r13_doc("land_table", f"שומה_רחוב_הצבעוני_14_{A}.docx", "ae1", u,
+                         "AE1: two reduction coefficients (0.8, 0.9) in two rows, each for another consideration, plus "
+                         "area, value-per-m2 and value rows, in a section dated by the unit's valuation date.", land))
+
+    # --- AE2: a capitalization section, one rate per cash flow, two equal numbers, a lead-in rate, a bare rate ------------
+    u = _r12_unit("הכלנית", "8", A, "9102", ["12"], "2023-09-30")
+    s1 = "שיעור היוון של 6.5% לתזרים דמי שכירות ממשרדים."
+    s2 = "שיעור היוון של 7.25% עבור תזרים דמי שכירות מחניות."
+    s3 = "שיעור היוון של 7.25% בגין תזרים דמי שכירות ממחסנים."
+    s4 = "שיעור היוון של 8.5% לתזרים ערך השייר."
+    lead = "תזרים הכנסות משטחי פרסום על הגג:"
+    s5 = "שיעור היוון 9%."
+    s6 = "שיעור היוון 10%."
+    u["body"] = [("h1", "3. היוון התזרימים"), ("p", "להלן שיעורי ההיוון שנקבעו לכל תזרים בנפרד."),
+                 ("p", s1), ("p", s2), ("p", s3), ("p", s4), ("p", lead), ("li", s5),
+                 ("h1", "4. סיכום והערות"), ("p", "השמאי הביא בחשבון את מכלול הנתונים שפורטו."), ("p", s6)]
+    cap_rates = [
+        _r13_datum("cap.offices", "rate", "percent", "6.5%", _r13_stated("תזרים דמי שכירות ממשרדים", "sentence", "own"),
+                   family="proportion", quote=s1),
+        _r13_datum("cap.parking", "rate", "percent", "7.25%", _r13_stated("תזרים דמי שכירות מחניות", "sentence", "own"),
+                   family="proportion", quote=s2, note="same number as cap.storage, another cash flow"),
+        _r13_datum("cap.storage", "rate", "percent", "7.25%", _r13_stated("תזרים דמי שכירות ממחסנים", "sentence", "own"),
+                   family="proportion", quote=s3),
+        _r13_datum("cap.residual", "rate", "percent", "8.5%", _r13_stated("תזרים ערך השייר", "sentence", "own"),
+                   family="proportion", quote=s4),
+        _r13_datum("cap.billboard", "rate", "percent", "9%", _r13_stated("תזרים הכנסות משטחי פרסום על הגג", "lead_in", "context"),
+                   family="proportion", quote=s5,
+                   note="the sentence names no cash flow; the preceding lead-in line (a colon line followed by a list item) does"),
+        _r13_datum("cap.bare", "rate", "percent", "10%",
+                   _r13_none("no cash flow in its sentence, no lead-in, and the nearest heading and the blocks before it name none"),
+                   family="proportion", quote=s6, note="unresolved in a component family: undecided against every other rate"),
+    ]
+    docs.append(_r13_doc("cap_rates", f"שומה_רחוב_הכלנית_8_{A}.docx", "ae2", u,
+                         "AE2: four rates each in a sentence naming its cash flow (two with 7.25%), one rate whose cash "
+                         "flow is only in the list lead-in, one bare rate with none.", cap_rates))
+
+    # --- AE3: three (four) appraisals of ONE property at one valuation date, a coefficient for one consideration ---------
+    row3 = "מקדם הפחתה בשל מגבלות בנייה"
+    coef3 = [("0.8", "ratio"), ("0.85", "ratio"), ("80%", "percent"), ("0.80", "ratio")]
+    for n, (shown, unit) in enumerate(coef3, start=1):
+        u = _r12_unit("הצפצפה", "21", A, "9103", ["5"], "2024-06-30")
+        cap3 = "טבלת מקדמי התאמה"
+        rows3 = [["רכיב", "ערך"], [row3, shown], ["מקדם מיקום", "1.1"]]
+        u["body"] = [("h1", "3. מקדמי התאמה"), ("p", cap3), ("table", rows3)]
+        b = round12_unit_blocks(u)
+        data = [
+            _r13_datum(f"conflict_{n}.coef", "coefficient", unit, shown, _r13_stated(row3, "row", "own"), family="coefficient",
+                       table=_r13_cell(b, cap3, row3, 1, shown)),
+            _r13_datum(f"conflict_{n}.location", "coefficient", "ratio", "1.1", _r13_stated("מקדם מיקום", "row", "own"),
+                       family="coefficient", table=_r13_cell(b, cap3, "מקדם מיקום", 1, "1.1")),
+        ]
+        docs.append(_r13_doc(f"conflict_{n}", f"שומה_רחוב_הצפצפה_21_{A}_{n:02d}.docx", "ae3", u,
+                             f"AE3: appraisal {n} of 4 of one property (הצפצפה 21, block 9103 parcel 5), valuation date "
+                             f"2024-06-30; the coefficient of one consideration is written {shown!r}.", data))
+
+    # --- AE4: the same cash flow in two surface forms (prefix letter, plural / construct, quote marks) --------------------
+    forms = [("שטחי \"מסחר\" בתב״ע", "6.5%", "חניות מקורות", "7.5%"), ("השטחים למסחר בתב\"ע", "6.75%", "החניות המקורות", "7.5%")]
+    for n, (first, first_rate, second, second_rate) in enumerate(forms, start=1):
+        u = _r12_unit("התבואה", "5", A, "9104", ["8"], "2024-12-31")
+        cap4 = "שיעורי היוון לפי תזרים"
+        rows4 = [["תזרים", "שיעור היוון"], [first, first_rate], [second, second_rate]]
+        u["body"] = [("h1", "3. היוון התזרימים"), ("p", cap4), ("table", rows4)]
+        b = round12_unit_blocks(u)
+        data = [
+            _r13_datum(f"forms_{n}.first", "rate", "percent", first_rate, _r13_stated(first, "row", "own"), family="proportion",
+                       table=_r13_cell(b, cap4, first, 1, first_rate)),
+            _r13_datum(f"forms_{n}.second", "rate", "percent", second_rate, _r13_stated(second, "row", "own"),
+                       family="proportion", table=_r13_cell(b, cap4, second, 1, second_rate)),
+        ]
+        docs.append(_r13_doc(f"forms_{n}", f"שומה_רחוב_התבואה_5_{A}_{n:02d}.docx", "ae4", u,
+                             f"AE4: appraisal {n} of 2 of one property (התבואה 5, block 9104 parcel 8), valuation date "
+                             "2024-12-31; its rows name two cash flows, written differently from the other appraisal.", data))
+
+    # --- history: two appraisals of one property in different years, each states ONE unlabelled capitalization rate -------
+    for n, (valuation, rate) in enumerate([("2021-06-30", "7%"), ("2024-06-30", "8%")], start=1):
+        u = _r12_unit("הערמון", "3", A, "9105", ["2"], valuation)
+        sentence = f"שיעור ההיוון שאומץ בשומה: {rate}."
+        u["body"] = [("h1", "3. שיעור היוון"), ("p", sentence)]
+        data = [_r13_datum(f"history_{n}.rate", "rate", "percent", rate,
+                           _r13_none("the sentence names no cash flow and the heading holds only generic words"),
+                           family="proportion", quote=sentence,
+                           note="the only rate of its base key in its unit: a headline datum")]
+        docs.append(_r13_doc(f"history_{n}", f"שומה_רחוב_הערמון_3_{A}_{n:02d}.docx", "history", u,
+                             f"History: appraisal {n} of 2 of one property (הערמון 3, block 9105 parcel 2), valuation date "
+                             f"{valuation}; one unlabelled capitalization rate {rate}.", data))
+
+    # --- the parts of a facet that the cases above do not use: column, caption, heading (and a sentence) ------------------
+    u = _r12_unit("הסביון", "9", A, "9108", ["3"], "2024-03-31")
+    cap_a = "מקדם הפחתה בשל קרבה לקו מתח עליון"
+    cap_b = "טבלת מקדמי התאמה לנכס"
+    sent = "שיעור היוון של 6% לתזרים דמי חכירה מהקרקע."
+    heading_rate = "שיעור היוון 5.5%."
+    rows_a = [["מדד", "ערך"], ["הערך שנקבע", "0.85"]]
+    rows_b = [["נתון", "מקדם מיקום", "מקדם צורת מגרש"], ["הערך שנקבע", "0.95", "1.05"]]
+    u["body"] = [("h1", "3. מקדמים ושיעורים"), ("p", cap_a), ("table", rows_a), ("p", cap_b), ("table", rows_b),
+                 ("p", sent), ("h2", "תזרים הכנסות מתחנת טעינה"), ("p", heading_rate)]
+    b = round12_unit_blocks(u)
+    generic = "the row label (\"הערך שנקבע\") is generic and states no facet"
+    parts = [
+        _r13_datum("parts.caption", "coefficient", "ratio", "0.85", _r13_stated(cap_a, "caption", "context"),
+                   family="coefficient", table=_r13_cell(b, cap_a, "הערך שנקבע", 1, "0.85"), note=generic),
+        _r13_datum("parts.column_location", "coefficient", "ratio", "0.95", _r13_stated("מקדם מיקום", "column", "own"),
+                   family="coefficient", table=_r13_cell(b, cap_b, "הערך שנקבע", 1, "0.95"), note=generic),
+        _r13_datum("parts.column_shape", "coefficient", "ratio", "1.05", _r13_stated("מקדם צורת מגרש", "column", "own"),
+                   family="coefficient", table=_r13_cell(b, cap_b, "הערך שנקבע", 2, "1.05"), note=generic),
+        _r13_datum("parts.sentence", "rate", "percent", "6%", _r13_stated("תזרים דמי חכירה מהקרקע", "sentence", "own"),
+                   family="proportion", quote=sent),
+        _r13_datum("parts.heading", "rate", "percent", "5.5%", _r13_stated("תזרים הכנסות מתחנת טעינה", "heading", "context"),
+                   family="proportion", quote=heading_rate,
+                   note="no lead-in; the nearest heading of its section names the cash flow"),
+    ]
+    docs.append(_r13_doc("facet_parts", f"שומה_רחוב_הסביון_9_{A}.docx", "parts", u,
+                         "Facet parts: a coefficient from a table caption (context), two from a matrix table's column "
+                         "headers (own), a rate from its sentence, a rate from the nearest heading (context).", parts))
+
+    # --- AE8: the appraiser's office in another city, in a declaration block (paragraphs, and a key-value table) ----------
+    declare = [("h1", "3. הצהרת השמאי"), ("p", f"שם המומחה: {ROUND13_APPRAISER}"), ("p", f"מספר רישיון: {ROUND13_LICENCE}"),
+               ("p", f"כתובת: {ROUND13_OFFICE_ADDRESS}, {B}"),
+               ("p", "אני החתומה מטה מצהירה כי אין לי עניין אישי בנכס, ושומה זו נערכה לפי מיטב הידע המקצועי שלי.")]
+    u8 = _r12_unit("הרקפת", "18", A, "9106", ["44"], "2024-12-31", area=85)
+    u8["body"] = [*declare]
+    b8 = round12_unit_blocks(u8)
+    docs.append(_r13_doc("appraiser_office", f"שומה_רחוב_הרקפת_18_{A}_הצהרה.docx", "ae8", u8,
+                         "AE8: the subject (הרקפת 18, עיר-סינתטית, block 9106 parcel 44) is identified in the header; the "
+                         "declaration block gives the appraiser's name, licence and a bare \"כתובת\" office address in "
+                         "another city.", blocks=b8))
+    u8b = _r12_unit("הנורית", "6", A, "9109", ["17"], "2025-02-28", area=72)
+    cover = [["מספר תיק", "2024-0183"], ["שם השמאי", ROUND13_APPRAISER], ["גוש וחלקה", "גוש 9109 חלקה 17"],
+             ["כתובת", "הנורית 6"], ["עיר", A]]
+    declare_table = [["מספר רישיון", ROUND13_LICENCE], ["שם המומחה", ROUND13_APPRAISER],
+                     ["כתובת", f"{ROUND13_OFFICE_ADDRESS}, {B}"]]
+    b8b = [("title", "חוות דעת שמאית — דירת מגורים"), ("table", cover), ("p", "סוג נכס: דירה"),
+           ("p", "המועד הקובע: 28/02/2025"), ("p", "שטח הנכס: 72 מ״ר"), ("h1", "1. מטרת השומה"),
+           ("p", "מסמך לנכס בדוי, לצורכי בדיקות מערכת בלבד."), ("h1", "2. שיקולי השמאי"),
+           ("p", "השמאי בחן נתוני שוק בסביבת הנכס."), ("h1", "3. הצהרת השמאי"), ("table", declare_table),
+           ("p", "אני החתום מטה מצהיר כי אין לי עניין אישי בנכס.")]
+    ident_b = {**_r12_identity(u8b), "identification_in": "cover_table"}
+    docs.append(_r13_doc("appraiser_office_table", f"חוות_דעת_שמאית_הנורית_6_{A}_טבלת_הצהרה.docx", "ae8", u8b,
+                         "AE8: the subject is identified only in a cover table (an appraiser row above a block-and-parcel "
+                         "row and a bare \"כתובת\" subject row, then \"עיר\"); the declaration is a two-column key-value "
+                         "table with the licence, the name and a bare \"כתובת\" office address in another city.",
+                         blocks=b8b, identity=ident_b))
+
+    # --- AE9: an office whose unidentified units include two that mention the property's street and number -----------------
+    focus = _r12_unit("הדגנית", "22", A, "9107", ["6"], "2024-05-31")
+    docs.append(_r13_doc("office_focus", f"שומה_רחוב_הדגנית_22_{A}.docx", "ae9", focus,
+                         "AE9: the identified appraisal of the focus property; the office's other units are in "
+                         "manifest[\"office_ae9\"] (unit_file specs)."))
+    return docs, _r13_office_ae9(focus)
+
+
+def _r13_office_ae9(focus: dict[str, Any]) -> dict[str, Any]:
+    """The AE9 office as ``unit_file`` specs: the focus appraisal, another identified property, and twenty unidentified
+    units (no address, city, block or parcel), two of which mention the focus street and number in their text."""
+    street_no = f"{focus['street']} {focus['number']}"
+    mention = {7: f"בסקירת השמאי נזכר הנכס ברחוב {street_no}, ובסביבתו נבחנו נתוני שוק.",
+               15: f"לצורך ההשוואה נבדק גם נכס ברחוב {street_no}."}
+    other = _r12_unit("הנחל", "2", ROUND12_CITY_A, "9110", ["9"], "2024-01-31")
+    units: list[dict[str, Any]] = [
+        {"role": "focus", "class": "identified", "title": round12_unit_blocks(focus)[0][1], "aliases": [], "kind": "appraisal",
+         "certainty": "certain", "identifiers": [f"{street_no}, {ROUND12_CITY_A}"],
+         "blocks": _r13_unit_blocks(round12_unit_blocks(focus))},
+        {"role": "other_property", "class": "other", "title": round12_unit_blocks(other)[0][1], "aliases": [],
+         "kind": "appraisal", "certainty": "certain", "identifiers": [f"הנחל 2, {ROUND12_CITY_A}"],
+         "blocks": _r13_unit_blocks(round12_unit_blocks(other))},
+    ]
+    for n in range(1, 21):
+        valuation = date(2020 + n % 5, n % 12 + 1, 28).isoformat()
+        blocks = ["שומת מקרקעין (בדויה)", "סוג נכס: דירה", f"המועד הקובע: {_r12_text(valuation)}",
+                  f"שטח הנכס: {60 + 3 * n} מ״ר", f"שווי הנכס: {_round11_money(1_500_000 + 40_000 * n)} ₪",
+                  "מסמך לנכס בדוי, לצורכי בדיקות מערכת בלבד."]
+        if n in mention:
+            blocks.insert(5, mention[n])
+        units.append({"role": "unidentified", "class": "candidate" if n in mention else "unlinkable", "n": n,
+                      "title": None, "aliases": [], "kind": "appraisal", "certainty": "certain", "identifiers": [],
+                      "blocks": blocks, "valuation_date": valuation, "mentions_focus": n in mention,
+                      **({"would_leave_candidate_class_when_read": True,
+                          "why": "a comparable's mention: read under a comparables sentence, it is another subject"}
+                         if n == 15 else {})})
+    assert sum(u["class"] == "candidate" for u in units) == 2 and sum(u["class"] == "unlinkable" for u in units) == 18
+    assert not any(street_no in " ".join(u["blocks"]) or focus["street"] in " ".join(u["blocks"])
+                   for u in units if u["class"] == "unlinkable")
+    return {"focus_property": _r12_identity(focus), "expected": {"candidates": 2, "unlinkable": 18, "other_properties": 1,
+                                                                  "blocks_completeness": "the two candidates only",
+                                                                  "named_candidates": [u["n"] for u in units
+                                                                                      if u["class"] == "candidate"]},
+            "units": units, "note": "build with tests.support.unit_files.unit_file(office, group, title, [dicts without "
+            "the role/class/n/valuation_date/mentions_focus keys]); the unidentified units are numbered 1..20 in reading "
+            "order after the two identified ones"}
+
+
+# --- the pairwise decisions the cases name (KTD3): (case, a, b, decision, why) -------------------------------------------
+
+def _r13_pairs() -> list[tuple[str, str, str, str, str]]:
+    cases: list[tuple[str, str, str, str, str]] = [
+        ("AE1", "land.coef_building", "land.coef_sharing", "different",
+         "two rows of one table, each core keeps a content word the other lacks"),
+        ("AE2", "cap.offices", "cap.parking", "different", "own cash-flow facets with disjoint content words, one section"),
+        ("AE2", "cap.offices", "cap.storage", "different", "own cash-flow facets with disjoint content words, one section"),
+        ("AE2", "cap.offices", "cap.residual", "different", "own cash-flow facets with disjoint content words, one section"),
+        ("AE2", "cap.parking", "cap.storage", "different",
+         "the same number 7.25% for two cash flows: two classes, two rows after _dedupe"),
+        ("AE2", "cap.parking", "cap.residual", "different", "own cash-flow facets with disjoint content words, one section"),
+        ("AE2", "cap.storage", "cap.residual", "different", "own cash-flow facets with disjoint content words, one section"),
+        ("AE2", "cap.billboard", "cap.offices", "different",
+         "a context facet from the lead-in against an own facet, disjoint content words, one section"),
+        ("AE2", "cap.bare", "cap.offices", "undecided", "an unresolved facet in a component family is never same or different"),
+        ("AE2", "cap.bare", "cap.parking", "undecided", "an unresolved facet in a component family"),
+        ("AE2", "cap.bare", "cap.storage", "undecided", "an unresolved facet in a component family"),
+        ("AE2", "cap.bare", "cap.residual", "undecided", "an unresolved facet in a component family"),
+        ("AE2", "cap.bare", "cap.billboard", "undecided", "an unresolved facet in a component family"),
+        ("AE3", "conflict_1.coef", "conflict_2.coef", "same", "the same row label, own facets with equal cores: 0.8 against 0.85"),
+        ("AE3", "conflict_1.coef", "conflict_3.coef", "same", "the same row label: 0.8 against \"80%\" (percent against fraction)"),
+        ("AE3", "conflict_2.coef", "conflict_3.coef", "same", "the same row label: 0.85 against \"80%\""),
+        ("AE3", "conflict_1.coef", "conflict_4.coef", "same", "the same row label: 0.8 against 0.80 (trailing zero)"),
+        ("AE3", "conflict_3.coef", "conflict_4.coef", "same", "the same row label: \"80%\" against 0.80"),
+        ("AE3", "conflict_2.coef", "conflict_4.coef", "same", "the same row label: 0.85 against 0.80"),
+        ("AE3", "conflict_1.coef", "conflict_1.location", "different", "two rows of one table"),
+        ("AE3", "conflict_1.location", "conflict_2.location", "same", "the same row label, 1.1 against 1.1: equal, no conflict"),
+        ("AE3", "conflict_1.coef", "conflict_2.location", "undecided",
+         "different row labels in two units: disjoint across units (the facet rule is not transitive)"),
+        ("AE4", "forms_1.first", "forms_2.first", "same",
+         "שטחי \"מסחר\" בתב״ע against השטחים למסחר בתב\"ע: a prefix letter, plural and construct endings, quote marks and "
+         "gershayim; compared, and 6.5% against 6.75% conflict"),
+        ("AE4", "forms_1.second", "forms_2.second", "same", "חניות מקורות against החניות המקורות: the prefix letter; 7.5% = 7.5%"),
+        ("AE4", "forms_1.first", "forms_1.second", "different", "two rows of one table"),
+        ("AE4", "forms_2.first", "forms_2.second", "different", "two rows of one table"),
+        ("AE4", "forms_1.first", "forms_2.second", "undecided", "disjoint facets across two units"),
+        ("AE4", "forms_1.second", "forms_2.first", "undecided", "disjoint facets across two units"),
+        ("history", "history_1.rate", "history_2.rate", "same",
+         "both headline data: the only rate of its base key in its unit; the periods do not overlap, so no conflict"),
+        ("parts", "parts.column_location", "parts.column_shape", "different", "two columns of one matrix table"),
+    ]
+    return cases
+
+
+def _r13_decided_pairs(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The named pairs with the consequence each decision has (R4-R6): a "same" pair with different amounts and overlapping
+    periods is a conflict, an "undecided" one with different amounts and overlapping periods gets the undecided mark, a
+    "different" one is neither. Amounts are compared as canonical fractions and periods overlap when the units' valuation
+    dates are equal (every datum here is dated by its unit's valuation date)."""
+    index = {d["id"]: (d, doc) for doc in docs for d in doc["data"]}
+    out = []
+    for case, a, b, decision, why in _r13_pairs():
+        (da, doc_a), (db, doc_b) = index[a], index[b]
+        equal = da["fraction"] == db["fraction"]
+        overlap = doc_a["unit"]["valuation"] == doc_b["unit"]["valuation"]
+        assert decision in ("same", "different", "undecided"), (a, b)
+        out.append({"case": case, "a": a, "b": b, "decision": decision, "why": why, "same_unit": doc_a["key"] == doc_b["key"],
+                    "same_property": doc_a["identity"]["address"] == doc_b["identity"]["address"],
+                    "amounts_equal": equal, "periods_overlap": overlap,
+                    "conflict": decision == "same" and overlap and not equal,
+                    "undecided_mark": decision == "undecided" and overlap and not equal})
+    return out
+
+
+def _r13_cases(docs: list[dict[str, Any]], pairs: list[dict[str, Any]], office: dict[str, Any]) -> list[dict[str, Any]]:
+    """Per acceptance example: the documents that exercise it and the outcome the plan expects (AE5-AE7 are answer-level
+    examples with no fixture of their own; the derived reduction 1 - x of AE5 is stated for the AE1 coefficients)."""
+    def conflicts(case: str) -> list[list[str]]:
+        return [[p["a"], p["b"]] for p in pairs if p["case"] == case and p["conflict"]]
+
+    def equal(case: str) -> list[list[str]]:
+        return [[p["a"], p["b"]] for p in pairs if p["case"] == case and p["decision"] == "same" and p["amounts_equal"]]
+
+    cap = next(d for d in docs if d["key"] == "cap_rates")
+    undecided_marks = [[p["a"], p["b"]] for p in pairs if p["case"] == "AE2" and p["undecided_mark"]]
+    return [
+        {"id": "AE1", "covers": "R1, R3, R8, R9", "documents": ["land_table"],
+         "expected": {"conflict_marks": 0, "uncertain_marks": 0, "timeline_blocks_joining_the_coefficients": 0,
+                      "breakdown": [{"unit_valuation_date": "2023-03-01",
+                                     "rows": ["land.coef_building", "land.coef_sharing"],
+                                     "facets_shown": ["מקדם הפחתה בשל זכויות בנייה חלקיות", "מקדם הפחתה בשל שיתוף במקרקעין"]}],
+                      "derived_reductions_ae5": {"land.coef_building": "20%", "land.coef_sharing": "10%",
+                                                 "rule": "1 - x, shown as a percent; a different percent is not derived"},
+                      "date": "2023-03-01"}},
+        {"id": "AE2", "covers": "R1, R2, R3, R6, R10", "documents": ["cap_rates"],
+         "expected": {"facets": {d["id"]: d["facet"]["status"] for d in cap["data"]},
+                      "conflict_marks": 0, "undecided_marks": undecided_marks,
+                      "breakdown_rows": [d["id"] for d in cap["data"]],
+                      "equal_numbers_stay_two_rows": ["cap.parking", "cap.storage"],
+                      "no_facet_row_label": _R13_NO_FACET,
+                      "lead_in_case": "cap.billboard (facet from the lead-in)", "bare_case": "cap.bare (undecided, never a conflict)"}},
+        {"id": "AE3", "covers": "R4, R5", "documents": ["conflict_1", "conflict_2", "conflict_3", "conflict_4"],
+         "expected": {"same_property": True, "valuation_date": "2024-06-30", "conflicting_pairs": conflicts("AE3"),
+                      "equal_pairs_not_a_conflict": equal("AE3"),
+                      "note": "the plan's AE3 names 0.8 and 0.85 as the conflict, one coefficient written \"80%\" and a "
+                              "third 0.80; here conflict_3 writes \"80%\" and conflict_4 writes 0.80, so each equality is covered"}},
+        {"id": "AE4", "covers": "R3", "documents": ["forms_1", "forms_2"],
+         "expected": {"decided_same": [[p["a"], p["b"]] for p in pairs if p["case"] == "AE4" and p["decision"] == "same"],
+                      "conflicting_pairs": conflicts("AE4"), "equal_pairs": equal("AE4")}},
+        {"id": "history", "covers": "KTD3 headline data, R8", "documents": ["history_1", "history_2"],
+         "expected": {"decision": "same", "timeline_blocks": 1, "rows": ["history_1.rate", "history_2.rate"],
+                      "conflict_marks": 0, "undecided_marks": 0, "breakdown": 0}},
+        {"id": "parts", "covers": "R1 (parts column, caption, sentence, heading)", "documents": ["facet_parts"],
+         "expected": {"parts": {d["id"]: d["facet"]["part"] for d in next(x for x in docs if x["key"] == "facet_parts")["data"]}}},
+        {"id": "AE8", "covers": "R11", "documents": ["appraiser_office", "appraiser_office_table"],
+         "expected": {"identity": {d["key"]: d["identity"] for d in docs if d["group"] == "ae8"},
+                      "no_facts_from": {"street": "הנחושת", "number": "3", "city": ROUND12_CITY_B,
+                                        "appraiser_name": ROUND13_APPRAISER, "licence": ROUND13_LICENCE},
+                      "city_conflict": False, "group_label_names_one_address": True,
+                      "labels": {"appraiser_office": f"הרקפת 18, {ROUND12_CITY_A}",
+                                 "appraiser_office_table": f"הנורית 6, {ROUND12_CITY_A}"},
+                      "subject_rows_kept": "the cover table keeps the block-and-parcel row and the bare \"כתובת\" subject "
+                                           "row below the appraiser row; the bare \"כתובת\" office rows give no fact"}},
+        {"id": "AE9", "covers": "R18", "documents": ["office_focus"], "office": "office_ae9",
+         "expected": office["expected"]},
+    ]
+
+
+def write_round13(out: Path) -> None:
+    """Writes the round-13 fixtures and ``manifest.json``: per document its file, identity, valuation date, data (each with
+    its facet), tables and ``unit_file`` blocks; the named pairwise decisions with their consequences; per acceptance
+    example the documents and the expected outcome; and the AE9 office as ``unit_file`` specs - all from the generator's
+    own spec (never read back)."""
+    rdir = out / ROUND13_DIR
+    rdir.mkdir(parents=True, exist_ok=True)
+    documents, office = round13_documents()
+    keys = [d["key"] for d in documents]
+    files = [d["file"] for d in documents]
+    assert len(set(keys)) == len(keys) and len(set(files)) == len(files), "duplicate key or file name"
+    ids = [x["id"] for d in documents for x in d["data"]]
+    assert len(set(ids)) == len(ids), "duplicate datum id"
+    docs: dict[str, dict[str, Any]] = {}
+    for d in documents:
+        _r13_check(d)
+        data = render_round10_docx(d["blocks"], d["title"], mark=ROUND13_MARK)
+        (rdir / d["file"]).write_bytes(data)
+        print(f"wrote {ROUND13_DIR}/{d['file']} ({len(data):,} bytes)")
+        valuation = d["unit"]["valuation"]
+        docs[d["key"]] = {
+            "key": d["key"], "file": f"{ROUND13_DIR}/{d['file']}", "title": d["title"], "source_kind": d["kind"],
+            "group": d["group"], "note": d["note"], "identity": d["identity"],
+            "valuation_date": valuation, "valuation_date_text": _r12_text(valuation),
+            "data": d["data"],
+            "tables": [{"caption": d["blocks"][i - 1][1] if d["blocks"][i - 1][0] == "p" else None,
+                        "headers": t[0], "rows": t[1:]} for i, (k, t) in enumerate(d["blocks"]) if k == "table"],
+            "unit_blocks": _r13_unit_blocks(d["body"]),
+            "paragraphs": [t for k, t in d["blocks"] if k in ("mark", "p", "li")],
+        }
+    pairs = _r13_decided_pairs(documents)
+    seen = {(p["a"], p["b"]) for p in pairs}
+    assert len(seen) == len(pairs), "duplicate pair"
+    manifest = {
+        "about": f"{ROUND13_MARK}. Known contents of the round-13 fixtures (a land table with two reduction coefficients; a "
+                 "capitalization section with rates by cash flow, a lead-in rate and a bare rate; four appraisals of one "
+                 "property with a coefficient for one consideration; one cash flow written in two forms; two appraisals "
+                 "of one property in different years; every facet part; two declaration blocks that give the appraiser's "
+                 "office in another city; an office of unidentified units for the coverage classes); generated by "
+                 "scripts/generate_fixtures.py --only round13 from the generator's own text (never read back from the "
+                 "files) - do not edit by hand. Every name, address, city, block, parcel, licence and amount is invented.",
+        "synthetic_marker": ROUND13_MARK,
+        "cities": [ROUND12_CITY_A, ROUND12_CITY_B],
+        "facet_vocabulary": {
+            "status": {"stated": "the source states it", "none": "read, nothing stated (shown as \"" + _R13_NO_FACET + "\")",
+                       "not_read": "not read (no fixture here)"},
+            "part": ["row", "column", "caption", "sentence", "lead_in", "heading"],
+            "tier": {"own": "the value's own row label, its column header in a matrix table, or the purpose phrase of its "
+                            "own sentence", "context": "the table caption, the list lead-in or the nearest heading"},
+            "written": "the source's words without a leading preposition (ל / עבור / בגין); compare normalized, not as "
+                       "strings",
+            "families": {"coefficient": "needs a facet", "proportion": "needs a facet (rates, percentages)",
+                         "other": "an empty facet is the unit's headline datum"},
+            "scope": "the data listed are the ones each case is about; the header lines (area, valuation date) are not "
+                     "listed and assert no facet"},
+        "decision_vocabulary": {
+            "same": "one datum: compared, and a conflict when amounts differ and periods overlap",
+            "different": "parallel components: never a conflict",
+            "undecided": "cannot be established: marked \"השוואה לא הוכרעה\" when amounts differ and periods overlap, "
+                         "naming the other value; neither a conflict nor agreement"},
+        "pairs": pairs,
+        "cases": _r13_cases(documents, pairs, office),
+        "documents": docs,
+        "office_ae9": office,
+    }
+    text_ = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+    (rdir / ROUND13_MANIFEST).write_text(text_, encoding="utf-8")
+    print(f"wrote {ROUND13_DIR}/{ROUND13_MANIFEST} ({len(text_):,} chars)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--font-dir", default=DEFAULT_FONT_DIR)
     parser.add_argument("--out", default="tests/fixtures")
-    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9", "round10", "round11", "round12"],
+    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9", "round10", "round11", "round12", "round13"],
                         default="all",
                         help="regions: write only the uncovered-region fixtures (tests/fixtures/regions/); "
                              "positions: only the page-position fixtures (tests/fixtures/positions/); "
@@ -6582,7 +7104,9 @@ def main() -> None:
                              "round11: only the round-11 multi-date fixtures (DOCX) and their manifest "
                              "(tests/fixtures/round11/); "
                              "round12: only the round-12 identity, date and attribute fixtures (DOCX) and their manifest "
-                             "(tests/fixtures/round12/)")
+                             "(tests/fixtures/round12/); "
+                             "round13: only the round-13 facet, decision, identity and coverage fixtures (DOCX) and their "
+                             "manifest (tests/fixtures/round13/)")
     args = parser.parse_args()
     font_dir = Path(args.font_dir)
     out = Path(args.out)
@@ -6613,6 +7137,9 @@ def main() -> None:
         return
     if args.only == "round12":
         write_round12(out)
+        return
+    if args.only == "round13":
+        write_round13(out)
         return
 
     docs: dict[str, dict[str, Any]] = {}
@@ -6666,6 +7193,7 @@ def main() -> None:
     write_round10(out)
     write_round11(out)
     write_round12(out)
+    write_round13(out)
 
 
 if __name__ == "__main__":
