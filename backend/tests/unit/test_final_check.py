@@ -1150,3 +1150,149 @@ def test_support_named_in_a_source_the_sentence_does_not_cite_is_refused_when_th
     assert (p.check, p.failure_kind, p.cause) == ("final", "absent_from_source", "")
     assert p.reason.startswith(final_check.FINAL_UNSUPPORTED.format(reason="")) and "S2" in p.reason, p.reason
     assert out.final_digest == text_digest(md)
+
+
+# --- round 13 U11 (KTD13, R16, AE7): the final text reads whole after removals -------------------------------------------
+
+LEAD = "הנתונים לחלקה 7 הם:"
+BULLET_A = "- מקדם א הוא 0.8 [S1]"
+BULLET_B = "- מקדם ב הוא 0.9 [S1]"
+BACK = "שני המקדמים לעיל חלים על כל החלקה [S1]."
+COEFFICIENTS = "חלקה 7: מקדם א 0.8, מקדם ב 0.9. שני המקדמים חלים על כל החלקה."
+COEFFICIENT_QUESTION = "מה המקדמים בחלקה 7?"
+
+
+def _coefficient_rule(removed: bool):
+    """Verification: the two bullets are unsupported (``removed``) or supported. The final check, shown the sentence that
+    refers back with its removed predecessors (``removed_before``), names them in ``depends_on``."""
+    def rule(text, input, n):
+        if "מקדם" in text and "לעיל" not in text and "שני" not in text:
+            return "unsupported" if removed else "supported"
+        if "לעיל" in text and 'removed_before="' in input:
+            ids = re.search(r'<preceding unit="\d+" removed_before="([\d,]+)"', input).group(1)
+            return {"verdict": "supported", "depends_on": [int(i) for i in ids.split(",")]}
+        return "supported"
+
+    return rule
+
+
+def _coefficient_turn(offline, rule, answer: str | None = None):
+    offline.texts = [COEFFICIENTS]
+    answer = answer or f"{LEAD}\n{BULLET_A}\n{BULLET_B}\n{BACK}"
+    judge = Judge(rule)
+    return _turn(ScriptedAgent([SEARCH, final(answer), final(answer), final(answer)], judge=judge),
+                 COEFFICIENT_QUESTION), judge
+
+
+def test_ae7_when_both_bullets_are_removed_the_lead_in_goes_and_the_sentence_that_refers_back_is_removed_as_dependent(offline):
+    out, judge = _coefficient_turn(offline, _coefficient_rule(True))
+    md = out.answer.answer_markdown
+    assert LEAD not in md and "לעיל" not in md and "מקדם" not in md.split("\n\n> ")[0], md
+    removals = {p.unit.index: p for p in out.report.removals()}
+    assert set(removals) == {0, 1, 2, 3}
+    assert removals[0].check == "dependency" and removals[3].check == "dependency"
+    assert removals[3].failure_kind == removals[1].failure_kind and removals[3].basis
+    # the sentence was judged again, as saved, with the removed units beside it and the text that stays before it
+    final_input = judge.inputs[-1]
+    assert '<preceding unit="3" removed_before="0,1,2">' in final_input and "<removed_units>" in final_input
+    assert _purposes(out).count("verify_final") == 1
+    assert out.final_digest == text_digest(md)
+
+
+def test_ae7_when_the_bullets_stay_both_sentences_stay_and_nothing_is_judged_again(offline):
+    out, _ = _coefficient_turn(offline, _coefficient_rule(False))
+    md = out.answer.answer_markdown
+    assert md == f"{LEAD}\n{BULLET_A}\n{BULLET_B}\n{BACK}"
+    assert "verify_final" not in _purposes(out) and out.report.removals() == []
+
+
+def test_a_back_reference_with_no_removed_predecessor_is_not_judged_again(offline):
+    """"כאמור" before a unit that was removed is no orphan: the sentence's key is its draft key and its verdict is reused."""
+    offline.texts = [SOURCE]
+    answer = "השווי למ\"ר הוא 9,500 ₪ [S1].\nכאמור, הנכס פנוי [S1].\nהשטח המותר הוא 77 מ״ר [S1]."
+
+    def rule(text, input, n):
+        return {"verdict": "unsupported", "failure": "absent_from_source"} if "77" in text else "supported"
+
+    out = _turn(ScriptedAgent([SEARCH, final(answer), final(answer), final(answer)], judge=Judge(rule)),
+                "מה השווי?")
+    md = out.answer.answer_markdown
+    assert "כאמור" in md and "77" not in md
+    assert "verify_final" not in _purposes(out) and out.final_digest == text_digest(md)
+
+
+def test_a_back_reference_sentence_is_judged_again_only_in_the_section_the_removal_was_in(offline):
+    offline.texts = [SOURCE]
+    answer = ("## א\nהשטח המותר הוא 77 מ״ר [S1].\n## ב\nהשווי למ\"ר הוא 9,500 ₪ [S1].\nכאמור, הנכס פנוי [S1].")
+
+    def rule(text, input, n):
+        return {"verdict": "unsupported", "failure": "absent_from_source"} if "77" in text else "supported"
+
+    out = _turn(ScriptedAgent([SEARCH, final(answer), final(answer), final(answer)], judge=Judge(rule)), "מה השווי?")
+    assert "כאמור" in out.answer.answer_markdown and "verify_final" not in _purposes(out)
+
+
+def test_a_back_reference_the_judge_finds_independent_stays(offline):
+    out, judge = _coefficient_turn(
+        offline, lambda t, i, n: "unsupported" if "מקדם ב" in t and "לעיל" not in t else "supported")
+    shown = re.search(r'<preceding unit="3" removed_before="2">(.*?)</preceding>', judge.inputs[-1], re.S).group(1)
+    assert "מקדם א הוא 0.8" in shown and "מקדם ב" not in shown  # what stays before it, not what was removed
+    md = out.answer.answer_markdown
+    assert BULLET_A in md and BACK in md and "מקדם ב" not in md.split("\n\n> ")[0].replace(BACK, "")
+    assert _purposes(out).count("verify_final") == 1  # judged again: a predecessor was removed
+    assert out.report.removed_units() == {2}
+
+
+def test_without_time_a_back_reference_after_a_removal_is_withheld_not_kept_unchecked(offline, monkeypatch):
+    monkeypatch.setattr(final_check, "FINAL_MIN_SECONDS", 10**6)
+    out, _ = _coefficient_turn(offline, _coefficient_rule(True))
+    md = out.answer.answer_markdown
+    assert "verify_final" not in _purposes(out) and "לעיל" not in md
+    sentence = next(p for p in out.report.removals() if p.unit.index == 3)
+    assert sentence.failure_kind == "not_checked" and sentence.cause == "time_limit"
+    assert out.final_digest == text_digest(md)
+
+
+def test_a_lead_in_whose_items_the_final_check_removed_goes_with_them(offline):
+    """U10 removed a lead-in whose items verification removed; the same when the FINAL check removed them (R16)."""
+    offline.texts = [f"{COEFFICIENTS} השווי למ\"ר הוא 9,500 ₪."]
+    items = f"- מקדם א הוא 0.8, {CLAUSE} [S1]\n- מקדם ב הוא 0.9, {CLAUSE} [S1]"
+
+    def rule(text, input, n):
+        if n == 1 and CLAUSE in text:
+            return {"verdict": "partial", "defect": "part", "claims": [
+                {"span": text.replace(f", {CLAUSE}", ""), "verdict": "supported"},
+                {"span": CLAUSE, "verdict": "unsupported", "failure": "absent_from_source"}]}
+        return {"verdict": "unsupported", "failure": "absent_from_source"} if MARKER in text else "supported"
+
+    answer = f"{LEAD}\n{items}\n{VALUE}"
+    out = _turn(ScriptedAgent([SEARCH, final(answer), final(answer), final(answer)], judge=Judge(rule)),
+                COEFFICIENT_QUESTION)
+    md = out.answer.answer_markdown
+    assert md.startswith(VALUE) and LEAD not in md and "מקדם" not in md.split("\n\n> ")[0]
+    lead = next(p for p in out.report.removals() if p.unit.index == 0)
+    assert lead.check == "dependency" and lead.failure_kind == "absent_from_source" and lead.basis
+    assert {p.check for p in out.report.removals() if p.unit.index in (1, 2)} == {"final"}
+    assert out.final_digest == text_digest(md)
+
+
+def test_a_first_line_a_cut_would_leave_without_a_word_is_removed_whole_and_the_saved_text_opens_with_substance(offline):
+    """KTD13 rule 1: "הפחתה של" fails and only "20%" would stand beside a marker. The unit goes whole, with no marker, as a
+    dependency; the registry has the removal note only, and the text recomposes to the byte (the fixed point)."""
+    offline.texts = ["מקדם הפחתה 20% נקבע לחלקה. " + SOURCE]
+    stub = "הפחתה של"
+
+    def rule(text, input, n):
+        if n == 1 and stub in text:
+            return {"verdict": "partial", "defect": "part", "claims": [
+                {"span": stub, "verdict": "unsupported", "failure": "absent_from_source"},
+                {"span": "20%", "verdict": "supported"}]}
+        return "supported"
+
+    answer = f"{stub} 20% [S1].\n{VALUE}"
+    out = _turn(ScriptedAgent([SEARCH, final(answer), final(answer), final(answer)], judge=Judge(rule)), "מה ההפחתה?")
+    md = out.answer.answer_markdown
+    assert md.startswith(VALUE) and MARKER not in md and "20%" not in md.split("\n\n> ")[0]
+    (p,) = out.report.removals()
+    assert p.check == "dependency" and p.unit.index == 0 and p.failure_kind == "absent_from_source"
+    assert _kinds(out) == ["removal_note"] and out.final_digest == text_digest(md)

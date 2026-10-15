@@ -243,7 +243,7 @@ def test_the_rows_of_the_normal_payload_name_the_claim_the_action_and_the_marker
     assert [r["text"] for r in rows] == [verify.REMOVAL_SENTENCES["absent_from_source"]] * 2
     assert set(m["answer"]["verification"]) <= {"judged", "judge_status", "removed", "partial", "annotated",
                                                 "request_mismatch", "conditional", "correctness", "completeness",
-                                                "removals", "final_digest", "actions"}
+                                                "removals", "final_digest", "actions", "edited"}
 
 
 def test_every_handled_claim_has_a_log_entry_with_the_whole_record_and_the_rows_pair_with_it_by_claim_id(

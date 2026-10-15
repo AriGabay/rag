@@ -1520,15 +1520,38 @@ def test_the_judge_policy_names_the_server_held_line_and_the_derived_computation
     assert verify.SERVER_HELD in verify.JUDGE_POLICY and "derived" in verify.JUDGE_POLICY
 
 
-# --- the judge contract is version 8: a verdict of an older contract is not reused (round 13 U9, KTD19) --------------------
+# --- the judge contract is version 9: a verdict of an older contract is not reused (round 13 U9, U11, KTD19) ---------------
 
-def test_a_verdict_cached_under_judge_contract_7_misses_under_8(monkeypatch):
-    assert verify.JUDGE_VERSION == 8
+def test_a_verdict_cached_under_judge_contract_8_misses_under_9(monkeypatch):
+    assert verify.JUDGE_VERSION == 9
     ws, a, cache = _valued(), _answer("הנכס פנוי [S1]."), verify.VerdictCache()
     judge, seen = _recording_supported()
-    monkeypatch.setattr(verify, "JUDGE_VERSION", 7)
+    monkeypatch.setattr(verify, "JUDGE_VERSION", 8)
     verify_answer(judge, a, ws, "?", [], cache=cache)
     assert verify_answer(judge, a, ws, "?", [], cache=cache).reused == 1
-    monkeypatch.setattr(verify, "JUDGE_VERSION", 8)
+    monkeypatch.setattr(verify, "JUDGE_VERSION", 9)
     assert verify_answer(judge, a, ws, "?", [], cache=cache).reused == 0
     assert verify_answer(judge, a, ws, "?", [], cache=cache).reused == 1
+
+
+# --- back-references and the final check's rule 31 (round 13 U11, KTD13 rule 3) -------------------------------------------
+
+@pytest.mark.parametrize("text", [
+    "שני המקדמים לעיל חלים על כל החלקה.", "כאמור, השטח אינו משתנה.", "וכאמור השטח אינו משתנה.", "הנתון האמור נכון.",
+    "לפי האמור בסעיף 3.", "שלושת השיעורים נקבעו כך.", "המקדמים האלה נקבעו כך.", "הערכים הנ\"ל נקבעו כך.",
+    "הערכים הנ״ל נקבעו כך.", "השיעורים הללו נקבעו כך.", "זכויות הבנייה לעיל.",
+])
+def test_a_sentence_that_refers_back_is_recognised(text):
+    assert verify.has_back_reference(text)
+
+
+@pytest.mark.parametrize("text", [
+    "מקדם א הוא 0.8.", "השטח העיקרי הוא 1,200 מ״ר.", "המקדמים נקבעו בשומה.", "שניים מהמקדמים נקבעו בשומה.",
+    "הוא אמר שיעלה.", "תיאורטית השווי גבוה.", "",
+])
+def test_a_sentence_that_refers_to_nothing_before_it_is_not(text):
+    assert not verify.has_back_reference(text)
+
+
+def test_the_judge_policy_names_the_preceding_text_and_the_removed_predecessors():
+    assert "<preceding" in verify.JUDGE_POLICY and "removed_before" in verify.JUDGE_POLICY

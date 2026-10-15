@@ -17,7 +17,17 @@ from app.chat.verify import Expansion, TurnRequirements, verify_answer
 from app.providers.llm import Purpose
 from tests.support.scripted_provider import ScriptedProvider
 from tests.unit.test_verify_reread import FakeFetcher
-from tests.unit.test_verify_units import _answer, _judge, _registered
+from tests.unit.test_verify_units import (
+    AREA,
+    LEAD_IN,
+    LEAD_SOURCE,
+    MARKER_1,
+    _answer,
+    _claims_judge,
+    _judge,
+    _registered,
+    _ws,
+)
 
 RENT = "שכר דירה 5,000 ₪"  # the quote states no period
 RENT_MONTHLY = "שכר דירה חודשי 5,000 ₪"
@@ -435,3 +445,86 @@ def test_a_round_that_follows_reuses_the_notes_already_read(monkeypatch):
     n = len(fetcher.calls)
     a, r = _read(VAT_UNIT, ws, fetcher)
     assert len(fetcher.calls) == n and r.qualifier_edits == {} and r.removed_units() == set()
+
+
+# --- coherence after a cut (round 13 U11, KTD13, R16, AE7) -------------------------------------------------------------------
+
+REDUCTION_SOURCE = "מקדם הפחתה 20% נקבע לחלקה. השטח העיקרי בתא שטח 1 הוא 1,200 מ״ר."
+STUB = "הפחתה של"  # the claim the judge fails; the standing claim "20%" is left with no word of its own
+STUB_UNIT = f"{STUB} 20% [S1]."
+
+
+def _stub_judge():
+    """A judge that splits the stub unit into a failing "הפחתה של" and a standing "20%"; every other unit is supported."""
+    return _claims_judge(lambda t: [(STUB, "unsupported", {"failure": "absent_from_source"}), ("20%", "supported")]
+                         if STUB in t else None)
+
+
+def test_a_cut_that_leaves_no_word_is_a_whole_unit_removal_with_no_marker_and_the_answer_opens_with_substance():
+    a = _answer(f"{STUB_UNIT}\n{AREA} [S1].")
+    r = verify_answer(_stub_judge(), a, _ws(REDUCTION_SOURCE), "?", [])
+    assert r.cuts == {} and r.removed_units() == {0} and r.ok
+    (p,) = r.removals()
+    assert p.check == "dependency" and p.failure_kind == "absent_from_source" and p.basis and p.claim_id
+    text = r.edit(a).doc.text
+    assert text.startswith(f"{AREA} [S1].") and "חלק שלא אומת הושמט" not in text and "20%" not in text
+    assert {x.action for x in r.claims[0]} == {"removed"} and r.counts()["removed"] == 1
+
+
+def test_no_bullet_or_paragraph_made_only_of_markers_remains_and_its_lead_in_goes_with_it():
+    a = _answer(f"{LEAD_IN}\n- {STUB_UNIT}\n- {STUB_UNIT}\n{AREA} [S1].")
+    r = verify_answer(_stub_judge(), a, _ws(f"{REDUCTION_SOURCE} {LEAD_SOURCE}"), "?", [])
+    assert r.removed_units() == {0, 1, 2}
+    assert [p.check for p in r.removals()] == ["dependency"] * 3
+    text = r.edit(a).doc.text
+    assert text.startswith(f"{AREA} [S1].") and "חלק שלא אומת הושמט" not in text and LEAD_IN not in text
+
+
+def test_a_cut_that_leaves_words_is_still_a_marker():
+    a = _answer(f"{AREA}, {STUB} 20% [S1].")
+    r = verify_answer(_claims_judge(lambda t: [(AREA, "supported"), ("20%", "unsupported")] if STUB in t else None), a,
+                      _ws(REDUCTION_SOURCE), "?", [])
+    assert r.removed_units() == set() and r.edit(a).doc.text.startswith(f"{AREA}, {STUB} {MARKER_1} [S1].")
+
+
+def test_a_cut_ending_in_a_connector_is_extended_to_the_clause_boundary():
+    """The judge's span ends in "של": the object of the connector goes with it, up to the clause end (the citation and the
+    full stop stay)."""
+    a = _answer(f"{AREA}, {STUB} 20% [S1].")
+    r = verify_answer(_claims_judge(lambda t: [(AREA, "supported"), (STUB, "unsupported")] if STUB in t else None), a,
+                      _ws(REDUCTION_SOURCE), "?", [])
+    assert r.removed_units() == set()
+    assert r.edit(a).doc.text.startswith(f"{AREA}, {MARKER_1} [S1].")
+
+
+def test_an_extension_that_would_take_a_standing_claim_is_not_made():
+    a = _answer(f"{STUB} 20% [S1]. {AREA} [S1].")
+    r = verify_answer(_claims_judge(lambda t: [(STUB, "unsupported"), ("20%", "supported")] if STUB in t else None), a,
+                      _ws(REDUCTION_SOURCE), "?", [])
+    # nothing of the unit would stand once the cut leaves "20%" alone: it is removed whole, not cut across a claim
+    assert r.cuts == {} and r.removed_units() == {0}
+
+
+def test_recomposition_after_the_rules_reproduces_the_text_and_the_registry():
+    a = _answer(f"{LEAD_IN}\n- {STUB_UNIT}\n{AREA}, {STUB} 20% [S1].")
+    r = verify_answer(_claims_judge(lambda t: [(AREA, "supported"), (STUB, "unsupported")] if AREA in t else (
+        [(STUB, "unsupported", {"failure": "absent_from_source"}), ("20%", "supported")] if STUB in t else None)),
+        a, _ws(REDUCTION_SOURCE), "?", [])
+    first, second = r.edit(a), r.edit(a)
+    assert first.doc.text == second.doc.text and first.doc.spans() == second.doc.spans()
+
+
+@pytest.mark.parametrize("lead", ["הנתון נקבע כי", "ההפחתה היא של", "המקדם אשר", "השיעור —", "כולל:", "המקדם ו־"])
+def test_every_connector_extends_the_cut_to_the_clause_end(lead):
+    a = _answer(f"{AREA}, {lead} 20% במסגרת השומה [S1]. השורה הבאה.")
+    r = verify_answer(_claims_judge(lambda t: [(AREA, "supported"), (lead, "unsupported")] if lead in t else None), a,
+                      _ws(REDUCTION_SOURCE, "השורה הבאה."), "?", [])
+    assert r.removed_units() == set()
+    assert r.edit(a).doc.text.startswith(f"{AREA}, {MARKER_1} [S1]. השורה הבאה.")
+
+
+def test_a_decimal_point_or_thousands_comma_does_not_end_the_clause():
+    a = _answer(f"{AREA}, {STUB} 0.8 או 1,200 מ״ר [S1].")
+    r = verify_answer(_claims_judge(lambda t: [(AREA, "supported"), (STUB, "unsupported")] if STUB in t else None), a,
+                      _ws("0.8 1,200 " + REDUCTION_SOURCE), "?", [])
+    assert r.edit(a).doc.text.startswith(f"{AREA}, {MARKER_1} [S1].")

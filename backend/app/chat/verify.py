@@ -249,8 +249,10 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # versioned). 6 (round 10 U9, KTD14): the evidence header of a standard carries its kind, limits and wording, and the policy
 # the rules that need them. 8 (round 13 U9, KTD10, KTD9): a cited source's header carries the server's own facts about its
 # unit (``SERVER_HELD``: the stated valuation date and the link reason), and a derived computation (C#, result kind
-# ``derived``) joins the unit's evidence; rules (29) and (30) read them.
-JUDGE_VERSION = 8
+# ``derived``) joins the unit's evidence; rules (29) and (30) read them. 9 (round 13 U11, KTD13): the final check shows a unit that
+# refers back (``BACK_REFERENCES``) the text that stays before it and the units removed from before it (``<preceding>``,
+# ``removed_before``); rule (31) reads them.
+JUDGE_VERSION = 9
 # the label of the facts the server holds about a cited source's unit and states beside its text (round 13 U9, KTD10, R13): the
 # stated valuation date of the unit that holds the passage, and why the server linked the appraisal to the property. Read
 # from the stored document, not from the passage: the judge takes them as evidence, never as a claim to check
@@ -378,7 +380,12 @@ JUDGE_POLICY = (
     "היחידה שבה נמצא הקטע, או הסיבה שהשומה נקשרה לנכס. טענה שנותנת את אותו מועד קובע לשומה או ליחידה נתמכת בו גם כשהטקסט "
     "של הקטע עצמו אינו מכיל אותו; מועד אחר ממנו אינו נתמך בו. (30) חישוב מערכת מסוג «נגזר» (derived) הוא נוסחה פשוטה "
     "שהשרת חישב מערכים שהיחידה מצטטת (למשל 1 פחות מקדם, כשהיחידה כותבת הפחתה): מספר שהוא תוצאתו נתמך אם הניסוח של "
-    "היחידה מתאים לנוסחה, ואינו נתמך אם הניסוח מתאר משהו אחר."
+    "היחידה מתאים לנוסחה, ואינו נתמך אם הניסוח מתאר משהו אחר. "
+    "(31) <preceding unit=\"N\" removed_before=\"i,j\"> לפני יחידה הוא הטקסט שנשאר בתשובה ממש לפניה באותו סעיף, אחרי "
+    "שהשרת הסיר ממנו יחידות; ה-index של היחידות שהוסרו מצוינים ב-removed_before ונוסחן ב-<removed_units>. יחידה שמפנה "
+    "לתוכן שאינו מופיע בטקסט שנשאר (\"לעיל\", \"כאמור\", \"הנ\"ל\", \"שני המקדמים\", \"שלושת הערכים\") ושהתוכן הזה "
+    "הוסר ממנו — אינה עומדת בפני עצמה: ציין ב-depends_on את ה-index של היחידות שהוסרו שהיא מפנה אליהן. הפניה "
+    "שהתוכן שלה מופיע ב-<preceding> אינה תלות, ו-depends_on ריק."
 )
 
 
@@ -555,6 +562,7 @@ CHECK_CAUSE_SENTENCES = {
 NOT_CHECKED = "הטענה לא נבדקה מול המקורות"
 NOT_CHECKED_FAILED = "הטענה לא נבדקה מול המקורות: הבדיקה לא הושלמה ({status})"
 NOT_CLASSIFIED = "טענה סווגה כלא-עובדתית או ככותרת; לא אומתה"
+CUT_LEAVES_NOTHING = "אחרי הסרת החלק שלא נתמך (\"{text}\") לא נשארו בטענה מילים משלה"
 DEPENDS_ON_REMOVED = "מסקנה שנשענת על טענה שהוסרה באימות (\"{text}\")"
 # the server's qualifier after a total row whose component row went, or lost a claim (round 8 R12): the total was
 # computed over what the table showed before the edit, and says so
@@ -743,6 +751,28 @@ QUALIFIER_LEXICON = frozenset("""
 _QUALIFIER_PATTERN = re.compile(
     r"\d{1,2}\s*[./-]\s*\d{1,2}\s*[./-]\s*\d{2,4}|\d{1,2}\s*[./]\s*(?:19|20)\d{2}|(?<!\d)(?:19|20)\d{2}(?!\d)"
     r"|(?<![א-ת])כ\s?[־\-–]?\s?\d")
+
+
+# What a sentence says when it refers to content written before it (round 13 U11, KTD13, R16): "above", "the aforementioned",
+# "as stated", "the two coefficients", "the three rates", "the coefficients mentioned". Regular expressions over the written text, in
+# one tuple; a prefix letter may stand before a word. A unit holding one is judged again in the final check when a unit
+# before it in its section was removed (``has_back_reference``); a wide list only costs a re-check.
+_HE = "א-ת"
+BACK_REFERENCES = (
+    rf"(?<![{_HE}])[ו]?לעיל(?![{_HE}])",
+    rf"(?<![{_HE}])הנ[\"״”]ל(?![{_HE}])",
+    rf"(?<![{_HE}])[ו]?כאמור(?![{_HE}])",
+    rf"(?<![{_HE}])[ובלמכש]{{0,2}}האמור(?![{_HE}])",
+    rf"(?<![{_HE}])שני\s+ה[{_HE}]+",
+    rf"(?<![{_HE}])שלושת\s+ה[{_HE}]+",
+    rf"(?<![{_HE}])ה(?:מקדמים|שיעורים|ערכים)\s+(?:ה?אלה|הללו|הנ[\"״”]ל)(?![{_HE}])",
+)
+_BACK_REFERENCE = re.compile("|".join(BACK_REFERENCES))
+
+
+def has_back_reference(text: str) -> bool:
+    """Whether ``text`` refers back to content written before it (``BACK_REFERENCES``)."""
+    return bool(_BACK_REFERENCE.search(text or ""))
 
 
 def qualifier_words(text: str) -> list[str]:
@@ -1092,6 +1122,11 @@ class Unit:
     # so a short colon line there is a lead-in (``structural_kind``)
     list_item: bool = False
     leads_list: bool = False
+    # a unit of the final check that refers back (``has_back_reference``) after a unit before it in its section was removed
+    # (round 13 U11, KTD13): the text that stays before it in its section, and the draft indexes of the removed units, shown
+    # to the judge as ``<preceding>`` (rule 31)
+    preceding: str = ""
+    removed_before: list[int] = field(default_factory=list)
 
 
 def _norm(text: str) -> str:
@@ -4200,6 +4235,15 @@ def _unit_context(u: Unit) -> str:
             + "".join(f"<{tag}>{prompt_text(value)}</{tag}>\n" for tag, value in parts) + "</unit_context>\n")
 
 
+def _preceding_note(u: Unit) -> str:
+    """For a unit that refers back after a removal (round 13 U11, rule 31): the text that stays before it in its section, and
+    which units were removed from before it. Beside the unit, never in its text."""
+    if not u.removed_before:
+        return ""
+    return (f'<preceding unit="{u.index}" removed_before="{",".join(str(i) for i in u.removed_before)}">'
+            f"{prompt_text(u.preceding)}</preceding>\n")
+
+
 def _unstated_note(u: Unit) -> str:
     """The numbers the server found in no cited source, beside the unit (rule 21): never in its text."""
     if not u.unstated:
@@ -4258,7 +4302,7 @@ def _render_batch(batch: _Batch, ws: Workspace, coverage: _Coverage | None = Non
     blocks += [b for sid, texts in wanted.items() if (b := _candidate_block(sid, texts, ws, batch.narrow))]
     # before a unit: the headings above it and its table row's header (R7); after a unit showing a result of a
     # conditional calculation: the qualifier the server writes next to it
-    units = [_unit_context(u) + _unstated_note(u) + _reread_note(batch, u)
+    units = [_unit_context(u) + _preceding_note(u) + _unstated_note(u) + _reread_note(batch, u)
              + f'<unit index="{u.index}" cites="{prompt_attr(",".join(u.ids))}">\n'
              f'{_unit_text(u)}\n</unit>'
              + "".join(f'\n<server_qualifier unit="{u.index}">({prompt_text(note)})</server_qualifier>'
@@ -5017,6 +5061,51 @@ def _cut_range(u: Unit, r: ClaimRecord) -> tuple[int, int] | None:
     return (r.start + lead, r.end - trail) if raw.strip() else None
 
 
+# a connector a clause cannot end on (round 13 U11, KTD13): "of", a dash, a colon, "and-", "that", "which", the one-letter "that" — the
+# object of it is the text that follows
+_CONNECTOR_END = re.compile(r"(?:(?<![א-ת])(?:של|כי|אשר|ש|ו[־\-])|[—–:])\s*$")
+# where the clause a cut ended inside goes on no longer: a comma, semicolon, full stop, question or exclamation mark or colon
+# that ends a word (never the point of "0.8" or the comma of "1,200"), a dash set apart by spaces, the end of the line, the cell
+# edge of a table row, or the citation that closes the sentence
+_CLAUSE_STOP = re.compile(r"[,;.!?:](?=\s|$)|\s[—–](?=\s)|[\n|]")
+
+
+def _extend_cut(u: Unit, a: int, b: int, standing: list[ClaimRecord]) -> tuple[int, int]:
+    """The range of a cut once it no longer ends on a connector (round 13 U11, KTD13 rule 4, R16): a span that ends in "של", a
+    dash, a colon, "ו־", "כי", "אשר" or "ש" leaves the object of it behind ("«marker» 20%"), so it is extended to the end of
+    its clause — the next comma, full stop, colon, dash or cell edge, before the citation that closes the sentence. The
+    extension is made only when it holds no citation and takes no word of a claim that stands; otherwise the cut stays as the
+    judge gave it. A function of the cut and the unit's text alone (the fixed point)."""
+    lo, hi = a - u.start, b - u.start
+    if not _CONNECTOR_END.search(u.raw[lo:hi]):
+        return a, b
+    stop = _CLAUSE_STOP.search(u.raw, hi)
+    end = stop.start() if stop else len(u.raw)
+    cited = _IDS.search(u.raw, hi)
+    if cited is not None:
+        end = min(end, cited.start())
+    end = len(u.raw[:end].rstrip())
+    if end <= hi or any(lo < s.end - u.start and s.start - u.start < end for s in standing):
+        return a, b
+    return a, u.start + end
+
+
+def _leaves_words(u: Unit, groups: list[CutGroup]) -> bool:
+    """Whether the unit still has a word of its own once the ``groups`` are cut from it (round 13 U11, KTD13 rule 1): not
+    only markers, punctuation, a list marker, a citation, a number or a connector. A cut that leaves none is no cut."""
+    left, at = [], 0
+    for g in groups:
+        left.append(u.raw[at:g.start - u.start])
+        at = g.end - u.start
+    left.append(u.raw[at:])
+    text = _IDS.sub("", "".join(left))
+    return any(len(w) > 1 and re.search(r"[א-תA-Za-z]", w) and w not in _CONNECTOR_WORDS
+               for w in _MISSING_TOKEN.findall(text))
+
+
+_CONNECTOR_WORDS = frozenset("של כי אשר".split())
+
+
 def _cut_groups(u: Unit, recs: list[ClaimRecord]) -> list[CutGroup] | None:
     """The cuts that remove every failing claim of the unit and nothing else, or None when one cannot be made: the
     unit keeps no supported claim, a claim has no exact span, or a standing claim overlaps a failing claim's span or
@@ -5031,7 +5120,7 @@ def _cut_groups(u: Unit, recs: list[ClaimRecord]) -> list[CutGroup] | None:
         if span is None or any(span[0] < s.end and s.start < span[1] for s in standing) \
                 or any(r.id in s.depends_on for s in standing):
             return None
-        found.append((*span, r))
+        found.append((*_extend_cut(u, *span, standing), r))
     found.sort(key=lambda f: (f[0], f[1]))
     groups: list[list] = []
     for a, b, r in found:
@@ -5061,6 +5150,17 @@ def plan_edits(report: VerifyReport) -> None:
             continue
         groups = _cut_groups(u, recs)
         mine = [p for p in report.problems if p.unit.index == idx and p.claim_id in failing]
+        if groups is not None and not _leaves_words(u, groups):
+            # the cut would leave a marker beside a number, a citation or a list marker and no word (round 13 U11, KTD13 rule 1):
+            # the unit goes whole with no marker, a dependency on the claim whose cut emptied it, and the server resolves it
+            # without a repair round, as it does a cut
+            first = next(iter(failing.values()))
+            for p in mine:
+                p.severity, p.resolution = "partial", "cut"
+            report.problems.append(Problem(u, CUT_LEAVES_NOTHING.format(text=first.text[:120]), failure_kind=first.failure_kind(),
+                                           check="dependency", claim_id=first.id, basis=first.id, cause=first.cause,
+                                           resolution="cut"))
+            continue
         if groups is not None:
             report.cuts[idx] = groups
             for p in mine:
@@ -5076,6 +5176,7 @@ def plan_edits(report: VerifyReport) -> None:
             report.problems.append(Problem(u, NOT_CHECKED if first.verdict == "unchecked" else
                                            "לא נתמך במקורות: " + first.text[:120], failure_kind=first.failure_kind(),
                                            check="judge", claim_id=first.id, cause=first.cause))
+    _orphan_lead_ins(report)  # a lead-in whose items went whole, a cut that left no word among them (round 13 U11, KTD13 rule 2)
     gone: dict[int, Problem] = {}
     for p in report.problems:
         if p.removes_unit:

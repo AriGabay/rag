@@ -20,6 +20,10 @@ as a whole, within the verification allowance, and returns it with its digest. T
    removed from the draft's report with the check that fired (``final``), what rests on it goes with it, and the answer is
    composed and checked again — the gap paragraph, the removal note and the coverage note follow from the new state — up
    to ``FINAL_PASSES`` times.
+   A model unit that refers back ("לעיל", "כאמור", "שני המקדמים"; ``verify.BACK_REFERENCES``) after a unit before it in its
+   section was removed is not that sentence any more (round 13 U11, KTD13 rule 3, R16, AE7): its key holds the removed
+   predecessors, so it is judged again with the text that stays before it and the removed units beside it, and a verdict that
+   names a removed unit in ``depends_on`` removes it as a ``dependency``.
 5. After the last pass (or when the judge cannot be reached, or there is no time), what still fails or is unchecked is
    withheld, with no further judge call. Withholding cascades deterministically: a kept unit whose context changed because of
    a removal and has no verdict for its new key is withheld too (a sentence whose heading went; a table without its
@@ -37,6 +41,7 @@ from __future__ import annotations
 
 import bisect
 import dataclasses
+import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -46,6 +51,7 @@ from app.chat.verify import (
     _IDS,
     _MISSING_TOKEN,
     DEFECT_FAILURES,
+    DEPENDS_ON_REMOVED,
     GONE_ACTIONS,
     NOT_CLASSIFIED,
     JudgeRequirement,
@@ -67,6 +73,7 @@ from app.chat.verify import (
     _workspace_listing,
     clarification_question,
     exempt_without_verdict,
+    has_back_reference,
     has_qualifier,
     ids_in,
     rescued_expansions,
@@ -80,6 +87,8 @@ logger = logging.getLogger(__name__)
 
 FINAL_PASSES = 2  # compose-and-check rounds that may judge; what still fails after them is withheld (KTD6)
 FINAL_MIN_SECONDS = 10  # the final check does not call the judge with less of the verification allowance left
+PRECEDING_UNITS = 4  # the units that stay before a unit that refers back, shown to the judge with it (round 13 U11)
+PRECEDING_CHARS = 1_200
 FINAL_LABEL = "verify_final"  # the usage purpose of its judge calls (KTD10)
 # why a sentence of the saved text was removed or withheld by the final check (diagnostics; the user's path has the
 # server's fixed sentences, ``verify.REMOVAL_SENTENCES`` and ``CHECK_CAUSE_SENTENCES``)
@@ -107,6 +116,10 @@ class FinalUnit:
     protected: bool = False
     exempt: bool = False  # neutral navigation text, which needs no verdict (``exempt_without_verdict``)
     text: str = ""  # the model-written text the key stands for: no citations, no server span, no list marker
+    # a unit that refers back after a removal before it in its section (round 13 U11, KTD13 rule 3): the draft indexes of the
+    # removed units, and the model text that stays before it in its section (both in its key)
+    removed_before: list[int] = field(default_factory=list)
+    preceding: str = ""
 
 
 @dataclass
@@ -119,6 +132,8 @@ class Failure:
     reason: str
     cause: str = ""
     record: str = "unsupported"
+    check: str = "final"  # ``dependency``: the unit rests on a unit removed before it (``basis``: the claim of that unit)
+    basis: str = ""
 
 
 @dataclass
@@ -222,7 +237,28 @@ class _Final:
             f.protected = bool(question) and (question in _norm(u.text) or any(
                 d in self.report.protected for d in drafts))
             out.append(f)
+        self.back_references(out)
         return out
+
+    def back_references(self, units: list[FinalUnit]) -> None:
+        """A model unit that refers back (``verify.has_back_reference``) with a unit removed before it in its section is judged
+        again (round 13 U11, KTD13 rule 3): its key takes in the removed predecessors, and it is shown the model text that
+        stays before it in its section. A function of the composed text and the report's removals; a removal elsewhere (another
+        section, after the unit) leaves the key as the draft's."""
+        removed = self.report.removed_units()
+        for n, f in enumerate(units):
+            if not f.model or f.exempt or not f.drafts or not has_back_reference(f.text):
+                continue
+            first = min(f.drafts)
+            heading = self.drafts[first].heading if first in self.drafts else f.unit.heading
+            before = sorted(i for i in removed if i < first and i in self.drafts and self.drafts[i].heading == heading)
+            if not before:
+                continue
+            f.removed_before = before
+            stays = [x.text for x in units[:n] if x.model and x.unit.heading == f.unit.heading and x.text]
+            f.preceding = " ".join(stays[-PRECEDING_UNITS:])[-PRECEDING_CHARS:]
+            salt = "\x1f".join(f"{i}\x1e{self.drafts[i].id}" for i in before)
+            f.key = hashlib.sha256(f"{f.key}\x1d{salt}".encode()).hexdigest()
 
     def draft_at(self, offset: int) -> int:
         """The index of the draft unit holding ``offset`` of the draft, -1 for none (whitespace, markup)."""
@@ -265,7 +301,7 @@ class _Final:
             # the context a re-read read for a claim of these sentences is shown again in the source it expanded
             shown = rescued_expansions(self.report, self.ws, sorted({d for f in todo for d in f.drafts}))
             verdicts, scored, unchecked = _judge_all(self.provider, batch, self.ws, self.usage, self.deadline, coverage,
-                                                     [], FINAL_LABEL, shown)
+                                                     self.removed_units(todo), FINAL_LABEL, shown)
         except VerificationUnavailable as exc:
             logger.warning("final check: the judge could not be reached (%s)", exc.status)
             self.stats["unavailable"], res.unavailable = True, True
@@ -286,6 +322,12 @@ class _Final:
             res.mutated |= self.rescore(scored, {bi: (f.drafts[0] if f.drafts else -1) for bi, f in index_of.items()},
                                         {d for f in todo for d in f.drafts})
         return res
+
+    def removed_units(self, todo: list[FinalUnit]) -> list[Unit]:
+        """The draft units removed from before the units of a call that refer back (``<removed_units>``, rule 31): shown so
+        the judge can name them in ``depends_on``."""
+        wanted = sorted({i for f in todo for i in f.removed_before})
+        return [self.drafts[i] for i in wanted if i in self.drafts]
 
     def remainder_stands(self, f: FinalUnit) -> bool:
         """Whether a changed unit needs no judge call (round 9 R19, KTD10, AE6): it is a draft unit whose edit was a cut
@@ -350,7 +392,8 @@ class _Final:
             bi = f.drafts[0] if len(f.drafts) == 1 and f.drafts[0] not in used else fresh + len(index_of)
             used.add(bi)
             index_of[bi] = f
-            batch.append(dataclasses.replace(f.unit, index=bi))
+            batch.append(dataclasses.replace(f.unit, index=bi, removed_before=list(f.removed_before),
+                                             preceding=f.preceding))
         coverage = None
         if self.turn.derived and self.report.requirements and any(set(f.drafts) & self.voters() for f in todo):
             listing, known = _workspace_listing(self.ws, self.turn)
@@ -387,6 +430,9 @@ class _Final:
             res.failures.append(Failure(f.drafts, _judged_failure(u, v, self.ws),
                                         FINAL_UNSUPPORTED.format(reason=v.reason), record=v.verdict))
             return
+        if (dependency := self.dependency(f, v)) is not None:
+            res.failures.append(dependency)
+            return
         claims = unit_claims(u, v, self.ws)
         failing = [c for c in claims if not c.whole_unit and c.verdict in ("unsupported", "contradicts", "partial")]
         if v.verdict == "partial" and (failing or v.defect != "none") or (
@@ -412,6 +458,18 @@ class _Final:
                     res.mutated |= self.mark(Problem(d, FINAL_ATTACH.format(source=s), kind="needs_citation",
                                                      cite=s, check="final"))
         self.accept(f, v.verdict)
+
+    def dependency(self, f: FinalUnit, v: JudgeVerdict) -> Failure | None:
+        """A unit that refers back and whose verdict rests (``depends_on``) on a unit removed from before it is removed as a
+        dependency on that unit, with its failure kind and cause (round 13 U11, KTD13 rule 3, AE7; the same as
+        ``verify._remove_dependents``). A repair would be a rewrite, and there is no round left for one."""
+        names = [d for d in v.depends_on if d in f.removed_before]
+        base = next((p for d in names for p in self.report.problems if p.unit.index == d and p.removes_unit), None)
+        if base is None:
+            return None
+        return Failure(f.drafts, base.failure_kind or "absent_from_source",
+                       DEPENDS_ON_REMOVED.format(text=base.unit.text[:120]), base.cause, check="dependency",
+                       basis=base.claim_id)
 
     def mark(self, problem: Problem) -> bool:
         """Add a problem the composer turns into a server span (a partial mark, an attached citation), once."""
@@ -450,8 +508,8 @@ class _Final:
                 if d is None or di in gone or di in report.protected:
                     continue
                 gone.add(di)
-                head = Problem(d, fail.reason, failure_kind=fail.kind, check="final", cause=fail.cause,
-                               claim_id=_primary_claim_id(report, di))
+                head = Problem(d, fail.reason, failure_kind=fail.kind, check=fail.check, cause=fail.cause,
+                               claim_id=_primary_claim_id(report, di), basis=fail.basis)
                 report.problems.append(head)
                 mark_claims(di)
                 if d.table_header and d.table_span is not None:
