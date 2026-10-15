@@ -245,7 +245,7 @@ export interface ChatComputationInput {
 
 /** What a calculation is: a scenario the user asked for (it rests on a user assumption), a value the report itself
  * writes reproduced, or a computation. */
-export type ChatResultKind = "scenario" | "reproduces_report_value" | "computed";
+export type ChatResultKind = "scenario" | "reproduces_report_value" | "computed" | "derived";
 
 /** An intermediate result of a calculation: its formula in ids and its full value (when the server provides steps). */
 export interface ChatComputationStep {
@@ -401,6 +401,7 @@ export type ChatFailureKind =
   | "wrong_unit"
   | "uncertain_reading"
   | "contradicts_source"
+  | "context_not_read"
   | "wrong_calculation"
   | "invalid_citation"
   | "not_checked";

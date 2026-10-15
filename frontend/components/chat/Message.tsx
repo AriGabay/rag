@@ -60,6 +60,7 @@ const RESULT_KIND: Record<string, string> = {
   scenario: "תרחיש לפי בקשה",
   reproduces_report_value: "משחזר ערך מהשומה",
   computed: "חישוב",
+  derived: "נגזר מהערכים שצוטטו",
 };
 const VAT: Record<string, string> = { included: "כולל מע״מ", excluded: "ללא מע״מ", unknown: "מע״מ לא צוין", not_applicable: "" };
 const PERIOD: Record<string, string> = { month: "לחודש", year: "לשנה", one_time: "חד-פעמי", none: "", unknown: "תקופה לא צוינה" };

@@ -35,11 +35,13 @@ const RESULT_BADGE: Record<string, string> = {
   reproduces_report_value: "כתוב בשומה",
   scenario: "חושב עכשיו לפי בקשתך",
   computed: "חושב עכשיו",
+  derived: "נגזר מהערכים שצוטטו",
 };
 const RESULT_STATEMENT: Record<string, string> = {
   reproduces_report_value: "המספר הזה כתוב במקור; החישוב משחזר אותו מנתוני המסמך.",
   scenario: "תרחיש שחושב עכשיו לפי בקשתך, על סמך הנחה שנתת. המספר עצמו אינו כתוב במסמך.",
   computed: "חושב עכשיו מנתוני המסמכים. המספר עצמו אינו כתוב במסמך.",
+  derived: "המערכת חישבה את המספר מהערכים שהתשובה מצטטת, כדי לאמת אותו. המספר עצמו אינו כתוב במסמך.",
 };
 const VAT_BASIS: Record<string, string> = {
   included: "כל סכומי הכסף שבחישוב כוללים מע״מ",
