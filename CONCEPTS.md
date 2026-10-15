@@ -50,7 +50,7 @@ Which appraisals are of one property. Two appraisal units are linked only by pro
 
 ### Time coverage
 
-The record of which appraisals of a property a time answer checked: searched with a match, searched without one, not searched and why, undated, and unlinked candidates. When coverage is partial, the answer calls its datum the latest in the sources checked, never the latest in the repository.
+The record of which appraisals of a property a time answer checked. Each appraisal is read (the datum or its section was read), located (only a passage was found), searched without a match, not searched (with the reason), or undated. Unidentified appraisals of the office are split three ways. A possible candidate mentions the property or has an unread identification part; it is named and keeps the record partial. An unlinkable appraisal has neither, and is counted. An appraisal proven to be another property is set aside. When coverage is partial, the answer calls its datum the latest in the sources checked, never the latest in the repository, and names what was not read.
 
 ## Documents
 
