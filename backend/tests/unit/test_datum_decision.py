@@ -288,6 +288,37 @@ def test_a_subset_is_undecided_and_so_is_a_stated_facet_against_a_headline_value
     assert datum.relation(a, site(None, family="coefficient", section="3"), 1, 1) == datum.UNDECIDED
 
 
+def test_across_units_a_value_with_no_facet_is_the_same_as_one_with_a_stated_facet_in_a_family_that_needs_none():
+    """Outside the facet families (rent, value, area, income ...) a stated facet is a wording of the source, not a component: the
+    headline datum of one appraisal is compared with the other appraisal's value of the same key, and only two own facets with
+    disjoint cores across units stay undecided (no structural evidence that they name different things)."""
+    stated = site("שכר דירה חודשי", family="rent", unit=UNIT_A)
+    bare = site(None, family="rent", unit=UNIT_B)
+    assert datum.core_of(stated) and not datum.core_of(bare)
+    assert datum.relation(stated, bare, 1, 1) == datum.SAME
+    assert datum.relation(bare, stated, 1, 1) == datum.SAME
+    assert datum.relation(stated, bare, 3, 2) == datum.SAME  # however many values of the key the units hold
+    assert datum.relation(stated, site("דמי שכירות", family="rent", unit=UNIT_B)) == datum.UNDECIDED  # both stated, disjoint
+    assert datum.relation(site(None, family="value", unit=UNIT_A), site(None, family="value", unit=UNIT_B)) == datum.SAME
+    # inside one unit nothing changes, and a facet family still reads a stated facet against a headline value as undecided
+    assert datum.relation(stated, site(None, family="rent", unit=UNIT_A), 2, 2) == datum.UNDECIDED
+    assert datum.relation(site("מקדם מיקום", family="coefficient", unit=UNIT_A),
+                          site(None, family="coefficient", unit=UNIT_B), 1, 1) == datum.UNDECIDED
+
+
+def test_a_rent_stated_as_monthly_in_one_appraisal_conflicts_with_the_bare_rent_of_another_and_two_stated_wordings_do_not():
+    def rents(first: dict, second: dict | None) -> Office:
+        o = Office()
+        o.value(o.doc(), "5,000", as_of("2025-01-20"), kind="rent", period="month", facet=first)
+        o.value(o.doc(), "5,500", as_of("2025-01-20"), kind="rent", period="month", facet=second)
+        return o
+
+    assert coverage.conflicting(rents(datum.facet("שכר דירה חודשי", "row", "own"), None).ws)
+    assert coverage.conflicting(rents(datum.facet("שכר דירה חודשי", "row", "own"), datum.none()).ws)
+    assert not coverage.conflicting(rents(datum.facet("שכר דירה חודשי", "row", "own"),
+                                          datum.facet("דמי שכירות", "row", "own")).ws)  # undecided, never a conflict
+
+
 def test_the_decision_is_symmetric():
     a = site("מקדם מיקום", family="coefficient", section="3")
     b = site("מקדם צורת מגרש", family="coefficient", section="3")

@@ -64,6 +64,7 @@ import unicodedata
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from itertools import islice
 from uuid import UUID
 
@@ -270,6 +271,7 @@ def _party_label(raw: str) -> bool:
     return " ".join(re.sub(r"[\"'״׳`]", "", _label_of(raw)).split()) in PARTY_LABELS
 
 
+@lru_cache(maxsize=4096)
 def _section_of(raw: str) -> str | None:
     """Whether a heading opens an identification section (`identification`), closes the reading (`excluded` for an appendix
     or comparables part, `party` for the declaration, the signature and a party's details: round 13 U7), or neither."""

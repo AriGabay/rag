@@ -651,6 +651,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     compute_ok = False  # the step may call the compute tools only (the tool budget is spent, there is time left)
     compute_steps = 0  # such steps taken so far
     mixed_asked = False  # a mixed question's answer was already asked for its professional part (once per turn)
+    pre_mixed = None  # the first answer of a mixed question, kept while that extra round runs (round 13 U14)
     rounds: list[list[dict]] = []
     # the request's requirements, frozen for the turn (the request's components, or the judge's derivation when there
     # are none), and its tool failures
@@ -943,10 +944,16 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             # used as a round without time would use it, its unverified claims removed, instead of failing the turn
             logger.warning("chat repair round failed: %s; the verified answer is kept", failure[0])
             return finish(*checked)
+        restored = False
         if failure is not None:
-            raise ProviderFailure(*failure)
-        items.extend(step.output)
-        if step.calls:
+            if pre_mixed is None:
+                raise ProviderFailure(*failure)
+            # the mixed question's extra round is best effort: the first answer was valid and is verified as it stood
+            logger.warning("chat mixed round failed: %s; the first answer is kept", failure[0])
+            answer, restored = pre_mixed, True
+        if not restored:
+            items.extend(step.output)
+        if not restored and step.calls:
             if pending is not None and not intent_waited:
                 # the intent is read before the first step's tools run, so every tool sees it (round 10 KTD3); the
                 # components are appended after the tool outputs, as before
@@ -969,27 +976,32 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                 turn.record(call.name, call.arguments, output)
                 items.append({"type": "function_call_output", "call_id": call.call_id, "output": output})
             continue
-        try:
-            answer = FinalAnswer.model_validate(step.final)
-        except ValueError as exc:
-            if checked is not None:
-                logger.warning("chat repair round failed: final schema; the verified answer is kept")
-                return finish(*checked)
-            raise ProviderFailure(CallStatus.INVALID.value, "final schema") from exc
-        answer_seconds = time.monotonic() - step_started
-        ws.clock.add("compose", answer_seconds)
-        if pending is not None or held is not None:
-            settle_analysis()  # the first step answered: the requirements are frozen before verification
-        if answer.status == "clarification" and answer.clarification_question.strip() and not answer.answer_markdown.strip():
-            answer.answer_markdown = answer.clarification_question
+        if not restored:
+            try:
+                answer = FinalAnswer.model_validate(step.final)
+            except ValueError as exc:
+                if checked is not None:
+                    logger.warning("chat repair round failed: final schema; the verified answer is kept")
+                    return finish(*checked)
+                if pre_mixed is None:
+                    raise ProviderFailure(CallStatus.INVALID.value, "final schema") from exc
+                logger.warning("chat mixed round failed: final schema; the first answer is kept")
+                answer, restored = pre_mixed, True
+        if not restored:
+            answer_seconds = time.monotonic() - step_started
+            ws.clock.add("compose", answer_seconds)
+            if pending is not None or held is not None:
+                settle_analysis()  # the first step answered: the requirements are frozen before verification
+            if answer.status == "clarification" and answer.clarification_question.strip() and not answer.answer_markdown.strip():
+                answer.answer_markdown = answer.clarification_question
+            pre_mixed = None  # an answer that arrived: the extra round is over
         if (attempt == 0 and not mixed_asked and answer.status in ("answered", "partial") and steps + 1 < bound
                 and time.monotonic() < deadline - max(REPAIR_MIN_SECONDS, REPAIR_TIME_FACTOR * answer_seconds)
-                and (notice := _professional_gap(ws, answer.answer_markdown)) is not None
-                and not (notice == MIXED_UNREAD and last)):
+                and (notice := _professional_gap(ws, answer.answer_markdown, not last)) is not None):
             # a mixed question whose answer cites no professional source: asked once, before verification, to search
             # the professional pool (or to cite what the turn read there) unless the appraisal already states the point.
             # A searching notice needs a step that may call tools (round 13 U14, KTD18)
-            mixed_asked = True
+            mixed_asked, pre_mixed = True, answer
             progress("repair", MSG_MIXED_PROGRESS)
             items.append({"role": "user", "content": notice})
             continue
@@ -1225,11 +1237,12 @@ def _surviving_focus(ws: T.Workspace, final: FinalAnswer) -> Focus | None:
     return focus if kept == focus.document_ids else focus.model_copy(update={"document_ids": kept})
 
 
-def _professional_gap(ws: T.Workspace, markdown: str) -> str | None:
+def _professional_gap(ws: T.Workspace, markdown: str, can_search: bool) -> str | None:
     """The notice a mixed question's answer earns when it cites no professional source (round 13 U14, KTD18), or None.
 
     ``MIXED_UNCITED`` when the turn's tools returned professional sources (a standard or another professional document,
-    a listing excepted) and the answer cites none of them; ``MIXED_UNREAD`` when it returned none. Never for another
+    a listing excepted) and the answer cites none of them; ``MIXED_UNREAD`` when it returned none and the step may call tools
+    (``can_search``: a searching notice is no use to the last step). Never for another
     intent, for an office that holds no professional document (the search says so and the turn records it), or for an
     answer that cites a professional source. The server cannot tell whether an appraisal passage already states the
     professional point, so the notice leaves that to the model: it asks, it does not require a citation."""
@@ -1240,7 +1253,7 @@ def _professional_gap(ws: T.Workspace, markdown: str) -> str | None:
     if cited.intersection(held):
         return None
     if not held:
-        return MIXED_UNREAD
+        return MIXED_UNREAD if can_search else None
     return MIXED_UNCITED.format(sources=", ".join(held[:MIXED_SOURCES_SHOWN]))
 
 

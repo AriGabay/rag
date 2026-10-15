@@ -395,10 +395,33 @@ test.describe("the removal note's action", () => {
     await expect(cut.getByTestId("removal-reason")).toContainText(CUT_REASON);
     await expect(cut.locator(".removal-sources")).toContainText(TITLE);
     expect(calls).toBe(1);
-    // the same button closes them together
+    // the button never closes: a second press leaves the details open and every removal expanded
     await action.click();
+    await expect(action).toHaveAttribute("aria-expanded", "true");
+    await expect(reply.locator("details.msg-details")).toHaveAttribute("open", "");
+    await expect(reply.getByTestId("removal-detail")).toHaveCount(2);
+    await page.request.delete(`/api/chat/conversations/${id}`);
+  });
+
+  test("the button is an idempotent open-all: after the details are closed by hand, a press opens them and the removals again", async ({
+    page,
+  }) => {
+    const { id, reply } = await openAnswer(page, noteAnswer());
+    await page.route("**/api/chat/messages/m2/diagnostics", (route) => route.fulfill({ json: noteDiagnostics() }));
+    const action = reply.getByTestId("removal-note").getByRole("button", { name: "פירוט ההסרות" });
+    const details = reply.locator("details.msg-details");
+    await action.click();
+    await expect(details).toHaveAttribute("open", "");
+    await expect(action).toHaveAttribute("aria-expanded", "true");
+    await expect(reply.getByTestId("removal-detail")).toHaveCount(2);
+    // close the details by hand: aria-expanded follows the real state
+    await details.locator("summary").click();
+    await expect(details).not.toHaveAttribute("open", "");
     await expect(action).toHaveAttribute("aria-expanded", "false");
-    await expect(reply.getByTestId("removal-detail")).toHaveCount(0);
+    await action.click();
+    await expect(details).toHaveAttribute("open", "");
+    await expect(action).toHaveAttribute("aria-expanded", "true");
+    await expect(reply.getByTestId("removal-detail")).toHaveCount(2);
     await page.request.delete(`/api/chat/conversations/${id}`);
   });
 
@@ -455,6 +478,27 @@ test.describe("the removal note's action", () => {
     await expect(reply.getByTestId("removal-detail")).toHaveCount(2);
     await expect(reply.getByTestId("removal-draft").first()).toContainText(DRAFT);
     await page.request.delete(`/api/chat/conversations/${id}`);
+  });
+
+  test("a span whose text does not start with '>' or lies out of range gives no button and the text stays whole", async ({
+    page,
+  }) => {
+    const bad: Array<{ name: string; span: (len: number) => Json }> = [
+      { name: "not a blockquote", span: () => ({ start: 0, end: 10, kind: "removal_note" }) },
+      { name: "end out of range", span: (len) => ({ start: len - 5, end: len + 40, kind: "removal_note" }) },
+      { name: "negative start", span: () => ({ start: -3, end: 10, kind: "removal_note" }) },
+    ];
+    for (const { span } of bad) {
+      const answer = noteAnswer();
+      const markdown = String(answer.markdown);
+      answer.server_spans = [span(Array.from(markdown).length)];
+      const { id, reply } = await openAnswer(page, answer);
+      await expect(reply.locator(".body")).toContainText("הוסרו מהתשובה 2 טענות");
+      await expect(reply.locator(".body")).toContainText("השווי למ״ר בשומה הוא 9,500");
+      await expect(reply.getByTestId("removal-note")).toHaveCount(0);
+      await expect(reply.getByTestId("removal-note-action")).toHaveCount(0);
+      await page.request.delete(`/api/chat/conversations/${id}`);
+    }
   });
 
   test("an older answer without the registry shows the note as text and no button", async ({ page }) => {

@@ -168,10 +168,13 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
   const openCut = useCallback((ordinal: number) => setFocus((f) => ({ ordinal, tick: (f?.tick ?? 0) + 1 })), []);
   // the removal note's button opens the details with every removal expanded (round 13 U12, KTD14)
   const [expandAll, setExpandAll] = useState<ExpandAll | null>(null);
-  const toggleRemovals = useCallback(
-    () => setExpandAll((c) => ({ tick: (c?.tick ?? 0) + 1, open: !(c?.open ?? false) })),
+  // idempotent "open all": every press opens the details and expands every removal, never closes them
+  const openAllRemovals = useCallback(
+    () => setExpandAll((c) => ({ tick: (c?.tick ?? 0) + 1, open: true })),
     [],
   );
+  // the button's aria-expanded follows the real <details> state, synced through its toggle event
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const removalsId = useId();
   const noteParts = useMemo(() => (answer ? removalNoteParts(answer) : null), [answer]);
 
@@ -244,6 +247,9 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
   }
 
   const timeNote = timePreferenceNote(message, answer);
+  const renderMarkdown = (markdown: string) => (
+    <Markdown markdown={markdown} citations={citations} onCite={cite} cuts={cutOrdinals} onCut={openCut} />
+  );
 
   const copy = async () => {
     try {
@@ -267,28 +273,24 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
       <div className="body" dir="rtl">
         {noteParts ? (
           <>
-            {noteParts.head.trim() && (
-              <Markdown markdown={noteParts.head} citations={citations} onCite={cite} cuts={cutOrdinals} onCut={openCut} />
-            )}
+            {noteParts.head.trim() && renderMarkdown(noteParts.head)}
             <div className="removal-note" data-testid="removal-note">
-              <Markdown markdown={noteParts.note} citations={citations} onCite={cite} cuts={cutOrdinals} onCut={openCut} />
+              {renderMarkdown(noteParts.note)}
               <button
                 type="button"
                 className="source-link"
                 data-testid="removal-note-action"
-                aria-expanded={expandAll?.open ?? false}
+                aria-expanded={detailsOpen}
                 aria-controls={removalsId}
-                onClick={toggleRemovals}
+                onClick={openAllRemovals}
               >
                 פירוט ההסרות
               </button>
             </div>
-            {noteParts.tail.trim() && (
-              <Markdown markdown={noteParts.tail} citations={citations} onCite={cite} cuts={cutOrdinals} onCut={openCut} />
-            )}
+            {noteParts.tail.trim() && renderMarkdown(noteParts.tail)}
           </>
         ) : (
-          <Markdown markdown={answer.markdown} citations={citations} onCite={cite} cuts={cutOrdinals} onCut={openCut} />
+          renderMarkdown(answer.markdown)
         )}
       </div>
       <AnswerQuality answer={answer} />
@@ -319,6 +321,7 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
         onCite={cite}
         focus={focus}
         expandAll={expandAll}
+        onDetailsToggle={setDetailsOpen}
         removalsId={removalsId}
         onOpenSource={onOpenSource}
       />
@@ -386,7 +389,7 @@ function timelineDate(row: Pick<ChatTimelineRow, "date" | "precision" | "end">):
 
 /** The value as the row shows it: the server's `unit` is display text ("₪", "מ״ר"), appended only when the value text does
  * not already carry it, as the plain-text copy does. */
-function timelineValue(row: { value_text: string; unit: string | null }): string {
+function timelineValue(row: Pick<ChatTimelineRow, "value_text" | "unit">): string {
   return row.unit && !row.value_text.includes(row.unit) ? `${row.value_text} ${row.unit}` : row.value_text;
 }
 
@@ -414,7 +417,7 @@ function CoverageNote({ coverage }: { coverage: ChatTimeCoverage | null | undefi
 
 /** The marks that name the values they are about: the key of the row's list, and the accessible text of its chip. */
 const MARK_WITH: Partial<Record<ChatTimelineMark, { key: "undecided_with" | "conflict_with"; label: string }>> = {
-  undecided: { key: "undecided_with", label: "השוואה לא הוכרעה" },
+  undecided: { key: "undecided_with", label: TIMELINE_MARK.undecided.label },
   conflict: { key: "conflict_with", label: "סתירה" },
 };
 
@@ -443,7 +446,7 @@ function MarkBadges({
           );
         }
         return (
-          <span key={k} className="tl-undecided" data-mark={k}>
+          <span key={k} className="tl-mark-with" data-mark={k}>
             <span className={`badge ${TIMELINE_MARK[k].cls}`} aria-hidden="true">
               {TIMELINE_MARK[k].label}
             </span>
@@ -464,6 +467,38 @@ function MarkBadges({
       })}
     </>
   );
+}
+
+/** The three cells the timeline and the components table share. The `td` (its class) stays with each table. */
+function SourceCell({ row, onCite }: { row: Pick<ChatTimelineRow, "sid" | "source">; onCite: (id: string) => void }) {
+  return (
+    <>
+      <button
+        type="button"
+        className="cite tl-cite"
+        onClick={() => onCite(row.sid)}
+        title={[row.source.title, row.source.location].filter(Boolean).join(" — ")}
+        aria-label={`מקור ${row.sid}: ${row.source.title}`}
+      >
+        {row.sid}
+      </button>
+      <span className="tl-title">{row.source.title}</span>
+    </>
+  );
+}
+
+function ValueCell({ row }: { row: Pick<ChatTimelineRow, "value_text" | "unit"> }) {
+  return <B>{timelineValue(row)}</B>;
+}
+
+function MarksCell({
+  row,
+  onCite,
+}: {
+  row: Pick<ChatTimelineRow, "marks" | "undecided_with" | "conflict_with">;
+  onCite: (id: string) => void;
+}) {
+  return <MarkBadges marks={row.marks} counterparts={row} onCite={onCite} />;
 }
 
 /** The server-built timeline of comparable dated values (round 11 U9, U10): groups and rows in the payload's order,
@@ -495,22 +530,13 @@ function Timeline({ groups, onCite }: { groups: ChatTimelineGroup[] | undefined;
                     {r.date_kind && DATE_KIND_LABEL[r.date_kind] && <span className="tl-kind">{DATE_KIND_LABEL[r.date_kind]}</span>}
                   </td>
                   <td role="cell" className="tl-value">
-                    <B>{timelineValue(r)}</B>
+                    <ValueCell row={r} />
                   </td>
                   <td role="cell" className="tl-source">
-                    <button
-                      type="button"
-                      className="cite tl-cite"
-                      onClick={() => onCite(r.sid)}
-                      title={[r.source.title, r.source.location].filter(Boolean).join(" — ")}
-                      aria-label={`מקור ${r.sid}: ${r.source.title}`}
-                    >
-                      {r.sid}
-                    </button>
-                    <span className="tl-title">{r.source.title}</span>
+                    <SourceCell row={r} onCite={onCite} />
                   </td>
                   <td role="cell" className="tl-marks">
-                    <MarkBadges marks={r.marks} counterparts={r} onCite={onCite} />
+                    <MarksCell row={r} onCite={onCite} />
                   </td>
                 </tr>
               ))}
@@ -557,22 +583,13 @@ function Breakdown({ blocks, onCite }: { blocks: ChatBreakdownBlock[] | undefine
                     {r.facet}
                   </td>
                   <td role="cell" className="tl-value">
-                    <B>{timelineValue(r)}</B>
+                    <ValueCell row={r} />
                   </td>
                   <td role="cell" className="tl-source">
-                    <button
-                      type="button"
-                      className="cite tl-cite"
-                      onClick={() => onCite(r.sid)}
-                      title={[r.source.title, r.source.location].filter(Boolean).join(" — ")}
-                      aria-label={`מקור ${r.sid}: ${r.source.title}`}
-                    >
-                      {r.sid}
-                    </button>
-                    <span className="tl-title">{r.source.title}</span>
+                    <SourceCell row={r} onCite={onCite} />
                   </td>
                   <td role="cell" className="tl-marks">
-                    <MarkBadges marks={r.marks} counterparts={r} onCite={onCite} />
+                    <MarksCell row={r} onCite={onCite} />
                   </td>
                 </tr>
               ))}
@@ -730,6 +747,7 @@ function AnswerDetails({
   onCite,
   focus,
   expandAll,
+  onDetailsToggle,
   removalsId,
   onOpenSource,
 }: {
@@ -740,6 +758,8 @@ function AnswerDetails({
   focus: CutFocus | null;
   /** The removal note's button: opens the details with every removal expanded. */
   expandAll: ExpandAll | null;
+  /** Reports the real open state of the <details>, so the note's button can mirror it in `aria-expanded`. */
+  onDetailsToggle: (open: boolean) => void;
   /** The id of the removals list the note's button controls. */
   removalsId: string;
   onOpenSource?: (nav: ViewerNav) => void;
@@ -763,7 +783,11 @@ function AnswerDetails({
     if (expandTick && detailsRef.current) detailsRef.current.open = true;
   }, [expandTick]);
   return (
-    <details className="msg-details" ref={detailsRef}>
+    <details
+      className="msg-details"
+      ref={detailsRef}
+      onToggle={(e) => onDetailsToggle((e.currentTarget as HTMLDetailsElement).open)}
+    >
       <summary>מקורות ופרטים ({ordered.length})</summary>
       {ordered.length > 0 && (
         <div className="details-section">

@@ -241,6 +241,16 @@ def test_the_families_that_need_a_facet_are_the_coefficient_and_the_proportion()
     assert datum.family_of("value_per_area") == "value" and datum.family_of("value") == "value"
 
 
+def test_the_datum_family_of_a_kind_is_the_one_resolve_has():
+    from app.chat import resolve
+
+    kinds = {*resolve.REQUEST_KINDS, *resolve._FAMILY, "", "unknown", "other"}
+    kinds |= {f"{k}_per_area" for k in kinds}
+    for kind in kinds:
+        assert datum.family_of(kind) == resolve.family(kind), kind
+    assert datum.family_of(None) == ""
+
+
 # --- the manifest's facets, read from the fixtures' own text --------------------------------------------------------
 
 def _structure(doc: dict, caption: str) -> dict:

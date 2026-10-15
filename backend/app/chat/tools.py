@@ -565,6 +565,9 @@ class Workspace:
     # ({"source", "scope", "outcome", ...}), kept across the turn's verification rounds
     reread_done: set = field(default_factory=set)
     reread_log: dict = field(default_factory=dict)
+    # the blocks of the section a re-read source cites, kept for the turn (``rereader._section_rows``): (version, first block,
+    # reading) -> (the heading chain, the blocks), so the section is loaded once for the lead-in, the notes and the heading
+    section_rows: dict = field(default_factory=dict)
     # what depends only on a source's text, kept for the turn (``verify._unit_candidates``): id -> (text, the numbers in
     # it, the words in it); an entry is used only while the source still has that text
     source_terms: dict = field(default_factory=dict)
@@ -1876,18 +1879,24 @@ def _unit_search(ws: Workspace, conn: Connection, handle: str, query: str, limit
     return [], [], MSG_UNIT_SEARCHED.format(unit=unit, pages=_unit_pages(*cx.pages(number)), extended="", query=_txt(query))
 
 
+def _memo(ws: Workspace, key: tuple, build: Callable[[], Any]) -> Any:
+    """``ws.property_memo[key]``, built on first use. ``key`` is (name, ..., data version): the entries of the same name (and
+    the same middle parts, e.g. a property's seed) at another data version are evicted first — a data version that moved
+    on is never read again."""
+    found = ws.property_memo.get(key)
+    if found is None:
+        for old in [k for k in ws.property_memo if k[0] == key[0] and k[1:-1] == key[1:-1]]:
+            del ws.property_memo[old]
+        found = ws.property_memo[key] = build()
+    return found
+
+
 def property_graph(ws: Workspace, conn: Connection) -> PropertyGraph:
     """The turn's property graph (round 12 U6, KTD5): the relation of every visible, current subject unit to every other,
     built once per turn and data version and kept in ``ws.property_memo``. Retrieval (``_property_search``, ``_named_gathered``, ``_question_gathered``), the timeline
     (``property_partition``) and the coverage read this one snapshot. Identities are derived on first use and cached in
     the turn's ``date_cache`` (``identity.identities``)."""
-    key = ("graph", current_data_version(conn))
-    graph = ws.property_memo.get(key)
-    if graph is None:
-        for old in [k for k in ws.property_memo if k[0] == "graph"]:
-            del ws.property_memo[old]  # a data version that moved on: the old graph is never read again
-        graph = ws.property_memo[key] = build_graph(conn, cache=ws.date_cache)
-    return graph
+    return _memo(ws, ("graph", current_data_version(conn)), lambda: build_graph(conn, cache=ws.date_cache))
 
 
 def property_gathered(ws: Workspace, conn: Connection, version_id, unit_no: int) -> Gathered | None:
@@ -2081,12 +2090,7 @@ def _titles(ws: Workspace, conn: Connection, document_ids: Iterable) -> dict[str
     ids = sorted({str(d) for d in document_ids})
     if not ids:
         return {}
-    key = ("titles", current_data_version(conn))
-    known = ws.property_memo.get(key)
-    if known is None:
-        for old in [k for k in ws.property_memo if k[0] == "titles"]:
-            del ws.property_memo[old]  # a data version that moved on: those titles are never read again
-        known = ws.property_memo[key] = {}
+    known = _memo(ws, ("titles", current_data_version(conn)), dict)
     missing = [i for i in ids if i not in known]
     if missing:
         known.update({str(r.id): r.title for r in conn.execute(
@@ -2100,6 +2104,17 @@ def _no_candidates() -> dict:
     return {"named": [], "count": 0}
 
 
+def _coverage_item(ws: Workspace, conn: Connection, node, titles: dict[str, str], reason: str, elsewhere: bool) -> dict:
+    """One candidate of the record (``_candidates_of``, ``_classify_uncached``): its place, title, date, the ``reason`` it is
+    a candidate, whether every mention stands under another subject (``elsewhere``) and ``read`` (False until
+    ``settle_coverage``)."""
+    date_, status = unit_dating(ws, conn, node.version_id, node.unit_no)
+    return {"document_id": str(node.document_id), "version_id": str(node.version_id), "unit_no": node.unit_no,
+            "title": node.title or titles.get(str(node.document_id)), "date": date_[0] if date_ else None,
+            "precision": date_[1] if date_ else None, "date_status": status, "reason": reason,
+            "elsewhere": elsewhere, "read": False}
+
+
 def _candidates_of(ws: Workspace, conn: Connection, gathered: Gathered, elsewhere: dict | None = None) -> dict:
     """The unlinked candidates of the property for the record (KTD7): up to ``NAMED_CANDIDATES`` named newest first with
     their dates and the reason they are not linked, the rest counted. Round 13 U8 (KTD15): every candidate is kept as an
@@ -2109,13 +2124,9 @@ def _candidates_of(ws: Workspace, conn: Connection, gathered: Gathered, elsewher
         return _no_candidates()
     prime_dates(ws, conn, [c.node.version_id for c in gathered.candidates])
     titles = _titles(ws, conn, [c.node.document_id for c in gathered.candidates])
-    items = []
-    for c in gathered.candidates:
-        date_, status = unit_dating(ws, conn, c.node.version_id, c.node.unit_no)
-        items.append({"document_id": str(c.node.document_id), "version_id": str(c.node.version_id), "unit_no": c.node.unit_no,
-                      "title": c.node.title or titles.get(str(c.node.document_id)), "date": date_[0] if date_ else None,
-                      "precision": date_[1] if date_ else None, "date_status": status, "reason": c.link.reason,
-                      "elsewhere": (elsewhere or {}).get((str(c.node.version_id), c.node.unit_no), False), "read": False})
+    items = [_coverage_item(ws, conn, c.node, titles, c.link.reason,
+                            (elsewhere or {}).get((str(c.node.version_id), c.node.unit_no), False))
+             for c in gathered.candidates]
     group = {"named": [], "count": 0, "read": 0, "items": items}
     _settle_class(group)
     return group
@@ -2126,16 +2137,22 @@ def _alias_owners(ws: Workspace, conn: Connection) -> dict[str, set[tuple[str, i
     units of every version in the turn's property graph, read from the units the graph build already cached. Once per turn
     and data version."""
     key = ("aliases", current_data_version(conn))
-    owners = ws.property_memo.get(key)
-    if owners is None:
-        for old in [k for k in ws.property_memo if k[0] == "aliases"]:
-            del ws.property_memo[old]
-        owners = ws.property_memo[key] = {}
+
+    def build() -> dict:
+        owners = ws.property_memo[key] = {}  # stored before it is filled, as the other per-turn tables are
         for version in sorted({str(n.version_id) for n in property_graph(ws, conn).nodes}):
             for u in chat_dates.units_of(conn, UUID(version), ws.date_cache):
                 for a in u.aliases:
                     owners.setdefault(contexts.name_key(a), set()).add((version, u.unit_no))
-    return owners
+        return owners
+
+    return _memo(ws, key, build)
+
+
+def _node_unit(ws: Workspace, conn: Connection, node):
+    """The stored unit a graph node stands for (its version's units, kept in the turn's ``date_cache``); None when it has none."""
+    return next((u for u in chat_dates.units_of(conn, UUID(str(node.version_id)), ws.date_cache)
+                 if u.unit_no == node.unit_no), None)
 
 
 def _focus_identity(ws: Workspace, conn: Connection, gathered: Gathered) -> contexts.Identity:
@@ -2156,10 +2173,9 @@ def _focus_identity(ws: Workspace, conn: Connection, gathered: Gathered) -> cont
             m = re.fullmatch(r"(\d+)([א-ת]?)", number)
             streets.append((tuple(core.split()), m.group(1) if m else number, m.group(2) if m else ""))
         parcels |= {(b, p) for b, p, _ in n.identity.parcels}
-        for u in ws.date_cache.get(("units", UUID(str(n.version_id)))) or ():
-            if u.unit_no == n.unit_no:
-                aliases += [a for a in (contexts.name_key(x) for x in u.aliases)
-                            if len(a.split()) >= 2 and owners.get(a, set()) <= own]
+        if (u := _node_unit(ws, conn, n)) is not None:  # cached by ``_alias_owners`` for every version of the graph
+            aliases += [a for a in (contexts.name_key(x) for x in u.aliases)
+                        if len(a.split()) >= 2 and owners.get(a, set()) <= own]
     return contexts.Identity(frozenset(addresses), frozenset(parcels), (), tuple(streets), tuple(dict.fromkeys(aliases)))
 
 
@@ -2201,8 +2217,7 @@ def _partly_read(ws: Workspace, conn: Connection, nodes: Iterable) -> set[tuple[
     found = set()
     for n in nodes:
         v = str(n.version_id)
-        unit = next((u for u in chat_dates.units_of(conn, UUID(str(n.version_id)), ws.date_cache)
-                     if u.unit_no == n.unit_no), None)
+        unit = _node_unit(ws, conn, n)
         if unit is None:
             continue
         if any(unit.block_first <= b <= unit.block_last and (b < unit.block_first + unit_store.RUN_MAX
@@ -2219,6 +2234,9 @@ def _mentioned(ws: Workspace, conn: Connection, nodes: Iterable, identity: conte
     (``_mentions_elsewhere``). A passage counts only when the identifiers are in its text (``identifier_in``); the search
     ranks, it does not decide."""
     by_unit = {(str(n.version_id), n.unit_no): n for n in nodes}
+    by_version: dict[str, list[tuple[str, int]]] = {}
+    for k in by_unit:
+        by_version.setdefault(k[0], []).append(k)
     query = _probe_query(identity)
     if not by_unit or not query:
         return {}
@@ -2232,7 +2250,7 @@ def _mentioned(ws: Workspace, conn: Connection, nodes: Iterable, identity: conte
         cx = contexts_of(ws, conn, version)
         number = cx.at_block(placed.get(h["chunk_id"], (None, None))[0])
         if (version, number) not in by_unit:
-            alone = [k for k in by_unit if k[0] == version]
+            alone = by_version.get(version, [])
             if cx.multi or len(alone) != 1:
                 continue
             number = alone[0][1]
@@ -2265,13 +2283,8 @@ def classify_undetermined(ws: Workspace, conn: Connection, gathered: Gathered) -
     probe or the property states no identifier."""
     if not gathered.undetermined and not gathered.candidates:
         return Classes(gathered, [], {})
-    key = ("classes", gathered.seed, current_data_version(conn))
-    found = ws.property_memo.get(key)
-    if found is None:
-        for old in [k for k in ws.property_memo if k[0] == "classes" and k[1] == gathered.seed]:
-            del ws.property_memo[old]
-        found = ws.property_memo[key] = _classify_uncached(ws, conn, gathered)
-    return found
+    return _memo(ws, ("classes", gathered.seed, current_data_version(conn)),
+                 lambda: _classify_uncached(ws, conn, gathered))
 
 
 def _classify_uncached(ws: Workspace, conn: Connection, gathered: Gathered) -> Classes:
@@ -2286,12 +2299,8 @@ def _classify_uncached(ws: Workspace, conn: Connection, gathered: Gathered) -> C
     items = []
     for n in nodes:
         where = (str(n.version_id), n.unit_no)
-        date_, status = unit_dating(ws, conn, n.version_id, n.unit_no)
-        items.append({"document_id": str(n.document_id), "version_id": str(n.version_id), "unit_no": n.unit_no,
-                      "title": n.title or titles.get(str(n.document_id)), "date": date_[0] if date_ else None,
-                      "precision": date_[1] if date_ else None, "date_status": status,
-                      "reason": REASON_MENTIONED if where in mentioned else REASON_PARTLY_READ,
-                      "elsewhere": mentioned.get(where, False), "read": False})
+        items.append(_coverage_item(ws, conn, n, titles, REASON_MENTIONED if where in mentioned else REASON_PARTLY_READ,
+                                    mentioned.get(where, False)))
     return Classes(classified, items, mentioned)
 
 
@@ -2330,7 +2339,8 @@ def coverage_record(ws: Workspace, conn: Connection, *, scope: str, via: str | N
     possible, elsewhere = _no_possible(), {}
     if gathered is not None:
         classes = classify_undetermined(ws, conn, gathered)
-        gathered, possible["items"], elsewhere = classes.gathered, classes.possible, classes.elsewhere
+        gathered, elsewhere = classes.gathered, classes.elsewhere
+        possible["items"] = classes.possible
     record = {
         "v": COVERAGE_V, "mode": time.mode, "requested": time.requested.as_dict() if time.requested else None,
         "scope": scope, "via": via, "identified": gathered is not None and gathered.identified and scope == PROPERTY,
@@ -4705,33 +4715,65 @@ def _measurement_facet(row, structure: dict | None) -> dict:
     row ``row_index``, the column header its row carries, the caption), read through the table structure — not read when
     that is not stored; a text row's from its quote (the purpose phrase of the sentence holding its number), which has
     no blocks above it to read, so a quote naming nothing is ``none``."""
-    family = datum.facet_family(row.metric_kind or "", row.quote or "", row.metric or "")
+    if row.table_index is not None and structure is None:
+        return datum.not_read()
     if row.table_index is not None:
-        if structure is None:
-            return datum.not_read()
         rows = structure.get("rows") or []
         ri = row.row_index
         cells = (rows[ri].get("cells") if ri is not None and 0 <= ri < len(rows) else None) or []
-        return datum.read_cell(cells[0] if cells else "", getattr(row, "header", None), structure.get("caption"),
-                               [x for x in structure.get("title") or [] if x], family=family, matrix=len(cells) >= 3)
+        return _cell_facet(row, cells, structure.get("caption"), structure.get("title"))
+    return _quote_facet(row)
+
+
+def _cell_facet(row, cells: list, caption: str | None, title) -> dict:
+    """The facet of a table row from what it reads of its table: the cells of the row (the first is the row label; three or
+    more make a matrix), the column header the row carries, the caption and the title lines."""
+    family = datum.facet_family(row.metric_kind or "", row.quote or "", row.metric or "")
+    return datum.read_cell(cells[0] if cells else "", getattr(row, "header", None), caption,
+                           [x for x in title or [] if x], family=family, matrix=len(cells) >= 3)
+
+
+def _quote_facet(row) -> dict:
+    family = datum.facet_family(row.metric_kind or "", row.quote or "", row.metric or "")
     found = _numbers_of(meaning._norm(row.value_text or ""))
     written = found[0][0] if found else ""
     return datum.read_quote(datum.sentence_with(row.quote or "", written), written, family, [])
 
 
-def _measurement_facet_of(ws: Workspace, conn: Connection | None, row) -> dict:
-    """``_measurement_facet`` memoized in the workspace; a table row is read with the turn's cached table structure
-    (``_table_at``) when a connection is at hand, and is otherwise not read (and not memoized)."""
-    key = ("m", str(row.id))
+def _listed_facet(row) -> dict:
+    """``_measurement_facet`` of a row that carries what its table gives the facet (the columns of
+    ``meaning.TABLE_TEXT_COLUMNS``: whether the table is stored, the cells of its own row, the title lines), with no read of
+    the table's structure."""
+    if row.table_index is None:
+        return _quote_facet(row)
+    if not row.table_stored:
+        return datum.not_read()
+    return _cell_facet(row, row.row_cells or [], row.caption, row.title_lines)
+
+
+def _facet_memo(ws: Workspace, key: tuple, read: Callable[..., dict], *args, **kwargs) -> dict:
+    """The facet kept under ``key`` in the workspace, else ``read(*args, **kwargs)``, kept unless it is not read."""
     if key in ws.facets:
         return dict(ws.facets[key])
-    structure = None
-    if row.table_index is not None and conn is not None:
-        structure = _table_at(ws, conn, row.version_id, row.table_index)[0]
-    found = _measurement_facet(row, structure)
+    found = read(*args, **kwargs)
     if found["status"] != datum.STATUS_NOT_READ:
         ws.facets[key] = found
     return found
+
+
+def _measurement_facet_of(ws: Workspace, conn: Connection | None, row) -> dict:
+    """``_measurement_facet`` memoized in the workspace. A row that carries its table's text (the listing's own columns,
+    ``meaning.TABLE_TEXT_COLUMNS``) is read from them; any other table row is read with the turn's cached table structure
+    (``_table_at``) when a connection is at hand, and is otherwise not read (and not memoized)."""
+    def read() -> dict:
+        if hasattr(row, "table_stored"):
+            return _listed_facet(row)
+        structure = None
+        if row.table_index is not None and conn is not None:
+            structure = _table_at(ws, conn, row.version_id, row.table_index)[0]
+        return _measurement_facet(row, structure)
+
+    return _facet_memo(ws, ("m", str(row.id)), read)
 
 
 def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | None = None,
@@ -5567,19 +5609,25 @@ def _value_facet(ws: Workspace, src: Source, taken: dict, kind: str) -> dict:
         return datum.not_read()
     if inp["cell"]:
         family = datum.facet_family(kind, inp["row"], inp["header"], inp["caption"])
-        read = lambda: datum.read_cell(inp["row"], inp["header"], inp["caption"], inp["title"],  # noqa: E731
-                                       family=family, matrix=inp["matrix"])
-    else:
-        sentence = _own_sentence(taken)
-        family = datum.facet_family(kind, sentence)
-        read = lambda: datum.read_quote(sentence, inp["written"], family, taken.get("preceding"))  # noqa: E731
+        key = (*_locator_key(src.version_id, src.reading_id, taken["locator"]), family)
+        return _facet_memo(ws, key, datum.read_cell, inp["row"], inp["header"], inp["caption"], inp["title"],
+                           family=family, matrix=inp["matrix"])
+    sentence = _own_sentence(taken)
+    family = datum.facet_family(kind, sentence)
     key = (*_locator_key(src.version_id, src.reading_id, taken["locator"]), family)
-    if key in ws.facets:
-        return dict(ws.facets[key])
-    found = read()
-    if found["status"] != datum.STATUS_NOT_READ:
-        ws.facets[key] = found
-    return found
+    return _facet_memo(ws, key, datum.read_quote, sentence, inp["written"], family, taken.get("preceding"))
+
+
+def _facet_known(ws: Workspace, src: Source, taken: dict, kind: str) -> bool:
+    """Whether ``_value_facet`` settles a quote value's facet without the blocks above it: the workspace holds it for this place
+    and family, or its own sentence states one (an own facet is read before any context)."""
+    inp = taken.get("facet_in")
+    if taken.get("facet") is not None or inp is None or inp["cell"]:
+        return False
+    sentence = _own_sentence(taken)
+    family = datum.facet_family(kind, sentence)
+    return ((*_locator_key(src.version_id, src.reading_id, taken["locator"]), family) in ws.facets
+            or datum.read_sentence(sentence, inp["written"], family) is not None)
 
 
 def _preceding_blocks(conn: Connection, version_id, region: list, taken: dict, kind: str) -> list[tuple[str, str]] | None:
@@ -5750,7 +5798,9 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
         # REREADS_PER_VALUE times; the same region again is served from the stored readings)
         region = [r for r in rows if at is None or r.block_index in at]
         if not cell:  # a quote's facet: the blocks above its own, read once with the rest (round 13 U3, KTD2)
-            taken["preceding"] = _preceding_blocks(conn, src.version_id, region, taken, given.get("kind") or "")
+            kind = _settle_meaning(taken, given)[0]["kind"]  # the family is the settled kind's, as ``_value_facet`` reads it
+            taken["preceding"] = (None if _facet_known(ws, src, taken, kind) else
+                                  _preceding_blocks(conn, src.version_id, region, taken, kind))
         unclear = next((r for r in region if r.status == reader.UNCERTAIN), None)
         dating = _date_inputs(ws, conn, src.version_id, taken, region[0].block_index if region else src.block_start, vision)
         cx = contexts_of(ws, conn, src.version_id, v.reading_id)
@@ -6351,38 +6401,27 @@ MSG_RESCALED = ("הקלטים מצוינים במקורות בקני מידה ש
                 "והתוצאה ביחידות מלאות")
 
 
-def tool_calculate(ws: Workspace, expression: str, label: str = "", justification: str | None = None) -> str:
-    """Evaluate an expression over the turn's ids (``app.chat.calc``) and register the result as a C#."""
-    try:
-        node = calc.parse(expression)
-    except calc.CalcError as e:
-        raise ToolError(f"ביטוי לא תקין: {e}") from None
-    ids = list(dict.fromkeys(calc.ids_of(node)))
-    operands = {i: _operand(ws, i) for i in ids}
-    leaves = _leaves(ws, ids)
-    _check_available(ws, leaves)
-    justification = (justification or "").strip() or None
-    try:
-        out = calc.evaluate(node, operands, justification, contexts=allowed_contexts(ws))
-    except calc.CalcError as e:
-        raise ToolError(f"אי אפשר לחשב: {e}") from None
+def _input_name(ws: Workspace, i: str) -> str:
+    """The label a value, assumption, result or measurement id is shown under in a calculation."""
+    if i in ws.values:
+        return ws.values[i].label
+    if i in ws.assumptions:
+        return ws.assumptions[i].label
+    if i in ws.computations:
+        return ws.computations[i].label
+    return ws.measurements[i].row.metric if i in ws.measurements else i
 
-    def name(i: str) -> str:
-        if i in ws.values:
-            return ws.values[i].label
-        if i in ws.assumptions:
-            return ws.assumptions[i].label
-        if i in ws.computations:
-            return ws.computations[i].label
-        return ws.measurements[i].row.metric if i in ws.measurements else i
 
+def _computation_inputs(ws: Workspace, out) -> list[dict]:
+    """The record of each input a calculation read (``out.inputs``), as ``tool_calculate`` and the verifier's derived
+    results (``verify._derived_computation``) keep it."""
     inputs = []
     for i in out.inputs:
         kind = ("value" if i in ws.values else "assumption" if i in ws.assumptions else
                 "computation" if i in ws.computations else "measurement")
         value = (ws.values[i].value if i in ws.values else ws.assumptions[i].value if i in ws.assumptions
                  else ws.computations[i].value if i in ws.computations else ws.measurements[i].row.value)
-        entry = {"id": i, "label": name(i), "kind": kind, "value": None if value is None else str(value),
+        entry = {"id": i, "label": _input_name(ws, i), "kind": kind, "value": None if value is None else str(value),
                  "display": None if value is None else calc.fmt(Decimal(str(value)))}
         if i in ws.values:
             entry |= {"source_id": ws.values[i].source_id, "value_text": ws.values[i].written,
@@ -6392,10 +6431,75 @@ def tool_calculate(ws: Workspace, expression: str, label: str = "", justificatio
         elif i in ws.measurements:
             entry |= {"value_text": ws.measurements[i].row.value_text}
         inputs.append(entry)
+    return inputs
+
+
+def _leaf_sources_docs(ws: Workspace, leaves: list[str]) -> tuple[list[str], int]:
+    """The source ids the ``leaves`` (values and measurements) rest on, in order, and how many documents hold them."""
     sources = list(dict.fromkeys([ws.values[i].source_id for i in leaves if i in ws.values]
                                  + [i for i in leaves if i in ws.measurements]))
     docs = {str(ws.values[i].document_id) for i in leaves if i in ws.values}
     docs |= {str(ws.measurements[i].document_id) for i in leaves if i in ws.measurements}
+    return sources, len(docs)
+
+
+def computation_operands(ws: Workspace, ids: list[str]) -> dict[str, calc.Operand]:
+    """The operands of the turn's ids a calculation reads (``ToolError`` for an id the turn does not hold)."""
+    return {i: _operand(ws, i) for i in ids}
+
+
+def register_computation(ws: Workspace, node, out, leaves: list[str], *, label: str = "", label_prefix: str = "",
+                         kind: str, justification: str | None = None, justified: bool = False,
+                         notes: list[str] | None = None, reproduces: dict | None = None, near: dict | None = None,
+                         differs: dict | None = None, conditional_in_note: bool = False) -> tuple[calc.Computation, str]:
+    """Register the C# of an evaluated expression (``out``, over the turn's ``leaves``), as ``tool_calculate`` and the
+    verifier's derived results (``verify._derived_computation``) both keep it (round 13): the record of its inputs, the
+    sources and documents behind them, the conditional that an uncertain input makes (R28; the reason each is uncertain,
+    when the turn knows it) and the ``calc.Computation`` in ``ws.computations``. Returns it with its conditional text
+    ("מותנה: ..." and the justification when the mix needed one; empty when it is not conditional), which a derived result
+    also keeps in its note (``conditional_in_note``). ``label`` is the model's own name for it, else ``label_prefix`` and
+    the formula by the labels of the inputs."""
+    def name(i: str) -> str:
+        return _input_name(ws, i)
+
+    inputs = _computation_inputs(ws, out)
+    sources, documents = _leaf_sources_docs(ws, leaves)
+    uncertain = uncertain_inputs(ws, leaves)
+    if uncertain:
+        # why each is uncertain, when the turn knows (an unclear region, a cell OCR did not confirm in its place)
+        why = [f"{i}: {r}" for i in uncertain
+               if (r := ws.uncertain_values.get(i) or (ws.values[i].reading_note if i in ws.values else ""))]
+        out.conditional.append(MSG_UNCERTAIN_INPUTS.format(ids=", ".join(uncertain))
+                               + (f" ({'; '.join(why)})" if why else ""))
+    conditional = ("מותנה: " + "; ".join(out.conditional)
+                   + (f" — לפי ההצדקה: {justification}" if justified else "")
+                   if out.conditional else "")
+    note = " ".join([*(notes or []), *([conditional] if conditional and conditional_in_note else [])])
+    c = calc.Computation(f"C{len(ws.computations) + 1}",
+                         (label or "").strip() or label_prefix + calc.render(node, name, True),
+                         calc.render(node, lambda i: i), calc.render(node, lambda i: f"«{name(i)}»", True), out,
+                         inputs, sources, documents, kind, justification if justified else None, note, reproduces,
+                         [lf.id for lf in out.leaves], near, differs, calc.applied_rates(node), list(uncertain))
+    ws.computations[c.cid] = c
+    return c, conditional
+
+
+def tool_calculate(ws: Workspace, expression: str, label: str = "", justification: str | None = None) -> str:
+    """Evaluate an expression over the turn's ids (``app.chat.calc``) and register the result as a C#."""
+    try:
+        node = calc.parse(expression)
+    except calc.CalcError as e:
+        raise ToolError(f"ביטוי לא תקין: {e}") from None
+    ids = list(dict.fromkeys(calc.ids_of(node)))
+    operands = computation_operands(ws, ids)
+    leaves = _leaves(ws, ids)
+    _check_available(ws, leaves)
+    justification = (justification or "").strip() or None
+    try:
+        out = calc.evaluate(node, operands, justification, contexts=allowed_contexts(ws))
+    except calc.CalcError as e:
+        raise ToolError(f"אי אפשר לחשב: {e}") from None
+
     notes = []
     if out.approx:
         notes.append("חלק מהערכים מקורבים; התוצאה מקורבת בהתאם.")
@@ -6423,16 +6527,6 @@ def tool_calculate(ws: Workspace, expression: str, label: str = "", justificatio
     if statuses:
         notes.append("מצב הערכים: " + "; ".join(statuses) + ".")
     justified = bool(out.conditional)  # conditional on the justification the mix needed
-    uncertain = uncertain_inputs(ws, leaves)
-    if uncertain:
-        # why each is uncertain, when the turn knows (an unclear region, a cell OCR did not confirm in its place)
-        why = [f"{i}: {r}" for i in uncertain
-               if (r := ws.uncertain_values.get(i) or (ws.values[i].reading_note if i in ws.values else ""))]
-        out.conditional.append(MSG_UNCERTAIN_INPUTS.format(ids=", ".join(uncertain))
-                               + (f" ({'; '.join(why)})" if why else ""))
-    conditional = ("מותנה: " + "; ".join(out.conditional)
-                   + (f" — לפי ההצדקה: {justification}" if justified else "")
-                   if out.conditional else "")
     reproduces = None if out.assumptions else _reproduces(ws, out, leaves)
     kind = "scenario" if out.assumptions else "reproduces_report_value" if reproduces else "computed"
     # a product of a rounded document rate beside the amount its section states (KTD8): reported and kept in the
@@ -6454,12 +6548,10 @@ def tool_calculate(ws: Workspace, expression: str, label: str = "", justificatio
         notes.append(MSG_STATED_DIFFERS.format(source=differs["source"], amount=differs["amount"],
                                                quote=differs["quote"], rate=differs["rate"],
                                                low=differs["interval"][0], high=differs["interval"][1]))
-    c = calc.Computation(f"C{len(ws.computations) + 1}", (label or "").strip() or calc.render(node, name, True),
-                         calc.render(node, lambda i: i), calc.render(node, lambda i: f"«{name(i)}»", True), out,
-                         inputs, sources, len(docs), kind, justification if justified else None, " ".join(notes),
-                         reproduces, [lf.id for lf in out.leaves], near, differs, calc.applied_rates(node),
-                         list(uncertain))
-    ws.computations[c.cid] = c
+    c, conditional = register_computation(ws, node, out, leaves, label=label, kind=kind, justification=justification,
+                                          justified=justified, notes=notes, reproduces=reproduces, near=near,
+                                          differs=differs)
+    inputs = c.inputs
     return json.dumps({"id": c.cid, "label": c.label, "expression": c.expression, "formula": c.formula,
                        "value": str(c.value), "display": c.display(), "unit": c.unit_label, "scale": c.scale,
                        "result_kind": calc.RESULT_KINDS[kind], "reproduces": reproduces, "conditional": c.conditional,

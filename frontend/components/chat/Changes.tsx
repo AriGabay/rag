@@ -33,8 +33,8 @@ export interface CutFocus {
   tick: number;
 }
 
-/** The removal note's button in the answer's body (round 13 U12, KTD14): every removal opens (`open`) or closes together;
- * `tick` makes a second press count. The first removal takes the focus when they open. */
+/** The removal note's button in the answer's body (round 13 U12, KTD14): every press is an idempotent "open all" (`open`
+ * is always true); `tick` makes a repeated press count. The first removal takes the focus when they open. */
 export interface ExpandAll {
   tick: number;
   open: boolean;
@@ -336,7 +336,7 @@ function RemovalItem({
 }) {
   const action = rowChangeAction(removal);
   const pick = useCallback((d: ChatDiagnostics) => pairDecision(d, removal, index), [removal, index]);
-  const { open, state, load, expand, collapse, toggle } = useExpandable(diagnostics, pick);
+  const { open, state, load, expand, toggle } = useExpandable(diagnostics, pick);
   const panelId = useId();
   const li = useRef<HTMLLIElement>(null);
   const handled = useRef(0);
@@ -359,10 +359,7 @@ function RemovalItem({
   useEffect(() => {
     if (!allTick || allTick === handledAll.current) return;
     handledAll.current = allTick;
-    if (!allOpen) {
-      collapse();
-      return;
-    }
+    if (!allOpen) return;
     expand();
     if (index === 0) {
       window.requestAnimationFrame(() => {
@@ -370,7 +367,7 @@ function RemovalItem({
         li.current?.focus();
       });
     }
-  }, [allTick, allOpen, index, expand, collapse]);
+  }, [allTick, allOpen, index, expand]);
 
   return (
     <li

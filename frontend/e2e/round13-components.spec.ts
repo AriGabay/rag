@@ -129,8 +129,8 @@ test.describe("the undecided mark", () => {
     await expect(chip).toBeVisible();
     await expect(chip).toHaveText("S2");
     // the badge comes first, then the chip; the badge text is not read a second time
-    expect(await first.locator(".tl-undecided").evaluate((el) => el.children[0].textContent)).toBe("השוואה לא הוכרעה");
-    await expect(first.locator(".tl-undecided .badge")).toHaveAttribute("aria-hidden", "true");
+    expect(await first.locator(".tl-mark-with").evaluate((el) => el.children[0].textContent)).toBe("השוואה לא הוכרעה");
+    await expect(first.locator(".tl-mark-with .badge")).toHaveAttribute("aria-hidden", "true");
     await chip.click();
     await expect(sourceViewer(page)).toBeVisible();
     // the second row names the first

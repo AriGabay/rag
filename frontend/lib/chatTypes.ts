@@ -701,17 +701,10 @@ export interface ChatTimelineGroup {
 
 /** One row of the components table (round 13 U6, KTD7): a component of one appraisal at one date. `facet` is the
  * consideration or cash flow the source gives the value, in its own words, or the server's "רכיב לא צוין במקור". */
-export interface ChatBreakdownRow {
-  facet: string;
-  value_text: string;
-  /** The unit as display text; null when none. */
-  unit: string | null;
-  sid: string;
-  source: { document_id: string; title: string; location: string | null };
-  marks: ChatTimelineMark[];
-  undecided_with?: string[];
-  conflict_with?: string[];
-}
+export type ChatBreakdownRow = Pick<
+  ChatTimelineRow,
+  "value_text" | "unit" | "sid" | "source" | "marks" | "undecided_with" | "conflict_with"
+> & { facet: string };
 
 /** The components of one appraisal unit at one date (parallel components, never competing values), rows in server order.
  * Its rows are in no timeline group. */

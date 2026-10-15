@@ -31,7 +31,6 @@ from app.measurements.values import parse_amount
 
 STATUS_STATED, STATUS_NONE, STATUS_NOT_READ = "stated", "none", "not_read"
 TIER_OWN, TIER_CONTEXT = "own", "context"
-PARTS = ("row", "column", "caption", "sentence", "lead_in", "heading")
 CONTEXT_BLOCKS = 3  # the blocks above a quote value that the bounded context read looks at (KTD2)
 
 # the families whose datum needs a facet (KTD3): a coefficient, and a proportion (a rate, a percentage, an
@@ -61,9 +60,10 @@ def not_read() -> dict:
 
 def family_of(kind: str) -> str:
     """The datum family of a kind, as ``resolve.family`` has it (a ratio and a rate are one proportion; value and
-    value per area are one family), without importing ``resolve`` (which imports the tools)."""
-    base = (kind or "")[: -len("_per_area")] if (kind or "").endswith("_per_area") else (kind or "")
-    return {"ratio": "proportion", "rate": "proportion"}.get(base, base)
+    value per area are one family); ``resolve`` is imported where used: it reaches the tools, which read this module."""
+    from app.chat.resolve import family
+
+    return family(kind or "")
 
 
 def needs_facet(family: str) -> bool:
@@ -135,8 +135,6 @@ FAMILY_WORDS: dict[str, frozenset[str]] = {
 # then name the component
 _BASIS_WORDS = _stems("בסיס בסיסי")  # "בסיס" is a word of a basis label, not a cue
 _CUE_WORDS = (_COEFFICIENT_WORDS | _PROPORTION_WORDS) - _BASIS_WORDS
-# a row or column label that is no component by itself: the generic words of a label column
-_LABEL_WORDS = _BASE_WORDS
 
 
 def generic_words(family: str) -> frozenset[str]:
@@ -144,6 +142,7 @@ def generic_words(family: str) -> frozenset[str]:
     return FAMILY_WORDS.get(family, _BASE_WORDS)
 
 
+@lru_cache(maxsize=4096)
 def core(written: str | None, family: str = "") -> frozenset[str]:
     """The words of a facet, normalized, for comparing two spellings of one component (KTD3): quote marks unified,
     prefix letters and plural endings folded, the family's generic and metric words and every word of two letters or
@@ -399,18 +398,13 @@ class Site(NamedTuple):
     section: str = ""
 
 
-@lru_cache(maxsize=4096)
-def _core(written: str, family: str) -> frozenset[str]:
-    return core(written, family)
-
-
 def core_of(site) -> frozenset[str]:
     """The core of a datum's stated facet; empty when it states none (a facet of the status ``none`` or ``not_read``, or one
     that reduces to generic words only)."""
     f = site.facet or {}
     if f.get("status") != STATUS_STATED:
         return frozenset()
-    return _core(f.get("written") or "", site.family)
+    return core(f.get("written") or "", site.family)
 
 
 def headline(site, in_unit: int = 1) -> bool:
@@ -436,12 +430,16 @@ def relation(a, b, a_in_unit: int = 1, b_in_unit: int = 1) -> str:
 
     1. both facets are ``own`` tier and their cores are equal and not empty: same;
     2. both are the unit's headline datum (``headline``): same;
+    2b. a family that needs no facet (rent, value, area, income ...), the two data in different appraisal units, one stating a
+       facet and the other none: same. A stated facet there is a wording of the source, not a component, so the value that states
+       none (the headline datum of its unit) is compared with the other unit's value of the key; two own facets with disjoint
+       cores across units stay undecided (rule 4). Inside one unit this rule does not apply;
     3. each core keeps a content word the other lacks, and both are in one unit's same table, list or section: different;
        or both facets are ``own`` tier (the value's own row label, column header or purpose phrase) and both data are in the
        same appraisal unit, in any section: different (round 13 follow-up: an own facet is the value's own words, so two
        disjoint ones inside one appraisal are two components even where the sections differ);
     4. everything else (a subset, disjoint across units, context-tier cores that are not side by side, equal context-tier
-       cores, an unresolved facet, a stated facet against a headline datum): undecided.
+       cores, an unresolved facet, a stated facet against a headline datum in a facet family or in one unit): undecided.
 
     "Different" needs structural evidence: two wordings of one datum in two documents can share no words. The rule is not
     transitive, so it is no key field: ``timeline`` joins "same" pairs into classes. The two data are of one base key
@@ -451,6 +449,8 @@ def relation(a, b, a_in_unit: int = 1, b_in_unit: int = 1) -> str:
     if own and ca and ca == cb:
         return SAME
     if headline(a, a_in_unit) and headline(b, b_in_unit):
+        return SAME
+    if not needs_facet(a.family) and not needs_facet(b.family) and a.appraisal != b.appraisal and not (ca and cb):
         return SAME
     if ca - cb and cb - ca and (_together(a, b) or (own and a.appraisal is not None and a.appraisal == b.appraisal)):
         return DIFFERENT

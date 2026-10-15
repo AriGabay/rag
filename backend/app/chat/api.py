@@ -326,11 +326,14 @@ def _answer_documents(answer: dict | None) -> set[str]:
     visible."""
     if not answer:
         return set()
-    ids = {s.get("document_id") for s in answer.get("sources") or []}
+    def doc_ids(items) -> set:
+        return {x.get("document_id") for x in items}
+
+    ids = doc_ids(answer.get("sources") or [])
     ids |= {d for s in answer.get("sources") or [] for d in s.get("listed_document_ids") or []}
-    ids |= {m.get("document_id") for m in answer.get("measurements") or []}
-    ids |= {v.get("document_id") for v in answer.get("values") or []}
-    ids |= {d.get("document_id") for d in answer.get("documents") or []}
+    ids |= doc_ids(answer.get("measurements") or [])
+    ids |= doc_ids(answer.get("values") or [])
+    ids |= doc_ids(answer.get("documents") or [])
     ids |= coverage.ledger_documents(answer.get("ledger"))
     record = (answer.get("time") or {}).get("coverage") or {}  # round 12: units not searched or without a hit are never cited
     ids |= {u.get("document_id") for u in record.get("units") or [] if isinstance(u, dict)}
@@ -346,7 +349,7 @@ def _answer_documents(answer: dict | None) -> set[str]:
     ids |= set((answer.get("focus") or {}).get("document_ids") or [])
     ids.add((answer.get("unit") or {}).get("document_id"))  # the unit the conversation is in (round 9 U10)
     ids |= set((answer.get("request") or {}).get("document_ids") or [])
-    ids |= {c.get("document_id") for c in (answer.get("request") or {}).get("candidates") or []}
+    ids |= doc_ids((answer.get("request") or {}).get("candidates") or [])
     ids |= set((answer.get("request") or {}).get("named_document_ids") or [])  # the files a clarification names
     ids |= {d for r in answer.get("requested") or [] for d in r.get("document_ids") or []}
     ids |= set(answer.get("touched_documents") or [])

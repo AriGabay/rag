@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING
 
 from app.answering.verify import _NUMBER as _NUM_AT
 from app.answering.verify import not_an_amount, numbers_in
+from app.chat.datum import STATUS_NOT_READ
 from app.chat.evidence import _content_words
 from app.measurements.extract import _MONTH_WORDS, _YEAR_WORDS, PERIOD_LABELS
 
@@ -703,7 +704,11 @@ TABLE_TEXT_JOIN = (" LEFT JOIN extracted_tables et ON et.version_id = m.version_
 TABLE_TEXT_COLUMNS = (
     "et.structure->>'caption' AS caption, (SELECT h FROM jsonb_array_elements_text(CASE WHEN"
     " jsonb_typeof(et.structure->'headers') = 'array' THEN et.structure->'headers' ELSE '[]'::jsonb END) AS h"
-    " WHERE h <> '' AND position(h || ': ' || m.value_text IN m.quote) > 0 ORDER BY length(h) DESC LIMIT 1) AS header")
+    " WHERE h <> '' AND position(h || ': ' || m.value_text IN m.quote) > 0 ORDER BY length(h) DESC LIMIT 1) AS header,"
+    # what the facet of a table row reads (`tools._listed_facet`, round 13 U3): whether the table is stored, the cells of the
+    # row itself (a negative index would count from the end) and the table's title lines — never the whole structure
+    " (et.version_id IS NOT NULL) AS table_stored, CASE WHEN m.row_index >= 0 THEN"
+    " et.structure->'rows'->(m.row_index::int)->'cells' END AS row_cells, et.structure->'title' AS title_lines")
 READS = 6  # database reads per verification for evidence beyond the cited passages
 
 
@@ -830,6 +835,17 @@ class Fetcher:
             return found.sid
         adopted = self.ws.add_measurement(found)
         adopted.as_of = measurement_date(self.ws, found)
+        if adopted.facet["status"] == STATUS_NOT_READ and self.ws.ctx is not None:
+            # a table row that does not carry its table's text (the listing columns) is read through the stored table now, so
+            # the cell the turn also cites as a V# is one component with it, never a second "not stated" row (round 13 U3)
+            from app.chat.tools import _measurement_facet_of
+            from app.db import tenant_tx
+
+            try:
+                with tenant_tx(self.ws.ctx) as conn:
+                    adopted.facet = _measurement_facet_of(self.ws, conn, found)
+            except Exception:  # noqa: BLE001 - a facet not read is a facet not read; the check stays strict
+                pass
         return adopted.mid
 
     def attesting(self, unit: Unit, forms: frozenset[str], kind: str, key: str, words: set[str]) -> str | None:

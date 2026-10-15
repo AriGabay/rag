@@ -756,7 +756,7 @@ def test_a_newer_datum_of_an_undecided_class_is_named_in_the_record_and_the_note
     out = run(ws, "search", query=VALUE_QUERY, limit=6)
     v_old, v_new = take(ws, out, old, "1,950,000"), take(ws, out, new, "2,410,000")
     by_ref = {d.ref: d for d in timeline.datums(ws)}
-    monkeypatch.setattr(timeline, "later_undecided", lambda ws_, cited, identity=None: [(by_ref[v_old], by_ref[v_new])])
+    monkeypatch.setattr(timeline, "later_undecided", lambda ws_, cited, identity=None, built=None: [(by_ref[v_old], by_ref[v_new])])
     record = timeline.coverage_of(ws, [v_old])
     (later,) = record["later_undecided"]
     assert (later["older"], later["newer"], later["document_id"]) == (v_old, v_new, new) and later["when"] == "30/06/2025"
@@ -764,7 +764,7 @@ def test_a_newer_datum_of_an_undecided_class_is_named_in_the_record_and_the_note
     note = TF.coverage_note(record)
     assert TF.LATEST_CHECKED in note and "מסמך lu-2025" in note and "30/06/2025" in note
     assert timeline.partial_coverage(ws, [v_old]) is not None
-    monkeypatch.setattr(timeline, "later_undecided", lambda ws_, cited, identity=None: [])
+    monkeypatch.setattr(timeline, "later_undecided", lambda ws_, cited, identity=None, built=None: [])
     assert "later_undecided" not in timeline.coverage_of(ws, [v_old]) and timeline.coverage_of(ws, [v_old])["complete"]
     payload = timeline.payload(ws, {v_old}, coverage=timeline.coverage_of(ws, [v_old]))
     assert payload["coverage"]["note"] == TF.coverage_note(timeline.coverage_of(ws, [v_old]))

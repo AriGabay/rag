@@ -1622,7 +1622,7 @@ button.cut-marker:focus-visible {
   white-space: normal;
 }
 
-.tl-undecided {
+.tl-mark-with {
   display: inline-flex;
   flex-wrap: wrap;
   align-items: center;

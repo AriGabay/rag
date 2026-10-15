@@ -72,23 +72,37 @@ def _table_head(st: dict) -> list[str]:
     return lines
 
 
-def _section_rows(ws: Workspace, conn: Connection, head: reader.Version, src: Source) -> tuple[tuple[str, ...], list]:
+def _section_rows(ws: Workspace, conn: Connection, head: reader.Version, src: Source,
+                  chain: tuple[str, ...] | None = None) -> tuple[tuple[str, ...], list]:
     """The innermost section a source cites a block of, and the blocks of it (its sub-sections too), within its appraisal
-    context; nothing for a source with no place in the document (a search hit's chunk)."""
+    context; nothing for a source with no place in the document (a search hit's chunk). Kept for the turn by (version, first
+    block, reading), so the qualifier pre-read loads a section once. ``chain``: the source's ``_chain_of`` when the caller
+    has it."""
     if src.block_start is None:
         return (), []
-    chain = _chain_of(ws, conn, head, src)
-    if not chain:
-        return (), []
-    cx = contexts_of(ws, conn, src.version_id, head.reading_id)
-    rows = reader.blocks_in_section(conn, src.version_id, chain, window=reader.section_window(cx, src.block_start, chain))
-    return chain, [r for r in rows if r.text]
+    key = (str(src.version_id), src.block_start, head.reading_id)
+    if key not in ws.section_rows:
+        chain = _chain_of(ws, conn, head, src) if chain is None else chain
+        if not chain:
+            ws.section_rows[key] = (), []
+        else:
+            cx = contexts_of(ws, conn, src.version_id, head.reading_id)
+            rows = reader.blocks_in_section(conn, src.version_id, chain,
+                                            window=reader.section_window(cx, src.block_start, chain))
+            ws.section_rows[key] = chain, [r for r in rows if r.text]
+    return ws.section_rows[key]
 
 
-def _expand_section_lead(ws, conn, head, src):
+def _note_lines(rows, pattern: re.Pattern) -> list[str]:
+    """The lines of the blocks ``rows`` that start as a note (``pattern``), stripped, in order."""
+    return [x.strip() for r in rows for x in (r.text or "").splitlines() if pattern.match(x)]
+
+
+def _expand_section_lead(ws, conn, head, src, chain=None):
     """The section's lead-in (round 13 U10, KTD11, R14): the first paragraphs under its heading, before any sub-section or
-    table — where a section says what all that follows is (a scale, a basis, a date) — as stored text only."""
-    chain, rows = _section_rows(ws, conn, head, src)
+    table — where a section says what all that follows is (a scale, a basis, a date) — as stored text only. ``chain``: the
+    source's heading chain when the caller has it."""
+    chain, rows = _section_rows(ws, conn, head, src, chain)
     lead: list[str] = []
     for r in rows:
         if r.kind == "heading" or r.table_index is not None:
@@ -110,10 +124,7 @@ def _expand_section_notes(ws, conn, head, src, marks_only: bool = False):
     ``marks_only``, the word for a note — wherever in the section it stands (a note often follows its table by a paragraph)."""
     _, rows = _section_rows(ws, conn, head, src)
     start = _NOTE_LINE if marks_only else _SECTION_NOTE
-    lines: list[str] = []
-    for r in rows:
-        lines += [x.strip() for x in (r.text or "").splitlines() if start.match(x)]
-    lines = list(dict.fromkeys(lines))
+    lines = list(dict.fromkeys(_note_lines(rows, start)))
     if not lines:
         return None
     return "הערות הסעיף:\n" + "\n".join(lines), "הערות הסעיף", {}
@@ -133,7 +144,7 @@ def _expand_heading(ws, conn, head, src):
         return None
     # the heading chain and the lead-in under it: what the section opens with says what it is about (round 13 U10, KTD11)
     return _joined(("כותרות מעל המקור, מהחיצונית לפנימית: " + " › ".join(chain), "כותרות הסעיף", {}),
-                   _expand_section_lead(ws, conn, head, src))
+                   _expand_section_lead(ws, conn, head, src, chain))
 
 
 def _expand_neighbours(ws, conn, head, src):
@@ -194,8 +205,7 @@ def _expand_footnotes(ws, conn, head, src):
         b = reader.blocks_at(conn, src.version_id, [src.block_start]).get(src.block_start)
         pages = [b.page] if b is not None and b.page else []
     if pages:
-        for r in reader.blocks_on_pages(conn, src.version_id, min(pages), max(pages)):
-            lines += [x.strip() for x in (r.text or "").splitlines() if _NOTE_LINE.match(x)]
+        lines += _note_lines(reader.blocks_on_pages(conn, src.version_id, min(pages), max(pages)), _NOTE_LINE)
     lines = list(dict.fromkeys(lines))
     section = _expand_section_notes(ws, conn, head, src, marks_only=True)  # a footnote's mark, as on the page
     if not lines and section is None:

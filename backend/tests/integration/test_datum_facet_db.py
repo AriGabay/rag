@@ -123,3 +123,143 @@ def test_listed_measurements_carry_their_facets_in_the_listing_and_in_public(off
     T.tool_find_measurements(text_ws, "שיעור היוון")
     text_row = next(m for m in text_ws.measurements.values() if m.row.metric_kind == "rate")
     assert text_row.public()["facet"]["written"] == "תזרים דמי שכירות ממשרדים"
+
+
+# --- a page of table measurements: a bounded number of statements (review finding: one read per distinct table) -----------
+
+EXTRA_TABLES = 6
+COMPONENTS = ["גובה", "קומה", "מיקום", "שימוש", "גודל", "מצב"]
+
+
+def _more_tables(office) -> list[str]:
+    """``EXTRA_TABLES`` more tables (indexes 1..), each with two body rows and a measurement of the second row. The first
+    holds a generic row label and a title line that names a component, the second a matrix (three cells per row)."""
+    with tenant_tx(office.system) as conn:
+        ver = conn.execute(text("SELECT id FROM document_versions WHERE document_id = :d"), {"d": office.doc}).scalar_one()
+        for i in range(1, EXTRA_TABLES + 1):
+            structure = {"headers": ["רכיב", "ערך"] if i != 2 else ["רכיב", "משרדים", "ערך"],
+                         "caption": f"טבלה {i}", "title": ["מקדם גובה בנייה"] if i == 1 else [], "notes": [],
+                         "section": SECTION_B, "block_index": 7,
+                         "rows": [{"cells": ["שטח", "10"]},
+                                  {"cells": ["הערך שנקבע" if i == 1 else f"מקדם {COMPONENTS[i - 1]}", "0.8"] if i != 2
+                                           else [f"מקדם {COMPONENTS[1]}", "0.7", "0.8"]}]}
+            conn.execute(text("INSERT INTO extracted_tables (office_id, document_id, version_id, table_index, page_start,"
+                              " page_end, structure) VALUES (app_office(), :d, :v, :t, 1, 1, CAST(:s AS jsonb))"),
+                         {"d": office.doc, "v": ver, "t": i, "s": json.dumps(structure, ensure_ascii=False)})
+            conn.execute(text(
+                "INSERT INTO measurements (office_id, document_id, version_id, block_index, table_index, row_index,"
+                " statement_key, metric, metric_kind, value, value_form, value_text, unit, period, vat, subject_role,"
+                " value_role, quote, extraction_version, model, status, issues) VALUES (app_office(), :d, :v, 7, :t,"
+                " 1, :sk, 'מקדם התאמה', 'coefficient', 0.8, 'exact', '0.8', 'ratio', 'none', 'unknown', 'general',"
+                " 'other', :q, :e, 'test', 'auto_validated', '[]'::jsonb)"),
+                {"d": office.doc, "v": ver, "t": i, "sk": f"t{i}:r1:מקדם", "q": f"מקדם {COMPONENTS[i - 1]} | 0.8",
+                 "e": EXTRACTION_VERSION})
+    return [str(i) for i in range(1, EXTRA_TABLES + 1)]
+
+
+def _listing_statements(office, query: str):
+    from sqlalchemy import event
+
+    from app.db import get_engine
+
+    seen: list[str] = []
+
+    def record(conn, cursor, statement, *args):  # noqa: ARG001
+        if "set_config" not in statement:
+            seen.append(statement)
+
+    engine = get_engine()
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        ws = workspace(office)
+        T.tool_find_measurements(ws, query, metric_kinds=["coefficient"])
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    return ws, seen
+
+
+def test_a_page_of_table_measurements_reads_no_table_apart_and_its_facets_equal_the_structure_reads(office):
+    from app.chat import reader
+
+    _listing_statements(office, "מקדם")  # once to warm what the version caches, apart from the listing itself
+    _, one = _listing_statements(office, "מקדם")  # the single table of the fixture
+    _more_tables(office)
+    ws, many = _listing_statements(office, "מקדם")
+    assert len(ws.measurements) == 1 + EXTRA_TABLES
+    # the listing's own query carries what the facets read: no table structure or block is fetched per table
+    assert not [s for s in many if "FROM extracted_tables" in s and "JOIN" not in s]
+    assert not [s for s in many if "FROM document_blocks" in s]
+    assert len(many) == len(one)
+    with tenant_tx(office.ctx()) as conn:
+        for m in ws.measurements.values():
+            structure = reader.table_structure(conn, m.row.version_id, m.row.table_index)
+            assert m.facet == T._measurement_facet(m.row, structure), m.row.quote
+    assert {m.facet["status"] for m in ws.measurements.values()} == {"stated"}
+    assert {m.facet["part"] for m in ws.measurements.values()} == {"row", "caption"}  # a title line read as well
+
+
+# --- a measurement the verifier adopts has its facet read (review finding: a phantom components row) ---------------------
+
+def _adopt_beside_value(office, listed: bool):
+    """The coefficient cell taken as V1, and the same cell's stored measurement adopted as M1 by the verifier's fetcher:
+    ``listed`` as the fetcher's own query returns it (the table text columns), else as a plain ``m.*`` row."""
+    import uuid
+
+    from app.chat import meaning
+
+    with tenant_tx(office.system) as conn:  # the stored row is the subject property's own determination
+        conn.execute(text("UPDATE measurements SET subject_role = 'appraised_property',"
+                          " value_role = 'appraiser_determination' WHERE metric_kind = 'coefficient'"))
+    ws = workspace(office)
+    ws.doc = office.doc
+    outline = T.tool_outline(ws, ws_doc(ws))
+    handle = re.search(r"(T\d+) «טבלת חישוב שווי הקרקע»", outline).group(1)
+    s = re.search(r'<source id="(S\d+)"', T.tool_read(ws, {"table": handle})).group(1)
+    taken = run(ws, "take_value", source=s, locator={"table": None, "row": "מקדם הפחתה בשל שיתוף במקרקעין",
+                                                    "row_number": None, "column": "ערך", "column_number": None,
+                                                    "quote": None, "number": None},
+                meaning={"kind": "coefficient", "unit": "ratio", "period": "none", "vat": "unknown", "area_basis": "",
+                         "subject": "הנכס", "role": "other"}, label="מקדם")
+    assert taken.startswith("V1 נרשם"), taken
+    fetcher = meaning.Fetcher(ws)
+    if listed:
+        row = fetcher.subject_measurements({uuid.UUID(office.doc)})[0]
+    else:
+        with tenant_tx(office.ctx()) as conn:
+            row = conn.execute(text("SELECT m.*, d.title FROM measurements m JOIN documents d ON d.id = m.document_id"
+                                    " WHERE m.metric_kind = 'coefficient'")).first()
+    return ws, fetcher.adopt(row)
+
+
+@pytest.mark.parametrize("listed", [True, False])
+def test_a_table_measurement_adopted_beside_a_value_of_the_same_cell_is_one_component(office, listed):
+    from app.chat import timeline
+
+    ws, mid = _adopt_beside_value(office, listed)
+    assert ws.measurements[mid].facet == ws.values["V1"].facet
+    assert ws.measurements[mid].facet["status"] == "stated"
+    timeline_blocks, breakdown = timeline.compose(ws, {"V1", mid})
+    assert breakdown == []  # one class of the unit and its date: no second component row
+
+
+def test_the_blocks_above_a_quote_are_read_for_the_family_of_the_settled_kind_not_the_given_one(office, monkeypatch):
+    """The family that decides whether a quote value reads its context (`datum.needs_facet`) is the settled kind's, as the
+    facet itself is read (`_value_facet`): a kind the settling changes is the one used for both."""
+    real_settle, real_preceding, seen = T._settle_meaning, T._preceding_blocks, []
+
+    def settle(taken, given):
+        fields, prov, anchors = real_settle(taken, given)
+        return fields | {"kind": "rate"}, prov, anchors
+
+    def preceding(conn, version_id, region, taken, kind):
+        seen.append(kind)
+        return real_preceding(conn, version_id, region, taken, kind)
+
+    monkeypatch.setattr(T, "_settle_meaning", settle)
+    monkeypatch.setattr(T, "_preceding_blocks", preceding)
+    ws = workspace(office)
+    ws.doc = office.doc
+    s = _source_of(ws, SECTION_A)
+    run(ws, "take_value", source=s, locator=quote(BLOCKS[3][2].rstrip("."), "9"),
+        meaning=_meaning() | {"kind": "income"}, label="שיעור")
+    assert seen == ["rate"], seen

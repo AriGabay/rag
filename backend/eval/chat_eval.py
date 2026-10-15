@@ -77,7 +77,8 @@ from pathlib import Path
 import httpx
 import yaml
 
-from app.chat.verify import split_units
+from app.chat.verify import ROW_ACTIONS, split_units
+from app.platform import source_kinds
 from eval.scoring import (
     calc_check,
     norm,
@@ -242,7 +243,6 @@ def run_turn(c: httpx.Client, cid: str, content: str) -> dict:
 
 
 SOURCE_DOCS_MODES = ("cited", "if_needed")
-GONE_ACTIONS = ("removed", "withheld", "cut")  # the log's actions that take a claim out of the answer (``verify``)
 
 
 class SetHashMismatch(Exception):
@@ -302,7 +302,7 @@ def professional_support(m: dict, expect: dict, needle: str | list[str]) -> list
     problems: list[str] = []
 
     def professional_kind(s: dict) -> bool:
-        return s.get("kind") != "listing" and s.get("source_kind") not in (None, "appraisal")
+        return s.get("kind") != "listing" and s.get("source_kind") not in (None, source_kinds.APPRAISAL)
 
     statements = []
     for u in split_units(a.get("markdown") or ""):
@@ -312,7 +312,7 @@ def professional_support(m: dict, expect: dict, needle: str | list[str]) -> list
             statements.append((text, cited))
     verification = a.get("verification") or {}
     diagnostics = m.get("_diagnostics")
-    handled = [d for d in (diagnostics or {}).get("removed") or [] if d.get("action") in GONE_ACTIONS]
+    handled = [d for d in (diagnostics or {}).get("removed") or [] if d.get("action") in ROW_ACTIONS]
     if diagnostics is None and (verification.get("removed") or verification.get("removals")):
         problems.append("הוסרו טענות מהתשובה ואין אבחון שמראה אם אחת מהן מקצועית")
     for d in handled:

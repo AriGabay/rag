@@ -2194,8 +2194,9 @@ def split_units(markdown: str) -> list[Unit]:
             units.append(Unit(len(units), part, clean, ids_in(part), base + a, base + a + len(part),
                               header_row, table_span, context))
         if table_span is None and len(units) > first_unit:
+            item = bool(_LIST_ITEM.match(stripped))
             for u in units[first_unit:]:
-                u.list_item = bool(_LIST_ITEM.match(stripped))
+                u.list_item = item
             units[-1].leads_list = bool(_LIST_ITEM.match(following) or _HEADING_LINE.match(following))
     units = _attach_bare_lines(markdown, units)
     chains = _headings_above(markdown, units)
@@ -2675,6 +2676,8 @@ def _date_backed(text: str, ws: Workspace, ids: list[str]) -> set[str]:
 def _all_numbers(ws: Workspace) -> set[str]:
     """Every number the turn's evidence states, for a unit that cites nothing (a listing's counts and house
     numbers are not: a count over a set must cite the listing)."""
+    from app.chat.calc import DERIVED
+
     nums: set[str] = set()
     for s in ws.sources.values():
         if not s.is_listing:
@@ -2688,7 +2691,7 @@ def _all_numbers(ws: Workspace) -> set[str]:
     for a in ws.assumptions.values():
         nums |= numbers_in(a.written)
     for c in ws.computations.values():
-        if c.result_kind != "derived":  # a derived result backs only a unit that cites its inputs (round 13 U9)
+        if c.result_kind != DERIVED:  # a derived result backs only a unit that cites its inputs (round 13 U9)
             nums |= numbers_in(computation_text(c))
     return nums
 
@@ -3193,13 +3196,12 @@ def _number_edits(u: Unit, ws: Workspace, unstated: list[str]) -> list[Qualifier
     text, to_raw = u.text, _text_to_raw(u)
     if to_raw is None:
         return None
-    dates = [m.span() for m in _DATE_AT.finditer(text)]
-    targets = [n for n in _shown(text) if numbers_in(n.written) & set(unstated) and not any(a <= n.start < b for a, b in dates)]
+    wanted = set(unstated)
+    targets = _numbers_outside_dates(text, wanted)
     gates = (_REDUCTION, _ADDITION, _RELATION_SUM, _RELATION_DIFFERENCE, _RELATION_PRODUCT, _RELATION_RATIO)
     spans: list[tuple[int, int]] = []
     for n in targets:
-        lo = max((m.end() for m in _CLAUSE_END.finditer(text, 0, n.start)), default=0)
-        hi = next((m.start() for m in _CLAUSE_END.finditer(text, n.end)), len(text))
+        lo, hi = _clause_span(text, n.start, n.end)
         words = [m for rx in gates for m in rx.finditer(text, lo, hi)]
         if not words:
             return None
@@ -3236,7 +3238,8 @@ def _number_edits(u: Unit, ws: Workspace, unstated: list[str]) -> list[Qualifier
     for a, b in spans:
         rest, pos = rest + text[pos:a], b
     rest += text[pos:]
-    if not numbers_in(rest) or numbers_in(rest) & set(unstated) or not numbers_in(gone) <= set(unstated):
+    left = numbers_in(rest)
+    if not left or left & wanted or not numbers_in(gone) <= wanted:
         return None
     out: list[QualifierEdit] = []
     for a, b in spans:
@@ -3274,7 +3277,7 @@ def plan_qualifier_edits(report: VerifyReport, ws: Workspace, question: str,
                     p.resolution = "qualifier"
             continue
         if (not removing or u.index in report.protected or not u.ids
-                or any(p.kind != "claim" or p.check not in ("meaning", "vat") for p in removing)):
+                or any(p.kind != "claim" or p.check not in QUALIFIER_CHECKS for p in removing)):
             continue
         mine = meanings.get(u.index, [])
         if any(m.needs_citation for m in mine):  # evidence found elsewhere in the same calculation: its own path
@@ -3349,13 +3352,13 @@ def _recency_claim(u: Unit, ws: Workspace) -> Problem | None:
     from app.chat import timeframe, timeline
 
     cited = [i for i in u.ids if i in ws.values or i in ws.measurements]
-    found = timeline.later_than(ws, cited) if cited else []
+    found, undecided = timeline.later_pairs(ws, cited)
     if found:
         older, newer = found[0]
         reason = MSG_NOT_LATEST.format(older=older.ref, newer=newer.ref, when=timeline.shown(newer.as_of), title=newer.title)
         return Problem(u, reason, severity="partial", defect="recency", failure_kind="contradicts_source", check=RECENCY_CHECK)
-    if cited and timeframe.QUALIFIED not in u.text and (found := timeline.later_undecided(ws, cited)):
-        older, newer = found[0]
+    if cited and timeframe.QUALIFIED not in u.text and undecided:
+        older, newer = undecided[0]
         reason = MSG_LATEST_UNDECIDED.format(older=older.ref, newer=newer.ref, when=timeline.shown(newer.as_of),
                                              title=newer.title, phrase=timeframe.LATEST_CHECKED)
         return Problem(u, reason, severity="partial", defect="recency", failure_kind="contradicts_source", check=RECENCY_CHECK)
@@ -3440,9 +3443,12 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
         cited.add(str(len(c.inputs)))
         cited.add(str(c.documents))
     held = bool(u.ids) or strict
-    # a unit that cites nothing may show any calculation of the turn the model made; a derived one (round 13 U9, KTD9) backs
-    # only a unit that cites one of its inputs, so it is never in this pool
-    turn_wide = [c for c in ws.computations.values() if c.result_kind != "derived"]
+    if not held:
+        # a unit that cites nothing may show any calculation of the turn the model made; a derived one (round 13 U9, KTD9)
+        # backs only a unit that cites one of its inputs, so it is never in this pool
+        from app.chat.calc import DERIVED
+
+        computations = [c for c in ws.computations.values() if c.result_kind != DERIVED]
     pool = cited if held else everything
     values = [ws.values[i] for i in u.ids if i in ws.values] if held else list(ws.values.values())
     # a numbered heading's own number ("9.1 שיטת השומה") is its place in the answer, not a fact
@@ -3452,12 +3458,12 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
         backed = _date_backed(_stated_text(u), ws, u.ids)
         missing = [n for n in missing if n not in backed]
     if missing:  # a calculation's result shown rounded to the precision and in the scale it is written in
-        shown = _computed_numbers(u.text, computations if held else turn_wide)
+        shown = _computed_numbers(u.text, computations)
         missing = [n for n in missing if n not in shown]
     if missing:  # a number of the evidence in another form: a scale word, or a correct rounding marked as one (R14)
         restated = _restated(u.text, pool, {v.value * v.scale for v in values if v.scale != 1})
         missing = [n for n in missing if n not in restated]
-    wrong = _wrong_scale(u, ws, values, computations if held else turn_wide)
+    wrong = _wrong_scale(u, ws, values, computations)
     # a datum of the property that only the cited standard states, beside evidence that is not one (R34)
     only = _standard_only(u, ws, by_id, question_numbers) if held and any(_professional(ws, i) for i in by_id) else []
     return missing + [n for n in [*wrong, *only] if n not in missing]
@@ -3780,11 +3786,24 @@ MSG_DERIVED_NOTE = ("נגזר על ידי השרת מערכים שהיחידה �
 DERIVED_OPERANDS = 8  # cited values considered for a derivation; the pairs are bounded by it
 
 
+def _clause_span(text: str, start: int, end: int | None = None) -> tuple[int, int]:
+    """The span of the sentence of ``text`` that holds positions ``start`` to ``end`` (``start``: a position), up to the clause
+    ends ``_CLAUSE_END``."""
+    lo = max((m.end() for m in _CLAUSE_END.finditer(text, 0, start)), default=0)
+    hi = next((m.start() for m in _CLAUSE_END.finditer(text, start if end is None else end)), len(text))
+    return lo, hi
+
+
 def _clause_of(text: str, at: int) -> str:
     """The sentence of ``text`` that holds position ``at`` (up to the clause ends ``_CLAUSE_END``)."""
-    start = max((m.end() for m in _CLAUSE_END.finditer(text, 0, at)), default=0)
-    end = next((m.start() for m in _CLAUSE_END.finditer(text, at)), len(text))
-    return text[start:end]
+    lo, hi = _clause_span(text, at)
+    return text[lo:hi]
+
+
+def _numbers_outside_dates(text: str, loose: set[str]) -> list[Shown]:
+    """The numbers as shown in ``text`` that write one of ``loose`` (as ``numbers_in`` reads them), outside any date."""
+    dates = [m.span() for m in _DATE_AT.finditer(text)]
+    return [n for n in _shown(text) if numbers_in(n.written) & loose and not any(a <= n.start < b for a, b in dates)]
 
 
 def _appraisal_unit(ws: Workspace, i: str) -> tuple | None:
@@ -3813,17 +3832,20 @@ def _derivations(ws: Workspace, ids: list[str], shown: Shown, clause: str) -> li
             out.append((f"{x} * 100", False))
         else:
             out.append((f"{x} / 100", False))
+    unit_of = {i: _appraisal_unit(ws, i) for i in cited}
+    total, difference = bool(_RELATION_SUM.search(clause)), bool(_RELATION_DIFFERENCE.search(clause))
+    product, ratio = bool(_RELATION_PRODUCT.search(clause)), bool(_RELATION_RATIO.search(clause))
     for a in cited:
         for b in cited:
-            if a == b or _appraisal_unit(ws, a) != _appraisal_unit(ws, b):
+            if a == b or unit_of[a] != unit_of[b]:
                 continue
-            if _RELATION_SUM.search(clause) and a < b:
+            if total and a < b:
                 out.append((f"{a} + {b}", False))
-            if _RELATION_DIFFERENCE.search(clause):
+            if difference:
                 out.append((f"{a} - {b}", True))
-            if _RELATION_PRODUCT.search(clause) and a < b:
+            if product and a < b:
                 out.append((f"{a} * {b}", False))
-            if _RELATION_RATIO.search(clause):
+            if ratio:
                 out.append((f"{a} / {b}", False))
     return out
 
@@ -3842,7 +3864,7 @@ def _derived_computation(ws: Workspace, expression: str, shown: Shown, positive:
         existing = next((c for c in ws.computations.values()
                          if c.result_kind == calc.DERIVED and c.expression == written), None)
         ids = list(dict.fromkeys(calc.ids_of(node)))
-        out = calc.evaluate(node, {i: chat_tools._operand(ws, i) for i in ids})
+        out = calc.evaluate(node, chat_tools.computation_operands(ws, ids))
     except (calc.CalcError, chat_tools.ToolError):
         return None
     if (positive and out.value <= 0) or not calc.display_matches(shown.written, shown.percent, out.value, out.dims,
@@ -3850,37 +3872,10 @@ def _derived_computation(ws: Workspace, expression: str, shown: Shown, positive:
         return None
     if existing is not None:
         return existing.cid
-
-    def name(i: str) -> str:
-        return ws.values[i].label if i in ws.values else ws.measurements[i].row.metric
-
-    inputs = []
-    for i in out.inputs:
-        value = ws.values[i].value if i in ws.values else ws.measurements[i].row.value
-        entry = {"id": i, "label": name(i), "kind": "value" if i in ws.values else "measurement",
-                 "value": None if value is None else str(value),
-                 "display": None if value is None else calc.fmt(Decimal(str(value)))}
-        if i in ws.values:
-            entry |= {"source_id": ws.values[i].source_id, "value_text": ws.values[i].written,
-                      "certainty": ws.values[i].certainty}
-        else:
-            entry |= {"value_text": ws.measurements[i].row.value_text}
-        inputs.append(entry)
-    leaves = [lf.id for lf in out.leaves]
-    sources = list(dict.fromkeys([ws.values[i].source_id for i in leaves if i in ws.values]
-                                 + [i for i in leaves if i in ws.measurements]))
-    docs = {str(ws.values[i].document_id) for i in leaves if i in ws.values}
-    docs |= {str(ws.measurements[i].document_id) for i in leaves if i in ws.measurements}
-    uncertain = chat_tools.uncertain_inputs(ws, leaves)
-    if uncertain:  # a result resting on an uncertain input is conditional, never certain (R28), as ``tool_calculate`` has it
-        out.conditional.append(chat_tools.MSG_UNCERTAIN_INPUTS.format(ids=", ".join(uncertain)))
-    conditional = "מותנה: " + "; ".join(out.conditional) if out.conditional else ""
-    label = f"נגזר: {calc.render(node, name, True)}"
-    c = calc.Computation(f"C{len(ws.computations) + 1}", label, calc.render(node, lambda i: i),
-                         calc.render(node, lambda i: f"«{name(i)}»", True), out, inputs, sources, len(docs),
-                         calc.DERIVED, None, MSG_DERIVED_NOTE + (" " + conditional if conditional else ""), None, leaves,
-                         None, None, calc.applied_rates(node), list(uncertain))
-    ws.computations[c.cid] = c
+    # registered as ``tool_calculate`` registers a result: a result resting on an uncertain input is conditional, never
+    # certain (R28), and the conditional is kept in the note
+    c, _ = chat_tools.register_computation(ws, node, out, [lf.id for lf in out.leaves], label_prefix="נגזר: ",
+                                           kind=calc.DERIVED, notes=[MSG_DERIVED_NOTE], conditional_in_note=True)
     return c.cid
 
 
@@ -3889,10 +3884,7 @@ def derive_numbers(u: Unit, ws: Workspace, loose: set[str]) -> list[str]:
     each derived from the unit's cited values by a formula its own clause's wording names (``_derivations``). A number
     inside a date is never derived. Registers what it finds (``_derived_computation``); the caller cites it."""
     found: list[str] = []
-    dates = [m.span() for m in _DATE_AT.finditer(u.text)]
-    for n in _shown(u.text):
-        if not numbers_in(n.written) & loose or any(a <= n.start < b for a, b in dates):
-            continue
+    for n in _numbers_outside_dates(u.text, loose):
         clause = _clause_of(u.text, n.start)
         for expression, positive in _derivations(ws, u.ids, n, clause):
             cid = _derived_computation(ws, expression, n, positive)
@@ -4922,7 +4914,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     # a lead-in before list items is structure (round 13 U10, KTD12, R15): the judge is not asked, it is recorded as navigation,
     # and its numbers are read by the deterministic checks above like any unit's
     for u in to_judge:
-        if structural_kind(u) == "lead_in":
+        if u.leads_list and structural_kind(u) == "lead_in":
             verdicts[u.index] = JudgeVerdict(index=u.index, verdict="navigation", reason=LEAD_IN_REASON)
     fresh = [u for u in to_judge if u.index not in verdicts]
     if coverage and not fresh:
@@ -5573,6 +5565,13 @@ def _primary_claim_id(report: VerifyReport, index: int) -> str:
     return next((r.id for r in recs if r.verdict in FAILING_VERDICTS), recs[0].id if recs else "")
 
 
+def _dependency_problem(unit: Unit, base: Problem, claim_id: str) -> Problem:
+    """The removal of ``unit`` for resting on the removed unit of ``base`` (check ``dependency``): its failure kind and cause
+    are the basis's."""
+    return Problem(unit, DEPENDS_ON_REMOVED.format(text=base.unit.text[:120]), failure_kind=base.failure_kind,
+                   check="dependency", claim_id=claim_id, basis=base.claim_id, cause=base.cause)
+
+
 def _remove_dependents(report: VerifyReport, verdicts: dict[int, JudgeVerdict]) -> None:
     """What rests on a removed claim is removed too (KTD10, R15; round 8 R11), with that claim's failure kind (check
     ``dependency``), until nothing more rests on a removed one. At unit level: a unit whose verdict says it rests on a
@@ -5586,10 +5585,7 @@ def _remove_dependents(report: VerifyReport, verdicts: dict[int, JudgeVerdict]) 
             base = next((removed[d] for d in v.depends_on if d in removed), None)
             if i in removed or i not in units or base is None:
                 continue
-            report.problems.append(Problem(units[i], DEPENDS_ON_REMOVED.format(text=base.unit.text[:120]),
-                                           failure_kind=base.failure_kind, check="dependency",
-                                           claim_id=_primary_claim_id(report, i), basis=base.claim_id,
-                                           cause=base.cause))
+            report.problems.append(_dependency_problem(units[i], base, _primary_claim_id(report, i)))
             removed[i] = report.problems[-1]
             added = True
         changed = _claim_cascade(report)
@@ -5604,7 +5600,7 @@ def _orphan_lead_ins(report: VerifyReport) -> bool:
     removed = {p.unit.index: p for p in reversed(report.removals())}
     added = False
     for n, u in enumerate(report.units):
-        if u.index in removed or structural_kind(u) != "lead_in":
+        if u.index in removed or not u.leads_list or structural_kind(u) != "lead_in":
             continue
         items = []
         for x in report.units[n + 1:]:
@@ -5618,8 +5614,7 @@ def _orphan_lead_ins(report: VerifyReport) -> bool:
         record.fail_as(base.failure_kind or "absent_from_source")
         record.basis, record.cause = base.claim_id, base.cause
         report.claims[u.index] = [record]
-        report.problems.append(Problem(u, DEPENDS_ON_REMOVED.format(text=base.unit.text[:120]), failure_kind=base.failure_kind,
-                                       check="dependency", claim_id=record.id, basis=base.claim_id, cause=base.cause))
+        report.problems.append(_dependency_problem(u, base, record.id))
         removed[u.index] = report.problems[-1]
         added = True
     return added

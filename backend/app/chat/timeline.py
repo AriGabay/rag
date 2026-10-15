@@ -167,6 +167,12 @@ class Datum:
     def date_key(self) -> tuple | None:
         return date_key(self.as_of)
 
+    def as_comparable(self):
+        """The datum as ``coverage.conflicting_pairs`` and ``clashing`` compare it: its comparable amount and its period."""
+        from app.chat.coverage import Comparable
+
+        return Comparable(None, self.comparable, self.as_of)
+
 
 # The identity of a datum's known date — (ISO date, precision, end) — or None when it has none (``tools.dated``: every
 # ``as_of`` that holds a date holds its precision). Whether two values conflict is decided by their periods, not by this
@@ -395,6 +401,7 @@ class Bucket:
 
     def __post_init__(self) -> None:
         self._class = {d.ref: n for n, c in enumerate(self.classes) for d in c}
+        self._relations: dict[tuple[int, int], str] = {}  # (class number, class number) -> ``class_relation``
 
     def class_of(self, d: Datum) -> int:
         return self._class[d.ref]
@@ -409,22 +416,23 @@ class Bucket:
     def class_relation(self, x: list[Datum], y: list[Datum]) -> str:
         """The decision for two classes: ``different`` as soon as one pair across them is decided different (two data that are
         each one datum with their class-mates, and two of them parallel components, make the classes two data), else
-        ``undecided``. Two classes are never ``same``."""
-        for a in x:
-            for b in y:
-                if self.relation(a, b) == D.DIFFERENT:
-                    return D.DIFFERENT
-        return D.UNDECIDED
+        ``undecided``. Two classes are never ``same``. Kept per pair of classes."""
+        key = (self.class_of(x[0]), self.class_of(y[0]))
+        found = self._relations.get(key)
+        if found is None:
+            found = self._relations[key] = D.DIFFERENT if any(
+                self.relation(a, b) == D.DIFFERENT for a in x for b in y) else D.UNDECIDED
+        return found
 
     def conflicts(self, keep: Callable[[Datum], bool] | None = None) -> list[tuple[Datum, Datum]]:
         """The pairs inside a class whose amounts differ and whose periods overlap (``coverage.conflicting_pairs``): the one
         conflict rule. ``keep``: only the data it accepts are compared (a class is still the whole class)."""
-        from app.chat.coverage import Comparable, conflicting_pairs
+        from app.chat.coverage import conflicting_pairs
 
         out = []
         for cls in self.classes:
             seen = [d for d in cls if keep is None or keep(d)]
-            pairs = conflicting_pairs([Comparable(None, d.comparable, d.as_of) for d in seen])
+            pairs = conflicting_pairs([d.as_comparable() for d in seen])
             out.extend((seen[i], seen[j]) for i, j in pairs)
         return out
 
@@ -434,7 +442,7 @@ class Bucket:
         KTD4): when any pair across two classes is ``different`` the classes are two components — a member of one is the
         same datum as its class-mates, which are structurally different from the other class — so none of their members is
         marked; a pair is marked only when the class relation is ``undecided`` and the pair itself is."""
-        from app.chat.coverage import Comparable, clashing
+        from app.chat.coverage import clashing
 
         out = []
         for n, a in enumerate(self.members):
@@ -443,7 +451,7 @@ class Bucket:
                     continue
                 if self.class_relation(self.classes[self.class_of(a)], self.classes[self.class_of(b)]) != D.UNDECIDED:
                     continue
-                if clashing(Comparable(None, a.comparable, a.as_of), Comparable(None, b.comparable, b.as_of)):
+                if clashing(a.as_comparable(), b.as_comparable()):
                     out.append((a, b))
         return out
 
@@ -453,11 +461,18 @@ class Bucket:
         are resolved own facets (disjoint across units) both are marked. A datum with a stated facet whose only undecided
         partners are unresolved carries no mark."""
         out: dict[str, list[str]] = {}
+        open_: dict[str, bool] = {}  # a datum -> ``unresolved``, read once
+
+        def is_open(d: Datum) -> bool:
+            if d.ref not in open_:
+                open_[d.ref] = unresolved(d)
+            return open_[d.ref]
+
         for a, b in self.undecided():
-            both = not unresolved(a) and not unresolved(b)
-            if both or unresolved(a):
+            both = not is_open(a) and not is_open(b)
+            if both or is_open(a):
                 out.setdefault(a.ref, []).append(b.ref)
-            if both or unresolved(b):
+            if both or is_open(b):
                 out.setdefault(b.ref, []).append(a.ref)
         return out
 
@@ -671,7 +686,7 @@ def compose(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], I
       ``undecided`` (round 13 U4, R6) when a datum of another class of its base key that could not be compared with it has a
       different amount in an overlapping period; the row then carries that datum's sid as ``undecided_with``. A class that has rows
       in a components block shows its other dated rows, even one."""
-    from app.chat.coverage import Comparable, conflicting_pairs
+    from app.chat.coverage import conflicting_pairs
 
     identity = identity or identity_of(ws)
     timeline_blocks: list[dict] = []
@@ -681,7 +696,7 @@ def compose(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], I
         classes = [(cls, _dedupe(cls, cited)) for cls in bucket.classes]
         conflicts: dict[str, list[str]] = {}  # a datum -> the sids it conflicts with (its class's conflict pairs)
         for _, members in classes:
-            for i, j in conflicting_pairs([Comparable(None, d.comparable, d.as_of) for d in members]):
+            for i, j in conflicting_pairs([d.as_comparable() for d in members]):
                 conflicts.setdefault(members[i].ref, []).append(members[j].ref)
                 conflicts.setdefault(members[j].ref, []).append(members[i].ref)
         # one appraisal unit at one date: the classes that meet there are parallel components
@@ -758,14 +773,16 @@ def plain_text(blocks: list[dict], components: Iterable[dict] = ()) -> str:
     """The whole timeline as plain text: the heading, then for each group its label and one line per row — date, kind of
     date, value, source title, marks. The components table follows it (heading ``BREAKDOWN_HEADING``; round 13 U6): per block
     its label and date, then one line per row — facet, value, source title, marks. "" when there is neither."""
+    def value_of(r: dict) -> str:
+        return f"{r['value_text']} {r['unit']}" if r["unit"] else r["value_text"]
+
     parts = []
     if blocks:
         lines = [HEADING]
         for b in blocks:
             lines.append(b["label"])
             for r in b["rows"]:
-                value = f"{r['value_text']} {r['unit']}" if r["unit"] else r["value_text"]
-                cells = [shown(r), DATE_KINDS.get(r["date_kind"]), value, r["source"]["title"],
+                cells = [shown(r), DATE_KINDS.get(r["date_kind"]), value_of(r), r["source"]["title"],
                          ", ".join(_mark_text(r, m) for m in r["marks"] if not (m == "unknown_date" and not r["date"]))]
                 lines.append("- " + " · ".join(c for c in cells if c))
         parts.append("\n".join(lines))
@@ -775,8 +792,7 @@ def plain_text(blocks: list[dict], components: Iterable[dict] = ()) -> str:
         for b in components:
             lines.append(f"{b['label']} ({shown(b['as_of'])})")
             for r in b["rows"]:
-                value = f"{r['value_text']} {r['unit']}" if r["unit"] else r["value_text"]
-                cells = [r["facet"], value, r["source"]["title"], ", ".join(_mark_text(r, m) for m in r["marks"])]
+                cells = [r["facet"], value_of(r), r["source"]["title"], ", ".join(_mark_text(r, m) for m in r["marks"])]
                 lines.append("- " + " · ".join(c for c in cells if c))
         parts.append("\n".join(lines))
     return "\n\n".join(parts)
@@ -806,9 +822,11 @@ def _settled(ws: Workspace, ids: Collection[str], record: dict | None) -> dict |
     if record is None:
         return None
     cited = [i for i in ids if i in ws.values or i in ws.measurements]
-    datum_places = {(d.version_id, d.unit_no) for b in buckets(ws, cited) for d in b.members} if cited else set()
+    built = buckets(ws, cited) if cited else []
+    datum_places = {(d.version_id, d.unit_no) for b in built for d in b.members}
     later = [{"older": a.ref, "newer": b.ref, "title": b.title, "when": shown(b.as_of), "document_id": b.document_id,
-              "version_id": b.version_id, "unit_no": b.unit_no} for a, b in later_undecided(ws, cited)] if cited else []
+              "version_id": b.version_id, "unit_no": b.unit_no} for a, b in later_undecided(ws, cited, built=built)
+             ] if cited else []
     return settle_coverage(ws, record, read_places(ws, ids, datum_places), later)
 
 
@@ -875,31 +893,41 @@ def _measured_before_anchor(ws: Workspace, d: Datum) -> bool:
     return d.dated and not d.forecast and not is_after_anchor(a.get("end") or a["date"], a["precision"], ws.time.anchor)
 
 
-def _later(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None
-           ) -> tuple[list[tuple[Datum, Datum]], list[tuple[Datum, Datum]]]:
+def _newest_after(ws: Workspace, members: list[Datum], newest: Datum) -> Datum | None:
+    """The latest measured datum of ``members`` that starts after ``newest`` ends; None when there is none."""
+    later = [d for d in members if _measured_before_anchor(ws, d) and _start(d) > _end(newest)]
+    return max(later, key=lambda d: (_end(d), -d.index)) if later else None
+
+
+def _later(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None,
+           built: list[Bucket] | None = None) -> tuple[list[tuple[Datum, Datum]], list[tuple[Datum, Datum]]]:
     """``(decided, undecided)`` — the pairs (the latest cited value of a class, the latest later one) of ``later_than`` and of
     ``later_undecided``. A later datum of the cited datum's own class is decided; one of another class of its base key is
-    ignored when that class is decided different from the cited one, and undecided otherwise (KTD4)."""
+    ignored when that class is decided different from the cited one, and undecided otherwise (KTD4). ``built``: the
+    ``buckets`` of the same ``cited`` and ``identity`` when the caller has them."""
     decided: list[tuple[Datum, Datum]] = []
     undecided: list[tuple[Datum, Datum]] = []
-    for bucket in buckets(ws, cited, identity):
+    for bucket in buckets(ws, cited, identity) if built is None else built:
         for cls in bucket.classes:
             mine = [d for d in cls if d.ref in cited and _measured_before_anchor(ws, d)]
             if not mine:
                 continue
             newest = max(mine, key=lambda d: (_end(d), -d.index))
-
-            def newer(members: list[Datum], newest: Datum = newest) -> Datum | None:
-                later = [d for d in members if _measured_before_anchor(ws, d) and _start(d) > _end(newest)]
-                return max(later, key=lambda d: (_end(d), -d.index)) if later else None
-
-            if (found := newer(cls)) is not None:
+            if (found := _newest_after(ws, cls, newest)) is not None:
                 decided.append((newest, found))
             for other in bucket.classes:
                 if other is not cls and bucket.class_relation(cls, other) == D.UNDECIDED \
-                        and (found := newer(other)) is not None:
+                        and (found := _newest_after(ws, other, newest)) is not None:
                     undecided.append((newest, found))
     return decided, undecided
+
+
+def later_pairs(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None
+                ) -> tuple[list[tuple[Datum, Datum]], list[tuple[Datum, Datum]]]:
+    """``(later_than, later_undecided)`` of the cited ids from one pass over the turn's buckets, for a caller that reads both."""
+    if not cited:
+        return [], []
+    return _later(ws, cited, identity)
 
 
 def later_than(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None
@@ -915,11 +943,12 @@ def later_than(ws: Workspace, cited: Collection[str], identity: Callable[[Datum]
     return _later(ws, cited, identity)[0]
 
 
-def later_undecided(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None
-                    ) -> list[tuple[Datum, Datum]]:
+def later_undecided(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None,
+                    built: list[Bucket] | None = None) -> list[tuple[Datum, Datum]]:
     """The pairs (the latest cited value of a class, the latest measured value starting after it) of another class of the same
     base key whose facet could not be compared with the cited one's (round 13 U4, KTD4, R20): the server cannot say that the
-    cited value is the latest datum, so a "latest" claim about it stays qualified, and the datum is named."""
+    cited value is the latest datum, so a "latest" claim about it stays qualified, and the datum is named. ``built``: the
+    ``buckets`` of the same ``cited`` (default identity) when the caller has them."""
     if not cited:
         return []
-    return _later(ws, cited, identity)[1]
+    return _later(ws, cited, identity, built)[1]

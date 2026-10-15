@@ -22,6 +22,7 @@ import pytest
 
 from app.chat import engine
 from app.chat import tools as T
+from app.providers.llm import CallStatus
 from tests.conftest import login
 from tests.factories import make_office
 from tests.integration.test_chat import cloud, new_conversation, send
@@ -160,6 +161,25 @@ def test_the_request_is_made_once_and_an_answer_the_appraisals_own_text_supports
     m = asked(client, office, monkeypatch, agent)
     assert m["status"] == "done", m
     assert nudges(agent, UNREAD) == 1 and len(agent.seen) == 3  # asked once, then accepted
+    assert "עסקאות השוואה בנכסים דומים" in m["answer"]["markdown"]
+    assert {s["source_kind"] for s in m["answer"]["sources"]} == {"appraisal"}
+
+
+@pytest.mark.parametrize("failure", [CallStatus.TIMEOUT, CallStatus.INCOMPLETE, {"final": {"status": "bogus"}}])
+def test_a_failed_mixed_round_leaves_the_first_answer_to_be_verified_and_shown(client, office, monkeypatch, failure):
+    """The extra round is best effort (round 13 U14): when the step after the notice fails (a provider failure or a final
+    answer of an invalid schema) the first answer is verified as it stood, never a failed turn."""
+    def property_only(items) -> dict:
+        a = sid_of(items, office.appraisal, "נבחרה גישת ההשוואה")
+        return final(f"בשומה נבחרה גישת ההשוואה לפי עסקאות השוואה בנכסים דומים בסביבה [{a}].",
+                     documents=[office.appraisal])
+
+    agent = ScriptedAgent([[call("search", query="גישת ההשוואה בשומה הרקפות 5", document_ids=[office.appraisal],
+                                 limit=None, unit=None, pool=None)],
+                           property_only, failure, property_only], intent="mixed")
+    m = asked(client, office, monkeypatch, agent)
+    assert m["status"] == "done", m
+    assert nudges(agent, UNREAD) == 1  # the round was asked, then failed
     assert "עסקאות השוואה בנכסים דומים" in m["answer"]["markdown"]
     assert {s["source_kind"] for s in m["answer"]["sources"]} == {"appraisal"}
 
