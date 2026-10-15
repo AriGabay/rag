@@ -2744,7 +2744,11 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
     call = TimeCall(query) if timed else None  # what this call checked (round 12 U7); off mode records nothing (R14)
     in_focus = False
     if not unit:
-        unit = focus_unit_for(ws, document_ids)  # the conversation's unit
+        # the conversation's unit, unless the call names the professional pool and the intent reads it as a primary pool
+        # (a mixed or document question): the pool the model chose is not the unit's file, and the unit's search would
+        # silently answer it from the appraisal (round 13 U14, KTD18). A call that names a unit or documents is as asked
+        own_pool = pool == PROFESSIONAL_POOL and ws.pools.get(PROFESSIONAL_POOL) == PRIMARY and not document_ids
+        unit = None if own_pool else focus_unit_for(ws, document_ids)
         in_focus = unit is not None
     elif timed and names_focus_unit(ws, unit, document_ids):
         in_focus = True  # the model names the focus unit it sees in the context: still the conversation's unit (U16)

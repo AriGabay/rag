@@ -263,7 +263,18 @@ def check_set_sha(set_file: str | Path, sha_file: str | Path) -> str:
     return actual
 
 
-def professional_support(m: dict, expect: dict, needle: str) -> list[str]:
+def fragments_of(needle: str | list[str]) -> tuple[str, ...]:
+    """A ``source_docs`` entry as its title fragments: one string, or a list of alternatives for a document the office
+    stores under more than one title (round 13 U14: the same glossary is stored twice, once under a title the
+    extraction garbled), any of which names it."""
+    return (needle,) if isinstance(needle, str) else tuple(needle)
+
+
+def title_holds(title: str | None, needle: str | list[str]) -> bool:
+    return any(f in (title or "") for f in fragments_of(needle))
+
+
+def professional_support(m: dict, expect: dict, needle: str | list[str]) -> list[str]:
     """The ``source_docs`` check of one fragment in ``if_needed`` mode, for a fragment no cited source's title holds
     (round 13 U1, KTD18): the problems, none when the answer needs no glossary citation.
 
@@ -285,6 +296,7 @@ def professional_support(m: dict, expect: dict, needle: str) -> list[str]:
     ``professional_not_asked`` (that waives only the missing statement). A professional statement that cites only an
     appraisal is seen only through ``professional_patterns``."""
     a = m.get("answer") or {}
+    shown = " / ".join(fragments_of(needle))
     patterns = [re.compile(norm(p)) for p in expect.get("professional_patterns", [])]
     by_id = {s.get("id"): s for s in a.get("sources") or []}
     problems: list[str] = []
@@ -306,15 +318,15 @@ def professional_support(m: dict, expect: dict, needle: str) -> list[str]:
     for d in handled:
         if any(s.get("type") == "sources" and professional_kind(s) for s in d.get("sources") or []) \
                 or any(p.search(norm(d.get("text") or "")) for p in patterns):
-            problems.append(f"טענה מקצועית הוסרה ({d['action']}) ואין ציטוט מהמסמך '{needle}': "
+            problems.append(f"טענה מקצועית הוסרה ({d['action']}) ואין ציטוט מהמסמך '{shown}': "
                             f"«{norm(d.get('text') or '')[:120]}»")
     if not statements:
         if not problems and not expect.get("professional_not_asked"):
-            problems.append(f"אין בתשובה טענה מקצועית ואין בה ציטוט מהמסמך '{needle}'")
+            problems.append(f"אין בתשובה טענה מקצועית ואין בה ציטוט מהמסמך '{shown}'")
         return problems
     for text, cited in statements:
-        if not any(needle not in (s.get("title") or "") for s in cited):
-            problems.append(f"הטענה המקצועית אינה נתמכת במקור מצוטט אחר מ'{needle}': «{text[:120]}»")
+        if not any(not title_holds(s.get("title"), needle) for s in cited):
+            problems.append(f"הטענה המקצועית אינה נתמכת במקור מצוטט אחר מ'{shown}': «{text[:120]}»")
     if not verification.get("judged") or verification.get("judge_status") != "ok":
         problems.append(f"הטענות המקצועיות לא אומתו (judged={verification.get('judged')}, "
                         f"judge_status={verification.get('judge_status')})")
@@ -343,12 +355,12 @@ def grade_turn(m: dict, expect: dict, docs: dict) -> list[str]:
         problems.append(f"מצב source_docs לא מוכר '{mode}' (המצבים: {', '.join(SOURCE_DOCS_MODES)})")
         mode = "cited"
     for needle in expect.get("source_docs", []):
-        if any(needle in (t or "") for t in titles):
+        if any(title_holds(t, needle) for t in titles):
             continue
         if mode == "if_needed":
             problems += professional_support(m, expect, needle)
         else:
-            problems.append(f"אין מקור מהמסמך '{needle}'")
+            problems.append(f"אין מקור מהמסמך '{' / '.join(fragments_of(needle))}'")
     for needle in expect.get("not_source_docs", []):
         if any(needle in (t or "") for t in titles):
             problems.append(f"מקור ממסמך שלא אמור להופיע '{needle}'")

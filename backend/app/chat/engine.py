@@ -122,6 +122,7 @@ from app.chat.verify import (
 from app.config import get_settings
 from app.db import TenantContext
 from app.measurements.extract import PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
+from app.platform import source_kinds
 from app.providers.llm import (
     TOKEN_FIELDS,
     AgentStep,
@@ -191,7 +192,9 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
   מסמך מקצועי מתאים, ענה מהמסמכים האחרים שהוחזרו כשהם מסבירים את המושג או השיטה (מילון מונחים, הסבר כללי), ציין את סוגם
   ושנוסח התקן אינו במאגר — אל תסרב לענות רק משום שאין תקן. שאלה על נכס
   נענית משומות; תקן בשאלה כזו מסביר שיטה בלבד, ולעולם אינו מקור לשטח, לשכירות או לשווי של נכס. שאלה שמשלבת נכס עם ידע
-  מקצועי: הפרד בין הדרישה של התקן (עם התקן, המהדורה והסעיף), הנתונים של השומה (עם הנכס והמקור) והיישום או המסקנה שלך מהם.
+  מקצועי: הפרד בין הדרישה של התקן (עם התקן, המהדורה והסעיף), הנתונים של השומה (עם הנכס והמקור) והיישום או המסקנה שלך מהם. טענה מקצועית בתשובה
+  כזו (הגדרה, מושג, שיטה, תקן) נתמכת במקור מקצועי או בנוסח השומה עצמה שצוטט; כשאין לה מקור אחר, חפש אותה במאגר המקצועי
+  בחיפוש נפרד עם pool=professional (בלי document_ids ובלי unit, גם כשהשיחה כבר עובדת ביחידה) וצטט אותו.
   כלל של תקן נקרא יחד עם התנאים והחריגים של הסעיף שלו — כלל בלי החריג שלו מטעה — וכשהתוצאה מציינת אותם, ציין אותם;
   read עם section=§# פותח את הסעיף כולו. המלצה, דוגמה או חלופה אינן דרישה מחייבת. הפניה לתקן שאינו במאגר היא פער שמציינים,
   לא תוכן שמשלימים. ציין מספר תקן, מהדורה ותאריך תחילה כשהם ידועים. אין לקבוע שמהדורה היא האחרונה אלא אם find_standards
@@ -299,6 +302,20 @@ REWRITE = """גם התשובה המתוקנת לא אומתה במלואה. אל
 השאר את הטענות לשמירה כלשונן, והשמט את הטענות לתיקון אם אי אפשר לתמוך בהן. אל תוסיף טענות חדשות. אם נקודה חשובה לשאלה לא
 אומתה, השמט אותה — השרת יציין אחרי התשובה מה לא ניתן ולמה. החזר באותו מבנה."""
 
+
+# A mixed question (a general question about a named property, round 13 U14, KTD18) has a professional part that the
+# appraisal's own text may support or may not. The server asks once, before verification, when the answer cites no
+# professional source: the model decides, because only it knows whether an appraisal passage already states the
+# professional point. Appended, so the cached prefix survives. ``{sources}``: the professional sources the turn read.
+MIXED_UNREAD = """המאגר המקצועי לא נחפש בתור הזה, והשאלה משלבת נכס עם ידע מקצועי (הגדרה, מושג, שיטה או תקן). טענה מקצועית
+שאין לה מקור אחר שכבר צוטט — למשל נוסח השומה עצמה — נתמכת רק במקור מקצועי: חפש אותה עכשיו עם search ו-pool=professional
+(בלי document_ids ובלי unit) וצטט אותו, בנפרד מנתוני השומה. אם כל טענה מקצועית בתשובה נתמכת במקור שכבר צוטט — החזר
+את אותה תשובה."""
+MIXED_UNCITED = """החיפוש בתור הזה החזיר מקורות מקצועיים ({sources}) שהתשובה לא ציטטה, והשאלה משלבת נכס עם ידע מקצועי
+(הגדרה, מושג, שיטה או תקן). טענה מקצועית שאין לה מקור אחר שכבר צוטט — למשל נוסח השומה עצמה — כתוב מהם וצטט אותם, בנפרד
+מנתוני השומה, בלי חיפוש נוסף. אם כל טענה מקצועית בתשובה נתמכת במקור שכבר צוטט — החזר את אותה תשובה."""
+MIXED_SOURCES_SHOWN = 6  # professional sources named in ``MIXED_UNCITED``
+MSG_MIXED_PROGRESS = "משלים את החלק המקצועי של השאלה"
 
 # the item that makes a step the last one, by the limit that was reached (appended, so the cached prefix survives)
 LIMIT_NOTICE = """אין עוד קריאה לכלים בשאלה הזו: {why}. ענה עכשיו רק ממה שכבר קראת ומהמזהים שקיבלת. אל תציג את
@@ -633,6 +650,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     intent_wait_spent = False  # a bounded wait for the intent already ran out: the first step's tools wait no more
     compute_ok = False  # the step may call the compute tools only (the tool budget is spent, there is time left)
     compute_steps = 0  # such steps taken so far
+    mixed_asked = False  # a mixed question's answer was already asked for its professional part (once per turn)
     rounds: list[list[dict]] = []
     # the request's requirements, frozen for the turn (the request's components, or the judge's derivation when there
     # are none), and its tool failures
@@ -964,6 +982,17 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             settle_analysis()  # the first step answered: the requirements are frozen before verification
         if answer.status == "clarification" and answer.clarification_question.strip() and not answer.answer_markdown.strip():
             answer.answer_markdown = answer.clarification_question
+        if (attempt == 0 and not mixed_asked and answer.status in ("answered", "partial") and steps + 1 < bound
+                and time.monotonic() < deadline - max(REPAIR_MIN_SECONDS, REPAIR_TIME_FACTOR * answer_seconds)
+                and (notice := _professional_gap(ws, answer.answer_markdown)) is not None
+                and not (notice == MIXED_UNREAD and last)):
+            # a mixed question whose answer cites no professional source: asked once, before verification, to search
+            # the professional pool (or to cite what the turn read there) unless the appraisal already states the point.
+            # A searching notice needs a step that may call tools (round 13 U14, KTD18)
+            mixed_asked = True
+            progress("repair", MSG_MIXED_PROGRESS)
+            items.append({"role": "user", "content": notice})
+            continue
         if checked is not None and (lost := checked[1].lost_supported(answer.answer_markdown)):
             # a repair round rewrote the answer and lost what the last round judged supported (R8, R10): its answer is
             # not adopted — the checked one is composed instead, its failing claims cut or removed. Decided before the
@@ -1194,6 +1223,25 @@ def _surviving_focus(ws: T.Workspace, final: FinalAnswer) -> Focus | None:
     if not kept:
         return None
     return focus if kept == focus.document_ids else focus.model_copy(update={"document_ids": kept})
+
+
+def _professional_gap(ws: T.Workspace, markdown: str) -> str | None:
+    """The notice a mixed question's answer earns when it cites no professional source (round 13 U14, KTD18), or None.
+
+    ``MIXED_UNCITED`` when the turn's tools returned professional sources (a standard or another professional document,
+    a listing excepted) and the answer cites none of them; ``MIXED_UNREAD`` when it returned none. Never for another
+    intent, for an office that holds no professional document (the search says so and the turn records it), or for an
+    answer that cites a professional source. The server cannot tell whether an appraisal passage already states the
+    professional point, so the notice leaves that to the model: it asks, it does not require a citation."""
+    if ws.intent != intent_mod.MIXED or ws.standards_absent:
+        return None
+    held = [sid for sid, s in ws.sources.items() if s.kind != "listing" and s.source_kind != source_kinds.APPRAISAL]
+    cited = set(re.findall(r"\bS\d+\b", markdown))
+    if cited.intersection(held):
+        return None
+    if not held:
+        return MIXED_UNREAD
+    return MIXED_UNCITED.format(sources=", ".join(held[:MIXED_SOURCES_SHOWN]))
 
 
 def _limit_sentences(limits: list[str]) -> list[str]:

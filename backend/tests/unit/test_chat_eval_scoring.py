@@ -367,3 +367,31 @@ def test_main_refuses_a_set_that_differs_from_its_sha_before_touching_the_stack(
     err = capsys.readouterr().err
     assert code == 2 and "0" * 64 in err and _sha_of(q) in err
     assert not (tmp_path / "out").exists()
+
+
+# --- a `source_docs` entry may list alternative title fragments (round 13 U14) ------------------------------------
+
+STORED_TWICE = ["מילון", "מים, |"]  # the same glossary stored under its own title and under one the extraction garbled
+
+
+def test_a_source_docs_entry_may_be_a_list_of_alternative_title_fragments():
+    from eval.chat_eval import grade_turn
+
+    garbled = _src("S3", "מים, |", "professional")
+    m = _mixed_turn(f"{APPRAISAL_LINE}\n\nהמונח מוגדר במילון [S3].", [*SOURCES[:2], garbled])
+    assert grade_turn(m, {"source_docs": [STORED_TWICE]}, {}) == []
+    # the string form still names one fragment only
+    assert grade_turn(m, {"source_docs": ["מילון"]}, {}) == ["אין מקור מהמסמך 'מילון'"]
+    # none of the alternatives is cited: the problem names them all
+    absent = _mixed_turn(APPRAISAL_LINE, SOURCES[:1])
+    assert grade_turn(absent, {"source_docs": [STORED_TWICE]}, {}) == ["אין מקור מהמסמך 'מילון / מים, |'"]
+
+
+def test_if_needed_with_alternatives_judges_support_by_a_source_none_of_them_names():
+    from eval.chat_eval import grade_turn
+
+    m = _mixed_turn(f"{APPRAISAL_LINE}\n\n{STANDARD_LINE}", SOURCES[:2])
+    assert grade_turn(m, {"source_docs": [STORED_TWICE], "source_docs_mode": "if_needed"}, {}) == []
+    only_glossary_copy = _mixed_turn(f"{APPRAISAL_LINE}\n\nהמונח במילון [S3].", [SOURCES[0], _src("S3", "מים, |", "standard")])
+    # a statement cited to one of the alternatives is the glossary itself: it is cited, so nothing more is asked
+    assert grade_turn(only_glossary_copy, {"source_docs": [STORED_TWICE], "source_docs_mode": "if_needed"}, {}) == []
