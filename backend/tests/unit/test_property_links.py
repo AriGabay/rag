@@ -273,6 +273,32 @@ def test_undetermined_units_have_no_identity_or_nothing_to_compare_with_the_prop
     assert g.identified
 
 
+def test_the_rest_of_the_office_is_in_three_classes_excluded_possible_and_unlinkable():
+    """Round 13 U8 (R18, KTD15): a unit proven to be another property is ``excluded`` (counted, never searched); the graph
+    leaves the undetermined ones all ``possible`` (the safe default) until a probe splits them with ``classified``."""
+    focus = node("F", addresses=["הצאלון 7"], cities=[CITY_X], parcels=["7101/15"])
+    elsewhere = node("E", addresses=["הדולב 3"], cities=[CITY_X])     # both state an address and they differ
+    other_city = node("C", addresses=["הצאלון 7"], cities=[CITY_Y])   # a city that differs: an incompatible link
+    foreign = node("D", parcels=["9000/1"])                           # a parcel that excludes it
+    blank_a, blank_b, blank_c = node("A"), node("B"), node("K")      # no identity facts
+    g = graph(focus, elsewhere, other_city, foreign, blank_a, blank_b, blank_c).gather(focus.key)
+    assert {n.key for n in g.excluded} == {elsewhere.key, other_city.key, foreign.key}
+    assert [n.key for n in g.undetermined] == [blank_a.key, blank_b.key, blank_c.key]
+    assert [n.key for n in g.possible] == [n.key for n in g.undetermined] and not g.unlinkable, "unprobed: all possible"
+    split = g.classified([blank_b.key, ("missing", 1), elsewhere.key])
+    assert [n.key for n in split.possible] == [blank_b.key], "only an undetermined unit can be possible"
+    assert [n.key for n in split.unlinkable] == [blank_a.key, blank_c.key] and split.undetermined == g.undetermined
+    assert split.excluded == g.excluded and split.members == g.members, "the rest of the property is untouched"
+    assert g.classified([]).unlinkable == g.undetermined and not g.classified([]).possible
+
+
+def test_a_candidate_is_neither_excluded_nor_undetermined():
+    focus = node("F", addresses=["הצאלון 7"], cities=[CITY_X])
+    cityless = node("N", addresses=["הצאלון 7"])
+    g = graph(focus, cityless).gather(focus.key)
+    assert [c.node.key for c in g.candidates] == [cityless.key] and not g.excluded and not g.undetermined
+
+
 def test_an_unidentified_focus_gathers_only_itself_and_says_so():
     blank, other = node("B"), node("O", parcels=["7101/15"])
     g = graph(blank, other).gather(blank.key)

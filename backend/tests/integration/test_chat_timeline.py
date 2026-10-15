@@ -261,8 +261,8 @@ def qualified(vid: str) -> dict:
 def test_complete_coverage_records_a_note_that_never_claims_the_latest_in_the_repository(client, setup, monkeypatch):
     a = ask(client, setup, monkeypatch, agent(setup, ["y2025", "y2024", "y2022"], cited("V1")))["answer"]
     cov = a["time"]["coverage"]
-    assert cov["v"] == 1 and cov["complete"] is True and cov["blocking"] == []
-    assert [u["status"] for u in cov["units"]] == ["hit", "hit", "hit"] and not any(u["undated"] for u in cov["units"])
+    assert cov["v"] == 2 and cov["complete"] is True and cov["blocking"] == []
+    assert [u["status"] for u in cov["units"]] == ["read", "read", "read"] and not any(u["undated"] for u in cov["units"])
     assert cov["note"] == "נבדקו כל השומות של הנכס הזמינות לך (3)." and "במאגר" not in cov["note"]
     assert a["time"]["text"].endswith(cov["note"]), "the copy text ends with the note, after the timeline"
 
@@ -270,7 +270,7 @@ def test_complete_coverage_records_a_note_that_never_claims_the_latest_in_the_re
 def test_ae4_an_undated_unit_makes_the_coverage_partial_and_the_note_names_it_in_the_payload_and_the_copy(client, partial, monkeypatch):
     a = ask(client, partial, monkeypatch, agent(partial, ["y2025", "y2024", "y2022"], qualified("V1")))["answer"]
     cov = a["time"]["coverage"]
-    assert cov["v"] == 1 and cov["complete"] is False and "undated" in cov["blocking"]
+    assert cov["v"] == 2 and cov["complete"] is False and "undated" in cov["blocking"]
     assert cov["note"].splitlines()[0] == QUALIFIED + "."
     assert UNDATED_TITLE in cov["note"]
     assert any(u["undated"] and u["blocks"] for u in cov["units"])

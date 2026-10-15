@@ -311,7 +311,8 @@ def test_ae3_the_latest_of_fifteen_appraisals_beyond_the_window_is_found_first_a
             ("V1", "2026-03-31", ids["window_latest"]), ("V2", "2025-09-30", ids["window_14"])], f"run {run}"
         cov = a["time"]["coverage"]
         assert [u["document_id"] for u in cov["units"]][0] == ids["window_latest"] and len(cov["units"]) == 15
-        assert Counter(u["status"] for u in cov["units"]) == {"hit": 8, "not_searched_cap": 7}, "eight read, the seven oldest not"
+        assert Counter(u["status"] for u in cov["units"]) == {"located": 6, "read": 2, "not_searched_cap": 7}, (
+            "eight searched (the two the answer cites are read), the seven oldest not")
         assert cov["complete"] and cov["property"]["units"] == 15 and cov["property"]["reasons"] == ["parcel 8801/9"]
         assert "latest" not in cov["note"] and cov["note"] == "נבדקו כל השומות של הנכס הזמינות לך (15)."
 
@@ -351,7 +352,7 @@ def test_ae4_ten_dated_appraisals_with_a_cap_of_eight_are_complete_for_the_lates
     a = t.answer
     cov = a["time"]["coverage"]
     assert cov["complete"] and cov["blocking"] == [] and len(cov["units"]) == 10
-    assert Counter(u["status"] for u in cov["units"]) == {"hit": 8, "not_searched_cap": 2}
+    assert Counter(u["status"] for u in cov["units"]) == {"located": 6, "read": 2, "not_searched_cap": 2}
     assert {u["document_id"] for u in cov["units"] if u["status"] == "not_searched_cap"} == {docs[2015], docs[2016]}
     assert a["status"] == "answered" and a["markdown"].startswith(f"השווי העדכני הוא {amount_of(2024)}"), "no repair"
     assert "recency" not in json.dumps(m_diagnostics(client, t.message), ensure_ascii=False)
@@ -594,7 +595,11 @@ def test_off_mode_reads_the_named_appraisal_only_orders_chronologically_and_carr
     on = ask_off([mid], [(mid, amount_of(2023))], answer_with("V1", amount_of(2023), "הגפן 15", vat=True), on=True)
     assert set(first_search_documents(on)) == {old, mid, new} and T.MSG_PROPERTY_SEARCHED in next(
         c for c in on.tools if c.name == "search").output
-    assert on.answer["time"]["coverage"]["complete"]
+    # round 13 U8 (R19): the newest appraisal's passage was returned but the answer cites the 2023 one only, so the newest is
+    # located and not read: the record is partial and the answer's wording stays qualified
+    cov_on = on.answer["time"]["coverage"]
+    assert not cov_on["complete"] and cov_on["blocking"] == ["newer_located"]
+    assert [(u["document_id"], u["status"]) for u in cov_on["units"] if u["blocks"]] == [(new, "located")]
 
     # the appraisals the model names itself: off keeps the chronological order of the timeline, oldest first
     picks = [(new, amount_of(2024)), (old, amount_of(2022)), (mid, amount_of(2023))]

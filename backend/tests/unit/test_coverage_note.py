@@ -23,19 +23,36 @@ EXPLICIT = TimeMode("explicit", "question", ANCHOR, Requested("point", "2022", "
 LATEST_PHRASE = "הנתון המאוחר ביותר במקורות שנבדקו"
 
 
-def unit(n: int, iso: str | None, status: str = T.HIT, title: str | None = None, precision: str = "day") -> dict:
+def unit(n: int, iso: str | None, status: str = T.LOCATED, title: str | None = None, precision: str = "day") -> dict:
     return {"document_id": f"d{n}", "version_id": f"v{n}", "unit_no": 1, "title": title or f"שומה סינתטית {n}",
             "date": iso, "precision": precision if iso else None, "date_status": "stated" if iso else "none",
             "undated": iso is None, "status": status, "link": "parcel 7101/15", "focus": n == 1, "blocks": False}
 
 
-def record(time: TimeMode, units: list[dict], *, candidates: dict | None = None, undetermined: int = 0,
-           scope: str = T.PROPERTY, identified: bool = True) -> dict:
-    rec = {"v": 1, "mode": time.mode, "requested": time.requested.as_dict() if time.requested else None, "scope": scope,
+def record(time: TimeMode, units: list[dict], *, candidates: dict | None = None, undetermined: int | None = None,
+           scope: str = T.PROPERTY, identified: bool = True, possible: list[dict] | None = None, unlinkable: int = 0,
+           excluded: int = 0, later_undecided: list[dict] | None = None) -> dict:
+    """A record as ``coverage_record`` makes it (v2); ``undetermined`` builds the v1 shape instead (its single count)."""
+    rec = {"v": 1 if undetermined is not None else 2, "mode": time.mode,
+           "requested": time.requested.as_dict() if time.requested else None, "scope": scope,
            "via": "focus", "identified": identified,
            "property": {"label": "הצאלון 7", "reasons": ["parcel 7101/15"], "units": len(units)},
-           "units": units, "candidates": candidates or {"named": [], "count": 0}, "undetermined": undetermined}
+           "units": units, "candidates": candidates or {"named": [], "count": 0}}
+    if undetermined is not None:
+        rec["undetermined"] = undetermined
+    else:
+        rec |= {"possible": {"named": [], "count": 0, "read": 0, "items": possible or []}, "unlinkable": unlinkable,
+                "excluded": excluded}
+    if later_undecided:
+        rec["later_undecided"] = later_undecided
     return T.assess_coverage(time, rec)
+
+
+def possible_unit(n: int, iso: str | None, title: str | None = None, *, elsewhere: bool = False, read: bool = False) -> dict:
+    """A possible candidate: an unidentified unit that mentions the property or was read in part (round 13 U8, R18)."""
+    return {"document_id": f"p{n}", "version_id": f"pv{n}", "unit_no": 1, "title": title or f"מועמדת בלי זיהוי {n}",
+            "date": iso, "precision": "day" if iso else None, "date_status": "stated" if iso else "none",
+            "reason": "mentioned", "elsewhere": elsewhere, "read": read}
 
 
 def test_ae4_one_undated_unit_not_searched_makes_recent_partial_and_the_note_names_it():
@@ -114,10 +131,91 @@ def test_candidates_are_named_up_to_three_from_the_record_and_the_rest_counted()
     assert note.index("מועמדת 3") < note.index("מועמדת 2") < note.index("מועמדת 1"), "newest first"
 
 
-def test_undetermined_units_are_counted_never_named():
-    rec = record(RECENT, [unit(1, "2025-03-31")], undetermined=4)
+def test_a_v1_record_with_an_undetermined_count_renders_as_it_did():
+    """Round 13 U8: an answer stored under coverage v1 (the single ``undetermined`` count, the status ``hit``) still renders."""
+    stored = {"v": 1, "mode": "recent", "complete": False, "blocking": ["undetermined"], "undetermined": 4,
+              "units": [unit(1, "2025-03-31", "hit")], "candidates": {"named": [], "count": 0}}
+    note = TF.coverage_note(stored)
+    assert note.splitlines() == [TF.MSG_NOTE_RECENT, f"{TF.MSG_GROUP_UNDETERMINED}: 4."], "the stored record is read as it is"
+    old = record(RECENT, [unit(1, "2025-03-31")], undetermined=4)  # a v1-shaped record assessed today still blocks on it
+    assert not old["complete"] and old["blocking"] == [TF.B_UNDETERMINED]
+
+
+def test_ae9_possible_candidates_are_named_up_to_three_and_the_unlinkable_ones_are_counted_apart():
+    """Two possible candidates are named (newest first) and block; the unlinkable units are one count line, and a unit proven
+    to be another property is no part of the note."""
+    rec = record(RECENT, [unit(1, "2025-03-31")], unlinkable=18, excluded=1,
+                 possible=[possible_unit(7, "2022-08-28", "מועדאת ישנה"), possible_unit(15, "2020-04-28", "מועדאת ישנה מאוד")])
+    assert not rec["complete"] and rec["blocking"] == [T.B_POSSIBLE] and rec["possible"]["count"] == 2
+    lines = TF.coverage_note(rec).splitlines()
+    (named,) = [ln for ln in lines if "מועדאת ישנה" in ln]
+    assert named.index("מועדאת ישנה (") < named.index("מועדאת ישנה מאוד"), "newest first"
+    assert f"{TF.MSG_GROUP_UNLINKABLE}: 18." in lines
+    assert not any("1" == ln.strip(". ") for ln in lines) and "אחר" not in " ".join(lines)
+
+
+def test_five_possible_candidates_name_three_newest_first_and_count_the_rest():
+    rec = record(RECENT, [unit(1, "2025-03-31")],
+                 possible=[possible_unit(n, f"20{20 + n:02d}-01-01", f"מועמדת {n} סינתטית") for n in range(1, 6)])
+    assert rec["possible"]["count"] == 5 and len(rec["possible"]["named"]) == 3
+    (line,) = [ln for ln in TF.coverage_note(rec).splitlines() if "מועמדת 5 סינתטית" in ln]
+    assert line.index("מועמדת 5") < line.index("מועמדת 4") < line.index("מועמדת 3") and "מועמדת 2" not in line
+    assert line.rstrip(".").endswith("ועוד 2")
+
+
+def test_only_unlinkable_units_outside_the_property_leave_the_record_complete_and_the_note_counts_them():
+    rec = record(RECENT, [unit(1, "2025-03-31")], unlinkable=6, excluded=3)
+    assert rec["complete"] and not rec["blocking"], "an unlinkable unit blocks nothing"
+    assert TF.coverage_note(rec).splitlines() == [TF.MSG_NOTE_COMPLETE.format(n=1), f"{TF.MSG_GROUP_UNLINKABLE}: 6."]
+    assert TF.coverage_note(record(RECENT, [unit(1, "2025-03-31")])) == TF.MSG_NOTE_COMPLETE.format(n=1), "none: no line"
+
+
+def test_a_possible_candidate_whose_mention_was_read_under_another_subject_stops_blocking_and_is_counted_apart():
+    stays = possible_unit(1, "2023-01-01", "נשארת", read=True)               # read, but about the property: still a candidate
+    left = possible_unit(2, "2022-01-01", "עזבה", elsewhere=True, read=True)  # read inside a comparison part
+    unread = possible_unit(3, "2021-01-01", "לא נקראה", elsewhere=True)       # elsewhere, but the turn did not read it
+    rec = record(RECENT, [unit(1, "2025-03-31")], possible=[stays, left, unread])
+    assert rec["possible"]["count"] == 2 and rec["possible"]["read"] == 1 and rec["blocking"] == [T.B_POSSIBLE]
+    assert [i["title"] for i in rec["possible"]["named"]] == ["נשארת", "לא נקראה"]
+    done = record(RECENT, [unit(1, "2025-03-31")], possible=[left])
+    assert done["complete"] and done["possible"]["count"] == 0 and done["possible"]["read"] == 1
+
+
+def test_a_newer_unit_that_was_only_located_blocks_once_a_unit_was_read_and_the_note_names_its_date():
+    newer, older = unit(1, "2025-03-31", T.LOCATED), unit(2, "2023-06-15", T.READ)
+    rec = record(RECENT, [newer, older])
+    assert not rec["complete"] and rec["blocking"] == [T.B_LOCATED] and rec["units"][0]["blocks"]
     note = TF.coverage_note(rec)
-    assert not rec["complete"] and "4" in note
+    assert TF.MSG_LOCATED.format(date="31/03/2025") in note.splitlines()
+    assert note.splitlines()[0] == TF.MSG_NOTE_RECENT and LATEST_PHRASE in note
+    # round 12 stands where nothing was read: a located newest unit is checked
+    assert record(RECENT, [unit(1, "2025-03-31", T.LOCATED), unit(2, "2023-06-15", T.LOCATED)])["complete"]
+    # the datum was read from the newest unit: an older located one does not matter
+    assert record(RECENT, [unit(1, "2025-03-31", T.READ), unit(2, "2023-06-15", T.LOCATED)])["complete"]
+    # explicit mode keeps its own rule: located is searched
+    assert record(EXPLICIT, [unit(1, "2024-05-01", T.LOCATED), unit(2, "2022-03-01", T.READ)])["complete"]
+
+
+def test_three_located_newer_units_are_named_newest_first_and_the_rest_counted():
+    units = [unit(n, f"20{20 + n:02d}-06-01", T.LOCATED) for n in range(2, 7)] + [unit(1, "2019-06-01", T.READ)]
+    rec = record(RECENT, units)
+    lines = [ln for ln in TF.coverage_note(rec).splitlines() if "אך הנתון בה לא נקרא" in ln]
+    assert [ln for ln in lines] == [TF.MSG_LOCATED.format(date=d) for d in ("01/06/2026", "01/06/2025", "01/06/2024")]
+    assert TF.MSG_MORE.format(n=2) + "." in TF.coverage_note(rec).splitlines()
+
+
+def test_a_newer_datum_of_an_undecided_class_makes_the_record_partial_and_the_note_names_it():
+    later = [{"older": "V1", "newer": "V2", "title": "שומת 2026 סינתטית", "when": "03/2026", "document_id": "d9"}]
+    rec = record(RECENT, [unit(1, "2025-03-31", T.READ)], later_undecided=later)
+    assert not rec["complete"] and rec["blocking"] == [T.B_LATER_UNDECIDED]
+    note = TF.coverage_note(rec)
+    assert LATEST_PHRASE in note and "שומת 2026 סינתטית" in note and "03/2026" in note
+
+
+def test_the_summary_for_the_model_names_the_located_unit_so_it_can_read_it():
+    rec = record(RECENT, [unit(1, "2025-03-31", T.LOCATED), unit(2, "2023-06-15", T.READ)])
+    summary = TF.coverage_summary(rec)
+    assert TF.MSG_LOCATED.format(date="31/03/2025") in summary and TF.PHRASE_RULE in summary
 
 
 def test_a_unit_is_named_by_its_title_and_date_and_an_undated_one_by_its_title_alone():
@@ -127,7 +225,7 @@ def test_a_unit_is_named_by_its_title_and_date_and_an_undated_one_by_its_title_a
     assert any("שומה ב" in ln and "/" not in ln for ln in lines)
 
 
-@pytest.mark.parametrize("units", [[unit(1, "2025-03-31"), unit(2, None, T.HIT)]])
+@pytest.mark.parametrize("units", [[unit(1, "2025-03-31"), unit(2, None, T.LOCATED)]])
 def test_the_note_depends_on_the_record_alone(units):
     rec = record(RECENT, units)
     assert TF.coverage_note(rec) == TF.coverage_note(dict(rec)), "same record, same words"
@@ -170,7 +268,7 @@ def test_the_payload_carries_the_record_and_the_note_with_no_timeline_rows_and_t
 
     rec = record(RECENT, [unit(1, "2025-03-31"), unit(2, None, T.NOT_SEARCHED_CAP, "שומה ללא תאריך")])
     out = timeline.payload(_ws(), set(), coverage=rec)
-    assert out["timeline"] == [] and out["coverage"]["v"] == 1 and out["coverage"]["note"] == TF.coverage_note(rec)
+    assert out["timeline"] == [] and out["coverage"]["v"] == 2 and out["coverage"]["note"] == TF.coverage_note(rec)
     assert out["text"] == out["coverage"]["note"]
     assert out["coverage"]["units"] == rec["units"], "the record itself is kept, with the note added"
     assert "note" not in rec, "the caller's record is not changed"
@@ -232,3 +330,15 @@ def test_an_undated_unit_not_searched_stays_in_the_undated_group_of_a_reads_only
     assert rec["blocking"] == [T.B_UNDATED]
     note = TF.coverage_note(rec)
     assert "שומה ללא תאריך סינתטית" in note and TF.MSG_GROUP_READ_ONLY not in note
+
+
+def test_every_document_a_v2_record_names_is_in_the_visibility_check_of_the_answer():
+    """Round 13 U8 (C10): the possible and unlinked candidates and the newer undecided datum the note names carry document
+    ids, so a revoked one hides the answer."""
+    from app.chat import api
+
+    cand = {"named": [], "count": 1, "read": 0, "items": [possible_unit(1, "2023-01-01") | {"document_id": "dc"}]}
+    rec = record(RECENT, [unit(1, "2025-03-31", T.READ)], possible=[possible_unit(2, "2022-01-01") | {"document_id": "dp"}],
+                 later_undecided=[{"older": "V1", "newer": "V2", "title": "t", "when": "2026", "document_id": "dl"}])
+    rec["candidates"] = cand
+    assert {"d1", "dc", "dp", "dl"} <= api._answer_documents({"time": {"coverage": rec}})

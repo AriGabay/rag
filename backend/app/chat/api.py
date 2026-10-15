@@ -335,6 +335,11 @@ def _answer_documents(answer: dict | None) -> set[str]:
     ids |= {(r.get("source") or {}).get("document_id") for b in (answer.get("time") or {}).get("breakdown") or []
             if isinstance(b, dict) for r in b.get("rows") or [] if isinstance(r, dict)}
     ids |= {c.get("document_id") for c in (record.get("candidates") or {}).get("named") or [] if isinstance(c, dict)}
+    # round 13 U8: the possible candidates (every one is kept in the record, the note names three) and the newer datum of an
+    # undecided class the note names
+    for group in (record.get("candidates"), record.get("possible")):
+        ids |= {c.get("document_id") for c in (group or {}).get("items") or [] if isinstance(c, dict)}
+    ids |= {c.get("document_id") for c in record.get("later_undecided") or [] if isinstance(c, dict)}
     ids |= set((answer.get("focus") or {}).get("document_ids") or [])
     ids.add((answer.get("unit") or {}).get("document_id"))  # the unit the conversation is in (round 9 U10)
     ids |= set((answer.get("request") or {}).get("document_ids") or [])

@@ -33,7 +33,14 @@ gathered neighbours in (relation strength, document id, unit number) order, and 
 ``Link.compatible``). So A{24, 40} gathers B{40}, but C{42} never joins through A when B is the seed. Each member keeps the
 link it joined by (``Joined``: the member it came from and the link's reason); a non-member that is a ``candidate`` of a
 member and conflicts with none is a named ``Candidate``; a non-member the graph cannot exclude (no identity facts, or
-nothing in common to compare) is ``undetermined``. ``Gathered`` is what the inventory and the coverage record read.
+nothing in common to compare) is ``undetermined``; a non-member proven another property is ``excluded``. ``Gathered`` is
+what the inventory and the coverage record read.
+
+**Three classes of the rest** (round 13 U8, R18, KTD15). The graph alone cannot tell an unidentified unit that mentions the
+focus property from one that has nothing to do with it, so ``undetermined`` is split by the tools' one bounded lexical probe
+(``Gathered.classified``): ``possible`` — units that mention the property's identifiers, or were read only in part (they
+block completeness and are named) — and ``unlinkable`` (counted only). Until a probe has split them every undetermined unit
+is ``possible`` (the safe default); ``excluded`` is counted in the record and blocks nothing.
 
 **Everything else** (``PropertyGraph.partition``) is grouped without a seed: the units outside the focus set form a group
 only when they are connected by gathered links and every pair of the component is compatible; otherwise each unit stays a
@@ -74,6 +81,10 @@ REASON_ADDRESS_SUB_MISSING = "אותה כתובת, דירה או תת-חלקה �
 REASON_CITY_MISSING = "עיר לא צוינה"
 REASON_DIFFERENT_ADDRESS = "כתובת שונה"
 REASON_NOTHING_TO_COMPARE = "אין נתון להשוואה"
+# why an unlinked unit with no identity is a possible candidate (round 13 U8, KTD15): the tools' probe found the property's
+# identifiers in its text, or the unit was read only in part
+REASON_MENTIONED = "נזכר בה הנכס, בלי פרטי זיהוי"
+REASON_PARTLY_READ = "נקראה רק בחלקה"
 
 LABEL_PARCELS = 3          # parcels a link reason or a label names before it stops
 ABSENT, EQUAL, DIFFER, ONE_SIDED = "absent", "equal", "differ", "one_sided"
@@ -196,13 +207,20 @@ class Candidate:
 class Gathered:
     """The focus property: its ``members`` in key order (the seed among them), the ``joined`` links in the order they were
     made, the named ``candidates`` and the ``undetermined`` units (key order). ``identified`` is False when the seed states
-    no parcel and no address: the property is then the seed alone (R13)."""
+    no parcel and no address: the property is then the seed alone (R13).
+
+    Round 13 U8 (R18, KTD15): ``excluded`` — the units proven to be another property (an incompatible link, or addresses on
+    both sides that differ); ``possible`` and ``unlinkable`` — the ``undetermined`` units in two classes. As the graph builds
+    it every undetermined unit is ``possible``; ``classified`` moves the ones a probe found no mention of to ``unlinkable``."""
     seed: Key
     members: tuple[Node, ...]
     joined: tuple[Joined, ...]
     candidates: tuple[Candidate, ...]
     undetermined: tuple[Node, ...]
     identified: bool
+    possible: tuple[Node, ...] = ()
+    unlinkable: tuple[Node, ...] = ()
+    excluded: tuple[Node, ...] = ()
 
     @property
     def keys(self) -> frozenset[Key]:
@@ -211,6 +229,13 @@ class Gathered:
     def reasons(self) -> dict[Key, str]:
         """Each joined member's link reason."""
         return {j.node.key: j.link.reason for j in self.joined}
+
+    def classified(self, possible: Iterable[Key]) -> Gathered:
+        """The same property with its undetermined units split: those whose keys are in ``possible`` stay ``possible``, the
+        others are ``unlinkable`` (round 13 U8, KTD15). A key that is not undetermined is ignored."""
+        keep = set(possible)
+        return replace(self, possible=tuple(n for n in self.undetermined if n.key in keep),
+                       unlinkable=tuple(n for n in self.undetermined if n.key not in keep))
 
 
 @dataclass(frozen=True)
@@ -329,20 +354,23 @@ class PropertyGraph:
                 members.add(n.key)
                 joined.append(Joined(n, current.key, link))
                 queue.append(n)
-        candidates, undetermined = [], []
+        candidates, undetermined, excluded = [], [], []
         for n in self.nodes:
             if n.key in members:
                 continue
             links = [(m, self.link(m.key, n.key)) for m in order]
             if any(not link.compatible for _, link in links):
-                continue  # proven to be another property
+                excluded.append(n)  # proven to be another property
+                continue
             named = next(((m, link) for m, link in links if link.relation == CANDIDATE), None)
             if named is not None:
                 candidates.append(Candidate(n, named[1], named[0].key))
-            elif not all(link.reason == REASON_DIFFERENT_ADDRESS for _, link in links):
+            elif all(link.reason == REASON_DIFFERENT_ADDRESS for _, link in links):
+                excluded.append(n)  # both sides state an address and the addresses differ
+            else:
                 undetermined.append(n)
         return Gathered(seed, tuple(sorted(order, key=lambda x: x.key)), tuple(joined), tuple(candidates),
-                        tuple(undetermined), root.identity.identified)
+                        tuple(undetermined), root.identity.identified, tuple(undetermined), (), tuple(excluded))
 
     def partition(self, focus: Gathered | None = None) -> Partition:
         """Every node in one group: the focus property's members as one group, and the others grouped without a seed (the

@@ -125,9 +125,12 @@ comparison and drops that default. It is also the asked property when no title o
 address or parcel the question itself names — lists the property's appraisal units and their valuation dates first
 (``property_inventory``, from the turn's property graph), selects up to ``CAP_UNITS`` of them in the mode's order, searches
 each on its own (``_property_hits``) and ranks the hits per (version, unit) (``ranked_by_time``). What each call checked is a
-coverage record (``coverage_record``: per unit hit, no match or not searched for the cap, with an ``undated`` flag;
-unlinked candidates; undetermined units) kept in ``Workspace.time_calls`` with the S# the call returned; the answer's
-coverage is that of the calls that produced the data it cites (``coverage_for``, ``merge_coverage``). The server states
+coverage record (``coverage_record``: per unit located, no match or not searched for the cap, with an ``undated`` flag;
+unlinked candidates; the rest of the office in three classes — possible candidates, unlinkable units, units proven to be
+another property, from one probe, ``classify_undetermined``) kept in ``Workspace.time_calls`` with the S# the call returned;
+the answer's coverage is that of the calls that produced the data it cites (``coverage_for``, ``merge_coverage``), settled
+with what the turn read (``settle_coverage``: a unit is ``read`` when a datum of the cited datum's base key was registered
+from it, a source of it is cited, or its section or table was opened; a newer unit only ``located`` blocks, round 13 U8). The server states
 nothing in words here: the wording and the payload are built from the record. Without a time mode none of this runs.
 Round 12 U12b: each source of a gathered unit other than the focus carries the server's link in its header (``link``:
 "שומה של אותו נכס: חלקה 8401/40 משותפת"), the search result lists the gathered units with their reasons, and the judge reads
@@ -173,7 +176,9 @@ from app.chat.evidence import TABLE_SIZE_PREFIX
 from app.chat.intent import MIXED, PROFESSIONAL
 from app.chat.property import (
     REASON_ADDRESS_CITY,
+    REASON_MENTIONED,
     REASON_PARCEL_PREFIX,
+    REASON_PARTLY_READ,
     Gathered,
     Partition,
     PropertyGraph,
@@ -182,16 +187,19 @@ from app.chat.property import (
 )
 from app.chat.timeframe import (
     B_CANDIDATES,
+    B_LATER_UNDECIDED,
+    B_LOCATED,
     B_NEWER,
     B_NO_MATCH,
     B_NOT_IDENTIFIED,
     B_NOT_SEARCHED,
+    B_POSSIBLE,
     B_RANGE,
     B_SEVERAL,
     B_UNDATED,
     B_UNDETERMINED,
     B_WINDOW,
-    HIT,
+    LOCATED,
     NO_MATCH,
     NOT_SEARCHED,
     NOT_SEARCHED_CAP,
@@ -1918,7 +1926,9 @@ def property_partition(ws: Workspace, conn: Connection) -> Partition:
 CAP_UNITS = 8          # appraisal units one call reads (KTD6)
 CAP_UNDATED = 2        # of them, up to this many are kept for units with no valuation date, in document order
 NAMED_CANDIDATES = 3   # unlinked candidates the record names, newest first; the rest are counted
-COVERAGE_V = 1         # the record's version (``answer.time.coverage.v``)
+COVERAGE_V = 2         # the record's version (``answer.time.coverage.v``); 2: the three classes and ``located``/``read`` (U8)
+PROBE_LIMIT = 60       # passages the coverage probe reads (round 13 U8, KTD15): one search over the undetermined units
+PROBE_IDENTIFIERS = 4  # addresses, parcels and aliases the probe query names, each
 # the record's unit statuses, scopes and blocking reasons are the strings ``timeframe`` words the note from (one definition,
 # imported here: ``timeframe`` is a leaf and cannot import this module)
 
@@ -1927,8 +1937,9 @@ COVERAGE_V = 1         # the record's version (``answer.time.coverage.v``)
 class InventoryUnit:
     """One appraisal unit of the property's inventory: what it is, its stated valuation date (``date``: ISO date and
     precision; None when the unit states none or several that disagree — ``date_status`` says which), the reason of the
-    link it joined by, and its search status (``HIT``, ``NO_MATCH`` or ``NOT_SEARCHED_CAP``). ``undated`` is a flag, not a
-    status: an undated unit is searched or not like any other."""
+    link it joined by, and its search status (``LOCATED``, ``NO_MATCH`` or ``NOT_SEARCHED_CAP``; ``READ`` once the answer is
+    known to rest on the unit, ``settle_coverage``). ``undated`` is a flag, not a status: an undated unit is searched or not
+    like any other."""
     document_id: Any
     version_id: Any
     unit_no: int
@@ -2063,23 +2074,192 @@ def _no_candidates() -> dict:
     return {"named": [], "count": 0}
 
 
-def _candidates_of(ws: Workspace, conn: Connection, gathered: Gathered) -> dict:
+def _candidates_of(ws: Workspace, conn: Connection, gathered: Gathered, elsewhere: dict | None = None) -> dict:
     """The unlinked candidates of the property for the record (KTD7): up to ``NAMED_CANDIDATES`` named newest first with
-    their dates and the reason they are not linked, the rest counted."""
+    their dates and the reason they are not linked, the rest counted. Round 13 U8 (KTD15): every candidate is kept as an
+    ``item`` with ``elsewhere`` (the probe found its mentions under another subject, ``elsewhere``) and ``read`` (False until
+    ``settle_coverage``), so one the turn read under another subject leaves the class (``_settle_class``)."""
     if not gathered.candidates:
         return _no_candidates()
     prime_dates(ws, conn, [c.node.version_id for c in gathered.candidates])
-    rows = []
+    titles = _titles(ws, conn, [c.node.document_id for c in gathered.candidates])
+    items = []
     for c in gathered.candidates:
         date_, status = unit_dating(ws, conn, c.node.version_id, c.node.unit_no)
-        rows.append((_inventory_key(ws.time, None if date_ is None else (*date_, None)), c.node.key, c, date_, status))
-    rows.sort(key=lambda r: r[:2])
-    titles = _titles(ws, conn, [r[2].node.document_id for r in rows[:NAMED_CANDIDATES]])
-    named = [{"document_id": str(c.node.document_id), "version_id": str(c.node.version_id), "unit_no": c.node.unit_no,
-              "title": c.node.title or titles.get(str(c.node.document_id)), "date": d[0] if d else None,
-              "precision": d[1] if d else None, "date_status": status, "reason": c.link.reason}
-             for _, _, c, d, status in rows[:NAMED_CANDIDATES]]
-    return {"named": named, "count": len(rows)}
+        items.append({"document_id": str(c.node.document_id), "version_id": str(c.node.version_id), "unit_no": c.node.unit_no,
+                      "title": c.node.title or titles.get(str(c.node.document_id)), "date": date_[0] if date_ else None,
+                      "precision": date_[1] if date_ else None, "date_status": status, "reason": c.link.reason,
+                      "elsewhere": (elsewhere or {}).get((str(c.node.version_id), c.node.unit_no), False), "read": False})
+    group = {"named": [], "count": 0, "read": 0, "items": items}
+    _settle_class(group)
+    return group
+
+
+def _focus_identity(ws: Workspace, gathered: Gathered) -> contexts.Identity:
+    """The focus property's identifiers as the probe and the matcher read them (round 13 U8, KTD15): the street core and number
+    of each address of its members, their block and parcel pairs, and the document-grounded aliases of their units (two words
+    or more: a one-word alias would match any text). ``contexts.Identity.identifier_in`` and ``name_spans`` match them in free
+    text with the prefix letters and the label optional, as for a question."""
+    addresses, parcels, streets, aliases = set(), set(), [], []
+    for n in gathered.members:
+        for core, number in sorted(n.identity.addresses):
+            if (core, number) in addresses:
+                continue
+            addresses.add((core, number))
+            m = re.fullmatch(r"(\d+)([א-ת]?)", number)
+            streets.append((tuple(core.split()), m.group(1) if m else number, m.group(2) if m else ""))
+        parcels |= {(b, p) for b, p, _ in n.identity.parcels}
+        for u in ws.date_cache.get(("units", UUID(str(n.version_id)))) or ():
+            if u.unit_no == n.unit_no:
+                aliases += [a for a in (contexts.name_key(x) for x in u.aliases) if len(a.split()) >= 2]
+    return contexts.Identity(frozenset(addresses), frozenset(parcels), (), tuple(streets), tuple(dict.fromkeys(aliases)))
+
+
+def _probe_query(identity: contexts.Identity) -> str:
+    """The words of the probe's one search: each address (street core and number), each block and parcel, each alias, at most
+    ``PROBE_IDENTIFIERS`` of each kind in a stable order."""
+    streets = [f"{' '.join(w)} {num}{letter}" for w, num, letter in sorted(identity.streets)[:PROBE_IDENTIFIERS]]
+    parcels = [f"גוש {b} חלקה {p}" for b, p in sorted(identity.parcels)[:PROBE_IDENTIFIERS]]
+    return " ".join([*streets, *parcels, *identity.names[:PROBE_IDENTIFIERS]])
+
+
+# the words that put a mention under another subject: a comparison, a transaction, an appendix (round 13 U8, KTD15). The
+# section name of the passage and the lines that carry the mention are read, never the whole chunk
+_OTHER_SUBJECT = re.compile(r"השוואה|השוואתי|עסק(?:ה|ת|אות)|מכירות|נכסים דומים|נכס דומה|נספח")
+
+
+def _mentions_elsewhere(identity: contexts.Identity, hit: dict) -> bool:
+    """Whether a passage's mention of the property stands under another subject: its section's name, or the lines of the
+    passage that carry the mention, say comparison, transaction or appendix."""
+    lines = [ln for ln in (hit.get("text") or "").splitlines() if identity.named_in(ln)]
+    return bool(_OTHER_SUBJECT.search(" ".join([hit.get("section") or "", *lines])))
+
+
+def _partly_read(ws: Workspace, conn: Connection, nodes: Iterable) -> set[tuple[str, int]]:
+    """The (version, unit number) of the units read only in part: a block of the unit that is unread or read uncertainly, or
+    a version some page or region of which was not read (``reader.Version.partial``). Two queries for all the units."""
+    nodes = list(nodes)
+    versions = sorted({str(n.version_id) for n in nodes})
+    if not versions:
+        return set()
+    partial = {str(r.id) for r in conn.execute(text(
+        "SELECT v.id FROM document_versions v WHERE v.id = ANY(CAST(:v AS uuid[])) AND (COALESCE(v.pages_incomplete, 0) > 0"
+        " OR COALESCE((v.ingestion->>'partial')::boolean, false))"), {"v": versions})}
+    flagged: dict[str, list[int]] = {}
+    for r in conn.execute(text("SELECT version_id, block_index FROM document_blocks WHERE version_id = ANY(CAST(:v AS uuid[]))"
+                               " AND status IN (:a, :b)"), {"v": versions, "a": reader.UNREAD, "b": reader.UNCERTAIN}):
+        flagged.setdefault(str(r.version_id), []).append(r.block_index)
+    found = set()
+    for n in nodes:
+        v = str(n.version_id)
+        rng = next(((u.block_first, u.block_last) for u in chat_dates.units_of(conn, UUID(str(n.version_id)), ws.date_cache)
+                    if u.unit_no == n.unit_no), None)
+        if v in partial or (rng is not None and any(rng[0] <= b <= rng[1] for b in flagged.get(v, ()))):
+            found.add((v, n.unit_no))
+    return found
+
+
+def _mentioned(ws: Workspace, conn: Connection, nodes: Iterable, identity: contexts.Identity) -> dict[tuple[str, int], bool]:
+    """The units among ``nodes`` (the undetermined units and the unlinked candidates) whose text mentions the focus
+    property's identifiers, from ONE scoped search over their versions (round 13 U8, KTD15; the search is memoized, so a
+    second call of the turn costs none): (version, unit number) -> whether every mention stands under another subject
+    (``_mentions_elsewhere``). A passage counts only when the identifiers are in its text (``identifier_in``); the search
+    ranks, it does not decide."""
+    by_unit = {(str(n.version_id), n.unit_no): n for n in nodes}
+    query = _probe_query(identity)
+    if not by_unit or not query:
+        return {}
+    kinds = POOL_KINDS[APPRAISAL_POOL]
+    scope = SearchScope(version_ids=tuple(sorted({UUID(v) for v, _ in by_unit})), source_kinds=kinds)
+    hits = [h for h in memoized_search(ws, conn, query, PROBE_LIMIT, scope, window=True) if identity.named_in(h.get("text") or "")]
+    placed = chunk_blocks(ws, conn, [h["chunk_id"] for h in hits])
+    out: dict[tuple[str, int], bool] = {}
+    for h in hits:
+        version = str(h["version_id"])
+        cx = contexts_of(ws, conn, version)
+        number = cx.at_block(placed.get(h["chunk_id"], (None, None))[0])
+        if (version, number) not in by_unit:
+            alone = [k for k in by_unit if k[0] == version]
+            if cx.multi or len(alone) != 1:
+                continue
+            number = alone[0][1]
+        out[(version, number)] = out.get((version, number), True) and _mentions_elsewhere(identity, h)
+    return out
+
+
+@dataclass(frozen=True)
+class Classes:
+    """What the probe made of the rest of the office (``classify_undetermined``): the property with its undetermined units
+    classified, the possible candidates as record items, and, for every probed unit, whether all its mentions stand under
+    another subject."""
+    gathered: Gathered
+    possible: list[dict]
+    elsewhere: dict
+
+
+def classify_undetermined(ws: Workspace, conn: Connection, gathered: Gathered) -> Classes:
+    """The property with its undetermined units in the classes of R18 (round 13 U8, KTD15), once per turn and data version:
+    one bounded lexical probe for the focus property's identifiers over the undetermined units' and the unlinked candidates'
+    versions, then
+
+    - **possible candidates** — an undetermined unit with a hit, or read only in part: they block completeness and are
+      named in the note;
+    - **unlinkable** — the other undetermined units: counted only, they block nothing;
+    - **excluded** — units proven to be another property (counted by the record, never searched).
+
+    The possible candidates are record items (document, version, unit, title, date, the reason, ``elsewhere``: every mention
+    stands under another subject, and ``read``: False until ``settle_coverage``). No search runs when there is nothing to
+    probe or the property states no identifier."""
+    if not gathered.undetermined and not gathered.candidates:
+        return Classes(gathered, [], {})
+    key = ("classes", gathered.seed, current_data_version(conn))
+    found = ws.property_memo.get(key)
+    if found is None:
+        for old in [k for k in ws.property_memo if k[0] == "classes" and k[1] == gathered.seed]:
+            del ws.property_memo[old]
+        found = ws.property_memo[key] = _classify_uncached(ws, conn, gathered)
+    return found
+
+
+def _classify_uncached(ws: Workspace, conn: Connection, gathered: Gathered) -> Classes:
+    mentioned = _mentioned(ws, conn, [*gathered.undetermined, *(c.node for c in gathered.candidates)],
+                           _focus_identity(ws, gathered))
+    partly = _partly_read(ws, conn, gathered.undetermined)
+    nodes = [n for n in gathered.undetermined if (str(n.version_id), n.unit_no) in mentioned
+             or (str(n.version_id), n.unit_no) in partly]
+    classified = gathered.classified(n.key for n in nodes)
+    prime_dates(ws, conn, [n.version_id for n in nodes])
+    titles = _titles(ws, conn, [n.document_id for n in nodes])
+    items = []
+    for n in nodes:
+        where = (str(n.version_id), n.unit_no)
+        date_, status = unit_dating(ws, conn, n.version_id, n.unit_no)
+        items.append({"document_id": str(n.document_id), "version_id": str(n.version_id), "unit_no": n.unit_no,
+                      "title": n.title or titles.get(str(n.document_id)), "date": date_[0] if date_ else None,
+                      "precision": date_[1] if date_ else None, "date_status": status,
+                      "reason": REASON_MENTIONED if where in mentioned else REASON_PARTLY_READ,
+                      "elsewhere": mentioned.get(where, False), "read": False})
+    return Classes(classified, items, mentioned)
+
+
+def _no_possible() -> dict:
+    return {"named": [], "count": 0, "read": 0, "items": []}
+
+
+def _settle_class(group: dict) -> None:
+    """Name and count the candidates of a class that still block (round 13 U8, KTD15): all of them, except a candidate whose
+    mention the turn read and whose mention stands under another subject (``elsewhere``), which left the class and is counted
+    apart as ``read``. ``named``: at most ``NAMED_CANDIDATES``, newest first (undated last). A group with no ``items`` (a
+    record built by hand, or from before round 13) keeps its ``named`` and ``count``."""
+    if "items" not in group:
+        return
+    items = group["items"]
+    blocking = [i for i in items if not (i.get("read") and i.get("elsewhere"))]
+    ordered = sorted(sorted(blocking, key=lambda i: (i["document_id"], i["unit_no"])), key=lambda i: i.get("date") or "",
+                     reverse=True)  # stable: equal dates keep the key order, the undated ("") come last
+    group["count"] = len(blocking)
+    group["read"] = len(items) - len(blocking)
+    group["named"] = [dict(i) for i in ordered[:NAMED_CANDIDATES]]
 
 
 def coverage_record(ws: Workspace, conn: Connection, *, scope: str, via: str | None, units: list[InventoryUnit],
@@ -2088,10 +2268,16 @@ def coverage_record(ws: Workspace, conn: Connection, *, scope: str, via: str | N
     requested time; what it covers (``scope``: a gathered ``property``, one ``unit``, a relevance ``window``) and how the
     property was identified (``via``: the conversation's ``focus``, the call's named ``documents``, the ``question``'s own
     address or parcel); the property's label and link reasons; every inventory unit with its date, ``undated`` flag, search
-    status, title, link reason and whether it keeps the answer from being complete; the unlinked candidates; the count of
-    undetermined units. ``complete`` and ``blocking`` come from ``assess_coverage``."""
+    status, title, link reason and whether it keeps the answer from being complete; the unlinked candidates; and — round 13
+    U8, R18 — the three classes of the rest of the office: ``possible`` (unidentified units that mention the property or were
+    read in part: named, counted, blocking), ``unlinkable`` (their count) and ``excluded`` (the count of the units proven to
+    be another property). ``complete`` and ``blocking`` come from ``assess_coverage``."""
     titles = _titles(ws, conn, {u.document_id for u in units})
     time = ws.time
+    possible, elsewhere = _no_possible(), {}
+    if gathered is not None:
+        classes = classify_undetermined(ws, conn, gathered)
+        gathered, possible["items"], elsewhere = classes.gathered, classes.possible, classes.elsewhere
     record = {
         "v": COVERAGE_V, "mode": time.mode, "requested": time.requested.as_dict() if time.requested else None,
         "scope": scope, "via": via, "identified": gathered is not None and gathered.identified and scope == PROPERTY,
@@ -2101,8 +2287,10 @@ def coverage_record(ws: Workspace, conn: Connection, *, scope: str, via: str | N
                    "title": u.title or titles.get(str(u.document_id)), "date": u.date[0] if u.date else None,
                    "precision": u.date[1] if u.date else None, "date_status": u.date_status, "undated": u.undated,
                    "status": u.status, "link": u.link, "focus": u.focus, "blocks": False} for u in units],
-        "candidates": _candidates_of(ws, conn, gathered) if gathered is not None else _no_candidates(),
-        "undetermined": len(gathered.undetermined) if gathered is not None else 0,
+        "candidates": _candidates_of(ws, conn, gathered, elsewhere) if gathered is not None else _no_candidates(),
+        "possible": possible,
+        "unlinkable": len(gathered.unlinkable) if gathered is not None else 0,
+        "excluded": len(gathered.excluded) if gathered is not None else 0,
     }
     return assess_coverage(time, record)
 
@@ -2110,13 +2298,17 @@ def coverage_record(ws: Workspace, conn: Connection, *, scope: str, via: str | N
 def assess_coverage(time: TimeMode, record: dict) -> dict:
     """Mark the units that keep a record from being complete, list why, and set ``complete`` (KTD7). Completeness is relative
     to the appraisals visible to the user. A record is never complete for a turn with no identified property (its coverage is
-    the search window, or the one unit), when it merges calls of different scopes, or while an unlinked candidate or an
-    undetermined unit remains.
+    the search window, or the one unit), when it merges calls of different scopes, or while an unlinked candidate or a
+    possible candidate (an unidentified unit that mentions the property or was read in part, R18) remains. Unlinkable units
+    and units proven to be another property block nothing.
 
     - **Recent:** complete only when the unit holding the newest datum found is the newest dated inventory unit (or ties
       it): a dated unit that comes before the best hit in the mode's order (``time_key``) and was not searched, or was
       searched without a match, is named (it may hold a newer datum phrased differently). Older units left unsearched do
-      not matter (AE4).
+      not matter (AE4). Round 13 U8 (R19, KTD16): once any unit is ``READ`` (a datum of the cited datum's base key came
+      from it, or its section or table was read), the best is the newest ``READ`` unit, and a newer unit that is only
+      ``LOCATED`` (a passage returned, nothing read) blocks with ``B_LOCATED``; with no unit read, a located unit counts
+      as checked, as in round 12.
     - **Explicit:** complete when every unit whose date can fall in or after the requested time (the first two classes of
       ``_inventory_key``) was searched.
     - **Undated units** (no stated date, or dates that disagree) always keep a record from being complete: their data
@@ -2129,7 +2321,10 @@ def assess_coverage(time: TimeMode, record: dict) -> dict:
     def key_of(u: dict) -> tuple:
         return _inventory_key(time, None if u["date"] is None else (u["date"], u["precision"], None))
 
-    best = min((key_of(u) for u in units if u["status"] in (HIT, READ) and not u["undated"]), default=None)
+    best = min((key_of(u) for u in units if u["status"] in (LOCATED, READ) and not u["undated"]), default=None)
+    best_read = min((key_of(u) for u in units if u["status"] == READ and not u["undated"]), default=None)
+    if best_read is not None:
+        best = best_read  # the datum was read: a newer unit that was only located is not checked (R19)
     blocking: list[str] = []
     for u in units:
         reason = None
@@ -2140,15 +2335,24 @@ def assess_coverage(time: TimeMode, record: dict) -> dict:
         elif explicit:
             if u["status"] == NOT_SEARCHED_CAP and key_of(u)[0] in (0, 1):
                 reason = B_RANGE
-        elif u["status"] not in (HIT, READ) and (best is None or key_of(u) < best):
+        elif u["status"] not in (LOCATED, READ) and (best is None or key_of(u) < best):
             reason = B_NEWER if u["status"] == NOT_SEARCHED_CAP else B_NO_MATCH
+        elif u["status"] == LOCATED and best_read is not None and key_of(u) < best_read:
+            reason = B_LOCATED
         u["blocks"] = reason is not None
         if reason is not None:
             blocking.append(reason)
+    _settle_class(record["candidates"])
     if record["candidates"]["count"]:
         blocking.append(B_CANDIDATES)
-    if record["undetermined"]:
+    if record.get("possible") is not None:
+        _settle_class(record["possible"])
+        if record["possible"]["count"]:
+            blocking.append(B_POSSIBLE)
+    if record.get("undetermined"):  # a v1 record: every undetermined unit blocked
         blocking.append(B_UNDETERMINED)
+    if record.get("later_undecided"):
+        blocking.append(B_LATER_UNDECIDED)
     if record["scope"] == UNIT or (record["scope"] == PROPERTY and not record["identified"]):
         blocking.append(B_NOT_IDENTIFIED)
     if record["scope"] == WINDOW:
@@ -2179,7 +2383,7 @@ def merge_coverage(time: TimeMode, records: list[dict]) -> dict | None:
         return merged
     for i, u in enumerate(merged["units"]):
         seen = [r["units"][i]["status"] for r in records]
-        u["status"] = NOT_SEARCHED_CAP if NOT_SEARCHED_CAP in seen else HIT if HIT in seen else NO_MATCH
+        u["status"] = NOT_SEARCHED_CAP if NOT_SEARCHED_CAP in seen else LOCATED if LOCATED in seen else NO_MATCH
     return assess_coverage(time, merged)
 
 
@@ -2194,13 +2398,64 @@ def coverage_for(ws: Workspace, sids: Iterable[str] | None = None) -> dict | Non
     return merge_coverage(ws.time, [c.record for c in calls if c.record is not None])
 
 
+def opened_places(ws: Workspace) -> set[tuple[str, int | None]]:
+    """(version id, unit number) of every place the turn read a section, a table or a page window of (round 13 U8, KTD16):
+    the openings its tools recorded (``Workspace.touch`` with an opening). ``None`` for a place in no unit of a file of
+    several: it names the version's only unit, if it has one."""
+    out: set[tuple[str, int | None]] = set()
+    for a in ws.activity.values():
+        for o in a.get("openings") or []:
+            src = ws.sources.get(o.get("sid"))
+            if src is not None and src.version_id is not None:
+                out |= {(str(src.version_id), n) for n in (src.contexts or [None])}
+    return out
+
+
+def read_places(ws: Workspace, ids: Iterable[str] = (), datum_places: Iterable[tuple[str, int | None]] = ()
+                ) -> set[tuple[str, int | None]]:
+    """Where the turn read the datum the answer is about (round 13 U8, KTD16): the places of the cited ids (a cited passage,
+    value or measurement: ``_cited_places``), the places the turn registered a V# or M# of the cited datum's base key from
+    (``datum_places``: the timeline's buckets know them; (version id, unit number)), and the sections and tables it opened."""
+    out = {(v, n) for v, nums in _cited_places(ws, ids) for n in (nums or [None])}
+    return out | {(str(v), n) for v, n in datum_places} | opened_places(ws)
+
+
+def settle_coverage(ws: Workspace, record: dict | None, places: Iterable[tuple[str, int | None]],
+                    later_undecided: Iterable[dict] = ()) -> dict | None:
+    """The coverage record with what the turn read (round 13 U8, R19, KTD16, KTD15), on a copy: a unit the turn read from
+    (``places``) is ``READ`` whatever it was before, so a newer unit left only ``LOCATED`` blocks (``B_LOCATED``); a possible
+    candidate the turn read is marked read, and one whose mention stands under another subject leaves the candidate class
+    (counted apart); ``later_undecided`` — the newer data of a class that could not be compared with the cited one (U4) —
+    joins the record, which is then never complete. The record is assessed again. None stays None."""
+    if record is None:
+        return None
+    out = json.loads(json.dumps(record))
+    by_version: dict[str, list[dict]] = {}
+    for u in out["units"]:
+        by_version.setdefault(u["version_id"], []).append(u)
+    for version, number in places:
+        held = by_version.get(version, [])
+        for u in held:
+            if u["unit_no"] == number or (number is None and len(held) == 1):
+                u["status"] = READ
+    read = {(v, n) for v, n in places}
+    for group in (out["candidates"], out.get("possible") or {}):
+        for item in group.get("items") or []:
+            if (item["version_id"], item["unit_no"]) in read or (item["version_id"], None) in read:
+                item["read"] = True
+    if later_undecided:
+        out["later_undecided"] = list(later_undecided)
+    return assess_coverage(ws.time, out)
+
+
 def _register_call(ws: Workspace, call: TimeCall | None, sources: Iterable[Source] = ()) -> None:
-    """Keep a finished call and its results on the workspace, and refresh the turn's coverage (``Workspace.time_coverage``)."""
+    """Keep a finished call and its results on the workspace, and refresh the turn's coverage (``Workspace.time_coverage``,
+    what the model is told): with the sections and tables the turn has opened so far, which count as read."""
     if call is None or call.record is None:
         return
     call.sids = [s.sid for s in sources]
     ws.time_calls.append(call)
-    ws.time_coverage = coverage_for(ws)
+    ws.time_coverage = settle_coverage(ws, coverage_for(ws), opened_places(ws))
 
 
 def _cited_places(ws: Workspace, ids: Iterable[str]) -> list[tuple[str, list[int] | None]]:
@@ -2296,12 +2551,12 @@ def unit_coverage(ws: Workspace, conn: Connection, handle: str, found: bool, in_
     if gathered is not None and gathered.identified:
         units = property_inventory(ws, conn, gathered)
         for u in units:
-            u.status = HIT if found else NO_MATCH
+            u.status = LOCATED if found else NO_MATCH
         return coverage_record(ws, conn, scope=PROPERTY, via="focus", units=units, gathered=gathered)
     prime_dates(ws, conn, [v.version_id])
     date_, status = unit_dating(ws, conn, v.version_id, number)
     title = cx.segment(number).title if cx.multi else None
-    unit = InventoryUnit(v.document_id, v.version_id, number, title, date_, status, None, True, HIT if found else NO_MATCH)
+    unit = InventoryUnit(v.document_id, v.version_id, number, title, date_, status, None, True, LOCATED if found else NO_MATCH)
     return coverage_record(ws, conn, scope=UNIT, via="focus" if in_focus else "unit", units=[unit], gathered=None)
 
 
@@ -2318,7 +2573,7 @@ def window_coverage(ws: Workspace, conn: Connection, hits: list[dict]) -> dict:
             continue
         date_, status = unit_dating(ws, conn, h["version_id"], unit_no)
         units[(str(h["document_id"]), unit_no)] = InventoryUnit(h["document_id"], h["version_id"], unit_no, h["title"],
-                                                                date_, status, None, False, HIT)
+                                                                date_, status, None, False, LOCATED)
     return coverage_record(ws, conn, scope=WINDOW, via=None, units=list(units.values()), gathered=None)
 
 
@@ -2341,8 +2596,8 @@ def _property_hits(ws: Workspace, conn: Connection, gathered: Gathered, query: s
     version = current_data_version(conn) if selected else None
     for u in selected:
         found = memoized_search(ws, conn, query, limit, _unit_scope(ws, conn, u), version=version)
-        u.status = HIT if any(h.get("lexical_support") for h in found) else NO_MATCH
-        if u.status == HIT:
+        u.status = LOCATED if any(h.get("lexical_support") for h in found) else NO_MATCH
+        if u.status == LOCATED:
             hits += found
     if call is not None:
         call.record = coverage_record(ws, conn, scope=PROPERTY, via=via, units=inventory, gathered=gathered)

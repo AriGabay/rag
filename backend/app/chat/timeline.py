@@ -79,6 +79,8 @@ from app.chat.tools import (
     measurement_uncertain,
     property_partition,
     read_coverage,
+    read_places,
+    settle_coverage,
     time_key,
     value_uncertain,
 )
@@ -771,26 +773,43 @@ def sids_behind(ws: Workspace, ids: Iterable[str]) -> set[str]:
     return sids | {s.sid for s in ws.sources.values() if s.version_id is not None and str(s.version_id) in versions}
 
 
+def _settled(ws: Workspace, ids: Collection[str], record: dict | None) -> dict | None:
+    """The record with what the turn read and the newer datum it could not place (round 13 U8, R19, R20, KTD4, KTD16): a
+    unit is read when a V# or M# of the cited datum's base key — registered from it, cited or not — came from it, or its
+    section or table was read (``tools.read_places``); a newer measured datum of a class decided neither same nor different
+    (``later_undecided``) is named in the record, so its note keeps "במקורות שנבדקו" and says which datum it could not place."""
+    if record is None:
+        return None
+    cited = [i for i in ids if i in ws.values or i in ws.measurements]
+    datum_places = {(d.version_id, d.unit_no) for b in buckets(ws, cited) for d in b.members} if cited else set()
+    later = [{"older": a.ref, "newer": b.ref, "title": b.title, "when": shown(b.as_of), "document_id": b.document_id,
+              "version_id": b.version_id, "unit_no": b.unit_no} for a, b in later_undecided(ws, cited)] if cited else []
+    return settle_coverage(ws, record, read_places(ws, ids, datum_places), later)
+
+
 def coverage_of(ws: Workspace, ids: Iterable[str]) -> dict | None:
     """The coverage record of the data the ids cite (KTD7): that of the time-ranked calls whose results they come from, else
     of the turn's calls together; None when the turn made no time-ranked call (off mode, R14). A timed turn that made none
-    but read the sources it cites has the reads-only record (``read_coverage``, round 12 U12b)."""
+    but read the sources it cites has the reads-only record (``read_coverage``, round 12 U12b). Round 13 U8: settled with
+    what the turn read (``_settled``)."""
+    ids = list(ids)
     record = coverage_for(ws, sids_behind(ws, ids))
-    return record if record is not None or ws.time_calls else read_coverage(ws, ids)
+    return _settled(ws, ids, record if record is not None or ws.time_calls else read_coverage(ws, ids))
 
 
 def partial_coverage(ws: Workspace, ids: Iterable[str]) -> dict | None:
     """The record of a time-ranked call that produced the data ``ids`` cite, when that record is not complete (a partial
     coverage or a property not identified); None for ids no time-ranked call produced, and for a complete record. The
     claim check reads it: a "latest" claim about data of a call that did not check every appraisal needs the qualified
-    phrase (``verify._recency_claim``)."""
+    phrase (``verify._recency_claim``). Settled like ``coverage_of``, so a newer unit that was only located counts."""
+    ids = list(ids)
     if not ws.time_calls:  # no time-ranked search: the reads-only record, when the cited sources identify the property
-        record = read_coverage(ws, ids)
+        record = _settled(ws, ids, read_coverage(ws, ids))
         return None if record is None or record.get("complete") else record
     behind = sids_behind(ws, ids)
     if not any(behind & set(c.sids) for c in ws.time_calls):
         return None
-    record = coverage_for(ws, behind)
+    record = _settled(ws, ids, coverage_for(ws, behind))
     return None if record is None or record.get("complete") else record
 
 

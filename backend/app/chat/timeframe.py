@@ -286,16 +286,22 @@ def block(time: TimeMode) -> str | None:
 # never decides it. A message without a record reads as "not recorded": no note, never "complete". Statuses and blocking
 # reasons are the record's own strings, defined here once (this module is a leaf: ``tools`` imports them).
 
-HIT, NO_MATCH, NOT_SEARCHED_CAP = "hit", "no_match", "not_searched_cap"
+# ``LOCATED``: a passage of the unit was returned by the search (round 13 U8, KTD16: the status ``hit`` of a round-12 record,
+# which a stored answer may still carry, is the same thing). It is not ``READ``: a unit is read when the turn registered a
+# datum of the cited datum's base key from it, or read its section or table.
+LOCATED, NO_MATCH, NOT_SEARCHED_CAP = "located", "no_match", "not_searched_cap"
 # a record built at answer time for a turn that ran no time-ranked search (``read_coverage``, round 12 U12b): a unit whose
 # source the answer cites was ``READ``; every other unit of the property is ``NOT_SEARCHED`` (no search ran at all)
 READ, NOT_SEARCHED = "read", "not_searched"
 PROPERTY, UNIT, WINDOW = "property", "unit", "window"  # what a record covers: a gathered property, one unit, a relevance window
 # why a record is not complete (``tools.assess_coverage``); a unit that causes one carries ``blocks``
 B_NEWER, B_NO_MATCH, B_RANGE = "newer_not_searched", "newer_no_match", "range_not_searched"
-B_UNDATED, B_CANDIDATES, B_UNDETERMINED = "undated", "candidates", "undetermined"
+B_UNDATED, B_CANDIDATES, B_UNDETERMINED = "undated", "candidates", "undetermined"  # ``undetermined``: a v1 record only
 B_NOT_IDENTIFIED, B_WINDOW, B_SEVERAL = "not_identified", "window", "several_scopes"
 B_NOT_SEARCHED = "not_searched"
+# round 13 U8 (R18-R20, KTD15, KTD16): a newer unit only located; a possible candidate (an unidentified unit that mentions the
+# property or was read in part); a newer datum of an undecided class (U4, KTD4)
+B_LOCATED, B_POSSIBLE, B_LATER_UNDECIDED = "newer_located", "possible", "later_undecided"
 
 MSG_NOTE_RECENT = f"{LATEST_CHECKED}."
 MSG_NOTE_EXPLICIT = f"הנתונים לתקופה שביקשת נמצאו רק {QUALIFIED}."
@@ -306,7 +312,11 @@ MSG_GROUP_NO_MATCH = "נבדקו ללא התאמה לחיפוש"
 MSG_GROUP_READ_ONLY = "נבדקו רק המקורות שנקראו; לא נבדקו"  # a turn with no time-ranked search (round 12 U12b)
 MSG_GROUP_UNDATED = "ללא מועד קובע ברור"
 MSG_GROUP_CANDIDATES = "שומות שלא קושרו לנכס (אין הוכחה שהן שלו)"
-MSG_GROUP_UNDETERMINED = "שומות שלא ניתן לקבוע אם הן של הנכס"
+MSG_GROUP_UNDETERMINED = "שומות שלא ניתן לקבוע אם הן של הנכס"  # a v1 record's count; a v2 record has the two lines below
+MSG_GROUP_POSSIBLE = "שומות בלי פרטי זיהוי שייתכן שהן של הנכס (הנכס נזכר בהן, או שנקראו רק בחלקן)"
+MSG_GROUP_UNLINKABLE = "שומות במשרד בלי פרטי זיהוי ובלי אזכור של הנכס, שלא נכללו"
+MSG_LOCATED = "נמצא קטע בשומה מ-{date} אך הנתון בה לא נקרא."
+MSG_GROUP_LATER_UNDECIDED = "נמצא נתון מאוחר יותר שלא ניתן להשוות לנתון שצוין: {title} ({when})"
 MSG_GROUP_WINDOW = "נבדקו רק השומות שעלו בחיפוש, בלי רשימה של כל שומות הנכס."
 MSG_GROUP_SEVERAL = "הנתונים הם מכמה חיפושים או נכסים, ולכן הכיסוי אינו אחיד."
 MSG_UNTITLED = "שומה ללא כותרת"
@@ -339,32 +349,66 @@ def _group(label: str, items: list[dict], total: int | None = None, *, dated: bo
     return f"{label}: {names}" + (f" {MSG_MORE.format(n=rest)}" if rest else "") + "."
 
 
+def _located(items: list[dict]) -> list[str]:
+    """One line per newer unit that was only located (round 13 U8, R19), newest first, at most ``NAMED_PER_GROUP``, then
+    "ועוד N": the search returned a passage of it but no datum of the cited kind was registered from it or read in it."""
+    ordered = sorted(items, key=_date_of, reverse=True)
+    lines = [MSG_LOCATED.format(date=dates.shown_period(i["date"], i.get("precision") or "day", None))
+             for i in ordered[:NAMED_PER_GROUP] if i.get("date")]
+    if len(ordered) > NAMED_PER_GROUP:
+        lines.append(MSG_MORE.format(n=len(ordered) - NAMED_PER_GROUP) + ".")
+    return lines
+
+
+def _later_undecided(record: dict) -> str | None:
+    """The newer datum of a class that could not be compared with the cited one (round 13 U4, KTD4; U8): named by its title
+    and date, so the answer keeps the qualified wording and says which datum it could not place."""
+    found = record.get("later_undecided") or []
+    if not found:
+        return None
+    return "; ".join(MSG_GROUP_LATER_UNDECIDED.format(title=(i.get("title") or "").strip() or MSG_UNTITLED,
+                                                      when=i.get("when") or "") for i in found[:NAMED_PER_GROUP]) + "."
+
+
+def _unlinkable(record: dict) -> str | None:
+    n = int(record.get("unlinkable") or 0)
+    return f"{MSG_GROUP_UNLINKABLE}: {n}." if n else None
+
+
 def coverage_note(record: dict | None) -> str | None:
     """The visible coverage note of a record (KTD8's state table), or None for a message with no record (an old message,
     or a turn with no time mode: nothing is claimed). Complete: the count of the appraisals checked, relative to those the
-    user can see. Not identified: the property was not identified, only the focus appraisal was searched. Partial: the
+    user can see, and — round 13 U8 (R18) — the count of unlinkable units, which are no part of the property's record and
+    block nothing. Not identified: the property was not identified, only the focus appraisal was searched. Partial: the
     mode's sentence, then one line per reason group — the units that keep the datum from being called the latest (not
     searched for the cap or searched without a match, only those that block), the units nothing searched when the answer
-    rests on reads alone ("נבדקו רק המקורות שנקראו; לא נבדקו", round 12 U12b), the undated ones, the unlinked candidates and
-    the count of undetermined units. At most three units per group, newest first, then "ועוד N"."""
+    rests on reads alone ("נבדקו רק המקורות שנקראו; לא נבדקו", round 12 U12b), a newer unit only located (R19), the undated
+    ones, the unlinked candidates, the possible candidates among the unidentified units, a newer datum that could not be
+    compared (KTD4) and the count of unlinkable units. At most three units per group, newest first, then "ועוד N". A v1
+    record (its single ``undetermined`` count) renders as it did."""
     if not record or record.get("mode") not in ("recent", "explicit"):
         return None
     units = record.get("units") or []
     blocking = record.get("blocking") or []
     if record.get("complete"):
-        return MSG_NOTE_COMPLETE.format(n=len(units))
+        return "\n".join(ln for ln in (MSG_NOTE_COMPLETE.format(n=len(units)), _unlinkable(record)) if ln)
     if B_NOT_IDENTIFIED in blocking:
         return MSG_NOTE_NOT_IDENTIFIED
     lines = [MSG_NOTE_EXPLICIT if record["mode"] == "explicit" else MSG_NOTE_RECENT]
     dated = [u for u in units if not u.get("undated")]
     candidates = record.get("candidates") or {}
+    possible = record.get("possible") or {}
     undetermined = int(record.get("undetermined") or 0)
     lines += [ln for ln in (
         _group(MSG_GROUP_CAP, [u for u in dated if u["status"] == NOT_SEARCHED_CAP and u.get("blocks")]),
         _group(MSG_GROUP_NO_MATCH, [u for u in dated if u["status"] == NO_MATCH and u.get("blocks")]),
         _group(MSG_GROUP_READ_ONLY, [u for u in dated if u["status"] == NOT_SEARCHED and u.get("blocks")]),
+        *_located([u for u in dated if u["status"] == LOCATED and u.get("blocks")]),
         _group(MSG_GROUP_UNDATED, [u for u in units if u.get("undated")], dated=False),
         _group(MSG_GROUP_CANDIDATES, list(candidates.get("named") or []), int(candidates.get("count") or 0)),
+        _group(MSG_GROUP_POSSIBLE, list(possible.get("named") or []), int(possible.get("count") or 0)),
+        _later_undecided(record),
+        _unlinkable(record),
         f"{MSG_GROUP_UNDETERMINED}: {undetermined}." if undetermined else None,
         MSG_GROUP_WINDOW if B_WINDOW in blocking else None,
         MSG_GROUP_SEVERAL if B_SEVERAL in blocking else None) if ln]

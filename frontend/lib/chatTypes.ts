@@ -721,19 +721,61 @@ export interface ChatCoverageUnit {
   precision: "day" | "month" | "year" | null;
   date_status: string;
   undated: boolean;
-  /** `hit`: searched with a match; `no_match`: searched without one; `not_searched_cap`: not searched (the cap);
-   * `read` and `not_searched` appear only on a read-only record (`read_only`): read by the answer without a search, or
-   * not checked by a read-only turn. */
-  status: "hit" | "no_match" | "not_searched_cap" | "read" | "not_searched";
+  /** `located`: the search returned a passage of the unit (round 13: a record of v1 says `hit` for the same thing);
+   * `no_match`: searched without one; `not_searched_cap`: not searched (the cap); `read`: the datum was read from the
+   * unit (a value or measurement of the cited datum's kind was registered from it, or its section or table was opened)
+   * or, on a read-only record (`read_only`), the answer cites its source; `not_searched`: not checked by a read-only
+   * turn. */
+  status: "located" | "hit" | "no_match" | "not_searched_cap" | "read" | "not_searched";
   link: string | null;
   focus: boolean;
   /** Whether this unit keeps the coverage from being complete. */
   blocks: boolean;
 }
 
+/** An unlinked or possible candidate of the property (round 12 U7, round 13 U8): the fields of the candidates the record
+ * names. `elsewhere` and `read` are on the items only (`items` of a v2 record). */
+export interface ChatCoverageCandidate {
+  document_id: string;
+  version_id: string;
+  unit_no: number;
+  title: string | null;
+  date: string | null;
+  precision: "day" | "month" | "year" | null;
+  date_status: string;
+  reason: string;
+  /** Every mention of the property in the unit stands under another subject (a comparison, a transaction, an appendix). */
+  elsewhere?: boolean;
+  /** The answer's turn read the unit; read and `elsewhere` together take it out of the candidate class. */
+  read?: boolean;
+}
+
+/** A class of candidates in a v2 coverage record: at most three `named` (newest first), `count` the ones that still block,
+ * `read` the ones that left the class (read under another subject), `items` every one. A v1 record has `named` and `count`. */
+export interface ChatCoverageCandidates {
+  named: ChatCoverageCandidate[];
+  count: number;
+  read?: number;
+  items?: ChatCoverageCandidate[];
+}
+
+/** The newer datum of a class that could not be compared with the cited one (round 13 U4, U8): the answer keeps the
+ * qualified wording and the note names it. */
+export interface ChatLaterUndecided {
+  older: string;
+  newer: string;
+  title: string | null;
+  when: string;
+  document_id: string;
+  version_id: string;
+  unit_no: number | null;
+}
+
 /** What a time answer checked (round 12 U7, U8; R12): the appraisals searched, searched without a match, not searched,
  * undated, and unlinked candidates, with the server-written `note` the screen shows. Absent on an answer from before
- * round 12 and on a turn with no time mode: "not recorded", never "complete". */
+ * round 12 and on a turn with no time mode: "not recorded", never "complete". Round 13 U8 (`v: 2`) splits the rest of the
+ * office into `possible` candidates (block completeness), `unlinkable` units (counted) and `excluded` ones (proven another
+ * property, counted); a v1 record has `undetermined` instead. Every field added in v2 is optional here. */
 export interface ChatTimeCoverage {
   v: number;
   mode: "recent" | "explicit";
@@ -743,8 +785,17 @@ export interface ChatTimeCoverage {
   identified: boolean;
   property: { label: string; reasons: string[]; units: number } | null;
   units: ChatCoverageUnit[];
-  candidates: { named: Record<string, unknown>[]; count: number };
-  undetermined: number;
+  candidates: ChatCoverageCandidates;
+  /** v2: unidentified units that mention the property, or were read in part. */
+  possible?: ChatCoverageCandidates;
+  /** v2: unidentified units with no mention of the property; counted, they block nothing. */
+  unlinkable?: number;
+  /** v2: units proven to be another property. */
+  excluded?: number;
+  /** v1 only: every unit whose identity could not exclude the property. */
+  undetermined?: number;
+  /** v2: newer measured data of a class that could not be compared with the cited one. */
+  later_undecided?: ChatLaterUndecided[];
   complete: boolean;
   blocking: string[];
   /** True on a record built for a timed turn that answered from read sources with no time-ranked search (round 12):
