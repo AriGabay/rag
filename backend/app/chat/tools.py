@@ -170,6 +170,7 @@ from sqlalchemy import Connection, text
 from app.answering.verify import numbers_in
 from app.chat import anchors, calc, contexts, datum, meaning, reader
 from app.chat import dates as chat_dates
+from app.chat import units as unit_store
 from app.chat import unread as unread_text
 from app.chat.contexts import MSG_NO_TITLE
 from app.chat.evidence import TABLE_SIZE_PREFIX
@@ -1933,6 +1934,31 @@ PROBE_IDENTIFIERS = 4  # addresses, parcels and aliases the probe query names, e
 # imported here: ``timeframe`` is a leaf and cannot import this module)
 
 
+def stamp_valuation(ws: Workspace, conn: Connection, src: Source) -> Source:
+    """The date line of a passage of an appraisal the turn opened by any route (round 13 U9, KTD10, R13): a read of a section,
+    pages, paragraphs or a table, an inspection, a cell taken from a cached read — not only a search hit. The unit's stated
+    valuation date, as ``valuation_line`` words it, from the block the passage begins at; a source that has one (a search
+    hit, a source returned again), a professional source and a passage with no place in the document keep what they have.
+    The verifier reads it as the server's own fact about the unit (``verify._valuation_dates``)."""
+    if src.date_line is None and _dated_appraisal(src):
+        src.date_line = valuation_line(valuation_of(ws, conn, src.version_id, src.block_start))
+    return src
+
+
+def _stamp_new_sources(ws: Workspace, before: int) -> None:
+    """``stamp_valuation`` for the sources a tool call added that no route stamped (one read of the dates, in one
+    transaction); a date that cannot be read leaves the source without a line, never fails the tool."""
+    fresh = [s for s in islice(ws.sources.values(), before, None) if s.date_line is None and _dated_appraisal(s)]
+    if not fresh:
+        return
+    try:
+        with tenant_tx(ws.ctx) as conn:
+            for s in fresh:
+                stamp_valuation(ws, conn, s)
+    except Exception:  # noqa: BLE001 - the line is evidence, not a result
+        logger.warning("valuation date line not stamped on %d sources", len(fresh))
+
+
 @dataclass
 class InventoryUnit:
     """One appraisal unit of the property's inventory: what it is, its stated valuation date (``date``: ISO date and
@@ -2136,25 +2162,30 @@ def _mentions_elsewhere(identity: contexts.Identity, hit: dict) -> bool:
 
 
 def _partly_read(ws: Workspace, conn: Connection, nodes: Iterable) -> set[tuple[str, int]]:
-    """The (version, unit number) of the units read only in part: a block of the unit that is unread or read uncertainly, or
-    a version some page or region of which was not read (``reader.Version.partial``). Two queries for all the units."""
+    """The (version, unit number) of the units whose identification region was not read (round 13 U8, KTD15): a block with
+    status ``unread`` in the unit's opening — its first ``units.RUN_MAX`` blocks (the title run the identity reader reads)
+    or any block on its first page. Such a unit may state the property where nothing could read it, so it is a possible
+    candidate even with no mention. An uncertain block was read (it is searchable, so the probe covered it) and a block
+    unread elsewhere in a large unit is the ordinary case: neither counts, nor does a version that is partial elsewhere.
+    One query for all the units."""
     nodes = list(nodes)
     versions = sorted({str(n.version_id) for n in nodes})
     if not versions:
         return set()
-    partial = {str(r.id) for r in conn.execute(text(
-        "SELECT v.id FROM document_versions v WHERE v.id = ANY(CAST(:v AS uuid[])) AND (COALESCE(v.pages_incomplete, 0) > 0"
-        " OR COALESCE((v.ingestion->>'partial')::boolean, false))"), {"v": versions})}
-    flagged: dict[str, list[int]] = {}
-    for r in conn.execute(text("SELECT version_id, block_index FROM document_blocks WHERE version_id = ANY(CAST(:v AS uuid[]))"
-                               " AND status IN (:a, :b)"), {"v": versions, "a": reader.UNREAD, "b": reader.UNCERTAIN}):
-        flagged.setdefault(str(r.version_id), []).append(r.block_index)
+    unread: dict[str, list[tuple[int, int | None]]] = {}
+    for r in conn.execute(text("SELECT version_id, block_index, page FROM document_blocks WHERE version_id ="
+                               " ANY(CAST(:v AS uuid[])) AND status = :a"), {"v": versions, "a": reader.UNREAD}):
+        unread.setdefault(str(r.version_id), []).append((r.block_index, r.page))
     found = set()
     for n in nodes:
         v = str(n.version_id)
-        rng = next(((u.block_first, u.block_last) for u in chat_dates.units_of(conn, UUID(str(n.version_id)), ws.date_cache)
-                    if u.unit_no == n.unit_no), None)
-        if v in partial or (rng is not None and any(rng[0] <= b <= rng[1] for b in flagged.get(v, ()))):
+        unit = next((u for u in chat_dates.units_of(conn, UUID(str(n.version_id)), ws.date_cache)
+                     if u.unit_no == n.unit_no), None)
+        if unit is None:
+            continue
+        if any(unit.block_first <= b <= unit.block_last and (b < unit.block_first + unit_store.RUN_MAX
+                                                             or (page is not None and page == unit.page_first))
+               for b, page in unread.get(v, ())):
             found.add((v, n.unit_no))
     return found
 
@@ -2202,7 +2233,7 @@ def classify_undetermined(ws: Workspace, conn: Connection, gathered: Gathered) -
     one bounded lexical probe for the focus property's identifiers over the undetermined units' and the unlinked candidates'
     versions, then
 
-    - **possible candidates** — an undetermined unit with a hit, or read only in part: they block completeness and are
+    - **possible candidates** — an undetermined unit with a hit, or whose identification region (its opening) was not read: they block completeness and are
       named in the note;
     - **unlinkable** — the other undetermined units: counted only, they block nothing;
     - **excluded** — units proven to be another property (counted by the record, never searched).
@@ -3709,6 +3740,7 @@ def tool_read(ws: Workspace, target: dict) -> str:
                 s = _read_table(ws, conn, v, data["target"][2], data["pos"])
             else:
                 s = _read_window(ws, conn, v, data["target"], data["pos"], data.get("within"))
+        stamp_valuation(ws, conn, s)
     return _render_source(s) + (f"\n\n{note}" if note else "")
 
 
@@ -6640,6 +6672,7 @@ def run_tool(ws: Workspace, name: str, arguments: str) -> str:
     started = ws.clock.now()
     before = len(ws.sources)
     output = ws.spend(_run_tool(ws, name, arguments))
+    _stamp_new_sources(ws, before)
     if name in HANDLERS:
         pages = ({p for s in islice(ws.sources.values(), before, None) for p in s.page_list or ()}
                  if name in PAGE_TOOLS else None)

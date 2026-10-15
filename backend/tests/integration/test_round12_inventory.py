@@ -600,7 +600,7 @@ def test_an_unidentified_unit_that_mentions_the_property_in_its_body_is_possible
     assert (after["count"], after["read"]) == (1, 1) and [c["document_id"] for c in after["named"]] == [own]
 
 
-def test_a_partly_read_unidentified_unit_with_no_mention_is_a_possible_candidate(office):
+def test_a_unit_whose_opening_was_not_read_is_a_possible_candidate_even_with_no_mention(office):
     a = appraisal(office, "pr-a", "30/06/2022")
     partly = appraisal(office, "pr-partly", "30/06/2024", identification=[], place=None)
     whole = appraisal(office, "pr-whole", "30/06/2025", identification=[], place=None)
@@ -614,6 +614,43 @@ def test_a_partly_read_unidentified_unit_with_no_mention_is_a_possible_candidate
     assert record["possible"]["named"][0]["reason"] == P.REASON_PARTLY_READ
     assert record["unlinkable"] == 1 and whole not in {c["document_id"] for c in record["possible"]["items"]}
     assert not record["complete"] and record["blocking"] == [TF.B_POSSIBLE]
+
+
+def long_unit(office, key: str, valuation: str) -> str:
+    """An appraisal with no identification and a long body: eleven blocks on its first page (past the title run), then a
+    second page (``deep``)."""
+    doc, _ = unit_file(office, office.default_group_id, f"מסמך {key}", [{"title": None, "blocks": [
+        "שומה בדויה — נתונים סינתטיים", f"המועד הקובע: {valuation}", *[f"סעיף מספר {n} בדוי." for n in range(9)]],
+        "deep": [f"עמוד שני, פסקה {n} בדויה." for n in range(4)]}], sha=hashlib.sha256(f"long-{key}".encode()).hexdigest())
+    return doc
+
+
+def test_uncertain_blocks_or_an_unread_block_deep_in_a_large_unit_do_not_make_it_a_candidate(office):
+    """Almost every large real unit has a block that was read uncertainly or not at all somewhere in its body: only an
+    unread block of the opening (the title run, or the first page) puts the identification in doubt."""
+    a = appraisal(office, "ur-a", "30/06/2022")
+    uncertain = long_unit(office, "uncertain", "30/06/2023")
+    deep = long_unit(office, "deep", "30/06/2024")
+    opening = long_unit(office, "opening", "30/06/2025")
+    with tenant_tx(office.system) as conn:
+        v_unc, _ = version_of(office, uncertain)
+        v_deep, _ = version_of(office, deep)
+        v_open, _ = version_of(office, opening)
+        conn.execute(text("UPDATE document_blocks SET status = 'read_uncertain' WHERE version_id = :v"), {"v": v_unc})
+        conn.execute(text("UPDATE document_blocks SET status = 'unread' WHERE version_id = :v AND page = 2"), {"v": v_deep})
+        conn.execute(text("UPDATE document_blocks SET status = 'unread' WHERE version_id = :v AND block_index = 9"),
+                     {"v": v_open})  # past the title run, but on the unit's first page
+    ws = focused(office, RECENT, a)
+    run(ws, "search", query=QUERY, limit=6)
+    record = ws.time_coverage
+    assert [c["document_id"] for c in record["possible"]["named"]] == [opening], "only the unread opening"
+    assert record["unlinkable"] == 2 and record["possible"]["count"] == 1
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_blocks SET status = 'read' WHERE version_id = :v"), {"v": v_open})
+    ws = focused(office, RECENT, a)
+    run(ws, "search", query=QUERY, limit=6)
+    assert ws.time_coverage["possible"]["count"] == 0 and ws.time_coverage["complete"]
+    assert ws.time_coverage["unlinkable"] == 3
 
 
 def test_focus_closure_with_only_unlinkable_units_outside_it_is_complete_and_the_note_counts_them(office):

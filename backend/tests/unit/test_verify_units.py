@@ -1555,3 +1555,25 @@ def test_a_sentence_that_refers_to_nothing_before_it_is_not(text):
 
 def test_the_judge_policy_names_the_preceding_text_and_the_removed_predecessors():
     assert "<preceding" in verify.JUDGE_POLICY and "removed_before" in verify.JUDGE_POLICY
+
+
+@pytest.mark.parametrize("line_date, claimed", [
+    ("15/07/2024", "15.7.2024"), ("15/07/2024", "15.07.2024"), ("15.07.2024", "15/7/2024"), ("5/7/2024", "05.07.2024"),
+    ("05/07/2024", "5.7.2024"),
+])
+def test_a_claim_date_matches_the_units_valuation_date_in_any_digit_form(line_date, claimed):
+    """One-digit and two-digit days and months are the same date, on either side (round 13 U9, KTD10)."""
+    ws = _valued(f"למועד הקובע {line_date}")
+    assert _numbers(f"הערכת השווי בשומה נעשתה למועד הקובע {claimed} [S1].", ws) == []
+    assert _numbers("הערכת השווי בשומה נעשתה למועד הקובע 16.7.2024 [S1].", ws)
+
+
+def test_a_professional_source_or_one_with_no_place_is_never_stamped_with_a_valuation_date():
+    from app.chat.tools import stamp_valuation
+
+    ws = _ws("תקן סינתטי: על השמאי לציין את המועד הקובע.")
+    src = ws.sources["S1"]
+    src.source_kind, src.block_start = "standard", 3
+    assert stamp_valuation(ws, None, src).date_line is None  # no connection is needed to decide it is not an appraisal
+    src.source_kind, src.block_start = "appraisal", None
+    assert stamp_valuation(ws, None, src).date_line is None

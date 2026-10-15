@@ -82,9 +82,9 @@ REASON_CITY_MISSING = "עיר לא צוינה"
 REASON_DIFFERENT_ADDRESS = "כתובת שונה"
 REASON_NOTHING_TO_COMPARE = "אין נתון להשוואה"
 # why an unlinked unit with no identity is a possible candidate (round 13 U8, KTD15): the tools' probe found the property's
-# identifiers in its text, or the unit was read only in part
+# identifiers in its text, or the region where the unit identifies its property (its opening) was not read
 REASON_MENTIONED = "נזכר בה הנכס, בלי פרטי זיהוי"
-REASON_PARTLY_READ = "נקראה רק בחלקה"
+REASON_PARTLY_READ = "פרטי הזיהוי שלה לא נקראו"
 
 LABEL_PARCELS = 3          # parcels a link reason or a label names before it stops
 ABSENT, EQUAL, DIFFER, ONE_SIDED = "absent", "equal", "differ", "one_sided"
