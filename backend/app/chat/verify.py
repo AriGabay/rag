@@ -60,6 +60,13 @@ state it (``QUALIFIER_UNSTATED``). The removal note records each edit (``MSG_QUA
 ``edited``, never as a removal; the final check judges the edited sentence as saved, and an unsupported verdict removes it. A
 source that states a different value, and a unit with a number-level problem, keep the removal path.
 
+Round 13 U9 (KTD9, KTD10; R12, R13). The judge reads what the server holds about a cited source's unit — its stated valuation
+date and its link reason, ``SERVER_HELD`` in the source's header — and a date equal to the cited passage's unit valuation date is
+backed (``_date_backed``). A number that no source states but a simple formula over the unit's cited values reproduces ("מקדם 0.8
+— הפחתה של 20%": 1 − 0.8, behind reduction wording) is registered as a C# of result kind ``derived`` and cited
+(``derive_numbers``, from ``bind_computations``); the unit is still judged with the computation shown. A derivation that
+does not verify is a number edit (``_number_edits``): the derived clause is cut to its boundary and the grounded number stays.
+
 Every removal is a structured decision, made where its check fires (round 7 U4: KTD5, KTD10; R12–R15): the
 ``Problem`` carries its failure kind (``FAILURE_KINDS``), the check (``unknown_id`` — invalid citation;
 ``unstated_number`` — absent from the source; ``computation_mismatch`` and ``framed_result`` — wrong calculation;
@@ -240,8 +247,14 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # The judge contract's version (round 8 KTD7): part of every verdict key, bumped whenever the policy, the schema or what
 # a call renders changes what a verdict means, so a verdict of an older contract is never reused (cached readings are
 # versioned). 6 (round 10 U9, KTD14): the evidence header of a standard carries its kind, limits and wording, and the policy
-# the rules that need them.
-JUDGE_VERSION = 7
+# the rules that need them. 8 (round 13 U9, KTD10, KTD9): a cited source's header carries the server's own facts about its
+# unit (``SERVER_HELD``: the stated valuation date and the link reason), and a derived computation (C#, result kind
+# ``derived``) joins the unit's evidence; rules (29) and (30) read them.
+JUDGE_VERSION = 8
+# the label of the facts the server holds about a cited source's unit and states beside its text (round 13 U9, KTD10, R13): the
+# stated valuation date of the unit that holds the passage, and why the server linked the appraisal to the property. Read
+# from the stored document, not from the passage: the judge takes them as evidence, never as a claim to check
+SERVER_HELD = "נתון שהשרת מחזיק"
 # an uncited factual unit is judged against the sources the turn already read (round 8 KTD3, R2): the sources of the
 # turn whose text holds its numbers or content words are shown beside it as candidates, bounded so the call stays
 # within ``JUDGE_CALL_CHARS``. How many candidates a unit gets, how many characters one candidate may show, and how
@@ -360,7 +373,12 @@ JUDGE_POLICY = (
     "ועל מטרתה; בלי זה — unsupported. (27) תיאור של שיטה או נוסחה בתקן אינו מאמת את ערכי הקלט של חישוב: ערך של נכס "
     "(שטח, שווי, שיעור) נתמך רק בשומה של אותו נכס, ומספר שמופיע רק בתקן (בדוגמה או בתיאור) אינו תומך בו. (28) "
     "\"העדכני\" או \"המאוחר ביותר\" נבחן מול הנתונים המתוארכים: נתון שמועדו לא ידוע אינו סותר אותו ואינו הופך אותו "
-    "לחלקי, כל עוד היחידה אינה טוענת שהיא מכסה גם אותו; נתון של נכס, מדד, יחידה, תקופתיות או מע\"מ אחרים אינו סותר אותו."
+    "לחלקי, כל עוד היחידה אינה טוענת שהיא מכסה גם אותו; נתון של נכס, מדד, יחידה, תקופתיות או מע\"מ אחרים אינו סותר אותו. "
+    f"(29) שורה שמסומנת «{SERVER_HELD}» בכותרת של מקור היא עובדה שהשרת קרא מהמסמך השמור ולא טענה לבדוק: המועד הקובע של "
+    "היחידה שבה נמצא הקטע, או הסיבה שהשומה נקשרה לנכס. טענה שנותנת את אותו מועד קובע לשומה או ליחידה נתמכת בו גם כשהטקסט "
+    "של הקטע עצמו אינו מכיל אותו; מועד אחר ממנו אינו נתמך בו. (30) חישוב מערכת מסוג «נגזר» (derived) הוא נוסחה פשוטה "
+    "שהשרת חישב מערכים שהיחידה מצטטת (למשל 1 פחות מקדם, כשהיחידה כותבת הפחתה): מספר שהוא תוצאתו נתמך אם הניסוח של "
+    "היחידה מתאים לנוסחה, ואינו נתמך אם הניסוח מתאר משהו אחר."
 )
 
 
@@ -489,10 +507,13 @@ REPAIR_HINTS = {
 }
 # the qualifier edit (round 12 U10, KTD10, R7): the attribute each edit names in the removal note, and what is written in
 # place of a qualifier the source does not state when the question itself asked about that attribute
-QUALIFIER_LABELS = {"period": "התקופה", "basis": "בסיס השטח", "vat": "המע\"מ"}
+QUALIFIER_LABELS = {"period": "התקופה", "basis": "בסיס השטח", "vat": "המע\"מ", "number": "מספר נגזר"}
 QUALIFIER_UNSTATED = {"period": " (התקופה לא צוינה במקור)", "basis": " (בסיס השטח לא צוין במקור)",
                       "vat": " (המע\"מ לא צוין במקור)"}
 MSG_QUALIFIER_EDITED = "> הוסר ניסוח של {label} שלא נכתב במקור לגבי {n} נתונים; הנתונים עצמם נשארו בתשובה."
+# a derived number that did not verify (round 13 U9, KTD9, R12): the clause that wrote it went, the grounded number stayed
+MSG_NUMBER_EDITED = "> הוסר ניסוח של מספר נגזר שלא אומת מהנתונים שצוטטו לגבי {n} נתונים; הנתונים עצמם נשארו בתשובה."
+QUALIFIER_NOTES = {"number": MSG_NUMBER_EDITED}  # the removal note's line of an edit kind; any other kind: MSG_QUALIFIER_EDITED
 # the server's fixed sentence for each removal on the user's normal path (KTD5): never the claim or a judge's words
 REMOVAL_SENTENCES = {
     "absent_from_source": "הוסרה טענה שהמקורות שנבדקו אינם מציינים.",
@@ -1227,8 +1248,9 @@ class Problem:
 class QualifierEdit:
     """One qualifier edit of a unit (round 12 U10, KTD10): the range ``start:end`` of the answer's Markdown — the
     qualifier's own words and the space or comma beside it — replaced by ``marker`` (the server's "not stated in the
-    source", when the question asked about that attribute) or by nothing. ``kind``: ``period``, ``basis`` or ``vat``;
-    ``written``: the words that go."""
+    source", when the question asked about that attribute) or by nothing. ``kind``: ``period``, ``basis`` or ``vat``; or
+    ``number`` (round 13 U9, KTD9): a derived number the cited values do not verify, cut with its clause (the dash or
+    comma that opens it, to the clause boundary), the grounded number before it kept; ``written``: the words that go."""
 
     unit: int
     kind: str
@@ -1815,7 +1837,7 @@ class VerifyReport:
         status = answer.status
         if any(s.kind == "marker" for s in doc.spans()) and status == "answered":
             status = "partial"  # part of the answer was left out
-        edited = [MSG_QUALIFIER_EDITED.format(label=QUALIFIER_LABELS[kind], n=n)
+        edited = [QUALIFIER_NOTES.get(kind, MSG_QUALIFIER_EDITED).format(label=QUALIFIER_LABELS[kind], n=n)
                   for kind in QUALIFIER_LABELS if (n := sum(1 for q in qualifiers if q.kind == kind))]
         if removed:
             lines = ([f"> הוסרו מהתשובה {removed - unchecked} טענות שלא נמצאה להן תמיכה במקורות."]
@@ -2240,8 +2262,13 @@ def _source_parts(ws: Workspace, sid: str, *, dated: bool = True) -> tuple[str, 
             head += f" — זיהוי מתוך המסמך: {src.subject}"
         if src.source_kind != source_kinds.APPRAISAL:  # an appraisal's header stays what it was
             head += " — " + _professional_head(src)
-        if src.link and dated:  # the server linked this appraisal to the property (round 12 U12b, R3): evidence for the
-            head += " — " + src.link  # judge; not for the number check, which a parcel's digits must not feed
+        # the facts the server holds about the unit the passage is in (round 13 U9, KTD10, R13), stated as the server's: the
+        # valuation date it stated for the unit (the judge's evidence for a sentence that names the appraisal's date, though
+        # the passage does not hold the line) and, for an appraisal other than the focus, why it linked it to the property
+        # (round 12 U12b, R3). Evidence for the judge; not for the number check, which a date's or a parcel's digits must not
+        # feed (``dated=False``)
+        if dated:
+            head += "".join(f" — {SERVER_HELD}: {fact}" for fact in (src.date_line, src.link) if fact)
         return head, src.text, src.kind
     if sid in ws.measurements:
         m = ws.measurements[sid].public()
@@ -2548,14 +2575,27 @@ def _as_of_forms(as_of: dict | None) -> list[str]:
     return [shared_dates.shown_date(iso, precision) for iso, precision in chat_dates.stated_dates(as_of)]
 
 
+def _valuation_dates(src) -> list[tuple[str, str]]:
+    """The (ISO, precision) valuation date the server stated for the appraisal unit that holds a cited passage
+    (``Source.date_line``: "למועד הקובע 15/04/2025", round 13 U9, KTD10, R13). Nothing when the unit's date is unknown or
+    several disagree: the line then names no date it states."""
+    from app.chat.tools import MSG_DATE_VALUATION
+
+    lead = MSG_DATE_VALUATION.split("{", 1)[0]
+    line = getattr(src, "date_line", None) or ""
+    return [(p.iso, p.precision) for p in shared_dates.find_all(line[len(lead):])] if line.startswith(lead) else []
+
+
 def _date_backed(text: str, ws: Workspace, ids: list[str]) -> set[str]:
     """The number tokens of the dates a unit's text gives that a cited value (V#) or measurement (M#) states as its own
     date (``as_of``: read by the server from the source's date line, row, caption or unit; round 11 U15 B, as KTD10 does
-    for the VAT): the date sits in the record the claim cites, though the cited passage may not hold the line. A date
+    for the VAT), or that a cited passage's unit states as its valuation date (``_valuation_dates``, round 13 U9, KTD10): the
+    date sits in the record the claim cites, though the cited passage may not hold the line. A date
     counts when it is, at its precision or coarser, one of the stated dates (a range: both ends); a date the record does
     not hold is not backed, and a token that is also written outside every backed date ("10 יחידות") is not either."""
     stated = [d for i in ids
               for d in chat_dates.stated_dates(getattr(ws.values.get(i) or ws.measurements.get(i), "as_of", None))]
+    stated += [d for i in ids if i in ws.sources for d in _valuation_dates(ws.sources[i])]
     if not stated:
         return set()
     backed = [p for p in shared_dates.find_all(text)
@@ -2585,7 +2625,8 @@ def _all_numbers(ws: Workspace) -> set[str]:
     for a in ws.assumptions.values():
         nums |= numbers_in(a.written)
     for c in ws.computations.values():
-        nums |= numbers_in(computation_text(c))
+        if c.result_kind != "derived":  # a derived result backs only a unit that cites its inputs (round 13 U9)
+            nums |= numbers_in(computation_text(c))
     return nums
 
 
@@ -3070,6 +3111,79 @@ def _qualifier_edits(u: Unit, ws: Workspace, question: str, blocking: list, vat:
     return out or None
 
 
+# what opens the clause that writes a derived number: a dash, a comma or an opening parenthesis (never a table cell's bar)
+_CLAUSE_OPEN = re.compile(r"\s*(?:[—–]|[،,](?!\d)|(?<=\s)-(?=\s)|\()\s*")
+_DASH_AHEAD = re.compile(r"\s[—–]\s")
+
+
+def _number_edits(u: Unit, ws: Workspace, unstated: list[str]) -> list[QualifierEdit] | None:
+    """The number edits (round 13 U9, KTD9, R12, AE5) of a unit whose only removing problems are numbers no cited source
+    states, when each is a number the unit presents as derived from the values it cites — its clause says "הפחתה",
+    "תוספת", "סה״כ", ... (the wording of ``_derivations``), and ``derive_numbers`` found no formula that verifies it. Each edit
+    cuts that clause whole, from the dash, comma or parenthesis that opens it to the clause boundary (the sentence's end, a
+    clause of its own after a comma — ", ו..." — a dash, a closing parenthesis, or a comma that is followed by another
+    number), so no "של" or dash is left behind; the grounded number before it and its citation stay. None when the unit
+    cites no value, a number has no such clause, the words cannot be placed exactly, they touch a citation or a table
+    cell's edge, or the cut would take a number the sources state (the removal path)."""
+    if not any(i in ws.values or i in ws.measurements for i in u.ids):
+        return None
+    text, to_raw = u.text, _text_to_raw(u)
+    if to_raw is None:
+        return None
+    dates = [m.span() for m in _DATE_AT.finditer(text)]
+    targets = [n for n in _shown(text) if numbers_in(n.written) & set(unstated) and not any(a <= n.start < b for a, b in dates)]
+    gates = (_REDUCTION, _ADDITION, _RELATION_SUM, _RELATION_DIFFERENCE, _RELATION_PRODUCT, _RELATION_RATIO)
+    spans: list[tuple[int, int]] = []
+    for n in targets:
+        lo = max((m.end() for m in _CLAUSE_END.finditer(text, 0, n.start)), default=0)
+        hi = next((m.start() for m in _CLAUSE_END.finditer(text, n.end)), len(text))
+        words = [m for rx in gates for m in rx.finditer(text, lo, hi)]
+        if not words:
+            return None
+        anchor = min(min(words, key=lambda m: abs(m.start() - n.start)).start(), n.start)
+        opens = list(_CLAUSE_OPEN.finditer(text, lo, anchor))
+        if not opens:
+            return None
+        a = opens[-1].start() + (len(opens[-1].group(0)) - len(opens[-1].group(0).lstrip()))
+        opener = text[a]
+        while a > 0 and text[a - 1] in " \t" and to_raw[a - 1] == to_raw[a] - 1:  # the space before it, if nothing sits between
+            a -= 1
+        stops = [m.start() for m in _DASH_AHEAD.finditer(text, n.end, hi)]
+        stops += [m.start() for m in _OWN_CLAUSE.finditer(text, n.end, hi)]
+        if opener == "(":
+            close = text.find(")", n.end, hi)
+            stops.append(close + 1 if close >= 0 else hi)
+        # a comma that is followed by another number opens a clause of its own too (a grounded number is never cut)
+        stops += [m.start() for m in re.finditer(r"[،,](?!\d)", text[:hi]) if m.start() >= n.end
+                  and re.search(r"\d", text[m.end():hi])][:1]
+        b = min([hi, *stops])
+        while b > a and text[b - 1] in " \t":
+            b -= 1
+        if b <= n.end:
+            return None
+        if spans and a == spans[-1][0]:  # two numbers of one clause: one cut
+            spans[-1] = (a, max(b, spans[-1][1]))
+        elif spans and a < spans[-1][1]:
+            return None
+        else:
+            spans.append((a, b))
+    if not spans:
+        return None
+    gone, rest, pos = "".join(text[a:b] for a, b in spans), "", 0
+    for a, b in spans:
+        rest, pos = rest + text[pos:a], b
+    rest += text[pos:]
+    if not numbers_in(rest) or numbers_in(rest) & set(unstated) or not numbers_in(gone) <= set(unstated):
+        return None
+    out: list[QualifierEdit] = []
+    for a, b in spans:
+        raw_a, raw_b = to_raw[a], to_raw[b - 1] + 1
+        if _IDS.search(u.raw[raw_a:raw_b]) or any(c in u.raw[raw_a:raw_b] for c in "|\n"):
+            return None
+        out.append(QualifierEdit(u.index, "number", u.start + raw_a, u.start + raw_b, text[a:b].strip()))
+    return out
+
+
 def plan_qualifier_edits(report: VerifyReport, ws: Workspace, question: str,
                          meanings: dict[int, list[meaning.MeaningProblem]]) -> None:
     """The qualifier edit (round 12 U10, KTD10, R7), planned once the deterministic checks are settled: a unit whose only
@@ -3078,10 +3192,24 @@ def plan_qualifier_edits(report: VerifyReport, ws: Workspace, question: str,
     problems take ``resolution == "qualifier"`` (still repairable: the repair rounds come first, the edit is the step after
     them, ``VerifyReport.edit``); ``report.qualifier_edits`` holds the words that go. A source that states a different
     value, a unit with any other failing check (a number-level problem included), or words that cannot be placed exactly
-    keep the removal path."""
+    keep the removal path.
+
+    Round 13 U9 (KTD9, R12): a unit whose only removing problems are numbers no cited source states, each written in a clause
+    that presents it as derived from the cited values (``_number_edits``), takes the same step with an edit of kind
+    ``number``: the derived clause is cut, the grounded number and its citation stay."""
     report.qualifier_edits = {}
     for u in report.units:
         removing = [p for p in report.problems if p.unit.index == u.index and p.removes_unit]
+        if removing and u.index not in report.protected and all(
+                p.kind == "claim" and p.check == "unstated_number" and p.unstated for p in removing):
+            # a number derived from the cited values that did not verify (round 13 U9, KTD9): its clause goes, the number
+            # the sources state stays
+            edits = _number_edits(u, ws, sorted({n for p in removing for n in p.unstated}))
+            if edits:
+                report.qualifier_edits[u.index] = edits
+                for p in removing:
+                    p.resolution = "qualifier"
+            continue
         if (not removing or u.index in report.protected or not u.ids
                 or any(p.kind != "claim" or p.check not in ("meaning", "vat") for p in removing)):
             continue
@@ -3249,6 +3377,9 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
         cited.add(str(len(c.inputs)))
         cited.add(str(c.documents))
     held = bool(u.ids) or strict
+    # a unit that cites nothing may show any calculation of the turn the model made; a derived one (round 13 U9, KTD9) backs
+    # only a unit that cites one of its inputs, so it is never in this pool
+    turn_wide = [c for c in ws.computations.values() if c.result_kind != "derived"]
     pool = cited if held else everything
     values = [ws.values[i] for i in u.ids if i in ws.values] if held else list(ws.values.values())
     # a numbered heading's own number ("9.1 שיטת השומה") is its place in the answer, not a fact
@@ -3258,12 +3389,12 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
         backed = _date_backed(_stated_text(u), ws, u.ids)
         missing = [n for n in missing if n not in backed]
     if missing:  # a calculation's result shown rounded to the precision and in the scale it is written in
-        shown = _computed_numbers(u.text, computations if held else list(ws.computations.values()))
+        shown = _computed_numbers(u.text, computations if held else turn_wide)
         missing = [n for n in missing if n not in shown]
     if missing:  # a number of the evidence in another form: a scale word, or a correct rounding marked as one (R14)
         restated = _restated(u.text, pool, {v.value * v.scale for v in values if v.scale != 1})
         missing = [n for n in missing if n not in restated]
-    wrong = _wrong_scale(u, ws, values, computations if held else list(ws.computations.values()))
+    wrong = _wrong_scale(u, ws, values, computations if held else turn_wide)
     # a datum of the property that only the cited standard states, beside evidence that is not one (R34)
     only = _standard_only(u, ws, by_id, question_numbers) if held and any(_professional(ws, i) for i in by_id) else []
     return missing + [n for n in [*wrong, *only] if n not in missing]
@@ -3564,14 +3695,166 @@ def _wrong_context(u: Unit, ws: Workspace, question: str) -> str | None:
     return None
 
 
+# --- a number derived from the values a unit cites (round 13 U9, KTD9, R12, AE5) -------------------------------------------------
+#
+# "מקדם 0.8 — הפחתה של 20%" cites the coefficient's cell: the 20% is 1 − 0.8, a number no source states and no calculation of
+# the turn made. The server tries a bounded set of simple formulas over the unit's cited V#/M# of ONE appraisal unit and, when
+# one reproduces the number at the precision it is written in, registers it as a C# of result kind ``derived``, so
+# ``_computed_numbers``, ``bind_computations``, the judge's ``computation_text`` and the final check read it like any
+# calculation. Every formula has a wording gate — the claim must say what the formula is — so a number equal by chance to a
+# combination of two cited values derives nothing; and the unit still goes to the judge with the computation shown.
+
+_AFFIX = r"(?<![א-ת])[ובלהשכמ]{0,2}"
+_REDUCTION = re.compile(_AFFIX + r"(?:הפחתה|הפחתת|הפחתות|מופחת|מופחתת|הנחה|הנחת|הנחות)(?![א-ת])")
+_ADDITION = re.compile(_AFFIX + r"(?:תוספת|תוספות|פרמיה|פרמיית)(?![א-ת])")
+# the relation a two-operand formula needs the claim to name: סך / סה״כ (a + b), הפרש (a − b), מכפלת (a · b), חלקי / ביחס ל (a / b)
+_RELATION_SUM = re.compile(r"(?<![א-ת])ה?(?:סך|סה[\"״']?כ|סכום)(?![א-ת])")
+_RELATION_DIFFERENCE = re.compile(_AFFIX + r"הפרש(?![א-ת])")
+_RELATION_PRODUCT = re.compile(_AFFIX + r"מכפלת|(?<![א-ת])מכפלה(?![א-ת])")
+_RELATION_RATIO = re.compile(r"(?<![א-ת])חלקי(?![א-ת])|(?<![א-ת])ביחס\s+(?:ל|אל)")
+MSG_DERIVED_NOTE = ("נגזר על ידי השרת מערכים שהיחידה מצטטת, לפי הניסוח שלה; המספר אינו כתוב בשומה כפי שהוא ואינו תוצאה "
+                    "שהמודל חישב.")
+DERIVED_OPERANDS = 8  # cited values considered for a derivation; the pairs are bounded by it
+
+
+def _clause_of(text: str, at: int) -> str:
+    """The sentence of ``text`` that holds position ``at`` (up to the clause ends ``_CLAUSE_END``)."""
+    start = max((m.end() for m in _CLAUSE_END.finditer(text, 0, at)), default=0)
+    end = next((m.start() for m in _CLAUSE_END.finditer(text, at)), len(text))
+    return text[start:end]
+
+
+def _appraisal_unit(ws: Workspace, i: str) -> tuple | None:
+    """The appraisal unit a cited value or measurement is in: its document version and, in a file holding several appraisals,
+    its context. None for an id that is neither."""
+    rec = ws.values.get(i) or ws.measurements.get(i)
+    if rec is None:
+        return None
+    return str(rec.version_id), (rec.context or {}).get("key")
+
+
+def _derivations(ws: Workspace, ids: list[str], shown: Shown, clause: str) -> list[tuple[str, bool]]:
+    """The expressions (over ``ids``, all cited values of one appraisal unit) a number as shown may be derived by, in the
+    order they are tried, and whether a result must be positive (a reduction, an addition and a difference are
+    magnitudes). The wording of the number's own clause gates each formula (KTD9)."""
+    out: list[tuple[str, bool]] = []
+    cited = [i for i in ids if i in ws.values or i in ws.measurements][:DERIVED_OPERANDS]
+    reduction, addition = bool(_REDUCTION.search(clause)), bool(_ADDITION.search(clause))
+    for x in cited:
+        if reduction:
+            out += [(f"1 - {x}", True), (f"(1 - {x}) * 100", True)]
+        if addition:
+            out += [(f"{x} - 1", True), (f"({x} - 1) * 100", True)]
+        # the percent or fraction form of the same cited value, behind no wording but the form itself
+        if shown.percent:
+            out.append((f"{x} * 100", False))
+        else:
+            out.append((f"{x} / 100", False))
+    for a in cited:
+        for b in cited:
+            if a == b or _appraisal_unit(ws, a) != _appraisal_unit(ws, b):
+                continue
+            if _RELATION_SUM.search(clause) and a < b:
+                out.append((f"{a} + {b}", False))
+            if _RELATION_DIFFERENCE.search(clause):
+                out.append((f"{a} - {b}", True))
+            if _RELATION_PRODUCT.search(clause) and a < b:
+                out.append((f"{a} * {b}", False))
+            if _RELATION_RATIO.search(clause):
+                out.append((f"{a} / {b}", False))
+    return out
+
+
+def _derived_computation(ws: Workspace, expression: str, shown: Shown, positive: bool) -> str | None:
+    """The C# of ``expression`` when it reproduces the number as shown (``calc.evaluate`` and ``calc.display_matches``,
+    the precision and scale it is written in); registered once per expression, with result kind ``derived``. None when the
+    calculator refuses it (units that do not combine, a literal beside a value that is not dimensionless), it is not
+    positive where it must be, or it does not show the number."""
+    from app.chat import calc
+    from app.chat import tools as chat_tools
+
+    try:
+        node = calc.parse(expression)
+        written = calc.render(node, lambda i: i)
+        existing = next((c for c in ws.computations.values()
+                         if c.result_kind == calc.DERIVED and c.expression == written), None)
+        ids = list(dict.fromkeys(calc.ids_of(node)))
+        out = calc.evaluate(node, {i: chat_tools._operand(ws, i) for i in ids})
+    except (calc.CalcError, chat_tools.ToolError):
+        return None
+    if (positive and out.value <= 0) or not calc.display_matches(shown.written, shown.percent, out.value, out.dims,
+                                                                  out.kind, shown.scale, out.scale):
+        return None
+    if existing is not None:
+        return existing.cid
+
+    def name(i: str) -> str:
+        return ws.values[i].label if i in ws.values else ws.measurements[i].row.metric
+
+    inputs = []
+    for i in out.inputs:
+        value = ws.values[i].value if i in ws.values else ws.measurements[i].row.value
+        entry = {"id": i, "label": name(i), "kind": "value" if i in ws.values else "measurement",
+                 "value": None if value is None else str(value),
+                 "display": None if value is None else calc.fmt(Decimal(str(value)))}
+        if i in ws.values:
+            entry |= {"source_id": ws.values[i].source_id, "value_text": ws.values[i].written,
+                      "certainty": ws.values[i].certainty}
+        else:
+            entry |= {"value_text": ws.measurements[i].row.value_text}
+        inputs.append(entry)
+    leaves = [lf.id for lf in out.leaves]
+    sources = list(dict.fromkeys([ws.values[i].source_id for i in leaves if i in ws.values]
+                                 + [i for i in leaves if i in ws.measurements]))
+    docs = {str(ws.values[i].document_id) for i in leaves if i in ws.values}
+    docs |= {str(ws.measurements[i].document_id) for i in leaves if i in ws.measurements}
+    uncertain = chat_tools.uncertain_inputs(ws, leaves)
+    if uncertain:  # a result resting on an uncertain input is conditional, never certain (R28), as ``tool_calculate`` has it
+        out.conditional.append(chat_tools.MSG_UNCERTAIN_INPUTS.format(ids=", ".join(uncertain)))
+    conditional = "מותנה: " + "; ".join(out.conditional) if out.conditional else ""
+    label = f"נגזר: {calc.render(node, name, True)}"
+    c = calc.Computation(f"C{len(ws.computations) + 1}", label, calc.render(node, lambda i: i),
+                         calc.render(node, lambda i: f"«{name(i)}»", True), out, inputs, sources, len(docs),
+                         calc.DERIVED, None, MSG_DERIVED_NOTE + (" " + conditional if conditional else ""), None, leaves,
+                         None, None, calc.applied_rates(node), list(uncertain))
+    ws.computations[c.cid] = c
+    return c.cid
+
+
+def derive_numbers(u: Unit, ws: Workspace, loose: set[str]) -> list[str]:
+    """The C# ids that verify numbers of a unit that no source it cites states (``loose``: as ``numbers_in`` reads them),
+    each derived from the unit's cited values by a formula its own clause's wording names (``_derivations``). A number
+    inside a date is never derived. Registers what it finds (``_derived_computation``); the caller cites it."""
+    found: list[str] = []
+    dates = [m.span() for m in _DATE_AT.finditer(u.text)]
+    for n in _shown(u.text):
+        if not numbers_in(n.written) & loose or any(a <= n.start < b for a, b in dates):
+            continue
+        clause = _clause_of(u.text, n.start)
+        for expression, positive in _derivations(ws, u.ids, n, clause):
+            cid = _derived_computation(ws, expression, n, positive)
+            if cid is not None:
+                if cid not in found:
+                    found.append(cid)
+                break
+    return found
+
+
 def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[int, list[str]]:
     """Bind each unit that shows a result of the turn's calculations without citing it (citing only its inputs, or
     nothing) to that calculation: the C# joins the unit's citations, so the number check, the VAT check and the
     judge read the unit with it, and the server cites it in the answer. A number binds when it is the result at the
     precision and scale it is shown in (a calculation whose inputs the unit cites first; an intermediate step of
     one counts only when the unit cites an input of it) and is not presented as written by a document or said by a
-    party; the unit binds only when, with the calculations, every number of it is stated. Returns {unit index: the C# ids bound}."""
-    if not ws.computations:
+    party; the unit binds only when, with the calculations, every number of it is stated. Returns {unit index: the C# ids bound}.
+
+    Round 13 U9 (KTD9, R12): a number of a unit that cites values and that no cited source states is first tried against
+    the derivations of ``derive_numbers`` (1 − a cited coefficient behind "הפחתה", ...); one that verifies is registered as
+    a C# of result kind ``derived`` and joins the unit's citations, whatever else the unit holds. A derived result binds
+    only to a unit that cites an input of it."""
+    from app.chat.calc import DERIVED
+
+    if not (ws.computations or ws.values or ws.measurements):
         return {}
     question_numbers = numbers_in(question)
     bound: dict[int, list[str]] = {}
@@ -3582,6 +3865,13 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
         loose = set(_unstated(u, ws, question_numbers, set(), strict=True, stated_by=stated_by))
         if not loose:
             continue
+        derived = [cid for cid in derive_numbers(u, ws, loose) if cid not in u.ids] if u.ids else []
+        if derived:
+            u.ids.extend(derived)
+            bound[u.index] = list(derived)
+            loose = set(_unstated(u, ws, question_numbers, set(), strict=True, stated_by=stated_by))
+            if not loose:
+                continue
         chosen: list[str] = []
         for n in _shown(u.text):
             if not numbers_in(n.written) & loose or _stated_as_written(u.text, n.start):
@@ -3589,6 +3879,7 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
             # a result of a calculation; or an intermediate step of one whose inputs the unit cites (round 9 U12:
             # "1.05" of 1 + 5%, shown beside the inputs it was made of)
             matches = [c for cid, c in ws.computations.items() if cid not in u.ids and cid not in chosen
+                       and (c.result_kind != DERIVED or set(c.leaves) & set(u.ids))
                        and _shows(c, n.written, n.percent, n.scale, steps=bool(set(c.leaves) & set(u.ids)))]
             if matches:
                 order = list(ws.computations)
@@ -3600,7 +3891,7 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
         if _unstated(trial, ws, question_numbers, set(), stated_by=stated_by) or _framed_result(trial, ws):
             continue
         u.ids.extend(chosen)
-        bound[u.index] = chosen
+        bound[u.index] = [*bound.get(u.index, []), *chosen]
     return bound
 
 
@@ -4355,7 +4646,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     # a unit failed only for numbers no cited source states, that holds more than those numbers, is not removed up front:
     # the judge splits it into claims and the claim holding such a number fails (``_fail_unstated``)
     soft = {p.unit.index: p for p in report.problems if p.check == "unstated_number" and p.unstated
-            and _holds_more(p.unit, p.unstated)}
+            and p.resolution != "qualifier" and _holds_more(p.unit, p.unstated)}
     if soft:
         report.problems = [p for p in report.problems if p.unit.index not in soft]
         for p in soft.values():

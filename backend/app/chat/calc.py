@@ -104,7 +104,11 @@ NOT_SUMMED_KINDS = {"rate", "coefficient"}
 ROLES = ("income", "cost", "total", "component", "comparison", "rate", "other")
 ROLE_LABELS = {"income": "הכנסה", "cost": "עלות", "total": "סה״כ", "component": "רכיב", "comparison": "השוואה",
                "rate": "שיעור", "other": "אחר"}
-RESULT_KINDS = {"scenario": "תרחיש לפי בקשה", "reproduces_report_value": "משחזר ערך מהשומה", "computed": "חישוב"}
+DERIVED = "derived"
+# "derived" (round 13 U9, KTD9): a simple formula over the values a unit cites, which the server worked out to verify a number
+# the answer writes that no source states (1 − a coefficient behind "הפחתה"); never registered by the model's own calculation
+RESULT_KINDS = {"scenario": "תרחיש לפי בקשה", "reproduces_report_value": "משחזר ערך מהשומה", "computed": "חישוב",
+                DERIVED: "נגזר מערכים מצוטטים"}
 TOTAL_WORDS = re.compile(r"סה[\"״']?כ|סך\s*ה?כו?ל|סיכום|(?<![A-Za-z])total(?![A-Za-z])", re.I)
 
 
@@ -1252,7 +1256,7 @@ class Computation:
     inputs: list[dict]  # [{"id", "label", "value", "kind": "value" | "assumption" | "measurement" | "computation"}]
     sources: list[str]  # the S# and M# behind the inputs
     documents: int
-    result_kind: str  # "scenario" | "reproduces_report_value" | "computed"
+    result_kind: str  # "scenario" | "reproduces_report_value" | "computed" | "derived"
     justification: str | None
     note: str
     reproduces: dict | None = None  # {"source": S#|M#, "as_written"} when it equals a number the report writes

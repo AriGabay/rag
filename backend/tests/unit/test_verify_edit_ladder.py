@@ -223,3 +223,83 @@ def test_the_marker_form_is_judged_again_too():
 def test_a_report_edits_the_same_text_every_time_it_is_composed():
     a, r = _report("שכר הדירה הוא 5,000 ₪ לחודש [V1].", _silent_period())
     assert r.edit(a).doc.text == r.edit(a).doc.text
+
+
+# --- a derived number that does not verify is cut with its clause, the grounded number stays (round 13 U9, KTD9, R12, AE5) --------
+
+def _coefficient(written: str = "0.8"):
+    return _registered(written, f"מקדם הדגמה {written}", unit="ratio")
+
+
+def test_a_reduction_that_is_not_one_minus_the_cited_coefficient_is_cut_to_its_clause_and_the_coefficient_stays():
+    a, r = _report("מקדם 0.8 — הפחתה של 25% [V1].", _coefficient())
+    assert r.removed_units() == set() and r.removals() == [] and r.failed_units() == set()
+    assert [(p.check, p.resolution) for p in r.problems] == [("unstated_number", "qualifier")]
+    text = r.edit(a).doc.text
+    assert text.startswith("מקדם 0.8 [V1].")
+    for stub in ("הפחתה", "25", "של", "—"):
+        assert stub not in text.split("\n")[0], text
+
+
+def test_the_number_edit_is_counted_as_edited_and_the_note_says_a_derived_number_went():
+    a, r = _report("מקדם 0.8 — הפחתה של 25% [V1].", _coefficient())
+    counts = r.counts()
+    assert counts["removed"] == 0 and counts["edited"] == 1 and counts["removals"] == []
+    note = r.apply(a).answer_markdown.split("\n\n", 1)[1]
+    assert note.startswith(">") and EDIT_NOTE in note and REMOVAL_NOTE not in note
+    assert [row.action for row in r.logged()] == ["qualified"]
+
+
+def test_the_number_edit_waits_for_the_repair_rounds_like_every_qualifier_edit():
+    a, r = _report("מקדם 0.8 — הפחתה של 25% [V1].", _coefficient())
+    assert not r.ok and r.repair_keys() and "25" in r.problems_text()
+
+
+@pytest.mark.parametrize("raw, kept", [
+    ("מקדם 0.8, בהפחתה של 25% [V1].", "מקדם 0.8 [V1]."),
+    ("מקדם 0.8 (הפחתה של 25%) [V1].", "מקדם 0.8 [V1]."),
+    ("מקדם 0.8 [V1] — הפחתה של 25%.", "מקדם 0.8 [V1]."),
+    ("מקדם 0.8 — הפחתה של 25%, והנכס פנוי [V1].", "מקדם 0.8, והנכס פנוי [V1]."),
+])
+def test_the_cut_ends_at_the_clause_boundary_in_each_written_form(raw, kept):
+    a, r = _report(raw, _coefficient())
+    assert r.removed_units() == set()
+    assert r.edit(a).doc.text.startswith(kept), r.edit(a).doc.text
+
+
+def test_two_derived_clauses_of_one_unit_are_both_cut():
+    ws = _coefficient()
+    a, r = _report("מקדם 0.8 — הפחתה של 25% [V1], ושוב מקדם 0.8 — הפחתה של 30% [V1].", ws)
+    text = r.edit(a).doc.text.split("\n")[0]
+    assert "25" not in text and "30" not in text and "הפחתה" not in text and text.count("0.8") == 2
+
+
+def test_a_derived_clause_that_touches_a_citation_or_a_table_cell_edge_keeps_the_removal_path():
+    a, r = _report("מקדם 0.8 — הפחתה של [V1] 25%.", _coefficient())  # the citation sits inside the clause
+    assert r.removed_units() == {0} and r.counts()["edited"] == 0
+    md = "| מקדם | הערה |\n|---|---|\n| 0.8 [V1] | הפחתה של 25% |"
+    a, r = _report(md, _coefficient())
+    assert r.counts()["edited"] == 0
+
+
+def test_a_unit_that_is_only_the_unstated_number_keeps_the_existing_removal():
+    a, r = _report("הפחתה של 25% [V1].", _coefficient())
+    assert r.removed_units() == {0} and r.counts()["edited"] == 0 and r.removals()[0].check == "unstated_number"
+
+
+def test_an_unstated_number_with_no_derivation_wording_is_not_a_number_edit():
+    a, r = _report("מקדם 0.8, ושטח של 25 מ״ר [V1].", _coefficient())
+    assert r.counts()["edited"] == 0  # the judge splits it and a cut marks it, as before
+
+
+def test_the_number_edit_label_exists_beside_the_qualifier_labels():
+    from app.chat.verify import QUALIFIER_LABELS
+
+    assert {"period", "basis", "vat", "number"} <= set(QUALIFIER_LABELS)
+
+
+def test_the_edited_derived_sentence_is_judged_again_in_the_final_check():
+    done, r, seen, usage = _final("מקדם 0.8 — הפחתה של 25% [V1].", _coefficient(), lambda t: "supported")
+    assert [u["purpose"] for u in usage] == [final_check.FINAL_LABEL]
+    assert len(seen) == 1 and "0.8" in seen[0] and "25" not in seen[0]
+    assert done.composition.answer.answer_markdown.startswith("מקדם 0.8 [V1].")

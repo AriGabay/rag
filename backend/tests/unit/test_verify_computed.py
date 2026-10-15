@@ -724,3 +724,164 @@ def test_a_qualifier_goes_after_the_number_with_its_percent_sign_or_currency(raw
     unit = Unit(0, raw, 0, len(raw))
     at = _after_number(unit, number)
     assert raw[:at].endswith(after)
+
+
+# --- a number derived from cited, grounded values by a simple formula (round 13 U9, KTD9, R12, AE5) ----------------------------
+
+def _ratio(ws: Workspace, written: str, label: str, *, unit: str = "ratio", kind: str = "coefficient",
+           version: uuid.UUID | None = None) -> str:
+    """A value of the invented appraisal unit ``version`` (a coefficient by default), as the registered record holds it."""
+    vid = f"V{len(ws.values) + 1}"
+    ws.values[vid] = calc.Value(vid, Decimal(written.replace(",", "")), written, "S1", uuid.uuid4(),
+                                version or uuid.uuid4(), None, "שומת הדגמה", "טבלת מקדמים", label, kind, unit, "none",
+                                "not_applicable", "", SUBJECT, "appraiser_determination",
+                                {"unit": "source", "vat": "source"}, {"quote": f"{label} {written}"},
+                                f"{label} {written}")
+    return vid
+
+
+def _expr(expression: str) -> str:
+    """An expression as the calculator writes it (``calc.render``: "1 − V1")."""
+    return calc.render(calc.parse(expression), lambda i: i)
+
+
+def _derived(ws: Workspace) -> list[calc.Computation]:
+    return [c for c in ws.computations.values() if c.result_kind == "derived"]
+
+
+def test_a_reduction_that_is_one_minus_the_cited_coefficient_is_derived_registered_and_kept():
+    """AE5: "מקדם 0.8 — הפחתה של 20%" cites the 0.8 cell; the 20% is 1 - 0.8, so the bullet stays and the judge reads the
+    server's computation beside the cited cell."""
+    ws = Workspace(ctx=None)
+    _ratio(ws, "0.8", "מקדם הדגמה")
+    seen: list = []
+    report, applied = _verify(ws, "מקדם 0.8 — הפחתה של 20% [V1].", seen=seen)
+    (c,) = _derived(ws)
+    assert (c.cid, c.expression, c.value, c.result_kind) == ("C1", _expr("1 - V1"), Decimal("0.2"), "derived")
+    assert c.leaves == ["V1"] and c.sources == ["S1"]
+    assert not report.removed_units() and report.ok, report.problems_text()
+    assert applied.answer_markdown == "מקדם 0.8 — הפחתה של 20% [V1][C1]."
+    shown = "\n".join(i for _, i in seen)
+    assert '<source id="C1"' in shown and "נוסחה:" in shown and _expr("1 - V1") in shown and "נגזר" in shown
+
+
+@pytest.mark.parametrize("claim", ["מקדם 0.8 — הפחתה של 20%", "מקדם 0.8 — הפחתה של 20 אחוז", "מקדם 0.8 — הנחה של 0.2",
+                                   "מקדם 0.8, בהנחה של 20 נקודות אחוז"])
+def test_a_reduction_is_derived_in_every_written_form_of_the_complement(claim):
+    ws = Workspace(ctx=None)
+    _ratio(ws, "0.8", "מקדם הדגמה")
+    report, _ = _verify(ws, claim + " [V1].")
+    assert [c.expression for c in _derived(ws)] == [_expr("1 - V1" if "נקודות" not in claim else "(1 - V1) * 100")]
+    assert not report.removed_units()
+
+
+def test_the_derived_computation_reaches_the_judge_as_the_units_own_evidence_and_the_unit_is_still_judged():
+    ws = Workspace(ctx=None)
+    _ratio(ws, "0.8", "מקדם הדגמה")
+    seen: list = []
+    report, _ = _verify(ws, "מקדם 0.8 — הפחתה של 20% [V1].", rule=lambda t: "unsupported", seen=seen)
+    assert seen, "the unit was not sent to the judge"
+    assert report.removed_units() == {0}  # the judge's verdict still decides: the derivation only settles the number check
+    assert report.removals()[0].check == "judge"
+
+
+def test_an_addition_is_derived_only_behind_addition_wording():
+    ws = Workspace(ctx=None)
+    _ratio(ws, "1.2", "מקדם הדגמה")
+    _verify(ws, "מקדם 1.2 — תוספת של 20% [V1].")
+    assert [c.expression for c in _derived(ws)] == [_expr("V1 - 1")]
+
+
+@pytest.mark.parametrize("claim", [
+    "מקדם 0.8 — תוספת של 20% [V1].",  # addition wording on a coefficient below 1: negative
+    "מקדם 0.8 — פרמיה של 20% [V1].",
+    "מקדם 0.8 — שיעור של 20% [V1].",  # no wording at all
+    "מקדם 0.8 — הפחתה של 25% [V1].",  # the wrong complement
+    "מקדם 1.2 — הפחתה של 20% [V1].",  # 1 - 1.2 is not a reduction
+])
+def test_the_wording_gate_and_the_sign_keep_a_coincidence_from_deriving(claim):
+    ws = Workspace(ctx=None)
+    _ratio(ws, "0.8" if "1.2" not in claim else "1.2", "מקדם הדגמה")
+    report, _ = _verify(ws, claim)
+    assert _derived(ws) == []
+    assert [p.check for p in report.problems if p.removes_unit or p.resolution == "qualifier"] == ["unstated_number"]
+
+
+def test_the_percent_form_of_the_same_cited_value_is_derived_in_both_directions():
+    ws = Workspace(ctx=None)
+    _ratio(ws, "0.8", "מקדם הדגמה")
+    _ratio(ws, "20", "שיעור הדגמה", unit="percent", kind="rate")
+    _verify(ws, "מקדם 80% [V1].")
+    _verify(ws, "שיעור 0.2 [V2].")
+    assert sorted(c.expression for c in _derived(ws)) == sorted([_expr("V1 * 100"), _expr("V2 / 100")])
+
+
+def test_the_percent_form_is_not_a_license_for_a_plain_number_equal_to_a_hundred_times_a_value():
+    ws = Workspace(ctx=None)
+    _ratio(ws, "0.8", "מקדם הדגמה")
+    report, _ = _verify(ws, "שטח הדירה 80 מ״ר [V1].")
+    assert _derived(ws) == [] and report.removed_units() == {0}
+
+
+@pytest.mark.parametrize("wording, expression, shown", [
+    ("סה״כ", "V1 + V2", "350"), ("סך הכל", "V1 + V2", "350"), ("הפרש", "V2 - V1", "150"),
+    ("מכפלת", "V1 * V2", "25,000"), ("ביחס ל", "V1 / V2", "0.4"),
+])
+def test_two_operand_forms_derive_only_when_the_claim_names_the_relation_and_both_come_from_one_unit(
+        wording, expression, shown):
+    unit = uuid.uuid4()
+    ws = Workspace(ctx=None)
+    _ratio(ws, "100", "רכיב א", unit="other", kind="cost", version=unit)
+    _ratio(ws, "250", "רכיב ב", unit="other", kind="cost", version=unit)
+    named = f"{wording} {shown} [V1][V2]."
+    unnamed = f"הערך {shown} [V1][V2]."
+    _verify(ws, unnamed)
+    assert _derived(ws) == []  # a number equal by chance to a sum of two cited values derives nothing
+    report, _ = _verify(ws, named)
+    assert [c.expression for c in _derived(ws)] == [_expr(expression)] and not report.removed_units()
+
+
+def test_two_operands_of_different_appraisal_units_are_never_combined():
+    ws = Workspace(ctx=None)
+    _ratio(ws, "100", "רכיב א", unit="other", kind="cost")
+    _ratio(ws, "250", "רכיב ב", unit="other", kind="cost")  # another unit of the file set: another version
+    report, _ = _verify(ws, "סה״כ 350 [V1][V2].")
+    assert _derived(ws) == [] and report.removed_units() == {0}
+
+
+def test_a_value_the_unit_does_not_cite_is_never_an_operand():
+    unit = uuid.uuid4()
+    ws = Workspace(ctx=None)
+    _ratio(ws, "0.8", "מקדם א", version=unit)
+    _ratio(ws, "0.7", "מקדם ב", version=unit)
+    report, _ = _verify(ws, "מקדם 0.8 — הפחתה של 30% [V1].")
+    assert _derived(ws) == [] and report.counts()["edited"] == 1
+
+
+def test_a_second_verification_of_the_same_answer_reuses_the_derived_computation():
+    ws = Workspace(ctx=None)
+    _ratio(ws, "0.8", "מקדם הדגמה")
+    _verify(ws, "מקדם 0.8 — הפחתה של 20% [V1].")
+    _verify(ws, "מקדם 0.8 — הפחתה של 20% [V1].")
+    assert len(_derived(ws)) == 1 and len(ws.computations) == 1
+
+
+def test_a_derived_result_lends_its_number_only_to_a_unit_that_cites_its_inputs():
+    ws = Workspace(ctx=None)
+    _ratio(ws, "0.8", "מקדם הדגמה")
+    _ratio(ws, "0.9", "מקדם אחר")
+    _verify(ws, "מקדם 0.8 — הפחתה של 20% [V1].")
+    units = split_units("מקדם אחר 0.9 [V2] — ובנפרד 20% [V2].")
+    assert verify.bind_computations(units, ws, QUESTION) == {}
+
+
+def test_a_derived_result_backs_no_number_of_a_unit_that_cites_nothing():
+    """Round 13 U9 (KTD9): the model's own C# may back an uncited unit; a server-derived one only backs a unit that cites
+    (or is bound to) one of its inputs."""
+    ws = Workspace(ctx=None)
+    _ratio(ws, "0.8", "מקדם הדגמה")
+    _verify(ws, "מקדם 0.8 — הפחתה של 20% [V1].")
+    assert [c.value for c in _derived(ws)] == [Decimal("0.2")]
+    (problem,) = _numbers_only(ws, "שיעור הוצאות ייעודי של 20% בלבד.")
+    assert problem.check == "unstated_number" and "20" in problem.unstated
+    assert _numbers_only(_scenario(), "הרווח בתרחיש יהיה 1,530,000 ₪.") == []  # a model-made C# keeps the old behavior

@@ -1353,3 +1353,107 @@ def test_a_measurements_stored_vat_backs_a_claim_only_when_its_own_words_state_i
     ws = _ws(PAIR)
     _measured(ws, "דמי השכירות למ\"ר נקבעו ל-58 ₪ לחודש.", caption="דמי שכירות, ללא מע\"מ", header="")
     assert verify.deterministic(split_units("דמי השכירות הם 58 ₪ ללא מע\"מ [M1]."), ws, "?") == []
+
+
+# --- the server's own facts about a cited source's unit reach the judge and the date check (round 13 U9, KTD10, R13, AE6) ------
+
+VALUATION_LINE = "למועד הקובע 01/03/2023"
+_UNIT_PASSAGE = "סיכום השומה: גישת ההשוואה העניקה שווי של 1,950,000 ₪ לנכס."  # the passage states no valuation date
+
+
+def _valued(date_line: str | None = VALUATION_LINE, link: str | None = None) -> Workspace:
+    """A workspace whose S1 is a passage of an appraisal unit the server dated (``Source.date_line``), without the date in
+    its text."""
+    ws = _ws(_UNIT_PASSAGE)
+    ws.sources["S1"].date_line = date_line
+    ws.sources["S1"].link = link
+    return ws
+
+
+def _recording_supported() -> tuple[ScriptedProvider, list[str]]:
+    seen: list[str] = []
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        seen.append(input)
+        return {"verdicts": [{"index": int(i), "verdict": "supported", "reason": "בדיקה"}
+                             for i in re.findall(r'<unit index="(\d+)"', input)]}
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    return p, seen
+
+
+@pytest.mark.parametrize("written", ["01/03/2023", "1.3.2023", "01.03.2023"])
+def test_a_date_equal_to_the_cited_sources_stated_unit_valuation_date_is_backed(written):
+    ws = _valued()
+    assert _numbers(f"הערכת השווי בשומה נעשתה למועד הקובע {written} [S1].", ws) == []
+
+
+@pytest.mark.parametrize("other", ["02/03/2023", "01/04/2023", "01/03/2022", "03/01/2023"])
+def test_another_date_than_the_units_valuation_date_is_still_unstated(other):
+    ws = _valued()
+    (problem,) = _numbers(f"הערכת השווי בשומה נעשתה למועד הקובע {other} [S1].", ws)
+    assert problem.unstated, other
+
+
+@pytest.mark.parametrize("line", [None, "מועד לא ידוע",
+                                  "מועד לא ידוע (בחלק הזה של המסמך כמה מועדים קובעים שונים: 01/03/2023, 05/06/2024)"])
+def test_a_unit_with_no_stated_valuation_date_backs_no_date(line):
+    ws = _valued(line)
+    assert _numbers("הערכת השווי בשומה נעשתה למועד הקובע 01/03/2023 [S1].", ws)
+
+
+def test_the_valuation_date_of_a_source_the_unit_does_not_cite_backs_nothing():
+    ws = _valued()
+    ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="מסמך אחר", section="סיכום",
+                  location="סעיף 2", kind="context", text="גישת ההשוואה העניקה שווי של 1,950,000 ₪.")
+    assert _numbers("הערכת השווי בשומה נעשתה למועד הקובע 01/03/2023 [S2].", ws)
+
+
+def test_the_date_lines_digits_never_back_another_number_of_the_unit():
+    ws = _valued()
+    problems = _numbers("הנכס בן 3 חדרים ו-1 חניות, והשומה למועד הקובע 01/03/2023 [S1].", ws)
+    assert problems and {"3", "1"} <= set(problems[0].unstated)
+    assert "01/03/2023" not in verify._source_parts(ws, "S1", dated=False)[0]  # the number check reads the record without it
+
+
+def test_the_judge_reads_the_units_valuation_date_as_a_fact_the_server_holds():
+    ws = _valued()
+    head, body, kind = verify._source_parts(ws, "S1")
+    assert VALUATION_LINE in head and verify.SERVER_HELD in head and kind == "context"
+    assert VALUATION_LINE not in body  # the passage's own text is untouched
+
+
+def test_a_sentence_naming_the_units_valuation_date_is_kept_and_the_judge_input_holds_the_server_date_line():
+    ws = _valued()
+    judge, seen = _recording_supported()
+    a = _answer("הערכת השווי בשומה נעשתה למועד הקובע 01.03.2023 [S1].")
+    r = verify_answer(judge, a, ws, "?", [])
+    assert r.ok and not r.removed_units(), [p.reason for p in r.problems]
+    assert VALUATION_LINE in seen[0] and verify.SERVER_HELD in seen[0]
+    assert r.apply(a).answer_markdown == a.answer_markdown
+
+
+def test_the_link_phrase_is_rendered_as_server_held_text_too():
+    ws = _valued(link="שומה של אותו נכס: חלקה 8401/40 משותפת")
+    head = verify._source_parts(ws, "S1")[0]
+    assert "שומה של אותו נכס: חלקה 8401/40 משותפת" in head and head.count(verify.SERVER_HELD) == 2
+    assert "שומה של אותו נכס" not in verify._source_parts(ws, "S1", dated=False)[0]
+
+
+def test_the_judge_policy_names_the_server_held_line_and_the_derived_computation():
+    assert verify.SERVER_HELD in verify.JUDGE_POLICY and "derived" in verify.JUDGE_POLICY
+
+
+# --- the judge contract is version 8: a verdict of an older contract is not reused (round 13 U9, KTD19) --------------------
+
+def test_a_verdict_cached_under_judge_contract_7_misses_under_8(monkeypatch):
+    assert verify.JUDGE_VERSION == 8
+    ws, a, cache = _valued(), _answer("הנכס פנוי [S1]."), verify.VerdictCache()
+    judge, seen = _recording_supported()
+    monkeypatch.setattr(verify, "JUDGE_VERSION", 7)
+    verify_answer(judge, a, ws, "?", [], cache=cache)
+    assert verify_answer(judge, a, ws, "?", [], cache=cache).reused == 1
+    monkeypatch.setattr(verify, "JUDGE_VERSION", 8)
+    assert verify_answer(judge, a, ws, "?", [], cache=cache).reused == 0
+    assert verify_answer(judge, a, ws, "?", [], cache=cache).reused == 1
