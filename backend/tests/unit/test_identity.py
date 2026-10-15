@@ -16,12 +16,15 @@ import pytest
 
 from app.chat import contexts
 from app.chat import identity as I  # noqa: E741 - the module is short-named like `dates` and `units`
+from app.chat import property as P
 from app.chat.units import Unit
 from app.config import get_settings
 from app.extraction.docx import extract_docx
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "round12"
 MANIFEST = json.loads((FIXTURES / "manifest.json").read_text(encoding="utf-8"))["documents"]
+FIXTURES_13 = Path(__file__).resolve().parents[1] / "fixtures" / "round13"
+MANIFEST_13 = json.loads((FIXTURES_13 / "manifest.json").read_text(encoding="utf-8"))["documents"]
 
 
 def block(i: int, text: str, kind: str = "paragraph", path: tuple = (), page: int | None = None):
@@ -415,3 +418,160 @@ def test_a_block_is_carried_to_the_parcel_line_below_it_but_not_across_a_gap():
     assert ids[1].parcels == {("8501", "7", None)}
     far = blocks_of("גוש: 8501", "א", "ב", "ג", "ד", "חלקה: 7")
     assert read(far)[1][1].parcels == frozenset()
+
+
+# --- round 13 U7: party blocks never supply identity facts (R11, KTD8; AE8) -----------------------------------------------
+
+SUBJECT = ["שומת מקרקעין — רחוב הרקפת 18, עיר-סינתטית", "עיר: עיר-סינתטית", "כתובת הנכס: הרקפת 18",
+           "גוש: 9106 חלקה: 44"]
+OFFICE_ROWS = ["שם המומחה: דנה סינתטית-בדוי", "מספר רישיון: 76543", "כתובת: הנחושת 3, עיר-סינתטית-ב"]
+
+
+def _subject_only(ids) -> None:
+    """The identity of the subject and nothing of the office: one address, one city, no conflict (AE8)."""
+    got = ids[1]
+    assert got.addresses == {addr("הרקפת", "18")} and got.parcels == {("9106", "44", None)}
+    assert got.cities == {"עיר-סינתטית"} and not got.city_conflict and got.link_city == "עיר-סינתטית"
+
+
+def test_a_declaration_block_naming_the_expert_gives_no_office_address_or_city():
+    declaration = "\n".join(OFFICE_ROWS + ["אני החתומה מטה מצהירה כי אין לי עניין אישי בנכס."])
+    facts, ids = read(blocks_of(*SUBJECT, "השמאי בחן נתוני שוק.", declaration))
+    _subject_only(ids)
+    assert not [f for f in facts if f.block_index >= 4]
+
+
+def test_the_same_declaration_in_a_two_column_table_gives_no_fact():
+    table = block(5, "\n".join(f"{a} | {b}" for a, b in (("מספר רישיון", "76543"), ("שם המומחה", "דנה סינתטית-בדוי"),
+                                                          ("כתובת", "הנחושת 3, עיר-סינתטית-ב"), ("עיר", "עיר-סינתטית-ב"))),
+                  "table")
+    blocks = [*blocks_of(*SUBJECT, "השמאי בחן נתוני שוק."), table]
+    facts, ids = read(blocks)
+    _subject_only(ids)
+    assert not [f for f in facts if f.block_index == 5]
+
+
+def test_a_subject_address_line_in_a_block_that_also_names_the_appraiser_is_still_read():
+    mixed = "שם השמאי: דנה סינתטית-בדוי\nמספר רישיון: 76543\nכתובת הנכס: הרקפת 18\nעיר: עיר-סינתטית"
+    _, ids = read(blocks_of("שומת מקרקעין", mixed))
+    assert ids[1].addresses == {addr("הרקפת", "18")} and ids[1].cities == {"עיר-סינתטית"}
+
+
+def test_a_cover_table_with_an_appraiser_row_above_the_block_and_parcel_row_keeps_the_subject_address():
+    cover = block(1, "מספר תיק | 2024-0183\nשם השמאי | דנה סינתטית-בדוי\nגוש וחלקה | גוש 9109 חלקה 17\n"
+                     "כתובת | הנורית 6\nעיר | עיר-סינתטית", "table")
+    _, ids = read([block(0, "חוות דעת שמאית — דירת מגורים"), cover])
+    assert ids[1].addresses == {addr("הנורית", "6")} and ids[1].parcels == {("9109", "17", None)}
+    assert ids[1].cities == {"עיר-סינתטית"}
+
+
+def test_a_party_row_followed_by_a_bare_address_and_no_subject_label_gives_nothing():
+    cover = block(1, "שם השמאי | דנה סינתטית-בדוי\nכתובת | הנחושת 3\nעיר | עיר-סינתטית-ב", "table")
+    facts, _ = read([block(0, "חוות דעת שמאית"), cover])
+    assert facts == []
+
+
+def test_a_bare_address_directly_under_the_expert_name_and_licence_rows_gives_no_fact():
+    facts, ids = read(blocks_of("חוות דעת שמאית", "שם המומחה: דנה סינתטית-בדוי\nמס' רשיון: 76543\nכתובת: הנחושת 3, עיר-סינתטית-ב"))
+    assert facts == [] and not ids[1].identified
+
+
+@pytest.mark.parametrize("label", ["טלפון", "נייד", "פקס", "דוא\"ל", "אימייל", "משרד", "שם השמאי", "מס׳ רישיון"])
+def test_every_party_label_guards_a_following_bare_address_and_city(label):
+    block_ = f"{label}: 050-0000000\nכתובת: הנחושת 3\nעיר: עיר-סינתטית-ב"
+    facts, _ = read(blocks_of("חוות דעת שמאית", block_))
+    assert facts == []
+
+
+def test_a_bare_address_or_city_outside_a_party_group_is_read_as_before():
+    _, ids = read(blocks_of("חוות דעת שמאית", "כתובת: הרקפת 18\nעיר: עיר-סינתטית"))
+    assert ids[1].addresses == {addr("הרקפת", "18")} and ids[1].cities == {"עיר-סינתטית"}
+
+
+def test_the_guard_is_scoped_to_its_block_a_bare_address_in_the_next_block_is_read():
+    _, ids = read(blocks_of("חוות דעת שמאית", "שם השמאי: דנה סינתטית-בדוי", "כתובת: הרקפת 18"))
+    assert ids[1].addresses == {addr("הרקפת", "18")}
+
+
+def test_a_parcel_row_between_the_party_row_and_the_address_row_ends_the_guard():
+    _, ids = read(blocks_of("חוות דעת שמאית", "שם השמאי: דנה סינתטית-בדוי\nגוש: 9109 חלקה: 17\nכתובת: הנורית 6"))
+    assert ids[1].addresses == {addr("הנורית", "6")} and ids[1].parcels == {("9109", "17", None)}
+
+
+def test_a_heading_of_the_appraisers_details_closes_its_section_until_the_next_heading():
+    blocks = [block(0, "חוות דעת שמאית"), block(1, "פרטי השמאי", "heading"),
+              block(2, "עיר: עיר-סינתטית-ב"), block(3, "כתובת הנכס: הנחושת 3"), block(4, "גוש: 9199 חלקה: 1"),
+              block(5, "2. הנכס", "heading"), block(6, "כתובת הנכס: הרקפת 18"), block(7, "גוש: 9106 חלקה: 44")]
+    facts, ids = read(blocks)
+    assert {f.block_index for f in facts} == {6, 7}
+    assert ids[1].addresses == {addr("הרקפת", "18")} and ids[1].cities == frozenset()
+
+
+@pytest.mark.parametrize("heading", ["3. הצהרת השמאי", "הצהרת המומחה", "הצהרה", "פרטי המומחה", "פרטי המזמין", "פרטי הלקוח",
+                                     "פרטי משרד השמאי", "חתימה", "חתימת השמאי", "פרטי השמאית"])
+def test_every_party_heading_closes_its_section(heading):
+    assert I._section_of(heading) == "party"
+    facts, _ = read([block(0, "חוות דעת שמאית"), block(1, heading, "heading"), block(2, "עיר: עיר-סינתטית-ב")])
+    assert facts == []
+
+
+def test_a_heading_like_paragraph_of_the_declaration_closes_the_section_too():
+    facts, _ = read(blocks_of("חוות דעת שמאית", "הצהרת השמאי", "עיר: עיר-סינתטית-ב", "כתובת הנכס: הנחושת 3"))
+    assert facts == []
+
+
+def test_a_party_ancestor_in_the_section_path_closes_a_block_below_a_sub_heading():
+    blocks = [block(0, "חוות דעת שמאית"),
+              block(1, "עיר: עיר-סינתטית-ב", path=("3. הצהרת השמאי", "3.1 משרד")),
+              block(2, "עיר: עיר-סינתטית", path=("2. הנכס",))]
+    facts, _ = read(blocks)
+    assert [f.block_index for f in facts] == [2]
+
+
+def test_the_identification_and_unrelated_headings_are_not_party_headings():
+    for heading in ("זיהוי הנכס", "פרטי הנכס", "מטרת השומה", "2. שיקולי השמאי", "מקדם המשרד", "תיאור הנכס"):
+        assert I._section_of(heading) != "party", heading
+
+
+def test_the_identity_version_is_v2():
+    assert I.IDENTITY_VERSION == "identity-v2"
+
+
+@pytest.mark.parametrize("name", ["appraiser_office", "appraiser_office_table"])
+def test_the_round_13_declaration_fixtures_keep_the_subject_and_name_one_address(name):
+    spec = MANIFEST_13[name]
+    identity = spec["identity"]
+    path = FIXTURES_13 / spec["file"].split("/", 1)[1]
+    got_blocks = extract_docx(path.read_bytes(), time.monotonic() + 60, get_settings()).blocks
+    blocks = [block(b.index, b.text, b.kind, tuple(b.section_path), b.page) for b in got_blocks]
+    facts, ids = read(blocks)
+    got = ids[1]
+    assert got.addresses == {addr(identity["street"], identity["number"])}
+    assert got.parcels == {(identity["block"], p, identity["sub_parcel"]) for p in identity["parcels"]}
+    assert got.cities == {identity["city"]} and not got.city_conflict and got.link_city == identity["city"]
+    # nothing of the declaration: the office street, its city, the expert's name and licence
+    written = " ".join(f.written for f in facts)
+    assert "הנחושת" not in written and "עיר-סינתטית-ב" not in written
+    assert "76543" not in written and "דנה" not in written
+    street, number = addr(identity["street"], identity["number"])   # the label names the cored street (no article)
+    label = P.label_of([P.Node("doc", "v", 1, got)])
+    assert label == f"{street} {number}, {identity['city']}" and label.count(",") == 1 and "·" not in label
+
+
+def test_the_manifest_round_13_declaration_blocks_read_as_the_fixture_does():
+    """The manifest's own paragraphs, tables and unit blocks rebuilt as blocks (no document reading): the same identity."""
+    for name in ("appraiser_office", "appraiser_office_table"):
+        spec = MANIFEST_13[name]
+        # table rows arrive one block per row in `unit_blocks` ("|label | value"): a run of rows is one table block
+        merged: list = []
+        for line in spec["unit_blocks"]:
+            if line.startswith("|") and merged and merged[-1].kind == "table" and merged[-1].text:
+                merged[-1].text += "\n" + line.removeprefix("|").strip()
+            elif line.startswith("|"):
+                merged.append(block(len(merged), line.removeprefix("|").strip(), "table"))
+            else:
+                merged.append(block(len(merged), line))
+        identity = spec["identity"]
+        _, ids = read(merged)
+        assert ids[1].addresses == {addr(identity["street"], identity["number"])}, name
+        assert ids[1].cities == {identity["city"]} and not ids[1].city_conflict, name

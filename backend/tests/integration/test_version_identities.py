@@ -128,13 +128,31 @@ def test_many_versions_are_read_in_one_call_and_an_unknown_one_is_left_out(offic
 def test_a_new_identity_version_derives_again_and_a_current_one_never_does(office, monkeypatch):
     _, ver = single(office, [HEADER, *IDENT])
     read(office, ver)
-    monkeypatch.setattr(I, "IDENTITY_VERSION", "identity-v2")
+    monkeypatch.setattr(I, "IDENTITY_VERSION", "identity-v3")
     assert read(office, ver)[UUID(ver)][1].parcels == {("8201", "11", None)}
-    assert sorted({r.identity_version for r in rows(office, ver)}) == ["identity-v1", "identity-v2"]   # the old rows stay
+    assert sorted({r.identity_version for r in rows(office, ver)}) == ["identity-v2", "identity-v3"]   # the old rows stay
     with tenant_tx(office.system) as conn:
         again = inserts(conn)
         I.identities(conn, [ver])
         assert again == []
+
+
+def test_v1_rows_stay_in_place_and_the_first_read_derives_v2_rows_beside_them(office):
+    """Round 13 U7, KTD8, R22: the party-block reader is a new identity version; the v1 rows of a version are neither read
+    nor deleted, and the first read derives the v2 rows (with no party fact) beside them."""
+    doc, ver = single(office, [HEADER, *IDENT, "שם המומחה: דנה סינתטית-בדוי\nמספר רישיון: 76543\nכתובת: הנחושת 3, עיר-סינתטית-ב"])
+    assert I.IDENTITY_VERSION == "identity-v2"
+    with tenant_tx(office.system) as conn:   # a v1 record as the previous reader stored it: it read the office address
+        conn.execute(text(
+            "INSERT INTO version_identities (office_id, document_id, version_id, identity_version, block_index, kind,"
+            " street, number, written, section) VALUES (app_office(), :d, :v, 'identity-v1', 4, 'address', 'נחושת', '3',"
+            " 'רחוב הנחושת 3', 'label')"), {"d": UUID(str(doc)), "v": UUID(ver)})
+    got = read(office, ver)[UUID(ver)][1]
+    assert got.addresses == {addr("הדולב", "7")} and got.cities == {"עיר-סינתטית"} and not got.city_conflict
+    stored = rows(office, ver)
+    assert {r.identity_version for r in stored} == {"identity-v1", "identity-v2"}
+    assert [r.street for r in stored if r.identity_version == "identity-v1"] == ["נחושת"]   # the old row is untouched
+    assert not [r for r in stored if r.identity_version == "identity-v2" and r.street == "נחושת"]
 
 
 def test_a_professional_kind_version_derives_nothing_and_stores_nothing(office):

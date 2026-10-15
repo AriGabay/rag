@@ -15,10 +15,18 @@ city. It is never inferred from a comparable, an index, a neighbour or a title t
 3. *labelled lines and cells* anywhere else (`label: value`: גוש, חלקה, תת חלקה, דירה, כתובת, עיר, ישוב/יישוב), and the
    cells of a key-value table or of a one-row table whose header names the labels.
 
-It never reads a comparables or appendix section (by its heading or any ancestor in the section path), a table with
+It never reads a comparables or appendix section (by its heading or any ancestor in the section path), a *party* section
+(round 13 U7, KTD8: the declaration, the signature and the expert's, appraiser's, client's or office's details, closed by
+its heading or any ancestor like an appendix), a table with
 several data rows (a comparables table, a cover or an index table), a sentence about an adjacent property ("גובלת",
 "סמוכה", "שכנה"), or a bare slash pair. A fact is stored per *block*; its owner is found at read time (below), so a
 re-derivation of the units needs no rewrite and `document_units.identifiers` and `UNITS_VERSION` stay untouched.
+
+**Party blocks** (round 13 U7, R11, KTD8). The appraiser's office is not the property: its bare "כתובת" and "עיר" rows
+must never become the subject's address or a second city. Besides the party heading class, a bare address or city row is
+skipped when the nearest preceding label row of its text block or table is a party label (the expert's or appraiser's
+name, licence, phone, fax, e-mail, office) and no subject, parcel or apartment label stands between them; a subject address
+label ("כתובת הנכס" and variants) is never skipped, and a bare row outside such a group is read as before.
 
 **Parcels** expand lists and ranges ("חלקות 24, 40, 42-44", "ו-" joiners; at most `MAX_PARCELS` per statement) and
 pair each parcel with the nearest block before it in the statement, or in the last few blocks. A sub-parcel written in the
@@ -80,7 +88,7 @@ from app.professional.sections import flight, landed
 
 logger = logging.getLogger(__name__)
 
-IDENTITY_VERSION = "identity-v1"
+IDENTITY_VERSION = "identity-v2"   # v2 (round 13 U7, KTD8): party blocks give no fact; v1 rows stay, never read
 
 PARCEL, ADDRESS, CITY, APARTMENT, MARKER = "parcel", "address", "city", "apartment", "marker"
 TITLE, IDENTIFICATION, LABEL, TABLE = "title", "identification", "label", "table"
@@ -101,6 +109,20 @@ EXCLUDED_HEADINGS = (*unit_store.APPENDIX_WORDS, *unit_store.COMPARABLES_WORDS, 
 CITY_LABELS = frozenset({"עיר", "ישוב", "יישוב", "עיר ישוב", "ישוב עיר", "עיר יישוב"})
 ADDRESS_LABELS = frozenset({"כתובת", "הכתובת", "כתובת הנכס", "כתובת הנכס הנדון", "כתובת הנכס נשוא השומה", "מען",
                             "מען הנכס", "רחוב"})
+# headings that open a party section (round 13 U7, KTD8): the declaration, the signature and the expert's, appraiser's,
+# client's or office's details; a section closed like an appendix (`startswith`, so "פרטי הנכס" is not one of them)
+PARTY_HEADINGS = ("הצהרת", "הצהרה", "חתימת", "חתימה", "פרטי השמאי", "פרטי השמאית", "פרטי המומחה", "פרטי המומחית",
+                  "פרטי המעריך", "פרטי המזמין", "פרטי הלקוח", "פרטי מזמין", "פרטי משרד", "פרטי המשרד", "פרטי הקשר")
+# labels of a party row (quotes and apostrophes dropped, hyphens and slashes read as spaces): who signs, their licence,
+# how to reach them and where their office is. A bare address or city row after one of them is the party's, not the subject's
+PARTY_LABELS = frozenset({
+    "שם המומחה", "שם המומחית", "שם השמאי", "שם השמאית", "שם המעריך", "שם משרד", "שם המשרד", "משרד", "המשרד",
+    "המומחה", "השמאי", "שם המזמין", "שם הלקוח", "המזמין", "הלקוח",
+    "מס רשיון", "מס רישיון", "מספר רשיון", "מספר רישיון", "רשיון", "רישיון", "מספר רשיון שמאי", "מספר רישיון שמאי",
+    "מס רשיון שמאי", "מס רישיון שמאי", "טלפון", "טל", "נייד", "פלאפון", "טלפון נייד", "פקס", "דואל", "אימייל", "אי מייל",
+    "מייל", "כתובת המשרד", "כתובת משרד", "כתובת השמאי", "כתובת המומחה", "מען המשרד"})
+# the address labels that name the subject itself; one is never skipped by the party guard
+SUBJECT_ADDRESS_LABELS = frozenset(lab for lab in ADDRESS_LABELS if "הנכס" in lab)
 # header cells a one-row identification table may carry besides the labels; a price, an area or a date column makes the
 # table a list of transactions
 NEUTRAL_HEADERS = frozenset({"מס", "מספר", "סוג נכס", "סוג", "שכונה", "ייעוד", "יעוד"})
@@ -242,13 +264,22 @@ def _label_kind(raw: str) -> str | None:
     return None
 
 
+def _party_label(raw: str) -> bool:
+    """Whether a label names the party (the expert, the appraiser, the client, their office or how to reach them), not the
+    property (round 13 U7, KTD8). Quotes and apostrophes are dropped, so "דוא"ל", "דוא״ל" and "מס' רשיון" all match."""
+    return " ".join(re.sub(r"[\"'״׳`]", "", _label_of(raw)).split()) in PARTY_LABELS
+
+
 def _section_of(raw: str) -> str | None:
-    """Whether a heading opens an identification section (`identification`), closes the reading (`excluded`), or neither."""
+    """Whether a heading opens an identification section (`identification`), closes the reading (`excluded` for an appendix
+    or comparables part, `party` for the declaration, the signature and a party's details: round 13 U7), or neither."""
     head = " ".join(_canon(_SECTION_NUMBER.sub("", _light(raw))).replace("׳", "'").split())
     if not head:
         return None
     if any(w in head for w in EXCLUDED_HEADINGS) and len(head.split()) <= 8:
         return "excluded"
+    if any(head.startswith(_canon(w)) for w in PARTY_HEADINGS) and len(head.split()) <= 8:
+        return "party"
     if any(head.startswith(_canon(w)) for w in IDENTIFICATION_HEADINGS):
         return "identification"
     return None
@@ -343,9 +374,23 @@ class _Reader:
         self._last_parcel: tuple[int, int] | None = None   # (index in facts, row index) of the last single parcel
         self.row: _Row | None = None
         self.section = LABEL
+        self._party = False    # a party label row stands above in this block or table, and no subject label since
+
+    def begin(self, row: _Row, section: str) -> None:
+        """Start a text block or table: the party guard looks at the rows of its own block or table only."""
+        self.row, self.section, self._party = row, section, False
+
+    def _track(self, label: str, kind: str | None) -> None:
+        """The party guard's state after a label row (round 13 U7, KTD8): a party label raises it; a subject address, a
+        parcel or an apartment label lowers it; a bare address or city label and any other label leave it."""
+        if _party_label(label):
+            self._party = True
+        elif kind in (PARCEL, APARTMENT) or (kind == ADDRESS and _label_of(label) in SUBJECT_ADDRESS_LABELS):
+            self._party = False
 
     def reset(self) -> None:
         self._block = self._last_parcel = None
+        self._party = False
 
     def add(self, **kw) -> int | None:
         row = self.row
@@ -439,6 +484,10 @@ class _Reader:
     # one labelled pair (a line "label: value" or a table cell under a header)
 
     def pair(self, kind: str, label: str, value: str) -> None:
+        """One labelled pair. A bare address or city row under a party label (and no subject label since) is the party's
+        office, not the property (round 13 U7, KTD8): it gives no fact; a subject address label is never skipped."""
+        if self._party and (kind == CITY or (kind == ADDRESS and _label_of(label) not in SUBJECT_ADDRESS_LABELS)):
+            return
         if kind == CITY:
             self.city(value)
         elif kind == ADDRESS:
@@ -462,15 +511,19 @@ class _Reader:
         """One line of a text block: a labelled field, a parcel line, and in a title run or an identification section any
         free statement."""
         if (a := _APARTMENT_LINE.match(_light(line))) is not None:
+            self._party = False   # an apartment line is a subject label
             self.apartment(a.group(1))
             return
         lab = _LABELLED.match(_light(line))
         kind = _label_kind(lab.group("label")) if lab else None
+        if lab:
+            self._track(lab.group("label"), kind)
         if kind is not None:
             self.pair(kind, lab.group("label"), lab.group("value"))
         elif _PARCEL_START.match(_light(line)):
+            self._party = False   # a block and parcel statement is a subject row
             self.parcels(line)
-        if free and kind is None:
+        if free and kind is None and not (lab and _party_label(lab.group("label"))):
             for sentence in _SENTENCE.split(_light(line)):
                 if _ADJACENT.search(sentence):
                     continue
@@ -484,7 +537,9 @@ class _Reader:
         lines = [[c.strip() for c in ln.split("|")] for ln in raw.split("\n") if ln.strip()]
         if lines and all(len(ln) == 2 for ln in lines):
             for label, value in lines:
-                if (kind := _label_kind(label)) is not None and value:
+                kind = _label_kind(label)
+                self._track(label, kind)
+                if kind is not None and value:
                     self.pair(kind, label, value)
         elif (len(lines) == 2 and len(lines[0]) >= 2 and len(lines[0]) == len(lines[1])
               and all(_label_kind(c) or _label_of(c) in NEUTRAL_HEADERS for c in lines[0] if c)
@@ -529,15 +584,14 @@ def derive(blocks: Iterable, units: Sequence = ()) -> list[Fact]:
             opened = _section_of(row.text)
             if opened is not None or row.kind == "heading":
                 state = opened
-        excluded = state == "excluded" or any(_section_of(p) == "excluded" for p in row.path)
-        if excluded:
+        classes = {_section_of(p) for p in row.path}
+        if state in ("excluded", "party") or classes & {"excluded", "party"}:
             continue
         in_run = row.index in runs
         if heading and not in_run:
             continue
-        identification = state == "identification" or any(_section_of(p) == "identification" for p in row.path)
-        reader.row = row
-        reader.section = TITLE if in_run else IDENTIFICATION if identification else LABEL
+        identification = state == "identification" or "identification" in classes
+        reader.begin(row, TITLE if in_run else IDENTIFICATION if identification else LABEL)
         if row.kind == "table":
             reader.section = TABLE
             reader.table(_light(row.text))
