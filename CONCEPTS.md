@@ -38,7 +38,11 @@ How a conversation orders data that changes over time. With the switch "העדף
 
 ### Datum date
 
-The date a datum refers to: the valuation date of the appraisal whose own conclusion it is, a date stated in the datum's own row, cell or sentence, or a range stated by its table. A report's writing date, the upload date and the processing date never date a datum. A date the sources do not give stays unknown, and a forecast is never treated as measured. Only data of the same property, metric, unit, periodicity, area basis, VAT basis and scenario form one timeline.
+The date a datum refers to: the valuation date of the appraisal whose own conclusion it is, a date stated in the datum's own row, cell or sentence, or a range stated by its table. A report's writing date, the upload date and the processing date never date a datum. A date the sources do not give stays unknown, and a forecast is never treated as measured. Only data of one datum identity form one timeline.
+
+### Datum identity
+
+What makes two values the same datum: the property and the appraisal unit, the metric, the unit after normalization, the periodicity, the area basis, the VAT basis, the scenario, and the facet. The facet is the component, consideration or cash flow the source states for the value: its table row or column, its own sentence, or failing those its lead-in or heading. A label the assistant wrote is never a facet. Two values are the same datum, different data, or undecided. Different components of one appraisal are shown side by side, not as competing values. A conflict is two values of the same datum that disagree for overlapping periods. When the facet cannot be read, the comparison stays undecided and is never called a conflict.
 
 ### Property identity
 
