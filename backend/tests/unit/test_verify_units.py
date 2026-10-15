@@ -1646,3 +1646,45 @@ def test_a_professional_source_or_one_with_no_place_is_never_stamped_with_a_valu
     assert stamp_valuation(ws, None, src).date_line is None  # no connection is needed to decide it is not an appraisal
     src.source_kind, src.block_start = "appraisal", None
     assert stamp_valuation(ws, None, src).date_line is None
+
+
+# --- a percentage of a fraction the source states (round 13) -------------------------------------------------
+
+WEIGHTS = "גישה א | 300,000 | 0.80 | 240,000\nגישה ב | 200,000 | 0.20 | 40,000"
+
+
+@pytest.mark.parametrize("shown,fraction", [("80%", "0.80"), ("7.25%", "0.0725"), ("100%", "1.00"), ("20%", "0.20")])
+def test_a_percentage_of_a_fraction_the_cited_source_states_is_not_an_unstated_number(shown, fraction):
+    ws = _ws(f"גישה א | {fraction}")
+    assert _numbers(f"משקל של {shown} [S1].", ws) == []
+
+
+def test_the_weights_of_a_table_written_as_percentages_are_not_unstated():
+    ws = _ws(WEIGHTS)
+    assert _numbers("גישה א קיבלה משקל של **80%** וגישה ב משקל של **20%** [S1].", ws) == []
+
+
+def test_a_percentage_whose_fraction_the_source_does_not_state_is_still_unstated():
+    (problem,) = _numbers("משקל של 80% [S1].", _ws("גישה א | 0.75"))
+    assert "80" in problem.unstated
+
+
+def test_a_number_without_a_percent_sign_is_not_converted_to_a_fraction():
+    (problem,) = _numbers("משקל של 80 [S1].", _ws("גישה א | 0.80"))
+    assert "80" in problem.unstated
+
+
+def test_a_fraction_in_the_answer_is_not_read_as_a_percentage_of_the_source():
+    (problem,) = _numbers("משקל של 0.8 [S1].", _ws("גישה א | 80%"))
+    assert "0.8" in problem.unstated
+
+
+def test_the_same_digits_written_without_a_percent_sign_stay_unstated():
+    (problem,) = _numbers("משקל של 80% ושטח של 80 מ\"ר [S1].", _ws("גישה א | 0.80"))
+    assert "80" in problem.unstated
+
+
+def test_a_percentage_of_a_fraction_any_source_of_the_turn_states_backs_a_unit_that_cites_nothing():
+    ws = _ws("גישה א | 0.8")
+    assert _numbers("משקל של 80% בשומה.", ws) == []
+    assert _numbers("משקל של 75% בשומה.", ws)

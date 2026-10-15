@@ -3446,13 +3446,16 @@ def _unknown_ids(u: Unit, ws: Workspace) -> list[str]:
 
 
 def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: set[str],
-              strict: bool = False, stated_by: dict[str, set[str]] | None = None, extra_text: str = "") -> list[str]:
+              strict: bool = False, stated_by: dict[str, set[str]] | None = None, extra_text: str = "",
+              percent_of_fraction: bool = True) -> list[str]:
     """The numbers of a unit that nothing it cites states (for a unit that cites nothing, nothing of the turn —
     unless ``strict``, which holds it to its citations too), that the question does not give and that show no
     result of a calculation it cites (any of the turn's, for a unit citing nothing, unless ``strict``) — and the
     numbers that write a scaled value or result of what it cites with a scale word that is not its scale
     (``_wrong_scale``). ``stated_by``: the numbers each cited id states, kept across one verification's units.
-    ``extra_text``: more text of a cited source (the context a re-read expanded it with), whose numbers it states too."""
+    ``extra_text``: more text of a cited source (the context a re-read expanded it with), whose numbers it states too.
+    ``percent_of_fraction``: whether a percentage counts as stated by the fraction a source states (``_percent_of_fraction``);
+    ``bind_computations`` turns it off, so the percent form of a cited value is still derived and bound as a C#."""
     cited: set[str] = set(numbers_in(extra_text, words=True)) if extra_text else set()
     by_id: dict[str, set[str]] = {}
     for i, t in _texts(ws, u.ids):
@@ -3485,6 +3488,9 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
     if missing:  # a calculation's result shown rounded to the precision and in the scale it is written in
         shown = _computed_numbers(u.text, computations)
         missing = [n for n in missing if n not in shown]
+    if missing and percent_of_fraction:  # a percentage of a fraction the source states (round 13): 80% of a table's 0.80
+        as_fraction = _percent_of_fraction(u.text, pool)
+        missing = [n for n in missing if n not in as_fraction]
     if missing:  # a number of the evidence in another form: a scale word, or a correct rounding marked as one (R14)
         restated = _restated(u.text, pool, {v.value * v.scale for v in values if v.scale != 1})
         missing = [n for n in missing if n not in restated]
@@ -3492,6 +3498,28 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
     # a datum of the property that only the cited standard states, beside evidence that is not one (R34)
     only = _standard_only(u, ws, by_id, question_numbers) if held and any(_professional(ws, i) for i in by_id) else []
     return missing + [n for n in [*wrong, *only] if n not in missing]
+
+
+def _percent_of_fraction(text: str, pool: set[str]) -> set[str]:
+    """The numbers of ``text`` written with a percent sign whose fraction the ``pool`` states: 80% and 7.25% are the
+    0.8 and 0.0725 of a source table that writes a weight as a coefficient (round 13: a percentage of a fraction the
+    source states is the same number, a difference of representation). One direction only — a number with no percent
+    sign is never converted, a fraction in the text is not read as a percentage — and a number the text also writes
+    without a percent sign ("80% ... 80 מ"ר") is not cleared by it."""
+    shown = _shown(text)
+    bare: set[str] = set()
+    for n in shown:
+        if not n.percent:
+            bare |= numbers_in(n.written)
+    out: set[str] = set()
+    for n in shown:
+        amount = n.amount
+        if not n.percent or amount is None:
+            continue
+        fraction = numbers_in(format(amount / 100, "f"))
+        if fraction and fraction <= pool:
+            out |= numbers_in(n.written) - bare
+    return out
 
 
 def _wrong_scale(u: Unit, ws: Workspace, values: list, computations: list) -> list[str]:
@@ -3942,7 +3970,7 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
     for u in units:
         if _unknown_ids(u, ws):
             continue
-        loose = set(_unstated(u, ws, question_numbers, set(), strict=True, stated_by=stated_by))
+        loose = set(_unstated(u, ws, question_numbers, set(), strict=True, stated_by=stated_by, percent_of_fraction=False))
         if not loose:
             continue
         derived = [cid for cid in derive_numbers(u, ws, loose) if cid not in u.ids] if u.ids else []
