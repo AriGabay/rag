@@ -394,3 +394,17 @@ def test_the_answer_documents_include_the_time_coverage_units_and_named_candidat
     assert _answer_documents(base | {"time": {"coverage": record}}) == {"d1", "d2", "d3"}
     assert _answer_documents(base | {"time": {"coverage": None}}) == {"d1"}, "off mode / old answers: no record"
     assert _answer_documents(base | {"time": {"coverage": {"units": [], "candidates": None}}}) == {"d1"}
+
+
+def test_the_answer_documents_include_the_documents_behind_the_components_table_rows():
+    """Round 13 U6 (KTD7): a hidden document behind a breakdown row hides the answer on reload, as for the timeline; an older
+    message without ``breakdown`` still works."""
+    from app.chat.api import _answer_documents
+
+    base = {"sources": [{"id": "S1", "document_id": "d1"}]}
+    row = {"facet": "x", "value_text": "0.8", "unit": None, "sid": "V1", "marks": [],
+           "source": {"document_id": "d4", "title": "t", "location": None}}
+    blocks = [{"label": "l", "as_of": {"date": "2025-03-31"}, "rows": [row, row | {"source": {"document_id": "d5"}}]}]
+    assert _answer_documents(base | {"time": {"breakdown": blocks}}) == {"d1", "d4", "d5"}
+    assert _answer_documents(base | {"time": {"breakdown": []}}) == {"d1"}
+    assert _answer_documents(base | {"time": {"timeline": []}}) == {"d1"}, "an older message has no breakdown"

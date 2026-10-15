@@ -1615,6 +1615,20 @@ button.cut-marker:focus-visible {
   font-size: 12.5px;
 }
 
+/* the components table (round 13 U6) reuses the timeline's table: a facet is the source's own words, so it wraps, never truncates */
+.tl-facet {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.tl-undecided {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
 .tl-kind,
 .tl-title {
   display: inline-block;

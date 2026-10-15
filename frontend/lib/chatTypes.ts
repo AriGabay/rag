@@ -656,8 +656,10 @@ export interface ChatUnitScope {
   file_title: string;
 }
 
-/** What marks a timeline row (round 11 U9); each is shown as a text badge, never by colour alone. */
-export type ChatTimelineMark = "forecast" | "conflict" | "outside_requested" | "uncertain" | "unknown_date";
+/** What marks a timeline row (round 11 U9); each is shown as a text badge, never by colour alone. `undecided` (round 13 U4):
+ * a datum of the same kind whose facet could not be compared with this one's has a different amount in an overlapping
+ * period; neither a conflict nor agreement. The row's `undecided_with` names it. */
+export type ChatTimelineMark = "forecast" | "conflict" | "undecided" | "outside_requested" | "uncertain" | "unknown_date";
 
 export interface ChatTimelineRow {
   /** ISO date at the row's own precision, null when the sources give none. */
@@ -673,12 +675,39 @@ export interface ChatTimelineRow {
   sid: string;
   source: { document_id: string; title: string; location: string | null };
   marks: ChatTimelineMark[];
+  /** With the `undecided` mark: the citation ids (V#/M#) of the values this one could not be compared with. */
+  undecided_with?: string[];
+  /** With the `conflict` mark (round 13 U6): the citation ids of every value this one conflicts with, even one in another
+   * block. Absent when the row is in no conflict. */
+  conflict_with?: string[];
 }
 
 /** One comparable group, its rows already in display order (the server orders them; the screen never re-sorts). */
 export interface ChatTimelineGroup {
   label: string;
   rows: ChatTimelineRow[];
+}
+
+/** One row of the components table (round 13 U6, KTD7): a component of one appraisal at one date. `facet` is the
+ * consideration or cash flow the source gives the value, in its own words, or the server's "רכיב לא צוין במקור". */
+export interface ChatBreakdownRow {
+  facet: string;
+  value_text: string;
+  /** The unit as display text; null when none. */
+  unit: string | null;
+  sid: string;
+  source: { document_id: string; title: string; location: string | null };
+  marks: ChatTimelineMark[];
+  undecided_with?: string[];
+  conflict_with?: string[];
+}
+
+/** The components of one appraisal unit at one date (parallel components, never competing values), rows in server order.
+ * Its rows are in no timeline group. */
+export interface ChatBreakdownBlock {
+  label: string;
+  as_of: Pick<ChatTimelineRow, "date" | "precision" | "end" | "date_kind">;
+  rows: ChatBreakdownRow[];
 }
 
 /** One appraisal unit of a property's inventory in the coverage record (round 12 U7, U8). */
@@ -731,7 +760,9 @@ export interface ChatAnswerTime {
   prefer_recent: boolean;
   requested: { kind: string; start: string | null; end: string | null; precision: string | null; text: string } | null;
   timeline: ChatTimelineGroup[];
-  /** A plain-text copy of the whole timeline, ending with the coverage note when there is one; not in `markdown`, so it
+  /** The components table (round 13 U6, `answer.time.breakdown`); absent on an older answer. */
+  breakdown?: ChatBreakdownBlock[];
+  /** A plain-text copy of the whole timeline and the components table, ending with the coverage note when there is one; not in `markdown`, so it
    * is not shown twice. The copy button appends it. */
   text?: string | null;
   /** The coverage record with its note (round 12 U8); absent on older answers and with no time mode. */

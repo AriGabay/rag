@@ -589,7 +589,8 @@ def test_off_mode_reads_the_named_appraisal_only_orders_chronologically_and_carr
     output = next(c for c in off.tools if c.name == "search").output
     for wording in (T.MSG_PROPERTY_SEARCHED, "כיסוי השומות", LATEST_CHECKED):
         assert wording not in output, wording
-    assert off.answer["time"] == {"mode": "none", "prefer_recent": False, "requested": None, "timeline": [], "text": None}
+    assert off.answer["time"] == {"mode": "none", "prefer_recent": False, "requested": None, "timeline": [], "breakdown": [],
+                                    "text": None}
     on = ask_off([mid], [(mid, amount_of(2023))], answer_with("V1", amount_of(2023), "הגפן 15", vat=True), on=True)
     assert set(first_search_documents(on)) == {old, mid, new} and T.MSG_PROPERTY_SEARCHED in next(
         c for c in on.tools if c.name == "search").output

@@ -96,7 +96,11 @@ def test_every_manifest_pair_is_decided_as_the_manifest_says(pair):
     assert decided == pair["decision"], pair["why"]
     key = frozenset((a.ref, b.ref))
     assert (key in _refs(bucket.conflicts())) is pair["conflict"], pair["why"]
-    assert (key in _refs(bucket.undecided())) is pair["undecided_mark"], pair["why"]
+    # the mark is decided at class level (round 13 U6): a pair the manifest marks undecided carries no mark when any pair across
+    # its two classes is decided different (the relation of the pair itself, asserted above, is unchanged)
+    classes = [bucket.classes[bucket.class_of(d)] for d in (a, b)]
+    marked = pair["undecided_mark"] and bucket.class_relation(*classes) == datum.UNDECIDED
+    assert (key in _refs(bucket.undecided())) is marked, pair["why"]
     # the amounts are compared as the manifest says: a percent against a fraction is the same amount
     assert (a.amount == b.amount) is pair["amounts_equal"], pair["why"]
 
@@ -134,12 +138,14 @@ def test_ae2_the_undecided_mark_names_the_counterpart_and_is_neither_a_conflict_
     earlier = c.o.value(d2, "6", as_of("2022-09-30"), kind="rate", unit="percent",
                         facet=datum.facet("התזרים דמי שכירות משרדים", "sentence", "own"), section="3")
     offices, bare = c.ids["cap.offices"], c.ids["cap.bare"]
+    # round 13 U6 (KTD7): the rates of the appraisal's own date are its components table; the timeline keeps the earlier row
     (block,) = c.o.blocks({offices})
-    rows = {r["sid"]: r for r in block["rows"]}
-    assert set(rows) == {offices, earlier}
+    assert [r["sid"] for r in block["rows"]] == [earlier] and block["rows"][0]["marks"] == []  # 2022 and 2023 do not overlap
+    (table,) = timeline.breakdown(c.ws, {offices})
+    rows = {r["sid"]: r for r in table["rows"]}
+    assert earlier not in rows and offices in rows and bare in rows
     assert rows[offices]["marks"] == ["undecided"] and rows[offices]["undecided_with"] == [bare]
-    assert rows[earlier]["marks"] == [] and "undecided_with" not in rows[earlier]  # 2022 and 2023 do not overlap
-    assert f"{timeline.MARKS['undecided']} ({bare})" in timeline.plain_text([block])
+    assert f"{timeline.MARKS['undecided']} ({bare})" in timeline.plain_text([], [table])
     assert not coverage.conflicting(c.ws)
 
 
@@ -162,8 +168,10 @@ def test_ae3_the_same_consideration_conflicts_across_appraisals_but_the_equal_wr
     expected = _CASES["AE3"]["expected"]
     assert _refs(bucket.conflicts()) == {frozenset(c.sids(*p)) for p in expected["conflicting_pairs"]}
     assert coverage.conflicting(c.ws)
-    (block,) = c.o.blocks(c.sids(*coefs))
-    marks = {r["sid"]: r["marks"] for r in block["rows"]}
+    # round 13 U6 (KTD7): each coefficient sits beside its appraisal's other coefficient at the one date, so its row is in that
+    # appraisal's components block (a row belongs to one block), and the conflict mark is on it there
+    assert c.o.blocks(c.sids(*coefs)) == []
+    marks = {r["sid"]: r["marks"] for b in timeline.breakdown(c.ws, c.sids(*coefs)) for r in b["rows"]}
     assert all("conflict" in marks[c.ids[n]] for n in coefs)
     # the other coefficient of each appraisal (1.1 in all four) is a datum of its own, and 1.1 = 1.1
     locations = [f"conflict_{n}.location" for n in (1, 2, 3, 4)]

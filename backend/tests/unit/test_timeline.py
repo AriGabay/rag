@@ -460,7 +460,7 @@ def test_the_payload_without_a_timeline_has_no_text():
     o = Office(NONE)
     a = o.value(o.doc(), "2,000,000", as_of("2024-01-01"))
     p = timeline.payload(o.ws, {a})
-    assert p == {"mode": "none", "prefer_recent": False, "requested": None, "timeline": [], "text": None}
+    assert p == {"mode": "none", "prefer_recent": False, "requested": None, "timeline": [], "breakdown": [], "text": None}
 
 
 def test_the_ids_of_the_rows_are_the_values_and_measurements_the_payload_must_carry():
@@ -747,3 +747,175 @@ def test_a_property_graph_that_cannot_be_read_gives_every_datum_no_identity_and_
     for ref in (v1, v2):
         value = ws.values[ref]
         assert timeline.property_key(ws, ref, value.document_id, value.version_id, value.context) is None
+
+
+# --- the components table (round 13 U6: R8, R9, R10, R24; KTD7) -------------------------------------------------------------------
+
+def _unit(o: Office) -> tuple[uuid.UUID, uuid.UUID]:
+    """One appraisal unit: a document and its version, for the coefficients that sit side by side in it."""
+    return o.doc(), uuid.uuid4()
+
+
+def test_ae1_two_parallel_coefficients_are_one_components_block_naming_their_row_labels_and_no_timeline_block():
+    o = Office()
+    doc, ver = _unit(o)
+    a = _coefficient(o, doc, "0.8", as_of("2025-03-31"), "מקדם הפחתה בשל מגבלות בנייה", version=ver)
+    b = _coefficient(o, doc, "0.9", as_of("2025-03-31"), "מקדם הפחתה בשל שיתוף במקרקעין", version=ver)
+    assert o.blocks({a, b}) == []
+    (block,) = timeline.breakdown(o.ws, {a})  # one cited coefficient brings its parallel component with it
+    assert [r["sid"] for r in block["rows"]] == [a, b]
+    assert [r["facet"] for r in block["rows"]] == ["מקדם הפחתה בשל מגבלות בנייה", "מקדם הפחתה בשל שיתוף במקרקעין"]
+    assert [r["value_text"] for r in block["rows"]] == ["0.8", "0.9"]
+    assert all(r["marks"] == [] and r["source"]["title"] and r["source"]["document_id"] for r in block["rows"])
+    assert block["as_of"]["date"] == "2025-03-31" and block["as_of"]["date_kind"] == "valuation" and block["label"]
+    assert not coverage.conflicting(o.ws)
+
+
+def test_one_facet_over_two_dates_is_a_timeline_labelled_with_the_facet_and_no_breakdown():
+    o = Office()
+    facet = "מקדם הפחתה בשל מגבלות בנייה"
+    old = _coefficient(o, o.doc(), "0.8", as_of("2023-03-31"), facet)
+    new = _coefficient(o, o.doc(), "0.85", as_of("2025-03-31"), facet)
+    (g,) = o.blocks({new})
+    assert [r["sid"] for r in g["rows"]] == [new, old] and facet in g["label"]
+    assert timeline.breakdown(o.ws, {new}) == []
+
+
+def test_one_facet_on_two_dates_beside_a_second_facet_on_the_later_date_splits_the_rows_between_the_two_blocks():
+    o = Office()
+    doc, ver = _unit(o)
+    first, second = "מקדם הפחתה בשל מגבלות בנייה", "מקדם הפחתה בשל שיתוף במקרקעין"
+    early = _coefficient(o, doc, "0.8", as_of("2023-03-31"), first, version=ver)
+    late = _coefficient(o, doc, "0.85", as_of("2025-03-31"), first, version=ver)
+    other = _coefficient(o, doc, "0.9", as_of("2025-03-31"), second, version=ver)
+    (comp,) = timeline.breakdown(o.ws, {late})
+    assert [r["sid"] for r in comp["rows"]] == [late, other]
+    (g,) = o.blocks({late})  # the first facet's timeline holds its other row only, and is still shown with one row
+    assert [r["sid"] for r in g["rows"]] == [early] and first in g["label"]
+    assert timeline.row_ids([g]).isdisjoint(timeline.row_ids([comp])), "a row belongs to exactly one block"
+    assert o.blocks({other}) == [], "the second facet has no other row: no timeline block"
+    assert timeline.row_ids(timeline.build(o.ws, {late, other}) + timeline.breakdown(o.ws, {late, other})) == {early, late, other}
+
+
+def test_ae4_rows_of_one_class_show_each_their_own_wording_and_the_label_the_first_rows():
+    o = Office()
+    doc, ver = _unit(o)
+    plural = _coefficient(o, doc, "0.8", as_of("2025-03-31"), 'מקדמי הפחתה לנכס "מושע"', version=ver)
+    singular = _coefficient(o, o.doc(), "0.8", as_of("2024-03-31"), "מקדם הפחתה לנכס מושע")  # same datum, another spelling
+    other = _coefficient(o, doc, "0.9", as_of("2025-03-31"), "מקדם הפחתה בשל מגבלות בנייה", version=ver)
+    (comp,) = timeline.breakdown(o.ws, {plural})
+    assert {r["sid"]: r["facet"] for r in comp["rows"]} == {plural: 'מקדמי הפחתה לנכס "מושע"',
+                                                              other: "מקדם הפחתה בשל מגבלות בנייה"}
+    (g,) = o.blocks({plural})
+    assert [r["sid"] for r in g["rows"]] == [singular]
+    both = timeline.build(o.ws, {singular, plural})  # the same datum on two dates, neither in a components block here
+    assert both and "מקדם הפחתה לנכס מושע" in both[0]["label"]
+
+
+def test_the_label_of_a_class_shows_the_first_rows_written_facet_in_server_order():
+    o = Office()
+    new = _coefficient(o, o.doc(), "0.8", as_of("2025-03-31"), 'מקדמי הפחתה לנכס "מושע"')
+    old = _coefficient(o, o.doc(), "0.8", as_of("2022-03-31"), "מקדם הפחתה לנכס מושע")
+    (g,) = o.blocks({new})
+    assert [r["sid"] for r in g["rows"]] == [new, old]
+    assert 'מקדמי הפחתה לנכס "מושע"' in g["label"] and "מקדם הפחתה לנכס מושע" not in g["label"]
+
+
+def test_a_row_whose_source_states_no_facet_shows_that_it_names_none():
+    o = Office()
+    doc, ver = _unit(o)
+    named = _coefficient(o, doc, "0.8", as_of("2025-03-31"), "מקדם הפחתה בשל מגבלות בנייה", version=ver)
+    bare = _coefficient(o, doc, "0.9", as_of("2025-03-31"), None, version=ver)
+    unread = o.value(doc, "0.95", as_of("2025-03-31"), kind="coefficient", unit="ratio", version=ver,
+                     facet=datum.not_read(), section="3. מקדמים")
+    (comp,) = timeline.breakdown(o.ws, {named})
+    facets = {r["sid"]: r["facet"] for r in comp["rows"]}
+    assert facets[bare] == facets[unread] == timeline.MSG_NO_FACET == "רכיב לא צוין במקור"
+    assert facets[named] == "מקדם הפחתה בשל מגבלות בנייה"
+
+
+def test_an_undecided_pair_in_one_unit_is_a_components_row_with_the_mark_and_its_counterpart():
+    o = Office()
+    doc, ver = _unit(o)
+    a = _coefficient(o, doc, "0.8", as_of("2025-03-31"), "מקדם הפחתה בשל מגבלות בנייה", version=ver)
+    b = _coefficient(o, doc, "0.9", as_of("2025-03-31"), None, version=ver)  # no facet: not comparable with a stated one
+    (comp,) = timeline.breakdown(o.ws, {a})
+    rows = {r["sid"]: r for r in comp["rows"]}
+    assert rows[a]["marks"] == ["undecided"] and rows[a]["undecided_with"] == [b]
+    assert rows[b]["marks"] == ["undecided"] and rows[b]["undecided_with"] == [a]
+    assert timeline.MARKS["undecided"] in timeline.plain_text([], [comp])
+
+
+def test_two_equal_numbers_of_two_facets_stay_two_rows_of_the_breakdown():
+    o = Office()
+    doc, ver = _unit(o)
+    a = _coefficient(o, doc, "0.8", as_of("2025-03-31"), "מקדם הפחתה בשל מגבלות בנייה", version=ver)
+    b = _coefficient(o, doc, "0.8", as_of("2025-03-31"), "מקדם הפחתה בשל שיתוף במקרקעין", version=ver)
+    (comp,) = timeline.breakdown(o.ws, {a})
+    assert [r["sid"] for r in comp["rows"]] == [a, b] and comp["rows"][0]["value_text"] == comp["rows"][1]["value_text"]
+
+
+def test_a_breakdown_nobody_cited_is_not_built_and_the_dates_of_two_units_are_not_mixed():
+    o = Office()
+    d1, v1 = _unit(o)
+    d2, v2 = _unit(o)
+    _coefficient(o, d1, "0.8", as_of("2025-03-31"), "מקדם הפחתה בשל מגבלות בנייה", version=v1)
+    _coefficient(o, d1, "0.9", as_of("2025-03-31"), "מקדם הפחתה בשל שיתוף במקרקעין", version=v1)
+    lone = _coefficient(o, d2, "0.7", as_of("2025-03-31"), "מקדם הפחתה בשל מגבלות בנייה", version=v2)
+    assert timeline.breakdown(o.ws, {lone}) == [] and timeline.breakdown(o.ws, set()) == []
+
+
+def test_plain_text_copies_the_breakdown_after_the_timeline_under_its_heading():
+    o = Office()
+    doc, ver = _unit(o)
+    a = _coefficient(o, doc, "0.8", as_of("2025-03-31"), "מקדם הפחתה בשל מגבלות בנייה", version=ver)
+    b = _coefficient(o, doc, "0.9", as_of("2025-03-31"), "מקדם הפחתה בשל שיתוף במקרקעין", version=ver)
+    p = timeline.payload(o.ws, {a, b})
+    assert p["timeline"] == [] and len(p["breakdown"]) == 1
+    lines = p["text"].splitlines()
+    assert lines[0] == timeline.BREAKDOWN_HEADING == "רכיבי השומה"
+    rows = [ln for ln in lines if ln.startswith("- ")]
+    assert len(rows) == 2 and "מקדם הפחתה בשל מגבלות בנייה" in rows[0] and "0.9" in rows[1] and "31/03/2025" in lines[1]
+    assert timeline.plain_text([], []) == ""
+    both = timeline.plain_text(o.blocks({a}), p["breakdown"])
+    assert both == timeline.plain_text([], p["breakdown"])  # no timeline block: the copy is the breakdown alone
+
+
+def test_ae3_each_conflicting_row_names_its_counterpart_even_in_another_breakdown_block():
+    """Round 13 U6: two appraisals of one property state the same consideration as 0.8 and 0.85 at one date, each beside another
+    coefficient, so each conflicting row is in its own appraisal's components block. The mark names the other row's sid."""
+    o = Office()
+    d1, v1 = _unit(o)
+    d2, v2 = _unit(o)
+    facet, other = "מקדם הפחתה בשל מגבלות בנייה", "מקדם התאמה בשל שיתוף במקרקעין"
+    a1 = _coefficient(o, d1, "0.8", as_of("2025-03-31"), facet, version=v1)
+    b1 = _coefficient(o, d1, "0.9", as_of("2025-03-31"), other, version=v1)
+    a2 = _coefficient(o, d2, "0.85", as_of("2025-03-31"), facet, version=v2)
+    b2 = _coefficient(o, d2, "0.9", as_of("2025-03-31"), other, version=v2)
+    assert o.blocks({a1, a2}) == []
+    blocks = timeline.breakdown(o.ws, {a1, a2})
+    assert [[r["sid"] for r in b["rows"]] for b in blocks] == [[a1, b1], [a2, b2]]
+    rows = {r["sid"]: r for b in blocks for r in b["rows"]}
+    assert "conflict" in rows[a1]["marks"] and rows[a1]["conflict_with"] == [a2]
+    assert "conflict" in rows[a2]["marks"] and rows[a2]["conflict_with"] == [a1]
+    for equal in (b1, b2):  # 0.9 = 0.9: no conflict, and no counterpart key at all
+        assert "conflict" not in rows[equal]["marks"] and "conflict_with" not in rows[equal]
+    # the 0.8 / 0.9 pair across the appraisals is undecided as a pair, but its classes are decided different (a1 against b1, side by
+    # side in one table), so no row carries an undecided mark
+    assert all("undecided" not in r["marks"] and "undecided_with" not in r for r in rows.values())
+    assert timeline.buckets(o.ws, {a1})[0].undecided() == []
+    text = timeline.plain_text([], blocks)
+    assert f"{timeline.MARKS['conflict']} ({a2})" in text and f"{timeline.MARKS['conflict']} ({a1})" in text
+
+
+def test_a_timeline_row_in_a_conflict_names_every_counterpart_and_a_clean_row_names_none():
+    o = Office()
+    a = o.value(o.doc(), "2,000,000", as_of("2025-01-01"))
+    b = o.value(o.doc(), "2,100,000", as_of("2025-01-01"))
+    c = o.value(o.doc(), "2,200,000", as_of("2025-01-01"))
+    old = o.value(o.doc(), "1,900,000", as_of("2022-01-01"))
+    (g,) = o.blocks({a})
+    rows = {r["sid"]: r for r in g["rows"]}
+    assert rows[a]["conflict_with"] == [b, c] and rows[b]["conflict_with"] == [a, c]
+    assert "conflict_with" not in rows[old] and rows[old]["marks"] == []
+    assert f"{timeline.MARKS['conflict']} ({b}, {c})" in timeline.plain_text([g])

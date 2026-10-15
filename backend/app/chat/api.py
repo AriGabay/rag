@@ -314,7 +314,8 @@ def public_removals(items: list) -> list[dict]:
 
 def _answer_documents(answer: dict | None) -> set[str]:
     """Every document an answer draws on or names: its sources, measurements, values and documents, the documents its
-    coverage ledger lists (in scope, checked or not), the documents its time coverage record names (every inventory unit and
+    coverage ledger lists (in scope, checked or not), the documents behind the rows of its components table
+    (``time.breakdown``), the documents its time coverage record names (every inventory unit and
     every named candidate: the note prints their titles and dates), the documents of its focus, and every document the turn's
     tools touched (a claim removed in verification may have quoted one; its text is kept in
     message_diagnostics, whose document ids come from this set), and every document a citation's anchor points at
@@ -330,6 +331,9 @@ def _answer_documents(answer: dict | None) -> set[str]:
     ids |= coverage.ledger_documents(answer.get("ledger"))
     record = (answer.get("time") or {}).get("coverage") or {}  # round 12: units not searched or without a hit are never cited
     ids |= {u.get("document_id") for u in record.get("units") or [] if isinstance(u, dict)}
+    # round 13 U6 (KTD7): the components table's rows name their documents like the timeline's values do, so a hidden one hides the answer
+    ids |= {(r.get("source") or {}).get("document_id") for b in (answer.get("time") or {}).get("breakdown") or []
+            if isinstance(b, dict) for r in b.get("rows") or [] if isinstance(r, dict)}
     ids |= {c.get("document_id") for c in (record.get("candidates") or {}).get("named") or [] if isinstance(c, dict)}
     ids |= set((answer.get("focus") or {}).get("document_ids") or [])
     ids.add((answer.get("unit") or {}).get("document_id"))  # the unit the conversation is in (round 9 U10)
@@ -873,7 +877,8 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
     # round 12 U8 (R12, KTD7): the coverage of the time-ranked calls whose results the answer cites (a V# or M# is read
     # through the passages behind it), else of the turn's calls together; no record in off mode, so no ``coverage`` key
     answer_time = timeline.payload(ws, used, coverage=timeline.coverage_of(ws, used))  # ids that are no V# or M# match no value
-    used |= timeline.row_ids(answer_time["timeline"])
+    # round 13 U6 (KTD7): the components table's rows open their sources the same way
+    used |= timeline.row_ids([*answer_time["timeline"], *answer_time["breakdown"]])
     measurements = [ws.measurements[i].public() for i in ws.measurements if i in used]
     computations = [ws.computations[i].public() for i in ws.computations if i in used]
     values = [ws.values[i].public() for i in ws.values if i in used]

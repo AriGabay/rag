@@ -28,9 +28,18 @@ compares:
 rule, and the ``same`` pairs are joined (union-find) into *classes*; a class is one datum, and every reader takes it as such: the
 timeline blocks, the conflict pairs (``coverage.conflicting_pairs`` inside a class only), ``_dedupe``, the ``alone`` shortcut,
 ``later_than`` and ``coverage.conflicting``. Between two classes of one base key, a pair that is ``undecided`` whose amounts
-differ and whose periods overlap is marked ``undecided`` on both rows, each naming the other (``undecided_with``). The unit is
+differ and whose periods overlap is marked ``undecided`` on both rows, each naming the other (``undecided_with``), unless the two
+classes are decided different by any other pair across them (the class relation, as for recency). The unit is
 normalized (a percent and a ratio of a coefficient or a proportion are one unit) and the amounts are compared in one canonical
 form (``datum.canonical_amount``).
+
+**The components table** (round 13 U6, KTD7, R8-R10): ``answer.time.breakdown`` holds one block for every appraisal unit and date
+where two or more classes of one base key meet (their pairs are ``different`` or ``undecided``, never ``same``): parallel
+components of one appraisal at one date, each row with its own written facet. A row belongs to exactly one block: the rows of a
+unit and a date that has a components block are only there, and a class's timeline block holds its other dated rows (it is still
+shown with a single one). A timeline label names the facet of the class's first row in server order; a row whose source states no
+facet shows ``MSG_NO_FACET``. A row marked ``conflict`` names the datum it conflicts with (``conflict_with``, the sids of every
+conflict pair it is in, read from its class), as ``undecided`` does: the counterpart may be a row of another block.
 
 **Rows** are ordered by the turn's time mode with the ordering of ``tools.time_key`` (KTD6): ``recent`` — dated values not
 later than the anchor and not forecast, newest first, then the later or forecast ones, then the unknown; ``explicit`` —
@@ -80,6 +89,8 @@ from app.platform.dates import shown_period
 logger = logging.getLogger(__name__)
 
 HEADING = "ציר זמן"
+BREAKDOWN_HEADING = "רכיבי השומה"  # not "רכיבי הבקשה": that is the request's components (KTD7)
+MSG_NO_FACET = "רכיב לא צוין במקור"
 DATE_KINDS = {"valuation": "מועד קובע", "transaction": "מועד עסקה", "stated": "מועד שצוין", "range": "תקופה"}
 MARKS = {"forecast": "תחזית", "conflict": "סתירה בין מקורות", "undecided": "השוואה לא הוכרעה",
          "outside_requested": "מחוץ לזמן שביקשת", "uncertain": "קריאה לא ודאית", "unknown_date": "מועד לא ידוע"}
@@ -404,15 +415,19 @@ class Bucket:
         return out
 
     def undecided(self) -> list[tuple[Datum, Datum]]:
-        """The pairs of two classes that could not be compared (``undecided``) whose amounts differ and whose periods overlap
-        (the same period rule as a conflict): neither a conflict nor agreement (R6). Decided pair by pair: a pair across two
-        classes is marked even when other pairs of the same classes are decided different."""
+        """The pairs across two classes that could not be compared whose amounts differ and whose periods overlap (the same
+        period rule as a conflict): neither a conflict nor agreement (R6). Decided at class level, as recency is (round 13 U6,
+        KTD4): when any pair across two classes is ``different`` the classes are two components — a member of one is the
+        same datum as its class-mates, which are structurally different from the other class — so none of their members is
+        marked; a pair is marked only when the class relation is ``undecided`` and the pair itself is."""
         from app.chat.coverage import Comparable, clashing
 
         out = []
         for n, a in enumerate(self.members):
             for b in self.members[n + 1:]:
                 if self.class_of(a) == self.class_of(b) or self.pairs[(a.ref, b.ref)] != D.UNDECIDED:
+                    continue
+                if self.class_relation(self.classes[self.class_of(a)], self.classes[self.class_of(b)]) != D.UNDECIDED:
                     continue
                 if clashing(Comparable(None, a.comparable, a.as_of), Comparable(None, b.comparable, b.as_of)):
                     out.append((a, b))
@@ -542,7 +557,9 @@ def _outside(ws: Workspace, d: Datum) -> bool:
     return ws.time.mode == "explicit" and ws.time.requested is not None and d.dated and _order(ws, d)[0] != 0
 
 
-def _row(ws: Workspace, d: Datum, conflicts: set, undecided: dict[str, list[str]] | None = None) -> dict:
+def _row(ws: Workspace, d: Datum, conflicts: dict[str, list[str]], undecided: dict[str, list[str]] | None = None) -> dict:
+    """A timeline row. ``conflicts``: the counterparts' sids of every conflict pair a datum is in; ``undecided``: the same for
+    the pairs that could not be compared."""
     marks = []
     if d.forecast:
         marks.append("forecast")
@@ -563,12 +580,27 @@ def _row(ws: Workspace, d: Datum, conflicts: set, undecided: dict[str, list[str]
            "marks": marks}
     if undecided and d.ref in undecided:
         row["undecided_with"] = list(undecided[d.ref])  # the counterpart's sid (R6): the mark names the other value
+    if conflicts.get(d.ref):
+        row["conflict_with"] = list(conflicts[d.ref])  # the same for a conflict (round 13 U6): a row of another block is named
     return row
 
 
-def _label(members: list[Datum], who: Identity) -> str:
+def _facet_text(d: Datum) -> str:
+    """The facet of a datum as the reader sees it: the source's own words, else that the source states none (status ``none``
+    or ``not_read``: round 13 U6, KTD7). No truncation: a long facet wraps."""
+    f = d.facet or {}
+    return (f.get("written") or MSG_NO_FACET) if f.get("status") == D.STATUS_STATED else MSG_NO_FACET
+
+
+def _label(members: list[Datum], who: Identity, *, with_facet: bool = True) -> str:
+    """The label of a block. The kind is followed by the written facet of the first row (``members`` are in server order;
+    round 13 U6, R9): a coefficient or a rate whose source states none shows ``MSG_NO_FACET``, any other datum names a facet
+    only when it has one. A components block names no facet: each of its rows does."""
     first = members[0]
-    parts = [KIND_LABELS.get(first.kind, first.kind) if first.kind else ""]
+    kind = KIND_LABELS.get(first.kind, first.kind) if first.kind else ""
+    if with_facet and ((first.facet or {}).get("status") == D.STATUS_STATED or D.needs_facet(first.family)):
+        kind = f"{kind}: {_facet_text(first)}" if kind else _facet_text(first)
+    parts = [kind]
     if first.period in ("month", "year"):
         parts.append(PERIOD_LABELS[first.period])
     if first.vat in ("included", "excluded") and first.unit in MONEY_UNITS:
@@ -580,31 +612,95 @@ def _label(members: list[Datum], who: Identity) -> str:
     return f"{what} — {where}" if what and where else what or where
 
 
-def build(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None) -> list[dict]:
-    """The timeline: a ``{"label", "rows"}`` block for every datum class of the ``cited`` ids that holds two or more dated
-    values, or a conflict that involves a value with no date (round 12 U11, KTD13: the mark must be visible), its rows
-    ordered by the turn's time mode and marked (see the module doc). A row is marked ``conflict`` when
-    ``coverage.conflicting_pairs`` pairs it with another row of its class, and ``undecided`` (round 13 U4, R6) when a datum of
-    another class of its base key that could not be compared with it has a different amount in an overlapping period; the
-    row then carries that datum's sid as ``undecided_with``."""
+def _component_row(ws: Workspace, d: Datum, conflicts: dict[str, list[str]], undecided: dict[str, list[str]]) -> dict:
+    """A row of the components table: the facet (its own written words), the value, unit, sid, source and marks; ``undecided_with``
+    names the counterpart of an undecided mark, as in the timeline."""
+    row = _row(ws, d, conflicts, undecided)
+    out = {"facet": _facet_text(d), "value_text": row["value_text"], "unit": row["unit"], "sid": row["sid"],
+           "source": row["source"], "marks": row["marks"]}
+    for key in ("undecided_with", "conflict_with"):
+        if key in row:
+            out[key] = row[key]
+    return out
+
+
+def _block_as_of(d: Datum) -> dict:
+    return {"date": d.as_of["date"], "precision": d.as_of.get("precision"), "end": d.as_of.get("end"),
+            "date_kind": _date_kind(d)}
+
+
+def compose(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None
+            ) -> tuple[list[dict], list[dict]]:
+    """``(timeline, breakdown)`` for the ``cited`` ids: the two blocks that share the rows (round 13 U6, KTD7), so one pass places
+    every row in exactly one of them.
+
+    - **breakdown**: per base key, the rows of one appraisal unit and one date (a class deduped on its own) that come from two or
+      more classes — parallel components, ``different`` or ``undecided`` — in one block, when a cited datum is among them. A block is
+      ``{"label", "as_of", "rows"}``, its rows in the registration order (one date: the server order) with the facet each row
+      states; the blocks follow the turn's time mode, then registration.
+    - **timeline**: a block for every datum class of the cited ids that holds two or more dated values, or a conflict that involves a
+      value with no date (round 12 U11: the mark must be visible), its rows ordered by the turn's time mode and marked (see the
+      module doc). A row is marked ``conflict`` when ``coverage.conflicting_pairs`` pairs it with another row of its class, and
+      ``undecided`` (round 13 U4, R6) when a datum of another class of its base key that could not be compared with it has a
+      different amount in an overlapping period; the row then carries that datum's sid as ``undecided_with``. A class that has rows
+      in a components block shows its other dated rows, even one."""
     from app.chat.coverage import Comparable, conflicting_pairs
 
     identity = identity or identity_of(ws)
-    blocks = []
+    timeline_blocks: list[dict] = []
+    components: list[tuple[tuple, dict]] = []
     for bucket in buckets(ws, cited, identity):
         undecided = bucket.undecided_with()
-        for cls in bucket.classes:
+        classes = [(cls, _dedupe(cls)) for cls in bucket.classes]
+        conflicts: dict[str, list[str]] = {}  # a datum -> the sids it conflicts with (its class's conflict pairs)
+        for _, members in classes:
+            for i, j in conflicting_pairs([Comparable(None, d.comparable, d.as_of) for d in members]):
+                conflicts.setdefault(members[i].ref, []).append(members[j].ref)
+                conflicts.setdefault(members[j].ref, []).append(members[i].ref)
+        # one appraisal unit at one date: the classes that meet there are parallel components
+        at: dict[tuple, list[Datum]] = {}
+        met: dict[tuple, set[int]] = {}
+        for n, (_, members) in enumerate(classes):
+            for d in members:
+                if d.dated:
+                    at.setdefault((d.appraisal, d.date_key()), []).append(d)
+                    met.setdefault((d.appraisal, d.date_key()), set()).add(n)
+        placed: set[str] = set()
+        for key, rows in at.items():
+            if len(met[key]) < 2 or not any(d.ref in cited for d in rows):
+                continue
+            rows = sorted(rows, key=lambda d: d.index)
+            placed |= {d.ref for d in rows}
+            components.append(((_order(ws, rows[0]), rows[0].index), {
+                "label": _label(rows, identity(rows[0]), with_facet=False), "as_of": _block_as_of(rows[0]),
+                "rows": [_component_row(ws, d, conflicts, undecided) for d in rows]}))
+        for cls, members in classes:
             if not any(d.ref in cited for d in cls):
                 continue
-            members = _dedupe(cls)
-            pairs = conflicting_pairs([Comparable(None, d.comparable, d.as_of) for d in members])
-            conflicts = {members[i].ref for pair in pairs for i in pair}
-            if sum(1 for d in members if d.dated) < 2 and not any(not d.dated and d.ref in conflicts for d in members):
+            rest = [d for d in members if d.ref not in placed]
+            dated = sum(1 for d in rest if d.dated)
+            undated_conflict = any(not d.dated and d.ref in conflicts for d in rest)
+            if not ((dated >= 1 and len(rest) < len(members)) or dated >= 2 or undated_conflict):
                 continue
-            ordered = sorted(members, key=lambda d: (_order(ws, d), d.index))
-            blocks.append({"label": _label(ordered, identity(ordered[0])),
-                           "rows": [_row(ws, d, conflicts, undecided) for d in ordered]})
-    return blocks
+            ordered = sorted(rest, key=lambda d: (_order(ws, d), d.index))
+            timeline_blocks.append({"label": _label(ordered, identity(ordered[0])),
+                                    "rows": [_row(ws, d, conflicts, undecided) for d in ordered]})
+    return timeline_blocks, [block for _, block in sorted(components, key=lambda c: c[0])]
+
+
+def build(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None) -> list[dict]:
+    """The timeline: a ``{"label", "rows"}`` block for every datum class of the ``cited`` ids that holds dated values to show
+    (``compose``): two or more, a conflict that involves a value with no date, or one when its class has its other rows in a
+    components block."""
+    return compose(ws, cited, identity)[0]
+
+
+def breakdown(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None) -> list[dict]:
+    """The components table of the answer (``answer.time.breakdown``, round 13 U6, KTD7): a ``{"label", "as_of", "rows"}`` block
+    for every appraisal unit and date where two or more datum classes of one base key meet (``compose``); a row is
+    ``{"facet", "value_text", "unit", "sid", "source", "marks"}`` and, for an undecided or a conflict mark, ``undecided_with`` or
+    ``conflict_with`` (the counterparts' sids, wherever they sit)."""
+    return compose(ws, cited, identity)[1]
 
 
 def row_ids(blocks: Iterable[dict]) -> set[str]:
@@ -623,26 +719,40 @@ def shown(row: dict | None) -> str:
 
 
 def _mark_text(row: dict, mark: str) -> str:
-    """A mark as the copy shows it; an undecided one names the datum it could not be compared with."""
-    if mark == "undecided" and row.get("undecided_with"):
-        return f"{MARKS[mark]} ({', '.join(row['undecided_with'])})"
+    """A mark as the copy shows it; an undecided one names the datum it could not be compared with, a conflict the datum it
+    conflicts with (round 13 U6)."""
+    named = {"undecided": "undecided_with", "conflict": "conflict_with"}.get(mark)
+    if named and row.get(named):
+        return f"{MARKS[mark]} ({', '.join(row[named])})"
     return MARKS[mark]
 
 
-def plain_text(blocks: list[dict]) -> str:
+def plain_text(blocks: list[dict], components: Iterable[dict] = ()) -> str:
     """The whole timeline as plain text: the heading, then for each group its label and one line per row — date, kind of
-    date, value, source title, marks. "" when there is no timeline."""
-    if not blocks:
-        return ""
-    lines = [HEADING]
-    for b in blocks:
-        lines.append(b["label"])
-        for r in b["rows"]:
-            value = f"{r['value_text']} {r['unit']}" if r["unit"] else r["value_text"]
-            cells = [shown(r), DATE_KINDS.get(r["date_kind"]), value, r["source"]["title"],
-                     ", ".join(_mark_text(r, m) for m in r["marks"] if not (m == "unknown_date" and not r["date"]))]
-            lines.append("- " + " · ".join(c for c in cells if c))
-    return "\n".join(lines)
+    date, value, source title, marks. The components table follows it (heading ``BREAKDOWN_HEADING``; round 13 U6): per block
+    its label and date, then one line per row — facet, value, source title, marks. "" when there is neither."""
+    parts = []
+    if blocks:
+        lines = [HEADING]
+        for b in blocks:
+            lines.append(b["label"])
+            for r in b["rows"]:
+                value = f"{r['value_text']} {r['unit']}" if r["unit"] else r["value_text"]
+                cells = [shown(r), DATE_KINDS.get(r["date_kind"]), value, r["source"]["title"],
+                         ", ".join(_mark_text(r, m) for m in r["marks"] if not (m == "unknown_date" and not r["date"]))]
+                lines.append("- " + " · ".join(c for c in cells if c))
+        parts.append("\n".join(lines))
+    components = list(components)
+    if components:
+        lines = [BREAKDOWN_HEADING]
+        for b in components:
+            lines.append(f"{b['label']} ({shown(b['as_of'])})")
+            for r in b["rows"]:
+                value = f"{r['value_text']} {r['unit']}" if r["unit"] else r["value_text"]
+                cells = [r["facet"], value, r["source"]["title"], ", ".join(_mark_text(r, m) for m in r["marks"])]
+                lines.append("- " + " · ".join(c for c in cells if c))
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
 
 
 def sids_behind(ws: Workspace, ids: Iterable[str]) -> set[str]:
@@ -690,12 +800,13 @@ def payload(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], I
     timeline and its plain-text copy (None without a timeline). Round 12 U8 (R12, KTD8): ``coverage`` — the coverage record
     of the data the answer cites (``coverage_of``) — joins it as ``coverage`` with the server-written ``note``, and the copy
     text ends with the note whether or not the timeline has rows. Without a record (off mode, R14) there is no ``coverage``
-    key, and an old message without one reads as "not recorded"."""
-    blocks = build(ws, cited, identity) if cited else []
+    key, and an old message without one reads as "not recorded". Round 13 U6 (KTD7): ``breakdown`` — the components table — sits
+    beside the timeline and joins the copy text; an old message has no such key."""
+    blocks, components = compose(ws, cited, identity) if cited else ([], [])
     requested = ws.time.requested
     out = {"mode": ws.time.mode, "prefer_recent": ws.time.prefer_recent,
            "requested": requested.as_dict() if requested is not None else None, "timeline": blocks,
-           "text": plain_text(blocks) or None}
+           "breakdown": components, "text": plain_text(blocks, components) or None}
     if coverage is not None:
         note = coverage_note(coverage)
         out["coverage"] = coverage | {"note": note}

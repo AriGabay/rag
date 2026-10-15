@@ -5,6 +5,7 @@ import { B } from "@/components/ui";
 import type {
   ChatAnswer,
   ChatAnswerTime,
+  ChatBreakdownBlock,
   ChatAssumption,
   ChatComponent,
   ChatComputation,
@@ -259,6 +260,7 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
       </div>
       <AnswerQuality answer={answer} />
       <Timeline groups={answer.time?.timeline} onCite={cite} />
+      <Breakdown blocks={answer.time?.breakdown} onCite={cite} />
       <CoverageNote coverage={answer.time?.coverage} />
       <div className="msg-actions">
         <button type="button" className="icon-btn" onClick={copy} aria-label="העתקת התשובה" title="העתקה">
@@ -308,6 +310,7 @@ const DATE_KIND_LABEL: Record<string, string> = {
 const TIMELINE_MARK: Record<ChatTimelineMark, { label: string; cls: string }> = {
   forecast: { label: "תחזית", cls: "badge-info" },
   conflict: { label: "סתירה בין מקורות", cls: "badge-warn" },
+  undecided: { label: "השוואה לא הוכרעה", cls: "badge-info" },
   outside_requested: { label: "מחוץ לזמן שביקשת", cls: "" },
   uncertain: { label: "קריאה לא ודאית", cls: "badge-warn" },
   unknown_date: { label: "מועד לא ידוע", cls: "" },
@@ -325,7 +328,7 @@ function timelinePoint(iso: string, precision: ChatTimelineRow["precision"]): st
 
 /** A timeline row's date: the start, and for a period (a table caption's range) its end in the same precision, joined by an
  * en dash like the server's plain-text copy (`shown_period`). */
-function timelineDate(row: ChatTimelineRow): string {
+function timelineDate(row: Pick<ChatTimelineRow, "date" | "precision" | "end">): string {
   if (!row.date) return "ללא תאריך";
   const first = timelinePoint(row.date, row.precision);
   return row.end ? `${first}–${timelinePoint(row.end, row.precision)}` : first;
@@ -333,7 +336,7 @@ function timelineDate(row: ChatTimelineRow): string {
 
 /** The value as the row shows it: the server's `unit` is display text ("₪", "מ״ר"), appended only when the value text does
  * not already carry it, as the plain-text copy does. */
-function timelineValue(row: ChatTimelineRow): string {
+function timelineValue(row: { value_text: string; unit: string | null }): string {
   return row.unit && !row.value_text.includes(row.unit) ? `${row.value_text} ${row.unit}` : row.value_text;
 }
 
@@ -356,6 +359,60 @@ function CoverageNote({ coverage }: { coverage: ChatTimeCoverage | null | undefi
     <div className="coverage-note" role="note" data-testid="coverage-note" aria-label="כיסוי החיפוש" dir="rtl">
       {note}
     </div>
+  );
+}
+
+/** The marks that name the values they are about: the key of the row's list, and the accessible text of its chip. */
+const MARK_WITH: Partial<Record<ChatTimelineMark, { key: "undecided_with" | "conflict_with"; label: string }>> = {
+  undecided: { key: "undecided_with", label: "השוואה לא הוכרעה" },
+  conflict: { key: "conflict_with", label: "סתירה" },
+};
+
+/** A row's marks as text badges. The undecided and the conflict one are followed by a citation chip for each value they
+ * are about (round 13 U6, R6), which opens the viewer like any other source chip; the chip reads to assistive technology
+ * as "השוואה לא הוכרעה מול <id>" or "סתירה מול <id>" (the badge beside it is then not read twice). */
+function MarkBadges({
+  marks,
+  counterparts,
+  onCite,
+}: {
+  marks: ChatTimelineMark[];
+  counterparts: { undecided_with?: string[]; conflict_with?: string[] };
+  onCite: (id: string) => void;
+}) {
+  return (
+    <>
+      {marks.map((k) => {
+        const named = MARK_WITH[k];
+        const sids = (named && counterparts[named.key]) || [];
+        if (!named || sids.length === 0) {
+          return (
+            <span key={k} className={`badge ${TIMELINE_MARK[k]?.cls ?? ""}`} data-mark={k}>
+              {TIMELINE_MARK[k]?.label ?? k}
+            </span>
+          );
+        }
+        return (
+          <span key={k} className="tl-undecided" data-mark={k}>
+            <span className={`badge ${TIMELINE_MARK[k].cls}`} aria-hidden="true">
+              {TIMELINE_MARK[k].label}
+            </span>
+            {sids.map((sid) => (
+              <button
+                key={sid}
+                type="button"
+                className="cite tl-cite"
+                data-testid={`${k}-with`}
+                onClick={() => onCite(sid)}
+                aria-label={`${named.label} מול ${sid}`}
+              >
+                {sid}
+              </button>
+            ))}
+          </span>
+        );
+      })}
+    </>
   );
 }
 
@@ -403,11 +460,69 @@ function Timeline({ groups, onCite }: { groups: ChatTimelineGroup[] | undefined;
                     <span className="tl-title">{r.source.title}</span>
                   </td>
                   <td role="cell" className="tl-marks">
-                    {r.marks.map((k) => (
-                      <span key={k} className={`badge ${TIMELINE_MARK[k]?.cls ?? ""}`} data-mark={k}>
-                        {TIMELINE_MARK[k]?.label ?? k}
-                      </span>
-                    ))}
+                    <MarkBadges marks={r.marks} counterparts={r} onCite={onCite} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+/** The components table (round 13 U6, KTD7, R8-R10): the parallel components of one appraisal unit at one date, side by side
+ * instead of as competing values. Blocks and rows in the payload's order, never re-sorted here; each row shows the facet in
+ * the source's own words (long ones wrap), the value, the source chip and the marks. Built like the timeline (same table,
+ * stacked rows on a phone); an older message has no `breakdown` and renders nothing. */
+function Breakdown({ blocks, onCite }: { blocks: ChatBreakdownBlock[] | undefined; onCite: (id: string) => void }) {
+  const shown = (blocks ?? []).filter((b) => b.rows.length > 0);
+  if (shown.length === 0) return null;
+  return (
+    <section className="timeline breakdown" data-testid="breakdown" aria-label="רכיבי השומה">
+      <h4 className="timeline-heading">רכיבי השומה</h4>
+      {shown.map((b, bi) => (
+        <div key={`${bi}-${b.label}`} className="timeline-group" data-testid="breakdown-block">
+          <div className="timeline-label">
+            {b.label}
+            <span className="tl-kind">{timelineDate(b.as_of)}</span>
+            {b.as_of.date_kind && DATE_KIND_LABEL[b.as_of.date_kind] && (
+              <span className="tl-kind">{DATE_KIND_LABEL[b.as_of.date_kind]}</span>
+            )}
+          </div>
+          <table className="timeline-table breakdown-table" role="table" aria-label={`רכיבי השומה: ${b.label}`}>
+            <thead role="rowgroup">
+              <tr role="row">
+                <th role="columnheader" scope="col">רכיב או שיקול (כלשון המקור)</th>
+                <th role="columnheader" scope="col">ערך</th>
+                <th role="columnheader" scope="col">מקור</th>
+                <th role="columnheader" scope="col">סימון</th>
+              </tr>
+            </thead>
+            <tbody role="rowgroup">
+              {b.rows.map((r, ri) => (
+                <tr key={`${ri}-${r.sid}`} role="row" data-testid="breakdown-row">
+                  <td role="cell" className="tl-facet" data-testid="breakdown-facet">
+                    {r.facet}
+                  </td>
+                  <td role="cell" className="tl-value">
+                    <B>{timelineValue(r)}</B>
+                  </td>
+                  <td role="cell" className="tl-source">
+                    <button
+                      type="button"
+                      className="cite tl-cite"
+                      onClick={() => onCite(r.sid)}
+                      title={[r.source.title, r.source.location].filter(Boolean).join(" — ")}
+                      aria-label={`מקור ${r.sid}: ${r.source.title}`}
+                    >
+                      {r.sid}
+                    </button>
+                    <span className="tl-title">{r.source.title}</span>
+                  </td>
+                  <td role="cell" className="tl-marks">
+                    <MarkBadges marks={r.marks} counterparts={r} onCite={onCite} />
                   </td>
                 </tr>
               ))}
