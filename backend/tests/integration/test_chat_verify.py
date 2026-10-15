@@ -263,9 +263,10 @@ def test_every_handled_claim_has_a_log_entry_with_the_whole_record_and_the_rows_
     assert "812" in removed["text"] and removed["remaining"] == "" and removed["check"] == "unstated_number"
     assert removed["sources_checked"] == ["S1"] and [s["document_id"] for s in removed["sources"]] == [setup.secret]
     assert removed["sources"][0]["id"] == "S1" and "anchor" in removed["sources"][0]
-    # the number was looked for in the rest of the source before the unit was given up (U5): both attempts are logged
+    # the number was looked for in the rest of the source before the unit was given up (U5), and in the part of the
+    # section before the passage (round 13): every attempt is logged
     assert [(x["source"], x["scope"], x["outcome"]) for x in removed["rereads"]] == [
-        ("S1", "next_page", "not_found"), ("S1", "continuation", "not_found")]
+        ("S1", "next_page", "not_found"), ("S1", "continuation", "not_found"), ("S1", "preceding", "not_found")]
     assert cut["rereads"] == [] and removed["post_check"] and cut["post_check"]
     assert qualified["text"].startswith("דמי הניהול בנוסף") and qualified["remaining"] == qualified["text"]
     # a summary finds its decision by claim id, whatever the order of the list
