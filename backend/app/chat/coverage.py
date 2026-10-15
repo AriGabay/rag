@@ -41,7 +41,7 @@ table, first match wins (``reason_of``):
    missing from the request;
 6. a calculation whose inputs were found and never computed — calculation not completed (also a calculation component
    the judge scored full whose surviving units show no computation of the turn: it is partial, KTD3);
-7. a value found with an uncertain reading or meaning — found, not verifiable;
+7. a value found with an uncertain reading, or whose kind or unit was asserted (round 13 U5) — found, not verifiable;
 8. values of one datum that differ — sources conflict when their periods overlap or one has no date (``conflicting_pairs``,
    round 12 U11, R18, KTD13: a datum undated only because it is history or a comparable conflicts with nothing, and values of
    different non-overlapping dates are a history). One datum is one class of the timeline's decision (round 13 U4, R3, R4,
@@ -509,9 +509,10 @@ def related_evidence(ws: Workspace, outcome: dict, turn: TurnRequirements | None
 
 
 def _uncertain_value(ws: Workspace, ids: list[str]) -> bool:
-    """A value among ``ids`` whose meaning was asserted rather than found in its source, whose own region stayed
-    unclear after its focused re-reads (``Value.reading``), or whose source was read uncertainly while its own
-    region was not found clear."""
+    """A value among ``ids`` whose kind or unit was asserted rather than found in its source (``Value.certainty``: an
+    asserted stance, speaker, scenario, period, area basis or VAT counts as not stated and does not limit the component,
+    round 13 U5, KTD6), whose own region stayed unclear after its focused re-reads (``Value.reading``), or whose source
+    was read uncertainly while its own region was not found clear."""
     return any(value_uncertain(ws, i) for i in ids if i in ws.values)
 
 

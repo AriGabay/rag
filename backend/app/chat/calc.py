@@ -1096,6 +1096,10 @@ def scaled_label(label: str, scale: int) -> str:
 
 # --- what the turn registers ---------------------------------------------------------------------------------------
 
+# the attributes that define the number (round 13 U5, KTD6): only an asserted one of these leaves a value uncertain
+DEFINING_ATTRIBUTES = ("kind", "unit")
+
+
 @dataclass
 class Value:
     """A value the server verified in a source the turn read (V#)."""
@@ -1162,9 +1166,15 @@ class Value:
 
     @property
     def certainty(self) -> str:
-        """"model_asserted": part of its meaning or attribution was asserted rather than found in its source;
-        "uncertain_reading": its region stayed unclear; otherwise "verified"."""
-        if "model_asserted" in self.provenance.values():
+        """"model_asserted": the kind or the unit — the attributes that define the number — was asserted rather than
+        found in its source; "uncertain_reading": its region stayed unclear; otherwise "verified".
+
+        Round 13 U5 (R7, KTD6): a stance, speaker, scenario, period, area basis or VAT status the model asserted never makes
+        the value uncertain. Each counts as not stated in every reader — the timeline's key (``timeline._stated``), a
+        calculation's operand (``operand``), the coverage reason, the judge's evidence (source-only qualifiers) — so the
+        number is neither marked nor limited for it; a claim that states such an attribute goes through the qualifier edit
+        (``verify.plan_qualifier_edits``). The asserted entry stays in ``provenance`` as the model's, never as found."""
+        if any(self.provenance.get(k) == "model_asserted" for k in DEFINING_ATTRIBUTES):
             return "model_asserted"
         return "uncertain_reading" if self.reading == "uncertain" else "verified"
 

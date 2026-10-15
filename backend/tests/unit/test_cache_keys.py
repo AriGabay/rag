@@ -214,7 +214,8 @@ def test_a_cached_value_checks_the_new_meaning_against_its_source(cached):
     with pytest.raises(T.ToolError):
         T.tool_take_value(ws, handle, {}, _given(unit="sqm"), "שטח")
     out = T.tool_take_value(ws, handle, {}, _given(stance="estimate", scenario="תרחיש שהמודל קבע"), "שווי")
-    assert ws.values["V1"].certainty == "model_asserted" and "קביעה שלך" in out
+    assert ws.values["V1"].provenance["stance"] == "model_asserted" and "קביעה שלך" in out
+    assert ws.values["V1"].certainty == "verified"  # round 13 U5: an asserted stance and scenario are not stated
 
 
 def test_a_cached_value_of_a_document_no_longer_visible_or_read_again_is_not_used(cached):

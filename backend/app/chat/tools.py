@@ -4607,9 +4607,11 @@ MSG_SOURCE_UNCERTAIN = "המקור נקרא בקריאה לא ודאית"
 
 
 def value_uncertain(ws: Workspace, vid: str) -> bool:
-    """A value (V#) that cannot be presented as certain: part of its meaning was asserted rather than found in its
-    source, its source was read uncertainly (a visual transcription included), or its region stayed unclear after
-    the focused re-reads (``Workspace.uncertain_values``)."""
+    """A value (V#) that cannot be presented as certain: its kind or unit was asserted rather than found in its source
+    (the attributes that define the number: ``calc.Value.certainty``; an asserted stance, speaker, scenario, period, area
+    basis or VAT counts as not stated and leaves it certain, round 13 U5, KTD6), its source was read uncertainly (a
+    visual transcription included), or its region stayed unclear after the focused re-reads
+    (``Workspace.uncertain_values``)."""
     v = ws.values[vid]
     source = ws.sources.get(v.source_id)
     return (v.certainty != "verified" or vid in ws.uncertain_values
@@ -5134,8 +5136,8 @@ def _section_said(path: tuple) -> Attribution | None:
 def _settle_attribution(given: dict, said: Attribution | None, context: str) -> tuple[dict, dict]:
     """Who stated the value, how, and its scenario (KTD8): what the words around it attest is the source's (and
     fills a stance or speaker the model left unknown when the text gives one); what they do not is the model's
-    (``model_asserted``, which leaves the value uncertain). A stance the text contradicts is kept as the model's,
-    asserted, beside the text's words — never as found."""
+    (``model_asserted``: it counts as not stated in every reader and never makes the value uncertain, round 13 U5). A
+    stance the text contradicts is kept as the model's, asserted, beside the text's words — never as found."""
     stance = given.get("stance") or "unknown"
     who = " ".join(str(given.get("stated_by") or "").split())
     scenario = " ".join(str(given.get("scenario") or "").split())
@@ -5161,14 +5163,15 @@ def _settle_attribution(given: dict, said: Attribution | None, context: str) -> 
     return {"stance": stance, "stated_by": who, "scenario": scenario}, prov
 
 
-# a stance or a speaker the model gave where the words around the number say nothing of who stated it or how: the
-# value stays uncertain (round 6 KTD8), and the model is told how to take it as the source has it
+# a stance or a speaker the model gave where the words around the number say nothing of who stated it or how: it counts
+# as not stated (round 13 U5, KTD6; the value is not left uncertain for it), and the model is told how to take it as the
+# source has it
 MSG_ATTRIBUTION_UNSTATED = ("המקור אינו אומר מי קבע את הערך או באיזה מעמד (אומץ, טענה, הצעה או אומדן). אם אין לכך "
                             "בסיס במילים המצוטטות, בכותרת השורה או העמודה או בסעיף — קח את הערך שוב ב-take_value עם "
                             "stance=unknown ו-stated_by ריק: כך הוא נרשם כפי שהמקור כותב אותו")
 MSG_SCENARIO_UNSTATED = ("המקור אינו מציין את התרחיש או המועד שנתת. אם המילים המצוטטות, כותרת השורה או העמודה או "
                          "הסעיף אינם מציינים תרחיש — קח את הערך שוב ב-take_value עם scenario ריק: תרחיש שאינו "
-                         "במקור משאיר את הערך לא ודאי ואת החישובים עליו מותנים")
+                         "במקור נחשב כלא צוין ואינו נכנס להשוואה בין ערכים")
 
 
 def _attribution_line(value: calc.Value, said: Attribution | None) -> str:
@@ -5344,9 +5347,9 @@ def _value_report(ws: Workspace, value: calc.Value, said: Attribution | None, no
              f"בסיס שטח: {value.area_basis}" if value.area_basis else ""]
     place = (f"שורה «{where['row']}» (מס' {where['row_number']}), עמודה «{where['column']}»" if "row" in where
              else f"ציטוט «{_clip(value.quote, 200)}»")
-    asserted = [{"unit": "יחידה", "period": "תקופה", "vat": "מע\"מ", "area_basis": "בסיס שטח", "kind": "סוג",
-                 "stance": "עמדה", "stated_by": "מי אמר", "scenario": "תרחיש"}[k]
-                for k, p in prov.items() if p == "model_asserted"]
+    names = {"unit": "יחידה", "period": "תקופה", "vat": "מע\"מ", "area_basis": "בסיס שטח", "kind": "סוג",
+             "stance": "עמדה", "stated_by": "מי אמר", "scenario": "תרחיש"}
+    asserted = [k for k, p in prov.items() if p == "model_asserted"]
     lines = [f"{value.vid} נרשם: «{_txt(value.label)}» = {value.written} ({'; '.join(x for x in shown if x) or 'ללא יחידה'})"
              f" | סוג: {VALUE_KINDS[value.kind]} | תפקיד: {calc.ROLE_LABELS[value.role]}"
              + (f" | נושא: {_txt(value.subject)}" if value.subject else "") + (" | שורת סה\"כ" if value.total else "")
@@ -5361,8 +5364,13 @@ def _value_report(ws: Workspace, value: calc.Value, said: Attribution | None, no
     lines.append(datum_line(value.as_of))
     if (src := ws.sources.get(value.source_id)) is not None and src.link:  # the appraisal is the property's (U12b)
         lines.append(src.link)
-    lines.append("ודאות: " + ("כל התכונות שצוינו נמצאו במקור" if not asserted else
-                              "נמוכה יותר — תכונות שהמודל קבע ולא נמצאו במקור: " + ", ".join(asserted)))
+    # only the kind and the unit lower the certainty (round 13 U5, KTD6); any other attribute the model asserted is reported
+    # as not stated, which neither lowers it nor enters a comparison or a calculation
+    defining = [names[k] for k in asserted if k in calc.DEFINING_ATTRIBUTES]
+    other = [names[k] for k in asserted if k not in calc.DEFINING_ATTRIBUTES]
+    lines.append("ודאות: " + ("כל התכונות שמגדירות את המספר נמצאו במקור" if not defining else
+                              "נמוכה יותר — תכונות שהמודל קבע ולא נמצאו במקור: " + ", ".join(defining))
+                 + (" | נחשבות כלא צוינו, ואינן מורידות את הוודאות: " + ", ".join(other) if other else ""))
     if note:
         lines.append(note)
     lines += context or []

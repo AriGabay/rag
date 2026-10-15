@@ -156,29 +156,32 @@ def test_the_decisions_figure_is_recorded_as_adopted_from_the_text(decision):
     assert v.provenance["stated_by"] == "not_stated" and v.section == DECISION and v.certainty == "verified"
 
 
-def test_a_partys_figure_given_as_adopted_is_asserted_and_uncertain(decision):
+def test_a_partys_figure_given_as_adopted_is_asserted_and_counts_as_not_stated(decision):
+    """Round 13 U5 (KTD6): the asserted stance is recorded as the model's, beside the source's words, and does not make
+    the number uncertain (its kind and unit are the source's)."""
     out = T.tool_take_value(decision.ws, decision.sid, _quote(CLAIM_TEXT, "200"), _meaning(stance="adopted"), "שווי")
     v = decision.ws.values["V1"]
     assert v.stance == "adopted" and v.provenance["stance"] == "model_asserted"
-    assert v.certainty == "model_asserted" and T.value_uncertain(decision.ws, "V1")
-    assert "טענה" in out and "המשיבה" in out and T.STATUS_UNCERTAIN in out
+    assert v.certainty == "verified" and not T.value_uncertain(decision.ws, "V1")
+    assert "טענה" in out and "המשיבה" in out and T.STATUS_AUTO in out and T.STATUS_UNCERTAIN not in out
 
 
 def test_a_stance_and_speaker_the_text_does_not_give_are_asserted_not_verified(decision):
     v = _take(decision, PLAIN_TEXT, "210", stance="adopted", stated_by="השמאי המכריע")
     assert v.provenance["stance"] == "model_asserted" and v.provenance["stated_by"] == "model_asserted"
-    assert v.certainty != "verified" and T.value_status(decision.ws, v.vid) == T.STATUS_UNCERTAIN
+    assert v.certainty == "verified" and T.value_status(decision.ws, v.vid) == T.STATUS_AUTO  # round 13 U5: not stated
     head, body, _ = verify._source_parts(decision.ws, v.vid)
     assert "לא נמצא במקור" in body
 
 
 def test_a_stance_the_source_says_nothing_about_tells_the_model_to_take_it_again_unknown(decision):
     """The model's own stance or speaker, where the words around the number say nothing of who stated it or how
-    (U9: a cost table taken as "estimate"): the value stays uncertain, and the tool says plainly that the source
-    does not state it and how to take it again; the re-take with stance unknown and no speaker is verified."""
+    (U9: a cost table taken as "estimate"): the tool says plainly that the source does not state it and how to take it
+    again (the value is not left uncertain for it, round 13 U5); the re-take with stance unknown and no speaker is the
+    value as the source has it."""
     out = T.tool_take_value(decision.ws, decision.sid, _quote(PLAIN_TEXT, "210"),
                             _meaning(stance="estimate", stated_by="השמאי"), "שווי")
-    assert decision.ws.values["V1"].certainty == "model_asserted" and T.STATUS_UNCERTAIN in out
+    assert decision.ws.values["V1"].provenance["stance"] == "model_asserted" and T.STATUS_AUTO in out
     assert T.MSG_ATTRIBUTION_UNSTATED in out
     again = T.tool_take_value(decision.ws, decision.sid, _quote(PLAIN_TEXT, "210"), _meaning(), "שווי")
     assert decision.ws.values["V2"].certainty == "verified" and T.STATUS_AUTO in again
@@ -213,7 +216,7 @@ def test_a_scenario_is_found_in_the_text_or_asserted(monkeypatch):
     d = _workspace(monkeypatch, [_block(0, DECISION, [DECISION]), _block(1, text, [DECISION])])
     assert _take(d, text, "150", scenario="מצב תכנוני קודם").provenance["scenario"] == "source"
     v = _take(d, text, "150", scenario="מצב תכנוני מוצע")
-    assert v.provenance["scenario"] == "model_asserted" and v.certainty == "model_asserted"
+    assert v.provenance["scenario"] == "model_asserted" and v.certainty == "verified"  # round 13 U5: not stated
 
 
 def test_an_unknown_stance_value_is_rejected():
@@ -420,12 +423,12 @@ def test_a_computation_states_the_rounding_rule_its_display_follows():
 
 
 def test_a_scenario_the_source_does_not_name_tells_the_model_to_take_it_again_without_one(decision):
-    """A scenario label of the model's own ("בדיקה בסיסית" for the only figures there are) leaves the value
-    uncertain and every result built on it conditional: the tool says the source names no such scenario and how
-    to take the value again; the re-take with no scenario is verified."""
+    """A scenario label of the model's own ("בדיקה בסיסית" for the only figures there are) counts as not stated
+    (round 13 U5: the value stays certain): the tool says the source names no such scenario and how to take the value
+    again; the re-take with no scenario is verified."""
     out = T.tool_take_value(decision.ws, decision.sid, _quote(PLAIN_TEXT, "210"),
                             _meaning(scenario="בדיקה בסיסית"), "שווי")
-    assert decision.ws.values["V1"].certainty == "model_asserted" and T.MSG_SCENARIO_UNSTATED in out
+    assert decision.ws.values["V1"].provenance["scenario"] == "model_asserted" and T.MSG_SCENARIO_UNSTATED in out
     again = T.tool_take_value(decision.ws, decision.sid, _quote(PLAIN_TEXT, "210"), _meaning(), "שווי")
     assert decision.ws.values["V2"].certainty == "verified" and T.MSG_SCENARIO_UNSTATED not in again
 
