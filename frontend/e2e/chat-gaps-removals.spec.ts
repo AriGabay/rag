@@ -17,6 +17,7 @@ import {
   removal,
   thread,
   TITLE,
+  withRemovalNote,
   DOC,
   type Json,
 } from "./answer-fixtures";
@@ -325,6 +326,143 @@ test.describe("clarification", () => {
     await expect(assistantMessages(page).last().locator(".body")).toContainText("8,962", { timeout: 15_000 });
     expect(posted).toHaveLength(1);
     expect(posted[0].content).toBe("6% לשנה");
+    await page.request.delete(`/api/chat/conversations/${id}`);
+  });
+});
+
+// --- the removal note's action (round 13 U12, R17, KTD14) ----------------------------------------------------------
+
+const CUT_MARK = "«[1: חלק שלא אומת הושמט]»";
+const CUT_ORIGINAL = "שיעור ההיוון הוא 7% לשנה ותקופת ההיוון היא עשר שנים.";
+const CUT_REASON = "המקור אינו מציין את תקופת ההיוון.";
+const LONG_DRAFT = `${DRAFT} ${"הנחות נוספות בטיוטה הארוכה. ".repeat(20)}סוף הטיוטה.`;
+
+/** An answer whose note names two removals: a whole claim taken out and a part cut from another (its marker in the body). */
+function noteAnswer(): Json {
+  const { markdown, server_spans } = withRemovalNote(
+    `השווי למ״ר בשומה הוא 9,500 ₪ [S1].\n\nשיעור ההיוון הוא 7% לשנה ${CUT_MARK} [S1].`,
+    ["הוסרו מהתשובה 2 טענות שלא נמצאה להן תמיכה במקורות."],
+  );
+  return answerWith({ markdown, server_spans, status: "partial" }, {
+    removed: 2, edited: 3, correctness: "partial", actions: { removed: 1, cut: 1, rewritten: 0, withheld: 0, qualified: 0, cited: 0 },
+    removals: [
+      removal("wrong_unit", "N2", { claim_id: cid(1), action: "removed" }),
+      removal("absent_from_source", null, { claim_id: cid(2), action: "cut", ordinal: 1 }),
+    ],
+  });
+}
+
+function noteDiagnostics(): Json {
+  return diagnostics([
+    decision("wrong_unit", { claim_id: cid(1), action: "removed", text: LONG_DRAFT }),
+    decision("absent_from_source", { claim_id: cid(2), action: "cut", ordinal: 1, text: CUT_ORIGINAL, remaining: CUT_MARK,
+      reason: CUT_REASON }),
+  ]);
+}
+
+test.describe("the removal note's action", () => {
+  test("one click opens every removal with the original claim, the kept part, the reason and the checked sources, on one request", async ({
+    page,
+  }) => {
+    const { id, reply } = await openAnswer(page, noteAnswer());
+    let calls = 0;
+    await page.route("**/api/chat/messages/m2/diagnostics", async (route) => {
+      calls += 1;
+      await route.fulfill({ json: noteDiagnostics() });
+    });
+    const note = reply.getByTestId("removal-note");
+    await expect(note).toContainText("הוסרו מהתשובה 2 טענות");
+    const action = note.getByRole("button", { name: "פירוט ההסרות" });
+    await expect(action).toHaveAttribute("aria-expanded", "false");
+    const listId = await action.getAttribute("aria-controls");
+    expect(listId).toBeTruthy();
+    await expect(reply.locator("details.msg-details")).not.toHaveAttribute("open", "");
+    await action.click();
+    await expect(reply.locator("details.msg-details")).toHaveAttribute("open", "");
+    await expect(action).toHaveAttribute("aria-expanded", "true");
+    await expect(reply.locator(`[id="${listId}"]`)).toHaveAttribute("data-testid", "removals");
+    const details = reply.getByTestId("removal-detail");
+    await expect(details).toHaveCount(2);
+    const [whole, cut] = [reply.getByTestId("removal").nth(0), reply.getByTestId("removal").nth(1)];
+    // a claim taken out: the whole original (kept past 300 characters), the reason and the sources checked
+    expect(LONG_DRAFT.length).toBeGreaterThan(300);
+    await expect(whole.getByTestId("removal-draft")).toContainText("סוף הטיוטה.");
+    await expect(whole.getByTestId("removal-reason")).toContainText(REASON);
+    await expect(whole.locator(".removal-sources")).toContainText(TITLE);
+    // a part cut: the original, what stays in the text, the reason and the sources checked
+    await expect(cut.getByTestId("removal-draft")).toContainText(CUT_ORIGINAL);
+    await expect(cut.getByTestId("change-kept")).toContainText(CUT_MARK);
+    await expect(cut.getByTestId("removal-reason")).toContainText(CUT_REASON);
+    await expect(cut.locator(".removal-sources")).toContainText(TITLE);
+    expect(calls).toBe(1);
+    // the same button closes them together
+    await action.click();
+    await expect(action).toHaveAttribute("aria-expanded", "false");
+    await expect(reply.getByTestId("removal-detail")).toHaveCount(0);
+    await page.request.delete(`/api/chat/conversations/${id}`);
+  });
+
+  test("keyboard only: the button opens the removals and the focus lands on the first one", async ({ page }) => {
+    const { id, reply } = await openAnswer(page, noteAnswer());
+    await page.route("**/api/chat/messages/m2/diagnostics", (route) => route.fulfill({ json: noteDiagnostics() }));
+    const action = reply.getByTestId("removal-note").getByRole("button", { name: "פירוט ההסרות" });
+    await action.focus();
+    await page.keyboard.press("Enter");
+    await expect(reply.getByTestId("removal-detail")).toHaveCount(2);
+    const first = reply.getByTestId("removal").first();
+    await expect(first).toBeFocused();
+    await expect(first).toBeInViewport();
+    await page.request.delete(`/api/chat/conversations/${id}`);
+  });
+
+  test("a failed request shows the existing retry in every removal; retrying loads the detail", async ({ page }) => {
+    const { id, reply } = await openAnswer(page, noteAnswer());
+    let fail = true;
+    await page.route("**/api/chat/messages/m2/diagnostics", (route) =>
+      fail ? route.fulfill({ status: 500, json: { detail: "x" } }) : route.fulfill({ json: noteDiagnostics() }));
+    await reply.getByTestId("removal-note").getByRole("button", { name: "פירוט ההסרות" }).click();
+    await expect(reply.getByTestId("removal-error")).toHaveCount(2);
+    fail = false;
+    await reply.getByTestId("removal-error").first().getByRole("button", { name: "ניסיון חוזר" }).click();
+    await expect(reply.getByTestId("removal-draft").first()).toContainText("סוף הטיוטה.");
+    await page.request.delete(`/api/chat/conversations/${id}`);
+  });
+
+  test("a 404 (a document behind the answer is hidden) leaves the existing unavailable line", async ({ page }) => {
+    const { id, reply } = await openAnswer(page, noteAnswer());
+    await page.route("**/api/chat/messages/m2/diagnostics", (route) =>
+      route.fulfill({ status: 404, json: { detail: "not found" } }));
+    await reply.getByTestId("removal-note").getByRole("button", { name: "פירוט ההסרות" }).click();
+    await expect(reply.getByTestId("removal-unavailable")).toHaveCount(2);
+    await page.request.delete(`/api/chat/conversations/${id}`);
+  });
+
+  test("the answer quality line shows how many claims were edited", async ({ page }) => {
+    const { id, reply } = await openAnswer(page, noteAnswer());
+    const edited = reply.getByTestId("edited-notice");
+    await expect(edited).toBeVisible();
+    await expect(edited).toContainText("3");
+    await expect(edited).not.toContainText(DRAFT);
+    await page.request.delete(`/api/chat/conversations/${id}`);
+  });
+
+  test("after a reload the same detail opens", async ({ page }) => {
+    const { id } = await openAnswer(page, noteAnswer());
+    await page.route("**/api/chat/messages/m2/diagnostics", (route) => route.fulfill({ json: noteDiagnostics() }));
+    await page.reload();
+    const reply = assistantMessages(page).last();
+    await reply.getByTestId("removal-note").getByRole("button", { name: "פירוט ההסרות" }).click();
+    await expect(reply.getByTestId("removal-detail")).toHaveCount(2);
+    await expect(reply.getByTestId("removal-draft").first()).toContainText(DRAFT);
+    await page.request.delete(`/api/chat/conversations/${id}`);
+  });
+
+  test("an older answer without the registry shows the note as text and no button", async ({ page }) => {
+    const answer = noteAnswer();
+    delete answer.server_spans;
+    const { id, reply } = await openAnswer(page, answer);
+    await expect(reply.locator(".body")).toContainText("הוסרו מהתשובה 2 טענות");
+    await expect(reply.getByTestId("removal-note-action")).toHaveCount(0);
     await page.request.delete(`/api/chat/conversations/${id}`);
   });
 });

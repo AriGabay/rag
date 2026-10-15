@@ -28,6 +28,8 @@ ACTION_REASONS = {
     "removed": "הטענה הוסרה",
     "withheld": "הטענה לא נבדקה והוצאה מהתשובה",
 }
+# the most of a removed claim's original text the log keeps (round 13 U12, KTD14); ``Problem.as_dict`` cuts it at 300
+TEXT_LIMIT = 2000
 REREAD_KEYS = ("source", "scope", "outcome", "reason", "expanded_source")
 
 
@@ -41,7 +43,7 @@ def decision(entry: verify.Logged, sources: list[dict]) -> dict:
     removed = action in verify.GONE_ACTIONS
     base = p.as_dict() if p is not None else verify.Problem.undecided_dict(entry.unit)
     claim = r.text if r is not None else entry.unit.text
-    original = base["text"] if removed and p is not None else ((r.draft if r is not None else "") or claim)
+    original = p.unit.raw[:TEXT_LIMIT] if removed and p is not None else ((r.draft if r is not None else "") or claim)
     if action == "cut" and r is not None:
         base["failure_kind"] = r.failure_kind()
     reread: list[dict] = []

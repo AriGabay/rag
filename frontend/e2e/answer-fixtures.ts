@@ -173,3 +173,14 @@ export async function openDetails(reply: Locator): Promise<void> {
   await expect(reply.locator("details.msg-details")).toHaveAttribute("open", "");
 }
 
+
+/** The removal note the server appends (round 13 U12): `body` followed by the note's blockquote lines, with the
+ * registry span that marks the note (offsets in code points, as the server writes them). */
+export function withRemovalNote(body: string, lines: string[]): { markdown: string; server_spans: Json[] } {
+  const note = "\n\n" + lines.map((l) => `> ${l}`).join("\n>\n");
+  const start = Array.from(body).length;
+  return {
+    markdown: body + note,
+    server_spans: [{ start, end: start + Array.from(note).length, kind: "removal_note" }],
+  };
+}

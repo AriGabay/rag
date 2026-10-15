@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { B } from "@/components/ui";
 import type {
   ChatAnswer,
@@ -46,7 +46,7 @@ import {
 } from "@/lib/format";
 import { type CitationTarget, Markdown, citationOrder, plainAnswer } from "./Markdown";
 import { assumptionText, citedTarget, standardChipTitle, valueStatusOf } from "./cited";
-import { ActionLines, type CutFocus, RemovalsSection } from "./Changes";
+import { ActionLines, type CutFocus, type ExpandAll, RemovalsSection } from "./Changes";
 
 export interface CitedItem {
   /** A passage, or the document passage behind a measurement or computation input. */
@@ -166,6 +166,14 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
     [answer],
   );
   const openCut = useCallback((ordinal: number) => setFocus((f) => ({ ordinal, tick: (f?.tick ?? 0) + 1 })), []);
+  // the removal note's button opens the details with every removal expanded (round 13 U12, KTD14)
+  const [expandAll, setExpandAll] = useState<ExpandAll | null>(null);
+  const toggleRemovals = useCallback(
+    () => setExpandAll((c) => ({ tick: (c?.tick ?? 0) + 1, open: !(c?.open ?? false) })),
+    [],
+  );
+  const removalsId = useId();
+  const noteParts = useMemo(() => (answer ? removalNoteParts(answer) : null), [answer]);
 
   if (message.status === "running" || message.status === "cancelling") {
     const steps = progressLines(message.progress);
@@ -257,7 +265,31 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
         <div className="stale-note">המסמכים או ההרשאות השתנו מאז התשובה. מומלץ לשאול שוב לקבלת תשובה עדכנית.</div>
       )}
       <div className="body" dir="rtl">
-        <Markdown markdown={answer.markdown} citations={citations} onCite={cite} cuts={cutOrdinals} onCut={openCut} />
+        {noteParts ? (
+          <>
+            {noteParts.head.trim() && (
+              <Markdown markdown={noteParts.head} citations={citations} onCite={cite} cuts={cutOrdinals} onCut={openCut} />
+            )}
+            <div className="removal-note" data-testid="removal-note">
+              <Markdown markdown={noteParts.note} citations={citations} onCite={cite} cuts={cutOrdinals} onCut={openCut} />
+              <button
+                type="button"
+                className="source-link"
+                data-testid="removal-note-action"
+                aria-expanded={expandAll?.open ?? false}
+                aria-controls={removalsId}
+                onClick={toggleRemovals}
+              >
+                פירוט ההסרות
+              </button>
+            </div>
+            {noteParts.tail.trim() && (
+              <Markdown markdown={noteParts.tail} citations={citations} onCite={cite} cuts={cutOrdinals} onCut={openCut} />
+            )}
+          </>
+        ) : (
+          <Markdown markdown={answer.markdown} citations={citations} onCite={cite} cuts={cutOrdinals} onCut={openCut} />
+        )}
       </div>
       <AnswerQuality answer={answer} />
       <Timeline groups={answer.time?.timeline} onCite={cite} />
@@ -286,10 +318,27 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
         citations={citations}
         onCite={cite}
         focus={focus}
+        expandAll={expandAll}
+        removalsId={removalsId}
         onOpenSource={onOpenSource}
       />
     </div>
   );
+}
+
+/** The saved text split around the server's removal note (round 13 U12, KTD14): the text before it, the note and the
+ * text after it, so the note carries its action. Only when the answer has removal rows to open and the registry's span
+ * (code-point offsets, as Python wrote them) holds a blockquote; otherwise the text is shown whole, as before. */
+export function removalNoteParts(answer: ChatAnswer): { head: string; note: string; tail: string } | null {
+  if (!answer.verification?.removals?.length) return null;
+  const spans = (answer.server_spans ?? []).filter((s) => s.kind === "removal_note");
+  if (spans.length !== 1) return null;
+  const { start, end } = spans[0];
+  const chars = Array.from(answer.markdown);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start || end > chars.length) return null;
+  const note = chars.slice(start, end).join("");
+  if (!note.trimStart().startsWith(">")) return null;
+  return { head: chars.slice(0, start).join(""), note, tail: chars.slice(end).join("") };
 }
 
 /** The time preference an answer was produced with, worded as the setting and not as a claim that ordering happened
@@ -602,7 +651,9 @@ function AnswerQuality({ answer }: { answer: ChatAnswer }) {
     correctness === "partial" && (verification?.conditional ?? 0) > 0 && affected === 0 &&
     !verification?.partial && !verification?.removed;
   const doubtful = correctness && correctness !== "verified" && !onlyRemoved;
-  if (!clarification && !incomplete && !doubtful && affected === 0) return null;
+  // claims whose unsupported qualifier was edited out of a number the sources back (round 13 U12, R17)
+  const edited = verification?.edited ?? 0;
+  if (!clarification && !incomplete && !doubtful && affected === 0 && edited === 0) return null;
   const structured = hasComponents(answer);
   const pending = clarification ? pendingDetail(answer) : "";
   return (
@@ -638,6 +689,13 @@ function AnswerQuality({ answer }: { answer: ChatAnswer }) {
           {verification?.actions ? changesNotice(contentCounts(verification), removals) : removalNotice(removals)}
         </p>
       )}
+      {edited > 0 && (
+        <p className="removal-line" data-testid="edited-notice" data-count={edited}>
+          {edited === 1
+            ? "האימות ערך טענה אחת: הוסר ממנה ניסוח שלא נכתב במקור, והנתון עצמו נשאר בתשובה."
+            : `האימות ערך ${edited} טענות: הוסר מהן ניסוח שלא נכתב במקור, והנתונים עצמם נשארו בתשובה.`}
+        </p>
+      )}
       {doubtful && (
         <p className="correctness-line" data-testid="correctness" data-status={correctness}>
           {onlyConditional ? CONDITIONAL_LINE : CORRECTNESS_LINE[correctness]}
@@ -671,6 +729,8 @@ function AnswerDetails({
   citations,
   onCite,
   focus,
+  expandAll,
+  removalsId,
   onOpenSource,
 }: {
   answer: ChatAnswer;
@@ -678,6 +738,10 @@ function AnswerDetails({
   citations: Map<string, CitationTarget>;
   onCite: (id: string) => void;
   focus: CutFocus | null;
+  /** The removal note's button: opens the details with every removal expanded. */
+  expandAll: ExpandAll | null;
+  /** The id of the removals list the note's button controls. */
+  removalsId: string;
   onOpenSource?: (nav: ViewerNav) => void;
 }) {
   const ordered = [...citations.values()];
@@ -694,6 +758,10 @@ function AnswerDetails({
   useEffect(() => {
     if (focusTick && detailsRef.current) detailsRef.current.open = true;
   }, [focusTick]);
+  const expandTick = expandAll?.open ? expandAll.tick : 0;
+  useEffect(() => {
+    if (expandTick && detailsRef.current) detailsRef.current.open = true;
+  }, [expandTick]);
   return (
     <details className="msg-details" ref={detailsRef}>
       <summary>מקורות ופרטים ({ordered.length})</summary>
@@ -781,6 +849,8 @@ function AnswerDetails({
               components={answer.components ?? []}
               messageId={messageId}
               focus={focus}
+              expandAll={expandAll}
+              listId={removalsId}
               onOpenSource={onOpenSource}
             />
           )}

@@ -33,6 +33,13 @@ export interface CutFocus {
   tick: number;
 }
 
+/** The removal note's button in the answer's body (round 13 U12, KTD14): every removal opens (`open`) or closes together;
+ * `tick` makes a second press count. The first removal takes the focus when they open. */
+export interface ExpandAll {
+  tick: number;
+  open: boolean;
+}
+
 /** One line per action that touched a claim (round 8 U8): what changed in the text first, then the qualifiers and
  * the citations it added. */
 export function ActionLines({ actions }: { actions: ChatVerificationActions }) {
@@ -108,6 +115,8 @@ export function RemovalsSection({
   components,
   messageId,
   focus,
+  expandAll,
+  listId,
   onOpenSource,
 }: {
   removals: ChatRemoval[];
@@ -115,6 +124,10 @@ export function RemovalsSection({
   components: ChatComponent[];
   messageId: string;
   focus: CutFocus | null;
+  /** The removal note's action: opens every removal using the one shared request. */
+  expandAll?: ExpandAll | null;
+  /** The id of the removals list, which the note's button names in `aria-controls`. */
+  listId?: string;
   onOpenSource?: (nav: ViewerNav) => void;
 }) {
   const byId = new Map(components.map((c) => [c.id, c]));
@@ -165,7 +178,7 @@ export function RemovalsSection({
   return (
     <>
       {keyed.length > 0 && (
-        <ul className="removals" data-testid="removals">
+        <ul className="removals" data-testid="removals" id={listId}>
           {keyed.map(({ row, index, key }) => (
             <RemovalItem
               key={key}
@@ -174,6 +187,7 @@ export function RemovalsSection({
               component={row.component ? byId.get(row.component) : undefined}
               diagnostics={diagnostics}
               focus={focus}
+              expandAll={expandAll ?? null}
               onOpenSource={onOpenSource}
             />
           ))}
@@ -233,18 +247,20 @@ function useExpandable<T>(diagnostics: Diagnostics, pick: (d: ChatDiagnostics) =
     load();
   }, [load]);
 
-  const toggle = useCallback(() => {
-    if (isOpen.current) {
-      ctrl.current?.abort();
-      isOpen.current = false;
-      setOpen(false);
-      setState({ phase: "idle" });
-      return;
-    }
-    expand();
-  }, [expand]);
+  const collapse = useCallback(() => {
+    if (!isOpen.current) return;
+    ctrl.current?.abort();
+    isOpen.current = false;
+    setOpen(false);
+    setState({ phase: "idle" });
+  }, []);
 
-  return { open, state, load, expand, toggle };
+  const toggle = useCallback(() => {
+    if (isOpen.current) collapse();
+    else expand();
+  }, [expand, collapse]);
+
+  return { open, state, load, expand, collapse, toggle };
 }
 
 /** What an expanded entry shows while its content loads, fails or is gone. */
@@ -307,6 +323,7 @@ function RemovalItem({
   component,
   diagnostics,
   focus,
+  expandAll,
   onOpenSource,
 }: {
   removal: ChatRemoval;
@@ -314,11 +331,12 @@ function RemovalItem({
   component: ChatComponent | undefined;
   diagnostics: Diagnostics;
   focus: CutFocus | null;
+  expandAll: ExpandAll | null;
   onOpenSource?: (nav: ViewerNav) => void;
 }) {
   const action = rowChangeAction(removal);
   const pick = useCallback((d: ChatDiagnostics) => pairDecision(d, removal, index), [removal, index]);
-  const { open, state, load, expand, toggle } = useExpandable(diagnostics, pick);
+  const { open, state, load, expand, collapse, toggle } = useExpandable(diagnostics, pick);
   const panelId = useId();
   const li = useRef<HTMLLIElement>(null);
   const handled = useRef(0);
@@ -333,9 +351,31 @@ function RemovalItem({
     return () => window.cancelAnimationFrame(raf);
   }, [tick, expand]);
 
+  // the removal note's button: every entry opens in the same commit, so they join one diagnostics request; the first
+  // one scrolls into view and takes the focus once the details around it are laid out (round 13 U12, KTD14)
+  const allTick = expandAll?.tick ?? 0;
+  const allOpen = expandAll?.open ?? false;
+  const handledAll = useRef(0);
+  useEffect(() => {
+    if (!allTick || allTick === handledAll.current) return;
+    handledAll.current = allTick;
+    if (!allOpen) {
+      collapse();
+      return;
+    }
+    expand();
+    if (index === 0) {
+      window.requestAnimationFrame(() => {
+        li.current?.scrollIntoView({ block: "nearest" });
+        li.current?.focus();
+      });
+    }
+  }, [allTick, allOpen, index, expand, collapse]);
+
   return (
     <li
       ref={li}
+      tabIndex={-1}
       className="removal"
       data-testid="removal"
       data-kind={removal.failure_kind}

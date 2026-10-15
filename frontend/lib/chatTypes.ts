@@ -468,6 +468,16 @@ export interface ChatVerification {
   actions?: ChatVerificationActions;
   /** Results kept with the server's conditional qualifier (absent on older answers). */
   conditional?: number;
+  /** Claims whose unsupported qualifier the server edited out of a number the sources back: an edit, not a removal
+   * (round 13 U12; absent on older answers). */
+  edited?: number;
+}
+
+/** A run of the saved Markdown the server wrote: offsets in code points and a kind, never its text. */
+export interface ChatServerSpan {
+  start: number;
+  end: number;
+  kind: string;
 }
 
 /** A component of the request with its outcome in the shown answer (round 7 U3; `coverage.public_components`). */
@@ -864,6 +874,8 @@ export interface ChatAnswer {
   unit_scope?: ChatUnitScope | null;
   /** The time mode and the server-built timeline (round 11; absent on older answers). */
   time?: ChatAnswerTime | null;
+  /** Where the server wrote in `markdown` (the removal note among them); absent on older answers. */
+  server_spans?: ChatServerSpan[];
 }
 
 export type ChatMessageStatus = "running" | "cancelling" | "cancelled" | "done" | "failed";

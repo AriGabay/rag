@@ -272,7 +272,10 @@ def public_verification(v: dict) -> dict:
             "partial": v.get("partial", sum(1 for p in problems if p.get("severity") == "partial")),
             "annotated": v.get("annotated", 0), "request_mismatch": v.get("request_mismatch", False),
             # results the server marked conditional next to their number (none on answers stored before it)
-            "conditional": v.get("conditional", 0)} | {
+            "conditional": v.get("conditional", 0)} | (
+        # the claims whose unsupported qualifier the server edited out of a number the sources back (round 13 U12, R17,
+        # KTD14): an edit, not a removal; counts stored before it have none
+        {"edited": v["edited"]} if type(v.get("edited")) is int else {}) | {
         # claim correctness and answer completeness, shown apart (answers stored before them have neither)
         k: v[k] for k in ("correctness", "completeness") if k in v} | (
         # each removal's kind, component and the server's fixed sentence, rebuilt here from the kind (KTD5)
