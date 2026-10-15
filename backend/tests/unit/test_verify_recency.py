@@ -121,6 +121,41 @@ def test_a_unit_that_cites_no_value_is_not_checked():
     assert _check("השווי העדכני נקבע לפי גישת ההשוואה.", _ws(*V)) == []
 
 
+# --- the datum is a class of the timeline's decision (round 13 U4, KTD4, R20) -----------------------------------------------
+
+from app.chat import datum  # noqa: E402
+
+
+def _rates(newer_facet: dict, *, same_unit: bool) -> Workspace:
+    """V1 (2021, the offices cash flow) and a newer V2 (2024) of one property, both capitalization rates."""
+    ws = _ws(("V1", "6.5", "2021-01-01"), ("V2", "7.5", "2024-01-01"), kind="rate")
+    for v in ws.values.values():
+        v.unit, v.section = "percent", "3. היוון"
+    ws.values["V1"].facet = datum.facet("תזרים דמי שכירות ממשרדים", "sentence", datum.TIER_OWN)
+    ws.values["V2"].facet = newer_facet
+    if same_unit:
+        ws.values["V2"].version_id = ws.values["V1"].version_id
+    return ws
+
+
+def test_a_newer_rate_of_another_cash_flow_does_not_make_the_latest_claim_false():
+    parking = datum.facet("תזרים דמי שכירות מחניות", "sentence", datum.TIER_OWN)
+    assert _check("שיעור ההיוון העדכני הוא 6.5% [V1].", _rates(parking, same_unit=True)) == []
+
+
+def test_a_newer_rate_whose_cash_flow_is_undecided_keeps_the_latest_claim_qualified_and_is_named():
+    ws = _rates(datum.none(), same_unit=False)  # another appraisal, its rate states no cash flow: not comparable
+    (p,) = _check("שיעור ההיוון העדכני הוא 6.5% [V1].", ws)
+    assert p.check == "recency_claim" and p.severity == "partial" and p.repairable and not p.removes_unit
+    assert "V2" in p.reason and "01/01/2024" in p.reason and "לא הוכרע" in p.reason
+    assert p.checked_ids == ["V1"] and p.failure_kind in verify.FAILURE_KINDS
+    # the qualified wording is enough; the decided later value of the same datum stays the stricter reason
+    assert _check("שיעור ההיוון העדכני ביותר במקורות שנבדקו הוא 6.5% [V1].", ws) == []
+    same = datum.facet("התזרים דמי שכירות משרדים", "sentence", datum.TIER_OWN)
+    (q,) = _check("שיעור ההיוון העדכני הוא 6.5% [V1].", _rates(same, same_unit=False))
+    assert "לא הוכרע" not in q.reason and "V2" in q.reason
+
+
 # --- inside the verification: the unit is judged, kept and repaired, never removed -----------------------------------------
 
 def _answer(markdown: str) -> FinalAnswer:

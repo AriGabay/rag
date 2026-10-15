@@ -38,13 +38,19 @@ def _ws(*texts: str) -> Workspace:
 
 
 def _value(ws: Workspace, written: str, label: str, kind: str = "other", *, subject: str = "נכס הדגמה",
-           document=None, asserted: bool = False) -> str:
+           document=None, asserted: bool = False, grounded: bool = False) -> str:
+    """``grounded``: a value whose kind, unit, period and VAT the source states (round 13 U4: the conflict check reads the
+    timeline's classes, whose key counts only a field the source states), with the stance of the appraisal's own data."""
     vid = f"V{len(ws.values) + 1}"
+    prov = {"unit": "model_asserted" if asserted else "source"}
+    if grounded:
+        prov |= {"kind": "source", "period": "source", "vat": "source", "stance": "source", "scenario": "not_stated"}
     ws.values[vid] = calc.Value(vid, Decimal(written.replace(",", "")), written, "S1", document or uuid.uuid4(),
-                                uuid.uuid4(), None, "דוח בדיקה", "סעיף \"סיכום\"", label, kind, "ILS", "none",
-                                "unknown", "", subject, "other",
-                                {"unit": "model_asserted" if asserted else "source"}, {"quote": f"{label} {written}"},
-                                f"{label} {written}")
+                                uuid.uuid4(), None, "דוח בדיקה", "סעיף \"סיכום\"", label, kind, "ILS",
+                                "month" if grounded and kind == "management_fee" else "none",
+                                "included" if grounded else "unknown", "", subject, "other", prov,
+                                {"quote": f"{label} {written}"}, f"{label} {written}",
+                                **({"stance": "adopted"} if grounded else {}))
     return vid
 
 
@@ -557,7 +563,9 @@ def test_a_tool_failure_is_the_reason():
 
 def test_two_values_for_the_same_property_conflict():
     ws = _ws()
-    ids = [_value(ws, "12", "דמי הניהול", "management_fee"), _value(ws, "15", "דמי הניהול", "management_fee")]
+    doc = uuid.uuid4()  # round 13 U4: one datum is the timeline's class, so the two values must be of one identity (one unit)
+    ids = [_value(ws, "12", "דמי הניהול", "management_fee", document=doc, grounded=True),
+           _value(ws, "15", "דמי הניהול", "management_fee", document=doc, grounded=True)]
     _, outcomes, gap = _missing_with(ws, TurnRequirements(), ids)
     assert outcomes[1]["limitation"] == "sources_conflict" and "סותרים" in gap
 
@@ -569,8 +577,12 @@ def test_two_values_for_different_properties_or_scenarios_do_not_conflict():
     _, outcomes, gap = _missing_with(ws, TurnRequirements(), ids)
     assert outcomes[1]["limitation"] == "not_verifiable" and "סותרים" not in gap
     ws = _ws()
-    ids = [_value(ws, "12", "דמי הניהול", "management_fee"), _value(ws, "15", "דמי הניהול", "management_fee")]
+    doc = uuid.uuid4()  # round 13 U4: one identity, so only the scenario (a stated one) tells the two apart
+    ids = [_value(ws, "12", "דמי הניהול", "management_fee", document=doc, grounded=True),
+           _value(ws, "15", "דמי הניהול", "management_fee", document=doc, grounded=True)]
+    assert coverage.conflicting(ws)
     ws.values[ids[1]].scenario = "לאחר מימוש התכנית"
+    ws.values[ids[1]].provenance["scenario"] = "source"
     assert not coverage.conflicting(ws)
 
 
@@ -1292,15 +1304,16 @@ def test_pairs_each_pair_is_decided_alone():
 
 
 def _dated_value(ws: Workspace, written: str, when: dict | None, **kw) -> str:
-    vid = _value(ws, written, "השווי", "value", **kw)
+    vid = _value(ws, written, "השווי", "value", **({"grounded": True} | kw))
     ws.values[vid].as_of = when
     return vid
 
 
 def test_conflicting_reads_a_dated_and_an_undated_value_as_one_conflict_unless_the_undated_is_history():
     ws = _ws()
-    _dated_value(ws, "2,450,000", _when("2025-03-31"))
-    undated = _dated_value(ws, "2,300,000", None)
+    doc = uuid.uuid4()  # round 13 U4: one identity (the timeline's), a grounded kind, unit and VAT
+    _dated_value(ws, "2,450,000", _when("2025-03-31"), document=doc)
+    undated = _dated_value(ws, "2,300,000", None, document=doc)
     assert coverage.conflicting(ws)
     ws.values[undated].as_of = _when(None, origin="history")
     assert not coverage.conflicting(ws)

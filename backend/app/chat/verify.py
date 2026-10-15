@@ -3111,6 +3111,11 @@ MSG_NOT_LATEST = ("הטענה קוראת ל-{older} «העדכני», אבל ב�
 # under partial coverage (round 12 U8, KTD8): the qualified wording a "latest" claim may carry, and the repair's reason
 MSG_LATEST_UNQUALIFIED = ("הטענה קוראת לנתון «העדכני» / «האחרון», אבל לא נבדקו כל השומות של הנכס ({gap}). כתוב "
                           "«{phrase}» וציין מה לא נבדק (אל תמחק ערך שנתמך), או השמט את הניסוח «העדכני» / «האחרון»")
+# a newer value whose component could not be compared with the cited one's (round 13 U4, KTD4, R20): it may or may not be a
+# later value of the same datum, so the "latest" stays qualified and the value is named
+MSG_LATEST_UNDECIDED = ("הטענה קוראת ל-{older} «העדכני» / «האחרון», אבל בתור נרשם ערך מאוחר יותר שלא הוכרע אם הוא אותו "
+                        "נתון: {newer} (מועד {when}, {title}) — הרכיב שלו לא נקבע במקור. כתוב «{phrase}» וציין ש-{newer} "
+                        "לא הוכרע (אל תמחק ערך שנתמך), או השמט את הניסוח «העדכני» / «האחרון»")
 
 
 def _calls_latest(text: str) -> bool:
@@ -3136,8 +3141,10 @@ def _latest_amount(text: str) -> bool:
 
 def _recency_claim(u: Unit, ws: Workspace) -> Problem | None:
     """A unit that calls a value the latest while the turn registered a later-dated value comparable to the one it cites
-    (``timeline.later_than``: the same property, metric family, unit, periodicity, area basis, VAT, scenario and stance; dated,
-    measured, not a forecast). The server cannot tell which value the unit means, so a unit that cites the group's latest
+    (``timeline.later_than``: the same datum — the same property, metric family, unit, periodicity, area basis, VAT, scenario,
+    stance and facet class (round 13 U4, KTD4); dated, measured, not a forecast). A newer value of another component, decided
+    different from the cited one, is no later value of it; one whose component is undecided keeps the wording qualified
+    (``timeline.later_undecided``, ``MSG_LATEST_UNDECIDED``). The server cannot tell which value the unit means, so a unit that cites the group's latest
     beside an older one passes. It is a repairable partial problem, never a removal: the number the unit states is supported;
     only "the latest" is false. Whatever the mode of the turn (a false "latest" is wrong with the switch off too).
 
@@ -3155,6 +3162,11 @@ def _recency_claim(u: Unit, ws: Workspace) -> Problem | None:
     if found:
         older, newer = found[0]
         reason = MSG_NOT_LATEST.format(older=older.ref, newer=newer.ref, when=timeline.shown(newer.as_of), title=newer.title)
+        return Problem(u, reason, severity="partial", defect="recency", failure_kind="contradicts_source", check=RECENCY_CHECK)
+    if cited and timeframe.QUALIFIED not in u.text and (found := timeline.later_undecided(ws, cited)):
+        older, newer = found[0]
+        reason = MSG_LATEST_UNDECIDED.format(older=older.ref, newer=newer.ref, when=timeline.shown(newer.as_of),
+                                             title=newer.title, phrase=timeframe.LATEST_CHECKED)
         return Problem(u, reason, severity="partial", defect="recency", failure_kind="contradicts_source", check=RECENCY_CHECK)
     if not u.ids or timeframe.QUALIFIED in u.text or (not cited and not _latest_amount(u.text)):
         return None  # a passage-only unit counts only when its "latest" sits in a clause with an amount

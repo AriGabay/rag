@@ -14,14 +14,20 @@ It is source text only: what the model wrote (``Value.label``, ``Value.subject``
 reading is a pure function of stored text (no model call, no database): ``tools`` hands it the cell's row, header and
 caption, or the value's sentence with the blocks above it, once, when a datum enters the turn (KTD2).
 
-Comparing two facets is the next unit's decision; this module gives it ``core``: the facet's words normalized (quote
-marks unified, prefix letters and plural endings folded, the family's generic and metric words dropped, digits kept),
-so two spellings of one cash flow have one core. ``FACET_FAMILIES`` names the families whose datum needs a facet."""
+Comparing two facets is ``relation`` (round 13 U4, KTD3): ``core`` is the facet's words normalized (quote marks unified,
+prefix letters and plural endings folded, the family's generic and metric words dropped, digits kept), so two spellings
+of one cash flow have one core. ``FACET_FAMILIES`` names the families whose datum needs a facet. ``canonical_amount``
+(KTD5) is the one form in which two amounts are compared."""
 
 from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from decimal import Decimal
+from functools import lru_cache
+from typing import NamedTuple
+
+from app.measurements.values import parse_amount
 
 STATUS_STATED, STATUS_NONE, STATUS_NOT_READ = "stated", "none", "not_read"
 TIER_OWN, TIER_CONTEXT = "own", "context"
@@ -327,3 +333,106 @@ def sentence_with(text: str, written: str) -> str:
         if _number_token(part, written):
             return part.strip()
     return (text or "").strip()
+
+
+# --- the canonical amount (round 13 U4, KTD5) ---------------------------------------------------------------------------
+
+# a datum's amount as two data are compared: a Decimal, or (low, high) for a range. Never a string
+Amount = Decimal | tuple[Decimal, Decimal]
+
+
+def _fraction(value: Decimal, unit: str, family: str) -> Decimal:
+    """A coefficient or a proportion in the form of a fraction: a percent is divided by 100, so the unit ``percent`` ("80%" is
+    stored as 80) and the unit ``ratio`` (0.8) meet. Any other family keeps its number."""
+    return value / 100 if unit == "percent" and needs_facet(family) else value
+
+
+def canonical_amount(value: Decimal | None, *, scale: int = 1, unit: str = "", family: str = "") -> Decimal | None:
+    """The amount of a registered value (V#) as it is compared (KTD5): the number normalized (``8.0`` is ``8``) and multiplied by
+    the scale its source states ("באלפי ₪"), as a fraction in a coefficient or proportion family. None: no amount."""
+    if value is None:
+        return None
+    return _fraction(value * (scale or 1), unit, family).normalize()
+
+
+def canonical_measurement(value: object, value_text: str, *, unit: str = "", family: str = "") -> Amount | None:
+    """The amount of a stored measurement (M#) as it is compared (KTD5): a range by its bounds (``parse_amount`` of the
+    written text), else the extraction's own number (``value``), else the number ``parse_amount`` reads in the text; in the same
+    form as ``canonical_amount``. None: the text holds no number (a datum of words: it is compared as the words)."""
+    parsed = parse_amount(value_text or "")
+    if parsed is not None and parsed.form == "range" and parsed.low is not None and parsed.high is not None:
+        return (_fraction(parsed.low, unit, family).normalize(), _fraction(parsed.high, unit, family).normalize())
+    number = Decimal(str(value)) if value is not None else (parsed.value if parsed is not None else None)
+    return _fraction(number, unit, family).normalize() if number is not None else None
+
+
+# --- the decision (round 13 U4, KTD3) -----------------------------------------------------------------------------------
+
+SAME, DIFFERENT, UNDECIDED = "same", "different", "undecided"
+
+
+class Site(NamedTuple):
+    """What ``relation`` reads of a datum: ``timeline.Datum`` has the same attributes. ``appraisal``: the appraisal unit it is in
+    ((version, unit number)); ``table``: (version, table index) of its cell, or None; ``section``: the section path of its
+    block."""
+
+    family: str
+    facet: dict | None
+    appraisal: tuple | None = None
+    table: tuple | None = None
+    section: str = ""
+
+
+@lru_cache(maxsize=4096)
+def _core(written: str, family: str) -> frozenset[str]:
+    return core(written, family)
+
+
+def core_of(site) -> frozenset[str]:
+    """The core of a datum's stated facet; empty when it states none (a facet of the status ``none`` or ``not_read``, or one
+    that reduces to generic words only)."""
+    f = site.facet or {}
+    if f.get("status") != STATUS_STATED:
+        return frozenset()
+    return _core(f.get("written") or "", site.family)
+
+
+def headline(site, in_unit: int = 1) -> bool:
+    """Whether a datum is its appraisal unit's headline datum (KTD3): it states no facet, and either its family needs none or it
+    is the only value of its base key in its unit (``in_unit``: how many values of that key the unit holds)."""
+    return not core_of(site) and (not needs_facet(site.family) or in_unit <= 1)
+
+
+def _together(a, b) -> bool:
+    """Whether two data of one appraisal unit are structurally side by side: the same table, or the same section path (a list
+    and its lead-in always sit in one section, so a list needs no signal of its own: values do not store their block)."""
+    if a.appraisal is None or a.appraisal != b.appraisal:
+        return False
+    if a.table is not None and a.table == b.table:
+        return True
+    return bool(a.section) and a.section == b.section
+
+
+def relation(a, b, a_in_unit: int = 1, b_in_unit: int = 1) -> str:
+    """The one pairwise decision (R3, KTD3): are ``a`` and ``b`` one datum (``same``: compared, and a conflict when their amounts
+    differ and their periods overlap), parallel components (``different``: never a conflict) or not to be established
+    (``undecided``)? First match wins:
+
+    1. both facets are ``own`` tier and their cores are equal and not empty: same;
+    2. both are the unit's headline datum (``headline``): same;
+    3. each core keeps a content word the other lacks, and both are in one unit's same table, list or section: different;
+    4. everything else (a subset, disjoint across units, equal context-tier cores, an unresolved facet, a stated facet against
+       a headline datum): undecided.
+
+    "Different" needs structural evidence: two wordings of one datum in two documents can share no words. The rule is not
+    transitive, so it is no key field: ``timeline`` joins "same" pairs into classes. The two data are of one base key
+    (``timeline`` buckets them): ``in_unit`` is the number of values of that key in each one's appraisal unit."""
+    ca, cb = core_of(a), core_of(b)
+    own = (a.facet or {}).get("tier") == TIER_OWN and (b.facet or {}).get("tier") == TIER_OWN
+    if own and ca and ca == cb:
+        return SAME
+    if headline(a, a_in_unit) and headline(b, b_in_unit):
+        return SAME
+    if ca - cb and cb - ca and _together(a, b):
+        return DIFFERENT
+    return UNDECIDED

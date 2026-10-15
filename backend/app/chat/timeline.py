@@ -23,13 +23,23 @@ compares:
   "other" each stay a class of their own. A field that does not apply to the metric is left out of the key instead: the area basis of a total amount, the periodicity of a
   one-time value or of a datum that does not repeat, the VAT of a figure that is not money.
 
+**The datum** (round 13 U4, KTD3, KTD4, KTD5): the key above is the *base key* — it has no facet, because the facet rule
+(``datum.relation``) is not transitive. Inside a base key, two data are decided ``same``, ``different`` or ``undecided`` by that one
+rule, and the ``same`` pairs are joined (union-find) into *classes*; a class is one datum, and every reader takes it as such: the
+timeline blocks, the conflict pairs (``coverage.conflicting_pairs`` inside a class only), ``_dedupe``, the ``alone`` shortcut,
+``later_than`` and ``coverage.conflicting``. Between two classes of one base key, a pair that is ``undecided`` whose amounts
+differ and whose periods overlap is marked ``undecided`` on both rows, each naming the other (``undecided_with``). The unit is
+normalized (a percent and a ratio of a coefficient or a proportion are one unit) and the amounts are compared in one canonical
+form (``datum.canonical_amount``).
+
 **Rows** are ordered by the turn's time mode with the ordering of ``tools.time_key`` (KTD6): ``recent`` — dated values not
 later than the anchor and not forecast, newest first, then the later or forecast ones, then the unknown; ``explicit`` —
 the requested time first, then the nearest, then the unknown (the rows outside it are marked); ``none`` — chronological,
 oldest first, a forecast after the measured, the unknown last. A forecast is marked and never first. A row's marks:
 ``forecast``, ``conflict`` (another row of its group has a different amount and an overlapping period, or either has no date
 unless it is history or a comparable — ``coverage.conflicting_pairs``, round 12 U11, R18; a group with such a conflict
-gets a block even when it holds one dated row), ``outside_requested``
+gets a block even when it holds one dated row), ``undecided`` (a row of another class of its base key, whose facet could not
+be compared with it, has a different amount and an overlapping period: neither a conflict nor agreement), ``outside_requested``
 (an explicit mode, a dated row outside the requested time), ``uncertain`` (the value's or measurement's reading cannot be
 presented as certain: ``tools.value_uncertain`` / ``measurement_uncertain``) and ``unknown_date``. A value cited twice from one document
 (same date and amount) is one row.
@@ -44,11 +54,10 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from collections.abc import Callable, Collection, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
-from decimal import Decimal
 
-from app.answering.verify import numbers_in
+from app.chat import datum as D
 from app.chat.dates import is_after_anchor
 from app.chat.meaning import basis_key
 from app.chat.timeframe import coverage_note
@@ -72,8 +81,8 @@ logger = logging.getLogger(__name__)
 
 HEADING = "ציר זמן"
 DATE_KINDS = {"valuation": "מועד קובע", "transaction": "מועד עסקה", "stated": "מועד שצוין", "range": "תקופה"}
-MARKS = {"forecast": "תחזית", "conflict": "סתירה בין מקורות", "outside_requested": "מחוץ לזמן שביקשת",
-         "uncertain": "קריאה לא ודאית", "unknown_date": "מועד לא ידוע"}
+MARKS = {"forecast": "תחזית", "conflict": "סתירה בין מקורות", "undecided": "השוואה לא הוכרעה",
+         "outside_requested": "מחוץ לזמן שביקשת", "uncertain": "קריאה לא ודאית", "unknown_date": "מועד לא ידוע"}
 MSG_UNKNOWN_DATE = MARKS["unknown_date"]
 MSG_NO_LOCATION = "נתון כמותי שחולץ"
 
@@ -113,7 +122,7 @@ class Datum:
     unit: str
     fields: tuple | None  # the key's fields after the property; None: a field is unknown, so it matches no other
     written: str
-    amount: Decimal | None
+    amount: object  # the canonical amount (``datum.canonical_amount``): a Decimal, (low, high) of a range, or None
     as_of: dict | None
     role: str = ""  # a value's role, or a measurement's value role
     kind: str = ""
@@ -121,6 +130,12 @@ class Datum:
     vat: str = ""
     basis: str = ""
     uncertain: bool = False  # its reading cannot be presented as certain (review #3): shown, and marked as such
+    # what the datum decision reads (round 13 U4, KTD3; ``datum.Site``): the source's facet of the datum, the appraisal unit
+    # it is in, its table ((version, table index) of a cell) and the section path of its block
+    facet: dict | None = None
+    appraisal: tuple | None = None
+    table: tuple | None = None
+    section: str = ""
 
     @property
     def dated(self) -> bool:
@@ -129,6 +144,11 @@ class Datum:
     @property
     def forecast(self) -> bool:
         return bool(self.as_of and self.as_of.get("forecast"))
+
+    @property
+    def comparable(self) -> object:
+        """What the conflict rule compares: the canonical amount, else the words of a datum that holds no number."""
+        return self.amount if self.amount is not None else " ".join((self.written or "").split())
 
     def date_key(self) -> tuple | None:
         return date_key(self.as_of)
@@ -162,13 +182,19 @@ def _stated(provenance: dict, field: str) -> bool:
     return provenance.get(field) == "source"
 
 
+def unit_key(family_: str, unit: str) -> str:
+    """The unit as the key reads it (KTD5): a coefficient or a proportion written as a percent ("80%") and as a fraction (0.8)
+    is one datum, so their units meet; any other unit is its own."""
+    return "fraction" if unit in ("percent", "ratio") and D.needs_facet(family_) else unit
+
+
 def _fields(family_: str, unit: str, period: str, vat: str, basis: str, scenario: str, stance: str,
             provenance: Callable[[str], bool]) -> tuple | None:
     """The key fields after the property (see the module doc), or None when a field that applies is unknown. ``provenance``:
     whether the source states a field."""
     if family_ in UNSPECIFIC_KINDS or not provenance("kind") or not unit or unit == "other" or not provenance("unit"):
         return None
-    out: list = [family_, unit]
+    out: list = [family_, unit_key(family_, unit)]
     if period == "one_time":
         pass  # a one-time value has no periodicity
     elif period in ("month", "year") and provenance("period"):
@@ -206,32 +232,31 @@ def datums(ws: Workspace) -> list[Datum]:
     for i, v in ws.values.items():
         prov = v.provenance or {}
         number, subject = _context(v.context)
-        amount = v.value * (v.scale or 1) if v.value is not None else None
         fam = family(v.kind)
         out.append(Datum(
             i, len(out), str(v.document_id), str(v.version_id), v.title, v.location, number, subject, fam, v.unit,
             _fields(fam, v.unit, v.period, v.vat, v.area_basis or "", v.scenario or "", v.stance or "",
                     lambda f, p=prov: _stated(p, f)),
-            v.written, amount, v.as_of, v.role or "", v.kind, v.period, v.vat, v.area_basis or "",
-            value_uncertain(ws, i)))
+            v.written, D.canonical_amount(v.value, scale=v.scale, unit=v.unit, family=fam), v.as_of, v.role or "",
+            v.kind, v.period, v.vat, v.area_basis or "", value_uncertain(ws, i),
+            v.facet, (str(v.version_id), number), tuple(v.table) if v.table else None, v.section or ""))
     for i, m in ws.measurements.items():
         r = m.row
         number, subject = _context(m.context)
         kind = getattr(r, "metric_kind", "") or ""
         fam = family(kind)
-        amount = getattr(r, "value", None)
-        if amount is None:
-            nums = sorted(numbers_in(r.value_text or ""))
-            amount = Decimal(nums[0].replace(",", "")) if len(nums) == 1 and nums[0].replace(",", "").replace(".", "", 1).isdigit() else None
+        table_index = getattr(r, "table_index", None)
         out.append(Datum(
             i, len(out), str(m.document_id), str(m.version_id), m.title, _measurement_location(r), number, subject,
             fam, r.unit or "",
             _fields(fam, r.unit or "", r.period or "", r.vat or "", r.area_basis or "",
                     getattr(r, "scenario", "") or "", getattr(r, "stance", "") or "",
                     lambda f, r=r: _record_states(r, f)),
-            r.value_text or "", Decimal(str(amount)) if amount is not None else None, m.as_of,
-            getattr(r, "value_role", "") or "", kind, r.period or "", r.vat or "", r.area_basis or "",
-            measurement_uncertain(r)))
+            r.value_text or "",
+            D.canonical_measurement(getattr(r, "value", None), r.value_text or "", unit=r.unit or "", family=fam),
+            m.as_of, getattr(r, "value_role", "") or "", kind, r.period or "", r.vat or "", r.area_basis or "",
+            measurement_uncertain(r), m.facet, (str(m.version_id), number),
+            (str(m.version_id), table_index) if table_index is not None else None, getattr(r, "section", "") or ""))
     return out
 
 
@@ -332,20 +357,120 @@ def _full_key(d: Datum, identity: Callable[[Datum], Identity], cache: dict) -> t
     return (prop, *d.fields)
 
 
-def groups(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None
-           ) -> list[list[Datum]]:
-    """The comparability groups that hold at least one of the ``cited`` ids (V#/M#), each filled from everything the turn
-    registered, in registration order; the groups in the order of their first cited datum."""
-    if not cited:
+@dataclass
+class Bucket:
+    """The data of one base key (``_full_key``), the classes the datum decision joins them into (round 13 U4, KTD3, KTD4) and the
+    decision of every pair. ``classes`` holds each class in registration order (a class is one datum); ``relation`` and
+    ``class_relation`` answer for two data and two classes. U6 reads the classes of a unit and a date from here."""
+
+    key: tuple
+    members: list[Datum]
+    classes: list[list[Datum]]
+    pairs: dict[tuple[str, str], str] = field(default_factory=dict)  # (ref, ref) in registration order -> the decision
+
+    def __post_init__(self) -> None:
+        self._class = {d.ref: n for n, c in enumerate(self.classes) for d in c}
+
+    def class_of(self, d: Datum) -> int:
+        return self._class[d.ref]
+
+    def relation(self, a: Datum, b: Datum) -> str:
+        """The decision for two data of this key: ``same`` when they are of one class (even where the pair itself was not
+        decided so: the classes close the relation), else the pair's own decision."""
+        if self.class_of(a) == self.class_of(b):
+            return D.SAME
+        return self.pairs[(a.ref, b.ref) if a.index < b.index else (b.ref, a.ref)]
+
+    def class_relation(self, x: list[Datum], y: list[Datum]) -> str:
+        """The decision for two classes: ``different`` as soon as one pair across them is decided different (two data that are
+        each one datum with their class-mates, and two of them parallel components, make the classes two data), else
+        ``undecided``. Two classes are never ``same``."""
+        for a in x:
+            for b in y:
+                if self.relation(a, b) == D.DIFFERENT:
+                    return D.DIFFERENT
+        return D.UNDECIDED
+
+    def conflicts(self, keep: Callable[[Datum], bool] | None = None) -> list[tuple[Datum, Datum]]:
+        """The pairs inside a class whose amounts differ and whose periods overlap (``coverage.conflicting_pairs``): the one
+        conflict rule. ``keep``: only the data it accepts are compared (a class is still the whole class)."""
+        from app.chat.coverage import Comparable, conflicting_pairs
+
+        out = []
+        for cls in self.classes:
+            seen = [d for d in cls if keep is None or keep(d)]
+            pairs = conflicting_pairs([Comparable(None, d.comparable, d.as_of) for d in seen])
+            out.extend((seen[i], seen[j]) for i, j in pairs)
+        return out
+
+    def undecided(self) -> list[tuple[Datum, Datum]]:
+        """The pairs of two classes that could not be compared (``undecided``) whose amounts differ and whose periods overlap
+        (the same period rule as a conflict): neither a conflict nor agreement (R6). Decided pair by pair: a pair across two
+        classes is marked even when other pairs of the same classes are decided different."""
+        from app.chat.coverage import Comparable, clashing
+
+        out = []
+        for n, a in enumerate(self.members):
+            for b in self.members[n + 1:]:
+                if self.class_of(a) == self.class_of(b) or self.pairs[(a.ref, b.ref)] != D.UNDECIDED:
+                    continue
+                if clashing(Comparable(None, a.comparable, a.as_of), Comparable(None, b.comparable, b.as_of)):
+                    out.append((a, b))
+        return out
+
+    def undecided_with(self) -> dict[str, list[str]]:
+        """``undecided`` by datum: the ids of the data each could not be compared with (the counterpart's sid, R6)."""
+        out: dict[str, list[str]] = {}
+        for a, b in self.undecided():
+            out.setdefault(a.ref, []).append(b.ref)
+            out.setdefault(b.ref, []).append(a.ref)
+        return out
+
+
+def _classify(key: tuple, members: list[Datum]) -> Bucket:
+    """Decide every pair of a base key (``datum.relation``) and join the ``same`` ones into classes (union-find). A datum is
+    the headline datum of its appraisal unit when no other value of the key — counted by amount, so a value taken from the
+    text and the stored measurement of the same figure are one — is in that unit."""
+    amounts: dict[tuple, set] = {}
+    for d in members:
+        amounts.setdefault(d.appraisal, set()).add(d.comparable)
+    count = {d.ref: len(amounts[d.appraisal]) for d in members}
+    parent = list(range(len(members)))
+
+    def root(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    pairs: dict[tuple[str, str], str] = {}
+    for i, a in enumerate(members):
+        for j in range(i + 1, len(members)):
+            b = members[j]
+            decision = pairs[(a.ref, b.ref)] = D.relation(a, b, count[a.ref], count[b.ref])
+            if decision == D.SAME:
+                parent[root(j)] = root(i)
+    by_root: dict[int, list[Datum]] = {}
+    for i, d in enumerate(members):
+        by_root.setdefault(root(i), []).append(d)
+    return Bucket(key, members, sorted(by_root.values(), key=lambda c: c[0].index), pairs)
+
+
+def buckets(ws: Workspace, cited: Collection[str] | None, identity: Callable[[Datum], Identity] | None = None,
+            everything: list[Datum] | None = None) -> list[Bucket]:
+    """The base-key buckets that hold at least one of the ``cited`` ids (V#/M#; None: every datum), each filled from everything
+    the turn registered, in registration order, with its classes and decisions; the buckets in the order of their first cited
+    datum. ``everything``: the turn's ``datums`` when the caller already has them."""
+    if cited is not None and not cited:
         return []
     identity = identity or identity_of(ws)
-    everything = datums(ws)
-    wanted = [d for d in everything if d.ref in cited]
+    everything = datums(ws) if everything is None else everything
+    wanted = everything if cited is None else [d for d in everything if d.ref in cited]
     cache: dict = {}
     alone = {f for f, n in Counter(d.fields for d in everything if d.fields is not None).items() if n == 1}
 
     def key_of(d: Datum) -> tuple:
-        # a datum whose fields no other datum has is alone in its group whatever its property is: the group is dropped by
+        # a datum whose fields no other datum has is alone in its bucket whatever its property is: the bucket is dropped by
         # every reader (``build``, ``later_than``: no second dated value, no later one), so its property is never read
         if d.fields in alone:
             return ("alone", d.ref)
@@ -362,7 +487,16 @@ def groups(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Id
                 found[("unknown", d.ref)].append(d)
         elif d.fields in fields and (key := key_of(d)) in found:
             found[key].append(d)
-    return list(found.values())
+    return [_classify(k, members) for k, members in found.items()]
+
+
+def groups(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None
+           ) -> list[list[Datum]]:
+    """The datum classes that hold at least one of the ``cited`` ids (V#/M#), each filled from everything the turn registered
+    (in registration order): one datum's history. A base key may hold several classes (parallel or undecided components)."""
+    if not cited:
+        return []
+    return [c for b in buckets(ws, cited, identity) for c in b.classes if any(d.ref in cited for d in c)]
 
 
 # --- order, marks, rows ---------------------------------------------------------------------------------------------------
@@ -380,11 +514,12 @@ def _order(ws: Workspace, d: Datum) -> tuple:
 
 
 def _dedupe(members: list[Datum]) -> list[Datum]:
-    """One row for a datum registered twice from one document (same date and amount)."""
+    """One row for a datum registered twice from one document (same date, amount and facet: round 13 U4, R10 — the same number
+    of two components is two rows)."""
     seen: set[tuple] = set()
     out = []
     for d in members:
-        k = (d.document_id, d.date_key(), d.amount if d.amount is not None else d.written)
+        k = (d.document_id, d.date_key(), d.comparable, D.core_of(d))
         if k in seen:
             continue
         seen.add(k)
@@ -407,23 +542,28 @@ def _outside(ws: Workspace, d: Datum) -> bool:
     return ws.time.mode == "explicit" and ws.time.requested is not None and d.dated and _order(ws, d)[0] != 0
 
 
-def _row(ws: Workspace, d: Datum, conflicts: set) -> dict:
+def _row(ws: Workspace, d: Datum, conflicts: set, undecided: dict[str, list[str]] | None = None) -> dict:
     marks = []
     if d.forecast:
         marks.append("forecast")
     if d.ref in conflicts:
         marks.append("conflict")
+    if undecided and d.ref in undecided:
+        marks.append("undecided")
     if _outside(ws, d):
         marks.append("outside_requested")
     if d.uncertain:
         marks.append("uncertain")
     if not d.dated:
         marks.append("unknown_date")
-    return {"date": d.as_of["date"] if d.dated else None, "precision": d.as_of.get("precision") if d.dated else None,
-            "end": d.as_of.get("end") if d.dated else None, "date_kind": _date_kind(d), "value_text": d.written,
-            "unit": UNIT_LABELS.get(d.unit) or None, "sid": d.ref,
-            "source": {"document_id": d.document_id, "title": d.title, "location": d.location or None},
-            "marks": marks}
+    row = {"date": d.as_of["date"] if d.dated else None, "precision": d.as_of.get("precision") if d.dated else None,
+           "end": d.as_of.get("end") if d.dated else None, "date_kind": _date_kind(d), "value_text": d.written,
+           "unit": UNIT_LABELS.get(d.unit) or None, "sid": d.ref,
+           "source": {"document_id": d.document_id, "title": d.title, "location": d.location or None},
+           "marks": marks}
+    if undecided and d.ref in undecided:
+        row["undecided_with"] = list(undecided[d.ref])  # the counterpart's sid (R6): the mark names the other value
+    return row
 
 
 def _label(members: list[Datum], who: Identity) -> str:
@@ -441,24 +581,29 @@ def _label(members: list[Datum], who: Identity) -> str:
 
 
 def build(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None) -> list[dict]:
-    """The timeline: a ``{"label", "rows"}`` block for every comparability group of the ``cited`` ids that holds two or more
-    dated values, or a conflict that involves a value with no date (round 12 U11, KTD13: the mark must be visible), its rows
+    """The timeline: a ``{"label", "rows"}`` block for every datum class of the ``cited`` ids that holds two or more dated
+    values, or a conflict that involves a value with no date (round 12 U11, KTD13: the mark must be visible), its rows
     ordered by the turn's time mode and marked (see the module doc). A row is marked ``conflict`` when
-    ``coverage.conflicting_pairs`` pairs it with another row of its group."""
+    ``coverage.conflicting_pairs`` pairs it with another row of its class, and ``undecided`` (round 13 U4, R6) when a datum of
+    another class of its base key that could not be compared with it has a different amount in an overlapping period; the
+    row then carries that datum's sid as ``undecided_with``."""
     from app.chat.coverage import Comparable, conflicting_pairs
 
     identity = identity or identity_of(ws)
     blocks = []
-    for members in groups(ws, cited, identity):
-        members = _dedupe(members)
-        pairs = conflicting_pairs([Comparable(None, d.amount if d.amount is not None else d.written, d.as_of)
-                                   for d in members])
-        conflicts = {members[i].ref for pair in pairs for i in pair}
-        if sum(1 for d in members if d.dated) < 2 and not any(not d.dated and d.ref in conflicts for d in members):
-            continue
-        ordered = sorted(members, key=lambda d: (_order(ws, d), d.index))
-        blocks.append({"label": _label(ordered, identity(ordered[0])),
-                       "rows": [_row(ws, d, conflicts) for d in ordered]})
+    for bucket in buckets(ws, cited, identity):
+        undecided = bucket.undecided_with()
+        for cls in bucket.classes:
+            if not any(d.ref in cited for d in cls):
+                continue
+            members = _dedupe(cls)
+            pairs = conflicting_pairs([Comparable(None, d.comparable, d.as_of) for d in members])
+            conflicts = {members[i].ref for pair in pairs for i in pair}
+            if sum(1 for d in members if d.dated) < 2 and not any(not d.dated and d.ref in conflicts for d in members):
+                continue
+            ordered = sorted(members, key=lambda d: (_order(ws, d), d.index))
+            blocks.append({"label": _label(ordered, identity(ordered[0])),
+                           "rows": [_row(ws, d, conflicts, undecided) for d in ordered]})
     return blocks
 
 
@@ -477,6 +622,13 @@ def shown(row: dict | None) -> str:
     return shown_period(row["date"], row["precision"], row.get("end"))
 
 
+def _mark_text(row: dict, mark: str) -> str:
+    """A mark as the copy shows it; an undecided one names the datum it could not be compared with."""
+    if mark == "undecided" and row.get("undecided_with"):
+        return f"{MARKS[mark]} ({', '.join(row['undecided_with'])})"
+    return MARKS[mark]
+
+
 def plain_text(blocks: list[dict]) -> str:
     """The whole timeline as plain text: the heading, then for each group its label and one line per row — date, kind of
     date, value, source title, marks. "" when there is no timeline."""
@@ -488,7 +640,7 @@ def plain_text(blocks: list[dict]) -> str:
         for r in b["rows"]:
             value = f"{r['value_text']} {r['unit']}" if r["unit"] else r["value_text"]
             cells = [shown(r), DATE_KINDS.get(r["date_kind"]), value, r["source"]["title"],
-                     ", ".join(MARKS[m] for m in r["marks"] if not (m == "unknown_date" and not r["date"]))]
+                     ", ".join(_mark_text(r, m) for m in r["marks"] if not (m == "unknown_date" and not r["date"]))]
             lines.append("- " + " · ".join(c for c in cells if c))
     return "\n".join(lines)
 
@@ -568,22 +720,51 @@ def _measured_before_anchor(ws: Workspace, d: Datum) -> bool:
     return d.dated and not d.forecast and not is_after_anchor(a.get("end") or a["date"], a["precision"], ws.time.anchor)
 
 
+def _later(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None
+           ) -> tuple[list[tuple[Datum, Datum]], list[tuple[Datum, Datum]]]:
+    """``(decided, undecided)`` — the pairs (the latest cited value of a class, the latest later one) of ``later_than`` and of
+    ``later_undecided``. A later datum of the cited datum's own class is decided; one of another class of its base key is
+    ignored when that class is decided different from the cited one, and undecided otherwise (KTD4)."""
+    decided: list[tuple[Datum, Datum]] = []
+    undecided: list[tuple[Datum, Datum]] = []
+    for bucket in buckets(ws, cited, identity):
+        for cls in bucket.classes:
+            mine = [d for d in cls if d.ref in cited and _measured_before_anchor(ws, d)]
+            if not mine:
+                continue
+            newest = max(mine, key=lambda d: (_end(d), -d.index))
+
+            def newer(members: list[Datum], newest: Datum = newest) -> Datum | None:
+                later = [d for d in members if _measured_before_anchor(ws, d) and _start(d) > _end(newest)]
+                return max(later, key=lambda d: (_end(d), -d.index)) if later else None
+
+            if (found := newer(cls)) is not None:
+                decided.append((newest, found))
+            for other in bucket.classes:
+                if other is not cls and bucket.class_relation(cls, other) == D.UNDECIDED \
+                        and (found := newer(other)) is not None:
+                    undecided.append((newest, found))
+    return decided, undecided
+
+
 def later_than(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None
                ) -> list[tuple[Datum, Datum]]:
-    """For every comparability group of the cited ids: when the latest-dated cited value is dated before a comparable value
-    the turn registered — one dated, measured (not a forecast, not later than the anchor) and starting after the cited
-    period ends — the pair (the latest cited value, the latest registered one). A group where a cited value is the latest
-    gives nothing."""
+    """For every datum class of the cited ids: when the latest-dated cited value is dated before a value of the same datum the
+    turn registered — one dated, measured (not a forecast, not later than the anchor) and starting after the cited period
+    ends — the pair (the latest cited value, the latest registered one). A class where a cited value is the latest gives
+    nothing, and a newer datum of another class gives nothing here: a newer datum of a class decided different (another
+    component) is not a later value of this datum (round 13 U4, KTD4), and one of an undecided class is
+    ``later_undecided``."""
     if not cited:
         return []
-    identity = identity or identity_of(ws)
-    out = []
-    for members in groups(ws, cited, identity):  # groups holds only the datums (V#, M#) among the cited ids
-        mine = [d for d in members if d.ref in cited and _measured_before_anchor(ws, d)]
-        if not mine:
-            continue
-        newest = max(mine, key=lambda d: (_end(d), -d.index))
-        later = [d for d in members if _measured_before_anchor(ws, d) and _start(d) > _end(newest)]
-        if later:
-            out.append((newest, max(later, key=lambda d: (_end(d), -d.index))))
-    return out
+    return _later(ws, cited, identity)[0]
+
+
+def later_undecided(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None
+                    ) -> list[tuple[Datum, Datum]]:
+    """The pairs (the latest cited value of a class, the latest measured value starting after it) of another class of the same
+    base key whose facet could not be compared with the cited one's (round 13 U4, KTD4, R20): the server cannot say that the
+    cited value is the latest datum, so a "latest" claim about it stays qualified, and the datum is named."""
+    if not cited:
+        return []
+    return _later(ws, cited, identity)[1]

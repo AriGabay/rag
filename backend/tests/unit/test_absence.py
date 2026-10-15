@@ -127,14 +127,19 @@ def test_an_unlinked_claim_is_not_stated_beside_the_requests_components():
     assert outcomes[0]["limitation"] == "not_located"
 
 
-def _value(ws: Workspace, vid: str, doc: str, value: str, subject: str = "מבנה ראשי") -> None:
+def _value(ws: Workspace, vid: str, doc: str, value: str, subject: str = "מבנה ראשי", facet: str = "") -> None:
+    """A value whose kind, unit and area basis the source states (round 13 U4: the conflict check reads the timeline's datum
+    classes, whose key counts only a stated field); ``facet``: the row label its source gives it (own tier)."""
     from decimal import Decimal
 
+    from app.chat import datum
     from app.chat.calc import Value
 
     ws.values[vid] = Value(vid, Decimal(value.replace(",", "")), value, "S1", doc, "v-1", None, "שומה", "עמ' 2",
-                           "שטח בנוי", "area", "sqm", "unknown", "unknown", "", subject, "total", {}, {"quote": value},
-                           value)
+                           "שטח בנוי", "area", "sqm", "unknown", "unknown", "נטו", subject, "total",
+                           {"kind": "source", "unit": "source", "area_basis": "source"}, {"quote": value}, value,
+                           section="2. תיאור הנכס",
+                           facet=datum.facet(facet, "row", datum.TIER_OWN) if facet else datum.none())
 
 
 def test_conflicting_values_in_the_sources_are_stated_as_a_conflict():
@@ -150,7 +155,7 @@ def test_conflicting_values_in_the_sources_are_stated_as_a_conflict():
 
 def test_a_conflict_without_conflicting_values_is_not_stated():
     ws = _ws()
-    _value(ws, "V1", DOC, "184")
-    _value(ws, "V2", DOC, "192", subject="מחסן")  # another subject: no conflict
+    _value(ws, "V1", DOC, "184", facet="שטח בנוי")
+    _value(ws, "V2", DOC, "192", subject="מחסן", facet="שטח המחסן")  # another component of the unit (round 13 U4): no conflict
     (r,) = coverage.validate_requested(ws, [_req("sources_conflict", label="השטח הבנוי")])
     assert r["status"] == "found"

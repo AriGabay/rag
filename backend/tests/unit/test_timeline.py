@@ -52,10 +52,12 @@ class Office:
 
     def value(self, doc: uuid.UUID, amount: str, when: dict | None, *, kind: str = "value", unit: str = "ILS",
               period: str = "none", vat: str = "included", area_basis: str = "", provenance: dict | None = None,
-              title: str | None = None, **kw) -> str:
+              title: str | None = None, version: uuid.UUID | None = None, **kw) -> str:
+        """``version``: the document version it is in (a new one for each value when not given); ``kw``: more ``calc.Value``
+        fields (``facet``, ``table``, ``section``, ``scale`` ...)."""
         vid = f"V{len(self.ws.values) + 1}"
         prov = SOURCE | (provenance or {})
-        v = calc.Value(vid, Decimal(amount.replace(",", "")), amount, "S1", doc, uuid.uuid4(), "r1",
+        v = calc.Value(vid, Decimal(amount.replace(",", "")), amount, "S1", doc, version or uuid.uuid4(), "r1",
                        title or self.titles.get(doc, "שומה סינתטית"), "סעיף 3", "שווי הנכס", kind, unit, period, vat,
                        area_basis, "הנכס", "appraiser_determination", prov, {"quote": f"{amount} ₪"}, f"{amount} ₪",
                        stance="adopted", **kw)
@@ -64,14 +66,16 @@ class Office:
         return vid
 
     def measurement(self, doc: uuid.UUID, amount: str, when: dict | None, *, metric_kind: str = "rent", unit: str = "ILS",
-                    period: str = "month", vat: str = "included", area_basis: str = "", stance: str = "adopted") -> str:
+                    period: str = "month", vat: str = "included", area_basis: str = "", stance: str = "adopted",
+                    value_text: str | None = None, facet: dict | None = None) -> str:
         mid = f"M{len(self.ws.measurements) + 1}"
         row = SimpleNamespace(id=uuid.uuid4(), metric="דמי שכירות", metric_kind=metric_kind, value=Decimal(amount.replace(",", "")),
-                              value_text=f"{amount} ₪", unit=unit, period=period, vat=vat, area_basis=area_basis,
-                              subject="הנכס", scenario="", stance=stance, status="auto_validated", quote="x",
-                              section="סעיף 4", block_index=1, table_index=None)
+                              value_text=value_text or f"{amount} ₪", unit=unit, period=period, vat=vat,
+                              area_basis=area_basis, subject="הנכס", scenario="", stance=stance, status="auto_validated",
+                              quote="x", section="סעיף 4", block_index=1, table_index=None)
         m = Measurement(mid, row.id, doc, uuid.uuid4(), self.titles.get(doc, "שומה סינתטית"), row)
         m.as_of = when
+        m.facet = facet
         self.ws.measurements[mid] = m
         return mid
 
@@ -650,6 +654,70 @@ def test_validate_requested_keeps_sources_conflict_exactly_when_the_timeline_sho
         o.value(o.doc(), "2,300,000", second)
         status, marked = claimed(o, v1)
         assert marked is expected and (status == "sources_conflict") is expected
+
+
+# --- one datum decision (round 13 U4: R3, R4, R6; KTD3, KTD4) ----------------------------------------------------------------------
+
+from app.chat import datum  # noqa: E402
+
+
+def _coefficient(o: Office, doc, amount: str, when: dict | None, written: str | None, *, version=None,
+                 tier: str = "own") -> str:
+    """A coefficient of a table row naming ``written`` (None: no facet stated), in one section."""
+    facet = datum.facet(written, "row", tier) if written else datum.none()
+    return o.value(doc, amount, when, kind="coefficient", unit="ratio", version=version or uuid.uuid4(), facet=facet,
+                   section="3. מקדמים")
+
+
+def test_two_coefficients_that_could_not_be_compared_are_undecided_not_a_conflict_and_the_status_follows():
+    """The parity test of the conflict reason, for a pair that is neither: undecided on the timeline, and
+    ``sources_conflict`` is not kept for it."""
+    o = Office()
+    a = _coefficient(o, o.doc(), "0.8", as_of("2025-03-31"), "מקדם הפחתה בשל מגבלות בנייה")
+    b = _coefficient(o, o.doc(), "0.9", as_of("2025-03-31"), "מקדם הפחתה בשל שיתוף במקרקעין")  # another unit: no evidence
+    docs = [str(d) for d in o.property]
+    for d in docs:
+        o.ws.activity[d] = {"title": "שומה סינתטית", "partial": False}
+    req = SimpleNamespace(document_ids=docs, status="sources_conflict", component="N1", label="שווי", checked_where=None)
+    (out,) = coverage.validate_requested(o.ws, [req])
+    assert out["status"] != "sources_conflict" and not coverage.conflicting(o.ws)
+    assert o.blocks({a, b}) == []  # one row each: no timeline block (the components table is U6's)
+    ((x, y),) = timeline.buckets(o.ws, {a, b})[0].undecided()
+    assert {x.ref, y.ref} == {a, b}
+
+
+def test_an_undecided_mark_is_on_both_rows_and_carries_the_counterparts_sid():
+    o = Office()
+    facet = "מקדם הפחתה בשל מגבלות בנייה"
+    old = _coefficient(o, o.doc(), "0.8", as_of("2023-03-31"), facet)
+    new = _coefficient(o, o.doc(), "0.8", as_of("2025-03-31"), facet)  # one datum over two years: a history, two rows
+    other = _coefficient(o, o.doc(), "0.9", as_of("2025-03-31"), "מקדם הפחתה בשל שיתוף במקרקעין")
+    (g,) = o.blocks({new})
+    rows = {r["sid"]: r for r in g["rows"]}
+    assert set(rows) == {old, new}
+    assert rows[new]["marks"] == ["undecided"] and rows[new]["undecided_with"] == [other]
+    assert rows[old]["marks"] == [] and "undecided_with" not in rows[old]  # 2023 does not overlap 2025
+    assert timeline.MARKS["undecided"] == "השוואה לא הוכרעה"
+    assert f"{timeline.MARKS['undecided']} ({other})" in timeline.plain_text([g])
+    assert not coverage.conflicting(o.ws)
+
+
+def test_a_pair_of_equal_amounts_is_never_marked_undecided():
+    o = Office()
+    a = _coefficient(o, o.doc(), "0.8", as_of("2025-03-31"), "מקדם הפחתה בשל מגבלות בנייה")
+    b = _coefficient(o, o.doc(), "0.80", as_of("2025-03-31"), "מקדם הפחתה בשל שיתוף במקרקעין")
+    assert timeline.buckets(o.ws, {a, b})[0].undecided() == []
+
+
+def test_the_base_key_normalizes_the_unit_so_a_percent_and_a_ratio_of_a_coefficient_meet_but_a_value_does_not_split():
+    o = Office()
+    doc = o.doc()
+    fraction = o.value(doc, "0.8", as_of("2025-03-31"), kind="coefficient", unit="ratio")
+    percent = o.value(o.doc(), "80", as_of("2025-03-31"), kind="coefficient", unit="percent")
+    assert [len(g) for g in timeline.groups(o.ws, {fraction})] == [2]
+    other = o.value(doc, "80", as_of("2025-03-31"), kind="value", unit="percent")  # not a coefficient or a proportion
+    assert all(other not in {d.ref for d in g} for g in timeline.groups(o.ws, {fraction}))
+    assert not coverage.conflicting(o.ws, ids={fraction, percent})  # 0.8 = 80%: one amount at one date
 
 
 def test_a_property_graph_that_cannot_be_read_gives_every_datum_no_identity_and_the_conflict_check_no_key(monkeypatch):

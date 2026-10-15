@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.chat import calc, contexts, coverage
+from app.chat.tools import Workspace
 
 
 def B(i: int, kind: str, page: int | None, text: str, top: float = 100.0, table_index: int | None = None,
@@ -184,23 +185,28 @@ def test_calculate_refuses_values_of_two_contexts_without_a_comparison():
     assert calc.evaluate(calc.parse("V1 + V2"), same, contexts=[]).value == Decimal("21520")
 
 
-def test_two_contexts_with_different_values_are_not_a_source_conflict(monkeypatch):
-    from app.config import get_settings
+def _grounded(vid: str, amount: str, number: int, document) -> calc.Value:
+    """A value per area the source states (kind, unit, area basis), in appraisal ``number`` of file ``document``."""
+    from uuid import uuid4
 
-    def value(vid: str, amount: str, ctx: dict | None):
-        return SimpleNamespace(vid=vid, document_id="d", kind="value_per_area", unit="ILS_per_sqm", period="none",
-                               area_basis="", subject="הנכס", scenario="", stance="unknown", value=Decimal(amount),
-                               context=ctx)
+    return calc.Value(vid, Decimal(amount), amount, "S1", document, uuid4(), "r1", "t", "loc", "l", "value_per_area",
+                      "ILS_per_sqm", "none", "not_applicable", "נטו", "הנכס", "appraised_property",
+                      {"kind": "source", "unit": "source", "area_basis": "source"}, {}, "q",
+                      context={"key": f"v#{number}", "number": number, "subject": True})
 
-    ws = SimpleNamespace(values={"V1": value("V1", "21400", {"key": "v#1"}),
-                                 "V2": value("V2", "22100", {"key": "v#2"})}, measurements={})
-    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+
+def test_two_contexts_with_different_values_are_not_a_source_conflict():
+    """Round 13 U4 (R3, KTD4): the conflict check reads the timeline's datum classes, and the appraisal unit (its context
+    number) is the identity of a value no property group holds — so two appraisals of one file never conflict, whatever
+    ``chat_appraisal_context_enforced`` says, and two values of one appraisal do."""
+    from uuid import uuid4
+
+    doc = uuid4()
+    ws = Workspace(ctx=None)
+    ws.values.update({"V1": _grounded("V1", "21400", 1, doc), "V2": _grounded("V2", "22100", 2, doc)})
     assert not coverage.conflicting(ws)
-    ws.values["V3"] = value("V3", "22500", {"key": "v#2"})  # the same context, the same datum, another amount
+    ws.values["V3"] = _grounded("V3", "22500", 2, doc)  # the same context, the same datum, another amount
     assert coverage.conflicting(ws)
-    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", False)
-    del ws.values["V3"]
-    assert coverage.conflicting(ws)  # off: keyed on the subject's words, as before
 
 
 # --- only a real report start opens a context: the top-level numbering restarts there (U6 follow-up) ------------------
@@ -441,17 +447,21 @@ def test_a_claim_about_appraisal_one_citing_a_comparables_row_is_not_removed_as_
 
 
 def test_an_appendix_value_is_no_second_answer_for_the_subjects_datum(monkeypatch):
+    from uuid import uuid4
+
     from app.config import get_settings
 
     cx = _units_contexts()
+    doc = uuid4()
 
     def value(vid: str, n: int, amount: str):
-        return SimpleNamespace(vid=vid, document_id="d", kind="value_per_area", unit="ILS_per_sqm", period="none",
-                               area_basis="", subject="הנכס", scenario="", stance="unknown", value=Decimal(amount),
-                               context=_real_value(cx, n, vid, "1").context)
+        v = _grounded(vid, amount, n, doc)
+        v.context = _real_value(cx, n, vid, "1").context
+        return v
 
     monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
-    ws = SimpleNamespace(values={"V1": value("V1", 2, "21400"), "V2": value("V2", 4, "9000")}, measurements={})
+    ws = Workspace(ctx=None)
+    ws.values.update({"V1": value("V1", 2, "21400"), "V2": value("V2", 4, "9000")})
     assert not coverage.conflicting(ws)
 
 
