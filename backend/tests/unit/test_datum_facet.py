@@ -125,6 +125,17 @@ def test_a_purpose_phrase_between_the_metric_word_and_the_number_is_read_too():
     assert _quote(text, "8.5").facet == _facet("תזרים ערך השייר", "sentence")
 
 
+def test_function_words_at_the_edges_of_a_purpose_phrase_are_trimmed_before_and_after_the_number():
+    before = "הובאה בחשבון הפחתה לסחירות וגמישות מועטה של שימושים של 20%."
+    f = _quote(before, "20", preceding=[], kind="coefficient", unit="percent").facet
+    assert f == _facet("סחירות וגמישות מועטה של שימושים", "sentence")  # the inner "של" stays, the trailing one goes
+    after = "שיעור היוון של 6.5% לתזרים דמי שכירות ממשרדים בשיעור -"
+    assert _quote(after, "6.5", preceding=[]).facet == _facet("תזרים דמי שכירות ממשרדים", "sentence")
+    assert datum.tidy("על: שימושים של ") == "שימושים"
+    assert datum.core("סחירות וגמישות מועטה של שימושים של", "coefficient") == datum.core(
+        "סחירות וגמישות מועטה של שימושים", "coefficient")
+
+
 def test_a_lead_in_naming_a_cash_flow_is_a_context_facet_when_the_sentence_names_none():
     f = _quote("שיעור היוון 9%.", "9", preceding=[("paragraph", LEAD_IN)]).facet
     assert f == _facet("תזרים הכנסות משטחי פרסום על הגג", "lead_in", "context")

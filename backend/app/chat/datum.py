@@ -211,7 +211,7 @@ def _context(text: str, family: str, part: str) -> dict | None:
     cleaned = re.sub(r"^\s*(?:\d+(?:\.\d+)*[.)]?|[א-ת][.)])\s+", "", (text or "").strip()).rstrip(" :").strip()
     if not cleaned or not (_stems(cleaned) & _CUE_WORDS) or not _states(cleaned, family):
         return None
-    return facet(cleaned, part, TIER_CONTEXT)
+    return facet(tidy(cleaned), part, TIER_CONTEXT)
 
 
 # --- quote values ----------------------------------------------------------------------------------------------------------
@@ -224,6 +224,22 @@ _NOT_A_COMPONENT = _stems(
 _CLAUSE_END = ",;:.)"
 _STOP_WORDS = frozenset({"הוא", "היא", "הינו", "הינה", "עומד", "עומדת", "נקבע", "נקבעה", "אומץ", "אומצה"})
 _PHRASE_MAX = 8
+
+
+# function words and connectors that open or close a phrase without belonging to the component it names ("…מועטה של"
+# before a number, "בשיעור …" after one)
+_EDGE_WORDS = frozenset({"של", "על", "עם", "את", "ב", "ל", "ו", "בגובה", "בשיעור", "בסך", "הוא", "היא", "-", "–", "—"})
+
+
+def tidy(written: str) -> str:
+    """A facet's written words without the function words, connectors, dashes and colons at either edge; the words
+    inside are the source's as they are. The core of the text is the same before and after."""
+    words = [w for w in (written or "").split() if w.strip(":,;")]
+    while words and (words[-1].strip(":,;") in _EDGE_WORDS or not _bare(words[-1])):
+        words.pop()
+    while words and (words[0].strip(":,;") in _EDGE_WORDS or not _bare(words[0])):
+        words.pop(0)
+    return " ".join(words).strip(" :,;-–—")
 
 
 def _bare(token: str) -> str:
@@ -260,7 +276,7 @@ def read_sentence(sentence: str, written: str, family: str = "") -> dict | None:
             first, head = j, bare[j][1:]
         if first is not None and head and not _excluded_head(head):
             words = [head] + [_bare(t) for t in _after(tokens, first)]
-            phrase = " ".join(w for w in words if w)
+            phrase = tidy(" ".join(w for w in words if w))
             if _states(phrase, family):
                 return facet(phrase, "sentence", TIER_OWN)
         if tokens[j][-1:] in ",;:" and (at is None or j < at):
