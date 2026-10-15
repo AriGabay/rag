@@ -92,6 +92,9 @@ Synthetic fixtures passed before each of these was found. The real reported ques
 - **Marks needed class-level resolution.** If A ≡ A′ and A′ is different from B′, then A is different from B′.
 - **The model writes the component into the free-text scenario,** which split the key. A scenario contained in the facet is now not part of the key.
 - **Duplicates kept the uncited copy,** so the components block was skipped.
+- **The number re-read read only forward.** A plot number stated once at the start of a section, eight blocks before the cited passage, removed a claim holding two grounded reductions. A claim with no citation, whose support the judge named, also got no re-read. Both now get the bounded re-read, which includes the part of the section before the passage.
+- **A PDF line break inside a VAT phrase.** "לא", then a line break, then "כולל מע״מ" ended the clause at the break. The source was read as "VAT included", and a grounded value was removed. A break inside the phrase is now read as a space.
+- **A percentage of a stated fraction.** Weights the answer wrote as 80% and 20% were "absent", because the table writes them as 0.80 and 0.20. A percentage now counts as stated when the source states its fraction.
 
 ## Prevention
 - **Decide identity pairwise, with a reason.** A pairwise decision with a stored reason replaces a key whenever "different" is not transitive. This is the same move round 12 made for property identity.
