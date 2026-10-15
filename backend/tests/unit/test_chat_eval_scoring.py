@@ -196,3 +196,174 @@ def test_usage_report_prices_each_call_by_its_model_and_purpose_with_cache_bucke
     assert "| verify | gpt-6-luna | 1 | 1,000 | 40% | 10% | 50 | 0.0001$ |" in text  # 91.5e-6
     assert "| resolve | unpriced-model | 1 |" in text and "בלי 1 קריאות שעלותן לא ידועה" in text
     assert "סה\"כ 0.750$" in text and "0.37" in text  # mean per turn over both turns, the failed one included
+
+
+# --- `source_docs_mode: if_needed` and `--sha` (round 13 U1, KTD18) ---------------------------------------------
+
+GLOSSARY = "מילון מונחים"
+APPRAISAL_TITLE = "שומה הדגמה 5"
+STANDARD_TITLE = "תקן הדגמה 99"
+
+
+def _src(sid: str, title: str, kind: str = "appraisal") -> dict:
+    return {"id": sid, "title": title, "source_kind": kind, "kind": "passage"}
+
+
+def _mixed_turn(markdown: str, sources: list[dict], *, removed: list[dict] | None = None, judge_status: str = "ok",
+                judged: bool = True) -> dict:
+    """A turn as the runner stores it: the answer payload, with the diagnostics the runner fetched."""
+    cited = [s for s in sources if f"[{s['id']}]" in markdown]
+    removals = [{"claim_id": r["claim_id"], "action": r["action"]} for r in removed or []]
+    return {"status": "done",
+            "answer": {"markdown": markdown, "status": "answered", "sources": cited, "measurements": [],
+                       "verification": {"judged": judged, "judge_status": judge_status, "removed": len(removals),
+                                        "removals": removals}},
+            "_diagnostics": {"rounds": [], "removed": removed or []}}
+
+
+def _removal(action: str, text: str, kind: str) -> dict:
+    return {"claim_id": "c1", "action": action, "text": text, "verdict": "unsupported",
+            "sources": [{"id": "S9", "type": "sources", "source_kind": kind}]}
+
+
+IF_NEEDED = {"source_docs": [GLOSSARY], "source_docs_mode": "if_needed"}
+APPRAISAL_LINE = "השווי למ\"ר בשומה הוא 9,500 ₪ [S1]."
+STANDARD_LINE = "לפי התקן, שווי שוק הוא המחיר שהיה משולם בעסקה בין קונה מרצון למוכר מרצון [S2]."
+SOURCES = [_src("S1", APPRAISAL_TITLE), _src("S2", STANDARD_TITLE, "standard"),
+           _src("S3", GLOSSARY, "professional")]
+
+
+def test_default_mode_still_requires_the_cited_document():
+    from eval.chat_eval import grade_turn
+
+    m = _mixed_turn(f"{APPRAISAL_LINE}\n\n{STANDARD_LINE}", SOURCES)
+    assert grade_turn(m, {"source_docs": [GLOSSARY]}, {}) == [f"אין מקור מהמסמך '{GLOSSARY}'"]
+    assert grade_turn(m, {"source_docs": [GLOSSARY], "source_docs_mode": "cited"}, {}) == [
+        f"אין מקור מהמסמך '{GLOSSARY}'"]
+
+
+def test_if_needed_passes_when_the_glossary_is_cited():
+    from eval.chat_eval import grade_turn
+
+    m = _mixed_turn(f"{APPRAISAL_LINE}\n\nהמונח מוגדר במילון [S3].", SOURCES)
+    assert grade_turn(m, IF_NEEDED, {}) == []
+
+
+def test_if_needed_passes_when_every_professional_statement_is_verified_by_another_cited_source():
+    from eval.chat_eval import grade_turn
+
+    m = _mixed_turn(f"{APPRAISAL_LINE}\n\n{STANDARD_LINE}", SOURCES)
+    assert grade_turn(m, IF_NEEDED, {}) == []
+
+
+def test_if_needed_fails_when_a_professional_statement_was_removed_and_the_glossary_is_not_cited():
+    from eval.chat_eval import grade_turn
+
+    gone = _removal("removed", "שווי שוק הוא המחיר בעסקה בין קונה מרצון למוכר מרצון.", "professional")
+    m = _mixed_turn(f"{APPRAISAL_LINE}\n\n{STANDARD_LINE}", SOURCES, removed=[gone])
+    problems = grade_turn(m, IF_NEEDED, {})
+    assert len(problems) == 1 and GLOSSARY in problems[0] and "הוסרה" in problems[0]
+    only_gone = _mixed_turn(APPRAISAL_LINE, SOURCES, removed=[gone])  # nothing professional is left in the text
+    assert grade_turn(only_gone, IF_NEEDED, {})
+    # a removed property statement is none of this check's business
+    property_gone = _removal("removed", "השטח הבנוי 120 מ\"ר.", "appraisal")
+    assert grade_turn(_mixed_turn(f"{APPRAISAL_LINE}\n\n{STANDARD_LINE}", SOURCES, removed=[property_gone]),
+                      IF_NEEDED, {}) == []
+
+
+def test_if_needed_fails_an_answer_without_a_professional_statement_unless_it_was_not_asked():
+    from eval.chat_eval import grade_turn
+
+    m = _mixed_turn(APPRAISAL_LINE, SOURCES)
+    problems = grade_turn(m, IF_NEEDED, {})
+    assert len(problems) == 1 and "אין בתשובה טענה מקצועית" in problems[0]
+    assert grade_turn(m, IF_NEEDED | {"professional_not_asked": True}, {}) == []
+    # not asked waives the missing part only: a professional statement that did not hold still fails
+    gone = _removal("cut", "הגדרה.", "standard")
+    assert grade_turn(_mixed_turn(APPRAISAL_LINE, SOURCES, removed=[gone]),
+                      IF_NEEDED | {"professional_not_asked": True}, {})
+
+
+def test_if_needed_fails_a_professional_statement_that_cannot_be_called_verified():
+    from eval.chat_eval import grade_turn
+
+    md = f"{APPRAISAL_LINE}\n\n{STANDARD_LINE}"
+    assert grade_turn(_mixed_turn(md, SOURCES, judge_status="unavailable"), IF_NEEDED, {})
+    assert grade_turn(_mixed_turn(md, SOURCES, judged=False), IF_NEEDED, {})
+    no_diagnostics = _mixed_turn(md, SOURCES) | {"_diagnostics": None}
+    assert grade_turn(no_diagnostics, IF_NEEDED, {}) == []  # nothing was removed, so there is nothing to inspect
+    no_diagnostics["answer"]["verification"]["removed"] = 1
+    assert grade_turn(no_diagnostics, IF_NEEDED, {})  # something was removed and what it was cannot be seen
+
+
+def test_if_needed_names_professional_statements_by_pattern_and_needs_a_cited_support_for_each():
+    from eval.chat_eval import grade_turn
+
+    expect = IF_NEEDED | {"professional_patterns": ["שווי שוק הוא"]}
+    # supported by the appraisal's own cited text: another cited source than the glossary
+    own = _mixed_turn("שווי שוק הוא המחיר שהיה משולם בעסקה, כפי שהשומה מגדירה [S1].", SOURCES)
+    assert grade_turn(own, expect, {}) == []
+    uncited = _mixed_turn(f"{APPRAISAL_LINE}\n\nשווי שוק הוא המחיר שהיה משולם בעסקה.", SOURCES)
+    problems = grade_turn(uncited, expect, {})
+    assert len(problems) == 1 and "אינה נתמכת" in problems[0]
+
+
+def test_if_needed_applies_to_a_stored_result_on_rescore():
+    from eval.chat_eval import rescore
+
+    turn = {"ask": "מהו שווי שוק ומה שווי הנכס?", "expect": IF_NEEDED}
+    m = _mixed_turn(f"{APPRAISAL_LINE}\n\n{STANDARD_LINE}", SOURCES)
+    stored = [{"kind": "answers", "id": "X1", "ok": False, "detail": [],
+               "data": {"turns": [{"ask": turn["ask"], "status": "done", "markdown": m["answer"]["markdown"],
+                                   "answer": m["answer"], "diagnostics": m["_diagnostics"]}]}}]
+    (r,) = rescore({"answers": [{"id": "X1", "turns": [turn]}]}, stored)
+    assert r.ok
+    stored[0]["data"]["turns"][0]["diagnostics"] = {"removed": [_removal("removed", "טענה.", "standard")]}
+    (r,) = rescore({"answers": [{"id": "X1", "turns": [turn]}]}, stored)
+    assert not r.ok
+
+
+def test_an_unknown_source_docs_mode_is_a_problem_not_a_pass():
+    from eval.chat_eval import grade_turn
+
+    m = _mixed_turn(APPRAISAL_LINE, SOURCES)
+    assert grade_turn(m, {"source_docs": [GLOSSARY], "source_docs_mode": "sometimes"}, {})
+
+
+def _sha_of(path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_sha_check_accepts_a_matching_file_and_refuses_a_changed_one(tmp_path):
+    import pytest
+
+    from eval.chat_eval import SetHashMismatch, check_set_sha
+
+    q = tmp_path / "set.yaml"
+    q.write_text("title: synthetic\nanswers: []\n", encoding="utf-8")
+    sha = tmp_path / "set.yaml.sha256"
+    sha.write_text(f"{_sha_of(q)}  set.yaml\n", encoding="utf-8")
+    assert check_set_sha(q, sha) == _sha_of(q)
+    q.write_text("title: synthetic\nanswers: []\n# edited\n", encoding="utf-8")
+    with pytest.raises(SetHashMismatch) as e:
+        check_set_sha(q, sha)
+    assert _sha_of(q) in str(e.value) and sha.read_text().split()[0] in str(e.value)
+    sha.write_text("not a hash\n", encoding="utf-8")
+    with pytest.raises(SetHashMismatch):
+        check_set_sha(q, sha)
+
+
+def test_main_refuses_a_set_that_differs_from_its_sha_before_touching_the_stack(tmp_path, capsys):
+    from eval.chat_eval import main
+
+    q = tmp_path / "set.yaml"
+    q.write_text("title: synthetic\nanswers: []\n", encoding="utf-8")
+    sha = tmp_path / "set.sha256"
+    sha.write_text("0" * 64 + "  set.yaml\n", encoding="utf-8")
+    # an unreachable base: a run that got past the check would fail on the connection, not return 2
+    code = main(["--set", str(q), "--out", str(tmp_path / "out"), "--sha", str(sha), "--base", "http://127.0.0.1:9"])
+    err = capsys.readouterr().err
+    assert code == 2 and "0" * 64 in err and _sha_of(q) in err
+    assert not (tmp_path / "out").exists()

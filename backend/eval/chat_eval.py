@@ -3,7 +3,7 @@
 Usage::
 
     uv run python -m eval.chat_eval --set <questions.yaml> --out <dir> [--base http://localhost:8000]
-                                    [--email ...] [--password ...] [--only C1,C3]
+                                    [--email ...] [--password ...] [--only C1,C3] [--sha <file>]
 
 The question set is YAML. It may describe real office documents, so the set and the results belong outside
 the repository (``real_documents/`` is ignored by git); the runner holds no document content.
@@ -46,6 +46,18 @@ A reference answer found wrong is corrected in the set, not silently: the turn k
 a turn both ways, and the report gives the original automated score and the score after reference corrections
 apart, with each correction and its evidence. The cost table gives the cost per conversation that passed.
 
+``--sha <file>`` (round 13 U1, KTD18) holds a ``shasum -a 256`` line (``<hex>  <name>``) of a frozen set. The set given
+with ``--set`` is hashed before anything runs (a rescore included) and a set that differs is refused with exit code 2,
+naming the expected and the actual hash (``check_set_sha``). Without it nothing changes.
+
+``source_docs_mode: if_needed`` (round 13 U1, KTD18) on a turn's ``expect`` is for a mixed question, whose professional
+part needs a glossary citation only when its answer needs one. The turn passes ``source_docs`` for a fragment when a
+cited source's title holds it; otherwise only when ``professional_support`` finds at least one professional statement
+and every one is verified by another cited source (the rule is in that function). ``professional_not_asked: true`` marks
+a reference whose professional part was not asked, so an answer without a professional statement passes;
+``professional_patterns: [regex]`` names professional statements by their words, for a statement that cites an
+appraisal. The default mode (``cited``) is unchanged.
+
 Each check passes or fails on its own; the report lists every failure with the text that caused it, so a
 person can read the failing answers.
 """
@@ -53,6 +65,7 @@ person can read the failing answers.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -64,6 +77,7 @@ from pathlib import Path
 import httpx
 import yaml
 
+from app.chat.verify import split_units
 from eval.scoring import (
     calc_check,
     norm,
@@ -227,6 +241,86 @@ def run_turn(c: httpx.Client, cid: str, content: str) -> dict:
         time.sleep(POLL_SECONDS)
 
 
+SOURCE_DOCS_MODES = ("cited", "if_needed")
+GONE_ACTIONS = ("removed", "withheld", "cut")  # the log's actions that take a claim out of the answer (``verify``)
+
+
+class SetHashMismatch(Exception):
+    """The question set is not the one whose hash was recorded when it was frozen."""
+
+
+def check_set_sha(set_file: str | Path, sha_file: str | Path) -> str:
+    """Round 13 U1 (KTD18): the sha256 of ``set_file`` must equal the one in ``sha_file`` (a ``shasum -a 256`` line,
+    ``<hex>  <name>``; the first word of the first non-empty line). Returns the hash; raises ``SetHashMismatch`` naming
+    the expected and the actual hash otherwise, or when the file holds no hash."""
+    lines = [x for x in Path(sha_file).read_text(encoding="utf-8").splitlines() if x.strip()]
+    expected = lines[0].split()[0].lower() if lines else ""
+    actual = hashlib.sha256(Path(set_file).read_bytes()).hexdigest()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise SetHashMismatch(f"{sha_file} holds no sha256 hash (expected a `shasum -a 256` line); actual {actual}")
+    if expected != actual:
+        raise SetHashMismatch(f"{set_file} differs from the frozen set: expected {expected}, actual {actual}")
+    return actual
+
+
+def professional_support(m: dict, expect: dict, needle: str) -> list[str]:
+    """The ``source_docs`` check of one fragment in ``if_needed`` mode, for a fragment no cited source's title holds
+    (round 13 U1, KTD18): the problems, none when the answer needs no glossary citation.
+
+    The payload has no marker on a claim saying it is professional (``claims`` is empty, ``components`` kinds are
+    information, calculation, instruction, clarification), so the rule reads what the stored turn does hold:
+
+    - a *professional statement* is a statement of the saved text (``split_units``) that cites a source whose
+      ``source_kind`` is a standard or another professional document, or whose words match one of the turn's
+      ``professional_patterns``; and, from the diagnostics, a claim the server took out (``removed``, ``withheld``,
+      ``cut``) that was checked against such a source or matches a pattern (a removed one has no text to cite);
+    - it is *verified by another cited source* when it cites a source of the answer whose title does not hold the
+      fragment, and survives the verification: the claims that failed are the ones removed, cut or withheld, so a
+      statement still standing in the text is a supported or partly supported one, provided the verifier ran
+      (``verification.judged`` and ``judge_status == "ok"``).
+
+    The answer passes when it has at least one professional statement, none was removed and every one is verified. It
+    fails when a professional statement was removed, when one is not supported by another cited source, when the
+    verification did not run, and when it has no professional statement at all, unless the turn's ``expect`` sets
+    ``professional_not_asked`` (that waives only the missing statement). A professional statement that cites only an
+    appraisal is seen only through ``professional_patterns``."""
+    a = m.get("answer") or {}
+    patterns = [re.compile(norm(p)) for p in expect.get("professional_patterns", [])]
+    by_id = {s.get("id"): s for s in a.get("sources") or []}
+    problems: list[str] = []
+
+    def professional_kind(s: dict) -> bool:
+        return s.get("kind") != "listing" and s.get("source_kind") not in (None, "appraisal")
+
+    statements = []
+    for u in split_units(a.get("markdown") or ""):
+        cited = [by_id[i] for i in u.ids if i in by_id]
+        text = norm(u.text)
+        if any(professional_kind(s) for s in cited) or any(p.search(text) for p in patterns):
+            statements.append((text, cited))
+    verification = a.get("verification") or {}
+    diagnostics = m.get("_diagnostics")
+    handled = [d for d in (diagnostics or {}).get("removed") or [] if d.get("action") in GONE_ACTIONS]
+    if diagnostics is None and (verification.get("removed") or verification.get("removals")):
+        problems.append("הוסרו טענות מהתשובה ואין אבחון שמראה אם אחת מהן מקצועית")
+    for d in handled:
+        if any(s.get("type") == "sources" and professional_kind(s) for s in d.get("sources") or []) \
+                or any(p.search(norm(d.get("text") or "")) for p in patterns):
+            problems.append(f"טענה מקצועית הוסרה ({d['action']}) ואין ציטוט מהמסמך '{needle}': "
+                            f"«{norm(d.get('text') or '')[:120]}»")
+    if not statements:
+        if not problems and not expect.get("professional_not_asked"):
+            problems.append(f"אין בתשובה טענה מקצועית ואין בה ציטוט מהמסמך '{needle}'")
+        return problems
+    for text, cited in statements:
+        if not any(needle not in (s.get("title") or "") for s in cited):
+            problems.append(f"הטענה המקצועית אינה נתמכת במקור מצוטט אחר מ'{needle}': «{text[:120]}»")
+    if not verification.get("judged") or verification.get("judge_status") != "ok":
+        problems.append(f"הטענות המקצועיות לא אומתו (judged={verification.get('judged')}, "
+                        f"judge_status={verification.get('judge_status')})")
+    return problems
+
+
 def grade_turn(m: dict, expect: dict, docs: dict) -> list[str]:
     """The regression layer: regular expressions, status and source documents."""
     problems = []
@@ -244,8 +338,16 @@ def grade_turn(m: dict, expect: dict, docs: dict) -> list[str]:
     if "status" in expect and a.get("status") not in expect["status"]:
         problems.append(f"סטטוס תשובה {a.get('status')} (צפוי {expect['status']})")
     titles = {s.get("title") for s in a.get("sources") or []}
+    mode = expect.get("source_docs_mode", "cited")
+    if mode not in SOURCE_DOCS_MODES:
+        problems.append(f"מצב source_docs לא מוכר '{mode}' (המצבים: {', '.join(SOURCE_DOCS_MODES)})")
+        mode = "cited"
     for needle in expect.get("source_docs", []):
-        if not any(needle in (t or "") for t in titles):
+        if any(needle in (t or "") for t in titles):
+            continue
+        if mode == "if_needed":
+            problems += professional_support(m, expect, needle)
+        else:
             problems.append(f"אין מקור מהמסמך '{needle}'")
     for needle in expect.get("not_source_docs", []):
         if any(needle in (t or "") for t in titles):
@@ -348,7 +450,8 @@ def rescore(spec: dict, stored: list[dict]) -> list[Result]:
         ok, detail = True, []
         turns = r["data"].get("turns", [])
         for i, (t, spec_turn) in enumerate(zip(turns, items[r["id"]]["turns"], strict=False)):
-            m = {"status": t["status"], "error": t.get("error"), "answer": t.get("answer") or {
+            m = {"status": t["status"], "error": t.get("error"), "_diagnostics": t.get("diagnostics"),
+                 "answer": t.get("answer") or {
                 "markdown": t.get("markdown"), "status": t.get("answer_status"),
                 "sources": [{"title": s.split(" ", 1)[1].rsplit(" — ", 1)[0], "location": s.rsplit(" — ", 1)[-1]}
                             for s in t.get("sources") or []]}}
@@ -670,7 +773,15 @@ def main(argv: list[str] | None = None) -> int:
                     "an `office` key belong to A); sign in with that office's --email")
     ap.add_argument("--build", default="", help="the build the stack runs, recorded beside the checkout's commit")
     ap.add_argument("--image", default="", help="the backend image id, recorded in the report")
+    ap.add_argument("--sha", default="", help="a `shasum -a 256` line of the frozen set: a --set that differs is "
+                    "refused (exit 2) before anything runs")
     args = ap.parse_args(argv)
+    if args.sha:
+        try:
+            check_set_sha(args.set, args.sha)
+        except (SetHashMismatch, OSError) as e:
+            print(f"refused: {e}", file=sys.stderr)
+            return 2
     spec = yaml.safe_load(Path(args.set).read_text(encoding="utf-8"))
     if args.rescore:
         stored = json.loads(Path(args.rescore).read_text(encoding="utf-8"))
