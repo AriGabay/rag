@@ -768,3 +768,31 @@ def test_a_newer_datum_of_an_undecided_class_is_named_in_the_record_and_the_note
     assert "later_undecided" not in timeline.coverage_of(ws, [v_old]) and timeline.coverage_of(ws, [v_old])["complete"]
     payload = timeline.payload(ws, {v_old}, coverage=timeline.coverage_of(ws, [v_old]))
     assert payload["coverage"]["note"] == TF.coverage_note(timeline.coverage_of(ws, [v_old]))
+
+
+def aliased(office, key: str, valuation: str, aliases: list[str], identification: list[str], *body: str) -> str:
+    doc, _ = unit_file(office, office.default_group_id, f"מסמך {key}", [{
+        "title": f"מסמך {key}", "aliases": aliases, "blocks": ["מסמך סינתטי — נתונים בדויים", *identification,
+                                                              f"המועד הקובע: {valuation}", *body]}],
+        sha=hashlib.sha256(f"alias-{key}".encode()).hexdigest())
+    return doc
+
+
+def test_an_alias_another_property_also_carries_is_not_used_by_the_probe_but_a_unique_one_is(office):
+    """The property's aliases include a description of its type that other properties' units carry too: a unit that merely
+    uses that description is no candidate; one that uses the property's own, unique name is."""
+    unique, shared = "מגדלי הים הכחול", "בית לדוגמה משותף"
+    focus = aliased(office, "al-focus", "30/06/2022", [unique, shared], PROPERTY)
+    aliased(office, "al-other", "30/06/2023", [shared], [CITY, "כתובת הנכס: הדולב 3", "גוש: 7102 חלקה: 4"])
+    by_unique = body_unit(office, "al-unique", "30/06/2024", f"הנכס הוא חלק מהמתחם {unique} וליד הים.")
+    by_shared = body_unit(office, "al-shared", "30/06/2025", f"הנכס הוא {shared} רגיל.")
+    ws = focused(office, RECENT, focus)
+    run(ws, "search", query=QUERY, limit=6)
+    record = ws.time_coverage
+    assert [c["document_id"] for c in record["possible"]["items"]] == [by_unique], "the unique alias is used"
+    assert by_shared not in {c["document_id"] for c in record["possible"]["items"]} and record["unlinkable"] == 1
+    assert record["excluded"] == 1 and record["blocking"] == [TF.B_POSSIBLE]
+    with tenant_tx(office.ctx()) as conn:
+        identity = T._focus_identity(ws, conn, T.property_graph(ws, conn).gather(
+            next(n.key for n in T.property_graph(ws, conn).nodes if str(n.document_id) == focus)))
+    assert identity.names == (unique,)

@@ -2121,11 +2121,32 @@ def _candidates_of(ws: Workspace, conn: Connection, gathered: Gathered, elsewher
     return group
 
 
-def _focus_identity(ws: Workspace, gathered: Gathered) -> contexts.Identity:
+def _alias_owners(ws: Workspace, conn: Connection) -> dict[str, set[tuple[str, int]]]:
+    """Each alias (``contexts.name_key``) of the office's units -> the (version, unit number) of the units that carry it: the
+    units of every version in the turn's property graph, read from the units the graph build already cached. Once per turn
+    and data version."""
+    key = ("aliases", current_data_version(conn))
+    owners = ws.property_memo.get(key)
+    if owners is None:
+        for old in [k for k in ws.property_memo if k[0] == "aliases"]:
+            del ws.property_memo[old]
+        owners = ws.property_memo[key] = {}
+        for version in sorted({str(n.version_id) for n in property_graph(ws, conn).nodes}):
+            for u in chat_dates.units_of(conn, UUID(version), ws.date_cache):
+                for a in u.aliases:
+                    owners.setdefault(contexts.name_key(a), set()).add((version, u.unit_no))
+    return owners
+
+
+def _focus_identity(ws: Workspace, conn: Connection, gathered: Gathered) -> contexts.Identity:
     """The focus property's identifiers as the probe and the matcher read them (round 13 U8, KTD15): the street core and number
-    of each address of its members, their block and parcel pairs, and the document-grounded aliases of their units (two words
-    or more: a one-word alias would match any text). ``contexts.Identity.identifier_in`` and ``name_spans`` match them in free
-    text with the prefix letters and the label optional, as for a question."""
+    of each address of its members, their block and parcel pairs, and the document-grounded aliases of their units. An alias
+    counts only when it is distinctive: two words or more (a one-word alias would match any text) and carried by no unit
+    outside the property's members — a description of the property's type ("דיור מוגן") is on every unit of that type and
+    would make each of them a candidate. ``contexts.Identity.identifier_in`` and ``name_spans`` match them in free text with
+    the prefix letters and the label optional, as for a question."""
+    own = {(str(n.version_id), n.unit_no) for n in gathered.members}
+    owners = _alias_owners(ws, conn)
     addresses, parcels, streets, aliases = set(), set(), [], []
     for n in gathered.members:
         for core, number in sorted(n.identity.addresses):
@@ -2137,7 +2158,8 @@ def _focus_identity(ws: Workspace, gathered: Gathered) -> contexts.Identity:
         parcels |= {(b, p) for b, p, _ in n.identity.parcels}
         for u in ws.date_cache.get(("units", UUID(str(n.version_id)))) or ():
             if u.unit_no == n.unit_no:
-                aliases += [a for a in (contexts.name_key(x) for x in u.aliases) if len(a.split()) >= 2]
+                aliases += [a for a in (contexts.name_key(x) for x in u.aliases)
+                            if len(a.split()) >= 2 and owners.get(a, set()) <= own]
     return contexts.Identity(frozenset(addresses), frozenset(parcels), (), tuple(streets), tuple(dict.fromkeys(aliases)))
 
 
@@ -2254,7 +2276,7 @@ def classify_undetermined(ws: Workspace, conn: Connection, gathered: Gathered) -
 
 def _classify_uncached(ws: Workspace, conn: Connection, gathered: Gathered) -> Classes:
     mentioned = _mentioned(ws, conn, [*gathered.undetermined, *(c.node for c in gathered.candidates)],
-                           _focus_identity(ws, gathered))
+                           _focus_identity(ws, conn, gathered))
     partly = _partly_read(ws, conn, gathered.undetermined)
     nodes = [n for n in gathered.undetermined if (str(n.version_id), n.unit_no) in mentioned
              or (str(n.version_id), n.unit_no) in partly]
