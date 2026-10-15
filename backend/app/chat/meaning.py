@@ -81,7 +81,8 @@ _PERIOD = [
 _APPROX_BEFORE = re.compile(r"(?:(?<![א-ת\"'])[בו]?כ[-־–]?\s?|בערך\s|בסביבות\s|כמעט\s)$")
 _AMOUNT_AFTER = re.compile(r"\s*(?:₪|ש\"ח|מ\"ר|דונם|%|אלף|מיליון)")
 _APPROX_WORDS = re.compile(r"(?<![א-ת])(?:מקורב|בקירוב|בערך|בסביבות)(?![א-ת])")
-_CLAUSE_END = re.compile(r"[.;\n](?!\d)")
+# a clause ends at a full stop, a semicolon or a line end, but not inside the dotted VAT abbreviation "מ.ע.מ." (round 13)
+_CLAUSE_END = re.compile(r"(?<!מ\.ע)[.;\n](?!\d)(?!ע\.?מ(?![א-ת]))")
 _ROW = " | "
 # a clause saying the source does not state / does not show something ("לא צוין אם הסכום כולל מע״מ", "אינו מופיע"): it
 # claims no basis, period or VAT for the numbers it names, so no number-meaning check applies to it (round 9 U12)

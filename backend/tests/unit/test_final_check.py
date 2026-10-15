@@ -1113,6 +1113,66 @@ def test_a_cut_sentence_judged_partly_supported_with_no_defect_passes_marked_as_
     assert _purposes(out).count("verify_final") == 1 and out.final_digest == text_digest(md)
 
 
+# --- a grounded number is never removed because of an attribute (round 13 V2/W10, settled decision) -----------------------
+
+VAT_SOURCE = "השווי למ\"ר הוא 9,500 ₪. הנכס פנוי."  # states no VAT
+VAT_CLAIM = "השווי למ\"ר הוא 9,500 ₪, ללא מע\"מ [S1]."  # verification cuts the VAT phrase (a qualifier edit), then the final judge reads it
+
+
+def _edited_then(final_reply: dict):
+    """A judge that supports the sentence as the model wrote it (the VAT phrase in it fails the deterministic VAT check and is
+    cut) and answers ``final_reply`` for the sentence as saved."""
+
+    def rule(text, input, n):
+        return "supported" if "מע" in text else final_reply
+
+    return Judge(rule)
+
+
+@pytest.mark.parametrize("reply", [
+    {"verdict": "partial", "defect": "units", "reason": "המע\"מ אינו מצוין"},
+    {"verdict": "partial", "defect": "none", "claims": [
+        {"span": "9,500 ₪", "verdict": "partial"}]},
+    {"verdict": "partial", "defect": "units", "claims": [
+        {"span": "9,500 ₪", "verdict": "unsupported", "failure": "wrong_unit"}]},
+], ids=["units-defect", "partial-claim", "wrong-unit-claim"])
+def test_a_qualifier_edited_sentence_judged_partial_for_the_attribute_only_stays_marked_partly_verified(offline, reply):
+    offline.texts = [VAT_SOURCE]
+    out = _turn(ScriptedAgent([SEARCH, final(VAT_CLAIM), final(VAT_CLAIM), final(VAT_CLAIM)], judge=_edited_then(reply)),
+                "מה השווי?")
+    md = out.answer.answer_markdown
+    assert "9,500" in md and "אומת חלקית" in md and "מע\"מ" not in md.split("\n")[0], md
+    assert out.report.removals() == [] and out.report.counts()["edited"] == 1
+    assert any(p.check == "final" and p.reason == final_check.FINAL_PARTIAL for p in out.report.problems)
+    assert _purposes(out).count("verify_final") == 1 and out.final_digest == text_digest(md)
+
+
+@pytest.mark.parametrize("reply", [
+    {"verdict": "partial", "defect": "part", "claims": [
+        {"span": "9,500 ₪", "verdict": "unsupported", "failure": "absent_from_source"}]},
+    {"verdict": "partial", "defect": "formula"},
+    {"verdict": "partial", "defect": "units", "claims": [
+        {"span": "9,500 ₪", "verdict": "contradicts"}]},
+], ids=["wrong-number", "other-defect", "contradicted-claim"])
+def test_a_qualifier_edited_sentence_judged_partial_for_another_defect_is_handled_as_before(offline, reply):
+    offline.texts = [VAT_SOURCE]
+    out = _turn(ScriptedAgent([SEARCH, final(VAT_CLAIM), final(VAT_CLAIM), final(VAT_CLAIM)], judge=_edited_then(reply)),
+                "מה השווי?")
+    assert "9,500" not in out.answer.answer_markdown.split("\n\n")[0], out.answer.answer_markdown
+    (p,) = out.report.removals()
+    assert p.check == "final"
+
+
+def test_a_sentence_no_qualifier_edit_touched_judged_partial_for_an_attribute_is_still_removed(offline):
+    """The rule is for the qualifier-edited sentence only: a sentence whose claim span was cut (no qualifier edit) and that the
+    final judge calls partly supported for its units keeps today's path, removal."""
+    out = _turn(ScriptedAgent([SEARCH, final(f"{MIXED}\n{VALUE}")], judge=_as_saved({"verdict": "partial", "defect": "units"})))
+    md = out.answer.answer_markdown
+    assert out.report.counts()["edited"] == 0 and "1,200" not in md and "9,500" in md
+    (p,) = out.report.removals()
+    assert p.check == "final" and p.failure_kind == "wrong_unit"
+
+
 def test_a_cut_sentence_supported_by_a_source_it_does_not_cite_gets_the_citation_attached(offline):
     offline.texts = [SOURCE, "נספח: השטח העיקרי בתא שטח 1 הוא 1,200 מ״ר."]
     uncited = f"{AREA}, {CLAUSE}."

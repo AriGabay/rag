@@ -54,7 +54,9 @@ NOTE_PATTERN = r"\*\*כיסוי:\*\*|\*\*שימו לב:\*\*"
 
 
 def norm(s: str) -> str:
-    return (s or "").replace("״", '"').replace("׳", "'").replace("–", "-").replace("‏", "")
+    """One spelling of the marks a pattern and an answer may differ by: the gershayim and geresh, the en dash and the Hebrew
+    maqaf (U+05BE, "אי־התאמה") as the hyphen, and no right-to-left mark (round 13 X6)."""
+    return (s or "").replace("״", '"').replace("׳", "'").replace("–", "-").replace("־", "-").replace("‏", "")
 
 
 def _forms(value) -> set[str]:

@@ -67,7 +67,10 @@ UNIT_LABELS = {"ILS": "₪", "ILS_per_sqm": "₪ למ״ר", "sqm": "מ״ר", "du
 PERIOD_LABELS = {"month": "לחודש", "year": "לשנה", "one_time": "חד-פעמי", "none": "", "unknown": "תקופה לא צוינה"}
 VAT_LABELS = {"included": "כולל מע״מ", "excluded": "ללא מע״מ", "unknown": "מע״מ לא צוין", "not_applicable": ""}
 
-_VAT_WORDS = re.compile(r"מע[\"״']?מ|מעמ")
+# every written form of the VAT (round 13): "מע״מ" / "מע"מ" / "מע''מ", the dotted "מ.ע.מ", "מעמ" and "מס ערך מוסף", with a
+# prefix letter ("במע״מ", "ללא המע״מ"); not a longer word that starts like one ("מעמד")
+VAT_TERM = (r"(?<![א-ת])[ובלהכשמ]{0,2}(?:מע(?:[\"״'׳]{1,2})?מ|מ\.ע\.מ|מס\s+ערך\s+מוסף)(?![א-ת])")
+_VAT_WORDS = re.compile(VAT_TERM)
 _MONTH_WORDS = re.compile(r"לחודש|חודשי|/\s*חודש|לח[\"״']ד|בחודש")
 _YEAR_WORDS = re.compile(r"לשנה|שנתי|/\s*שנה|בשנה")
 _AREA_WORDS = re.compile(r"מ[\"״']ר|מטר|למ[\"״']ר|דונם")

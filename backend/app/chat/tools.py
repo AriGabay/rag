@@ -2370,8 +2370,9 @@ def assess_coverage(time: TimeMode, record: dict) -> dict:
       searched without a match, is named (it may hold a newer datum phrased differently). Older units left unsearched do
       not matter (AE4). Round 13 U8 (R19, KTD16): once any unit is ``READ`` (a datum of the cited datum's base key came
       from it, or its section or table was read), the best is the newest ``READ`` unit, and a newer unit that is only
-      ``LOCATED`` (a passage returned, nothing read) blocks with ``B_LOCATED``; with no unit read, a located unit counts
-      as checked, as in round 12.
+      ``LOCATED`` (a passage returned, nothing read) blocks with ``B_LOCATED`` — only a unit of the property (scope property
+      or unit), never one of a window, whose units are whatever the search found, other properties among them; with no unit
+      read, a located unit counts as checked, as in round 12.
     - **Explicit:** complete when every unit whose date can fall in or after the requested time (the first two classes of
       ``_inventory_key``) was searched.
     - **Undated units** (no stated date, or dates that disagree) always keep a record from being complete: their data
@@ -2400,7 +2401,8 @@ def assess_coverage(time: TimeMode, record: dict) -> dict:
                 reason = B_RANGE
         elif u["status"] not in (LOCATED, READ) and (best is None or key_of(u) < best):
             reason = B_NEWER if u["status"] == NOT_SEARCHED_CAP else B_NO_MATCH
-        elif u["status"] == LOCATED and best_read is not None and key_of(u) < best_read:
+        elif (u["status"] == LOCATED and best_read is not None and key_of(u) < best_read
+              and record["scope"] != WINDOW):  # a window's units are not the property's: no property to be newer in
             reason = B_LOCATED
         u["blocks"] = reason is not None
         if reason is not None:

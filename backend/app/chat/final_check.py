@@ -435,7 +435,7 @@ class _Final:
             return
         claims = unit_claims(u, v, self.ws)
         failing = [c for c in claims if not c.whole_unit and c.verdict in ("unsupported", "contradicts", "partial")]
-        if v.verdict == "partial" and (failing or v.defect != "none") or (
+        if v.verdict == "partial" and (failing or v.defect != "none") and not self.attribute_only(f, v, failing) or (
                 v.verdict == "supported" and any(c.verdict in ("unsupported", "contradicts") for c in claims)):
             res.failures.append(Failure(f.drafts, DEFECT_FAILURES.get(v.defect) or "absent_from_source",
                                         FINAL_UNSUPPORTED.format(reason=v.reason), record="partial"))
@@ -458,6 +458,19 @@ class _Final:
                     res.mutated |= self.mark(Problem(d, FINAL_ATTACH.format(source=s), kind="needs_citation",
                                                      cite=s, check="final"))
         self.accept(f, v.verdict)
+
+    def attribute_only(self, f: FinalUnit, v: JudgeVerdict, failing: list) -> bool:
+        """Whether a partly supported verdict on a sentence verification already qualifier-edited (a VAT, basis, period or
+        number edit cut the attribute's words) names only that kind of defect: no defect, or a unit/period/VAT defect, and
+        no claim of it unsupported or contradicted for any other reason. A grounded number is never removed because of an
+        attribute (round 13, settled decision: the supported parts stay, the sentence is marked partly verified); the
+        server's own edit already said the attribute is not stated. Any other defect, or a claim found absent or
+        contradicted, keeps the removal."""
+        if len(f.drafts) != 1 or self.drafts[f.drafts[0]].index not in self.report.qualifier_edits:
+            return False
+        if v.defect not in ("none", "units"):
+            return False
+        return all(c.verdict == "partial" or (c.verdict == "unsupported" and c.failure == "wrong_unit") for c in failing)
 
     def dependency(self, f: FinalUnit, v: JudgeVerdict) -> Failure | None:
         """A unit that refers back and whose verdict rests (``depends_on``) on a unit removed from before it is removed as a

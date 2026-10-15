@@ -45,6 +45,17 @@ def test_changing_a_unit_fails():
     assert check(good, expect) == []
 
 
+def test_a_hebrew_maqaf_matches_a_hyphen_in_must_and_must_not_patterns():
+    """Round 13 X6/W11: "אי־התאמה" written with the maqaf (U+05BE) is the same word as the hyphenated or spaced forms."""
+    expect = {"value_meaning": [{"value": "74.70", "must_near": ["אי[- ]?התאמה"], "must_not_near": ["התאמה מלאה"]}]}
+    for word in ("אי־התאמה", "אי-התאמה", "אי התאמה", "אי\u2013התאמה"):
+        assert check(_answer(f"יש {word} בין 74.70 ל-74.80 [S1]."), expect) == [], word
+    assert check(_answer("יש התאמה מלאה בין 74.70 ל-74.80 [S1]."), expect)
+    # a pattern written with the maqaf matches the hyphen in the text, and the reverse
+    maqaf = {"value_meaning": [{"value": "74.70", "must_near": ["אי־התאמה"]}]}
+    assert check(_answer("יש אי-התאמה בין 74.70 ל-74.80 [S1]."), maqaf) == []
+
+
 def test_one_value_instead_of_the_set_fails_unless_called_an_example_with_the_size():
     values = [str(51 + i) for i in range(9)]
     one = _answer("שכר הדירה למ\"ר בטבלה הוא 53 ₪ [S1].")

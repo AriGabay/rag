@@ -196,6 +196,20 @@ def test_a_newer_unit_that_was_only_located_blocks_once_a_unit_was_read_and_the_
     assert record(EXPLICIT, [unit(1, "2024-05-01", T.LOCATED), unit(2, "2022-03-01", T.READ)])["complete"]
 
 
+def test_in_a_window_scope_a_newer_unit_that_was_only_located_is_not_listed_and_does_not_block():
+    """Round 13 V5: with no identified property the units of a window are whatever the search found, other properties among
+    them: one only located is no newer unit of the property, so it neither blocks (``B_LOCATED``) nor is named. The window
+    itself still keeps the record partial."""
+    units = [unit(1, "2025-03-31", T.LOCATED), unit(2, "2023-06-15", T.READ)]
+    rec = record(RECENT, units, scope=T.WINDOW, identified=False)
+    assert T.B_LOCATED not in rec["blocking"] and not any(u["blocks"] for u in rec["units"]) and not rec["complete"]
+    assert TF.MSG_LOCATED.format(date="31/03/2025") not in (TF.coverage_note(rec) or "")
+    # the same units of a property's own scope (gathered members) or a focused unit still block
+    for scope in (T.PROPERTY, T.UNIT):
+        again = record(RECENT, [dict(u) for u in units], scope=scope)
+        assert T.B_LOCATED in again["blocking"] and again["units"][0]["blocks"]
+
+
 def test_three_located_newer_units_are_named_newest_first_and_the_rest_counted():
     units = [unit(n, f"20{20 + n:02d}-06-01", T.LOCATED) for n in range(2, 7)] + [unit(1, "2019-06-01", T.READ)]
     rec = record(RECENT, units)

@@ -204,7 +204,7 @@ from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited, line_cut
 from app.chat.evidence import select
 from app.chat.request import ID_PREFIX, Aspect, Kind
 from app.config import get_settings
-from app.measurements.extract import stance_label
+from app.measurements.extract import VAT_TERM, stance_label
 from app.platform import dates as shared_dates
 from app.platform import source_kinds
 from app.professional.sections import MODALITY_CLASSES
@@ -2697,8 +2697,8 @@ def _all_numbers(ws: Workspace) -> set[str]:
 
 
 _VAT = re.compile(r"(?P<neg>ללא|לא\s+כולל|לא\s+כוללים|אינו\s+כולל|אינם\s+כוללים|אינה\s+כוללת|לפני|בתוספת|\+)?\s*"
-                  r"(?:כולל\s+)?מע[\"״']?מ")
-_CLAUSE_END = re.compile(r"[.;\n](?!\d)")
+                  r"(?:כולל\s+)?" + VAT_TERM)
+_CLAUSE_END = meaning._CLAUSE_END
 
 
 _NOT_A_PRICE_AFTER = re.compile(r"\s*(?:מ[\"״']?ר|מטר|דונם|שנ(?:ה|ים|ות)|חודש(?:ים)?|קומות|יח[\"״']?ד|%)")
@@ -2799,6 +2799,14 @@ def _vat_backing(unit: Unit, ws: Workspace) -> set[tuple[str, str]]:
             v = ws.values[i]
             if v.vat in ("included", "excluded") and v.provenance.get("vat") == "source":
                 backed |= {(f, v.vat) for f in numbers_in(v.written)}
+            # the passage the value was taken from also writes its VAT, on a line the quote leaves out or in a note the
+            # model did not cite (round 13 V2/W5/W10: a claim citing only [V#]): what that passage writes for this number
+            # (or for the whole passage) backs it, as it would had the claim cited the passage
+            passage = ws.sources.get(v.source_id)
+            if passage is not None and v.source_id not in unit.ids:
+                forms = numbers_in(v.written)
+                pairs, general = vat_attachments(passage.text)
+                backed |= {(f, pol) for f, pol in pairs if f in forms} | {(f, g) for g in general for f in forms}
         parts = _source_parts(ws, i, dated=False)
         if parts is None:
             continue

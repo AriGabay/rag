@@ -134,6 +134,27 @@ def test_a_source_that_states_another_period_keeps_the_removal_path():
     assert r.removals()[0].check == "meaning" and "5,000" not in r.apply(a).answer_markdown.split("\n\n")[0]
 
 
+@pytest.mark.parametrize("source_vat", ["לא כולל מ.ע.מ.", "אינו כולל מס ערך מוסף", "אינו כולל מעמ"])
+def test_a_vat_the_source_writes_in_another_form_backs_the_claim_with_no_edit(source_vat):
+    """Round 13 V2/W5/W10: the claim writes "ללא מע״מ", the cited passage writes the same fact as "מ.ע.מ." or in words: no
+    `vat` problem and no qualifier edit (synthetic text)."""
+    ws = _ws(f"שווי הנכס לעיל הוא 2,450,000 ₪ וזה {source_vat}.")
+    a, r = _report("שווי הנכס הוא 2,450,000 ₪ ללא מע״מ [S1].", ws)
+    assert not any(p.check == "vat" for p in r.problems)
+    assert r.qualifier_edits == {} and r.removed_units() == set() and r.counts()["edited"] == 0
+    assert "ללא מע״מ" in r.apply(a).answer_markdown
+
+
+def test_a_registered_value_cited_as_v_reads_the_vat_its_own_source_passage_writes():
+    """The claim cites V1 only; V1's quote is a bare number and its VAT was the model's, but the passage V1 was taken from
+    (``source_id``) writes the VAT in another form: that passage backs the claim."""
+    ws = _registered("2,450,000", "2,450,000", vat="excluded", provenance={"vat": "model_asserted"})
+    ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="שומת הדגמה", section="סעיף 3", location="סעיף 3",
+                  kind="paragraph", text="השווי לעיל 2,450,000 ₪ אינו כולל מ.ע.מ.")
+    a, r = _report("שווי הנכס הוא 2,450,000 ₪ ללא מע״מ [V1].", ws)
+    assert not any(p.check == "vat" for p in r.problems) and r.qualifier_edits == {}
+
+
 def test_a_source_that_states_another_vat_keeps_the_removal_path():
     ws = _registered("2,450,000", "שווי הנכס: 2,450,000 ₪ כולל מע\"מ", vat="included")
     a, r = _report("שווי הנכס הוא 2,450,000 ₪, לא כולל מע\"מ [V1].", ws)

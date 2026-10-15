@@ -10,7 +10,7 @@ import uuid
 
 import pytest
 
-from app.chat import verify
+from app.chat import meaning, verify
 from app.chat.engine import FinalAnswer
 from app.chat.tools import Workspace
 from app.chat.verify import Unit, VerificationUnavailable, split_units, structural_kind, verify_answer
@@ -360,6 +360,33 @@ def test_vat_with_the_other_polarity_fails():
 def test_a_general_vat_note_covers_the_table():
     table = "שכירות מבוקשת:\nהדקל 2 | ₪ 55\nהדקל 9 | ₪ 58\n(*) המחירים המבוקשים אינם כוללים מע\"מ."
     assert _deterministic("ברחוב הדקל 9 מבוקשים 58 ₪ למ\"ר, ללא מע\"מ [S1].", table) == []
+
+
+@pytest.mark.parametrize("written", ["לא כולל מ.ע.מ.", "אינו כולל מ.ע.מ", "לא כולל מע״מ", "אינו כולל מעמ",
+                                     "לא כולל מס ערך מוסף", "לא כולל המס ערך מוסף", "אינו כולל מע''מ"])
+@pytest.mark.parametrize("claim", ["ללא מע\"מ", "ללא מע״מ", "לא כולל מס ערך מוסף", "לפני מ.ע.מ."])
+def test_every_written_form_of_the_vat_is_read_in_the_source_and_the_claim(written, claim):
+    """Round 13 W5/V2/W10: a source writing the VAT as "מ.ע.מ.", "מעמ" or "מס ערך מוסף" backs a claim writing it as
+    "מע״מ" and the reverse (synthetic sentences)."""
+    source = f"שווי הנכס לעיל הוא 2,450,000 ₪, {written}. מועד הביקור 01.02.2020."
+    assert _deterministic(f"שווי הנכס הוא 2,450,000 ₪, {claim} [S1].", source) == []
+
+
+def test_a_dotted_vat_abbreviation_does_not_split_the_sentence_and_the_other_polarity_still_fails():
+    source = "השווי 2,450,000 ₪ אינו כולל מ.ע.מ. והוא נקבע ליום 01.02.2020"
+    pairs, general = verify.vat_attachments(source)
+    assert pairs == {(f, "excluded") for f in verify.numbers_in("2,450,000")} and not general
+    assert _deterministic("השווי הוא 2,450,000 ₪, כולל מע\"מ [S1].", source)
+
+
+def test_vat_words_and_attested_read_the_written_forms():
+    assert meaning.vat_words("המחיר אינו כולל מ.ע.מ.") == {"excluded": "אינו כולל מ.ע.מ"}
+    assert meaning.vat_words("המחיר כולל מס ערך מוסף").get("included", "").endswith("מס ערך מוסף")
+    assert meaning.vat_attested("שווי 2,450,000 ₪ אינו כולל מעמ", frozenset(verify.numbers_in("2,450,000"))) == {"excluded"}
+
+
+def test_a_word_that_only_looks_like_a_vat_abbreviation_is_not_one():
+    assert verify.vat_attachments("המעמד של 5,000 ₪ לא כולל מעמד נוסף")[0] == set()
 
 
 def test_vat_claim_backed_by_a_measurement_record():
