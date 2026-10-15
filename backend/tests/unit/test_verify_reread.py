@@ -423,7 +423,7 @@ def test_an_expansion_that_does_not_state_the_number_leaves_the_removal():
     (p,) = report.problems
     assert p.removes_unit and p.check == "unstated_number" and not report.ok
     assert fetcher.adopted == [] and list(ws.sources) == ["S1"]
-    assert [x["outcome"] for x in report.claims[0][0].rereads] == ["not_found", "not_found"]
+    assert [x["outcome"] for x in report.claims[0][0].rereads] == ["not_found"] * 3  # next_page, continuation, preceding
 
 
 def test_a_number_in_a_different_form_is_matched_as_the_check_matches_it():
@@ -500,6 +500,100 @@ def test_an_uncited_unit_or_one_failing_for_another_reason_is_not_expanded():
     verify_answer(_all_supported(), _answer("הסה\"כ בטבלה הוא 600."), ws, "?", [], reread=fetcher)
     verify_answer(_all_supported(), _answer("הסה\"כ בטבלה הוא 600 [S7]."), ws, "?", [], reread=fetcher)
     assert fetcher.calls == []
+
+
+# --- a number the part of the section before the passage states (round 13) ---------------------------------------------
+
+PASSAGE = "שיעור ההפחתה לשטח הבנוי הוא 15%."
+EARLIER = "מגרש 101 הוא מגרש פינתי בשטח רגיל."
+ELSEWHERE = "מגרש 101 מופיע גם בנספח התכניות."  # another source of the turn states the number: a unit citing nothing may use it
+NAMED_MD = "במגרש 101 חל שיעור הפחתה של 15%."  # cites nothing; the judge names S1
+
+
+def _named_ws() -> Workspace:
+    return _ws(PASSAGE, ELSEWHERE, block_start=9, block_end=9)
+
+
+def _names_s1() -> ScriptedProvider:
+    """A judge that finds every unit supported by S1, which the unit does not cite."""
+    return ScriptedProvider().on(Purpose.VERIFY, lambda i, input: {"verdicts": [
+        {"index": n, "verdict": "supported", "reason": "בדיקה", "supported_by": ["S1"]} for n in _units(input)]},
+        repeat=True)
+
+
+def test_the_expansions_of_a_missing_number_read_the_part_before_the_passage_last():
+    assert verify.UNSTATED_EXPANSIONS == ("next_page", "continuation", "preceding")
+    assert "preceding" not in get_args(verify.NeedsContext)  # the judge cannot ask for it
+
+
+def test_a_cited_unit_finds_its_number_in_the_part_of_the_section_before_the_passage():
+    ws = _ws(PASSAGE, block_start=9, block_end=9)
+    fetcher = FakeFetcher({("S1", "preceding"): Expansion(EARLIER, "תחילת הסעיף שלפני המקור")}, ws=ws)
+    report = verify_answer(_all_supported(), _answer(f"{NAMED_MD} [S1]"), ws, "?", [], reread=fetcher)
+    assert report.ok and not report.removed_units()
+    assert [k for _, k in fetcher.calls] == ["next_page", "continuation", "preceding"]
+    assert [p.cite for p in report.problems if p.kind == "needs_citation"] == ["S2"]
+    assert [x["outcome"] for x in report.claims[0][0].rereads] == ["not_found", "not_found", "found"]
+    assert report.claims[0][0].rereads[-1]["scope"] == "preceding"
+
+
+def test_a_unit_the_judge_found_supported_by_a_named_source_keeps_a_number_the_section_before_it_states():
+    ws = _named_ws()
+    fetcher = FakeFetcher({("S1", "preceding"): Expansion(EARLIER, "תחילת הסעיף שלפני המקור")}, ws=ws)
+    report = verify_answer(_names_s1(), _answer(NAMED_MD), ws, "?", [], reread=fetcher)
+    assert report.ok and not report.removed_units()
+    # the named source and the adopted expansion are both cited by the server
+    assert sorted(p.cite for p in report.problems if p.kind == "needs_citation") == ["S1", "S3"]
+    assert EARLIER in ws.sources["S3"].text
+    (log,) = ws.reread_log.values()
+    assert [(x["source"], x["scope"], x["outcome"]) for x in log] == [
+        ("S1", "next_page", "not_found"), ("S1", "continuation", "not_found"), ("S1", "preceding", "found")]
+    assert log[-1]["expanded_source"] == "S3"
+    assert fetcher.adopted == [("S1", "preceding")]
+
+
+def test_a_number_nowhere_in_the_source_removes_a_named_support_unit_as_before():
+    ws = _named_ws()
+    fetcher = FakeFetcher({("S1", "preceding"): "פסקה אחרת, מגרש 202."}, ws=ws)
+    report = verify_answer(_names_s1(), _answer(NAMED_MD), ws, "?", [], reread=fetcher)
+    (p,) = report.problems
+    assert p.removes_unit and p.check == "unstated_number" and p.failure_kind == "absent_from_source"
+    assert fetcher.adopted == [] and list(ws.sources) == ["S1", "S2"]
+    assert [x["outcome"] for x in next(iter(ws.reread_log.values()))] == ["not_found"] * 3
+
+
+def test_a_named_support_unit_the_bound_kept_from_the_read_is_context_not_read(monkeypatch):
+    monkeypatch.setattr(get_settings(), "chat_reread_claims", 0)
+    ws = _named_ws()
+    fetcher = FakeFetcher({("S1", "preceding"): EARLIER}, ws=ws)
+    report = verify_answer(_names_s1(), _answer(NAMED_MD), ws, "?", [], reread=fetcher)
+    (p,) = report.problems
+    assert p.removes_unit and p.failure_kind == "context_not_read" and p.check == "unstated_number"
+    assert fetcher.calls == [] and next(iter(ws.reread_log.values()))[-1]["outcome"] == "bound"
+
+
+def test_a_named_support_unit_with_no_time_for_the_read_is_context_not_read():
+    ws = _named_ws()
+    fetcher = FakeFetcher({("S1", "preceding"): EARLIER}, ws=ws)
+    report = verify_answer(_names_s1(), _answer(NAMED_MD), ws, "?", [],
+                           deadline=time.monotonic() + verify.REREAD_MIN_SECONDS / 2, reread=fetcher)
+    (p,) = report.problems
+    assert p.failure_kind == "context_not_read" and fetcher.calls == []
+
+
+def test_a_failing_read_of_a_named_support_unit_stays_the_technical_failure():
+    ws = _named_ws()
+    report = verify_answer(_names_s1(), _answer(NAMED_MD), ws, "?", [], reread=FakeFetcher(fail=True, ws=ws))
+    (p,) = report.problems
+    assert p.removes_unit and p.failure_kind != "context_not_read"
+    assert next(iter(ws.reread_log.values()))[-1]["outcome"] == "check_failed"
+
+
+def test_a_named_support_unit_is_removed_as_before_without_a_fetcher():
+    ws = _named_ws()
+    report = verify_answer(_names_s1(), _answer(NAMED_MD), ws, "?", [])
+    (p,) = report.problems
+    assert p.removes_unit and p.check == "unstated_number" and ws.reread_log == {}
 
 
 # --- a removal for context not read is its own kind (round 13 U10, KTD11, R14) --------------------------------------------

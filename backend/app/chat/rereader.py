@@ -173,6 +173,31 @@ def _expand_continuation(ws, conn, head, src):
             {"block_start": src.block_start, "block_end": rows[-1].block_index})
 
 
+def _expand_preceding(ws, conn, head, src):
+    """The part of the top section that comes before the source (round 13): where a section states a figure (a plot, a
+    date, a basis) that the passage cited from further down only uses. The blocks right before the passage, nearest
+    first, as many as fit ``REREAD_CHARS`` (the nearest are the ones kept), given in document order — the reverse of
+    ``continuation``, which reads forward from the end of the passage. None at the start of a section."""
+    if src.block_start is None:
+        return None
+    cx = contexts_of(ws, conn, src.version_id, head.reading_id)
+    top = _chain_of(ws, conn, head, src)[:1]
+    rows = [r for r in reader.blocks_in_section(conn, src.version_id, top, until_block=src.block_start,
+                                                window=reader.section_window(cx, src.block_start, top)) if r.text]
+    kept: list = []
+    size = 0
+    for r in reversed(rows):
+        size += len(r.text) + 1
+        if size > REREAD_CHARS and kept:
+            break
+        kept.append(r)
+    if not kept:
+        return None
+    kept.reverse()
+    return ("\n".join(r.text for r in kept), "תחילת הסעיף שלפני המקור",
+            {"block_start": kept[0].block_index, "block_end": kept[-1].block_index})
+
+
 def _expand_table_headers(ws, conn, head, src):
     _, st = _stored_table(conn, src)
     lines = _table_head(st) if st else []
@@ -263,9 +288,10 @@ def _expand_region(ws, conn, head, src):
 
 
 # ``section_lead`` and ``section_notes`` are read by the server on its own (the qualifier pre-read, round 13 U10, KTD11) and
-# are also part of what the judge's ``heading`` and ``footnotes`` read; the judge does not name them
+# are also part of what the judge's ``heading`` and ``footnotes`` read; the judge does not name them. ``preceding`` is read
+# only for a missing number (``verify.UNSTATED_EXPANSIONS``) and is not among the judge's ``NeedsContext``
 _EXPANDERS = {"heading": _expand_heading, "neighbours": _expand_neighbours, "continuation": _expand_continuation,
-              "table_headers": _expand_table_headers, "units_note": _expand_units_note,
+              "preceding": _expand_preceding, "table_headers": _expand_table_headers, "units_note": _expand_units_note,
               "footnotes": _expand_footnotes, "next_page": _expand_next_page, "region": _expand_region,
               "section_lead": _expand_section_lead, "section_notes": _expand_section_notes}
 

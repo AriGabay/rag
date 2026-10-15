@@ -602,7 +602,10 @@ REREAD_MIN_SECONDS = 10  # a re-read (an expansion and a judge call) does not st
 READ_IN_PART = "המקור נקרא בחלקו"  # R14: a claim whose source the bound kept the turn from reading further
 REREAD_OUTCOMES = ("supported", "partial", "unsupported", "contradicts", "check_failed", "no_context", "no_time",
                    "bound", "found", "not_found")
-UNSTATED_EXPANSIONS = ("next_page", "continuation")  # where a number no cited passage states is looked for next
+# where a number no cited passage states is looked for next: the table's next page, the rest of the section after the passage,
+# and (round 13) the part of the section before it — a section states a plot or a date once, near its start, and the passage
+# cited from further down only uses it. ``preceding`` is an internal kind of the number re-read, not one the judge names
+UNSTATED_EXPANSIONS = ("next_page", "continuation", "preceding")
 # the re-read outcomes after which the context a claim needed was still not read (round 13 U10, KTD11, R14): the source had
 # nothing more to give, the turn's bound or its time kept the read from starting, or the number was not in what was read.
 # ``check_failed`` is the technical failure (a read or a call that broke) and is not among them
@@ -766,6 +769,8 @@ BACK_REFERENCES = (
     rf"(?<![{_HE}])שני\s+ה[{_HE}]+",
     rf"(?<![{_HE}])שלושת\s+ה[{_HE}]+",
     rf"(?<![{_HE}])ה(?:מקדמים|שיעורים|ערכים)\s+(?:ה?אלה|הללו|הנ[\"״”]ל)(?![{_HE}])",
+    # the indefinite form (round 13): "these rates", "these adjustments" — the noun without the article, then the demonstrative
+    rf"(?<![{_HE}])[ו]?ה?(?:מקדמים|שיעורים|ערכים|הפחתות|התאמות|נתונים|אחוזים)\s+(?:אלה|אלו|הללו)(?![{_HE}])",
 )
 _BACK_REFERENCE = re.compile("|".join(BACK_REFERENCES))
 
@@ -4542,21 +4547,77 @@ def _adopt_expansion(fetcher: ContextFetcher, sid: str, kind: str) -> str | None
         return None
 
 
+class _TurnNumbers:
+    """The numbers the turn's evidence states (``_all_numbers``), read once a body is there to check; read again after a
+    source was registered (``reset``), which adds to them."""
+
+    def __init__(self, ws: Workspace) -> None:
+        self.ws = ws
+        self._numbers: set[str] | None = None
+
+    def get(self) -> set[str]:
+        if self._numbers is None:
+            self._numbers = _all_numbers(self.ws)
+        return self._numbers
+
+    def reset(self) -> None:
+        self._numbers = None
+
+
+def _expand_numbers(u: Unit, sid: str, ws: Workspace, question_numbers: set[str], everything: _TurnNumbers,
+                    deadline: float | None, fetcher: ContextFetcher) -> str | None:
+    """Reads the places of ``UNSTATED_EXPANSIONS`` of ``sid`` for the numbers no passage ``u`` cites states (round 13): the
+    first whose text states every one of them — by the same number check, ``_unstated`` — is registered as a turn source
+    through the fetcher, and its id is given; None when none does. The unit takes one place of the turn's bound
+    (``chat_reread_claims``) and none starts without ``REREAD_MIN_SECONDS`` left; a unit read before in the turn is not read
+    again (``ws.reread_done``). Every attempt is logged on the unit's key in ``ws.reread_log``, whose last entry says how the
+    read ended (``found``, ``not_found``, ``bound``, ``no_time``, ``check_failed``). It does not touch ``u``: citing the
+    adopted source is the caller's."""
+    key = "unit:" + u.id
+    if key in ws.reread_done:
+        return None
+    if max(0, get_settings().chat_reread_claims - len(ws.reread_done)) <= 0:
+        _log_reread(ws, key, source=sid, scope=UNSTATED_EXPANSIONS[0], outcome="bound", reason="source_read_in_part")
+        return None
+    ws.reread_done.add(key)
+    for kind in UNSTATED_EXPANSIONS:
+        entry = {"source": sid, "scope": kind}
+        if not _reread_time_left(deadline):
+            _log_reread(ws, key, **entry, outcome="no_time")
+            return None
+        try:
+            got = fetcher.expand(sid, kind)
+        except Exception:  # noqa: BLE001 - a read that failed is a check that did not complete
+            logger.warning("re-read of %s (%s) failed", sid, kind, exc_info=True)
+            _log_reread(ws, key, **entry, outcome="check_failed")
+            return None
+        body = _expansion_text(got)
+        if not body or _unstated(u, ws, question_numbers, everything.get(), extra_text=body):
+            _log_reread(ws, key, **entry, outcome="not_found")
+            continue
+        new_sid = _adopt_expansion(fetcher, sid, kind)
+        if not new_sid or new_sid not in ws.sources:
+            _log_reread(ws, key, **entry, outcome="check_failed")
+            return None
+        everything.reset()  # the source just registered adds to the turn's numbers
+        _log_reread(ws, key, **entry, outcome="found", expanded_source=new_sid)
+        return new_sid
+    return None
+
+
 def _expand_unstated(report: VerifyReport, units: list[Unit], meanings: dict, ws: Workspace, question: str,
                      deadline: float | None, fetcher: ContextFetcher, meaning_fetcher: meaning.Fetcher
                      ) -> dict[int, str]:
     """A unit failed only because no passage it cites states a number (``unstated_number``) may state it in the source's
-    next part (R13): the table's continuation on the next page, or the rest of the section. Before the unit is removed,
-    or set aside for the judge, each of ``UNSTATED_EXPANSIONS`` is read once through ``fetcher`` (one unit takes one
-    place of the turn's bound, ``chat_reread_claims``, and none starts without ``REREAD_MIN_SECONDS`` left); the first
-    whose text states every one of the unit's missing numbers — by the same number check — is registered as a turn
-    source and cited with the unit (the server attaches the citation), and the deterministic checks run again with it.
-    A unit no expansion helps keeps its problem, as before. Each attempt is on the unit's claims (``ws.reread_log``).
-    Returns the unit index -> the id of the source whose citation the server attaches."""
+    next part (R13): the table's continuation on the next page, the rest of the section, or the part of the section before
+    the passage (round 13). Before the unit is removed, or set aside for the judge, each of ``UNSTATED_EXPANSIONS`` is read
+    once through ``fetcher`` (``_expand_numbers``); the first whose text states every one of the unit's missing numbers is
+    registered as a turn source and cited with the unit (the server attaches the citation), and the deterministic checks run
+    again with it. A unit no expansion helps keeps its problem, as before. Each attempt is on the unit's claims
+    (``ws.reread_log``). Returns the unit index -> the id of the source whose citation the server attaches."""
     cites: dict[int, str] = {}
-    budget = max(0, get_settings().chat_reread_claims - len(ws.reread_done))
     question_numbers = numbers_in(question)
-    everything: set[str] | None = None  # the turn's numbers, read once a body is there to check; again after an adopt
+    everything = _TurnNumbers(ws)
     for p in list(report.problems):
         u = p.unit
         if p.check != "unstated_number" or not p.unstated or not u.ids or u.index < 0:
@@ -4564,44 +4625,40 @@ def _expand_unstated(report: VerifyReport, units: list[Unit], meanings: dict, ws
         sid = _reread_source(u, "next_page", ws)
         if sid is None:
             continue
-        key = "unit:" + u.id
-        if key in ws.reread_done:
+        new_sid = _expand_numbers(u, sid, ws, question_numbers, everything, deadline, fetcher)
+        if new_sid is None:
             continue
-        if budget <= 0:
-            _log_reread(ws, key, source=sid, scope=UNSTATED_EXPANSIONS[0], outcome="bound", reason="source_read_in_part")
-            continue
-        ws.reread_done.add(key)
-        budget -= 1
-        for kind in UNSTATED_EXPANSIONS:
-            entry = {"source": sid, "scope": kind}
-            if not _reread_time_left(deadline):
-                _log_reread(ws, key, **entry, outcome="no_time")
-                break
-            try:
-                got = fetcher.expand(sid, kind)
-            except Exception:  # noqa: BLE001 - a read that failed is a check that did not complete
-                logger.warning("re-read of %s (%s) failed", sid, kind, exc_info=True)
-                _log_reread(ws, key, **entry, outcome="check_failed")
-                break
-            body = _expansion_text(got)
-            if body and everything is None:
-                everything = _all_numbers(ws)
-            if not body or _unstated(u, ws, question_numbers, everything, extra_text=body):
-                _log_reread(ws, key, **entry, outcome="not_found")
-                continue
-            new_sid = _adopt_expansion(fetcher, sid, kind)
-            if not new_sid or new_sid not in ws.sources:
-                _log_reread(ws, key, **entry, outcome="check_failed")
-                break
-            u.ids.append(new_sid)
-            everything = None  # the source just registered adds to the turn's numbers
-            meanings[u.index] = meaning.check(u, ws, meaning_fetcher)
-            again = deterministic([u], ws, question, meanings)
-            report.problems = [x for x in report.problems if x is not p] + again
-            cites[u.index] = new_sid
-            _log_reread(ws, key, **entry, outcome="found", expanded_source=new_sid)
-            break
+        u.ids.append(new_sid)
+        meanings[u.index] = meaning.check(u, ws, meaning_fetcher)
+        again = deterministic([u], ws, question, meanings)
+        report.problems = [x for x in report.problems if x is not p] + again
+        cites[u.index] = new_sid
     return cites
+
+
+def _named_support_expanded(u: Unit, named: list[str], problem: Problem, ws: Workspace, question: str,
+                            deadline: float | None, fetcher: ContextFetcher) -> tuple[Problem | None, list[str]]:
+    """A unit the judge found supported by shown sources it does not cite (``named``) whose only failure is a number their
+    passages do not state (round 13): the bounded number re-read (``_expand_numbers``, as for a unit that cites) runs on the
+    unit cited with ``named`` — the number may be stated in the part of the section the passage leaves out, most often
+    the part before it. Returns (the problem the unit keeps, the ids to cite): None and ``[*named, adopted]`` when an
+    expansion states every missing number and the checks pass with it; else the problem as it was, and, when the
+    read did not happen (the turn's bound or time, ``CONTEXT_UNREAD`` but ``not_found``), failing as ``context_not_read`` —
+    not "absent", which no one found out."""
+    cited = dataclasses.replace(u, ids=[*u.ids, *named])
+    sid = _reread_source(cited, "next_page", ws)
+    if sid is None:
+        return problem, []
+    new_sid = _expand_numbers(cited, sid, ws, numbers_in(question), _TurnNumbers(ws), deadline, fetcher)
+    if new_sid is not None:
+        again = _named_support(u, [*named, new_sid], ws, question)
+        if again is None:
+            return None, [*named, new_sid]
+        return again, []
+    last = (ws.reread_log.get("unit:" + u.id) or [{}])[-1].get("outcome")
+    if last in CONTEXT_UNREAD and last != "not_found":
+        problem.failure_kind = CONTEXT_NOT_READ
+    return problem, []
 
 
 QUALIFIER_SCOPE = "qualifier"  # the scope of the log entry of a qualifier pre-read (``_expand_qualifiers``)
@@ -5013,11 +5070,16 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
             elif named := [s for s in dict.fromkeys(v.supported_by) if s not in u.ids]:
                 # supported by a shown source the unit does not cite: kept, and cited, only if the numbers agree
                 problem = _named_support(u, named, ws, question)
+                cite_ids = named
+                if problem is not None and problem.check == "unstated_number" and reread is not None:
+                    # a number only the part of the section the passage leaves out states (round 13): read it before the unit
+                    # is removed, as for a unit that cites
+                    problem, cite_ids = _named_support_expanded(u, named, problem, ws, question, deadline, reread)
                 if problem is not None:
                     report.problems.append(problem)
                 else:
                     report.problems += [Problem(u, f"נתמך ב-{s}, שהתשובה לא ציטטה", kind="needs_citation", cite=s)
-                                        for s in named]
+                                        for s in cite_ids]
         complete_records(report)
         _remove_dependents(report, verdicts)
     report.protect_question(answer)

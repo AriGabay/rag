@@ -123,6 +123,44 @@ def test_continuation_is_the_rest_of_the_section_not_another_section(office, rep
     assert s.block_start == 1 and s.block_end == 4  # from the cited block to the last one read
 
 
+def test_preceding_is_the_blocks_before_the_source_in_its_section_in_order(office, report):
+    """Round 13: where a section states what a passage cited from further down only uses."""
+    doc, ver = report
+    ws = _ws(office.ctx(), doc, ver, text="(1) הסכומים אינם כוללים מע\"מ.", block_start=4, block_end=4)
+    fetcher = ContextReader(ws)
+    got = fetcher.expand("S1", "preceding")
+    assert got is not None and "סעיף אחר" not in got.text and "הסכומים אינם כוללים" not in got.text
+    lines = got.text.splitlines()
+    assert lines[0].startswith("טבלת נכסים") and lines[-1] == "הערה: הנתונים נכונים למועד הקובע."  # document order
+    assert len(lines) == 4  # the section's blocks 0-3, none of the source or after it
+    s = ws.sources[fetcher.adopt("S1", "preceding")]
+    assert (s.block_start, s.block_end) == (0, 3) and "תחילת הסעיף שלפני המקור" in s.location
+
+
+def test_preceding_keeps_the_nearest_blocks_within_the_bound(office, report, monkeypatch):
+    from app.chat import rereader
+
+    doc, ver = report
+    monkeypatch.setattr(rereader, "REREAD_CHARS", 90)
+    ws = _ws(office.ctx(), doc, ver, text="(1) הסכומים אינם כוללים מע\"מ.", block_start=4, block_end=4)
+    fetcher = ContextReader(ws)
+    got = fetcher.expand("S1", "preceding")
+    assert got is not None and "הערה: הנתונים נכונים למועד הקובע." in got.text  # the nearest block stays
+    assert "טבלת נכסים" not in got.text and len(got.text) <= 90 + 20  # the farthest are left out
+    s = ws.sources[fetcher.adopt("S1", "preceding")]
+    assert (s.block_start, s.block_end) == (2, 3)
+
+
+def test_a_source_at_the_start_of_its_section_has_nothing_preceding(office, report):
+    doc, ver = report
+    ws = _ws(office.ctx(), doc, ver, text="סעיף אחר", block_start=5, block_end=5)
+    assert ContextReader(ws).expand("S1", "preceding") is None  # the first block of the second section: not the first's
+    ws = _ws(office.ctx(), doc, ver, text="טבלת נכסים", block_start=0, block_end=0)
+    assert ContextReader(ws).expand("S1", "preceding") is None
+    ws = _ws(office.ctx(), doc, ver, text="x")  # a search hit's chunk: no place in the document
+    assert ContextReader(ws).expand("S1", "preceding") is None
+
+
 def test_the_end_of_a_section_has_no_continuation(office, report):
     doc, ver = report
     ws = _ws(office.ctx(), doc, ver, text="(1) הסכומים אינם כוללים מע\"מ.", block_start=4, block_end=4)
@@ -407,4 +445,4 @@ def test_a_total_no_page_of_the_table_states_is_still_removed(office, report):
     md = "סך הנכסים בטבלה הוא 99,999 [S1]."
     rep = verify_answer(_judge_supported(), _answer(md), ws, "?", [], reread=ContextReader(ws))
     assert rep.removed_units() == {0} and list(ws.sources) == ["S1"]
-    assert [x["outcome"] for x in rep.claims[0][0].rereads] == ["not_found", "not_found"]  # next_page, continuation
+    assert [x["outcome"] for x in rep.claims[0][0].rereads] == ["not_found"] * 3  # next_page, continuation, preceding

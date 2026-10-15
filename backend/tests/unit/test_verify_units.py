@@ -1567,6 +1567,9 @@ def test_a_verdict_cached_under_judge_contract_8_misses_under_9(monkeypatch):
     "שני המקדמים לעיל חלים על כל החלקה.", "כאמור, השטח אינו משתנה.", "וכאמור השטח אינו משתנה.", "הנתון האמור נכון.",
     "לפי האמור בסעיף 3.", "שלושת השיעורים נקבעו כך.", "המקדמים האלה נקבעו כך.", "הערכים הנ\"ל נקבעו כך.",
     "הערכים הנ״ל נקבעו כך.", "השיעורים הללו נקבעו כך.", "זכויות הבנייה לעיל.",
+    # the indefinite demonstrative form (round 13)
+    "שיעורים אלה נכללו בחישוב.", "ומקדמים אלו נקבעו כך.", "ערכים הללו נקבעו כך.", "ההפחתות אלה נקבעו כך.",
+    "התאמות אלה חלות על החלקה.", "נתונים אלה נלקחו מהטבלה.",
 ])
 def test_a_sentence_that_refers_back_is_recognised(text):
     assert verify.has_back_reference(text)
@@ -1574,7 +1577,7 @@ def test_a_sentence_that_refers_back_is_recognised(text):
 
 @pytest.mark.parametrize("text", [
     "מקדם א הוא 0.8.", "השטח העיקרי הוא 1,200 מ״ר.", "המקדמים נקבעו בשומה.", "שניים מהמקדמים נקבעו בשומה.",
-    "הוא אמר שיעלה.", "תיאורטית השווי גבוה.", "",
+    "הוא אמר שיעלה.", "תיאורטית השווי גבוה.", "", "שיעורים שונים נקבעו בשומה.", "הפחתות נקבעו בשומה.",
 ])
 def test_a_sentence_that_refers_to_nothing_before_it_is_not(text):
     assert not verify.has_back_reference(text)

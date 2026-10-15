@@ -111,27 +111,34 @@ def blocks_on_pages(conn: Connection, version_id: UUID, first: int, last: int, f
         f"{_from(from_block)} ORDER BY block_index"), {"v": version_id, "a": first, "b": last, "from": from_block}).all()
 
 
+def _until(until_block: int | None) -> str:
+    return " AND block_index < :until" if until_block is not None else ""
+
+
 def blocks_in_section(conn: Connection, version_id: UUID, path: tuple[str, ...], from_block: int | None = None,
-                      window: tuple[int, int] | None = None) -> list:
+                      window: tuple[int, int] | None = None, until_block: int | None = None) -> list:
     """The blocks of a section, its sub-sections included: every block whose section path starts with ``path``
     (from block ``from_block`` when given). The empty path is the part before the first heading. ``window``: only
     the blocks of that range (a section of one appraisal context); with the empty path, every block of it (the
-    context's title part, whatever path the extraction gave it)."""
+    context's title part, whatever path the extraction gave it). ``until_block``: only the blocks before it (the part of a
+    section that precedes a passage, round 13)."""
     if window is not None:
         lo, hi = window
         cond = "" if not path else f" AND section_path[1:{len(path)}] = CAST(:p AS text[])"
         return conn.execute(text(
             f"SELECT {BLOCK_COLS} FROM document_blocks WHERE version_id = :v AND block_index BETWEEN :lo AND :hi"
-            f"{cond}{_from(from_block)} ORDER BY block_index"),
-            {"v": version_id, "p": list(path), "lo": lo, "hi": hi, "from": from_block}).all()
+            f"{cond}{_from(from_block)}{_until(until_block)} ORDER BY block_index"),
+            {"v": version_id, "p": list(path), "lo": lo, "hi": hi, "from": from_block, "until": until_block}).all()
     if not path:
         return conn.execute(text(
             f"SELECT {BLOCK_COLS} FROM document_blocks WHERE version_id = :v AND cardinality(section_path) = 0"
-            f"{_from(from_block)} ORDER BY block_index"), {"v": version_id, "from": from_block}).all()
+            f"{_from(from_block)}{_until(until_block)} ORDER BY block_index"),
+            {"v": version_id, "from": from_block, "until": until_block}).all()
     return conn.execute(text(
         f"SELECT {BLOCK_COLS} FROM document_blocks WHERE version_id = :v"
-        f" AND section_path[1:{len(path)}] = CAST(:p AS text[]){_from(from_block)} ORDER BY block_index"),
-        {"v": version_id, "p": list(path), "from": from_block}).all()
+        f" AND section_path[1:{len(path)}] = CAST(:p AS text[]){_from(from_block)}{_until(until_block)}"
+        " ORDER BY block_index"),
+        {"v": version_id, "p": list(path), "from": from_block, "until": until_block}).all()
 
 
 def section_blocks(conn: Connection, version_id: UUID) -> list[tuple[int, tuple[str, ...] | None, str | None]]:
