@@ -28,7 +28,8 @@ compares:
 rule, and the ``same`` pairs are joined (union-find) into *classes*; a class is one datum, and every reader takes it as such: the
 timeline blocks, the conflict pairs (``coverage.conflicting_pairs`` inside a class only), ``_dedupe``, the ``alone`` shortcut,
 ``later_than`` and ``coverage.conflicting``. Between two classes of one base key, a pair that is ``undecided`` whose amounts
-differ and whose periods overlap is marked ``undecided`` on both rows, each naming the other (``undecided_with``), unless the two
+differ and whose periods overlap is marked ``undecided`` (``undecided_with`` names the counterparts) on the row(s) whose facet is
+unresolved — none or not read, or an empty core — and on both when both are resolved own facets (disjoint across units), unless the two
 classes are decided different by any other pair across them (the class relation, as for recency). The unit is
 normalized (a percent and a ratio of a coefficient or a proportion are one unit) and the amounts are compared in one canonical
 form (``datum.canonical_amount``).
@@ -436,12 +437,24 @@ class Bucket:
         return out
 
     def undecided_with(self) -> dict[str, list[str]]:
-        """``undecided`` by datum: the ids of the data each could not be compared with (the counterpart's sid, R6)."""
+        """``undecided`` by datum: the ids of the data each could not be compared with (the counterpart's sid, R6). The mark is
+        asymmetric (round 13 U6, KTD4): a pair marks only the side(s) whose facet is unresolved (``unresolved``); when both sides
+        are resolved own facets (disjoint across units) both are marked. A datum with a stated facet whose only undecided
+        partners are unresolved carries no mark."""
         out: dict[str, list[str]] = {}
         for a, b in self.undecided():
-            out.setdefault(a.ref, []).append(b.ref)
-            out.setdefault(b.ref, []).append(a.ref)
+            both = not unresolved(a) and not unresolved(b)
+            if both or unresolved(a):
+                out.setdefault(a.ref, []).append(b.ref)
+            if both or unresolved(b):
+                out.setdefault(b.ref, []).append(a.ref)
         return out
+
+
+def unresolved(d: Datum) -> bool:
+    """Whether a datum's facet is unresolved (round 13 U6): the source states none or it was not read, or what it states reduces
+    to generic words (an empty core). Such a datum is the one an undecided pair is marked on."""
+    return not D.core_of(d)
 
 
 def _classify(key: tuple, members: list[Datum]) -> Bucket:

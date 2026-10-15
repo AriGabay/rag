@@ -841,7 +841,8 @@ def test_an_undecided_pair_in_one_unit_is_a_components_row_with_the_mark_and_its
     b = _coefficient(o, doc, "0.9", as_of("2025-03-31"), None, version=ver)  # no facet: not comparable with a stated one
     (comp,) = timeline.breakdown(o.ws, {a})
     rows = {r["sid"]: r for r in comp["rows"]}
-    assert rows[a]["marks"] == ["undecided"] and rows[a]["undecided_with"] == [b]
+    # the mark is on the unresolved side: the row without a facet, naming the stated one (round 13 follow-up)
+    assert rows[a]["marks"] == [] and "undecided_with" not in rows[a]
     assert rows[b]["marks"] == ["undecided"] and rows[b]["undecided_with"] == [a]
     assert timeline.MARKS["undecided"] in timeline.plain_text([], [comp])
 
@@ -919,3 +920,27 @@ def test_a_timeline_row_in_a_conflict_names_every_counterpart_and_a_clean_row_na
     assert rows[a]["conflict_with"] == [b, c] and rows[b]["conflict_with"] == [a, c]
     assert "conflict_with" not in rows[old] and rows[old]["marks"] == []
     assert f"{timeline.MARKS['conflict']} ({b}, {c})" in timeline.plain_text([g])
+
+
+def test_a_breakdown_of_four_own_facet_rates_in_two_sections_and_two_bare_rates_marks_only_the_bare_rows():
+    """Round 13 follow-up: own facets of one appraisal unit are different in any section, and an undecided pair is marked on the
+    side whose facet is unresolved, which names its counterparts."""
+    o = Office()
+    doc, ver = _unit(o)
+    when = as_of("2025-03-31")
+
+    def rate(amount: str, written: str | None, section: str) -> str:
+        facet = datum.facet(written, "sentence", "own") if written else datum.none()
+        return o.value(doc, amount, when, kind="rate", unit="percent", version=ver, facet=facet, section=section)
+
+    stated = [rate("6", "התזרים מדמי שכירות ממשרדים", "3. היוון"), rate("7", "התזרים מחניות", "3. היוון"),
+              rate("8", "התזרים ממחסנים", "5. סיכום"), rate("9", "התזרים משלטי פרסום", "5. סיכום")]
+    bare = [rate("10", None, "5. סיכום"), rate("11", None, "3. היוון")]
+    (block,) = timeline.breakdown(o.ws, set(stated))
+    rows = {r["sid"]: r for r in block["rows"]}
+    assert set(rows) == {*stated, *bare}
+    assert all(rows[s]["marks"] == [] and "undecided_with" not in rows[s] for s in stated), "resolved own facets: no mark"
+    for b in bare:
+        assert rows[b]["marks"] == ["undecided"]
+        assert set(rows[b]["undecided_with"]) >= set(stated)  # every stated rate; the other bare rate too (both unresolved)
+    assert not coverage.conflicting(o.ws)

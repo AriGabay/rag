@@ -144,8 +144,12 @@ def test_ae2_the_undecided_mark_names_the_counterpart_and_is_neither_a_conflict_
     (table,) = timeline.breakdown(c.ws, {offices})
     rows = {r["sid"]: r for r in table["rows"]}
     assert earlier not in rows and offices in rows and bare in rows
-    assert rows[offices]["marks"] == ["undecided"] and rows[offices]["undecided_with"] == [bare]
-    assert f"{timeline.MARKS['undecided']} ({bare})" in timeline.plain_text([], [table])
+    # round 13 follow-up: the mark is on the unresolved side only. The bare rate (no facet) is undecided against every rate with
+    # one and names them; the offices rate, whose only undecided partner is the bare rate, carries no mark
+    assert rows[offices]["marks"] == [] and "undecided_with" not in rows[offices]
+    assert rows[bare]["marks"] == ["undecided"] and offices in rows[bare]["undecided_with"]
+    assert set(rows[bare]["undecided_with"]) <= {r["sid"] for r in table["rows"]} - {bare}
+    assert f"{timeline.MARKS['undecided']} ({offices}" in timeline.plain_text([], [table])
     assert not coverage.conflicting(c.ws)
 
 
@@ -263,9 +267,17 @@ def test_each_core_keeping_a_word_the_other_lacks_in_one_table_list_or_section_i
     assert datum.relation(a, b) == datum.DIFFERENT
     a, b = a._replace(table=None, section="3. היוון"), b._replace(table=None, section="3. היוון")
     assert datum.relation(a, b) == datum.DIFFERENT  # the same section path (a list sits in one section)
-    assert datum.relation(a, b._replace(section="4. סיכום")) == datum.UNDECIDED  # another section: no structural evidence
     assert datum.relation(a, b._replace(appraisal=UNIT_B)) == datum.UNDECIDED  # disjoint across units
-    assert datum.relation(a._replace(section=""), b._replace(section="")) == datum.UNDECIDED  # nothing says they sit together
+    # round 13 follow-up: two own facets of one appraisal unit are different in any section, with nothing saying they sit together
+    assert datum.relation(a, b._replace(section="4. סיכום")) == datum.DIFFERENT
+    assert datum.relation(a._replace(section=""), b._replace(section="")) == datum.DIFFERENT
+    assert datum.relation(a._replace(appraisal=None), b._replace(appraisal=None, section="4. סיכום")) == datum.UNDECIDED
+    # a context-tier facet (caption, lead-in, heading) still needs the same table, list or section; own against context neither
+    ctx = [site(w, tier="context", family="coefficient", section=sec) for w, sec in
+           (("מקדם מיקום", "3. היוון"), ("מקדם צורת מגרש", "3. היוון"), ("מקדם צורת מגרש", "4. סיכום"))]
+    assert datum.relation(ctx[0], ctx[1]) == datum.DIFFERENT  # context tier, one section
+    assert datum.relation(ctx[0], ctx[2]) == datum.UNDECIDED  # context tier, another section: no structural evidence
+    assert datum.relation(a, ctx[2]) == datum.UNDECIDED  # one own, one context, another section
 
 
 def test_a_subset_is_undecided_and_so_is_a_stated_facet_against_a_headline_value():

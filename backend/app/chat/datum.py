@@ -437,8 +437,11 @@ def relation(a, b, a_in_unit: int = 1, b_in_unit: int = 1) -> str:
     1. both facets are ``own`` tier and their cores are equal and not empty: same;
     2. both are the unit's headline datum (``headline``): same;
     3. each core keeps a content word the other lacks, and both are in one unit's same table, list or section: different;
-    4. everything else (a subset, disjoint across units, equal context-tier cores, an unresolved facet, a stated facet against
-       a headline datum): undecided.
+       or both facets are ``own`` tier (the value's own row label, column header or purpose phrase) and both data are in the
+       same appraisal unit, in any section: different (round 13 follow-up: an own facet is the value's own words, so two
+       disjoint ones inside one appraisal are two components even where the sections differ);
+    4. everything else (a subset, disjoint across units, context-tier cores that are not side by side, equal context-tier
+       cores, an unresolved facet, a stated facet against a headline datum): undecided.
 
     "Different" needs structural evidence: two wordings of one datum in two documents can share no words. The rule is not
     transitive, so it is no key field: ``timeline`` joins "same" pairs into classes. The two data are of one base key
@@ -449,6 +452,6 @@ def relation(a, b, a_in_unit: int = 1, b_in_unit: int = 1) -> str:
         return SAME
     if headline(a, a_in_unit) and headline(b, b_in_unit):
         return SAME
-    if ca - cb and cb - ca and _together(a, b):
+    if ca - cb and cb - ca and (_together(a, b) or (own and a.appraisal is not None and a.appraisal == b.appraisal)):
         return DIFFERENT
     return UNDECIDED
