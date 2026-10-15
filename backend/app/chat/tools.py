@@ -165,7 +165,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import Connection, text
 
 from app.answering.verify import numbers_in
-from app.chat import anchors, calc, contexts, meaning, reader
+from app.chat import anchors, calc, contexts, datum, meaning, reader
 from app.chat import dates as chat_dates
 from app.chat import unread as unread_text
 from app.chat.contexts import MSG_NO_TITLE
@@ -395,6 +395,9 @@ class Measurement:
     # the date it refers to (round 11 U8, KTD4; ``dates.measurement_as_of``): the stored date counts only when the quote holds
     # it; None when unknown. A forecast with no date is ``{"date": None, ..., "forecast": True}``
     as_of: dict | None = None
+    # the component its source states (round 13 U3, KTD2; ``datum.read_cell`` / ``read_quote``): resolved when listed, from
+    # its table row or its quote; None until then (``public`` then says not read)
+    facet: dict | None = None
 
     def public(self) -> dict:
         r = self.row
@@ -409,7 +412,8 @@ class Measurement:
                 "stated_by": getattr(r, "stated_by", None), "stance": getattr(r, "stance", None),
                 # the unit its block is in, in a file holding several (round 9 U9, R10)
                 "unit_id": self.context["unit_id"] if self.context else None,
-                "as_of": dict(self.as_of) if self.as_of else None}
+                "as_of": dict(self.as_of) if self.as_of else None,
+                "facet": dict(self.facet) if self.facet else datum.not_read()}
 
 
 def anchor_lost(row) -> bool:
@@ -539,6 +543,9 @@ class Workspace:
     # (version id, reading id) -> every block's index, section path and status (``reader.section_blocks``), and each
     # table's first block with its rows' positions (``_table_rows``)
     tables: dict[tuple, tuple] = field(default_factory=dict)
+    # facets resolved this turn (round 13 U3, KTD2): a value's by its place and family, a measurement's by its id, so a
+    # datum met again is not read again
+    facets: dict[tuple, dict] = field(default_factory=dict)
     section_blocks: dict[tuple, list] = field(default_factory=dict)
     table_rows: dict[tuple, dict] = field(default_factory=dict)
     # the turn's salt for claim and unit ids (round 8 KTD2, ``verify.assign_ids``): an id is a hash of the salt and the
@@ -705,6 +712,7 @@ class Workspace:
         if known is None:
             known = Measurement(f"M{len(self.measurements) + 1}", row.id, row.document_id, row.version_id, row.title,
                                 row)
+            known.facet = _measurement_facet_of(self, None, row)
             cx = self.contexts.get(str(row.version_id))
             if cx is not None and cx.multi:  # its appraisal context, from its block (KTD7)
                 known.context = value_context(cx, cx.at_block(getattr(row, "block_index", None)))
@@ -4379,6 +4387,40 @@ def _describe_key(key: tuple) -> str:
     return ", ".join(p for p in parts if p)
 
 
+def _measurement_facet(row, structure: dict | None) -> dict:
+    """The facet of a stored measurement (round 13 U3, R1, KTD2): a table row's from its table (the row label of the body
+    row ``row_index``, the column header its row carries, the caption), read through the table structure — not read when
+    that is not stored; a text row's from its quote (the purpose phrase of the sentence holding its number), which has
+    no blocks above it to read, so a quote naming nothing is ``none``."""
+    family = datum.facet_family(row.metric_kind or "", row.quote or "", row.metric or "")
+    if row.table_index is not None:
+        if structure is None:
+            return datum.not_read()
+        rows = structure.get("rows") or []
+        ri = row.row_index
+        cells = (rows[ri].get("cells") if ri is not None and 0 <= ri < len(rows) else None) or []
+        return datum.read_cell(cells[0] if cells else "", getattr(row, "header", None), structure.get("caption"),
+                               [x for x in structure.get("title") or [] if x], family=family, matrix=len(cells) >= 3)
+    found = _numbers_of(meaning._norm(row.value_text or ""))
+    written = found[0][0] if found else ""
+    return datum.read_quote(datum.sentence_with(row.quote or "", written), written, family, [])
+
+
+def _measurement_facet_of(ws: Workspace, conn: Connection | None, row) -> dict:
+    """``_measurement_facet`` memoized in the workspace; a table row is read with the turn's cached table structure
+    (``_table_at``) when a connection is at hand, and is otherwise not read (and not memoized)."""
+    key = ("m", str(row.id))
+    if key in ws.facets:
+        return dict(ws.facets[key])
+    structure = None
+    if row.table_index is not None and conn is not None:
+        structure = _table_at(ws, conn, row.version_id, row.table_index)[0]
+    found = _measurement_facet(row, structure)
+    if found["status"] != datum.STATUS_NOT_READ:
+        ws.facets[key] = found
+    return found
+
+
 def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | None = None,
                            document_ids: list[str] | None = None, value_roles: list[str] | None = None,
                            page: int | None = None) -> str:
@@ -4437,6 +4479,7 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
             f" WHERE d.deleted_at IS NULL AND {APPRAISALS_SQL}" + (" AND d.id = ANY(:d)" if docs else "")),
             params).all()
         cached, cached_total = _cached_listing(conn, docs, metric_kinds, words)
+        facets = {r.id: _measurement_facet_of(ws, conn, r) for r in rows}  # a table row's from its table (round 13 U3)
         for vid, reading in {(str(r.version_id), r.reading_id) for r in rows}:
             contexts_of(ws, conn, vid, reading)  # a measurement records its appraisal context (KTD7)
     key = (" ".join(words) if not metric_kinds else "", tuple(sorted(metric_kinds or [])),
@@ -4447,6 +4490,7 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
     for r in rows:
         m = ws.add_measurement(r)
         m.as_of = as_ofs[r.id]
+        m.facet = facets[r.id]
         m.listings.add(key)
         ws.touch(r.document_id, r.title, "read")
         groups.setdefault(_compat_key(r), []).append(m)
@@ -4480,6 +4524,8 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
                     f" של {_txt(r.stated_by)}" if getattr(r, "stated_by", None) else "")
             if m.context:
                 extra += f" | הקשר: {_txt(m.context['described'])}"
+            if m.facet and m.facet["status"] != datum.STATUS_NOT_READ:
+                extra += f" | {_txt(datum.line(m.facet))}"
             issues = f" | הערות: {_txt('; '.join(r.issues))}" if r.issues else ""
             if anchor_lost(r):
                 issues += " | המיקום במסמך אבד בעיבוד מחדש: הערך אינו מאומת מול הקריאה הנוכחית של המסמך"
@@ -4538,10 +4584,12 @@ def _cached_lines(ws: Workspace, rows: list, total: int) -> list[str]:
             attested.append(f"ייחוס: {stance_label(record['stance'])}"
                             + (f" של {record['stated_by']}" if record.get("stated_by") else ""))
         says = "; ".join(x for x in attested if x) or "המקור אינו מעיד על משמעותו"
+        facet_line = (f" | {_txt(datum.line(record['facet']))}"
+                      if (record.get("facet") or {}).get("status") in (datum.STATUS_STATED, datum.STATUS_NONE) else "")
         out.append(f'  {name}{" (כבר נרשם בתור הזה)" if held else ""}: {_txt(record.get("value_text"))} | מסמך: '
                    f'"{_txt(r.title)}" | מקום: {_txt(_cached_where(record))}'
                    + (f" | סעיף: {_txt(record['section'])}" if record.get("section") else "")
-                   + f" | המקור מעיד: {_txt(says)} | סטטוס: {STATUS_AUTO}"
+                   + f" | המקור מעיד: {_txt(says)}{facet_line} | סטטוס: {STATUS_AUTO}"
                    + f"\n    ציטוט: {_txt(_clip(record.get('quote') or '', 300))}")
     return out
 
@@ -4789,6 +4837,9 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
             "total": bool(calc.TOTAL_WORDS.search(meaning._norm(cells[0] if cells else ""))),
             "table": (str(src.version_id), index), "said": said, "context": " ".join([*near, *table_text]),
             "meaning_from": {"unit": unit_from} if unit_from else {}, "scale": scale,
+            # what the facet is read from (round 13 U3, KTD2): the row label, the column header and the caption and title
+            "facet_in": {"cell": True, "row": label, "header": header, "caption": st.get("caption") or "",
+                         "title": [x for x in st.get("title") or [] if x], "matrix": len(cells) >= 3},
             # the cell as stored (KTD1): its box is looked up when the answer is stored, never searched for
             "anchor": {"table_index": index, "row": ri, "column": ci,
                        "pages": [p] if (p := (st.get("rows") or [])[ri].get("page")) else []}}
@@ -4984,7 +5035,8 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
             "kind_context": quote, "kind_parts": [("sentence", quote)], "locator": {"quote": loc["quote"].strip()},
             "total": False, "table": None,
             "anchor": anchor, "said": said, "context": f"{line}\n{quote}",
-            "meaning_from": {"unit": unit_from} if unit_from else {}, "scale": scale}
+            "meaning_from": {"unit": unit_from} if unit_from else {}, "scale": scale,
+            "facet_in": {"cell": False, "written": written}}
 
 
 def _vat_anchors(vats: set[str], parts: list[tuple[str, str]], fallback: str) -> dict[str, dict]:
@@ -5181,8 +5233,50 @@ def _new_value(ws: Workspace, src: Source, sid: str, taken: dict, settled: tuple
                        section=" › ".join(path), stated_by=who["stated_by"], stance=who["stance"],
                        scenario=who["scenario"], attribution=said.evidence if said is not None else "",
                        meaning_from=dict(taken.get("meaning_from") or {}) | anchors, scale=int(taken.get("scale") or 1))
+    value.facet = _value_facet(ws, src, taken, fields["kind"])
     ws.values[value.vid] = value
     return value
+
+
+def _value_facet(ws: Workspace, src: Source, taken: dict, kind: str) -> dict:
+    """The facet of a value as it enters the turn (round 13 U3, R1, R2, KTD2): the source's own words that name the
+    component it is for — a cell's row label (else its column header, else the caption as context), or the purpose phrase
+    of a quote's own sentence (else the lead-in or heading above it, ``taken["preceding"]``) — never the model's label or
+    subject. Memoized in the workspace by place and family; a cached value (``taken["facet"]``) keeps the one it was
+    cached with."""
+    if taken.get("facet") is not None:
+        return dict(taken["facet"])
+    inp = taken.get("facet_in")
+    if inp is None:
+        return datum.not_read()
+    if inp["cell"]:
+        family = datum.facet_family(kind, inp["row"], inp["header"], inp["caption"])
+        read = lambda: datum.read_cell(inp["row"], inp["header"], inp["caption"], inp["title"],  # noqa: E731
+                                       family=family, matrix=inp["matrix"])
+    else:
+        sentence = _own_sentence(taken)
+        family = datum.facet_family(kind, sentence)
+        read = lambda: datum.read_quote(sentence, inp["written"], family, taken.get("preceding"))  # noqa: E731
+    key = (*_locator_key(src.version_id, src.reading_id, taken["locator"]), family)
+    if key in ws.facets:
+        return dict(ws.facets[key])
+    found = read()
+    if found["status"] != datum.STATUS_NOT_READ:
+        ws.facets[key] = found
+    return found
+
+
+def _preceding_blocks(conn: Connection, version_id, region: list, taken: dict, kind: str) -> list[tuple[str, str]] | None:
+    """The blocks above a quote value's own, for its bounded context read (round 13 U3, R2, KTD2): the heading and
+    paragraph blocks among the ``datum.CONTEXT_BLOCKS`` before the block holding it, inside its section, nearest first —
+    read only for a value of a family that needs a facet. None: not read (not a family that needs one, or no block of
+    its own)."""
+    if not region or not datum.needs_facet(datum.facet_family(kind, _own_sentence(taken))):
+        return None
+    holder = region[0]
+    first = holder.block_index
+    above = reader.blocks_between(conn, version_id, max(0, first - datum.CONTEXT_BLOCKS), first - 1) if first > 0 else []
+    return datum.preceding([*above, holder], first, tuple(getattr(holder, "section_path", None) or ()))
 
 
 def _own_sentence(taken: dict) -> str:
@@ -5255,7 +5349,8 @@ def _value_report(ws: Workspace, value: calc.Value, said: Attribution | None, no
                 for k, p in prov.items() if p == "model_asserted"]
     lines = [f"{value.vid} נרשם: «{_txt(value.label)}» = {value.written} ({'; '.join(x for x in shown if x) or 'ללא יחידה'})"
              f" | סוג: {VALUE_KINDS[value.kind]} | תפקיד: {calc.ROLE_LABELS[value.role]}"
-             + (f" | נושא: {_txt(value.subject)}" if value.subject else "") + (" | שורת סה\"כ" if value.total else ""),
+             + (f" | נושא: {_txt(value.subject)}" if value.subject else "") + (" | שורת סה\"כ" if value.total else "")
+             + f" | {_txt(datum.line(value.facet))}",
              f"אומת ב-{value.source_id}: {_txt(place)}" + (f" | סעיף: {_txt(value.section)}" if value.section else ""),
              _attribution_line(value, said)]
     if value.scale != 1:
@@ -5333,6 +5428,8 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
         # the value's own region: read clearly, or read uncertainly at ingestion (then re-read, below, at most
         # REREADS_PER_VALUE times; the same region again is served from the stored readings)
         region = [r for r in rows if at is None or r.block_index in at]
+        if not cell:  # a quote's facet: the blocks above its own, read once with the rest (round 13 U3, KTD2)
+            taken["preceding"] = _preceding_blocks(conn, src.version_id, region, taken, given.get("kind") or "")
         unclear = next((r for r in region if r.status == reader.UNCERTAIN), None)
         dating = _date_inputs(ws, conn, src.version_id, taken, region[0].block_index if region else src.block_start, vision)
         cx = contexts_of(ws, conn, src.version_id, v.reading_id)
@@ -5418,7 +5515,7 @@ CACHE_HANDLE = "Q"
 CACHED_MAX = 40  # cached values listed by one find_measurements call
 SOURCE_FIELDS = ("kind", "unit", "period", "vat", "area_basis", "stance", "stated_by", "scenario")
 RECORD_FIELDS = ("value", "value_text", "document_id", "version_id", "reading_id", "title", "location", "locator",
-                 "quote", "total", "approx", "section", "attribution", "meaning_from")
+                 "quote", "total", "approx", "section", "attribution", "meaning_from", "facet")
 MSG_CACHED_CLEAR = ("האזור של הערך נקרא בעיבוד המסמך בקריאה לא ודאית; הערך כבר אומת בקריאה ברורה של אותה קריאת "
                     "מסמך (ערך מאומת שמור), בלי קריאה חוזרת.")
 MSG_CACHED_TAKEN = ("נלקח מערך מאומת שמור ({handle}) של הקריאה הנוכחית של המסמך, בלי קריאה נוספת; המשמעות שנתת "
@@ -5493,8 +5590,9 @@ def _cache_record(value: calc.Value) -> dict:
 
 # v3: scoped table periods and clearly read governing currency as well as scale; v4 (round 12 U9, KTD9): the anchor
 # {part, written} of each source attribute in the record and the part of each qualifier in the facts — a v3 row is
-# inert (neither listed nor reused), never deleted
-VALUE_VERIFIER_VERSION = "value-v4"
+# inert (neither listed nor reused), never deleted; v5 (round 13 U3, KTD19): the facet — the component the source states
+# for the value — in the record, so a v4 row (without one) is inert in the same way
+VALUE_VERIFIER_VERSION = "value-v5"
 
 
 def _cache_doc(value: calc.Value, taken: dict, path: tuple, stub: dict | None, src: Source,
@@ -5611,6 +5709,7 @@ def _take_cached(ws: Workspace, handle: str, data: dict, loc: dict, given: dict,
     if not _locator_agrees(record, loc):
         raise ToolError(MSG_CACHED_LOCATOR.format(handle=handle, where=_cached_where(record)))
     taken, path = _facts_from_json(doc["facts"])
+    taken["facet"] = record.get("facet") or datum.not_read()  # the facet it was cached with (round 13 U3)
     settled = _settle(taken, given, path)
     place = doc.get("source") or {}
     src = ws.add_source(document_id=v.document_id, version_id=v.version_id, title=v.title,

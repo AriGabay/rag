@@ -70,6 +70,7 @@ from fractions import Fraction
 from typing import Any
 from uuid import UUID
 
+from app.chat import datum
 from app.chat.contexts import context_subject
 from app.measurements.extract import PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
 
@@ -1153,6 +1154,11 @@ class Value:
     # the server from the value's own row or sentence, its table's range, or its unit's valuation date; None when the
     # sources give none. A forecast with no date is ``{"date": None, ..., "forecast": True}``: the wording alone marks it
     as_of: dict | None = None
+    # the component, consideration or cash flow its source states (round 13 U3, KTD1): {"status": stated | none |
+    # not_read, "written", "part", "tier"} — the source's own words (its row label, column header, caption, the
+    # purpose phrase of its sentence, a lead-in or heading), never ``label`` or ``subject``; ``datum.not_read()`` until
+    # the tools resolve it when the value enters the turn
+    facet: dict = field(default_factory=datum.not_read)
 
     @property
     def certainty(self) -> str:
@@ -1195,7 +1201,7 @@ class Value:
                 "attribution": self.attribution, "meaning_from": dict(self.meaning_from), "reading": self.reading,
                 "reading_note": self.reading_note, "context": dict(self.context) if self.context else None,
                 "subject_from": self.subject_from, "scale": self.scale,
-                "as_of": dict(self.as_of) if self.as_of else None}
+                "as_of": dict(self.as_of) if self.as_of else None, "facet": dict(self.facet)}
 
 
 @dataclass

@@ -222,6 +222,8 @@ export interface ChatMeasurement {
   reading_id?: string | null;
   /** Its place was not found again when the document was reprocessed: not verified against the current reading. */
   anchor_lost?: boolean;
+  /** The component its source states for it (absent on older answers). */
+  facet?: ChatFacet | null;
   anchor?: ChatAnchor | null;
 }
 
@@ -288,6 +290,17 @@ export interface ChatComputation {
   anchor?: ChatComputedAnchor | null;
 }
 
+/** The component, consideration or cash flow a value's or measurement's source states for it ("רכיב"): the source's own
+ * words — its row label, column header, caption, the purpose phrase of its sentence, a list lead-in or a heading — never
+ * a label or subject the model wrote. `own`: the value's own row, column or sentence; `context`: the caption, lead-in or
+ * heading. `none`: read, and the source states none; `not_read`: not read. Absent on older answers. */
+export interface ChatFacet {
+  status: "stated" | "none" | "not_read";
+  written: string | null;
+  part: "row" | "column" | "caption" | "sentence" | "lead_in" | "heading" | null;
+  tier: "own" | "context" | null;
+}
+
 /** A value the server verified in a source the answer's turn read (V#): the cell at a row and column, or a number
  * inside an exact quote, with its meaning and which parts of it the source attests. */
 export interface ChatValue {
@@ -327,6 +340,8 @@ export interface ChatValue {
   quote: string;
   total: boolean;
   approx: boolean;
+  /** The component its source states for it (absent on older answers). */
+  facet?: ChatFacet | null;
   /** The cell or quoted words it was taken from (absent on older answers). */
   anchor?: ChatAnchor | null;
 }
