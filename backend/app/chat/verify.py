@@ -222,7 +222,7 @@ from app.providers.llm import (
 
 if TYPE_CHECKING:
     from app.chat.engine import FinalAnswer
-    from app.chat.tools import Workspace
+    from app.chat.tools import Source, Workspace
 
 logger = logging.getLogger(__name__)
 
@@ -477,7 +477,9 @@ _SCENARIO_MARK = re.compile(r"(?<![א-ת])(?:אם|בהנחה|בהנחת|בתרח
 # own — a check that did not finish (the judge timed out on the unit's call, or left it out) — and is never "wrong".
 _JudgedFailure = Literal["absent_from_source", "wrong_subject", "wrong_unit", "uncertain_reading", "contradicts_source",
                          "wrong_calculation", "invalid_citation"]
-FailureKind = Literal[_JudgedFailure, "not_checked"]
+# ``context_not_read`` (round 13 U10, KTD11, R14) is the server's too: the judge asked for context the bounded re-read could not
+# supply (``CONTEXT_UNREAD``), so the claim is neither found wrong nor found absent — its defining context was not read
+FailureKind = Literal[_JudgedFailure, "not_checked", "context_not_read"]
 FAILURE_KINDS: tuple[str, ...] = get_args(FailureKind)
 # the judge's field: every failure kind but the server's own ``not_checked``, or "none"
 JudgeFailure = Literal["none", _JudgedFailure]
@@ -494,6 +496,7 @@ FAILURE_LABELS = {
     "wrong_calculation": "חישוב שגוי או קלטים שגויים",
     "invalid_citation": "ציטוט של מזהה שלא הוחזר בתור הזה",
     "not_checked": "לא נבדק מול המקורות",
+    "context_not_read": "ההקשר שמגדיר אותו (כותרות, הערות או המשך) לא נקרא",
 }
 REPAIR_HINTS = {
     "wrong_subject": "ייחס את הנתון לנכס או לצד הנכון, או קח אותו מההקשר של הנכס שעליו נשאלת השאלה",
@@ -504,6 +507,7 @@ REPAIR_HINTS = {
     "wrong_unit": "הצג את הנתון ביחידה, בתקופה, בבסיס השטח ובמע\"מ שנכתבו לו במקור",
     "contradicts_source": "תקן לפי המקור או השמט",
     "invalid_citation": "צטט רק מזהים שהוחזרו בתור הזה",
+    "context_not_read": "קרא את ההקשר שמגדיר את הנתון (כותרות, הערות או המשך הטבלה, פתיחת הסעיף) או השמט את הטענה",
 }
 # the qualifier edit (round 12 U10, KTD10, R7): the attribute each edit names in the removal note, and what is written in
 # place of a qualifier the source does not state when the question itself asked about that attribute
@@ -524,6 +528,7 @@ REMOVAL_SENTENCES = {
     "wrong_calculation": "הוסרה טענה שהציגה חישוב שגוי או חישוב על קלטים שגויים.",
     "invalid_citation": "הוסרה טענה שציטטה מקור שלא נבדק בתור הזה.",
     "not_checked": "הוסרה טענה שלא ניתן היה לבדוק מול המקורות; היא לא נמצאה שגויה.",
+    "context_not_read": "הוסרה טענה שההקשר הדרוש לבדיקתה לא נקרא.",
 }
 # a judge's concrete defect of a partly supported unit, as a failure kind (for the repair prompt)
 DEFECT_FAILURES = {"input": "wrong_calculation", "scenario": "wrong_calculation", "formula": "wrong_calculation",
@@ -590,6 +595,15 @@ READ_IN_PART = "המקור נקרא בחלקו"  # R14: a claim whose source the
 REREAD_OUTCOMES = ("supported", "partial", "unsupported", "contradicts", "check_failed", "no_context", "no_time",
                    "bound", "found", "not_found")
 UNSTATED_EXPANSIONS = ("next_page", "continuation")  # where a number no cited passage states is looked for next
+# the re-read outcomes after which the context a claim needed was still not read (round 13 U10, KTD11, R14): the source had
+# nothing more to give, the turn's bound or its time kept the read from starting, or the number was not in what was read.
+# ``check_failed`` is the technical failure (a read or a call that broke) and is not among them
+CONTEXT_UNREAD = ("no_context", "bound", "not_found", "no_time")
+CONTEXT_NOT_READ = "context_not_read"
+# where a qualifier a value is given (a VAT status, an area basis, a period) is looked for before the edit takes it out of
+# the answer (round 13 U10, KTD11): the table's caption, headers and notes, the notes of its page and of its section, the
+# section's lead-in, and the table's continuation — stored text only, one place of the turn's bound per unit
+QUALIFIER_READS = ("table_headers", "footnotes", "section_lead", "section_notes", "next_page")
 
 
 @dataclass(frozen=True)
@@ -1073,6 +1087,11 @@ class Unit:
     # numbers no cited source states, found by the deterministic check in a unit that also holds other content: the
     # unit goes to the judge with them named (``<unstated>``), and the claim holding one fails (``fail_unstated``)
     unstated: list[str] = field(default_factory=list)
+    # the shape of the line around the unit (``split_units``, round 13 U10, KTD12): ``list_item`` — its line is a list item;
+    # ``leads_list`` — it is the last unit of a line that the next non-blank line follows with a list item or a heading,
+    # so a short colon line there is a lead-in (``structural_kind``)
+    list_item: bool = False
+    leads_list: bool = False
 
 
 def _norm(text: str) -> str:
@@ -2071,6 +2090,10 @@ def ids_in(text: str) -> list[str]:
     return list(dict.fromkeys(i for m in _IDS.finditer(text) for i in _ID.findall(m.group(1))))
 
 
+_LIST_ITEM = re.compile(r"(?:[-*+•]|\d{1,3}[.)])\s+\S")  # a Markdown bullet or numbered item
+_HEADING_LINE = re.compile(r"#{1,6}\s+\S")
+
+
 def split_units(markdown: str) -> list[Unit]:
     """Every statement of the answer with its character span: lines; long lines split into sentences; a Markdown
     table row is one unit. Citations written after a sentence's full stop ("... 55 ₪. [S2]") belong to it. A
@@ -2112,6 +2135,7 @@ def split_units(markdown: str) -> list[Unit]:
                 pos = m.end()
             pieces.append((pos, len(stripped)))
         spans: list[list[int]] = []
+        first_unit = len(units)
         for a, b in pieces:
             piece = stripped[a:b]
             lead = _LEADING_IDS.match(piece)
@@ -2134,6 +2158,10 @@ def split_units(markdown: str) -> list[Unit]:
                 continue
             units.append(Unit(len(units), part, clean, ids_in(part), base + a, base + a + len(part),
                               header_row, table_span, context))
+        if table_span is None and len(units) > first_unit:
+            for u in units[first_unit:]:
+                u.list_item = bool(_LIST_ITEM.match(stripped))
+            units[-1].leads_list = bool(_LIST_ITEM.match(following) or _HEADING_LINE.match(following))
     units = _attach_bare_lines(markdown, units)
     chains = _headings_above(markdown, units)
     for u in units:
@@ -2209,7 +2237,7 @@ def _attach_bare_lines(markdown: str, units: list[Unit]) -> list[Unit]:
 def _joined(markdown: str, first: Unit, second: Unit) -> Unit:
     raw = markdown[first.start:second.end]
     return Unit(first.index, raw, _IDS.sub("", raw).strip(), list(dict.fromkeys([*first.ids, *second.ids])),
-                first.start, second.end, False, None, "")
+                first.start, second.end, False, None, "", list_item=first.list_item, leads_list=second.leads_list)
 
 
 _KIND_NAMES = {source_kinds.STANDARD: "תקן", source_kinds.PROFESSIONAL: "מסמך מקצועי"}
@@ -3912,13 +3940,29 @@ def _document_count(n: str, text: str) -> bool:
 _DIGIT = re.compile(r"\d")
 
 
+LEAD_IN_WORDS = 8  # a lead-in is at most this many words long (round 13 U10, KTD12)
+LEAD_IN_REASON = "פתיח מבני לפני רשימה או כותרת: לא טענה לבדיקה; המספרים שבו נבדקים בבדיקות של השרת"
+
+
+def is_lead_in(unit: Unit) -> bool:
+    """Whether the unit is a lead-in (round 13 U10, KTD12, R15): a line of at most ``LEAD_IN_WORDS`` words that ends with a colon
+    and is followed by list items or a heading ("הנתונים לחלקה 7 הם:"), even when it holds a number. It states no amount of its
+    own (a line that does is a claim) and is no table row. Structure, not a claim — the judge is not asked about it, and the
+    server's own checks still read its numbers."""
+    text = unit.text.strip()
+    return (unit.leads_list and unit.table_span is None and not unit.table_header
+            and text.strip("*_ ").endswith(":") and len(text.split()) <= LEAD_IN_WORDS and not _AMOUNT.search(text))
+
+
 def structural_kind(unit: Unit) -> str | None:
-    """``heading``, ``label``, ``question`` or ``connective`` when the unit is structurally not a claim; None
+    """``heading``, ``lead_in``, ``label``, ``question`` or ``connective`` when the unit is structurally not a claim; None
     otherwise. Conservative: anything else is a claim and needs a verdict."""
     text = unit.text.strip()
     words = len(text.split())
     if re.match(r"^#{1,6}\s", unit.raw.strip()) or _numbered_heading(unit.raw):
         return "heading"
+    if is_lead_in(unit):
+        return "lead_in"
     if unit.table_header and not unit.ids:
         return "table_header"
     has_digit = bool(_DIGIT.search(text))
@@ -3945,11 +3989,12 @@ def _one_word(text: str) -> bool:
 
 def exempt_without_verdict(unit: Unit) -> bool:
     """Whether a unit may pass without a judge verdict: only neutral navigation text — a question, a bare
-    connective, or a heading, label or table header that is one digit-free word (each column name, for a header
-    row). The shape alone proves nothing: "# הנכס פנוי" and "**הנכס מושכר:**" are claims."""
+    connective, a lead-in before list items (``is_lead_in``, round 13 U10), or a heading, label or table header that is
+    one digit-free word (each column name, for a header row). The shape alone proves nothing: "# הנכס פנוי" and
+    "**הנכס מושכר:**" are claims."""
     kind = structural_kind(unit)
-    if kind in ("question", "connective"):
-        return True
+    if kind in ("question", "connective", "lead_in"):
+        return True  # (a lead-in cites what it likes: its number is checked by the server, not judged)
     if kind is None or unit.ids:
         return False
     if kind == "table_header":
@@ -4380,6 +4425,12 @@ def _judge_all(provider: LLMProvider, units: list[Unit], ws: Workspace, usage: l
     return verdicts, scores, unchecked
 
 
+def _context_unread(recs: list[ClaimRecord]) -> bool:
+    """Whether every claim of a failing unit that fails does so for context not read (``mark_context_unread``)."""
+    failing = [r for r in recs if not r.whole_unit and r.verdict in FAILING_VERDICTS]
+    return bool(failing) and all(r.failure == CONTEXT_NOT_READ for r in failing)
+
+
 def _read_in_part(recs: list[ClaimRecord]) -> str:
     """"; the source was read in part" for claims the bound kept from a re-read (R14): their verdict stands as it was,
     and says why more was not read."""
@@ -4403,6 +4454,20 @@ def _reread_source(u: Unit, kind: str, ws: Workspace) -> str | None:
             if s.kind in ("table", "table_row", "image") or s.table_index is not None or s.vision:
                 return i
     return readable[0] if readable else None
+
+
+def mark_context_unread(report: VerifyReport, ws: Workspace) -> None:
+    """The claims the judge could not settle for lack of context (``needs_context``) whose bounded re-read ended with the context
+    still unread (``CONTEXT_UNREAD``) fail as ``context_not_read`` — not absent from the source, which no one found out, and
+    not a contradiction (round 13 U10, KTD11, R14). The claim's own last log entry decides, so a claim re-read in an earlier
+    round of the turn (``ws.reread_done``) keeps the outcome it had. A claim the re-read judged again (its outcome is a verdict:
+    the expansion was shown) and one whose read or call failed technically (``check_failed``) are not marked."""
+    for recs in report.claims.values():
+        for r in recs:
+            log = ws.reread_log.get(r.id)
+            if (r.verdict in ("partial", "unsupported") and r.needs_context != "none" and log
+                    and log[-1].get("outcome") in CONTEXT_UNREAD):
+                r.failure = CONTEXT_NOT_READ
 
 
 def _log_reread(ws: Workspace, claim_id: str, **entry) -> None:
@@ -4492,6 +4557,112 @@ def _expand_unstated(report: VerifyReport, units: list[Unit], meanings: dict, ws
             cites[u.index] = new_sid
             _log_reread(ws, key, **entry, outcome="found", expanded_source=new_sid)
             break
+    return cites
+
+
+QUALIFIER_SCOPE = "qualifier"  # the scope of the log entry of a qualifier pre-read (``_expand_qualifiers``)
+QUALIFIER_CHECKS = ("meaning", "vat")  # the checks whose failure a qualifier edit resolves (``plan_qualifier_edits``)
+TRIAL_ID = "X0"  # the id a context under trial has in the workspace for one check, never kept
+MSG_QUALIFIER_FOUND = "המאפיין (מע\"מ, בסיס שטח או תקופה) כתוב ב-{sid} (הקשר המקור); צטט אותו"
+
+
+def _cite_for_qualifiers(u: Unit, ws: Workspace, question: str, meanings: dict, meaning_fetcher: meaning.Fetcher,
+                         src: Source) -> list[Problem] | None:
+    """The unit's problems with ``src`` cited as well, when that clears every qualifier problem of it; None — and the unit as it
+    was — when it does not."""
+    before = meanings.get(u.index, [])
+    u.ids.append(src.sid)
+    meanings[u.index] = meaning.check(u, ws, meaning_fetcher)
+    again = deterministic([u], ws, question, meanings)
+    if any(p.check in QUALIFIER_CHECKS for p in again):
+        u.ids.remove(src.sid)
+        meanings[u.index] = before
+        return None
+    return again
+
+
+def _expand_qualifiers(report: VerifyReport, units: list[Unit], meanings: dict, ws: Workspace, question: str,
+                       deadline: float | None, fetcher: ContextFetcher, meaning_fetcher: meaning.Fetcher
+                       ) -> dict[int, str]:
+    """The bounded read before a qualifier edit (round 13 U10, KTD11, R14, AE6). A unit whose only removing problems are an
+    area basis, a period or a VAT status its cited sources do not state — the case ``plan_qualifier_edits`` would edit — may
+    have them stated in the context of the source it rests on: the table's caption, headers and notes, the notes of its page
+    and section, the section's lead-in and the table's continuation (``QUALIFIER_READS``, stored text only, one place of the
+    turn's bound ``chat_reread_claims`` per unit, none without ``REREAD_MIN_SECONDS`` left). What was read joins the source
+    as one text (a general note — "all amounts exclude VAT" — backs the numbers of the table it is a note of); if the checks
+    pass with it, it is registered as a turn source with the cited anchor and cited with the unit (the server attaches
+    the citation), the unit's problems are the checks' again, and no edit is planned. Otherwise nothing is registered and
+    the edit stands. A later round of the turn reuses what was registered. Each attempt is on the unit's claims
+    (``ws.reread_log``). Returns the unit index -> the id of the source the citation of which the server attaches."""
+    cites: dict[int, str] = {}
+    budget = max(0, get_settings().chat_reread_claims - len(ws.reread_done))
+    for u in units:
+        mine = [p for p in report.problems if p.unit.index == u.index and p.removes_unit]
+        if (not mine or not u.ids or u.index < 0 or any(p.kind != "claim" or p.check not in QUALIFIER_CHECKS for p in mine)
+                or any(m.needs_citation for m in meanings.get(u.index, []))):
+            continue
+        sid = _reread_source(u, "table_headers", ws)
+        if sid is None:
+            continue
+        key = "unit:" + u.id
+        before = meanings.get(u.index, [])
+        attempt = functools.partial(_cite_for_qualifiers, u, ws, question, meanings, meaning_fetcher)
+
+        if key in ws.reread_done:  # read in an earlier round of the turn: what it registered is reused
+            known = next((x["expanded_source"] for x in reversed(ws.reread_log.get(key, []))
+                          if x.get("scope") == QUALIFIER_SCOPE and x.get("expanded_source") in ws.sources), None)
+            if known is not None and known not in u.ids and (again := attempt(ws.sources[known])) is not None:
+                report.problems = [x for x in report.problems if x not in mine] + again
+                cites[u.index] = known
+            continue
+        if budget <= 0:
+            _log_reread(ws, key, source=sid, scope=QUALIFIER_SCOPE, outcome="bound", reason="source_read_in_part")
+            continue
+        ws.reread_done.add(key)
+        budget -= 1
+        entry = {"source": sid, "scope": QUALIFIER_SCOPE}
+        bodies: list[str] = []
+        failed = False
+        for kind in QUALIFIER_READS:
+            if not _reread_time_left(deadline):
+                break
+            try:
+                body = _expansion_text(fetcher.expand(sid, kind))
+            except Exception:  # noqa: BLE001 - a read that failed is a check that did not complete
+                logger.warning("re-read of %s (%s) failed", sid, kind, exc_info=True)
+                failed = True
+                break
+            if body and body.strip() and body.strip() not in bodies:
+                bodies.append(body.strip())
+        if failed:
+            _log_reread(ws, key, **entry, outcome="check_failed")
+            continue
+        if not bodies:
+            _log_reread(ws, key, **entry, outcome="no_time" if not _reread_time_left(deadline) else "no_context")
+            continue
+        src = ws.sources[sid]
+        trial = dataclasses.replace(src, sid=TRIAL_ID, text=src.text + "\n" + "\n".join(bodies), body=None, same_as=None,
+                                    location=f"{src.location} — הקשר המקור")
+        ws.sources[TRIAL_ID] = trial
+        try:
+            again = attempt(trial)
+        finally:
+            ws.sources.pop(TRIAL_ID, None)
+        if again is None:
+            _log_reread(ws, key, **entry, outcome="not_found")
+            continue
+        u.ids.remove(TRIAL_ID)
+        meanings[u.index] = before
+        new = ws.adopt(dataclasses.replace(trial, sid=""))
+        again = attempt(new)
+        if again is None:  # the registered source does not read as the trial did: nothing is kept of it
+            ws.sources.pop(new.sid, None)
+            ws.anchors.pop(new.sid, None)
+            _log_reread(ws, key, **entry, outcome="check_failed")
+            continue
+        report.problems = [x for x in report.problems if x not in mine] + again
+        cites[u.index] = new.sid
+        _log_reread(ws, key, **entry, outcome="found", expanded_source=new.sid)
     return cites
 
 
@@ -4641,6 +4812,9 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     report.problems = deterministic(units, ws, question, meanings)
     found_in = _expand_unstated(report, units, meanings, ws, question, deadline, reread, fetcher) \
         if reread is not None else {}
+    # a qualifier the sources are silent on may be stated in the context of the table: read before it is edited out (U10)
+    qualified_in = _expand_qualifiers(report, units, meanings, ws, question, deadline, reread, fetcher) \
+        if reread is not None else {}
     # a number the sources back whose only fault is a qualifier they do not state is edited, not removed (round 12 U10)
     plan_qualifier_edits(report, ws, question, meanings)
     # a unit failed only for numbers no cited source states, that holds more than those numbers, is not removed up front:
@@ -4660,6 +4834,9 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         if u.index in found_in:  # a number only the source's next part states: its citation is attached
             report.problems.append(Problem(u, f"המספר מופיע ב-{found_in[u.index]} (המשך המקור); צטט אותו",
                                            kind="needs_citation", cite=found_in[u.index]))
+        if u.index in qualified_in:  # a qualifier only the source's context states: its citation is attached
+            report.problems.append(Problem(u, MSG_QUALIFIER_FOUND.format(sid=qualified_in[u.index]),
+                                           kind="needs_citation", cite=qualified_in[u.index]))
         report.problems += [Problem(u, f"תוצאת החישוב {cid} מוצגת בלי לצטט אותו", kind="needs_citation", cite=cid)
                             for cid in bound.get(u.index, [])]
         for m in meanings[u.index]:
@@ -4698,6 +4875,11 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         signature = (tuple((keys[u.index], u.index in failed) for u in units),
                      coverage.workspace if coverage else "", request or question,
                      tuple(r["id"] for r in requirements.items) if requirements is not None else ())
+    # a lead-in before list items is structure (round 13 U10, KTD12, R15): the judge is not asked, it is recorded as navigation,
+    # and its numbers are read by the deterministic checks above like any unit's
+    for u in to_judge:
+        if structural_kind(u) == "lead_in":
+            verdicts[u.index] = JudgeVerdict(index=u.index, verdict="navigation", reason=LEAD_IN_REASON)
     fresh = [u for u in to_judge if u.index not in verdicts]
     if coverage and not fresh:
         if cache is not None and cache.last is not None and requirements.derived and cache.last.signature == signature:
@@ -4725,6 +4907,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                          for u in to_judge if u.index in verdicts}
         if reread is not None:
             _reread(provider, report, verdicts, ws, usage, deadline, reread, cache, keys)
+            mark_context_unread(report, ws)
         report.unit_verdicts = dict(verdicts)
         _attach_rereads(report, ws)
         handled: set[int] = set()
@@ -4758,6 +4941,8 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                                                    cause="not_classified"))
             elif v.verdict in ("unsupported", "contradicts"):
                 failure = _judged_failure(u, v, ws)
+                if failure == "absent_from_source" and _context_unread(recs):
+                    failure = CONTEXT_NOT_READ  # the judge needed context the re-read did not supply: not "absent"
                 reason = "לא נתמך במקורות: " + v.reason
                 if not u.ids and v.verdict == "unsupported" and failure == "absent_from_source" \
                         and NOT_LINKED_REASON not in v.reason:
@@ -4775,7 +4960,8 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                     why = (reasons.get(r.id) if r is not None else None) or v.reason + (
                         f" («{r.text}»)" if r is not None else "")
                     why += _read_in_part([r] if r is not None else [])
-                    kind = (r.failure_kind() if r is not None and r.verdict in ("unsupported", "contradicts")
+                    kind = (r.failure_kind() if r is not None and (r.verdict in ("unsupported", "contradicts")
+                                                                   or r.failure == CONTEXT_NOT_READ)
                             else DEFECT_FAILURES.get(v.defect))
                     report.problems.append(Problem(u, "נתמך חלקית: " + why, "partial", defect=v.defect,
                                                    failure_kind=kind, check="judge",
@@ -5305,8 +5491,37 @@ def _remove_dependents(report: VerifyReport, verdicts: dict[int, JudgeVerdict]) 
                                            cause=base.cause))
             removed[i] = report.problems[-1]
             added = True
-        if not (_claim_cascade(report) or added):
+        changed = _claim_cascade(report)
+        changed = _orphan_lead_ins(report) or changed
+        if not (changed or added):
             return
+
+
+def _orphan_lead_ins(report: VerifyReport) -> bool:
+    """A lead-in whose list items were all removed goes with them, as a dependency on the first of them (round 13 U10, KTD12, R15,
+    AE7): its failure kind and cause are theirs. A lead-in with an item left, cut or not, stays. Whether one was added."""
+    removed = {p.unit.index: p for p in reversed(report.removals())}
+    added = False
+    for n, u in enumerate(report.units):
+        if u.index in removed or structural_kind(u) != "lead_in":
+            continue
+        items = []
+        for x in report.units[n + 1:]:
+            if not x.list_item:
+                break
+            items.append(x)
+        if not items or any(x.index not in removed for x in items):
+            continue
+        base = removed[items[0].index]
+        record = _whole_record(u, "unsupported")
+        record.fail_as(base.failure_kind or "absent_from_source")
+        record.basis, record.cause = base.claim_id, base.cause
+        report.claims[u.index] = [record]
+        report.problems.append(Problem(u, DEPENDS_ON_REMOVED.format(text=base.unit.text[:120]), failure_kind=base.failure_kind,
+                                       check="dependency", claim_id=record.id, basis=base.claim_id, cause=base.cause))
+        removed[u.index] = report.problems[-1]
+        added = True
+    return added
 
 
 def _ref_target(recs: list[ClaimRecord], ref: str, own: ClaimRecord) -> ClaimRecord | None:

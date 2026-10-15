@@ -1,6 +1,7 @@
 """The database fetcher of the bounded re-read (round 8 U5, KTD5; R13-R15, R24): the context a claim lacked — the heading
-chain, the paragraphs around the cited blocks, the rest of the section, a table's headers, units and notes, the notes of
-the page, a table continued on the next page, the stored reading of a picture's region — read from the stored document
+chain and the lead-in under it, the paragraphs around the cited blocks, the rest of the section, a table's caption,
+headers, units and notes, the notes of the page and of the section, a table continued on the next page, the stored
+reading of a picture's region — read from the stored document
 through the reader, under the user's own permissions, for the verification only. ``ContextReader`` is the
 ``verify.ContextFetcher`` of a turn; the per-turn state of the re-read (``reread_done``, ``reread_log``) stays on the
 ``Workspace``. It reads stored text only: no model call is made."""
@@ -30,7 +31,10 @@ from app.db import tenant_tx
 # --- the bounded re-read of a claim's source (round 8 U5, KTD5) -----------------------------------------------------
 
 REREAD_CHARS = 6000  # the text one expansion sends the judge
+LEAD_BLOCKS = 3  # the paragraphs under a heading that are its lead-in (round 13 U10, KTD11)
 _NOTE_LINE = re.compile(r"^\s*(?:\(\s*\d{1,2}\s*\)|\d{1,2}\s*\)|\(?\*+\)?|\*+)")  # "(1)", "1)", "(*)", "*": a footnote's start
+# a section's own note (round 13 U10, KTD11): a footnote mark, or a line that starts with the word for a note
+_SECTION_NOTE = re.compile(_NOTE_LINE.pattern + r"|^\s*(?:הערה|הערות|הבהרה|הבהרות)\s*[:\d.]")
 
 
 def _chain_of(ws: Workspace, conn: Connection, head: reader.Version, src: Source) -> tuple[str, ...]:
@@ -68,11 +72,68 @@ def _table_head(st: dict) -> list[str]:
     return lines
 
 
+def _section_rows(ws: Workspace, conn: Connection, head: reader.Version, src: Source) -> tuple[tuple[str, ...], list]:
+    """The innermost section a source cites a block of, and the blocks of it (its sub-sections too), within its appraisal
+    context; nothing for a source with no place in the document (a search hit's chunk)."""
+    if src.block_start is None:
+        return (), []
+    chain = _chain_of(ws, conn, head, src)
+    if not chain:
+        return (), []
+    cx = contexts_of(ws, conn, src.version_id, head.reading_id)
+    rows = reader.blocks_in_section(conn, src.version_id, chain, window=reader.section_window(cx, src.block_start, chain))
+    return chain, [r for r in rows if r.text]
+
+
+def _expand_section_lead(ws, conn, head, src):
+    """The section's lead-in (round 13 U10, KTD11, R14): the first paragraphs under its heading, before any sub-section or
+    table — where a section says what all that follows is (a scale, a basis, a date) — as stored text only."""
+    chain, rows = _section_rows(ws, conn, head, src)
+    lead: list[str] = []
+    for r in rows:
+        if r.kind == "heading" or r.table_index is not None:
+            if lead:
+                break
+            continue
+        if tuple(r.section_path or ()) != chain:
+            break  # a sub-section opened: what came before it was the lead-in
+        lead.append(r.text.strip())
+        if len(lead) == LEAD_BLOCKS:
+            break
+    if not lead:
+        return None
+    return "פתיחת הסעיף:\n" + "\n".join(lead), "פתיחת הסעיף", {}
+
+
+def _expand_section_notes(ws, conn, head, src, marks_only: bool = False):
+    """The notes of the section (round 13 U10, KTD11, R14): every line of it that starts as a note — a footnote mark or, unless
+    ``marks_only``, the word for a note — wherever in the section it stands (a note often follows its table by a paragraph)."""
+    _, rows = _section_rows(ws, conn, head, src)
+    start = _NOTE_LINE if marks_only else _SECTION_NOTE
+    lines: list[str] = []
+    for r in rows:
+        lines += [x.strip() for x in (r.text or "").splitlines() if start.match(x)]
+    lines = list(dict.fromkeys(lines))
+    if not lines:
+        return None
+    return "הערות הסעיף:\n" + "\n".join(lines), "הערות הסעיף", {}
+
+
+def _joined(*parts) -> tuple[str, str, dict] | None:
+    """The expansions among ``parts`` that exist, as one: their texts one after the other, the first one's scope."""
+    found = [p for p in parts if p is not None]
+    if not found:
+        return None
+    return "\n".join(p[0] for p in found), found[0][1], found[0][2]
+
+
 def _expand_heading(ws, conn, head, src):
     chain = _chain_of(ws, conn, head, src)
     if not chain:
         return None
-    return "כותרות מעל המקור, מהחיצונית לפנימית: " + " › ".join(chain), "כותרות הסעיף", {}
+    # the heading chain and the lead-in under it: what the section opens with says what it is about (round 13 U10, KTD11)
+    return _joined(("כותרות מעל המקור, מהחיצונית לפנימית: " + " › ".join(chain), "כותרות הסעיף", {}),
+                   _expand_section_lead(ws, conn, head, src))
 
 
 def _expand_neighbours(ws, conn, head, src):
@@ -136,9 +197,12 @@ def _expand_footnotes(ws, conn, head, src):
         for r in reader.blocks_on_pages(conn, src.version_id, min(pages), max(pages)):
             lines += [x.strip() for x in (r.text or "").splitlines() if _NOTE_LINE.match(x)]
     lines = list(dict.fromkeys(lines))
-    if not lines:
+    section = _expand_section_notes(ws, conn, head, src, marks_only=True)  # a footnote's mark, as on the page
+    if not lines and section is None:
         return None
-    return "הערות שוליים והערות של העמוד והטבלה:\n" + "\n".join(lines), "הערות שוליים", {}
+    # a table's and a page's notes, and the section's own (round 13 U10, KTD11)
+    return _joined(("הערות שוליים והערות של העמוד והטבלה:\n" + "\n".join(lines), "הערות שוליים", {}) if lines else None,
+                   section)
 
 
 def _expand_next_page(ws, conn, head, src):
@@ -188,9 +252,12 @@ def _expand_region(ws, conn, head, src):
         "הקריאה השמורה של טבלת התמונה", {}
 
 
+# ``section_lead`` and ``section_notes`` are read by the server on its own (the qualifier pre-read, round 13 U10, KTD11) and
+# are also part of what the judge's ``heading`` and ``footnotes`` read; the judge does not name them
 _EXPANDERS = {"heading": _expand_heading, "neighbours": _expand_neighbours, "continuation": _expand_continuation,
               "table_headers": _expand_table_headers, "units_note": _expand_units_note,
-              "footnotes": _expand_footnotes, "next_page": _expand_next_page, "region": _expand_region}
+              "footnotes": _expand_footnotes, "next_page": _expand_next_page, "region": _expand_region,
+              "section_lead": _expand_section_lead, "section_notes": _expand_section_notes}
 
 
 @dataclass

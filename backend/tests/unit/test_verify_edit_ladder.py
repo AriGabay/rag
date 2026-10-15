@@ -8,13 +8,15 @@ the removal path. The judge is scripted; synthetic text only."""
 from __future__ import annotations
 
 import re
+import uuid
 
 import pytest
 
-from app.chat import coverage, final_check
-from app.chat.verify import TurnRequirements, verify_answer
+from app.chat import coverage, final_check, verify
+from app.chat.verify import Expansion, TurnRequirements, verify_answer
 from app.providers.llm import Purpose
 from tests.support.scripted_provider import ScriptedProvider
+from tests.unit.test_verify_reread import FakeFetcher
 from tests.unit.test_verify_units import _answer, _judge, _registered
 
 RENT = "שכר דירה 5,000 ₪"  # the quote states no period
@@ -303,3 +305,133 @@ def test_the_edited_derived_sentence_is_judged_again_in_the_final_check():
     assert [u["purpose"] for u in usage] == [final_check.FINAL_LABEL]
     assert len(seen) == 1 and "0.8" in seen[0] and "25" not in seen[0]
     assert done.composition.answer.answer_markdown.startswith("מקדם 0.8 [V1].")
+
+
+# --- the table's notes are read before a qualifier is edited out (round 13 U10, KTD11, R14, AE6) ---------------------------------
+
+def _noted(expansions: dict, vat: str = "excluded", table_text: str = "שווי הנכס | 2,450,000 ₪", **kw):
+    """A workspace whose V1 was taken from the table S1 with a VAT status only the model asserted, and a fetcher that gives
+    the table's context (``expansions``, by kind)."""
+    ws = _registered("2,450,000", "שווי הנכס: 2,450,000 ₪", vat=vat, provenance={"vat": "model_asserted"}, **kw)
+    ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="שומת הדגמה", section="טבלה", location="טבלה 3",
+                  kind="table", text=table_text, table_index=0)
+    return ws, FakeFetcher({("S1", k): Expansion(v, "הקשר") for k, v in expansions.items()}, ws=ws)
+
+
+VAT_UNIT = "שווי הנכס הוא 2,450,000 ₪, לא כולל מע\"מ [V1]."
+NOTES_EXCL = "הערה: כל הסכומים בטבלה אינם כוללים מע\"מ."
+
+
+def _read(markdown: str, ws, fetcher, question: str = "?"):
+    a = _answer(markdown)
+    return a, verify_answer(_judge(lambda t: "supported"), a, ws, question, [], reread=fetcher)
+
+
+def test_a_vat_status_the_tables_notes_state_is_kept_with_its_anchor_and_the_edit_is_skipped():
+    ws, fetcher = _noted({"table_headers": NOTES_EXCL})
+    a, r = _read(VAT_UNIT, ws, fetcher)
+    assert r.qualifier_edits == {} and r.removed_units() == set() and r.counts()["edited"] == 0
+    assert not any(p.check in ("vat", "meaning") for p in r.problems)
+    (cite,) = [p.cite for p in r.problems if p.kind == "needs_citation"]
+    assert cite == "S2" and cite in ws.sources  # the notes, registered where they were read
+    assert (ws.sources[cite].table_index, ws.sources[cite].document_id) == (0, ws.sources["S1"].document_id)
+    out = r.apply(a).answer_markdown
+    assert "לא כולל מע\"מ" in out and f"[V1][{cite}]" in out
+    (log,) = r.claims[0][0].rereads
+    assert (log["source"], log["outcome"], log["expanded_source"]) == ("S1", "found", cite)
+    assert fetcher.calls[0] == ("S1", "table_headers")
+
+
+@pytest.mark.parametrize("kind", ["footnotes", "section_lead", "section_notes", "next_page"])
+def test_the_other_places_a_qualifier_may_be_stated_are_read_too(kind):
+    ws, fetcher = _noted({kind: NOTES_EXCL})
+    _, r = _read(VAT_UNIT, ws, fetcher)
+    assert r.qualifier_edits == {} and r.removed_units() == set()
+    assert {c[1] for c in fetcher.calls} == set(verify.QUALIFIER_READS)
+
+
+def test_notes_that_say_nothing_of_the_vat_leave_the_edit_as_before():
+    ws, fetcher = _noted({"table_headers": "הערה: הסכומים באלפי ₪."})
+    a, r = _read(VAT_UNIT, ws, fetcher)
+    assert r.removed_units() == set() and r.counts()["edited"] == 1
+    assert r.edit(a).doc.text.startswith("שווי הנכס הוא 2,450,000 ₪ [V1].")
+    assert list(ws.sources) == ["S1"]  # nothing was registered
+    assert r.claims[0][0].rereads[0]["outcome"] == "not_found"
+
+
+def test_notes_that_state_the_other_vat_do_not_back_the_claim():
+    ws, fetcher = _noted({"table_headers": "הערה: כל הסכומים בטבלה כוללים מע\"מ."})
+    _, r = _read(VAT_UNIT, ws, fetcher)
+    assert list(ws.sources) == ["S1"] and not any(p.kind == "needs_citation" for p in r.problems)
+    assert r.removed_units() == set() and r.counts()["edited"] == 1  # the wrong status still goes, as before
+
+
+def test_nothing_to_read_leaves_the_edit_and_logs_it():
+    ws, fetcher = _noted({})
+    _, r = _read(VAT_UNIT, ws, fetcher)
+    assert r.counts()["edited"] == 1 and r.claims[0][0].rereads[0]["outcome"] == "no_context"
+
+
+def test_a_failing_read_leaves_the_edit_and_is_not_a_verdict():
+    ws, _ = _noted({})
+    _, r = _read(VAT_UNIT, ws, FakeFetcher(fail=True, ws=ws))
+    assert r.counts()["edited"] == 1 and r.claims[0][0].rereads[0]["outcome"] == "check_failed"
+
+
+def test_the_read_counts_against_the_turns_bound(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_reread_claims", 0)
+    ws, fetcher = _noted({"table_headers": NOTES_EXCL})
+    _, r = _read(VAT_UNIT, ws, fetcher)
+    assert fetcher.calls == [] and r.counts()["edited"] == 1
+    assert r.claims[0][0].rereads[0]["outcome"] == "bound"
+
+
+def test_no_read_starts_without_time():
+    import time
+
+    ws, fetcher = _noted({"table_headers": NOTES_EXCL})
+    a = _answer(VAT_UNIT)
+    r = verify_answer(_judge(lambda t: "supported"), a, ws, "?", [], deadline=time.monotonic() + verify.REREAD_MIN_SECONDS / 2,
+                      reread=fetcher)
+    assert fetcher.calls == [] and r.counts()["edited"] == 1
+    assert r.claims[0][0].rereads[0]["outcome"] == "no_time"
+
+
+def _rent(expansions: dict):
+    """V1 = 5,000, taken from a table row whose own words state neither a period nor an area basis."""
+    from decimal import Decimal
+
+    ws, fetcher = _noted(expansions, table_text="שכר דירה | 5,000 ₪", unit="ILS")
+    ws.values["V1"].written, ws.values["V1"].value = "5,000", Decimal(5000)
+    return ws, fetcher
+
+
+@pytest.mark.parametrize("unit_md, note", [
+    ("דמי השכירות הם 5,000 ₪ ברוטו [V1].", "הערה: השטחים בטבלה ברוטו."),
+    ("שכר הדירה הוא 5,000 ₪ לחודש [V1].", "כל הסכומים בטבלה הם לחודש."),
+])
+def test_a_basis_or_a_period_the_notes_state_is_kept_and_without_them_it_is_edited(unit_md, note):
+    ws, fetcher = _rent({})
+    _, r = _read(unit_md, ws, fetcher)
+    assert r.counts()["edited"] == 1  # silent sources: the edit, as before
+    ws, fetcher = _rent({"table_headers": note})
+    a, r = _read(unit_md, ws, fetcher)
+    assert r.counts()["edited"] == 0 and r.qualifier_edits == {} and r.removed_units() == set()
+    assert r.apply(a).answer_markdown.startswith(unit_md[:-len(" [V1].")])
+    assert [p.cite for p in r.problems if p.kind == "needs_citation"] == ["S2"]
+
+
+def test_the_read_does_not_run_for_a_unit_that_would_not_be_edited():
+    ws, fetcher = _noted({"table_headers": NOTES_EXCL})
+    _, r = _read("שווי הנכס הוא 7,000,000 ₪, לא כולל מע\"מ [V1].", ws, fetcher)  # a number that fails its own check
+    assert ("S1", "table_headers") not in fetcher.calls and r.removed_units() == {0}  # (the unstated number's own read ran)
+
+
+def test_a_round_that_follows_reuses_the_notes_already_read(monkeypatch):
+    ws, fetcher = _noted({"table_headers": NOTES_EXCL})
+    _read(VAT_UNIT, ws, fetcher)
+    n = len(fetcher.calls)
+    a, r = _read(VAT_UNIT, ws, fetcher)
+    assert len(fetcher.calls) == n and r.qualifier_edits == {} and r.removed_units() == set()

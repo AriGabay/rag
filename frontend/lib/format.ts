@@ -431,6 +431,7 @@ export const FAILURE_KIND_LABEL: Record<string, string> = {
   wrong_unit: "יחידה, תקופה, בסיס שטח או מע״מ שאינם כבמקור",
   uncertain_reading: "נשען על קריאה לא ודאית של המקור",
   contradicts_source: "סותר את המקור",
+  context_not_read: "ההקשר הדרוש לבדיקה לא נקרא",
   wrong_calculation: "חישוב שגוי או על קלטים שגויים",
   invalid_citation: "ציטט מקור שלא נבדק בתור הזה",
   not_checked: "לא ניתן היה לבדוק מול המקורות",

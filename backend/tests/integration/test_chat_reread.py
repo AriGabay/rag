@@ -157,6 +157,60 @@ def test_footnotes_are_the_notes_of_the_table_and_of_the_page(office, report):
     assert "הנתונים נכונים" not in got.text  # a note's start marks it, not any paragraph of the page
 
 
+def test_the_section_lead_is_its_first_paragraphs_not_a_sub_section_or_another_section(office, report):
+    """Round 13 U10 (KTD11, R14): what a section opens with, as stored text."""
+    doc, ver = report
+    ws = _ws(office.ctx(), doc, ver, text="סך כל הנכסים בקבוצה: 25,742", block_start=2, block_end=2)
+    got = ContextReader(ws).expand("S1", "section_lead")
+    assert got is not None and "הטבלה שלהלן מפרטת" in got.text and "טקסט מסעיף אחר" not in got.text
+    assert len(ws.sources) == 1  # reading is not registering
+    # the judge's "heading" reads the chain and the lead-in under it
+    heading = ContextReader(ws).expand("S1", "heading")
+    assert heading is not None and NOTE in heading.text and "הטבלה שלהלן מפרטת" in heading.text
+
+
+def test_the_section_notes_are_the_lines_that_start_as_notes_wherever_in_the_section(office, report):
+    doc, ver = report
+    ws = _ws(office.ctx(), doc, ver, text="הטבלה שלהלן מפרטת את הנכסים בקבוצה.", block_start=1, block_end=1)
+    got = ContextReader(ws).expand("S1", "section_notes")
+    assert got is not None
+    assert "הערה: הנתונים נכונים למועד הקובע" in got.text and "(1) הסכומים אינם כוללים מע\"מ" in got.text
+    assert "סך כל הנכסים" not in got.text and "טקסט מסעיף אחר" not in got.text
+
+
+def test_a_source_with_no_place_in_the_document_has_no_section_to_read(office, report):
+    doc, ver = report
+    ws = _ws(office.ctx(), doc, ver, text="סך כל הנכסים בקבוצה: 25,742")  # a search hit's chunk: no block range
+    reader = ContextReader(ws)
+    assert reader.expand("S1", "section_lead") is None and reader.expand("S1", "section_notes") is None
+
+
+def test_a_vat_status_the_stored_tables_notes_state_is_kept_with_its_anchor_instead_of_being_edited_out(office, report):
+    """The real defect (round 13 U10, AE6): the table's notes state the VAT basis, and the figure's qualifier was edited away
+    as unstated. The notes are read from the stored table before the edit, and cited with the table's anchor."""
+    from decimal import Decimal
+
+    from app.chat import calc
+
+    doc, ver = report
+    ws = _ws(office.ctx(), doc, ver, kind="table", text="נכס ב | 7,000", table_index=0, block_start=2, block_end=2,
+             page_list=[3])
+    ws.values["V1"] = calc.Value("V1", Decimal(7000), "7,000", "S1", doc, ver, None, "שומת הדגמה", "טבלה", "שווי נכס ב",
+                                 "value", "ILS", "none", "excluded", "", "נכס הדגמה", "appraiser_determination",
+                                 {"unit": "source", "vat": "model_asserted", "area_basis": "source", "period": "source"},
+                                 {"quote": "נכס ב | 7,000"}, "נכס ב | 7,000")
+    md = "שווי נכס ב הוא 7,000, לא כולל מע\"מ [V1]."
+    usage: list = []
+    rep = verify_answer(_judge_supported(), _answer(md), ws, "?", usage, reread=ContextReader(ws))
+    assert rep.qualifier_edits == {} and rep.removed_units() == set() and rep.counts()["edited"] == 0
+    (cite,) = [p.cite for p in rep.problems if p.kind == "needs_citation"]
+    s = ws.sources[cite]
+    assert "(*) לא כולל מע\"מ" in s.text and (s.table_index, s.block_start, s.document_id) == (0, 2, doc)
+    assert ws.anchors[cite]["table_index"] == 0
+    assert "לא כולל מע\"מ" in rep.apply(_answer(md)).answer_markdown
+    assert [u["purpose"] for u in usage] == ["verify"]  # no model call for the read
+
+
 def test_next_page_is_the_stored_table_with_its_continuation(office, report):
     doc, ver = report
     ws = _ws(office.ctx(), doc, ver, kind="table", text="נכס ב | 7,000", table_index=0, block_start=2, block_end=2)

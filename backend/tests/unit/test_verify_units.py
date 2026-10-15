@@ -81,6 +81,79 @@ def test_claims_are_not_structural(raw):
     assert structural_kind(u) is None
 
 
+# --- a lead-in before list items is structure, not a claim (round 13 U10, KTD12, R15) ------------------------------------
+
+LEAD_IN = "הנתונים לחלקה 7 הם:"  # invented: a lot number in a short line ending with a colon
+LEAD_SOURCE = "חלקה 7: מקדם א 0.8, מקדם ב 0.9."
+
+
+@pytest.mark.parametrize("tail", ["- מקדם א\n- מקדם ב", "* מקדם א\n* מקדם ב", "1. מקדם א\n2. מקדם ב", "## פירוט"])
+def test_a_short_colon_line_before_list_items_or_a_heading_is_a_lead_in_even_with_a_number(tail):
+    lead = split_units(f"{LEAD_IN}\n{tail}")[0]
+    assert structural_kind(lead) == "lead_in" and verify.exempt_without_verdict(lead)
+
+
+def test_the_same_line_alone_or_before_prose_is_still_a_claim():
+    for markdown in (LEAD_IN, f"{LEAD_IN}\nמקדם א נקבע בשומה."):
+        lead = split_units(markdown)[0]
+        assert structural_kind(lead) is None and not verify.exempt_without_verdict(lead)
+
+
+def test_a_colon_line_of_more_than_eight_words_before_items_is_still_judged():
+    long_line = "הנתונים שנקבעו לחלקה 7 בשומה זו לפי השמאי המכריע הם:"
+    assert len(long_line.split()) > 8
+    lead = split_units(f"{long_line}\n- מקדם א\n- מקדם ב")[0]
+    assert structural_kind(lead) is None and not verify.exempt_without_verdict(lead)
+
+
+def test_a_colon_line_that_states_an_amount_before_items_is_still_judged():
+    lead = split_units("דמי השכירות 55 ₪ למ\"ר הם:\n- א\n- ב")[0]
+    assert structural_kind(lead) is None
+
+
+def test_a_lead_in_is_not_sent_to_the_judge_and_is_not_removed_as_an_unverified_claim():
+    """The real defect: the judge called the lot-number lead-in ``not_factual`` and it was withheld as not classified; or
+    it called it unsupported. Neither reaches the answer now: the judge is not asked, and the numbers still pass the checks."""
+    seen: list[str] = []
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        seen.append(input)
+        return {"verdicts": [{"index": int(i), "verdict": "supported", "reason": "בדיקה"}
+                             for i in re.findall(r'<unit index="(\d+)"', input)]}
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    a = _answer(f"{LEAD_IN}\n- מקדם א הוא 0.8 [S1]\n- מקדם ב הוא 0.9 [S1]")
+    r = verify_answer(p, a, _ws(LEAD_SOURCE), "?", [])
+    assert r.ok and r.removed_units() == set() and r.problems == []
+    assert all(LEAD_IN not in i for i in seen)
+    assert r.verdicts[0] == "navigation" and r.claims[0][0].action == "kept"
+    assert r.apply(a).answer_markdown == a.answer_markdown
+
+
+def test_a_wrong_number_in_a_lead_in_is_still_caught_by_the_deterministic_checks():
+    a = _answer("הנתונים לחלקה 9 הם:\n- מקדם א הוא 0.8 [S1]\n- מקדם ב הוא 0.9 [S1]")
+    r = verify_answer(_judge(lambda t: "supported"), a, _ws(LEAD_SOURCE), "?", [])
+    (p,) = [x for x in r.problems if x.unit.index == 0]
+    assert p.check == "unstated_number" and p.removes_unit and "9" in p.unstated
+
+
+def test_a_lead_in_whose_items_were_all_removed_goes_with_them_as_a_dependency():
+    a = _answer(f"{LEAD_IN}\n- מקדם א הוא 0.8 [S1]\n- מקדם ב הוא 0.9 [S1]")
+    r = verify_answer(_judge(lambda t: "unsupported" if "מקדם" in t else "supported"), a, _ws(LEAD_SOURCE), "?", [])
+    assert r.removed_units() == {0, 1, 2}
+    lead = next(x for x in r.removals() if x.unit.index == 0)
+    assert lead.check == "dependency" and lead.failure_kind == "absent_from_source" and lead.basis
+    assert LEAD_IN not in r.apply(a).answer_markdown.split("\n\n> ")[0]
+
+
+def test_a_lead_in_stays_while_one_of_its_items_stands():
+    a = _answer(f"{LEAD_IN}\n- מקדם א הוא 0.8 [S1]\n- מקדם ב הוא 0.9 [S1]")
+    r = verify_answer(_judge(lambda t: "unsupported" if "מקדם ב" in t else "supported"), a, _ws(LEAD_SOURCE), "?", [])
+    assert r.removed_units() == {2}
+    assert r.apply(a).answer_markdown.startswith(f"{LEAD_IN}\n- מקדם א הוא 0.8 [S1]")
+
+
 # A shape is not evidence: only one-word, digit-free navigation text passes without a verdict.
 @pytest.mark.parametrize("raw", ["## מקורות", "**סיכום**", "### פירוט:", "האם תרצה פירוט נוסף?", "בנוסף,"])
 def test_neutral_navigation_is_exempt(raw):
@@ -137,7 +210,8 @@ def test_a_structural_unit_without_a_verdict_passes():
 
 
 def test_claims_styled_as_headings_labels_or_table_headers_fail_when_the_judge_skips_them():
-    md = ("# הנכס פנוי\n**השווי נקבע ל-9,800 ₪**\n**הנכס מושכר:**\n## מקורות\n"
+    # (a colon line right before a heading is a lead-in since round 13 U10, KTD12: the claim styled so stands before prose)
+    md = ("# הנכס פנוי\n**השווי נקבע ל-9,800 ₪**\n## מקורות\n**הנכס מושכר:**\n"
           "השווי למ\"ר הוא 9,500 ₪ [S1].\n\n| הנכס פנוי | כן |\n|---|---|\n| הגפן | 9,500 ₪ [S1] |")
     p = _judge(lambda t: "supported" if t.startswith("השווי למ") or t.startswith("| הגפן") else None)
     a = _answer(md)
@@ -829,7 +903,8 @@ def test_the_judge_verdict_carries_a_failure_kind_and_dependencies_with_defaults
     fields = verify.JudgeVerdict.model_fields
     assert {"failure", "depends_on"} <= set(fields)
     assert set(verify.FAILURE_KINDS) == {"absent_from_source", "wrong_subject", "wrong_unit", "uncertain_reading",
-                                         "contradicts_source", "wrong_calculation", "invalid_citation", "not_checked"}
+                                         "contradicts_source", "wrong_calculation", "invalid_citation", "not_checked",
+                                         "context_not_read"}
     # the judge never says "not checked": that is the server's when a check did not finish
     assert "not_checked" not in verify.JudgeVerdict.model_json_schema()["properties"]["failure"]["enum"]
     assert "failure" in verify.JUDGE_POLICY and "depends_on" in verify.JUDGE_POLICY

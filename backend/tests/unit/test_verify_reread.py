@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import time
 import uuid
+from typing import get_args
 
 import pytest
 
@@ -499,3 +500,166 @@ def test_an_uncited_unit_or_one_failing_for_another_reason_is_not_expanded():
     verify_answer(_all_supported(), _answer("הסה\"כ בטבלה הוא 600."), ws, "?", [], reread=fetcher)
     verify_answer(_all_supported(), _answer("הסה\"כ בטבלה הוא 600 [S7]."), ws, "?", [], reread=fetcher)
     assert fetcher.calls == []
+
+
+# --- a removal for context not read is its own kind (round 13 U10, KTD11, R14) --------------------------------------------
+
+CLAIM = "סך כל הנכסים הוא 25,742"
+OTHER = "השכירות היא 55"
+SRC = "סיכום: סך כל הנכסים 25,742. השכירות 55."
+
+
+def _judge_needing(needs: str, verdict: str = "unsupported", also: bool = False, seen: list[str] | None = None
+                   ) -> ScriptedProvider:
+    """A judge whose claim about the total needs ``needs`` and is ``verdict`` for want of it; with ``also``, the unit's other
+    claim (the rent) is supported. Shown ``UNITS_NOTE`` it supports everything."""
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        if seen is not None:
+            seen.append(input)
+        out = []
+        for i in _units(input):
+            if UNITS_NOTE in input:
+                out.append(_supported(i))
+                continue
+            claims = [{"span": CLAIM, "verdict": verdict, "needs_context": needs}]
+            if also:
+                claims.append({"span": OTHER, "verdict": "supported"})
+            out.append({"index": i, "verdict": verdict if not also else "partial", "reason": "חסר הקשר",
+                        "defect": "part" if also else "none", "claims": claims})
+        return {"verdicts": out}
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    return p
+
+
+def test_the_new_kind_has_its_sentence_label_and_hint_and_the_judge_cannot_emit_it():
+    kind = "context_not_read"
+    assert kind in verify.FAILURE_KINDS
+    assert verify.REMOVAL_SENTENCES[kind] and verify.FAILURE_LABELS[kind] and verify.REPAIR_HINTS[kind]
+    assert verify.removal_summary(kind)["text"] == verify.REMOVAL_SENTENCES[kind]
+    assert kind not in get_args(verify.JudgeFailure)  # the server sets it; the judge's field stays as it was
+    assert verify.JUDGE_VERSION == 8  # the judge's policy and schema did not change
+
+
+def test_a_header_re_read_that_states_the_datum_makes_the_claim_supported():
+    ws = _ws("שורה | 25,742", kind="table", table_index=0)
+    fetcher = FakeFetcher({("S1", "table_headers"): Expansion(f"כותרות הטבלה: {UNITS_NOTE}", "כותרות")}, ws=ws)
+    report = verify_answer(_judge_needing("table_headers"), _answer(f"{CLAIM} [S1]."), ws, "?", [], reread=fetcher)
+    assert report.ok and report.claims[0][0].verdict == "supported"
+    assert report.claims[0][0].rereads[0]["outcome"] == "supported"
+
+
+@pytest.mark.parametrize("fetcher_kw,outcome", [
+    ({}, "no_context"),  # the source has nothing more to give
+])
+def test_a_re_read_that_finds_nothing_removes_the_claim_as_context_not_read(fetcher_kw, outcome):
+    ws = _ws(SRC)
+    report = verify_answer(_judge_needing("units_note"), _answer(f"{CLAIM} [S1]."), ws, "?", [],
+                           reread=FakeFetcher(**fetcher_kw))
+    assert report.claims[0][0].rereads[0]["outcome"] == outcome
+    (p,) = report.problems
+    assert p.removes_unit and p.failure_kind == "context_not_read"
+    assert p.summary()["text"] == verify.REMOVAL_SENTENCES["context_not_read"]
+    assert p.summary()["text"] != verify.REMOVAL_SENTENCES["absent_from_source"]
+    (row,) = report.counts()["removals"]
+    assert row["failure_kind"] == "context_not_read"
+
+
+def test_a_claim_the_bound_kept_from_a_re_read_is_context_not_read_and_says_the_source_was_read_in_part():
+    ws, md, fetcher = _five()
+    p = ScriptedProvider()
+    p.on(Purpose.VERIFY, lambda i, input: {"verdicts": [
+        _supported(n) if UNITS_NOTE in input else
+        {"index": n, "verdict": "unsupported", "reason": "חסר הקשר",
+         "claims": [{"span": t, "verdict": "unsupported", "needs_context": "units_note"}]}
+        for n, t in _units(input).items()]}, repeat=True)
+    report = verify_answer(p, _answer(md), ws, "?", [], reread=fetcher)
+    (problem,) = report.problems  # the first four were supported by the note; the fifth was never read
+    assert problem.unit.index == 4 and problem.failure_kind == "context_not_read"
+    assert verify.READ_IN_PART in problem.reason
+    assert report.claims[4][0].failure_kind() == "context_not_read"
+
+
+def test_a_claim_with_no_time_left_for_the_re_read_is_context_not_read():
+    ws = _ws(SRC)
+    report = verify_answer(_judge_needing("units_note"), _answer(f"{CLAIM} [S1]."), ws, "?", [],
+                           deadline=time.monotonic() + verify.REREAD_MIN_SECONDS / 2,
+                           reread=FakeFetcher({("S1", "units_note"): UNITS_NOTE}))
+    assert report.claims[0][0].rereads[0]["outcome"] == "no_time"
+    assert [p.failure_kind for p in report.problems] == ["context_not_read"]
+
+
+def test_one_unsupported_claim_of_a_unit_is_cut_with_the_new_kind_and_the_other_stays():
+    ws = _ws(SRC)
+    md = f"{CLAIM} [S1] ו{OTHER} [S1]."
+    report = verify_answer(_judge_needing("units_note", also=True), _answer(md), ws, "?", [], reread=FakeFetcher())
+    assert report.cuts and report.removed_units() == set()
+    (row,) = report.logged()
+    assert row.action == "cut" and row.summary()["failure_kind"] == "context_not_read"
+
+
+def test_a_failed_read_or_re_judge_stays_the_technical_failure_never_this_kind():
+    ws = _ws(SRC)
+    report = verify_answer(_judge_needing("units_note"), _answer(f"{CLAIM} [S1]."), ws, "?", [],
+                           reread=FakeFetcher(fail=True))
+    assert report.claims[0][0].rereads[0]["outcome"] == "check_failed"
+    assert [p.failure_kind for p in report.problems] == ["absent_from_source"]
+
+
+def test_a_claim_still_unsupported_after_the_expansion_was_shown_is_absent_from_the_source():
+    ws = _ws(SRC)
+    fetcher = FakeFetcher({("S1", "units_note"): "טקסט שלא מציין את הסכום"})
+    report = verify_answer(_judge_needing("units_note"), _answer(f"{CLAIM} [S1]."), ws, "?", [], reread=fetcher)
+    assert report.claims[0][0].rereads[0]["outcome"] == "unsupported"
+    assert [p.failure_kind for p in report.problems] == ["absent_from_source"]
+
+
+def test_a_judge_contradiction_stays_contradicts_source_and_is_not_re_read():
+    ws = _ws(SRC)
+    fetcher = FakeFetcher({("S1", "units_note"): UNITS_NOTE})
+    p = ScriptedProvider().on(Purpose.VERIFY, lambda i, input: {"verdicts": [
+        {"index": n, "verdict": "contradicts", "reason": "אחר",
+         "claims": [{"span": CLAIM, "verdict": "contradicts", "needs_context": "units_note"}]}
+        for n in _units(input)]}, repeat=True)
+    report = verify_answer(p, _answer(f"{CLAIM} [S1]."), ws, "?", [], reread=fetcher)
+    assert fetcher.calls == [] and [x.failure_kind for x in report.problems] == ["contradicts_source"]
+
+
+def test_a_failing_judge_call_stays_not_checked_check_failed():
+    ws = _ws(SRC)
+    p = ScriptedProvider().on(Purpose.VERIFY, CallStatus.TIMEOUT, repeat=True)
+    with pytest.raises(verify.VerificationUnavailable):
+        verify_answer(p, _answer(f"{CLAIM} [S1]."), ws, "?", [], reread=FakeFetcher())
+    # a unit the judge left out is unchecked, never context not read
+    p = ScriptedProvider().on(Purpose.VERIFY, {"verdicts": []}, repeat=True)
+    report = verify_answer(p, _answer(f"{CLAIM} [S1]."), ws, "?", [], reread=FakeFetcher())
+    assert [(x.failure_kind, x.cause) for x in report.problems] == [("not_checked", "omitted")]
+
+
+def test_the_next_round_of_the_turn_keeps_the_kind_of_a_claim_already_re_read():
+    ws = _ws(SRC)
+    fetcher, cache = FakeFetcher(), VerdictCache()
+    judge = _judge_needing("units_note")
+    md = _answer(f"{CLAIM} [S1].")
+    verify_answer(judge, md, ws, "?", [], reread=fetcher, cache=cache)
+    report = verify_answer(judge, md, ws, "?", [], reread=fetcher, cache=cache)
+    assert [p.failure_kind for p in report.problems] == ["context_not_read"]
+
+
+def test_a_partial_claim_whose_context_is_unread_is_marked_with_the_kind_and_stays_a_partial_problem():
+    ws = _ws(SRC)
+    report = verify_answer(_judge("units_note", UNITS_NOTE), _answer(f"{CLAIM} [S1]."), ws, "?", [],
+                           reread=FakeFetcher())
+    (p,) = report.problems
+    assert p.severity == "partial" and p.failure_kind == "context_not_read"
+    assert verify.FAILURE_LABELS["context_not_read"] in p.repair_note()
+
+
+def test_public_removals_passes_the_new_kind_with_its_fixed_sentence():
+    from app.chat import api
+
+    out = api.public_removals([{"failure_kind": "context_not_read", "component": "N1", "text": "must not leak"}])
+    assert out == [{"failure_kind": "context_not_read", "component": "N1",
+                    "text": verify.REMOVAL_SENTENCES["context_not_read"]}]
