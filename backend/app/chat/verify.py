@@ -2704,6 +2704,17 @@ def _all_numbers(ws: Workspace) -> set[str]:
 _VAT = re.compile(r"(?P<neg>ללא|לא\s+כולל|לא\s+כוללים|אינו\s+כולל|אינם\s+כוללים|אינה\s+כוללת|לפני|בתוספת|\+)?\s*"
                   r"(?:כולל\s+)?" + VAT_TERM)
 _CLAUSE_END = meaning._CLAUSE_END
+# round 13: PDF text wraps lines mid-sentence, and a line break between the negation (or inclusion) word and the rest of
+# a VAT phrase ("... ₪ לא\nכולל מע״מ") ended the clause there, so the phrase lost its "לא" and its number and was read as
+# "included" for the whole source. The break inside such a phrase is read as a space (the same length, so offsets into the
+# text stay valid); a break anywhere else still ends the clause (table rows).
+_VAT_LINE_WRAP = re.compile(r"(?<![א-ת])((?:ללא|לא|אינו|אינם|אינה|כולל|כוללים|כוללת|בתוספת|לפני)[ \t]*)\n([ \t]*)"
+                            r"(?=(?:(?:כולל|כוללים|כוללת)\s+)?" + VAT_TERM + ")")
+
+
+def _unwrap_vat_lines(text: str) -> str:
+    """``text`` with each line break that falls inside a VAT phrase replaced by a space (same length)."""
+    return _VAT_LINE_WRAP.sub(lambda m: m.group(1) + " " + m.group(2), text)
 
 
 _NOT_A_PRICE_AFTER = re.compile(r"\s*(?:מ[\"״']?ר|מטר|דונם|שנ(?:ה|ים|ות)|חודש(?:ים)?|קומות|יח[\"״']?ד|%)")
@@ -2734,6 +2745,7 @@ def _vat_phrases(text: str, skip_absence: bool):
     forms of the nearest number before the phrase in its sentence (None when the sentence has none) and start and end
     are the phrase's offsets in ``text``. ``skip_absence``: a clause saying the text does not state something gives
     nothing. Shared by ``vat_attachments`` and ``_vat_spans``."""
+    text = _unwrap_vat_lines(text)
     start = 0
     for end_m in [*_CLAUSE_END.finditer(text), None]:
         end = end_m.end() if end_m else len(text)

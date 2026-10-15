@@ -389,6 +389,45 @@ def test_a_word_that_only_looks_like_a_vat_abbreviation_is_not_one():
     assert verify.vat_attachments("המעמד של 5,000 ₪ לא כולל מעמד נוסף")[0] == set()
 
 
+@pytest.mark.parametrize("wrapped, polarity", [
+    ('בסך של 2,450,000 ₪ לא\nכולל מע"מ.', "excluded"),
+    ('בסך של 2,450,000 ₪ ללא\nמע"מ.', "excluded"),
+    ('בסך של 2,450,000 ₪ אינו\nכולל מע״מ.', "excluded"),
+    ('בסך של 2,450,000 ₪ לא \n כולל מ.ע.מ.', "excluded"),
+    ('בסך של 2,450,000 ₪ (שני מיליון ארבע מאות חמישים אלף שקלים חדשים) לא\nכולל מע"מ.', "excluded"),
+    ('בסך של 2,450,000 ₪ כולל\nמע"מ.', "included"),
+])
+def test_a_line_break_inside_a_vat_phrase_does_not_reverse_its_status(wrapped, polarity):
+    """Round 13: PDF text wraps a line between the negation and the rest of the VAT phrase (synthetic sentences)."""
+    pairs, general = verify.vat_attachments(wrapped)
+    assert pairs == {(f, polarity) for f in verify.numbers_in("2,450,000")} and not general
+
+
+def test_a_claim_is_backed_by_a_source_that_wraps_the_vat_phrase_across_lines():
+    source = 'שווי הנכס נקבע בסך של 2,450,000 ₪ (שני מיליון ארבע מאות חמישים אלף שקלים חדשים) לא\nכולל מע"מ.'
+    assert _deterministic('השווי הוא 2,450,000 ₪, לא כולל מע״מ [S1].', source) == []
+    assert _deterministic('השווי הוא 2,450,000 ₪, כולל מע"מ [S1].', source)
+    unit = split_units('השווי הוא 2,450,000 ₪, לא כולל מע״מ [S1].')[0]
+    assert verify._vat_problems(unit, _ws(source)) == []
+
+
+def test_a_line_break_between_table_rows_still_ends_the_clause():
+    # the next row starts with the VAT phrase and does not continue a negation: it stays a general note, as before
+    pairs, general = verify.vat_attachments('שווי 1,000 ₪\nכולל מע"מ: לא צוין')
+    assert pairs == set() and general == {"included"}
+    pairs, general = verify.vat_attachments('הדקל 9 | ₪ 58\nלא\nכולל מע"מ')
+    assert pairs == set() and general == {"excluded"}
+
+
+def test_vat_spans_offsets_point_at_the_phrase_in_the_original_text():
+    text = 'בסך של 2,450,000 ₪ לא\nכולל מע"מ.'
+    spans = list(verify._vat_spans(text))
+    assert len(spans) == 1
+    forms, polarity, a, b = spans[0]
+    assert polarity == "excluded" and forms == verify.numbers_in("2,450,000")
+    assert text[a:b] == 'לא\nכולל מע"מ'
+
+
 def test_vat_claim_backed_by_a_measurement_record():
     ws = _ws(PAIR)
     from types import SimpleNamespace
