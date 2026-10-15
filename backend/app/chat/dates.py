@@ -80,7 +80,10 @@ from app.professional.sections import flight, landed
 
 logger = logging.getLogger(__name__)
 
-DATES_VERSION = "dates-v4"
+# dates-v5 (round 13 U13, KTD17, KTD19): the same derivation as v4. A database that cycled migration 0022 (downgrade, then
+# upgrade) before the downgrade relabelled its rows holds v4 rows whose `primary_section` flags were lost; a version with
+# any current row is never derived again, so the bump makes every version derive afresh beside them. The v4 rows stay, unread.
+DATES_VERSION = "dates-v5"
 MARKER_BLOCK = -1       # the block index of the row that records "derived, none found"
 DOCUMENT_SCOPE = 0      # the unit number of a version that has no units: the document is the scope
 
