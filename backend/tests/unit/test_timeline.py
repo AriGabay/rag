@@ -52,14 +52,16 @@ class Office:
 
     def value(self, doc: uuid.UUID, amount: str, when: dict | None, *, kind: str = "value", unit: str = "ILS",
               period: str = "none", vat: str = "included", area_basis: str = "", provenance: dict | None = None,
-              title: str | None = None, version: uuid.UUID | None = None, span: tuple | None = None, **kw) -> str:
+              title: str | None = None, version: uuid.UUID | None = None, span: tuple | None = None,
+              quote: str | None = None, **kw) -> str:
         """``version``: the document version it is in (a new one for each value when not given); ``span``: its source span
-        (round 14 U1; ``Workspace.spans``); ``kw``: more ``calc.Value`` fields (``facet``, ``table``, ``section``, ``scale`` ...)."""
+        (round 14 U1; ``Workspace.spans``); ``quote``: the source's words around the number (default: the amount and ₪);
+        ``kw``: more ``calc.Value`` fields (``facet``, ``table``, ``section``, ``scale`` ...)."""
         vid = f"V{len(self.ws.values) + 1}"
         prov = SOURCE | (provenance or {})
         v = calc.Value(vid, Decimal(amount.replace(",", "")), amount, "S1", doc, version or uuid.uuid4(), "r1",
                        title or self.titles.get(doc, "שומה סינתטית"), "סעיף 3", "שווי הנכס", kind, unit, period, vat,
-                       area_basis, "הנכס", "appraiser_determination", prov, {"quote": f"{amount} ₪"}, f"{amount} ₪",
+                       area_basis, "הנכס", "appraiser_determination", prov, {"quote": f"{amount} ₪"}, quote or f"{amount} ₪",
                        stance="adopted", **kw)
         v.as_of = when
         self.ws.values[vid] = v
@@ -1052,3 +1054,174 @@ def test_equal_spans_in_two_versions_of_one_document_are_not_the_same_span():
                 facet=datum.facet("הפחתה בשל עוצמת ניצול", "sentence", "own"), span=_span(2, 40, "v2"))
     by = {d.ref: d for d in timeline.datums(o.ws)}
     assert by[a].span != by[b].span
+
+
+# --- round 14 U4: a coefficient and its reduction are one adjustment (R8, R9; KTD6; AE6) -----------------------------------------
+
+def _row_coefficient(o: Office, doc, ver, amount: str, written: str, *, when: dict | None = None) -> str:
+    """A coefficient of a table row (the row label is its own facet), in one table of one appraisal unit."""
+    return o.value(doc, amount, when or as_of("2025-03-31"), kind="coefficient", unit="ratio", version=ver,
+                   facet=datum.facet(written, "row", "own"), section="3. מקדמים", table=(str(ver), 0))
+
+
+def _reduction(o: Office, doc, ver, percent: str, written: str, quote: str, *, when: dict | None = None) -> str:
+    """A reduction stated in the text as a percent: the purpose phrase of its sentence is its own facet, ``quote`` the words."""
+    return o.value(doc, percent, when or as_of("2025-03-31"), kind="rate", unit="percent", version=ver,
+                   facet=datum.facet(written, "sentence", "own"), section="3. מקדמים", quote=quote)
+
+
+def test_ae6_a_coefficient_and_its_text_reduction_are_one_row_with_both_forms_and_no_conflict():
+    o = Office()
+    doc, ver = _unit(o)
+    c = _row_coefficient(o, doc, ver, "0.9", "מקדם מיקום")
+    other = _row_coefficient(o, doc, ver, "0.8", "מקדם שיתוף במקרקעין")
+    r = _reduction(o, doc, ver, "10", "מיקום", "בשל מיקום נקבעה הפחתה של 10%")
+    (block,) = timeline.breakdown(o.ws, {c, other, r})
+    assert [row["sid"] for row in block["rows"]] == [c, other], "the reduction is no row of its own"
+    row = block["rows"][0]
+    assert row["value_text"] == "0.9" and row["reduction"]["sid"] == r and row["reduction"]["value_text"] == "10"
+    assert row["marks"] == [] and "conflict_with" not in row and row["derived"] is None  # no C# registered yet
+    assert timeline.row_ids([block]) >= {c, other, r}
+    assert not coverage.conflicting(o.ws) and o.blocks({c, other, r}) == []
+
+
+def test_ae6_the_derived_computation_is_one_minus_the_coefficient_and_the_row_refers_to_it():
+    from app.chat import verify
+
+    o = Office()
+    doc, ver = _unit(o)
+    c = _row_coefficient(o, doc, ver, "0.9", "מקדם מיקום")
+    _row_coefficient(o, doc, ver, "0.8", "מקדם שיתוף במקרקעין")
+    r = _reduction(o, doc, ver, "10", "הפחתת מיקום", "הפחתה של 10%")
+    added = timeline.register_derived(o.ws, {c, r})
+    (cid,) = [i for i in added if i in o.ws.computations]
+    comp = o.ws.computations[cid]
+    assert comp.result_kind == "derived" and comp.expression == "1 − V1" and comp.value == Decimal("0.1")
+    assert [i["id"] for i in comp.inputs] == [c] and c in added, "the coefficient is its input, and joins the used ids"
+    assert timeline.register_derived(o.ws, {c, r}) == added and len(o.ws.computations) == 1, "registered once"
+    (block,) = timeline.breakdown(o.ws, {c, r})
+    assert block["rows"][0]["derived"] == cid
+    assert verify.derive_reduction(o.ws, c) == cid
+    assert timeline.row_ids([block]) >= {c, r, cid}
+    assert "10" in timeline.plain_text([], [block]) and "0.9" in timeline.plain_text([], [block])
+
+
+def test_the_reduction_alone_cited_still_shows_the_adjustment_row_of_its_coefficient():
+    o = Office()
+    doc, ver = _unit(o)
+    c = _row_coefficient(o, doc, ver, "0.9", "מקדם מיקום")
+    other = _row_coefficient(o, doc, ver, "0.8", "מקדם שיתוף במקרקעין")
+    r = _reduction(o, doc, ver, "10", "מיקום", "הנחה של 10%")
+    (block,) = timeline.breakdown(o.ws, {r})
+    assert [row["sid"] for row in block["rows"]] == [c, other] and block["rows"][0]["reduction"]["sid"] == r
+
+
+def test_a_coefficient_and_a_reduction_that_do_not_reconcile_are_a_conflict_marked_on_both_rows_naming_each_other():
+    o = Office()
+    doc, ver = _unit(o)
+    c = _row_coefficient(o, doc, ver, "0.9", "מקדם מיקום")
+    other = _row_coefficient(o, doc, ver, "0.8", "מקדם שיתוף במקרקעין")
+    r = _reduction(o, doc, ver, "15", "מיקום", "בשל מיקום נקבעה הפחתה של 15%")
+    (block,) = timeline.breakdown(o.ws, {c, r})
+    rows = {row["sid"]: row for row in block["rows"]}
+    assert set(rows) == {c, other, r} and "reduction" not in rows[c]
+    assert rows[c]["marks"] == ["conflict"] and rows[c]["conflict_with"] == [r]
+    assert rows[r]["marks"] == ["conflict"] and rows[r]["conflict_with"] == [c]
+    assert rows[other]["marks"] == []
+    assert timeline.register_derived(o.ws, {c, r}) == set(), "nothing reconciles: no C#"
+
+
+def test_a_conflicting_pair_with_no_components_table_of_its_own_is_a_block_of_its_two_rows():
+    o = Office()
+    doc, ver = _unit(o)
+    c = _row_coefficient(o, doc, ver, "0.9", "מקדם מיקום")
+    r = _reduction(o, doc, ver, "15", "מיקום", "הפחתה של 15%")
+    (block,) = timeline.breakdown(o.ws, {c})
+    assert [row["sid"] for row in block["rows"]] == [c, r]
+    assert all(row["marks"] == ["conflict"] for row in block["rows"])
+    assert o.blocks({c, r}) == []
+
+
+def test_a_coefficient_and_a_percent_of_different_considerations_are_two_rows_and_not_reconciled():
+    o = Office()
+    doc, ver = _unit(o)
+    c = _row_coefficient(o, doc, ver, "0.9", "מקדם מיקום")
+    other = _row_coefficient(o, doc, ver, "0.8", "מקדם שיתוף במקרקעין")
+    r = _reduction(o, doc, ver, "10", "גודל החלקה", "בשל גודל החלקה נקבעה הפחתה של 10%")
+    pair = _reduction(o, doc, ver, "20", "מגבלות בנייה", "הפחתה של 20%")
+    assert timeline.reconciled(o.ws, {c, r, pair}) == []
+    blocks = timeline.breakdown(o.ws, {c, other})
+    (block,) = blocks
+    assert [row["sid"] for row in block["rows"]] == [c, other]
+    assert all("reduction" not in row and row["marks"] == [] for row in block["rows"])
+
+
+def test_a_percent_with_no_reduction_cue_is_not_reconciled_with_the_coefficient():
+    o = Office()
+    doc, ver = _unit(o)
+    c = _row_coefficient(o, doc, ver, "0.9", "מקדם מיקום")
+    _row_coefficient(o, doc, ver, "0.8", "מקדם שיתוף במקרקעין")
+    r = _reduction(o, doc, ver, "10", "מיקום", "שיעור מיקום של 10%")  # a rate of the same consideration, no reduction word
+    assert timeline.reconciled(o.ws, {c, r}) == []
+    (block,) = timeline.breakdown(o.ws, {c, r})
+    assert all("reduction" not in row and "conflict" not in row["marks"] for row in block["rows"])
+    assert o.ws.computations == {} and timeline.register_derived(o.ws, {c, r}) == set()
+
+
+def test_a_coefficient_and_a_percent_of_two_appraisal_units_are_unrelated_whatever_the_amounts():
+    o = Office()
+    doc = o.doc()
+    ver1, ver2 = uuid.uuid4(), uuid.uuid4()
+    c = _row_coefficient(o, doc, ver1, "0.9", "מקדם מיקום")
+    _row_coefficient(o, doc, ver1, "0.8", "מקדם שיתוף במקרקעין")
+    same = _reduction(o, doc, ver2, "10", "מיקום", "הפחתה של 10%")  # reconciles in amount, in another unit
+    wrong = _reduction(o, doc, ver2, "15", "מיקום", "הפחתה של 15%")
+    assert timeline.reconciled(o.ws, {c, same, wrong}) == []
+    (block,) = timeline.breakdown(o.ws, {c})
+    assert all(row["marks"] == [] and "reduction" not in row for row in block["rows"])
+    assert not any("conflict" in row["marks"] for b in timeline.breakdown(o.ws, {c, same, wrong}) for row in b["rows"])
+
+
+def test_the_pair_is_decided_in_the_same_property_and_not_across_other_key_fields():
+    """The buckets of the two families pair only where every key field but the family matches (KTD6)."""
+    o = Office()
+    doc, ver = _unit(o)
+    c = _row_coefficient(o, doc, ver, "0.9", "מקדם מיקום")
+    r = o.value(doc, "10", as_of("2025-03-31"), kind="rate", unit="percent", version=ver,
+                facet=datum.facet("מיקום", "sentence", "own"), section="3. מקדמים", quote="הפחתה של 10%")
+    o.ws.values[r].stance = "claim"  # another stance: another key
+    assert timeline.reconciled(o.ws, {c, r}) == []
+
+
+def test_a_lone_coefficient_beside_a_lone_reduction_is_no_longer_alone_so_the_pair_can_meet():
+    o = Office()
+    doc, ver = _unit(o)
+    c = _row_coefficient(o, doc, ver, "0.9", "מקדם מיקום")
+    r = _reduction(o, doc, ver, "10", "מיקום", "הפחתה של 10%")
+    ((adj),) = timeline.reconciled(o.ws, {c})
+    assert (adj.coefficient.ref, adj.proportion.ref) == (c, r)
+
+
+# --- round 14 U4: a datum whose key fields are unknown is keyed by its span ---------------------------------------------------
+
+def test_two_registrations_of_one_span_with_unknown_key_fields_share_a_bucket_and_are_one_class():
+    o = Office()
+    doc, ver = _unit(o)
+    a = o.value(doc, "7", as_of("2025-03-31"), kind="unknown", version=ver, span=_span(3, 12))
+    b = o.value(doc, "7", as_of("2025-03-31"), kind="unknown", version=ver, span=_span(3, 12))
+    c = o.value(doc, "7", as_of("2025-03-31"), kind="unknown", version=ver, span=_span(4, 12))
+    assert all(d.fields is None for d in timeline.datums(o.ws))
+    built = timeline.buckets(o.ws, {a, b, c})
+    (twin,) = [x for x in built if a in {d.ref for d in x.members}]
+    assert {d.ref for d in twin.members} == {a, b} and len(twin.classes) == 1
+    (alone,) = [x for x in built if c in {d.ref for d in x.members}]
+    assert [d.ref for d in alone.members] == [c], "another span: its own bucket"
+
+
+def test_unknown_key_fields_with_no_span_keep_a_bucket_of_their_own_per_registration():
+    o = Office()
+    doc, ver = _unit(o)
+    a = o.value(doc, "7", as_of("2025-03-31"), kind="unknown", version=ver)
+    b = o.value(doc, "7", as_of("2025-03-31"), kind="unknown", version=ver)
+    built = timeline.buckets(o.ws, {a, b})
+    assert sorted(len(x.members) for x in built) == [1, 1]

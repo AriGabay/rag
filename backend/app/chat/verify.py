@@ -4007,6 +4007,30 @@ def _derived_computation(ws: Workspace, expression: str, shown: Shown, positive:
     return c.cid
 
 
+def derive_reduction(ws: Workspace, coefficient: str) -> str | None:
+    """The C# of the reduction a coefficient implies, ``1 − Vn`` (round 14 U4, KTD6, R8): the record that makes a coefficient and the
+    reduction written beside it one adjustment, with the formula and its input. It is the same derivation the verifier makes
+    (``_derived_computation``), shown as the fraction the complement is, and registered once: a derived result the verifier already
+    made for this coefficient, in the fraction or the percent form, is the one returned. None when the calculator refuses the
+    coefficient (a percent beside a literal, an id the turn does not hold) or one minus it is not a magnitude."""
+    from app.chat import calc
+    from app.chat import tools as chat_tools
+
+    try:
+        node = calc.parse(f"1 - {coefficient}")
+        out = calc.evaluate(node, chat_tools.computation_operands(ws, [coefficient]))
+        forms = {calc.render(calc.parse(f"1 - {coefficient}"), lambda i: i),
+                 calc.render(calc.parse(f"(1 - {coefficient}) * 100"), lambda i: i)}
+    except (calc.CalcError, chat_tools.ToolError):
+        return None
+    if out.value <= 0 or out.dims != ():
+        return None
+    if (existing := next((c for c in ws.computations.values() if c.result_kind == calc.DERIVED and c.expression in forms),
+                         None)) is not None:
+        return existing.cid
+    return _derived_computation(ws, f"1 - {coefficient}", Shown(format(out.value.normalize(), "f"), False, 1, 0, 0), True)
+
+
 def derive_numbers(u: Unit, ws: Workspace, loose: set[str]) -> list[str]:
     """The C# ids that verify numbers of a unit that no source it cites states (``loose``: as ``numbers_in`` reads them),
     each derived from the unit's cited values by a formula its own clause's wording names (``_derivations``). A number

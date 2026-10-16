@@ -915,6 +915,9 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
                 used.add(i)
                 if i in ws.computations:
                     todo.append(i)
+    # a coefficient and the reduction written beside it are one adjustment (round 14 U4, KTD6, R8): the server registers the C# of
+    # ``1 − Vn`` here, before the timeline places its rows and before the used ids are read, so the C# and its inputs are carried
+    used |= timeline.register_derived(ws, used)
     # the timeline (round 11 U9, KTD8): every comparable group holding a value the answer rests on, filled from all the
     # values the turn registered. Its rows open their sources like a citation does, so the uncited ones join the records
     # (and the documents) the payload carries

@@ -769,3 +769,58 @@ def relation(a, b, a_in_unit: int = 1, b_in_unit: int = 1) -> str:
     if ca - cb and cb - ca and (_together(a, b) or (flow and a.appraisal is not None and a.appraisal == b.appraisal)):
         return DIFFERENT
     return UNDECIDED
+
+
+# --- a coefficient and its reduction (round 14 U4, KTD6) -------------------------------------------------------------------
+
+RECONCILED, CONFLICT, UNRELATED = "reconciled", "conflict", "unrelated"
+
+# the words of a reduction, with the prefix letters Hebrew writes before a noun and the construct and plural forms: it is the
+# source's own cue that a proportion is the complement of a coefficient (a rate or a share is not)
+_REDUCTION_CUE = re.compile(r"(?<![א-ת])[ובלהשכמ]{0,2}(?:הפחת(?:ה|ת|ות)|הנח(?:ה|ת|ות)|ניכוי|ניכויי)(?![א-ת])")
+_NUMBER_WRITTEN = re.compile(r"\d[\d,]*(?:\.(\d+))?")
+_REDUCTION_STEMS = _stems("הפחתה הפחתת הפחתות הנחה הנחת הנחות ניכוי ניכויי")  # the cue words, which name no consideration
+
+
+def reduction_cue(text: str | None) -> bool:
+    """Whether a text holds a word of a reduction (הפחתה, הנחה, ניכוי)."""
+    return bool(_REDUCTION_CUE.search(_flat(text or "")))
+
+
+def _half_unit(site) -> Decimal:
+    """Half a unit of the last digit a datum's number is written with, as a fraction: "15" of a percent is 0.005, "0.15" of a ratio
+    0.005, "8.5" of a percent 0.0005."""
+    found = _NUMBER_WRITTEN.search(getattr(site, "written", "") or "")
+    places = len(found.group(1) or "") if found else 0
+    half = Decimal(5) / (Decimal(10) ** (places + 1))
+    return half / 100 if getattr(site, "unit", "") == "percent" else half
+
+
+def reconciles(coefficient, proportion) -> str:
+    """Whether a coefficient and a proportion are one adjustment, written twice (round 14 U4, KTD6, R8, AE6): the coefficient is one
+    minus the reduction ("0.85" and "15%", "0.83" and "17%"). Pure, over two data of different buckets (the metric family leads
+    the base key, so ``relation`` never compares them). The data read as ``relation`` reads them, with ``amount`` (the canonical
+    amount), ``written`` and ``unit`` (the number as the source writes it) and ``words`` (the source's words around the
+    proportion's number):
+
+    - ``reconciled``: the same appraisal unit, equal stated facet cores, a reduction cue (``reduction_cue``) in the proportion's own
+      words or facet, and the coefficient equal to 1 − the proportion to within half a unit of the last digit the proportion is
+      written with (the way ``calc.display_matches`` checks a derived number against what the answer shows), the half unit itself
+      excluded: 0.9 is not 1 − 15%, 0.85 only rounds up to it;
+    - ``conflict``: the same unit, equal cores and the cue, with amounts that do not reconcile;
+    - ``unrelated``: anything else — two appraisal units (whatever the amounts), different or unstated cores, no cue, a range or a
+      missing amount, or the families in any other order. A proportion with no reduction cue is a rate of its own, never the
+      complement of a coefficient."""
+    if getattr(coefficient, "family", "") != "coefficient" or getattr(proportion, "family", "") != "proportion":
+        return UNRELATED
+    if coefficient.appraisal is None or coefficient.appraisal != proportion.appraisal:
+        return UNRELATED
+    cores = core_of(coefficient) - _REDUCTION_STEMS
+    if not cores or cores != core_of(proportion) - _REDUCTION_STEMS:
+        return UNRELATED
+    if not (reduction_cue(getattr(proportion, "words", "")) or reduction_cue((proportion.facet or {}).get("written"))):
+        return UNRELATED
+    c, p = getattr(coefficient, "amount", None), getattr(proportion, "amount", None)
+    if not isinstance(c, Decimal) or not isinstance(p, Decimal):
+        return UNRELATED
+    return RECONCILED if abs(c - (1 - p)) < _half_unit(proportion) else CONFLICT

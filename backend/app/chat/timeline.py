@@ -42,6 +42,13 @@ shown with a single one). A timeline label names the facet of the class's first 
 facet shows ``MSG_NO_FACET``. A row marked ``conflict`` names the datum it conflicts with (``conflict_with``, the sids of every
 conflict pair it is in, read from its class), as ``undecided`` does: the counterpart may be a row of another block.
 
+**One adjustment, written twice** (round 14 U4, KTD6, R8): the metric family leads the base key, so a coefficient (0.9) and a
+proportion (a reduction of 10%) are in two buckets and ``datum.relation`` never compares them. After ``_classify`` the two
+families' buckets are paired where every other key field matches (``adjustments``) and ``datum.reconciles`` decides each pair of
+one appraisal unit and one date: a reconciled pair is one row of the components table (the coefficient first, then the reduction, and
+the C# of ``1 − Vn`` that ``register_derived`` made while the payload was built); a pair that does not reconcile is a conflict marked
+on both rows. A datum whose key fields are unknown is keyed by its source span, so two registrations of one number are one datum.
+
 **Rows** are ordered by the turn's time mode with the ordering of ``tools.time_key`` (KTD6): ``recent`` — dated values not
 later than the anchor and not forecast, newest first, then the later or forecast ones, then the unknown; ``explicit`` —
 the requested time first, then the nearest, then the unknown (the rows outside it are marked); ``none`` — chronological,
@@ -152,6 +159,8 @@ class Datum:
     table: tuple | None = None
     section: str = ""
     span: tuple | None = None
+    # the source's words around the number (the sentence of its quote): where a reduction cue is read (round 14 U4, KTD6)
+    words: str = ""
 
     @property
     def dated(self) -> bool:
@@ -273,7 +282,8 @@ def datums(ws: Workspace) -> list[Datum]:
                     lambda f, p=prov: _stated(p, f), v.facet),
             v.written, D.canonical_amount(v.value, scale=v.scale, unit=v.unit, family=fam), v.as_of, v.role or "",
             v.kind, v.period, v.vat, v.area_basis or "", value_uncertain(ws, i),
-            v.facet, (str(v.version_id), number), tuple(v.table) if v.table else None, v.section or "", spans.get(i)))
+            v.facet, (str(v.version_id), number), tuple(v.table) if v.table else None, v.section or "", spans.get(i),
+            D.sentence_with(v.quote, v.written)))
     for i, m in ws.measurements.items():
         r = m.row
         number, subject = _context(m.context)
@@ -291,7 +301,7 @@ def datums(ws: Workspace) -> list[Datum]:
             m.as_of, getattr(r, "value_role", "") or "", kind, r.period or "", r.vat or "", r.area_basis or "",
             measurement_uncertain(r), m.facet, (str(m.version_id), number),
             (str(m.version_id), table_index) if table_index is not None else None, getattr(r, "section", "") or "",
-            spans.get(i)))
+            spans.get(i), D.sentence_with(getattr(r, "quote", "") or "", r.value_text or "")))
     return out
 
 
@@ -380,11 +390,18 @@ def identity_of(ws: Workspace) -> Callable[[Datum], Identity]:
     return fn
 
 
+def _unknown_key(d: Datum) -> tuple:
+    """The key of a datum whose fields are unknown: its source span when it has one (round 14 U4: two registrations of one number
+    share a bucket, so rule 0 of ``datum.relation`` makes them one class), else the datum itself."""
+    return ("unknown", d.span) if d.span else ("unknown", d.ref)
+
+
 def _full_key(d: Datum, identity: Callable[[Datum], Identity], cache: dict) -> tuple:
     """The comparability key of a datum: its property and fields, or — when a field is unknown or the property is not
-    stated — a key only it has (a document's own identity for the property, the datum itself for an unknown field)."""
+    stated — a key only it has (a document's own identity for the property, the datum itself for an unknown field; two
+    registrations of one source span are one datum, so they share the key)."""
     if d.fields is None:
-        return ("unknown", d.ref)
+        return _unknown_key(d)
     who = cache.get(d.ref)
     if who is None:
         who = cache[d.ref] = identity(d)
@@ -516,23 +533,51 @@ def _classify(key: tuple, members: list[Datum]) -> Bucket:
     return Bucket(key, members, sorted(by_root.values(), key=lambda c: c[0].index), pairs)
 
 
+ADJUSTMENT_FAMILIES = ("coefficient", "proportion")
+
+
+def _adjustable(fields: tuple | None) -> bool:
+    """Whether a datum's key fields are those of a coefficient or a proportion in the fraction form: the two families that can
+    be one adjustment written twice (round 14 U4, KTD6)."""
+    return bool(fields) and len(fields) > 1 and fields[0] in ADJUSTMENT_FAMILIES and fields[1] == "fraction"
+
+
+def _pair_key(fields: tuple | None) -> tuple | None:
+    """The key fields with the family left out, for an adjustable datum (a coefficient and a proportion of one pair key are
+    the two buckets KTD6 pairs); any other datum keeps its fields."""
+    return ("adjustment", *fields[2:]) if _adjustable(fields) else fields
+
+
 def buckets(ws: Workspace, cited: Collection[str] | None, identity: Callable[[Datum], Identity] | None = None,
-            everything: list[Datum] | None = None) -> list[Bucket]:
+            everything: list[Datum] | None = None, *, pair: bool = False) -> list[Bucket]:
     """The base-key buckets that hold at least one of the ``cited`` ids (V#/M#; None: every datum), each filled from everything
     the turn registered, in registration order, with its classes and decisions; the buckets in the order of their first cited
-    datum. ``everything``: the turn's ``datums`` when the caller already has them."""
+    datum. ``everything``: the turn's ``datums`` when the caller already has them. ``pair`` (round 14 U4, KTD6): the buckets of the
+    other family of a cited coefficient or proportion — the proportion or the coefficient of the same pair key — are built too, after
+    the cited ones, so the cross-bucket step (``adjustments``) sees both sides of an adjustment cited through one of them.
+
+    A coefficient and a proportion are in different buckets (the family leads the key), so a datum is *alone* only when no other
+    datum has its fields, the other family's included (``_pair_key``): a lone coefficient beside a reduction is no longer alone."""
     if cited is not None and not cited:
         return []
     identity = identity or identity_of(ws)
     everything = datums(ws) if everything is None else everything
     wanted = everything if cited is None else [d for d in everything if d.ref in cited]
+    if pair and cited is not None:
+        families: dict[tuple, set[str]] = {}
+        for d in wanted:
+            if _adjustable(d.fields):
+                families.setdefault(_pair_key(d.fields), set()).add(d.fields[0])
+        have = {d.ref for d in wanted}
+        wanted = wanted + [d for d in everything if d.ref not in have and _adjustable(d.fields)
+                           and d.fields[0] not in families.get(_pair_key(d.fields), ADJUSTMENT_FAMILIES)]
     cache: dict = {}
-    alone = {f for f, n in Counter(d.fields for d in everything if d.fields is not None).items() if n == 1}
+    alone = {f for f, n in Counter(_pair_key(d.fields) for d in everything if d.fields is not None).items() if n == 1}
 
     def key_of(d: Datum) -> tuple:
         # a datum whose fields no other datum has is alone in its bucket whatever its property is: the bucket is dropped by
         # every reader (``build``, ``later_than``: no second dated value, no later one), so its property is never read
-        if d.fields in alone:
+        if _pair_key(d.fields) in alone:
             return ("alone", d.ref)
         return _full_key(d, identity, cache)
 
@@ -543,8 +588,8 @@ def buckets(ws: Workspace, cited: Collection[str] | None, identity: Callable[[Da
     fields = {d.fields for d in wanted if d.fields is not None}
     for d in everything:
         if d.fields is None:
-            if ("unknown", d.ref) in found:
-                found[("unknown", d.ref)].append(d)
+            if (key := _unknown_key(d)) in found:
+                found[key].append(d)
         elif d.fields in fields and (key := key_of(d)) in found:
             found[key].append(d)
     return [_classify(k, members) for k, members in found.items()]
@@ -658,21 +703,116 @@ def _label(members: list[Datum], who: Identity, *, with_facet: bool = True) -> s
     return f"{what} — {where}" if what and where else what or where
 
 
-def _component_row(ws: Workspace, d: Datum, conflicts: dict[str, list[str]], undecided: dict[str, list[str]]) -> dict:
+def _component_row(ws: Workspace, d: Datum, conflicts: dict[str, list[str]], undecided: dict[str, list[str]],
+                   reduction: Datum | None = None, derived: str | None = None) -> dict:
     """A row of the components table: the facet (its own written words), the value, unit, sid, source and marks; ``undecided_with``
-    names the counterpart of an undecided mark, as in the timeline."""
+    names the counterpart of an undecided mark, as in the timeline. ``reduction`` (round 14 U4, KTD6, R8): the proportion that is
+    one minus this coefficient — one adjustment, one row, the coefficient first — as ``reduction``
+    ``{"sid", "value_text", "unit", "source"}``, with ``derived`` the C# of ``1 − Vn`` (None while none is registered); the row
+    then carries the marks and counterparts of both."""
     row = _row(ws, d, conflicts, undecided)
     out = {"facet": _facet_text(d), "value_text": row["value_text"], "unit": row["unit"], "sid": row["sid"],
            "source": row["source"], "marks": row["marks"]}
     for key in ("undecided_with", "conflict_with"):
         if key in row:
             out[key] = row[key]
+    if reduction is not None:
+        other = _row(ws, reduction, conflicts, undecided)
+        out["reduction"] = {"sid": other["sid"], "value_text": other["value_text"], "unit": other["unit"],
+                            "source": other["source"]}
+        out["derived"] = derived
+        out["marks"] = out["marks"] + [m for m in other["marks"] if m not in out["marks"]]
+        for key in ("undecided_with", "conflict_with"):
+            if key in other:
+                out[key] = out.get(key, []) + [x for x in other[key] if x not in out.get(key, [])]
     return out
 
 
 def _block_as_of(d: Datum) -> dict:
     return {"date": d.as_of["date"], "precision": d.as_of.get("precision"), "end": d.as_of.get("end"),
             "date_kind": _date_kind(d)}
+
+
+# --- a coefficient and its reduction: one adjustment (round 14 U4, KTD6, R8) ------------------------------------------------
+
+@dataclass(frozen=True)
+class Adjustment:
+    """A coefficient and a proportion of two buckets that ``datum.reconciles`` decides (``decision``: ``reconciled`` or
+    ``conflict``) — a pair of data of one appraisal unit and one date."""
+
+    coefficient: Datum
+    proportion: Datum
+    decision: str
+
+
+def adjustments(built: Iterable[Bucket], cited: Collection[str] = ()) -> list[Adjustment]:
+    """The cross-bucket step after ``_classify`` (round 14 U4, KTD6): the coefficient-family buckets are paired with the
+    proportion-family buckets whose key fields match except the family (the property, the unit, the period, the VAT, the
+    scenario and the stance), and ``datum.reconciles`` decides each coefficient and proportion of the pair that are of one date. A
+    datum is read once as the row of its class is (``_dedupe``). A coefficient is reconciled with at most one proportion and the
+    reverse (the first in registration order); a conflict is every pair that does not reconcile and is not unrelated."""
+    held: dict[tuple, dict[str, list[Datum]]] = {}
+    for b in built:
+        key = b.key
+        if len(key) < 3 or not isinstance(key[0], tuple) or not _adjustable(key[1:]):
+            continue
+        rows = [d for cls in b.classes for d in _dedupe(cls, cited)]
+        held.setdefault((key[0], *key[3:]), {}).setdefault(key[1], []).extend(rows)
+    found: list[Adjustment] = []
+    for sides in held.values():
+        for c in sorted(sides.get("coefficient", ()), key=lambda d: d.index):
+            for p in sorted(sides.get("proportion", ()), key=lambda d: d.index):
+                if c.date_key() != p.date_key():
+                    continue
+                if (decision := D.reconciles(c, p)) != D.UNRELATED:
+                    found.append(Adjustment(c, p, decision))
+    taken: set[str] = set()
+    out: list[Adjustment] = []
+    for a in found:  # a reduction is the complement of one coefficient: the first pair wins, the others stay apart
+        if a.decision == D.RECONCILED:
+            if a.coefficient.ref in taken or a.proportion.ref in taken:
+                continue
+            taken |= {a.coefficient.ref, a.proportion.ref}
+        out.append(a)
+    return out
+
+
+def reconciled(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None
+               ) -> list[Adjustment]:
+    """The coefficients of the ``cited`` ids (or the reductions) that are one adjustment with a proportion (or a coefficient) of
+    the turn, as ``compose`` places them."""
+    if not cited:
+        return []
+    return [a for a in adjustments(buckets(ws, cited, identity, pair=True), cited) if a.decision == D.RECONCILED]
+
+
+def _derived_expressions(ref: str) -> frozenset[str]:
+    from app.chat import calc
+
+    return frozenset(calc.render(calc.parse(e), lambda i: i) for e in (f"1 - {ref}", f"(1 - {ref}) * 100"))
+
+
+def derived_for(ws: Workspace, coefficient: str) -> str | None:
+    """The C# the server derived as the reduction of a coefficient (``verify.derive_reduction``: ``1 − Vn``, or its percent
+    form), or None while none is registered."""
+    from app.chat import calc
+
+    forms = _derived_expressions(coefficient)
+    return next((c.cid for c in ws.computations.values() if c.result_kind == calc.DERIVED and c.expression in forms), None)
+
+
+def register_derived(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None) -> set[str]:
+    """Register the derived C# (``1 − Vn``) of every adjustment the ``cited`` ids make, and return the ids to add to the ones the
+    answer uses: each C# and its inputs (round 14 U4, KTD6). Called while the payload is built, before the used ids are read and
+    before ``compose`` places the rows, which then refer to the C#. A C# the calculator refuses is no row's reference."""
+    from app.chat import verify
+
+    out: set[str] = set()
+    for a in reconciled(ws, cited, identity):
+        if (cid := verify.derive_reduction(ws, a.coefficient.ref)) is not None:
+            c = ws.computations[cid]
+            out |= {cid, *(x["id"] for x in c.inputs), *c.leaves}
+    return out
 
 
 def compose(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None
@@ -689,16 +829,32 @@ def compose(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], I
       module doc). A row is marked ``conflict`` when ``coverage.conflicting_pairs`` pairs it with another row of its class, and
       ``undecided`` (round 13 U4, R6) when a datum of another class of its base key that could not be compared with it has a
       different amount in an overlapping period; the row then carries that datum's sid as ``undecided_with``. A class that has rows
-      in a components block shows its other dated rows, even one."""
+      in a components block shows its other dated rows, even one.
+
+    **A coefficient and its reduction** (round 14 U4, KTD6, R8): after every bucket is decided, the coefficient-family and
+    proportion-family buckets are paired (``adjustments``). A reconciled pair is *one* row — the coefficient first, then the reduction
+    (``reduction``) and the C# of ``1 − Vn`` (``derived``, once ``register_derived`` made it) — at the coefficient's place, else at the
+    reduction's; the reduction is no row of its own in a block, and an adjustment cited through either is cited. A conflict pair is
+    marked ``conflict`` on both rows, each naming the other (``conflict_with``), and both rows are placed: where one is in a block the
+    other joins it, else a block of the two. A pair of two appraisal units, of unequal facet cores or with no reduction cue is
+    unrelated: two rows, no mark."""
     from app.chat.coverage import conflicting_pairs
 
     identity = identity or identity_of(ws)
-    timeline_blocks: list[dict] = []
-    components: list[tuple[tuple, dict]] = []
-    for bucket in buckets(ws, cited, identity):
-        undecided = bucket.undecided_with()
+    built = buckets(ws, cited, identity, pair=True)
+    pairs = adjustments(built, cited)
+    # an adjustment is cited through either of its two data (the other is a partner bucket's datum, not a cited one)
+    shown = set(cited) | {r for a in pairs if a.coefficient.ref in cited or a.proportion.ref in cited
+                          for r in (a.coefficient.ref, a.proportion.ref)}
+    conflicts: dict[str, list[str]] = {}  # a datum -> the sids it conflicts with (its class's conflict pairs, and its pair's)
+    undecided: dict[str, list[str]] = {}
+    seen: list[list[tuple[list[Datum], list[Datum]]]] = []  # per bucket: its classes, each with its deduped rows
+    components: list[dict] = []
+    placed: set[str] = set()
+    for bucket in built:
+        undecided |= bucket.undecided_with()
         classes = [(cls, _dedupe(cls, cited)) for cls in bucket.classes]
-        conflicts: dict[str, list[str]] = {}  # a datum -> the sids it conflicts with (its class's conflict pairs)
+        seen.append(classes)
         for _, members in classes:
             for i, j in conflicting_pairs([d.as_comparable() for d in members]):
                 conflicts.setdefault(members[i].ref, []).append(members[j].ref)
@@ -711,15 +867,47 @@ def compose(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], I
                 if d.dated:
                     at.setdefault((d.appraisal, d.date_key()), []).append(d)
                     met.setdefault((d.appraisal, d.date_key()), set()).add(n)
-        placed: set[str] = set()
         for key, rows in at.items():
-            if len(met[key]) < 2 or not any(d.ref in cited for d in rows):
+            if len(met[key]) < 2 or not any(d.ref in shown for d in rows):
                 continue
             rows = sorted(rows, key=lambda d: d.index)
             placed |= {d.ref for d in rows}
-            components.append(((_order(ws, rows[0]), rows[0].index), {
-                "label": _label(rows, identity(rows[0]), with_facet=False), "as_of": _block_as_of(rows[0]),
-                "rows": [_component_row(ws, d, conflicts, undecided) for d in rows]}))
+            components.append({"sort": (_order(ws, rows[0]), rows[0].index), "rows": rows})
+    where = {d.ref: block for block in components for d in block["rows"]}
+    absorbed: dict[str, Datum] = {}  # a coefficient -> the reduction shown in its row
+    for a in (x for x in pairs if x.decision == D.RECONCILED):
+        c, p = a.coefficient, a.proportion
+        in_c, in_p = where.get(c.ref), where.get(p.ref)
+        if in_c is None and in_p is None:
+            continue  # neither is a row of the table: nothing to join
+        if in_p is not None:
+            index = in_p["rows"].index(p)
+            if in_c is None:  # the coefficient takes the reduction's place
+                in_p["rows"][index] = c
+                where[c.ref] = in_p
+            else:
+                in_p["rows"].pop(index)
+            del where[p.ref]
+        placed |= {c.ref, p.ref}
+        absorbed[c.ref] = p
+    held = {p.ref for p in absorbed.values()}
+    for a in (x for x in pairs if x.decision == D.CONFLICT):
+        c, p = a.coefficient, a.proportion
+        conflicts.setdefault(c.ref, []).append(p.ref)
+        conflicts.setdefault(p.ref, []).append(c.ref)
+        if c.ref not in shown or not c.dated:
+            continue  # the marks stay; an undated pair has no components block to join
+        host = where.get(c.ref) or where.get(p.ref)
+        if host is None:
+            host = {"sort": (_order(ws, c), c.index), "rows": []}
+            components.append(host)
+        for late in (c, p):  # both rows are on screen: the one the block lacks joins it (a reduction shown in a row stays there)
+            if late.ref not in where and late.ref not in held:
+                host["rows"] = sorted([*host["rows"], late], key=lambda d: d.index)
+                where[late.ref] = host
+                placed.add(late.ref)
+    timeline_blocks: list[dict] = []
+    for classes in seen:
         for cls, members in classes:
             if not any(d.ref in cited for d in cls):
                 continue
@@ -731,7 +919,13 @@ def compose(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], I
             ordered = sorted(rest, key=lambda d: (_order(ws, d), d.index))
             timeline_blocks.append({"label": _label(ordered, identity(ordered[0])),
                                     "rows": [_row(ws, d, conflicts, undecided) for d in ordered]})
-    return timeline_blocks, [block for _, block in sorted(components, key=lambda c: c[0])]
+    breakdown_blocks = [
+        {"label": _label(block["rows"], identity(block["rows"][0]), with_facet=False),
+         "as_of": _block_as_of(block["rows"][0]),
+         "rows": [_component_row(ws, d, conflicts, undecided, absorbed.get(d.ref),
+                                 derived_for(ws, d.ref) if d.ref in absorbed else None) for d in block["rows"]]}
+        for block in sorted(components, key=lambda b: b["sort"]) if block["rows"]]
+    return timeline_blocks, breakdown_blocks
 
 
 def build(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None) -> list[dict]:
@@ -750,8 +944,16 @@ def breakdown(ws: Workspace, cited: Collection[str], identity: Callable[[Datum],
 
 
 def row_ids(blocks: Iterable[dict]) -> set[str]:
-    """The V# and M# ids the rows of a timeline stand for."""
-    return {r["sid"] for b in blocks for r in b["rows"]}
+    """The V# and M# ids the rows of a timeline stand for: a row of an adjustment (round 14 U4) stands for its reduction too, and
+    names the C# it was derived by."""
+    ids = {r["sid"] for b in blocks for r in b["rows"]}
+    for b in blocks:
+        for r in b["rows"]:
+            if r.get("reduction"):
+                ids.add(r["reduction"]["sid"])
+            if r.get("derived"):
+                ids.add(r["derived"])
+    return ids
 
 
 # --- the plain-text copy --------------------------------------------------------------------------------------------------
@@ -796,7 +998,10 @@ def plain_text(blocks: list[dict], components: Iterable[dict] = ()) -> str:
         for b in components:
             lines.append(f"{b['label']} ({shown(b['as_of'])})")
             for r in b["rows"]:
-                cells = [r["facet"], value_of(r), r["source"]["title"], ", ".join(_mark_text(r, m) for m in r["marks"])]
+                value = value_of(r)
+                if r.get("reduction"):  # one adjustment, both forms: "0.9 / 10%"
+                    value = f"{value} / {value_of(r['reduction'])}"
+                cells = [r["facet"], value, r["source"]["title"], ", ".join(_mark_text(r, m) for m in r["marks"])]
                 lines.append("- " + " · ".join(c for c in cells if c))
         parts.append("\n".join(lines))
     return "\n\n".join(parts)

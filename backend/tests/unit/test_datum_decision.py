@@ -15,6 +15,7 @@ import re
 import uuid
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -465,3 +466,74 @@ def test_span_builders_name_the_version_the_reading_and_the_place():
     assert datum.quote_span("v1", "r1", {"blocks": [4, 5]}) is None  # block precision: no span
     assert datum.quote_span("v1", "r1", {}) is None
     assert datum.cell_span("v1", "r1", 2, 3, 4) == ("cell", "v1", "r1", 2, 3, 4)
+
+
+# --- round 14 U4: a coefficient and its reduction (R8; KTD6; AE6) ---------------------------------------------------------------
+
+def _coefficient(amount: str, facet: str | None = "מקדם מיקום", *, unit: str = "ratio", appraisal=("v1", 1)):
+    """A coefficient as ``reconciles`` reads it: the family, its stated facet, appraisal unit, canonical amount and the number as written."""
+    return SimpleNamespace(family="coefficient", facet=datum.facet(facet, "row", "own") if facet else datum.none(),
+                           appraisal=appraisal, amount=datum.canonical_amount(Decimal(amount), unit=unit, family="coefficient"),
+                           written=amount, unit=unit, words="")
+
+
+def _proportion(amount: str, facet: str | None = "מיקום", words: str = "בשל מיקום נקבעה הפחתה", *, unit: str = "percent",
+                appraisal=("v1", 1)):
+    return SimpleNamespace(family="proportion", facet=datum.facet(facet, "sentence", "own") if facet else datum.none(),
+                           appraisal=appraisal, amount=datum.canonical_amount(Decimal(amount), unit=unit, family="proportion"),
+                           written=amount, unit=unit, words=words)
+
+
+@pytest.mark.parametrize("coefficient, percent", [("0.9", "10"), ("0.85", "15"), ("0.83", "17"), ("0.833", "17"),
+                                                  ("0.8", "20"), ("0.75", "25"), ("0.915", "8.5")])
+def test_a_coefficient_that_is_one_minus_the_reduction_within_the_shown_digits_reconciles(coefficient, percent):
+    assert datum.reconciles(_coefficient(coefficient), _proportion(percent)) == datum.RECONCILED
+
+
+@pytest.mark.parametrize("coefficient, percent", [("0.9", "15"), ("0.9", "11"), ("0.85", "10"), ("0.83", "18"), ("0.9", "90")])
+def test_amounts_that_do_not_reconcile_are_a_conflict_when_everything_else_matches(coefficient, percent):
+    assert datum.reconciles(_coefficient(coefficient), _proportion(percent)) == datum.CONFLICT
+
+
+def test_a_reduction_written_as_a_ratio_reconciles_in_the_precision_it_shows():
+    assert datum.reconciles(_coefficient("0.85"), _proportion("0.15", unit="ratio")) == datum.RECONCILED
+    assert datum.reconciles(_coefficient("0.85"), _proportion("0.2", unit="ratio")) == datum.CONFLICT
+    assert datum.reconciles(_coefficient("85", unit="percent"), _proportion("15")) == datum.RECONCILED
+
+
+def test_the_reduction_cue_may_be_in_the_proportions_words_or_in_its_facet_and_nowhere_else():
+    cue = _proportion("10", "מיקום", "בשל מיקום נקבעה הפחתה")
+    in_facet = _proportion("10", "הנחה בשל מיקום", "")
+    in_words = _proportion("10", "מיקום", "ניכוי של 10% מהשווי")
+    prefixed = _proportion("10", "מיקום", "וההפחתה היא 10%")
+    none = _proportion("10", "מיקום", "שיעור מיקום של 10%")
+    coefficient_words = _coefficient("0.9")
+    coefficient_words.words = "מקדם הפחתה 0.9"  # the cue must be the proportion's own: the coefficient's words are not read
+    assert [datum.reconciles(_coefficient("0.9"), p) for p in (cue, in_facet, in_words, prefixed)] == [datum.RECONCILED] * 4
+    assert datum.reconciles(coefficient_words, none) == datum.UNRELATED
+    assert datum.reconciles(_coefficient("0.9"), none) == datum.UNRELATED
+    assert datum.reconciles(_coefficient("0.9"), _proportion("15", "מיקום", "שיעור מיקום של 15%")) == datum.UNRELATED
+
+
+def test_two_different_appraisal_units_are_unrelated_whatever_the_amounts():
+    assert datum.reconciles(_coefficient("0.9"), _proportion("10", appraisal=("v2", 1))) == datum.UNRELATED
+    assert datum.reconciles(_coefficient("0.9"), _proportion("15", appraisal=("v1", 2))) == datum.UNRELATED
+    assert datum.reconciles(_coefficient("0.9", appraisal=None), _proportion("10", appraisal=None)) == datum.UNRELATED
+
+
+def test_facet_cores_must_be_equal_and_stated():
+    assert datum.reconciles(_coefficient("0.9", "מקדם מיקום"), _proportion("10", "גודל החלקה")) == datum.UNRELATED
+    assert datum.reconciles(_coefficient("0.9", "מקדם מיקום"), _proportion("10", "מיקום וגודל החלקה")) == datum.UNRELATED  # a subset
+    assert datum.reconciles(_coefficient("0.9", None), _proportion("10", None)) == datum.UNRELATED  # nothing stated
+    assert datum.reconciles(_coefficient("0.9", "מקדם מיקום"), _proportion("10", None, "הפחתה של 10%")) == datum.UNRELATED
+
+
+def test_only_a_coefficient_with_a_proportion_in_that_order_and_with_plain_amounts_is_decided():
+    a, b = _coefficient("0.9"), _proportion("10")
+    assert datum.reconciles(b, a) == datum.UNRELATED and datum.reconciles(a, a) == datum.UNRELATED
+    ranged = _proportion("10")
+    ranged.amount = (Decimal("0.1"), Decimal("0.12"))
+    assert datum.reconciles(a, ranged) == datum.UNRELATED
+    nothing = _coefficient("0.9")
+    nothing.amount = None
+    assert datum.reconciles(nothing, b) == datum.UNRELATED

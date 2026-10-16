@@ -885,3 +885,34 @@ def test_a_derived_result_backs_no_number_of_a_unit_that_cites_nothing():
     (problem,) = _numbers_only(ws, "שיעור הוצאות ייעודי של 20% בלבד.")
     assert problem.check == "unstated_number" and "20" in problem.unstated
     assert _numbers_only(_scenario(), "הרווח בתרחיש יהיה 1,530,000 ₪.") == []  # a model-made C# keeps the old behavior
+
+
+# --- round 14 U4: the reduction a coefficient implies, registered through the same derivation (R8, KTD6, AE6) -----------------------
+
+def test_the_reduction_of_a_coefficient_is_registered_as_one_minus_it_once():
+    """``derive_reduction`` is ``_derived_computation`` for ``1 − Vn`` shown as the fraction it is: a C# of result kind
+    ``derived`` whose only input is the coefficient, reused on the second call."""
+    ws = Workspace(ctx=None)
+    _ratio(ws, "0.9", "מקדם הדגמה")
+    cid = verify.derive_reduction(ws, "V1")
+    c = ws.computations[cid]
+    assert (c.result_kind, c.expression, c.value, c.leaves) == ("derived", _expr("1 - V1"), Decimal("0.1"), ["V1"])
+    assert [i["id"] for i in c.inputs] == ["V1"]
+    assert verify.derive_reduction(ws, "V1") == cid and len(ws.computations) == 1
+
+
+def test_the_reduction_reuses_the_percent_form_the_verifier_already_derived():
+    ws = Workspace(ctx=None)
+    _ratio(ws, "0.8", "מקדם הדגמה")
+    _verify(ws, "מקדם 0.8, בהנחה של 20 נקודות אחוז [V1].")
+    (existing,) = _derived(ws)
+    assert existing.expression == _expr("(1 - V1) * 100")
+    assert verify.derive_reduction(ws, "V1") == existing.cid and len(ws.computations) == 1
+
+
+def test_no_reduction_is_derived_where_the_calculator_refuses_the_coefficient():
+    ws = Workspace(ctx=None)
+    _ratio(ws, "90", "מקדם באחוזים", unit="percent")  # 90 percent: a literal 1 beside a percent does not combine
+    _ratio(ws, "1.2", "מקדם מעל אחד")  # one minus it is negative: a reduction is a magnitude
+    assert verify.derive_reduction(ws, "V1") is None and verify.derive_reduction(ws, "V2") is None
+    assert verify.derive_reduction(ws, "V99") is None and ws.computations == {}
