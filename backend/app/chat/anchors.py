@@ -886,9 +886,60 @@ def anchored_documents(answer: dict | None) -> set[str]:
     return out
 
 
+# what a context stub keeps of the value's own stub: the document, version and reading, never the value's place (its block range,
+# row, cell, quote, number or span), which would point the context at the value
+_CONTEXT_KEEPS = ("document_id", "version_id", "reading_id", "section", "unit")
+CONTEXT_QUOTE_MAX = 120  # characters of a context's quote (``timeline.CONTEXT_QUOTE_MAX``)
+
+
+def context_stub(ws, sid: str) -> dict | None:
+    """The stub of the place a value's component was read from, when that place is not the value's own sentence (round 14 U6, KTD8):
+    the context sentence the facet stamped (``at``: its segments or blocks, in the value's own version), else — for a table's caption
+    or note — the table itself. The value's own place is dropped from it. None: the facet records no place (a row label, a column
+    header, a lead-in the reader did not locate)."""
+    holder = ws.values.get(sid) or ws.measurements.get(sid)
+    facet = getattr(holder, "facet", None) or {}
+    base = ws.anchors.get(sid)
+    if not base:
+        return None
+    stub = {k: base[k] for k in _CONTEXT_KEEPS if base.get(k) is not None}
+    at = facet.get("at")
+    if isinstance(at, dict) and (at.get("segments") or at.get("blocks")):
+        return stub | {"kind": "quote"} | {k: at[k] for k in ("segments", "blocks") if at.get(k)}
+    if facet.get("part") in ("caption", "table_note") and base.get("table_index") is not None:
+        return stub | {"kind": "table", "table_index": base["table_index"]} | (
+            {"pages": base["pages"]} if base.get("pages") else {})
+    return None
+
+
+def _context_items(ws, answer: dict) -> list[tuple[dict, dict, str]]:
+    """``(context, stub, quote)`` for every row of the answer's timeline and components table whose component was read from a
+    context (``state.component.context``): the dict the anchor goes in, the stub to resolve and the quote it shows."""
+    out = []
+    for key in ("timeline", "breakdown"):
+        for block in (answer.get("time") or {}).get(key) or []:
+            for row in block.get("rows") or []:
+                ctx = (((row.get("state") or {}).get("component") or {}).get("context"))
+                if isinstance(ctx, dict) and (stub := context_stub(ws, row.get("sid"))) is not None:
+                    out.append((ctx, stub, ctx.get("quote") or ""))
+    return out
+
+
+def _sentence_of(snap: dict) -> str | None:
+    """The context sentence a DOCX snapshot highlights in its cited text, when it highlights one."""
+    structured = snap.get("structured") or {}
+    mark = structured.get("highlight")
+    if not mark or not structured.get("text"):
+        return None
+    return " ".join(structured["text"][mark[0]:mark[1]].split()) or None
+
+
 def attach(ws, answer: dict) -> None:
     """Snapshot the anchor of every source, value and measurement the answer keeps (``anchor`` on each), and the
-    inputs of every computation, resolved in one transaction against the turn's pinned readings."""
+    inputs of every computation, resolved in one transaction against the turn's pinned readings. Round 14 U6 (KTD8): the same
+    transaction resolves the context stub of every timeline and components row whose component was read from elsewhere than the
+    value's own sentence, into ``state.component.context.anchor``; the sentence the snapshot highlights, when it has one, is the
+    context's ``quote`` (clipped)."""
     from app.db import tenant_tx
 
     for c in answer.get("computations") or []:
@@ -899,6 +950,8 @@ def attach(ws, answer: dict) -> None:
             stub = ws.anchors.get(d.get("id")) if isinstance(d, dict) else None
             if stub is not None:
                 items.append((d, stub, d.get("text") or d.get("quote") or ""))
+    contexts = _context_items(ws, answer)
+    items += contexts
     if not items:
         return
     readings: dict[str, Reading] = {}
@@ -912,3 +965,6 @@ def attach(ws, answer: dict) -> None:
     for d, stub, cited in items:
         vid = stub["version_id"]
         d["anchor"] = bound(snapshot(stub, readings.get(vid), ws.readings.get(vid, stub.get("reading_id")), cited))
+    for ctx, _, _ in contexts:
+        if ctx.get("quote") and (sentence := _sentence_of(ctx["anchor"])):
+            ctx["quote"] = sentence[:CONTEXT_QUOTE_MAX].rstrip()

@@ -147,6 +147,19 @@ def test_the_uncited_rows_open_like_citations_their_values_and_sources_are_in_th
     assert {d["document_id"] for d in a["documents"]} >= {setup.docs[k] for k in setup.docs}
 
 
+def test_a_cited_values_history_rows_from_other_appraisals_are_labelled_history_and_carry_their_state(client, setup, monkeypatch):
+    """Round 14 U6 (KTD7, KTD8, R13): the cited row is `cited` with the verification result of its claim; the rows of the same datum in
+    the other appraisals, which no claim cites, are `history` — a reading state, no claim, and the server's history label."""
+    m = ask(client, setup, monkeypatch, agent(setup, ["y2025", "y2024", "y2022"], cited("V1")))
+    by = {r["sid"]: r for r in rows(m)}
+    assert by["V1"]["state"]["support"] == "cited" and by["V1"]["state"]["claim"]["result"] == "supported" and "note" not in by["V1"]
+    for old in ("V2", "V3"):
+        state = by[old]["state"]
+        assert state["support"] == "history" and state["claim"] is None and state["reading"] == "verified"
+        assert state["comparison"]["status"] == "same" and by[old]["note"]
+    assert m["answer"]["time"]["text"].count(by["V2"]["note"]) == 2, "the copy says it of each history row"
+
+
 def test_the_copy_of_the_timeline_is_plain_text_outside_the_markdown(client, setup, monkeypatch):
     a = ask(client, setup, monkeypatch, agent(setup, ["y2025", "y2024", "y2022"], cited("V1")))["answer"]
     text = a["time"]["text"]

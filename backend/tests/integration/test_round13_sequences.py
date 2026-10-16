@@ -286,7 +286,7 @@ def test_ae2_six_rates_of_five_cash_flows_and_a_bare_one_are_six_components_the_
     rows = block["rows"]
     assert [r["sid"] for r in rows] == [f"V{n}" for n in range(1, 7)]
     assert [r["value_text"] for r in rows] == ["6.5", "7.25", "7.25", "8.5", "9", "10"]
-    assert [r["facet"] for r in rows] == [DATUM[i]["facet"]["written"] for i in CAP[:5]] + [NO_FACET]
+    assert [r["facet"] for r in rows] == [DATUM[i]["facet"]["written"] for i in CAP[:5]] + [TL.FACET_TEXT[("none", "not_in_range")]]
     # the bare rate could not be compared with any other rate: only its row carries the undecided mark, naming the five it was
     # set against (a row with a stated component carries none because of a bare one); never a conflict
     by_sid = rows_in(a["time"]["breakdown"])

@@ -689,8 +689,87 @@ export interface ChatTimelineRow {
   /** With the `undecided` mark: the citation ids (V#/M#) of the values this one could not be compared with. */
   undecided_with?: string[];
   /** With the `conflict` mark (round 13 U6): the citation ids of every value this one conflicts with, even one in another
-   * block. Absent when the row is in no conflict. */
+   * block. Absent when the row is in no conflict. Round 14 U6: only rows that are on screen (a counterpart without a row is in
+   * `not_in_answer_with`). */
   conflict_with?: string[];
+  /** Round 14 U6 (KTD7, R13): counterparts of an `undecided` or `conflict` mark that have no row because the answer does not use
+   * them, shown as the text "ערך זה אינו בתשובה: <title>, <location>". Absent when there are none. */
+  not_in_answer_with?: ChatNotInAnswer[];
+  /** Round 14 U6: on a row of a value the answer does not use (one datum's history), the server's label "נתון היסטורי, לא נכלל
+   * במסקנת התשובה". Absent on a row the answer uses. */
+  note?: string;
+  /** Round 14 U6 (KTD8): the structured state of the row. Absent on an answer stored before round 14: read such a row as before. */
+  state?: ChatRowState;
+}
+
+/** A value a mark names that is not in the answer (round 14 U6): no row, so no citation chip. */
+export interface ChatNotInAnswer {
+  sid: string;
+  title: string;
+  location: string;
+}
+
+/** The state of a component (round 14 KTD4): `stated`; `none` (read, nothing in the range checked names one); `unparsed` (read,
+ * ambiguous); `not_read`. A proven conflict is a comparison result, never a component state. */
+export type ChatRowComponentStatus = "stated" | "none" | "unparsed" | "not_read";
+
+/** Why a component is not stated (`reason` is null for `stated`): `not_in_range`, `intervening_value`, `two_components`,
+ * `picture_cell`, `not_needed` (the family needs none), `cap` (the read reached its character cap), or `other` (no more precise
+ * reason is recorded). */
+export type ChatComponentReason =
+  | "not_in_range"
+  | "intervening_value"
+  | "two_components"
+  | "picture_cell"
+  | "not_needed"
+  | "cap"
+  | "other";
+
+/** Where a component was read from, when that is not the value's own sentence, row or cell (round 14 U6, KTD8). `anchor` is the
+ * resolved snapshot of that place (null when it cannot be located); the raw stub is never sent. */
+export interface ChatComponentContext {
+  /** The server's label of the place ("משפט קודם באותה פסקה", "פסקה קודמת בסעיף", "פתיח הרשימה", "כותרת הסעיף", "הערת הטבלה", "כותרת הטבלה"). */
+  location: string;
+  /** The interpreting text, clipped to 120 characters (null when the read stated no phrase). */
+  quote: string | null;
+  anchor: ChatAnchor | null;
+}
+
+export interface ChatRowComponent {
+  status: ChatRowComponentStatus;
+  reason: ChatComponentReason | null;
+  /** The source's own words; null unless `status` is `stated`. */
+  written: string | null;
+  /** Where they are: `row`, `column`, `caption`, `sentence`, `lead_in`, `heading`, `preceding_sentence`, `paragraph`, `table_note`. */
+  part: string | null;
+  /** `own` (the value's own row label, column header or purpose phrase) or `context` (anything read from around it). */
+  tier: "own" | "context" | null;
+  context: ChatComponentContext | null;
+}
+
+/** The verification result of the claim that cites the value, with its reason class (a failure kind, `recency`, `final`,
+ * `unspecified`; never the claim's text). */
+export interface ChatRowClaim {
+  result: "supported" | "partial" | "unsupported" | "not_checked";
+  reason: string | null;
+}
+
+export type ChatComparisonStatus = "same" | "different" | "undecided" | "conflict" | "single";
+
+/** The four questions of a row apart, plus its support (round 14 U6, KTD8, R9): an undecided comparison never makes a supported
+ * value unverified. */
+export interface ChatRowState {
+  /** `verified`: the server matched the number in the source; `uncertain`: the reading cannot be presented as certain. */
+  reading: "verified" | "uncertain";
+  component: ChatRowComponent;
+  /** Null on a history row (no claim of the answer cites it) and when no verification report was given. */
+  claim: ChatRowClaim | null;
+  /** `cited`: the answer uses the value; `history`: one datum's other rows, not part of the conclusion. */
+  support: "cited" | "history";
+  /** `with`: the citation ids of rows on screen. */
+  comparison: { status: ChatComparisonStatus; with: string[] };
+  /** The one row-level reason key: the component's `reason` when it is not stated, else the comparison status. */
+  reason: string;
 }
 
 /** One comparable group, its rows already in display order (the server orders them; the screen never re-sorts). */
@@ -700,11 +779,27 @@ export interface ChatTimelineGroup {
 }
 
 /** One row of the components table (round 13 U6, KTD7): a component of one appraisal at one date. `facet` is the
- * consideration or cash flow the source gives the value, in its own words, or the server's "רכיב לא צוין במקור". */
+ * consideration or cash flow the source gives the value, in its own words, or the server's sentence for the state of the
+ * component (round 14 U6: "המקור לא מציין רכיב בקטע שנקרא", "ההקשר לא נקרא", ...; "רכיב לא צוין במקור" only for a family that needs
+ * none). `reduction` and `derived` (round 14 U4): a coefficient and the percentage reduction that is one minus it are one row. */
 export type ChatBreakdownRow = Pick<
   ChatTimelineRow,
-  "value_text" | "unit" | "sid" | "source" | "marks" | "undecided_with" | "conflict_with"
-> & { facet: string };
+  | "value_text"
+  | "unit"
+  | "sid"
+  | "source"
+  | "marks"
+  | "undecided_with"
+  | "conflict_with"
+  | "not_in_answer_with"
+  | "note"
+  | "state"
+> & {
+  facet: string;
+  reduction?: { sid: string; value_text: string; unit: string | null; source: ChatTimelineRow["source"] };
+  /** The C# of `1 − Vn` the server derived for the reduction; null while none is registered. */
+  derived?: string | null;
+};
 
 /** The components of one appraisal unit at one date (parallel components, never competing values), rows in server order.
  * Its rows are in no timeline group. */

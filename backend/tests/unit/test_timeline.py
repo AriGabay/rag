@@ -695,16 +695,18 @@ def test_two_coefficients_that_could_not_be_compared_are_undecided_not_a_conflic
 def test_an_undecided_mark_is_on_both_rows_and_carries_the_counterparts_sid():
     o = Office()
     facet = "מקדם הפחתה בשל מגבלות בנייה"
+    doc, ver = _unit(o)
     old = _coefficient(o, o.doc(), "0.8", as_of("2023-03-31"), facet)
-    new = _coefficient(o, o.doc(), "0.8", as_of("2025-03-31"), facet)  # one datum over two years: a history, two rows
-    other = _coefficient(o, o.doc(), "0.9", as_of("2025-03-31"), "מקדם הפחתה בשל שיתוף במקרקעין")
-    (g,) = o.blocks({new})
-    rows = {r["sid"]: r for r in g["rows"]}
-    assert set(rows) == {old, new}
-    assert rows[new]["marks"] == ["undecided"] and rows[new]["undecided_with"] == [other]
-    assert rows[old]["marks"] == [] and "undecided_with" not in rows[old]  # 2023 does not overlap 2025
+    new = _coefficient(o, doc, "0.8", as_of("2025-03-31"), facet, version=ver)  # one datum over two years: a history, two rows
+    other = _coefficient(o, doc, "0.9", as_of("2025-03-31"), None, version=ver)  # no facet: not comparable with a stated one
+    (g,) = o.blocks({new, other})  # the history of the datum
+    assert [r["sid"] for r in g["rows"]] == [old] and g["rows"][0]["marks"] == []  # 2023 does not overlap 2025
+    (comp,) = timeline.breakdown(o.ws, {new, other})
+    rows = {r["sid"]: r for r in comp["rows"]}
+    assert set(rows) == {new, other}
+    assert rows[other]["marks"] == ["undecided"] and rows[other]["undecided_with"] == [new] and rows[new]["marks"] == []
     assert timeline.MARKS["undecided"] == "השוואה לא הוכרעה"
-    assert f"{timeline.MARKS['undecided']} ({other})" in timeline.plain_text([g])
+    assert f"{timeline.MARKS['undecided']} ({new})" in timeline.plain_text([g], [comp])
     assert not coverage.conflicting(o.ws)
 
 
@@ -768,7 +770,7 @@ def test_ae1_two_parallel_coefficients_are_one_components_block_naming_their_row
     a = _coefficient(o, doc, "0.8", as_of("2025-03-31"), "מקדם הפחתה בשל מגבלות בנייה", version=ver)
     b = _coefficient(o, doc, "0.9", as_of("2025-03-31"), "מקדם הפחתה בשל שיתוף במקרקעין", version=ver)
     assert o.blocks({a, b}) == []
-    (block,) = timeline.breakdown(o.ws, {a})  # one cited coefficient brings its parallel component with it
+    (block,) = timeline.breakdown(o.ws, {a, b})  # the table holds the rows the answer uses (round 14 U6, KTD7)
     assert [r["sid"] for r in block["rows"]] == [a, b]
     assert [r["facet"] for r in block["rows"]] == ["מקדם הפחתה בשל מגבלות בנייה", "מקדם הפחתה בשל שיתוף במקרקעין"]
     assert [r["value_text"] for r in block["rows"]] == ["0.8", "0.9"]
@@ -794,9 +796,9 @@ def test_one_facet_on_two_dates_beside_a_second_facet_on_the_later_date_splits_t
     early = _coefficient(o, doc, "0.8", as_of("2023-03-31"), first, version=ver)
     late = _coefficient(o, doc, "0.85", as_of("2025-03-31"), first, version=ver)
     other = _coefficient(o, doc, "0.9", as_of("2025-03-31"), second, version=ver)
-    (comp,) = timeline.breakdown(o.ws, {late})
+    (comp,) = timeline.breakdown(o.ws, {late, other})
     assert [r["sid"] for r in comp["rows"]] == [late, other]
-    (g,) = o.blocks({late})  # the first facet's timeline holds its other row only, and is still shown with one row
+    (g,) = o.blocks({late, other})  # the first facet's timeline holds its other row only, and is still shown with one row
     assert [r["sid"] for r in g["rows"]] == [early] and first in g["label"]
     assert timeline.row_ids([g]).isdisjoint(timeline.row_ids([comp])), "a row belongs to exactly one block"
     assert o.blocks({other}) == [], "the second facet has no other row: no timeline block"
@@ -809,12 +811,12 @@ def test_ae4_rows_of_one_class_show_each_their_own_wording_and_the_label_the_fir
     plural = _coefficient(o, doc, "0.8", as_of("2025-03-31"), 'מקדמי הפחתה לנכס "מושע"', version=ver)
     singular = _coefficient(o, o.doc(), "0.8", as_of("2024-03-31"), "מקדם הפחתה לנכס מושע")  # same datum, another spelling
     other = _coefficient(o, doc, "0.9", as_of("2025-03-31"), "מקדם הפחתה בשל מגבלות בנייה", version=ver)
-    (comp,) = timeline.breakdown(o.ws, {plural})
+    (comp,) = timeline.breakdown(o.ws, {plural, other})
     assert {r["sid"]: r["facet"] for r in comp["rows"]} == {plural: 'מקדמי הפחתה לנכס "מושע"',
                                                               other: "מקדם הפחתה בשל מגבלות בנייה"}
-    (g,) = o.blocks({plural})
+    (g,) = o.blocks({plural, other})
     assert [r["sid"] for r in g["rows"]] == [singular]
-    both = timeline.build(o.ws, {singular, plural})  # the same datum on two dates, neither in a components block here
+    both = timeline.build(o.ws, {singular, plural, other})  # the same datum on two dates; the components table takes the 2025 row
     assert both and "מקדם הפחתה לנכס מושע" in both[0]["label"]
 
 
@@ -827,17 +829,18 @@ def test_the_label_of_a_class_shows_the_first_rows_written_facet_in_server_order
     assert 'מקדמי הפחתה לנכס "מושע"' in g["label"] and "מקדם הפחתה לנכס מושע" not in g["label"]
 
 
-def test_a_row_whose_source_states_no_facet_shows_that_it_names_none():
+def test_a_row_whose_source_states_no_facet_says_so_and_a_row_not_read_says_that():
     o = Office()
     doc, ver = _unit(o)
     named = _coefficient(o, doc, "0.8", as_of("2025-03-31"), "מקדם הפחתה בשל מגבלות בנייה", version=ver)
     bare = _coefficient(o, doc, "0.9", as_of("2025-03-31"), None, version=ver)
     unread = o.value(doc, "0.95", as_of("2025-03-31"), kind="coefficient", unit="ratio", version=ver,
                      facet=datum.not_read(), section="3. מקדמים")
-    (comp,) = timeline.breakdown(o.ws, {named})
+    (comp,) = timeline.breakdown(o.ws, {named, bare, unread})
     facets = {r["sid"]: r["facet"] for r in comp["rows"]}
-    assert facets[bare] == facets[unread] == timeline.MSG_NO_FACET == "רכיב לא צוין במקור"
-    assert facets[named] == "מקדם הפחתה בשל מגבלות בנייה"
+    # round 14 U6 (KTD8, R11): read-and-nothing-named and not-read are two sentences, and neither is the old "not stated" wording
+    assert facets[bare] == timeline.FACET_TEXT[("none", "not_in_range")] and facets[unread] == timeline.MSG_NOT_READ
+    assert timeline.MSG_NO_FACET not in facets.values() and facets[named] == "מקדם הפחתה בשל מגבלות בנייה"
 
 
 def test_an_undecided_pair_in_one_unit_is_a_components_row_with_the_mark_and_its_counterpart():
@@ -845,7 +848,7 @@ def test_an_undecided_pair_in_one_unit_is_a_components_row_with_the_mark_and_its
     doc, ver = _unit(o)
     a = _coefficient(o, doc, "0.8", as_of("2025-03-31"), "מקדם הפחתה בשל מגבלות בנייה", version=ver)
     b = _coefficient(o, doc, "0.9", as_of("2025-03-31"), None, version=ver)  # no facet: not comparable with a stated one
-    (comp,) = timeline.breakdown(o.ws, {a})
+    (comp,) = timeline.breakdown(o.ws, {a, b})
     rows = {r["sid"]: r for r in comp["rows"]}
     # the mark is on the unresolved side: the row without a facet, naming the stated one (round 13 follow-up)
     assert rows[a]["marks"] == [] and "undecided_with" not in rows[a]
@@ -858,7 +861,7 @@ def test_two_equal_numbers_of_two_facets_stay_two_rows_of_the_breakdown():
     doc, ver = _unit(o)
     a = _coefficient(o, doc, "0.8", as_of("2025-03-31"), "מקדם הפחתה בשל מגבלות בנייה", version=ver)
     b = _coefficient(o, doc, "0.8", as_of("2025-03-31"), "מקדם הפחתה בשל שיתוף במקרקעין", version=ver)
-    (comp,) = timeline.breakdown(o.ws, {a})
+    (comp,) = timeline.breakdown(o.ws, {a, b})
     assert [r["sid"] for r in comp["rows"]] == [a, b] and comp["rows"][0]["value_text"] == comp["rows"][1]["value_text"]
 
 
@@ -899,8 +902,8 @@ def test_ae3_each_conflicting_row_names_its_counterpart_even_in_another_breakdow
     b1 = _coefficient(o, d1, "0.9", as_of("2025-03-31"), other, version=v1)
     a2 = _coefficient(o, d2, "0.85", as_of("2025-03-31"), facet, version=v2)
     b2 = _coefficient(o, d2, "0.9", as_of("2025-03-31"), other, version=v2)
-    assert o.blocks({a1, a2}) == []
-    blocks = timeline.breakdown(o.ws, {a1, a2})
+    assert o.blocks({a1, b1, a2, b2}) == []
+    blocks = timeline.breakdown(o.ws, {a1, b1, a2, b2})
     assert [[r["sid"] for r in b["rows"]] for b in blocks] == [[a1, b1], [a2, b2]]
     rows = {r["sid"]: r for b in blocks for r in b["rows"]}
     assert "conflict" in rows[a1]["marks"] and rows[a1]["conflict_with"] == [a2]
@@ -942,7 +945,7 @@ def test_a_breakdown_of_four_own_facet_rates_in_two_sections_and_two_bare_rates_
     stated = [rate("6", "התזרים דמי שכירות ממשרדים", "3. היוון"), rate("7", "התזרים מחניות", "3. היוון"),
               rate("8", "התזרים ממחסנים", "5. סיכום"), rate("9", "התזרים משלטי פרסום", "5. סיכום")]
     bare = [rate("10", None, "5. סיכום"), rate("11", None, "3. היוון")]
-    (block,) = timeline.breakdown(o.ws, set(stated))
+    (block,) = timeline.breakdown(o.ws, {*stated, *bare})
     rows = {r["sid"]: r for r in block["rows"]}
     assert set(rows) == {*stated, *bare}
     assert all(rows[s]["marks"] == [] and "undecided_with" not in rows[s] for s in stated), "resolved own facets: no mark"
@@ -966,7 +969,7 @@ def test_a_scenario_that_restates_the_facet_is_no_part_of_the_key_so_the_rates_f
     a = _rate(o, doc, ver, "6", "התזרים דמי שכירות ממשרדים", "תזרים דמי שכירות ממשרדים")
     b = _rate(o, doc, ver, "7", "התזרים מחניות", "תזרים מחניות")
     assert all(("scenario", "") in d.fields for d in timeline.datums(o.ws)), "the restating scenario is not in the key"
-    (block,) = timeline.breakdown(o.ws, {a})
+    (block,) = timeline.breakdown(o.ws, {a, b})
     assert [r["sid"] for r in block["rows"]] == [a, b]
     assert [r["facet"] for r in block["rows"]] == ["התזרים דמי שכירות ממשרדים", "התזרים מחניות"]
 
@@ -990,10 +993,10 @@ def test_of_duplicate_registrations_the_cited_one_is_the_row_and_the_block_is_bu
     v1 = _coefficient(o, doc, "0.8", as_of("2025-03-31"), first, version=ver)
     v2 = _coefficient(o, doc, "0.9", as_of("2025-03-31"), second, version=ver)
     v3 = _coefficient(o, doc, "0.8", as_of("2025-03-31"), first, version=ver)  # the same figure registered again
-    (block,) = timeline.breakdown(o.ws, {v3})
+    (block,) = timeline.breakdown(o.ws, {v2, v3})
     assert [r["sid"] for r in block["rows"]] == [v2, v3]  # registration order, with the cited duplicate
     assert v1 not in {r["sid"] for r in block["rows"]}
-    (uncited,) = timeline.breakdown(o.ws, {v1})
+    (uncited,) = timeline.breakdown(o.ws, {v1, v2})
     assert v1 in {r["sid"] for r in uncited["rows"]} and v3 not in {r["sid"] for r in uncited["rows"]}
     assert [d.ref for d in timeline._dedupe(timeline.datums(o.ws))] == [v1, v2]  # nothing cited: the first registration
 
@@ -1040,7 +1043,7 @@ def test_ae5_three_adjustments_of_ten_percent_with_three_stated_considerations_a
     (bucket,) = [b for b in timeline.buckets(o.ws, set(ids)) if ids[0] in {d.ref for d in b.members}]
     assert len(bucket.classes) == 3 and bucket.conflicts() == [] and bucket.undecided() == []
     assert not coverage.conflicting(o.ws)
-    (block,) = timeline.breakdown(o.ws, {ids[0]})
+    (block,) = timeline.breakdown(o.ws, set(ids))
     assert [r["sid"] for r in block["rows"]] == ids and all(r["marks"] == [] for r in block["rows"])
 
 
@@ -1091,28 +1094,28 @@ def test_ae6_the_derived_computation_is_one_minus_the_coefficient_and_the_row_re
     o = Office()
     doc, ver = _unit(o)
     c = _row_coefficient(o, doc, ver, "0.9", "מקדם מיקום")
-    _row_coefficient(o, doc, ver, "0.8", "מקדם שיתוף במקרקעין")
+    other = _row_coefficient(o, doc, ver, "0.8", "מקדם שיתוף במקרקעין")
     r = _reduction(o, doc, ver, "10", "הפחתת מיקום", "הפחתה של 10%")
-    added = timeline.register_derived(o.ws, {c, r})
+    added = timeline.register_derived(o.ws, {c, other, r})
     (cid,) = [i for i in added if i in o.ws.computations]
     comp = o.ws.computations[cid]
     assert comp.result_kind == "derived" and comp.expression == "1 − V1" and comp.value == Decimal("0.1")
     assert [i["id"] for i in comp.inputs] == [c] and c in added, "the coefficient is its input, and joins the used ids"
-    assert timeline.register_derived(o.ws, {c, r}) == added and len(o.ws.computations) == 1, "registered once"
-    (block,) = timeline.breakdown(o.ws, {c, r})
+    assert timeline.register_derived(o.ws, {c, other, r}) == added and len(o.ws.computations) == 1, "registered once"
+    (block,) = timeline.breakdown(o.ws, {c, other, r})
     assert block["rows"][0]["derived"] == cid
     assert verify.derive_reduction(o.ws, c) == cid
     assert timeline.row_ids([block]) >= {c, r, cid}
     assert "10" in timeline.plain_text([], [block]) and "0.9" in timeline.plain_text([], [block])
 
 
-def test_the_reduction_alone_cited_still_shows_the_adjustment_row_of_its_coefficient():
+def test_the_reduction_cited_instead_of_its_coefficient_still_shows_the_adjustment_row_of_its_coefficient():
     o = Office()
     doc, ver = _unit(o)
     c = _row_coefficient(o, doc, ver, "0.9", "מקדם מיקום")
     other = _row_coefficient(o, doc, ver, "0.8", "מקדם שיתוף במקרקעין")
     r = _reduction(o, doc, ver, "10", "מיקום", "הנחה של 10%")
-    (block,) = timeline.breakdown(o.ws, {r})
+    (block,) = timeline.breakdown(o.ws, {r, other})
     assert [row["sid"] for row in block["rows"]] == [c, other] and block["rows"][0]["reduction"]["sid"] == r
 
 
@@ -1122,7 +1125,7 @@ def test_a_coefficient_and_a_reduction_that_do_not_reconcile_are_a_conflict_mark
     c = _row_coefficient(o, doc, ver, "0.9", "מקדם מיקום")
     other = _row_coefficient(o, doc, ver, "0.8", "מקדם שיתוף במקרקעין")
     r = _reduction(o, doc, ver, "15", "מיקום", "בשל מיקום נקבעה הפחתה של 15%")
-    (block,) = timeline.breakdown(o.ws, {c, r})
+    (block,) = timeline.breakdown(o.ws, {c, other, r})
     rows = {row["sid"]: row for row in block["rows"]}
     assert set(rows) == {c, other, r} and "reduction" not in rows[c]
     assert rows[c]["marks"] == ["conflict"] and rows[c]["conflict_with"] == [r]
@@ -1136,10 +1139,11 @@ def test_a_conflicting_pair_with_no_components_table_of_its_own_is_a_block_of_it
     doc, ver = _unit(o)
     c = _row_coefficient(o, doc, ver, "0.9", "מקדם מיקום")
     r = _reduction(o, doc, ver, "15", "מיקום", "הפחתה של 15%")
-    (block,) = timeline.breakdown(o.ws, {c})
+    (block,) = timeline.breakdown(o.ws, {c, r})
     assert [row["sid"] for row in block["rows"]] == [c, r]
     assert all(row["marks"] == ["conflict"] for row in block["rows"])
     assert o.blocks({c, r}) == []
+    assert timeline.breakdown(o.ws, {c}) == [], "the answer uses one of the two: no table, and the other is not a row"
 
 
 def test_a_coefficient_and_a_percent_of_different_considerations_are_two_rows_and_not_reconciled():
@@ -1160,10 +1164,10 @@ def test_a_percent_with_no_reduction_cue_is_not_reconciled_with_the_coefficient(
     o = Office()
     doc, ver = _unit(o)
     c = _row_coefficient(o, doc, ver, "0.9", "מקדם מיקום")
-    _row_coefficient(o, doc, ver, "0.8", "מקדם שיתוף במקרקעין")
+    other = _row_coefficient(o, doc, ver, "0.8", "מקדם שיתוף במקרקעין")
     r = _reduction(o, doc, ver, "10", "מיקום", "שיעור מיקום של 10%")  # a rate of the same consideration, no reduction word
     assert timeline.reconciled(o.ws, {c, r}) == []
-    (block,) = timeline.breakdown(o.ws, {c, r})
+    (block,) = timeline.breakdown(o.ws, {c, other, r})
     assert all("reduction" not in row and "conflict" not in row["marks"] for row in block["rows"])
     assert o.ws.computations == {} and timeline.register_derived(o.ws, {c, r}) == set()
 
@@ -1173,11 +1177,11 @@ def test_a_coefficient_and_a_percent_of_two_appraisal_units_are_unrelated_whatev
     doc = o.doc()
     ver1, ver2 = uuid.uuid4(), uuid.uuid4()
     c = _row_coefficient(o, doc, ver1, "0.9", "מקדם מיקום")
-    _row_coefficient(o, doc, ver1, "0.8", "מקדם שיתוף במקרקעין")
+    other = _row_coefficient(o, doc, ver1, "0.8", "מקדם שיתוף במקרקעין")
     same = _reduction(o, doc, ver2, "10", "מיקום", "הפחתה של 10%")  # reconciles in amount, in another unit
     wrong = _reduction(o, doc, ver2, "15", "מיקום", "הפחתה של 15%")
     assert timeline.reconciled(o.ws, {c, same, wrong}) == []
-    (block,) = timeline.breakdown(o.ws, {c})
+    (block,) = timeline.breakdown(o.ws, {c, other})
     assert all(row["marks"] == [] and "reduction" not in row for row in block["rows"])
     assert not any("conflict" in row["marks"] for b in timeline.breakdown(o.ws, {c, same, wrong}) for row in b["rows"])
 
@@ -1225,3 +1229,212 @@ def test_unknown_key_fields_with_no_span_keep_a_bucket_of_their_own_per_registra
     b = o.value(doc, "7", as_of("2025-03-31"), kind="unknown", version=ver)
     built = timeline.buckets(o.ws, {a, b})
     assert sorted(len(x.members) for x in built) == [1, 1]
+
+
+# --- round 14 U6: rows from the final answer, each with a structured state (R9, R11, R12, R13, R16; KTD7, KTD8; AE9) ---------------
+
+FIRST, SECOND, THIRD = "מקדם הפחתה בשל מגבלות בנייה", "מקדם הפחתה בשל שיתוף במקרקעין", "מקדם הפחתה בשל סחירות"
+
+
+def _three_in_a_unit(o: Office) -> tuple[str, str, str]:
+    doc, ver = _unit(o)
+    return tuple(_coefficient(o, doc, amount, as_of("2025-03-31"), written, version=ver)
+                 for amount, written in (("0.8", FIRST), ("0.9", SECOND), ("0.95", THIRD)))
+
+
+def test_ae9_a_registered_value_the_answer_does_not_use_is_no_row_of_the_components_table_and_a_lone_used_one_is_no_table():
+    o = Office()
+    a, b, c = _three_in_a_unit(o)
+    (block,) = timeline.breakdown(o.ws, {a, c})
+    assert [r["sid"] for r in block["rows"]] == [a, c] and b not in timeline.row_ids([block])
+    assert SECOND not in timeline.payload(o.ws, {a, c})["text"], "the unused value is in no copy of the table either"
+    # R16: the answer lost the claim of the second: its row leaves, and the one left alone is in the answer's text only
+    assert timeline.breakdown(o.ws, {a}) == [] and o.blocks({a}) == []
+    assert timeline.payload(o.ws, {a})["breakdown"] == [] and timeline.payload(o.ws, {a})["text"] is None
+
+
+def test_an_undecided_mark_names_only_rows_on_screen_and_an_absent_counterpart_is_named_as_not_in_the_answer():
+    o = Office()
+    doc, ver = _unit(o)
+    stated = _coefficient(o, doc, "0.8", as_of("2025-03-31"), FIRST, version=ver)
+    bare = _coefficient(o, doc, "0.9", as_of("2025-03-31"), None, version=ver)
+    away = _coefficient(o, doc, "0.95", as_of("2025-03-31"), None, version=ver)  # registered, not used by the answer
+    (block,) = timeline.breakdown(o.ws, {stated, bare})
+    rows = {r["sid"]: r for r in block["rows"]}
+    assert set(rows) == {stated, bare} and rows[bare]["marks"] == ["undecided"] and rows[bare]["undecided_with"] == [stated]
+    value = o.ws.values[away]
+    assert rows[bare]["not_in_answer_with"] == [{"sid": away, "title": value.title, "location": value.location}]
+    named = {x for r in rows.values() for k in ("undecided_with", "conflict_with") for x in r.get(k, [])}
+    assert named <= set(rows), "no mark names a value that has no row"
+    assert rows[bare]["state"]["comparison"] == {"status": "undecided", "with": [stated]}
+    text = timeline.plain_text([], [block])
+    assert timeline.MSG_NOT_IN_ANSWER.format(title=value.title, location=value.location) in text and away not in text
+
+
+def test_a_conflict_with_a_value_off_screen_keeps_the_mark_and_names_it_as_not_in_the_answer():
+    o = Office()
+    doc, ver = _unit(o)
+    c = _row_coefficient(o, doc, ver, "0.9", "מקדם מיקום")
+    other = _row_coefficient(o, doc, ver, "0.8", "מקדם שיתוף במקרקעין")
+    r = _reduction(o, doc, ver, "15", "מיקום", "בשל מיקום נקבעה הפחתה של 15%")  # does not reconcile with 0.9: a conflict, not used
+    (block,) = timeline.breakdown(o.ws, {c, other})
+    row = {x["sid"]: x for x in block["rows"]}[c]
+    assert "conflict" in row["marks"] and "conflict_with" not in row, "the mark stays, and names no row that is not on screen"
+    assert [x["sid"] for x in row["not_in_answer_with"]] == [r] and row["state"]["comparison"] == {"status": "conflict", "with": []}
+    assert row["not_in_answer_with"][0]["title"] and r not in timeline.row_ids([block])
+    (both,) = timeline.breakdown(o.ws, {c, other, r})
+    named = {x["sid"]: x for x in both["rows"]}
+    assert named[c]["conflict_with"] == [r] and "not_in_answer_with" not in named[c], "used: a row, named as before"
+
+
+def test_a_history_row_of_a_cited_value_is_labelled_history_with_its_reading_state_and_a_cited_row_is_not():
+    o = Office()
+    new = _coefficient(o, o.doc(), "0.8", as_of("2025-03-31"), FIRST)
+    old = _coefficient(o, o.doc(), "0.85", as_of("2023-03-31"), FIRST)  # another appraisal of the property, not cited
+    (g,) = o.blocks({new})
+    rows = {r["sid"]: r for r in g["rows"]}
+    assert rows[new]["state"]["support"] == "cited" and "note" not in rows[new]
+    assert rows[old]["state"]["support"] == "history" and rows[old]["state"]["reading"] == "verified"
+    assert rows[old]["note"] == timeline.MSG_HISTORY and rows[new]["state"]["comparison"]["status"] == "same"
+    assert rows[old]["state"]["comparison"]["with"] == [new]
+    text = timeline.plain_text([g])
+    assert text.count(timeline.MSG_HISTORY) == 1
+
+
+FACET_STATES = [
+    (datum.none(), "none", "not_in_range"), (datum.none(datum.REASON_NOT_NEEDED), "none", "not_needed"),
+    (datum.unparsed(datum.REASON_INTERVENING, "preceding_sentence"), "unparsed", "intervening_value"),
+    (datum.unparsed(datum.REASON_TWO_COMPONENTS, "paragraph"), "unparsed", "two_components"),
+    (datum.not_read(datum.REASON_CAP), "not_read", "cap"), (datum.not_read(datum.REASON_PICTURE_CELL), "not_read", "picture_cell"),
+    (datum.not_read(), "not_read", "other"),
+]
+
+
+def test_each_component_state_and_reason_renders_its_own_sentence_and_every_row_carries_a_reason():
+    o = Office()
+    doc, ver = _unit(o)
+    stated = _coefficient(o, doc, "0.5", as_of("2025-03-31"), FIRST, version=ver)
+    rows = [o.value(doc, f"0.{n}", as_of("2025-03-31"), kind="coefficient", unit="ratio", version=ver, facet=f, section="3. מקדמים")
+            for n, (f, _, _) in enumerate(FACET_STATES, 6)]
+    (block,) = timeline.breakdown(o.ws, {stated, *rows})
+    by = {r["sid"]: r for r in block["rows"]}
+    assert by[stated]["state"]["component"]["status"] == "stated" and by[stated]["facet"] == FIRST
+    texts = []
+    for sid, (_, status, reason) in zip(rows, FACET_STATES, strict=True):
+        state = by[sid]["state"]
+        assert (state["component"]["status"], state["component"]["reason"], state["reason"]) == (status, reason, reason)
+        texts.append(by[sid]["facet"])
+    assert len(set(texts)) == len(texts), "each state and reason has its own sentence"
+    assert all(by[s]["state"]["reason"] for s in by), "every row has a row-level reason"
+    for sid, (_, status, _) in zip(rows, FACET_STATES, strict=True):
+        if status == "not_read":
+            assert by[sid]["facet"] != timeline.MSG_NO_FACET and "לא צוין" not in by[sid]["facet"]
+    assert by[rows[0]]["facet"] == timeline.FACET_TEXT[("none", "not_in_range")]
+    assert by[rows[1]]["facet"] == timeline.MSG_NO_FACET, "a family that needs no component keeps today's wording"
+    assert by[stated]["state"]["reason"] == by[stated]["state"]["comparison"]["status"]
+
+
+def test_the_reading_state_says_uncertain_when_the_value_cannot_be_presented_as_certain():
+    o = Office()
+    doc, ver = _unit(o)
+    ok = _coefficient(o, doc, "0.8", as_of("2025-03-31"), FIRST, version=ver)
+    bad = _coefficient(o, doc, "0.9", as_of("2025-03-31"), SECOND, version=ver)
+    o.ws.uncertain_values[bad] = "אזור לא ברור"
+    (block,) = timeline.breakdown(o.ws, {ok, bad})
+    by = {r["sid"]: r for r in block["rows"]}
+    assert by[ok]["state"]["reading"] == "verified" and by[bad]["state"]["reading"] == "uncertain" and "uncertain" in by[bad]["marks"]
+
+
+def test_a_row_carries_the_verification_result_of_the_claim_that_cites_it():
+    o = Office()
+    a, b, c = _three_in_a_unit(o)
+    claims = {a: {"result": "supported", "reason": None}, b: {"result": "partial", "reason": "absent_from_source"}}
+    (block,) = timeline.payload(o.ws, {a, b, c}, claims=claims)["breakdown"]
+    by = {r["sid"]: r["state"]["claim"] for r in block["rows"]}
+    assert by[a] == {"result": "supported", "reason": None} and by[b] == {"result": "partial", "reason": "absent_from_source"}
+    assert by[c] == {"result": "not_checked", "reason": None}, "used, and no claim record names it"
+    (plain,) = timeline.payload(o.ws, {a, b, c})["breakdown"]
+    assert all(r["state"]["claim"] is None for r in plain["rows"]), "no verification report given: the claim is not stated"
+
+
+def _report(units: list, claims: dict, problems: list = ()):
+    from app.chat.verify import VerifyReport
+
+    return VerifyReport(units, problems=list(problems), claims=claims)
+
+
+def _unit_of(index: int, ids: list[str]):
+    from app.chat.verify import Unit
+
+    return Unit(index, f"טענה {index} [{ids[0]}]", f"טענה {index}", ids)
+
+
+def _record(unit, verdict: str, **kw):
+    from app.chat.verify import ClaimRecord
+
+    return ClaimRecord(f"c{unit.index}", f"u{unit.index}", unit.index, 0, 5, unit.text, "datum", verdict, **kw)
+
+
+def test_claim_states_read_the_verification_records_of_the_units_that_stay_and_a_qualified_claim_is_partial():
+    from app.chat.verify import Problem
+
+    o = Office()
+    a, b, c = _three_in_a_unit(o)
+    ua, ub, uc = _unit_of(0, [a]), _unit_of(1, [b]), _unit_of(2, [c])
+    qualified = _record(ub, "partial", action="qualified")
+    partial = Problem(ub, "חלק מהטענה חסר", severity="partial", failure_kind="wrong_unit", check="judge", claim_id=qualified.id)
+    report = _report([ua, ub, uc], {0: [_record(ua, "supported")], 1: [qualified], 2: [_record(uc, "unsupported", failure="wrong_subject")]},
+                     [partial])
+    states = timeline.claim_states(o.ws, report)
+    assert states[a] == {"result": "supported", "reason": None}
+    assert states[b] == {"result": "partial", "reason": "wrong_unit"}, "a qualified claim is partial, with its reason class"
+    assert states[c]["result"] == "unsupported" and states[c]["reason"] == "wrong_subject"
+
+
+def test_claim_states_skip_a_removed_unit_and_reach_a_value_through_the_calculation_that_cites_it():
+    from app.chat.verify import Problem
+
+    o = Office()
+    a, b, _ = _three_in_a_unit(o)
+    ua, ub = _unit_of(0, [a]), _unit_of(1, [b])
+    removed = Problem(ub, "לא נמצא", failure_kind="absent_from_source", check="judge")
+    report = _report([ua, ub], {0: [_record(ua, "supported")], 1: [_record(ub, "unsupported")]}, [removed])
+    assert set(timeline.claim_states(o.ws, report)) == {a}, "the removed unit's claim is no claim of the answer"
+    from app.chat import verify
+
+    cid = verify.derive_reduction(o.ws, a)  # 1 − V1: the calculation rests on the coefficient
+    uc = _unit_of(2, [cid])
+    both = _report([uc], {2: [_record(uc, "partial", action="qualified")]})
+    assert timeline.claim_states(o.ws, both)[a]["result"] == "partial", "a calculation's inputs share its claim"
+
+
+def test_a_context_facet_carries_its_location_a_clipped_quote_and_an_anchor_slot_but_never_the_raw_stub():
+    o = Office()
+    doc, ver = _unit(o)
+    long = " ".join(["עוצמת ניצול"] * 30)
+    context = datum.facet(long, "preceding_sentence", "context", block=3, sentence=1, at={"segments": [[3, 0, 20]]})
+    a = o.value(doc, "0.8", as_of("2025-03-31"), kind="coefficient", unit="ratio", version=ver, facet=context, section="3. מקדמים")
+    b = _coefficient(o, doc, "0.9", as_of("2025-03-31"), SECOND, version=ver)
+    (block,) = timeline.breakdown(o.ws, {a, b})
+    by = {r["sid"]: r for r in block["rows"]}
+    ctx = by[a]["state"]["component"]["context"]
+    assert set(ctx) == {"location", "quote", "anchor"} and ctx["anchor"] is None and ctx["location"]
+    assert 0 < len(ctx["quote"]) <= 120 and ctx["quote"] == long[:len(ctx["quote"])]
+    assert "segments" not in str(block) and "'at'" not in str(block), "the raw stub is never sent"
+    own = by[b]["state"]["component"]
+    assert own["context"] is None and (own["status"], own["part"], own["tier"], own["written"]) == ("stated", "row", "own", SECOND)
+    assert (by[a]["state"]["component"]["part"], by[a]["state"]["component"]["tier"]) == ("preceding_sentence", "context")
+
+
+def test_a_reconciled_pair_that_ends_with_no_visible_row_registers_no_derived_calculation():
+    o = Office()
+    doc, ver = _unit(o)
+    c = _row_coefficient(o, doc, ver, "0.9", "מקדם מיקום")
+    other = _row_coefficient(o, doc, ver, "0.8", "מקדם שיתוף במקרקעין")
+    r = _reduction(o, doc, ver, "10", "מיקום", "בשל מיקום נקבעה הפחתה של 10%")
+    assert timeline.register_derived(o.ws, {c, r}) == set() and o.ws.computations == {}, "one used row: no table, no C#"
+    assert timeline.breakdown(o.ws, {c, r}) == []
+    added = timeline.register_derived(o.ws, {c, other, r})
+    assert len([i for i in added if i in o.ws.computations]) == 1
+    (block,) = timeline.breakdown(o.ws, {c, other, r})
+    assert block["rows"][0]["derived"] in added

@@ -923,8 +923,14 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
     # (and the documents) the payload carries
     # round 12 U8 (R12, KTD7): the coverage of the time-ranked calls whose results the answer cites (a V# or M# is read
     # through the passages behind it), else of the turn's calls together; no record in off mode, so no ``coverage`` key
-    answer_time = timeline.payload(ws, used, coverage=timeline.coverage_of(ws, used))  # ids that are no V# or M# match no value
-    # round 13 U6 (KTD7): the components table's rows open their sources the same way
+    # round 14 U6 (KTD7, KTD8): the components table is built from the used ids (the final text's citations and their calculations'
+    # inputs) alone, and each row states the verification result of the claim that cites it (``claim_states``)
+    answer_time = timeline.payload(ws, used, coverage=timeline.coverage_of(ws, used),  # ids that are no V# or M# match no value
+                                   claims=timeline.claim_states(ws, outcome.report))
+    # round 13 U6 (KTD7): the rows open their sources the same way. Round 14 U6: the components rows are used values already, so only
+    # a history row (one datum's other rows, ``state.support: history``) adds an entry; a value the answer does not use and that is no
+    # row — however many the turn registered — adds none, and a mark's counterpart that is not in the answer (``not_in_answer_with``)
+    # adds none
     used |= timeline.row_ids([*answer_time["timeline"], *answer_time["breakdown"]])
     measurements = [ws.measurements[i].public() for i in ws.measurements if i in used]
     computations = [ws.computations[i].public() for i in ws.computations if i in used]

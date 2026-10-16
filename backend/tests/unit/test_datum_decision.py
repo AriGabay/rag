@@ -140,9 +140,9 @@ def test_ae2_the_undecided_mark_names_the_counterpart_and_is_neither_a_conflict_
                         facet=datum.facet("התזרים דמי שכירות משרדים", "sentence", "own"), section="3")
     offices, bare = c.ids["cap.offices"], c.ids["cap.bare"]
     # round 13 U6 (KTD7): the rates of the appraisal's own date are its components table; the timeline keeps the earlier row
-    (block,) = c.o.blocks({offices})
+    (block,) = c.o.blocks({offices, bare})
     assert [r["sid"] for r in block["rows"]] == [earlier] and block["rows"][0]["marks"] == []  # 2022 and 2023 do not overlap
-    (table,) = timeline.breakdown(c.ws, {offices})
+    (table,) = timeline.breakdown(c.ws, {offices, bare})
     rows = {r["sid"]: r for r in table["rows"]}
     assert earlier not in rows and offices in rows and bare in rows
     # round 13 follow-up: the mark is on the unresolved side only. The bare rate (no facet) is undecided against every rate with
@@ -169,17 +169,17 @@ def test_equal_numbers_of_two_cash_flows_stay_two_rows():
 def test_ae3_the_same_consideration_conflicts_across_appraisals_but_the_equal_written_forms_do_not():
     c = Case("AE3")
     coefs = [f"conflict_{n}.coef" for n in (1, 2, 3, 4)]
+    # the other coefficient of each appraisal (1.1 in all four) is a datum of its own, and 1.1 = 1.1
+    locations = [f"conflict_{n}.location" for n in (1, 2, 3, 4)]
     bucket = c.bucket(*coefs)
     expected = _CASES["AE3"]["expected"]
     assert _refs(bucket.conflicts()) == {frozenset(c.sids(*p)) for p in expected["conflicting_pairs"]}
     assert coverage.conflicting(c.ws)
     # round 13 U6 (KTD7): each coefficient sits beside its appraisal's other coefficient at the one date, so its row is in that
     # appraisal's components block (a row belongs to one block), and the conflict mark is on it there
-    assert c.o.blocks(c.sids(*coefs)) == []
-    marks = {r["sid"]: r["marks"] for b in timeline.breakdown(c.ws, c.sids(*coefs)) for r in b["rows"]}
+    assert c.o.blocks(c.sids(*coefs, *locations)) == []
+    marks = {r["sid"]: r["marks"] for b in timeline.breakdown(c.ws, c.sids(*coefs, *locations)) for r in b["rows"]}
     assert all("conflict" in marks[c.ids[n]] for n in coefs)
-    # the other coefficient of each appraisal (1.1 in all four) is a datum of its own, and 1.1 = 1.1
-    locations = [f"conflict_{n}.location" for n in (1, 2, 3, 4)]
     assert not bucket.conflicts(lambda d: d.ref in c.sids(*locations))
 
 
