@@ -15,7 +15,9 @@ answer with its registry; the editors keep their own logic and write through ``D
 The spans a kind covers:
 
 - ``marker``: «[N: חלק שלא אומת הושמט]», in place of a claim's span cut from a sentence (the edit ladder, step 2), with N
-  its ordinal in the final text; ``partial_mark``: " *(אומת חלקית)*" after a partly supported sentence;
+  its ordinal in the final text; ``partial_mark``: " *(אומת חלקית)*" after a partly supported sentence — the one span
+  that also carries its ordinal among the marks of the final text and the claim ids of the unit it marks (round 14 U7,
+  KTD9: ids, never text), so the client links it to the diagnostics entries of those claims;
   ``qualifier``: a qualifier written next to a number, or after a total row whose component went; ``citation``: a
   ``[S#]`` inserted for support the server found;
 - ``removal_note``: the note that says how many claims were removed; ``replacement``: the sentence that replaces an
@@ -86,14 +88,21 @@ def strip_server_spans(markdown: str, spans) -> str:
 
 @dataclass(frozen=True)
 class ServerSpan:
-    """A run of the final Markdown the server wrote: offsets and a fixed kind (``SERVER_KINDS``), never its text."""
+    """A run of the final Markdown the server wrote: offsets and a fixed kind (``SERVER_KINDS``), never its text. A
+    ``partial_mark`` also has its ``ordinal`` (1, 2, ... in the text's order, like the ordinal of a cut marker) and the
+    ``claim_ids`` of the unit it marks (round 14 U7, KTD9); every other kind has neither."""
 
     start: int
     end: int
     kind: str
+    ordinal: int = 0
+    claim_ids: tuple[str, ...] = ()
 
     def as_dict(self) -> dict:
-        return {"start": self.start, "end": self.end, "kind": self.kind}
+        out = {"start": self.start, "end": self.end, "kind": self.kind}
+        if self.kind == "partial_mark":
+            out |= {"ordinal": self.ordinal, "claim_ids": list(self.claim_ids)}
+        return out
 
 
 class Doc:
@@ -159,13 +168,18 @@ class Doc:
     def refs(self) -> list[tuple[ServerSpan, tuple]]:
         """Each server span with what the composer linked it to, in the text's order."""
         out: list[tuple[ServerSpan, tuple]] = []
-        i, n = 0, len(self.text)
+        i, n, marks = 0, len(self.text), 0
         while i < n:
             tag, j = self._tag[i], i
             while j < n and self._tag[j] == tag:
                 j += 1
             if tag:
-                out.append((ServerSpan(i, j, self._kind[tag]), self._ref[tag]))
+                kind, ref = self._kind[tag], self._ref[tag]
+                if kind == "partial_mark":  # the mark's place among the marks of the text, and the claims it covers
+                    marks += 1
+                    out.append((ServerSpan(i, j, kind, marks, tuple(ref)), ref))
+                else:
+                    out.append((ServerSpan(i, j, kind), ref))
             i = j
         return out
 
@@ -248,7 +262,9 @@ def compose(ws, answer: FinalAnswer, report, turn, *, question: str, limit_sente
         edited.status = built.status
         _take_appended(doc, built.answer_markdown, "membership_note" if ledger.get("membership") else "coverage_note")
     report.mark_markers(doc.renumber("marker", MARKER))
-    return Composition(edited.answer(answer), doc.spans(), outcomes, ledger, doc.origins())
+    spans = doc.spans()
+    report.mark_partials([(s.ordinal, s.claim_ids) for s in spans if s.kind == "partial_mark"])
+    return Composition(edited.answer(answer), spans, outcomes, ledger, doc.origins())
 
 
 def _unread_notice(ws, doc: Doc, report, question: str) -> list[dict]:

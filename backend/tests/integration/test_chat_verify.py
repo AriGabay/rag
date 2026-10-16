@@ -243,7 +243,7 @@ def test_the_rows_of_the_normal_payload_name_the_claim_the_action_and_the_marker
     assert [r["text"] for r in rows] == [verify.REMOVAL_SENTENCES["absent_from_source"]] * 2
     assert set(m["answer"]["verification"]) <= {"judged", "judge_status", "removed", "partial", "annotated",
                                                 "request_mismatch", "conditional", "correctness", "completeness",
-                                                "removals", "final_digest", "actions", "edited"}
+                                                "removals", "final_digest", "actions", "edited", "partials"}
 
 
 def test_every_handled_claim_has_a_log_entry_with_the_whole_record_and_the_rows_pair_with_it_by_claim_id(
@@ -280,7 +280,9 @@ def test_every_handled_claim_has_a_log_entry_with_the_whole_record_and_the_rows_
 def test_the_serialized_answer_holds_no_draft_text_and_its_registry_only_offsets_and_kinds(client, setup, monkeypatch):
     m = _handled_turn(client, setup, monkeypatch)
     spans = m["answer"][SERVER_SPANS_FIELD]
-    assert spans and all(set(s) == {"start", "end", "kind"} for s in spans)
+    # a mark also carries its ordinal and the claims it covers (round 14 U7, KTD9); no other span does
+    assert spans and all(set(s) == ({"start", "end", "kind", "ordinal", "claim_ids"} if s["kind"] == "partial_mark"
+                                    else {"start", "end", "kind"}) for s in spans)
     assert {s["kind"] for s in spans} >= {"marker", "partial_mark", "removal_note"}
     assert all(m["content"][s["start"]:s["end"]] for s in spans)
     shown = json.dumps(m["answer"], ensure_ascii=False)
@@ -322,3 +324,61 @@ def test_a_message_stored_before_claim_rows_and_the_registry_still_serializes(cl
                               "text": verify.REMOVAL_SENTENCES["absent_from_source"]}]
     assert "final_digest" not in v and "actions" not in v and shown["answer"]["claims"]  # its own, as stored
     assert client.get(f"/api/chat/messages/{m['id']}/diagnostics").status_code == 200
+
+
+# --- round 14 U7 (R14, KTD9, AE10): a partial mark pairs with one diagnostics entry and opens its detail ------------------
+
+def test_a_partial_mark_pairs_with_one_diagnostics_entry_by_claim_id_and_the_normal_path_has_only_the_class_sentence(
+        client, setup, monkeypatch):
+    m = _handled_turn(client, setup, monkeypatch)
+    v = m["answer"]["verification"]
+    marks = [s for s in m["answer"][SERVER_SPANS_FIELD] if s["kind"] == "partial_mark"]
+    # one row per mark, in the text's order: the sentence the final check found only partly supported once its clause was
+    # cut, and the marked rent sentence
+    assert len(marks) == len(v["partials"]) == 2
+    assert [s["ordinal"] for s in marks] == [row["ordinal"] for row in v["partials"]] == [1, 2]
+    log = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["removed"]
+    for span, row in zip(marks, v["partials"], strict=True):
+        assert span["claim_ids"] == row["claim_ids"] and row["claim_id"] == row["claim_ids"][0]
+        assert re.fullmatch(r"k[0-9a-f]{12}", row["claim_id"])
+        assert {k for k in row} == {"ordinal", "claim_id", "claim_ids", "failure_kind", "check", "text"}
+        # every mark pairs with exactly one diagnostics entry per claim id, and the entry states the detail
+        for cid in row["claim_ids"]:
+            (entry,) = [e for e in log if e["claim_id"] == cid]
+            assert entry["action"] in ("qualified", "cut")
+            assert entry["supported"] and entry["not_verified"] and set(entry["checked"]) == {"sources", "rereads"}
+            assert entry["checked"]["sources"] == ["S1"] and entry["why"]["check"]
+    rent = v["partials"][1]
+    assert rent["text"] == verify.PARTIAL_SENTENCES["unspecified"] and rent["failure_kind"] is None
+    assert rent["check"] == "judge"
+    (qualified,) = [e for e in log if e["claim_id"] == rent["claim_id"]]
+    assert qualified["supported"].startswith("דמי הניהול בנוסף") and qualified["why"] == {
+        "failure_kind": None, "check": "judge"}
+    assert "דמי הניהול בנוסף" not in json.dumps(v, ensure_ascii=False)  # no draft text
+    # the owner may open the detail; the entries of the stored record are the ones served
+    assert m["can_view_diagnostics"] is True
+    assert [e["claim_id"] for e in _diagnostics_row(setup, m["id"]).removed] == [e["claim_id"] for e in log]
+
+
+def test_another_office_user_is_refused_the_diagnostics_of_a_message_with_partial_marks(client, setup, monkeypatch):
+    m = _handled_turn(client, setup, monkeypatch)
+    assert m["answer"]["verification"]["partials"] and m["can_view_diagnostics"] is True
+    make_user(setup, "emp2@example.test", [setup.g3])
+    login(client, "emp2@example.test")
+    assert client.get(f"/api/chat/messages/{m['id']}/diagnostics").status_code == 404
+    assert client.get(f"/api/chat/messages/{m['id']}").status_code == 404  # not theirs: nothing, so no flag either
+
+
+def test_a_message_stored_before_partial_rows_reads_with_none_and_without_error(client, setup, monkeypatch):
+    m = _handled_turn(client, setup, monkeypatch)
+    with tenant_tx(setup.system) as conn:
+        old = conn.execute(text("SELECT answer FROM messages WHERE id = :m"), {"m": m["id"]}).scalar_one()
+        old["verification"].pop("partials")
+        for span in old[SERVER_SPANS_FIELD]:
+            span.pop("ordinal", None), span.pop("claim_ids", None)
+        conn.execute(text("UPDATE messages SET answer = CAST(:a AS jsonb) WHERE id = :m"),
+                     {"a": json.dumps(old, ensure_ascii=False), "m": m["id"]})
+    shown = client.get(f"/api/chat/messages/{m['id']}")
+    assert shown.status_code == 200
+    assert "partials" not in shown.json()["answer"]["verification"]
+    assert shown.json()["answer"]["verification"]["partial"] == 2

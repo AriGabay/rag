@@ -23,7 +23,10 @@ citation state and offsets stay in the log. The turn's time per stage and per to
 to an office admin (audited), and only while every document behind the answer — the documents every entry was checked
 against and every re-read reached included — is visible to them; those documents are behind the message too
 (``removal_documents``), so revoking one hides both. The registry of the spans the server wrote in the text is saved with
-the answer (``compose.SERVER_SPANS_FIELD``: offsets and a fixed kind, never text).
+the answer (``compose.SERVER_SPANS_FIELD``: offsets and a fixed kind, never text; a partial mark also holds its ordinal and
+the claim ids of its unit, round 14 U7, KTD9). The rows of the normal path also hold one ``verification.partials`` row per
+partial mark (ordinal, claim ids, the fixed sentence of its reason class), and a message says whether the viewer may open
+diagnostics (``can_view_diagnostics``: the message's owner or an office admin).
 
 A clarification that asks for a detail only the user can give (round 7 U7, KTD9, R25) keeps its found values and
 citations, and stores its pending parameter in the answer (``answer.pending``: the component, its parameters, the
@@ -234,7 +237,8 @@ def _stale_after() -> int:
     return get_settings().chat_turn_seconds * STALE_FACTOR + 60
 
 
-def _message_json(r, dv: int | None = None, sh: str | None = None, visible: set | None = None) -> dict:
+def _message_json(r, dv: int | None = None, sh: str | None = None, visible: set | None = None,
+                  ctx: TenantContext | None = None) -> dict:
     status_ = r.status
     error = r.error
     if status_ in ("running", "cancelling") and getattr(r, "age", 0) and r.age > _stale_after():
@@ -256,6 +260,10 @@ def _message_json(r, dv: int | None = None, sh: str | None = None, visible: set 
             "progress": r.progress or [], "answer": answer, "reply_to": str(r.reply_to) if r.reply_to else None,
             "client_id": str(r.client_id) if r.client_id else None, "created_at": r.created_at.isoformat(),
             "stale": stale, "cancel_requested": r.cancel_requested,
+            # whether the viewer may open this answer's diagnostics — what a "verified in part" mark leads to (round 14 U7, R14,
+            # KTD9): the message's owner or an office admin, as ``get_diagnostics`` decides; nothing else of it is told
+            "can_view_diagnostics": bool(ctx is not None and r.role == "assistant" and not (answer or {}).get("hidden")
+                                         and (ctx.is_admin or r.user_id == ctx.user_id)),
             # the time preference the message was produced with (both roles); None: a message from before round 11
             "time_preference": r.time_preference,
             # token counts per model call (no content): the cost and latency of the turn
@@ -280,6 +288,9 @@ def public_verification(v: dict) -> dict:
         k: v[k] for k in ("correctness", "completeness") if k in v} | (
         # each removal's kind, component and the server's fixed sentence, rebuilt here from the kind (KTD5)
         {"removals": public_removals(v["removals"])} if isinstance(v.get("removals"), list) else {}) | (
+        # each "verified in part" mark: its ordinal, claims and the fixed sentence of its reason class (round 14 U7, KTD9);
+        # answers stored before it have none
+        {"partials": public_partials(v["partials"])} if isinstance(v.get("partials"), list) else {}) | (
         # the digest of the saved text and how many claims each action touched (round 8 U7, R17; none on older answers)
         {"final_digest": v["final_digest"]} if isinstance(v.get("final_digest"), str)
         and _DIGEST.fullmatch(v["final_digest"]) else {}) | (
@@ -312,6 +323,28 @@ def public_removals(items: list) -> list[dict]:
                    | ({"claim_id": claim_id} if isinstance(claim_id, str) and _CLAIM_ID.fullmatch(claim_id) else {})
                    | ({"action": action} if action else {})
                    | ({"ordinal": ordinal} if action == "cut" and type(ordinal) is int and ordinal > 0 else {}))
+    return out
+
+
+_CHECK_NAME = re.compile(r"[a-z][a-z_]{0,39}")
+
+
+def public_partials(items: list) -> list[dict]:
+    """The partial-mark rows the normal path shows (round 14 U7, R14, KTD9): the mark's ordinal, the claims it covers (ids
+    only), the failure kind and check when they are known names and the server's fixed sentence of the reason class, rebuilt
+    here from them (``verify.partial_summary``); nothing else that was stored passes. A row without a valid ordinal is dropped."""
+    out = []
+    for r in items:
+        ordinal = r.get("ordinal") if isinstance(r, dict) else None
+        if type(ordinal) is not int or ordinal < 1:
+            continue
+        check = r.get("check")
+        ids = [c for c in r.get("claim_ids") or () if isinstance(c, str) and _CLAIM_ID.fullmatch(c)] \
+            if isinstance(r.get("claim_ids"), list) else []
+        out.append({"ordinal": ordinal}
+                   | verify.partial_summary(r.get("failure_kind"), check if isinstance(check, str)
+                                            and _CHECK_NAME.fullmatch(check) else None)
+                   | ({"claim_id": ids[0], "claim_ids": ids} if ids else {}))
     return out
 
 
@@ -411,7 +444,7 @@ def list_messages(conversation_id: str, before: str | None = None, limit: int = 
         dv = current_data_version(conn)
         visible = _visible_documents(conn, rows)
     sh = scope_hash(ctx)
-    return {"conversation": _conv_json(conv), "messages": [_message_json(r, dv, sh, visible) for r in rows],
+    return {"conversation": _conv_json(conv), "messages": [_message_json(r, dv, sh, visible, ctx) for r in rows],
             "has_more": more}
 
 
@@ -423,7 +456,7 @@ def get_message(message_id: str, ctx: TenantContext = Depends(get_ctx)) -> dict:
             raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
         dv = current_data_version(conn)
         visible = _visible_documents(conn, [r])
-    return _message_json(r, dv, scope_hash(ctx), visible)
+    return _message_json(r, dv, scope_hash(ctx), visible, ctx)
 
 
 @router.get("/messages/{message_id}/diagnostics")
@@ -467,8 +500,8 @@ def send_message(conversation_id: str, body: SendBody, ctx: TenantContext = Depe
                 reply = conn.execute(text(_SELECT + " WHERE m.reply_to = :u ORDER BY m.created_at DESC LIMIT 1"),
                                      {"u": existing.id}).first()
                 visible = _visible_documents(conn, [reply] if reply else [])
-                return {"user": _message_json(existing),
-                        "assistant": _message_json(reply, visible=visible) if reply else None}
+                return {"user": _message_json(existing, ctx=ctx),
+                        "assistant": _message_json(reply, visible=visible, ctx=ctx) if reply else None}
         busy = conn.execute(text("SELECT 1 FROM messages WHERE conversation_id = :c AND role = 'assistant'"
                                  " AND status IN ('running', 'cancelling') AND updated_at > now() - make_interval(secs => :s)"),
                             {"c": conv.id, "s": _stale_after()}).first()
@@ -490,7 +523,7 @@ def send_message(conversation_id: str, body: SendBody, ctx: TenantContext = Depe
         conn.execute(text("UPDATE conversations SET updated_at = now(), engine = 'rag', prefer_recent = :p WHERE id = :c"),
                      {"c": conv.id, "p": prefer_recent})
     _start(ctx, conv.id, assistant.id, user.id)
-    return {"user": _message_json(user), "assistant": _message_json(assistant)}
+    return {"user": _message_json(user, ctx=ctx), "assistant": _message_json(assistant, ctx=ctx)}
 
 
 def _new_assistant(conn: Connection, ctx: TenantContext, conversation_id: UUID, user_message_id: UUID,
@@ -515,7 +548,7 @@ def cancel_message(message_id: str, ctx: TenantContext = Depends(get_ctx)) -> di
         visible = _visible_documents(conn, [r]) if r is not None else set()
     if r is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
-    return _message_json(r, visible=visible)
+    return _message_json(r, visible=visible, ctx=ctx)
 
 
 @router.post("/messages/{message_id}/retry")
@@ -539,7 +572,7 @@ def retry_message(message_id: str, ctx: TenantContext = Depends(get_ctx)) -> dic
                                    _recorded_state(asked.time_preference, asked.created_at))
         conn.execute(text("UPDATE conversations SET updated_at = now() WHERE id = :c"), {"c": r.conversation_id})
     _start(ctx, r.conversation_id, assistant.id, r.reply_to)
-    return _message_json(assistant)
+    return _message_json(assistant, ctx=ctx)
 
 
 # --- the background turn ---------------------------------------------------------------------------------
@@ -961,8 +994,8 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
         # digest is the one the final check returned for the text it verified, which is the saved one (R17)
         "verification": outcome.report.counts() | {"final_digest": digest},
         # where the server wrote in the text: offsets and a kind, never text (the history of a later turn reads it)
-        SERVER_SPANS_FIELD: [{"start": int(sp.start), "end": int(sp.end), "kind": str(sp.kind)}
-                             for sp in outcome.server_spans],
+        # (a partial mark also holds its ordinal and the claim ids of its unit, round 14 U7)
+        SERVER_SPANS_FIELD: [sp.as_dict() for sp in outcome.server_spans],
         "searches": ws.searches, "coverage": ws.coverage, "steps": outcome.steps,
         # the turn limits it reached (tool-output budget, steps, time, visual readings): the answer says so
         "limits_hit": list(ws.limits_hit),

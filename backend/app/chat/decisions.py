@@ -31,6 +31,9 @@ ACTION_REASONS = {
 # the most of a removed claim's original text the log keeps (round 13 U12, KTD14); ``Problem.as_dict`` cuts it at 300
 TEXT_LIMIT = 2000
 REREAD_KEYS = ("source", "scope", "outcome", "reason", "expanded_source")
+# the actions whose entry also states the partial detail (round 14 U7, KTD9): a sentence kept with a part not verified
+DETAIL_ACTIONS = ("qualified", "cut")
+PARTIAL_PREFIX = "נתמך חלקית: "
 
 
 def decision(entry: verify.Logged, sources: list[dict]) -> dict:
@@ -38,7 +41,9 @@ def decision(entry: verify.Logged, sources: list[dict]) -> dict:
     (``text`` and ``remaining``); the verdict and the reason; the failure kind, the check, the component and whether a
     repair was asked (round 7); the cause when the claim could not be checked; the ids checked (``checked_ids``) and the
     sources checked (``sources_checked``, with ``sources`` as the client opens them); the re-reads attempted; the result of
-    the final check on the text as saved."""
+    the final check on the text as saved. A qualified or cut entry also states what a partial mark opens (round 14 U7, R14,
+    KTD9): ``supported`` (the text kept), ``not_verified`` (the claim span, else the judge's reason), ``why`` (the failure
+    kind and the check) and ``checked`` (the sources checked and the re-reads)."""
     p, r, action = entry.problem, entry.record, entry.action
     removed = action in verify.GONE_ACTIONS
     base = p.as_dict() if p is not None else verify.Problem.undecided_dict(entry.unit)
@@ -58,12 +63,29 @@ def decision(entry: verify.Logged, sources: list[dict]) -> dict:
         remaining = MARKER.format(n=entry.ordinal) if entry.ordinal > 0 else ""
     else:
         remaining = claim
+    checked = list(dict.fromkeys(i for rec in entry.records for i in rec.sources_checked))
+    reason = base["reason"] or ACTION_REASONS.get(action, "")
     return base | {
         "claim_id": entry.claim_id, "action": action, "text": original, "remaining": remaining,
         "verdict": r.verdict if r is not None else "",
-        "reason": base["reason"] or ACTION_REASONS.get(action, ""),
+        "reason": reason,
         "cause": base["cause"] or (r.cause if r is not None else ""),
-        "sources_checked": list(dict.fromkeys(i for rec in entry.records for i in rec.sources_checked)),
+        "sources_checked": checked,
         "sources": sources, "rereads": reread,
         "post_check": next((rec.post_check for rec in entry.records if rec.post_check), "n/a"),
-    } | ({"ordinal": entry.ordinal} if action == "cut" and entry.ordinal > 0 else {})
+    } | ({"ordinal": entry.ordinal} if action == "cut" and entry.ordinal > 0 else {}) | (
+        _partial_detail(entry, base, reason, checked, reread) if action in DETAIL_ACTIONS else {})
+
+
+def _partial_detail(entry: verify.Logged, base: dict, reason: str, checked: list[str], reread: list[dict]) -> dict:
+    """What a "verified in part" mark opens for one claim (round 14 U7, KTD9), from what ``decision`` already collected:
+    ``supported`` — the sentence's text as it stays (a cut's span is not in it); ``not_verified`` — the claim's own span, or,
+    when the judge could not tell the parts apart (a whole-unit claim), its reason; ``why`` — the failure kind and the check;
+    ``checked`` — the sources checked and the re-reads, each with its outcome."""
+    r, unit = entry.record, entry.unit
+    span = r.text if r is not None and not r.whole_unit else ""
+    kept = unit.text.replace(span, "", 1) if entry.action == "cut" and span else unit.text
+    return {"supported": " ".join(kept.split())[:TEXT_LIMIT],
+            "not_verified": (span or reason.removeprefix(PARTIAL_PREFIX))[:TEXT_LIMIT],
+            "why": {"failure_kind": base["failure_kind"], "check": base["check"]},
+            "checked": {"sources": checked, "rereads": reread}}

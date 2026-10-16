@@ -4,10 +4,11 @@ cut, collapsed or appended after the span was written. The judge and the model a
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 
-from app.chat import coverage
+from app.chat import coverage, verify
 from app.chat.compose import MARKER, SERVER_KINDS, Doc, compose
 from app.chat.engine import FinalAnswer
 from app.chat.tools import Workspace
@@ -290,3 +291,81 @@ def test_the_unit_that_holds_the_question_is_never_removed_even_when_a_check_fai
     # a draft that is not a clarification has no protected unit
     plain = verify_answer(_judge(lambda t: {"verdict": "supported"}), _answer("הנכס פנוי [S1]."), _ws(), "?", [])
     assert plain.protected == set()
+
+
+# --- round 14 U7 (R14, KTD9, AE10): a partial mark carries its ordinal and the unit's partly supported claims -----------
+
+RENT = "דמי השכירות הם 55 ₪ למ\"ר לחודש"
+
+
+def _partial_report(*, two_claims: bool = False):
+    """The rent sentence is partly supported for an attribute the source does not state (``units``); the first and the
+    last sentence are supported. With ``two_claims`` the rent sentence holds two partly supported claims."""
+    a = _answer(f"הנכס פנוי [S1].\n{RENT} [S1].\nהשווי למ\"ר הוא 9,500 ₪ [S1].\nדמי הניהול הם 12 ₪ למ\"ר לחודש [S1].")
+
+    def respond(text: str) -> dict:
+        if "השכירות" in text and two_claims:
+            return {"verdict": "partial", "defect": "units",
+                    "claims": [{"span": "דמי השכירות הם 55 ₪", "verdict": "partial"},
+                               {"span": "למ\"ר לחודש", "verdict": "partial"}]}
+        if "לחודש" in text:
+            return {"verdict": "partial", "defect": "units"}
+        return {"verdict": "supported"}
+
+    return a, verify_answer(_judge(respond), a, _ws(), "?", [])
+
+
+def _claim_ids(report, needle: str) -> list[str]:
+    """The ids of every claim of the unit that has a claim whose text holds ``needle``."""
+    return [r.id for recs in report.claims.values() if any(needle in x.text for x in recs) for r in recs]
+
+
+def _no_ledger(monkeypatch) -> None:
+    monkeypatch.setattr(coverage, "build", lambda ws, answer, question: ({}, answer))
+
+
+def test_a_partial_mark_span_carries_its_ordinal_and_the_failing_claim_ids_in_the_texts_order():
+    a, r = _partial_report()
+    edited = r.edit(a)
+    marks = [s for s in edited.doc.spans() if s.kind == "partial_mark"]
+    assert [m.ordinal for m in marks] == [1, 2], marks  # two units are marked: the rent and the management fee
+    assert marks[0].claim_ids == tuple(_claim_ids(r, "השכירות")) and len(marks[0].claim_ids) == 1
+    assert marks[1].claim_ids == tuple(_claim_ids(r, "הניהול"))
+    # the registry as saved: offsets and a kind, and a mark's ordinal and claims; no other span carries them
+    saved = [s.as_dict() for s in edited.doc.spans()]
+    assert all(set(s) == ({"start", "end", "kind", "ordinal", "claim_ids"} if s["kind"] == "partial_mark"
+                          else {"start", "end", "kind"}) for s in saved), saved
+    assert [s["ordinal"] for s in saved if s["kind"] == "partial_mark"] == [1, 2]
+
+
+def test_a_unit_with_two_partly_supported_claims_has_one_mark_carrying_both_claim_ids():
+    a, r = _partial_report(two_claims=True)
+    edited = r.edit(a)
+    marks = [s for s in edited.doc.spans() if s.kind == "partial_mark"]
+    rent = [m for m in marks if len(m.claim_ids) > 1]
+    assert len(marks) == 2 and len(rent) == 1, marks
+    assert set(rent[0].claim_ids) == set(_claim_ids(r, "השכירות")) and len(rent[0].claim_ids) == 2
+
+
+def test_compose_records_the_ordinals_of_the_marks_that_reached_the_final_text_on_the_report_and_its_rows(monkeypatch):
+    _no_ledger(monkeypatch)
+    a, r = _partial_report()
+    out = compose(_ws(), a, r, TurnRequirements(), question="?")
+    marks = [s for s in out.spans if s.kind == "partial_mark"]
+    assert [(m.ordinal, m.claim_ids) for m in marks] == r.partial_marks
+    rows = r.counts()["partials"]
+    assert [row["ordinal"] for row in rows] == [1, 2]
+    assert [row["claim_id"] for row in rows] == [m.claim_ids[0] for m in marks]
+    # a row is a failure kind, a check, the claims and the server's fixed sentence: never the sentence's own words
+    assert rows[0]["failure_kind"] == "wrong_unit" and rows[0]["check"] == "judge"
+    assert rows[0]["text"] == verify.PARTIAL_SENTENCES["wrong_unit"]
+    assert RENT not in json.dumps(rows, ensure_ascii=False)
+
+
+def test_every_logged_qualified_claim_of_a_mark_pairs_with_one_diagnostics_entry_by_claim_id(monkeypatch):
+    _no_ledger(monkeypatch)
+    a, r = _partial_report(two_claims=True)
+    compose(_ws(), a, r, TurnRequirements(), question="?")
+    entries = {e.claim_id: e for e in r.logged() if e.action == "qualified"}
+    for row in r.counts()["partials"]:
+        assert row["claim_ids"] and all(cid in entries for cid in row["claim_ids"]), (row, list(entries))

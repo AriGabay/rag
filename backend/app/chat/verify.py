@@ -1190,6 +1190,35 @@ def removal_summary(kind: str, cause: str = "", component: str | None = None) ->
         {"cause": cause} if cause else {})
 
 
+# the server's fixed sentence for each "verified in part" mark on the user's normal path (round 14 U7, R14, KTD9), keyed by the
+# mark's reason class: a failure kind, ``recency`` (the recency check), ``final`` (the final check judged the sentence as saved
+# only partly supported) or ``unspecified`` (a judge that named no concrete defect). Never the claim's text or a judge's words.
+PARTIAL_SENTENCES = {
+    "absent_from_source": "אומת חלקית: חלק מהטענה אינו מצוין במקורות שנבדקו.",
+    "wrong_subject": "אומת חלקית: חלק מהטענה ייחס נתון לנכס או לצד אחר מזה שבמקור.",
+    "wrong_unit": "אומת חלקית: היחידה, התקופה, בסיס השטח או המע\"מ של הנתון אינם מצוינים במקור או אינם כבמקור.",
+    "uncertain_reading": "אומת חלקית: חלק מהטענה נשען על קריאה לא ודאית של המקור.",
+    "contradicts_source": "אומת חלקית: חלק מהטענה סותר את המקור.",
+    "wrong_calculation": "אומת חלקית: חלק מהטענה הוא חישוב שלא אומת במלואו.",
+    "invalid_citation": "אומת חלקית: חלק מהטענה ציטט מקור שלא נבדק בתור הזה.",
+    "not_checked": "אומת חלקית: חלק מהטענה לא נבדק מול המקורות.",
+    "context_not_read": "אומת חלקית: ההקשר שמגדיר חלק מהטענה לא נקרא.",
+    "recency": "אומת חלקית: לא אומת שהנתון הוא העדכני ביותר.",
+    "final": "אומת חלקית: הטענה, כפי שנוסחה בסוף, נתמכת במקורות רק בחלקה.",
+    "unspecified": "אומת חלקית: המקורות תומכים בטענה רק בחלקה.",
+}
+
+
+def partial_summary(failure_kind: str | None, check: str | None = None) -> dict:
+    """A partial mark on the user's normal path (round 14 U7, KTD9): its failure kind and check when known, and the server's
+    fixed sentence for its reason class (``PARTIAL_SENTENCES``) — the recency check first, then the failure kind, then the
+    final check; any other mark is ``unspecified``. The check is the name of a deterministic check, ``judge``, ``dependency``
+    or ``final``."""
+    kind = failure_kind if failure_kind in FAILURE_KINDS else None
+    cls = "recency" if check == RECENCY_CHECK else kind or ("final" if check == "final" else "unspecified")
+    return {"failure_kind": kind, "text": PARTIAL_SENTENCES[cls]} | ({"check": check} if check else {})
+
+
 @dataclass
 class Problem:
     unit: Unit
@@ -1359,6 +1388,9 @@ class VerifyReport:
     # an area basis or a VAT status its source does not state keeps the number; ``plan_qualifier_edits`` decides, ``edit``
     # applies them after the repair rounds, and the final check judges the edited sentence again
     qualifier_edits: dict[int, list[QualifierEdit]] = field(default_factory=dict)
+    # the "verified in part" marks of the final text (round 14 U7, KTD9): each mark's ordinal among the marks and the claim ids
+    # of the unit it marks, in the text's order; set by the composer (``mark_partials``), like the markers' ordinals
+    partial_marks: list[tuple[int, tuple[str, ...]]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -1574,6 +1606,9 @@ class VerifyReport:
                # the server's fixed sentence (KTD5), its claim id, its action and, for a cut, its marker (KTD8), in the
                # text's order; and how many claims each action touched
                "removals": [row.summary() for row in logged if row.action in ROW_ACTIONS],
+               # one row per "verified in part" mark of the final text, with the claims it covers and the fixed sentence of
+               # its reason class (round 14 U7, KTD9); each claim id pairs with a log entry
+               "partials": self.partial_rows(),
                "actions": {a: sum(1 for row in logged if row.action == a) for a in LOG_ACTIONS}}
         if self.completeness is not None:
             out["completeness"] = self.completeness
@@ -1611,6 +1646,34 @@ class VerifyReport:
             for cid in ref:
                 if cid in by_id:
                     by_id[cid].marker = n
+
+    def partial_claim_ids(self, index: int) -> tuple[str, ...]:
+        """The claims a unit's partial mark covers (round 14 U7, KTD9), once each: those its partial problems name (a claim
+        that failed, or the unit's first), then the claims the judge found only partly supported, else the claims the log
+        records as qualified (a unit marked by a check that names no claim, such as the recency check)."""
+        recs = self.claims.get(index, [])
+        ids = [p.claim_id for p in self.problems if p.unit.index == index and p.severity == "partial"
+               and p.resolution != "cut" and p.claim_id]
+        ids += [r.id for r in recs if r.action == "qualified" and r.verdict == "partial"]
+        if not ids:
+            ids = [r.id for r in recs if r.action == "qualified"]
+        return tuple(dict.fromkeys(ids))
+
+    def mark_partials(self, marks: list[tuple[int, tuple[str, ...]]]) -> None:
+        """Record the marks the final text holds (``Doc.spans``: each mark's ordinal and claim ids)."""
+        self.partial_marks = [(n, tuple(ids)) for n, ids in marks]
+
+    def partial_rows(self) -> list[dict]:
+        """The rows of the final text's partial marks (``partial_marks``), in the text's order: ordinal, the claims, and the
+        failure kind, check and fixed sentence of the first partial problem of the unit the claims are in."""
+        rows = []
+        for n, ids in self.partial_marks:
+            idx = next((i for i, recs in self.claims.items() if any(r.id in ids for r in recs)), None)
+            mine = [p for p in self.problems if p.unit.index == idx and p.severity == "partial" and p.resolution != "cut"]
+            p = next((p for p in mine if p.claim_id in ids), mine[0] if mine else None)
+            rows.append({"ordinal": n} | partial_summary(p.failure_kind if p else None, p.check if p else None)
+                        | ({"claim_id": ids[0], "claim_ids": list(ids)} if ids else {}))
+        return rows
 
     def requirement_outcomes(self, applied: FinalAnswer | None = None) -> list[dict]:
         """Each component with its status in the verified answer (KTD3, R6, R7), merged by id across the judge
@@ -1848,8 +1911,9 @@ class VerifyReport:
         spans = [(g.start, g.end) for groups in planned.values() for g in groups]
         blocked = cuts + spans  # a qualifier or a citation never lands inside a removed or replaced span
         edits: list[tuple[int, int, str, str | None, tuple]] = [(a, b, "", None, ()) for a, b in cuts]
-        edits += [(u.end, u.end, PARTIAL_MARK, "partial_mark", ()) for u in self.units if u.index in partial
-                  and not any(a <= u.start < b for a, b in cuts)]
+        # a mark carries the claim ids of its unit (round 14 U7, KTD9)
+        edits += [(u.end, u.end, PARTIAL_MARK, "partial_mark", self.partial_claim_ids(u.index)) for u in self.units
+                  if u.index in partial and not any(a <= u.start < b for a, b in cuts)]
         edits += [(g.start, g.end, MARKER.format(n=0), "marker", g.claims) for groups in planned.values()
                   for g in groups if not any(a <= g.start < b for a, b in cuts)]
         edits += totals
@@ -5304,7 +5368,10 @@ def plan_edits(report: VerifyReport) -> None:
             elif r.parent_id:
                 r.action = "rewritten"
             elif any(p.annotatable or p.resolution == "qualifier" for p in mine) or (r.verdict == "partial" and any(
-                    p.severity == "partial" and p.resolution != "cut" for p in mine)):
+                    p.severity == "partial" and p.resolution != "cut" for p in mine)) or any(
+                    p.severity == "partial" and p.resolution != "cut" and not p.claim_id for p in mine):
+                # the last: a unit marked by a check that names no claim (the recency check) logs each claim it keeps as
+                # qualified, so its mark pairs with log entries (round 14 U7, KTD9)
                 r.action = "qualified"
             elif any(p.kind == "needs_citation" and p.uncited for p in mine):
                 r.action = "cited"
