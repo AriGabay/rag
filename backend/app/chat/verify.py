@@ -3324,6 +3324,10 @@ _LATEST = re.compile(r"(?<![א-ת])(?:[וש]?ה)?(?:עדכני(?:ת|ים|ות)?|
 # "the last year", "in the last month": a period of time, not the latest value
 _TIME_NOUNS = frozenset({"שנה", "שנים", "שנתיים", "חודש", "חודשים", "שבוע", "שבועות", "יום", "ימים", "רבעון", "רבעונים",
                          "תקופה", "עשור", "עשורים", "עונה", "פעם"})
+# "the current opinion", "in the current appraisal": נוכחי / נוכחית after one of these names the document, not the latest value
+# (round 14 U5, KTD10). Only the "current" words are exempt: "the latest appraisal" says the appraisal is the latest.
+_DOCUMENT_NOUNS = frozenset({"שומה", "חוות", "דעת", "דוח", "הערכה", "מסמך", "תחשיב", "נספח"})
+_CURRENT_WORDS = frozenset({"נוכחי", "נוכחית"})
 MSG_NOT_LATEST = ("הטענה קוראת ל-{older} «העדכני», אבל בתור הזה נרשם ערך מאוחר יותר מאותו נתון של אותו נכס: {newer} "
                   "(מועד {when}, {title}). הצג את {newer} כערך העדכני ואת {older} כערך קודם, עם תאריכיהם ומראי המקום "
                   "של שניהם (אל תמחק ערך שנתמך), או השמט את הניסוח «העדכני» / «האחרון»")
@@ -3337,12 +3341,19 @@ MSG_LATEST_UNDECIDED = ("הטענה קוראת ל-{older} «העדכני» / «�
                         "לא הוכרע (אל תמחק ערך שנתמך), או השמט את הניסוח «העדכני» / «האחרון»")
 
 
+def _is_document_noun(word: str) -> bool:
+    """Whether ``word`` is a document noun with up to two prefix letters ("בחוות", "הדעת", "לשומה", "וחוות")."""
+    return any(word[i:] in _DOCUMENT_NOUNS for i in range(min(3, len(word))))
+
+
 def _calls_latest(text: str) -> bool:
     """Whether a unit's words call something the latest, apart from a period of time ("בשנה האחרונה")."""
     for m in _LATEST.finditer(text):
         before = re.findall(r"[א-ת]+", text[max(0, m.start() - 24):m.start()])
         word = re.sub(r"^[בהלמוכש]{1,2}(?=[א-ת]{2,})", "", before[-1]) if before else ""
         if before and (before[-1] in _TIME_NOUNS or word in _TIME_NOUNS):
+            continue
+        if before and re.sub(r"^(?:[וש]?ה)", "", m.group()) in _CURRENT_WORDS and _is_document_noun(before[-1]):
             continue
         return True
     return False

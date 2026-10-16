@@ -272,3 +272,34 @@ def test_a_passage_only_sentence_with_current_wording_that_states_no_amount_rais
 def test_the_round_11_later_value_message_still_wins_when_a_later_value_exists_under_partial_coverage():
     (p,) = _check("השווי העדכני הוא 2,100,000 ₪ [V1].", _covered(_ws(*V), complete=False))
     assert "20/01/2025" in p.reason and "V3" in p.reason
+
+
+# --- "current" that describes the document is no recency claim (round 14 U5, R10, KTD10, AE11) ---------------------------
+
+
+def test_current_after_a_document_noun_is_no_recency_claim_under_partial_coverage():
+    """AE11: "in the current opinion" says which document, not that its value is the latest."""
+    ws = _covered(_ws(*V), complete=False)
+    assert _check("בחוות הדעת הנוכחית הובאה בחשבון הפחתה, והשווי 2,410,000 ₪ [V3].", ws) == []
+    assert _check("בשומה הנוכחית הובאה בחשבון הפחתה, והשווי 2,410,000 ₪ [V3].", ws) == []
+    for noun in ("הדוח", "בהערכה", "במסמך", "בתחשיב", "בנספח", "לשומה", "וחוות הדעת"):
+        assert _check(f"{noun} הנוכחי הובאה בחשבון הפחתה, והשווי 2,410,000 ₪ [V3].", ws) == [], noun
+        assert _check(f"{noun} הנוכחית הובאה בחשבון הפחתה, והשווי 2,410,000 ₪ [V3].", ws) == [], noun
+    for text in ("בחוות הדעת הנוכחית הובאה בחשבון הפחתה, והשווי 2,410,000 ₪ [V3].", "בשומה הנוכחית נקבע שווי של 2,410,000 ₪ [V3]."):
+        assert not verify._calls_latest(text), text
+
+
+def test_the_latest_after_a_document_noun_and_a_latest_value_are_still_recency_claims():
+    """AE11: only נוכחי / נוכחית are exempt; "the latest appraisal" says the appraisal is the latest."""
+    ws = _covered(_ws(*V), complete=False)
+    assert len(_check("בשומה האחרונה נקבע שווי של 2,410,000 ₪ [V3].", ws)) == 1
+    assert len(_check("בדוח העדכני נקבע שווי של 2,410,000 ₪ [V3].", ws)) == 1
+    assert len(_check("השווי העדכני הוא 2,410,000 ₪ [V3].", ws)) == 1
+    assert len(_check("השווי הנוכחי הוא 2,410,000 ₪ [V3].", ws)) == 1, "a current value is not a document noun's current"
+    assert verify._calls_latest("בשומה האחרונה נקבע שווי של 2,410,000 ₪") and verify._calls_latest("השווי העדכני הוא 2,410,000 ₪")
+
+
+def test_a_sentence_with_both_forms_is_still_a_recency_claim():
+    ws = _covered(_ws(*V), complete=False)
+    assert len(_check("בחוות הדעת הנוכחית השווי העדכני הוא 2,410,000 ₪ [V3].", ws)) == 1
+    assert verify._calls_latest("בחוות הדעת הנוכחית השווי העדכני הוא 2,410,000 ₪")
