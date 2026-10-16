@@ -422,3 +422,46 @@ def test_the_same_datum_in_a_later_appraisal_is_a_later_value():
     ((older, newer),) = timeline.later_than(o.ws, {old})
     assert (older.ref, newer.ref) == (old, new)
     assert timeline.later_undecided(o.ws, {old}) == []
+
+
+# --- round 14 U1: rule 0, the source span (R6, R7; KTD1) -------------------------------------------------------------------
+
+def _site(facet: dict | None, span: tuple | None = None) -> datum.Site:
+    return datum.Site("proportion", facet, ("v1", 1), None, "3. היוון", span)
+
+
+_OFFICES = datum.facet("הפחתה בשל עוצמת ניצול", "sentence", "own")
+_PARKING = datum.facet("הפחתה בשל סחירות", "sentence", "own")
+
+
+def test_equal_non_empty_spans_are_one_datum_before_every_other_rule():
+    span = ("quote", "v1", "r1", 4, 17)
+    # the facet rules alone call these two parallel components (own facets, disjoint cores, one unit); the span says one number
+    assert datum.relation(_site(_OFFICES), _site(_PARKING)) == datum.DIFFERENT
+    assert datum.relation(_site(_OFFICES, span), _site(_PARKING, span)) == datum.SAME
+    assert datum.relation(_site(_OFFICES, span), _site(datum.none(), span)) == datum.SAME
+
+
+def test_spans_that_differ_or_are_missing_decide_nothing():
+    a, b = ("quote", "v1", "r1", 4, 17), ("quote", "v1", "r1", 4, 18)
+    assert datum.relation(_site(_OFFICES, a), _site(_PARKING, b)) == datum.DIFFERENT
+    assert datum.relation(_site(_OFFICES, None), _site(_PARKING, None)) == datum.DIFFERENT
+    assert datum.relation(_site(_OFFICES, ()), _site(_PARKING, ())) == datum.DIFFERENT  # an empty span is no span
+    assert datum.relation(_site(_OFFICES, a), _site(datum.none(), None)) == datum.UNDECIDED
+
+
+def test_a_datum_without_a_span_attribute_is_read_as_having_none():
+    class Bare:  # the shape of the stand-ins of older callers: no span
+        family, facet, appraisal, table, section = "proportion", _OFFICES, ("v1", 1), None, "3. היוון"
+
+    assert datum.relation(Bare(), Bare()) == datum.SAME  # equal own cores
+
+
+def test_span_builders_name_the_version_the_reading_and_the_place():
+    anchor = {"segments": [[4, 0, 60]], "number": [4, 17, 20], "pages": [2]}
+    assert datum.quote_span("v1", "r1", anchor) == ("quote", "v1", "r1", 4, 17)
+    assert datum.quote_span("v2", "r1", anchor) != datum.quote_span("v1", "r1", anchor)
+    assert datum.quote_span("v1", "r2", anchor) != datum.quote_span("v1", "r1", anchor)
+    assert datum.quote_span("v1", "r1", {"blocks": [4, 5]}) is None  # block precision: no span
+    assert datum.quote_span("v1", "r1", {}) is None
+    assert datum.cell_span("v1", "r1", 2, 3, 4) == ("cell", "v1", "r1", 2, 3, 4)

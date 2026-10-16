@@ -52,9 +52,9 @@ class Office:
 
     def value(self, doc: uuid.UUID, amount: str, when: dict | None, *, kind: str = "value", unit: str = "ILS",
               period: str = "none", vat: str = "included", area_basis: str = "", provenance: dict | None = None,
-              title: str | None = None, version: uuid.UUID | None = None, **kw) -> str:
-        """``version``: the document version it is in (a new one for each value when not given); ``kw``: more ``calc.Value``
-        fields (``facet``, ``table``, ``section``, ``scale`` ...)."""
+              title: str | None = None, version: uuid.UUID | None = None, span: tuple | None = None, **kw) -> str:
+        """``version``: the document version it is in (a new one for each value when not given); ``span``: its source span
+        (round 14 U1; ``Workspace.spans``); ``kw``: more ``calc.Value`` fields (``facet``, ``table``, ``section``, ``scale`` ...)."""
         vid = f"V{len(self.ws.values) + 1}"
         prov = SOURCE | (provenance or {})
         v = calc.Value(vid, Decimal(amount.replace(",", "")), amount, "S1", doc, version or uuid.uuid4(), "r1",
@@ -63,11 +63,13 @@ class Office:
                        stance="adopted", **kw)
         v.as_of = when
         self.ws.values[vid] = v
+        if span is not None:
+            self.ws.spans[vid] = span
         return vid
 
     def measurement(self, doc: uuid.UUID, amount: str, when: dict | None, *, metric_kind: str = "rent", unit: str = "ILS",
                     period: str = "month", vat: str = "included", area_basis: str = "", stance: str = "adopted",
-                    value_text: str | None = None, facet: dict | None = None) -> str:
+                    value_text: str | None = None, facet: dict | None = None, span: tuple | None = None) -> str:
         mid = f"M{len(self.ws.measurements) + 1}"
         row = SimpleNamespace(id=uuid.uuid4(), metric="דמי שכירות", metric_kind=metric_kind, value=Decimal(amount.replace(",", "")),
                               value_text=value_text or f"{amount} ₪", unit=unit, period=period, vat=vat,
@@ -77,6 +79,8 @@ class Office:
         m.as_of = when
         m.facet = facet
         self.ws.measurements[mid] = m
+        if span is not None:
+            self.ws.spans[mid] = span
         return mid
 
     def blocks(self, cited: set[str]) -> list[dict]:
@@ -990,3 +994,61 @@ def test_of_duplicate_registrations_the_cited_one_is_the_row_and_the_block_is_bu
     (uncited,) = timeline.breakdown(o.ws, {v1})
     assert v1 in {r["sid"] for r in uncited["rows"]} and v3 not in {r["sid"] for r in uncited["rows"]}
     assert [d.ref for d in timeline._dedupe(timeline.datums(o.ws))] == [v1, v2]  # nothing cited: the first registration
+
+
+# --- round 14 U1: the source span is on every datum, and rule 0 reads it (R6, R7; KTD1; AE5) -------------------------------
+
+def _span(block: int, offset: int, version: str = "v1") -> tuple:
+    return ("quote", version, "r1", block, offset)
+
+
+def test_a_datum_carries_the_span_the_workspace_holds_for_its_value_or_measurement():
+    o = Office()
+    doc, ver = _unit(o)
+    v = _coefficient(o, doc, "0.8", as_of("2025-03-31"), "מקדם הפחתה בשל מגבלות בנייה", version=ver)
+    bare = _coefficient(o, doc, "0.9", as_of("2025-03-31"), "מקדם הפחתה בשל שיתוף במקרקעין", version=ver)
+    m = o.measurement(doc, "5,000", as_of("2025-03-31"), span=("cell", "v1", "r1", 2, 3, 4))
+    o.ws.spans[v] = _span(4, 17)
+    by = {d.ref: d for d in timeline.datums(o.ws)}
+    assert by[v].span == _span(4, 17) and by[bare].span is None and by[m].span == ("cell", "v1", "r1", 2, 3, 4)
+
+
+def test_two_registrations_of_one_span_are_one_class_even_when_their_facets_would_decide_otherwise():
+    """Rule 0 (KTD1): a model that registers one number twice, once with a wider quote that reads a component, must not get two
+    classes: the stated facet against the facet that states none is undecided without the span, and the one datum with it."""
+    o = Office()
+    doc, ver = _unit(o)
+    stated = o.value(doc, "10", as_of("2025-03-31"), kind="rate", unit="percent", version=ver, section="3. היוון",
+                     facet=datum.facet("הפחתה בשל עוצמת ניצול", "sentence", "own"), span=_span(2, 40))
+    bare = o.value(doc, "10", as_of("2025-03-31"), kind="rate", unit="percent", version=ver, section="3. היוון",
+                   facet=datum.none(), span=_span(2, 40))
+    (bucket,) = [b for b in timeline.buckets(o.ws, {stated}) if stated in {d.ref for d in b.members}]
+    assert len(bucket.classes) == 1 and list(bucket.pairs.values()) == [datum.SAME]
+    o.ws.spans.pop(bare)  # without the span the same two data are undecided
+    (apart,) = [b for b in timeline.buckets(o.ws, {stated}) if stated in {d.ref for d in b.members}]
+    assert len(apart.classes) == 2 and list(apart.pairs.values()) == [datum.UNDECIDED]
+
+
+def test_ae5_three_adjustments_of_ten_percent_with_three_stated_considerations_are_three_classes_no_conflict_no_undecided():
+    o = Office()
+    doc, ver = _unit(o)
+    ids = [o.value(doc, "10", as_of("2025-03-31"), kind="coefficient", unit="percent", version=ver, section="3. התאמות",
+                   facet=datum.facet(written, "sentence", "own"), span=_span(2 + n, 30))
+           for n, written in enumerate(("הפחתה בשל עוצמת ניצול", "הפחתה בשל סחירות", "הפחתה בשל מגבלות בנייה"))]
+    (bucket,) = [b for b in timeline.buckets(o.ws, set(ids)) if ids[0] in {d.ref for d in b.members}]
+    assert len(bucket.classes) == 3 and bucket.conflicts() == [] and bucket.undecided() == []
+    assert not coverage.conflicting(o.ws)
+    (block,) = timeline.breakdown(o.ws, {ids[0]})
+    assert [r["sid"] for r in block["rows"]] == ids and all(r["marks"] == [] for r in block["rows"])
+
+
+def test_equal_spans_in_two_versions_of_one_document_are_not_the_same_span():
+    """The span names the version: the same block and offset of two versions is two places, decided by the facet rules."""
+    o = Office()
+    doc = o.doc()
+    a = o.value(doc, "10", as_of("2025-03-31"), kind="rate", unit="percent", version=uuid.uuid4(), section="3. היוון",
+                facet=datum.none(), span=_span(2, 40, "v1"))
+    b = o.value(doc, "10", as_of("2025-03-31"), kind="rate", unit="percent", version=uuid.uuid4(), section="3. היוון",
+                facet=datum.facet("הפחתה בשל עוצמת ניצול", "sentence", "own"), span=_span(2, 40, "v2"))
+    by = {d.ref: d for d in timeline.datums(o.ws)}
+    assert by[a].span != by[b].span

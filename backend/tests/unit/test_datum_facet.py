@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.chat import calc, datum
+from app.chat import calc, datum, timeline
 from app.chat import tools as T
 from app.chat.tools import Workspace
 from app.config import get_settings
@@ -387,3 +387,272 @@ def test_the_cache_version_is_v5_and_the_record_round_trips_the_facet(monkeypatc
     out = T.tool_take_value(ws, handle, {}, _given(), "שיעור")
     assert out.startswith("V1 נרשם")
     assert ws.values["V1"].facet == _facet("תזרים דמי שכירות ממשרדים", "sentence")
+
+
+# =======================================================================================================================
+# round 14 U1: a source span on every datum, and one registration for a repeated span (R6, R7, R15; KTD1, KTD2, KTD11)
+# =======================================================================================================================
+
+RATE_TEXT = "שיעור היוון של 6.5% לתזרים דמי שכירות ממשרדים."
+AT = RATE_TEXT.index("6.5")  # the number's offset in its block
+BARE_TEXT = "הערך 0.8 נקבע בנספח."  # states no unit and no kind: whatever the model says of them is its own
+
+
+def _cached_world(monkeypatch, text: str = RATE_TEXT, number: str = "6.5", **given):
+    """One cached value (Q#) of a visible current version, as ``test_cache_keys`` fakes it; its anchor stub is stored, so a
+    registration has an anchor step. Returns the workspace and the Q#."""
+    src = _source(text)
+    taken = T._take_quote(src, text, {"quote": text, "number": number}, [(0, text, 1)])
+    taken["preceding"] = []
+    earlier = _register(taken, _given(**given), src)
+    stub = {"kind": "quote", "document_id": str(DOC), "version_id": str(VER), "reading_id": "r1", "block_start": 0,
+            "block_end": 0, "pages": [1], "section": "3. היוון", **taken["anchor"]}
+    doc = json.loads(json.dumps(T._cache_doc(earlier, taken, (), stub, src, (0, 0)), ensure_ascii=False))
+    monkeypatch.setattr(T, "tenant_tx", lambda ctx: contextlib.nullcontext())
+    monkeypatch.setattr(T, "_bound", lambda conn, ws, handle, data: SimpleNamespace(
+        version_id=VER, document_id=DOC, reading_id="r1", title="שומה סינתטית", partial=False))
+    monkeypatch.setattr(T.contexts, "of_version", lambda conn, vid, reading: T.contexts.derive([], str(vid)))
+    monkeypatch.setattr(T, "_cached_value", lambda conn, version_id, reading_id, locator: doc)
+    ws = Workspace(ctx=None)
+    return ws, T._cached_handle(ws, VER, "r1", DOC, doc["record"]["locator"])
+
+
+# --- the span of a value and of a measurement ------------------------------------------------------------------------
+
+def _taken_quote(text: str, quote: str, number: str, block: int = 0) -> dict:
+    return T._take_quote(_source(text), text, {"quote": quote, "number": number}, [(block, text, 1)])
+
+
+def test_two_numbers_of_one_quote_are_two_spans():
+    text = "הובאה הפחתה של 10% בגין סחירות והפחתה של 20% בגין עוצמת ניצול."
+    ten, twenty = (T.value_span(VER, "r1", _taken_quote(text, text, n)) for n in ("10", "20"))
+    assert ten is not None and twenty is not None and ten != twenty and ten[:4] == twenty[:4]  # one block, two offsets
+
+
+def test_the_same_number_twice_in_a_paragraph_is_two_spans():
+    text = "הובאה הפחתה של 10% בגין סחירות. הובאה הפחתה של 10% בגין עוצמת ניצול."
+    first, second = (T.value_span(VER, "r1", _taken_quote(text, q, "10")) for q in (
+        "הובאה הפחתה של 10% בגין סחירות.", "הובאה הפחתה של 10% בגין עוצמת ניצול."))
+    assert first is not None and second is not None and first != second
+
+
+def test_the_same_quote_in_two_versions_or_two_readings_is_two_spans():
+    taken = _taken_quote(RATE_TEXT, RATE_TEXT, "6.5")
+    here = T.value_span(VER, "r1", taken)
+    assert here == T.value_span(VER, "r1", _taken_quote(RATE_TEXT, RATE_TEXT, "6.5")) and here is not None
+    assert T.value_span(uuid.UUID(int=99), "r1", taken) != here and T.value_span(VER, "r2", taken) != here
+
+
+def test_a_quote_located_to_block_precision_only_has_no_span():
+    text = "שיעור היוון של 6.5% לתזרים דמי שכירות ממשרדים."
+    twice = [(0, text, 1), (1, text, 1)]  # the quote is in two blocks of the cited range, the same number in both
+    taken = T._take_quote(_source(text), text, {"quote": text, "number": "6.5"}, twice)
+    assert "number" not in taken["anchor"] and T.value_span(VER, "r1", taken) is None
+    assert T.value_span(VER, "r1", T._take_quote(_source(text), text, {"quote": text, "number": "6.5"})) is None  # no blocks
+
+
+def test_a_cell_is_its_table_row_and_column():
+    table = _table(["רכיב", "ערך", "הערה"], [["שטח קרקע", "620", "620"], [STATED_ROW, "0.8", "0.9"]], "טבלת חישוב שווי הקרקע")
+    full = T._table_text(table, table["rows"])
+    src = _source(full, "table")
+    spans = {col: T.value_span(VER, "r1", T._cell_of(src, full, {"row": STATED_ROW, "column": col}, table, 0))
+             for col in ("ערך", "הערה")}
+    assert spans["ערך"] == ("cell", str(VER), "r1", 0, 2, 2) and spans["הערה"] == ("cell", str(VER), "r1", 0, 2, 3)
+
+
+def _measurement_row(**kw) -> SimpleNamespace:
+    base = dict(version_id=VER, reading_id="r1", value=Decimal("0.8"), quote=RATE_TEXT, block_index=0, table_index=None,
+                row_index=None, row_cells=None)
+    return SimpleNamespace(**(base | kw))
+
+
+def test_a_measurement_of_a_text_has_the_span_of_the_value_taken_from_the_same_place():
+    value_span = T.value_span(VER, "r1", _taken_quote(RATE_TEXT, RATE_TEXT, "6.5"))
+    row = _measurement_row(value=Decimal("6.5"))
+    assert T.measurement_span(row, RATE_TEXT) == value_span
+    assert T.measurement_span(row) is None  # its block was not read: no span
+    assert T.measurement_span(_measurement_row(quote="ציטוט שאינו בבלוק", value=Decimal("6.5")), RATE_TEXT) is None
+
+
+def test_a_measurement_of_a_table_row_has_the_span_of_its_one_cell_holding_the_value():
+    row = _measurement_row(table_index=2, row_index=1, value=Decimal("0.8"), row_cells=[STATED_ROW, "0.8", "0.9"])
+    assert T.measurement_span(row) == ("cell", str(VER), "r1", 2, 2, 2)
+    # the row holds the value twice: the column is not named, so the measurement has no span (KTD1)
+    assert T.measurement_span(_measurement_row(table_index=2, row_index=1, row_cells=["x", "0.8", "0.8"])) is None
+    assert T.measurement_span(_measurement_row(table_index=2, row_index=1, row_cells=None)) is None
+
+
+def test_add_measurement_records_the_span_of_a_listed_table_row_in_the_workspace():
+    ws = Workspace(ctx=None)
+    row = _measurement_row(id=uuid.uuid4(), document_id=DOC, title="שומה סינתטית", metric="מקדם", metric_kind="coefficient",
+                           value_text="0.8", unit="ratio", period="unknown", vat="unknown", area_basis="", subject="הנכס",
+                           value_role="other", status="auto_validated", section="3", table_index=2, row_index=1,
+                           row_cells=[STATED_ROW, "0.8", "0.9"], table_stored=True, caption="טבלה", title_lines=[],
+                           header=None, scenario="", stance="unknown")
+    m = ws.add_measurement(row)
+    assert ws.spans[m.mid] == ("cell", str(VER), "r1", 2, 2, 2)
+
+
+# --- a repeated span returns the first value (AE4; KTD2) ---------------------------------------------------------------
+
+def test_ae4_three_registrations_of_one_quote_and_number_are_one_value_and_the_repeats_say_so(monkeypatch):
+    ws, handle = _cached_world(monkeypatch)
+    first = T.tool_take_value(ws, handle, {}, _given(), "שיעור ראשון")
+    second = T.tool_take_value(ws, handle, {}, _given(subject="אחר"), "תווית אחרת")
+    third = T.tool_take_value(ws, handle, {}, _given(), "עוד תווית")
+    assert list(ws.values) == ["V1"] and list(ws.sources) == ["S1"] and list(ws.spans) == ["V1"]
+    assert T.MSG_ALREADY_REGISTERED not in first
+    for out in (second, third):
+        assert out.startswith("V1") and T.MSG_ALREADY_REGISTERED in out
+    assert ws.values["V1"].label == "שיעור ראשון" and ws.values["V1"].subject == "הנכס"  # the first value's label and subject stay
+
+
+def test_a_registration_at_another_place_is_a_new_value(monkeypatch):
+    ws, handle = _cached_world(monkeypatch)
+    T.tool_take_value(ws, handle, {}, _given(), "א")
+    ws.spans["V1"] = ("quote", str(VER), "r1", 0, 999)  # the registered value stands at another place
+    T.tool_take_value(ws, handle, {}, _given(), "ב")
+    assert list(ws.values) == ["V1", "V2"] and ws.spans["V2"] != ws.spans["V1"]
+
+
+def test_a_repeat_whose_meaning_contradicts_a_model_asserted_field_corrects_it(monkeypatch):
+    ws, handle = _cached_world(monkeypatch, BARE_TEXT, "0.8", kind="coefficient", unit="ratio")
+    T.tool_take_value(ws, handle, {}, _given(kind="coefficient", unit="ratio"), "מקדם")
+    v = ws.values["V1"]
+    assert v.provenance["unit"] == "model_asserted" and v.unit == "ratio"
+    out = T.tool_take_value(ws, handle, {}, _given(kind="coefficient", unit="percent", subject="אחר"), "מקדם שוב")
+    assert list(ws.values) == ["V1"] and v.unit == "percent" and v.subject == "הנכס" and v.label == "מקדם"
+    assert T.MSG_ALREADY_REGISTERED in out and v.kind == "coefficient"
+    # the key fields follow the corrected unit: a fraction and a percent of a coefficient are one unit key (KTD5)
+    (d,) = timeline.datums(ws)
+    assert d.unit == "percent"
+
+
+def test_a_repeat_whose_meaning_contradicts_a_source_attested_field_fails_naming_the_first_value(monkeypatch):
+    ws, handle = _cached_world(monkeypatch, kind="rate", unit="percent")
+    T.tool_take_value(ws, handle, {}, _given(kind="rate", unit="percent"), "שיעור")
+    assert ws.values["V1"].provenance["kind"] == "source"
+    with pytest.raises(T.ToolError, match="V1"):
+        T.tool_take_value(ws, handle, {}, _given(kind="coefficient", unit="percent"), "מקדם")
+    assert list(ws.values) == ["V1"] and list(ws.sources) == ["S1"] and ws.values["V1"].kind == "rate"
+
+
+def test_taking_the_value_again_as_the_source_has_it_withdraws_the_models_unsupported_stance_and_scenario(monkeypatch):
+    """The tool tells the model to take a value again with stance unknown and no scenario when the source says nothing of them
+    (``MSG_ATTRIBUTION_UNSTATED``, ``MSG_SCENARIO_UNSTATED``): that is the same span, so it is the same V#, now as the source has it."""
+    ws, handle = _cached_world(monkeypatch)
+    first = T.tool_take_value(ws, handle, {}, _given(stance="estimate", stated_by="השמאי", scenario="תרחיש שהמודל קבע"), "שיעור")
+    v = ws.values["V1"]
+    assert v.provenance["stance"] == "model_asserted" and v.scenario and T.MSG_SCENARIO_UNSTATED in first
+    again = T.tool_take_value(ws, handle, {}, _given(), "שיעור")
+    assert list(ws.values) == ["V1"] and v.stance == "unknown" and v.stated_by == "" and v.scenario == ""
+    assert v.provenance["stance"] == "not_stated" and v.provenance["scenario"] == "not_stated"
+    assert T.MSG_SCENARIO_UNSTATED not in again and T.MSG_ATTRIBUTION_UNSTATED not in again
+
+
+def test_a_stance_or_scenario_the_source_attests_is_never_replaced_by_a_repeat():
+    ws = Workspace(ctx=None)
+    first = _existing(ws, NONE)
+    first.provenance["scenario"], first.scenario = "source", "מצב תכנוני קודם"
+    first.provenance["stance"], first.stance = "source", "claim"
+    assert _again(ws, NONE, stance="adopted", scenario="") is not None
+    assert (first.scenario, first.stance) == ("מצב תכנוני קודם", "claim")
+
+
+def _existing(ws: Workspace, facet: dict, span=("quote", str(VER), "r1", 0, AT)) -> calc.Value:
+    value = _quote(RATE_TEXT, "6.5", preceding=[])
+    value.facet = dict(facet)
+    value.vid = "V1"
+    T._register_value(ws, value, span)
+    return value
+
+
+def _again(ws: Workspace, facet: dict, span=("quote", str(VER), "r1", 0, AT), **given):
+    src = _source(RATE_TEXT)
+    taken = T._take_quote(src, RATE_TEXT, {"quote": RATE_TEXT, "number": "6.5"}, [(0, RATE_TEXT, 1)])
+    return T._registered_again(ws, span, T._settle(taken, _given(**given), ()), lambda kind: dict(facet))
+
+
+def test_a_wider_quote_that_reads_a_stated_facet_upgrades_the_first_values_facet():
+    stated = _facet("תזרים דמי שכירות ממשרדים", "paragraph", "context")
+    for weak in (NONE, datum.not_read()):
+        ws = Workspace(ctx=None)
+        first = _existing(ws, weak)
+        found = _again(ws, stated)
+        assert found is not None and found[0] is first and first.facet == stated
+
+
+def test_a_weaker_read_never_downgrades_a_facet_and_a_stated_one_keeps_the_first():
+    stated = _facet("תזרים דמי שכירות ממשרדים", "sentence")
+    other = _facet("תזרים אחר", "paragraph", "context")
+    for weak in (NONE, datum.not_read()):
+        ws = Workspace(ctx=None)
+        first = _existing(ws, stated)
+        _again(ws, weak)
+        assert first.facet == stated
+    ws = Workspace(ctx=None)
+    first = _existing(ws, NONE)
+    _again(ws, datum.not_read())
+    assert first.facet == NONE  # not read does not replace "read, nothing stated"
+    ws = Workspace(ctx=None)
+    first = _existing(ws, stated)
+    _again(ws, other)
+    assert first.facet == stated
+
+
+def test_a_span_nobody_registered_is_no_repeat():
+    ws = Workspace(ctx=None)
+    _existing(ws, NONE)
+    assert _again(ws, NONE, span=("quote", str(VER), "r1", 0, 99)) is None and _again(ws, NONE, span=None) is None
+
+
+# --- a registration changes the workspace in its last step only (KTD2) -----------------------------------------------------
+
+@pytest.mark.parametrize("failing", ["_stamp_date", "_back_date_words"])
+def test_a_registration_that_fails_after_the_anchor_step_leaves_no_value_and_no_source(monkeypatch, failing):
+    ws, handle = _cached_world(monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("synthetic failure")
+
+    real = getattr(T, failing)
+    monkeypatch.setattr(T, failing, boom)
+    with pytest.raises(RuntimeError):
+        T.tool_take_value(ws, handle, {}, _given(), "שיעור")
+    assert not ws.values and not ws.sources and not ws.anchors and not ws.spans
+    assert not ws.settled_values and not ws.uncertain_values
+    monkeypatch.setattr(T, failing, real)
+    out = T.tool_take_value(ws, handle, {}, _given(), "שיעור")
+    assert out.startswith("V1") and list(ws.sources) == ["S1"] and ws.anchors["V1"]["kind"] == "quote"
+    assert ws.spans["V1"] == ("quote", str(VER), "r1", 0, AT)  # the number's offset in its block
+
+
+# --- a failed registration is audited (R15, KTD11) ------------------------------------------------------------------------
+
+def _call(ws: Workspace, name: str, **arguments) -> str:
+    return T.run_tool(ws, name, json.dumps(arguments, ensure_ascii=False))
+
+
+def test_a_failed_take_value_is_logged_with_its_reason_and_a_clipped_locator_and_a_successful_one_is_not(monkeypatch):
+    ws, handle = _cached_world(monkeypatch)
+    meaning = _given()
+    locator = {"table": None, "row": None, "row_number": None, "column": None, "column_number": None,
+               "quote": "ציטוט ארוך מאוד " * 60, "number": "6.5"}
+    out = _call(ws, "take_value", source="S9", locator=locator, meaning=meaning, label="x")
+    assert out.startswith("שגיאה")
+    (entry,) = ws.registration_log
+    assert entry["tool"] == "take_value" and entry["source"] == "S9" and entry["key"] and entry["at"]
+    assert 0 < len(entry["locator"]) < len(json.dumps(locator, ensure_ascii=False))
+    assert entry["message"] and len(entry["message"]) <= 300
+    empty = dict.fromkeys(locator)
+    ok = _call(ws, "take_value", source=handle, locator=empty, meaning=meaning, label="x")
+    assert ok.startswith("V1") and len(ws.registration_log) == 1
+    _call(ws, "assume", value="zzz", quote="q")  # another tool's refusal is no registration
+    assert len(ws.registration_log) == 1
+
+
+def test_the_registration_log_is_bounded():
+    ws = Workspace(ctx=None)
+    for n in range(T.REGISTRATION_LOG_MAX + 5):
+        _call(ws, "take_value", source=f"S{n}", locator={"quote": "x", "number": "1"}, meaning=_given(), label="x")
+    assert len(ws.registration_log) == T.REGISTRATION_LOG_MAX

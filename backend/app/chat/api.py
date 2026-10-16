@@ -1131,7 +1131,11 @@ def _diagnostics(outcome: engine.TurnOutcome, payload: dict, removals: _Removals
     # the stage clock (round 9 KTD9) travels in the resolution's jsonb under ``timing``: numbers and tool names, no
     # column of its own; ``get_diagnostics`` serves it apart from the resolution
     timing = outcome.timing or outcome.workspace.clock.summary()
-    return {"rounds": outcome.rounds, "removed": removed, "resolution": (resolution or {}) | {"timing": timing},
+    # the take_value calls the server refused (round 14 U1, KTD11, R15): the reason and the place of each, with the rest of the
+    # diagnostics (owner and office admin only); no key at all when every registration succeeded
+    registrations = {"registrations": list(outcome.workspace.registration_log)} if outcome.workspace.registration_log else {}
+    return {"rounds": outcome.rounds, "removed": removed,
+            "resolution": (resolution or {}) | {"timing": timing} | registrations,
             "document_ids": _answer_documents(payload) | found | checked,
             "limits_hit": list(outcome.workspace.limits_hit)}
 

@@ -145,11 +145,13 @@ class Datum:
     basis: str = ""
     uncertain: bool = False  # its reading cannot be presented as certain (review #3): shown, and marked as such
     # what the datum decision reads (round 13 U4, KTD3; ``datum.Site``): the source's facet of the datum, the appraisal unit
-    # it is in, its table ((version, table index) of a cell) and the section path of its block
+    # it is in, its table ((version, table index) of a cell) and the section path of its block; ``span``: where its number is in
+    # its source (round 14 U1, KTD1; ``Workspace.spans``): equal spans are one datum (``datum.relation`` rule 0)
     facet: dict | None = None
     appraisal: tuple | None = None
     table: tuple | None = None
     section: str = ""
+    span: tuple | None = None
 
     @property
     def dated(self) -> bool:
@@ -260,6 +262,7 @@ def _context(ctx: dict | None) -> tuple[int | None, bool]:
 def datums(ws: Workspace) -> list[Datum]:
     """Every value and measurement the turn registered, as the timeline reads it (values first, in registration order)."""
     out: list[Datum] = []
+    spans = getattr(ws, "spans", None) or {}
     for i, v in ws.values.items():
         prov = v.provenance or {}
         number, subject = _context(v.context)
@@ -270,7 +273,7 @@ def datums(ws: Workspace) -> list[Datum]:
                     lambda f, p=prov: _stated(p, f), v.facet),
             v.written, D.canonical_amount(v.value, scale=v.scale, unit=v.unit, family=fam), v.as_of, v.role or "",
             v.kind, v.period, v.vat, v.area_basis or "", value_uncertain(ws, i),
-            v.facet, (str(v.version_id), number), tuple(v.table) if v.table else None, v.section or ""))
+            v.facet, (str(v.version_id), number), tuple(v.table) if v.table else None, v.section or "", spans.get(i)))
     for i, m in ws.measurements.items():
         r = m.row
         number, subject = _context(m.context)
@@ -287,7 +290,8 @@ def datums(ws: Workspace) -> list[Datum]:
             D.canonical_measurement(getattr(r, "value", None), r.value_text or "", unit=r.unit or "", family=fam),
             m.as_of, getattr(r, "value_role", "") or "", kind, r.period or "", r.vat or "", r.area_basis or "",
             measurement_uncertain(r), m.facet, (str(m.version_id), number),
-            (str(m.version_id), table_index) if table_index is not None else None, getattr(r, "section", "") or ""))
+            (str(m.version_id), table_index) if table_index is not None else None, getattr(r, "section", "") or "",
+            spans.get(i)))
     return out
 
 

@@ -428,12 +428,12 @@ def test_a_computed_result_is_kept_at_its_scale_and_vat_basis_and_removed_when_m
 def test_a_division_by_zero_on_found_values_is_reported_as_a_failed_calculation_not_missing_data(office):
     ws = workspace(office)
     s = read_table(ws, office.doc)
-    for label in ("הכנסות", "הכנסות (שוב)"):
-        assert run(ws, "take_value", source=s, locator=cell("סה\"כ", INCOME), meaning=meaning("income", role="income"),
-                   label=label).startswith("V")
+    # one cell is one value (round 14 U1): the income is taken once, and the divisor is the income less itself
+    assert run(ws, "take_value", source=s, locator=cell("סה\"כ", INCOME), meaning=meaning("income", role="income"),
+               label="הכנסות").startswith("V1")
     assert run(ws, "take_value", source=s, locator=cell("סה\"כ", COST), meaning=meaning("cost", role="cost"),
-               label="עלויות").startswith("V3")
-    out = run(ws, "calculate", expression="V3 / (V1 - V2)", label="יחס", justification=None)
+               label="עלויות").startswith("V2")
+    out = run(ws, "calculate", expression="V2 / (V1 - V1)", label="יחס", justification=None)
     assert out.startswith("שגיאה") and "חלוקה באפס" in out
     assert "החישוב נכשל" in out and "לא נתון חסר" in out and not ws.computations
 

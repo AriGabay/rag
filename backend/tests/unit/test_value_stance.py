@@ -184,8 +184,12 @@ def test_a_stance_the_source_says_nothing_about_tells_the_model_to_take_it_again
     assert decision.ws.values["V1"].provenance["stance"] == "model_asserted" and T.STATUS_AUTO in out
     assert T.MSG_ATTRIBUTION_UNSTATED in out
     again = T.tool_take_value(decision.ws, decision.sid, _quote(PLAIN_TEXT, "210"), _meaning(), "שווי")
-    assert decision.ws.values["V2"].certainty == "verified" and T.STATUS_AUTO in again
-    assert T.MSG_ATTRIBUTION_UNSTATED not in again
+    # round 14 U1 (KTD2): the same place taken again corrects the model's own stance and speaker on the first value, in place
+    first = decision.ws.values["V1"]
+    assert list(decision.ws.values) == ["V1"] and again.startswith("V1")
+    assert (first.stance, first.stated_by) == ("unknown", "")
+    assert "model_asserted" not in (first.provenance["stance"], first.provenance["stated_by"])
+    assert first.certainty == "verified" and T.STATUS_AUTO in again and T.MSG_ATTRIBUTION_UNSTATED not in again
     # where the source does say who stated it, the tool shows its words instead (and never this hint)
     other = T.tool_take_value(decision.ws, decision.sid, _quote(CLAIM_TEXT, "200"), _meaning(stance="adopted"), "שווי")
     assert T.MSG_ATTRIBUTION_UNSTATED not in other and "המשיבה" in other
@@ -215,6 +219,8 @@ def test_a_scenario_is_found_in_the_text_or_asserted(monkeypatch):
     text = "במצב התכנוני הקודם שווי הנכס הוא 150 ₪ למ\"ר."
     d = _workspace(monkeypatch, [_block(0, DECISION, [DECISION]), _block(1, text, [DECISION])])
     assert _take(d, text, "150", scenario="מצב תכנוני קודם").provenance["scenario"] == "source"
+    # a first registration of the place in a turn of its own (a second take of one place corrects the first value, round 14 U1)
+    d = _workspace(monkeypatch, [_block(0, DECISION, [DECISION]), _block(1, text, [DECISION])])
     v = _take(d, text, "150", scenario="מצב תכנוני מוצע")
     assert v.provenance["scenario"] == "model_asserted" and v.certainty == "verified"  # round 13 U5: not stated
 
@@ -430,7 +436,11 @@ def test_a_scenario_the_source_does_not_name_tells_the_model_to_take_it_again_wi
                             _meaning(scenario="בדיקה בסיסית"), "שווי")
     assert decision.ws.values["V1"].provenance["scenario"] == "model_asserted" and T.MSG_SCENARIO_UNSTATED in out
     again = T.tool_take_value(decision.ws, decision.sid, _quote(PLAIN_TEXT, "210"), _meaning(), "שווי")
-    assert decision.ws.values["V2"].certainty == "verified" and T.MSG_SCENARIO_UNSTATED not in again
+    # round 14 U1 (KTD2): the re-take of the same place corrects the model's own scenario on the first value, in place
+    first = decision.ws.values["V1"]
+    assert list(decision.ws.values) == ["V1"] and again.startswith("V1")
+    assert first.scenario == "" and first.provenance["scenario"] != "model_asserted"
+    assert first.certainty == "verified" and T.MSG_SCENARIO_UNSTATED not in again
 
 
 # --- the identity a file of one subject unit states for itself, shown to the judge --------------------------------

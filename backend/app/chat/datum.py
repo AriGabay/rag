@@ -58,6 +58,21 @@ def not_read() -> dict:
     return {"status": STATUS_NOT_READ, "written": None, "part": None, "tier": None}
 
 
+# how much a component state says (round 14 U1, KTD2): "not read" is nothing, "read" (nothing stated, or ambiguous) is more, "stated"
+# is most. A state only moves forward
+_STATE_RANK = {STATUS_NOT_READ: 0, STATUS_NONE: 1, "unparsed": 1, STATUS_STATED: 2}
+
+
+def forward(first: dict | None, second: dict | None) -> dict:
+    """The facet a datum keeps once a second registration of the same source span read one (round 14 U1, KTD2, R6): the
+    second replaces the first only when it states more — a stated facet over one that was not read, read without a component or
+    ambiguous, and a read one over one not read — and never the reverse. The model often registers again with a wider quote to
+    fix a context, and this keeps what that read found; an equal state keeps the first."""
+    first = first or not_read()
+    second = second or not_read()
+    return dict(second if _STATE_RANK.get(second.get("status"), 0) > _STATE_RANK.get(first.get("status"), 0) else first)
+
+
 def family_of(kind: str) -> str:
     """The datum family of a kind, as ``resolve.family`` has it (a ratio and a rate are one proportion; value and
     value per area are one family); ``resolve`` is imported where used: it reaches the tools, which read this module."""
@@ -381,6 +396,25 @@ def canonical_measurement(value: object, value_text: str, *, unit: str = "", fam
     return _fraction(number, unit, family).normalize() if number is not None else None
 
 
+# --- the source span (round 14 U1, KTD1) ------------------------------------------------------------------------------------
+
+def quote_span(version_id, reading_id: str | None, anchor: dict | None) -> tuple | None:
+    """Where a quote value's number is in its source: the version, the reading, the block that holds the number and the
+    number's character offset in that block's text — from the anchor ``anchors.locate_quote`` gave (``number``: [block, start,
+    end]). One quote can hold one number twice and two quotes can cover one number, so neither a quote nor a quote index is a
+    place. None when the quote was located to block precision only (found more than once in the read range) or not at all."""
+    number = (anchor or {}).get("number")
+    if not number or len(number) < 2:
+        return None
+    return ("quote", str(version_id), reading_id, number[0], number[1])
+
+
+def cell_span(version_id, reading_id: str | None, table, row: int, column: int) -> tuple:
+    """Where a table cell's number is: the version, the reading, the table (its index, or the region and index of a table a
+    visual read transcribed), the row and the column (``row_number`` and ``column_number``: counted from 1)."""
+    return ("cell", str(version_id), reading_id, table, row, column)
+
+
 # --- the decision (round 13 U4, KTD3) -----------------------------------------------------------------------------------
 
 SAME, DIFFERENT, UNDECIDED = "same", "different", "undecided"
@@ -389,13 +423,15 @@ SAME, DIFFERENT, UNDECIDED = "same", "different", "undecided"
 class Site(NamedTuple):
     """What ``relation`` reads of a datum: ``timeline.Datum`` has the same attributes. ``appraisal``: the appraisal unit it is in
     ((version, unit number)); ``table``: (version, table index) of its cell, or None; ``section``: the section path of its
-    block."""
+    block; ``span``: where the number is in its source (``quote_span``, ``cell_span``; round 14 U1, KTD1), or None when it
+    cannot be placed to a number."""
 
     family: str
     facet: dict | None
     appraisal: tuple | None = None
     table: tuple | None = None
     section: str = ""
+    span: tuple | None = None
 
 
 def core_of(site) -> frozenset[str]:
@@ -428,6 +464,9 @@ def relation(a, b, a_in_unit: int = 1, b_in_unit: int = 1) -> str:
     differ and their periods overlap), parallel components (``different``: never a conflict) or not to be established
     (``undecided``)? First match wins:
 
+    0. both have the same non-empty source span (round 14 U1, KTD1): one number in one place of one reading, however many
+       times it was registered, so it is one datum whatever the two facets read (a wider quote can read a facet the first
+       registration missed) — before every facet rule, and so for the coverage, recency and timeline readers that call this;
     1. both facets are ``own`` tier and their cores are equal and not empty: same;
     2. both are the unit's headline datum (``headline``): same;
     2b. a family that needs no facet (rent, value, area, income ...), the two data in different appraisal units, one stating a
@@ -444,6 +483,8 @@ def relation(a, b, a_in_unit: int = 1, b_in_unit: int = 1) -> str:
     "Different" needs structural evidence: two wordings of one datum in two documents can share no words. The rule is not
     transitive, so it is no key field: ``timeline`` joins "same" pairs into classes. The two data are of one base key
     (``timeline`` buckets them): ``in_unit`` is the number of values of that key in each one's appraisal unit."""
+    if (span := getattr(a, "span", None)) and span == getattr(b, "span", None):
+        return SAME
     ca, cb = core_of(a), core_of(b)
     own = (a.facet or {}).get("tier") == TIER_OWN and (b.facet or {}).get("tier") == TIER_OWN
     if own and ca and ca == cb:

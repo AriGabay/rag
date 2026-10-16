@@ -94,11 +94,15 @@ def test_each_figure_is_attributed_by_its_own_words_or_section(office):
     assert adopted.stance == "adopted" and adopted.provenance["stance"] == "source" and adopted.section == DECISION
     unknown = _take(ws, sid, PLAIN, "80")
     assert unknown.stance == "unknown" and unknown.certainty == "verified"
-    asserted = _take(ws, sid, PLAIN, "80", stance="adopted", stated_by="השמאי המכריע")
+    # a first registration of the place, in a turn of its own: a second take of one place in a turn corrects the first value
+    # in place (round 14 U1, KTD2)
+    ws_asserted = T.Workspace(ctx=office.ctx())
+    asserted = _take(ws_asserted, _read_page(ws_asserted, office.doc), PLAIN, "80", stance="adopted",
+                     stated_by="השמאי המכריע")
     # round 13 U5 (KTD6): a stance and speaker the text does not give are the model's, counted as not stated; the number stays
     # a checked one (its kind and unit are the source's)
     assert asserted.provenance["stance"] == "model_asserted" and asserted.certainty == "verified"
-    assert T.value_status(ws, asserted.vid) == T.STATUS_AUTO
+    assert T.value_status(ws_asserted, asserted.vid) == T.STATUS_AUTO
     body = verify._source_parts(ws, claim.vid)[1]
     assert RESPONDENT in body and "המשיבה" in body and "נמצא במקור" in body
     assert "ייחוס: לא ידוע" in verify._source_parts(ws, unknown.vid)[1]

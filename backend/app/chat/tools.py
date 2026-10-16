@@ -159,7 +159,7 @@ import re
 import time
 from collections.abc import Callable, Container, Iterable
 from dataclasses import dataclass, field, replace
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from itertools import islice
 from typing import Any
@@ -292,7 +292,13 @@ def table_rows() -> int:
 
 
 class ToolError(Exception):
-    """A tool call the server refuses (bad arguments, unknown ids); its message goes back to the model."""
+    """A tool call the server refuses (bad arguments, unknown ids); its message goes back to the model. ``key``: a stable
+    short reason (``refused`` unless the raise site names one), which the audit of a failed registration records
+    (round 14 U1, KTD11)."""
+
+    def __init__(self, message: str = "", key: str = "refused") -> None:
+        super().__init__(message)
+        self.key = key
 
 
 @dataclass
@@ -555,6 +561,12 @@ class Workspace:
     # facets resolved this turn (round 13 U3, KTD2): a value's by its place and family, a measurement's by its id, so a
     # datum met again is not read again
     facets: dict[tuple, dict] = field(default_factory=dict)
+    # V# and M# -> where its number is in its source (round 14 U1, KTD1; ``value_span``, ``measurement_span``): the datum
+    # decision reads it, so one number registered twice is one datum. Absent: the place is not known to a number
+    spans: dict[str, tuple] = field(default_factory=dict)
+    # the take_value calls the server refused (round 14 U1, KTD11, R15), at most ``REGISTRATION_LOG_MAX``: stored in the
+    # message diagnostics as ``resolution["registrations"]``
+    registration_log: list[dict] = field(default_factory=list)
     section_blocks: dict[tuple, list] = field(default_factory=dict)
     table_rows: dict[tuple, dict] = field(default_factory=dict)
     # the turn's salt for claim and unit ids (round 8 KTD2, ``verify.assign_ids``): an id is a hash of the salt and the
@@ -730,6 +742,8 @@ class Workspace:
                 known.context = value_context(cx, cx.at_block(getattr(row, "block_index", None)))
             self.measurements[known.mid] = known
             self.anchors[known.mid] = anchors.measurement_stub(known)
+            if (span := measurement_span(row)) is not None:  # a table row that names its cell; a text row waits for its block
+                self.spans[known.mid] = span
         return known
 
     def adopt(self, source: Source) -> Source:
@@ -4969,9 +4983,15 @@ def value_uncertain(ws: Workspace, vid: str) -> bool:
     basis or VAT counts as not stated and leaves it certain, round 13 U5, KTD6), its source was read uncertainly (a
     visual transcription included), or its region stayed unclear after the focused re-reads
     (``Workspace.uncertain_values``)."""
+    return ws.values[vid].certainty != "verified" or reading_unclear(ws, vid)
+
+
+def reading_unclear(ws: Workspace, vid: str) -> bool:
+    """The reading half of ``value_uncertain``: the value's region stayed unclear after its focused re-reads, or its source was
+    read uncertainly and nothing settled the value since. A model-asserted kind or unit is not a reading question."""
     v = ws.values[vid]
     source = ws.sources.get(v.source_id)
-    return (v.certainty != "verified" or vid in ws.uncertain_values
+    return (vid in ws.uncertain_values
             or (source is not None and source.status == "uncertain_reading" and vid not in ws.settled_values
                 and v.reading != "clear"))
 
@@ -5346,7 +5366,7 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
         try:
             found = anchors.locate_quote(blocks, loc["quote"], abs(wanted[1]))
         except anchors.AmbiguousQuote:
-            raise ToolError(MSG_QUOTE_AMBIGUOUS.format(sid=src.sid)) from None
+            raise ToolError(MSG_QUOTE_AMBIGUOUS.format(sid=src.sid), "quote_ambiguous") from None
         if found is not None:
             pages = {b[0]: b[2] for b in blocks if len(b) > 2}
             anchor = ({"segments": found.segments, "number": found.number} if found.segments
@@ -5580,6 +5600,8 @@ def _settle(taken: dict, given: dict, path: tuple) -> tuple[dict, dict, dict, At
 
 def _new_value(ws: Workspace, src: Source, sid: str, taken: dict, settled: tuple, given: dict, label: str,
                path: tuple, reading_id: str | None) -> calc.Value:
+    """The value a take builds, with the next V# and its facet. It changes nothing in the workspace: ``_register_value`` does,
+    as the last step of the registration (round 14 U1, KTD2), so a step that fails in between leaves no orphan V#."""
     fields, prov, who, said, anchors = settled
     where = taken["locator"]
     default = (f"{where['row']} — {where['column']}" if "row" in where
@@ -5594,7 +5616,6 @@ def _new_value(ws: Workspace, src: Source, sid: str, taken: dict, settled: tuple
                        scenario=who["scenario"], attribution=said.evidence if said is not None else "",
                        meaning_from=dict(taken.get("meaning_from") or {}) | anchors, scale=int(taken.get("scale") or 1))
     value.facet = _value_facet(ws, src, taken, fields["kind"])
-    ws.values[value.vid] = value
     return value
 
 
@@ -5746,6 +5767,131 @@ MSG_VALUE_SCALE = ("קנה מידה: המקור מציין את הערך ב{scal
                    "כתוב; תוצאת חישוב עליו תהיה באותו קנה מידה")
 
 
+# --- one datum per source span (round 14 U1, R6, R7, KTD1, KTD2) -----------------------------------------------------------
+
+REGISTRATION_LOG_MAX = 40  # failed take_value calls kept for the diagnostics of one turn
+MSG_ALREADY_REGISTERED = ("המספר הזה כבר נרשם בתור הזה, באותו מקום במסמך: זה אותו ערך ולא ערך חדש, והמזהה שלו הוא זה "
+                          "שבתחילת התשובה. התווית, הנושא והתפקיד של הרישום הראשון נשארו; לא נוצר מזהה נוסף.")
+MSG_SPAN_CORRECTED = ("תיקון: {fields} של הערך הוחלפו לפי הרישום הזה. הרישום הראשון קבע אותם בלי שהמקור מעיד עליהם, "
+                      "והמקור אינו סותר את הרישום הזה.")
+MSG_SPAN_CONTRADICTS = ("המספר הזה כבר נרשם כ-{vid} באותו מקום במסמך, ו{field} של {vid} הוא מה שהמקור מעיד: {old}, לא "
+                        "{new}. השתמש ב-{vid} כמו שהוא, או קח מספר אחר מהמקור.")
+# the defining attributes a repeated registration may contradict, with how each is shown to the model
+_DEFINING_LABELS = {"kind": ("הסוג", lambda x: VALUE_KINDS.get(x, x)), "unit": ("היחידה", lambda x: UNIT_LABELS.get(x, x))}
+# the fields a repeated registration fills when the first left them empty and this one has them from the source: field -> empty
+_FILLABLE = {"period": "unknown", "vat": "unknown", "area_basis": "", "stance": "unknown", "stated_by": "", "scenario": ""}
+
+
+def value_span(version_id, reading_id: str | None, taken: dict) -> tuple | None:
+    """Where the number of a taken value is in its source (round 14 U1, KTD1): a cell is its version, reading, table, row and
+    column; a quote value is its version, reading, the block holding the number and the number's offset in it — the anchor
+    ``take_value`` located it with. None when the quote was located only to block precision."""
+    if taken.get("table"):
+        where = taken["locator"]
+        return datum.cell_span(version_id, reading_id, taken["table"][1], where["row_number"], where["column_number"])
+    return datum.quote_span(version_id, reading_id, taken.get("anchor"))
+
+
+def measurement_span(row, block_text: str | None = None) -> tuple | None:
+    """Where the number of a stored measurement is in its source, in the same form as ``value_span`` so a V# and an M# of one
+    number meet (KTD1). A table row: its table, row and the one cell of the row that holds the value (a row that holds it twice
+    names no column here: no span). A text row: its quote located in ``block_text``, the text of its block, with
+    ``anchors.locate_quote``; None without the block's text (the caller that reads blocks supplies it) or when the quote is not
+    found in it, or found only to block precision."""
+    value = getattr(row, "value", None)
+    if value is None:
+        return None
+    wanted = abs(Decimal(str(value)))
+    version, reading = row.version_id, getattr(row, "reading_id", None)
+    if getattr(row, "table_index", None) is not None:
+        cells, index = getattr(row, "row_cells", None), getattr(row, "row_index", None)
+        if not cells or index is None or index < 0:
+            return None
+        hits = [i for i, c in enumerate(cells) if any(n[3] == wanted for n in _numbers_of(meaning._norm(str(c))))]
+        return datum.cell_span(version, reading, row.table_index, index + 1, hits[0] + 1) if len(hits) == 1 else None
+    block = getattr(row, "block_index", None)
+    if block_text is None or block is None or not getattr(row, "quote", None):
+        return None
+    try:
+        found = anchors.locate_quote([(block, block_text)], row.quote, wanted)
+    except anchors.AmbiguousQuote:
+        return None
+    return datum.quote_span(version, reading, {"number": found.number}) if found is not None and found.number else None
+
+
+def _registered_again(ws: Workspace, span: tuple | None, settled: tuple, facet_of: Callable[[str], dict]) -> tuple[calc.Value, str] | None:
+    """The value already registered at ``span`` with what this call adds, and the note to tell the model; None when the span
+    is not known or nobody registered it (round 14 U1, KTD2, R6). Run before any step that costs a read or a model call.
+
+    - the first value's reading is not clear (``reading_unclear``): None, the call registers as before this round;
+    - same meaning: the first value stays whole — its label, subject, role and stance are the first call's. Source-backed
+      meaning this call adds fills only the fields the first left empty; the facet moves forward only (``datum.forward``). The
+      one exception is the model's own unsupported stance, speaker or scenario on the first value, which this call replaces;
+    - a defining attribute (``calc.DEFINING_ATTRIBUTES``: kind and unit) that differs: when the first value's field is the model's
+      own assertion, this call corrects it and the value's facet is read again in the new family; when the source attests the first
+      value's field, the call fails naming the first V#, and nothing changes.
+
+    ``settled``: this call's ``_settle`` (fields, provenance, who, said, anchors); ``facet_of(kind)``: this call's facet for the
+    kind it settled."""
+    first = next((v for i, v in ws.values.items() if span and ws.spans.get(i) == span), None)
+    if first is None or reading_unclear(ws, first.vid):
+        # a reading that is not clear keeps its re-read: the take goes the whole way again (``_reread_value``, at most
+        # ``REREADS_PER_VALUE`` per place), and ``datum.relation`` rule 0 still joins the registrations into one class
+        return None
+    fields, prov, who, _, anchors_ = settled
+    corrected = []
+    for name in calc.DEFINING_ATTRIBUTES:
+        if fields[name] == getattr(first, name):
+            continue
+        if first.provenance.get(name) != "model_asserted":
+            label, show = _DEFINING_LABELS[name]
+            raise ToolError(MSG_SPAN_CONTRADICTS.format(vid=first.vid, field=label, old=show(getattr(first, name)),
+                                                        new=show(fields[name])), "span_contradiction")
+        corrected.append(name)
+    moved_family = datum.family_of(first.kind) != datum.family_of(fields["kind"])
+    for name in corrected:
+        setattr(first, name, fields[name])
+        first.provenance[name] = prov[name]
+        if name in anchors_:
+            first.meaning_from[name] = anchors_[name]
+    mine = fields | who
+    for name, empty in _FILLABLE.items():
+        if getattr(first, name) in (empty, None) and mine.get(name) not in (empty, None) and prov.get(name) == "source" \
+                and first.provenance.get(name) != "source":
+            setattr(first, name, mine[name])
+            first.provenance[name] = "source"
+            if name in anchors_:
+                first.meaning_from[name] = anchors_[name]
+    # who stated it, how, and the scenario: a word of the model's own that the source does not attest yields to this call's (the
+    # model took the value again as the source has it, as ``MSG_ATTRIBUTION_UNSTATED`` and ``MSG_SCENARIO_UNSTATED`` tell it to)
+    for name in ("stance", "stated_by", "scenario"):
+        if first.provenance.get(name) == "model_asserted" and mine[name] != getattr(first, name):
+            setattr(first, name, mine[name])
+            first.provenance[name] = prov[name]
+    read = facet_of(fields["kind"])
+    first.facet = read if corrected and moved_family else datum.forward(first.facet, read)
+    note = MSG_ALREADY_REGISTERED
+    if corrected:
+        note += " " + MSG_SPAN_CORRECTED.format(fields=" ו".join(_DEFINING_LABELS[n][0] for n in corrected))
+    return first, note
+
+
+def _register_value(ws: Workspace, value: calc.Value, span: tuple | None, *, stub: dict | None = None,
+                    settled: bool = False, uncertain: str | None = None) -> None:
+    """The last step of a registration (round 14 U1, KTD2): the V# enters the workspace with its span, its anchor stub and
+    how its region was read. Every step before it works on the value alone, so a failure in any of them leaves no V#, no S# the
+    value was the reason for and no entry keyed by an id nobody holds."""
+    ws.values[value.vid] = value
+    if span is not None:
+        ws.spans[value.vid] = span
+    if settled:
+        ws.settled_values.add(value.vid)
+    if uncertain:
+        ws.uncertain_values[value.vid] = uncertain
+    if stub:
+        ws.anchors[value.vid] = stub
+
+
 def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: dict | None, label: str = "") -> str:
     """Register a value of a source the turn read (V#) once the server verified that the number is the one the
     locator names: the cell at that row and column of the table, or a number inside an exact quote. ``source`` may
@@ -5759,15 +5905,16 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
         return _take_cached(ws, sid, data, loc, _given_meaning(meaning_), label)
     src = ws.sources.get(sid)
     if src is None:
-        raise ToolError(f"מקור לא מוכר: {source}. ערך נלקח רק ממקור S# שהוחזר בתור הזה (search או read)")
+        raise ToolError(f"מקור לא מוכר: {source}. ערך נלקח רק ממקור S# שהוחזר בתור הזה (search או read)",
+                        "unknown_source")
     if src.is_listing or src.version_id is None:
-        raise ToolError("רשימת מסמכים אינה מקור לערך: קח את הערך ממקור במסמך")
+        raise ToolError("רשימת מסמכים אינה מקור לערך: קח את הערך ממקור במסמך", "not_a_source")
     full = src.text or (ws.sources[src.same_as].text if src.same_as in ws.sources else "")
     given = _given_meaning(meaning_)
     cell = any(k in loc for k in ("table", "row", "row_number", "column", "column_number"))
     if cell == ("quote" in loc):
         raise ToolError("locator: תא בטבלה (row או row_number, ו-column או column_number; אפשר גם table) או ציטוט "
-                        "(quote ו-number) — אחד מהם בלבד")
+                        "(quote ו-number) — אחד מהם בלבד", "locator_shape")
     vision = src.vision is not None
     if vision and not cell:  # a quoted row of a table read by inspect is its cell, checked as one
         resolved = _vision_quote_cell(ws, src, loc)
@@ -5776,9 +5923,9 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
     with tenant_tx(ws.ctx) as conn:
         v = reader.version(conn, src.version_id)
         if v is None:
-            raise ToolError(MSG_UNAVAILABLE)
+            raise ToolError(MSG_UNAVAILABLE, "unavailable")
         if src.reading_id is not None and v.reading_id != src.reading_id:
-            raise ToolError(MSG_STALE_REF.format(source_id=sid))
+            raise ToolError(MSG_STALE_REF.format(source_id=sid), "stale_reference")
         rows: list = []
         if cell and vision:
             taken = _take_vision_cell(ws, src, full, loc, _governing_note(ws, conn, src.version_id, src.block_start))
@@ -5812,12 +5959,18 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
                                    region[0].block_index if region else src.block_start)
             if here is None and len(src.contexts) == 1:
                 here = src.contexts[0]
-    # the same value verified clearly before, in this reading: its earlier clear reading is reused (KTD12)
-    known = _known_clear(ws, src.version_id, reading_id, taken["locator"]) if unclear is not None else None
     # its section path: the block holding the number (a quote), or the table's block (a cell); else the source's
     holder = region[0] if region else None
     path = tuple(getattr(holder, "section_path", None) or ()) or ((src.section,) if src.section else ())
     settled = _settle(taken, given, path)
+    # the number is already registered at this place (round 14 U1, KTD2): the first value is returned, before any re-read or
+    # cache lookup of this call, and a stated facet this call read upgrades the first one's
+    span = value_span(src.version_id, reading_id, taken)
+    again = _registered_again(ws, span, settled, lambda kind: _value_facet(ws, src, taken, kind))
+    if again is not None:
+        return _value_report(ws, again[0], settled[3], again[1], _context_lines(ws, cx, again[0]))
+    # the same value verified clearly before, in this reading: its earlier clear reading is reused (KTD12)
+    known = _known_clear(ws, src.version_id, reading_id, taken["locator"]) if unclear is not None else None
     reread = None
     if unclear is not None:
         if known is not None and known["record"].get("value") == str(taken["value"]):
@@ -5834,25 +5987,27 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
         number = here
     value.context, value.subject_from = value_context(cx, number), subject_from(cx, number, value.subject)
     note = reread[1] if reread is not None else None
-    # how its own region was read, on the value itself, so coverage and the stored answer see it (R28)
+    # how its own region was read, on the value itself, so coverage and the stored answer see it (R28); the workspace learns
+    # it with the registration, in its last step
+    settled_region, uncertain = False, None
     if "evidence" in taken:  # a cell of a table read by inspect: confirmed by OCR in its place, or uncertain (R18)
         from app.extraction.images import CELL_CONFIRMED
 
         note = taken["why"]
         if taken["evidence"]["status"] == CELL_CONFIRMED:
-            ws.settled_values.add(value.vid)
+            settled_region = True
             value.reading = "clear"
         else:
-            ws.uncertain_values[value.vid] = note
+            uncertain = note
             value.reading, value.reading_note = "uncertain", note
     elif reread is not None and not reread[0]:
-        ws.uncertain_values[value.vid] = reread[1]
+        uncertain = reread[1]
         value.reading, value.reading_note = "uncertain", reread[1]
     elif (reread is not None and reread[0]) or (
             region and all(r.status not in (reader.UNREAD, reader.UNCERTAIN) for r in region)):
         # confirmed by a focused re-read, or its own region read clearly (never a region left unread, which only a
         # visual transcription made now has read)
-        ws.settled_values.add(value.vid)  # its own region read clearly: another region of the source does not matter
+        settled_region = True  # its own region read clearly: another region of the source does not matter
         value.reading = "clear"
     elif src.status == "uncertain_reading":
         value.reading, value.reading_note = "uncertain", MSG_SOURCE_UNCERTAIN
@@ -5866,11 +6021,11 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
             stub["context"] = {k: (v["part"] if isinstance(v, dict) else v) for k, v in value.meaning_from.items()}
         if pages:
             stub["pages"] = pages
-        ws.anchors[value.vid] = stub
     if known is None and _cacheable(ws, value, src, reread):
-        span = (min(r.block_index for r in region), max(r.block_index for r in region)) if region else None
-        _store_verified(ws, value, _cache_doc(value, taken, path, ws.anchors.get(value.vid), src, span))
+        blocks = (min(r.block_index for r in region), max(r.block_index for r in region)) if region else None
+        _store_verified(ws, value, _cache_doc(value, taken, path, stub, src, blocks))
     _back_date_words(value)
+    _register_value(ws, value, span, stub=stub, settled=settled_region, uncertain=uncertain)  # the last step (KTD2)
     return _value_report(ws, value, settled[3], note, _context_lines(ws, cx, value))
 
 
@@ -6077,33 +6232,40 @@ def _take_cached(ws: Workspace, handle: str, data: dict, loc: dict, given: dict,
         dating = (_date_inputs(ws, conn, v.version_id, _facts_from_json(doc["facts"])[0], place.get("block_start"))
                   if doc is not None else None)
     if doc is None:
-        raise ToolError(MSG_UNAVAILABLE)
+        raise ToolError(MSG_UNAVAILABLE, "unavailable")
     record = doc["record"]
     if not _locator_agrees(record, loc):
-        raise ToolError(MSG_CACHED_LOCATOR.format(handle=handle, where=_cached_where(record)))
+        raise ToolError(MSG_CACHED_LOCATOR.format(handle=handle, where=_cached_where(record)), "cached_locator")
     taken, path = _facts_from_json(doc["facts"])
     taken["facet"] = record.get("facet") or datum.not_read()  # the facet it was cached with (round 13 U3)
     settled = _settle(taken, given, path)
+    # the number is already registered at this place (round 14 U1, KTD2): no new source and no new id
+    span = value_span(v.version_id, v.reading_id, taken)
+    again = _registered_again(ws, span, settled, lambda kind: dict(taken["facet"]))
+    if again is not None:
+        return _value_report(ws, again[0], settled[3], again[1] + " " + MSG_CACHED_TAKEN.format(handle=handle),
+                             _context_lines(ws, cx, again[0]))
     place = doc.get("source") or {}
-    src = ws.add_source(document_id=v.document_id, version_id=v.version_id, title=v.title,
-                        section=place.get("section"), location=place.get("location") or record.get("location") or "",
-                        kind=place.get("kind") or "context", text=record.get("quote") or taken["quote"],
-                        block_start=place.get("block_start"), block_end=place.get("block_end"),
-                        table_index=place.get("table_index"), page_list=place.get("page_list") or None,
-                        partial_document=v.partial, reading_id=v.reading_id, status="complete",
-                        tags={"document": ws.doc_handle(v.document_id)})
+    # the source is built here and enters the workspace with the value, in the last step: a failure before it leaves no S#
+    src = Source(sid="", document_id=v.document_id, version_id=v.version_id, title=v.title, section=place.get("section"),
+                 location=place.get("location") or record.get("location") or "", kind=place.get("kind") or "context",
+                 text=record.get("quote") or taken["quote"], block_start=place.get("block_start"),
+                 block_end=place.get("block_end"), table_index=place.get("table_index"),
+                 page_list=place.get("page_list") or None, partial_document=v.partial, reading_id=v.reading_id,
+                 status="complete", tags={"document": ws.doc_handle(v.document_id)})
     ws.touch(v.document_id, v.title, "retrieved", v.partial)
-    value = _new_value(ws, src, src.sid, taken, settled, given, label, path, v.reading_id)
+    value = _new_value(ws, src, "", taken, settled, given, label, path, v.reading_id)
     _stamp_date(ws, value, taken, dating, path)
-    ws.settled_values.add(value.vid)  # cached only when its own region was read clearly
-    value.reading = "clear"
+    value.reading = "clear"  # cached only when its own region was read clearly
     value.context, value.subject_from = value_context(cx, number), subject_from(cx, number, value.subject)
     _mark(src, cx, [number] if number else [])
     stub = doc.get("anchor")
     if stub:
-        ws.anchors[value.vid] = dict(stub) | {"reading_id": value.reading_id} | (
-            {"unit": src.unit} if src.unit else {})
+        stub = dict(stub) | {"reading_id": value.reading_id} | ({"unit": src.unit} if src.unit else {})
     _back_date_words(value)
+    ws.adopt(src)  # the S# and the V# are made together, as the last steps
+    value.source_id = src.sid
+    _register_value(ws, value, span, stub=stub, settled=True)
     return _value_report(ws, value, settled[3], MSG_CACHED_TAKEN.format(handle=handle), _context_lines(ws, cx, value))
 
 
@@ -6796,6 +6958,20 @@ def run_tool(ws: Workspace, name: str, arguments: str) -> str:
     return output
 
 
+def _note_refusal(ws: Workspace, name: str, args: dict, key: str, message: str) -> None:
+    """Record a take_value call the server refused (round 14 U1, KTD11, R15): the tool, the source id, a clipped locator, the
+    reason key and message, and the time. It is stored in the message diagnostics (owner and office admin only) as
+    ``resolution["registrations"]``; the model never sees it, and a successful call leaves nothing here."""
+    if name != "take_value" or len(ws.registration_log) >= REGISTRATION_LOG_MAX:
+        return
+    where = {k: v for k, v in (args.get("locator") or {}).items() if v not in (None, "")} if isinstance(
+        args.get("locator"), dict) else {}
+    ws.registration_log.append({
+        "tool": name, "source": _clip(str(args.get("source") or ""), 40),
+        "locator": _clip(json.dumps(where, ensure_ascii=False, sort_keys=True), 160), "key": key,
+        "message": _clip(" ".join(message.split()), 240), "at": datetime.now(UTC).isoformat(timespec="seconds")})
+
+
 def _run_tool(ws: Workspace, name: str, arguments: str) -> str:
     handler = HANDLERS.get(name)
     if handler is None:
@@ -6805,6 +6981,7 @@ def _run_tool(ws: Workspace, name: str, arguments: str) -> str:
         if not isinstance(args, dict):
             raise ValueError
     except ValueError:
+        _note_refusal(ws, name, {}, "bad_json", "")
         return "ארגומנטים לא תקינים (JSON)"
     if name in READING_TOOLS and ws.budget_spent:
         return _withheld(name, args)
@@ -6816,10 +6993,13 @@ def _run_tool(ws: Workspace, name: str, arguments: str) -> str:
     try:
         return handler(ws, args)
     except ToolError as e:
+        _note_refusal(ws, name, args, e.key, str(e))
         return f"שגיאה: {e}"
     except (KeyError, TypeError, ValueError) as e:
         logger.warning("tool %s rejected its arguments: %s", name, type(e).__name__)
+        _note_refusal(ws, name, args, "bad_arguments", type(e).__name__)
         return "שגיאה: ארגומנטים לא תקינים לכלי"
-    except Exception:  # noqa: BLE001 - a failing tool is reported to the model; the turn goes on
+    except Exception as e:  # noqa: BLE001 - a failing tool is reported to the model; the turn goes on
         logger.exception("tool %s failed", name)
+        _note_refusal(ws, name, args, "tool_failed", type(e).__name__)
         return "שגיאה: הכלי נכשל. אפשר לנסות שוב או לנסות דרך אחרת"
