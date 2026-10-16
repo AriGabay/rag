@@ -44,6 +44,18 @@ The date a datum refers to: the valuation date of the appraisal whose own conclu
 
 What makes two values the same datum: the property and the appraisal unit, the metric, the unit after normalization, the periodicity, the area basis, the VAT basis, the scenario, and the facet. The facet is the component, consideration or cash flow the source states for the value: its table row or column, its own sentence, or failing those its lead-in or heading. A label the assistant wrote is never a facet. Two values are the same datum, different data, or undecided. Different components of one appraisal are shown side by side, not as competing values. A conflict is two values of the same datum that disagree for overlapping periods. When the facet cannot be read, the comparison stays undecided and is never called a conflict.
 
+A facet has one of four states:
+- **stated:** the source names the component.
+- **read without a component:** the range that was read names none.
+- **read but ambiguous:** a nearby phrase could not be tied to the value.
+- **not read:** the context was not read.
+
+Only the second means the document gave nothing in the range checked.
+
+Two registrations of one span of the source are one datum.
+
+A coefficient and the reduction derived from it, 1 minus the coefficient, are one adjustment in two forms.
+
 ### Property identity
 
 Which appraisals are of one property. Two appraisal units are linked only by proving evidence from their own identification text: a shared block and parcel with a compatible sub-parcel, or the same street, house number and city. Each link keeps its reason. A street and number without a city never links by itself; such an appraisal is an unlinked candidate.
