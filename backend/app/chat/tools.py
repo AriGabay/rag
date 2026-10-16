@@ -162,7 +162,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from itertools import islice
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, text
@@ -242,6 +242,11 @@ SEARCH_MAX = 12
 CONTEXT_CHARS = {"neighbors": 3500, "section": 9000, "table": 14000, "candidates": 6000}
 READ_SCOPES = ("neighbors", "section", "table")
 CANDIDATE_BLOCKS = 40  # the most blocks above a value the context read fetches in one query; a read that needs more is capped
+# the reader that wrote a cached facet (round 14 U3, KTD5): a record without ``facet_reader`` is the round-13 reader's. A cached take whose
+# facet is not stated, or was read by an older reader, reads the context again from the stored blocks (no model call); the verifier
+# version stays, because a bump would also drop ``_known_clear`` reuse and the re-reads that follow can call a model (R17)
+FACET_READER_VERSION = 2
+MEASUREMENT_FACET_ROWS = 40  # the text measurements of one listing whose context is read; the rows beyond it are not read (reason cap)
 MEASUREMENTS_MAX = 120  # per page
 LIST_MAX = 60  # per page
 SCOPE_PAGE = 30
@@ -734,8 +739,9 @@ class Workspace:
     def add_source(self, **kw) -> Source:
         return self.adopt(Source(sid="", **kw))
 
-    def add_measurement(self, row) -> Measurement:
-        """A stored measurement as the turn's M#; one found again keeps its id, so it is never counted twice."""
+    def add_measurement(self, row, block_text: str | None = None) -> Measurement:
+        """A stored measurement as the turn's M#; one found again keeps its id, so it is never counted twice. ``block_text``: the
+        text of the block holding a text measurement, read by the listing, so its number's place is found in it (round 14 U3, KTD1)."""
         known = next((m for m in self.measurements.values() if m.id == row.id), None)
         if known is None:
             known = Measurement(f"M{len(self.measurements) + 1}", row.id, row.document_id, row.version_id, row.title,
@@ -746,8 +752,8 @@ class Workspace:
                 known.context = value_context(cx, cx.at_block(getattr(row, "block_index", None)))
             self.measurements[known.mid] = known
             self.anchors[known.mid] = anchors.measurement_stub(known)
-            if (span := measurement_span(row)) is not None:  # a table row that names its cell; a text row waits for its block
-                self.spans[known.mid] = span
+        if known.mid not in self.spans and (span := measurement_span(row, block_text)) is not None:
+            self.spans[known.mid] = span  # a table row that names its cell; a text row's, once its block is read
         return known
 
     def adopt(self, source: Source) -> Source:
@@ -4730,70 +4736,200 @@ def _describe_key(key: tuple) -> str:
     return ", ".join(p for p in parts if p)
 
 
-def _measurement_facet(row, structure: dict | None) -> dict:
-    """The facet of a stored measurement (round 13 U3, R1, KTD2): a table row's from its table (the row label of the body
-    row ``row_index``, the column header its row carries, the caption), read through the table structure — not read when
-    that is not stored; a text row's from its quote (the purpose phrase of the sentence holding its number), which has
-    no blocks above it to read, so a quote naming nothing is ``none``."""
+class _TextRead(NamedTuple):
+    """What a listing read of the blocks around a text measurement (``_text_reads``, round 14 U3, KTD5): ``reach`` the bounded
+    candidates above its quote, nearest first (None: no context was read for it), ``block_text`` the text of the block holding
+    it (its number's place is found in it), ``picture`` its block is a picture's text (the text around it is not read), and
+    ``capped`` the listing's cap on context reads was spent before it."""
+
+    reach: datum.Reach | None = None
+    block_text: str | None = None
+    picture: bool = False
+    capped: bool = False
+
+
+def _measurement_facet(row, structure: dict | None, read: _TextRead | None = None) -> dict:
+    """The facet of a stored measurement (round 13 U3, R1, KTD2; round 14 U3, R4, KTD5): a table row's from its table (the row label
+    of the body row ``row_index``, the column header its row carries, the caption, the title lines and the notes), read through the
+    table structure — not read when that is not stored; a text row's from its quote (the purpose phrase of the sentence holding its
+    number, else what the bounded read of the blocks above it accepts, ``read``). A text row read without those blocks, in a family
+    that needs a facet, is not read: never ``none``, which would claim a read nobody made."""
     if row.table_index is not None and structure is None:
         return datum.not_read()
     if row.table_index is not None:
         rows = structure.get("rows") or []
         ri = row.row_index
         cells = (rows[ri].get("cells") if ri is not None and 0 <= ri < len(rows) else None) or []
-        return _cell_facet(row, cells, structure.get("caption"), structure.get("title"))
-    return _quote_facet(row)
+        return _cell_facet(row, cells, structure.get("caption"), structure.get("title"), structure.get("notes") or ())
+    return _quote_facet(row, read)
 
 
-def _cell_facet(row, cells: list, caption: str | None, title) -> dict:
+def _cell_facet(row, cells: list, caption: str | None, title, notes=()) -> dict:
     """The facet of a table row from what it reads of its table: the cells of the row (the first is the row label; three or
-    more make a matrix), the column header the row carries, the caption and the title lines."""
+    more make a matrix), the column header the row carries, the caption, the title lines and the notes (a note that names the row
+    label, round 14 U2)."""
     family = datum.facet_family(row.metric_kind or "", row.quote or "", row.metric or "")
     return datum.read_cell(cells[0] if cells else "", getattr(row, "header", None), caption,
-                           [x for x in title or [] if x], family=family, matrix=len(cells) >= 3)
+                           [x for x in title or [] if x], family=family, matrix=len(cells) >= 3,
+                           notes=[str(x) for x in notes or [] if x])
 
 
-def _quote_facet(row) -> dict:
+def _quote_facet(row, read: _TextRead | None = None) -> dict:
     family = datum.facet_family(row.metric_kind or "", row.quote or "", row.metric or "")
     found = _numbers_of(meaning._norm(row.value_text or ""))
     written = found[0][0] if found else ""
-    return datum.read_quote(datum.sentence_with(row.quote or "", written), written, family, [])
+    sentence = datum.sentence_with(row.quote or "", written)
+    if read is None or not datum.needs_facet(family) or datum.read_sentence(sentence, written, family) is not None:
+        return datum.read_quote(sentence, written, family, None)  # an own phrase, a family that needs none, or no blocks at hand
+    if read.picture:
+        return datum.not_read(datum.REASON_PICTURE_CELL)
+    if read.capped:
+        return datum.not_read(datum.REASON_CAP)
+    return _read_quote_placed(sentence, written, family, read.reach)
 
 
-def _listed_facet(row) -> dict:
+def _listed_facet(row, notes=(), read: _TextRead | None = None) -> dict:
     """``_measurement_facet`` of a row that carries what its table gives the facet (the columns of
     ``meaning.TABLE_TEXT_COLUMNS``: whether the table is stored, the cells of its own row, the title lines), with no read of
-    the table's structure."""
+    the table's structure. ``notes``: the table's notes, which the listing reads for the rows still without a facet; ``read``: the
+    blocks around a text row (``_text_reads``)."""
     if row.table_index is None:
-        return _quote_facet(row)
+        return _quote_facet(row, read)
     if not row.table_stored:
         return datum.not_read()
-    return _cell_facet(row, row.row_cells or [], row.caption, row.title_lines)
+    return _cell_facet(row, row.row_cells or [], row.caption, row.title_lines, notes)
 
 
-def _facet_memo(ws: Workspace, key: tuple, read: Callable[..., dict], *args, **kwargs) -> dict:
-    """The facet kept under ``key`` in the workspace, else ``read(*args, **kwargs)``, kept unless it is not read."""
-    if key in ws.facets:
-        return dict(ws.facets[key])
-    found = read(*args, **kwargs)
-    if found["status"] != datum.STATUS_NOT_READ:
-        ws.facets[key] = found
+def _memoized(ws: Workspace, keys: Iterable[tuple], read: Callable[[], dict]) -> dict:
+    """The facet kept in the workspace under one of ``keys``, else ``read()``, kept under all of them only when it is stated
+    (round 14 U3, KTD5, R5): a ``none``, ambiguous or not-read result is never kept, so a wider read at the same place later in the
+    turn is not answered with the earlier, weaker one."""
+    keys = list(keys)
+    for key in keys:
+        if key in ws.facets:
+            return dict(ws.facets[key])
+    found = read()
+    if found["status"] == datum.STATUS_STATED:
+        for key in keys:
+            ws.facets[key] = found
     return found
 
 
-def _measurement_facet_of(ws: Workspace, conn: Connection | None, row) -> dict:
-    """``_measurement_facet`` memoized in the workspace. A row that carries its table's text (the listing's own columns,
+def _facet_memo(ws: Workspace, key: tuple, read: Callable[..., dict], *args, **kwargs) -> dict:
+    """The facet kept under ``key`` in the workspace, else ``read(*args, **kwargs)``, kept only when it is stated."""
+    return _memoized(ws, [key], lambda: read(*args, **kwargs))
+
+
+def _span_facet_key(span: tuple, family: str) -> tuple:
+    """The workspace key of a facet by the source span of its number and its family (round 14 U3, KTD5): a value (V#) and a
+    stored measurement (M#) of one number share it."""
+    return ("facet", *span, family)
+
+
+def _measurement_facet_of(ws: Workspace, conn: Connection | None, row, read: _TextRead | None = None, *, notes=(),
+                          span: tuple | None = None) -> dict:
+    """``_measurement_facet`` memoized in the workspace, by the measurement's id and by the span of its number when known (shared
+    with a value taken at the same place). A row that carries its table's text (the listing's own columns,
     ``meaning.TABLE_TEXT_COLUMNS``) is read from them; any other table row is read with the turn's cached table structure
-    (``_table_at``) when a connection is at hand, and is otherwise not read (and not memoized)."""
-    def read() -> dict:
+    (``_table_at``) when a connection is at hand, and is otherwise not read (and not memoized). A text row that comes with no
+    ``read`` of its blocks has them read now (one query) when a connection is at hand; ``span``: the number's place, from the
+    block of that read."""
+    mid = next((m.mid for m in ws.measurements.values() if m.id == row.id), None)
+    span = span or (ws.spans.get(mid) if mid else None)
+    family = datum.facet_family(row.metric_kind or "", row.quote or "", row.metric or "")
+    keys = [("m", str(row.id)), *([_span_facet_key(span, family)] if span else [])]
+
+    def reading() -> dict:
+        own = read
+        if own is None and conn is not None and row.table_index is None:
+            own = _text_reads(ws, conn, [row]).get(row.id)
+            if own is not None and mid and mid not in ws.spans and (placed := measurement_span(row, own.block_text)):
+                ws.spans[mid] = placed
         if hasattr(row, "table_stored"):
-            return _listed_facet(row)
+            return _listed_facet(row, notes, own)
         structure = None
         if row.table_index is not None and conn is not None:
             structure = _table_at(ws, conn, row.version_id, row.table_index)[0]
-        return _measurement_facet(row, structure)
+        return _measurement_facet(row, structure, own)
 
-    return _facet_memo(ws, ("m", str(row.id)), read)
+    return _memoized(ws, keys, reading)
+
+
+def _text_reads(ws: Workspace, conn: Connection, rows: list) -> dict:
+    """The blocks around the text measurements of ``rows``, read in ONE query (round 14 U3, KTD1, KTD5): for each row that needs
+    a facet (a family that needs one, its own sentence states none, none kept for it yet) the blocks above its own, down to the
+    first of its appraisal unit — the bounded candidates of its context read; for each row whose number's place is not known, its own
+    block, whatever the facet cap. At most ``MEASUREMENT_FACET_ROWS`` rows read their context per call: the rest are ``capped``.
+    Returns ``{row id: _TextRead}``; a table row, and a text row with no block or no quote, has none."""
+    wanted = []
+    for r in rows:
+        if r.table_index is not None or getattr(r, "block_index", None) is None or not r.quote:
+            continue
+        mid = next((m.mid for m in ws.measurements.values() if m.id == r.id), None)
+        family = datum.facet_family(r.metric_kind or "", r.quote or "", r.metric or "")
+        found = _numbers_of(meaning._norm(r.value_text or ""))
+        written = found[0][0] if found else ""
+        context = (datum.needs_facet(family) and ("m", str(r.id)) not in ws.facets
+                   and datum.read_sentence(datum.sentence_with(r.quote, written), written, family) is None)
+        if context or mid is None or mid not in ws.spans:
+            wanted.append((r, context))
+    if not wanted:
+        return {}
+    budget, plan = MEASUREMENT_FACET_ROWS, []
+    for r, context in wanted:
+        cx = contexts_of(ws, conn, r.version_id, getattr(r, "reading_id", None))
+        seg = cx.segment_at(r.block_index) if cx.multi else None
+        floor = seg.first if seg is not None else 0
+        reads_context = context and budget > 0
+        budget -= 1 if reads_context else 0
+        plan.append((r, cx, context, not reads_context and context,
+                     max(floor, r.block_index - CANDIDATE_BLOCKS) if reads_context else r.block_index))
+    got = conn.execute(text(
+        "SELECT version_id, block_index, kind, section_path, text FROM document_blocks WHERE EXISTS (SELECT 1 FROM"
+        " unnest(CAST(:v AS uuid[]), CAST(:a AS int[]), CAST(:z AS int[])) AS w(version_id, lo, hi) WHERE"
+        " w.version_id = document_blocks.version_id AND document_blocks.block_index BETWEEN w.lo AND w.hi)"
+        " ORDER BY version_id, block_index"),
+        {"v": [str(r.version_id) for r, *_ in plan], "a": [lo for *_, lo in plan],
+         "z": [r.block_index for r, *_ in plan]}).all()
+    blocks: dict[str, dict[int, Any]] = {}
+    for b in got:
+        blocks.setdefault(str(b.version_id), {})[b.block_index] = b
+    out: dict = {}
+    for r, cx, context, capped, lo in plan:
+        mine = blocks.get(str(r.version_id), {})
+        holder = mine.get(r.block_index)
+        if holder is None:
+            out[r.id] = _TextRead()  # its block is not stored (any more): nothing was read
+        elif not context:
+            out[r.id] = _TextRead(None, holder.text)
+        elif holder.kind == "image":  # the text of a picture: the text around it is not what it was read with
+            out[r.id] = _TextRead(None, holder.text, picture=True)
+        elif capped:
+            out[r.id] = _TextRead(None, holder.text, capped=True)
+        else:
+            path = tuple(holder.section_path or ())
+            window = reader.section_window(cx, r.block_index, path)
+            first = window[0] if window is not None else 0
+            above = [mine[i] for i in range(max(first, lo), r.block_index) if i in mine]
+            out[r.id] = _TextRead(datum.reach([*above, holder], r.block_index, r.quote, path=path, lo=first,
+                                              chars=CONTEXT_CHARS["candidates"], truncated=len(above) >= CANDIDATE_BLOCKS),
+                                  holder.text)
+    return out
+
+
+def _table_notes(conn: Connection, rows: list) -> dict:
+    """The notes of the tables of ``rows`` (the table measurements the listing could not give a component yet), in ONE query:
+    ``{(version id, table index): [note, ...]}``."""
+    pairs = sorted({(str(r.version_id), r.table_index) for r in rows})
+    if not pairs:
+        return {}
+    got = conn.execute(text(
+        "SELECT version_id, table_index, structure->'notes' AS notes FROM extracted_tables WHERE EXISTS (SELECT 1 FROM"
+        " unnest(CAST(:v AS uuid[]), CAST(:t AS int[])) AS w(version_id, table_index) WHERE"
+        " w.version_id = extracted_tables.version_id AND w.table_index = extracted_tables.table_index)"),
+        {"v": [p[0] for p in pairs], "t": [p[1] for p in pairs]}).all()
+    return {(str(g.version_id), g.table_index): [str(n) for n in g.notes or [] if n] if isinstance(g.notes, list) else []
+            for g in got}
 
 
 def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | None = None,
@@ -4854,16 +4990,28 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
             f" WHERE d.deleted_at IS NULL AND {APPRAISALS_SQL}" + (" AND d.id = ANY(:d)" if docs else "")),
             params).all()
         cached, cached_total = _cached_listing(conn, docs, metric_kinds, words)
-        facets = {r.id: _measurement_facet_of(ws, conn, r) for r in rows}  # a table row's from its table (round 13 U3)
         for vid, reading in {(str(r.version_id), r.reading_id) for r in rows}:
             contexts_of(ws, conn, vid, reading)  # a measurement records its appraisal context (KTD7)
+        reads = _text_reads(ws, conn, rows)  # the blocks of the text rows: their context and their number's place, in one query
+        facets = {r.id: _measurement_facet_of(
+            ws, conn, r, reads.get(r.id), span=measurement_span(r, reads[r.id].block_text if r.id in reads else None))
+            for r in rows}  # a table row's from its table (round 13 U3), a text row's from its blocks (round 14 U3)
+        bare = [r for r in rows if r.table_index is not None and facets[r.id]["status"] != datum.STATUS_STATED
+                and hasattr(r, "table_stored") and r.table_stored
+                and datum.needs_facet(datum.facet_family(r.metric_kind or "", r.quote or "", r.metric or ""))]
+        if bare:  # a table row still without a component: the notes of its table, in one query
+            noted = _table_notes(conn, bare)
+            for r in bare:
+                if notes := noted.get((str(r.version_id), r.table_index)):
+                    facets[r.id] = _measurement_facet_of(ws, conn, r, notes=notes,
+                                                         span=measurement_span(r))
     key = (" ".join(words) if not metric_kinds else "", tuple(sorted(metric_kinds or [])),
            tuple(sorted(str(d) for d in docs)), tuple(sorted(value_roles or [])))
     listing = ws.listings.setdefault(key, {"pages": pages, "pages_read": set(), "total": total})
     listing["pages_read"].add(page)
     groups: dict[tuple, list] = {}
     for r in rows:
-        m = ws.add_measurement(r)
+        m = ws.add_measurement(r, reads[r.id].block_text if r.id in reads else None)
         m.as_of = as_ofs[r.id]
         m.facet = facets[r.id]
         m.listings.add(key)
@@ -4945,10 +5093,16 @@ def _cached_lines(ws: Workspace, rows: list, total: int) -> list[str]:
     out = ["", MSG_CACHED_HEADER]
     if total > len(rows):
         out.append(f"מוצגים {len(rows)} מתוך {total} ערכים שמורים; צמצם לפי מסמך או סוג נתון כדי לראות את השאר.")
+    # a record written before the key named the number (round 14 U3, KTD5) is not listed beside the record of the same number
+    keyed = {(str(r.version_id), r.reading_id, (r.value.get("record") or {}).get("quote"), (r.value.get("record") or {}).get("value"))
+             for r in rows if "at" in r.locator}
     for r in rows:
         record = r.value.get("record") or {}
+        if "at" not in r.locator and (str(r.version_id), r.reading_id, record.get("quote"), record.get("value")) in keyed:
+            continue
         held = next((v.vid for v in ws.values.values() if str(v.version_id) == str(r.version_id)
-                     and v.reading_id == r.reading_id and v.locator == r.locator), None)
+                     and v.reading_id == r.reading_id
+                     and r.locator in (v.locator, _cache_locator(v.locator, ws.spans.get(v.vid)))), None)
         name = held or _cached_handle(ws, r.version_id, r.reading_id, r.document_id, r.locator)
         ws.touch(r.document_id, r.title, "retrieved")
         # the cached fields are strings or absent, and no label table has a None or "" key
@@ -5103,6 +5257,15 @@ def _take_cell(ws: Workspace, conn: Connection, src: Source, full: str, loc: dic
                     _governing_note(ws, conn, src.version_id, block.block_index if block is not None else None))
 
 
+def _cell_facet_in(label: str, header: str, st: dict, cells: list) -> dict:
+    """What the facet of a table cell is read from (round 13 U3, KTD2; round 14 U2, KTD3): its row label, its column header, and its
+    table's caption, title lines and notes (a note that names the row label). The same for a cell taken now and for one a cached
+    value is read again from (round 14 U3, KTD5)."""
+    return {"cell": True, "row": label, "header": header, "caption": st.get("caption") or "",
+            "title": [x for x in st.get("title") or [] if x], "matrix": len(cells) >= 3,
+            "notes": [str(x) for x in st.get("notes") or [] if x]}
+
+
 def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str | _ScaleNote = "") -> dict:
     """The cell a locator names in a table structure (``extracted_tables.structure``, or a visual reading's table in
     the same shape), its number checked against the cell and the source's text, with what the table attests.
@@ -5221,9 +5384,7 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
             "table": (str(src.version_id), index), "said": said, "context": " ".join([*near, *table_text]),
             "meaning_from": {"unit": unit_from} if unit_from else {}, "scale": scale,
             # what the facet is read from (round 13 U3, KTD2): the row label, the column header and the caption and title
-            "facet_in": {"cell": True, "row": label, "header": header, "caption": st.get("caption") or "",
-                         "title": [x for x in st.get("title") or [] if x], "matrix": len(cells) >= 3,
-                         "notes": [str(x) for x in st.get("notes") or [] if x]},  # round 14 U2, KTD3: a note names its row label
+            "facet_in": _cell_facet_in(label, header, st, cells),
             # the cell as stored (KTD1): its box is looked up when the answer is stored, never searched for
             "anchor": {"table_index": index, "row": ri, "column": ci,
                        "pages": [p] if (p := (st.get("rows") or [])[ri].get("page")) else []}}
@@ -5638,7 +5799,7 @@ def _value_facet(ws: Workspace, src: Source, taken: dict, kind: str) -> dict:
         return datum.not_read(datum.REASON_PICTURE_CELL)
     if inp["cell"]:
         family = datum.facet_family(kind, inp["row"], inp["header"], inp["caption"])
-        key = (*_locator_key(src.version_id, src.reading_id, taken["locator"]), family)
+        key = _span_facet_key(value_span(src.version_id, src.reading_id, taken), family)
         return _facet_memo(ws, key, datum.read_cell, inp["row"], inp["header"], inp["caption"], inp["title"],
                            family=family, matrix=inp["matrix"], notes=inp.get("notes") or ())
     sentence = _own_sentence(taken)
@@ -5648,11 +5809,14 @@ def _value_facet(ws: Workspace, src: Source, taken: dict, kind: str) -> dict:
 
 
 def _quote_facet_key(src: Source, taken: dict, family: str) -> tuple:
-    """The workspace key of a quote value's facet: its quote's place and family, and where its number stands when the anchor
-    located it (round 14 U2): one sentence written in two sections is two places with two contexts, and the facet read in one is
-    never the other's. A quote located to block precision only keeps the quote-only key."""
-    number = (taken.get("anchor") or {}).get("number")
-    return (*_locator_key(src.version_id, src.reading_id, taken["locator"]), *(("at", number[0], number[1]) if number else ()), family)
+    """The workspace key of a quote value's facet: the span of its number (block and offset, from the anchor) and its family
+    (round 14 U2, U3, KTD5): one sentence written in two sections is two places with two contexts, and the facet read in one is
+    never the other's; a stored measurement of the same number shares it. A quote located to block precision only has no span and
+    keeps its quote's place."""
+    span = datum.quote_span(src.version_id, src.reading_id, taken.get("anchor"))
+    if span is not None:
+        return _span_facet_key(span, family)
+    return (*_locator_key(src.version_id, src.reading_id, taken["locator"]), family)
 
 
 def _read_quote_placed(sentence: str, written: str, family: str, preceding: datum.Reach | None) -> dict:
@@ -6009,7 +6173,7 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
     if again is not None:
         return _value_report(ws, again[0], settled[3], again[1], _context_lines(ws, cx, again[0]))
     # the same value verified clearly before, in this reading: its earlier clear reading is reused (KTD12)
-    known = _known_clear(ws, src.version_id, reading_id, taken["locator"]) if unclear is not None else None
+    known = _known_clear(ws, src.version_id, reading_id, taken["locator"], span) if unclear is not None else None
     reread = None
     if unclear is not None:
         if known is not None and known["record"].get("value") == str(taken["value"]):
@@ -6062,7 +6226,7 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
             stub["pages"] = pages
     if known is None and _cacheable(ws, value, src, reread):
         blocks = (min(r.block_index for r in region), max(r.block_index for r in region)) if region else None
-        _store_verified(ws, value, _cache_doc(value, taken, path, stub, src, blocks))
+        _store_verified(ws, value, _cache_doc(value, taken, path, stub, src, blocks), _cache_locator(value.locator, span))
     _back_date_words(value)
     _register_value(ws, value, span, stub=stub, settled=settled_region, uncertain=uncertain)  # the last step (KTD2)
     return _value_report(ws, value, settled[3], note, _context_lines(ws, cx, value))
@@ -6152,6 +6316,7 @@ def _cache_record(value: calc.Value) -> dict:
                               if not isinstance(v, dict) or value.provenance.get(k) == "source"}
     record |= {f: pub[f] for f in SOURCE_FIELDS if value.provenance.get(f) == "source"}
     record["provenance"] = {k: p for k, p in value.provenance.items() if p == "source"}
+    record["facet_reader"] = FACET_READER_VERSION  # the reader that read its facet (round 14 U3, KTD5)
     return record
 
 
@@ -6206,22 +6371,49 @@ def _cached_value(conn: Connection, version_id, reading_id: str, locator: dict) 
     return row.value if row is not None else None
 
 
-def _known_clear(ws: Workspace, version_id, reading_id: str | None, locator: dict) -> dict | None:
+def _cache_locator(locator: dict, span: tuple | None) -> dict:
+    """The locator a verified value is keyed by (round 14 U3, KTD5): a quote value's own locator with the place of its number in
+    its block (``at``: block and character offset), so two numbers of one quote, and one sentence written in two sections, are
+    two rows. A cell's locator already names its row and column; a quote located to block precision only has no span and keeps
+    the quote alone. The record keeps the value's own locator."""
+    if span is not None and span[0] == "quote":
+        return dict(locator) | {"at": [span[3], span[4]]}
+    return dict(locator)
+
+
+def _cached_value_at(conn: Connection, version_id, reading_id: str, locator: dict, span: tuple | None) -> dict | None:
+    """The cached value of a place (round 14 U3, KTD5): under the key with its number's place; a miss falls back to the
+    quote-only key of a record written before the key named the number, but only when that quote holds a single number (with
+    two, the older record may be either one's)."""
+    key = _cache_locator(locator, span)
+    found = _cached_value(conn, version_id, reading_id, key)
+    if found is not None or key == locator:
+        return found
+    quote_ = locator.get("quote")
+    if quote_ and len(_numbers_of(meaning._norm(quote_))) == 1:
+        return _cached_value(conn, version_id, reading_id, locator)
+    return None
+
+
+def _known_clear(ws: Workspace, version_id, reading_id: str | None, locator: dict, span: tuple | None = None) -> dict | None:
     """The cached value at a locator of a reading, looked up in its own transaction (only for a value whose region
     was read uncertainly, which it spares a re-read); a cache that cannot be read only costs that re-read."""
     if not reading_id:
         return None
     try:
         with tenant_tx(ws.ctx) as conn:
-            return _cached_value(conn, version_id, reading_id, locator)
+            return _cached_value_at(conn, version_id, reading_id, locator, span)
     except Exception:  # noqa: BLE001
         logger.warning("verified value cache lookup failed")
         return None
 
 
-def _store_verified(ws: Workspace, value: calc.Value, doc: dict) -> None:
+def _store_verified(ws: Workspace, value: calc.Value, doc: dict, locator: dict | None = None) -> None:
     """Cache a verified value, in its own transaction, only while the user still sees its version and its reading
-    is the current one. A cache that cannot be written only costs a later re-verification."""
+    is the current one. A cache that cannot be written only costs a later re-verification. ``locator``: the key
+    (``_cache_locator``), else the value's own. The upsert skips a row of the same verifier version, so a facet this read states
+    completes the row in place (``_write_facet``: only the facet and its reader), never replacing it."""
+    key = locator if locator is not None else value.locator
     try:
         with tenant_tx(ws.ctx) as conn:
             v = reader.version(conn, value.version_id)
@@ -6233,10 +6425,36 @@ def _store_verified(ws: Workspace, value: calc.Value, doc: dict) -> None:
                 " ON CONFLICT (version_id, reading_id, locator) DO UPDATE SET value = EXCLUDED.value"
                 " WHERE verified_values.value->>'verifier_version' IS DISTINCT FROM :verifier_version"),
                 {"d": v.document_id, "v": value.version_id, "r": value.reading_id,
-                 "l": json.dumps(value.locator, ensure_ascii=False), "x": json.dumps(doc, ensure_ascii=False),
+                 "l": json.dumps(key, ensure_ascii=False), "x": json.dumps(doc, ensure_ascii=False),
                  "verifier_version": VALUE_VERIFIER_VERSION})
+            if ((doc.get("record") or {}).get("facet") or {}).get("status") == datum.STATUS_STATED:
+                _write_facet(conn, value.version_id, value.reading_id, key, doc["record"]["facet"])
     except Exception:  # noqa: BLE001 - the value itself is registered; only its reuse is lost
         logger.warning("verified value cache store failed")
+
+
+def _write_facet(conn: Connection, version_id, reading_id: str, locator: dict, facet: dict) -> None:
+    """Complete a cached record in place with a stated facet (round 14 U3, KTD5, R5): only ``value.record.facet`` and
+    ``value.record.facet_reader`` of the row change (``jsonb_set``), the rest of the cached document stays, and nothing is deleted.
+    It moves forward only: a row whose facet is already stated by this reader or a later one is left as it is."""
+    conn.execute(text(
+        "UPDATE verified_values SET value = jsonb_set(jsonb_set(value, '{record,facet}', CAST(:f AS jsonb)),"
+        " '{record,facet_reader}', CAST(:rj AS jsonb)) WHERE version_id = :v AND reading_id = :r"
+        " AND locator = CAST(:l AS jsonb) AND value->>'verifier_version' = :verifier_version"
+        " AND (value #>> '{record,facet,status}' IS DISTINCT FROM 'stated'"
+        " OR COALESCE((value #>> '{record,facet_reader}')::int, 1) < :ri)"),
+        {"f": json.dumps(facet, ensure_ascii=False), "rj": json.dumps(FACET_READER_VERSION), "ri": FACET_READER_VERSION,
+         "v": version_id, "r": reading_id, "l": json.dumps(locator, ensure_ascii=False),
+         "verifier_version": VALUE_VERIFIER_VERSION})
+
+
+def _update_cached_facet(ws: Workspace, version_id, reading_id: str, locator: dict, facet: dict) -> None:
+    """``_write_facet`` in its own tenant transaction, failing soft: a facet that cannot be written is read again next time."""
+    try:
+        with tenant_tx(ws.ctx) as conn:
+            _write_facet(conn, version_id, reading_id, locator, facet)
+    except Exception:  # noqa: BLE001 - the value is registered with the facet; only the cache misses it
+        logger.warning("verified value cache facet update failed")
 
 
 def _locator_key(version_id, reading_id: str | None, locator: dict) -> tuple:
@@ -6257,10 +6475,71 @@ def _cached_where(record: dict) -> str:
             else f"ציטוט «{_clip(where.get('quote') or record.get('quote') or '', 200)}»")
 
 
+def _facet_stale(record: dict) -> bool:
+    """Whether a cached record's facet is read again on a take (round 14 U3, KTD5, R5): it is not stated (nothing, or only
+    an ambiguous read, was found when it was cached), or the reader that read it is older than ``FACET_READER_VERSION`` (a record
+    without ``facet_reader`` is the round-13 reader's)."""
+    reader_ = record.get("facet_reader")
+    return ((record.get("facet") or {}).get("status") != datum.STATUS_STATED
+            or (reader_ if isinstance(reader_, int) else 1) < FACET_READER_VERSION)
+
+
+def _picture_cell(taken: dict) -> bool:
+    """Whether a taken value is a cell of a picture (a table a visual reading transcribed): the text around it is not read."""
+    return bool(taken.get("table")) and ("region" in taken["locator"] or bool((taken.get("anchor") or {}).get("vision")))
+
+
+def _stated_at(ws: Workspace, span: tuple | None) -> bool:
+    """Whether a value of the turn at ``span`` already has a stated facet: a take there again reads nothing."""
+    return span is not None and any(ws.spans.get(i) == span and v.facet.get("status") == datum.STATUS_STATED
+                                    for i, v in ws.values.items())
+
+
+def _facet_again(ws: Workspace, src: Source, taken: dict, kind: str, doc: dict) -> dict | None:
+    """The facet of a cached value read again from the stored blocks (round 14 U3, KTD5): the same reader as a fresh take
+    (``_value_facet`` over the candidates ``_preceding_blocks`` builds, or a cell's row label, header, caption, title and notes), in
+    one transaction, with no model call. None: nothing to read (a picture cell, a family that needs no facet, a table or blocks no
+    longer stored) or the read failed — the cached facet stands."""
+    if _picture_cell(taken) or not datum.needs_facet(datum.facet_family(kind, _own_sentence(taken))):
+        return None
+    taken["facet"] = None  # read as a fresh take reads it
+    try:
+        with tenant_tx(ws.ctx) as conn:
+            if taken.get("table"):
+                where = taken["locator"]
+                st = _table_at(ws, conn, src.version_id, where["table_index"])[0]
+                rows = (st or {}).get("rows") or []
+                ri, ci = where["row_number"] - 1, where["column_number"] - 1
+                if st is None or not 0 <= ri < len(rows):
+                    return None
+                cells = rows[ri].get("cells") or []
+                headers = st.get("headers") or []
+                taken["facet_in"] = _cell_facet_in(cells[0] if cells else "", headers[ci] if 0 <= ci < len(headers) else "",
+                                                   st, cells)
+            else:
+                taken["facet_in"] = {"cell": False, "written": taken["written"]}
+                place = doc.get("source") or {}
+                if place.get("block_start") is None or _facet_known(ws, src, taken, kind):
+                    taken["preceding"] = None
+                else:
+                    held = reader.blocks_between(conn, src.version_id, place["block_start"],
+                                                 place["block_end"] if place.get("block_end") is not None else place["block_start"])
+                    at = _value_blocks(taken.get("anchor") or {})
+                    region = [r for r in held if at is None or r.block_index in at]
+                    taken["preceding"] = _preceding_blocks(conn, contexts_of(ws, conn, src.version_id, src.reading_id),
+                                                           src.version_id, region, taken, kind)
+            return _value_facet(ws, src, taken, kind)
+    except Exception:  # noqa: BLE001 - the cached facet stands; a read that failed is read again on the next take
+        logger.warning("cached facet read again failed")
+        return None
+
+
 def _take_cached(ws: Workspace, handle: str, data: dict, loc: dict, given: dict, label: str) -> str:
     """Register a cached verified value (``Q#``) as this turn's V#: the document is resolved again under the current
     permissions and the reading must still be the one it was verified in; its meaning and attribution are settled
-    from the cached facts and this turn's meaning, as on a fresh take; its anchor is the cached one."""
+    from the cached facts and this turn's meaning, as on a fresh take; its anchor is the cached one. A facet that is not stated, or
+    was read by an older reader, is read again from the stored blocks and, when it now states a component, written to the row in
+    place (round 14 U3, KTD5, R5)."""
     with tenant_tx(ws.ctx) as conn:
         v = _bound(conn, ws, handle, data)
         doc = _cached_value(conn, v.version_id, data["reading_id"], data["locator"])
@@ -6268,22 +6547,17 @@ def _take_cached(ws: Workspace, handle: str, data: dict, loc: dict, given: dict,
         place = (doc or {}).get("source") or {}
         number = _context_number(ws, conn, cx, v.version_id, (doc or {}).get("anchor") or {},
                                  place.get("block_start")) if doc is not None else None
-        dating = (_date_inputs(ws, conn, v.version_id, _facts_from_json(doc["facts"])[0], place.get("block_start"))
-                  if doc is not None else None)
+        facts = _facts_from_json(doc["facts"])[0] if doc is not None else None
+        dating = (_date_inputs(ws, conn, v.version_id, facts, place.get("block_start"), _picture_cell(facts))
+                  if doc is not None else None)  # a picture's table is not a stored one
     if doc is None:
         raise ToolError(MSG_UNAVAILABLE, "unavailable")
     record = doc["record"]
     if not _locator_agrees(record, loc):
         raise ToolError(MSG_CACHED_LOCATOR.format(handle=handle, where=_cached_where(record)), "cached_locator")
     taken, path = _facts_from_json(doc["facts"])
-    taken["facet"] = record.get("facet") or datum.not_read()  # the facet it was cached with (round 13 U3)
+    taken["facet"] = old = record.get("facet") or datum.not_read()  # the facet it was cached with (round 13 U3)
     settled = _settle(taken, given, path)
-    # the number is already registered at this place (round 14 U1, KTD2): no new source and no new id
-    span = value_span(v.version_id, v.reading_id, taken)
-    again = _registered_again(ws, span, settled, lambda kind: dict(taken["facet"]))
-    if again is not None:
-        return _value_report(ws, again[0], settled[3], again[1] + " " + MSG_CACHED_TAKEN.format(handle=handle),
-                             _context_lines(ws, cx, again[0]))
     place = doc.get("source") or {}
     # the source is built here and enters the workspace with the value, in the last step: a failure before it leaves no S#
     src = Source(sid="", document_id=v.document_id, version_id=v.version_id, title=v.title, section=place.get("section"),
@@ -6292,6 +6566,19 @@ def _take_cached(ws: Workspace, handle: str, data: dict, loc: dict, given: dict,
                  block_end=place.get("block_end"), table_index=place.get("table_index"),
                  page_list=place.get("page_list") or None, partial_document=v.partial, reading_id=v.reading_id,
                  status="complete", tags={"document": ws.doc_handle(v.document_id)})
+    span = value_span(v.version_id, v.reading_id, taken)
+    if _facet_stale(record) and not _stated_at(ws, span):
+        if _picture_cell(taken):  # its text was never read: that is what it says, and nothing is read for it now
+            taken["facet"] = old if old.get("status") == datum.STATUS_STATED else datum.not_read(datum.REASON_PICTURE_CELL)
+        elif (fresh := _facet_again(ws, src, dict(taken), settled[0]["kind"], doc)) is not None:
+            taken["facet"] = datum.forward(fresh, old)  # equal states take the new read (it carries its reason); never lower
+            if fresh["status"] == datum.STATUS_STATED:
+                _update_cached_facet(ws, v.version_id, v.reading_id, data["locator"], fresh)
+    # the number is already registered at this place (round 14 U1, KTD2): no new source and no new id
+    again = _registered_again(ws, span, settled, lambda kind: dict(taken["facet"]))
+    if again is not None:
+        return _value_report(ws, again[0], settled[3], again[1] + " " + MSG_CACHED_TAKEN.format(handle=handle),
+                             _context_lines(ws, cx, again[0]))
     ws.touch(v.document_id, v.title, "retrieved", v.partial)
     value = _new_value(ws, src, "", taken, settled, given, label, path, v.reading_id)
     _stamp_date(ws, value, taken, dating, path)

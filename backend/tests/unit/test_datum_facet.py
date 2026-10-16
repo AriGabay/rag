@@ -328,11 +328,12 @@ def test_a_stored_table_measurement_whose_table_is_not_stored_is_not_read():
     assert T._measurement_facet(_row(table_index=2, row_index=0), None)["status"] == "not_read"
 
 
-def test_a_text_measurement_takes_its_facet_from_its_quote_and_none_when_the_quote_names_nothing():
+def test_a_text_measurement_takes_its_facet_from_its_quote_and_is_not_read_when_the_quote_names_nothing_and_no_blocks_are_at_hand():
     named = _row(quote="שיעור היוון של 6.5% לתזרים דמי שכירות ממשרדים.", value_text="6.5%")
     assert T._measurement_facet(named, None) == _facet("תזרים דמי שכירות ממשרדים", "sentence")
+    # round 14 U3 (R4): "none" would claim a read of the text above that nobody made; the batched block read gives that
     bare = _row(quote="שיעור היוון 10%.", value_text="10%")
-    assert T._measurement_facet(bare, None) == NONE
+    assert T._measurement_facet(bare, None)["status"] == "not_read"
 
 
 def test_a_listed_measurement_exposes_its_facet_in_public():
@@ -931,3 +932,213 @@ def test_the_round14_fixtures_two_plots_are_different_components_not_undecided()
         facets.append((_read_at(rows, at, quote, number), rows[at].section_path[0]))
     (a, sa), (b, sb) = facets
     assert sa != sb and datum.relation(_site(a, sa), _site(b, sb)) == datum.DIFFERENT
+
+
+# =======================================================================================================================
+# round 14 U3: every extraction path and the caches (R4, R5, R17; AE7, AE8; KTD4, KTD5)
+# =======================================================================================================================
+
+PREV_SENTENCE_ROWS = _rows(("paragraph", "לא ניתנה הפחתה בגין עוצמת ניצול. שיעור הפחתה 9%."))
+
+
+def _text_read(rows=PREV_SENTENCE_ROWS, at: int = 0, quote: str = "שיעור הפחתה 9%.", **kw) -> T._TextRead:
+    return T._TextRead(datum.reach(rows, at, quote), rows[at].text, **kw)
+
+
+def test_the_facet_reader_version_is_two_the_verifier_version_stays_and_a_new_record_carries_the_reader():
+    assert T.FACET_READER_VERSION == 2 and T.VALUE_VERIFIER_VERSION == "value-v5"  # KTD5: a bump would drop _known_clear reuse
+    record = T._cache_record(_quote("שיעור היוון של 6.5% לתזרים דמי שכירות ממשרדים.", "6.5"))
+    assert record["facet_reader"] == T.FACET_READER_VERSION
+
+
+def test_the_facet_memo_keeps_only_a_stated_result():
+    ws = Workspace(ctx=None)
+    for status_of, kept in ((lambda: datum.none(), False), (lambda: datum.not_read(), False),
+                            (lambda: datum.unparsed(datum.REASON_INTERVENING), False), (lambda: _facet("x y", "sentence"), True)):
+        key = ("k", len(ws.facets))
+        found = T._facet_memo(ws, key, status_of)
+        assert (key in ws.facets) is kept and found["status"] in ("none", "not_read", "unparsed", "stated")
+    # a second value at the place after a wider read gets the stated facet (nothing froze the earlier "none")
+    key = ("place",)
+    assert T._facet_memo(ws, key, datum.none)["status"] == "none"
+    assert T._facet_memo(ws, key, lambda: _facet("עוצמת ניצול", "paragraph", "context"))["status"] == "stated"
+    assert T._facet_memo(ws, key, datum.none)["status"] == "stated"  # and it is kept from then on
+
+
+def test_a_stated_facet_is_shared_by_a_value_and_a_measurement_of_one_span():
+    text = "לא ניתנה הפחתה בגין עוצמת ניצול. שיעור הפחתה 9%."
+    src = _source(text)
+    taken = T._take_quote(src, text, {"quote": "שיעור הפחתה 9%.", "number": "9"}, [(0, text, 1)])
+    stated = _facet("עוצמת ניצול", "preceding_sentence", "context")
+    ws = Workspace(ctx=None)
+    ws.facets[T._quote_facet_key(src, taken, "proportion")] = stated
+    row = _row(quote="שיעור הפחתה 9%.", value_text="9%", value=Decimal("9"), reading_id="r1", block_index=0)
+    span = T.measurement_span(row, text)
+    assert span == T.value_span(VER, "r1", taken)
+    assert T._measurement_facet_of(ws, None, row, span=span) == stated  # not the measurement's own read (not_read)
+    assert T._measurement_facet_of(Workspace(ctx=None), None, row, span=span)["status"] == "not_read"
+
+
+# --- a stored measurement from text: its context from the batched block read (KTD5) ------------------------------------------
+
+def test_a_text_measurement_in_a_family_that_needs_a_facet_is_not_read_without_its_blocks_never_none():
+    bare = _row(quote="שיעור היוון 10%.", value_text="10%")
+    f = T._measurement_facet(bare, None)
+    assert (f["status"], f["reason"]) == ("not_read", None) and datum.LABEL_NOT_STATED not in datum.line(f)
+    area = _row(metric_kind="area", metric="שטח", unit="sqm", value_text="100 מ\"ר", quote="שטח הנכס 100 מ\"ר.")
+    assert T._measurement_facet(area, None) == datum.none(datum.REASON_NOT_NEEDED)  # a family that needs none reads none
+
+
+def test_a_text_measurement_takes_its_component_from_the_previous_sentence_it_was_read_with():
+    row = _row(quote="שיעור הפחתה 9%.", value_text="9%", metric="שיעור הפחתה", metric_kind="rate")
+    f = T._measurement_facet(row, None, _text_read())
+    assert (f["status"], f["written"], f["part"], f["tier"]) == ("stated", "עוצמת ניצול", "preceding_sentence", "context")
+    assert f["block"] == 0 and f["at"]["segments"][0][0] == 0  # where the context is, apart from the number's own place
+    own = _row(quote="שיעור היוון של 6.5% לתזרים דמי שכירות ממשרדים.", value_text="6.5%")
+    assert T._measurement_facet(own, None, _text_read())["part"] == "sentence"  # an own phrase is read before any context
+
+
+def test_a_text_measurement_listed_beyond_the_cap_or_in_a_picture_is_not_read_with_the_reason():
+    row = _row(quote="שיעור הפחתה 9%.", value_text="9%", metric="שיעור הפחתה", metric_kind="rate")
+    assert T._measurement_facet(row, None, T._TextRead(capped=True)) == datum.not_read(datum.REASON_CAP)
+    assert T._measurement_facet(row, None, T._TextRead(picture=True)) == datum.not_read(datum.REASON_PICTURE_CELL)
+    # the reach itself ran into the character cap before an accepted candidate: not read, never none
+    cut = T._TextRead(datum.Reach([], True, {}), "x")
+    assert T._measurement_facet(row, None, cut) == datum.not_read(datum.REASON_CAP)
+
+
+def test_a_table_measurement_reads_the_notes_of_its_table_after_the_caption():
+    st = _table(["רכיב", "ערך"], [["שטח קרקע", "620"], [STATED_ROW, "0.8"]], "טבלת חישוב")
+    st["notes"] = [f"{STATED_ROW} נקבע בגין זכויות בנייה חלקיות."]
+    row = _row(table_index=0, row_index=1, metric_kind="coefficient", value_text="0.8", header="ערך",
+               quote=f"{STATED_ROW} | 0.8")
+    assert T._measurement_facet(row, st)["status"] == "stated"  # the row label is its own facet, first
+    generic = _table(["רכיב", "ערך"], [["הערך שנקבע", "0.8"]], "טבלת חישוב")
+    generic["notes"] = ["הערך שנקבע הוא מקדם הפחתה בגין עוצמת ניצול."]
+    row = _row(table_index=0, row_index=0, metric_kind="coefficient", value_text="0.8", header="ערך")
+    f = T._measurement_facet(row, generic)
+    assert (f["status"], f["part"], f["tier"]) == ("stated", "table_note", "context")
+    listed = _row(table_index=0, row_index=0, metric_kind="coefficient", value_text="0.8", header="ערך",
+                  table_stored=True, row_cells=["הערך שנקבע", "0.8"], caption="טבלת חישוב", title_lines=[])
+    assert T._listed_facet(listed)["status"] == "none"
+    assert T._listed_facet(listed, generic["notes"]) == f
+
+
+# --- the cache: a locator that names the number, completed in place (KTD5) -------------------------------------------------
+
+def test_two_numbers_of_one_quote_are_keyed_apart_in_the_cache_and_a_cell_keeps_its_own_locator():
+    text = "הובאה הפחתה של 10% בגין סחירות והפחתה של 20% בגין עוצמת ניצול."
+    one, two = (_taken_quote(text, text, n) for n in ("10", "20"))
+    keys = [T._cache_locator(t["locator"], T.value_span(VER, "r1", t)) for t in (one, two)]
+    assert keys[0] != keys[1] and all(k["quote"] == text for k in keys)  # the quote alone is no longer the key
+    cell = {"table_index": 0, "row": "x", "row_number": 1, "column": "y", "column_number": 2}
+    assert T._cache_locator(cell, ("cell", str(VER), "r1", 0, 1, 2)) == cell
+    assert T._cache_locator(one["locator"], None) == one["locator"]  # a quote located to block precision: the old key
+
+
+def test_a_cached_value_is_found_by_its_span_key_else_by_an_older_quote_only_record_of_a_single_number(monkeypatch):
+    stored: dict = {}
+    monkeypatch.setattr(T, "_cached_value", lambda conn, v, r, locator: stored.get(json.dumps(locator, sort_keys=True)))
+    single = "שיעור היוון של 6.5% לתזרים דמי שכירות ממשרדים."
+    two = "הובאה הפחתה של 10% בגין סחירות והפחתה של 20% בגין עוצמת ניצול."
+    for text, number in ((single, "6.5"), (two, "10")):
+        taken = _taken_quote(text, text, number)
+        span = T.value_span(VER, "r1", taken)
+        legacy = {"verifier_version": "value-v5", "record": {"value": number}}
+        stored[json.dumps(taken["locator"], sort_keys=True)] = legacy  # an older record, keyed by the quote alone
+        found = T._cached_value_at(None, VER, "r1", taken["locator"], span)
+        assert (found is legacy) is (text == single)  # found only when that quote holds a single number
+    new = {"verifier_version": "value-v5", "record": {"value": "10"}}
+    taken = _taken_quote(two, two, "10")
+    stored[json.dumps(T._cache_locator(taken["locator"], T.value_span(VER, "r1", taken)), sort_keys=True)] = new
+    assert T._cached_value_at(None, VER, "r1", taken["locator"], T.value_span(VER, "r1", taken)) is new
+
+
+def _cached_with(monkeypatch, facet: dict, reader_version: int | None, text: str = "שיעור הפחתה 9%.", number: str = "9"):
+    """A cached quote value (Q#) whose record carries ``facet`` and ``facet_reader``; the blocks it is read again from are faked.
+    The default sentence states no component of its own, so only the text above it can."""
+    ws, handle = _cached_world(monkeypatch, text, number)
+    doc = T._cached_value(None, VER, "r1", {})
+    doc["record"]["facet"] = facet
+    if reader_version is None:
+        doc["record"].pop("facet_reader", None)
+    else:
+        doc["record"]["facet_reader"] = reader_version
+    calls = {"blocks": 0, "update": []}
+
+    def blocks_between(conn, version_id, a, b):
+        calls["blocks"] += 1
+        return [SimpleNamespace(block_index=0, kind="paragraph", text=doc["record"]["quote"], section_path=("3. היוון",),
+                                status="read")]
+
+    reach_ = datum.reach(PREV_SENTENCE_ROWS, 0, "שיעור הפחתה 9%.")
+    monkeypatch.setattr(T.reader, "blocks_between", blocks_between)
+
+    def preceding(*args, **kwargs):
+        calls["blocks"] += 1
+        return reach_
+
+    monkeypatch.setattr(T, "_preceding_blocks", preceding)
+    monkeypatch.setattr(T, "_update_cached_facet", lambda ws_, version_id, reading_id, locator, found:
+                        calls["update"].append((locator, found)))
+    return ws, handle, calls
+
+
+def test_ae7_a_cached_none_is_read_again_and_a_facet_found_now_is_shown_and_written_in_place(monkeypatch):
+    ws, handle, calls = _cached_with(monkeypatch, datum.none(), T.FACET_READER_VERSION)
+    out = T.tool_take_value(ws, handle, {}, _given(), "שיעור")
+    f = ws.values["V1"].facet
+    assert (f["status"], f["written"], f["part"]) == ("stated", "עוצמת ניצול", "preceding_sentence") and "עוצמת ניצול" in out
+    assert calls["blocks"] >= 1
+    ((locator, written),) = calls["update"]  # one facet-only update of the existing row, with the stated facet
+    assert written == f and locator == ws.handles[handle]["locator"]
+
+
+def test_a_cached_record_of_the_round_13_reader_is_read_again_even_when_it_states_a_facet(monkeypatch):
+    old = _facet("תזרים דמי שכירות ממשרדים", "sentence")
+    ws, handle, calls = _cached_with(monkeypatch, old, None, RATE_TEXT, "6.5")  # absent facet_reader: the round-13 reader
+    T.tool_take_value(ws, handle, {}, _given(), "שיעור")
+    assert ws.values["V1"].facet == old and calls["blocks"] == 0  # its own sentence states it: no block is read for that
+    assert len(calls["update"]) == 1  # stated again: the row learns the reader that read it
+
+
+def test_a_cached_stated_facet_of_the_current_reader_is_reused_with_no_block_read_and_no_write(monkeypatch):
+    stated = _facet("תזרים דמי שכירות ממשרדים", "sentence")
+    ws, handle, calls = _cached_with(monkeypatch, stated, T.FACET_READER_VERSION, RATE_TEXT, "6.5")
+    T.tool_take_value(ws, handle, {}, _given(), "שיעור")
+    assert ws.values["V1"].facet == stated and calls["blocks"] == 0 and calls["update"] == []
+
+
+def test_a_read_again_that_finds_nothing_keeps_the_cached_state_and_writes_nothing(monkeypatch):
+    ws, handle, calls = _cached_with(monkeypatch, datum.none(), T.FACET_READER_VERSION)
+    monkeypatch.setattr(T, "_preceding_blocks", lambda *a, **k: datum.Reach([], False, {}))
+    T.tool_take_value(ws, handle, {}, _given(), "שיעור")
+    assert ws.values["V1"].facet["status"] == "none" and calls["update"] == []
+    ws, handle, calls = _cached_with(monkeypatch, datum.unparsed(datum.REASON_INTERVENING, "paragraph"), 1)
+    monkeypatch.setattr(T, "_preceding_blocks", lambda *a, **k: None)  # the blocks could not be read: never lower a state
+    T.tool_take_value(ws, handle, {}, _given(), "שיעור")
+    assert ws.values["V1"].facet["status"] == "unparsed" and calls["update"] == []
+
+
+def test_a_read_again_that_fails_leaves_the_cached_facet_and_the_take_succeeds(monkeypatch):
+    ws, handle, calls = _cached_with(monkeypatch, datum.none(), T.FACET_READER_VERSION)
+
+    def boom(*a, **k):
+        raise RuntimeError("synthetic")
+
+    monkeypatch.setattr(T.reader, "blocks_between", boom)
+    out = T.tool_take_value(ws, handle, {}, _given(), "שיעור")
+    assert out.startswith("V1") and ws.values["V1"].facet["status"] == "none" and calls["update"] == []
+
+
+def test_ae8_a_cached_picture_cell_is_not_read_again_and_says_the_context_was_not_read(monkeypatch):
+    ws, handle, calls = _cached_with(monkeypatch, datum.not_read(), None)  # a round-13 picture cell: not read, no reason
+    doc = T._cached_value(None, VER, "r1", {})
+    doc["facts"]["locator"] = {"region": "p1#0", "vision_table": 0, "row": "מקדם", "row_number": 1, "column": "ערך",
+                               "column_number": 2}
+    doc["facts"]["table"] = [str(VER), "p1#0#0"]
+    doc["facts"]["anchor"] = {"vision": {"region": "p1#0", "table": 0, "row": 0, "column": 1}}
+    doc["record"]["locator"] = doc["facts"]["locator"]
+    T.tool_take_value(ws, handle, {}, _given(), "שיעור")
+    f = ws.values["V1"].facet
+    assert (f["status"], f["reason"]) == ("not_read", "picture_cell") and calls["blocks"] == 0 and calls["update"] == []

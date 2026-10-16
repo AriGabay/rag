@@ -21,6 +21,7 @@ pytestmark = pytest.mark.db
 
 SECTION_A, SECTION_B = "3. היוון התזרימים", "4. סיכום והערות"
 LEAD_IN = "תזרים הכנסות משטחי פרסום על הגג:"
+TWO_RATES = "הובאה הפחתה של 10% בגין סחירות והפחתה של 20% בגין עוצמת ניצול."
 BLOCKS = [  # (kind, section, text, table_index)
     ("heading", SECTION_A, SECTION_A, None),
     ("paragraph", SECTION_A, "שיעור היוון של 6.5% לתזרים דמי שכירות ממשרדים.", None),
@@ -30,6 +31,7 @@ BLOCKS = [  # (kind, section, text, table_index)
     ("paragraph", SECTION_B, "השמאי הביא בחשבון את מכלול הנתונים שפורטו.", None),
     ("paragraph", SECTION_B, "שיעור היוון 10%.", None),
     ("table", SECTION_B, "טבלת חישוב שווי הקרקע", 0),
+    ("paragraph", SECTION_B, TWO_RATES, None),  # round 14 U3: one sentence holding two numbers (two cache keys)
 ]
 TABLE = {"headers": ["רכיב", "ערך"], "caption": "טבלת חישוב שווי הקרקע", "title": [], "notes": [],
          "section": SECTION_B, "block_index": 7,
@@ -365,3 +367,200 @@ def test_the_read_below_the_context_lookup_asks_the_database_once_for_the_blocks
     finally:
         event.remove(engine, "before_cursor_execute", record)
     assert sum("ORDER BY block_index DESC LIMIT" in q for q in seen) == 1, seen
+
+
+# =======================================================================================================================
+# round 14 U3: every extraction path and the caches, against stored blocks (R4, R5, R17; AE7, AE8; KTD4, KTD5)
+# =======================================================================================================================
+
+def _statements(fn):
+    """The SQL statements ``fn`` ran, without the session set-up."""
+    from sqlalchemy import event
+
+    from app.db import get_engine
+
+    seen: list[str] = []
+
+    def record(conn, cursor, statement, *args):  # noqa: ARG001
+        if "set_config" not in statement:
+            seen.append(statement)
+
+    engine = get_engine()
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        out = fn()
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    return out, seen
+
+
+def _block_reads(statements: list[str]) -> list[str]:
+    """The statements that read the stored blocks of a value's place or its context (``reader.blocks_between``,
+    ``reader.blocks_above``), not the version's cached appraisal contexts."""
+    return [s for s in statements if "FROM document_blocks WHERE version_id" in s]
+
+
+def _add_text_measurement(office, block: int, quote_text: str, value_text: str, value: float, key: str) -> None:
+    with tenant_tx(office.system) as conn:
+        ver = conn.execute(text("SELECT id FROM document_versions WHERE document_id = :d"), {"d": office.doc}).scalar_one()
+        conn.execute(text(
+            "INSERT INTO measurements (office_id, document_id, version_id, block_index, statement_key, metric,"
+            " metric_kind, value, value_form, value_text, unit, period, vat, subject_role, value_role, quote,"
+            " extraction_version, model, status, issues) VALUES (app_office(), :d, :v, :bi, :sk, 'שיעור הפחתה', 'rate',"
+            " :val, 'exact', :vt, 'ratio', 'none', 'unknown', 'general', 'other', :q, :e, 'test', 'auto_validated',"
+            " '[]'::jsonb)"),
+            {"d": office.doc, "v": ver, "bi": block, "sk": key, "val": value, "vt": value_text, "q": quote_text,
+             "e": EXTRACTION_VERSION})
+
+
+def test_a_text_measurement_gets_its_component_and_its_span_from_one_batched_block_read(office):
+    _add_text_measurement(office, 3, BLOCKS[3][2], "9%", 9, "b3:x")
+    _add_text_measurement(office, 3, "ציטוט שאינו בבלוק 9%.", "9%", 9, "b3:y")  # its quote is not in its block
+    ws = workspace(office)
+    _, seen = _statements(lambda: T.tool_find_measurements(ws, "שיעור", metric_kinds=["rate"]))
+    by = {m.row.statement_key: m for m in ws.measurements.values()}
+    lead = by["b3:x"].facet
+    assert (lead["status"], lead["part"], lead["written"]) == ("stated", "lead_in", "תזרים הכנסות משטחי פרסום על הגג")
+    assert by["b1:x"].facet["part"] == "sentence"  # an own phrase needs no context
+    ver = str(by["b3:x"].row.version_id)
+    assert ws.spans[by["b3:x"].mid] == ("quote", ver, "reading-1", 3, BLOCKS[3][2].index("9"))
+    assert by["b3:y"].mid not in ws.spans  # a quote not found in its block has no span
+    assert len([s for s in seen if "FROM document_blocks WHERE EXISTS" in s]) == 1  # one block query for the listing
+    assert not _block_reads(seen)
+
+
+def test_a_listing_beyond_the_context_cap_marks_the_extra_rows_not_read_with_the_reason(office, monkeypatch):
+    _add_text_measurement(office, 3, BLOCKS[3][2], "9%", 9, "b3:x")
+    _add_text_measurement(office, 6, BLOCKS[6][2], "10%", 10, "b6:x")
+    monkeypatch.setattr(T, "MEASUREMENT_FACET_ROWS", 1)
+    ws = workspace(office)
+    _, seen = _statements(lambda: T.tool_find_measurements(ws, "שיעור", metric_kinds=["rate"]))
+    by = {m.row.statement_key: m for m in ws.measurements.values()}
+    read, capped = by["b3:x"].facet, by["b6:x"].facet  # the cap takes the listing's order: block 3 before block 6
+    assert read["status"] == "stated" and (capped["status"], capped["reason"]) == ("not_read", "cap")
+    assert len([s for s in seen if "FROM document_blocks WHERE EXISTS" in s]) == 1
+    assert by["b6:x"].mid in ws.spans  # the span is read from the same query, whatever the facet cap
+
+
+def _cached_rows(office) -> list:
+    with tenant_tx(office.system) as conn:
+        return conn.execute(text("SELECT locator, value FROM verified_values ORDER BY created_at, locator::text")).all()
+
+
+def _q_of(ws, query: str) -> str:
+    return re.search(r"(Q\d+)", T.tool_find_measurements(ws, query)).group(1)
+
+
+def test_ae7_a_cached_none_is_read_again_and_only_the_facet_of_its_row_changes(office):
+    ws, _ = _take(office, SECTION_A, BLOCKS[3][2], "9")
+    fresh = ws.values["V1"].facet
+    assert fresh["status"] == "stated" and fresh["part"] == "lead_in"
+    (row,) = _cached_rows(office)
+    assert row.value["record"]["facet_reader"] == T.FACET_READER_VERSION and row.locator["at"] == [3, BLOCKS[3][2].index("9")]
+    # an earlier turn read it without the context: the record says none and names no reader (the round-13 shape)
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE verified_values SET value = jsonb_set(value #- '{record,facet_reader}', '{record,facet}',"
+                          " CAST(:f AS jsonb))"), {"f": json.dumps(datum_none())})
+    (stale,) = _cached_rows(office)
+    assert "facet_reader" not in stale.value["record"] and stale.value["record"]["facet"]["status"] == "none"
+
+    later = workspace(office)
+    q = _q_of(later, "שיעור היוון")
+    out = run(later, "take_value", source=q, locator={}, meaning=_meaning(), label="שיעור")
+    assert out.startswith("V1 נרשם"), out
+    shown = later.values["V1"].facet
+    assert shown["status"] == "stated" and shown["written"] == fresh["written"] and shown["part"] == "lead_in"
+    (after,) = _cached_rows(office)  # the row is completed in place: same key, same row, only the facet and its reader
+    assert after.locator == stale.locator
+    changed = {k for k in set(after.value["record"]) | set(stale.value["record"])
+               if after.value["record"].get(k) != stale.value["record"].get(k)}
+    assert changed == {"facet", "facet_reader"}
+    assert {k: v for k, v in after.value.items() if k != "record"} == {k: v for k, v in stale.value.items() if k != "record"}
+    assert after.value["record"]["facet"] == shown and after.value["record"]["facet_reader"] == T.FACET_READER_VERSION
+
+    # and it is stated now: a later take reuses it with no read of the blocks, and the verifier version is the same
+    again = workspace(office)
+    q = _q_of(again, "שיעור היוון")
+    _, seen = _statements(lambda: run(again, "take_value", source=q, locator={}, meaning=_meaning(), label="שיעור"))
+    assert not _block_reads(seen) and again.values["V1"].facet == shown
+    assert len(_cached_rows(office)) == 1 and T.VALUE_VERIFIER_VERSION == "value-v5"
+
+
+def datum_none() -> dict:
+    from app.chat import datum
+
+    return datum.none()
+
+
+def test_two_numbers_of_one_quote_are_cached_under_two_keys_and_an_older_quote_only_record_of_one_number_is_found(office):
+    ws = workspace(office)
+    ws.doc = office.doc
+    s = _source_of(ws, SECTION_B)
+    for number in ("10", "20"):
+        out = run(ws, "take_value", source=s, locator=quote(TWO_RATES.rstrip("."), number), meaning=_meaning(), label=number)
+        assert out.startswith("V"), out
+    rows = _cached_rows(office)
+    assert len(rows) == 2 and len({json.dumps(r.locator, sort_keys=True) for r in rows}) == 2
+    assert {r.locator["at"][1] for r in rows} == {TWO_RATES.index("10"), TWO_RATES.index("20")}
+    assert {r.value["record"]["value"] for r in rows} == {"10", "20"}
+
+    # a record written before this round is keyed by its quote alone: found while that quote holds a single number
+    one, _ = _take(office, SECTION_A, BLOCKS[3][2], "9")
+    legacy_quote = BLOCKS[3][2].rstrip(".")
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE verified_values SET locator = locator - 'at' WHERE locator->>'quote' = :q"),
+                     {"q": legacy_quote})
+    span = one.spans["V1"]
+    with tenant_tx(office.ctx()) as conn:
+        ver = conn.execute(text("SELECT id FROM document_versions WHERE document_id = :d"), {"d": office.doc}).scalar_one()
+        found = T._cached_value_at(conn, ver, "reading-1", {"quote": legacy_quote}, span)
+        assert found is not None and found["record"]["value"] == "9"
+        # a quote that holds two numbers is never answered by a quote-only record
+        assert T._cached_value_at(conn, ver, "reading-1", {"quote": TWO_RATES.rstrip(".")}, ("quote", str(ver), "reading-1", 8, 99)) is None
+    assert len(_cached_rows(office)) == 3  # nothing deleted along the way
+
+
+def test_a_fresh_take_that_reads_a_component_completes_a_cached_record_that_had_none(office):
+    _take(office, SECTION_B, BLOCKS[6][2], "10")  # nothing names a component for it: none
+    (row,) = _cached_rows(office)
+    assert row.value["record"]["facet"]["status"] == "none"
+    # the paragraph above it now names one (the stored text is edited for the test); a fresh take reads it and completes the row
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_blocks SET text = 'שיעור היוון נקבע לתזרים הכנסות משטחי חניה.'"
+                          " WHERE block_index = 5"))
+    later = workspace(office)
+    later.doc = office.doc
+    s = _source_of(later, SECTION_B)
+    out = run(later, "take_value", source=s, locator=quote(BLOCKS[6][2].rstrip("."), "10"), meaning=_meaning(), label="שיעור")
+    assert out.startswith("V1 נרשם"), out
+    assert later.values["V1"].facet["status"] == "stated"
+    (after,) = _cached_rows(office)
+    assert after.value["record"]["facet"] == later.values["V1"].facet and after.locator == row.locator
+
+
+def test_a_text_measurement_the_verifier_adopts_has_its_context_read_and_its_span_set(office):
+    import uuid
+
+    from app.chat import meaning
+
+    _add_text_measurement(office, 3, BLOCKS[3][2], "9%", 9, "b3:x")
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE measurements SET subject_role = 'appraised_property',"
+                          " value_role = 'appraiser_determination' WHERE statement_key = 'b3:x'"))
+    ws = workspace(office)
+    fetcher = meaning.Fetcher(ws)
+    row = next(r for r in fetcher.subject_measurements({uuid.UUID(office.doc)}) if r.statement_key == "b3:x")
+    mid = fetcher.adopt(row)
+    facet = ws.measurements[mid].facet
+    assert (facet["status"], facet["part"], facet["written"]) == ("stated", "lead_in", "תזרים הכנסות משטחי פרסום על הגג")
+    assert ws.spans[mid] == ("quote", str(row.version_id), "reading-1", 3, BLOCKS[3][2].index("9"))
+
+
+def test_ae8_a_measurement_read_from_the_text_of_a_picture_says_its_context_was_not_read(office):
+    _add_text_measurement(office, 3, BLOCKS[3][2], "9%", 9, "b3:x")
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_blocks SET kind = 'image' WHERE block_index = 3"))
+    ws = workspace(office)
+    T.tool_find_measurements(ws, "שיעור", metric_kinds=["rate"])
+    facet = next(m.facet for m in ws.measurements.values() if m.row.statement_key == "b3:x")
+    assert (facet["status"], facet["reason"]) == ("not_read", "picture_cell")

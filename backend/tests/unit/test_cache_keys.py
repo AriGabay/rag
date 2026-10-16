@@ -233,3 +233,16 @@ def test_a_cached_value_refuses_another_locator(cached):
     ws, handle, _ = cached
     with pytest.raises(T.ToolError, match=handle):
         T.tool_take_value(ws, handle, {"quote": "השווי", "number": "9,500"}, _given(), "שווי")
+
+
+# --- round 14 U3 (KTD5): the reader that read a cached facet, and the key that names the number ---------------------------------
+
+def test_the_cached_document_names_the_facet_reader_and_keeps_the_values_own_locator_apart_from_its_key():
+    taken = _taken()
+    doc = json.loads(json.dumps(T._cache_doc(_value({"unit": "source"}), taken, ("5. תחשיב",), None, _src(), (0, 0)),
+                                ensure_ascii=False))
+    assert doc["verifier_version"] == "value-v5" and doc["record"]["facet_reader"] == T.FACET_READER_VERSION == 2
+    span = T.value_span(VER, "r1", taken)
+    key = T._cache_locator(taken["locator"], span)
+    assert key["at"] == [span[3], span[4]] and doc["record"]["locator"] == taken["locator"]  # the record's locator is the value's own
+    assert T._locator_agrees(doc["record"], {"quote": PARAGRAPH, "number": "9,500"})
