@@ -7106,7 +7106,7 @@ ROUND14_MANIFEST = "manifest.json"
 ROUND14_MARK = "מסמך בדיקה סינתטי (סבב 14) — נתונים בדויים לבדיקת המערכת בלבד"
 _R14_TAKEN = "בהתאם לאמור לעיל נלקח מקדם הפחתה נוסף בשיעור 10%."
 _R14_STATES = ("stated", "none", "unparsed", "not_read")
-_R14_REASONS = ("not_in_range", "intervening_value", "two_components", "picture_cell", "not_needed", "cap")
+_R14_REASONS = ("not_in_range", "intervening_value", "two_components", "picture_cell", "not_needed", "cap", "own_sentence")
 _R14_PARTS = ("row", "column", "caption", "sentence", "lead_in", "heading", "preceding_sentence", "paragraph", "table_note")
 
 
@@ -7173,7 +7173,87 @@ def round14_documents() -> list[dict[str, Any]]:
                    "AE1-AE3: eight reductions in seven plots, each with the text above it that does or does not state its "
                    "consideration", data)
     doc["blocks"][0] = ("mark", ROUND14_MARK)
-    return [doc]
+    return [doc, *_r14_adjustment_documents()]
+
+
+def _r14_text_datum(did: str, kind: str, unit: str, shown: str, quote: str, facet: dict[str, Any], family: str, section: str,
+                    note: str) -> dict[str, Any]:
+    """A datum read from a sentence (a quote), of any kind: the sentence is in ``section``."""
+    out = _r13_datum(did, kind, unit, shown, facet, family=family, quote=quote, note=note)
+    out["where"]["section"] = section
+    return out
+
+
+def _r14_adjustment_documents() -> list[dict[str, Any]]:
+    """Round-14 U9 shapes of the adjustments of one appraisal, one file each: a table coefficient and the reduction the text
+    gives for the same consideration (the two equal, ``adjust_match``; the two not equal, ``adjust_conflict``: AE6), three equal
+    reductions for three considerations (``three_equal``: AE5) and a sentence that describes its value in words no rule ties to a
+    component, with a consideration in the paragraph above that must not be borrowed (``own_sentence``)."""
+    docs: list[dict[str, Any]] = []
+    sharing = "מקדם הפחתה בשל שיתוף במקרקעין"
+    cap = "טבלת מקדמי התאמה"
+    section = "3. מקדמי התאמה"
+    for key, number, parcel, percent in (("adjust_match", "11", "7", "10%"), ("adjust_conflict", "13", "8", "15%")):
+        u = _r12_unit("התמר", number, ROUND12_CITY_A, "9301", [parcel], "2024-05-31")
+        text_reduction = f"הובאה בחשבון הפחתה של {percent} בגין שיתוף במקרקעין."
+        rows = [["רכיב", "ערך"], ["שטח המגרש", "310 מ״ר"], [sharing, "0.9"], ["מקדם מיקום", "1.1"]]
+        u["body"] = [("h1", section), ("p", cap), ("table", rows), ("p", text_reduction)]
+        blocks = round12_unit_blocks(u)
+        data = [
+            _r13_datum(f"{key}.coef", "coefficient", "ratio", "0.9", _r13_stated(sharing, "row", "own"), family="coefficient",
+                       table=_r13_cell(blocks, cap, sharing, 1, "0.9"),
+                       note="the table coefficient of the consideration"),
+            _r13_datum(f"{key}.location", "coefficient", "ratio", "1.1", _r13_stated("מקדם מיקום", "row", "own"),
+                       family="coefficient", table=_r13_cell(blocks, cap, "מקדם מיקום", 1, "1.1"),
+                       note="a second coefficient, so the answer holds a components table"),
+            _r14_text_datum(f"{key}.reduction", "rate", "percent", percent, text_reduction,
+                            _r13_stated("שיתוף במקרקעין", "sentence", "own"), "proportion", section,
+                            "the text's reduction for the same consideration: "
+                            + ("1 − 0.9 = 10%, one adjustment" if percent == "10%" else "15% is not 1 − 0.9: a conflict")),
+        ]
+        docs.append(_r13_doc(key, f"שומה_רחוב_התמר_{number}_{ROUND12_CITY_A}.docx", "round14", u,
+                             "AE6: a table coefficient for a consideration and the reduction the text gives for it ("
+                             + ("equal" if percent == "10%" else "not equal") + ")", data))
+    # AE5: three reductions of 10%, each for a consideration of its own
+    u = _r12_unit("הדס", "5", ROUND12_CITY_A, "9302", ["3"], "2024-05-31")
+    considerations = ["סחירות", "מושע", "גמישות שימושים"]
+    sentences = [f"הובאה בחשבון הפחתה של 10% בגין {c}." for c in considerations]
+    u["body"] = [("h1", "3. הפחתות"), *[("p", s) for s in sentences]]
+    data = [_r14_text_datum(f"three_equal.{n}", "rate", "percent", "10%", s, _r13_stated(c, "sentence", "own"), "proportion",
+                            "3. הפחתות", "one of three equal reductions, each with its own consideration")
+            for n, (c, s) in enumerate(zip(considerations, sentences, strict=True), 1)]
+    docs.append(_r13_doc("three_equal", f"שומה_רחוב_הדס_5_{ROUND12_CITY_A}.docx", "round14", u,
+                         "AE5: three reductions of 10% for three considerations of one appraisal", data))
+    # the own-sentence rule: the paragraph above names a consideration; the value's sentence describes itself in other words
+    u = _r12_unit("האלה", "9", ROUND12_CITY_A, "9303", ["4"], "2024-05-31")
+    neighbour = "בוצעה הפחתה בגין אי ודאות תכנונית."
+    own = "שיעור ההיוון המקובל בשוק המסחר הוא 6.7%."
+    other = "הובאה בחשבון הפחתה של 8% בגין סחירות."
+    u["body"] = [("h1", "3. שיעורי היוון"), ("p", neighbour), ("p", own), ("p", other)]
+    data = [_r14_text_datum("own_sentence.rate", "rate", "percent", "6.7%", own,
+                            _r14_facet("unparsed", part="sentence", tier="own", reason="own_sentence"), "proportion",
+                            "3. שיעורי היוון", "the sentence describes its value: no component, and the paragraph above is not borrowed"),
+            _r14_text_datum("own_sentence.other", "rate", "percent", "8%", other, _r13_stated("סחירות", "sentence", "own"),
+                            "proportion", "3. שיעורי היוון", "a second value of the appraisal, with a purpose phrase of its own")]
+    docs.append(_r13_doc("own_sentence", f"שומה_רחוב_האלה_9_{ROUND12_CITY_A}.docx", "round14", u,
+                         "the own-sentence rule: a descriptive sentence is unparsed and borrows nothing", data))
+    # the reported shape: two reductions of one appraisal; the second is explained two sentences earlier, in its own paragraph
+    u = _r12_unit("הברוש", "3", ROUND12_CITY_A, "9304", ["6"], "2024-05-31")
+    first = "נלקח מקדם הפחתה בשיעור 20% בגין סחירות."
+    explained = "השמאי לא מצא לנכון לתת הפחתה בגין אינטנסיביות שימוש. הנכס נבדק לגופו ונמצא תקין."
+    second = "לאור האמור, בחוות דעת זו הבאתי בחשבון מקדם הפחתה נוסף של 10%."
+    u["body"] = [("h1", "3. הפחתות"), ("p", first), ("h1", "4. הפחתה נוספת"), ("p", f"{explained} {second}")]
+    data = [_r14_text_datum("reported.first", "coefficient", "percent", "20%", first, _r13_stated("סחירות", "sentence", "own"),
+                            "coefficient", "3. הפחתות", "the first reduction names its consideration itself"),
+            _r14_text_datum("reported.second", "coefficient", "percent", "10%", second,
+                            _r14_facet("stated", "אינטנסיביות שימוש", "preceding_sentence", "context"), "coefficient",
+                            "4. הפחתה נוספת", "the consideration is two sentences earlier, in the same paragraph, with no reduction between")]
+    docs.append(_r13_doc("reported", f"שומה_רחוב_הברוש_3_{ROUND12_CITY_A}.docx", "round14", u,
+                         "the reported shape: a reduction with its own consideration, and a second explained two sentences earlier",
+                         data))
+    for doc in docs:
+        doc["blocks"][0] = ("mark", ROUND14_MARK)
+    return docs
 
 
 def _r14_cases(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -7192,6 +7272,15 @@ def _r14_cases(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         {"id": "AE3", "covers": "R2", "documents": ["context_reader"],
          "expected": states("r14.second_plot", "r14.table_edge"),
          "also": "the read stops at another section's heading and at a table; the state is read without a component"},
+        {"id": "AE5", "covers": "R7", "documents": ["three_equal"], "expected": states("three_equal.1", "three_equal.2", "three_equal.3"),
+         "also": "three reductions of 10%, each for a consideration of its own: three rows, no conflict, no undecided"},
+        {"id": "AE6", "covers": "R8", "documents": ["adjust_match", "adjust_conflict"],
+         "expected": {"adjust_match": {"pair": ["adjust_match.coef", "adjust_match.reduction"], "decision": "reconciled"},
+                      "adjust_conflict": {"pair": ["adjust_conflict.coef", "adjust_conflict.reduction"], "decision": "conflict"}}},
+        {"id": "reported", "covers": "R1, R2", "documents": ["reported"], "expected": states("reported.first", "reported.second"),
+         "also": "the second reduction takes the consideration two sentences earlier; the first keeps its own"},
+        {"id": "own_sentence", "covers": "R2", "documents": ["own_sentence"],
+         "expected": states("own_sentence.rate", "own_sentence.other")},
         {"id": "relation", "covers": "R2, KTD3 rule 3", "documents": ["context_reader"],
          "expected": {"pair": ["r14.same_block", "r14.own_phrase"], "decision": "different",
                       "why": "a facet read from the sentence above and an own purpose phrase, in two sections of one appraisal "
@@ -7226,7 +7315,8 @@ def write_round14(out: Path) -> None:
         "about": f"{ROUND14_MARK}. Known contents of the round-14 fixture (eight plots of one appraisal, each with a reduction of 10% "
                  "or 20% and the text above it: the consideration in the sentence just before, in the paragraph above, behind a "
                  "reduction of another kind, as two considerations, behind a table, across a section heading, and the value's own "
-                 "purpose phrase); generated by scripts/generate_fixtures.py --only round14 from the generator's own text (never "
+                 "purpose phrase; and five more files for the U9 acceptance shapes: a table coefficient and its text reduction, equal and not "
+                 "equal, three equal reductions for three considerations, a descriptive sentence, and the reported shape of two reductions); generated by scripts/generate_fixtures.py --only round14 from the generator's own text (never "
                  "read back from the files) - do not edit by hand. Every name, address, city, block, parcel and amount is invented.",
         "synthetic_marker": ROUND14_MARK,
         "cities": [ROUND12_CITY_A],
@@ -7240,7 +7330,8 @@ def write_round14(out: Path) -> None:
                        "two_components": "the phrase names two components",
                        "picture_cell": "a cell of a picture: its text was not read",
                        "not_needed": "the family needs no component",
-                       "cap": "the character cap ended the search before its range did"},
+                       "cap": "the character cap ended the search before its range did",
+                       "own_sentence": "the value's own sentence describes it, and no rule ties its words to a component"},
             "part": list(_R14_PARTS),
             "tier": {"own": "the value's own row label, column header or purpose phrase",
                      "context": "an earlier sentence or paragraph, a note, a caption, a lead-in or a heading"},

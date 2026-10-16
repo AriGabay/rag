@@ -18,15 +18,26 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 
 import pytest
 from sqlalchemy import text
 
-from app.chat import timeline
+from app.chat import datum, timeline
 from app.chat import tools as T
+from app.chat.compose import SERVER_SPANS_FIELD
 from app.db import tenant_tx
+from app.measurements.extract import EXTRACTION_VERSION
 from tests.integration.test_chat_inspect import emp
-from tests.integration.test_chat_timeline import ADOPTED
+from tests.integration.test_chat_timeline import (
+    ADOPTED,
+    _focus_of,
+    m_diagnostics,
+    partial,  # noqa: F401 - three dated appraisals and an undated one of a property: coverage that can never be complete (the fixture)
+    setup,  # noqa: F401 - the office of those appraisals (the fixture ``partial`` takes)
+)
+from tests.integration.test_chat_timeline import agent as timeline_agent
+from tests.integration.test_chat_timeline import ask as ask_timeline
 from tests.integration.test_chat_value_status import (
     _ocr_sees_the_table,
     _uncertain_table,
@@ -39,7 +50,7 @@ from tests.integration.test_round10_sequences import (
 from tests.integration.test_round10_sequences import (
     no_models as no_models,  # noqa: F401 - the autouse inline-run setup
 )
-from tests.integration.test_round12_sequences import bare_world
+from tests.integration.test_round12_sequences import bare_world, unit_appraisal
 from tests.integration.test_round13_sequences import (
     LAND,
     LAND_Q,
@@ -58,7 +69,7 @@ from tests.integration.test_round13_sequences import (
     take,
     world13,
 )
-from tests.support.scripted_agent import call
+from tests.support.scripted_agent import call, final
 
 pytestmark = pytest.mark.db
 
@@ -103,8 +114,8 @@ def test_ae4_one_quote_and_number_registered_three_times_is_one_value_and_one_ro
     (block,) = a["time"]["breakdown"]
     assert [r["sid"] for r in block["rows"]] == ["V1", "V2"] and [r["value_text"] for r in block["rows"]] == ["6.5", "7.25"]
     assert all(r["marks"] == [] for r in block["rows"]) and a["time"]["timeline"] == []
-    # (d) after a refresh the same rows
-    stored = refreshed_equals_live(o, t, live)
+    # (d) after a refresh the same rows; the body and the table agree and the turn made no model call beyond the script
+    stored = after_turn(o, t, live)
     assert rows_in(stored["time"]["breakdown"]).keys() == {"V1", "V2"}
     # the diagnostics of a turn whose registrations all succeeded hold no record of failures
     assert "registrations" not in (diagnostics_of(o, t)["resolution"] or {})
@@ -203,7 +214,7 @@ def test_ae9_values_the_answer_does_not_cite_are_no_rows_and_no_payload_values_a
         assert r["state"]["reading"] == "verified" and r["state"]["claim"]["result"] == "supported"
     assert rows["V6"]["state"]["component"]["status"] == "none" and rows["V6"]["state"]["reason"] == "not_in_range"
     assert rows["V1"]["state"]["component"]["status"] == "stated" and rows["V1"]["state"]["comparison"]["status"] == "different"
-    stored = refreshed_equals_live(o, t, live)
+    stored = after_turn(o, t, live)
     assert stored["time"]["breakdown"] == a["time"]["breakdown"]
     # an answer stored before round 14 has no state, note or counterpart list: the API returns it as stored
     with tenant_tx(o.ctx()) as conn:
@@ -244,40 +255,154 @@ def test_r16_when_verification_removes_the_only_claim_citing_a_value_its_row_lea
     refreshed_equals_live(o, t, live)
 
 
+# =======================================================================================================================
+# round 14 U9: the acceptance shapes (AE1-AE11) end to end, with a reload, and no model call beyond the script (R1-R17)
+# =======================================================================================================================
+
+CITED = re.compile(r"\[([VM]\d+)\]")
+FACET_FIELDS = ("status", "written", "part", "tier")
+MODEL_PURPOSES = {"agent", "request", "verify", "verify_final"}
+
+
+def rows_of_answer(answer: dict) -> list[dict]:
+    return [r for key in ("timeline", "breakdown") for b in answer["time"][key] for r in b["rows"]]
+
+
+def component_of(row: dict) -> dict:
+    return {k: row["state"]["component"].get(k) for k in FACET_FIELDS}
+
+
+def consistent_with_body(answer: dict) -> None:
+    """The body and the table agree (R7, R9, R11, R13; KTD7, KTD8): every value the final answer cites that is in a components
+    block is on screen exactly once (a row of its own, or the reduction of its coefficient's row), no value is on screen twice, a
+    components row is one the answer cites, and every row's component state is the facet of its value: the table says what the
+    reading found, whatever words the body used. A component the source states is never shown as missing."""
+    cited = set(CITED.findall(answer["markdown"])) | {i["id"] for c in answer.get("computations") or [] for i in c.get("inputs") or []}
+    on_screen = Counter()
+    for r in rows_of_answer(answer):
+        on_screen[r["sid"]] += 1
+        if r.get("reduction"):
+            on_screen[r["reduction"]["sid"]] += 1
+    assert all(n == 1 for n in on_screen.values()), f"a value on screen twice: {on_screen}"
+    for b in answer["time"]["breakdown"]:
+        for r in b["rows"]:
+            for sid in (r["sid"], (r.get("reduction") or {}).get("sid")):
+                assert sid is None or sid in cited, f"{sid} is on screen in a components block and the answer does not cite it"
+    values = {v["id"]: v for v in [*answer["values"], *(answer.get("measurements") or [])]}
+    for r in rows_of_answer(answer):
+        facet = {k: values[r["sid"]]["facet"].get(k) for k in FACET_FIELDS}
+        assert component_of(r) == facet, (r["sid"], component_of(r), facet)
+        if facet["status"] == datum.STATUS_STATED:
+            assert r["facet"] == facet["written"] and r["facet"] != timeline.MSG_NO_FACET
+        else:
+            assert r["facet"] != timeline.MSG_NO_FACET or r["state"]["component"]["reason"] == datum.REASON_NOT_NEEDED
+        assert r["state"]["component"]["status"] != datum.STATUS_STATED or r["state"]["component"]["written"]
+
+
+def model_calls(message: dict) -> Counter:
+    """The model calls of a turn by purpose, as the message stored them."""
+    return Counter(u["purpose"] for u in message["usage"])
+
+
+def no_extra_model_calls(message: dict, agent, exhausted: bool = True) -> None:
+    """The new paths make no model call (KTD3, KTD4; the plan's cost criterion): the calls the turn recorded by purpose are the
+    scripted agent's own steps, the request analysis and the verification judge, exactly as the scripted provider received them."""
+    used = model_calls(message)
+    assert set(used) <= MODEL_PURPOSES, used
+    received = Counter(c.purpose.value for c in agent.calls)
+    assert set(received) <= {"resolve", "verify"}, received  # nothing else reached the provider
+    assert used["agent"] == len(agent.seen)
+    assert used["request"] == received.get("resolve", 0)
+    assert used["verify"] + used["verify_final"] == received.get("verify", 0)
+    assert not exhausted or agent.steps == [], "the script was used up: no step was left over and none was asked beyond it"
+
+
+def after_turn(o, t, live, exhausted: bool = True) -> dict:
+    """What every sequence ends with: the answer read back equals the live one, the body and the table agree, the turn made no model
+    call beyond the script. Returns the stored answer."""
+    stored = refreshed_equals_live(o, t, live)
+    assert stored["verification"]["correctness"] == live[-1]["verification"]["correctness"]
+    consistent_with_body(stored)
+    no_extra_model_calls(t.message, t.agent, exhausted)
+    return stored
+
+
 # --- a component read from an earlier sentence: its location, quote and resolved anchor ------------------------------------------
 
 MANIFEST14 = json.loads((FIXTURES / "round14" / "manifest.json").read_text(encoding="utf-8"))
-DOC14 = MANIFEST14["documents"]["context_reader"]
+DOCS14 = MANIFEST14["documents"]
+DOC14 = DOCS14["context_reader"]
 DATA14 = {d["id"]: d for d in DOC14["data"]}
+DATUM14 = {d["id"]: d | {"doc": key} for key, spec in DOCS14.items() for d in spec["data"]}
 
 
-def plot_hits(items: list) -> list[dict]:
-    """The search hits the model has seen, as attributes (a hit that repeats an earlier one is self-closing: ``same_as``)."""
+def world14(db, client, monkeypatch, calls, keys: tuple[str, ...], email: str = "admin-r14u9@example.test"):
+    """A synthetic office with the given round-14 fixtures uploaded through the worker (single appraisals), cloud use on."""
+    o = bare_world(db, client, monkeypatch, calls, email)
+    for key in keys:
+        o.ids[key] = upload(o, FIXTURES / DOCS14[key]["file"], DOCS14[key]["source_kind"], monkeypatch)
+    return o
+
+
+def hits14(items: list, doc: str) -> list[dict]:
+    """The search hits of ``doc`` the model has seen, as attributes and body, in order (a hit that repeats an earlier one is
+    self-closing, ``same_as``, and holds no text: it is not a candidate)."""
     out = []
     for it in items:
         if isinstance(it, dict) and it.get("type") == "function_call_output":
-            for m in re.finditer(r"<source ([^>]*?)/?>", it["output"]):
-                out.append(dict(re.findall(r'(\w+)="([^"]*)"', m.group(1))))
+            for m in re.finditer(r"<source ([^>]*?[^/>])>(.*?)</source>", it["output"], re.S):
+                attrs = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
+                if attrs.get("document_id") == doc:
+                    out.append(attrs | {"body": m.group(2)})
     return out
 
 
-def take14(o, datum_id: str, items: list) -> dict:
-    d = DATA14[datum_id]
-    quote = d["where"]["quote"].rstrip(".")
-    locator = {"table": None, "row": None, "row_number": None, "column": None, "column_number": None, "quote": quote,
-               "number": re.sub(r"[^\d.,]", "", d["shown"])}
-    section = d["where"]["section"]  # the same sentence is in several plots: the hit is the one of the datum's section
-    source = next(h["id"] for h in plot_hits(items) if section in h.get("location", "") and "same_as" not in h)
-    return call("take_value", source=source, locator=locator, meaning=ADOPTED | {"kind": "coefficient", "unit": "percent",
-                                                                               "subject": "הנכס"}, label=datum_id)
+def take14(o, datum_id: str, items: list, **meaning) -> dict:
+    """A ``take_value`` of a round-14 manifest datum, from the hit of its document that holds it: a cell by its row and column
+    header, a sentence by its quote (the same sentence is in several plots: the hit is the one of the datum's section), with the
+    kind and unit the manifest gives."""
+    d = DATUM14[datum_id]
+    doc, where = o.ids[d["doc"]], d["where"]
+    number = re.sub(r"[^\d.,]", "", d["shown"])
+    if "table" in where:
+        t = where["table"]
+        locator = {"table": None, "row": t["row_label"], "row_number": None, "column": t["column_header"], "column_number": None,
+                   "quote": None, "number": number}
+        needles, section = (t["row_label"], number), ""
+    else:
+        quote = where["quote"].rstrip(".")
+        locator = {"table": None, "row": None, "row_number": None, "column": None, "column_number": None, "quote": quote,
+                   "number": number}
+        needles, section = (quote,), where.get("section", "")
+    held = [h for h in hits14(items, doc) if all(n in h["body"] for n in needles)]
+    source = next(h["id"] for h in held if section in h.get("location", ""))
+    base = ADOPTED | {"kind": d["kind"], "unit": d["unit"], "subject": "הנכס"}
+    return call("take_value", source=source, locator=locator, meaning=base | meaning, label=datum_id)
+
+
+def search14(o, datum_ids: list[str]) -> list:
+    """The model's first step: a search per datum, by its row label or its sentence, in the datum's document."""
+    asked = []
+    for i in datum_ids:
+        d = DATUM14[i]
+        where = d["where"]
+        asked.append((o.ids[d["doc"]], where["table"]["row_label"] if "table" in where else where["quote"].rstrip(".")))
+    return [call("search", query=q, document_ids=[doc], limit=None) for doc, q in dict.fromkeys(asked)]
+
+
+def sequence14(o, question: str, datum_ids: list[str], body: str, subject: str, kind: str = "coefficient", unit: str = "percent",
+               **agent):
+    """One turn: search, register the data in order (V1, V2 ...) and answer with ``body``."""
+    steps = [search14(o, datum_ids), lambda items: [take14(o, i, items) for i in datum_ids],
+             answer_of(body, subject, kind, unit)]
+    return ask13(o, question, steps, **agent)
 
 
 def test_a_component_read_from_an_earlier_sentence_carries_its_location_quote_and_resolved_anchor_never_the_stub(
         db, client, monkeypatch, calls, live):
-    o = bare_world(db, client, monkeypatch, calls, "admin-r14u6@example.test")
-    o.ids["ctx14"] = upload(o, FIXTURES / DOC14["file"], DOC14["source_kind"], monkeypatch)
+    o = world14(db, client, monkeypatch, calls, ("context_reader",), "admin-r14u6@example.test")
     pair = ["r14.same_block", "r14.own_phrase"]
-    steps = [[call("search", query=DATA14[i]["where"]["quote"].rstrip("."), document_ids=[o.ids["ctx14"]], limit=None) for i in pair],
+    steps = [[call("search", query=DATA14[i]["where"]["quote"].rstrip("."), document_ids=[o.ids["context_reader"]], limit=None) for i in pair],
              lambda items: [take14(o, i, items) for i in pair],
              answer_of("; ".join(f"מקדם הפחתה {DATA14[i]['shown']} [V{n}]" for n, i in enumerate(pair, 1)) + ".", "הרימון 7",
                        "coefficient", "percent")]
@@ -290,11 +415,11 @@ def test_a_component_read_from_an_earlier_sentence_carries_its_location_quote_an
         "preceding_sentence", "paragraph")
     ctx = first["context"]
     assert ctx["location"] and ctx["quote"] and len(ctx["quote"]) <= timeline.CONTEXT_QUOTE_MAX
-    assert ctx["anchor"]["document_id"] == o.ids["ctx14"] and ctx["anchor"]["precision"] == "structured"
+    assert ctx["anchor"]["document_id"] == o.ids["context_reader"] and ctx["anchor"]["precision"] == "structured"
     assert ctx["quote"] == "השמאי לא נתן הפחתה בגין עוצמת ניצול.", "the sentence the snapshot highlights"
     assert (second["status"], second["tier"], second["context"]) == ("stated", "own", None)
     assert "'at'" not in str(a["time"]) and '"at"' not in json.dumps(a["time"], ensure_ascii=False), "the raw stub is never sent"
-    refreshed_equals_live(o, t, live)
+    after_turn(o, t, live)
 
 
 def second_bullet_partial_judge(input: str) -> dict:
@@ -321,3 +446,341 @@ def test_a_row_states_the_verification_result_of_the_claim_citing_it_and_a_partl
     # the reading and the comparison are apart from the claim: a partly supported value is still a verified reading
     assert rows["V2"]["state"]["reading"] == "verified" and rows["V2"]["state"]["comparison"]["status"] == "different"
     refreshed_equals_live(o, t, live)
+
+
+# --- AE2, AE3: another value stands between, or another plot's section: no component is borrowed --------------------------------
+
+def reduction_line(datum_id: str, n: int, words: str = "מקדם הפחתה") -> str:
+    return f"{words} {DATUM14[datum_id]['shown']} [V{n}]"
+
+
+def test_ae2_a_value_between_the_consideration_and_the_value_leaves_the_10_percent_without_the_component_and_says_why(
+        db, client, monkeypatch, calls, live):
+    o = world14(db, client, monkeypatch, calls, ("context_reader",))
+    ids = ["r14.between", "r14.same_block"]
+    body = "; ".join(reduction_line(i, n) for n, i in enumerate(ids, 1)) + "."
+    t = sequence14(o, "מהן ההפחתות בנכס ברחוב הרימון 7?", ids, body, "הרימון 7")
+    a = t.answer
+    kept_whole(o, t)
+    (block,) = a["time"]["breakdown"]
+    rows = rows_in(a["time"]["breakdown"])
+    ten = rows["V1"]["state"]["component"]
+    assert (ten["status"], ten["reason"], ten["written"]) == ("unparsed", "intervening_value", None)
+    assert rows["V1"]["facet"] == timeline.FACET_TEXT[("unparsed", "intervening_value")]
+    assert rows["V1"]["facet"] != "עוצמת ניצול", "the consideration before the 20% is not the 10%'s"
+    # the same sentence in the plot with no value between is stated: the difference is the value that stands between
+    assert rows["V2"]["state"]["component"]["written"] == "עוצמת ניצול"
+    assert not any("conflict" in r["marks"] for r in block["rows"]) and named_by_marks(a) <= set(rows)
+    assert [v["facet"]["written"] for v in a["values"]] == [None, "עוצמת ניצול"]
+    after_turn(o, t, live)
+
+
+def test_ae3_a_value_across_a_section_heading_and_one_behind_a_table_take_no_component_from_the_plot_before_and_are_not_merged(
+        db, client, monkeypatch, calls, live):
+    """Both edges in one answer: the value across a section heading and the one behind a table each read no component, and the two
+    bare 10% (two places of one appraisal) are two values — the equal amount merges nothing (R7, KTD1)."""
+    o = world14(db, client, monkeypatch, calls, ("context_reader",))
+    ids = ["r14.same_block", "r14.second_plot", "r14.table_edge"]
+    body = "; ".join(reduction_line(i, n) for n, i in enumerate(ids, 1)) + "."
+    t = sequence14(o, "מהם מקדמי ההפחתה בנכס ברחוב הרימון 7?", ids, body, "הרימון 7")
+    a = t.answer
+    kept_whole(o, t)
+    rows = rows_in(a["time"]["breakdown"])
+    assert set(rows) == {"V1", "V2", "V3"}
+    first = rows["V1"]["state"]["component"]
+    assert (first["status"], first["written"], first["part"]) == ("stated", "עוצמת ניצול", "preceding_sentence")
+    # the read stopped at the heading (or the table): read, with no component, and the consideration of the plot before is not its
+    for sid in ("V2", "V3"):
+        second = rows[sid]["state"]
+        assert (second["component"]["status"], second["component"]["reason"], second["component"]["written"]) == (
+            "none", "not_in_range", None) and second["reason"] == "not_in_range"
+        assert rows[sid]["facet"] == timeline.FACET_TEXT[("none", "not_in_range")] and rows[sid]["facet"] != first["written"]
+    assert [v["facet"]["written"] for v in a["values"]] == ["עוצמת ניצול", None, None]
+    # equal amounts, one with a component and two without: nothing to set against each other, so no conflict mark of any kind
+    assert not any("conflict" in r["marks"] for r in rows.values()) and all("conflict_with" not in r for r in rows.values())
+    # the two bare values are two data of two places: neither is the unit's headline datum, and equal numbers alone never merge them
+    assert rows["V2"]["state"]["comparison"]["status"] == rows["V3"]["state"]["comparison"]["status"] != "same"
+    after_turn(o, t, live)
+
+
+def test_ae1_the_reported_shape_a_second_reduction_explained_two_sentences_earlier_is_one_row_with_that_component_beside_the_first(
+        db, client, monkeypatch, calls, live):
+    """Two reductions of one appraisal: the first names its own consideration, the second (its sentence points back: "in light of the
+    above") takes the consideration from the sentence two before it, in its paragraph."""
+    o = world14(db, client, monkeypatch, calls, ("reported",))
+    ids = ["reported.first", "reported.second"]
+    body = ("מקדם הפחתה בגין סחירות 20% [V1]; מקדם הפחתה נוסף בגין אינטנסיביות שימוש 10% [V2].")
+    t = sequence14(o, "מהם מקדמי ההפחתה שהובאו בחשבון בנכס ברחוב הברוש 3?", ids, body, "הברוש 3")
+    a = t.answer
+    kept_whole(o, t)
+    rows = rows_in(a["time"]["breakdown"])
+    assert [(r["value_text"], r["facet"]) for r in rows.values()] == [("20", "סחירות"), ("10", "אינטנסיביות שימוש")]
+    second = rows["V2"]["state"]["component"]
+    assert (second["status"], second["part"], second["tier"]) == ("stated", "preceding_sentence", "context")
+    assert second["context"]["quote"] == "השמאי לא מצא לנכון לתת הפחתה בגין אינטנסיביות שימוש."
+    assert all(r["marks"] == [] for r in rows.values()) and named_by_marks(a) == set()
+    after_turn(o, t, live)
+
+
+# --- the own-sentence rule: a sentence that describes its value borrows nothing --------------------------------------------------
+
+def test_a_value_whose_own_sentence_describes_it_is_unparsed_with_that_reason_and_borrows_nothing_from_the_paragraph_above(
+        db, client, monkeypatch, calls, live):
+    o = world14(db, client, monkeypatch, calls, ("own_sentence",))
+    ids = ["own_sentence.rate", "own_sentence.other"]
+    body = ("שיעור ההיוון המקובל בשוק המסחר הוא 6.7% [V1]; הפחתה של 8% בגין סחירות [V2].")
+    t = sequence14(o, "מהם שיעורי ההיוון וההפחתות בנכס ברחוב האלה 9?", ids, body, "האלה 9", "rate", "percent")
+    a = t.answer
+    kept_whole(o, t)
+    rows = rows_in(a["time"]["breakdown"])
+    own = rows["V1"]["state"]
+    assert (own["component"]["status"], own["component"]["reason"], own["component"]["tier"], own["component"]["part"]) == (
+        "unparsed", "own_sentence", "own", "sentence")
+    assert own["component"]["written"] is None and own["component"]["context"] is None, "no borrowed place"
+    assert rows["V1"]["facet"] == timeline.FACET_TEXT[("unparsed", "own_sentence")]
+    # the consideration of the paragraph above (uncertainty of planning) is nowhere in the table or in what the model was told
+    assert "אי ודאות" not in json.dumps(a["time"], ensure_ascii=False) + json.dumps(a["values"], ensure_ascii=False)
+    told = next(c for c in calls if c.name == "take_value").output
+    assert "אי ודאות" not in told and datum.line(datum.unparsed(datum.REASON_OWN_SENTENCE, datum.PART_SENTENCE, datum.TIER_OWN)) in told
+    assert rows["V2"]["state"]["component"]["written"] == "סחירות"
+    after_turn(o, t, live)
+
+
+# --- AE5: three equal rates for three adjustments --------------------------------------------------------------------------------
+
+def test_ae5_three_equal_reductions_for_three_considerations_are_three_rows_with_three_components_and_no_mark(
+        db, client, monkeypatch, calls, live):
+    o = world14(db, client, monkeypatch, calls, ("three_equal",))
+    ids = ["three_equal.1", "three_equal.2", "three_equal.3"]
+    body = "; ".join(f"הפחתה של 10% בגין {DATUM14[i]['facet']['written']} [V{n}]" for n, i in enumerate(ids, 1)) + "."
+    t = sequence14(o, "מהן ההפחתות בנכס ברחוב הדס 5?", ids, body, "הדס 5", "rate", "percent")
+    a = t.answer
+    kept_whole(o, t)
+    (block,) = a["time"]["breakdown"]
+    assert [r["sid"] for r in block["rows"]] == ["V1", "V2", "V3"] and [r["value_text"] for r in block["rows"]] == ["10"] * 3
+    assert [r["facet"] for r in block["rows"]] == ["סחירות", "מושע", "גמישות שימושים"]
+    assert all(r["marks"] == [] and "conflict_with" not in r and "undecided_with" not in r for r in block["rows"])
+    assert all(r["state"]["comparison"]["status"] == "different" for r in block["rows"])
+    assert "conflict" not in json.dumps(a["time"], ensure_ascii=False) and "undecided" not in json.dumps(a["time"], ensure_ascii=False)
+    assert a["time"]["timeline"] == [] and a["requested"] == [] and a["gaps"] == []
+    after_turn(o, t, live)
+
+
+# --- AE6: a table coefficient and the text's reduction of the same consideration ---------------------------------------------------
+
+ADJUSTMENT_Q = "מהם מקדמי ההתאמה וההפחתות בנכס ברחוב התמר {n}?"
+
+
+def adjustment_turn(db, client, monkeypatch, calls, key: str, n: str, email: str):
+    o = world14(db, client, monkeypatch, calls, (key,), email)
+    ids = [f"{key}.coef", f"{key}.location", f"{key}.reduction"]
+    reduction = DATUM14[ids[2]]["shown"]
+    body = ("- מקדם הפחתה בשל שיתוף במקרקעין הוא 0.9 [V1]\n- מקדם מיקום הוא 1.1 [V2]\n"
+            f"- ההפחתה בשל שיתוף במקרקעין היא {reduction} [V3]")
+    return o, sequence14(o, ADJUSTMENT_Q.format(n=n), ids, body, f"התמר {n}")
+
+
+def test_ae6_a_table_coefficient_and_the_texts_reduction_for_the_same_consideration_are_one_row_with_the_derived_computation(
+        db, client, monkeypatch, calls, live):
+    o, t = adjustment_turn(db, client, monkeypatch, calls, "adjust_match", "11", "admin-r14u9a@example.test")
+    a = t.answer
+    kept_whole(o, t)
+    (block,) = a["time"]["breakdown"]
+    assert [r["sid"] for r in block["rows"]] == ["V1", "V2"], "the reduction is no row of its own"
+    row = block["rows"][0]
+    assert row["value_text"] == "0.9" and row["reduction"]["sid"] == "V3" and row["reduction"]["value_text"] == "10"
+    assert row["marks"] == [] and "conflict_with" not in row and "undecided_with" not in row
+    (c,) = a["computations"]
+    assert row["derived"] == c["id"] and c["result_kind"] == "derived" and c["expression"] == "1 − V1" and c["value"] == "0.1"
+    assert [i["id"] for i in c["inputs"]] == ["V1"] and "conflict" not in json.dumps(a["time"], ensure_ascii=False)
+    # the reduction's own facet is the coefficient's consideration, which is why they are one adjustment
+    values = {v["id"]: v for v in a["values"]}
+    assert values["V3"]["facet"]["written"] in values["V1"]["facet"]["written"]
+    after_turn(o, t, live)
+
+
+def test_ae6_a_reduction_of_15_percent_against_the_coefficient_0_9_of_the_same_consideration_is_a_conflict_naming_each_other(
+        db, client, monkeypatch, calls, live):
+    o, t = adjustment_turn(db, client, monkeypatch, calls, "adjust_conflict", "13", "admin-r14u9b@example.test")
+    a = t.answer
+    rows = rows_in(a["time"]["breakdown"])
+    assert set(rows) == {"V1", "V2", "V3"} and "reduction" not in rows["V1"]
+    assert rows["V1"]["marks"] == ["conflict"] and rows["V1"]["conflict_with"] == ["V3"]
+    assert rows["V3"]["marks"] == ["conflict"] and rows["V3"]["conflict_with"] == ["V1"]
+    assert rows["V2"]["marks"] == [] and a["computations"] == [], "nothing reconciles: no derived computation"
+    assert "מקדם הפחתה בשל שיתוף במקרקעין" in (rows["V1"]["facet"], rows["V3"]["facet"]) or rows["V3"]["facet"] == "שיתוף במקרקעין"
+    after_turn(o, t, live)
+
+
+# --- AE10: a partial mark opens the detail of the claim it marks -----------------------------------------------------------------
+
+def test_ae10_a_claim_marked_verified_in_part_has_a_partials_row_a_mark_in_the_text_and_a_diagnostics_entry_with_its_detail(
+        db, client, monkeypatch, calls, live):
+    o = world13(db, client, monkeypatch, calls, ("land_table",))
+    ans = answer_of("\n".join([BULLET_1, BULLET_2]), "הצבעוני 14")
+    steps = [search_for(o, "מקדם הפחתה", ("land_table",), LAND), registering(o, LAND), ans, ans, ans]
+    t = ask13(o, LAND_Q, steps, judge=second_bullet_partial_judge)
+    a = t.answer
+    v = a["verification"]
+    assert v["partial"] == 1 and v["removed"] == 0 and "0.9" in a["markdown"]
+    # the partials row, the mark in the text and the diagnostics entry are one claim, paired by its id
+    (row,) = v["partials"]
+    (span,) = [s for s in a[SERVER_SPANS_FIELD] if s["kind"] == "partial_mark"]
+    assert span["ordinal"] == row["ordinal"] == 1 and span["claim_ids"] == row["claim_ids"] and row["claim_id"] == row["claim_ids"][0]
+    log = diagnostics_of(o, t)["removed"]
+    (entry,) = [e for e in log if e["claim_id"] == row["claim_id"]]
+    assert entry["action"] in ("qualified", "cut")
+    assert entry["supported"] and entry["not_verified"], "what was verified and what was not"
+    assert entry["why"]["check"] and set(entry["checked"]) == {"sources", "rereads"}, "why, and what was checked"
+    assert entry["checked"]["sources"], "the sources the check read"
+    # the owner may open it, and the value's row says the claim is partial
+    assert client.get(f"/api/chat/messages/{t.message['id']}").json()["can_view_diagnostics"] is True
+    assert rows_in(a["time"]["breakdown"])["V2"]["state"]["claim"]["result"] == "partial"
+    # after a reload the mark, the row and the entry are the same
+    stored = after_turn(o, t, live, exhausted=False)
+    assert stored["verification"]["partials"] == v["partials"]
+    assert [s for s in stored[SERVER_SPANS_FIELD] if s["kind"] == "partial_mark"] == [span]
+    assert [e for e in diagnostics_of(o, t)["removed"] if e["claim_id"] == row["claim_id"]] == [entry]
+
+
+# --- AE11: "current" describing the document is no recency claim ------------------------------------------------------------------
+
+OLDEST = "1,950,000 ₪ כולל מע״מ"  # the 2022 appraisal's value: V3 of the timeline office, an older value than the latest
+
+
+def older_value_answer(words: str) -> dict:
+    return final(f"{words} הוא {OLDEST} [V3].", focus=_focus_of(),
+                 claims=[{"text": f"{words} הוא {OLDEST}", "source_ids": ["V3"], "basis": "explicit"}])
+
+
+def recency_turn(client, partial, monkeypatch, words: str, insists: bool):
+    steps = timeline_agent(partial, ["y2025", "y2024", "y2022"], older_value_answer(words))
+    if insists:
+        steps.steps += [older_value_answer(words)] * 2  # the model keeps the wording through the repair rounds
+    m = ask_timeline(client, partial, monkeypatch, steps)
+    return m, steps
+
+
+@pytest.mark.parametrize("words", ["בחוות הדעת הנוכחית השווי", "בשומה הנוכחית השווי"])
+def test_ae11_current_describing_the_document_raises_no_recency_problem_under_partial_coverage(
+        client, partial, monkeypatch, words):
+    m, steps = recency_turn(client, partial, monkeypatch, words, insists=False)
+    a = m["answer"]
+    assert a["time"]["coverage"]["complete"] is False, "the coverage is partial: the recency check is armed"
+    assert "recency_claim" not in json.dumps(m_diagnostics(client, m), ensure_ascii=False)
+    assert a["markdown"] == f"{words} הוא {OLDEST} [V3]." and a["verification"]["removed"] == 0
+    assert client.get(f"/api/chat/messages/{m['id']}").json()["answer"]["markdown"] == a["markdown"]
+    no_extra_model_calls(m, steps)
+
+
+@pytest.mark.parametrize("words", ["בשומה האחרונה השווי", "השווי העדכני"])
+def test_ae11_the_latest_appraisal_and_the_latest_value_still_raise_the_recency_problem(client, partial, monkeypatch, words):
+    m, steps = recency_turn(client, partial, monkeypatch, words, insists=True)
+    assert "recency_claim" in json.dumps(m_diagnostics(client, m), ensure_ascii=False)
+    assert "1,950,000" in m["answer"]["markdown"] and m["answer"]["verification"]["removed"] == 0, "supported content is marked, not removed"
+    no_extra_model_calls(m, steps, exhausted=False)
+
+
+# --- AE7: a cached value with no component is read again when a later turn takes it ----------------------------------------------
+
+def cached_rows(o) -> list:
+    with tenant_tx(o.system) as conn:
+        return conn.execute(text("SELECT locator, value FROM verified_values ORDER BY created_at, locator::text")).all()
+
+
+@pytest.mark.parametrize("stale", [datum.none, datum.not_read], ids=["none", "not_read"])
+def test_ae7_a_cached_value_whose_component_state_is_none_or_not_read_is_read_again_on_a_later_turn_and_the_row_is_completed(
+        db, client, monkeypatch, calls, live, stale):
+    o = world14(db, client, monkeypatch, calls, ("context_reader",))
+    ids = ["r14.same_block", "r14.own_phrase"]
+    body = "; ".join(reduction_line(i, n) for n, i in enumerate(ids, 1)) + "."
+    first = sequence14(o, "מהם מקדמי ההפחתה בנכס ברחוב הרימון 7?", ids, body, "הרימון 7")
+    assert rows_in(first.answer["time"]["breakdown"])["V1"]["state"]["component"]["written"] == "עוצמת ניצול"
+    before = cached_rows(o)
+    assert len(before) == 2 and all(r.value["record"]["facet"]["status"] == "stated" for r in before)
+    # an earlier build cached the first value read without its context: the record says none (or not read) and names no reader
+    sentence = DATUM14["r14.same_block"]["where"]["quote"].rstrip(".")
+    with tenant_tx(o.system) as conn:
+        conn.execute(text("UPDATE verified_values SET value = jsonb_set(value #- '{record,facet_reader}', '{record,facet}',"
+                          " CAST(:f AS jsonb)) WHERE value->'record'->>'quote' = :q"), {"f": json.dumps(stale()), "q": sentence})
+    (old,) = [r for r in cached_rows(o) if r.value["record"]["quote"] == sentence]
+    assert old.value["record"]["facet"]["status"] in ("none", "not_read") and "facet_reader" not in old.value["record"]
+
+    # a later turn takes it from the cache (Q#), and the unit's other value afresh
+    def cached(items):
+        q = re.search(r"\b(Q\d+)\b", [i["output"] for i in items if isinstance(i, dict) and i.get("type") == "function_call_output"][-2])
+        empty = {"table": None, "row": None, "row_number": None, "column": None, "column_number": None, "quote": None, "number": None}
+        base = ADOPTED | {"kind": "coefficient", "unit": "percent", "subject": "הנכס"}
+        return [call("take_value", source=q.group(1), locator=empty, meaning=base, label="r14.same_block"),
+                take14(o, "r14.own_phrase", items)]
+
+    doc = o.ids["context_reader"]
+    steps = [[call("find_measurements", query="בהתאם לאמור לעיל", metric_kinds=None, document_ids=[doc], value_roles=None, page=None),
+              *search14(o, ["r14.own_phrase"])], cached, answer_of(body, "הרימון 7", "coefficient", "percent")]
+    second = ask13(o, "מהם מקדמי ההפחתה בנכס ברחוב הרימון 7?", steps)
+    a = second.answer
+    taken = [c for c in calls if c.name == "take_value"][-2]
+    assert "Q" in taken.args["source"] and taken.output.startswith("V1"), taken.output
+    rows = rows_in(a["time"]["breakdown"])
+    component = rows["V1"]["state"]["component"]
+    assert (component["status"], component["written"], component["part"]) == ("stated", "עוצמת ניצול", "preceding_sentence")
+    assert rows["V1"]["facet"] == "עוצמת ניצול" and "עוצמת ניצול" in taken.output
+    # the record was completed in place: the same row, only its facet and its reader changed; nothing was added or deleted
+    after = cached_rows(o)
+    assert len(after) == 2
+    (done,) = [r for r in after if r.value["record"]["quote"] == sentence]
+    assert done.locator == old.locator and done.value["record"]["facet"]["status"] == "stated"
+    assert done.value["record"]["facet_reader"] == T.FACET_READER_VERSION
+    changed = {k for k in set(done.value["record"]) | set(old.value["record"]) if done.value["record"].get(k) != old.value["record"].get(k)}
+    assert changed == {"facet", "facet_reader"}
+    kept_whole(o, second)
+    after_turn(o, second, live)
+
+
+# --- AE8: a cell of a picture says its context was not read ----------------------------------------------------------------------
+
+def test_ae8_a_value_read_from_the_text_of_a_picture_says_its_context_was_not_read_never_that_the_source_states_no_component(
+        db, client, monkeypatch, calls, live):
+    """The listing path: two stored rate measurements of one appraisal, one in a paragraph (its sentence names its cash flow) and one
+    in the text of a picture (a bare sentence, whose neighbours are not what it was read with), both cited by their M#."""
+    o = bare_world(db, client, monkeypatch, calls, "admin-r14u9c@example.test")
+    stated, picture = "שיעור היוון של 6.5% לתזרים דמי שכירות ממשרדים (31/03/2024).", "שיעור היוון 9% (31/03/2024)."
+    doc = unit_appraisal(o, "r14-picture", "עיר-סינתטית", "31/03/2024", "1,000,000", street="הכלנית", number="8", block="9102",
+                         parcel="12", extra=[stated, picture])
+    with tenant_tx(o.system) as conn:
+        ver = conn.execute(text("SELECT id FROM document_versions WHERE document_id = :d"), {"d": doc}).scalar_one()
+        blocks = {t: i for i, t in conn.execute(text("SELECT block_index, text FROM document_blocks WHERE document_id = :d"),
+                                                {"d": doc}).all()}
+        conn.execute(text("UPDATE document_blocks SET kind = 'image' WHERE document_id = :d AND text = :t"), {"d": doc, "t": picture})
+        for quote, shown, amount in ((stated, "6.5%", 6.5), (picture, "9%", 9)):
+            conn.execute(text(
+                "INSERT INTO measurements (office_id, document_id, version_id, block_index, statement_key, metric, metric_kind,"
+                " value, value_form, value_text, unit, period, vat, subject_role, value_role, quote, effective_date,"
+                " extraction_version, model, status, issues) VALUES (app_office(), :d, :v, :bi, :sk, 'שיעור היוון', 'rate', :val,"
+                " 'exact', :vt, 'percent', 'none', 'unknown', 'appraised_property', 'appraiser_determination', :q, '2024-03-31',"
+                " :e, 'test', 'auto_validated', '[]'::jsonb)"),
+                {"d": doc, "v": ver, "bi": blocks[quote], "sk": f"b{blocks[quote]}:x", "val": amount, "vt": shown, "q": quote,
+                 "e": EXTRACTION_VERSION})
+
+    def answer(items):
+        listing_ = [i["output"] for i in items if isinstance(i, dict) and i.get("type") == "function_call_output"][-1]
+        ids = {shown: re.search(rf"(M\d+): [^\n]*= {re.escape(shown)}", listing_).group(1) for shown in ("6.5%", "9%")}
+        return answer_of(f"שיעור היוון 6.5% [{ids['6.5%']}]; שיעור היוון 9% [{ids['9%']}].", "הכלנית 8", "rate", "percent", [doc])
+
+    steps = [[call("find_measurements", query="שיעור היוון", metric_kinds=["rate"], document_ids=[doc], value_roles=None, page=None)],
+             answer]
+    t = ask13(o, "מהם שיעורי ההיוון בנכס ברחוב הכלנית 8?", steps)
+    a = t.answer
+    kept_whole(o, t)
+    rows = rows_in(a["time"]["breakdown"])
+    (pic,) = [r for r in rows.values() if r["value_text"] == "9%"]
+    (ok,) = [r for r in rows.values() if r["value_text"] == "6.5%"]
+    state = pic["state"]["component"]
+    assert (state["status"], state["reason"], state["written"]) == ("not_read", "picture_cell", None) and pic["state"]["reason"] == "picture_cell"
+    assert pic["facet"] == timeline.FACET_TEXT[("not_read", "picture_cell")]
+    assert pic["facet"] not in (timeline.MSG_NO_FACET, timeline.FACET_TEXT[("none", "not_in_range")]), "not read is never not stated"
+    assert ok["state"]["component"]["status"] == "stated" and ok["facet"] == "תזרים דמי שכירות ממשרדים"
+    # the payload's measurement carries the same state, and the listing the model read did not say the component is missing
+    assert {m["value_text"]: m["facet"]["reason"] for m in a["measurements"] if m["facet"]["status"] != "stated"} == {"9%": "picture_cell"}
+    assert timeline.MSG_NO_FACET not in [c for c in calls if c.name == "find_measurements"][0].output
+    after_turn(o, t, live)
