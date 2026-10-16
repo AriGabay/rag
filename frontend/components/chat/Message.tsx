@@ -6,12 +6,15 @@ import type {
   ChatAnswer,
   ChatAnswerTime,
   ChatBreakdownBlock,
+  ChatBreakdownRow,
   ChatAssumption,
   ChatComponent,
+  ChatComponentContext,
   ChatComputation,
   ChatComputationInput,
   ChatLedger,
   ChatMessage,
+  ChatNotInAnswer,
   ChatProgressStep,
   ChatRemoval,
   ChatRequirement,
@@ -45,8 +48,9 @@ import {
   valueStatusText,
 } from "@/lib/format";
 import { type CitationTarget, Markdown, citationOrder, plainAnswer } from "./Markdown";
-import { assumptionText, citedTarget, standardChipTitle, valueStatusOf } from "./cited";
-import { ActionLines, type CutFocus, type ExpandAll, RemovalsSection } from "./Changes";
+import { assumptionText, citedSource, citedTarget, standardChipTitle, valueStatusOf } from "./cited";
+import { ActionLines, type CutFocus, type ExpandAll, type PartialFocus, RemovalsSection } from "./Changes";
+import { documentAnchor } from "./SourceViewer";
 
 export interface CitedItem {
   /** A passage, or the document passage behind a measurement or computation input. */
@@ -104,6 +108,57 @@ export function citedView(answer: ChatAnswer, id: string): CitedView | null {
   if (answer.assumptions?.some((a) => a.id === id)) return { kind: "assumption", id };
   const nav = answerNav(answer, id);
   return nav ? { kind: "source", nav } : null;
+}
+
+/** The server's "verified in part" mark, as `compose.PARTIAL_MARK` writes it (leading space included). */
+const PARTIAL_MARK = " *(אומת חלקית)*";
+
+/** A "verified in part" mark of the saved text that the client can link (round 14 U8, KTD9): its ordinal, its code-point range and the
+ * claims it covers. Only a `partial_mark` span with an ordinal whose range holds exactly the server's mark text; a mark stored
+ * before round 14 (no ordinal) or a span that no longer matches the text stays plain text. */
+export interface PartialSpan {
+  ordinal: number;
+  start: number;
+  end: number;
+  claimIds: string[];
+}
+
+export function partialSpans(answer: ChatAnswer): PartialSpan[] {
+  const chars = Array.from(answer.markdown);
+  const seen = new Set<number>();
+  const out: PartialSpan[] = [];
+  for (const s of answer.server_spans ?? []) {
+    const n = s.ordinal;
+    if (s.kind !== "partial_mark" || typeof n !== "number" || !Number.isInteger(n) || n < 1 || seen.has(n)) continue;
+    if (!Number.isInteger(s.start) || !Number.isInteger(s.end) || s.start < 0 || s.end <= s.start || s.end > chars.length) continue;
+    if (chars.slice(s.start, s.end).join("") !== PARTIAL_MARK) continue;
+    seen.add(n);
+    const row = answer.verification?.partials?.find((p) => p.ordinal === n);
+    out.push({
+      ordinal: n,
+      start: s.start,
+      end: s.end,
+      claimIds: s.claim_ids ?? row?.claim_ids ?? (row?.claim_id ? [row.claim_id] : []),
+    });
+  }
+  return out.sort((a, b) => a.start - b.start);
+}
+
+/** `markdown` (a piece of the saved text that starts at code point `base`) with each of `marks` inside it turned into a `#partial-N`
+ * link, like the cut markers' `#cut-N`: the displayed words stay the saved words, and `Markdown` renders the link as a button. */
+export function linkPartialMarks(markdown: string, base: number, marks: PartialSpan[]): string {
+  if (marks.length === 0) return markdown;
+  const chars = Array.from(markdown);
+  let out = "";
+  let at = 0;
+  for (const m of marks) {
+    const a = m.start - base;
+    const b = m.end - base;
+    if (a < at || b > chars.length) continue; // not in this piece
+    out += chars.slice(at, a).join("") + ` *[(אומת חלקית)](#partial-${m.ordinal})*`;
+    at = b;
+  }
+  return out + chars.slice(at).join("");
 }
 
 function citationTargets(answer: ChatAnswer): Map<string, CitationTarget> {
@@ -177,6 +232,31 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
   const [detailsOpen, setDetailsOpen] = useState(false);
   const removalsId = useId();
   const noteParts = useMemo(() => (answer ? removalNoteParts(answer) : null), [answer]);
+  // a "verified in part" mark is a button only for a viewer who may open the diagnostics (round 14 U8, KTD9): the owner or an admin
+  const canViewDiagnostics = message.can_view_diagnostics === true;
+  const marks = useMemo(
+    () => (answer && !answer.hidden && canViewDiagnostics ? partialSpans(answer) : []),
+    [answer, canViewDiagnostics],
+  );
+  const markOrdinals = useMemo(() => new Set(marks.map((m) => m.ordinal)), [marks]);
+  const [partialFocus, setPartialFocus] = useState<PartialFocus | null>(null);
+  const openPartial = useCallback(
+    (ordinal: number) =>
+      setPartialFocus((f) => ({
+        ordinal,
+        claimIds: marks.find((m) => m.ordinal === ordinal)?.claimIds ?? [],
+        tick: (f?.tick ?? 0) + 1,
+      })),
+    [marks],
+  );
+  // a components-table row's context chip: the viewer at the place the component was read from (round 14 U8, R12)
+  const openContext = useCallback(
+    (sid: string, ctx: ChatComponentContext) => {
+      const target = answer && onOpenSource ? contextTarget(answer, sid, ctx) : null;
+      if (target && onOpenSource) onOpenSource({ items: [target], index: 0 });
+    },
+    [answer, onOpenSource],
+  );
 
   if (message.status === "running" || message.status === "cancelling") {
     const steps = progressLines(message.progress);
@@ -247,8 +327,16 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
   }
 
   const timeNote = timePreferenceNote(message, answer);
-  const renderMarkdown = (markdown: string) => (
-    <Markdown markdown={markdown} citations={citations} onCite={cite} cuts={cutOrdinals} onCut={openCut} />
+  const renderMarkdown = (markdown: string, base = 0) => (
+    <Markdown
+      markdown={linkPartialMarks(markdown, base, marks)}
+      citations={citations}
+      onCite={cite}
+      cuts={cutOrdinals}
+      onCut={openCut}
+      partials={markOrdinals}
+      onPartial={openPartial}
+    />
   );
 
   const copy = async () => {
@@ -273,9 +361,9 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
       <div className="body" dir="rtl">
         {noteParts ? (
           <>
-            {noteParts.head.trim() && renderMarkdown(noteParts.head)}
+            {noteParts.head.trim() && renderMarkdown(noteParts.head, 0)}
             <div className="removal-note" data-testid="removal-note">
-              {renderMarkdown(noteParts.note)}
+              {renderMarkdown(noteParts.note, noteParts.start)}
               <button
                 type="button"
                 className="source-link"
@@ -287,7 +375,7 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
                 פירוט ההסרות
               </button>
             </div>
-            {noteParts.tail.trim() && renderMarkdown(noteParts.tail)}
+            {noteParts.tail.trim() && renderMarkdown(noteParts.tail, noteParts.end)}
           </>
         ) : (
           renderMarkdown(answer.markdown)
@@ -295,7 +383,7 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
       </div>
       <AnswerQuality answer={answer} />
       <Timeline groups={answer.time?.timeline} onCite={cite} />
-      <Breakdown blocks={answer.time?.breakdown} onCite={cite} />
+      <Breakdown blocks={answer.time?.breakdown} onCite={cite} onOpenContext={onOpenSource ? openContext : undefined} />
       <CoverageNote coverage={answer.time?.coverage} />
       <div className="msg-actions">
         <button type="button" className="icon-btn" onClick={copy} aria-label="העתקת התשובה" title="העתקה">
@@ -324,6 +412,8 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
         onDetailsToggle={setDetailsOpen}
         removalsId={removalsId}
         onOpenSource={onOpenSource}
+        canViewDiagnostics={canViewDiagnostics}
+        partialFocus={partialFocus}
       />
     </div>
   );
@@ -332,7 +422,9 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
 /** The saved text split around the server's removal note (round 13 U12, KTD14): the text before it, the note and the
  * text after it, so the note carries its action. Only when the answer has removal rows to open and the registry's span
  * (code-point offsets, as Python wrote them) holds a blockquote; otherwise the text is shown whole, as before. */
-export function removalNoteParts(answer: ChatAnswer): { head: string; note: string; tail: string } | null {
+export function removalNoteParts(
+  answer: ChatAnswer,
+): { head: string; note: string; tail: string; start: number; end: number } | null {
   if (!answer.verification?.removals?.length) return null;
   const spans = (answer.server_spans ?? []).filter((s) => s.kind === "removal_note");
   if (spans.length !== 1) return null;
@@ -341,7 +433,7 @@ export function removalNoteParts(answer: ChatAnswer): { head: string; note: stri
   if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start || end > chars.length) return null;
   const note = chars.slice(start, end).join("");
   if (!note.trimStart().startsWith(">")) return null;
-  return { head: chars.slice(0, start).join(""), note, tail: chars.slice(end).join("") };
+  return { head: chars.slice(0, start).join(""), note, tail: chars.slice(end).join(""), start, end };
 }
 
 /** The time preference an answer was produced with, worded as the setting and not as a claim that ordering happened
@@ -469,19 +561,43 @@ function MarkBadges({
   );
 }
 
-/** The three cells the timeline and the components table share. The `td` (its class) stays with each table. */
-function SourceCell({ row, onCite }: { row: Pick<ChatTimelineRow, "sid" | "source">; onCite: (id: string) => void }) {
+/** A value's or source's citation chip: it opens the viewer at the value's own place (the anchor of its V#, M# or S#). */
+function SourceChip({
+  sid,
+  source,
+  onCite,
+}: {
+  sid: string;
+  source: ChatTimelineRow["source"];
+  onCite: (id: string) => void;
+}) {
+  return (
+    <button
+      type="button"
+      className="cite tl-cite"
+      onClick={() => onCite(sid)}
+      title={[source.title, source.location].filter(Boolean).join(" — ")}
+      aria-label={`מקור ${sid}: ${source.title}`}
+    >
+      {sid}
+    </button>
+  );
+}
+
+/** The three cells the timeline and the components table share. The `td` (its class) stays with each table. `chip` is false in a
+ * reconciled row, whose value cell holds the chip of each of its two forms (round 14 U8). */
+function SourceCell({
+  row,
+  onCite,
+  chip = true,
+}: {
+  row: Pick<ChatTimelineRow, "sid" | "source">;
+  onCite: (id: string) => void;
+  chip?: boolean;
+}) {
   return (
     <>
-      <button
-        type="button"
-        className="cite tl-cite"
-        onClick={() => onCite(row.sid)}
-        title={[row.source.title, row.source.location].filter(Boolean).join(" — ")}
-        aria-label={`מקור ${row.sid}: ${row.source.title}`}
-      >
-        {row.sid}
-      </button>
+      {chip && <SourceChip sid={row.sid} source={row.source} onCite={onCite} />}
       <span className="tl-title">{row.source.title}</span>
     </>
   );
@@ -491,14 +607,33 @@ function ValueCell({ row }: { row: Pick<ChatTimelineRow, "value_text" | "unit"> 
   return <B>{timelineValue(row)}</B>;
 }
 
+/** A history row's label (round 14 U6): the server's note that the value is one datum's other row, not part of the conclusion. */
+function RowNote({ note }: { note: string | undefined }) {
+  if (!note) return null;
+  return (
+    <span className="tl-kind" data-testid="row-note" style={{ display: "block", marginInlineStart: 0 }}>
+      {note}
+    </span>
+  );
+}
+
 function MarksCell({
   row,
   onCite,
 }: {
-  row: Pick<ChatTimelineRow, "marks" | "undecided_with" | "conflict_with">;
+  row: Pick<ChatTimelineRow, "marks" | "undecided_with" | "conflict_with" | "not_in_answer_with">;
   onCite: (id: string) => void;
 }) {
-  return <MarkBadges marks={row.marks} counterparts={row} onCite={onCite} />;
+  return (
+    <>
+      <MarkBadges marks={row.marks} counterparts={row} onCite={onCite} />
+      {(row.not_in_answer_with ?? []).map((c: ChatNotInAnswer) => (
+        <span key={c.sid} className="tl-kind" data-testid="not-in-answer" style={{ marginInlineStart: 0 }}>
+          {`ערך זה אינו בתשובה: ${[c.title, c.location].filter(Boolean).join(", ")}`}
+        </span>
+      ))}
+    </>
+  );
 }
 
 /** The server-built timeline of comparable dated values (round 11 U9, U10): groups and rows in the payload's order,
@@ -531,6 +666,7 @@ function Timeline({ groups, onCite }: { groups: ChatTimelineGroup[] | undefined;
                   </td>
                   <td role="cell" className="tl-value">
                     <ValueCell row={r} />
+                    <RowNote note={r.note} />
                   </td>
                   <td role="cell" className="tl-source">
                     <SourceCell row={r} onCite={onCite} />
@@ -548,11 +684,137 @@ function Timeline({ groups, onCite }: { groups: ChatTimelineGroup[] | undefined;
   );
 }
 
-/** The components table (round 13 U6, KTD7, R8-R10): the parallel components of one appraisal unit at one date, side by side
- * instead of as competing values. Blocks and rows in the payload's order, never re-sorted here; each row shows the facet in
- * the source's own words (long ones wrap), the value, the source chip and the marks. Built like the timeline (same table,
- * stacked rows on a phone); an older message has no `breakdown` and renders nothing. */
-function Breakdown({ blocks, onCite }: { blocks: ChatBreakdownBlock[] | undefined; onCite: (id: string) => void }) {
+/** The context line is clipped to the same 120 characters the server clips to; the screen holds the limit itself (round 14 U8). */
+const CONTEXT_QUOTE_LIMIT = 120;
+
+function clipQuote(quote: string): string {
+  const chars = Array.from(quote.trim());
+  return chars.length > CONTEXT_QUOTE_LIMIT ? `${chars.slice(0, CONTEXT_QUOTE_LIMIT).join("").trimEnd()}…` : chars.join("");
+}
+
+/** What the context chip opens: the place the component was read from, in the viewer. It is the value's source passage with the
+ * context's words and its resolved anchor; null when the place could not be located (the line is then shown without a chip). */
+export function contextTarget(answer: ChatAnswer, sid: string, ctx: ChatComponentContext): ViewerTarget | null {
+  const anchor = documentAnchor(ctx.anchor);
+  const src = citedSource(answer, sid);
+  if (!anchor || !src) return null;
+  return {
+    // another id than the value's own, so the viewer does not take the two places for one
+    id: `${sid}#context`,
+    anchor,
+    source: {
+      ...src,
+      document_id: anchor.document_id,
+      version_id: anchor.version_id,
+      reading_id: anchor.reading_id ?? src.reading_id ?? null,
+      title: anchor.location.title ?? src.title,
+      section: anchor.location.section ?? src.section,
+      location: ctx.location,
+      text: ctx.quote ?? src.text,
+      block_start: anchor.block_start,
+      block_end: anchor.block_end,
+      table_index: anchor.table?.table_index ?? null,
+      page_list: anchor.pages.map((p) => p.page),
+      anchor: ctx.anchor,
+    },
+  };
+}
+
+/** The component cell (round 14 U8, R11, R12), in order: the component's words, or the server's sentence for the state of the
+ * component (`facet` already carries the right one: "ההקשר לא נקרא" is never worded as "not stated"); one line saying where it was
+ * read from and the words there; a chip that opens that place. The line and the chip exist only when the component was read from
+ * elsewhere than the value's own sentence (`state.component.context`); a row of an older answer is its facet alone. */
+function FacetCell({
+  row,
+  onOpenContext,
+}: {
+  row: ChatBreakdownRow;
+  onOpenContext?: (sid: string, ctx: ChatComponentContext) => void;
+}) {
+  const ctx = row.state?.component.context ?? null;
+  const where = ctx ? `${ctx.location}${ctx.quote ? `: «${clipQuote(ctx.quote)}»` : ""}` : "";
+  return (
+    <td role="cell" className="tl-facet">
+      <div data-testid="breakdown-facet">{row.facet}</div>
+      {ctx && (
+        <div
+          data-testid="breakdown-context"
+          style={{ fontWeight: 400, fontSize: "12.5px", color: "var(--chat-muted)", overflowWrap: "anywhere" }}
+        >
+          {where}
+        </div>
+      )}
+      {ctx && ctx.anchor && onOpenContext && (
+        <button
+          type="button"
+          className="cite tl-cite"
+          data-testid="context-chip"
+          onClick={() => onOpenContext(row.sid, ctx)}
+          aria-label={`פתיחת ההקשר: ${ctx.location}, ${ctx.anchor.location.label}`}
+          title={`${ctx.location} — ${ctx.anchor.location.label}`}
+        >
+          הקשר
+        </button>
+      )}
+    </td>
+  );
+}
+
+/** A coefficient and the reduction derived from it are one adjustment (round 14 U4, AE6): both forms on two lines, the coefficient
+ * first, each with its own value chip; under them the formula (`1 − 0.9`) with a chip that opens the derived calculation
+ * (`derived`, null while none is registered: the text alone). */
+function ReconciledValue({
+  row,
+  reduction,
+  onCite,
+}: {
+  row: ChatBreakdownRow;
+  reduction: NonNullable<ChatBreakdownRow["reduction"]>;
+  onCite: (id: string) => void;
+}) {
+  const formula = `1 − ${row.value_text}`;
+  return (
+    <>
+      <div data-testid="reconciled-form">
+        <B>{timelineValue(row)}</B> <SourceChip sid={row.sid} source={row.source} onCite={onCite} />
+      </div>
+      <div data-testid="reconciled-form">
+        <B>{timelineValue(reduction)}</B> <SourceChip sid={reduction.sid} source={reduction.source} onCite={onCite} />
+      </div>
+      <div className="tl-kind" data-testid="reconciled-formula" style={{ display: "block", marginInlineStart: 0 }}>
+        <bdi dir="ltr">{formula}</bdi>
+        {row.derived && (
+          <>
+            {" "}
+            <button
+              type="button"
+              className="cite tl-cite"
+              data-testid="derived-chip"
+              onClick={() => onCite(row.derived as string)}
+              aria-label={`חישוב ${row.derived}: ${formula}`}
+            >
+              {row.derived}
+            </button>
+          </>
+        )}
+      </div>
+    </>
+  );
+}
+
+/** The components table (round 13 U6, KTD7, R8-R10; round 14 U8): the parallel components of one appraisal unit at one date, side
+ * by side instead of as competing values. Blocks and rows in the payload's order, never re-sorted here; each row shows the component
+ * cell (`FacetCell`), the value, the source chip and the marks. Built like the timeline (same table, stacked rows on a phone); an
+ * older message has no `breakdown` and renders nothing, and a row without `state` is the facet alone. */
+function Breakdown({
+  blocks,
+  onCite,
+  onOpenContext,
+}: {
+  blocks: ChatBreakdownBlock[] | undefined;
+  onCite: (id: string) => void;
+  onOpenContext?: (sid: string, ctx: ChatComponentContext) => void;
+}) {
   const shown = (blocks ?? []).filter((b) => b.rows.length > 0);
   if (shown.length === 0) return null;
   return (
@@ -579,14 +841,20 @@ function Breakdown({ blocks, onCite }: { blocks: ChatBreakdownBlock[] | undefine
             <tbody role="rowgroup">
               {b.rows.map((r, ri) => (
                 <tr key={`${ri}-${r.sid}`} role="row" data-testid="breakdown-row">
-                  <td role="cell" className="tl-facet" data-testid="breakdown-facet">
-                    {r.facet}
-                  </td>
+                  <FacetCell row={r} onOpenContext={onOpenContext} />
                   <td role="cell" className="tl-value">
-                    <ValueCell row={r} />
+                    {r.reduction ? (
+                      <ReconciledValue row={r} reduction={r.reduction} onCite={onCite} />
+                    ) : (
+                      <ValueCell row={r} />
+                    )}
+                    <RowNote note={r.note} />
                   </td>
                   <td role="cell" className="tl-source">
-                    <SourceCell row={r} onCite={onCite} />
+                    <SourceCell row={r} onCite={onCite} chip={!r.reduction} />
+                    {r.reduction && r.reduction.source.title !== r.source.title && (
+                      <span className="tl-title">{r.reduction.source.title}</span>
+                    )}
                   </td>
                   <td role="cell" className="tl-marks">
                     <MarksCell row={r} onCite={onCite} />
@@ -750,6 +1018,8 @@ function AnswerDetails({
   onDetailsToggle,
   removalsId,
   onOpenSource,
+  canViewDiagnostics,
+  partialFocus,
 }: {
   answer: ChatAnswer;
   messageId: string;
@@ -763,6 +1033,11 @@ function AnswerDetails({
   /** The id of the removals list the note's button controls. */
   removalsId: string;
   onOpenSource?: (nav: ViewerNav) => void;
+  /** The viewer may open the diagnostics (round 14 KTD9): a mark is a button and the detail opens on its claims; otherwise the
+   * reason sentences of the marks are listed here instead. */
+  canViewDiagnostics: boolean;
+  /** A partial mark the owner pressed: the details open and the other changes show its claims. */
+  partialFocus: PartialFocus | null;
 }) {
   const ordered = [...citations.values()];
   const verification = answer.verification;
@@ -770,7 +1045,9 @@ function AnswerDetails({
   const changed = verification
     ? verification.removed + verification.partial + verification.annotated + (actions ? sum(actions) : 0)
     : 0;
-  const otherChanges = actions ? actions.rewritten + actions.qualified + actions.cited : 0;
+  const partials = [...(verification?.partials ?? [])].sort((a, b) => a.ordinal - b.ordinal);
+  const detailMarks = canViewDiagnostics ? partials.length : 0;
+  const otherChanges = Math.max(actions ? actions.rewritten + actions.qualified + actions.cited : 0, detailMarks);
   const coverage = answer.coverage.at(-1);
   // a cut marker clicked in the body opens the details, then its own entry (`RemovalItem`)
   const detailsRef = useRef<HTMLDetailsElement>(null);
@@ -778,6 +1055,10 @@ function AnswerDetails({
   useEffect(() => {
     if (focusTick && detailsRef.current) detailsRef.current.open = true;
   }, [focusTick]);
+  const partialTick = partialFocus?.tick;
+  useEffect(() => {
+    if (partialTick && detailsRef.current) detailsRef.current.open = true;
+  }, [partialTick]);
   const expandTick = expandAll?.open ? expandAll.tick : 0;
   useEffect(() => {
     if (expandTick && detailsRef.current) detailsRef.current.open = true;
@@ -860,7 +1141,20 @@ function AnswerDetails({
                 </li>
               )
             )}
-            {verification.partial > 0 && <li>{verification.partial} טענות אומתו חלקית (מסומנות בתשובה).</li>}
+            {verification.partial > 0 && (
+              <li>
+                {verification.partial} טענות אומתו חלקית (מסומנות בתשובה).
+                {!canViewDiagnostics && partials.length > 0 && (
+                  <ul data-testid="partial-reasons">
+                    {partials.map((p) => (
+                      <li key={p.ordinal} data-ordinal={p.ordinal}>
+                        {p.text}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </li>
+            )}
             {verification.annotated > 0 && (
               <li>ל-{verification.annotated} נתונים נוסף ליד המספר תיאור שנכתב במקור (מסומן «כפי שנכתב במקור»).</li>
             )}
@@ -876,6 +1170,8 @@ function AnswerDetails({
               expandAll={expandAll}
               listId={removalsId}
               onOpenSource={onOpenSource}
+              partialFocus={partialFocus}
+              partials={canViewDiagnostics ? partials : []}
             />
           )}
         </div>

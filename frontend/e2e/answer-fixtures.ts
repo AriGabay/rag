@@ -36,6 +36,14 @@ export function anchor(): Json {
   };
 }
 
+/** A document anchor at another place of the same fixed document (round 14 U8: a value's place and its context's place
+ * differ): `label` is the readable location the viewer's header shows. */
+export function anchorAt(label: string, page: number, block: number): Json {
+  const a = anchor() as { pages: Json[]; location: Json } & Json;
+  return { ...a, block_start: block, block_end: block, pages: [{ ...a.pages[0], page }],
+    location: { ...a.location, label, page, section: null } };
+}
+
 export function source(id: string, extra: Json = {}): Json {
   return {
     id, document_id: DOC, version_id: VER, title: TITLE, section: "4. שיטת ההיוון", location: "עמוד 3", kind: "text",
@@ -139,13 +147,14 @@ export function decision(kind: string, extra: Json = {}): Json {
   };
 }
 
-/** Logs in, serves `answer` as the reply to one question, and opens the conversation. */
-export async function openAnswer(page: Page, answer: Json): Promise<{ id: string; reply: Locator }> {
+/** Logs in, serves `answer` as the reply to one question, and opens the conversation. `messageExtra` sets keys of the
+ * assistant message itself (round 14: `can_view_diagnostics`). */
+export async function openAnswer(page: Page, answer: Json, messageExtra: Json = {}): Promise<{ id: string; reply: Locator }> {
   await login(page, USERS.adminB);
   const { id } = await (await page.request.post("/api/chat/conversations")).json();
   await page.route(`**/api/chat/conversations/${id}/messages*`, (route) =>
     route.fulfill({ json: thread(id, [message("m1", "user", "מה השווי למ״ר ומה שיעור ההיוון?", null),
-      message("m2", "assistant", String(answer.markdown), answer)]) }));
+      message("m2", "assistant", String(answer.markdown), answer, messageExtra)]) }));
   await page.route("**/api/documents/**/pages/*/image*", (route) =>
     route.fulfill({ status: 200, contentType: "image/png", body: PNG,
       headers: { "X-Display-Width": "600", "X-Display-Height": "900", "X-Render-Scale": "1", "X-Scale-Tier": "normal",
@@ -182,5 +191,97 @@ export function withRemovalNote(body: string, lines: string[]): { markdown: stri
   return {
     markdown: body + note,
     server_spans: [{ start, end: start + Array.from(note).length, kind: "removal_note" }],
+  };
+}
+
+
+// --- round 14 U8: row states, context, the reconciled adjustment and the partial marks ------------------------------
+
+/** The server's literal "verified in part" mark, with its leading space (compose.PARTIAL_MARK). */
+export const PARTIAL_MARK = " *(אומת חלקית)*";
+
+/** A row's `state` (round 14 U6, KTD8). `component` overrides the component part (default: stated, no context). */
+export function rowState(opts: { component?: Json; support?: "cited" | "history"; comparison?: Json; reason?: string;
+  claim?: Json | null } = {}): Json {
+  const component = { status: "stated", reason: null, written: "מקדם", part: "sentence", tier: "own", context: null,
+    ...opts.component };
+  return {
+    reading: "verified", component, claim: opts.claim === undefined ? { result: "supported", reason: null } : opts.claim,
+    support: opts.support ?? "cited", comparison: opts.comparison ?? { status: "single", with: [] },
+    reason: opts.reason ?? (component.reason as string | null) ?? "single",
+  };
+}
+
+/** The component part of a state whose component was read from elsewhere than the value's own sentence. */
+export function contextComponent(location: string, quote: string | null, at: Json | null): Json {
+  return { status: "stated", reason: null, written: "הפחתה בשל מגבלות בנייה", part: "paragraph", tier: "context",
+    context: { location, quote, anchor: at } };
+}
+
+/** The markdown of `body` plus the server's partial marks, and the `partial_mark` spans that locate them (offsets in code
+ * points, as Python counts them): `marks` is each mark's claim ids, in the text's order. `parts` are the text pieces; a mark
+ * follows each piece but the last. */
+export function withPartialMarks(parts: string[], marks: string[][]): { markdown: string; server_spans: Json[] } {
+  let markdown = "";
+  const server_spans: Json[] = [];
+  parts.forEach((part, i) => {
+    markdown += part;
+    if (i < marks.length) {
+      const start = Array.from(markdown).length;
+      markdown += PARTIAL_MARK;
+      server_spans.push({ start, end: start + Array.from(PARTIAL_MARK).length, kind: "partial_mark", ordinal: i + 1,
+        claim_ids: marks[i] });
+    }
+  });
+  return { markdown, server_spans };
+}
+
+export const PARTIAL_SENTENCE = "אומת חלקית: חלק מהטענה אינו מצוין במקורות שנבדקו.";
+export const PARTIAL_SENTENCE_2 = "אומת חלקית: ההקשר שמגדיר חלק מהטענה לא נקרא.";
+
+/** `verification.partials` rows (round 14 U7): one per mark, in the text's order. */
+export function partialRows(marks: { claims: string[]; kind?: string; text?: string }[]): Json[] {
+  return marks.map((m, i) => ({ ordinal: i + 1, claim_id: m.claims[0], claim_ids: m.claims,
+    failure_kind: m.kind ?? "absent_from_source", check: "judge", text: m.text ?? PARTIAL_SENTENCE }));
+}
+
+export const SUPPORTED = "שווי הנכס בשומה הוא 9,500 ₪ למ״ר";
+export const NOT_VERIFIED = "ושיעור ההיוון שלו הוא 7%";
+export const WHY_CHECK = "judge";
+
+/** A diagnostics entry a partial mark opens (round 14 U7): action `qualified`, with the structured detail. */
+export function partialDecision(claimId: string, extra: Json = {}): Json {
+  return decision("absent_from_source", {
+    claim_id: claimId, action: "qualified", text: `${SUPPORTED} ${NOT_VERIFIED}`, remaining: SUPPORTED, verdict: "partial",
+    reason: "אומת חלקית: חלק מהטענה אינו מצוין במקורות שנבדקו.", repair_attempted: false, check: WHY_CHECK,
+    supported: SUPPORTED, not_verified: NOT_VERIFIED, why: { failure_kind: "absent_from_source", check: WHY_CHECK },
+    checked: { sources: ["S1", "S2"], rereads: [{ source: "S2", scope: "next_page", outcome: "not_found" }] },
+    sources_checked: ["S1", "S2"], sources: [{ ...source("S1"), type: "sources" }],
+    ...extra,
+  });
+}
+
+/** An answer with partial marks: `marks` lists the claims of each mark; `verification` has the matching `partials` rows and
+ * the count of qualified claims. The first part of the text carries a citation so that the details have a source. */
+export function partialAnswer(marks: string[][], extra: Json = {}, kinds: { kind?: string; text?: string }[] = []): Json {
+  const parts = [`${SUPPORTED} [S1]`, `. ושיעור ההיוון הוא 7% [S1]`, "."].slice(0, marks.length + 1);
+  const { markdown, server_spans } = withPartialMarks(parts, marks);
+  const rows = marks.map((claims, i) => ({ claims, ...kinds[i] }));
+  return answerWith({ markdown, server_spans, status: "answered", gaps: [], components: [], ...extra },
+    { partial: marks.length, correctness: "partial", partials: partialRows(rows),
+      actions: { removed: 0, cut: 0, rewritten: 0, withheld: 0, qualified: marks.length, cited: 0 },
+      completeness: { status: "full", requirements: 1, missing: [] } });
+}
+
+/** A stored computation (C#) the derived reduction points at: `1 − V1`. */
+export function derivedComputation(id: string, label: string): Json {
+  return {
+    id, label, expression: "1 - V1", formula: `1 − ${label}`, value: "0.1", display: { value: "0.1", percent: "10%" },
+    unit: "", kind: "ratio", result_kind: "derived", result_kind_label: "נגזר מערכים מצוטטים",
+    inputs: [{ id: "V1", label, kind: "value", value: "0.9", display: "0.9", value_text: "0.9", source_id: "S1",
+      certainty: "verified" }],
+    assumptions: [], sources: ["S1"], documents: 1, conditional: false, conditions: [], vat: null, justification: null,
+    note: "", reproduces: null, n: null, operation: "1 - V1", result: "0.1",
+    anchor: { v: 1, precision: "computed", precision_label: "תוצאה מחושבת", inputs: ["V1"] },
   };
 }

@@ -471,6 +471,21 @@ export interface ChatVerification {
   /** Claims whose unsupported qualifier the server edited out of a number the sources back: an edit, not a removal
    * (round 13 U12; absent on older answers). */
   edited?: number;
+  /** One row per "אומת חלקית" mark of the text, in the text's order (round 14 U7, KTD9); every viewer gets them, so a
+   * viewer who may not open the detail reads the reason sentences here. Absent on answers stored before round 14. */
+  partials?: ChatPartialRow[];
+}
+
+/** The reason class of one "אומת חלקית" mark (round 14 U7): `ordinal` is the mark's number among the marks, the `ordinal` of its
+ * `partial_mark` span; `claim_ids` are the claims it covers (each is one entry of the diagnostics route); `text` is the server's
+ * fixed sentence for the class, never the claim's text. */
+export interface ChatPartialRow {
+  ordinal: number;
+  claim_id?: string;
+  claim_ids?: string[];
+  failure_kind: string | null;
+  check?: string | null;
+  text: string;
 }
 
 /** A run of the saved Markdown the server wrote: offsets in code points and a kind, never its text. */
@@ -478,6 +493,10 @@ export interface ChatServerSpan {
   start: number;
   end: number;
   kind: string;
+  /** A `partial_mark` span only (round 14 U7): the mark's number among the marks of the text, from 1, and the claims of the
+   * unit it marks. Absent on a mark stored before round 14. */
+  ordinal?: number;
+  claim_ids?: string[];
 }
 
 /** A component of the request with its outcome in the shown answer (round 7 U3; `coverage.public_components`). */
@@ -578,6 +597,13 @@ export interface ChatRemovalDecision {
   rereads?: ChatReread[];
   /** The final check's result on the claim as saved (`n/a` when it was not judged again). */
   post_check?: string;
+  /** What a "verified in part" mark opens (round 14 U7, KTD9; on an entry whose action is `qualified` or `cut`): the sentence's
+   * text as it stays, the claim's span (else the judge's reason) that was not verified, why (failure kind and check), and what
+   * was checked (the sources and the re-reads, each with its outcome). Absent on other entries and on older logs. */
+  supported?: string;
+  not_verified?: string;
+  why?: { failure_kind: string | null; check: string | null };
+  checked?: { sources: string[]; rereads: ChatReread[] };
 }
 
 /** GET /api/chat/messages/{id}/diagnostics: the owner's or an office admin's view of what verification removed. */
@@ -983,6 +1009,9 @@ export interface ChatMessage {
   cancel_requested: boolean;
   /** The switch state this message was sent or answered with (null: from before round 11). */
   time_preference?: ChatTimePreference | null;
+  /** Round 14 U7 (KTD9): the viewer may open this message's diagnostics (its owner, or an office admin). Only then is a "verified
+   * in part" mark a button; absent or false, it stays text. A diagnostics 404 can still happen. */
+  can_view_diagnostics?: boolean;
 }
 
 export interface SourceBlock {

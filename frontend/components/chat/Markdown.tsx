@@ -55,9 +55,13 @@ interface Props {
   /** The ordinals of the markers that have an entry in the details (round 8 U8); the others are shown, not linked. */
   cuts?: ReadonlySet<number>;
   onCut?: (ordinal: number) => void;
+  /** Round 14 U8 (KTD9): the ordinals of the "אומת חלקית" marks that open the verification detail; the caller has turned each one
+   * into a `#partial-N` link (`linkPartialMarks`) only for a viewer who may open it, so a mark not in the set is shown as text. */
+  partials?: ReadonlySet<number>;
+  onPartial?: (ordinal: number) => void;
 }
 
-function MarkdownImpl({ markdown, citations, onCite, cuts, onCut }: Props) {
+function MarkdownImpl({ markdown, citations, onCite, cuts, onCut, partials, onPartial }: Props) {
   const components = useMemo<Components>(
     () => ({
       a({ href, children }) {
@@ -99,6 +103,24 @@ function MarkdownImpl({ markdown, citations, onCite, cuts, onCut }: Props) {
             </span>
           );
         }
+        if (href && href.startsWith("#partial-")) {
+          const n = Number(href.slice(9));
+          if (partials?.has(n) && onPartial) {
+            return (
+              <button
+                type="button"
+                className="cut-marker partial-mark"
+                data-testid="partial-mark"
+                data-ordinal={n}
+                aria-label={`אומת חלקית ${n}: פתיחת הפירוט`}
+                onClick={() => onPartial(n)}
+              >
+                {children}
+              </button>
+            );
+          }
+          return <>{children}</>;
+        }
         // Answers carry no outside links: any other link is shown as its text only.
         return <>{children}</>;
       },
@@ -113,7 +135,7 @@ function MarkdownImpl({ markdown, citations, onCite, cuts, onCut }: Props) {
         return null;
       },
     }),
-    [citations, onCite, cuts, onCut],
+    [citations, onCite, cuts, onCut, partials, onPartial],
   );
   return (
     <ReactMarkdown remarkPlugins={[remarkGfm]} components={components} skipHtml>

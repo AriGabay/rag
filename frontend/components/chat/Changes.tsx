@@ -6,6 +6,8 @@ import type {
   ChatCheckedSource,
   ChatComponent,
   ChatDiagnostics,
+  ChatPartialRow,
+  ChatReread,
   ChatRemoval,
   ChatRemovalDecision,
   ChatSource,
@@ -21,6 +23,7 @@ import {
   WITHHELD_CAUSE_TEXT,
   WITHHELD_DEFAULT_TEXT,
   type ChangeAction,
+  FAILURE_KIND_LABEL,
   failureKindText,
   rowChangeAction,
   plainClaimText,
@@ -38,6 +41,14 @@ export interface CutFocus {
 export interface ExpandAll {
   tick: number;
   open: boolean;
+}
+
+/** A "verified in part" mark the owner pressed (round 14 U8, KTD9): which mark, the claims it covers (each is one entry of the
+ * diagnostics route) and a counter so that pressing the same mark again moves the focus to its entries again. */
+export interface PartialFocus {
+  ordinal: number;
+  claimIds: string[];
+  tick: number;
 }
 
 /** One line per action that touched a claim (round 8 U8): what changed in the text first, then the qualifiers and
@@ -118,12 +129,18 @@ export function RemovalsSection({
   expandAll,
   listId,
   onOpenSource,
+  partialFocus,
+  partials,
 }: {
   removals: ChatRemoval[];
   otherChanges: number;
   components: ChatComponent[];
   messageId: string;
   focus: CutFocus | null;
+  /** A partial mark's press (round 14 U8): opens the other changes on the mark's claims. */
+  partialFocus?: PartialFocus | null;
+  /** The reason sentences of the text's partial marks (`verification.partials`): the fallback when the detail cannot load. */
+  partials?: ChatPartialRow[];
   /** The removal note's action: opens every removal using the one shared request. */
   expandAll?: ExpandAll | null;
   /** The id of the removals list, which the note's button names in `aria-controls`. */
@@ -199,6 +216,8 @@ export function RemovalsSection({
           rowIds={new Set(removals.map((r) => r.claim_id).filter((x): x is string => !!x))}
           diagnostics={diagnostics}
           onOpenSource={onOpenSource}
+          partialFocus={partialFocus ?? null}
+          partials={partials ?? []}
         />
       )}
     </>
@@ -268,10 +287,13 @@ function ExpandedState<T>({
   state,
   load,
   children,
+  fallback,
 }: {
   state: Loaded<T>;
   load: () => void;
   children: (value: T) => React.ReactNode;
+  /** Shown when the detail could not be loaded (a failed request or a 404): a partial mark's reason sentence. */
+  fallback?: React.ReactNode;
 }) {
   return (
     <>
@@ -293,6 +315,7 @@ function ExpandedState<T>({
           אין פירוט נוסף להצגה.
         </p>
       )}
+      {(state.phase === "error" || state.phase === "gone") && fallback}
       {state.phase === "ready" && children(state.value)}
     </>
   );
@@ -410,32 +433,83 @@ function RemovalItem({
 
 const OTHER_ACTIONS: readonly ChangeAction[] = ["rewritten", "qualified", "cited"];
 
+/** The reason sentence of the mark(s) a press opened (`verification.partials`, matched by the mark's ordinal): what a viewer reads
+ * when the entries cannot be loaded, or have no entry for the mark's claims. */
+function PartialReason({ focus, partials }: { focus: PartialFocus | null; partials: ChatPartialRow[] }) {
+  const rows = focus ? partials.filter((p) => p.ordinal === focus.ordinal) : [];
+  if (rows.length === 0) return null;
+  return (
+    <p className="partial-reason" data-testid="partial-reason" role="note">
+      {rows.map((p) => p.text).join(" ")}
+    </p>
+  );
+}
+
 /** Claims rewritten, kept with a qualifier or given a citation: no row on the normal path (they changed no claim out
- * of the text), so one toggle loads their entries from the diagnostics route, each under its own claim id. */
+ * of the text), so one toggle loads their entries from the diagnostics route, each under its own claim id. Round 14 U8
+ * (KTD9): a "verified in part" mark's press (`focus`) opens the same section on the mark's claims, scrolls to their entries
+ * and moves the focus there; when the route answers 404 or fails, the mark's reason sentence is shown in the entries' place.
+ * The entries of the mark's claims are listed even when a row of the removals has them (a cut and a qualifier in one sentence). */
 function OtherChanges({
   count,
   rowIds,
   diagnostics,
   onOpenSource,
+  partialFocus,
+  partials,
 }: {
   count: number;
   rowIds: Set<string>;
   diagnostics: Diagnostics;
   onOpenSource?: (nav: ViewerNav) => void;
+  partialFocus: PartialFocus | null;
+  partials: ChatPartialRow[];
 }) {
   const pick = useCallback(
     (d: ChatDiagnostics) => {
       if (!Array.isArray(d.removed)) return undefined;
+      const partialIds = new Set(partials.flatMap((p) => p.claim_ids ?? (p.claim_id ? [p.claim_id] : [])));
       const found = d.removed.filter(
         (x): x is ChatRemovalDecision & { claim_id: string; action: ChangeAction } =>
-          !!x.claim_id && !!x.action && OTHER_ACTIONS.includes(x.action) && !rowIds.has(x.claim_id),
+          !!x.claim_id &&
+          !!x.action &&
+          ((OTHER_ACTIONS.includes(x.action) && !rowIds.has(x.claim_id)) ||
+            (partialIds.has(x.claim_id) && (x.action === "qualified" || x.action === "cut"))),
       );
       return found.length > 0 ? found : undefined; // none: the same "no further detail" line as a missing entry
     },
-    [rowIds],
+    [rowIds, partials],
   );
-  const { open, state, load, toggle } = useExpandable(diagnostics, pick);
+  const { open, state, load, expand, toggle } = useExpandable(diagnostics, pick);
   const panelId = useId();
+  const list = useRef<HTMLUListElement>(null);
+  // a mark's press: open the section once (a second press of any mark only moves the focus, or loads again after a failure)
+  const tick = partialFocus?.tick ?? 0;
+  const handledOpen = useRef(0);
+  useEffect(() => {
+    if (!tick || tick === handledOpen.current) return;
+    handledOpen.current = tick;
+    if (open && (state.phase === "error" || state.phase === "gone")) load();
+    else expand();
+  }, [tick, open, state.phase, expand, load]);
+  // once the entries are laid out, the first of the mark's claims scrolls into view and takes the focus
+  const handledFocus = useRef(0);
+  const claimKey = partialFocus?.claimIds.join(",") ?? "";
+  useEffect(() => {
+    if (!tick || state.phase !== "ready" || handledFocus.current === tick) return;
+    handledFocus.current = tick;
+    const raf = window.requestAnimationFrame(() => {
+      const ids = claimKey.split(",");
+      const el = Array.from(list.current?.querySelectorAll<HTMLElement>("[data-claim-id]") ?? []).find((x) =>
+        ids.includes(x.dataset.claimId ?? ""),
+      );
+      el?.scrollIntoView({ block: "nearest" });
+      el?.focus();
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, [tick, state.phase, claimKey]);
+  const focusIds = new Set(partialFocus?.claimIds ?? []);
+  const reason = <PartialReason focus={partialFocus} partials={partials} />;
   return (
     <div className="other-changes" data-testid="other-changes">
       <button type="button" className="source-link" aria-expanded={open} aria-controls={panelId} onClick={toggle}>
@@ -443,22 +517,27 @@ function OtherChanges({
       </button>
       {open && (
         <div id={panelId} className="removal-detail" aria-busy={state.phase === "loading"}>
-          <ExpandedState state={state} load={load}>
+          <ExpandedState state={state} load={load} fallback={reason}>
             {(entries) => (
-              <ul className="removals" data-testid="changes">
-                {entries.map((x) => (
-                  <li
-                    key={x.claim_id}
-                    className="removal"
-                    data-testid="change"
-                    data-action={x.action}
-                    data-claim-id={x.claim_id}
-                  >
-                    <ChangeBadge action={x.action} />
-                    <ChangeDetail action={x.action} decision={x} onOpenSource={onOpenSource} />
-                  </li>
-                ))}
-              </ul>
+              <>
+                <ul className="removals" data-testid="changes" ref={list}>
+                  {entries.map((x) => (
+                    <li
+                      key={x.claim_id}
+                      tabIndex={-1}
+                      className="removal"
+                      data-testid="change"
+                      data-action={x.action}
+                      data-claim-id={x.claim_id}
+                      data-focused={focusIds.has(x.claim_id) ? "true" : undefined}
+                    >
+                      <ChangeBadge action={x.action} />
+                      <ChangeDetail action={x.action} decision={x} onOpenSource={onOpenSource} />
+                    </li>
+                  ))}
+                </ul>
+                {partialFocus && !entries.some((x) => focusIds.has(x.claim_id)) && reason}
+              </>
             )}
           </ExpandedState>
         </div>
@@ -493,6 +572,90 @@ const REASON_LABEL: Partial<Record<ChangeAction, string>> = {
   rewritten: "סיבת הניסוח מחדש:",
   qualified: "הסייג:",
 };
+
+/** How a re-read's scope and outcome read (round 8 U5); an unknown value is shown as the server wrote it. */
+const REREAD_SCOPE: Record<string, string> = {
+  table_headers: "כותרות הטבלה",
+  units_note: "הערת היחידות",
+  next_page: "העמוד הבא",
+  region: "אזור בעמוד",
+  continuation: "המשך הסעיף",
+  preceding: "תחילת הסעיף",
+};
+const REREAD_OUTCOME: Record<string, string> = {
+  supported: "נתמך",
+  partial: "נתמך בחלקו",
+  unsupported: "לא נתמך",
+  contradicts: "סותר את הטענה",
+  check_failed: "הבדיקה נכשלה",
+  no_context: "לא נמצא הקשר נוסף",
+  no_time: "לא נשאר זמן לקריאה",
+  bound: "הגעה למגבלת הקריאה",
+  found: "נמצא",
+  not_found: "לא נמצא",
+};
+
+function rereadLine(r: ChatReread): string {
+  const scope = r.scope ? REREAD_SCOPE[r.scope] ?? r.scope : "";
+  const outcome = r.outcome ? REREAD_OUTCOME[r.outcome] ?? r.outcome : "";
+  return [`קריאה חוזרת של ${r.source}`, scope && `(${scope})`, outcome && `— ${outcome}`].filter(Boolean).join(" ");
+}
+
+/** Whether an entry has the detail a "verified in part" mark opens (round 14 U7): only an entry the server wrote it for. */
+function hasPartialDetail(d: ChatRemovalDecision): boolean {
+  return typeof d.supported === "string" || typeof d.not_verified === "string" || !!d.why || !!d.checked;
+}
+
+/** The detail of a claim a mark covers (round 14 U8, R14, AE10): what is supported, exactly what was not verified, why, and
+ * what was checked — the sources and the re-reads. Each part only when the server sent it. */
+function PartialDetail({ decision }: { decision: ChatRemovalDecision }) {
+  const { supported, not_verified: notVerified, why, checked } = decision;
+  const kind = why?.failure_kind ? FAILURE_KIND_LABEL[why.failure_kind] ?? "" : "";
+  const rereads = checked?.rereads ?? [];
+  const sources = checked?.sources ?? [];
+  return (
+    <div className="partial-detail" data-testid="partial-detail">
+      {supported && (
+        <p data-testid="partial-supported">
+          <strong>נתמך:</strong> <bdi>{supported}</bdi>
+        </p>
+      )}
+      {notVerified && (
+        <p data-testid="partial-not-verified">
+          <strong>לא אומת:</strong> <bdi>{notVerified}</bdi>
+        </p>
+      )}
+      {(kind || why?.check) && (
+        <p data-testid="partial-why">
+          <strong>למה:</strong> {kind}
+          {why?.check && (
+            <span className="muted">
+              {kind ? " · " : ""}בדיקה: <bdi>{why.check}</bdi>
+            </span>
+          )}
+        </p>
+      )}
+      {(sources.length > 0 || rereads.length > 0) && (
+        <div data-testid="partial-checked">
+          <strong>מה נבדק:</strong>
+          {sources.length > 0 && (
+            <span>
+              {" "}
+              מקורות: <bdi>{sources.join(", ")}</bdi>
+            </span>
+          )}
+          {rereads.length > 0 && (
+            <ul>
+              {rereads.map((r, i) => (
+                <li key={`${r.source}-${i}`}>{rereadLine(r)}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 /** What an entry shows when expanded, by its action (round 8 U8, R23):
  * - removed: the reason, and the original under "rejected draft";
@@ -535,9 +698,12 @@ function ChangeDetail({
   const reason = decision.reason?.trim();
   const reasonLabel = REASON_LABEL[action];
   const markerOnly = action === "cut" && MARKER_ONLY.test(remaining);
+  // an entry a "verified in part" mark opens carries its own detail (round 14 U7): it replaces the generic reason and kept text
+  const partial = hasPartialDetail(decision);
   return (
     <div data-testid="removal-detail" data-action={action}>
-      {reasonLabel && reason && (
+      {partial && <PartialDetail decision={decision} />}
+      {!partial && reasonLabel && reason && (
         <p data-testid="removal-reason">
           <strong>{reasonLabel}</strong> <bdi>{reason}</bdi>
         </p>
@@ -577,7 +743,7 @@ function ChangeDetail({
           שנבדק.
         </p>
       )}
-      {action !== "removed" && action !== "withheld" && action !== "cited" && remaining && !markerOnly && (
+      {!partial && action !== "removed" && action !== "withheld" && action !== "cited" && remaining && !markerOnly && (
           <div className="change-kept" data-testid="change-kept">
             <strong>{action === "rewritten" ? "הנוסח שנשאר בתשובה (נבדק מחדש):" : "הטקסט שנשאר בתשובה:"}</strong>
             <blockquote dir="auto">{plainClaimText(remaining)}</blockquote>
