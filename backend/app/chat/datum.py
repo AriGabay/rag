@@ -849,7 +849,8 @@ def core_of(site) -> frozenset[str]:
 
 def headline(site, in_unit: int = 1) -> bool:
     """Whether a datum is its appraisal unit's headline datum (KTD3): it states no facet, and either its family needs none or it
-    is the only value of its base key in its unit (``in_unit``: how many values of that key the unit holds)."""
+    is the only datum of its base key in its unit (``in_unit``: how many data of that key the unit holds, counted by source span: see
+    ``timeline._classify``)."""
     return not core_of(site) and (not needs_facet(site.family) or in_unit <= 1)
 
 
@@ -894,7 +895,7 @@ def relation(a, b, a_in_unit: int = 1, b_in_unit: int = 1) -> str:
 
     "Different" needs structural evidence: two wordings of one datum in two documents can share no words. The rule is not
     transitive, so it is no key field: ``timeline`` joins "same" pairs into classes. The two data are of one base key
-    (``timeline`` buckets them): ``in_unit`` is the number of values of that key in each one's appraisal unit."""
+    (``timeline`` buckets them): ``in_unit`` is the number of data of that key in each one's appraisal unit."""
     if (span := getattr(a, "span", None)) and span == getattr(b, "span", None):
         return SAME
     ca, cb = core_of(a), core_of(b)

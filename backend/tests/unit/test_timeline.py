@@ -1059,6 +1059,56 @@ def test_equal_spans_in_two_versions_of_one_document_are_not_the_same_span():
     assert by[a].span != by[b].span
 
 
+# --- round 14 U9 follow-up: the headline datum is counted by datum (span), never by amount (R7, KTD1) --------------------------
+
+def _bare_rate(o: Office, doc, ver, amount: str, span: tuple | None, *, when: dict | None = None) -> str:
+    return o.value(doc, amount, when or as_of("2025-03-31"), kind="rate", unit="percent", version=ver, section="3. היוון",
+                   facet=datum.none(), span=span)
+
+
+def test_two_equal_bare_values_of_two_places_in_one_appraisal_are_two_classes_never_merged_by_their_equal_amount():
+    """The headline datum is the only value of its key in its unit. Two registrations of different places that happen to read the
+    same number are two values, so neither is the headline datum, and equal numbers alone never merge (R7, KTD1)."""
+    o = Office()
+    doc, ver = _unit(o)
+    a = _bare_rate(o, doc, ver, "10", _span(2, 40))
+    b = _bare_rate(o, doc, ver, "10", _span(9, 12))
+    (bucket,) = [x for x in timeline.buckets(o.ws, {a, b}) if a in {d.ref for d in x.members}]
+    assert len(bucket.classes) == 2 and list(bucket.pairs.values()) == [datum.UNDECIDED]
+    assert not coverage.conflicting(o.ws)
+    (block,) = timeline.breakdown(o.ws, {a, b})  # both rows are shown; equal amounts clash with nothing, so no mark is needed
+    assert {r["sid"] for r in block["rows"]} == {a, b} and all("conflict" not in r["marks"] for r in block["rows"])
+
+
+def test_one_bare_value_in_the_appraisal_is_still_its_headline_datum_and_joins_the_unlabelled_rate_of_another_appraisal():
+    o = Office()
+    doc_a, ver_a = _unit(o)
+    doc_b, ver_b = _unit(o)
+    a = _bare_rate(o, doc_a, ver_a, "10", _span(2, 40), when=as_of("2024-03-31"))
+    b = _bare_rate(o, doc_b, ver_b, "10", _span(2, 40), when=as_of("2025-03-31"))
+    (bucket,) = [x for x in timeline.buckets(o.ws, {a, b}) if a in {d.ref for d in x.members}]
+    assert len(bucket.classes) == 1 and list(bucket.pairs.values()) == [datum.SAME]
+
+
+def test_several_registrations_of_one_span_alone_in_the_appraisal_are_one_class_and_the_headline_datum():
+    o = Office()
+    doc, ver = _unit(o)
+    twins = [_bare_rate(o, doc, ver, "10", _span(2, 40)) for _ in range(3)]
+    other_doc, other_ver = _unit(o)
+    other = _bare_rate(o, other_doc, other_ver, "10", _span(2, 40), when=as_of("2024-03-31"))
+    (bucket,) = [x for x in timeline.buckets(o.ws, {*twins, other}) if other in {d.ref for d in x.members}]
+    assert len(bucket.classes) == 1, "three registrations of one span are one datum, the unit's headline datum"
+    assert set(bucket.pairs.values()) == {datum.SAME}
+
+
+def test_a_registration_with_no_span_counts_on_its_own_so_two_of_them_are_not_a_headline_datum():
+    o = Office()
+    doc, ver = _unit(o)
+    a, b = _bare_rate(o, doc, ver, "10", None), _bare_rate(o, doc, ver, "10", None)
+    (bucket,) = [x for x in timeline.buckets(o.ws, {a, b}) if a in {d.ref for d in x.members}]
+    assert len(bucket.classes) == 2 and list(bucket.pairs.values()) == [datum.UNDECIDED]
+
+
 # --- round 14 U4: a coefficient and its reduction are one adjustment (R8, R9; KTD6; AE6) -----------------------------------------
 
 def _row_coefficient(o: Office, doc, ver, amount: str, written: str, *, when: dict | None = None) -> str:

@@ -538,12 +538,14 @@ def unresolved(d: Datum) -> bool:
 
 def _classify(key: tuple, members: list[Datum]) -> Bucket:
     """Decide every pair of a base key (``datum.relation``) and join the ``same`` ones into classes (union-find). A datum is
-    the headline datum of its appraisal unit when no other value of the key — counted by amount, so a value taken from the
-    text and the stored measurement of the same figure are one — is in that unit."""
-    amounts: dict[tuple, set] = {}
+    the headline datum of its appraisal unit when no other datum of the key is in that unit. Data are counted by their source
+    span, never by amount (round 14 U9 follow-up, KTD1): registrations of one span are one datum (``datum.relation`` rule 0), a
+    datum with no span counts on its own, and two different places that read an equal number are two data — neither is the
+    headline datum, so equal numbers alone never merge them."""
+    seen: dict[tuple | None, set] = {}
     for d in members:
-        amounts.setdefault(d.appraisal, set()).add(d.comparable)
-    count = {d.ref: len(amounts[d.appraisal]) for d in members}
+        seen.setdefault(d.appraisal, set()).add(d.span or ("ref", d.ref))
+    count = {d.ref: len(seen[d.appraisal]) for d in members}
     parent = list(range(len(members)))
 
     def root(i: int) -> int:
