@@ -7087,11 +7087,177 @@ def write_round13(out: Path) -> None:
     print(f"wrote {ROUND13_DIR}/{ROUND13_MANIFEST} ({len(text_):,} chars)")
 
 
+# =======================================================================================================================
+# round 14 (U2): the bounded context read — a value's component stated in an earlier sentence or paragraph
+# =======================================================================================================================
+#
+# One DOCX, one appraisal, several plots; each plot is a section whose heading names no component (a plot number only), so
+# what a 10% value takes as its component comes from the sentence or paragraph above it, or from nothing. The shapes: the
+# consideration in the sentence just before the value (part ``preceding_sentence``); in the paragraph block above (``paragraph``);
+# with a reduction of another kind between (``unparsed``, ``intervening_value``); two considerations in one sentence
+# (``unparsed``, ``two_components``); a table between (``none``, ``not_in_range``); the consideration in the plot before, across a
+# section heading (``none``); and the plot's own purpose phrase (an own facet, to be compared with a context one). As in
+# rounds 12 and 13, each fact is stated once, in a spec, and the document text and the manifest derive from it; ``_r13_check``
+# asserts that every quote is in the text it points at. A DOCX is not split into appraisal units by the reader, so the unit edge
+# is a unit test of ``datum.reach`` (``lo``), not a fixture.
+
+ROUND14_DIR = "round14"
+ROUND14_MANIFEST = "manifest.json"
+ROUND14_MARK = "מסמך בדיקה סינתטי (סבב 14) — נתונים בדויים לבדיקת המערכת בלבד"
+_R14_TAKEN = "בהתאם לאמור לעיל נלקח מקדם הפחתה נוסף בשיעור 10%."
+_R14_STATES = ("stated", "none", "unparsed", "not_read")
+_R14_REASONS = ("not_in_range", "intervening_value", "two_components", "picture_cell", "not_needed", "cap")
+_R14_PARTS = ("row", "column", "caption", "sentence", "lead_in", "heading", "preceding_sentence", "paragraph", "table_note")
+
+
+def _r14_facet(status: str, written: str | None = None, part: str | None = None, tier: str | None = None,
+               reason: str | None = None) -> dict[str, Any]:
+    """The expected facet of a datum: a state (``stated``, ``none``, ``unparsed``), the source's own words, the part they were
+    read from, the tier, and for a state that is not ``stated`` its reason (an ``unparsed`` one says where the rejected text is)."""
+    assert status in _R14_STATES and (reason is None or reason in _R14_REASONS) and (part is None or part in _R14_PARTS)
+    assert (status == "stated") == (written is not None) and (status == "stated") == (reason is None)
+    assert status == "unparsed" or (part is None) == (status != "stated")
+    return {"status": status, "written": written, "part": part, "tier": tier, **({"reason": reason} if reason else {})}
+
+
+def _r14_datum(did: str, section: str, shown: str, quote: str, facet: dict[str, Any], note: str) -> dict[str, Any]:
+    """A datum of one plot's section: ``quote`` is its own sentence (the quote a take cites), ``section`` the heading of the
+    section that holds it (the same sentence is written in several sections)."""
+    out = _r13_datum(did, "coefficient", "percent", shown, facet, family="coefficient", quote=quote, note=note)
+    out["where"]["section"] = section
+    return out
+
+
+def round14_documents() -> list[dict[str, Any]]:
+    """The one round-14 file, with its data."""
+    u = _r12_unit("הרימון", "7", ROUND12_CITY_A, "9201", ["5"], "2024-03-31")
+    reduction = "השמאי לא נתן הפחתה בגין עוצמת ניצול."
+    consideration = "לא ניתנה הפחתה בגין עוצמת ניצול."
+    twenty = "ניתנה הפחתה של 20% בגין סחירות."
+    two = "ניתנה הפחתה לעוצמת ניצול ולגמישות שימושים."
+    own = "נלקח מקדם הפחתה בשיעור 10% בגין סחירות."
+    plots = {12: "3. מגרש 12", 14: "4. מגרש 14", 16: "5. מגרש 16", 18: "6. מגרש 18", 20: "7. מגרש 20", 22: "8. מגרש 22",
+             24: "9. מגרש 24"}
+    u["body"] = [
+        ("h1", plots[12]), ("p", f"{reduction} {_R14_TAKEN}"),
+        ("h1", plots[14]), ("p", _R14_TAKEN),
+        ("h1", plots[16]), ("p", consideration), ("p", _R14_TAKEN),
+        ("h1", plots[18]), ("p", f"{consideration} {twenty} {_R14_TAKEN}"),
+        ("h1", plots[20]), ("p", two), ("p", _R14_TAKEN),
+        ("h1", plots[22]), ("p", consideration), ("table", [["נתון", "ערך"], ["שטח המגרש", "310 מ״ר"]]), ("p", _R14_TAKEN),
+        ("h1", plots[24]), ("p", own),
+    ]
+    data = [
+        _r14_datum("r14.same_block", plots[12], "10%", _R14_TAKEN,
+                   _r14_facet("stated", "עוצמת ניצול", "preceding_sentence", "context"),
+                   "AE1: the consideration is the sentence just before the value, in the same paragraph; no reduction between"),
+        _r14_datum("r14.second_plot", plots[14], "10%", _R14_TAKEN, _r14_facet("none", reason="not_in_range"),
+                   "AE3: the nearest consideration is in the plot before, across a section heading; the read stops at the heading"),
+        _r14_datum("r14.prev_paragraph", plots[16], "10%", _R14_TAKEN,
+                   _r14_facet("stated", "עוצמת ניצול", "paragraph", "context"),
+                   "the consideration is the paragraph block above the value, in the same section"),
+        _r14_datum("r14.between", plots[18], "10%", _R14_TAKEN,
+                   _r14_facet("unparsed", part="preceding_sentence", tier="context", reason="intervening_value"),
+                   "AE2: a reduction of 20% for another consideration stands between the consideration and the value"),
+        _r14_datum("r14.between_20", plots[18], "20%", twenty, _r14_facet("stated", "סחירות", "sentence", "own"),
+                   "the reduction that stands between: it has its own purpose phrase"),
+        _r14_datum("r14.two_components", plots[20], "10%", _R14_TAKEN,
+                   _r14_facet("unparsed", part="paragraph", tier="context", reason="two_components"),
+                   "the paragraph above names two considerations: which one is the value's is not said"),
+        _r14_datum("r14.table_edge", plots[22], "10%", _R14_TAKEN, _r14_facet("none", reason="not_in_range"),
+                   "AE3: a table stands between the consideration and the value; the read stops at the table"),
+        _r14_datum("r14.own_phrase", plots[24], "10%", own, _r14_facet("stated", "סחירות", "sentence", "own"),
+                   "the value names its own consideration in its sentence"),
+    ]
+    doc = _r13_doc("context_reader", "שומה_רחוב_הרימון_7_עיר-סינתטית.docx", "round14", u,
+                   "AE1-AE3: eight reductions in seven plots, each with the text above it that does or does not state its "
+                   "consideration", data)
+    doc["blocks"][0] = ("mark", ROUND14_MARK)
+    return [doc]
+
+
+def _r14_cases(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    facets = {d["id"]: d["facet"] for doc in docs for d in doc["data"]}
+
+    def states(*ids: str) -> dict[str, Any]:
+        return {i: {k: facets[i].get(k) for k in ("status", "written", "part", "tier", "reason")} for i in ids}
+
+    return [
+        {"id": "AE1", "covers": "R1, R2", "documents": ["context_reader"], "expected": states("r14.same_block"),
+         "also": "the context sentence is located in its block (block, sentence, at); the value's own sentence is not"},
+        {"id": "paragraph", "covers": "R1", "documents": ["context_reader"], "expected": states("r14.prev_paragraph")},
+        {"id": "AE2", "covers": "R2", "documents": ["context_reader"], "expected": states("r14.between", "r14.between_20"),
+         "also": "the 10% is read but ambiguous and takes no component: another value stands between"},
+        {"id": "two_components", "covers": "R2", "documents": ["context_reader"], "expected": states("r14.two_components")},
+        {"id": "AE3", "covers": "R2", "documents": ["context_reader"],
+         "expected": states("r14.second_plot", "r14.table_edge"),
+         "also": "the read stops at another section's heading and at a table; the state is read without a component"},
+        {"id": "relation", "covers": "R2, KTD3 rule 3", "documents": ["context_reader"],
+         "expected": {"pair": ["r14.same_block", "r14.own_phrase"], "decision": "different",
+                      "why": "a facet read from the sentence above and an own purpose phrase, in two sections of one appraisal "
+                             "unit, with disjoint cores"}},
+    ]
+
+
+def write_round14(out: Path) -> None:
+    """Writes the round-14 fixture (DOCX) and ``manifest.json``: the document with its data (each with the facet it must read as,
+    its state and reason), its tables and blocks, and the cases - all from the generator's own spec (never read back)."""
+    rdir = out / ROUND14_DIR
+    rdir.mkdir(parents=True, exist_ok=True)
+    documents = round14_documents()
+    ids = [x["id"] for d in documents for x in d["data"]]
+    assert len(set(ids)) == len(ids), "duplicate datum id"
+    docs: dict[str, dict[str, Any]] = {}
+    for d in documents:
+        _r13_check(d)
+        data = render_round10_docx(d["blocks"], d["title"], mark=ROUND14_MARK)
+        (rdir / d["file"]).write_bytes(data)
+        print(f"wrote {ROUND14_DIR}/{d['file']} ({len(data):,} bytes)")
+        valuation = d["unit"]["valuation"]
+        docs[d["key"]] = {
+            "key": d["key"], "file": f"{ROUND14_DIR}/{d['file']}", "title": d["title"], "source_kind": d["kind"],
+            "group": d["group"], "note": d["note"], "identity": d["identity"], "valuation_date": valuation,
+            "valuation_date_text": _r12_text(valuation), "data": d["data"],
+            "tables": [{"caption": d["blocks"][i - 1][1] if d["blocks"][i - 1][0] == "p" else None,
+                        "headers": t[0], "rows": t[1:]} for i, (k, t) in enumerate(d["blocks"]) if k == "table"],
+            "paragraphs": [t for k, t in d["blocks"] if k in ("mark", "p", "li")],
+        }
+    manifest = {
+        "about": f"{ROUND14_MARK}. Known contents of the round-14 fixture (eight plots of one appraisal, each with a reduction of 10% "
+                 "or 20% and the text above it: the consideration in the sentence just before, in the paragraph above, behind a "
+                 "reduction of another kind, as two considerations, behind a table, across a section heading, and the value's own "
+                 "purpose phrase); generated by scripts/generate_fixtures.py --only round14 from the generator's own text (never "
+                 "read back from the files) - do not edit by hand. Every name, address, city, block, parcel and amount is invented.",
+        "synthetic_marker": ROUND14_MARK,
+        "cities": [ROUND12_CITY_A],
+        "context_vocabulary": {
+            "status": {"stated": "the source states the component, in the place named by part",
+                       "none": "read, and nothing in the range checked names one (reason not_in_range)",
+                       "unparsed": "read, and the nearest text that names one cannot be attributed to the value",
+                       "not_read": "not read (no fixture here)"},
+            "reason": {"not_in_range": "nothing in range names a component",
+                       "intervening_value": "a value of the same kind stands between the phrase and the value",
+                       "two_components": "the phrase names two components",
+                       "picture_cell": "a cell of a picture: its text was not read",
+                       "not_needed": "the family needs no component",
+                       "cap": "the character cap ended the search before its range did"},
+            "part": list(_R14_PARTS),
+            "tier": {"own": "the value's own row label, column header or purpose phrase",
+                     "context": "an earlier sentence or paragraph, a note, a caption, a lead-in or a heading"},
+            "scope": "the data listed are the ones each case is about; the header lines are not listed and assert no facet"},
+        "cases": _r14_cases(documents),
+        "documents": docs,
+    }
+    text_ = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+    (rdir / ROUND14_MANIFEST).write_text(text_, encoding="utf-8")
+    print(f"wrote {ROUND14_DIR}/{ROUND14_MANIFEST} ({len(text_):,} chars)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--font-dir", default=DEFAULT_FONT_DIR)
     parser.add_argument("--out", default="tests/fixtures")
-    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9", "round10", "round11", "round12", "round13"],
+    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9", "round10", "round11", "round12", "round13", "round14"],
                         default="all",
                         help="regions: write only the uncovered-region fixtures (tests/fixtures/regions/); "
                              "positions: only the page-position fixtures (tests/fixtures/positions/); "
@@ -7106,7 +7272,9 @@ def main() -> None:
                              "round12: only the round-12 identity, date and attribute fixtures (DOCX) and their manifest "
                              "(tests/fixtures/round12/); "
                              "round13: only the round-13 facet, decision, identity and coverage fixtures (DOCX) and their "
-                             "manifest (tests/fixtures/round13/)")
+                             "manifest (tests/fixtures/round13/); "
+                             "round14: only the round-14 context-reader fixture (DOCX) and its manifest "
+                             "(tests/fixtures/round14/)")
     args = parser.parse_args()
     font_dir = Path(args.font_dir)
     out = Path(args.out)
@@ -7140,6 +7308,9 @@ def main() -> None:
         return
     if args.only == "round13":
         write_round13(out)
+        return
+    if args.only == "round14":
+        write_round14(out)
         return
 
     docs: dict[str, dict[str, Any]] = {}
@@ -7194,6 +7365,7 @@ def main() -> None:
     write_round11(out)
     write_round12(out)
     write_round13(out)
+    write_round14(out)
 
 
 if __name__ == "__main__":

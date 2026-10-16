@@ -237,7 +237,11 @@ logger = logging.getLogger(__name__)
 
 SEARCH_LIMIT = 6
 SEARCH_MAX = 12
-CONTEXT_CHARS = {"neighbors": 3500, "section": 9000, "table": 14000}
+# the characters read around a source, by scope; "candidates" (round 14 U2, KTD3) is not a read scope: it caps the text above a value that
+# the bounded context read looks at, in place of a count of blocks
+CONTEXT_CHARS = {"neighbors": 3500, "section": 9000, "table": 14000, "candidates": 6000}
+READ_SCOPES = ("neighbors", "section", "table")
+CANDIDATE_BLOCKS = 40  # the most blocks above a value the context read fetches in one query; a read that needs more is capped
 MEASUREMENTS_MAX = 120  # per page
 LIST_MAX = 60  # per page
 SCOPE_PAGE = 30
@@ -3067,7 +3071,7 @@ def read_scope(ws: Workspace, source_id: str, scope: str = "neighbors", ref: dic
     """The context around a source (``neighbors``), its whole top-level section, or its whole table, read for the
     server's own checks (``app.chat.meaning``) through the same reader as ``read``: the source is not registered
     and the turn's coverage does not change — the caller registers it (``Workspace.adopt``) only if it cites it."""
-    if scope not in CONTEXT_CHARS:
+    if scope not in READ_SCOPES:
         raise ToolError("scope חייב להיות neighbors, section או table")
     ref = ref or _ref(ws, source_id)
     vid = UUID(str(ref["version_id"]))
@@ -5218,7 +5222,8 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
             "meaning_from": {"unit": unit_from} if unit_from else {}, "scale": scale,
             # what the facet is read from (round 13 U3, KTD2): the row label, the column header and the caption and title
             "facet_in": {"cell": True, "row": label, "header": header, "caption": st.get("caption") or "",
-                         "title": [x for x in st.get("title") or [] if x], "matrix": len(cells) >= 3},
+                         "title": [x for x in st.get("title") or [] if x], "matrix": len(cells) >= 3,
+                         "notes": [str(x) for x in st.get("notes") or [] if x]},  # round 14 U2, KTD3: a note names its row label
             # the cell as stored (KTD1): its box is looked up when the answer is stored, never searched for
             "anchor": {"table_index": index, "row": ri, "column": ci,
                        "pages": [p] if (p := (st.get("rows") or [])[ri].get("page")) else []}}
@@ -5620,25 +5625,54 @@ def _new_value(ws: Workspace, src: Source, sid: str, taken: dict, settled: tuple
 
 
 def _value_facet(ws: Workspace, src: Source, taken: dict, kind: str) -> dict:
-    """The facet of a value as it enters the turn (round 13 U3, R1, R2, KTD2): the source's own words that name the
-    component it is for — a cell's row label (else its column header, else the caption as context), or the purpose phrase
-    of a quote's own sentence (else the lead-in or heading above it, ``taken["preceding"]``) — never the model's label or
-    subject. Memoized in the workspace by place and family; a cached value (``taken["facet"]``) keeps the one it was
-    cached with."""
+    """The facet of a value as it enters the turn (round 13 U3, R1, R2, KTD2; round 14 U2, KTD3, KTD4): the source's own words
+    that name the component it is for — a cell's row label (else its column header, else the caption as context, else a note of
+    its table that names its row), or the purpose phrase of a quote's own sentence (else what the bounded read of the text above
+    it accepts, ``taken["preceding"]``) — never the model's label or subject. Memoized in the workspace by place and family; a
+    cached value (``taken["facet"]``) keeps the one it was cached with. A cell of a picture reads no text around it: not read,
+    with the reason."""
     if taken.get("facet") is not None:
         return dict(taken["facet"])
     inp = taken.get("facet_in")
     if inp is None:
-        return datum.not_read()
+        return datum.not_read(datum.REASON_PICTURE_CELL)
     if inp["cell"]:
         family = datum.facet_family(kind, inp["row"], inp["header"], inp["caption"])
         key = (*_locator_key(src.version_id, src.reading_id, taken["locator"]), family)
         return _facet_memo(ws, key, datum.read_cell, inp["row"], inp["header"], inp["caption"], inp["title"],
-                           family=family, matrix=inp["matrix"])
+                           family=family, matrix=inp["matrix"], notes=inp.get("notes") or ())
     sentence = _own_sentence(taken)
     family = datum.facet_family(kind, sentence)
-    key = (*_locator_key(src.version_id, src.reading_id, taken["locator"]), family)
-    return _facet_memo(ws, key, datum.read_quote, sentence, inp["written"], family, taken.get("preceding"))
+    return _facet_memo(ws, _quote_facet_key(src, taken, family), _read_quote_placed, sentence, inp["written"], family,
+                       taken.get("preceding"))
+
+
+def _quote_facet_key(src: Source, taken: dict, family: str) -> tuple:
+    """The workspace key of a quote value's facet: its quote's place and family, and where its number stands when the anchor
+    located it (round 14 U2): one sentence written in two sections is two places with two contexts, and the facet read in one is
+    never the other's. A quote located to block precision only keeps the quote-only key."""
+    number = (taken.get("anchor") or {}).get("number")
+    return (*_locator_key(src.version_id, src.reading_id, taken["locator"]), *(("at", number[0], number[1]) if number else ()), family)
+
+
+def _read_quote_placed(sentence: str, written: str, family: str, preceding: datum.Reach | None) -> dict:
+    """``datum.read_quote``, with the place of a context sentence stamped on the facet it reads (round 14 U2, KTD3, R3): ``at``
+    is the stub ``anchors.locate_quote`` gives for that sentence in its block, kept apart from the value's own anchor. A facet of
+    the value's own sentence has none."""
+    found = datum.read_quote(sentence, written, family, preceding)
+    block, index = found.get("block"), found.get("sentence")
+    if block is None or index is None or not isinstance(preceding, datum.Reach) or block not in preceding.blocks:
+        return found
+    sentences = sections.sentences(preceding.blocks[block])
+    if not 0 <= index < len(sentences):
+        return found
+    try:
+        located = anchors.locate_quote([(block, preceding.blocks[block])], sentences[index], Decimal("NaN"))
+    except anchors.AmbiguousQuote:  # no number to tell the occurrences apart by
+        located = None
+    if located is not None:
+        found["at"] = {"segments": located.segments} if located.segments else {"blocks": located.blocks}
+    return found
 
 
 def _facet_known(ws: Workspace, src: Source, taken: dict, kind: str) -> bool:
@@ -5649,21 +5683,26 @@ def _facet_known(ws: Workspace, src: Source, taken: dict, kind: str) -> bool:
         return False
     sentence = _own_sentence(taken)
     family = datum.facet_family(kind, sentence)
-    return ((*_locator_key(src.version_id, src.reading_id, taken["locator"]), family) in ws.facets
+    return (_quote_facet_key(src, taken, family) in ws.facets
             or datum.read_sentence(sentence, inp["written"], family) is not None)
 
 
-def _preceding_blocks(conn: Connection, version_id, region: list, taken: dict, kind: str) -> list[tuple[str, str]] | None:
-    """The blocks above a quote value's own, for its bounded context read (round 13 U3, R2, KTD2): the heading and
-    paragraph blocks among the ``datum.CONTEXT_BLOCKS`` before the block holding it, inside its section, nearest first —
-    read only for a value of a family that needs a facet. None: not read (not a family that needs one, or no block of
-    its own)."""
+def _preceding_blocks(conn: Connection, cx, version_id, region: list, taken: dict, kind: str) -> datum.Reach | None:
+    """The candidates above a quote value's own block, for its bounded context read (round 14 U2, R1, R2, KTD3): the earlier
+    sentences of its block, the earlier paragraphs of its section and the section's heading or lead-in, nearest first, inside
+    the value's appraisal unit (``cx``: its first block ends the read; ``reader.section_window``) and section. No fixed count of
+    blocks: ``CONTEXT_CHARS["candidates"]`` caps the text, and a search that reaches it is capped (``datum.Reach``). None: not
+    read (not a family that needs a facet, or no block of its own)."""
     if not region or not datum.needs_facet(datum.facet_family(kind, _own_sentence(taken))):
         return None
     holder = region[0]
     first = holder.block_index
-    above = reader.blocks_between(conn, version_id, max(0, first - datum.CONTEXT_BLOCKS), first - 1) if first > 0 else []
-    return datum.preceding([*above, holder], first, tuple(getattr(holder, "section_path", None) or ()))
+    path = tuple(getattr(holder, "section_path", None) or ())
+    window = reader.section_window(cx, first, path)
+    lo = window[0] if window is not None else 0
+    above = reader.blocks_above(conn, version_id, first, lo, CANDIDATE_BLOCKS) if first > lo else []
+    return datum.reach([*above, holder], first, taken["quote"], path=path, lo=lo, chars=CONTEXT_CHARS["candidates"],
+                       truncated=len(above) >= CANDIDATE_BLOCKS)
 
 
 def _own_sentence(taken: dict) -> str:
@@ -5946,13 +5985,13 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
         # the value's own region: read clearly, or read uncertainly at ingestion (then re-read, below, at most
         # REREADS_PER_VALUE times; the same region again is served from the stored readings)
         region = [r for r in rows if at is None or r.block_index in at]
-        if not cell:  # a quote's facet: the blocks above its own, read once with the rest (round 13 U3, KTD2)
-            kind = _settle_meaning(taken, given)[0]["kind"]  # the family is the settled kind's, as ``_value_facet`` reads it
-            taken["preceding"] = (None if _facet_known(ws, src, taken, kind) else
-                                  _preceding_blocks(conn, src.version_id, region, taken, kind))
         unclear = next((r for r in region if r.status == reader.UNCERTAIN), None)
         dating = _date_inputs(ws, conn, src.version_id, taken, region[0].block_index if region else src.block_start, vision)
         cx = contexts_of(ws, conn, src.version_id, v.reading_id)
+        if not cell:  # a quote's facet: the text above its own block, bounded by its unit and section, read once (round 14 U2, KTD3)
+            kind = _settle_meaning(taken, given)[0]["kind"]  # the family is the settled kind's, as ``_value_facet`` reads it
+            taken["preceding"] = (None if _facet_known(ws, src, taken, kind) else
+                                  _preceding_blocks(conn, cx, src.version_id, region, taken, kind))
         here = None
         if cx.multi and not (cell and vision):
             here = _context_number(ws, conn, cx, src.version_id, taken.get("anchor") or {},

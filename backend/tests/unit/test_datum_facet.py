@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import time
 import uuid
 from decimal import Decimal
@@ -72,7 +73,7 @@ def _facet(written, part, tier="own") -> dict:
     return {"status": "stated", "written": written, "part": part, "tier": tier}
 
 
-NONE = {"status": "none", "written": None, "part": None, "tier": None}
+NONE = {"status": "none", "written": None, "part": None, "tier": None, "reason": "not_in_range"}  # round 14 U2: a state carries its reason
 
 
 # --- table cells: the row label, the column header, the caption ----------------------------------------------------
@@ -179,14 +180,15 @@ def test_what_the_model_wrote_never_feeds_the_facet():
     ("שיעור ההיוון לצורך חישוב השווי הוא 6%.", "6", "rate", "percent"),
 ])
 def test_a_period_unit_date_or_basis_phrase_is_no_facet(text, number, kind, unit):
-    assert _quote(text, number, preceding=[], kind=kind, unit=unit).facet == NONE
+    found = _quote(text, number, preceding=[], kind=kind, unit=unit).facet
+    assert found["status"] == "none" and found["written"] is None  # read, and nothing in it names a component
 
 
 def test_a_family_that_needs_no_facet_reads_no_context():
     # a value is not a coefficient or a proportion: an empty facet is the unit's headline datum, no block is read
     v = _quote("שווי הנכס 1,540,000 ₪.", "1,540,000", preceding=[("heading", "תזרים הכנסות מתחנת טעינה")],
                kind="value", unit="ILS")
-    assert v.facet == NONE
+    assert v.facet == datum.none(datum.REASON_NOT_NEEDED)
 
 
 # --- normalization (KTD3): the cores U4 compares --------------------------------------------------------------------
@@ -289,14 +291,15 @@ def _read_manifest_facet(key: str, d: dict) -> dict:
         number = T._numbers_of(where["quote"])[0][0]
         taken = T._take_quote(src, full, {"quote": where["quote"], "number": number},
                               [(r.block_index, r.text, 1) for r in rows])
-        taken["preceding"] = datum.preceding(rows, at)
+        taken["preceding"] = datum.reach(rows, at, where["quote"])
     return T._value_facet(Workspace(ctx=None), src, taken, d["kind"])
 
 
 @pytest.mark.parametrize("key, d", _manifest_cases())
 def test_every_manifest_datum_reads_its_expected_facet_from_the_fixture(key, d):
     expected = {k: d["facet"].get(k) for k in ("status", "written", "part", "tier")}
-    assert _read_manifest_facet(key, d) == expected
+    found = _read_manifest_facet(key, d)  # a context facet also says where it was read (block, sentence, at): round 14 U2
+    assert {k: found.get(k) for k in expected} == expected
 
 
 def test_the_capitalization_section_reads_the_statuses_the_manifest_states():
@@ -656,3 +659,275 @@ def test_the_registration_log_is_bounded():
     for n in range(T.REGISTRATION_LOG_MAX + 5):
         _call(ws, "take_value", source=f"S{n}", locator={"quote": "x", "number": "1"}, meaning=_given(), label="x")
     assert len(ws.registration_log) == T.REGISTRATION_LOG_MAX
+
+
+# =======================================================================================================================
+# round 14 U2: the context reader — evidence, bounds and where it was found (R1-R4, R12; AE1-AE3, AE8; KTD3, KTD4)
+# =======================================================================================================================
+
+MANIFEST14 = json.loads((FIXTURES / "round14" / "manifest.json").read_text(encoding="utf-8"))
+DOC14 = MANIFEST14["documents"]["context_reader"]
+TAKEN = "בהתאם לאמור לעיל נלקח מקדם הפחתה נוסף בשיעור 10%."  # the value's own sentence: it states no component
+CONSIDERATION = "לא ניתנה הפחתה בגין עוצמת ניצול."
+SHOWN_KEYS = ("status", "written", "part", "tier", "reason")
+
+
+def _rows(*blocks, section="3. מגרש 12") -> list:
+    """Blocks as the reader stores them: ``(kind, text)`` or ``(kind, text, section)``, numbered from 0."""
+    return [SimpleNamespace(block_index=i, kind=b[0], text=b[1], section_path=(b[2] if len(b) > 2 else section,))
+            for i, b in enumerate(blocks)]
+
+
+def _read_at(rows, at: int, quote: str = TAKEN, number: str = "10", *, kind: str = "coefficient", **bounds) -> dict:
+    """The facet of the value in block ``at`` of ``rows`` (its own sentence ``quote``), read as ``tools`` reads it: the candidates
+    above it, then ``datum.read_quote``."""
+    holder = rows[at]
+    src = _source(holder.text)
+    taken = T._take_quote(src, holder.text, {"quote": quote, "number": number}, [(at, holder.text, 1)])
+    taken["preceding"] = datum.reach(rows, at, quote, **bounds)
+    return T._value_facet(Workspace(ctx=None), src, taken, kind)
+
+
+def _manifest14(datum_id: str) -> tuple[dict, list, int]:
+    d = next(x for x in DOC14["data"] if x["id"] == datum_id)
+    rows = _blocks_of(DOC14)
+    section = d["where"]["section"]
+    at = next(r.block_index for r in rows if r.kind == "paragraph" and r.section_path[:1] == (section,)
+              and d["where"]["quote"] in r.text)
+    return d, rows, at
+
+
+def _manifest14_cases():
+    for d in DOC14["data"]:
+        yield pytest.param(d["id"], id=d["id"])
+
+
+@pytest.mark.parametrize("datum_id", _manifest14_cases())
+def test_every_round14_datum_reads_the_facet_the_manifest_states(datum_id):
+    d, rows, at = _manifest14(datum_id)
+    found = _read_at(rows, at, d["where"]["quote"], re.sub(r"[^\d.,]", "", d["shown"]))
+    expected = {k: d["facet"].get(k) for k in SHOWN_KEYS}
+    assert {k: found.get(k) for k in SHOWN_KEYS} == expected
+
+
+def test_ae1_the_consideration_two_sentences_back_is_the_component_and_its_place_is_kept():
+    d, rows, at = _manifest14("r14.same_block")
+    f = _read_at(rows, at, d["where"]["quote"], "10")
+    assert (f["status"], f["written"], f["part"], f["tier"]) == ("stated", "עוצמת ניצול", "preceding_sentence", "context")
+    assert f["block"] == at and f["sentence"] == 0  # the context sentence is the first of the value's own block
+    start, end = f["at"]["segments"][0][1:]
+    assert rows[at].text[start:end] == "השמאי לא נתן הפחתה בגין עוצמת ניצול."  # `at` is the stub of the context sentence
+
+
+def test_a_facet_of_the_values_own_sentence_has_no_context_place():
+    f = _read_at(*_manifest14_args("r14.own_phrase"))
+    assert f["part"] == "sentence" and f["tier"] == "own" and not {"block", "sentence", "at"} & f.keys()
+
+
+def _manifest14_args(datum_id: str):
+    d, rows, at = _manifest14(datum_id)
+    return rows, at, d["where"]["quote"], "10"
+
+
+def test_the_consideration_in_the_previous_paragraph_block_is_a_paragraph_facet_with_its_block():
+    rows, at, quote, number = _manifest14_args("r14.prev_paragraph")
+    f = _read_at(rows, at, quote, number)
+    assert (f["written"], f["part"]) == ("עוצמת ניצול", "paragraph") and f["block"] == at - 1 and f["sentence"] == 0
+    start, end = f["at"]["segments"][0][1:]
+    assert rows[at - 1].text[start:end] == CONSIDERATION
+
+
+def test_ae2_a_reduction_of_another_kind_between_the_consideration_and_the_value_gives_no_component():
+    rows, at, quote, number = _manifest14_args("r14.between")
+    f = _read_at(rows, at, quote, number)
+    assert (f["status"], f["reason"], f["written"]) == ("unparsed", "intervening_value", None)
+    assert datum.core_of(datum.Site("coefficient", f)) == frozenset()  # a state without a component has no core
+    assert f["part"] == "preceding_sentence" and f["block"] == at  # the rejected text is the 20% sentence, kept for the reader
+    assert "ערך אחר" in datum.line(f) and "בין" in datum.line(f)
+
+
+def test_a_percent_between_with_no_purpose_phrase_of_its_own_is_enough_to_reject_the_consideration():
+    rows = _rows(("paragraph", f"{CONSIDERATION} הופחתו 20% בנוסף. {TAKEN}"))
+    assert _read_at(rows, 0)["reason"] == "intervening_value"
+    rows = _rows(("paragraph", f"{CONSIDERATION} נלקח מקדם 0.85 בנוסף. {TAKEN}"))  # a coefficient between counts as well
+    assert _read_at(rows, 0)["reason"] == "intervening_value"
+    rows = _rows(("paragraph", f"{CONSIDERATION} שטח המגרש 310 מ״ר, בשנת 2022. {TAKEN}"))  # an area and a year are no values
+    assert _read_at(rows, 0)["status"] == "stated"
+
+
+def test_a_consideration_with_a_number_of_its_own_is_that_numbers_not_the_values():
+    rows = _rows(("paragraph", f"ניתנה הפחתה של 20% בגין סחירות. {TAKEN}"))
+    f = _read_at(rows, 0)
+    assert (f["status"], f["reason"]) == ("unparsed", "intervening_value")
+
+
+def test_ae3_the_read_stops_at_a_table_at_another_sections_heading_and_at_the_units_first_block():
+    # a table block between
+    rows = _rows(("paragraph", CONSIDERATION), ("table", "נתון | ערך"), ("paragraph", TAKEN))
+    f = _read_at(rows, 2)
+    assert (f["status"], f["reason"]) == ("none", "not_in_range")
+    # another section's heading, and its text, between
+    rows = _rows(("paragraph", CONSIDERATION, "3. מגרש 12"), ("heading", "4. מגרש 14", "4. מגרש 14"),
+                 ("paragraph", TAKEN, "4. מגרש 14"))
+    assert (f := _read_at(rows, 2))["status"] == "none" and f["reason"] == "not_in_range"
+    # the same section path in the unit before: the unit's first block ends the read
+    rows = _rows(("paragraph", CONSIDERATION), ("paragraph", "שנת הערכה."), ("paragraph", TAKEN))
+    assert _read_at(rows, 2)["status"] == "stated"
+    assert (f := _read_at(rows, 2, lo=1))["status"] == "none" and f["reason"] == "not_in_range"
+    assert _read_at(rows, 2, lo=0)["written"] == "עוצמת ניצול"
+
+
+def test_the_values_own_sentence_and_what_follows_it_are_never_candidates():
+    rows = _rows(("paragraph", f"{TAKEN} {CONSIDERATION}"))
+    assert datum.reach(rows, 0, TAKEN).candidates == []
+    assert _read_at(rows, 0)["status"] == "none"  # a consideration after the value is not the value's
+    several = _rows(("paragraph", f"{CONSIDERATION} {TAKEN} אחרי."))
+    assert [c.text for c in datum.reach(several, 0, TAKEN).candidates] == [CONSIDERATION]
+
+
+def test_a_candidate_naming_two_components_is_ambiguous_not_attributed():
+    for text in ("ניתנה הפחתה לעוצמת ניצול ולגמישות שימושים.", "ניתנה הפחתה בגין עוצמת ניצול ובגין גמישות שימושים.",
+                 "ניתנה הפחתה בגין עוצמת ניצול, ובגין גמישות שימושים.", "ניתנה הפחתה בגין עוצמת ניצול עבור גמישות שימושים."):
+        f = _read_at(_rows(("paragraph", text), ("paragraph", TAKEN)), 1)
+        assert (f["status"], f["reason"], f["written"]) == ("unparsed", "two_components", None), text
+    one = "ניתנה הפחתה בגין עוצמת ניצול, ולכן נלקח מקדם נוסף לבחינה."  # a conjunction that opens no purpose is not a second component
+    assert _read_at(_rows(("paragraph", one), ("paragraph", TAKEN)), 1)["status"] == "stated"
+
+
+def test_the_connective_in_accordance_with_is_no_cue_word_and_opens_no_phrase():
+    assert datum.read_sentence(TAKEN, "10", "coefficient") is None  # "בהתאם לאמור…": the stem of "התאמות" is not its meaning
+    rows = _rows(("paragraph", "בהתאם לעוצמת הניצול שנבדקה נקבע ערך."), ("paragraph", TAKEN))
+    assert _read_at(rows, 1)["status"] == "none"
+
+
+def test_a_candidate_needs_a_cue_word_and_a_purpose_phrase():
+    for text in ("ניתנה התחשבות בעוצמת ניצול.",  # no cue word of a coefficient or a rate
+                 "ניתנה הפחתה.",  # a cue word, no purpose phrase
+                 "ניתנה הפחתה לשנה.",  # a phrase that is a period
+                 "הנכס נבדק בגין עוצמת ניצול."):  # a connector and a phrase, no cue
+        assert _read_at(_rows(("paragraph", text), ("paragraph", TAKEN)), 1)["status"] == "none", text
+
+
+def test_a_list_lead_in_is_the_components_of_its_items_but_a_paragraph_value_between_blocks_it():
+    lead = "הפחתה בגין עוצמת ניצול:"
+    rows = _rows(("paragraph", lead), ("li", "בשיעור 5%."), ("paragraph", "בשיעור 7%."), ("paragraph", "בשיעור 9%."))
+    assert _read_at(rows, 3, "בשיעור 9%.", "9")["reason"] == "intervening_value"  # a value of a paragraph stands between
+    rows = _rows(("paragraph", lead), ("li", "בשיעור 5%."), ("li", "בשיעור 7%."))
+    f = _read_at(rows, 2, "בשיעור 7%.", "7")  # a sibling item does not: the lead-in is the whole list's
+    assert (f["status"], f["part"], f["written"]) == ("stated", "lead_in", "הפחתה בגין עוצמת ניצול") and f["block"] == 0
+    # a numbered heading with a number of its own kind does not count the section number as a value
+    rows = _rows(("heading", "3.2 הפחתה בגין עוצמת ניצול"), ("paragraph", TAKEN))
+    assert _read_at(rows, 1)["part"] == "heading"
+
+
+def test_a_legacy_pair_of_blocks_above_is_still_read():
+    f = datum.read_quote("שיעור היוון 9%.", "9", "proportion", [("paragraph", LEAD_IN)])
+    assert (f["part"], f["tier"]) == ("lead_in", "context")
+
+
+def test_the_candidate_text_is_capped_by_characters_and_a_capped_search_is_not_read_never_none():
+    filler = "הנכס נבדק בהתאם לנתוני השוק שנאספו בסביבתו. " * 4
+    rows = _rows(("paragraph", CONSIDERATION), *[("paragraph", filler)] * 6, ("paragraph", TAKEN))
+    wide = datum.reach(rows, 7, TAKEN, chars=10_000)
+    assert not wide.capped and _read_at(rows, 7)["written"] == "עוצמת ניצול"
+    cut = datum.reach(rows, 7, TAKEN, chars=len(filler) * 3)
+    assert cut.capped and sum(len(c.text) for c in cut.candidates) <= len(filler) * 3
+    f = _read_at(rows, 7, chars=len(filler) * 3)
+    assert (f["status"], f["reason"]) == ("not_read", "cap")
+    assert datum.read_context(cut, "coefficient")["status"] == "not_read"
+    # an accepted candidate before the cap settles it; the cap is a key of the existing dictionary, not a read scope
+    near = _rows(("paragraph", filler), ("paragraph", CONSIDERATION), ("paragraph", TAKEN))
+    assert _read_at(near, 2, chars=len(CONSIDERATION) + 5)["written"] == "עוצמת ניצול"
+    assert T.CONTEXT_CHARS["candidates"] > 0 and "candidates" not in T.READ_SCOPES
+    with pytest.raises(T.ToolError):
+        T.read_scope(Workspace(ctx=None), "S1", "candidates")
+
+
+def test_rows_cut_by_the_reader_limit_are_a_capped_search():
+    rows = _rows(("paragraph", "נבדק."), ("paragraph", TAKEN))
+    assert datum.reach(rows[1:], 1, TAKEN, truncated=True).capped and not datum.reach(rows[1:], 1, TAKEN).capped
+    assert datum.reach(rows, 1, TAKEN, truncated=True).capped is False  # the range was reached: the cut did not matter
+
+
+def test_a_header_only_table_context_still_gives_the_caption_facet_and_a_note_comes_after_it():
+    table = _table(["מדד", "ערך"], [["הערך שנקבע", "0.85"]], "מקדם הפחתה בשל קרבה לקו מתח עליון")
+    table["notes"] = ["הערך שנקבע: הפחתה בגין סחירות."]
+    assert _cell(table, "הערך שנקבע", "ערך").facet == _facet("מקדם הפחתה בשל קרבה לקו מתח עליון", "caption", "context")
+
+
+def test_ae_table_note_that_names_the_row_label_gives_the_consideration():
+    table = _table(["מדד", "ערך"], [["הערך שנקבע", "0.85"]], "טבלת מקדמי התאמה לנכס")
+    table["notes"] = ["הערה כללית לטבלה.", "הערך שנקבע: מקדם הפחתה בגין עוצמת ניצול."]
+    f = _cell(table, "הערך שנקבע", "ערך").facet
+    assert (f["status"], f["written"], f["part"], f["tier"], f["sentence"]) == ("stated", "עוצמת ניצול", "table_note",
+                                                                                  "context", 1)
+    # a note about another row names nothing for this one, and a note naming two considerations is ambiguous
+    table["notes"] = ["שטח המגרש: הפחתה בגין עוצמת ניצול."]
+    assert _cell(table, "הערך שנקבע", "ערך").facet == NONE
+    table["notes"] = ["הערך שנקבע: הפחתה בגין עוצמת ניצול ובגין גמישות שימושים."]
+    f = _cell(table, "הערך שנקבע", "ערך").facet
+    assert (f["status"], f["reason"], f["part"]) == ("unparsed", "two_components", "table_note")
+    # the notes are read last: the row label, the column header and the caption come first
+    table = _table(["מדד", "ערך"], [[STATED_ROW, "0.85"]], "")
+    table["notes"] = [f"{STATED_ROW}: הפחתה בגין סחירות."]
+    assert _cell(table, STATED_ROW, "ערך").facet == _facet(STATED_ROW, "row")
+
+
+def test_a_cell_of_a_family_that_needs_no_facet_reads_no_notes():
+    table = _table(["מדד", "ערך"], [["הערך שנקבע", "620"]], "")
+    table["notes"] = ["הערך שנקבע: הפחתה בגין סחירות."]
+    assert _cell(table, "הערך שנקבע", "ערך", kind="area", unit="sqm").facet == datum.none(datum.REASON_NOT_NEEDED)
+
+
+def test_ae8_a_cell_of_a_picture_has_a_component_that_was_not_read_with_the_reason():
+    src = _source("x")
+    taken = {"locator": {"table_index": 0, "row": "מקדם", "row_number": 1, "column": "ערך", "column_number": 1}}
+    f = T._value_facet(Workspace(ctx=None), src, taken, "coefficient")  # a picture cell has no facet_in (_take_vision_cell)
+    assert (f["status"], f["reason"]) == ("not_read", "picture_cell") and f["written"] is None
+    assert datum.core_of(datum.Site("coefficient", f)) == frozenset()
+    assert datum.LABEL_NOT_STATED not in datum.line(f) and "תמונה" in datum.line(f)
+
+
+def test_no_state_but_stated_has_a_core_and_the_model_is_told_each_state_in_words():
+    lines = {datum.line(s) for s in (datum.none(), datum.not_read(), datum.not_read(datum.REASON_CAP),
+                                     datum.not_read(datum.REASON_PICTURE_CELL), datum.unparsed(datum.REASON_INTERVENING),
+                                     datum.unparsed(datum.REASON_TWO_COMPONENTS))}
+    assert len(lines) == 6  # six states, six wordings: none is shown as another
+    for f in (datum.none(), datum.not_read(), datum.unparsed(datum.REASON_INTERVENING, "paragraph", block=3, sentence=0)):
+        assert datum.core_of(datum.Site("coefficient", f)) == frozenset()
+
+
+def test_an_ambiguous_read_moves_forward_to_a_stated_one_and_never_back():
+    stated = _facet("עוצמת ניצול", "paragraph", "context")
+    ambiguous = datum.unparsed(datum.REASON_INTERVENING, "paragraph")
+    assert datum.forward(ambiguous, stated) == stated and datum.forward(stated, ambiguous) == stated
+    assert datum.forward(datum.not_read(), ambiguous) == ambiguous and datum.forward(ambiguous, datum.not_read()) == ambiguous
+
+
+# --- relation: a facet read from the sentence above is the value's own words (rule 3) ------------------------------------
+
+def _site(facet: dict, section: str, appraisal=("v", 1)) -> datum.Site:
+    return datum.Site("coefficient", facet, appraisal, None, section)
+
+
+def test_a_context_sentence_and_an_own_phrase_in_two_sections_of_one_unit_are_different_when_their_cores_differ():
+    sentence = datum.facet("עוצמת ניצול", "preceding_sentence", "context", block=15, sentence=0)
+    own = datum.facet("סחירות", "sentence", "own")
+    assert datum.relation(_site(sentence, "3. מגרש 12"), _site(own, "9. מגרש 24")) == datum.DIFFERENT
+    paragraph = datum.facet("גמישות שימושים", "paragraph", "context", block=19, sentence=0)
+    assert datum.relation(_site(sentence, "3. מגרש 12"), _site(paragraph, "5. מגרש 16")) == datum.DIFFERENT
+    # in another unit, or when one of them is a heading or a lead-in, nothing new is decided
+    assert datum.relation(_site(sentence, "3. מגרש 12"), _site(own, "9. מגרש 24", ("v", 2))) == datum.UNDECIDED
+    heading = datum.facet("עוצמת ניצול", "heading", "context")
+    assert datum.relation(_site(heading, "3. מגרש 12"), _site(own, "9. מגרש 24")) == datum.UNDECIDED
+    # equal cores are not "same" by this rule: only an own facet pair is (rule 1)
+    assert datum.relation(_site(sentence, "3"), _site(datum.facet("עוצמת ניצול", "paragraph", "context"), "5")) == datum.UNDECIDED
+
+
+def test_the_round14_fixtures_two_plots_are_different_components_not_undecided():
+    facets = []
+    for datum_id in ("r14.same_block", "r14.own_phrase"):
+        rows, at, quote, number = _manifest14_args(datum_id)
+        facets.append((_read_at(rows, at, quote, number), rows[at].section_path[0]))
+    (a, sa), (b, sb) = facets
+    assert sa != sb and datum.relation(_site(a, sa), _site(b, sb)) == datum.DIFFERENT

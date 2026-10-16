@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 import pytest
 from sqlalchemy import text
@@ -95,8 +96,10 @@ def _take(office, section: str, sentence: str, number: str):
 
 def test_a_quote_value_with_no_component_in_its_sentence_reads_the_lead_in_above_it(office):
     ws, out = _take(office, SECTION_A, BLOCKS[3][2], "9")
-    assert ws.values["V1"].facet == {"status": "stated", "written": "תזרים הכנסות משטחי פרסום על הגג",
-                                     "part": "lead_in", "tier": "context"}
+    f = ws.values["V1"].facet  # round 14 U2: a context facet also says where it was read
+    assert {k: f[k] for k in ("status", "written", "part", "tier")} == {
+        "status": "stated", "written": "תזרים הכנסות משטחי פרסום על הגג", "part": "lead_in", "tier": "context"}
+    assert (f["block"], f["sentence"]) == (2, 0) and f["at"]["segments"][0][0] == 2
     assert "תזרים הכנסות משטחי פרסום על הגג" in out  # the model is told
 
 
@@ -108,7 +111,7 @@ def test_a_quote_value_whose_sentence_names_the_cash_flow_has_an_own_facet(offic
 
 def test_a_heading_that_names_no_cash_flow_leaves_the_value_with_status_none(office):
     ws, out = _take(office, SECTION_B, BLOCKS[6][2], "10")
-    assert ws.values["V1"].facet["status"] == "none"
+    assert ws.values["V1"].facet["status"] == "none" and ws.values["V1"].facet["reason"] == "not_in_range"
     assert "רכיב: לא צוין במקור" in out
 
 
@@ -251,9 +254,9 @@ def test_the_blocks_above_a_quote_are_read_for_the_family_of_the_settled_kind_no
         fields, prov, anchors = real_settle(taken, given)
         return fields | {"kind": "rate"}, prov, anchors
 
-    def preceding(conn, version_id, region, taken, kind):
+    def preceding(conn, cx, version_id, region, taken, kind):
         seen.append(kind)
-        return real_preceding(conn, version_id, region, taken, kind)
+        return real_preceding(conn, cx, version_id, region, taken, kind)
 
     monkeypatch.setattr(T, "_settle_meaning", settle)
     monkeypatch.setattr(T, "_preceding_blocks", preceding)
@@ -263,3 +266,102 @@ def test_the_blocks_above_a_quote_are_read_for_the_family_of_the_settled_kind_no
     run(ws, "take_value", source=s, locator=quote(BLOCKS[3][2].rstrip("."), "9"),
         meaning=_meaning() | {"kind": "income"}, label="שיעור")
     assert seen == ["rate"], seen
+
+
+# =======================================================================================================================
+# round 14 U2: the bounded context read against a stored DOCX (R1, R2; AE1-AE3; KTD3): two plots in two sections
+# =======================================================================================================================
+
+MANIFEST14 = json.loads((Path(__file__).resolve().parents[1] / "fixtures" / "round14" / "manifest.json").read_text(encoding="utf-8"))
+DOC14 = MANIFEST14["documents"]["context_reader"]
+DATA14 = {d["id"]: d for d in DOC14["data"]}
+SHOWN = ("status", "written", "part", "tier", "reason")
+
+
+@pytest.fixture
+def office14(db, client, monkeypatch):
+    """The round-14 context-reader DOCX, uploaded and read by the worker (text only), in a synthetic office."""
+    from tests.conftest import login
+    from tests.integration.test_property_scope import FIXTURES, upload
+
+    o = make_office(db, "משרד סינתטי יד", "admin-r14f@example.test")
+    login(client, "admin-r14f@example.test")
+    o.client = client
+    o.doc = upload(o, FIXTURES / DOC14["file"], DOC14["source_kind"], monkeypatch)
+    return o
+
+
+def _take14(office, ws, datum_id: str) -> str:
+    """The value ``datum_id`` of the manifest, taken from the section that holds it, with the kind the manifest gives."""
+    d = DATA14[datum_id]
+    s = _source_of(ws, d["where"]["section"])
+    number = re.sub(r"[^\d.,]", "", d["shown"])
+    return run(ws, "take_value", source=s, locator=quote(d["where"]["quote"].rstrip("."), number),
+               meaning=_meaning() | {"kind": "coefficient"}, label=datum_id)
+
+
+def _workspace14(office):
+    ws = workspace(office)
+    ws.doc = office.doc
+    return ws
+
+
+@pytest.mark.parametrize("datum_id", list(DATA14))
+def test_every_round14_datum_taken_from_the_stored_document_has_the_facet_the_manifest_states(office14, datum_id):
+    ws = _workspace14(office14)
+    out = _take14(office14, ws, datum_id)
+    assert out.startswith("V1 נרשם"), out
+    found = ws.values["V1"].facet
+    assert {k: found.get(k) for k in SHOWN} == {k: DATA14[datum_id]["facet"].get(k) for k in SHOWN}
+
+
+def test_the_second_plots_value_does_not_take_the_first_plots_consideration(office14):
+    from app.chat import datum, timeline
+
+    ws = _workspace14(office14)
+    assert _take14(office14, ws, "r14.same_block").startswith("V1 נרשם")
+    second_out = _take14(office14, ws, "r14.second_plot")
+    assert second_out.startswith("V2 נרשם") and "רכיב: לא צוין במקור" in second_out
+    first, second = ws.values["V1"].facet, ws.values["V2"].facet
+    assert (first["status"], first["written"], first["part"]) == ("stated", "עוצמת ניצול", "preceding_sentence")
+    assert (second["status"], second["written"], second["reason"]) == ("none", None, "not_in_range")
+    d1, d2 = timeline.datums(ws)
+    assert datum.relation(d1, d2) == datum.UNDECIDED  # two 10% values of two plots are not one datum
+
+
+def test_a_context_sentence_is_located_in_its_stored_block_and_the_value_keeps_its_own_anchor(office14):
+    ws = _workspace14(office14)
+    _take14(office14, ws, "r14.same_block")
+    f = ws.values["V1"].facet
+    with tenant_tx(office14.ctx()) as conn:
+        rows = conn.execute(text("SELECT block_index, text FROM document_blocks WHERE document_id = :d ORDER BY block_index"),
+                            {"d": office14.doc}).all()
+    by = dict(rows)
+    block, start, end = f["at"]["segments"][0]
+    assert block == f["block"] and by[block][start:end] == "השמאי לא נתן הפחתה בגין עוצמת ניצול."
+    number = ws.anchors["V1"]["number"]  # the value's own locator is its own sentence, apart from the context's
+    assert number[0] == block and number[1] >= end
+
+
+def test_the_read_below_the_context_lookup_asks_the_database_once_for_the_blocks_above(office14):
+    from sqlalchemy import event
+
+    from app.db import get_engine
+
+    seen: list[str] = []
+
+    def record(conn, cursor, statement, *args):  # noqa: ARG001
+        if "FROM document_blocks" in statement:
+            seen.append(statement)
+
+    ws = _workspace14(office14)
+    s = _source_of(ws, DATA14["r14.prev_paragraph"]["where"]["section"])
+    engine = get_engine()
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        number = re.sub(r"[^\d.,]", "", DATA14["r14.prev_paragraph"]["shown"])
+        run(ws, "take_value", source=s, locator=quote(DATA14["r14.prev_paragraph"]["where"]["quote"].rstrip("."), number),
+            meaning=_meaning() | {"kind": "coefficient"}, label="x")
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    assert sum("ORDER BY block_index DESC LIMIT" in q for q in seen) == 1, seen

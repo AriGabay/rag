@@ -95,6 +95,16 @@ def blocks_between(conn: Connection, version_id: UUID, start: int | None = None,
          "b": end if end is not None else 2_000_000_000}).all()
 
 
+def blocks_above(conn: Connection, version_id: UUID, before: int, lo: int = 0, limit: int = 40) -> list:
+    """The ``limit`` blocks nearest above block ``before`` (not it), down to block ``lo`` (inclusive), in reading order
+    (round 14 U2, KTD3): the text a value's context is read from, nearest first once reversed by the caller. ``lo`` is the first
+    block of the appraisal unit (or 0 in a file of one)."""
+    rows = conn.execute(text(
+        f"SELECT {BLOCK_COLS} FROM document_blocks WHERE version_id = :v AND block_index BETWEEN :a AND :b"
+        " ORDER BY block_index DESC LIMIT :n"), {"v": version_id, "a": max(lo, 0), "b": before - 1, "n": int(limit)}).all()
+    return list(reversed(rows))
+
+
 def block_count(conn: Connection, version_id: UUID) -> int:
     return conn.execute(text("SELECT count(*) FROM document_blocks WHERE version_id = :v"),
                         {"v": version_id}).scalar_one()

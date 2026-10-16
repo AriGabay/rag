@@ -5,14 +5,17 @@ consideration, are parallel components of one appraisal, not two values of one d
 anchored record of the source's own words:
 
 - ``written``: the words as the source wrote them, without a leading preposition (ל / עבור / בגין);
-- ``part``: where they are (``row``, ``column``, ``caption``, ``sentence``, ``lead_in`` or ``heading``);
+- ``part``: where they are (``row``, ``column``, ``caption``, ``sentence``, ``lead_in``, ``heading``; round 14 U2, KTD3: also
+  ``preceding_sentence``, ``paragraph`` and ``table_note``);
 - ``tier``: ``own`` (the value's own row label, its column header in a matrix, the purpose phrase of its own sentence)
-  or ``context`` (the table caption, the list lead-in, the nearest heading);
-- ``status``: ``stated``, ``none`` (read, nothing stated) or ``not_read``.
+  or ``context`` (the table caption, a table note, an earlier sentence or paragraph, the list lead-in, the nearest heading);
+- ``status``: ``stated``, ``none`` (read, nothing stated), ``unparsed`` (read, ambiguous) or ``not_read`` (round 14 U2, KTD4);
+  every state but ``stated`` carries a ``reason``, and a context facet its place: ``block`` and ``sentence`` (indexes) and
+  ``at`` (the stub of the context sentence, stamped by ``tools``).
 
 It is source text only: what the model wrote (``Value.label``, ``Value.subject``) never reaches this module. The
 reading is a pure function of stored text (no model call, no database): ``tools`` hands it the cell's row, header and
-caption, or the value's sentence with the blocks above it, once, when a datum enters the turn (KTD2).
+caption, or the value's sentence with the candidates above it, once, when a datum enters the turn (KTD2).
 
 Comparing two facets is ``relation`` (round 13 U4, KTD3): ``core`` is the facet's words normalized (quote marks unified,
 prefix letters and plural endings folded, the family's generic and metric words dropped, digits kept), so two spellings
@@ -30,8 +33,22 @@ from typing import NamedTuple
 from app.measurements.values import parse_amount
 
 STATUS_STATED, STATUS_NONE, STATUS_NOT_READ = "stated", "none", "not_read"
+STATUS_UNPARSED = "unparsed"  # read, and the source's words cannot be attributed to the value (round 14 U2, KTD4)
 TIER_OWN, TIER_CONTEXT = "own", "context"
-CONTEXT_BLOCKS = 3  # the blocks above a quote value that the bounded context read looks at (KTD2)
+
+# the reasons of a state that is not ``stated`` (round 14 U2, KTD4): what was checked, and why it settled nothing
+REASON_NOT_IN_RANGE = "not_in_range"  # read the whole range (own sentence, earlier text of the unit and section): nothing names one
+REASON_INTERVENING = "intervening_value"  # a component phrase, with a value of the same kind between it and this value
+REASON_TWO_COMPONENTS = "two_components"  # the phrase names two components: which one is this value's is not said
+REASON_PICTURE_CELL = "picture_cell"  # a cell of a picture: the text around it was not read
+REASON_NOT_NEEDED = "not_needed"  # the family needs no component (the unit's headline datum)
+REASON_CAP = "cap"  # the search reached its character cap before an accepted candidate
+
+# where a context facet was read from (``part``)
+PART_PRECEDING_SENTENCE, PART_PARAGRAPH, PART_HEADING, PART_LEAD_IN = "preceding_sentence", "paragraph", "heading", "lead_in"
+PART_TABLE_NOTE, PART_CAPTION, PART_LIST_ITEM = "table_note", "caption", "list_item"
+# the parts that are sentence-level evidence in the value's own paragraph flow: ``relation`` rule 3 counts them like an own facet
+SENTENCE_PARTS = frozenset({PART_PRECEDING_SENTENCE, PART_PARAGRAPH})
 
 # the families whose datum needs a facet (KTD3): a coefficient, and a proportion (a rate, a percentage, an
 # adjustment). In any other family an empty or absent facet is the appraisal unit's headline datum
@@ -41,26 +58,46 @@ LABEL_NOT_STATED = "לא צוין במקור"
 LABEL_NOT_READ = "לא נקרא"
 LABEL_FROM_CONTEXT = "מההקשר"
 LABEL_FACET = "רכיב"
+LABEL_UNPARSED = {
+    REASON_INTERVENING: "נקרא ולא הוכרע: ערך אחר מאותו סוג עומד בין ההקשר לערך",
+    REASON_TWO_COMPONENTS: "נקרא ולא הוכרע: ההקשר מונה שני רכיבים",
+}
+LABEL_NOT_READ_REASON = {
+    REASON_PICTURE_CELL: "לא נקרא: תא בתמונה, הטקסט סביבו לא נקרא",
+    REASON_CAP: "לא נקרא: החיפוש הגיע למגבלת הקריאה לפני שנמצא הקשר",
+}
 
 
-def facet(written: str, part: str, tier: str) -> dict:
-    """A stated facet."""
-    return {"status": STATUS_STATED, "written": written, "part": part, "tier": tier}
+def facet(written: str, part: str, tier: str, **place) -> dict:
+    """A stated facet. ``place``: where a context facet was read (``block``, ``sentence``, ``at``; round 14 U2, KTD3), kept
+    apart from the value's own locator."""
+    return {"status": STATUS_STATED, "written": written, "part": part, "tier": tier} | {
+        k: v for k, v in place.items() if v is not None}
 
 
-def none() -> dict:
-    """Read, and the source states no facet (the unit's headline datum, or a datum that cannot be placed)."""
-    return {"status": STATUS_NONE, "written": None, "part": None, "tier": None}
+def none(reason: str = REASON_NOT_IN_RANGE) -> dict:
+    """Read, and the source states no facet (the unit's headline datum, or a datum that cannot be placed): nothing in the range
+    checked names one (``not_in_range``), or its family needs none (``not_needed``)."""
+    return {"status": STATUS_NONE, "written": None, "part": None, "tier": None, "reason": reason}
 
 
-def not_read() -> dict:
-    """Not read: the place the facet is read from was not at hand."""
-    return {"status": STATUS_NOT_READ, "written": None, "part": None, "tier": None}
+def not_read(reason: str | None = None) -> dict:
+    """Not read: the place the facet is read from was not at hand (no ``reason``), a picture cell, or the search reached its
+    cap. It is never shown as "the source states none"."""
+    return {"status": STATUS_NOT_READ, "written": None, "part": None, "tier": None, "reason": reason}
+
+
+def unparsed(reason: str, part: str | None = None, **place) -> dict:
+    """Read, and ambiguous (round 14 U2, KTD3, KTD4): the nearest text that names a component cannot be attributed to this value
+    (``intervening_value``, ``two_components``). No component is stated, so ``core_of`` is empty; ``part`` and the place say
+    where the rejected text is."""
+    return {"status": STATUS_UNPARSED, "written": None, "part": part, "tier": TIER_CONTEXT, "reason": reason} | {
+        k: v for k, v in place.items() if v is not None}
 
 
 # how much a component state says (round 14 U1, KTD2): "not read" is nothing, "read" (nothing stated, or ambiguous) is more, "stated"
 # is most. A state only moves forward
-_STATE_RANK = {STATUS_NOT_READ: 0, STATUS_NONE: 1, "unparsed": 1, STATUS_STATED: 2}
+_STATE_RANK = {STATUS_NOT_READ: 0, STATUS_NONE: 1, STATUS_UNPARSED: 1, STATUS_STATED: 2}
 
 
 def forward(first: dict | None, second: dict | None) -> dict:
@@ -86,14 +123,19 @@ def needs_facet(family: str) -> bool:
 
 
 def line(f: dict | None) -> str:
-    """The facet as the model is told it (short, Hebrew): its written words, or that the source states none."""
+    """The facet as the model is told it (short, Hebrew): its written words, or the state in words (round 14 U2, KTD4, KTD12): the
+    source states none in the range checked, the read was ambiguous (and why), or it was not read (and why) — never one for
+    another."""
     f = f or {}
-    if f.get("status") == STATUS_STATED:
+    status, reason = f.get("status"), f.get("reason")
+    if status == STATUS_STATED:
         where = f" ({LABEL_FROM_CONTEXT})" if f.get("tier") == TIER_CONTEXT else ""
         return f"{LABEL_FACET}{where}: «{f.get('written')}»"
-    if f.get("status") == STATUS_NONE:
+    if status == STATUS_NONE:
         return f"{LABEL_FACET}: {LABEL_NOT_STATED}"
-    return f"{LABEL_FACET}: {LABEL_NOT_READ}"
+    if status == STATUS_UNPARSED:
+        return f"{LABEL_FACET}: {LABEL_UNPARSED.get(reason, 'נקרא ולא הוכרע')}"
+    return f"{LABEL_FACET}: {LABEL_NOT_READ_REASON.get(reason, LABEL_NOT_READ)}"
 
 
 # --- normalization (KTD3) ---------------------------------------------------------------------------------------------
@@ -150,6 +192,14 @@ FAMILY_WORDS: dict[str, frozenset[str]] = {
 # then name the component
 _BASIS_WORDS = _stems("בסיס בסיסי")  # "בסיס" is a word of a basis label, not a cue
 _CUE_WORDS = (_COEFFICIENT_WORDS | _PROPORTION_WORDS) - _BASIS_WORDS
+# "בהתאם" ("in accordance with") has the stem of the plural "התאמות" (an adjustment): it is a connective of nearly every sentence
+# that cites an earlier one, never a cue (round 14 U2: a candidate needs a cue word, and "בהתאם לאמור" must not open a phrase)
+_NOT_A_CUE = frozenset({"בהתאם", "בהתאמה"})
+
+
+def _has_cue(text: str) -> bool:
+    """Whether a text holds a cue word of a metric (a coefficient or a rate)."""
+    return any(_stem(w) in _CUE_WORDS for w in _TOKEN.findall(_flat(text)) if w not in _NOT_A_CUE)
 
 
 def generic_words(family: str) -> frozenset[str]:
@@ -200,11 +250,13 @@ def facet_family(kind: str, *texts: str) -> str:
 # --- table cells ---------------------------------------------------------------------------------------------------------
 
 def read_cell(row_label: str | None, header: str | None, caption: str | None = None, title: Sequence[str] = (),
-              *, family: str = "", matrix: bool = False) -> dict:
+              *, family: str = "", matrix: bool = False, notes: Sequence[str] = ()) -> dict:
     """The facet of a table cell (R1): its row label is the own facet; the column header names it when the row label
     states nothing (a generic label such as "הערך שנקבע"); a (row label, column header) pair when both name things in a
     matrix (more than one value column). The caption and the table's title are the context facet, read only in a family
-    that needs a facet and only when they hold a metric word and name a component beside it. Nothing stated: ``none``."""
+    that needs a facet and only when they hold a metric word and name a component beside it. Last, in the same family, the
+    table's notes (round 14 U2, KTD3): a note that names the row label and states a purpose phrase for it
+    (``table_note``). Nothing stated: ``none``."""
     row, col = (row_label or "").strip(), (header or "").strip()
     if row and _states(row, family):
         if matrix and col and _states(col, family):
@@ -212,20 +264,45 @@ def read_cell(row_label: str | None, header: str | None, caption: str | None = N
         return facet(row, "row", TIER_OWN)
     if col and _states(col, family):
         return facet(col, "column", TIER_OWN)
-    if needs_facet(family):
-        for text in (caption or "", *title):
-            if (found := _context(text, family, "caption")) is not None:
-                return found
+    if not needs_facet(family):
+        return none(REASON_NOT_NEEDED)
+    for text in (caption or "", *title):
+        if (found := _context(text, family, PART_CAPTION)) is not None:
+            return found
+    for index, note in enumerate(notes):
+        if (found := _note(note, row, family, index)) is not None:
+            return found
     return none()
 
 
-def _context(text: str, family: str, part: str) -> dict | None:
+def _note(note: str, row_label: str, family: str, index: int) -> dict | None:
+    """A table note as the context of a cell (round 14 U2, KTD3, R1): the note must name the cell's row label (the label
+    as written, so a footnote about another row never reaches this one) and hold a cue word with a purpose phrase for it. A note
+    that names two components is ambiguous, not attributed."""
+    label = " ".join(_flat(row_label).split())
+    text = " ".join(_flat(note).split())
+    if len(label) < 2 or label not in text:
+        return None
+    phrase, two = _candidate_phrase(note, family)
+    if phrase is None:
+        return None
+    if two:
+        return unparsed(REASON_TWO_COMPONENTS, PART_TABLE_NOTE, sentence=index)
+    return facet(phrase, PART_TABLE_NOTE, TIER_CONTEXT, sentence=index)
+
+
+def _context(text: str, family: str, part: str, **place) -> dict | None:
     """A caption, a lead-in or a heading as a context facet, or None: it must hold a metric word of the family (the cue
     that it speaks of the coefficient or rate) and name a component beside it."""
-    cleaned = re.sub(r"^\s*(?:\d+(?:\.\d+)*[.)]?|[א-ת][.)])\s+", "", (text or "").strip()).rstrip(" :").strip()
-    if not cleaned or not (_stems(cleaned) & _CUE_WORDS) or not _states(cleaned, family):
+    cleaned = _unnumbered(text).rstrip(" :").strip()
+    if not cleaned or not _has_cue(cleaned) or not _states(cleaned, family):
         return None
-    return facet(tidy(cleaned), part, TIER_CONTEXT)
+    return facet(tidy(cleaned), part, TIER_CONTEXT, **place)
+
+
+def _unnumbered(text: str) -> str:
+    """A text without the section number or list letter that opens it ("3.2 …", "א. …")."""
+    return re.sub(r"^\s*(?:\d+(?:\.\d+)*[.)]?|[א-ת][.)])\s+", "", (text or "").strip())
 
 
 # --- quote values ----------------------------------------------------------------------------------------------------------
@@ -270,15 +347,15 @@ def _excluded_head(word: str) -> bool:
     return not flat or flat[0].isdigit() or _stem(flat) in _NOT_A_COMPONENT or flat in _NOT_A_COMPONENT
 
 
-def read_sentence(sentence: str, written: str, family: str = "") -> dict | None:
-    """The purpose phrase of the value's own sentence as an own facet, or None: the words after ל / עבור / בגין / בעבור
-    that follow the number or the metric word, to the clause end (a comma, a semicolon, a colon, a full stop, another
-    number or a conjoined "ול…" purpose). A phrase whose head word is a period, a unit, a date or a basis term (לשנה,
-    למ״ר, למועד, לפי …) is not a facet, and a phrase of only generic words names no component."""
+def _find_phrase(sentence: str, written: str, family: str) -> tuple[str, int, list[str]] | None:
+    """The purpose phrase of a sentence, ``(phrase, index of the token that opens it, tokens)``, or None: the words after
+    ל / עבור / בגין / בעבור that follow the number (``written``; none when empty) or the metric word, to the clause end. See
+    ``read_sentence`` for the rules."""
     tokens = sentence.split()
     bare = [_bare(t) for t in tokens]
     at = next((i for i, t in enumerate(tokens) if _number_token(t, written)), None)
-    metric = next((i for i, t in enumerate(bare) if _stem(_flat(t)) in _CUE_WORDS and (at is None or i < at)), None)
+    metric = next((i for i, t in enumerate(bare) if _flat(t) not in _NOT_A_CUE and _stem(_flat(t)) in _CUE_WORDS
+                   and (at is None or i < at)), None)
     marks = [i for i in (at, metric) if i is not None]
     j = min(marks) + 1 if marks else 0
     while j < len(tokens):
@@ -292,11 +369,20 @@ def read_sentence(sentence: str, written: str, family: str = "") -> dict | None:
             words = [head] + [_bare(t) for t in _after(tokens, first)]
             phrase = tidy(" ".join(w for w in words if w))
             if _states(phrase, family):
-                return facet(phrase, "sentence", TIER_OWN)
+                return phrase, first, tokens
         if tokens[j][-1:] in ",;:" and (at is None or j < at):
             return None  # the clause ended before the number: a phrase after it is another clause's
         j += 1
     return None
+
+
+def read_sentence(sentence: str, written: str, family: str = "") -> dict | None:
+    """The purpose phrase of the value's own sentence as an own facet, or None: the words after ל / עבור / בגין / בעבור
+    that follow the number or the metric word, to the clause end (a comma, a semicolon, a colon, a full stop, another
+    number or a conjoined "ול…" purpose). A phrase whose head word is a period, a unit, a date or a basis term (לשנה,
+    למ״ר, למועד, לפי …) is not a facet, and a phrase of only generic words names no component."""
+    found = _find_phrase(sentence, written, family)
+    return facet(found[0], "sentence", TIER_OWN) if found is not None else None
 
 
 def _after(tokens: list[str], first: int) -> list[str]:
@@ -315,46 +401,224 @@ def _after(tokens: list[str], first: int) -> list[str]:
     return out
 
 
-def read_context(preceding: Sequence[tuple[str, str]], family: str = "") -> dict | None:
-    """The bounded context read of a quote value whose sentence states no facet (KTD2): the nearest list lead-in (a
-    paragraph ending in a colon) or heading among the blocks above it, ``(kind, text)`` nearest first, as a context
-    facet. The nearest heading ends the read; a lead-in that names no component is passed over."""
-    for kind, text in list(preceding)[:CONTEXT_BLOCKS]:
-        if kind == "heading":
-            return _context(text, family, "heading")
-        if (text or "").rstrip().endswith(":") and (found := _context(text, family, "lead_in")) is not None:
+# --- the context candidates (round 14 U2, KTD3) -----------------------------------------------------------------------------
+
+# a ו+ל word that opens no second purpose ("ולכן", "ולאחר" ...)
+_NOT_A_PURPOSE = frozenset({"ולכן", "ולפיכך", "ולאחר", "ולפי", "ולמרות", "ולעומת", "ולצורך", "ולאור", "ולמעשה", "ולהלן", "ולעיל"})
+_VAV_CONNECTORS = frozenset({"ובגין", "ועבור", "ובעבור"})
+_PERCENT = re.compile(r"\d[\d.,]*\s*(?:%|אחוז)")
+_COEFFICIENT_NUMBER = re.compile(r"(?<![\d.,])[01][.,]\d+(?!\d|[.,]\d)")
+
+
+def family_number(text: str) -> bool:
+    """Whether a text states a number of the kind a facet is read for — a percent, or a coefficient (a decimal 0.x or 1.x) — the
+    other value that would stand between a context phrase and the value it might name (R2). A section number that opens the
+    text is no value."""
+    body = _unnumbered(text)
+    return bool(_PERCENT.search(body) or _COEFFICIENT_NUMBER.search(body))
+
+
+def _second_purpose(tokens: list[str], first: int) -> bool:
+    """Whether the sentence names a second purpose after the one that opens at token ``first``: another connector or a
+    conjoined "ול…" / "ובגין" in the same clause, or an explicit "ובגין / ועבור" after the clause end."""
+    open_clause = tokens[first][-1:] not in _CLAUSE_END
+    for k in range(first + 1, len(tokens)):
+        word = _flat(_bare(tokens[k]))
+        if word in _VAV_CONNECTORS:
+            return True
+        if open_clause and (word in _CONNECTORS or (word.startswith("ול") and len(word) > 3 and word not in _NOT_A_PURPOSE)):
+            return True
+        if tokens[k][-1:] in _CLAUSE_END:
+            open_clause = False
+    return False
+
+
+def _candidate_phrase(text: str, family: str) -> tuple[str | None, bool]:
+    """The component an earlier sentence, paragraph or note states: ``(phrase, names two)``. The text must hold a cue word of
+    the family and a purpose phrase (``read_sentence``'s phrase rules, here without a number to anchor on); None: it states none."""
+    body = _unnumbered(text)
+    if not _has_cue(body):
+        return None, False
+    found = _find_phrase(body, "", family)
+    if found is None:
+        return None, False
+    return found[0], _second_purpose(found[2], found[1])
+
+
+class Candidate(NamedTuple):
+    """A text above a value that may state its component: ``part`` is where it is (``PART_*``), ``block`` its block index and
+    ``sentence`` its index among the block's sentences (``professional.sections.sentences``)."""
+
+    text: str
+    part: str
+    block: int | None = None
+    sentence: int | None = None
+
+
+class Reach(NamedTuple):
+    """What a bounded read of the text above a value covered, nearest first (``reach``): the candidates, whether the character
+    cap cut the search short (a search that ends so with no accepted candidate is not read, never "none"), and the text of the
+    blocks the candidates are in (their places are located in them)."""
+
+    candidates: list
+    capped: bool = False
+    blocks: dict = {}  # noqa: RUF012 - never mutated: an immutable NamedTuple default
+
+
+def _as_candidate(item) -> Candidate:
+    """A ``Candidate``, or a legacy ``(kind, text)`` pair of a block above the value (round 13)."""
+    if isinstance(item, Candidate):
+        return item
+    kind, text = item
+    if kind == "heading":
+        return Candidate(text, PART_HEADING)
+    return Candidate(text, PART_LEAD_IN if (text or "").rstrip().endswith(":") else PART_PARAGRAPH)
+
+
+def _accepted(c: Candidate, family: str) -> tuple[dict | None, bool]:
+    """What a candidate states: ``(a stated facet, whether it names two components)``; ``(None, False)``: it states none."""
+    if c.part == PART_LIST_ITEM:
+        return None, False  # a sibling of the list: it holds numbers that stand between, never the component
+    place = {"block": c.block, "sentence": c.sentence}
+    if c.part in (PART_HEADING, PART_LEAD_IN):
+        found = _context(c.text, family, c.part, **place)
+        if found is None:
+            return None, False
+        phrase = _find_phrase(_unnumbered(c.text), "", family)
+        return found, bool(phrase is not None and _second_purpose(phrase[2], phrase[1]))
+    phrase, two = _candidate_phrase(c.text, family)
+    return (facet(phrase, c.part, TIER_CONTEXT, **place) if phrase is not None else None), two
+
+
+def read_context(preceding: Reach | Sequence, family: str = "") -> dict:
+    """The bounded context read of a quote value whose sentence states no facet (round 14 U2, KTD3, KTD4; R1, R2): the
+    candidates above it, nearest first (a ``Reach``, or a plain sequence of ``Candidate`` / legacy ``(kind, text)`` pairs).
+
+    The first candidate that holds a component phrase decides: it is the value's facet (``stated``, tier context) unless
+    - it names two components: ``unparsed``, reason ``two_components``;
+    - a number of the same kind stands between it and the value, or the candidate states one itself (the phrase is that
+      value's): ``unparsed``, reason ``intervening_value``. A list lead-in is not blocked by the numbers of its own list items:
+      the items are peers, the lead-in is theirs all.
+    A candidate with no phrase is passed over (its numbers count as standing between). Nothing accepted: ``none`` (reason
+    ``not_in_range``), or ``not_read`` (reason ``cap``) when the character cap ended the search before its range did."""
+    reach_ = preceding if isinstance(preceding, Reach) else Reach(list(preceding))
+    seen_text = seen_item = False
+    for item in reach_.candidates:
+        c = _as_candidate(item)
+        found, two = _accepted(c, family)
+        has_number = family_number(c.text)
+        if found is not None:
+            place = {"block": c.block, "sentence": c.sentence}
+            if two:
+                return unparsed(REASON_TWO_COMPONENTS, c.part, **place)
+            if seen_text or has_number or (seen_item and c.part != PART_LEAD_IN):
+                return unparsed(REASON_INTERVENING, c.part, **place)
             return found
-    return None
+        if has_number:
+            seen_item = seen_item or c.part == PART_LIST_ITEM
+            seen_text = seen_text or c.part != PART_LIST_ITEM
+    return not_read(REASON_CAP) if reach_.capped else none()
 
 
-def read_quote(sentence: str, written: str, family: str = "", preceding: Sequence[tuple[str, str]] | None = None) -> dict:
+def read_quote(sentence: str, written: str, family: str = "", preceding: Reach | Sequence | None = None) -> dict:
     """The facet of a value quoted from a text: the purpose phrase of its sentence (own); else, in a family that needs a
-    facet, the lead-in or heading above it (context); else ``none``. ``preceding`` None: the blocks above were not at
-    hand, so a family that needs a facet is ``not_read`` rather than ``none``."""
+    facet, what the candidates above it state (``read_context``: context); else ``none``. ``preceding`` None: the text above was
+    not at hand, so a family that needs a facet is ``not_read`` rather than ``none``."""
     if (own := read_sentence(sentence, written, family)) is not None:
         return own
-    if needs_facet(family):
-        if preceding is None:
-            return not_read()
-        if (found := read_context(preceding, family)) is not None:
-            return found
-    return none()
+    if not needs_facet(family):
+        return none(REASON_NOT_NEEDED)
+    if preceding is None:
+        return not_read()
+    return read_context(preceding, family)
 
 
-def preceding(rows: Sequence, at: int, path: Sequence[str] | None = None, limit: int = CONTEXT_BLOCKS) -> list[tuple[str, str]]:
-    """The ``(kind, text)`` of the heading and paragraph blocks among the ``limit`` blocks above block ``at``, nearest
-    first, inside the section of that block (the same section path: the read stops at the section's edge).
-    ``rows``: blocks with ``block_index``, ``kind``, ``text`` and ``section_path``."""
+def _own_range(sentences: Sequence[str], text: str, quote: str) -> int:
+    """The index of the first sentence of a block that the value's quote overlaps; -1 when the quote is not found in the block
+    (then no sentence of the block is offered as a candidate)."""
+    flat = " ".join(_flat(text).split())
+    wanted = " ".join(_flat(quote).split())
+    start = flat.find(wanted) if wanted else -1
+    if start < 0:
+        return -1
+    end, pos = start + len(wanted), 0
+    for i, sentence in enumerate(sentences):
+        one = " ".join(_flat(sentence).split())
+        at = flat.find(one, pos)
+        if at < 0:
+            continue
+        pos = at + len(one)
+        if at < end and pos > start:
+            return i
+    return -1
+
+
+def reach(rows: Sequence, at: int, quote: str = "", *, path: Sequence[str] | None = None, lo: int = 0,
+          chars: int = 6000, truncated: bool = False) -> Reach:
+    """The candidates above a quote value, nearest first (round 14 U2, KTD3; R1, R2), from ``rows``: blocks with
+    ``block_index``, ``kind``, ``text`` and ``section_path``, holding the block ``at`` that has the value and the blocks above it.
+
+    1. the earlier sentences of the holder block (the value's own sentence, and what follows it, excluded);
+    2. the earlier paragraph blocks of the same section, a sentence at a time, nearest first; a paragraph that ends in a colon is
+       a ``lead_in`` as a whole, and a list item is kept only for the numbers it holds;
+    3. the heading of the section, which ends the read.
+    The read stops at a table block, at a block of another section (its heading or its text) and at ``lo``, the first block of
+    the appraisal unit. ``chars`` caps the text of the candidates: the one that crosses it is dropped, the search ends there and
+    ``capped`` is set. ``truncated``: ``rows`` were cut by the reader's row limit, so a block of the range that is missing from
+    them means the search did not reach its edge (``capped``); otherwise a missing block simply ends the range."""
+    from app.professional.sections import sentences as split
+
     by = {r.block_index: r for r in rows}
-    here = tuple(path) if path is not None else tuple(getattr(by.get(at), "section_path", None) or ())
-    out: list[tuple[str, str]] = []
-    for k in range(at - 1, at - limit - 1, -1):
+    holder = by.get(at)
+    here = tuple(path) if path is not None else tuple(getattr(holder, "section_path", None) or ())
+    out: list[Candidate] = []
+    texts: dict[int, str] = {}
+    used = 0
+    capped = False
+
+    def add(c: Candidate) -> bool:
+        nonlocal used, capped
+        used += len(c.text)
+        if used > chars:
+            capped = True
+            return False
+        out.append(c)
+        return True
+
+    if holder is not None:
+        sents = split(holder.text or "")
+        texts[at] = holder.text or ""
+        for i in range(_own_range(sents, holder.text or "", quote) - 1, -1, -1):
+            if not add(Candidate(sents[i], PART_PRECEDING_SENTENCE, at, i)):
+                return Reach(out, capped, texts)
+    for k in range(at - 1, lo - 1, -1):
         r = by.get(k)
-        if r is None or tuple(r.section_path or ()) != here:
+        if r is None:
+            return Reach(out, truncated, texts)
+        if tuple(r.section_path or ()) != here or r.kind == "table":
             break
-        if r.kind in ("heading", "paragraph") and (r.text or "").strip():
-            out.append((r.kind, r.text.strip()))
-    return out
+        text = (r.text or "").strip()
+        if r.kind == "heading":
+            if text:
+                texts[k] = r.text
+                add(Candidate(text, PART_HEADING, k, 0))
+            break
+        if not text or r.kind not in ("paragraph", "li"):
+            continue
+        texts[k] = r.text
+        if r.kind == "li":
+            if not add(Candidate(text, PART_LIST_ITEM, k, 0)):
+                break
+        elif text.endswith(":"):
+            if not add(Candidate(text, PART_LEAD_IN, k, 0)):
+                break
+        else:
+            sents = split(text)
+            if not all(add(Candidate(sents[i], PART_PARAGRAPH, k, i)) for i in range(len(sents) - 1, -1, -1)):
+                break
+        if capped:
+            break
+    return Reach(out, capped, texts)
 
 
 def sentence_with(text: str, written: str) -> str:
@@ -459,6 +723,13 @@ def _together(a, b) -> bool:
     return bool(a.section) and a.section == b.section
 
 
+def _own_words(f: dict | None) -> bool:
+    """Whether a facet is the value's own words in its own paragraph flow: its own tier, or read from the sentence or paragraph
+    just above it (round 14 U2, KTD3) — sentence-level evidence, which a section edge between two values does not weaken."""
+    f = f or {}
+    return f.get("tier") == TIER_OWN or f.get("part") in SENTENCE_PARTS
+
+
 def relation(a, b, a_in_unit: int = 1, b_in_unit: int = 1) -> str:
     """The one pairwise decision (R3, KTD3): are ``a`` and ``b`` one datum (``same``: compared, and a conflict when their amounts
     differ and their periods overlap), parallel components (``different``: never a conflict) or not to be established
@@ -474,9 +745,10 @@ def relation(a, b, a_in_unit: int = 1, b_in_unit: int = 1) -> str:
        none (the headline datum of its unit) is compared with the other unit's value of the key; two own facets with disjoint
        cores across units stay undecided (rule 4). Inside one unit this rule does not apply;
     3. each core keeps a content word the other lacks, and both are in one unit's same table, list or section: different;
-       or both facets are ``own`` tier (the value's own row label, column header or purpose phrase) and both data are in the
-       same appraisal unit, in any section: different (round 13 follow-up: an own facet is the value's own words, so two
-       disjoint ones inside one appraisal are two components even where the sections differ);
+       or both facets are the value's own words — ``own`` tier (the value's own row label, column header or purpose phrase), or
+       read from an earlier sentence or paragraph of the value's own paragraph flow (``SENTENCE_PARTS``, round 14 U2) — and both
+       data are in the same appraisal unit, in any section: different (round 13 follow-up: an own facet is the value's own words,
+       so two disjoint ones inside one appraisal are two components even where the sections differ);
     4. everything else (a subset, disjoint across units, context-tier cores that are not side by side, equal context-tier
        cores, an unresolved facet, a stated facet against a headline datum in a facet family or in one unit): undecided.
 
@@ -487,12 +759,13 @@ def relation(a, b, a_in_unit: int = 1, b_in_unit: int = 1) -> str:
         return SAME
     ca, cb = core_of(a), core_of(b)
     own = (a.facet or {}).get("tier") == TIER_OWN and (b.facet or {}).get("tier") == TIER_OWN
+    flow = _own_words(a.facet) and _own_words(b.facet)
     if own and ca and ca == cb:
         return SAME
     if headline(a, a_in_unit) and headline(b, b_in_unit):
         return SAME
     if not needs_facet(a.family) and not needs_facet(b.family) and a.appraisal != b.appraisal and not (ca and cb):
         return SAME
-    if ca - cb and cb - ca and (_together(a, b) or (own and a.appraisal is not None and a.appraisal == b.appraisal)):
+    if ca - cb and cb - ca and (_together(a, b) or (flow and a.appraisal is not None and a.appraisal == b.appraisal)):
         return DIFFERENT
     return UNDECIDED
