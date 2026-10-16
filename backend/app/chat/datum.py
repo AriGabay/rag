@@ -6,7 +6,7 @@ anchored record of the source's own words:
 
 - ``written``: the words as the source wrote them, without a leading preposition (ל / עבור / בגין);
 - ``part``: where they are (``row``, ``column``, ``caption``, ``sentence``, ``lead_in``, ``heading``; round 14 U2, KTD3: also
-  ``preceding_sentence``, ``paragraph`` and ``table_note``);
+  ``preceding_sentence``, ``paragraph`` and ``table_note``; follow-up: ``label``, the label of a short list item or line);
 - ``tier``: ``own`` (the value's own row label, its column header in a matrix, the purpose phrase of its own sentence)
   or ``context`` (the table caption, a table note, an earlier sentence or paragraph, the list lead-in, the nearest heading);
 - ``status``: ``stated``, ``none`` (read, nothing stated), ``unparsed`` (read, ambiguous) or ``not_read`` (round 14 U2, KTD4);
@@ -43,10 +43,13 @@ REASON_TWO_COMPONENTS = "two_components"  # the phrase names two components: whi
 REASON_PICTURE_CELL = "picture_cell"  # a cell of a picture: the text around it was not read
 REASON_NOT_NEEDED = "not_needed"  # the family needs no component (the unit's headline datum)
 REASON_CAP = "cap"  # the search reached its character cap before an accepted candidate
+REASON_OWN_SENTENCE = "own_sentence"  # the value's own sentence describes it, and the reader could not tie the words to a component
 
 # where a context facet was read from (``part``)
 PART_PRECEDING_SENTENCE, PART_PARAGRAPH, PART_HEADING, PART_LEAD_IN = "preceding_sentence", "paragraph", "heading", "lead_in"
 PART_TABLE_NOTE, PART_CAPTION, PART_LIST_ITEM = "table_note", "caption", "list_item"
+# where an own facet is: the purpose phrase of the value's sentence, or the label of its short line or list item (round 14 U2 follow-up)
+PART_SENTENCE, PART_LABEL = "sentence", "label"
 # the parts that are sentence-level evidence in the value's own paragraph flow: ``relation`` rule 3 counts them like an own facet
 SENTENCE_PARTS = frozenset({PART_PRECEDING_SENTENCE, PART_PARAGRAPH})
 
@@ -61,6 +64,7 @@ LABEL_FACET = "רכיב"
 LABEL_UNPARSED = {
     REASON_INTERVENING: "נקרא ולא הוכרע: ערך אחר מאותו סוג עומד בין ההקשר לערך",
     REASON_TWO_COMPONENTS: "נקרא ולא הוכרע: ההקשר מונה שני רכיבים",
+    REASON_OWN_SENTENCE: "נקרא ולא הוכרע: משפט הערך מתאר אותו, ולא ניתן לקשור את המילים לרכיב",
 }
 LABEL_NOT_READ_REASON = {
     REASON_PICTURE_CELL: "לא נקרא: תא בתמונה, הטקסט סביבו לא נקרא",
@@ -87,11 +91,12 @@ def not_read(reason: str | None = None) -> dict:
     return {"status": STATUS_NOT_READ, "written": None, "part": None, "tier": None, "reason": reason}
 
 
-def unparsed(reason: str, part: str | None = None, **place) -> dict:
+def unparsed(reason: str, part: str | None = None, tier: str = TIER_CONTEXT, **place) -> dict:
     """Read, and ambiguous (round 14 U2, KTD3, KTD4): the nearest text that names a component cannot be attributed to this value
-    (``intervening_value``, ``two_components``). No component is stated, so ``core_of`` is empty; ``part`` and the place say
-    where the rejected text is."""
-    return {"status": STATUS_UNPARSED, "written": None, "part": part, "tier": TIER_CONTEXT, "reason": reason} | {
+    (``intervening_value``, ``two_components``), or the value's own sentence describes it in words no rule ties to one
+    (``own_sentence``, tier own, part ``sentence``: nothing was borrowed). No component is stated, so ``core_of`` is empty;
+    ``part`` and the place say where the rejected text is."""
+    return {"status": STATUS_UNPARSED, "written": None, "part": part, "tier": tier, "reason": reason} | {
         k: v for k, v in place.items() if v is not None}
 
 
@@ -256,8 +261,11 @@ def read_cell(row_label: str | None, header: str | None, caption: str | None = N
     matrix (more than one value column). The caption and the table's title are the context facet, read only in a family
     that needs a facet and only when they hold a metric word and name a component beside it. Last, in the same family, the
     table's notes (round 14 U2, KTD3): a note that names the row label and states a purpose phrase for it
-    (``table_note``). Nothing stated: ``none``."""
+    (``table_note``). A totals or aggregate column header (``_totals``) is no component at all: a row that holds only the metric word
+    reads the caption and the title as round 13 does. Nothing stated: ``none``."""
     row, col = (row_label or "").strip(), (header or "").strip()
+    if col and _totals(col):
+        col = ""  # a totals or aggregate column is never a component: not the column facet, not a qualifier of the row (round 14, KTD3)
     if row and _states(row, family):
         if matrix and col and _states(col, family):
             return facet(f"{row} — {col}", "row", TIER_OWN)
@@ -273,6 +281,21 @@ def read_cell(row_label: str | None, header: str | None, caption: str | None = N
         if (found := _note(note, row, family, index)) is not None:
             return found
     return none()
+
+
+# the words of a totals or aggregate column, with the usual abbreviation forms (סה"כ, סה״כ, ס"ה, סך הכל, ממוצע, ממוצ', מצטבר ...)
+_INCLUDING = _stem("כולל")
+_TOTAL_WORDS = _stems("סהכ סה סכ סך כולל סיכום ממוצע ממוצעת ממוצעים ממוצ מצטבר מצטברת מצטברים מצטב")
+
+
+def _totals(header: str) -> bool:
+    """Whether a column header is a total or an average column (round 14 U2 follow-up, KTD3): any word of it is a totals word
+    ("סה"כ מר"א" is one). Such a header names no component in any case: it is neither the column facet nor a qualifier of a row label
+    ("שיעור היוון (בתחשיב …)" is the component by itself; the metric word alone reads the caption)."""
+    words = [_stem(w) for w in _TOKEN.findall(_flat(header)) if not w[0].isdigit()]
+    if any(w in _TOTAL_WORDS and w != _INCLUDING for w in words):
+        return True
+    return _INCLUDING in words and not _has_cue(header)  # "כולל" also means "including": "מקדם התאמה כולל" is a name, not a total
 
 
 def _note(note: str, row_label: str, family: str, index: int) -> dict | None:
@@ -350,7 +373,8 @@ def _excluded_head(word: str) -> bool:
 def _find_phrase(sentence: str, written: str, family: str) -> tuple[str, int, list[str]] | None:
     """The purpose phrase of a sentence, ``(phrase, index of the token that opens it, tokens)``, or None: the words after
     ל / עבור / בגין / בעבור that follow the number (``written``; none when empty) or the metric word, to the clause end. See
-    ``read_sentence`` for the rules."""
+    ``read_sentence`` for the rules. With a number, the phrase right after it wins over one before it (round 14 U2 follow-up): the
+    one before is kept only when none follows, and only when its clause did not end before the number."""
     tokens = sentence.split()
     bare = [_bare(t) for t in tokens]
     at = next((i for i, t in enumerate(tokens) if _number_token(t, written)), None)
@@ -358,6 +382,8 @@ def _find_phrase(sentence: str, written: str, family: str) -> tuple[str, int, li
                    and (at is None or i < at)), None)
     marks = [i for i in (at, metric) if i is not None]
     j = min(marks) + 1 if marks else 0
+    before: tuple[str, int, list[str]] | None = None
+    closed = False  # a clause ended before the number: a phrase between that end and the number is another clause's
     while j < len(tokens):
         word = _flat(bare[j])
         first = None
@@ -369,11 +395,16 @@ def _find_phrase(sentence: str, written: str, family: str) -> tuple[str, int, li
             words = [head] + [_bare(t) for t in _after(tokens, first)]
             phrase = tidy(" ".join(w for w in words if w))
             if _states(phrase, family):
-                return phrase, first, tokens
+                if at is None or j > at:
+                    return phrase, first, tokens
+                if before is None and not closed:
+                    before = (phrase, first, tokens)
         if tokens[j][-1:] in ",;:" and (at is None or j < at):
-            return None  # the clause ended before the number: a phrase after it is another clause's
+            if at is None:
+                return None  # the clause ended before the number: a phrase after it is another clause's
+            closed = True
         j += 1
-    return None
+    return before
 
 
 def read_sentence(sentence: str, written: str, family: str = "") -> dict | None:
@@ -382,7 +413,7 @@ def read_sentence(sentence: str, written: str, family: str = "") -> dict | None:
     number or a conjoined "ול…" purpose). A phrase whose head word is a period, a unit, a date or a basis term (לשנה,
     למ״ר, למועד, לפי …) is not a facet, and a phrase of only generic words names no component."""
     found = _find_phrase(sentence, written, family)
-    return facet(found[0], "sentence", TIER_OWN) if found is not None else None
+    return facet(found[0], PART_SENTENCE, TIER_OWN) if found is not None else None
 
 
 def _after(tokens: list[str], first: int) -> list[str]:
@@ -399,6 +430,114 @@ def _after(tokens: list[str], first: int) -> list[str]:
         if t[-1:] in _CLAUSE_END:
             break
     return out
+
+
+# --- the value's own sentence decides what may be borrowed (round 14 U2 follow-up, R2) --------------------------------------
+#
+# A value's context is borrowed only when its own sentence leaves the question open: it is bare (the number, its unit, the metric's
+# cue words and the words of taking a value into the appraisal) or it points back at the text above. A sentence that describes
+# the value in other words is the value's own description: when no rule ties those words to a component the facet is
+# ``unparsed`` (``own_sentence``) and nothing is borrowed — a neighbour's component on a value that describes itself is the one
+# error the round's precision criterion rules out. A short line "<label> – <number>" is its own label.
+
+# the words of taking a value into the appraisal, the document's own words and connectives: they describe no component
+_OWN_FUNCTION = _stems(
+    "הובא הובאה הובאו הבאתי נלקח נלקחה נלקחו נקבע נקבעה נקבעו בחשבון חשבון חוות בחוות דעת זו זה זאת שומה הערכה בשיעור בגובה של "
+    "הוא היא הינו הינה עומד עומדת אומץ אומצה גם אך כי אשר כאשר לכן ולכן זאת כן שנת")
+# the markers of a sentence that points back at the text above (נוסף, כאמור, האמור, לעיל, הנ"ל), in every prefixed spelling
+_BACK_REFERENCE = _stems("נוסף נוספת נוספים נוספות האמור כאמור לאמור לעיל דלעיל הנל")
+_THIS = frozenset({"זה", "זו", "זאת"})
+LINE_WORDS_MAX = 15  # a "<label> – <number>" line is short; a longer sentence is a description
+
+
+def _unit_phrase_end(tokens: list[str], i: int) -> int:
+    """The index of the last token of a period, unit, date, basis or pointer phrase that opens at token ``i`` ("לשנה", "למ״ר",
+    "עבור שנה", "לפי המקור" ...), or ``i - 1`` when none opens there: the words of such a phrase describe no component."""
+    word = _flat(_bare(tokens[i]))
+    if word in _CONNECTORS:
+        if i + 1 < len(tokens) and _excluded_head(_bare(tokens[i + 1])):
+            return i + len(_after(tokens, i + 1)) + 1
+    elif word.startswith("ל") and len(word) >= 3 and _excluded_head(word[1:]):
+        return i + len(_after(tokens, i))
+    return i - 1
+
+
+def _content_words(sentence: str, written: str) -> list[str]:
+    """The words of a value's own sentence that describe something: not the number and its unit, the family's cue words, the
+    function words and taking verbs (``_OWN_FUNCTION``), the base and period words, the words of a period, unit or basis phrase,
+    nor a word of two letters or fewer. A word in another script counts."""
+    tokens = sentence.split()
+    out: list[str] = []
+    skip = -1
+    for i, token in enumerate(tokens):
+        if i <= skip:
+            continue
+        if _number_token(token, written):
+            continue
+        if (end := _unit_phrase_end(tokens, i)) >= i:
+            skip = end
+            continue
+        for word in _TOKEN.findall(_flat(token)):
+            if word[0].isdigit():
+                continue
+            stem = _stem(word)
+            if len(stem) > 2 and stem not in _CUE_WORDS and stem not in _BASIS_WORDS and stem not in _BASE_WORDS \
+                    and stem not in _OWN_FUNCTION and stem not in _NOT_A_COMPONENT:
+                out.append(word)
+    return out
+
+
+def _points_back(sentence: str) -> bool:
+    """Whether a sentence carries a back-reference marker (נוסף, כאמור, האמור, לעיל, דלעיל, הנ"ל), or a "this" right after the
+    metric word ("מקדם הפחתה זה", "שיעור זה")."""
+    words = _TOKEN.findall(_flat(sentence))
+    if any(_stem(w) in _BACK_REFERENCE for w in words if not w[0].isdigit()):
+        return True
+    return any(b in _THIS and _stem(a) in _CUE_WORDS for a, b in zip(words, words[1:], strict=False))
+
+
+def _label_of(sentence: str, written: str, family: str) -> dict | None:
+    """The label of a short line or list item "<label> – <number>" (also "-", "—", ":"), as an own facet, or None: at most
+    ``LINE_WORDS_MAX`` words, the number the last thing in the line (a unit sign or a percent word may follow), a separator right
+    before it, and a label of content words with no cue word of the metric (a line that holds one is a description) and no value of
+    its own. The label is the source's words, tidied of a leading connector and the edge words."""
+    tokens = sentence.split()
+    if not written or not 2 <= len(tokens) <= LINE_WORDS_MAX:
+        return None
+    at = max((i for i, t in enumerate(tokens) if _number_token(t, written)), default=None)
+    if at is None or at == 0:
+        return None
+    if any(_TOKEN.search(_flat(t)) and _stem(_flat(_bare(t))) not in _PROPORTION_WORDS for t in tokens[at + 1:]):
+        return None  # a word follows the number: the line is a sentence
+    before = tokens[at - 1]
+    if before in ("-", "–", "—"):
+        words = tokens[:at - 1]
+    elif before[-1:] in (":", "-", "–", "—"):
+        words = tokens[:at]
+    else:
+        return None
+    while words and _flat(_bare(words[0])) in _CONNECTORS:
+        words = words[1:]
+    label = tidy(" ".join(words))
+    if not label or _has_cue(label) or family_number(label) or not _states(label, family):
+        return None
+    return facet(label, PART_LABEL, TIER_OWN)
+
+
+def own_facet(sentence: str, written: str, family: str = "") -> dict | None:
+    """What a value's own sentence settles of its facet (round 14 U2 follow-up, R2), or None when it settles nothing and the text
+    above may be read: the purpose phrase of the sentence (``read_sentence``) in any family; then, in a family that needs a facet,
+    the label of a short line (``_label_of``); then ``unparsed`` (reason ``own_sentence``, part ``sentence``, tier own) when the
+    sentence holds a content word and points back at nothing. Bare (no content word) or back-referring: None."""
+    if (own := read_sentence(sentence, written, family)) is not None:
+        return own
+    if not needs_facet(family):
+        return None
+    if (label := _label_of(sentence, written, family)) is not None:
+        return label
+    if _points_back(sentence) or not _content_words(sentence, written):
+        return None
+    return unparsed(REASON_OWN_SENTENCE, PART_SENTENCE, TIER_OWN)
 
 
 # --- the context candidates (round 14 U2, KTD3) -----------------------------------------------------------------------------
@@ -521,10 +660,11 @@ def read_context(preceding: Reach | Sequence, family: str = "") -> dict:
 
 
 def read_quote(sentence: str, written: str, family: str = "", preceding: Reach | Sequence | None = None) -> dict:
-    """The facet of a value quoted from a text: the purpose phrase of its sentence (own); else, in a family that needs a
-    facet, what the candidates above it state (``read_context``: context); else ``none``. ``preceding`` None: the text above was
-    not at hand, so a family that needs a facet is ``not_read`` rather than ``none``."""
-    if (own := read_sentence(sentence, written, family)) is not None:
+    """The facet of a value quoted from a text: what its own sentence settles (``own_facet``: its purpose phrase, the label of a
+    short line, or an own description that names no component); else, in a family that needs a facet, what the candidates above it
+    state (``read_context``: context) — only for a bare or back-referring sentence; else ``none``. ``preceding`` None: the text
+    above was not at hand, so a family that needs a facet is ``not_read`` rather than ``none``."""
+    if (own := own_facet(sentence, written, family)) is not None:
         return own
     if not needs_facet(family):
         return none(REASON_NOT_NEEDED)

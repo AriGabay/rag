@@ -1305,6 +1305,7 @@ FACET_STATES = [
     (datum.none(), "none", "not_in_range"), (datum.none(datum.REASON_NOT_NEEDED), "none", "not_needed"),
     (datum.unparsed(datum.REASON_INTERVENING, "preceding_sentence"), "unparsed", "intervening_value"),
     (datum.unparsed(datum.REASON_TWO_COMPONENTS, "paragraph"), "unparsed", "two_components"),
+    (datum.unparsed(datum.REASON_OWN_SENTENCE, "sentence", datum.TIER_OWN), "unparsed", "own_sentence"),
     (datum.not_read(datum.REASON_CAP), "not_read", "cap"), (datum.not_read(datum.REASON_PICTURE_CELL), "not_read", "picture_cell"),
     (datum.not_read(), "not_read", "other"),
 ]
@@ -1330,6 +1331,9 @@ def test_each_component_state_and_reason_renders_its_own_sentence_and_every_row_
         if status == "not_read":
             assert by[sid]["facet"] != timeline.MSG_NO_FACET and "לא צוין" not in by[sid]["facet"]
     assert by[rows[0]]["facet"] == timeline.FACET_TEXT[("none", "not_in_range")]
+    own = rows[FACET_STATES.index(next(x for x in FACET_STATES if x[2] == "own_sentence"))]
+    assert by[own]["facet"] == timeline.FACET_TEXT[("unparsed", "own_sentence")] != timeline.MSG_UNPARSED
+    assert by[own]["state"]["component"]["context"] is None and by[own]["state"]["component"]["tier"] == "own"
     assert by[rows[1]]["facet"] == timeline.MSG_NO_FACET, "a family that needs no component keeps today's wording"
     assert by[stated]["state"]["reason"] == by[stated]["state"]["comparison"]["status"]
 

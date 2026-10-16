@@ -1142,3 +1142,207 @@ def test_ae8_a_cached_picture_cell_is_not_read_again_and_says_the_context_was_no
     T.tool_take_value(ws, handle, {}, _given(), "שיעור")
     f = ws.values["V1"].facet
     assert (f["status"], f["reason"]) == ("not_read", "picture_cell") and calls["blocks"] == 0 and calls["update"] == []
+
+
+# =======================================================================================================================
+# round 14 U2 follow-up (R2): the value's own sentence decides whether context may be borrowed; a list item's label is the
+# component; a purpose phrase after the number wins; a row label with the metric word and a qualifier is the component
+# =======================================================================================================================
+
+METHOD = "תזרימי המזומנים יבטאו את הסיכון השונה בגין מרכיבי ההכנסה בנכס."  # a neighbouring sentence that WOULD be borrowed
+UNCERTAINTY = "בוצעה הפחתה בגין אי ודאות תכנונית."
+OWN_SENTENCES = [  # (sentence, number, kind, neighbour): each describes its value in words no parser ties to a component
+    ("שיעור התשואה הממוצע בעסקאות של נכסי תעשיה ולוגיסטיקה הוא 6.9%.", "6.9", "rate", METHOD),
+    ("שיעור ההיוון השנתי המקובל בשוק המסחר הוא 6.7%.", "6.7", "rate", UNCERTAINTY),
+    ('הפחתה, על הצד הזהיר, מהמחיר למ"ר שנגזר ממחיר המינימום – 7.5%.', "7.5", "rate", "נבחנה הפחתה בגין מושע."),
+]
+
+
+def _borrowed(text: str, number: str, *above: str, kind: str = "coefficient") -> dict:
+    """The facet of ``text`` (its own paragraph block) with the paragraph blocks ``above`` it, as ``tools`` reads it."""
+    rows = _rows(*[("paragraph", a) for a in above], ("paragraph", text))
+    return _read_at(rows, len(above), text, number, kind=kind)
+
+
+@pytest.mark.parametrize("text, number, kind, neighbour", OWN_SENTENCES)
+def test_an_own_sentence_that_describes_the_value_is_unparsed_and_borrows_no_context(text, number, kind, neighbour):
+    f = _borrowed(text, number, neighbour, kind=kind)
+    assert (f["status"], f["reason"], f["part"], f["tier"], f["written"]) == ("unparsed", "own_sentence", "sentence", "own", None)
+    assert not {"block", "sentence", "at"} & f.keys()  # nothing was read from another place
+    assert datum.core_of(datum.Site("proportion", f)) == frozenset()
+    assert datum.line(f) != datum.line(datum.unparsed(datum.REASON_INTERVENING))  # the model is told this reason
+    # the neighbour alone, in front of a bare sentence, would have been the component: the bare/back-reference rule is the only gate
+    assert _borrowed("שיעור התשואה 6.9%.", "6.9", neighbour, kind="rate")["status"] == "stated"
+
+
+def test_the_reported_shapes_are_never_attributed_to_a_neighbours_component():
+    # the sentences as first reported: an own phrase (or none) is read, and none of them ever carries a context tier
+    for text, number, neighbour in (("שיעור התשואה הממוצע בעסקאות לנכסי תעשיה ולוגיסטיקה הוא 6.9%.", "6.9", METHOD),
+                                    ("שיעור ההיוון השנתי למסחר בהתאם לסקירה הוא 6.7%.", "6.7", UNCERTAINTY)):
+        assert _borrowed(text, number, neighbour, kind="rate")["tier"] == "own"
+
+
+def test_the_own_sentence_decision_is_the_same_on_the_listing_path_and_needs_no_blocks():
+    text, number, kind, neighbour = OWN_SENTENCES[0]
+    row = _row(quote=text, value_text="6.9%", metric="שיעור התשואה", metric_kind="rate")
+    rows = _rows(("paragraph", neighbour), ("paragraph", text))
+    read = T._TextRead(datum.reach(rows, 1, text), text)
+    f = T._measurement_facet(row, None, read)
+    assert (f["status"], f["reason"], f["tier"]) == ("unparsed", "own_sentence", "own")
+    assert T._measurement_facet(row, None, None)["reason"] == "own_sentence"  # blocks not at hand: still read, still unparsed
+    bare = _row(quote="שיעור התשואה 6.9%.", value_text="6.9%", metric="שיעור התשואה", metric_kind="rate")
+    assert T._measurement_facet(bare, None, None)["status"] == "not_read"  # a bare sentence still needs its blocks
+    # the take path asks for no blocks above a value whose own sentence settles its facet
+    src = _source(text)
+    taken = T._take_quote(src, text, {"quote": text, "number": number}, [(0, text, 1)])
+    assert T._facet_known(Workspace(ctx=None), src, taken, "rate") is True
+    plain = _source("שיעור התשואה 6.9%.")
+    taken = T._take_quote(plain, plain.text, {"quote": plain.text, "number": "6.9"}, [(0, plain.text, 1)])
+    assert T._facet_known(Workspace(ctx=None), plain, taken, "rate") is False
+
+
+@pytest.mark.parametrize("text", [
+    "בחוות דעת זו הובאה בחשבון הפחתה בשיעור 10%.",  # taking verbs, the document's own words, function words: no content word
+    "הבאתי בחשבון הפחתה בגובה 10%.",
+    "בשומה זו נקבעה הפחתה של 10%.",
+    "מקדם הפחתה זה הוא 10%.",  # "this" right after the metric word points back
+    "כאמור, הובאה הפחתה בגובה 10%.",
+    "הפחתה נוספת בשיעור 10% הובאה בחשבון.",
+    "בהתאם לאמור לעיל נלקח מקדם הפחתה נוסף בשיעור 10%.",
+    "10%.",  # a bare number
+])
+def test_a_bare_or_back_referring_own_sentence_borrows_the_component_from_the_text_above(text):
+    f = _borrowed(text, "10", CONSIDERATION)
+    assert (f["status"], f["written"], f["part"], f["tier"]) == ("stated", "עוצמת ניצול", "paragraph", "context"), text
+
+
+def test_ae1_the_reported_shape_is_stated_from_the_earlier_sentence_of_the_same_block():
+    block = ("השמאי לא מצא לנכון לתת הפחתה בגין אינטנסיביות שימוש. הנכס נבדק לגופו ונמצא תקין. "
+             "לאור האמור, בחוות דעת זו הבאתי בחשבון מקדם הפחתה נוסף של 10%.")
+    rows = _rows(("paragraph", block))
+    f = _read_at(rows, 0, "לאור האמור, בחוות דעת זו הבאתי בחשבון מקדם הפחתה נוסף של 10%.", "10")
+    assert (f["status"], f["written"], f["part"], f["tier"]) == ("stated", "אינטנסיביות שימוש", "preceding_sentence", "context")
+
+
+def test_a_back_reference_marker_alone_decides_even_with_other_words_but_a_descriptive_sentence_without_one_does_not():
+    assert _borrowed("לאור האמור הובאה הפחתה נוספת בשל מושע של 10%.", "10", CONSIDERATION)["part"] == "paragraph"
+    assert _borrowed("הובאה הפחתה בשל מושע של 10%.", "10", CONSIDERATION)["reason"] == "own_sentence"
+    # a period or unit phrase is no description of the component
+    assert _borrowed("שיעור היוון של 6.5% לשנה.", "6.5", LEAD_IN, kind="rate")["part"] == "lead_in"
+    assert datum.read_quote("הפחתה בשל מושע 10%.", "10", "coefficient", None)["reason"] == "own_sentence"  # needs no blocks
+    assert datum.read_quote("הפחתה 10%.", "10", "coefficient", None)["status"] == "not_read"
+    assert datum.read_quote("הפחתה בשל מושע 10%.", "10", "value", None) == datum.none(datum.REASON_NOT_NEEDED)  # no facet family
+
+
+# --- decision 2: the label of a short list item or line is the component -------------------------------------------------
+
+ITEM_LEAD = "שיעורי ההיוון שנלקחו בחשבון בהערכה זו:"
+
+
+@pytest.mark.parametrize("item, number, label", [
+    ("שוכר א' - יחידה 1 עד תום החוזה - 6.5%", "6.5", "שוכר א' - יחידה 1 עד תום החוזה"),
+    ("שוכר ב' – יחידה 2 לאחר תום החוזה – 7.25%", "7.25", "שוכר ב' – יחידה 2 לאחר תום החוזה"),
+    ("מחסנים וחניות: 8%", "8", "מחסנים וחניות"),
+    ("בגין מרפסות - 5%", "5", "מרפסות"),  # a leading connector is no part of the label
+])
+def test_the_label_of_a_short_list_item_is_its_own_component(item, number, label):
+    rows = _rows(("paragraph", ITEM_LEAD), ("li", item))
+    f = _read_at(rows, 1, item, number, kind="rate")
+    assert (f["status"], f["written"], f["part"], f["tier"]) == ("stated", label, "label", "own")
+    assert not {"block", "sentence", "at"} & f.keys()
+    assert datum.core_of(datum.Site("proportion", f)) == datum.core(label, "proportion")
+
+
+def test_two_list_items_with_different_labels_are_different_components_of_one_unit():
+    a = _read_at(_rows(("paragraph", ITEM_LEAD), ("li", "שוכר א' - יחידה 1 - 6.5%")), 1, "שוכר א' - יחידה 1 - 6.5%", "6.5", kind="rate")
+    b = _read_at(_rows(("paragraph", ITEM_LEAD), ("li", "שוכר ב' - יחידה 2 - 6.5%")), 1, "שוכר ב' - יחידה 2 - 6.5%", "6.5", kind="rate")
+    assert datum.relation(_site(a, "3. מגרש 12"), _site(b, "3. מגרש 12")) == datum.DIFFERENT
+
+
+@pytest.mark.parametrize("line", [
+    "שיעור היוון – 6.5%",  # the label holds only the metric word: it names no component
+    "הפחתה, על הצד הזהיר, מהמחיר למ\"ר שנגזר ממחיר המינימום – 6.5%",  # a cue word in a descriptive line
+    "6.5%",
+    "שוכר א' יחידה 1 עד תום החוזה 6.5%",  # no separator
+    "שוכר א' - 6.5% מהשטח הכולל",  # something follows the number
+    "הנכס הנדון הוא נכס מניב אשר מושכר לשוכר אחד בלבד לפי חוזה שכירות ארוך טווח בתנאי שוק - 6.5%",  # a long sentence
+])
+def test_a_line_that_is_not_a_label_and_number_gives_no_label(line):
+    f = _read_at(_rows(("paragraph", ITEM_LEAD), ("li", line)), 1, line, "6.5", kind="rate")
+    assert f.get("part") != "label"  # whatever it is (the lead-in's, or unparsed), it is not read as a label
+
+
+# --- decision 3: the purpose phrase right after the number wins --------------------------------------------------------------
+
+def test_a_purpose_phrase_after_the_number_wins_over_one_before_it():
+    text = "מקדם התאמה כולל תועלת עבור השימוש והקומה, והעמסה של 20% עבור שטחים לשיווק."
+    assert datum.read_sentence(text, "20", "coefficient") == _facet("שטחים לשיווק", "sentence")
+    assert datum.read_sentence("הובאה הפחתה לסחירות בשיעור של 20% לשטחים משותפים.", "20", "coefficient") == _facet(
+        "שטחים משותפים", "sentence")
+
+
+def test_a_purpose_phrase_before_the_number_stands_when_none_follows():
+    assert datum.read_sentence("הובאה הפחתה עבור סחירות של 20%.", "20", "coefficient") == _facet("סחירות", "sentence")
+    # a phrase that is a period after the number is no phrase: the one before stays
+    assert datum.read_sentence("הובאה הפחתה עבור סחירות של 20% לשנה.", "20", "coefficient") == _facet("סחירות", "sentence")
+    # no number to anchor on (a candidate sentence): the first phrase, as before
+    assert datum._candidate_phrase("ניתנה הפחתה בגין עוצמת ניצול.", "coefficient") == ("עוצמת ניצול", False)
+
+
+# --- decision 4: a row label with the metric word and a qualifier is the component ----------------------------------------------
+
+QUALIFIED_ROW = "שיעור היוון (בתחשיב שווי הנכס בגישת היוון דמי שכירות ראויים)"
+TOTALS = 'סה"כ מר"א'
+
+
+def _matrix(row: str):
+    return _table(["", TOTALS, "יחידה 1"], [[row, "6.7%", "6.5%"], ["נתון אחר", "1%", "2%"]])
+
+
+def test_a_row_label_with_the_metric_word_and_a_qualifier_is_the_component_not_its_pair_with_a_totals_column():
+    f = _cell(_matrix(QUALIFIED_ROW), QUALIFIED_ROW, TOTALS, kind="rate", unit="percent").facet
+    assert f == _facet(QUALIFIED_ROW, "row")  # the totals column's words are no part of the component
+    # another column that names a thing still pairs with the row, as in round 13: two columns are two components
+    g = _cell(_matrix(QUALIFIED_ROW), QUALIFIED_ROW, "יחידה 1", kind="rate", unit="percent").facet
+    assert g["part"] == "row" and QUALIFIED_ROW in g["written"] and "יחידה 1" in g["written"]
+
+
+# --- follow-up: a totals or aggregate column header is never a component (KTD3, KTD4) ------------------------------------------
+
+CALC_HEADING = "תחשיב שווי נכס סינתטי בגישת היוון דמי שכירות"
+
+
+@pytest.mark.parametrize("header", ['סה"כ מר"א', "סה״כ", "סך הכל", "סך כולל", "כולל", "ממוצע", "מצטבר", 'סה"כ לשנה'])
+def test_a_row_label_of_the_metric_word_alone_never_takes_a_totals_header_and_reads_the_heading(header):
+    # a calculation table: the row is the metric word alone, its value sits in a totals column, the heading names the calculation
+    table = _table(["", header, "יחידה 1"], [["שיעור היוון", "6.7%", "6.5%"], ["נתון אחר", "1%", "2%"]], title=[CALC_HEADING])
+    f = _cell(table, "שיעור היוון", header, kind="rate", unit="percent").facet
+    assert (f["status"], f["written"], f["part"], f["tier"]) == ("stated", CALC_HEADING, "caption", "context")
+    assert header not in f["written"]
+
+
+def test_a_totals_header_is_not_a_column_facet_and_the_caption_is_read_in_the_same_way():
+    f = datum.read_cell("שיעור היוון", 'סה"כ מר"א', CALC_HEADING, family="proportion", matrix=True)
+    assert (f["status"], f["written"], f["part"], f["tier"]) == ("stated", CALC_HEADING, "caption", "context")
+    # no caption and no title: the source states none, and the totals header is not a stand-in for one
+    assert datum.read_cell("שיעור היוון", 'סה"כ מר"א', family="proportion", matrix=True) == datum.none()
+
+
+def test_a_totals_header_is_not_appended_to_a_row_in_any_matrix():
+    # a row that states a component by itself, with or without the metric word, keeps its own words
+    for row in ("שיעור היוון (בתחשיב שווי הנכס)", "שטח מסחרי", "מחסנים"):
+        f = datum.read_cell(row, 'סה"כ מר"א', family="proportion", matrix=True)
+        assert (f["part"], f["written"]) == ("row", row), row
+
+
+def test_a_non_totals_header_still_pairs_with_the_row_and_still_names_a_generic_row():
+    paired = datum.read_cell("שטח מסחרי", "יחידה 1", family="proportion", matrix=True)
+    assert (paired["part"], paired["written"]) == ("row", "שטח מסחרי — יחידה 1")
+    named = datum.read_cell("הערך שנקבע", "מקדם מיקום", family="coefficient", matrix=True)
+    assert (named["part"], named["written"]) == ("column", "מקדם מיקום")
+
+
+def test_the_word_including_in_a_metric_header_is_a_name_not_a_total():
+    named = datum.read_cell("הערך שנקבע", "מקדם מיקום כולל", family="coefficient", matrix=True)
+    assert (named["part"], named["written"]) == ("column", "מקדם מיקום כולל")
+    assert datum.read_cell("הערך שנקבע", "כולל", CALC_HEADING, family="proportion", matrix=True)["part"] == "caption"

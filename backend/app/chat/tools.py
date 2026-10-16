@@ -4779,8 +4779,10 @@ def _quote_facet(row, read: _TextRead | None = None) -> dict:
     found = _numbers_of(meaning._norm(row.value_text or ""))
     written = found[0][0] if found else ""
     sentence = datum.sentence_with(row.quote or "", written)
-    if read is None or not datum.needs_facet(family) or datum.read_sentence(sentence, written, family) is not None:
-        return datum.read_quote(sentence, written, family, None)  # an own phrase, a family that needs none, or no blocks at hand
+    if read is None or not datum.needs_facet(family) or datum.own_facet(sentence, written, family) is not None:
+        # no blocks at hand, a family that needs none, or an own sentence that settles it (a phrase, a label, a description):
+        # nothing above it is read (round 14 U2 follow-up)
+        return datum.read_quote(sentence, written, family, None)
     if read.picture:
         return datum.not_read(datum.REASON_PICTURE_CELL)
     if read.capped:
@@ -4870,7 +4872,7 @@ def _text_reads(ws: Workspace, conn: Connection, rows: list) -> dict:
         found = _numbers_of(meaning._norm(r.value_text or ""))
         written = found[0][0] if found else ""
         context = (datum.needs_facet(family) and ("m", str(r.id)) not in ws.facets
-                   and datum.read_sentence(datum.sentence_with(r.quote, written), written, family) is None)
+                   and datum.own_facet(datum.sentence_with(r.quote, written), written, family) is None)
         if context or mid is None or mid not in ws.spans:
             wanted.append((r, context))
     if not wanted:
@@ -5841,14 +5843,15 @@ def _read_quote_placed(sentence: str, written: str, family: str, preceding: datu
 
 def _facet_known(ws: Workspace, src: Source, taken: dict, kind: str) -> bool:
     """Whether ``_value_facet`` settles a quote value's facet without the blocks above it: the workspace holds it for this place
-    and family, or its own sentence states one (an own facet is read before any context)."""
+    and family, or its own sentence settles it (an own phrase, a line's label or a description no rule ties to a component is read
+    before any context, and a description borrows none: round 14 U2 follow-up)."""
     inp = taken.get("facet_in")
     if taken.get("facet") is not None or inp is None or inp["cell"]:
         return False
     sentence = _own_sentence(taken)
     family = datum.facet_family(kind, sentence)
     return (_quote_facet_key(src, taken, family) in ws.facets
-            or datum.read_sentence(sentence, inp["written"], family) is not None)
+            or datum.own_facet(sentence, inp["written"], family) is not None)
 
 
 def _preceding_blocks(conn: Connection, cx, version_id, region: list, taken: dict, kind: str) -> datum.Reach | None:

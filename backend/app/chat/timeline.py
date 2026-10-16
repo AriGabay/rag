@@ -116,6 +116,7 @@ FACET_TEXT = {
     (D.STATUS_NONE, D.REASON_NOT_IN_RANGE): "המקור לא מציין רכיב בקטע שנקרא",
     (D.STATUS_UNPARSED, D.REASON_INTERVENING): "נקרא, אך ערך אחר מפריד בין הרכיב לערך ולכן לא שויך",
     (D.STATUS_UNPARSED, D.REASON_TWO_COMPONENTS): "נקרא, אך מוזכרים שני רכיבים ולא הוכרע לאיזה מהם שייך",
+    (D.STATUS_UNPARSED, D.REASON_OWN_SENTENCE): "נקרא: המשפט של הערך מתאר אותו, אך לא זוהה בו רכיב",
     (D.STATUS_NOT_READ, D.REASON_CAP): "ההקשר לא נקרא: הגעה למגבלת הקריאה",
     (D.STATUS_NOT_READ, D.REASON_PICTURE_CELL): "ההקשר לא נקרא: הערך נקרא מתמונה",
 }
@@ -128,7 +129,7 @@ REASON_OTHER = "other"  # a component state with no reason of its own (a facet s
 CONTEXT_LOCATIONS = {
     D.PART_PRECEDING_SENTENCE: "משפט קודם באותה פסקה", D.PART_PARAGRAPH: "פסקה קודמת בסעיף",
     D.PART_LEAD_IN: "פתיח הרשימה", D.PART_HEADING: "כותרת הסעיף", D.PART_TABLE_NOTE: "הערת הטבלה",
-    D.PART_CAPTION: "כותרת הטבלה", D.PART_LIST_ITEM: "פריט ברשימה",
+    D.PART_CAPTION: "כותרת הטבלה", D.PART_LIST_ITEM: "פריט ברשימה", D.PART_LABEL: "תווית השורה",
 }
 MSG_CONTEXT_LOCATION = "ההקשר של הערך"
 CONTEXT_QUOTE_MAX = 120

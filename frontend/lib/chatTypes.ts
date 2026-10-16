@@ -297,7 +297,7 @@ export interface ChatComputation {
 export interface ChatFacet {
   status: "stated" | "none" | "not_read";
   written: string | null;
-  part: "row" | "column" | "caption" | "sentence" | "lead_in" | "heading" | null;
+  part: "row" | "column" | "label" | "caption" | "sentence" | "lead_in" | "heading" | null;
   tier: "own" | "context" | null;
 }
 
@@ -740,12 +740,13 @@ export interface ChatNotInAnswer {
 export type ChatRowComponentStatus = "stated" | "none" | "unparsed" | "not_read";
 
 /** Why a component is not stated (`reason` is null for `stated`): `not_in_range`, `intervening_value`, `two_components`,
- * `picture_cell`, `not_needed` (the family needs none), `cap` (the read reached its character cap), or `other` (no more precise
- * reason is recorded). */
+ * `own_sentence` (the value's own sentence describes it, and no component was recognised in it), `picture_cell`, `not_needed` (the
+ * family needs none), `cap` (the read reached its character cap), or `other` (no more precise reason is recorded). */
 export type ChatComponentReason =
   | "not_in_range"
   | "intervening_value"
   | "two_components"
+  | "own_sentence"
   | "picture_cell"
   | "not_needed"
   | "cap"
@@ -766,7 +767,8 @@ export interface ChatRowComponent {
   reason: ChatComponentReason | null;
   /** The source's own words; null unless `status` is `stated`. */
   written: string | null;
-  /** Where they are: `row`, `column`, `caption`, `sentence`, `lead_in`, `heading`, `preceding_sentence`, `paragraph`, `table_note`. */
+  /** Where they are: `row`, `column`, `label` (the label of a short line or list item), `caption`, `sentence`, `lead_in`, `heading`, `preceding_sentence`,
+   * `paragraph`, `table_note`. */
   part: string | null;
   /** `own` (the value's own row label, column header or purpose phrase) or `context` (anything read from around it). */
   tier: "own" | "context" | null;
