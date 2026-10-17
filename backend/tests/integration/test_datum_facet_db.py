@@ -754,3 +754,54 @@ def test_more_than_the_candidate_blocks_of_filler_above_a_value_make_the_read_ca
     T.tool_find_measurements(listed, "שיעור היוון", metric_kinds=["rate"])
     far = next(m for m in listed.measurements.values() if m.row.statement_key == "far:x")
     assert (far.facet["status"], far.facet["reason"]) == ("not_read", "cap")
+
+
+# --- a PDF paragraph block keeps its line wraps: a wrap is no sentence end (round 14 follow-up) -----------------------------
+
+# the block as PDF extraction stores it: lines joined by "\n", wrapping mid-sentence ("בגין\nאינטנסיביות", "נוסף\nשל 10%.")
+WRAPPED_BLOCK = ("בחשבון הפחתה בגין מיקום של 20% זאת בהתחשב בכך שמדובר\nבנכס פינתי. הפחתה כאמור הובאה בחשבון\nגם בחוות דעת זו.\n"
+                 "השמאי הקודם לא מצא לנכון לתת הפחתה בגין\nאינטנסיביות שימוש. יצוין כי ממועד עריכת הטבלאות פסקה הפעילות, "
+                 "לאור האמור, בחוות דעת זו הבאתי בחשבון מקדם הפחתה נוסף\nשל 10%.")
+WRAPPED_QUOTE = "בחוות דעת זו הבאתי בחשבון מקדם הפחתה נוסף של 10%"
+WRAPPED_BLOCK_INDEX = 10
+
+
+def _add_wrapped_block(office) -> None:
+    """A heading and the wrapped paragraph as blocks 9 and 10 of a section of their own."""
+    with tenant_tx(office.system) as conn:
+        ver = conn.execute(text("SELECT id FROM document_versions WHERE document_id = :d"), {"d": office.doc}).scalar_one()
+        for index, kind, body in ((9, "heading", SECTION_C), (WRAPPED_BLOCK_INDEX, "paragraph", WRAPPED_BLOCK)):
+            conn.execute(text(
+                "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
+                " section_path, page, text, status, table_index) VALUES (app_office(), :d, :v, :b, :k, :s, :sp, 1,"
+                " :t, 'read', NULL)"),
+                {"d": office.doc, "v": ver, "b": index, "k": kind, "s": SECTION_C, "sp": [SECTION_C], "t": body})
+
+
+def _assert_wrapped_context(facet: dict) -> None:
+    assert (facet["status"], facet["written"], facet["part"], facet["tier"]) == (
+        "stated", "אינטנסיביות שימוש", "preceding_sentence", "context"), facet
+    assert (facet["block"], facet["sentence"]) == (WRAPPED_BLOCK_INDEX, 2)  # the third sentence, wraps read as spaces
+    segment = facet["at"]["segments"][0]  # `at` is located in the STORED block text, wraps included
+    assert segment[0] == WRAPPED_BLOCK_INDEX
+    assert " ".join(WRAPPED_BLOCK[segment[1]:segment[2]].split()) == "השמאי הקודם לא מצא לנכון לתת הפחתה בגין אינטנסיביות שימוש."
+
+
+def test_a_value_in_a_wrapped_paragraph_block_takes_its_component_from_the_earlier_sentence_across_the_wraps(office):
+    _add_wrapped_block(office)
+    ws = workspace(office)
+    ws.doc = office.doc
+    out = run(ws, "take_value", source=_source_of(ws, SECTION_C), locator=quote(WRAPPED_QUOTE, "10"), meaning=_meaning(),
+              label="שיעור")
+    assert out.startswith("V1 נרשם"), out
+    _assert_wrapped_context(ws.values["V1"].facet)
+    assert "אינטנסיביות שימוש" in out  # the model is told
+
+
+def test_a_text_measurement_in_a_wrapped_paragraph_block_has_the_same_component(office):
+    _add_wrapped_block(office)
+    _add_text_measurement(office, WRAPPED_BLOCK_INDEX, "של 10%.", "10%", 10, "wrap:x")
+    ws = workspace(office)
+    T.tool_find_measurements(ws, "שיעור", metric_kinds=["rate"])
+    row = next(m for m in ws.measurements.values() if m.row.statement_key == "wrap:x")
+    _assert_wrapped_context(row.facet)

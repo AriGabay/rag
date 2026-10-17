@@ -616,7 +616,7 @@ def _candidate_phrase(text: str, family: str) -> tuple[str | None, bool]:
 
 class Candidate(NamedTuple):
     """A text above a value that may state its component: ``part`` is where it is (``PART_*``), ``block`` its block index and
-    ``sentence`` its index among the block's sentences (``professional.sections.sentences``)."""
+    ``sentence`` its index among the block's sentences (``sentences_of``)."""
 
     text: str
     part: str
@@ -695,15 +695,52 @@ def read_quote(sentence: str, written: str, family: str = "", preceding: Reach |
     return read_context(preceding, family)
 
 
-def _own_range(sentences: Sequence[str], text: str, quote: str) -> int:
-    """The index of the first sentence of a block that the value's quote overlaps; -1 when the quote is not found in the block
-    (then no sentence of the block is offered as a candidate)."""
+# --- line wraps (round 14 follow-up) -------------------------------------------------------------------------------------
+# PDF extraction stores a paragraph block as lines joined by "\n": the line wraps mid-sentence. The context reader reads a wrap as
+# a space (``unwrap``); the sentence splitter of ``professional.sections`` (standards parsing, limits) is not changed.
+
+_LINE_BREAK = re.compile(r"(?<!\n)\n(?!\n)")  # one "\n" alone; a run of them is a paragraph break
+_BREAK_PUNCT = (".", "!", "?", "…", ":")  # a line ending so ends its sentence (":" opens a list)
+_CLOSERS = "\"'”’״׳)]"  # closing marks that may follow the punctuation
+# a list item's opening: a bullet, a dash or a number or Hebrew letter with "." or ")" and a space ("2.5 מ"ר" or "-5%" are not)
+_LIST_MARKER = re.compile(r"[•*·]|(?:[-–—]|\d{1,3}[.)]|[א-ת][.)])(?=\s)")
+
+
+def unwrap(text: str | None) -> str:
+    """A paragraph block's text with each line wrap read as a space (round 14 follow-up, KTD3): a "\n" ends no sentence unless
+    the line before it ends with sentence punctuation (. ! ? … :) or the next line opens a list item (a bullet, a dash, a number or a
+    Hebrew letter with "." or ")"); a run of "\n" is a paragraph break and stays. The replacement has the same length, so every
+    offset computed on the result (an anchor, a span, a sentence's place) is valid against the stored text."""
+    text = text or ""
+
+    def one(m: re.Match) -> str:
+        start = text.rfind("\n", 0, m.start()) + 1
+        before = text[start:m.start()].strip().rstrip(_CLOSERS)
+        after = text[m.end():m.end() + 24].lstrip(" \t")
+        if not before or not after or after[0] == "\n" or before.endswith(_BREAK_PUNCT):
+            return "\n"
+        return "\n" if _LIST_MARKER.match(after) else " "
+
+    return _LINE_BREAK.sub(one, text)
+
+
+def sentences_of(text: str | None) -> list[str]:
+    """The sentences of a paragraph block, a line wrap not ending one (``unwrap``): ``professional.sections.sentences`` of the
+    unwrapped text. The index of a sentence in this list is the one ``Candidate.sentence`` and a facet's ``sentence`` carry."""
+    from app.professional.sections import sentences
+
+    return sentences(unwrap(text))
+
+
+def _overlapping(sentences: Sequence[str], text: str, quote: str) -> list[int]:
+    """The indexes of the sentences of a block that the value's quote overlaps, in order; empty when the quote is not found in the
+    block (then no sentence of the block is offered as a candidate)."""
     flat = " ".join(_flat(text).split())
     wanted = " ".join(_flat(quote).split())
     start = flat.find(wanted) if wanted else -1
     if start < 0:
-        return -1
-    end, pos = start + len(wanted), 0
+        return []
+    end, pos, out = start + len(wanted), 0, []
     for i, sentence in enumerate(sentences):
         one = " ".join(_flat(sentence).split())
         at = flat.find(one, pos)
@@ -711,8 +748,27 @@ def _own_range(sentences: Sequence[str], text: str, quote: str) -> int:
             continue
         pos = at + len(one)
         if at < end and pos > start:
-            return i
-    return -1
+            out.append(i)
+    return out
+
+
+def _own_range(sentences: Sequence[str], text: str, quote: str) -> int:
+    """The index of the first sentence of a block that the value's quote overlaps; -1 when the quote is not found in the block."""
+    found = _overlapping(sentences, text, quote)
+    return found[0] if found else -1
+
+
+def own_sentence(block_text: str | None, quote: str, written: str = "") -> str | None:
+    """The whole sentence of a block that a value's quote is in, a line wrap not ending it (``unwrap``): the quote may be a line, or a
+    stretch of the sentence, of a PDF paragraph. ``written`` (the number as written): of the sentences the quote overlaps, the
+    first that holds the number; without it, the one sentence that holds the whole quote. None: the quote is not in the block (or
+    spans sentences without the number), so the caller keeps the sentence it had."""
+    sentences = sentences_of(block_text)
+    found = _overlapping(sentences, block_text or "", quote)
+    if written:
+        return next((sentences[i] for i in found if _number_token(sentences[i], written)), None)
+    flat = " ".join(_flat(quote).split())
+    return next((sentences[i] for i in found if flat in " ".join(_flat(sentences[i]).split())), None)
 
 
 def reach(rows: Sequence, at: int, quote: str = "", *, path: Sequence[str] | None = None, lo: int = 0,
@@ -724,11 +780,12 @@ def reach(rows: Sequence, at: int, quote: str = "", *, path: Sequence[str] | Non
     2. the earlier paragraph blocks of the same section, a sentence at a time, nearest first; a paragraph that ends in a colon is
        a ``lead_in`` as a whole, and a list item is kept only for the numbers it holds;
     3. the heading of the section, which ends the read.
+    A paragraph's sentences are those of ``sentences_of``: a PDF line wrap inside a sentence is no sentence end.
     The read stops at a table block, at a block of another section (its heading or its text) and at ``lo``, the first block of
     the appraisal unit. ``chars`` caps the text of the candidates: the one that crosses it is dropped, the search ends there and
     ``capped`` is set. ``truncated``: ``rows`` were cut by the reader's row limit, so a block of the range that is missing from
     them means the search did not reach its edge (``capped``); otherwise a missing block simply ends the range."""
-    from app.professional.sections import sentences as split
+    split = sentences_of  # a line wrap is no sentence end (``unwrap``)
 
     by = {r.block_index: r for r in rows}
     holder = by.get(at)
@@ -784,8 +841,9 @@ def reach(rows: Sequence, at: int, quote: str = "", *, path: Sequence[str] | Non
 
 
 def sentence_with(text: str, written: str) -> str:
-    """The sentence of a text that holds a number as written (the whole text when none does)."""
-    for part in re.split(r"(?<=[.!?])\s+|\n", text or ""):
+    """The sentence of a text that holds a number as written (the whole text when none does). A line wrap is no sentence end
+    (``unwrap``)."""
+    for part in re.split(r"(?<=[.!?])\s+|\n", unwrap(text)):
         if _number_token(part, written):
             return part.strip()
     return (text or "").strip()

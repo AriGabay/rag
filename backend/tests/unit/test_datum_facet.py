@@ -1422,3 +1422,85 @@ def test_the_word_including_in_a_metric_header_is_a_name_not_a_total():
     named = datum.read_cell("הערך שנקבע", "מקדם מיקום כולל", family="coefficient", matrix=True)
     assert (named["part"], named["written"]) == ("column", "מקדם מיקום כולל")
     assert datum.read_cell("הערך שנקבע", "כולל", CALC_HEADING, family="proportion", matrix=True)["part"] == "caption"
+
+
+# =======================================================================================================================
+# round 14 follow-up: a PDF paragraph block keeps its line wraps ("\n"); the context reader reads a wrap as a space
+# =======================================================================================================================
+
+# a paragraph block as PDF extraction stores it: the lines wrap mid-sentence ("בגין\nאינטנסיביות", "נוסף\nשל 10%.")
+WRAPPED = ("בחשבון הפחתה בגין מיקום של 20% זאת בהתחשב בכך שמדובר\nבנכס פינתי. הפחתה כאמור הובאה בחשבון\nגם בחוות דעת זו.\n"
+           "השמאי הקודם לא מצא לנכון לתת הפחתה בגין\nאינטנסיביות שימוש. יצוין כי ממועד עריכת הטבלאות פסקה הפעילות, לאור "
+           "האמור, בחוות דעת זו הבאתי בחשבון מקדם הפחתה נוסף\nשל 10%.")
+WRAPPED_OWN = "יצוין כי ממועד עריכת הטבלאות פסקה הפעילות, לאור האמור, בחוות דעת זו הבאתי בחשבון מקדם הפחתה נוסף של 10%."
+
+
+@pytest.mark.parametrize("quote", [WRAPPED_OWN, "נוסף של 10%.", "מקדם הפחתה נוסף של 10%"])
+def test_a_line_wrap_inside_a_paragraph_block_is_not_a_sentence_end_for_the_context_read(quote):
+    f = _read_at(_rows(("paragraph", WRAPPED)), 0, quote, "10")
+    assert (f["status"], f["written"], f["part"], f["tier"]) == ("stated", "אינטנסיביות שימוש", "preceding_sentence", "context")
+    assert (f["block"], f["sentence"]) == (0, 2)  # the third sentence of the block, wraps unwrapped
+    start, end = f["at"]["segments"][0][1:]  # `at` is located in the STORED text, wraps included
+    assert " ".join(WRAPPED[start:end].split()) == "השמאי הקודם לא מצא לנכון לתת הפחתה בגין אינטנסיביות שימוש."
+
+
+def test_the_wrapped_own_sentence_of_a_value_is_the_whole_sentence_not_the_line():
+    taken = T._take_quote(_source(WRAPPED), WRAPPED, {"quote": "של 10%.", "number": "10"}, [(0, WRAPPED, 1)])
+    assert T._own_sentence(taken) == WRAPPED_OWN
+    # no block text at hand (a take without blocks): today's line is the fallback
+    bare = T._take_quote(_source(WRAPPED), WRAPPED, {"quote": "של 10%.", "number": "10"})
+    assert T._own_sentence(bare) == "של 10%."
+
+
+@pytest.mark.parametrize("quote", ["שיעור היוון של 7%", "של 7%", "שיעור היוון של 7% לתזרים הכנסות מחניה."])
+def test_a_purpose_phrase_split_across_lines_is_the_own_facet(quote):
+    f = _read_at(_rows(("paragraph", "לצורך החישוב נקבע שיעור היוון של 7%\nלתזרים הכנסות מחניה.")), 0, quote, "7", kind="rate")
+    assert (f["status"], f["written"], f["part"], f["tier"]) == ("stated", "תזרים הכנסות מחניה", "sentence", "own")
+
+
+def test_a_newline_after_a_full_stop_still_ends_the_sentence():
+    text = "לא ניתנה הפחתה בגין עוצמת ניצול.\nשיעור הפחתה 9%."
+    f = _read_at(_rows(("paragraph", text)), 0, "שיעור הפחתה 9%.", "9", kind="rate")
+    assert (f["written"], f["part"], f["sentence"]) == ("עוצמת ניצול", "preceding_sentence", 0)
+    assert datum.sentence_with(text, "9") == "שיעור הפחתה 9%."
+
+
+LIST_BLOCK = "שיעורי ההיוון:\n- משרדים 7%\n- מסחר 6.5%"
+
+
+def test_a_list_keeps_its_lines_as_items_nothing_is_unwrapped_after_a_colon_or_before_a_marker():
+    assert datum.unwrap(LIST_BLOCK) == LIST_BLOCK
+    assert datum.sentences_of(LIST_BLOCK) == ["שיעורי ההיוון:", "- משרדים 7%", "- מסחר 6.5%"]
+    assert datum.sentence_with(LIST_BLOCK, "6.5") == "- מסחר 6.5%"
+    for marker in ("–", "•", "*", "1.", "12)", "ב."):
+        text = f"הפרטים הם כלהלן\n{marker} מסחר 6.5%"
+        assert datum.unwrap(text) == text, marker
+    # a wrapped line that begins with a number or a dash glued to a number is a wrap, not an item
+    assert datum.unwrap("נקבע שיעור של\n6.5% לתזרים") == "נקבע שיעור של 6.5% לתזרים"
+    assert datum.unwrap("נקבע שיעור של\n2.5 מ\"ר") == "נקבע שיעור של 2.5 מ\"ר"
+    assert datum.unwrap("הפרש של\n-5% לעומת") == "הפרש של -5% לעומת"
+    assert datum.unwrap("פסקה אחת\n\nפסקה שנייה") == "פסקה אחת\n\nפסקה שנייה"  # a blank line is a break
+
+
+def test_unwrap_keeps_the_length_so_every_offset_stays_valid_against_the_stored_text():
+    assert datum.unwrap("") == "" and datum.unwrap(None) == ""
+    out = datum.unwrap(WRAPPED)
+    assert len(out) == len(WRAPPED) and "\n" in out  # the wraps after "." remain
+    assert out.count("\n") == 1  # "גם בחוות דעת זו.\nהשמאי": the one real break
+    assert all(a == b for a, b in zip(out, WRAPPED, strict=True) if b != "\n")
+    assert out.index("אינטנסיביות") == WRAPPED.index("אינטנסיביות")
+
+
+def test_a_text_measurement_in_a_wrapped_block_reads_the_same_facet_as_the_value():
+    row = _row(quote="של 10%.", value_text="10%", value=Decimal("10"), metric="מקדם הפחתה", metric_kind="coefficient")
+    rows = _rows(("paragraph", WRAPPED))
+    f = T._measurement_facet(row, None, T._TextRead(datum.reach(rows, 0, row.quote), WRAPPED))
+    assert (f["status"], f["written"], f["part"], f["tier"]) == ("stated", "אינטנסיביות שימוש", "preceding_sentence", "context")
+
+
+def test_the_whole_sentence_of_a_quote_is_cached_with_its_facts_and_an_older_record_without_it_still_loads():
+    taken = T._take_quote(_source(WRAPPED), WRAPPED, {"quote": "של 10%.", "number": "10"}, [(0, WRAPPED, 1)])
+    facts = json.loads(json.dumps(T._facts_json(taken, ()), ensure_ascii=False))
+    assert facts["sentence"] == WRAPPED_OWN and T._own_sentence(T._facts_from_json(facts)[0]) == WRAPPED_OWN
+    del facts["sentence"]  # a record written before: today's line
+    assert T._own_sentence(T._facts_from_json(facts)[0]) == "של 10%."

@@ -4805,10 +4805,18 @@ def _cell_facet(row, cells: list, caption: str | None, title, notes=()) -> dict:
                            notes=[str(x) for x in notes or [] if x])
 
 
+def _quote_sentence(row, read: _TextRead | None, written: str) -> str:
+    """The sentence of a stored text measurement that holds its number: the whole sentence of its block when the block is at hand
+    (``read.block_text``; a PDF line wrap is no sentence end, round 14 follow-up), else the one in its quote (``datum.sentence_with``)."""
+    found = datum.own_sentence(meaning._norm(read.block_text), meaning._norm(row.quote or ""), written) if (
+        read is not None and read.block_text and row.quote) else None
+    return found or datum.sentence_with(row.quote or "", written)
+
+
 def _quote_facet(row, read: _TextRead | None = None) -> dict:
     family = _row_family(row)
     written = _written_of(row)
-    sentence = datum.sentence_with(row.quote or "", written)
+    sentence = _quote_sentence(row, read, written)
     if read is None or not datum.needs_facet(family) or datum.own_facet(sentence, written, family) is not None:
         # no blocks at hand, a family that needs none, or an own sentence that settles it (a phrase, a label, a description):
         # nothing above it is read (round 14 U2 follow-up)
@@ -5539,6 +5547,17 @@ MSG_QUOTE_AMBIGUOUS = ("הציטוט מופיע ב-{sid} יותר מפעם אח�
                        "שמופיע במקור פעם אחת בלבד ושהמספר כתוב בו במלואו")
 
 
+def _block_sentence(blocks: Iterable[tuple] | None, anchor: dict, quote: str) -> str | None:
+    """The whole sentence a quote is in, read from the text of its block (round 14 follow-up): PDF extraction stores a paragraph
+    as lines, and a line wrap is no sentence end (``datum.own_sentence``). The blocks are those the anchor says hold the quote (else
+    all of the cited range); None when they do not agree on one sentence, or there are no blocks — the caller keeps the sentence
+    of the source line."""
+    held = _value_blocks(anchor)
+    found = {datum.own_sentence(meaning._norm(b[1] or ""), quote)
+             for b in blocks or () if held is None or b[0] in held}
+    return found.pop() if len(found) == 1 else None
+
+
 def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = None,
                 governing: Callable[[int], str | _ScaleNote] | None = None) -> dict:
     """The number inside an exact quote of the source: the quote must occur in the source's full text, and the
@@ -5610,7 +5629,9 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
         if units:
             unit_from = "governing_note"
     vats = meaning.vat_attested(line, forms, full)
+    sentence = _block_sentence(blocks, anchor, quote)
     return {"written": written, "value": sign * value, "forms": forms, "quote": loc["quote"].strip(),
+            **({"sentence": sentence} if sentence else {}),
             "qualifiers": meaning.number_qualifiers(full, forms, quote),
             "units": units, "vat": vats,
             "vat_from": _vat_anchors(vats, [("sentence", quote), ("paragraph", line), ("note", full)], "paragraph"),
@@ -5864,7 +5885,7 @@ def _read_quote_placed(sentence: str, written: str, family: str, preceding: datu
     block, index = found.get("block"), found.get("sentence")
     if block is None or index is None or not isinstance(preceding, datum.Reach) or block not in preceding.blocks:
         return found
-    sentences = sections.sentences(preceding.blocks[block])
+    sentences = datum.sentences_of(preceding.blocks[block])  # the stored text: same offsets as the unwrapped one
     if not 0 <= index < len(sentences):
         return found
     try:
@@ -5908,10 +5929,14 @@ def _preceding_blocks(conn: Connection, cx, version_id, region: list, taken: dic
 
 
 def _own_sentence(taken: dict) -> str:
-    """The row or sentence a taken value is in: a table cell's row as read; for a quote, the sentence of its source line
-    that holds the quote (the quote itself when it spans sentences) — where a date of the value's own is looked for."""
+    """The row or sentence a taken value is in: a table cell's row as read; for a quote, the whole sentence of its block that holds
+    the quote, a PDF line wrap not ending it (``taken["sentence"]``, set where the block is at hand: ``_take_quote``,
+    ``_facet_again``; round 14 follow-up), else the sentence of its source line that holds the quote (the quote itself when it spans
+    sentences) — where a date of the value's own is looked for."""
     if taken.get("table"):
         return taken["quote"]
+    if taken.get("sentence"):
+        return taken["sentence"]
     line = (taken.get("context") or "").split("\n")[0]
     quote = meaning._flat(taken["quote"])
     return next((x for x in sections.sentences(line) if quote in meaning._flat(x)), taken["quote"])
@@ -6335,7 +6360,8 @@ def _facts_json(taken: dict, path: tuple) -> dict:
             "said": ({"stances": sorted(said.stances), "stated_by": said.stated_by, "evidence": said.evidence}
                      if said is not None else None),
             "context": taken.get("context") or "", "meaning_from": dict(taken.get("meaning_from") or {}),
-            "anchor": dict(taken.get("anchor") or {}), "path": list(path), "scale": int(taken.get("scale") or 1)}
+            "anchor": dict(taken.get("anchor") or {}), "path": list(path), "scale": int(taken.get("scale") or 1),
+            **({"sentence": taken["sentence"]} if taken.get("sentence") else {})}
 
 
 def _facts_from_json(d: dict) -> tuple[dict, tuple]:
@@ -6354,6 +6380,8 @@ def _facts_from_json(d: dict) -> tuple[dict, tuple]:
                       if said is not None else None),
              "context": d.get("context") or "", "meaning_from": dict(d.get("meaning_from") or {}),
              "anchor": dict(d.get("anchor") or {}), "scale": int(d.get("scale") or 1)}
+    if d.get("sentence"):  # the whole sentence of the quote's block (round 14 follow-up); an older record has none
+        taken["sentence"] = d["sentence"]
     return taken, tuple(d.get("path") or ())
 
 
@@ -6591,6 +6619,10 @@ def _facet_again(ws: Workspace, src: Source, taken: dict, kind: str, doc: dict) 
                                                  place["block_end"] if place.get("block_end") is not None else place["block_start"])
                     at = _value_blocks(taken.get("anchor") or {})
                     region = [r for r in held if at is None or r.block_index in at]
+                    if not taken.get("sentence"):  # a record of an older reader: the quote's whole sentence, from its block now
+                        sentence = _block_sentence([(r.block_index, r.text or "", r.page) for r in region],
+                                                   taken.get("anchor") or {}, meaning._flat(taken["quote"]))
+                        taken |= {"sentence": sentence} if sentence else {}
                     taken["preceding"] = _preceding_blocks(conn, contexts_of(ws, conn, src.version_id, src.reading_id),
                                                            src.version_id, region, taken, kind)
             return _value_facet(ws, src, taken, kind)
