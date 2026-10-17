@@ -226,6 +226,7 @@ from app.measurements.extract import (
     names_match,
     stance_label,
 )
+from app.platform import dates as platform_dates
 from app.platform import source_kinds
 from app.platform.dates import precision_of, shown_date, shown_period
 from app.platform.documents import coverage_of, display_box_of, reading_notes
@@ -547,6 +548,9 @@ class Workspace:
     # (at most ``REREADS_PER_VALUE``); V# -> why it stays uncertain after them (R28)
     rereads: dict[tuple, int] = field(default_factory=dict)
     uncertain_values: dict[str, str] = field(default_factory=dict)
+    # V# whose unit its source leaves ambiguous -> why (round 15 U1, KTD9): registered with the model's unit, never an input
+    # of ``calculate``
+    ambiguous_units: dict[str, str] = field(default_factory=dict)
     # V# whose own region was read clearly (at ingestion, or by a re-read): an uncertain region elsewhere in its
     # source does not make it uncertain
     settled_values: set = field(default_factory=set)
@@ -5231,6 +5235,37 @@ def _parse_number(raw: str) -> tuple[str, Decimal] | None:
     return m.group(3), value
 
 
+MSG_DATE_CITE = ("תאריך אינו ערך שנרשם: צטט אותו כקטע (S#) שבו הוא כתוב, בלי take_value. ערך מתוארך שהתשובה מציגה "
+                 "נרשם כרגיל, והשרת מצרף לו את התאריך שלו")
+
+
+MSG_UNIT_AMBIGUOUS_WHY = "המקור מזכיר ליד הערך יותר מיחידה אחת ({units}) ואינו קובע איזו מהן שלו"
+MSG_UNIT_AMBIGUOUS_TAKEN = ("היחידה של הערך לא ברורה במקור: {why}. הערך נרשם ביחידה שנתת, אפשר לצטט ולהציג אותו, אבל "
+                            "אי אפשר לחשב איתו")
+MSG_UNIT_AMBIGUOUS_INPUT = ("אי אפשר לחשב עם {inputs}: היחידה של הערך לא ברורה במקור. אל תחשב עם ערך כזה — קח "
+                            "מהמסמך ערך שהיחידה שלו כתובה (תא עם כותרת שמציינת יחידה, או משפט), או הצג את הערך בלי חישוב")
+
+
+def _not_one_number(raw) -> ToolError:
+    """The refusal for a ``number`` that is not one number: a date gets its own message — it is cited, not registered (round 15 U1,
+    KTD9, R12)."""
+    if platform_dates.parse(str(raw or "")) is not None:
+        return ToolError(MSG_DATE_CITE, "date_not_registered")
+    return ToolError(f"number «{raw}» אינו מספר אחד")
+
+
+def _header_units(header: str, column_unit: str = "") -> set[str]:
+    """The unit a column header states for its cells (round 15 U1, KTD9): ``meaning.units_attested`` over the header and the
+    unit read from it (``extraction.tables.units_for``). A money kind per area with no currency ("שווי למ״ר בנוי") is ₪
+    per m² — the header names an amount, and the area is its denominator, not its unit."""
+    text_ = f"{header} {column_unit}"
+    units = meaning.units_attested(text_)
+    if units == {"sqm"} and meaning._PER_SQM.search(meaning._norm(text_)) \
+            and any(meaning.kind_attested(k, text_) for k in meaning.MONEY_KINDS):
+        return {"ILS_per_sqm"}
+    return units
+
+
 def _numbers_of(text_: str) -> list[tuple[str, int, int, Decimal]]:
     """Every number written in a text: (as written, start, end, value)."""
     from app.answering.verify import _NUMBER
@@ -5249,18 +5284,55 @@ def _key(s) -> str:
     return meaning._flat(str(s or "")).strip(" :")
 
 
+_LOOSE = re.compile(r"[\W_]+")
+
+
+def _loose(s) -> str:
+    """A label for matching when two spellings differ only in spaces, punctuation or bracket marks ("ממוצע (*)" and
+    "ממוצע ( *)"): its letters and digits alone (round 15 U1, KTD9). Matching only, never shown."""
+    return _LOOSE.sub("", _key(s))
+
+
+def _label_tiers(wanted: str) -> list[Callable[[str], bool]]:
+    """How a label may name an option, strictest first: the same label, the same letters and digits, a label inside
+    the option, its letters and digits inside the option's."""
+    k, loose = _key(wanted), _loose(wanted)
+    return [lambda o: _key(o) == k, lambda o: bool(loose) and _loose(o) == loose,
+            lambda o: bool(k) and k in _key(o), lambda o: bool(loose) and loose in _loose(o)]
+
+
 def _match_one(wanted: str, options: list[str], what: str) -> int:
-    """The index of the option a label names: an exact match, else the only option that contains it."""
-    k = _key(wanted)
-    exact = [i for i, o in enumerate(options) if _key(o) == k]
-    if len(exact) == 1:
-        return exact[0]
-    near = exact or [i for i, o in enumerate(options) if k and k in _key(o)]
-    if len(near) == 1:
-        return near[0]
-    if not near:
-        raise ToolError(f"{what} «{wanted}» לא נמצא בטבלה. האפשרויות: " + "; ".join(f"«{o}»" for o in options[:20] if o))
-    raise ToolError(f"{what} «{wanted}» מתאים לכמה ({', '.join(str(i + 1) for i in near[:8])}); בחר לפי מספר")
+    """The index of the option a label names: the first tier (``_label_tiers``) with a match decides — the only option
+    of it, else a refusal naming the several."""
+    for same in _label_tiers(wanted):
+        hit = [i for i, o in enumerate(options) if same(o)]
+        if len(hit) == 1:
+            return hit[0]
+        if hit:
+            raise ToolError(f"{what} «{wanted}» מתאים לכמה ({', '.join(str(i + 1) for i in hit[:8])}); בחר לפי מספר")
+    raise ToolError(f"{what} «{wanted}» לא נמצא בטבלה. האפשרויות: " + "; ".join(f"«{o}»" for o in options[:20] if o))
+
+
+def _rows_named(rows: list[list[str]], label: str) -> list[int]:
+    """The rows a label names (round 15 U1, KTD9, R12): per tier, rows whose first cell it names, else rows with any
+    non-numeric cell it names — a group column or an empty first cell does not hide the label. The first tier with
+    a hit decides; empty: no row."""
+    scopes = (lambda r: r[:1], lambda r: [c for c in r if _parse_number(c) is None])
+    for same in _label_tiers(label):
+        for cells_of in scopes:
+            hit = [i for i, r in enumerate(rows) if any(c and same(c) for c in cells_of(r))]
+            if hit:
+                return hit
+    return []
+
+
+def _row_name(cells: list[str]) -> str:
+    """A row as the model names it in a refusal: its non-numeric cells."""
+    return " | ".join(c for c in cells if c and _parse_number(c) is None) or " | ".join(cells)
+
+
+def _rows_listed(rows: list[list[str]], at: list[int]) -> str:
+    return "; ".join(f"שורה {i + 1} «{_clip(_row_name(rows[i]), 80)}»" for i in at[:8])
 
 
 def _table_of(ws: Workspace, src: Source, given) -> int:
@@ -5323,19 +5395,24 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
         ri = int(loc["row_number"]) - 1
         if not 0 <= ri < len(rows):
             raise ToolError(f"לטבלה {len(rows)} שורות; row_number מ-1 עד {len(rows)}")
-        if loc.get("row") and _key(loc["row"]) not in (_key(c) for c in rows[ri]):
-            raise ToolError(f"שורה {ri + 1} אינה «{loc['row']}»: היא «{' | '.join(rows[ri])}»")
+        if loc.get("row"):
+            # the label decides when the number disagrees with it and the label names exactly one row (round 15 U1, KTD9)
+            named = _rows_named(rows, loc["row"])
+            here = any(c and same(c) for same in _label_tiers(loc["row"])[:2] for c in rows[ri])
+            if ri not in named and not here:
+                if len(named) == 1:
+                    ri = named[0]
+                else:
+                    raise ToolError(f"שורה {ri + 1} אינה «{loc['row']}»: היא «{' | '.join(rows[ri])}»"
+                                    + (f". «{loc['row']}» נמצא ב{_rows_listed(rows, named)}; בחר לפי row_number"
+                                       if named else ""))
     elif loc.get("row"):
-        labels = [r[0] if r else "" for r in rows]
-        try:
-            ri = _match_one(loc["row"], labels, "השורה")
-        except ToolError:
-            # a label in another cell of the row (a table whose label column is not the first)
-            hits = [i for i, r in enumerate(rows) if any(_key(c) == _key(loc["row"]) and _parse_number(c) is None
-                                                         for c in r)]
-            if len(hits) != 1:
-                raise
-            ri = hits[0]
+        named = _rows_named(rows, loc["row"])
+        if not named:
+            raise ToolError(f"השורה «{loc['row']}» לא נמצאה בטבלה. השורות: " + _rows_listed(rows, list(range(len(rows)))))
+        if len(named) > 1:
+            raise ToolError(f"השורה «{loc['row']}» מתאימה לכמה שורות — {_rows_listed(rows, named)}; בחר לפי row_number")
+        ri = named[0]
     else:
         raise ToolError("תא בטבלה נבחר לפי שורה (row: התווית, או row_number) ועמודה (column: הכותרת, או "
                         "column_number)")
@@ -5359,7 +5436,7 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     if loc.get("number"):
         wanted = _parse_number(loc["number"])
         if wanted is None:
-            raise ToolError(f"number «{loc['number']}» אינו מספר אחד")
+            raise _not_one_number(loc["number"])
         hit = [n for n in numbers if n[3] == wanted[1]]
         if not hit:
             elsewhere = [(r, c) for r, row in enumerate(rows) for c, x in enumerate(row)
@@ -5374,6 +5451,8 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
         at_cell = hit[0][1:3]
     else:
         if len(numbers) != 1:
+            if numbers and platform_dates.parse(cell) is not None:
+                raise ToolError(MSG_DATE_CITE, "date_not_registered")
             raise ToolError(f"בתא שנבחר ({where}) " + ("אין מספר" if not numbers else f"יש כמה מספרים («{cell}»); "
                                                        "ציין number"))
         written, value = numbers[0][0], numbers[0][3]
@@ -5387,6 +5466,8 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
                         "(read עם table=T# או cursor) וקח אותו מהמקור הזה")
     line = " | ".join(cells)
     label = cells[0] if cells else ""
+    if not label:  # an empty first cell (a group column left blank): the row is named by its first label cell
+        label = next((c for c in cells if c and _parse_number(c) is None), "")
     column_units = st.get("units") or []
     near = [cell, label, header, str(column_units[ci]) if ci < len(column_units) and column_units[ci] else ""]
     table_text = [st.get("caption") or "", *(st.get("title") or []), *(st.get("notes") or [])]
@@ -5397,14 +5478,27 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     vat_parts = [("cell", cell), ("row", label), ("header", header), ("header", near[3]), ("caption", caption_text),
                  ("note", notes_text)]
     vats = meaning.vat_attested("\n".join(near + table_text), forms)
-    # the unit of the cell, its row or its column; the table's caption or notes only when those state none
-    units = meaning.units_attested(" ".join(near)) or meaning.units_attested(" ".join(table_text))
+    # the unit of the cell, its row or its column; the table's caption or notes only when those state none. A cell that
+    # states no unit of its own takes the one its column header states, before the cell, row label and header are read
+    # together (round 15 U1, KTD9): "שווי למ״ר" over a row that names "דירה 3 חדרים" is ₪ per m², not m²
+    head_units = set() if meaning.units_attested(cell) else _header_units(header, near[3])
+    units = head_units or meaning.units_attested(" ".join(near)) or meaning.units_attested(" ".join(table_text))
     # where the source states the unit (R10): the cell, its row label, its column header (or the column's unit
     # read from it), else the table's caption, title or notes
-    unit_from = next((where for where, t in (("cell", near[0]), ("row", near[1]), ("header", near[2] + " " + near[3]))
-                      if meaning.units_attested(t)), "table" if units else None)
+    unit_from = "header" if head_units else next(
+        (where for where, t in (("cell", near[0]), ("row", near[1]), ("header", near[2] + " " + near[3]))
+         if meaning.units_attested(t)), "table" if units else None)
+    # a unit only the row's own label mentions, beside a caption that states another, and nothing in the cell or its
+    # header: "דירה 90 מ״ר | 21,000" under "(₪)" — the m² describes the row's property, the amount is the caption's. The
+    # source does not say which: the value registers with the model's unit and a flag that blocks calculating with it
+    row_units = meaning.units_attested(label)
+    caption_units = meaning.units_attested(" ".join(table_text))
+    ambiguous = (not head_units and not meaning.units_attested(" ".join([cell, header, near[3]])) and bool(row_units)
+                 and bool(caption_units) and row_units != caption_units and bool(re.search(r"\d", label)))
+    if ambiguous:
+        units, unit_from = set(), None
     own_kind_not_money = meaning.nonmonetary(" ".join(near))
-    if not units and not own_kind_not_money:
+    if not units and not own_kind_not_money and not ambiguous:
         units = _note_units(governing)
         if units:
             unit_from = "governing_note"
@@ -5428,6 +5522,7 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
             "total": bool(calc.TOTAL_WORDS.search(meaning._norm(cells[0] if cells else ""))),
             "table": (str(src.version_id), index), "said": said, "context": " ".join([*near, *table_text]),
             "meaning_from": {"unit": unit_from} if unit_from else {}, "scale": scale,
+            **({"unit_ambiguous": sorted(row_units | caption_units)} if ambiguous else {}),
             # what the facet is read from (round 13 U3, KTD2): the row label, the column header and the caption and title
             "facet_in": _cell_facet_in(label, header, st, cells),
             # the cell as stored (KTD1): its box is looked up when the answer is stored, never searched for
@@ -5543,6 +5638,36 @@ def _vision_quote_cell(ws: Workspace, src: Source, loc: dict) -> dict | None:
     return {"table": src.vision["tables"][ti], "row_number": ri + 1, "column_number": ci + 1, "number": loc["number"]}
 
 
+def _row_quote_locator(sid: str, st: dict, loc: dict) -> dict:
+    """The cell locator of a quote that is (part of) one row of the source's table (round 15 U1, KTD9, R12): the row whose cells
+    hold the quote, and the cell of it that holds the number and is inside the quote. No such row, or several rows or cells,
+    is a refusal that names the rows found. The quote and the cells are compared by their letters and digits and the cell
+    borders, so "( *)" and "(*)" are one."""
+    if not loc.get("number"):
+        raise ToolError("ציטוט (quote) דורש גם את המספר כפי שנכתב בו (number)")
+    wanted = _parse_number(loc["number"])
+    if wanted is None:
+        raise _not_one_number(loc["number"])
+    rows = [list(r.get("cells") or []) for r in st.get("rows") or []]
+    shape = lambda text_: "|".join(_loose(part) for part in meaning._flat(text_).split("|"))  # noqa: E731
+    quote = shape(loc["quote"])
+    if len(quote.replace("|", "")) < 3:
+        raise ToolError(f"הציטוט אינו מופיע כלשונו ב-{sid}: העתק את המשפט מהמקור בדיוק (או בחר תא בטבלה)")
+    held = [i for i, r in enumerate(rows) if quote in shape(" | ".join(r))]
+    if not held:
+        raise ToolError(f"הציטוט אינו שורה בטבלה של {sid}. השורות: " + _rows_listed(rows, list(range(len(rows)))))
+    places = [(i, ci) for i in held for ci, c in enumerate(rows[i])
+              if any(n[3] == abs(wanted[1]) for n in _numbers_of(meaning._norm(c))) and _loose(c) and _loose(c) in quote]
+    if not places:
+        raise ToolError(f"המספר {loc['number']} אינו בתאים של הציטוט ({_rows_listed(rows, held)}): צטט את השורה "
+                        "כשהמספר בתוכה, או בחר תא לפי row ו-column")
+    if len(places) > 1:
+        raise ToolError("הציטוט מתאים לכמה תאים: " + "; ".join(f"שורה {i + 1} «{_clip(_row_name(rows[i]), 80)}», עמודה {ci + 1}"
+                                                                  for i, ci in places[:8]) + ". בחר לפי row_number ו-column_number")
+    i, ci = places[0]
+    return {"row_number": i + 1, "column_number": ci + 1, "number": loc["number"]}
+
+
 MSG_QUOTE_AMBIGUOUS = ("הציטוט מופיע ב-{sid} יותר מפעם אחת, ובמקומות שונים כתוב בו מספר אחר: צטט ציטוט ארוך יותר, "
                        "שמופיע במקור פעם אחת בלבד ושהמספר כתוב בו במלואו")
 
@@ -5570,7 +5695,7 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
         raise ToolError("ציטוט (quote) דורש גם את המספר כפי שנכתב בו (number)")
     wanted = _parse_number(loc["number"])
     if wanted is None:
-        raise ToolError(f"number «{loc['number']}» אינו מספר אחד")
+        raise _not_one_number(loc["number"])
     quote = meaning._flat(loc["quote"])
     text_ = meaning._flat(full)
     if len(quote) < 3 or quote not in text_:
@@ -6152,7 +6277,7 @@ def _registered_again(ws: Workspace, span: tuple | None, settled: tuple, facet_o
 
 
 def _register_value(ws: Workspace, value: calc.Value, span: tuple | None, *, stub: dict | None = None,
-                    settled: bool = False, uncertain: str | None = None) -> None:
+                    settled: bool = False, uncertain: str | None = None, ambiguous: str | None = None) -> None:
     """The last step of a registration (round 14 U1, KTD2): the V# enters the workspace with its span, its anchor stub and
     how its region was read. Every step before it works on the value alone, so a failure in any of them leaves no V#, no S# the
     value was the reason for and no entry keyed by an id nobody holds."""
@@ -6163,6 +6288,8 @@ def _register_value(ws: Workspace, value: calc.Value, span: tuple | None, *, stu
         ws.settled_values.add(value.vid)
     if uncertain:
         ws.uncertain_values[value.vid] = uncertain
+    if ambiguous:
+        ws.ambiguous_units[value.vid] = ambiguous
     if stub:
         ws.anchors[value.vid] = stub
 
@@ -6201,6 +6328,13 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
             raise ToolError(MSG_UNAVAILABLE, "unavailable")
         if src.reading_id is not None and v.reading_id != src.reading_id:
             raise ToolError(MSG_STALE_REF.format(source_id=sid), "stale_reference")
+        if not cell and not vision and src.table_index is not None and "|" in (loc.get("quote") or ""):
+            # a quoted table row is the row of the source's table that holds it, and the cell with the number is taken
+            # as a cell (round 15 U1, KTD9)
+            st, _ = _table_at(ws, conn, src.version_id, src.table_index)
+            if st is None:
+                raise ToolError("הטבלה לא נמצאה בקריאה הנוכחית של המסמך")
+            loc, cell = _row_quote_locator(sid, st, loc), True
         rows: list = []
         if cell and vision:
             taken = _take_vision_cell(ws, src, full, loc, _governing_note(ws, conn, src.version_id, src.block_start))
@@ -6300,11 +6434,16 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
             stub["context"] = {k: (v["part"] if isinstance(v, dict) else v) for k, v in value.meaning_from.items()}
         if pages:
             stub["pages"] = pages
-    if known is None and _cacheable(ws, value, src, reread):
+    if known is None and not taken.get("unit_ambiguous") and _cacheable(ws, value, src, reread):
         blocks = (min(r.block_index for r in region), max(r.block_index for r in region)) if region else None
         _store_verified(ws, value, _cache_doc(value, taken, path, stub, src, blocks), _cache_locator(value.locator, span))
     _back_date_words(value)
-    _register_value(ws, value, span, stub=stub, settled=settled_region, uncertain=uncertain)  # the last step (KTD2)
+    ambiguous = (MSG_UNIT_AMBIGUOUS_WHY.format(units=", ".join(UNIT_LABELS.get(u, u) for u in taken["unit_ambiguous"]))
+                 if taken.get("unit_ambiguous") else None)
+    if ambiguous:
+        note = " ".join(x for x in (note, MSG_UNIT_AMBIGUOUS_TAKEN.format(why=ambiguous)) if x)
+    _register_value(ws, value, span, stub=stub, settled=settled_region, uncertain=uncertain,
+                    ambiguous=ambiguous)  # the last step (KTD2)
     return _value_report(ws, value, settled[3], note, _context_lines(ws, cx, value))
 
 
@@ -7082,6 +7221,10 @@ def tool_calculate(ws: Workspace, expression: str, label: str = "", justificatio
     ids = list(dict.fromkeys(calc.ids_of(node)))
     operands = computation_operands(ws, ids)
     leaves = _leaves(ws, ids)
+    unclear = [i for i in leaves if i in ws.ambiguous_units]
+    if unclear:  # a value whose unit the source leaves ambiguous is never an input (round 15 U1, KTD9)
+        raise ToolError(MSG_UNIT_AMBIGUOUS_INPUT.format(
+            inputs=", ".join(f"{i} «{_input_name(ws, i)}» ({ws.ambiguous_units[i]})" for i in unclear)), "unit_ambiguous")
     _check_available(ws, leaves)
     justification = (justification or "").strip() or None
     try:
@@ -7234,7 +7377,9 @@ TOOLS = [
     _fn("take_value",
         "רישום ערך ממקור S# שקראת בתור הזה, אחרי שהשרת מאמת שהמספר הוא זה שבמיקום שבחרת: תא בטבלה (שורה ועמודה; "
         "השאר null) או ציטוט מדויק מהמקור שהמספר בתוכו (quote ו-number; השאר null), עם משמעות הערך. מחזיר V#. מספר "
-        "שנמצא בשורה או בעמודה אחרת נדחה עם הסיבה; מה שהמקור מעיד על הערך נרשם כשל המקור, והשאר כקביעה שלך. ערך "
+        "שנמצא בשורה או בעמודה אחרת נדחה עם הסיבה; מה שהמקור מעיד על הערך נרשם כשל המקור, והשאר כקביעה שלך. שורת "
+        "טבלה שצוטטה כפי שהיא כתובה (עם \" | \") נרשמת כתא שלה; תווית שנבדלת רק ברווחים או בסימני פיסוק מתאימה; "
+        "יחידה לא ברורה במקור נרשמת בלי אפשרות לחשב איתה; תאריך אינו נרשם. ערך "
         "מאומת שמור (Q# מ-find_measurements) נרשם עם locator ריק (כל השדות null).",
         {"source": {"type": "string",
                     "description": ("S# מהתור הזה (טבלה שנקראה, גם טבלה בקריאה חזותית של inspect, שורת טבלה "
