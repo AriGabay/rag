@@ -1,0 +1,787 @@
+"""A presented number keeps the meaning its evidence gives it: its area basis as written, its period and its
+approximation are carried, and nothing is added that the evidence lacks. Synthetic names, amounts and
+phrasings only; the judge is scripted."""
+
+from __future__ import annotations
+
+import re
+import uuid
+from types import SimpleNamespace
+
+import pytest
+
+from app.chat import meaning
+from app.chat.engine import FinalAnswer
+from app.chat.tools import Measurement, Workspace
+from app.chat.verify import split_units, verify_answer
+from app.providers.llm import Purpose
+from tests.support.scripted_provider import ScriptedProvider
+
+
+def _ws(*texts: str, kind: str = "context") -> Workspace:
+    ws = Workspace(ctx=None)
+    for t in texts:
+        ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="שומת בדיקה", section="תחשיב",
+                      location="סעיף \"תחשיב\"", kind=kind, text=t)
+    return ws
+
+
+def _problems(markdown: str, ws: Workspace) -> list[meaning.MeaningProblem]:
+    (u,) = split_units(markdown)
+    return meaning.check(u, ws)
+
+
+def _answer(markdown: str) -> FinalAnswer:
+    return FinalAnswer(status="answered", answer_markdown=markdown, claims=[], clarification_question="",
+                       missing_info="", referenced_document_ids=[], scope_kind="focused", scope_query="", omitted=[],
+                       focus=None, requested=[], parts=[])
+
+
+def _judge(verdict: str = "supported") -> ScriptedProvider:
+    p = ScriptedProvider()
+    p.on(Purpose.VERIFY, lambda i, input: {"verdicts": [
+        {"index": int(n), "verdict": verdict, "reason": "בדיקה"}
+        for n in re.findall(r'<unit index="(\d+)"', input)]}, repeat=True)
+    return p
+
+
+VALUE = "בפרק התחשיב: השווי למ\"ר אקוו' לנכס ברחוב הצאלון 7 נקבע ל-14,250 ₪, ללא מע\"מ."
+
+
+# --- missing qualifiers -------------------------------------------------------------------------------------
+
+def test_a_dropped_area_basis_is_a_missing_qualifier_with_one_annotation():
+    (p,) = _problems("השווי למ\"ר בצאלון 7 הוא 14,250 ₪ [S1].", _ws(VALUE))
+    assert not p.blocking and p.kind == "basis" and p.annotation == "מ״ר אקוו׳"
+
+
+def test_the_basis_written_in_any_spelling_passes():
+    for said in ("למ\"ר אקוויוולנטי", "למ״ר אקו׳", "למ\"ר אקוו'"):
+        assert _problems(f"השווי {said} בצאלון 7 הוא 14,250 ₪ [S1].", _ws(VALUE)) == []
+
+
+@pytest.mark.parametrize("source,answer,annotation", [
+    ("שטח הדירה בקומה 3 הוא 96 מ\"ר פלדלת.", "שטח הדירה הוא 96 מ\"ר [S1].", "מ״ר פלדלת"),
+    ("לפי היתר הבנייה, שטח המבנה 412 מ\"ר ברוטו.", "שטח המבנה הוא 412 מ\"ר [S1].", "מ״ר ברוטו"),
+    ("דמי הניהול בבניין הם 18 ₪ למ\"ר לחודש.", "דמי הניהול הם 18 ₪ למ\"ר [S1].", "לחודש"),
+    ("התקבולים השנתיים מהחניון נאמדו בכ-310,000 ₪.", "התקבולים השנתיים מהחניון הם 310,000 ₪ [S1].", "מקורב"),
+])
+def test_needed_qualifiers_are_required(source, answer, annotation):
+    (p,) = _problems(answer, _ws(source))
+    assert not p.blocking and p.annotation == annotation
+
+
+def test_a_period_in_the_column_header_is_needed_and_written_there_passes():
+    table = "שכירות בבניין הדולב\nנכס | שכ\"ד לחודש (₪ למ\"ר)\nהדולב 4 | 71\nהדולב 6 | 64"
+    ws = _ws(table, kind="table")
+    (p,) = _problems("בדולב 6 דמי השכירות הם 64 ₪ למ\"ר [S1].", ws)
+    assert p.kind == "period" and p.annotation == "לחודש"
+    assert _problems("בדולב 6 דמי השכירות החודשיים הם 64 ₪ למ\"ר [S1].", ws) == []
+
+
+def test_a_monthly_rent_table_does_not_attest_a_period_for_a_project_total():
+    source = 'שווי הפרויקט הוא 2,730,000 ₪.\nנכס | שכ"ד לחודש (₪ למ"ר)\nהדולב 6 | 64'
+    q = meaning.number_qualifiers(source, frozenset({"2730000", "2,730,000"}), 'שווי הפרויקט הוא 2,730,000 ₪.')
+    assert not q.keys("period")
+    assert _problems('שווי הפרויקט הוא 2,730,000 ₪ [S1].', _ws(source)) == []
+
+
+def test_a_row_label_carries_the_basis():
+    table = "סיכום שווי\nרכיב | ערך\nשווי למ\"ר פלדלת | 11,900\nשווי כולל | 1,130,500"
+    (p,) = _problems("השווי למ\"ר הוא 11,900 ₪ [S1].", _ws(table, kind="table"))
+    assert p.kind == "basis" and p.annotation == "מ״ר פלדלת"
+
+
+def test_an_answer_table_header_counts_for_its_rows():
+    table = "נכס | שכ\"ד לחודש (₪ למ\"ר)\nהדולב 4 | 71"
+    units = split_units("| נכס | שכ\"ד לחודש |\n|---|---|\n| הדולב 4 | 71 ₪ [S1] |")
+    assert meaning.check(units[1], _ws(table, kind="table")) == []
+
+
+def test_two_bases_attested_ask_for_a_repair_without_annotation():
+    src = ("שווי הדירה ברחוב הערבה 2 הוא 12,600 ₪ למ\"ר פלדלת.\n"
+           "בטבלת ההשוואה, הדירה ברחוב הערבה 2 נמכרה ב-12,600 ₪ למ\"ר ברוטו.")
+    (p,) = _problems("בערבה 2 הערך הוא 12,600 ₪ למ\"ר [S1].", _ws(src))
+    assert not p.blocking and p.annotation is None and "פלדלת" in p.reason and "ברוטו" in p.reason
+
+
+def test_the_same_number_with_another_meaning_elsewhere_is_not_required():
+    src = "במגרש 64 חניות תת-קרקעיות.\nדמי השכירות לחניה הם 64 ₪ לחודש."
+    assert _problems("במגרש יש 64 חניות תת-קרקעיות [S1].", _ws(src)) == []
+
+
+def test_a_number_without_qualifiers_in_the_evidence_has_no_problem():
+    assert _problems("מספר הקומות הוא 9 [S1].", _ws("הבניין בן 9 קומות מעל קומת קרקע.")) == []
+
+
+def test_a_cited_measurement_gives_the_qualifiers():
+    ws = _ws("טבלה")
+    # round 12 U9: the stored basis counts as evidence only when its own words are in the measurement's quote
+    row = SimpleNamespace(value_text="8,350", quote="שווי למ\"ר ברוטו 8,350", vat="unknown", metric="שווי למ\"ר",
+                          metric_kind="value_per_area", unit="ILS_per_sqm", period="none", area_basis="ברוטו",
+                          subject="השקמה 11", value_role="appraiser_determination", value_form="exact")
+    ws.measurements["M1"] = Measurement("M1", uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), "שומה", row)
+    (p,) = _problems("השווי למ\"ר בשקמה 11 הוא 8,350 ₪ [M1].", ws)
+    assert p.kind == "basis" and p.annotation == "ברוטו"
+
+
+# --- qualifiers the evidence does not give ---------------------------------------------------------------
+
+def test_an_added_period_is_blocking():
+    ws = _ws("שכ\"ד 63 ₪ למ\"ר לפי הסקר בשכונת רמת האלה.")
+    (p,) = _problems("דמי השכירות הם 63 ₪ למ\"ר לחודש [S1].", ws)
+    assert p.blocking and p.kind == "period"
+    assert _problems("דמי השכירות הם 63 ₪ למ\"ר [S1].", ws) == []
+
+
+def test_a_contradicting_period_is_blocking():
+    ws = _ws("דמי השכירות לנכס נקבעו ל-760 ₪ למ\"ר לשנה.")
+    problems = _problems("דמי השכירות הם 760 ₪ למ\"ר לחודש [S1].", ws)
+    assert any(p.blocking and p.kind == "period" for p in problems)
+
+
+def test_an_added_area_basis_is_blocking():
+    (p,) = _problems("שטח המשרד 240 מ\"ר ברוטו [S1].", _ws("שטח המשרד בקומה הרביעית 240 מ\"ר."))
+    assert p.blocking and p.kind == "basis"
+
+
+def test_a_period_stated_once_for_the_whole_source_attests_it():
+    src = "כל דמי השכירות בטבלה הם לחודש.\nהאורן 3 | 58\nהאורן 5 | 61"
+    assert _problems("באורן 5 דמי השכירות הם 61 ₪ למ\"ר לחודש [S1].", _ws(src, kind="table")) == []
+
+
+def test_qualifiers_belong_to_their_own_number():
+    src = "דמי השכירות 63 ₪ למ\"ר לחודש, והשווי 14,250 ₪ למ\"ר אקוו'."
+    answer = "דמי השכירות 63 ₪ למ\"ר לחודש והשווי 14,250 ₪ למ\"ר אקוו' [S1]."
+    assert _problems(answer, _ws(src)) == []
+
+
+# --- through verification -------------------------------------------------------------------------------------
+
+def test_a_missing_basis_is_judged_and_finally_annotated():
+    ws = _ws(VALUE)
+    a = _answer("השווי למ\"ר בצאלון 7 הוא 14,250 ₪ [S1].")
+    p = _judge("supported")
+    r = verify_answer(p, a, ws, "?", [])
+    assert r.ok and len(p.calls) == 1  # still judged; the server writes the qualifier in itself, so no repair round
+    out = r.apply(a).answer_markdown
+    assert out.startswith("השווי למ\"ר בצאלון 7 הוא 14,250 ₪ (מ״ר אקוו׳, כפי שנכתב במקור) [S1].")
+    assert "הוסרו" not in out
+
+
+def test_a_missing_basis_on_an_unsupported_unit_is_removed_not_annotated():
+    ws = _ws(VALUE)
+    a = _answer("השווי למ\"ר בצאלון 7 הוא 14,250 ₪ [S1].\nהנכס בצאלון 7 מושכר [S1].")
+    r = verify_answer(_judge("unsupported"), a, ws, "?", [])
+    out = r.apply(a).answer_markdown
+    assert "כפי שנכתב במקור" not in out and "14,250" not in out
+
+
+def test_an_added_period_is_removed_and_the_number_stays_without_judging_it():
+    # round 12 U10 (R7, KTD10): the source is silent on the period, so only the added "לחודש" goes; the number it
+    # states stays
+    ws = _ws("שכ\"ד 63 ₪ למ\"ר לפי הסקר בשכונת רמת האלה.")
+    a = _answer("דמי השכירות הם 63 ₪ למ\"ר לחודש [S1].")
+    p = _judge("supported")
+    r = verify_answer(p, a, ws, "?", [])
+    assert [x.kind for x in r.problems] == ["claim"] and not p.calls
+    out = r.apply(a).answer_markdown
+    assert "63" in out and "לחודש" not in out
+
+
+@pytest.mark.parametrize("source,answer", [
+    ("החוזה נחתם לפני שנה, והשווי למ\"ר נקבע ל-9,150 ₪.", "השווי למ\"ר הוא 9,150 ₪ [S1]."),
+    ("תקופת השכירות 12 חודשים, ודמי השכירות 4,700 ₪.", "דמי השכירות הם 4,700 ₪ [S1]."),
+])
+def test_a_duration_or_a_date_is_not_a_period(source, answer):
+    assert _problems(answer, _ws(source)) == []
+
+
+def test_a_slash_period_is_a_period():
+    ws = _ws("דמ\"ש ראויים בגבולות של 47 ₪ למ\"ר/חודש.")
+    assert _problems("דמי השכירות הראויים הם 47 ₪ למ\"ר לחודש [S1].", ws) == []
+    (p,) = _problems("דמי השכירות הראויים הם 47 ₪ למ\"ר [S1].", ws)
+    assert p.kind == "period" and p.annotation == "לחודש"
+
+
+def test_a_basis_of_two_words_is_one_basis():
+    ws = _ws("ראוי לקבוע את השווי למ\"ר בנוי ברוטו למסחר בגבולות של 8,700 ₪.")
+    (p,) = _problems("השווי נקבע 8,700 ₪ [S1].", ws)
+    assert p.annotation == "מ״ר בנוי ברוטו"
+
+
+# --- review fixes -------------------------------------------------------------------------------------------
+
+def test_a_total_abbreviation_is_not_an_approximation():
+    ws = _ws("שווי הבניין: סה״כ 96,250,000 ₪, כולל מע״מ.")
+    assert _problems("שווי הבניין הוא 96,250,000 ₪, כולל מע״מ [S1].", ws) == []
+
+
+def test_a_period_written_before_its_amount_belongs_to_it():
+    ws = _ws("הנכס בשטח 120 מ\"ר, דמי השכירות לחודש 7,560 ₪ ללא מע\"מ.")
+    assert _problems("דמי השכירות הם 7,560 ₪ לחודש [S1].", ws) == []
+    assert _problems("דמי השכירות החודשיים הם 7,560 ₪ [S1].", ws) == []
+    assert _problems("שטח הנכס 120 מ\"ר [S1].", ws) == []  # the period is not the area's
+    (p,) = _problems("דמי השכירות הם 7,560 ₪ [S1].", ws)
+    assert p.kind == "period" and not p.blocking
+
+
+def test_an_approximate_number_written_as_approximate_passes():
+    ws = _ws("התקבולים השנתיים מהחניון נאמדו בכ-310,000 ₪.")
+    assert _problems("התקבולים השנתיים הם כ-310,000 ₪ [S1].", ws) == []
+
+
+# --- meaning stated elsewhere in the same calculation (plan 2026-10-07-1643, KTD5) ---------------------------
+
+CALC = ("תחשיב שווי בגישת היוון ההכנסות:\nרכיב | ערך\nסה\"כ מ\"ר אקווי' | 2,480\nדמ\"ש למ\"ר | ₪ 52\n"
+        "הכנסה שנתית | ₪ 1,547,520\nשווי מעוגל | ₪ 20,630,000\n(*) דמי השכירות בטבלה הם לחודש, ללא מע\"מ.")
+
+
+def test_a_rate_gets_the_basis_of_its_tables_area_row_and_the_period_of_its_notes():
+    found = {p.kind: p for p in _problems("דמי השכירות בתחשיב הם 52 ₪ למ\"ר [S1].", _ws(CALC, kind="table"))}
+    assert found["basis"].annotation == "מ״ר אקווי׳" and not found["basis"].blocking
+    assert found["period"].annotation == "לחודש"
+    # the total of the same table gets neither
+    assert _problems("השווי המעוגל הוא 20,630,000 ₪ [S1].", _ws(CALC, kind="table")) == []
+
+
+def test_a_table_note_qualifies_the_rent_rate_only_when_a_total_is_taken():
+    total = meaning.number_qualifiers(CALC, frozenset({"20630000", "20,630,000"}), 'שווי מעוגל | ₪ 20,630,000')
+    rate = meaning.number_qualifiers(CALC, frozenset({"52"}), 'דמ"ש למ"ר | ₪ 52')
+    assert not total.keys("period")
+    assert rate.keys("period") == {"month"}
+
+
+def test_a_headed_income_table_keeps_the_period_of_its_caption():
+    source = 'ההכנסות בטבלה הן לשנה.\nרכיב | סכום (₪)\nשכירות | 100,000\nחניה | 20,000\nסה״כ | 120,000'
+    for number, row in [('100,000', 'שכירות'), ('20,000', 'חניה'), ('120,000', 'סה״כ')]:
+        assert _periods(source, number, f'{row} | {number}') == {"year"}
+
+
+def test_a_headerless_rent_and_capital_table_keeps_the_period_off_capital():
+    source = CALC.replace('\nרכיב | ערך', '')
+    assert _periods(source, '20,630,000', 'שווי מעוגל | ₪ 20,630,000') == set()
+    assert _periods(source, '52', 'דמ"ש למ"ר | ₪ 52') == {"month"}
+    assert _periods(source, '2,480', 'סה"כ מ"ר אקווי\' | 2,480') == set()
+
+
+def test_a_rent_caption_does_not_give_a_month_to_a_capital_rate():
+    source = CALC + '\nשווי למ"ר | ₪ 8,320'
+    assert _periods(source, '8,320', 'שווי למ"ר | ₪ 8,320') == set()
+
+
+def test_a_rent_caption_does_not_give_a_month_to_a_purchase_price():
+    source = CALC + '\nמחיר רכישה | ₪ 2,000,000'
+    assert _periods(source, '2,000,000', 'מחיר רכישה | ₪ 2,000,000') == set()
+
+
+def test_a_table_with_two_bases_binds_none():
+    two = CALC.replace("דמ\"ש למ\"ר | ₪ 52", "שטח פלדלת במ\"ר | 2,100\nדמ\"ש למ\"ר | ₪ 52")
+    assert not [p for p in _problems("דמי השכירות הם 52 ₪ למ\"ר [S1].", _ws(two, kind="table")) if p.kind == "basis"]
+
+
+def test_text_around_a_table_in_a_long_passage_is_not_the_tables_definition():
+    passage = "\n".join([f"פסקה {i}: תיאור כללי של הנכס." for i in range(5)]
+                        + ["שטח הבניין נמדד במ\"ר אקוו'.", "רכיב | ערך", "דמ\"ש למ\"ר | ₪ 52"])
+    assert not [p for p in _problems("דמי השכירות הם 52 ₪ למ\"ר [S1].", _ws(passage)) if p.kind == "basis"]
+
+
+def test_spellings_of_the_equivalent_basis_are_one_basis_shown_as_written():
+    src = "השווי למ\"ר אקוו' לנכס נקבע ל-14,250 ₪."
+    for said in ("אקווי׳", "אקוי׳", "אקו׳"):
+        assert _problems(f"השווי למ״ר {said} הוא 14,250 ₪ [S1].", _ws(src)) == [], said
+    (p,) = _problems("השווי למ\"ר הוא 52 ₪ [S1].", _ws("השווי למ\"ר אקווי' נקבע ל-52 ₪."))
+    assert p.annotation == "מ״ר אקווי׳"
+
+
+def _same_document(*sections: tuple[str, str]) -> Workspace:
+    ws = Workspace(ctx=None)
+    doc, ver = uuid.uuid4(), uuid.uuid4()
+    for section, t in sections:
+        ws.add_source(document_id=doc, version_id=ver, title="שומת בדיקה", section=section,
+                      location=f"סעיף \"{section}\"", kind="context", text=t)
+    return ws
+
+
+def test_a_correct_period_written_elsewhere_in_the_calculation_is_cited_not_removed():
+    ws = _same_document(("תחשיב", "דמי השכירות הראויים לנכס הם 70 ₪ למ\"ר."),
+                        ("תחשיב", "לאחר התאמות, דמי השכירות הראויים נקבעו ל-70 ₪ למ\"ר לחודש."))
+    (u,) = split_units("דמי השכירות הראויים הם 70 ₪ למ\"ר לחודש [S1].")
+    (p,) = meaning.check(u, ws, meaning.Fetcher(ws))
+    assert p.needs_citation and p.cite == "S2" and not p.blocking and "S2" in u.ids
+    out = verify_answer(_judge(), _answer("דמי השכירות הראויים הם 70 ₪ למ\"ר לחודש [S1]."), ws, "?", [])
+    final = out.apply(_answer("דמי השכירות הראויים הם 70 ₪ למ\"ר לחודש [S1]."))
+    assert out.ok and "לחודש" in final.answer_markdown and "[S1][S2]" in final.answer_markdown
+
+
+def test_the_same_number_with_a_period_in_a_comparables_section_attests_nothing():
+    ws = _same_document(("תחשיב", "דמי השכירות הראויים לנכס הם 70 ₪ למ\"ר."),
+                        ("סקר שוק", "עסקת השוואה ברחוב הערבה: 70 ₪ למ\"ר לחודש."))
+    (u,) = split_units("דמי השכירות הראויים הם 70 ₪ למ\"ר לחודש [S1].")
+    (p,) = meaning.check(u, ws, meaning.Fetcher(ws))
+    assert p.blocking and p.kind == "period" and u.ids == ["S1"]
+
+
+# --- an area basis qualifies an area or a per-area amount, never a total in ₪ or a factor --------------------------
+
+AREA_CALC = ("תחשיב מצב חדש\nמהות | שטח | מקדם אקוו' | סה\"כ מ\"ר אקוו'\nשטח עיקרי | 145 | 1 | 145\n"
+        "שטח חצר | 100 | 0.25 | 25\nמקדם דחיה | | | 0.8712\nשווי מצב חדש | | | 28,940,300")
+
+
+@pytest.mark.parametrize("answer", [
+    "שווי המצב החדש שנקבע הוא 28,940,300 ₪ [S1].",
+    "הובא בחשבון מקדם דחיה של 0.8712 [S1].",
+])
+def test_a_total_or_a_factor_in_an_area_table_is_not_given_the_tables_area_basis(answer):
+    assert _problems(answer, _ws(AREA_CALC, kind="table")) == []
+
+
+def test_an_area_in_the_same_table_still_needs_its_basis():
+    (p,) = _problems("שטח החצר המשוקלל הוא 25 מ\"ר [S1].", _ws(AREA_CALC, kind="table"))
+    assert p.kind == "basis" and "אקוו" in p.annotation
+
+
+def test_the_equivalent_basis_written_without_a_geresh_is_that_basis():
+    src = "שווי הנכס: 8,640 ₪ X 68.40 מ\"ר אקווי'."
+    for said in ("אקווי", "אקוי"):
+        assert _problems(f"בתחשיב השווי הוכפל ב-68.40 מ״ר {said} [S1].", _ws(src)) == [], said
+
+
+def test_a_per_area_amount_named_only_by_its_column_header_still_needs_its_basis():
+    table = "דירות בבניין\nדירה | שטח | שווי למ\"ר\nדירה 3 | 80 | 8,700\nסה\"כ מ\"ר אקוו' | 2,480"
+    (p,) = _problems("השווי של דירה 3 הוא 8,700 ₪ [S1].", _ws(table, kind="table"))
+    assert p.kind == "basis" and "אקוו" in p.annotation
+
+
+def test_a_per_area_word_belongs_to_the_figure_it_follows_in_a_list():
+    answer = ("למצב החדש נרשמו 145 ₪ למ\"ר מבונה, שווי מצב חדש של 28,940,300 ₪, ומקדם דחיה 0.8712 [S1].")
+    numbers = {p.number for p in _problems(answer, _ws(AREA_CALC, kind="table"))}
+    assert not numbers & {"28,940,300", "0.8712"}
+
+
+def test_a_currency_stated_with_a_scale_attests_the_currency():
+    """Round 7 R14: the scale is carried apart (``calc.stated_scale``), so "באלפי ₪" attests ₪ like a plain ₪."""
+    from app.chat.meaning import units_attested
+    assert units_attested("סך ההכנסות (באלפי ₪) 412,300") == {"ILS"}
+    assert units_attested("עלות 5,000,000 ₪") == {"ILS"}
+    assert units_attested("שיעור 17%") == {"percent"}
+    assert units_attested("12 קומות") == set()
+
+
+# --- a period word attests a number of its own line, sentence or governing line only (final evaluation, round 7) ----
+#
+# A feasibility section in thousands: a heading-like line, one figure per paragraph, and a later paragraph on the
+# financing whose "ריבית שנתית" wraps onto the next line — the interest rate's period, in another paragraph.
+
+FEASIBILITY = ("ממצאי בדיקת הכדאיות לפרויקט באלפי ₪ לא כולל מע״מ\nסה״כ הכנסות היזם 117,860\n"
+               "סה״כ הוצאות (כולל מימון ועקיפות) 104,610-\nרווח שוטף (הפסד) 13,250\nשיעור רווח לעלות (הפסד) 12.7%\n"
+               "הבדיקה נערכה על בסיס הנחות היזם, לרבות מימון בנקאי בריבית שנתית\nשל 6% לכל תקופת ההקמה.")
+
+
+def _periods(text: str, number: str, within: str) -> set[str]:
+    return meaning.number_qualifiers(text, frozenset(meaning.numbers_in(number)), within).keys("period")
+
+
+@pytest.mark.parametrize("number, within", [
+    ("104,610", "סה״כ הוצאות (כולל מימון ועקיפות) 104,610-"),
+    ("13,250", "רווח שוטף (הפסד) 13,250"),
+    ("12.7", "שיעור רווח לעלות (הפסד) 12.7%"),
+])
+def test_an_interest_rates_year_in_another_paragraph_is_not_the_totals_period(number, within):
+    assert _periods(FEASIBILITY, number, within) == set()
+
+
+def test_an_interest_rates_period_is_the_rates_own():
+    assert _periods("המימון הבנקאי בריבית שנתית של 6% לכל תקופת ההקמה.", "6", "בריבית שנתית של 6%") == {"year"}
+    # a line on the financing above the figures states the rate's period, not theirs
+    above = "המימון חושב בריבית שנתית.\nסה״כ הוצאות 104,610"
+    assert _periods(above, "104,610", "סה״כ הוצאות 104,610") == set()
+
+
+@pytest.mark.parametrize("text, number, within", [
+    ("סה״כ ההכנסות מהחניון 310,000 ₪ לשנה.", "310,000", "ההכנסות מהחניון 310,000"),  # its own line
+    ("ההכנסות המוצגות להלן הן לשנה\nהכנסות מהחניון 310,000\nהכנסות מהמחסנים 42,500", "42,500", "המחסנים 42,500"),
+    ("דמי השכירות לנכס נקבעו ל-310,000 ₪\nלשנה, בהתאם להסכם.", "310,000", "נקבעו ל-310,000 ₪"),  # wrapped
+])
+def test_a_genuine_period_on_the_values_line_its_sentence_or_its_heading_line_still_attests_it(text, number, within):
+    assert _periods(text, number, within) == {"year"}
+
+
+def test_a_period_in_a_later_paragraph_is_not_the_figures():
+    text = "סה״כ הכנסות היזם 117,860\nרווח שוטף 13,250\nההצמדה למדד מחושבת לשנה."
+    assert _periods(text, "13,250", "רווח שוטף 13,250") == set()
+    # nor does it attest a period an answer gives the figure
+    (p,) = _problems("הרווח השוטף הוא 13,250 ₪ לשנה [S1].", _ws(text))
+    assert p.blocking and p.kind == "period"
+
+
+@pytest.mark.parametrize("source", [
+    "ההכנסות המוצגות להלן הן לשנה\nהכנסות מהחניון 310,000",
+    "הכנסות מהחניון 310,000 ₪\nלשנה, בהתאם להסכם.",
+])
+def test_a_governing_period_is_required_when_the_answer_omits_it(source):
+    (p,) = _problems("הכנסות מהחניון הן 310,000 ₪ [S1].", _ws(source))
+    assert not p.blocking and p.kind == "period" and p.annotation == "לשנה"
+
+
+def test_a_period_heading_does_not_cross_a_numbered_new_section():
+    source = "ההכנסות לשנה\nהכנסות 100\n8. סיכום עלויות הפרויקט\nעלות כוללת 450"
+    assert _periods(source, "450", "עלות כוללת 450") == set()
+
+
+def test_a_wrapped_interest_rate_keeps_its_own_period():
+    source = "מימון בנקאי בריבית שנתית\nשל 6% לכל תקופת ההקמה."
+    assert _periods(source, "6", "של 6% לכל תקופת ההקמה") == {"year"}
+
+
+def test_an_expanded_source_can_attest_its_governing_period():
+    ws = _ws("הכנסות מהחניון 310,000")
+    original = ws.sources["S1"]
+    expanded = ws.add_source(document_id=original.document_id, version_id=original.version_id,
+                             title=original.title, section=original.section, location="", kind="context",
+                             text="ההכנסות לשנה\nהכנסות מהחניון 310,000")
+    (unit,) = split_units("הכנסות מהחניון הן 310,000 ₪ לשנה [S1].")
+    assert meaning.Fetcher(ws).attesting(unit, frozenset(meaning.numbers_in("310,000")),
+                                        "period", "year", set()) == expanded.sid
+
+
+@pytest.mark.parametrize("context, units", [
+    ("מספר יח\"ד בפרויקט", {"units"}),
+    ("מקדם התאמה", {"ratio"}),
+    ("מספר השנים שנותרו בחכירה", set()),
+    ("מספר חודשי הגרייס", set()),
+])
+def test_a_count_is_units_but_a_number_of_years_is_not(context, units):
+    from app.chat.meaning import units_attested
+
+    assert units_attested(context) == units
+
+
+def test_a_line_above_on_another_kind_gives_no_period_to_a_capital_value():
+    source = 'השוכר משלם בנוסף דמי ניהול לחודש.\nשווי השוק של הנכס הינו 3,200,000 ₪.'
+    assert _periods(source, '3,200,000', 'שווי השוק של הנכס הינו 3,200,000 ₪') == set()
+    noted = 'ההכנסות להלן הן לשנה\nהכנסות משכירות 480,000 ₪'
+    assert _periods(noted, '480,000', 'הכנסות משכירות 480,000 ₪') == {"year"}
+
+
+# --- identifiers, years and absence sentences are not amounts (round 9 U12, KTD10, R22) -----------------------------
+
+PERMIT = "היתר בנייה מס׳ 638 מיום 01.11.1966, בתוקף לשנה. דמי האגרה 70 ₪ לחודש."
+
+
+@pytest.mark.parametrize("answer", [
+    "היתר הבנייה הוא מס׳ 638, מיום 01.11.1966 [S1].",
+    "היתר הבנייה הוא מס׳ 638, מיום 01.11.1966. [S1]",
+    "היתר מספר 638 מיום 01.11.1966 [S1].",
+    "ההיתר הוא No 638 [S1].",
+    "ההיתר הוא #638 [S1].",
+])
+def test_a_permit_number_and_the_year_of_its_date_are_not_amounts(answer):
+    # the source puts "לשנה" near them: neither the number nor the year is an amount that needs (or lacks) a period
+    assert _problems(answer, _ws(PERMIT)) == []
+
+
+def test_a_year_alone_is_not_an_amount_but_a_year_with_a_currency_is():
+    ws = _ws("השומה נכונה לשנת 2019, לחודש. דמי השכירות 2019 ₪ לחודש.")
+    assert _problems("השומה נכונה לשנת 2019 [S1].", ws) == []
+    (p,) = _problems("דמי השכירות הם 2019 ₪ [S1].", ws)
+    assert p.kind == "period" and p.annotation == "לחודש"
+
+
+def test_the_amount_next_to_an_identifier_is_still_checked():
+    (p,) = _problems("דמי האגרה לפי היתר מס׳ 638 הם 70 ₪ [S1].", _ws(PERMIT))
+    assert p.kind == "period" and p.annotation == "לחודש" and p.number == "70"
+
+
+@pytest.mark.parametrize("answer", [
+    "לא צוין אם הסכום של 70 ₪ כולל מע\"מ [S1].",
+    "לא צוינה תקופה לסכום של 70 ₪ [S1].",
+    "הסכום 70 ₪ אינו מופיע במסמך [S1].",
+])
+def test_an_absence_sentence_gets_no_number_meaning_check(answer):
+    assert _problems(answer, _ws(PERMIT)) == []
+
+
+def test_only_the_absence_clause_is_exempt():
+    (p,) = _problems("דמי האגרה 70 ₪; לא צוין אם יש היטל נוסף [S1].", _ws(PERMIT))
+    assert p.kind == "period" and p.annotation == "לחודש"
+
+
+# --- per-attribute provenance (round 12 U9, R6, R8, KTD9, AE5) --------------------------------------------------
+#
+# A registered value's period and area basis back a claim only when its source states them: the record of a field
+# the model asserted is no evidence, and only the words of the value's own quote can attest it. A stored measurement's
+# period or basis counts only when its own words are in the measurement's quote (or caption, header). Synthetic text.
+
+from decimal import Decimal  # noqa: E402
+
+from app.chat import calc  # noqa: E402
+from app.chat import tools as T  # noqa: E402
+
+RENT_QUOTE = "שכר דירה 5,000 ₪"
+RENT_QUOTE_MONTHLY = "שכר דירה 5,000 ₪ לחודש"
+SOURCE_ALL = {"unit": "source", "vat": "source", "area_basis": "source", "period": "source"}
+
+
+def _registered(written: str, quote: str, *, period: str = "none", area_basis: str = "", unit: str = "ILS",
+                provenance: dict | None = None, kind: str = "rent") -> Workspace:
+    """A workspace whose V1 is a registered value of an invented property: ``period`` and ``area_basis`` as its record
+    holds them, each with the ``provenance`` entry given (default: all from the source)."""
+    ws = Workspace(ctx=None)
+    ws.values["V1"] = calc.Value("V1", Decimal(written.replace(",", "")), written, "S1", uuid.uuid4(), uuid.uuid4(),
+                                 None, "שומת הדגמה", "סעיף 3", "דמי שכירות", kind, unit, period, "unknown",
+                                 area_basis, "נכס הדגמה", "other", SOURCE_ALL | (provenance or {}),
+                                 {"quote": quote}, quote)
+    return ws
+
+
+def test_a_model_asserted_period_is_no_evidence_for_the_same_period_in_the_answer():
+    """AE5: V1 registered from a quote that states no period, the model having asserted "month": the number is the
+    source's, the period is not."""
+    ws = _registered("5,000", RENT_QUOTE, period="month", provenance={"period": "model_asserted"})
+    (p,) = _problems("שכר הדירה הוא 5,000 ₪ לחודש [V1].", ws)
+    assert p.blocking and p.kind == "period"
+    assert _problems("שכר הדירה הוא 5,000 ₪ [V1].", ws) == []  # nothing the source lacks is asked for either
+
+
+def test_a_model_asserted_period_is_attested_when_the_values_own_quote_states_it():
+    ws = _registered("5,000", RENT_QUOTE_MONTHLY, period="month", provenance={"period": "model_asserted"})
+    assert _problems("שכר הדירה הוא 5,000 ₪ לחודש [V1].", ws) == []
+    (p,) = _problems("שכר הדירה הוא 5,000 ₪ לשנה [V1].", ws)  # the quote's own word still decides
+    assert p.blocking and p.kind == "period"
+
+
+def test_a_source_given_period_of_the_record_is_attested():
+    ws = _registered("5,000", RENT_QUOTE, period="month")
+    assert _problems("שכר הדירה הוא 5,000 ₪ לחודש [V1].", ws) == []
+
+
+def test_a_model_asserted_basis_is_no_evidence_and_is_not_demanded():
+    quote = "שטח הדירה 96 מ\"ר"
+    ws = _registered("96", quote, unit="sqm", area_basis="פלדלת", provenance={"area_basis": "model_asserted"},
+                     kind="area")
+    (p,) = _problems("שטח הדירה הוא 96 מ\"ר פלדלת [V1].", ws)
+    assert p.blocking and p.kind == "basis"
+    assert _problems("שטח הדירה הוא 96 מ\"ר [V1].", ws) == []
+    stated = _registered("96", "שטח הדירה 96 מ\"ר פלדלת", unit="sqm", area_basis="פלדלת",
+                         provenance={"area_basis": "model_asserted"}, kind="area")
+    assert _problems("שטח הדירה הוא 96 מ\"ר פלדלת [V1].", stated) == []
+
+
+# --- a stored measurement's period and basis need their own words in what it quotes -----------------------------
+
+def _measured(quote: str, **fields) -> Workspace:
+    ws = _ws("טבלה")
+    row = SimpleNamespace(value_text="5,000", quote=quote, vat="unknown", metric="שכר דירה", metric_kind="rent",
+                          unit="ILS", period="none", area_basis=None, subject="הדולב 4",
+                          value_role="appraiser_determination", value_form="exact")
+    for k, v in fields.items():
+        setattr(row, k, v)
+    ws.measurements["M1"] = Measurement("M1", uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), "שומה", row)
+    return ws
+
+
+def test_a_stored_period_that_neither_the_quote_nor_the_header_states_is_not_attested():
+    ws = _measured(RENT_QUOTE, period="year")
+    (p,) = _problems("שכר הדירה הוא 5,000 ₪ לשנה [M1].", ws)
+    assert p.blocking and p.kind == "period"
+    assert _problems("שכר הדירה הוא 5,000 ₪ [M1].", ws) == []  # and no period is demanded of the answer
+
+
+def test_a_stored_period_its_quote_states_is_attested_and_a_header_in_the_quote_counts():
+    assert _problems("שכר הדירה הוא 5,000 ₪ לשנה [M1].", _measured("שכר דירה 5,000 ₪ לשנה", period="year")) == []
+    by_header = _measured("שכר דירה שנתי: 5,000", period="year")
+    assert _problems("שכר הדירה הוא 5,000 ₪ לשנה [M1].", by_header) == []
+
+
+def test_a_stored_basis_the_quote_does_not_write_is_not_attested():
+    ws = _measured("שווי למ\"ר 8,350", value_text="8,350", metric_kind="value_per_area", unit="ILS_per_sqm",
+                   area_basis="ברוטו")
+    assert _problems("השווי למ\"ר הוא 8,350 ₪ [M1].", ws) == []
+    (p,) = _problems("השווי למ\"ר ברוטו הוא 8,350 ₪ [M1].", ws)
+    assert p.blocking and p.kind == "basis"
+
+
+def test_measurement_states_follows_the_extraction_checks_for_each_field():
+    row = SimpleNamespace(quote="דמי ניהול 18 ₪ למ\"ר לחודש, ללא מע\"מ", period="month", vat="excluded",
+                          area_basis="")
+    assert meaning.measurement_states(row, "period") and meaning.measurement_states(row, "vat")
+    assert not meaning.measurement_states(SimpleNamespace(**{**vars(row), "period": "year"}), "period")
+    assert not meaning.measurement_states(SimpleNamespace(**{**vars(row), "vat": "included"}), "vat")
+    assert not meaning.measurement_states(SimpleNamespace(**{**vars(row), "period": "unknown"}), "period")
+    assert not meaning.measurement_states(SimpleNamespace(**{**vars(row), "quote": "דמי ניהול 18 ₪ למ\"ר"}),
+                                          "period")
+    # the caption or header of the table, when the row carries them, states it too
+    assert meaning.measurement_states(SimpleNamespace(quote="הדולב 4 | 71", period="month", header="שכ\"ד לחודש"),
+                                      "period")
+
+
+# --- the anchor of each source attribute, recorded when the value is taken ----------------------------------------
+
+DOC, VER = uuid.UUID(int=11), uuid.UUID(int=12)
+
+
+def _source(text: str, kind: str = "context") -> T.Source:
+    return T.Source(sid="S1", document_id=DOC, version_id=VER, title="שומה סינתטית", section="5. תחשיב",
+                    location="עמוד 3", kind=kind, text=text, block_start=0, block_end=0, reading_id="r1",
+                    status="complete")
+
+
+def _given(**kw) -> dict:
+    return {"kind": "rent", "unit": "ILS", "period": "unknown", "vat": "unknown", "area_basis": "",
+            "subject": "הנכס", "role": "other", "stated_by": "", "stance": "unknown", "scenario": ""} | kw
+
+
+def _register(ws: Workspace, taken: dict, given: dict, src: T.Source) -> calc.Value:
+    settled = T._settle(taken, given, ())
+    return T._new_value(ws, src, "S1", taken, settled, given, "תווית", (), "r1")
+
+
+def test_a_period_vat_and_kind_in_the_quoted_sentence_are_anchored_to_the_sentence():
+    text = "דמי הניהול בבניין הם 18 ₪ למ\"ר לחודש, ללא מע\"מ."
+    src = _source(text)
+    taken = T._take_quote(src, text, {"quote": text, "number": "18"}, [(0, text, 1)])
+    v = _register(Workspace(ctx=None), taken, _given(kind="management_fee", unit="ILS_per_sqm"), src)
+    assert (v.period, v.vat) == ("month", "excluded")
+    assert v.meaning_from["period"] == {"part": "sentence", "written": "לחודש"}
+    assert v.meaning_from["vat"]["part"] == "sentence" and "מע" in v.meaning_from["vat"]["written"]
+    assert v.meaning_from["kind"] == {"part": "sentence", "written": "ניהול"}
+    assert v.meaning_from["unit"] == "quote"  # the unit keeps its earlier shape
+
+
+def test_what_the_model_asserted_has_no_anchor():
+    text = "דמי הניהול בבניין הם 18 ₪."
+    src = _source(text)
+    taken = T._take_quote(src, text, {"quote": text, "number": "18"}, [(0, text, 1)])
+    v = _register(Workspace(ctx=None), taken, _given(kind="management_fee", period="month", vat="included",
+                                                     area_basis="פלדלת"), src)
+    assert {k: v.provenance[k] for k in ("period", "vat", "area_basis")} == {
+        "period": "model_asserted", "vat": "model_asserted", "area_basis": "model_asserted"}
+    assert not {"period", "vat", "area_basis"} & set(v.meaning_from)
+    assert v.meaning_from["kind"]["part"] == "sentence"  # the sentence names the kind: that one is the source's
+
+
+TABLE = {"headers": ["נכס", "שכר דירה חודשי (₪)", "שטח (מ\"ר פלדלת)"], "caption": "שכירות בבניין הדולב (נתונים סינתטיים)",
+         "title": [], "notes": ["הסכומים ללא מע\"מ"], "rows": [{"cells": ["הדולב 4", "5,000", "96"], "page": 1}]}
+
+
+def _cell_value(column: str, **given) -> calc.Value:
+    full = T._table_text(TABLE, TABLE["rows"])
+    src = _source(full, "table")
+    taken = T._cell_of(src, full, {"row": "הדולב 4", "column": column}, TABLE, 0)
+    return _register(Workspace(ctx=None), taken, _given(**given), src)
+
+
+def test_a_period_in_the_column_header_is_source_provenanced_with_the_header_anchor():
+    v = _cell_value("שכר דירה חודשי (₪)")
+    assert v.period == "month" and v.provenance["period"] == "source"
+    assert v.meaning_from["period"] == {"part": "header", "written": "חודשי"}
+    assert v.meaning_from["vat"] == {"part": "note", "written": "ללא מע\"מ"}
+    ws = Workspace(ctx=None)
+    ws.values["V1"] = v
+    assert _problems("שכר הדירה הוא 5,000 ₪ לחודש [V1].", ws) == []  # attested from the record, not the quote
+
+
+def test_an_area_basis_in_the_column_header_is_anchored_to_the_header():
+    v = _cell_value("שטח (מ\"ר פלדלת)", kind="area", unit="sqm")
+    assert v.provenance["area_basis"] == "source" and v.meaning_from["area_basis"]["part"] == "header"
+    assert "פלדלת" in v.meaning_from["area_basis"]["written"]
+
+
+def test_the_qualifiers_a_source_gives_carry_the_part_that_states_them():
+    table = "שכירות בבניין הדולב\nנכס | שכ\"ד לחודש (₪ למ\"ר)\nהדולב 4 | 71"
+    q = meaning.number_qualifiers(table, frozenset({"71"}), "הדולב 4 | 71")
+    assert q.parts["period"]["month"] == "header"
+    q = meaning.number_qualifiers("דמי הניהול הם 18 ₪ לחודש.", frozenset({"18"}), "דמי הניהול הם 18 ₪ לחודש.")
+    assert q.parts["period"]["month"] == "sentence"
+
+
+# --- a calculation reads only the periods and bases a source states ---------------------------------------------
+
+def test_the_operand_of_a_value_whose_period_the_model_asserted_has_an_unknown_period():
+    stated = _registered("5,000", RENT_QUOTE_MONTHLY, period="month").values["V1"]
+    asserted = _registered("5,000", RENT_QUOTE, period="month", provenance={"period": "model_asserted"}).values["V1"]
+    assert stated.operand().period == "month" and asserted.operand().period == "unknown"
+    plain = _registered("5,000", RENT_QUOTE, period="none", provenance={"period": "not_stated"}).values["V1"]
+    assert plain.operand().period is None  # a capital or one-time amount keeps having no period
+
+
+def test_a_basis_the_model_asserted_is_not_the_operands_basis():
+    stated = _registered("96", "שטח הדירה 96 מ\"ר פלדלת", unit="sqm", area_basis="פלדלת", kind="area").values["V1"]
+    asserted = _registered("96", "שטח הדירה 96 מ\"ר", unit="sqm", area_basis="פלדלת", kind="area",
+                           provenance={"area_basis": "model_asserted"}).values["V1"]
+    assert stated.operand().basis == "פלדלת" and asserted.operand().basis == ""
+
+
+def test_a_sum_of_a_stated_and_an_asserted_month_goes_through_the_unknown_period_assumption():
+    stated = _registered("5,000", RENT_QUOTE_MONTHLY, period="month").values["V1"]
+    asserted = _registered("3,000", RENT_QUOTE, period="month", provenance={"period": "model_asserted"}).values["V1"]
+    asserted.vid = "V2"
+    operands = {"V1": stated.operand(), "V2": asserted.operand()}
+    with pytest.raises(calc.CalcError, match="תקופה"):  # the existing mixed-period guard asks for a justification
+        calc.evaluate(calc.parse("V1 + V2"), operands, None)
+    out = calc.evaluate(calc.parse("V1 + V2"), operands, "שני הסכומים לחודש לפי הדוח")
+    assert any("תקופה" in c for c in out.conditional)  # and the result is conditional on the period of one
+    other = _registered("3,000", RENT_QUOTE_MONTHLY, period="month").values["V1"]
+    other.vid = "V2"
+    out = calc.evaluate(calc.parse("V1 + V2"), {"V1": stated.operand(), "V2": other.operand()}, None)
+    assert not out.conditional and out.period == "month"
+
+
+# --- an adopted measurement carries its date (round 12 U4, KTD14, R17) ----------------------------------------------------
+
+def _stored(quote: str, **kw) -> SimpleNamespace:
+    """A stored measurement row of the subject property as the fetcher reads it (synthetic), with its table's caption and
+    column header as the fetcher's query adds them."""
+    base = dict(id=uuid.uuid4(), document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="שומת בדיקה", metric="דמי שכירות",
+                metric_kind="rent_per_area", value_text="55 ₪", quote=quote, effective_date=None, caption=None,
+                header=None, block_index=3, table_index=0, row_index=1, period="month", area_basis="", vat="unknown",
+                value_form="exact", section="תחשיב", status="auto_validated", anchor_lost=None, subject_role="appraised_property",
+                value_role="appraiser_determination", value=55)
+    return SimpleNamespace(**(base | kw))
+
+
+def test_a_measurement_adopted_from_a_table_whose_caption_states_its_year_is_dated_by_it():
+    ws = Workspace(ctx=None)
+    row = _stored("דמי שכירות: 55 ₪", caption="שכר דירה לשנת 2023")
+    mid = meaning.Fetcher(ws).adopt(row)
+    as_of = ws.measurements[mid].as_of
+    assert (as_of["date"], as_of["precision"], as_of["provenance"]) == ("2023", "year", "source_table")
+
+
+def test_a_measurement_adopted_with_a_date_in_its_quote_is_dated_by_the_quote():
+    ws = Workspace(ctx=None)
+    mid = meaning.Fetcher(ws).adopt(_stored("דמי השכירות הם 55 ₪ למ\"ר לחודש נכון ל-01/03/2023"))
+    as_of = ws.measurements[mid].as_of
+    assert (as_of["date"], as_of["provenance"]) == ("2023-03-01", "source")
+
+
+def test_a_measurement_adopted_with_no_date_anywhere_stays_unknown_and_is_shown_as_such():
+    from app.chat import timeline
+
+    ws = Workspace(ctx=None)
+    mid = meaning.Fetcher(ws).adopt(_stored("דמי שכירות: 55 ₪", caption="שכר דירה"))
+    assert ws.measurements[mid].as_of is None
+    assert timeline.shown(ws.measurements[mid].as_of) == timeline.MSG_UNKNOWN_DATE
+
+
+def test_a_measurement_found_again_keeps_the_date_it_was_stamped_with():
+    ws = Workspace(ctx=None)
+    row = _stored("דמי שכירות: 55 ₪", caption="שכר דירה לשנת 2023")
+    fetcher = meaning.Fetcher(ws)
+    mid = fetcher.adopt(row)
+    assert fetcher.adopt(row) == mid and ws.measurements[mid].as_of["date"] == "2023"
+
+
+def test_a_period_given_by_the_column_header_is_stated_for_the_measurement():
+    """The fetcher's query adds the column header, so a period the header states backs a claim (U9, `measurement_states`)."""
+    row = _stored("55 ₪", header="דמי שכירות לחודש")
+    assert meaning.measurement_states(row, "period")
+    assert not meaning.measurement_states(_stored("55 ₪", header="דמי שכירות"), "period")
+
+
+def test_the_fetcher_query_reads_each_rows_table_caption_and_column_header_with_the_row():
+    """The caption and the header come in the one subject-measurement query (no second read): the fragments the query is
+    built from name both columns."""
+    assert "AS caption" in meaning.TABLE_TEXT_COLUMNS and "AS header" in meaning.TABLE_TEXT_COLUMNS
+    assert "extracted_tables" in meaning.TABLE_TEXT_JOIN

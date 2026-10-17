@@ -1,18 +1,8 @@
 import { expect, test } from "@playwright/test";
-import {
-  answerCards,
-  ask,
-  conditionsOf,
-  deleteOfficeBDocsByTitle,
-  fixture,
-  login,
-  resolveClarifications,
-  shot,
-  USERS,
-} from "./helpers";
+import { deleteOfficeBDocsByTitle, fixture, login, sendAndWait, shot, USERS } from "./helpers";
 
-// Gate 8 full flow, office B admin: upload → per-file result → status → review approve → ask → clarification →
-// numeric answer → sources → source PDF. Office B only; office A data is never modified.
+// Full flow, office B admin: upload → per-file result → status and reading summary → review approve → ask in the
+// chat → sources → source panel → source PDF. Office B only; office A data is never modified.
 const FILE = "D5_synthetic_harozim_mixed_formats.pdf";
 const TITLE = "D5 synthetic harozim mixed formats";
 
@@ -25,7 +15,7 @@ test.describe("full flow (office B)", () => {
   test("upload, review, approve, ask, clarify, answer, open source", async ({ page }) => {
     test.setTimeout(300_000);
     await login(page, USERS.adminB);
-    await page.getByRole("navigation", { name: "ניווט ראשי" }).getByRole("link", { name: "מסמכים" }).click();
+    await page.getByRole("link", { name: "מסמכים" }).first().click();
     await expect(page).toHaveURL(/\/documents$/);
 
     // 1. Upload through the file input; per-file result.
@@ -43,6 +33,9 @@ test.describe("full flow (office B)", () => {
       .filter({ hasNotText: "נמחק" });
     await expect(row).toHaveCount(1);
     await expect(row.getByRole("status", { name: /^סטטוס: (מוכן|דורש בדיקה)$/ })).toBeVisible({ timeout: 180_000 });
+    // What was read is shown apart from structured records: passages and tables, not only "records".
+    await expect(row).toContainText(/\d+ קטעים/);
+    await expect(row).toContainText("רשומות עסקאות");
 
     // 3. Open the document's review queue from the per-file result.
     await results.getByRole("button", { name: "פרטים" }).click();
@@ -51,6 +44,7 @@ test.describe("full flow (office B)", () => {
     await expect(panel.getByRole("status", { name: /^סטטוס: (מוכן|דורש בדיקה)$/ })).toBeVisible();
     await panel.getByRole("link", { name: "לבדיקת הנתונים של המסמך" }).click();
     await expect(page).toHaveURL(/\/review\?document_id=/);
+    await page.getByRole("tab", { name: "רשומות עסקה" }).click();
     await expect(page.getByText("מסונן למסמך אחד")).toBeVisible();
 
     const queue = page.getByRole("complementary", { name: "תור הבדיקה" });
@@ -78,41 +72,23 @@ test.describe("full flow (office B)", () => {
     await expect(detail.getByText("הרשומה אושרה.")).toBeVisible();
     await expect(detail.getByText("הערת בדיקה: נבדק מול המקור בבדיקת דפדפן")).toBeVisible();
 
-    // 6. Ask in chat; the clarification options are the primary path.
-    await page.getByRole("navigation", { name: "ניווט ראשי" }).getByRole("link", { name: "שאלות" }).click();
-    await page.getByRole("button", { name: "שיחה חדשה", exact: true }).click();
-    await ask(page, "מה מחיר למ״ר ברמת גן בשכונת חרוזים בשנת 2024?");
-    const clar = page.getByRole("group", { name: "אפשרויות הבהרה" });
-    await expect(clar.getByRole("button", { name: "מחירי עסקאות" })).toBeVisible();
-    await expect(answerCards(page).last()).toContainText("לאיזה נתון הכוונה?");
-    const asked = await resolveClarifications(page, [/^מחירי עסקאות$/, /^תאריך העסקה$/]);
-    expect(asked.length).toBeGreaterThanOrEqual(2);
+    // 6. Ask in the chat. Office B has cloud use off here, so the reply is plainly labelled as search results with
+    // their sources, never presented as an analyzed answer.
+    await page.goto("/chat");
+    await page.getByRole("button", { name: "שיחה חדשה" }).first().click();
+    const reply = await sendAndWait(page, "מחיר למ״ר ברמת גן בשכונת חרוזים");
+    await expect(reply).toContainText("תוצאות חיפוש בלבד");
+    await expect(reply.locator(".cite").first()).toBeVisible();
+    await page.screenshot({ path: shot("chat-limited-mode.png"), fullPage: true });
 
-    // 7. Numeric answer card with labeled mean and weighted figures.
-    const card = answerCards(page).last();
-    await expect(card.getByText("ממוצע מחירי המ״ר", { exact: true })).toBeVisible();
-    await expect(card.getByText("מחיר משוקלל = סך מחירים חלקי סך שטחים", { exact: true })).toBeVisible();
-    const figures = card.locator(".figure-value bdi");
-    await expect(figures).toHaveCount(2);
-    for (const v of await figures.allInnerTexts()) expect(v).toMatch(/^\d{1,3}(,\d{3})*(\.\d+)? ₪ למ״ר$/);
-    await expect(card.getByText(/מבוסס על \d+ רשומות ייחודיות/)).toBeVisible();
-    const conds = await conditionsOf(card);
-    expect(conds["עיר"]).toBe("רמת גן");
-    expect(conds["שכונה"]).toBe("חרוזים");
-    expect(conds["סוג הנתון"]).toBe("מחירי עסקאות");
+    // 7. A source opens beside the thread at its place in the document, with the original file one click away.
+    await reply.locator(".cite").first().click();
+    const sourcePanel = page.getByRole("complementary", { name: "תצוגת מקור" });
+    await expect(sourcePanel).toContainText(TITLE);
+    const href = await sourcePanel.getByRole("link", { name: "הורדת הקובץ המקורי" }).getAttribute("href");
+    expect(href).toMatch(/^\/api\/documents\/[^/]+\/versions\/[^/]+\/file$/);
 
-    // 8. Sources list; each source links to the authenticated file endpoint at a page.
-    const sources = card.getByRole("region", { name: "מקורות" });
-    await expect(sources.getByRole("heading", { name: "מקורות" })).toBeVisible();
-    const links = sources.getByRole("link");
-    expect(await links.count()).toBeGreaterThan(0);
-    const href = await links.first().getAttribute("href");
-    expect(href).toMatch(/^\/api\/documents\/[^/]+\/versions\/[^/]+\/file#page=\d+$/);
-    await expect(links.first()).toHaveAttribute("target", "_blank");
-    await card.scrollIntoViewIfNeeded();
-    await page.screenshot({ path: shot("chat-numeric-answer.png"), fullPage: true });
-
-    // 9. Opening the source returns the PDF with the page's own session cookie.
+    // 8. Opening the source returns the PDF with the page's own session cookie.
     const fetched = await page.evaluate(async (url) => {
       const res = await fetch(url, { credentials: "same-origin" });
       const buf = new Uint8Array(await res.arrayBuffer());
@@ -121,17 +97,5 @@ test.describe("full flow (office B)", () => {
     expect(fetched.status).toBe(200);
     expect(fetched.type).toContain("application/pdf");
     expect(fetched.magic).toBe("%PDF-");
-
-    // Clicking the link opens the source in a new tab (noopener) that loads the PDF with the session cookie.
-    const path = href!.split("#")[0];
-    const [popup, request] = await Promise.all([
-      page.waitForEvent("popup"),
-      page.context().waitForEvent("request", (r) => new URL(r.url()).pathname === path),
-      links.first().click(),
-    ]);
-    const response = await request.response();
-    expect(response?.status()).toBe(200);
-    expect(response?.headers()["content-type"]).toContain("application/pdf");
-    await popup.close();
   });
 });

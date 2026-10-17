@@ -9,6 +9,9 @@ two. We normalize in the application, identically for indexed text and queries:
 - drop thousands separators inside numbers (1,250,000 -> 1250000)
 - for Hebrew words starting with a one-letter prefix (ו ה ב ל מ ש כ) add the stripped form as
   an extra token, so both 'ברמת' and 'רמת' are searchable
+- light inflection (KTD10): plural and construct suffixes add singular-form tokens on both sides
+  ('דירות' -> 'דירה', 'חדרים' -> 'חדר', construct 'שיקולי' -> 'שיקולים', 'שיקול'). A morphological rule,
+  not topic vocabulary. Changing these rules changes indexed text: run ``scripts/reindex_text.py``.
 """
 
 from __future__ import annotations
@@ -61,17 +64,41 @@ def prefix_variants(word: str) -> list[str]:
     return variants
 
 
+def inflection_variants(word: str) -> list[str]:
+    """Singular forms for plural/construct suffixes: -ות -> -ת/-ה, -ים -> stem, construct -ת -> -ה, and
+    construct plural -י -> -ים and stem ('שיקולי' -> 'שיקולים', 'שיקול', the same stem '-ים' yields).
+    Only when at least three stem letters remain, so short words are never truncated."""
+    variants: list[str] = []
+    if len(word) >= 5 and word.endswith("ות"):
+        variants += [word[:-2] + "ת", word[:-2] + "ה"]
+    elif len(word) >= 5 and word.endswith("ים"):
+        variants.append(word[:-2])
+    elif len(word) >= 4 and word.endswith("ת"):
+        variants.append(word[:-1] + "ה")
+    elif len(word) >= 4 and word.endswith("י"):
+        variants += [word[:-1] + "ים", word[:-1]]
+    return variants
+
+
+def _word_variants(word: str) -> list[str]:
+    """Prefix-stripped forms, and inflection variants of the word and of each stripped form."""
+    out = prefix_variants(word)
+    for w in [word, *out]:
+        out = out + inflection_variants(w)
+    return out
+
+
 def normalize_for_search(text: str) -> str:
-    """Normalized text plus prefix-stripped variants, for tsvector and trigram indexing."""
+    """Normalized text plus prefix-stripped and inflection variants, for tsvector and trigram indexing."""
     base = base_normalize(text)
     extra: list[str] = []
     for m in _HEB_WORD.finditer(base):
-        extra.extend(prefix_variants(m.group(0)))
+        extra.extend(_word_variants(m.group(0)))
     return base if not extra else f"{base} {' '.join(extra)}"
 
 
 def query_tokens(query: str) -> list[str]:
-    """Tokens for an OR-style tsquery: base tokens plus prefix-stripped variants."""
+    """Tokens for an OR-style tsquery: base tokens plus prefix-stripped and inflection variants."""
     base = base_normalize(query)
     tokens: list[str] = []
     for raw in re.findall(r"[\w״׳./]+", base):
@@ -81,6 +108,38 @@ def query_tokens(query: str) -> list[str]:
             continue
         tokens.append(tok)
         if _HEB_WORD.fullmatch(tok):
-            tokens.extend(prefix_variants(tok))
+            tokens.extend(_word_variants(tok))
     seen: set[str] = set()
     return [t for t in tokens if not (t in seen or seen.add(t))]
+
+
+# --- negation (one vocabulary for search, interpretation and composition) ---------------------------
+
+# Negation and absence words. "אל" is also the preposition "to" ("פונה אל הרחוב"): it is listed (the
+# prohibitive "don't") but marked ambiguous, so callers that read running text can leave it out.
+NEGATION_WORDS = frozenset(
+    "לא אין אינו אינה אינם אינן איננו איננה ללא בלי מבלי אל היעדר העדר בהיעדר בהעדר".split()
+)
+AMBIGUOUS_NEGATIONS = frozenset({"אל"})
+# Prefixes a negation takes ("ואין", "שלא", "כשאין", "וללא"). Not ב/ל/מ/כ alone: "מלא" (full) and
+# "כלא" (prison) are not negations.
+_NEGATION_PREFIXES = ("וכש", "וש", "כש", "ו", "ש")
+
+
+def is_negation(word: str, *, ambiguous: bool = True) -> bool:
+    """Whether a normalized word is a negation, bare or after a conjunction/relative prefix ("ואין",
+    "שלא"). With ``ambiguous=False`` words that are also prepositions ("אל") never count; an ambiguous
+    word counts only bare ("שאל" is "asked", "ואל" is "and to")."""
+    def listed(w: str, bare: bool) -> bool:
+        return w in NEGATION_WORDS and (w not in AMBIGUOUS_NEGATIONS or (ambiguous and bare))
+
+    return listed(word, True) or any(
+        word.startswith(p) and listed(word[len(p):], False) for p in _NEGATION_PREFIXES)
+
+
+def undouble_word(word: str) -> str:
+    """A word whose every character appears twice in a row (``'ההננככסס'``, ``'2200,,550000'``) read once: what an
+    older reader extracted from a bold font drawn twice, before char dedupe. Any other word is returned as is."""
+    if len(word) >= 2 and len(word) % 2 == 0 and word[0::2] == word[1::2]:
+        return word[0::2]
+    return word

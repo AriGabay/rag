@@ -10,12 +10,17 @@ Orientation is decided with a cheap check: Hebrew final letters (ך ם ן ף ץ)
 text, so reversed text puts them at word starts (and leaves non-final כ מ נ פ צ at word ends). Label
 colons and sentence periods give the same signal (``'עיר:'`` vs ``':ריע'``).
 
+A font whose character map is broken writes the right glyphs but the wrong characters into the text layer
+(``'הðכס'`` for ``'הנכס'``). ``suspect_positions`` finds such characters inside Hebrew words; the repair itself is
+in ``fontmap``, and ``quality_score`` takes the share of words it could not repair as a corruption signal.
+
 Text is content only: nothing here interprets what the text says (R29).
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
 
 QUALITY_THRESHOLD = 0.8
 
@@ -64,14 +69,19 @@ def orientation_evidence(text: str) -> tuple[int, int]:
     return logical, visual
 
 
-def looks_visual(text: str, margin: int = 1) -> bool | None:
-    """True = visual order, False = logical, None = no decision at this margin."""
-    logical, visual = orientation_evidence(text)
+def visual_from_evidence(logical: int, visual: int, margin: int = 1) -> bool | None:
+    """True = visual order, False = logical, None = no decision at this margin. Evidence adds up over words, so a
+    document's counts are the sum of its pages' counts."""
     if visual - logical >= margin:
         return True
     if logical - visual >= margin:
         return False
     return None
+
+
+def looks_visual(text: str, margin: int = 1) -> bool | None:
+    """True = visual order, False = logical, None = no decision at this margin."""
+    return visual_from_evidence(*orientation_evidence(text), margin)
 
 
 def _balanced(s: str) -> bool:
@@ -163,10 +173,14 @@ def _is_good_char(ch: str) -> bool:
     return ch in "₪—–…•°’‘“”€$·"
 
 
-def quality_score(text: str) -> float:
+def quality_score(text: str, corruption: float = 0.0) -> float:
     """Score in [0, 1]: share of expected characters (Hebrew, Latin, digits, punctuation), penalized
     for replacement characters / mojibake, too little alphanumeric content, too little text, and text
-    whose orientation check says it is still in visual order."""
+    whose orientation check says it is still in visual order.
+
+    ``corruption`` is the share of the text's Hebrew words that carry a font-map corruption no verified repair
+    fixed (``fontmap``): it scales the score down, so such a page scores lower even when the wrong characters are
+    few. Without it the score is what the characters alone give."""
     chars = [c for c in strip_bidi_controls(text) if not c.isspace()]
     total = len(chars)
     if total == 0:
@@ -182,4 +196,48 @@ def quality_score(text: str) -> float:
         score *= logical / (logical + visual)
     if total < 15:
         score *= total / 15
+    if corruption > 0:
+        score *= max(0.0, 1.0 - corruption)
     return round(max(0.0, min(1.0, score)), 3)
+
+
+# --- broken character maps ---------------------------------------------------------------------------------------
+
+_WORD_JOINERS = "\u05f3\u05f4\"'"  # geresh / gershayim inside an abbreviation (מ״ר, ש׳)
+
+
+def is_hebrew_letter(ch: str) -> bool:
+    return "\u05d0" <= ch <= "\u05ea"
+
+
+def letter_like(ch: str) -> bool:
+    """A letter of any script, or a private-use glyph (a font's own code for a glyph it did not map)."""
+    return ch.isalpha() or unicodedata.category(ch) == "Co"
+
+
+def suspect_positions(text: str) -> list[int]:
+    """Indices of characters in ``text`` that can only be a broken font map: a letter of another script (not ASCII
+    Latin) or a private-use glyph inside a Hebrew word. A Hebrew word is a run of letters (with niqqud, and geresh /
+    gershayim between letters) holding at least one Hebrew letter and no ASCII Latin letter, so a Latin word that
+    legitimately has ``ð`` and a mixed token such as ``הPDF`` give nothing."""
+    out: list[int] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        if not letter_like(text[i]):
+            i += 1
+            continue
+        j = i
+        while j < n:
+            ch = text[j]
+            if letter_like(ch) or unicodedata.category(ch) == "Mn":
+                j += 1
+            elif ch in _WORD_JOINERS and j + 1 < n and letter_like(text[j + 1]) and j > i:
+                j += 1
+            else:
+                break
+        run = text[i:j]
+        if any(is_hebrew_letter(c) for c in run) and not any(c.isascii() and c.isalpha() for c in run):
+            out.extend(i + k for k, c in enumerate(run) if letter_like(c) and not is_hebrew_letter(c))
+        i = j
+    return out
