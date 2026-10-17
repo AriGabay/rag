@@ -57,6 +57,7 @@ Both answers turned the appraisal's parallel components into competing values, a
 1. **A facet on every value and measurement** (`datum.py`). The source's component, consideration or cash flow, with its part and tier:
    - **Own tier:** the row or column label, or the value's own purpose phrase.
    - **Context tier:** the caption, the list lead-in, or the nearest heading within three blocks of its section.
+     Round 14 replaced this tier with a bounded, evidence-based context reader; see `datum-context-is-lost-between-extraction-cache-and-display.md`.
    - **Never a facet:** a label the model wrote.
 2. **One pairwise decision: same, different or undecided** (`datum.relation`).
    - "Same" pairs are joined into classes by union-find inside the old key (`timeline.buckets`).
