@@ -47,7 +47,7 @@ proportion (a reduction of 10%) are in two buckets and ``datum.relation`` never 
 families' buckets are paired where every other key field matches (``adjustments``) and ``datum.reconciles`` decides each pair of
 one appraisal unit and one date: a reconciled pair is one row of the components table (the coefficient first, then the reduction, and
 the C# of ``1 − Vn`` that ``register_derived`` made while the payload was built); a pair that does not reconcile is a conflict marked
-on both rows. A datum whose key fields are unknown is keyed by its source span, so two registrations of one number are one datum.
+on both rows, and ``adjustment_conflicts`` gives these pairs to ``coverage.conflicting``, which reads the same two rules. A datum whose key fields are unknown is keyed by its source span, so two registrations of one number are one datum.
 
 **The final answer's rows** (round 14 U6, KTD7, KTD8, R9, R11, R13, R16): ``cited`` — the ids the *final* text uses (its citations and the
 inputs and leaves of its calculations, read after every verification edit) — decides what the components table holds. A block needs two
@@ -84,8 +84,10 @@ from dataclasses import dataclass, field
 from datetime import date
 
 from app.chat import datum as D
+from app.chat.anchors import CONTEXT_QUOTE_MAX
 from app.chat.dates import is_after_anchor
 from app.chat.meaning import basis_key
+from app.chat.slots import clip
 from app.chat.timeframe import coverage_note
 from app.chat.tools import (
     KIND_LABELS,
@@ -132,7 +134,6 @@ CONTEXT_LOCATIONS = {
     D.PART_CAPTION: "כותרת הטבלה", D.PART_LIST_ITEM: "פריט ברשימה", D.PART_LABEL: "תווית השורה",
 }
 MSG_CONTEXT_LOCATION = "ההקשר של הערך"
-CONTEXT_QUOTE_MAX = 120
 DATE_KINDS = {"valuation": "מועד קובע", "transaction": "מועד עסקה", "stated": "מועד שצוין", "range": "תקופה"}
 MARKS = {"forecast": "תחזית", "conflict": "סתירה בין מקורות", "undecided": "השוואה לא הוכרעה",
          "outside_requested": "מחוץ לזמן שביקשת", "uncertain": "קריאה לא ודאית", "unknown_date": "מועד לא ידוע"}
@@ -567,13 +568,10 @@ def _classify(key: tuple, members: list[Datum]) -> Bucket:
     return Bucket(key, members, sorted(by_root.values(), key=lambda c: c[0].index), pairs)
 
 
-ADJUSTMENT_FAMILIES = ("coefficient", "proportion")
-
-
 def _adjustable(fields: tuple | None) -> bool:
     """Whether a datum's key fields are those of a coefficient or a proportion in the fraction form: the two families that can
     be one adjustment written twice (round 14 U4, KTD6)."""
-    return bool(fields) and len(fields) > 1 and fields[0] in ADJUSTMENT_FAMILIES and fields[1] == "fraction"
+    return bool(fields) and len(fields) > 1 and fields[0] in D.FACET_FAMILIES and fields[1] == "fraction"
 
 
 def _pair_key(fields: tuple | None) -> tuple | None:
@@ -604,7 +602,7 @@ def buckets(ws: Workspace, cited: Collection[str] | None, identity: Callable[[Da
                 families.setdefault(_pair_key(d.fields), set()).add(d.fields[0])
         have = {d.ref for d in wanted}
         wanted = wanted + [d for d in everything if d.ref not in have and _adjustable(d.fields)
-                           and d.fields[0] not in families.get(_pair_key(d.fields), ADJUSTMENT_FAMILIES)]
+                           and d.fields[0] not in families.get(_pair_key(d.fields), D.FACET_FAMILIES)]
     cache: dict = {}
     alone = {f for f, n in Counter(_pair_key(d.fields) for d in everything if d.fields is not None).items() if n == 1}
 
@@ -698,11 +696,6 @@ class _View:
     claims: dict[str, dict] | None = None
 
 
-def _clip(text: str, size: int) -> str:
-    text = " ".join((text or "").split())
-    return text if len(text) <= size else text[:size].rstrip()
-
-
 def _component_state(d: Datum) -> dict:
     """The component of a row as the response states it (round 14 U6, KTD8): the facet's state and reason (a state that is not
     ``stated`` always has a reason), the words, where they were read and their tier, and — for a facet read from the context, never
@@ -719,7 +712,7 @@ def _component_state(d: Datum) -> dict:
         reason = f.get("reason") or (D.REASON_NOT_IN_RANGE if status == D.STATUS_NONE else REASON_OTHER)
     context = None
     if f.get("tier") == D.TIER_CONTEXT and status in (D.STATUS_STATED, D.STATUS_UNPARSED):
-        quote = _clip(f.get("written") or "", CONTEXT_QUOTE_MAX) if status == D.STATUS_STATED else ""
+        quote = clip(f.get("written") or "", CONTEXT_QUOTE_MAX) if status == D.STATUS_STATED else ""
         context = {"location": CONTEXT_LOCATIONS.get(f.get("part"), MSG_CONTEXT_LOCATION), "quote": quote or None,
                    "anchor": None}
     return {"status": status, "reason": reason, "written": f.get("written") if status == D.STATUS_STATED else None,
@@ -743,7 +736,7 @@ def _comparison(d: Datum, view: _View, named: dict[str, list[str]], conflict: bo
     if conflict:
         return {"status": "conflict", "with": named["conflict_with"]}
     if undecided:
-        return {"status": "undecided", "with": named["undecided_with"]}
+        return {"status": D.UNDECIDED, "with": named["undecided_with"]}
     bucket = view.bucket_of.get(d.ref)
     same: list[str] = []
     different: list[str] = []
@@ -758,8 +751,8 @@ def _comparison(d: Datum, view: _View, named: dict[str, list[str]], conflict: bo
     if d.ref in view.absorbed:
         same.append(view.absorbed[d.ref].ref)
     if different:
-        return {"status": "different", "with": different}
-    return {"status": "same", "with": same} if same else {"status": "single", "with": []}
+        return {"status": D.DIFFERENT, "with": different}
+    return {"status": D.SAME, "with": same} if same else {"status": "single", "with": []}
 
 
 def _claim_of(d: Datum, view: _View) -> dict | None:
@@ -793,13 +786,8 @@ def _state(d: Datum, view: _View, named: dict[str, list[str]], conflict: bool, u
             "reason": component["reason"] if component["status"] != D.STATUS_STATED else comparison["status"]}
 
 
-def _row(ws: Workspace, d: Datum, conflicts: dict[str, list[str]], undecided: dict[str, list[str]] | None = None, *,
-         view: _View, merged: Datum | None = None) -> dict:
-    """A timeline row. ``conflicts``: the counterparts' sids of every conflict pair a datum is in; ``undecided``: the same for
-    the pairs that could not be compared. A mark names only counterparts that have a row on screen (``view.screen``); one that has
-    not is in ``not_in_answer_with`` (sid, title, location) and the mark stays (round 14 U6, KTD7, R13); a counterpart the answer
-    uses that has no row (its table was left with one used row) is named in neither. A row of a value the answer does not use carries ``note`` (``MSG_HISTORY``). Every row carries its structured ``state`` (KTD8)."""
-    undecided = undecided or {}
+def _marks(ws: Workspace, d: Datum, conflicts: dict[str, list[str]], undecided: dict[str, list[str]]) -> list[str]:
+    """The marks of a datum's row, in the order the row shows them."""
     marks = []
     if d.forecast:
         marks.append("forecast")
@@ -813,11 +801,27 @@ def _row(ws: Workspace, d: Datum, conflicts: dict[str, list[str]], undecided: di
         marks.append("uncertain")
     if not d.dated:
         marks.append("unknown_date")
+    return marks
+
+
+def _unit_label(d: Datum) -> str | None:
+    return UNIT_LABELS.get(d.unit) or None
+
+
+def _source(d: Datum) -> dict:
+    return {"document_id": d.document_id, "title": d.title, "location": d.location or None}
+
+
+def _row(ws: Workspace, d: Datum, conflicts: dict[str, list[str]], undecided: dict[str, list[str]] | None = None, *,
+         view: _View, merged: Datum | None = None) -> dict:
+    """A timeline row. ``conflicts``: the counterparts' sids of every conflict pair a datum is in; ``undecided``: the same for
+    the pairs that could not be compared. A mark names only counterparts that have a row on screen (``view.screen``); one that has
+    not is in ``not_in_answer_with`` (sid, title, location) and the mark stays (round 14 U6, KTD7, R13); a counterpart the answer
+    uses that has no row (its table was left with one used row) is named in neither. A row of a value the answer does not use carries ``note`` (``MSG_HISTORY``). Every row carries its structured ``state`` (KTD8)."""
+    undecided = undecided or {}
     row = {"date": d.as_of["date"] if d.dated else None, "precision": d.as_of.get("precision") if d.dated else None,
            "end": d.as_of.get("end") if d.dated else None, "date_kind": _date_kind(d), "value_text": d.written,
-           "unit": UNIT_LABELS.get(d.unit) or None, "sid": d.ref,
-           "source": {"document_id": d.document_id, "title": d.title, "location": d.location or None},
-           "marks": marks}
+           "unit": _unit_label(d), "sid": d.ref, "source": _source(d), "marks": _marks(ws, d, conflicts, undecided)}
     named: dict[str, list[str]] = {}
     for key, found in (("undecided_with", undecided.get(d.ref)), ("conflict_with", conflicts.get(d.ref))):
         named[key] = [x for x in found or [] if x in view.screen]
@@ -838,7 +842,11 @@ def _facet_text(d: Datum) -> str:
     for the state and reason (``FACET_TEXT``) — the source names none in the range read, the read left it open and why, or the context
     was not read and why. A family that needs no component keeps ``MSG_NO_FACET``. "Not read" is never "not stated in the source". No
     truncation: a long facet wraps."""
-    state = _component_state(d)
+    return _facet_of(_component_state(d))
+
+
+def _facet_of(state: dict) -> str:
+    """``_facet_text`` of a component state already computed (``_component_state``)."""
     status, reason = state["status"], state["reason"]
     if status == D.STATUS_STATED:
         return state["written"] or MSG_NO_FACET
@@ -869,27 +877,28 @@ def _label(members: list[Datum], who: Identity, *, with_facet: bool = True) -> s
 
 
 def _component_row(ws: Workspace, d: Datum, conflicts: dict[str, list[str]], undecided: dict[str, list[str]],
-                   reduction: Datum | None = None, derived: str | None = None, *, view: _View) -> dict:
+                   *, view: _View) -> dict:
     """A row of the components table: the facet (its own written words, else the sentence of its state), the value, unit, sid, source
     and marks, and its structured ``state`` (round 14 U6, KTD8); ``undecided_with`` names the counterpart of an undecided mark, as in
-    the timeline. ``reduction`` (round 14 U4, KTD6, R8): the proportion that is one minus this coefficient — one adjustment, one row,
-    the coefficient first — as ``reduction`` ``{"sid", "value_text", "unit", "source"}``, with ``derived`` the C# of ``1 − Vn`` (None
-    while none is registered); the row then carries the marks and counterparts of both."""
+    the timeline. The reduction (round 14 U4, KTD6, R8; ``view.absorbed``): the proportion that is one minus this coefficient — one
+    adjustment, one row, the coefficient first — as ``reduction`` ``{"sid", "value_text", "unit", "source"}``, with ``derived`` the C#
+    of ``1 − Vn`` (None while none is registered); the row then carries the marks and counterparts of both."""
+    reduction = view.absorbed.get(d.ref)
+    derived = derived_for(ws, d.ref) if reduction is not None else None
     if reduction is not None:  # the row stands for both data: it names the counterparts of either
         conflicts = _joined(conflicts, d, reduction)
         undecided = _joined(undecided, d, reduction)
     row = _row(ws, d, conflicts, undecided, view=view, merged=reduction)
-    out = {"facet": _facet_text(d), "value_text": row["value_text"], "unit": row["unit"], "sid": row["sid"],
+    out = {"facet": _facet_of(row["state"]["component"]), "value_text": row["value_text"], "unit": row["unit"], "sid": row["sid"],
            "source": row["source"], "marks": row["marks"]}
     for key in ("undecided_with", "conflict_with", "not_in_answer_with", "note", "state"):
         if key in row:
             out[key] = row[key]
     if reduction is not None:
-        other = _row(ws, reduction, conflicts, undecided, view=view)
-        out["reduction"] = {"sid": other["sid"], "value_text": other["value_text"], "unit": other["unit"],
-                            "source": other["source"]}
+        out["reduction"] = {"sid": reduction.ref, "value_text": reduction.written, "unit": _unit_label(reduction),
+                            "source": _source(reduction)}
         out["derived"] = derived
-        out["marks"] = out["marks"] + [m for m in other["marks"] if m not in out["marks"]]
+        out["marks"] = out["marks"] + [m for m in _marks(ws, reduction, conflicts, undecided) if m not in out["marks"]]
     return out
 
 
@@ -932,8 +941,8 @@ def adjustments(built: Iterable[Bucket], cited: Collection[str] = ()) -> list[Ad
         held.setdefault((key[0], *key[3:]), {}).setdefault(key[1], []).extend(rows)
     found: list[Adjustment] = []
     for sides in held.values():
-        for c in sorted(sides.get("coefficient", ()), key=lambda d: d.index):
-            for p in sorted(sides.get("proportion", ()), key=lambda d: d.index):
+        for c in sorted(sides.get(D.COEFFICIENT, ()), key=lambda d: d.index):
+            for p in sorted(sides.get(D.PROPORTION, ()), key=lambda d: d.index):
                 if c.date_key() != p.date_key():
                     continue
                 if (decision := D.reconciles(c, p)) != D.UNRELATED:
@@ -949,6 +958,23 @@ def adjustments(built: Iterable[Bucket], cited: Collection[str] = ()) -> list[Ad
     return out
 
 
+def adjustment_conflicts(ws: Workspace, keep: Callable[[Datum], bool] | None = None,
+                         identity: Callable[[Datum], Identity] | None = None, everything: list[Datum] | None = None
+                         ) -> list[tuple[Datum, Datum]]:
+    """The (coefficient, proportion) pairs the table marks ``conflict`` across the two families (round 14 U4, KTD6; review #3): a
+    coefficient and a proportion of one consideration that ``datum.reconciles`` does not reconcile. ``coverage.conflicting`` reads
+    these with ``Bucket.conflicts``, so "the sources conflict" has one reader: the pairs inside a datum class and the pairs across
+    the two forms of one adjustment. ``keep``: only a pair whose two data it accepts counts (the ``document_ids`` and ``ids`` of
+    ``coverage.conflicting``); ``everything``: the turn's ``datums`` when the caller already has them."""
+    everything = datums(ws) if everything is None else everything
+    asked = {d.ref for d in everything if _adjustable(d.fields) and (keep is None or keep(d))}
+    if not asked:
+        return []
+    built = buckets(ws, asked, identity, everything, pair=True)
+    return [(a.coefficient, a.proportion) for a in adjustments(built)
+            if a.decision == D.CONFLICT and (keep is None or (keep(a.coefficient) and keep(a.proportion)))]
+
+
 def reconciled(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None
                ) -> list[Adjustment]:
     """The coefficients of the ``cited`` ids (or the reductions) that are one adjustment with a proportion (or a coefficient) of
@@ -958,19 +984,13 @@ def reconciled(ws: Workspace, cited: Collection[str], identity: Callable[[Datum]
     return [a for a in adjustments(buckets(ws, cited, identity, pair=True), cited) if a.decision == D.RECONCILED]
 
 
-def _derived_expressions(ref: str) -> frozenset[str]:
-    from app.chat import calc
-
-    return frozenset(calc.render(calc.parse(e), lambda i: i) for e in (f"1 - {ref}", f"(1 - {ref}) * 100"))
-
-
 def derived_for(ws: Workspace, coefficient: str) -> str | None:
     """The C# the server derived as the reduction of a coefficient (``verify.derive_reduction``: ``1 − Vn``, or its percent
     form), or None while none is registered."""
     from app.chat import calc
 
-    forms = _derived_expressions(coefficient)
-    return next((c.cid for c in ws.computations.values() if c.result_kind == calc.DERIVED and c.expression in forms), None)
+    c = calc.find_derived(ws.computations, calc.derived_forms(coefficient))
+    return c.cid if c is not None else None
 
 
 def register_derived(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], Identity] | None = None) -> set[str]:
@@ -1133,8 +1153,7 @@ def compose(ws: Workspace, cited: Collection[str], identity: Callable[[Datum], I
     breakdown_out = [
         {"label": _label(block["rows"], identity(block["rows"][0]), with_facet=False),
          "as_of": _block_as_of(block["rows"][0]),
-         "rows": [_component_row(ws, d, plan.conflicts, plan.undecided, plan.absorbed.get(d.ref),
-                                 derived_for(ws, d.ref) if d.ref in plan.absorbed else None, view=view) for d in block["rows"]]}
+         "rows": [_component_row(ws, d, plan.conflicts, plan.undecided, view=view) for d in block["rows"]]}
         for block in components]
     return timeline_out, breakdown_out
 
@@ -1314,7 +1333,7 @@ def _unit_claim(report, unit) -> dict | None:
     from app.chat import verify
 
     records = [r for r in report.claims.get(unit.index, []) if r.verdict in verify.RECORD_VERDICTS and r.action not in verify.ROW_ACTIONS]
-    problems = [p for p in report.problems if p.unit.index == unit.index and p.severity == "partial" and p.resolution != "cut"]
+    problems = report.partial_problems(unit.index)
     failing = next((r for r in records if r.verdict in ("unsupported", "contradicts")), None)
     unchecked = next((r for r in records if r.verdict == "unchecked"), None)
     if failing is not None:
@@ -1326,9 +1345,7 @@ def _unit_claim(report, unit) -> dict | None:
         p = next((p for p in problems if p.claim_id in named), problems[0] if problems else None)
         if p is None:
             return {"result": "partial", "reason": "unspecified"}
-        reason = ("recency" if p.check == verify.RECENCY_CHECK else p.failure_kind if p.failure_kind in verify.FAILURE_KINDS
-                  else "final" if p.check == "final" else "unspecified")
-        return {"result": "partial", "reason": reason}
+        return {"result": "partial", "reason": verify.partial_reason_class(p.failure_kind, p.check)}
     return {"result": "supported", "reason": None} if records else None
 
 

@@ -26,6 +26,7 @@ from sqlalchemy import text
 from app.chat import datum, timeline
 from app.chat import tools as T
 from app.chat.compose import SERVER_SPANS_FIELD
+from app.chat.verify import PARTIAL_SENTENCES
 from app.db import tenant_tx
 from app.measurements.extract import EXTRACTION_VERSION
 from tests.integration.test_chat_inspect import emp
@@ -673,11 +674,23 @@ def test_ae11_current_describing_the_document_raises_no_recency_problem_under_pa
     no_extra_model_calls(m, steps)
 
 
-@pytest.mark.parametrize("words", ["בשומה האחרונה השווי", "השווי העדכני"])
+@pytest.mark.parametrize("words", ["בשומה האחרונה השווי", "השווי העדכני", "ההערכה הנוכחית"])
 def test_ae11_the_latest_appraisal_and_the_latest_value_still_raise_the_recency_problem(client, partial, monkeypatch, words):
     m, steps = recency_turn(client, partial, monkeypatch, words, insists=True)
     assert "recency_claim" in json.dumps(m_diagnostics(client, m), ensure_ascii=False)
     assert "1,950,000" in m["answer"]["markdown"] and m["answer"]["verification"]["removed"] == 0, "supported content is marked, not removed"
+    # the mark of a check that names no claim (the recency check) still pairs with the log: one partials row with the fixed
+    # recency sentence, one mark in the text over the same claim ids, and one diagnostics entry for each of them (review #8)
+    a = m["answer"]
+    (row,) = a["verification"]["partials"]
+    assert row["text"] == PARTIAL_SENTENCES["recency"] and row["check"] == "recency_claim" and row["claim_ids"]
+    (span,) = [x for x in a[SERVER_SPANS_FIELD] if x["kind"] == "partial_mark"]
+    assert span["claim_ids"] and span["claim_ids"] == row["claim_ids"] and span["ordinal"] == row["ordinal"] == 1
+    removed = m_diagnostics(client, m)["removed"]
+    for claim_id in row["claim_ids"]:
+        (entry,) = [e for e in removed if e["claim_id"] == claim_id]
+        assert entry["action"] == "qualified" and entry["supported"] and entry["not_verified"]
+        assert entry["why"]["check"] == "recency_claim"
     no_extra_model_calls(m, steps, exhausted=False)
 
 

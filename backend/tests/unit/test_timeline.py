@@ -1184,6 +1184,46 @@ def test_a_coefficient_and_a_reduction_that_do_not_reconcile_are_a_conflict_mark
     assert timeline.register_derived(o.ws, {c, r}) == set(), "nothing reconciles: no C#"
 
 
+def test_two_borrowed_facets_in_two_sections_with_disagreeing_amounts_are_undecided_not_two_components():
+    """Review (round 14), the narrowed "different": a restated adjustment worded differently in two sections of one appraisal
+    (both facets read from the text above the value, neither the value's own) is not decided different, so the table marks
+    the pair ``undecided`` instead of showing two components that can never conflict."""
+    o = Office()
+    doc, ver = _unit(o)
+    a = o.value(doc, "10", as_of("2025-03-31"), kind="rate", unit="percent", version=ver, section="3. מגרש 12",
+                facet=datum.facet("עוצמת ניצול", "preceding_sentence", "context", block=3, sentence=0))
+    b = o.value(doc, "15", as_of("2025-03-31"), kind="rate", unit="percent", version=ver, section="7. סיכום",
+                facet=datum.facet("גמישות שימושים", "paragraph", "context", block=9, sentence=0))
+    (bucket,) = [x for x in timeline.buckets(o.ws, {a, b}) if a in {d.ref for d in x.members}]
+    assert list(bucket.pairs.values()) == [datum.UNDECIDED] and len(bucket.classes) == 2
+    own = o.value(doc, "15", as_of("2025-03-31"), kind="rate", unit="percent", version=ver, section="7. סיכום",
+                  facet=datum.facet("סחירות", "sentence", "own"))
+    (bucket,) = [x for x in timeline.buckets(o.ws, {a, own}) if a in {d.ref for d in x.members}]
+    assert datum.DIFFERENT in bucket.pairs.values(), "beside a true own facet it is the reported shape: two components"
+
+
+def test_a_coefficient_and_a_reduction_that_do_not_reconcile_are_a_conflict_coverage_sees_too_and_a_reconciled_pair_is_not():
+    """Round 14 review #3: one reader of "conflict". The table marks a 0.9 coefficient and a 15% reduction of one consideration
+    as a conflict, so ``coverage.conflicting`` (the reader of a model's "the sources conflict" claim) must say so too; the
+    reconciled 0.9 / 10% pair is neither. The ``document_ids`` and ``ids`` filters still apply."""
+    o = Office()
+    doc, ver = _unit(o)
+    c = _row_coefficient(o, doc, ver, "0.9", "מקדם מיקום")
+    r = _reduction(o, doc, ver, "15", "מיקום", "בשל מיקום נקבעה הפחתה של 15%")
+    (block,) = timeline.breakdown(o.ws, {c, r})
+    assert all(row["marks"] == ["conflict"] for row in block["rows"])
+    assert coverage.conflicting(o.ws) is True
+    assert coverage.conflicting(o.ws, [str(doc)]) is True and coverage.conflicting(o.ws, ["other-doc"]) is False
+    assert coverage.conflicting(o.ws, ids={c, r}) is True
+    assert coverage.conflicting(o.ws, ids={c}) is False, "a filter that leaves one side out compares nothing"
+    ok = Office()
+    doc2, ver2 = _unit(ok)
+    c2 = _row_coefficient(ok, doc2, ver2, "0.9", "מקדם מיקום")
+    r2 = _reduction(ok, doc2, ver2, "10", "מיקום", "בשל מיקום נקבעה הפחתה של 10%")
+    assert len(timeline.reconciled(ok.ws, {c2, r2})) == 1 and timeline.breakdown(ok.ws, {c2, r2}) == []
+    assert coverage.conflicting(ok.ws) is False and coverage.conflicting(ok.ws, ids={c2, r2}) is False
+
+
 def test_a_conflicting_pair_with_no_components_table_of_its_own_is_a_block_of_its_two_rows():
     o = Office()
     doc, ver = _unit(o)

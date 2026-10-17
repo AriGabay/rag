@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type {
   ChatAnswer,
   ChatCheckedSource,
@@ -42,6 +42,9 @@ export interface ExpandAll {
   tick: number;
   open: boolean;
 }
+
+/** The partial marks of a viewer who has none to open: one stable array, so a prop never changes identity for nothing. */
+export const NO_PARTIALS: ChatPartialRow[] = [];
 
 /** A "verified in part" mark the owner pressed (round 14 U8, KTD9): which mark, the claims it covers (each is one entry of the
  * diagnostics route) and a counter so that pressing the same mark again moves the focus to its entries again. */
@@ -148,6 +151,7 @@ export function RemovalsSection({
   onOpenSource?: (nav: ViewerNav) => void;
 }) {
   const byId = new Map(components.map((c) => [c.id, c]));
+  const rowIds = useMemo(() => new Set(removals.map((r) => r.claim_id).filter((x): x is string => !!x)), [removals]);
   const shared = useRef<SharedDiagnostics | null>(null);
   const diagnostics = useCallback(
     (signal: AbortSignal): Promise<ChatDiagnostics> => {
@@ -213,11 +217,11 @@ export function RemovalsSection({
       {otherChanges > 0 && (
         <OtherChanges
           count={otherChanges}
-          rowIds={new Set(removals.map((r) => r.claim_id).filter((x): x is string => !!x))}
+          rowIds={rowIds}
           diagnostics={diagnostics}
           onOpenSource={onOpenSource}
           partialFocus={partialFocus ?? null}
-          partials={partials ?? []}
+          partials={partials ?? NO_PARTIALS}
         />
       )}
     </>

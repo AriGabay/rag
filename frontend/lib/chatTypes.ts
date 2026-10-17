@@ -295,11 +295,28 @@ export interface ChatComputation {
  * a label or subject the model wrote. `own`: the value's own row, column or sentence; `context`: the caption, lead-in or
  * heading. `none`: read, and the source states none; `not_read`: not read. Absent on older answers. */
 export interface ChatFacet {
-  status: "stated" | "none" | "not_read";
+  status: ChatRowComponentStatus;
+  /** Why it is not stated (absent on older answers; null for `stated`). */
+  reason?: ChatComponentReason | null;
   written: string | null;
-  part: "row" | "column" | "label" | "caption" | "sentence" | "lead_in" | "heading" | null;
+  part: ChatComponentPart | null;
   tier: "own" | "context" | null;
 }
+
+/** Where a component was read from (`datum.py` `PART_*`): the value's own `row`, `column`, `label` (the label of a short line or list
+ * item) or `sentence`; or, around it, a `caption`, `lead_in`, `heading`, `preceding_sentence`, `paragraph`, `table_note` or `list_item`. */
+export type ChatComponentPart =
+  | "row"
+  | "column"
+  | "label"
+  | "sentence"
+  | "caption"
+  | "heading"
+  | "lead_in"
+  | "preceding_sentence"
+  | "paragraph"
+  | "table_note"
+  | "list_item";
 
 /** A value the server verified in a source the answer's turn read (V#): the cell at a row and column, or a number
  * inside an exact quote, with its meaning and which parts of it the source attests. */
@@ -767,9 +784,8 @@ export interface ChatRowComponent {
   reason: ChatComponentReason | null;
   /** The source's own words; null unless `status` is `stated`. */
   written: string | null;
-  /** Where they are: `row`, `column`, `label` (the label of a short line or list item), `caption`, `sentence`, `lead_in`, `heading`, `preceding_sentence`,
-   * `paragraph`, `table_note`. */
-  part: string | null;
+  /** Where they are (see `ChatComponentPart`). */
+  part: ChatComponentPart | null;
   /** `own` (the value's own row label, column header or purpose phrase) or `context` (anything read from around it). */
   tier: "own" | "context" | null;
   context: ChatComponentContext | null;

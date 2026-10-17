@@ -1215,7 +1215,7 @@ class Value:
                 "attribution": self.attribution, "meaning_from": dict(self.meaning_from), "reading": self.reading,
                 "reading_note": self.reading_note, "context": dict(self.context) if self.context else None,
                 "subject_from": self.subject_from, "scale": self.scale,
-                "as_of": dict(self.as_of) if self.as_of else None, "facet": dict(self.facet)}
+                "as_of": dict(self.as_of) if self.as_of else None, "facet": datum.public_facet(self.facet)}
 
 
 @dataclass
@@ -1242,6 +1242,18 @@ class Assumption:
         return {"id": self.aid, "value": str(self.value), "value_text": self.written, "unit": self.unit,
                 "label": self.label, "quote": self.quote, "turn": self.turn, "current": self.current} | (
             {"parameter": self.parameter} if self.parameter else {})
+
+
+def derived_forms(ref: str, fraction=None) -> frozenset[str]:
+    """The expressions a derived reduction of the coefficient ``ref`` is registered under (round 14 U4, KTD6): ``1 − ref``, or its
+    percent form ``(1 − ref) × 100``, as ``render`` writes them. ``fraction``: ``parse(f"1 - {ref}")`` when the caller holds it."""
+    fraction = parse(f"1 - {ref}") if fraction is None else fraction
+    return frozenset((render(fraction, lambda i: i), render(parse(f"(1 - {ref}) * 100"), lambda i: i)))
+
+
+def find_derived(computations: dict, forms: frozenset[str]) -> Computation | None:
+    """The first derived result among ``computations`` whose expression is one of ``forms`` (``derived_forms``), or None."""
+    return next((c for c in computations.values() if c.result_kind == DERIVED and c.expression in forms), None)
 
 
 @dataclass

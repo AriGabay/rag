@@ -50,12 +50,14 @@ PART_PRECEDING_SENTENCE, PART_PARAGRAPH, PART_HEADING, PART_LEAD_IN = "preceding
 PART_TABLE_NOTE, PART_CAPTION, PART_LIST_ITEM = "table_note", "caption", "list_item"
 # where an own facet is: the purpose phrase of the value's sentence, or the label of its short line or list item (round 14 U2 follow-up)
 PART_SENTENCE, PART_LABEL = "sentence", "label"
-# the parts that are sentence-level evidence in the value's own paragraph flow: ``relation`` rule 3 counts them like an own facet
+# the parts read from the text above the value in its own paragraph flow: ``relation`` rule 3 counts them like the value's own words
+# where the two data sit together, and across sections only beside a true own-tier facet
 SENTENCE_PARTS = frozenset({PART_PRECEDING_SENTENCE, PART_PARAGRAPH})
 
 # the families whose datum needs a facet (KTD3): a coefficient, and a proportion (a rate, a percentage, an
 # adjustment). In any other family an empty or absent facet is the appraisal unit's headline datum
-FACET_FAMILIES = frozenset({"coefficient", "proportion"})
+COEFFICIENT, PROPORTION = "coefficient", "proportion"
+FACET_FAMILIES = frozenset({COEFFICIENT, PROPORTION})
 
 LABEL_NOT_STATED = "לא צוין במקור"
 LABEL_NOT_READ = "לא נקרא"
@@ -77,6 +79,18 @@ def facet(written: str, part: str, tier: str, **place) -> dict:
     apart from the value's own locator."""
     return {"status": STATUS_STATED, "written": written, "part": part, "tier": tier} | {
         k: v for k, v in place.items() if v is not None}
+
+
+PUBLIC_FACET_KEYS = ("status", "reason", "written", "part", "tier")
+
+
+def public_facet(f: dict | None) -> dict:
+    """The facet as a client may read it (review, round 14; ``docs/api-contract.md``): ``status``, ``reason``, ``written``,
+    ``part`` and ``tier`` only. The reader's internals — the block and sentence it read from, and ``at``, the offsets the context
+    anchor is resolved from (``anchors.context_stub``) — stay on the workspace object and in the cache, never in a response, so a
+    client cannot come to depend on a place format the server may change. A key the facet does not have is not added."""
+    f = f or not_read()
+    return {k: f[k] for k in PUBLIC_FACET_KEYS if k in f}
 
 
 def none(reason: str = REASON_NOT_IN_RANGE) -> dict:
@@ -113,6 +127,22 @@ def forward(first: dict | None, second: dict | None) -> dict:
     first = first or not_read()
     second = second or not_read()
     return dict(second if _STATE_RANK.get(second.get("status"), 0) > _STATE_RANK.get(first.get("status"), 0) else first)
+
+
+def reread(fresh: dict | None, old: dict | None, *, older_reader: bool) -> dict:
+    """The facet a cached value keeps once its context is read again (round 14 U3, KTD5, R5; review #7): ``forward`` (never lower;
+    equal states take the fresh read, which carries its reason), except that a *stated context-tier* facet written by an older
+    reader (``older_reader``) is replaced by a fresh read that found nothing (``none``) or an ambiguity (``unparsed``). The old
+    reader had no intervening-value or two-component rule, so a heading it borrowed across another value is exactly what the
+    careful read now rejects; keeping it would present the wrong component as the source's own words. A facet written by the
+    current reader, an own-tier facet (the value's own sentence or label: nothing was borrowed) and a read that was not made
+    (``not_read``: a cap, an unreachable place) keep the forward-only rule."""
+    fresh = fresh or not_read()
+    old = old or not_read()
+    if (older_reader and old.get("status") == STATUS_STATED and old.get("tier") == TIER_CONTEXT
+            and fresh.get("status") in (STATUS_NONE, STATUS_UNPARSED)):
+        return dict(fresh)
+    return forward(fresh, old)
 
 
 def family_of(kind: str) -> str:
@@ -189,8 +219,8 @@ _PROPORTION_WORDS = _stems("שיעור שיעורי שיעורים היוון ת
 # the generic and metric words dropped per family; a coefficient is often written as a percent, and a rate as a
 # ratio, so both facet families drop both families' metric words. Any other family drops only the base words
 FAMILY_WORDS: dict[str, frozenset[str]] = {
-    "coefficient": _BASE_WORDS | _COEFFICIENT_WORDS | _PROPORTION_WORDS,
-    "proportion": _BASE_WORDS | _COEFFICIENT_WORDS | _PROPORTION_WORDS,
+    COEFFICIENT: _BASE_WORDS | _COEFFICIENT_WORDS | _PROPORTION_WORDS,
+    PROPORTION: _BASE_WORDS | _COEFFICIENT_WORDS | _PROPORTION_WORDS,
 }
 # the words that introduce a component in a caption, a heading or a lead-in (a context text states a facet only when
 # it holds one of them): a metric word is the cue that the text is about the coefficient or rate, and its other words
@@ -246,9 +276,9 @@ def facet_family(kind: str, *texts: str) -> str:
         return family
     stems = _stems(" ".join(texts))
     if stems & (_COEFFICIENT_WORDS - _BASIS_WORDS):
-        return "coefficient"
+        return COEFFICIENT
     if stems & _PROPORTION_WORDS:
-        return "proportion"
+        return PROPORTION
     return family
 
 
@@ -593,6 +623,10 @@ class Candidate(NamedTuple):
     block: int | None = None
     sentence: int | None = None
 
+    def place(self) -> dict:
+        """Where the candidate is, as the keywords of ``facet`` / ``unparsed`` take it."""
+        return {"block": self.block, "sentence": self.sentence}
+
 
 class Reach(NamedTuple):
     """What a bounded read of the text above a value covered, nearest first (``reach``): the candidates, whether the character
@@ -604,21 +638,11 @@ class Reach(NamedTuple):
     blocks: dict = {}  # noqa: RUF012 - never mutated: an immutable NamedTuple default
 
 
-def _as_candidate(item) -> Candidate:
-    """A ``Candidate``, or a legacy ``(kind, text)`` pair of a block above the value (round 13)."""
-    if isinstance(item, Candidate):
-        return item
-    kind, text = item
-    if kind == "heading":
-        return Candidate(text, PART_HEADING)
-    return Candidate(text, PART_LEAD_IN if (text or "").rstrip().endswith(":") else PART_PARAGRAPH)
-
-
 def _accepted(c: Candidate, family: str) -> tuple[dict | None, bool]:
     """What a candidate states: ``(a stated facet, whether it names two components)``; ``(None, False)``: it states none."""
     if c.part == PART_LIST_ITEM:
         return None, False  # a sibling of the list: it holds numbers that stand between, never the component
-    place = {"block": c.block, "sentence": c.sentence}
+    place = c.place()
     if c.part in (PART_HEADING, PART_LEAD_IN):
         found = _context(c.text, family, c.part, **place)
         if found is None:
@@ -629,9 +653,9 @@ def _accepted(c: Candidate, family: str) -> tuple[dict | None, bool]:
     return (facet(phrase, c.part, TIER_CONTEXT, **place) if phrase is not None else None), two
 
 
-def read_context(preceding: Reach | Sequence, family: str = "") -> dict:
+def read_context(preceding: Reach, family: str = "") -> dict:
     """The bounded context read of a quote value whose sentence states no facet (round 14 U2, KTD3, KTD4; R1, R2): the
-    candidates above it, nearest first (a ``Reach``, or a plain sequence of ``Candidate`` / legacy ``(kind, text)`` pairs).
+    candidates above it, nearest first (a ``Reach``).
 
     The first candidate that holds a component phrase decides: it is the value's facet (``stated``, tier context) unless
     - it names two components: ``unparsed``, reason ``two_components``;
@@ -640,14 +664,12 @@ def read_context(preceding: Reach | Sequence, family: str = "") -> dict:
       the items are peers, the lead-in is theirs all.
     A candidate with no phrase is passed over (its numbers count as standing between). Nothing accepted: ``none`` (reason
     ``not_in_range``), or ``not_read`` (reason ``cap``) when the character cap ended the search before its range did."""
-    reach_ = preceding if isinstance(preceding, Reach) else Reach(list(preceding))
     seen_text = seen_item = False
-    for item in reach_.candidates:
-        c = _as_candidate(item)
+    for c in preceding.candidates:
         found, two = _accepted(c, family)
         has_number = family_number(c.text)
         if found is not None:
-            place = {"block": c.block, "sentence": c.sentence}
+            place = c.place()
             if two:
                 return unparsed(REASON_TWO_COMPONENTS, c.part, **place)
             if seen_text or has_number or (seen_item and c.part != PART_LEAD_IN):
@@ -656,10 +678,10 @@ def read_context(preceding: Reach | Sequence, family: str = "") -> dict:
         if has_number:
             seen_item = seen_item or c.part == PART_LIST_ITEM
             seen_text = seen_text or c.part != PART_LIST_ITEM
-    return not_read(REASON_CAP) if reach_.capped else none()
+    return not_read(REASON_CAP) if preceding.capped else none()
 
 
-def read_quote(sentence: str, written: str, family: str = "", preceding: Reach | Sequence | None = None) -> dict:
+def read_quote(sentence: str, written: str, family: str = "", preceding: Reach | None = None) -> dict:
     """The facet of a value quoted from a text: what its own sentence settles (``own_facet``: its purpose phrase, the label of a
     short line, or an own description that names no component); else, in a family that needs a facet, what the candidates above it
     state (``read_context``: context) — only for a bare or back-referring sentence; else ``none``. ``preceding`` None: the text
@@ -866,7 +888,7 @@ def _together(a, b) -> bool:
 
 def _own_words(f: dict | None) -> bool:
     """Whether a facet is the value's own words in its own paragraph flow: its own tier, or read from the sentence or paragraph
-    just above it (round 14 U2, KTD3) — sentence-level evidence, which a section edge between two values does not weaken."""
+    just above it (round 14 U2, KTD3)."""
     f = f or {}
     return f.get("tier") == TIER_OWN or f.get("part") in SENTENCE_PARTS
 
@@ -885,11 +907,15 @@ def relation(a, b, a_in_unit: int = 1, b_in_unit: int = 1) -> str:
        facet and the other none: same. A stated facet there is a wording of the source, not a component, so the value that states
        none (the headline datum of its unit) is compared with the other unit's value of the key; two own facets with disjoint
        cores across units stay undecided (rule 4). Inside one unit this rule does not apply;
-    3. each core keeps a content word the other lacks, and both are in one unit's same table, list or section: different;
-       or both facets are the value's own words — ``own`` tier (the value's own row label, column header or purpose phrase), or
-       read from an earlier sentence or paragraph of the value's own paragraph flow (``SENTENCE_PARTS``, round 14 U2) — and both
-       data are in the same appraisal unit, in any section: different (round 13 follow-up: an own facet is the value's own words,
-       so two disjoint ones inside one appraisal are two components even where the sections differ);
+    3. each core keeps a content word the other lacks, and both are in one unit's same table, list or section: different, whatever
+       the tier (a facet read from the sentence or paragraph above the value counts there like the value's own words); or both
+       facets are the value's own words — ``own`` tier (its own row label, column header or purpose phrase), or read from an earlier
+       sentence or paragraph of its paragraph flow (``SENTENCE_PARTS``, round 14 U2) — at least one of them a true ``own`` facet, and
+       both data are in the same appraisal unit, in any section: different (round 13 follow-up: an own facet is the value's own
+       words, so two disjoint ones inside one appraisal are two components even where the sections differ; a reduction that
+       takes its consideration from the sentence above, beside one that names its own, is the reported shape). Across sections two
+       facets that are *both* borrowed from the text above decide nothing (review, round 14): a restated adjustment worded
+       differently in two sections must not lose its conflict, so the pair is undecided;
     4. everything else (a subset, disjoint across units, context-tier cores that are not side by side, equal context-tier
        cores, an unresolved facet, a stated facet against a headline datum in a facet family or in one unit): undecided.
 
@@ -899,7 +925,8 @@ def relation(a, b, a_in_unit: int = 1, b_in_unit: int = 1) -> str:
     if (span := getattr(a, "span", None)) and span == getattr(b, "span", None):
         return SAME
     ca, cb = core_of(a), core_of(b)
-    own = (a.facet or {}).get("tier") == TIER_OWN and (b.facet or {}).get("tier") == TIER_OWN
+    a_own, b_own = (a.facet or {}).get("tier") == TIER_OWN, (b.facet or {}).get("tier") == TIER_OWN
+    own = a_own and b_own
     flow = _own_words(a.facet) and _own_words(b.facet)
     if own and ca and ca == cb:
         return SAME
@@ -907,7 +934,8 @@ def relation(a, b, a_in_unit: int = 1, b_in_unit: int = 1) -> str:
         return SAME
     if not needs_facet(a.family) and not needs_facet(b.family) and a.appraisal != b.appraisal and not (ca and cb):
         return SAME
-    if ca - cb and cb - ca and (_together(a, b) or (flow and a.appraisal is not None and a.appraisal == b.appraisal)):
+    across = flow and (a_own or b_own) and a.appraisal is not None and a.appraisal == b.appraisal
+    if ca - cb and cb - ca and (_together(a, b) or across):
         return DIFFERENT
     return UNDECIDED
 
@@ -952,7 +980,7 @@ def reconciles(coefficient, proportion) -> str:
     - ``unrelated``: anything else — two appraisal units (whatever the amounts), different or unstated cores, no cue, a range or a
       missing amount, or the families in any other order. A proportion with no reduction cue is a rate of its own, never the
       complement of a coefficient."""
-    if getattr(coefficient, "family", "") != "coefficient" or getattr(proportion, "family", "") != "proportion":
+    if getattr(coefficient, "family", "") != COEFFICIENT or getattr(proportion, "family", "") != PROPORTION:
         return UNRELATED
     if coefficient.appraisal is None or coefficient.appraisal != proportion.appraisal:
         return UNRELATED

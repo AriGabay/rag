@@ -282,7 +282,7 @@ def test_current_after_a_document_noun_is_no_recency_claim_under_partial_coverag
     ws = _covered(_ws(*V), complete=False)
     assert _check("בחוות הדעת הנוכחית הובאה בחשבון הפחתה, והשווי 2,410,000 ₪ [V3].", ws) == []
     assert _check("בשומה הנוכחית הובאה בחשבון הפחתה, והשווי 2,410,000 ₪ [V3].", ws) == []
-    for noun in ("הדוח", "בהערכה", "במסמך", "בתחשיב", "בנספח", "לשומה", "וחוות הדעת"):
+    for noun in ("הדוח", "במסמך", "בנספח", "לשומה", "וחוות הדעת"):
         assert _check(f"{noun} הנוכחי הובאה בחשבון הפחתה, והשווי 2,410,000 ₪ [V3].", ws) == [], noun
         assert _check(f"{noun} הנוכחית הובאה בחשבון הפחתה, והשווי 2,410,000 ₪ [V3].", ws) == [], noun
     for text in ("בחוות הדעת הנוכחית הובאה בחשבון הפחתה, והשווי 2,410,000 ₪ [V3].", "בשומה הנוכחית נקבע שווי של 2,410,000 ₪ [V3]."):
@@ -297,6 +297,17 @@ def test_the_latest_after_a_document_noun_and_a_latest_value_are_still_recency_c
     assert len(_check("השווי העדכני הוא 2,410,000 ₪ [V3].", ws)) == 1
     assert len(_check("השווי הנוכחי הוא 2,410,000 ₪ [V3].", ws)) == 1, "a current value is not a document noun's current"
     assert verify._calls_latest("בשומה האחרונה נקבע שווי של 2,410,000 ₪") and verify._calls_latest("השווי העדכני הוא 2,410,000 ₪")
+
+
+def test_current_after_an_assessment_or_a_calculation_can_name_the_value_itself_and_is_still_a_recency_claim():
+    """Review (round 14): הערכה and תחשיב name a figure as often as a document ("the current assessment is X"), so they are not
+    document nouns: a current value cited as the older one is still held to the coverage."""
+    ws = _covered(_ws(*V), complete=False)
+    for text in ("ההערכה הנוכחית היא 2,100,000 ₪ [V1].", "התחשיב הנוכחי הוא 2,100,000 ₪ [V1].",
+                 "בהערכה הנוכחית נקבע שווי של 2,100,000 ₪ [V1]."):
+        assert verify._calls_latest(text), text
+        assert len(_check(text, ws)) == 1, text
+    assert not {"הערכה", "תחשיב"} & verify._DOCUMENT_NOUNS
 
 
 def test_a_sentence_with_both_forms_is_still_a_recency_claim():

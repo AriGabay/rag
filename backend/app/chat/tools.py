@@ -437,7 +437,7 @@ class Measurement:
                 # the unit its block is in, in a file holding several (round 9 U9, R10)
                 "unit_id": self.context["unit_id"] if self.context else None,
                 "as_of": dict(self.as_of) if self.as_of else None,
-                "facet": dict(self.facet) if self.facet else datum.not_read()}
+                "facet": datum.public_facet(self.facet)}
 
 
 def anchor_lost(row) -> bool:
@@ -573,6 +573,8 @@ class Workspace:
     # V# and M# -> where its number is in its source (round 14 U1, KTD1; ``value_span``, ``measurement_span``): the datum
     # decision reads it, so one number registered twice is one datum. Absent: the place is not known to a number
     spans: dict[str, tuple] = field(default_factory=dict)
+    # stored measurement row id -> its Measurement, kept by ``add_measurement`` (``measurement_of``)
+    _by_row: dict = field(default_factory=dict, repr=False)
     # the take_value calls the server refused (round 14 U1, KTD11, R15), at most ``REGISTRATION_LOG_MAX``: stored in the
     # message diagnostics as ``resolution["registrations"]``
     registration_log: list[dict] = field(default_factory=list)
@@ -739,10 +741,25 @@ class Workspace:
     def add_source(self, **kw) -> Source:
         return self.adopt(Source(sid="", **kw))
 
-    def add_measurement(self, row, block_text: str | None = None) -> Measurement:
+    def measurement_of(self, row_id) -> Measurement | None:
+        """The turn's measurement of a stored row, by the row's id (an index kept by ``add_measurement``; rebuilt when
+        ``measurements`` was filled directly)."""
+        if len(self._by_row) != len(self.measurements):
+            self._by_row = {}
+            for m in self.measurements.values():
+                self._by_row.setdefault(m.id, m)
+        return self._by_row.get(row_id)
+
+    def mid_of(self, row_id) -> str | None:
+        """The M# of a stored row's measurement, or None while the turn holds none."""
+        known = self.measurement_of(row_id)
+        return known.mid if known is not None else None
+
+    def add_measurement(self, row, block_text: str | None = None, *, span=...) -> Measurement:
         """A stored measurement as the turn's M#; one found again keeps its id, so it is never counted twice. ``block_text``: the
-        text of the block holding a text measurement, read by the listing, so its number's place is found in it (round 14 U3, KTD1)."""
-        known = next((m for m in self.measurements.values() if m.id == row.id), None)
+        text of the block holding a text measurement, read by the listing, so its number's place is found in it (round 14 U3, KTD1);
+        ``span``: the number's place when the caller computed it already (``measurement_span`` of the same row and text; None: none)."""
+        known = self.measurement_of(row.id)
         if known is None:
             known = Measurement(f"M{len(self.measurements) + 1}", row.id, row.document_id, row.version_id, row.title,
                                 row)
@@ -751,9 +768,12 @@ class Workspace:
             if cx is not None and cx.multi:  # its appraisal context, from its block (KTD7)
                 known.context = value_context(cx, cx.at_block(getattr(row, "block_index", None)))
             self.measurements[known.mid] = known
+            self._by_row[row.id] = known
             self.anchors[known.mid] = anchors.measurement_stub(known)
-        if known.mid not in self.spans and (span := measurement_span(row, block_text)) is not None:
-            self.spans[known.mid] = span  # a table row that names its cell; a text row's, once its block is read
+        if known.mid not in self.spans:
+            placed = measurement_span(row, block_text) if span is ... else span
+            if placed is not None:
+                self.spans[known.mid] = placed  # a table row that names its cell; a text row's, once its block is read
         return known
 
     def adopt(self, source: Source) -> Source:
@@ -4764,20 +4784,30 @@ def _measurement_facet(row, structure: dict | None, read: _TextRead | None = Non
     return _quote_facet(row, read)
 
 
+def _row_family(row) -> str:
+    """The facet family a stored measurement reads its component as (``datum.facet_family``): its kind, quote and metric."""
+    return datum.facet_family(row.metric_kind or "", row.quote or "", row.metric or "")
+
+
+def _written_of(row) -> str:
+    """The number of a stored measurement as its value text writes it (the first number of the text, else empty)."""
+    found = _numbers_of(meaning._norm(row.value_text or ""))
+    return found[0][0] if found else ""
+
+
 def _cell_facet(row, cells: list, caption: str | None, title, notes=()) -> dict:
     """The facet of a table row from what it reads of its table: the cells of the row (the first is the row label; three or
     more make a matrix), the column header the row carries, the caption, the title lines and the notes (a note that names the row
     label, round 14 U2)."""
-    family = datum.facet_family(row.metric_kind or "", row.quote or "", row.metric or "")
+    family = _row_family(row)
     return datum.read_cell(cells[0] if cells else "", getattr(row, "header", None), caption,
                            [x for x in title or [] if x], family=family, matrix=len(cells) >= 3,
                            notes=[str(x) for x in notes or [] if x])
 
 
 def _quote_facet(row, read: _TextRead | None = None) -> dict:
-    family = datum.facet_family(row.metric_kind or "", row.quote or "", row.metric or "")
-    found = _numbers_of(meaning._norm(row.value_text or ""))
-    written = found[0][0] if found else ""
+    family = _row_family(row)
+    written = _written_of(row)
     sentence = datum.sentence_with(row.quote or "", written)
     if read is None or not datum.needs_facet(family) or datum.own_facet(sentence, written, family) is not None:
         # no blocks at hand, a family that needs none, or an own sentence that settles it (a phrase, a label, a description):
@@ -4836,9 +4866,9 @@ def _measurement_facet_of(ws: Workspace, conn: Connection | None, row, read: _Te
     (``_table_at``) when a connection is at hand, and is otherwise not read (and not memoized). A text row that comes with no
     ``read`` of its blocks has them read now (one query) when a connection is at hand; ``span``: the number's place, from the
     block of that read."""
-    mid = next((m.mid for m in ws.measurements.values() if m.id == row.id), None)
+    mid = ws.mid_of(row.id)
     span = span or (ws.spans.get(mid) if mid else None)
-    family = datum.facet_family(row.metric_kind or "", row.quote or "", row.metric or "")
+    family = _row_family(row)
     keys = [("m", str(row.id)), *([_span_facet_key(span, family)] if span else [])]
 
     def reading() -> dict:
@@ -4867,10 +4897,9 @@ def _text_reads(ws: Workspace, conn: Connection, rows: list) -> dict:
     for r in rows:
         if r.table_index is not None or getattr(r, "block_index", None) is None or not r.quote:
             continue
-        mid = next((m.mid for m in ws.measurements.values() if m.id == r.id), None)
-        family = datum.facet_family(r.metric_kind or "", r.quote or "", r.metric or "")
-        found = _numbers_of(meaning._norm(r.value_text or ""))
-        written = found[0][0] if found else ""
+        mid = ws.mid_of(r.id)
+        family = _row_family(r)
+        written = _written_of(r)
         context = (datum.needs_facet(family) and ("m", str(r.id)) not in ws.facets
                    and datum.own_facet(datum.sentence_with(r.quote, written), written, family) is None)
         if context or mid is None or mid not in ws.spans:
@@ -4995,25 +5024,28 @@ def tool_find_measurements(ws: Workspace, query: str, metric_kinds: list[str] | 
         for vid, reading in {(str(r.version_id), r.reading_id) for r in rows}:
             contexts_of(ws, conn, vid, reading)  # a measurement records its appraisal context (KTD7)
         reads = _text_reads(ws, conn, rows)  # the blocks of the text rows: their context and their number's place, in one query
-        facets = {r.id: _measurement_facet_of(
-            ws, conn, r, reads.get(r.id), span=measurement_span(r, reads[r.id].block_text if r.id in reads else None))
-            for r in rows}  # a table row's from its table (round 13 U3), a text row's from its blocks (round 14 U3)
+        # the place of each row's number, found once: a row the turn already holds a place for keeps it (``ws.spans``)
+        spans: dict = {}
+        facets = {}  # a table row's from its table (round 13 U3), a text row's from its blocks (round 14 U3)
+        for r in rows:
+            spans[r.id] = None if ws.mid_of(r.id) in ws.spans else measurement_span(
+                r, reads[r.id].block_text if r.id in reads else None)
+            facets[r.id] = _measurement_facet_of(ws, conn, r, reads.get(r.id), span=spans[r.id])
         bare = [r for r in rows if r.table_index is not None and facets[r.id]["status"] != datum.STATUS_STATED
                 and hasattr(r, "table_stored") and r.table_stored
-                and datum.needs_facet(datum.facet_family(r.metric_kind or "", r.quote or "", r.metric or ""))]
+                and datum.needs_facet(_row_family(r))]
         if bare:  # a table row still without a component: the notes of its table, in one query
             noted = _table_notes(conn, bare)
             for r in bare:
                 if notes := noted.get((str(r.version_id), r.table_index)):
-                    facets[r.id] = _measurement_facet_of(ws, conn, r, notes=notes,
-                                                         span=measurement_span(r))
+                    facets[r.id] = _measurement_facet_of(ws, conn, r, notes=notes, span=spans[r.id])
     key = (" ".join(words) if not metric_kinds else "", tuple(sorted(metric_kinds or [])),
            tuple(sorted(str(d) for d in docs)), tuple(sorted(value_roles or [])))
     listing = ws.listings.setdefault(key, {"pages": pages, "pages_read": set(), "total": total})
     listing["pages_read"].add(page)
     groups: dict[tuple, list] = {}
     for r in rows:
-        m = ws.add_measurement(r, reads[r.id].block_text if r.id in reads else None)
+        m = ws.add_measurement(r, reads[r.id].block_text if r.id in reads else None, span=spans[r.id])
         m.as_of = as_ofs[r.id]
         m.facet = facets[r.id]
         m.listings.add(key)
@@ -5098,13 +5130,16 @@ def _cached_lines(ws: Workspace, rows: list, total: int) -> list[str]:
     # a record written before the key named the number (round 14 U3, KTD5) is not listed beside the record of the same number
     keyed = {(str(r.version_id), r.reading_id, (r.value.get("record") or {}).get("quote"), (r.value.get("record") or {}).get("value"))
              for r in rows if "at" in r.locator}
+    # the V# the turn registered for each place, under the value's own locator and under its cache key (the first V# of a place wins)
+    registered: dict[tuple, str] = {}
+    for v in ws.values.values():
+        for loc in (v.locator, _cache_locator(v.locator, ws.spans.get(v.vid))):
+            registered.setdefault(_locator_key(v.version_id, v.reading_id, loc), v.vid)
     for r in rows:
         record = r.value.get("record") or {}
         if "at" not in r.locator and (str(r.version_id), r.reading_id, record.get("quote"), record.get("value")) in keyed:
             continue
-        held = next((v.vid for v in ws.values.values() if str(v.version_id) == str(r.version_id)
-                     and v.reading_id == r.reading_id
-                     and r.locator in (v.locator, _cache_locator(v.locator, ws.spans.get(v.vid)))), None)
+        held = registered.get(_locator_key(r.version_id, r.reading_id, r.locator))
         name = held or _cached_handle(ws, r.version_id, r.reading_id, r.document_id, r.locator)
         ws.touch(r.document_id, r.title, "retrieved")
         # the cached fields are strings or absent, and no label table has a None or "" key
@@ -6025,6 +6060,24 @@ def measurement_span(row, block_text: str | None = None) -> tuple | None:
     return datum.quote_span(version, reading, {"number": found.number}) if found is not None and found.number else None
 
 
+def _adopt(first: calc.Value, name: str, value, prov: dict, anchors_: dict, *, anchor: bool = True) -> None:
+    """Set one field of the value already registered to what this call settled, with its provenance (``prov[name]``) and, when
+    ``anchor``, the place the source states it (``anchors_[name]``), as ``_registered_again`` takes a call's meaning."""
+    setattr(first, name, value)
+    first.provenance[name] = prov[name]
+    if anchor and name in anchors_:
+        first.meaning_from[name] = anchors_[name]
+
+
+def _registered_at(ws: Workspace, span: tuple | None) -> calc.Value | None:
+    """The value ``_registered_again`` answers a take at ``span`` with: the first value registered there, unless its reading is
+    not clear — a reading that is not clear keeps its re-read: the take goes the whole way again (``_reread_value``, at most
+    ``REREADS_PER_VALUE`` per place), and ``datum.relation`` rule 0 still joins the registrations into one class. None: a take
+    there registers a new value."""
+    first = next((v for i, v in ws.values.items() if span and ws.spans.get(i) == span), None)
+    return None if first is None or reading_unclear(ws, first.vid) else first
+
+
 def _registered_again(ws: Workspace, span: tuple | None, settled: tuple, facet_of: Callable[[str], dict]) -> tuple[calc.Value, str] | None:
     """The value already registered at ``span`` with what this call adds, and the note to tell the model; None when the span
     is not known or nobody registered it (round 14 U1, KTD2, R6). Run before any step that costs a read or a model call.
@@ -6039,10 +6092,8 @@ def _registered_again(ws: Workspace, span: tuple | None, settled: tuple, facet_o
 
     ``settled``: this call's ``_settle`` (fields, provenance, who, said, anchors); ``facet_of(kind)``: this call's facet for the
     kind it settled."""
-    first = next((v for i, v in ws.values.items() if span and ws.spans.get(i) == span), None)
-    if first is None or reading_unclear(ws, first.vid):
-        # a reading that is not clear keeps its re-read: the take goes the whole way again (``_reread_value``, at most
-        # ``REREADS_PER_VALUE`` per place), and ``datum.relation`` rule 0 still joins the registrations into one class
+    first = _registered_at(ws, span)
+    if first is None:
         return None
     fields, prov, who, _, anchors_ = settled
     corrected = []
@@ -6056,24 +6107,17 @@ def _registered_again(ws: Workspace, span: tuple | None, settled: tuple, facet_o
         corrected.append(name)
     moved_family = datum.family_of(first.kind) != datum.family_of(fields["kind"])
     for name in corrected:
-        setattr(first, name, fields[name])
-        first.provenance[name] = prov[name]
-        if name in anchors_:
-            first.meaning_from[name] = anchors_[name]
+        _adopt(first, name, fields[name], prov, anchors_)
     mine = fields | who
     for name, empty in _FILLABLE.items():
         if getattr(first, name) in (empty, None) and mine.get(name) not in (empty, None) and prov.get(name) == "source" \
                 and first.provenance.get(name) != "source":
-            setattr(first, name, mine[name])
-            first.provenance[name] = "source"
-            if name in anchors_:
-                first.meaning_from[name] = anchors_[name]
+            _adopt(first, name, mine[name], prov, anchors_)  # ``prov[name]`` is "source" here
     # who stated it, how, and the scenario: a word of the model's own that the source does not attest yields to this call's (the
     # model took the value again as the source has it, as ``MSG_ATTRIBUTION_UNSTATED`` and ``MSG_SCENARIO_UNSTATED`` tell it to)
     for name in ("stance", "stated_by", "scenario"):
         if first.provenance.get(name) == "model_asserted" and mine[name] != getattr(first, name):
-            setattr(first, name, mine[name])
-            first.provenance[name] = prov[name]
+            _adopt(first, name, mine[name], prov, anchors_, anchor=False)
     read = facet_of(fields["kind"])
     first.facet = read if corrected and moved_family else datum.forward(first.facet, read)
     note = MSG_ALREADY_REGISTERED
@@ -6149,18 +6193,23 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
             taken = _take_quote(src, full, loc, blocks, lambda b: _governing_note(ws, conn, src.version_id, b))
             at = _value_blocks(taken.get("anchor") or {})
         reading_id = src.reading_id or v.reading_id
+        # the number's place, from the anchor ``take`` located (no read): a value already registered there answers this call
+        # (``_registered_again``), which needs neither its date inputs nor its context number
+        span = value_span(src.version_id, reading_id, taken)
+        registered = _registered_at(ws, span) is not None
         # the value's own region: read clearly, or read uncertainly at ingestion (then re-read, below, at most
         # REREADS_PER_VALUE times; the same region again is served from the stored readings)
         region = [r for r in rows if at is None or r.block_index in at]
         unclear = next((r for r in region if r.status == reader.UNCERTAIN), None)
-        dating = _date_inputs(ws, conn, src.version_id, taken, region[0].block_index if region else src.block_start, vision)
+        dating = None if registered else _date_inputs(
+            ws, conn, src.version_id, taken, region[0].block_index if region else src.block_start, vision)
         cx = contexts_of(ws, conn, src.version_id, v.reading_id)
         if not cell:  # a quote's facet: the text above its own block, bounded by its unit and section, read once (round 14 U2, KTD3)
             kind = _settle_meaning(taken, given)[0]["kind"]  # the family is the settled kind's, as ``_value_facet`` reads it
             taken["preceding"] = (None if _facet_known(ws, src, taken, kind) else
                                   _preceding_blocks(conn, cx, src.version_id, region, taken, kind))
         here = None
-        if cx.multi and not (cell and vision):
+        if cx.multi and not (cell and vision) and not registered:
             here = _context_number(ws, conn, cx, src.version_id, taken.get("anchor") or {},
                                    region[0].block_index if region else src.block_start)
             if here is None and len(src.contexts) == 1:
@@ -6171,7 +6220,6 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
     settled = _settle(taken, given, path)
     # the number is already registered at this place (round 14 U1, KTD2): the first value is returned, before any re-read or
     # cache lookup of this call, and a stated facet this call read upgrades the first one's
-    span = value_span(src.version_id, reading_id, taken)
     again = _registered_again(ws, span, settled, lambda kind: _value_facet(ws, src, taken, kind))
     if again is not None:
         return _value_report(ws, again[0], settled[3], again[1], _context_lines(ws, cx, again[0]))
@@ -6313,7 +6361,8 @@ def _cache_record(value: calc.Value) -> dict:
     """A value's public record as cached: the number, its place and the fields its source attests, with their
     provenance; a field the model asserted, and the label, subject and role it named, are left out."""
     pub = value.public()
-    record = {k: pub[k] for k in RECORD_FIELDS}
+    record = {k: pub[k] for k in RECORD_FIELDS if k != "facet"}
+    record["facet"] = dict(value.facet)  # whole: the reader's place (``at``) stays with the cached value, the public one has none
     # the anchors of the attributes the source states (round 12 U9): never one of a field the model asserted
     record["meaning_from"] = {k: v for k, v in pub["meaning_from"].items()
                               if not isinstance(v, dict) or value.provenance.get(k) == "source"}
@@ -6422,15 +6471,17 @@ def _store_verified(ws: Workspace, value: calc.Value, doc: dict, locator: dict |
             v = reader.version(conn, value.version_id)
             if v is None or v.reading_id != value.reading_id:
                 return
-            conn.execute(text(
+            written = conn.execute(text(
                 "INSERT INTO verified_values (office_id, document_id, version_id, reading_id, locator, value)"
                 " VALUES (app_office(), :d, :v, :r, CAST(:l AS jsonb), CAST(:x AS jsonb))"
                 " ON CONFLICT (version_id, reading_id, locator) DO UPDATE SET value = EXCLUDED.value"
                 " WHERE verified_values.value->>'verifier_version' IS DISTINCT FROM :verifier_version"),
                 {"d": v.document_id, "v": value.version_id, "r": value.reading_id,
                  "l": json.dumps(key, ensure_ascii=False), "x": json.dumps(doc, ensure_ascii=False),
-                 "verifier_version": VALUE_VERIFIER_VERSION})
-            if ((doc.get("record") or {}).get("facet") or {}).get("status") == datum.STATUS_STATED:
+                 "verifier_version": VALUE_VERIFIER_VERSION}).rowcount
+            # a row this call wrote holds ``doc``, whose record carries the current reader (``_cache_record``): there is nothing
+            # to complete. Only a row of the same verifier version, which the upsert left as it was, may take the facet
+            if written <= 0 and ((doc.get("record") or {}).get("facet") or {}).get("status") == datum.STATUS_STATED:
                 _write_facet(conn, value.version_id, value.reading_id, key, doc["record"]["facet"])
     except Exception:  # noqa: BLE001 - the value itself is registered; only its reuse is lost
         logger.warning("verified value cache store failed")
@@ -6439,16 +6490,23 @@ def _store_verified(ws: Workspace, value: calc.Value, doc: dict, locator: dict |
 def _write_facet(conn: Connection, version_id, reading_id: str, locator: dict, facet: dict) -> None:
     """Complete a cached record in place with a stated facet (round 14 U3, KTD5, R5): only ``value.record.facet`` and
     ``value.record.facet_reader`` of the row change (``jsonb_set``), the rest of the cached document stays, and nothing is deleted.
-    It moves forward only: a row whose facet is already stated by this reader or a later one is left as it is."""
+    It moves forward only: a row whose facet is already stated by this reader or a later one is left as it is. The one backward
+    step (review #7): a facet that states nothing (``none`` or ``unparsed``, the careful read's verdict) replaces a stated
+    context-tier facet an older reader wrote (``datum.reread``) — never a facet of this reader, an own-tier one or a row that holds
+    no stated facet, so a late or repeated write cannot lower a row."""
+    if facet.get("status") == datum.STATUS_STATED:
+        guard = ("(value #>> '{record,facet,status}' IS DISTINCT FROM 'stated'"
+                 " OR COALESCE((value #>> '{record,facet_reader}')::int, 1) < :ri)")
+    else:
+        guard = ("(value #>> '{record,facet,status}' = 'stated' AND value #>> '{record,facet,tier}' = :tier"
+                 " AND COALESCE((value #>> '{record,facet_reader}')::int, 1) < :ri)")
     conn.execute(text(
         "UPDATE verified_values SET value = jsonb_set(jsonb_set(value, '{record,facet}', CAST(:f AS jsonb)),"
         " '{record,facet_reader}', CAST(:rj AS jsonb)) WHERE version_id = :v AND reading_id = :r"
-        " AND locator = CAST(:l AS jsonb) AND value->>'verifier_version' = :verifier_version"
-        " AND (value #>> '{record,facet,status}' IS DISTINCT FROM 'stated'"
-        " OR COALESCE((value #>> '{record,facet_reader}')::int, 1) < :ri)"),
+        " AND locator = CAST(:l AS jsonb) AND value->>'verifier_version' = :verifier_version AND " + guard),
         {"f": json.dumps(facet, ensure_ascii=False), "rj": json.dumps(FACET_READER_VERSION), "ri": FACET_READER_VERSION,
          "v": version_id, "r": reading_id, "l": json.dumps(locator, ensure_ascii=False),
-         "verifier_version": VALUE_VERIFIER_VERSION})
+         "verifier_version": VALUE_VERIFIER_VERSION, "tier": datum.TIER_CONTEXT})
 
 
 def _update_cached_facet(ws: Workspace, version_id, reading_id: str, locator: dict, facet: dict) -> None:
@@ -6482,9 +6540,13 @@ def _facet_stale(record: dict) -> bool:
     """Whether a cached record's facet is read again on a take (round 14 U3, KTD5, R5): it is not stated (nothing, or only
     an ambiguous read, was found when it was cached), or the reader that read it is older than ``FACET_READER_VERSION`` (a record
     without ``facet_reader`` is the round-13 reader's)."""
+    return (record.get("facet") or {}).get("status") != datum.STATUS_STATED or _older_reader(record)
+
+
+def _older_reader(record: dict) -> bool:
+    """Whether a cached record's facet was written by a reader older than ``FACET_READER_VERSION`` (absent: the round-13 reader's)."""
     reader_ = record.get("facet_reader")
-    return ((record.get("facet") or {}).get("status") != datum.STATUS_STATED
-            or (reader_ if isinstance(reader_, int) else 1) < FACET_READER_VERSION)
+    return (reader_ if isinstance(reader_, int) else 1) < FACET_READER_VERSION
 
 
 def _picture_cell(taken: dict) -> bool:
@@ -6574,8 +6636,10 @@ def _take_cached(ws: Workspace, handle: str, data: dict, loc: dict, given: dict,
         if _picture_cell(taken):  # its text was never read: that is what it says, and nothing is read for it now
             taken["facet"] = old if old.get("status") == datum.STATUS_STATED else datum.not_read(datum.REASON_PICTURE_CELL)
         elif (fresh := _facet_again(ws, src, dict(taken), settled[0]["kind"], doc)) is not None:
-            taken["facet"] = datum.forward(fresh, old)  # equal states take the new read (it carries its reason); never lower
-            if fresh["status"] == datum.STATUS_STATED:
+            # equal states take the new read (it carries its reason); never lower, except that the careful read's "nothing" or
+            # "ambiguous" replaces a context facet a round-13 reader borrowed (review #7)
+            taken["facet"] = datum.reread(fresh, old, older_reader=_older_reader(record))
+            if taken["facet"] == fresh and (fresh["status"] == datum.STATUS_STATED or old.get("status") == datum.STATUS_STATED):
                 _update_cached_facet(ws, v.version_id, v.reading_id, data["locator"], fresh)
     # the number is already registered at this place (round 14 U1, KTD2): no new source and no new id
     again = _registered_again(ws, span, settled, lambda kind: dict(taken["facet"]))

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { B } from "@/components/ui";
 import type {
   ChatAnswer,
@@ -49,7 +49,7 @@ import {
 } from "@/lib/format";
 import { type CitationTarget, Markdown, citationOrder, plainAnswer } from "./Markdown";
 import { assumptionText, citedSource, citedTarget, standardChipTitle, valueStatusOf } from "./cited";
-import { ActionLines, type CutFocus, type ExpandAll, type PartialFocus, RemovalsSection } from "./Changes";
+import { ActionLines, type CutFocus, type ExpandAll, NO_PARTIALS, type PartialFocus, RemovalsSection } from "./Changes";
 import { documentAnchor } from "./SourceViewer";
 
 export interface CitedItem {
@@ -123,6 +123,11 @@ export interface PartialSpan {
   claimIds: string[];
 }
 
+/** Whether a server span is a usable range of a text of `length` code points: integer offsets, `0 <= start < end <= length`. */
+function validSpan(span: { start: number; end: number }, length: number): boolean {
+  return Number.isInteger(span.start) && Number.isInteger(span.end) && span.start >= 0 && span.end > span.start && span.end <= length;
+}
+
 export function partialSpans(answer: ChatAnswer): PartialSpan[] {
   const chars = Array.from(answer.markdown);
   const seen = new Set<number>();
@@ -130,7 +135,7 @@ export function partialSpans(answer: ChatAnswer): PartialSpan[] {
   for (const s of answer.server_spans ?? []) {
     const n = s.ordinal;
     if (s.kind !== "partial_mark" || typeof n !== "number" || !Number.isInteger(n) || n < 1 || seen.has(n)) continue;
-    if (!Number.isInteger(s.start) || !Number.isInteger(s.end) || s.start < 0 || s.end <= s.start || s.end > chars.length) continue;
+    if (!validSpan(s, chars.length)) continue;
     if (chars.slice(s.start, s.end).join("") !== PARTIAL_MARK) continue;
     seen.add(n);
     const row = answer.verification?.partials?.find((p) => p.ordinal === n);
@@ -239,6 +244,19 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
     [answer, canViewDiagnostics],
   );
   const markOrdinals = useMemo(() => new Set(marks.map((m) => m.ordinal)), [marks]);
+  // the saved text, or the pieces around the removal note, with the partial marks turned into links: once per answer and marks
+  const linked = useMemo(() => {
+    if (!answer || answer.hidden) return null;
+    if (!noteParts) return { whole: linkPartialMarks(answer.markdown, 0, marks), split: null };
+    return {
+      whole: null,
+      split: {
+        head: linkPartialMarks(noteParts.head, 0, marks),
+        note: linkPartialMarks(noteParts.note, noteParts.start, marks),
+        tail: linkPartialMarks(noteParts.tail, noteParts.end, marks),
+      },
+    };
+  }, [answer, noteParts, marks]);
   const [partialFocus, setPartialFocus] = useState<PartialFocus | null>(null);
   const openPartial = useCallback(
     (ordinal: number) =>
@@ -327,9 +345,9 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
   }
 
   const timeNote = timePreferenceNote(message, answer);
-  const renderMarkdown = (markdown: string, base = 0) => (
+  const renderMarkdown = (markdown: string) => (
     <Markdown
-      markdown={linkPartialMarks(markdown, base, marks)}
+      markdown={markdown}
       citations={citations}
       onCite={cite}
       cuts={cutOrdinals}
@@ -359,11 +377,11 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
         <div className="stale-note">המסמכים או ההרשאות השתנו מאז התשובה. מומלץ לשאול שוב לקבלת תשובה עדכנית.</div>
       )}
       <div className="body" dir="rtl">
-        {noteParts ? (
+        {noteParts && linked?.split ? (
           <>
-            {noteParts.head.trim() && renderMarkdown(noteParts.head, 0)}
+            {noteParts.head.trim() && renderMarkdown(linked.split.head)}
             <div className="removal-note" data-testid="removal-note">
-              {renderMarkdown(noteParts.note, noteParts.start)}
+              {renderMarkdown(linked.split.note)}
               <button
                 type="button"
                 className="source-link"
@@ -375,10 +393,10 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
                 פירוט ההסרות
               </button>
             </div>
-            {noteParts.tail.trim() && renderMarkdown(noteParts.tail, noteParts.end)}
+            {noteParts.tail.trim() && renderMarkdown(linked.split.tail)}
           </>
         ) : (
-          renderMarkdown(answer.markdown)
+          renderMarkdown(linked?.whole ?? "")
         )}
       </div>
       <AnswerQuality answer={answer} />
@@ -430,7 +448,7 @@ export function removalNoteParts(
   if (spans.length !== 1) return null;
   const { start, end } = spans[0];
   const chars = Array.from(answer.markdown);
-  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start || end > chars.length) return null;
+  if (!validSpan(spans[0], chars.length)) return null;
   const note = chars.slice(start, end).join("");
   if (!note.trimStart().startsWith(">")) return null;
   return { head: chars.slice(0, start).join(""), note, tail: chars.slice(end).join(""), start, end };
@@ -611,7 +629,7 @@ function ValueCell({ row }: { row: Pick<ChatTimelineRow, "value_text" | "unit"> 
 function RowNote({ note }: { note: string | undefined }) {
   if (!note) return null;
   return (
-    <span className="tl-kind" data-testid="row-note" style={{ display: "block", marginInlineStart: 0 }}>
+    <span className="tl-kind tl-kind--block tl-kind--flush" data-testid="row-note">
       {note}
     </span>
   );
@@ -628,7 +646,7 @@ function MarksCell({
     <>
       <MarkBadges marks={row.marks} counterparts={row} onCite={onCite} />
       {(row.not_in_answer_with ?? []).map((c: ChatNotInAnswer) => (
-        <span key={c.sid} className="tl-kind" data-testid="not-in-answer" style={{ marginInlineStart: 0 }}>
+        <span key={c.sid} className="tl-kind tl-kind--flush" data-testid="not-in-answer">
           {`ערך זה אינו בתשובה: ${[c.title, c.location].filter(Boolean).join(", ")}`}
         </span>
       ))}
@@ -639,7 +657,7 @@ function MarksCell({
 /** The server-built timeline of comparable dated values (round 11 U9, U10): groups and rows in the payload's order,
  * never re-sorted here. A table at desktop width, stacked rows on a phone (CSS only, so the order and the roles stay
  * the same); a mark is a text badge, never colour alone; the source chip opens the viewer like an answer citation. */
-function Timeline({ groups, onCite }: { groups: ChatTimelineGroup[] | undefined; onCite: (id: string) => void }) {
+const Timeline = memo(function Timeline({ groups, onCite }: { groups: ChatTimelineGroup[] | undefined; onCite: (id: string) => void }) {
   const shown = (groups ?? []).filter((g) => g.rows.length > 0);
   if (shown.length === 0) return null;
   return (
@@ -682,7 +700,7 @@ function Timeline({ groups, onCite }: { groups: ChatTimelineGroup[] | undefined;
       ))}
     </section>
   );
-}
+});
 
 /** The context line is clipped to the same 120 characters the server clips to; the screen holds the limit itself (round 14 U8). */
 const CONTEXT_QUOTE_LIMIT = 120;
@@ -737,10 +755,7 @@ function FacetCell({
     <td role="cell" className="tl-facet">
       <div data-testid="breakdown-facet">{row.facet}</div>
       {ctx && (
-        <div
-          data-testid="breakdown-context"
-          style={{ fontWeight: 400, fontSize: "12.5px", color: "var(--chat-muted)", overflowWrap: "anywhere" }}
-        >
+        <div className="tl-facet-context" data-testid="breakdown-context">
           {where}
         </div>
       )}
@@ -781,7 +796,7 @@ function ReconciledValue({
       <div data-testid="reconciled-form">
         <B>{timelineValue(reduction)}</B> <SourceChip sid={reduction.sid} source={reduction.source} onCite={onCite} />
       </div>
-      <div className="tl-kind" data-testid="reconciled-formula" style={{ display: "block", marginInlineStart: 0 }}>
+      <div className="tl-kind tl-kind--block tl-kind--flush" data-testid="reconciled-formula">
         <bdi dir="ltr">{formula}</bdi>
         {row.derived && (
           <>
@@ -806,7 +821,7 @@ function ReconciledValue({
  * by side instead of as competing values. Blocks and rows in the payload's order, never re-sorted here; each row shows the component
  * cell (`FacetCell`), the value, the source chip and the marks. Built like the timeline (same table, stacked rows on a phone); an
  * older message has no `breakdown` and renders nothing, and a row without `state` is the facet alone. */
-function Breakdown({
+const Breakdown = memo(function Breakdown({
   blocks,
   onCite,
   onOpenContext,
@@ -867,7 +882,7 @@ function Breakdown({
       ))}
     </section>
   );
-}
+});
 
 /** The summary rows of cuts that carry the ordinal of their marker in the text. */
 function cutRows(rows: ChatRemoval[] | undefined): ChatRemoval[] {
@@ -1045,7 +1060,10 @@ function AnswerDetails({
   const changed = verification
     ? verification.removed + verification.partial + verification.annotated + (actions ? sum(actions) : 0)
     : 0;
-  const partials = [...(verification?.partials ?? [])].sort((a, b) => a.ordinal - b.ordinal);
+  const partials = useMemo(
+    () => [...(verification?.partials ?? [])].sort((a, b) => a.ordinal - b.ordinal),
+    [verification?.partials],
+  );
   const detailMarks = canViewDiagnostics ? partials.length : 0;
   const otherChanges = Math.max(actions ? actions.rewritten + actions.qualified + actions.cited : 0, detailMarks);
   const coverage = answer.coverage.at(-1);
@@ -1171,7 +1189,7 @@ function AnswerDetails({
               listId={removalsId}
               onOpenSource={onOpenSource}
               partialFocus={partialFocus}
-              partials={canViewDiagnostics ? partials : []}
+              partials={canViewDiagnostics ? partials : NO_PARTIALS}
             />
           )}
         </div>

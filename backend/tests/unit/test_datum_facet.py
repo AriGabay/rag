@@ -56,6 +56,11 @@ def _cell(table: dict, row: str, column: str, **given) -> calc.Value:
     return _register(taken, _given(kind="coefficient", unit="ratio") | given, src)
 
 
+def _above(*candidates: tuple[str, str]) -> datum.Reach:
+    """What a read of the text above a value covered: ``(part, text)`` candidates, nearest first."""
+    return datum.Reach([datum.Candidate(text, part) for part, text in candidates])
+
+
 def _quote(text: str, number: str, preceding=None, **given) -> calc.Value:
     src = _source(text)
     taken = T._take_quote(src, text, {"quote": text, "number": number}, [(0, text, 1)])
@@ -128,31 +133,31 @@ def test_a_purpose_phrase_between_the_metric_word_and_the_number_is_read_too():
 
 def test_function_words_at_the_edges_of_a_purpose_phrase_are_trimmed_before_and_after_the_number():
     before = "הובאה בחשבון הפחתה לסחירות וגמישות מועטה של שימושים של 20%."
-    f = _quote(before, "20", preceding=[], kind="coefficient", unit="percent").facet
+    f = _quote(before, "20", preceding=datum.Reach([]), kind="coefficient", unit="percent").facet
     assert f == _facet("סחירות וגמישות מועטה של שימושים", "sentence")  # the inner "של" stays, the trailing one goes
     after = "שיעור היוון של 6.5% לתזרים דמי שכירות ממשרדים בשיעור -"
-    assert _quote(after, "6.5", preceding=[]).facet == _facet("תזרים דמי שכירות ממשרדים", "sentence")
+    assert _quote(after, "6.5", preceding=datum.Reach([])).facet == _facet("תזרים דמי שכירות ממשרדים", "sentence")
     assert datum.tidy("על: שימושים של ") == "שימושים"
     assert datum.core("סחירות וגמישות מועטה של שימושים של", "coefficient") == datum.core(
         "סחירות וגמישות מועטה של שימושים", "coefficient")
 
 
 def test_a_lead_in_naming_a_cash_flow_is_a_context_facet_when_the_sentence_names_none():
-    f = _quote("שיעור היוון 9%.", "9", preceding=[("paragraph", LEAD_IN)]).facet
+    f = _quote("שיעור היוון 9%.", "9", preceding=_above(("lead_in", LEAD_IN))).facet
     assert f == _facet("תזרים הכנסות משטחי פרסום על הגג", "lead_in", "context")
 
 
 def test_the_nearest_heading_is_the_context_facet_when_there_is_no_lead_in():
-    f = _quote("שיעור היוון 5.5%.", "5.5", preceding=[("heading", "תזרים הכנסות מתחנת טעינה")]).facet
+    f = _quote("שיעור היוון 5.5%.", "5.5", preceding=_above(("heading", "תזרים הכנסות מתחנת טעינה"))).facet
     assert f == _facet("תזרים הכנסות מתחנת טעינה", "heading", "context")
 
 
 def test_a_rate_with_neither_a_lead_in_nor_a_heading_naming_a_cash_flow_has_status_none():
-    bare = [("paragraph", "השמאי הביא בחשבון את מכלול הנתונים שפורטו."), ("heading", "4. סיכום והערות")]
+    bare = _above(("paragraph", "השמאי הביא בחשבון את מכלול הנתונים שפורטו."), ("heading", "4. סיכום והערות"))
     assert _quote("שיעור היוון 10%.", "10", preceding=bare).facet == NONE
-    assert _quote("שיעור היוון 10%.", "10", preceding=[]).facet == NONE
+    assert _quote("שיעור היוון 10%.", "10", preceding=datum.Reach([])).facet == NONE
     # only generic words in the section heading: no facet
-    assert _quote("שיעור היוון 10%.", "10", preceding=[("heading", "3. היוון התזרימים")]).facet == NONE
+    assert _quote("שיעור היוון 10%.", "10", preceding=_above(("heading", "3. היוון התזרימים"))).facet == NONE
 
 
 def test_a_sentence_read_without_its_preceding_blocks_is_not_read():
@@ -164,7 +169,7 @@ def test_what_the_model_wrote_never_feeds_the_facet():
     given = _given(subject="תזרים דמי שכירות ממשרדים")
     src = _source(text)
     taken = T._take_quote(src, text, {"quote": text, "number": "10"}, [(0, text, 1)])
-    taken["preceding"] = []
+    taken["preceding"] = datum.Reach([])
     value = T._new_value(Workspace(ctx=None), src, "S1", taken, T._settle(taken, given, ()), given,
                          "שיעור היוון לתזרים דמי שכירות ממשרדים", (), "r1")
     assert value.facet == NONE and "משרדים" in value.label and "משרדים" in value.subject
@@ -180,13 +185,13 @@ def test_what_the_model_wrote_never_feeds_the_facet():
     ("שיעור ההיוון לצורך חישוב השווי הוא 6%.", "6", "rate", "percent"),
 ])
 def test_a_period_unit_date_or_basis_phrase_is_no_facet(text, number, kind, unit):
-    found = _quote(text, number, preceding=[], kind=kind, unit=unit).facet
+    found = _quote(text, number, preceding=datum.Reach([]), kind=kind, unit=unit).facet
     assert found["status"] == "none" and found["written"] is None  # read, and nothing in it names a component
 
 
 def test_a_family_that_needs_no_facet_reads_no_context():
     # a value is not a coefficient or a proportion: an empty facet is the unit's headline datum, no block is read
-    v = _quote("שווי הנכס 1,540,000 ₪.", "1,540,000", preceding=[("heading", "תזרים הכנסות מתחנת טעינה")],
+    v = _quote("שווי הנכס 1,540,000 ₪.", "1,540,000", preceding=_above(("heading", "תזרים הכנסות מתחנת טעינה")),
                kind="value", unit="ILS")
     assert v.facet == datum.none(datum.REASON_NOT_NEEDED)
 
@@ -354,7 +359,7 @@ def test_the_value_report_shows_the_facet_to_the_model():
     ws.sources["S1"] = _source("x")
     report = T._value_report(ws, v, None, None)
     assert "רכיב" in report and STATED_ROW in report
-    none_report = T._value_report(ws, _quote("שיעור היוון 10%.", "10", preceding=[]), None, None)
+    none_report = T._value_report(ws, _quote("שיעור היוון 10%.", "10", preceding=datum.Reach([])), None, None)
     assert "רכיב: לא צוין במקור" in none_report
 
 
@@ -366,13 +371,35 @@ def test_value_public_includes_the_facet_and_a_value_without_one_is_not_read():
     assert bare.public()["facet"]["status"] == "not_read"
 
 
+def test_the_public_facet_of_a_value_and_a_measurement_holds_only_the_documented_keys_and_the_cache_keeps_the_place():
+    """Review #12: the reader's place (``block``, ``sentence``, ``at``) is internal. A client sees ``status``, ``reason``,
+    ``written``, ``part`` and ``tier``; the workspace object and the cached record keep the whole facet (the context anchor of a
+    cached take is resolved from ``at``)."""
+    place = {"block": 4, "sentence": 1, "at": {"blocks": [[4, 0, 12]]}}
+    context = datum.facet("עוצמת ניצול", "preceding_sentence", "context", **place)
+    unparsed = datum.unparsed(datum.REASON_INTERVENING, "paragraph", **place)
+    v = _quote("שיעור היוון של 6.5% לתזרים דמי שכירות ממשרדים.", "6.5")
+    ws = Workspace(ctx=None)
+    m = ws.add_measurement(_row(quote="שיעור היוון של 6.5% לתזרים דמי שכירות ממשרדים.", value_text="6.5%"))
+    for facet, keys in ((context, {"status", "written", "part", "tier"}),
+                        (unparsed, {"status", "reason", "written", "part", "tier"})):
+        v.facet = m.facet = dict(facet)
+        for public in (v.public()["facet"], m.public()["facet"]):
+            assert set(public) == keys and not {"block", "sentence", "at"} & set(public)
+            assert public == {k: facet[k] for k in keys}
+        assert v.facet == facet and m.facet == facet, "the workspace object keeps the full dict"
+    assert set(datum.public_facet(datum.not_read())) == {"status", "reason", "written", "part", "tier"}
+    v.facet = dict(context)
+    assert T._cache_record(v)["facet"] == context, "the cached facet keeps its place"
+
+
 def test_the_cache_version_is_v5_and_the_record_round_trips_the_facet(monkeypatch):
     assert T.VALUE_VERIFIER_VERSION == "value-v5"
     assert "facet" in T.RECORD_FIELDS
     text = "שיעור היוון של 6.5% לתזרים דמי שכירות ממשרדים."
     src = _source(text)
     taken = T._take_quote(src, text, {"quote": text, "number": "6.5"}, [(0, text, 1)])
-    taken["preceding"] = []
+    taken["preceding"] = datum.Reach([])
     earlier = _register(taken, _given(), src)
     prov = {k: "source" for k in ("unit",)}
     earlier.provenance = prov | earlier.provenance
@@ -407,7 +434,7 @@ def _cached_world(monkeypatch, text: str = RATE_TEXT, number: str = "6.5", **giv
     registration has an anchor step. Returns the workspace and the Q#."""
     src = _source(text)
     taken = T._take_quote(src, text, {"quote": text, "number": number}, [(0, text, 1)])
-    taken["preceding"] = []
+    taken["preceding"] = datum.Reach([])
     earlier = _register(taken, _given(**given), src)
     stub = {"kind": "quote", "document_id": str(DOC), "version_id": str(VER), "reading_id": "r1", "block_start": 0,
             "block_end": 0, "pages": [1], "section": "3. היוון", **taken["anchor"]}
@@ -564,7 +591,7 @@ def test_a_stance_or_scenario_the_source_attests_is_never_replaced_by_a_repeat()
 
 
 def _existing(ws: Workspace, facet: dict, span=("quote", str(VER), "r1", 0, AT)) -> calc.Value:
-    value = _quote(RATE_TEXT, "6.5", preceding=[])
+    value = _quote(RATE_TEXT, "6.5", preceding=datum.Reach([]))
     value.facet = dict(facet)
     value.vid = "V1"
     T._register_value(ws, value, span)
@@ -821,11 +848,6 @@ def test_a_list_lead_in_is_the_components_of_its_items_but_a_paragraph_value_bet
     assert _read_at(rows, 1)["part"] == "heading"
 
 
-def test_a_legacy_pair_of_blocks_above_is_still_read():
-    f = datum.read_quote("שיעור היוון 9%.", "9", "proportion", [("paragraph", LEAD_IN)])
-    assert (f["part"], f["tier"]) == ("lead_in", "context")
-
-
 def test_the_candidate_text_is_capped_by_characters_and_a_capped_search_is_not_read_never_none():
     filler = "הנכס נבדק בהתאם לנתוני השוק שנאספו בסביבתו. " * 4
     rows = _rows(("paragraph", CONSIDERATION), *[("paragraph", filler)] * 6, ("paragraph", TAKEN))
@@ -912,17 +934,33 @@ def _site(facet: dict, section: str, appraisal=("v", 1)) -> datum.Site:
 
 
 def test_a_context_sentence_and_an_own_phrase_in_two_sections_of_one_unit_are_different_when_their_cores_differ():
+    """Across sections a facet read from the text above the value counts as the value's own words only beside a true own-tier
+    facet (the reported shape: one reduction names its consideration, the other takes it from the sentence above). Two such
+    borrowed facets across sections are undecided (review, round 14): a restated adjustment worded differently in two sections
+    must not lose its conflict. In one section (``_together``) they are different whatever the tier."""
     sentence = datum.facet("עוצמת ניצול", "preceding_sentence", "context", block=15, sentence=0)
     own = datum.facet("סחירות", "sentence", "own")
     assert datum.relation(_site(sentence, "3. מגרש 12"), _site(own, "9. מגרש 24")) == datum.DIFFERENT
     paragraph = datum.facet("גמישות שימושים", "paragraph", "context", block=19, sentence=0)
-    assert datum.relation(_site(sentence, "3. מגרש 12"), _site(paragraph, "5. מגרש 16")) == datum.DIFFERENT
+    assert datum.relation(_site(sentence, "3. מגרש 12"), _site(paragraph, "5. מגרש 16")) == datum.UNDECIDED
+    assert datum.relation(_site(sentence, "3. מגרש 12"), _site(paragraph, "3. מגרש 12")) == datum.DIFFERENT
     # in another unit, or when one of them is a heading or a lead-in, nothing new is decided
     assert datum.relation(_site(sentence, "3. מגרש 12"), _site(own, "9. מגרש 24", ("v", 2))) == datum.UNDECIDED
     heading = datum.facet("עוצמת ניצול", "heading", "context")
     assert datum.relation(_site(heading, "3. מגרש 12"), _site(own, "9. מגרש 24")) == datum.UNDECIDED
     # equal cores are not "same" by this rule: only an own facet pair is (rule 1)
     assert datum.relation(_site(sentence, "3"), _site(datum.facet("עוצמת ניצול", "paragraph", "context"), "5")) == datum.UNDECIDED
+
+
+def test_two_borrowed_facets_in_different_sections_with_disagreeing_amounts_are_not_different_and_so_may_conflict():
+    """Negative case: neither facet is the value's own, the sections differ, the cores are disjoint. The pair is undecided, so
+    two amounts that disagree stay a mark (``undecided``) instead of two components that never conflict."""
+    a = datum.Site("proportion", datum.facet("עוצמת ניצול", "preceding_sentence", "context", block=3, sentence=0),
+                   ("v", 1), None, "3. מגרש 12")
+    b = datum.Site("proportion", datum.facet("גמישות שימושים", "paragraph", "context", block=9, sentence=0),
+                   ("v", 1), None, "7. סיכום")
+    assert datum.relation(a, b) == datum.UNDECIDED and datum.relation(b, a) == datum.UNDECIDED
+    assert datum.relation(a, b) != datum.DIFFERENT
 
 
 def test_the_round14_fixtures_two_plots_are_different_components_not_undecided():
@@ -1118,6 +1156,44 @@ def test_a_read_again_that_finds_nothing_keeps_the_cached_state_and_writes_nothi
     monkeypatch.setattr(T, "_preceding_blocks", lambda *a, **k: None)  # the blocks could not be read: never lower a state
     T.tool_take_value(ws, handle, {}, _given(), "שיעור")
     assert ws.values["V1"].facet["status"] == "unparsed" and calls["update"] == []
+
+
+def test_a_stale_context_facet_is_replaced_by_the_careful_reads_nothing_and_ambiguity_and_written_in_place(monkeypatch):
+    """Review #7: a context facet an older reader borrowed (a heading across another value) must not survive the new reader's
+    verdict just because "stated" outranks "none"; the row is corrected in place (facet only) so it stops being served."""
+    borrowed = _facet("עוצמת ניצול", "heading", "context")
+    for found in (datum.none(), datum.unparsed(datum.REASON_INTERVENING, "paragraph")):
+        ws, handle, calls = _cached_with(monkeypatch, borrowed, None)  # absent facet_reader: the round-13 reader
+        monkeypatch.setattr(T, "_facet_again", lambda *a, _found=found, **k: dict(_found))
+        T.tool_take_value(ws, handle, {}, _given(), "שיעור")
+        assert ws.values["V1"].facet == found, "the old reader's borrowed facet is not served"
+        ((locator, written),) = calls["update"]
+        assert written == found and locator == ws.handles[handle]["locator"]
+
+
+def test_a_stated_facet_stays_when_the_read_again_is_lower_unless_it_is_a_context_facet_of_an_older_reader(monkeypatch):
+    """The other direction: never lower for an own-tier facet, for a context facet of the current reader's version, and for a
+    read that was not made (a cap)."""
+    cases = [
+        (_facet("עוצמת ניצול", "sentence", "own"), None, datum.none()),  # own tier: nothing was borrowed
+        (_facet("עוצמת ניצול", "heading", "context"), None, datum.not_read(datum.REASON_CAP)),  # the read did not happen
+    ]
+    for old, version, found in cases:
+        ws, handle, calls = _cached_with(monkeypatch, old, version)
+        monkeypatch.setattr(T, "_facet_again", lambda *a, _found=found, **k: dict(_found))
+        T.tool_take_value(ws, handle, {}, _given(), "שיעור")
+        assert ws.values["V1"].facet == old and calls["update"] == []
+    # a facet the current reader wrote is not read again at all (``_facet_stale``): no block read, no write
+    current = _facet("עוצמת ניצול", "heading", "context")
+    ws, handle, calls = _cached_with(monkeypatch, current, T.FACET_READER_VERSION)
+    T.tool_take_value(ws, handle, {}, _given(), "שיעור")
+    assert ws.values["V1"].facet == current and calls["blocks"] == 0 and calls["update"] == []
+    # and the rule itself, by reader and tier
+    for older in (True, False):
+        for tier in ("context", "own"):
+            kept = datum.reread(datum.none(), _facet("x", "heading", tier), older_reader=older)
+            assert (kept["status"] == "none") is (older and tier == "context")
+    assert datum.reread(datum.facet("y", "heading", "context"), _facet("x", "heading", "context"), older_reader=True)["written"] == "y"
 
 
 def test_a_read_again_that_fails_leaves_the_cached_facet_and_the_take_succeeds(monkeypatch):

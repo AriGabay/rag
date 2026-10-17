@@ -1209,14 +1209,26 @@ PARTIAL_SENTENCES = {
 }
 
 
+# the lead of a partial problem's reason (review, round 14): the judge's reason follows it. ``decisions`` takes it off again to
+# state what was not verified, so the two read one spelling
+PARTIAL_REASON_PREFIX = "נתמך חלקית: "
+
+
+def partial_reason_class(failure_kind: str | None, check: str | None = None) -> str:
+    """The reason class of a partial mark (a key of ``PARTIAL_SENTENCES``): the recency check first, then the failure kind, then
+    the final check; any other mark is ``unspecified``. One rule for the answer's mark (``partial_summary``) and a claim's state
+    (``timeline._unit_claim``)."""
+    kind = failure_kind if failure_kind in FAILURE_KINDS else None
+    return "recency" if check == RECENCY_CHECK else kind or ("final" if check == "final" else "unspecified")
+
+
 def partial_summary(failure_kind: str | None, check: str | None = None) -> dict:
     """A partial mark on the user's normal path (round 14 U7, KTD9): its failure kind and check when known, and the server's
     fixed sentence for its reason class (``PARTIAL_SENTENCES``) — the recency check first, then the failure kind, then the
     final check; any other mark is ``unspecified``. The check is the name of a deterministic check, ``judge``, ``dependency``
     or ``final``."""
     kind = failure_kind if failure_kind in FAILURE_KINDS else None
-    cls = "recency" if check == RECENCY_CHECK else kind or ("final" if check == "final" else "unspecified")
-    return {"failure_kind": kind, "text": PARTIAL_SENTENCES[cls]} | ({"check": check} if check else {})
+    return {"failure_kind": kind, "text": PARTIAL_SENTENCES[partial_reason_class(failure_kind, check)]} | ({"check": check} if check else {})
 
 
 @dataclass
@@ -1287,6 +1299,12 @@ class Problem:
         if self.kind in ("needs_citation", "absence") or self.annotatable or self.resolution == "cut":
             return False
         return not (self.severity == "partial" and self.defect == "none")
+
+    @property
+    def partial_open(self) -> bool:
+        """A partial mark the final text carries: a partial problem the server does not resolve by cutting the span (a cut
+        leaves a marker, not a partial mark)."""
+        return self.severity == "partial" and self.resolution != "cut"
 
     @property
     def removes_unit(self) -> bool:
@@ -1520,6 +1538,11 @@ class VerifyReport:
         return {repair_key(p.unit) for p in self.problems if p.unit.index >= 0 and p.resolution != "cut"
                 and not (claims_only and p.kind == "requirement")}
 
+    def partial_problems(self, index: int | None = None) -> list[Problem]:
+        """The partial problems whose mark the final text carries (``Problem.partial_open``), of the unit ``index`` or, without
+        one, of every unit."""
+        return [p for p in self.problems if p.partial_open and (index is None or p.unit.index == index)]
+
     def conditional_units(self) -> set[int]:
         """The surviving units that show a result of a conditional calculation, qualified by the server as
         conditional (``conditional_notes``)."""
@@ -1592,8 +1615,7 @@ class VerifyReport:
         logged = self.logged()
         out = {"judged": self.judged, "judge_status": self.judge_status, "removed": len(errors),
                # a cut resolves its partial problem: the text carries a marker, not a partial mark (as in ``edit``)
-               "partial": len({p.unit.index for p in self.problems
-                               if p.severity == "partial" and p.resolution != "cut"} - errors),
+               "partial": len({p.unit.index for p in self.partial_problems()} - errors),
                # a qualifier written from the source; a result the server marked conditional is counted apart
                "annotated": sum(1 for p in self.problems if p.annotatable and not p.conditional
                                 and p.unit.index not in errors),
@@ -1652,8 +1674,7 @@ class VerifyReport:
         that failed, or the unit's first), then the claims the judge found only partly supported, else the claims the log
         records as qualified (a unit marked by a check that names no claim, such as the recency check)."""
         recs = self.claims.get(index, [])
-        ids = [p.claim_id for p in self.problems if p.unit.index == index and p.severity == "partial"
-               and p.resolution != "cut" and p.claim_id]
+        ids = [p.claim_id for p in self.partial_problems(index) if p.claim_id]
         ids += [r.id for r in recs if r.action == "qualified" and r.verdict == "partial"]
         if not ids:
             ids = [r.id for r in recs if r.action == "qualified"]
@@ -1669,7 +1690,7 @@ class VerifyReport:
         rows = []
         for n, ids in self.partial_marks:
             idx = next((i for i, recs in self.claims.items() if any(r.id in ids for r in recs)), None)
-            mine = [p for p in self.problems if p.unit.index == idx and p.severity == "partial" and p.resolution != "cut"]
+            mine = self.partial_problems(idx) if idx is not None else []
             p = next((p for p in mine if p.claim_id in ids), mine[0] if mine else None)
             rows.append({"ordinal": n} | partial_summary(p.failure_kind if p else None, p.check if p else None)
                         | ({"claim_id": ids[0], "claim_ids": list(ids)} if ids else {}))
@@ -1898,7 +1919,7 @@ class VerifyReport:
         sentence that says the answer could not be based on the sources."""
         errors = self.removed_units()
         planned = {i: groups for i, groups in self.cuts.items() if i not in errors}
-        partial = {p.unit.index for p in self.problems if p.severity == "partial" and p.resolution != "cut"}
+        partial = {p.unit.index for p in self.partial_problems()}
         notes = [p for p in self.problems if p.annotatable and p.unit.index not in errors]
         requests = [p.reason for p in self.problems if p.kind == "request"]
         cites = [p for p in self.problems if p.kind == "needs_citation" and p.uncited and p.unit.index not in errors]
@@ -3389,8 +3410,9 @@ _LATEST = re.compile(r"(?<![א-ת])(?:[וש]?ה)?(?:עדכני(?:ת|ים|ות)?|
 _TIME_NOUNS = frozenset({"שנה", "שנים", "שנתיים", "חודש", "חודשים", "שבוע", "שבועות", "יום", "ימים", "רבעון", "רבעונים",
                          "תקופה", "עשור", "עשורים", "עונה", "פעם"})
 # "the current opinion", "in the current appraisal": נוכחי / נוכחית after one of these names the document, not the latest value
-# (round 14 U5, KTD10). Only the "current" words are exempt: "the latest appraisal" says the appraisal is the latest.
-_DOCUMENT_NOUNS = frozenset({"שומה", "חוות", "דעת", "דוח", "הערכה", "מסמך", "תחשיב", "נספח"})
+# (round 14 U5, KTD10). Only the "current" words are exempt: "the latest appraisal" says the appraisal is the latest. הערכה and תחשיב
+# are left out (review, round 14): they name a figure as often as a document ("the current assessment is X").
+_DOCUMENT_NOUNS = frozenset({"שומה", "חוות", "דעת", "דוח", "מסמך", "נספח"})
 _CURRENT_WORDS = frozenset({"נוכחי", "נוכחית"})
 MSG_NOT_LATEST = ("הטענה קוראת ל-{older} «העדכני», אבל בתור הזה נרשם ערך מאוחר יותר מאותו נתון של אותו נכס: {newer} "
                   "(מועד {when}, {title}). הצג את {newer} כערך העדכני ואת {older} כערך קודם, עם תאריכיהם ומראי המקום "
@@ -4019,14 +4041,12 @@ def derive_reduction(ws: Workspace, coefficient: str) -> str | None:
     try:
         node = calc.parse(f"1 - {coefficient}")
         out = calc.evaluate(node, chat_tools.computation_operands(ws, [coefficient]))
-        forms = {calc.render(calc.parse(f"1 - {coefficient}"), lambda i: i),
-                 calc.render(calc.parse(f"(1 - {coefficient}) * 100"), lambda i: i)}
+        forms = calc.derived_forms(coefficient, node)
     except (calc.CalcError, chat_tools.ToolError):
         return None
     if out.value <= 0 or out.dims != ():
         return None
-    if (existing := next((c for c in ws.computations.values() if c.result_kind == calc.DERIVED and c.expression in forms),
-                         None)) is not None:
+    if (existing := calc.find_derived(ws.computations, forms)) is not None:
         return existing.cid
     return _derived_computation(ws, f"1 - {coefficient}", Shown(format(out.value.normalize(), "f"), False, 1, 0, 0), True)
 
@@ -5203,7 +5223,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                     kind = (r.failure_kind() if r is not None and (r.verdict in ("unsupported", "contradicts")
                                                                    or r.failure == CONTEXT_NOT_READ)
                             else DEFECT_FAILURES.get(v.defect))
-                    report.problems.append(Problem(u, "נתמך חלקית: " + why, "partial", defect=v.defect,
+                    report.problems.append(Problem(u, PARTIAL_REASON_PREFIX + why, "partial", defect=v.defect,
                                                    failure_kind=kind, check="judge",
                                                    claim_id=r.id if r is not None else recs[0].id))
             elif named := [s for s in dict.fromkeys(v.supported_by) if s not in u.ids]:
@@ -5392,10 +5412,10 @@ def plan_edits(report: VerifyReport) -> None:
             elif r.parent_id:
                 r.action = "rewritten"
             elif any(p.annotatable or p.resolution == "qualifier" for p in mine) or (r.verdict == "partial" and any(
-                    p.severity == "partial" and p.resolution != "cut" for p in mine)) or any(
-                    p.severity == "partial" and p.resolution != "cut" and not p.claim_id for p in mine):
-                # the last: a unit marked by a check that names no claim (the recency check) logs each claim it keeps as
-                # qualified, so its mark pairs with log entries (round 14 U7, KTD9)
+                    p.partial_open for p in mine)) or any(p.partial_open and p.check != "judge" for p in mine):
+                # the last: a unit marked by a check that names no claim (the recency check; ``complete_records`` has already
+                # given its problem the unit's claim id, so the check, not the id, tells) logs each claim it keeps as
+                # qualified, so its mark pairs with log entries (round 14 U7, KTD9; review #8)
                 r.action = "qualified"
             elif any(p.kind == "needs_citation" and p.uncited for p in mine):
                 r.action = "cited"

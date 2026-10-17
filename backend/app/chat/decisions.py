@@ -33,7 +33,6 @@ TEXT_LIMIT = 2000
 REREAD_KEYS = ("source", "scope", "outcome", "reason", "expanded_source")
 # the actions whose entry also states the partial detail (round 14 U7, KTD9): a sentence kept with a part not verified
 DETAIL_ACTIONS = ("qualified", "cut")
-PARTIAL_PREFIX = "נתמך חלקית: "
 
 
 def decision(entry: verify.Logged, sources: list[dict]) -> dict:
@@ -86,6 +85,6 @@ def _partial_detail(entry: verify.Logged, base: dict, reason: str, checked: list
     span = r.text if r is not None and not r.whole_unit else ""
     kept = unit.text.replace(span, "", 1) if entry.action == "cut" and span else unit.text
     return {"supported": " ".join(kept.split())[:TEXT_LIMIT],
-            "not_verified": (span or reason.removeprefix(PARTIAL_PREFIX))[:TEXT_LIMIT],
+            "not_verified": (span or reason.removeprefix(verify.PARTIAL_REASON_PREFIX))[:TEXT_LIMIT],
             "why": {"failure_kind": base["failure_kind"], "check": base["check"]},
             "checked": {"sources": checked, "rereads": reread}}

@@ -339,8 +339,8 @@ def public_partials(items: list) -> list[dict]:
         if type(ordinal) is not int or ordinal < 1:
             continue
         check = r.get("check")
-        ids = [c for c in r.get("claim_ids") or () if isinstance(c, str) and _CLAIM_ID.fullmatch(c)] \
-            if isinstance(r.get("claim_ids"), list) else []
+        claim_ids = r.get("claim_ids")
+        ids = [c for c in claim_ids or () if isinstance(c, str) and _CLAIM_ID.fullmatch(c)] if isinstance(claim_ids, list) else []
         out.append({"ordinal": ordinal}
                    | verify.partial_summary(r.get("failure_kind"), check if isinstance(check, str)
                                             and _CHECK_NAME.fullmatch(check) else None)

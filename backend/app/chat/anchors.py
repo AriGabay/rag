@@ -63,8 +63,9 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from app.answering.verify import _NUMBER
-from app.chat import reader
+from app.chat import datum, reader
 from app.chat.meaning import _norm, units_attested
+from app.chat.slots import clip
 from app.extraction.base import PageGeometry
 from app.extraction.geometry import Span, geometry_box
 
@@ -889,7 +890,7 @@ def anchored_documents(answer: dict | None) -> set[str]:
 # what a context stub keeps of the value's own stub: the document, version and reading, never the value's place (its block range,
 # row, cell, quote, number or span), which would point the context at the value
 _CONTEXT_KEEPS = ("document_id", "version_id", "reading_id", "section", "unit")
-CONTEXT_QUOTE_MAX = 120  # characters of a context's quote (``timeline.CONTEXT_QUOTE_MAX``)
+CONTEXT_QUOTE_MAX = 120  # characters of a context's quote (``timeline.CONTEXT_QUOTE_MAX`` is this one)
 
 
 def context_stub(ws, sid: str) -> dict | None:
@@ -906,7 +907,7 @@ def context_stub(ws, sid: str) -> dict | None:
     at = facet.get("at")
     if isinstance(at, dict) and (at.get("segments") or at.get("blocks")):
         return stub | {"kind": "quote"} | {k: at[k] for k in ("segments", "blocks") if at.get(k)}
-    if facet.get("part") in ("caption", "table_note") and base.get("table_index") is not None:
+    if facet.get("part") in (datum.PART_CAPTION, datum.PART_TABLE_NOTE) and base.get("table_index") is not None:
         return stub | {"kind": "table", "table_index": base["table_index"]} | (
             {"pages": base["pages"]} if base.get("pages") else {})
     return None
@@ -967,4 +968,4 @@ def attach(ws, answer: dict) -> None:
         d["anchor"] = bound(snapshot(stub, readings.get(vid), ws.readings.get(vid, stub.get("reading_id")), cited))
     for ctx, _, _ in contexts:
         if ctx.get("quote") and (sentence := _sentence_of(ctx["anchor"])):
-            ctx["quote"] = sentence[:CONTEXT_QUOTE_MAX].rstrip()
+            ctx["quote"] = clip(sentence, CONTEXT_QUOTE_MAX)

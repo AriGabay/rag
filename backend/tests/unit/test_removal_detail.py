@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
+import pytest
+
 from app.chat import api, decisions, verify
 from app.db import TenantContext
 
@@ -48,8 +50,8 @@ def _qualified(*, whole_unit: bool = False) -> verify.Logged:
         verdict="partial", action="qualified", sources_checked=["S1", "S2"], whole_unit=whole_unit,
         rereads=[{"source": "S1", "scope": "next_page", "outcome": "not_found"},
                  {"source": "S2", "scope": "continuation", "outcome": "partial", "expanded_source": "S3"}])
-    problem = verify.Problem(unit, "נתמך חלקית: התקופה לא צוינה במקור", "partial", defect="units", failure_kind="wrong_unit",
-                             check="judge", claim_id=CLAIM)
+    problem = verify.Problem(unit, verify.PARTIAL_REASON_PREFIX + "התקופה לא צוינה במקור", "partial", defect="units",
+                             failure_kind="wrong_unit", check="judge", claim_id=CLAIM)
     return verify.Logged(CLAIM, "qualified", unit, [record], problem)
 
 
@@ -119,3 +121,39 @@ def test_the_message_says_whether_the_viewer_may_open_diagnostics():
     assert api._message_json(row, ctx=_ctx("employee", other))["can_view_diagnostics"] is False
     assert api._message_json(row)["can_view_diagnostics"] is False  # no viewer: nothing is offered
     assert api._message_json(_row("user", owner), ctx=_ctx("employee", owner))["can_view_diagnostics"] is False
+
+
+# --- the reason class of a partial mark (review #8) ---------------------------------------------------------------------------
+
+_KNOWN_KIND = verify.FAILURE_KINDS[0]
+
+
+@pytest.mark.parametrize("failure_kind, check, expected", [
+    (None, verify.RECENCY_CHECK, "recency"),  # the recency check first, whatever the kind
+    ("contradicts_source", verify.RECENCY_CHECK, "recency"),
+    (None, "final", "final"),  # the final check judged the sentence as saved
+    (_KNOWN_KIND, "final", _KNOWN_KIND),  # a known failure kind beats the check "final"
+    (_KNOWN_KIND, "judge", _KNOWN_KIND),
+    ("wrong_unit", None, "wrong_unit"),
+    ("not_a_failure_kind", "judge", "unspecified"),  # a kind the server does not know is no class
+    ("not_a_failure_kind", "final", "final"),
+    (None, "judge", "unspecified"),
+    (None, None, "unspecified"),
+])
+def test_the_reason_class_of_a_partial_mark_and_its_fixed_sentence(failure_kind, check, expected):
+    assert verify.partial_reason_class(failure_kind, check) == expected
+    summary = verify.partial_summary(failure_kind, check)
+    assert summary["text"] == verify.PARTIAL_SENTENCES[expected]
+    assert summary["failure_kind"] == (failure_kind if failure_kind in verify.FAILURE_KINDS else None)
+    assert ("check" in summary) is bool(check) and summary.get("check", check) == check
+    assert expected in verify.PARTIAL_SENTENCES
+
+
+def test_every_reason_class_has_a_distinct_sentence_and_the_prefix_is_one_constant():
+    assert len(set(verify.PARTIAL_SENTENCES.values())) == len(verify.PARTIAL_SENTENCES)
+    assert {"recency", "final", "unspecified"} <= set(verify.PARTIAL_SENTENCES) and set(verify.FAILURE_KINDS) <= set(
+        verify.PARTIAL_SENTENCES)
+    assert not hasattr(decisions, "PARTIAL_PREFIX")
+    # a whole-unit claim names no span: the judge's reason is what was not verified, without the lead the problem adds
+    detail = decisions.decision(_qualified(whole_unit=True), [])
+    assert detail["not_verified"] == "התקופה לא צוינה במקור" and detail["reason"].startswith(verify.PARTIAL_REASON_PREFIX)

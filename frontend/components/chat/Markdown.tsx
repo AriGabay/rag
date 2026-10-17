@@ -33,6 +33,10 @@ export function plainAnswer(markdown: string): string {
   return markdown.replace(CITATION_GROUP, "").replace(/[ \t]+([.,:;])/g, "$1").trim();
 }
 
+const CITE_PREFIX = "#cite-";
+const CUT_PREFIX = "#cut-";
+const PARTIAL_PREFIX = "#partial-";
+
 function withCitationLinks(markdown: string): string {
   return markdown.replace(CITATION_GROUP, (_all, ids: string) =>
     ids
@@ -65,8 +69,8 @@ function MarkdownImpl({ markdown, citations, onCite, cuts, onCut, partials, onPa
   const components = useMemo<Components>(
     () => ({
       a({ href, children }) {
-        if (href && href.startsWith("#cite-")) {
-          const id = href.slice(6);
+        if (href && href.startsWith(CITE_PREFIX)) {
+          const id = href.slice(CITE_PREFIX.length);
           const target = citations.get(id);
           if (!target) return <span className="cite" aria-disabled="true">?</span>;
           return (
@@ -81,8 +85,8 @@ function MarkdownImpl({ markdown, citations, onCite, cuts, onCut, partials, onPa
             </button>
           );
         }
-        if (href && href.startsWith("#cut-")) {
-          const n = Number(href.slice(5));
+        if (href && href.startsWith(CUT_PREFIX)) {
+          const n = Number(href.slice(CUT_PREFIX.length));
           if (cuts?.has(n) && onCut) {
             return (
               <button
@@ -103,8 +107,8 @@ function MarkdownImpl({ markdown, citations, onCite, cuts, onCut, partials, onPa
             </span>
           );
         }
-        if (href && href.startsWith("#partial-")) {
-          const n = Number(href.slice(9));
+        if (href && href.startsWith(PARTIAL_PREFIX)) {
+          const n = Number(href.slice(PARTIAL_PREFIX.length));
           if (partials?.has(n) && onPartial) {
             return (
               <button

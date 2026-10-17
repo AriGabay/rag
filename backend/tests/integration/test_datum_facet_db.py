@@ -19,7 +19,7 @@ from tests.integration.test_chat_calculation import quote, run, workspace
 
 pytestmark = pytest.mark.db
 
-SECTION_A, SECTION_B = "3. היוון התזרימים", "4. סיכום והערות"
+SECTION_A, SECTION_B, SECTION_C = "3. היוון התזרימים", "4. סיכום והערות", "5. נספח נתונים"
 LEAD_IN = "תזרים הכנסות משטחי פרסום על הגג:"
 TWO_RATES = "הובאה הפחתה של 10% בגין סחירות והפחתה של 20% בגין עוצמת ניצול."
 BLOCKS = [  # (kind, section, text, table_index)
@@ -486,6 +486,54 @@ def test_ae7_a_cached_none_is_read_again_and_only_the_facet_of_its_row_changes(o
     assert len(_cached_rows(office)) == 1 and T.VALUE_VERIFIER_VERSION == "value-v5"
 
 
+def test_review7_a_stale_stated_context_facet_is_replaced_in_place_by_the_careful_read_and_a_current_one_is_not(office):
+    """A round-13 row holds a stated lead-in; the stored text above the value no longer names a component, so the current
+    reader finds none: the row's facet is corrected (facet and reader only). The same row, once written by the current reader,
+    is served as it is, whatever the blocks say."""
+    ws, _ = _take(office, SECTION_A, BLOCKS[3][2], "9")
+    stated = ws.values["V1"].facet
+    assert stated["status"] == "stated" and stated["tier"] == "context"
+    with tenant_tx(office.system) as conn:  # the round-13 record: stated context facet, no reader named
+        conn.execute(text("UPDATE verified_values SET value = value #- '{record,facet_reader}'"))
+        conn.execute(text("UPDATE document_blocks SET text = 'פירוט נוסף להלן:' WHERE block_index IN (1, 2)"))
+    (before,) = _cached_rows(office)
+    assert "facet_reader" not in before.value["record"] and before.value["record"]["facet"] == stated
+
+    later = workspace(office)
+    out = run(later, "take_value", source=_q_of(later, "שיעור היוון"), locator={}, meaning=_meaning(), label="שיעור")
+    assert out.startswith("V1 נרשם"), out
+    assert later.values["V1"].facet["status"] == "none", "the old reader's borrowed lead-in is not presented as the source's"
+    (after,) = _cached_rows(office)  # same row, same key, only the facet and its reader changed; nothing deleted
+    assert after.locator == before.locator
+    changed = {k for k in set(after.value["record"]) | set(before.value["record"])
+               if after.value["record"].get(k) != before.value["record"].get(k)}
+    assert changed == {"facet", "facet_reader"}
+    assert after.value["record"]["facet"] == later.values["V1"].facet
+    assert after.value["record"]["facet_reader"] == T.FACET_READER_VERSION and len(_cached_rows(office)) == 1
+
+    # the other direction: a stated context facet the current reader wrote is never lowered by a later read
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE verified_values SET value = jsonb_set(jsonb_set(value, '{record,facet}', CAST(:f AS jsonb)),"
+                          " '{record,facet_reader}', CAST(:r AS jsonb))"),
+                     {"f": json.dumps(stated, ensure_ascii=False), "r": json.dumps(T.FACET_READER_VERSION)})
+    (kept_before,) = _cached_rows(office)
+    again = workspace(office)
+    run(again, "take_value", source=_q_of(again, "שיעור היוון"), locator={}, meaning=_meaning(), label="שיעור")
+    assert again.values["V1"].facet == stated
+    (kept_after,) = _cached_rows(office)
+    assert kept_after.value == kept_before.value
+    # and the write guard itself, at the SQL: a nothing-facet never overwrites a stated facet of the current reader
+    with tenant_tx(office.system) as conn:
+        T._write_facet(conn, *_row_key(conn), datum_none())
+    (guarded,) = _cached_rows(office)
+    assert guarded.value == kept_before.value
+
+
+def _row_key(conn) -> tuple:
+    row = conn.execute(text("SELECT version_id, reading_id, locator FROM verified_values")).one()
+    return row.version_id, row.reading_id, row.locator
+
+
 def datum_none() -> dict:
     from app.chat import datum
 
@@ -564,3 +612,145 @@ def test_ae8_a_measurement_read_from_the_text_of_a_picture_says_its_context_was_
     T.tool_find_measurements(ws, "שיעור", metric_kinds=["rate"])
     facet = next(m.facet for m in ws.measurements.values() if m.row.statement_key == "b3:x")
     assert (facet["status"], facet["reason"]) == ("not_read", "picture_cell")
+
+
+# --- review #5: the tool layer's context reads that no other test executed (table notes, the unit floor, the block cap) ----------
+
+NOTE = "הערך שנקבע הוא מקדם הפחתה בגין עוצמת ניצול."
+GENERIC_ROW = "הערך שנקבע"
+
+
+def _noted_tables(office, indexes: tuple[int, ...], notes: list[str]) -> None:
+    """Tables (``indexes``) whose body row has a generic label and no caption or title naming a component, with a coefficient
+    measurement on that row: only a note of the table can name its component."""
+    with tenant_tx(office.system) as conn:
+        ver = conn.execute(text("SELECT id FROM document_versions WHERE document_id = :d"), {"d": office.doc}).scalar_one()
+        for i in indexes:
+            structure = {"headers": ["רכיב", "ערך"], "caption": f"טבלה {i}", "title": [], "notes": notes,
+                         "section": SECTION_B, "block_index": 7,
+                         "rows": [{"cells": ["שטח", "10"]}, {"cells": [GENERIC_ROW, "0.8"]}]}
+            conn.execute(text("INSERT INTO extracted_tables (office_id, document_id, version_id, table_index, page_start,"
+                              " page_end, structure) VALUES (app_office(), :d, :v, :t, 1, 1, CAST(:s AS jsonb))"),
+                         {"d": office.doc, "v": ver, "t": i, "s": json.dumps(structure, ensure_ascii=False)})
+            conn.execute(text(
+                "INSERT INTO measurements (office_id, document_id, version_id, block_index, table_index, row_index,"
+                " statement_key, metric, metric_kind, value, value_form, value_text, unit, period, vat, subject_role,"
+                " value_role, quote, extraction_version, model, status, issues) VALUES (app_office(), :d, :v, 7, :t,"
+                " 1, :sk, 'מקדם התאמה', 'coefficient', 0.8, 'exact', '0.8', 'ratio', 'none', 'unknown', 'general',"
+                " 'other', :q, :e, 'test', 'auto_validated', '[]'::jsonb)"),
+                {"d": office.doc, "v": ver, "t": i, "sk": f"t{i}:r1:הערך", "q": f"{GENERIC_ROW} | 0.8",
+                 "e": EXTRACTION_VERSION})
+
+
+def _notes_queries(statements: list[str]) -> list[str]:
+    return [s for s in statements if "structure->'notes'" in s]
+
+
+def test_a_bare_table_row_reads_its_facet_from_the_note_of_its_table_in_one_query_per_page_and_no_query_without_bare_rows(office):
+    # the fixture's one coefficient row names its component itself: nothing is bare, so the notes are not asked for
+    ws = workspace(office)
+    _, seen = _statements(lambda: T.tool_find_measurements(ws, "מקדם", metric_kinds=["coefficient"]))
+    assert {m.facet["status"] for m in ws.measurements.values()} == {"stated"} and not _notes_queries(seen)
+    # two more tables whose generic row label only a note explains: both read in ONE notes query
+    _noted_tables(office, (1, 2), [NOTE])
+    ws = workspace(office)
+    _, seen = _statements(lambda: T.tool_find_measurements(ws, "מקדם", metric_kinds=["coefficient"]))
+    assert len(_notes_queries(seen)) == 1, "the notes of every bare table of a page come from one statement"
+    noted = [m for m in ws.measurements.values() if m.row.statement_key.startswith(("t1:", "t2:"))]
+    assert len(noted) == 2
+    for m in noted:
+        assert (m.facet["status"], m.facet["part"], m.facet["tier"], m.facet["written"]) == (
+            "stated", "table_note", "context", "עוצמת ניצול")
+    # a note that names another row's label settles nothing for this one
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE extracted_tables SET structure = jsonb_set(structure, '{notes}', CAST(:n AS jsonb))"
+                          " WHERE table_index IN (1, 2)"), {"n": json.dumps(["שטח: הפחתה בגין עוצמת ניצול."], ensure_ascii=False)})
+    ws = workspace(office)
+    T.tool_find_measurements(ws, "מקדם", metric_kinds=["coefficient"])
+    assert {m.facet["status"] for m in ws.measurements.values() if m.row.statement_key.startswith(("t1:", "t2:"))} == {"none"}
+
+
+def _open_the_way(conn) -> None:
+    """Blocks 3 and 4 become plain paragraphs without a number: a heading ends the context read, a number stands between."""
+    conn.execute(text("UPDATE document_blocks SET text = 'הנתונים נבדקו.' WHERE block_index = 3"))
+    conn.execute(text("UPDATE document_blocks SET text = 'המסמכים נסקרו.', kind = 'paragraph' WHERE block_index = 4"))
+
+
+def _two_appraisals(office, *, leak: bool) -> None:
+    """The fixture's blocks as one section of two appraisal units (blocks 0-3 and 4-8): the consideration is named in the first
+    unit (block 2, a lead-in), the reduction (block 6) is bare and sits in the second. One section path: only the unit's first
+    block (the floor) keeps the first unit's lead-in from being borrowed. ``leak``: block 3 carries no number, so nothing but the
+    floor stands between them."""
+    from app.chat import units
+
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_blocks SET section = :s, section_path = :sp"), {"s": SECTION_A, "sp": [SECTION_A]})
+        if leak:  # no number and no heading between the lead-in and the reduction but the unit edge
+            _open_the_way(conn)
+        ver = conn.execute(text("SELECT id FROM document_versions WHERE document_id = :d"), {"d": office.doc}).scalar_one()
+        reading = units.reading_of(conn, ver)
+        units._insert(conn, ver, reading, [
+            units.Unit(1, "appraisal", "שומה סינתטית א", (), {}, 1, 1, 0, 3, "certain", {}),
+            units.Unit(2, "appraisal", "שומה סינתטית ב", (), {}, 1, 1, 4, 8, "certain", {})])
+
+
+def test_the_context_read_stops_at_the_first_block_of_the_appraisal_unit_for_take_value_and_for_a_listing(office):
+    # without a second unit the lead-in two blocks above is the reduction's component (the read reaches it)
+    _add_text_measurement(office, 6, BLOCKS[6][2], "10%", 10, "b6:x")
+    _two_appraisals(office, leak=True)
+    ws = workspace(office)
+    ws.doc = office.doc
+    T.tool_outline(ws, ws.doc)
+    # the second unit's text starts before its first heading: its section is the one the outline lists under context 2
+    second = re.search(r'<source id="(S\d+)"', T.tool_read(ws, {"section": "§2"})).group(1)
+    out = run(ws, "take_value", source=second, locator=quote(BLOCKS[6][2].rstrip("."), "10"), meaning=_meaning(),
+              label="שיעור")
+    assert out.startswith("V1 נרשם"), out
+    taken = ws.values["V1"].facet
+    assert (taken["status"], taken["reason"]) == ("none", "not_in_range"), "unit 1's lead-in is not unit 2's component"
+    listed = workspace(office)
+    T.tool_find_measurements(listed, "שיעור", metric_kinds=["rate"])
+    by = {m.row.statement_key: m for m in listed.measurements.values()}
+    assert (by["b6:x"].facet["status"], by["b6:x"].facet["reason"]) == ("none", "not_in_range")
+    assert by["b1:x"].facet["part"] == "sentence"  # a value with its own phrase is unchanged
+
+
+def test_without_a_unit_edge_the_same_read_borrows_the_lead_in_so_the_floor_is_what_stops_it(office):
+    """The control of the test above: same text, one unit."""
+    _add_text_measurement(office, 6, BLOCKS[6][2], "10%", 10, "b6:x")
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_blocks SET section = :s, section_path = :sp"), {"s": SECTION_A, "sp": [SECTION_A]})
+        _open_the_way(conn)
+    ws = workspace(office)
+    ws.doc = office.doc
+    out = run(ws, "take_value", source=_source_of(ws, SECTION_A), locator=quote(BLOCKS[6][2].rstrip("."), "10"),
+              meaning=_meaning(), label="שיעור")
+    assert out.startswith("V1 נרשם"), out
+    assert (ws.values["V1"].facet["status"], ws.values["V1"].facet["part"]) == ("stated", "lead_in")
+
+
+def test_more_than_the_candidate_blocks_of_filler_above_a_value_make_the_read_capped_not_none(office):
+    filler = T.CANDIDATE_BLOCKS + 5
+    target = 11 + filler
+    with tenant_tx(office.system) as conn:
+        ver = conn.execute(text("SELECT id FROM document_versions WHERE document_id = :d"), {"d": office.doc}).scalar_one()
+        rows = [("heading", SECTION_C, 9), ("paragraph", LEAD_IN, 10)]
+        rows += [("paragraph", "נבדק.", 11 + i) for i in range(filler)] + [("paragraph", "שיעור היוון 12%.", target)]
+        for kind, body, index in rows:
+            conn.execute(text(
+                "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
+                " section_path, page, text, status, table_index) VALUES (app_office(), :d, :v, :b, :k, :s, :sp, 1,"
+                " :t, 'read', NULL)"),
+                {"d": office.doc, "v": ver, "b": index, "k": kind, "s": SECTION_C, "sp": [SECTION_C], "t": body})
+    _add_text_measurement(office, target, "שיעור היוון 12%.", "12%", 12, "far:x")
+    ws = workspace(office)
+    ws.doc = office.doc
+    out = run(ws, "take_value", source=_source_of(ws, SECTION_C), locator=quote("שיעור היוון 12%".rstrip("."), "12"),
+              meaning=_meaning(), label="שיעור")
+    assert out.startswith("V1 נרשם"), out
+    taken = ws.values["V1"].facet
+    assert (taken["status"], taken["reason"]) == ("not_read", "cap"), "a search cut by the block limit is not 'none'"
+    listed = workspace(office)
+    T.tool_find_measurements(listed, "שיעור היוון", metric_kinds=["rate"])
+    far = next(m for m in listed.measurements.values() if m.row.statement_key == "far:x")
+    assert (far.facet["status"], far.facet["reason"]) == ("not_read", "cap")

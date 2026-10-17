@@ -1641,6 +1641,23 @@ button.cut-marker:focus-visible {
   margin-inline-start: 6px;
 }
 
+/* modifiers of `.tl-kind`: a note on its own line (`--block`), and one without the leading gap (`--flush`) */
+.tl-kind--block {
+  display: block;
+}
+
+.tl-kind--flush {
+  margin-inline-start: 0;
+}
+
+/* the line under a facet that names where its component was read from */
+.tl-facet-context {
+  font-weight: 400;
+  font-size: 12.5px;
+  color: var(--chat-muted);
+  overflow-wrap: anywhere;
+}
+
 .tl-marks {
   display: flex;
   flex-wrap: wrap;

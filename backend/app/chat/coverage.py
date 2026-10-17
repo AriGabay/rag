@@ -271,7 +271,8 @@ def clashing(a: Comparable, b: Comparable) -> bool:
 
 def conflicting_pairs(items: Sequence[Comparable]) -> list[tuple[int, int]]:
     """The pairs (indexes into ``items``, ``i < j``) that conflict: the one conflict rule of the answer and its timeline
-    (round 12 U11, R18, KTD13; ``conflicting`` and ``timeline.build`` both read it, nothing else decides a conflict).
+    (round 12 U11, R18, KTD13; ``conflicting`` and ``timeline.build`` both read it, and with ``timeline.adjustment_conflicts``, which
+    decides the pairs across a coefficient and a proportion, nothing else decides a conflict).
 
     Two data of one ``key`` with different amounts conflict when their periods overlap (a year and a day inside it overlap;
     a range runs to its end) or when either has no date, unless the one without a date is undated only because it is history
@@ -302,7 +303,9 @@ def conflicting_pairs(items: Sequence[Comparable]) -> list[tuple[int, int]]:
 def conflicting(ws: Workspace, document_ids: list[str] | None = None, ids: Collection[str] | None = None) -> bool:
     """Whether values the turn registered (V#) or measurements it listed (M#) give one datum different amounts: true only for
     a conflict pair inside a datum class (round 13 U4, R3, R4, KTD4) — the classes of ``timeline.buckets``, the same the
-    timeline shows, so this is true exactly when the timeline shows a conflict mark (round 12 U11, R18, KTD13: R8).
+    timeline shows — or a coefficient and a proportion of one consideration that are not one adjustment
+    (``timeline.adjustment_conflicts``, round 14 review #3), so this is true exactly when the timeline shows a conflict mark
+    (round 12 U11, R18, KTD13: R8).
     Two components of one appraisal (decided different), two data whose facets could not be compared (undecided), two
     properties, two scenarios, a party's claim and the decision are not one datum and never conflict; a datum undated only
     because it is history or a comparable conflicts with nothing. Only documents in ``document_ids``, and only the ids in
@@ -325,9 +328,11 @@ def conflicting(ws: Workspace, document_ids: list[str] | None = None, ids: Colle
             amounts.setdefault(d.fields, set()).add(d.comparable)
     open_fields = {f for f, seen in amounts.items() if len(seen) > 1}
     asked = [d.ref for d in everything if d.fields in open_fields and kept(d)]
-    if not asked:
-        return False
-    return any(bucket.conflicts(kept) for bucket in timeline.buckets(ws, asked, everything=everything))
+    if asked and any(bucket.conflicts(kept) for bucket in timeline.buckets(ws, asked, everything=everything)):
+        return True
+    # the other half of the one rule (round 14 review #3): a coefficient and a proportion that are not one adjustment are in two
+    # families, hence two buckets, and the table marks them ``conflict``
+    return bool(timeline.adjustment_conflicts(ws, kept, everything=everything))
 
 
 def validate_requested(ws: Workspace, requested, opened: dict[str, tuple[str, dict]] | None = None) -> list[dict]:
