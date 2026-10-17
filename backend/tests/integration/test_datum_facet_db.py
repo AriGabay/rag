@@ -805,3 +805,47 @@ def test_a_text_measurement_in_a_wrapped_paragraph_block_has_the_same_component(
     T.tool_find_measurements(ws, "שיעור", metric_kinds=["rate"])
     row = next(m for m in ws.measurements.values() if m.row.statement_key == "wrap:x")
     _assert_wrapped_context(row.facet)
+
+
+# --- label-value lines with no end punctuation: each value takes its own line's component ---------------------------------
+
+# a PDF paragraph block of label-value lines (synthetic); no line ends with punctuation
+LABEL_LINES = [("שיעור היוון לתזרים הפיקדונות 7.75%", "7.75%", "7.75", "תזרים הפיקדונות"),
+               ("שיעור היוון לתזרים התפעול 10.00%", "10.00%", "10.00", "תזרים התפעול"),
+               ('שיעור היוון לתזרים תשלומי מע"מ ופחת 8.00%', "8.00%", "8.00", 'תזרים תשלומי מע"מ ופחת'),
+               ("שיעור היוון להכנסות משכירות 7.25%", "7.25%", "7.25", "הכנסות משכירות")]
+LABEL_BLOCK = "\n".join(line for line, *_ in LABEL_LINES)
+LABEL_BLOCK_INDEX = 10
+
+
+def _add_label_block(office) -> None:
+    with tenant_tx(office.system) as conn:
+        ver = conn.execute(text("SELECT id FROM document_versions WHERE document_id = :d"), {"d": office.doc}).scalar_one()
+        for index, kind, body in ((9, "heading", SECTION_C), (LABEL_BLOCK_INDEX, "paragraph", LABEL_BLOCK)):
+            conn.execute(text(
+                "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
+                " section_path, page, text, status, table_index) VALUES (app_office(), :d, :v, :b, :k, :s, :sp, 1,"
+                " :t, 'read', NULL)"),
+                {"d": office.doc, "v": ver, "b": index, "k": kind, "s": SECTION_C, "sp": [SECTION_C], "t": body})
+
+
+@pytest.mark.parametrize(("line", "_written", "number", "component"), LABEL_LINES)
+def test_a_value_on_a_label_value_line_of_a_stored_block_takes_its_own_lines_component(office, line, _written, number, component):
+    _add_label_block(office)
+    ws = workspace(office)
+    ws.doc = office.doc
+    out = run(ws, "take_value", source=_source_of(ws, SECTION_C), locator=quote(line, number), meaning=_meaning(), label="שיעור")
+    assert out.startswith("V1 נרשם"), out
+    facet = ws.values["V1"].facet
+    assert (facet["status"], facet["written"], facet["part"], facet["tier"]) == ("stated", component, "sentence", "own"), facet
+
+
+def test_text_measurements_on_label_value_lines_each_have_their_own_lines_component(office):
+    _add_label_block(office)
+    for i, (line, written, _number, _component) in enumerate(LABEL_LINES):
+        _add_text_measurement(office, LABEL_BLOCK_INDEX, line, written, float(written.rstrip("%")), f"lv{i}:x")
+    ws = workspace(office)
+    T.tool_find_measurements(ws, "שיעור", metric_kinds=["rate"])
+    for i, (_line, _written, _number, component) in enumerate(LABEL_LINES):
+        row = next(m for m in ws.measurements.values() if m.row.statement_key == f"lv{i}:x")
+        assert (row.facet["status"], row.facet["written"], row.facet["tier"]) == ("stated", component, "own"), row.facet

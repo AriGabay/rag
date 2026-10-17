@@ -1504,3 +1504,80 @@ def test_the_whole_sentence_of_a_quote_is_cached_with_its_facts_and_an_older_rec
     assert facts["sentence"] == WRAPPED_OWN and T._own_sentence(T._facts_from_json(facts)[0]) == WRAPPED_OWN
     del facts["sentence"]  # a record written before: today's line
     assert T._own_sentence(T._facts_from_json(facts)[0]) == "של 10%."
+
+
+# =======================================================================================================================
+# round 14 follow-up: label-value LINES with no end punctuation are not one sentence; a phrase belongs to the nearer number
+# =======================================================================================================================
+
+# a PDF paragraph block of label-value lines (synthetic): no line ends with punctuation, each ends with its own number
+LABEL_LINES = [("שיעור היוון לתזרים הפיקדונות 7.75%", "7.75", "תזרים הפיקדונות"),
+               ("שיעור היוון לתזרים התפעול 10.00%", "10.00", "תזרים התפעול"),
+               ('שיעור היוון לתזרים תשלומי מע"מ ופחת 8.00%', "8.00", 'תזרים תשלומי מע"מ ופחת'),
+               ("שיעור היוון להכנסות משכירות 7.25%", "7.25", "הכנסות משכירות")]
+LABEL_BLOCK = "\n".join(line for line, _, _ in LABEL_LINES)
+PIPE_LINES = [("מקדם הפחתה לסחירות וגמישות מועטה של שימושים | 0.8", "0.8", "סחירות וגמישות מועטה של שימושים"),
+              ("מקדם הפחתה בגין אינטנסיביות שימוש | 0.9", "0.9", "אינטנסיביות שימוש")]
+PIPE_BLOCK = "\n".join(line for line, _, _ in PIPE_LINES)
+
+
+def test_a_line_that_ends_with_a_number_ends_its_statement_it_is_no_wrap():
+    assert datum.unwrap(LABEL_BLOCK) == LABEL_BLOCK and datum.unwrap(PIPE_BLOCK) == PIPE_BLOCK
+    assert len(datum.sentences_of(LABEL_BLOCK)) == 4 and len(datum.sentences_of(PIPE_BLOCK)) == 2
+    # the number may carry a unit, a sign, a closing mark or a unit word
+    for end in ("7%", "7.5‰", "300 ₪", 'ב-300 ש"ח', 'ב-120 מ"ר', "(7%)", "5 אחוז", "5 שנים", "0.8"):
+        text = f"שיעור היוון לתזרים א' {end}\nשיעור היוון לתזרים ב' 8%"
+        assert datum.unwrap(text) == text, end
+    # the reported shapes still unwrap: the line before ends with a word
+    assert datum.unwrap("מקדם הפחתה נוסף\nשל 10%.") == "מקדם הפחתה נוסף של 10%."
+    assert datum.unwrap("לתת הפחתה בגין\nאינטנסיביות שימוש.") == "לתת הפחתה בגין אינטנסיביות שימוש."
+    # a number inside a word's line is not the line's end; a value's own sentence that goes on on the next line (a purpose
+    # phrase) is still one sentence
+    assert datum.unwrap("נקבע שיעור היוון של 7%\nלתזרים הכנסות מחניה.") == "נקבע שיעור היוון של 7% לתזרים הכנסות מחניה."
+    assert datum.unwrap("נקבע שיעור היוון של 7%\nעבור תזרים הכנסות.") == "נקבע שיעור היוון של 7% עבור תזרים הכנסות."
+
+
+@pytest.mark.parametrize(("line", "number", "component"), LABEL_LINES)
+def test_each_label_value_line_of_a_block_without_punctuation_gets_its_own_component(line, number, component):
+    own = datum.own_sentence(LABEL_BLOCK, line, number)
+    assert own == line
+    f = datum.read_quote(own, number, "rate")
+    assert (f["status"], f["written"], f["part"], f["tier"]) == ("stated", component, "sentence", "own"), f
+    f = _read_at(_rows(("paragraph", LABEL_BLOCK)), 0, line, number, kind="rate")
+    assert (f["status"], f["written"], f["part"], f["tier"]) == ("stated", component, "sentence", "own"), f
+    # the number alone as the quote: the value's own sentence is still the whole line
+    f = _read_at(_rows(("paragraph", LABEL_BLOCK)), 0, number + "%", number, kind="rate")
+    assert (f["status"], f["written"]) == ("stated", component), f
+
+
+@pytest.mark.parametrize(("line", "number", "component"), PIPE_LINES)
+def test_each_pipe_separated_line_of_a_block_gets_its_own_component(line, number, component):
+    # the number alone is the quote (a whole "a | b" line is refused by take_value as a table row)
+    f = _read_at(_rows(("paragraph", PIPE_BLOCK)), 0, number, number, kind="coefficient")
+    assert (f["status"], f["written"], f["part"], f["tier"]) == ("stated", component, "sentence", "own"), f
+    own = datum.own_sentence(PIPE_BLOCK, line, number)  # and the reader itself, given the whole line
+    assert own == line
+    assert datum.read_quote(own, number, "coefficient")["written"] == component
+
+
+def test_a_table_separator_at_the_edge_of_a_written_facet_is_dropped():
+    for sep in ("|", "¦", "│"):
+        assert datum.tidy(f"אינטנסיביות שימוש {sep}") == "אינטנסיביות שימוש"
+        assert datum.tidy(f"{sep} אינטנסיביות שימוש") == "אינטנסיביות שימוש"
+    assert datum.tidy("אינטנסיביות שימוש|") == "אינטנסיביות שימוש"
+    assert datum.tidy("אינטנסיביות | שימוש") == "אינטנסיביות | שימוש"  # inside: the source's own words
+
+
+@pytest.mark.parametrize(("number", "component"), [("7%", "תזרים ראשון"), ("8%", "תזרים שני")])
+def test_values_joined_on_one_line_with_commas_keep_their_own_phrases(number, component):
+    sentence = "שיעור היוון לתזרים ראשון 7%, לתזרים שני 8%."
+    assert datum.read_sentence(sentence, number[:-1], "rate") == _facet(component, "sentence")
+
+
+def test_a_phrase_after_a_number_that_another_number_follows_belongs_to_that_number():
+    # four lines joined into one sentence (no breaks left): each value still takes the phrase right before it
+    joined = " ".join(line for line, _, _ in LABEL_LINES)
+    for _, number, component in LABEL_LINES:
+        assert datum.read_sentence(joined, number, "rate") == _facet(component, "sentence"), number
+    # the phrase before a number that another number follows is that number's: the last value has none before it
+    assert datum.read_sentence("הובאה הפחתה עבור סחירות 5% ו-8%", "8", "coefficient") is None

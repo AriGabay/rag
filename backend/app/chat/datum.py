@@ -372,7 +372,8 @@ _PHRASE_MAX = 8
 
 # function words and connectors that open or close a phrase without belonging to the component it names ("…מועטה של"
 # before a number, "בשיעור …" after one)
-_EDGE_WORDS = frozenset({"של", "על", "עם", "את", "ב", "ל", "ו", "בגובה", "בשיעור", "בסך", "הוא", "היא", "-", "–", "—"})
+_EDGE_WORDS = frozenset({"של", "על", "עם", "את", "ב", "ל", "ו", "בגובה", "בשיעור", "בסך", "הוא", "היא", "-", "–", "—",
+                         "|", "¦", "│"})  # a table separator of a text line "<label> | <value>" belongs to no facet
 
 
 def tidy(written: str) -> str:
@@ -383,7 +384,7 @@ def tidy(written: str) -> str:
         words.pop()
     while words and (words[0].strip(":,;") in _EDGE_WORDS or not _bare(words[0])):
         words.pop(0)
-    return " ".join(words).strip(" :,;-–—")
+    return " ".join(words).strip(" :,;-–—|¦│")
 
 
 def _bare(token: str) -> str:
@@ -403,8 +404,9 @@ def _excluded_head(word: str) -> bool:
 def _find_phrase(sentence: str, written: str, family: str) -> tuple[str, int, list[str]] | None:
     """The purpose phrase of a sentence, ``(phrase, index of the token that opens it, tokens)``, or None: the words after
     ל / עבור / בגין / בעבור that follow the number (``written``; none when empty) or the metric word, to the clause end. See
-    ``read_sentence`` for the rules. With a number, the phrase right after it wins over one before it (round 14 U2 follow-up): the
-    one before is kept only when none follows, and only when its clause did not end before the number."""
+    ``read_sentence`` for the rules. With a number, the phrase right after it wins over one before it (round 14 U2 follow-up) unless another number follows that
+    phrase in its clause (it is that number's); the one before is the latest of the number's own clause, else of an earlier one, and
+    is the number's only when no other number stands between it and the number."""
     tokens = sentence.split()
     bare = [_bare(t) for t in tokens]
     at = next((i for i, t in enumerate(tokens) if _number_token(t, written)), None)
@@ -412,8 +414,8 @@ def _find_phrase(sentence: str, written: str, family: str) -> tuple[str, int, li
                    and (at is None or i < at)), None)
     marks = [i for i in (at, metric) if i is not None]
     j = min(marks) + 1 if marks else 0
-    before: tuple[str, int, list[str]] | None = None
-    closed = False  # a clause ended before the number: a phrase between that end and the number is another clause's
+    before: tuple[str, int, list[str]] | None = None  # the latest phrase before the number, in the number's own clause
+    carried: tuple[str, int, list[str]] | None = None  # the one of an earlier clause, kept only when the own clause has none
     while j < len(tokens):
         word = _flat(bare[j])
         first = None
@@ -425,16 +427,33 @@ def _find_phrase(sentence: str, written: str, family: str) -> tuple[str, int, li
             words = [head] + [_bare(t) for t in _after(tokens, first)]
             phrase = tidy(" ".join(w for w in words if w))
             if _states(phrase, family):
-                if at is None or j > at:
+                if at is None:
                     return phrase, first, tokens
-                if before is None and not closed:
+                # a phrase belongs to the number that follows it in its clause: one that another number follows is that number's
+                # (round 14 follow-up: label-value lines read as one sentence give each value its neighbour's component)
+                follows = _number_after(tokens, first)
+                if j > at:
+                    if follows is None:
+                        return phrase, first, tokens
+                elif follows is None or follows == at:
                     before = (phrase, first, tokens)
         if tokens[j][-1:] in ",;:" and (at is None or j < at):
             if at is None:
                 return None  # the clause ended before the number: a phrase after it is another clause's
-            closed = True
+            carried, before = before or carried, None
         j += 1
-    return before
+    return before or carried
+
+
+def _number_after(tokens: list[str], first: int) -> int | None:
+    """The index of the first percent or coefficient token after the one that opens a phrase, up to the clause end, or None: the
+    number the phrase is said of when it is not the value being read (round 14 follow-up)."""
+    for k in range(first + 1, len(tokens)):
+        if re.match(r"^ו?-?\d", _bare(tokens[k])) and family_number(tokens[k]):
+            return k
+        if tokens[k][-1:] in _CLAUSE_END:
+            return None
+    return None
 
 
 def read_sentence(sentence: str, written: str, family: str = "") -> dict | None:
@@ -703,12 +722,18 @@ _LINE_BREAK = re.compile(r"(?<!\n)\n(?!\n)")  # one "\n" alone; a run of them is
 _BREAK_PUNCT = (".", "!", "?", "…", ":")  # a line ending so ends its sentence (":" opens a list)
 _CLOSERS = "\"'”’״׳)]"  # closing marks that may follow the punctuation
 # a list item's opening: a bullet, a dash or a number or Hebrew letter with "." or ")" and a space ("2.5 מ"ר" or "-5%" are not)
+# a line that ends with a number (digits, then a percent or currency sign or a unit word) ends its own statement: a label-value line
+_NUMERIC_END = re.compile(
+    r"\d(?:[\d.,]*\d)?\s*(?:%|‰|₪|ש[\"״]ח|מ[\"״]ר|אחוז(?:ים)?|שקל(?:ים)?|שנה|שנים|חודש(?:ים)?|מטר|דונם|דולר|יורו)?$")
+# ... unless the next line goes on with the value's purpose ("\nלתזרים הכנסות", "\nעבור ...")
+_PURPOSE_OPENING = re.compile(r"(?:עבור|בגין|בעבור)\b|ל[א-ת]{2,}")
 _LIST_MARKER = re.compile(r"[•*·]|(?:[-–—]|\d{1,3}[.)]|[א-ת][.)])(?=\s)")
 
 
 def unwrap(text: str | None) -> str:
     """A paragraph block's text with each line wrap read as a space (round 14 follow-up, KTD3): a "\n" ends no sentence unless
-    the line before it ends with sentence punctuation (. ! ? … :) or the next line opens a list item (a bullet, a dash, a number or a
+    the line before it ends with sentence punctuation (. ! ? … :) or with a number (a label-value line ends its own statement; unless
+    the next line opens with a purpose connector, ל… / עבור / בגין) or the next line opens a list item (a bullet, a dash, a number or a
     Hebrew letter with "." or ")"); a run of "\n" is a paragraph break and stays. The replacement has the same length, so every
     offset computed on the result (an anchor, a span, a sentence's place) is valid against the stored text."""
     text = text or ""
@@ -718,6 +743,8 @@ def unwrap(text: str | None) -> str:
         before = text[start:m.start()].strip().rstrip(_CLOSERS)
         after = text[m.end():m.end() + 24].lstrip(" \t")
         if not before or not after or after[0] == "\n" or before.endswith(_BREAK_PUNCT):
+            return "\n"
+        if _NUMERIC_END.search(before) and not _PURPOSE_OPENING.match(after):
             return "\n"
         return "\n" if _LIST_MARKER.match(after) else " "
 
