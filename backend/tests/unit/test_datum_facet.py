@@ -1581,3 +1581,23 @@ def test_a_phrase_after_a_number_that_another_number_follows_belongs_to_that_num
         assert datum.read_sentence(joined, number, "rate") == _facet(component, "sentence"), number
     # the phrase before a number that another number follows is that number's: the last value has none before it
     assert datum.read_sentence("הובאה הפחתה עבור סחירות 5% ו-8%", "8", "coefficient") is None
+
+
+# round 14 follow-up: the postfix pattern "X% ל-A ו-Y% ל-B" — a phrase right after the number is its own unless a cue word begins a new statement
+
+@pytest.mark.parametrize(("number", "component"), [("75", "יזם"), ("25", "בעלים")])
+def test_a_postfix_phrase_after_a_number_is_its_own_when_another_number_follows(number, component):
+    sentence = "חלוקת הזכויות היא 75% ליזם ו-25% לבעלים"
+    assert datum.read_sentence(sentence, number, "rate") == _facet(component, "sentence")
+
+
+@pytest.mark.parametrize(("number", "component"), [("7", "תזרים ראשון"), ("8", "תזרים שני")])
+def test_a_cue_word_family_postfix_pair_keeps_each_numbers_own_phrase(number, component):
+    sentence = "שיעור היוון של 7% לתזרים ראשון ו-8% לתזרים שני"
+    assert datum.read_sentence(sentence, number, "rate") == _facet(component, "sentence")
+
+
+@pytest.mark.parametrize(("number", "component"), [("7.75", "תזרים הפיקדונות"), ("10.00", "תזרים התפעול")])
+def test_a_cue_word_after_the_number_starts_a_new_statement_whose_phrase_is_the_next_numbers(number, component):
+    joined = "שיעור היוון לתזרים הפיקדונות 7.75% שיעור היוון לתזרים התפעול 10.00%"
+    assert datum.read_sentence(joined, number, "rate") == _facet(component, "sentence")

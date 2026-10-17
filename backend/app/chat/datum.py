@@ -404,9 +404,9 @@ def _excluded_head(word: str) -> bool:
 def _find_phrase(sentence: str, written: str, family: str) -> tuple[str, int, list[str]] | None:
     """The purpose phrase of a sentence, ``(phrase, index of the token that opens it, tokens)``, or None: the words after
     ל / עבור / בגין / בעבור that follow the number (``written``; none when empty) or the metric word, to the clause end. See
-    ``read_sentence`` for the rules. With a number, the phrase right after it wins over one before it (round 14 U2 follow-up) unless another number follows that
-    phrase in its clause (it is that number's); the one before is the latest of the number's own clause, else of an earlier one, and
-    is the number's only when no other number stands between it and the number."""
+    ``read_sentence`` for the rules. With a number, the phrase right after it wins over one before it (round 14 U2 follow-up) unless a cue word
+    stands between the number and the phrase (a new statement began: it is the next number's); the one before is the latest of the
+    number's own clause, else of an earlier one, and is the number's only when no other number stands between it and the number."""
     tokens = sentence.split()
     bare = [_bare(t) for t in tokens]
     at = next((i for i, t in enumerate(tokens) if _number_token(t, written)), None)
@@ -429,14 +429,18 @@ def _find_phrase(sentence: str, written: str, family: str) -> tuple[str, int, li
             if _states(phrase, family):
                 if at is None:
                     return phrase, first, tokens
-                # a phrase belongs to the number that follows it in its clause: one that another number follows is that number's
-                # (round 14 follow-up: label-value lines read as one sentence give each value its neighbour's component)
-                follows = _number_after(tokens, first)
                 if j > at:
-                    if follows is None:
+                    # a phrase right after the number is its own ("75% ליזם ו-25% לבעלים"), unless a cue word of the family stands
+                    # between them: a new statement began there and the phrase is the next number's ("7.75% שיעור היוון לתזרים
+                    # התפעול 10.00%": label-value lines read as one sentence); a comma, semicolon or colon between them ends the
+                    # number's clause, so the phrase is another clause's ("שיעור היוון לתזרים ראשון 7%, לתזרים שני 8%")
+                    if not _has_cue(" ".join(tokens[at + 1:j])) and not any(t[-1:] in ",;:" for t in tokens[at:j]):
                         return phrase, first, tokens
-                elif follows is None or follows == at:
-                    before = (phrase, first, tokens)
+                else:
+                    # before the number, a phrase that another number follows is that number's
+                    follows = _number_after(tokens, first)
+                    if follows is None or follows == at:
+                        before = (phrase, first, tokens)
         if tokens[j][-1:] in ",;:" and (at is None or j < at):
             if at is None:
                 return None  # the clause ended before the number: a phrase after it is another clause's
