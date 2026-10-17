@@ -42,7 +42,9 @@ words of a report's structure; it never holds question words.
 
 **Evidence** holds block indexes and rule names only, never copied text beyond the title and aliases themselves.
 
-**Store** (KTD4): ``document_units``, keyed (version, reading, unit number), written by ``replace`` inside the
+**Store** (KTD4, round 15 KTD6): ``document_units``, keyed (version, reading, derivation key, unit number), so the
+rows of a new derivation live beside the previous ones and nothing deletes the old (they are read only to resolve the
+unit anchors a conversation stored before: ``entities.live_unit``; every reader filters by the current key), written by ``replace`` inside the
 publish transaction and the reindex swap (so a ``ready`` version always has units) and by ``rebuild_if_stale`` when a
 positions backfill changes the derivation key (``UNITS_VERSION`` plus the reading's positions marker); a version
 published before this round gets its units on first use (``ensure``, single-flight per version and reading). Rows are
@@ -76,6 +78,33 @@ from app.professional.sections import flight, landed
 logger = logging.getLogger(__name__)
 
 UNITS_VERSION = "units-v4"
+# the derivation whose stable ids and anchors carry no tag: an id or an anchor without a tag is a ``units-v4`` one
+# (round 15 U3, KTD6); every later derivation's ids end in ``@<tag>``
+UNTAGGED_VERSION = "units-v4"
+
+
+def tag_of(units_version: str) -> str | None:
+    """The short tag a derivation's stable unit ids and anchors carry (``units-v5`` -> ``v5``); None for the untagged
+    ``units-v4``, so the ids already stored stay valid."""
+    return None if units_version == UNTAGGED_VERSION else units_version.removeprefix("units-")
+
+
+def version_of_tag(tag: str | None) -> str:
+    """The ``units_version`` an id or an anchor with this tag was derived by (no tag: ``units-v4``)."""
+    return f"units-{tag}" if tag else UNTAGGED_VERSION
+
+
+def current_tag() -> str | None:
+    """The tag of the derivation the code derives now."""
+    return tag_of(UNITS_VERSION)
+
+
+def current_key_sql(unit: str = "u", version: str = "v") -> str:
+    """The SQL condition that a ``document_units`` row (alias ``unit``) is of the current derivation key of its version
+    (alias ``version``, ``document_versions``): ``UNITS_VERSION`` plus the reading's positions marker, as
+    ``derivation_key`` builds it. Every raw reader of the table uses it, because the table holds the rows of earlier
+    derivations beside the current ones (round 15 U3, KTD6)."""
+    return (f"{unit}.derivation_key = '{UNITS_VERSION}|' || COALESCE(NULLIF({version}.ingestion->>'positions', ''), '-')")
 
 # --- kinds, certainty, rule names --------------------------------------------------------------------------------
 
@@ -743,6 +772,11 @@ class Reading:
     key: str
     furniture_images: tuple[str, ...]
 
+    @property
+    def tag(self) -> str | None:
+        """The tag of the derivation ``key`` names (``tag_of``)."""
+        return tag_of(self.key.split("|", 1)[0])
+
 
 def derivation_key(ingestion: dict | None) -> str:
     """``UNITS_VERSION`` plus the reading's positions marker: a positions backfill changes the pages' labels, so it
@@ -820,6 +854,19 @@ def stored_many(conn: Connection, version_ids: Sequence[UUID | str]) -> dict[UUI
     return {v: tuple(units) for v, units in out.items()}
 
 
+def kept(conn: Connection, version_id: UUID | str, reading_id: str, unit_no: int, tag: str | None) -> Unit | None:
+    """The kept row of an earlier derivation (``tag``: its ``tag_of``; None is ``units-v4``) for a unit number of a
+    reading, or None when none was kept: what an anchor stored before a re-derivation stood on, read only to find the
+    unit it stands for now (``entities.live_unit``, KTD6). Of several keys of that derivation (a positions backfill
+    changed it) the newest. Never the current rows: those are ``stored``."""
+    row = conn.execute(text(
+        "SELECT unit_no, kind, title, aliases, identifiers, page_first, page_last, block_first, block_last,"
+        " certainty, evidence FROM document_units WHERE version_id = :v AND reading_id = :r AND unit_no = :n"
+        " AND units_version = :uv ORDER BY created_at DESC, derivation_key DESC LIMIT 1"),
+        {"v": UUID(str(version_id)), "r": reading_id, "n": unit_no, "uv": version_of_tag(tag)}).first()
+    return _unit_of(row) if row is not None else None
+
+
 def read_or_derive(conn: Connection, version_id: UUID | str) -> tuple[Unit, ...]:
     """Stored units when they are current, else derived in memory; writes nothing (the count script)."""
     reading = reading_of(conn, version_id)
@@ -832,7 +879,7 @@ _INSERT = (
     "INSERT INTO document_units (office_id, document_id, version_id, reading_id, unit_no, kind, title, aliases,"
     " identifiers, page_first, page_last, block_first, block_last, certainty, evidence, units_version, derivation_key)"
     " VALUES (app_office(), :d, :v, :r, :n, :k, :t, CAST(:a AS text[]), CAST(:i AS jsonb), :pf, :pl, :bf, :bl, :c,"
-    " CAST(:e AS jsonb), :uv, :key) ON CONFLICT (version_id, reading_id, unit_no) DO NOTHING")
+    " CAST(:e AS jsonb), :uv, :key) ON CONFLICT (version_id, reading_id, derivation_key, unit_no) DO NOTHING")
 
 
 def _insert(conn: Connection, version_id: UUID | str, reading: Reading, units: Sequence[Unit]) -> None:
@@ -854,14 +901,17 @@ def _whole_file(conn: Connection, version_id: UUID | str, rule: str) -> tuple[Un
 
 
 def replace(conn: Connection, version_id: UUID | str) -> tuple[Unit, ...]:
-    """Derive the version's units from its stored reading and write them in place of any it had: the rows of a
-    replaced reading, or of an older derivation, go. Called inside the publish transaction and the reindex swap, so a
-    ready version always has units. A derivation that fails (it should not: it reads stored blocks only) leaves the
-    version one undetermined unit rather than blocking its publication; the failure is logged."""
+    """Derive the version's units from its stored reading and write them: the rows of the same reading and derivation
+    key are replaced by the new derivation, and the rows of any other key stay where they are (round 15 U3, KTD6, KD8:
+    derived data is added beside the old, which is kept to resolve the anchors a conversation stored before). Called
+    inside the publish transaction and the reindex swap, so a ready version always has units. A derivation that fails
+    (it should not: it reads stored blocks only) leaves the version one undetermined unit rather than blocking its
+    publication; the failure is logged."""
     reading = reading_of(conn, version_id)
     if reading is None:
         return ()
-    conn.execute(text("DELETE FROM document_units WHERE version_id = :v"), {"v": UUID(str(version_id))})
+    conn.execute(text("DELETE FROM document_units WHERE version_id = :v AND reading_id = :r AND derivation_key = :k"),
+                 {"v": UUID(str(version_id)), "r": reading.reading_id, "k": reading.key})
     units = _derived_or_whole(conn, version_id, reading)
     _insert(conn, version_id, reading, units)
     return units
@@ -888,7 +938,8 @@ _GUARD = threading.Lock()
 def ensure(conn: Connection, version_id: UUID | str) -> tuple[Unit, ...]:
     """The version's units for use in a chat turn (the caller resolved the version under the user's permissions): the
     stored ones when current; otherwise built here, once per version and reading in the process, and stored in the
-    caller's transaction (a savepoint, so a transaction that cannot write still gets its units)."""
+    caller's transaction (a savepoint, so a transaction that cannot write still gets its units), beside the rows of
+    earlier derivations, which it leaves alone."""
     reading = reading_of(conn, version_id)
     if reading is None:
         return ()
@@ -913,9 +964,8 @@ def ensure(conn: Connection, version_id: UUID | str) -> tuple[Unit, ...]:
                         _MEMO.popitem(last=False)
             try:
                 with conn.begin_nested():
-                    conn.execute(text("DELETE FROM document_units WHERE version_id = :v AND (reading_id <> :r"
-                                      " OR derivation_key <> :k)"),
-                                 {"v": UUID(vid), "r": reading.reading_id, "k": reading.key})
+                    # beside the rows of any other key or reading, which stay (KTD6): none is read by mistake, since
+                    # every reader filters by the version's current reading and derivation key
                     _insert(conn, version_id, reading, units)
             except Exception:  # noqa: BLE001 - a read-only transaction or a vanished version: the units still serve
                 logger.info("units of version %s not stored", vid, exc_info=True)

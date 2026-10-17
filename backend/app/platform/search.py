@@ -712,7 +712,9 @@ def units_matching(conn: Connection, query: str) -> UnitMatches:
                 continue
             matched = True
             unit = {"document_id": r.id, "version_id": r.version_id, "reading_id": r.reading_id, "unit_no": u.unit_no,
-                    "unit_id": unit_contexts.unit_key(r.version_id, r.reading_id, u.unit_no), "kind": u.kind, "title": u.title,
+                    "units_tag": unit_store.current_tag(),
+                    "unit_id": unit_contexts.unit_key(r.version_id, r.reading_id, u.unit_no, unit_store.current_tag()),
+                    "kind": u.kind, "title": u.title,
                     "aliases": list(u.aliases), "identifiers": list((u.identifiers or {}).get("shown") or ()),
                     "page_first": u.page_first, "page_last": u.page_last, "certainty": u.certainty,
                     "block_first": u.block_first, "block_last": u.block_last, "file_title": r.title,
@@ -817,6 +819,8 @@ def document_term_holders(conn: Connection, terms: list[list[str]]) -> dict[UUID
     """For each visible current document that is not split into several units (one unit, or none): the terms (their
     indexes) it holds as ``documents_matching`` reads them — in its title or in any chunk of its current text, each in
     any of its forms. One query; a document that holds none is not in the result."""
+    from app.chat import units as unit_store
+
     params: dict = {}
     counts = ", ".join(f"count(c.id) FILTER (WHERE c.tsv @@ ({_tsquery(forms, f't{i}', params)})) AS h{i}"
                        for i, forms in enumerate(terms))
@@ -827,7 +831,7 @@ def document_term_holders(conn: Connection, terms: list[list[str]]) -> dict[UUID
             f" AND v.is_current LEFT JOIN chunks c ON c.version_id = v.id WHERE d.deleted_at IS NULL AND {APPRAISALS_SQL}"
             " AND NOT EXISTS"
             " (SELECT 1 FROM document_units u WHERE u.version_id = v.id AND u.reading_id = COALESCE("
-            "v.ingestion->>'reading_id', '') OFFSET 1) GROUP BY d.id, d.title"), params):
+            f"v.ingestion->>'reading_id', '') AND {unit_store.current_key_sql()} OFFSET 1) GROUP BY d.id, d.title"), params):
         title = _title_words(r.title)
         held = {i for i, ts in enumerate(term_sets) if title & ts or getattr(r, f"h{i}")}
         if held:

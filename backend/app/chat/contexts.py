@@ -251,11 +251,14 @@ class Segment:
 @dataclass(frozen=True)
 class Contexts:
     """A version's contexts: its segments in reading order (one segment, number 1, for a single-context file).
-    ``reading_id``: the reading they were built from (None: not known), part of ``key``."""
+    ``reading_id``: the reading they were built from (None: not known), part of ``key``; ``tag``: the tag of the unit
+    derivation they were built from (``units.tag_of``; None: ``units-v4``, or contexts not built from stored units),
+    the last part of ``key`` (round 15 U3, KTD6)."""
 
     version_id: str
     segments: tuple[Segment, ...]
     reading_id: str | None = None
+    tag: str | None = None
 
     @property
     def multi(self) -> bool:
@@ -285,7 +288,7 @@ class Contexts:
 
     def key(self, number: int) -> str:
         """A context across the reading: version, reading and number (``split_key`` reads it back)."""
-        return unit_key(self.version_id, self.reading_id, number)
+        return unit_key(self.version_id, self.reading_id, number, self.tag)
 
     def label(self, number: int) -> str:
         """What names a context: a unit's title, then its identifiers; a part that is not an appraisal says so."""
@@ -391,10 +394,18 @@ class Reach:
         return bool(self.before or self.after)
 
 
-def unit_key(version_id: str, reading_id: str | None, number: int) -> str:
-    """The id of a unit across readings: version, reading (when known) and number (``split_unit_key`` reads it
-    back)."""
-    return f"{version_id}#{reading_id}#{number}" if reading_id else f"{version_id}#{number}"
+def unit_key(version_id: str, reading_id: str | None, number: int, tag: str | None = None) -> str:
+    """The id of a unit across readings: version, reading (when known) and number, and — for a unit of a derivation
+    after ``units-v4`` — the derivation's tag after ``@`` (``split_unit_key`` reads it back). An id without a tag is a
+    ``units-v4`` id, so the ids stored before round 15 keep their meaning, and a number of another derivation is never
+    taken for this one's (KTD6)."""
+    base = f"{version_id}#{reading_id}#{number}" if reading_id else f"{version_id}#{number}"
+    return f"{base}@{tag}" if tag else base
+
+
+def anchor_key(version_id: str, anchor: dict) -> str:
+    """The stable id of an anchor's unit (``unit_anchor``) in the version: ``unit_key`` with the anchor's own tag."""
+    return unit_key(version_id, anchor.get("reading_id"), anchor["unit_no"], anchor.get("units_tag"))
 
 
 def context_subject(context: dict | None) -> dict | None:
@@ -409,9 +420,15 @@ def pages_text(first: int | None, last: int | None, unknown: str = "") -> str:
 
 
 def split_unit_key(key: str) -> tuple[str, str | None, int]:
-    """(version id, reading id or None, number) of a ``Contexts.key``."""
+    """(version id, reading id or None, number) of a ``Contexts.key`` (its derivation tag, if any, is ``key_tag``)."""
     parts = key.split("#")
-    return parts[0], parts[1] if len(parts) == 3 else None, int(parts[-1])
+    return parts[0], parts[1] if len(parts) == 3 else None, int(parts[-1].split("@", 1)[0])
+
+
+def key_tag(key: str) -> str | None:
+    """The derivation tag of a ``Contexts.key`` (None: a ``units-v4`` id)."""
+    tail = key.rsplit("#", 1)[-1]
+    return tail.split("@", 1)[1] if "@" in tail else None
 
 
 def split_key(key: str) -> tuple[str, int]:
@@ -551,7 +568,9 @@ def derive(blocks: Iterable, version_id: str = "") -> Contexts:
 
 # --- per reading -----------------------------------------------------------------------------------------------------
 
-_CACHE: OrderedDict[tuple[str, str | None], Contexts] = OrderedDict()
+# keyed by version, reading and the unit derivation (``units.UNITS_VERSION``): a new derivation under the same reading id
+# is a new entry, so a running process never serves contexts of the derivation it no longer reads (round 15 U3, KTD6)
+_CACHE: OrderedDict[tuple[str, str | None, str], Contexts] = OrderedDict()
 _LOCK = threading.Lock()
 
 _FIRST_BLOCKS_SQL = (
@@ -576,7 +595,7 @@ def _unit_identity(u) -> Identity:
 
 
 def from_units(units: Sequence, first_blocks: dict, headings: Sequence[int], version_id: str,
-               reading_id: str | None = None) -> Contexts:
+               reading_id: str | None = None, tag: str | None = None) -> Contexts:
     """The contexts of a reading's units, one segment per unit in reading order. ``first_blocks``: each unit's first
     block by index (``block_index``, ``page``, ``bbox`` and its page's geometry, for ``top_of``); ``headings``: the
     indexes of the file's heading blocks, in order (a segment's ``lead`` is the first one inside its unit)."""
@@ -588,7 +607,7 @@ def from_units(units: Sequence, first_blocks: dict, headings: Sequence[int], ver
         start = (b.page or 0, top_of(b)) if n > 0 and b is not None else None
         segments.append(Segment(u.unit_no, _unit_identity(u), u.block_first, u.block_last, lead, start,
                                 u.page_first, u.page_last, u.kind, u.certainty, u.title))
-    return Contexts(version_id, tuple(segments), reading_id)
+    return Contexts(version_id, tuple(segments), reading_id, tag)
 
 
 def _of_units(conn: Connection, version_id: str, reading_id: str | None) -> Contexts | None:
@@ -602,16 +621,17 @@ def _of_units(conn: Connection, version_id: str, reading_id: str | None) -> Cont
             if not found:
                 return None
             v = UUID(version_id)
+            reading = unit_store.reading_of(conn, v)
             if reading_id is None:
-                reading = unit_store.reading_of(conn, v)
                 reading_id = reading.reading_id if reading is not None else None
+            tag = reading.tag if reading is not None else unit_store.current_tag()
             first = {r.block_index: r for r in conn.execute(
                 text(_FIRST_BLOCKS_SQL), {"v": v, "b": [u.block_first for u in found[1:]]})}
             headings = [r.block_index for r in conn.execute(text(_HEADINGS_SQL), {"v": v})]
     except Exception:  # noqa: BLE001 - the contexts of the blocks serve instead
         logger.exception("contexts of version %s could not be built from its units", version_id)
         return None
-    return from_units(found, first, headings, version_id, reading_id)
+    return from_units(found, first, headings, version_id, reading_id, tag)
 
 
 def of_version(conn: Connection, version_id: UUID | str, reading_id: str | None) -> Contexts:
@@ -620,7 +640,9 @@ def of_version(conn: Connection, version_id: UUID | str, reading_id: str | None)
     from its blocks. In the fallback only headings and blocks that may hold a labelled identifier bring their text,
     never a table's or a picture's (``derive`` never reads those for identifiers), each block with its page's stored
     geometry in the same query, so a segment's start is placed on the rendered page (``top_of``)."""
-    key = (str(version_id), reading_id)
+    from app.chat import units as unit_store  # units derives with this module's helpers
+
+    key = (str(version_id), reading_id, unit_store.UNITS_VERSION)
     with _LOCK:
         found = _CACHE.get(key)
         if found is not None:

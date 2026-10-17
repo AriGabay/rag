@@ -147,3 +147,77 @@ def test_a_full_title_is_found_as_a_whole_phrase_in_a_longer_reply_and_never_ins
     assert named is not None and named.kind == "resolved" and named.documents[0].unit["unit_no"] == 2
     assert entities.named_unit(cands, "מתחם הגפן בן", {"d1"}) is None  # "ב" is not a word of this reply
     assert entities.named_unit(cands, "מתחם הגפן ב", set()) is None  # none of them is visible any more
+
+
+# --- derivations side by side (round 15 U3, KTD6, R7) -----------------------------------------------------------------
+
+
+def row(no: int, title: str | None, first: int, last: int, *, kind: str = "appraisal", tag: str | None = "v5",
+        aliases=(), identifiers=(), label: str = "1") -> dict:
+    return {"document_id": "d1", "reading_id": "r1", "unit_no": no, "units_tag": tag, "kind": kind, "title": title,
+            "aliases": list(aliases), "identifiers": list(identifiers), "page_first": 1, "page_last": 1,
+            "block_first": first, "block_last": last, "first_label": label, "certainty": "certain"}
+
+
+def old_anchor(no: int, title: str | None = None, **kw) -> dict:
+    """An anchor stored before the change: made on a ``units-v4`` unit, so it carries no tag."""
+    return entities.unit_anchor(row(no, title, 0, 0, tag=None, **kw))
+
+
+def test_the_stable_id_of_a_later_derivation_carries_its_tag_and_a_v4_id_is_unchanged():
+    from app.chat import contexts, units
+
+    assert contexts.unit_key("v", "r1", 3) == "v#r1#3" and contexts.unit_key("v", None, 3) == "v#3"
+    assert contexts.unit_key("v", "r1", 3, "v5") == "v#r1#3@v5" and contexts.unit_key("v", None, 3, "v5") == "v#3@v5"
+    for key, parts, tag in (("v#r1#3", ("v", "r1", 3), None), ("v#r1#3@v5", ("v", "r1", 3), "v5"),
+                            ("v#3@v5", ("v", None, 3), "v5")):
+        assert contexts.split_unit_key(key) == parts and contexts.key_tag(key) == tag
+    assert contexts.split_key("v#r1#3@v5") == ("v", 3)
+    assert units.tag_of("units-v4") is None and units.tag_of("units-v5") == "v5"
+    assert units.version_of_tag(None) == "units-v4" and units.version_of_tag("v5") == "units-v5"
+    assert contexts.anchor_key("v", {"reading_id": "r1", "unit_no": 3, "units_tag": "v5"}) == "v#r1#3@v5"
+    assert contexts.anchor_key("v", {"reading_id": "r1", "unit_no": 3}) == "v#r1#3"
+
+
+def test_the_derivation_key_condition_is_the_one_derivation_key_builds():
+    from app.chat import units
+
+    sql = units.current_key_sql("u", "v")
+    assert f"'{units.UNITS_VERSION}|'" in sql and "u.derivation_key" in sql and "v.ingestion->>'positions'" in sql
+
+
+def test_an_anchor_carries_the_tag_of_its_derivation_and_a_stored_one_has_none():
+    assert entities.unit_anchor(row(2, "מתחם א", 5, 9))["units_tag"] == "v5"
+    stored_before = {k: v for k, v in old_anchor(2, "מתחם א").items() if k != "units_tag"}
+    assert entities.same_unit(stored_before, old_anchor(2, "מתחם א"))  # no tag at all reads as a units-v4 anchor
+
+
+def test_the_same_number_is_the_same_unit_only_within_one_derivation():
+    a = entities.unit_anchor(row(3, None, 10, 20, tag=None))
+    b = entities.unit_anchor(row(3, None, 12, 30, tag="v5"))
+    assert not entities.same_unit(a, b)   # unit 3 of v4 and unit 3 of v5 may be two appraisals: nothing to compare
+    assert entities.same_unit(a, entities.unit_anchor(row(3, None, 10, 20, tag=None)))
+    named_a = entities.unit_anchor(row(3, "מתחם הגפן א", 10, 20, tag=None))
+    named_b = entities.unit_anchor(row(4, "מתחם הגפן א", 12, 30, tag="v5"))
+    assert entities.same_unit(named_a, named_b)   # the name says it, whatever the number
+
+
+def test_an_untitled_anchor_whose_range_falls_in_one_new_unit_resolves_to_that_unit():
+    rows = [row(1, None, 0, 9), row(2, None, 10, 19), row(3, None, 20, 29), row(4, None, 30, 60)]
+    kept = {"block_first": 33, "block_last": 50}   # the v4 unit 3 (untitled) lay here
+    found = entities.resolve_older(old_anchor(3), rows, kept)
+    assert found is not None and found["unit_no"] == 4   # never the unit with the number 3
+
+
+def test_an_anchor_whose_range_spans_two_new_units_is_gone_and_a_missing_row_resolves_nothing():
+    rows = [row(1, None, 0, 9), row(2, None, 10, 19), row(3, None, 20, 29)]
+    assert entities.resolve_older(old_anchor(2), rows, {"block_first": 5, "block_last": 15}) is None
+    assert entities.resolve_older(old_anchor(2), rows, {"block_first": 40, "block_last": 50}) is None  # in no unit
+    assert entities.resolve_older(old_anchor(2), rows, None) is None   # no kept row: the number alone is not enough
+
+
+def test_an_old_anchor_resolves_by_name_before_the_range_and_never_into_an_appendix():
+    rows = [row(1, "מתחם הגפן א", 0, 9), row(2, "מתחם הגפן ב", 10, 19), row(3, "נספח", 20, 29, kind="appendix")]
+    named = old_anchor(7, "מתחם הגפן ב")
+    assert entities.resolve_older(named, rows, {"block_first": 0, "block_last": 5})["unit_no"] == 2   # the name wins
+    assert entities.resolve_older(old_anchor(5), rows, {"block_first": 21, "block_last": 25}) is None  # an appendix

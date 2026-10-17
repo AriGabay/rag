@@ -50,6 +50,12 @@ another unit of the same file therefore moves the conversation although the docu
 read again, ``live_unit`` finds the anchor's unit in the current reading (``rematch``: the normalized title or an alias,
 else the first printed page label together with an identifier); a unit no longer there is dropped and the answer asks,
 listing the file's appraisals, so an old unit number never selects a different appraisal.
+
+**Derivations side by side** (round 15 U3, KTD6, R7): the units of an earlier derivation stay in ``document_units`` beside
+the current ones, and an anchor carries the tag of the derivation that made it (``units_tag``; none: ``units-v4``). The
+unit number of an anchor of the current derivation still says which unit it is; for an older anchor ``live_unit`` reads the
+kept row of its unit and finds the unit by name, else by the one current unit that holds that row's whole block range
+(``resolve_older``), and a range that spans several units is "gone": the number alone is never used.
 """
 
 from __future__ import annotations
@@ -125,8 +131,10 @@ class Outcome:
 def unit_anchor(u: dict) -> dict:
     """What identifies a unit across readings (KTD8): the file, the reading it was found in, the normalized title and
     aliases, the first printed page label and the identifiers. Its number (``unit_no``) is only of that reading and is
-    never reused across readings. ``pages`` and ``display`` are for showing it."""
+    never reused across readings, nor across derivations of one reading: ``units_tag`` is the tag of the derivation that
+    numbered it (none: ``units-v4``, the anchors stored before round 15). ``pages`` and ``display`` are for showing it."""
     return {"document_id": str(u["document_id"]), "reading_id": u.get("reading_id") or None, "unit_no": u["unit_no"],
+            "units_tag": u.get("units_tag") or None,
             "title": contexts.name_key(u.get("title")) or None, "display": u.get("title"),
             "aliases": [k for a in u.get("aliases") or () if (k := contexts.name_key(a))],
             "first_label": u.get("first_label"), "identifiers": list(u.get("identifiers") or ()),
@@ -178,13 +186,18 @@ def _label_and_identifier(anchor: dict, u: dict) -> bool:
     return bool(label) and label == u.get("first_label") and bool(_identifiers(anchor) & _identifiers(u))
 
 
+def _numbering(x: dict) -> tuple[str | None, str | None]:
+    """What numbers an anchor's unit: its reading and the derivation within it (``units_tag``)."""
+    return x.get("reading_id") or None, x.get("units_tag") or None
+
+
 def same_unit(a: dict | None, b: dict | None) -> bool:
-    """Whether two anchors are one unit. Within a reading its number says; across readings only its names (or, with none
-    in common to compare, its first page label and an identifier) do — the number of a unit is never reused across
-    readings (KTD8)."""
+    """Whether two anchors are one unit. Within a reading and a derivation its number says; across readings, and across
+    derivations of one reading, only its names (or, with none in common to compare, its first page label and an
+    identifier) do — the number of a unit is never reused across readings (KTD8) or derivations (KTD6)."""
     if not a or not b or str(a["document_id"]) != str(b["document_id"]):
         return False
-    if (a.get("reading_id") or None) == (b.get("reading_id") or None):
+    if _numbering(a) == _numbering(b):
         return a.get("unit_no") == b.get("unit_no")
     names, theirs = _names(a), _names(b)
     return bool(names & theirs) if names and theirs else _label_and_identifier(a, b)
@@ -239,38 +252,64 @@ def _current_units(conn, document_id: UUID) -> tuple[str, str, str, list[dict]] 
         f" WHERE d.id = :d AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"), {"d": document_id}).first()
     if row is None:
         return None
+    tag = unit_store.current_tag()
     rows = [{"document_id": document_id, "version_id": row.version_id, "reading_id": row.reading_id,
-             "unit_no": u.unit_no, "unit_id": contexts.unit_key(row.version_id, row.reading_id, u.unit_no),
+             "unit_no": u.unit_no, "units_tag": tag,
+             "unit_id": contexts.unit_key(row.version_id, row.reading_id, u.unit_no, tag),
              "kind": u.kind, "title": u.title, "aliases": list(u.aliases),
              "identifiers": list((u.identifiers or {}).get("shown") or ()), "page_first": u.page_first,
-             "page_last": u.page_last, "certainty": u.certainty} for u in unit_store.ensure(conn, row.version_id)]
+             "page_last": u.page_last, "block_first": u.block_first, "block_last": u.block_last,
+             "certainty": u.certainty} for u in unit_store.ensure(conn, row.version_id)]
     if len(rows) > 1:
         printed_labels(conn, rows)
     return row.title, str(row.version_id), row.reading_id, rows
 
 
+def resolve_older(anchor: dict, rows: list[dict], kept: dict | None) -> dict | None:
+    """The unit of the current derivation that an anchor of an older derivation of the same reading stands for
+    (round 15 U3, KTD6): by its names (``rematch``), else by containment — the one current subject unit whose block range
+    holds the whole range of the unit the anchor was made on (``kept``: that unit's kept row, with ``block_first`` and
+    ``block_last``; None when none was kept). A range that falls in no unit, in an appendix or a comparables part, or
+    across several units is not resolved (None, the unit is "gone"); the number of the anchor is never used."""
+    found = rematch(anchor, rows)
+    if found is not None or kept is None:
+        return found
+    holders = [u for u in rows if u["block_first"] <= kept["block_first"] and kept["block_last"] <= u["block_last"]]
+    if len(holders) == 1 and holders[0]["kind"] not in contexts.NON_SUBJECT_KINDS:
+        return holders[0]
+    return None
+
+
 def live_unit(ctx: TenantContext, anchor: dict) -> LiveUnit:
     """The anchor's unit in the current reading of its document, under the user's permissions (see the module
-    docstring). Reads the stored units of the current version (built on first use)."""
+    docstring). Reads the stored units of the current version (built on first use) and, for an anchor of an earlier
+    derivation, the kept row it stood on."""
     try:
         document_id = UUID(str(anchor["document_id"]))
     except (KeyError, ValueError):
         return LiveUnit("unreadable")
+    older = False
+    kept = None
     with tenant_tx(ctx) as conn:
         current = _current_units(conn, document_id)
+        if current is not None and len(current[3]) > 1 and (anchor.get("reading_id") or None) == (current[2] or None):
+            older = (anchor.get("units_tag") or None) != unit_store.current_tag()
+            if older:
+                row = unit_store.kept(conn, current[1], current[2], int(anchor.get("unit_no") or 0), anchor.get("units_tag"))
+                kept = {"block_first": row.block_first, "block_last": row.block_last} if row is not None else None
     if current is None:
         return LiveUnit("unreadable")
     title, version, reading, rows = current
     if len(rows) < 2:
         return LiveUnit("single", version_id=version)
-    # the same reading: the unit with its number, if its names are still the anchor's (a derivation that changed under
-    # the same reading id would have renumbered it)
-    if (anchor.get("reading_id") or None) == (reading or None):
+    # the same reading and derivation: the unit with its number, if its names are still the anchor's (a derivation that
+    # changed under the same reading id would have renumbered it, and carries another tag)
+    if (anchor.get("reading_id") or None) == (reading or None) and not older:
         same = next((u for u in rows if u["unit_no"] == anchor.get("unit_no")
                      and u["kind"] not in contexts.NON_SUBJECT_KINDS), None)
         if same is not None and (not _names(anchor) or _names(anchor) & _names(same)):
             return LiveUnit("current", unit_anchor(same), version)
-    found = rematch(anchor, rows)
+    found = resolve_older(anchor, rows, kept) if older else rematch(anchor, rows)
     if found is not None:
         return LiveUnit("moved", unit_anchor(found), version)
     subjects = [unit_candidate(u, title) for u in rows if u["kind"] not in contexts.NON_SUBJECT_KINDS]
@@ -509,7 +548,7 @@ def _unit_names(conn) -> list[str]:
     names: list[str] = []
     for r in conn.execute(text(
             "SELECT u.title, u.aliases FROM document_units u JOIN document_versions v ON v.id = u.version_id"
-            " AND v.is_current AND u.reading_id = COALESCE(v.ingestion->>'reading_id', '')"
+            f" AND v.is_current AND u.reading_id = COALESCE(v.ingestion->>'reading_id', '') AND {unit_store.current_key_sql()}"
             f" JOIN documents d ON d.id = u.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"
             " WHERE u.kind NOT IN ('appendix', 'comparables')")):
         names += ([r.title] if r.title else []) + list(r.aliases or ())
@@ -600,7 +639,9 @@ def units_of_documents(ctx: TenantContext, ids) -> list[dict]:
             if len(units) < 2:
                 continue
             rows += [{"document_id": f.id, "version_id": version_id, "reading_id": f.reading_id, "unit_no": u.unit_no,
-                      "unit_id": contexts.unit_key(version_id, f.reading_id, u.unit_no), "kind": u.kind,
+                      "units_tag": unit_store.current_tag(),
+                      "unit_id": contexts.unit_key(version_id, f.reading_id, u.unit_no, unit_store.current_tag()),
+                      "kind": u.kind,
                       "title": u.title, "aliases": list(u.aliases),
                       "identifiers": list((u.identifiers or {}).get("shown") or ()), "page_first": u.page_first,
                       "page_last": u.page_last, "certainty": u.certainty, "file_title": f.title}
@@ -618,7 +659,7 @@ _UNIT_NAMES_SQL = (
     "SELECT u.document_id, u.version_id, u.reading_id, u.unit_no, u.kind, u.title, u.aliases, u.block_first,"
     " u.block_last, count(*) OVER (PARTITION BY u.version_id) AS units"
     " FROM document_units u JOIN document_versions v ON v.id = u.version_id AND v.is_current"
-    " AND u.reading_id = COALESCE(v.ingestion->>'reading_id', '')"
+    f" AND u.reading_id = COALESCE(v.ingestion->>'reading_id', '') AND {unit_store.current_key_sql()}"
     f" JOIN documents d ON d.id = u.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL}")
 
 

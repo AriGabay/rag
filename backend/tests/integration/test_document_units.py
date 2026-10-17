@@ -15,19 +15,21 @@ import re
 import threading
 import time
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 from sqlalchemy import text
 
 from app import worker
-from app.chat import units
+from app.chat import contexts, entities, units
 from app.db import tenant_tx
 from app.extraction.geometry import POSITIONS_VERSION
-from app.platform import pipeline
+from app.platform import pipeline, search
 from app.platform.jobs import enqueue_positions
 from tests.conftest import login
 from tests.factories import make_group, make_office, make_user
 from tests.helpers import upload
+from tests.support.unit_files import READING, unit_file
 
 pytestmark = pytest.mark.db
 
@@ -81,6 +83,13 @@ def stored(office, version: str) -> list:
             "SELECT unit_no, reading_id, kind, title, aliases, identifiers, page_first, page_last, block_first,"
             " block_last, certainty, evidence, units_version, derivation_key FROM document_units"
             " WHERE version_id = :v ORDER BY reading_id, unit_no"), {"v": version}).all()
+
+
+def current(office, version: str) -> list:
+    """The stored rows of the derivation key a freshly ingested reading has (the rows readers see): the table keeps the
+    rows of earlier keys beside them (round 15 U3, KTD6)."""
+    key = f"{units.UNITS_VERSION}|{POSITIONS_VERSION}"
+    return [r for r in stored(office, version) if r.derivation_key == key]
 
 
 def ingestion(office, version: str) -> dict:
@@ -194,13 +203,14 @@ def test_a_positions_backfill_derives_the_units_again_because_the_key_changed(of
     before = stored(office, ver)
     assert {r.derivation_key for r in before} == {f"{units.UNITS_VERSION}|-"} and before[0].title == "שורה ישנה"
     assert pipeline.backfill_positions(office.office_id, ver) == "positioned"
-    after = stored(office, ver)
-    assert {r.derivation_key for r in after} == {f"{units.UNITS_VERSION}|{POSITIONS_VERSION}"}
+    after = current(office, ver)
     assert [r.title for r in after] == ["שומת מקרקעין — רחוב הדמומית 12, כפר הדמה",
                                         "שומת מקרקעין — רחוב הצפצפה 7, כפר הדמה"]
     assert {r.reading_id for r in after} == {before[0].reading_id}  # the reading itself did not change
+    # the rows of the earlier key are kept beside the new ones, unchanged (KTD6, KD8)
+    assert [r for r in stored(office, ver) if r.derivation_key == f"{units.UNITS_VERSION}|-"] == before
     assert pipeline.backfill_positions(office.office_id, ver) == "present"
-    assert stored(office, ver) == after
+    assert current(office, ver) == after and len(stored(office, ver)) == len(before) + len(after)
 
 
 def test_the_positions_job_through_the_worker_rebuilds_the_units(office):
@@ -212,8 +222,9 @@ def test_the_positions_job_through_the_worker_rebuilds_the_units(office):
                      {"v": ver, "k": f"{units.UNITS_VERSION}|-"})
         assert enqueue_positions(conn, ver)
     drain()
-    assert {r.derivation_key for r in stored(office, ver)} == {f"{units.UNITS_VERSION}|{POSITIONS_VERSION}"}
-    assert all(r.title != "שורה ישנה" for r in stored(office, ver))
+    assert len(current(office, ver)) == 2 and all(r.title != "שורה ישנה" for r in current(office, ver))
+    # the rows the job replaced in meaning stay where they were (the old key, not read)
+    assert {r.title for r in stored(office, ver) if r.derivation_key == f"{units.UNITS_VERSION}|-"} == {"שורה ישנה"}
 
 
 # --- the lazy build ------------------------------------------------------------------------------------------------------
@@ -274,7 +285,9 @@ def test_four_callers_at_once_build_the_units_of_a_reading_once(office, monkeypa
     assert [r.unit_no for r in stored(office, ver)] == [1, 2, 3, 4]  # one set of rows, not four
 
 
-def test_units_of_another_derivation_key_are_derived_again_on_first_use(office):
+def test_units_of_another_derivation_key_are_derived_again_on_first_use_beside_the_old_rows(office):
+    """Round 15 U3 (KTD6, R7, KD8): a version whose rows are of another key gets the current key's rows on first use,
+    and the old rows are not deleted. Readers see only the current key."""
     _, ver = ingest(office, R7B)
     with tenant_tx(office.system) as conn:
         conn.execute(text("UPDATE document_units SET derivation_key = 'units-v0|-', title = 'שורה ישנה'"
@@ -282,9 +295,28 @@ def test_units_of_another_derivation_key_are_derived_again_on_first_use(office):
     units._MEMO.clear()
     with tenant_tx(office.ctx()) as conn:
         found = units.ensure(conn, ver)
+        assert [u.title for u in units.stored(conn, ver)] == [u.title for u in found]
+        assert [u.title for u in units.stored_many(conn, [ver])[UUID(ver)]] == [u.title for u in found]
     assert [u.title for u in found][0] != "שורה ישנה"
     rows = stored(office, ver)
-    assert {r.derivation_key for r in rows} == {f"{units.UNITS_VERSION}|{POSITIONS_VERSION}"} and len(rows) == 2
+    assert len(rows) == 4
+    assert {r.derivation_key for r in rows} == {"units-v0|-", f"{units.UNITS_VERSION}|{POSITIONS_VERSION}"}
+    assert {r.title for r in rows if r.derivation_key == "units-v0|-"} == {"שורה ישנה"}
+    assert len(current(office, ver)) == 2
+
+
+def test_replace_rewrites_only_the_rows_of_its_own_key(office):
+    _, ver = ingest(office, R7B)
+    with tenant_tx(office.system) as conn:   # the old key's rows: a copy of the current ones under another key
+        conn.execute(text(
+            "INSERT INTO document_units (office_id, document_id, version_id, reading_id, unit_no, kind, title, block_first,"
+            " block_last, certainty, units_version, derivation_key) SELECT office_id, document_id, version_id, reading_id,"
+            " unit_no, kind, 'שורה ישנה', block_first, block_last, certainty, 'units-v0', 'units-v0|-' FROM document_units"
+            " WHERE version_id = :v"), {"v": ver})
+        units.replace(conn, ver)   # re-derives the current key only
+    rows = stored(office, ver)
+    assert len(rows) == 4 and {r.title for r in rows if r.derivation_key == "units-v0|-"} == {"שורה ישנה"}
+    assert len(current(office, ver)) == 2 and all(r.title != "שורה ישנה" for r in current(office, ver))
 
 
 def test_a_user_outside_the_documents_group_neither_reads_builds_nor_writes_units(office, db):
@@ -350,3 +382,130 @@ def test_the_unit_count_script_reads_only_and_prints_no_document_content(office)
     with tenant_tx(office.system) as conn:  # read-only: the units it derived in memory were not written
         assert conn.execute(text("SELECT count(*) FROM document_units WHERE document_id = :d"),
                             {"d": single}).scalar_one() == 0
+
+
+# --- derivations side by side: readers see the current key only, older anchors resolve through the kept rows -----------
+# (round 15 U3, KTD6, R7, KD8). A later derivation is simulated by raising ``units.UNITS_VERSION`` and storing the rows
+# it would derive.
+
+
+def three_units(office, titled: bool = True) -> tuple[str, str]:
+    """A file of three appraisals of two blocks each (units 1, 2, 3 over blocks 0-1, 2-3, 4-5); the third is untitled
+    when ``titled`` is false."""
+    names = ["פרויקט הארז", "מתחם האשל", "פרויקט הברוש" if titled else None]
+    return unit_file(office, office.default_group_id, "קובץ שומות סינתטי", [
+        {"title": t, "aliases": [t.split()[-1]] if t else [], "identifiers": [f"רחוב הדוגמה {n}"],
+         "blocks": [t or f"שומה {n}", "ב"]} for n, t in enumerate(names, 1)])
+
+
+def derive_as(office, ver: str, monkeypatch, units_version: str, spec: list[dict], clear_caches: bool = True) -> None:
+    """The version's units as a later derivation would store them, beside the rows already there (``spec``: dicts with
+    ``blocks`` (first, last), ``pages``, and optionally ``title``, ``aliases``, ``kind``)."""
+    monkeypatch.setattr(units, "UNITS_VERSION", units_version)
+    with tenant_tx(office.system) as conn:
+        reading = units.reading_of(conn, ver)
+        rows = [units.Unit(n, u.get("kind", "appraisal"), u.get("title"), tuple(u.get("aliases") or ()),
+                           {"shown": list(u.get("identifiers") or ())}, u["pages"][0], u["pages"][1],
+                           u["blocks"][0], u["blocks"][1], "certain", {}) for n, u in enumerate(spec, 1)]
+        units._insert(conn, ver, reading, rows)
+    units._MEMO.clear()
+    if clear_caches:
+        contexts._CACHE.clear()
+
+
+def count(office, ver: str) -> int:
+    return len(stored(office, ver))
+
+
+def test_after_a_later_derivation_the_old_rows_stay_and_every_reader_returns_only_the_new_units(office, monkeypatch):
+    doc, ver = three_units(office)
+    before = stored(office, ver)
+    derive_as(office, ver, monkeypatch, "units-v5", [
+        {"title": "מתחם חדש א", "blocks": (0, 3), "pages": (1, 2)},
+        {"title": "מתחם חדש ב", "blocks": (4, 5), "pages": (3, 3)}])
+    after = stored(office, ver)
+    assert len(after) == len(before) + 2 and [r for r in after if r.units_version == "units-v4"] == before
+    with tenant_tx(office.ctx()) as conn:
+        assert [u.title for u in units.stored(conn, ver)] == ["מתחם חדש א", "מתחם חדש ב"]
+        assert [u.title for u in units.stored_many(conn, [ver])[UUID(ver)]] == ["מתחם חדש א", "מתחם חדש ב"]
+        assert [u.title for u in units.ensure(conn, ver)] == ["מתחם חדש א", "מתחם חדש ב"]
+        assert [u.title for u in units.read_or_derive(conn, ver)] == ["מתחם חדש א", "מתחם חדש ב"]
+        names = entities._unit_names(conn)
+        assert "מתחם חדש א" in names and "פרויקט הארז" not in names
+        # the first-message query (a module constant, of the derivation it was imported with) is keyed too
+        assert "derivation_key" in entities._UNIT_NAMES_SQL
+    assert count(office, ver) == len(after)   # reading changed nothing
+
+
+def test_the_one_unit_check_reads_the_current_derivation_only(office, monkeypatch):
+    doc, ver = three_units(office)
+    with tenant_tx(office.ctx()) as conn:
+        assert search.document_term_holders(conn, [["סינתטי"]]) == {}   # three units: the file is not "one unit"
+    derive_as(office, ver, monkeypatch, "units-v5", [{"title": "קובץ אחד", "blocks": (0, 5), "pages": (1, 3)}])
+    with tenant_tx(office.ctx()) as conn:
+        assert set(search.document_term_holders(conn, [["סינתטי"]])) == {UUID(doc)}   # the v5 derivation has one
+
+
+def test_contexts_of_a_version_follow_a_derivation_change_in_the_same_process(office, monkeypatch):
+    _, ver = three_units(office)
+    with tenant_tx(office.ctx()) as conn:
+        first = contexts.of_version(conn, ver, READING)
+    assert first.numbers == [1, 2, 3] and first.tag is None and first.key(2) == f"{ver}#{READING}#2"
+    derive_as(office, ver, monkeypatch, "units-v5", [
+        {"title": "מתחם חדש א", "blocks": (0, 3), "pages": (1, 2)}, {"title": "מתחם חדש ב", "blocks": (4, 5), "pages": (3, 3)}],
+        clear_caches=False)   # the contexts cache is keyed by derivation: the old entry is still there and is not read
+    assert (ver, READING, "units-v4") in contexts._CACHE
+    with tenant_tx(office.ctx()) as conn:
+        second = contexts.of_version(conn, ver, READING)
+    assert second.numbers == [1, 2] and second.tag == "v5" and second.key(2) == f"{ver}#{READING}#2@v5"
+
+
+def anchor_on_v4(doc: str, ver: str, no: int, title: str | None = None) -> dict:
+    """The anchor a conversation stored on a ``units-v4`` unit: no tag."""
+    return entities.unit_anchor({"document_id": doc, "reading_id": READING, "unit_no": no, "title": title,
+                                "aliases": [], "identifiers": [], "page_first": no, "page_last": no})
+
+
+def test_an_anchor_on_an_untitled_v4_unit_resolves_by_range_to_the_unit_that_now_holds_it(office, monkeypatch):
+    doc, ver = three_units(office, titled=False)
+    anchor = anchor_on_v4(doc, ver, 3)   # v4 unit 3: blocks 4-5
+    # v5 renumbers: a new unit 3 sits where the v4 unit 2 ended, and the range 4-5 is now unit 4
+    derive_as(office, ver, monkeypatch, "units-v5", [
+        {"blocks": (0, 1), "pages": (1, 1)}, {"blocks": (2, 2), "pages": (2, 2)},
+        {"blocks": (3, 3), "pages": (2, 2)}, {"blocks": (4, 5), "pages": (3, 3)}])
+    live = entities.live_unit(office.ctx(), anchor)
+    assert live.status == "moved" and live.unit["unit_no"] == 4 and live.unit["units_tag"] == "v5"
+    assert live.unit["unit_no"] != anchor["unit_no"]   # never the unit that happens to carry the old number
+    again = entities.live_unit(office.ctx(), live.unit)   # the new anchor is current, by its number
+    assert again.status == "current" and again.unit["unit_no"] == 4
+
+
+def test_an_anchor_whose_range_spans_two_new_units_is_gone_and_lists_the_candidates(office, monkeypatch):
+    doc, ver = three_units(office, titled=False)
+    anchor = anchor_on_v4(doc, ver, 3)
+    derive_as(office, ver, monkeypatch, "units-v5", [
+        {"blocks": (0, 1), "pages": (1, 1)}, {"blocks": (2, 4), "pages": (2, 3)}, {"blocks": (5, 5), "pages": (3, 3)}])
+    live = entities.live_unit(office.ctx(), anchor)
+    assert live.status == "gone" and live.unit is None and len(live.candidates) == 3
+
+
+def test_an_old_anchor_is_found_by_name_and_the_old_rows_are_not_read_as_current(office, monkeypatch):
+    doc, ver = three_units(office)
+    anchor = anchor_on_v4(doc, ver, 2, "מתחם האשל")
+    entities_anchor = entities.unit_anchor({"document_id": doc, "reading_id": READING, "unit_no": 2, "units_tag": None,
+                                            "title": "מתחם האשל", "aliases": []})
+    derive_as(office, ver, monkeypatch, "units-v5", [
+        {"title": "מתחם האשל", "blocks": (0, 3), "pages": (1, 2)}, {"title": "פרויקט הברוש", "blocks": (4, 5), "pages": (3, 3)}])
+    live = entities.live_unit(office.ctx(), anchor)
+    assert live.status == "moved" and live.unit["unit_no"] == 1 and live.unit["display"] == "מתחם האשל"
+    assert entities.same_unit(entities_anchor, live.unit)
+
+
+def test_the_kept_row_is_read_only_through_the_older_derivations_tag(office, monkeypatch):
+    doc, ver = three_units(office)
+    derive_as(office, ver, monkeypatch, "units-v5", [{"title": "קובץ אחד", "blocks": (0, 5), "pages": (1, 3)}])
+    with tenant_tx(office.ctx()) as conn:
+        old = units.kept(conn, ver, READING, 3, None)
+        assert old is not None and (old.block_first, old.block_last) == (4, 5)
+        assert units.kept(conn, ver, READING, 3, "v5") is None   # unit 3 of v5 does not exist
+        assert units.kept(conn, ver, "another-reading", 3, None) is None
