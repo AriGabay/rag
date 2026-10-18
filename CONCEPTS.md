@@ -22,11 +22,25 @@ Group visibility follows a document into everything derived from it, so a record
 
 The datum and documents a conversation is about after its last answer: what a follow-up such as "and the total?" or "I meant the value" refers to.
 
-The focus is context, not a filter. When the user names another property, unit or document, the focus documents are dropped and the newly named documents — found only among those the user may see — replace them; when nothing or several documents match, the user is asked which one, never answered from the focus.
+The focus is context, not a filter. When the user names another property, unit or document, the focus documents are dropped and the newly named documents — found only among those the user may see — replace them; when nothing or several documents match, the focus is not used as the answer's scope: the model gets the candidates and asks the user which one only when a material ambiguity remains.
 
 ### Question intent
 
-What a request is about, decided for every message and checked by the server against the message: a professional question (a concept, a method or a standard's requirement, answered without any particular property), a property question, a question about a specific document, a mixed question (professional knowledge applied to a named property), a question over a set of documents, or unknown. A property or document is looked up only for an intent that refers to one, and only on identifying evidence in the message: an address, a block and parcel, a unit label, or a name of a document or unit stated as a phrase. A word that document titles share is never evidence, and a standard or section number is never a house number.
+What a request is about, decided for every message: a professional question (a concept, a method or a standard's requirement, answered without any particular property), a property question, a question about a specific document, a mixed question (professional knowledge applied to a named property), a question over a set of documents, or unknown. The request analysis's reading of the message decides the intent. What the message holds as identifying evidence (an address, a block and parcel, a unit label, or a name of a document or unit stated as a phrase) is only a hint: it ranks the candidate units and is recorded, and it never turns a professional question into a property question or an unknown one into a property one. A word that document titles share is never evidence, and a standard or section number is never a house number.
+
+In a model-led turn the server does not answer in the model's place: a lookup that finds several documents or units reaches the model as candidate units, and a clarification to the user is the model's. Only the search-only path (an office without cloud sending, which has no model to read candidates) keeps the server's own reading of the evidence and its own clarifications.
+
+### Candidate units
+
+The appraisal units a first message, or a follow-up that names a subject other than the conversation's, points at, shown to the model as a short list of identity cards (at most eight, each with a handle, its file and pages, the basis of its ranking and the card's quotes). They come only from documents the user may see, are ranked by the identifying evidence in the message together with the cards' subject fields, and carry no volatile fields.
+
+The list is data the model weighs, not a pin and not a scope: it does not lock a search to one unit, and a unit that is not on it can still be found by name. A follow-up that keeps its subject gets the conversation's unit alone. When the model asks the user which unit was meant, the units it offered are stored with the message, and the reply binds to them.
+
+### Declared unit
+
+The appraisal unit, or units, the model states that its answer is about. The model chooses the unit from the candidates shown (or finds it by search) and declares it with the answer. The server accepts a declared unit only if it offered that unit or the model read it in this turn, and only if the user may read it now; anything else is dropped. A single declared unit becomes the conversation's unit for the next turn; several declared units are a comparison and set none.
+
+Verification compares each value's evidence with the asked unit. The asked unit is taken first from a unit the question or the request's components name by a distinguishing identity, and only then from the declaration. A name or identifier that two units of one file share names neither, so a generic name never removes a value that came from the right unit.
 
 ### Conversation slots
 
@@ -94,4 +108,12 @@ A standard keeps its structure — sections, definitions, the conditions and exc
 
 A part of a stored document that the system treats as one appraisal or one internal document, kept apart from the physical file, because a single file may bind several appraisals together with their appendices. Each unit has a stable identity, a title and aliases taken only from the document's own words, identifying details such as the address, block and parcel, or project name, the page or block range it covers, and the evidence that set its identity and boundaries. A unit is of kind appraisal, appendix, comparables, front matter, or a whole unsplit document; comparable properties and appendices are never treated as appraisals.
 
-Boundaries carry a certainty (certain, probable, or unsplit). When a boundary is uncertain, the reader may read past it, and nothing is invented to fill a missing name or boundary. The chat first locates a unit and then searches and reads inside it; passages and cited sources carry the unit they belong to. When several units fit a name, the user is asked, with the details that tell them apart, rather than one being picked by how many passages it has. A follow-up that changes only the metric keeps the same unit.
+Boundaries carry a certainty (certain, probable, or unsplit). When a boundary is uncertain, the reader may read past it, and nothing is invented to fill a missing name or boundary. The chat first locates a unit and then searches and reads inside it; passages and cited sources carry the unit they belong to. When several units fit a name, they reach the model as candidate units with the details that tell them apart; one is never picked by how many passages it has, and when the ambiguity is material the user is asked, with those details. A follow-up that changes only the metric keeps the same unit.
+
+A report's own subject line, or the letter opening that introduces it, starts a unit; a cover letter and the report it introduces stay one unit. A new derivation of the units is stored beside the previous one: the old rows are kept and are read only to resolve a unit anchor stored before the change, never by unit number alone.
+
+### Identity card
+
+What an appraisal unit says about its own subject, read once at ingestion from the unit's opening (its first pages) and kept for every unit of a file that holds several appraisals. A card holds only fields about the subject property: its name, address and city, block and parcel, property type, and the dates the opening writes as labelled text. Each field is stored together with a verbatim quote of the unit's blocks, and a field whose quote is not in those blocks is discarded, never the whole card.
+
+The addressee, the sender and every person's or organisation's name are not kept: the client's name and the appraiser's office address are not the property's. A card's dates tell appraisals apart in the candidate list; they never date a datum, which keeps the dating rules of the datum date. A card is pending, done, failed, or empty (read, and nothing verified); a unit without a finished card keeps its structural title and identifiers.

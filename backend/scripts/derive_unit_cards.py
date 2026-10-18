@@ -11,7 +11,8 @@ ceiling (`UNIT_CARDS_MAX_PER_VERSION`, default 60) stay `pending`; a second run 
 
     docker compose exec backend python scripts/derive_unit_cards.py --office <office uuid> [--dry-run]
 
-`--dry-run` writes nothing and calls no model: it prints the units, the versions skipped (single unit, not cloud), the
+`--dry-run` writes no card and calls no model (reading a version's units may derive its current-version unit rows, beside
+the older ones, as any first read does): it prints the units, the versions skipped (single unit, not cloud), the
 cards it would call, the units over the ceiling and a token estimate. Each unit's card is its own transaction, so an
 interrupted run keeps what it wrote and a second run continues.
 """
