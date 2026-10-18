@@ -3564,6 +3564,25 @@ def _unknown_ids(u: Unit, ws: Workspace) -> list[str]:
             and i not in ws.values and i not in ws.assumptions]
 
 
+def _value_origin(ws: Workspace, v) -> str:
+    """The text of the source a cited value (V#) was registered from that the claim citing it also states (round 15, R10/R11,
+    KD3): a table cell's value is registered with the cell's quote, but the claim is a row of apartments — the floor sits in
+    another cell of the same source row — so the row is what the V# states. The narrowest text of the source passage that
+    holds the value: the lines (a table's rows, a prose paragraph) that write its number — the ones that also write the
+    row label the registration recorded, when some do — else the whole passage (a value whose number the passage does
+    not write on its own line). Never the rest of the document, and nothing of a source the turn did not register the value
+    from: a number only another source states stays unstated."""
+    src = ws.sources.get(v.source_id)
+    if src is None or not src.text:
+        return ""
+    forms = numbers_in(v.written)
+    lines = [x for x in src.text.splitlines() if forms & numbers_in(x)]
+    label = (v.locator.get("row") or "").strip() if isinstance(v.locator, dict) else ""
+    if label:
+        lines = [x for x in lines if label in x] or lines
+    return "\n".join(lines) if lines else src.text
+
+
 def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: set[str],
               strict: bool = False, stated_by: dict[str, set[str]] | None = None, extra_text: str = "",
               percent_of_fraction: bool = True) -> list[str]:
@@ -3585,6 +3604,15 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
                 stated_by[i] = found
         by_id[i] = found
         cited |= found
+    for i in u.ids:  # a cited value states the row or paragraph it was registered from, not only itself (round 15, KD3)
+        if i in ws.values:
+            key = f"{i}\x00origin"
+            found = stated_by.get(key) if stated_by is not None else None
+            if found is None:
+                found = numbers_in(_value_origin(ws, ws.values[i]), words=True)
+                if stated_by is not None:
+                    stated_by[key] = found
+            cited |= found
     computations = [ws.computations[i] for i in u.ids if i in ws.computations]
     for c in computations:
         cited.add(str(len(c.inputs)))
