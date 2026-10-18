@@ -193,7 +193,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol, get_args
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from app.answering.verify import _DATE as _DATE_AT
 from app.answering.verify import _NUMBER as _NUM_AT  # one reading of numbers for both checks
@@ -484,6 +484,14 @@ REQ_DATA_FOUND = ("חלק של הבקשה שהתשובה לא נתנה במלו�
 REQ_TEXT_FOUND = ("חלק של הבקשה שהתשובה לא נתנה במלואו: «{text}». הוא כבר נקרא בתור הזה, ונכתב במקור: {where}. הוסף אותו "
                   "לתשובה מאותו מקור, עם מראה המקום שלו; אין צורך בחיפוש חדש")
 TEXT_FOUND_CHECK = "text_found"  # the ``Problem.check`` of a REQ_TEXT_FOUND problem (the repair step turns its tools off for it)
+# the requirements trace (diagnostics only): what a requirements call returned for a component and what the server did with its
+# support. Bounded: a quote prefix is all the document text it keeps
+TRACE_QUOTE_CHARS = 160  # the most of a support quote the trace keeps
+TRACE_MISSING_CHARS = 200  # the most of a ``missing`` text it keeps
+TRACE_SUPPORT_PER_VOTE = 12  # support entries kept per vote (the rest are counted in ``support_omitted``)
+TRACE_VOTES_PER_COMPONENT = 8  # votes (judge calls) kept per component and round
+TRACE_COMPONENTS = 40  # components kept per round
+TRACE_PASSAGE_IDS = 60  # passage ids kept per call
 SUPPORT_QUOTE_MIN = 6  # the least a support quote may hold, in characters after normalisation
 SUPPORT_QUOTE_MAX = 300  # the most: a quote is one sentence or table row, never a passage (a longer one is dropped silently)
 REQ_NOT_SEARCHED = ("חלק של הבקשה שהתשובה לא נתנה: «{text}». לא בוצע חיפוש או קריאה שמכסים אותו: יש לחפש אותו "
@@ -738,6 +746,9 @@ class JudgeRequirement(_Strict):
     # the answer omits, each with the verbatim quote. Kept per vote and only for a read source (``_Coverage.accept``); the
     # server checks the quote and decides what it is evidence of (round 16 U2). Empty by default, so an older reply stays valid.
     support: list[SupportQuote] = Field(default_factory=list)
+    # diagnostics only, never in the provider's schema: the call this vote came from, its read passages and what became of each
+    # support entry (``_Coverage.accept``, ``validated_support``); travels with the vote, also when a later round carries it
+    _trace: dict | None = PrivateAttr(default=None)
 
 
 class JudgeCoverageOutput(JudgeOutput):
@@ -1897,6 +1908,29 @@ class VerifyReport:
             rows.append({"ordinal": n} | partial_summary(p.failure_kind if p else None, p.check if p else None)
                         | ({"claim_id": ids[0], "claim_ids": list(ids)} if ids else {}))
         return rows
+
+    def requirements_trace(self) -> list[dict]:
+        """Per request component, what the requirements judge returned and what the server did with its support (diagnostics
+        only; owner and admin): the component's id and final merged status (``requirement_outcomes``), and one entry per judge
+        call that scored it — the call's number (``None``: a score carried from the turn's earlier round), its status and
+        ``missing`` text, whether its ``<read_passages>`` was rendered with its size and the ``S#`` ids it held, and every
+        support entry the judge returned: ``id``, the first ``TRACE_QUOTE_CHARS`` characters of the quote and its outcome
+        (``accepted``, or the first condition it failed). Bounded; never more document text than the quote prefix."""
+        if not self.requirements:
+            return []
+        final = {o["id"]: o["status"] for o in self.requirement_outcomes()}
+        out = []
+        for r in self.requirements[:TRACE_COMPONENTS]:
+            votes = []
+            for v in self.requirement_votes.get(r["id"], [])[:TRACE_VOTES_PER_COMPONENT]:
+                t = v._trace
+                if t is None:  # a score no judge call of this verification made (a hand-built report)
+                    votes.append({"call": None, "reused": False, "status": v.status, "passages": None,
+                                  "missing": v.missing[:TRACE_MISSING_CHARS], "support": [], "support_omitted": 0})
+                else:
+                    votes.append({k: val for k, val in t.items() if k != "_index"} | {"support": [dict(e) for e in t["support"]]})
+            out.append({"id": r["id"], "final_status": final.get(r["id"]), "votes": votes})
+        return out
 
     def requirement_outcomes(self, applied: FinalAnswer | None = None) -> list[dict]:
         """Each component with its status in the verified answer (KTD3, R6, R7), merged by id across the judge
@@ -4793,6 +4827,71 @@ def _read_passages(coverage: _Coverage, ws: Workspace, shown: dict[str, tuple[st
     return "<read_passages>\n" + "\n".join(out) + "\n</read_passages>" if out else ""
 
 
+class _VoteTrace:
+    """What one vote's support entries became (diagnostics only): an entry per support quote the judge returned, in its order,
+    with its ``outcome`` — ``accepted``, or the first condition it failed (``not_returned_source``, ``too_short``, ``too_long``,
+    ``other_document``, ``outside_asked_unit``, ``already_in_answer``, ``not_verbatim``), or why it was never weighed
+    (``not_partial_or_missing``: support on a vote that is neither; ``duplicate``; ``over_cap``). Notes the entry as the judge
+    wrote it, a quote prefix at most; ``None`` outcome: not decided yet. Bounded by ``TRACE_SUPPORT_PER_VOTE``."""
+
+    def __init__(self, call: int, status: str, passages: dict | None) -> None:
+        self.call, self.status, self.passages = call, status, passages
+        self.entries: list[dict] = []
+        self.index: dict[tuple[str, str], int] = {}  # (id, quote) -> its entry, for the entries still undecided
+        self.omitted = 0
+
+    def note(self, sid: str, quote: str, outcome: str | None) -> None:
+        if len(self.entries) >= TRACE_SUPPORT_PER_VOTE:
+            self.omitted += 1
+            return
+        self.index.setdefault((sid, quote), len(self.entries))
+        self.entries.append({"id": sid, "quote": quote[:TRACE_QUOTE_CHARS], "outcome": outcome})
+
+    def settle(self, sid: str, quote: str, outcome: str) -> None:
+        """Decide the entry noted as undecided for this (id, quote), when it was kept in the trace."""
+        n = self.index.get((sid, quote))
+        if n is not None:
+            self.entries[n]["outcome"] = outcome
+
+    def as_dict(self, missing: str, judged_missing: str) -> dict:
+        out = {"call": self.call, "reused": False, "status": self.status, "missing": missing[:TRACE_MISSING_CHARS],
+               "passages": self.passages, "support": self.entries, "support_omitted": self.omitted,
+               "_index": self.index}
+        if judged_missing.strip() and judged_missing.strip() != missing:
+            out["missing_dropped"] = judged_missing.strip()[:TRACE_MISSING_CHARS]  # the judge's words the server did not keep
+        return out
+
+
+def _carried(votes: list[JudgeRequirement]) -> list[JudgeRequirement]:
+    """Scores kept from an earlier verification of the turn, their traces marked as reused (no call of this round made them) and
+    copied, so the support outcomes of this round do not change what the earlier round recorded."""
+    out = []
+    for v in votes:
+        c = v.model_copy()
+        if v._trace is not None:
+            c._trace = {**v._trace, "reused": True, "call": None, "support": [dict(e) for e in v._trace["support"]]}
+        out.append(c)
+    return out
+
+
+def _settle(v: JudgeRequirement, sid: str, quote: str, outcome: str) -> None:
+    """Record, on the vote's trace, what the server decided about the support entry ``(sid, quote)`` (as the vote holds it)."""
+    t = v._trace
+    if t is not None and (n := t["_index"].get((sid, quote))) is not None and n < len(t["support"]):
+        t["support"][n]["outcome"] = outcome
+
+
+def _passages_info(rendered: str) -> dict:
+    """What a requirements call's ``<read_passages>`` held (diagnostics): whether it was rendered, its size in characters, and the
+    ids of its passages (``S#``), from the prompt as sent."""
+    start, end = rendered.find("<read_passages>"), rendered.rfind("</read_passages>")
+    if start < 0 or end < start:
+        return {"rendered": False, "chars": 0, "ids": []}
+    block = rendered[start:end + len("</read_passages>")]
+    ids = list(dict.fromkeys(re.findall(r'<read_passage id="([^"]+)"', block)))
+    return {"rendered": True, "chars": len(block), "ids": ids[:TRACE_PASSAGE_IDS]}
+
+
 @dataclass
 class _Coverage:
     """The completeness plane of a judge call: the turn's requirements (to derive, with the answer's declared parts
@@ -4808,6 +4907,7 @@ class _Coverage:
     # block asks about with them; and the read sources a requirement may name as support (set when a batch is judged)
     answer_ids: set[str] = field(default_factory=set)
     readable: set[str] = field(default_factory=set)
+    calls: int = 0  # the calls whose scores were accepted so far (the requirements trace numbers them)
 
     def component_texts(self) -> list[str]:
         """What the passages are clipped against: the asked components, else (before they are derived) the request and the
@@ -4835,32 +4935,56 @@ class _Coverage:
         out += f"\n<workspace>\n{self.workspace}\n</workspace>"
         return out
 
-    def accept(self, scored: list[JudgeRequirement], indexes: set[int]) -> list[JudgeRequirement]:
+    def accept(self, scored: list[JudgeRequirement], indexes: set[int], passages: dict | None = None
+               ) -> list[JudgeRequirement]:
         """A call's requirement scores, by frozen id: the deriving call freezes the list first. Units (and units
-        marked absent) are kept only when they are the call's units, related ids only when the workspace lists them."""
+        marked absent) are kept only when they are the call's units, related ids only when the workspace lists them.
+        Each score keeps its trace (diagnostics only): the call's number, ``passages`` (what the call's ``<read_passages>``
+        held) and what became of each support entry the judge returned, as far as this step decides it."""
         if not self.turn.derived:
             scored = [r.model_copy(update={"id": item["id"]}) for r, item in self.turn.freeze(scored)]
         texts = {r["id"]: r["text"] for r in self.turn.items}
-        return [r.model_copy(update={"units": [i for i in r.units if i in indexes],
+        self.calls += 1
+        out = []
+        for r in scored:
+            if r.id not in texts:
+                continue
+            trace = _VoteTrace(self.calls, r.status, passages)
+            missing = valid_missing(r.missing, r.status, texts[r.id], self.request)
+            v = r.model_copy(update={"units": [i for i in r.units if i in indexes],
                                      "absent": [i for i in r.absent if i in indexes],
                                      "related": [x for x in dict.fromkeys(r.related) if x in self.known],
-                                     "missing": valid_missing(r.missing, r.status, texts[r.id], self.request),
-                                     "support": self.valid_support(r)})
-                for r in scored if r.id in texts]
+                                     "missing": missing, "support": self.valid_support(r, trace)})
+            v._trace = trace.as_dict(missing, r.missing)
+            out.append(v)
+        return out
 
-    def valid_support(self, r: JudgeRequirement) -> list[SupportQuote]:
+    def valid_support(self, r: JudgeRequirement, trace: _VoteTrace | None = None) -> list[SupportQuote]:
         """The support a vote keeps: only for a ``partial`` or ``missing`` requirement, only for an id that is a read source of
         the turn (an opened section, table or page: a source only searched is not), each (id, quote) once, at most
         ``SUPPORT_PER_REQUIREMENT``. Whether the quote is in the passage, in an asked unit and absent from the answer is the
-        server's check after this (round 16 U2); this keeps the vote's own shape."""
+        server's check after this (round 16 U2); this keeps the vote's own shape. ``trace`` notes each entry's outcome here
+        (the ones kept are left for ``validated_support`` to settle)."""
+        trace = trace or _VoteTrace(0, r.status, None)
         if r.status not in ("partial", "missing"):
+            for x in r.support:
+                trace.note(x.id.strip(), x.quote.strip(), "not_partial_or_missing")
             return []
         out: dict[tuple[str, str], SupportQuote] = {}
         for x in r.support:
             sid, quote = x.id.strip(), x.quote.strip()
             if sid in self.readable and quote:
-                out.setdefault((sid, quote), SupportQuote(id=sid, quote=quote))
-        return list(out.values())[:SUPPORT_PER_REQUIREMENT]
+                if (sid, quote) in out:
+                    trace.note(sid, quote, "duplicate")
+                else:
+                    out[(sid, quote)] = SupportQuote(id=sid, quote=quote)
+                    trace.note(sid, quote, None)
+            else:
+                trace.note(sid, quote, "not_returned_source" if sid not in self.readable else "too_short")
+        kept = list(out.values())[:SUPPORT_PER_REQUIREMENT]
+        for x in list(out.values())[SUPPORT_PER_REQUIREMENT:]:
+            trace.settle(x.id, x.quote, "over_cap")
+        return kept
 
 
 def _requirement_attrs(r: dict) -> str:
@@ -5058,7 +5182,7 @@ def judge(provider: LLMProvider, batch: _Batch, rendered: str, usage: list[dict]
     scores: list[JudgeRequirement] = []
     if coverage:
         # a requirement is given only by a unit of this call (a removed one included); other indexes are ignored
-        scores = coverage.accept(r.parsed.requirements, shown)
+        scores = coverage.accept(r.parsed.requirements, shown, _passages_info(rendered))
     # a conclusion rests only on another unit this call showed
     return {v.index: v.model_copy(update={"depends_on": [i for i in dict.fromkeys(v.depends_on)
                                                          if i in shown and i != v.index]})
@@ -5663,6 +5787,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         headings = _headings_above(answer.answer_markdown, units)
         keys = {u.index: unit_key(u, ws, request or question, headings[u.index], digests) for u in units}
         verdicts, votes = cache.reuse(units, to_judge, keys)
+        votes = _carried(votes)
         report.reused = len(verdicts)
         signature = (tuple((keys[u.index], u.index in failed) for u in units),
                      coverage.workspace if coverage else "", request or question,
@@ -5675,7 +5800,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     fresh = [u for u in to_judge if u.index not in verdicts]
     if coverage and not fresh:
         if cache is not None and cache.last is not None and requirements.derived and cache.last.signature == signature:
-            votes = list(cache.last.votes)  # the same answer over the same workspace: scored already
+            votes = _carried(cache.last.votes)  # the same answer over the same workspace: scored already
         else:
             _, scored = _judge_batch(provider, _Batch([], removed=removed_shown), ws, usage, deadline, coverage)
             votes += scored
@@ -6507,7 +6632,8 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
     is at most ``SUPPORT_QUOTE_MAX`` characters and a verbatim substring of its text after normalisation, the
     block holding it lies in an asked unit (declared, located or cited) and not across a probable edge, the source's
     document is one the answer is about, and the quoted part is absent from the answer (no single surviving unit holds its
-    numbers with half of the words that name the item, ``_in_answer``). An invalid entry is dropped silently, never failing a unit. ``failed``: the
+    numbers with half of the words that name the item, ``_in_answer``). An invalid entry is dropped silently, never failing a
+    unit; the first condition it fails is kept on its vote's trace (``VerifyReport.requirements_trace``). ``failed``: the
     indexes of the units removed (not in the answer)."""
     votes = {cid: [v for v in vs if v.status in ("partial", "missing") and v.support]
              for cid, vs in report.requirement_votes.items()}
@@ -6531,18 +6657,39 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
     for cid, vs in votes.items():
         seen: set[tuple[str, str]] = set()
         kept: list[dict] = []
-        for x in (x for v in vs for x in v.support):
-            sid, quote = x.id.strip(), _read_back(x.quote.strip())
+        notes: list[tuple[JudgeRequirement, str, str]] = []  # the accepted entries, to say which the cap left out
+        for v, x in ((w, y) for w in vs for y in w.support):
+            given = x.quote.strip()
+            sid, quote = x.id.strip(), _read_back(given)
             flat = _flat_quote(quote)
             src = ws.sources.get(sid)
-            if ((sid, flat) in seen or src is None or sid not in readable
-                    or not SUPPORT_QUOTE_MIN <= len(flat) <= SUPPORT_QUOTE_MAX):
-                continue
-            seen.add((sid, flat))
-            # every condition holds; the cheap ones are tested first and the substring test, which reads the whole source, last
-            if (str(src.document_id) in documents and _support_in_asked_units(ws, src, asked)
-                    and not _in_answer(quote, units, components.get(cid, "")) and flat in flat_text(sid, src)):
-                kept.append({"id": sid, "quote": quote})
+            # the first condition the entry fails, in the order the decision is made: the cheap ones first and the substring
+            # test, which reads the whole source, last
+            if (sid, flat) in seen:
+                why = "duplicate"
+            elif src is None or sid not in readable:
+                why = "not_returned_source"
+            elif len(flat) < SUPPORT_QUOTE_MIN:
+                why = "too_short"
+            elif len(flat) > SUPPORT_QUOTE_MAX:
+                why = "too_long"
+            else:
+                seen.add((sid, flat))
+                if str(src.document_id) not in documents:
+                    why = "other_document"
+                elif not _support_in_asked_units(ws, src, asked):
+                    why = "outside_asked_unit"
+                elif _in_answer(quote, units, components.get(cid, "")):
+                    why = "already_in_answer"
+                elif flat not in flat_text(sid, src):
+                    why = "not_verbatim"
+                else:
+                    why = "accepted"
+                    kept.append({"id": sid, "quote": quote})
+                    notes.append((v, sid, given))
+            _settle(v, sid, given, why)
+        for v, sid, given in notes[SUPPORT_PER_REQUIREMENT:]:
+            _settle(v, sid, given, "over_cap")
         if kept:
             out[cid] = kept[:SUPPORT_PER_REQUIREMENT]
     return out

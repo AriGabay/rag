@@ -369,6 +369,22 @@ def test_ae1_a_rate_the_passage_lists_and_the_answer_omits_is_added_from_it_by_a
     assert a["verification"]["completeness"] == {"status": "full", "requirements": 1, "missing": []}
     assert a["verification"]["correctness"] == "verified"
     assert [c.purpose.value for c in agent.calls].count("verify") >= 2
+    # the diagnostics (owner and admin only) record, per round and component, what the judge returned and what the server did
+    assert "requirements_trace" not in m and "requirements_trace" not in a
+    d = client.get(f"/api/chat/messages/{m['id']}/diagnostics")
+    assert d.status_code == 200
+    trace = d.json()["requirements_trace"]
+    assert "requirements_trace" not in (d.json()["resolution"] or {})
+    assert [t["round"] for t in trace][:2] == [1, 2]
+    first = next(c for c in trace[0]["components"] if c["id"] == "N1")
+    assert first["final_status"] == "partial"
+    (vote,) = first["votes"]
+    assert vote["status"] == "partial" and set(vote["passages"]) == {"rendered", "chars", "ids"}
+    (entry,) = vote["support"]
+    assert entry["id"] == "S1" and "למחסנים" in entry["quote"] and len(entry["quote"]) <= 160
+    assert entry["outcome"] == "accepted"
+    last = next(c for c in trace[-1]["components"] if c["id"] == "N1")
+    assert last["final_status"] == "full" and last["votes"][-1]["status"] == "full"
 
 
 def test_a_part_the_repair_step_still_does_not_add_is_stated_as_read_and_not_used(client, office, monkeypatch):

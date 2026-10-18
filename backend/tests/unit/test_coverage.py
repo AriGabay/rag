@@ -1889,6 +1889,90 @@ def test_support_is_merged_by_component_across_votes_and_each_entry_is_validated
         "N1": [{"id": "S2", "quote": MISSING_RATE}, {"id": "S2", "quote": "גרעין: 11.3%"}]}
 
 
+# --- round 16 diagnostics: what the requirements judge returned and what the server did with its support (requirements_trace) ----
+
+def _trace_ws() -> tuple[Workspace, str]:
+    """A file of two units (S1 the cited source, S2 the rates in the asked unit, S3 in the other unit) and a comparable's
+    own file (S4, another document, read by the turn); the id of S4."""
+    other = "שיעורי היוון של שומה אחרת בקובץ: מחסנים: 5.5%"
+    ws = _rates_file(other, units=(1, 1, 2))
+    stranger = ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="שומה של נכס להשוואה", section="סיכום",
+                             location="סעיף \"סיכום\"", kind="context", text="שיעורי היוון:\nמחסנים: 9.1%\nמשרדים: 6.5%")
+    _read(ws, stranger.sid)
+    return ws, stranger.sid
+
+
+def _trace_of(ws: Workspace, support: list[dict], status: str = "partial", markdown: str = THREE_RATES,
+              cache: verify.VerdictCache | None = None, seen: list | None = None):
+    turn = _turn({"id": "1", "text": ASK_RATES})
+
+    def score(frozen, units):
+        return [_req("", status, list(units) if status == "partial" else [], id=frozen[0][0])
+                | {"missing": "שיעורי ההיוון" if status == "partial" else "", "support": support}]
+
+    return verify_answer(_judge(score, seen=seen), _answer(markdown), ws, "?", [], requirements=turn, cache=cache)
+
+
+def test_the_requirements_trace_records_each_support_entry_with_the_first_condition_it_fails_or_accepted():
+    ws, stranger = _trace_ws()
+    long_quote = "שיעור היוון " + "ארוך " * 80
+    # a vote keeps at most SUPPORT_PER_REQUIREMENT entries into validation, so the reasons are shown by two judge replies
+    first = [("S2", MISSING_RATE, "accepted"),
+             ("S99", MISSING_RATE, "not_returned_source"),  # never returned to the agent
+             ("S2", "9.1", "too_short"),
+             ("S2", long_quote, "too_long"),
+             ("S3", "מחסנים: 5.5%", "outside_asked_unit"),  # a returned source of the other unit
+             (stranger, "מחסנים: 9.1%", "other_document"),  # a returned source of a document the answer is not about
+             ("S2", MISSING_RATE, "duplicate")]  # the first entry again
+    second = [("S2", RATE_LINES[0], "already_in_answer"),  # the answer gives the rate already
+              ("S2", "שיעור היוון לגרעין 11.3%", "not_verbatim"),
+              ("S2", MISSING_RATE, "accepted")]
+    for entries in (first, second):
+        seen: list[str] = []
+        r = _trace_of(ws, [{"id": sid, "quote": q} for sid, q, _ in entries], seen=seen)
+        assert r.text_support == {"N1": [{"id": "S2", "quote": MISSING_RATE}]}  # the decisions are unchanged
+        (comp,) = r.requirements_trace()
+        assert comp["id"] == "N1" and comp["final_status"] == "partial"
+        (vote,) = comp["votes"]
+        assert vote["status"] == "partial" and vote["missing"] == "שיעורי ההיוון" and vote["reused"] is False
+        assert [(x["id"], x["outcome"]) for x in vote["support"]] == [(sid, why) for sid, _, why in entries]
+        assert all(len(x["quote"]) <= 160 for x in vote["support"])
+        block = _passages(seen[0])
+        assert vote["passages"] == {"rendered": True, "chars": len(block),
+                                    "ids": re.findall(r'<read_passage id="(S\d+)"', block)}
+        assert vote["passages"]["ids"]  # (S2 is cited by the answer, so it is shown there and not again as a passage)
+    assert next(x for x in comp["votes"][0]["support"] if x["outcome"] == "accepted")["quote"] == MISSING_RATE
+    (vote,) = _trace_of(ws, [{"id": "S2", "quote": long_quote}]).requirements_trace()[0]["votes"]
+    assert vote["support"][0]["quote"] == long_quote[:160] and len(vote["support"][0]["quote"]) == 160
+
+
+def test_the_requirements_trace_records_support_on_a_full_vote_as_ignored_and_a_status_per_call():
+    ws, _ = _trace_ws()
+    r = _trace_of(ws, [{"id": "S2", "quote": MISSING_RATE}], status="full")
+    (comp,) = r.requirements_trace()
+    (vote,) = comp["votes"]
+    assert vote["status"] == "full" and [x["outcome"] for x in vote["support"]] == ["not_partial_or_missing"]
+    assert r.text_support == {} and comp["final_status"] in ("full", "not_answered")
+
+
+def test_the_requirements_trace_caps_its_entries_and_a_carried_vote_is_marked_reused():
+    ws, _ = _trace_ws()
+    many = [{"id": "S2", "quote": f"שיעור היוון מספר {n} של סוג {n}"} for n in range(40)]
+    cache = verify.VerdictCache()
+    r = _trace_of(ws, many, cache=cache)
+    (vote,) = r.requirements_trace()[0]["votes"]
+    assert len(vote["support"]) == verify.TRACE_SUPPORT_PER_VOTE and vote["support_omitted"] == 40 - verify.TRACE_SUPPORT_PER_VOTE
+    again = _trace_of(ws, many, cache=cache)
+    (vote,) = again.requirements_trace()[0]["votes"]
+    assert vote["reused"] is True and vote["call"] is None and len(vote["support"]) == verify.TRACE_SUPPORT_PER_VOTE
+    assert [x["outcome"] for x in vote["support"][verify.SUPPORT_PER_REQUIREMENT:]] == ["over_cap"] * 6
+
+
+def test_a_verification_with_no_requirements_has_no_trace():
+    report = verify_answer(_judge(lambda f, u: []), _answer(THREE_RATES), _rates_file(), "?", [])
+    assert report.requirements_trace() == []
+
+
 def test_a_unit_saying_the_part_was_not_found_while_valid_text_support_exists_is_replaced_as_an_absence():
     ws = _rates_file()
     markdown = THREE_RATES + " שיעור ההיוון למחסנים לא נמצא בשומה [S2]."

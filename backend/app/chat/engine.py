@@ -550,6 +550,9 @@ class TurnOutcome:
     # the documents of the candidates the model was shown, for a clarification only: its text may name any of them, so the
     # message is hidden when the user loses access to one (``api._answer_documents``)
     shown_documents: list[str] = field(default_factory=list)
+    # per verification round, what the requirements judge returned for each component and what the server did with its support
+    # (``VerifyReport.requirements_trace``); diagnostics only, [{"round": the number in ``rounds``, "components": [...]}]
+    requirements_trace: list[dict] = field(default_factory=list)
 
 
 def usage_summary(usage: list[dict], **extra) -> dict:
@@ -692,6 +695,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     mixed_asked = False  # a mixed question's answer was already asked for its professional part (once per turn)
     pre_mixed = None  # the first answer of a mixed question, kept while that extra round runs (round 13 U14)
     rounds: list[list[dict]] = []
+    traces: list[dict] = []  # the requirements trace of each verification round (diagnostics only)
     # the request's requirements, frozen for the turn (the request's components, or the judge's derivation when there
     # are none), and its tool failures
     turn = TurnRequirements()
@@ -874,7 +878,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                                                   else _first_resolution(turn_intent, first_decisions), notes), ws.time),
                            _summary(usage, rounds, reused, turn),
                            _pending(ws, turn, final), composed.spans, done.digest, done.stats, ws.clock.summary(),
-                           unit, offered_units=offered, shown_documents=shown_documents)
+                           unit, offered_units=offered, shown_documents=shown_documents, requirements_trace=traces)
 
     def adopt_analysis() -> None:
         """The collected analysis as the turn's requirements: its components frozen and appended as one item, or the
@@ -1090,6 +1094,11 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         if cancelled():
             raise TurnCancelled
         rounds.append([p.as_dict() for p in report.problems])
+        try:
+            if components := report.requirements_trace():
+                traces.append({"round": len(rounds), "components": components})
+        except Exception:  # noqa: BLE001 - a diagnostics record never fails the turn
+            logger.warning("chat requirements trace failed", exc_info=True)
         reused += report.reused
         # after the repair round, what is left for the server (a qualifier it writes from the source, a note that
         # the datum is not the one requested, a partial with no concrete defect) does not justify a rewrite that
