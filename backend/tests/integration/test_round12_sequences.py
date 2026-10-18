@@ -72,11 +72,13 @@ def world(db, client, monkeypatch, calls, keys: tuple[str, ...], email: str = "a
 
 
 def sids_of(items: list) -> dict[str, list[dict]]:
-    """document id -> the search hits (attributes and body) of the tool outputs the model has seen, in order."""
+    """document id -> the search hits (attributes and body) of the tool outputs the model has seen, in order. A hit that repeats
+    an earlier one is self-closing (``<source .../>``, ``same_as``) and holds no text: it is skipped, not read as the opening of
+    the next hit (that would file the next hit's text under the repeated hit's document)."""
     out: dict[str, list[dict]] = {}
     for it in items:
         if isinstance(it, dict) and it.get("type") == "function_call_output":
-            for m in re.finditer(r"<source ([^>]*)>(.*?)</source>", it["output"], re.S):
+            for m in re.finditer(r"<source ([^>]*?[^/>])>(.*?)</source>", it["output"], re.S):
                 attrs = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
                 if attrs.get("id") and attrs.get("document_id"):
                     out.setdefault(attrs["document_id"], []).append(attrs | {"body": m.group(2)})

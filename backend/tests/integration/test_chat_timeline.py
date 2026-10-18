@@ -68,7 +68,7 @@ def sids_by_document(items: list) -> dict[str, str]:
     out = {}
     for it in items:
         if isinstance(it, dict) and it.get("type") == "function_call_output":
-            for m in re.finditer(r"<source ([^>]*)>(.*?)</source>", it["output"], re.S):
+            for m in re.finditer(r"<source ([^>]*?[^/>])>(.*?)</source>", it["output"], re.S):
                 attrs = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
                 if "השווי נקבע בסך" in m.group(2) and attrs.get("id") and attrs.get("document_id"):
                     out.setdefault(attrs["document_id"], attrs["id"])
