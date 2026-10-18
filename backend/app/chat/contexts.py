@@ -85,7 +85,8 @@ NON_SUBJECT_KINDS = frozenset({"appendix", "comparables"})
 # how a unit that is not an appraisal is called in a label (the one place that words them)
 UNIT_KIND_MARKS = {"appendix": "נספח", "comparables": "עסקאות השוואה", "front_matter": "פתיח"}
 MSG_UNNAMED = "ללא שם מזהה"
-MSG_NO_TITLE = "ללא כותרת"  # a unit with no title of its own, named in a line that shows it
+LABEL_NAMES = 2  # how many of a unit's names label it when it has no title and no identifiers (``Contexts.label``)
+MSG_NO_TITLE ="ללא כותרת"  # a unit with no title of its own, named in a line that shows it
 # punctuation that separates the words of a name (the aliases of a unit are normalized with it)
 NAME_PUNCT = re.compile(r"[\"“”‘’,.:;(){}\[\]<>!?|/\\—–_*•]")
 
@@ -290,11 +291,16 @@ class Contexts:
         return unit_key(self.version_id, self.reading_id, number, self.tag)
 
     def label(self, number: int) -> str:
-        """What names a context: a unit's title, then its identifiers; a part that is not an appraisal says so."""
+        """What names a context: a unit's title, then its identifiers; a unit with neither (a compendium unit with no
+        title block and no labelled identifiers) is named by the first ``LABEL_NAMES`` of its identity's names (card
+        subject names and document-grounded aliases, as ``name_key`` holds them), so a source from it is not shown as
+        unnamed beside a file title that names another property; a part that is not an appraisal says so."""
         seg = self.segment(number)
         # a title that restates one of the unit's identifiers adds nothing to them: the identifiers label it
         parts = [seg.title] if seg.title and not any(x in seg.title for x in seg.identity.shown) else []
         parts += seg.identity.shown
+        if not parts:
+            parts = list(seg.identity.names[:LABEL_NAMES])
         mark = UNIT_KIND_MARKS.get(seg.kind)
         if mark and not any(mark in p for p in parts):
             parts.insert(0, mark)

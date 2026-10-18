@@ -356,6 +356,31 @@ def test_an_appendix_or_comparables_unit_is_labelled_as_such_and_is_never_a_subj
     assert nameless.label(1) == contexts.MSG_UNNAMED
 
 
+def test_a_unit_with_names_but_no_title_or_identifiers_is_labelled_by_its_names():
+    """A compendium unit with no title block and no labelled identifiers still has the names its identity card or
+    aliases give it: its label is those names (the first two, in identity order), so a source from it is never shown
+    to the judge as unnamed beside a file title that names another property."""
+    named = contexts.from_units([_unit(1, "appraisal", "מתחם הגפן", first=0, last=2),
+                                 _unit(2, "appraisal", None, ("גבעת הנרקיס", "הנרקיס", "שכונת הצבעונים"), first=3, last=5)],
+                                {}, [], "v")
+    assert named.label(2) == "גבעת הנרקיס · הנרקיס"
+    assert named.describe(2) == "הקשר 2: גבעת הנרקיס · הנרקיס (עמוד 1)"
+    carded = contexts.from_units(
+        [_unit(1, "appraisal", None, first=0, last=2)], {}, [], "v",
+        cards={(0, 2): [{"field": "name", "quote": "מתחם הנרקיס"}, {"field": "city", "quote": "כפר הדמה"}]})
+    assert carded.label(1) == "מתחם הנרקיס"
+    # a title still labels its unit alone, and identifiers still follow it
+    assert named.label(1) == "מתחם הגפן"
+    titled = contexts.from_units([_unit(1, "appraisal", "מתחם הגפן", ("הגפן",), ("גוש 31140 חלקה 22",), first=0, last=2,
+                                        identifiers={"addresses": [], "parcels": [["31140", "22"]],
+                                                     "shown": ["גוש 31140 חלקה 22"]})], {}, [], "v")
+    assert titled.label(1) == "מתחם הגפן · גוש 31140 חלקה 22"
+    # names do not replace a part's kind mark; a unit with nothing stays unnamed
+    appendix = contexts.from_units([_unit(1, "appendix", None, ("טבלאות הנרקיס",), first=0, last=2)], {}, [], "v")
+    assert appendix.label(1) == "נספח · טבלאות הנרקיס"
+    assert contexts.from_units([_unit(1, "document", None, first=0, last=3)], {}, [], "v").label(1) == contexts.MSG_UNNAMED
+
+
 def test_a_name_inside_a_longer_name_does_not_name_its_unit_where_the_longer_one_is_written():
     cx = contexts.from_units([_unit(1, "appraisal", "מתחם הגפן", ("הגפן",), first=0, last=2),
                               _unit(2, "appraisal", "מתחם הגפן הצפוני", ("הגפן הצפוני",), first=3, last=5)], {}, [], "v")
