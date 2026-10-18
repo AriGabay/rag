@@ -3590,7 +3590,7 @@ def _value_origin(ws: Workspace, v) -> str:
 
 def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: set[str],
               strict: bool = False, stated_by: dict[str, set[str]] | None = None, extra_text: str = "",
-              percent_of_fraction: bool = True) -> list[str]:
+              percent_of_fraction: bool = True, origins: bool = True) -> list[str]:
     """The numbers of a unit that nothing it cites states (for a unit that cites nothing, nothing of the turn —
     unless ``strict``, which holds it to its citations too), that the question does not give and that show no
     result of a calculation it cites (any of the turn's, for a unit citing nothing, unless ``strict``) — and the
@@ -3598,7 +3598,9 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
     (``_wrong_scale``). ``stated_by``: the numbers each cited id states, kept across one verification's units.
     ``extra_text``: more text of a cited source (the context a re-read expanded it with), whose numbers it states too.
     ``percent_of_fraction``: whether a percentage counts as stated by the fraction a source states (``_percent_of_fraction``);
-    ``bind_computations`` turns it off, so the percent form of a cited value is still derived and bound as a C#."""
+    ``bind_computations`` turns it off, so the percent form of a cited value is still derived and bound as a C#.
+    ``origins``: whether a cited value also states the source line it was registered from (``_value_origin``); also off in
+    ``bind_computations``, so a result the source line happens to write is still bound to the calculation that made it."""
     cited: set[str] = set(numbers_in(extra_text, words=True)) if extra_text else set()
     by_id: dict[str, set[str]] = {}
     for i, t in _texts(ws, u.ids):
@@ -3609,7 +3611,7 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
                 stated_by[i] = found
         by_id[i] = found
         cited |= found
-    for i in u.ids:  # a cited value states the row or paragraph it was registered from, not only itself (round 15, KD3)
+    for i in u.ids if origins else ():  # a cited value states the row or paragraph it was registered from (round 15, KD3)
         if i in ws.values:
             key = f"{i}\x00origin"
             found = stated_by.get(key) if stated_by is not None else None
@@ -4176,14 +4178,15 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
     for u in units:
         if _unknown_ids(u, ws):
             continue
-        loose = set(_unstated(u, ws, question_numbers, set(), strict=True, stated_by=stated_by, percent_of_fraction=False))
+        loose = set(_unstated(u, ws, question_numbers, set(), strict=True, stated_by=stated_by, percent_of_fraction=False,
+                              origins=False))
         if not loose:
             continue
         derived = [cid for cid in derive_numbers(u, ws, loose) if cid not in u.ids] if u.ids else []
         if derived:
             u.ids.extend(derived)
             bound[u.index] = list(derived)
-            loose = set(_unstated(u, ws, question_numbers, set(), strict=True, stated_by=stated_by))
+            loose = set(_unstated(u, ws, question_numbers, set(), strict=True, stated_by=stated_by, origins=False))
             if not loose:
                 continue
         chosen: list[str] = []
