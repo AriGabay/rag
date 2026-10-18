@@ -377,6 +377,17 @@ def test_the_policy_computes_from_found_inputs_asks_or_conditions_a_missing_assu
     assert "נכתבו במסמך" in POLICY and "חושבו עכשיו" in POLICY
 
 
+def test_the_policy_asks_the_answer_to_state_its_calculation_basis_and_give_the_other_when_they_differ():
+    """Round 16 U6 (R11, KTD8, AE5): the basis is a line of the agent's policy, not a phrase list in code. It names stating the
+    basis, giving the other basis when a rounded conclusion and a computed sum differ, and never showing a computed result as
+    a figure written in the document."""
+    line = POLICY[POLICY.index("אמור באיזה בסיס חושבה התוצאה"):].split("\n  אם calculate מסרב")[0]
+    assert "מסקנה מעוגלת שכתובה במסמך" in line and "סכום שחושב עכשיו" in line
+    assert "תן גם את" in line and "ההפרש" in line
+    assert "אל תציג תוצאה שחושבה כמספר שכתוב במסמך" in line
+    assert POLICY.count("אמור באיזה בסיס חושבה התוצאה") == 1
+
+
 def test_a_division_by_zero_on_found_values_is_a_calculation_failure_not_missing_data():
     zero = calc.operand("V2", "0", "ILS", kind="cost", role="cost")
     income = calc.operand("V1", "100", "ILS", kind="income", role="income")
@@ -933,3 +944,164 @@ def test_no_reduction_is_derived_where_the_calculator_refuses_the_coefficient():
     _ratio(ws, "1.2", "מקדם מעל אחד")  # one minus it is negative: a reduction is a magnitude
     assert verify.derive_reduction(ws, "V1") is None and verify.derive_reduction(ws, "V2") is None
     assert verify.derive_reduction(ws, "V99") is None and ws.computations == {}
+
+
+# --- round 16 U6: a result sentence is bound to its conditional calculation without citing it (R12, KTD7, AE5) -----------------
+
+AVERAGE_QUESTION = "מה הערך הממוצע לדירה?"
+_COMPARABLES = ("| דירה | מחיר |\n| --- | --- |\n| א | 1,234,000 |\n| ב | 1,301,500 |\n| ג | 1,299,999 |")
+_AVERAGE_ROW = "\n| ממוצע | 1,278,500 |"  # a row of the same table that writes the result of the calculation
+
+
+def _average(uncertain: tuple[str, ...] = ("V3",), table_writes_average: bool = False) -> Workspace:
+    """S1 a comparables table (its own average row when ``table_writes_average``) and S2 the passage that dates the
+    appraisal; S3 a table of another building, that shares no input with C1; V1–V3 the three prices read from S1 and C1 their mean (1,278,499.67 ₪),
+    conditional on the price read uncertainly (V3) as ``tools.tool_calculate`` records it."""
+    from app.chat.tools import MSG_UNCERTAIN_INPUTS
+
+    ws = Workspace(ctx=None)
+    ws.user_messages = [{"turn": 1, "text": AVERAGE_QUESTION, "current": True}]
+    for title, text in (("טבלת מקרים להשוואה", _COMPARABLES + (_AVERAGE_ROW if table_writes_average else "")),
+                        ("פרק מבוא", "הערכת השווי נעשתה למועד הקובע 15/04/2025."),
+                        ("טבלת מקרים בבניין אחר", "| דירה | מחיר |\n| --- | --- |\n| ד | 987,000 |\n| ה | 1,020,000 |\n| ו | 1,278,500 |")):
+        ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title=title, section="סיכום", location="עמוד 4",
+                      kind="context", text=text)
+    ws.sources["S2"].date_line = "למועד הקובע 15/04/2025"
+    for written, label in (("1,234,000", "דירה א"), ("1,301,500", "דירה ב"), ("1,299,999", "דירה ג")):
+        _value(ws, written, label, "price", "comparable", vat="included")
+    c = _compute(ws, "mean(V1, V2, V3)", "ממוצע המחירים לדירה")
+    if uncertain:
+        c.outcome.conditional.append(MSG_UNCERTAIN_INPUTS.format(ids=", ".join(uncertain)) + " (V3: התא לא אושר)")
+        c.uncertain = list(uncertain)
+    return ws
+
+
+def _bound(ws: Workspace, markdown: str):
+    units = split_units(markdown)
+    return units, verify.bind_computations(units, ws, AVERAGE_QUESTION)
+
+
+SHOWN_RESULT = ["1,278,500 ₪", "כ־1,278,500 ₪", "כ-1,278,500 ₪", "בערך 1,278,500 ₪", "כ־1.28 מיליון ₪", "1.28 מיליון ₪",
+                "1,278.5 אלף ₪"]
+
+
+@pytest.mark.parametrize("shown", SHOWN_RESULT)
+def test_ae5_a_unit_showing_a_conditional_results_value_without_citing_it_is_bound_to_it(shown):
+    ws = _average()
+    units, bound = _bound(ws, f"לפי החישוב, הערך הממוצע הוא {shown} לדירה [S1].")
+    assert bound == {0: ["C1"]}, shown
+    assert units[0].ids == ["S1", "C1"]
+    (note,) = verify.conditional_notes(units[0], ws)
+    assert note[0] == "C1" and "V3" in note[2]
+
+
+@pytest.mark.parametrize("shown", SHOWN_RESULT)
+def test_ae5_a_result_the_cited_table_also_writes_is_still_bound_to_the_conditional_calculation_it_is_the_result_of(shown):
+    """The table the calculation's inputs were read from writes the average as well (the calculation reproduces it): the
+    sentence shows that calculation's result about the same data, so the server's qualifier is written (R12)."""
+    ws = _average(table_writes_average=True)
+    units, bound = _bound(ws, f"לפי החישוב, הערך הממוצע הוא {shown} לדירה [S1].")
+    assert bound == {0: ["C1"]}, shown
+    assert [n[0] for n in verify.conditional_notes(units[0], ws)] == ["C1"]
+
+
+def test_ae5_the_full_sentence_with_a_date_and_vat_citing_the_table_and_the_date_line_gets_the_servers_qualifier():
+    ws = _average(table_writes_average=True)
+    seen: list = []
+    markdown = "לפי החישוב, הערך הממוצע הוא כ־1,278,500 ₪ לדירה (כ־1.28 מיליון ₪), כולל מע\"מ, נכון ל־15/04/2025 [S1][S2]."
+    report, applied = _verify(ws, markdown, seen=seen, question=AVERAGE_QUESTION)
+    assert not report.removed_units(), report.problems_text()
+    (p,) = [p for p in report.problems if p.conditional]
+    assert p.cite == "C1" and "V3" in p.annotation
+    assert "[S1][S2][C1]" in applied.answer_markdown and "תוצאה מותנית" in applied.answer_markdown
+    judged = "\n".join(i for _, i in seen)
+    assert '<server_qualifier unit="0">' in judged and "V3" in judged
+    assert report.counts()["conditional"] == 1
+
+
+def test_ae5_a_judge_that_removes_a_conditional_result_shown_without_a_qualifier_keeps_it_now_that_the_qualifier_is_shown():
+    """The incident: the judge removed the unit as ``uncertain_reading`` ("presented without reservation") because it saw no
+    ``<server_qualifier>``. It is shown now (the unit is bound to C1), so the judge, who is told that a conditional result with
+    a server qualifier is no reason to remove, keeps it."""
+    ws = _average(table_writes_average=True)
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        out = []
+        for m in re.finditer(r'<unit index="(\d+)" cites="[^"]*">', input):
+            qualified = f'<server_qualifier unit="{m.group(1)}">' in input
+            out.append({"index": int(m.group(1)), "verdict": "supported" if qualified else "unsupported",
+                        "reason": "בדיקה", "failure": "none" if qualified else "uncertain_reading", "supported_by": []})
+        return {"verdicts": out}
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    answer = _answer("לפי החישוב, הערך הממוצע הוא כ־1,278,500 ₪ לדירה [S1].")
+    report = verify_answer(p, answer, ws, AVERAGE_QUESTION, [])
+    assert not report.removed_units(), report.problems_text()
+    assert "תוצאה מותנית" in report.apply(answer).answer_markdown
+
+
+def test_ae5_a_specific_result_is_bound_though_the_unit_cites_only_other_sources():
+    """The incident: the sentence cites an unrelated comparables table and a date line (none of them the calculation's sources
+    or inputs) and shows the result of the conditional calculation at full precision — a number of seven digits that no other
+    item equals by chance — so the server's qualifier is written and the judge, who removes a sentence without one, keeps it."""
+    ws = _average()
+    markdown = "לפי החישוב, הערך הממוצע הוא כ־1,278,500 ₪ לדירה, נכון ל־15/04/2025 [S2][S3]."
+    units, bound = _bound(ws, markdown)
+    assert bound == {0: ["C1"]} and units[0].ids == ["S2", "S3", "C1"]
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        out = []
+        for m in re.finditer(r'<unit index="(\d+)" cites="[^"]*">', input):
+            qualified = f'<server_qualifier unit="{m.group(1)}">' in input
+            out.append({"index": int(m.group(1)), "verdict": "supported" if qualified else "unsupported",
+                        "reason": "בדיקה", "failure": "none" if qualified else "uncertain_reading", "supported_by": []})
+        return {"verdicts": out}
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    answer = _answer(markdown)
+    report = verify_answer(p, _answer(markdown), ws, AVERAGE_QUESTION, [])
+    assert not report.removed_units(), report.problems_text()
+    assert "תוצאה מותנית" in report.apply(answer).answer_markdown
+    assert verify._specific("1,278,500") and verify._specific("1,278.5") and not verify._specific("1,300,000")
+
+
+def test_ae5_a_three_digit_number_equal_by_chance_to_a_conditional_result_is_not_bound_without_a_shared_source():
+    from app.chat.tools import MSG_UNCERTAIN_INPUTS
+
+    ws = Workspace(ctx=None)
+    ws.user_messages = [{"turn": 1, "text": AVERAGE_QUESTION, "current": True}]
+    ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="טבלת שטחים", section="סיכום", location="עמוד 2",
+                  kind="context", text="| יחידה | שטח |\n| א | 120 |\n| ב | 130 |")
+    ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="נספח אחר", section="סיכום", location="עמוד 9",
+                  kind="context", text="בקומה העליונה 250 מ\"ר של מרפסות.")
+    _value(ws, "120", "שטח א", "area", "income", unit="sqm")
+    _value(ws, "130", "שטח ב", "area", "income", unit="sqm")
+    c = _compute(ws, "V1 + V2", "סך השטחים")
+    c.outcome.conditional.append(MSG_UNCERTAIN_INPUTS.format(ids="V2") + " (V2: התא לא אושר)")
+    c.uncertain = ["V2"]
+    units = split_units("בקומה העליונה יש 250 מ\"ר של מרפסות [S2].")
+    assert verify.bind_computations(units, ws, AVERAGE_QUESTION) == {} and units[0].ids == ["S2"]
+    assert verify.conditional_notes(units[0], ws) == []
+    # the same number in a sentence that cites the calculation's own source is its result
+    units = split_units("סך השטחים הוא 250 מ\"ר [S1].")
+    assert verify.bind_computations(units, ws, AVERAGE_QUESTION) == {0: ["C1"]}
+
+
+def test_ae5_a_number_the_unit_presents_as_written_by_the_report_is_not_bound_to_a_calculation():
+    ws = _average(table_writes_average=True)
+    units, bound = _bound(ws, "השומה מציינת שהערך הממוצע הוא 1,278,500 ₪ לדירה [S1].")
+    assert bound == {} and units[0].ids == ["S1"]
+
+
+def test_ae5_a_result_of_a_calculation_that_is_not_conditional_needs_no_binding_when_the_table_writes_it():
+    ws = _average(uncertain=(), table_writes_average=True)
+    units, bound = _bound(ws, "הערך הממוצע הוא 1,278,500 ₪ לדירה [S1].")
+    assert bound == {} and units[0].ids == ["S1"]
+
+
+def test_ae5_a_date_or_a_count_that_happens_to_equal_nothing_of_the_result_is_left_alone():
+    ws = _average(table_writes_average=True)
+    units, bound = _bound(ws, "הערכת השווי נעשתה למועד הקובע 15/04/2025 [S2].")
+    assert bound == {} and units[0].ids == ["S2"]

@@ -4344,6 +4344,46 @@ def derive_numbers(u: Unit, ws: Workspace, loose: set[str]) -> list[str]:
     return found
 
 
+SPECIFIC_DIGITS = 5  # significant digits (as written) that a coincidence cannot plausibly produce (round 16 U6)
+
+
+def _specific(written: str) -> bool:
+    """Whether a number as written has at least ``SPECIFIC_DIGITS`` significant digits (leading zeros and the zeros that
+    only round an integer — the trailing ones of "1,300,000" — do not count): "1,234,567" and "1,278.5" are specific, "250"
+    and "1.3" (of "1.3 מיליון") are not."""
+    digits = re.sub(r"\D", "", written).lstrip("0")
+    if "." not in written:
+        digits = digits.rstrip("0")
+    return len(digits) >= SPECIFIC_DIGITS
+
+
+def _linked_conditional_results(u: Unit, ws: Workspace) -> list[str]:
+    """The C# ids of the conditional calculations (``Computation.conditional``) the unit does not cite whose result it shows
+    (``_shows``: exactly, approximately, rounded at its written precision or with a scale word) in a number outside any date
+    that it does not present as written by a document or said by a party (``_stated_as_written``), when the number is tied
+    to the calculation: the unit cites a source or an input of it (``Computation.sources``, ``leaves``) — the sentence is
+    about the data the calculation was made of — or the number is specific (``_specific``: at least ``SPECIFIC_DIGITS``
+    significant digits as written, which no other item equals by chance), whatever else the unit cites. So the server's
+    qualifier (R12, KTD7) belongs to the sentence even when a cited source writes the number too. A short or round number
+    equal to a result by chance, in a unit that cites nothing of the calculation, links to nothing."""
+    cited = set(u.ids)
+    if not cited:
+        return []
+    dates = [m.span() for m in _DATE_AT.finditer(u.text)]
+    out: list[str] = []
+    for n in _shown(u.text):
+        if any(a <= n.start < b for a, b in dates) or _stated_as_written(u.text, n.start):
+            continue
+        specific = _specific(n.written)
+        for cid, c in ws.computations.items():
+            if (cid in cited or cid in out or not c.conditional
+                    or not (specific or cited & (set(c.sources) | set(c.leaves)))
+                    or not _shows(c, n.written, n.percent, n.scale, steps=False)):
+                continue
+            out.append(cid)
+    return out
+
+
 def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[int, list[str]]:
     """Bind each unit that shows a result of the turn's calculations without citing it (citing only its inputs, or
     nothing) to that calculation: the C# joins the unit's citations, so the number check, the VAT check and the
@@ -4355,7 +4395,14 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
     Round 13 U9 (KTD9, R12): a number of a unit that cites values and that no cited source states is first tried against
     the derivations of ``derive_numbers`` (1 − a cited coefficient behind "הפחתה", ...); one that verifies is registered as
     a C# of result kind ``derived`` and joins the unit's citations, whatever else the unit holds. A derived result binds
-    only to a unit that cites an input of it."""
+    only to a unit that cites an input of it.
+
+    Round 16 U6 (KTD7, R12): a number a cited source also writes is not ``loose``, so a result of a *conditional* calculation
+    that the source happens to write too (the calculation reproduces a figure of the table its inputs were read from)
+    was never bound, and its sentence went to the judge with no ``<server_qualifier>``. ``_linked_conditional_results``
+    binds such a result when the unit cites a source or an input of the calculation (the sentence is about the same data;
+    a short number another source writes about another item stays unbound) or the number is specific (at least
+    ``SPECIFIC_DIGITS`` significant digits as written), and does not present it as written by a document."""
     from app.chat.calc import DERIVED
 
     if not (ws.computations or ws.values or ws.measurements):
@@ -4368,14 +4415,15 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
             continue
         loose = set(_unstated(u, ws, question_numbers, set(), strict=True, stated_by=stated_by, percent_of_fraction=False,
                               origins=False))
-        if not loose:
+        linked = _linked_conditional_results(u, ws)
+        if not loose and not linked:
             continue
-        derived = [cid for cid in derive_numbers(u, ws, loose) if cid not in u.ids] if u.ids else []
+        derived = [cid for cid in derive_numbers(u, ws, loose) if cid not in u.ids] if u.ids and loose else []
         if derived:
             u.ids.extend(derived)
             bound[u.index] = list(derived)
             loose = set(_unstated(u, ws, question_numbers, set(), strict=True, stated_by=stated_by, origins=False))
-            if not loose:
+            if not loose and not linked:
                 continue
         chosen: list[str] = []
         for n in _shown(u.text):
@@ -4390,6 +4438,7 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
                 order = list(ws.computations)
                 best = max(matches, key=lambda c: (len(set(c.leaves) & set(u.ids)), -order.index(c.cid)))
                 chosen.append(best.cid)
+        chosen += [cid for cid in linked if cid not in chosen and cid not in u.ids]
         if not chosen:
             continue
         trial = dataclasses.replace(u, ids=[*u.ids, *chosen])
