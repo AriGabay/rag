@@ -38,7 +38,7 @@ The list is data the model weighs, not a pin and not a scope: it does not lock a
 
 ### Declared unit
 
-The appraisal unit, or units, the model states that its answer is about. The model chooses the unit from the candidates shown (or finds it by search) and declares it with the answer. The server accepts a declared unit only if it offered that unit or the model read it in this turn, and only if the user may read it now; anything else is dropped. A single declared unit becomes the conversation's unit for the next turn; several declared units are a comparison and set none.
+The appraisal unit, or units, the model states that its answer is about. The model chooses the unit from the candidates shown (or finds it by search) and declares it with the answer. The server accepts a declared unit only if it offered that unit, listed it to the model in this turn (a document's units or a file's outline), or the model read it in this turn, and only if the user may read it now; anything else is dropped. A single declared unit becomes the conversation's unit for the next turn; several declared units are a comparison and set none.
 
 Verification compares each value's evidence with the asked unit. The asked unit is taken first from a unit the question or the request's components name by a distinguishing identity, and only then from the declaration. A name or identifier that two units of one file share names neither, so a generic name never removes a value that came from the right unit.
 
