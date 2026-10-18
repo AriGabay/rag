@@ -69,7 +69,7 @@ ranking reads the card's subject fields beside the unit's title, aliases and ide
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Literal
 from uuid import UUID
@@ -261,16 +261,33 @@ def _current_units(conn, document_id: UUID) -> tuple[str, str, str, list[dict]] 
     if row is None:
         return None
     tag = unit_store.current_tag()
-    rows = [{"document_id": document_id, "version_id": row.version_id, "reading_id": row.reading_id,
-             "unit_no": u.unit_no, "units_tag": tag,
-             "unit_id": contexts.unit_key(row.version_id, row.reading_id, u.unit_no, tag),
-             "kind": u.kind, "title": u.title, "aliases": list(u.aliases),
-             "identifiers": list((u.identifiers or {}).get("shown") or ()), "page_first": u.page_first,
-             "page_last": u.page_last, "block_first": u.block_first, "block_last": u.block_last,
-             "certainty": u.certainty} for u in unit_store.ensure(conn, row.version_id)]
+    rows = [contexts.unit_row(u, document_id, row.version_id, row.reading_id, tag)
+            for u in unit_store.ensure(conn, row.version_id)]
     if len(rows) > 1:
         printed_labels(conn, rows)
     return row.title, str(row.version_id), row.reading_id, rows
+
+
+def _subject_row(rows: list[dict], unit_no) -> dict | None:
+    """The subject unit numbered ``unit_no`` among a version's rows (an appendix or a comparables part is none)."""
+    return next((u for u in rows if u["unit_no"] == unit_no and u["kind"] not in contexts.NON_SUBJECT_KINDS), None)
+
+
+def _current_by_doc(conn) -> Callable[[object], tuple | None]:
+    """``_current_units`` of a document id, read once per document for the caller's connection; None for an id that is no
+    UUID, and for a document that is not readable."""
+    memo: dict[str, tuple | None] = {}
+
+    def current(doc) -> tuple | None:
+        key = str(doc)
+        if key not in memo:
+            try:
+                memo[key] = _current_units(conn, UUID(key))
+            except ValueError:
+                memo[key] = None
+        return memo[key]
+
+    return current
 
 
 def resolve_older(anchor: dict, rows: list[dict], kept: dict | None) -> dict | None:
@@ -313,8 +330,7 @@ def live_unit(ctx: TenantContext, anchor: dict) -> LiveUnit:
     # the same reading and derivation: the unit with its number, if its names are still the anchor's (a derivation that
     # changed under the same reading id would have renumbered it, and carries another tag)
     if (anchor.get("reading_id") or None) == (reading or None) and not older:
-        same = next((u for u in rows if u["unit_no"] == anchor.get("unit_no")
-                     and u["kind"] not in contexts.NON_SUBJECT_KINDS), None)
+        same = _subject_row(rows, anchor.get("unit_no"))
         if same is not None and (not _names(anchor) or _names(anchor) & _names(same)):
             return LiveUnit("current", unit_anchor(same), version)
     found = resolve_older(anchor, rows, kept) if older else rematch(anchor, rows)
@@ -328,16 +344,23 @@ def anchor_of(ctx: TenantContext, document_id: str, reading_id: str | None, unit
     """The anchor of a unit of a document's current reading, or None when the document is not readable, is one unit, or
     has been read again since (``reading_id`` is the one the turn worked in). An appendix or a comparables part has no
     anchor: it is never the subject of a conversation."""
-    try:
-        document_id = UUID(str(document_id))
-    except ValueError:
-        return None
+    return anchors_of(ctx, [(document_id, reading_id, unit_no)])[0]
+
+
+def anchors_of(ctx: TenantContext, places: list[tuple[str, str | None, int]]) -> list[dict | None]:
+    """``anchor_of`` of each place (document id, reading id, unit number), in one transaction that reads each document's
+    current units once."""
+    if not places:
+        return []
     with tenant_tx(ctx) as conn:
-        current = _current_units(conn, document_id)
-    if current is None or len(current[3]) < 2 or (reading_id or None) != (current[2] or None):
-        return None
-    found = next((u for u in current[3] if u["unit_no"] == unit_no and u["kind"] not in contexts.NON_SUBJECT_KINDS), None)
-    return unit_anchor(found) if found is not None else None
+        current = _current_by_doc(conn)
+        out: list[dict | None] = []
+        for document_id, reading_id, unit_no in places:
+            units = current(document_id)
+            found = (_subject_row(units[3], unit_no)
+                     if units is not None and len(units[3]) >= 2 and (reading_id or None) == (units[2] or None) else None)
+            out.append(unit_anchor(found) if found is not None else None)
+    return out
 
 
 def title_tokens(title: str) -> set[str]:
@@ -564,11 +587,9 @@ def _unit_names(conn) -> list[str]:
     part names no document): the names a document states for the appraisals in it, which a follow-up may use
     ("הרקפות") though no file title holds them. Under row security."""
     names: list[str] = []
+    ensure_current_units(conn)
     for r in conn.execute(text(
-            "SELECT u.title, u.aliases FROM document_units u JOIN document_versions v ON v.id = u.version_id"
-            f" AND v.is_current AND u.reading_id = COALESCE(v.ingestion->>'reading_id', '') AND {unit_store.current_key_sql()}"
-            f" JOIN documents d ON d.id = u.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"
-            " WHERE u.kind NOT IN ('appendix', 'comparables')")):
+            "SELECT u.title, u.aliases" + _CURRENT_UNITS_FROM + " WHERE u.kind NOT IN ('appendix', 'comparables')")):
         names += ([r.title] if r.title else []) + list(r.aliases or ())
     return list(dict.fromkeys(names))
 
@@ -651,18 +672,13 @@ def units_of_documents(ctx: TenantContext, ids) -> list[dict]:
             " FROM documents d JOIN document_versions v ON v.document_id = d.id AND v.is_current"
             f" WHERE d.id = ANY(:i) AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"), {"i": uuids})}
         stored = unit_store.stored_many(conn, list(files))
+        tag = unit_store.current_tag()
         rows = []
         for version_id, units in stored.items():
             f = files[version_id]
             if len(units) < 2:
                 continue
-            rows += [{"document_id": f.id, "version_id": version_id, "reading_id": f.reading_id, "unit_no": u.unit_no,
-                      "units_tag": unit_store.current_tag(),
-                      "unit_id": contexts.unit_key(version_id, f.reading_id, u.unit_no, unit_store.current_tag()),
-                      "kind": u.kind,
-                      "title": u.title, "aliases": list(u.aliases),
-                      "identifiers": list((u.identifiers or {}).get("shown") or ()), "page_first": u.page_first,
-                      "page_last": u.page_last, "certainty": u.certainty, "file_title": f.title}
+            rows += [contexts.unit_row(u, f.id, version_id, f.reading_id, tag, file_title=f.title)
                      for u in units if u.kind not in contexts.NON_SUBJECT_KINDS]
         if rows:
             printed_labels(conn, rows)
@@ -673,12 +689,37 @@ def units_of_documents(ctx: TenantContext, ids) -> list[dict]:
 # these (with the words of a unit's name) asks which appraisal, though no appraisal was named
 GENERIC_NAME_WORDS = frozenset({"שומה", "שומת", "שומות", "נכס", "נכסים", "פרויקט", "פרויקטים", "מתחם", "מתחמים",
                                 "בניין", "בניינים", "דוח", "דו\"ח", "חוות", "דעת", "הערכה", "שמאות", "דירה", "מגרש", "דיור"})
-_UNIT_NAMES_SQL = (
-    "SELECT u.document_id, u.version_id, u.reading_id, u.unit_no, u.kind, u.title, u.aliases, u.block_first,"
-    " u.block_last, count(*) OVER (PARTITION BY u.version_id) AS units"
+# the units of the readable appraisals' current readings, current derivation (the tables the unit queries read)
+_CURRENT_UNITS_FROM = (
     " FROM document_units u JOIN document_versions v ON v.id = u.version_id AND v.is_current"
     f" AND u.reading_id = COALESCE(v.ingestion->>'reading_id', '') AND {unit_store.current_key_sql()}"
     f" JOIN documents d ON d.id = u.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL}")
+# the current appraisal versions that hold units of some earlier derivation and none of the current one (the lazy build
+# has not reached them: ``search.units_matching`` ensures a version when a search touches it)
+_STALE_UNITS_SQL = (
+    "SELECT v.id FROM document_versions v JOIN documents d ON d.id = v.document_id AND d.deleted_at IS NULL"
+    f" AND {APPRAISALS_SQL} WHERE v.is_current"
+    " AND EXISTS (SELECT 1 FROM document_units o WHERE o.version_id = v.id)"
+    " AND NOT EXISTS (SELECT 1 FROM document_units u WHERE u.version_id = v.id"
+    f" AND u.reading_id = COALESCE(v.ingestion->>'reading_id', '') AND {unit_store.current_key_sql()})")
+
+
+def ensure_current_units(conn) -> None:
+    """Derive the current derivation's units for the readable appraisals that hold only those of an earlier one (a file
+    processed before the derivation changed: its units are built lazily, round 15 U3), so the raw readers of the table
+    (``_CURRENT_UNITS_FROM``) see them: called before the candidates are ranked and the unit names read (not in
+    ``first_message``, whose query budget is one). One query, which returns nothing once every version is current; ``unit_store.ensure`` only adds the current rows beside the old ones. Under row
+    security, in the caller's tenant transaction."""
+    for row in list(conn.execute(text(_STALE_UNITS_SQL))):
+        unit_store.ensure(conn, row.id)
+
+
+_UNIT_NAMES_SQL = (
+    "SELECT u.document_id, u.version_id, u.reading_id, u.unit_no, u.kind, u.title, u.aliases, u.block_first,"
+    " u.block_last, count(*) OVER (PARTITION BY u.version_id) AS units" + _CURRENT_UNITS_FROM)
+# only the subject units of files of several: the filter runs over the window query, whose count is over every kind
+_NON_SUBJECT_SQL = ", ".join(f"'{k}'" for k in sorted(contexts.NON_SUBJECT_KINDS))
+_SUBJECT_UNITS_SQL = f"SELECT * FROM ({{inner}}) w WHERE w.units > 1 AND w.kind NOT IN ({_NON_SUBJECT_SQL})"
 
 
 @dataclass
@@ -736,7 +777,7 @@ def first_message(ctx: TenantContext, question: str, passages: bool = True) -> F
 
     Only the subject units of files of several count; a question with no word to decide by returns None."""
     with tenant_tx(ctx) as conn:
-        units = [r for r in conn.execute(text(_UNIT_NAMES_SQL)) if r.units > 1 and r.kind not in contexts.NON_SUBJECT_KINDS]
+        units = list(conn.execute(text(_SUBJECT_UNITS_SQL.format(inner=_UNIT_NAMES_SQL))))
     names = {(r.document_id, r.unit_no): ([r.title] if r.title else []) + list(r.aliases or ()) for r in units}
     if len(names) < 2:
         return None
@@ -753,8 +794,7 @@ def first_message(ctx: TenantContext, question: str, passages: bool = True) -> F
             best = max(fits.values())
             tied = [k for k, v in fits.items() if v == best]
             # a unit whose complete name the question states is the one asked about, however alike the others are
-            stated = [key for key in tied if contexts.Identity(
-                names=tuple(k for n in names[key] if (k := contexts.name_key(n)))).name_spans(question)]
+            stated = [key for key in tied if _states_name(names[key], question)]
             if len(tied) == 1 or len(stated) == 1:
                 return _unit_found(ctx, (stated or tied)[0])
             if len(tied) > 1 and not stated:
@@ -825,14 +865,11 @@ BASIS_NAMED = "נמצאה לפי המילים שהמשתמש ציין"
 BASIS_ALIKE = "מתאימה למילים שהמשתמש ציין כמו האחרות ברשימה"
 BASIS_GONE = "אחת משומות הקובץ שנקרא מחדש"
 
-_CANDIDATE_ROWS_SQL = (
+_CANDIDATE_ROWS_SQL = _SUBJECT_UNITS_SQL.format(inner=(
     "SELECT u.document_id, u.version_id, u.reading_id, u.unit_no, u.kind, u.title, u.aliases, u.identifiers,"
     " u.page_first, u.page_last, u.block_first, u.block_last, u.certainty, d.title AS file_title,"
-    " count(*) OVER (PARTITION BY u.version_id) AS units"
-    " FROM document_units u JOIN document_versions v ON v.id = u.version_id AND v.is_current"
-    f" AND u.reading_id = COALESCE(v.ingestion->>'reading_id', '') AND {unit_store.current_key_sql()}"
-    f" JOIN documents d ON d.id = u.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"
-    " ORDER BY d.title, u.document_id, u.unit_no")
+    " count(*) OVER (PARTITION BY u.version_id) AS units" + _CURRENT_UNITS_FROM)) + (
+    " ORDER BY w.file_title, w.document_id, w.unit_no")
 
 
 @dataclass
@@ -857,26 +894,21 @@ class UnitCard:
 @dataclass
 class Ranked:
     """The units a question points at, best first: the ``cards`` shown (at most ``MAX_CARDS``), ``total`` — how many matched
-    (the user's visible documents only, so the count reveals nothing hidden) — and the ``words`` they were looked up by."""
+    (the user's visible documents only, so the count reveals nothing hidden)."""
 
     cards: list[UnitCard]
     total: int
-    words: str = ""
+
+    @property
+    def more(self) -> int:
+        """How many matched units are not among the cards."""
+        return self.total - len(self.cards)
 
 
-def _unit_row(r, tag: str | None) -> dict:
-    """A stored unit row of ``_CANDIDATE_ROWS_SQL`` as a unit row dict."""
-    return {"document_id": r.document_id, "version_id": r.version_id, "reading_id": r.reading_id, "unit_no": r.unit_no,
-            "units_tag": tag, "unit_id": contexts.unit_key(str(r.version_id), r.reading_id, r.unit_no, tag),
-            "kind": r.kind, "title": r.title, "aliases": list(r.aliases or ()),
-            "identifiers": list((r.identifiers or {}).get("shown") or ()), "page_first": r.page_first,
-            "page_last": r.page_last, "block_first": r.block_first, "block_last": r.block_last,
-            "certainty": r.certainty, "file_title": r.file_title}
-
-
-def _card_fields(conn, rows: list[dict]) -> dict[tuple[str, int, int], tuple[dict, ...]]:
-    """The verified subject fields of the ``done`` identity cards of the rows' versions, by (version, first block, last
-    block), in one query (``cards.cards_for_units``). A card that cannot be read leaves the unit its structural identity."""
+def _card_fields(conn, rows: list[dict]) -> dict[str, dict[tuple[int, int], tuple[dict, ...]]]:
+    """The verified subject fields of the ``done`` identity cards of the rows' versions, by version and (first block, last
+    block), in one query (``cards.subject_fields_for_versions``). A card that cannot be read leaves the unit its structural
+    identity."""
     from app.chat import cards as unit_cards
 
     versions = list(dict.fromkeys(str(r["version_id"]) for r in rows))
@@ -884,14 +916,19 @@ def _card_fields(conn, rows: list[dict]) -> dict[tuple[str, int, int], tuple[dic
         return {}
     try:
         with conn.begin_nested():
-            found = unit_cards.cards_for_units(conn, versions)
+            return unit_cards.subject_fields_for_versions(conn, versions)
     except Exception:  # noqa: BLE001 - no card: the structural identity serves
         return {}
-    return {(str(v), a, b): c.fields for (v, a, b), c in found.items() if c.state == unit_cards.DONE and c.fields}
 
 
 def _fields_of(fields: dict, row: dict) -> tuple[dict, ...]:
-    return fields.get((str(row["version_id"]), row["block_first"], row["block_last"]), ())
+    return fields.get(str(row["version_id"]), {}).get((row["block_first"], row["block_last"]), ())
+
+
+def _states_name(names: Iterable[str], question: str) -> bool:
+    """Whether the question states the complete title or an alias of a unit whose names these are, as a whole phrase."""
+    keys = tuple(k for n in names if (k := contexts.name_key(n)))
+    return bool(contexts.Identity(names=keys).name_spans(question))
 
 
 def _names_of(row: dict, fields: tuple[dict, ...]) -> list[str]:
@@ -924,9 +961,10 @@ def rank_candidates(ctx: TenantContext, question: str, cap: int = MAX_CARDS) -> 
     word of the trade alone (``GENERIC_NAME_WORDS``) names nothing. Only units of the documents the user may see (row
     security) are ranked or counted; the first ``cap`` are cards."""
     with tenant_tx(ctx) as conn:
-        raw = [r for r in conn.execute(text(_CANDIDATE_ROWS_SQL)) if r.units > 1 and r.kind not in contexts.NON_SUBJECT_KINDS]
+        ensure_current_units(conn)
+        raw = list(conn.execute(text(_CANDIDATE_ROWS_SQL)))
         tag = unit_store.current_tag()
-        rows = [_unit_row(r, tag) for r in raw]
+        rows = [contexts.unit_row(r, r.document_id, r.version_id, r.reading_id, tag, file_title=r.file_title) for r in raw]
         fields = _card_fields(conn, rows) if len(rows) > 1 else {}
     if len(rows) < 2:
         return None
@@ -940,8 +978,7 @@ def rank_candidates(ctx: TenantContext, question: str, cap: int = MAX_CARDS) -> 
         telling = {i for i, ts in enumerate(term_sets) if not ts & GENERIC_NAME_WORDS}
         for n, (r, ns) in enumerate(zip(rows, names, strict=True)):
             held, stated, extra = _best_name_fit(ns, term_sets)
-            keys = tuple(k for x in ns if (k := contexts.name_key(x)))
-            if contexts.Identity(names=keys).name_spans(question):
+            if _states_name(ns, question):
                 found.append((0, extra, n, BASIS_NAME))
             elif not asked.empty and asked.shares(contexts.identifiers(_identifiers_of(r, _fields_of(fields, r)))):
                 found.append((0, extra, n, BASIS_IDENTIFIER))
@@ -953,7 +990,6 @@ def rank_candidates(ctx: TenantContext, question: str, cap: int = MAX_CARDS) -> 
     elif not asked.empty:
         found += [(0, 0, n, BASIS_IDENTIFIER) for n, (r, _) in enumerate(zip(rows, names, strict=True))
                   if asked.shares(contexts.identifiers(_identifiers_of(r, _fields_of(fields, r))))]
-    query = " ".join(words)
     if not found:
         key = _unit_by_passages(ctx, question, raw)
         at = next((n for n, r in enumerate(rows) if (r["document_id"], r["unit_no"]) == key), None) if key else None
@@ -962,7 +998,7 @@ def rank_candidates(ctx: TenantContext, question: str, cap: int = MAX_CARDS) -> 
         found = [(3, 0, at, BASIS_PASSAGES)]
     found.sort(key=lambda t: (t[0], t[1], rows[t[2]]["file_title"], str(rows[t[2]]["document_id"]), rows[t[2]]["unit_no"]))
     cards = [UnitCard(rows[n], basis, _fields_of(fields, rows[n])) for _, _, n, basis in found[:cap]]
-    return Ranked(cards, len(found), query)
+    return Ranked(cards, len(found))
 
 
 def cards_of_units(ctx: TenantContext, items: list[tuple[dict, str]]) -> list[UnitCard]:
@@ -972,21 +1008,15 @@ def cards_of_units(ctx: TenantContext, items: list[tuple[dict, str]]) -> list[Un
     any other by its names (``rematch``)."""
     cards: list[UnitCard] = []
     with tenant_tx(ctx) as conn:
-        current: dict[str, tuple | None] = {}
+        current = _current_by_doc(conn)
         for anchor, basis in items:
             doc = str(anchor.get("document_id"))
-            if doc not in current:
-                try:
-                    current[doc] = _current_units(conn, UUID(doc))
-                except ValueError:
-                    current[doc] = None
-            found = current[doc]
+            found = current(doc)
             if found is None or len(found[3]) < 2:
                 continue
             title, _, reading, rows = found
             if _numbering(anchor) == ((reading or None), unit_store.current_tag()):
-                row = next((u for u in rows if u["unit_no"] == anchor.get("unit_no")
-                            and u["kind"] not in contexts.NON_SUBJECT_KINDS), None)
+                row = _subject_row(rows, anchor.get("unit_no"))
             else:
                 row = rematch(anchor, rows)
             if row is not None and not any(c.key == (doc, row["unit_no"]) for c in cards):
@@ -1003,17 +1033,12 @@ def offered_candidates(ctx: TenantContext, places: list[tuple[str, str | None, i
     whose document is not readable now, is one unit, or was read again since (the reading differs) is left out."""
     out: list[dict] = []
     with tenant_tx(ctx) as conn:
-        current: dict[str, tuple | None] = {}
+        current = _current_by_doc(conn)
         for doc, reading_id, number in places:
-            if doc not in current:
-                try:
-                    current[doc] = _current_units(conn, UUID(str(doc)))
-                except ValueError:
-                    current[doc] = None
-            found = current[doc]
+            found = current(doc)
             if found is None or len(found[3]) < 2 or (reading_id or None) != (found[2] or None):
                 continue
-            row = next((u for u in found[3] if u["unit_no"] == number and u["kind"] not in contexts.NON_SUBJECT_KINDS), None)
+            row = _subject_row(found[3], number)
             if row is not None:
                 out.append(unit_candidate(row, found[0]).as_dict())
     return out

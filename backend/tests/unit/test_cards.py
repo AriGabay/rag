@@ -172,3 +172,7 @@ def test_identify_follows_the_extraction_model_and_effort_and_has_its_own_ceilin
     assert custom.model_for("identify")[0] == "house-extraction"
     assert Settings(_env_file=None, model_measure="house-extraction",
                     model_identify="own-model").model_for("identify")[0] == "own-model"
+
+
+def test_the_subject_types_are_the_field_types_but_a_partys_name():
+    assert cards.SUBJECT_TYPES == ("name", "address", "city", "block_parcel", "property_type", "date_text")

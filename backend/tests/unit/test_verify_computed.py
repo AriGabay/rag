@@ -765,6 +765,23 @@ def test_a_reduction_that_is_one_minus_the_cited_coefficient_is_derived_register
     assert '<source id="C1"' in shown and "נוסחה:" in shown and _expr("1 - V1") in shown and "נגזר" in shown
 
 
+def test_a_value_whose_unit_is_ambiguous_is_no_operand_of_a_derived_computation():
+    """Round 15 review (KTD9): ``calculate`` refuses a value whose unit its source leaves ambiguous, so the verifier's own
+    derivation (``derive_numbers``) does not take one as an operand either: the same claim derives from an unflagged value."""
+    claim = "מקדם 0.8 — הפחתה של 20% [V1]."
+    clear = Workspace(ctx=None)
+    _ratio(clear, "0.8", "מקדם הדגמה")
+    _verify(clear, claim)
+    assert [c.expression for c in _derived(clear)] == [_expr("1 - V1")]
+    ws = Workspace(ctx=None)
+    _ratio(ws, "0.8", "מקדם הדגמה")
+    ws.ambiguous_units["V1"] = "the source leaves the unit open"
+    report, _ = _verify(ws, claim)
+    assert _derived(ws) == []
+    assert verify._derivations(ws, ["V1"], verify.Shown("20", True, 1, 0, 0), "הפחתה של 20%") == []
+    assert [p.check for p in report.problems if p.removes_unit or p.resolution == "qualifier"] == ["unstated_number"]
+
+
 @pytest.mark.parametrize("claim", ["מקדם 0.8 — הפחתה של 20%", "מקדם 0.8 — הפחתה של 20 אחוז", "מקדם 0.8 — הנחה של 0.2",
                                    "מקדם 0.8, בהנחה של 20 נקודות אחוז"])
 def test_a_reduction_is_derived_in_every_written_form_of_the_complement(claim):

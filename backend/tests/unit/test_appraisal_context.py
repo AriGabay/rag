@@ -536,6 +536,7 @@ def _declared_ws(cx: contexts.Contexts, cited: dict[str, int], question: str, de
                             "unit_no": n} for n in cx.numbers}
     ws.declared_units = [{"document_id": "d", "reading_id": cx.reading_id, "unit_no": n, "units_tag": cx.tag,
                           "display": cx.label(n)} for n in declared or []]
+    ws.declared_handles = {f"U{a['unit_no']}": a for a in ws.declared_units}
     ws.located_unit = ws.unit_focus = None
     if sources:
         ws.sources = sources
@@ -674,11 +675,12 @@ def test_the_judge_header_of_a_passage_in_the_declared_unit_names_it_by_handle_a
         tools._mark(src, cx, [n], ws)
         src.date_line = ""
     ws.declared_units = [{"document_id": str(doc), "reading_id": "r1", "unit_no": 2, "units_tag": None, "display": "x"}]
+    ws.declared_handles = {handles[2]: ws.declared_units[0]}
     ws.sources["S1"].tags.update(unit=handles[2])
     head_declared, _, _ = verify._source_parts(ws, "S1")
     head_other, _, _ = verify._source_parts(ws, "S2")
     assert f"{verify.MSG_DECLARED_UNIT}: {handles[2]} «פרויקט הגפן א»" in head_declared
     assert verify.MSG_DECLARED_UNIT not in head_other  # the neighbour's passage is not the declared unit's
     assert verify.MSG_DECLARED_UNIT not in verify._source_parts(ws, "S1", dated=False)[0]
-    ws.declared_units = []
+    ws.declared_units, ws.declared_handles = [], {}
     assert verify.MSG_DECLARED_UNIT not in verify._source_parts(ws, "S1")[0]

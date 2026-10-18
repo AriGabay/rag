@@ -207,6 +207,32 @@ def _ask_between(client, gafen, monkeypatch, units: list[str]) -> str:
     return cid
 
 
+def _outline_handles(items) -> dict[int, str]:
+    """The U# handle of each unit number the model's outline of the file listed (``הקשר N: ... | U# unit_id=...``)."""
+    outs = [i["output"] for i in items if isinstance(i, dict) and i.get("type") == "function_call_output"]
+    return {int(n): h for o in outs for n, h in re.findall(r"הקשר (\d+):[^\n]*?\| (U\d+) unit_id=", o)}
+
+
+def test_a_clarification_may_offer_units_the_model_only_saw_listed_by_outline(client, gafen, monkeypatch):
+    """Round 15 review: units the model's own ``outline`` / ``find_documents`` listed (not among the server's eight cards,
+    not read) can be declared in a clarification between them; the declaration is kept as the offered units the reply binds to."""
+    asked = "בקובץ כמה מתחמים. לאיזה התכוונת?"
+
+    def between(items):
+        handles = _outline_handles(items)
+        assert 11 in handles and 12 in handles, handles
+        return final(asked, "clarification", clarification=asked, focus=_focus(gafen.doc, "", [handles[11], handles[12]]))
+
+    agent = ScriptedAgent([[call("outline", document=gafen.doc)], between], intent="property")
+    cloud(monkeypatch, gafen, agent)
+    m = send(client, new_conversation(client), "מה שווי הנכס במתחם הגפן?")
+    assert m["status"] == "done" and m["answer"]["status"] == "clarification", m
+    shown = {t for _, t in _cards(agent.seen[0][0]["content"])}
+    assert "מתחם הגפן ל" not in shown and "מתחם הגפן כ" not in shown  # beyond the eight cards: listed only
+    offered = m["answer"]["offered_units"]
+    assert [u["unit"]["unit_no"] for u in offered] == [11, 12], offered
+
+
 def _reply(client, cid: str, monkeypatch, message: str, steps: list, parse: dict) -> tuple[ScriptedAgent, dict]:
     agent = ScriptedAgent(steps, intent="property")
     agent.on("resolve", parse)
@@ -528,3 +554,29 @@ def test_a_hit_across_a_probable_edge_is_evidence_for_the_neighbour_not_for_the_
     _next(monkeypatch, agent)
     m = send(client, new_conversation(client), "מה שווי הנכס בפרויקט הכרמל?")
     assert _value(1) not in m["answer"]["markdown"] and m["answer"]["verification"]["removed"] >= 1
+
+
+def test_a_clarification_is_hidden_once_the_user_loses_a_document_it_only_showed_among_the_candidates(client, gafen,
+                                                                                                    monkeypatch):
+    """Round 15 review (KTD1): the message is bound to the documents of every candidate the model was SHOWN, not only the
+    ones it offered. A second file whose units were cards (and not offered) is made invisible: the stored message is hidden."""
+    other_doc, _ = unit_file(gafen, gafen.default_group_id, "אאא קובץ נוסף סינתטי", [
+        {"title": f"מתחם הגפן {x}", "aliases": [f"מתחם הגפן {x}"], "blocks": [f"מתחם הגפן {x}", "שווי הנכס 9,900,000 ₪."]}
+        for x in ("ת", "ש")], sha="o" * 64)
+    asked = "בקובץ כמה מתחמים. לאיזה התכוונת?"
+    agent = ScriptedAgent([final(asked, "clarification", clarification=asked, focus=_focus(gafen.doc, "", ["U3", "U4"]))],
+                          intent="property")
+    cloud(monkeypatch, gafen, agent)
+    m = send(client, new_conversation(client), "מה שווי הנכס במתחם הגפן?")
+    assert m["status"] == "done" and m["answer"]["status"] == "clarification", m
+    cards = dict(_cards(agent.seen[0][0]["content"]))
+    assert cards["U1"].startswith("מתחם הגפן") and cards["U1"][-1] in "תש", cards  # the second file's units lead the cards
+    offered = m["answer"]["offered_units"]
+    assert offered and {u["document_id"] for u in offered} == {gafen.doc}  # nothing of the second file was offered
+    assert other_doc in m["answer"]["shown_documents"] and gafen.doc in m["answer"]["shown_documents"]
+    stored = client.get(f"/api/chat/messages/{m['id']}").json()
+    assert stored["answer"].get("hidden") is not True and stored["answer"]["status"] == "clarification"
+    with tenant_tx(gafen.system) as conn:
+        conn.execute(text("UPDATE documents SET deleted_at = now() WHERE id = :d"), {"d": other_doc})
+    hidden = client.get(f"/api/chat/messages/{m['id']}").json()
+    assert hidden["answer"].get("hidden") is True and not hidden["content"], hidden

@@ -2411,7 +2411,7 @@ def _declared_head(ws: Workspace, src) -> str:
     check of the asked set (``_wrong_context``) reads the declaration, the judge does not take it as evidence for
     any claim. Empty for a passage of another unit, or when nothing was declared."""
     unit = getattr(src, "unit", None)
-    handle = declared_handles(ws).get(unit["id"]) if unit and getattr(ws, "declared_units", None) else None
+    handle = declared_handles(ws).get(unit["id"]) if unit else None
     if handle is None:
         return ""
     title = unit.get("title")
@@ -3433,9 +3433,11 @@ _TIME_NOUNS = frozenset({"שנה", "שנים", "שנתיים", "חודש", "חו
 # are left out (review, round 14): they name a figure as often as a document ("the current assessment is X").
 _DOCUMENT_NOUNS = frozenset({"שומה", "חוות", "דעת", "דוח", "מסמך", "נספח"})
 _CURRENT_WORDS = frozenset({"נוכחי", "נוכחית"})
-# "present value" (מקדם הערך הנוכחי, הערך הנוכחי של תזרים): an appraisal's discounting term, not the latest value (round 15).
-# "השווי הנוכחי" — the current value — stays a recency claim.
-_PRESENT_VALUE_NOUNS = frozenset({"ערך"})
+# "present value" (מקדם הערך הנוכחי, היוון לערך נוכחי): an appraisal's discounting term, not the latest value (round 15). It is so
+# only where the word before "ערך" (one or two words back, with a ה/ו/ל/ב prefix) is the discounting term itself: מקדם, or a form of
+# היוון / הוון / מהוון / להוון. "הערך הנוכחי של הנכס" and "השווי הנוכחי" — the current value — stay recency claims.
+_PRESENT_VALUE_NOUN = "ערך"
+_DISCOUNTING = re.compile(r"[הולבכש]{0,2}(?:מקדם|מקדמי|מקדמים|הי?וון|מהוון(?:ת|ים|ות)?)")
 MSG_NOT_LATEST = ("הטענה קוראת ל-{older} «העדכני», אבל בתור הזה נרשם ערך מאוחר יותר מאותו נתון של אותו נכס: {newer} "
                   "(מועד {when}, {title}). הצג את {newer} כערך העדכני ואת {older} כערך קודם, עם תאריכיהם ומראי המקום "
                   "של שניהם (אל תמחק ערך שנתמך), או השמט את הניסוח «העדכני» / «האחרון»")
@@ -3457,6 +3459,14 @@ def _is_document_noun(word: str) -> bool:
     return any(word[i:] in _DOCUMENT_NOUNS for i in range(min(3, len(word))))
 
 
+def _is_present_value(head: str) -> bool:
+    """Whether ``head`` (the text before a "current" word) ends in the present value of a discounting term: "ערך" (with a
+    prefix) after a form of מקדם or of היוון within the two words before it ("מקדם הערך", "היוון התזרים לערך")."""
+    words = re.findall(r"[א-ת]+", head[-48:])
+    noun = re.sub(r"^[בהלמוכש]{1,2}(?=[א-ת]{2,})", "", words[-1]) if words else ""
+    return noun == _PRESENT_VALUE_NOUN and any(_DISCOUNTING.fullmatch(w) for w in words[-3:-1])
+
+
 def _calls_latest(text: str) -> bool:
     """Whether a unit's words call something the latest, apart from a period of time ("בשנה האחרונה")."""
     for m in _LATEST.finditer(text):
@@ -3464,9 +3474,8 @@ def _calls_latest(text: str) -> bool:
         word = re.sub(r"^[בהלמוכש]{1,2}(?=[א-ת]{2,})", "", before[-1]) if before else ""
         if before and (before[-1] in _TIME_NOUNS or word in _TIME_NOUNS):
             continue
-        if before and re.sub(r"^(?:[וש]?ה)", "", m.group()) in _CURRENT_WORDS and _is_document_noun(before[-1]):
-            continue
-        if before and re.sub(r"^(?:[וש]?ה)", "", m.group()) in _CURRENT_WORDS and word in _PRESENT_VALUE_NOUNS:
+        if (before and re.sub(r"^(?:[וש]?ה)", "", m.group()) in _CURRENT_WORDS
+                and (_is_document_noun(before[-1]) or _is_present_value(text[:m.start()]))):
             continue
         return True
     return False
@@ -3925,18 +3934,12 @@ def _evidence_contexts(u: Unit, ws: Workspace) -> list[tuple[str, set[int], str,
 
 
 def declared_handles(ws: Workspace) -> dict[str, str]:
-    """The units the answer declared (``Workspace.declared_units``: anchors the server validated against the units it
+    """The units the answer declared (``Workspace.declared_handles``: anchors the server validated against the units it
     offered or the turn read, round 15 U6, KTD7), as {the unit's stable id (``Contexts.key``): its handle}. An anchor has no
     version: the handle the server issued for the unit (``Workspace.handles``) says which version it is of."""
     from app.chat import contexts
 
-    out: dict[str, str] = {}
-    for a in getattr(ws, "declared_units", None) or []:
-        for h, d in (getattr(ws, "handles", None) or {}).items():
-            if (d.get("kind") == "U" and str(d["document_id"]) == str(a["document_id"])
-                    and (d.get("reading_id") or None) == (a.get("reading_id") or None) and d["unit_no"] == a["unit_no"]):
-                out[contexts.anchor_key(d["version_id"], a)] = h
-    return out
+    return {contexts.anchor_key(ws.handles[h]["version_id"], a): h for h, a in (getattr(ws, "declared_handles", None) or {}).items()}
 
 
 def declared_contexts(ws: Workspace, cx) -> set[int]:
@@ -4059,7 +4062,7 @@ def _derivations(ws: Workspace, ids: list[str], shown: Shown, clause: str) -> li
     order they are tried, and whether a result must be positive (a reduction, an addition and a difference are
     magnitudes). The wording of the number's own clause gates each formula (KTD9)."""
     out: list[tuple[str, bool]] = []
-    cited = [i for i in ids if i in ws.values or i in ws.measurements][:DERIVED_OPERANDS]
+    cited = [i for i in ids if (i in ws.values or i in ws.measurements) and i not in ws.ambiguous_units][:DERIVED_OPERANDS]
     reduction, addition = bool(_REDUCTION.search(clause)), bool(_ADDITION.search(clause))
     for x in cited:
         if reduction:

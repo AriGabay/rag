@@ -211,13 +211,12 @@ def identifiers(raw: str | None) -> Identity:
         if not words or words[0] in _NOT_STREET:
             continue
         number, letter = m.group(2).lstrip("0") or "0", m.group(3) or ""
-        keep = 2 if len(words) > 1 else 3
-        core = " ".join([_strip_prefix(words[0], keep), *words[1:]])
-        if (core, number + letter) not in addresses:
-            addresses.add((core, number + letter))
+        street = (tuple(words), number, letter)
+        if (address := _street_key(street)) not in addresses:
+            addresses.add(address)
             label = re.match(rf"[{_PREFIXES}]{{0,2}}((?:{_LABELS}))", m.group(0).strip())
             shown.append(f"{label.group(1) if label else ''} {' '.join(words)} {number}{letter}".strip())
-            streets.append((tuple(words), number, letter))
+            streets.append(street)
     for m in _BP_LABELED.finditer(norm):
         b, p = m.group(1).lstrip("0"), m.group(2).lstrip("0")
         if (b, p) not in parcels:
@@ -431,6 +430,17 @@ def unit_key(version_id: str, reading_id: str | None, number: int, tag: str | No
     return f"{base}@{tag}" if tag else base
 
 
+def unit_row(u, document_id, version_id, reading_id: str | None, tag: str | None, **extra) -> dict:
+    """A stored unit (a ``units.Unit``, or a ``document_units`` row with the same columns) as the unit row dict the lookups,
+    the candidates and the clarifications carry: the file, the version and reading it is in, its stable id under the
+    derivation ``tag`` and its columns; ``extra`` adds what the caller knows beside them (the file's title, how it matched)."""
+    return {"document_id": document_id, "version_id": version_id, "reading_id": reading_id, "unit_no": u.unit_no,
+            "units_tag": tag, "unit_id": unit_key(version_id, reading_id, u.unit_no, tag), "kind": u.kind, "title": u.title,
+            "aliases": list(u.aliases or ()), "identifiers": list((u.identifiers or {}).get("shown") or ()),
+            "page_first": u.page_first, "page_last": u.page_last, "block_first": u.block_first, "block_last": u.block_last,
+            "certainty": u.certainty} | extra
+
+
 def anchor_key(version_id: str, anchor: dict) -> str:
     """The stable id of an anchor's unit (``unit_anchor``) in the version: ``unit_key`` with the anchor's own tag."""
     return unit_key(version_id, anchor.get("reading_id"), anchor["unit_no"], anchor.get("units_tag"))
@@ -599,8 +609,9 @@ def derive(blocks: Iterable, version_id: str = "") -> Contexts:
 # keyed by version, reading and the unit derivation (``units.UNITS_VERSION``): a new derivation under the same reading id
 # is a new entry, so a running process never serves contexts of the derivation it no longer reads (round 15 U3, KTD6)
 # and by the unit cards' states (``cards.state_digest``), so a card that completes after a chat read is seen by the next
-# one (round 15 U5, KTD5)
-_CACHE: OrderedDict[tuple[str, str | None, str, str], Contexts] = OrderedDict()
+# one (round 15 U5, KTD5). A file of one unit with no cards has nothing to change it: its contexts are also kept under a key whose digest
+# is None, which ``of_version`` answers without reading the digest
+_CACHE: OrderedDict[tuple[str, str | None, str, str | None], Contexts] = OrderedDict()
 _LOCK = threading.Lock()
 
 _FIRST_BLOCKS_SQL = (
@@ -665,9 +676,10 @@ def from_units(units: Sequence, first_blocks: dict, headings: Sequence[int], ver
     return Contexts(version_id, tuple(segments), reading_id, tag)
 
 
-def _of_units(conn: Connection, version_id: str, reading_id: str | None) -> Contexts | None:
+def _of_units(conn: Connection, version_id: str, reading_id: str | None, has_cards: bool = True) -> Contexts | None:
     """The contexts of the reading's stored units (built on first use: ``units.ensure``); None when the version has
-    none (no reading) or they cannot be had."""
+    none (no reading) or they cannot be had. ``has_cards``: the version has identity cards (its cards digest is not empty);
+    without them the subject fields are not read."""
     from app.chat import cards as unit_cards
     from app.chat import units as unit_store  # units derives with this module's helpers
 
@@ -687,12 +699,13 @@ def _of_units(conn: Connection, version_id: str, reading_id: str | None) -> Cont
     except Exception:  # noqa: BLE001 - the contexts of the blocks serve instead
         logger.exception("contexts of version %s could not be built from its units", version_id)
         return None
-    try:  # a card that cannot be read leaves the unit its structural identity
-        with conn.begin_nested():
-            card_fields = unit_cards.subject_fields(conn, v)
-    except Exception:  # noqa: BLE001
-        logger.warning("identity cards of version %s could not be read", version_id, exc_info=True)
-        card_fields = {}
+    card_fields = {}
+    if has_cards:
+        try:  # a card that cannot be read leaves the unit its structural identity
+            with conn.begin_nested():
+                card_fields = unit_cards.subject_fields(conn, v)
+        except Exception:  # noqa: BLE001
+            logger.warning("identity cards of version %s could not be read", version_id, exc_info=True)
     return from_units(found, first, headings, version_id, reading_id, tag, card_fields)
 
 
@@ -705,13 +718,20 @@ def of_version(conn: Connection, version_id: UUID | str, reading_id: str | None)
     from app.chat import cards as unit_cards
     from app.chat import units as unit_store  # units derives with this module's helpers
 
-    key = (str(version_id), reading_id, unit_store.UNITS_VERSION, unit_cards.state_digest(conn, version_id))
+    base = (str(version_id), reading_id, unit_store.UNITS_VERSION)
+    with _LOCK:
+        found = _CACHE.get((*base, None))
+        if found is not None:
+            _CACHE.move_to_end((*base, None))
+            return found
+    digest = unit_cards.state_digest(conn, version_id)
+    key = (*base, digest)
     with _LOCK:
         found = _CACHE.get(key)
         if found is not None:
             _CACHE.move_to_end(key)
             return found
-    found = _of_units(conn, str(version_id), reading_id)
+    found = _of_units(conn, str(version_id), reading_id, has_cards=bool(digest))
     if found is None:
         rows = conn.execute(text(
             "SELECT b.block_index, b.kind, b.page, b.bbox, b.status, b.table_index,"
@@ -724,6 +744,8 @@ def of_version(conn: Connection, version_id: UUID | str, reading_id: str | None)
         found = derive(rows, str(version_id))
     with _LOCK:
         _CACHE[key] = found
+        if not found.multi and not digest:
+            _CACHE[(*base, None)] = found
         while len(_CACHE) > CACHE_MAX:
             _CACHE.popitem(last=False)
     return found

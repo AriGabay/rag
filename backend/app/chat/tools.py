@@ -158,6 +158,7 @@ import logging
 import math
 import re
 import time
+from collections import Counter
 from collections.abc import Callable, Container, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
@@ -626,10 +627,15 @@ class Workspace:
     # (set only by the search-only path, which has no model to choose a unit); ``offered_units`` — the handles of the
     # candidate units the turn's first message showed the model; ``declared_units`` — the units the answer declared in
     # ``focus.units`` and the server validated against the offered ones and the ones the turn read (anchors, in the model's
-    # order), which the next unit's verification and the turn's unit read
+    # order), which the next unit's verification and the turn's unit read; ``declared_handles`` — the same units keyed by the
+    # handle (U#) the model declared each by (``engine._declare_units`` sets both); ``listed_units`` — the handles of the
+    # units ``find_documents`` and ``outline`` listed: a clarification may offer them, though they are neither read nor
+    # offered by the server (so ``coverage._offered_only`` does not count them)
     unit_default: bool = False
     offered_units: set = field(default_factory=set)
+    listed_units: set = field(default_factory=set)
     declared_units: list = field(default_factory=list)
+    declared_handles: dict[str, dict] = field(default_factory=dict)
     # the passages an identical search returned, kept for the turn (round 9 R16, KTD3, ``memoized_search``):
     # (query, scope, limit, the office's data version) -> hits
     search_memo: dict = field(default_factory=dict)
@@ -1081,16 +1087,35 @@ def unit_info(cx, number: int) -> dict:
             "pages": [first, last] if first else []}
 
 
-def unit_handle_of(ws: Workspace, document_id, version_id, reading_id: str | None, number: int) -> str:
+def unit_handle_of(ws: Workspace, document_id, version_id, reading_id: str | None, number: int,
+                   units_tag: str | None = None) -> str:
     """The turn's handle (U#) for a unit: bound to the version and the reading it was issued for, and the same for
-    the same unit whichever tool names it."""
-    return ws.handle("U", (str(version_id), reading_id or None, number), document_id=str(document_id),
-                     version_id=str(version_id), reading_id=reading_id or None, unit_no=number)
+    the same unit whichever tool names it. ``units_tag`` is the tag of the derivation the caller read the unit from (a
+    ``Contexts.tag``, an anchor's or a row's ``units_tag``; None: ``units-v4``): kept in the handle's data, not in its
+    identity, so that the handle names the unit by the same stable id as ``Contexts.key`` (``contexts.anchor_key``,
+    round 15 U4). A handle first minted without a tag takes the tag of a later caller that knows it."""
+    h = ws.handle("U", (str(version_id), reading_id or None, number), document_id=str(document_id),
+                  version_id=str(version_id), reading_id=reading_id or None, unit_no=number,
+                  units_tag=units_tag or None)
+    if units_tag and not ws.handles[h].get("units_tag"):
+        ws.handles[h]["units_tag"] = units_tag
+    return h
+
+
+def read_unit_handles(ws: Workspace) -> set[str]:
+    """The handles (U#) of the units the turn read: the unit of any passage its tools returned, and any unit a tool worked
+    inside through a handle (``Workspace.unit_scopes``). A unit only listed (an outline, a find) is not read."""
+    out = {h for s in ws.sources.values() if not s.is_listing and (h := s.tags.get("unit"))}
+    for scope in ws.unit_scopes.values():
+        h = ws.handle_ids.get(("U", (scope["version_id"], scope["reading_id"] or None, scope["unit_no"])))
+        if h:
+            out.add(h)
+    return out
 
 
 def unit_handle(ws: Workspace, cx, number: int, document_id) -> str:
     """The handle (U#) of a unit of a version's contexts."""
-    return unit_handle_of(ws, document_id, cx.version_id, cx.reading_id, number)
+    return unit_handle_of(ws, document_id, cx.version_id, cx.reading_id, number, cx.tag)
 
 
 def _mark(s: Source, cx, numbers, ws: Workspace | None = None) -> Source:
@@ -1191,11 +1216,16 @@ def _row_contexts(ws: Workspace, conn: Connection, cx, version_id, table_index: 
                                  block.page if block else st.get("page")), st
 
 
-def _hit_contexts(ws: Workspace, conn: Connection, cx, h: dict, bs, be) -> list[int]:
-    """The contexts of a search hit: of its rows for a table or a table row, else of its blocks."""
-    ti = h.get("table_index")
-    if ti is not None and h["kind"] in ("table", "table_row"):
-        groups, _ = _row_contexts(ws, conn, cx, h["version_id"], ti)
+def _is_table_hit(h: dict) -> bool:
+    """Whether a search hit is a stored table or a row of one (it has a table whose rows are placed by context)."""
+    return h.get("table_index") is not None and h["kind"] in ("table", "table_row")
+
+
+def _hit_contexts(cx, h: dict, bs, be, table: tuple[list[dict], dict] | None) -> list[int]:
+    """The contexts of a search hit: of its rows for a table or a table row (``table``: ``_row_contexts`` of its table),
+    else of its blocks."""
+    if table is not None:
+        groups = table[0]
         if h["kind"] == "table_row" and h.get("row_index") is not None:
             n = int(h["row_index"]) + 1
             return [g["context"] for g in groups if g["first"] <= n <= g["last"]]
@@ -1910,7 +1940,8 @@ def locate_unit(ws: Workspace, anchor: dict, version_id) -> bool:
         return False
     if ws.unit_focus is not None:
         return False
-    handle = unit_handle_of(ws, anchor["document_id"], version_id, anchor.get("reading_id"), anchor["unit_no"])
+    handle = unit_handle_of(ws, anchor["document_id"], version_id, anchor.get("reading_id"), anchor["unit_no"],
+                            anchor.get("units_tag"))
     ws.unit_focus = {"handle": handle, "document_id": str(anchor["document_id"]), "display": entities.focus_text(anchor)}
     ws.located_unit = {"key": key, "anchor": anchor}
     ws.unit_default = True
@@ -2686,15 +2717,15 @@ def _answer_properties(ws: Workspace, conn: Connection, places: list[tuple[str, 
         yield asked, "question"
 
 
-def unit_coverage(ws: Workspace, conn: Connection, handle: str, found: bool, named: bool) -> dict:
+def unit_coverage(ws: Workspace, conn: Connection, handle: str, found: bool) -> dict:
     """The record of a call that searched one unit only (the unit search stood): the property's inventory of one unit when
     the unit is in the graph and states an identity (the property is appraised by no other unit, but its candidates and
     undetermined units still count); otherwise a ``unit`` record, which says the property was not identified (R13) and is
-    never complete. ``found``: the search matched. ``named``: the call names the unit in a turn with a time mode — the unit
-    it works in, whether the conversation kept it or the first message's candidates offered it (round 15 U2, KTD10); the
-    record's ``via`` is ``focus`` for it, as the widened search records."""
+    never complete. ``found``: the search matched. The call names the unit in a turn with a time mode — the unit it works in,
+    whether the conversation kept it or the first message's candidates offered it (round 15 U2, KTD10); the record's ``via``
+    is ``focus``, as the widened search records."""
     v, cx, number = _unit_of(conn, ws, handle)
-    gathered = property_gathered(ws, conn, v.version_id, number) if named else None
+    gathered = property_gathered(ws, conn, v.version_id, number)
     if gathered is not None and gathered.identified:
         units = property_inventory(ws, conn, gathered)
         for u in units:
@@ -2704,7 +2735,7 @@ def unit_coverage(ws: Workspace, conn: Connection, handle: str, found: bool, nam
     date_, status = unit_dating(ws, conn, v.version_id, number)
     title = cx.segment(number).title if cx.multi else None
     unit = InventoryUnit(v.document_id, v.version_id, number, title, date_, status, None, True, LOCATED if found else NO_MATCH)
-    return coverage_record(ws, conn, scope=UNIT, via="focus" if named else "unit", units=[unit], gathered=None)
+    return coverage_record(ws, conn, scope=UNIT, via="focus", units=[unit], gathered=None)
 
 
 def window_coverage(ws: Workspace, conn: Connection, hits: list[dict]) -> dict:
@@ -2921,23 +2952,36 @@ def _rows_in_scope(chunk: str, rows: list[dict], groups: list[dict], keep: set[i
     return "\n".join([*kept, MSG_TABLE_CUT])
 
 
-def _around_terms(passage: str, query: str, width: int, by_line: bool = False) -> tuple[str, bool]:
-    """At most ``width`` characters of ``passage`` around the query's terms (round 15 U2, R9): the window that holds the most
-    of the topic terms, starting at the first of them it can hold, cut at a space (at a line for a table) and marked with an
-    ellipsis where the passage goes on. A passage of ``width`` characters or less is returned as it is. A passage with none
-    of the terms (a hit by meaning) shows its start. Returns (text, whether it was cut)."""
+def _scoped_terms(query: str) -> list[str]:
+    """The topic terms of a query a unit-scoped hit is shown around (``_around_terms``): each once, two characters or more."""
+    return [t for t in dict.fromkeys(topic_tokens(query)) if len(t) >= 2]
+
+
+def _around_terms(passage: str, terms: list[str], width: int, by_line: bool = False) -> tuple[str, bool]:
+    """At most ``width`` characters of ``passage`` around the query's terms (``_scoped_terms``; round 15 U2, R9): the window
+    that holds the most of the topic terms, starting at the first of them it can hold, cut at a space (at a line for a table)
+    and marked with an ellipsis where the passage goes on. A passage of ``width`` characters or less is returned as it is. A
+    passage with none of the terms (a hit by meaning) shows its start. Returns (text, whether it was cut)."""
     if len(passage) <= width:
         return passage, False
     room = width - 2  # the two ellipses
     low = passage.lower()
-    spots = sorted({(at, t) for t in dict.fromkeys(topic_tokens(query)) if len(t) >= 2
-                    for at in islice((m.start() for m in re.finditer(re.escape(t), low)), 60)})
+    spots = sorted({(at, t) for t in terms for at in islice((m.start() for m in re.finditer(re.escape(t), low)), 60)})
     start, best = 0, 0
+    inside: Counter[str] = Counter()  # the terms of the spots in the window [lo, lo + room), moved on as lo only grows
+    left = right = 0
     for at, _ in spots:
         lo = max(0, at - room // 4)
-        covered = len({t for a, t in spots if lo <= a < lo + room})
-        if covered > best:
-            start, best = lo, covered
+        while right < len(spots) and spots[right][0] < lo + room:
+            inside[spots[right][1]] += 1
+            right += 1
+        while left < right and spots[left][0] < lo:
+            inside[spots[left][1]] -= 1
+            if not inside[spots[left][1]]:
+                del inside[spots[left][1]]
+            left += 1
+        if len(inside) > best:
+            start, best = lo, len(inside)
     stops = "\n" if by_line else " \n"
     if start > 0:  # begin after a break, not inside a word
         cut = max((passage.rfind(c, max(0, start - 40), start + 1) for c in stops), default=-1)
@@ -2979,7 +3023,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
             widened = _property_search(ws, conn, unit, query, limit, call, document_ids) if timed else None
             hits, notes, nothing = widened or _unit_search(ws, conn, unit, query, limit, document_ids)
             if call is not None and widened is None:  # the unit search stood: the coverage is that of the unit (R13)
-                call.record = unit_coverage(ws, conn, unit, bool(hits), timed)
+                call.record = unit_coverage(ws, conn, unit, bool(hits))
             if in_focus:
                 focus_note = MSG_UNIT_FOCUS.format(unit=unit)
                 if nothing:
@@ -3068,6 +3112,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
         prime_dates(ws, conn, [h["version_id"] for h in rendered if h["pool"] != PROFESSIONAL_POOL
                                and extra.get(h["chunk_id"], (None, None))[0] is not None])
         valuations = functools.partial(_hit_valuations, ws, conn, {})  # the property's dates, read when a hit needs them
+        around = _scoped_terms(query) if scoped else []
         for h in rendered:
             bs, be = extra.get(h["chunk_id"], (None, None))
             if h["pool"] == PROFESSIONAL_POOL:
@@ -3080,14 +3125,15 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 noted[str(h["document_id"])] = cx
             # a passage that runs into the next unit is that of the unit it begins in (R10): cut there
             passage, be, page_list = _clip_to_unit(conn, h["version_id"], cx, h["kind"], bs, be, h["text"], h["page_list"])
-            held = _hit_contexts(ws, conn, cx, h, bs, be) if cx.multi else []
+            table = _row_contexts(ws, conn, cx, h["version_id"], h["table_index"]) if cx.multi and _is_table_hit(h) else None
+            held = _hit_contexts(cx, h, bs, be, table) if cx.multi else []
             if cx.multi and h.get("scope_blocks") and h["kind"] in ("table", "table_row"):
                 # a stored table's rows are placed by their own contexts: only those inside the search's reach are shown
                 kept = _reach_contexts(cx, h["scope_blocks"])
                 if h["kind"] == "table_row" and held and not set(held) & kept:
                     continue  # a row of the table in another unit is no hit of this scope
-                if h["kind"] == "table" and h.get("table_index") is not None:
-                    groups, st = _row_contexts(ws, conn, cx, h["version_id"], h["table_index"])
+                if h["kind"] == "table" and table is not None:
+                    groups, st = table
                     passage = _rows_in_scope(passage, st.get("rows") or [], groups, kept)
                     if passage is None:
                         continue
@@ -3098,7 +3144,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 tags["table"] = _table_handle(ws, h["document_id"], h["version_id"],
                                               ws.readings.get(str(h["version_id"])), h["table_index"])
             # a hit of a unit-scoped search shows the passage around the query's terms, the rest on demand (round 15 U2, R9)
-            shown, cut = (_around_terms(passage, query, SCOPED_PASSAGE_CHARS, h["kind"] in ("table", "table_row"))
+            shown, cut = (_around_terms(passage, around, SCOPED_PASSAGE_CHARS, h["kind"] in ("table", "table_row"))
                           if scoped else (_clip(passage, get_settings().chat_passage_chars), False))
             src = _mark(ws.add_source(
                 document_id=h["document_id"], version_id=h["version_id"], title=h["title"], section=h["section"],
@@ -4301,7 +4347,8 @@ MSG_ONLY_COMPARABLE = ("בקובץ «{title}» המונחים מופיעים ר�
 def _unit_detail(ws: Workspace, u: dict) -> str:
     """A unit found by ``find_documents``: handle, title (or that it has none), kind, pages, identifiers, and why it
     matched (a name the document states, or passages)."""
-    h = unit_handle_of(ws, u["document_id"], u["version_id"], u["reading_id"], u["unit_no"])
+    h = unit_handle_of(ws, u["document_id"], u["version_id"], u["reading_id"], u["unit_no"], u.get("units_tag"))
+    ws.listed_units.add(h)  # a unit the model was shown may be declared in a clarification (round 15 U6)
     why = {"alias": "שם שכתוב במסמך", "file_title": "כותרת הקובץ"}.get(u["matched_by"], "קטעים ביחידה")
     return (f'  - {h} | «{_txt(u["title"]) if u["title"] else MSG_NO_TITLE}» | {UNIT_KIND_WORDS.get(u["kind"], u["kind"])}'
             f' | {_unit_pages(u["page_first"], u["page_last"])}' + (f' | {_txt(" · ".join(u["identifiers"]))}' if u["identifiers"] else "")
@@ -4363,7 +4410,6 @@ def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> s
     if units:
         out += "\n\n" + "\n".join([MSG_UNITS_LISTED, *(_unit_detail(ws, u) for u in units)]
                                     + ([MSG_SEVERAL_UNITS] if len(units) > 1 else []))
-    # a single unit listed is listed, not chosen (round 15 U6, KTD1): the model names the unit it works in, and declares it
     return out + extra
 
 
@@ -4382,7 +4428,9 @@ def _unit_line(ws: Workspace, cx, number: int, document_id) -> str:
     seg = cx.segment(number)
     edge = f" | {MSG_UNIT_EDGE}" if seg.certainty == "probable" else ""
     title = "" if seg.title else f" ({MSG_NO_TITLE})"
-    return (f"{cx.describe(number)}{title} | {unit_handle(ws, cx, number, document_id)} unit_id={cx.key(number)} | "
+    handle = unit_handle(ws, cx, number, document_id)
+    ws.listed_units.add(handle)  # a unit the model was shown may be declared in a clarification (round 15 U6)
+    return (f"{cx.describe(number)}{title} | {handle} unit_id={cx.key(number)} | "
             f"{UNIT_KIND_WORDS.get(seg.kind, seg.kind)}{edge}")
 
 
@@ -5363,11 +5411,16 @@ MSG_UNIT_AMBIGUOUS_INPUT = ("אי אפשר לחשב עם {inputs}: היחידה 
                             "מהמסמך ערך שהיחידה שלו כתובה (תא עם כותרת שמציינת יחידה, או משפט), או הצג את הערך בלי חישוב")
 
 
+def _date_cite() -> ToolError:
+    """The refusal of a date offered as a value: it is cited as a passage, not registered."""
+    return ToolError(MSG_DATE_CITE, "date_not_registered")
+
+
 def _not_one_number(raw) -> ToolError:
     """The refusal for a ``number`` that is not one number: a date gets its own message — it is cited, not registered (round 15 U1,
     KTD9, R12)."""
     if platform_dates.parse(str(raw or "")) is not None:
-        return ToolError(MSG_DATE_CITE, "date_not_registered")
+        return _date_cite()
     return ToolError(f"number «{raw}» אינו מספר אחד")
 
 
@@ -5485,32 +5538,39 @@ def _rows_like_text(rows: list[list[str]], text_: str) -> list[tuple[int, float,
     return sorted(out, key=lambda x: (-x[1], -x[2], x[0]))
 
 
+def _row_index(row_number, rows: list[list[str]]) -> int | None:
+    """The 0-based row a 1-based ``row_number`` names, or None when none is given or it is outside the table."""
+    if row_number is None:
+        return None
+    at = int(row_number) - 1
+    return at if 0 <= at < len(rows) else None
+
+
 def _row_of_text(rows: list[list[str]], text_: str, row_number) -> int:
     """The row a whole rendered row names (round 15 U1 follow-up, KTD9): the ``row_number`` row when it matches, else the
     only best match; a refusal naming the candidate rows when none matches or several match equally."""
     like = _rows_like_text(rows, text_)
-    if row_number is not None and 0 <= int(row_number) - 1 < len(rows) and any(i == int(row_number) - 1 for i, *_ in like):
-        return int(row_number) - 1
+    given = _row_index(row_number, rows)
+    if given is not None and any(i == given for i, *_ in like):
+        return given
     if like:
         best = [i for i, share, eq in like if (share, eq) == like[0][1:]]
         if len(best) == 1:
             return best[0]
         raise ToolError(f"השורה «{_clip(text_, 80)}» מתאימה לכמה שורות — {_rows_listed(rows, best)}; בחר לפי row_number")
-    at = [int(row_number) - 1] if row_number is not None and 0 <= int(row_number) - 1 < len(rows) else []
     raise ToolError(f"השורה «{_clip(text_, 80)}» אינה שורה בטבלה"
-                    + (f". שורה {at[0] + 1} היא «{_clip(' | '.join(rows[at[0]]), 120)}»" if at else "")
-                    + ". השורות: " + _rows_listed(rows, list(range(len(rows)))))
+                    + (f". שורה {given + 1} היא «{_clip(' | '.join(rows[given]), 120)}»" if given is not None else "")
+                    + ". השורות: " + _rows_listed(rows))
 
 
 def _column_of(wanted: str, headers: list[str]) -> int:
     """The column a header label names; a multi-level header written with " | " ("קבוצה | 101") is matched loosely: a header
     that holds every level, else the leaf level alone (round 15 U1 follow-up, KTD9)."""
-    if not _is_row_text(wanted):
-        return _match_one(wanted, headers, "העמודה")
     try:
         return _match_one(wanted, headers, "העמודה")
     except ToolError:
-        pass
+        if not _is_row_text(wanted):
+            raise
     levels = [g for g in (_loose(x) for x in wanted.split("|")) if g]
     own = [_loose(h) for h in headers]
     for need in (levels, levels[-1:]):
@@ -5530,8 +5590,9 @@ def _row_name(cells: list[str]) -> str:
     return " | ".join(c for c in cells if c and _parse_number(c) is None) or " | ".join(cells)
 
 
-def _rows_listed(rows: list[list[str]], at: list[int]) -> str:
-    return "; ".join(f"שורה {i + 1} «{_clip(_row_name(rows[i]), 80)}»" for i in at[:8])
+def _rows_listed(rows: list[list[str]], at: list[int] | None = None) -> str:
+    """The rows ``at`` (the first eight; default: every row) by number and name, as a refusal lists them."""
+    return "; ".join(f"שורה {i + 1} «{_clip(_row_name(rows[i]), 80)}»" for i in (list(range(len(rows))) if at is None else at)[:8])
 
 
 def _table_of(ws: Workspace, src: Source, given) -> int:
@@ -5594,8 +5655,8 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
         # the model passed the whole rendered row: its cells decide, the row_number only breaks a tie (round 15 U1 follow-up)
         ri = _row_of_text(rows, loc["row"], loc.get("row_number"))
     elif loc.get("row_number") is not None:
-        ri = int(loc["row_number"]) - 1
-        if not 0 <= ri < len(rows):
+        ri = _row_index(loc["row_number"], rows)
+        if ri is None:
             raise ToolError(f"לטבלה {len(rows)} שורות; row_number מ-1 עד {len(rows)}")
         if loc.get("row"):
             # the label decides when the number disagrees with it and the label names exactly one row (round 15 U1, KTD9)
@@ -5611,7 +5672,7 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     elif loc.get("row"):
         named = _rows_named(rows, loc["row"])
         if not named:
-            raise ToolError(f"השורה «{loc['row']}» לא נמצאה בטבלה. השורות: " + _rows_listed(rows, list(range(len(rows)))))
+            raise ToolError(f"השורה «{loc['row']}» לא נמצאה בטבלה. השורות: " + _rows_listed(rows))
         if len(named) > 1:
             raise ToolError(f"השורה «{loc['row']}» מתאימה לכמה שורות — {_rows_listed(rows, named)}; בחר לפי row_number")
         ri = named[0]
@@ -5654,7 +5715,7 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     else:
         if len(numbers) != 1:
             if numbers and platform_dates.parse(cell) is not None:
-                raise ToolError(MSG_DATE_CITE, "date_not_registered")
+                raise _date_cite()
             raise ToolError(f"בתא שנבחר ({where}) " + ("אין מספר" if not numbers else f"יש כמה מספרים («{cell}»); "
                                                        "ציין number"))
         written, value = numbers[0][0], numbers[0][3]
@@ -5863,7 +5924,7 @@ def _row_quote_locator(sid: str, st: dict, loc: dict) -> dict:
         raise ToolError(f"הציטוט אינו מופיע כלשונו ב-{sid}: העתק את המשפט מהמקור בדיוק (או בחר תא בטבלה)")
     held = [i for i, r in enumerate(rows) if quote in shape(" | ".join(r))]
     if not held:
-        raise ToolError(f"הציטוט אינו שורה בטבלה של {sid}. השורות: " + _rows_listed(rows, list(range(len(rows)))))
+        raise ToolError(f"הציטוט אינו שורה בטבלה של {sid}. השורות: " + _rows_listed(rows))
     places = [(i, ci) for i in held for ci, c in enumerate(rows[i])
               if any(n[3] == abs(wanted[1]) for n in _numbers_of(meaning._norm(c))) and _loose(c) and _loose(c) in quote]
     if not places:

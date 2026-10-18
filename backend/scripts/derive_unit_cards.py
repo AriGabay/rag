@@ -29,7 +29,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sqlalchemy import Connection, text  # noqa: E402
 
 from app.chat import cards  # noqa: E402
-from app.chat import units as unit_store  # noqa: E402
 from app.config import get_settings  # noqa: E402
 from app.db import TenantContext, system_ctx, tenant_tx  # noqa: E402
 from app.platform.source_kinds import APPRAISALS_SQL  # noqa: E402
@@ -47,15 +46,17 @@ def current_versions(conn: Connection) -> list[UUID]:
     return list(conn.execute(text(_CURRENT_SQL)).scalars())
 
 
-def plan_version(conn: Connection, version_id: UUID, ceiling: int) -> tuple[cards.Plan, int] | None:
-    """The cards a run would call for one version and the tokens (input and output) they would use; None for a version
-    with one unit (or that has none: not an appraisal)."""
-    units = unit_store.ensure(conn, version_id)
-    if len(units) <= 1:
+def plan_version(conn: Connection, version_id: UUID, ceiling: int, *,
+                 estimate: bool = False) -> tuple[cards.Plan, int] | None:
+    """The cards a run would call for one version and, when ``estimate``, the tokens (input and output) they would use
+    (else 0: the prompts are built only for the dry run); None for a version with one unit (or that has none: not an
+    appraisal)."""
+    _, _, plan = cards.plan_version(conn, version_id, ceiling)
+    if plan is None:
         return None
-    reading = unit_store.reading_of(conn, version_id)
-    plan = cards.plan_units(units, cards.cards_of(conn, version_id, reading.reading_id if reading else None), ceiling)
-    inputs = [cards.build_input(cards.opening_blocks(cards.opening_rows(conn, version_id, u), u)) for u in plan.to_call]
+    if not estimate:
+        return plan, 0
+    inputs = [cards.build_input(cards.opening_of(conn, version_id, u)) for u in plan.to_call]
     return plan, sum(cards.estimate_tokens(inputs))
 
 
@@ -72,7 +73,7 @@ def backfill_office(ctx: TenantContext, *, dry_run: bool = False, provider=None,
     out["versions"] = len(versions)
     for v in versions:
         with tenant_tx(ctx) as conn:
-            planned = plan_version(conn, v, ceiling)
+            planned = plan_version(conn, v, ceiling, estimate=dry_run and cloud)
         if planned is None:
             out["single_unit_skipped"] += 1
             continue

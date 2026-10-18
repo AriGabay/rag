@@ -706,8 +706,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     held: request_analysis.Analysis | None = None
     turn_intent: intent_mod.Intent | None = None
     first_decisions: dict[str, str] = {}
-    shown: list[entities.UnitCard] = []  # the candidate cards of a first message or of a new subject (round 15 U6, KTD1)
-    more = 0  # how many others matched
+    ranked: entities.Ranked | None = None  # the candidate cards of a first message or of a new subject (round 15 U6, KTD1)
 
     def start_analysis() -> None:
         nonlocal pending
@@ -817,15 +816,13 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                 and not request.offered):
             ranked = entities.rank_candidates(ctx, inp.question)
             if ranked is not None:
-                shown, more = ranked.cards, ranked.total - len(ranked.cards)
-                request.resolution.setdefault("decisions", {})["candidates"] = _candidates_decision(ranked.cards, more)
+                request.resolution.setdefault("decisions", {})["candidates"] = _candidates_decision(ranked.cards, ranked.more)
     else:
         # a first message gets the candidates its words point at, as cards, with no wait for the request analysis and no
         # pin (round 15 U6, KTD1, KTD2): the model chooses the unit and declares it
         ranked = entities.rank_candidates(ctx, inp.question)
         if ranked is not None:
-            shown, more = ranked.cards, ranked.total - len(ranked.cards)
-            first_decisions["candidates"] = _candidates_decision(ranked.cards, more)
+            first_decisions["candidates"] = _candidates_decision(ranked.cards, ranked.more)
 
     def finish(answer: FinalAnswer, report: VerifyReport) -> TurnOutcome:
         # removals; each component recomputed from the surviving units; the absences the server states removed; one
@@ -914,7 +911,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     ws.binding = binding  # an ``assume`` of the bound number records the parameter it fills (KTD9)
     items: list = [{"role": "user", "content": _context_message(
         inp, request, binding, ws.unit_focus["handle"] if ws.unit_focus else None,
-        _candidates_text(ctx, ws, request, inp.question, shown, more), turn_intent, ws.time)}]
+        _candidates_text(ctx, ws, request, inp.question, ranked), turn_intent, ws.time)}]
     if request is None and first_turn:
         # a first turn: the request is analysed beside the first step (no added latency), within the reading time
         start_analysis()
@@ -1181,7 +1178,8 @@ def _settle_unit(ctx: TenantContext, ws: T.Workspace, request: resolve.Request) 
         if live.status == "moved":
             request.located_unit, decisions["unit"] = live.unit, "re-resolved"
         u = request.located_unit
-        handle = T.unit_handle_of(ws, u["document_id"], live.version_id, u.get("reading_id"), u["unit_no"])
+        handle = T.unit_handle_of(ws, u["document_id"], live.version_id, u.get("reading_id"), u["unit_no"],
+                                  u.get("units_tag"))
         ws.unit_focus = {"handle": handle, "document_id": str(u["document_id"]), "display": _focus_text(u)}
         ws.offered_units.add(handle)  # the model may name it and declare it
         return
@@ -1211,13 +1209,13 @@ def _candidates_decision(cards: list[entities.UnitCard], more: int) -> str:
 
 
 def _candidates_text(ctx: TenantContext, ws: T.Workspace, request: resolve.Request | None, question: str,
-                     shown: list[entities.UnitCard], more: int) -> str:
+                     ranked: entities.Ranked | None) -> str:
     """The turn's candidates block (``resolve.candidates_block``), with the handle (U#) of each card registered in the
     workspace, so the model can pass it to ``search``, ``outline`` and ``read`` and the server can check what it declares.
-    A first message and a new subject bring the ranked ``shown`` cards; a follow-up that keeps its unit gets that unit's
+    A first message and a new subject bring the ``ranked`` cards; a follow-up that keeps its unit gets that unit's
     card alone; a lookup that found several (or a unit gone) gets the file's candidates. A professional or set request
     carries none. Rebuilt from live permissions every turn (``entities.cards_of_units`` reads under the user's)."""
-    cards = list(shown)
+    cards, more = (list(ranked.cards), ranked.more) if ranked is not None else ([], 0)
     if request is not None and not request.intent.professional and request.scope != "set":
         items = []
         if request.located_unit:
@@ -1238,22 +1236,12 @@ def _candidates_text(ctx: TenantContext, ws: T.Workspace, request: resolve.Reque
 
     def handle_of(card: entities.UnitCard) -> str:
         row = card.row
-        handle = T.unit_handle_of(ws, row["document_id"], row["version_id"], row["reading_id"], row["unit_no"])
+        handle = T.unit_handle_of(ws, row["document_id"], row["version_id"], row["reading_id"], row["unit_no"],
+                                  row.get("units_tag"))
         ws.offered_units.add(handle)
         return handle
 
     return resolve.candidates_block(cards, handle_of, more)
-
-
-def _read_unit_handles(ws: T.Workspace) -> set[str]:
-    """The handles (U#) of the units the turn read: the unit of any passage its tools returned, and any unit a tool worked
-    inside through a handle (``Workspace.unit_scopes``). A unit only listed (an outline, a find) is not read."""
-    out = {h for s in ws.sources.values() if not s.is_listing and (h := s.tags.get("unit"))}
-    for scope in ws.unit_scopes.values():
-        h = ws.handle_ids.get(("U", (scope["version_id"], scope["reading_id"] or None, scope["unit_no"])))
-        if h:
-            out.add(h)
-    return out
 
 
 def _declare_units(ctx: TenantContext, ws: T.Workspace, answer: FinalAnswer) -> None:
@@ -1264,18 +1252,19 @@ def _declare_units(ctx: TenantContext, ws: T.Workspace, answer: FinalAnswer) -> 
     focus (``unit_focus``) and the unit the next turn keeps (``located_unit``); several are a comparison and set no single
     unit. An answer that declares none keeps what an earlier answer of the turn declared (a repair round that forgot it)."""
     handles = list(dict.fromkeys(h.strip() for h in (answer.focus.units if answer.focus is not None else []) if h and h.strip()))
-    allowed = ws.offered_units | _read_unit_handles(ws)
+    if not handles:
+        return
+    allowed = ws.offered_units | ws.listed_units | T.read_unit_handles(ws)
+    named = [(h, data) for h in handles if h in allowed and (data := ws.handles.get(h)) and data.get("kind") == "U"]
+    anchors = entities.anchors_of(ctx, [(d["document_id"], d["reading_id"], d["unit_no"]) for _, d in named])
     found: list[tuple[str, dict, dict]] = []  # (handle, the handle's data, the unit's anchor)
-    for h in handles:
-        data = ws.handles.get(h)
-        if h not in allowed or not data or data.get("kind") != "U":
-            continue
-        anchor = entities.anchor_of(ctx, data["document_id"], data["reading_id"], data["unit_no"])
+    for (h, data), anchor in zip(named, anchors, strict=True):
         if anchor is not None and not any(entities.same_unit(anchor, x) for _, _, x in found):
             found.append((h, data, anchor))
     if not found:
         return
     ws.declared_units = [a for _, _, a in found]
+    ws.declared_handles = {h: a for h, _, a in found}
     if answer.status != "clarification" and len(found) == 1:
         handle, data, a = found[0]
         ws.unit_focus = {"handle": handle, "document_id": str(a["document_id"]), "display": entities.focus_text(a)}

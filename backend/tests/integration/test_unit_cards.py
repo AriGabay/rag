@@ -225,6 +225,20 @@ def test_the_readers_return_done_subject_fields_by_unit_range(office):
     assert every[(version, *first)].state == "done" and every[(version, *appendix)].state == "empty"
 
 
+def test_subject_fields_for_versions_gives_done_cards_with_fields_by_version_and_range(office):
+    cards.generate(office.system, office.ver, scripted())
+    with tenant_tx(office.system) as conn:
+        got = cards.subject_fields_for_versions(conn, [office.ver, office.ver], reading_id=READING)
+        current = cards.subject_fields_for_versions(conn, [office.ver])
+        single = cards.subject_fields(conn, office.ver, READING)
+        none = cards.subject_fields_for_versions(conn, [])
+    first, second, appendix = unit_ranges(office)
+    assert set(got) == {str(office.ver)}                  # keyed by the version id as a string
+    assert set(got[str(office.ver)]) == {first, second}   # the empty appendix card and any card not done are left out
+    assert got == current == {str(office.ver): single} and none == {}
+    assert [f["field"] for f in got[str(office.ver)][first]] == ["name", "address", "block_parcel", "property_type"]
+
+
 # --- who enqueues, and when -------------------------------------------------------------------------------------------
 
 

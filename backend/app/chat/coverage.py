@@ -571,18 +571,15 @@ def _offered_only(ws: Workspace) -> set[str]:
     round 15 U6): not read (a passage of theirs returned), not worked in through a handle (``unit_scopes``), not the
     conversation's unit, not declared in the answer. A candidate shown and ignored is no unit the turn was in, nor a file it
     knew to hold several units (round 15 U7)."""
+    from app.chat.tools import read_unit_handles
+
     offered = set(getattr(ws, "offered_units", ()) or ())
     if not offered:
         return set()
-    used = {h for s in ws.sources.values() if not s.is_listing and (h := s.tags.get("unit"))}
-    used |= {h for scope in ws.unit_scopes.values()
-             if (h := ws.handle_ids.get(("U", (scope["version_id"], scope["reading_id"] or None, scope["unit_no"]))))}
+    used = read_unit_handles(ws)
     if ws.unit_focus and ws.unit_focus.get("handle"):
         used.add(ws.unit_focus["handle"])
-    for a in getattr(ws, "declared_units", ()) or ():
-        used |= {h for h, d in ws.handles.items() if d["kind"] == "U" and str(d["document_id"]) == str(a["document_id"])
-                 and (d.get("reading_id") or None) == (a.get("reading_id") or None) and d["unit_no"] == a["unit_no"]}
-    return offered - used
+    return offered - used - set(getattr(ws, "declared_handles", ()) or ())
 
 
 def unit_signal(ws: Workspace) -> dict:
@@ -611,13 +608,10 @@ def unit_signal(ws: Workspace) -> dict:
         found[key] = _unit_text(ws, key, focus.get("display") or "")
     for key in ws.unit_scopes:
         found.setdefault(key, _unit_text(ws, key))
-    for a in getattr(ws, "declared_units", ()) or ():  # the answer's own declaration, validated against what was offered or read
+    for h, a in (getattr(ws, "declared_handles", None) or {}).items():  # the answer's own declaration, validated against what was offered or read
         multi.add(str(a["document_id"]))
-        for d in handles.values():
-            if (str(d["document_id"]) == str(a["document_id"]) and (d.get("reading_id") or None) == (a.get("reading_id") or None)
-                    and d["unit_no"] == a["unit_no"]):
-                key = _unit_key(d)
-                found.setdefault(key, _unit_text(ws, key, entities.focus_text(a)))
+        key = _unit_key(ws.handles[h])
+        found.setdefault(key, _unit_text(ws, key, entities.focus_text(a)))
     for cx in ws.contexts.values():
         if cx.multi:
             named = [n for n in asked_contexts(ws, cx) if cx.is_subject(n)]

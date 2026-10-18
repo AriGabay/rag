@@ -1369,6 +1369,7 @@ def test_an_offered_unit_the_turn_read_scoped_or_declared_is_counted():
         else:
             ws.declared_units = [{"document_id": str(source.document_id), "reading_id": "r1", "unit_no": 2,
                                   "units_tag": None, "display": "שומה ב"}]
+            ws.declared_handles = {handles[2]: ws.declared_units[0]}
         signal = coverage.unit_signal(ws)
         assert str(source.document_id) in signal["multi"], how
         if how != "read":  # reading a passage does not locate the property; naming it or declaring it does
@@ -1376,13 +1377,50 @@ def test_an_offered_unit_the_turn_read_scoped_or_declared_is_counted():
         assert T.unit_handle_of(ws, source.document_id, source.version_id, "r1", 2) == handles[2]
 
 
+def test_a_unit_handle_names_the_unit_by_the_id_of_the_contexts_it_was_read_in_so_a_tagged_derivation_is_located():
+    """Round 15 review: a handle (``tools.unit_handle``) carries the derivation tag of the contexts it was issued from, so the
+    unit it focuses lies in the same unit as the source (``Source.unit["id"]`` is ``Contexts.key``, ``@v5``): the signal and
+    ``_inside_unit`` agree. A handle without the tag named the ``units-v4`` unit and located nothing."""
+    from app.chat import tools as T
+    from app.chat import units as unit_store
+    from app.chat.contexts import Contexts, Identity, Segment
+    from app.chat.tools import unit_info
+
+    tag = unit_store.current_tag()
+    assert tag, "the current derivation is tagged"
+    ws = _ws()
+    source = ws.sources["S1"]
+    cx = Contexts(str(source.version_id), tuple(
+        Segment(n, Identity(), n * 10, n * 10 + 9, n * 10, None, first, last, "appraisal", "certain", title)
+        for n, (title, first, last) in UNIT_TITLES.items()), "r1", tag)
+    ws.contexts[str(source.version_id)] = cx
+    source.contexts, source.unit = [2], unit_info(cx, 2)
+    assert source.unit["id"].endswith(f"@{tag}")
+    handle = T.unit_handle(ws, cx, 2, source.document_id)
+    assert ws.handles[handle]["units_tag"] == tag
+    assert coverage._unit_key(ws.handles[handle]) == cx.key(2)
+    assert T.unit_handle_of(ws, source.document_id, source.version_id, "r1", 2) == handle  # one handle for the unit
+    ws.unit_focus = {"handle": handle, "document_id": str(source.document_id), "display": "שומה ב"}
+    signal = coverage.unit_signal(ws)
+    assert list(signal["located"]) == [source.unit["id"]], signal
+    assert coverage._inside_unit(ws, "S1", signal)
+    # a handle issued without the tag takes it from a later caller that knows it; the identity stays the unit's
+    ws = _ws()
+    source = ws.sources["S1"]
+    bare = T.unit_handle_of(ws, source.document_id, source.version_id, "r1", 1)
+    assert ws.handles[bare]["units_tag"] is None
+    assert T.unit_handle_of(ws, source.document_id, source.version_id, "r1", 1, tag) == bare
+    assert ws.handles[bare]["units_tag"] == tag
+
+
 def test_a_comparison_of_declared_units_locates_each_of_them():
     ws = _ws()
     _in_units(ws)
-    _offer(ws, 1, 2)
+    handles = _offer(ws, 1, 2)
     source = ws.sources["S1"]
     ws.declared_units = [{"document_id": str(source.document_id), "reading_id": "r1", "unit_no": n, "units_tag": None,
                           "display": UNIT_TITLES[n][0]} for n in (1, 2)]
+    ws.declared_handles = {handles[a["unit_no"]]: a for a in ws.declared_units}
     cx = ws.contexts[str(source.version_id)]
     assert set(coverage.unit_signal(ws)["located"]) == {cx.key(1), cx.key(2)}
 

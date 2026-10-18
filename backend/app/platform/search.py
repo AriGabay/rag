@@ -674,6 +674,7 @@ def units_matching(conn: Connection, query: str) -> UnitMatches:
         counts.append(f"count(c.id) FILTER (WHERE c.tsv @@ ({q})) AS h{i}")
     term_sets = [set(t) for t in terms]
     out = UnitMatches()
+    tag = unit_store.current_tag()
     passing = []
     for r in conn.execute(text(_FILE_SQL.format(counts=", ".join(counts))), params).all():
         title = _title_words(r.title)
@@ -711,17 +712,12 @@ def units_matching(conn: Connection, query: str) -> UnitMatches:
             if len(by_name | prose | tabular) < len(terms):
                 continue
             matched = True
-            unit = {"document_id": r.id, "version_id": r.version_id, "reading_id": r.reading_id, "unit_no": u.unit_no,
-                    "units_tag": unit_store.current_tag(),
-                    "unit_id": unit_contexts.unit_key(r.version_id, r.reading_id, u.unit_no, unit_store.current_tag()),
-                    "kind": u.kind, "title": u.title,
-                    "aliases": list(u.aliases), "identifiers": list((u.identifiers or {}).get("shown") or ()),
-                    "page_first": u.page_first, "page_last": u.page_last, "certainty": u.certainty,
-                    "block_first": u.block_first, "block_last": u.block_last, "file_title": r.title,
-                    "matched_by": ("alias" if len(by_name) == len(terms) and named else
-                                   "file_title" if len(by_name) == len(terms) else "passage"),
-                    "name_terms": len(named), "name_extra": extra, "hits": len(prose) + len(tabular),
-                    "in_name": [terms[i][0] for i in sorted(named | in_file_title)]}
+            unit = unit_contexts.unit_row(
+                u, r.id, r.version_id, r.reading_id, tag, file_title=r.title,
+                matched_by=("alias" if len(by_name) == len(terms) and named else
+                            "file_title" if len(by_name) == len(terms) else "passage"),
+                name_terms=len(named), name_extra=extra, hits=len(prose) + len(tabular),
+                in_name=[terms[i][0] for i in sorted(named | in_file_title)])
             # a unit is the asked subject when its name and its prose hold every term; one that needs cells of its
             # comparison tables to hold them has the property as a comparable, not as its own subject
             comparable = u.kind in unit_contexts.NON_SUBJECT_KINDS or len(by_name | prose) < len(terms)

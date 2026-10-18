@@ -264,8 +264,8 @@ def enqueue_unit_cards(conn: Connection, version_id: UUID | str, card_version: s
     """Queue the identity cards of one version's units (round 15 U5, KTD5): one job per version and card version, so a
     queued or running job is left alone and a finished or failed one is queued again (the backfill's second run, a
     reading that changed). The caller checked the office's cloud consent and that the version has more than one unit."""
-    return _requeue(conn, UUID(str(version_id)), "unit_cards", unit_cards_job_key(UUID(str(version_id)), card_version),
-                    {"card_version": card_version})
+    vid = UUID(str(version_id))
+    return _requeue(conn, vid, "unit_cards", unit_cards_job_key(vid, card_version), {"card_version": card_version})
 
 
 def positions_job_key(version_id: UUID) -> str:

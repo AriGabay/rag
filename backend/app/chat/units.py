@@ -966,9 +966,8 @@ def stored_many(conn: Connection, version_ids: Sequence[UUID | str]) -> dict[UUI
             " u.block_first, u.block_last, u.certainty, u.evidence FROM document_units u"
             " JOIN document_versions v ON v.id = u.version_id WHERE u.version_id = ANY(:v)"
             " AND u.reading_id = COALESCE(v.ingestion->>'reading_id', :none)"
-            " AND u.derivation_key = :uv || '|' || COALESCE(NULLIF(v.ingestion->>'positions', ''), '-')"
-            " ORDER BY u.version_id, u.unit_no"),
-            {"v": [UUID(str(v)) for v in version_ids], "none": NO_READING, "uv": UNITS_VERSION}):
+            f" AND {current_key_sql()} ORDER BY u.version_id, u.unit_no"),
+            {"v": [UUID(str(v)) for v in version_ids], "none": NO_READING}):
         out[r.version_id].append(_unit_of(r))
     return {v: tuple(units) for v, units in out.items()}
 

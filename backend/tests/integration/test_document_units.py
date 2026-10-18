@@ -305,6 +305,38 @@ def test_units_of_another_derivation_key_are_derived_again_on_first_use_beside_t
     assert len(current(office, ver)) == 2
 
 
+def test_a_version_holding_only_an_earlier_derivation_gets_the_current_units_before_the_candidates_are_ranked(office):
+    """Round 15 review (KTD6): the raw readers of the units (the candidates, the first message, the unit names) see the
+    current derivation only, and the current rows are built lazily; a file processed before the derivation changed would
+    have no candidates until something else ensured it. ``entities.ensure_current_units`` builds them first, beside the
+    old rows, which stay."""
+    _, ver = ingest(office, R7B)
+    titles = [r.title for r in current(office, ver) if r.title]
+    assert len(titles) == 2, titles
+    with tenant_tx(office.system) as conn:   # the rows are those of an earlier derivation (units-v4), none of the current one
+        conn.execute(text("UPDATE document_units SET derivation_key = 'units-v4|-', units_version = 'units-v4'"
+                          " WHERE version_id = :v"), {"v": ver})
+    units._MEMO.clear()
+    contexts._CACHE.clear()
+    assert current(office, ver) == [] and len(stored(office, ver)) == 2
+    question = f"מה שווי הנכס ב{titles[0]}?"
+    with tenant_tx(office.ctx()) as conn:
+        assert entities.ensure_current_units(conn) is None
+    assert len(current(office, ver)) == 2 and len(stored(office, ver)) == 4   # added beside the old rows, nothing deleted
+    with tenant_tx(office.ctx()) as conn:   # nothing is stale now: the check changes nothing
+        entities.ensure_current_units(conn)
+    assert len(stored(office, ver)) == 4
+    # the same, from the readers themselves: back to a version holding only the earlier derivation
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("DELETE FROM document_units WHERE version_id = :v AND units_version <> 'units-v4'"), {"v": ver})
+    units._MEMO.clear()
+    contexts._CACHE.clear()
+    assert current(office, ver) == []
+    ranked = entities.rank_candidates(office.ctx(), question)
+    assert ranked is not None and ranked.cards and titles[0] in {c.row["title"] for c in ranked.cards}
+    assert len(current(office, ver)) == 2 and len(stored(office, ver)) == 4
+
+
 def test_replace_rewrites_only_the_rows_of_its_own_key(office):
     _, ver = ingest(office, R7B)
     with tenant_tx(office.system) as conn:   # the old key's rows: a copy of the current ones under another key
