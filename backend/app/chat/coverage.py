@@ -835,12 +835,12 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
                                    .get("title"))
         # a partly given leaf is stated only for the part the judge named missing (validated against the request,
         # ``verify.valid_missing``): a conditional requirement (R21) or one that is no datum of the documents never is
-        if o["status"] != "partial" or o["conditional"] or o["kind"] not in ("information", "calculation"):
+        datum = not o["conditional"] and o["kind"] in ("information", "calculation")
+        if o["status"] != "partial" or not datum:
             o["missing_part"] = ""
         # a part a read passage states and the answer omits is stated too (round 16 U2, R6), never a conditional component
         o["stated"] = (o["status"] != "partial" or o["kind"] == "instruction" or bool(o["missing_part"])
-                       or (o["variant"] == "read_not_used" and not o["conditional"]
-                           and o["kind"] in ("information", "calculation")))
+                       or (o["variant"] == "read_not_used" and datum))
         o["gap"] = gap_sentence(why["reason"], o["variant"], [gap_label(o)], o["place"], o["document"], o["detail"])
     return outcomes
 

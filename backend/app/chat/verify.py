@@ -221,6 +221,9 @@ from app.providers.llm import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from app.chat.calc import Computation
     from app.chat.engine import FinalAnswer
     from app.chat.tools import Source, Workspace
 
@@ -880,19 +883,28 @@ def _covers_any(covers: list[set[str]], claim: str, heading: str, numeric: bool)
     return any(covers_it(c) for c in covers)
 
 
+def _word_forms(text: str) -> set[str]:
+    """The comparable forms (``_missing_forms``) of every word of ``text``."""
+    return {f for w in _MISSING_TOKEN.findall(text) for f in _missing_forms(w)}
+
+
 def _cover_forms(text: str) -> tuple[list[Unit], dict[int, str], list[set[str]]]:
     """The units of ``text``, the heading chain above each and the comparable forms of each unit's words with its
     chain's (``_covers_any``'s ``covers``)."""
     units = split_units(text)
     chains = _headings_above(text, units)
-    return units, chains, [{f for w in _MISSING_TOKEN.findall(f"{u.text}\n{chains[u.index]}") for f in _missing_forms(w)}
-                           for u in units]
+    return units, chains, [_word_forms(f"{u.text}\n{chains[u.index]}") for u in units]
 
 
-def _word_share(claim: str, heading: str, forms: set[str]) -> float:
-    """The share of the content words (no numbers; ``claim`` and its heading chain) whose comparable forms are among
-    ``forms``; 1.0 when it has none."""
-    words = [_missing_forms(w) for w in _missing_words(f"{claim}\n{heading}") if not w[0].isdigit()]
+def _content_forms(claim: str, heading: str) -> list[set[str]]:
+    """The comparable forms of each content word (no numbers) of ``claim`` and its heading chain: what ``_word_share``
+    compares, computed once per claim."""
+    return [_missing_forms(w) for w in _missing_words(f"{claim}\n{heading}") if not w[0].isdigit()]
+
+
+def _word_share(words: list[set[str]], forms: set[str]) -> float:
+    """The share of the content words (``_content_forms``) whose comparable forms are among ``forms``; 1.0 when it has
+    none."""
     return sum(bool(w & forms) for w in words) / len(words) if words else 1.0
 
 
@@ -908,9 +920,10 @@ def _restored_sentence(u: Unit, r: ClaimRecord) -> str:
     claim is the unit's text as written; a table row is its cells (a lone row has no header to stand under)."""
     raw = u.raw
     if r.whole_unit or not r.exact:
-        span, cites = raw, ""
+        whole, span, cites = True, raw, ""
     else:
         a, b = r.start - u.start, r.end - u.start
+        whole = a == 0 and b >= len(raw)  # a span that is the whole text is the text itself
         span, tail = raw[a:b], _LEADING_IDS.match(raw[b:])
         cites = " ".join(m.group(0) for m in _IDS.finditer(tail.group(0))) if tail else ""
         if not cites:
@@ -919,7 +932,7 @@ def _restored_sentence(u: Unit, r: ClaimRecord) -> str:
             cites = ""
     if u.table_span is not None:
         cells = [c.strip() for c in raw.strip().strip("|").split("|")]
-        if span is raw:
+        if whole:
             span = " · ".join(c for c in cells if c)
         elif cells and cells[0] and cells[0] not in span:
             span = f"{cells[0]}: {span}"
@@ -1625,15 +1638,17 @@ class VerifyReport:
         supported = [(units[idx], claim) for idx, recs in self.claims.items() if idx in units
                      for r in recs if (claim := _supported_claim(r))]
         known = set().union(*(numbers_in(c) for _, c in supported)) if supported else set()
-        forms = [{f for w in _MISSING_TOKEN.findall(f"{c}\n{u.heading}") for f in _missing_forms(w)} for u, c in supported]
+        forms = [_word_forms(f"{c}\n{u.heading}") for u, c in supported]
         for unit in split_units(text):
             if not unit.ids or states_absence(unit.text):
                 continue
             numbers = numbers_in(unit.text)
             if numbers and not numbers <= known:
                 return True
-            if _missing_words(unit.text) and not any(_word_share(unit.text, "", f) >= ADDED_WORD_SHARE for f in forms):
-                return True
+            if _missing_words(unit.text):
+                words = _content_forms(unit.text, "")
+                if not any(_word_share(words, f) >= ADDED_WORD_SHARE for f in forms):
+                    return True
         return False
 
     def restore_lost(self, text: str, lost: list[tuple[Unit, ClaimRecord]]) -> tuple[str, list[tuple[Unit, ClaimRecord]]]:
@@ -1663,9 +1678,10 @@ class VerifyReport:
 
         def anchor(u: Unit, r: ClaimRecord) -> Unit | None:
             claim = _supported_claim(r)
-            best = max(((_word_share(claim, u.heading, covers[j]), -j) for j in range(len(new_units))), default=(0.0, 0))
-            if best[0] >= ANCHOR_WORD_SHARE:
-                return new_units[-best[1]]
+            words = _content_forms(claim, u.heading)
+            best = max(range(len(new_units)), key=lambda j: _word_share(words, covers[j]), default=None)
+            if best is not None and _word_share(words, covers[best]) >= ANCHOR_WORD_SHARE:
+                return new_units[best]
             nearby = [(u, y) for y in self.claims.get(u.index, []) if y is not r]
             for d in (-1, 1, -2, 2):
                 nearby += [(by_index[u.index + d], y) for y in self.claims.get(u.index + d, [])
@@ -4357,8 +4373,9 @@ def _specific(written: str) -> bool:
     return len(digits) >= SPECIFIC_DIGITS
 
 
-def _linked_conditional_results(u: Unit, ws: Workspace) -> list[str]:
-    """The C# ids of the conditional calculations (``Computation.conditional``) the unit does not cite whose result it shows
+def _linked_conditional_results(u: Unit, conditional: Sequence[tuple[str, Computation]]) -> list[str]:
+    """The C# ids of the conditional calculations (``conditional``: the (C#, calculation) pairs of the turn's calculations
+    whose ``Computation.conditional`` holds, in the turn's order) the unit does not cite whose result it shows
     (``_shows``: exactly, approximately, rounded at its written precision or with a scale word) in a number outside any date
     that it does not present as written by a document or said by a party (``_stated_as_written``), when the number is tied
     to the calculation: the unit cites a source or an input of it (``Computation.sources``, ``leaves``) — the sentence is
@@ -4375,8 +4392,8 @@ def _linked_conditional_results(u: Unit, ws: Workspace) -> list[str]:
         if any(a <= n.start < b for a, b in dates) or _stated_as_written(u.text, n.start):
             continue
         specific = _specific(n.written)
-        for cid, c in ws.computations.items():
-            if (cid in cited or cid in out or not c.conditional
+        for cid, c in conditional:
+            if (cid in cited or cid in out
                     or not (specific or cited & (set(c.sources) | set(c.leaves)))
                     or not _shows(c, n.written, n.percent, n.scale, steps=False)):
                 continue
@@ -4410,12 +4427,17 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
     question_numbers = numbers_in(question)
     bound: dict[int, list[str]] = {}
     stated_by: dict[str, set[str]] = {}  # the numbers each cited id states, read once for all units
+    conditional: list[tuple[str, Computation]] = []  # the conditional calculations; read again when a unit registers one
+    known_computations = -1
     for u in units:
         if _unknown_ids(u, ws):
             continue
         loose = set(_unstated(u, ws, question_numbers, set(), strict=True, stated_by=stated_by, percent_of_fraction=False,
                               origins=False))
-        linked = _linked_conditional_results(u, ws)
+        if len(ws.computations) != known_computations:  # calculations are only ever added (a derived result, below)
+            known_computations = len(ws.computations)
+            conditional = [(cid, c) for cid, c in ws.computations.items() if c.conditional]
+        linked = _linked_conditional_results(u, conditional) if conditional else []
         if not loose and not linked:
             continue
         derived = [cid for cid in derive_numbers(u, ws, loose) if cid not in u.ids] if u.ids and loose else []
@@ -4627,8 +4649,10 @@ def read_source_ids(ws: Workspace) -> list[str]:
     """The S# of the sources the turn read, in the order they were made: the sections, tables and pages it opened
     (``Workspace.activity`` openings) that hold text. A source the turn only searched, a listing and a measurement are not
     read (round 16 U1, KTD1: opening a passage is how a part of the answer's source reaches the judge)."""
-    ids = {o["sid"] for a in ws.activity.values() for o in a.get("openings") or []
-           if o.get("sid") in ws.sources and ws.sources[o["sid"]].kind != "listing" and (ws.sources[o["sid"]].text or "").strip()}
+    from app.chat.coverage import _openings
+
+    ids = [sid for sid in _openings(ws)
+           if sid in ws.sources and ws.sources[sid].kind != "listing" and (ws.sources[sid].text or "").strip()]
     return sorted(ids, key=lambda sid: int(sid[1:]) if sid[1:].isdigit() else 0)
 
 
@@ -4661,7 +4685,9 @@ def _read_passages(coverage: _Coverage, ws: Workspace, shown: dict[str, tuple[st
     asked = _asked_unit_ids(ws, coverage.answer_ids | set(shown))
     professional = getattr(ws, "intent", None) in (intent_mod.PROFESSIONAL, intent_mod.MIXED)
     whole = {ws.sources[i].text for i, (_, excerpt) in shown.items() if not excerpt and i in ws.sources}
-    entries: list[tuple[str, str, str, tuple[Segment, ...] | str, bool]] = []  # (id, extra attributes, head, text, continues)
+    # (id, extra attributes, head, text, continues): ``text`` is the source's whole text (str) for a source the call does not
+    # cite, and the segments of it the call's excerpt does not show (tuple of ``Segment``, ``continues``) for one it cites
+    entries: list[tuple[str, str, str, tuple[Segment, ...] | str, bool]] = []
     seen: set[tuple[str, str]] = set()
     for sid in read_source_ids(ws):
         src = ws.sources[sid]
@@ -6419,6 +6445,14 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
     asked = _asked_unit_ids(ws, {i for u in units for i in u.ids})
     documents = _answer_documents(ws, units)
     components = {r["id"]: r["text"] for r in report.requirements}
+    flat_texts: dict[str, str] = {}
+
+    def flat_text(sid: str, src: Source) -> str:
+        """The source's text in the spelling of the verbatim test, flattened once per source."""
+        if sid not in flat_texts:
+            flat_texts[sid] = _flat_quote(src.text)
+        return flat_texts[sid]
+
     out: dict[str, list[dict]] = {}
     for cid, vs in votes.items():
         seen: set[tuple[str, str]] = set()
@@ -6430,8 +6464,9 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
             if (sid, flat) in seen or src is None or sid not in readable or len(flat) < SUPPORT_QUOTE_MIN:
                 continue
             seen.add((sid, flat))
-            if (flat in _flat_quote(src.text) and str(src.document_id) in documents
-                    and _support_in_asked_units(ws, src, asked) and not _in_answer(quote, units, components.get(cid, ""))):
+            # every condition holds; the cheap ones are tested first and the substring test, which reads the whole source, last
+            if (str(src.document_id) in documents and _support_in_asked_units(ws, src, asked)
+                    and not _in_answer(quote, units, components.get(cid, "")) and flat in flat_text(sid, src)):
                 kept.append({"id": sid, "quote": quote})
         if kept:
             out[cid] = kept[:SUPPORT_PER_REQUIREMENT]
@@ -6460,16 +6495,17 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
     report.text_support = support = validated_support(report, ws, failed)
     for r in report.requirements:
         for v in report.requirement_votes.get(r["id"], []):
-            data = related_evidence(ws, {"related": v.related}, turn)["data"] or [x["id"] for x in support.get(r["id"], [])]
-            data = list(dict.fromkeys(data))
-            if not data or v.status not in ("missing", "partial"):
+            evidence = related_evidence(ws, {"related": v.related}, turn)["data"] or [
+                x["id"] for x in support.get(r["id"], [])]
+            evidence = list(dict.fromkeys(evidence))  # the data ids, else the ids of the passages that support the part
+            if not evidence or v.status not in ("missing", "partial"):
                 continue
             for i in dict.fromkeys([*v.units, *v.absent]):
                 if i in units and i not in failed and NOT_FOUND.search(units[i].text):
                     # false, and the server states the component itself: removed as an absence it replaces (the
                     # repair round is asked to use the data by the component's own problem below)
                     failed.add(i)
-                    report.problems.append(Problem(units[i], REQ_FOUND_NOT_ABSENT.format(ids=", ".join(data)),
+                    report.problems.append(Problem(units[i], REQ_FOUND_NOT_ABSENT.format(ids=", ".join(evidence)),
                                                    kind="absence", check="absence", component=r["id"]))
     for o in report.requirement_outcomes():
         if o["children"]:

@@ -172,13 +172,13 @@ TOC_WORDS = ("תוכן", "תוכן עניינים", "תוכן העניינים",
 BOILERPLATE_ANYWHERE = ("pdf",)
 BOILERPLATE_ALONE = frozenset({"מסמך"})
 LETTER_RUN_MIN = 3  # single-letter tokens in a row that make a line spaced letters (all tokens, from two)
-# the opening of a report (round 15 U4, KTD4): the word that introduces its subject line ("הנדון: ..."), the word that
-# opens its addressee line, and the month names of a dated line; a letter opens with them wherever the appraiser's
-# letterhead puts them
 # the words of a title that name a report type (a cover's title: "VALUATION REPORT", "דוח הערכת שווי"); any language the
 # office writes in may be added here, it is the one place that names them
 REPORT_TYPE_WORDS = ("הערכת שווי", "שומה", "שומת", "חוות דעת", "דוח", "דו״ח", "valuation", "appraisal", "assessment",
                      "report")
+# the opening of a report (round 15 U4, KTD4): the word that introduces its subject line ("הנדון: ..."), the word that
+# opens its addressee line, and the month names of a dated line; a letter opens with them wherever the appraiser's
+# letterhead puts them
 SUBJECT_WORDS = ("הנדון", "הנידון", "בנדון", "בעניין", "בענין")
 ADDRESSEE_WORDS = ("לכבוד",)
 ADDRESSEE_COLON_WORDS = ("אל",)  # "אל: X" is an addressee line, "אל" inside a sentence is not
@@ -230,8 +230,9 @@ _LABEL_NUMBER = re.compile(r"(\d{1,4})\s*$")
 # a page-number line: a bare number ("12", "- 12 -"), or the page word and its number at the END of the line, after
 # anything (a footer may open with a file path whose digits are not the page): "עמוד 3", "עמוד 3 מתוך 10", "עמ׳ 3",
 # "Page 3", or the number before the word alone on the line ("3 עמוד")
-_PAGE_WORD_THEN_NUMBER = re.compile(
-    r"(?:עמוד|עמ['׳’]?|page)\s*[:.]?\s*(\d{1,4})(?:\s*(?:מתוך|מ-|of|/)\s*\d{1,4})?[\s.\-–—]*$", re.IGNORECASE)
+_PAGE_WORD = r"(?:עמוד|עמ['׳’]?|page)\s*[:.]?\s*"  # the page word and what may stand between it and its number
+_PAGE_OF_TOTAL = r"(?:\s*(?:מתוך|מ-|of|/)\s*\d{1,4})?"  # "מתוך 10": the page count that may follow the number
+_PAGE_WORD_THEN_NUMBER = re.compile(_PAGE_WORD + r"(\d{1,4})" + _PAGE_OF_TOTAL + r"[\s.\-–—]*$", re.IGNORECASE)
 _NUMBER_THEN_PAGE_WORD = re.compile(r"^[\s\-–—]*(\d{1,4})\s*(?:עמוד|עמ['׳’]?|page)[\s.\-–—]*$", re.IGNORECASE)
 _BARE_NUMBER = re.compile(r"^[\s\-–—]*(\d{1,4})[\s\-–—]*$")
 _NAME_CUT = re.compile(r"[,:;()|—–]|\s-\s")
@@ -313,6 +314,11 @@ def _title_shaped(t: str) -> bool:
 def _is_text(r) -> bool:
     return r.kind in (*_TEXT_KINDS, "heading") and getattr(r, "table_index", None) is None and bool(_text(r)) and (
         (getattr(r, "status", None) or "read") in _READ)
+
+
+def _readable_text_block(r) -> bool:
+    """Whether a block is no picture, was read and holds text (the blocks a cover and a page's opening text are made of)."""
+    return r.kind != "image" and (getattr(r, "status", None) or "read") in _READ and bool(_text(r))
 
 
 def _picture_title(r, furniture_images: frozenset) -> bool:
@@ -618,7 +624,7 @@ def _opening(c: _Ctx, start: int, page: int) -> dict[str, dict]:
 # ignored, so the line is the same on every page of a run; a bare page number, a date and the page-number tail of a
 # footer are no running line.
 
-_PAGE_TAIL = re.compile(r"(?:עמוד|עמ['׳’]?|page)\s*[:.]?\s*\d{1,4}(?:\s*(?:מתוך|מ-|of|/)\s*\d{1,4})?", re.IGNORECASE)
+_PAGE_TAIL = re.compile(_PAGE_WORD + r"\d{1,4}" + _PAGE_OF_TOTAL, re.IGNORECASE)
 _SEGMENT_SPLIT = re.compile(r"\s[-–—]\s|[–—|•·:;,/()\[\]]")
 _DIGITS = re.compile(r"\d+")
 _PAGE_WORDS = frozenset({"עמוד", "עמ", "page", "מתוך", "of"})
@@ -730,8 +736,7 @@ def _cover_title(c: _Ctx, page: int) -> tuple[int, str] | None:
     cover: None."""
     if c.body is None:
         return None
-    blocks = [r for r in c.by_page.get(page, ()) if r.kind != "image" and (getattr(r, "status", None) or "read") in _READ
-              and _text(r)]
+    blocks = [r for r in c.by_page.get(page, ()) if _readable_text_block(r)]
     if not blocks or len(blocks) > COVER_BLOCKS_MAX or any(r.kind == "table" or getattr(r, "table_index", None) is not None
                                                           for r in blocks):
         return None
@@ -811,14 +816,10 @@ def _cuts(c: _Ctx, pages: Sequence, version_id: str) -> list[_Cut]:
     rows = c.rows
     first_block = rows[0].block_index
     position = {r.block_index: i for i, r in enumerate(rows)}
-    lead_at: dict[int, int] = {}  # page -> position of its first block
-    for i, r in enumerate(rows):
-        if r.page is not None:
-            lead_at.setdefault(r.page, i)
     numbers = page_numbers(pages, rows)
     restart_at: dict[int, dict] = {}  # page that has blocks -> the pages that show the restart
     for page, detail in label_restarts(numbers).items():
-        resolved = next((q for q in sorted(lead_at) if q >= page), None)
+        resolved = next((q for q in sorted(c.lead_at) if q >= page), None)
         if resolved is not None:
             restart_at.setdefault(resolved, detail)
     toc = _toc_entries(rows)
@@ -831,8 +832,8 @@ def _cuts(c: _Ctx, pages: Sequence, version_id: str) -> list[_Cut]:
             cut.detail[signal] = detail
 
     ref = None  # the file's first title block (its lead line)
-    for page in sorted(lead_at):
-        pos = lead_at[page]
+    for page in sorted(c.lead_at):
+        pos = c.lead_at[page]
         if rows[pos].block_index == first_block:
             run = _run(c, pos)
             ref = ref or _lead(c, run)
@@ -852,34 +853,34 @@ def _cuts(c: _Ctx, pages: Sequence, version_id: str) -> list[_Cut]:
             ref = lead
     # a running header or footer that changes for good (round 16 U4, KTD5): a report with a cover page, a running header
     # and its own footer needs no subject line, no letter and no number drop
-    lead_pages = sorted(lead_at)
+    lead_pages = sorted(c.lead_at)
     for page, detail in _running_cuts(c, set(restart_at)).items():
         at = bisect_left(lead_pages, page)
-        if at < len(lead_pages) and rows[lead_at[lead_pages[at]]].block_index != first_block:
-            add(rows[lead_at[lead_pages[at]]].block_index, lead_pages[at], RUNNING_LINE_CHANGE, detail)
+        if at < len(lead_pages) and rows[c.lead_at[lead_pages[at]]].block_index != first_block:
+            add(rows[c.lead_at[lead_pages[at]]].block_index, lead_pages[at], RUNNING_LINE_CHANGE, detail)
     # the restated-identifier rule of the appraisal contexts: a new context opens a unit
     for seg in contexts.derive(rows, version_id).segments[1:]:
         s = seg.first
         page = rows[position[s]].page if s in position else None
-        lead_pos = lead_at.get(page) if page is not None else None
+        lead_pos = c.lead_at.get(page) if page is not None else None
         if lead_pos is not None and all(r.kind == "image" for r in rows[lead_pos:position[s]]):
             s = rows[lead_pos].block_index  # the title block starts at the page's top (a picture may precede it)
         if s > first_block:
             add(s, page, IDENTIFIER_RESTART)
     # the report's own opening run (round 15 U4, KTD4): only where the reading has pages. The file's start counts as
     # the previous cut, so a cover letter and the report it introduces stay one unit
-    if lead_at:
-        start_page = previous = min(lead_at)
+    if c.lead_at:
+        start_page = previous = min(c.lead_at)
         strong = sorted({x.page for x in cuts.values() if x.page is not None and x.signals - WEAK_SIGNALS})
-        for page in sorted(lead_at):
+        for page in sorted(c.lead_at):
             if page == start_page:
                 continue
             previous = max([previous, *(q for q in strong if q < page)])
-            found = _opening(c, lead_at[page], page)
+            found = _opening(c, c.lead_at[page], page)
             if not found or page - previous <= OPENING_SUPPRESS_PAGES:
                 continue
             for signal, detail in found.items():
-                add(rows[lead_at[page]].block_index, page, signal, detail)
+                add(rows[c.lead_at[page]].block_index, page, signal, detail)
             previous = page
     # a repeated layout alone cuts nothing
     return [cuts[b] for b in sorted(cuts) if cuts[b].signals - WEAK_SIGNALS]
@@ -940,8 +941,8 @@ def _spans(c: _Ctx, ranges: Sequence[tuple], indexes: list[int]) -> list[tuple[i
     return out
 
 
-def _running_subjects(c: _Ctx, spans: Sequence[tuple[int | None, int | None]]) -> list[list[tuple[str, str]]]:
-    """The running subject of each unit (round 16 U5, KTD6, R9): the (segment, edge) pairs of its top running lines (the
+def _running_subjects(c: _Ctx, spans: Sequence[tuple[int | None, int | None]]) -> list[list[str]]:
+    """The running subject of each unit (round 16 U5, KTD6, R9): the segments of its top running lines (the
     running header; a bottom line is the office's, a party, never the property's, and a line with contact details is no
     header) that are constant across its pages (a segment on at least ``RUNNING_SUBJECT_SHARE`` of them, counted per
     segment so a chapter's name joined to a constant segment never hides it) and that no other unit of the file carries
@@ -950,38 +951,26 @@ def _running_subjects(c: _Ctx, spans: Sequence[tuple[int | None, int | None]]) -
     run = c.running
     if run is None:
         return [[] for _ in spans]
-    constant: list[list[tuple[str, str]]] = []
+    constant: list[list[str]] = []
     present: list[set[str]] = []
     for first, last in spans:
         window = run.window(first, last) if first is not None and last is not None else range(0)
-        counts: dict[tuple[str, str], int] = defaultdict(int)
+        counts: dict[str, int] = defaultdict(int)
         for i in window:
             key = run.top[i]
             if key is not None and key not in run.contact:
                 for seg in set(run.segments[key]):
-                    counts[(seg, "top")] += 1
+                    counts[seg] += 1
         need = max(2, math.ceil(RUNNING_SUBJECT_SHARE * len(window)))
         half = max(2, math.ceil(RUN_SHARE * len(window)))
-        found: list[tuple[str, str]] = []
-        for (seg, edge), k in counts.items():
-            if k >= need and len(seg) >= NAME_CHARS_MIN and not _names_only_a_report_type(seg):
-                found.append((seg, edge))
-        constant.append(sorted(found, key=lambda x: (x[1] != "top", x[0])))
-        present.append({seg for (seg, _), k in counts.items() if k >= half})
+        constant.append(sorted(seg for seg, k in counts.items()
+                               if k >= need and len(seg) >= NAME_CHARS_MIN and not _names_only_a_report_type(seg)))
+        present.append({seg for seg, k in counts.items() if k >= half})
     holders: dict[str, int] = defaultdict(int)
     for segs in present:
         for seg in segs:
             holders[seg] += 1
-    out = []
-    for n, found in enumerate(constant):
-        seen: set[str] = set()
-        mine = []
-        for seg, edge in found:
-            if seg not in seen and holders[seg] - (seg in present[n]) == 0:
-                seen.add(seg)
-                mine.append((seg, edge))
-        out.append(mine)
-    return out
+    return [[seg for seg in found if holders[seg] - (seg in present[n]) == 0] for n, found in enumerate(constant)]
 
 
 def _name_key(raw: str) -> str:
@@ -994,7 +983,7 @@ def _text_of_pages(c: _Ctx, pages: Iterable[int]) -> str:
     for page in pages:
         taken = 0
         for r in c.by_page.get(page, ()):
-            if r.kind == "image" or (getattr(r, "status", None) or "read") not in _READ or not _text(r):
+            if not _readable_text_block(r):
                 continue
             out.append(_text(r))
             taken += 1
@@ -1047,12 +1036,17 @@ def _continuity(c: _Ctx, cuts: list[_Cut]) -> list[_Cut]:
         crossable = cut is not None and cut.page is not None and not cut.signals & OPENING_SIGNALS
         anchor.append(len(heads) - 1 if of_unit(q)[0] or not crossable else anchor[-1])
 
+    def open_unit(q: int, cut: _Cut) -> None:
+        """Keep ``cut``: the unit ``q`` it opens is the new group."""
+        nonlocal start, group
+        kept.append(cut)
+        start, group = q, {q}
+        keep_head(q, cut)
+
     for k, cut in enumerate(cuts):
         q = k + 1
         if cut.signals & OPENING_SIGNALS or cut.page is None:
-            kept.append(cut)
-            start, group = q, {q}
-            keep_head(q, cut)
+            open_unit(q, cut)
             continue
         names, known = of_unit(start)
         if not segments[start] & segments[q]:
@@ -1076,9 +1070,7 @@ def _continuity(c: _Ctx, cuts: list[_Cut]) -> list[_Cut]:
         if named and not differs:
             group.add(q)
             continue
-        kept.append(cut)
-        start, group = q, {q}
-        keep_head(q, cut)
+        open_unit(q, cut)
     return kept
 
 
@@ -1141,11 +1133,11 @@ def _identifiers_json(ident: contexts.Identity) -> dict:
             "shown": list(ident.shown)}
 
 
-def _identity(c: _Ctx, run: list, letterhead: set, subjects: Sequence[tuple[str, str]] = (),
+def _identity(c: _Ctx, run: list, letterhead: set, subjects: Sequence[str] = (),
               cover: tuple[int, str] | None = None) -> tuple[str | None, list[str], list[dict], dict, dict]:
     """(title, aliases, alias evidence, identifiers, title evidence) of a unit from its title run, its cover title
     (``cover``: the block and text of the prominent title of its first page, when that page is a cover) and its running
-    subject (``subjects``: the (segment, edge) pairs ``_running_subjects`` finds). The cover title and the running
+    subject (``subjects``: the top-line segments ``_running_subjects`` finds). The cover title and the running
     subject are the title when the title run gives none, else aliases (round 16 U5, R9); a cover title that only names a
     report type or opens several units alike is no name. Evidence holds the rule, the block or the edge, never the text."""
     lines = [r for r in run if r.kind != "image" and _norm(_text(r)) not in letterhead]
@@ -1195,11 +1187,11 @@ def _identity(c: _Ctx, run: list, letterhead: set, subjects: Sequence[tuple[str,
             keep(cover[1], "cover_title", cover[0], False)
         for alias, rule in _alias_candidates(cover[1], True):
             keep(alias, rule, cover[0], False)
-    for segment, edge in subjects:
+    for segment in subjects:
         if title is None:
-            title, title_ev = segment, {"rule": "running_subject", "edge": edge}
+            title, title_ev = segment, {"rule": "running_subject", "edge": "top"}
         elif segment != _norm(title):
-            keep(segment, "running_subject", None, False, edge=edge)
+            keep(segment, "running_subject", None, False, edge="top")
     return title, aliases, evidence, _identifiers_json(ident), title_ev
 
 

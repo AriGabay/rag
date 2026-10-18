@@ -167,18 +167,25 @@ def fit_segments(claims: list[str], segs: tuple[Segment, ...], limit: int) -> tu
         headers = []
     ranked = [*headers, *order]
     ranked += [j for i in order for j in (i - 1, i + 1) if 0 <= j < len(segs)]
+    # the rendering is kept as a running length (``render``: the picked texts and one ``OMITTED`` per run of unpicked
+    # segments, joined by a newline): adding segment ``i`` adds its text, closes the run it sat in and opens one on each
+    # side that has an unpicked neighbour. Nothing is rendered until the picked set is final
     picked: set[int] = set()
-    best = ("", True)
+    texts = 0  # the characters of the picked segments
+    gaps = 1  # the runs of unpicked segments (all of them, before the first pick)
     for i in ranked:
         if i in picked:
             continue
-        trial = render(segs, picked | {i})
-        if len(trial[0]) <= limit:
+        gaps_after = gaps - 1 + (i > 0 and i - 1 not in picked) + (i < len(segs) - 1 and i + 1 not in picked)
+        # the rendering of the picked set with ``i``: its texts, the markers, and a newline between the parts
+        size = texts + len(segs[i].text) + gaps_after * len(OMITTED) + (len(picked) + 1 + gaps_after) - 1
+        if size <= limit:
             picked.add(i)
-            best = trial
-            if len(trial[0]) >= limit - 30:
+            texts += len(segs[i].text)
+            gaps = gaps_after
+            if size >= limit - 30:
                 break
-    return best if picked else ("", True)
+    return render(segs, picked) if picked else ("", True)
 
 
 def fit(claims: list[str], text: str, kind: str = "text", *, limit: int) -> tuple[str, bool]:
