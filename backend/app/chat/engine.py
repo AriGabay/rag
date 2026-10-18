@@ -1036,15 +1036,30 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             items.append({"role": "user", "content": notice})
             continue
         if checked is not None and (lost := checked[1].lost_supported(answer.answer_markdown)):
-            # a repair round rewrote the answer and lost what the last round judged supported (R8, R10): its answer is
-            # not adopted — the checked one is composed instead, its failing claims cut or removed. Decided before the
-            # judge call, so it costs nothing and adds no model call
-            logger.info("chat repair round dropped %d supported claim(s) with numbers; the verified answer is kept",
-                        len(lost))
-            rounds.append([Problem(unit, "טענה שאומתה בסבב הקודם נעלמה מהתשובה המתוקנת", severity="partial",
-                                   check="repair_lost_supported", claim_id=claim.id).as_dict()
-                           for unit, claim in lost])
-            return finish(*checked)
+            # a repair round rewrote the answer and lost what the last round judged supported (R8, R10). When it added
+            # something grounded and the merged answer can still be verified, the lost claims are restored — each its own
+            # sentence with its citations — and the merged answer takes the ordinary path (verdicts reused, coherence
+            # rules run): the addition and what was verified both stay (round 16 U3, KTD4). Decided before the judge
+            # call, so it adds no model call: the merged answer's verification replaces the repaired answer's
+            if (verify_deadline - time.monotonic() >= settings.chat_verify_min_seconds
+                    and checked[1].adds_content(answer.answer_markdown)):
+                merged, back = checked[1].restore_lost(answer.answer_markdown, lost)
+                if back:
+                    logger.info("chat repair round dropped %d supported claim(s); restored into the repaired answer",
+                                len(back))
+                    rounds.append([Problem(unit, "טענה שאומתה בסבב הקודם נעלמה מהתשובה המתוקנת ושוחזרה אליה",
+                                           severity="partial", check="repair_restored_supported",
+                                           claim_id=claim.id).as_dict() for unit, claim in back])
+                    answer = answer.model_copy(update={"answer_markdown": merged})
+                # else: every lost claim is said in other words by the repaired answer, which is verified as it stands
+            else:
+                # the repaired answer adds nothing grounded to keep them beside, or there is no time to verify a merge: it
+                # is not adopted — the checked answer is composed instead, its failing claims cut or removed
+                logger.info("chat repair round dropped %d supported claim(s); the verified answer is kept", len(lost))
+                rounds.append([Problem(unit, "טענה שאומתה בסבב הקודם נעלמה מהתשובה המתוקנת", severity="partial",
+                                       check="repair_lost_supported", claim_id=claim.id).as_dict()
+                               for unit, claim in lost])
+                return finish(*checked)
         if verify_deadline - time.monotonic() < settings.chat_verify_min_seconds:
             # an answer that cannot be checked is never shown: a repaired one gives way to the answer already
             # verified, a first one fails the turn, saying why

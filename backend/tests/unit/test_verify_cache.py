@@ -581,20 +581,45 @@ def test_a_removal_with_no_repair_round_records_that_none_was_attempted(offline,
 
 LOST = ("דמי השכירות הם 55 ₪ למ\"ר לחודש [S1].\n"
         "הנכס פנוי [S1].")  # the repair fixes the failing sentence but drops the supported "9,500 ₪" one
+NOTHING_ADDED = "דמי השכירות הם 55 ₪ למ\"ר לחודש [S1]."  # the repair only drops the supported "9,500 ₪" sentence
 
 
-def test_a_repair_that_drops_a_supported_numeric_sentence_gives_way_to_the_checked_answer(offline):
-    agent = ScriptedAgent([SEARCH, final(THREE), final(LOST)], judge=_judge_wrong_management)
+def _entries(out, check: str) -> list[dict]:
+    return [p for r in out.rounds for p in r if p["check"] == check]
+
+
+def test_a_repair_that_drops_a_supported_numeric_sentence_and_adds_nothing_gives_way_to_the_checked_answer(offline):
+    """Round 16 U3 (KTD4): the discard is the fallback when the repaired answer adds no grounded content."""
+    agent = ScriptedAgent([SEARCH, final(THREE), final(NOTHING_ADDED)], judge=_judge_wrong_management)
     out = _turn(agent)
     md = out.answer.answer_markdown
     assert "9,500" in md and "55" in md  # the supported parts survive
-    assert "מושכר" not in md and "הנכס פנוי" not in md  # the failing part is cut or removed, not rewritten in
+    assert "מושכר" not in md  # the failing part is cut or removed, not rewritten in
     assert len(agent.seen) == 3  # no model call beyond the one repair round
     assert [u["purpose"] for u in out.usage].count("agent") == 3  # search step, answer, repair: nothing added
+    assert len(_verify_inputs(agent)) == 1  # the repaired answer was never verified: the checked one is composed
     # recorded: a round of its own, checked "repair_lost_supported", one entry per lost claim
-    lost = [p for r in out.rounds for p in r if p["check"] == "repair_lost_supported"]
+    lost = _entries(out, "repair_lost_supported")
     assert len(lost) == 1 and lost[0]["claim_id"] and "9,500" in lost[0]["text"]
+    assert not _entries(out, "repair_restored_supported")
     assert out.report.ok is False and out.report.counts()["removed"] >= 1
+
+
+def test_a_repair_that_adds_a_part_and_drops_a_supported_numeric_sentence_ends_with_both(offline):
+    """AE3 (R5): the repair adds the part and rephrases away a verified number: the verified claim is put back."""
+    agent = ScriptedAgent([SEARCH, final(THREE), final(LOST)], judge=_judge_wrong_management)
+    out = _turn(agent)
+    md = out.answer.answer_markdown
+    assert "9,500" in md and "55" in md and "הנכס פנוי" in md  # the verified sentence and the addition
+    assert "מושכר" not in md
+    assert md.count("9,500") == 1  # restored once, as its own sentence with its citation
+    assert "השווי למ\"ר הוא 9,500 ₪ [S1]" in md
+    (entry,) = _entries(out, "repair_restored_supported")
+    assert entry["claim_id"] and "9,500" in entry["text"]
+    assert not _entries(out, "repair_lost_supported")
+    # no model call beyond the ordinary ones: the merged answer's verification replaces the repaired answer's
+    assert len(agent.seen) == 3 and [u["purpose"] for u in out.usage].count("agent") == 3
+    assert len(_verify_inputs(agent)) == 2 and out.report.ok
 
 
 def test_a_repair_that_keeps_the_supported_numbers_rephrased_is_adopted(offline):
@@ -608,20 +633,32 @@ def test_a_repair_that_keeps_the_supported_numbers_rephrased_is_adopted(offline)
     assert out.summary["rounds"] == 2 and out.report.ok
 
 
-def test_a_supported_claim_without_numbers_gives_way_to_the_checked_answer_when_the_repair_drops_it(offline):
-    """Round 9 U15 (R20). This test used to pin the opposite — ``..._does_not_hold_back_a_repair``: a supported sentence
-    with no number could be dropped by a repair round, because only numbers were protected. Verified non-numeric
-    information (a status, a date, a caveat, a plain fact) is now protected by its salient words: the repair that drops
-    "הנכס פנוי" is not adopted, and the checked answer — with its failing sentence removed — is composed instead."""
+def test_a_supported_claim_without_numbers_dropped_by_a_repair_that_adds_a_part_is_restored(offline):
+    """Round 9 U15 (R20) protects verified non-numeric information (a status, a date, a caveat, a plain fact) by its
+    salient words. Round 16 U3 (KTD4, R5): when the repair that drops "הנכס פנוי" adds a grounded part, the sentence is put
+    back beside it; when it adds nothing, the checked answer is composed instead (the next test)."""
     first = "הנכס פנוי [S1].\nהנכס מושכר [S1]."
-    repaired = "השווי למ\"ר הוא 9,500 ₪ [S1]."  # drops the supported sentence, which carries no number
+    repaired = "דמי הניהול הם 12 ₪ למ\"ר [S1]."  # drops the supported sentence, which carries no number
     agent = ScriptedAgent([SEARCH, final(first), final(repaired)], judge=_judge_wrong_management)
     out = _turn(agent)
     md = out.answer.answer_markdown
-    assert "הנכס פנוי" in md and "מושכר" not in md and "9,500" not in md
-    (lost,) = [p for r in out.rounds for p in r if p["check"] == "repair_lost_supported"]
-    assert lost["claim_id"] and "פנוי" in lost["text"]
+    assert "הנכס פנוי [S1]" in md and "12" in md and "מושכר" not in md
+    (entry,) = _entries(out, "repair_restored_supported")
+    assert entry["claim_id"] and "פנוי" in entry["text"]
     assert [u["purpose"] for u in out.usage].count("agent") == 3  # no model call beyond the one repair round
+
+
+def test_a_supported_claim_without_numbers_gives_way_to_the_checked_answer_when_the_repair_adds_nothing_grounded(offline):
+    first = "הנכס פנוי [S1].\nהנכס מושכר [S1]."
+    repaired = "לא נמצא מידע על דמי תחזוקה."  # an absence statement, with no citation
+    agent = ScriptedAgent([SEARCH, final(first), final(repaired)], judge=_judge_wrong_management)
+    out = _turn(agent)
+    md = out.answer.answer_markdown
+    assert "הנכס פנוי" in md and "מושכר" not in md and "תחזוקה" not in md
+    (lost,) = _entries(out, "repair_lost_supported")
+    assert lost["claim_id"] and "פנוי" in lost["text"]
+    assert not _entries(out, "repair_restored_supported")
+    assert [u["purpose"] for u in out.usage].count("agent") == 3 and len(_verify_inputs(agent)) == 1
 
 
 def test_a_repair_that_rephrases_a_supported_claim_with_the_same_salient_words_is_adopted(offline):
@@ -632,14 +669,15 @@ def test_a_repair_that_rephrases_a_supported_claim_with_the_same_salient_words_i
     assert not [p for r in out.rounds for p in r if p["check"] == "repair_lost_supported"]
 
 
-def test_a_repair_that_drops_a_supported_date_only_claim_gives_way_to_the_checked_answer(offline):
-    """A date is verified information too: the month name is a qualifier word, so the repair must keep it."""
-    offline.texts = [SOURCE + " הנכס נבדק במרץ."]
+def test_a_repair_that_drops_a_supported_date_only_claim_keeps_it_beside_its_addition(offline):
+    """A date is verified information too: the month name is a qualifier word, so the repair must keep it. The
+    repair's own addition (a status) stays as well."""
     first = "הנכס נבדק במרץ [S1].\nהנכס מושכר [S1]."
     repaired = "הנכס פנוי [S1]."
     out = _turn(ScriptedAgent([SEARCH, final(first), final(repaired)], judge=_judge_wrong_management))
-    assert "במרץ" in out.answer.answer_markdown and "פנוי" not in out.answer.answer_markdown
-    assert [p["check"] for r in out.rounds for p in r].count("repair_lost_supported") == 1
+    md = out.answer.answer_markdown
+    assert "הנכס נבדק במרץ [S1]" in md and "הנכס פנוי" in md and "מושכר" not in md
+    assert [p["check"] for r in out.rounds for p in r].count("repair_restored_supported") == 1
 
 
 def test_a_repair_that_rephrases_a_supported_caveat_with_the_same_salient_words_is_adopted(offline):
@@ -686,6 +724,105 @@ def test_a_repair_that_replaces_a_supported_absence_statement_with_the_value_is_
     out = _turn(ScriptedAgent([SEARCH, final(first), final(repaired)], judge=_judge_wrong_management))
     assert out.answer.answer_markdown == repaired
     assert not [p for r in out.rounds for p in r if p["check"] == "repair_lost_supported"]
+
+
+def test_a_repair_that_changed_a_computed_result_keeps_the_verified_one_beside_the_new_one(offline):
+    """KTD4 / R11: a claim whose value the repair changed is put back beside the new one, so both bases stay visible."""
+    offline.text = SOURCE + " סכום השורות בטבלה הוא 9,400 ₪."
+    first = "הסכום הכולל הוא 9,500 ₪ לפי המסקנה [S1].\nהנכס מושכר [S1]."
+    repaired = "הסכום הכולל הוא 9,400 ₪ לפי סכום השורות בטבלה [S1]."
+    agent = ScriptedAgent([SEARCH, final(first), final(repaired)], judge=_judge_wrong_management)
+    out = _turn(agent)
+    lines = out.answer.answer_markdown.split("\n")
+    assert len(lines) == 2 and "9,400" in lines[0] and "9,500 ₪ לפי המסקנה [S1]" in lines[1]  # beside, right after
+    assert len(_entries(out, "repair_restored_supported")) == 1 and not _entries(out, "repair_lost_supported")
+
+
+def test_the_time_to_verify_the_merged_answer_is_missing_so_the_checked_answer_is_composed(offline):
+    settings = get_settings()
+    wanted = settings.chat_verify_min_seconds
+    agent = ScriptedAgent([SEARCH, final(THREE), final(LOST)], judge=_judge_wrong_management)
+
+    def squeeze(step: int) -> None:
+        if step == 2:  # the repair round's answer arrives with less time than a verification needs
+            settings.chat_verify_min_seconds = 10**6
+
+    agent.on_step = squeeze
+    try:
+        out = _turn(agent)
+    finally:
+        settings.chat_verify_min_seconds = wanted
+    md = out.answer.answer_markdown
+    assert "9,500" in md and "55" in md and "מושכר" not in md and "הנכס פנוי" not in md  # the checked answer, composed
+    assert len(_verify_inputs(agent)) == 1
+    assert len(_entries(out, "repair_lost_supported")) == 1 and not _entries(out, "repair_restored_supported")
+
+
+# --- the restore helper: which claims, which sentence, where (round 16 U3, KTD4) -----------------------------------
+
+def _fixed(respond) -> ScriptedProvider:
+    p = ScriptedProvider()
+    p.on(Purpose.VERIFY, lambda instructions, input: respond(input), repeat=True)
+    return p
+
+
+def _mixed_judge(input: str) -> dict:
+    """A unit that holds a verified number and a failing status is judged as two claims."""
+    out = []
+    for i, t in _units(input).items():
+        if "מושכר" in t and "9,500" in t:
+            out.append({"index": i, "verdict": "partial", "reason": "חלקי", "defect": "part", "claims": [
+                {"span": "השווי למ\"ר הוא 9,500 ₪", "verdict": "supported"},
+                {"span": "והנכס מושכר", "verdict": "unsupported", "failure": "absent_from_source"}]})
+        else:
+            out.append({"index": i, "verdict": _wrong_management(t), "reason": "בדיקה"})
+    return {"verdicts": out}
+
+
+def test_a_unit_with_one_verified_and_one_failing_claim_has_only_the_verified_sentence_restored():
+    report = verify_answer(_fixed(_mixed_judge), _answer("השווי למ\"ר הוא 9,500 ₪ והנכס מושכר [S1]."), _ws(), "?", [])
+    repaired = "דמי הניהול הם 12 ₪ למ\"ר [S1]."
+    lost = report.lost_supported(repaired)
+    assert [r.text for _, r in lost] == ["השווי למ\"ר הוא 9,500 ₪"]  # the failing claim is not protected
+    merged, back = report.restore_lost(repaired, lost)
+    assert len(back) == 1
+    assert merged == repaired + "\n\nהשווי למ\"ר הוא 9,500 ₪ [S1]."
+    assert "מושכר" not in merged
+
+
+def test_a_restored_sentence_goes_after_the_unit_holding_its_neighbouring_claim_and_the_rest_stays():
+    first = ("## שכירות\nדמי השכירות הם 55 ₪ למ\"ר לחודש [S1].\nהשווי למ\"ר הוא 9,500 ₪ [S1].\n"
+             "## ניהול\nדמי הניהול הם 12 ₪ למ\"ר [S1].")
+    report = verify_answer(_judge(), _answer(first), _ws(), "?", [])
+    repaired = ("## שכירות\nהשווי למ\"ר הוא 9,500 ₪ [S1].\nהנכס פנוי [S1].\n"
+                "## ניהול\nדמי הניהול הם 12 ₪ למ\"ר [S1].")
+    lost = report.lost_supported(repaired)
+    assert [r.text.rstrip(" .") for _, r in lost] == ["דמי השכירות הם 55 ₪ למ\"ר לחודש"]
+    merged, back = report.restore_lost(repaired, lost)
+    assert merged == ("## שכירות\nהשווי למ\"ר הוא 9,500 ₪ [S1].\nדמי השכירות הם 55 ₪ למ\"ר לחודש [S1].\nהנכס פנוי [S1].\n"
+                      "## ניהול\nדמי הניהול הם 12 ₪ למ\"ר [S1].")
+    assert len(back) == 1
+
+
+def test_a_claim_the_repair_kept_in_other_words_is_not_restored_again_and_the_rest_is():
+    first = "הנכס פנוי [S1].\nדמי השכירות הם 55 ₪ למ\"ר לחודש [S1]."
+    report = verify_answer(_judge(), _answer(first), _ws(), "?", [])
+    repaired = "הנכס עצמו פנוי [S2].\nדמי הניהול הם 12 ₪ למ\"ר [S2]."  # re-cited: both are lost, one is said again
+    assert len(report.lost_supported(repaired)) == 2
+    merged, back = report.restore_lost(repaired, report.lost_supported(repaired))
+    assert [r.text.rstrip(" .") for _, r in back] == ["דמי השכירות הם 55 ₪ למ\"ר לחודש"]
+    assert merged.count("פנוי") == 1 and merged.count("55") == 1
+
+
+def test_an_added_part_needs_a_citation_a_new_number_or_new_words():
+    report = verify_answer(_judge(), _answer("הנכס פנוי בכפוף לאישור הוועדה [S1].\nדמי השכירות הם 55 ₪ למ\"ר לחודש [S1]."),
+                           _ws(), "?", [])
+    assert report.adds_content("דמי הניהול הם 12 ₪ למ\"ר [S1].")  # a number no verified claim holds
+    assert report.adds_content("החצר משותפת לכל הדיירים [S1].")  # words no verified claim holds
+    assert not report.adds_content("דמי השכירות הם 55 ₪ [S1].")  # a verified claim, shorter
+    assert not report.adds_content("הנכס פנוי [S1].")  # a verified claim, without its caveat
+    assert not report.adds_content("החצר משותפת לכל הדיירים.")  # no citation: nothing grounded
+    assert not report.adds_content("לא נמצא מידע על דמי תחזוקה [S1].")  # an absence is no content
 
 
 def test_a_negation_that_qualifies_a_positive_claim_is_protected_but_an_absence_statement_is_not():

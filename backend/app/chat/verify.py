@@ -880,6 +880,54 @@ def _covers_any(covers: list[set[str]], claim: str, heading: str, numeric: bool)
     return any(covers_it(c) for c in covers)
 
 
+def _cover_forms(text: str) -> tuple[list[Unit], dict[int, str], list[set[str]]]:
+    """The units of ``text``, the heading chain above each and the comparable forms of each unit's words with its
+    chain's (``_covers_any``'s ``covers``)."""
+    units = split_units(text)
+    chains = _headings_above(text, units)
+    return units, chains, [{f for w in _MISSING_TOKEN.findall(f"{u.text}\n{chains[u.index]}") for f in _missing_forms(w)}
+                           for u in units]
+
+
+def _word_share(claim: str, heading: str, forms: set[str]) -> float:
+    """The share of the content words (no numbers; ``claim`` and its heading chain) whose comparable forms are among
+    ``forms``; 1.0 when it has none."""
+    words = [_missing_forms(w) for w in _missing_words(f"{claim}\n{heading}") if not w[0].isdigit()]
+    return sum(bool(w & forms) for w in words) / len(words) if words else 1.0
+
+
+ADDED_WORD_SHARE = 0.6  # a repaired unit with no new number that shares this much of its words with one supported claim adds nothing
+ANCHOR_WORD_SHARE = 0.6  # the share of a lost claim's words a repaired unit must hold to be the place it is restored beside
+_BULLET = re.compile(r"\s*([-*+•])\s+")
+_LIST_MARK = re.compile(r"^\s*(?:[-*+•]|\d{1,3}[.)]|#{1,6})\s+")  # a list item's or heading's mark, not part of its sentence
+
+
+def _restored_sentence(u: Unit, r: ClaimRecord) -> str:
+    """The sentence a lost verified claim is restored as (round 16 U3, KTD4): the claim's own span, never the rest of its
+    unit, with the citations the unit wrote directly after it (all of the unit's when none stands there). A whole-unit
+    claim is the unit's text as written; a table row is its cells (a lone row has no header to stand under)."""
+    raw = u.raw
+    if r.whole_unit or not r.exact:
+        span, cites = raw, ""
+    else:
+        a, b = r.start - u.start, r.end - u.start
+        span, tail = raw[a:b], _LEADING_IDS.match(raw[b:])
+        cites = " ".join(m.group(0) for m in _IDS.finditer(tail.group(0))) if tail else ""
+        if not cites:
+            cites = " ".join(dict.fromkeys(m.group(0) for m in _IDS.finditer(raw)))
+        if _IDS.search(span):
+            cites = ""
+    if u.table_span is not None:
+        cells = [c.strip() for c in raw.strip().strip("|").split("|")]
+        if span is raw:
+            span = " · ".join(c for c in cells if c)
+        elif cells and cells[0] and cells[0] not in span:
+            span = f"{cells[0]}: {span}"
+    span = _LIST_MARK.sub("", span)
+    sentence = " ".join(f"{span.strip()} {cites}".split())
+    return sentence if sentence.endswith((".", "!", "?", ":")) else sentence + "."
+
+
 # a request clause is a question: it ends with "?" or holds a question word (with a "ו" or "ש" prefix at most). A gap
 # line names a short noun phrase, never a clause of the request (round 9 R24, KTD10)
 _QUESTION_WORD = re.compile(r"(?<![א-ת])[וש]?(?:מהו|מהי|מהם|מהן|מה|כמה|מתי|האם|איזה|איזו|אילו|היכן|איפה)(?![א-ת])")
@@ -1549,10 +1597,7 @@ class VerifyReport:
         rephrasing that keeps its salient words is not a loss. A claim of kind ``absence``, and a clause saying a datum is
         not stated, found, computed or determined, is not protected (``_without_absence``): the repair fills it."""
         shown = numbers_in(text)
-        new_units = split_units(text)
-        chains = _headings_above(text, new_units)
-        covers = [{f for w in _MISSING_TOKEN.findall(f"{u.text}\n{chains[u.index]}") for f in _missing_forms(w)}
-                  for u in new_units]
+        _, _, covers = _cover_forms(text)
         cited = set(ids_in(text))
         units = {u.index: u for u in self.units}
         lost = []
@@ -1570,6 +1615,90 @@ class VerifyReport:
                         covers, claim, u.heading, bool(needed)):
                     lost.append((u, r))
         return lost
+
+    def adds_content(self, text: str) -> bool:
+        """Whether ``text`` — a repair round's answer — says something this report did not already have supported (round
+        16 U3, KTD4): a cited unit that holds a number no supported claim holds, or of whose words fewer than
+        ``ADDED_WORD_SHARE`` stand in any single supported claim. A rephrasing of a verified claim, a statement of an
+        absence and a unit that cites nothing add nothing grounded; a failing claim rewritten into a new statement does."""
+        units = {u.index: u for u in self.units}
+        supported = [(units[idx], claim) for idx, recs in self.claims.items() if idx in units
+                     for r in recs if (claim := _supported_claim(r))]
+        known = set().union(*(numbers_in(c) for _, c in supported)) if supported else set()
+        forms = [{f for w in _MISSING_TOKEN.findall(f"{c}\n{u.heading}") for f in _missing_forms(w)} for u, c in supported]
+        for unit in split_units(text):
+            if not unit.ids or states_absence(unit.text):
+                continue
+            numbers = numbers_in(unit.text)
+            if numbers and not numbers <= known:
+                return True
+            if _missing_words(unit.text) and not any(_word_share(unit.text, "", f) >= ADDED_WORD_SHARE for f in forms):
+                return True
+        return False
+
+    def restore_lost(self, text: str, lost: list[tuple[Unit, ClaimRecord]]) -> tuple[str, list[tuple[Unit, ClaimRecord]]]:
+        """``text`` — a repair round's answer — with the verified claims it lost (``lost_supported``) put back (round 16
+        U3, KTD4), and the claims put back. Each is its own sentence with its citations (``_restored_sentence``). A claim
+        whose number ``text`` still shows and that one of its units covers in other words is not put back. The sentence goes
+        after the unit of ``text`` that holds most of the claim's own words (a value the repair changed stays beside the
+        new one), else after the unit holding a neighbouring claim (the claim's unit's other claims, then the units around
+        it), else at the end of the section with its heading chain, else at the end of the answer."""
+        shown = numbers_in(text)
+        new_units, chains, covers = _cover_forms(text)
+        by_index = {u.index: u for u in self.units}
+        todo = []
+        for u, r in lost:
+            claim = _supported_claim(r)
+            needed = numbers_in(claim)
+            if (not needed or needed <= shown) and _covers_any(covers, claim, u.heading, bool(needed)):
+                continue  # its content is there in other words
+            if all(_restored_sentence(u, r) != _restored_sentence(x, y) for x, y in todo):
+                todo.append((u, r))
+
+        def holds(j: int, claim: str, heading: str) -> bool:
+            needed = numbers_in(claim)
+            if needed:
+                return needed <= numbers_in(new_units[j].text)
+            return _covers_any([covers[j]], claim, heading, False)
+
+        def anchor(u: Unit, r: ClaimRecord) -> Unit | None:
+            claim = _supported_claim(r)
+            best = max(((_word_share(claim, u.heading, covers[j]), -j) for j in range(len(new_units))), default=(0.0, 0))
+            if best[0] >= ANCHOR_WORD_SHARE:
+                return new_units[-best[1]]
+            nearby = [(u, y) for y in self.claims.get(u.index, []) if y is not r]
+            for d in (-1, 1, -2, 2):
+                nearby += [(by_index[u.index + d], y) for y in self.claims.get(u.index + d, [])
+                           if u.index + d in by_index]
+            for x, y in nearby:
+                neighbour = _supported_claim(y)
+                if neighbour and (j := next((j for j in range(len(new_units)) if holds(j, neighbour, x.heading)), None)) is not None:
+                    return new_units[j]
+            same = [x for x in new_units if u.heading and chains[x.index] == u.heading]
+            return same[-1] if same else None
+
+        after: dict[int, list[str]] = {}
+        end: list[str] = []
+        for u, r in todo:
+            at = anchor(u, r)
+            if at is None:
+                end.append(_restored_sentence(u, r))
+                continue
+            # the end of the anchor's line (of its table), where a sentence of its own goes
+            line_end = at.table_span[1] if at.table_span is not None else text.find("\n", at.end)
+            line_end = len(text) if line_end < 0 else line_end
+            if at.table_span is not None:
+                line_end = len(text[:line_end].rstrip("\n"))
+            after.setdefault(line_end, []).append(_restored_sentence(u, r))
+        merged = text
+        for pos in sorted(after, reverse=True):
+            line = text[text.rfind("\n", 0, pos) + 1:pos]
+            bullet = _BULLET.match(line)
+            lead = f"{bullet.group(1)} " if bullet else ""
+            merged = merged[:pos] + "".join(f"\n{lead}{x}" for x in after[pos]) + merged[pos:]
+        if end:
+            merged = merged.rstrip("\n") + "\n\n" + "\n".join(end)
+        return merged, todo
 
     def repair_keys(self, claims_only: bool = False) -> set[str]:
         """The units the repair prompt (``problems_text``) names: not one whose failing claim the server cuts."""
