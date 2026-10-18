@@ -388,6 +388,20 @@ def test_the_policy_asks_the_answer_to_state_its_calculation_basis_and_give_the_
     assert POLICY.count("אמור באיזה בסיס חושבה התוצאה") == 1
 
 
+def test_the_policy_asks_for_every_asked_item_of_the_asked_property_with_its_condition_and_citation():
+    """Round 16: brevity never drops an asked item. The sentence sits in the answer-wording section (after the direct-answer
+    line), names the item kinds, the attached condition/caveat/exception and the citation, and keeps another property's items out."""
+    start = POLICY.index("ניסוח התשובה (answer_markdown):")
+    section = POLICY[start:]
+    sentence = section[section.index("כשהבקשה מבקשת פריטים מסוג מסוים"):].split("\n- ")[0]
+    assert POLICY.count("כשהבקשה מבקשת פריטים מסוג מסוים") == 1
+    assert "ערכים, שיעורים, תנאים, סיבות, חברי רשימה" in sentence
+    assert "כל פריט כזה שהקטעים שקראת קובעים לאותו נכס" in sentence
+    assert "תנאי, הסתייגות או חריג" in sentence and "מראה המקום שלו" in sentence
+    assert "קיצור אינו מוריד פריט שנשאל" in sentence and "פריטים של נכס אחר אינם מתווספים" in sentence
+    assert section.index("התשובה הישירה קודם, בקצרה") < section.index(sentence)
+
+
 def test_a_division_by_zero_on_found_values_is_a_calculation_failure_not_missing_data():
     zero = calc.operand("V2", "0", "ILS", kind="cost", role="cost")
     income = calc.operand("V1", "100", "ILS", kind="income", role="income")
