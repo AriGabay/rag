@@ -397,7 +397,9 @@ def _statements(fn):
 def _block_reads(statements: list[str]) -> list[str]:
     """The statements that read the stored blocks of a value's place or its context (``reader.blocks_between``,
     ``reader.blocks_above``), not the version's cached appraisal contexts."""
-    return [s for s in statements if "FROM document_blocks WHERE version_id" in s]
+    # the unit derivation's own block read (``units._ROWS_SQL``, round 15 U4: it opens with the per-page lead CTE) builds
+    # the version's appraisal contexts, which this test does not count
+    return [s for s in statements if "FROM document_blocks WHERE version_id" in s and not s.lstrip().startswith("WITH lead AS")]
 
 
 def _add_text_measurement(office, block: int, quote_text: str, value_text: str, value: float, key: str) -> None:

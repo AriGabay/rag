@@ -25,11 +25,14 @@ The number classes are told apart before a house number is looked for, by patter
 "תקן" or "סעיף" (decimals such as 1.1 included) is a professional reference (R9), a four-digit year, a floor and a
 duration are non-names, an amount is none either. A number is a house number only beside a title word.
 
-**Settling** (``settle``): the model's claim becomes the turn's ``Intent`` and the server records why. A
-``professional`` claim whose message holds evidence is ``mixed`` (the message names a property); ``property`` and
-``document`` keep their value, and whether a lookup runs is the evidence's decision, not the claim's; a missing,
-invalid or ``unknown`` claim is ``property`` when the message holds evidence (the request is about that property) and
-``unknown`` otherwise — ``unknown`` runs no lookup and no selection. ``set`` mirrors ``scope``.
+**Settling** (``settle``): the model's claim becomes the turn's ``Intent`` and the server records why. Since round 15
+(U6, KTD2, R1) the claim is the intent: evidence is a hint the server records (``Intent.evidence``) and the candidates
+are ranked from, and it never overrides the claim — a ``professional`` claim stays ``professional`` although the message
+holds a name that is also a document's, an ``unknown`` claim stays ``unknown`` (both pools, labelled). ``property`` and
+``document`` keep their value, and whether a lookup runs is the evidence's decision, not the claim's. Only when there is
+no claim at all (a missing or invalid parse: the search-only path and a failed analysis, which have no model reading to
+follow) is the intent ``property`` when the message holds evidence and ``unknown`` otherwise — ``unknown`` runs no
+lookup and no selection. ``set`` mirrors ``scope``.
 
 A reference to the conversation is settled the same way (round 10 U7; KTD6): ``prior_answer_item`` with ``item: n`` binds
 only when the message holds an ordinal form (an ordinal word, a digit, "האחרון/ה") and the previous answer's item n
@@ -48,7 +51,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from app.chat import contexts, entities, slots
-from app.chat.slots import MIXED, PROFESSIONAL
+from app.chat.slots import MIXED, PROFESSIONAL  # noqa: F401 - MIXED is read as ``intent.MIXED`` by the engine
 from app.extraction.normalize_text import base_normalize
 from app.platform.search import _scope_terms
 
@@ -354,13 +357,11 @@ def settle(claim: IntentClaim | None, message: str, vocabulary: list[str], scope
         value = "property" if found else "unknown"
         why.append("no valid intent part: " + ("the message holds evidence of a property" if found
                                             else "no evidence, no lookup"))
-    elif claimed == PROFESSIONAL and found:
-        value = MIXED
-        why.append("professional claim, but the message names a property or a document")
     elif claimed in ("unknown", "set"):
-        value = "property" if found else "unknown"
-        why.append(("claim " + claimed + ": ") + ("the message holds evidence of a property" if found
-                                              else "no evidence, no lookup"))
+        # the analysis gave no reading (round 15 U6, KTD2): the intent stays unknown — both pools, labelled — and the
+        # evidence the message holds is a recorded hint for the candidates, not a decision that it is a property
+        value = "unknown"
+        why.append(f"claim {claimed}: the intent stays unknown" + ("; the message's evidence is a hint" if found else ""))
     else:
         value = claimed
         if claimed in LOOKUP_VALUES and not found:

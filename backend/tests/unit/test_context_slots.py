@@ -265,12 +265,13 @@ def test_a_message_that_is_not_an_answer_is_a_new_question_and_the_pending_clari
         assert req.resolution["decisions"]["pending"].startswith("expired"), message
 
 
-def test_the_clarification_is_asked_again_only_for_an_answer_that_names_two_or_more_candidates():
+def test_the_candidates_reach_the_model_again_only_for_an_answer_that_names_two_or_more_of_them():
     req = _validate(_resolved(relation="clarification_answer", intent=_intent("property", "clarification")), "הגפן",
                     candidates=CANDIDATES)
-    assert req.server_clarify and len(req.candidates) == 2
+    # round 15 U6: the two candidates the reply names reach the model again; the server asks nothing
+    assert not req.server_clarify and not req.clarify and len(req.offered) == 2 and req.candidates == []
     new = _validate(_resolved(relation="new_question", intent=_intent("property")), "הגפן", candidates=CANDIDATES)
-    assert not new.clarify  # not called an answer: a new question
+    assert not new.clarify and not new.offered  # not called an answer: a new question
 
 
 def test_a_complete_name_stated_in_a_new_question_still_selects_that_candidate():
@@ -302,20 +303,24 @@ def test_an_ordinal_with_no_list_is_rejected_recorded_and_flagged_for_the_reques
     assert "לא ניתנה רשימה" not in resolve.requested_block(ok) and "גישת ההכנסות" in resolve.requested_block(ok)
 
 
-def test_an_ordinal_that_also_fits_the_candidates_or_a_listing_gets_one_focused_server_question():
+def test_an_ordinal_that_also_fits_the_candidates_or_a_listing_is_told_to_the_model_as_two_readings():
+    """Round 10 KTD6, round 15 U6 (KTD1, R2): two substantive readings of an ordinal are the model's to weigh, as a hint in
+    the request block; the server asks nothing."""
     r = _resolved(intent=_intent("professional", "prior_answer_item", item=2))
     both = _validate(r, "השנייה", candidates=CANDIDATES, items=ITEMS)
-    assert both.server_clarify and "גישת ההכנסות" in both.clarify and "מתחם הגפן ב" in both.clarify
+    assert not both.server_clarify and not both.clarify
+    assert both.hints and "גישת ההכנסות" in both.hints[0] and "מתחם הגפן ב" in both.hints[0]
     assert both.candidates == [] and both.resolution["decisions"]["item"].startswith("ambiguous")
+    assert "גישת ההכנסות" in resolve.requested_block(both)
     listing = [{"document_id": "d-1", "title": "שומה א"}, {"document_id": "d-2", "title": "שומה ב"}]
     listed = _validate(r, "השנייה", items=ITEMS, listing=listing)
-    assert listed.server_clarify and "שומה ב" in listed.clarify and "ברשימת המסמכים" in listed.clarify
+    assert not listed.clarify and listed.hints and "שומה ב" in listed.hints[0] and "ברשימת המסמכים" in listed.hints[0]
     same = _validate(r, "השנייה", items=ITEMS, listing=[{"document_id": "d-1", "title": "גישת ההשוואה"},
                                                         {"document_id": "d-2", "title": "גישת ההכנסות"}])
-    assert not same.clarify  # the listing and the list name the same thing: one reading
+    assert not same.hints  # the listing and the list name the same thing: one reading
     short = _validate(_resolved(intent=_intent("professional", "prior_answer_item", item=3)), "השלישית",
                       candidates=CANDIDATES, items=ITEMS)
-    assert not short.clarify  # the third fits no candidate: one reading
+    assert not short.hints  # the third fits no candidate: one reading
 
 
 FOCUS = {"metric_as_written": "שווי", "metric_kind": "value", "unit": "ILS", "period": "unknown", "area_basis": "",

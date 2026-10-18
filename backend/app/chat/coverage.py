@@ -566,19 +566,42 @@ def _unit_text(ws: Workspace, key: str, fallback: str = "") -> str:
     return f"«{name}»" + (f" ({pages})" if pages else "")
 
 
+def _offered_only(ws: Workspace) -> set[str]:
+    """The handles of the candidate units the turn's first message only OFFERED the model (``Workspace.offered_units``,
+    round 15 U6): not read (a passage of theirs returned), not worked in through a handle (``unit_scopes``), not the
+    conversation's unit, not declared in the answer. A candidate shown and ignored is no unit the turn was in, nor a file it
+    knew to hold several units (round 15 U7)."""
+    offered = set(getattr(ws, "offered_units", ()) or ())
+    if not offered:
+        return set()
+    used = {h for s in ws.sources.values() if not s.is_listing and (h := s.tags.get("unit"))}
+    used |= {h for scope in ws.unit_scopes.values()
+             if (h := ws.handle_ids.get(("U", (scope["version_id"], scope["reading_id"] or None, scope["unit_no"]))))}
+    if ws.unit_focus and ws.unit_focus.get("handle"):
+        used.add(ws.unit_focus["handle"])
+    for a in getattr(ws, "declared_units", ()) or ():
+        used |= {h for h, d in ws.handles.items() if d["kind"] == "U" and str(d["document_id"]) == str(a["document_id"])
+                 and (d.get("reading_id") or None) == (a.get("reading_id") or None) and d["unit_no"] == a["unit_no"]}
+    return offered - used
+
+
 def unit_signal(ws: Workspace) -> dict:
     """What the turn knows of the appraisal unit (round 9 U9, U10): ``multi`` — the documents it saw to hold several
     units (a source or a unit handle of theirs); ``located`` — the units it was in, as {unit id: how a line names it}:
     the conversation's unit (``Workspace.unit_focus``), a unit its tools worked in through a handle
-    (``unit_scopes``), the one unit a request that names a property matches in a file, and the one unit
-    ``find_documents`` listed when it listed no other. A turn that touched a file of several units and was in none of
-    them has located nothing (R18)."""
+    (``unit_scopes``), the units the answer declared (``declared_units``, round 15 U7), the one unit a request that names
+    a property matches in a file, and the one unit ``find_documents`` listed when it listed no other. A turn that touched
+    a file of several units and was in none of them has located nothing (R18). A candidate the first message only offered
+    the model is neither (``_offered_only``): it counts once the turn read, scoped or declared it."""
+    from app.chat import entities
     from app.chat.tools import asked_contexts
 
+    ignored = _offered_only(ws)
     several = {v for v, cx in ws.contexts.items() if cx.multi}
     multi = {str(s.document_id) for s in ws.sources.values()
              if s.document_id is not None and (s.unit or str(s.version_id) in several)}
-    multi |= {d["document_id"] for d in ws.handles.values() if d["kind"] == "U"}
+    handles = {h: d for h, d in ws.handles.items() if d["kind"] == "U" and h not in ignored}
+    multi |= {d["document_id"] for d in handles.values()}
     multi |= {x["document_id"] for x in ws.unit_scopes.values()}
     found: dict[str, str] = {}
     focus = ws.unit_focus
@@ -588,12 +611,19 @@ def unit_signal(ws: Workspace) -> dict:
         found[key] = _unit_text(ws, key, focus.get("display") or "")
     for key in ws.unit_scopes:
         found.setdefault(key, _unit_text(ws, key))
+    for a in getattr(ws, "declared_units", ()) or ():  # the answer's own declaration, validated against what was offered or read
+        multi.add(str(a["document_id"]))
+        for d in handles.values():
+            if (str(d["document_id"]) == str(a["document_id"]) and (d.get("reading_id") or None) == (a.get("reading_id") or None)
+                    and d["unit_no"] == a["unit_no"]):
+                key = _unit_key(d)
+                found.setdefault(key, _unit_text(ws, key, entities.focus_text(a)))
     for cx in ws.contexts.values():
         if cx.multi:
             named = [n for n in asked_contexts(ws, cx) if cx.is_subject(n)]
             if len(named) == 1:
                 found.setdefault(cx.key(named[0]), _unit_text(ws, cx.key(named[0])))
-    listed = [d for d in ws.handles.values() if d["kind"] == "U"]
+    listed = list(handles.values())
     if not found and len(listed) == 1:
         key = _unit_key(listed[0])
         found[key] = _unit_text(ws, key)

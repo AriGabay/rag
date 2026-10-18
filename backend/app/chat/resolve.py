@@ -21,8 +21,9 @@ metric, unit, scale, period and area basis. The server then validates the parse:
   documents the user may see (decided by the database under the user's permissions, ``authorized``), and the
   documents the new request names. When the user changes the property, the unit or the document — or names an
   address, a parcel, a unit label or a complete name that the focus does not hold — the old documents are no filter: the
-  user's words are looked up (``app.chat.entities``) and the outcome is the scope, or a clarification. A question
-  over a set of documents leaves the set to the tools;
+  user's words are looked up (``app.chat.entities``) and the outcome is the scope — or, when it is no one document or
+  unit, the candidates (``Request.offered``) and a hint (``Request.hints``) the answering model gets: since round 15 U6
+  (KTD1, R2) the server asks nothing in its place. A question over a set of documents leaves the set to the tools;
 - **intent** (round 10 KTD1, KTD2, KTD7; ``app.chat.intent``): the parse also says what the request is about
   (professional, property, document, mixed, set, unknown), and the server settles it against the message. A lookup of a
   property or a document runs only for an intent that refers to one, and only on hard evidence — an address, a block
@@ -225,6 +226,13 @@ class Request:
     entity_changed: bool = False  # the documents are the ones the user's words named, not the focus's
     server_clarify: bool = False  # the clarification is the server's (titles the user may see, the user's words)
     candidates: list[dict] = field(default_factory=list)  # the documents a server clarification named
+    # round 15 U6 (KTD1, R2): what a lookup that is not one document or unit reaches the model as. ``offered``: the
+    # candidates (``Candidate.as_dict``, units with their anchors) an ambiguous lookup found, or the file's appraisals when
+    # the conversation's unit is gone — rendered as cards, never a server question; ``hints``: model-facing lines for an
+    # outcome with no candidate (nothing found, the words split across appraisals, a document not read, two readings of an
+    # ordinal). Neither is stored with the message: the lookup is in the diagnostics (``resolution["lookup"]``)
+    offered: list[dict] = field(default_factory=list)
+    hints: list[str] = field(default_factory=list)
     # the other files a server clarification names — not read, listed as not checked, or holding the words in different
     # units — bound to the message like candidates, so it is hidden once the user loses access to one of them
     named_documents: list[str] = field(default_factory=list)
@@ -326,51 +334,36 @@ def _scale_of(resolved: ResolvedRequest) -> bool | None:
     return None
 
 
-MSG_ANSWER_BY_NUMBER = "אפשר לענות במספר, או במילה שמבדילה ביניהן."
+MSG_HINT_GONE = ("הקובץ נקרא מחדש, והשומה שדיברנו עליה («{title}») כבר אינה בו כפי שנקראה; מספרה הקודם אינו מזהה שומה. "
+                 "שומות הקובץ ברשימת היחידות המועמדות: בחר לפי מה שהמשתמש אמר, ושאל רק אם נשארת עמימות מהותית.")
 
 
-def _numbered_candidates(cands: list[entities.Candidate]) -> str:
-    """The candidates of a clarification as a numbered list, one per line, each as ``candidate_label`` names it."""
-    return "\n".join(f"{n}. {prompt_text(entities.candidate_label(c.as_dict()))}" for n, c in enumerate(cands, 1))
+def gone_unit_hint(gone: dict) -> str:
+    """What the model is told when the unit the conversation was in is not in the file's new reading (round 15 U6, KTD1,
+    R2): the file's appraisals are the candidates, the old unit number selects nothing, and the server asks nothing."""
+    return MSG_HINT_GONE.format(title=prompt_text(gone.get("display") or MSG_NO_TITLE))
 
 
-def _clarify_titles(outcome: entities.Outcome, words: str) -> str:
-    """The server's question between candidates: documents by title; units by title, pages, identifiers and file, in the
-    order of how well their names fit the words (round 9 U9, R13)."""
-    if any(d.unit for d in outcome.documents):
-        names = _numbered_candidates(outcome.documents)
-        return (f"נמצאו כמה שומות שמתאימות ל\"{prompt_text(words)}\":\n{names}\nלאיזו מהן התכוונת? "
-                + MSG_ANSWER_BY_NUMBER)
-    names = "; ".join(f"«{prompt_text(d.title)}»" for d in outcome.documents)
-    return f"נמצאו כמה מסמכים שמתאימים ל\"{prompt_text(words)}\": {names}. לאיזה מהם התכוונת?"
+MSG_SPLIT = ("המילים \"{words}\" מופיעות בקובץ «{title}» אך בשומות שונות שבו: אף שומה אחת אינה מכילה את כולן. אל תייחס "
+             "אותן לשומה אחת בלי שהמסמכים מראים זאת.")
 
 
-MSG_UNIT_GONE = ("הקובץ נקרא מחדש, והשומה שדיברנו עליה («{title}») כבר אינה בו כפי שנקראה. לאיזו מהשומות בקובץ "
-                 "התכוונת?")
+MSG_HINT_AMBIGUOUS = ("החיפוש לפי \"{words}\" מצא כמה שומות שמתאימות במידה דומה; הן מופיעות ברשימת היחידות המועמדות. "
+                      "אל תבחר ביניהן לפי מספר הקטעים: בחר לפי מה שהמשתמש אמר ומה שהמסמכים מראים, ושאל את המשתמש רק אם "
+                      "נשארת עמימות מהותית.")
+MSG_HINT_MISSING = ("החיפוש לפי \"{words}\" במסמכים שהמשתמש רשאי לראות לא איתר מסמך או שומה כאלה. אל תענה על נכס אחר במקומו "
+                    "ואל תחזור לנכס הקודם; אם גם החיפוש שלך אינו מוצא אותם — אמור שלא אותרו, לא שאינם קיימים במסמכים.")
+MSG_HINT_NO_WORDS = ("החיפוש לא איתר במסמכים שהמשתמש רשאי לראות את הנכס שצוין. אל תענה על נכס אחר במקומו ואל תחזור לנכס "
+                     "הקודם; אם גם החיפוש שלך אינו מוצא אותו — אמור שלא אותר, לא שאינו קיים במסמכים.")
+MSG_HINT_NOT_READ = "המילים \"{words}\" מתאימות למסמך שלא נקרא, ולכן לא נבדק:"
 
 
-def clarify_gone_unit(gone: dict, shown: list[entities.Candidate], total: int) -> str:
-    """The server's question when the unit the conversation was in is not in the file's new reading: the file's
-    appraisals, each by title, pages, identifiers and file (the old number selects nothing). ``total``: how many the file
-    has, of which ``shown`` are listed."""
-    names = _numbered_candidates(shown)
-    more = f"\n(יש בקובץ עוד {total - len(shown)}; אפשר לנקוב בשם הפרויקט או הנכס.)" if total > len(shown) else ""
-    return (MSG_UNIT_GONE.format(title=prompt_text(gone.get("display") or MSG_NO_TITLE)) + f"\n{names}{more}\n"
-            + MSG_ANSWER_BY_NUMBER)
-
-
-MSG_SPLIT = ("המילים \"{words}\" מופיעות בקובץ «{title}» אך בשומות שונות שבו: אף שומה אחת אינה מכילה את כולן. לאיזו "
-             "שומה התכוונת?")
-
-
-def _clarify_missing(words: str, files: list[dict] | None = None,
-                     split: list[dict] | None = None) -> tuple[str, list[str]]:
-    """The server's question when no readable document is named, and the ids of the files it names. Files the user may
-    see that were not read are listed as not checked (R5): the words may name something held only in them, so the
-    message never says it is absent."""
-    asked = (f"לא מצאתי במסמכים שאתה מורשה לראות מסמך על \"{prompt_text(words)}\". לאיזה נכס או מסמך התכוונת?"
-             if words.strip() else
-             "לא מצאתי במסמכים שאתה מורשה לראות את הנכס שציינת. לאיזה נכס או מסמך התכוונת?")
+def _missing_hint(words: str, files: list[dict] | None = None,
+                  split: list[dict] | None = None) -> tuple[str, list[str]]:
+    """What the model is told when no readable document is named, and the ids of the files it names (round 15 U6, KTD1,
+    R2: the server states the fact and the model answers or asks). Files the user may see that were not read are listed as
+    not checked (R5): the words may name something held only in them, so nothing says it is absent."""
+    asked = MSG_HINT_MISSING.format(words=prompt_text(words)) if words.strip() else MSG_HINT_NO_WORDS
     if split:  # the words are in one file, in different appraisals: nothing was found that holds them together (R11)
         asked = "\n".join(MSG_SPLIT.format(words=prompt_text(words), title=prompt_text(d["title"])) for d in split)
     listing, shown = unread.notice(files or [], words)
@@ -595,7 +588,7 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
         decisions.setdefault("subject", "rejected")
     if resolved.ambiguity.strip() and relation == "correction" and not out.clarify:
         out.clarify = resolved.ambiguity.strip()
-    _ask_which_list(out, settled, candidates, listing, decisions)
+    _note_two_lists(out, settled, candidates, listing, decisions)
     # the components apart from the rest: what is wrong with them never undoes the resolution
     analysis = request_analysis.settle(resolved.components, user_texts if user_texts is not None else [message])
     out.components, out.components_status = analysis.items, analysis.status
@@ -610,10 +603,13 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
 
 def _take(out: Request, outcome: entities.Outcome, words: str, decisions: dict,
           focus_ids: set[str] | None = None, focus_unit: dict | None = None) -> None:
-    """The scope the lookup's outcome sets, or the clarification it needs. A lookup that lands on the focus's own
+    """The scope the lookup's outcome sets, or what it reaches the model as. A lookup that lands on the focus's own
     documents changes nothing: the conversation stays where it was. In a file of several appraisals it lands on a
     unit, and the conversation stays only when that is the focus's own unit (``focus_unit``): another unit of the same
-    file is another property (KTD8)."""
+    file is another property (KTD8). An outcome that is no one document or unit does not end the turn in a question of
+    the server's (round 15 U6, KTD1, R2): the previous property is no scope, and the model gets the candidates (``offered``)
+    or a hint of what was not found (``hints``) and decides — it asks only when the candidates and the conversation leave a
+    material ambiguity."""
     decisions["entity"] = outcome.kind
     out.resolution["lookup"] = outcome.as_dict()
     if outcome.kind == "resolved":
@@ -623,24 +619,29 @@ def _take(out: Request, outcome: entities.Outcome, words: str, decisions: dict,
             out.located_unit is not None and not entities.same_unit(focus_unit, out.located_unit))
         return
     out.entity_changed = True
-    out.document_ids, out.server_clarify = [], True
+    out.document_ids = []
     if outcome.kind == "not_read":
-        # the words name a document that was not read: its state is the answer, and nothing is searched in it. The
-        # clarification offers no candidates — a reply to it is a new question
-        out.clarify = unread.message([d.unread for d in outcome.documents], prompt_text(words))
+        # the words name a document that was not read: its state is the answer, and nothing is searched in it
+        out.hints.append(MSG_HINT_NOT_READ.format(words=prompt_text(words)) + "\n"
+                         + unread.tool_block([d.unread for d in outcome.documents]))
         out.named_documents = [d.document_id for d in outcome.documents]
         return
-    out.candidates = [d.as_dict() for d in outcome.documents]
     if outcome.kind == "ambiguous":
-        out.clarify = _clarify_titles(outcome, words)
-    else:
-        out.clarify, out.named_documents = _clarify_missing(words, outcome.unread, outcome.split)
-    if outcome.kind == "not_found":
-        out.subject = ""
+        out.offered = [d.as_dict() | {"basis": entities.BASIS_ALIKE} for d in outcome.documents]
+        out.hints.append(MSG_HINT_AMBIGUOUS.format(words=prompt_text(words)))
+        # a document that is one appraisal has no unit card: it is named here, by title, with the id the tools take
+        files = [d for d in outcome.documents if not d.unit]
+        if files:
+            out.hints.append("מסמכים שמתאימים: " + "; ".join(
+                f"«{prompt_text(d.title)}» (document_id={d.document_id})" for d in files))
+        return
+    text_, out.named_documents = _missing_hint(words, outcome.unread, outcome.split)
+    out.hints.append(text_)
+    out.subject = ""
 
 
-MSG_TWO_LISTS = ("ההפניה למספר {n} מתאימה ליותר מדבר אחד: פריט {n} ברשימה שבתשובה הקודמת («{item}») ו{other}. "
-                 "לאיזה מהם התכוונת? אפשר לענות בשם.")
+MSG_TWO_LISTS = ("ההפניה למספר {n} מתאימה ליותר מדבר אחד: פריט {n} ברשימה שבתשובה הקודמת («{item}») ו{other}. הכרע לפי "
+                 "ההקשר ואמור למה התכוונת; שאל את המשתמש רק אם נשארת עמימות מהותית.")
 
 
 def _bind_references(out: Request, resolved: ResolvedRequest, settled: intent_mod.Intent, topic: str,
@@ -669,11 +670,12 @@ def _bind_references(out: Request, resolved: ResolvedRequest, settled: intent_mo
             decisions["topic"] = "no topic in the conversation: the model's own words stand"
 
 
-def _ask_which_list(out: Request, settled: intent_mod.Intent, candidates: list[dict] | None, listing: list[dict] | None,
+def _note_two_lists(out: Request, settled: intent_mod.Intent, candidates: list[dict] | None, listing: list[dict] | None,
                     decisions: dict) -> None:
     """An ordinal that names an item of the previous answer's list and also fits the candidates of a clarification or
-    a listing of documents the previous turn offered has two substantive readings: one focused question, from the
-    server (round 10 KTD6). A listing that names the same thing as the item is one reading."""
+    a listing of documents the previous turn offered has two substantive readings (round 10 KTD6). Since round 15 U6 (KTD1,
+    R2) the server does not ask: the model gets both readings as a hint and decides, asking only when the ambiguity is
+    material. A listing that names the same thing as the item is one reading."""
     if settled.bound != "item":
         return
     n, rivals = settled.item, []
@@ -685,20 +687,9 @@ def _ask_which_list(out: Request, settled: intent_mod.Intent, candidates: list[d
             rivals.append(f"מסמך {n} ברשימת המסמכים שהוצגה («{prompt_text(title)}»)")
     if not rivals:
         return
-    out.clarify = MSG_TWO_LISTS.format(n=n, item=prompt_text(settled.item_label), other=" ו".join(rivals))
-    out.server_clarify, out.candidates, out.named_documents = True, [], []
+    out.hints.append(MSG_TWO_LISTS.format(n=n, item=prompt_text(settled.item_label), other=" ו".join(rivals)))
     decisions["item"] = f"ambiguous: ordinal {n} fits the list «{settled.item_label}» and " + ("the candidates" if candidates
                                                                                               and len(candidates) >= n else "the listing")
-
-
-def first_message_clarification(question: str, outcome: entities.Outcome, words: str) -> Request:
-    """The request of a conversation's first message that names several units alike (``entities.first_message_ambiguity``):
-    the server's question between them, with the candidates the reply will be resolved among (R13, AE4)."""
-    out = Request(KIND_OF_RELATION["new_question"], question, relation="new_question")
-    decisions = {"first_message": "the words fit several units of a file equally well"}
-    _take(out, outcome, words, decisions)
-    out.resolution.update(parse=None, decisions=decisions)
-    return out
 
 
 def _input(focus: dict | None, history: list, message: str, documents: list[dict],
@@ -857,9 +848,12 @@ def requested_block(req: Request, unit_handle: str | None = None) -> str:
         where = "; ".join(x for x in (entities.unit_pages(u), " · ".join(u.get("identifiers") or ())) if x)
         lines.append(f"- יחידה בקובץ: {unit_handle} «{prompt_text(u.get('display') or MSG_NO_TITLE)}»"
                      + (f" ({prompt_text(where)})" if where else "")
-                     + (" — היחידה שהשיחה כבר עוסקת בה; שינוי מדד או חישוב אינו מעביר שומה" if req.unit_kept else "")
-                     + f". חפש וקרא בתוכה בלבד (search ו-outline עם unit={unit_handle}, read עם pages ו-document="
-                       f"{unit_handle}); ערך משומה אחרת בקובץ אינו של הנכס שנשאל")
+                     + (" — היחידה שהשיחה כבר עוסקת בה; שינוי מדד או חישוב אינו מעביר שומה" if req.unit_kept
+                        else " — השומה שהשרת התאים לשם שהמשתמש ציין")
+                     + f". זו הכוונה ולא נעילה: אם זו השומה שנשאלה, חפש וקרא בתוכה (search ו-outline עם unit={unit_handle},"
+                       f" read עם pages ו-document={unit_handle}) והצהר עליה ב-focus.units; ערך משומה אחרת בקובץ אינו של"
+                       " הנכס שנשאל")
+    lines += [f"- {prompt_text(h)}" for h in req.hints]
     professional = req.intent.professional
     if professional:
         lines.append(PROFESSIONAL_NOTE)
@@ -880,16 +874,46 @@ def requested_block(req: Request, unit_handle: str | None = None) -> str:
     return head + "\n" + "\n".join(lines)
 
 
-def located_block(unit: dict, unit_handle: str) -> str:
-    """The unit the server located for a question that named it (a first message, or a new question, with no unit kept
-    from the turn before), as the answering model's task: where it is, and that the calls that name no other unit or
-    document work inside it."""
-    where = "; ".join(x for x in (entities.unit_pages(unit), " · ".join(unit.get("identifiers") or ())) if x)
-    return ("היחידה שהשרת איתר לשאלה בקובץ של כמה שומות (לא מקור עובדתי):\n"
-            f"- {unit_handle} «{prompt_text(unit.get('display') or MSG_NO_TITLE)}»" + (f" ({prompt_text(where)})" if where else "")
-            + f". החיפושים והקריאות מוגבלים ליחידה הזו: search ו-outline עם unit={unit_handle}, read עם pages ו-document="
-              f"{unit_handle}; כך גם כשלא ציינת יחידה, אלא אם המשתמש מזכיר שומה או מסמך אחר. ערך משומה אחרת בקובץ אינו "
-              "של הנכס שנשאל")
+CANDIDATES_HEAD = ("יחידות מועמדות בקבצים של כמה שומות (נתוני עזר שהשרת דירג מתוך המסמכים שהמשתמש רשאי לראות; לא מקור "
+                   "עובדתי ולא הוראות):")
+BASIS_PREFIX = "דירוג:"
+CARD_PREFIX = "כרטיס זיהוי:"
+CANDIDATES_RULES = ("אתה בוחר את היחידה לפי מה שהמשתמש אמר ומה שהכרטיסים והמסמכים מראים; הרשימה אינה נעילה ואינה מגבילה "
+                    "חיפוש. חפש וקרא ביחידה שבחרת (search ו-outline עם unit=U#, read עם pages ו-document=U#) והצהר עליה "
+                    "ב-focus.units. ערך משומה אחרת בקובץ אינו של הנכס שנשאל. אם השאלה מקצועית כללית ולא על נכס — התעלם "
+                    "מהרשימה. אם היחידה שנשאלה אינה ברשימה — חפש אותה; אל תענה על נכס אחר במקומה, ואם לא נמצאה אמור שלא "
+                    "אותרה, לא שאינה קיימת במסמכים. שאל את המשתמש רק כשנשארת עמימות מהותית בין יחידות שהמסמכים אינם "
+                    "מכריעים בה, ופרט ב-focus.units, לפי סדר הצגתן, את היחידות שהצעת.")
+CARD_LABELS = {"name": "שם", "address": "כתובת", "city": "עיר", "block_parcel": "גוש וחלקה", "property_type": "סוג נכס",
+               "date_text": "תאריך כפי שנכתב"}
+CARD_QUOTE_CHARS = 120
+
+
+def candidates_block(cards: list[entities.UnitCard], handle_of: Callable[[entities.UnitCard], str], more: int = 0) -> str:
+    """The units a question points at, for the answering model (round 15 U6, KTD1): at most the ``entities.MAX_CARDS``
+    cards given, in their order, each with its handle (U#, ``handle_of``), title, pages, identifiers and file, the basis of
+    its ranking and the quotes of its identity card; ``more`` — how many others matched, counted and never listed. Data
+    the model weighs, never a scope rule; it holds nothing that changes between two runs of the same turn. "" for no
+    cards. Document-derived text goes through ``prompt_text``."""
+    if not cards:
+        return ""
+    lines = [CANDIDATES_HEAD]
+    for c in cards:
+        a = c.anchor
+        where = [x for x in (entities.unit_pages(a), " · ".join(a.get("identifiers") or ())) if x]
+        lines.append(f"- {handle_of(c)} «{prompt_text(a.get('display') or MSG_NO_TITLE)}»"
+                     + "".join(f" | {prompt_text(x)}" for x in where) + f" | קובץ «{prompt_text(c.row.get('file_title') or '')}»")
+        if c.basis:
+            lines.append(f"  {BASIS_PREFIX} {prompt_text(c.basis)}")
+        quotes = [f"{CARD_LABELS[f['field']]} «{prompt_text((f.get('quote') or '')[:CARD_QUOTE_CHARS])}»"
+                  for f in c.fields if f.get("field") in CARD_LABELS and f.get("quote")]
+        if quotes:
+            lines.append(f"  {CARD_PREFIX} " + "; ".join(quotes))
+    if more > 0:
+        lines.append(f"ועוד {more} יחידות מתאימות שאינן מוצגות; אם היחידה שנשאלה אינה ברשימה, מצא אותה לפי שמה "
+                     "(find_documents).")
+    lines.append(CANDIDATES_RULES)
+    return "\n".join(lines)
 
 
 def family(kind: str) -> str:

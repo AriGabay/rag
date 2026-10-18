@@ -40,6 +40,19 @@ One turn:
    digest goes with it. Every path that returns an answer comes through ``finish``, the fallbacks to an earlier round's
    answer included.
 
+Candidates and the declared unit (round 15 U6, KTD1, KTD2, KTD7; R1-R4). The model, not the server, decides which appraisal a
+question is about. The intent is the request analysis' claim (``intent.settle``: evidence is a recorded hint). On a first
+message, and on a follow-up that names another subject, the model's first message ends with a block of candidate units — at most
+eight cards ranked by name, identifier and identity card, each with a ``U#`` handle, pages, the card's quotes and the basis of
+its rank, and a count of the rest (``entities.rank_candidates``, ``resolve.candidates_block``); a follow-up that keeps its unit
+gets that unit's card alone. The block is data: nothing in it scopes a call, the server pins nothing (``tools.locate_unit`` is
+the search-only path's) and asks nothing in the model's place when a lookup is ambiguous, finds nothing or the unit is gone — the
+model gets the candidates or a hint and asks only when a material ambiguity remains. The answer declares the unit it is about in
+``focus.units``; the server keeps the handles it offered or the turn read (``_declare_units``) as ``Workspace.declared_units``,
+which are the turn's unit and the unit the next turn keeps, and a clarification's validated units are stored as the candidates
+its reply binds to (``TurnOutcome.offered_units``). Pending-parameter binding, the scale contradiction and the resolution
+model's own question about a correction are the only questions that still end a turn without an answer step.
+
 Inputs and missing assumptions (round 7 U7, KTD8, KTD9, R23–R25). The policy has one rule on assumptions: a
 material parameter the user did not give is never assumed; a rate the report itself states (a sensitivity scenario,
 say) is a document value to compute from and present as the report's; when neither gave it, the answer is a
@@ -149,10 +162,13 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
 - קובץ אחד יכול להכיל כמה שומות או נספחים — יחידות (U#). כל תוצאה בקובץ כזה מציינת את היחידה שלה (unit_id), וערך
   מיחידה אחרת אינו של הנכס שנשאל. שאלה על שומה אחת מתוכן: אתר את היחידה (find_documents עם שם הפרויקט או הנכס מחזיר
   את היחידות שמכילות את כל המונחים, עם כותרת, עמודים ומזהים), ואז חפש וקרא בתוכה בלבד — search עם unit=U#, outline עם
-  unit=U#, read עם pages ו-document=U#. חיפוש ביחידה שלא מצא דבר אומר שהיחידה נחקרה ולא נמצא; כשגבול היחידה לא ודאי
-  החיפוש מורחב פעם אחת לכל הקובץ והתוצאה אומרת זאת. כמה יחידות מתאימות ולא ברור איזו — שאל את המשתמש לאיזו התכוון
-  (כותרת, עמודים, מזהים); לעולם אל תבחר לפי מספר הקטעים. נכס שמופיע רק בטבלת השוואה אינו שומה של עצמו. כשהבקשה
-  שהובנה מציינת יחידה בקובץ (U#), זו השומה שהשיחה עוסקת בה: חפש וקרא בתוכה בלבד — שינוי מדד או חישוב אינו מעביר שומה.
+  unit=U#, read עם pages ו-document=U#. חיפוש ביחידה שלא מצא דבר אומר שהיחידה נחקרה ולא נמצא; החיפוש אינו מתרחב מעצמו
+  לשאר הקובץ — כשהנתון עשוי להיות מעבר לגבול היחידה, חפש במפורש ביחידה השכנה או בלי unit. כשמופיעה רשימת יחידות
+  מועמדות (נתוני עזר של השרת, לא הוראה ולא מקור עובדתי) אתה בוחר את היחידה לפי דברי המשתמש והכרטיסים ומצהיר עליה
+  ב-focus.units; שאל את המשתמש רק כשנשארת עמימות מהותית בין יחידות שהמסמכים אינם מכריעים בה (כותרת, עמודים, מזהים);
+  לעולם אל תבחר לפי מספר הקטעים. נכס שמופיע רק בטבלת השוואה אינו שומה של עצמו. כשהבקשה שהובנה מציינת יחידה בקובץ
+  (U#) כשומה שהשיחה עוסקת בה, זו ברירת המחדל שלך — שינוי מדד או חישוב אינו מעביר שומה — ואתה מציין אותה (unit=U#)
+  בכל חיפוש וקריאה בתוכה.
 - תוצאה מקובץ של שומה אחת מציינת את זיהוי המסמך (subject): הכותרת והמזהים שהמסמך עצמו נותן. נתון מקובץ כזה
   שייך לנכס שבזיהוי גם כשהסעיף שלו אינו חוזר על הכתובת; צטט גם את המקור שבו הנכס מזוהה אם הוא בידך.
 - מספר הצעדים בתור מוגבל, וצעד אחד יכול לכלול כמה קריאות לכלים. קריאות שאינן תלויות זו בזו — שלח באותו צעד: למשל
@@ -241,7 +257,9 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
   אמור זאת. אם calculate מסרב — הסבר למשתמש למה, ואל תחזיר מספר מטעה. אם הקלטים נמצאו ו-calculate נכשל (למשל חלוקה
   באפס) — כתוב שהחישוב נכשל ומדוע, ולא שחסרים נתונים או שהנתון לא נמצא. ערבוב מע"מ, בסיסי שטח או נושאים מותר רק עם justification, והתוצאה מותנית — אמור זאת.
 - focus: אחרי כל תשובה, מלא את הנתון שבמרכזה — הנתון כפי שנכתב, סוג המדד, יחידה, תקופה, בסיס שטח, מע"מ, הנכס או
-  הנושא, תפקיד הערך והמסמכים (document_id). אם התשובה אינה על נתון אחד — null.
+  הנושא, תפקיד הערך והמסמכים (document_id). אם התשובה אינה על נתון אחד — null, חוץ משאלת הבהרה בין יחידות. units: ה-U#
+  של השומות שהתשובה עוסקת בהן, לפי סדר, מתוך הרשימה שהוצגה לך או מיחידות שקראת בתור (אחרת השרת מוחק אותן); בשאלת
+  הבהרה בין יחידות — היחידות שהצעת, לפי סדר הצגתן (מלא focus גם בלי נתון); ריק כשהתשובה אינה על שומה בקובץ של כמה שומות.
 - תיקון של המשתמש ("התכוונתי ל...", "לא, ה..."): שנה רק את מה שתוקן, ושמור מ"הנתון שבמרכז השיחה" את כל השאר — אותו
   נכס, אותם מסמכים, אותה יחידה ובסיס שטח. "התכוונתי לשווי" אחרי שאלה על שכירות למ"ר = שווי למ"ר באותו נכס, לא השווי
   הכולל. כשהנתון שבמרכז השיחה הוא ליחידת שטח (למ"ר), "שווי" בתיקון או בשאלת המשך הוא השווי ליחידת שטח של אותו נכס;
@@ -384,6 +402,11 @@ class Focus(_Strict):
     subject: str
     value_role: _choice(*T.ROLE_LABELS)
     document_ids: list[str]
+    # round 15 U6 (KTD7): the units (U#, in order) the answer is about, or — for a clarification between units — the units it
+    # offers, in the order it writes them. The server validates each against the units it offered in the candidates block or
+    # the turn read, and drops anything else (``_declare_units``); a handle means nothing to the next turn, so the stored focus
+    # carries none
+    units: list[str]
 
 
 class Requested(_Strict):
@@ -513,6 +536,13 @@ class TurnOutcome:
     unit: dict | None = None
     # the turn ended in the server's own question (``asked_by_server``): its text is the server's, not a list of items
     server_asked: bool = False
+    # a model's clarification between units (round 15 U6, KTD1): the units it declared in ``focus.units`` and the server
+    # validated, in the order it wrote them, as the candidates a reply is resolved among (``Candidate.as_dict``: the file,
+    # the unit and its anchor). Empty for any other answer, and for a clarification that declared none: it binds nothing
+    offered_units: list[dict] = field(default_factory=list)
+    # the documents of the candidates the model was shown, for a clarification only: its text may name any of them, so the
+    # message is hidden when the user loses access to one (``api._answer_documents``)
+    shown_documents: list[str] = field(default_factory=list)
 
 
 def usage_summary(usage: list[dict], **extra) -> dict:
@@ -531,12 +561,14 @@ def usage_summary(usage: list[dict], **extra) -> dict:
 
 
 def _context_message(inp: TurnInput, request: resolve.Request | None = None, binding: dict | None = None,
-                     unit_handle: str | None = None, located: dict | None = None,
+                     unit_handle: str | None = None, candidates: str = "",
                      intent: intent_mod.Intent | None = None, time_mode: timeframe.TimeMode | None = None) -> str:
     """The turn's first message. ``intent``: a first turn's settled intent, when it is known by now (a follow-up's is on
     its ``request``). A professional request carries no focus block: the conversation's property is not its subject
     (round 10 KTD7). ``time_mode``: the turn's time decision (round 11 U7, KTD2, KTD5); its block follows the request
-    block, only when the mode is ``recent`` or ``explicit`` (``none``: no block), and never touches the focus above."""
+    block, only when the mode is ``recent`` or ``explicit`` (``none``: no block), and never touches the focus above.
+    ``candidates``: the candidates block (``resolve.candidates_block``, round 15 U6, KTD1) — the last item, data the model
+    weighs and never a scope rule."""
     parts = []
     if inp.summary:
         parts.append("סיכום השיחה עד כה (לא מקור עובדתי):\n" + prompt_text(inp.summary))
@@ -590,8 +622,8 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None, bin
         parts.append("הבקשה כפי שהובנה:\n" + resolve.PROFESSIONAL_NOTE)
     if time_mode is not None and (time_block := timeframe.block(time_mode)):
         parts.append(time_block)
-    if located is not None and unit_handle:  # the unit the server found for the question at the turn's start
-        parts.append(resolve.located_block(located["anchor"], unit_handle))
+    if candidates:  # the units the question points at, ranked (round 15 U6, KTD1): data after the request block
+        parts.append(candidates)
     return "\n\n".join(parts)
 
 
@@ -674,6 +706,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     held: request_analysis.Analysis | None = None
     turn_intent: intent_mod.Intent | None = None
     first_decisions: dict[str, str] = {}
+    shown: list[entities.UnitCard] = []  # the candidate cards of a first message or of a new subject (round 15 U6, KTD1)
+    more = 0  # how many others matched
 
     def start_analysis() -> None:
         nonlocal pending
@@ -775,41 +809,23 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         # server's names only titles the user may see and the user's own words
         if request is not None and request.clarify and (request.server_clarify or not re.search(r"\d", request.clarify)):
             return asked_by_server(request)
-        # a new question that no unit is kept for is looked up as a first message is — but never a professional one, and
-        # for an intent that refers to a property only when the question holds hard evidence of it (round 10 KTD3, R8):
-        # a pin from passages or a name word shared by units is no evidence
+        # a new question that no unit is kept for gets the candidates a first message gets (round 15 U6, KTD1): ranked from
+        # the same evidence, as cards the model weighs — never a pin and never a question of the server's. Not for a
+        # professional or a set question, which name no appraisal to choose
         if (request is not None and request.relation == "new_question" and ws.unit_focus is None
-                and not request.document_ids and request.intent.refers and request.intent.evidence
-                and (found := entities.first_message(ctx, inp.question)) is not None):
-            if found.ambiguity is not None:
-                settled = request.intent
-                request = resolve.first_message_clarification(inp.question, *found.ambiguity)
-                request.intent = settled
-                _record_intent(request.resolution, settled)
-                return asked_by_server(request)
-            T.locate_unit(ws, found.unit, found.version_id)
-    elif (found := entities.first_message(ctx, inp.question)) is not None:
-        # Hard evidence in the question (a complete unit name, an address, a parcel or a label) applies at once. A pin
-        # from passages, or name words several units share without a complete name, is provisional: it waits for the
-        # request analysis, within ``chat_intent_wait_seconds``, and is dropped for a professional question, for an
-        # unknown intent and when the analysis is late (round 10 KTD3, R8)
-        keep = bool(intent_mod.evidence(inp.question, titles()))
-        if not keep:
-            start_analysis()
-            collect_analysis(settings.chat_intent_wait_seconds)
-            keep = held is not None and turn_intent is not None and turn_intent.refers
-            first_decisions["first_message"] = ("provisional, applied: intent " + turn_intent.value if keep else
-                                                "provisional, dropped: " + (f"intent {turn_intent.value}" if turn_intent
-                                                                            else "no intent"))
-        if keep and found.ambiguity is not None:
-            # a first message whose words fit several units of a file alike: the question between them is the server's,
-            # as it is for a follow-up, and no model is called (R13, AE4)
-            request = resolve.first_message_clarification(inp.question, *found.ambiguity)
-            request.intent = turn_intent or intent_mod.settle(None, inp.question, titles())
-            _record_intent(request.resolution, request.intent, first_decisions)
-            return asked_by_server(request)
-        if keep:
-            T.locate_unit(ws, found.unit, found.version_id)  # the one unit the question names: the turn's working unit
+                and not request.document_ids and not request.intent.professional and request.scope != "set"
+                and not request.offered):
+            ranked = entities.rank_candidates(ctx, inp.question)
+            if ranked is not None:
+                shown, more = ranked.cards, ranked.total - len(ranked.cards)
+                request.resolution.setdefault("decisions", {})["candidates"] = _candidates_decision(ranked.cards, more)
+    else:
+        # a first message gets the candidates its words point at, as cards, with no wait for the request analysis and no
+        # pin (round 15 U6, KTD1, KTD2): the model chooses the unit and declares it
+        ranked = entities.rank_candidates(ctx, inp.question)
+        if ranked is not None:
+            shown, more = ranked.cards, ranked.total - len(ranked.cards)
+            first_decisions["candidates"] = _candidates_decision(ranked.cards, more)
 
     def finish(answer: FinalAnswer, report: VerifyReport) -> TurnOutcome:
         # removals; each component recomputed from the surviving units; the absences the server states removed; one
@@ -832,6 +848,15 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         final, outcomes, ledger = composed.answer, composed.outcomes, composed.ledger
         final = final.model_copy(update={"focus": _surviving_focus(ws, final)})
         unit = _turn_unit(ctx, ws, final, request)
+        # a clarification between units: the units it offered, in the order it wrote them, which the reply binds to
+        offered = (entities.offered_candidates(ctx, [(str(a["document_id"]), a.get("reading_id"), a["unit_no"])
+                                                     for a in ws.declared_units])
+                   if final.status == "clarification" else [])
+        # a clarification may name any of the candidates the model was shown (the cards and the documents of a lookup): the
+        # message is bound to their documents, so it is hidden once the user loses access to one of them (round 15 U6, KTD1)
+        shown_documents = (sorted({str(ws.handles[h]["document_id"]) for h in ws.offered_units if h in ws.handles}
+                                  | {str(d["document_id"]) for d in (request.offered if request is not None else [])})
+                           if final.status == "clarification" else [])
         report.completeness = coverage.completeness(outcomes)
         # the side effects, once, after the last pass: the documents the final text cites are marked verified
         if final.status != "clarification":
@@ -845,7 +870,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                                                   else _first_resolution(turn_intent, first_decisions), notes), ws.time),
                            _summary(usage, rounds, reused, turn),
                            _pending(ws, turn, final), composed.spans, done.digest, done.stats, ws.clock.summary(),
-                           unit)
+                           unit, offered_units=offered, shown_documents=shown_documents)
 
     def adopt_analysis() -> None:
         """The collected analysis as the turn's requirements: its components frozen and appended as one item, or the
@@ -888,8 +913,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
 
     ws.binding = binding  # an ``assume`` of the bound number records the parameter it fills (KTD9)
     items: list = [{"role": "user", "content": _context_message(
-        inp, request, binding, ws.unit_focus["handle"] if ws.unit_focus else None, ws.located_unit, turn_intent,
-        ws.time)}]
+        inp, request, binding, ws.unit_focus["handle"] if ws.unit_focus else None,
+        _candidates_text(ctx, ws, request, inp.question, shown, more), turn_intent, ws.time)}]
     if request is None and first_turn:
         # a first turn: the request is analysed beside the first step (no added latency), within the reading time
         start_analysis()
@@ -990,6 +1015,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         if not restored:
             answer_seconds = time.monotonic() - step_started
             ws.clock.add("compose", answer_seconds)
+            _declare_units(ctx, ws, answer)  # the units it declares, validated (round 15 U6, KTD7)
             if pending is not None or held is not None:
                 settle_analysis()  # the first step answered: the requirements are frozen before verification
             if answer.status == "clarification" and answer.clarification_question.strip() and not answer.answer_markdown.strip():
@@ -1147,8 +1173,8 @@ def _settle_unit(ctx: TenantContext, ws: T.Workspace, request: resolve.Request) 
     """The request's unit against the current reading of its file (KTD8): the same unit, or — the file was read again —
     the unit found by its anchor, never by its number. The conversation's unit gets its turn handle (U#), which a search
     or outline that names no other document works inside (``tools.focus_unit_for``). A unit no longer in the file is
-    dropped and the answer asks which appraisal is meant; a file that is one unit now, or one the user cannot read, drops
-    it silently."""
+    dropped and the file's appraisals become the model's candidates (it asks only if the ambiguity is material); a file
+    that is one unit now, or one the user cannot read, drops it silently."""
     live = entities.live_unit(ctx, request.located_unit)
     decisions = request.resolution.setdefault("decisions", {})
     if live.status in ("current", "moved"):
@@ -1157,22 +1183,103 @@ def _settle_unit(ctx: TenantContext, ws: T.Workspace, request: resolve.Request) 
         u = request.located_unit
         handle = T.unit_handle_of(ws, u["document_id"], live.version_id, u.get("reading_id"), u["unit_no"])
         ws.unit_focus = {"handle": handle, "document_id": str(u["document_id"]), "display": _focus_text(u)}
+        ws.offered_units.add(handle)  # the model may name it and declare it
         return
     gone = request.located_unit
     request.located_unit, request.unit_kept = None, False
     if live.status != "gone":
         decisions["unit"] = f"dropped: {live.status}"
         return
+    # the unit is not in the file's new reading: the file's appraisals reach the model as candidates and the old number
+    # selects nothing (round 15 U6, KTD1, R2) — the server does not ask in its place
     decisions["unit"] = "gone"
-    shown = live.candidates[:entities.CLARIFY_TITLES]
-    request.clarify = resolve.clarify_gone_unit(gone, shown, len(live.candidates))
-    request.candidates = [c.as_dict() for c in shown]
-    request.document_ids, request.entity_changed, request.server_clarify = [], True, True
+    request.offered = [c.as_dict() | {"basis": entities.BASIS_GONE} for c in live.candidates]
+    request.hints.append(resolve.gone_unit_hint(gone))
+    request.document_ids, request.entity_changed = [], True
 
 
 def _focus_text(unit: dict) -> str:
     """How a gap line names the conversation's unit when the turn read nothing in it: «title» and its pages."""
     return entities.focus_text(unit)
+
+
+def _candidates_decision(cards: list[entities.UnitCard], more: int) -> str:
+    """The candidates block as the diagnostics record it: how many cards and how many more matched, and each card's stable
+    unit id in the order shown (so the rank of the unit a question was about can be read later). No text of a document."""
+    return f"{len(cards)} shown" + (f", {more} more" if more else "") + ": " + ", ".join(
+        str(c.row.get("unit_id")) for c in cards)
+
+
+def _candidates_text(ctx: TenantContext, ws: T.Workspace, request: resolve.Request | None, question: str,
+                     shown: list[entities.UnitCard], more: int) -> str:
+    """The turn's candidates block (``resolve.candidates_block``), with the handle (U#) of each card registered in the
+    workspace, so the model can pass it to ``search``, ``outline`` and ``read`` and the server can check what it declares.
+    A first message and a new subject bring the ranked ``shown`` cards; a follow-up that keeps its unit gets that unit's
+    card alone; a lookup that found several (or a unit gone) gets the file's candidates. A professional or set request
+    carries none. Rebuilt from live permissions every turn (``entities.cards_of_units`` reads under the user's)."""
+    cards = list(shown)
+    if request is not None and not request.intent.professional and request.scope != "set":
+        items = []
+        if request.located_unit:
+            items.append((request.located_unit, entities.BASIS_FOCUS if request.unit_kept else entities.BASIS_NAMED))
+        offered = [d for d in request.offered if d.get("unit")]
+        # the unit whose complete name the user's words state leads, with that basis, though the lookup's words could not
+        # tell it from its siblings
+        stated = set(entities.stated_in(offered, question))
+        order = [n for n in range(len(offered)) if n in stated] + [n for n in range(len(offered)) if n not in stated]
+        items += [(offered[n]["unit"], entities.BASIS_NAME if n in stated else offered[n].get("basis") or entities.BASIS_ALIKE)
+                  for n in order[:entities.MAX_CARDS]]
+        if items:
+            more = max(0, len(offered) - entities.MAX_CARDS)
+            cards = entities.cards_of_units(ctx, items)
+            request.resolution.setdefault("decisions", {})["candidates"] = _candidates_decision(cards, more)
+    if not cards:
+        return ""
+
+    def handle_of(card: entities.UnitCard) -> str:
+        row = card.row
+        handle = T.unit_handle_of(ws, row["document_id"], row["version_id"], row["reading_id"], row["unit_no"])
+        ws.offered_units.add(handle)
+        return handle
+
+    return resolve.candidates_block(cards, handle_of, more)
+
+
+def _read_unit_handles(ws: T.Workspace) -> set[str]:
+    """The handles (U#) of the units the turn read: the unit of any passage its tools returned, and any unit a tool worked
+    inside through a handle (``Workspace.unit_scopes``). A unit only listed (an outline, a find) is not read."""
+    out = {h for s in ws.sources.values() if not s.is_listing and (h := s.tags.get("unit"))}
+    for scope in ws.unit_scopes.values():
+        h = ws.handle_ids.get(("U", (scope["version_id"], scope["reading_id"] or None, scope["unit_no"])))
+        if h:
+            out.add(h)
+    return out
+
+
+def _declare_units(ctx: TenantContext, ws: T.Workspace, answer: FinalAnswer) -> None:
+    """The units an answer declares in ``focus.units`` (round 15 U6, KTD7), validated: each must be a unit the server
+    offered in the candidates block (or as the conversation's unit) or one the turn read, and a unit the user cannot read
+    now is none; anything else is dropped. The valid ones, in the model's order, are ``Workspace.declared_units`` (anchors).
+    One declared unit of an answer (not a clarification, which only offers units) is also the turn's unit: the conversation's
+    focus (``unit_focus``) and the unit the next turn keeps (``located_unit``); several are a comparison and set no single
+    unit. An answer that declares none keeps what an earlier answer of the turn declared (a repair round that forgot it)."""
+    handles = list(dict.fromkeys(h.strip() for h in (answer.focus.units if answer.focus is not None else []) if h and h.strip()))
+    allowed = ws.offered_units | _read_unit_handles(ws)
+    found: list[tuple[str, dict, dict]] = []  # (handle, the handle's data, the unit's anchor)
+    for h in handles:
+        data = ws.handles.get(h)
+        if h not in allowed or not data or data.get("kind") != "U":
+            continue
+        anchor = entities.anchor_of(ctx, data["document_id"], data["reading_id"], data["unit_no"])
+        if anchor is not None and not any(entities.same_unit(anchor, x) for _, _, x in found):
+            found.append((h, data, anchor))
+    if not found:
+        return
+    ws.declared_units = [a for _, _, a in found]
+    if answer.status != "clarification" and len(found) == 1:
+        handle, data, a = found[0]
+        ws.unit_focus = {"handle": handle, "document_id": str(a["document_id"]), "display": entities.focus_text(a)}
+        ws.located_unit = {"key": contexts.anchor_key(data["version_id"], a), "anchor": a}
 
 
 def _cited_units(ws: T.Workspace, markdown: str) -> dict[str, set[str | None]]:
@@ -1202,10 +1309,12 @@ def _cited_units(ws: T.Workspace, markdown: str) -> dict[str, set[str | None]]:
 
 
 def _turn_unit(ctx: TenantContext, ws: T.Workspace, final: FinalAnswer, request: resolve.Request | None) -> dict | None:
-    """The unit the conversation is about after this answer (KTD8), as its anchor: the one the request is in (kept from
-    the turn before, or named by the user); else the one every place the answer cites in its (single) document lies in;
+    """The unit the conversation is about after this answer (KTD8), as its anchor: the one the answer declared (round 15 U6);
+    else the one the request is in (kept from the turn before, or named by the user); else the one every place the answer cites in its (single) document lies in;
     else, when the turn ended on a limit and its tools worked inside exactly one unit, that unit — a turn cut short
     leaves the conversation where it was reading, so "continue" reads on inside it."""
+    if len(ws.declared_units) == 1 and final.status != "clarification":
+        return ws.declared_units[0]  # the unit the answer declared, validated (round 15 U6, KTD7)
     if request is not None and request.located_unit:
         return request.located_unit
     if ws.located_unit is not None:  # the unit the turn's own lookup located for the question (``tools.locate_unit``)

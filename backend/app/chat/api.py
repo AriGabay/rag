@@ -383,6 +383,8 @@ def _answer_documents(answer: dict | None) -> set[str]:
     ids.add((answer.get("unit") or {}).get("document_id"))  # the unit the conversation is in (round 9 U10)
     ids |= set((answer.get("request") or {}).get("document_ids") or [])
     ids |= doc_ids((answer.get("request") or {}).get("candidates") or [])
+    ids |= doc_ids(answer.get("offered_units") or [])  # the units a model clarification offered (round 15 U6)
+    ids |= set(answer.get("shown_documents") or [])  # and the documents of every candidate it was shown
     ids |= set((answer.get("request") or {}).get("named_document_ids") or [])  # the files a clarification names
     ids |= {d for r in answer.get("requested") or [] for d in r.get("document_ids") or []}
     ids |= set(answer.get("touched_documents") or [])
@@ -788,7 +790,7 @@ def _legacy_context(answer: dict) -> dict:
     pending = None
     if answer.get("status") == "clarification":
         pending = _pending_slot(answer.get("pending") if isinstance(answer.get("pending"), dict) else None,
-                                (answer.get("request") or {}).get("candidates") or [],
+                                (answer.get("request") or {}).get("candidates") or answer.get("offered_units") or [],
                                 (answer.get("request") or {}).get("named_document_ids") or [], _clarified_documents(answer),
                                 None)
     return {"version": slots.VERSION, "topic": None, "property": prop, "params": params,
@@ -962,6 +964,7 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
         # only documents this turn actually touched or cites; a focus with none is no focus
         known = set(ws.activity) | set(docs)
         focus = a.focus.model_dump()
+        focus.pop("units", None)  # turn handles (U#) mean nothing to the next turn: the validated units are ``unit`` below
         focus["document_ids"] = [d for d in focus["document_ids"] if d in known]
         if not focus["document_ids"] and a.status == "not_found":
             focus = None
@@ -1012,6 +1015,9 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
         # the appraisal unit the conversation is about now, and — when the turn stayed in the unit of the turn before —
         # the answer's scope line for it (round 9 U10)
         "unit": unit, **({"unit_scope": unit_scope} if unit_scope else {}),
+        # a clarification between units: the units it offered (``focus.units``, validated), which the reply binds to (round
+        # 15 U6, KTD1); a hidden one hides the message like any candidate the answer names
+        "offered_units": list(outcome.offered_units), "shown_documents": list(outcome.shown_documents),
         # each requested datum with the status the turn's actions support (found, or how it was not found)
         "requested": coverage.validate_requested(ws, a.requested),
         # round 7 U3 (KTD3, KTD4): each component of the request with its status, reason and evidence (the detail
@@ -1060,8 +1066,11 @@ def _context(outcome: engine.TurnOutcome, payload: dict, previous: dict | None, 
                           "standard": src.get("standard"), "section": src.get("section")})
     asked = None
     if a.status == "clarification":
-        asked = _pending_slot(payload.get("pending"), request.get("candidates") or [], request.get("named_document_ids") or [],
-                              _clarified_documents(payload), datetime.now(UTC).isoformat(timespec="seconds"))
+        # the reply binds to the units the clarification declared it offered (``focus.units``, validated; round 15 U6, KTD1) or
+        # to the candidates of a server clarification; one that declared none binds nothing — the model reads the reply
+        # from the history, so the files the turn touched are no longer a pool a reply is looked up in
+        asked = _pending_slot(payload.get("pending"), request.get("candidates") or payload.get("offered_units") or [],
+                              request.get("named_document_ids") or [], [], datetime.now(UTC).isoformat(timespec="seconds"))
     return slots.carry(previous, intent=intent, property=prop, params=params, topic=topic, items=items,
                        message_id=message_id, sources=cited, pending=asked)
 

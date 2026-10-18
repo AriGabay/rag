@@ -119,12 +119,14 @@ def test_a_unit_in_the_same_building_keeps_its_document_even_when_another_mentio
     assert req.document_ids == [BUILDING]
 
 
-def test_similar_addresses_in_two_towns_ask_then_resolve_with_the_town():
+def test_similar_addresses_in_two_towns_reach_the_model_as_candidates_then_resolve_with_the_town():
+    # round 15 U6 (KTD1, R2): the lookup's ambiguity is the model's to weigh; the server asks nothing in its place
     r = _resolved(relation="new_question", changed_fields=_changed(("subject", "הנרקיס 4")), subject="הנרקיס 4")
     req = _validate(r, RENT_FOCUS, "ובהנרקיס 4?")
-    assert req.server_clarify and req.document_ids == []
-    assert "עין ורד" in req.clarify and "כפר גפן" in req.clarify
-    assert {c["document_id"] for c in req.candidates} == {NARKIS_A, NARKIS_B}
+    assert not req.server_clarify and not req.clarify and req.document_ids == [] and req.entity_changed
+    assert {c["document_id"] for c in req.offered} == {NARKIS_A, NARKIS_B} and req.candidates == []
+    assert req.hints and req.resolution["decisions"]["entity"] == "ambiguous"
+    assert "הנרקיס 4" in resolve.requested_block(req)  # the model is told what the lookup found
     r2 = _resolved(relation="new_question", changed_fields=_changed(("subject", "הנרקיס 4 בכפר גפן")))
     assert _validate(r2, RENT_FOCUS, "ובהנרקיס 4 בכפר גפן?").document_ids == [NARKIS_B]
 
@@ -140,15 +142,19 @@ def test_a_bare_reply_to_the_clarification_is_resolved_among_its_candidates():
     chosen = _validate(_resolved(relation="clarification_answer"), focus, "בכפר גפן", candidates=offered)
     assert "A3" not in chosen.subject and "כפר גפן" in chosen.subject  # nothing of the previous property stays
     again = _validate(_resolved(relation="clarification_answer"), RENT_FOCUS, "בהנרקיס", candidates=offered)
-    assert again.server_clarify and again.document_ids == [] and DOC not in again.document_ids
+    # a reply that names two candidates still binds none: they reach the model again, and the old property is no scope
+    assert not again.server_clarify and not again.clarify and again.document_ids == [] and DOC not in again.document_ids
 
 
-def test_nothing_found_asks_and_never_falls_back_to_the_focus():
+def test_nothing_found_is_a_hint_for_the_model_and_never_falls_back_to_the_focus():
     # an address no title holds (a word and its house number), a title word with a number no title has, a parcel
     for words in ("היסמין 3", "הסנונית 99", "גוש 9999 חלקה 8"):
         r = _resolved(changed_fields=_changed(("subject", words)), subject=words)
         req = _validate(r, RENT_FOCUS, f"התכוונתי ל{words}")
-        assert req.server_clarify and req.document_ids == [] and "לא מצאתי" in req.clarify, words
+        assert not req.server_clarify and not req.clarify and req.document_ids == [] and req.entity_changed, words
+        assert req.hints and words.split()[0] in req.hints[0] and req.resolution["decisions"]["entity"] == "not_found"
+        block = resolve.requested_block(req)
+        assert "לא איתר" in block and "החליף נכס" in block, words
 
 
 def test_a_generic_word_claimed_as_a_document_change_stays_on_the_focus():
@@ -401,7 +407,7 @@ def test_income_cost_profit_ratio_and_rate_are_request_and_focus_kinds(kind):
 
     assert _resolved(metric_kind=kind).metric_kind == kind
     Focus(metric_as_written="", metric_kind=kind, unit="unknown", period="unknown", area_basis="", vat="unknown",
-          subject="", value_role="unknown", document_ids=[])
+          subject="", value_role="unknown", document_ids=[], units=[])
     assert kind in resolve.REQUEST_KINDS
 
 
@@ -576,17 +582,17 @@ def test_a_new_reading_re_matches_by_title_or_alias_then_by_page_label_and_ident
         _unit_dict(2, "r2", title="נעלם לא", aliases=[], identifiers=[])]) is None
 
 
-# --- the files a server clarification names are bound to the message (authorization) ---
+# --- the files a lookup hint names are bound to the message (authorization) ---
 
 def _named(outcome: entities.Outcome) -> list[str]:
     r = _resolved(relation="new_question", changed_fields=_changed(("subject", "היסמין 3")), subject="היסמין 3")
     req = validate(r, RENT_FOCUS, "ובהיסמין 3?", authorized, TITLES, lambda words: outcome, None,
                    focus_titles=[CORPUS[DOC][0]])
-    assert req.server_clarify
+    assert not req.server_clarify and not req.clarify and req.hints  # the model is told; the server asks nothing
     return req.as_dict()["named_document_ids"]
 
 
-def test_a_clarification_names_the_ids_of_the_split_files_and_the_shown_unread_files():
+def test_a_lookup_hint_names_the_ids_of_the_split_files_and_the_shown_unread_files():
     unread = [{"document_id": f"u-{i}", "title": f"תיק {i}", "status": "failed", "reason": "", "progress": None,
                "uploaded_at": None} for i in range(unread_notice_limit() + 2)]
     split = [{"document_id": "s-1", "title": "קובץ מפוצל", "units": 3}]
@@ -595,7 +601,7 @@ def test_a_clarification_names_the_ids_of_the_split_files_and_the_shown_unread_f
     assert set(named[1:]) <= {d["document_id"] for d in unread}
 
 
-def test_a_not_read_clarification_names_the_unread_documents():
+def test_a_not_read_hint_names_the_unread_documents():
     unread = {"document_id": "u-1", "title": "תיק 1", "status": "failed", "reason": "", "progress": None}
     named = _named(entities.Outcome("not_read", documents=[entities.Candidate("u-1", "תיק 1", unread=unread)]))
     assert named == ["u-1"]
@@ -682,11 +688,20 @@ def test_a_property_parse_without_evidence_runs_no_lookup_and_keeps_the_focus():
     assert calls == [] and req.document_ids == [SYN_FOCUS] and not req.entity_changed
 
 
-def test_a_professional_parse_that_names_an_address_is_mixed_and_looks_it_up():
-    parsed = _approaches_parse(intent=_intent("professional", topic="גישות השומה"))
+def test_a_mixed_parse_that_names_an_address_looks_it_up():
+    parsed = _approaches_parse(intent=_intent("mixed", topic="גישות השומה"))
     req, calls = _syn_validate(parsed, "מה דורשת גישת ההשוואה לגבי הדקל 5?")
     assert req.intent.value == "mixed" and calls == ["הדקל 5"]
     assert req.document_ids == [SYN_A] and req.entity_changed and req.resolution["decisions"]["intent"] == "mixed"
+
+
+def test_a_professional_parse_that_names_an_address_stays_professional_and_looks_nothing_up():
+    """Round 15 U6 (KTD2, R1): the analysis' reading is the intent. The address is evidence the server records as a hint; it
+    no longer turns a professional claim into a property lookup."""
+    parsed = _approaches_parse(intent=_intent("professional", topic="גישות השומה"))
+    req, calls = _syn_validate(parsed, "מה דורשת גישת ההשוואה לגבי הדקל 5?")
+    assert req.intent.value == "professional" and calls == [] and req.document_ids == [] and not req.entity_changed
+    assert [e.text for e in req.intent.evidence] == ["הדקל 5"]
 
 
 def test_a_standard_number_is_not_an_address_and_names_no_appraisal():
@@ -738,3 +753,35 @@ def test_the_focus_own_name_is_no_new_evidence():
     parsed = _resolved(relation="same_datum", intent=_intent("property", reference="conversation_property"))
     req, calls = _syn_validate(parsed, "ומה עוד כתוב על הדקל 5?", focus=focus)
     assert calls == [] and req.document_ids == [SYN_A] and not req.entity_changed
+
+
+# --- round 15 U6: the candidates block (KTD1) is data, in a stable order, with the basis of each card -------------------
+
+def _card(no: int, title: str, basis: str = "", fields: tuple = ()) -> entities.UnitCard:
+    row = {"document_id": FILE, "version_id": "v-1", "reading_id": "r1", "unit_no": no, "units_tag": "v5",
+           "unit_id": f"v-1#r1#{no}@v5", "kind": "appraisal", "title": title, "aliases": [], "identifiers": [f"רחוב ד {no}"],
+           "page_first": no, "page_last": no + 1, "block_first": 0, "block_last": 1, "certainty": "certain",
+           "file_title": FILE_TITLE}
+    return entities.UnitCard(row, basis, fields)
+
+
+def test_the_candidates_block_lists_the_cards_in_order_with_handles_basis_and_card_text_and_counts_the_rest():
+    cards = [_card(2, "פרויקט א", entities.BASIS_NAME, ({"field": "name", "quote": "שם <b>מוזר</b>"},
+                                                           {"field": "city", "quote": "עיר-ב"})),
+             _card(3, "פרויקט ב", entities.BASIS_SHARED.format(words="פרויקט"))]
+    block = resolve.candidates_block(cards, lambda c: f"U{c.row['unit_no'] - 1}", more=4)
+    assert block.startswith(resolve.CANDIDATES_HEAD)
+    lines = block.splitlines()
+    assert lines[1].startswith("- U1 «פרויקט א» | עמודים 2–3 | רחוב ד 2 | קובץ «" + FILE_TITLE + "»")
+    assert lines[2] == f"  {resolve.BASIS_PREFIX} {entities.BASIS_NAME}"
+    assert "שם «שם ‹b›מוזר‹/b›»" in lines[3] and "עיר «עיר-ב»" in lines[3]  # document text cannot open a tag
+    assert lines.index(next(x for x in lines if x.startswith("- U2 «פרויקט ב»"))) > 3
+    assert any(x.startswith("ועוד 4 ") for x in lines)  # the rest is counted, never listed
+    assert resolve.candidates_block([], lambda c: "U1") == ""
+    # nothing in it changes between two runs of the same turn
+    assert block == resolve.candidates_block(cards, lambda c: f"U{c.row['unit_no'] - 1}", more=4)
+
+
+def test_a_unit_gone_after_a_reread_is_told_to_the_model_with_its_old_name_and_no_number():
+    hint = resolve.gone_unit_hint({"display": "מתחם <x>", "unit_no": 7})
+    assert "מתחם ‹x›" in hint and "7" not in hint

@@ -7,7 +7,7 @@ a name or an identifier that only some candidates hold. Every name is invented."
 
 from __future__ import annotations
 
-from app.chat import entities, resolve
+from app.chat import entities
 
 FILE = "קובץ מרוכז סינתטי"
 
@@ -65,16 +65,16 @@ def test_a_document_level_candidate_is_ordered_by_title_not_by_passages():
     assert out.kind == "ambiguous" and [d.document_id for d in out.documents] == ["b", "a"]
 
 
-def test_the_clarification_names_a_unit_by_title_pages_identifiers_and_file():
+def test_a_candidate_is_named_by_title_pages_identifiers_and_file():
     out = entities.choose([unit(1, "מתחם הגפן א", ["הגפן א"], pages=(1, 1), identifiers=["רחוב הגפן 4"]),
                            unit(2, None, [], pages=(2, 5))], "הגפן", set())
     assert out.kind == "resolved"  # one name fit: the unnamed unit holds nothing of the words but passages
     both = entities.choose([unit(1, "מתחם הגפן א", ["הגפן א"], pages=(1, 1), identifiers=["רחוב הגפן 4"]),
                             unit(2, "מתחם הגפן ב", ["הגפן ב"], pages=(2, 5), identifiers=["גוש 1 חלקה 2"])],
                            "הגפן", set())
-    asked = resolve._clarify_titles(both, "הגפן")
-    assert "1. «מתחם הגפן א» (עמוד 1; רחוב הגפן 4; בקובץ «קובץ מרוכז סינתטי»)" in asked
-    assert "2. «מתחם הגפן ב» (עמודים 2–5; גוש 1 חלקה 2; בקובץ «קובץ מרוכז סינתטי»)" in asked
+    labels = [entities.candidate_label(d.as_dict()) for d in both.documents]
+    assert labels[0] == "«מתחם הגפן א» (עמוד 1; רחוב הגפן 4; בקובץ «קובץ מרוכז סינתטי»)"
+    assert labels[1] == "«מתחם הגפן ב» (עמודים 2–5; גוש 1 חלקה 2; בקובץ «קובץ מרוכז סינתטי»)"
     assert entities.candidate_label(entities.Candidate("d", "x", unit={"display": None, "pages": [4, 4],
                                                                        "identifiers": []}, file_title="f").as_dict()
                                     ) == "«ללא כותרת» (עמוד 4; בקובץ «f»)"

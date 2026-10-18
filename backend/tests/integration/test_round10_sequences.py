@@ -575,17 +575,22 @@ def test_an_explicit_reference_to_a_specific_appraisal_in_a_professional_convers
 # =======================================================================================================================
 
 def _clarification(world) -> tuple[str, Turn]:
-    """A property question whose words fit two appraisals of one file equally: the server's own clarification, no agent step."""
+    """A property question whose words fit two appraisals of one file equally: since round 15 U6 (KTD1, R2) the model asks
+    between them - the two cards it was shown, declared in ``focus.units`` - and the server stores them for the reply."""
     r = world.client.post("/api/documents", files=[("files", (R9B.name, R9B.read_bytes(), "application/octet-stream"))],
                           data={"group_id": str(world.default_group_id)})
     assert r.status_code == 200, r.text
     while worker.run_one("test-worker"):
         pass
     cid = conversation(world)
-    t = turn(world, cid, SIMILAR_QUESTION, [], None, intent="property")
-    assert t.answer["status"] == "clarification" and t.agent.seen == [], t.answer
+    asked = "בקובץ שני מתחמים: מתחם הגפן א ומתחם הגפן ב. לאיזה התכוונת?"
+    doc = r.json()["results"][0]["document_id"]
+    t = turn(world, cid, SIMILAR_QUESTION, [final(asked, "clarification", clarification=asked,
+                                                   focus=_focus(doc, "", "unknown") | {"units": ["U1", "U2"]})],
+             None, intent="property")
+    assert t.answer["status"] == "clarification" and len(t.agent.seen) == 1, t.answer
     assert t.context["pending"]["kind"] == "candidates"
-    assert [c["unit"]["unit_no"] for c in t.candidates] == [1, 2]
+    assert [c["unit"]["unit_no"] for c in t.answer["offered_units"]] == [1, 2]
     return cid, t
 
 

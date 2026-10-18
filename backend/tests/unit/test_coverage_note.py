@@ -229,7 +229,7 @@ def test_a_newer_datum_of_an_undecided_class_makes_the_record_partial_and_the_no
 def test_the_summary_for_the_model_names_the_located_unit_so_it_can_read_it():
     rec = record(RECENT, [unit(1, "2025-03-31", T.LOCATED), unit(2, "2023-06-15", T.READ)])
     summary = TF.coverage_summary(rec)
-    assert TF.MSG_LOCATED.format(date="31/03/2025") in summary and TF.PHRASE_RULE in summary
+    assert TF.MSG_LOCATED.format(date="31/03/2025") in summary and summary == TF._SUMMARY_HEAD + TF.coverage_note(rec)
 
 
 def test_a_unit_is_named_by_its_title_and_date_and_an_undated_one_by_its_title_alone():
@@ -252,18 +252,24 @@ def test_a_record_of_a_turn_with_no_time_mode_has_no_note():
     assert TF.coverage_note(rec) is None
 
 
-def test_the_summary_for_the_model_carries_the_note_and_the_phrase_rule_only_when_partial():
+def test_the_summary_for_the_model_carries_the_servers_note_and_asks_it_to_write_nothing():
+    """Round 15 U7 (KTD8, R11): the qualified «latest in the sources checked» wording is the server's note, shown to the
+    model so it knows what the answer will carry; no rule asks the model to write the phrase."""
     partial = record(RECENT, [unit(1, "2025-03-31", T.NO_MATCH), unit(2, "2024-06-15")])
     complete = record(RECENT, [unit(1, "2025-03-31"), unit(2, "2024-06-15")])
-    assert LATEST_PHRASE in TF.coverage_summary(partial) and TF.coverage_note(partial) in TF.coverage_summary(partial)
+    assert TF.coverage_summary(partial) == TF._SUMMARY_HEAD + TF.coverage_note(partial)
+    assert LATEST_PHRASE in TF.coverage_summary(partial)  # inside the note, which is the server's
+    assert TF.coverage_summary(complete) == TF._SUMMARY_HEAD + TF.coverage_note(complete)
     assert LATEST_PHRASE not in TF.coverage_summary(complete)
     assert TF.coverage_summary(None) is None
+    assert not hasattr(TF, "PHRASE_RULE")
 
 
-def test_the_time_block_states_the_phrase_rule_in_both_modes():
+def test_the_time_block_no_longer_asks_the_model_to_write_the_qualified_phrase_in_either_mode():
     for mode in (RECENT, EXPLICIT):
         block = TF.block(mode)
-        assert LATEST_PHRASE in block
+        assert LATEST_PHRASE not in block and "הערת כיסוי" not in block and "כתוב «" not in block
+        assert "take_value" in block  # the rest of the time rules stay
     assert TF.block(TimeMode("none", "switch", ANCHOR, None, False)) is None
 
 

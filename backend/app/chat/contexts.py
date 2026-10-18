@@ -64,7 +64,7 @@ from bisect import bisect_left
 from collections import OrderedDict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from uuid import UUID
 
 from sqlalchemy import Connection, text
@@ -358,19 +358,47 @@ class Contexts:
                      max(pages) if pages else None, tuple(s.number for s in segs[lo:at]),
                      tuple(s.number for s in segs[at + 1:hi + 1]))
 
+    @cached_property
+    def _distinguishing(self) -> dict[int, Identity]:
+        """For each subject context, the part of its identity that no OTHER subject context of the file holds (round 15
+        U7, KTD8, R10): the addresses, parcels and names (title and aliases) it alone writes. A project word, a street or a
+        name two units share tells them apart from nothing, so it names neither; what only one unit holds still names it. An
+        appendix or a comparables part is no subject and holds nothing against a unit."""
+        held = {n: self.identity(n) for n in self.subjects}
+        return {n: _distinct(ident, [o for m, o in held.items() if m != n]) for n, ident in held.items()}
+
     def named(self, words: str | None) -> list[int]:
-        """The subject contexts whose identifiers or names a free text names (never an appendix or a comparables
-        part). A name that lies inside a longer name of another context in the text ("מגדלי הים" inside "מגדלי הים
-        הצפוני") does not name its own context there."""
+        """The subject contexts whose DISTINGUISHING identifiers or names a free text names (never an appendix or a
+        comparables part; ``_distinguishing``): a name or identifier that another subject context of the file holds too
+        names none of them (round 15 U7, KTD8). A name that lies inside a longer name of another context in the text
+        ("מגדלי הים" inside "מגדלי הים הצפוני") does not name its own context there."""
         if not words or not self.multi:
             return []
-        by_id = [n for n in self.subjects if self.identity(n).identifier_in(words)]
-        spans = {n: self.identity(n).name_spans(words) for n in self.subjects if n not in by_id}
+        own = self._distinguishing
+        by_id = [n for n in self.subjects if own[n].identifier_in(words)]
+        spans = {n: own[n].name_spans(words) for n in self.subjects if n not in by_id}
         spans = {n: sp for n, sp in spans.items() if sp}
         every = [x for sp in spans.values() for x in sp]
         by_name = [n for n, sp in spans.items()
                    if not all(any(o[0] <= a and b <= o[1] and (a, b) != o for o in every) for a, b in sp)]
         return [n for n in self.numbers if n in by_id or n in by_name]
+
+
+def _street_key(street: tuple[tuple[str, ...], str, str]) -> tuple[str, str]:
+    """The ``Identity.addresses`` entry of a ``streets`` entry: the street core (the prefix letters of the first word
+    stripped as ``identifiers`` does) and the house number with its letter."""
+    words, number, letter = street
+    core = " ".join([_strip_prefix(words[0], 2 if len(words) > 1 else 3), *words[1:]])
+    return core, number + letter
+
+
+def _distinct(ident: Identity, others: Sequence[Identity]) -> Identity:
+    """``ident`` without the addresses, parcels and names any of ``others`` holds too (``Contexts._distinguishing``)."""
+    addresses = ident.addresses - frozenset().union(*(o.addresses for o in others))
+    parcels = ident.parcels - frozenset().union(*(o.parcels for o in others))
+    names = tuple(x for x in ident.names if not any(x in o.names for o in others))
+    streets = tuple(s for s in ident.streets if _street_key(s) in addresses)
+    return Identity(addresses, parcels, ident.shown, streets, names)
 
 
 @dataclass(frozen=True)

@@ -251,8 +251,9 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # unit (``SERVER_HELD``: the stated valuation date and the link reason), and a derived computation (C#, result kind
 # ``derived``) joins the unit's evidence; rules (29) and (30) read them. 9 (round 13 U11, KTD13): the final check shows a unit that
 # refers back (``BACK_REFERENCES``) the text that stays before it and the units removed from before it (``<preceding>``,
-# ``removed_before``); rule (31) reads them.
-JUDGE_VERSION = 9
+# ``removed_before``); rule (31) reads them. 10 (round 15 U7, KTD7): the header of a passage in a unit the answer declared names
+# it by handle and structural title (``_declared_head``).
+JUDGE_VERSION = 10
 # the label of the facts the server holds about a cited source's unit and states beside its text (round 13 U9, KTD10, R13): the
 # stated valuation date of the unit that holds the passage, and why the server linked the appraisal to the property. Read
 # from the stored document, not from the passage: the judge takes them as evidence, never as a claim to check
@@ -2400,6 +2401,23 @@ def _professional_head(src) -> str:
     return " | ".join(parts)
 
 
+MSG_DECLARED_UNIT = "היחידה שהתשובה מצהירה עליה"
+
+
+def _declared_head(ws: Workspace, src) -> str:
+    """The header line of a passage that lies in a unit the answer declared (round 15 U7, KTD7): the unit by its handle and
+    its structural title (the title the ingestion derived, never a card's quotation, which only the candidates block
+    shows). It names the unit the answer is about, so the judge reads the passage in that frame; the server's
+    check of the asked set (``_wrong_context``) reads the declaration, the judge does not take it as evidence for
+    any claim. Empty for a passage of another unit, or when nothing was declared."""
+    unit = getattr(src, "unit", None)
+    handle = declared_handles(ws).get(unit["id"]) if unit and getattr(ws, "declared_units", None) else None
+    if handle is None:
+        return ""
+    title = unit.get("title")
+    return f" — {MSG_DECLARED_UNIT}: {handle}" + (f" «{title}»" if title else "")
+
+
 def _source_parts(ws: Workspace, sid: str, *, dated: bool = True) -> tuple[str, str, str] | None:
     """(heading, body, kind) of a cited id: a passage's title and location and its text; a measurement or a
     computation as one short statement of its meaning. ``dated``: a value's or measurement's record carries the date the
@@ -2423,6 +2441,7 @@ def _source_parts(ws: Workspace, sid: str, *, dated: bool = True) -> tuple[str, 
         # feed (``dated=False``)
         if dated:
             head += "".join(f" — {SERVER_HELD}: {fact}" for fact in (src.date_line, src.link) if fact)
+            head += _declared_head(ws, src)
         return head, src.text, src.kind
     if sid in ws.measurements:
         m = ws.measurements[sid].public()
@@ -3417,9 +3436,12 @@ _CURRENT_WORDS = frozenset({"נוכחי", "נוכחית"})
 MSG_NOT_LATEST = ("הטענה קוראת ל-{older} «העדכני», אבל בתור הזה נרשם ערך מאוחר יותר מאותו נתון של אותו נכס: {newer} "
                   "(מועד {when}, {title}). הצג את {newer} כערך העדכני ואת {older} כערך קודם, עם תאריכיהם ומראי המקום "
                   "של שניהם (אל תמחק ערך שנתמך), או השמט את הניסוח «העדכני» / «האחרון»")
-# under partial coverage (round 12 U8, KTD8): the qualified wording a "latest" claim may carry, and the repair's reason
-MSG_LATEST_UNQUALIFIED = ("הטענה קוראת לנתון «העדכני» / «האחרון», אבל לא נבדקו כל השומות של הנכס ({gap}). כתוב "
-                          "«{phrase}» וציין מה לא נבדק (אל תמחק ערך שנתמך), או השמט את הניסוח «העדכני» / «האחרון»")
+# under partial coverage (round 12 U8, KTD8; round 15 U7, R11): the repair's reason for a sentence of the model that calls a
+# value the latest. The coverage wording is the server's own note, added after the answer; the model is asked only to drop
+# the claim of recency, and the qualified wording stays an accepted way to keep it
+MSG_LATEST_UNQUALIFIED = ("הטענה קוראת לנתון «העדכני» / «האחרון», אבל לא נבדקו כל השומות של הנכס ({gap}). השמט את "
+                          "הניסוח «העדכני» / «האחרון» (אל תמחק ערך שנתמך; השרת מוסיף לתשובה הערת כיסוי משלו), או כתוב "
+                          "«{phrase}» וציין מה לא נבדק")
 # a newer value whose component could not be compared with the cited one's (round 13 U4, KTD4, R20): it may or may not be a
 # later value of the same datum, so the "latest" stays qualified and the value is named
 MSG_LATEST_UNDECIDED = ("הטענה קוראת ל-{older} «העדכני» / «האחרון», אבל בתור נרשם ערך מאוחר יותר שלא הוכרע אם הוא אותו "
@@ -3867,16 +3889,42 @@ def _evidence_contexts(u: Unit, ws: Workspace) -> list[tuple[str, set[int], str,
     return out
 
 
+def declared_handles(ws: Workspace) -> dict[str, str]:
+    """The units the answer declared (``Workspace.declared_units``: anchors the server validated against the units it
+    offered or the turn read, round 15 U6, KTD7), as {the unit's stable id (``Contexts.key``): its handle}. An anchor has no
+    version: the handle the server issued for the unit (``Workspace.handles``) says which version it is of."""
+    from app.chat import contexts
+
+    out: dict[str, str] = {}
+    for a in getattr(ws, "declared_units", None) or []:
+        for h, d in (getattr(ws, "handles", None) or {}).items():
+            if (d.get("kind") == "U" and str(d["document_id"]) == str(a["document_id"])
+                    and (d.get("reading_id") or None) == (a.get("reading_id") or None) and d["unit_no"] == a["unit_no"]):
+                out[contexts.anchor_key(d["version_id"], a)] = h
+    return out
+
+
+def declared_contexts(ws: Workspace, cx) -> set[int]:
+    """The subject contexts of ``cx`` the answer declared; empty without a declaration."""
+    keys = declared_handles(ws) if cx.multi else {}
+    return {n for n in cx.subjects if cx.key(n) in keys}
+
+
 def _wrong_context(u: Unit, ws: Workspace, question: str) -> str | None:
     """A claim about the asked property that rests on another appraisal context of the same file (round 7 U6, KTD7,
-    R21): the property is the one the unit names (an identifier of one of the file's contexts), else the one the
-    request's components name (their subjects), else the one the question names, else the one the value's own subject
-    names; a value, measurement or source of another context, or a calculation none of whose inputs is of the asked
-    context, is another property's figure — the file, its title or the conversation's focus never prove otherwise.
-    Only a subject context counts as elsewhere: evidence in an appendix or a comparables part belongs to the
-    appraisal it serves and is left to the judge — except a value there whose recorded subject is ``contradicted``
-    (the source places it on another property), and never a calculation built from such values. Only when the context checks are enforced (``contexts.enforced``);
-    None when nothing is asked or nothing is elsewhere."""
+    R21; round 15 U7, KTD7, KTD8, R3, R10): the asked set is the property the unit's own words name, else the one the
+    request's components name (their subjects), else the one the question names — each only by a DISTINGUISHING name or
+    identifier (``Contexts.named``: a project word, a street or a name two units of the file share names neither) — else
+    the one the value's own subject names, else the units the answer DECLARED (``declared_units``), else the unit the
+    turn located. A declaration is therefore never what the model checks itself with: when the claim, the components or
+    the question name a unit distinctively, that unit is the asked set and a declaration excluding it is contradicted; the
+    declaration decides only where nothing distinctive was written. A value, measurement or source of another context
+    (a passage a search returned across a probable edge is of the neighbour it lies in), or a calculation none of whose
+    inputs is of the asked context, is another property's figure — the file, its title or the conversation's focus never
+    prove otherwise. Only a subject context counts as elsewhere: evidence in an appendix or a comparables part belongs to
+    the appraisal it serves and is left to the judge — except a value there whose recorded subject is ``contradicted``
+    (the source places it on another property), and never a calculation built from such values. Only when the context
+    checks are enforced (``contexts.enforced``); None when nothing is asked or nothing is elsewhere."""
     from app.chat import contexts
     from app.chat import intent as intent_mod
     from app.chat.tools import asked_subjects, located_contexts
@@ -3903,13 +3951,19 @@ def _wrong_context(u: Unit, ws: Workspace, question: str) -> str | None:
             asked = {n for x in subjects for n in cx.named(x)} if from_components else set()
         if not asked:
             asked = set(cx.named(question))
+        declared = declared_contexts(ws, cx)
+        distinctive = bool(asked)
         if not asked and i in ws.values and ws.values[i].subject_from == "contradicted":
             asked = set(cx.named(ws.values[i].subject))
+        if not asked:  # nothing distinctive was written: the units the answer declared are the asked property
+            asked = declared
         if not asked:  # no title or alias names the asked property: the unit the turn located for the question is it
             asked = located_contexts(ws, cx)
         if asked and not numbers & asked:
+            said = (", והתשובה הצהירה על " + ", ".join(cx.describe(n) for n in sorted(declared))
+                    if distinctive and declared and not declared & asked else "")
             return (f"{what} כתוב ב" + ", ".join(cx.describe(n) for n in sorted(numbers)) + ", והטענה עוסקת ב"
-                    + ", ".join(cx.describe(n) for n in sorted(asked)) + ": זה נתון של נכס אחר באותו קובץ. קח את "
+                    + ", ".join(cx.describe(n) for n in sorted(asked)) + said + ": זה נתון של נכס אחר באותו קובץ. קח את "
                     "הנתון מההקשר של הנכס שנשאל עליו, או ייחס אותו לנכס שלו")
     return None
 

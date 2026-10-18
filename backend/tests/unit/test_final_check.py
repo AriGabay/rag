@@ -1356,3 +1356,19 @@ def test_a_first_line_a_cut_would_leave_without_a_word_is_removed_whole_and_the_
     (p,) = out.report.removals()
     assert p.check == "dependency" and p.unit.index == 0 and p.failure_kind == "absent_from_source"
     assert _kinds(out) == ["removal_note"] and out.final_digest == text_digest(md)
+
+
+def test_the_servers_coverage_note_never_reaches_the_judge_as_a_claim(offline):
+    """Round 15 U7 (KTD8, R11): the note the server appends after the verification is not in any judge call of the turn, and
+    the final check of the saved text judges nothing of it — it is a registered server span, checked by construction."""
+    from app.chat import timeframe as TF
+
+    note = TF.MSG_NOTE_RECENT + "\n" + TF.MSG_GROUP_CAP + ": שומה סינתטית."
+    offline.coverage = lambda answer: note
+    judge = Judge(lambda t, i, n: "supported")
+    out = _turn(ScriptedAgent([SEARCH, final(VALUE), final(VALUE), final(VALUE)], judge=judge))
+    md = out.answer.answer_markdown
+    assert TF.LATEST_CHECKED in md and _kinds(out) == ["coverage_note"], (md, _kinds(out))
+    assert judge.inputs, "the model's own sentence was judged"
+    assert all(TF.LATEST_CHECKED not in i and TF.MSG_GROUP_CAP not in i for i in judge.inputs), "the note was never shown"
+    assert out.final_check["judge_calls"] == 0

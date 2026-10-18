@@ -100,6 +100,18 @@ def _sources(out: str) -> list[str]:
     return re.findall(r'<source id="(S\d+)"', out)
 
 
+def _offer(doc: str, *units: str) -> dict:
+    """The focus of a model clarification that offers the given units (U#, in the order it writes them): no datum, the units
+    in ``units`` (round 15 U6, KTD1)."""
+    return {"metric_as_written": "", "metric_kind": "unknown", "unit": "unknown", "period": "unknown", "area_basis": "",
+            "vat": "unknown", "subject": "", "value_role": "unknown", "document_ids": [doc], "units": list(units)}
+
+
+def _card_titles(content: str) -> list[str]:
+    """The titles of the cards of the candidates block of the turn's first message, in order."""
+    return re.findall(r"^- U\d+ «([^»]*)»", content, re.M)
+
+
 # --- locating the unit (AE2, AE3) -------------------------------------------------------------------------------------
 
 
@@ -299,9 +311,9 @@ def test_similar_names_give_a_clarification_listing_both_units_in_name_order_wit
     assert [a["pages"] for a in anchors] == [[1, 1], [2, 2]] and {a["document_id"] for a in anchors} == {doc}
     assert [a["first_label"] for a in anchors] == ["1", "1"] and anchors[0]["aliases"][0] == "הגפן א"
     assert anchors[0]["reading_id"] == _reading(office, ver) and "unit_no" in anchors[0]
-    asked = resolve._clarify_titles(out, "הגפן")
-    assert "1. «מתחם הגפן א» (עמוד 1;" in asked and "2. «מתחם הגפן ב» (עמוד 2;" in asked
-    assert MANIFEST["similar_names"]["title"] in asked
+    labels = [entities.candidate_label(d.as_dict()) for d in out.documents]  # how a candidate is named to the model and the user
+    assert labels[0].startswith("«מתחם הגפן א» (עמוד 1;") and labels[1].startswith("«מתחם הגפן ב» (עמוד 2;")
+    assert all(MANIFEST["similar_names"]["title"] in label for label in labels)
 
 
 def test_replying_the_second_or_a_letter_only_one_unit_holds_picks_that_unit(office):
@@ -349,22 +361,25 @@ def statements():
     event.remove(engine, "before_cursor_execute", record)
 
 
-def test_a_first_message_whose_words_fit_two_units_equally_gets_the_servers_clarification_with_no_model_call(
+def test_a_first_message_whose_words_fit_two_units_equally_reaches_the_model_with_both_as_candidates(
         client, office, monkeypatch):
     doc, _ = ingest(office, R9B)
-    # the question names a phrase both units' names hold ("מתחם הגפן"): hard evidence of a reference (round 10, the
-    # partial name), so the server asks between them at once, with no model call at all — as round 9 did
-    agent = ScriptedAgent([], intent="property")
+    # the question names a phrase both units' names hold ("מתחם הגפן"): hard evidence of a reference. Since round 15 U6 (KTD1,
+    # R2) the server does not ask between them with no model call: both are candidates, in name-fit order, and the model, which
+    # asks only for a material ambiguity, asks here in its own words, offering the two units it was shown
+    asked = "בקובץ שני מתחמים: מתחם הגפן א ומתחם הגפן ב. לאיזה התכוונת?"
+    agent = ScriptedAgent([final(asked, "clarification", clarification=asked, focus=_offer(doc, "U1", "U2"))],
+                          intent="property")
     cloud(monkeypatch, office, agent)
     m = send(client, new_conversation(client), SIMILAR_QUESTION)
     assert m["status"] == "done", m
     a = m["answer"]
-    assert a["status"] == "clarification" and a["status"] != "answered", a["markdown"]
-    md = a["markdown"]
-    assert "1. «מתחם הגפן א» (עמוד 1;" in md and "2. «מתחם הגפן ב» (עמוד 2;" in md and R9B_TITLE in md
-    assert [(c["document_id"], c["unit"]["unit_no"]) for c in a["request"]["candidates"]] == [(doc, 1), (doc, 2)]
-    # no agent step and no request analysis: the evidence decided
-    assert agent.seen == [] and agent.calls == []
+    assert a["status"] == "clarification" and a["markdown"] == asked  # the model's question, not the server's
+    assert len(agent.seen) == 1  # the model was called
+    content = agent.seen[0][0]["content"]
+    assert _card_titles(content) == ["מתחם הגפן א", "מתחם הגפן ב"] and R9B_TITLE in content
+    assert [(c["document_id"], c["unit"]["unit_no"]) for c in a["offered_units"]] == [(doc, 1), (doc, 2)]
+    assert not (a.get("request") or {}).get("candidates")
 
 
 def test_a_first_message_is_left_to_the_model_unless_it_names_two_or_more_units_without_a_better_fit(
@@ -418,10 +433,12 @@ def _reply_turn(client, monkeypatch, cid: str, message: str, relation: str) -> t
 
 
 @pytest.mark.parametrize("relation", ["clarification_answer", "new_question"])
-def test_after_the_servers_clarification_the_reply_that_is_the_full_name_selects_that_unit_whatever_the_parse(
+def test_after_the_models_clarification_between_units_the_reply_that_is_the_full_name_selects_that_unit_whatever_the_parse(
         client, office, monkeypatch, relation):
     doc, _ = ingest(office, R9B)
-    cloud(monkeypatch, office, ScriptedAgent([], intent="property"))
+    asked = "בקובץ שני מתחמים: מתחם הגפן א ומתחם הגפן ב. לאיזה התכוונת?"
+    cloud(monkeypatch, office, ScriptedAgent([final(asked, "clarification", clarification=asked,
+                                                    focus=_offer(doc, "U1", "U2"))], intent="property"))
     cid = new_conversation(client)
     assert send(client, cid, SIMILAR_QUESTION)["answer"]["status"] == "clarification"
     agent, m = _reply_turn(client, monkeypatch, cid, "מתחם הגפן ב", relation)
@@ -432,7 +449,7 @@ def test_after_the_servers_clarification_the_reply_that_is_the_full_name_selects
     assert _task_unit(agent) == "מתחם הגפן ב"
 
 
-def test_after_the_models_own_clarification_the_reply_is_matched_against_the_units_of_the_files_that_turn_touched(
+def test_after_a_models_clarification_that_declared_no_unit_a_full_name_reply_is_an_ordinary_lookup_with_the_named_unit_first(
         client, office, monkeypatch):
     doc, _ = ingest(office, R9B)
     asked = "בקובץ שני מתחמים: מתחם הגפן א ומתחם הגפן ב. לאיזה התכוונת?"
@@ -441,13 +458,14 @@ def test_after_the_models_own_clarification_the_reply_is_matched_against_the_uni
     cloud(monkeypatch, office, first)
     cid = new_conversation(client)
     m = send(client, cid, "מה דמי השכירות החודשיים?")
-    assert m["answer"]["status"] == "clarification" and not (m["answer"].get("request") or {}).get("candidates")
+    assert m["answer"]["status"] == "clarification" and not m["answer"].get("offered_units")
+    # a clarification that offered no unit binds nothing (KTD1): the reply is read as a new message, whose words the lookup
+    # cannot tell apart ("מתחם הגפן ב" - the one letter is no search term), so both units reach the model, the named one first
     agent, m = _reply_turn(client, monkeypatch, cid, "מתחם הגפן ב", "new_question")
     req = m["answer"]["request"]
-    assert m["answer"]["status"] != "clarification"
-    assert req["located_unit"]["display"] == "מתחם הגפן ב" and req["located_unit"]["unit_no"] == 2
-    assert req["document_ids"] == [doc]
-    assert _task_unit(agent) == "מתחם הגפן ב"
+    assert req["located_unit"] is None and req["document_ids"] == [] and req["candidates"] == []
+    content = agent.seen[0][0]["content"]
+    assert _card_titles(content) == ["מתחם הגפן ב", "מתחם הגפן א"] and entities.BASIS_NAME in content
 
 
 def test_a_reply_after_the_models_clarification_that_names_no_unit_in_full_is_not_looked_up(
@@ -467,7 +485,7 @@ def test_a_reply_after_the_models_clarification_that_names_no_unit_in_full_is_no
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: agent)
     m = send(client, cid, "הגפן")
     assert m["answer"]["status"] == "clarification" and m["answer"]["markdown"] == again
-    assert not m["answer"]["request"]["candidates"] and len(agent.seen) == 1
+    assert not m["answer"]["request"]["candidates"] and len(agent.seen) == 1  # the model asked again, in its own words
 
 
 # --- name fit, never passage counts (R13) ------------------------------------------------------------------------------
@@ -655,12 +673,13 @@ def test_price_then_rent_stays_on_the_same_unit_without_a_clarification(client, 
     """AE5. The rent of R9a is written in the third appraisal only: a search that left the unit would find it there."""
     cid, first = _value_turn(client, r9a, monkeypatch, 1, SECOND)
     agent, m = _follow(client, cid, monkeypatch, "ומה דמי השכירות?", [
-        [call("search", query="דמי השכירות החודשיים", document_ids=None, limit=None, unit=None)],
+        [call("search", query="דמי השכירות החודשיים", document_ids=None, limit=None, unit="U1")],  # the focus unit, named
         final("לא נמצאו דמי שכירות ביחידה שנשאלה.", "not_found")],
         _parse(changed_fields=[{"field": "metric_kind", "user_words": "דמי השכירות"}], metric_kind="rent"))
     task = agent.seen[0][0]["content"]
     assert UNITS[1]["title"] in task and "U1" in task and UNITS[2]["title"] not in task
-    searched = agent.tool_outputs(1)[0]  # no unit named in the call: the conversation's unit is the scope
+    assert _card_titles(task) == [UNITS[1]["title"]]  # the focus unit's card alone (R4)
+    searched = agent.tool_outputs(1)[0]  # the call names the conversation's unit (round 15 U6: nothing is scoped silently)
     assert "חיפוש בתוך היחידה U1" in searched and "(היחידה שהשיחה עוסקת בה: U1)" in searched
     assert not re.search(r"(?<![\w-])92(?![\w-])", searched) and set(re.findall(r'unit_id="[^"]*#(\d+)(?:@[^"]*)?"', searched)) == {"2"}
     a = m["answer"]
@@ -725,7 +744,7 @@ def test_a_turn_that_ended_on_the_time_limit_keeps_the_unit_and_continue_reads_o
                      claims=[{"text": f"שווי הנכס הוא {SECOND} ₪", "source_ids": [sid], "basis": "explicit"}])
 
     agent2, m = _follow(client, cid, monkeypatch, "המשך", [
-        [call("search", query="שווי הנכס", document_ids=None, limit=None, unit=None)], answer],
+        [call("search", query="שווי הנכס", document_ids=None, limit=None, unit="U1")], answer],
         _parse(relation="same_datum"))
     assert UNITS[1]["title"] in agent2.seen[0][0]["content"]
     out = agent2.tool_outputs(1)[0]
@@ -776,7 +795,7 @@ def test_after_a_reindex_the_unit_is_found_again_by_its_anchor_and_never_by_its_
          "pages": (3, 3)}])
     contexts._CACHE.clear()
     agent, m = _follow(client, cid, monkeypatch, "ומה דמי השכירות?", [
-        [call("search", query="שווי הנכס", document_ids=None, limit=None, unit=None)],
+        [call("search", query="שווי הנכס", document_ids=None, limit=None, unit="U1")],
         final("לא נמצאו דמי שכירות.", "not_found")],
         _parse(changed_fields=[{"field": "metric_kind", "user_words": "דמי השכירות"}], metric_kind="rent"))
     located = m["answer"]["request"]["located_unit"]
@@ -788,7 +807,8 @@ def test_after_a_reindex_the_unit_is_found_again_by_its_anchor_and_never_by_its_
     assert m["answer"]["unit"]["unit_no"] == 3 and m["answer"]["unit"]["reading_id"] == "reading-units-2"
 
 
-def test_a_unit_that_is_gone_after_a_reindex_asks_and_the_old_number_selects_nothing(client, syn, monkeypatch):
+def test_a_unit_that_is_gone_after_a_reindex_reaches_the_model_as_the_files_candidates_and_the_old_number_selects_nothing(
+        client, syn, monkeypatch):
     cid = _syn_turn(client, syn, monkeypatch)
     # read again with no appraisal of that name: the old number 2 is now the third appraisal
     reread(syn, syn.ver, "reading-units-3", [
@@ -796,18 +816,22 @@ def test_a_unit_that_is_gone_after_a_reindex_asks_and_the_old_number_selects_not
         {"title": "פרויקט הברוש", "aliases": ["הברוש"], "identifiers": ["רחוב הברוש 2"], "blocks": (2, 5),
          "pages": (2, 3)}])
     contexts._CACHE.clear()
-    agent, m = _follow(client, cid, monkeypatch, "ומה דמי השכירות?", [],
-                       _parse(changed_fields=[{"field": "metric_kind", "user_words": "דמי השכירות"}],
-                              metric_kind="rent"))
+    asked = "השומה שדיברנו עליה כבר אינה בקובץ. לאיזו מהשומות שבו התכוונת?"
+    agent, m = _follow(client, cid, monkeypatch, "ומה דמי השכירות?", [
+        final(asked, "clarification", clarification=asked, focus=_offer(syn.doc, "U1", "U2"))],
+        _parse(changed_fields=[{"field": "metric_kind", "user_words": "דמי השכירות"}], metric_kind="rent"))
     a = m["answer"]
-    assert a["status"] == "clarification" and agent.seen == []  # asked, and no answering step
-    assert "מתחם האשל" in a["markdown"] and "פרויקט הארז" in a["markdown"] and "פרויקט הברוש" in a["markdown"]
+    # round 15 U6 (KTD1, R2): the server did not ask in the model's place - the model was called, saw the file's appraisals as
+    # candidates and a hint that the old unit is gone, and asked in its own words, offering the two
+    assert a["status"] == "clarification" and a["markdown"] == asked and len(agent.seen) == 1
+    content = agent.seen[0][0]["content"]
+    assert _card_titles(content) == ["פרויקט הארז", "פרויקט הברוש"] and "מתחם האשל" in content
     assert a["request"]["located_unit"] is None and a["request"]["document_ids"] == []
-    assert {c["unit"]["display"] for c in a["request"]["candidates"]} == {"פרויקט הארז", "פרויקט הברוש"}
+    assert [c["unit"]["display"] for c in a["offered_units"]] == ["פרויקט הארז", "פרויקט הברוש"]
     assert "unit" not in a or a["unit"] is None
-    # the reply picks among the units named; the chosen one becomes the conversation's
+    # the reply picks among the units offered; the chosen one becomes the conversation's
     agent3, m3 = _follow(client, cid, monkeypatch, "השני", [
-        [call("search", query="שווי הנכס", document_ids=None, limit=None, unit=None)],
+        [call("search", query="שווי הנכס", document_ids=None, limit=None, unit="U1")],
         final("לא נמצא.", "not_found")], _parse(relation="clarification_answer"))
     assert m3["answer"]["request"]["located_unit"]["display"] == "פרויקט הברוש"
     assert "3,000,000" in agent3.tool_outputs(1)[0] and "1,000,000" not in agent3.tool_outputs(1)[0]
@@ -825,10 +849,13 @@ def test_a_unit_of_a_file_the_user_can_no_longer_see_is_dropped_silently(client,
     assert SECOND not in a["markdown"] and "unit_scope" not in a
 
 
-def test_the_conversations_unit_is_the_default_scope_of_a_search_or_outline_that_names_no_other_document(r9a):
+def test_the_search_only_pin_is_the_default_scope_of_a_search_or_outline_that_names_no_other_document(r9a):
+    """Round 15 U6 (KTD3): only the server's pin of the search-only path scopes a call that names no unit; in a model turn
+    the focus unit scopes the calls that name it (``test_round15_sequences``)."""
     ws = T.Workspace(ctx=r9a.ctx())
     handle = T.unit_handle_of(ws, r9a.doc, r9a.ver, _reading(r9a, r9a.ver), 2)
     ws.unit_focus = {"handle": handle, "document_id": r9a.doc, "unit_id": None}
+    ws.unit_default = True
     searched = T.tool_search(ws, "שווי הנכס", None, 12)
     assert SECOND in searched and FIRST not in searched and THIRD not in searched
     assert f"(היחידה שהשיחה עוסקת בה: {handle})" in searched
@@ -859,10 +886,11 @@ def test_the_unit_of_an_answer_is_a_document_the_answer_rests_on_for_the_permiss
     assert api._with_unit(None, None) is None
 
 
-def test_pages_of_the_conversations_file_are_read_within_its_unit(r9a):
+def test_pages_of_the_pinned_units_file_are_read_within_its_unit(r9a):
     ws = T.Workspace(ctx=r9a.ctx())
     handle = T.unit_handle_of(ws, r9a.doc, r9a.ver, _reading(r9a, r9a.ver), 2)
     ws.unit_focus = {"handle": handle, "document_id": r9a.doc, "unit_id": None}
+    ws.unit_default = True  # the search-only pin (round 15 U6, KTD3)
     out = T.tool_read(ws, {"pages": {"document": r9a.doc, "from_page": 1, "to_page": 8}})
     assert SECOND in out and FIRST not in out and THIRD not in out and "הטווח נחתך לעמודי היחידה" in out
     refused = T._run_tool(ws, "read", json.dumps({"target": {"pages": {"document": r9a.doc, "from_page": 6, "to_page": 7},
@@ -945,33 +973,46 @@ def _values_in(out: str) -> set[str]:
     return {v for v in (U1_VALUE, U2_VALUE, U3_VALUE) if v in out}
 
 
-def test_a_unit_found_by_find_documents_is_the_default_scope_of_the_searches_that_name_no_unit(untitled):
+def test_a_unit_found_by_find_documents_is_listed_not_chosen_and_the_servers_pin_is_the_search_only_default(untitled):
     ws = T.Workspace(ctx=untitled.ctx())
     found = T.tool_find_documents(ws, "הצפצפה")
     handle = _unit_handle(found, "ללא כותרת")
-    assert ws.unit_focus and ws.unit_focus["handle"] == handle and ws.located_unit["anchor"]["unit_no"] == 2
-    assert handle in found and "עמוד 2" in found and "מוגבלים ליחידה" in found  # the model is told
-    searched = T.tool_search(ws, "שווי הנכס", None, 12)  # no unit argument: the search stays in the unit found
-    assert _values_in(searched) == {U2_VALUE} and f"(היחידה שהשיחה עוסקת בה: {handle})" in searched
-    again = T.tool_search(ws, "הנכס שווי", [untitled.doc], 12)  # its own file: still inside
-    assert f"חיפוש בתוך היחידה {handle}" in again and not _values_in(again) - {U2_VALUE}
-    assert f"סעיפי היחידה {handle} בלבד" in T.tool_outline(ws, untitled.doc)
-    assert "הטווח נחתך לעמודי היחידה" in T.tool_read(ws, {"pages": {"document": untitled.doc, "from_page": 1, "to_page": 3}})
+    # round 15 U6 (KTD1): the listing stays, the auto-focus is gone - a unit listed is a unit offered, the model names the one it
+    # works in
+    assert ws.unit_focus is None and ws.located_unit is None and handle in found and "עמוד 2" in found
+    assert "מוגבלים ליחידה" not in found
+    assert _values_in(T.tool_search(ws, "שווי הנכס", None, 12, handle)) == {U2_VALUE}  # naming the unit works inside it
+    assert _values_in(T.tool_search(T.Workspace(ctx=untitled.ctx()), "שווי הנכס", None, 12)) == {U1_VALUE, U2_VALUE, U3_VALUE}
+    # the search-only path pins the unit its question names (``locate_unit``): that unit is the default scope of the calls that
+    # name no unit and no other document
+    pin = T.Workspace(ctx=untitled.ctx())
+    first = entities.first_message(untitled.ctx(), "מה שווי הנכס בפרויקט הצפצפה?")
+    assert T.locate_unit(pin, first.unit, first.version_id)
+    pinned = pin.unit_focus["handle"]
+    assert pin.unit_default and pinned and pin.located_unit["anchor"]["unit_no"] == 2
+    searched = T.tool_search(pin, "שווי הנכס", None, 12)  # no unit argument: the search stays in the unit pinned
+    assert _values_in(searched) == {U2_VALUE} and f"(היחידה שהשיחה עוסקת בה: {pinned})" in searched
+    again = T.tool_search(pin, "הנכס שווי", [untitled.doc], 12)  # its own file: still inside
+    assert f"חיפוש בתוך היחידה {pinned}" in again and not _values_in(again) - {U2_VALUE}
+    assert f"סעיפי היחידה {pinned} בלבד" in T.tool_outline(pin, untitled.doc)
+    assert "הטווח נחתך לעמודי היחידה" in T.tool_read(pin, {"pages": {"document": untitled.doc, "from_page": 1, "to_page": 3}})
     # the call that names a unit of its own is left as it is
-    other = T.unit_handle_of(ws, untitled.doc, untitled.ver, _reading(untitled, untitled.ver), 3)
-    assert _values_in(T.tool_search(ws, "שווי הנכס", None, 12, other)) == {U3_VALUE}
+    other = T.unit_handle_of(pin, untitled.doc, untitled.ver, _reading(untitled, untitled.ver), 3)
+    assert _values_in(T.tool_search(pin, "שווי הנכס", None, 12, other)) == {U3_VALUE}
 
 
-def test_a_find_documents_that_lists_several_units_or_a_second_unit_leaves_no_default_scope(untitled):
+def test_a_listing_of_several_units_chooses_none_and_a_second_pinned_unit_drops_the_default_scope(untitled):
     ws = T.Workspace(ctx=untitled.ctx())
     T.tool_find_documents(ws, "מתחם")  # the word of every unit
     assert ws.unit_focus is None and ws.located_unit is None
     assert _values_in(T.tool_search(ws, "שווי הנכס", None, 12)) == {U1_VALUE, U2_VALUE, U3_VALUE}
     ws = T.Workspace(ctx=untitled.ctx())
-    T.tool_find_documents(ws, "הצפצפה")
-    assert ws.unit_focus is not None
-    T.tool_find_documents(ws, "הדולב")  # two units in one turn: a comparison, not one property
-    assert ws.unit_focus is None and ws.located_unit is None
+    ctx = untitled.ctx()
+    for question in ("מה שווי הנכס בפרויקט הצפצפה?", "מה שווי הנכס בפרויקט הדולב?"):
+        found = entities.first_message(ctx, question)
+        T.locate_unit(ws, found.unit, found.version_id)
+    # two units pinned in one turn: a comparison, not one property
+    assert ws.unit_focus is None and ws.located_unit is None and not ws.unit_default
     assert _values_in(T.tool_search(ws, "שווי הנכס", None, 12)) == {U1_VALUE, U2_VALUE, U3_VALUE}
 
 
@@ -998,20 +1039,23 @@ def test_a_single_appraisal_file_that_holds_the_deciding_words_too_is_a_competit
     assert entities.first_message(ctx, "מה שווי הנכס בפרויקט הדולב?").unit["unit_no"] == 3
 
 
-def test_a_first_message_naming_a_word_of_one_unit_only_works_inside_that_unit(client, untitled, monkeypatch):
+def test_a_first_message_naming_a_word_of_one_unit_only_gets_that_unit_as_a_candidate_with_the_passages_basis(
+        client, untitled, monkeypatch):
     def answer(items) -> dict:
         sid = _sid(items, U2_VALUE)
-        return final(f"שווי הנכס הוא {U2_VALUE} ₪ [{sid}].", claims=[
-            {"text": f"שווי הנכס הוא {U2_VALUE} ₪", "source_ids": [sid], "basis": "explicit"}])
+        return final(f"שווי הנכס הוא {U2_VALUE} ₪ [{sid}].", focus=_offer(untitled.doc, "U1") | {"subject": "מתחם הצפצפה"},
+                     claims=[{"text": f"שווי הנכס הוא {U2_VALUE} ₪", "source_ids": [sid], "basis": "explicit"}])
 
-    # a pin from the passages is provisional: it applies when the request analysis says the question is about a property
-    agent = ScriptedAgent([[call("search", query="שווי הנכס פרויקט הצפצפה", document_ids=None, limit=None, unit=None)],
+    # the unit states no name: the one word only its passages hold ranks it, as a candidate with that basis shown (round 15 U6,
+    # KTD1) - no pin, no wait for the request analysis; the model searches inside the unit it chooses and declares it
+    agent = ScriptedAgent([[call("search", query="שווי הנכס פרויקט הצפצפה", document_ids=None, limit=None, unit="U1")],
                            answer], intent="property")
     cloud(monkeypatch, untitled, agent)
     m = send(client, new_conversation(client), "מה שווי הנכס בפרויקט הצפצפה?")
     assert m["status"] == "done", m
-    task = agent.seen[0][0]["content"]  # the model is told which unit the turn is in, and that searches stay in it
-    assert "U1" in task and "עמוד 2" in task and "unit=U1" in task and "אלא אם המשתמש מזכיר" in task
+    task = agent.seen[0][0]["content"]
+    assert re.search(r"^- U1 «[^»]*» \| עמוד 2", task, re.M) and entities.BASIS_PASSAGES in task
+    assert "אלא אם המשתמש מזכיר" not in task  # the block is data, not a scope rule
     searched = agent.tool_outputs(1)[0]
     assert _values_in(searched) == {U2_VALUE} and "חיפוש בתוך היחידה U1" in searched
     a = m["answer"]
@@ -1025,7 +1069,7 @@ def test_a_general_question_over_an_untitled_file_is_not_scoped_to_a_unit(client
     cloud(monkeypatch, untitled, agent)
     m = send(client, new_conversation(client), "מה שווי הנכס?")
     assert m["status"] == "done", m
-    assert "unit=U" not in agent.seen[0][0]["content"] and "אלא אם המשתמש מזכיר" not in agent.seen[0][0]["content"]
+    assert resolve.CANDIDATES_HEAD not in agent.seen[0][0]["content"]  # no word names a unit: no candidates block
     assert _values_in(agent.tool_outputs(1)[0]) == {U1_VALUE, U2_VALUE, U3_VALUE}
 
 
@@ -1034,7 +1078,8 @@ def test_a_claim_about_the_located_unit_resting_on_another_units_value_is_remove
 
     ws = T.Workspace(ctx=untitled.ctx())
     ws.requirements = verify.TurnRequirements()
-    T.tool_find_documents(ws, "הצפצפה")  # the turn's unit: the second
+    found = entities.first_message(untitled.ctx(), "מה שווי הנכס בפרויקט הצפצפה?")  # the unit a pin or a declaration names
+    T.locate_unit(ws, found.unit, found.version_id)  # the turn's unit: the second
     sids = {}
     for n, value in ((2, U2_VALUE), (3, U3_VALUE)):  # each read through its own unit handle
         handle = T.unit_handle_of(ws, untitled.doc, untitled.ver, _reading(untitled, untitled.ver), n)
@@ -1164,8 +1209,10 @@ def test_a_unit_kept_from_the_conversation_is_never_replaced_by_one_the_turn_loc
     handle = T.unit_handle_of(ws, untitled.doc, untitled.ver, _reading(untitled, untitled.ver), 3)
     kept = {"handle": handle, "document_id": untitled.doc, "display": "x"}
     ws.unit_focus = dict(kept)
-    out = T.tool_find_documents(ws, "הצפצפה")
-    assert ws.unit_focus == kept and ws.located_unit is None and "נמצאה יחידה אחת" not in out
+    ws.unit_default = True
+    found = entities.first_message(untitled.ctx(), "מה שווי הנכס בפרויקט הצפצפה?")
+    assert not T.locate_unit(ws, found.unit, found.version_id)
+    assert ws.unit_focus == kept and ws.located_unit is None
     assert _values_in(T.tool_search(ws, "שווי הנכס", None, 12)) == {U3_VALUE}
 
 

@@ -7,9 +7,13 @@ The request analysis answers with the components a test gives (``request=``: a l
 information component per part the first scripted final answer declares, and with none when it declares none —
 an empty analysis, so the judge derives the requirements as before the analysis existed (the fallback).
 
-The analysis also carries the question's intent (round 10): by default ``unknown`` — which, on a first turn, drops a
-provisional unit pin (a pin from passages) and runs no lookup; a test that wants the pin gives ``intent="property"``
-(a value of ``app.chat.intent.Value``, or a dict of the whole part, or a callable ``(input) -> either``)."""
+The analysis also carries the question's intent (round 10): by default ``unknown`` — the turn's intent is the claim
+(round 15 U6: evidence never overrides it), and ``unknown`` plans both pools; a test that wants a property or a
+professional reading gives ``intent="property"`` (a value of ``app.chat.intent.Value``, or a dict of the whole part, or a
+callable ``(input) -> either``).
+
+A ``final(...)`` focus is sent with ``units: []`` unless it gives ``units`` (the U# handles the answer declares, or — for a
+clarification between units — offers): the strict schema has the model send every field."""
 
 from __future__ import annotations
 
@@ -43,7 +47,9 @@ def final(markdown: str, status: str = "answered", claims: list | None = None, c
     return {"final": {"status": status, "answer_markdown": markdown, "claims": claims or [],
                       "clarification_question": clarification, "missing_info": missing,
                       "referenced_document_ids": documents or [], "scope_kind": scope, "scope_query": scope_query,
-                      "omitted": omitted or [], "focus": focus,
+                      "omitted": omitted or [],
+                      # the strict schema has the model send every field: a focus that declares no unit says ``units: []``
+                      "focus": {"units": []} | focus if focus is not None else None,
                       # the strict schema has the model send every field: a claim tied to no component says ""
                       "requested": [{"component": ""} | r if isinstance(r, dict) else r for r in requested or []],
                       "parts": parts or []}}

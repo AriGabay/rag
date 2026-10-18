@@ -84,15 +84,19 @@ def test_another_property_is_answered_from_its_own_document(client, setup, monke
     assert "החליף נכס" in task
 
 
-def test_a_similar_address_in_two_towns_asks_then_resolves_a_bare_reply(client, setup, monkeypatch):
+def test_a_similar_address_in_two_towns_reaches_the_model_which_asks_and_a_bare_reply_resolves(client, setup, monkeypatch):
+    """Round 15 U6 (KTD1, R2): the lookup's ambiguity is told to the model with both documents; the server does not ask in its
+    place. The model asks between the towns in its own words, and the reply names one."""
     cid = _first_turn(client, setup, monkeypatch)
-    agent = _turn(monkeypatch, [], _resolution(relation="new_question",
-                                               changed_fields=[{"field": "subject", "user_words": "בהנרקיס 4"}]))
+    asked = "יש שני מסמכים על הנרקיס 4: בעין ורד ובכפר גפן. לאיזה התכוונת?"
+    agent = _turn(monkeypatch, [final(asked, "clarification", clarification=asked)],
+                  _resolution(relation="new_question", changed_fields=[{"field": "subject", "user_words": "בהנרקיס 4"}]))
     m = send(client, cid, "ובהנרקיס 4?")
     a = m["answer"]
-    assert a["status"] == "clarification" and agent.seen == []  # no answering step
-    assert "עין ורד" in a["markdown"] and "כפר גפן" in a["markdown"]
-    assert {c["document_id"] for c in a["request"]["candidates"]} == {setup.narkis_a, setup.narkis_b}
+    assert a["status"] == "clarification" and a["markdown"] == asked and len(agent.seen) == 1  # the model's question
+    task = agent.seen[0][0]["content"]
+    assert setup.narkis_a in task and setup.narkis_b in task and setup.dror not in task  # both documents, none of the focus
+    assert a["request"]["candidates"] == [] and a["request"]["document_ids"] == []
     reply = _turn(monkeypatch, [[call("search", query="שווי", document_ids=[setup.narkis_b], limit=None)],
                                 final("השווי 5,300,000 ₪ [S1].")],
                   _resolution(relation="clarification_answer"))
@@ -101,26 +105,32 @@ def test_a_similar_address_in_two_towns_asks_then_resolves_a_bare_reply(client, 
     assert setup.dror not in reply.seen[0][0]["content"]
 
 
-def test_a_property_that_is_not_there_asks_and_never_answers_from_the_previous_one(client, setup, monkeypatch):
+def test_a_property_that_is_not_there_is_told_to_the_model_and_nothing_of_the_previous_one_is_its_scope(client, setup,
+                                                                                                         monkeypatch):
     cid = _first_turn(client, setup, monkeypatch)
-    agent = _turn(monkeypatch, [], _resolution(relation="new_question",
-                                               changed_fields=[{"field": "subject", "user_words": "בהיסמין 3"}]))
+    agent = _turn(monkeypatch, [final("לא איתרתי את הנכס בהיסמין 3 במסמכים שלך.", "not_found")],
+                  _resolution(relation="new_question", changed_fields=[{"field": "subject", "user_words": "בהיסמין 3"}]))
     a = send(client, cid, "ובהיסמין 3?")["answer"]
-    assert a["status"] == "clarification" and "לא מצאתי" in a["markdown"] and agent.seen == []
-    assert "13,700" not in a["markdown"]
+    task = agent.seen[0][0]["content"]  # the server asked nothing: the model was told what the lookup found
+    assert a["status"] == "not_found" and len(agent.seen) == 1
+    assert "החיפוש" in task and "לא איתר" in task and "הנתון שבמרכז השיחה" not in task  # (the history is not a source)
+    assert "13,700" not in a["markdown"] and a["request"]["document_ids"] == []
 
 
 def test_a_clarification_is_hidden_once_a_document_it_named_is_revoked(client, setup, monkeypatch):
     cid = _first_turn(client, setup, monkeypatch)
-    _turn(monkeypatch, [], _resolution(relation="new_question",
-                                       changed_fields=[{"field": "subject", "user_words": "בהנרקיס 4"}]))
-    send(client, cid, "ובהנרקיס 4?")
+    asked = "יש שני מסמכים על הנרקיס 4: בעין ורד ובכפר גפן. לאיזה התכוונת?"
+    _turn(monkeypatch, [final(asked, "clarification", clarification=asked)],
+          _resolution(relation="new_question", changed_fields=[{"field": "subject", "user_words": "בהנרקיס 4"}]))
+    shown = send(client, cid, "ובהנרקיס 4?")
+    assert shown["answer"]["markdown"] == asked
     with tenant_tx(setup.system) as conn:
         conn.execute(text("UPDATE documents SET deleted_at = now() WHERE id = :d"), {"d": setup.narkis_a})
     msgs = client.get(f"/api/chat/conversations/{cid}/messages").json()["messages"]
     clarification = [m for m in msgs if m["role"] == "assistant"][-1]
     assert "עין ורד" not in (clarification.get("content") or "")
     assert "כפר גפן" not in (clarification.get("content") or "")
+    assert client.get(f"/api/chat/messages/{shown['id']}").json()["answer"].get("hidden") is True
 
 
 def test_the_lookup_never_sees_another_offices_documents(setup):
@@ -132,9 +142,10 @@ def test_the_lookup_never_sees_another_offices_documents(setup):
 
 def test_the_resolution_is_diagnostics_only_and_follows_the_documents_it_names(client, setup, monkeypatch):
     cid = _first_turn(client, setup, monkeypatch)
-    _turn(monkeypatch, [], _resolution(relation="new_question", document_ids=[setup.foreign],
-                                       changed_fields=[{"field": "subject", "user_words": "בהנרקיס 4"},
-                                                       {"field": "scale", "user_words": "הכולל"}]))
+    _turn(monkeypatch, [final("לא ברור לאיזה מהמסמכים התכוונת.", "not_found")],
+          _resolution(relation="new_question", document_ids=[setup.foreign],
+                      changed_fields=[{"field": "subject", "user_words": "בהנרקיס 4"},
+                                      {"field": "scale", "user_words": "הכולל"}]))
     m = send(client, cid, "ובהנרקיס 4?")
     assert "parse" not in m["answer"]["request"] and "decisions" not in str(m["answer"])
     d = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["resolution"]
@@ -149,23 +160,23 @@ def test_the_resolution_is_diagnostics_only_and_follows_the_documents_it_names(c
 # --- documents that were not read (round 9 U6, KTD11; AE1) -------------------------------------------------------------
 
 
-def test_a_follow_up_naming_a_failed_document_says_it_was_not_read_and_why(client, setup, monkeypatch):
+def test_a_follow_up_naming_a_failed_document_tells_the_model_it_was_not_read_and_why(client, setup, monkeypatch):
     cid = _first_turn(client, setup, monkeypatch)
     add_unread(setup, setup.default_group_id, "שומה - הזית 9 נווה ים")
-    agent = _turn(monkeypatch, [], _resolution(relation="new_question",
-                                               changed_fields=[{"field": "subject", "user_words": "בהזית 9"}]))
+    agent = _turn(monkeypatch, [final("המסמך «שומה - הזית 9 נווה ים» לא נקרא, ולכן לא בדקתי בו.", "not_found")],
+                  _resolution(relation="new_question", changed_fields=[{"field": "subject", "user_words": "בהזית 9"}]))
     a = send(client, cid, "ובהזית 9?")["answer"]
-    assert a["status"] == "clarification" and agent.seen == []  # no answering step, no search over the file
-    assert "שומה - הזית 9 נווה ים" in a["markdown"] and TOO_LONG in a["markdown"]
-    assert "לא נקרא" in a["markdown"] or "העיבוד נכשל" in a["markdown"]
-    assert "לא מצאתי" not in a["markdown"] and "13,700" not in a["markdown"]
-    assert a["request"]["candidates"] == []  # nothing to choose between: a reply is a new question
+    task = agent.seen[0][0]["content"]  # the model was told; nothing was searched in the file and the server asked nothing
+    assert len(agent.seen) == 1 and "שומה - הזית 9 נווה ים" in task and TOO_LONG in task
+    assert "הנתון שבמרכז השיחה" not in task and a["request"]["candidates"] == []  # nothing to choose between
+    assert a["request"]["named_document_ids"]  # the unread file is bound to the message (authorization)
 
 
-def _revoked_after(client, setup, monkeypatch, user_words: str, question: str, add) -> tuple[str, dict, ScriptedAgent]:
-    """An employee's first answer, a follow-up that the server answers with a clarification naming files that were not
-    read, and then the group of those files is taken away from the employee. Returns the conversation, the clarification
-    message and the agent of the next turn (whose resolve input is what the model is given of the history)."""
+def _revoked_after(client, setup, monkeypatch, user_words: str, question: str, add,
+                   title: str) -> tuple[str, dict, ScriptedAgent]:
+    """An employee's first answer, a follow-up whose answer (the model's, told which files were not read) names a file that
+    was not read, and then the group of those files is taken away from the employee. Returns the conversation, that message
+    and the agent of the next turn (whose resolve input is what the model is given of the history)."""
     make_user(setup, "emp@example.test", [setup.default_group_id])
     first = ScriptedAgent([[call("search", query="שווי למ\"ר", document_ids=[setup.dror], limit=None)],
                            final("השווי למ\"ר אקוו' נקבע ל-13,700 ₪ [S1].", focus=_focus(setup.dror, "הדרור 5"))])
@@ -175,15 +186,16 @@ def _revoked_after(client, setup, monkeypatch, user_words: str, question: str, a
     assert send(client, cid, "מה השווי למ״ר בהדרור 5?")["status"] == "done"
     other = make_group(setup, "קבוצה אחרת")
     named = add(setup)
-    _turn(monkeypatch, [], _resolution(relation="new_question",
-                                       changed_fields=[{"field": "subject", "user_words": user_words}]))
+    asked = f"הקובץ «{title}» לא נקרא ולכן לא נבדק. על איזה נכס התכוונת לשאול?"
+    _turn(monkeypatch, [final(asked, "clarification", clarification=asked)],
+          _resolution(relation="new_question", changed_fields=[{"field": "subject", "user_words": user_words}]))
     shown = send(client, cid, question)
     assert shown["answer"]["status"] == "clarification"
     with tenant_tx(setup.system) as conn:  # the employee loses access to every file the message named
         conn.execute(text("UPDATE documents SET group_id = :g WHERE id = ANY(:d)"),
                      {"g": other, "d": [str(d) for d in named]})
-    agent = _turn(monkeypatch, [], _resolution(relation="new_question",
-                                               changed_fields=[{"field": "subject", "user_words": "בהיסמין 3"}]))
+    agent = _turn(monkeypatch, [final("אין לי נתון.", "not_found")],
+                  _resolution(relation="new_question", changed_fields=[{"field": "subject", "user_words": "בהיסמין 3"}]))
     return cid, shown, agent
 
 
@@ -196,29 +208,30 @@ def _assert_hidden_everywhere(client, cid: str, shown: dict, agent: ScriptedAgen
     assert title not in "\n".join(c.input for c in agent.calls)  # and the next turn's history does not carry it
 
 
-def test_a_clarification_about_an_unread_file_is_hidden_once_the_user_loses_access_to_it(client, setup, monkeypatch):
+def test_an_answer_naming_an_unread_file_is_hidden_once_the_user_loses_access_to_it(client, setup, monkeypatch):
     title = "שומה - הזית 9 נווה ים"
     cid, shown, agent = _revoked_after(client, setup, monkeypatch, "בהזית 9", "ובהזית 9?",
-                                       lambda s: [add_unread(s, s.default_group_id, title)])
+                                       lambda s: [add_unread(s, s.default_group_id, title)], title)
     _assert_hidden_everywhere(client, cid, shown, agent, title)
 
 
-def test_a_clarification_listing_unread_files_is_hidden_once_the_user_loses_access_to_one(client, setup, monkeypatch):
+def test_an_answer_listing_unread_files_is_hidden_once_the_user_loses_access_to_one(client, setup, monkeypatch):
     title = "קובץ מרוכז - מתחם הרצל"
     cid, shown, agent = _revoked_after(client, setup, monkeypatch, "בהיסמין 3", "ובהיסמין 3?",
-                                       lambda s: [add_unread(s, s.default_group_id, title)])
+                                       lambda s: [add_unread(s, s.default_group_id, title)], title)
     _assert_hidden_everywhere(client, cid, shown, agent, title)
 
 
-def test_a_follow_up_that_names_nothing_lists_the_files_that_were_not_read(client, setup, monkeypatch):
+def test_a_follow_up_that_names_nothing_tells_the_model_which_files_were_not_read(client, setup, monkeypatch):
     cid = _first_turn(client, setup, monkeypatch)
     add_unread(setup, setup.default_group_id, "קובץ מרוכז - מתחם הרצל")
-    _turn(monkeypatch, [], _resolution(relation="new_question",
-                                       changed_fields=[{"field": "subject", "user_words": "בהיסמין 3"}]))
-    a = send(client, cid, "ובהיסמין 3?")["answer"]
-    assert a["status"] == "clarification" and "לא מצאתי" in a["markdown"]
-    assert "קבצים שאתה רשאי לראות לא נקראו, ולכן לא נבדקו" in a["markdown"]
-    assert "קובץ מרוכז - מתחם הרצל" in a["markdown"] and TOO_LONG in a["markdown"]
+    agent = _turn(monkeypatch, [final("לא איתרתי את הנכס; הקובץ «קובץ מרוכז - מתחם הרצל» לא נקרא.", "not_found")],
+                  _resolution(relation="new_question", changed_fields=[{"field": "subject", "user_words": "בהיסמין 3"}]))
+    send(client, cid, "ובהיסמין 3?")
+    task = agent.seen[0][0]["content"]
+    assert "לא איתר" in task  # the lookup found no document (the model decides how to say it)
+    assert "קבצים שאתה רשאי לראות לא נקראו, ולכן לא נבדקו" in task
+    assert "קובץ מרוכז - מתחם הרצל" in task and TOO_LONG in task
 
 
 # --- the unit in the conversation's focus (round 9 U10, KTD8, R14) --------------------------------------------------------

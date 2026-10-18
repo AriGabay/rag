@@ -74,6 +74,7 @@ def focused(office, intent: str) -> T.Workspace:
     ws = workspace(office, intent)
     handle = T.unit_handle_of(ws, office.appraisal, office.version, READING, 1)
     ws.unit_focus = {"handle": handle, "document_id": office.appraisal, "unit_id": None}
+    ws.unit_default = True  # the server's pin (the search-only path, round 15 U6): a call that names no unit works inside it
     return ws
 
 

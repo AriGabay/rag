@@ -481,3 +481,204 @@ def test_only_a_contradicted_appendix_value_is_removed_and_a_calculation_from_ap
     leaves = [SimpleNamespace(context=_real_value(cx, 4, "V1", "1").operand().leaves[0].context)]
     ws.computations = {"C1": SimpleNamespace(outcome=SimpleNamespace(leaves=leaves))}
     assert verify._wrong_context(calc_unit, ws, asked) is None
+
+
+# --- a name or identifier names a unit only if no other subject unit of the file holds it (round 15 U7, KTD8, R10) -----------
+
+def _ident(street: str = "", parcel: tuple[str, str] | None = None) -> dict:
+    """The stored identifiers of a synthetic unit (``units.Unit.identifiers``): what the ingestion keeps of the labelled ones."""
+    written = ([f"רחוב {street}"] if street else []) + ([f"גוש {parcel[0]} חלקה {parcel[1]}"] if parcel else [])
+    found = contexts.identifiers("\n".join(written))
+    return {"addresses": [list(a) for a in found.addresses], "parcels": [list(p) for p in found.parcels],
+            "shown": list(found.shown)}
+
+
+def _shared_word_contexts() -> contexts.Contexts:
+    """Units 2 and 3 share the project word «פרויקט הגפן» (an alias of both) and the street «הגפן 4»; each has its own letter
+    title and parcel; unit 4 is a comparables part that names unit 3."""
+    parts = [_unit(1, "front_matter", None, first=0, last=1),
+             _unit(2, "appraisal", "פרויקט הגפן א", ("פרויקט הגפן", "הגפן א"), first=2, last=5, pages=(2, 3),
+                   identifiers=_ident("הגפן 4", ("100", "5"))),
+             _unit(3, "appraisal", "פרויקט הגפן ב", ("פרויקט הגפן", "הגפן ב"), first=6, last=9, pages=(4, 5),
+                   identifiers=_ident("הגפן 4", ("100", "6"))),
+             _unit(4, "comparables", "עסקאות השוואה - פרויקט הגפן ב", ("עסקאות השוואה",), first=10, last=12, pages=(6, 6))]
+    first = {n: SimpleNamespace(block_index=n, page=p, bbox=[50.0, 40.0, 500.0, 52.0]) for n, p in ((2, 2), (6, 4), (10, 6))}
+    return contexts.from_units(parts, first, [3, 7, 11], "v", "r1")
+
+
+def test_a_name_or_identifier_held_by_two_subject_units_names_neither_and_a_unique_one_still_names_its_unit():
+    cx = _shared_word_contexts()
+    assert cx.numbers == [1, 2, 3, 4] and cx.subjects == [1, 2, 3]
+    assert cx.named("מה שווי הנכס בפרויקט הגפן?") == []  # the shared alias decides nothing
+    assert cx.named("רחוב הגפן 4") == []  # the shared address decides nothing
+    assert cx.named("פרויקט הגפן א") == [2] and cx.named("שווי הגפן ב") == [3]  # a name of one unit only
+    assert cx.named("גוש 100 חלקה 5") == [2] and cx.named("100/6") == [3]  # a unique identifier keeps naming
+    assert cx.named("השווה בין פרויקט הגפן א לפרויקט הגפן ב") == [2, 3]
+    assert cx.named("עסקאות השוואה") == []  # a comparables part is never a subject, held or not
+
+
+def test_a_name_held_only_by_an_appendix_or_comparables_part_still_names_its_subject_unit():
+    parts = [_unit(1, "appraisal", "פרויקט הדקל", ("הדקל",), first=0, last=3),
+             _unit(2, "appraisal", "פרויקט האורן", ("האורן",), first=4, last=7),
+             _unit(3, "comparables", "השוואה לפרויקט הדקל", ("הדקל",), first=8, last=9)]
+    cx = contexts.from_units(parts, {}, [], "v", "r1")
+    assert cx.named("שווי הדקל") == [1]  # the comparables part is no subject: it holds the name against nobody
+
+
+# --- the asked set of the context check: distinctive naming first, then the declared units (round 15 U7, KTD7, R3, R10) ----
+
+def _declared_ws(cx: contexts.Contexts, cited: dict[str, int], question: str, declared: list[int] | None = None,
+                 sources: dict | None = None) -> SimpleNamespace:
+    """A workspace whose answer cites ``cited`` (id -> context number) and declares the units ``declared`` (numbers of
+    ``cx``): their anchors and the handles the server issued for them, as the engine keeps them."""
+    ws = _claim_ws(cx, cited, question)
+    ws.handles = {f"U{n}": {"kind": "U", "document_id": "d", "version_id": cx.version_id, "reading_id": cx.reading_id,
+                            "unit_no": n} for n in cx.numbers}
+    ws.declared_units = [{"document_id": "d", "reading_id": cx.reading_id, "unit_no": n, "units_tag": cx.tag,
+                          "display": cx.label(n)} for n in declared or []]
+    ws.located_unit = ws.unit_focus = None
+    if sources:
+        ws.sources = sources
+    return ws
+
+
+def _wrong(cx, cited, question, declared=None, claim="שווי הנכס 14,850,000 ₪", sources=None, ids=None):
+    from app.chat import verify
+
+    ws = _declared_ws(cx, cited, question, declared, sources)
+    unit = verify.Unit(0, f"{claim} [{', '.join(ids or cited)}].", claim, list(ids or cited))
+    return verify._wrong_context(unit, ws, question)
+
+
+def test_a_value_of_the_declared_unit_is_kept_when_the_units_share_a_project_word(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+    cx = _shared_word_contexts()
+    ask = "מה שווי הנכס בפרויקט הגפן?"
+    assert _wrong(cx, {"V1": 2}, ask, declared=[2]) is None
+    assert _wrong(cx, {"V1": 3}, ask, declared=[3]) is None
+    # the other unit's value under that declaration is another property's
+    elsewhere = _wrong(cx, {"V1": 3}, ask, declared=[2])
+    assert elsewhere and cx.describe(3) in elsewhere and cx.describe(2) in elsewhere
+    # several declared units are a comparison: a value of either is theirs
+    assert _wrong(cx, {"V1": 2}, ask, declared=[2, 3]) is None and _wrong(cx, {"V1": 3}, ask, declared=[2, 3]) is None
+    # nothing declared and nothing distinctly named: the shared word decides nothing, so nothing is removed on it
+    assert _wrong(cx, {"V1": 3}, ask) is None
+
+
+def test_a_question_that_names_a_unit_distinctively_outranks_the_declaration(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+    cx = _shared_word_contexts()
+    ask = "מה שווי הנכס בפרויקט הגפן א?"
+    # the answer declares and cites unit 3, the question names unit 2: the declaration is contradicted
+    assert _wrong(cx, {"V1": 3}, ask, declared=[3]) is not None
+    # the value of the unit the question names is kept, though the declaration excluded it
+    assert _wrong(cx, {"V1": 2}, ask, declared=[3]) is None
+    assert _wrong(cx, {"V1": 2}, ask, declared=[2]) is None
+    # a declaration that adds a unit does not widen what the question named
+    assert _wrong(cx, {"V1": 3}, ask, declared=[2, 3]) is not None
+
+
+def test_the_request_components_naming_a_unit_distinctively_outrank_the_declaration(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+    cx = _shared_word_contexts()
+    ws = _declared_ws(cx, {"V1": 3}, "מה השווי?", declared=[3])
+    ws.requirement_items = [{"subject": "פרויקט הגפן א"}]
+    from app.chat import verify
+
+    unit = verify.Unit(0, "שווי הנכס 14,850,000 ₪ [V1].", "שווי הנכס 14,850,000 ₪", ["V1"])
+    assert verify._wrong_context(unit, ws, "מה השווי?") is not None
+    ws.requirement_items = [{"subject": "פרויקט הגפן"}]  # the shared word names nobody: the declaration is the asked set
+    assert verify._wrong_context(unit, ws, "מה השווי?") is None
+
+
+def test_a_claim_naming_the_asked_unit_distinctively_is_removed_when_it_cites_a_sibling_whatever_the_declaration(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+    cx = _shared_word_contexts()
+    ask = "מה שווי הנכס בפרויקט הגפן?"
+    claim = "שווי הנכס בפרויקט הגפן א הוא 14,850,000 ₪"
+    assert _wrong(cx, {"V1": 3}, ask, claim=claim) is not None  # no declaration
+    assert _wrong(cx, {"V1": 3}, ask, declared=[3], claim=claim) is not None  # a declaration of the sibling
+    assert _wrong(cx, {"V1": 2}, ask, declared=[2], claim=claim) is None
+
+
+def test_a_declaration_the_server_dropped_falls_back_to_name_matching(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+    cx = _shared_word_contexts()
+    ask = "מה שווי הנכס בפרויקט הגפן ב?"  # ``declared_units`` is empty: U6 dropped a handle that was neither offered nor read
+    assert _wrong(cx, {"V1": 2}, ask, declared=[]) is not None
+    assert _wrong(cx, {"V1": 3}, ask, declared=[]) is None
+
+
+def test_a_mention_of_another_appraisal_in_the_units_comparables_part_is_left_to_the_judge(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+    cx = _shared_word_contexts()
+    ask = "מה שווי הנכס בפרויקט הגפן?"
+    claim = "בעסקאות ההשוואה של פרויקט הגפן א נרשם פרויקט הגפן ב בסך 14,850,000 ₪"
+    # the figure is in the comparables part (context 4): no subject context, so the check leaves it to the judge
+    assert _wrong(cx, {"V1": 4}, ask, declared=[2], claim=claim) is None
+
+
+def test_a_neighbour_units_passage_is_evidence_for_the_neighbour_not_for_the_declared_unit(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+    cx = _shared_word_contexts()
+    # the passage a search of unit 2 returned across a probable edge lies in unit 3: its sources say so
+    neighbour = SimpleNamespace(contexts=[3], version_id="v", text="שווי הנכס 14,850,000 ₪", document_id="d")
+    own = SimpleNamespace(contexts=[2], version_id="v", text="שווי הנכס 14,850,000 ₪", document_id="d")
+    ask = "מה שווי הנכס בפרויקט הגפן?"
+    assert _wrong(cx, {}, ask, declared=[2], sources={"S1": neighbour}, ids=["S1"]) is not None
+    assert _wrong(cx, {}, ask, declared=[2], sources={"S1": own}, ids=["S1"]) is None
+    # declaring both says the answer is about both
+    assert _wrong(cx, {}, ask, declared=[2, 3], sources={"S1": neighbour}, ids=["S1"]) is None
+
+
+def test_a_professional_question_still_removes_nothing_under_a_declaration(monkeypatch):
+    from app.chat import verify
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+    cx = _shared_word_contexts()
+    ws = _declared_ws(cx, {"V1": 3}, "מה שווי הנכס בפרויקט הגפן?", declared=[2])
+    unit = verify.Unit(0, "שווי הנכס 14,850,000 ₪ [V1].", "שווי הנכס 14,850,000 ₪", ["V1"])
+    ws.intent = "property"
+    assert verify._wrong_context(unit, ws, "מה שווי הנכס בפרויקט הגפן?")
+    ws.intent = "professional"
+    assert verify._wrong_context(unit, ws, "מה שווי הנכס בפרויקט הגפן?") is None
+
+
+def test_the_judge_header_of_a_passage_in_the_declared_unit_names_it_by_handle_and_structural_title_only():
+    import uuid
+
+    from app.chat import tools, verify
+
+    cx = _shared_word_contexts()
+    doc, ws = uuid.uuid4(), Workspace(ctx=None)
+    ws.contexts["v"] = cx
+    handles = {n: tools.unit_handle_of(ws, doc, "v", "r1", n) for n in (2, 3)}
+    for n in (2, 3):
+        src = ws.add_source(document_id=doc, version_id="v", title="קובץ שומות סינתטי", section=None, location="עמוד 2",
+                            kind="context", text="שווי הנכס 14,850,000 ₪.")
+        tools._mark(src, cx, [n], ws)
+        src.date_line = ""
+    ws.declared_units = [{"document_id": str(doc), "reading_id": "r1", "unit_no": 2, "units_tag": None, "display": "x"}]
+    ws.sources["S1"].tags.update(unit=handles[2])
+    head_declared, _, _ = verify._source_parts(ws, "S1")
+    head_other, _, _ = verify._source_parts(ws, "S2")
+    assert f"{verify.MSG_DECLARED_UNIT}: {handles[2]} «פרויקט הגפן א»" in head_declared
+    assert verify.MSG_DECLARED_UNIT not in head_other  # the neighbour's passage is not the declared unit's
+    assert verify.MSG_DECLARED_UNIT not in verify._source_parts(ws, "S1", dated=False)[0]
+    ws.declared_units = []
+    assert verify.MSG_DECLARED_UNIT not in verify._source_parts(ws, "S1")[0]

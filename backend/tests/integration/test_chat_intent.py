@@ -8,11 +8,12 @@ places only."""
 
 from __future__ import annotations
 
+import re
 import time
 
 import pytest
 
-from app.chat import contexts, entities
+from app.chat import contexts, entities, resolve
 from app.platform import pipeline
 from app.providers.llm import CallStatus
 from tests.conftest import login
@@ -132,7 +133,8 @@ UNIT_VALUES = ("1,100,000", "2,200,000", "3,300,000")
 def units(setup):
     """Three appraisals of one file whose stored units carry no title: the one word that tells them apart is in their
     passages (here "גישות", held by the second only), so a first message that uses it is pinned to that unit by its
-    passages — provisionally."""
+    passages: the server's pin of the search-only path (``entities.first_message``) takes it provisionally, and a model turn
+    gets it as a candidate with that basis (round 15 U6, KTD1)."""
     setup.doc, setup.ver = unit_file(setup, setup.default_group_id, "קובץ שומות סינתטי ללא כותרות", [
         {"blocks": ["מתחם הנרקיס, שומת מקרקעין", f"שווי הנכס {UNIT_VALUES[0]} ₪."]},
         {"blocks": ["מתחם הצפצפה, שומת מקרקעין", f"גישות ההערכה בשומה זו שלוש. שווי הנכס {UNIT_VALUES[1]} ₪."]},
@@ -148,14 +150,17 @@ def _general_answer() -> ScriptedAgent:
                           final("אין מידע.", "not_found")])
 
 
-def test_the_passages_pin_is_the_provisional_one(units):
+def test_the_passages_pin_of_the_search_only_path_is_the_provisional_one(units):
     found = entities.first_message(units.ctx(), GENERAL)
     assert found is not None and found.unit["unit_no"] == 2 and found.ambiguity is None
 
 
-@pytest.mark.parametrize("value, pinned", [("professional", False), ("unknown", False), ("property", True),
-                                           ("mixed", True), ("document", True)])
-def test_a_first_message_pin_from_passages_waits_for_the_intent(client, units, monkeypatch, value, pinned):
+@pytest.mark.parametrize("value", ["professional", "unknown", "property", "mixed", "document"])
+def test_a_first_message_gets_the_passages_candidate_as_data_whatever_the_intent_and_never_waits_for_it(client, units,
+                                                                                                        monkeypatch, value):
+    """Round 15 U6 (KTD1, KTD2): the unit only the passages hold is a candidate with its basis shown, not a pin that waits for
+    the request analysis and is dropped for a professional or an unknown intent; the block is a hint the model weighs and it
+    never says «search only inside». The intent is the analysis' claim."""
     agent = ScriptedAgent([[call("search", query="גישות ההערכה", document_ids=None, limit=None, unit=None)],
                            final("אין מידע.", "not_found")], intent=value)
     cloud(monkeypatch, units, agent)
@@ -163,14 +168,14 @@ def test_a_first_message_pin_from_passages_waits_for_the_intent(client, units, m
     m = send(client, new_conversation(client), GENERAL)
     assert m["status"] == "done", m
     task = agent.seen[0][0]["content"]
-    assert ("unit=U1" in task) is pinned, task
+    assert resolve.CANDIDATES_HEAD in task and entities.BASIS_PASSAGES in task and "אלא אם המשתמש מזכיר" not in task
+    assert [t for t in re.findall(r"^- (U\d+) «", task, re.M)] == ["U1"]
     res = _diagnostics(client, m)["resolution"]
-    assert res["decisions"]["intent"] == value
-    assert res["decisions"]["first_message"].startswith("provisional, " + ("applied" if pinned else "dropped"))
-    assert ("זו שאלה מקצועית כללית" in task) is (value == "professional")
+    assert res["decisions"]["intent"] == value and "first_message" not in res["decisions"]
+    assert res["decisions"]["candidates"].startswith("1 shown")
 
 
-def test_a_first_message_whose_analysis_times_out_drops_the_pin_and_records_the_wait(client, units, monkeypatch):
+def test_a_first_message_whose_analysis_times_out_still_gets_its_candidate_and_records_the_wait(client, units, monkeypatch):
     from app.config import get_settings
 
     monkeypatch.setattr(get_settings(), "chat_intent_wait_seconds", 0.3)
@@ -185,20 +190,20 @@ def test_a_first_message_whose_analysis_times_out_drops_the_pin_and_records_the_
     login(client, "admin-a@example.test")
     m = send(client, new_conversation(client), GENERAL)
     assert m["status"] == "done", m
-    assert "unit=U1" not in agent.seen[0][0]["content"]  # the pin was dropped
+    assert resolve.CANDIDATES_HEAD in agent.seen[0][0]["content"]  # the candidates never waited for the analysis
     d = _diagnostics(client, m)
-    assert d["resolution"]["decisions"]["first_message"] == "provisional, dropped: intent unknown"
-    assert d["timing"]["waits"]["intent"] >= 0.25  # the wait is in the turn's timing
+    assert d["timing"]["waits"]["intent"] >= 0.25  # the first step's tools waited (a bounded time) for the intent: pools only
+    assert d["resolution"]["decisions"]["intent"] == "property (late)"  # the analysis landed after the tools ran
 
 
-def test_a_first_message_whose_analysis_fails_is_unknown_and_drops_the_pin(client, units, monkeypatch):
+def test_a_first_message_whose_analysis_fails_is_unknown_and_keeps_its_candidate(client, units, monkeypatch):
     agent = ScriptedAgent([[call("search", query="גישות ההערכה", document_ids=None, limit=None, unit=None)],
                            final("אין מידע.", "not_found")], request=CallStatus.TIMEOUT)
     cloud(monkeypatch, units, agent)
     login(client, "admin-a@example.test")
     m = send(client, new_conversation(client), GENERAL)
     assert m["status"] == "done", m
-    assert "unit=U1" not in agent.seen[0][0]["content"]
+    assert resolve.CANDIDATES_HEAD in agent.seen[0][0]["content"]
     res = _diagnostics(client, m)["resolution"]
     assert res["decisions"]["intent"] == "unknown"
 
@@ -224,8 +229,8 @@ def test_the_analysis_is_collected_before_the_first_steps_tools_run(client, setu
 
 # --- the follow-up gate (KTD3) ------------------------------------------------------------------------------------
 
-def test_a_professional_follow_up_whose_words_are_unique_to_one_unit_pins_no_unit_and_asks_nothing(client, units,
-                                                                                                    monkeypatch):
+def test_a_professional_follow_up_whose_words_are_unique_to_one_unit_shows_no_candidates_and_asks_nothing(client, units,
+                                                                                                          monkeypatch):
     first = ScriptedAgent([final("אין מידע.", "not_found")])
     cloud(monkeypatch, units, first)
     login(client, "admin-a@example.test")
@@ -237,11 +242,14 @@ def test_a_professional_follow_up_whose_words_are_unique_to_one_unit_pins_no_uni
     _next(monkeypatch, second)
     m = send(client, cid, GENERAL)
     assert m["status"] == "done" and m["answer"]["status"] != "clarification", m
-    assert "unit=U1" not in second.seen[0][0]["content"]
-    # the same words from a parse that says property, with no evidence beyond the passages: still no pin
+    assert resolve.CANDIDATES_HEAD not in second.seen[0][0]["content"]  # a professional question names no appraisal
+    # the same words from a parse that says property, with no evidence beyond the passages: the unit is a candidate (data
+    # with its basis), never a pin
     third = ScriptedAgent([[call("search", query="גישות ההערכה", document_ids=None, limit=None, unit=None)],
                            final("אין מידע.", "not_found")])
     third.on("resolve", _resolution(intent=intent_part("property")))
     _next(monkeypatch, third)
     m = send(client, cid, GENERAL)
-    assert m["status"] == "done" and "unit=U1" not in third.seen[0][0]["content"]
+    assert m["status"] == "done" and m["answer"]["status"] != "clarification"
+    task = third.seen[0][0]["content"]
+    assert resolve.CANDIDATES_HEAD in task and entities.BASIS_PASSAGES in task and "אלא אם המשתמש מזכיר" not in task

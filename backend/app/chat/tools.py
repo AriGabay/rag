@@ -110,16 +110,16 @@ unit and runs on into the next unit's blocks is cut at the unit's last block (``
 and pages; a table chunk the same, its rows by their contexts: ``_rows_in_scope``), and a read through a unit handle reads no block outside the unit's reach, so a cited passage never holds
 another unit's text (R10).
 
-**The unit in the conversation** (round 9 U10, KTD8): when the request is in a unit — kept from the previous turn across a
-metric change, or named by the user — the engine gives it a handle (``Workspace.unit_focus``) and a ``search``,
-``outline`` or ``read`` of pages that names no unit and no document but that unit's file works inside it
-(``focus_unit_for``); a call that names another document or a unit of its own is left as it is. The units a turn's tools
-worked in are kept (``Workspace.unit_scopes``), so a turn cut short by a limit leaves the conversation in the unit it
-was reading. A unit the turn itself locates for the question is the turn's unit the same way (``locate_unit``): the one
-subject unit ``find_documents`` lists, or the one the engine finds at a first message or a new question by the unit names
-or, where the units state none, by their passages (``entities.first_message``) — a second unit located in the turn is a
-comparison and drops that default. It is also the asked property when no title or alias names one
-(``located_contexts``): a claim about it resting only on another unit's value is removed as ``wrong_subject``.
+**The unit in the conversation** (round 9 U10, KTD8; round 15 U6, KTD1, KTD3): when the request is in a unit — kept from the
+previous turn across a metric change, or named by the user — the engine gives it a handle (``Workspace.unit_focus``), and
+the candidate units a question points at get handles of their own (``Workspace.offered_units``); the model names the unit it
+works in (``unit=U#``, ``document=U#``) and declares it in ``focus.units``. A call that names no unit is not silently scoped
+(``focus_unit_for``); a call that names another document or a unit of its own is as asked. Only the server's pin of the
+search-only path (``locate_unit``, ``Workspace.unit_default``: the unit the question names by its name or, where the units
+state none, by their passages, ``entities.first_message``) scopes the calls that name no unit and no other document to it —
+a second unit located in the turn is a comparison and drops that default; the pin is also the asked property when no title
+or alias names one (``located_contexts``). The units a turn's tools worked in are kept (``Workspace.unit_scopes``), so a turn
+cut short by a limit leaves the conversation in the unit it was reading.
 
 **Time search** (round 12 U7: KTD6, KTD7; R9-R14, R20): in a turn with a time mode (the switch, or a requested time) a
 ``search`` about an identified property — a call naming a unit (whether or not it is the conversation's: round 15 U2, KTD10),
@@ -622,6 +622,14 @@ class Workspace:
     # the units the turn's tools worked in through a unit handle: unit id -> {"document_id", "version_id", "reading_id",
     # "unit_no"}; the unit a turn that ended on a limit leaves the conversation in when nothing it cited says
     unit_scopes: dict[str, dict] = field(default_factory=dict)
+    # round 15 U6 (KTD1, KTD3, KTD7): ``unit_default`` — the server's pin scopes a call that names no unit to ``unit_focus``
+    # (set only by the search-only path, which has no model to choose a unit); ``offered_units`` — the handles of the
+    # candidate units the turn's first message showed the model; ``declared_units`` — the units the answer declared in
+    # ``focus.units`` and the server validated against the offered ones and the ones the turn read (anchors, in the model's
+    # order), which the next unit's verification and the turn's unit read
+    unit_default: bool = False
+    offered_units: set = field(default_factory=set)
+    declared_units: list = field(default_factory=list)
     # the passages an identical search returned, kept for the turn (round 9 R16, KTD3, ``memoized_search``):
     # (query, scope, limit, the office's data version) -> hits
     search_memo: dict = field(default_factory=dict)
@@ -1845,15 +1853,26 @@ def _unit_of(conn: Connection, ws: Workspace, handle: str):
 MSG_UNIT_FOCUS = "(היחידה שהשיחה עוסקת בה: {unit})"
 
 
-def focus_unit_for(ws: Workspace, documents: list[str] | str | None) -> str | None:
-    """The handle of the conversation's unit (U#), when a call that names no unit asks for no document but the unit's
-    own: the search or outline then works inside it (KTD8) — the user named no other property, or the request would
-    have moved. A call that names any other document is left as it is."""
+def _documents_of_focus(ws: Workspace, documents: list[str] | str | None) -> bool:
+    """Whether a call's documents are the focus unit's own file or nothing (a call that names any other document is as
+    asked)."""
     focus = ws.unit_focus
     if not focus:
-        return None
+        return False
     named = {str(x).strip() for x in ([documents] if isinstance(documents, str) else documents or ()) if str(x).strip()}
-    return focus["handle"] if named <= {focus["document_id"], ws.doc_handle(focus["document_id"])} else None
+    return named <= {focus["document_id"], ws.doc_handle(focus["document_id"])}
+
+
+def focus_unit_for(ws: Workspace, documents: list[str] | str | None) -> str | None:
+    """The handle of the unit a call that names no unit is scoped to, or None. Since round 15 U6 (KTD1, KTD3) a model turn
+    scopes nothing it was not told to: a call works inside a unit only when it names that unit (``unit=U#``, also the
+    focus unit's own handle), so a call that names none is never silently scoped. Only the server's pin of the search-only
+    path (``Workspace.unit_default``), which has no model to choose, scopes the calls that name no unit and no other document
+    than the pinned unit's file to it (KTD8 of round 9)."""
+    focus = ws.unit_focus
+    if not focus or not ws.unit_default:
+        return None
+    return focus["handle"] if _documents_of_focus(ws, documents) else None
 
 
 def names_focus_unit(ws: Workspace, unit: str | None, documents: list[str] | str | None = None) -> bool:
@@ -1861,9 +1880,9 @@ def names_focus_unit(ws: Workspace, unit: str | None, documents: list[str] | str
     unit's handle in the context and passes it, which is no choice of another unit — the search then says it works in the
     conversation's unit (``MSG_UNIT_FOCUS``). Since round 15 U2 (KTD10) this decides no widening: the time search follows
     the unit any call names. A handle is the same handle for the same unit (``unit_handle_of``), but the version, reading
-    and unit number are compared too; a call that names another document is no focus call (``focus_unit_for``)."""
+    and unit number are compared too; a call that names another document is no focus call."""
     focus = ws.unit_focus
-    if not focus or not unit or focus_unit_for(ws, documents) is None:
+    if not focus or not unit or not _documents_of_focus(ws, documents):
         return False
     unit = str(unit).strip()
     if unit == focus["handle"]:
@@ -1873,17 +1892,13 @@ def names_focus_unit(ws: Workspace, unit: str | None, documents: list[str] | str
                 == (b["version_id"], b["reading_id"], b["unit_no"]))
 
 
-MSG_UNIT_LOCATED = ("נמצאה יחידה אחת לשאלה: {unit} ({pages}). מעתה search, outline ו-read (עמודים) שאינם מציינים יחידה או "
-                    "מסמך אחר מוגבלים ליחידה הזו (הכל בתוכה בלבד; ערך משומה אחרת בקובץ אינו של הנכס שנשאל); כדי לעבוד "
-                    "ביחידה אחרת ציין אותה (unit=U#).")
-
-
 def locate_unit(ws: Workspace, anchor: dict, version_id) -> bool:
-    """The turn's lookup located a unit for the question (``find_documents`` listed exactly one subject unit, or the
-    engine found the one the question names at the turn's start): it becomes the turn's working unit, as a unit kept from
-    the turn before would be (``unit_focus``, so ``focus_unit_for`` scopes the calls that name no unit and no other
-    document to it). A second unit located in the turn is a comparison, not one property: the turn's own default scope is
-    dropped; a unit kept from the conversation is never replaced. Returns whether the turn's unit is now ``anchor``."""
+    """The server pins a unit for the question (round 9; since round 15 U6, KTD3, only the search-only path does, because
+    it has no model to choose a unit — the model turn gets candidates instead): it becomes the turn's working unit
+    (``unit_focus``) and the default scope of the calls that name no unit and no other document
+    (``Workspace.unit_default``, ``focus_unit_for``). A second unit located in the turn is a comparison, not one property:
+    the turn's own default scope is dropped; a unit kept from the conversation is never replaced. Returns whether the
+    turn's unit is now ``anchor``."""
     from app.chat import entities
 
     key = contexts.anchor_key(version_id, anchor)  # carries the derivation tag, so it matches ``cx.key(n)`` (round 15 U2)
@@ -1891,12 +1906,14 @@ def locate_unit(ws: Workspace, anchor: dict, version_id) -> bool:
     if len(ws.turn_located) > 1:
         if ws.located_unit is not None:
             ws.unit_focus = ws.located_unit = None
+            ws.unit_default = False
         return False
     if ws.unit_focus is not None:
         return False
     handle = unit_handle_of(ws, anchor["document_id"], version_id, anchor.get("reading_id"), anchor["unit_no"])
     ws.unit_focus = {"handle": handle, "document_id": str(anchor["document_id"]), "display": entities.focus_text(anchor)}
     ws.located_unit = {"key": key, "anchor": anchor}
+    ws.unit_default = True
     return True
 
 
@@ -4346,15 +4363,7 @@ def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> s
     if units:
         out += "\n\n" + "\n".join([MSG_UNITS_LISTED, *(_unit_detail(ws, u) for u in units)]
                                     + ([MSG_SEVERAL_UNITS] if len(units) > 1 else []))
-    # exactly one subject unit in the whole set (not only on this page): the turn's working unit
-    only = [u for d in found for u in d["units"]]
-    if len(only) == 1:
-        from app.chat import entities
-
-        u = only[0]
-        if locate_unit(ws, entities.anchor_with_id(u), u["version_id"]):
-            out += "\n\n" + MSG_UNIT_LOCATED.format(unit=ws.unit_focus["handle"],
-                                                    pages=_unit_pages(u["page_first"], u["page_last"]))
+    # a single unit listed is listed, not chosen (round 15 U6, KTD1): the model names the unit it works in, and declares it
     return out + extra
 
 

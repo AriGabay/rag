@@ -234,7 +234,7 @@ def test_a_changed_limit_or_wording_is_a_new_verdict_key_and_an_appraisals_key_i
 
 
 def test_the_judge_version_is_bumped_and_the_cache_does_not_reuse_an_older_contract(monkeypatch):
-    assert verify.JUDGE_VERSION == 9  # round 13 U9: server-held unit facts and derived computations; U11: the preceding text of a back-reference
+    assert verify.JUDGE_VERSION == 10  # round 13 U9: server-held unit facts and derived computations; U11: the preceding text of a back-reference; round 15 U7: the declared unit in a source header
     ws = _ws()
     s1 = standard(ws, "על השמאי לבסס את הערכתו על עסקאות השוואה.", rules=RULES)
     seen: list[str] = []

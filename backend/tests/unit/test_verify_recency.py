@@ -314,3 +314,21 @@ def test_a_sentence_with_both_forms_is_still_a_recency_claim():
     ws = _covered(_ws(*V), complete=False)
     assert len(_check("בחוות הדעת הנוכחית השווי העדכני הוא 2,410,000 ₪ [V3].", ws)) == 1
     assert verify._calls_latest("בחוות הדעת הנוכחית השווי העדכני הוא 2,410,000 ₪")
+
+
+# --- the coverage wording is the server's (round 15 U7, KTD8, R11) ---------------------------------------------------------
+
+def test_a_model_sentence_calling_a_value_the_latest_under_partial_coverage_is_still_marked_partial_not_removed():
+    ws = _covered(_ws(*V), complete=False)
+    report = verify_answer(_supporting_judge(), _answer("הנתון העדכני ביותר הוא 2,410,000 ₪ [V3]."), ws, "?", [])
+    (p,) = [x for x in report.problems if x.check == "recency_claim"]
+    assert p.repairable and p.severity == "partial" and p.defect == "recency"
+    assert report.removed_units() == set() and report.failed_units() == set() and report.correctness() == "partial"
+    # the repair asks to drop the claim of recency; it no longer leads with the instruction to write the phrase
+    assert p.reason.index("השמט") < p.reason.index("הנתון המאוחר ביותר במקורות שנבדקו")
+
+
+def test_the_same_sentence_in_the_servers_qualified_words_is_no_problem_so_the_servers_note_never_needs_repair():
+    ws = _covered(_ws(*V), complete=False)
+    report = verify_answer(_supporting_judge(), _answer("הנתון המאוחר ביותר במקורות שנבדקו הוא 2,410,000 ₪ [V3]."), ws, "?", [])
+    assert [x for x in report.problems if x.check == "recency_claim"] == [] and report.ok

@@ -476,6 +476,7 @@ def test_a_user_who_cannot_see_one_of_two_linked_appraisals_gets_no_link_no_titl
         ws.time = RECENT
         ver, reading = version_of(office, seen)
         ws.unit_focus = {"handle": T.unit_handle_of(ws, seen, ver, reading, 1), "document_id": seen, "unit_id": None}
+        ws.unit_default = True  # a call that names no unit works inside it (the server's pin, round 15 U6)
         return ws, run(ws, "search", query=QUERY, limit=6)
 
     ws, out = turn(outsider)
@@ -744,7 +745,7 @@ def test_the_model_summary_names_a_located_unit_once_the_turn_read_another(offic
     run(ws, "read", target={"pages": {"document": T.unit_handle_of(ws, old, ver, reading, 1), "from_page": 1, "to_page": 1}})
     run(ws, "search", query="המועד הקובע", limit=6)
     summary = TF.coverage_summary(ws.time_coverage)
-    assert TF.MSG_LOCATED.format(date="30/06/2025") in summary and TF.PHRASE_RULE in summary, new
+    assert TF.MSG_LOCATED.format(date="30/06/2025") in summary and summary.endswith(TF.coverage_note(ws.time_coverage)), new
 
 
 def test_a_newer_datum_of_an_undecided_class_is_named_in_the_record_and_the_note(office, monkeypatch):

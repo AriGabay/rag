@@ -93,10 +93,14 @@ def test_professional_without_evidence_stays_professional():
     assert got.evidence == () and not got.refers
 
 
-def test_professional_with_evidence_becomes_mixed():
+def test_professional_with_evidence_stays_professional_and_the_evidence_is_a_recorded_hint():
+    """Round 15 U6 (KTD2, R1): the request analysis' reading is the intent. A phrase that is also a document's name
+    is a hint the server records, never a decision: it no longer turns a professional claim into ``mixed``."""
     got = settle(claim("professional"), "מה דורש התקן לגבי הדקל 5?", VOCABULARY)
-    assert got.value == "mixed" and got.refers and [e.text for e in got.evidence] == ["הדקל 5"]
-    assert any("professional claim" in r for r in got.reasons)
+    assert got.value == "professional" and got.claimed == "professional" and got.professional and not got.refers
+    assert [e.text for e in got.evidence] == ["הדקל 5"]  # the hint is kept
+    assert not any("professional claim" in r for r in got.reasons)
+    assert settle(claim("mixed"), "מה דורש התקן לגבי הדקל 5?", VOCABULARY).value == "mixed"
 
 
 def test_property_and_document_keep_their_value_with_no_evidence_but_say_so():
@@ -105,12 +109,17 @@ def test_property_and_document_keep_their_value_with_no_evidence_but_say_so():
         assert got.value == value and got.evidence == () and any("no lookup" in r for r in got.reasons)
 
 
-def test_a_missing_or_invalid_parse_settles_from_the_evidence():
+def test_a_missing_parse_settles_from_the_evidence_and_an_unknown_claim_stays_unknown():
+    # the None-claim branch (the search-only path and a failed analysis) is deterministic and unchanged (KTD3)
     assert settle(None, "ובהדקל 5?", VOCABULARY).value == "property"
     assert settle(None, APPROACHES, VOCABULARY).value == "unknown"
-    assert settle(claim("unknown"), "ובהדקל 5?", VOCABULARY).value == "property"
-    assert settle(claim("unknown"), APPROACHES, VOCABULARY).value == "unknown"
     assert settle(None, APPROACHES, VOCABULARY).claimed == ""
+    # a claim the analysis gave is not overridden: «unknown» with evidence stays unknown (both pools, labelled), and the
+    # evidence is recorded for the candidates (round 15 U6, KTD2)
+    got = settle(claim("unknown"), "ובהדקל 5?", VOCABULARY)
+    assert got.value == "unknown" and got.claimed == "unknown" and [e.text for e in got.evidence] == ["הדקל 5"]
+    assert settle(claim("unknown"), APPROACHES, VOCABULARY).value == "unknown"
+    assert settle(claim("set"), "ובהדקל 5?", VOCABULARY).value == "unknown"  # a set claim of an entity-scope parse
 
 
 def test_scope_set_decides_intent_set():

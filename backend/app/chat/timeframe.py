@@ -222,14 +222,12 @@ def resolve(question: str, time_preference: dict | None) -> TimeMode:
 
 # --- the model-facing block ---------------------------------------------------------------------------------------------
 
-# the one phrase the answer uses for a datum when not every appraisal of the property was checked (round 12 U8, R12, KTD8;
-# session-settled): the latest datum in the sources checked, never the latest in the repository
+# the words that qualify a "latest" claim under partial coverage (round 12 U8, R12, KTD8; session-settled): the latest datum
+# in the sources checked, never the latest in the repository. Since round 15 U7 (KTD8, R11) they are the SERVER's text only:
+# the coverage note (``coverage_note``) says it after the answer, and no instruction asks the model to write the phrase;
+# ``verify._recency_claim`` still flags a model sentence that calls a value the latest while the coverage is partial
 QUALIFIED = "במקורות שנבדקו"   # the words that qualify a "latest" claim (`verify` checks for them)
 LATEST_CHECKED = f"הנתון המאוחר ביותר {QUALIFIED}"
-PHRASE_RULE = (
-    f"כשתוצאת החיפוש מציינת שכיסוי השומות חלקי, או שהנכס לא זוהה, אל תכתוב על נתון שהוא «העדכני ביותר» או «האחרון»: "
-    f"כתוב «{LATEST_CHECKED}» וציין מה לא נבדק. גם כשהכיסוי מלא, אל תכתוב שזה הנתון האחרון במאגר — רק של השומות "
-    f"שנבדקו. השרת מוסיף לתשובה הערת כיסוי משלו, ואינו תלוי בניסוח שלך.")
 
 _GENERAL_RULES = (
     "- אל תשמיט נתון ישן שרלוונטי: העדפת הזמן קובעת סדר, לא סינון.\n"
@@ -239,8 +237,7 @@ _GENERAL_RULES = (
     "- נתונים של נכסים שונים, או של מדד, יחידה, תקופתיות, בסיס שטח או מע\"מ שונים, אינם היסטוריה אחת: הצג אותם "
     "כקבוצות נפרדות (למשל שכירות לחודש מול שכירות לשנה, כולל מע\"מ מול לא כולל), כל קבוצה מהחדש לישן.\n"
     "- נתון מתוארך שאתה מציג כנתון, גם הקודמים, רשום ב-take_value וצטט (V#): השרת בונה מהערכים הרשומים ציר זמן מאומת "
-    "עם המועד והמקור של כל אחד, ונתון שצוטט רק כקטע (S#) אינו נכנס אליו. התאריך עצמו נכתב ומצוטט, לא נרשם.\n"
-    f"- {PHRASE_RULE}")
+    "עם המועד והמקור של כל אחד, ונתון שצוטט רק כקטע (S#) אינו נכנס אליו. התאריך עצמו נכתב ומצוטט, לא נרשם.")
 
 BLOCK_RECENT = (
     "הנחיית זמן (המשתמש ביקש להעדיף נתונים עדכניים):\n"
@@ -416,11 +413,9 @@ def coverage_note(record: dict | None) -> str | None:
 
 
 def coverage_summary(record: dict | None) -> str | None:
-    """What the model reads after a time-ranked search (KTD8): the note the answer will carry, and — when the coverage is
-    partial or the property not identified — the rule for the phrase. None without a record."""
+    """What the model reads after a time-ranked search (KTD8): the note the server will add to the answer, which it need
+    not write (round 15 U7, R11: no rule asks it to word the coverage). None without a record."""
     note = coverage_note(record)
     if note is None:
         return None
-    if record.get("complete"):
-        return _SUMMARY_HEAD + note
-    return f"{_SUMMARY_HEAD}{note}\n{PHRASE_RULE}"
+    return _SUMMARY_HEAD + note

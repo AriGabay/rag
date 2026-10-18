@@ -1321,3 +1321,76 @@ def test_conflicting_reads_a_dated_and_an_undated_value_as_one_conflict_unless_t
     assert not coverage.conflicting(ws)
     ws.values[undated].as_of = _when("2025", "year")
     assert coverage.conflicting(ws)
+
+
+# --- round 15 U7: the unit signal counts the units a turn used or declared, not the candidates it was only offered ------------
+
+def _offer(ws: Workspace, *numbers: int) -> dict[int, str]:
+    """The candidates block's handles for units of S1's file (``Workspace.offered_units``): the file's contexts are those of
+    ``_in_units``; the handles are issued as the engine issues them."""
+    from app.chat import tools as T
+
+    source = ws.sources["S1"]
+    handles = {n: T.unit_handle_of(ws, source.document_id, source.version_id, "r1", n) for n in numbers}
+    ws.offered_units |= set(handles.values())
+    return handles
+
+
+def test_candidate_units_only_offered_to_the_model_are_not_a_located_unit_nor_a_file_of_several_units():
+    ws = _ws()
+    _offer(ws, 2)  # one candidate shown; the model never read, scoped or declared it
+    signal = coverage.unit_signal(ws)
+    assert signal["multi"] == set() and signal["located"] == {}, signal  # not "the one unit find_documents listed"
+    ws = _ws()
+    _offer(ws, 1, 2)
+    assert coverage.unit_signal(ws) == {"multi": set(), "located": {}}
+    # the same handles listed by a tool (not offered as candidates) keep their meaning: the one unit listed is located
+    ws = _ws()
+    handles = _offer(ws, 2)
+    ws.offered_units.clear()
+    signal = coverage.unit_signal(ws)
+    assert signal["multi"] == {str(ws.sources["S1"].document_id)} and len(signal["located"]) == 1, (handles, signal)
+
+
+def test_an_offered_unit_the_turn_read_scoped_or_declared_is_counted():
+    from app.chat import tools as T
+
+    for how in ("scoped", "read", "declared"):
+        ws = _ws()
+        _in_units(ws)
+        handles = _offer(ws, 1, 2)
+        source = ws.sources["S1"]
+        if how == "scoped":
+            ws.unit_scopes[ws.contexts[str(source.version_id)].key(2)] = {
+                "document_id": str(source.document_id), "version_id": str(source.version_id), "reading_id": "r1",
+                "unit_no": 2}
+        elif how == "read":
+            source.tags["unit"] = handles[2]
+        else:
+            ws.declared_units = [{"document_id": str(source.document_id), "reading_id": "r1", "unit_no": 2,
+                                  "units_tag": None, "display": "שומה ב"}]
+        signal = coverage.unit_signal(ws)
+        assert str(source.document_id) in signal["multi"], how
+        if how != "read":  # reading a passage does not locate the property; naming it or declaring it does
+            assert list(signal["located"]) == [ws.contexts[str(source.version_id)].key(2)], (how, signal)
+        assert T.unit_handle_of(ws, source.document_id, source.version_id, "r1", 2) == handles[2]
+
+
+def test_a_comparison_of_declared_units_locates_each_of_them():
+    ws = _ws()
+    _in_units(ws)
+    _offer(ws, 1, 2)
+    source = ws.sources["S1"]
+    ws.declared_units = [{"document_id": str(source.document_id), "reading_id": "r1", "unit_no": n, "units_tag": None,
+                          "display": UNIT_TITLES[n][0]} for n in (1, 2)]
+    cx = ws.contexts[str(source.version_id)]
+    assert set(coverage.unit_signal(ws)["located"]) == {cx.key(1), cx.key(2)}
+
+
+def test_a_turn_offered_candidates_and_using_none_still_says_the_unit_was_not_located_when_a_file_of_several_was_read():
+    ws = _ws()
+    ws.searches.append("דמי ניהול")
+    _in_units(ws)  # S1 is in a file of two units (a context-built file) and the turn located neither
+    _offer(ws, 1, 2)
+    o, gap = _only_missing(ws)
+    assert o["limitation"] == "unit_not_located", (o, gap)

@@ -82,12 +82,15 @@ def version_of(office, doc: str) -> tuple[str, str | None]:
 
 
 def focused(office, time: TimeMode, doc: str, unit_no: int = 1) -> T.Workspace:
-    """A workspace whose conversation is on unit ``unit_no`` of ``doc`` (as a prior turn leaves it)."""
+    """A workspace whose conversation is on unit ``unit_no`` of ``doc`` (as a prior turn leaves it), a call that names no unit
+    working inside it: the server's pin (``unit_default``, round 15 U6) — the call a model turn makes with ``unit=U#`` takes
+    the same path (``unfocused`` and the tests of a named unit)."""
     ws = workspace(office, "property")
     ws.time = time
     ver, reading = version_of(office, doc)
     handle = T.unit_handle_of(ws, doc, ver, reading, unit_no)
     ws.unit_focus = {"handle": handle, "document_id": doc, "unit_id": None}
+    ws.unit_default = True
     return ws
 
 

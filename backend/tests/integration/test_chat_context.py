@@ -111,8 +111,9 @@ def _rent_turn(world) -> dict:
 def _unit_turn(world) -> dict:
     """A first turn that names a unit of the file of several by its complete name: the property is that unit."""
     m, _ = _turn(world, "מה שווי הנכס במתחם הדולב?", [
-        [call("search", query="שווי הנכס", document_ids=None, limit=None, unit=None)],
-        final(f"שווי הנכס הוא {VALUES[2]} ₪ [S1].", focus=_focus(world.file, "מתחם הדולב", "value", unit="ILS"),
+        [call("search", query="שווי הנכס", document_ids=None, limit=None, unit="U1")],  # the candidate the model was offered
+        final(f"שווי הנכס הוא {VALUES[2]} ₪ [S1].",
+              focus=_focus(world.file, "מתחם הדולב", "value", unit="ILS", units=["U1"]),
               claims=_claims(f"שווי הנכס הוא {VALUES[2]} ₪"))], intent="property")
     return m
 
@@ -174,7 +175,7 @@ def test_ae4_a_professional_turn_leaves_the_property_and_its_unit_for_the_next_t
     assert slot["subject"] == "מתחם הדולב"
     assert _context(world, m)["params"]["metric_kind"] == "value"  # the task parameters are dormant with it
     third, agent = _turn(world, "ומה השווי שם?", [
-        [call("search", query="שווי הנכס", document_ids=None, limit=None, unit=None)],
+        [call("search", query="שווי הנכס", document_ids=None, limit=None, unit="U1")],
         final(f"שווי הנכס הוא {VALUES[2]} ₪ [S1].", claims=_claims(f"שווי הנכס הוא {VALUES[2]} ₪"))],
         _resolution(relation="same_datum", intent=intent_part("property", "conversation_property"),
                     standalone_question="מה השווי במתחם הדולב?"))
@@ -294,7 +295,7 @@ def test_items_persist_the_second_and_then_the_third_bind_to_the_same_list(world
     assert labels == ["גישת ההכנסות", "גישת העלות"]
 
 
-def test_an_ordinal_that_fits_a_numbered_answer_and_a_listing_of_the_previous_turn_gets_one_focused_question(world):
+def test_an_ordinal_that_fits_a_numbered_answer_and_a_listing_of_the_previous_turn_is_told_to_the_model_as_two_readings(world):
     # the answer shows the documents of the listing as well as the approaches: two lists the user saw
     listed = ("השומות שלנו ברשימה [S1]: דירת מגורים רחוב התמר 9 עיר-ב (סינתטי); מדריך שמאות כללי (סינתטי); דירה "
               "ברחוב היסמין 3 עיר-ג (סינתטי). הגישות שהן משתמשות בהן:\n1. **גישת ההשוואה**\n2. **גישת ההכנסות**\n"
@@ -303,11 +304,12 @@ def test_an_ordinal_that_fits_a_numbered_answer_and_a_listing_of_the_previous_tu
         [call("list_documents", query="סינתטי", page=None)],
         final(listed, scope="set", scope_query="סינתטי")], None, intent="set")
     assert [s["kind"] for s in first["answer"]["sources"]] == ["listing"]
-    m, agent = _turn(world, "השנייה", [], _resolution(
+    m, agent = _turn(world, "השנייה", [final("התכוונת לגישה השנייה: גישת ההכנסות.", "not_found")], _resolution(
         standalone_question="השנייה", intent=intent_part("professional", "prior_answer_item", item=2)))
     a = m["answer"]
-    assert a["status"] == "clarification" and agent.seen == []  # the server's question: no agent step
-    assert "גישת ההכנסות" in a["markdown"] and "ברשימת המסמכים" in a["markdown"]
+    # round 15 U6 (KTD1, R2): the two readings are the model's to weigh - the server asks nothing in its place
+    assert a["status"] != "clarification" and len(agent.seen) == 1
+    assert "גישת ההכנסות" in _task(agent) and "ברשימת המסמכים" in _task(agent)
     assert _decisions(world, m)["item"].startswith("ambiguous")
     assert _context(world, m)["pending"] is None  # the reply is a new message, not a bound answer
 
@@ -329,13 +331,17 @@ def test_a_listing_the_answer_did_not_show_is_no_second_reading_of_an_ordinal(wo
 
 
 def _clarification(world) -> dict:
-    ingest(world, R9B)
-    m, agent = _turn(world, SIMILAR_QUESTION, [], None, intent="property")
-    assert m["answer"]["status"] == "clarification" and agent.seen == []
+    """The model's question between the two similar units of R9B, offering both (the cards it was shown, U1 and U2)."""
+    doc, _ = ingest(world, R9B)
+    asked = "בקובץ שני מתחמים: מתחם הגפן א ומתחם הגפן ב. לאיזה התכוונת?"
+    m, agent = _turn(world, SIMILAR_QUESTION, [final(asked, "clarification", clarification=asked,
+                                                        focus=_focus(doc, "", "unknown", units=["U1", "U2"]))],
+                     None, intent="property")
+    assert m["answer"]["status"] == "clarification" and len(agent.seen) == 1
     return m
 
 
-def test_a_server_clarification_stores_its_candidates_as_the_pending_slot(world):
+def test_a_model_clarification_stores_the_units_it_offered_as_the_pending_slot(world):
     m = _clarification(world)
     pending = _context(world, m)["pending"]
     assert pending["kind"] == "candidates" and pending["asked_at"]
@@ -388,12 +394,16 @@ def test_after_a_chosen_candidate_a_reply_of_all_of_them_asks_nothing_again(worl
     assert m["answer"]["status"] != "clarification" and agent.seen
 
 
-def test_a_reply_that_names_two_candidates_is_asked_again_when_the_model_calls_it_an_answer(world):
+def test_a_reply_that_names_two_candidates_reaches_the_model_again_when_the_model_calls_it_an_answer(world):
     _clarification(world)
-    m, agent = _turn(world, "הגפן", [], _resolution(
-        relation="clarification_answer", standalone_question="הגפן", intent=intent_part("property", "clarification")))
-    assert m["answer"]["status"] == "clarification" and agent.seen == []
-    assert len(m["answer"]["request"]["candidates"]) == 2  # a word both hold: the one question again
+    again = "הגפן קיים בשני מתחמים. התכוונת לא או לב?"
+    m, agent = _turn(world, "הגפן", [final(again, "clarification", clarification=again,
+                                           focus=_focus(world.file, "", "unknown", units=[]))],
+                     _resolution(relation="clarification_answer", standalone_question="הגפן",
+                                 intent=intent_part("property", "clarification")))
+    # the server asks nothing: the two candidates the reply names are the model's to weigh (and to ask about, in its words)
+    assert m["answer"]["markdown"] == again and len(agent.seen) == 1
+    assert not m["answer"]["request"]["candidates"] and m["answer"]["request"]["located_unit"] is None
 
 
 def test_ae7_a_new_question_holding_a_year_is_not_bound_as_the_pending_parameter(client, office, monkeypatch):
