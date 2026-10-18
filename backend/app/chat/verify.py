@@ -3433,6 +3433,9 @@ _TIME_NOUNS = frozenset({"שנה", "שנים", "שנתיים", "חודש", "חו
 # are left out (review, round 14): they name a figure as often as a document ("the current assessment is X").
 _DOCUMENT_NOUNS = frozenset({"שומה", "חוות", "דעת", "דוח", "מסמך", "נספח"})
 _CURRENT_WORDS = frozenset({"נוכחי", "נוכחית"})
+# "present value" (מקדם הערך הנוכחי, הערך הנוכחי של תזרים): an appraisal's discounting term, not the latest value (round 15).
+# "השווי הנוכחי" — the current value — stays a recency claim.
+_PRESENT_VALUE_NOUNS = frozenset({"ערך"})
 MSG_NOT_LATEST = ("הטענה קוראת ל-{older} «העדכני», אבל בתור הזה נרשם ערך מאוחר יותר מאותו נתון של אותו נכס: {newer} "
                   "(מועד {when}, {title}). הצג את {newer} כערך העדכני ואת {older} כערך קודם, עם תאריכיהם ומראי המקום "
                   "של שניהם (אל תמחק ערך שנתמך), או השמט את הניסוח «העדכני» / «האחרון»")
@@ -3462,6 +3465,8 @@ def _calls_latest(text: str) -> bool:
         if before and (before[-1] in _TIME_NOUNS or word in _TIME_NOUNS):
             continue
         if before and re.sub(r"^(?:[וש]?ה)", "", m.group()) in _CURRENT_WORDS and _is_document_noun(before[-1]):
+            continue
+        if before and re.sub(r"^(?:[וש]?ה)", "", m.group()) in _CURRENT_WORDS and word in _PRESENT_VALUE_NOUNS:
             continue
         return True
     return False

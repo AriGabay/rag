@@ -332,3 +332,19 @@ def test_the_same_sentence_in_the_servers_qualified_words_is_no_problem_so_the_s
     ws = _covered(_ws(*V), complete=False)
     report = verify_answer(_supporting_judge(), _answer("הנתון המאוחר ביותר במקורות שנבדקו הוא 2,410,000 ₪ [V3]."), ws, "?", [])
     assert [x for x in report.problems if x.check == "recency_claim"] == [] and report.ok
+
+
+# --- "present value" is a finance term, not a claim that a value is the latest (round 15) ------------------------------------
+
+
+def test_present_value_is_no_recency_claim_and_the_current_value_still_is():
+    """"מקדם הערך הנוכחי" / "הערך הנוכחי של תזרים" is the present value of a discounted flow (an appraisal's own term); a bullet
+    giving a capitalization rate beside it was removed as a claim of recency on the rebuilt stack (round 15). "השווי הנוכחי" — the
+    current value — is still a recency claim."""
+    ws = _covered(_ws(*V), complete=False)
+    for text in ("שיעור ההיוון 7.75% מופיע לצד מקדם הערך הנוכחי [V3].", "הערך הנוכחי של התזרים חושב בשיעור 7.75% [V3].",
+                 "ובערך הנוכחי נכללו דמי השכירות [V3]."):
+        assert not verify._calls_latest(text), text
+        assert _check(text, ws) == [], text
+    assert verify._calls_latest("השווי הנוכחי הוא 2,410,000 ₪")
+    assert len(_check("השווי הנוכחי הוא 2,410,000 ₪ [V3].", ws)) == 1
