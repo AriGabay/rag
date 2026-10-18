@@ -30,9 +30,26 @@ signals say a new part starts; each signal is recorded as evidence by name:
   subject line says: a cover letter followed by its report is one unit. The two signals count as two, so a subject line
   with a letter opening is ``certain``; either alone is ``probable``.
 
+- ``running_line_change`` (round 16 U4, KTD5) — the running header or footer of the pages changes for good: the text
+  lines at the top and at the bottom of each page (the page's stored text, which keeps the footer lines that carry a
+  page number and that the blocks drop), normalised with the digits ignored — never a bare page number, a date or a
+  page-number tail — form local runs of consecutive pages. A run of at least ``RUN_MIN_PAGES`` pages that replaces
+  an earlier such run on the same edge is a candidate; it is accepted only when it agrees with one more fact: the
+  other edge's run changes too (within a page), a cover page precedes it, or the printed numbering restarts there. A
+  report's own chapter header changes alone on one edge, so it agrees with nothing and cuts nothing. The boundary moves
+  back over one cover page that carries neither run (a cover is a page of few short blocks with a prominent title that
+  names a report type or a subject; a divider page is none), and the cover page is recorded in the detail;
 Two signals or more make the cut ``certain``, one strong signal makes it ``probable`` (R8: it stays marked, and
 reading may extend across it), none, or the weak signal alone: no cut. A file with no cut is one unit of kind ``document`` and certainty
 ``unsplit``: it is not presented as an appraisal on the strength of a first heading (R8).
+
+**Continuity** (round 16 U4, KTD6): a cut that carries neither a ``subject_line`` nor a ``letter_opening`` (it rests on
+a restarted page numbering, a running-line change, a repeated layout or a TOC entry) is dropped when the opening
+blocks of its pages (the cut page and the next) name the previous unit (its title and aliases, the aliases of its
+subject line, and its running subject: the segments of its running header that no other unit's header carries, when
+the new unit's header shares none of them) and
+state no address or parcel the previous unit's first page does not: an appendix whose pages restart the numbering and
+still name the report stays in it. A cut whose pages name no previous unit, or state another property, is kept.
 
 **Identity** is the unit's own title block, the lines at the top of its first page up to the first heading: the title
 is the most prominent line; aliases are quoted names, named-project phrases (a word of ``PROJECT_WORDS`` and the
@@ -85,14 +102,14 @@ from app.professional.sections import flight, landed
 
 logger = logging.getLogger(__name__)
 
-UNITS_VERSION = "units-v5"
+UNITS_VERSION = "units-v6"
 # the derivation whose stable ids and anchors carry no tag: an id or an anchor without a tag is a ``units-v4`` one
 # (round 15 U3, KTD6); every later derivation's ids end in ``@<tag>``
 UNTAGGED_VERSION = "units-v4"
 
 
 def tag_of(units_version: str) -> str | None:
-    """The short tag a derivation's stable unit ids and anchors carry (``units-v5`` -> ``v5``); None for the untagged
+    """The short tag a derivation's stable unit ids and anchors carry (``units-v6`` -> ``v6``); None for the untagged
     ``units-v4``, so the ids already stored stay valid."""
     return None if units_version == UNTAGGED_VERSION else units_version.removeprefix("units-")
 
@@ -126,7 +143,11 @@ TOC_ENTRY = "toc_entry"
 IDENTIFIER_RESTART = "identifier_numbering_restart"
 SUBJECT_LINE = "subject_line"
 LETTER_OPENING = "letter_opening"
-SIGNALS = (LABEL_RESTART, TITLE_BLOCK_REPEAT, TOC_ENTRY, IDENTIFIER_RESTART, SUBJECT_LINE, LETTER_OPENING)
+RUNNING_LINE_CHANGE = "running_line_change"
+SIGNALS = (LABEL_RESTART, TITLE_BLOCK_REPEAT, TOC_ENTRY, IDENTIFIER_RESTART, SUBJECT_LINE, LETTER_OPENING,
+           RUNNING_LINE_CHANGE)
+# the signals of a report's own opening: a cut that carries one is never checked for continuity
+OPENING_SIGNALS = frozenset({SUBJECT_LINE, LETTER_OPENING})
 CERTAIN_SIGNALS = 2  # independent signals that make a cut certain
 # a repeated layout is weak evidence: many pages of one report may share a title block's layout, so it never cuts
 # alone; with a strong signal it makes the cut certain
@@ -154,6 +175,10 @@ LETTER_RUN_MIN = 3  # single-letter tokens in a row that make a line spaced lett
 # the opening of a report (round 15 U4, KTD4): the word that introduces its subject line ("הנדון: ..."), the word that
 # opens its addressee line, and the month names of a dated line; a letter opens with them wherever the appraiser's
 # letterhead puts them
+# the words of a title that name a report type (a cover's title: "VALUATION REPORT", "דוח הערכת שווי"); any language the
+# office writes in may be added here, it is the one place that names them
+REPORT_TYPE_WORDS = ("הערכת שווי", "שומה", "שומת", "חוות דעת", "דוח", "דו״ח", "valuation", "appraisal", "assessment",
+                     "report")
 SUBJECT_WORDS = ("הנדון", "הנידון", "בנדון", "בעניין", "בענין")
 ADDRESSEE_WORDS = ("לכבוד",)
 ADDRESSEE_COLON_WORDS = ("אל",)  # "אל: X" is an addressee line, "אל" inside a sentence is not
@@ -182,6 +207,16 @@ TEXT_KEPT = 600  # characters of a block's text read for the derivation
 OPENING_BLOCKS = 12  # blocks at the top of a page that make its opening run
 OPENING_LEAD_ROWS = 16  # blocks at the top of each page whose table text is read (the run skips furniture and pictures)
 OPENING_SUPPRESS_PAGES = 3  # an opening run this close to the previous cut (a cover letter and its report) is no cut
+RUN_MIN_PAGES = 4  # a running line must repeat on this many consecutive pages to be a run (and a new run to be a regime)
+RUN_SHARE = 0.5  # a running line of a unit is one on at least this share of its pages
+RUNNING_LINE_CHARS = 160  # a running line is short: a longer line is body text
+RUNNING_EDGE_LINES = 2  # lines read in from the top and from the bottom of a page's text for its running line
+COVER_BLOCKS_MAX = 8  # a cover page: at most this many text blocks ...
+COVER_BLOCK_CHARS = 120  # ... each this short ...
+COVER_CHARS_MAX = 400  # ... and this much text on the page
+CONTINUITY_PAGES = 2  # pages (the cut page and the next) whose opening blocks must name the previous unit
+CONTINUITY_BLOCKS = 12  # opening blocks read on each of them
+NAME_CHARS_MIN = 4  # a name or a segment shorter than this names nothing
 DATE_LINE_CHARS = 45  # a line that holds a date and is no longer than this is a date line, not a sentence
 
 _TEXT_KINDS = ("paragraph", "textbox")
@@ -439,6 +474,9 @@ class _Ctx:
     body: float | None  # the median line height of one-line paragraphs
     furniture: frozenset  # normalized texts of running headers
     furniture_images: frozenset
+    running: _Running | None = None  # the running lines of the stored pages (round 16 U4); None without pages
+    by_page: dict[int, list] = field(default_factory=dict)  # page -> its blocks, in reading order
+    lead_at: dict[int, int] = field(default_factory=dict)  # page -> position of its first block
 
 
 def _run(c: _Ctx, start: int) -> list:
@@ -516,13 +554,13 @@ def _is_date_line(cell: str) -> bool:
     return len(cell) <= DATE_LINE_CHARS and bool(_DATE_NUMBERS.search(cell) or _DATE_WORDS.search(cell))
 
 
-def _opening(c: _Ctx, start: int, page: int) -> dict[str, dict]:
-    """The signals of the opening run of ``page`` (round 15 U4, KTD4): the blocks from ``start`` (the page's first
-    position in ``c.rows``) up to ``OPENING_BLOCKS``, stopping at the first heading that is no subject line. Running
-    headers, pictures and page-number lines are skipped. ``subject_line`` when a line or a table cell is a subject
-    line (``in_table`` for a table block); ``letter_opening`` when the run holds a date line and an addressee line.
-    Each signal maps to its evidence: the rule and block indexes only."""
+def _opening_scan(c: _Ctx, start: int, page: int) -> tuple[dict | None, str | None, int | None, int | None]:
+    """The opening run of ``page`` (round 15 U4, KTD4): the blocks from ``start`` (the page's first position in
+    ``c.rows``) up to ``OPENING_BLOCKS``, stopping at the first heading that is no subject line. Running headers,
+    pictures and page-number lines are skipped. Returns (the subject line's evidence, the subject it states, the block of
+    a date line, the block of an addressee line); the subject text is for the continuity check and never stored."""
     subject: dict | None = None
+    subject_text: str | None = None
     date_block = addressee_block = None
     seen = 0
     for r in islice(c.rows, start, None):
@@ -543,6 +581,10 @@ def _opening(c: _Ctx, start: int, page: int) -> dict[str, dict]:
                 if subject is None and _is_subject_cell(cell, follows):
                     subject, found = {"rule": "page_top_run", "block": r.block_index} | (
                         {"in_table": True} if r.kind == "table" else {}), True
+                    rest = _SUBJECT.match(cell).group("rest").strip()  # type: ignore[union-attr]
+                    others = [x for j, x in enumerate(cells) if j != i and x]
+                    subject_text = rest or " ".join(others) or (" ".join(x for x in lines[n + 1] if x)
+                                                                if n + 1 < len(lines) else "")
                 if date_block is None and _is_date_line(cell):
                     date_block = r.block_index
                 if addressee_block is None and _ADDRESSEE.match(cell):
@@ -552,11 +594,182 @@ def _opening(c: _Ctx, start: int, page: int) -> dict[str, dict]:
         seen += 1
         if seen >= OPENING_BLOCKS:
             break
+    return subject, subject_text, date_block, addressee_block
+
+
+def _opening(c: _Ctx, start: int, page: int) -> dict[str, dict]:
+    """The signals of the opening run of ``page`` (``_opening_scan``): ``subject_line`` when a line or a table cell is a
+    subject line (``in_table`` for a table block); ``letter_opening`` when the run holds a date line and an addressee
+    line. Each signal maps to its evidence: the rule and block indexes only."""
+    subject, _, date_block, addressee_block = _opening_scan(c, start, page)
     out: dict[str, dict] = {}
     if subject is not None:
         out[SUBJECT_LINE] = subject
     if date_block is not None and addressee_block is not None:
         out[LETTER_OPENING] = {"rule": "page_top_run", "blocks": sorted({date_block, addressee_block})}
+    return out
+
+
+# --- running lines ----------------------------------------------------------------------------------------------------
+#
+# The first and last text lines of each page, from the page's stored text (``pages.text``: the edge of it): the stored
+# blocks drop a footer line that carries a page number ("<office> | עמוד 7"), the page text keeps every line. Digits are
+# ignored, so the line is the same on every page of a run; a bare page number, a date and the page-number tail of a
+# footer are no running line.
+
+_PAGE_TAIL = re.compile(r"(?:עמוד|עמ['׳’]?|page)\s*[:.]?\s*\d{1,4}(?:\s*(?:מתוך|מ-|of|/)\s*\d{1,4})?", re.IGNORECASE)
+_SEGMENT_SPLIT = re.compile(r"\s[-–—]\s|[–—|•·:;,/()\[\]]")
+_DIGITS = re.compile(r"\d+")
+_PAGE_WORDS = frozenset({"עמוד", "עמ", "page", "מתוך", "of"})
+_REPORT_TYPE = re.compile("(?<![א-תa-z])[והבלמשכ]?(?:" + "|".join(re.escape(_norm(w)) for w in REPORT_TYPE_WORDS)
+                          + ")(?![א-תa-z])")
+
+
+def running_line(line: str) -> tuple[str, ...] | None:
+    """The segments of a page's top or bottom line as a running line: the line without its dates, its page-number tail
+    and its digits, split at the separators of a header ("דוח הערכת שווי — מגדל הים" has two); None for a line that is
+    only a page number, a date, a page word or too long to be a header. Two pages of a run have the same segments."""
+    t = hebrew.strip_bidi_controls(line or "").strip()
+    if not t or len(t) > RUNNING_LINE_CHARS:
+        return None
+    t = _DIGITS.sub(" ", _PAGE_TAIL.sub(" ", _DATE_WORDS.sub(" ", _DATE_NUMBERS.sub(" ", t))))
+    found = []
+    for part in _SEGMENT_SPLIT.split(t):
+        seg = _norm(part)
+        if sum(ch.isalpha() for ch in seg) >= 3 and not set(seg.split()) <= _PAGE_WORDS:
+            found.append(seg)
+    return tuple(found) or None
+
+
+@dataclass
+class _Running:
+    """The running lines of a reading's pages: ``pages`` ascending, and for each the key (the segments joined) of its
+    top line and of its bottom line (None: the page has none); ``segments`` maps a key to its segments."""
+
+    pages: list[int]
+    top: list[str | None]
+    bottom: list[str | None]
+    segments: dict[str, tuple[str, ...]]
+
+    def window(self, first: int, last: int) -> range:
+        return range(bisect_left(self.pages, first), bisect_right(self.pages, last))
+
+
+def _running_lines(pages: Sequence) -> _Running | None:
+    rows = sorted((p for p in pages if getattr(p, "page_no", None) is not None), key=lambda p: p.page_no)
+    if not rows:
+        return None
+    segments: dict[str, tuple[str, ...]] = {}
+
+    def key_of(lines: Iterable[str]) -> str | None:
+        for ln in islice(lines, RUNNING_EDGE_LINES):
+            found = running_line(ln)
+            if found:
+                key = " | ".join(found)
+                segments[key] = found
+                return key
+        return None
+
+    top, bottom = [], []
+    for p in rows:
+        lines = [ln.strip() for ln in (getattr(p, "edge", None) or "").splitlines() if ln.strip()]
+        top.append(key_of(lines))
+        bottom.append(key_of(reversed(lines)))
+    return _Running([p.page_no for p in rows], top, bottom, segments)
+
+
+def _long_runs(keys: Sequence[str | None]) -> list[tuple[int, int, str]]:
+    """(first index, last index, key) of each maximal run of one key over consecutive pages that is at least
+    ``RUN_MIN_PAGES`` long."""
+    out, i = [], 0
+    while i < len(keys):
+        key = keys[i]
+        if key is None:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(keys) and keys[j + 1] == key:
+            j += 1
+        if j - i + 1 >= RUN_MIN_PAGES:
+            out.append((i, j, key))
+        i = j + 1
+    return out
+
+
+def _names_report_type_or_subject(blocks: Sequence, title: str) -> bool:
+    t = _norm(title)
+    if any(t == w or t.startswith(f"{w} ") for w in APPENDIX_WORDS):
+        return False
+    if _REPORT_TYPE.search(t):
+        return True
+    return any(_alias_candidates(_text(r), True) or not contexts.identifiers(_text(r)).empty for r in blocks)
+
+
+def _is_cover(c: _Ctx, page: int) -> bool:
+    """Whether a page is a cover (round 16 U4, KTD5): few short text blocks, no table, and a prominent one-line title
+    that names a report type (``REPORT_TYPE_WORDS``) or, with the lines around it, a subject (a project phrase, a quoted
+    name or an address). A short divider page ("נספח א׳"), whose title names neither, is no cover."""
+    if c.body is None:
+        return False
+    blocks = [r for r in c.by_page.get(page, ()) if r.kind != "image" and (getattr(r, "status", None) or "read") in _READ
+              and _text(r)]
+    if not blocks or len(blocks) > COVER_BLOCKS_MAX or any(r.kind == "table" or getattr(r, "table_index", None) is not None
+                                                          for r in blocks):
+        return False
+    texts = [_text(r) for r in blocks]
+    if any(len(t) > COVER_BLOCK_CHARS for t in texts) or sum(map(len, texts)) > COVER_CHARS_MAX:
+        return False
+    tall = [(h, r) for r in blocks if (h := _line_height(r)) is not None and h >= PROMINENT_RATIO * c.body
+            and _title_shaped(_text(r))]
+    if not tall:
+        return False
+    title = _text(max(tall, key=lambda x: x[0])[1])
+    return _names_report_type_or_subject(blocks, title)
+
+
+def _running_cuts(c: _Ctx, restarts: set[int]) -> dict[int, dict]:
+    """The pages where a report starts by its running lines (round 16 U4, KTD5): page -> evidence. An event is the
+    first page of a run of at least ``RUN_MIN_PAGES`` pages on the top or the bottom line that replaces an earlier such
+    run. It is accepted when the other edge has an event within a page, a cover page precedes it, or the printed
+    numbering restarts at it (``restarts``: pages that open a new numbering). The cut moves back over one cover page
+    that carries neither run. Linear in the pages."""
+    run = c.running
+    if run is None:
+        return {}
+    events: list[tuple[int, str, int]] = []
+    for edge, keys in (("top", run.top), ("bottom", run.bottom)):
+        runs = _long_runs(keys)
+        events += [(cur[0], edge, cur[1] - cur[0] + 1) for prev, cur in zip(runs, runs[1:], strict=False)
+                   if prev[2] != cur[2]]
+    events.sort()
+    out: dict[int, dict] = {}
+    k = 0
+    while k < len(events):
+        group = [events[k]]
+        k += 1
+        while k < len(events) and events[k][0] <= group[0][0] + 1 and events[k][1] != group[-1][1]:
+            group.append(events[k])
+            k += 1
+        at = group[0][0]
+        agrees = []
+        if len({e[1] for e in group}) > 1:
+            agrees.append("other_edge")
+        if at >= 1 and _is_cover(c, run.pages[at - 1]):
+            agrees.append("cover")
+        if any(run.pages[i] in restarts for i in range(max(0, at - 2), at + 1)):
+            agrees.append("page_number_restart")
+        if not agrees:
+            continue
+        detail: dict = {"rule": "run_change", "edges": sorted({e[1] for e in group}), "agrees": agrees,
+                        "run_pages": max(e[2] for e in group)}
+        if at >= 1 and "cover" in agrees:
+            cover = at - 1
+            mine = {run.top[cover], run.bottom[cover]} - {None}
+            around = {run.top[at], run.bottom[at]} | ({run.top[at - 2], run.bottom[at - 2]} if at >= 2 else set())
+            if not mine & around:  # a cover that carries neither the old run nor the new
+                at, detail["cover_page"] = cover, run.pages[cover]
+        if at >= 1:
+            out[run.pages[at]] = detail
     return out
 
 
@@ -614,6 +827,13 @@ def _cuts(c: _Ctx, pages: Sequence, version_id: str) -> list[_Cut]:
                 add(block, page, TOC_ENTRY)
         if ref is None and lead is not None:
             ref = lead
+    # a running header or footer that changes for good (round 16 U4, KTD5): a report with a cover page, a running header
+    # and its own footer needs no subject line, no letter and no number drop
+    lead_pages = sorted(lead_at)
+    for page, detail in _running_cuts(c, set(restart_at)).items():
+        at = bisect_left(lead_pages, page)
+        if at < len(lead_pages) and rows[lead_at[lead_pages[at]]].block_index != first_block:
+            add(rows[lead_at[lead_pages[at]]].block_index, lead_pages[at], RUNNING_LINE_CHANGE, detail)
     # the restated-identifier rule of the appraisal contexts: a new context opens a unit
     for seg in contexts.derive(rows, version_id).segments[1:]:
         s = seg.first
@@ -640,6 +860,129 @@ def _cuts(c: _Ctx, pages: Sequence, version_id: str) -> list[_Cut]:
             previous = page
     # a repeated layout alone cuts nothing
     return [cuts[b] for b in sorted(cuts) if cuts[b].signals - WEAK_SIGNALS]
+
+
+# --- continuity ----------------------------------------------------------------------------------------------------------
+
+
+def _parts(c: _Ctx, cuts: Sequence[_Cut]) -> tuple[list[tuple], list[list], set[str], dict[int, int], list[int]]:
+    """The block ranges of the units the cuts make, with their title runs, the letterhead lines that open several of them
+    alike, the position of each block and the block indexes: (ranges, runs, letterhead, position, indexes); a range is
+    (first block, last block, page, signals, detail)."""
+    rows = c.rows
+    starts = [(rows[0].block_index, None, None, {})] + [(x.block, x.page, x.signals, x.detail) for x in cuts]
+    ranges = []
+    for n, (first, page, signals, detail) in enumerate(starts):
+        last = starts[n + 1][0] - 1 if n + 1 < len(starts) else rows[-1].block_index
+        ranges.append((first, last, page, signals, detail))
+    indexes = [r.block_index for r in rows]
+    position = {b: i for i, b in enumerate(indexes)}
+    runs = [_run(c, position[first]) for first, _, _, _, _ in ranges]
+    # lines that open several units alike are a letterhead, never a title or an alias
+    seen: dict[str, int] = defaultdict(int)
+    for run in runs:
+        for t in {_norm(_picture_line(r) or "") if r.kind == "image" else _norm(_text(r)) for r in run} - {""}:
+            seen[t] += 1
+    letterhead = {t for t, k in seen.items() if k >= 2} if len(runs) >= 2 else set()
+    return ranges, runs, letterhead, position, indexes
+
+
+def _header_segments(c: _Ctx, first_page: int | None, last_page: int | None) -> frozenset[str]:
+    """The segments of the running headers of a unit's pages: those of the top lines on at least ``RUN_SHARE`` of its
+    pages (a header constant across most of the unit, never a chapter's)."""
+    run = c.running
+    if run is None or first_page is None or last_page is None:
+        return frozenset()
+    window = run.window(first_page, last_page)
+    counts: dict[str, int] = defaultdict(int)
+    for i in window:
+        if run.top[i] is not None:
+            counts[run.top[i]] += 1
+    need = max(2, math.ceil(RUN_SHARE * len(window)))
+    return frozenset(seg for key, k in counts.items() if k >= need for seg in run.segments[key]
+                     if len(seg) >= NAME_CHARS_MIN)
+
+
+def _name_key(raw: str) -> str:
+    return _norm(_DIGITS.sub(" ", raw))
+
+
+def _text_of_pages(c: _Ctx, pages: Iterable[int]) -> str:
+    """The text of the opening blocks of the pages: ``CONTINUITY_BLOCKS`` read blocks on each, in reading order."""
+    out: list[str] = []
+    for page in pages:
+        taken = 0
+        for r in c.by_page.get(page, ()):
+            if r.kind == "image" or (getattr(r, "status", None) or "read") not in _READ or not _text(r):
+                continue
+            out.append(_text(r))
+            taken += 1
+            if taken >= CONTINUITY_BLOCKS:
+                break
+    return "\n".join(out)
+
+
+def _continuity(c: _Ctx, cuts: list[_Cut]) -> list[_Cut]:
+    """Drop the cuts that continue the unit before them (round 16 U4, KTD6). A cut that carries neither a subject line
+    nor a letter opening is dropped when the opening blocks of its pages (``CONTINUITY_PAGES``) name the unit it would
+    end and state no address or parcel that unit's first page does not. The unit it would end is the one the kept cuts
+    before it make: its names are its title and aliases, the aliases of its subject line and its running subject (the
+    segments of its running header that no unit outside it carries), less any name the new unit carries itself.
+    Linear in the pages."""
+    if not cuts:
+        return cuts
+    rows = c.rows
+    ranges, runs, letterhead, position, _ = _parts(c, cuts)
+    spans = []  # the pages of each unit the cuts make
+    for first, last, _, _, _ in ranges:
+        spans.append((rows[position[first]].page, rows[position[last]].page))
+    users: dict[str, set[int]] = defaultdict(set)
+    segments = [_header_segments(c, *span) for span in spans]
+    for n, segs in enumerate(segments):
+        for seg in segs:
+            users[seg].add(n)
+    pages_with_blocks = sorted(c.by_page)
+    cache: dict[int, tuple[set[str], contexts.Identity]] = {}
+
+    def of_unit(n: int) -> tuple[set[str], contexts.Identity]:
+        """(names, identifiers) of unit ``n`` as the first unit of a kept group."""
+        if n not in cache:
+            title, aliases, _, _, _ = _identity(c, runs[n], letterhead)
+            found = [t for t in (title, *aliases) if t]
+            page = spans[n][0]
+            if page is not None and page in c.lead_at:
+                _, subject, _, _ = _opening_scan(c, c.lead_at[page], page)
+                found += [alias for alias, _ in _alias_candidates(subject or "", True)]
+            cache[n] = ({k for x in found if len(k := _name_key(x)) >= NAME_CHARS_MIN},
+                        contexts.identifiers(_text_of_pages(c, [page] if page is not None else [])))
+        return cache[n]
+
+    kept: list[_Cut] = []
+    start, group = 0, {0}
+    for k, cut in enumerate(cuts):
+        q = k + 1
+        if cut.signals & OPENING_SIGNALS or cut.page is None:
+            kept.append(cut)
+            start, group = q, {q}
+            continue
+        names, known = of_unit(start)
+        if not segments[start] & segments[q]:
+            # a header the two units share is the report's own: what differs between them is a chapter's name, not a subject
+            names = names | {_name_key(seg) for seg in segments[start] if users[seg] <= group}
+        names = {n for n in names if len(n) >= NAME_CHARS_MIN} - of_unit(q)[0]
+        at = bisect_left(pages_with_blocks, cut.page)
+        window = pages_with_blocks[at:at + CONTINUITY_PAGES]
+        raw = _text_of_pages(c, window)
+        norm = f" {_name_key(raw)} "
+        named = any(re.search(rf"(?<![א-תa-z0-9])[והבלמשכ]?{re.escape(n)}(?![א-תa-z0-9])", norm) for n in names)
+        stated = contexts.identifiers(raw)
+        differs = bool(stated.addresses - known.addresses or stated.parcels - known.parcels)
+        if named and not differs:
+            group.add(q)
+            continue
+        kept.append(cut)
+        start, group = q, {q}
+    return kept
 
 
 # --- identity ------------------------------------------------------------------------------------------------------
@@ -799,22 +1142,13 @@ def derive(blocks: Iterable, pages: Iterable = (), version_id: str = "", furnitu
     pages_seen = len({r.page for r in rows if r.page is not None})
     need = max(FURNITURE_MIN_PAGES, math.ceil(FURNITURE_SHARE * pages_seen))
     furniture = frozenset(t for t, ps in per_text.items() if t and len(ps) >= need)
-    c = _Ctx(rows, body, furniture, frozenset(furniture_images))
-    cuts = _cuts(c, pages, version_id)
-    starts = [(rows[0].block_index, None, None, {})] + [(x.block, x.page, x.signals, x.detail) for x in cuts]
-    ranges = []
-    for n, (first, page, signals, detail) in enumerate(starts):
-        last = starts[n + 1][0] - 1 if n + 1 < len(starts) else rows[-1].block_index
-        ranges.append((first, last, page, signals, detail))
-    indexes = [r.block_index for r in rows]
-    position = {b: i for i, b in enumerate(indexes)}
-    runs = [_run(c, position[first]) for first, _, _, _, _ in ranges]
-    # lines that open several units alike are a letterhead, never a title or an alias
-    seen: dict[str, int] = defaultdict(int)
-    for run in runs:
-        for t in {_norm(_picture_line(r) or "") if r.kind == "image" else _norm(_text(r)) for r in run} - {""}:
-            seen[t] += 1
-    letterhead = {t for t, k in seen.items() if k >= 2} if len(runs) >= 2 else set()
+    c = _Ctx(rows, body, furniture, frozenset(furniture_images), _running_lines(pages))
+    for i, r in enumerate(rows):
+        if r.page is not None:
+            c.by_page.setdefault(r.page, []).append(r)
+            c.lead_at.setdefault(r.page, i)
+    cuts = _continuity(c, _cuts(c, pages, version_id))
+    ranges, runs, letterhead, position, indexes = _parts(c, cuts)
     units: list[Unit] = []
     for n, ((first, last, page, signals, detail), run) in enumerate(zip(ranges, runs, strict=True), start=1):
         own = rows[bisect_left(indexes, first):bisect_right(indexes, last)]

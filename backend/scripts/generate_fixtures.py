@@ -7430,11 +7430,193 @@ def write_round15(out: Path, font_dir: Path) -> None:
     print(f"wrote {ROUND15_DIR}/{ROUND15_MANIFEST}")
 
 
+# --------------------------------------------------------------------------- round 16 (running-line boundaries)
+#
+# One synthetic compendium PDF that merges today: report A (Hebrew, a letter with a subject line, a running header and
+# the office's footer), A's appendices (a divider page, then cash-flow exports whose printed numbering restarts at each
+# export and whose pages still name A), report B (English: a cover page, then a running header "<report type> -
+# <property>" that gains a chapter segment in each chapter, and its firm's footer; its printed numbers are the file's
+# page numbers, so no number drops at its start) with a comparables table that names two other properties, and report C
+# (its own cover and header, the same firm footer as B). Report B and C open with no subject line and no letter. Every
+# name, street, block and parcel is invented.
+
+ROUND16_DIR = "round16"
+ROUND16_MANIFEST = "manifest.json"
+ROUND16_COMPENDIUM_FILE = "R16a_synthetic_compendium_running_lines.pdf"
+ROUND16_A = {"subject": "שומת מקרקעין — מתחם גבעת הכליל", "street": "רחוב הכליל 7", "block": "33120", "parcel": "5",
+             "name": "מתחם גבעת הכליל", "key": "a", "in_table": False}
+ROUND16_A_OFFICE = "שמאות דמו א׳ (סינתטי)"
+ROUND16_A_HEADER = "שומת מקרקעין — מתחם גבעת הכליל"
+ROUND16_A_APPENDIX_HEADER = "תזרים מזומנים — מתחם גבעת הכליל"
+ROUND16_A_BODY_PAGES = 6
+ROUND16_A_EXPORTS = 3  # cash-flow exports of two pages, each numbered 1, 2
+ROUND16_REPORT_TYPE = "VALUATION REPORT"
+ROUND16_FIRM = "Meridian Valuation Group (synthetic)"
+ROUND16_B = {"property": "Cedar Quay Tower", "address": "14 Quay Street, Demo City", "client": "Demo Holdings Ltd",
+             "chapters": ["Introduction", "Market analysis", "Valuation"]}
+ROUND16_C = {"property": "Birch Court Plaza", "address": "9 Birch Lane, Demo City", "client": "Demo Holdings Ltd",
+             "chapters": ["Introduction", "Market analysis"]}
+ROUND16_COMPARABLES = [["Harbor Gate Plaza", "310", "4,100,000"], ["Willow Mews Offices", "280", "3,700,000"]]
+ROUND16_PAGES_PER_CHAPTER = 4
+
+
+class Round16PdfRenderer(Round15PdfRenderer):
+    """The round-16 compendium. Every page records the running header and footer it was drawn with (``chrome``), which
+    the manifest reports; a page of a cover carries neither."""
+
+    def __init__(self, font_dir: Path) -> None:
+        super().__init__(font_dir)
+        self.regime: dict[str, Any] = {"top": None, "foot": None, "style": "he"}
+        self.chrome: dict[int, dict[str, Any]] = {}
+        self.pdf.header = self._running_header
+        self.pdf.footer = self._running_footer
+
+    def _running_header(self) -> None:
+        pdf = self.pdf
+        self.chrome[pdf.page_no()] = dict(self.regime)
+        if self.regime["top"]:
+            pdf.set_y(6)
+            pdf.set_font("DejaVu", "", 8)
+            pdf.cell(0, 5, self.regime["top"], align="C")
+        pdf.set_y(15)
+
+    def _running_footer(self) -> None:
+        pdf = self.pdf
+        regime = self.chrome.get(pdf.page_no())
+        if not regime or not regime["foot"]:
+            return
+        label = pdf.page_labels.get(pdf.page_no())
+        if regime["style"] == "he":
+            text = f"{regime['foot']} | עמוד {label}" if label else regime["foot"]
+        else:
+            text = f"{regime['foot']} · Page {label}" if label else regime["foot"]
+        pdf.set_y(-12)
+        pdf.set_font("DejaVu", "", 8)
+        pdf.cell(0, 6, text, align="C")
+
+    def physical_page(self, top: str | None, foot: str | None, style: str = "en") -> None:
+        """A new page numbered with its place in the file (a report bound into a compendium keeps no numbering of its
+        own), under the given running lines."""
+        self.regime = {"top": top, "foot": foot, "style": style}
+        self.pdf.add_page()
+        self.pdf.page_labels[self.pdf.page_no()] = self.pdf.page_no()
+
+    def a_report(self) -> None:
+        r = ROUND16_A
+        self.regime = {"top": None, "foot": ROUND16_A_OFFICE, "style": "he"}
+        self.begin_unit("a", "appraisal", r["subject"], [])
+        self.opening(r)
+        for n in range(ROUND16_A_BODY_PAGES):
+            if n:
+                self.regime = {"top": ROUND16_A_HEADER, "foot": ROUND16_A_OFFICE, "style": "he"}
+                self._page(n + 1)
+            self.chapter_heading(ROUND9_CHAPTERS[n])
+            self.fact(None, f"פרק זה בשומה של {r['street']} נערך לצורך הדגמה (מסמך סינתטי).")
+
+    def a_appendices(self) -> None:
+        """A divider page (no number), then cash-flow exports of two pages whose numbering restarts at each export and
+        whose pages still name A's property."""
+        pdf = self.pdf
+        r = ROUND16_A
+        self.regime = {"top": None, "foot": ROUND16_A_OFFICE, "style": "he"}
+        pdf.add_page()
+        pdf.ln(60)
+        self.placed(None, "נספח א׳ — דוחות תזרים מזומנים", size=18, bold=True, h=12)
+        self.regime = {"top": ROUND16_A_APPENDIX_HEADER, "foot": ROUND16_A_OFFICE, "style": "he"}
+        for export in range(ROUND16_A_EXPORTS):
+            for n in range(2):
+                self._page(n + 1)
+                self.placed(None, f"נכס: {r['name']}")
+                self.placed(None, f"{r['name']} (סכומים באלפי ₪)")
+                self.placed(None, f"ייצוא תזרים מספר {export + 1}, עמוד {n + 1} (מסמך סינתטי).")
+                pdf.set_fill_color(225, 225, 225)
+                self.ruled_row(["שנה", "הכנסות", "הוצאות"], [60, 60, 60], bold=True)
+                for year in range(1, 4):
+                    self.ruled_row([f"שנה {year}", str(1000 * year + 100 * export), str(300 * year)], [60, 60, 60])
+
+    def english_report(self, r: dict[str, Any], comparables_in: str | None = None) -> None:
+        """A cover (a report-type title, the property, its address, who it is for; no running lines), then chapters of
+        four pages each under a header that gains the chapter's name, and the firm's footer."""
+        pdf = self.pdf
+        self.regime = {"top": None, "foot": None, "style": "en"}
+        pdf.add_page()
+        pdf.set_text_shaping(use_shaping_engine=False)  # the rest of the file is Latin text, drawn left to right
+        pdf.ln(50)
+        self.placed(None, ROUND16_REPORT_TYPE, size=26, bold=True, h=16)
+        self.placed(None, r["property"], size=18, bold=True, h=12)
+        self.placed(None, r["address"])
+        self.placed(None, f"Prepared for: {r['client']}")
+        for n, chapter in enumerate(r["chapters"]):
+            top = f"{ROUND16_REPORT_TYPE} – {r['property']}" + (f" | {chapter}" if n else "")
+            for page in range(ROUND16_PAGES_PER_CHAPTER):
+                self.physical_page(top, ROUND16_FIRM)
+                self.placed(None, f"{n + 1}. {chapter}", size=12.5, bold=True, h=8)
+                self.placed(None, f"This chapter of the report on {r['property']} is written for demonstration only.")
+                if chapter == comparables_in and page == 1:
+                    pdf.set_fill_color(225, 225, 225)
+                    self.placed(None, "Comparable properties (other buildings, not the subject):")
+                    self.ruled_row(["Property", "Area (sqm)", "Price"], [90, 40, 50], bold=True)
+                    for row in ROUND16_COMPARABLES:
+                        self.ruled_row(row, [90, 40, 50])
+
+    def render_running_lines(self) -> bytes:
+        self.a_report()
+        self.a_appendices()
+        self.end_unit()
+        self.english_report(ROUND16_B, comparables_in="Valuation")
+        self.english_report(ROUND16_C)
+        return bytes(self.pdf.output())
+
+
+def write_round16(out: Path, font_dir: Path) -> None:
+    """Writes the round-16 compendium and its ``manifest.json``: the page range of each report, the cover pages, the
+    appendix and chapter pages that must cut nothing, and the running lines each page was drawn with."""
+    from pypdf import PdfReader
+
+    rdir = out / ROUND16_DIR
+    rdir.mkdir(parents=True, exist_ok=True)
+    r = Round16PdfRenderer(font_dir)
+    data = r.render_running_lines()
+    (rdir / ROUND16_COMPENDIUM_FILE).write_bytes(data)
+    print(f"wrote {ROUND16_DIR}/{ROUND16_COMPENDIUM_FILE} ({len(data):,} bytes)")
+    pages = len(PdfReader(io.BytesIO(data)).pages)
+    a_last = 1 + ROUND16_A_BODY_PAGES - 1 + 1 + 2 * ROUND16_A_EXPORTS
+    b_cover = a_last + 1
+    b_last = b_cover + ROUND16_PAGES_PER_CHAPTER * len(ROUND16_B["chapters"])
+    c_cover = b_last + 1
+    c_last = c_cover + ROUND16_PAGES_PER_CHAPTER * len(ROUND16_C["chapters"])
+    assert c_last == pages, (c_last, pages)
+    manifest = {
+        "about": f"{SYNTHETIC_MARKER}. Known contents of the round-16 fixture (a compendium of three reports: A with "
+                 "appendices that restart the page numbers and still name A, B and C each with a cover page and a "
+                 "running header, no subject line and no letter): generated by scripts/generate_fixtures.py --only "
+                 "round16 - do not edit by hand. Every name, street, block and parcel is invented.",
+        "synthetic_marker": SYNTHETIC_MARKER,
+        "documents": {"compendium": {
+            "file": f"{ROUND16_DIR}/{ROUND16_COMPENDIUM_FILE}", "pages": pages,
+            "units": [
+                {"id": "a", "first_page": 1, "last_page": a_last, "subject": ROUND16_A["subject"], "cover_page": None},
+                {"id": "b", "first_page": b_cover, "last_page": b_last, "running_subject": ROUND16_B["property"],
+                 "cover_page": b_cover, "report_type": ROUND16_REPORT_TYPE},
+                {"id": "c", "first_page": c_cover, "last_page": c_last, "running_subject": ROUND16_C["property"],
+                 "cover_page": c_cover, "report_type": ROUND16_REPORT_TYPE}],
+            "appendix_pages": list(range(1 + ROUND16_A_BODY_PAGES, a_last + 1)),
+            "chapter_pages_of_b": {ch: list(range(b_cover + 1 + n * ROUND16_PAGES_PER_CHAPTER,
+                                                  b_cover + 1 + (n + 1) * ROUND16_PAGES_PER_CHAPTER))
+                                   for n, ch in enumerate(ROUND16_B["chapters"])},
+            "comparables_page": b_cover + 1 + 2 * ROUND16_PAGES_PER_CHAPTER + 1,
+            "comparables": [row[0] for row in ROUND16_COMPARABLES],
+            "running_lines": {str(p): {"top": c["top"], "foot": c["foot"]} for p, c in sorted(r.chrome.items())}}},
+    }
+    (rdir / ROUND16_MANIFEST).write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote {ROUND16_DIR}/{ROUND16_MANIFEST}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--font-dir", default=DEFAULT_FONT_DIR)
     parser.add_argument("--out", default="tests/fixtures")
-    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9", "round10", "round11", "round12", "round13", "round14", "round15"],
+    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9", "round10", "round11", "round12", "round13", "round14", "round15", "round16"],
                         default="all",
                         help="regions: write only the uncovered-region fixtures (tests/fixtures/regions/); "
                              "positions: only the page-position fixtures (tests/fixtures/positions/); "
@@ -7453,7 +7635,9 @@ def main() -> None:
                              "round14: only the round-14 context-reader fixture (DOCX) and its manifest "
                              "(tests/fixtures/round14/); "
                              "round15: only the round-15 subject-line compendium (PDF) and its manifest "
-                             "(tests/fixtures/round15/)")
+                             "(tests/fixtures/round15/); "
+                             "round16: only the round-16 running-line compendium (PDF) and its manifest "
+                             "(tests/fixtures/round16/)")
     args = parser.parse_args()
     font_dir = Path(args.font_dir)
     out = Path(args.out)
@@ -7493,6 +7677,9 @@ def main() -> None:
         return
     if args.only == "round15":
         write_round15(out, font_dir)
+        return
+    if args.only == "round16":
+        write_round16(out, font_dir)
         return
 
     docs: dict[str, dict[str, Any]] = {}

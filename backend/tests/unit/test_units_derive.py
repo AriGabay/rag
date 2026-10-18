@@ -556,7 +556,8 @@ def no_ocr(monkeypatch):
 
 # files that hold several appraisals; every other fixture is one appraisal (or part of one) and must stay one unit
 MULTI = {"R7b_synthetic_two_appraisals_one_file.pdf": 2, "R9a_synthetic_compendium_three_appraisals.pdf": 4,
-         "R9b_synthetic_two_similar_names.pdf": 2, "R15a_synthetic_compendium_letter_openings.pdf": 3}
+         "R9b_synthetic_two_similar_names.pdf": 2, "R15a_synthetic_compendium_letter_openings.pdf": 3,
+         "R16a_synthetic_compendium_running_lines.pdf": 3}
 SKIPPED = {"R9d_synthetic_long_file_1000_pages.pdf"}  # a thousand pages: its first 50 are read below
 
 
@@ -648,12 +649,12 @@ def test_a_picture_letterhead_opening_every_unit_is_no_title_and_does_not_stop_t
 # --- round 15 U4 (KTD4, R6): the subject line and the letter opening of a report ---------------------------------------
 
 
-def test_the_derivation_is_units_v5_and_a_v5_unit_id_carries_its_tag():
+def test_the_derivation_is_units_v6_and_a_v6_unit_id_carries_its_tag():
     from app.chat import contexts, coverage
 
-    assert units.UNITS_VERSION == "units-v5" and units.current_tag() == "v5"
+    assert units.UNITS_VERSION == "units-v6" and units.current_tag() == "v6"
     data = {"version_id": "ver", "reading_id": "rd", "unit_no": 3, "units_tag": units.current_tag()}
-    assert coverage._unit_key(data) == contexts.unit_key("ver", "rd", 3, "v5") == "ver#rd#3@v5"
+    assert coverage._unit_key(data) == contexts.unit_key("ver", "rd", 3, "v6") == "ver#rd#3@v6"
     assert coverage._unit_key({"version_id": "ver", "reading_id": None, "unit_no": 3}) == "ver#3"  # a units-v4 id
 
 
@@ -817,3 +818,292 @@ def test_the_round_15_compendium_of_letter_openings_derives_a_unit_per_report_wi
         assert u.certainty == CERTAIN and u.kind == APPRAISAL
         assert u.evidence["boundary"]["signals"] == [units.SUBJECT_LINE, units.LETTER_OPENING]
         assert u.evidence["boundary"]["detail"][units.SUBJECT_LINE].get("in_table") is e["subject_in_table"]
+
+
+# --- round 16 U4 (KTD5, KTD6, R7, R8): a running-line change starts a report; a lone cut is checked for continuity -------
+
+A_FOOT, B_FOOT = "שמאות דמו א׳ (סינתטי)", "משרד שמאות ב׳ (סינתטי)"
+A_HEADER = "שומת מקרקעין — מתחם גבעת הכליל"
+B_HEADER = "דוח הערכת שווי — מגדל הים"
+B_COVER = ("דוח הערכת שווי", "מגדל הים", "רחוב הים 4, עיר הדמה", "הוכן עבור: דמו החזקות בע״מ")
+
+
+def run_pages(d: Doc, first: int, count: int, top, foot: str, labels=None, body=None) -> None:
+    """Pages whose stored text opens with the running header ``top`` (a text, or a function of the page's place in the
+    run) and ends with the running footer ``foot``; ``labels`` are the printed numbers (None: unnumbered)."""
+    for i in range(count):
+        n = first + i
+        header = top(i) if callable(top) else top
+        label = None if labels is None else labels[i]
+        d.pages.append(SimpleNamespace(page_no=n, printed_label=None if label is None else str(label),
+                                       edge=f"{header}\nגוף העמוד\n{foot}"))
+        d.chapters(n, [CHAPTERS[i % 6]], top=60.0)
+        if body:
+            d.add("paragraph", n, body, 130.0, h=11.0)
+
+
+def cover_page(d: Doc, n: int, title: str, *lines: str) -> None:
+    """A cover: few short blocks and a prominent title, no running header or footer."""
+    d.pages.append(SimpleNamespace(page_no=n, printed_label=None, edge="\n".join([title, *lines])))
+    d.add("paragraph", n, title, 120.0, h=24.0)
+    for k, line in enumerate(lines):
+        d.add("paragraph", n, line, 170.0 + 20 * k, h=11.0)
+
+
+def report_a(d: Doc, pages: int = 6) -> None:
+    """Report A: its first page opens with a letter and a subject line that names the property; every later page
+    carries A's running header, and all of them A's office footer."""
+    d.pages.append(SimpleNamespace(page_no=1, printed_label="1", edge=f"שמאות דמו א׳ (סינתטי)\nגוף העמוד\n{A_FOOT}"))
+    d.opening(1, A_HEADER)
+    d.add("paragraph", 1, "כתובת הנכס: רחוב הכליל 7, כפר הדמה", 150.0, h=11.0)
+    d.chapters(1, [CHAPTERS[0]], top=180.0)
+    run_pages(d, 2, pages - 1, A_HEADER, A_FOOT, labels=list(range(2, pages + 1)))
+
+
+def appendix_pages(d: Doc, first: int, exports: int = 3, header: str = "תזרים מזומנים — מתחם גבעת הכליל",
+                   address: str | None = None) -> int:
+    """A divider page, then cash-flow exports of two pages whose numbering restarts at every export and whose pages
+    still name A. Returns the next free page."""
+    d.pages.append(SimpleNamespace(page_no=first, printed_label=None, edge=f"נספח א׳ — דוחות תזרים\n{A_FOOT}"))
+    d.add("paragraph", first, "נספח א׳ — דוחות תזרים", 120.0, h=24.0)
+    page_no = first + 1
+    for _ in range(exports):
+        for number in (1, 2):
+            d.pages.append(SimpleNamespace(page_no=page_no, printed_label=str(number),
+                                           edge=f"{header}\nגוף העמוד\n{A_FOOT}"))
+            d.add("paragraph", page_no, "נכס: מתחם גבעת הכליל", 60.0, h=11.0)
+            d.add("paragraph", page_no, "מתחם גבעת הכליל (סכומים באלפי ₪)", 80.0, h=11.0)
+            if address:
+                d.add("paragraph", page_no, f"כתובת הנכס: {address}", 100.0, h=11.0)
+            d.add("table", page_no, "שנה | הכנסות\nשנה 1 | 1,000", 130.0, h=60.0, table_index=500 + page_no)
+            page_no += 1
+    return page_no
+
+
+def spans(found) -> list[tuple[int, int]]:
+    return [(u.page_first, u.page_last) for u in found]
+
+
+def test_a_report_with_a_cover_page_and_its_own_running_lines_starts_at_the_cover():
+    d = Doc()
+    report_a(d)
+    cover_page(d, 7, *B_COVER)
+    run_pages(d, 8, 6, B_HEADER, B_FOOT)
+    first, second = d.derive()
+    assert spans((first, second)) == [(1, 6), (7, 13)]
+    boundary = second.evidence["boundary"]
+    assert boundary["signals"] == [units.RUNNING_LINE_CHANGE] and second.certainty == PROBABLE
+    detail = boundary["detail"][units.RUNNING_LINE_CHANGE]
+    assert detail["cover_page"] == 7 and {"other_edge", "cover"} <= set(detail["agrees"])
+    assert second.block_first == next(i for i, b in enumerate(d.blocks) if b.page == 7)
+
+
+def test_a_report_sharing_the_previous_footer_still_starts_at_its_cover_when_only_the_header_changes():
+    d = Doc()
+    report_a(d)
+    cover_page(d, 7, *B_COVER)
+    run_pages(d, 8, 6, B_HEADER, B_FOOT)
+    cover_page(d, 14, "דוח הערכת שווי", "קניון הגפן", "דרך הגפן 2, עיר הדמה")
+    run_pages(d, 15, 6, "דוח הערכת שווי — קניון הגפן", B_FOOT)  # the same firm's footer: only the header changes
+    found = d.derive()
+    assert spans(found) == [(1, 6), (7, 13), (14, 20)]
+    detail = found[2].evidence["boundary"]["detail"][units.RUNNING_LINE_CHANGE]
+    assert detail["agrees"] == ["cover"] and detail["cover_page"] == 14
+
+
+def test_a_cover_that_names_only_a_subject_and_no_report_type_is_a_cover():
+    d = Doc()
+    report_a(d)
+    cover_page(d, 7, "פרויקט גני הצבעוני", "שדרות הדקל 9, עיר הדמה")
+    run_pages(d, 8, 5, "הערכה — גני הצבעוני", A_FOOT)  # a new header over the same footer
+    found = d.derive()
+    assert spans(found) == [(1, 6), (7, 12)]
+    assert found[1].evidence["boundary"]["detail"][units.RUNNING_LINE_CHANGE]["agrees"] == ["cover"]
+
+
+def test_a_short_divider_page_is_not_a_cover_so_the_cut_opens_at_the_first_page_of_the_new_run():
+    d = Doc()
+    report_a(d)
+    cover_page(d, 7, "פרק נוסף", "חלק שני")  # a divider: a short page whose title names no report type and no subject
+    run_pages(d, 8, 6, B_HEADER, B_FOOT)
+    found = d.derive()
+    assert spans(found) == [(1, 7), (8, 13)]  # the divider stays where it is: it is not backtracked over
+    detail = found[1].evidence["boundary"]["detail"][units.RUNNING_LINE_CHANGE]
+    assert detail["agrees"] == ["other_edge"] and "cover_page" not in detail
+    appendix = Doc()
+    report_a(appendix)
+    cover_page(appendix, 7, "נספח ב׳ — דוחות", "חלק שני")  # an appendix title is never a cover
+    run_pages(appendix, 8, 6, B_HEADER, B_FOOT)
+    assert spans(appendix.derive()) == [(1, 7), (8, 13)]
+
+
+def test_a_new_run_of_one_edge_alone_cuts_nothing_but_a_page_number_restart_agrees_with_it():
+    def file(labels) -> Doc:
+        d = Doc()
+        run_pages(d, 1, 6, "שומה — מתחם הדקל הצפוני", A_FOOT, labels=list(range(1, 7)))
+        run_pages(d, 7, 6, "הערכה — מתחם גבעת הרקפות", A_FOOT, labels=labels)  # the header changes; the footer does not
+        return d
+
+    assert spans(file(list(range(7, 13))).derive()) == [(1, 12)]  # a header alone: no cover, no restart, no other edge
+    cut = file([1, 2, 3, 4, 5, 6]).derive()
+    assert spans(cut) == [(1, 6), (7, 12)]
+    assert cut[1].evidence["boundary"]["signals"] == [units.LABEL_RESTART, units.RUNNING_LINE_CHANGE]
+    assert cut[1].certainty == CERTAIN
+    assert cut[1].evidence["boundary"]["detail"][units.RUNNING_LINE_CHANGE]["agrees"] == ["page_number_restart"]
+
+
+def test_both_edges_changing_together_cut_at_the_first_page_of_the_new_runs_with_no_cover():
+    d = Doc()
+    run_pages(d, 1, 6, "שומה — מתחם הדקל הצפוני", A_FOOT)
+    run_pages(d, 7, 6, B_HEADER, B_FOOT)
+    found = d.derive()
+    assert spans(found) == [(1, 6), (7, 12)]
+    assert found[1].evidence["boundary"]["detail"][units.RUNNING_LINE_CHANGE]["agrees"] == ["other_edge"]
+
+
+def test_a_run_shorter_than_the_minimum_is_no_boundary():
+    d = Doc()
+    run_pages(d, 1, 6, "שומה — מתחם הדקל הצפוני", A_FOOT)
+    run_pages(d, 7, units.RUN_MIN_PAGES - 1, B_HEADER, B_FOOT)  # a few pages: a stamp, a short insert, not a report
+    run_pages(d, 7 + units.RUN_MIN_PAGES - 1, 6, "שומה — מתחם הדקל הצפוני", A_FOOT)
+    assert len(d.derive()) == 1
+
+
+def test_chapter_running_headers_that_change_inside_a_report_cut_nothing():
+    d = Doc()
+    report_a(d)
+    cover_page(d, 7, *B_COVER)
+    for k, chapter in enumerate(("מבוא", "ניתוח שוק", "הערכת שווי")):  # the header gains the chapter's name
+        run_pages(d, 8 + 4 * k, 4, f"{B_HEADER} | {chapter}", B_FOOT)
+    found = d.derive()
+    assert spans(found) == [(1, 6), (7, 19)]
+    assert found[1].evidence["boundary"]["signals"] == [units.RUNNING_LINE_CHANGE]  # only the report's own start
+
+
+def test_a_comparables_table_that_names_other_properties_cuts_nothing():
+    d = Doc()
+    run_pages(d, 1, 8, B_HEADER, B_FOOT)
+    d.add("table", 4, "נכס | שטח | מחיר\nמגדל השקד, רחוב השקד 3 | 310 | 4,100,000\nקניון הגפן | 280 | 3,700,000", 140.0,
+          h=80.0, table_index=900)
+    d.add("paragraph", 5, "העסקאות בנכס פארק האורן, דרך האורן 6, גוש 33140 חלקה 8 נבחרו להשוואה.", 140.0, h=11.0)
+    (only,) = d.derive()
+    assert only.certainty == UNSPLIT and (only.page_first, only.page_last) == (1, 8)
+
+
+def test_a_running_line_that_is_only_a_page_number_or_a_date_is_ignored():
+    for line in ("עמוד 12", "12", "- 7 -", "Page 3 of 40", "12/03/2025", "12 מרץ 2025", "3 עמוד", ""):
+        assert units.running_line(line) is None, line
+    assert units.running_line("שמאות דמו א׳ (סינתטי) | עמוד 12") == units.running_line("שמאות דמו א׳ (סינתטי) | עמוד 13")
+    assert units.running_line("Cedar Quay · Page 3") == units.running_line("Cedar Quay · Page 14")
+    d = Doc()
+    for n in range(1, 13):  # the top line of every page is a date, then another date, and the bottom a page number
+        d.pages.append(SimpleNamespace(page_no=n, printed_label=None,
+                                       edge=f"{'12/03/2025' if n <= 6 else '13/03/2025'}\nגוף העמוד\nעמוד {n}"))
+        d.chapters(n, [CHAPTERS[n % 6]], top=60.0)
+    assert len(d.derive()) == 1
+
+
+def test_a_file_where_every_report_shares_one_footer_cuts_at_subject_lines_as_before():
+    d = Doc()
+    for first, subject in ((1, "שומת מקרקעין — פרויקט שדרות האלון"), (5, "שומת מקרקעין — מתחם גבעת הרקפות"),
+                           (9, "שומת מקרקעין — פרויקט נחל הדס")):
+        for n in range(4):
+            d.pages.append(SimpleNamespace(page_no=first + n, printed_label=None, edge=f"גוף העמוד\n{A_FOOT}"))
+        d.opening(first, subject, letter=False)
+        for n in range(4):
+            d.chapters(first + n, [CHAPTERS[n]], top=150.0 if n == 0 else 54.0)
+    found = d.derive()
+    assert spans(found) == [(1, 4), (5, 8), (9, 12)]
+    assert all(u.evidence["boundary"]["signals"] == [units.SUBJECT_LINE] for u in found[1:])
+
+
+def test_appendix_exports_that_restart_the_numbering_and_still_name_the_report_stay_in_its_unit():
+    d = Doc()
+    report_a(d)
+    end = appendix_pages(d, 7)
+    # without the continuity check the divider and each export would cut on the number drops and the new header run
+    (only,) = d.derive()
+    assert (only.page_first, only.page_last) == (1, end - 1)
+    assert only.certainty == UNSPLIT and only.evidence["boundary"]["signals"] == []
+
+
+def test_an_export_that_restarts_the_numbering_and_names_another_property_is_still_a_cut():
+    d = Doc()
+    report_a(d)
+    appendix_pages(d, 7, exports=1)
+    # a second export of other property: its pages carry another address, so a lone restart is a real boundary
+    d.pages.append(SimpleNamespace(page_no=10, printed_label="1", edge="נספח א׳\nגוף העמוד\nמשרד אחר"))
+    d.add("paragraph", 10, "כתובת הנכס: רחוב הדקל 3, כפר הדמה", 60.0, h=11.0)
+    d.add("paragraph", 10, "מתחם גבעת הכליל (השוואה)", 80.0, h=11.0)  # it even mentions A: an identifier differs
+    d.chapters(10, [CHAPTERS[1]], top=100.0)
+    found = d.derive()
+    assert [u.page_first for u in found] == [1, 10]
+    assert found[1].evidence["boundary"]["signals"] == [units.LABEL_RESTART]
+
+
+def test_a_lone_number_restart_whose_pages_name_the_previous_report_is_not_a_cut():
+    d = Doc()
+    report_a(d, pages=4)
+    for n in range(5, 9):  # a restarted numbering over four more pages, no running lines, naming A's property
+        d.pages.append(SimpleNamespace(page_no=n, printed_label=str(n - 4), edge="גוף העמוד"))
+        d.chapters(n, [CHAPTERS[n % 6]], top=100.0)
+    d.add("paragraph", 5, "המשך הדוח בעניין מתחם גבעת הכליל", 60.0, h=11.0)
+    (only,) = d.derive()
+    assert only.certainty == UNSPLIT and (only.page_first, only.page_last) == (1, 8)
+
+
+def test_the_running_subject_of_the_previous_unit_is_a_name_the_continuity_check_knows():
+    def file(opening: str) -> Doc:
+        d = Doc()
+        run_pages(d, 1, 6, A_HEADER, A_FOOT, labels=list(range(1, 7)))  # no subject line, no title: only the header names A
+        for n in range(7, 11):  # a restarted numbering, no running lines of its own
+            d.pages.append(SimpleNamespace(page_no=n, printed_label=str(n - 6), edge="גוף העמוד"))
+            d.chapters(n, [CHAPTERS[n % 6]], top=100.0)
+        d.add("paragraph", 7, opening, 60.0, h=11.0)
+        return d
+
+    (only,) = file("נספח: תחשיב עבור מתחם גבעת הכליל").derive()
+    assert (only.page_first, only.page_last) == (1, 10)
+    assert [u.page_first for u in file("נספח: תחשיב עבור נכס אחר").derive()] == [1, 7]  # it names nothing of A: a cut
+
+
+def test_a_report_start_with_no_running_lines_and_a_new_address_is_not_dropped_by_the_continuity_check():
+    d = Doc()
+    report_a(d, pages=4)
+    for n in range(5, 9):
+        d.pages.append(SimpleNamespace(page_no=n, printed_label=str(n - 4), edge="גוף העמוד"))
+        d.chapters(n, [CHAPTERS[n % 6]], top=100.0)
+    d.add("paragraph", 5, "כתובת הנכס: רחוב הדקל 3, כפר הדמה", 40.0, h=11.0)
+    found = d.derive()
+    assert [u.page_first for u in found] == [1, 5]
+
+
+def test_a_thousand_pages_with_running_headers_that_change_every_ten_pages_stay_fast():
+    d = Doc()
+    for block in range(100):
+        run_pages(d, 1 + 10 * block, 10, f"{B_HEADER} {block % 7} | פרק {block}", B_FOOT if block % 2 else A_FOOT,
+                  labels=list(range(1, 11)))
+    t = time.perf_counter()
+    found = d.derive()
+    assert time.perf_counter() - t < 5.0
+    assert found  # every block restarts the numbering and changes the footer: cuts, derived linearly
+
+
+def test_the_round_16_compendium_derives_a_unit_per_report_starting_at_each_cover():
+    """A real PDF (extracted, no OCR): report A with appendices that restart the numbering and still name A, then
+    reports B and C, each with a cover page and a running header, no subject line and no letter; B's chapters change
+    the header; B's comparables table names two other properties."""
+    entry = json.loads((FIXTURES / "round16" / "manifest.json").read_text(encoding="utf-8"))["documents"]["compendium"]
+    found = units.derive(*extract(FIXTURES / entry["file"]), "v")
+    assert spans(found) == [(e["first_page"], e["last_page"]) for e in entry["units"]]
+    a, b, c = found
+    for u, e in ((b, entry["units"][1]), (c, entry["units"][2])):
+        boundary = u.evidence["boundary"]
+        assert boundary["signals"] == [units.RUNNING_LINE_CHANGE]
+        assert boundary["detail"][units.RUNNING_LINE_CHANGE]["cover_page"] == e["cover_page"] == u.page_first
+    assert a.page_last == min(entry["appendix_pages"]) - 1 + len(entry["appendix_pages"])  # A holds its appendices
+    assert all(a.page_first <= p <= a.page_last for p in entry["appendix_pages"])
+    chapter_pages = [p for pages_ in entry["chapter_pages_of_b"].values() for p in pages_]
+    assert all(b.page_first < p <= b.page_last for p in chapter_pages)
+    assert b.page_first < entry["comparables_page"] <= b.page_last
+    assert json.dumps(b.evidence, ensure_ascii=False)

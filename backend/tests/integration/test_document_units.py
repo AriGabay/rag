@@ -454,7 +454,7 @@ def count(office, ver: str) -> int:
 def test_after_a_later_derivation_the_old_rows_stay_and_every_reader_returns_only_the_new_units(office, monkeypatch):
     doc, ver = three_units(office, monkeypatch)
     before = stored(office, ver)
-    derive_as(office, ver, monkeypatch, "units-v5", [
+    derive_as(office, ver, monkeypatch, "units-v6", [
         {"title": "מתחם חדש א", "blocks": (0, 3), "pages": (1, 2)},
         {"title": "מתחם חדש ב", "blocks": (4, 5), "pages": (3, 3)}])
     after = stored(office, ver)
@@ -475,9 +475,9 @@ def test_the_one_unit_check_reads_the_current_derivation_only(office, monkeypatc
     doc, ver = three_units(office, monkeypatch)
     with tenant_tx(office.ctx()) as conn:
         assert search.document_term_holders(conn, [["סינתטי"]]) == {}   # three units: the file is not "one unit"
-    derive_as(office, ver, monkeypatch, "units-v5", [{"title": "קובץ אחד", "blocks": (0, 5), "pages": (1, 3)}])
+    derive_as(office, ver, monkeypatch, "units-v6", [{"title": "קובץ אחד", "blocks": (0, 5), "pages": (1, 3)}])
     with tenant_tx(office.ctx()) as conn:
-        assert set(search.document_term_holders(conn, [["סינתטי"]])) == {UUID(doc)}   # the v5 derivation has one
+        assert set(search.document_term_holders(conn, [["סינתטי"]])) == {UUID(doc)}   # the v6 derivation has one
 
 
 def test_contexts_of_a_version_follow_a_derivation_change_in_the_same_process(office, monkeypatch):
@@ -485,13 +485,13 @@ def test_contexts_of_a_version_follow_a_derivation_change_in_the_same_process(of
     with tenant_tx(office.ctx()) as conn:
         first = contexts.of_version(conn, ver, READING)
     assert first.numbers == [1, 2, 3] and first.tag is None and first.key(2) == f"{ver}#{READING}#2"
-    derive_as(office, ver, monkeypatch, "units-v5", [
+    derive_as(office, ver, monkeypatch, "units-v6", [
         {"title": "מתחם חדש א", "blocks": (0, 3), "pages": (1, 2)}, {"title": "מתחם חדש ב", "blocks": (4, 5), "pages": (3, 3)}],
         clear_caches=False)   # the contexts cache is keyed by derivation: the old entry is still there and is not read
     assert any(k[:3] == (ver, READING, "units-v4") for k in contexts._CACHE)   # the key ends with the cards' digest
     with tenant_tx(office.ctx()) as conn:
         second = contexts.of_version(conn, ver, READING)
-    assert second.numbers == [1, 2] and second.tag == "v5" and second.key(2) == f"{ver}#{READING}#2@v5"
+    assert second.numbers == [1, 2] and second.tag == "v6" and second.key(2) == f"{ver}#{READING}#2@v6"
 
 
 def anchor_on_v4(doc: str, ver: str, no: int, title: str | None = None) -> dict:
@@ -503,12 +503,12 @@ def anchor_on_v4(doc: str, ver: str, no: int, title: str | None = None) -> dict:
 def test_an_anchor_on_an_untitled_v4_unit_resolves_by_range_to_the_unit_that_now_holds_it(office, monkeypatch):
     doc, ver = three_units(office, monkeypatch, titled=False)
     anchor = anchor_on_v4(doc, ver, 3)   # v4 unit 3: blocks 4-5
-    # v5 renumbers: a new unit 3 sits where the v4 unit 2 ended, and the range 4-5 is now unit 4
-    derive_as(office, ver, monkeypatch, "units-v5", [
+    # v6 renumbers: a new unit 3 sits where the v4 unit 2 ended, and the range 4-5 is now unit 4
+    derive_as(office, ver, monkeypatch, "units-v6", [
         {"blocks": (0, 1), "pages": (1, 1)}, {"blocks": (2, 2), "pages": (2, 2)},
         {"blocks": (3, 3), "pages": (2, 2)}, {"blocks": (4, 5), "pages": (3, 3)}])
     live = entities.live_unit(office.ctx(), anchor)
-    assert live.status == "moved" and live.unit["unit_no"] == 4 and live.unit["units_tag"] == "v5"
+    assert live.status == "moved" and live.unit["unit_no"] == 4 and live.unit["units_tag"] == "v6"
     assert live.unit["unit_no"] != anchor["unit_no"]   # never the unit that happens to carry the old number
     again = entities.live_unit(office.ctx(), live.unit)   # the new anchor is current, by its number
     assert again.status == "current" and again.unit["unit_no"] == 4
@@ -517,7 +517,7 @@ def test_an_anchor_on_an_untitled_v4_unit_resolves_by_range_to_the_unit_that_now
 def test_an_anchor_whose_range_spans_two_new_units_is_gone_and_lists_the_candidates(office, monkeypatch):
     doc, ver = three_units(office, monkeypatch, titled=False)
     anchor = anchor_on_v4(doc, ver, 3)
-    derive_as(office, ver, monkeypatch, "units-v5", [
+    derive_as(office, ver, monkeypatch, "units-v6", [
         {"blocks": (0, 1), "pages": (1, 1)}, {"blocks": (2, 4), "pages": (2, 3)}, {"blocks": (5, 5), "pages": (3, 3)}])
     live = entities.live_unit(office.ctx(), anchor)
     assert live.status == "gone" and live.unit is None and len(live.candidates) == 3
@@ -528,7 +528,7 @@ def test_an_old_anchor_is_found_by_name_and_the_old_rows_are_not_read_as_current
     anchor = anchor_on_v4(doc, ver, 2, "מתחם האשל")
     entities_anchor = entities.unit_anchor({"document_id": doc, "reading_id": READING, "unit_no": 2, "units_tag": None,
                                             "title": "מתחם האשל", "aliases": []})
-    derive_as(office, ver, monkeypatch, "units-v5", [
+    derive_as(office, ver, monkeypatch, "units-v6", [
         {"title": "מתחם האשל", "blocks": (0, 3), "pages": (1, 2)}, {"title": "פרויקט הברוש", "blocks": (4, 5), "pages": (3, 3)}])
     live = entities.live_unit(office.ctx(), anchor)
     assert live.status == "moved" and live.unit["unit_no"] == 1 and live.unit["display"] == "מתחם האשל"
@@ -537,9 +537,9 @@ def test_an_old_anchor_is_found_by_name_and_the_old_rows_are_not_read_as_current
 
 def test_the_kept_row_is_read_only_through_the_older_derivations_tag(office, monkeypatch):
     doc, ver = three_units(office, monkeypatch)
-    derive_as(office, ver, monkeypatch, "units-v5", [{"title": "קובץ אחד", "blocks": (0, 5), "pages": (1, 3)}])
+    derive_as(office, ver, monkeypatch, "units-v6", [{"title": "קובץ אחד", "blocks": (0, 5), "pages": (1, 3)}])
     with tenant_tx(office.ctx()) as conn:
         old = units.kept(conn, ver, READING, 3, None)
         assert old is not None and (old.block_first, old.block_last) == (4, 5)
-        assert units.kept(conn, ver, READING, 3, "v5") is None   # unit 3 of v5 does not exist
+        assert units.kept(conn, ver, READING, 3, "v6") is None   # unit 3 of v6 does not exist
         assert units.kept(conn, ver, "another-reading", 3, None) is None
