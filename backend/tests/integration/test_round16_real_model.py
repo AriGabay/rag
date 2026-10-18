@@ -192,8 +192,8 @@ class Turn:
         return [ln for ln in self.markdown.splitlines() if needle in ln]
 
     def documents_cited_in(self, line: str) -> set[str]:
-        """The documents of the sources the line cites."""
-        by_id = {s.get("id"): s.get("document_id") for s in self.sources}
+        """The documents of the sources (S#) and of the registered values (V#) the line cites."""
+        by_id = {s.get("id"): s.get("document_id") for s in [*self.sources, *(self.answer.get("values") or [])]}
         return {by_id[i] for i in CITED.findall(line) if i in by_id}
 
     def record(self) -> dict:
@@ -265,16 +265,18 @@ def cites_document(t: Turn, document: str) -> None:
         "the passage's document is not cited", [(s.get("id"), s.get("title")) for s in t.sources])
 
 
-def one_shape(sequence: str, question: str, parts: dict[str, tuple[str, ...]], documents: list[str], office, extra=None) -> None:
+def one_shape(sequence: str, question: str, parts: dict[str, tuple[str | re.Pattern, ...]], documents: list[str], office, extra=None) -> None:
     """The common sequence: ``question`` asked in a new conversation three times; the gating checks are ``answered``, ``part``
-    (every group of ``parts``, a name -> words that must all be in the answer) and ``cited`` (each of ``documents``, a title,
+    (every group of ``parts``, a name -> words that must all be in the answer; a word is a substring or a compiled
+    pattern that must match) and ``cited`` (each of ``documents``, a title,
     cited); ``extra(office, turn)`` adds more. Informational: the stage of every part, the completeness, the rounds."""
     names = ("answered", "part", "cited", *(("attributed",) if extra else ()))
 
     def body(o, c, cid, rec):
         t = ask(c, cid, question, rec)
         text_ = re.sub(r"\s+", " ", t.markdown)
-        reached = {name: all(w in text_ for w in words) for name, words in parts.items()}
+        reached = {name: all(w.search(text_) if isinstance(w, re.Pattern) else w in text_ for w in words)
+                   for name, words in parts.items()}
         rec["info"] = {"parts_reached": reached, "stage": {n: stage(t, r) for n, r in reached.items()},
                        "completeness": t.completeness.get("status"), "completed_by_server": t.completed_by_server,
                        "tools": t.tools}
@@ -299,7 +301,7 @@ def _all_reached(reached: dict[str, bool]) -> None:
 def test_s1_a_professional_explanation_the_standard_states_reaches_the_answer_three_times(office, monkeypatch, tmp_path):
     ingest(office, monkeypatch, tmp_path, STANDARD)
     one_shape("s1_professional_explanation", "לפי תקן סינתטי 77, איך קובעים את שיעור ההיוון ומה הנימוק לכך?",
-              {"rule": ("שיעור שוק",), "reason": ("חלופי", "סיכון דומה")}, [STANDARD["title"]], office)
+              {"rule": (re.compile(r"לפי\s+\**\s*שיעור\s+ה?שוק"),), "reason": ("חלופי", "סיכון דומה")}, [STANDARD["title"]], office)
 
 
 def test_s2_a_condition_of_a_rate_reaches_the_answer_three_times(office, monkeypatch, tmp_path):

@@ -3017,6 +3017,44 @@ def _date_backed(text: str, ws: Workspace, ids: list[str]) -> set[str]:
     return set().union(*(numbers_in(text[p.span[0]:p.span[1]]) for p in backed)) - numbers_in(rest)
 
 
+_LABEL_QUOTES = '"«»“”״'
+_LABEL_SPLIT = re.compile(r"[^\s" + _LABEL_QUOTES + r"]+")
+
+
+def _read_labels(ws: Workspace) -> list[str]:
+    """The labels the turn's read evidence is shown under, which hold a number: the title of each source (a listing is no
+    document and names none) and its location, whole and by each comma-separated part ("עמוד 3, סעיף 2" is also "עמוד 3" and
+    "סעיף 2"), and the same for a registered value (round 16)."""
+    labels: set[str] = set()
+    for t, loc in [(s.title, s.location) for s in ws.sources.values() if not s.is_listing] + \
+            [(v.title, v.location) for v in ws.values.values()]:
+        for label in (t, loc, *(loc or "").split(",")):
+            label = (label or "").strip()
+            if label and _DIGIT.search(label):
+                labels.add(label)
+    return sorted(labels)
+
+
+def _label_backed(text: str, labels: list[str]) -> set[str]:
+    """The number tokens of ``text`` written inside a whole label of the evidence (round 16): "לפי סעיף 2 לתקן 77" names the
+    section "סעיף 2" of the document "תקן 77", so its 2 and 77 are the place the claim names, which the source states by
+    labelling its passage with it. The whole label is compared (its words, in order, quotation marks and spacing aside; a
+    Hebrew prefix letter may stand before it), never its bare number: "סעיף 2" does not match "סעיף 2.1" or "סעיף 25", and
+    a token that is also written outside every matched label ("2%" beside "סעיף 2") is not backed."""
+    spans: list[tuple[int, int]] = []
+    for label in labels:
+        words = _LABEL_SPLIT.findall(label)
+        pattern = (r"(?<![א-תA-Za-z0-9])(?:[בהוכלמש]{0,2})(" + rf"[\s{_LABEL_QUOTES}]+".join(map(re.escape, words))
+                   + r")(?![0-9A-Za-zא-ת])(?![.,]\d)")
+        spans += [m.span(1) for m in re.finditer(pattern, text)]
+    if not spans:
+        return set()
+    rest = text
+    for a, b in spans:
+        rest = rest[:a] + " " * (b - a) + rest[b:]
+    return set().union(*(numbers_in(text[a:b]) for a, b in spans)) - numbers_in(rest)
+
+
 def _all_numbers(ws: Workspace) -> set[str]:
     """Every number the turn's evidence states, for a unit that cites nothing (a listing's counts and house
     numbers are not: a count over a set must cite the listing)."""
@@ -3886,6 +3924,9 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
     if missing:  # a calculation's result shown rounded to the precision and in the scale it is written in
         shown = _computed_numbers(u.text, computations)
         missing = [n for n in missing if n not in shown]
+    if missing and not held:  # the section and document the claim names as the read evidence labels them (round 16)
+        labelled = _label_backed(_stated_text(u), _read_labels(ws))
+        missing = [n for n in missing if n not in labelled]
     if missing and percent_of_fraction:  # a percentage of a fraction the source states (round 13): 80% of a table's 0.80
         as_fraction = _percent_of_fraction(u.text, pool)
         missing = [n for n in missing if n not in as_fraction]

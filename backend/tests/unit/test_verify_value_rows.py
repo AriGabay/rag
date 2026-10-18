@@ -87,3 +87,48 @@ def test_citing_the_passage_too_still_states_its_numbers():
     ws = _ws()
     _cell(ws, "1,761,000", "דירה אלף")
     assert verify.deterministic(split_units("| דירה בית | 4 | ₪1,761,000 [V1] [S1] |"), ws, "?") == []
+
+
+# --- the label a source is shown under states the number in it (round 16: "סעיף 2 לתקן 77") ---------------------------------
+
+STANDARD = "שיעור ההיוון נקבע לפי שיעור השוק במועד הקובע."
+
+
+def _standard(title: str = "תקן 77", location: str = "סעיף 2", text: str = STANDARD) -> Workspace:
+    ws = Workspace(ctx=None)
+    ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title=title, section=None, location=location,
+                  kind="context", text=text)
+    return ws
+
+
+def test_a_section_and_standard_named_as_the_source_labels_them_are_stated():
+    claim = "לפי סעיף 2 לתקן 77, השמאי קובע את שיעור ההיוון לפי שיעור השוק."
+    assert _unstated(claim, _standard()) == []
+    assert _unstated("בסעיף 2 נאמר כי שיעור ההיוון נקבע לפי שיעור השוק.", _standard()) == []
+
+
+def test_a_bare_number_that_equals_the_section_number_is_still_unstated():
+    assert _unstated("שיעור ההיוון הוא 2% לפי שיעור השוק.", _standard()) == ["2"]
+    # the label's own occurrence states its number; the same digit elsewhere in the claim does not borrow it
+    assert _unstated("לפי סעיף 2 לתקן 77, שיעור ההיוון הוא 2%.", _standard()) == ["2"]
+
+
+def test_only_the_whole_label_counts_not_another_number_after_the_same_word():
+    assert _unstated("לפי סעיף 3 לתקן 77, השמאי קובע את שיעור ההיוון.", _standard()) == ["3"]
+    assert _unstated("לפי סעיף 2.1 לתקן 77, השמאי קובע את שיעור ההיוון.", _standard()) == ["2.1"]
+
+
+def test_a_number_of_the_documents_title_is_stated_when_the_claim_names_the_title():
+    assert _unstated("תקן 77 קובע את שיעור ההיוון לפי שיעור השוק.", _standard()) == []
+    assert _unstated("שיעור ההיוון הוא 77% לפי שיעור השוק.", _standard()) == ["77"]
+
+
+def test_one_part_of_a_composite_location_is_a_label_of_its_own():
+    ws = _standard(location='עמוד 3, סעיף "2", טבלה')
+    assert _unstated("לפי עמוד 3 בתקן 77, השיעור נקבע לפי שיעור השוק.", ws) == []
+    assert _unstated("שיעור ההיוון הוא 3% לפי שיעור השוק.", ws) == ["3"]
+
+
+def test_a_label_of_a_listing_or_a_source_that_is_not_read_states_nothing():
+    ws = _standard(location="סעיף 5")
+    assert _unstated("לפי סעיף 2 לתקן 77, השמאי קובע את שיעור ההיוון.", ws) == ["2"]
