@@ -84,6 +84,7 @@ class Purpose(StrEnum):
     MEASURE = "measure"  # measurements with their meaning, from one document's passages
     RESOLVE = "resolve"  # resolving a follow-up in its context
     SUMMARY = "summary"  # the conversation summary
+    IDENTIFY = "identify"  # the identity card of one appraisal unit, from its opening blocks (ingestion)
 
 
 class CallStatus(StrEnum):

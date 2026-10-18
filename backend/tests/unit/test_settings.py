@@ -13,7 +13,7 @@ FAKE_FALLBACK = "test-openai-fallback-not-real-0002"
 PROVIDER_ENV = ("OPENAI_KEY", "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_REASONING_EFFORT", "LLM_PROVIDER",
                 "ANTHROPIC_API_KEY", *(f"{kind}_{p.upper()}" for kind in ("MODEL", "EFFORT") for p in MODEL_PURPOSES))
 DEFAULT_EFFORTS = {"agent": "medium", "verify": "low", "vision": "low", "measure": "low", "resolve": "none",
-                   "summary": "none"}
+                   "summary": "none", "identify": "low"}
 
 
 @pytest.fixture

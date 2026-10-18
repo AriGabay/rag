@@ -176,7 +176,8 @@ def test_no_key_status_and_test_without_network(client, office, no_key):
     assert s["key_present"] is False and s["mode"] == "demo" and s["provider_name"] == "OpenAI"
     assert s["model"] == get_settings().model_for("agent")[0] and s["last_test"] is None
     # the status screen lists every purpose's model and effort as settings resolve them (KTD1)
-    assert [u["purpose"] for u in s["purposes"]] == ["agent", "resolve", "verify", "measure", "vision", "summary"]
+    assert [u["purpose"] for u in s["purposes"]] == [
+        "agent", "resolve", "verify", "measure", "vision", "summary", "identify"]
     assert all((u["model"], u["effort"]) == get_settings().model_for(u["purpose"]) for u in s["purposes"])
     r = client.post("/api/admin/provider/test")
     assert r.status_code == 200, r.text

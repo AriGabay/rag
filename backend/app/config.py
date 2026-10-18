@@ -11,7 +11,10 @@ DEFAULT_LLM_PROVIDER = "openai"
 DEFAULT_OPENAI_MODEL = "gpt-6-luna"
 # The model purposes with their own model and reasoning-effort settings (KTD1, R27). Every other call (the
 # connection test, the earlier answer path) uses the agent's model at OPENAI_REASONING_EFFORT.
-MODEL_PURPOSES = ("agent", "resolve", "verify", "measure", "vision", "summary")
+MODEL_PURPOSES = ("agent", "resolve", "verify", "measure", "vision", "summary", "identify")
+# a purpose whose own model setting is empty follows another purpose's before OPENAI_MODEL: the identity cards read
+# with the extraction model (round 15 U5, KTD5)
+MODEL_FALLBACKS = {"identify": "measure"}
 _SNAPSHOT = re.compile(r"-\d{4}-\d{2}-\d{2}$")  # a dated snapshot of a model: gpt-6-luna-2026-09-30
 
 
@@ -106,12 +109,16 @@ class Settings(BaseSettings):
     model_measure: str = ""  # measurements with their meaning (a background job)
     model_vision: str = ""  # reading a picture embedded in a document (ingestion)
     model_summary: str = ""  # the conversation summary
+    # identity cards of a multi-appraisal file's units, a background call (round 15 U5, KTD5): empty follows the
+    # extraction model (``model_measure``), so it changes nowhere until it is set
+    model_identify: str = ""
     effort_agent: str = "medium"  # measured: completes calculations and explanations that "low" left partial
     effort_resolve: str = "none"
     effort_verify: str = "low"  # the verifier reads meaning, not only words
     effort_measure: str = "low"  # completeness over speed
     effort_vision: str = "low"
     effort_summary: str = "none"
+    effort_identify: str = "low"  # the same effort as the measurement extraction it follows
     # Price table for the cost of logged model calls; no budget logic reads it.
     llm_prices: dict[str, ModelPrice] = Field(default_factory=lambda: dict(DEFAULT_LLM_PRICES))
 
@@ -125,6 +132,10 @@ class Settings(BaseSettings):
     llm_timeout_vision_seconds: float = 90
     llm_timeout_resolve_seconds: float = 30
     llm_timeout_summary_seconds: float = 60  # a background call after the answer is stored
+    llm_timeout_identify_seconds: float = 60  # one unit's opening blocks (a background ingestion call)
+    # identity cards (round 15 U5, KTD5): the most card calls one version's upload makes; units beyond it stay
+    # ``pending`` with their structural identity
+    unit_cards_max_per_version: int = 60
     # The conversational answering loop: its step bound and wall clock (KTD12). Every limit the loop reaches ends
     # the reading with a forced final step and a visible limitation, never an answer that looks complete.
     # model steps of a turn, its repair rounds included: reading takes up to 12, the last of them forced to answer —
@@ -204,7 +215,9 @@ class Settings(BaseSettings):
         """(model, reasoning effort) of an OpenAI call of ``purpose``: its own settings for a purpose in
         ``MODEL_PURPOSES``, else the agent's model at ``openai_reasoning_effort``."""
         if purpose in MODEL_PURPOSES:
-            return getattr(self, f"model_{purpose}") or self.openai_model, getattr(self, f"effort_{purpose}")
+            model = next((m for p in (purpose, MODEL_FALLBACKS.get(purpose)) if p and (m := getattr(self, f"model_{p}"))),
+                         self.openai_model)
+            return model, getattr(self, f"effort_{purpose}")
         return self.model_for("agent")[0], self.openai_reasoning_effort
 
     @model_validator(mode="after")

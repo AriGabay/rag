@@ -456,7 +456,7 @@ def test_contexts_of_a_version_follow_a_derivation_change_in_the_same_process(of
     derive_as(office, ver, monkeypatch, "units-v5", [
         {"title": "מתחם חדש א", "blocks": (0, 3), "pages": (1, 2)}, {"title": "מתחם חדש ב", "blocks": (4, 5), "pages": (3, 3)}],
         clear_caches=False)   # the contexts cache is keyed by derivation: the old entry is still there and is not read
-    assert (ver, READING, "units-v4") in contexts._CACHE
+    assert any(k[:3] == (ver, READING, "units-v4") for k in contexts._CACHE)   # the key ends with the cards' digest
     with tenant_tx(office.ctx()) as conn:
         second = contexts.of_version(conn, ver, READING)
     assert second.numbers == [1, 2] and second.tag == "v5" and second.key(2) == f"{ver}#{READING}#2@v5"

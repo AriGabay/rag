@@ -570,7 +570,9 @@ def derive(blocks: Iterable, version_id: str = "") -> Contexts:
 
 # keyed by version, reading and the unit derivation (``units.UNITS_VERSION``): a new derivation under the same reading id
 # is a new entry, so a running process never serves contexts of the derivation it no longer reads (round 15 U3, KTD6)
-_CACHE: OrderedDict[tuple[str, str | None, str], Contexts] = OrderedDict()
+# and by the unit cards' states (``cards.state_digest``), so a card that completes after a chat read is seen by the next
+# one (round 15 U5, KTD5)
+_CACHE: OrderedDict[tuple[str, str | None, str, str], Contexts] = OrderedDict()
 _LOCK = threading.Lock()
 
 _FIRST_BLOCKS_SQL = (
@@ -580,9 +582,30 @@ _FIRST_BLOCKS_SQL = (
 _HEADINGS_SQL = "SELECT block_index FROM document_blocks WHERE kind = 'heading' AND version_id = :v ORDER BY block_index"
 
 
-def _unit_identity(u) -> Identity:
+def _card_identity(fields: Sequence[dict]) -> Identity:
+    """What the subject fields of a unit's identity card name (round 15 U5, KTD5): the name of the property and its
+    address are names the unit answers to, an address and a block and parcel are identifiers when they are written as
+    labelled ones. A city, a property type and a date as written name no unit (they are shown in the candidates and
+    never matched), and a card holds no party's name."""
+    ident = Identity()
+    names: list[str] = []
+    for f in fields:
+        quote = f.get("quote") or ""
+        kind = f.get("field")
+        if kind == "name":
+            names.append(name_key(quote))
+        elif kind in ("address", "block_parcel"):
+            found = identifiers(quote)
+            ident |= found
+            if kind == "address" or found.empty:
+                names.append(name_key(quote))
+    return Identity(names=tuple(dict.fromkeys(n for n in names if n))) | ident
+
+
+def _unit_identity(u, card_fields: Sequence[dict] = ()) -> Identity:
     """A unit's identity: its labelled identifiers (stored with how they were written, which read again give the
-    street words the matching needs) and its title and aliases as names."""
+    street words the matching needs) and its title and aliases as names; with a ``done`` identity card, the subject
+    fields of the card as well (``_card_identity``). A unit without a card keeps the structural identity."""
     stored = u.identifiers or {}
     shown = tuple(stored.get("shown") or ())
     ident = identifiers("\n".join(shown))
@@ -591,21 +614,25 @@ def _unit_identity(u) -> Identity:
         ident = Identity(frozenset(tuple(a) for a in stored.get("addresses") or ()),
                          frozenset(tuple(p) for p in stored.get("parcels") or ()), shown)
     names = tuple(dict.fromkeys(k for x in ([u.title] if u.title else []) + list(u.aliases) if (k := name_key(x))))
-    return Identity(ident.addresses, ident.parcels, shown, ident.streets, names)
+    base = Identity(ident.addresses, ident.parcels, shown, ident.streets, names)
+    return base | _card_identity(card_fields) if card_fields else base
 
 
 def from_units(units: Sequence, first_blocks: dict, headings: Sequence[int], version_id: str,
-               reading_id: str | None = None, tag: str | None = None) -> Contexts:
+               reading_id: str | None = None, tag: str | None = None,
+               cards: dict[tuple[int, int], Sequence[dict]] | None = None) -> Contexts:
     """The contexts of a reading's units, one segment per unit in reading order. ``first_blocks``: each unit's first
     block by index (``block_index``, ``page``, ``bbox`` and its page's geometry, for ``top_of``); ``headings``: the
-    indexes of the file's heading blocks, in order (a segment's ``lead`` is the first one inside its unit)."""
+    indexes of the file's heading blocks, in order (a segment's ``lead`` is the first one inside its unit); ``cards``:
+    the subject fields of the units' ``done`` identity cards by block range (``cards.subject_fields``)."""
     segments = []
     for n, u in enumerate(units):
         at = bisect_left(headings, u.block_first)
         lead = headings[at] if at < len(headings) and headings[at] <= u.block_last else None
         b = first_blocks.get(u.block_first)
         start = (b.page or 0, top_of(b)) if n > 0 and b is not None else None
-        segments.append(Segment(u.unit_no, _unit_identity(u), u.block_first, u.block_last, lead, start,
+        segments.append(Segment(u.unit_no, _unit_identity(u, (cards or {}).get((u.block_first, u.block_last), ())),
+                                u.block_first, u.block_last, lead, start,
                                 u.page_first, u.page_last, u.kind, u.certainty, u.title))
     return Contexts(version_id, tuple(segments), reading_id, tag)
 
@@ -613,6 +640,7 @@ def from_units(units: Sequence, first_blocks: dict, headings: Sequence[int], ver
 def _of_units(conn: Connection, version_id: str, reading_id: str | None) -> Contexts | None:
     """The contexts of the reading's stored units (built on first use: ``units.ensure``); None when the version has
     none (no reading) or they cannot be had."""
+    from app.chat import cards as unit_cards
     from app.chat import units as unit_store  # units derives with this module's helpers
 
     try:
@@ -631,7 +659,13 @@ def _of_units(conn: Connection, version_id: str, reading_id: str | None) -> Cont
     except Exception:  # noqa: BLE001 - the contexts of the blocks serve instead
         logger.exception("contexts of version %s could not be built from its units", version_id)
         return None
-    return from_units(found, first, headings, version_id, reading_id, tag)
+    try:  # a card that cannot be read leaves the unit its structural identity
+        with conn.begin_nested():
+            card_fields = unit_cards.subject_fields(conn, v)
+    except Exception:  # noqa: BLE001
+        logger.warning("identity cards of version %s could not be read", version_id, exc_info=True)
+        card_fields = {}
+    return from_units(found, first, headings, version_id, reading_id, tag, card_fields)
 
 
 def of_version(conn: Connection, version_id: UUID | str, reading_id: str | None) -> Contexts:
@@ -640,9 +674,10 @@ def of_version(conn: Connection, version_id: UUID | str, reading_id: str | None)
     from its blocks. In the fallback only headings and blocks that may hold a labelled identifier bring their text,
     never a table's or a picture's (``derive`` never reads those for identifiers), each block with its page's stored
     geometry in the same query, so a segment's start is placed on the rendered page (``top_of``)."""
+    from app.chat import cards as unit_cards
     from app.chat import units as unit_store  # units derives with this module's helpers
 
-    key = (str(version_id), reading_id, unit_store.UNITS_VERSION)
+    key = (str(version_id), reading_id, unit_store.UNITS_VERSION, unit_cards.state_digest(conn, version_id))
     with _LOCK:
         found = _CACHE.get(key)
         if found is not None:

@@ -2,7 +2,8 @@
 
 ``process`` jobs run the ingestion pipeline; ``extract_facts`` jobs extract one attribute from one
 version (KTD8); ``positions`` jobs give a version read before positions existed its page geometry, word spans and
-cell boxes from its stored file, keeping its reading (KTD3). Run with ``python -m app.worker``. Several workers may run; ``jobs_claim`` uses
+cell boxes from its stored file, keeping its reading (KTD3); ``unit_cards`` jobs read the identity cards of a
+multi-appraisal version's units (round 15 U5). Run with ``python -m app.worker``. Several workers may run; ``jobs_claim`` uses
 FOR UPDATE SKIP LOCKED so a job is never processed twice concurrently, and an expired lease
 lets another worker resume a crashed job. A long PDF's job that runs out of time at a window or batch boundary
 (``ExtractionPaused``) is queued again at once, without using an attempt when it finished a unit of work (KTD2)."""
@@ -122,12 +123,14 @@ def _run_background(ctx: TenantContext, job, worker_id: str, work: Callable[[], 
 
 
 def handle_background(ctx: TenantContext, job, worker_id: str) -> None:
-    """Reindexing a processed version, or extracting its measurements. Neither changes the version's status: a
-    failure is recorded on the job only (the version keeps its earlier reading). A reading worse than the current
+    """Reindexing a processed version, extracting its measurements or reading its units' identity cards. None changes
+    the version's status: a failure is recorded on the job only (the version keeps its earlier reading). A reading worse than the current
     one (``pipeline.ReadingRegression``) ends at once as ``kept_previous`` (``jobs.fail_job``): reading again would read the same."""
     def work():
         if job.kind == "extract_measurements":
             return pipeline.run_measurements(job.office_id, job.version_id)
+        if job.kind == "unit_cards":
+            return pipeline.run_unit_cards(job.office_id, job.version_id)
         return pipeline.reindex_version(job.office_id, job.version_id,
                                         accept_regression=bool((job.payload or {}).get("accept_regression")))
 
@@ -154,8 +157,8 @@ def run_one(worker_id: str) -> bool:
     if job.kind == "positions":
         handle_positions(ctx, job, worker_id)
         return True
-    # what is left is a ``process`` job (the jobs table allows four kinds), so ``is_reindex`` reads only its mode
-    if job.kind == "extract_measurements" or is_reindex(job.kind, job.payload):
+    # what is left is a ``process`` job (the jobs table allows five kinds), so ``is_reindex`` reads only its mode
+    if job.kind in ("extract_measurements", "unit_cards") or is_reindex(job.kind, job.payload):
         handle_background(ctx, job, worker_id)
         return True
     keeper = _LeaseKeeper(job.office_id, job.job_id, worker_id)

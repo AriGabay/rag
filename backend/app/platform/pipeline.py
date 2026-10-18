@@ -522,6 +522,7 @@ def process_version(office_id: UUID, version_id: UUID) -> str | None:
     purge_staging(office_id, version_id)
     derive_professional(ctx, info.id, outcome)
     queue_measurements(ctx, info)
+    queue_unit_cards(ctx, info)
     return outcome
 
 
@@ -558,6 +559,24 @@ def queue_measurements(ctx: TenantContext, info: VersionInfo) -> bool:
 
     with tenant_tx(ctx) as conn:
         return enqueue_measurements(conn, info.id, MEASURE_VERSION)
+
+
+def queue_unit_cards(ctx: TenantContext, info: VersionInfo) -> bool:
+    """Queue the identity cards of the version's units (round 15 U5, KTD5): only for an appraisal in an office whose
+    provider mode is cloud (the consent that lets document text reach a model), and only when the version's current
+    derivation has more than one unit — a single-unit file keeps its structural identity. Never fails the publication:
+    a version that cannot be read for it is left without cards (structural identity) and the backfill finds it."""
+    if not is_appraisal(ctx, info.document_id) or vision_reader(ctx) is None:
+        return False
+    from app.chat import cards
+    from app.platform.jobs import enqueue_unit_cards
+
+    try:
+        with tenant_tx(ctx) as conn:
+            return cards.multi_unit(conn, info.id) and enqueue_unit_cards(conn, info.id, cards.CARD_VERSION)
+    except Exception:  # noqa: BLE001
+        logger.exception("identity cards of version %s not queued", info.id)
+        return False
 
 
 # --- reindexing and measurements ----------------------------------------------------------------------------
@@ -798,6 +817,7 @@ def reindex_version(office_id: UUID, version_id: UUID, accept_regression: bool =
         raise ReadingRegression(regression)
     derive_professional(ctx, info.id, "reindexed")
     queue_measurements(ctx, info)
+    queue_unit_cards(ctx, info)
     return "reindexed"
 
 
@@ -816,6 +836,22 @@ def run_measurements(office_id: UUID, version_id: UUID) -> str:
     result = extract_version(ctx, version_id, get_selected_provider())
     with tenant_tx(ctx) as conn:
         bump_data_version(conn)
+    return result.state
+
+
+def run_unit_cards(office_id: UUID, version_id: UUID) -> str:
+    """The identity cards of one version's units (round 15 U5): none when the office left cloud mode since the job was
+    queued (the same consent as measurements). A run whose every call failed raises, and the queue tries the job again."""
+    from app.chat import cards
+    from app.providers.llm import get_selected_provider
+
+    ctx = system_ctx(office_id)
+    if vision_reader(ctx) is None:
+        return "skipped"
+    result = cards.generate(ctx, version_id, get_selected_provider())
+    if result.done:
+        with tenant_tx(ctx) as conn:
+            bump_data_version(conn)  # a card is part of a unit's identity: what was found by it is found again
     return result.state
 
 

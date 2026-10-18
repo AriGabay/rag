@@ -2,7 +2,8 @@
 
 Several kinds share the queue: ``process`` (ingestion, one per version, and reindexing), ``extract_facts`` (one
 attribute from one version, U7), ``extract_measurements`` and ``positions`` (the geometry-only backfill of a version
-read before positions existed, KTD3). ``jobs_claim`` serves process jobs first, so no background work starves
+read before positions existed, KTD3) and ``unit_cards`` (the identity cards of a multi-appraisal file's units, round 15
+U5). ``jobs_claim`` serves process jobs first, so no background work starves
 ingestion.
 
 A reindex never writes before its gate, so a reindex job that ends without replacing the reading (a regression,
@@ -253,6 +254,18 @@ def enqueue_reindex(conn: Connection, version_id: UUID, ingestion_version: str,
 def enqueue_measurements(conn: Connection, version_id: UUID, extraction_version: str) -> bool:
     return _requeue(conn, version_id, "extract_measurements", f"measure:{version_id}:{extraction_version}",
                     {"extraction_version": extraction_version})
+
+
+def unit_cards_job_key(version_id: UUID, card_version: str) -> str:
+    return f"cards:{version_id}:{card_version}"
+
+
+def enqueue_unit_cards(conn: Connection, version_id: UUID | str, card_version: str) -> bool:
+    """Queue the identity cards of one version's units (round 15 U5, KTD5): one job per version and card version, so a
+    queued or running job is left alone and a finished or failed one is queued again (the backfill's second run, a
+    reading that changed). The caller checked the office's cloud consent and that the version has more than one unit."""
+    return _requeue(conn, UUID(str(version_id)), "unit_cards", unit_cards_job_key(UUID(str(version_id)), card_version),
+                    {"card_version": card_version})
 
 
 def positions_job_key(version_id: UUID) -> str:
