@@ -3962,9 +3962,12 @@ def _wrong_context(u: Unit, ws: Workspace, question: str) -> str | None:
     prove otherwise. Only a subject context counts as elsewhere: evidence in an appendix or a comparables part belongs to
     the appraisal it serves and is left to the judge — except a value there whose recorded subject is ``contradicted``
     (the source places it on another property), and never a calculation built from such values. Only when the context
-    checks are enforced (``contexts.enforced``); None when nothing is asked or nothing is elsewhere."""
+    checks are enforced (``contexts.enforced``); None when nothing is asked or nothing is elsewhere. A name the
+    evidence's own unit writes in the passages read there separates nothing: a unit named only by such a name is not the
+    asked set (round 15, held-out)."""
     from app.chat import contexts
     from app.chat import intent as intent_mod
+    from app.chat.contexts import Identity
     from app.chat.tools import asked_subjects, located_contexts
 
     if not contexts.enforced():
@@ -3984,11 +3987,20 @@ def _wrong_context(u: Unit, ws: Workspace, question: str) -> str | None:
             numbers = {n for n in numbers if cx.is_subject(n)}
         if not numbers:
             continue
+        passages = [s.text for s in ws.sources.values()
+                    if str(s.version_id) == version and set(s.contexts or ()) & numbers and s.text]
+        naming = u.text
         asked = set(cx.named(u.text))
         if not asked:
+            naming = " ".join(subjects)
             asked = {n for x in subjects for n in cx.named(x)} if from_components else set()
         if not asked:
+            naming = question
             asked = set(cx.named(question))
+        # a unit named only by a name that the evidence's own unit writes in the passages read there is named by nothing
+        # that separates it from that unit (round 15, held-out)
+        asked = {n for n in asked if cx.named_by_identifier(n, naming)
+                 or not any(Identity(names=(x,)).name_spans(t) for x in cx.naming_names(n, naming) for t in passages)}
         declared = declared_contexts(ws, cx)
         distinctive = bool(asked)
         if not asked and i in ws.values and ws.values[i].subject_from == "contradicted":

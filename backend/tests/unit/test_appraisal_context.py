@@ -684,3 +684,42 @@ def test_the_judge_header_of_a_passage_in_the_declared_unit_names_it_by_handle_a
     assert verify.MSG_DECLARED_UNIT not in verify._source_parts(ws, "S1", dated=False)[0]
     ws.declared_units, ws.declared_handles = [], {}
     assert verify.MSG_DECLARED_UNIT not in verify._source_parts(ws, "S1")[0]
+
+
+# --- a name the evidence's own unit writes separates nothing (round 15, held-out) ----------------------------------------------
+
+def _brand_contexts() -> contexts.Contexts:
+    """Unit 2's card holds the synthetic name «מרכז אופנה סינתטי» (and the street «הדקל 7»); unit 3 has no identity at all."""
+    parts = [_unit(1, "front_matter", None, first=0, last=1),
+             _unit(2, "appraisal", "מרכז אופנה סינתטי", ("מרכז אופנה סינתטי",), first=2, last=5, pages=(2, 3),
+                   identifiers=_ident("הדקל 7")),
+             _unit(3, "appraisal", None, first=6, last=9, pages=(4, 5), identifiers={})]
+    first = {n: SimpleNamespace(block_index=n, page=p, bbox=[50.0, 40.0, 500.0, 52.0]) for n, p in ((2, 2), (6, 4))}
+    return contexts.from_units(parts, first, [3, 7], "v", "r1")
+
+
+def _brand_wrong(monkeypatch, passage: str, claim: str):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+    cx = _brand_contexts()
+    assert cx.subjects == [1, 2, 3] and cx.named("מרכז אופנה סינתטי") == [2]
+    source = SimpleNamespace(contexts=[3], version_id="v", text=passage, document_id="d")
+    return _wrong(cx, {"V1": 3}, "מה ה-NOI?", claim=claim, sources={"S1": source}), cx
+
+
+def test_a_name_the_evidence_unit_writes_in_its_own_passages_does_not_make_another_unit_the_asked_one(monkeypatch):
+    removed, _ = _brand_wrong(monkeypatch, "מרכז אופנה סינתטי — הכנסה נטו 14,850,000 ₪, מרכז אופנה סינתטי ממוקם בקומה 2.",
+                              "ה-NOI של מרכז אופנה סינתטי הוא 14,850,000 ₪")
+    assert removed is None  # unit 3 itself writes that name: it separates unit 2 from unit 3 by nothing
+
+
+def test_a_name_the_evidence_unit_does_not_write_still_marks_its_value_as_another_properties(monkeypatch):
+    removed, cx = _brand_wrong(monkeypatch, "הכנסה נטו 14,850,000 ₪ לשנה.", "ה-NOI של מרכז אופנה סינתטי הוא 14,850,000 ₪")
+    assert removed and cx.describe(3) in removed and cx.describe(2) in removed  # the protection is kept
+
+
+def test_a_unit_named_by_an_identifier_is_kept_asked_though_the_passage_writes_its_other_name(monkeypatch):
+    removed, _ = _brand_wrong(monkeypatch, "מרכז אופנה סינתטי — הכנסה נטו 14,850,000 ₪.",
+                              "ה-NOI של מרכז אופנה סינתטי, רחוב הדקל 7, הוא 14,850,000 ₪")
+    assert removed  # the address names unit 2 whatever the passage writes

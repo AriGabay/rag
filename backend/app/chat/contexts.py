@@ -382,6 +382,18 @@ class Contexts:
                    if not all(any(o[0] <= a and b <= o[1] and (a, b) != o for o in every) for a, b in sp)]
         return [n for n in self.numbers if n in by_id or n in by_name]
 
+    def naming_names(self, n: int, words: str | None) -> tuple[str, ...]:
+        """The DISTINGUISHING names (title and aliases, not addresses or parcels) of subject context ``n`` that a free text
+        names, matched as ``Identity.name_spans`` does (round 15, held-out): the names by which ``named`` may have named ``n``."""
+        if not words or not self.multi or n not in self.subjects:
+            return ()
+        return tuple(x for x in self._distinguishing[n].names if Identity(names=(x,)).name_spans(words))
+
+    def named_by_identifier(self, n: int, words: str | None) -> bool:
+        """Whether a free text names subject context ``n`` by one of its DISTINGUISHING addresses or parcels (what
+        ``named`` tests before it tests names)."""
+        return bool(words) and self.multi and n in self.subjects and self._distinguishing[n].identifier_in(words)
+
 
 def _street_key(street: tuple[tuple[str, ...], str, str]) -> tuple[str, str]:
     """The ``Identity.addresses`` entry of a ``streets`` entry: the street core (the prefix letters of the first word
