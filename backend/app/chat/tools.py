@@ -100,13 +100,14 @@ named only in a comparison table, is reported as a comparable, never as an appra
 ``§#``). ``search`` (``unit=``), ``read`` (``pages`` with ``document=U#``) and ``outline`` (``unit=``) work inside one unit:
 the scope is the unit's blocks, extended over the neighbouring unit up to the next *certain* edge where an edge of it is
 only ``probable`` (``contexts.Contexts.reach``, R8); a unit search that finds no passage holding the query's words says
-the unit was searched and nothing found, and — only next to a probable edge — widens once to the whole file, every hit
-labelled by its unit, and says so. The outline of a file of more than ``OUTLINE_INLINE_UNITS`` units lists its units and
+the unit was searched and nothing found, and names its uncertain edges: it never widens to the file on its own (round 15
+U2, KTD10 — the model widens by an explicit call). A hit of a unit search shows at most ``SCOPED_PASSAGE_CHARS`` around the
+query's terms and points at ``read(source=S#)`` for the rest. The outline of a file of more than ``OUTLINE_INLINE_UNITS`` units lists its units and
 then the chosen unit's sections only, so no section list is cut at ``OUTLINE_MAX``. Every search hit, read source,
 value, measurement and citation anchor of such a file carries the unit (``unit_id``: version, reading, number; with
 title and pages for the answer's payload); a file with one unit shows and checks nothing new. A text hit that begins in a
 unit and runs on into the next unit's blocks is cut at the unit's last block (``_clip_to_unit``: its text, last block
-and pages), and a read through a unit handle reads no block outside the unit's reach, so a cited passage never holds
+and pages; a table chunk the same, its rows by their contexts: ``_rows_in_scope``), and a read through a unit handle reads no block outside the unit's reach, so a cited passage never holds
 another unit's text (R10).
 
 **The unit in the conversation** (round 9 U10, KTD8): when the request is in a unit — kept from the previous turn across a
@@ -121,8 +122,8 @@ comparison and drops that default. It is also the asked property when no title o
 (``located_contexts``): a claim about it resting only on another unit's value is removed as ``wrong_subject``.
 
 **Time search** (round 12 U7: KTD6, KTD7; R9-R14, R20): in a turn with a time mode (the switch, or a requested time) a
-``search`` about an identified property — the conversation's unit, a call naming it, the documents a call names, or the
-address or parcel the question itself names — lists the property's appraisal units and their valuation dates first
+``search`` about an identified property — a call naming a unit (whether or not it is the conversation's: round 15 U2, KTD10),
+the documents a call names, or the address or parcel the question itself names — lists the property's appraisal units and their valuation dates first
 (``property_inventory``, from the turn's property graph), selects up to ``CAP_UNITS`` of them in the mode's order, searches
 each on its own (``_property_hits``) and ranks the hits per (version, unit) (``ranked_by_time``). What each call checked is a
 coverage record (``coverage_record``: per unit located, no match or not searched for the cap, with an ``undated`` flag;
@@ -230,7 +231,14 @@ from app.platform import dates as platform_dates
 from app.platform import source_kinds
 from app.platform.dates import precision_of, shown_date, shown_period
 from app.platform.documents import coverage_of, display_box_of, reading_notes
-from app.platform.search import SearchScope, search_passages, unread_documents, unread_matching, unread_named
+from app.platform.search import (
+    SearchScope,
+    search_passages,
+    topic_tokens,
+    unread_documents,
+    unread_matching,
+    unread_named,
+)
 from app.platform.source_kinds import APPRAISALS_SQL, PROFESSIONALS_SQL
 from app.professional import catalog, profile, sections
 
@@ -1780,8 +1788,13 @@ def memoized_search(ws: Workspace, conn: Connection, query: str, limit: int, sco
 MSG_UNIT_SEARCHED = ("חיפשתי ביחידה {unit} ({pages}) {extended}ולא נמצא קטע שמכיל את מילות החיפוש \"{query}\". היחידה "
                      "נחקרה; לא חיפשתי בשאר הקובץ. אפשר לנסות ניסוח אחר או מונחים נרדפים.")
 MSG_UNIT_EXTENDED = ("גבול היחידה אינו ודאי (נקבע על סמך סימן אחד): החיפוש כלל גם את {which} עד הגבול הוודאי הבא.")
-MSG_UNIT_WIDENED = ("בגבולות היחידה {unit} לא נמצא דבר, וגבול שלה אינו ודאי: הרחבתי פעם אחת את החיפוש לכל הקובץ. כל תוצאה "
-                    "מסומנת ביחידה שהיא בה (unit) — אין להניח שתוצאה היא של היחידה שנשאלה.")
+# round 15 U2 (R8, KTD10): a unit search with no hit does not widen on its own; it names the uncertain edge it crossed and
+# the neighbour it reached, and the model widens by an explicit call (a search of that neighbour, or of no unit)
+MSG_UNIT_EDGES = ("הגבול הלא ודאי: החיפוש הגיע עד {which} ולא רחוק יותר, ולא הורחב מעצמו. אם הנתון עשוי להיות מעבר לגבול — "
+                  "חפש במפורש ביחידה השכנה (unit=U#) או בלי unit.")
+MSG_PASSAGE_CUT = ("[הקטע קוצר סביב מילות החיפוש; read(source={sid}) מחזיר את הקטע כולו]")
+MSG_TABLE_CUT = "[שורות הטבלה שמעבר לגבול היחידה הושמטו]"
+SCOPED_PASSAGE_CHARS = 900  # a hit of a unit-scoped search (round 15 U2, R9); the other searches keep ``chat_passage_chars``
 MSG_UNIT_ARGS = "היחידה (unit) והמסמך שנבחר אינם של אותו קובץ: היחידה קובעת את המסמך — בחר רק אחד מהם"
 MSG_PROPERTY_SEARCHED = ("(הנכס שהשיחה עוסקת בו: החיפוש כולל את כל השומות של הנכס הזה בארגון, לא רק את השומה שבמוקד. "
                          "כל תוצאה מסומנת בתאריך הקובע של השומה שלה.)")
@@ -1845,10 +1858,10 @@ def focus_unit_for(ws: Workspace, documents: list[str] | str | None) -> str | No
 
 def names_focus_unit(ws: Workspace, unit: str | None, documents: list[str] | str | None = None) -> bool:
     """Whether a call's ``unit`` is the conversation's own unit (round 11 U16, R4, R11, KTD6): the model sees the focus
-    unit's handle in the context and passes it, which is no choice of another unit — such a call gets the same property
-    widening as a call that names no unit (``_property_search``). A handle is the same handle for the same unit
-    (``unit_handle_of``), but the version, reading and unit number are compared too. A different unit, even of the same
-    property, is an explicit choice and stays as asked; so does a call that names another document (``focus_unit_for``)."""
+    unit's handle in the context and passes it, which is no choice of another unit — the search then says it works in the
+    conversation's unit (``MSG_UNIT_FOCUS``). Since round 15 U2 (KTD10) this decides no widening: the time search follows
+    the unit any call names. A handle is the same handle for the same unit (``unit_handle_of``), but the version, reading
+    and unit number are compared too; a call that names another document is no focus call (``focus_unit_for``)."""
     focus = ws.unit_focus
     if not focus or not unit or focus_unit_for(ws, documents) is None:
         return False
@@ -1873,7 +1886,7 @@ def locate_unit(ws: Workspace, anchor: dict, version_id) -> bool:
     dropped; a unit kept from the conversation is never replaced. Returns whether the turn's unit is now ``anchor``."""
     from app.chat import entities
 
-    key = contexts.unit_key(version_id, anchor.get("reading_id"), anchor["unit_no"])
+    key = contexts.anchor_key(version_id, anchor)  # carries the derivation tag, so it matches ``cx.key(n)`` (round 15 U2)
     ws.turn_located[key] = anchor
     if len(ws.turn_located) > 1:
         if ws.located_unit is not None:
@@ -1895,12 +1908,12 @@ def _unit_pages(first: int | None, last: int | None) -> str:
 def _unit_search(ws: Workspace, conn: Connection, handle: str, query: str, limit: int,
                  document_ids: list[str] | None) -> tuple[list[dict], list[str], str | None]:
     """A search inside one unit (KTD7): the chunks that begin in its blocks, and in the neighbouring unit up to the next
-    certain edge where an edge of it is only probable. With no hit in such a unit the search widens once to the whole
-    file, every hit labelled by its unit, and says so; with no hit in a unit whose edges are certain it says the unit
-    was searched and found nothing. Returns (hits, notes for the model, the answer when nothing was found)."""
+    certain edge where an edge of it is only probable. It never widens to the whole file on its own (round 15 U2, R8,
+    KTD10): with no hit it says the unit was searched and nothing found, and — next to a probable edge — names the
+    neighbour the search reached, so the model widens by an explicit call. Each hit carries the block range it was searched
+    in (``scope_blocks``), for the table clip. Returns (hits, notes for the model, the answer when nothing was found)."""
     v, cx, number = _unit_of(conn, ws, handle)
-    if document_ids and {str(x) for x in document_ids} - {str(v.document_id), ws.doc_handle(v.document_id)}:
-        raise ToolError(MSG_UNIT_ARGS)
+    _same_file(ws, v, document_ids)
     if cx.multi:
         reach = cx.reach(number)
         scope = SearchScope(version_ids=(v.version_id,), blocks=(reach.first, reach.last))
@@ -1908,7 +1921,7 @@ def _unit_search(ws: Workspace, conn: Connection, handle: str, query: str, limit
     else:  # a file with one unit: the file is its unit
         reach, scope, unit = None, SearchScope(version_ids=(v.version_id,)), f"{handle} (כל הקובץ)"
     notes = []
-    extended = ""
+    extended = which = ""
     if reach is not None and reach.extended:
         which = ", ".join(unit_handle(ws, cx, n, v.document_id) for n in (*reach.before, *reach.after))
         extended = MSG_UNIT_EXTENDED.format(which=which) + " "
@@ -1917,14 +1930,16 @@ def _unit_search(ws: Workspace, conn: Connection, handle: str, query: str, limit
     # by meaning exist in any unit, and are no answer to "is it in this unit"
     hits = memoized_search(ws, conn, query, limit, scope)
     if any(h.get("lexical_support") for h in hits):
-        return hits, [f"חיפוש בתוך היחידה {unit} ({_unit_pages(*cx.pages(number))})", *notes], None
-    if reach is not None and reach.extended:
-        hits = memoized_search(ws, conn, query, limit, SearchScope(version_ids=(v.version_id,)))
-        if any(h.get("lexical_support") for h in hits):
-            return hits, [MSG_UNIT_WIDENED.format(unit=unit), *notes], None
-        return [], [], (MSG_UNIT_SEARCHED.format(unit=unit, pages=_unit_pages(*cx.pages(number)), extended=extended,
-                                                 query=_txt(query)) + " גם הרחבה לכל הקובץ לא מצאה דבר.")
-    return [], [], MSG_UNIT_SEARCHED.format(unit=unit, pages=_unit_pages(*cx.pages(number)), extended="", query=_txt(query))
+        return [h | {"scope_blocks": scope.blocks} for h in hits], \
+            [f"חיפוש בתוך היחידה {unit} ({_unit_pages(*cx.pages(number))})", *notes], None
+    nothing = MSG_UNIT_SEARCHED.format(unit=unit, pages=_unit_pages(*cx.pages(number)), extended=extended, query=_txt(query))
+    return [], [], nothing + (" " + MSG_UNIT_EDGES.format(which=which) if which else "")
+
+
+def _same_file(ws: Workspace, v, document_ids: list[str] | None) -> None:
+    """A call that names a unit and documents names them of the unit's own file only: the unit fixes the document."""
+    if document_ids and {str(x) for x in document_ids} - {str(v.document_id), ws.doc_handle(v.document_id)}:
+        raise ToolError(MSG_UNIT_ARGS)
 
 
 def _memo(ws: Workspace, key: tuple, build: Callable[[], Any]) -> Any:
@@ -2654,13 +2669,15 @@ def _answer_properties(ws: Workspace, conn: Connection, places: list[tuple[str, 
         yield asked, "question"
 
 
-def unit_coverage(ws: Workspace, conn: Connection, handle: str, found: bool, in_focus: bool) -> dict:
+def unit_coverage(ws: Workspace, conn: Connection, handle: str, found: bool, named: bool) -> dict:
     """The record of a call that searched one unit only (the unit search stood): the property's inventory of one unit when
-    the unit is the conversation's, is in the graph and states an identity (the property is appraised by no other unit, but
-    its candidates and undetermined units still count); otherwise a ``unit`` record, which says the property was not
-    identified (R13) and is never complete. ``found``: the search matched."""
+    the unit is in the graph and states an identity (the property is appraised by no other unit, but its candidates and
+    undetermined units still count); otherwise a ``unit`` record, which says the property was not identified (R13) and is
+    never complete. ``found``: the search matched. ``named``: the call names the unit in a turn with a time mode — the unit
+    it works in, whether the conversation kept it or the first message's candidates offered it (round 15 U2, KTD10); the
+    record's ``via`` is ``focus`` for it, as the widened search records."""
     v, cx, number = _unit_of(conn, ws, handle)
-    gathered = property_gathered(ws, conn, v.version_id, number) if in_focus else None
+    gathered = property_gathered(ws, conn, v.version_id, number) if named else None
     if gathered is not None and gathered.identified:
         units = property_inventory(ws, conn, gathered)
         for u in units:
@@ -2670,7 +2687,7 @@ def unit_coverage(ws: Workspace, conn: Connection, handle: str, found: bool, in_
     date_, status = unit_dating(ws, conn, v.version_id, number)
     title = cx.segment(number).title if cx.multi else None
     unit = InventoryUnit(v.document_id, v.version_id, number, title, date_, status, None, True, LOCATED if found else NO_MATCH)
-    return coverage_record(ws, conn, scope=UNIT, via="focus" if in_focus else "unit", units=[unit], gathered=None)
+    return coverage_record(ws, conn, scope=UNIT, via="focus" if named else "unit", units=[unit], gathered=None)
 
 
 def window_coverage(ws: Workspace, conn: Connection, hits: list[dict]) -> dict:
@@ -2708,10 +2725,11 @@ def _property_hits(ws: Workspace, conn: Connection, gathered: Gathered, query: s
             u.status = NOT_SEARCHED_CAP
     version = current_data_version(conn) if selected else None
     for u in selected:
-        found = memoized_search(ws, conn, query, limit, _unit_scope(ws, conn, u), version=version)
+        scope = _unit_scope(ws, conn, u)
+        found = memoized_search(ws, conn, query, limit, scope, version=version)
         u.status = LOCATED if any(h.get("lexical_support") for h in found) else NO_MATCH
         if u.status == LOCATED:
-            hits += found
+            hits += [h | {"scope_blocks": scope.blocks} for h in found] if scope.blocks else found
     if call is not None:
         call.record = coverage_record(ws, conn, scope=PROPERTY, via=via, units=inventory, gathered=gathered)
         for u in inventory:
@@ -2740,15 +2758,18 @@ def _units_line(ws: Workspace, conn: Connection, inventory: list[InventoryUnit])
 
 
 def _property_search(ws: Workspace, conn: Connection, handle: str, query: str, limit: int,
-                     call: TimeCall | None = None) -> tuple[list[dict], list[str], str | None] | None:
-    """The time search of the conversation's property (round 11 U14, R4, R11, R12, KTD6, KTD9; round 12 U6, KTD4, KTD5; U7):
-    when the turn has a time mode and the focus unit's property is appraised by other units too (its gathered set in the
-    turn's property graph: linked by a shared parcel, or by the same street, number and city, each link with its reason),
-    the search reads all of them instead of the focus unit alone — a question about 2022 asked in a conversation on the 2025
-    appraisal must read the 2022 one (``_property_hits``). None: the unit is gathered with no other unit (it states no
-    identity, or nothing proves another appraisal is its property) — the unit search stands.
+                     call: TimeCall | None = None, document_ids: list[str] | None = None
+                     ) -> tuple[list[dict], list[str], str | None] | None:
+    """The time search of the property of the unit a call names (round 11 U14, R4, R11, R12, KTD6, KTD9; round 12 U6, KTD4,
+    KTD5; U7; round 15 U2, R8, KTD10): when the turn has a time mode and the unit's property is appraised by other units too
+    (its gathered set in the turn's property graph: linked by a shared parcel, or by the same street, number and city, each
+    link with its reason), the search reads all of them instead of the unit alone — a question about 2022 asked in a
+    conversation on the 2025 appraisal must read the 2022 one (``_property_hits``). The unit is the one the call names,
+    whichever call of the turn comes first: it needs no kept focus. None: the unit is gathered with no other unit (it states
+    no identity, or nothing proves another appraisal is its property) — the unit search stands.
     Returns (hits, notes for the model, the answer when nothing was found), as ``_unit_search`` does."""
     v, cx, number = _unit_of(conn, ws, handle)
+    _same_file(ws, v, document_ids)
     gathered = property_gathered(ws, conn, v.version_id, number)
     if gathered is None or len(gathered.members) < 2:
         return None
@@ -2819,14 +2840,23 @@ def _question_gathered(ws: Workspace, conn: Connection) -> Gathered | None:
     return _covering_closure(graph, matched, {n.key for n in matched})
 
 
+def _reach_contexts(cx, blocks: tuple[int, int]) -> set[int]:
+    """The contexts a search over the block range ``blocks`` reaches: the units whose blocks lie wholly inside it (the unit
+    searched and, across a probable edge, the neighbours up to the next certain one)."""
+    first, last = blocks
+    return {seg.number for seg in cx.segments if first <= seg.first and seg.last <= last}
+
+
 def _clip_to_unit(conn: Connection, version_id, cx, kind: str, bs, be, body: str,
                   pages: list[int] | None) -> tuple[str, int | None, list[int] | None]:
-    """A text passage of a file of several units, cut at the last block of the unit it begins in (round 9 R10): a chunk
-    that runs on into the next unit's title block is labelled with the unit it begins in, so its text is that unit's
-    blocks only (the chunk's text without the blocks past the unit, else the unit's own blocks joined), its last block
-    the unit's, and its pages the pages of the blocks left. Returns (text, last block, pages); unchanged for a table
-    (its rows are placed by ``_row_contexts``), a passage inside its unit, and a file with one unit."""
-    if not cx.multi or bs is None or be is None or kind in ("table", "table_row"):
+    """A passage of a file of several units, cut at the last block of the unit it begins in (round 9 R10; round 15 U2,
+    KTD10): a chunk that runs on into the next unit's title block is labelled with the unit it begins in, so its text is that
+    unit's blocks only (the chunk's text without the blocks past the unit, else the unit's own blocks joined), its last block
+    the unit's, and its pages the pages of the blocks left. A table chunk over several blocks is cut the same way (its table
+    blocks count with the prose). Returns (text, last block, pages); unchanged for a table row (placed by
+    ``_row_contexts``; ``_rows_in_scope`` cuts a stored table's rows), a passage inside its unit, a table inside one block and
+    a file with one unit."""
+    if not cx.multi or bs is None or be is None or kind == "table_row" or (kind == "table" and bs == be):
         return body, be, pages
     seg = cx.segment_at(bs)
     if seg is None or be <= seg.last:
@@ -2835,7 +2865,7 @@ def _clip_to_unit(conn: Connection, version_id, cx, kind: str, bs, be, body: str
         "SELECT block_index, kind, text, page FROM document_blocks WHERE version_id = :v AND block_index BETWEEN :a"
         " AND :b ORDER BY block_index"), {"v": version_id, "a": bs, "b": be}).all()
     inside = [r for r in rows if r.block_index <= seg.last]
-    prose = ("heading", "paragraph", "textbox")
+    prose = ("heading", "paragraph", "textbox", *(("table",) if kind == "table" else ()))
     past = "\n".join(r.text for r in rows if r.block_index > seg.last and r.text and r.kind in prose)
     own = body[:-len(past)].rstrip("\n") if past and body.endswith(past) else "\n".join(
         r.text for r in inside if r.text and r.kind in prose)
@@ -2843,6 +2873,64 @@ def _clip_to_unit(conn: Connection, version_id, cx, kind: str, bs, be, body: str
         return body, be, pages
     held = sorted({r.page for r in inside if r.page})
     return own, seg.last, [p for p in pages or [] if p in held] or held or pages
+
+
+def _rows_in_scope(chunk: str, rows: list[dict], groups: list[dict], keep: set[int]) -> str | None:
+    """The text of a stored table's chunk without the rows of contexts outside ``keep`` (round 15 U2, R8, KTD10: a table
+    that runs on into another unit shows that unit's rows only when the search reaches it). ``rows``: the table's rows
+    (``structure["rows"]``); ``groups``: its rows by context (``reader.table_contexts``, rows counted from 1). A chunk line
+    is a row when it equals the row's cells joined by `` | ``, read in order; the other lines (caption, header, notes) stay.
+    Returns the chunk unchanged when no row is outside, None when every row of it is, else the kept lines and
+    ``MSG_TABLE_CUT``. A table stored without rows or contexts is not cut."""
+    if not rows or not groups:
+        return chunk
+    context_of = {n: g["context"] for g in groups for n in range(g["first"], g["last"] + 1)}
+    cells = [" | ".join(str(c) for c in (r.get("cells") or [])) for r in rows]
+    lines, at, kept, tagged, dropped = chunk.split("\n"), 0, [], 0, 0
+    for line in lines:
+        found = next((i for i in range(at, len(cells)) if cells[i] == line), None)
+        if found is None:
+            kept.append(line)
+            continue
+        at, tagged = found + 1, tagged + 1
+        if context_of.get(found + 1) in keep or found + 1 not in context_of:
+            kept.append(line)
+        else:
+            dropped += 1
+    if not dropped:
+        return chunk
+    if dropped == tagged:
+        return None
+    return "\n".join([*kept, MSG_TABLE_CUT])
+
+
+def _around_terms(passage: str, query: str, width: int, by_line: bool = False) -> tuple[str, bool]:
+    """At most ``width`` characters of ``passage`` around the query's terms (round 15 U2, R9): the window that holds the most
+    of the topic terms, starting at the first of them it can hold, cut at a space (at a line for a table) and marked with an
+    ellipsis where the passage goes on. A passage of ``width`` characters or less is returned as it is. A passage with none
+    of the terms (a hit by meaning) shows its start. Returns (text, whether it was cut)."""
+    if len(passage) <= width:
+        return passage, False
+    room = width - 2  # the two ellipses
+    low = passage.lower()
+    spots = sorted({(at, t) for t in dict.fromkeys(topic_tokens(query)) if len(t) >= 2
+                    for at in islice((m.start() for m in re.finditer(re.escape(t), low)), 60)})
+    start, best = 0, 0
+    for at, _ in spots:
+        lo = max(0, at - room // 4)
+        covered = len({t for a, t in spots if lo <= a < lo + room})
+        if covered > best:
+            start, best = lo, covered
+    stops = "\n" if by_line else " \n"
+    if start > 0:  # begin after a break, not inside a word
+        cut = max((passage.rfind(c, max(0, start - 40), start + 1) for c in stops), default=-1)
+        start = cut + 1 if cut >= 0 else start
+    end = min(len(passage), start + room)
+    if end < len(passage):
+        cut = max((passage.rfind(c, start + room // 2, end) for c in stops), default=-1)
+        end = cut if cut > start else end
+    shown = passage[start:end].strip()
+    return ("…" if start > 0 else "") + shown + ("…" if end < len(passage) else ""), True
 
 
 def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None, limit: int | None = None,
@@ -2865,13 +2953,16 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
         in_focus = unit is not None
     elif timed and names_focus_unit(ws, unit, document_ids):
         in_focus = True  # the model names the focus unit it sees in the context: still the conversation's unit (U16)
+    scoped = bool(unit)  # a call that names a unit (or the conversation's) reads inside it: compact hits (round 15 U2, R9)
     with tenant_tx(ws.ctx) as conn:
         if unit:
-            # the conversation's unit in a turn with a time mode: its property's other appraisals are read too (U14)
-            widened = _property_search(ws, conn, unit, query, limit, call) if in_focus and timed else None
+            # the unit the call names, in a turn with a time mode: its property's other appraisals are read too (U14). It
+            # is the named unit that decides, not whether the conversation kept it: a first message's first call widens
+            # exactly as a pinned one does (round 15 U2, R8, KTD10)
+            widened = _property_search(ws, conn, unit, query, limit, call, document_ids) if timed else None
             hits, notes, nothing = widened or _unit_search(ws, conn, unit, query, limit, document_ids)
             if call is not None and widened is None:  # the unit search stood: the coverage is that of the unit (R13)
-                call.record = unit_coverage(ws, conn, unit, bool(hits), in_focus)
+                call.record = unit_coverage(ws, conn, unit, bool(hits), timed)
             if in_focus:
                 focus_note = MSG_UNIT_FOCUS.format(unit=unit)
                 if nothing:
@@ -2972,21 +3063,38 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 noted[str(h["document_id"])] = cx
             # a passage that runs into the next unit is that of the unit it begins in (R10): cut there
             passage, be, page_list = _clip_to_unit(conn, h["version_id"], cx, h["kind"], bs, be, h["text"], h["page_list"])
+            held = _hit_contexts(ws, conn, cx, h, bs, be) if cx.multi else []
+            if cx.multi and h.get("scope_blocks") and h["kind"] in ("table", "table_row"):
+                # a stored table's rows are placed by their own contexts: only those inside the search's reach are shown
+                kept = _reach_contexts(cx, h["scope_blocks"])
+                if h["kind"] == "table_row" and held and not set(held) & kept:
+                    continue  # a row of the table in another unit is no hit of this scope
+                if h["kind"] == "table" and h.get("table_index") is not None:
+                    groups, st = _row_contexts(ws, conn, cx, h["version_id"], h["table_index"])
+                    passage = _rows_in_scope(passage, st.get("rows") or [], groups, kept)
+                    if passage is None:
+                        continue
+                held = [n for n in held if n in kept] or held
             paragraphs, media = _block_info(conn, h["version_id"], bs, be)
             tags = {"document": ws.doc_handle(h["document_id"])}
             if h.get("table_index") is not None:  # a matched row opens its whole table
                 tags["table"] = _table_handle(ws, h["document_id"], h["version_id"],
                                               ws.readings.get(str(h["version_id"])), h["table_index"])
+            # a hit of a unit-scoped search shows the passage around the query's terms, the rest on demand (round 15 U2, R9)
+            shown, cut = (_around_terms(passage, query, SCOPED_PASSAGE_CHARS, h["kind"] in ("table", "table_row"))
+                          if scoped else (_clip(passage, get_settings().chat_passage_chars), False))
             src = _mark(ws.add_source(
                 document_id=h["document_id"], version_id=h["version_id"], title=h["title"], section=h["section"],
                 location=_location(h["section"], h["kind"], page_list, bs, be, paragraphs, media),
-                kind=h["kind"], text=_with_size(sizes.get((h["version_id"], h.get("table_index"))),
-                                                _clip(passage, get_settings().chat_passage_chars)), block_start=bs, block_end=be,
+                kind=h["kind"], text=_with_size(sizes.get((h["version_id"], h.get("table_index"))), shown),
+                block_start=bs, block_end=be,
                 table_index=h.get("table_index"), chunk_id=h["chunk_id"], page_list=page_list or None,
                 # read in part only when the page or section it cites has an unread region (R28)
                 partial_document=gaps.get(h["version_id"], whole).cites(page_list, h["section"]), tags=tags,
                 row_index=h.get("row_index") if h["kind"] == "table_row" else None),
-                cx, _hit_contexts(ws, conn, cx, h, bs, be) if cx.multi else [], ws)
+                cx, held, ws)
+            if cut:  # what the model reads says where the rest is; what a claim is checked against is the passage shown
+                src.body = f"{src.text}\n{MSG_PASSAGE_CUT.format(sid=src.sid)}"
             src.label = _label_of(src, cx, h["pool"], h["role"], ws.intent)
             uv = valuation_of(ws, conn, h["version_id"], bs)
             src.date_line = valuation_line(uv)

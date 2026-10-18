@@ -334,15 +334,16 @@ def test_two_calls_of_one_turn_keep_the_coverage_of_the_call_that_produced_each_
     ws = focused(office, RECENT, docs[2020])
     run(ws, "search", query=QUERY, limit=6)
     first_sids = set(ws.time_calls[0].sids)
-    ver, reading = (version_of(office, docs[2015]))
-    oldest = T.unit_handle_of(ws, docs[2015], ver, reading, 1)
-    run(ws, "search", query=QUERY, limit=6, unit=oldest)  # a call naming another unit: that unit alone
+    loose = appraisal(office, "two-loose", "30/06/2019", identification=[], place=None)  # states no identity: no property
+    ver, reading = (version_of(office, loose))
+    alone = T.unit_handle_of(ws, loose, ver, reading, 1)
+    run(ws, "search", query=QUERY, limit=6, unit=alone)  # a call naming a unit of no property: that unit alone
     second_sids = set(ws.time_calls[1].sids) - first_sids
     assert first_sids and second_sids
     one = T.coverage_for(ws, first_sids)
     two = T.coverage_for(ws, second_sids)
     assert one["scope"] == "property" and len(one["units"]) == 10 and one["complete"] and "calls" not in one
-    assert two["scope"] == "unit" and [u["document_id"] for u in two["units"]] == [docs[2015]] and not two["complete"]
+    assert two["scope"] == "unit" and [u["document_id"] for u in two["units"]] == [loose] and not two["complete"]
     both = T.coverage_for(ws, first_sids | second_sids)
     assert both["calls"] == 2 and "several_scopes" in both["blocking"] and not both["complete"]
     assert T.coverage_for(ws, {"S999"})["calls"] == 2, "no cited call: every call of the turn"

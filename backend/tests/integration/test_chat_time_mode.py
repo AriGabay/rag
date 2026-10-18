@@ -13,6 +13,7 @@ from uuid import UUID
 import pytest
 from sqlalchemy import text
 
+from app.chat import tools as T
 from app.db import tenant_tx
 from tests.conftest import login
 from tests.integration.test_chat import cloud, new_conversation
@@ -21,6 +22,14 @@ from tests.integration.test_chat_intent import (
     no_models as no_models,  # noqa: F401 - the autouse inline-run setup
 )
 from tests.integration.test_chat_intent import setup as setup  # noqa: F401 - the synthetic office
+from tests.integration.test_property_scope import focused, order, unfocused, version_of
+from tests.integration.test_round12_inventory import (
+    QUERY,
+    RECENT,
+    appraisal,
+    office,  # noqa: F401 - the throwaway office of the inventory tests
+)
+from tests.integration.test_tools_pools import run
 from tests.support.scripted_agent import ScriptedAgent, call, final, intent_part
 
 pytestmark = pytest.mark.db
@@ -235,3 +244,32 @@ def test_a_professional_question_after_a_property_turn_is_unchanged_by_the_switc
         seen[on] = (res["intent"]["value"], res["decisions"]["intent"], "זו שאלה מקצועית כללית" in first_item(third),
                     "הנתון שבמרכז השיחה" in first_item(third))
     assert seen[True] == seen[False] == ("professional", "professional", True, False)
+
+
+# ruff: noqa: F811 - the tests take the imported ``office`` fixture by name
+
+# --- round 15 U2: the property widening follows the unit the call names, whichever call comes first (R8, KTD10) ------------
+
+def test_the_first_search_naming_a_unit_in_time_mode_widens_like_a_pinned_call_with_the_same_ledger(office):
+    docs = {year: appraisal(office, f"first-{year}", f"30/06/{year}") for year in (2021, 2023, 2025)}
+    pinned = focused(office, RECENT, docs[2023])  # the conversation is on the 2023 appraisal (as a prior turn leaves it)
+    expected = run(pinned, "search", query=QUERY, limit=6)
+    assert T.MSG_PROPERTY_SEARCHED in expected and set(order(expected)) == set(docs.values())
+
+    ws = unfocused(office, RECENT)  # a first message: no unit is kept; the model passes the U# it was offered
+    ver, reading = version_of(office, docs[2023])
+    handle = T.unit_handle_of(ws, docs[2023], ver, reading, 1)
+    assert ws.unit_focus is None
+    out = run(ws, "search", query=QUERY, limit=6, unit=handle)
+    assert T.MSG_PROPERTY_SEARCHED in out
+    assert order(out) == order(expected)
+    assert ws.time_coverage == pinned.time_coverage
+    assert ws.time_coverage["scope"] == T.PROPERTY and len(ws.time_coverage["units"]) == 3
+
+
+def test_a_call_naming_a_unit_in_a_turn_without_a_time_mode_stays_inside_the_unit(office):
+    docs = {year: appraisal(office, f"flat-{year}", f"30/06/{year}") for year in (2021, 2023, 2025)}
+    ws = unfocused(office, T.TimeMode("none", "switch", RECENT.anchor, None, False))
+    ver, reading = version_of(office, docs[2023])
+    out = run(ws, "search", query=QUERY, limit=6, unit=T.unit_handle_of(ws, docs[2023], ver, reading, 1))
+    assert order(out) == [docs[2023]] and T.MSG_PROPERTY_SEARCHED not in out and ws.time_coverage is None

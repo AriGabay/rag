@@ -19,6 +19,7 @@ from sqlalchemy import text
 from app import worker
 from app.chat import contexts, entities, resolve
 from app.chat import tools as T
+from app.chat import units as unit_store
 from app.db import tenant_tx
 from app.measurements.extract import EXTRACTION_VERSION
 from app.platform import pipeline
@@ -81,6 +82,12 @@ def _reading(office, ver: str) -> str:
                             {"v": ver}).scalar_one()
 
 
+def _unit_id(office, number: int) -> str:
+    """The stable id of a unit of the ingested file as the current derivation numbers it (version, reading, number and —
+    after ``units-v4`` — the derivation's tag, round 15 U3)."""
+    return contexts.unit_key(office.ver, _reading(office, office.ver), number, unit_store.current_tag())
+
+
 def _unit_handle(out: str, title: str) -> str:
     for line in out.splitlines():
         m = re.search(r"\b(U\d+)\b", line)
@@ -136,7 +143,7 @@ def test_a_search_inside_the_second_unit_returns_only_its_pages_and_labels_every
     assert f"חיפוש בתוך היחידה {handle}" in out
     sids = _sources(out)
     assert sids
-    key = f"{r9a.ver}#{_reading(r9a, r9a.ver)}#2"
+    key = _unit_id(r9a, 2)
     for sid in sids:
         s = ws.sources[sid]
         assert s.unit["id"] == key and s.unit["no"] == 2 and s.unit["title"] == UNITS[1]["title"]
@@ -208,7 +215,7 @@ def test_a_stored_value_and_a_measurement_and_the_citation_carry_the_unit_id(r9a
     T.tool_take_value(ws, sid, {"quote": f"שווי הנכס: {SECOND} ₪.", "number": SECOND},
                       _meaning(kind="value", unit="ILS", subject=UNITS[1]["title"]), "שווי")
     value = list(ws.values.values())[-1]
-    key = f"{r9a.ver}#{_reading(r9a, r9a.ver)}#2"
+    key = _unit_id(r9a, 2)
     assert value.context["unit_id"] == key and value.context["title"] == UNITS[1]["title"]
     assert ws.anchors[value.vid]["unit"]["id"] == key
     # a stored measurement of a block in the second unit carries it too
@@ -258,16 +265,26 @@ def test_an_answer_just_past_a_probable_cut_is_still_found_and_the_extension_is_
     assert FIRST not in out
 
 
-def test_a_unit_search_with_no_hit_next_to_a_probable_edge_widens_once_to_the_file_and_says_so(r9a):
+def test_a_unit_search_with_no_hit_next_to_a_probable_edge_never_widens_to_the_file_and_names_the_edge(r9a):
+    """Round 15 U2, R8, KTD10: the silent widen-once is gone. The first appraisal's name is in neither the second unit nor
+    the third (which the probable edge lets the search reach): the answer is the no-hit report, with no hit from the
+    first unit, and it names the uncertain edge so the model widens by an explicit call."""
     _cut_early_and_mark_probable(r9a, r9a.ver)
     ws = T.Workspace(ctx=r9a.ctx())
     handle = _unit_handle(T.tool_find_documents(ws, UNITS[1]["aliases"][0]), UNITS[1]["title"])
-    out = T.tool_search(ws, UNITS[0]["aliases"][0], None, None, handle)  # the first appraisal's name: not in 2 or 3
-    assert "הרחבתי פעם אחת את החיפוש לכל הקובץ" in out
-    hit = next(s for s in _sources(out) if UNITS[0]["aliases"][0] in ws.sources[s].text)
-    assert ws.sources[hit].unit["no"] == 1  # labelled by its own unit, not the unit asked about
-    nothing = T.tool_search(ws, "זבנג שאין בשום מקום", None, None, handle)
-    assert "היחידה נחקרה" in nothing and "גם הרחבה לכל הקובץ לא מצאה דבר" in nothing
+    seen = []
+    real = T.memoized_search
+    T.memoized_search = lambda ws_, conn, q, limit, scope: (seen.append(scope), real(ws_, conn, q, limit, scope))[1]
+    try:
+        out = T.tool_search(ws, UNITS[0]["aliases"][0], None, None, handle)  # the first appraisal's name: not in 2 or 3
+    finally:
+        T.memoized_search = real
+    assert "הרחבתי" not in out and "היחידה נחקרה" in out and "לא חיפשתי בשאר הקובץ" in out
+    assert "גבול היחידה אינו ודאי" in out  # the edge is named, with the neighbour the search reached
+    third = T.unit_handle_of(ws, r9a.doc, r9a.ver, _reading(r9a, r9a.ver), 3)
+    assert third in out
+    assert len(seen) == 1 and seen[0].blocks is not None  # one search, inside the unit and its reach: never a file-wide one
+    assert [s for s in ws.sources.values() if not s.is_listing] == []  # no passage of the first unit was returned
 
 
 # --- clarification between similar names (AE4, R13) ------------------------------------------------------------------
@@ -537,7 +554,7 @@ def test_unit_names_join_the_vocabulary_but_a_comparables_part_names_no_document
 
 
 def test_a_scripted_turn_locates_the_second_appraisal_and_answers_from_its_pages_only(client, r9a, monkeypatch):
-    key = f"{r9a.ver}#{_reading(r9a, r9a.ver)}#2"
+    key = _unit_id(r9a, 2)
 
     def answer(items) -> dict:
         outs = [i["output"] for i in items if isinstance(i, dict) and i.get("type") == "function_call_output"]
@@ -645,7 +662,7 @@ def test_price_then_rent_stays_on_the_same_unit_without_a_clarification(client, 
     assert UNITS[1]["title"] in task and "U1" in task and UNITS[2]["title"] not in task
     searched = agent.tool_outputs(1)[0]  # no unit named in the call: the conversation's unit is the scope
     assert "חיפוש בתוך היחידה U1" in searched and "(היחידה שהשיחה עוסקת בה: U1)" in searched
-    assert not re.search(r"(?<![\w-])92(?![\w-])", searched) and set(re.findall(r'unit_id="[^"]*#(\d+)"', searched)) == {"2"}
+    assert not re.search(r"(?<![\w-])92(?![\w-])", searched) and set(re.findall(r'unit_id="[^"]*#(\d+)(?:@[^"]*)?"', searched)) == {"2"}
     a = m["answer"]
     assert a["status"] != "clarification" and a["request"]["entity_changed"] is False
     assert (a["request"]["located_unit"]["unit_no"], a["request"]["unit_kept"]) == (2, True)
@@ -1196,3 +1213,117 @@ def test_the_sources_of_a_file_of_several_appraisals_keep_their_context_and_no_s
     assert found and read.context
     for s in [*found, read]:
         assert s.subject == "" and s.context and s.unit is not None
+
+
+# --- round 15 U2: a unit search stays inside the unit, compact hits (R8, R9; KTD10) -----------------------------------------
+
+SHARED = "קובץ שלוש שומות עם מילים משותפות סינתטי"
+RENT = "דמי שכירות חודשיים"
+
+
+def _three(office, certainty3: str = "certain") -> tuple[str, str]:
+    """Three appraisals whose rent sentences share the same words. Only the first states "אלמוגים" and only the second
+    states "ספינות"; the third's opening edge is ``certainty3``."""
+    return unit_file(office, office.default_group_id, SHARED, [
+        {"title": "פרויקט הארז", "aliases": ["הארז"], "blocks": ["פרויקט הארז", f"{RENT} 1,100 ₪.", "בחצר האלמוגים גדלים."]},
+        {"title": "מתחם האשל", "aliases": ["האשל"], "blocks": ["מתחם האשל", f"{RENT} 5,400 ₪.", "בנמל ספינות רבות."]},
+        {"title": NEXT_TITLE, "aliases": ["הברוש"], "certainty": certainty3,
+         "blocks": [NEXT_TITLE, f"{RENT} 3,300 ₪.", "בים גדול שקט."]}], sha="s" * 64)
+
+
+def _handle_of(ws, office, doc: str, ver: str, number: int) -> str:
+    return T.unit_handle_of(ws, doc, ver, READING, number)
+
+
+def test_a_search_in_the_second_of_three_certain_units_returns_only_unit_two_though_every_unit_matches(office):
+    doc, ver = _three(office)
+    ws = T.Workspace(ctx=office.ctx())
+    handle = _handle_of(ws, office, doc, ver, 2)
+    out = T.tool_search(ws, RENT, None, None, handle)
+    sids = _sources(out)
+    assert sids and "5,400" in out and "1,100" not in out and "3,300" not in out
+    assert {ws.sources[s].unit["no"] for s in sids} == {2}
+    assert "גבול היחידה אינו ודאי" not in out
+
+
+def test_across_a_probable_edge_the_neighbour_up_to_the_next_certain_edge_is_searched_and_each_hit_keeps_its_own_unit(office):
+    doc, ver = _three(office, certainty3="probable")
+    ws = T.Workspace(ctx=office.ctx())
+    handle = _handle_of(ws, office, doc, ver, 2)
+    out = T.tool_search(ws, RENT, None, None, handle)
+    assert "1,100" not in out and "5,400" in out and "3,300" in out
+    assert "גבול היחידה אינו ודאי" in out and _handle_of(ws, office, doc, ver, 3) in out  # the extension is reported
+    by_amount = {a: ws.sources[s].unit["no"] for s in _sources(out) for a in ("5,400", "3,300") if a in ws.sources[s].text}
+    assert by_amount == {"5,400": 2, "3,300": 3}  # the neighbour's passage is labelled with the neighbour, not with unit 2
+    for sid in _sources(out):
+        assert ws.sources[sid].tags["unit"] == _handle_of(ws, office, doc, ver, ws.sources[sid].unit["no"])
+
+
+def test_no_hit_in_a_unit_with_a_probable_edge_reports_the_unit_and_the_edge_and_returns_no_passage_of_the_file(office):
+    doc, ver = _three(office, certainty3="probable")
+    ws = T.Workspace(ctx=office.ctx())
+    handle = _handle_of(ws, office, doc, ver, 2)
+    out = T.tool_search(ws, "אלמוגים", None, None, handle)  # only unit 1 states it
+    assert _sources(out) == [] and "אלמוגים" in out and "היחידה נחקרה" in out and "לא חיפשתי בשאר הקובץ" in out
+    assert "הרחבתי" not in out and "גבול היחידה אינו ודאי" in out
+    assert _handle_of(ws, office, doc, ver, 3) in out  # the uncertain edge's neighbour: the model may search it on purpose
+    assert [s for s in ws.sources.values() if not s.is_listing] == []
+
+
+def test_a_table_chunk_that_starts_in_the_unit_and_runs_past_it_is_cut_at_the_units_last_block(cross):
+    with tenant_tx(cross.system) as conn:  # the chunk over blocks 3-4 (the rent, then the next title) is a table's
+        conn.execute(text("UPDATE chunks SET kind = 'table' WHERE version_id = :v AND block_start = 3 AND block_end = 4"),
+                     {"v": cross.ver})
+    ws = T.Workspace(ctx=cross.ctx())
+    handle = _unit_handle(T.tool_find_documents(ws, "האשל"), "מתחם האשל")
+    out = T.tool_search(ws, "דמי שכירות חודשיים", None, None, handle)
+    s = _rent_hit(ws, out)
+    assert s.kind == "table" and s.unit["no"] == 2
+    assert NEXT_TITLE not in s.text and "5,400" in s.text
+    assert s.block_start == 3 and s.block_end == 3 and s.page_list == [2]
+
+
+def test_the_rows_of_a_table_past_the_units_contexts_are_cut_and_a_chunk_wholly_past_them_is_dropped():
+    rows = [{"cells": ["א", "1"]}, {"cells": ["ב", "2"]}, {"cells": ["ג", "3"]}]
+    groups = [{"context": 2, "first": 1, "last": 2}, {"context": 3, "first": 3, "last": 3}]
+    chunk = "כותרת | ערך\nא | 1\nב | 2\nג | 3"
+    assert T._rows_in_scope(chunk, rows, groups, {2, 3}) == chunk
+    cut = T._rows_in_scope(chunk, rows, groups, {2})
+    assert cut.startswith("כותרת | ערך\nא | 1\nב | 2") and "ג | 3" not in cut and T.MSG_TABLE_CUT in cut
+    only_third = T._rows_in_scope(chunk, rows, groups, {3})
+    assert "ג | 3" in only_third and "א | 1" not in only_third and "ב | 2" not in only_third
+    assert T._rows_in_scope(chunk, rows, groups, {1}) is None
+    assert T._rows_in_scope(chunk, [], [], {2}) == chunk  # a table stored without rows is not cut
+
+
+LONG = "ארוך"
+
+
+@pytest.fixture
+def long_hit(office):
+    """One unit whose rent sentence sits in the middle of a 2,400-character block (a marker at each end)."""
+    filler = "מילה " * 200
+    body = f"ראשית-המקטע {filler}{RENT} 5,400 ₪. {filler}סוף-המקטע"
+    office.doc, office.ver = unit_file(office, office.default_group_id, LONG, [
+        {"title": "פרויקט הארז", "aliases": ["הארז"], "blocks": ["פרויקט הארז", "שורה קצרה."]},
+        {"title": "מתחם האשל", "aliases": ["האשל"], "blocks": ["מתחם האשל", body]}], sha="l" * 64)
+    return office
+
+
+def test_a_scoped_hit_is_clipped_around_the_matched_terms_with_a_pointer_and_read_returns_the_whole_passage(long_hit):
+    ws = T.Workspace(ctx=long_hit.ctx())
+    handle = T.unit_handle_of(ws, long_hit.doc, long_hit.ver, READING, 2)
+    out = T.tool_search(ws, RENT, None, None, handle)
+    s = ws.sources[next(x for x in _sources(out) if "5,400" in ws.sources[x].text)]
+    assert len(s.text) <= T.SCOPED_PASSAGE_CHARS and "5,400" in s.text
+    assert "ראשית-המקטע" not in s.text and "סוף-המקטע" not in s.text
+    assert f"read(source={s.sid})" in out
+    whole = T.tool_read(ws, {"source": s.sid})
+    assert "ראשית-המקטע" in whole and "סוף-המקטע" in whole and "5,400" in whole
+
+
+def test_a_hit_of_a_call_that_names_no_unit_keeps_the_longer_clip(long_hit):
+    ws = T.Workspace(ctx=long_hit.ctx())
+    out = T.tool_search(ws, RENT, None, None)
+    s = ws.sources[next(x for x in _sources(out) if "5,400" in ws.sources[x].text)]
+    assert T.SCOPED_PASSAGE_CHARS < len(s.text) <= 1700 and f"read(source={s.sid})" not in out

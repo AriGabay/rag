@@ -93,6 +93,25 @@ def test_the_order_of_the_scope_documents_does_not_matter(monkeypatch):
     assert len(searches.calls) == 1
 
 
+def test_a_call_in_a_time_mode_and_a_call_without_one_do_not_share_an_entry_and_a_unit_scope_is_its_own(monkeypatch):
+    """Round 15 U2, KTD10: the key carries the turn's time mode and the unit the call names (its block range), so a search
+    of the same words and version answers each as asked."""
+    from app.chat.timeframe import TimeMode
+
+    _, searches = _scripted(monkeypatch)
+    ws = T.Workspace(ctx=None)
+    version = uuid4()
+    whole, unit = SearchScope(version_ids=(version,)), SearchScope(version_ids=(version,), blocks=(2, 5))
+    T.memoized_search(ws, None, "שאילתה", 8, unit)
+    T.memoized_search(ws, None, "שאילתה", 8, unit)
+    assert len(searches.calls) == 1
+    ws.time = TimeMode("recent", "switch", ws.time.anchor, None, True)  # the same query, now in a time mode
+    T.memoized_search(ws, None, "שאילתה", 8, unit)
+    assert len(searches.calls) == 2
+    T.memoized_search(ws, None, "שאילתה", 8, whole)  # the whole file is not the unit
+    assert len(searches.calls) == 3
+
+
 def test_each_turn_has_its_own_memo(monkeypatch):
     _, searches = _scripted(monkeypatch)
     T.memoized_search(T.Workspace(ctx=None), None, "שאילתה", 8, None)

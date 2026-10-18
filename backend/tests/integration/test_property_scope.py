@@ -150,9 +150,10 @@ def test_a_different_property_on_the_same_street_is_never_included_and_a_lone_un
         assert ids["hatzalon11"] not in order(run(focused(office, time, ids["hatzalon7_b"]), "search", query=QUERY, limit=6))
 
 
-def test_a_call_that_names_another_unit_or_another_document_is_left_as_it_is(office):
-    """Naming a different unit of the same property is an explicit choice of that unit; naming another property's document
-    stays as asked (U16; a document of the same property with no unit is widened, see the tests below)."""
+def test_a_call_naming_another_document_stays_as_asked_and_one_naming_another_unit_follows_that_unit(office):
+    """Naming another property's document stays as asked (U16; a document of the same property with no unit is widened, see
+    the tests below). Round 15 U2 (R8, KTD10): the time widening follows the unit a call names, whether or not the
+    conversation kept it — a different unit of the same property reads the property from that unit's seat."""
     ids = office.ids
     ws = focused(office, RECENT, ids["hatzalon7_c"])
     out = run(ws, "search", query=QUERY, limit=6, document_ids=[ids["hatzalon11"]])  # another property's document
@@ -163,7 +164,8 @@ def test_a_call_that_names_another_unit_or_another_document_is_left_as_it_is(off
         other = T.unit_handle_of(ws, ids["hatzalon7_b"], ver, reading, 1)
         assert other != ws.unit_focus["handle"]
         out = run(ws, "search", query=QUERY, limit=6, unit=other)
-        assert set(order(out)) == {ids["hatzalon7_b"]} and T.MSG_PROPERTY_SEARCHED not in out, (time.mode, out[:300])
+        assert T.MSG_PROPERTY_SEARCHED in out and set(order(out)) == {ids[k] for k in KEYS[:4]}, (time.mode, out[:300])
+        assert ids["hatzalon11"] not in order(out)  # the neighbour at number 11 is another property
 
 
 def test_a_call_naming_the_focus_unit_itself_is_the_focus_widened_in_a_time_mode_and_unchanged_without_one(office):
@@ -229,13 +231,17 @@ def test_mode_none_naming_a_document_reads_that_document_only(office):
     assert set(order(out)) == {ids["hatzalon7_c"]} and T.MSG_PROPERTY_SEARCHED not in out
 
 
-def test_a_named_unit_is_never_widened_by_the_documents_it_comes_with(office):
+def test_a_named_unit_is_widened_in_a_time_mode_whatever_its_own_documents_and_refuses_another_file(office):
+    """Round 15 U2: the call names a unit and the turn has a time mode, so the property is read; the documents the call
+    comes with must be the unit's own file (the unit fixes the document)."""
     ids = office.ids
     ws = unfocused(office, EXPLICIT_2022)
     ver, reading = version_of(office, ids["hatzalon7_c"])
     own = T.unit_handle_of(ws, ids["hatzalon7_c"], ver, reading, 1)
     out = run(ws, "search", query=QUERY, limit=6, unit=own, document_ids=[ids["hatzalon7_c"]])
-    assert set(order(out)) == {ids["hatzalon7_c"]} and T.MSG_PROPERTY_SEARCHED not in out
+    assert T.MSG_PROPERTY_SEARCHED in out and set(order(out)) == {ids[k] for k in KEYS[:4]}
+    refused = run(ws, "search", query=QUERY, limit=6, unit=own, document_ids=[ids["hatzalon11"]])
+    assert T.MSG_UNIT_ARGS in refused
 
 
 # --- units without a shared key; a file of several properties ---------------------------------------------------------
