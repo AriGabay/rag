@@ -245,3 +245,87 @@ def test_a_year_alone_in_a_year_built_cell_is_a_number():
     assert str(taken["value"]) == "1998" and taken["written"] == "1998"
     assert str(_row(table, "דירה", "שנת בנייה")["value"]) == "1998"
 
+
+
+# --- a whole rendered row as `row`, and a multi-level column header (round 15 U1 follow-up, KTD9) -------------------------
+
+ROWS = _table(["נושא", "תאריך", "תיאור", "שווי (₪)"],
+              [["פרויקט אלפא", "10/01/2020", "תכנון ובנייה בע\"מ", "12,000,000"],
+               ["פרויקט בטא", "20/05/2021", "ייזום", "7,500,000"],
+               ["פרויקט גמא", "11/11/2021", "שיווק", "3,250,000"],
+               ["פרויקט דלתא", "30/09/2021", "כלכלה והנדסה בע\"מ *", "53,000,000", ""]])
+RENDERED = "פרויקט דלתא | 30/09/2021 | כלכלה ו הנדסה בע\"מ | 53,000,000 ₪"
+
+
+def test_a_whole_rendered_row_with_ocr_spacing_resolves_the_row_the_number_names():
+    taken = _row(ROWS, RENDERED, "שווי (₪)", row_number=4)
+    assert taken["locator"]["row_number"] == 4 and taken["written"] == "53,000,000"
+
+
+def test_a_whole_rendered_row_resolves_by_its_cells_when_the_row_number_is_wrong():
+    taken = _row(ROWS, RENDERED, "שווי (₪)", row_number=2)
+    assert taken["locator"]["row_number"] == 4 and taken["written"] == "53,000,000"
+    assert _row(ROWS, RENDERED, "שווי (₪)")["locator"]["row_number"] == 4
+
+
+def test_a_whole_rendered_row_that_matches_no_row_is_refused_naming_the_rows():
+    with pytest.raises(T.ToolError) as e:
+        _row(ROWS, "פרויקט אחר | 01/01/2019 | משהו אחר | 99", "שווי (₪)", row_number=4)
+    msg = str(e.value)
+    assert "פרויקט דלתא" in msg and re.search(r"\b4\b", msg)
+
+
+def test_a_whole_rendered_row_found_in_two_rows_needs_the_row_number():
+    table = _table(["נושא", "שווי (₪)"], [["פרויקט", "5"], ["אחר", "6"], ["פרויקט", "5"]])
+    with pytest.raises(T.ToolError) as e:
+        _row(table, "פרויקט | 5", "שווי (₪)")
+    assert re.search(r"\b1\b", str(e.value)) and re.search(r"\b3\b", str(e.value))
+    assert _row(table, "פרויקט | 5", "שווי (₪)", row_number=3)["locator"]["row_number"] == 3
+
+
+def test_a_multi_level_column_header_is_matched_loosely_against_the_headers():
+    table = _table(["נושא", "קבוצה א 101", "קבוצה א 102"], [["דירה", "4", "5"]])
+    assert _row(table, "דירה", "קבוצה א | 101")["written"] == "4"
+    assert _row(table, "דירה", "קבוצה א | 102")["written"] == "5"
+
+
+def test_a_multi_level_column_header_falls_back_to_its_leaf_header():
+    table = _table(["נושא", "101", "102"], [["דירה", "4", "5"]])
+    assert _row(table, "דירה", "קבוצה א | 102")["written"] == "5"
+
+
+# --- a row label that states a money-per-area quantity gives the currency-only cell that unit -----------------------------
+
+PER_AREA_ROWS = _table(["סעיף", "ערך"], [["שווי מ\"ר מבונה", "11,900 ₪"], ["מחיר למ\"ר", "12,400 ₪"],
+                                         ["שווי דירה 90 מ\"ר", "1,071,000 ₪"], ["שווי למ\"ר", "13,000 ₪ למ\"ר"]])
+
+
+def test_a_row_label_that_names_money_per_area_gives_a_currency_only_cell_that_unit(monkeypatch):
+    d = _workspace(monkeypatch, PER_AREA_ROWS)
+    _take(d, _loc(row="שווי מ\"ר מבונה", column="ערך"), kind="value", unit="ILS_per_sqm")
+    v = d.ws.values["V1"]
+    assert v.unit == "ILS_per_sqm" and v.provenance["unit"] == "source" and v.meaning_from["unit"] == "row"
+    assert "V1" not in d.ws.ambiguous_units
+    _take(d, _loc(row="מחיר למ\"ר", column="ערך"), kind="price", unit="ILS_per_sqm")
+    assert d.ws.values["V2"].unit == "ILS_per_sqm"
+
+
+def test_a_row_label_with_a_property_area_stays_a_currency_amount(monkeypatch):
+    d = _workspace(monkeypatch, PER_AREA_ROWS)
+    _take(d, _loc(row="שווי דירה 90 מ\"ר", column="ערך"), kind="value", unit="ILS")
+    assert d.ws.values["V1"].unit == "ILS"
+    with pytest.raises(T.ToolError):
+        _take(d, _loc(row="שווי דירה 90 מ\"ר", column="ערך"), kind="value", unit="ILS_per_sqm")
+
+
+def test_a_cell_that_states_its_own_per_area_unit_is_unchanged(monkeypatch):
+    d = _workspace(monkeypatch, PER_AREA_ROWS)
+    _take(d, _loc(row="שווי למ\"ר", column="ערך"), kind="value", unit="ILS_per_sqm")
+    assert d.ws.values["V1"].unit == "ILS_per_sqm" and d.ws.values["V1"].meaning_from["unit"] == "cell"
+
+
+def test_a_header_that_states_another_unit_keeps_its_unit_over_the_row_label(monkeypatch):
+    table = _table(["סעיף", "שטח (מ\"ר)"], [["שווי מ\"ר מבונה", "120 ₪"]])
+    d = _workspace(monkeypatch, table)
+    with pytest.raises(T.ToolError):
+        _take(d, _loc(row="שווי מ\"ר מבונה", column="שטח (מ\"ר)"), kind="value", unit="ILS_per_sqm")

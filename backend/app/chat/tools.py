@@ -5383,6 +5383,21 @@ def _header_units(header: str, column_unit: str = "") -> set[str]:
     return units
 
 
+_AREA_MARK = re.compile(r"מ\"ר|מטר")
+
+
+def _label_units(label: str) -> set[str]:
+    """The unit a row label states by naming a money quantity per area (round 15 U1 follow-up, KTD9): "שווי מ״ר מבונה", "מחיר
+    למ״ר" — a money kind with the area as its denominator, so a cell that states only the currency is ₪ per m². A label that
+    holds a number beside the area ("שווי דירה 90 מ״ר") describes a property, not a rate: none."""
+    text_ = meaning._norm(label)
+    if not any(meaning.kind_attested(k, text_) for k in meaning.MONEY_KINDS) or not _AREA_MARK.search(text_):
+        return set()
+    if meaning._PER_SQM.search(text_) or not re.search(r"\d", text_):
+        return {"ILS_per_sqm"}
+    return set()
+
+
 def _numbers_of(text_: str) -> list[tuple[str, int, int, Decimal]]:
     """Every number written in a text: (as written, start, end, value)."""
     from app.answering.verify import _NUMBER
@@ -5441,6 +5456,73 @@ def _rows_named(rows: list[list[str]], label: str) -> list[int]:
             if hit:
                 return hit
     return []
+
+
+_ROW_JOIN = " | "
+_ROW_TEXT_SHARE = 0.8
+
+
+def _is_row_text(label) -> bool:
+    """Whether a ``row`` is a whole rendered row (cells joined with " | ") and not a label (round 15 U1 follow-up, KTD9)."""
+    return _ROW_JOIN in str(label or "")
+
+
+def _rows_like_text(rows: list[list[str]], text_: str) -> list[tuple[int, float, int]]:
+    """The rows a rendered row text matches, best first: (index, share of the given cells found loosely in the row, cells
+    equal to one of its cells). A cell is found when its letters and digits lie inside the row's (``_loose``), so OCR
+    spaces inside a word, a trailing '*' or an empty cell do not hide the row. A row matches at ``_ROW_TEXT_SHARE`` of the
+    given non-empty cells."""
+    given = [g for g in (_loose(c) for c in str(text_).split("|")) if g]
+    if not given:
+        return []
+    out = []
+    for i, r in enumerate(rows):
+        own = [_loose(c) for c in r]
+        joined = "".join(own)
+        found = sum(1 for g in given if g in joined)
+        if found / len(given) >= _ROW_TEXT_SHARE:
+            out.append((i, found / len(given), sum(1 for g in given if g in own)))
+    return sorted(out, key=lambda x: (-x[1], -x[2], x[0]))
+
+
+def _row_of_text(rows: list[list[str]], text_: str, row_number) -> int:
+    """The row a whole rendered row names (round 15 U1 follow-up, KTD9): the ``row_number`` row when it matches, else the
+    only best match; a refusal naming the candidate rows when none matches or several match equally."""
+    like = _rows_like_text(rows, text_)
+    if row_number is not None and 0 <= int(row_number) - 1 < len(rows) and any(i == int(row_number) - 1 for i, *_ in like):
+        return int(row_number) - 1
+    if like:
+        best = [i for i, share, eq in like if (share, eq) == like[0][1:]]
+        if len(best) == 1:
+            return best[0]
+        raise ToolError(f"השורה «{_clip(text_, 80)}» מתאימה לכמה שורות — {_rows_listed(rows, best)}; בחר לפי row_number")
+    at = [int(row_number) - 1] if row_number is not None and 0 <= int(row_number) - 1 < len(rows) else []
+    raise ToolError(f"השורה «{_clip(text_, 80)}» אינה שורה בטבלה"
+                    + (f". שורה {at[0] + 1} היא «{_clip(' | '.join(rows[at[0]]), 120)}»" if at else "")
+                    + ". השורות: " + _rows_listed(rows, list(range(len(rows)))))
+
+
+def _column_of(wanted: str, headers: list[str]) -> int:
+    """The column a header label names; a multi-level header written with " | " ("קבוצה | 101") is matched loosely: a header
+    that holds every level, else the leaf level alone (round 15 U1 follow-up, KTD9)."""
+    if not _is_row_text(wanted):
+        return _match_one(wanted, headers, "העמודה")
+    try:
+        return _match_one(wanted, headers, "העמודה")
+    except ToolError:
+        pass
+    levels = [g for g in (_loose(x) for x in wanted.split("|")) if g]
+    own = [_loose(h) for h in headers]
+    for need in (levels, levels[-1:]):
+        hit = [i for i, h in enumerate(own) if h and need and all(g in h for g in need)]
+        if len(hit) > 1:
+            exact = [i for i in hit if own[i] == "".join(need)]
+            hit = exact or hit
+        if len(hit) == 1:
+            return hit[0]
+        if hit:
+            raise ToolError(f"העמודה «{wanted}» מתאימה לכמה ({', '.join(str(i + 1) for i in hit[:8])}); בחר לפי מספר")
+    raise ToolError(f"העמודה «{wanted}» לא נמצאה בטבלה. האפשרויות: " + "; ".join(f"«{o}»" for o in headers[:20] if o))
 
 
 def _row_name(cells: list[str]) -> str:
@@ -5508,7 +5590,10 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     headers = list(st.get("headers") or [])
     if not rows:
         raise ToolError("לטבלה אין שורות")
-    if loc.get("row_number") is not None:
+    if _is_row_text(loc.get("row")):
+        # the model passed the whole rendered row: its cells decide, the row_number only breaks a tie (round 15 U1 follow-up)
+        ri = _row_of_text(rows, loc["row"], loc.get("row_number"))
+    elif loc.get("row_number") is not None:
         ri = int(loc["row_number"]) - 1
         if not 0 <= ri < len(rows):
             raise ToolError(f"לטבלה {len(rows)} שורות; row_number מ-1 עד {len(rows)}")
@@ -5541,7 +5626,7 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     elif loc.get("column"):
         if not any(headers):
             raise ToolError("לטבלה אין כותרות עמודה: בחר עמודה לפי column_number")
-        ci = _match_one(loc["column"], headers, "העמודה")
+        ci = _column_of(loc["column"], headers)
         if ci >= len(cells):
             raise ToolError(f"בשורה «{cells[0] if cells else ''}» אין תא בעמודה «{headers[ci]}»")
     else:
@@ -5600,9 +5685,15 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     # together (round 15 U1, KTD9): "שווי למ״ר" over a row that names "דירה 3 חדרים" is ₪ per m², not m²
     head_units = set() if meaning.units_attested(cell) else _header_units(header, near[3])
     units = head_units or meaning.units_attested(" ".join(near)) or meaning.units_attested(" ".join(table_text))
+    # a row label that names money per area gives a cell that states only the currency that unit; a cell or a header
+    # that states another unit keeps it (round 15 U1 follow-up, KTD9)
+    label_units = (_label_units(label) if not head_units and meaning.units_attested(cell) == {"ILS"}
+                   and meaning.units_attested(" ".join([header, near[3]])) <= {"ILS"} else set())
+    if label_units:
+        units = label_units
     # where the source states the unit (R10): the cell, its row label, its column header (or the column's unit
     # read from it), else the table's caption, title or notes
-    unit_from = "header" if head_units else next(
+    unit_from = "header" if head_units else "row" if label_units else next(
         (where for where, t in (("cell", near[0]), ("row", near[1]), ("header", near[2] + " " + near[3]))
          if meaning.units_attested(t)), "table" if units else None)
     # a unit only the row's own label mentions, beside a caption that states another, and nothing in the cell or its
@@ -5610,7 +5701,7 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     # source does not say which: the value registers with the model's unit and a flag that blocks calculating with it
     row_units = meaning.units_attested(label)
     caption_units = meaning.units_attested(" ".join(table_text))
-    ambiguous = (not head_units and not meaning.units_attested(" ".join([cell, header, near[3]])) and bool(row_units)
+    ambiguous = (not head_units and not label_units and not meaning.units_attested(" ".join([cell, header, near[3]])) and bool(row_units)
                  and bool(caption_units) and row_units != caption_units and bool(re.search(r"\d", label)))
     if ambiguous:
         units, unit_from = set(), None
