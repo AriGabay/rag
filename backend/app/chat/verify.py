@@ -201,7 +201,7 @@ from app.answering.verify import not_an_amount, numbers_in
 from app.chat import dates as chat_dates
 from app.chat import meaning
 from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited, line_cut
-from app.chat.evidence import select
+from app.chat.evidence import WHOLE_SOURCE_CHARS, Segment, fit, fit_segments, segments_of, select
 from app.chat.request import ID_PREFIX, Aspect, Kind
 from app.config import get_settings
 from app.measurements.extract import VAT_TERM, stance_label
@@ -252,8 +252,9 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # ``derived``) joins the unit's evidence; rules (29) and (30) read them. 9 (round 13 U11, KTD13): the final check shows a unit that
 # refers back (``BACK_REFERENCES``) the text that stays before it and the units removed from before it (``<preceding>``,
 # ``removed_before``); rule (31) reads them. 10 (round 15 U7, KTD7): the header of a passage in a unit the answer declared names
-# it by handle and structural title (``_declared_head``).
-JUDGE_VERSION = 10
+# it by handle and structural title (``_declared_head``). 11 (round 16 U1, KTD1): the requirements call carries the passages the
+# turn read (``<read_passages>``) and the judge may name ``support`` (a read passage and a verbatim quote) for a part the answer omits.
+JUDGE_VERSION = 11
 # the label of the facts the server holds about a cited source's unit and states beside its text (round 13 U9, KTD10, R13): the
 # stated valuation date of the unit that holds the passage, and why the server linked the appraisal to the property. Read
 # from the stored document, not from the passage: the judge takes them as evidence, never as a claim to check
@@ -438,7 +439,16 @@ JUDGE_REQUIREMENTS_POLICY = (
     "חישוב או כלי שנכשלו בדרך אליה, והחיפושים והקריאות שחיפשו אותה. יחידה שאומרת שנתון לא נמצא, כש-<workspace> "
     "מחזיק ערך, נתון או חישוב שלו — unsupported. יחידה מ-<removed_units> שנתנה דרישה — ציין אותה ב-units של "
     "הדרישה כרגיל (השרת יודע שהוסרה). claims: כשרק טענה אחת מתוך יחידה נותנת את הדרישה (ליחידה כמה טענות), ציין ב-claims "
-    "את ה-span של הטענה הנותנת אותה, כפי שהוא כתוב ביחידה; אחרת claims ריק והיחידה כולה נותנת אותה. missing: בדרישה עם status partial — החלק שהתשובה אינה נותנת ממנה, כביטוי שמני קצר במילות הבקשה עצמה (למשל «שטחי השירות בתא שטח 1» כשדרישה אחת מכסה כמה פריטים והתשובה נתנה אחד מהם בלבד); בכל status אחר — ריק. לעולם אל תנקוב בחלק שהבקשה לא ביקשה, ואל תמציא מילים שאינן בבקשה."
+    "את ה-span של הטענה הנותנת אותה, כפי שהוא כתוב ביחידה; אחרת claims ריק והיחידה כולה נותנת אותה. missing: בדרישה עם status partial — החלק שהתשובה אינה נותנת ממנה, כביטוי שמני קצר במילות הבקשה עצמה (למשל «שטחי השירות בתא שטח 1» כשדרישה אחת מכסה כמה פריטים והתשובה נתנה אחד מהם בלבד); בכל status אחר — ריק. לעולם אל תנקוב בחלק שהבקשה לא ביקשה, ואל תמציא מילים שאינן בבקשה.\n"
+    "קטעי קריאה: <read_passages> מכיל קטעים מהשומה שנשאלה, שהתור קרא (S#) ושהתשובה לא ציטטה, או שצוטט מהם רק חלק "
+    "(continues=\"true\" — המשך מקור מצוטט, מה שלא הוצג לך ב-<sources>; excerpt=\"true\" — קטע בלבד, והשמטה אינה ראיה "
+    "להיעדר); source_kind מסמן מקור מקצועי (תקן או מסמך מקצועי), שנותן רק דרישה מקצועית (כלל, שיטה או נימוק) ולעולם לא "
+    "נתון של הנכס. דרישה היא full רק כשהתשובה נותנת את מה שקטעי הקריאה והמקורות המצוטטים אומרים עליה: פריט ברשימה, תנאי, "
+    "הסתייגות, שיטה, נימוק או שורת טבלה שקטע קריאה אומר עליה והתשובה משמיטה — הדרישה partial, ב-missing ציין את החלק "
+    "החסר, וב-support ציין היכן הוא כתוב: [{\"id\": \"S#\", \"quote\": \"<משפט או שורת טבלה מתוך הקטע, מילה במילה>\"}]. "
+    "פתיחת מקור, או קיומו ב-<read_passages>, אינם נתינת הדרישה: רק יחידה שבקלט נותנת אותה (units). support רק לדרישה "
+    "partial או missing, רק עבור S# שמופיע ב-<read_passages> או ב-<sources>, ורק בציטוט שאתה רואה בקטע; כשאין חלק כזה — "
+    "support ריק."
 )
 # the judge's scores of a requirement in one call
 REQUIREMENT_STATUSES = ("full", "partial", "missing", "undeterminable")
@@ -455,6 +465,12 @@ NOT_FOUND = re.compile(r"(?<![א-ת])לא\s+(?:נמצא|נמצאה|נמצאו|א
 ABSENCE = re.compile(r"(?<![א-ת])(?:לא|אינו|אינה|אינם|אינן)\s+(?:נמצא|נמצאה|נמצאו|נמצאים|אותר|אותרה|אותרו|מופיע|"
                      r"מופיעה|מופיעים|מופיעות)(?![א-ת])")
 WORKSPACE_MEASUREMENTS = 30  # measurements listed for the judge (a listing may hold hundreds)
+# the passages the turn read, in the requirements call (round 16 U1, KTD1): the whole block, one passage of it, and the least
+# room worth giving a passage. Measured on a typical synthetic case in ``test_coverage`` (a few thousand characters)
+READ_PASSAGES_CHARS = 6_000
+READ_PASSAGE_CHARS = 2_000
+READ_PASSAGE_FLOOR = 300
+SUPPORT_PER_REQUIREMENT = 6  # a requirement names at most this many support quotes in one call
 REQ_DATA_FOUND = ("חלק של הבקשה שהתשובה לא נתנה במלואו: «{text}». הנתונים שלו כבר נמצאו בתור הזה ({ids}): השלם "
                   "אותו בתשובה מהם, וחשב ב-calculate אם הוא דורש חישוב")
 REQ_NOT_SEARCHED = ("חלק של הבקשה שהתשובה לא נתנה: «{text}». לא בוצע חיפוש או קריאה שמכסים אותו: יש לחפש אותו "
@@ -674,6 +690,14 @@ class JudgeOutput(_Strict):
     verdicts: list[JudgeVerdict]
 
 
+class SupportQuote(_Strict):
+    """Where a part of a requirement the answer omits is written (round 16 U1, KTD1): a read passage (``S#``) and a sentence
+    or table row of it, verbatim. The judge names it; the server validates it before it counts as evidence (KTD2)."""
+
+    id: str
+    quote: str
+
+
 class JudgeRequirement(_Strict):
     """A requirement of the request with its score in one judge call. A deriving call (the fallback) gives ``text``,
     ``kind``, ``calculation`` and ``conditional`` (the server assigns the id); a scoring call gives the frozen
@@ -697,6 +721,10 @@ class JudgeRequirement(_Strict):
     # phrase, "שטחי השירות בתא שטח 1"); empty otherwise. The server keeps it only when every content word of it is in
     # the component's text or the user's request (``valid_missing``): it never invents a part (round 8 R20, R21).
     missing: str = ""
+    # for a ``partial`` or ``missing`` requirement: the read passages (``<read_passages>``, or a cited source) that state a part
+    # the answer omits, each with the verbatim quote. Kept per vote and only for a read source (``_Coverage.accept``); the
+    # server checks the quote and decides what it is evidence of (round 16 U2). Empty by default, so an older reply stays valid.
+    support: list[SupportQuote] = Field(default_factory=list)
 
 
 class JudgeCoverageOutput(JudgeOutput):
@@ -4401,6 +4429,90 @@ def _candidate_block(sid: str, texts: list[str], ws: Workspace, narrow: bool) ->
             f'title="{prompt_attr(head)}">\n{prompt_text(shown)}\n</source>')
 
 
+def read_source_ids(ws: Workspace) -> list[str]:
+    """The S# of the sources the turn read, in the order they were made: the sections, tables and pages it opened
+    (``Workspace.activity`` openings) that hold text. A source the turn only searched, a listing and a measurement are not
+    read (round 16 U1, KTD1: opening a passage is how a part of the answer's source reaches the judge)."""
+    ids = {o["sid"] for a in ws.activity.values() for o in a.get("openings") or []
+           if o.get("sid") in ws.sources and ws.sources[o["sid"]].kind != "listing" and (ws.sources[o["sid"]].text or "").strip()}
+    return sorted(ids, key=lambda sid: int(sid[1:]) if sid[1:].isdigit() else 0)
+
+
+def _asked_unit_ids(ws: Workspace, cited: set[str]) -> set[str]:
+    """The units a read passage may lie in to be shown to the requirements judge: the units the answer declared, the unit the
+    turn located, and the units of the sources the answer cites. A passage of another unit of the file is of another appraisal."""
+    asked = set(declared_handles(ws))
+    located = getattr(ws, "located_unit", None)
+    if located and located.get("key"):
+        asked.add(located["key"])
+    return asked | {ws.sources[i].unit["id"] for i in cited if i in ws.sources and ws.sources[i].unit}
+
+
+def _passage_element(sid: str, extra: str, head: str, body: str, excerpt: bool, continues: bool) -> str:
+    """One ``<read_passage>`` of the block: its id, whether it is an excerpt, whether it continues a cited source, and its header."""
+    return (f'<read_passage id="{sid}" excerpt="{"true" if excerpt else "false"}"{' continues="true"' if continues else ""}'
+            f'{extra} title="{prompt_attr(head)}">\n{prompt_text(body)}\n</read_passage>')
+
+
+def _read_passages(coverage: _Coverage, ws: Workspace, shown: dict[str, tuple[str, bool]]) -> str:
+    """The ``<read_passages>`` block of a requirements call (round 16 U1, KTD1, R1, R3): the text of the sources the turn read in
+    the asked units, cited or not, so the judge scores a component against what the turn read and not only against what the
+    answer wrote. ``shown``: what the call's ``<sources>`` already show of the sources it cites (the text, and whether it is
+    an excerpt). A source shown whole is skipped; one shown as an excerpt adds the segments not shown (``continues``);
+    a professional source only for a professional or mixed question. A long passage is clipped to the components (never to
+    its first characters), and the block holds to ``READ_PASSAGES_CHARS`` with each passage at most ``READ_PASSAGE_CHARS`` of
+    it. Empty when nothing qualifies."""
+    from app.chat import intent as intent_mod
+
+    asked = _asked_unit_ids(ws, coverage.answer_ids | set(shown))
+    professional = getattr(ws, "intent", None) in (intent_mod.PROFESSIONAL, intent_mod.MIXED)
+    whole = {ws.sources[i].text for i, (_, excerpt) in shown.items() if not excerpt and i in ws.sources}
+    entries: list[tuple[str, str, str, tuple[Segment, ...] | str, bool]] = []  # (id, extra attributes, head, text, continues)
+    seen: set[tuple[str, str]] = set()
+    for sid in read_source_ids(ws):
+        src = ws.sources[sid]
+        if src.source_kind != source_kinds.APPRAISAL and not professional:
+            continue
+        if src.unit is not None and src.unit.get("id") not in asked:
+            continue
+        if src.text in whole or (str(src.version_id), src.text) in seen:
+            continue
+        seen.add((str(src.version_id), src.text))
+        parts = _source_parts(ws, sid)
+        if parts is None:
+            continue
+        head, body, kind = parts
+        extra = "" if src.source_kind == source_kinds.APPRAISAL else f' source_kind="{prompt_attr(src.source_kind)}"'
+        if sid in shown:  # cited: the segments the judge was not shown, when it saw an excerpt
+            lines = set(shown[sid][0].split("\n"))
+            rest = tuple(Segment(g.text) for g in segments_of(body, kind) if g.text not in lines)
+            if rest:
+                entries.append((sid, extra, head, rest, True))
+        else:
+            entries.append((sid, extra, head, body, False))
+    if not entries:
+        return ""
+    wanted = coverage.component_texts()
+    remaining = READ_PASSAGES_CHARS - len("<read_passages>\n\n</read_passages>")
+    out: list[str] = []
+    for n, (sid, extra, head, text, continues) in enumerate(entries):
+        room = (min(READ_PASSAGE_CHARS, remaining // (len(entries) - n))
+                - len(_passage_element(sid, extra, head, "", False, continues)) - 1)
+        if room < READ_PASSAGE_FLOOR:
+            continue
+        if isinstance(text, tuple):
+            joined = "\n".join(g.text for g in text)
+            body, excerpt = (joined, True) if len(joined) <= room else fit_segments(wanted, text, room)
+        else:
+            body, excerpt = fit(wanted, text, "text", limit=room)
+        if not body.strip():
+            continue
+        el = _passage_element(sid, extra, head, body, excerpt, continues)
+        remaining -= len(el) + 1
+        out.append(el)
+    return "<read_passages>\n" + "\n".join(out) + "\n</read_passages>" if out else ""
+
+
 @dataclass
 class _Coverage:
     """The completeness plane of a judge call: the turn's requirements (to derive, with the answer's declared parts
@@ -4412,8 +4524,18 @@ class _Coverage:
     request: str = ""
     workspace: str = ""
     known: set[str] = field(default_factory=set)  # the workspace ids a requirement may name as related
+    # round 16 U1: the S# the answer cites (all its units; the batch's own are added when it is rendered), the units the passages
+    # block asks about with them; and the read sources a requirement may name as support (set when a batch is judged)
+    answer_ids: set[str] = field(default_factory=set)
+    readable: set[str] = field(default_factory=set)
 
-    def render(self) -> str:
+    def component_texts(self) -> list[str]:
+        """What the passages are clipped against: the asked components, else (before they are derived) the request and the
+        answer's declared parts."""
+        asked = [r["text"] for r in self.turn.items if r.get("kind") != "instruction"]
+        return asked or [t for t in (self.request, *self.hints) if t and t.strip()]
+
+    def render(self, passages: str = "") -> str:
         out = f"\n\n<request>\n{prompt_text(self.request)}\n</request>" if self.request.strip() else "\n"
         if self.turn.derived:
             def listed(items: list[dict]) -> str:
@@ -4428,6 +4550,8 @@ class _Coverage:
         else:
             out += "\n<derive_requirements>" + "".join(f"\n<hint>{prompt_text(h)}</hint>" for h in self.hints) \
                 + "\n</derive_requirements>"
+        if passages:
+            out += "\n" + passages
         out += f"\n<workspace>\n{self.workspace}\n</workspace>"
         return out
 
@@ -4440,8 +4564,23 @@ class _Coverage:
         return [r.model_copy(update={"units": [i for i in r.units if i in indexes],
                                      "absent": [i for i in r.absent if i in indexes],
                                      "related": [x for x in dict.fromkeys(r.related) if x in self.known],
-                                     "missing": valid_missing(r.missing, r.status, texts[r.id], self.request)})
+                                     "missing": valid_missing(r.missing, r.status, texts[r.id], self.request),
+                                     "support": self.valid_support(r)})
                 for r in scored if r.id in texts]
+
+    def valid_support(self, r: JudgeRequirement) -> list[SupportQuote]:
+        """The support a vote keeps: only for a ``partial`` or ``missing`` requirement, only for an id that is a read source of
+        the turn (an opened section, table or page: a source only searched is not), each (id, quote) once, at most
+        ``SUPPORT_PER_REQUIREMENT``. Whether the quote is in the passage, in an asked unit and absent from the answer is the
+        server's check after this (round 16 U2); this keeps the vote's own shape."""
+        if r.status not in ("partial", "missing"):
+            return []
+        out: dict[tuple[str, str], SupportQuote] = {}
+        for x in r.support:
+            sid, quote = x.id.strip(), x.quote.strip()
+            if sid in self.readable and quote:
+                out.setdefault((sid, quote), SupportQuote(id=sid, quote=quote))
+        return list(out.values())[:SUPPORT_PER_REQUIREMENT]
 
 
 def _requirement_attrs(r: dict) -> str:
@@ -4552,12 +4691,14 @@ def _render_batch(batch: _Batch, ws: Workspace, coverage: _Coverage | None = Non
         for sid in u.ids:
             claims_of.setdefault(sid, []).append(u.text)
     blocks = []
+    shown: dict[str, tuple[str, bool]] = {}  # what the judge is shown of each source (for the read passages block)
     for sid, claims in claims_of.items():
         parts = _source_parts(ws, sid)
         if parts is None:
             continue
         head, body, kind = parts
         text_, excerpt = select(claims, body, kind, narrow=batch.narrow)
+        shown[sid] = (text_, excerpt)
         more = "".join(f'\n<expanded_context kind="{prompt_attr(k)}">\n{prompt_text(t)}\n</expanded_context>'
                        for k, t in batch.expanded.get(sid, []))
         blocks.append(f'<source id="{sid}" excerpt="{"true" if excerpt else "false"}" title="{prompt_attr(head)}">\n'
@@ -4568,7 +4709,11 @@ def _render_batch(batch: _Batch, ws: Workspace, coverage: _Coverage | None = Non
         for sid in _candidate_ids(batch, ws).get(u.index, []):
             if sid not in claims_of:
                 wanted.setdefault(sid, []).append(u.text)
-    blocks += [b for sid, texts in wanted.items() if (b := _candidate_block(sid, texts, ws, batch.narrow))]
+    for sid, texts in wanted.items():
+        if (b := _candidate_block(sid, texts, ws, batch.narrow)):
+            blocks.append(b)
+            if sid in ws.sources and len(ws.sources[sid].text or "") <= WHOLE_SOURCE_CHARS:
+                shown.setdefault(sid, (ws.sources[sid].text, False))  # short enough to be shown whole
     # before a unit: the headings above it and its table row's header (R7); after a unit showing a result of a
     # conditional calculation: the qualifier the server writes next to it
     units = [_unit_context(u) + _preceding_note(u) + _unstated_note(u) + _reread_note(batch, u)
@@ -4581,7 +4726,7 @@ def _render_batch(batch: _Batch, ws: Workspace, coverage: _Coverage | None = Non
                       for u in batch.removed)
     return ("<sources>\n" + "\n".join(blocks) + "\n</sources>\n\n" + "\n".join(units)
             + (f"\n\n<removed_units>{removed}\n</removed_units>" if removed else "")
-            + (coverage.render() if coverage else ""))
+            + (coverage.render(_read_passages(coverage, ws, shown)) if coverage else ""))
 
 
 def _batches(units: list[Unit], ws: Workspace, removed: list[Unit] | None = None,
@@ -4648,6 +4793,8 @@ def _judge_batch(provider: LLMProvider, batch: _Batch, ws: Workspace, usage: lis
     made once more; a truncated (``incomplete``) reply is split in half instead of resent. Raises
     ``VerificationUnavailable`` when the judge cannot answer. ``label``: the calls' usage purpose (``judge``);
     ``policy``: more rules for these calls."""
+    if coverage is not None:
+        coverage.readable = set(read_source_ids(ws))  # the sources a requirement may name as support (round 16 U1)
     rendered = _render_batch(batch, ws, coverage)
     got, status, scores = judge(provider, batch, rendered, usage, deadline, coverage, label=label, policy=policy)
     if status == "incomplete" and len(batch.units) > 1:
@@ -5166,7 +5313,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     if requirements is not None:
         listing, known = _workspace_listing(ws, requirements)
         coverage = _Coverage(requirements, [p.ask for p in getattr(answer, "parts", None) or []],
-                             request or question, listing, known)
+                             request or question, listing, known, {i for u in units for i in u.ids})
     # a result of the turn's calculations that a unit shows without citing it is bound to its C#, which joins the
     # unit's citations (and the answer's, once the unit is verified)
     bound = bind_computations(units, ws, question)

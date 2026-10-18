@@ -872,3 +872,14 @@ def test_a_sentence_that_moves_to_the_front_of_its_line_keeps_its_key(monkeypatc
     final, units, draft, report = _final(monkeypatch, markdown, rule)
     (value,) = [u for u in units if u.model]
     assert value.drafts == [1] and value.key == draft[1], value.unit.text
+
+
+# --- round 16 U1: the judge contract is version 11 and the verdict cache key moves with it --------------------------------------
+
+def test_the_judge_version_is_11_and_the_verdict_cache_key_changes_with_it(monkeypatch):
+    assert verify.JUDGE_VERSION == 11  # round 16 U1: the read passages in the requirements call, `support`
+    ws = _ws()
+    unit = verify.split_units("השווי למ\"ר הוא 9,500 ₪ [S1].")[0]
+    now = verify.unit_key(unit, ws, "?", "", {})
+    monkeypatch.setattr(verify, "JUDGE_VERSION", 10)
+    assert verify.unit_key(unit, ws, "?", "", {}) != now

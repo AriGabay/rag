@@ -1432,3 +1432,195 @@ def test_a_turn_offered_candidates_and_using_none_still_says_the_unit_was_not_lo
     _offer(ws, 1, 2)
     o, gap = _only_missing(ws)
     assert o["limitation"] == "unit_not_located", (o, gap)
+
+
+# --- round 16 U1: the requirements call sees the passages the turn read (KTD1), and the judge may name `support` -------------
+
+RATE_LINES = ["שיעור היוון למשרדים 6.5%", "שיעור היוון למסחר 7.0%", "שיעור היוון לחניה 8.25%",
+              "מחסנים: 9.1%"]
+RATES = "\n".join(["שיעורי ההיוון שנקבעו בשומה:", *RATE_LINES])
+ASK_RATES = "שיעורי ההיוון שנקבעו"
+FILLER = [f"שורה מספר {n} של תיאור כללי בלי נתון מיוחד לגבי הנכס והסביבה" for n in range(1, 90)]
+
+
+def _read(ws: Workspace, *sids: str) -> None:
+    """The turn read these sources (opened sections), as the workspace's activity records them."""
+    for sid in sids:
+        s = ws.sources[sid]
+        doc = str(s.document_id)
+        a = ws.activity.setdefault(doc, {"title": s.title, "level": "read", "read": True, "partial": False,
+                                         "read_partial": False, "read_complete": True, "openings": []})
+        a["openings"].append({"sid": sid, "scope": "section", "name": s.section or "", "target": ("section", doc, sid)})
+
+
+def _file(*texts: str, units: tuple[int, ...] = (), declared: tuple[int, ...] = ()) -> Workspace:
+    """One file of two appraisal units holding the sources ``S1…`` (all read); ``units``: the unit of each source (by
+    position), ``declared``: the units the answer declared."""
+    from app.chat import tools as T
+
+    ws = _ws(*texts)
+    first = ws.sources["S1"]
+    for s in ws.sources.values():
+        s.document_id, s.version_id = first.document_id, first.version_id
+    _in_units(ws)
+    cx = ws.contexts[str(first.version_id)]
+    for sid, n in zip(ws.sources, units, strict=False):
+        ws.sources[sid].contexts, ws.sources[sid].unit = [n], T.unit_info(cx, n)
+    handles = _offer(ws, *declared)
+    ws.declared_units = [{"document_id": str(first.document_id), "reading_id": "r1", "unit_no": n, "units_tag": None,
+                          "display": UNIT_TITLES[n][0]} for n in declared]
+    ws.declared_handles = {handles[a["unit_no"]]: a for a in ws.declared_units}
+    _read(ws, *ws.sources)
+    return ws
+
+
+def _passages(seen: str) -> str:
+    """The `<read_passages>` block of a judge call's input ('' when there is none)."""
+    m = re.search(r"<read_passages>.*?</read_passages>", seen, re.S)
+    return m.group() if m else ""
+
+
+def _ask(ws: Workspace, markdown: str, ask: str = ASK_RATES) -> tuple[list[str], object]:
+    seen: list[str] = []
+    turn = _turn({"id": "1", "text": ask})
+    r = verify_answer(_judge(_by_words({ask: {}}), seen=seen), _answer(markdown), ws, "?", [], requirements=turn)
+    return seen, r
+
+
+def test_an_uncited_passage_read_in_the_declared_unit_is_in_the_block_and_one_of_the_other_unit_is_not():
+    other = "שיעורי היוון של שומה אחרת בקובץ: 5.5% לדירות"
+    ws = _file(SOURCE, RATES, other, units=(1, 1, 2), declared=(1,))
+    seen, _ = _ask(ws, "השווי למ\"ר הוא 9,500 ₪ [S1].")
+    block = _passages(seen[0])
+    assert 'id="S2"' in block and RATE_LINES[3] in block
+    assert 'id="S3"' not in block and "5.5%" not in block
+    assert block in seen[0] and seen[0].index(block) < seen[0].index("<workspace>")
+
+
+def test_a_passage_of_the_unit_the_turn_located_or_the_answer_cites_is_asked_too():
+    ws = _file(SOURCE, RATES, units=(1, 2))  # S2 lies in the unit the turn located; nothing is cited
+    ws.located_unit = {"key": ws.sources["S2"].unit["id"], "anchor": {}}
+    seen, _ = _ask(ws, "הנכס פנוי.")
+    assert 'id="S2"' in _passages(seen[0]) and 'id="S1"' not in _passages(seen[0])
+    ws = _file(SOURCE, RATES, units=(1, 2))  # nothing declared or located: the unit of the cited S1 is asked, not S2's
+    seen, _ = _ask(ws, "השווי למ\"ר הוא 9,500 ₪ [S1].")
+    assert 'id="S2"' not in _passages(seen[0])
+
+
+def test_a_source_the_turn_only_searched_is_not_a_read_passage():
+    ws = _file(SOURCE, RATES, units=(1, 1), declared=(1,))
+    ws.activity[str(ws.sources["S1"].document_id)]["openings"] = [
+        o for o in ws.activity[str(ws.sources["S1"].document_id)]["openings"] if o["sid"] != "S2"]
+    seen, _ = _ask(ws, "השווי למ\"ר הוא 9,500 ₪ [S1].")
+    assert 'id="S2"' not in _passages(seen[0])
+
+
+def test_a_cited_passage_the_judge_sees_whole_is_not_repeated_in_the_block():
+    ws = _file(SOURCE, RATES, units=(1, 1), declared=(1,))
+    seen, _ = _ask(ws, "השווי למ\"ר הוא 9,500 ₪ [S1]. שיעור ההיוון למשרדים 6.5% [S2].")
+    assert 'id="S2"' not in _passages(seen[0]) and 'id="S1"' not in _passages(seen[0])
+    assert '<source id="S2" excerpt="false"' in seen[0]
+
+
+def test_a_cited_long_passage_shown_as_an_excerpt_adds_the_segments_the_claim_did_not_show():
+    long_text = "\n".join([RATE_LINES[0], *FILLER[:45], RATE_LINES[3], *FILLER[45:]])
+    assert len(long_text) > 4000
+    ws = _file(SOURCE, long_text, units=(1, 1), declared=(1,))
+    seen, _ = _ask(ws, "שיעור ההיוון למשרדים 6.5% [S2].")
+    source = re.search(r'<source id="S2" excerpt="true".*?</source>', seen[0], re.S).group()
+    assert RATE_LINES[0] in source and RATE_LINES[3] not in source  # the cited excerpt omits the fourth rate
+    block = _passages(seen[0])
+    assert 'id="S2"' in block and RATE_LINES[3] in block
+    assert RATE_LINES[0] not in block  # the segment the judge saw is not shown again
+
+
+def test_a_long_uncited_passage_is_clipped_to_the_requirement_not_to_its_prefix():
+    long_text = "\n".join([*FILLER[:50], RATE_LINES[2], *FILLER[50:]])
+    assert len(long_text) > verify.READ_PASSAGE_CHARS * 2
+    ws = _file(SOURCE, long_text, units=(1, 1), declared=(1,))
+    seen, _ = _ask(ws, "השווי למ\"ר הוא 9,500 ₪ [S1].", ask="שיעור היוון לחניה 8.25%")
+    block = _passages(seen[0])
+    assert RATE_LINES[2] in block and FILLER[0] not in block and FILLER[88] not in block and len(block) <= verify.READ_PASSAGES_CHARS
+
+
+def test_the_block_holds_to_its_cap_when_many_passages_were_read(capsys):
+    texts = [SOURCE] + [f"קטע {n}: " + "\n".join(FILLER[n:n + 40]) + f"\n{RATE_LINES[n % 4]}" for n in range(12)]
+    ws = _file(*texts, units=(1,) * len(texts), declared=(1,))
+    seen, _ = _ask(ws, "השווי למ\"ר הוא 9,500 ₪ [S1].")
+    block = _passages(seen[0])
+    assert 0 < len(block) <= verify.READ_PASSAGES_CHARS, len(block)
+    assert block.count("<read_passage ") >= 2  # the budget is shared, not spent on the first passage
+
+
+def test_the_measured_size_of_the_block_in_a_typical_case():
+    """Recorded for the round's cost attribution (U8): a typical turn read three passages of about a page each."""
+    page = lambda n: "\n".join(FILLER[n:n + 30] + [RATE_LINES[n % 4]])  # noqa: E731
+    ws = _file(SOURCE, page(0), page(10), page(20), units=(1,) * 4, declared=(1,))
+    seen, _ = _ask(ws, "השווי למ\"ר הוא 9,500 ₪ [S1].")
+    block = _passages(seen[0])
+    print(f"typical read_passages block: {len(block)} chars of a {len(seen[0])}-char requirements call")
+    assert 1000 < len(block) <= verify.READ_PASSAGES_CHARS
+
+
+def test_professional_passages_are_in_the_block_only_for_a_professional_or_mixed_question():
+    from app.chat import intent as intent_mod
+    from app.platform import source_kinds
+
+    for intent, present in ((intent_mod.PROFESSIONAL, True), (intent_mod.MIXED, True), ("property", False)):
+        ws = _file(SOURCE, "על השמאי לציין את שיעור ההיוון ואת בסיס קביעתו", units=(1, 1), declared=(1,))
+        ws.sources["S2"].source_kind = source_kinds.STANDARD
+        ws.sources["S2"].unit = None
+        ws.intent = intent
+        seen, _ = _ask(ws, "השווי למ\"ר הוא 9,500 ₪ [S1].")
+        assert ('id="S2"' in _passages(seen[0])) is present, intent
+        assert ('source_kind="standard"' in _passages(seen[0])) is present, intent
+
+
+def test_a_judge_reply_with_support_parses_and_an_older_reply_without_it_parses_with_none():
+    quote = RATE_LINES[3]
+    new = verify.JudgeRequirement.model_validate({"id": "N1", "status": "partial", "missing": "שיעורי ההיוון",
+                                                  "support": [{"id": "S2", "quote": quote}]})
+    assert [(s.id, s.quote) for s in new.support] == [("S2", quote)]
+    old = verify.JudgeRequirement.model_validate({"id": "N1", "status": "full"})
+    assert old.support == []
+    assert "support" in verify.JudgeRequirement.model_json_schema()["properties"]
+
+
+def test_support_is_kept_per_vote_only_for_read_sources_and_only_for_an_incomplete_component():
+    ws = _file(SOURCE, RATES, units=(1, 1), declared=(1,))
+    searched = ws.add_source(document_id=ws.sources["S1"].document_id, version_id=ws.sources["S1"].version_id,
+                             title="דוח בדיקה", section="נספח", location="נספח", kind="context", text=RATES)
+    turn = _turn({"id": "1", "text": ASK_RATES}, {"id": "2", "text": "השווי למ\"ר"})
+    support = [{"id": "S2", "quote": RATE_LINES[3]}, {"id": searched.sid, "quote": RATE_LINES[3]},
+               {"id": "S99", "quote": RATE_LINES[3]}]
+
+    def score(frozen, units):
+        return [_req("", "partial", [0], id=frozen[0][0]) | {"support": support},
+                _req("", "full", [0], id=frozen[1][0]) | {"support": support}]
+
+    seen: list[str] = []
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].")
+    r = verify_answer(_judge(score, seen=seen), a, ws, "?", [], requirements=turn)
+    kept = {rid: [(s.id, s.quote) for v in votes for s in v.support] for rid, votes in r.requirement_votes.items()}
+    assert kept == {"N1": [("S2", RATE_LINES[3])], "N2": []}
+
+
+def test_a_requirement_vote_carried_from_the_last_round_keeps_its_support():
+    ws = _file(SOURCE, RATES, units=(1, 1), declared=(1,))
+    turn = _turn({"id": "1", "text": "השווי למ\"ר"})
+    cache = verify.VerdictCache()
+
+    def score(frozen, units):
+        return [_req("", "partial", list(units), id=frozen[0][0]) | {"support": [{"id": "S2", "quote": RATE_LINES[3]}]}]
+
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].")
+    p = _judge(score)
+    verify_answer(p, a, ws, "?", [], requirements=turn, cache=cache)
+    again = verify_answer(p, a, ws, "?", [], requirements=turn, cache=cache)
+    assert again.reused == 1 and [s.id for v in again.requirement_votes["N1"] for s in v.support] == ["S2"]
+
+
+def test_the_policy_says_a_component_is_full_only_when_the_answer_gives_what_the_read_passages_state():
+    policy = verify.JUDGE_REQUIREMENTS_POLICY
+    assert "read_passages" in policy and "support" in policy and "quote" in policy
+    assert "מילה במילה" in policy  # a verbatim sentence or table row

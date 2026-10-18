@@ -141,3 +141,49 @@ def select(claims: list[str], text: str, kind: str = "text", *, narrow: bool = F
             got = {i for _, i in best} | {i for i, s in enumerate(segs) if s.header}
         picked |= got
     return render(segs, picked)
+
+
+def fit_segments(claims: list[str], segs: tuple[Segment, ...], limit: int) -> tuple[str, bool]:
+    """The segments that cover the claims, kept whole while the rendering stays within ``limit`` characters, and whether
+    anything was omitted (round 16 U1). Unlike ``select`` it bounds the size: the segments are taken by how well they
+    cover the claims (every number they state, then the words they share), a table's header lines first (when they take at
+    most a third of the limit), then each kept segment's neighbours. Never a prefix: a claim that nothing covers gets
+    segments spread over the source."""
+    if not segs:
+        return "", False
+    nums: set[str] = set()
+    words: set[str] = set()
+    for c in claims:
+        n, w = claim_terms(c)
+        nums |= n
+        words |= w
+    score = [3 * len(s.numbers & nums) + len(s.tokens & words) for s in segs]
+    order = sorted((i for i, v in enumerate(score) if v), key=lambda i: (-score[i], i))
+    if not order:  # nothing covers the claims: segments spread over the source, not its first lines
+        step = max(1, len(segs) // 8)
+        order = list(range(0, len(segs), step))
+    headers = [i for i, s in enumerate(segs) if s.header]
+    if sum(len(segs[i].text) + 1 for i in headers) > limit // 3:
+        headers = []
+    ranked = [*headers, *order]
+    ranked += [j for i in order for j in (i - 1, i + 1) if 0 <= j < len(segs)]
+    picked: set[int] = set()
+    best = ("", True)
+    for i in ranked:
+        if i in picked:
+            continue
+        trial = render(segs, picked | {i})
+        if len(trial[0]) <= limit:
+            picked.add(i)
+            best = trial
+            if len(trial[0]) >= limit - 30:
+                break
+    return best if picked else ("", True)
+
+
+def fit(claims: list[str], text: str, kind: str = "text", *, limit: int) -> tuple[str, bool]:
+    """The evidence of one long source for the claims within ``limit`` characters (``fit_segments``); the whole text when it
+    is short enough."""
+    if len(text or "") <= limit:
+        return text or "", False
+    return fit_segments(claims, segments_of(text, kind), limit)

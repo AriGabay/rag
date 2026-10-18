@@ -84,3 +84,23 @@ def test_narrow_keeps_only_number_matches_and_headers():
     text = _section(60, late=LATE)
     got, _ = evidence.select([CLAIM], text, narrow=True)
     assert LATE in got and "פסקת סיום 0" not in got
+
+
+# --- round 16 U1: a long passage fitted to a limit, chosen by the claims and never by its prefix ----------------------------
+
+def test_fit_keeps_the_segment_the_claim_needs_within_the_limit_and_not_the_first_lines():
+    from app.chat.evidence import fit
+
+    filler = [f"שורה מספר {n} של תיאור כללי בלי נתון מיוחד" for n in range(80)]
+    text = "\n".join([*filler[:60], "תנאי ההיוון: השיעור 7.25% בכפוף לאישור", *filler[60:]])
+    out, excerpt = fit(["השיעור 7.25%"], text, limit=500)
+    assert excerpt and len(out) <= 500 and "7.25%" in out and filler[0] not in out
+    assert fit(["x"], "קצר", limit=500) == ("קצר", False)
+
+
+def test_fit_with_a_claim_nothing_covers_spreads_over_the_source():
+    from app.chat.evidence import fit
+
+    text = "\n".join(f"שורה מספר {n} של תיאור כללי בלי נתון מיוחד" for n in range(80))
+    out, _ = fit(["מילים אחרות לגמרי"], text, limit=600)
+    assert len(out) <= 600 and "שורה מספר 70 " in out and "שורה מספר 40 " in out
