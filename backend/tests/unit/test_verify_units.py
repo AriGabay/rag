@@ -1586,16 +1586,16 @@ def test_the_judge_policy_names_the_server_held_line_and_the_derived_computation
     assert verify.SERVER_HELD in verify.JUDGE_POLICY and "derived" in verify.JUDGE_POLICY
 
 
-# --- the judge contract is version 11: a verdict of an older contract is not reused (round 13 U9, U11, KTD19; round 15 U7; round 16 U1) --
+# --- the judge contract is version 12: a verdict of an older contract is not reused (round 13 U9, U11, KTD19; round 15 U7; round 16 U1) --
 
-def test_a_verdict_cached_under_judge_contract_10_misses_under_11(monkeypatch):
-    assert verify.JUDGE_VERSION == 11
+def test_a_verdict_cached_under_judge_contract_11_misses_under_12(monkeypatch):
+    assert verify.JUDGE_VERSION == 12
     ws, a, cache = _valued(), _answer("הנכס פנוי [S1]."), verify.VerdictCache()
     judge, seen = _recording_supported()
-    monkeypatch.setattr(verify, "JUDGE_VERSION", 10)
+    monkeypatch.setattr(verify, "JUDGE_VERSION", 11)
     verify_answer(judge, a, ws, "?", [], cache=cache)
     assert verify_answer(judge, a, ws, "?", [], cache=cache).reused == 1
-    monkeypatch.setattr(verify, "JUDGE_VERSION", 11)
+    monkeypatch.setattr(verify, "JUDGE_VERSION", 12)
     assert verify_answer(judge, a, ws, "?", [], cache=cache).reused == 0
     assert verify_answer(judge, a, ws, "?", [], cache=cache).reused == 1
 

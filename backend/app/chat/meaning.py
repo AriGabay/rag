@@ -832,6 +832,7 @@ class Fetcher:
 
         if isinstance(found, Source):
             if not found.sid or self.ws.sources.get(found.sid) is not found:
+                found.server_made = True
                 self.ws.adopt(found)
             return found.sid
         adopted = self.ws.add_measurement(found)

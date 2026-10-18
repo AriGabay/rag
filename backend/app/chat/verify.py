@@ -257,7 +257,7 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # ``removed_before``); rule (31) reads them. 10 (round 15 U7, KTD7): the header of a passage in a unit the answer declared names
 # it by handle and structural title (``_declared_head``). 11 (round 16 U1, KTD1): the requirements call carries the passages the
 # turn read (``<read_passages>``) and the judge may name ``support`` (a read passage and a verbatim quote) for a part the answer omits.
-JUDGE_VERSION = 11
+JUDGE_VERSION = 12
 # the label of the facts the server holds about a cited source's unit and states beside its text (round 13 U9, KTD10, R13): the
 # stated valuation date of the unit that holds the passage, and why the server linked the appraisal to the property. Read
 # from the stored document, not from the passage: the judge takes them as evidence, never as a claim to check
@@ -443,12 +443,15 @@ JUDGE_REQUIREMENTS_POLICY = (
     "מחזיק ערך, נתון או חישוב שלו — unsupported. יחידה מ-<removed_units> שנתנה דרישה — ציין אותה ב-units של "
     "הדרישה כרגיל (השרת יודע שהוסרה). claims: כשרק טענה אחת מתוך יחידה נותנת את הדרישה (ליחידה כמה טענות), ציין ב-claims "
     "את ה-span של הטענה הנותנת אותה, כפי שהוא כתוב ביחידה; אחרת claims ריק והיחידה כולה נותנת אותה. missing: בדרישה עם status partial — החלק שהתשובה אינה נותנת ממנה, כביטוי שמני קצר במילות הבקשה עצמה (למשל «שטחי השירות בתא שטח 1» כשדרישה אחת מכסה כמה פריטים והתשובה נתנה אחד מהם בלבד); בכל status אחר — ריק. לעולם אל תנקוב בחלק שהבקשה לא ביקשה, ואל תמציא מילים שאינן בבקשה.\n"
-    "קטעי קריאה: <read_passages> מכיל קטעים מהשומה שנשאלה, שהתור קרא (S#) ושהתשובה לא ציטטה, או שצוטט מהם רק חלק "
+    "קטעי קריאה: <read_passages> מכיל קטעים מהשומה שנשאלה, שהתור החזיר (S#, מחיפוש או מקריאה) ושהתשובה לא ציטטה, או שצוטט מהם רק חלק "
     "(continues=\"true\" — המשך מקור מצוטט, מה שלא הוצג לך ב-<sources>; excerpt=\"true\" — קטע בלבד, והשמטה אינה ראיה "
     "להיעדר); source_kind מסמן מקור מקצועי (תקן או מסמך מקצועי), שנותן רק דרישה מקצועית (כלל, שיטה או נימוק) ולעולם לא "
     "נתון של הנכס. דרישה היא full רק כשהתשובה נותנת את מה שקטעי הקריאה והמקורות המצוטטים אומרים עליה: פריט ברשימה, תנאי, "
     "הסתייגות, שיטה, נימוק או שורת טבלה שקטע קריאה אומר עליה והתשובה משמיטה — הדרישה partial, ב-missing ציין את החלק "
     "החסר, וב-support ציין היכן הוא כתוב: [{\"id\": \"S#\", \"quote\": \"<משפט או שורת טבלה מתוך הקטע, מילה במילה>\"}]. "
+    "דרישה שמבקשת פריטים מסוג אחד (ערכים, שיעורים, תנאים, נימוקים או חברי רשימה) היא full רק כשהתשובה נותנת כל פריט מאותו "
+    "סוג ש-<read_passages> או המקורות המצוטטים אומרים על הנושא שנשאל; פריט אחד כזה חסר — הדרישה partial, ב-missing ציין "
+    "אותו, וב-support צטט אותו. "
     "פתיחת מקור, או קיומו ב-<read_passages>, אינם נתינת הדרישה: רק יחידה שבקלט נותנת אותה (units). support רק לדרישה "
     "partial או missing, רק עבור S# שמופיע ב-<read_passages> או ב-<sources>, ורק בציטוט שאתה רואה בקטע; כשאין חלק כזה — "
     "support ריק."
@@ -4655,22 +4658,29 @@ def _candidate_block(sid: str, texts: list[str], ws: Workspace, narrow: bool) ->
             f'title="{prompt_attr(head)}">\n{prompt_text(shown)}\n</source>'), shown, excerpt
 
 
+def _sid_no(sid: str) -> int:
+    """The number of an S# (0 for an id that is not one)."""
+    return int(sid[1:]) if sid[1:].isdigit() else 0
+
+
 def read_source_ids(ws: Workspace) -> list[str]:
     """The S# of the sources the turn read, in the order they were made: the sections, tables and pages it opened
     (``Workspace.activity`` openings) that hold text. A source the turn only searched, a listing and a measurement are not
-    read (round 16 U1, KTD1: opening a passage is how a part of the answer's source reaches the judge)."""
+    read; they are the opened sources among ``returned_text_sources`` (round 16 U1, KTD1; the block ranks the opened first)."""
     from app.chat.coverage import _openings
 
     ids = [sid for sid in _openings(ws)
            if sid in ws.sources and ws.sources[sid].kind != "listing" and (ws.sources[sid].text or "").strip()]
-    return sorted(ids, key=lambda sid: int(sid[1:]) if sid[1:].isdigit() else 0)
+    return sorted(ids, key=_sid_no)
 
 
-def _cited_text_sources(ws: Workspace, cited: set[str]) -> set[str]:
-    """Of the ids the answer cites, the sources that hold text (not a listing): the judge saw each as the evidence of a unit, so a
-    requirement may name it as support although the turn did not open it (``read_source_ids``)."""
-    return {sid for sid in cited if sid in ws.sources and ws.sources[sid].kind != "listing"
-            and (ws.sources[sid].text or "").strip()}
+def returned_text_sources(ws: Workspace) -> set[str]:
+    """The S# the turn returned to the agent with text: search hits, readings, tables and outlines — not a listing (it names
+    documents, it is not one), and not a source the server made for its own checks during verification
+    (``Source.server_made``). The requirements judge may be shown such a source and name a quote of it as support although the
+    answer did not cite it and the turn did not open it (round 16 follow-up: most of what the agent saw came from search hits)."""
+    return {sid for sid, src in ws.sources.items() if src.kind != "listing" and not src.server_made
+            and (src.text or "").strip()}
 
 
 def _asked_unit_ids(ws: Workspace, cited: set[str]) -> set[str]:
@@ -4689,52 +4699,85 @@ def _passage_element(sid: str, extra: str, head: str, body: str, excerpt: bool, 
             f'{extra} title="{prompt_attr(head)}">\n{prompt_text(body)}\n</read_passage>')
 
 
+def _relevance(wanted: list[str], segs: tuple[Segment, ...]) -> int:
+    """How much of the asked components a passage covers: its best segment by the scoring ``fit_segments`` uses (every number
+    it shares with the components, then the content words), plus the distinct numbers and words the passage shares with them
+    in all. The first term finds the passage that holds the item, the second the one that is about the subject."""
+    nums: set[str] = set()
+    words: set[str] = set()
+    for c in wanted:
+        n, w = claim_terms(c)
+        nums |= n
+        words |= w
+    best = max((3 * len(g.numbers & nums) + len(g.tokens & words) for g in segs), default=0)
+    seen_nums = set().union(*(g.numbers for g in segs)) & nums if segs else set()
+    seen_words = set().union(*(g.tokens for g in segs)) & words if segs else set()
+    return best + 3 * len(seen_nums) + len(seen_words)
+
+
 def _read_passages(coverage: _Coverage, ws: Workspace, shown: dict[str, tuple[str, bool]]) -> str:
-    """The ``<read_passages>`` block of a requirements call (round 16 U1, KTD1, R1, R3): the text of the sources the turn read in
-    the asked units, cited or not, so the judge scores a component against what the turn read and not only against what the
-    answer wrote. ``shown``: what the call's ``<sources>`` already show of the sources it cites (the text, and whether it is
-    an excerpt). A source shown whole is skipped; one shown as an excerpt adds the segments not shown (``continues``);
-    a professional source only for a professional or mixed question. A long passage is clipped to the components (never to
-    its first characters), and the block holds to ``READ_PASSAGES_CHARS`` with each passage at most ``READ_PASSAGE_CHARS`` of
-    it. Empty when nothing qualifies."""
+    """The ``<read_passages>`` block of a requirements call (round 16 U1, KTD1, R1, R3; follow-up): the text of the sources the
+    turn returned to the agent in the asked units, cited or not and opened or only found by a search, so the judge scores a
+    component against what the turn saw and not only against what the answer wrote. ``shown``: what the call's ``<sources>``
+    already show of the sources it cites (the text, and whether it is an excerpt). A source shown whole is skipped; one shown
+    as an excerpt adds the segments not shown (``continues``); a professional source only for a professional or mixed
+    question; a source of a file with unit marks only in an asked unit; a source only found by a search also only in a
+    document the answer is about (an opened one as before) and only when it shares a number or a content word with the
+    components. The passages are ranked by what they share with the components (``_relevance``; an opened source first among
+    equals) and the block's budget goes down that ranking, each passage getting up to ``READ_PASSAGE_CHARS`` of the room
+    left, a long one clipped to the components (never to its first characters). A text returned twice is one passage. Empty
+    when nothing qualifies."""
     from app.chat import intent as intent_mod
 
     asked = _asked_unit_ids(ws, coverage.answer_ids | set(shown))
+    documents = _documents_of(ws, coverage.answer_ids | set(shown))
     professional = getattr(ws, "intent", None) in (intent_mod.PROFESSIONAL, intent_mod.MIXED)
+    wanted = coverage.component_texts()
     whole = {ws.sources[i].text for i, (_, excerpt) in shown.items() if not excerpt and i in ws.sources}
-    # (id, extra attributes, head, text, continues): ``text`` is the source's whole text (str) for a source the call does not
-    # cite, and the segments of it the call's excerpt does not show (tuple of ``Segment``, ``continues``) for one it cites
-    entries: list[tuple[str, str, str, tuple[Segment, ...] | str, bool]] = []
+    returned = returned_text_sources(ws)
+    opened = set(read_source_ids(ws)) & returned
+    # the opened sources first, so that of two sources with one text the opened one is the passage
+    order = [*sorted(opened, key=_sid_no), *sorted(returned - opened, key=_sid_no)]
+    # (rank, id, extra attributes, head, text, continues): ``text`` is the source's whole text (str) for a source the call does
+    # not cite, and the segments of it the call's excerpt does not show (tuple of ``Segment``) for one it cites
+    entries: list[tuple[tuple[int, int, int], str, str, str, tuple[Segment, ...] | str, bool]] = []
     seen: set[tuple[str, str]] = set()
-    for sid in read_source_ids(ws):
+    for sid in order:
         src = ws.sources[sid]
         if src.source_kind != source_kinds.APPRAISAL and not professional:
             continue
         if src.unit is not None and src.unit.get("id") not in asked:
             continue
+        if sid not in opened and sid not in shown and str(src.document_id) not in documents:
+            continue
         if src.text in whole or (str(src.version_id), src.text) in seen:
             continue
-        seen.add((str(src.version_id), src.text))
         parts = _source_parts(ws, sid)
         if parts is None:
             continue
         head, body, kind = parts
         extra = "" if src.source_kind == source_kinds.APPRAISAL else f' source_kind="{prompt_attr(src.source_kind)}"'
+        segs = segments_of(body, kind)
         if sid in shown:  # cited: the segments the judge was not shown, when it saw an excerpt
             lines = set(shown[sid][0].split("\n"))
-            rest = tuple(Segment(g.text) for g in segments_of(body, kind) if g.text not in lines)
-            if rest:
-                entries.append((sid, extra, head, rest, True))
+            rest = tuple(Segment(g.text) for g in segs if g.text not in lines)
+            if not rest:
+                continue
+            text, continues = rest, True
         else:
-            entries.append((sid, extra, head, body, False))
+            text, continues = body, False
+        score = _relevance(wanted, segs)
+        if score == 0 and sid not in opened:
+            continue  # a passage only found by a search that shares nothing with the components is noise
+        seen.add((str(src.version_id), src.text))
+        entries.append(((-score, 0 if sid in opened else 1, _sid_no(sid)), sid, extra, head, text, continues))
     if not entries:
         return ""
-    wanted = coverage.component_texts()
+    entries.sort(key=lambda e: e[0])
     remaining = READ_PASSAGES_CHARS - len("<read_passages>\n\n</read_passages>")
     out: list[str] = []
-    for n, (sid, extra, head, text, continues) in enumerate(entries):
-        room = (min(READ_PASSAGE_CHARS, remaining // (len(entries) - n))
-                - len(_passage_element(sid, extra, head, "", False, continues)) - 1)
+    for _, sid, extra, head, text, continues in entries:
+        room = (min(READ_PASSAGE_CHARS, remaining) - len(_passage_element(sid, extra, head, "", False, continues)) - 1)
         if room < READ_PASSAGE_FLOOR:
             continue
         if isinstance(text, tuple):
@@ -5030,8 +5073,8 @@ def _judge_batch(provider: LLMProvider, batch: _Batch, ws: Workspace, usage: lis
     ``VerificationUnavailable`` when the judge cannot answer. ``label``: the calls' usage purpose (``judge``);
     ``policy``: more rules for these calls."""
     if coverage is not None:
-        # the sources a requirement may name as support (round 16 U1): those the turn read and those the answer cites
-        coverage.readable = set(read_source_ids(ws)) | _cited_text_sources(ws, coverage.answer_ids)
+        # the sources a requirement may name as support (round 16 U1; follow-up): any source returned to the agent with text
+        coverage.readable = returned_text_sources(ws)
     rendered = _render_batch(batch, ws, coverage)
     got, status, scores = judge(provider, batch, rendered, usage, deadline, coverage, label=label, policy=policy)
     if status == "incomplete" and len(batch.units) > 1:
@@ -5402,7 +5445,7 @@ def _expand_qualifiers(report: VerifyReport, units: list[Unit], meanings: dict, 
             continue
         u.ids.remove(TRIAL_ID)
         meanings[u.index] = before
-        new = ws.adopt(dataclasses.replace(trial, sid=""))
+        new = ws.adopt(dataclasses.replace(trial, sid="", server_made=True))
         again = attempt(new)
         if again is None:  # the registered source does not read as the trial did: nothing is kept of it
             ws.sources.pop(new.sid, None)
@@ -6416,9 +6459,14 @@ def _answer_documents(ws: Workspace, units: list[Unit]) -> set[str]:
     """The documents the answer is about: those of the sources, values, measurements and calculations its surviving units
     cite, of the units it declared and of the unit the turn located. A passage of another document (another property's
     appraisal, a comparable's) is of none of them (round 16 U2, KTD2)."""
+    return _documents_of(ws, {i for u in units for i in u.ids})
+
+
+def _documents_of(ws: Workspace, ids: set[str]) -> set[str]:
+    """The documents of the cited ``ids`` (``_answer_documents``) and of the units the answer declared and the turn located."""
     from app.chat.coverage import cited_documents
 
-    docs = set(cited_documents(ws, "".join(f"[{i}]" for u in units for i in u.ids)))
+    docs = set(cited_documents(ws, "".join(f"[{i}]" for i in ids)))
     located = getattr(ws, "located_unit", None) or {}
     focus = getattr(ws, "unit_focus", None) or {}
     anchors = [*(getattr(ws, "declared_units", None) or []), located.get("anchor") or {}, focus,
@@ -6455,7 +6503,7 @@ def _in_answer(quote: str, units: list[Unit], component: str = "") -> bool:
 def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> dict[str, list[dict]]:
     """The judge's ``support`` (round 16 U1) that the server accepts as evidence of a part the answer omits (KTD2), by
     component id, merged across the judge calls: for a ``partial`` or ``missing`` vote, an entry [{"id", "quote"}] is kept
-    only when its S# is a source the turn read or one the answer cites (the judge saw it as the unit's evidence), the quote
+    only when its S# is a source returned to the agent with text (``returned_text_sources``: a search hit, a reading, a table; not a listing), the quote
     is at most ``SUPPORT_QUOTE_MAX`` characters and a verbatim substring of its text after normalisation, the
     block holding it lies in an asked unit (declared, located or cited) and not across a probable edge, the source's
     document is one the answer is about, and the quoted part is absent from the answer (no single surviving unit holds its
@@ -6467,7 +6515,7 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
         return {}
     units = [u for u in report.units if u.index not in failed]
     cited = {i for u in units for i in u.ids}
-    readable = set(read_source_ids(ws)) | _cited_text_sources(ws, cited)
+    readable = returned_text_sources(ws)
     asked = _asked_unit_ids(ws, cited)
     documents = _answer_documents(ws, units)
     components = {r["id"]: r["text"] for r in report.requirements}

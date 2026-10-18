@@ -356,5 +356,6 @@ class ContextReader:
         if found is None:
             return None
         if key not in self.adopted:
+            found.server_made = True
             self.adopted[key] = self.ws.adopt(found).sid
         return self.adopted[key]

@@ -391,6 +391,9 @@ class Source:
     # 8401/40 משותפת" — shown in the header beside the date line and to the judge as part of the source's evidence, so the
     # appraisal at another house number is not disowned as another property's. None for the focus and outside a time search
     link: str | None = None
+    # a source the server made for its own checks during verification (a re-read's context, an expansion, a trial): the agent was
+    # never shown it, so it is no read passage and no support for the requirements judge (round 16 follow-up)
+    server_made: bool = False
 
     @property
     def is_listing(self) -> bool:

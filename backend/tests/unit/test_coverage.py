@@ -1507,12 +1507,118 @@ def test_a_passage_of_the_unit_the_turn_located_or_the_answer_cites_is_asked_too
     assert 'id="S2"' not in _passages(seen[0])
 
 
-def test_a_source_the_turn_only_searched_is_not_a_read_passage():
+def _searched(ws: Workspace, *sids: str) -> None:
+    """These sources were only returned by a search (hits): the turn never opened them."""
+    for a in ws.activity.values():
+        a["openings"] = [o for o in a["openings"] if o["sid"] not in sids]
+
+
+def test_an_uncited_search_hit_in_the_asked_unit_is_in_the_block_and_its_quote_validates():
+    """Round 16 follow-up: most of what the agent saw came from search hits; one that holds the omitted item reaches the judge."""
     ws = _file(SOURCE, RATES, units=(1, 1), declared=(1,))
-    ws.activity[str(ws.sources["S1"].document_id)]["openings"] = [
-        o for o in ws.activity[str(ws.sources["S1"].document_id)]["openings"] if o["sid"] != "S2"]
+    _searched(ws, "S2")
+    assert "S2" not in verify.read_source_ids(ws)
+    seen, _ = _ask(ws, "השווי למ\"ר הוא 9,500 ₪ [S1].")
+    assert 'id="S2"' in _passages(seen[0]) and RATE_LINES[3] in _passages(seen[0])
+    r, _, _ = _support(ws, THREE_RATES, MISSING_RATE)
+    assert len(_completions(r)) == 1 and r.text_support == {"N1": [{"id": "S2", "quote": MISSING_RATE}]}
+
+
+def test_a_search_hit_of_another_unit_or_another_document_is_not_in_the_block_and_its_quote_is_rejected():
+    other = "שיעורי היוון של שומה אחרת בקובץ: מחסנים: 5.5%"
+    ws = _file(SOURCE, RATES, other, units=(1, 1, 2), declared=(1,))
+    stranger = ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="שומה של נכס להשוואה",
+                             section="סיכום", location="סעיף \"סיכום\"", kind="context",
+                             text="שיעורי היוון:\nמחסנים: 9.7%\nמשרדים: 6.5%")
+    _searched(ws, "S2", "S3")
+    seen, _ = _ask(ws, "השווי למ\"ר הוא 9,500 ₪ [S1].")
+    block = _passages(seen[0])
+    assert 'id="S2"' in block and 'id="S3"' not in block and f'id="{stranger.sid}"' not in block
+    assert "5.5%" not in block and "9.7%" not in block
+    for sid, quote in (("S3", "מחסנים: 5.5%"), (stranger.sid, "מחסנים: 9.7%")):
+        r, _, _ = _support(ws, THREE_RATES, [{"id": sid, "quote": quote}])
+        assert _completions(r) == [] and r.text_support == {}, sid
+
+
+def test_a_listing_source_is_never_a_read_passage_or_support():
+    ws = _file(SOURCE, RATES, units=(1, 1), declared=(1,))
+    listing = ws.add_source(document_id=None, version_id=None, title="רשימת מסמכים", section=None, location="רשימת מסמכים",
+                            kind="listing", text="שיעורי היוון למחסנים 9.1%\nשיעור היוון למשרדים 6.5%")
+    assert listing.sid not in verify.returned_text_sources(ws)
+    seen, _ = _ask(ws, "השווי למ\"ר הוא 9,500 ₪ [S1].")
+    assert f'id="{listing.sid}"' not in _passages(seen[0])
+    r, _, _ = _support(ws, THREE_RATES, [{"id": listing.sid, "quote": "שיעורי היוון למחסנים 9.1%"}])
+    assert _completions(r) == []
+
+
+def test_a_source_the_server_made_for_its_own_checks_is_not_a_read_passage_or_support():
+    ws = _file(SOURCE, RATES, units=(1, 1), declared=(1,))
+    ws.sources["S2"].server_made = True  # adopted during verification: the agent never saw it
+    assert "S2" not in verify.returned_text_sources(ws)
     seen, _ = _ask(ws, "השווי למ\"ר הוא 9,500 ₪ [S1].")
     assert 'id="S2"' not in _passages(seen[0])
+    r, _, _ = _support(ws, THREE_RATES, MISSING_RATE)
+    assert _completions(r) == []
+
+
+def test_a_search_hit_with_nothing_in_common_with_the_components_is_not_in_the_block():
+    ws = _file(SOURCE, "מידע כללי על הסביבה ועל התחבורה הציבורית", units=(1, 1), declared=(1,))
+    _searched(ws, "S2")
+    seen, _ = _ask(ws, "השווי למ\"ר הוא 9,500 ₪ [S1].")
+    assert 'id="S2"' not in _passages(seen[0])
+
+
+def test_the_same_text_returned_twice_is_one_read_passage():
+    ws = _file(SOURCE, RATES, RATES, units=(1, 1, 1), declared=(1,))
+    _searched(ws, "S3")
+    seen, _ = _ask(ws, "השווי למ\"ר הוא 9,500 ₪ [S1].")
+    block = _passages(seen[0])
+    assert block.count("<read_passage ") == 1 and block.count(RATE_LINES[3]) == 1
+    assert 'id="S2"' in block  # the opened one is kept
+
+
+def _long(topic: str, n: int, salt: int) -> str:
+    """A passage of about 2,600 characters: ``n`` lines of filler and a line about ``topic``."""
+    return "\n".join([*FILLER[salt:salt + n], topic])
+
+
+def test_candidates_are_ranked_by_what_they_share_with_the_component_and_the_best_gets_the_budget():
+    """Many passages compete: the one that shares the component's terms is first and is not squeezed to an equal share."""
+    noise = [_long("הערת שוליים כללית " + str(n), 40, n) for n in range(10)]
+    relevant = "\n".join([*FILLER[60:75], *RATE_LINES, *FILLER[75:85]])
+    ws = _file(SOURCE, *noise, relevant, units=(1,) * 12, declared=(1,))  # the relevant one is the last (S12)
+    _searched(ws, *[f"S{n}" for n in range(2, 13)])
+    seen, _ = _ask(ws, "השווי למ\"ר הוא 9,500 ₪ [S1].")
+    block = _passages(seen[0])
+    assert len(block) <= verify.READ_PASSAGES_CHARS
+    assert block.index('id="S12"') < min((block.index(f'id="S{n}"') for n in range(2, 12) if f'id="S{n}"' in block),
+                                         default=len(block))
+    part = re.search(r'<read_passage id="S12".*?</read_passage>', block, re.S).group()
+    assert all(line in part for line in RATE_LINES)  # all four rates, whole
+
+
+def test_an_opened_passage_breaks_a_tie_and_ranking_does_not_depend_on_the_order_of_reading():
+    twin = "שיעורי היוון:\nמחסנים: 9.1%"
+    ws = _file(SOURCE, twin + " ", twin + "  ", units=(1, 1, 1), declared=(1,))  # not duplicates, the same terms
+    _searched(ws, "S2")  # S3 is opened, S2 only searched
+    seen, _ = _ask(ws, "השווי למ\"ר הוא 9,500 ₪ [S1].")
+    block = _passages(seen[0])
+    assert block.index('id="S3"') < block.index('id="S2"')
+
+
+def test_the_block_of_twelve_candidate_passages_is_bounded_and_its_size_is_measured(capsys):
+    """Recorded for the follow-up's cost attribution: twelve search hits of about a page, each stating a rate, compete for the
+    budget; each is clipped to what it states about the components and the block stays within the cap."""
+    texts = [SOURCE] + [f"קטע {n}: " + "\n".join(FILLER[n:n + 38]) + f"\n{RATE_LINES[n % 3]}" for n in range(12)]
+    ws = _file(*texts, units=(1,) * len(texts), declared=(1,))
+    _searched(ws, *[f"S{n}" for n in range(2, 14)])
+    seen, _ = _ask(ws, "השווי למ\"ר הוא 9,500 ₪ [S1].")
+    block = _passages(seen[0])
+    print(f"12 candidate passages: read_passages block {block.count('<read_passage ')} passages, {len(block)} chars "
+          f"of a {len(seen[0])}-char requirements call")
+    assert 0 < len(block) <= verify.READ_PASSAGES_CHARS
+    assert block.count("<read_passage ") == 12  # each clipped to the lines about the component, so all twelve fit
+    assert all(rate in block for rate in RATE_LINES[:3]) and FILLER[3] not in block
 
 
 def test_a_cited_passage_the_judge_sees_whole_is_not_repeated_in_the_block():
@@ -1586,7 +1692,7 @@ def test_a_judge_reply_with_support_parses_and_an_older_reply_without_it_parses_
     assert "support" in verify.JudgeRequirement.model_json_schema()["properties"]
 
 
-def test_support_is_kept_per_vote_only_for_read_sources_and_only_for_an_incomplete_component():
+def test_support_is_kept_per_vote_for_any_returned_source_and_only_for_an_incomplete_component():
     ws = _file(SOURCE, RATES, units=(1, 1), declared=(1,))
     searched = ws.add_source(document_id=ws.sources["S1"].document_id, version_id=ws.sources["S1"].version_id,
                              title="דוח בדיקה", section="נספח", location="נספח", kind="context", text=RATES)
@@ -1602,7 +1708,8 @@ def test_support_is_kept_per_vote_only_for_read_sources_and_only_for_an_incomple
     a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].")
     r = verify_answer(_judge(score, seen=seen), a, ws, "?", [], requirements=turn)
     kept = {rid: [(s.id, s.quote) for v in votes for s in v.support] for rid, votes in r.requirement_votes.items()}
-    assert kept == {"N1": [("S2", RATE_LINES[3])], "N2": []}
+    # the source only searched (returned to the agent, same document) is valid too; S99 was never returned
+    assert kept == {"N1": [("S2", RATE_LINES[3]), (searched.sid, RATE_LINES[3])], "N2": []}
 
 
 def test_a_requirement_vote_carried_from_the_last_round_keeps_its_support():
@@ -1624,6 +1731,12 @@ def test_the_policy_says_a_component_is_full_only_when_the_answer_gives_what_the
     policy = verify.JUDGE_REQUIREMENTS_POLICY
     assert "read_passages" in policy and "support" in policy and "quote" in policy
     assert "מילה במילה" in policy  # a verbatim sentence or table row
+
+
+def test_the_policy_says_a_component_asking_for_items_of_a_kind_is_full_only_with_every_item_the_passages_state():
+    policy = verify.JUDGE_REQUIREMENTS_POLICY
+    assert "כל פריט מאותו סוג" in policy and "ערכים, שיעורים, תנאים, נימוקים או חברי רשימה" in policy
+    assert "פריט אחד כזה חסר" in policy
 
 
 # --- round 16 U2: support is validated by the server (KTD2), completes the answer from the read text (KTD3), and its gap ----------
@@ -1931,8 +2044,8 @@ def test_a_quote_of_a_cited_source_the_turn_never_opened_is_validated():
     assert "S2" not in verify.read_source_ids(ws)
     r, _, _ = _support(ws, THREE_RATES, MISSING_RATE)  # S2 is cited by the answer
     assert len(_completions(r)) == 1 and r.text_support == {"N1": [{"id": "S2", "quote": MISSING_RATE}]}
-    r, _, _ = _support(ws, "שיעור היוון למשרדים 6.5% [S1].", MISSING_RATE)  # not cited, not read: still no support
-    assert _completions(r) == [] and r.text_support == {}
+    r, _, _ = _support(ws, "שיעור היוון למשרדים 6.5% [S1].", MISSING_RATE)  # not cited, not read, but returned: support too
+    assert len(_completions(r)) == 1
 
 
 def test_a_text_completion_of_a_calculation_component_keeps_the_repair_rounds_tools():
