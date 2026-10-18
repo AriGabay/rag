@@ -110,7 +110,11 @@ A part of a stored document that the system treats as one appraisal or one inter
 
 Boundaries carry a certainty (certain, probable, or unsplit). When a boundary is uncertain, the reader may read past it, and nothing is invented to fill a missing name or boundary. The chat first locates a unit and then searches and reads inside it; passages and cited sources carry the unit they belong to. When several units fit a name, they reach the model as candidate units with the details that tell them apart; one is never picked by how many passages it has, and when the ambiguity is material the user is asked, with those details. A follow-up that changes only the metric keeps the same unit.
 
-A report's own subject line, or the letter opening that introduces it, starts a unit; a cover letter and the report it introduces stay one unit. A new derivation of the units is stored beside the previous one: the old rows are kept and are read only to resolve a unit anchor stored before the change, never by unit number alone.
+A report's own subject line, or the letter opening that introduces it, starts a unit; a cover letter and the report it introduces stay one unit. So does a change of the running header or footer that repeats across a report's pages, when another sign agrees (the other edge changes too, a cover page precedes it, or the page numbering restarts); the unit then starts at that cover page. Pages that still name the previous report and state no new address stay with it, so a report's appendices are never cut away by a page-number restart alone. A unit may also be named by the constant part of its own running header and by its cover title, never by an office or contact line. A new derivation of the units is stored beside the previous one: the old rows are kept and are read only to resolve a unit anchor stored before the change, never by unit number alone.
+
+### Read and not used
+
+A part of the request that a passage the turn read states, with the exact quote checked against that passage, but that the answer left out. It is completed from that passage in the repair round, without a new search; if it still is not given, the answer says where it was read and that it was not used — never that it was not found. Opening a source is not enough: only a verified quote inside the asked appraisal counts.
 
 ### Identity card
 
