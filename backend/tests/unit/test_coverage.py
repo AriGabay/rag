@@ -1747,15 +1747,16 @@ MISSING_RATE = RATE_LINES[3]  # "מחסנים: 9.1%": the fourth rate of the pas
 
 
 def _support(ws: Workspace, markdown: str, support: list[dict] | str, status: str = "partial", ask: str = ASK_RATES,
-             cache: verify.VerdictCache | None = None):
+             cache: verify.VerdictCache | None = None, related: tuple[str, ...] = ()):
     """The answer verified with a scripted judge that scores the one component ``status`` with ``support`` (a list of
-    {id, quote}, or the quote of S2 alone): (the report, the turn's requirements, the answer)."""
+    {id, quote}, or the quote of S2 alone) and the registered data ``related``: (the report, the turn's requirements, the
+    answer)."""
     if isinstance(support, str):
         support = [{"id": "S2", "quote": support}]
     turn = _turn({"id": "1", "text": ask})
 
     def score(frozen, units):
-        return [_req("", status, list(units) if status == "partial" else [], id=frozen[0][0])
+        return [_req("", status, list(units) if status == "partial" else [], related, id=frozen[0][0])
                 | {"missing": "שיעורי ההיוון" if status == "partial" else "", "support": support}]
 
     answer = _answer(markdown)
@@ -1787,6 +1788,26 @@ def test_ae1_a_partial_component_with_a_quote_in_a_read_passage_raises_one_text_
 def test_related_evidence_has_a_text_bucket_beside_data_failures_and_checks():
     ev = coverage.related_evidence(_ws(), {"related": []}, None)
     assert set(ev) == {"data", "failures", "checks", "text", "documents"} and ev["text"] == []
+
+
+def test_a_partial_component_with_related_data_and_a_valid_quote_names_both_in_one_problem_that_keeps_the_tools():
+    ws = _rates_file()
+    vid = _value(ws, "6.5", "שיעור היוון למשרדים")
+    r, _, _ = _support(ws, THREE_RATES, MISSING_RATE, related=(vid,))
+    (p,) = [p for p in r.problems if p.kind == "requirement" and p.component == "N1"]
+    assert p.check is None and p.severity == "error" and p.repairable  # the data's check: the tools stay on
+    assert vid in p.reason and "S2" in p.reason and MISSING_RATE in p.reason and "שיעורי ההיוון" in p.reason
+    assert p.reason.startswith(verify.REQ_DATA_FOUND.format(text=ASK_RATES, ids=vid))  # the data sentence, unchanged
+    assert _completions(r) == [] and r.text_completion_only() is False
+    assert r.text_support == {"N1": [{"id": "S2", "quote": MISSING_RATE}]}
+
+
+def test_a_component_with_related_data_alone_keeps_only_the_data_sentence():
+    ws = _rates_file()
+    vid = _value(ws, "6.5", "שיעור היוון למשרדים")
+    r, _, _ = _support(ws, THREE_RATES, [], related=(vid,))
+    (p,) = [p for p in r.problems if p.kind == "requirement" and p.component == "N1"]
+    assert p.reason == verify.REQ_DATA_FOUND.format(text=ASK_RATES, ids=vid) and p.check is None
 
 
 def test_a_missing_component_with_a_valid_quote_raises_the_completion_too():
@@ -1996,6 +2017,15 @@ def test_a_text_completion_alone_is_text_only_and_mixed_or_data_problems_are_not
     assert r.text_completion_only() is False
     clean = verify.VerifyReport(units=[])
     assert clean.text_completion_only() is False  # no problem: nothing to repair
+
+
+def test_a_failed_completion_of_a_component_with_data_and_a_read_part_leaves_the_read_not_used_gap():
+    ws = _rates_file()
+    vid = _value(ws, "6.5", "שיעור היוון למשרדים")
+    r, turn, answer = _support(ws, THREE_RATES, MISSING_RATE, related=(vid,))
+    _, outcomes = _finish(ws, answer, r, turn)
+    (o,) = outcomes
+    assert o["limitation"] == "not_verifiable" and o["variant"] == "read_not_used" and o["stated"] is True
 
 
 def test_a_failed_completion_leaves_a_gap_line_saying_where_the_part_was_read_and_not_used():

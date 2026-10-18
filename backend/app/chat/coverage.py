@@ -699,10 +699,10 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
         return out | {"reason": "sources_conflict"}
     if o.get("evidence_state") == "undeterminable":
         return out | {"reason": "not_verifiable", "variant": "undeterminable"}
+    if ev["text"]:  # a passage the turn read states the part and the answer does not give it (round 16 U2, R6): never "not found"
+        return out | _read_not_used(ws, ev["text"][0]["id"])  # also when related data was found: it is the omitted part's place
     if ev["data"]:
         return out | {"reason": "not_verifiable", "variant": "not_presented"}
-    if ev["text"]:  # a passage the turn read states the part and the answer does not give it (round 16 U2, R6): never "not found"
-        return out | _read_not_used(ws, ev["text"][0]["id"])
     # a professional question whose pool was empty: the repository holds no standard or professional document (U8, KTD15,
     # R29). It says what the repository lacks — never that a search found nothing in a standard
     if ws.intent == PROFESSIONAL and ws.standards_absent:

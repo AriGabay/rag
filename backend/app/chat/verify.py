@@ -6750,7 +6750,9 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
     - a component not given whose omitted part a passage the turn read states — the judge's support, validated
       (``validated_support``, round 16 U2, KTD2) — is a ``REQ_TEXT_FOUND`` problem (``check="text_found"``): the repair round
       adds the part from that passage and, when every problem of the round is one, runs with tools off (KTD3). The data
-      of a component comes first; a unit saying the part was not found is replaced as an absence for either."""
+      of a component comes first, and the validated passage is named beside it (the data sentence, then the
+      ``REQ_TEXT_FOUND`` sentence, with no ``check`` so the repair round keeps its tools); a unit saying the part was not
+      found is replaced as an absence for either."""
     from app.chat.coverage import related_evidence
 
     units = {u.index: u for u in report.units}
@@ -6790,11 +6792,14 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
             continue  # an assumption or a clarification is never searched for (R4)
         ev = related_evidence(ws, o, turn)
         check = None
+        found = REQ_TEXT_FOUND.format(text=o.get("missing_part") or o["text"], where="; ".join(
+            f"{x['id']} «{prompt_text(x['quote'])}»" for x in ev["text"])) if ev["text"] else ""
         if ev["data"]:
             reason = REQ_DATA_FOUND.format(text=o["text"], ids=", ".join(ev["data"]))
-        elif ev["text"]:
-            reason = REQ_TEXT_FOUND.format(text=o.get("missing_part") or o["text"], where="; ".join(
-                f"{x['id']} «{prompt_text(x['quote'])}»" for x in ev["text"]))
+            if found:  # the validated passage is named beside the data; no check, so the repair round keeps its tools
+                reason += ". " + found
+        elif found:
+            reason = found
             check = TEXT_FOUND_CHECK
         elif o["status"] == "not_answered" and not ev["checks"] and not ev["failures"]:
             reason = REQ_NOT_SEARCHED.format(text=o["text"])
