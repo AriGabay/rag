@@ -56,6 +56,7 @@ class Doc:
         self.blocks: list = []
         self.pages: list = []
         self.chapter = 0
+        self.tables = 0
 
     def add(self, kind, page_no, text, top, **kw):
         self.blocks.append(B(len(self.blocks), kind, page_no, text, top, **kw))
@@ -99,6 +100,34 @@ class Doc:
                          table_index=0)
         self.blocks[table].page_end = first_page + 1  # the table runs on to the next page
         self.page(first_page + 1, label + 1)
+
+    def opening(self, page_no: int, subject: str | None, letter: bool = True, in_table: bool = False) -> int:
+        """The run a report opens its first page with (round 15 U4, KTD4): letterhead, a date line, an addressee
+        ("לכבוד") block, then the subject line (``הנדון``) as a paragraph or as a row of a table block. Returns the
+        index of the block that holds the subject line (None without one)."""
+        top = 24.0
+        self.add("paragraph", page_no, "שמאות דמו בע״מ — מכתב סינתטי", top, h=10.0)
+        if letter:
+            self.add("paragraph", page_no, "12/03/2025", top + 18, h=10.0)
+            self.add("paragraph", page_no, "לכבוד\nמר דוד דמו\nרחוב הדמיון 3, כפר הדמה", top + 36, h=40.0)
+        if subject is None:
+            return -1
+        if in_table:
+            self.tables += 1
+            return self.add("table", page_no, f"הנדון | {subject}", top + 90, h=30.0, table_index=self.tables)
+        return self.add("paragraph", page_no, f"הנדון: {subject}", top + 90, h=12.0)
+
+    def report(self, first_page: int, pages: int, subject: str | None, letter: bool = True, in_table: bool = False,
+               ) -> int:
+        """A report of ``pages`` pages with no printed numbers (so no label signal), its first page opened by
+        ``opening``."""
+        found = -1
+        for n in range(pages):
+            self.page(first_page + n, None)
+            if n == 0:
+                found = self.opening(first_page, subject, letter, in_table)
+            self.chapters(first_page + n, [CHAPTERS[n % 6]], top=150.0 if n == 0 else 54.0)
+        return found
 
     def derive(self):
         return units.derive(self.blocks, self.pages, "v")
@@ -527,7 +556,7 @@ def no_ocr(monkeypatch):
 
 # files that hold several appraisals; every other fixture is one appraisal (or part of one) and must stay one unit
 MULTI = {"R7b_synthetic_two_appraisals_one_file.pdf": 2, "R9a_synthetic_compendium_three_appraisals.pdf": 4,
-         "R9b_synthetic_two_similar_names.pdf": 2}
+         "R9b_synthetic_two_similar_names.pdf": 2, "R15a_synthetic_compendium_letter_openings.pdf": 3}
 SKIPPED = {"R9d_synthetic_long_file_1000_pages.pdf"}  # a thousand pages: its first 50 are read below
 
 
@@ -614,3 +643,177 @@ def test_a_picture_letterhead_opening_every_unit_is_no_title_and_does_not_stop_t
     found = d.derive()
     assert found
     assert all("שמאות דמו" not in (u.title or "") for u in found)
+
+
+# --- round 15 U4 (KTD4, R6): the subject line and the letter opening of a report ---------------------------------------
+
+
+def test_the_derivation_is_units_v5_and_a_v5_unit_id_carries_its_tag():
+    from app.chat import contexts, coverage
+
+    assert units.UNITS_VERSION == "units-v5" and units.current_tag() == "v5"
+    data = {"version_id": "ver", "reading_id": "rd", "unit_no": 3, "units_tag": units.current_tag()}
+    assert coverage._unit_key(data) == contexts.unit_key("ver", "rd", 3, "v5") == "ver#rd#3@v5"
+    assert coverage._unit_key({"version_id": "ver", "reading_id": None, "unit_no": 3}) == "ver#3"  # a units-v4 id
+
+
+def test_a_subject_line_inside_a_table_block_at_the_top_of_a_page_starts_a_unit():
+    d = Doc()
+    d.report(1, 4, "שומת מקרקעין — פרויקט שדרות האלון", letter=False)
+    table = d.report(5, 4, "שומת מקרקעין — מתחם גבעת הרקפות", letter=False, in_table=True)
+    d.report(9, 4, "שומת מקרקעין — פרויקט נחל הדס", letter=False, in_table=True)
+    first, second, third = d.derive()
+    assert (first.page_first, first.page_last, second.page_first, second.page_last) == (1, 4, 5, 8)
+    assert (third.page_first, third.page_last) == (9, 12)
+    # a subject line alone is one strong signal: the cut is marked probable, and the signal is recorded by name
+    assert second.certainty == third.certainty == PROBABLE
+    assert second.evidence["boundary"]["signals"] == [units.SUBJECT_LINE]
+    assert second.evidence["boundary"]["detail"][units.SUBJECT_LINE] == {
+        "rule": "page_top_run", "block": table, "in_table": True}
+    assert second.block_first == next(i for i, b in enumerate(d.blocks) if b.page == 5)
+
+
+def test_a_subject_line_with_a_letter_opening_in_the_same_run_is_two_signals_and_the_cut_is_certain():
+    d = Doc()
+    d.report(1, 4, "שומת מקרקעין — פרויקט שדרות האלון")
+    d.report(5, 4, "שומת מקרקעין — מתחם גבעת הרקפות")
+    d.report(9, 4, "שומת מקרקעין — פרויקט נחל הדס", in_table=True)  # the subject in a table block, the letter around it
+    first, second, third = d.derive()
+    assert [u.page_first for u in (first, second, third)] == [1, 5, 9]
+    assert second.certainty == third.certainty == CERTAIN
+    assert second.evidence["boundary"]["signals"] == [units.SUBJECT_LINE, units.LETTER_OPENING]
+    assert third.evidence["boundary"]["signals"] == [units.SUBJECT_LINE, units.LETTER_OPENING]
+    assert second.evidence["boundary"]["detail"][units.LETTER_OPENING]["rule"] == "page_top_run"
+
+
+def test_a_letter_opening_alone_and_a_subject_line_alone_are_each_one_probable_signal():
+    d = Doc()
+    d.report(1, 4, "שומת מקרקעין — פרויקט שדרות האלון")
+    d.report(5, 4, None)  # a date and an addressee, no subject line
+    d.report(9, 4, "שומת מקרקעין — פרויקט נחל הדס", letter=False)  # a subject line, no letter
+    _, letter_only, subject_only = d.derive()
+    assert (letter_only.certainty, letter_only.evidence["boundary"]["signals"]) == (PROBABLE, [units.LETTER_OPENING])
+    assert (subject_only.certainty, subject_only.evidence["boundary"]["signals"]) == (PROBABLE, [units.SUBJECT_LINE])
+
+
+def test_a_label_restart_at_the_same_page_adds_to_the_subject_line():
+    d = Doc()
+    d.report(1, 4, "שומת מקרקעין — פרויקט שדרות האלון", letter=False)
+    d.report(5, 4, "שומת מקרקעין — מתחם גבעת הרקפות", letter=False)
+    for n, label in zip(range(1, 9), (1, 2, 3, 4, 1, 2, 3, 4), strict=True):
+        d.pages[n - 1] = page(n, label)
+    _, second = d.derive()
+    assert second.evidence["boundary"]["signals"] == [units.LABEL_RESTART, units.SUBJECT_LINE]
+    assert second.certainty == CERTAIN
+
+
+def test_a_second_opening_run_within_three_pages_of_the_previous_cut_does_not_cut_again():
+    # a cover letter with a subject line, then (two pages later) the report's own, different subject line: one unit
+    d = Doc()
+    d.page(1, None)
+    d.opening(1, "מכתב מלווה בעניין הערכת הנכס שברחוב הדמיון")
+    d.page(2, None)
+    d.add("paragraph", 2, "בכבוד רב, שמאי דמו", 60.0)
+    d.report(3, 5, "שומת מקרקעין — פרויקט שדרות האלון", letter=False)
+    (only,) = d.derive()
+    assert (only.kind, only.certainty) == (DOCUMENT, UNSPLIT)
+    assert (only.page_first, only.page_last) == (1, 7)
+    # inside a compendium: report 2's cover letter cuts, the report's own subject line two pages later does not
+    c = Doc()
+    c.report(1, 6, "שומת מקרקעין — פרויקט שדרות האלון")
+    c.page(7, None)
+    c.opening(7, "מכתב מלווה לשומת גבעת הרקפות")
+    c.page(8, None)
+    c.add("paragraph", 8, "בכבוד רב, שמאי דמו", 60.0)
+    c.report(9, 5, "שומת מקרקעין — מתחם גבעת הרקפות")
+    found = c.derive()
+    assert [(u.page_first, u.page_last) for u in found] == [(1, 6), (7, 13)]
+    assert found[1].evidence["boundary"]["signals"] == [units.SUBJECT_LINE, units.LETTER_OPENING]
+    assert found[1].certainty == CERTAIN
+
+
+def test_a_single_appraisal_whose_appendix_quotes_another_appraisals_subject_line_is_not_cut():
+    d = Doc()
+    d.report(1, 4, "שומת מקרקעין — פרויקט שדרות האלון")
+    # an appendix page that opens with a heading and then quotes a letter, and a page where the quote sits mid-page
+    d.page(5, None)
+    d.add("heading", 5, "נספח ג׳ — העתק מכתב", 48.0, h=14.0, label="נספח")
+    d.add("paragraph", 5, "הנדון: שומת מקרקעין — מתחם גבעת הרקפות", 70.0, h=12.0)
+    d.add("paragraph", 5, "לכבוד\nמר דוד דמו", 90.0, h=30.0)
+    d.add("paragraph", 5, "12/03/2025", 130.0, h=10.0)
+    d.page(6, None)
+    for n in range(14):
+        d.add("paragraph", 6, f"שורת נספח מספר {n + 1} — נתוני עזר לשומה.", 30.0 + 20 * n)
+    d.add("paragraph", 6, "הנדון: שומת מקרקעין — פרויקט נחל הדס", 400.0, h=12.0)
+    d.add("paragraph", 6, "לכבוד\nמר דוד דמו", 420.0, h=30.0)
+    d.add("paragraph", 6, "12/03/2025", 460.0, h=10.0)
+    (only,) = d.derive()
+    assert only.certainty == UNSPLIT and (only.page_first, only.page_last) == (1, 6)
+
+
+def test_body_text_that_begins_with_the_subject_word_is_no_subject_line():
+    for line in ("בעניין זה נערך סיור בנכס ובסביבתו.", "הנדון נבדק על ידי השמאי ביום הסיור.", "הנדונה בשומה היא חלקה 7."):
+        d = Doc()
+        d.report(1, 4, "שומת מקרקעין — פרויקט שדרות האלון")
+        d.page(5, None)
+        d.add("paragraph", 5, line, 40.0, h=11.0)
+        d.chapters(5, ["הערות"], top=100.0)
+        (only,) = d.derive()
+        assert only.certainty == UNSPLIT, line
+
+
+def test_a_docx_reading_without_pages_derives_exactly_as_before():
+    """A DOCX has no pages and no boxes: the subject line and the letter opening are page-top signals, so a DOCX
+    compendium derives as it did before (pages None, and the page 0 some readers use for it)."""
+
+    def docx(subject_lines: bool, page_no):
+        d = Doc()
+        for name in ("פרויקט שדרות האלון", "מתחם גבעת הרקפות", "פרויקט נחל הדס"):
+            if subject_lines:
+                d.add("paragraph", page_no, "12/03/2025", None)
+                d.add("paragraph", page_no, "לכבוד\nמר דוד דמו", None)
+                d.add("paragraph", page_no, f"הנדון: שומת מקרקעין — {name}", None)
+            else:
+                d.add("paragraph", page_no, f"שומת מקרקעין — {name}", None)
+            d.chapters(page_no, CHAPTERS[:3], top=0.0)
+        for b in d.blocks:
+            b.bbox = None
+        return units.derive(d.blocks, [], "v")
+
+    def shape(found):
+        return [(u.kind, u.certainty, u.evidence["boundary"]["signals"], u.block_last - u.block_first) for u in found]
+
+    for page_no in (None, 0):
+        with_lines = docx(True, page_no)
+        assert len(with_lines) == 1
+        assert not {units.SUBJECT_LINE, units.LETTER_OPENING} & {
+            s for u in with_lines for s in u.evidence["boundary"]["signals"]}
+        # the same blocks with the subject lines and letter lines made plain text derive the same way
+        assert shape(with_lines)[0][:3] == shape(docx(False, page_no))[0][:3]
+
+
+def test_the_appendices_that_follow_a_report_stay_in_its_unit_and_the_next_report_cuts_after_them():
+    d = Doc()
+    d.report(1, 4, "שומת מקרקעין — פרויקט שדרות האלון")
+    for p in (5, 6):  # the report's appendices: a heading, tables, no printed numbering of their own
+        d.page(p, None)
+        d.add("heading", p, "נספח א׳ — עסקאות השוואה" if p == 5 else "נספח ב׳ — תשריט", 48.0, h=14.0, label="נספח")
+        d.add("table", p, "נכס | שטח\nמתחם רכס | 300", 90.0, h=300.0, table_index=100 + p)
+    d.report(7, 4, "שומת מקרקעין — מתחם גבעת הרקפות")
+    first, second = d.derive()
+    assert (first.page_first, first.page_last) == (1, 6) and (second.page_first, second.page_last) == (7, 10)
+    assert first.kind == APPRAISAL and second.kind == APPRAISAL
+    assert second.certainty == CERTAIN
+
+
+def test_the_round_15_compendium_of_letter_openings_derives_a_unit_per_report_with_certain_cuts():
+    """A real PDF (extracted, no OCR): three reports that each open with a letter and a subject line, the second's and
+    third's as a row of a ruled table; the printed numbering runs on, so only the opening marks the boundary."""
+    manifest = json.loads((FIXTURES / "round15" / "manifest.json").read_text(encoding="utf-8"))["documents"]
+    entry = manifest["compendium"]
+    found = units.derive(*extract(FIXTURES / entry["file"]), "v")
+    assert [(u.page_first, u.page_last) for u in found] == [(e["first_page"], e["last_page"]) for e in entry["units"]]
+    for u, e in zip(found[1:], entry["units"][1:], strict=True):
+        assert u.certainty == CERTAIN and u.kind == APPRAISAL
+        assert u.evidence["boundary"]["signals"] == [units.SUBJECT_LINE, units.LETTER_OPENING]
+        assert u.evidence["boundary"]["detail"][units.SUBJECT_LINE].get("in_table") is e["subject_in_table"]

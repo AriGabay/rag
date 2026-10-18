@@ -389,10 +389,12 @@ def test_the_unit_count_script_reads_only_and_prints_no_document_content(office)
 # it would derive.
 
 
-def three_units(office, titled: bool = True) -> tuple[str, str]:
+def three_units(office, monkeypatch, titled: bool = True) -> tuple[str, str]:
     """A file of three appraisals of two blocks each (units 1, 2, 3 over blocks 0-1, 2-3, 4-5); the third is untitled
-    when ``titled`` is false."""
+    when ``titled`` is false. Its rows are those of the ``units-v4`` derivation (the one before the later derivation
+    ``derive_as`` simulates), whatever ``UNITS_VERSION`` the code has now."""
     names = ["פרויקט הארז", "מתחם האשל", "פרויקט הברוש" if titled else None]
+    monkeypatch.setattr(units, "UNITS_VERSION", "units-v4")
     return unit_file(office, office.default_group_id, "קובץ שומות סינתטי", [
         {"title": t, "aliases": [t.split()[-1]] if t else [], "identifiers": [f"רחוב הדוגמה {n}"],
          "blocks": [t or f"שומה {n}", "ב"]} for n, t in enumerate(names, 1)])
@@ -418,7 +420,7 @@ def count(office, ver: str) -> int:
 
 
 def test_after_a_later_derivation_the_old_rows_stay_and_every_reader_returns_only_the_new_units(office, monkeypatch):
-    doc, ver = three_units(office)
+    doc, ver = three_units(office, monkeypatch)
     before = stored(office, ver)
     derive_as(office, ver, monkeypatch, "units-v5", [
         {"title": "מתחם חדש א", "blocks": (0, 3), "pages": (1, 2)},
@@ -438,7 +440,7 @@ def test_after_a_later_derivation_the_old_rows_stay_and_every_reader_returns_onl
 
 
 def test_the_one_unit_check_reads_the_current_derivation_only(office, monkeypatch):
-    doc, ver = three_units(office)
+    doc, ver = three_units(office, monkeypatch)
     with tenant_tx(office.ctx()) as conn:
         assert search.document_term_holders(conn, [["סינתטי"]]) == {}   # three units: the file is not "one unit"
     derive_as(office, ver, monkeypatch, "units-v5", [{"title": "קובץ אחד", "blocks": (0, 5), "pages": (1, 3)}])
@@ -447,7 +449,7 @@ def test_the_one_unit_check_reads_the_current_derivation_only(office, monkeypatc
 
 
 def test_contexts_of_a_version_follow_a_derivation_change_in_the_same_process(office, monkeypatch):
-    _, ver = three_units(office)
+    _, ver = three_units(office, monkeypatch)
     with tenant_tx(office.ctx()) as conn:
         first = contexts.of_version(conn, ver, READING)
     assert first.numbers == [1, 2, 3] and first.tag is None and first.key(2) == f"{ver}#{READING}#2"
@@ -467,7 +469,7 @@ def anchor_on_v4(doc: str, ver: str, no: int, title: str | None = None) -> dict:
 
 
 def test_an_anchor_on_an_untitled_v4_unit_resolves_by_range_to_the_unit_that_now_holds_it(office, monkeypatch):
-    doc, ver = three_units(office, titled=False)
+    doc, ver = three_units(office, monkeypatch, titled=False)
     anchor = anchor_on_v4(doc, ver, 3)   # v4 unit 3: blocks 4-5
     # v5 renumbers: a new unit 3 sits where the v4 unit 2 ended, and the range 4-5 is now unit 4
     derive_as(office, ver, monkeypatch, "units-v5", [
@@ -481,7 +483,7 @@ def test_an_anchor_on_an_untitled_v4_unit_resolves_by_range_to_the_unit_that_now
 
 
 def test_an_anchor_whose_range_spans_two_new_units_is_gone_and_lists_the_candidates(office, monkeypatch):
-    doc, ver = three_units(office, titled=False)
+    doc, ver = three_units(office, monkeypatch, titled=False)
     anchor = anchor_on_v4(doc, ver, 3)
     derive_as(office, ver, monkeypatch, "units-v5", [
         {"blocks": (0, 1), "pages": (1, 1)}, {"blocks": (2, 4), "pages": (2, 3)}, {"blocks": (5, 5), "pages": (3, 3)}])
@@ -490,7 +492,7 @@ def test_an_anchor_whose_range_spans_two_new_units_is_gone_and_lists_the_candida
 
 
 def test_an_old_anchor_is_found_by_name_and_the_old_rows_are_not_read_as_current(office, monkeypatch):
-    doc, ver = three_units(office)
+    doc, ver = three_units(office, monkeypatch)
     anchor = anchor_on_v4(doc, ver, 2, "מתחם האשל")
     entities_anchor = entities.unit_anchor({"document_id": doc, "reading_id": READING, "unit_no": 2, "units_tag": None,
                                             "title": "מתחם האשל", "aliases": []})
@@ -502,7 +504,7 @@ def test_an_old_anchor_is_found_by_name_and_the_old_rows_are_not_read_as_current
 
 
 def test_the_kept_row_is_read_only_through_the_older_derivations_tag(office, monkeypatch):
-    doc, ver = three_units(office)
+    doc, ver = three_units(office, monkeypatch)
     derive_as(office, ver, monkeypatch, "units-v5", [{"title": "קובץ אחד", "blocks": (0, 5), "pages": (1, 3)}])
     with tenant_tx(office.ctx()) as conn:
         old = units.kept(conn, ver, READING, 3, None)

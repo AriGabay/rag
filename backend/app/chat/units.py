@@ -20,7 +20,15 @@ signals say a new part starts; each signal is recorded as evidence by name:
   ``bbox`` is pdfplumber's frame; positions are compared within the one document, never rendered). A weak signal:
   pages of one report share a layout, so it never cuts alone;
 - ``toc_entry`` — a table-of-contents entry maps the title the page opens with to that page;
-- ``identifier_numbering_restart`` — the restated-identifier rule of ``contexts.derive``, reused as is.
+- ``identifier_numbering_restart`` — the restated-identifier rule of ``contexts.derive``, reused as is;
+- ``subject_line`` and ``letter_opening`` (round 15 U4, KTD4, R6) — the report's own opening run at the top of a page: a
+  subject line (a line or a table cell that opens with a subject word of ``SUBJECT_WORDS``: ``הנדון: ...``, a table
+  block included) and a letter opening (a date line and an addressee line in the same run). The run is the first
+  blocks of the page up to its first heading (``OPENING_BLOCKS``), so a quoted letter further down a page, or under an
+  appendix heading, is no opening; the signal needs pages, so a DOCX (no pages) never fires it. A second opening run
+  within ``OPENING_SUPPRESS_PAGES`` pages of the previous cut (or of the file's start) does not cut again, whatever its
+  subject line says: a cover letter followed by its report is one unit. The two signals count as two, so a subject line
+  with a letter opening is ``certain``; either alone is ``probable``.
 
 Two signals or more make the cut ``certain``, one strong signal makes it ``probable`` (R8: it stays marked, and
 reading may extend across it), none, or the weak signal alone: no cut. A file with no cut is one unit of kind ``document`` and certainty
@@ -77,7 +85,7 @@ from app.professional.sections import flight, landed
 
 logger = logging.getLogger(__name__)
 
-UNITS_VERSION = "units-v4"
+UNITS_VERSION = "units-v5"
 # the derivation whose stable ids and anchors carry no tag: an id or an anchor without a tag is a ``units-v4`` one
 # (round 15 U3, KTD6); every later derivation's ids end in ``@<tag>``
 UNTAGGED_VERSION = "units-v4"
@@ -116,7 +124,9 @@ LABEL_RESTART = "label_restart"
 TITLE_BLOCK_REPEAT = "title_block_repeat"
 TOC_ENTRY = "toc_entry"
 IDENTIFIER_RESTART = "identifier_numbering_restart"
-SIGNALS = (LABEL_RESTART, TITLE_BLOCK_REPEAT, TOC_ENTRY, IDENTIFIER_RESTART)
+SUBJECT_LINE = "subject_line"
+LETTER_OPENING = "letter_opening"
+SIGNALS = (LABEL_RESTART, TITLE_BLOCK_REPEAT, TOC_ENTRY, IDENTIFIER_RESTART, SUBJECT_LINE, LETTER_OPENING)
 CERTAIN_SIGNALS = 2  # independent signals that make a cut certain
 # a repeated layout is weak evidence: many pages of one report may share a title block's layout, so it never cuts
 # alone; with a strong signal it makes the cut certain
@@ -141,6 +151,14 @@ TOC_WORDS = ("תוכן", "תוכן עניינים", "תוכן העניינים",
 BOILERPLATE_ANYWHERE = ("pdf",)
 BOILERPLATE_ALONE = frozenset({"מסמך"})
 LETTER_RUN_MIN = 3  # single-letter tokens in a row that make a line spaced letters (all tokens, from two)
+# the opening of a report (round 15 U4, KTD4): the word that introduces its subject line ("הנדון: ..."), the word that
+# opens its addressee line, and the month names of a dated line; a letter opens with them wherever the appraiser's
+# letterhead puts them
+SUBJECT_WORDS = ("הנדון", "הנידון", "בנדון", "בעניין", "בענין")
+ADDRESSEE_WORDS = ("לכבוד",)
+ADDRESSEE_COLON_WORDS = ("אל",)  # "אל: X" is an addressee line, "אל" inside a sentence is not
+DATE_MONTHS = ("ינואר", "פברואר", "מרץ", "מרס", "אפריל", "מאי", "יוני", "יולי", "אוגוסט", "ספטמבר", "אוקטובר", "נובמבר",
+               "דצמבר")
 
 # --- thresholds ----------------------------------------------------------------------------------------------------
 
@@ -161,6 +179,10 @@ PAGE_NUMBER_ZONE = 0.15  # share of the page height, at its top and bottom, wher
 PAGE_NUMBER_CHARS = 90  # a page-number block is short (a file path may precede the number)
 EDGE_LINES = (3, 8)  # lines read at the start and at the end of a page's stored text for a page-number line
 TEXT_KEPT = 600  # characters of a block's text read for the derivation
+OPENING_BLOCKS = 12  # blocks at the top of a page that make its opening run
+OPENING_LEAD_ROWS = 16  # blocks at the top of each page whose table text is read (the run skips furniture and pictures)
+OPENING_SUPPRESS_PAGES = 3  # an opening run this close to the previous cut (a cover letter and its report) is no cut
+DATE_LINE_CHARS = 45  # a line that holds a date and is no longer than this is a date line, not a sentence
 
 _TEXT_KINDS = ("paragraph", "textbox")
 _READ = ("read", "read_uncertain")
@@ -177,6 +199,11 @@ _PAGE_WORD_THEN_NUMBER = re.compile(
 _NUMBER_THEN_PAGE_WORD = re.compile(r"^[\s\-–—]*(\d{1,4})\s*(?:עמוד|עמ['׳’]?|page)[\s.\-–—]*$", re.IGNORECASE)
 _BARE_NUMBER = re.compile(r"^[\s\-–—]*(\d{1,4})[\s\-–—]*$")
 _NAME_CUT = re.compile(r"[,:;()|—–]|\s-\s")
+_SUBJECT = re.compile(rf"^(?:{'|'.join(SUBJECT_WORDS)})(?![א-ת\w])\s*(?P<sep>[:：\-–—])?\s*(?P<rest>.*)$")
+_ADDRESSEE = re.compile(rf"^(?:(?:{'|'.join(ADDRESSEE_WORDS)})(?![א-ת\w])|(?:{'|'.join(ADDRESSEE_COLON_WORDS)})\s*[:：])")
+_DATE_NUMBERS = re.compile(r"(?<!\d)\d{1,2}\s*[./-]\s*\d{1,2}\s*[./-]\s*(?:\d{4}|\d{2})(?!\d)")
+_DATE_WORDS = re.compile(rf"(?<!\d)\d{{1,2}}\s+[בלמ]?(?:{'|'.join(DATE_MONTHS)})\s+\d{{4}}(?!\d)")
+_LINE_LEAD = " \t*•·_>\"'“”״׳"
 
 # --- the unit ------------------------------------------------------------------------------------------------------
 
@@ -461,6 +488,78 @@ def _same_layout(a, b) -> bool:
     return ha is not None and hb is not None and abs(ha - hb) <= LAYOUT_HEIGHT_TOLERANCE
 
 
+# --- the opening run of a report ---------------------------------------------------------------------------------------
+
+
+def _opening_lines(r) -> list[list[str]]:
+    """The lines of a block, each as its cells: a paragraph's lines are one cell each, a table block's rows are split
+    into their cells (a subject line is often a row of a cover table)."""
+    t = hebrew.strip_bidi_controls(getattr(r, "text", None) or "")
+    rows = [ln.strip(_LINE_LEAD) for ln in t.splitlines()]
+    if r.kind == "table":
+        return [[c.strip(_LINE_LEAD) for c in ln.split("|")] for ln in rows if ln]
+    return [[ln] for ln in rows if ln]
+
+
+def _is_subject_cell(cell: str, others: bool) -> bool:
+    """Whether a line or a table cell is a subject line: a subject word followed by a separator and the subject, or the
+    word (with or without a separator) alone while the subject follows in the next line or cell (``others``). A
+    sentence that merely begins with the word ("בעניין זה נערך סיור") is no subject line."""
+    m = _SUBJECT.match(cell)
+    if m is None:
+        return False
+    rest = m.group("rest").strip()
+    return bool(rest) if m.group("sep") else (not rest and others)
+
+
+def _is_date_line(cell: str) -> bool:
+    return len(cell) <= DATE_LINE_CHARS and bool(_DATE_NUMBERS.search(cell) or _DATE_WORDS.search(cell))
+
+
+def _opening(c: _Ctx, start: int, page: int) -> dict[str, dict]:
+    """The signals of the opening run of ``page`` (round 15 U4, KTD4): the blocks from ``start`` (the page's first
+    position in ``c.rows``) up to ``OPENING_BLOCKS``, stopping at the first heading that is no subject line. Running
+    headers, pictures and page-number lines are skipped. ``subject_line`` when a line or a table cell is a subject
+    line (``in_table`` for a table block); ``letter_opening`` when the run holds a date line and an addressee line.
+    Each signal maps to its evidence: the rule and block indexes only."""
+    subject: dict | None = None
+    date_block = addressee_block = None
+    seen = 0
+    for r in islice(c.rows, start, None):
+        if r.page != page:
+            break
+        if r.kind == "image" or (getattr(r, "status", None) or "read") not in _READ:
+            continue
+        t = _text(r)
+        if r.kind != "table" and (_norm(t) in c.furniture or line_page_number(t) is not None):
+            continue
+        lines = _opening_lines(r)
+        found = False
+        for n, cells in enumerate(lines):
+            for i, cell in enumerate(cells):
+                if not cell:
+                    continue
+                follows = n + 1 < len(lines) or any(x for j, x in enumerate(cells) if j != i)
+                if subject is None and _is_subject_cell(cell, follows):
+                    subject, found = {"rule": "page_top_run", "block": r.block_index} | (
+                        {"in_table": True} if r.kind == "table" else {}), True
+                if date_block is None and _is_date_line(cell):
+                    date_block = r.block_index
+                if addressee_block is None and _ADDRESSEE.match(cell):
+                    addressee_block = r.block_index
+        if r.kind == "heading" and not found:
+            break
+        seen += 1
+        if seen >= OPENING_BLOCKS:
+            break
+    out: dict[str, dict] = {}
+    if subject is not None:
+        out[SUBJECT_LINE] = subject
+    if date_block is not None and addressee_block is not None:
+        out[LETTER_OPENING] = {"rule": "page_top_run", "blocks": sorted({date_block, addressee_block})}
+    return out
+
+
 # --- boundaries ------------------------------------------------------------------------------------------------------
 
 
@@ -524,6 +623,21 @@ def _cuts(c: _Ctx, pages: Sequence, version_id: str) -> list[_Cut]:
             s = rows[lead_pos].block_index  # the title block starts at the page's top (a picture may precede it)
         if s > first_block:
             add(s, page, IDENTIFIER_RESTART)
+    # the report's own opening run (round 15 U4, KTD4): only where the reading has pages. The file's start counts as
+    # the previous cut, so a cover letter and the report it introduces stay one unit
+    if lead_at:
+        start_page = previous = min(lead_at)
+        strong = sorted({x.page for x in cuts.values() if x.page is not None and x.signals - WEAK_SIGNALS})
+        for page in sorted(lead_at):
+            if page == start_page:
+                continue
+            previous = max([previous, *(q for q in strong if q < page)])
+            found = _opening(c, lead_at[page], page)
+            if not found or page - previous <= OPENING_SUPPRESS_PAGES:
+                continue
+            for signal, detail in found.items():
+                add(rows[lead_at[page]].block_index, page, signal, detail)
+            previous = page
     # a repeated layout alone cuts nothing
     return [cuts[b] for b in sorted(cuts) if cuts[b].signals - WEAK_SIGNALS]
 
@@ -749,13 +863,18 @@ def derive(blocks: Iterable, pages: Iterable = (), version_id: str = "", furnitu
 
 # --- the stored reading ---------------------------------------------------------------------------------------------------
 
+# a table block brings its text on the first pages (a TOC set as a table) and at the top of every page (the subject line
+# of a report's opening may be a row of a cover table: round 15 U4)
 _ROWS_SQL = (
-    "SELECT b.block_index, b.kind, b.page, b.bbox, b.status, b.table_index, b.label, b.content_hash,"
+    "WITH lead AS (SELECT block_index FROM (SELECT block_index, row_number() OVER (PARTITION BY page ORDER BY"
+    " block_index) AS rn FROM document_blocks WHERE version_id = :v AND page IS NOT NULL) x WHERE rn <= :lead)"
+    " SELECT b.block_index, b.kind, b.page, b.bbox, b.status, b.table_index, b.label, b.content_hash,"
     " t.page_end,"
     " CASE WHEN b.kind <> 'table' AND b.table_index IS NULL THEN left(b.text, :keep)"
-    " WHEN b.kind = 'table' AND b.page <= :toc THEN left(b.text, :keep) END AS text,"
+    " WHEN b.kind = 'table' AND (b.page <= :toc OR l.block_index IS NOT NULL) THEN left(b.text, :keep) END AS text,"
     " p.mediabox, p.cropbox, p.rotation, p.display_width, p.display_height, p.geometry_issue"
-    " FROM document_blocks b LEFT JOIN pages p ON p.version_id = b.version_id AND p.page_no = b.page"
+    " FROM document_blocks b LEFT JOIN lead l ON l.block_index = b.block_index"
+    " LEFT JOIN pages p ON p.version_id = b.version_id AND p.page_no = b.page"
     " LEFT JOIN extracted_tables t ON t.version_id = b.version_id AND t.table_index = b.table_index"
     " WHERE b.version_id = :v ORDER BY b.block_index")
 _PAGES_SQL = ("SELECT page_no, printed_label, left(text, 600) || E'\\n' || right(text, 600) AS edge FROM pages"
@@ -803,7 +922,7 @@ def derive_version(conn: Connection, version_id: UUID | str, reading: Reading | 
     """Derive a version's units from its stored blocks and pages (read-only, no model, no file)."""
     reading = reading or reading_of(conn, version_id)
     v = UUID(str(version_id))
-    rows = conn.execute(text(_ROWS_SQL), {"v": v, "keep": TEXT_KEPT, "toc": TOC_TABLE_PAGES}).all()
+    rows = conn.execute(text(_ROWS_SQL), {"v": v, "keep": TEXT_KEPT, "toc": TOC_TABLE_PAGES, "lead": OPENING_LEAD_ROWS}).all()
     pages = conn.execute(text(_PAGES_SQL), {"v": v}).all()
     return derive(rows, pages, str(version_id), reading.furniture_images if reading else ())
 

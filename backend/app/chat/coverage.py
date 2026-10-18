@@ -546,8 +546,9 @@ def _openings(ws: Workspace, documents: Collection[str] | None = None) -> dict[s
 
 
 def _unit_key(data: dict) -> str:
-    """The stable id of the unit a handle's data names (``Contexts.key``: version, reading and number)."""
-    return contexts.unit_key(data["version_id"], data.get("reading_id"), data["unit_no"])
+    """The stable id of the unit a handle's data names (``Contexts.key``: version, reading, number and, for a unit of
+    a derivation after ``units-v4``, its tag: ``contexts.anchor_key``, round 15 U4)."""
+    return contexts.anchor_key(data["version_id"], data)
 
 
 def _unit_text(ws: Workspace, key: str, fallback: str = "") -> str:
