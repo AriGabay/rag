@@ -814,9 +814,14 @@ def unit_term_holders(conn: Connection, terms: list[list[str]], units: Sequence)
 def document_term_holders(conn: Connection, terms: list[list[str]]) -> dict[UUID, set[int]]:
     """For each visible current document that is not split into several units (one unit, or none): the terms (their
     indexes) it holds as ``documents_matching`` reads them — in its title or in any chunk of its current text, each in
-    any of its forms. One query; a document that holds none is not in the result."""
+    any of its forms. A version that holds only the units of an earlier derivation gets the current ones first
+    (``entities.ensure_current_units``, additive: the old rows stay), so the "not split" test below reads the current
+    derivation and a document the new derivation splits is never counted whole (round 16 U5, R10). One query once every
+    version is current; a document that holds none is not in the result."""
     from app.chat import units as unit_store
+    from app.chat.entities import ensure_current_units
 
+    ensure_current_units(conn)
     params: dict = {}
     counts = ", ".join(f"count(c.id) FILTER (WHERE c.tsv @@ ({_tsquery(forms, f't{i}', params)})) AS h{i}"
                        for i, forms in enumerate(terms))

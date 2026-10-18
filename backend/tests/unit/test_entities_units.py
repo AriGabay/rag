@@ -221,3 +221,16 @@ def test_an_old_anchor_resolves_by_name_before_the_range_and_never_into_an_appen
     named = old_anchor(7, "מתחם הגפן ב")
     assert entities.resolve_older(named, rows, {"block_first": 0, "block_last": 5})["unit_no"] == 2   # the name wins
     assert entities.resolve_older(old_anchor(5), rows, {"block_first": 21, "block_last": 25}) is None  # an appendix
+
+
+def test_an_anchor_on_a_v5_unit_that_v6_split_in_two_resolves_by_name_else_is_gone():
+    """Round 16 U5 (R10): the units-v5 unit 2 (blocks 10-29) is cut by the new derivation into two; the old anchor finds the
+    half that carries its name, and an untitled one finds neither (the range is in two units: never a guess)."""
+    v5 = entities.unit_anchor(row(2, "מתחם הים", 10, 29, tag="v5"))
+    split = [row(1, "מגדל השקד", 0, 9, tag="v6"), row(2, "מתחם הים", 10, 19, tag="v6"), row(3, "קניון הגפן", 20, 29, tag="v6")]
+    kept = {"block_first": 10, "block_last": 29}
+    assert entities.resolve_older(v5, split, kept)["unit_no"] == 2   # the name, though the range spans two units
+    untitled = entities.unit_anchor(row(2, None, 10, 29, tag="v5"))
+    assert entities.resolve_older(untitled, split, kept) is None   # two units hold the range: "gone", units offered
+    # the half that holds the whole range is the one new unit when the other half is cut off elsewhere
+    assert entities.resolve_older(untitled, [split[0], row(2, None, 10, 40, tag="v6")], kept)["unit_no"] == 2

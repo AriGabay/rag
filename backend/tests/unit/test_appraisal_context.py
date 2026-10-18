@@ -723,3 +723,40 @@ def test_a_unit_named_by_an_identifier_is_kept_asked_though_the_passage_writes_i
     removed, _ = _brand_wrong(monkeypatch, "מרכז אופנה סינתטי — הכנסה נטו 14,850,000 ₪.",
                               "ה-NOI של מרכז אופנה סינתטי, רחוב הדקל 7, הוא 14,850,000 ₪")
     assert removed  # the address names unit 2 whatever the passage writes
+
+
+# --- a unit's running subject is its name: a brand phrase on one card, the longer name on another (round 16 U5, AE4, R9) ---
+
+BRAND, CITY = "אלמוג סינתטי", "עכו הדמה"
+
+
+def _brand_and_city_file() -> contexts.Contexts:
+    """Two reports derived through the real chain (``units.derive``) from synthetic pages: unit 1 opens with a title block
+    that holds only the brand phrase and runs under the header «דוח הערכת שווי — <brand>»; unit 2 has no title block and runs
+    under «דוח הערכת שווי — <brand> <city>» with another footer. Unit 2's only name is its running subject."""
+    from app.chat import units
+    from tests.unit.test_units_derive import A_FOOT, B_FOOT, Doc, run_pages
+
+    d = Doc()
+    d.page(1, 1)
+    d.title_block(1, BRAND, letterhead=False)
+    d.chapters(1, ["מבוא"])
+    run_pages(d, 2, 5, f"דוח הערכת שווי — {BRAND}", A_FOOT)
+    run_pages(d, 7, 6, f"דוח הערכת שווי — {BRAND} {CITY}", B_FOOT)
+    found = d.derive()
+    assert [(u.page_first, u.page_last) for u in found] == [(1, 6), (7, 12)]
+    assert found[0].title == BRAND and units._norm(f"{BRAND} {CITY}") in found[1].aliases + (found[1].title or "",)
+    return contexts.from_units(list(found), {}, [], "v", "r1")
+
+
+def test_a_claim_naming_the_longer_name_of_a_unit_whose_only_name_is_its_running_subject_is_not_another_properties(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+    cx = _brand_and_city_file()
+    assert cx.named(f"{BRAND} {CITY}") == [2] and cx.named(BRAND) == [1]
+    source = SimpleNamespace(contexts=[2], version_id="v", text="הכנסה נטו 14,850,000 ₪ לשנה.", document_id="d")
+    own = _wrong(cx, {"V1": 2}, "מה ה-NOI?", claim=f"ה-NOI של {BRAND} {CITY} הוא 14,850,000 ₪", sources={"S1": source})
+    assert own is None   # unit 2's value, said of the property unit 2 is named after
+    brand_only = _wrong(cx, {"V1": 2}, "מה ה-NOI?", claim=f"ה-NOI של {BRAND} הוא 14,850,000 ₪", sources={"S1": source})
+    assert brand_only and cx.describe(1) in brand_only   # the brand phrase alone is still unit 1: the protection is kept

@@ -337,6 +337,26 @@ def test_a_version_holding_only_an_earlier_derivation_gets_the_current_units_bef
     assert len(current(office, ver)) == 2 and len(stored(office, ver)) == 4
 
 
+def test_a_version_holding_only_units_v5_rows_gets_v6_rows_before_the_term_holders_are_counted(office):
+    """Round 16 U5 (R10): ``document_term_holders`` counts a document as "not split" when the current derivation has at most
+    one unit for it. A version that holds only units-v5 rows has none of the current key, so without the ensure a file the
+    new derivation splits in two would be counted whole. The current rows are built first, beside the old ones; nothing is
+    deleted."""
+    doc, ver = ingest(office, R7B)
+    with tenant_tx(office.system) as conn:   # the rows are those of units-v5, none of the current derivation
+        conn.execute(text("UPDATE document_units SET derivation_key = 'units-v5|-', units_version = 'units-v5'"
+                          " WHERE version_id = :v"), {"v": ver})
+    units._MEMO.clear()
+    contexts._CACHE.clear()
+    before = stored(office, ver)
+    assert current(office, ver) == [] and len(before) == 2 and units.UNITS_VERSION == "units-v6"
+    with tenant_tx(office.ctx()) as conn:
+        assert search.document_term_holders(conn, [["סינתטי"]]) == {}   # two units in v6: the file is not "one unit"
+    assert len(current(office, ver)) == 2
+    after = stored(office, ver)
+    assert len(after) == 4 and [r for r in after if r.units_version == "units-v5"] == before   # added beside, none deleted
+
+
 def test_replace_rewrites_only_the_rows_of_its_own_key(office):
     _, ver = ingest(office, R7B)
     with tenant_tx(office.system) as conn:   # the old key's rows: a copy of the current ones under another key
@@ -521,6 +541,29 @@ def test_an_anchor_whose_range_spans_two_new_units_is_gone_and_lists_the_candida
         {"blocks": (0, 1), "pages": (1, 1)}, {"blocks": (2, 4), "pages": (2, 3)}, {"blocks": (5, 5), "pages": (3, 3)}])
     live = entities.live_unit(office.ctx(), anchor)
     assert live.status == "gone" and live.unit is None and len(live.candidates) == 3
+
+
+def anchor_on_v5(doc: str, no: int, title: str | None = None) -> dict:
+    """The anchor a conversation stored on a ``units-v5`` unit: tagged ``v5``."""
+    return entities.unit_anchor({"document_id": doc, "reading_id": READING, "unit_no": no, "units_tag": "v5",
+                                "title": title, "aliases": [], "identifiers": [], "page_first": no, "page_last": no})
+
+
+def test_an_anchor_on_a_v5_unit_that_v6_split_in_two_is_found_by_name_else_gone_with_both_units_offered(office, monkeypatch):
+    """Round 16 U5 (R10): the units-v5 rows stay beside the new ones; an anchor made on a v5 unit that the new derivation cut
+    in two resolves by the name one half carries and otherwise is "gone" with the units offered, never a guessed one."""
+    doc, ver = three_units(office, monkeypatch, titled=False)
+    derive_as(office, ver, monkeypatch, "units-v5", [{"blocks": (0, 1), "pages": (1, 1)},
+                                                     {"title": "מתחם הים", "blocks": (2, 5), "pages": (2, 3)}])
+    named, unnamed = anchor_on_v5(doc, 2, "מתחם הים"), anchor_on_v5(doc, 2)
+    derive_as(office, ver, monkeypatch, "units-v6", [
+        {"blocks": (0, 1), "pages": (1, 1)}, {"title": "מתחם הים", "blocks": (2, 3), "pages": (2, 2)},
+        {"title": "קניון הגפן", "blocks": (4, 5), "pages": (3, 3)}])
+    live = entities.live_unit(office.ctx(), named)
+    assert live.status == "moved" and live.unit["unit_no"] == 2 and live.unit["units_tag"] == "v6"
+    live = entities.live_unit(office.ctx(), unnamed)
+    assert live.status == "gone" and live.unit is None and len(live.candidates) == 3
+    assert [r.units_version for r in stored(office, ver)].count("units-v5") == 2   # the v5 rows are still there
 
 
 def test_an_old_anchor_is_found_by_name_and_the_old_rows_are_not_read_as_current(office, monkeypatch):

@@ -1089,6 +1089,128 @@ def test_a_thousand_pages_with_running_headers_that_change_every_ten_pages_stay_
     assert found  # every block restarts the numbering and changes the footer: cuts, derived linearly
 
 
+# --- round 16 U5 (KTD6, R9, AE4): a unit's identity includes its running subject and its cover title ---------------------
+
+
+def names_of(u) -> set[str]:
+    return {x for x in (u.title, *u.aliases) if x}
+
+
+def test_a_running_header_with_a_report_type_and_a_subject_names_the_unit_by_the_subject():
+    d = Doc()
+    run_pages(d, 1, 6, "שומה — מתחם הדקל הצפוני", A_FOOT)
+    run_pages(d, 7, 6, B_HEADER, B_FOOT)
+    first, second = d.derive()
+    assert first.title == units._norm("מתחם הדקל הצפוני") and second.title == units._norm("מגדל הים")
+    assert units._norm("שומה") not in names_of(first) and units._norm("דוח הערכת שווי") not in names_of(second)
+    assert first.evidence["title"] == {"rule": "running_subject", "edge": "top"}
+    assert len(first.aliases) == len(first.evidence["aliases"])
+    assert all(e["rule"] != "running_subject" for e in first.evidence["aliases"])  # the office footer is no name
+    assert units._norm("שמאות דמו א") not in " ".join(names_of(first)) and "סינתטי" not in names_of(first)
+    assert "מגדל הים" not in json.dumps(second.evidence, ensure_ascii=False)  # evidence holds rule names, no copied text
+
+
+def test_a_running_subject_is_an_alias_when_the_unit_has_a_title_block():
+    d = Doc()
+    d.page(1, 1)
+    d.title_block(1, "פרויקט גני הצבעוני", "רחוב הדקל 3", "31102", "7")
+    d.chapters(1, CHAPTERS[:3])
+    run_pages(d, 2, 5, "שומה — גני הצבעוני הדרומיים", A_FOOT)
+    run_pages(d, 7, 6, B_HEADER, B_FOOT)
+    first, second = d.derive()
+    assert first.title == "פרויקט גני הצבעוני" and units._norm("גני הצבעוני הדרומיים") in first.aliases
+    assert second.title == units._norm("מגדל הים")
+
+
+def test_a_running_line_every_unit_shares_gives_no_name():
+    d = Doc()
+    for first, subject in ((1, "שומת מקרקעין — פרויקט שדרות האלון"), (5, "שומת מקרקעין — מתחם גבעת הרקפות"),
+                           (9, "שומת מקרקעין — פרויקט נחל הדס")):
+        for n in range(4):
+            d.pages.append(SimpleNamespace(page_no=first + n, printed_label=None,
+                                           edge=f"שומה — משרד הדמו המשותף\nגוף העמוד\n{A_FOOT}"))
+        d.opening(first, subject, letter=False)
+        for n in range(4):
+            d.chapters(first + n, [CHAPTERS[n]], top=150.0 if n == 0 else 54.0)
+    found = d.derive()
+    assert len(found) == 3
+    for u in found:
+        blob = " ".join(names_of(u))
+        assert "משרד הדמו המשותף" not in blob and "שמאות דמו" not in blob
+        assert all(e["rule"] != "running_subject" for e in u.evidence["aliases"])
+        assert u.evidence["title"]["rule"] != "running_subject"
+
+
+def test_chapter_names_joined_to_a_constant_top_segment_give_no_name_but_the_constant_subject_does():
+    d = Doc()
+    run_pages(d, 1, 6, lambda i: f"שומה — מתחם הדקל הצפוני | {CHAPTERS[i]}", A_FOOT, labels=list(range(1, 7)))
+    run_pages(d, 7, 6, lambda i: f"דוח הערכת שווי — מגדל הים | {CHAPTERS[i]}", B_FOOT, labels=[1, 2, 3, 4, 5, 6])
+    first, second = d.derive()
+    assert units.RUNNING_LINE_CHANGE in second.evidence["boundary"]["signals"]
+    assert names_of(second) == {units._norm("מגדל הים")}  # not a chapter's name, not the report type
+    assert second.evidence["title"] == {"rule": "running_subject", "edge": "top"} and second.aliases == ()
+    assert names_of(first) == {units._norm("מתחם הדקל הצפוני")}
+
+
+def test_a_bottom_office_line_and_a_top_line_with_contact_details_give_no_alias():
+    d = Doc()
+    run_pages(d, 1, 6, "שומה — מתחם הדקל הצפוני", "משרד שמאות אלפא בע״מ office-a@firm.example טל 03-5551234",
+              labels=list(range(1, 7)))
+    run_pages(d, 7, 6, "משרד שמאות גמא בע״מ gamma@firm.example", "משרד שמאות בטא בע״מ www.beta-firm.example",
+              labels=[1, 2, 3, 4, 5, 6])
+    first, second = d.derive()
+    assert [(u.page_first, u.page_last) for u in (first, second)] == [(1, 6), (7, 12)]
+    assert names_of(first) == {units._norm("מתחם הדקל הצפוני")}   # the unit-unique bottom office line names nothing
+    assert names_of(second) == set()   # a top line with an e-mail is the office's, not a header
+    for line, contact in (("טל 03-5551234 | משרד אלפא", True), ("www.firm.example", True), ("office@firm.example", True),
+                          ("דוח 2020-2021 מתחם הדקל", False), ("מגדל הים", False)):
+        assert units._has_contact(line) is contact, line
+
+
+def test_a_cover_title_names_a_unit_that_has_no_running_line_and_no_title_run():
+    d = Doc()
+    d.appraisal(1, "פרויקט שדרות האלון", "רחוב האלון 4", "31102", "7")
+    d.page(3, 1)  # the numbering restarts at the cover: the only signal
+    d.add("heading", 3, "מסמך לעיון בלבד", 60.0, h=11.0)  # a heading before the title ends the title run
+    d.add("paragraph", 3, "פרויקט גני הצבעוני", 120.0, h=24.0)
+    d.add("paragraph", 3, "שדרות הדקל 9, עיר הדמה", 170.0, h=11.0)
+    d.chapters(3, CHAPTERS[:2], top=220.0)
+    d.page(4, 2)
+    d.chapters(4, CHAPTERS[2:4], top=54.0)
+    first, second = d.derive()
+    assert (second.page_first, second.page_last) == (3, 4)
+    assert second.title == "פרויקט גני הצבעוני" and second.evidence["title"]["rule"] == "cover_title"
+    assert "block" in second.evidence["title"] and first.title == "פרויקט שדרות האלון"
+
+
+def untitled_appendix_then_restarts(second_export: str) -> Doc:
+    """Report A (named), an appendix export whose running lines change to a printout header that does not name A and that
+    has no title of its own, then two exports with no running lines whose numbering restarts and whose opening lines
+    name ``second_export`` for the second."""
+    d = Doc()
+    report_a(d)
+    run_pages(d, 7, 4, "תדפיס מערכת פנימי", "מחולל הדוחות הפנימי", labels=[1, 2, 3, 4])
+    for first, opening in ((11, "המשך תחשיב — מתחם גבעת הכליל"), (13, second_export)):
+        for n, number in ((first, 1), (first + 1, 2)):
+            d.pages.append(SimpleNamespace(page_no=n, printed_label=str(number), edge=""))
+            d.chapters(n, [CHAPTERS[n % 6]], top=100.0)
+        d.add("paragraph", first, opening, 60.0, h=11.0)
+    return d
+
+
+def test_restarted_exports_that_name_the_report_join_an_untitled_appendix_unit_that_follows_it():
+    found = untitled_appendix_then_restarts("המשך תחשיב — מתחם גבעת הכליל").derive()
+    assert spans(found) == [(1, 6), (7, 14)]  # the two restarts are dropped; the printout header still starts its unit
+    assert found[1].evidence["boundary"]["signals"] == [units.LABEL_RESTART, units.RUNNING_LINE_CHANGE]
+    assert found[0].title and not found[1].title
+
+
+def test_a_restarted_export_that_names_another_property_still_cuts_after_an_untitled_appendix_unit():
+    found = untitled_appendix_then_restarts("תחשיב עבור נכס אחר — מתחם הדקל הצפוני").derive()
+    assert spans(found) == [(1, 6), (7, 12), (13, 14)]
+    assert found[2].evidence["boundary"]["signals"] == [units.LABEL_RESTART]
+
+
 def test_the_round_16_compendium_derives_a_unit_per_report_starting_at_each_cover():
     """A real PDF (extracted, no OCR): report A with appendices that restart the numbering and still name A, then
     reports B and C, each with a cover page and a running header, no subject line and no letter; B's chapters change
