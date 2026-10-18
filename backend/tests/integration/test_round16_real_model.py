@@ -163,6 +163,11 @@ class Turn:
         body = d.json() if d.status_code == 200 else {}
         self.rounds = [[{"check": p.get("check"), "kind": p.get("kind"), "component": p.get("component")} for p in r]
                        for r in body.get("rounds") or []]
+        # what verification took out and why (synthetic documents only), so a part that did not reach the answer can be
+        # told apart: removed by a check, or never written
+        self.removed = [{"action": p.get("action"), "check": p.get("check"), "failure": p.get("failure_kind"),
+                         "text": (p.get("text") or "")[:300], "reason": (p.get("reason") or "")[:300]}
+                        for p in body.get("removed") or []]
         self.tools = [t.get("tool") for t in (body.get("timing") or {}).get("tools") or []]
         self.usage = usage_of(m, wall)
 
@@ -197,7 +202,7 @@ class Turn:
                 "completed_by_server": self.completed_by_server, "rounds": self.rounds, "tools": self.tools,
                 "cited": [{"id": s.get("id"), "document_id": s.get("document_id"), "title": s.get("title"),
                            "location": s.get("location"), "source_kind": s.get("source_kind")} for s in self.sources],
-                "usage": self.usage, "markdown": self.markdown}
+                "usage": self.usage, "markdown": self.markdown, "removed": self.removed}
 
 
 def ask(c, cid: str, question: str, rec: dict) -> Turn:
