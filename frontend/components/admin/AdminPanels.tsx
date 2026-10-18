@@ -21,6 +21,7 @@ const PURPOSE_LABELS: Record<PurposeModel["purpose"], string> = {
   resolve: "הבנת שאלת המשך",
   verify: "אימות תשובה",
   measure: "חילוץ מדידות",
+  identify: "זיהוי יחידות שומה",
   vision: "קריאה חזותית",
   summary: "סיכום שיחה",
 };

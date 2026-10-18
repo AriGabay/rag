@@ -555,7 +555,7 @@ export interface ProviderTest {
 }
 
 export interface PurposeModel {
-  purpose: "agent" | "resolve" | "verify" | "measure" | "vision" | "summary";
+  purpose: "agent" | "resolve" | "verify" | "measure" | "identify" | "vision" | "summary";
   model: string;
   effort: string | null;
 }
