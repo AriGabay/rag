@@ -1110,3 +1110,35 @@ def test_a_completion_that_fails_after_the_repair_leaves_the_part_stated_as_read
     (o,) = [o for o in out.report.requirement_outcomes() if o["id"] == "N1"]
     assert o["status"] == "partial" and o["support"] == [{"id": "S1", "quote": RATES[3]}]
     assert reading.calls == ["search"]
+
+
+def _restored(first: str, repaired: str, provider=None) -> tuple[str, list]:
+    report = verify_answer(provider or _judge(), _answer(first), _ws(), "?", [])
+    return report.restore_lost(repaired, report.lost_supported(repaired))
+
+
+def test_sentences_restored_after_a_table_row_anchor_are_paragraphs_after_a_blank_line_not_rows():
+    """Round 16 review #1: GFM absorbs a line right after a table row as another row, so a sentence restored behind a table
+    follows a blank line (several stay on consecutive lines after it)."""
+    first = ("| פריט | ערך |\n|---|---|\n| השווי למ\"ר | 9,500 ₪ [S1] |\n| דמי השכירות לחודש | 55 ₪ למ\"ר [S1] |")
+    repaired = ("| פריט | ערך |\n|---|---|\n| השווי למ\"ר | 9,000 ₪ [S1] |\n| דמי השכירות לחודש | 60 ₪ למ\"ר [S1] |")
+    merged, back = _restored(first, repaired)
+    assert len(back) == 2
+    assert merged == (repaired + "\n\nהשווי למ\"ר · 9,500 ₪ [S1].\nדמי השכירות לחודש · 55 ₪ למ\"ר [S1].")
+
+
+def test_a_partial_span_of_a_table_row_restored_after_its_table_follows_a_blank_line():
+    first = "| נכס | השווי למ\"ר הוא 9,500 ₪ והנכס מושכר [S1] |"
+    repaired = "| נכס | השווי למ\"ר הוא 9,000 ₪ [S1] |"
+    merged, back = _restored(first, repaired, _fixed(_mixed_judge))
+    assert len(back) == 1
+    assert merged == repaired + "\n\nנכס: השווי למ\"ר הוא 9,500 ₪ [S1]."
+    assert "מושכר" not in merged
+
+
+def test_a_sentence_restored_after_a_bullet_anchor_carries_the_list_lead_and_loses_the_list_mark_once():
+    first = "- דמי השכירות הם 55 ₪ למ\"ר לחודש [S1].\n- השווי למ\"ר הוא 9,500 ₪ [S1]."
+    repaired = "- השווי למ\"ר הוא 9,500 ₪ [S1].\n- הנכס פנוי [S1]."
+    merged, back = _restored(first, repaired)
+    assert len(back) == 1
+    assert merged == "- השווי למ\"ר הוא 9,500 ₪ [S1].\n- דמי השכירות הם 55 ₪ למ\"ר לחודש [S1].\n- הנכס פנוי [S1]."

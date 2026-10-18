@@ -532,6 +532,8 @@ export interface ChatComponent {
   /** Why it was not given: a gap reason key, null when it was given. */
   limitation?: ChatGapReason | string | null;
   limitation_text?: string | null;
+  /** The gap's variant under its reason (additive, optional): "read_not_used" is a part a read passage states that the answer omits. */
+  variant?: string | null;
   /** The server states it in the answer's gap paragraph. */
   stated?: boolean;
   /** Its sentence in the gap paragraph (already in the answer's text: never shown again). */

@@ -201,7 +201,7 @@ from app.answering.verify import not_an_amount, numbers_in
 from app.chat import dates as chat_dates
 from app.chat import meaning
 from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited, line_cut
-from app.chat.evidence import WHOLE_SOURCE_CHARS, Segment, claim_terms, fit, fit_segments, segments_of, select
+from app.chat.evidence import Segment, claim_terms, fit, fit_segments, segments_of, select
 from app.chat.request import ID_PREFIX, Aspect, Kind
 from app.config import get_settings
 from app.measurements.extract import VAT_TERM, stance_label
@@ -482,6 +482,7 @@ REQ_TEXT_FOUND = ("חלק של הבקשה שהתשובה לא נתנה במלו�
                   "לתשובה מאותו מקור, עם מראה המקום שלו; אין צורך בחיפוש חדש")
 TEXT_FOUND_CHECK = "text_found"  # the ``Problem.check`` of a REQ_TEXT_FOUND problem (the repair step turns its tools off for it)
 SUPPORT_QUOTE_MIN = 6  # the least a support quote may hold, in characters after normalisation
+SUPPORT_QUOTE_MAX = 300  # the most: a quote is one sentence or table row, never a passage (a longer one is dropped silently)
 REQ_NOT_SEARCHED = ("חלק של הבקשה שהתשובה לא נתנה: «{text}». לא בוצע חיפוש או קריאה שמכסים אותו: יש לחפש אותו "
                     "בכלים ולהשלים אותו אם נמצא; אם לא נמצא — אל תכתוב זאת בעצמך, השרת יציין זאת")
 REQ_INSTRUCTION = ("הוראה של המשתמש על התשובה עצמה שהתשובה אינה מקיימת: «{text}»{why}. שנה את התשובה כך שתקיים "
@@ -1694,6 +1695,7 @@ class VerifyReport:
             return same[-1] if same else None
 
         after: dict[int, list[str]] = {}
+        table_ends: dict[int, bool] = {}  # the insertion points that end a table
         end: list[str] = []
         for u, r in todo:
             at = anchor(u, r)
@@ -1706,12 +1708,16 @@ class VerifyReport:
             if at.table_span is not None:
                 line_end = len(text[:line_end].rstrip("\n"))
             after.setdefault(line_end, []).append(_restored_sentence(u, r))
+            if at.table_span is not None:
+                table_ends[line_end] = True
         merged = text
         for pos in sorted(after, reverse=True):
             line = text[text.rfind("\n", 0, pos) + 1:pos]
             bullet = _BULLET.match(line)
             lead = f"{bullet.group(1)} " if bullet else ""
-            merged = merged[:pos] + "".join(f"\n{lead}{x}" for x in after[pos]) + merged[pos:]
+            # GFM reads a line right after a table row as one more row: a sentence behind a table follows a blank line
+            gap = "\n\n" if table_ends.get(pos) else "\n"
+            merged = merged[:pos] + gap + "\n".join(f"{lead}{x}" for x in after[pos]) + merged[pos:]
         if end:
             merged = merged.rstrip("\n") + "\n\n" + "\n".join(end)
         return merged, todo
@@ -1834,9 +1840,12 @@ class VerifyReport:
     def text_completion_only(self) -> bool:
         """Whether every problem the repair round must fix is a completion from read text (``REQ_TEXT_FOUND``): the round then
         needs no tool and runs with tools off (round 16 U2, KTD3). A mixed round (a component nobody searched for, a data
-        completion that may need ``calculate``, a failing claim) keeps its tools. False without a problem to fix."""
+        completion that may need ``calculate``, a failing claim) keeps its tools, as does the completion of a calculation
+        component (it may need ``take_value`` or ``calculate``). False without a problem to fix."""
         open_ = [p for p in self.problems if p.repairable and p.resolution != "cut"]
-        return bool(open_) and all(p.kind == "requirement" and p.check == TEXT_FOUND_CHECK for p in open_)
+        calculations = {r["id"] for r in self.requirements if r.get("kind") == "calculation"}
+        return bool(open_) and all(p.kind == "requirement" and p.check == TEXT_FOUND_CHECK and p.component not in calculations
+                                   for p in open_)
 
     def _claims_note(self, index: int) -> str:
         """For a unit holding claims that differ, which the repair or the rewrite keeps verbatim and which it fixes
@@ -4627,9 +4636,10 @@ def _candidate_ids(batch: _Batch, ws: Workspace) -> dict[int, list[str]]:
     return batch.candidates
 
 
-def _candidate_block(sid: str, texts: list[str], ws: Workspace, narrow: bool) -> str | None:
+def _candidate_block(sid: str, texts: list[str], ws: Workspace, narrow: bool) -> tuple[str, str, bool] | None:
     """A candidate source as the judge sees it: the part of it the units that name it need (numbers and table headers
-    only when ``narrow``), cut to ``CANDIDATE_SOURCE_CHARS`` around the first number the units share with it."""
+    only when ``narrow``), cut to ``CANDIDATE_SOURCE_CHARS`` around the first number the units share with it. Returns
+    the block, the text shown and whether that is an excerpt (the read passages block continues an excerpt)."""
     parts = _source_parts(ws, sid)
     if parts is None:
         return None
@@ -4642,7 +4652,7 @@ def _candidate_block(sid: str, texts: list[str], ws: Workspace, narrow: bool) ->
         a = max(0, min(at - limit // 4, len(shown) - limit))
         shown, excerpt = shown[a:a + limit], True
     return (f'<source id="{sid}" excerpt="{"true" if excerpt else "false"}" candidate="true" '
-            f'title="{prompt_attr(head)}">\n{prompt_text(shown)}\n</source>')
+            f'title="{prompt_attr(head)}">\n{prompt_text(shown)}\n</source>'), shown, excerpt
 
 
 def read_source_ids(ws: Workspace) -> list[str]:
@@ -4654,6 +4664,13 @@ def read_source_ids(ws: Workspace) -> list[str]:
     ids = [sid for sid in _openings(ws)
            if sid in ws.sources and ws.sources[sid].kind != "listing" and (ws.sources[sid].text or "").strip()]
     return sorted(ids, key=lambda sid: int(sid[1:]) if sid[1:].isdigit() else 0)
+
+
+def _cited_text_sources(ws: Workspace, cited: set[str]) -> set[str]:
+    """Of the ids the answer cites, the sources that hold text (not a listing): the judge saw each as the evidence of a unit, so a
+    requirement may name it as support although the turn did not open it (``read_source_ids``)."""
+    return {sid for sid in cited if sid in ws.sources and ws.sources[sid].kind != "listing"
+            and (ws.sources[sid].text or "").strip()}
 
 
 def _asked_unit_ids(ws: Workspace, cited: set[str]) -> set[str]:
@@ -4931,9 +4948,8 @@ def _render_batch(batch: _Batch, ws: Workspace, coverage: _Coverage | None = Non
                 wanted.setdefault(sid, []).append(u.text)
     for sid, texts in wanted.items():
         if (b := _candidate_block(sid, texts, ws, batch.narrow)):
-            blocks.append(b)
-            if sid in ws.sources and len(ws.sources[sid].text or "") <= WHOLE_SOURCE_CHARS:
-                shown.setdefault(sid, (ws.sources[sid].text, False))  # short enough to be shown whole
+            blocks.append(b[0])
+            shown.setdefault(sid, (b[1], b[2]))  # what the judge was shown of it, and whether that is an excerpt
     # before a unit: the headings above it and its table row's header (R7); after a unit showing a result of a
     # conditional calculation: the qualifier the server writes next to it
     units = [_unit_context(u) + _preceding_note(u) + _unstated_note(u) + _reread_note(batch, u)
@@ -5014,7 +5030,8 @@ def _judge_batch(provider: LLMProvider, batch: _Batch, ws: Workspace, usage: lis
     ``VerificationUnavailable`` when the judge cannot answer. ``label``: the calls' usage purpose (``judge``);
     ``policy``: more rules for these calls."""
     if coverage is not None:
-        coverage.readable = set(read_source_ids(ws))  # the sources a requirement may name as support (round 16 U1)
+        # the sources a requirement may name as support (round 16 U1): those the turn read and those the answer cites
+        coverage.readable = set(read_source_ids(ws)) | _cited_text_sources(ws, coverage.answer_ids)
     rendered = _render_batch(batch, ws, coverage)
     got, status, scores = judge(provider, batch, rendered, usage, deadline, coverage, label=label, policy=policy)
     if status == "incomplete" and len(batch.units) > 1:
@@ -6382,10 +6399,17 @@ def _claim_cascade(report: VerifyReport) -> bool:
     return added
 
 
+def _read_back(text: str) -> str:
+    """``text`` with the look-alike angle brackets (U+2039, U+203A) a prompt shows (``prompt_text``) read back as < and >, as
+    ``attributes.match_norm`` does: a judge quotes a passage in the spelling it saw."""
+    return text.replace("‹", "<").replace("›", ">")
+
+
 def _flat_quote(text: str) -> str:
-    """A quote or a source text in one spelling for the verbatim test (``meaning._flat``: abbreviation marks, whitespace and
-    line wraps), a table row's cell separator read as a space: a quote may span the cells of a row or a wrapped line."""
-    return " ".join(meaning._flat(text).replace("|", " ").split())
+    """A quote or a source text in one spelling for the verbatim test (the look-alike angle brackets read back,
+    ``meaning._flat``: abbreviation marks, whitespace and line wraps), a table row's cell separator read as a space: a quote
+    may span the cells of a row or a wrapped line."""
+    return " ".join(meaning._flat(_read_back(text)).replace("|", " ").split())
 
 
 def _answer_documents(ws: Workspace, units: list[Unit]) -> set[str]:
@@ -6431,7 +6455,8 @@ def _in_answer(quote: str, units: list[Unit], component: str = "") -> bool:
 def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> dict[str, list[dict]]:
     """The judge's ``support`` (round 16 U1) that the server accepts as evidence of a part the answer omits (KTD2), by
     component id, merged across the judge calls: for a ``partial`` or ``missing`` vote, an entry [{"id", "quote"}] is kept
-    only when its S# is a source the turn read, the quote is a verbatim substring of its text after normalisation, the
+    only when its S# is a source the turn read or one the answer cites (the judge saw it as the unit's evidence), the quote
+    is at most ``SUPPORT_QUOTE_MAX`` characters and a verbatim substring of its text after normalisation, the
     block holding it lies in an asked unit (declared, located or cited) and not across a probable edge, the source's
     document is one the answer is about, and the quoted part is absent from the answer (no single surviving unit holds its
     numbers with half of the words that name the item, ``_in_answer``). An invalid entry is dropped silently, never failing a unit. ``failed``: the
@@ -6441,8 +6466,9 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
     if not any(votes.values()):
         return {}
     units = [u for u in report.units if u.index not in failed]
-    readable = set(read_source_ids(ws))
-    asked = _asked_unit_ids(ws, {i for u in units for i in u.ids})
+    cited = {i for u in units for i in u.ids}
+    readable = set(read_source_ids(ws)) | _cited_text_sources(ws, cited)
+    asked = _asked_unit_ids(ws, cited)
     documents = _answer_documents(ws, units)
     components = {r["id"]: r["text"] for r in report.requirements}
     flat_texts: dict[str, str] = {}
@@ -6458,10 +6484,11 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
         seen: set[tuple[str, str]] = set()
         kept: list[dict] = []
         for x in (x for v in vs for x in v.support):
-            sid, quote = x.id.strip(), x.quote.strip()
+            sid, quote = x.id.strip(), _read_back(x.quote.strip())
             flat = _flat_quote(quote)
             src = ws.sources.get(sid)
-            if (sid, flat) in seen or src is None or sid not in readable or len(flat) < SUPPORT_QUOTE_MIN:
+            if ((sid, flat) in seen or src is None or sid not in readable
+                    or not SUPPORT_QUOTE_MIN <= len(flat) <= SUPPORT_QUOTE_MAX):
                 continue
             seen.add((sid, flat))
             # every condition holds; the cheap ones are tested first and the substring test, which reads the whole source, last
@@ -6531,7 +6558,7 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
             reason = REQ_DATA_FOUND.format(text=o["text"], ids=", ".join(ev["data"]))
         elif ev["text"]:
             reason = REQ_TEXT_FOUND.format(text=o.get("missing_part") or o["text"], where="; ".join(
-                f"{x['id']} «{x['quote']}»" for x in ev["text"]))
+                f"{x['id']} «{prompt_text(x['quote'])}»" for x in ev["text"]))
             check = TEXT_FOUND_CHECK
         elif o["status"] == "not_answered" and not ev["checks"] and not ev["failures"]:
             reason = REQ_NOT_SEARCHED.format(text=o["text"])

@@ -42,6 +42,7 @@ import {
   failureKindText,
   formatIsoDate,
   gapReasonText,
+  gapVariantText,
   measurementValueStatus,
   rowChangeAction,
   unitLabel,
@@ -1291,7 +1292,7 @@ function ComponentsSection({
                 ...(c.removal_kinds ?? []),
               ]),
             ];
-            const reason = gapReasonText(c.limitation) || c.limitation_text || "";
+            const reason = gapVariantText(c.variant) || gapReasonText(c.limitation) || c.limitation_text || "";
             const where = [c.document_title ?? c.document, c.place?.name].filter(Boolean).join(", ");
             const parent = c.parent ? byId.get(c.parent) : undefined;
             const cited = (c.related ?? []).filter((id) => citable.has(id));

@@ -460,6 +460,16 @@ export function gapReasonText(reason: string | null | undefined): string {
   return reason ? GAP_REASON_LABEL[reason] ?? "" : "";
 }
 
+/** A gap variant's own label where its reason's label would say something else: a part the turn read at a place and the answer did
+ * not use is validated text, not "cannot be verified" (its reason stays `not_verifiable` for older clients). */
+export const GAP_VARIANT_LABEL: Record<string, string> = {
+  read_not_used: "נקרא במקור ולא נעשה בו שימוש בתשובה",
+};
+
+export function gapVariantText(variant: string | null | undefined): string {
+  return variant ? GAP_VARIANT_LABEL[variant] ?? "" : "";
+}
+
 /** A failure kind's label; an unknown kind reads as removed in verification, never as a specific fault. */
 export function failureKindText(kind: string | null | undefined): string {
   return (kind && FAILURE_KIND_LABEL[kind]) || "הוסרה באימות";

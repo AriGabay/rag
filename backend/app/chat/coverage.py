@@ -902,7 +902,7 @@ def gap_groups(items: list[dict]) -> list[dict]:
 
 # what the payload keeps of each component (the UI's per-component detail)
 PUBLIC_FIELDS = ("id", "text", "kind", "aspect", "parent", "conditional", "subject", "status", "evidence_state",
-                 "limitation", "limitation_text", "stated", "gap", "missing_part", "units", "removed_units", "removal_kinds",
+                 "limitation", "limitation_text", "variant", "stated", "gap", "missing_part", "units", "removed_units", "removal_kinds",
                  "absence_units",
                  "related", "place", "document", "document_id", "document_title", "searched", "claimed", "detail",
                  "uncited", "check", "pending_parameters")
