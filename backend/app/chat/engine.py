@@ -92,6 +92,10 @@ a few steps at most, while there is time; reading stays refused. Verification en
 the verification allowance does, so the final check of the saved text keeps its slice (round 9 U11, KTD9). Two tool
 steps before the step bound, an appended item tells the model to register what it still needs and calculate, or answer, now.
 
+A repair round whose only problems are completions from text the turn already read (``verify.REQ_TEXT_FOUND``: a part a
+passage states and the answer omits, round 16 U2, KTD3) runs with the same tools and ``tool_choice`` "none", like the last
+step: it adds the part from the passage it names and searches nothing. Any other problem in the round keeps its tools.
+
 Prompt caching. The policy, the tools and the turn's first message are the same at every step and carry nothing
 of the moment the turn runs; each step only appends to the items the previous step sent, and a tool output is
 never rewritten within a turn, so every step's input extends the cached prefix of the one before.
@@ -929,7 +933,10 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                   # an inspection refused for lack of time (``TIME_LIMIT`` in limits) ends the reading too
                   else TIME_LIMIT if ((now >= read_until or TIME_LIMIT in limits) if attempt == 0
                                       else left < FINAL_STEP_SECONDS) else None)
-        last = reason is not None or attempt == 2
+        # a repair round whose every problem is a completion from text the turn already read (``REQ_TEXT_FOUND``) needs no tool:
+        # it runs with tools off, as the last step does, and adds the part from the named passage (round 16 U2, KTD3)
+        text_only = attempt == 1 and checked is not None and checked[1].text_completion_only()
+        last = reason is not None or attempt == 2 or text_only
         compute_ok = (reason == T.TOOL_BUDGET and attempt == 0 and steps < bound and now < read_until
                       and compute_steps < COMPUTE_STEPS_AFTER_BUDGET)
         if last:

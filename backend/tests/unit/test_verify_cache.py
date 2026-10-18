@@ -883,3 +883,93 @@ def test_the_judge_version_is_11_and_the_verdict_cache_key_changes_with_it(monke
     now = verify.unit_key(unit, ws, "?", "", {})
     monkeypatch.setattr(verify, "JUDGE_VERSION", 10)
     assert verify.unit_key(unit, ws, "?", "", {}) != now
+
+
+# --- round 16 U2: a completion from read text runs the repair round with tools off (KTD3), and the cache carries its support ----
+
+RATES = ["שיעור היוון למשרדים 6.5%", "שיעור היוון למסחר 7.0%", "שיעור היוון לחניה 8.25%", "מחסנים: 9.1%"]
+RATES_TEXT = "שיעורי ההיוון שנקבעו בשומה:\n" + "\n".join(RATES)
+RATES_ASK = "שיעורי ההיוון שנקבעו"
+THREE_RATES = "שיעור היוון למשרדים 6.5% [S1].\nשיעור היוון למסחר 7.0% [S1].\nשיעור היוון לחניה 8.25% [S1]."
+ALL_RATES = THREE_RATES + "\nשיעור ההיוון למחסנים הוא 9.1% [S1]."
+
+
+class _Recording(ScriptedAgent):
+    """A scripted agent that keeps the ``tool_choice`` each step was asked with."""
+
+    def __init__(self, *a, **kw) -> None:
+        super().__init__(*a, **kw)
+        self.choices: list = []
+
+    def agent_step(self, instructions, items, tools, final_schema, **kw):
+        self.choices.append(kw.get("tool_choice"))
+        return super().agent_step(instructions, items, tools, final_schema, **kw)
+
+
+@pytest.fixture
+def reading(monkeypatch):
+    """Like ``offline``, but the search is a section the turn opened: its passage lists four rates and counts as read."""
+    calls: list = []
+
+    def run_tool(ws, name, arguments):
+        calls.append(name)
+        src = ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="דוח בדיקה", section="שיעורי היוון",
+                            location="סעיף \"שיעורי היוון\"", kind="context", text=RATES_TEXT)
+        doc = str(src.document_id)
+        ws.activity[doc] = {"title": "דוח בדיקה", "level": "read", "read": True, "partial": False, "read_partial": False,
+                            "read_complete": True,
+                            "openings": [{"sid": src.sid, "scope": "section", "name": "שיעורי היוון",
+                                          "target": ("section", doc, src.sid)}]}
+        return f'<source id="{src.sid}">{src.text}</source>'
+
+    run_tool.calls = calls
+    monkeypatch.setattr(T, "run_tool", run_tool)
+    monkeypatch.setattr(engine.coverage, "build", lambda ws, answer, question: ({}, answer))
+    return run_tool
+
+
+def _rates_judge(extra: list[tuple[str, str]] = ()):
+    """A judge scoring the rates component ``full`` when a unit names the warehouse rate, else ``partial`` with the fourth
+    rate's row as support; ``extra``: more (id-less) components, each scored missing with no support."""
+    def judge(input: str) -> dict:
+        units = _units(input)
+        ids = re.findall(r'<requirement id="(N[\d.]+)"', input)
+        given = [i for i, t in units.items() if "למחסנים" in t]
+        scored = [_req("", "full", list(units), id=ids[0]) if given else
+                  _req("", "partial", list(units), id=ids[0]) | {"missing": "שיעורי ההיוון",
+                                                                 "support": [{"id": "S1", "quote": RATES[3]}]}]
+        scored += [_req("", "missing", [], id=i) for i in ids[1:]]
+        return {"verdicts": [{"index": i, "verdict": "supported", "reason": "בדיקה"} for i in units],
+                "requirements": scored} if ids else {
+            "verdicts": [{"index": i, "verdict": "supported", "reason": "בדיקה"} for i in units]}
+    return judge
+
+
+def test_ae1_a_pure_text_completion_runs_the_repair_step_with_tools_off_and_adds_the_part(reading):
+    agent = _Recording([SEARCH, final(THREE_RATES), final(ALL_RATES)], judge=_rates_judge(),
+                       request=[component(RATES_ASK)])
+    out = _turn(agent, "מה שיעורי ההיוון שנקבעו?")
+    assert agent.choices == [None, None, "none"]  # the repair step has no tools
+    assert reading.calls == ["search"]  # the only search was the first step's: none in the repair round
+    repair = next(i["content"] for i in agent.seen[2] if isinstance(i, dict) and i.get("role") == "user"
+                  and "בדיקת האימות" in str(i.get("content")))
+    assert "S1" in repair and RATES[3] in repair and "חיפוש" in repair
+    assert out.answer.answer_markdown == ALL_RATES and out.report.ok
+    assert [(o["id"], o["status"]) for o in out.report.requirement_outcomes()] == [("N1", "full")]
+
+
+def test_a_repair_round_with_a_text_completion_and_a_component_nobody_searched_keeps_its_tools(reading):
+    judge = _rates_judge()
+    agent = _Recording([SEARCH, final(THREE_RATES), final(ALL_RATES)], judge=judge,
+                       request=[component(RATES_ASK), component("דמי ניהול")])
+    _turn(agent, "מה שיעורי ההיוון שנקבעו ומה דמי הניהול?")
+    assert agent.choices[:2] == [None, None] and agent.choices[2] is None  # mixed: the repair step may search
+
+
+def test_a_completion_that_fails_after_the_repair_leaves_the_part_stated_as_read_and_not_used(reading):
+    agent = _Recording([SEARCH, final(THREE_RATES), final(THREE_RATES), final(THREE_RATES), final(THREE_RATES)],
+                       judge=_rates_judge(), request=[component(RATES_ASK)])
+    out = _turn(agent, "מה שיעורי ההיוון שנקבעו?")
+    (o,) = [o for o in out.report.requirement_outcomes() if o["id"] == "N1"]
+    assert o["status"] == "partial" and o["support"] == [{"id": "S1", "quote": RATES[3]}]
+    assert reading.calls == ["search"]

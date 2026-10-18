@@ -201,7 +201,7 @@ from app.answering.verify import not_an_amount, numbers_in
 from app.chat import dates as chat_dates
 from app.chat import meaning
 from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited, line_cut
-from app.chat.evidence import WHOLE_SOURCE_CHARS, Segment, fit, fit_segments, segments_of, select
+from app.chat.evidence import WHOLE_SOURCE_CHARS, Segment, claim_terms, fit, fit_segments, segments_of, select
 from app.chat.request import ID_PREFIX, Aspect, Kind
 from app.config import get_settings
 from app.measurements.extract import VAT_TERM, stance_label
@@ -473,6 +473,12 @@ READ_PASSAGE_FLOOR = 300
 SUPPORT_PER_REQUIREMENT = 6  # a requirement names at most this many support quotes in one call
 REQ_DATA_FOUND = ("חלק של הבקשה שהתשובה לא נתנה במלואו: «{text}». הנתונים שלו כבר נמצאו בתור הזה ({ids}): השלם "
                   "אותו בתשובה מהם, וחשב ב-calculate אם הוא דורש חישוב")
+# a part of the request the answer omits, that a passage the turn read states (round 16 U2, KTD3): the repair round adds it from
+# that passage, with its citation, and does not search again. ``{where}``: each validated support, "S# «quote»"
+REQ_TEXT_FOUND = ("חלק של הבקשה שהתשובה לא נתנה במלואו: «{text}». הוא כבר נקרא בתור הזה, ונכתב במקור: {where}. הוסף אותו "
+                  "לתשובה מאותו מקור, עם מראה המקום שלו; אין צורך בחיפוש חדש")
+TEXT_FOUND_CHECK = "text_found"  # the ``Problem.check`` of a REQ_TEXT_FOUND problem (the repair step turns its tools off for it)
+SUPPORT_QUOTE_MIN = 6  # the least a support quote may hold, in characters after normalisation
 REQ_NOT_SEARCHED = ("חלק של הבקשה שהתשובה לא נתנה: «{text}». לא בוצע חיפוש או קריאה שמכסים אותו: יש לחפש אותו "
                     "בכלים ולהשלים אותו אם נמצא; אם לא נמצא — אל תכתוב זאת בעצמך, השרת יציין זאת")
 REQ_INSTRUCTION = ("הוראה של המשתמש על התשובה עצמה שהתשובה אינה מקיימת: «{text}»{why}. שנה את התשובה כך שתקיים "
@@ -1403,6 +1409,9 @@ class VerifyReport:
     judge_status: str | None = None
     requirements: list[dict] = field(default_factory=list)  # the turn's frozen requirements, when they were judged
     requirement_votes: dict[str, list[JudgeRequirement]] = field(default_factory=dict)  # per id, per judge call
+    # the judge's support the server validated (round 16 U2, KTD2), merged by component id across the calls: component ->
+    # [{"id": a read S#, "quote": its verbatim sentence or row}] that the answer omits (``validated_support``)
+    text_support: dict[str, list[dict]] = field(default_factory=dict)
     # the answer's completeness (``coverage.completeness``), set once the final answer is stated
     completeness: dict | None = None
     reused: int = 0  # units whose verdict came from an earlier round of the turn (``VerdictCache``)
@@ -1677,6 +1686,13 @@ class VerifyReport:
             lines.append("- " + (f"\"{p.unit.raw[:200]}\": " if p.unit.raw else "") + p.reason + p.repair_note() + note)
         return "\n".join(lines)
 
+    def text_completion_only(self) -> bool:
+        """Whether every problem the repair round must fix is a completion from read text (``REQ_TEXT_FOUND``): the round then
+        needs no tool and runs with tools off (round 16 U2, KTD3). A mixed round (a component nobody searched for, a data
+        completion that may need ``calculate``, a failing claim) keeps its tools. False without a problem to fix."""
+        open_ = [p for p in self.problems if p.repairable and p.resolution != "cut"]
+        return bool(open_) and all(p.kind == "requirement" and p.check == TEXT_FOUND_CHECK for p in open_)
+
     def _claims_note(self, index: int) -> str:
         """For a unit holding claims that differ, which the repair or the rewrite keeps verbatim and which it fixes
         (KTD4 step 3, R9): the supported claims' spans, and the failing ones'."""
@@ -1780,7 +1796,7 @@ class VerifyReport:
                                          | {i for v in absent for i in v.units}),
                  "related": list(dict.fromkeys(x for v in votes for x in v.related)),
                  "evidence_state": "undeterminable" if any(v.status == "undeterminable" for v in votes) else None,
-                 "missing_part": "", "stated": False}
+                 "missing_part": "", "stated": False, "support": list(self.text_support.get(r["id"], []))}
             if kind == "instruction" and o["aspect"] == "citation":
                 o |= {"check": "citation", "uncited": uncited, "status": "not_answered" if uncited else "full",
                       "reason": ""}
@@ -6162,6 +6178,88 @@ def _claim_cascade(report: VerifyReport) -> bool:
     return added
 
 
+def _flat_quote(text: str) -> str:
+    """A quote or a source text in one spelling for the verbatim test (``meaning._flat``: abbreviation marks, whitespace and
+    line wraps), a table row's cell separator read as a space: a quote may span the cells of a row or a wrapped line."""
+    return " ".join(meaning._flat(text).replace("|", " ").split())
+
+
+def _answer_documents(ws: Workspace, units: list[Unit]) -> set[str]:
+    """The documents the answer is about: those of the sources, values, measurements and calculations its surviving units
+    cite, of the units it declared and of the unit the turn located. A passage of another document (another property's
+    appraisal, a comparable's) is of none of them (round 16 U2, KTD2)."""
+    from app.chat.coverage import cited_documents
+
+    docs = set(cited_documents(ws, "".join(f"[{i}]" for u in units for i in u.ids)))
+    located = getattr(ws, "located_unit", None) or {}
+    focus = getattr(ws, "unit_focus", None) or {}
+    anchors = [*(getattr(ws, "declared_units", None) or []), located.get("anchor") or {}, focus,
+               *(getattr(ws, "turn_located", None) or {}).values()]
+    return docs | {str(a["document_id"]) for a in anchors if a.get("document_id")}
+
+
+def _support_in_asked_units(ws: Workspace, src: Source, asked: set[str]) -> bool:
+    """Whether the block holding a support quote lies in an asked unit and not across a probable edge into a neighbour
+    (round 16 U2, KTD2). A passage of a file without unit marks lies in the file's one appraisal. A passage in one unit is
+    asked when the unit is; one that spans units (its blocks run across an edge: ``Source.contexts``) is asked only when
+    every appraisal unit it touches is, because a quote's block inside it is not known to lie in the asked one."""
+    if src.unit is None:
+        return True
+    cx = ws.contexts.get(str(src.version_id))
+    numbers = list(src.contexts or [])
+    if cx is None or len(numbers) <= 1:
+        return src.unit.get("id") in asked
+    subjects = [n for n in numbers if cx.is_subject(n)]
+    return any(cx.key(n) in asked for n in numbers) and all(cx.key(n) in asked for n in subjects)
+
+
+def _in_answer(quote: str, units: list[Unit], component: str = "") -> bool:
+    """Whether the quoted part is in the answer (KTD2): a single unit holds the quote's numbers together with at least half
+    of its content words, the words that name the item (its label) — not those of the component's own text, which every item
+    of a list shares ("שיעור היוון") — and its value. Another item with the same value is no presence. A quote with neither
+    numbers nor words counts as present, so it supports nothing."""
+    nums, words = claim_terms(quote)
+    words = words - claim_terms(component)[1] or words
+    need = (len(words) + 1) // 2
+    return any(nums <= n and len(words & w) >= need for n, w in map(claim_terms, [u.text for u in units]))
+
+
+def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> dict[str, list[dict]]:
+    """The judge's ``support`` (round 16 U1) that the server accepts as evidence of a part the answer omits (KTD2), by
+    component id, merged across the judge calls: for a ``partial`` or ``missing`` vote, an entry [{"id", "quote"}] is kept
+    only when its S# is a source the turn read, the quote is a verbatim substring of its text after normalisation, the
+    block holding it lies in an asked unit (declared, located or cited) and not across a probable edge, the source's
+    document is one the answer is about, and the quoted part is absent from the answer (no single surviving unit holds its
+    numbers with half of the words that name the item, ``_in_answer``). An invalid entry is dropped silently, never failing a unit. ``failed``: the
+    indexes of the units removed (not in the answer)."""
+    votes = {cid: [v for v in vs if v.status in ("partial", "missing") and v.support]
+             for cid, vs in report.requirement_votes.items()}
+    if not any(votes.values()):
+        return {}
+    units = [u for u in report.units if u.index not in failed]
+    readable = set(read_source_ids(ws))
+    asked = _asked_unit_ids(ws, {i for u in units for i in u.ids})
+    documents = _answer_documents(ws, units)
+    components = {r["id"]: r["text"] for r in report.requirements}
+    out: dict[str, list[dict]] = {}
+    for cid, vs in votes.items():
+        seen: set[tuple[str, str]] = set()
+        kept: list[dict] = []
+        for x in (x for v in vs for x in v.support):
+            sid, quote = x.id.strip(), x.quote.strip()
+            flat = _flat_quote(quote)
+            src = ws.sources.get(sid)
+            if (sid, flat) in seen or src is None or sid not in readable or len(flat) < SUPPORT_QUOTE_MIN:
+                continue
+            seen.add((sid, flat))
+            if (flat in _flat_quote(src.text) and str(src.document_id) in documents
+                    and _support_in_asked_units(ws, src, asked) and not _in_answer(quote, units, components.get(cid, ""))):
+                kept.append({"id": sid, "quote": quote})
+        if kept:
+            out[cid] = kept[:SUPPORT_PER_REQUIREMENT]
+    return out
+
+
 def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequirements) -> None:
     """The components against what the turn found and the answer shows (R4, R20, R21; round 7 KTD2), before the
     repair decision. A unit that says a component was not found, when the turn holds its values, measurements or
@@ -6172,14 +6270,20 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
       without a citation (``kind="instruction"``, nothing removed);
     - a component about the documents (information or calculation) not given whose data the turn found, or not
       answered with no search, reading or failure behind it, is a problem for the repair round, which may call tools
-      (``kind="requirement"``, nothing removed); an assumption or a clarification is never searched for."""
+      (``kind="requirement"``, nothing removed); an assumption or a clarification is never searched for;
+    - a component not given whose omitted part a passage the turn read states — the judge's support, validated
+      (``validated_support``, round 16 U2, KTD2) — is a ``REQ_TEXT_FOUND`` problem (``check="text_found"``): the repair round
+      adds the part from that passage and, when every problem of the round is one, runs with tools off (KTD3). The data
+      of a component comes first; a unit saying the part was not found is replaced as an absence for either."""
     from app.chat.coverage import related_evidence
 
     units = {u.index: u for u in report.units}
     failed = {p.unit.index for p in report.problems if p.removes_unit}
+    report.text_support = support = validated_support(report, ws, failed)
     for r in report.requirements:
         for v in report.requirement_votes.get(r["id"], []):
-            data = related_evidence(ws, {"related": v.related}, turn)["data"]
+            data = related_evidence(ws, {"related": v.related}, turn)["data"] or [x["id"] for x in support.get(r["id"], [])]
+            data = list(dict.fromkeys(data))
             if not data or v.status not in ("missing", "partial"):
                 continue
             for i in dict.fromkeys([*v.units, *v.absent]):
@@ -6208,10 +6312,15 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
         if o["status"] not in ("not_answered", "partial") or o["kind"] not in SEARCHABLE_KINDS:
             continue  # an assumption or a clarification is never searched for (R4)
         ev = related_evidence(ws, o, turn)
+        check = None
         if ev["data"]:
             reason = REQ_DATA_FOUND.format(text=o["text"], ids=", ".join(ev["data"]))
+        elif ev["text"]:
+            reason = REQ_TEXT_FOUND.format(text=o.get("missing_part") or o["text"], where="; ".join(
+                f"{x['id']} «{x['quote']}»" for x in ev["text"]))
+            check = TEXT_FOUND_CHECK
         elif o["status"] == "not_answered" and not ev["checks"] and not ev["failures"]:
             reason = REQ_NOT_SEARCHED.format(text=o["text"])
         else:
             continue
-        report.problems.append(Problem(Unit(-1, "", "", []), reason, kind="requirement", component=o["id"]))
+        report.problems.append(Problem(Unit(-1, "", "", []), reason, kind="requirement", component=o["id"], check=check))

@@ -277,3 +277,112 @@ def test_a_calculation_filled_by_a_unit_citing_its_computation_stays_full_with_n
     assert not agent.steps  # no repair round was asked for
     assert [(c["id"], c["status"]) for c in a["components"]] == [("N1", "full"), ("N2", "full")]
     assert a["status"] == "answered"
+
+
+# --- round 16 U2 (AE1): a rate listed in a passage the turn read is added from it, with its citation, by a repair step ---------
+
+RATES_TITLE = "שומת הדגמה לשיעורי היוון"
+RATES_SECTION = "6. שיעורי היוון"
+RATE_PARAGRAPHS = ["שיעורי ההיוון שנקבעו בשומה:", "שיעור היוון למשרדים 6.5%", "שיעור היוון למסחר 7.0%",
+                   "שיעור היוון לחניה 8.25%", "שיעור היוון למחסנים 7.0%"]  # the fourth rate repeats the commerce rate's value
+RATES_ASK = "שיעורי ההיוון שנקבעו"
+RATES_QUESTION = "אילו שיעורי היוון נקבעו בשומה, לפי סוג השימוש?"
+THREE_RATES = ("שיעור היוון למשרדים 6.5% [S1].\nשיעור היוון למסחר 7.0% [S1].\nשיעור היוון לחניה 8.25% [S1].")
+ALL_RATES = THREE_RATES + "\nשיעור היוון למחסנים 7.0% [S1]."
+
+
+def _rates_document(office) -> str:
+    import json as _json
+
+    from sqlalchemy import text
+
+    from app.db import tenant_tx
+    from tests.factories import make_document
+
+    doc, ver = make_document(office, office.default_group_id, RATES_TITLE, sha="d" * 64)
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_versions SET page_count = 1, ingestion = CAST(:i AS jsonb) WHERE id = :v"),
+                     {"v": ver, "i": _json.dumps({"reading_id": "reading-1"})})
+        blocks = [("heading", RATES_SECTION), *(("paragraph", t) for t in RATE_PARAGRAPHS)]
+        for i, (kind, t) in enumerate(blocks):
+            conn.execute(text(
+                "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
+                " section_path, page, text, status) VALUES (app_office(), :d, :v, :b, :k, :s, :sp, 1, :t, 'read')"),
+                {"d": doc, "v": ver, "b": i, "k": kind, "s": RATES_SECTION, "sp": [RATES_SECTION], "t": t})
+    return str(doc)
+
+
+def _rates_judge(seen: list):
+    """Scores the one component ``full`` when the answer gives every rate, else ``partial`` with the quote of the omitted
+    rate's line, taken from the passage the call shows (the cited S1 or the read-passages block)."""
+    def judge(input: str) -> dict:
+        seen.append(input)
+        units = dict((int(i), t) for i, t in re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input,
+                                                         re.S))
+        ids = re.findall(r'<requirement id="(N[\d.]+)"', input)
+        verdicts = [{"index": i, "verdict": "supported", "reason": "בדיקה"} for i in units]
+        if not ids:
+            return {"verdicts": verdicts}
+        line = next((ln for ln in input.splitlines() if "למחסנים" in ln and not ln.startswith("<unit")
+                     and "[S1]" not in ln), "")
+        given = any("למחסנים" in t for t in units.values())
+        scored = (requirement(id=ids[0], units=list(units)) if given else
+                  requirement(id=ids[0], status="partial", units=list(units))
+                  | {"missing": "שיעורי ההיוון", "support": [{"id": "S1", "quote": line.strip()}]})
+        return {"verdicts": verdicts, "requirements": [scored]}
+    return judge
+
+
+class _RecordingAgent(ScriptedAgent):
+    """A scripted agent that keeps the ``tool_choice`` each step was asked with."""
+
+    def __init__(self, *a, **kw) -> None:
+        super().__init__(*a, **kw)
+        self.choices: list = []
+
+    def agent_step(self, instructions, items, tools, final_schema, **kw):
+        self.choices.append(kw.get("tool_choice"))
+        return super().agent_step(instructions, items, tools, final_schema, **kw)
+
+
+def test_ae1_a_rate_the_passage_lists_and_the_answer_omits_is_added_from_it_by_a_repair_step_without_tools(
+        client, office, monkeypatch):
+    doc = _rates_document(office)
+    steps = [[call("outline", document=doc)],
+             lambda items: [read(section=handle_of(_last_output(items), RATES_SECTION))],
+             final(THREE_RATES, documents=[doc]),
+             final(ALL_RATES, documents=[doc])]
+    seen: list[str] = []
+    agent = _RecordingAgent(steps, judge=_rates_judge(seen), request=[component(RATES_ASK)])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), RATES_QUESTION)
+    assert m["status"] == "done", m
+    a = m["answer"]
+    # the repair step (the fourth model step) had tools off and called none; the first three kept them
+    assert agent.choices == [None, None, None, "none"] and len(agent.seen) == 4
+    assert not [i for i in agent.seen[3][len(agent.seen[2]):] if isinstance(i, dict) and i.get("type") == "function_call"]
+    repair = next(i["content"] for i in agent.seen[3] if isinstance(i, dict) and i.get("role") == "user"
+                  and "בדיקת האימות" in str(i.get("content")))
+    assert "S1" in repair and "שיעור היוון למחסנים 7.0%" in repair and "חיפוש" in repair
+    assert "למחסנים 7.0% [S1]" in a["markdown"] and "לא נמצא" not in a["markdown"] and "לא אותר" not in a["markdown"]
+    assert a["verification"]["completeness"] == {"status": "full", "requirements": 1, "missing": []}
+    assert a["verification"]["correctness"] == "verified"
+    assert [c.purpose.value for c in agent.calls].count("verify") >= 2
+
+
+def test_a_part_the_repair_step_still_does_not_add_is_stated_as_read_and_not_used(client, office, monkeypatch):
+    doc = _rates_document(office)
+    steps = [[call("outline", document=doc)],
+             lambda items: [read(section=handle_of(_last_output(items), RATES_SECTION))],
+             *[final(THREE_RATES, documents=[doc])] * 4]
+    agent = _RecordingAgent(steps, judge=_rates_judge([]), request=[component(RATES_ASK)])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    a = send(client, new_conversation(client), RATES_QUESTION)["answer"]
+    assert a["status"] == "partial"
+    (c,) = a["components"]
+    assert c["limitation"] == "not_verifiable" and c["stated"] is True
+    gap = a["markdown"][len(THREE_RATES):].strip()
+    assert RATES_TITLE in gap and RATES_SECTION in gap and "[S1]" in gap and "לא נעשה בו שימוש" in gap
+    assert "לא נמצא" not in gap and "לא אותר" not in gap

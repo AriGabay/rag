@@ -1624,3 +1624,221 @@ def test_the_policy_says_a_component_is_full_only_when_the_answer_gives_what_the
     policy = verify.JUDGE_REQUIREMENTS_POLICY
     assert "read_passages" in policy and "support" in policy and "quote" in policy
     assert "מילה במילה" in policy  # a verbatim sentence or table row
+
+
+# --- round 16 U2: support is validated by the server (KTD2), completes the answer from the read text (KTD3), and its gap ----------
+
+ROWS_TEXT = "\n".join(["שיעורי היוון לפי שימוש", "שימוש | שיעור", "משרדים | 6.5%", "מסחר | 7.0%", "מחסנים | 9.1%"])
+THREE_RATES = "שיעור היוון למשרדים 6.5% [S2]. שיעור היוון למסחר 7.0% [S2]. שיעור היוון לחניה 8.25% [S2]."
+MISSING_RATE = RATE_LINES[3]  # "מחסנים: 9.1%": the fourth rate of the passage
+
+
+def _support(ws: Workspace, markdown: str, support: list[dict] | str, status: str = "partial", ask: str = ASK_RATES,
+             cache: verify.VerdictCache | None = None):
+    """The answer verified with a scripted judge that scores the one component ``status`` with ``support`` (a list of
+    {id, quote}, or the quote of S2 alone): (the report, the turn's requirements, the answer)."""
+    if isinstance(support, str):
+        support = [{"id": "S2", "quote": support}]
+    turn = _turn({"id": "1", "text": ask})
+
+    def score(frozen, units):
+        return [_req("", status, list(units) if status == "partial" else [], id=frozen[0][0])
+                | {"missing": "שיעורי ההיוון" if status == "partial" else "", "support": support}]
+
+    answer = _answer(markdown)
+    return verify_answer(_judge(score), answer, ws, "?", [], requirements=turn, cache=cache), turn, answer
+
+
+def _completions(report) -> list:
+    return [p for p in report.problems if p.kind == "requirement" and p.check == "text_found"]
+
+
+def _rates_file(*extra: str, units: tuple[int, ...] = (1, 1), declared: tuple[int, ...] = (1,)) -> Workspace:
+    return _file(SOURCE, RATES, *extra, units=units, declared=declared)
+
+
+def test_ae1_a_partial_component_with_a_quote_in_a_read_passage_raises_one_text_completion_problem():
+    ws = _rates_file()
+    r, turn, _ = _support(ws, THREE_RATES, MISSING_RATE)
+    (p,) = _completions(r)
+    assert p.component == "N1" and p.severity == "error" and not p.removes_unit and p.repairable
+    assert "S2" in p.reason and MISSING_RATE in p.reason and "שיעורי ההיוון" in p.reason
+    assert "חיפוש" in p.reason  # it says no new search is needed
+    assert r.text_support == {"N1": [{"id": "S2", "quote": MISSING_RATE}]}
+    (o,) = [o for o in r.requirement_outcomes() if o["id"] == "N1"]
+    assert o["status"] == "partial" and o["support"] == [{"id": "S2", "quote": MISSING_RATE}]
+    ev = coverage.related_evidence(ws, o, turn)
+    assert ev["text"] == [{"id": "S2", "quote": MISSING_RATE}] and ev["data"] == []
+
+
+def test_related_evidence_has_a_text_bucket_beside_data_failures_and_checks():
+    ev = coverage.related_evidence(_ws(), {"related": []}, None)
+    assert set(ev) == {"data", "failures", "checks", "text", "documents"} and ev["text"] == []
+
+
+def test_a_missing_component_with_a_valid_quote_raises_the_completion_too():
+    r, _, _ = _support(_rates_file(), "הנכס פנוי [S1].", MISSING_RATE, status="missing")
+    assert len(_completions(r)) == 1
+
+
+def test_ae2_a_quote_that_is_not_in_the_named_passage_is_dropped_silently():
+    ws = _rates_file()
+    r, _, _ = _support(ws, THREE_RATES, "שיעור היוון לגרעין 11.3%")
+    assert _completions(r) == [] and r.text_support == {}
+    r, _, _ = _support(ws, THREE_RATES, [{"id": "S1", "quote": MISSING_RATE}])  # in S2, not in the passage it names
+    assert _completions(r) == [] and r.text_support == {}
+    assert not [p for p in r.problems if p.severity == "error"]  # the unit is never failed for it
+
+
+def test_a_quote_spanning_a_table_rows_cells_or_a_line_wrap_still_matches_after_normalisation():
+    ws = _file(SOURCE, ROWS_TEXT, units=(1, 1), declared=(1,))
+    ws.sources["S2"].kind = "table"
+    answer = "שיעור היוון למשרדים 6.5% [S2]. שיעור היוון למסחר 7.0% [S2]."
+    for quote in ("מחסנים | 9.1%", "מחסנים 9.1%", "מחסנים |  9.1%"):
+        r, _, _ = _support(ws, answer, quote)
+        assert len(_completions(r)) == 1, quote
+    wrapped = _file(SOURCE, "הוחלט כי שיעור ההיוון\nלמחסנים הוא\n9.1% לפי השמאי", units=(1, 1), declared=(1,))
+    r, _, _ = _support(wrapped, "שיעור היוון למשרדים 6.5% [S2].", "שיעור ההיוון למחסנים הוא 9.1% לפי השמאי")
+    assert len(_completions(r)) == 1
+
+
+def test_a_quote_in_the_neighbouring_unit_is_dropped_also_when_the_passage_spans_both_units():
+    other = "שיעורי היוון של שומה אחרת בקובץ: מחסנים: 5.5%"
+    ws = _rates_file(other, units=(1, 1, 2))
+    r, _, _ = _support(ws, THREE_RATES, [{"id": "S3", "quote": "מחסנים: 5.5%"}])
+    assert _completions(r) == [] and r.text_support == {}
+    # a passage that begins in the asked unit and runs on into the neighbour across a probable edge: its block is not known
+    # to lie in the asked unit, so it is no support
+    ws = _rates_file(units=(1, 1))
+    ws.sources["S2"].contexts = [1, 2]
+    r, _, _ = _support(ws, THREE_RATES, MISSING_RATE)
+    assert _completions(r) == []
+    ws.sources["S2"].contexts = [1]
+    r, _, _ = _support(ws, THREE_RATES, MISSING_RATE)
+    assert len(_completions(r)) == 1
+
+
+def test_a_quote_of_another_document_than_the_answers_is_dropped_even_without_units():
+    ws = _rates_file()
+    # a comparable's own file: one appraisal (no unit marks), read by the turn, cited by nothing, declared by nothing
+    cmp_ = ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="שומה של נכס להשוואה", section="סיכום",
+                         location="סעיף \"סיכום\"", kind="context", text="שיעורי היוון:\nמחסנים: 9.1%\nמשרדים: 6.5%")
+    _read(ws, cmp_.sid)
+    r, _, _ = _support(ws, THREE_RATES, [{"id": cmp_.sid, "quote": "מחסנים: 9.1%"}])
+    assert _completions(r) == [] and r.text_support == {}
+    ws.sources[cmp_.sid].document_id = ws.sources["S2"].document_id  # the same document: the answer is about it
+    r, _, _ = _support(ws, THREE_RATES, [{"id": cmp_.sid, "quote": "מחסנים: 9.1%"}])
+    assert len(_completions(r)) == 1
+
+
+def test_a_document_the_answer_declares_or_the_turn_located_is_one_the_answer_is_about():
+    ws = _rates_file()
+    ws.add_source(document_id=ws.sources["S1"].document_id, version_id=ws.sources["S1"].version_id, title="נספח", section="נספח",
+                  location="נספח", kind="context", text="")
+    other = ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="שומה אחרת", section="סיכום",
+                          location="סעיף \"סיכום\"", kind="context", text="שיעורי היוון:\nמחסנים: 9.1%")
+    _read(ws, other.sid)
+    ask = [{"id": other.sid, "quote": "מחסנים: 9.1%"}]
+    r, _, _ = _support(ws, THREE_RATES, ask)
+    assert _completions(r) == []
+    ws.located_unit = {"key": "k", "anchor": {"document_id": str(other.document_id)}}
+    r, _, _ = _support(ws, THREE_RATES, ask)
+    assert len(_completions(r)) == 1
+
+
+def test_a_quote_whose_content_another_unit_of_the_answer_already_holds_raises_nothing():
+    ws = _rates_file()
+    given = THREE_RATES + " שיעור ההיוון למחסנים הוא 9.1% [S2]."  # another unit (another batch's) gives the fourth rate
+    r, _, _ = _support(ws, given, MISSING_RATE)
+    assert _completions(r) == [] and r.text_support == {}
+
+
+def test_an_omitted_rate_whose_value_equals_another_listed_rate_still_raises_the_completion():
+    text = "\n".join(["שיעור היוון למשרדים 6.5%", "שיעור היוון למסחר 7.0%", "שיעור היוון לחניה 8.25%",
+                      "שיעור היוון למחסנים 7.0%"])
+    ws = _file(SOURCE, text, units=(1, 1), declared=(1,))
+    r, _, _ = _support(ws, THREE_RATES, "שיעור היוון למחסנים 7.0%")  # 7.0% is given, for the commerce rate
+    (p,) = _completions(r)
+    assert "למחסנים" in p.reason
+
+
+def test_support_is_merged_by_component_across_votes_and_each_entry_is_validated_alone():
+    ws = _file(SOURCE, RATES + "\nגרעין: 11.3%", units=(1, 1), declared=(1,))
+    turn = _turn({"id": "1", "text": ASK_RATES})
+    votes = [verify.JudgeRequirement(id="N1", status="partial", support=[verify.SupportQuote(id="S2", quote=MISSING_RATE)]),
+             verify.JudgeRequirement(id="N1", status="missing", support=[
+                 verify.SupportQuote(id="S2", quote=MISSING_RATE),  # again, from another call: once
+                 verify.SupportQuote(id="S2", quote="שיעור היוון לתחנה 4.4%"),  # not in the passage: dropped
+                 verify.SupportQuote(id="S2", quote="גרעין: 11.3%")])]
+    report = verify.VerifyReport(units=verify.split_units(THREE_RATES), requirements=[dict(r) for r in turn.items],
+                                 requirement_votes={"N1": votes})
+    assert verify.validated_support(report, ws, set()) == {
+        "N1": [{"id": "S2", "quote": MISSING_RATE}, {"id": "S2", "quote": "גרעין: 11.3%"}]}
+
+
+def test_a_unit_saying_the_part_was_not_found_while_valid_text_support_exists_is_replaced_as_an_absence():
+    ws = _rates_file()
+    markdown = THREE_RATES + " שיעור ההיוון למחסנים לא נמצא בשומה [S2]."
+    r, _, _ = _support(ws, markdown, MISSING_RATE)
+    absences = [p for p in r.problems if p.kind == "absence"]
+    assert len(absences) == 1 and "S2" in absences[0].reason and absences[0].component == "N1"
+    assert len(_completions(r)) == 1
+
+
+def test_a_text_completion_alone_is_text_only_and_mixed_or_data_problems_are_not():
+    ws = _rates_file()
+    r, _, _ = _support(ws, THREE_RATES, MISSING_RATE)
+    assert r.text_completion_only() is True
+    other = verify.Problem(verify.Unit(-1, "", "", []), verify.REQ_NOT_SEARCHED.format(text="דמי ניהול"),
+                           kind="requirement", component="N2")
+    r.problems.append(other)  # a component nobody searched for: the repair round needs its tools
+    assert r.text_completion_only() is False
+    r.problems.remove(other)
+    r.problems.append(verify.Problem(verify.Unit(-1, "", "", []), verify.REQ_DATA_FOUND.format(text="x", ids="V1"),
+                                     kind="requirement", component="N2"))  # a data completion keeps `calculate`
+    assert r.text_completion_only() is False
+    clean = verify.VerifyReport(units=[])
+    assert clean.text_completion_only() is False  # no problem: nothing to repair
+
+
+def test_a_failed_completion_leaves_a_gap_line_saying_where_the_part_was_read_and_not_used():
+    ws = _rates_file()
+    ws.sources["S2"].location = 'סעיף "שיעורי היוון", עמוד 7'
+    r, turn, answer = _support(ws, THREE_RATES, MISSING_RATE)
+    final, outcomes = _finish(ws, answer, r, turn)
+    (o,) = outcomes
+    assert o["limitation"] == "not_verifiable" and o["variant"] == "read_not_used" and o["stated"] is True
+    gap = _gap(final, answer)
+    assert "דוח בדיקה" in gap and "עמוד 7" in gap and "S2" in gap
+    assert "נקרא" in gap and "לא נעשה בו שימוש" in gap
+    assert "לא נמצא" not in gap and "לא אותר" not in gap and "לא מופיע" not in gap
+
+
+def test_a_component_whose_quote_was_invalid_keeps_the_not_located_wording_in_its_gap_line():
+    ws = _rates_file()
+    r, turn, answer = _support(ws, THREE_RATES, "שיעור היוון לגרעין 11.3%")
+    final, outcomes = _finish(ws, answer, r, turn)
+    (o,) = outcomes
+    assert o["limitation"] == "not_located" and o["variant"] != "read_not_used"
+    assert "נקרא" not in _gap(final, answer) or "לא אותר" in _gap(final, answer)
+    assert "support" in o and o["support"] == []
+
+
+def test_a_conditional_component_with_support_is_not_stated_as_a_gap():
+    ws = _rates_file()
+    turn = _turn({"id": "1", "text": ASK_RATES, "conditional": True})
+    score = lambda frozen, units: [_req("", "partial", list(units), id=frozen[0][0])  # noqa: E731
+                                   | {"missing": "שיעורי ההיוון", "support": [{"id": "S2", "quote": MISSING_RATE}]}]
+    answer = _answer(THREE_RATES)
+    r = verify_answer(_judge(score), answer, ws, "?", [], requirements=turn)
+    _, outcomes = _finish(ws, answer, r, turn)
+    assert outcomes[0]["status"] == "partial" and outcomes[0]["stated"] is False  # R21: a condition is never stated
+
+
+def test_the_verdict_cache_round_validates_the_carried_votes_support_against_the_new_answer():
+    ws = _rates_file()
+    cache = verify.VerdictCache()
+    r, _, _ = _support(ws, THREE_RATES, MISSING_RATE, cache=cache)
+    assert len(_completions(r)) == 1
+    again, _, _ = _support(ws, THREE_RATES + " שיעור ההיוון למחסנים הוא 9.1% [S2].", MISSING_RATE, cache=cache)
+    assert _completions(again) == []  # the repaired answer holds the part: the support is no longer evidence

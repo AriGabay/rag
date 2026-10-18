@@ -50,6 +50,10 @@ table, first match wins (``reason_of``):
    compared, never conflict;
 9. the judge's "undeterminable" (an evidence state, not a status) — found, not verifiable (or sources conflict, 8);
 10. data found that the verified answer does not present — found, not verifiable;
+10-text. a part of a partly given or missing component that a passage the turn read states, with a verbatim quote the
+    server validated (``verify.validated_support``, round 16 U2, KTD2) and the answer still omits — found, not verifiable,
+    variant ``read_not_used``: the part was read at that place (the document, the section or pages, the S#) and not used.
+    It never says "not found" (R6); a component whose quote was not valid keeps the wording below;
 10a. a professional question whose pool was empty — the office holds no standard or professional document (round 10 U8,
     KTD15, R29): the standard text is not in the repository — standard text absent (stated as the repository's gap, and
     the other permitted sources still answer);
@@ -418,6 +422,10 @@ def gap_sentence(reason: str, variant: str, texts: list[str], place: dict | None
         return f"{who}: חסר פרט שהמשתמש צריך לתת" + (f" ({detail})" if detail else "") + ", ולכן לא נקבעה תוצאה."
     if reason == "not_verifiable" and variant == "uncertain":
         return f"{who}: נמצא ערך, אבל קריאתו או משמעותו אינן ודאיות, ולכן הוא לא הוצג כנתון מאומת."
+    if reason == "not_verifiable" and variant == "read_not_used":
+        # round 16 U2, R6: the part was read at a place and the answer does not give it - what the turn did, never "not found"
+        return (f"{who}: {'החלקים נקראו' if many else 'החלק נקרא'} ב\"{document}\"" + (f" ({detail})" if detail else "")
+                + (f" [{sid}]" if sid else "") + ", ולא נעשה בו שימוש בתשובה.")
     if reason == "not_verifiable" and variant == "undeterminable":
         return f"{who}: המסמכים אינם מספיקים כדי להכריע בכך."
     if reason == "not_verifiable":
@@ -489,9 +497,13 @@ _H = re.compile(r"H(\d+)")
 def related_evidence(ws: Workspace, outcome: dict, turn: TurnRequirements | None) -> dict:
     """What the turn holds for a requirement, from the ids the judge named as related (each checked against the
     workspace): ``data`` — values, measurements and calculations; ``failures`` — failed calculations and tools;
-    ``checks`` — searches (H#) and readings (S#); ``documents`` — the documents of its data and readings."""
+    ``checks`` — searches (H#) and readings (S#); ``text`` — the passages the turn read that state a part the answer omits,
+    as ``[{"id": S#, "quote"}]`` (the judge's support the server validated, ``verify.validated_support``, carried by the
+    outcome's ``support``; round 16 U2); ``documents`` — the documents of its data, readings and text."""
     incidents = {x["id"]: x for x in (turn.incidents if turn is not None else [])}
     data, failures, checks, documents = [], [], [], []
+    text = [dict(x) for x in outcome.get("support") or [] if x.get("id") in ws.sources]
+    documents += [str(ws.sources[x["id"]].document_id) for x in text]
     for i in outcome.get("related") or []:
         if i in ws.values:
             data.append(i)
@@ -511,7 +523,8 @@ def related_evidence(ws: Workspace, outcome: dict, turn: TurnRequirements | None
             documents.append(str(ws.sources[i].document_id))
         elif (m := _H.fullmatch(i)) and 1 <= int(m.group(1)) <= len(ws.searches):
             checks.append(i)
-    return {"data": data, "failures": failures, "checks": checks, "documents": list(dict.fromkeys(documents))}
+    return {"data": data, "failures": failures, "checks": checks, "text": text,
+            "documents": list(dict.fromkeys(documents))}
 
 
 def _uncertain_value(ws: Workspace, ids: list[str]) -> bool:
@@ -688,6 +701,8 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
         return out | {"reason": "not_verifiable", "variant": "undeterminable"}
     if ev["data"]:
         return out | {"reason": "not_verifiable", "variant": "not_presented"}
+    if ev["text"]:  # a passage the turn read states the part and the answer does not give it (round 16 U2, R6): never "not found"
+        return out | _read_not_used(ws, ev["text"][0]["id"])
     # a professional question whose pool was empty: the repository holds no standard or professional document (U8, KTD15,
     # R29). It says what the repository lacks — never that a search found nothing in a standard
     if ws.intent == PROFESSIONAL and ws.standards_absent:
@@ -745,6 +760,15 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
     if out["searched"] and len(outside) < len(ev["checks"]):
         return out | {"reason": "not_located", "variant": "searched"}
     return out | {"reason": "not_located", "searched": False}
+
+
+def _read_not_used(ws: Workspace, sid: str) -> dict:
+    """The gap of a part the turn read at ``sid`` (validated support) and the answer does not give: where it was read — the
+    document, the section or pages, the S# — and that it was not used. The place is that passage's."""
+    src = ws.sources[sid]
+    place = {"sid": sid, "scope": "section" if src.section else None, "name": src.section}
+    return {"reason": "not_verifiable", "variant": "read_not_used", "searched": True, "place": place,
+            "document": src.title, "document_id": str(src.document_id), "detail": src.location or ""}
 
 
 def _not_read_gap(ws: Workspace) -> dict:
@@ -813,7 +837,10 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
         # ``verify.valid_missing``): a conditional requirement (R21) or one that is no datum of the documents never is
         if o["status"] != "partial" or o["conditional"] or o["kind"] not in ("information", "calculation"):
             o["missing_part"] = ""
-        o["stated"] = o["status"] != "partial" or o["kind"] == "instruction" or bool(o["missing_part"])
+        # a part a read passage states and the answer omits is stated too (round 16 U2, R6), never a conditional component
+        o["stated"] = (o["status"] != "partial" or o["kind"] == "instruction" or bool(o["missing_part"])
+                       or (o["variant"] == "read_not_used" and not o["conditional"]
+                           and o["kind"] in ("information", "calculation")))
         o["gap"] = gap_sentence(why["reason"], o["variant"], [gap_label(o)], o["place"], o["document"], o["detail"])
     return outcomes
 
