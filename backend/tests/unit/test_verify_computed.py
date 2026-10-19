@@ -175,6 +175,40 @@ def test_a_wrong_step_is_not_bound_even_when_an_input_is_cited():
     assert verify.bind_computations(units, ws, QUESTION) == {}
 
 
+# --- a stated date is never an unstated number in a calculation unit (round 18 U2, KTD3, R8) ---------------------------------
+
+def _dated_scenario(date_line: str | None = "למועד הקובע 15/04/2025", text: str = "סיכום השומה: ההכנסות והעלויות של הפרויקט.") -> Workspace:
+    ws = _scenario()
+    ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="שומת הדגמה", section="סיכום", location="עמוד 4",
+                  kind="context", text=text)
+    ws.sources["S1"].date_line = date_line
+    return ws
+
+
+@pytest.mark.parametrize("written", ["15.04.2025", "15/04/2025", "15.4.2025"])
+def test_the_digits_of_a_valuation_date_the_calculations_source_states_are_not_unstated_in_a_calculation_unit(written):
+    ws = _dated_scenario()
+    assert _numbers_only(ws, f"נכון ל-{written}, הרווח בתרחיש יהיה 1,530,000 ₪ [C1][A1].") == []
+
+
+def test_a_date_the_calculations_source_writes_in_its_text_is_not_unstated_in_a_calculation_unit():
+    ws = _dated_scenario(date_line=None, text="סיכום השומה למועד 15/04/2025: ההכנסות והעלויות של הפרויקט.")
+    assert _numbers_only(ws, "נכון ל-15.04.2025, הרווח בתרחיש יהיה 1,530,000 ₪ [C1][A1].") == []
+
+
+@pytest.mark.parametrize("other", ["16.04.2025", "15.05.2025", "15.04.2024"])
+def test_another_date_in_a_calculation_unit_is_still_unstated(other):
+    ws = _dated_scenario()
+    problems = _numbers_only(ws, f"נכון ל-{other}, הרווח בתרחיש יהיה 1,530,000 ₪ [C1][A1].")
+    assert problems and problems[0].check == "computation_mismatch"
+
+
+def test_an_invented_number_in_a_calculation_unit_is_still_removed_with_a_stated_date():
+    ws = _dated_scenario()
+    (problem,) = _numbers_only(ws, "נכון ל-15.04.2025, הרווח בתרחיש יהיה 1,530,000 ₪ על 7,777 מ\"ר [C1][A1].")
+    assert problem.check == "computation_mismatch" and "7777" in problem.reason and "2025" not in problem.reason
+
+
 # --- scale words -------------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("shown, ok", [

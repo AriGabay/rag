@@ -757,3 +757,35 @@ def test_public_removals_passes_the_new_kind_with_its_fixed_sentence():
     out = api.public_removals([{"failure_kind": "context_not_read", "component": "N1", "text": "must not leak"}])
     assert out == [{"failure_kind": "context_not_read", "component": "N1",
                     "text": verify.REMOVAL_SENTENCES["context_not_read"]}]
+
+
+# --- an expansion is not adopted on a row ordinal of another table (round 18 U2, KTD3, R8) ------------------------------
+
+ORDINAL_TABLE = "1 | דירה א | 100\n2 | דירה ב | 200\n3 | דירה ג | 300"
+
+
+def test_an_expansion_whose_only_match_is_a_row_ordinal_of_another_table_is_not_adopted():
+    ws = _table_ws()
+    fetcher = FakeFetcher({("S1", "next_page"): ORDINAL_TABLE}, ws=ws)
+    report = verify_answer(_all_supported(), _answer("מספר החדרים בדירה הוא 3 [S1]."), ws, "?", [], reread=fetcher)
+    (p,) = report.problems
+    assert p.removes_unit and p.check == "unstated_number" and p.unstated == ["3"]
+    assert fetcher.adopted == [] and list(ws.sources) == ["S1"]
+    assert "next_page" in [x["scope"] for x in report.claims[0][0].rereads]
+    assert {x["outcome"] for x in report.claims[0][0].rereads} == {"not_found"}
+
+
+def test_the_same_number_written_as_a_value_in_the_expansion_is_still_adopted():
+    ws = _table_ws()
+    fetcher = FakeFetcher({("S1", "next_page"): "מספר חדרים | 3\n" + ORDINAL_TABLE}, ws=ws)
+    report = verify_answer(_all_supported(), _answer("מספר החדרים בדירה הוא 3 [S1]."), ws, "?", [], reread=fetcher)
+    assert report.ok and fetcher.adopted == [("S1", "next_page")]
+
+
+def test_only_consecutive_rows_that_count_are_row_ordinals():
+    blanked = verify._without_row_ordinals(ORDINAL_TABLE)
+    assert not verify.numbers_in(blanked) & {"1", "2", "3"}
+    assert verify.numbers_in(blanked) >= {"100", "200", "300"}
+    # a lone first cell, or one that does not count on, is a value
+    assert verify.numbers_in(verify._without_row_ordinals("3 | דירה ג | 300")) >= {"3"}
+    assert verify.numbers_in(verify._without_row_ordinals("3 | א | 1\n7 | ב | 2")) >= {"3", "7"}

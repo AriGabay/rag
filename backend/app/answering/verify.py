@@ -27,8 +27,9 @@ from app.providers.llm import (
 )
 
 CITE = re.compile(r"\[(E\d+)\]")
-# A number may follow a Hebrew prefix letter ("ב2019"), but not a Latin letter, digit or underscore.
-_NUMBER = re.compile(r"(?<![0-9A-Za-z_])\d[\d,]*(?:\.\d+)?")
+# A number may follow a Hebrew prefix letter ("ב2019"), but not a Latin letter, digit or underscore. A comma is a thousands
+# separator only in groups of three ("1,250,000"): "2018,2019,2021" is a list of three years.
+_NUMBER = re.compile(r"(?<![0-9A-Za-z_])(?:\d{1,3}(?:,\d{3})+(?!\d)|\d+)(?:\.\d+)?")
 # a date ends where no digit continues it: sentence punctuation after it ("01.11.1966." / "…,") is not a decimal
 # part, while a further "./" and digit ("1.2.2020.5") makes it a longer chain, which is no date
 _DATE = re.compile(r"(?<![\d.,/])(\d{1,2})[./-](\d{1,2})[./-](\d{4}|\d{2})(?!\d)(?![./]\d)")

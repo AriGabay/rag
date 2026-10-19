@@ -170,9 +170,6 @@ YEARS_LINE = "שווי הנכס נקבע לפי ממוצע שנות הבסיס 2
 UNIT_LINE = "מחיר ליחידת דיור בפרויקט הוא 50,000 ₪ [S1]."
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "U2: 'unstated_number' removes both sentences: '2021,2022,2023' is read as one number, so the three years are"
-    " unstated, and '50K' is read as 50, so 50,000 is unstated"))
 def test_a_list_of_years_joined_by_commas_and_an_amount_the_source_abbreviates_are_not_unstated_numbers(
         client, office, monkeypatch):
     m = ask(client, office, monkeypatch, NUMBERS, open_section(NUMBERS["years_heading"]), f"{YEARS_LINE}\n{UNIT_LINE}",
@@ -187,9 +184,6 @@ def test_a_list_of_years_joined_by_commas_and_an_amount_the_source_abbreviates_a
 VAT_ANSWER = "שווי הנכס בגישת ההשוואה הוא 16.07 מיליון ₪ כולל מע״מ [S1]."
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "U2: VAT backing compares the number as written: '16.07 מיליון' finds no VAT status for 16,070,000, so 'כולל מע״מ' is"
-    " replaced by '(המע\"מ לא צוין במקור)'"))
 def test_an_amount_written_in_millions_keeps_its_vat_wording_when_the_source_writes_it_in_full_digits(
         client, office, monkeypatch):
     m = ask(client, office, monkeypatch, NUMBERS, open_section(NUMBERS["vat_heading"]), VAT_ANSWER,

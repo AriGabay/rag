@@ -1688,3 +1688,83 @@ def test_a_percentage_of_a_fraction_any_source_of_the_turn_states_backs_a_unit_t
     ws = _ws("גישה א | 0.8")
     assert _numbers("משקל של 80% בשומה.", ws) == []
     assert _numbers("משקל של 75% בשומה.", ws)
+
+
+# --- number forms, VAT attachment and calculation dates (round 18 U2, KTD3, R8) ----------------------------------------------
+
+def test_a_source_listing_averaging_years_joined_by_commas_backs_each_year():
+    source = "הממוצע חושב על השנים 2018,2019,2021 בלבד."
+    assert _deterministic("הממוצע נלקח לפי השנים 2018, 2019 ו-2021 [S1].", source) == []
+    (problem,) = _deterministic("הממוצע נלקח לפי השנים 2018, 2019 ו-2020 [S1].", source)
+    assert problem.check == "unstated_number" and "2020" in problem.unstated and "2019" not in problem.unstated
+
+
+@pytest.mark.parametrize("source, claimed", [
+    ("הערך הנקוב הוא 850 אלף ₪.", "850,000"), ("הערך הנקוב הוא 1.5 מיליון ₪.", "1,500,000"),
+    ("הערך הנקוב הוא 122.7K ₪.", "122,700"), ("הערך הנקוב הוא 850 א׳ ₪.", "850,000"),
+    ("הערך הנקוב הוא ₪ 2.4M.", "2,400,000"),
+])
+def test_a_full_digit_amount_whose_source_writes_it_with_a_scale_word_is_not_an_unstated_number(source, claimed):
+    assert _deterministic(f"הערך הנקוב הוא {claimed} ₪ [S1].", source) == []
+
+
+def test_a_full_digit_amount_that_is_not_the_scaled_source_amount_is_still_unstated():
+    (problem,) = _deterministic("הערך הנקוב הוא 850,001 ₪ [S1].", "הערך הנקוב הוא 850 אלף ₪.")
+    assert "850001" in problem.unstated
+
+
+@pytest.mark.parametrize("source, claim", [
+    ("שווי הנכס 122,700,000 ₪ כולל מע\"מ.", "שווי הנכס 122.7 מיליון ₪ כולל מע\"מ"),
+    ("שווי הנכס 122.7 מיליון ₪ כולל מע\"מ.", "שווי הנכס 122,700,000 ₪ כולל מע\"מ"),
+    ("שווי הנכס 850 אלף ₪ לא כולל מע\"מ.", "שווי הנכס 850,000 ₪, ללא מע\"מ"),
+])
+def test_vat_is_compared_by_value_across_the_written_forms_of_an_amount(source, claim):
+    unit = split_units(f"{claim} [S1].")[0]
+    assert verify._wrong_vat(unit, _ws(source)) == []
+    assert verify._vat_problems(unit, _ws(source)) == []
+    assert _deterministic(f"{claim} [S1].", source) == []
+
+
+def test_vat_of_the_other_status_on_the_same_amount_in_another_form_is_still_wrong():
+    # protection: the source excludes the VAT of 122,700,000; "122.7 מיליון ... כולל מע״מ" is the opposite status
+    source = "שווי הנכס 122,700,000 ₪ לא כולל מע\"מ."
+    unit = split_units("שווי הנכס 122.7 מיליון ₪ כולל מע\"מ [S1].")[0]
+    assert verify._wrong_vat(unit, _ws(source))
+    (problem,) = [p for p in _deterministic("שווי הנכס 122.7 מיליון ₪ כולל מע\"מ [S1].", source) if p.check == "vat"]
+    assert "122.7" in problem.reason
+
+
+def test_a_vat_phrase_after_a_property_name_that_holds_a_number_is_not_attached_to_that_number():
+    pairs, general = verify.vat_attachments("דמי השכירות 58 ₪ לחודש בבניין מגדל הים 7 ללא מע\"מ")
+    assert pairs == {(f, "excluded") for f in verify.numbers_in("58")} and not general
+    source = "דמי השכירות 58 ₪ לחודש, ללא מע\"מ. הנכס נמצא בבניין מגדל הים 7."
+    assert _deterministic("דמי השכירות 58 ₪ לחודש בבניין מגדל הים 7 ללא מע\"מ [S1].", source) == []
+    # a plain number after a word that is no identifier is still an amount that carries the VAT
+    pairs, _ = verify.vat_attachments("דמי השכירות 58 ללא מע\"מ")
+    assert pairs == {("58", "excluded")}
+
+
+def test_a_vat_phrase_inside_the_parentheses_of_an_amount_belongs_to_that_amount():
+    pairs, general = verify.vat_attachments("השווי 3,100,000 ₪ (מתוכם 2,450,000 ₪ ללא מע\"מ)")
+    assert pairs == {(f, "excluded") for f in verify.numbers_in("2,450,000")} and not general
+    source = "השווי 3,100,000 ₪; מתוכם 2,450,000 ₪ ללא מע\"מ."
+    unit = split_units("השווי 3,100,000 ₪ (מתוכם 2,450,000 ₪ ללא מע\"מ) [S1].")[0]
+    assert verify._wrong_vat(unit, _ws(source)) == []
+    # a VAT phrase after the parentheses still belongs to the amount before them
+    pairs, _ = verify.vat_attachments("9,500 ₪ (שטח 120 מ\"ר), לא כולל מע\"מ")
+    assert pairs == {(f, "excluded") for f in verify.numbers_in("9,500")}
+
+
+def test_an_unstated_number_repair_names_the_number_and_asks_to_add_a_citation_not_to_replace_one():
+    (problem,) = _deterministic("הערך הנקוב הוא 850,001 ₪ [S1].", "הערך הנקוב הוא 850 אלף ₪.")
+    note = problem.repair_note()
+    assert "850,001" in note and "הוסף לטענה ציטוט" in note
+    assert "החלף" not in note and "במקום" not in note
+
+
+def test_vat_of_an_amount_shown_in_millions_is_backed_by_the_full_amount_rounded_to_the_shown_precision():
+    source = "שווי הנכס 122,749,000 ₪ כולל מע\"מ."
+    unit = split_units("שווי הנכס 122.7 מיליון ₪ כולל מע\"מ [S1].")[0]
+    assert verify._wrong_vat(unit, _ws(source)) == []
+    other = split_units("שווי הנכס 122.8 מיליון ₪ כולל מע\"מ [S1].")[0]
+    assert verify._wrong_vat(other, _ws(source))

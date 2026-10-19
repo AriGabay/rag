@@ -639,6 +639,9 @@ DEFECT_FAILURES = {"input": "wrong_calculation", "scenario": "wrong_calculation"
 # unmet instruction is a gap, never a removal
 KIND_FAILURES = {"input_choice": "wrong_calculation", "assumption": "wrong_calculation"}
 # how a repair of those kinds goes (KTD10): the stated amount, or the question the user must answer
+# how a repair of an unstated number goes (round 18 U2, KTD3): the citation it lacks is added, a valid one is never taken away
+UNSTATED_HINT = ("הוסף לטענה ציטוט של מקור שהמספר {numbers} כתוב בו, והשאר את הציטוטים התקפים שלה כפי שהם; "
+                 "אם אין מקור כזה — השמט את הטענה")
 KIND_HINTS = {"input_choice": "קח את הסכום שהמקור מציין (take_value) וחשב ממנו מחדש ב-calculate",
               "assumption": "אל תניח את הפרט: הצג את הנתונים שנמצאו עם מראי המקום, נוסחה כללית בלי מספר ושאלה אחת "
                             "ממוקדת (status=clarification)"}
@@ -1471,6 +1474,11 @@ class Problem:
         if self.failure_kind is None:
             self.failure_kind = KIND_FAILURES.get(self.kind)
 
+    def unstated_written(self) -> list[str]:
+        """The ``unstated`` numbers as the unit writes them (a few, in order of appearance)."""
+        written = [n.written for n in _shown(self.unit.text) if set(numbers_in(n.written)) & set(self.unstated)]
+        return list(dict.fromkeys(written or self.unstated))[:5]
+
     @property
     def uncited(self) -> bool:
         """The server found evidence (``cite``) that the unit does not cite yet."""
@@ -1533,6 +1541,8 @@ class Problem:
         if self.checked_ids:
             parts.append("נבדק מול: " + ", ".join(self.checked_ids))
         hint = KIND_HINTS.get(self.kind) or REPAIR_HINTS.get(self.failure_kind)
+        if self.check == "unstated_number" and self.unstated:
+            hint = UNSTATED_HINT.format(numbers=", ".join(self.unstated_written()))
         if hint:
             parts.append("תיקון: " + hint)
         return " (" + "; ".join(parts) + ")"
@@ -3248,6 +3258,18 @@ def _shown(text: str) -> tuple[Shown, ...]:
     return tuple(out)
 
 
+def scaled_numbers_in(text: str) -> set[str]:
+    """The full values of the numbers ``text`` writes with a scale word or abbreviation ("850 אלף" is 850,000, "1.5 מיליון"
+    1,500,000, "122.7K" 122,700), normalized as ``numbers_in`` gives them (round 18 U2, KTD3): an answer that writes such an
+    amount in full digits restates the source's number, it does not add one. The digits as written stay in ``numbers_in``."""
+    out: set[str] = set()
+    for n in _shown(text):
+        amount = n.amount
+        if amount is not None and n.scale != 1 and not n.percent:
+            out |= numbers_in(format(amount * n.scale, "f"))
+    return out
+
+
 def _shows(c, written: str, percent: bool, scale: int, steps: bool = True) -> bool:
     """Whether a number as shown is calculation ``c``'s result (or, with ``steps``, one of its intermediate results)
     rounded to the precision and in the scale it is written in — the scale word's against the scale the result is
@@ -3330,16 +3352,39 @@ def _valuation_dates(src) -> list[tuple[str, str]]:
     return [(p.iso, p.precision) for p in shared_dates.find_all(line[len(lead):])] if line.startswith(lead) else []
 
 
+def _calculation_inputs(ws: Workspace, ids: list[str]) -> list[str]:
+    """The sources, values and measurements behind the calculations among ``ids``, through the calculations they rest on."""
+    out: list[str] = []
+    todo = [i for i in ids if i in ws.computations]
+    seen: set[str] = set()
+    while todo:
+        c = ws.computations.get(todo.pop())
+        if c is None:
+            continue
+        for i in [*c.sources, *(x["id"] for x in c.inputs)]:
+            if i in ws.computations and i not in seen:
+                seen.add(i)
+                todo.append(i)
+            elif i not in ids and i not in out:
+                out.append(i)
+    return out
+
+
 def _date_backed(text: str, ws: Workspace, ids: list[str]) -> set[str]:
     """The number tokens of the dates a unit's text gives that a cited value (V#) or measurement (M#) states as its own
     date (``as_of``: read by the server from the source's date line, row, caption or unit; round 11 U15 B, as KTD10 does
     for the VAT), or that a cited passage's unit states as its valuation date (``_valuation_dates``, round 13 U9, KTD10): the
     date sits in the record the claim cites, though the cited passage may not hold the line. A date
     counts when it is, at its precision or coarser, one of the stated dates (a range: both ends); a date the record does
-    not hold is not backed, and a token that is also written outside every backed date ("10 יחידות") is not either."""
-    stated = [d for i in ids
+    not hold is not backed, and a token that is also written outside every backed date ("10 יחידות") is not either. A unit citing a calculation (C#) also rests on the dates of the sources and records behind its
+    inputs (``_calculation_inputs``), in whatever form they write them (round 18 U2)."""
+    behind = _calculation_inputs(ws, ids)
+    stated = [d for i in [*ids, *behind]
               for d in chat_dates.stated_dates(getattr(ws.values.get(i) or ws.measurements.get(i), "as_of", None))]
-    stated += [d for i in ids if i in ws.sources for d in _valuation_dates(ws.sources[i])]
+    stated += [d for i in [*ids, *behind] if i in ws.sources for d in _valuation_dates(ws.sources[i])]
+    # a calculation states the dates of the sources behind its inputs, in whatever form they write them (round 18 U2, KTD3)
+    stated += [(p.iso, p.precision) for i in behind if i in ws.sources
+               for p in shared_dates.find_all(without_part_tags(ws.sources[i].text))]
     if not stated:
         return set()
     backed = [p for p in shared_dates.find_all(text)
@@ -3399,11 +3444,13 @@ def _all_numbers(ws: Workspace) -> set[str]:
     nums: set[str] = set()
     for s in ws.sources.values():
         if not s.is_listing:
-            nums |= numbers_in(without_part_tags(s.text), words=True)
+            nums |= numbers_in(without_part_tags(s.text), words=True) | scaled_numbers_in(without_part_tags(s.text))
     for m in ws.measurements.values():
-        nums |= numbers_in(f"{m.row.value_text} {m.row.quote}", words=True)
+        written = f"{m.row.value_text} {m.row.quote}"
+        nums |= numbers_in(written, words=True) | scaled_numbers_in(written)
     for v in ws.values.values():
-        nums |= numbers_in(f"{v.written} {v.quote}", words=True)
+        written = f"{v.written} {v.quote}"
+        nums |= numbers_in(written, words=True) | scaled_numbers_in(written)
     for r in (*ws.values.values(), *ws.measurements.values()):
         nums |= numbers_in(" ".join(_as_of_forms(r.as_of)))
     for a in ws.assumptions.values():
@@ -3433,10 +3480,18 @@ def _unwrap_vat_lines(text: str) -> str:
 _NOT_A_PRICE_AFTER = re.compile(r"\s*(?:מ[\"״']?ר|מטר|דונם|שנ(?:ה|ים|ות)|חודש(?:ים)?|קומות|יח[\"״']?ד|%)")
 
 
-def _vat_bearing(clause: str, m: re.Match) -> bool:
+# the words that open the name of a property, plot or building ("מגדל הים 7", "גוש 1234"): a short number after one is part of
+# the name, whatever VAT phrase follows it (round 18 U2, KTD3)
+_NAME_BEFORE = re.compile(
+    r"(?<![א-ת])[בהולכמש]?(?:גוש|חלקה|תת[\s-]*חלקה|מגרש|דירה|דירת|יחידה|בניין|בנין|מבנה|מגדל|פרויקט|מתחם|רחוב|שדרות|"
+    r"שד[׳']|סמטת|בית|כניסה|קומה)\s+(?:[א-ת\"'׳״\-]+\s+){0,2}$")
+
+
+def _vat_bearing(clause: str, m: re.Match, nested: bool = False) -> bool:
     """Whether a number can carry a VAT status: not a year, not an area, count or rate (a number followed by
-    מ״ר, דונם, שנים, % ...), and not a number inside parentheses ("9,500 ₪ (שטח 120 מ״ר), לא כולל מע״מ" — the
-    VAT is the 9,500's)."""
+    מ״ר, דונם, שנים, % ...), not a number in the name of a property, plot or building (a short whole number after
+    "מגדל הים", "גוש", ...), and not a number inside parentheses ("9,500 ₪ (שטח 120 מ״ר), לא כולל מע״מ" — the VAT is the
+    9,500's) — unless ``nested``: the number is in the parentheses that hold the VAT phrase itself, which then belong to it."""
     value = m.group(0).replace(",", "")
     if re.fullmatch(r"(19|20)\d\d", value) and "₪" not in clause[m.end():m.end() + 3]:
         return False
@@ -3444,8 +3499,37 @@ def _vat_bearing(clause: str, m: re.Match) -> bool:
         return False
     if _NOT_A_PRICE_AFTER.match(clause, m.end()):
         return False
+    if (value.isdigit() and len(value) <= 4 and "₪" not in clause[max(0, m.start() - 2):m.end() + 3]
+            and _NAME_BEFORE.search(clause[max(0, m.start() - 40):m.start()])):
+        return False
     before = clause[:m.start()]
-    return before.count("(") <= before.count(")")
+    return nested or before.count("(") <= before.count(")")
+
+
+def _open_parenthesis(clause: str, pos: int) -> int | None:
+    """Where the innermost parenthesis still open at ``pos`` of ``clause`` starts; None when none is."""
+    opened: list[int] = []
+    for i, ch in enumerate(clause[:pos]):
+        if ch == "(":
+            opened.append(i)
+        elif ch == ")" and opened:
+            opened.pop()
+    return opened[-1] if opened else None
+
+
+def _value_forms(text: str, m: re.Match) -> set[str]:
+    """The forms of the number matched at ``m`` in ``text`` (``numbers_in``) and, written with a scale word, the forms of its full
+    value too: "122.7 מיליון" is also 122,700,000 (round 18 U2, KTD3)."""
+    from app.chat.calc import scale_after
+
+    forms = numbers_in(m.group(0))
+    scale = scale_after(text, m.start(), m.end())[0]
+    if scale != 1:
+        try:
+            forms |= numbers_in(format(Decimal(m.group(0).replace(",", "")) * scale, "f"))
+        except InvalidOperation:
+            pass
+    return forms
 
 
 def _vat_polarity(m: re.Match) -> str:
@@ -3463,12 +3547,18 @@ def _vat_phrases(text: str, skip_absence: bool):
     for end_m in [*_CLAUSE_END.finditer(text), None]:
         end = end_m.end() if end_m else len(text)
         clause = text[start:end]
-        nums = [(n.start(), numbers_in(n.group(0))) for n in _NUM_AT.finditer(clause) if _vat_bearing(clause, n)]
+        numbers = list(_NUM_AT.finditer(clause))
+        nums = [(n.start(), _value_forms(clause, n)) for n in numbers if _vat_bearing(clause, n)]
         for v in [] if skip_absence and meaning.ABSENCE_SENTENCE.search(clause) else _VAT.finditer(clause):
             polarity = _vat_polarity(v)
             if not polarity:
                 continue
             before = [forms for pos, forms in nums if pos < v.start()]
+            opened = _open_parenthesis(clause, v.start())
+            if opened is not None:  # a phrase inside parentheses belongs to the amount in those parentheses
+                inside = [_value_forms(clause, n) for n in numbers if opened < n.start() < v.start()
+                          and _vat_bearing(clause, n, nested=True)]
+                before = inside or before
             yield (before[-1] if before else None), polarity, start + v.start(), start + v.end()
         start = end
 
@@ -3548,14 +3638,35 @@ def _vat_backing(unit: Unit, ws: Workspace) -> set[tuple[str, str]]:
 
 
 def _wrong_vat(unit: Unit, ws: Workspace, backed: set[tuple[str, str]] | None = None) -> list[tuple[str, str]]:
-    """The (number, VAT status) pairs the unit gives that its cited sources do not give that number. ``backed`` is
-    ``_vat_backing(unit, ws)`` when the caller already has it."""
-    claimed, _ = vat_attachments(unit.text, skip_absence=True)
+    """The (number, VAT status) pairs the unit gives that its cited sources do not give that number: a number is compared
+    by value (``_value_forms``), and one shown in a scale at its precision is the full amount rounded to it ("122.7 מיליון"
+    for 122,700,000 and for 122,749,000). ``backed`` is ``_vat_backing(unit, ws)`` when the caller already has it."""
+    from app.chat.calc import display_matches
+
+    claimed = [(forms, polarity) for forms, polarity, _, _ in _vat_phrases(unit.text, True) if forms is not None]
     if not claimed:
         return []
     if backed is None:
         backed = _vat_backing(unit, ws)
-    return sorted((n, pol) for n, pol in claimed if (n, pol) not in backed and not n.isalpha())
+    scaled = [n for n in _shown(unit.text) if n.scale != 1 and not n.percent]
+    wrong: set[tuple[str, str]] = set()
+    for forms, polarity in claimed:
+        if any((f, polarity) in backed for f in forms):
+            continue
+        mine = [n for n in scaled if numbers_in(n.written) <= forms]
+        if mine and any(pol == polarity and (v := _decimal(f)) is not None
+                        and any(display_matches(n.written, False, v, (), None, n.scale) for n in mine)
+                        for f, pol in backed):
+            continue
+        wrong |= {(f, polarity) for f in forms if not f.isalpha()}
+    return sorted(wrong)
+
+
+def _decimal(token: str) -> Decimal | None:
+    try:
+        return Decimal(token)
+    except InvalidOperation:
+        return None
 
 
 def _vat_problems(unit: Unit, ws: Workspace) -> list[str]:
@@ -4455,12 +4566,12 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
     ``bind_computations`` turns it off, so the percent form of a cited value is still derived and bound as a C#.
     ``origins``: whether a cited value also states the source line it was registered from (``_value_origin``); also off in
     ``bind_computations``, so a result the source line happens to write is still bound to the calculation that made it."""
-    cited: set[str] = set(numbers_in(extra_text, words=True)) if extra_text else set()
+    cited: set[str] = (set(numbers_in(extra_text, words=True)) | scaled_numbers_in(extra_text)) if extra_text else set()
     by_id: dict[str, set[str]] = {}
     for i, t in _texts(ws, u.ids):
         found = stated_by.get(i) if stated_by is not None else None
         if found is None:
-            found = numbers_in(t, words=True)
+            found = numbers_in(t, words=True) | scaled_numbers_in(t)
             if stated_by is not None:
                 stated_by[i] = found
         by_id[i] = found
@@ -4470,7 +4581,8 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
             key = f"{i}\x00origin"
             found = stated_by.get(key) if stated_by is not None else None
             if found is None:
-                found = numbers_in(_value_origin(ws, ws.values[i]), words=True)
+                origin = _value_origin(ws, ws.values[i])
+                found = numbers_in(origin, words=True) | scaled_numbers_in(origin)
                 if stated_by is not None:
                     stated_by[key] = found
             cited |= found
@@ -6127,6 +6239,27 @@ class _TurnNumbers:
         self._numbers = None
 
 
+_ROW_ORDINAL = re.compile(r"^([ \t]*\|?[ \t]*)(\d{1,3})(?=[ \t]*\|)", re.M)
+
+
+def _without_row_ordinals(body: str) -> str:
+    """``body`` with the row ordinals of its tables blanked: the first cell of consecutive rows that counts them (1, 2, 3 ...).
+    A small number that only an ordinal of another table writes is that table's row number, not the datum the unit gives, so it
+    does not make the expansion state the number (round 18 U2, KTD3)."""
+    blank: list[re.Match] = []
+    run: list[re.Match] = []
+    for m in _ROW_ORDINAL.finditer(body):
+        if run and int(m.group(2)) == int(run[-1].group(2)) + 1:
+            run.append(m)
+            continue
+        blank += run if len(run) > 1 else []
+        run = [m]
+    blank += run if len(run) > 1 else []
+    for m in sorted(blank, key=lambda x: x.start(2), reverse=True):
+        body = body[:m.start(2)] + " " * len(m.group(2)) + body[m.end(2):]
+    return body
+
+
 def _expand_numbers(u: Unit, sid: str, ws: Workspace, question_numbers: set[str], everything: _TurnNumbers,
                     deadline: float | None, fetcher: ContextFetcher) -> str | None:
     """Reads the places of ``UNSTATED_EXPANSIONS`` of ``sid`` for the numbers no passage ``u`` cites states (round 13): the
@@ -6155,7 +6288,7 @@ def _expand_numbers(u: Unit, sid: str, ws: Workspace, question_numbers: set[str]
             _log_reread(ws, key, **entry, outcome="check_failed")
             return None
         body = _expansion_text(got)
-        if not body or _unstated(u, ws, question_numbers, everything.get(), extra_text=body):
+        if not body or _unstated(u, ws, question_numbers, everything.get(), extra_text=_without_row_ordinals(body)):
             _log_reread(ws, key, **entry, outcome="not_found")
             continue
         new_sid = _adopt_expansion(fetcher, sid, kind)

@@ -38,3 +38,27 @@ def test_a_real_decimal_at_a_sentence_end_stays_a_decimal():
 def test_a_dotted_chain_that_continues_is_not_a_date():
     # a section number or a version ("1.2.3.4") keeps its earlier reading: the date needs its end
     assert "1.2" in numbers_in("סעיף 1.2.3.4 בתקנון")
+
+
+# --- a comma is a thousands separator only in groups of three (round 18 U2, KTD3, R8) ---------------------------------
+
+def test_a_comma_joined_list_of_years_reads_as_each_year():
+    years = numbers_in("2018") | numbers_in("2019") | numbers_in("2021")
+    assert numbers_in("ממוצע השנים 2018,2019,2021") == years
+    assert numbers_in("השנים 2018,2019") == numbers_in("2018") | numbers_in("2019")
+    assert numbers_in("השנים 2018, 2019 ו-2021") == years
+
+
+@pytest.mark.parametrize("text, plain", [
+    ("1,250,000", "1250000"), ("12,500", "12500"), ("1,250.5", "1250.5"), ("999", "999"),
+    ("סך הכל 1,250,000.", "סך הכל 1250000."),
+])
+def test_numbers_with_thousands_separators_read_as_before(text, plain):
+    assert numbers_in(text) == numbers_in(plain)
+    assert "1250000" in numbers_in("1,250,000") and "12500" in numbers_in("12,500")
+
+
+def test_two_numbers_the_list_joins_are_not_one_thousands_number():
+    assert numbers_in("סך הכל 1,250,000, והשאר 12,500.") == numbers_in("1250000") | numbers_in("12500")
+    assert numbers_in("2018,201") == numbers_in("2018") | numbers_in("201")
+    assert numbers_in("12,5678") == numbers_in("12") | numbers_in("5678")

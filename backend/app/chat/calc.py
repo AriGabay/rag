@@ -963,11 +963,12 @@ def display(value: Decimal, dims: Dims, kind: str | None = None) -> dict:
 
 
 # the scale words an answer writes after an amount ("1.53 מיליון ₪", "850 אלף", "2.1 מיליארד", "1.53M"), with their
-# multiplier; "מ׳" is also a metre, so it is a million only next to a currency ("₪1.53 מ׳", "1.53 מ׳ ש״ח")
+# multiplier; "מ׳" is also a metre and "א׳" a letter, so they are a million and a thousand only next to a currency
+# ("₪1.53 מ׳", "1.53 מ׳ ש״ח", "850 א׳ ₪")
 _SCALE = re.compile(r"[ \u00a0]?(?:(?P<word>מיליארדי|מיליארד|מיליוני|מיליון|אלפי|אלפים|אלף|מיל[׳'])"
-                    r"|(?P<abbr>מ[׳'])|(?P<latin>[KkM])(?![A-Za-z]))(?![א-ת])")
+                    r"|(?P<abbr>[מא][׳'])|(?P<latin>[KkM])(?![A-Za-z]))(?![א-ת])")
 SCALES = {"מיליארד": 10**9, "מיליארדי": 10**9, "מיליון": 10**6, "מיליוני": 10**6, "מיל׳": 10**6, "מיל'": 10**6,
-          "מ׳": 10**6, "מ'": 10**6, "אלף": 10**3, "אלפי": 10**3, "אלפים": 10**3, "K": 10**3, "k": 10**3, "M": 10**6}
+          "מ׳": 10**6, "מ'": 10**6, "א׳": 10**3, "א'": 10**3, "אלף": 10**3, "אלפי": 10**3, "אלפים": 10**3, "K": 10**3, "k": 10**3, "M": 10**6}
 _CURRENCY = re.compile(r"₪|ש[\"״']ח|שקל")
 
 
