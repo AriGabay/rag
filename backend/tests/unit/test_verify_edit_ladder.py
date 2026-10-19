@@ -94,7 +94,7 @@ def test_a_question_that_named_the_period_gets_it_written_as_not_stated():
 
 def test_a_basis_the_source_does_not_state_is_removed_and_a_stated_period_stays():
     ws = _registered("5,000", RENT_MONTHLY, period="month")  # the quote states the period only
-    a, r = _report("שכר הדירה הוא 5,000 ₪ ברוטו לחודש [V1].", ws)
+    a, r = _report("שכר הדירה הוא 5,000 ₪ פלדלת לחודש [V1].", ws)
     assert [p.check for p in r.problems] == ["meaning"]
     assert r.edit(a).doc.text.startswith("שכר הדירה הוא 5,000 ₪ לחודש [V1].")
 
@@ -122,7 +122,7 @@ def test_a_question_that_named_the_vat_gets_it_written_as_not_stated():
 
 def test_two_unsupported_qualifiers_of_one_number_are_both_edited():
     ws = _registered("5,000", RENT, period="month", provenance=ASSERTED)
-    a, r = _report("שכר הדירה הוא 5,000 ₪ ברוטו לחודש [V1].", ws)
+    a, r = _report("שכר הדירה הוא 5,000 ₪ פלדלת לחודש [V1].", ws)
     assert r.removed_units() == set()
     assert r.edit(a).doc.text.startswith("שכר הדירה הוא 5,000 ₪ [V1].")
 
@@ -442,7 +442,7 @@ def _rent(expansions: dict):
 
 
 @pytest.mark.parametrize("unit_md, note", [
-    ("דמי השכירות הם 5,000 ₪ ברוטו [V1].", "הערה: השטחים בטבלה ברוטו."),
+    ("דמי השכירות הם 5,000 ₪ פלדלת [V1].", "הערה: השטחים בטבלה פלדלת."),
     ("שכר הדירה הוא 5,000 ₪ לחודש [V1].", "כל הסכומים בטבלה הם לחודש."),
 ])
 def test_a_basis_or_a_period_the_notes_state_is_kept_and_without_them_it_is_edited(unit_md, note):
@@ -825,3 +825,108 @@ def test_a_basis_the_sources_context_states_is_never_cut():
     a, r = _scoped(unit, _tables(_table(rows="סוג | דמי שכירות\nמשרדים | 96 ₪ למ\"ר", caption="דמי שכירות", before=None,
                                        after="השטחים בטבלה הם ברוטו.", heading="3. דמי השכירות")), _judge(lambda t: "supported"))
     assert r.qualifier_edits == {} and r.removed_units() == set() and r.apply(a).answer_markdown == unit
+
+
+# --- where the server writes a period or basis note, and when it never does (round 18 U1, KTD4, R10, AE9) --------------------------
+#
+# The note "(…, כפי שנכתב במקור)" goes after the number's unit phrase, at the occurrence the problem names, and never after a
+# duration (a number of months or years) or a count. Synthetic text only.
+
+def _note_edit(markdown: str, number: str, annotation: str, at: int | None) -> str:
+    units = split_units(markdown)
+    problem = verify.Problem(units[0], "x", kind="missing_qualifier", number=number, annotation=annotation, at=at)
+    return verify.VerifyReport(units, problems=[problem]).edit(_answer(markdown)).doc.text
+
+
+NOTE = " (לחודש, כפי שנכתב במקור)"
+
+
+@pytest.mark.parametrize("markdown, number, nth, expected", [
+    # the second of two equal numbers: the note lands there, not after the first
+    ("הנכס הראשון 50 ₪ למ\"ר והשני 50 ₪ למ\"ר [S1].", "50", 1, "הנכס הראשון 50 ₪ למ\"ר והשני 50 ₪ למ\"ר" + NOTE + " [S1]."),
+    ("הנכס הראשון 50 ₪ למ\"ר והשני 50 ₪ למ\"ר [S1].", "50", 0, "הנכס הראשון 50 ₪ למ\"ר" + NOTE + " והשני 50 ₪ למ\"ר [S1]."),
+    # after the whole unit phrase: currency, per-area words, shekel words and area units
+    ("שווי הנכס 5,000 שקלים [S1].", "5,000", 0, "שווי הנכס 5,000 שקלים" + NOTE + " [S1]."),
+    ("דמי השכירות 7,000 ש\"ח למטר [S1].", "7,000", 0, "דמי השכירות 7,000 ש\"ח למטר" + NOTE + " [S1]."),
+    ("דמי החכירה 90 ₪ לדונם [S1].", "90", 0, "דמי החכירה 90 ₪ לדונם" + NOTE + " [S1]."),
+    ("דמי השכירות 12 ₪ למ\"ר [S1].", "12", 0, "דמי השכירות 12 ₪ למ\"ר" + NOTE + " [S1]."),
+    ("דמי השכירות 12 ו-30 ₪ [S1].", "12", 0, "דמי השכירות 12" + NOTE + " ו-30 ₪ [S1]."),  # no unit phrase: no space is taken
+])
+def test_a_period_note_goes_after_the_unit_phrase_at_the_occurrence_the_problem_names(markdown, number, nth, expected):
+    (u,) = split_units(markdown)
+    at = [m.start() for m in re.finditer(re.escape(number), u.text)][nth]
+    assert _note_edit(markdown, number, "לחודש", at) == expected
+
+
+@pytest.mark.parametrize("markdown, number", [
+    ("תקופת השכירות היא 36 חודשים [S1].", "36"),
+    ("תקופת השכירות היא 36 חודשי שכירות [S1].", "36"),
+    ("תקופת הפטור היא 2 שנים [S1].", "2"),
+    ("בבניין 12 דירות [S1].", "12"),
+])
+def test_a_period_note_is_never_written_after_a_duration_or_a_count(markdown, number):
+    (u,) = split_units(markdown)
+    assert _note_edit(markdown, number, "לחודש", u.text.index(number)) == markdown
+
+
+def test_a_duration_in_the_unit_does_not_stop_the_note_of_the_amount_beside_it():
+    markdown = "תקופת השכירות 36 חודשים ודמי השכירות 5,000 ₪ [S1]."
+    (u,) = split_units(markdown)
+    assert _note_edit(markdown, "5,000", "לחודש", u.text.index("5,000")) == (
+        "תקופת השכירות 36 חודשים ודמי השכירות 5,000 ₪" + NOTE + " [S1].")
+
+
+def test_the_note_lands_after_the_amount_not_after_an_identifier_written_with_the_same_digits():
+    a, r = _report("בהיתר מס' 120 נקבע שטח של 120 מ\"ר [S1].", _ws("שטח 120 מ\"ר פלדלת."))
+    assert [p.kind for p in r.problems] == ["missing_qualifier"]
+    first = r.edit(a).doc.text.split("\n")[0]
+    assert first == "בהיתר מס' 120 נקבע שטח של 120 מ\"ר (מ״ר פלדלת, כפי שנכתב במקור) [S1]."
+
+
+def test_each_of_two_equal_amounts_is_noted_where_it_stands():
+    a, r = _report("הנכס הראשון 50 ₪ למ\"ר והשני 50 ₪ למ\"ר [S1].", _ws("דמי הניהול 50 ₪ למ\"ר לחודש."))
+    assert r.edit(a).doc.text.split("\n")[0] == (
+        "הנכס הראשון 50 ₪ למ\"ר (לחודש, כפי שנכתב במקור) והשני 50 ₪ למ\"ר (לחודש, כפי שנכתב במקור) [S1].")
+
+
+@pytest.mark.parametrize("source, claim", [
+    ("שכר דירה חודש י 5,000 ₪.", "שכר הדירה הוא 5,000 ₪ לחודש [S1]."),      # a split monthly word still backs the claim
+    ("דמי שכירות חודשיים 5,000 ₪.", "דמי השכירות הם 5,000 ₪ לחודש [S1]."),   # a plural adjective after a plural noun
+    ("שכר דירה 5,000 ₪ ל חודש.", "שכר הדירה הוא 5,000 ₪ לחודש [S1]."),
+])
+def test_a_period_the_source_writes_in_a_split_or_plural_form_is_not_removed_from_the_answer(source, claim):
+    a, r = _report(claim, _ws(source))
+    assert r.problems == [] and r.removed_units() == set() and r.qualifier_edits == {}
+    assert r.edit(a).doc.text.startswith(claim)
+
+
+def test_a_split_monthly_word_gives_the_missing_period_note_after_the_amount():
+    a, r = _report("שכר הדירה הוא 5,000 ₪ [S1].", _ws("שכר דירה חודש י 5,000 ₪."))
+    assert r.edit(a).doc.text.split("\n")[0] == "שכר הדירה הוא 5,000 ₪ (לחודש, כפי שנכתב במקור) [S1]."
+
+
+@pytest.mark.parametrize("source, claim", [
+    ("תקופת השכירות 36 חודשי ם, ודמי השכירות 4,700 ₪ לחודש.", "תקופת השכירות היא 36 חודשים [S1]."),
+    ("תקופת השכירות 36 חודשי שכירות, ודמי השכירות 4,700 ₪ לחודש.", "תקופת השכירות היא 36 חודשי שכירות [S1]."),
+])
+def test_a_months_count_is_neither_removed_nor_given_a_monthly_note(source, claim):
+    a, r = _report(claim, _ws(source))
+    assert r.problems == [] and r.removed_units() == set()
+    assert r.edit(a).doc.text.split("\n")[0] == claim
+
+
+def test_the_lease_term_and_the_rent_in_one_sentence_keep_their_own_meaning():
+    source = "תקופת השכירות 36 חודשים, שכר הדירה 50 ₪ למ\"ר לחודש."
+    a, r = _report("תקופת השכירות 36 חודשים ושכר הדירה 50 ₪ למ\"ר לחודש [S1].", _ws(source))
+    assert r.problems == [] and r.removed_units() == set()
+    a, r = _report("תקופת השכירות 36 חודשים ושכר הדירה 50 ₪ למ\"ר [S1].", _ws(source))
+    assert r.edit(a).doc.text.split("\n")[0] == (
+        "תקופת השכירות 36 חודשים ושכר הדירה 50 ₪ למ\"ר (לחודש, כפי שנכתב במקור) [S1].")
+
+
+def test_a_period_the_source_does_not_state_is_edited_out_beside_a_number_that_ends_with_a_comma():
+    """The number token "5,000," keeps no comma where its year and identifier tests and the edit read it, so the qualifier
+    edit still finds the number its blocking problem names."""
+    a, r = _report("שכר הדירה לחודש הוא 5,000, בלבד [V1].", _silent_period())
+    assert r.removed_units() == set() and [q.kind for q in r.qualifier_edits[0]] == ["period"]
+    assert r.edit(a).doc.text.startswith("שכר הדירה הוא 5,000, בלבד [V1].")

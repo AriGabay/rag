@@ -11,7 +11,8 @@ A qualifier belongs to the nearest amount (a number written with ₪, מ״ר, ד
 with none before it, to the first amount after it; in a clause without amounts, to the nearest number before it.
 In "השווי למ״ר אקוו׳ לנכס ברחוב הצאלון 7 נקבע ל-14,250 ₪" the basis is the 14,250's, not the house number's; in
 "63 ₪ למ״ר לחודש" the period is the 63's. In a table row it also comes from the row's label cell and the column's header. A source states a
-basis for all its numbers when it says it in a clause with no number, or in a table's title, caption or notes. A
+basis for all its numbers only in a table's title, caption or notes (a sentence with no number elsewhere gives no basis to
+other numbers), and an adjective such as ברוטו or נטו names a basis only next to the word for area. A
 period it states beyond a number's own clause attests that number only from the number's own line or sentence (a
 clause with no number in its line, a period word opening the next line of a wrapped sentence), the line above that
 governs it (the nearest line with no number stating a period), or its table's title, caption or notes — never from
@@ -30,6 +31,12 @@ Two kinds of problem:
 - **unsupported** — the unit gives the number a basis or period its evidence does not give it, or contradicts
   it ("לחודש" where the source says nothing about a period, or says "לשנה"). Nothing is added that the evidence
   lacks; unknown stays unknown.
+
+Round 18 (U1, KTD4, R10): a number is a duration ("36 חודשים": months or years) or a count ("12 דירות") when the words after
+it say so; it never owns or claims a period, and no header, caption or line above gives it one. A period word is read
+once: a word the text layer split ("חודש י") is joined first, the plural adjective ("חודשיים") is a period after a plural noun
+only, and neither "בחודש מאי", "לשנה אחת" nor a negated "אינו חודשי" is a period. Each table of a source has its own
+header, aligned to its data rows by their non-empty cells, and an empty header cell continues the cell before it.
 
 Round 9 (U12, KTD10, R22): a number that is no quantity — an identifier after מס׳ / מספר / No. / #, a date's day, month
 or year, a bare year — gets no check, and neither does a clause saying the source does not state something ("לא צוין
@@ -55,7 +62,13 @@ from app.answering.verify import _NUMBER as _NUM_AT
 from app.answering.verify import not_an_amount, numbers_in
 from app.chat.datum import STATUS_NOT_READ
 from app.chat.evidence import _content_words
-from app.measurements.extract import _MONTH_WORDS, _YEAR_WORDS, PERIOD_LABELS
+from app.measurements.extract import (
+    _MONTH_WORDS,
+    _YEAR_WORDS,
+    PERIOD_ADJECTIVES,
+    PERIOD_LABELS,
+    PERIOD_NOUNS,
+)
 
 if TYPE_CHECKING:
     from app.chat.tools import Workspace
@@ -72,10 +85,25 @@ _BASIS = [
     ("רשום", r"(?:מ\"ר\s*|שטח\s*)(?<![א-ת])רשום(?![א-ת])"),
     ("בנוי", r"מ\"ר\s+בנוי(?![א-ת])"),
 ]
+_MONTH_NAMES = (r"(?:[בל]?(?:ינואר|פברואר|מרץ|מרס|אפריל|מאי|יוני|יולי|אוגוסט|ספטמבר|אוקטובר|נובמבר|דצמבר|תשרי|חשוון|"
+                r"חשון|כסלו|טבת|שבט|אדר|ניסן|אייר|סיוון|סיון|תמוז|אב|אלול)(?![א-ת]))")
+# "for the month of May" / "for one year" name a date or a duration, not a period
+_NOT_A_PERIOD_AFTER = rf"(?!\s+(?:{_MONTH_NAMES}|(?:אחד|אחת|נוסף|נוספת)(?![א-ת])))"
+
+
+def _period_pattern(key: str, abbreviations: str = "") -> str:
+    """The period words of one period, built from the vocabulary the measurement extractor reads (``PERIOD_NOUNS``,
+    ``PERIOD_ADJECTIVES``): the noun after a prefix letter or a slash ("לחודש", "/חודש"), the adjective with its endings
+    ("חודשי", "חודשית", "החודשיים", and the plural "חודשיים" that ``_period_word_ok`` reads only after a plural noun)."""
+    noun, adj = PERIOD_NOUNS[key], PERIOD_ADJECTIVES[key]
+    return (rf"(?:(?<![א-ת])[לב]|/\s?){noun}(?![א-ת]){_NOT_A_PERIOD_AFTER}"
+            rf"|(?<![א-ת])(?:ו?ה?{adj}(?:ת|ים|ות)?{abbreviations})(?![א-ת])")
+
+
 _PERIOD = [
-    # "לחודש", "חודשי"; not "לפני שנה" or "12 חודשים" (a duration, not a period)
-    ("month", r"(?:(?<![א-ת])[לב]|/\s?)חודש(?![א-ת])|(?<![א-ת])(?:ו?ה?חודשי(?:ת)?|ו?החודשי(?:ים|ות)|לח'|לחו')(?![א-ת])"),
-    ("year", r"(?:(?<![א-ת])[לב]|/\s?)שנה(?![א-ת])|(?<![א-ת])(?:ו?ה?שנתי(?:ת)?|ו?השנתי(?:ים|ות))(?![א-ת])"),
+    # "לחודש", "חודשי"; not "לפני שנה", "12 חודשים" (a duration), "בחודש מאי" or "לשנה אחת" (a date, a duration)
+    ("month", _period_pattern("month", "|לח'|לחו'")),
+    ("year", _period_pattern("year")),
 ]
 # "כ-" right before a number; not the כ that ends an abbreviation (סה"כ)
 _APPROX_BEFORE = re.compile(r"(?:(?<![א-ת\"'])[בו]?כ[-־–]?\s?|בערך\s|בסביבות\s|כמעט\s)$")
@@ -155,15 +183,100 @@ def _of_rate(text: str, pos: int) -> bool:
     return bool(_RATE_NOUN.search(text[max(0, pos - 24):pos]))
 
 
+# --- words the text layer split, and what a period word is not ------------------------------------------------------------------
+#
+# A PDF text layer splits a word before or after one letter ("חודש י", "חודשי ם", "ל חודש"). The pieces are one word again, before
+# anything is scanned, only when the joined token is a period or time-unit word; the join moves the letter over the space, so
+# the text keeps its length and every position stays valid.
+# every written form of a month or a year (prefix letters, the noun, the adjective and the plural / dual nouns)
+_TIME_FORM = re.compile(r"[והבלמשכ]{0,2}(?:חודש(?:י(?:ת|ים|ות)?|ים)?|שנ(?:ה|ים|ות|תי(?:ת|ים|ות)?))")
+_SPLIT_TAIL = re.compile(r"(?<![א-ת])([א-ת]{2,}) ([א-ת])(?![א-ת])")
+_SPLIT_HEAD = re.compile(r"(?<![א-ת])([א-ת]) ([א-ת]{2,})(?![א-ת])")
+
+
+def _rejoin(text: str) -> str:
+    def tail(m: re.Match) -> str:
+        return f"{m.group(1)}{m.group(2)} " if _TIME_FORM.fullmatch(m.group(1) + m.group(2)) else m.group(0)
+
+    def head(m: re.Match) -> str:
+        return f"{m.group(1)}{m.group(2)} " if _TIME_FORM.fullmatch(m.group(1) + m.group(2)) else m.group(0)
+
+    return _SPLIT_HEAD.sub(head, _SPLIT_TAIL.sub(tail, text))
+
+
+def _read(text: str) -> str:
+    """The text as the number-meaning checks read it: one spelling of the Hebrew marks (``_norm``) and the split period words
+    joined (``_rejoin``); the same length as ``text``."""
+    return _rejoin(_norm(text))
+
+
+# a clause part with a negation before the period word: "אינו מוצג כסכום חודשי", "לא נקבע לשנה". Not a comparison ("לא פחות
+# מ-5,000 ₪ לחודש") nor "לא כולל מע״מ"; a comma, "אלא" and the end of the clause close the negation.
+_NEGATION = re.compile(r"(?<![א-ת])ו?(?:לא|אין|אינו|אינה|אינם|אינן)(?![א-ת])"
+                       r"(?!\s+(?:פחות|יותר|כולל|כוללת|כוללים|נמוך|גבוה|עולה|עולים|מעל|מתחת|יעלה|יפחת|רק)(?![א-ת]))")
+_NEGATION_END = re.compile(r"(?<!\d),|,(?!\d)|[.;\n]|(?<![א-ת])אלא(?![א-ת])")
+_PLURAL_ENDING = re.compile(r"(?:ים|ות|מי)$")
+# a preposition of a duration right before the word ("תקופה של חודשיים", "למשך שנתיים")
+_DURATION_PREPOSITION = re.compile(r"(?<![א-ת])(?:של|למשך|במשך|תוך|עד|כ|מעל|בערך|כמעט)\s+$")
+_NUMBER_BEFORE = re.compile(r"\d[\d,.]*\s*[-־]?\s*$")
+
+
+def _negated(text: str, pos: int) -> bool:
+    """Whether a negation stands before ``pos`` in the same part of the clause."""
+    start = max([0, *(m.end() for m in _NEGATION_END.finditer(text, 0, pos))])
+    return bool(_NEGATION.search(text, start, pos))
+
+
+def _after_plural_noun(text: str, pos: int) -> bool:
+    words = re.findall(r"[א-ת\"']+", text[max(0, pos - 40):pos])[-2:]
+    return any(_PLURAL_ENDING.search(w) for w in words)
+
+
+def _period_word_ok(text: str, m: re.Match) -> bool:
+    """Whether the period word ``m`` states a period: not in a negated part of its clause, and — as an adjective — not right
+    after a number ("36 חודשי שכירות", "2 חודשיים": a duration), the unprefixed plural ("חודשיים", "שנתיות") only after a
+    plural noun ("דמי שכירות חודשיים") and not after a preposition of a duration ("של חודשיים")."""
+    if _negated(text, m.start()):
+        return False
+    word = m.group(0).lstrip("ו")
+    if word[:1] in ("ל", "ב", "/"):  # a noun after its prefix or a slash, or an abbreviation
+        return True
+    before = text[:m.start()]
+    if _NUMBER_BEFORE.search(before):
+        return False
+    if word[:1] != "ה" and word.endswith(("ים", "ות")):
+        return not _DURATION_PREPOSITION.search(before) and _after_plural_noun(text, m.start())
+    return True
+
+
+# an area adjective names a basis only next to the word for area ("מ״ר ברוטו", "שטח עיקרי", "ברוטו למ״ר", "השטחים בטבלה הם
+# ברוטו"): "הסכום ברוטו" and "הרכיב העיקרי" are no area basis
+_NEEDS_AREA_WORD = {"ברוטו", "נטו", "עיקרי"}
+_AREA_WORD_NEAR = re.compile(r"(?<![א-ת])[הלב]?(?:מ\"ר|שטח|שטחים)(?![א-ת])")
+AREA_WORD_WINDOW = (3, 2)  # words before and after the adjective in which the area word stands
+
+
+def _basis_ok(text: str, key: str, m: re.Match) -> bool:
+    if key not in _NEEDS_AREA_WORD or m.group(0).startswith(("מ\"ר", "שטח")):
+        return True
+    before = text[:m.start()].split()[-AREA_WORD_WINDOW[0]:]
+    after = text[m.end():].split()[:AREA_WORD_WINDOW[1]]
+    return any(_AREA_WORD_NEAR.search(w) for w in before + after)
+
+
 def _scan(text: str, rates: bool = True) -> list[tuple[int, str, str, str]]:
     """Every qualifier in the text, in reading order: (position, kind, key, as written). ``rates=False``: without the
     period words of a rate (``_of_rate``) — what a text states for numbers other than that rate."""
+    text = _rejoin(text)
     out = []
     for kind, table in (("basis", _BASIS), ("period", _PERIOD)):
         for key, pattern in table:
             for m in re.finditer(pattern, text):
-                if rates or kind != "period" or not _of_rate(text, m.start()):
-                    out.append((m.start(), kind, key, m.group(0)))
+                if kind == "basis" and not _basis_ok(text, key, m):
+                    continue
+                if kind == "period" and not (_period_word_ok(text, m) and (rates or not _of_rate(text, m.start()))):
+                    continue
+                out.append((m.start(), kind, key, m.group(0)))
     return sorted(out)
 
 
@@ -171,26 +284,53 @@ def _numbers(text: str) -> list[tuple[int, int, frozenset[str]]]:
     return [(m.start(), m.end(), frozenset(numbers_in(m.group(0)))) for m in _NUM_AT.finditer(text)]
 
 
-def _owner(nums: list, amounts: list[int], pos: int, clause: str) -> int:
+def written_at(text: str, pos: int) -> str:
+    """The number written at ``pos`` as the answer shows it: without the comma that ends a list item ("בשנים 2021, 2022"), so a
+    year is tested as a year and an identifier as an identifier."""
+    return _NUM_AT.match(text, pos).group(0).rstrip(",")
+
+
+# What the words right after a number make of it: a number of months or years (a duration) and a number of things (a count)
+# are no amount of money, so they never own a period of their clause, never claim one, and never receive one from a header,
+# a caption or a line above (round 18 U1, KTD4, R10).
+_DURATION_AFTER = re.compile(
+    r"[\s\-־]*(?:חודש(?:ים|יים|י)?|שנה|שנים|שנתיים|שנות|שבוע|שבועות|שבועיים|יום|ימים|ימי)(?![א-ת])")
+_COUNT_AFTER = re.compile(
+    r"[\s\-־]*(?:יחידות|יח\"ד|דירות|חדרים|קומות|חניות|נכסים|עסקאות|מבנים|בניינים|דיירים|חוזים|מקומות|מחסנים|חנויות|משרדים)"
+    r"(?![א-ת])")
+
+
+def after_kind(text: str, end: int) -> str:
+    """"duration" or "count" when the words right after the number that ends at ``end`` make it one; else an empty string."""
+    if _DURATION_AFTER.match(text, end):
+        return "duration"
+    return "count" if _COUNT_AFTER.match(text, end) else ""
+
+
+def _owner(nums: list, amounts: list[int], pos: int, clause: str) -> int | None:
     """The number a qualifier at ``pos`` belongs to: the nearest amount before it, else the first amount after
     it — unless a comma separates it from the amount before and not from the one after ("בשטח 120 מ"ר, דמי
     השכירות לחודש 7,560 ₪": the period is the 7,560's); in a clause without amounts, the nearest number before
-    it, else the first."""
+    it, else the first. A duration or a count (``after_kind``) owns nothing: None when no other number is there."""
+    eligible = [i for i, (_, b, _) in enumerate(nums) if not after_kind(clause, b)]
+    if not eligible:
+        return None
+    amounts = [i for i in amounts if i in eligible]
     if amounts:
         before = [i for i in amounts if nums[i][0] < pos]
         after = [i for i in amounts if nums[i][0] > pos]
         if before and after and ", " in clause[nums[before[-1]][1]:pos] and ", " not in clause[pos:nums[after[0]][0]]:
             return after[0]
         return before[-1] if before else (after[0] if after else amounts[-1])
-    before = [i for i, (a, _, _) in enumerate(nums) if a < pos]
-    return before[-1] if before else 0
+    before = [i for i in eligible if nums[i][0] < pos]
+    return before[-1] if before else eligible[0]
 
 
 def attached(text: str) -> tuple[list[tuple[frozenset[str], int, Qualifiers]], Qualifiers]:
     """For each number in the text, its forms, position and the qualifiers attached to it; and the qualifiers of
     clauses with no number (what the text states beyond its own numbers). A rate's period word ("בריבית שנתית")
     belongs to a percent of its clause — the first after it, else the last before it — and with none, to nothing."""
-    text = _norm(text)
+    text = _read(text)
     out: list[tuple[frozenset[str], int, Qualifiers]] = []
     general = Qualifiers()
     start = 0
@@ -208,10 +348,11 @@ def attached(text: str) -> tuple[list[tuple[frozenset[str], int, Qualifiers]], Q
                 if percents:
                     quals[after[0] if after else percents[-1]].add(kind, key, written)
                 continue
-            if not nums:
+            owner = _owner(nums, amounts, pos, clause) if nums else None
+            if owner is None:
                 general.add(kind, key, written)
                 continue
-            quals[_owner(nums, amounts, pos, clause)].add(kind, key, written)
+            quals[owner].add(kind, key, written)
         for i, (a, _, forms) in enumerate(nums):
             if _APPROX_BEFORE.search(clause[max(0, a - 12):a]):
                 quals[i].add("approx", "approx", "מקורב")
@@ -222,7 +363,7 @@ def attached(text: str) -> tuple[list[tuple[frozenset[str], int, Qualifiers]], Q
 
 def _all(text: str, rates: bool = True) -> Qualifiers:
     q = Qualifiers()
-    for _, kind, key, written in _scan(_norm(text), rates):
+    for _, kind, key, written in _scan(_read(text), rates):
         q.add(kind, key, written)
     return q
 
@@ -409,68 +550,188 @@ def _period_lines(lines: list[str], is_row: list[bool]):
     return period
 
 
+_SEPARATOR_ROW = re.compile(r"[\s|:\-]+")
+# a time word naming how long: the label of a column or row of durations ("תקופת השכירות (חודשים)")
+_DURATION_LABEL = re.compile(r"(?<![א-ת])(?:חודשים|שנים|שנות|שבועות|ימים|תקופת|משך)(?![א-ת])")
+
+
+def context_kind(context: str) -> str:
+    """The kind of quantity the words around a number (its row label, its cell and its column header) make it:
+
+    - "rate": an amount that can be a periodic rate — money (₪, ₪ למ״ר), or a quantity with no unit those words rule out;
+    - "duration": a number of months or years (``_DURATION_LABEL``) and "count": a number of things (``units_attested``);
+    - "other": a percent, an area, a ratio or a coefficient."""
+    units = units_attested(context)
+    if units & {"ILS", "ILS_per_sqm"}:
+        return "rate"
+    if "units" in units:
+        return "count"
+    if units:
+        return "other"
+    c = _LABEL_NUMBER.sub(" ", _norm(context))
+    if _DURATION_LABEL.search(c):
+        return "duration"
+    return "other" if nonmonetary(c) else "rate"
+
+
+def _gated(q: Qualifiers, kind: str, owned: bool) -> Qualifiers:
+    """What a row label or a column header gives a cell of ``kind``: a period only to a cell that can be a rate, or — for the
+    row's own label and the column's own header cell — to a quantity other than a duration or a count. A period stated above
+    or across columns (an upper or spanned header cell) reaches amounts only."""
+    if kind == "rate" or (owned and kind == "other"):
+        return q
+    return _only(q, "period", keep=False)
+
+
+@dataclass(frozen=True)
+class _Table:
+    """A run of table rows: its header rows (the leading rows with no digit) as cells, and the line indexes they stand on."""
+
+    first: int
+    last: int
+    head_lines: frozenset[int]
+    head_rows: tuple[tuple[str, ...], ...]
+
+
+def _tables(lines: list[str], is_row: list[bool]) -> list[_Table]:
+    """Each table of the source (a run of row lines) with its own header: the rows from its start up to its first row that
+    holds a digit. A table with no such row after them has none."""
+    out: list[_Table] = []
+    i = 0
+    while i < len(lines):
+        if not is_row[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(lines) and is_row[j + 1]:
+            j += 1
+        k = i
+        while k <= j and not re.search(r"\d", lines[k]):
+            k += 1
+        head = [n for n in range(i, k) if not _SEPARATOR_ROW.fullmatch(lines[n])] if k <= j else []
+        out.append(_Table(i, j, frozenset(head), tuple(tuple(_row_cells(lines[n])) for n in head)))
+        i = j + 1
+    return out
+
+
+def _column_heads(table: _Table, cells: list[str]) -> tuple[list[str], list[str]]:
+    """For each cell of a data row, the table's header text of its column: (the column's own header cell, the header text
+    above it or spanned over it). A header row as wide as the data row is read cell by cell, and an empty header cell continues
+    the cell before it (a spanned header). A header row of another width is aligned to the data row by its non-empty cells,
+    from the right: a header with one cell fewer names the columns after the row label."""
+    n = len(cells)
+    own = [""] * n
+    above: list[list[str]] = [[] for _ in range(n)]
+    for r, row in enumerate(table.head_rows):
+        placed: list[tuple[str, bool]] = [("", False)] * n  # (header text, continued from the cell before it)
+        if len(row) == n:
+            carried = ""
+            for i, c in enumerate(row):
+                carried = c or carried
+                placed[i] = (carried, not c)
+        elif len(row) > n:
+            placed = [(c, False) for c in row[:n]]
+        else:
+            slots = [i for i, c in enumerate(cells) if c]
+            for text, i in zip(reversed([c for c in row if c]), reversed(slots), strict=False):
+                placed[i] = (text, False)
+        for i, (text, continued) in enumerate(placed):
+            if text and r == len(table.head_rows) - 1 and not continued:
+                own[i] = text
+            elif text:
+                above[i].append(text)
+    return own, [" ".join(a) for a in above]
+
+
+def _caption_lines(lines: list[str], is_row: list[bool], tables: list[_Table]) -> set[int]:
+    """The lines that are a table's own caption, title or notes: every line around the tables when they are few
+    (``TABLE_AROUND``), else the two lines right before a table and the two right after it."""
+    around = [i for i, row in enumerate(is_row) if not row]
+    if not tables:
+        return set()
+    if len(around) <= TABLE_AROUND:
+        return set(around)
+    near: set[int] = set()
+    for t in tables:
+        near |= {i for i in range(t.first - 2, t.first) if 0 <= i < len(lines) and not is_row[i]}
+        near |= {i for i in range(t.last + 1, t.last + 3) if i < len(lines) and not is_row[i]}
+    return near
+
+
 @lru_cache(maxsize=256)
 def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ...], Qualifiers]:
     """Every number a source states with what it attaches to it there, and what the source states for all its
     numbers. Parsed once per source text: the same sources are read for every number, unit and round.
 
-    In a table, a number also gets its row's label and its column's header; and a per-area amount ("דמ״ש למ״ר |
+    In a table, a number also gets its row's label and its column's header (each table of the source has its own header: its
+    leading rows with no digit, aligned to the data rows by their non-empty cells); a per-area amount ("דמ״ש למ״ר |
     75") gets the area basis and the period the table states once for the whole calculation — in its area row, its
-    title, caption or notes — when the table states exactly one of each kind. A table with two bases binds none.
-
-    What the source states for all its numbers is an area basis only: a period is stated for the numbers of its own
-    line, sentence or governing line, or of its table (``_period_lines``) — "בריבית שנתית"
+    title, caption or notes — when the table states exactly one of each kind. A table with two bases binds none. A period
+    of a header, a caption or a line above reaches only a number that can be a rate: never a duration ("36 חודשים") or a count
+    (``context_kind``, ``after_kind``).
+    What the source states for all its numbers is an area basis only, and only in a table's caption, title or notes (a
+    sentence with no number elsewhere in the source gives no basis to other numbers): a period is stated for the numbers of its
+    own line, sentence or governing line, or of its table (``_period_lines``) — "בריבית שנתית"
     in a paragraph after a feasibility check's totals is the interest rate's, not the totals'."""
-    text = _norm(text)
+    text = _read(text)
     lines = [ln for ln in text.split("\n") if ln.strip()]
     is_row = [_ROW in ln or ln.strip().startswith("|") for ln in lines]
-    rows = [ln for ln, row in zip(lines, is_row, strict=True) if row]
-    header = next((r for r in rows if not re.search(r"\d", r)), None)
-    heads = _row_cells(header) if header else []
-    table = _table_definitions(lines, is_row, heads) if rows else Qualifiers()
+    tables = _tables(lines, is_row)
+    table_of = {i: t for t in tables for i in range(t.first, t.last + 1)}
+    first_head = tables[0].head_rows[0] if tables and tables[0].head_rows else ()
+    table = _table_definitions(lines, is_row, list(first_head)) if tables else Qualifiers()
+    captions = _caption_lines(lines, is_row, tables)
     period = _period_lines(lines, is_row)
     occurrences: list[tuple[frozenset[str], Occurrence]] = []
     general = Qualifiers()
     for n, (line, row) in enumerate(zip(lines, is_row, strict=True)):
         if row:
-            if line is header:
+            tbl = table_of[n]
+            if n in tbl.head_lines:
                 continue
             cells = _row_cells(line)
+            own_heads, upper_heads = _column_heads(tbl, cells)
             for i, cell in enumerate(cells):
+                head = f"{own_heads[i]} {upper_heads[i]}".strip()
                 found, _ = attached(cell)
-                for f, _, q in found:
+                for f, at, q in found:
+                    own = cells[0] + " " + cell
+                    row_meaning = own + " " + head
+                    kind = after_kind(cell, at + len(written_at(cell, at))) or context_kind(row_meaning)
                     q = _tagged(q, "cell")
                     if i > 0:
-                        q.merge(_all(cells[0]), "row")  # the row's label
-                    if i < len(heads):
-                        q.merge(_all(heads[i]), "header")  # the column's header
-                    if _PER_AREA.search(cells[0] + " " + (heads[i] if i < len(heads) else "") + " " + cell):
+                        q.merge(_gated(_all(cells[0]), kind, True), "row")  # the row's label
+                    q.merge(_gated(_all(own_heads[i]), kind, True), "header")  # the column's header
+                    q.merge(_gated(_all(upper_heads[i]), kind, False), "header")  # a header above it or spanned over it
+                    if _PER_AREA.search(cells[0] + " " + head + " " + cell):
                         defined = table.found.get("basis", {})
                         if len(defined) == 1 and not q.keys("basis"):
                             key, written = next(iter(defined.items()))
                             q.add("basis", key, written, table.part_of("basis", key))
                     # a per-area amount by its label, header or cell ("שווי למ״ר"); an area by its own label or cell —
                     # a column header of areas ("סה״כ מ״ר אקוו׳") also heads a calculation's totals and factors
-                    own = cells[0] + " " + cell
-                    area = bool(_PER_AREA.search(own + " " + (heads[i] if i < len(heads) else ""))
-                                or _AREA_WORD.search(own))
+                    area = bool(_PER_AREA.search(own + " " + head) or _AREA_WORD.search(own))
                     # A caption also governs absolute monetary amounts, not only rates. Capital values and
                     # area/factor rows do not inherit a recurring period from neighbouring rent notes, even
-                    # without a header. An explicit row/header period takes precedence over the caption.
-                    row_meaning = own + " " + (heads[i] if i < len(heads) else "")
+                    # without a header; a duration or a count never does. An explicit row/header period takes
+                    # precedence over the caption.
                     units = units_attested(row_meaning)
                     monetary = bool(units & {"ILS", "ILS_per_sqm"})
                     rent_rate = bool(_PER_AREA.search(row_meaning) and kind_attested("rent", row_meaning))
-                    if not q.keys("period") and (monetary or rent_rate or not units and not heads):
+                    if (not q.keys("period") and kind not in ("duration", "count")
+                            and (monetary or rent_rate or not units and not tbl.head_rows)):
                         q.merge(period(n, row_meaning))
                     occurrences.append((f, Occurrence(q, line, area=area)))
             continue
-        found, gen = attached(line)
-        # a clause with no number speaks for the source; a table's title, caption or notes for its numbers — an area
-        # basis only: a period, for the numbers it governs (``_period_lines``)
-        general.merge(_only(_all(line) if rows else gen, "period", keep=False), "paragraph")
-        for i, (f, _, q) in enumerate(found):
-            q = _tagged(q, "sentence").merge(period(n))
+        found, _ = attached(line)
+        # a table's title, caption or notes state an area basis for its numbers — a period, for the numbers it governs
+        # (``_period_lines``); a sentence with no number elsewhere gives no basis to other numbers
+        if n in captions:
+            general.merge(_only(_all(line), "period", keep=False), "paragraph")
+        for i, (f, at, q) in enumerate(found):
+            q = _tagged(q, "sentence")
+            if not after_kind(line, at + len(written_at(line, at))):
+                q.merge(period(n))
             # A wrapped rate's period belongs solely to the percentage immediately following it.
             if i == 0 and n > 0 and not _SENTENCE_END.search(lines[n - 1]) \
                     and not _numbers(_ENUMERATION.sub("", lines[n - 1])) \
@@ -498,7 +759,7 @@ def number_qualifiers(text: str, forms: frozenset[str], within: str) -> Qualifie
     its numbers — the qualifiers a value taken from the source may carry as the source's own
     (``tools.tool_take_value``). The same number elsewhere in the source does not count."""
     parsed, general = parse_source(text)
-    w = _flat(within)
+    w = _flat(_read(within))
     q = Qualifiers().merge(general)
     for f, o in parsed:
         line = _flat(o.context)
@@ -693,6 +954,7 @@ class MeaningProblem:
     annotation: str | None = None  # the qualifier as written, when exactly one is attested
     cite: str | None = None  # the source (S#/M#) the server found that states it, cited with it
     needs_citation: bool = False  # the unit is right; only the citation of ``cite`` is missing
+    at: int | None = None  # where the number stands in the unit's text: the occurrence the problem is about
 
 
 SUBJECT_ROLES = ("appraiser_determination", "actual_contract", "calculation")
@@ -945,7 +1207,7 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
     may come from the table or section around it; either is then cited (``cite``)."""
     if not unit.ids:
         return []
-    text = _norm(unit.text)
+    text = _read(unit.text)
     whole = _all(text + "\n" + _norm(unit.context))
     approx_anywhere = bool(_APPROX_WORDS.search(text))
     words = _content_words(text)
@@ -955,11 +1217,12 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
     for forms, pos, claimed in in_unit:
         if not forms:
             continue
-        written = _NUM_AT.match(text, pos).group(0)
+        written = written_at(text, pos)
         # an identifier, a date's part or a year is no amount; a number in a clause saying the source does not state
         # something claims no meaning (round 9 U12)
         if not_an_amount(text, pos, pos + len(written)) or any(a <= pos < b for a, b in absent):
             continue
+        shape = after_kind(text, pos + len(written))  # a duration or a count has no period of its own
         occurrences, general = _evidence(unit, ws, forms)
         if not occurrences:
             continue  # not a number of the cited evidence: the number check owns it
@@ -970,6 +1233,8 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
             attested.merge(o.qualifiers).merge(_all(o.context, rates=False))
         # unsupported: a basis or period given to the number that its evidence does not give it
         for kind in ("basis", "period"):
+            if kind == "period" and shape:
+                continue
             extra = claimed.keys(kind) - attested.keys(kind)
             found_in = {k: fetcher.attesting(unit, forms, kind, k, words) for k in sorted(extra)} if fetcher else {}
             for k, where in found_in.items():
@@ -979,13 +1244,13 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
                         unit.ids.append(where)
                     problems.append(MeaningProblem(
                         written, kind, f"{KIND_LABELS[kind]} \"{display(claimed.found[kind][k])}\" של {written} נכתב "
-                        f"ב-{where}; צטט אותו", blocking=False, cite=where, needs_citation=True))
+                        f"ב-{where}; צטט אותו", blocking=False, cite=where, needs_citation=True, at=pos))
             extra = {k for k in extra if found_in.get(k) is None}
             if extra:
                 said = claimed.found[kind][sorted(extra)[0]]
                 problems.append(MeaningProblem(
                     written, kind, f"התשובה מייחסת ל-{written} {KIND_LABELS[kind]} \"{display(said)}\" שלא נכתב לגבי ערך זה "
-                    "במקור; אין להוסיף תקופה או בסיס שטח שלא נכתבו", blocking=True))
+                    "במקור; אין להוסיף תקופה או בסיס שטח שלא נכתבו", blocking=True, at=pos))
         # missing: what every closest occurrence attaches to the number, and the unit does not say at all; when the
         # cited passage does not say it, the table or section around it may (a basis in the table's area row)
         closest = _closest(occurrences, words)
@@ -993,6 +1258,8 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
         for kind in ("basis", "period", "approx"):
             if kind == "basis" and not _area_amount(text, pos, written, closest):
                 continue  # an area basis qualifies an area or a per-area amount only
+            if kind == "period" and shape:
+                continue  # a duration or a count never receives a period
             if not all(o.qualifiers.keys(kind) for o in closest):
                 if kind == "approx" or fetcher is None or whole.keys(kind):
                     continue
@@ -1014,7 +1281,7 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
                         unit.ids.append(cite)
                     problems.append(MeaningProblem(
                         written, kind, f"למספר {written} חסר {KIND_LABELS[kind]} כפי שנכתב ב-{cite} (\"{as_written}\"); "
-                        f"כתוב אותו ליד המספר וצטט את {cite}", blocking=False, annotation=as_written, cite=cite))
+                        f"כתוב אותו ליד המספר וצטט את {cite}", blocking=False, annotation=as_written, cite=cite, at=pos))
                     continue
                 near = _closest([o for o, _ in ring], words)
                 o = near[0]
@@ -1024,7 +1291,7 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
                     unit.ids.append(cite)
                 problems.append(MeaningProblem(
                     written, kind, f"למספר {written} חסר {KIND_LABELS[kind]} כפי שנכתב ב-{cite} (\"{as_written}\"); "
-                    f"כתוב אותו ליד המספר וצטט את {cite}", blocking=False, annotation=as_written, cite=cite))
+                    f"כתוב אותו ליד המספר וצטט את {cite}", blocking=False, annotation=as_written, cite=cite, at=pos))
                 continue
             if kind == "approx":
                 if claimed.keys("approx") or approx_anywhere:
@@ -1043,10 +1310,10 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
                 as_written = PERIOD_TEXT[keys[0]] if kind == "period" else display(written_q)  # one occurrence's words
                 problems.append(MeaningProblem(
                     written, kind, f"למספר {written} חסר {KIND_LABELS[kind]} כפי שנכתב במקור (\"{as_written}\"); "
-                    "כתוב אותו ליד המספר", blocking=False, annotation=as_written))
+                    "כתוב אותו ליד המספר", blocking=False, annotation=as_written, at=pos))
             else:
                 shown = ", ".join(f"\"{display(w)}\"" for w in needed.values())
                 problems.append(MeaningProblem(
                     written, kind, f"במקורות מופיעים לגבי {written} כמה ערכים של {KIND_LABELS[kind]} ({shown}); כתוב "
-                    "ליד המספר את זה שנכתב לגבי הערך שבתשובה", blocking=False))
+                    "ליד המספר את זה שנכתב לגבי הערך שבתשובה", blocking=False, at=pos))
     return problems

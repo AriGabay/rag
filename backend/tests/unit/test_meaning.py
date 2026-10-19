@@ -785,3 +785,201 @@ def test_the_fetcher_query_reads_each_rows_table_caption_and_column_header_with_
     built from name both columns."""
     assert "AS caption" in meaning.TABLE_TEXT_COLUMNS and "AS header" in meaning.TABLE_TEXT_COLUMNS
     assert "extracted_tables" in meaning.TABLE_TEXT_JOIN
+
+
+# --- quantity kinds and period reading (round 18 U1, KTD3, KTD4, R8, R10, AE9) ------------------------------------
+#
+# Synthetic wording only. A period, a duration and a count are told apart in the source and in the answer: a split word
+# of the text layer is one word again, a duration or a count never owns or claims a period, a header period reaches only
+# the cells of a rate, and each table of a source has its own header.
+
+def _no_period(source: str, number: str, within: str) -> None:
+    assert _periods(source, number, within) == set()
+
+
+@pytest.mark.parametrize("source", [
+    "שכר דירה חודש י 5,000 ₪.",          # "<prefix+stem> <final letter>": the monthly word split by the text layer
+    "שכר הדירה ה חודש י 5,000 ₪.",
+    "שכר דירה חודשי 5,000 ₪.",
+    "דמי שכירות חודשיים 5,000 ₪.",       # the unprefixed plural adjective after a plural noun
+])
+def test_a_monthly_word_split_by_the_text_layer_still_attests_the_period(source):
+    assert _periods(source, "5,000", source) == {"month"}
+    assert _problems("שכר הדירה הוא 5,000 ₪ לחודש [S1].", _ws(source)) == []
+    (p,) = _problems("שכר הדירה הוא 5,000 ₪ [S1].", _ws(source))
+    assert p.kind == "period" and not p.blocking and p.annotation == "לחודש"
+
+
+def test_a_split_prefix_letter_and_a_split_year_word_are_joined_too():
+    assert _periods("דמי ניהול 800 ₪ ל חודש.", "800", "דמי ניהול 800 ₪ ל חודש") == {"month"}
+    assert _periods("הכנסות שנת י 120,000 ₪.", "120,000", "הכנסות שנת י 120,000 ₪") == {"year"}
+
+
+def test_a_word_is_joined_only_when_the_joined_token_is_a_time_word():
+    # "מ" + "ר" ... none of these joins make a period or a duration word, so the text is read as written
+    for text in ("שכר דירה שכירות י 5,000 ₪.", "ביצוע ו 5,000 ₪ בלבד.", "תקופה ב 5,000 ₪ סה\"כ."):
+        assert meaning._read(text) == meaning._norm(text)
+    assert meaning._read("36 חודשי ם") == "36 חודשים "
+    assert len(meaning._read("שכר חודש י 5")) == len("שכר חודש י 5")  # positions stay valid
+
+
+@pytest.mark.parametrize("source, answer", [
+    ("תקופת השכירות 36 חודשים, ודמי השכירות 4,700 ₪ לחודש.", "תקופת השכירות היא 36 חודשים [S1]."),
+    ("תקופת השכירות 36 חודשי ם, ודמי השכירות 4,700 ₪ לחודש.", "תקופת השכירות היא 36 חודשים [S1]."),
+    ("תקופת השכירות 36 חודשי שכירות, ודמי השכירות 4,700 ₪ לחודש.", "תקופת השכירות היא 36 חודשי שכירות [S1]."),
+    ("תקופת הגרייס 2 חודשיים, ודמי השכירות 4,700 ₪ לחודש.", "תקופת הגרייס היא 2 חודשיים [S1]."),
+])
+def test_the_number_before_a_months_noun_is_a_duration_with_no_period_attested_or_claimed(source, answer):
+    assert _problems(answer, _ws(source)) == []
+
+
+def test_a_months_count_takes_no_period_from_the_line_above_or_from_its_sentence():
+    source = "דמי השכירות במתחם הם לחודש.\nתקופת השכירות 36 חודשים."
+    _no_period(source, "36", "תקופת השכירות 36 חודשים")
+    assert _problems("תקופת השכירות היא 36 חודשים [S1].", _ws(source)) == []
+
+
+def test_a_period_word_after_a_duration_belongs_to_the_amount_not_to_the_duration():
+    source = "תקופת השכירות 36 חודשים.\nדמי השכירות 5,000 ₪ לחודש."
+    # the answer writes the period before an amount that has no currency sign: the 36 is not its owner
+    assert _problems("תקופת השכירות 36 חודשים, ודמי השכירות החודשיים 5,000 [S1].", _ws(source)) == []
+
+
+def test_a_dual_months_word_after_a_rent_noun_is_a_monthly_rate_and_after_a_number_a_duration():
+    assert _periods("דמי שכירות חודשיים 5,000 ₪.", "5,000", "דמי שכירות חודשיים 5,000 ₪") == {"month"}
+    assert _periods("תקופת פטור 2 חודשיים, שכר דירה 5,000 ₪.", "5,000", "שכר דירה 5,000 ₪") == set()
+    assert meaning._all("תקופת פטור של חודשיים").keys("period") == set()
+    assert meaning._all("תשלומים שנתיים וגם 3 שנתיים").keys("period") == {"year"}
+
+
+@pytest.mark.parametrize("source", [
+    "החוזה נחתם לשנה אחת, ודמי השכירות 4,700 ₪.",
+    "החוזה נחתם לשנה אחת.\nדמי השכירות 4,700 ₪.",
+])
+def test_for_one_year_in_a_lease_sentence_is_a_duration_not_a_yearly_period(source):
+    assert _problems("דמי השכירות הם 4,700 ₪ [S1].", _ws(source)) == []
+    assert _problems("דמי השכירות הם 4,700 ₪ לשנה [S1].", _ws(source))[0].blocking
+
+
+@pytest.mark.parametrize("text", [
+    "דמי השכירות לחודש ינואר היו 5,000 ₪.",
+    "התשלום בחודש אפריל היה 5,000 ₪.",
+    "הסכום 5,000 ₪ אינו מוצג כסכום חודשי.",
+    "הסכום 5,000 ₪ לא נקבע לשנה.",
+])
+def test_a_month_name_after_the_month_of_and_a_negated_period_are_no_period(text):
+    assert meaning._all(text).keys("period") == set()
+    assert _problems("הסכום הוא 5,000 ₪ [S1].", _ws(text)) == []
+
+
+def test_a_period_in_a_comparison_is_still_a_period():
+    assert meaning._all("לא פחות מ-5,000 ₪ לחודש").keys("period") == {"month"}
+    assert meaning._all("הסכום 5,000 ₪, לא כולל מע\"מ, לחודש").keys("period") == {"month"}
+
+
+def test_an_answer_that_negates_a_period_claims_none():
+    assert _problems("הסכום הוא 5,000 ₪ ואינו חודשי [S1].", _ws("הסכום הוא 5,000 ₪.")) == []
+
+
+def test_a_period_the_source_contradicts_is_still_blocking():
+    (p,) = _problems("דמי השכירות הם 760 ₪ למ\"ר לחודש [S1].", _ws("דמי השכירות לנכס נקבעו ל-760 ₪ למ\"ר לשנה."))
+    assert p.blocking and p.kind == "period"
+    (p,) = _problems("דמי השכירות הם 760 ₪ למ\"ר לשנה [S1].", _ws("דמי שכירות חודשיים 760 ₪ למ\"ר."))
+    assert p.blocking and p.kind == "period"
+
+
+# column headers ----------------------------------------------------------------------------------------------------
+
+TWO_ROW_HEADER = ("| | לחודש | לחודש | לחודש\nנכס | שכ\"ד (₪ למ\"ר) | תפוסה (%) | מספר חוזים\n"
+                  "הדולב 4 | 71 | 92 | 3\nהדולב 6 | 64 | 88 | 5")
+
+
+def test_a_period_in_the_upper_header_row_reaches_the_amounts_and_not_a_percent_or_a_count_column():
+    assert _periods(TWO_ROW_HEADER, "71", "הדולב 4 | 71 | 92 | 3") == {"month"}
+    _no_period(TWO_ROW_HEADER, "92", "הדולב 4 | 71 | 92 | 3")
+    _no_period(TWO_ROW_HEADER, "3", "הדולב 4 | 71 | 92 | 3")
+    ws = _ws(TWO_ROW_HEADER, kind="table")
+    (p,) = _problems("בדולב 6 דמי השכירות הם 64 ₪ למ\"ר [S1].", ws)
+    assert p.kind == "period" and p.annotation == "לחודש"
+    assert _problems("בדולב 6 שיעור התפוסה הוא 88% [S1].", ws) == []
+
+
+def test_a_spanned_header_cell_reaches_the_empty_header_cells_after_it():
+    table = ("| | לחודש | | מדדים\nנכס | שכ\"ד (₪ למ\"ר) | דמי ניהול (₪) | מספר חוזים\n"
+             "הדולב 4 | 71 | 12 | 3")
+    assert _periods(table, "71", "הדולב 4 | 71 | 12 | 3") == {"month"}
+    assert _periods(table, "12", "הדולב 4 | 71 | 12 | 3") == {"month"}
+    _no_period(table, "3", "הדולב 4 | 71 | 12 | 3")
+
+
+def test_a_source_holding_two_tables_gives_each_cell_its_own_headers_period():
+    source = ("שכירות בבניין הדולב\nנכס | שכ\"ד לחודש (₪ למ\"ר)\nהדולב 4 | 71\nהדולב 6 | 64\n"
+              "הכנסות בבניין האורן\nנכס | הכנסה שנתית (₪)\nהאורן 3 | 480,000")
+    assert _periods(source, "71", "הדולב 4 | 71") == {"month"}
+    assert _periods(source, "480,000", "האורן 3 | 480,000") == {"year"}
+
+
+def test_a_header_row_with_one_cell_fewer_than_its_data_rows_aligns_by_its_non_empty_cells():
+    table = "שכ\"ד לחודש (₪ למ\"ר) | שטח (מ\"ר)\nהדולב 4 | 71 | 100\nהדולב 6 | 64 | 90"
+    assert _periods(table, "71", "הדולב 4 | 71 | 100") == {"month"}
+    _no_period(table, "100", "הדולב 4 | 71 | 100")
+
+
+def test_leading_digit_free_rows_form_the_header_and_a_later_digit_free_row_does_not():
+    table = "נכס | שכ\"ד חודשי (₪)\nהדולב 4 | 7,000\nסה\"כ שטחים | \nהדולב 6 | 6,000"
+    assert _periods(table, "6,000", "הדולב 6 | 6,000") == {"month"}
+    undated = "הדולב 4 | 7,000\nהערות בלבד | חודשי\nהדולב 6 | 6,000"
+    _no_period(undated, "6,000", "הדולב 6 | 6,000")
+
+
+def test_a_months_count_column_takes_no_header_period():
+    table = "| | לחודש | לחודש\nנכס | תקופת שכירות (חודשים) | שכ\"ד (₪)\nהדולב 4 | 36 | 7,000"
+    _no_period(table, "36", "הדולב 4 | 36 | 7,000")
+    assert _periods(table, "7,000", "הדולב 4 | 36 | 7,000") == {"month"}
+    ws = _ws(table, kind="table")
+    assert _problems("תקופת השכירות בדולב 4 היא 36 חודשים [S1].", ws) == []
+
+
+def test_a_rates_own_header_period_still_reaches_a_percent_column():
+    table = "נכס | תשואה שנתית (%)\nהדולב 4 | 6.5"
+    assert _periods(table, "6.5", "הדולב 4 | 6.5") == {"year"}
+
+
+# the area basis -------------------------------------------------------------------------------------------------------
+
+def test_a_basis_adjective_needs_its_area_word_next_to_it():
+    assert meaning._all("הסכום הוא 5,000 ₪ ברוטו").keys("basis") == set()
+    assert meaning._all("הרכיב העיקרי בתחשיב הוא 5,000 ₪").keys("basis") == set()
+    assert meaning._all("שטח המבנה 412 מ\"ר ברוטו").keys("basis") == {"ברוטו"}
+    assert meaning._all("שטח ברוטו 412").keys("basis") == {"ברוטו"}
+    assert meaning._all("שטח עיקרי 96").keys("basis") == {"עיקרי"}
+    assert meaning._all("96 מ\"ר בנוי ברוטו").keys("basis") == {"בנוי", "ברוטו"}
+
+
+def test_a_basis_word_in_a_sentence_with_no_number_gives_no_basis_to_other_numbers():
+    ws = _ws("הערכים בדוח מוצגים במ\"ר ברוטו.\nשטח הנכס 120 מ\"ר.")
+    (p,) = _problems("שטח הנכס הוא 120 מ\"ר ברוטו [S1].", ws)
+    assert p.blocking and p.kind == "basis"
+
+
+def test_a_table_captions_basis_is_still_a_general_basis_of_its_numbers():
+    ws = _ws("כל השטחים בטבלה הם מ\"ר ברוטו.\nנכס | שטח\nהדולב 4 | 120", kind="table")
+    assert [p for p in _problems("שטח הדולב 4 הוא 120 מ\"ר ברוטו [S1].", ws) if p.blocking] == []
+
+
+# trailing punctuation -------------------------------------------------------------------------------------------------
+
+def test_a_year_written_with_a_trailing_comma_is_a_year_not_an_amount():
+    source = "שכר הדירה לחודש בשנת 2021, עמד על 5,000."
+    assert _problems("בשנת 2021, שכר הדירה היה 5,000 [S1].", _ws(source)) == []
+    assert meaning.written_at("בשנת 2021, שכר הדירה", len("בשנת ")) == "2021"
+    assert meaning.written_at("שכר 5,000, עד", len("שכר ")) == "5,000"
+
+
+# the problem names its own occurrence -------------------------------------------------------------------------------------
+
+def test_a_problem_names_the_occurrence_it_is_about():
+    answer = "בהיתר מס' 120 נקבע שטח של 120 מ\"ר [S1]."
+    (p,) = _problems(answer, _ws("שטח 120 מ\"ר פלדלת."))
+    assert p.kind == "basis" and p.number == "120"
+    assert answer.index("120 מ\"ר") == p.at

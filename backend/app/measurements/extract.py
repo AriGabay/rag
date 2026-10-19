@@ -71,8 +71,16 @@ VAT_LABELS = {"included": "כולל מע״מ", "excluded": "ללא מע״מ", "u
 # prefix letter ("במע״מ", "ללא המע״מ"); not a longer word that starts like one ("מעמד")
 VAT_TERM = (r"(?<![א-ת])[ובלהכשמ]{0,2}(?:מע(?:[\"״'׳]{1,2})?מ|מ\.ע\.מ|מס\s+ערך\s+מוסף)(?![א-ת])")
 _VAT_WORDS = re.compile(VAT_TERM)
-_MONTH_WORDS = re.compile(r"לחודש|חודשי|/\s*חודש|לח[\"״']ד|בחודש")
-_YEAR_WORDS = re.compile(r"לשנה|שנתי|/\s*שנה|בשנה")
+# One vocabulary of period words for the extractor and for the meaning check (``chat.meaning``, round 18 U1, KTD4): the noun a
+# period prefix stands before ("לחודש", "בשנה", "/חודש") and the adjective with its endings ("חודשי", "חודשית", and the plural
+# "חודשיים" / "חודשיות" that ``meaning`` reads after a plural noun). Both modules build their patterns from these.
+PERIOD_NOUNS = {"month": "חודש", "year": "שנה"}
+PERIOD_ADJECTIVES = {"month": "חודשי", "year": "שנתי"}
+PERIOD_ADJECTIVE_ENDINGS = ("ת", "ים", "ות")
+_MONTH_WORDS = re.compile(rf"ל{PERIOD_NOUNS['month']}|{PERIOD_ADJECTIVES['month']}|/\s*{PERIOD_NOUNS['month']}"
+                          rf"|לח[\"״']ד|ב{PERIOD_NOUNS['month']}")
+_YEAR_WORDS = re.compile(rf"ל{PERIOD_NOUNS['year']}|{PERIOD_ADJECTIVES['year']}|/\s*{PERIOD_NOUNS['year']}"
+                         rf"|ב{PERIOD_NOUNS['year']}")
 _AREA_WORDS = re.compile(r"מ[\"״']ר|מטר|למ[\"״']ר|דונם")
 
 

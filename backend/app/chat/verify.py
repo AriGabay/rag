@@ -1436,6 +1436,7 @@ class Problem:
     kind: Literal["claim", "missing_qualifier", "needs_citation", "request", "requirement", "instruction",
                   "absence", "input_choice", "assumption"] = "claim"
     number: str | None = None  # for a missing qualifier: the number as written in the unit
+    at: int | None = None  # for a missing qualifier: where that number stands in the unit's text (the occurrence it is about)
     annotation: str | None = None  # for a missing qualifier: the one qualifier attested, as written
     cite: str | None = None  # the source or measurement the server found that states the qualifier
     # for a missing qualifier: the server's own, that the result of a conditional calculation (``cite``) is
@@ -2474,7 +2475,7 @@ class VerifyReport:
         # unit shows no number of it, where a citation would join the unit)
         tagged: set[tuple[int, int]] = set()
         for p in notes:
-            at = _after_number(p.unit, p.number or "") if p.number else None
+            at = _after_number(p.unit, p.number or "", p.at) if p.number else None
             if at is None and (p.conditional or p.check in SCOPE_CHECKS):
                 at = _citation_point(markdown, p.unit)
             if at is not None and not any(a <= at < b for a, b in blocked):
@@ -2490,7 +2491,7 @@ class VerifyReport:
                     edits.append((at, at, f" ({p.annotation})", "scope_note", ()))
                 elif p.check == SCOPE_CHECK:  # the scope the source states, written next to the value with its citation (R10)
                     edits.append((at, at, f" ({MSG_SCOPE_ADDED.format(phrase=p.annotation)}{cite})", "qualifier", ()))
-                else:
+                elif not _is_duration_or_count(p.unit, p.number or "", p.at):  # a source's period is never a duration's
                     edits.append((at, at, f" ({p.annotation}, כפי שנכתב במקור{cite})", "qualifier", ()))
         # evidence the server found in the same calculation is cited with the unit it supports
         for u, ids in _cites_by_unit(cites):
@@ -2727,19 +2728,40 @@ def _citation_point(markdown: str, unit: Unit) -> int:
     return end
 
 
-_AFTER_NUMBER = re.compile(r"\s*(?:%|₪|ש[\"״]ח)?(?:\s*ל?מ[\"״]ר)?")  # "12.11%" is never split from its sign
+# the unit phrase of a number: its currency and its per-area or area words ("12.11%" is never split from its sign)
+_AFTER_NUMBER = re.compile(
+    r"(?:\s*(?:%|₪|ש[\"״]ח|שקלים|שקל(?![א-ת])))?(?:\s*[ל/]?\s?(?:מ[\"״]ר|מטר\s+רבוע|מטר|דונם)(?![א-ת]))?")
 
 
-def _after_number(unit: Unit, written: str) -> int | None:
+def _number_start(unit: Unit, written: str, at: int | None) -> int | None:
+    """Where the number ``written`` stands in the unit's raw text: the occurrence at ``at`` in its text (the one a problem
+    names), else the first occurrence of the number as a whole."""
+    if at is not None:
+        to_raw = _text_to_raw(unit)
+        if to_raw is not None and 0 <= at < len(to_raw) and unit.raw.startswith(written, to_raw[at]):
+            return to_raw[at]
+    m = re.search(rf"(?<![\d,.]){re.escape(written)}(?![\d])", unit.raw)
+    return m.start() if m else None
+
+
+def _after_number(unit: Unit, written: str, at: int | None = None) -> int | None:
     """The position in the answer right after a number of the unit (and its scale word, percent sign, currency and per-m² words:
-    "25.74 מיליון ₪")."""
+    "25.74 מיליון ₪"): the occurrence at ``at`` in the unit's text when given, else the first."""
     from app.chat.calc import scale_after
 
-    m = re.search(rf"(?<![\d,.]){re.escape(written)}(?![\d])", unit.raw)
-    if m is None:
+    start = _number_start(unit, written, at)
+    if start is None:
         return None
-    tail = _AFTER_NUMBER.match(unit.raw, scale_after(unit.raw, m.start(), m.end())[1])
-    return unit.start + (tail.end() if tail else m.end())
+    end = start + len(written)
+    tail = _AFTER_NUMBER.match(unit.raw, scale_after(unit.raw, start, end)[1])
+    return unit.start + (tail.end() if tail else end)
+
+
+def _is_duration_or_count(unit: Unit, written: str, at: int | None) -> bool:
+    """Whether the number the server would note is a duration or a count ("36 חודשים", "12 דירות"): no period is written next to
+    one (``meaning.after_kind``)."""
+    start = _number_start(unit, written, at)
+    return start is not None and bool(meaning.after_kind(unit.raw, start + len(written)))
 
 
 def ids_in(text: str) -> list[str]:
@@ -3970,7 +3992,7 @@ def _stated_in_context(u: Unit, ws: Workspace, problem: meaning.MeaningProblem) 
     text = meaning._norm(u.text)
     entries, _ = meaning.attached(text)
     for forms, pos, claimed in entries:
-        if not forms or _NUM_AT.match(text, pos).group(0) != problem.number:
+        if not forms or meaning.written_at(text, pos) != problem.number:
             continue
         _, attested = _attested_qualifiers(u, ws, frozenset(forms))
         if attested.keys(problem.kind):
@@ -4043,7 +4065,7 @@ def _silent_qualifier_spans(u: Unit, ws: Workspace, text: str, entries: list, pr
     kind = problem.kind
     context: meaning.Qualifiers | None = None  # what the cited sources' context states, read once and only when an entry needs it
     for forms, pos, claimed in entries:
-        written = _NUM_AT.match(text, pos).group(0)
+        written = meaning.written_at(text, pos)
         if (written != problem.number or not forms or not_an_amount(text, pos, pos + len(written))
                 or any(a <= pos < b for a, b in absent)):
             continue
@@ -6500,7 +6522,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
             if m.needs_citation:
                 report.problems.append(Problem(u, m.reason, kind="needs_citation", cite=m.cite))
             elif not m.blocking:
-                report.problems.append(Problem(u, m.reason, kind="missing_qualifier", number=m.number,
+                report.problems.append(Problem(u, m.reason, kind="missing_qualifier", number=m.number, at=m.at,
                                                annotation=m.annotation, cite=m.cite))
         # a result of a conditional calculation: the server writes that it is conditional next to it (the judge
         # reads the unit with it), so an unhedged sentence is shown as conditional, never lost and never certain
