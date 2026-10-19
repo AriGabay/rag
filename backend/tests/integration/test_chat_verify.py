@@ -312,7 +312,8 @@ def test_the_serialized_answer_holds_no_draft_text_and_its_registry_only_offsets
     assert {s["kind"] for s in spans} >= {"marker", "partial_mark", "removal_note"}
     assert all(m["content"][s["start"]:s["end"]] for s in spans)
     shown = json.dumps(m["answer"], ensure_ascii=False)
-    assert "812" not in shown and CLAUSE not in shown and CLAUSE not in m["content"]
+    # the removed sentence's own words, not its bare digits: "812" can occur inside a random UUID of the payload
+    assert "השטח הוא 812" not in shown and CLAUSE not in shown and CLAUSE not in m["content"]
     # no claim list, no verdict, no offsets of claims
     assert m["answer"]["claims"] == []
     assert not {"claim_records", "verdict", "citation", "sources_checked", "rereads", "post_check"} & (
