@@ -707,6 +707,70 @@ def test_a_cut_of_a_unit_that_voted_for_nothing_asks_for_no_requirements(offline
     assert len(judge.inputs) == 2 and "<requirements>" not in judge.inputs[-1]
 
 
+# --- round 17 U3: the item ledger in the final check (KTD3; R6, R8) ------------------------------------------------------------
+
+RATES_TEXT = "שיעורי היוון לפי שימוש:\nמשרדים | 6.5%\nמסחר | 7.0%\nחניה | 8.25%"
+RATES_ASK = "שיעורי ההיוון שנקבעו"
+
+
+def _rate_item(label: str, quote: str, value: str, **kw) -> dict:
+    return {"component": RATES_ASK, "label": label, "source": "S1", "quote": quote, "value": value, "condition": "",
+            "state": "included", "reason": ""} | kw
+
+
+def test_item_gap_lines_are_server_text_that_is_a_fixed_point_and_cost_no_judge_call(offline):
+    """An item the answer does not give, one declared not verifiable and one declared not applicable are stated by the server
+    in lines after the answer (``item_gap``): checked by construction, not judged, and the digest is that of the saved bytes. The
+    answer is partial (the omitted item), and the line says where the item was read and that it was not used."""
+    offline.texts = [RATES_TEXT]
+    answer = "שיעור ההיוון למשרדים הוא 6.5% [S1]."
+    items = [_rate_item("שיעור למשרדים", "משרדים | 6.5%", "6.5%"), _rate_item("שיעור למסחר", "מסחר | 7.0%", "7.0%"),
+             _rate_item("שיעור לחניה", "חניה | 8.25%", "8.25%", state="not_verifiable", reason="הטבלה נקראה בקריאה לא ודאית")]
+    judge = Judge(lambda t, i, n: "supported", asks={RATES_ASK: "6.5%"})
+    out = _turn(ScriptedAgent([SEARCH, final(answer, items=items), final(answer, items=items), final(answer, items=items)],
+                              judge=judge, request=[component(RATES_ASK)]), "מהם שיעורי ההיוון שנקבעו?")
+    md = out.answer.answer_markdown
+    assert _kinds(out) == ["item_gap"], md
+    (span,) = out.server_spans
+    lines = md[span.start:span.end].strip().splitlines()
+    assert len(lines) == 2 and "שיעור למסחר" in lines[0] and "S1" in lines[0] and "לא נעשה בו שימוש" in lines[0]
+    assert "שיעור לחניה" in lines[1] and "הטבלה נקראה בקריאה לא ודאית" in lines[1] and "S1" in lines[1]
+    assert not re.search(r"לא נמצא|לא אותר|לא מופיע", md)
+    assert out.answer.status == "partial" and md.startswith(answer)
+    assert out.final_check["judge_calls"] == 0 and "verify_final" not in _purposes(out)
+    assert out.final_digest == text_digest(md) == hashlib.sha256(md.encode()).hexdigest()
+    states = {i["label"]: i["state"] for i in out.item_ledger["items"]}
+    assert states == {"שיעור למשרדים": "covered", "שיעור למסחר": "omitted", "שיעור לחניה": "not_verifiable"}
+    assert [d["title"] for d in out.ledger["gap_documents"]] == ["דוח בדיקה"]  # the place of the lines joins the permission set
+
+
+def test_a_ledger_that_is_covered_or_explained_adds_no_line_and_keeps_the_answer_whole(offline):
+    offline.texts = [RATES_TEXT]
+    answer = "שיעור ההיוון למשרדים הוא 6.5% [S1]. שיעור ההיוון למסחר הוא 7.0% [S1]."
+    items = [_rate_item("שיעור למשרדים", "משרדים | 6.5%", "6.5%"), _rate_item("שיעור למסחר", "מסחר | 7.0%", "7.0%")]
+    judge = Judge(lambda t, i, n: "supported", asks={RATES_ASK: "6.5%"})
+    out = _turn(ScriptedAgent([SEARCH, final(answer, items=items)], judge=judge, request=[component(RATES_ASK)]),
+                "מהם שיעורי ההיוון שנקבעו?")
+    assert _kinds(out) == [] and out.answer.answer_markdown == answer and out.answer.status == "answered"
+    assert [i["state"] for i in out.item_ledger["items"]] == ["covered", "covered"]
+
+
+def test_the_final_checks_requirements_call_shows_the_ledger_like_the_first_calls_do(offline):
+    """A unit that voted for a component and was cut is judged again with the requirements block (KTD9): the block carries the
+    turn's item ledger, as the first verification's does."""
+    approval, area = "אישור התוכנית", "השטח העיקרי"
+    item = {"component": area, "label": "שטח עיקרי", "source": "S1", "quote": "השטח העיקרי הוא 1,200 מ״ר",
+            "value": "1,200", "condition": "", "state": "included", "reason": ""}
+    judge = Judge(_mixed_rule, asks={approval: "שאושר", area: "1,200"})
+    agent = ScriptedAgent([SEARCH, final(f"{MIXED}\n{VALUE}", items=[item])], judge=judge,
+                          request=[component(approval), component(area)])
+    out = _turn(agent, "מה השטח העיקרי ומה אישור התוכנית?")
+    assert out.final_check["judge_calls"] == 1
+    for call_input in (judge.inputs[0], judge.inputs[-1]):
+        assert "<item_ledger>" in call_input and 'id="I1"' in call_input and "השטח העיקרי הוא 1,200" in call_input
+    assert [i["id"] for i in out.item_ledger["items"]] == ["I1"]
+
+
 # --- the fallbacks that return an earlier round's answer are composed and checked like any other ---------------------------
 
 FIRST = f"{MIXED}\nהנכס מושכר [S1]."  # a cut, and a sentence nothing supports (a repair round is asked)

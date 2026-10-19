@@ -398,7 +398,7 @@ class _Final:
         if self.turn.derived and self.report.requirements and any(set(f.drafts) & self.voters() for f in todo):
             listing, known = _workspace_listing(self.ws, self.turn)
             coverage = _Coverage(self.turn, [p.ask for p in getattr(self.answer, "parts", None) or []],
-                                 self.request or self.question, listing, known)
+                                 self.request or self.question, listing, known, items=self.report.item_listing())
         return batch, index_of, coverage
 
     def rescore(self, scored: list[JudgeRequirement], to_draft: dict[int, int], judged: set[int]) -> bool:

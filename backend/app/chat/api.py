@@ -1194,8 +1194,14 @@ def _diagnostics(outcome: engine.TurnOutcome, payload: dict, removals: _Removals
     # the quote prefixes are document text: the documents they come from are behind the message too, as the removals' are
     checked |= {str(src.document_id) for rnd in outcome.requirements_trace for c in rnd["components"] for v in c["votes"]
                 for x in v["support"] if (src := outcome.workspace.sources.get(x["id"])) is not None and src.document_id}
+    # the item ledger (round 17 U3): items and the quote prefixes of the ones validation excluded are document text too, so the
+    # documents of both are behind the message like the support quotes' are
+    item_ledger = {"item_ledger": outcome.item_ledger} if outcome.item_ledger else {}
+    checked |= {str(i["document_id"]) for i in outcome.item_ledger.get("items", []) if i.get("document_id")}
+    checked |= {str(src.document_id) for e in outcome.item_ledger.get("excluded", [])
+                if (src := outcome.workspace.sources.get(e.get("source"))) is not None and src.document_id}
     return {"rounds": outcome.rounds, "removed": removed,
-            "resolution": (resolution or {}) | {"timing": timing} | registrations | trace,
+            "resolution": (resolution or {}) | {"timing": timing} | registrations | trace | item_ledger,
             "document_ids": _answer_documents(payload) | found | checked,
             "limits_hit": list(outcome.workspace.limits_hit)}
 

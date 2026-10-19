@@ -2174,3 +2174,249 @@ def test_a_text_completion_of_a_calculation_component_keeps_the_repair_rounds_to
     r = verify_answer(_judge(score), _answer(THREE_RATES), ws, "?", [], requirements=turn)
     assert len(_completions(r)) == 1
     assert r.text_completion_only() is False
+
+
+# --- round 17 U3: the item ledger in the requirements call, the cap and the repair, the gap lines (KTD3; R2, R6, R8, R14) ------------
+
+ADJ_TEXT = "\n".join(["התאמות לנכס להשוואה", "סוג התאמה | שיעור", "מיקום | 5%", "קומה | 3%", "גיל הבניין | 2%"])
+ADJ_ASK = "ההתאמות שהשומה יישמה"
+TWO_ADJ = "ההתאמה למיקום היא 5% [S2]. ההתאמה לקומה היא 3% [S2]."
+THREE_ADJ = TWO_ADJ + " ההתאמה לגיל הבניין היא 2% [S2]."
+FOURTH_ADJ = "מרפסת | 1%"  # a row of the table the agent's ledger misses
+
+
+def _adj_item(label: str, quote: str, value: str, **kw):
+    from app.chat.engine import LedgerItem
+
+    return LedgerItem(**({"component": "N1", "label": label, "source": "S2", "quote": quote, "value": value, "condition": "",
+                          "state": "included", "reason": ""} | kw))
+
+
+def _adj_items(**third):
+    return [_adj_item("ההתאמה למיקום", "מיקום | 5%", "5%"), _adj_item("ההתאמה לקומה", "קומה | 3%", "3%"),
+            _adj_item("ההתאמה לגיל הבניין", "גיל הבניין | 2%", "2%", **third)]
+
+
+def _adj_file(*extra_rows: str) -> Workspace:
+    return _file(SOURCE, "\n".join([ADJ_TEXT, *extra_rows]), units=(1, 1), declared=(1,))
+
+
+def _ledger_check(ws: Workspace, markdown: str, raw, *, status: str = "full", support=None, ledger=None, seen=None,
+                  kind: str = "information"):
+    """The answer (with its item list ``raw``) verified over the turn's one component by a judge that scores it ``status`` over
+    the units shown (``support``: the quotes it names for the part the answer omits): (report, turn, answer, ledger)."""
+    from app.chat import items as ledger_items
+
+    turn = _turn({"id": "1", "text": ADJ_ASK, "kind": kind})
+    answer = _answer(markdown).model_copy(update={"items": raw})
+    ledger = ledger if ledger is not None else ledger_items.Ledger()
+
+    def score(frozen, units):
+        vote = _req("", status, list(units) if status in ("full", "partial") else [], id=frozen[0][0])
+        return [vote | ({"missing": "ההתאמות", "support": support} if support else {})]
+
+    r = verify_answer(_judge(score, seen=seen), answer, ws, "?", [], requirements=turn, ledger=ledger)
+    return r, turn, answer, ledger
+
+
+def test_ae3_a_ledger_of_three_items_with_two_covered_caps_a_full_vote_at_partial_and_asks_for_the_third_without_tools():
+    ws = _adj_file()
+    r, turn, _, ledger = _ledger_check(ws, TWO_ADJ, _adj_items())
+    (o,) = r.requirement_outcomes()
+    assert o["status"] == "partial" and o["omitted_items"] == ["I3"]  # the lenient judge said full; the ledger decides
+    (p,) = _completions(r)
+    assert p.component == "N1" and p.severity == "error" and p.repairable
+    assert "S2" in p.reason and "גיל הבניין | 2%" in p.reason and "חיפוש" in p.reason  # named, from the table, no new search
+    assert "מיקום | 5%" not in p.reason and "קומה | 3%" not in p.reason  # only the omitted item is listed
+    assert r.text_completion_only() is True  # the repair round runs with its tools off (R14)
+    assert [(i.id, i.state) for i in ledger.items.values()] == [("I1", "included"), ("I2", "included"), ("I3", "included")]
+
+
+def test_after_the_repair_adds_the_third_item_the_same_ledger_makes_the_component_full_with_no_problem():
+    ws = _adj_file()
+    _, _, _, ledger = _ledger_check(ws, TWO_ADJ, _adj_items())
+    r, _, _, _ = _ledger_check(ws, THREE_ADJ, _adj_items(), ledger=ledger)
+    (o,) = r.requirement_outcomes()
+    assert o["status"] == "full" and not o.get("omitted_items")
+    assert not [p for p in r.problems if p.kind == "requirement"] and len(ledger.items) == 3
+
+
+def test_a_member_the_judges_support_names_and_the_ledger_missed_becomes_an_omitted_item_and_is_asked_for():
+    ws = _adj_file(FOURTH_ADJ)
+    r, _, _, ledger = _ledger_check(ws, THREE_ADJ, _adj_items(), status="partial", support=[{"id": "S2", "quote": FOURTH_ADJ}])
+    judged = [i for i in ledger.items.values() if i.origin == "judge_support"]
+    assert [(i.source, i.quote, i.state, i.component) for i in judged] == [("S2", FOURTH_ADJ, "omitted", "N1")]
+    (o,) = r.requirement_outcomes()
+    assert o["status"] == "partial" and o["omitted_items"] == [judged[0].id]
+    (p,) = _completions(r)
+    assert FOURTH_ADJ in p.reason and "גיל הבניין" not in p.reason
+
+
+def test_support_from_a_source_the_turn_never_returned_adds_no_item_and_leaves_the_state_as_it_was():
+    ws = _adj_file()
+    r, _, _, ledger = _ledger_check(ws, THREE_ADJ, _adj_items(), status="partial", support=[{"id": "S9", "quote": FOURTH_ADJ}])
+    assert len(ledger.items) == 3 and all(i.origin == "agent" for i in ledger.items.values())
+    (o,) = r.requirement_outcomes()
+    assert o["status"] == "partial" and not o.get("omitted_items") and not _completions(r)  # the vote's own partial, nothing added
+    (vote,) = r.requirements_trace()[0]["votes"]
+    assert [x["outcome"] for x in vote["support"]] == ["not_returned_source"]
+
+
+def test_support_for_a_part_the_ledger_already_closed_does_not_reopen_it():
+    ws = _adj_file()
+    raw = _adj_items(state="not_verifiable", reason="השורה נקראה בקריאה לא ודאית")
+    r, _, _, ledger = _ledger_check(ws, TWO_ADJ, raw, status="partial", support=[{"id": "S2", "quote": "גיל הבניין | 2%"}])
+    assert len(ledger.items) == 3 and not _completions(r)
+    assert [i.state for i in ledger.items.values()][2] == "not_verifiable"
+
+
+def test_a_not_verifiable_item_with_a_reason_does_not_block_full_and_its_gap_line_names_the_item_the_place_and_the_reason():
+    ws = _adj_file()
+    r, turn, answer, _ = _ledger_check(ws, TWO_ADJ, _adj_items(state="not_verifiable", reason="השורה נקראה בקריאה לא ודאית"))
+    (o,) = r.requirement_outcomes()
+    assert o["status"] == "full" and not _completions(r)
+    final, outcomes = _finish(ws, answer, r, turn)
+    assert [x["status"] for x in outcomes] == ["full"] and final.status == "answered"
+    gap = _gap(final, answer)
+    assert "ההתאמה לגיל הבניין" in gap and "דוח בדיקה" in gap and "S2" in gap and "השורה נקראה בקריאה לא ודאית" in gap
+    assert "לא נמצא" not in gap and "לא אותר" not in gap
+
+
+def test_a_not_applicable_item_gets_a_gap_line_with_the_request_condition_that_excludes_it():
+    ws = _adj_file()
+    r, turn, answer, _ = _ledger_check(ws, TWO_ADJ, _adj_items(state="not_applicable", reason="הבקשה היא לנכס שנבנה אחרי 2020"))
+    final, outcomes = _finish(ws, answer, r, turn)
+    assert outcomes[0]["status"] == "full"
+    gap = _gap(final, answer)
+    assert "ההתאמה לגיל הבניין" in gap and "הבקשה היא לנכס שנבנה אחרי 2020" in gap and "S2" in gap
+
+
+def test_an_item_still_omitted_after_the_repair_gets_a_line_saying_where_it_was_read_and_that_it_was_not_used():
+    ws = _adj_file()
+    ws.sources["S2"].location = 'סעיף "התאמות", עמוד 4'
+    r, turn, answer, _ = _ledger_check(ws, TWO_ADJ, _adj_items())
+    final, outcomes = _finish(ws, answer, r, turn)
+    (o,) = outcomes
+    assert o["status"] == "partial" and final.status == "partial"
+    assert o["limitation"] == "not_verifiable" and o["variant"] == "read_not_used" and o["stated"] is False  # the item line states it
+    gap = _gap(final, answer)
+    assert "ההתאמה לגיל הבניין" in gap and "דוח בדיקה" in gap and "עמוד 4" in gap and "S2" in gap
+    assert "נקרא" in gap and "לא נעשה בו שימוש" in gap
+    assert not re.search(r"לא נמצא|לא אותר|לא מופיע", gap)
+    assert gap.count("\n") == 0  # one line for the one item; the component's own gap line is not added beside it
+    assert coverage.gap_documents(outcomes, r.item_gaps) == [{"document_id": str(ws.sources["S2"].document_id), "title": "דוח בדיקה"}]
+
+
+def test_item_gap_lines_are_capped_and_the_rest_is_counted(monkeypatch):
+    monkeypatch.setattr(coverage, "ITEM_GAP_LINES", 2)
+    ws = _adj_file()
+    raw = [_adj_item("ההתאמה למיקום", "מיקום | 5%", "5%"), _adj_item("ההתאמה לקומה", "קומה | 3%", "3%"),
+           _adj_item("ההתאמה לגיל הבניין", "גיל הבניין | 2%", "2%")]
+    r, turn, answer, _ = _ledger_check(ws, "ההתאמות נקבעו לפי הטבלה [S2].", raw)
+    final, _ = _finish(ws, answer, r, turn)
+    lines = _gap(final, answer).splitlines()
+    assert len(lines) == 3 and "1" in lines[-1] and "ההתאמה לגיל הבניין" not in "".join(lines[:2])
+
+
+def test_a_text_completion_of_an_omitted_item_of_a_calculation_component_keeps_the_repair_rounds_tools():
+    ws = _adj_file()
+    r, _, _, _ = _ledger_check(ws, TWO_ADJ, _adj_items(), kind="calculation")
+    (p,) = [p for p in r.problems if p.kind == "requirement" and p.component == "N1"]
+    assert "גיל הבניין | 2%" in p.reason and r.text_completion_only() is False
+
+
+def test_the_requirements_call_shows_each_components_items_with_their_state_and_a_ledger_rule_in_the_policy():
+    ws = _adj_file()
+    seen: list[str] = []
+    _ledger_check(ws, TWO_ADJ, _adj_items(), seen=seen)
+    block = re.search(r"<item_ledger>.*?</item_ledger>", seen[0], re.S).group()
+    assert block.index('<component id="N1">') < block.index('id="I1"') and 'id="I3"' in block
+    states = dict(re.findall(r'<item id="(I\d+)"[^>]*state="(\w+)"', block))
+    assert states == {"I1": "covered", "I2": "covered", "I3": "omitted"}
+    assert "גיל הבניין | 2%" in block and 'source="S2"' in block
+    assert seen[0].index("<item_ledger>") < seen[0].index("<workspace>")
+    assert "<item_ledger>" in verify.JUDGE_REQUIREMENTS_POLICY  # one rule about it
+    assert block.count("\n") <= 8 and len(block) < 1200  # the ledger of a typical case is small
+
+
+def test_a_turn_with_no_items_renders_no_ledger_block_and_adds_no_problem():
+    ws = _adj_file()
+    seen: list[str] = []
+    r, _, _, ledger = _ledger_check(ws, TWO_ADJ, [], seen=seen)
+    assert "<item_ledger>" not in seen[0] and ledger.items == {}
+    assert r.requirement_outcomes()[0]["status"] == "full" and not r.problems
+
+
+def test_the_items_rendered_per_component_are_capped_with_the_uncovered_ones_first(monkeypatch):
+    monkeypatch.setattr(verify, "ITEMS_PER_COMPONENT", 2)
+    ws = _adj_file()
+    seen: list[str] = []
+    _ledger_check(ws, TWO_ADJ, _adj_items(), seen=seen)
+    block = re.search(r"<item_ledger>.*?</item_ledger>", seen[0], re.S).group()
+    assert block.count("<item ") == 2 and 'id="I3"' in block and '<more count="1"' in block
+
+
+def test_the_requirements_trace_carries_the_ledger_outcomes_per_component():
+    ws = _adj_file()
+    r, _, _, _ = _ledger_check(ws, TWO_ADJ, _adj_items())
+    (comp,) = r.requirements_trace()
+    assert [(i["id"], i["state"], i["origin"]) for i in comp["items"]] == [("I1", "covered", "agent"), ("I2", "covered", "agent"),
+                                                                           ("I3", "omitted", "agent")]
+    assert comp["items"][2]["why"] == "value_not_stated" and comp["items"][2]["source"] == "S2"
+    assert all(len(i["quote"]) <= verify.TRACE_QUOTE_CHARS for i in comp["items"])
+
+
+def test_the_ledger_is_validated_against_the_units_that_survive_the_deterministic_checks():
+    ws = _adj_file()
+    bad = _adj_items()[:2] + [_adj_item("ההתאמה לגיל הבניין", "גיל הבניין | 4%", "4%")]  # not verbatim
+    r, _, _, ledger = _ledger_check(ws, TWO_ADJ, bad)
+    assert len(ledger.items) == 2 and [e["reason"] for e in ledger.excluded] == ["not_verbatim"]
+    assert r.requirement_outcomes()[0]["status"] == "full"
+
+
+def test_a_part_only_the_judge_named_is_stated_by_its_components_own_line_and_the_agents_by_item_lines():
+    ws = _adj_file(FOURTH_ADJ)
+    raw = _adj_items()[:2] + [_adj_item("ההתאמה לגיל הבניין", "גיל הבניין | 2%", "2%")]
+    r, turn, answer, ledger = _ledger_check(ws, TWO_ADJ, raw, status="partial", support=[{"id": "S2", "quote": FOURTH_ADJ}])
+    final, outcomes = _finish(ws, answer, r, turn)
+    (o,) = outcomes
+    assert o["omitted_items"] == ["I4", "I3"] and o["judge_items"] == ["I4"] and o["stated"] is True
+    lines = _gap(final, answer).split("\n\n")
+    assert len(lines) == 2 and "החלק נקרא" in lines[0] and "S2" in lines[0]  # round 16's line for the judge's part
+    assert "ההתאמה לגיל הבניין" in lines[1] and FOURTH_ADJ not in lines[1]  # one item line, for the agent's item only
+
+
+def test_a_sentence_of_the_table_that_shares_the_words_of_a_judge_added_rate_does_not_close_it():
+    ws = _rates_file()
+    from app.chat import items as ledger_items
+
+    ledger = ledger_items.Ledger()
+    turn = _turn({"id": "1", "text": ASK_RATES})
+    markdown = THREE_RATES + " שיעור היוון למחסנים עבור מבנים ישנים אינו נקבע [S2]."  # words of the rate, none of its number
+
+    def score(frozen, units):
+        return [_req("", "partial", list(units), id=frozen[0][0])
+                | {"missing": "שיעורי ההיוון", "support": [{"id": "S2", "quote": MISSING_RATE}]}]
+
+    r = verify_answer(_judge(score), _answer(markdown), ws, "?", [], requirements=turn, ledger=ledger)
+    (o,) = r.requirement_outcomes()
+    assert o["status"] == "partial" and o["judge_items"] and len(_completions(r)) == 1
+    again = verify_answer(_judge(lambda f, u: [_req("", "full", list(u), id=f[0][0])]), _answer(markdown + " מחסנים: 9.1% [S2]."),
+                          ws, "?", [], requirements=turn, ledger=ledger)
+    assert again.requirement_outcomes()[0]["status"] == "full" and not _completions(again)
+
+
+def test_the_diagnostics_carry_the_ledger_and_the_documents_of_its_items_join_the_permission_set():
+    from app.chat import api
+    from app.chat.engine import TurnOutcome
+
+    ws = _adj_file()
+    r, _, answer, _ = _ledger_check(ws, TWO_ADJ, _adj_items() + [_adj_item("ההתאמה לגג", "התאמת גג הבניין | 1%", "1%", source="S1")])
+    outcome = TurnOutcome(answer, ws, r, 1, item_ledger=r.item_diagnostics())
+    out = api._diagnostics(outcome, {})
+    ledger = out["resolution"]["item_ledger"]
+    assert [(i["id"], i["state"]) for i in ledger["items"]] == [("I1", "covered"), ("I2", "covered"), ("I3", "omitted")]
+    assert [e["reason"] for e in ledger["excluded"]] == ["not_verbatim"]  # S1 does not hold the roof row
+    assert str(ws.sources["S2"].document_id) in out["document_ids"]
+    assert str(ws.sources["S1"].document_id) in out["document_ids"]  # the excluded item's quote prefix is document text too
+    assert api._diagnostics(TurnOutcome(answer, ws, r, 1), {})["resolution"].get("item_ledger") is None

@@ -54,6 +54,12 @@ table, first match wins (``reason_of``):
     server validated (``verify.validated_support``, round 16 U2, KTD2) and the answer still omits — found, not verifiable,
     variant ``read_not_used``: the part was read at that place (the document, the section or pages, the S#) and not used.
     It never says "not found" (R6); a component whose quote was not valid keeps the wording below;
+10-item. an item of the turn's item ledger (``items.Ledger``, round 17 U3, KTD3, R8) the answer does not give — listed by the agent
+    and given by no surviving unit — or that the agent declared ``not_verifiable`` or ``not_applicable`` with a reason: its own
+    line after the gap paragraph (``item_gap_lines``, the ``item_gap`` server span) naming the item, the place it was read at
+    (document, location, S#) and, for a declared one, the reason. An omitted item makes its component partial
+    (``VerifyReport.requirement_outcomes``) and, as the judge's validated support does, is a ``REQ_TEXT_FOUND`` completion for the
+    repair round; it is never "not found". A declared item does not block ``full``;
 10a. a professional question whose pool was empty — the office holds no standard or professional document (round 10 U8,
     KTD15, R29): the standard text is not in the repository — standard text absent (stated as the repository's gap, and
     the other permitted sources still answer);
@@ -224,6 +230,11 @@ LIMIT_WHERE = {TIME_LIMIT: "מגבלת הזמן של השאלה", TOOL_BUDGET: "
 UNIT_IN_FOCUS = "{unit} נשאר בפוקוס; אפשר לבקש להמשיך לקרוא."
 # a component whose text is a clause of the request, with no noun phrase to name it: the datum asked for
 GENERIC_LABEL = "הנתון המבוקש"
+# the item lines after the answer (round 17 U3, KTD3, R8): at most this many lines (the rest is counted in one), an item's name
+# and the agent's reason clipped to these lengths (the reason is the model's, in a server line: never more than a short clause)
+ITEM_GAP_LINES = 8
+ITEM_NAME_CHARS = 80
+ITEM_REASON_CHARS = 160
 # a model claim's status -> the reason it supports, once validated
 _KIND_OF_STATUS = {"not_found_search": "not_located", "source_partial": "region_not_read",
                    "section_checked_absent": "not_in_part_read", "sources_conflict": "sources_conflict"}
@@ -771,6 +782,52 @@ def _read_not_used(ws: Workspace, sid: str) -> dict:
             "document": src.title, "document_id": str(src.document_id), "detail": src.location or ""}
 
 
+_BRACKETS = re.compile(r"[\[\]\r\n]+")
+
+
+def _plain(text: str, limit: int) -> str:
+    """A model-written phrase for a server line: one line, no square brackets (a citation is the server's to write), clipped."""
+    flat = " ".join(_BRACKETS.sub(" ", text or "").split())
+    return flat if len(flat) <= limit else flat[:limit].rstrip() + "…"
+
+
+def item_line(ws: Workspace, state: dict) -> dict:
+    """The server's line for one item of the ledger the answer does not give (round 17 U3, KTD3, R8): it names the item, the place
+    in the source it was read at (the document, the location, the S#) and the reason — still omitted: read there and not used,
+    never "not found"; ``not_verifiable`` / ``not_applicable``: the reason the agent gave. {"id", "state", "text", "document_id",
+    "title"}."""
+    src = ws.sources.get(state["source"])
+    title = (src.title if src is not None else "") or ""
+    place = f'ב"{title}"' + (f" ({src.location})" if src is not None and src.location else "") + f" [{state['source']}]"
+    name = "«" + _plain(state["label"] or state["quote"], ITEM_NAME_CHARS) + "»"
+    reason = _plain(state["reason"], ITEM_REASON_CHARS).rstrip(".")
+    if state["state"] == "not_verifiable":
+        text = f"{name}: נקרא {place}, אך לא ניתן לאמת אותו: {reason}."
+    elif state["state"] == "not_applicable":
+        text = f"{name}: נקרא {place}, ולא נכלל בתשובה כי הוא אינו חל על הבקשה: {reason}."
+    else:
+        text = f"{name}: נקרא {place}, ולא נעשה בו שימוש בתשובה."
+    return {"id": state["id"], "state": state["state"], "text": text,
+            "document_id": str(src.document_id) if src is not None and src.document_id is not None else None,
+            "title": title}
+
+
+def item_gap_lines(ws: Workspace, report, outcomes: Sequence[dict]) -> list[dict]:
+    """The lines for the ledger's items that stand open in the saved answer: those the agent listed and no surviving unit gives
+    (still omitted) and those declared ``not_verifiable`` or ``not_applicable`` with a reason (``item_line``), in the ledger's order, at most
+    ``ITEM_GAP_LINES`` (one more line counts the rest). An item of a component the request made not relevant is not stated."""
+    skip = {o["id"] for o in outcomes if o.get("status") == "not_relevant"}
+    # a part only the judge named is stated by its component's own line (round 16: ``read_not_used``), not twice
+    lines = [item_line(ws, st) for st in report.item_states()
+             if st["component"] not in skip and (st["state"] in ("not_verifiable", "not_applicable")
+                                                 or (st["state"] == "omitted" and st["origin"] != "judge_support"))]
+    if len(lines) <= ITEM_GAP_LINES:
+        return lines
+    rest = len(lines) - ITEM_GAP_LINES
+    return lines[:ITEM_GAP_LINES] + [{"id": "", "state": "more", "text": f"ועוד {rest} פריטים נוספים שנקראו ולא נכללו בתשובה.",
+                                      "document_id": None, "title": ""}]
+
+
 def _not_read_gap(ws: Workspace) -> dict:
     """The gap of a component whose named document was not read (``document_not_read``): the documents the turn's
     lookups matched by title, with their state and reason (``unread.gap_detail``)."""
@@ -841,6 +898,8 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
         # a part a read passage states and the answer omits is stated too (round 16 U2, R6), never a conditional component
         o["stated"] = (o["status"] != "partial" or o["kind"] == "instruction" or bool(o["missing_part"])
                        or (o["variant"] == "read_not_used" and datum))
+        if o.get("omitted_items") and not o.get("judge_items"):
+            o["stated"] = False  # the agent's omitted items are stated one by one, in the item lines (``item_gap_lines``)
         o["gap"] = gap_sentence(why["reason"], o["variant"], [gap_label(o)], o["place"], o["document"], o["detail"])
     return outcomes
 
@@ -956,7 +1015,14 @@ def compose_components(ws: Workspace, answer: FinalAnswer, report,
         doc.tidy_blank_lines()
         doc.append(("\n\n" if doc.text else "") + "\n".join(lines), "gap_paragraph")
         edited.status = "partial" if edited.status == "answered" else edited.status
-    elif any(not o["children"] and o["status"] in UNMET for o in outcomes) and edited.status == "answered":
+    # the ledger's items the answer does not give, or that were declared not verifiable / not applicable, one line each (round 17
+    # U3, R8): server text, a pure function of the final state like the gap paragraph. Whether the answer is partial follows the
+    # components (an omitted item makes its component partial; an item declared with a reason does not)
+    report.item_gaps = item_lines = item_gap_lines(ws, report, outcomes) if outcomes else []
+    if item_lines:
+        doc.tidy_blank_lines()
+        doc.append(("\n\n" if doc.text else "") + "\n".join(x["text"] for x in item_lines), "item_gap")
+    if any(not o["children"] and o["status"] in UNMET for o in outcomes) and edited.status == "answered":
         edited.status = "partial"
     doc.delete(tidy_cuts(doc.text))
     doc.tidy_blank_lines()
@@ -970,13 +1036,16 @@ def state_components(ws: Workspace, answer: FinalAnswer, report,
     return edited.answer(answer), outcomes
 
 
-def gap_documents(outcomes: list[dict]) -> list[dict]:
-    """The documents the gap statements name (a section read, a document read in part): permission checks cover
-    them (``LEDGER_DOCUMENT_KEYS``)."""
+def gap_documents(outcomes: list[dict], item_lines: Sequence[dict] = ()) -> list[dict]:
+    """The documents the gap statements name (a section read, a document read in part, the place of an item line,
+    ``item_gap_lines``): permission checks cover them (``LEDGER_DOCUMENT_KEYS``)."""
     out: dict[str, dict] = {}
     for o in outcomes:
         if o.get("stated") and o.get("document_id"):
             out[o["document_id"]] = {"document_id": o["document_id"], "title": o.get("document_title")}
+    for line in item_lines:
+        if line.get("document_id"):
+            out.setdefault(line["document_id"], {"document_id": line["document_id"], "title": line.get("title")})
     return list(out.values())
 
 

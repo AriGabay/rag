@@ -8,7 +8,9 @@ the marker when it lands (a strict xfail that starts passing fails the suite, so
 1. An old ``full`` hides a gap (AE1, owned by U1/U3). Round 1 gives the component ``full`` over two rate sentences while a
    third sentence of the answer fails; the repair rewrites that sentence only. The fresh requirements call over the
    edited answer scores the component ``partial`` with a validated quote of the rate the answer omits. The vote carried
-   from the unchanged sentences wins by "best status", so the component ends ``full`` and the gap is never asked for.
+   from the unchanged sentences wins by "best status", so the component ends ``full`` and the gap is never asked for. U3 closed
+   this sequence (the validated support becomes an omitted ledger item, which caps the component at partial whatever a vote
+   says); U1's version rules (reuse and history of decisions) are still its own.
 2. A list answered in part (AE3, owned by U3 with the ledger of U2). A read table lists three adjustments, the answer gives
    two with citations and a lenient judge scores the component ``full``: nothing asks for the third. Expressed in
    observable outcomes (what the answer states, the repair request, the tools called); once the item ledger exists, the
@@ -39,6 +41,7 @@ from tests.integration.test_chat import cloud, new_conversation, send
 from tests.integration.test_chat_calculation import _outputs, handle_of
 from tests.integration.test_documents_api import ingest
 from tests.integration.test_round16_sequences import (
+    RecordingAgent,
     _source_line,
     block_document,
     checks_of,
@@ -55,8 +58,6 @@ MANIFEST = json.loads((FIXTURES / "round17" / "manifest.json").read_text(encodin
 SENSITIVITY, ADJUSTMENTS = MANIFEST["sensitivity"], MANIFEST["adjustments"]
 
 # the owning unit removes its marker when it lands (strict: a test that starts passing with the marker left fails)
-U1_U3 = pytest.mark.xfail(strict=True, reason="U1/U3 not landed: an old full vote still hides a gap a fresh vote validated")
-U3 = pytest.mark.xfail(strict=True, reason="U3 not landed: a list answered in part is scored full and never completed")
 U5 = pytest.mark.xfail(strict=True, reason="U5 not landed: a table value is written without the scope its paragraph states")
 
 
@@ -145,7 +146,6 @@ def rates_judge(seen: list[str]):
     return judge
 
 
-@U1_U3
 def test_an_old_full_vote_does_not_hide_a_rate_a_fresh_vote_on_the_edited_answer_validated_as_omitted(
         client, office, monkeypatch):
     doc = block_document(office, RATES_TITLE, [(RATES_HEAD, [*RATES_LINES, RATES_NOTE])], "c" * 64)
@@ -196,15 +196,25 @@ def lenient_judge(seen: list[str] | None = None):
     return judge
 
 
-@U3
+def adjustment_items(state_of_third: str = "included") -> list[dict]:
+    """The item ledger the answering agent declares for the table: the three adjustments, each quoted from its row of the read
+    table (S1), the third as given."""
+    rows = (ADJ_LOCATION, ADJ_AREA, ADJ_FLOOR)
+    return [{"component": "N1", "label": row[0], "source": "S1", "quote": f"{row[0]} | {row[1]}", "value": row[1],
+             "condition": "", "state": state_of_third if row is ADJ_FLOOR else "included",
+             "reason": "המקור נקרא בקריאה לא ודאית" if row is ADJ_FLOOR and state_of_third != "included" else ""}
+            for row in rows]
+
+
 def test_the_third_adjustment_a_read_table_lists_and_the_answer_omits_is_added_from_it_without_a_new_search(
         client, office, monkeypatch):
-    # With the item ledger (U2) the scripted final answers also declare ``items``: the three adjustments of the table,
-    # the third ``included``; the observable outcomes below stay the same.
+    # The scripted final answers declare ``items``: the three adjustments of the table, the third ``included`` (AE3). The
+    # lenient judge scores the component full over the two it is shown; the ledger, not the vote, decides.
     doc = ingest_pdf(office, monkeypatch, ADJUSTMENTS)
-    steps = [[call("outline", document=doc)], read_table(ADJ_CAPTION), final(ADJ_TWO, documents=[doc]),
-             final(ADJ_THREE, documents=[doc])]
-    agent = ScriptedAgent(steps, judge=lenient_judge(), request=[component(ADJ_ASK)])
+    steps = [[call("outline", document=doc)], read_table(ADJ_CAPTION),
+             final(ADJ_TWO, documents=[doc], items=adjustment_items()),
+             final(ADJ_THREE, documents=[doc], items=adjustment_items())]
+    agent = RecordingAgent(steps, judge=lenient_judge(), request=[component(ADJ_ASK)])
     cloud(monkeypatch, office, agent)
     login_b(client)
     m = send(client, new_conversation(client), ADJ_QUESTION)
@@ -218,9 +228,56 @@ def test_the_third_adjustment_a_read_table_lists_and_the_answer_omits_is_added_f
     assert ADJ_FLOOR[0] in repair and "S1" in repair
     assert not repair_calls(agent)
     assert f"{ADJ_FLOOR[0]}: {ADJ_FLOOR[1]} [S1]" in md
+    (n1,) = [r["id"] for r in m["answer"]["ledger"]["requirements"]]
+    assert checks_of(client, m)[0] == [("text_found", n1)]  # one REQ_TEXT_FOUND problem for the component, nothing else
+    assert m["answer"]["verification"]["completeness"]["status"] == "full"
     # no search at any step of the turn: the table was read once and nothing else was looked for
-    called = [i["name"] for step in agent.seen for i in step if isinstance(i, dict) and i.get("type") == "function_call"]
-    assert set(called) == {"outline", "read"} and called.count("read") == 1, called
+    called = [i["name"] for i in agent.seen[-1] if isinstance(i, dict) and i.get("type") == "function_call"]
+    assert called == ["outline", "read"], called  # the items of each step hold the earlier ones: the whole turn's calls
+    assert agent.choices[-1] == "none" and agent.choices[:-1] == [None] * 3  # only the repair step ran with its tools off
+    # the ledger is in the diagnostics: the three items, the third open in the first round and covered in the second
+    diagnostics = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()
+    ledger = diagnostics["resolution"]["item_ledger"]
+    assert [(i["id"], i["state"]) for i in ledger["items"]] == [("I1", "covered"), ("I2", "covered"), ("I3", "covered")]
+    rounds = trace_of(client, m, n1)
+    assert [[i["state"] for i in c["items"]] for c in rounds] == [["covered", "covered", "omitted"], ["covered"] * 3]
+    assert [c["final_status"] for c in rounds] == ["partial", "full"]
+
+
+def test_an_item_the_answer_still_omits_after_the_repair_is_stated_as_read_and_not_used_never_as_not_found(
+        client, office, monkeypatch):
+    doc = ingest_pdf(office, monkeypatch, ADJUSTMENTS)
+    steps = [[call("outline", document=doc)], read_table(ADJ_CAPTION),
+             final(ADJ_TWO, documents=[doc], items=adjustment_items()),
+             final(ADJ_TWO, documents=[doc], items=adjustment_items()),
+             final(ADJ_TWO, documents=[doc], items=adjustment_items())]
+    agent = ScriptedAgent(steps, judge=lenient_judge(), request=[component(ADJ_ASK)])
+    cloud(monkeypatch, office, agent)
+    login_b(client)
+    m = send(client, new_conversation(client), ADJ_QUESTION)
+    assert m["status"] == "done", m
+    md = m["answer"]["markdown"]
+    (line,) = [ln for ln in md.splitlines() if ADJ_FLOOR[0] in ln]
+    assert "S1" in line and "לא נעשה בו שימוש" in line and "נקרא" in line, line
+    assert not re.search(r"לא נמצא|לא אותר|לא מופיע", md)
+    assert m["answer"]["status"] == "partial" and m["answer"]["verification"]["completeness"]["status"] == "partial"
+
+
+def test_a_third_adjustment_declared_not_verifiable_with_a_reason_keeps_the_answer_full_and_is_stated_in_a_line(
+        client, office, monkeypatch):
+    doc = ingest_pdf(office, monkeypatch, ADJUSTMENTS)
+    items = adjustment_items("not_verifiable")
+    steps = [[call("outline", document=doc)], read_table(ADJ_CAPTION), final(ADJ_TWO, documents=[doc], items=items)]
+    agent = ScriptedAgent(steps, judge=lenient_judge(), request=[component(ADJ_ASK)])
+    cloud(monkeypatch, office, agent)
+    login_b(client)
+    m = send(client, new_conversation(client), ADJ_QUESTION)
+    assert m["status"] == "done", m
+    md = m["answer"]["markdown"]
+    assert len(agent.seen) == 3 and checks_of(client, m)[0] == []  # nothing to repair: the item is explicitly dispositioned
+    (line,) = [ln for ln in md.splitlines() if ADJ_FLOOR[0] in ln]
+    assert "המקור נקרא בקריאה לא ודאית" in line and "S1" in line
+    assert m["answer"]["verification"]["completeness"]["status"] == "full"
 
 
 # --- 3. a scope qualifier after a table (AE5) --------------------------------------------------------------------------

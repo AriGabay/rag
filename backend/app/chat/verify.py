@@ -463,7 +463,12 @@ JUDGE_REQUIREMENTS_POLICY = (
     "אותו, וב-support צטט אותו. "
     "פתיחת מקור, או קיומו ב-<read_passages>, אינם נתינת הדרישה: רק יחידה שבקלט נותנת אותה (units). support רק לדרישה "
     "partial או missing, רק עבור S# שמופיע ב-<read_passages> או ב-<sources>, ורק בציטוט שאתה רואה בקטע; כשאין חלק כזה — "
-    "support ריק."
+    "support ריק.\n"
+    "פנקס פריטים: כשמופיע <item_ledger>, הוא מפרט לכל רכיב את הפריטים שהתשובה הצהירה עליהם מתוך הקטעים שנקראו (I#, מקורם "
+    "source ו-state: covered — יחידה נותנת אותו עם מקורו; omitted — אף יחידה אינה נותנת אותו; not_verifiable או "
+    "not_applicable — הוצהר עם סיבה; <more> — מספר פריטים נוספים שלא הוצגו). רכיב שיש לו פנקס הוא full רק כשכל פריט שלו ניתן "
+    "ביחידות שבקלט, ו-<read_passages> והמקורות המצוטטים אינם אומרים חבר נוסף מאותו סוג לנכס שנשאל שהפנקס חסר; חבר כזה "
+    "הוא partial, וציין אותו ב-support לפי הכללים שלמעלה."
 )
 # the judge's scores of a requirement in one call
 REQUIREMENT_STATUSES = ("full", "partial", "missing", "undeterminable")
@@ -486,18 +491,25 @@ READ_PASSAGES_CHARS = 6_000
 READ_PASSAGE_CHARS = 2_000
 READ_PASSAGE_FLOOR = 300
 SUPPORT_PER_REQUIREMENT = 6  # a requirement names at most this many support quotes in one call
+# the item ledger in the requirements call (round 17 U3, KTD3, KTD7): at most this many items of a component are rendered (the
+# uncovered ones first; ``<more>`` counts the rest), and no more of an item's quote than the trace keeps. The same cap bounds the
+# omitted items one REQ_TEXT_FOUND problem lists
+ITEMS_PER_COMPONENT = 12
+ITEM_QUOTE_CHARS = 160
 REQ_DATA_FOUND = ("חלק של הבקשה שהתשובה לא נתנה במלואו: «{text}». הנתונים שלו כבר נמצאו בתור הזה ({ids}): השלם "
                   "אותו בתשובה מהם, וחשב ב-calculate אם הוא דורש חישוב")
 # a part of the request the answer omits, that a passage the turn read states (round 16 U2, KTD3): the repair round adds it from
 # that passage, with its citation, and does not search again. ``{where}``: each validated support, "S# «quote»"
 REQ_TEXT_FOUND = ("חלק של הבקשה שהתשובה לא נתנה במלואו: «{text}». הוא כבר נקרא בתור הזה, ונכתב במקור: {where}. הוסף אותו "
                   "לתשובה מאותו מקור, עם מראה המקום שלו; אין צורך בחיפוש חדש")
+REQ_TEXT_FOUND_MORE = " ועוד {n} פריטים שנקראו באותו מקור"  # after the first ``ITEMS_PER_COMPONENT`` parts one problem lists
 TEXT_FOUND_CHECK = "text_found"  # the ``Problem.check`` of a REQ_TEXT_FOUND problem (the repair step turns its tools off for it)
 # the requirements trace (diagnostics only): what a requirements call returned for a component and what the server did with its
 # support. Bounded: a quote prefix is all the document text it keeps
 TRACE_QUOTE_CHARS = 160  # the most of a support quote the trace keeps
 TRACE_MISSING_CHARS = 200  # the most of a ``missing`` text it keeps
 TRACE_SUPPORT_PER_VOTE = 12  # support entries kept per vote (the rest are counted in ``support_omitted``)
+TRACE_ITEMS_PER_COMPONENT = 24  # ledger items kept per component in the trace
 TRACE_VOTES_PER_COMPONENT = 8  # votes (judge calls) kept per component and round
 TRACE_COMPONENTS = 40  # components kept per round
 TRACE_PASSAGE_IDS = 60  # passage ids kept per call
@@ -1510,6 +1522,12 @@ class VerifyReport:
     instructions: dict = field(default_factory=dict)
     # the server's gap paragraph, grouped by reason (``coverage.gap_groups``), set once the final answer is stated
     gaps: list[dict] = field(default_factory=list)
+    # the item ledger of the turn (round 17 U3, KTD3: ``app.chat.items.Ledger``, shared by the turn's reports) and the workspace its
+    # coverage is read from; None outside a turn that froze its components. ``item_gaps``: the server's item lines
+    # (``coverage.item_gap_lines``), set once the final answer is stated
+    item_ledger: object | None = None
+    item_ws: object | None = None
+    item_gaps: list[dict] = field(default_factory=list)
     # calculation components waiting for a detail only the user can give (round 7 KTD9): id -> the parameters no
     # user assumption and no document rate of the turn fills (``unfilled_parameters``)
     pending_parameters: dict[str, list[str]] = field(default_factory=dict)
@@ -1918,6 +1936,54 @@ class VerifyReport:
                         | ({"claim_id": ids[0], "claim_ids": list(ids)} if ids else {}))
         return rows
 
+    def item_states(self, kept: set[int] | None = None) -> list[dict]:
+        """Every item of the turn's ledger against the units that survive (``kept``: their indexes, else every unit not removed):
+        ``Ledger.outcomes`` — ``covered``, ``omitted`` (included or judge-added and given by no surviving unit), or the
+        ``not_verifiable`` / ``not_applicable`` the agent declared with a reason. Empty without a ledger."""
+        ledger = self.item_ledger
+        if ledger is None or not ledger.items:
+            return []
+        if kept is None:
+            gone = self.removed_units()
+            kept = {u.index for u in self.units if u.index not in gone}
+        units = [u for u in self.units if u.index in kept]
+        states = ledger.outcomes(units, self.item_ws)
+        texts = {r["id"]: r["text"] for r in self.requirements}
+        for st in states:
+            # the judge names a part by its quote alone: unit attribution is not enough for it, the round-16 presence test must
+            # hold too (the quote's numbers with half of the words that name the item, not the component's own words), or a
+            # sentence of the same table that shares the rate's words would close an omitted rate
+            if st["origin"] == "judge_support" and st["state"] == "covered" \
+                    and not _in_answer(st["quote"], units, texts.get(st["component"], "")):
+                st |= {"state": "omitted", "covered_by": None, "why": "value_not_stated"}
+        return states
+
+    def item_listing(self, kept: set[int] | None = None) -> list[dict]:
+        """The ledger as the requirements call is shown it (``_Coverage.items``): each item's id, component, label, source, quote,
+        value, condition and state (and the reason of a declared one)."""
+        return [{k: s[k] for k in ("id", "component", "label", "source", "quote", "value", "condition", "state", "reason")}
+                for s in self.item_states(kept)]
+
+    def add_support_items(self, support: dict[str, list[dict]]) -> None:
+        """The judge's validated support (``validated_support``) enters the turn's ledger as items with origin ``judge_support`` and
+        state ``omitted`` (round 17 U3, R6): a member of the asked kind the ledger missed. An item the ledger already holds is
+        not changed by it (``Ledger.merge``)."""
+        from app.chat import items as item_ledger
+
+        ledger = self.item_ledger
+        if ledger is None:
+            return
+        ledger.merge([item_ledger.support_item(cid, x["id"], x["quote"], ledger, ws=self.item_ws)
+                      for cid, entries in support.items() for x in entries])
+
+    def item_diagnostics(self) -> dict:
+        """The turn's ledger for the diagnostics: each item with its state against the units that stand, and what validation
+        excluded (``{}`` without items)."""
+        ledger = self.item_ledger
+        if ledger is None or not (ledger.items or ledger.excluded):
+            return {}
+        return {"items": self.item_states(), "excluded": list(ledger.excluded)}
+
     def requirements_trace(self) -> list[dict]:
         """Per request component, what the requirements judge returned and what the server did with its support (diagnostics
         only; owner and admin): the component's id and final merged status (``requirement_outcomes``), and one entry per judge
@@ -1928,6 +1994,7 @@ class VerifyReport:
         if not self.requirements:
             return []
         final = {o["id"]: o["status"] for o in self.requirement_outcomes()}
+        ledger_items = self.item_states()
         out = []
         for r in self.requirements[:TRACE_COMPONENTS]:
             votes = []
@@ -1938,7 +2005,14 @@ class VerifyReport:
                                   "missing": v.missing[:TRACE_MISSING_CHARS], "support": [], "support_omitted": 0})
                 else:
                     votes.append({k: val for k, val in t.items() if k != "_index"} | {"support": [dict(e) for e in t["support"]]})
-            out.append({"id": r["id"], "final_status": final.get(r["id"]), "votes": votes})
+            entry = {"id": r["id"], "final_status": final.get(r["id"]), "votes": votes}
+            if mine := [i for i in ledger_items if i["component"] == r["id"]]:  # round 17 U3: the ledger and its outcomes
+                entry["items"] = [{"id": i["id"], "origin": i["origin"], "source": i["source"], "state": i["state"],
+                                   "declared": i["declared"], "why": i["why"], "covered_by": i["covered_by"],
+                                   "label": i["label"][:TRACE_QUOTE_CHARS], "quote": i["quote"][:TRACE_QUOTE_CHARS],
+                                   "value": i["value"], "condition": i["condition"][:TRACE_QUOTE_CHARS],
+                                   "reason": i["reason"][:TRACE_QUOTE_CHARS]} for i in mine[:TRACE_ITEMS_PER_COMPONENT]]
+            out.append(entry)
         return out
 
     def requirement_outcomes(self, applied: FinalAnswer | None = None) -> list[dict]:
@@ -1975,6 +2049,15 @@ class VerifyReport:
         for r in self.requirements:
             if r.get("parent"):
                 children.setdefault(r["parent"], []).append(r["id"])
+        # the item ledger (round 17 U3, KTD3, R2, R6): the items no surviving unit gives, by component, and the keys of the items
+        # the ledger closed (covered, or declared not verifiable / not applicable with a reason)
+        omitted_by: dict[str, list[dict]] = {}
+        closed: set[tuple[str, str, str]] = set()
+        for st in self.item_states(kept):
+            if st["state"] == "omitted":
+                omitted_by.setdefault(st["component"], []).append(st)
+            else:
+                closed.add((st["component"], st["source"], SupportScope.flat(st["quote"])))
         out: dict[str, dict] = {}
         for r in self.requirements:
             votes = self.requirement_votes.get(r["id"], [])
@@ -1996,7 +2079,21 @@ class VerifyReport:
                                          | {i for v in absent for i in v.units}),
                  "related": list(dict.fromkeys(x for v in votes for x in v.related)),
                  "evidence_state": "undeterminable" if any(v.status == "undeterminable" for v in votes) else None,
-                 "missing_part": "", "stated": False, "support": list(self.text_support.get(r["id"], []))}
+                 "missing_part": "", "stated": False,
+                 # the judge's validated support, less what the ledger closed; and the omitted items, which are the same kind of
+                 # evidence (a part of the asked kind that a read source states and the answer does not give)
+                 "support": [x for x in self.text_support.get(r["id"], [])
+                             if (r["id"], x["id"], SupportScope.flat(x["quote"])) not in closed]}
+            omitted = omitted_by.get(r["id"], []) if kind in SEARCHABLE_KINDS else []
+            if omitted:
+                # the judge's items first (the component's own gap line names the place of the first part): the part the judge
+                # named is stated by that line, the agent's items one by one (``coverage.item_gap_lines``)
+                omitted = sorted(omitted, key=lambda i: i["origin"] != "judge_support")
+                have = {(x["id"], SupportScope.flat(x["quote"])) for x in o["support"]}
+                o["omitted_items"] = [i["id"] for i in omitted]
+                o["judge_items"] = [i["id"] for i in omitted if i["origin"] == "judge_support"]
+                o["support"] += [{"id": i["source"], "quote": i["quote"]} for i in omitted
+                                 if (i["source"], SupportScope.flat(i["quote"])) not in have]
             if kind == "instruction" and o["aspect"] == "citation":
                 o |= {"check": "citation", "uncited": uncited, "status": "not_answered" if uncited else "full",
                       "reason": ""}
@@ -2023,6 +2120,8 @@ class VerifyReport:
                 if kind == "calculation" and self.pending_parameters.get(r["id"]):
                     status = "needs_clarification"  # waiting for the user's detail (KTD9), not missing data
                 o |= {"status": status, "reason": (absent or votes)[0].reason if votes else ""}
+            if omitted and o["status"] == "full":
+                o["status"] = "partial"  # a required item no surviving unit gives: at most partial, whatever a vote says (R2, R6)
             o["pending_parameters"] = list(self.pending_parameters.get(r["id"]) or [])
             out[r["id"]] = o
 
@@ -2041,6 +2140,8 @@ class VerifyReport:
                 status = "needs_clarification"
             else:
                 status = "not_answered"
+            if status == "full" and o.get("omitted_items"):
+                status = "partial"
             o["status"] = status
             return status
 
@@ -4973,6 +5074,8 @@ class _Coverage:
     answer_ids: set[str] = field(default_factory=set)
     readable: set[str] = field(default_factory=set)
     calls: int = 0  # the calls whose scores were accepted so far (the requirements trace numbers them)
+    # round 17 U3 (KTD3): the turn's item ledger as ``VerifyReport.item_listing`` gives it, rendered beside ``<read_passages>``
+    items: list[dict] = field(default_factory=list)
 
     def component_texts(self) -> list[str]:
         """What the passages are clipped against: the asked components, else (before they are derived) the request and the
@@ -4995,6 +5098,8 @@ class _Coverage:
         else:
             out += "\n<derive_requirements>" + "".join(f"\n<hint>{prompt_text(h)}</hint>" for h in self.hints) \
                 + "\n</derive_requirements>"
+        if ledger := _item_ledger_block(self.items):
+            out += "\n" + ledger
         if passages:
             out += "\n" + passages
         out += f"\n<workspace>\n{self.workspace}\n</workspace>"
@@ -5050,6 +5155,33 @@ class _Coverage:
         for x in list(out.values())[SUPPORT_PER_REQUIREMENT:]:
             trace.settle(x.id, x.quote, "over_cap")
         return kept
+
+
+def _item_ledger_block(items: list[dict]) -> str:
+    """The ``<item_ledger>`` block of a requirements call (round 17 U3, KTD3, KTD7): per component the items the answer declared
+    from the read sources, each with its I#, source and state (``covered``, ``omitted``, or the ``not_verifiable`` /
+    ``not_applicable`` it was declared with its reason), its label, value and condition when it has them, and its quote (at most
+    ``ITEM_QUOTE_CHARS``). At most ``ITEMS_PER_COMPONENT`` items per component, the uncovered first (shown in the ledger's order);
+    ``<more count=…/>`` counts the rest. Empty when the ledger holds no item."""
+    by_component: dict[str, list[dict]] = {}
+    for i in items:
+        by_component.setdefault(i["component"], []).append(i)
+    blocks = []
+    for cid, mine in by_component.items():
+        shown = {i["id"] for i in sorted(mine, key=lambda i: i["state"] == "covered")[:ITEMS_PER_COMPONENT]}
+        lines = []
+        for i in mine:
+            if i["id"] not in shown:
+                continue
+            attrs = f'id="{prompt_attr(i["id"])}" source="{prompt_attr(i["source"])}" state="{prompt_attr(i["state"])}"'
+            for name in ("label", "value", "condition", "reason"):
+                if i.get(name):
+                    attrs += f' {name}="{prompt_attr(i[name])}"'
+            lines.append(f"<item {attrs}>{prompt_text(i['quote'][:ITEM_QUOTE_CHARS])}</item>")
+        if len(mine) > len(shown):
+            lines.append(f'<more count="{len(mine) - len(shown)}"/>')
+        blocks.append(f'<component id="{prompt_attr(cid)}">\n' + "\n".join(lines) + "\n</component>")
+    return "<item_ledger>\n" + "\n".join(blocks) + "\n</item_ledger>" if blocks else ""
 
 
 def _requirement_attrs(r: dict) -> str:
@@ -5764,7 +5896,8 @@ def _reread(provider: LLMProvider, report: VerifyReport, verdicts: dict[int, Jud
 def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, question: str,
                   usage: list[dict], deadline: float | None = None, mismatch: str | None = None,
                   request: str | None = None, requirements: TurnRequirements | None = None,
-                  cache: VerdictCache | None = None, reread: ContextFetcher | None = None) -> VerifyReport:
+                  cache: VerdictCache | None = None, reread: ContextFetcher | None = None,
+                  ledger=None, item_version: int = 0) -> VerifyReport:
     """Deterministic checks, then the judge on every remaining unit. ``mismatch`` says why the answer's datum is
     not the one the resolved request asked for (``app.chat.resolve.mismatch``): a problem of the whole answer,
     for the repair round, and a note on the final answer. ``requirements``: the turn's requirements — frozen from the
@@ -5773,6 +5906,11 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     ``request``: the request as resolved in context (the question itself when there is none). ``cache``: the turn's verdicts (KTD10) — a unit judged
     before in the turn, unchanged, is not judged again. ``reread``: reads the context of a claim the judge could not settle
     for lack of it (``needs_context``), once, before the claim is given up (KTD5); without it nothing is re-read.
+    ``ledger``: the turn's item ledger (``app.chat.items.Ledger``, round 17 U3, KTD2, KTD3), kept across the turn's answer versions:
+    the items this answer declares (``answer.items``) are validated against its units that pass the deterministic checks and
+    merged into it (``item_version``: this answer's number, for the exclusions' record) — only when the turn's components are
+    frozen — and the ledger, with its state against the surviving units, is shown to the judge beside ``<read_passages>``,
+    caps the components in ``requirement_outcomes`` and states its gaps (``coverage.item_gap_lines``).
     Raises ``VerificationUnavailable``."""
     units = split_units(answer.answer_markdown)
     assign_ids(units, ws.claim_salt)
@@ -5808,6 +5946,15 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
             p.unit.unstated = _written_forms(p.unit.text, set(p.unstated)) or list(p.unstated)
     # a recency claim does not keep its unit from the judge: the number it states is supported, only "the latest" is not
     failed = {p.unit.index for p in report.problems if p.check != RECENCY_CHECK}
+    if ledger is not None and coverage is not None and requirements.derived and answer.status != "clarification":
+        # the items the answer declares, validated against the units that stand, join the turn's ledger before the judge sees it
+        from app.chat import items as item_ledger
+
+        stand = [u for u in units if u.index not in failed]
+        valid = item_ledger.validate(getattr(answer, "items", None) or [], ws, stand, requirements.items, ledger)
+        ledger.merge(valid.kept, excluded=valid.excluded, version=item_version)
+        report.item_ledger, report.item_ws = ledger, ws
+        coverage.items = report.item_listing({u.index for u in stand})
     # a missing qualifier does not keep the unit from the judge: it is annotated only if the unit is supported
     for u in units:
         if u.index in failed:
@@ -5856,7 +6003,8 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         report.reused = len(verdicts)
         signature = (tuple((keys[u.index], u.index in failed) for u in units),
                      coverage.workspace if coverage else "", request or question,
-                     tuple(r["id"] for r in requirements.items) if requirements is not None else ())
+                     tuple(r["id"] for r in requirements.items) if requirements is not None else (),
+                     tuple((i["id"], i["state"]) for i in coverage.items) if coverage else ())
     # a lead-in before list items is structure (round 13 U10, KTD12, R15): the judge is not asked, it is recorded as navigation,
     # and its numbers are read by the deterministic checks above like any unit's
     for u in to_judge:
@@ -6801,6 +6949,7 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
     units = {u.index: u for u in report.units}
     failed = {p.unit.index for p in report.problems if p.removes_unit}
     report.text_support = support = validated_support(report, ws, failed)
+    report.add_support_items(support)  # a member the ledger missed joins it as an omitted item (round 17 U3, R6)
     for r in report.requirements:
         for v in report.requirement_votes.get(r["id"], []):
             evidence = related_evidence(ws, {"related": v.related}, turn)["data"] or [
@@ -6836,7 +6985,9 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
         ev = related_evidence(ws, o, turn)
         check = None
         found = REQ_TEXT_FOUND.format(text=o.get("missing_part") or o["text"], where="; ".join(
-            f"{x['id']} «{prompt_text(x['quote'])}»" for x in ev["text"])) if ev["text"] else ""
+            f"{x['id']} «{prompt_text(x['quote'])}»" for x in ev["text"][:ITEMS_PER_COMPONENT])
+            + (REQ_TEXT_FOUND_MORE.format(n=len(ev["text"]) - ITEMS_PER_COMPONENT)
+               if len(ev["text"]) > ITEMS_PER_COMPONENT else "")) if ev["text"] else ""
         if ev["data"]:
             reason = REQ_DATA_FOUND.format(text=o["text"], ids=", ".join(ev["data"]))
             if found:  # the validated passage is named beside the data; no check, so the repair round keeps its tools

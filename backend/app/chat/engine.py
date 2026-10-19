@@ -124,6 +124,7 @@ from app.chat import request as request_analysis
 from app.chat import tools as T
 from app.chat.compose import ServerSpan, text_digest
 from app.chat.final_check import FinalCheckError, finalize
+from app.chat.items import Ledger as ItemLedger
 from app.chat.rereader import ContextReader
 from app.chat.timing import done_label
 from app.chat.verify import (
@@ -582,6 +583,9 @@ class TurnOutcome:
     # per verification round, what the requirements judge returned for each component and what the server did with its support
     # (``VerifyReport.requirements_trace``); diagnostics only, [{"round": the number in ``rounds``, "components": [...]}]
     requirements_trace: list[dict] = field(default_factory=list)
+    # the turn's item ledger (round 17 U3, KTD2, KTD3): each item with its state against the units that stand, and the items
+    # validation excluded with their reasons (``VerifyReport.item_diagnostics``); diagnostics only, {} when the turn had none
+    item_ledger: dict = field(default_factory=dict)
 
 
 def usage_summary(usage: list[dict], **extra) -> dict:
@@ -731,6 +735,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     ws.requirements = turn  # the tools read what the request asks about and compares (round 7 U6, KTD7)
     # the turn's verdicts: a repair round judges only what changed (KTD10)
     verdicts = VerdictCache()
+    item_ledger = ItemLedger()  # the turn's items across its answer versions (round 17 U3, KTD2)
     rereader = ContextReader(ws)  # a claim the judge lacked context for is read again once (round 8 U5)
     reused = 0
     checked = None  # the last verified answer with its report, kept when a repair round cannot finish
@@ -899,7 +904,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         if final.status != "clarification":
             coverage.touch_verified(ws, final.answer_markdown)
             ledger["requirements"] = outcomes
-            ledger["gap_documents"] = coverage.gap_documents(outcomes)
+            ledger["gap_documents"] = coverage.gap_documents(outcomes, report.item_gaps)
             ledger["requirements_origin"] = turn.record_origin()
         return TurnOutcome(final, ws, report, steps, usage, ledger, rounds,
                            request.as_dict() if request is not None else None,
@@ -907,7 +912,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                                                   else _first_resolution(turn_intent, first_decisions), notes), ws.time),
                            _summary(usage, rounds, reused, turn),
                            _pending(ws, turn, final), composed.spans, done.digest, done.stats, ws.clock.summary(),
-                           unit, offered_units=offered, shown_documents=shown_documents, requirements_trace=traces)
+                           unit, offered_units=offered, shown_documents=shown_documents, requirements_trace=traces,
+                           item_ledger=report.item_diagnostics())
 
     def adopt_analysis() -> None:
         """The collected analysis as the turn's requirements: its components frozen and appended as one item, or the
@@ -1112,7 +1118,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                                    mismatch=resolve.mismatch(request, answer.focus),
                                    request=request.standalone_question if request is not None else None,
                                    requirements=turn if answer.status != "clarification" else None,
-                                   cache=verdicts, reread=rereader)
+                                   cache=verdicts, reread=rereader, ledger=item_ledger, item_version=attempt + 1)
         except VerificationUnavailable as exc:
             # the answer could not be checked against its sources: a failure with retry, never an unchecked answer
             if checked is not None:

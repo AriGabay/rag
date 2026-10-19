@@ -22,7 +22,9 @@ The spans a kind covers:
   ``[S#]`` inserted for support the server found;
 - ``removal_note``: the note that says how many claims were removed; ``replacement``: the sentence that replaces an
   answer nothing of which was supported; ``request_note``: the note that the datum is not the one requested;
-- ``gap_paragraph``: the lines that state each component not given; ``limit_sentence``: what a limit the turn reached
+- ``gap_paragraph``: the lines that state each component not given; ``item_gap``: the lines that state each item of the item
+  ledger the answer does not give, or declared not verifiable or not applicable (round 17 U3, R8; ``coverage.item_gap_lines``);
+  ``limit_sentence``: what a limit the turn reached
   means for the answer; ``coverage_note`` and ``membership_note``: the coverage ledger's note; ``unread_notice``: the
   one notice of the files the user may see that were not read, written after the gap paragraph when the turn located
   no document (round 9 U6, KTD11).
@@ -44,7 +46,7 @@ if TYPE_CHECKING:
 
 SERVER_KINDS = ("marker", "partial_mark", "qualifier", "citation", "removal_note", "request_note", "gap_paragraph",
                 "limit_sentence", "coverage_note", "membership_note", "replacement", "unread_notice",
-                "conditional_note")
+                "conditional_note", "item_gap")
 # the marker a cut span leaves: an ordinal, so the log entry of the claim it replaced is found by it
 MARKER = "«[{n}: חלק שלא אומת הושמט]»"
 PARTIAL_MARK = " *(אומת חלקית)*"
