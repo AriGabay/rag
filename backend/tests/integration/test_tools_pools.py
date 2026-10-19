@@ -77,8 +77,10 @@ def run(ws, name, **args) -> str:
 def sources_of(output: str) -> list[dict]:
     """The header attributes of every ``<source>`` in a tool output (a listing too), with its body."""
     found = []
-    for m in re.finditer(r"<source ([^>]*)>(.*?)</source>", output, re.S):
-        found.append(dict(re.findall(r'(\w+)="([^"]*)"', m.group(1))) | {"body": m.group(2)})
+    for block in re.split(r"(?=<document )", output):  # the hits of one document share its <document> tag (round 17 U6)
+        shared = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1))) if (m := re.match(r"<document ([^>]*)>", block)) else {}
+        for m in re.finditer(r"<source ([^>]*)>(.*?)</source>", block, re.S):
+            found.append(shared | dict(re.findall(r'(\w+)="([^"]*)"', m.group(1))) | {"body": m.group(2)})
     return found
 
 

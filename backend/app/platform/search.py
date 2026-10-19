@@ -607,6 +607,12 @@ class UnitMatches:
     def units(self) -> list[dict]:
         return [u for d in self.documents for u in d.get("units") or ()]
 
+    @property
+    def continuations(self) -> list[dict]:
+        """The units that continue a listed subject unit (``units_continuing``), each with ``continuation_of``: the number
+        of the subject unit before it. Never subjects: a continuation is not in ``units``."""
+        return [u for d in self.documents for u in d.get("continuations") or ()]
+
 
 _FILE_SQL = (
     "SELECT d.id, d.title, v.id AS version_id, COALESCE(v.ingestion->>'reading_id', '') AS reading_id, {counts}"
@@ -647,6 +653,30 @@ def _best_name_fit(names: Sequence[str], term_sets: list[set[str]]) -> tuple[set
         if got and (len(got), -extra) > (best[0], -best[1]):
             best = (len(got), extra)
     return held, best[0], best[1]
+
+
+def units_continuing(units: Sequence, subjects: Sequence[int]) -> dict[int, int]:
+    """The units of one file (stored ``Unit`` rows, in reading order) that continue a subject unit, as {unit number: the
+    subject unit's number} (round 17 U6, KTD6 item 5, class E). After a subject unit, each following unit that has no
+    identity of its own continues it — until the next unit that has one, or that is itself a subject. A unit has an
+    identity of its own when it states an alias or an identifier, or when it is a report or document with a title; an
+    appendix or comparables part with no alias and no identifier is the attachment of the unit before it, titled or not, and a
+    unit with no title at all is a continuation whatever its kind. A front matter part opens the next report and ends the
+    chain."""
+    from app.chat.contexts import NON_SUBJECT_KINDS
+
+    wanted = set(subjects)
+    out: dict[int, int] = {}
+    for i, u in enumerate(units):
+        if u.unit_no not in wanted:
+            continue
+        for nxt in units[i + 1:]:
+            has_own = bool(nxt.aliases) or bool((nxt.identifiers or {}).get("shown"))
+            if nxt.unit_no in wanted or nxt.kind == "front_matter" or has_own or (
+                    nxt.title and nxt.kind not in NON_SUBJECT_KINDS):
+                break
+            out[nxt.unit_no] = u.unit_no
+    return out
 
 
 def units_matching(conn: Connection, query: str) -> UnitMatches:
@@ -727,10 +757,18 @@ def units_matching(conn: Connection, query: str) -> UnitMatches:
             else:
                 row["units"].append(unit)
         if row["units"]:
+            follow = units_continuing(stored[r.version_id], [u["unit_no"] for u in row["units"]])
+            row["continuations"] = [
+                unit_contexts.unit_row(u, r.id, r.version_id, r.reading_id, tag, file_title=r.title,
+                                       matched_by="continuation", continuation_of=follow[u.unit_no], name_terms=0,
+                                       name_extra=0, hits=0, in_name=[])
+                for u in stored[r.version_id] if u.unit_no in follow]
+            # a continuation of a subject unit is a part of that appraisal, not a comparable of the file
+            out.comparables = [c for c in out.comparables if not (c["version_id"] == r.version_id and c["unit_no"] in follow)]
             out.documents.append(row)
         elif not matched:
             out.split.append({"document_id": r.id, "title": r.title, "units": len(stored[r.version_id])})
-    printed_labels(conn, [*out.units, *out.comparables])
+    printed_labels(conn, [*out.units, *out.comparables, *out.continuations])
     out.documents.sort(key=lambda d: (-len(d["in_title"]), -d["hits"], d["title"], str(d["document_id"])))
     return out
 

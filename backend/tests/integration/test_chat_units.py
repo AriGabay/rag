@@ -1374,3 +1374,112 @@ def test_a_hit_of_a_call_that_names_no_unit_keeps_the_longer_clip(long_hit):
     out = T.tool_search(ws, RENT, None, None)
     s = ws.sources[next(x for x in _sources(out) if "5,400" in ws.sources[x].text)]
     assert T.SCOPED_PASSAGE_CHARS < len(s.text) <= 1700 and f"read(source={s.sid})" not in out
+
+
+# --- round 17 U6: continuation units follow the subject unit they belong to (KTD6 item 5) -----------------------------------
+
+def _continuations(db, extra_units: list[dict] | None = None, sha: str = "e1" * 32):
+    """A named appraisal followed by two untitled appendix units, then another named appraisal with one untitled appendix."""
+    a = make_office(db, G, "a@example.test")
+    units = [
+        {"title": "מתחם הברוש", "aliases": ["הברוש"], "blocks": ["מתחם הברוש", "שווי הנכס 2,000,000 ₪."]},
+        {"title": None, "kind": "appendix", "blocks": ["טבלת חישוב שנספחה", "חישוב הצמדה 120 ₪."]},
+        {"title": None, "kind": "appendix", "blocks": ["נתוני עזר שנספחו", "מקדם 0.9."]},
+        {"title": "מתחם האלון", "aliases": ["האלון"], "blocks": ["מתחם האלון", "שווי הנכס 3,000,000 ₪."]},
+        {"title": None, "kind": "appendix", "blocks": ["נספח לאלון", "שטח מדוד 88 מטר."]},
+        *(extra_units or [])]
+    unit_file(a, a.default_group_id, "קובץ מתחמים סינתטי", units, sha=sha)
+    return a
+
+
+def _lines(out: str, marker: str) -> list[str]:
+    return [ln for ln in out.splitlines() if ln.lstrip().startswith(marker)]
+
+
+def test_find_documents_lists_the_untitled_units_after_a_named_unit_as_its_continuations_never_as_subjects(db):
+    a = _continuations(db)
+    ws = T.Workspace(ctx=a.ctx())
+    out = T.tool_find_documents(ws, "הברוש")
+    subjects = [ln for ln in out.splitlines() if re.match(r"\s+- U\d+ \|", ln)]
+    assert len(subjects) == 1 and "מתחם הברוש" in subjects[0]
+    subject = re.match(r"\s+- (U\d+)", subjects[0]).group(1)
+    cont = _lines(out, "↳")
+    assert len(cont) == 2 and all(f"המשך של {subject}" in ln for ln in cont), out
+    assert all(ln.lstrip().startswith("↳ U") for ln in cont)
+    # the continuations' handles are units the model was shown: they may be declared in a clarification
+    for ln in cont:
+        assert re.search(r"U\d+", ln).group(0) in ws.listed_units
+    assert subject in ws.listed_units
+    assert "מתחם האלון" not in out and "נספח לאלון" not in out  # the unit with an identity of its own ends the chain
+
+
+def test_a_continuation_is_not_counted_among_the_several_units_that_need_a_question_to_the_user(db):
+    a = _continuations(db)
+    out = T.tool_find_documents(T.Workspace(ctx=a.ctx()), "הברוש")
+    assert T.MSG_SEVERAL_UNITS not in out  # one subject unit, however many continuations it has
+
+
+def test_a_unit_with_its_own_identity_after_a_subject_unit_is_not_its_continuation(db):
+    a = _continuations(db)
+    out = T.tool_find_documents(T.Workspace(ctx=a.ctx()), "האלון")
+    subjects = [ln for ln in out.splitlines() if re.match(r"\s+- U\d+ \|", ln)]
+    assert len(subjects) == 1 and "מתחם האלון" in subjects[0]
+    cont = _lines(out, "↳")
+    assert len(cont) == 1 and "נספח" in cont[0], out  # only its own appendix; the Brosh units before it are not listed
+    assert "מתחם הברוש" not in out
+
+
+def test_the_last_named_units_continuation_ends_with_the_file(db):
+    a = make_office(db, G, "a@example.test")
+    unit_file(a, a.default_group_id, "קובץ מתחמים סינתטי", [
+        {"title": "מתחם הברוש", "aliases": ["הברוש"], "blocks": ["מתחם הברוש", "שווי הנכס 2,000,000 ₪."]},
+        {"title": None, "kind": "appendix", "blocks": ["נתוני עזר", "מקדם 0.9."]}], sha="e2" * 32)
+    out = T.tool_find_documents(T.Workspace(ctx=a.ctx()), "הברוש")
+    assert len(_lines(out, "↳")) == 1
+
+
+def test_a_titled_report_with_an_identifier_of_its_own_is_never_a_continuation(db):
+    a = make_office(db, G, "a@example.test")
+    unit_file(a, a.default_group_id, "קובץ מתחמים סינתטי", [
+        {"title": "מתחם הברוש", "aliases": ["הברוש"], "blocks": ["מתחם הברוש", "שווי הנכס 2,000,000 ₪."]},
+        {"title": None, "kind": "appraisal", "identifiers": ["גוש 7000 חלקה 3"], "blocks": ["חוות דעת נוספת", "שווי 1,000,000 ₪."]}],
+        sha="e3" * 32)
+    out = T.tool_find_documents(T.Workspace(ctx=a.ctx()), "הברוש")
+    assert not _lines(out, "↳")
+
+
+def test_a_unit_that_is_a_continuation_is_not_reported_as_a_comparable_of_its_subject_file(db):
+    a = make_office(db, G, "a@example.test")
+    unit_file(a, a.default_group_id, "קובץ מתחמים סינתטי", [
+        {"title": "מתחם הברוש", "aliases": ["הברוש"], "blocks": ["מתחם הברוש", "שווי הנכס 2,000,000 ₪."]},
+        {"title": None, "kind": "appendix", "blocks": ["נספח", "הברוש הוזכר בנספח: מקדם 0.9."]}], sha="e4" * 32)
+    out = T.tool_find_documents(T.Workspace(ctx=a.ctx()), "הברוש")
+    assert len(_lines(out, "↳")) == 1 and "רק כנכס השוואה" not in out
+
+
+def test_units_matching_returns_the_continuations_flagged_with_their_subject_unit_and_apart_from_the_subjects(db):
+    from app.platform.search import units_matching
+
+    a = _continuations(db)
+    with tenant_tx(a.ctx()) as conn:
+        m = units_matching(conn, "הברוש")
+    assert [u["unit_no"] for u in m.units] == [1]
+    assert [(u["unit_no"], u["continuation_of"], u["matched_by"]) for u in m.continuations] == [
+        (2, 1, "continuation"), (3, 1, "continuation")]
+    assert m.comparables == [] and m.documents[0]["units"][0]["unit_no"] == 1
+
+
+def test_units_continuing_stops_at_a_unit_with_an_identity_a_subject_or_front_matter():
+    from types import SimpleNamespace
+
+    from app.platform.search import units_continuing
+
+    def unit(n, kind="appraisal", title=None, aliases=(), shown=()):
+        return SimpleNamespace(unit_no=n, kind=kind, title=title, aliases=aliases, identifiers={"shown": list(shown)})
+
+    units = [unit(1, title="א"), unit(2, kind="appendix", title="נספח ב"), unit(3), unit(4, title="ב"), unit(5),
+             unit(6, kind="front_matter"), unit(7), unit(8, title="ג"), unit(9, shown=["גוש 1 חלקה 2"])]
+    assert units_continuing(units, [1]) == {2: 1, 3: 1}  # a titled appendix and an untitled part; the titled report ends it
+    assert units_continuing(units, [1, 4]) == {2: 1, 3: 1, 5: 4}  # front matter opens the next report
+    assert units_continuing(units, [8]) == {}  # the next unit states an identifier of its own
+    assert units_continuing(units, [3, 4]) == {5: 4}  # unit 4 is a subject: it ends the chain of 3 and has its own

@@ -57,6 +57,10 @@ def _source_of(items: list, document_id: str) -> str:
             for m in re.finditer(r'<source id="(S\d+)" document_id="([^"]+)"', i["output"]):
                 if m.group(2) == document_id:
                     return m.group(1)
+            # the hits of one document are printed under one <document> tag (round 17 U6): its first hit
+            for m in re.finditer(r'<document document_id="([^"]+)"[^>]*>\s*<source id="(S\d+)"', i["output"]):
+                if m.group(1) == document_id:
+                    return m.group(2)
     raise AssertionError("document not in the tool outputs")
 
 

@@ -793,3 +793,129 @@ def test_a_table_row_hit_registers_nothing_and_read_source_still_returns_the_tab
     table = T.tool_read(ws, {"source": "S1"})
     assert 'kind="table"' in table and "תרחיש 3 | 4,030,000" in table and re.search(r'table="T\d+"', table)
     assert f"[אחרי הטבלה · פסקה · בלוק 1] {SCOPE_NOTE}" in table
+
+
+# --- round 17 U6: the search envelope prints a document's attributes once; a section read lists its unread siblings ------
+
+THREE = ["שטח הדירה לפי המדידה הוא 94 מ\"ר.", "מחיר למ\"ר בדירה הוא 12,000 ₪.", "הדירה נמצאת בקומה השלישית."]
+
+
+def _three_hits(office, monkeypatch, sha: str = "c1" * 32) -> tuple[UUID, UUID]:
+    doc, ver = add_laid_out(office, [("paragraph", PATH4, b, None) for b in THREE], sha=sha)
+    _searching(monkeypatch, *[_hit_of(office, doc, ver, kind="text", body=b, first=i, last=i)
+                              for i, b in enumerate(THREE)])
+    return doc, ver
+
+
+def test_three_hits_of_one_document_print_its_title_and_id_once_and_each_hit_keeps_its_id_location_and_kind(
+        office, monkeypatch):
+    doc, ver = _three_hits(office, monkeypatch)
+    ws = T.Workspace(ctx=office.ctx())
+    out = T.tool_search(ws, "הדירה", [str(doc)])
+    assert out.count(LAID_OUT_TITLE) == 1 and out.count("<document ") == 1  # the title and the document tag, once
+    assert out.count(f'<source id="S1" document_id="{doc}"') == 1  # a hit opens as it always did
+    tags = re.findall(r'<source id="(S\d+)"([^>]*)>', out)
+    assert [sid for sid, _ in tags] == ["S1", "S2", "S3"]
+    for _sid, attrs in tags:
+        assert re.search(r'\blocation="[^"]+"', attrs) and re.search(r'\bkind="text"', attrs), attrs
+        assert re.search(r'\bdocument="D\d+"', out)  # the document's handle is still given (once, with the document)
+    assert all(b in out for b in THREE)
+
+
+def test_the_sources_the_verifier_checks_against_are_the_same_whether_the_search_output_is_grouped_or_not(
+        office, monkeypatch):
+    doc, ver = _three_hits(office, monkeypatch)
+    ws = T.Workspace(ctx=office.ctx())
+    T.tool_search(ws, "הדירה", [str(doc)])
+    for src, body in zip(ws.sources.values(), THREE, strict=True):
+        assert src.text == body and src.title == LAID_OUT_TITLE and str(src.document_id) == str(doc)
+        assert src.body is None and src.location and src.kind == "text"
+
+
+def test_grouping_saves_the_envelope_of_every_hit_after_the_first(office, monkeypatch):
+    doc, ver = _three_hits(office, monkeypatch)
+    ws = T.Workspace(ctx=office.ctx())
+    out = T.tool_search(ws, "הדירה", [str(doc)])
+    flat = "\n\n".join(T._render_source(s) for s in ws.sources.values())
+    saved = len(flat) - len(out)
+    # the title and the document handle are printed once instead of three times (the group tag itself costs a little)
+    assert saved >= 2 * len(LAID_OUT_TITLE) - 40, (len(flat), len(out))
+    print(f"\nENVELOPE 3 same-document hits: before={len(flat)} after={len(out)} saved={saved}")
+
+
+def test_hits_of_two_documents_form_two_groups_in_order_and_a_lone_hit_keeps_its_own_tag(office, monkeypatch):
+    doc1, ver1 = add_laid_out(office, [("paragraph", PATH4, THREE[0], None), ("paragraph", PATH4, THREE[1], None)],
+                              sha="c2" * 32)
+    doc2, ver2 = add_laid_out(office, [("paragraph", PATH4, THREE[2], None)], sha="c3" * 32)
+    _searching(monkeypatch,
+               _hit_of(office, doc1, ver1, kind="text", body=THREE[0], first=0, last=0),
+               _hit_of(office, doc2, ver2, kind="text", body=THREE[2], first=0, last=0),
+               _hit_of(office, doc1, ver1, kind="text", body=THREE[1], first=1, last=1))
+    ws = T.Workspace(ctx=office.ctx())
+    out = T.tool_search(ws, "הדירה", None)
+    assert out.count("<document ") == 1 and out.count(LAID_OUT_TITLE) == 2  # a group of two: the title once; the lone hit as before
+    assert re.search(r'<document document="D\d+" title="[^"]+"', out) and f'<source id="S2" document_id="{doc2}"' in out
+    assert 'title="' + LAID_OUT_TITLE + '"' in out.split("</document>")[1]  # the lone hit keeps its own title
+    assert out.index(THREE[0]) < out.index(THREE[1]) < out.index(THREE[2])  # the group follows its first hit
+    assert [s.document_id for s in ws.sources.values()] == [doc1, doc2, doc1]  # source ids are still in rank order
+
+
+def test_the_progress_label_of_a_grouped_search_counts_its_hits_and_documents(office, monkeypatch):
+    from app.chat import timing
+
+    doc, ver = add_laid_out(office, [("paragraph", PATH4, b, None) for b in THREE[:2]], sha="c4" * 32)
+    doc2, ver2 = add_laid_out(office, [("paragraph", PATH4, THREE[2], None)], sha="c5" * 32)
+    mine = [_hit_of(office, doc, ver, kind="text", body=b, first=i, last=i) for i, b in enumerate(THREE[:2])]
+    other = _hit_of(office, doc2, ver2, kind="text", body=THREE[2], first=0, last=0)
+    _searching(monkeypatch, *mine)
+    out = T.tool_search(T.Workspace(ctx=office.ctx()), "הדירה", None)
+    assert timing.done_label("search", {}, out) == "נמצאו 2 קטעים"
+    _searching(monkeypatch, *mine, other)
+    out = T.tool_search(T.Workspace(ctx=office.ctx()), "הדירה", None)
+    assert timing.done_label("search", {}, out) == "נמצאו 3 קטעים ב-2 מסמכים"
+
+
+SIX = "6. התחשיב"
+S61, S62, S63 = [SIX, "6.1 עסקאות"], [SIX, "6.2 שכירויות"], [SIX, "6.3 סיכום"]
+
+
+def _six(office, sha: str = "d1" * 32):
+    return add_laid_out(office, [
+        ("heading", [SIX], SIX, None),
+        ("heading", S61, "6.1 עסקאות", None), ("paragraph", S61, "עסקה אחת במתחם: 3,000,000 ₪.", None),
+        ("heading", S62, "6.2 שכירויות", None), ("paragraph", S62, "דמי שכירות חודשיים: 5,400 ₪.", None),
+        ("heading", S63, "6.3 סיכום", None), ("paragraph", S63, "השווי הסופי נקבע לפי העסקאות.", None)], sha=sha)
+
+
+def test_a_sub_section_read_lists_its_unread_siblings_with_handles_and_drops_one_once_it_is_read(office):
+    doc, _ = _six(office)
+    ws = T.Workspace(ctx=office.ctx())
+    outline = T.tool_outline(ws, str(doc))
+    h61, h62, h63 = (handle_of(outline, n) for n in ("6.1 עסקאות", "6.2 שכירויות", "6.3 סיכום"))
+    first = T.tool_read(ws, {"section": h61})
+    assert "6.2 שכירויות" in first and "6.3 סיכום" in first and h62 in first and h63 in first
+    assert "6.1 עסקאות»" not in first.split("סעיפים אחים")[-1]  # the section being read is not its own sibling
+    second = T.tool_read(ws, {"section": h62})
+    tail = second.split("סעיפים אחים")[-1]
+    assert h63 in tail and "6.3 סיכום" in tail and "6.1 עסקאות" not in tail  # 6.1 was read: no longer listed
+    third = T.tool_read(ws, {"section": h63})
+    assert "סעיפים אחים" not in third  # nothing unread is left
+
+
+def test_a_top_level_section_read_lists_no_siblings(office):
+    doc, _ = _six(office, sha="d2" * 32)
+    ws = T.Workspace(ctx=office.ctx())
+    out = T.tool_read(ws, {"section": handle_of(T.tool_outline(ws, str(doc)), SIX)})
+    assert "סעיפים אחים" not in out
+
+
+def test_the_next_part_of_a_section_does_not_repeat_the_sibling_list(office):
+    doc, _ = add_laid_out(office, [
+        ("heading", [SIX], SIX, None), ("heading", S61, "6.1 עסקאות", None),
+        *[("paragraph", S61, f"פסקה {n}: " + FILLER, None) for n in range(1, 9)],
+        ("heading", S62, "6.2 שכירויות", None), ("paragraph", S62, "דמי שכירות חודשיים: 5,400 ₪.", None)], sha="d3" * 32)
+    ws = T.Workspace(ctx=office.ctx())
+    first = T.tool_read(ws, {"section": handle_of(T.tool_outline(ws, str(doc)), "6.1 עסקאות")})
+    assert tag(first, "more") and "6.2 שכירויות" in first
+    second = T.tool_read(ws, {"cursor": tag(first, "more")})
+    assert "סעיפים אחים" not in second

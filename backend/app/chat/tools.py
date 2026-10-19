@@ -97,7 +97,8 @@ office that holds no standard says so, and the turn records the gap (``Workspace
 a stated alias, or in its passages — so terms split between two appraisals match neither, and an appendix, or a property
 named only in a comparison table, is reported as a comparable, never as an appraisal) and lists the units that match
 (title or that it has none, pages, identifiers) with turn handles (``U#``, bound to the version and the reading like
-``§#``). ``search`` (``unit=``), ``read`` (``pages`` with ``document=U#``) and ``outline`` (``unit=``) work inside one unit:
+``§#``); the units that follow a listed one with no identity of their own (an untitled part, an appendix) are listed under it as
+its continuations (``↳``, round 17 U6), never as subjects. ``search`` (``unit=``), ``read`` (``pages`` with ``document=U#``) and ``outline`` (``unit=``) work inside one unit:
 the scope is the unit's blocks, extended over the neighbouring unit up to the next *certain* edge where an edge of it is
 only ``probable`` (``contexts.Contexts.reach``, R8); a unit search that finds no passage holding the query's words says
 the unit was searched and nothing found, and names its uncertain edges: it never widens to the file on its own (round 15
@@ -956,33 +957,83 @@ def _with_size(size: str | None, body: str) -> str:
     return f"{size}\n{body}" if size else body
 
 
-def _render_source(s: Source) -> str:
+# the attributes of a source's tag that belong to its document and are the same on every hit of it (round 17 U6, KTD6 item 3)
+DOCUMENT_ATTRS = ("document", "title", "subject", "link")  # ``date`` and ``source_kind`` stay on each hit: readers take them there
+
+
+def _envelope(s: Source) -> list[tuple[str, str]]:
+    """The attributes of a source's tag after its ``id`` and ``document_id``, in the order they are printed (each value
+    already escaped for a prompt attribute)."""
+    out: list[tuple[str, str]] = [(k, str(v)) for k, v in s.tags.items()]
+    if s.context:  # the appraisal context it is in, in a file holding several (KTD7)
+        out.append(("context", _attr(s.context)))
+    elif s.subject:  # the identity a file of one subject unit states for itself
+        out.append(("subject", _attr(s.subject)))
+    if s.unit:  # its stable unit id (version, reading, number), beside the turn's handle in the tags (round 9 U9)
+        out.append(("unit_id", _attr(s.unit["id"])))
+    if s.date_line:  # the valuation date of the unit holding the passage, or that it is unknown (round 11 U8, KTD6)
+        out.append(("date", _attr(s.date_line)))
+    if s.link:  # why the server gathered this appraisal as the property's (round 12 U12b, R3)
+        out.append(("link", _attr(s.link)))
+    if s.status:  # a reading: how complete it is, the reading it is of, and how to read on
+        out += [("status", s.status), ("version_id", str(s.version_id)), ("reading_id", _attr(s.reading_id))]
+        if s.more:
+            out.append(("more", str(s.more)))
+    out.append(("title", _attr(s.title)))
+    return out
+
+
+def _render_source(s: Source, hoisted: frozenset | set = frozenset()) -> str:
+    """The text a source is sent to the model as. ``hoisted``: the attributes of its document that are printed once in the
+    ``<document>`` tag above it (``_render_sources``) and not repeated here. The ``document_id`` stays on every source, the
+    key that readers of the output (the eval harness, the progress label) take a hit's document by. What the verifier checks
+    a claim against is ``Source.text`` and does not depend on this envelope."""
     if s.is_listing:
         return f'<source id="{s.sid}" kind="listing" title="{_attr(s.title)}">\n{_txt(s.text)}\n</source>'
     if s.same_as:
         return (f'<source id="{s.sid}" same_as="{s.same_as}" document_id="{s.document_id}" title="{_attr(s.title)}"'
                 f' location="{_attr(s.location)}"/> (אותו טקסט כמו {s.same_as}, שכבר הוחזר בתור הזה)')
     flag = " (המסמך נקרא חלקית: חלק מהתמונות לא נקראו)" if s.partial_document else ""
-    tags = "".join(f' {k}="{v}"' for k, v in s.tags.items())
-    if s.context:  # the appraisal context it is in, in a file holding several (KTD7)
-        tags += f' context="{_attr(s.context)}"'
-    elif s.subject:  # the identity a file of one subject unit states for itself
-        tags += f' subject="{_attr(s.subject)}"'
-    if s.unit:  # its stable unit id (version, reading, number), beside the turn's handle in the tags (round 9 U9)
-        tags += f' unit_id="{_attr(s.unit["id"])}"'
-    if s.date_line:  # the valuation date of the unit holding the passage, or that it is unknown (round 11 U8, KTD6)
-        tags += f' date="{_attr(s.date_line)}"'
-    if s.link:  # why the server gathered this appraisal as the property's (round 12 U12b, R3)
-        tags += f' link="{_attr(s.link)}"'
-    if s.status:  # a reading: how complete it is, the reading it is of, and how to read on
-        tags += (f' status="{s.status}" version_id="{s.version_id}" reading_id="{_attr(s.reading_id)}"'
-                 + (f' more="{s.more}"' if s.more else ""))
+    parts = [(k, v) for k, v in _envelope(s) if k not in hoisted]
+    title = next((f' title="{v}"' for k, v in parts if k == "title"), "")
+    tags = "".join(f' {k}="{v}"' for k, v in parts if k != "title")
     # what kind of document it is, when that is not an appraisal, and how its pool labels it (round 10 U8)
     pool = "" if s.source_kind == source_kinds.APPRAISAL else f' source_kind="{s.source_kind}"'
     pool += f' label="{_attr(s.label)}"' if s.label else ""
-    return (f'<source id="{s.sid}" document_id="{s.document_id}"{tags} title="{_attr(s.title)}"'
+    return (f'<source id="{s.sid}" document_id="{s.document_id}"{tags}{title}'
             f' location="{_attr(s.location)}" kind="{s.kind}"{pool}>{flag}\n{_txt(s.body if s.body is not None else s.text)}'
             "\n</source>")
+
+
+def _render_sources(sources: list[Source]) -> list[str]:
+    """The sources of one search, each as ``_render_source`` prints it, except that the hits of one document are printed
+    together under one ``<document>`` tag that states what they share once — the document's handle and title, and the
+    subject and link when they are the same on every hit (about 45% of the output of a search was this
+    envelope, repeated per hit; round 17 U6, KTD6 item 3). Each hit keeps its own id, ``document_id``, location, kind and
+    unit tags. A document with a single hit, a listing and a pointer to an earlier source are printed as before; the order is
+    that of the first hit of each document, and a group's hits follow it in their own order."""
+    by_document: dict = {}
+    for s in sources:
+        if not s.is_listing and not s.same_as and s.document_id is not None:
+            by_document.setdefault(s.document_id, []).append(s)
+    groups = {d: g for d, g in by_document.items() if len(g) > 1}
+    out: list[str] = []
+    done: set = set()
+    for s in sources:
+        group = groups.get(s.document_id) if not s.is_listing and not s.same_as else None
+        if group is None:
+            out.append(_render_source(s))
+        elif s.document_id not in done:
+            done.add(s.document_id)
+            shared = {}
+            for name in DOCUMENT_ATTRS:
+                seen = [dict(_envelope(x)).get(name) for x in group]
+                if seen[0] is not None and all(v == seen[0] for v in seen):
+                    shared[name] = seen[0]
+            head = "".join(f' {k}="{v}"' for k, v in shared.items())
+            out.append(f"<document{head}>\n" + "\n\n".join(_render_source(x, frozenset(shared)) for x in group)
+                       + "\n</document>")
+    return out
 
 
 def _attr(v: str | None) -> str:
@@ -3178,7 +3229,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 + (f"\n\n{lead}" if lead else "") + (f"\n\n{block}" if block else ""))
     hints = [MSG_ROWS_NOT_SHOWN.format(handle=t, n=n) for t, n in capped] + ([block] if block else [])
     hints += [f"{ws.doc_handle(d)}: {note}" for d, cx in noted.items() if (note := _note_once(ws, d, cx))]
-    return "\n\n".join([*notes, *(_render_source(s) for s in out), *hints])
+    return "\n\n".join([*notes, *_render_sources(out), *hints])
 
 
 def _register_shown(ws: Workspace, conn: Connection, src: Source, kind: str, passage: str, shown: str) -> None:
@@ -3741,6 +3792,37 @@ def _memoized_read(ws: Workspace, conn: Connection, key: tuple, v: reader.Versio
     return s
 
 
+SIBLINGS_LISTED = 8
+MSG_SIBLINGS = "סעיפים אחים שלא נקראו בסעיף «{parent}» (לקריאה: read עם section=§#): {items}"
+
+
+def _unread_siblings(ws: Workspace, conn: Connection, v: reader.Version, cx, path: tuple, window: tuple[int, int] | None
+                     ) -> list[str]:
+    """For a section read: the other sub-sections of its parent that the turn has not read, as handles that open each
+    (round 17 U6, KTD6 item 4: an item listed in a sibling sub-section was missed because nothing pointed to it). A
+    sibling is read once every one of its blocks that holds text was returned to the reader (``ws.sent``); one line, or
+    none when nothing is left. In a file of several contexts only the siblings within the same context."""
+    parent = tuple(path[:-1])
+    found, _ = reader.outline(conn, v.version_id, cx)
+    siblings = [e for e in found if len(e.path) == len(path) and tuple(e.path[:-1]) == parent
+                and tuple(e.path) != tuple(path) and (window is None or e.window == window)]
+    if not siblings:
+        return []
+    lo, hi = min(e.first for e in siblings), max(e.last for e in siblings)
+    held = [r.block_index for r in conn.execute(text(
+        "SELECT block_index FROM document_blocks WHERE version_id = :v AND block_index BETWEEN :a AND :z"
+        " AND COALESCE(text, '') <> ''"), {"v": v.version_id, "a": lo, "z": hi})]
+    sent = ws.sent.get(str(v.version_id), {})
+    unread = [e for e in siblings if any(i not in sent for i in held if e.first <= i <= e.last)]
+    if not unread:
+        return []
+    items = "; ".join(f"{_section_handle(ws, v, e.path, e.window)} «{_txt(_section_name(e.path))}»"
+                      for e in unread[:SIBLINGS_LISTED])
+    if len(unread) > SIBLINGS_LISTED:
+        items += f" (ועוד {len(unread) - SIBLINGS_LISTED})"
+    return [MSG_SIBLINGS.format(parent=_txt(_section_name(parent)), items=items)]
+
+
 def _read_window(ws: Workspace, conn: Connection, v: reader.Version, target: tuple, pos,
                  within: tuple[int, int] | None = None) -> Source:
     """A part of a section (its sub-sections included) or of a page range, from ``pos`` (None: its beginning).
@@ -3763,6 +3845,8 @@ def _read_window_once(ws: Workspace, conn: Connection, v: reader.Version, target
         rows = reader.blocks_in_section(conn, vid, path, from_block, window)
         name = _section_name(path, _later_context(cx, window))
         lines = []
+        if pos is None and len(path) >= 2:  # a sub-section opened from its start: the sub-sections beside it not yet read
+            lines += _unread_siblings(ws, conn, v, cx, path, window)
     else:
         first, last = target[2], target[3]
         rows = reader.blocks_on_pages(conn, vid, first, last, from_block)
@@ -4541,6 +4625,31 @@ def _unit_detail(ws: Workspace, u: dict) -> str:
             + (" | גבול לא ודאי" if u["certainty"] == "probable" else ""))
 
 
+MSG_CONTINUATION_OF = "המשך של {subject} (חלק מאותה שומה, לא נושא בפני עצמו)"
+
+
+def _continuation_detail(ws: Workspace, u: dict, subject: str) -> str:
+    """A unit that continues a subject unit ``find_documents`` listed (an appendix or an untitled part after it, round 17
+    U6, KTD6 item 5): its handle, kind and pages, labelled as the continuation of ``subject`` and never as a subject. Its
+    handle is a unit the model was shown, so it may be read, searched in and declared."""
+    h = unit_handle_of(ws, u["document_id"], u["version_id"], u["reading_id"], u["unit_no"], u.get("units_tag"))
+    ws.listed_units.add(h)
+    return (f'    ↳ {h} | «{_txt(u["title"]) if u["title"] else MSG_NO_TITLE}» | {UNIT_KIND_WORDS.get(u["kind"], u["kind"])}'
+            f' | {_unit_pages(u["page_first"], u["page_last"])} | {MSG_CONTINUATION_OF.format(subject=subject)}')
+
+
+def _units_with_continuations(ws: Workspace, shown: list[dict]) -> list[str]:
+    """The unit lines of the documents shown: each subject unit, then the continuation units that follow it."""
+    lines: list[str] = []
+    for d in shown:
+        follow = d.get("continuations") or []
+        for u in d["units"]:
+            lines.append(_unit_detail(ws, u))
+            handle = unit_handle_of(ws, u["document_id"], u["version_id"], u["reading_id"], u["unit_no"], u.get("units_tag"))
+            lines += [_continuation_detail(ws, c, handle) for c in follow if c["continuation_of"] == u["unit_no"]]
+    return lines
+
+
 def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> str:
     """The set a question is about: every visible document containing all the terms that define it (in its title
     or text). The server keeps the whole set as the turn's scope; the model reads it a page at a time. A file of
@@ -4593,7 +4702,7 @@ def tool_find_documents(ws: Workspace, query: str, page: int | None = None) -> s
     # the units are beside the listing, not in it: a count over the set cites the documents, never a page number
     units = [u for d in shown for u in d["units"]]
     if units:
-        out += "\n\n" + "\n".join([MSG_UNITS_LISTED, *(_unit_detail(ws, u) for u in units)]
+        out += "\n\n" + "\n".join([MSG_UNITS_LISTED, *_units_with_continuations(ws, shown)]
                                     + ([MSG_SEVERAL_UNITS] if len(units) > 1 else []))
     return out + extra
 
@@ -5780,6 +5889,25 @@ def _rows_listed(rows: list[list[str]], at: list[int] | None = None) -> str:
     return "; ".join(f"שורה {i + 1} «{_clip(_row_name(rows[i]), 80)}»" for i in (list(range(len(rows))) if at is None else at)[:8])
 
 
+MSG_NO_ROW = "חסרה שורה (row: התווית, או row_number). השורות בטבלה: {rows}. למשל row_number={n}"
+MSG_NO_COLUMN = "חסרה עמודה (column: הכותרת, או column_number). העמודות בטבלה: {columns}. למשל column_number={n}"
+MSG_QUOTE_OF_ANOTHER_ROW = ("הציטוט אינו מהשורה שנבחרה. התא שנבחר ({where}) הוא «{cell}»{held}. הסר את quote, או בחר את "
+                            "השורה שהציטוט שלה")
+MSG_QUOTE_HELD_BY = "; הציטוט הוא מ{rows}: row_number={row}, column_number={column}"
+MSG_NUMBER_AT = "{at}. הלוקטור הנכון: row_number={row}, column_number={column}"
+MSG_LOCATOR_SHAPE = ("locator: תא בטבלה (row או row_number, ו-column או column_number; אפשר גם table) או ציטוט (quote ו-number)"
+                     " — חייב להיות אחד מהם. למשל {example}")
+MSG_LOCATOR_EXAMPLE_TABLE = '{"row_number": 1, "column_number": 2} או {"quote": "השורה כפי שנכתבה", "number": "המספר"}'
+MSG_LOCATOR_EXAMPLE_TEXT = '{"quote": "המשפט כפי שנכתב", "number": "המספר"}'
+
+
+def _columns_listed(headers: list[str], width: int) -> str:
+    """The columns of a table by number and header, as a refusal lists them (the count alone when it has no headers)."""
+    if not any(headers):
+        return f"{width} עמודות ללא כותרות (column_number מ-1 עד {width})"
+    return "; ".join(f"{i + 1} «{_clip(h, 60)}»" for i, h in enumerate(headers[:20]) if h)
+
+
 def _table_of(ws: Workspace, src: Source, given) -> int:
     """The table a cell locator names: the source's own table, or the T# / table S# given (of the same table)."""
     index = src.table_index
@@ -5828,6 +5956,21 @@ def _cell_facet_in(label: str, header: str, st: dict, cells: list) -> dict:
             "notes": [str(x) for x in st.get("notes") or [] if x]}
 
 
+def _check_quote_of_row(quote: str, rows: list[list[str]], ri: int, ci: int, where: str, cell: str) -> None:
+    """A quote given beside cell fields must be (part of) the row of the cell they name (round 17 U6, KTD6 item 6); the
+    refusal names the cell found, and the row the quote is from. Compared as ``_row_quote_locator`` does, by letters and
+    digits and the cell borders. A quote too short to compare (under three letters) checks nothing."""
+    shape = lambda text_: "|".join(_loose(part) for part in meaning._flat(text_).split("|"))  # noqa: E731
+    wanted = shape(quote)
+    if len(wanted.replace("|", "")) < 3 or wanted in shape(" | ".join(rows[ri])):
+        return
+    held = [i for i, r in enumerate(rows) if wanted in shape(" | ".join(r))]
+    raise ToolError(MSG_QUOTE_OF_ANOTHER_ROW.format(
+        where=where, cell=cell,
+        held=(MSG_QUOTE_HELD_BY.format(rows=_rows_listed(rows, held[:1]), row=held[0] + 1, column=ci + 1) if held else "")),
+        "quote_not_in_row")
+
+
 def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str | _ScaleNote = "") -> dict:
     """The cell a locator names in a table structure (``extracted_tables.structure``, or a visual reading's table in
     the same shape), its number checked against the cell and the source's text, with what the table attests.
@@ -5862,8 +6005,7 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
             raise ToolError(f"השורה «{loc['row']}» מתאימה לכמה שורות — {_rows_listed(rows, named)}; בחר לפי row_number")
         ri = named[0]
     else:
-        raise ToolError("תא בטבלה נבחר לפי שורה (row: התווית, או row_number) ועמודה (column: הכותרת, או "
-                        "column_number)")
+        raise ToolError(MSG_NO_ROW.format(rows=_rows_listed(rows), n=1), "no_row")
     cells = rows[ri]
     if loc.get("column_number") is not None:
         ci = int(loc["column_number"]) - 1
@@ -5876,11 +6018,14 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
         if ci >= len(cells):
             raise ToolError(f"בשורה «{cells[0] if cells else ''}» אין תא בעמודה «{headers[ci]}»")
     else:
-        raise ToolError("חסרה עמודה: column (הכותרת) או column_number")
+        raise ToolError(MSG_NO_COLUMN.format(columns=_columns_listed(headers, max(len(cells), len(headers))), n=1),
+                        "no_column")
     cell = cells[ci]
     header = headers[ci] if ci < len(headers) else ""
     numbers = _numbers_of(meaning._norm(cell))
     where = f"שורה «{cells[0] if cells else ri + 1}», עמודה «{header or ci + 1}»"
+    if loc.get("quote"):  # cell fields and a quote together (round 17 U6, KTD6): the cell decides, the quote must be its row's
+        _check_quote_of_row(loc["quote"], rows, ri, ci, where, cell)
     if loc.get("number"):
         wanted = _parse_number(loc["number"])
         if wanted is None:
@@ -5892,8 +6037,9 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
             if elsewhere:
                 r, c = elsewhere[0]
                 at = f"שורה «{rows[r][0] if rows[r] else r + 1}», עמודה «{headers[c] if c < len(headers) else c + 1}»"
-                raise ToolError(f"המספר {loc['number']} נמצא בטבלה ב{at}, לא ב{where} שנבחרו (שם כתוב «{cell}»). ערך "
-                                "נלקח רק מהשורה והעמודה שהוא שייך להן")
+                raise ToolError(MSG_NUMBER_AT.format(
+                    at=f"המספר {loc['number']} נמצא בטבלה ב{at}, לא ב{where} שנבחרו (שם כתוב «{cell}»). ערך נלקח רק "
+                       "מהשורה והעמודה שהוא שייך להן", row=r + 1, column=c + 1), "number_elsewhere")
             raise ToolError(f"המספר {loc['number']} אינו בתא שנבחר ({where}: «{cell}») ואינו בטבלה")
         written, value = hit[0][0], hit[0][3]
         at_cell = hit[0][1:3]
@@ -6768,9 +6914,10 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
     full = src.text or (ws.sources[src.same_as].text if src.same_as in ws.sources else "")
     given = _given_meaning(meaning_)
     cell = any(k in loc for k in ("table", "row", "row_number", "column", "column_number"))
-    if cell == ("quote" in loc):
-        raise ToolError("locator: תא בטבלה (row או row_number, ו-column או column_number; אפשר גם table) או ציטוט "
-                        "(quote ו-number) — אחד מהם בלבד", "locator_shape")
+    if not cell and "quote" not in loc:  # cell fields with a quote: the cell is taken and the quote checked (round 17 U6)
+        raise ToolError(MSG_LOCATOR_SHAPE.format(
+            example=MSG_LOCATOR_EXAMPLE_TABLE if src.table_index is not None or src.vision is not None
+            else MSG_LOCATOR_EXAMPLE_TEXT), "locator_shape")
     vision = src.vision is not None
     if vision and not cell:  # a quoted row of a table read by inspect is its cell, checked as one
         resolved = _vision_quote_cell(ws, src, loc)
@@ -7830,7 +7977,8 @@ TOOLS = [
         ["query", "metric_kinds", "document_ids", "value_roles", "page"]),
     _fn("take_value",
         "רישום ערך ממקור S# שקראת בתור הזה, אחרי שהשרת מאמת שהמספר הוא זה שבמיקום שבחרת: תא בטבלה (שורה ועמודה; "
-        "השאר null) או ציטוט מדויק מהמקור שהמספר בתוכו (quote ו-number; השאר null), עם משמעות הערך. מחזיר V#. מספר "
+        "השאר null) או ציטוט מדויק מהמקור שהמספר בתוכו (quote ו-number; השאר null), או שניהם יחד — אז התא קובע והציטוט נבדק "
+        "מול השורה שלו — עם משמעות הערך. מחזיר V#. מספר "
         "שנמצא בשורה או בעמודה אחרת נדחה עם הסיבה; מה שהמקור מעיד על הערך נרשם כשל המקור, והשאר כקביעה שלך. שורת "
         "טבלה שצוטטה כפי שהיא כתובה (עם \" | \") נרשמת כתא שלה; תווית שנבדלת רק ברווחים או בסימני פיסוק מתאימה; "
         "יחידה לא ברורה במקור נרשמת בלי אפשרות לחשב איתה; תאריך אינו נרשם. ערך "

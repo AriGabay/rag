@@ -329,3 +329,61 @@ def test_a_header_that_states_another_unit_keeps_its_unit_over_the_row_label(mon
     d = _workspace(monkeypatch, table)
     with pytest.raises(T.ToolError):
         _take(d, _loc(row="שווי מ\"ר מבונה", column="שטח (מ\"ר)"), kind="value", unit="ILS_per_sqm")
+
+
+# --- round 17 U6 (KTD6 item 6): cell fields and a quote together; refusals that name the corrected locator ---------------
+
+def test_cell_fields_with_a_matching_quote_register_the_cell(monkeypatch):
+    d = _workspace(monkeypatch, COEFFS)
+    _take(d, _loc(row="מקדם התאמה לשטח", column="מקדם", quote="מקדם התאמה לשטח | 0.9", number="0.9"))
+    v = d.ws.values["V1"]
+    assert str(v.value) == "0.9"
+    assert (v.locator["row_number"], v.locator["column_number"]) == (1, 2)
+
+
+def test_cell_fields_with_a_quote_of_part_of_the_row_register_the_cell(monkeypatch):
+    d = _workspace(monkeypatch, COEFFS)
+    _take(d, _loc(row_number=2, column_number=2, quote="התאמה למיקום | 1.1"))
+    assert str(d.ws.values["V1"].value) == "1.1"
+
+
+def test_cell_fields_with_a_quote_of_another_row_are_refused_naming_the_cell_found(monkeypatch):
+    d = _workspace(monkeypatch, COEFFS)
+    with pytest.raises(T.ToolError) as e:
+        _take(d, _loc(row="מקדם התאמה לשטח", column="מקדם", quote="מקדם התאמה למיקום | 1.1", number="1.1"))
+    msg = str(e.value)
+    assert "מקדם התאמה לשטח" in msg and "0.9" in msg and "מקדם התאמה למיקום" in msg  # the cell found, and the quote's row
+    assert not d.ws.values
+
+
+def test_a_locator_with_neither_cell_fields_nor_a_quote_names_the_corrected_locator(monkeypatch):
+    d = _workspace(monkeypatch, COEFFS)
+    with pytest.raises(T.ToolError) as e:
+        _take(d, _loc(number="0.9"))
+    msg = str(e.value)
+    assert '"row_number": 1, "column_number": 2' in msg and '"quote"' in msg  # an example locator of the right shape
+    assert not d.ws.values
+
+
+def test_a_missing_column_names_the_tables_columns(monkeypatch):
+    d = _workspace(monkeypatch, COEFFS)
+    with pytest.raises(T.ToolError) as e:
+        _take(d, _loc(row="מקדם התאמה לשטח"))
+    msg = str(e.value)
+    assert "רכיב" in msg and "מקדם" in msg and "column_number" in msg and not d.ws.values
+
+
+def test_a_missing_row_names_the_tables_rows(monkeypatch):
+    d = _workspace(monkeypatch, COEFFS)
+    with pytest.raises(T.ToolError) as e:
+        _take(d, _loc(column="מקדם"))
+    msg = str(e.value)
+    assert "מקדם התאמה לשטח" in msg and "מקדם התאמה למיקום" in msg and "row_number" in msg and not d.ws.values
+
+
+def test_a_number_in_another_cell_is_refused_with_the_locator_of_that_cell(monkeypatch):
+    d = _workspace(monkeypatch, COEFFS)
+    with pytest.raises(T.ToolError) as e:
+        _take(d, _loc(row="מקדם התאמה לשטח", column="מקדם", number="1.1"))
+    msg = str(e.value)
+    assert "row_number=2" in msg and "column_number=2" in msg and not d.ws.values
