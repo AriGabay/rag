@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+from uuid import UUID
 
 import pytest
 from sqlalchemy import text
@@ -289,7 +290,8 @@ def test_a_continued_table_part_keeps_the_caption_the_headers_the_size_and_the_n
     caption, size = lines.index("טבלת עסקאות השוואה"), next(i for i, x in enumerate(lines) if "45 שורות" in x)
     header = lines.index("כתובת | שטח במ\"ר | מחיר למ\"ר")
     assert caption < size < header < lines.index("רחוב הערבה 41 | 121 | 9410")
-    assert lines[-2] == "המחירים ללא מע\"מ."  # the notes close every part (then the source tag ends)
+    assert lines[-3] == "המחירים ללא מע\"מ."  # the notes close the table of every part (then what follows, and the tag)
+    assert lines[-2].startswith("[אחרי הטבלה: ")
     assert "שורות 41–45 מתוך 45" in rest
 
 
@@ -474,3 +476,320 @@ def test_a_prior_reference_opens_while_its_reading_is_current_and_is_stale_after
         T.tool_read(T.Workspace(ctx=office.ctx(), prior={"P1": prior}), {"source": "P1"})
     with pytest.raises(T.ToolError, match="קריאה קודמת"):
         T.tool_read(ws, {"cursor": cursor})
+
+
+# --- round 17 U4: a table read carries its context and registers what was sent (KTD4, KTD6 items 1-2) -------------------
+
+PATH4 = ["4. שיטות"]
+PATH5 = ["5. סיכום"]
+SENSITIVITY = "טבלת רגישות לשיעור ההיוון"
+SCOPE_NOTE = "הערה: הנתונים בטבלה מתייחסים לגישת ההיוון בלבד, ולא לשווי הנכס כולו."
+LAID_OUT_TITLE = "שומה רחוב הצפצפה 3"
+
+
+def _sensitivity(caption: str = SENSITIVITY, block_index: int = 1, rows: int = 3) -> dict:
+    """A stored table with no title and no notes (the shape of a DOCX or PDF table whose note lies outside it)."""
+    return {"headers": ["תרחיש", "שווי"], "caption": caption, "title": [], "notes": [], "section": PATH4[0],
+            "block_index": block_index, "rows": [{"cells": [f"תרחיש {n}", f"{4_000_000 + 10_000 * n:,}"]}
+                                                 for n in range(1, rows + 1)]}
+
+
+def add_laid_out(office, blocks: list[tuple], tables: dict[int, dict] | None = None, *, sha: str,
+                 pages: bool = True) -> tuple[UUID, UUID]:
+    """A document of the given blocks, (kind, section path, text, table index) in reading order, all read; ``tables``
+    their stored structures by table index. ``pages=False``: a Word file (blocks without a page)."""
+    doc, ver = make_document(office, office.default_group_id, LAID_OUT_TITLE, sha=sha)
+    with tenant_tx(office.system) as conn:
+        conn.execute(text("UPDATE document_versions SET page_count = :n, ingestion = CAST(:i AS jsonb) WHERE id = :v"),
+                     {"v": ver, "n": 4 if pages else None, "i": json.dumps({"reading_id": "reading-1"})})
+        for i, (kind, path, body, table) in enumerate(blocks):
+            conn.execute(text(
+                "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
+                " section_path, page, text, status, table_index) VALUES (app_office(), :d, :v, :b, :k, :s, :sp, :pg,"
+                " :t, 'read', :ti)"),
+                {"d": doc, "v": ver, "b": i, "k": kind, "s": path[-1], "sp": path, "pg": 1 if pages else None, "t": body,
+                 "ti": table})
+        for index, structure in (tables or {}).items():
+            conn.execute(text("INSERT INTO extracted_tables (office_id, document_id, version_id, table_index,"
+                              " page_start, page_end, structure) VALUES (app_office(), :d, :v, :t, :p, :p,"
+                              " CAST(:s AS jsonb))"),
+                         {"d": doc, "v": ver, "t": index, "p": 1 if pages else None,
+                          "s": json.dumps(structure, ensure_ascii=False)})
+    return doc, ver
+
+
+def read_table(ws, doc, name: str = SENSITIVITY) -> str:
+    return T.tool_read(ws, {"table": handle_of(T.tool_outline(ws, str(doc)), name)})
+
+
+def the_source(ws, out: str):
+    return ws.sources[re.search(r'<source id="(S\d+)"', out).group(1)]
+
+
+def test_ae5_a_note_after_the_table_reaches_its_read_context_with_its_block_reference_and_stops_at_the_heading(office):
+    doc, _ = add_laid_out(office, [("heading", PATH4, PATH4[0], None), ("table", PATH4, SENSITIVITY, 0),
+                                   ("paragraph", PATH4, SCOPE_NOTE, None), ("heading", PATH5, PATH5[0], None),
+                                   ("paragraph", PATH5, "ההמלצה סופית ואינה תלויה בטבלה.", None)],
+                          {0: _sensitivity()}, sha="1" * 64)
+    ws = T.Workspace(ctx=office.ctx())
+    out = read_table(ws, doc)
+    s = the_source(ws, out)
+    note = f"[אחרי הטבלה · פסקה · בלוק 2] {SCOPE_NOTE}"
+    assert note in s.text and note in out  # what the verifier checks and what the model reads
+    assert f"כותרות מעל הטבלה: {PATH4[0]}" in s.text
+    assert PATH5[0] not in s.text and "ההמלצה" not in s.text  # it stops before the heading
+    # the status and the pointer speak of the table and name what follows, with a handle that reads on
+    assert "מצב הטבלה: הטבלה נקראה במלואה" in out and "מצב: נקרא במלואו" not in out
+    pointer = re.search(r"\[אחרי הטבלה: כותרת \(בלוק 3\), פסקה \(בלוק 4\) — .*read\(cursor=(K\d+)\)\]", out)
+    assert pointer and pointer.group(0) in out.split(note)[1]
+    assert "ההמלצה סופית" in T.tool_read(ws, {"cursor": pointer.group(1)})
+
+
+def test_a_table_followed_by_long_paragraphs_takes_only_those_within_the_cap_and_the_pointer_names_the_rest(office,
+                                                                                                            monkeypatch):
+    monkeypatch.setattr(T, "TABLE_CONTEXT_AFTER_CHARS", 300)
+    paragraphs = [f"פסקה {n}: " + "מילה " * 28 for n in (1, 2, 3)]  # ~150 characters each
+    doc, _ = add_laid_out(office, [("table", PATH4, SENSITIVITY, 0), *[("paragraph", PATH4, p, None) for p in paragraphs]],
+                          {0: _sensitivity(block_index=0)}, sha="2" * 64)
+    ws = T.Workspace(ctx=office.ctx())
+    out = read_table(ws, doc)
+    s = the_source(ws, out)
+    assert "[אחרי הטבלה · פסקה · בלוק 1]" in s.text and "[אחרי הטבלה · פסקה · בלוק 2]" in s.text
+    assert "פסקה 3:" not in s.text and "[אחרי הטבלה · פסקה · בלוק 3]" not in s.text
+    pointer = re.search(r"\[אחרי הטבלה: פסקה \(בלוק 3\) — .*read\(cursor=(K\d+)\)\]", out)
+    assert pointer
+    assert "פסקה 3:" in T.tool_read(ws, {"cursor": pointer.group(1)})
+
+
+def test_a_table_followed_directly_by_another_table_takes_no_trailing_part_and_the_pointer_names_it(office):
+    doc, _ = add_laid_out(office, [("table", PATH4, SENSITIVITY, 0), ("table", PATH4, "טבלת מדדים", 1),
+                                   ("paragraph", PATH4, SCOPE_NOTE, None)],
+                          {0: _sensitivity(block_index=0), 1: _sensitivity("טבלת מדדים", 1)}, sha="3" * 64)
+    ws = T.Workspace(ctx=office.ctx())
+    out = read_table(ws, doc)
+    s = the_source(ws, out)
+    assert "[אחרי הטבלה ·" not in s.text and SCOPE_NOTE not in s.text and "[לפני הטבלה ·" not in s.text
+    assert re.search(r"\[אחרי הטבלה: טבלה \(בלוק 1\), פסקה \(בלוק 2\) — .*read\(cursor=K\d+\)\]", out)
+
+
+def test_the_paragraph_before_a_table_is_a_part_unless_it_is_the_tables_caption(office):
+    intro = "הטבלה שלהלן מציגה את שווי הנכס בשלושה תרחישים."
+    doc, _ = add_laid_out(office, [("paragraph", PATH4, intro, None), ("table", PATH4, SENSITIVITY, 0),
+                                   ("paragraph", PATH4, "טבלת מדדים", None), ("table", PATH4, "טבלת מדדים", 1)],
+                          {0: _sensitivity(), 1: _sensitivity("טבלת מדדים", 3)}, sha="4" * 64)
+    ws = T.Workspace(ctx=office.ctx())
+    first = the_source(ws, read_table(ws, doc))
+    assert f"[לפני הטבלה · פסקה · בלוק 0] {intro}" in first.text
+    second = the_source(ws, read_table(ws, doc, "טבלת מדדים"))
+    # the block above the second table is its caption, written as a paragraph here: not a part, not repeated
+    assert "[לפני הטבלה ·" not in second.text
+    # and the first table's trailing paragraph is that caption: between the two tables
+    assert "[אחרי הטבלה · בין שתי טבלאות · פסקה · בלוק 2] טבלת מדדים" in first.text
+
+
+@pytest.mark.parametrize("pages", [True, False], ids=["pdf-shaped", "docx-shaped"])
+def test_pdf_and_docx_shaped_tables_with_no_notes_and_no_title_still_get_their_trailing_part(office, pages):
+    doc, _ = add_laid_out(office, [("table", PATH4, SENSITIVITY, 0), ("paragraph", PATH4, SCOPE_NOTE, None)],
+                          {0: _sensitivity(block_index=0)}, sha="5" * 64, pages=pages)
+    ws = T.Workspace(ctx=office.ctx())
+    s = the_source(ws, read_table(ws, doc))
+    assert f"[אחרי הטבלה · פסקה · בלוק 1] {SCOPE_NOTE}" in s.text
+
+
+def test_a_paragraph_between_two_tables_is_a_part_of_both_tagged_as_between_tables(office):
+    between = "הנתונים שלהלן מבוססים על סקר שוק שנערך השנה."
+    doc, _ = add_laid_out(office, [("table", PATH4, SENSITIVITY, 0), ("paragraph", PATH4, between, None),
+                                   ("table", PATH4, "טבלת מדדים", 1)],
+                          {0: _sensitivity(block_index=0), 1: _sensitivity("טבלת מדדים", 2)}, sha="6" * 64)
+    ws = T.Workspace(ctx=office.ctx())
+    a = the_source(ws, read_table(ws, doc))
+    b = the_source(ws, read_table(ws, doc, "טבלת מדדים"))
+    assert f"[אחרי הטבלה · בין שתי טבלאות · פסקה · בלוק 1] {between}" in a.text
+    assert f"[לפני הטבלה · בין שתי טבלאות · פסקה · בלוק 1] {between}" in b.text
+
+
+def test_a_table_at_the_end_of_a_unit_takes_no_trailing_part_from_the_next_units_untitled_paragraph(office):
+    from app.chat.contexts import Contexts, Identity, Segment
+
+    doc, ver = add_laid_out(office, [("heading", PATH4, PATH4[0], None), ("table", PATH4, SENSITIVITY, 0),
+                                     ("paragraph", PATH4, "פסקת פתיחה ללא כותרת של הנכס הבא.", None),
+                                     ("heading", PATH5, PATH5[0], None)], {0: _sensitivity()}, sha="7" * 64)
+    ws = T.Workspace(ctx=office.ctx())
+    ws.contexts[str(ver)] = Contexts(str(ver), (
+        Segment(1, Identity(), 0, 1, 0, None, 1, 1, "appraisal", "certain", "נכס ראשון"),
+        Segment(2, Identity(), 2, 3, 3, None, 1, 1, "appraisal", "certain", "נכס שני")), "reading-1")
+    out = read_table(ws, doc)
+    s = the_source(ws, out)
+    assert "פסקת פתיחה" not in s.text and "[אחרי הטבלה ·" not in s.text
+    assert "פסקת פתיחה" not in out and "אין עוד קטעים ביחידה" in out and "read(cursor=" not in out.split("מצב הטבלה")[1]
+
+
+def test_a_hebrew_note_with_quotation_marks_and_numbers_reaches_the_read_context_verbatim(office):
+    note = "* לפי תקן 17 ״הערכת שווי״: השיעורים הם 7.5% ו-8.25% והסכומים באלפי ₪."
+    doc, _ = add_laid_out(office, [("table", PATH4, SENSITIVITY, 0), ("paragraph", PATH4, note, None)],
+                          {0: _sensitivity(block_index=0)}, sha="8" * 64)
+    ws = T.Workspace(ctx=office.ctx())
+    out = read_table(ws, doc)
+    assert f"[אחרי הטבלה · פסקה · בלוק 1] {note}" in the_source(ws, out).text and note in out
+
+
+def test_a_table_read_twice_returns_the_memoized_copy_with_the_same_context_parts(office):
+    doc, _ = add_laid_out(office, [("table", PATH4, SENSITIVITY, 0), ("paragraph", PATH4, SCOPE_NOTE, None)],
+                          {0: _sensitivity(block_index=0)}, sha="9" * 64)
+    ws = T.Workspace(ctx=office.ctx())
+    handle = handle_of(T.tool_outline(ws, str(doc)), SENSITIVITY)
+    first = T.tool_read(ws, {"table": handle})
+    again = T.tool_read(ws, {"table": handle})
+    s1, s2 = ws.sources["S1"], ws.sources["S2"]
+    assert 'same_as="S1"' in again and SCOPE_NOTE not in again
+    assert s2.text == s1.text and f"[אחרי הטבלה · פסקה · בלוק 1] {SCOPE_NOTE}" in s2.text and s2.body == s1.body
+    assert SCOPE_NOTE in first
+
+
+def test_a_complete_table_read_registers_its_block_and_its_parts_so_a_later_section_read_sends_them_once(office):
+    sub = [*PATH4, "4.1 תת-סעיף"]
+    doc, ver = add_laid_out(office, [("heading", PATH4, PATH4[0], None), ("table", PATH4, SENSITIVITY, 0),
+                                     ("paragraph", PATH4, SCOPE_NOTE, None), ("heading", sub, sub[1], None),
+                                     ("paragraph", sub, "פסקה חדשה בסעיף שטרם נקראה.", None)],
+                          {0: _sensitivity()}, sha="a1" * 32)
+    ws = T.Workspace(ctx=office.ctx())
+    out = T.tool_outline(ws, str(doc))
+    T.tool_read(ws, {"table": handle_of(out, SENSITIVITY)})
+    assert ws.sent[str(ver)] == {1: "S1", 2: "S1"}
+    section = T.tool_read(ws, {"section": handle_of(out, PATH4[0])})
+    assert SCOPE_NOTE not in section and "S1" in section and "כבר הוחזרו" in section
+    assert "פסקה חדשה בסעיף" in section
+    assert SCOPE_NOTE in ws.sources["S2"].text  # the verifier still reads the full text
+
+
+def test_a_clipped_table_part_registers_its_context_parts_but_not_its_block_and_the_next_part_points_to_them(office):
+    doc, ver = add_laid_out(office, [("table", PATH4, SENSITIVITY, 0), ("paragraph", PATH4, SCOPE_NOTE, None)],
+                            {0: _sensitivity(block_index=0, rows=45)}, sha="a2" * 32)
+    ws = T.Workspace(ctx=office.ctx())
+    first = read_table(ws, doc)
+    assert tag(first, "status") == "clipped" and SCOPE_NOTE in first
+    assert ws.sent[str(ver)] == {1: "S1"}  # the table was not read whole
+    rest = T.tool_read(ws, {"cursor": tag(first, "more")})
+    assert SCOPE_NOTE not in rest and "כבר הוחזר ב-S1" in rest
+    s2 = the_source(ws, rest)
+    assert f"[אחרי הטבלה · פסקה · בלוק 1] {SCOPE_NOTE}" in s2.text  # the verifier's text of every part keeps it
+    assert 0 not in ws.sent[str(ver)]  # the last part alone is not the whole table either
+
+
+def test_the_status_of_a_clipped_table_speaks_of_the_table(office):
+    doc, _ = add_laid_out(office, [("table", PATH4, SENSITIVITY, 0)], {0: _sensitivity(block_index=0, rows=45)},
+                          sha="a3" * 32)
+    out = read_table(ws := T.Workspace(ctx=office.ctx()), doc)
+    assert "מצב הטבלה: נקרא חלק מהטבלה; יש המשך" in out and ws.sources["S1"].status == "clipped"
+
+
+def test_the_rereads_table_expansion_carries_the_same_context_parts(office):
+    from app.chat import reader
+    from app.chat.rereader import _expand_table_headers
+
+    note = SCOPE_NOTE
+    intro = "הטבלה שלהלן מציגה את שווי הנכס בשלושה תרחישים."
+    doc, ver = add_laid_out(office, [("paragraph", PATH4, intro, None), ("table", PATH4, SENSITIVITY, 0),
+                                     ("paragraph", PATH4, note, None)], {0: _sensitivity()}, sha="a4" * 32)
+    ws = T.Workspace(ctx=office.ctx())
+    s = the_source(ws, read_table(ws, doc))
+    with tenant_tx(office.ctx()) as conn:
+        text_, _, _ = _expand_table_headers(ws, conn, reader.version(conn, ver), s)
+    assert f"[לפני הטבלה · פסקה · בלוק 0] {intro}" in text_ and f"[אחרי הטבלה · פסקה · בלוק 2] {note}" in text_
+    assert text_.index("בלוק 0") < text_.index("תרחיש") < text_.index("בלוק 2")
+
+
+def test_the_verifiers_view_of_a_clipped_long_table_keeps_the_trailing_part(office):
+    from app.chat import evidence
+
+    doc, _ = add_laid_out(office, [("table", PATH4, SENSITIVITY, 0), ("paragraph", PATH4, SCOPE_NOTE, None)],
+                          {0: _sensitivity(block_index=0, rows=40)}, sha="a5" * 32)
+    ws = T.Workspace(ctx=office.ctx())
+    s = the_source(ws, read_table(ws, doc))
+    assert len(s.text) > 300
+    kept, excerpt = evidence.fit(["שווי של 4,010,000 בתרחיש 1"], s.text, "table", limit=300)
+    assert excerpt and f"[אחרי הטבלה · פסקה · בלוק 1] {SCOPE_NOTE}" in kept and "4,010,000" in kept
+
+
+# --- search hits register the blocks they showed whole ---------------------------------------------------------
+
+def _hit_of(office, doc, ver, *, kind: str, body: str, first: int, last: int, table_index: int | None = None,
+            row_index: int | None = None) -> dict:
+    with tenant_tx(office.system) as conn:
+        cid = conn.execute(text(
+            "INSERT INTO chunks (office_id, document_id, version_id, chunk_index, kind, page_list, section, text,"
+            " normalized_text, table_index, row_index, block_start, block_end) VALUES (app_office(), :d, :v, :i, :k,"
+            " '{1}', :s, :t, :t, :ti, :ri, :a, :b) RETURNING id"),
+            {"d": doc, "v": ver, "i": first, "k": kind, "s": PATH4[0], "t": body, "ti": table_index, "ri": row_index,
+             "a": first, "b": last}).scalar_one()
+    hit = {"chunk_id": cid, "document_id": doc, "version_id": ver, "page_list": [1], "section": PATH4[0], "text": body,
+           "kind": kind, "title": LAID_OUT_TITLE, "score": 1.0, "lexical_support": True, "snippet": body}
+    if table_index is not None:
+        hit["table_index"] = table_index
+    if row_index is not None:
+        hit["row_index"] = row_index
+    return hit
+
+
+def _searching(monkeypatch, *hits: dict) -> None:
+    monkeypatch.setattr(T, "memoized_search", lambda ws, conn, query, limit, scope, window=False, version=None:
+                        [dict(h) for h in hits])
+
+
+def test_a_paragraph_hit_shown_whole_is_not_sent_again_by_a_later_read_and_the_output_says_so(office, monkeypatch):
+    target = "שטח הדירה לפי המדידה הוא 94 מ\"ר, לא כולל מרפסת."
+    doc, ver = add_laid_out(office, [("paragraph", PATH4, "פסקה לפני.", None), ("paragraph", PATH4, target, None),
+                                     ("paragraph", PATH4, "פסקה אחרי.", None)], sha="b1" * 32)
+    _searching(monkeypatch, _hit_of(office, doc, ver, kind="text", body=target, first=1, last=1))
+    ws = T.Workspace(ctx=office.ctx())
+    hit = T.tool_search(ws, "שטח הדירה", [str(doc)])
+    assert target in hit and ws.sent[str(ver)] == {1: "S1"}
+    nearby = T.tool_read(ws, {"source": "S1"})
+    assert target not in nearby and "כבר הוחזרו" in nearby and "S1" in nearby
+    assert "פסקה לפני." in nearby and "פסקה אחרי." in nearby
+    assert target in ws.sources["S2"].text  # the verifier keeps the full text
+
+
+def test_a_hit_clipped_by_the_passage_cap_registers_nothing_and_a_later_read_sends_it_in_full(office, monkeypatch):
+    from app.config import get_settings
+
+    long_body = "תיאור מפורט של הבניין. " * 30 + "סוף-הפסקה"
+    doc, ver = add_laid_out(office, [("paragraph", PATH4, long_body, None)], sha="b2" * 32)
+    monkeypatch.setattr(get_settings(), "chat_passage_chars", 120)
+    _searching(monkeypatch, _hit_of(office, doc, ver, kind="text", body=long_body, first=0, last=0))
+    ws = T.Workspace(ctx=office.ctx())
+    hit = T.tool_search(ws, "תיאור הבניין", [str(doc)])
+    assert "סוף-הפסקה" not in hit and not ws.sent.get(str(ver))
+    assert "סוף-הפסקה" in T.tool_read(ws, {"source": "S1"})
+
+
+def test_a_scoped_hit_cut_around_the_query_terms_registers_nothing_and_a_later_read_sends_the_block_in_full(office):
+    from tests.integration.test_chat_units import RENT
+    from tests.support.unit_files import READING, unit_file
+
+    filler = "מילה " * 200
+    body = f"ראשית-המקטע {filler}{RENT} 5,400 ₪. {filler}סוף-המקטע"
+    doc, ver = unit_file(office, office.default_group_id, "קובץ יחידות", [
+        {"title": "פרויקט הארז", "aliases": ["הארז"], "blocks": ["פרויקט הארז", "שורה קצרה."]},
+        {"title": "מתחם האשל", "aliases": ["האשל"], "blocks": ["מתחם האשל", body]}], sha="b3" * 32)
+    ws = T.Workspace(ctx=office.ctx())
+    handle = T.unit_handle_of(ws, doc, ver, READING, 2)
+    out = T.tool_search(ws, RENT, None, None, handle)
+    cut = next(s for s in ws.sources.values() if "5,400" in s.text)
+    assert "סוף-המקטע" not in cut.text and f"read(source={cut.sid})" in out
+    assert cut.block_start not in ws.sent.get(str(ver), {})  # a cut passage is not a block returned whole
+    assert "סוף-המקטע" in T.tool_read(ws, {"source": cut.sid})
+
+
+def test_a_table_row_hit_registers_nothing_and_read_source_still_returns_the_table_and_its_handle(office, monkeypatch):
+    doc, ver = add_laid_out(office, [("table", PATH4, SENSITIVITY, 0), ("paragraph", PATH4, SCOPE_NOTE, None)],
+                            {0: _sensitivity(block_index=0)}, sha="b4" * 32)
+    row = "טבלת רגישות לשיעור ההיוון: תרחיש: תרחיש 2 | שווי: 4,020,000"
+    _searching(monkeypatch, _hit_of(office, doc, ver, kind="table_row", body=row, first=0, last=0, table_index=0,
+                                    row_index=1))
+    ws = T.Workspace(ctx=office.ctx())
+    hit = T.tool_search(ws, "תרחיש 2", [str(doc)])
+    assert re.search(r'table="T\d+"', hit) and not ws.sent.get(str(ver))
+    table = T.tool_read(ws, {"source": "S1"})
+    assert 'kind="table"' in table and "תרחיש 3 | 4,030,000" in table and re.search(r'table="T\d+"', table)
+    assert f"[אחרי הטבלה · פסקה · בלוק 1] {SCOPE_NOTE}" in table

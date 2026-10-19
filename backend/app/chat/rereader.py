@@ -22,6 +22,8 @@ from app.chat.tools import (
     ToolError,
     Workspace,
     _clip,
+    _table_context,
+    _table_context_lines,
     _table_text,
     contexts_of,
 )
@@ -199,10 +201,17 @@ def _expand_preceding(ws, conn, head, src):
 
 
 def _expand_table_headers(ws, conn, head, src):
-    _, st = _stored_table(conn, src)
+    index, st = _stored_table(conn, src)
     lines = _table_head(st) if st else []
     if not lines:
         return None
+    # the blocks around the table, as the read of it carries them (round 17 U4, KTD4): the paragraph above, and the ones
+    # after, where a note says what the table's values refer to
+    block = reader.table_block(conn, src.version_id, index)
+    if block is not None:
+        above, below = _table_context_lines(_table_context(ws, conn, head, index, st, block,
+                                                      contexts_of(ws, conn, src.version_id, head.reading_id)), path=False)
+        lines = [*above, *lines, *below]
     chain = _chain_of(ws, conn, head, src)
     if chain:
         lines.insert(0, "כותרות מעל הטבלה: " + " › ".join(chain))

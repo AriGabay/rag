@@ -10,7 +10,9 @@ segments that cover it are kept:
 - the segments sharing the most words with the claim (prefix, inflection and abbreviation variants count);
 - one neighbouring segment on each side of what was kept, for context;
 - for a table: its caption, title, size line, header row and notes, so a row is read with its column meanings,
-  units and qualifications.
+  units and qualifications, and the context parts the read added (the heading path and the short blocks before and after
+  the table, ``tools._table_context``): kept before any other header, because a note after a table scopes its values
+  (round 17 U4, KTD4).
 
 A source short enough is kept whole. A cut source is rendered with the omitted spans marked, and the judge is
 told it is an excerpt (an omission is not evidence that something is absent).
@@ -31,6 +33,11 @@ LONG_LINE = 400  # a longer line is split into sentences
 TOP_WORD_SEGMENTS = 3
 OMITTED = "…[הושמט]…"
 TABLE_SIZE_PREFIX = "הטבלה:"  # the size line a table source starts with (tools.table_size_line)
+# the lines a table read adds around the table (round 17 U4, KTD4): one line per part, starting with one of these marks
+TABLE_BEFORE = "לפני הטבלה"
+TABLE_AFTER = "אחרי הטבלה"
+TABLE_PATH_PREFIX = "כותרות מעל הטבלה:"
+CONTEXT_MARKS = (f"[{TABLE_BEFORE}", f"[{TABLE_AFTER}", TABLE_PATH_PREFIX)
 
 _SENTENCE = re.compile(r"(?<=[.!?:;])\s+(?=\S)")
 _NOTE = re.compile(r"^\s*(?:\(?\*+\)?|הערה|הערות|הע׳|הע')")
@@ -45,6 +52,7 @@ def _content_words(text: str) -> set[str]:
 class Segment:
     text: str
     header: bool = False
+    context: bool = False  # a context part of a table read (``CONTEXT_MARKS``): kept before the other headers
 
     @cached_property
     def tokens(self) -> frozenset[str]:
@@ -64,6 +72,9 @@ def segments_of(text: str, kind: str = "text") -> tuple[Segment, ...]:
     first_row, last_row = (rows[0], rows[-1]) if rows else (None, None)
     out: list[Segment] = []
     for i, ln in enumerate(lines):
+        if ln.lstrip().startswith(CONTEXT_MARKS):  # a part is one bounded line: never split into sentences
+            out.append(Segment(ln, tabular, True))
+            continue
         if tabular and first_row is not None:
             header = (i <= first_row or i > last_row or bool(_NOTE.match(ln))
                       or ln.startswith(TABLE_SIZE_PREFIX))
@@ -162,10 +173,13 @@ def fit_segments(claims: list[str], segs: tuple[Segment, ...], limit: int) -> tu
     if not order:  # nothing covers the claims: segments spread over the source, not its first lines
         step = max(1, len(segs) // 8)
         order = list(range(0, len(segs), step))
-    headers = [i for i, s in enumerate(segs) if s.header]
+    # the context parts of a table read come first and are bounded by their own caps; the other headers only while they take
+    # at most a third of the limit
+    context = [i for i, s in enumerate(segs) if s.context]
+    headers = [i for i, s in enumerate(segs) if s.header and not s.context]
     if sum(len(segs[i].text) + 1 for i in headers) > limit // 3:
         headers = []
-    ranked = [*headers, *order]
+    ranked = [*context, *headers, *order]
     ranked += [j for i in order for j in (i - 1, i + 1) if 0 <= j < len(segs)]
     # the rendering is kept as a running length (``render``: the picked texts and one ``OMITTED`` per run of unpicked
     # segments, joined by a newline): adding segment ``i`` adds its text, closes the run it sat in and opens one on each

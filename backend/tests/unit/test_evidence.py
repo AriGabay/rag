@@ -200,3 +200,32 @@ def test_fit_segments_agrees_with_the_reference_on_segments_of_any_length_and_an
         limit = rng.randint(0, 400)
         claims = rng.sample(["שכר 55", "a", "x 7", "b"], rng.randint(0, 3))
         assert evidence.fit_segments(claims, segs, limit) == _fit_segments_by_rendering(claims, segs, limit)
+
+
+# --- round 17 U4: the context parts of a table read are kept when the table is clipped (KTD4) -----------------------------
+
+def _read_table_text(note_lines: int) -> str:
+    rows = [f"תרחיש {n} | {4_000_000 + n:,}" for n in range(1, 120)]
+    notes = [f"הערה {n}: " + "פירוט שלא קשור לערכי הטבלה כלל. " * 4 for n in range(note_lines)]
+    return "\n".join([f"{evidence.TABLE_PATH_PREFIX} 4. שיטות",
+                      f"[{evidence.TABLE_BEFORE} · פסקה · בלוק 7] הטבלה מציגה את שווי הנכס בתרחישים.",
+                      "טבלת רגישות", f"{evidence.TABLE_SIZE_PREFIX} 119 שורות", "תרחיש | שווי", *rows, *notes,
+                      f"[{evidence.TABLE_AFTER} · פסקה · בלוק 9] הנתונים בטבלה מתייחסים לגישת ההיוון בלבד."])
+
+
+def test_the_context_parts_of_a_clipped_table_are_kept_even_when_its_other_headers_are_dropped():
+    text = _read_table_text(note_lines=4)  # the notes alone are more than a third of the limit: the headers are dropped
+    segs = evidence.segments_of(text, "table")
+    assert [s.text.split("]")[0] for s in segs if s.context] == [f"{evidence.TABLE_PATH_PREFIX} 4. שיטות".split("]")[0],
+                                                                  f"[{evidence.TABLE_BEFORE} · פסקה · בלוק 7",
+                                                                  f"[{evidence.TABLE_AFTER} · פסקה · בלוק 9"]
+    kept, excerpt = evidence.fit(["תרחיש 60 שווה 4,000,060"], text, "table", limit=600)
+    assert excerpt and len(kept) <= 600 and "4,000,060" in kept
+    assert "הנתונים בטבלה מתייחסים לגישת ההיוון בלבד." in kept  # the trailing part, with its block reference
+    assert f"[{evidence.TABLE_AFTER} · פסקה · בלוק 9]" in kept and "בלוק 7]" in kept and "4. שיטות" in kept
+    assert "תרחיש 100 |" not in kept
+
+
+def test_a_line_that_merely_resembles_a_context_part_is_no_context_part():
+    segs = evidence.segments_of("כותרת\nתרחיש | שווי\nתרחיש 1 | 4,000,001\nאחרי הטבלה יש הערה\n[הערה]", "table")
+    assert not any(s.context for s in segs)

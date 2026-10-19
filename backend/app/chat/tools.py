@@ -175,7 +175,7 @@ from app.chat import dates as chat_dates
 from app.chat import units as unit_store
 from app.chat import unread as unread_text
 from app.chat.contexts import MSG_NO_TITLE
-from app.chat.evidence import TABLE_SIZE_PREFIX
+from app.chat.evidence import TABLE_AFTER, TABLE_BEFORE, TABLE_PATH_PREFIX, TABLE_SIZE_PREFIX
 from app.chat.intent import MIXED, PROFESSIONAL
 from app.chat.property import (
     REASON_ADDRESS_CITY,
@@ -3167,6 +3167,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
             if call is not None:  # a hit of a gathered appraisal other than the focus says why it is the property's (U12b)
                 src.link = call.link_of(h["version_id"], uv.unit_no)
             out.append(ws.once(src, ("chunk", h["chunk_id"])))
+            _register_shown(ws, conn, src, h["kind"], passage, shown)
             # the document as a whole: a datum not found may be in a part of it that was not read
             ws.touch(h["document_id"], h["title"], "retrieved", gaps.get(h["version_id"], whole).partial)
     _register_call(ws, call, out)
@@ -3178,6 +3179,21 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
     hints = [MSG_ROWS_NOT_SHOWN.format(handle=t, n=n) for t, n in capped] + ([block] if block else [])
     hints += [f"{ws.doc_handle(d)}: {note}" for d, cx in noted.items() if (note := _note_once(ws, d, cx))]
     return "\n\n".join([*notes, *(_render_source(s) for s in out), *hints])
+
+
+def _register_shown(ws: Workspace, conn: Connection, src: Source, kind: str, passage: str, shown: str) -> None:
+    """Record in ``ws.sent`` the blocks a search hit displayed whole, so a later read sends only the blocks the turn has not
+    returned (KTD6 item 2). Only a hit of paragraph text whose passage was shown as it is — not cut by the scoped window or
+    the passage cap, not a reference to an earlier hit (``same_as``) — and only the blocks whose full text is in what was
+    shown. A table or table-row hit registers nothing: its text is rows and a caption, not the table block."""
+    if (kind in ("table", "table_row") or src.same_as or src.block_start is None or src.block_end is None
+            or shown != passage):
+        return
+    flat = _flat(shown)
+    registered = ws.sent.setdefault(str(src.version_id), {})
+    for r in reader.blocks_between(conn, src.version_id, src.block_start, src.block_end):
+        if r.kind in ("heading", "paragraph", "textbox") and r.status == "read" and r.text and _flat(r.text) in flat:
+            registered.setdefault(r.block_index, src.sid)
 
 
 def _hit_valuations(ws: Workspace, conn: Connection, memo: dict) -> list:
@@ -3255,10 +3271,12 @@ _TABLE_SOURCES = {"emf": "טבלה מתוך תמונה וקטורית (נקרא�
                   "ocr": "טבלה מתוך תמונה (OCR)"}
 
 
-def _table_text(st: dict, rows: list, marks: dict[int, str] | None = None) -> str:
+def _table_text(st: dict, rows: list, marks: dict[int, str] | None = None, before: Iterable[str] = (),
+                after: Iterable[str] = ()) -> str:
     """A table as the model and the verifier read it: its caption and titles, its size, its headers, the given
     rows and its notes. ``marks``: a line to send before a row (by its place among ``rows``) — where the rows of
-    another appraisal context start (KTD7); never part of what the verifier reads."""
+    another appraisal context start (KTD7); never part of what the verifier reads. ``before``/``after``: the lines of the
+    context parts a table read adds above and below the table (``_table_context``, round 17 U4)."""
     lines = [x for x in [st.get("caption"), *(st.get("title") or []), table_size_line(st)] if x]
     if any(st.get("headers") or []):
         lines.append(" | ".join(st["headers"]))
@@ -3268,7 +3286,157 @@ def _table_text(st: dict, rows: list, marks: dict[int, str] | None = None) -> st
         lines.append(" | ".join(r.get("cells") or []))
     lines += st.get("notes") or []
     note = _TABLE_SOURCES.get(st.get("source") or "", "")
-    return (note + "\n" if note else "") + "\n".join(lines)
+    return (note + "\n" if note else "") + "\n".join([*before, *lines, *after])
+
+
+# --- the context of a table read (round 17 U4, KTD4; R9, R12, R13) ---------------------------------------------------
+#
+# A table's meaning is often stated beside it: the section it is in, the paragraph that introduces it, and a note after it
+# that says what its values refer to (one valuation approach, a unit, a date). The extraction does not store those with the
+# table, so a read of the table takes them from the blocks around it, by position and kind only: no phrase decides what a
+# note is. Each part is a whole block (never cut, so it can be registered as sent), tagged with its kind and block number;
+# the parts stop at a heading, a table or a picture, at the edge of the appraisal unit, and at a character cap.
+
+TABLE_CONTEXT_BEFORE_CHARS = 700  # the paragraph above a table is a part only when it is at most this long
+TABLE_CONTEXT_AFTER_CHARS = 1200  # the paragraphs after a table, together
+TABLE_CONTEXT_SCAN = 12  # the blocks read after a table to find its parts and what follows
+TABLE_FOLLOWS = 4  # the blocks after the parts that the "what follows" line names
+_BLOCK_KINDS = {"paragraph": "פסקה", "textbox": "תיבת טקסט", "heading": "כותרת", "table": "טבלה", "image": "תמונה"}
+_UNREAD_REGION = "אזור שלא נקרא"
+_BETWEEN_TABLES = "בין שתי טבלאות"
+MSG_TABLE_PART = "[{side}{between} · {kind} · בלוק {block}] {text}"
+MSG_TABLE_PART_SENT = "[{side}{between} · {kind} · בלוק {block}: כבר הוחזר ב-{sid}]"
+MSG_TABLE_FOLLOWS = "[אחרי הטבלה: {kinds} — להמשך הקריאה מהקטע הבא: read(cursor={cursor})]"
+MSG_TABLE_FOLLOWS_UNPLACED = "[אחרי הטבלה: {kinds}]"
+MSG_TABLE_NOTHING_AFTER = "[אחרי הטבלה: אין עוד קטעים ביחידה]"
+# the status of a table read speaks of the table: it says nothing of the section the table is in (KTD6 item 1)
+TABLE_STATUS_LABELS = {"complete": "הטבלה נקראה במלואה (כל שורותיה, כותרותיה והערותיה); הסעיף שהיא בו לא נקרא בקריאה הזו",
+                       "clipped": "נקרא חלק מהטבלה; יש המשך", "uncertain_reading": "הטבלה נקראה בקריאה לא ודאית"}
+
+
+class TablePart(NamedTuple):
+    """A block beside a table that its read carries: ``side`` is ``before`` or ``after``; ``between``: a paragraph that
+    lies between two tables, which belongs to neither one's own text more than to the other's."""
+
+    side: str
+    kind: str
+    block_index: int
+    text: str
+    between: bool
+
+
+@dataclass
+class TableContext:
+    """What surrounds a table: its heading path, its parts, the blocks that follow the parts (kind, block) and where they
+    can be read on from (a section target and position), and the blocks of the table itself."""
+
+    path: tuple[str, ...] = ()
+    parts: list[TablePart] = field(default_factory=list)
+    follows: list[tuple[str, int]] = field(default_factory=list)
+    resume: tuple[tuple, tuple[int, int]] | None = None
+    table_blocks: list[int] = field(default_factory=list)
+
+
+def _flat(s: str | None) -> str:
+    return " ".join((s or "").split())
+
+
+def _is_prose(r) -> bool:
+    """A block a table part can be: a paragraph of text that was read (not a heading, a table or a picture)."""
+    return (r.kind not in ("heading", "table", "image") and bool((r.text or "").strip())
+            and r.status not in (reader.UNREAD, reader.UNCERTAIN, "decorative", "no_text"))
+
+
+def _kind_of(r) -> str:
+    return _UNREAD_REGION if r.status == reader.UNREAD else _BLOCK_KINDS.get(r.kind, "קטע")
+
+
+def _table_context(ws: Workspace, conn: Connection, v: reader.Version, table_index: int, st: dict, block, cx
+                   ) -> TableContext:
+    """The context of a table (``TableContext``) from the blocks around its first block ``block``, within its appraisal unit:
+    the paragraph just above it when that is not its caption, and the paragraphs just after it up to the next heading, table
+    or picture, within ``TABLE_CONTEXT_AFTER_CHARS`` (a paragraph that does not fit ends the parts: none is cut). A paragraph
+    between two tables is tagged as such. Nothing is taken from another unit. The blocks after the parts are named, with
+    the position that reads on from the first of them."""
+    if block is None:
+        return TableContext()
+    first = block.block_index
+    seg = cx.segment_at(first) if cx.multi else None
+
+    def inside(index: int) -> bool:
+        return not cx.multi or (seg is not None and seg.first <= index <= seg.last)
+
+    ctx = TableContext(path=reader.effective_path(cx, first, tuple(block.section_path or ())))
+    captions = {_flat(x) for x in [st.get("caption"), *(st.get("title") or []), block.text] if x}
+    above = reader.blocks_above(conn, v.version_id, first, lo=seg.first if seg is not None else 0, limit=2)
+    near = above[-1] if above else None
+    if near is not None and _is_prose(near) and _flat(near.text) not in captions \
+            and len(near.text) <= TABLE_CONTEXT_BEFORE_CHARS:
+        ctx.parts.append(TablePart("before", near.kind, near.block_index, near.text.strip(),
+                                   len(above) == 2 and above[0].kind == "table"))
+    rows = reader.blocks_between(conn, v.version_id, first, first + TABLE_CONTEXT_SCAN, limit=TABLE_CONTEXT_SCAN + 1)
+    lead = 0
+    while lead < len(rows) and rows[lead].table_index == table_index:  # the table's own blocks come first
+        ctx.table_blocks.append(rows[lead].block_index)
+        lead += 1
+    run, end = [], None  # the paragraphs after the table, and the block that ends them
+    for r in rows[lead:]:
+        if not inside(r.block_index):
+            break
+        if r.status == "decorative":
+            continue
+        if _is_prose(r):
+            run.append(r)
+            continue
+        end = r
+        break
+    between = end is not None and end.kind == "table"
+    used, shown = 0, []
+    for r in run:
+        if used + len(r.text.strip()) > TABLE_CONTEXT_AFTER_CHARS:
+            break
+        used += len(r.text.strip())
+        shown.append(r)
+    ctx.parts += [TablePart("after", r.kind, r.block_index, r.text.strip(), between) for r in shown]
+    last = shown[-1].block_index if shown else (ctx.table_blocks[-1] if ctx.table_blocks else first)
+    tail = [r for r in rows[lead:] if r.block_index > last and inside(r.block_index) and r.status != "decorative"]
+    ctx.follows = [(_kind_of(r), r.block_index) for r in tail[:TABLE_FOLLOWS]]
+    if tail:
+        path = reader.effective_path(cx, tail[0].block_index, tuple(tail[0].section_path or ()))
+        ctx.resume = (_section_target(v, path, reader.section_window(cx, tail[0].block_index, path)),
+                      (tail[0].block_index, 0))
+    return ctx
+
+
+def _part_line(p: TablePart, sent: dict[int, str] | None = None) -> str:
+    """A part as one line, with its kind and block reference; as a pointer to the source that returned it when ``sent``
+    (the blocks the turn returned whole) holds it."""
+    fields = {"side": TABLE_BEFORE if p.side == "before" else TABLE_AFTER,
+              "between": f" · {_BETWEEN_TABLES}" if p.between else "", "kind": _BLOCK_KINDS.get(p.kind, "קטע"),
+              "block": p.block_index}
+    if sent is not None and p.block_index in sent:
+        return MSG_TABLE_PART_SENT.format(sid=sent[p.block_index], **fields)
+    return MSG_TABLE_PART.format(text=_flat(p.text), **fields)
+
+
+def _table_context_lines(ctx: TableContext, sent: dict[int, str] | None = None, *, path: bool = True
+                   ) -> tuple[list[str], list[str]]:
+    """The lines a table read puts above and below the table: the heading path (unless ``path`` is False) and the parts
+    before it; the parts after it. ``sent``: the blocks already returned, which become pointers (what the model reads); the
+    text the verifier reads is built without it."""
+    head = [f"{TABLE_PATH_PREFIX} {' › '.join(ctx.path)}"] if path and ctx.path else []
+    return (head + [_part_line(p, sent) for p in ctx.parts if p.side == "before"],
+            [_part_line(p, sent) for p in ctx.parts if p.side == "after"])
+
+
+def _follows_line(ws: Workspace, v: reader.Version, ctx: TableContext) -> str:
+    """The "what follows" pointer of a table read: the kinds and blocks after its parts, and the cursor that reads on."""
+    if not ctx.follows:
+        return MSG_TABLE_NOTHING_AFTER
+    kinds = ", ".join(f"{kind} (בלוק {index})" for kind, index in ctx.follows)
+    if ctx.resume is None:
+        return MSG_TABLE_FOLLOWS_UNPLACED.format(kinds=kinds)
+    return MSG_TABLE_FOLLOWS.format(kinds=kinds, cursor=_cursor(ws, v, *ctx.resume))
 
 
 def read_scope(ws: Workspace, source_id: str, scope: str = "neighbors", ref: dict | None = None) -> Source:
@@ -3803,21 +3971,27 @@ def _read_table_once(ws: Workspace, conn: Connection, v: reader.Version, table_i
     more = _cursor(ws, v, target, nxt) if nxt is not None else None
     uncertain = block is not None and block.status == reader.UNCERTAIN
     status = "clipped" if nxt is not None else "uncertain_reading" if uncertain else "complete"
-    head = [f"מצב: {STATUS_LABELS[status]}" + (f"; להמשך: read(cursor={more})" if more else "")]
+    head = [f"מצב הטבלה: {TABLE_STATUS_LABELS[status]}" + (f"; להמשך: read(cursor={more})" if more else "")]
     if len(rows) > size:
         head.append(f"שורות {row0 + 1}–{row0 + len(window)} מתוך {len(rows)}")
-    body = _table_text(st, window)
-    # a table the extraction merged across appraisal contexts: its rows of each context, marked where they start
+    # what the table is read with: its heading path and the blocks before and after it (KTD4). The verifier's text holds
+    # every part in full; what is sent points to the parts an earlier read of the turn returned (KTD6 item 2)
     cx = contexts_of(ws, conn, v.version_id, v.reading_id)
+    ctx = _table_context(ws, conn, v, table_index, st, block, cx)
+    already = ws.sent.get(vid, {})
+    full_above, full_below = _table_context_lines(ctx)
+    body = _table_text(st, window, before=full_above, after=full_below)
+    # a table the extraction merged across appraisal contexts: its rows of each context, marked where they start
     groups = reader.table_contexts(cx, st, block.block_index if block is not None else st.get("block_index"),
                                    block.page if block is not None else st.get("page"))
     numbers = [g["context"] for g in groups if g["first"] <= row0 + len(window) and g["last"] > row0]
-    sent = body
+    marks = None
     if len(groups) > 1:
         marks = {max(g["first"] - 1, row0) - row0: MSG_TABLE_ROWS.format(
             first=g["first"], last=g["last"], which=cx.describe(g["context"])) for g in groups
             if g["first"] <= row0 + len(window) and g["last"] > row0}
-        sent = _table_text(st, window, marks)
+    above, below = _table_context_lines(ctx, already)
+    sent = _table_text(st, window, marks, before=above, after=below) + "\n" + _follows_line(ws, v, ctx)
     page = block.page if block is not None else st.get("page")
     index = block.block_index if block is not None else st.get("block_index")
     name = st.get("caption") or (st.get("title") or [""])[0] or st.get("section") or "טבלה"
@@ -3836,6 +4010,14 @@ def _read_table_once(ws: Workspace, conn: Connection, v: reader.Version, table_i
     ws.touch(v.document_id, v.title, "read", v.partial, {"sid": s.sid, "scope": "table", "name": name,
                                                          "target": target})
     ws.read_progress(target, row0 or None, nxt, str(v.document_id), False)
+    # the blocks this read returned whole: every context part (each is sent in full or points to the source that sent
+    # it), and the table's own blocks only when this one read holds the whole table (KTD6 item 2)
+    registered = ws.sent.setdefault(vid, {})
+    for p in ctx.parts:
+        registered.setdefault(p.block_index, s.sid)
+    if status == "complete" and row0 == 0:
+        for b in ctx.table_blocks:
+            registered.setdefault(b, s.sid)
     return s
 
 

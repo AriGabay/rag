@@ -137,3 +137,27 @@ def test_borderless_ocr_table_from_word_boxes():
         ["השקד 7", "05/11/2023", "2,050,000"],
     ]
     assert (1, 1, 1) not in used and (1, 1, 5) not in used
+
+
+# --- round 17 U4: a table read's text carries the parts around the table (KTD4) -------------------------------------------
+
+def test_table_text_puts_the_context_parts_around_the_table_and_the_notes_before_the_trailing_part():
+    from app.chat import tools as T
+
+    st = {"headers": ["תרחיש", "שווי"], "caption": "טבלת רגישות", "title": [], "notes": ["* באלפי ₪"],
+          "rows": [{"cells": ["תרחיש 1", "4,010"]}]}
+    out = T._table_text(st, st["rows"], before=["כותרות מעל הטבלה: 4. שיטות"],
+                        after=["[אחרי הטבלה · פסקה · בלוק 9] הנתונים לגישת ההיוון בלבד."])
+    lines = out.split("\n")
+    assert lines[0] == "כותרות מעל הטבלה: 4. שיטות" and lines[1] == "טבלת רגישות"
+    assert lines[-2:] == ["* באלפי ₪", "[אחרי הטבלה · פסקה · בלוק 9] הנתונים לגישת ההיוון בלבד."]
+    assert T._table_text(st, st["rows"]) == "\n".join(lines[1:-1])  # no parts: the text as it always was
+
+
+def test_a_part_is_one_line_with_its_kind_and_block_and_a_pointer_when_the_block_was_already_returned():
+    from app.chat import tools as T
+
+    part = T.TablePart("after", "paragraph", 9, "שורה ראשונה\nשורה שנייה", True)
+    assert T._part_line(part) == "[אחרי הטבלה · בין שתי טבלאות · פסקה · בלוק 9] שורה ראשונה שורה שנייה"
+    assert T._part_line(part, {9: "S4"}) == "[אחרי הטבלה · בין שתי טבלאות · פסקה · בלוק 9: כבר הוחזר ב-S4]"
+    assert T._part_line(part, {3: "S1"}).endswith("שורה שנייה")
