@@ -62,6 +62,7 @@ from app.chat.verify import (
     VerificationUnavailable,
     VerifyReport,
     _Coverage,
+    _Evidence,
     _headings_above,
     _judge_all,
     _judged_failure,
@@ -278,7 +279,9 @@ class _Final:
         res = Checked()
         units = [f for f in self.split(comp) if f.model]
         self.stats["units"] = len(units)
-        todo = [f for f in units if not f.protected and not f.exempt and f.key not in self.passed]
+        stale = self.stale_units() if may_judge else set()  # without a call, the draft's verdicts stand
+        todo = [f for f in units if not f.protected and not f.exempt and (f.key not in self.passed
+                                                                           or set(f.drafts) & stale)]
         self.stats["reused"] += len(units) - len(todo)
         if not todo:
             return res
@@ -360,6 +363,17 @@ class _Final:
 
         return words("".join(left)) == words(f.text)
 
+    def stale_units(self) -> set[int]:
+        """The draft units that gave a score whose component's evidence changed since it was cast (round 17 U1, KTD1): the same
+        admission rule the verification applies to a carried score. The final check compares the read passages (the ledger is
+        what the verification closed). Such a unit is judged again with the requirements block, and its component is scored
+        again over its own units, as in ``VerdictCache.reuse``."""
+        if not (self.turn.derived and self.report.requirements and self.report.requirement_votes):
+            return set()
+        evidence = _Evidence(self.ws, self.report.requirements, self.report.answer_ids)
+        return {i for votes in self.report.requirement_votes.values() for v in votes
+                if evidence.refusal(v, items=False) for i in (*v.units, *v.absent)}
+
     def with_votes(self, todo: list[FinalUnit], units: list[FinalUnit]) -> list[FinalUnit]:
         """A unit that voted for a component and changed is judged with the units it voted with (KTD9, as
         ``VerdictCache.reuse`` does): the requirement is scored on them together."""
@@ -407,6 +421,12 @@ class _Final:
         mapped = [v.model_copy(update={"units": [to_draft[i] for i in v.units if to_draft.get(i, -1) >= 0],
                                        "absent": [to_draft[i] for i in v.absent if to_draft.get(i, -1) >= 0]})
                   for v in scored]
+        evidence = _Evidence(self.ws, self.report.requirements, self.report.answer_ids)
+        for v in mapped:  # cast on the saved text of this version: stamped as the verification stamps its own
+            stamp = v._stamp or {}
+            evidence.stamp(v, self.report.version, self.report.digest)
+            v._stamp |= {"call_units": [to_draft[i] for i in stamp.get("call_units", []) if to_draft.get(i, -1) >= 0],
+                         "final": True}
         votes = self.report.requirement_votes
         before = {rid: [v.model_dump_json() for v in old] for rid, old in votes.items()}
         for rid, old in list(votes.items()):

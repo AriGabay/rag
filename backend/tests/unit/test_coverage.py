@@ -2420,3 +2420,246 @@ def test_the_diagnostics_carry_the_ledger_and_the_documents_of_its_items_join_th
     assert str(ws.sources["S2"].document_id) in out["document_ids"]
     assert str(ws.sources["S1"].document_id) in out["document_ids"]  # the excluded item's quote prefix is document text too
     assert api._diagnostics(TurnOutcome(answer, ws, r, 1), {})["resolution"].get("item_ledger") is None
+
+
+# --- round 17 U1: completeness decisions bound to the answer version (KTD1; R1, R2, R3) -----------------------------------------
+
+ASK_VALUE = "השווי למ\"ר"
+VALUE_LINE = "השווי למ\"ר הוא 9,500 ₪ [S1]."
+V1_MD = f"{THREE_RATES} {VALUE_LINE}"  # three rate units (0-2) and the value unit (3)
+V2_MD = V1_MD.replace(VALUE_LINE, "השווי למ\"ר הוא 9,500 ₪ לפי הדוח [S1].")  # the repair edits the last sentence only
+
+
+def _round(ws, markdown, score, cache, turn, version, seen=None, **kw):
+    """One verification of the turn's answer version ``version`` with a judge scripted by ``score``."""
+    return verify_answer(_judge(score, seen=seen), _answer(markdown), ws, "?", [], requirements=turn, cache=cache,
+                         item_version=version, **kw)
+
+
+def _gives(table: dict[str, tuple[str, str]]):
+    """Score each component ``id`` by (the word its units hold, the status when a unit of the call holds it; else ``missing``)."""
+    def score(frozen, units):
+        out = []
+        for cid, _ in frozen:
+            word, status = table[cid]
+            hits = [i for i, t in units.items() if word in t]
+            out.append(_req("", status if hits else "missing", hits, id=cid))
+        return out
+    return score
+
+
+def _units(input: str) -> dict[int, str]:
+    return {int(i): t for i, t in re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S)}
+
+
+def _two_components():
+    return _turn({"id": "1", "text": ASK_RATES}, {"id": "2", "text": ASK_VALUE})
+
+
+def test_ae1_a_carried_full_vote_does_not_hide_the_gap_a_fresh_vote_validated_and_stays_in_the_history():
+    ws, cache, turn = _rates_file(), verify.VerdictCache(), _turn({"id": "1", "text": ASK_RATES})
+
+    def score(frozen, units):
+        if 0 in units:  # round 1: the call holds the rates and gives the component whole
+            return [_req("", "full", [0, 1, 2], id=frozen[0][0])]
+        return [_req("", "partial", list(units), id=frozen[0][0])  # round 2: the edited sentence only, and a rate it omits
+                | {"missing": "שיעורי ההיוון", "support": [{"id": "S2", "quote": MISSING_RATE}]}]
+
+    first = _round(ws, V1_MD, score, cache, turn, 1)
+    assert first.requirement_outcomes()[0]["status"] == "full"
+    second = _round(ws, V2_MD, score, cache, turn, 2)
+    (o,) = second.requirement_outcomes()
+    assert o["status"] == "partial" and o["missing_part"] == "שיעורי ההיוון"  # the validated gap lowers it whatever a vote says (R2)
+    d = second.requirement_decisions["N1"]
+    assert (d["status"], d["version"], d["reused"], d["caps"]) == ("partial", 2, False, ["validated_support"])
+    assert [(x["origin"], x["status"], x["version"]) for x in d["rests_on"]] == [("fresh", "partial", 2)]
+    # the old full is history (R3): kept, tagged with the version it was cast on, and never what the decision rests on
+    assert [(h["status"], h["origin"], h["version"], h["why"]) for h in second.requirement_history["N1"]] == [
+        ("full", "carried", 1, "overruled_by_validated_support")]
+    (comp,) = second.requirements_trace()
+    assert comp["decision"]["status"] == comp["final_status"] == "partial"
+    assert [h["status"] for h in comp["history"]] == ["full"] and comp["history"][0]["version"] == 1
+
+
+def test_a_component_partial_in_round_one_whose_repair_adds_the_rate_is_full_on_the_fresh_vote_of_round_two():
+    ws, cache, turn = _rates_file(), verify.VerdictCache(), _turn({"id": "1", "text": ASK_RATES})
+    md2 = V1_MD + " שיעור ההיוון למחסנים הוא 9.1% [S2]."
+
+    def score(frozen, units):
+        if 0 in units:
+            return [_req("", "partial", [0, 1, 2], id=frozen[0][0])
+                    | {"missing": "שיעורי ההיוון", "support": [{"id": "S2", "quote": MISSING_RATE}]}]
+        return [_req("", "full", list(units), id=frozen[0][0])]
+
+    first = _round(ws, V1_MD, score, cache, turn, 1)
+    assert first.requirement_outcomes()[0]["status"] == "partial" and first.text_support
+    second = _round(ws, md2, score, cache, turn, 2)
+    (o,) = second.requirement_outcomes()
+    assert o["status"] == "full" and second.text_support == {}  # the repaired answer holds the rate: no longer evidence
+    d = second.requirement_decisions["N1"]
+    assert d["status"] == "full" and d["caps"] == [] and ("fresh", "full", 2) in [(x["origin"], x["status"], x["version"]) for x in d["rests_on"]]
+
+
+def test_ae2_a_repair_that_changes_a_unit_which_does_not_give_a_component_reuses_its_full_decision_and_marks_it_reused():
+    ws, cache, turn = _rates_file(), verify.VerdictCache(), _two_components()
+    score = _gives({"N1": ("שיעור היוון", "full"), "N2": (ASK_VALUE, "full")})
+    seen: list[str] = []
+    _round(ws, V1_MD, score, cache, turn, 1, seen)
+    second = _round(ws, V2_MD, score, cache, turn, 2, seen)
+    assert len(seen) == 2 and list(_units(seen[1])) == [3]  # the fresh batch holds the edited unit only: it scores N1 missing
+    n1 = second.requirement_decisions["N1"]
+    assert (n1["status"], n1["version"], n1["reused"]) == ("full", 2, True)  # reused with no fresh vote, from round 1
+    assert [(x["origin"], x["status"], x["version"]) for x in n1["rests_on"]] == [("carried", "full", 1)]
+    n2 = second.requirement_decisions["N2"]
+    assert (n2["status"], n2["reused"]) == ("full", False) and n2["rests_on"][0]["origin"] == "fresh"
+    assert [(o["id"], o["status"]) for o in second.requirement_outcomes()] == [("N1", "full"), ("N2", "full")]
+    votes = second.requirements_trace()[0]["votes"]  # the trace shows both: the carried vote with its source version, the fresh one
+    assert {(v["origin"], v["status"], v["version"]) for v in votes} == {("carried", "full", 1), ("fresh", "missing", 2)}
+
+
+def test_a_fresh_batch_without_the_unchanged_giving_unit_scores_missing_and_the_carried_full_passes_ktd1():
+    ws, cache, turn = _rates_file(), verify.VerdictCache(), _turn({"id": "1", "text": ASK_RATES})
+
+    def score(frozen, units):
+        hits = [i for i, t in units.items() if "שיעור היוון" in t]
+        return [_req("", "full" if hits else "missing", hits, id=frozen[0][0])]
+
+    _round(ws, V1_MD, score, cache, turn, 1)
+    second = _round(ws, V2_MD, score, cache, turn, 2)
+    assert {v.status for v in second.requirement_votes["N1"]} == {"full", "missing"}
+    assert second.requirement_outcomes()[0]["status"] == "full"  # batches are relative: the best status, not the last call's
+    assert second.requirement_decisions["N1"]["reused"] is True and not second.requirement_history.get("N1")
+
+
+def test_a_passage_read_after_round_one_that_bears_on_the_component_refuses_the_carried_vote_and_judges_its_units_in_the_same_round():
+    ws, cache, turn = _rates_file(), verify.VerdictCache(), _turn({"id": "1", "text": ASK_RATES})
+    seen: list[str] = []
+
+    def score(frozen, units):
+        if len(seen) == 1:
+            return [_req("", "full", [0, 1, 2], id=frozen[0][0])]
+        return [_req("", "partial", list(units), id=frozen[0][0]) | {"missing": "שיעורי ההיוון"}]
+
+    _round(ws, V1_MD, score, cache, turn, 1, seen)
+    s2 = ws.sources["S2"]  # the turn read one more passage of the same unit that states a member of the asked kind
+    extra = ws.add_source(document_id=s2.document_id, version_id=s2.version_id, title="דוח בדיקה", section="נספח",
+                          location="נספח", kind="context", text="שיעורי ההיוון שנקבעו לנכסים נוספים: מחסנים: 9.1%")
+    extra.contexts, extra.unit = list(s2.contexts), s2.unit
+    _read(ws, extra.sid)
+    second = _round(ws, V2_MD, score, cache, turn, 2, seen)
+    assert len(seen) == 2  # no judge round was added
+    assert list(_units(seen[1])) == [0, 1, 2, 3]  # the giving units of the refused vote joined the units judged fresh
+    (o,) = second.requirement_outcomes()
+    assert o["status"] == "partial"  # decided from the fresh vote: the old full was not admitted
+    d = second.requirement_decisions["N1"]
+    assert d["reused"] is False and [x["origin"] for x in d["rests_on"]] == ["fresh"]
+    assert [(h["status"], h["version"], h["why"]) for h in second.requirement_history["N1"]] == [("full", 1, "evidence_changed")]
+
+
+def test_an_identical_answer_over_the_same_evidence_carries_the_whole_decision_without_a_call():
+    ws, cache, turn = _rates_file(), verify.VerdictCache(), _turn({"id": "1", "text": ASK_RATES})
+    seen: list[str] = []
+    score = _gives({"N1": ("שיעור היוון", "full")})
+    _round(ws, V1_MD, score, cache, turn, 1, seen)
+    again = _round(ws, V1_MD, score, cache, turn, 2, seen)
+    assert len(seen) == 1
+    d = again.requirement_decisions["N1"]
+    assert (d["status"], d["version"], d["reused"]) == ("full", 2, True) and d["rests_on"][0]["version"] == 1
+
+
+def test_an_identical_answer_over_changed_evidence_does_not_carry_the_whole_decision():
+    ws, cache, turn = _rates_file(), verify.VerdictCache(), _turn({"id": "1", "text": ASK_RATES})
+    seen: list[str] = []
+
+    def score(frozen, units):
+        return [_req("", "full" if len(seen) == 1 else "partial", list(units), id=frozen[0][0])]
+
+    _round(ws, V1_MD, score, cache, turn, 1, seen)
+    s2 = ws.sources["S2"]
+    extra = ws.add_source(document_id=s2.document_id, version_id=s2.version_id, title="דוח בדיקה", section="נספח",
+                          location="נספח", kind="context", text="שיעורי ההיוון שנקבעו לנכסים נוספים: מחסנים: 9.1%")
+    extra.contexts, extra.unit = list(s2.contexts), s2.unit
+    _read(ws, extra.sid)
+    again = _round(ws, V1_MD, score, cache, turn, 2, seen)
+    assert len(seen) == 2 and list(_units(seen[1])) == [0, 1, 2, 3]
+    assert again.requirement_outcomes()[0]["status"] == "partial"
+    assert again.requirement_decisions["N1"]["reused"] is False
+
+
+def test_a_condition_edited_in_the_giving_unit_changes_its_key_so_the_old_vote_is_not_carried():
+    ws, cache, turn = _rates_file(), verify.VerdictCache(), _turn({"id": "1", "text": ASK_RATES})
+    first_md = "שיעור היוון למשרדים 6.5% ללא מע\"מ [S2]."
+    second_md = "שיעור היוון למשרדים 6.5% כולל מע\"מ [S2]."
+    seen: list[str] = []
+
+    def score(frozen, units):
+        return [_req("", "full" if len(seen) == 1 else "partial", list(units), id=frozen[0][0])]
+
+    _round(ws, first_md, score, cache, turn, 1, seen)
+    second = _round(ws, second_md, score, cache, turn, 2, seen)
+    assert list(_units(seen[1])) == [0] and second.requirement_outcomes()[0]["status"] == "partial"
+    assert [v.status for v in second.requirement_votes["N1"]] == ["partial"]  # the round-1 full did not feed the decision
+    assert second.requirement_decisions["N1"]["reused"] is False
+
+
+def test_two_fresh_batches_of_one_version_merge_by_best_status_and_the_decision_rests_on_the_calls_that_gave_it(monkeypatch):
+    monkeypatch.setattr(verify, "JUDGE_MAX_UNITS", 3)
+    ws, turn = _rates_file(), _turn({"id": "1", "text": ASK_RATES})
+    r = _round(ws, V1_MD, _gives({"N1": ("שיעור היוון", "full")}), None, turn, 1)
+    statuses = {v.status for v in r.requirement_votes["N1"]}
+    assert statuses == {"full", "missing"}  # the batch with the rates, the batch with the value line only
+    d = r.requirement_decisions["N1"]
+    assert d["status"] == "full" and d["reused"] is False and {x["origin"] for x in d["rests_on"]} == {"fresh"}
+    assert all(x["status"] == "full" for x in d["rests_on"])
+
+
+def test_every_fresh_vote_is_stamped_with_the_answer_version_digest_and_its_calls_unit_indexes(monkeypatch):
+    monkeypatch.setattr(verify, "JUDGE_MAX_UNITS", 2)
+    ws, turn = _rates_file(), _turn({"id": "1", "text": ASK_RATES})
+    score = _gives({"N1": ("שיעור היוון", "full")})
+    one = _round(ws, V1_MD, score, None, turn, 1)
+    stamps = [v._stamp for v in one.requirement_votes["N1"]]
+    assert [s["call_units"] for s in stamps] == [[0, 1], [2, 3]] and {s["version"] for s in stamps} == {1}
+    assert len({s["digest"] for s in stamps}) == 1 and stamps[0]["digest"] == one.digest and one.version == 1
+    again = _round(ws, V1_MD, score, None, turn, 2)  # the same answer over the same evidence: the same digest
+    assert again.digest == one.digest
+    edited = _round(ws, V2_MD, score, None, turn, 3)  # another answer
+    assert edited.digest != one.digest
+    ws.searches.append("שיעורי היוון")  # the same answer over other read evidence
+    assert _round(ws, V1_MD, score, None, turn, 4).digest != one.digest
+
+
+def test_the_trace_bounds_its_votes_and_history_and_the_decision_always_appears(monkeypatch):
+    monkeypatch.setattr(verify, "JUDGE_MAX_UNITS", 1)
+    monkeypatch.setattr(verify, "TRACE_VOTES_PER_COMPONENT", 2)
+    ws, turn = _rates_file(), _turn({"id": "1", "text": ASK_RATES})
+    r = _round(ws, V1_MD, _gives({"N1": ("שיעור היוון", "full")}), None, turn, 1)
+    assert len(r.requirement_votes["N1"]) == 4
+    (comp,) = r.requirements_trace()
+    assert len(comp["votes"]) == 2 and len(comp["history"]) <= 2
+    assert comp["decision"]["status"] == "full" and len(comp["decision"]["rests_on"]) <= 2
+
+
+def test_votes_of_a_report_built_by_hand_carry_no_stamp_and_the_decision_still_rests_on_them():
+    turn = _turn({"id": "1", "text": ASK_RATES})
+    votes = [verify.JudgeRequirement(id="N1", status="full", units=[0])]
+    report = verify.VerifyReport(units=verify.split_units(THREE_RATES), requirements=[dict(r) for r in turn.items],
+                                 requirement_votes={"N1": votes})
+    d = report.requirement_decisions["N1"]
+    assert d["status"] == "full" and d["rests_on"][0]["version"] is None and d["reused"] is False
+    assert report.requirements_trace()[0]["decision"]["status"] == "full"
+
+
+def test_item_coverage_reads_the_unit_text_after_a_cut_so_an_item_stated_only_in_the_cut_part_is_omitted():
+    ws = _adj_file()
+    md = "ההתאמה למיקום היא 5%, וההתאמה לקומה היא 3%, וההתאמה לגיל הבניין היא 2% [S2]."
+    r, turn, answer, _ = _ledger_check(ws, md, _adj_items())
+    assert r.requirement_outcomes()[0]["status"] == "full"  # one sentence states all three
+    start = md.index(", וההתאמה לגיל הבניין")
+    unit = r.units[0]
+    r.cuts[0] = [verify.CutGroup(start, md.index(" [S2]"), ("c1",))]  # the edit ladder cuts the claim of the third adjustment
+    assert [(i["id"], i["state"]) for i in r.item_states()] == [("I1", "covered"), ("I2", "covered"), ("I3", "omitted")]
+    (o,) = r.requirement_outcomes()
+    assert o["status"] == "partial" and o["omitted_items"] == ["I3"] and unit.index == 0
+    r.cuts.clear()
+    assert [i["state"] for i in r.item_states()] == ["covered"] * 3  # without the cut the sentence covers it again

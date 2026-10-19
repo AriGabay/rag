@@ -10,7 +10,7 @@ the marker when it lands (a strict xfail that starts passing fails the suite, so
    edited answer scores the component ``partial`` with a validated quote of the rate the answer omits. The vote carried
    from the unchanged sentences wins by "best status", so the component ends ``full`` and the gap is never asked for. U3 closed
    this sequence (the validated support becomes an omitted ledger item, which caps the component at partial whatever a vote
-   says); U1's version rules (reuse and history of decisions) are still its own.
+   says); U1 adds the version rules: the decision rests on the fresh vote of the edited version and the carried full is history.
 2. A list answered in part (AE3, owned by U3 with the ledger of U2). A read table lists three adjustments, the answer gives
    two with citations and a lenient judge scores the component ``full``: nothing asks for the third. Expressed in
    observable outcomes (what the answer states, the repair request, the tools called); once the item ledger exists, the
@@ -170,6 +170,11 @@ def test_an_old_full_vote_does_not_hide_a_rate_a_fresh_vote_on_the_edited_answer
     assert [e["outcome"] for e in fresh["support"]] == ["accepted"], fresh
     # AE1: the decision is made on the current answer; the old full vote is history only
     assert trace[1]["final_status"] == "partial", trace[1]
+    # (U1) the decision rests on the fresh vote of the edited version; the carried full is history with the version it was cast on
+    decision = trace[1]["decision"]
+    assert decision["status"] == "partial" and decision["version"] == 2 and not decision["reused"], decision
+    assert [(x["origin"], x["status"]) for x in decision["rests_on"]] == [("fresh", "partial")], decision
+    assert [(h["status"], h["origin"], h["version"]) for h in trace[1]["history"]] == [("full", "carried", 1)], trace[1]["history"]
     assert ("text_found", n1) in checks_of(client, m)[1]  # the omitted rate is asked for (REQ_TEXT_FOUND)
     assert m["answer"]["verification"]["completeness"]["status"] == "partial"
 

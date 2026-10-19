@@ -1436,3 +1436,69 @@ def test_the_servers_coverage_note_never_reaches_the_judge_as_a_claim(offline):
     assert judge.inputs, "the model's own sentence was judged"
     assert all(TF.LATEST_CHECKED not in i and TF.MSG_GROUP_CAP not in i for i in judge.inputs), "the note was never shown"
     assert out.final_check["judge_calls"] == 0
+
+
+# --- round 17 U1: the final check admits an untouched score only while its component's evidence is unchanged (KTD1) -------------
+
+def _scored_draft(monkeypatch):
+    """The two-component draft verified once (N1 given by the three rate units, N2 by the value unit), and the judge's scripts."""
+    from app.chat import coverage
+    from tests.unit import test_coverage as tc
+
+    monkeypatch.setattr(coverage, "build", lambda ws, answer, question: ({}, answer))  # no lookups: no database
+
+    ws, turn = tc._rates_file(), tc._two_components()
+    score = tc._gives({"N1": ("שיעור היוון", "full"), "N2": (tc.ASK_VALUE, "full")})
+    answer = tc._answer(tc.V1_MD)
+    report = verify.verify_answer(tc._judge(score), answer, ws, "?", [], requirements=turn, item_version=1)
+    return tc, ws, turn, score, answer, report
+
+
+def _read_one_more_passage(tc, ws) -> None:
+    s2 = ws.sources["S2"]
+    extra = ws.add_source(document_id=s2.document_id, version_id=s2.version_id, title="דוח בדיקה", section="נספח",
+                          location="נספח", kind="context", text="שיעורי ההיוון שנקבעו לנכסים נוספים: מחסנים: 9.1%")
+    extra.contexts, extra.unit = list(s2.contexts), s2.unit
+    tc._read(ws, extra.sid)
+
+
+def test_the_final_check_leaves_an_untouched_score_alone_while_the_evidence_of_its_component_is_unchanged(monkeypatch):
+    tc, ws, turn, score, answer, report = _scored_draft(monkeypatch)
+    seen: list[str] = []
+    usage: list = []
+    done = final_check.finalize(tc._judge(score, seen=seen), ws, answer, report, turn, question="?", usage=usage)
+    assert seen == [] and usage == []  # nothing changed: no judge call at all
+    assert [(o["id"], o["status"]) for o in report.requirement_outcomes()] == [("N1", "full"), ("N2", "full")]
+    assert done.composition.answer.answer_markdown.startswith(tc.V1_MD)
+
+
+def test_the_final_check_judges_again_the_giving_units_of_a_score_whose_component_gained_a_passage_and_only_those(monkeypatch):
+    tc, ws, turn, score, answer, report = _scored_draft(monkeypatch)
+    _read_one_more_passage(tc, ws)  # read after the verification, bearing on N1 only
+    seen: list[str] = []
+    usage: list = []
+
+    def late(frozen, units):  # the judge, shown the passage, now finds the rates incomplete
+        return [tc._req("", "partial" if cid == "N1" else "full", list(units), id=cid) | ({"missing": "שיעורי ההיוון"} if cid == "N1" else {})
+                for cid, _ in frozen if any(("שיעור היוון" if cid == "N1" else tc.ASK_VALUE) in t for t in units.values())]
+
+    final_check.finalize(tc._judge(late, seen=seen), ws, answer, report, turn, question="?", usage=usage)
+    assert len(seen) == 1 and [u["purpose"] for u in usage] == [final_check.FINAL_LABEL]  # one call, the final check's own
+    assert set(tc._units(seen[0])) == {0, 1, 2} and "<requirements>" in seen[0]  # N1's giving units; N2's unit was not judged again
+    outcomes = {o["id"]: o["status"] for o in report.requirement_outcomes()}
+    assert outcomes == {"N1": "partial", "N2": "full"}  # decided from the fresh score; the old full was replaced
+    n1, n2 = report.requirement_decisions["N1"], report.requirement_decisions["N2"]
+    assert [(x["origin"], x["version"]) for x in n1["rests_on"]] == [("fresh", 1)] and n1["reused"] is False
+    assert report.requirement_votes["N1"][0]._stamp["final"] is True and "final" not in report.requirement_votes["N2"][0]._stamp
+    assert n2["rests_on"][0]["origin"] == "fresh" and n2["status"] == "full"
+
+
+def test_the_final_check_without_time_to_judge_keeps_the_drafts_scores_even_when_their_evidence_changed(monkeypatch):
+    tc, ws, turn, score, answer, report = _scored_draft(monkeypatch)
+    _read_one_more_passage(tc, ws)
+    seen: list[str] = []
+    done = final_check.finalize(tc._judge(score, seen=seen), ws, answer, report, turn, question="?", usage=[],
+                                deadline=time.monotonic() - 1)
+    assert seen == []  # no allowance left: the draft's verdicts stand, nothing is withheld for a changed passage
+    assert done.composition.answer.answer_markdown.startswith(tc.V1_MD)
+    assert [o["status"] for o in report.requirement_outcomes()] == ["full", "full"]

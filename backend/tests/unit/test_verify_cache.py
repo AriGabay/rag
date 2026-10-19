@@ -1142,3 +1142,45 @@ def test_a_sentence_restored_after_a_bullet_anchor_carries_the_list_lead_and_los
     merged, back = _restored(first, repaired)
     assert len(back) == 1
     assert merged == "- השווי למ\"ר הוא 9,500 ₪ [S1].\n- דמי השכירות הם 55 ₪ למ\"ר לחודש [S1].\n- הנכס פנוי [S1]."
+
+
+# --- round 17 U1: a carried requirement score is admitted only while its units and its component's evidence are unchanged --------
+
+def _scored_cache():
+    """A cache holding one verification of THREE with the requirements scored (N1 given by the value line, N2 by the rent line)."""
+    ws, cache, turn = _ws(), VerdictCache(), TurnRequirements()
+    p = _judge(score=_by_words(["השווי למ\"ר", "דמי השכירות"]))
+    answer = _answer(THREE)
+    verify_answer(p, answer, ws, "?", [], requirements=turn, cache=cache, item_version=1)
+    units = verify.split_units(THREE)
+    return cache, units, dict(enumerate(cache.last.keys))
+
+
+def test_reuse_carries_the_scores_of_unchanged_units_and_reports_the_ones_it_did_not_carry():
+    cache, units, keys = _scored_cache()
+    verdicts, carried, refused = cache.reuse(units, units, keys)
+    assert sorted(verdicts) == [0, 1, 2] and sorted(v.id for v in carried) == ["N1", "N2"] and refused == []
+    changed = dict(keys) | {1: "another-key"}  # the rent line changed: N2 (given by it) is scored again with the unit it gave with
+    verdicts, carried, refused = cache.reuse(units, units, changed)
+    assert [v.id for v in carried] == ["N1"] and [(v.id, why) for v, why in refused] == [("N2", verify.RESCORED)]
+
+
+def test_reuse_refuses_a_score_the_evidence_test_refuses_and_returns_its_giving_units_to_the_fresh_ones():
+    cache, units, keys = _scored_cache()
+    gave = {i for v in cache.last.votes if v.id == "N2" for i in v.units}
+    assert gave and gave != {0, 1, 2}
+    verdicts, carried, refused = cache.reuse(
+        units, units, keys, lambda v: verify.EVIDENCE_CHANGED if v.id == "N2" else None)
+    assert [v.id for v in carried] == ["N1"] and [(v.id, why) for v, why in refused] == [("N2", verify.EVIDENCE_CHANGED)]
+    assert not gave & set(verdicts) and set(verdicts) == {0, 1, 2} - gave  # judged fresh in this same round, with no cached verdict
+    assert sorted(i for i in verdicts) != [0, 1, 2]
+
+
+def test_a_carried_score_keeps_the_version_it_was_cast_on_through_every_round():
+    ws, cache, turn = _ws(), VerdictCache(), TurnRequirements()
+    p = _judge(score=_by_words(["השווי למ\"ר", "דמי השכירות"]))
+    for version in (1, 2, 3, 4):  # the same answer four times (the second round scores the components just derived once more)
+        report = verify_answer(p, _answer(THREE), ws, "?", [], requirements=turn, cache=cache, item_version=version)
+    stamps = [v._stamp for votes in report.requirement_votes.values() for v in votes]
+    assert {s["version"] for s in stamps} <= {1, 2} and {s["origin"] for s in stamps} == {"carried"}  # none is of version 3 or 4
+    assert report.version == 4 and report.requirement_decisions["N1"]["rests_on"][0]["version"] == 1

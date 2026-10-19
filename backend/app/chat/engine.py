@@ -581,7 +581,7 @@ class TurnOutcome:
     # message is hidden when the user loses access to one (``api._answer_documents``)
     shown_documents: list[str] = field(default_factory=list)
     # per verification round, what the requirements judge returned for each component and what the server did with its support
-    # (``VerifyReport.requirements_trace``); diagnostics only, [{"round": the number in ``rounds``, "components": [...]}]
+    # (``VerifyReport.requirements_trace``); diagnostics only, [{"round": the number in ``rounds``, "version": the answer version, "components": [...]}]
     requirements_trace: list[dict] = field(default_factory=list)
     # the turn's item ledger (round 17 U3, KTD2, KTD3): each item with its state against the units that stand, and the items
     # validation excluded with their reasons (``VerifyReport.item_diagnostics``); diagnostics only, {} when the turn had none
@@ -1131,7 +1131,9 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         rounds.append([p.as_dict() for p in report.problems])
         try:
             if components := report.requirements_trace():
-                traces.append({"round": len(rounds), "components": components})
+                # ``round``: the number in ``rounds`` (restored-claim entries count there too); ``version``: the answer version the
+                # scores were cast on (the decisions and votes of the trace are tagged with it, round 17 U1)
+                traces.append({"round": len(rounds), "version": attempt + 1, "components": components})
         except Exception:  # noqa: BLE001 - a diagnostics record never fails the turn
             logger.warning("chat requirements trace failed", exc_info=True)
         reused += report.reused

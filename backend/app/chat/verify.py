@@ -111,6 +111,14 @@ found or did about it (``<workspace>``: values, measurements, calculations, fail
 searches, readings). Instruction components reach the judge as a separate list (``<instructions>``), scored against
 the shown answer as a whole (round 7 KTD2).
 
+Round 17 U1 (KTD1, R1-R3): a component's status is decided on the answer version the user will see. Every score is stamped with the
+version it scored (the digest of the ordered unit keys and the read evidence, ``_answer_digest``) and its call's units; a score of an
+earlier round is carried (``VerdictCache.reuse``, the whole-answer carry, ``final_check``'s re-score) only while the units it rests on
+and its component's evidence (``_Evidence``: the passages read for it, the related evidence it named, its ledger items) are unchanged,
+and a refused score's units are judged fresh in the same round. The decision merges the version's fresh batch scores with the
+admitted carried ones by best status and the server's validated evidence of a missing part then caps it at ``partial``
+(``requirement_decisions``, with the scores each rests on); the scores it does not rest on are ``requirement_history``.
+
 Scores are merged by id into one status per component (``VerifyReport.requirement_outcomes``, round 7 KTD3, R6,
 R7): ``full`` or ``partial`` only through a unit that survived verification — a component given only by removed
 units is ``not_answered``, with those units kept (``removed_units``) so its reason is "removed in verification"; a
@@ -230,7 +238,7 @@ from app.providers.llm import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from app.chat.calc import Computation
     from app.chat.engine import FinalAnswer
@@ -513,6 +521,14 @@ TRACE_ITEMS_PER_COMPONENT = 24  # ledger items kept per component in the trace
 TRACE_VOTES_PER_COMPONENT = 8  # votes (judge calls) kept per component and round
 TRACE_COMPONENTS = 40  # components kept per round
 TRACE_PASSAGE_IDS = 60  # passage ids kept per call
+# why a score of an earlier round is not what a component's decision rests on (round 17 U1, KTD1): ``RESCORED`` — a unit it gave
+# changed (or it named none), so this round's calls scored the component again; ``EVIDENCE_CHANGED`` — the passages the turn read
+# for the component (or the related evidence it named, or the component's items) changed since it was cast; ``OVERRULED_*`` —
+# the score stands but the server's validated evidence of a missing part (R2) lowers the component below it
+RESCORED = "rescored"
+EVIDENCE_CHANGED = "evidence_changed"
+OVERRULED_SUPPORT = "overruled_by_validated_support"
+OVERRULED_ITEMS = "overruled_by_omitted_items"
 SUPPORT_QUOTE_MIN = 6  # the least a support quote may hold, in characters after normalisation
 SUPPORT_QUOTE_MAX = 300  # the most: a quote is one sentence or table row, never a passage (a longer one is dropped silently)
 REQ_NOT_SEARCHED = ("חלק של הבקשה שהתשובה לא נתנה: «{text}». לא בוצע חיפוש או קריאה שמכסים אותו: יש לחפש אותו "
@@ -770,6 +786,11 @@ class JudgeRequirement(_Strict):
     # diagnostics only, never in the provider's schema: the call this vote came from, its read passages and what became of each
     # support entry (``_Coverage.accept``, ``validated_support``); travels with the vote, also when a later round carries it
     _trace: dict | None = PrivateAttr(default=None)
+    # diagnostics and admission, never in the provider's schema (round 17 U1, KTD1): the answer version this vote scored (``version``
+    # number, ``digest``), the unit indexes of its call (``units``), what its call could see for the component (``passages``,
+    # ``items``: signatures, ``ids``: the passages and related ids behind ``passages``) and whether this round's call made it
+    # (``origin`` ``fresh``) or an earlier round did (``carried``, with the version it was cast on). None: a hand-built vote
+    _stamp: dict | None = PrivateAttr(default=None)
 
 
 class JudgeCoverageOutput(JudgeOutput):
@@ -1130,38 +1151,49 @@ class VerdictCache:
     last: _Round | None = None
     records: dict[str, ClaimRecord] = field(default_factory=dict)
 
-    def reuse(self, units: list[Unit], to_judge: list[Unit],
-              keys: dict[int, str]) -> tuple[dict[int, JudgeVerdict], list[JudgeRequirement]]:
+    def reuse(self, units: list[Unit], to_judge: list[Unit], keys: dict[int, str],
+              admit: Callable[[JudgeRequirement], str | None] | None = None
+              ) -> tuple[dict[int, JudgeVerdict], list[JudgeRequirement], list[tuple[JudgeRequirement, str]]]:
         """The cached verdicts of the units to judge that the last verification judged unchanged, at their indexes
-        now, and the last verification's requirement scores that rest on them alone (moved to those indexes, with the
-        units they marked as saying it is missing). A unit that gave a requirement with a unit that changed is judged
-        again, so the requirement is scored on the two together."""
+        now, the last verification's requirement scores that rest on them alone (moved to those indexes, with the
+        units they marked as saying it is missing), and the scores that were not carried with the reason. A unit that gave a
+        requirement with a unit that changed is judged again, so the requirement is scored on the two together.
+
+        A carried score is admitted only while its units are unchanged and the evidence of its component is (round 17 U1,
+        KTD1): ``admit`` gives the reason a score is refused (its component's evidence changed since it was cast), None when it
+        stands. The units of a refused score join the units judged fresh in this same round, as those of a score that
+        gave with a changed unit do: the component is then scored over its own units by this round's calls, and no call is
+        added."""
         last = self.last
         if last is None:
-            return {}, []
+            return {}, [], []
         known = len(last.keys)
         # the units the deterministic checks removed last time: shown to its calls as removed (round 7 KTD5), they
         # gave nothing that counted, so a score naming them rests on its other units alone
         dropped = {n for n, (_, failed) in enumerate(last.signature[0] if last.signature else ()) if failed}
+        stale = {id(v): why for v in last.votes if admit is not None and (why := admit(v))}
         candidates = {u.index for u in to_judge if keys[u.index] in self.verdicts}
         while True:
             moved = _match(last.keys, [(i, keys[i]) for i in sorted(candidates)])
             keep = set(moved.values())
             for v in last.votes:
                 refs = [i for i in v.units if i < known and i not in dropped]
-                if v.status in ("full", "partial") and any(i not in moved for i in refs):
+                if (v.status in ("full", "partial") and any(i not in moved for i in refs)) or id(v) in stale:
                     keep -= {moved[i] for i in refs if i in moved}
             if keep == candidates:
                 break
             candidates = keep
-        carried = []
+        carried, refused = [], []
         for v in last.votes:
             refs = [i for i in v.units if i < known and i not in dropped]
-            if not refs or any(i not in moved for i in refs):
-                continue  # scored again by this verification's calls
-            carried.append(v.model_copy(update={"units": [moved[i] for i in refs],
-                                                "absent": [moved[i] for i in v.absent if i in moved]}))
-        return {i: self.verdicts[keys[i]].model_copy(update={"index": i}) for i in candidates}, carried
+            if id(v) in stale:
+                refused.append((v, stale[id(v)]))
+            elif not refs or any(i not in moved for i in refs):
+                refused.append((v, RESCORED))  # scored again by this verification's calls
+            else:
+                carried.append(v.model_copy(update={"units": [moved[i] for i in refs],
+                                                    "absent": [moved[i] for i in v.absent if i in moved]}))
+        return {i: self.verdicts[keys[i]].model_copy(update={"index": i}) for i in candidates}, carried, refused
 
 
 def _match(old: list[str], new: list[tuple[int, str]]) -> dict[int, int]:
@@ -1505,7 +1537,15 @@ class VerifyReport:
     judged: bool = False
     judge_status: str | None = None
     requirements: list[dict] = field(default_factory=list)  # the turn's frozen requirements, when they were judged
-    requirement_votes: dict[str, list[JudgeRequirement]] = field(default_factory=dict)  # per id, per judge call
+    # the scores the current decisions are merged from (round 17 U1, KTD1): this round's judge calls (``origin`` fresh) and the
+    # scores of the turn's earlier rounds that were admitted (carried: their units and their component's evidence unchanged),
+    # per id, each stamped with the answer version it scored (``JudgeRequirement._stamp``). The scores that were not admitted
+    # are ``refused`` and, with the ones the server's evidence overruled, the ``requirement_history``
+    requirement_votes: dict[str, list[JudgeRequirement]] = field(default_factory=dict)
+    version: int = 0  # the answer version this verification judged (the turn's attempt number), and its digest (``_answer_digest``)
+    digest: str = ""
+    refused: dict[str, list[dict]] = field(default_factory=dict)  # per id: the earlier scores not admitted, with the reason
+    answer_ids: set[str] = field(default_factory=set)  # the ids the answer cited when the scores were cast (``_Evidence``)
     # the judge's support the server validated (round 16 U2, KTD2), merged by component id across the calls: component ->
     # [{"id": a read S#, "quote": its verbatim sentence or row}] that the answer omits (``validated_support``)
     text_support: dict[str, list[dict]] = field(default_factory=dict)
@@ -1946,7 +1986,7 @@ class VerifyReport:
         if kept is None:
             gone = self.removed_units()
             kept = {u.index for u in self.units if u.index not in gone}
-        units = [u for u in self.units if u.index in kept]
+        units = [self._as_edited(u) for u in self.units if u.index in kept]
         states = ledger.outcomes(units, self.item_ws)
         texts = {r["id"]: r["text"] for r in self.requirements}
         for st in states:
@@ -1957,6 +1997,26 @@ class VerifyReport:
                     and not _in_answer(st["quote"], units, texts.get(st["component"], "")):
                 st |= {"state": "omitted", "covered_by": None, "why": "value_not_stated"}
         return states
+
+    def _as_edited(self, u: Unit) -> Unit:
+        """The unit as it reads once the server's edits of its own words are applied: the spans the edit ladder cuts
+        (``cuts``) and the qualifier words it takes out (``qualifier_edits``) are gone, so an item stated only in a cut claim is
+        not covered by the sentence that stays (round 17 U1; the ledger reads the text the user will see, not the draft's)."""
+        spans = sorted((g.start - u.start, g.end - u.start) for g in self.cuts.get(u.index, [])) + sorted(
+            (q.start - u.start, q.end - u.start) for q in self.qualifier_edits.get(u.index, []))
+        spans = sorted((max(a, 0), min(b, len(u.raw))) for a, b in spans if a < len(u.raw) and b > 0)
+        if not spans:
+            return u
+        kept, at = [], 0
+        for a, b in spans:
+            if a >= at:
+                kept.append(u.raw[at:a])
+                at = b
+            else:
+                at = max(at, b)
+        kept.append(u.raw[at:])
+        raw = "".join(kept)
+        return dataclasses.replace(u, raw=raw, text=_IDS.sub("", raw).strip(), ids=ids_in(raw))
 
     def item_listing(self, kept: set[int] | None = None) -> list[dict]:
         """The ledger as the requirements call is shown it (``_Coverage.items``): each item's id, component, label, source, quote,
@@ -1984,28 +2044,88 @@ class VerifyReport:
             return {}
         return {"items": self.item_states(), "excluded": list(ledger.excluded)}
 
+    @staticmethod
+    def _score_row(v: JudgeRequirement) -> dict:
+        """A score as the decisions and the history name it: the call (None: carried), its status, whether this round's call made
+        it (``fresh``) or an earlier round did (``carried``) and the answer version it was cast on (None: built by hand)."""
+        stamp, trace = v._stamp or {}, v._trace or {}
+        return {"call": trace.get("call"), "status": v.status, "origin": stamp.get("origin", "fresh"),
+                "version": stamp.get("version"), "units": list(v.units)}
+
+    @property
+    def requirement_decisions(self) -> dict[str, dict]:
+        """The current decision of every component, keyed by id (round 17 U1, KTD1, R3): ``status`` as ``requirement_outcomes``
+        merges it, the ``version`` and ``digest`` of the answer it is for, ``rests_on`` — the scores the status rests on, each
+        ``fresh`` (this round's call) or ``carried`` with the version it was cast on —, the ``caps`` of the server's evidence
+        that lowered it (R2), the ``evidence`` ids its scores saw and ``reused``: it rests on carried scores alone, no call of
+        this version made it. A parent's status comes from its children (``from_children``). Computed from the report's present
+        state; earlier versions' scores are in ``requirement_history`` and never feed it."""
+        notes: dict[str, dict] = {}
+        return self._decisions(self._resolve(None, notes), notes)
+
+    def _decisions(self, outcomes: list[dict], notes: dict[str, dict]) -> dict[str, dict]:
+        out = {}
+        for o in outcomes:
+            note = notes[o["id"]]
+            rows = [self._score_row(v) for v in note["voters"]]
+            ids = [x for v in note["voters"] for x in (v._stamp or {}).get("ids", [])]
+            ids += [x["id"] for x in o.get("support") or []]
+            out[o["id"]] = {"id": o["id"], "status": o["status"], "version": self.version, "digest": self.digest,
+                            "reused": bool(rows) and all(r["origin"] == "carried" for r in rows), "rests_on": rows,
+                            "caps": list(note["caps"]), "evidence": list(dict.fromkeys(ids))[:TRACE_PASSAGE_IDS],
+                            "from_children": list(o["children"])}
+        return out
+
+    @property
+    def requirement_history(self) -> dict[str, list[dict]]:
+        """The scores of earlier versions and of this one that the current decisions do not rest on (round 17 U1, R3), per
+        component, each with the answer version it was cast on and why it is not what the decision rests on: ``rescored`` (a unit it
+        gave changed, so this round's calls scored the component again), ``evidence_changed`` (the passages read for the component
+        changed), or overruled by the server's validated evidence of a missing part (R2). Diagnostics only."""
+        notes: dict[str, dict] = {}
+        self._resolve(None, notes)
+        out = {cid: [dict(row) for row in rows] for cid, rows in self.refused.items()}
+        for cid, note in notes.items():
+            out.setdefault(cid, []).extend(self._score_row(v) | {"why": why} for v, why in note["overruled"])
+        return {cid: rows for cid, rows in out.items() if rows}
+
     def requirements_trace(self) -> list[dict]:
         """Per request component, what the requirements judge returned and what the server did with its support (diagnostics
         only; owner and admin): the component's id and final merged status (``requirement_outcomes``), and one entry per judge
         call that scored it — the call's number (``None``: a score carried from the turn's earlier round), its status and
         ``missing`` text, whether its ``<read_passages>`` was rendered with its size and the ``S#`` ids it held, and every
         support entry the judge returned: ``id``, the first ``TRACE_QUOTE_CHARS`` characters of the quote and its outcome
-        (``accepted``, or the first condition it failed). Bounded; never more document text than the quote prefix."""
+        (``accepted``, or the first condition it failed). Bounded; never more document text than the quote prefix.
+
+        Round 17 U1: each score also says the answer version it was cast on (``version``), whether it is ``fresh`` or ``carried``
+        and its call's units; ``history`` lists the scores of earlier versions the decision does not rest on, with the reason
+        (no document text), and ``decision`` is the component's current decision (``requirement_decisions``)."""
         if not self.requirements:
             return []
-        final = {o["id"]: o["status"] for o in self.requirement_outcomes()}
+        notes: dict[str, dict] = {}
+        outcomes = self._resolve(None, notes)
+        final = {o["id"]: o["status"] for o in outcomes}
+        decisions = self._decisions(outcomes, notes)
+        history = self.requirement_history
         ledger_items = self.item_states()
         out = []
         for r in self.requirements[:TRACE_COMPONENTS]:
             votes = []
             for v in self.requirement_votes.get(r["id"], [])[:TRACE_VOTES_PER_COMPONENT]:
-                t = v._trace
+                t, stamp = v._trace, v._stamp or {}
+                tag = {"version": stamp.get("version"), "origin": stamp.get("origin", "fresh"),
+                       "call_units": stamp.get("call_units", [])}
                 if t is None:  # a score no judge call of this verification made (a hand-built report)
                     votes.append({"call": None, "reused": False, "status": v.status, "passages": None,
-                                  "missing": v.missing[:TRACE_MISSING_CHARS], "support": [], "support_omitted": 0})
+                                  "missing": v.missing[:TRACE_MISSING_CHARS], "support": [], "support_omitted": 0} | tag)
                 else:
-                    votes.append({k: val for k, val in t.items() if k != "_index"} | {"support": [dict(e) for e in t["support"]]})
-            entry = {"id": r["id"], "final_status": final.get(r["id"]), "votes": votes}
+                    votes.append({k: val for k, val in t.items() if k != "_index"} | {"support": [dict(e) for e in t["support"]]} | tag)
+            decision = decisions[r["id"]]
+            kept = history.get(r["id"], [])
+            entry = {"id": r["id"], "final_status": final.get(r["id"]), "votes": votes,
+                     "history": kept[:TRACE_VOTES_PER_COMPONENT], "history_omitted": max(0, len(kept) - TRACE_VOTES_PER_COMPONENT),
+                     "decision": decision | {"rests_on": decision["rests_on"][:TRACE_VOTES_PER_COMPONENT],
+                                             "rests_omitted": max(0, len(decision["rests_on"]) - TRACE_VOTES_PER_COMPONENT)}}
             if mine := [i for i in ledger_items if i["component"] == r["id"]]:  # round 17 U3: the ledger and its outcomes
                 entry["items"] = [{"id": i["id"], "origin": i["origin"], "source": i["source"], "state": i["state"],
                                    "declared": i["declared"], "why": i["why"], "covered_by": i["covered_by"],
@@ -2033,7 +2153,17 @@ class VerifyReport:
           partial; every one needing clarification — needs clarification; otherwise not answered.
 
         ``absence_units``: the units that say it is missing (marked ``absent``, or named by a missing score).
-        ``related``: the workspace ids the calls named. ``stated`` is set by the server when it states the gap."""
+        ``related``: the workspace ids the calls named. ``stated`` is set by the server when it states the gap.
+
+        The scores are the ones of this verification's version (``requirement_votes``: its fresh calls and the admitted carried
+        scores), merged by best status, and then the server's evidence of a missing part caps the merge (round 17 U1, KTD1, R2):
+        a full component with validated support (``validated_support``) or an omitted ledger item is at most ``partial``, whatever
+        any score says. ``requirement_decisions`` is the same merge with the scores each decision rests on."""
+        return self._resolve(applied, None)
+
+    def _resolve(self, applied: FinalAnswer | None, notes: dict[str, dict] | None) -> list[dict]:
+        """``requirement_outcomes``; ``notes`` (when given) receives, per component, the scores its status rests on (``voters``), the
+        scores a cap overruled (``overruled``) and the caps that applied (``caps``)."""
         errors = self.removed_units()
         kept = {u.index for u in self.units if u.index not in errors}
         if applied is not None and errors and not _IDS.search(applied.answer_markdown):
@@ -2066,6 +2196,9 @@ class VerifyReport:
             live = {id(v): [i for i in v.units if i in kept and self.gives(v, i)] for v in votes}
             given = [v for v in offered if live[id(v)]]
             absent = [v for v in votes if v.status in ("missing", "undeterminable")]
+            note = {"voters": [], "overruled": [], "caps": []}
+            if notes is not None:
+                notes[r["id"]] = note
             o = {"id": r["id"], "text": r["text"], "calculation": bool(r.get("calculation")), "kind": kind,
                  "aspect": r.get("aspect") or "", "parent": r.get("parent") or "",
                  "conditional": bool(r.get("conditional")), "subject": r.get("subject") or "",
@@ -2084,6 +2217,7 @@ class VerifyReport:
                  # evidence (a part of the asked kind that a read source states and the answer does not give)
                  "support": [x for x in self.text_support.get(r["id"], [])
                              if (r["id"], x["id"], SupportScope.flat(x["quote"])) not in closed]}
+            validated = list(o["support"]) if kind in SEARCHABLE_KINDS else []  # the judge's validated part: evidence of a gap (R2)
             omitted = omitted_by.get(r["id"], []) if kind in SEARCHABLE_KINDS else []
             if omitted:
                 # the judge's items first (the component's own gap line names the place of the first part): the part the judge
@@ -2102,8 +2236,10 @@ class VerifyReport:
                 status = best.status if best is not None and best.status in ("full", "partial") else "not_answered"
                 o |= {"check": "judge", "status": status, "reason": best.reason if best is not None else "",
                       "units": sorted({i for i in (best.units if best else []) if i in kept})}
+                note["voters"] = [best] if best is not None else []
             elif given:
                 best = min(given, key=lambda v: _RANK[v.status])
+                note["voters"] = [v for v in given if v.status == best.status]
                 o |= {"status": best.status, "reason": best.reason,
                       "units": sorted({i for v in given if v.status == best.status for i in live[id(v)]})}
                 if best.status == "partial":
@@ -2120,8 +2256,19 @@ class VerifyReport:
                 if kind == "calculation" and self.pending_parameters.get(r["id"]):
                     status = "needs_clarification"  # waiting for the user's detail (KTD9), not missing data
                 o |= {"status": status, "reason": (absent or votes)[0].reason if votes else ""}
-            if omitted and o["status"] == "full":
-                o["status"] = "partial"  # a required item no surviving unit gives: at most partial, whatever a vote says (R2, R6)
+                note["voters"] = absent or votes
+            if o["status"] == "full" and (omitted or validated):
+                # a required item no surviving unit gives, or a part of the asked kind a read passage states that the answer
+                # omits (validated, ``validated_support``): at most partial, whatever any score says (R2, R6)
+                o["status"] = "partial"
+                note["caps"] = (["validated_support"] if validated else []) + (["omitted_items"] if omitted else [])
+                partial = [v for v in votes if v.status == "partial"]
+                o["missing_part"] = o["missing_part"] or (_common_missing(partial) if partial else "")
+                lower = [v for v in given if v.status == "partial"]
+                if lower:  # a score that gave less stands; the better scores are overruled by the evidence
+                    note["overruled"] = [(v, OVERRULED_SUPPORT if validated else OVERRULED_ITEMS) for v in given
+                                         if v.status == "full"]
+                    note["voters"] = lower
             o["pending_parameters"] = list(self.pending_parameters.get(r["id"]) or [])
             out[r["id"]] = o
 
@@ -5030,14 +5177,103 @@ class _VoteTrace:
 
 def _carried(votes: list[JudgeRequirement]) -> list[JudgeRequirement]:
     """Scores kept from an earlier verification of the turn, their traces marked as reused (no call of this round made them) and
-    copied, so the support outcomes of this round do not change what the earlier round recorded."""
+    copied, so the support outcomes of this round do not change what the earlier round recorded. Their stamp keeps the version
+    they were cast on and says they are carried (round 17 U1)."""
     out = []
     for v in votes:
         c = v.model_copy()
         if v._trace is not None:
             c._trace = {**v._trace, "reused": True, "call": None, "support": [dict(e) for e in v._trace["support"]]}
+        if v._stamp is not None:
+            c._stamp = {**v._stamp, "origin": "carried"}
         out.append(c)
     return out
+
+
+def refused_by_evidence(refused: list[tuple[JudgeRequirement, str]]) -> bool:
+    """Whether a score of the last round was refused because its component's evidence changed (``VerdictCache.reuse``)."""
+    return any(why == EVIDENCE_CHANGED for _, why in refused)
+
+
+def _answer_digest(units: list[Unit], keys: dict[int, str], coverage: _Coverage, ws: Workspace) -> str:
+    """The answer version's digest (round 17 U1, KTD1): the ordered unit keys of the whole answer and the workspace signature of
+    the read evidence (the workspace listing the calls are shown, and the content of every source the turn returned)."""
+    read = sorted((sid, _sha(ws.sources[sid].text)[:12]) for sid in returned_text_sources(ws))
+    return _sha([[keys[u.index] for u in units], _sha(coverage.workspace), read])
+
+
+def _sha(value) -> str:
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, default=str).encode()).hexdigest()[:16]
+
+
+class _Evidence:
+    """What a requirements call could see for each component, as signatures (round 17 U1, KTD1). ``passages``: the passages the turn
+    read that bear on the component — the returned sources of the asked units and documents that share a number or a content word
+    with its text (the rule of ``_read_passages``, independent of the batch that cites them) — with the content of each, and the
+    related evidence the score named; ``items``: the component's ledger items with their states. A score stamped with these
+    (``stamp``) is admitted later (``refusal``) only while both are what they were: a passage read since that bears on the
+    component, a source whose text changed, or an item that opened or closed is new evidence the score did not weigh."""
+
+    def __init__(self, ws: Workspace, requirements: list[dict], answer_ids: set[str], items: list[dict] | None = None):
+        self.ws = ws
+        self.texts = {r["id"]: r["text"] for r in requirements}
+        self.answer_ids = answer_ids
+        self._items: dict[str, list[tuple[str, str]]] = {}
+        for i in items or ():
+            self._items.setdefault(i["component"], []).append((i["id"], i["state"]))
+        self._pool: list[tuple[str, str, tuple[Segment, ...]]] | None = None
+        self._signatures: dict[tuple, dict] = {}
+
+    def pool(self) -> list[tuple[str, str, tuple[Segment, ...]]]:
+        """(S#, digest of its text, its segments) of the returned sources a call may be shown for this answer, once."""
+        if self._pool is None:
+            from app.chat import intent as intent_mod
+
+            ws = self.ws
+            asked = _asked_unit_ids(ws, self.answer_ids)
+            documents = _documents_of(ws, self.answer_ids)
+            professional = getattr(ws, "intent", None) in (intent_mod.PROFESSIONAL, intent_mod.MIXED)
+            opened = set(read_source_ids(ws))
+            self._pool = []
+            for sid in sorted(returned_text_sources(ws), key=_sid_no):
+                src = ws.sources[sid]
+                if (src.source_kind != source_kinds.APPRAISAL and not professional) or (
+                        src.unit is not None and src.unit.get("id") not in asked) or (
+                        sid not in opened and str(src.document_id) not in documents):
+                    continue
+                parts = _source_parts(ws, sid)
+                if parts is not None:
+                    self._pool.append((sid, _sha(src.text)[:12], segments_of(parts[1], parts[2])))
+        return self._pool
+
+    def signature(self, cid: str, related: list[str] | tuple[str, ...] = ()) -> dict:
+        """The component's evidence signatures and the ids behind them."""
+        key = (cid, tuple(related))
+        if key not in self._signatures:
+            self._signatures[key] = self._sign(cid, related)
+        return self._signatures[key]
+
+    def _sign(self, cid: str, related: list[str] | tuple[str, ...]) -> dict:
+        text = self.texts.get(cid, "")
+        seen = [(sid, digest) for sid, digest, segs in self.pool() if _relevance([text], segs) > 0]
+        named = [(x, _sha(self.ws.sources[x].text)[:12] if x in self.ws.sources else "") for x in dict.fromkeys(related)]
+        return {"passages": _sha([seen, named]), "items": _sha(sorted(self._items.get(cid, ()))),
+                "ids": [x for x, _ in [*seen, *named]][:TRACE_PASSAGE_IDS]}
+
+    def stamp(self, vote: JudgeRequirement, version: int, digest: str) -> None:
+        """Stamp a score this round's call made with the answer version it scored and what its call could see."""
+        vote._stamp = {**(vote._stamp or {}), "version": version, "digest": digest, "origin": "fresh",
+                       **self.signature(vote.id, vote.related)}
+
+    def refusal(self, vote: JudgeRequirement, *, items: bool = True) -> str | None:
+        """Why a score of an earlier round is not admitted now (``EVIDENCE_CHANGED``), None when its component's evidence is what
+        it was. A score with no stamp (built by hand) is admitted. ``items``: the ledger items count as evidence (the
+        verification, whose calls show them); the final check compares the read passages alone."""
+        stamp = vote._stamp
+        if stamp is None or "passages" not in stamp:
+            return None
+        now = self.signature(vote.id, vote.related)
+        return EVIDENCE_CHANGED if stamp["passages"] != now["passages"] or (items and stamp["items"] != now["items"]) else None
 
 
 def _settle(v: JudgeRequirement, sid: str, quote: str, outcome: str) -> None:
@@ -5126,6 +5362,7 @@ class _Coverage:
                                      "related": [x for x in dict.fromkeys(r.related) if x in self.known],
                                      "missing": missing, "support": self.valid_support(r, trace)})
             v._trace = trace.as_dict(missing, r.missing)
+            v._stamp = {"call_units": sorted(indexes)}
             out.append(v)
         return out
 
@@ -5985,6 +6222,10 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     # derived and scored (a coverage-only call). A unit they removed is shown as removed (KTD5, KTD10): the judge
     # names the component it gave and the conclusions resting on it
     to_judge = [u for u in units if u.index not in failed]
+    # the evidence of each component as a call can see it now (round 17 U1, KTD1): a score of an earlier round is admitted only
+    # while this is what it was (``cache.reuse``, the whole-answer carry below)
+    evidence = _Evidence(ws, requirements.items, coverage.answer_ids, coverage.items) \
+        if coverage is not None and requirements.derived else None
     # (a unit whose qualifier the server edits out is shown too, so the judge names the component it gives: the unit stays)
     removed_shown = [u for u in units if u.index in {p.unit.index for p in report.problems
                                                      if p.removes_unit or p.resolution == "qualifier"}]
@@ -5993,12 +6234,19 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     votes: list[JudgeRequirement] = []
     keys: dict[int, str] = {}
     signature: tuple = ()
-    if cache is not None:
-        # a unit judged earlier in the turn, unchanged, keeps its verdict, and the requirements it gave keep theirs
+    refused: list[tuple[JudgeRequirement, str]] = []
+    if cache is not None or coverage is not None:
         digests: dict[str, str] = {}
         headings = _headings_above(answer.answer_markdown, units)
         keys = {u.index: unit_key(u, ws, request or question, headings[u.index], digests) for u in units}
-        verdicts, votes = cache.reuse(units, to_judge, keys)
+    if coverage is not None:
+        report.version, report.digest = item_version, _answer_digest(units, keys, coverage, ws)
+        report.answer_ids = set(coverage.answer_ids)
+    if cache is not None:
+        # a unit judged earlier in the turn, unchanged, keeps its verdict, and the requirements it gave keep theirs while their
+        # component's evidence is unchanged too (round 17 U1, KTD1)
+        verdicts, votes, refused = cache.reuse(units, to_judge, keys,
+                                               evidence.refusal if evidence is not None else None)
         votes = _carried(votes)
         report.reused = len(verdicts)
         signature = (tuple((keys[u.index], u.index in failed) for u in units),
@@ -6012,8 +6260,9 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
             verdicts[u.index] = JudgeVerdict(index=u.index, verdict="navigation", reason=LEAD_IN_REASON)
     fresh = [u for u in to_judge if u.index not in verdicts]
     if coverage and not fresh:
-        if cache is not None and cache.last is not None and requirements.derived and cache.last.signature == signature:
-            votes = _carried(cache.last.votes)  # the same answer over the same workspace: scored already
+        if (cache is not None and cache.last is not None and requirements.derived and cache.last.signature == signature
+                and not refused_by_evidence(refused)):
+            votes, refused = _carried(cache.last.votes), []  # the same answer over the same workspace: scored already
         else:
             _, scored = _judge_batch(provider, _Batch([], removed=removed_shown), ws, usage, deadline, coverage)
             votes += scored
@@ -6028,6 +6277,15 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 # else the call showed: never reused
                 if v is not None and not [s for s in v.supported_by if s not in u.ids] and not v.depends_on:
                     cache.verdicts[keys[u.index]] = v
+    if coverage is not None:
+        # every score this round's calls made is stamped with the answer version it scored and what its call could see
+        evidence = evidence or _Evidence(ws, requirements.items, coverage.answer_ids, coverage.items)
+        for v in votes:
+            if v._stamp is None or "version" not in v._stamp:
+                evidence.stamp(v, report.version, report.digest)
+        for v, why in refused:
+            if v.id in {r["id"] for r in requirements.items}:
+                report.refused.setdefault(v.id, []).append(report._score_row(v) | {"origin": "carried", "why": why})
     if cache is not None:
         cache.last = _Round([keys[u.index] for u in units], list(votes), signature)
     if to_judge:
