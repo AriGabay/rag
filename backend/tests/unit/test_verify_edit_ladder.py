@@ -44,7 +44,7 @@ RENT_MONTHLY = "שכר דירה חודשי 5,000 ₪"
 RENT_YEARLY = "שכר דירה 5,000 ₪ לשנה"
 ASSERTED = {"period": "model_asserted"}
 EDIT_NOTE = "הוסר ניסוח"  # the removal note's line for an edit starts with this
-REMOVAL_NOTE = "הוסרו מהתשובה"
+REMOVAL_NOTE = "הוסרה טענה"  # a removal note line starts with this (the per-cause sentences, ``verify.REMOVAL_SENTENCES``)
 
 
 def _report(markdown: str, ws, question: str = "?"):

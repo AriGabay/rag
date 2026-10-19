@@ -279,7 +279,8 @@ def test_a_third_adjustment_declared_not_verifiable_with_a_reason_keeps_the_answ
     md = m["answer"]["markdown"]
     assert len(agent.seen) == 3 and checks_of(client, m)[0] == []  # nothing to repair: the item is explicitly dispositioned
     (line,) = [ln for ln in md.splitlines() if ADJ_FLOOR[0] in ln]
-    assert "המקור נקרא בקריאה לא ודאית" in line and "S1" in line
+    # round 18 U7: the agent's reason has words in neither the row nor the request, so the state's own wording stands without it
+    assert "לא ניתן לאמת" in line and "המקור נקרא בקריאה לא ודאית" not in line and "S1" in line
     assert m["answer"]["verification"]["completeness"]["status"] == "full"
 
 

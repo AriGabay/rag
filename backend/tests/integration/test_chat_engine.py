@@ -13,6 +13,7 @@ import re
 import pytest
 from sqlalchemy import text
 
+from app.chat import verify
 from app.db import tenant_tx
 from tests.conftest import login
 from tests.factories import make_office
@@ -159,7 +160,7 @@ def test_a_follow_up_reads_the_earlier_answer_without_the_words_the_server_wrote
     cid = new_conversation(client)
     m = send(client, cid, "מה דמי השכירות והאם הנכס מושכר?")
     md = m["answer"]["markdown"]
-    note = next(line for line in md.split("\n") if "הוסרו מהתשובה" in line)
+    note = next(line for line in md.split("\n") if verify.REMOVAL_SENTENCES["absent_from_source"] in line)
     assert "מושכר" not in md and note in md
     # what U7 saves with the message: the registry of the server's spans (offsets and a kind, never text)
     start = md.index("\n\n> " + note.removeprefix("> "))
@@ -171,4 +172,4 @@ def test_a_follow_up_reads_the_earlier_answer_without_the_words_the_server_wrote
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
     send(client, cid, "ומה עוד?")
     context = second.seen[0][0]["content"]
-    assert "דמי השכירות הראויים הם 55" in context and "הוסרו מהתשובה" not in context
+    assert "דמי השכירות הראויים הם 55" in context and verify.REMOVAL_SENTENCES["absent_from_source"] not in context

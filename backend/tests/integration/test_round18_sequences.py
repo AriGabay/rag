@@ -123,7 +123,17 @@ def ask(client, office, monkeypatch, spec: dict, read_step, answer: str, questio
     login(client, "admin-b@example.test")
     m = send(client, new_conversation(client), question)
     assert m["status"] == "done", m
+    assert_no_false_not_used(m["answer"]["markdown"])
     return m
+
+
+def assert_no_false_not_used(markdown: str) -> None:
+    """Round 18 U7 (R11): no "read and not used" line names an item the answer gives: the name the line carries (the source's own label
+    of the row) is nowhere in the answer's other lines."""
+    lines = markdown.splitlines()
+    for line in (ln for ln in lines if "לא נעשה בו שימוש" in ln and ln.startswith("«")):
+        name = line[1:line.index("»")]
+        assert not any(name in other for other in lines if "לא נעשה בו שימוש" not in other), (name, markdown)
 
 
 def line_with(markdown: str, needle: str) -> str:
@@ -197,6 +207,19 @@ def test_an_amount_written_in_millions_keeps_its_vat_wording_when_the_source_wri
     md = m["answer"]["markdown"]
     assert line_with(md, "16.07") == VAT_ANSWER, md
     assert "הוסר" not in md and "לא צוין" not in md, md
+
+
+def test_ae10_an_item_the_answer_gives_in_millions_against_full_digits_gets_no_read_and_not_used_line(
+        client, office, monkeypatch):
+    """R11 (U7): the item is declared with its full-digit value; the answer writes 16.07 million. The ledger covers it by value form."""
+    item = {"component": "N1", "label": "שווי הנכס בגישת ההשוואה", "source": "S1", "quote": NUMBERS["vat_line"],
+            "value": "16,070,000 ₪", "condition": "", "state": "included", "reason": ""}
+    m = ask(client, office, monkeypatch, NUMBERS, open_section(NUMBERS["vat_heading"]), VAT_ANSWER,
+            "מהו שווי הנכס בגישת ההשוואה, והאם הוא כולל מע״מ?", "שווי הנכס בגישת ההשוואה וסטטוס המע״מ שלו", items=[item])
+    md = m["answer"]["markdown"]
+    assert line_with(md, "16.07") == VAT_ANSWER, md
+    assert "לא נעשה בו שימוש" not in md and "הוסר" not in md, md
+    assert m["answer"]["verification"]["completeness"]["status"] == "full"
 
 
 # --- 5. calculation pages that open with a colon heading (U3) -----------------------------------------------------------
@@ -434,6 +457,7 @@ def test_rows_of_a_cited_rate_table_the_judge_marks_asked_are_added_from_the_tab
     m = send(client, new_conversation(client), RATE_QUESTION)
     assert m["status"] == "done", m
     md = m["answer"]["markdown"]
+    assert_no_false_not_used(md)
     # AE5: the two rows the agent never listed nor wrote are in the answer, from the table already read
     for row in (RATE_SINGLE, RATE_NIGHT, RATE_WEEKEND):
         assert any(row[1] in ln and re.search(r"\[S\d+\]", ln) for ln in md.splitlines()), md
@@ -470,6 +494,7 @@ def test_a_rate_row_the_repair_never_writes_is_stated_as_read_and_not_used_with_
     m = send(client, new_conversation(client), RATE_QUESTION)
     assert m["status"] == "done", m
     md = m["answer"]["markdown"]
+    assert_no_false_not_used(md)
     lines = [ln for ln in md.splitlines() if "לא נעשה בו שימוש" in ln]
     assert [ln.split("»")[0] for ln in lines] == [f"«{RATE_NIGHT[0]}", f"«{RATE_WEEKEND[0]}"], md
     assert all("S1" in ln and "נקרא" in ln for ln in lines) and RATE_SUBSCRIPTION[0] not in md, md

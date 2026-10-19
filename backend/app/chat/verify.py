@@ -935,6 +935,18 @@ def shares_request_word(text: str, forms: set[str]) -> bool:
     return any(_loose_forms(w) & forms for w in _missing_words(text) if not w[0].isdigit())
 
 
+def words_stand_in(phrase: str, *texts: str) -> bool:
+    """Whether every content word of ``phrase`` (a Hebrew or latin word, or a number) stands in one of ``texts``, compared by the loose
+    forms of ``request_word_forms`` (round 18 U7, KTD6): model text in a server line is shown only when this holds, else the server's
+    own wording replaces it. A phrase with no content word says nothing and stands in nothing."""
+    words = _missing_words(phrase)
+    if not words:
+        return False
+    joined = "\n".join(texts)
+    forms, numbers = request_word_forms(joined), numbers_in(joined)
+    return all((numbers_in(w) & numbers) if w[0].isdigit() else bool(_loose_forms(w) & forms) for w in words)
+
+
 # What qualifies a claim (round 9 KTD10, R19–R21): one lexicon, used twice — a cut span holding any of it is never dropped
 # unseen when the final check has no time to judge the remainder (``final_check``), and a supported claim that holds
 # any of it is lost with it from a repair round's answer (``VerifyReport.lost_supported``). Words are compared by their
@@ -1462,6 +1474,17 @@ def removal_summary(kind: str, cause: str = "", component: str | None = None) ->
         {"cause": cause} if cause else {})
 
 
+def removal_lines(removals: list[Problem]) -> list[str]:
+    """The removal note's lines (round 18 U7, R12, KTD6): one per cause, in the order the answer's removals first show it, each the
+    server's fixed sentence for that cause (``removal_summary``: ``REMOVAL_SENTENCES``, or the sentence of the cause a claim could not
+    be checked for) and, when several claims went for it, how many. A removal is never described by a cause it did not have."""
+    counts: dict[str, int] = {}
+    for p in removals:
+        text = p.summary()["text"]
+        counts[text] = counts.get(text, 0) + 1
+    return [f"> {text}" if n == 1 else f"> {text.rstrip('.')} ({n} פעמים)." for text, n in counts.items()]
+
+
 # the server's fixed sentence for each "verified in part" mark on the user's normal path (round 14 U7, R14, KTD9), keyed by the
 # mark's reason class: a failure kind, ``recency`` (the recency check), ``final`` (the final check judged the sentence as saved
 # only partly supported) or ``unspecified`` (a judge that named no concrete defect). Never the claim's text or a judge's words.
@@ -1527,6 +1550,10 @@ class Problem:
     # for a missing qualifier: the server's own, that the result of a conditional calculation (``cite``) is
     # conditional (``conditional_notes``) — written as the server's, never "as written in the source"
     conditional: bool = False
+    # for a conditional result (round 18 U7, KTD6, R12): the reason of the server's note and the result it is about, in words (the
+    # label and number of each value, the number the unit shows) — the note shows these, never a V# or a C#
+    named: str = ""
+    result: str = ""
     defect: str | None = None  # for a judge's partial: the concrete defect it named ("none": none; None: not given)
     # the structured decision (round 7 KTD5, R12): why (``FAILURE_KINDS``), the check that fired (a deterministic
     # check's name, ``judge`` or ``dependency``), the component the unit gave (``N#``, when known), the ids it was
@@ -1684,6 +1711,7 @@ class VerifyReport:
     item_ledger: Ledger | None = None
     item_ws: Workspace | None = None
     item_gaps: list[dict] = field(default_factory=list)
+    request: str = ""  # the request this verification judged (its words, with the components', ground the model text of a server line)
     # the candidates this verification's requirements calls were offered, by K# (``items.Candidate``), and the offer's record (the K# ids,
     # the counts left out): the judge's validated assignments are read against them (``add_candidate_items``), round 18 U6
     candidate_pool: dict = field(default_factory=dict)
@@ -1941,19 +1969,19 @@ class VerifyReport:
 
     def conditional_note(self) -> str:
         """The one caveat of the conditional calculations whose results the surviving text shows (R23, KTD10): a line
-        per distinct reason — "התוצאות C3 ו־C4 מותנות: <reason>" — naming the calculations that share it, in the order
-        the text shows them; "" when there is none. A result removed with its unit is covered by none."""
+        per distinct reason — "התוצאות 20,220,000 ו־10,980,000 מותנות: <reason>" — naming the results that share it in words (the
+        number the text shows, else the calculation's label; the reason names its values by their labels and numbers, round 18 U7),
+        in the order the text shows them; "" when there is none. A result removed with its unit is covered by none."""
         errors = self.removed_units()
-        reasons: dict[str, list[str]] = {}
+        reasons: dict[str, dict[str, str]] = {}
         for p in self.problems:
             if p.annotatable and p.conditional and p.cite and p.unit.index not in errors:
-                ids = reasons.setdefault(p.annotation.removeprefix(CONDITIONAL_LEAD), [])
-                if p.cite not in ids:
-                    ids.append(p.cite)
+                names = reasons.setdefault(p.named or p.annotation.removeprefix(CONDITIONAL_LEAD), {})
+                names.setdefault(p.cite, p.result or p.cite)
         lines = []
-        for reason, ids in reasons.items():
-            named = ids[0] if len(ids) == 1 else ", ".join(ids[:-1]) + " ו־" + ids[-1]
-            line = (CONDITIONAL_NOTE_ONE if len(ids) == 1 else CONDITIONAL_NOTE_MANY).format(ids=named, reason=reason)
+        for reason, names in reasons.items():
+            shown = list(dict.fromkeys(names.values()))
+            line = (CONDITIONAL_NOTE_ONE if len(shown) == 1 else CONDITIONAL_NOTE_MANY).format(ids=_join_and(shown), reason=reason)
             lines.append(line if line.endswith((".", "!", "?")) else line + ".")
         return "\n".join(lines)
 
@@ -2616,13 +2644,17 @@ class VerifyReport:
         # unit shows no number of it, where a citation would join the unit)
         tagged: set[tuple[int, int]] = set()
         for p in notes:
-            at = _after_number(p.unit, p.number or "", p.at) if p.number else None
+            if p.conditional and p.unit.table_span is None:
+                at = _phrase_end(markdown, p.unit)  # after the sentence, never inside its phrase (round 18 U7)
+            else:
+                at = _after_number(p.unit, p.number or "", p.at) if p.number else None
             if at is None and (p.conditional or p.check in NOTE_CHECKS):
                 at = _citation_point(markdown, p.unit)
             if at is not None and not any(a <= at < b for a, b in blocked):
                 if p.conditional:
-                    # the reason is said once, in the conditional note; by the number stays a short tag — none when
-                    # the unit already says its result is conditional, and one per place however many calculations
+                    # the reason is said once, in the conditional note; the short tag stays after the sentence (in a table
+                    # row, by its number) — none when the unit already says its result is conditional, and one per
+                    # place however many calculations
                     if (at, p.unit.index) not in tagged and not _SAYS_CONDITIONAL.search(p.unit.text):
                         edits.append((at, at, f" ({CONDITIONAL_TAG})", "qualifier", ()))
                         tagged.add((at, p.unit.index))
@@ -2649,9 +2681,8 @@ class VerifyReport:
         doc.tidy_blank_lines()
         self.mark_markers(doc.renumber("marker", MARKER))
         # an absence the server replaced is not a claim that failed; a claim not checked is not called unsupported
-        kinds = [p.failure_kind for p in self.removals()]
-        removed = len(kinds)
-        unchecked = kinds.count("not_checked")
+        removals = self.removals()
+        removed = len(removals)
         claims = [c for c in answer.claims if not any(
             c.text.strip() and c.text.strip()[:40] in u.raw for u in self.units if u.index in errors)]
         status = answer.status
@@ -2660,10 +2691,7 @@ class VerifyReport:
         edited = [QUALIFIER_NOTES.get(kind, MSG_QUALIFIER_EDITED).format(label=QUALIFIER_LABELS[kind], n=n)
                   for kind in QUALIFIER_LABELS if (n := sum(1 for q in qualifiers if q.kind == kind))]
         if removed:
-            lines = ([f"> הוסרו מהתשובה {removed - unchecked} טענות שלא נמצאה להן תמיכה במקורות."]
-                     if removed > unchecked else [])
-            lines += [f"> הוסרו מהתשובה {unchecked} טענות שלא ניתן היה לבדוק מול המקורות."] if unchecked else []
-            lines += edited
+            lines = removal_lines(removals) + edited
             if answer.status == "clarification" and doc.text.strip():
                 # the question stays and so does the status (R29): only the note says what went from around it
                 doc.append("\n\n" + "\n>\n".join(lines), "removal_note")
@@ -2871,6 +2899,15 @@ def _citation_point(markdown: str, unit: Unit) -> int:
     return end
 
 
+def _phrase_end(markdown: str, unit: Unit) -> int:
+    """Where a unit ends before its closing punctuation (``.:;!?``): after the citations it ends with, and after all its words."""
+    stripped = markdown[unit.start:unit.end].rstrip()
+    end = unit.start + len(stripped)
+    while end > unit.start and markdown[end - 1] in ".:;!?":
+        end -= 1
+    return end
+
+
 # the unit phrase of a number: its currency and its per-area or area words ("12.11%" is never split from its sign)
 _AFTER_NUMBER = re.compile(
     r"(?:\s*(?:%|₪|ש[\"״]ח|שקלים|שקל(?![א-ת])))?(?:\s*[ל/]?\s?(?:מ[\"״]ר|מטר\s+רבוע|מטר|דונם)(?![א-ת]))?")
@@ -2898,6 +2935,13 @@ def _after_number(unit: Unit, written: str, at: int | None = None) -> int | None
     end = start + len(written)
     tail = _AFTER_NUMBER.match(unit.raw, scale_after(unit.raw, start, end)[1])
     return unit.start + (tail.end() if tail else end)
+
+
+def _shown_result(unit: Unit, written: str | None) -> str | None:
+    """The result as the unit shows it, with its scale word, currency and per-area words ("20.22 מיליון ₪"): how a note names it."""
+    start = _number_start(unit, written, None) if written else None
+    end = _after_number(unit, written) if written else None
+    return None if start is None or end is None else " ".join(unit.raw[start:end - unit.start].split())
 
 
 def _is_duration_or_count(unit: Unit, written: str, at: int | None) -> bool:
@@ -3324,23 +3368,50 @@ def computation_text(c, ws: Workspace | None = None) -> str:
     return "\n".join(lines)
 
 
-def conditional_qualifier(c, stated: bool = False) -> str:
+def _join_and(names: list[str]) -> str:
+    """"א", "א ו־ב", "א, ב ו־ג"."""
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " ו־" + names[-1]
+
+
+_ID_IN_TEXT = re.compile(r"(?<![A-Za-z0-9])[VMCA]\d+(?!\d)")
+
+
+def input_words(ws: Workspace, i: str) -> str:
+    """A value, measurement, assumption or result of the turn in words, for a line the user reads (round 18 U7): «its label» and, for a
+    value, the number as the source writes it. An id the turn does not hold is "the value"."""
+    if i in ws.values:
+        v = ws.values[i]
+        return f"«{v.label}» ({v.written})" if v.label else v.written
+    if i in ws.measurements:
+        return f"«{ws.measurements[i].row.metric}»"
+    if i in ws.assumptions:
+        return f"«{ws.assumptions[i].label}»"
+    if i in ws.computations:
+        return f"«{ws.computations[i].label}»"
+    return "הערך"
+
+
+def conditional_qualifier(c, stated: bool = False, ws: Workspace | None = None) -> str:
     """The server's qualifier for a result of conditional calculation ``c``, from its own record only: the uncertain
     inputs it was computed from (``Computation.uncertain``) and the mix of bases its justification covered — the
     conditions it recorded beside them. ``stated``: the unit already says the result is conditional, so only the
-    reason is given."""
+    reason is given. ``ws``: the qualifier the user reads, which names the inputs in words (``input_words``) instead of by V# and
+    C#; without it, the qualifier the judge is shown (ids)."""
     from app.chat.tools import MSG_UNCERTAIN_INPUTS
+
+    def words(text: str) -> str:
+        return _ID_IN_TEXT.sub(lambda m: input_words(ws, m.group(0)), text) if ws is not None else text
 
     uncertain = list(c.uncertain or [])
     said = MSG_UNCERTAIN_INPUTS.format(ids=", ".join(uncertain)) if uncertain else None
     why = []
     if uncertain:
-        why.append((CONDITIONAL_UNCERTAIN_ONE if len(uncertain) == 1 else CONDITIONAL_UNCERTAIN_MANY).format(
-            ids=", ".join(uncertain)))
-    mix = [x for x in c.outcome.conditional if not (said and x.startswith(said))]
+        ids = _join_and([input_words(ws, i) for i in uncertain]) if ws is not None else ", ".join(uncertain)
+        why.append((CONDITIONAL_UNCERTAIN_ONE if len(uncertain) == 1 else CONDITIONAL_UNCERTAIN_MANY).format(ids=ids))
+    mix = [words(x) for x in c.outcome.conditional if not (said and x.startswith(said))]
     if mix:
         why.append(CONDITIONAL_MIX.format(needs="; ".join(mix)))
-    reason = "; ".join(why) or "; ".join(c.outcome.conditional)
+    reason = "; ".join(why) or words("; ".join(c.outcome.conditional))
     return reason if stated else CONDITIONAL_LEAD + reason
 
 
@@ -7036,7 +7107,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     units = split_units(answer.answer_markdown)
     assign_ids(units, ws.claim_salt)
     report = VerifyReport(units, pending_parameters=pending_parameters(ws, requirements) if requirements is not None
-                          else {})
+                          else {}, request=request or question)
     coverage = None
     if requirements is not None:
         listing, known = _workspace_listing(ws, requirements)
@@ -7108,7 +7179,9 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         # reads the unit with it), so an unhedged sentence is shown as conditional, never lost and never certain
         for cid, number, note in conditional_notes(u, ws):
             report.problems.append(Problem(u, CONDITIONAL_UNSTATED.format(cid=cid, why=note), kind="missing_qualifier",
-                                           number=number, annotation=note, cite=cid, conditional=True))
+                                           number=number, annotation=note, cite=cid, conditional=True,
+                                           named=conditional_qualifier(ws.computations[cid], True, ws),
+                                           result=_shown_result(u, number) or f"«{ws.computations[cid].label}»"))
     if mismatch:
         report.problems.append(Problem(Unit(-1, "", "", []), f"התשובה אינה מציגה את הנתון שהתבקש: {mismatch}",
                                        kind="request"))

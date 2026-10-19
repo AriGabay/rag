@@ -532,7 +532,7 @@ def test_a_result_of_a_conditional_calculation_shown_without_a_hedge_is_kept_wit
     (p,) = [p for p in report.problems if p.annotatable]
     assert p.conditional and p.cite == "C1" and p.number == "20,220,000"
     # only the short tag stays by the number; the reason is said once, in the note (R23)
-    assert "20,220,000 ₪ (תוצאה מותנית) [C1]." in applied.answer_markdown, applied.answer_markdown
+    assert "20,220,000 ₪ [C1] (תוצאה מותנית)." in applied.answer_markdown, applied.answer_markdown
     assert "אינם ודאיים" not in applied.answer_markdown
     assert "כפי שנכתב במקור" not in applied.answer_markdown  # the server's, never presented as the source's
     # shown as conditional, never as verified certainty; not a removal and not a source qualifier
@@ -547,8 +547,8 @@ def test_a_result_of_a_conditional_calculation_shown_without_a_hedge_is_kept_wit
 
 def test_a_conditional_qualifier_names_one_uncertain_input_in_the_singular():
     _, text, _ = _composed(_conditional_sum(("V2",)), "סך העלות הוא 20,220,000 ₪ [C1].")
-    assert "20,220,000 ₪ (תוצאה מותנית) [C1]" in text
-    assert "התוצאה C1 מותנית: הערך V2 אינו ודאי." in text
+    assert "20,220,000 ₪ [C1] (תוצאה מותנית)." in text
+    assert "התוצאה 20,220,000 ₪ מותנית: הערך «חניון תת-קרקעי» (4,620,000) אינו ודאי." in text
 
 
 def test_a_conditional_calculation_on_a_justified_mix_is_qualified_with_the_mix_it_rests_on():
@@ -560,15 +560,15 @@ def test_a_conditional_calculation_on_a_justified_mix_is_qualified_with_the_mix_
 
     text = coverage.compose_components(ws, answer, report)[0].doc.text
     body, note = text.split("\n\n")
-    assert "1,530,000 ₪ (תוצאה מותנית) [C1]." in body and "לפי הצדקה" not in body
-    assert note.startswith("התוצאה C1 מותנית: לפי הצדקה לערבוב נתונים שאינם תואמים — מע״מ:"), note
+    assert "1,530,000 ₪ [C1] (תוצאה מותנית)." in body and "לפי הצדקה" not in body
+    assert note.startswith("התוצאה 1,530,000 ₪ מותנית: לפי הצדקה לערבוב נתונים שאינם תואמים — מע״מ:"), note
 
 
 def test_a_unit_that_already_says_its_result_is_conditional_gets_only_the_short_reason():
     _, body, _ = _composed(_conditional_sum(), "בכפוף לאימות הקלטים, התוצאה מותנית: 20,220,000 ₪ [C1].")
     first, note = body.split("\n\n")
     assert first == "בכפוף לאימות הקלטים, התוצאה מותנית: 20,220,000 ₪ [C1]."  # the unit says it: no tag, no copy
-    assert note == "התוצאה C1 מותנית: הערכים V1, V2 אינם ודאיים."
+    assert note == "התוצאה 20,220,000 ₪ מותנית: הערכים «בנייה עילית» (15,600,000) ו־«חניון תת-קרקעי» (4,620,000) אינם ודאיים."
 
 
 def test_a_wrong_number_for_a_conditional_calculation_is_still_removed_as_a_wrong_calculation():
@@ -594,8 +594,8 @@ def test_a_result_of_a_calculation_that_is_not_conditional_gets_no_qualifier():
 
 def test_a_conditional_result_bound_to_a_unit_that_cites_only_its_inputs_is_qualified_too():
     _, text, _ = _composed(_conditional_sum(), "סך העלות הוא 20,220,000 ₪ [V1][V2].")
-    assert "20,220,000 ₪ (תוצאה מותנית) [V1][V2][C1]" in text
-    assert text.endswith("התוצאה C1 מותנית: הערכים V1, V2 אינם ודאיים.")
+    assert "20,220,000 ₪ [V1][V2][C1] (תוצאה מותנית)." in text
+    assert text.endswith("התוצאה 20,220,000 ₪ מותנית: הערכים «בנייה עילית» (15,600,000) ו־«חניון תת-קרקעי» (4,620,000) אינם ודאיים.")
 
 
 def test_r23_two_results_of_one_calculation_carry_a_short_tag_each_and_one_caveat_names_them():
@@ -607,8 +607,8 @@ def test_r23_two_results_of_one_calculation_carry_a_short_tag_each_and_one_cavea
     body, note = text.split("\n\n")
     # a tag by the result of each sentence that shows it (nothing looks certain), and the reason is not repeated
     assert body.count("(תוצאה מותנית)") == 2 and "אינם ודאיים" not in body
-    assert text.count("אינם ודאיים") == 1 and text.count("התוצאה C1 מותנית") == 1
-    assert note == "התוצאה C1 מותנית: הערכים V1, V2 אינם ודאיים."
+    assert text.count("אינם ודאיים") == 1 and text.count("התוצאה 20,220,000 ₪ מותנית") == 1
+    assert note == "התוצאה 20,220,000 ₪ מותנית: הערכים «בנייה עילית» (15,600,000) ו־«חניון תת-קרקעי» (4,620,000) אינם ודאיים."
     assert [k for t, k in spans if k == "conditional_note"] == ["conditional_note"]
     assert [t for t, k in spans if k == "conditional_note"] == ["\n\n" + note]
     assert report.counts()["conditional"] == 2  # the units are still counted as conditional
@@ -621,7 +621,7 @@ def test_r23_calculations_with_the_same_reason_share_one_line_that_names_all_the
     markdown = "העלות הכוללת היא 20,220,000 ₪ [C1].\nההפרש בין העלויות הוא 10,980,000 ₪ [C2]."
     _, text, spans = _composed(ws, markdown)
     body, note = text.split("\n\n")
-    assert note == "התוצאות C1 ו־C2 מותנות: הערכים V1, V2 אינם ודאיים."
+    assert note == "התוצאות 20,220,000 ₪ ו־10,980,000 ₪ מותנות: הערכים «בנייה עילית» (15,600,000) ו־«חניון תת-קרקעי» (4,620,000) אינם ודאיים."
     assert body.count("(תוצאה מותנית)") == 2 and text.count("אינם ודאיים") == 1
 
 
@@ -632,8 +632,8 @@ def test_r23_calculations_with_different_reasons_get_a_line_each():
     markdown = "העלות הכוללת היא 20,220,000 ₪ [C1].\nההפרש בין העלויות הוא 10,980,000 ₪ [C2]."
     _, text, _ = _composed(ws, markdown)
     note = text.split("\n\n")[1]
-    assert note.split("\n")[0] == "התוצאה C1 מותנית: הערכים V1, V2 אינם ודאיים."
-    assert note.split("\n")[1].startswith("התוצאה C2 מותנית: ") and "בסיס שטח" in note.split("\n")[1]
+    assert note.split("\n")[0] == "התוצאה 20,220,000 ₪ מותנית: הערכים «בנייה עילית» (15,600,000) ו־«חניון תת-קרקעי» (4,620,000) אינם ודאיים."
+    assert note.split("\n")[1].startswith("התוצאה 10,980,000 ₪ מותנית: ") and "בסיס שטח" in note.split("\n")[1]
 
 
 def test_r23_a_conditional_note_is_after_the_body_and_before_the_gap_paragraph():
@@ -665,7 +665,7 @@ def test_r23_a_conditional_note_is_after_the_body_and_before_the_gap_paragraph()
     final, _ = coverage.state_components(ws, answer, report, turn)
     parts = final.answer_markdown.split("\n\n")
     assert len(parts) == 3, parts
-    assert "(תוצאה מותנית)" in parts[0] and parts[1].startswith("התוצאה C1 מותנית") and "דמי הניהול" in parts[2]
+    assert "(תוצאה מותנית)" in parts[0] and parts[1].startswith("התוצאה 20,220,000 ₪ מותנית") and "דמי הניהול" in parts[2]
 
 
 # --- amounts a source states in a scale (R14): "באלפי ₪" -------------------------------------------------------------
@@ -768,7 +768,7 @@ def test_a_sum_of_an_amount_in_thousands_and_an_amount_in_units_is_computed_in_u
 
 def test_the_servers_qualifier_follows_a_result_shown_with_a_scale_word_after_the_word():
     _, applied = _qualified(_conditional_sum(), "סך העלות הוא 20.22 מיליון ₪ [C1].")
-    assert "20.22 מיליון ₪ (תוצאה מותנית) [C1]" in applied.answer_markdown
+    assert "20.22 מיליון ₪ [C1] (תוצאה מותנית)" in applied.answer_markdown
 
 
 @pytest.mark.parametrize("raw, number, after", [
@@ -1153,3 +1153,45 @@ def test_ae5_a_date_or_a_count_that_happens_to_equal_nothing_of_the_result_is_le
     ws = _average(table_writes_average=True)
     units, bound = _bound(ws, "הערכת השווי נעשתה למועד הקובע 15/04/2025 [S2].")
     assert bound == {} and units[0].ids == ["S2"]
+
+
+# --- round 18 U7: a conditional note names the values in words and stands after the phrase (KTD6, R12) ---------------------------
+
+def test_the_conditional_note_names_the_result_and_its_uncertain_values_in_words_never_by_internal_ids():
+    _, text, _ = _composed(_conditional_sum(), "סך העלות הוא 20,220,000 ₪ [C1].")
+    note = text.split("\n\n")[1]
+    assert note == "התוצאה 20,220,000 ₪ מותנית: הערכים «בנייה עילית» (15,600,000) ו־«חניון תת-קרקעי» (4,620,000) אינם ודאיים."
+    assert not re.search(r"\b[VCMA]\d+\b", note)
+    _, text, _ = _composed(_conditional_sum(("V2",)), "סך העלות הוא 20,220,000 ₪ [C1].")
+    assert text.split("\n\n")[1] == "התוצאה 20,220,000 ₪ מותנית: הערך «חניון תת-קרקעי» (4,620,000) אינו ודאי."
+
+
+def test_calculations_that_share_a_reason_are_named_together_by_the_numbers_they_show_in_words():
+    ws = _conditional_sum()
+    _second_conditional(ws)
+    markdown = "העלות הכוללת היא 20,220,000 ₪ [C1].\nההפרש בין העלויות הוא 10,980,000 ₪ [C2]."
+    _, text, _ = _composed(ws, markdown)
+    note = text.split("\n\n")[1]
+    assert note.startswith("התוצאות 20,220,000 ₪ ו־10,980,000 ₪ מותנות: ") and not re.search(r"\b[VCMA]\d+\b", note)
+
+
+def test_a_result_the_unit_shows_no_number_of_is_named_by_the_calculations_label():
+    ws = _conditional_sum()
+    _, text, _ = _composed(ws, "העלות הכוללת של הבנייה והחניון נבדקה [C1].")
+    note = text.split("\n\n")[-1]
+    assert note.startswith("התוצאה «עלות הבנייה והחניון» מותנית: ") and "C1" not in note
+
+
+def test_the_short_tag_of_a_conditional_result_stands_after_its_sentence_not_inside_the_phrase():
+    ws = _conditional_sum()
+    _, text, _ = _composed(ws, "העלות הכוללת היא 20,220,000 ₪ [C1] לפי חישוב המערכת.")
+    body = text.split("\n\n")[0]
+    assert body == "העלות הכוללת היא 20,220,000 ₪ [C1] לפי חישוב המערכת (תוצאה מותנית)."
+    assert "₪ (תוצאה מותנית)" not in body
+
+
+def test_the_short_tag_of_a_conditional_result_in_a_table_row_stays_in_its_cell():
+    ws = _conditional_sum()
+    markdown = "| פריט | סכום |\n| --- | --- |\n| עלות כוללת | 20,220,000 ₪ [C1] |"
+    _, text, _ = _composed(ws, markdown)
+    assert "| עלות כוללת | 20,220,000 ₪ (תוצאה מותנית) [C1] |" in text

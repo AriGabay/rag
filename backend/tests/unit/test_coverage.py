@@ -2272,23 +2272,24 @@ def test_support_for_a_part_the_ledger_already_closed_does_not_reopen_it():
 
 def test_a_not_verifiable_item_with_a_reason_does_not_block_full_and_its_gap_line_names_the_item_the_place_and_the_reason():
     ws = _adj_file()
-    r, turn, answer, _ = _ledger_check(ws, TWO_ADJ, _adj_items(state="not_verifiable", reason="השורה נקראה בקריאה לא ודאית"))
+    # (round 18 U7: the reason is shown because its words stand in the item's row and the request; the item is named by its row)
+    r, turn, answer, _ = _ledger_check(ws, TWO_ADJ, _adj_items(state="not_verifiable", reason="גיל הבניין בין ההתאמות שהשומה יישמה"))
     (o,) = r.requirement_outcomes()
     assert o["status"] == "full" and not _completions(r)
     final, outcomes = _finish(ws, answer, r, turn)
     assert [x["status"] for x in outcomes] == ["full"] and final.status == "answered"
     gap = _gap(final, answer)
-    assert "ההתאמה לגיל הבניין" in gap and "דוח בדיקה" in gap and "S2" in gap and "השורה נקראה בקריאה לא ודאית" in gap
+    assert "«גיל הבניין»" in gap and "דוח בדיקה" in gap and "S2" in gap and "גיל הבניין בין ההתאמות שהשומה יישמה" in gap
     assert "לא נמצא" not in gap and "לא אותר" not in gap
 
 
 def test_a_not_applicable_item_gets_a_gap_line_with_the_request_condition_that_excludes_it():
     ws = _adj_file()
-    r, turn, answer, _ = _ledger_check(ws, TWO_ADJ, _adj_items(state="not_applicable", reason="הבקשה היא לנכס שנבנה אחרי 2020"))
+    r, turn, answer, _ = _ledger_check(ws, TWO_ADJ, _adj_items(state="not_applicable", reason="ההתאמות שהשומה יישמה"))
     final, outcomes = _finish(ws, answer, r, turn)
     assert outcomes[0]["status"] == "full"
     gap = _gap(final, answer)
-    assert "ההתאמה לגיל הבניין" in gap and "הבקשה היא לנכס שנבנה אחרי 2020" in gap and "S2" in gap
+    assert "«גיל הבניין»" in gap and "ההתאמות שהשומה יישמה" in gap and "S2" in gap
 
 
 def test_an_item_still_omitted_after_the_repair_gets_a_line_saying_where_it_was_read_and_that_it_was_not_used():
@@ -2300,7 +2301,7 @@ def test_an_item_still_omitted_after_the_repair_gets_a_line_saying_where_it_was_
     assert o["status"] == "partial" and final.status == "partial"
     assert o["limitation"] == "not_verifiable" and o["variant"] == "read_not_used" and o["stated"] is False  # the item line states it
     gap = _gap(final, answer)
-    assert "ההתאמה לגיל הבניין" in gap and "דוח בדיקה" in gap and "עמוד 4" in gap and "S2" in gap
+    assert "«גיל הבניין»" in gap and "דוח בדיקה" in gap and "עמוד 4" in gap and "S2" in gap
     assert "נקרא" in gap and "לא נעשה בו שימוש" in gap
     assert not re.search(r"לא נמצא|לא אותר|לא מופיע", gap)
     assert gap.count("\n") == 0  # one line for the one item; the component's own gap line is not added beside it
@@ -2383,7 +2384,7 @@ def test_a_part_only_the_judge_named_is_stated_by_its_components_own_line_and_th
     assert o["omitted_items"] == ["I4", "I3"] and o["judge_items"] == ["I4"] and o["stated"] is True
     lines = _gap(final, answer).split("\n\n")
     assert len(lines) == 2 and "החלק נקרא" in lines[0] and "S2" in lines[0]  # round 16's line for the judge's part
-    assert "ההתאמה לגיל הבניין" in lines[1] and FOURTH_ADJ not in lines[1]  # one item line, for the agent's item only
+    assert "«גיל הבניין»" in lines[1] and FOURTH_ADJ not in lines[1]  # one item line, for the agent's item only
 
 
 def test_a_not_answered_component_with_omitted_agent_items_keeps_its_own_gap_line():
@@ -3214,3 +3215,126 @@ def test_the_candidates_block_is_bounded_per_source_and_its_growth_of_the_call_i
                   requirements=_turn({"id": "1", "text": RATE_ASKED}), ledger=ledger_items.Ledger())
     assert "<candidates>" not in bare[0] and len(seen[0]) - len(bare[0]) == len(block) + 1  # nothing else of the call changed
     assert ledger_items.CANDIDATE_SOURCES == 0 and len(block) * 4 <= 0.16 * (verify.JUDGE_CALL_CHARS + verify.READ_PASSAGES_CHARS) + 1
+
+
+# --- round 18 U7: every line the server adds is true; model text in server lines is verified or replaced (KTD6; R11, R12) ------
+
+U7_ROWS = ["נתוני שווי", "פריט | סכום", "שווי השוק | 16,070,000", "דמי ניהול | 45,000"]
+
+
+def _u7_file(*rows: str) -> Workspace:
+    return _file(SOURCE, "\n".join(rows), units=(1, 1), declared=(1,))
+
+
+def _lines_not_used(markdown: str) -> list[str]:
+    return [ln for ln in markdown.splitlines() if "לא נעשה בו שימוש" in ln]
+
+
+def test_ae10_items_written_in_millions_and_thousands_against_full_digit_sources_get_no_read_and_not_used_line():
+    ws = _u7_file(*U7_ROWS)
+    raw = [_adj_item("שווי השוק", "שווי השוק | 16,070,000", "16,070,000"), _adj_item("דמי ניהול", "דמי ניהול | 45,000", "45,000")]
+    r, turn, answer, _ = _ledger_check(ws, "שווי השוק הוא 16.07 מיליון ₪ [S2]. דמי הניהול הם 45 אלף ₪ [S2].", raw)
+    final, outcomes = _finish(ws, answer, r, turn)
+    assert outcomes[0]["status"] == "full" and r.item_gaps == []
+    assert _lines_not_used(final.answer_markdown) == []
+
+
+def test_ae10_a_table_row_under_a_lead_sentence_that_carries_the_date_gets_no_line():
+    ws = _u7_file("נתוני שווי", "פריט | סכום", "שווי השוק ליום 31.12.2023 | 16,070,000")
+    raw = [_adj_item("שווי השוק", "שווי השוק ליום 31.12.2023 | 16,070,000", "16,070,000")]
+    markdown = "הנתונים נכון ליום 31.12.2023:\n\n| פריט | סכום |\n| --- | --- |\n| שווי השוק | 16.07 מיליון ₪ [S2] |"
+    r, turn, answer, _ = _ledger_check(ws, markdown, raw)
+    final, outcomes = _finish(ws, answer, r, turn)
+    assert outcomes[0]["status"] == "full" and r.item_gaps == []
+    assert _lines_not_used(final.answer_markdown) == []
+
+
+def test_a_value_stated_with_attribution_but_without_its_date_is_never_read_and_not_used():
+    ws = _u7_file("התאמות", "סוג התאמה | שיעור", "מיקום | 5%", "קומה ליום 31.12.2023 | 3%")
+    raw = [_adj_item("ההתאמה למיקום", "מיקום | 5%", "5%"), _adj_item("ההתאמה לקומה", "קומה ליום 31.12.2023 | 3%", "3%")]
+    r, turn, answer, _ = _ledger_check(ws, TWO_ADJ, raw)
+    final, _ = _finish(ws, answer, r, turn)
+    assert [s["state"] for s in r.item_states()][1] == "omitted"  # the ledger still sees the date as open
+    assert _lines_not_used(final.answer_markdown) == [] and r.item_gaps == []
+
+
+def test_a_value_stated_without_the_condition_of_an_item_whose_value_no_sibling_shares_is_not_read_and_not_used():
+    ws = _u7_file("התאמות", "סוג התאמה | שיעור | הערה", "מיקום | 5% | התאמה לפי קרבה לים", "קומה | 3% | כאשר הבניין מעל גיל 30 שנה")
+    raw = [_adj_item("ההתאמה למיקום", "מיקום | 5%", "5%", condition="התאמה לפי קרבה לים"),
+           _adj_item("ההתאמה לקומה", "קומה | 3%", "3%", condition="כאשר הבניין מעל גיל 30 שנה")]
+    r, turn, answer, _ = _ledger_check(ws, TWO_ADJ, raw)
+    final, _ = _finish(ws, answer, r, turn)
+    assert _lines_not_used(final.answer_markdown) == []  # the condition is the condition check's job (round 18 U5), not this line's
+
+
+def test_an_item_the_answer_does_not_give_still_gets_its_line_with_the_row_label_the_source_gives_it():
+    ws = _adj_file()
+    ws.sources["S2"].location = 'סעיף "התאמות", עמוד 4'
+    raw = _adj_items()
+    raw[2] = _adj_item("התאמה מדומה של הסוכן", "גיל הבניין | 2%", "2%")  # the agent's own name for the row
+    r, turn, answer, _ = _ledger_check(ws, TWO_ADJ, raw)
+    final, _ = _finish(ws, answer, r, turn)
+    (line,) = _lines_not_used(final.answer_markdown)
+    assert line.startswith("«גיל הבניין»") and "מדומה" not in final.answer_markdown and "S2" in line and "עמוד 4" in line
+
+
+def test_an_agent_reason_with_words_in_neither_the_source_nor_the_request_is_replaced_by_the_states_server_wording():
+    ws = _adj_file()
+    r, turn, answer, _ = _ledger_check(ws, TWO_ADJ, _adj_items(state="not_verifiable", reason="הנכס נהרס בשריפה ב-1999"))
+    final, _ = _finish(ws, answer, r, turn)
+    gap = _gap(final, answer)
+    assert "הנכס נהרס" not in final.answer_markdown and "1999" not in final.answer_markdown
+    assert gap.startswith("«גיל הבניין»") and "לא ניתן לאמת" in gap
+    r, turn, answer, _ = _ledger_check(ws, TWO_ADJ, _adj_items(state="not_applicable", reason="הבניין חדש מדי"))
+    final, _ = _finish(ws, answer, r, turn)
+    assert "חדש מדי" not in final.answer_markdown and "אינו חל על הבקשה" in _gap(final, answer)
+
+
+def test_an_agent_reason_whose_words_stand_in_the_item_source_or_the_request_is_shown():
+    ws = _adj_file()
+    r, turn, answer, _ = _ledger_check(ws, TWO_ADJ, _adj_items(state="not_verifiable", reason="גיל הבניין בין ההתאמות שהשומה יישמה"))
+    final, _ = _finish(ws, answer, r, turn)
+    assert "גיל הבניין בין ההתאמות שהשומה יישמה" in _gap(final, answer)
+
+
+def test_a_partly_given_component_names_the_part_the_passage_states_and_not_the_whole_component():
+    ws = _rates_file()
+    ws.sources["S2"].location = 'סעיף "שיעורי היוון", עמוד 7'
+    turn = _turn({"id": "1", "text": ASK_RATES})
+    answer = _answer(THREE_RATES)
+
+    def score(frozen, units):  # partial, naming a part the request never asked for (so no part is validated), and a quote of the passage
+        return [_req("", "partial", list(units), id=frozen[0][0])
+                | {"missing": "שיעור הגרעין", "support": [{"id": "S2", "quote": MISSING_RATE}]}]
+
+    r = verify_answer(_judge(score), answer, ws, "?", [], requirements=turn)
+    final, outcomes = _finish(ws, answer, r, turn)
+    (o,) = outcomes
+    assert o["status"] == "partial" and o["variant"] == "read_not_used" and o["stated"] is True and o["missing_part"] == ""
+    gap = _gap(final, answer)
+    assert "**מחסנים: 9.1%**" in gap and "נקרא" in gap and "לא נעשה בו שימוש" in gap
+    assert ASK_RATES not in gap  # never the whole component
+
+
+def test_a_partly_given_component_whose_judge_named_the_missing_part_is_stated_by_that_part():
+    ws = _rates_file()
+    r, turn, answer = _support(ws, THREE_RATES, MISSING_RATE)
+    final, outcomes = _finish(ws, answer, r, turn)
+    assert outcomes[0]["missing_part"] == "שיעורי ההיוון" and "**שיעורי ההיוון**" in _gap(final, answer)
+
+
+def test_a_value_whose_cited_sentence_survives_is_not_called_uncertain_because_its_quote_lacked_a_kind_word():
+    ws = _ws()
+    vid = _value(ws, "12", "דמי הניהול", asserted=True)  # its unit was asserted: the number's kind was not found in its quote
+    a = _answer(f"דמי ניהול 12 ₪ [{vid}]. השווי למ\"ר הוא 9,500 ₪ [S1].")
+    turn = TurnRequirements()
+    r = verify_answer(_judge(_by_words({"השווי למ\"ר": {}, "דמי הניהול": {"related": [vid]}}, missing_status="missing")), a,
+                      ws, "?", [], requirements=turn)
+    final, outcomes = _finish(ws, a, r, turn)
+    assert outcomes[1]["variant"] != "uncertain" and "אינן ודאיות" not in final.answer_markdown
+
+
+def test_a_value_the_answer_does_not_show_stays_uncertain():
+    ws = _ws()
+    vid = _value(ws, "12", "דמי הניהול", asserted=True)
+    assert coverage._uncertain_value(ws, [vid]) and not coverage._uncertain_value(ws, [vid], shown={vid})

@@ -114,7 +114,7 @@ def test_the_registry_of_a_reports_edits_indexes_the_final_text_exactly_for_ever
     assert [k for k, _ in _texts(text, spans)] == ["marker", "citation", "partial_mark", "removal_note", "request_note"]
     assert dict(_texts(text, spans)) == {
         "marker": MARKER.format(n=1), "citation": " [S1]", "partial_mark": " *(אומת חלקית)*",
-        "removal_note": "\n\n> הוסרו מהתשובה 1 טענות שלא נמצאה להן תמיכה במקורות.",
+        "removal_note": "\n\n> " + verify.REMOVAL_SENTENCES["absent_from_source"],
         "request_note": "\n\n> **שימו לב:** התשובה אינה מציגה את הנתון שהתבקש: שווי במקום שכירות."}
     # nothing but those spans is the server's: with them masked, what is left is the model's text, minus the cuts
     assert edited.doc.masked() == ("הנכס פנוי,  [S1].\nהשווי למ\"ר הוא 9,500 ₪.\n"
@@ -169,7 +169,7 @@ def test_compose_registers_the_gap_paragraph_the_limit_sentence_and_the_coverage
     by_kind = dict(got)
     assert by_kind["gap_paragraph"].strip() == "**דמי הניהול** לא נמצא בחיפוש במסמכים שנבדקו."
     assert by_kind["limit_sentence"].strip() == limit and by_kind["coverage_note"].strip() == note
-    assert by_kind["removal_note"].strip().startswith("> הוסרו מהתשובה 1 טענות")
+    assert by_kind["removal_note"].strip() == "> " + verify.REMOVAL_SENTENCES["absent_from_source"]
     # every span lies inside the text and none overlaps another
     ends = [0] + [x for s in out.spans for x in (s.start, s.end)]
     assert ends == sorted(ends) and out.spans[-1].end == len(text)
@@ -256,7 +256,7 @@ def test_the_answer_without_the_servers_spans_for_a_later_turn(monkeypatch):
     text = out.answer.answer_markdown
     stripped = strip_server_spans(text, [s.as_dict() for s in out.spans])  # as the saved message holds them
     assert stripped == strip_server_spans(text, out.spans)
-    assert "הוסרו מהתשובה" not in stripped and "חלק שלא אומת" not in stripped and "אומת חלקית" not in stripped
+    assert verify.REMOVAL_SENTENCES["absent_from_source"] not in stripped and "חלק שלא אומת" not in stripped and "אומת חלקית" not in stripped
     assert "שימו לב" not in stripped
     assert "הנכס פנוי," in stripped and "דמי השכירות הם 55 ₪ למ\"ר לחודש [S1]." in stripped
     assert "  " not in stripped and "\n\n\n" not in stripped

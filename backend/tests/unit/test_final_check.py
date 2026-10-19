@@ -222,7 +222,7 @@ def test_a_cut_whose_remainder_is_not_supported_is_removed_and_the_answer_is_com
 
     out = _turn(ScriptedAgent([SEARCH, final(f"{MIXED}\n{VALUE}")], judge=Judge(rule)))
     md = out.answer.answer_markdown
-    assert "1,200" not in md and "9,500" in md and "הוסרו מהתשובה 1 טענות" in md
+    assert "1,200" not in md and "9,500" in md and verify.REMOVAL_SENTENCES["absent_from_source"] in md
     assert _purposes(out).count("verify_final") == 1 and out.final_check["passes"] == 2
     assert out.final_check["removed"] == 1 and _kinds(out) == ["removal_note"]
     (p,) = out.report.removals()
@@ -594,7 +594,8 @@ def test_a_last_pass_heading_removal_withholds_the_sentence_below_it_and_recompu
     # saved) and the sentence (not checked under its new heading) apart, and the registry indexes the saved text exactly
     (note,) = out.server_spans
     assert note.kind == "removal_note" and md[note.end:] == "" and md[:note.start] == "השווי למ\"ר הוא 9,500 ₪ [S2]."
-    assert md[note.start:note.end].count("הוסרו מהתשובה 1 טענות") == 2
+    note_text = md[note.start:note.end]  # the heading (not supported as saved) and the sentence (not checked) are noted by their own causes
+    assert len(note_text.strip().splitlines()) == 2 and verify.REMOVAL_SENTENCES["absent_from_source"] in note_text and verify.CHECK_CAUSE_SENTENCES["check_failed"] in note_text
     assert out.final_digest == text_digest(md)
 
 
@@ -642,7 +643,7 @@ def test_what_rests_on_a_unit_the_final_check_removes_goes_with_it(offline):
 
     out = _turn(ScriptedAgent([SEARCH, final(f"{MIXED}\n{conclusion}\n{VALUE}")], judge=Judge(rule)))
     md = out.answer.answer_markdown
-    assert "מכאן" not in md and "1,200" not in md and "9,500" in md and "הוסרו מהתשובה 2 טענות" in md
+    assert "מכאן" not in md and "1,200" not in md and "9,500" in md and (verify.REMOVAL_SENTENCES["absent_from_source"].rstrip(".") + " (2 פעמים).") in md
     gone = {p.unit.text.split(",")[0].split(" ")[0]: p for p in out.report.removals()}
     assert gone["מכאן"].check == "dependency" and gone["מכאן"].failure_kind == gone["השטח"].failure_kind
     assert _purposes(out).count("verify_final") == 1 and out.final_digest == text_digest(md)
@@ -734,8 +735,10 @@ def test_item_gap_lines_are_server_text_that_is_a_fixed_point_and_cost_no_judge_
     assert _kinds(out) == ["item_gap"], md
     (span,) = out.server_spans
     lines = md[span.start:span.end].strip().splitlines()
-    assert len(lines) == 2 and "שיעור למסחר" in lines[0] and "S1" in lines[0] and "לא נעשה בו שימוש" in lines[0]
-    assert "שיעור לחניה" in lines[1] and "הטבלה נקראה בקריאה לא ודאית" in lines[1] and "S1" in lines[1]
+    # (round 18 U7: the items are named as the source names their rows, and the agent's reason, with words in neither the row nor the
+    # request, is replaced by the state's wording)
+    assert len(lines) == 2 and lines[0].startswith("«מסחר»") and "S1" in lines[0] and "לא נעשה בו שימוש" in lines[0]
+    assert lines[1].startswith("«חניה»") and "לא ניתן לאמת" in lines[1] and "S1" in lines[1] and "הטבלה נקראה" not in lines[1]
     assert not re.search(r"לא נמצא|לא אותר|לא מופיע", md)
     assert out.answer.status == "partial" and md.startswith(answer)
     assert out.final_check["judge_calls"] == 0 and "verify_final" not in _purposes(out)
@@ -783,7 +786,7 @@ def _fallback_rule(text, input, n):
 
 def _assert_fallback_checked(out):
     md = out.answer.answer_markdown
-    assert "1,200" in md and MARKER in md and "מושכר" not in md and "הוסרו מהתשובה 1 טענות" in md
+    assert "1,200" in md and MARKER in md and "מושכר" not in md and verify.REMOVAL_SENTENCES["absent_from_source"] in md
     assert _purposes(out)[-1] == "verify_final" and out.final_digest == text_digest(md)
     assert {"marker", "removal_note"} <= set(_kinds(out))
 
@@ -921,7 +924,7 @@ def test_the_conditional_note_is_server_text_that_is_a_fixed_point_and_costs_no_
     out = _turn(ScriptedAgent([SEARCH, final(answer), final(answer)], judge=Judge(lambda t, i, n: "supported")),
                 "מה עלות הבנייה העילית והחניון יחד?")
     md = out.answer.answer_markdown
-    note = "התוצאה C1 מותנית: הערכים V1, V2 אינם ודאיים."
+    note = "התוצאה 20,220,000 ₪ מותנית: הערכים «בנייה עילית» (15,600,000) ו־«חניון תת-קרקעי» (4,620,000) אינם ודאיים."
     assert md.endswith("\n\n" + note) and md.count("אינם ודאיים") == 1, md
     assert md.count("(תוצאה מותנית)") == 2
     kinds = _kinds(out)

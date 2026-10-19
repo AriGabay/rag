@@ -47,7 +47,14 @@ A note, paragraph or heading that LIMITS a value is that value's condition span,
 which candidate a frozen component asks for (``verify.valid_candidates`` checks its words against the request and the candidate's
 own text); ``candidate_item`` builds the ledger item of a kept one — origin ``source``, ``candidate`` True, its label, value and
 condition built from the source — which stays open until a sentence gives it, is completed by the existing text repair, and gets
-the "read at <place>, not used" line (built from the source's words) if it is still omitted."""
+the "read at <place>, not used" line (built from the source's words) if it is still omitted.
+
+Round 18 U7 (KTD6; R11) makes what coverage says, and what the lines built from it say, true. A value is stated when each of its numbers
+has a form the sentence writes (``_number_forms``: "16.07 מיליון" and "16,070,000" are one number); an item's date may stand in the
+sentence's own lead (``_leads``: the lead-in of its list, the sentence and header before its table, the headings above it) when the
+sentence states no date of its own. ``source_name`` is how a server line names an item: the source's row label or quote, never the
+agent's label. An item whose value an attributed sentence states but whose date it does not stays omitted for the repair round, and is
+never "read and not used" (``coverage.item_gap_lines``)."""
 
 from __future__ import annotations
 
@@ -63,6 +70,7 @@ from app.chat import conditions
 from app.chat.evidence import claim_terms
 from app.chat.meaning import _row_cells
 from app.chat.verify import (
+    _NUM_AT,
     ITEM_COVERED,
     ITEM_INCLUDED,
     ITEM_NOT_APPLICABLE,
@@ -76,6 +84,7 @@ from app.chat.verify import (
     Unit,
     _cited_sources,
     _is_tabular,
+    _value_forms,
     context_of_source,
     request_word_forms,
     shares_request_word,
@@ -258,6 +267,17 @@ class Span(NamedTuple):
 def _row_of(body: Sequence[str], flat: str) -> str | None:
     """The line of a source's body (a table row, a paragraph) that holds the quote ``flat``."""
     return next((ln for ln in body if flat in _flat_text(ln)), None)
+
+
+def source_name(src, quote: str) -> str:
+    """How the source names the span an item quotes (round 18 U7, KTD6): the first cell of its table row, else the quote itself. A server
+    line names an item by this, never by the agent's own label."""
+    if src is not None:
+        row = _row_of(context_of_source(src)[1], SupportScope.flat(quote))
+        cells = _row_cells(row) if row is not None and "|" in row else []
+        if len(cells) >= 2 and re.search(r"[^\W\d_]", cells[0]):
+            return " ".join(cells[0].split())
+    return " ".join(quote.split())
 
 
 def _header_cells(body: Sequence[str]) -> list[str]:
@@ -727,40 +747,70 @@ def _enough(wanted: str, have: frozenset[str]) -> bool:
     return not groups or sum(1 for g in groups if g & have) >= (len(groups) + 1) // 2
 
 
+def _number_forms(text: str) -> list[set[str]]:
+    """The forms of each number ``text`` writes, outside its dates (``verify._value_forms``): a number written with a scale word has the
+    forms of its full value too, so "16.07 מיליון" and "16,070,000" are one number (round 18 U7, KTD6)."""
+    blank = _outside_dates(text)
+    return [forms for m in _NUM_AT.finditer(blank) if (forms := _value_forms(blank, m))]
+
+
 def _states_value(item: Item, text: str, words: frozenset[str]) -> bool:
     if parsed := shared_dates.parse(item.value):
         return any(p.iso.startswith(parsed.iso) for p in shared_dates.find_all(text))
-    wanted = numbers_in(_outside_dates(item.value))
+    wanted = _number_forms(item.value)
     if wanted:
-        return wanted <= numbers_in(_outside_dates(text))
+        have = set().union(*_number_forms(text))
+        return all(forms & have for forms in wanted)
     return _enough(item.value or item.label or item.quote, words)
 
 
-def _states_date(item: Item, text: str) -> bool:
-    stated = [p.iso for p in shared_dates.find_all(text)]
+def _states_date(item: Item, text: str, lead: str = "") -> bool:
+    """The item's date is stated by the sentence, or, when the sentence states no date of its own, by its lead: the lead-in sentence of
+    its list, the sentence and header before its table, or the heading above it (``_leads``; round 18 U7)."""
+    stated = [p.iso for p in shared_dates.find_all(text)] or [p.iso for p in shared_dates.find_all(lead)]
     return all(any(s.startswith(iso) for s in stated) for iso in _item_dates(item))
 
 
-def _unit_covers(item: Item, unit: Unit, ws, shared: bool) -> str:
-    """"" when the unit gives the item, else the first check it fails."""
+def _leads(units: Sequence[Unit]) -> dict[int, str]:
+    """For each unit (by index), the text around it that dates it: its table's header row and the line before the table
+    (``Unit.context``), the lead-in line of the list it is an item of — the nearest earlier unit that leads a list, through the items
+    directly before it — and the headings above it (``Unit.heading``). A lead-in the answer no longer holds dates nothing."""
+    by_index = {u.index: u for u in units}
+    out = {}
+    for u in units:
+        parts = [u.heading, u.context]
+        if u.list_item:
+            prev = by_index.get(u.index - 1)
+            while prev is not None and prev.list_item and not prev.leads_list:
+                prev = by_index.get(prev.index - 1)
+            if prev is not None and prev.leads_list:
+                parts.append(prev.text)
+        out[u.index] = " ; ".join(x for x in parts if x)
+    return out
+
+
+def _unit_covers(item: Item, unit: Unit, ws, shared: bool, lead: str = "") -> str:
+    """"" when the unit gives the item, else the first check it fails. ``lead``: the text around the unit that dates it (``_leads``)."""
     if not _attributed(item, unit, ws):
         return "not_attributed"
     words = claim_terms(unit.text)[1]
     if not _states_value(item, unit.text, words):
         return "value_not_stated"
-    if not _states_date(item, unit.text):
+    if not _states_date(item, unit.text, lead):
         return "date_not_stated"
     if shared and not _enough(item.condition or item.label, words):
         return "condition_not_stated"
     return ""
 
 
-def _coverage(item: Item, units: Sequence[Unit], ws, shared: bool) -> Coverage:
+def _coverage(item: Item, units: Sequence[Unit], ws, shared: bool, leads: Mapping[int, str] | None = None) -> Coverage:
     """Whether a surviving unit of the answer gives the item (R5; see the module docstring). ``shared``: another item of the item's
-    component has its signature (its value, or its label), which makes its condition words (else its label's) needed."""
+    component has its signature (its value, or its label), which makes its condition words (else its label's) needed. ``leads``: the
+    text around each unit that dates it (``_leads``), when the caller already has it."""
     furthest = -1
+    leads = _leads(units) if leads is None else leads
     for unit in units:
-        why = _unit_covers(item, unit, ws, shared)
+        why = _unit_covers(item, unit, ws, shared, leads.get(unit.index, ""))
         if not why:
             return Coverage(True, unit.index, "")
         furthest = max(furthest, _WHY_ORDER.index(why))
@@ -830,17 +880,19 @@ class Ledger:
         signatures = {id(i): _signature(i) for i in self.items.values()}
         alike = Counter((i.component, signatures[id(i)]) for i in self.items.values())
         by_index = {u.index: u for u in units}
+        leads = _leads(units)
         spans = {i.key: _spans_of(ws, i) for i in self.items.values()}
         rows: list[tuple[Item, Coverage | None, bool]] = []
         for item in self.items.values():
             sig = signatures[id(item)]
             shared = bool(sig) and alike[(item.component, sig)] > 1
-            got = _coverage(item, units, ws, shared) if item.state in (ITEM_INCLUDED, OMITTED) else None
+            got = _coverage(item, units, ws, shared, leads) if item.state in (ITEM_INCLUDED, OMITTED) else None
             if item.origin == ORIGIN_SOURCE and not item.candidate and (got is None or not got.ok):
                 continue  # (a candidate the call assigned to a component is an open item whatever sentence cited what: round 18 U6)
             rows.append((item, got, shared))
         # the units that give each covered item (the first is the covering unit above), and each item's own context text
-        gave = {i.key: {u.index for u in units if not _unit_covers(i, u, ws, shared)} for i, g, shared in rows if g is not None and g.ok}
+        gave = {i.key: {u.index for u in units if not _unit_covers(i, u, ws, shared, leads[u.index])} for i, g, shared in rows
+                if g is not None and g.ok}
         owns = {i.key: _own_text(ws, i) for i, _, _ in rows}
         for item, got, _ in rows:
             state = item.state if got is None else (COVERED if got.ok else OMITTED)

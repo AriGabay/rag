@@ -777,3 +777,50 @@ def test_an_agent_item_for_the_same_row_replaces_the_candidate_item_and_a_second
                                             reason="הבקשה היא לשעות היום"), components=RATE_ASK, ledger=ledger)
     merged = ledger.merge(declared.kept)
     assert [(i.origin, i.candidate, i.state) for i in merged] == [("agent", False, "not_applicable")]
+
+
+# --- round 18 U7: coverage compares value forms, and a date may stand in the sentence's lead-in or heading (KTD6, AE10) ------------
+
+def test_ae10_an_item_valued_in_full_digits_is_covered_by_a_sentence_that_writes_it_with_a_scale_word_and_the_other_way_round():
+    ws = _ws("שווי הנכס | 16,070,000 ₪", "דמי ניהול | 45 אלף ₪")
+    full = _item(label="שווי הנכס", quote="שווי הנכס | 16,070,000 ₪", value="16,070,000 ₪")
+    assert _covered(ws, "שווי הנכס הוא 16.07 מיליון ₪ [S1].", full).ok
+    thousand = _item(label="דמי ניהול", source="S2", quote="דמי ניהול | 45 אלף ₪", value="45 אלף ₪")
+    assert _covered(ws, "דמי הניהול הם 45,000 ₪ [S2].", thousand).ok
+    assert _covered(ws, "דמי הניהול הם 45 אלף ₪ [S2].", thousand).ok
+    digits = _item(label="דמי ניהול", source="S2", quote="דמי ניהול | 45 אלף ₪", value="45,000 ₪")
+    assert _covered(ws, "דמי הניהול הם 45 אלף ₪ [S2].", digits).ok
+
+
+def test_a_different_amount_is_not_covered_by_a_scale_word_that_does_not_equal_it():
+    ws = _ws("שווי הנכס | 16,070,000 ₪")
+    item = _item(label="שווי הנכס", quote="שווי הנכס | 16,070,000 ₪", value="16,070,000 ₪")
+    got = _covered(ws, "שווי הנכס הוא 16.7 מיליון ₪ [S1].", item)
+    assert not got.ok and got.why == "value_not_stated"
+
+
+DATED = "שיעור היוון ליום 31.12.2023 – 7.5%"
+
+
+def test_an_items_date_stated_in_the_lead_in_sentence_of_its_list_counts():
+    ws = _ws(DATED)
+    item = _item(label="שיעור ההיוון", quote=DATED, value="7.5%")
+    assert _covered(ws, "הנתונים נכון ליום 31.12.2023:\n\n- שיעור ההיוון הוא 7.5% [S1].", item).ok
+    other = _covered(ws, "הנתונים נכון ליום 30.06.2024:\n\n- שיעור ההיוון הוא 7.5% [S1].", item)
+    assert not other.ok and other.why == "date_not_stated"
+
+
+def test_an_items_date_stated_in_the_sentence_before_its_table_or_in_the_heading_above_it_counts():
+    ws = _ws(DATED)
+    item = _item(label="שיעור ההיוון", quote=DATED, value="7.5%")
+    table = "השיעורים נכון ליום 31.12.2023:\n\n| פריט | שיעור |\n| --- | --- |\n| שיעור ההיוון | 7.5% [S1] |"
+    assert _covered(ws, table, item).ok
+    assert _covered(ws, "## מצב ליום 31.12.2023\n\nשיעור ההיוון הוא 7.5% [S1].", item).ok
+    assert not _covered(ws, "## מצב ליום 30.06.2024\n\nשיעור ההיוון הוא 7.5% [S1].", item).ok
+
+
+def test_a_lead_in_that_is_not_the_sentences_own_does_not_lend_it_its_date():
+    ws = _ws(DATED)
+    item = _item(label="שיעור ההיוון", quote=DATED, value="7.5%")
+    far = "הנתונים נכון ליום 31.12.2023:\n\n- פריט אחר.\n\nפסקה חדשה.\n\nשיעור ההיוון הוא 7.5% [S1]."
+    assert not _covered(ws, far, item).ok

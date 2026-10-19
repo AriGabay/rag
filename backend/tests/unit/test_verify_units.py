@@ -1050,7 +1050,7 @@ def test_a_judge_timeout_on_one_batch_records_its_units_as_not_checked_never_as_
                        "action": "withheld"}
     assert "שגוי" not in summary["text"].replace("לא נמצאה שגויה", "") and "תמיכה" not in summary["text"]
     out = r.apply(a).answer_markdown
-    assert "פנוי" not in out and "לא נמצאה להן תמיכה" not in out and "לא ניתן היה לבדוק" in out
+    assert "פנוי" not in out and "תמיכה" not in out and out.endswith("> " + verify.CHECK_CAUSE_SENTENCES["check_failed"])  # its own cause (round 18 U7)
 
 
 def test_a_judge_that_fails_on_every_batch_still_fails_the_verification(monkeypatch):
@@ -1109,6 +1109,48 @@ def test_the_public_removal_summary_has_the_kind_and_a_fixed_sentence_never_the_
     shown = json.dumps(counts, ensure_ascii=False)
     assert "שכירות" not in shown and "השווי שייך לנכס אחר" not in shown
     assert set(verify.REMOVAL_SENTENCES) == set(verify.FAILURE_KINDS)
+
+
+def _note_lines(edited) -> list[str]:
+    """The lines of the removal note the answer ends with (round 18 U7)."""
+    return [ln for ln in edited.doc.text.split("\n\n")[-1].split("\n>\n")]
+
+
+def test_a_wrong_subject_removal_note_says_the_passage_belongs_to_another_subject_and_not_that_no_support_was_found():
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nדמי השכירות בנכס הם 55 ₪ למ\"ר לחודש [S1].")
+    p = _decided(lambda t, _: {"verdict": "unsupported", "failure": "wrong_subject"} if "שכירות" in t
+                 else {"verdict": "supported"})
+    edited = verify_answer(p, a, _ws(SOURCE), "?", []).edit(a)
+    assert _note_lines(edited) == ["> " + verify.REMOVAL_SENTENCES["wrong_subject"]]
+    assert "לא נמצאה להן תמיכה" not in edited.doc.text and "לא נמצאה תמיכה" not in edited.doc.text
+
+
+def test_each_cause_of_removal_gets_its_own_note_line_in_the_answers_order_and_a_repeated_cause_is_counted():
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nדמי השכירות בנכס הם 55 ₪ למ\"ר לחודש [S1].\n"
+                "הנכס מנוהל בידי חברת ניהול [S1].\nהנכס מושכר לטווח ארוך [S1].\nהנכס מרוהט [S1].")
+    kinds = {"שכירות": "wrong_subject", "ניהול": "wrong_subject", "לטווח": "absent_from_source", "מרוהט": "contradicts_source"}
+    p = _decided(lambda t, _: {"verdict": "unsupported", "failure": next(k for w, k in kinds.items() if w in t)}
+                 if any(w in t for w in kinds) else {"verdict": "supported"})
+    edited = verify_answer(p, a, _ws(SOURCE), "?", []).edit(a)
+    assert _note_lines(edited) == [
+        "> " + verify.REMOVAL_SENTENCES["wrong_subject"].rstrip(".") + " (2 פעמים).",
+        "> " + verify.REMOVAL_SENTENCES["absent_from_source"],
+        "> " + verify.REMOVAL_SENTENCES["contradicts_source"]]
+
+
+def test_a_claim_that_could_not_be_checked_is_noted_with_its_own_cause_sentence(monkeypatch):
+    monkeypatch.setattr(verify, "JUDGE_MAX_UNITS", 1)
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str):
+        if 1 in _indexes(input):
+            return StructuredResult(CallStatus.TIMEOUT, detail="timeout")
+        return {"verdicts": [{"index": n, "verdict": "supported", "reason": "ok"} for n in _indexes(input)]}
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nהנכס פנוי [S1].")
+    edited = verify_answer(p, a, _ws(SOURCE), "?", []).edit(a)
+    assert _note_lines(edited) == ["> " + verify.CHECK_CAUSE_SENTENCES["check_failed"]]
 
 
 def test_the_repair_prompt_names_each_problems_failure_kind_and_the_ids_checked():
@@ -1248,7 +1290,8 @@ def test_a_unit_with_only_failing_claims_is_removed_whole_as_the_last_resort_and
     r = verify_answer(judge, a, _ws(AREA_SOURCE), "?", [])
     assert r.removed_units() == {1} and not r.ok  # a rewrite is still tried first (repairable), then it goes
     out = r.apply(a).answer_markdown
-    assert "מושכר" not in out and "«" not in out and out.startswith("הנכס פנוי [S1].\n\n> הוסרו")
+    assert "מושכר" not in out and "«" not in out
+    assert out == "הנכס פנוי [S1].\n\n> " + verify.REMOVAL_SENTENCES["absent_from_source"]
     assert [c.action for c in r.claims[1]] == ["removed", "removed"] and r.claims[0][0].action == "kept"
 
 
@@ -1321,7 +1364,7 @@ def test_a_removed_row_under_a_total_row_qualifies_the_total():
     edited = r.edit(a)
     assert edited.doc.text == (
         "| רכיב | סכום |\n|---|---|\n| רכיב א | 100 ₪ [S1] |\n| רכיב ג | 50 ₪ [S1] |\n"
-        "| סה״כ (הסכום כולל שורה שהוסרה) | 350 ₪ [S1] |\n\n> הוסרו מהתשובה 1 טענות שלא נמצאה להן תמיכה במקורות.")
+        "| סה״כ (הסכום כולל שורה שהוסרה) | 350 ₪ [S1] |\n\n> " + verify.REMOVAL_SENTENCES["absent_from_source"])
     assert [s.kind for s in edited.doc.spans()] == ["qualifier", "removal_note"]
 
 
@@ -1345,7 +1388,8 @@ def test_a_table_left_with_its_header_only_is_removed_with_its_header_and_the_he
     r = verify_answer(_judge(lambda t: "unsupported" if "רכיב" in t and "|" in t and "סכום" not in t else "supported"),
                       a, _ws(PARTS_SOURCE, AREA_SOURCE), "?", [])
     out = r.apply(a).answer_markdown
-    assert "|" not in out and "הרכיבים" not in out and out.startswith("הנכס פנוי [S1].\n\n> הוסרו מהתשובה 2 טענות")
+    assert "|" not in out and "הרכיבים" not in out
+    assert out == "הנכס פנוי [S1].\n\n> " + verify.REMOVAL_SENTENCES["absent_from_source"].rstrip(".") + " (2 פעמים)."
 
 
 # --- a unit failed only for numbers no cited source states is split by the judge, not removed up front -------------------

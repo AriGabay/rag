@@ -59,7 +59,9 @@ table, first match wins (``reason_of``):
     line after the gap paragraph (``item_gap_lines``, the ``item_gap`` server span) naming the item, the place it was read at
     (document, location, S#) and, for a declared one, the reason. An omitted item makes its component partial
     (``VerifyReport.requirement_outcomes``) and, as the judge's validated support does, is a ``REQ_TEXT_FOUND`` completion for the
-    repair round; it is never "not found". A declared item does not block ``full``;
+    repair round; it is never "not found". A declared item does not block ``full``. Round 18 U7 (KTD6): the line is built from verified
+    material — the item is named as its source names it (``items.source_name``), the agent's reason is shown only when its words stand
+    in the item's source context or the request, and an item an attributed sentence gives by value but not by date is no line;
 10a. a professional question whose pool was empty — the office holds no standard or professional document (round 10 U8,
     KTD15, R29): the standard text is not in the repository — standard text absent (stated as the repository's gap, and
     the other permitted sources still answer);
@@ -105,6 +107,7 @@ from app.chat.tools import (
     TOOL_BUDGET,
     dated,
     period_bounds,
+    reading_unclear,
     value_uncertain,
 )
 from app.db import tenant_tx
@@ -542,12 +545,14 @@ def related_evidence(ws: Workspace, outcome: dict, turn: TurnRequirements | None
             "documents": list(dict.fromkeys(documents))}
 
 
-def _uncertain_value(ws: Workspace, ids: list[str]) -> bool:
+def _uncertain_value(ws: Workspace, ids: list[str], shown: Collection[str] = ()) -> bool:
     """A value among ``ids`` whose kind or unit was asserted rather than found in its source (``Value.certainty``: an
     asserted stance, speaker, scenario, period, area basis or VAT counts as not stated and does not limit the component,
     round 13 U5, KTD6), whose own region stayed unclear after its focused re-reads (``Value.reading``), or whose source
-    was read uncertainly while its own region was not found clear."""
-    return any(value_uncertain(ws, i) for i in ids if i in ws.values)
+    was read uncertainly while its own region was not found clear. A value in ``shown`` (the ids the final answer cites: its
+    sentence stands) is uncertain only by its reading: that its quote lacked a kind word is no reason to call a value the answer
+    gives uncertain (round 18 U7, KTD6)."""
+    return any(reading_unclear(ws, i) if i in shown else value_uncertain(ws, i) for i in ids if i in ws.values)
 
 
 def _openings(ws: Workspace, documents: Collection[str] | None = None) -> dict[str, tuple[str, dict]]:
@@ -680,11 +685,13 @@ def _missing_parameters(ws: Workspace, o: dict, ev: dict) -> list[str]:
 
 
 def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict | None = None,
-              opened: dict[str, tuple[str, dict]] | None = None, signal: dict | None = None) -> dict:
+              opened: dict[str, tuple[str, dict]] | None = None, signal: dict | None = None,
+              shown: Collection[str] = ()) -> dict:
     """Why a component is not given, chosen from the turn's evidence by the reason table (first match wins; the
     module docstring lists it): {"reason", "variant", "place", "document", "searched", "detail"}. ``claim``: the
     model's validated claim about it, which adds evidence and never upgrades. ``opened``: the turn's openings
-    (``_openings``), and ``signal``: the turn's unit signal (``unit_signal``), when the caller already has them."""
+    (``_openings``), and ``signal``: the turn's unit signal (``unit_signal``), when the caller already has them. ``shown``: the ids
+    the final answer cites (``_uncertain_value``)."""
     ev = related_evidence(ws, o, turn)
     kinds = {f["kind"] for f in ev["failures"]}
     # covered only by a search or reading the judge tied to it: a model's "not found in the search" proves none
@@ -707,7 +714,7 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
         return out | {"reason": "detail_missing", "detail": "; ".join(missing)}
     if o["kind"] == "calculation" and ev["data"]:
         return out | {"reason": "calculation_incomplete", "variant": "not_computed"}
-    if _uncertain_value(ws, ev["data"]):
+    if _uncertain_value(ws, ev["data"], shown):
         return out | {"reason": "not_verifiable", "variant": "uncertain"}
     if (ev["data"] and conflicting(ws, ev["documents"] or None, ev["data"])) or (
             claim is not None and claim["status"] == "sources_conflict"):
@@ -715,7 +722,8 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
     if o.get("evidence_state") == "undeterminable":
         return out | {"reason": "not_verifiable", "variant": "undeterminable"}
     if ev["text"]:  # a passage the turn read states the part and the answer does not give it (round 16 U2, R6): never "not found"
-        return out | _read_not_used(ws, ev["text"][0]["id"])  # also when related data was found: it is the omitted part's place
+        # also when related data was found: it is the omitted part's place
+        return out | _read_not_used(ws, ev["text"][0]["id"], ev["text"][0].get("quote") or "")
     if ev["data"]:
         return out | {"reason": "not_verifiable", "variant": "not_presented"}
     # a professional question whose pool was empty: the repository holds no standard or professional document (U8, KTD15,
@@ -777,13 +785,18 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
     return out | {"reason": "not_located", "searched": False}
 
 
-def _read_not_used(ws: Workspace, sid: str) -> dict:
+def _read_not_used(ws: Workspace, sid: str, quote: str = "") -> dict:
     """The gap of a part the turn read at ``sid`` (validated support) and the answer does not give: where it was read — the
-    document, the section or pages, the S# — and that it was not used. The place is that passage's."""
+    document, the section or pages, the S# — and that it was not used. The place is that passage's; ``part`` names the part as
+    the source does (its row label, or the quote), which a partly given component's line names instead of the whole component
+    (round 18 U7)."""
+    from app.chat.items import source_name
+
     src = ws.sources[sid]
     place = {"sid": sid, "scope": "section" if src.section else None, "name": src.section}
     return {"reason": "not_verifiable", "variant": "read_not_used", "searched": True, "place": place,
-            "document": src.title, "document_id": str(src.document_id), "detail": src.location or ""}
+            "document": src.title, "document_id": str(src.document_id), "detail": src.location or "",
+            "part": _plain(source_name(src, quote), ITEM_NAME_CHARS) if quote else ""}
 
 
 _BRACKETS = re.compile(r"[\[\]\r\n]+")
@@ -795,22 +808,28 @@ def _plain(text: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[:limit].rstrip() + "…"
 
 
-def item_line(ws: Workspace, state: dict) -> dict:
+def item_line(ws: Workspace, state: dict, request: str = "") -> dict:
     """The server's line for one item of the ledger the answer does not give (round 17 U3, KTD3, R8): it names the item, the place
     in the source it was read at (the document, the location, the S#) and the reason — still omitted: read there and not used,
     never "not found"; ``not_verifiable`` / ``not_applicable``: the reason the agent gave. {"id", "state", "text", "document_id",
-    "title"}."""
-    from app.chat.verify import ITEM_NOT_APPLICABLE, ITEM_NOT_VERIFIABLE
+    "title"}. Round 18 U7 (KTD6): every word of the line is the server's or the source's. The item is named as the source names it (its
+    row label, or its quote; ``items.source_name``), never by the agent's label; the agent's reason is shown only when every content
+    word of it stands in the item's source context or in the ``request`` (``verify.words_stand_in``), else the state's own wording
+    stands without it."""
+    from app.chat.items import _contexts, source_name
+    from app.chat.verify import ITEM_NOT_APPLICABLE, ITEM_NOT_VERIFIABLE, words_stand_in
 
     src = ws.sources.get(state["source"])
     title = (src.title if src is not None else "") or ""
     place = _read_at(title, src.location if src is not None else "", state["source"])
-    name = "«" + _plain(state["label"] or state["quote"], ITEM_NAME_CHARS) + "»"
+    name = "«" + _plain(source_name(src, state["quote"]), ITEM_NAME_CHARS) + "»"
+    own = _contexts(src, state["quote"])[0] if src is not None else state["quote"]
     reason = _plain(state["reason"], ITEM_REASON_CHARS).rstrip(".")
+    reason = reason if reason and words_stand_in(reason, own, request) else ""
     if state["state"] == ITEM_NOT_VERIFIABLE:
-        text = f"{name}: נקרא {place}, אך לא ניתן לאמת אותו: {reason}."
+        text = f"{name}: נקרא {place}, אך לא ניתן לאמת אותו" + (f": {reason}." if reason else ".")
     elif state["state"] == ITEM_NOT_APPLICABLE:
-        text = f"{name}: נקרא {place}, ולא נכלל בתשובה כי הוא אינו חל על הבקשה: {reason}."
+        text = f"{name}: נקרא {place}, ולא נכלל בתשובה כי הוא אינו חל על הבקשה" + (f": {reason}." if reason else ".")
     else:
         text = f"{name}: נקרא {place}, ולא נעשה בו שימוש בתשובה."
     return {"id": state["id"], "state": state["state"], "text": text,
@@ -831,13 +850,16 @@ def item_gap_lines(ws: Workspace, report, outcomes: Sequence[dict]) -> list[dict
     )
 
     skip = {o["id"] for o in outcomes if o.get("status") == "not_relevant"}
+    request = " ".join([report.request, *(f"{o.get('text') or ''} {o.get('subject') or ''}" for o in outcomes)])
     # a part only the judge named is stated by its component's own line (round 16: ``read_not_used``), not twice; an item the server
     # built from a span a sentence cites (round 18 U5) is covered by that sentence and is never "read and not used"; a candidate a
     # component asked for (round 18 U6) is, once it stays omitted: its line is built from the source's label and quote (``item_line``)
-    lines = [item_line(ws, st) for st in report.item_states()
+    # an item a sentence gives by attribution and value but not by its date is no item "read and not used" (round 18 U7, KTD6): the date is a
+    # note at most
+    lines = [item_line(ws, st, request) for st in report.item_states()
              if st["component"] not in skip and (st["origin"] != ORIGIN_SOURCE or st["candidate"])
              and (st["state"] in (ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE)
-                  or (st["state"] == ITEM_OMITTED and st["origin"] != ORIGIN_JUDGE_SUPPORT))]
+                  or (st["state"] == ITEM_OMITTED and st["origin"] != ORIGIN_JUDGE_SUPPORT and st["why"] != "date_not_stated"))]
     if len(lines) <= ITEM_GAP_LINES:
         return lines
     rest = len(lines) - ITEM_GAP_LINES
@@ -891,6 +913,7 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
     claims, _ = _claims_by_component(ws, requested, opened)
     outcomes = report.requirement_outcomes(applied)
     signal = None  # the turn's unit signal, computed once for the first component that needs a reason
+    shown = cited_ids(applied.answer_markdown)  # the ids the final answer cites: a value among them is not called uncertain by its kind
     for o in outcomes:
         o |= {"limitation": None, "limitation_text": None, "place": None, "document": None, "document_id": None,
               "document_title": None,
@@ -900,10 +923,10 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
             continue
         if signal is None:
             signal = unit_signal(ws)
-        why = reason_of(ws, o, turn, claims.get(o["id"]), opened, signal)
+        why = reason_of(ws, o, turn, claims.get(o["id"]), opened, signal, shown)
         o |= {"limitation": why["reason"], "limitation_text": REASONS[why["reason"]], "place": why.get("place"),
               "document": why.get("document"), "document_id": why.get("document_id"), "searched": why["searched"],
-              "detail": why.get("detail") or "", "variant": why.get("variant") or ""}
+              "detail": why.get("detail") or "", "variant": why.get("variant") or "", "read_part": why.get("part") or ""}
         if o["document_id"]:
             o["document_title"] = ((ws.activity.get(o["document_id"]) or ws.unread_named.get(o["document_id"]) or {})
                                    .get("title"))
@@ -929,7 +952,8 @@ SHORT_COMPONENT_WORDS = 8  # a component of at most this many words, in one clau
 
 def gap_label(o: dict) -> str:
     """What a component's gap line names (R24): never the whole request or a long or multi-clause question. In order:
-    the part of a partly given component the answer does not give (R20; validated, so a noun phrase); the component's
+    the part of a partly given component the answer does not give (R20; validated, so a noun phrase), else, for the part a read
+    passage states and the answer omits, that part as the source names it (round 18 U7); the component's
     own words when they are a noun phrase; a short component (``SHORT_COMPONENT_WORDS`` words, one clause, no "?") as
     the user wrote it, a yes/no "האם …" one included; the words without a leading interrogative pronoun ("מהו תאריך
     הטופס?" -> "תאריך הטופס") when what remains is a noun phrase; the datum asked for, with the component's subject;
@@ -938,6 +962,8 @@ def gap_label(o: dict) -> str:
 
     if o.get("status") == "partial" and o.get("missing_part"):
         return o["missing_part"]
+    if o.get("status") == "partial" and o.get("variant") == "read_not_used" and o.get("read_part"):
+        return o["read_part"]  # the part a read passage states, as the source names it: the component is partly given, not wholly unused
     text = " ".join((o.get("text") or "").split())
     if text and not is_request_clause(text) and len(text) <= MISSING_PART_CHARS:
         return text
