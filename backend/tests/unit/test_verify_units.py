@@ -1589,7 +1589,7 @@ def test_the_judge_policy_names_the_server_held_line_and_the_derived_computation
 # --- the judge contract is version 14: a verdict of an older contract is not reused (round 13 U9, U11, KTD19; round 15 U7; round 16 U1; round 18 U3) --
 
 def test_a_verdict_cached_under_judge_contract_13_misses_under_14(monkeypatch):
-    assert verify.JUDGE_VERSION == 16  # 15: round 18 U4 (the marks of a table part's attribution, rule 32); 16: round 18 U5 (the condition outcome of an item in the requirements call, `conditions`)
+    assert verify.JUDGE_VERSION == 17  # 15: round 18 U4 (the marks of a table part's attribution, rule 32); 16: round 18 U5 (the condition outcome of an item in the requirements call, `conditions`); 17: round 18 U6 (the candidates of the requirements call, `candidates`)
     ws, a, cache = _valued(), _answer("הנכס פנוי [S1]."), verify.VerdictCache()
     judge, seen = _recording_supported()
     monkeypatch.setattr(verify, "JUDGE_VERSION", 13)

@@ -20,13 +20,13 @@ AGE_TABLE = "\n".join(["התאמות לנכס להשוואה", "סוג התאמ�
                        "גיל הבניין | 2% | כאשר הבניין מעל גיל 30 שנה"])
 
 
-def _ws(*texts: str, same_file: bool = False) -> Workspace:
+def _ws(*texts: str, same_file: bool = False, kind: str = "table") -> Workspace:
     """S1… each a source of its own document (or of one file, ``same_file``)."""
     ws = Workspace(ctx=None)
     document, version = uuid.uuid4(), uuid.uuid4()
     for t in texts:
         ws.add_source(document_id=document if same_file else uuid.uuid4(), version_id=version if same_file else uuid.uuid4(),
-                      title="דוח בדיקה", section="התאמות", location="טבלה 1", kind="table", text=t)
+                      title="דוח בדיקה", section="התאמות", location="טבלה 1", kind=kind, text=t)
     return ws
 
 
@@ -627,3 +627,153 @@ def test_a_sentence_that_gives_both_values_does_not_make_either_a_hint_from_the_
     ledger.merge([small, large])
     out = ledger.outcomes(_units("השכירות היא 3,000 עד שנה מהמסירה ו-5,000 לדירה גדולה [S1]."), ws)
     assert {o["condition_check"] for o in out} <= {"", "kept"}
+
+
+# --- round 18 U6: candidate items from the structure of the sources read (KTD2; R5-R7; AE5, AE6) ------------------------------------
+
+RATE_HEAD = ["תעריף לשימוש בחניון", "סוג שימוש | תעריף לשימוש (₪)"]
+RATE_ROWS = ["כניסה בודדת | 12", "כניסה בלילה | 8", "כניסה בסוף שבוע | 15", "דמי מנוי שנתי | 900"]
+RATE_TABLE = "\n".join([*RATE_HEAD, *RATE_ROWS])
+RATE_ASK = [{"id": "N1", "text": "התעריפים לשימוש בחניון"}]
+RATE_ONE = "התעריף לכניסה בודדת הוא 12 ₪ [S1]."
+REASONS_LIST = "\n".join(["הנימוקים להתאמה:", "- מיקום מרכזי בעיר", "- קרבה לתחבורה ציבורית", "- מצב תחזוקה טוב", "- חזית מסחרית רחבה"])
+REASONS_ASK = [{"id": "N1", "text": "הנימוקים להתאמה"}]
+REASONS_THREE = "ההתאמה נובעת ממיקום מרכזי בעיר, מקרבה לתחבורה ציבורית ומצב תחזוקה טוב [S1]."
+
+
+def _offer(ws: Workspace, markdown: str, components=RATE_ASK, ledger=None, request: str = ""):
+    return items.candidates(_units(markdown), ws, ledger if ledger is not None else items.Ledger(), components, request)
+
+
+def test_ae5_a_cited_row_of_a_rate_table_yields_the_other_data_rows_as_candidates_with_server_built_fields():
+    ws = _ws(RATE_TABLE)
+    offer = _offer(ws, RATE_ONE)
+    assert [(c.id, c.source, c.label, c.value) for c in offer.candidates] == [
+        ("K1", "S1", "כניסה בלילה", "8"), ("K2", "S1", "כניסה בסוף שבוע", "15"), ("K3", "S1", "דמי מנוי שנתי", "900")]
+    assert [c.quote for c in offer.candidates] == RATE_ROWS[1:] and offer.left_out == {} and offer.sources_left == 0
+    assert "תעריף לשימוש (₪)" in offer.candidates[0].own and "תעריף לשימוש בחניון" in offer.candidates[0].own  # header and caption
+    # the same candidates in the next call keep their ids
+    ledger = items.Ledger()
+    first = items.candidates(_units(RATE_ONE), ws, ledger, RATE_ASK, "")
+    again = items.candidates(_units(RATE_ONE), ws, ledger, RATE_ASK, "")
+    assert [c.id for c in again.candidates] == [c.id for c in first.candidates]
+
+
+def test_a_candidate_the_answer_covers_or_the_ledger_holds_is_not_offered_and_neither_is_a_header():
+    ws = _ws(RATE_TABLE)
+    both = _offer(ws, "התעריף לכניסה בודדת הוא 12 ₪ והתעריף לכניסה בלילה הוא 8 ₪ [S1].")
+    assert [c.label for c in both.candidates] == ["כניסה בסוף שבוע", "דמי מנוי שנתי"]
+    ledger = items.Ledger()
+    ledger.merge([_item(label="כניסה בסוף שבוע", quote="כניסה בסוף שבוע | 15", value="15")])
+    held = _offer(ws, RATE_ONE, ledger=ledger)
+    assert [c.label for c in held.candidates] == ["כניסה בלילה", "דמי מנוי שנתי"]
+
+
+def test_a_turn_with_no_agent_ledger_still_gets_candidates_from_a_cited_table_and_a_ledger_item_alone_anchors_its_table():
+    ws = _ws(RATE_TABLE)
+    assert len(_offer(ws, RATE_ONE).candidates) == 3  # no ledger item: the cited table anchors
+    ws = _ws(RATE_TABLE, "דוח\nפריט | ערך\nשטח | 40", same_file=True)
+    ledger = items.Ledger()
+    ledger.merge([_item(label="כניסה בודדת", quote="כניסה בודדת | 12", value="12")])
+    anchored = _offer(ws, "השטח הוא 40 [S2].", ledger=ledger)  # the answer cites another source of the file: the ledger item anchors S1
+    assert [c.label for c in anchored.candidates if c.source == "S1"] == ["כניסה בלילה", "כניסה בסוף שבוע", "דמי מנוי שנתי"]
+
+
+def test_a_source_the_answer_never_cites_and_no_ledger_item_names_anchors_nothing():
+    ws = _ws(RATE_TABLE, "טבלה אחרת\nשם | ערך\nפריט | 5")
+    assert {c.source for c in _offer(ws, RATE_ONE).candidates} == {"S1"}
+
+
+def test_a_four_member_list_where_the_answer_gives_three_yields_the_fourth_as_a_candidate():
+    ws = _ws(REASONS_LIST, kind="context")
+    offer = _offer(ws, REASONS_THREE, REASONS_ASK)
+    (c,) = offer.candidates
+    assert (c.source, c.label, c.value, c.quote) == ("S1", "", "חזית מסחרית רחבה", "- חזית מסחרית רחבה")
+    assert "הנימוקים להתאמה" in c.own  # the list's lead-in belongs to its own text
+
+
+def test_a_list_none_of_whose_members_the_answer_touches_is_no_anchor_and_a_sentence_run_needs_a_covered_sentence():
+    ws = _ws(REASONS_LIST, kind="context")
+    assert _offer(ws, "השווי נקבע לפי השוואה [S1].", REASONS_ASK).candidates == []
+    prose = _ws("שיעור ההיוון למשרדים הוא 6.5%. שיעור ההיוון למסחר הוא 7.0%. שיעור ההיוון לחניה הוא 8.25%.", kind="context")
+    ask = [{"id": "N1", "text": "שיעורי ההיוון"}]
+    (c,) = _offer(prose, "שיעור ההיוון למשרדים הוא 6.5% ושיעור ההיוון למסחר הוא 7.0% [S1].", ask).candidates
+    assert (c.label, c.value, c.quote) == ("שיעור ההיוון לחניה הוא 8.25%", "8.25%", "שיעור ההיוון לחניה הוא 8.25%.")
+    assert _offer(prose, "השווי נקבע לפי השוואה [S1].", ask).candidates == []
+
+
+def test_a_note_that_limits_a_value_is_its_condition_span_and_never_a_candidate_while_a_note_with_a_value_of_its_own_is_one():
+    text = "\n".join([*RATE_HEAD, *RATE_ROWS[:2], "הערה: התעריפים חלים רק בימי חול", "תעריף לילד: 5 ₪"])
+    ws = _ws(text)
+    offer = _offer(ws, RATE_ONE)
+    assert [c.label for c in offer.candidates][0] == "כניסה בלילה"
+    assert not any("בימי חול" in c.quote for c in offer.candidates)
+    assert [c.quote for c in offer.candidates if "5" in c.value] == ["תעריף לילד: 5 ₪"]
+    assert [(s.place, s.text) for s in items.condition_spans(ws.sources["S1"], "כניסה בודדת | 12")] == [
+        ("paragraph", "הערה: התעריפים חלים רק בימי חול")]  # the limiting note is the value's condition
+    night = next(c for c in offer.candidates if c.label == "כניסה בלילה")
+    assert night.condition == "הערה: התעריפים חלים רק בימי חול"
+
+
+def test_candidates_are_capped_per_anchor_source_and_the_count_left_out_is_recorded(monkeypatch):
+    monkeypatch.setattr(items, "CANDIDATES_PER_SOURCE", 2)
+    ws = _ws("\n".join([*RATE_HEAD, *RATE_ROWS, "כניסה בחג | 20"]))
+    offer = _offer(ws, RATE_ONE)
+    assert [c.label for c in offer.candidates] == ["כניסה בלילה", "כניסה בסוף שבוע"] and offer.left_out == {"S1": 2}
+
+
+def test_the_default_cap_is_twenty_candidates_per_source_and_a_few_sources():
+    assert items.CANDIDATES_PER_SOURCE == 20 and 1 <= items.CANDIDATE_SOURCES <= 6
+
+
+def test_a_candidate_of_another_appraisal_unit_of_the_same_file_is_not_offered():
+    ws = _ws(RATE_TABLE, RATE_TABLE, same_file=True)
+    _in_units(ws, 1, 2)
+    ledger = items.Ledger()
+    ledger.merge([_item(source="S2", label="כניסה בודדת", quote="כניסה בודדת | 12", value="12")])  # a ledger item of unit 2
+    offer = _offer(ws, RATE_ONE, ledger=ledger)  # the answer cites only unit 1's table
+    assert {c.source for c in offer.candidates} == {"S1"}
+
+
+def test_a_row_that_shares_no_word_with_the_request_or_its_components_is_not_offered():
+    ws = _ws(RATE_TABLE)
+    assert _offer(ws, RATE_ONE, [{"id": "N1", "text": "שטח הבניין"}], request="מה שטח הבניין?").candidates == []
+    assert len(_offer(ws, RATE_ONE, [], request="מהם התעריפים לשימוש בחניון?").candidates) == 3  # the request's words count too
+
+
+def test_a_candidate_becomes_an_origin_source_item_built_from_the_source_and_stays_open_until_a_sentence_gives_it():
+    ws = _ws(RATE_TABLE)
+    ledger = items.Ledger()
+    offer = items.candidates(_units(RATE_ONE), ws, ledger, RATE_ASK, "")
+    night = next(c for c in offer.candidates if c.label == "כניסה בלילה")
+    item = items.candidate_item(night, "N1", ledger)
+    assert (item.origin, item.candidate, item.state, item.component, item.label, item.value, item.quote) == (
+        "source", True, "included", "N1", "כניסה בלילה", "8", "כניסה בלילה | 8")
+    assert item.id and item.document_id == str(ws.sources["S1"].document_id) and item.condition == ""
+    ledger.merge([item])
+    (open_,) = ledger.outcomes(_units(RATE_ONE), ws)  # the sentence does not give it: a candidate stays open
+    assert (open_["state"], open_["origin"], open_["candidate"]) == ("omitted", "source", True)
+    (done,) = ledger.outcomes(_units(RATE_ONE + " התעריף לכניסה בלילה הוא 8 ₪ [S1]."), ws)
+    assert done["state"] == "covered"
+
+
+def test_an_origin_source_item_that_is_not_a_candidate_is_still_dropped_when_no_sentence_gives_it():
+    ws = _ws(RATE_TABLE)
+    ledger = items.Ledger()
+    plain = items.Item("N1", "כניסה בלילה", "S1", "כניסה בלילה | 8", "8", origin="source")
+    ledger.merge([plain])
+    assert ledger.outcomes(_units("אין כאן נתון."), ws) == []
+
+
+def test_an_agent_item_for_the_same_row_replaces_the_candidate_item_and_a_second_candidate_does_not_change_it():
+    ws = _ws(RATE_TABLE)
+    ledger = items.Ledger()
+    offer = items.candidates(_units(RATE_ONE), ws, ledger, RATE_ASK, "")
+    night = next(c for c in offer.candidates if c.label == "כניסה בלילה")
+    ledger.merge([items.candidate_item(night, "N1", ledger)])
+    ledger.merge([items.candidate_item(night, "N1", ledger)])
+    assert len(ledger.items) == 1
+    declared = _validate(ws, RATE_ONE, _raw(label="כניסה בלילה", quote="כניסה בלילה | 8", value="8", state="not_applicable",
+                                            reason="הבקשה היא לשעות היום"), components=RATE_ASK, ledger=ledger)
+    merged = ledger.merge(declared.kept)
+    assert [(i.origin, i.candidate, i.state) for i in merged] == [("agent", False, "not_applicable")]

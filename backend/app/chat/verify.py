@@ -288,8 +288,10 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # of why it is not attributed to the table («לא צמוד לטבלה», «בלי הפניה לטבלה») or that it is a heading-like label («כותרת בסעיף»);
 # rule (32) reads them. 16 (round 18 U5, KTD1): the requirements call's ``<item_ledger>`` asks the condition outcome of an item whose
 # condition the server could not decide (``check``, ``span``, ``unit``, ``hint``), and a requirement carries per-item ``conditions``
-# (kept, missing, contradicted or from another item, each with a quote in the right span).
-JUDGE_VERSION = 16
+# (kept, missing, contradicted or from another item, each with a quote in the right span). 17 (round 18 U6, KTD2): the requirements call's
+# ``<candidates>`` offers the siblings of what the answer draws on (a table's other rows, a list's other members, a passage's other
+# value-bearing sentences) and a requirement names the ones it asks for with the request words they answer (``candidates``).
+JUDGE_VERSION = 17
 # the label of the facts the server holds about a cited source's unit and states beside its text (round 13 U9, KTD10, R13): the
 # stated valuation date of the unit that holds the passage, and why the server linked the appraisal to the property. Read
 # from the stored document, not from the passage: the judge takes them as evidence, never as a claim to check
@@ -513,7 +515,13 @@ JUDGE_REQUIREMENTS_POLICY = (
     "למשל «כולל» במקום «אינו כולל» (quote — מילה במילה מתוך ה-span של הפריט שהיא סותרת); other_item — היחידה נותנת לערך תנאי "
     "שמקורו בפריט אחר (hint=\"other_item:I#\"; quote — מילה במילה מתוך ה-span של הפריט האחר). תנאי שהיחידה אומרת באותה משמעות "
     "הוא kept גם כשהמילים שונות. hint=\"contradicted\" הוא חשד של השרת בלבד: אשר אותו רק אם היחידה באמת אומרת את ההפך. החזר רשומה "
-    "רק לפריט שמסומן check, ולכל היותר אחת לפריט; כשאינך בטוח אל תחזיר רשומה. תנאי חסר או שגוי אינו סיבה להסיר את הערך."
+    "רק לפריט שמסומן check, ולכל היותר אחת לפריט; כשאינך בטוח אל תחזיר רשומה. תנאי חסר או שגוי אינו סיבה להסיר את הערך.\n"
+    "מועמדים: כשמופיע <candidates>, הוא מפרט שורות של טבלה, חברי רשימה ומשפטים מהמקורות שנקראו (K#, source, label ו-value כפי "
+    "שהמקור כותב אותם) שהתשובה אינה נותנת, בקרבת מה שהתשובה והפנקס נשענים עליו; <more> — כמה מועמדים נוספים לא הוצגו. מועמד "
+    "שדרישה של הבקשה מבקשת — פריט מאותו סוג שהיא מבקשת, בנושא ובנכס שנשאלו — החזר ב-candidates של אותה דרישה {candidate: K#, "
+    "words}: words — ביטוי קצר ממילות הבקשה או הדרישה שהמועמד עונה עליהן, כפי שגם השורה שלו, כותרת העמודה, הכיתוב או הכותרת "
+    "שלו כותבים אותן. מועמד שאף דרישה אינה מבקשת (שורה שהבקשה לא שאלה עליה) — אל תחזיר עליו רשומה, הוא לא התבקש. כשאינך בטוח "
+    "אל תחזיר רשומה, ולעולם לא מילים שאינן בבקשה."
 )
 # the judge's scores of a requirement in one call
 REQUIREMENT_STATUSES = ("full", "partial", "missing", "undeterminable")
@@ -557,6 +565,8 @@ TRACE_QUOTE_CHARS = 160  # the most of a support quote the trace keeps
 TRACE_MISSING_CHARS = 200  # the most of a ``missing`` text it keeps
 TRACE_SUPPORT_PER_VOTE = 12  # support entries kept per vote (the rest are counted in ``support_omitted``)
 TRACE_ITEMS_PER_COMPONENT = 24  # ledger items kept per component in the trace
+TRACE_CANDIDATES_PER_VOTE = 24  # candidate assignments kept per vote in the trace
+CANDIDATE_TEXT_CHARS = 120  # the most of a candidate's label or value the requirements call shows
 TRACE_VOTES_PER_COMPONENT = 8  # votes (judge calls) kept per component and round
 TRACE_COMPONENTS = 40  # components kept per round
 TRACE_PASSAGE_IDS = 60  # passage ids kept per call
@@ -817,6 +827,16 @@ class ConditionVerdict(_Strict):
     quote: str = ""
 
 
+class CandidateAssignment(_Strict):
+    """The judge's reading of one candidate (round 18 U6, KTD2): the requirement it sits under asks for the candidate ``candidate``
+    (K#), and ``words`` are the request words it answers — a short noun phrase of the request or the requirement that the candidate's
+    own row, column header, caption or heading writes too (the server keeps the assignment only then: ``_Coverage.valid_candidates``).
+    A candidate no requirement names is not asked."""
+
+    candidate: str
+    words: str
+
+
 class JudgeRequirement(_Strict):
     """A requirement of the request with its score in one judge call. A deriving call (the fallback) gives ``text``,
     ``kind``, ``calculation`` and ``conditional`` (the server assigns the id); a scoring call gives the frozen
@@ -847,6 +867,9 @@ class JudgeRequirement(_Strict):
     # the condition outcome of each ledger item the call asked (``<item_ledger>`` items with ``check``), kept per vote and only when
     # its quote stands in the right span (``_Coverage.valid_conditions``, round 18 U5). Empty by default, so an older reply stays valid.
     conditions: list[ConditionVerdict] = Field(default_factory=list)
+    # the candidates (``<candidates>``) this requirement asks for, each with the request words it answers; kept per vote and only when
+    # the words stand in the requirement or request and in the candidate's own text (``_Coverage.valid_candidates``, round 18 U6).
+    candidates: list[CandidateAssignment] = Field(default_factory=list)
     # diagnostics only, never in the provider's schema: the call this vote came from, its read passages and what became of each
     # support entry (``_Coverage.accept``, ``validated_support``); travels with the vote, also when a later round carries it
     _trace: dict | None = PrivateAttr(default=None)
@@ -891,6 +914,25 @@ def _missing_forms(word: str) -> set[str]:
 def _missing_words(text: str) -> list[str]:
     """The content words of a text: Hebrew and latin words and numbers, without the stop words."""
     return [t for t in _MISSING_TOKEN.findall(text or "") if t.casefold() not in _MISSING_STOP]
+
+
+_FINAL_LETTERS = str.maketrans("ךםןףץ", "כמנפצ")
+
+
+def _loose_forms(word: str) -> set[str]:
+    """``_missing_forms`` with the final letters read as their medial forms, so that the singular and plural of a noun meet
+    ("תעריף" and "התעריפים"): how a candidate's request words are compared (round 18 U6)."""
+    return {f.translate(_FINAL_LETTERS) for f in _missing_forms(word)}
+
+
+def request_word_forms(text: str) -> set[str]:
+    """The comparable forms (``_loose_forms``) of every content word of ``text`` that is not a number."""
+    return {f for w in _missing_words(text) if not w[0].isdigit() for f in _loose_forms(w)}
+
+
+def shares_request_word(text: str, forms: set[str]) -> bool:
+    """Whether a content word of ``text`` (not a number) has a comparable form among ``forms`` (``request_word_forms``)."""
+    return any(_loose_forms(w) & forms for w in _missing_words(text) if not w[0].isdigit())
 
 
 # What qualifies a claim (round 9 KTD10, R19–R21): one lexicon, used twice — a cut span holding any of it is never dropped
@@ -1642,6 +1684,10 @@ class VerifyReport:
     item_ledger: Ledger | None = None
     item_ws: Workspace | None = None
     item_gaps: list[dict] = field(default_factory=list)
+    # the candidates this verification's requirements calls were offered, by K# (``items.Candidate``), and the offer's record (the K# ids,
+    # the counts left out): the judge's validated assignments are read against them (``add_candidate_items``), round 18 U6
+    candidate_pool: dict = field(default_factory=dict)
+    candidate_offer: dict = field(default_factory=dict)
     # calculation components waiting for a detail only the user can give (round 7 KTD9): id -> the parameters no
     # user assumption and no document rate of the turn fills (``unfilled_parameters``)
     pending_parameters: dict[str, list[str]] = field(default_factory=dict)
@@ -2060,7 +2106,8 @@ class VerifyReport:
         ``not_verifiable`` / ``not_applicable`` the agent declared with a reason. Empty without a ledger. ``texts``: the
         components' texts by id, when the report does not hold them yet (before the judge), so that the presence test of a
         judge-added item reads the same words before and after the judge. An origin ``source`` item (round 18 U5) is in the result only
-        while a surviving unit gives it, and the presence test below is for the judge's items alone."""
+        while a surviving unit gives it, unless a component asks for it (a ``candidate``, round 18 U6: an open item like an agent's),
+        and the presence test below is for the judge's items alone."""
         ledger = self.item_ledger
         if ledger is None or not ledger.items:
             return []
@@ -2069,8 +2116,9 @@ class VerifyReport:
             kept = {u.index for u in self.units if u.index not in gone}
         units = [self._as_edited(u) for u in self.units if u.index in kept]
         # an origin ``source`` item exists only while a surviving unit gives it (the sentence that cited its span): otherwise it is no
-        # open item and no line (round 18 U5)
-        states = [st for st in ledger.outcomes(units, self.item_ws) if st["origin"] != ORIGIN_SOURCE or st["state"] == ITEM_COVERED]
+        # open item and no line (round 18 U5); a candidate a component asks for is open until a unit gives it (round 18 U6)
+        states = [st for st in ledger.outcomes(units, self.item_ws)
+                  if st["origin"] != ORIGIN_SOURCE or st["candidate"] or st["state"] == ITEM_COVERED]
         texts = texts if texts is not None else {r["id"]: r["text"] for r in self.requirements}
         for st in states:
             # the judge names a part by its quote alone: unit attribution is not enough for it, the round-16 presence test must
@@ -2109,7 +2157,8 @@ class VerifyReport:
         (``spans``, in full: the server checks a judge's quote against them). ``texts``: see ``item_states``."""
         out = []
         for s in self.item_states(kept, texts):
-            row = {k: s[k] for k in ("id", "component", "origin", "label", "source", "quote", "value", "condition", "state", "reason")}
+            row = {k: s[k] for k in ("id", "component", "origin", "candidate", "label", "source", "quote", "value", "condition", "state",
+                                     "reason")}
             asked = ask and s["condition_check"] in ASKED_CHECKS
             out.append(row | {"check": s["condition_check"] if asked else "", "unit": s["condition_unit"],
                               "hint": s["condition_hint"], "foreign": s["condition_foreign"],
@@ -2128,15 +2177,38 @@ class VerifyReport:
         ledger.merge([item_ledger.support_item(cid, x["id"], x["quote"], ledger, ws=self.item_ws)
                       for cid, entries in support.items() for x in entries])
 
+    def add_candidate_items(self) -> None:
+        """The candidates a requirements call offered and a frozen component asks for (``JudgeRequirement.candidates``, validated by
+        ``_Coverage.valid_candidates``) enter the turn's ledger as items the server builds from the source (``items.candidate_item``,
+        round 18 U6, KTD2; R6, R7): origin ``source``, label, value and condition from the source, open until a surviving unit gives
+        them. A candidate a component of an earlier call asked for stays in the ledger; one named by two components belongs to the
+        first. Nothing is added without a ledger or for a candidate this verification was not offered."""
+        from app.chat import items as item_ledger
+
+        ledger = self.item_ledger
+        if ledger is None or not self.candidate_pool:
+            return
+        kept = []
+        seen: set[str] = set()
+        for r in self.requirements:
+            for v in self.requirement_votes.get(r["id"], []):
+                for a in v.candidates:
+                    c = self.candidate_pool.get(a.candidate)
+                    if c is not None and a.candidate not in seen:
+                        seen.add(a.candidate)
+                        kept.append(item_ledger.candidate_item(c, r["id"], ledger))
+        ledger.merge(kept)
+
     def item_diagnostics(self) -> dict:
-        """The turn's ledger for the diagnostics: each item with its state against the units that stand, and what validation
-        excluded (``{}`` without items)."""
+        """The turn's ledger for the diagnostics: each item with its state against the units that stand, what validation excluded and
+        what the candidate offer held (``{}`` without items)."""
         ledger = self.item_ledger
         if ledger is None or not (ledger.items or ledger.excluded or ledger.misattributed):
             return {}
         # round 18 U5: the conditions an agent wrote that stand only in another item's context are recorded, never silent
         return {"items": self.item_states(), "excluded": list(ledger.excluded)} | (
-            {"misattributed": list(ledger.misattributed)} if ledger.misattributed else {})
+            {"misattributed": list(ledger.misattributed)} if ledger.misattributed else {}) | (
+            {"candidates": dict(self.candidate_offer)} if self.candidate_offer.get("offered") else {})
 
     @staticmethod
     def _score_row(v: JudgeRequirement) -> dict:
@@ -2285,8 +2357,9 @@ class VerifyReport:
         omitted_by: dict[str, list[dict]] = {}
         closed: set[tuple[str, str, str]] = set()
         for st in self.item_states(kept) if states is None else states:
-            if st["origin"] == ORIGIN_SOURCE:
+            if st["origin"] == ORIGIN_SOURCE and not st["candidate"]:
                 continue  # an item the server built from a cited span is given by the sentence that cites it: it never caps a component
+                # (a candidate a component asked for (round 18 U6) is an item of that component like an agent's: it caps it while omitted)
             if st["state"] == ITEM_OMITTED:
                 omitted_by.setdefault(st["component"], []).append(st)
             else:
@@ -5796,6 +5869,7 @@ class _VoteTrace:
         self.index: dict[tuple[str, str], int] = {}  # (id, quote) -> its entry, for the entries still undecided
         self.omitted = 0
         self.conditions: list[dict] = []  # the condition outcomes the judge returned, each with whether the server accepted it
+        self.candidates: list[dict] = []  # the candidate assignments the judge returned, each with whether the server kept it and why not
 
     def note(self, sid: str, quote: str, outcome: str | None) -> None:
         if len(self.entries) >= TRACE_SUPPORT_PER_VOTE:
@@ -5813,7 +5887,8 @@ class _VoteTrace:
     def as_dict(self, missing: str, judged_missing: str) -> dict:
         out = {"call": self.call, "reused": False, "status": self.status, "missing": missing[:TRACE_MISSING_CHARS],
                "passages": self.passages, "support": self.entries, "support_omitted": self.omitted,
-               "conditions": self.conditions[:TRACE_SUPPORT_PER_VOTE], "_index": self.index}
+               "conditions": self.conditions[:TRACE_SUPPORT_PER_VOTE], "candidates": self.candidates[:TRACE_CANDIDATES_PER_VOTE],
+               "_index": self.index}
         if judged_missing.strip() and judged_missing.strip() != missing:
             out["missing_dropped"] = judged_missing.strip()[:TRACE_MISSING_CHARS]  # the judge's words the server did not keep
         return out
@@ -5961,6 +6036,11 @@ class _Coverage:
     calls: int = 0  # the calls whose scores were accepted so far (the requirements trace numbers them)
     # round 17 U3 (KTD3): the turn's item ledger as ``VerifyReport.item_listing`` gives it, rendered beside ``<read_passages>``
     items: list[dict] = field(default_factory=list)
+    # round 18 U6 (KTD2): the candidates the call offers (``items.Candidate.listing``), the number left out of each anchor source and of
+    # the anchor sources (``items.Offer``), rendered beside the ledger
+    candidates: list[dict] = field(default_factory=list)
+    candidates_left: dict[str, int] = field(default_factory=dict)
+    candidate_sources_left: int = 0
 
     def component_texts(self) -> list[str]:
         """What the passages are clipped against: the asked components, else (before they are derived) the request and the
@@ -5985,6 +6065,8 @@ class _Coverage:
                 + "\n</derive_requirements>"
         if ledger := _item_ledger_block(self.items):
             out += "\n" + ledger
+        if offered := _candidates_block(self.candidates, self.candidates_left, self.candidate_sources_left):
+            out += "\n" + offered
         if passages:
             out += "\n" + passages
         out += f"\n<workspace>\n{self.workspace}\n</workspace>"
@@ -6010,7 +6092,8 @@ class _Coverage:
                                      "absent": [i for i in r.absent if i in indexes],
                                      "related": [x for x in dict.fromkeys(r.related) if x in self.known],
                                      "missing": missing, "support": self.valid_support(r, trace),
-                                     "conditions": self.valid_conditions(r, indexes, trace)})
+                                     "conditions": self.valid_conditions(r, indexes, trace),
+                                     "candidates": self.valid_candidates(r, texts, trace)})
             v._trace = trace.as_dict(missing, r.missing)
             v._stamp = {"call_units": sorted(indexes)}
             out.append(v)
@@ -6077,6 +6160,41 @@ class _Coverage:
                 out[c.item.strip()] = ConditionVerdict(item=c.item.strip(), outcome=c.outcome, quote=c.quote.strip())
         return list(out.values())
 
+    def valid_candidates(self, r: JudgeRequirement, texts: dict[str, str], trace: _VoteTrace | None = None
+                         ) -> list[CandidateAssignment]:
+        """The candidate assignments a vote keeps (round 18 U6, KTD2; R6), each candidate once: only for a candidate this call offered,
+        under a requirement that asks for data of the documents (information or calculation), with request words — a short noun phrase,
+        no clause of the request — every content word of which stands in the requirement's text or the user's request AND in the
+        candidate's own text (its row, column header, caption or heading): ``valid_missing``'s rule, with the final letters read as medial
+        ones. The server never keeps an assignment on the judge's word alone. The trace says why an assignment was dropped."""
+        trace = trace or _VoteTrace(0, r.status, None)
+        pool = {c["id"]: c for c in self.candidates}
+        kind = next((x.get("kind") or ("calculation" if x.get("calculation") else "information")
+                     for x in self.turn.items if x["id"] == r.id), "information")
+        known = [_loose_forms(w) for w in _missing_words(f"{texts.get(r.id, '')}\n{self.request}")]
+        out: dict[str, CandidateAssignment] = {}
+        for a in r.candidates:
+            cid, part = a.candidate.strip(), _norm(a.words or "")
+            words = _missing_words(part)
+            c = pool.get(cid)
+            if c is None:
+                why = "not_offered"
+            elif cid in out:
+                why = "duplicate"
+            elif kind not in SEARCHABLE_KINDS:
+                why = "not_a_datum"
+            elif not words or len(part) > MISSING_PART_CHARS or is_request_clause(part):
+                why = "no_words"
+            elif not all(any(_loose_forms(w) & k for k in known) for w in words):
+                why = "words_not_in_request"
+            else:
+                own = [_loose_forms(w) for w in _missing_words(c.get("own", ""))]
+                why = None if all(any(_loose_forms(w) & o for o in own) for w in words) else "words_not_in_candidate"
+            trace.candidates.append({"candidate": cid, "words": part[:TRACE_MISSING_CHARS], "accepted": why is None, "why": why or ""})
+            if why is None:
+                out[cid] = CandidateAssignment(candidate=cid, words=part)
+        return list(out.values())
+
 
 DECIDED_MISSING = "missing"  # the condition check the server decides alone (``conditions.MISSING``): not asked, completed
 ASKED_CHECKS = ("undecided", "hint")  # the condition checks the requirements call is asked to decide (``Ledger.outcomes``)
@@ -6097,12 +6215,13 @@ def _item_ledger_block(items: list[dict]) -> str:
     condition span its source states (``span``), the unit that gives it (``unit``) and, for a hint, what the server suspects
     (``hint``: ``contradicted``, or ``other_item:I#``); the items a hint names carry their spans too, so the judge can quote them.
     An item whose condition the server decided, or that has none, is rendered as before, and an origin ``source`` item the judge
-    is not asked about is not rendered: a turn with no undecided condition is shown exactly the ledger it was."""
+    is not asked about is not rendered: a turn with no undecided condition is shown exactly the ledger it was. A ``candidate`` item
+    (round 18 U6: an origin ``source`` item a component asked for) is rendered like an agent's: it is an open requirement of its component."""
     asked = {i["id"] for i in items if i.get("check") in ASKED_CHECKS}
     named = {x for i in items if i["id"] in asked for x in i.get("foreign", ())}
     by_component: dict[str, list[dict]] = {}
     for i in items:
-        if i.get("origin") == ORIGIN_SOURCE and i["id"] not in asked | named:
+        if i.get("origin") == ORIGIN_SOURCE and not i.get("candidate") and i["id"] not in asked | named:
             continue
         by_component.setdefault(i["component"], []).append(i)
     blocks = []
@@ -6127,6 +6246,29 @@ def _item_ledger_block(items: list[dict]) -> str:
             lines.append(f'<more count="{len(mine) - len(shown)}"/>')
         blocks.append(f'<component id="{prompt_attr(cid)}">\n' + "\n".join(lines) + "\n</component>")
     return "<item_ledger>\n" + "\n".join(blocks) + "\n</item_ledger>" if blocks else ""
+
+
+def _candidates_block(candidates: list[dict], left_out: dict[str, int], sources_left: int = 0) -> str:
+    """The ``<candidates>`` block of a requirements call (round 18 U6, KTD2): the siblings of what the answer draws on that it does
+    not give, each compact — its K#, source, label and value as the source writes them, never its quote or its context — grouped by
+    source, with ``<more source=… count=…/>`` for the candidates a source's cap left out and ``<more_sources count=…/>`` for the anchor
+    sources left out. Empty when nothing is offered, so a turn without a candidate is shown exactly the call it was."""
+    if not candidates:
+        return ""
+    lines = []
+    sources = list(dict.fromkeys(c["source"] for c in candidates))
+    for sid in sources:
+        for c in (x for x in candidates if x["source"] == sid):
+            attrs = f'id="{prompt_attr(c["id"])}" source="{prompt_attr(sid)}"'
+            for name in ("label", "value"):
+                if c.get(name):
+                    attrs += f' {name}="{prompt_attr(c[name][:CANDIDATE_TEXT_CHARS])}"'
+            lines.append(f"<candidate {attrs}/>")
+        if left_out.get(sid):
+            lines.append(f'<more source="{prompt_attr(sid)}" count="{left_out[sid]}"/>')
+    if sources_left:
+        lines.append(f'<more_sources count="{sources_left}"/>')
+    return "<candidates>\n" + "\n".join(lines) + "\n</candidates>"
 
 
 def _requirement_attrs(r: dict) -> str:
@@ -6936,6 +7078,13 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         # is checked also when the agent declared nothing (round 18 U5, KTD1)
         ledger.merge(item_ledger.source_items(stand, ws, requirements.items, ledger), version=item_version)
         report.item_ledger, report.item_ws = ledger, ws
+        # the siblings of what the answer draws on that it does not give are offered to the requirements call (round 18 U6, KTD2): the
+        # judge assigns them to the frozen components, the server validates the assignment and builds the items
+        offer = item_ledger.candidates(stand, ws, ledger, requirements.items, request or question)
+        report.candidate_pool = {c.id: c for c in offer.candidates}
+        report.candidate_offer = offer.record()
+        coverage.candidates, coverage.candidates_left = [c.listing() for c in offer.candidates], dict(offer.left_out)
+        coverage.candidate_sources_left = offer.sources_left
         coverage.items = report.item_listing({u.index for u in stand}, {r["id"]: r["text"] for r in requirements.items})
     # a missing qualifier does not keep the unit from the judge: it is annotated only if the unit is supported
     for u in units:
@@ -6997,7 +7146,8 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         signature = (tuple((keys[u.index], u.index in failed) for u in units),
                      coverage.workspace if coverage else "", request or question,
                      tuple(r["id"] for r in requirements.items) if requirements is not None else (),
-                     tuple((i["id"], i["state"], i["check"], i["unit"]) for i in coverage.items) if coverage else ())
+                     tuple((i["id"], i["state"], i["check"], i["unit"]) for i in coverage.items) if coverage else (),
+                     tuple(c["id"] for c in coverage.candidates) if coverage else ())
     # a lead-in before list items is structure (round 13 U10, KTD12, R15): the judge is not asked, it is recorded as navigation,
     # and its numbers are read by the deterministic checks above like any unit's
     for u in to_judge:
@@ -8013,6 +8163,7 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
     failed = {p.unit.index for p in report.problems if p.removes_unit}
     report.text_support = support = validated_support(report, ws, failed)
     report.add_support_items(support)  # a member the ledger missed joins it as an omitted item (round 17 U3, R6)
+    report.add_candidate_items()  # a candidate a component asks for joins it too, built from the source (round 18 U6, R6, R7)
     for r in report.requirements:
         for v in report.requirement_votes.get(r["id"], []):
             evidence = related_evidence(ws, {"related": v.related}, turn)["data"] or [

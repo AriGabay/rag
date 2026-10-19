@@ -832,9 +832,10 @@ def item_gap_lines(ws: Workspace, report, outcomes: Sequence[dict]) -> list[dict
 
     skip = {o["id"] for o in outcomes if o.get("status") == "not_relevant"}
     # a part only the judge named is stated by its component's own line (round 16: ``read_not_used``), not twice; an item the server
-    # built from a span a sentence cites (round 18 U5) is covered by that sentence and is never "read and not used"
+    # built from a span a sentence cites (round 18 U5) is covered by that sentence and is never "read and not used"; a candidate a
+    # component asked for (round 18 U6) is, once it stays omitted: its line is built from the source's label and quote (``item_line``)
     lines = [item_line(ws, st) for st in report.item_states()
-             if st["component"] not in skip and st["origin"] != ORIGIN_SOURCE
+             if st["component"] not in skip and (st["origin"] != ORIGIN_SOURCE or st["candidate"])
              and (st["state"] in (ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE)
                   or (st["state"] == ITEM_OMITTED and st["origin"] != ORIGIN_JUDGE_SUPPORT))]
     if len(lines) <= ITEM_GAP_LINES:

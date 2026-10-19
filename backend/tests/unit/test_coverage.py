@@ -2979,3 +2979,238 @@ def test_an_agent_condition_that_stands_only_in_another_row_is_recorded_in_the_d
     assert [(m["quote"], m["version"]) for m in diag["misattributed"]] == [("מסחר | 6%", 0)] and diag["items"]
     out = api._diagnostics(TurnOutcome(answer, ws, r, 1, item_ledger=diag), {})
     assert out["resolution"]["item_ledger"]["misattributed"] and str(ws.sources["S2"].document_id) in out["document_ids"]
+
+
+# --- round 18 U6: candidate items decided in the requirements call (KTD2, KTD8; R5-R7; AE5, AE6) -------------------------------------
+
+RATE_ROWS = ["תעריף לשימוש בחניון", "סוג שימוש | תעריף לשימוש (₪)", "כניסה בודדת | 12", "כניסה בלילה | 8", "כניסה בסוף שבוע | 15",
+             "דמי מנוי שנתי | 900"]
+RATE_ASKED = "התעריפים לשימוש בחניון"
+RATE_ONE = "התעריף לכניסה בודדת הוא 12 ₪ [S2]."
+RATE_THREE = RATE_ONE + " התעריף לכניסה בלילה הוא 8 ₪ [S2]. התעריף לכניסה בסוף שבוע הוא 15 ₪ [S2]."
+
+
+def _per_entry(cid: str, attrs: str) -> str | None:
+    """The scripted judge's reading of a candidate: the entries are asked for, the subscription row is not."""
+    return "תעריף לשימוש" if "כניסה" in attrs else None
+
+
+def _candidate_judge(assign=_per_entry, seen: list | None = None) -> ScriptedProvider:
+    """A judge that gives every component full over the units shown and, for each ``<candidate>`` the call renders, names the
+    request words it answers with ``assign(id, attrs)`` (None: not asked), under every scored requirement."""
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        if seen is not None:
+            seen.append(input)
+        units = {int(i): t for i, t in re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S)}
+        asks = []
+        for cid, attrs in re.findall(r'<candidate id="(K\d+)"([^>]*)/>', input):
+            words = assign(cid, attrs)
+            if words is not None:
+                asks.append({"candidate": cid, "words": words})
+        out = {"verdicts": [{"index": i, "verdict": "supported", "reason": "בדיקה"} for i in units]}
+        if "<requirements>" in input:
+            ids = re.findall(r'<requirement id="(N[\d.]+)"', input)
+            out["requirements"] = [_req("", "full", list(units), id=i) | {"candidates": asks} for i in ids]
+        return out
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    return p
+
+
+def _rate_file(*rows: str) -> Workspace:
+    ws = _file(SOURCE, "\n".join(rows or RATE_ROWS), units=(1, 1), declared=(1,))
+    ws.sources["S2"].kind = "table"
+    return ws
+
+
+def _rate_check(markdown: str, assign=_per_entry, *, ledger=None, seen=None, ask: str = RATE_ASKED, raw=(), ws=None):
+    from app.chat import items as ledger_items
+
+    ws = ws or _rate_file()
+    turn = _turn({"id": "1", "text": ask})
+    answer = _answer(markdown).model_copy(update={"items": list(raw)})
+    ledger = ledger if ledger is not None else ledger_items.Ledger()
+    report = verify_answer(_candidate_judge(assign, seen), answer, ws, "?", [], requirements=turn, ledger=ledger)
+    return report, ws, answer, ledger, turn
+
+
+def test_an_old_reply_without_candidates_is_still_a_valid_requirement_score_and_the_schema_has_the_field():
+    out = verify.JudgeCoverageOutput.model_validate({"verdicts": [], "requirements": [{"id": "N1", "status": "full"}]})
+    assert out.requirements[0].candidates == []
+    assert "candidates" in verify.JudgeRequirement.model_json_schema()["properties"]
+    assert verify.JUDGE_VERSION == 17
+
+
+def test_ae5_the_other_rows_of_a_cited_rate_table_are_candidates_the_judge_assigns_become_items_and_the_repair_adds_them():
+    seen: list[str] = []
+    r, ws, answer, ledger, _ = _rate_check(RATE_ONE, seen=seen)
+    block = re.search(r"<candidates>.*?</candidates>", seen[0], re.S).group()
+    assert block.count("<candidate ") == 3  # the other three rows of the table; the cited row is not offered
+    assert seen[0].index("<candidates>") < seen[0].index("<workspace>")
+    made = [i for i in ledger.items.values() if i.candidate]
+    assert [(i.label, i.value, i.origin, i.state, i.component) for i in made] == [
+        ("כניסה בלילה", "8", "source", "included", "N1"), ("כניסה בסוף שבוע", "15", "source", "included", "N1")]
+    assert all(i.condition == "" and i.quote in RATE_ROWS for i in made)  # built by the server from the source
+    assert "דמי מנוי" not in "".join(i.label for i in ledger.items.values())  # not asked: never an item
+    (o,) = r.requirement_outcomes()
+    assert o["status"] == "partial" and sorted(o["omitted_items"]) == sorted(i.id for i in made)  # the lenient judge said full
+    (p,) = [p for p in r.problems if p.kind == "requirement" and p.component == "N1"]
+    assert p.check == verify.TEXT_FOUND_CHECK and "כניסה בלילה | 8" in p.reason and "כניסה בסוף שבוע | 15" in p.reason
+    assert "דמי מנוי" not in p.reason and "חיפוש" in p.reason and "S2" in p.reason  # from the table already read, no new search
+    assert r.text_completion_only() is True  # the repair round runs with its tools off
+    # the repair adds them: the same ledger makes the component full, and no candidate is offered again
+    seen.clear()
+    again, *_ = _rate_check(RATE_THREE, ledger=ledger, seen=seen)
+    (o2,) = again.requirement_outcomes()
+    assert o2["status"] == "full" and not o2.get("omitted_items") and not [p for p in again.problems if p.kind == "requirement"]
+    assert [i["state"] for i in again.item_states()] == ["covered", "covered"]
+    assert re.search(r"<candidates>.*?</candidates>", seen[0], re.S).group().count("<candidate ") == 1  # only the subscription row
+
+
+def test_ae6_a_row_the_judge_does_not_assign_never_becomes_an_item_and_is_not_asked_for():
+    r, ws, answer, ledger, _ = _rate_check(RATE_ONE, lambda cid, attrs: None)
+    assert ledger.items == {} and not [p for p in r.problems if p.kind == "requirement"]
+    assert r.requirement_outcomes()[0]["status"] == "full"
+    (vote,) = r.requirements_trace()[0]["votes"]
+    assert vote["candidates"] == []
+
+
+def _cov(candidates: list[dict], ask: str = RATE_ASKED, request: str = "?") -> verify._Coverage:
+    return verify._Coverage(_turn({"id": "1", "text": ask}), [], request, candidates=candidates)
+
+
+NIGHT = {"id": "K1", "source": "S2", "label": "כניסה בלילה", "value": "8", "quote": "כניסה בלילה | 8",
+         "own": "תעריף לשימוש בחניון סוג שימוש תעריף לשימוש (₪) כניסה בלילה | 8"}
+
+
+def _assigned(words: str, cid: str = "K1", cov=None):
+    from app.chat.verify import CandidateAssignment, JudgeRequirement
+
+    cov = cov or _cov([NIGHT])
+    vote = JudgeRequirement(id="N1", status="full", candidates=[CandidateAssignment(candidate=cid, words=words)])
+    trace = verify._VoteTrace(1, "full", None)
+    kept = cov.valid_candidates(vote, {"N1": RATE_ASKED}, trace)
+    return [a.candidate for a in kept], trace.candidates
+
+
+def test_ae6_an_assignment_is_kept_only_when_its_words_are_in_the_request_or_component_and_in_the_candidates_own_text():
+    assert _assigned("תעריף לשימוש")[0] == ["K1"]
+    assert _assigned("תעריפים לשימוש")[0] == ["K1"]  # plural and prefix forms meet
+    ids, trace = _assigned("מנוי שנתי")  # in the candidate's neighbour row, not in the request or the component
+    assert ids == [] and trace[0]["why"] == "words_not_in_request"
+    ids, trace = _assigned("חניון", cov=_cov([NIGHT | {"own": "סוג שימוש כניסה בלילה | 8"}]))  # in the request, not in the candidate's text
+    assert ids == [] and trace[0]["why"] == "words_not_in_candidate"
+    assert _assigned("")[0] == [] and _assigned("   ")[1][0]["why"] == "no_words"
+    assert _assigned("תעריף לשימוש", cid="K9")[1][0]["why"] == "not_offered"
+    assert _assigned("מה התעריף לשימוש?")[1][0]["why"] == "no_words"  # a clause of the request is no noun phrase
+    ids, trace = _assigned("תעריף לשימוש")
+    assert trace == [{"candidate": "K1", "words": "תעריף לשימוש", "accepted": True, "why": ""}]
+
+
+def test_an_assignment_is_dropped_for_a_duplicate_and_for_a_component_that_is_not_a_datum_of_the_documents():
+    from app.chat.verify import CandidateAssignment, JudgeRequirement
+
+    cov = _cov([NIGHT])
+    twice = JudgeRequirement(id="N1", status="full", candidates=[CandidateAssignment(candidate="K1", words="תעריף לשימוש")] * 2)
+    assert [a.candidate for a in cov.valid_candidates(twice, {"N1": RATE_ASKED}, verify._VoteTrace(1, "full", None))] == ["K1"]
+    instruction = verify._Coverage(_turn({"id": "1", "text": "צטט את המקורות", "kind": "instruction", "aspect": "citation"}), [], "?",
+                                   candidates=[NIGHT])
+    vote = JudgeRequirement(id="N1", status="full", candidates=[CandidateAssignment(candidate="K1", words="צטט")])
+    assert instruction.valid_candidates(vote, {"N1": "צטט את המקורות"}, verify._VoteTrace(1, "full", None)) == []
+
+
+def test_a_judge_assignment_with_words_outside_the_request_never_makes_an_item_in_a_turn():
+    r, ws, answer, ledger, _ = _rate_check(RATE_ONE, lambda cid, attrs: "מנוי שנתי")
+    assert ledger.items == {} and r.requirement_outcomes()[0]["status"] == "full"
+    (vote,) = r.requirements_trace()[0]["votes"]
+    assert {c["why"] for c in vote["candidates"]} == {"words_not_in_request"}
+
+
+def test_the_candidates_block_is_compact_records_what_it_left_out_and_is_absent_without_a_candidate(monkeypatch):
+    seen: list[str] = []
+    _rate_check(RATE_ONE, seen=seen)
+    block = re.search(r"<candidates>.*?</candidates>", seen[0], re.S).group()
+    line = next(ln for ln in block.splitlines() if 'label="כניסה בלילה"' in ln)
+    assert line == '<candidate id="K1" source="S2" label="כניסה בלילה" value="8"/>'  # id, label, value, source: no quote, no own text
+    assert "<candidates>" in verify.JUDGE_REQUIREMENTS_POLICY and "candidates" in verify.JUDGE_REQUIREMENTS_POLICY
+    monkeypatch.setattr("app.chat.items.CANDIDATES_PER_SOURCE", 1)
+    capped: list[str] = []
+    _rate_check(RATE_ONE, seen=capped)
+    block = re.search(r"<candidates>.*?</candidates>", capped[0], re.S).group()
+    assert block.count("<candidate ") == 1 and '<more source="S2" count="2"/>' in block
+    none: list[str] = []
+    _rate_check("אין בתשובה נתון.", seen=none)
+    assert "<candidates>" not in none[0]
+
+
+def test_a_candidate_item_is_in_the_ledger_block_of_the_next_call_as_an_open_item_and_a_plain_source_item_is_not():
+    seen: list[str] = []
+    _, _, _, ledger, _ = _rate_check(RATE_ONE)
+    _rate_check(RATE_ONE, ledger=ledger, seen=seen)
+    block = re.search(r"<item_ledger>.*?</item_ledger>", seen[0], re.S).group()
+    assert block.count("<item ") == 2 and 'state="omitted"' in block and "כניסה בלילה | 8" in block
+    assert "origin=" not in block
+
+
+def test_a_candidate_still_omitted_after_the_repair_gets_a_read_and_not_used_line_built_from_the_source_text():
+    r, ws, answer, ledger, turn = _rate_check(RATE_ONE)
+    ws.sources["S2"].location = 'סעיף "תעריפים", עמוד 4'
+    final, outcomes = _finish(ws, answer, r, turn)
+    (o,) = outcomes
+    assert o["status"] == "partial" and o["variant"] == "read_not_used" and o["stated"] is False
+    lines = _gap(final, answer).splitlines()
+    assert len(lines) == 2 and all("נקרא" in x and "לא נעשה בו שימוש" in x and "S2" in x and "עמוד 4" in x for x in lines)
+    assert lines[0].startswith("«כניסה בלילה»") and lines[1].startswith("«כניסה בסוף שבוע»")  # the row labels the source writes
+    assert "תעריף לשימוש" not in "".join(x.split(":")[0] for x in lines)  # nothing of the judge's words
+    assert not re.search(r"לא נמצא|לא אותר|לא מופיע", "".join(lines))
+    assert len(r.item_gaps) == 2
+
+
+def test_a_candidate_is_in_the_diagnostics_with_what_the_call_offered_and_left_out(monkeypatch):
+    monkeypatch.setattr("app.chat.items.CANDIDATES_PER_SOURCE", 2)
+    r, *_ = _rate_check(RATE_ONE)
+    diag = r.item_diagnostics()
+    assert diag["candidates"] == {"offered": ["K1", "K2"], "left_out": {"S2": 1}, "sources_left": 0}
+    assert [(i["id"], i["origin"], i["candidate"], i["state"]) for i in diag["items"]] == [
+        ("I1", "source", True, "omitted"), ("I2", "source", True, "omitted")]
+
+
+def test_candidates_need_a_frozen_turn_with_a_ledger_and_an_answered_status():
+    from app.chat import items as ledger_items
+
+    ws = _rate_file()
+    seen: list[str] = []
+    turn = _turn({"id": "1", "text": RATE_ASKED})
+    verify_answer(_candidate_judge(seen=seen), _answer(RATE_ONE), ws, "?", [], requirements=turn)  # no ledger object: none
+    assert "<candidates>" not in seen[0]
+    report = verify_answer(_candidate_judge(), _answer(RATE_ONE), ws, "?", [], requirements=turn, ledger=ledger_items.Ledger())
+    assert report.candidate_pool and all(c.source == "S2" for c in report.candidate_pool.values())
+
+
+def _rate_rows(n: int) -> list[str]:
+    return [RATE_ROWS[0], RATE_ROWS[1], RATE_ROWS[2], *(f"כניסה בשעה {h} | {h + 20}" for h in range(n))]
+
+
+def test_the_candidates_block_is_bounded_per_source_and_its_growth_of_the_call_is_measured(monkeypatch):
+    """KTD8 / Assumptions: what the candidate fields add to a requirements call. Measured on a read table of 23 rows, one cited, the cap
+    of 20 candidates offered (the table itself is in the call as a cited source): the block is 1,377 characters, 69 per candidate, on a
+    call of 1,152 characters without it. Against the evidence a call may carry (``JUDGE_CALL_CHARS`` 30,000 and the 6,000 of read passages)
+    the cap of 20 for each of the ``CANDIDATE_SOURCES`` anchor sources adds at most about 5,600 characters (under 16%); a call without
+    an anchored, relevant table or list grows by nothing."""
+    from app.chat import items as ledger_items
+
+    ask = _turn({"id": "1", "text": RATE_ASKED})
+    seen: list[str] = []
+    verify_answer(_candidate_judge(lambda cid, attrs: None, seen), _answer(RATE_ONE), _rate_file(*_rate_rows(22)), "?", [],
+                  requirements=ask, ledger=ledger_items.Ledger())
+    block = re.search(r"<candidates>.*?</candidates>", seen[0], re.S).group()
+    assert block.count("<candidate ") == ledger_items.CANDIDATES_PER_SOURCE == 20 and '<more source="S2" count="2"/>' in block
+    assert len(block) / 20 <= 100 and len(block) <= 2_200, len(block)
+    monkeypatch.setattr("app.chat.items.CANDIDATE_SOURCES", 0)
+    bare: list[str] = []
+    verify_answer(_candidate_judge(lambda cid, attrs: None, bare), _answer(RATE_ONE), _rate_file(*_rate_rows(22)), "?", [],
+                  requirements=_turn({"id": "1", "text": RATE_ASKED}), ledger=ledger_items.Ledger())
+    assert "<candidates>" not in bare[0] and len(seen[0]) - len(bare[0]) == len(block) + 1  # nothing else of the call changed
+    assert ledger_items.CANDIDATE_SOURCES == 0 and len(block) * 4 <= 0.16 * (verify.JUDGE_CALL_CHARS + verify.READ_PASSAGES_CHARS) + 1

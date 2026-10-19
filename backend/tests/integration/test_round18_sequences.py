@@ -26,6 +26,9 @@ the user sees (the final message and the server's lines in it), never on a call 
    note scopes the first table (the read tags it "between two tables" and the server then refuses it).
 9. A numbered method heading over a table (AE8, U4/U5): the method reaches a value of the table, a later section's note does
    not.
+10. A per-use rate table of which the answer cites one row (AE5, AE6, U6): the agent declared no item; the other rows are
+    candidates, the judge marks the three rates of use as asked and the annual subscription row as not asked, and the completion
+    repair (tools off, no search) adds the asked rows from the table already read.
 
 The documents are the synthetic fixtures of ``tests/fixtures/round18`` (``scripts/generate_fixtures.py --only round18``);
 every name and figure is invented."""
@@ -44,6 +47,7 @@ from tests.factories import make_office
 from tests.integration.test_chat import cloud, new_conversation, send
 from tests.integration.test_chat_calculation import _outputs, handle_of
 from tests.integration.test_documents_api import ingest
+from tests.integration.test_round16_sequences import RecordingAgent, repair_calls, repair_prompt
 from tests.support.scripted_agent import ScriptedAgent, call, component, final, read, requirement
 
 pytestmark = pytest.mark.db
@@ -388,3 +392,86 @@ def test_the_method_a_numbered_heading_names_reaches_a_value_of_its_table_and_a_
     line = line_with(md, METHOD_VALUE)
     assert METHOD["method_phrase"] in line and re.search(r"\[S\d+\]", line), md
     assert "גישת ההשוואה" not in md, md
+
+
+# --- 10. a per-use rate table of which the answer cites one row (AE5, AE6, U6) -----------------------------------------------
+
+RATE = MANIFEST["rate_table"]
+(RATE_SINGLE, RATE_NIGHT, RATE_WEEKEND, RATE_SUBSCRIPTION) = RATE["rows"]
+RATE_ASK = "התעריפים לשימוש בחניון"
+RATE_QUESTION = "מהם התעריפים לשימוש בחניון?"
+RATE_CITED = f"התעריף ל{RATE_SINGLE[0]} הוא {RATE_SINGLE[1]} ₪ [S1]."
+RATE_COMPLETED = (RATE_CITED + f"\nהתעריף ל{RATE_NIGHT[0]} הוא {RATE_NIGHT[1]} ₪ [S1]."
+                  f"\nהתעריף ל{RATE_WEEKEND[0]} הוא {RATE_WEEKEND[1]} ₪ [S1].")
+
+
+def candidate_judge(seen: list[str] | None = None):
+    """A judge that supports every unit, scores every component full over the units shown (the lenient judge of round 16) and,
+    in the requirements call, assigns each candidate row of a use ("כניסה") to the component with the request words it answers
+    (the subscription row is not asked: it gets no assignment)."""
+    def judge(input: str) -> dict:
+        if seen is not None:
+            seen.append(input)
+        out = lenient_judge(input)
+        asks = [{"candidate": c, "words": "תעריף לשימוש"} for c, label in
+                re.findall(r'<candidate id="(K\d+)"[^>]*label="([^"]*)"', input) if label.startswith("כניסה")]
+        for r in out.get("requirements", []):
+            r["candidates"] = asks
+        return out
+    return judge
+
+
+def test_rows_of_a_cited_rate_table_the_judge_marks_asked_are_added_from_the_table_without_a_search_and_the_rest_is_not(
+        client, office, monkeypatch):
+    doc = ingest_pdf(office, monkeypatch, RATE)
+    DOCUMENT_OF[0] = doc
+    seen: list[str] = []
+    steps = [[call("outline", document=doc)], read_table(RATE["caption"]), final(RATE_CITED, documents=[doc]),
+             final(RATE_COMPLETED, documents=[doc])]
+    agent = RecordingAgent(steps, judge=candidate_judge(seen), request=[component(RATE_ASK)])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-b@example.test")
+    m = send(client, new_conversation(client), RATE_QUESTION)
+    assert m["status"] == "done", m
+    md = m["answer"]["markdown"]
+    # AE5: the two rows the agent never listed nor wrote are in the answer, from the table already read
+    for row in (RATE_SINGLE, RATE_NIGHT, RATE_WEEKEND):
+        assert any(row[1] in ln and re.search(r"\[S\d+\]", ln) for ln in md.splitlines()), md
+    # AE6: the annual subscription row was not asked for, and it is neither written nor stated as "read and not used"
+    assert RATE_SUBSCRIPTION[0] not in md and RATE_SUBSCRIPTION[1] not in md, md
+    assert "לא נעשה בו שימוש" not in md and "לא נמצא" not in md, md
+    # no search: the whole turn called the outline and the table once, and the repair step ran with its tools off
+    called = [i["name"] for i in agent.seen[-1] if isinstance(i, dict) and i.get("type") == "function_call"]
+    assert called == ["outline", "read"], called
+    assert len(agent.seen) == 4 and agent.choices[-1] == "none" and agent.choices[:-1] == [None] * 3
+    assert not repair_calls(agent)
+    repair = repair_prompt(agent)
+    assert RATE_NIGHT[0] in repair and RATE_WEEKEND[0] in repair and RATE_SUBSCRIPTION[0] not in repair
+    assert m["answer"]["verification"]["completeness"]["status"] == "full"
+    # the candidates the first call was shown: the three rows besides the cited one, rendered compactly
+    first = next(x for x in seen if "<candidates>" in x)
+    assert first.count("<candidate ") == 3 and "<candidates>" in first and RATE_SUBSCRIPTION[0] in first
+    # the diagnostics hold the items the server built from the judge's assignment
+    ledger = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["resolution"]["item_ledger"]
+    assert [(i["label"], i["origin"], i["candidate"], i["state"]) for i in ledger["items"]] == [
+        (RATE_NIGHT[0], "source", True, "covered"), (RATE_WEEKEND[0], "source", True, "covered")]
+    assert ledger["candidates"]["offered"] and ledger["candidates"]["left_out"] == {}
+
+
+def test_a_rate_row_the_repair_never_writes_is_stated_as_read_and_not_used_with_the_name_the_source_gives_it(
+        client, office, monkeypatch):
+    doc = ingest_pdf(office, monkeypatch, RATE)
+    DOCUMENT_OF[0] = doc
+    steps = [[call("outline", document=doc)], read_table(RATE["caption"]), final(RATE_CITED, documents=[doc]),
+             final(RATE_CITED, documents=[doc]), final(RATE_CITED, documents=[doc]), final(RATE_CITED, documents=[doc])]
+    agent = ScriptedAgent(steps, judge=candidate_judge(), request=[component(RATE_ASK)])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-b@example.test")
+    m = send(client, new_conversation(client), RATE_QUESTION)
+    assert m["status"] == "done", m
+    md = m["answer"]["markdown"]
+    lines = [ln for ln in md.splitlines() if "לא נעשה בו שימוש" in ln]
+    assert [ln.split("»")[0] for ln in lines] == [f"«{RATE_NIGHT[0]}", f"«{RATE_WEEKEND[0]}"], md
+    assert all("S1" in ln and "נקרא" in ln for ln in lines) and RATE_SUBSCRIPTION[0] not in md, md
+    assert not re.search(r"לא נמצא|לא אותר|לא מופיע", md)
+    assert m["answer"]["verification"]["completeness"]["status"] == "partial"

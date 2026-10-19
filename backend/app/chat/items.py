@@ -37,7 +37,17 @@ similar items apart:
   ``kept``, ``missing`` (the clear case: the operator's class and its operand are both absent from the sentence, decided by the
   server alone and never sent to the requirements call), ``undecided`` or ``hint``, apart from the coverage above. A condition is
   read only from the source's own spans; what the server cannot decide goes to the requirements call (``verify._item_ledger_block``). A sentence that carries a condition of
-  another item's span, and none of its own, is a ``hint`` from another item."""
+  another item's span, and none of its own, is a ``hint`` from another item.
+
+Round 18 U6 (KTD2; R5-R7) finds the items the agent dropped from BOTH its ledger and the answer, in the structure of the sources the
+turn read. ``candidates`` offers, around each anchor (a ledger item's source, a read source the answer cites), the siblings of the
+anchor that no sentence gives and no ledger item holds: the other data rows of its table, the other members of its enumerated list,
+the other value-bearing sentences of a cited passage's paragraph run, and the notes of its table that state a value of their own.
+A note, paragraph or heading that LIMITS a value is that value's condition span, never a candidate. The requirements call decides
+which candidate a frozen component asks for (``verify.valid_candidates`` checks its words against the request and the candidate's
+own text); ``candidate_item`` builds the ledger item of a kept one — origin ``source``, ``candidate`` True, its label, value and
+condition built from the source — which stays open until a sentence gives it, is completed by the existing text repair, and gets
+the "read at <place>, not used" line (built from the source's words) if it is still omitted."""
 
 from __future__ import annotations
 
@@ -67,6 +77,8 @@ from app.chat.verify import (
     _cited_sources,
     _is_tabular,
     context_of_source,
+    request_word_forms,
+    shares_request_word,
 )
 from app.platform import dates as shared_dates
 
@@ -97,6 +109,7 @@ class Item:
     id: str = ""
     document_id: str = ""
     unit_id: str | None = None
+    candidate: bool = False  # round 18 U6: an origin ``source`` item built from a candidate the requirements call assigned to a component
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -106,7 +119,8 @@ class Item:
     def public(self) -> dict:
         return {"id": self.id, "component": self.component, "label": self.label, "source": self.source,
                 "quote": self.quote, "value": self.value, "condition": self.condition, "state": self.state,
-                "reason": self.reason, "origin": self.origin, "document_id": self.document_id, "unit_id": self.unit_id}
+                "reason": self.reason, "origin": self.origin, "document_id": self.document_id, "unit_id": self.unit_id,
+                "candidate": self.candidate}
 
 
 class Validation(NamedTuple):
@@ -410,6 +424,210 @@ def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledge
     return built
 
 
+# --- candidate items: the siblings of what the answer draws on (round 18 U6, KTD2; R5-R7) --------------------------------------
+
+CANDIDATES_PER_SOURCE = 20  # the candidates of one anchor source one call offers, at most (the count left out is recorded)
+CANDIDATE_SOURCES = 4  # the anchor sources one call offers candidates from, at most (the count left out is recorded)
+FIRST_WORDS = 6  # the words of a sentence that name a candidate with a value
+_MEMBER_LINE = re.compile(r"^\s*(?:[-*+•·–—]|\d{1,3}[.)]|[א-ת][.)])\s+")  # a list member's opening: a bullet, a dash, a number or a letter
+_HEADING_LINE = re.compile(r"^\s*#{1,6}\s")  # a heading line ends the paragraph run of a section's text
+
+
+@dataclass
+class Candidate:
+    """One sibling of an anchor that the answer does not give: ``kind`` — ``row`` (a data row of a table), ``member`` (a member of an
+    enumerated list), ``sentence`` (a value-bearing sentence of a passage) or ``note`` (a note of a table that states a value of its own).
+    ``label``, ``value`` and ``condition`` are built from the source (a member without a number is its own value); ``own`` is its own
+    text — the row, the header, the caption, the heading or the list's lead-in — which an assignment's request words must stand in."""
+
+    id: str
+    source: str
+    quote: str
+    label: str
+    value: str
+    condition: str
+    own: str
+    kind: str
+    document_id: str = ""
+    unit_id: str | None = None
+
+    def listing(self) -> dict:
+        """The candidate as the requirements call renders it (``id``, ``source``, ``label``, ``value``) and checks an assignment
+        against it (``quote``, ``own``)."""
+        return {"id": self.id, "source": self.source, "label": self.label, "value": self.value, "quote": self.quote,
+                "own": self.own, "kind": self.kind}
+
+
+class Offer(NamedTuple):
+    """What one call offers: the candidates, the number left out of each anchor source by ``CANDIDATES_PER_SOURCE`` and the number of
+    anchor sources left out by ``CANDIDATE_SOURCES``."""
+
+    candidates: list[Candidate]
+    left_out: dict[str, int]
+    sources_left: int
+
+    def record(self) -> dict:
+        return {"offered": [c.id for c in self.candidates], "left_out": dict(self.left_out), "sources_left": self.sources_left}
+
+
+class _Raw(NamedTuple):
+    quote: str
+    label: str
+    value: str
+    kind: str
+    own: str
+    group: str  # the table, the list or the paragraph run the span stands in: an anchor reaches the spans of its group
+
+
+def _first_value(text: str) -> str:
+    """The first number of ``text`` as it is written, outside dates; "" when it has none."""
+    return next((m.group(0) for m in _NUMBER.finditer(_outside_dates(text)) if numbers_in(m.group(0))), "")
+
+
+def _named(text: str) -> tuple[str, str]:
+    """(label, value) of a sentence or list member: its first words and its number; a span without a number is its own value."""
+    number = _first_value(text)
+    return (" ".join(text.split()[:FIRST_WORDS]).rstrip(".:;,"), number) if number else ("", _MEMBER_LINE.sub("", text).strip())
+
+
+def _context_words(src, parts) -> str:
+    """The text of the headings and captions of a source (and its section): what every span of it is about."""
+    return " ".join([*(p.text for p in parts if p.place in ("heading", "caption")), _text(src.section)])
+
+
+def _raws(src) -> tuple[list[_Raw], dict[str, list[str]]]:
+    """The spans of a source that can be an item, and the lines of each group (``_Raw.group``). A table: the data rows (a first cell,
+    and a value cell with a number) and the sentences of its attributed notes that state a number and limit nothing. A passage: the
+    members of each enumerated list (two lines or more in a row that open with a list mark) and the sentences with a number of the
+    other lines, a heading line ending the paragraph run."""
+    parts, body = context_of_source(src)
+    about = _context_words(src, parts)
+    raws: list[_Raw] = []
+    groups: dict[str, list[str]] = {}
+    if _is_tabular(src):
+        header: list[str] = []
+        for line in body:
+            cells = _row_cells(line) if "|" in line else []
+            if len(cells) < 2:
+                continue
+            values = [c for c in cells[1:] if re.search(r"\d", c)]
+            if not values:
+                if not raws:
+                    header += cells
+                continue
+            if numbers_in(_outside_dates(" ".join(values))):
+                quote = _clip_row(line)
+                raws.append(_Raw(quote, cells[0], values[0], "row", f"{quote} {' '.join(header)} {about}", "table"))
+        for part in parts:
+            if part.place in ("before", "after", "note") and not part.reason:
+                for sentence in _SENTENCE_END.split(part.text):
+                    number = _first_value(sentence)
+                    if number and not conditions.material(sentence):  # a note that limits a value is that value's condition span
+                        raws.append(_Raw(sentence.strip(), " ".join(sentence.split()[:FIRST_WORDS]).rstrip(".:;,"), number, "note",
+                                         f"{sentence} {about}", "table"))
+        groups["table"] = list(body)
+        return raws, groups
+    run, listing, lead = 0, 0, ""
+    for at, line in enumerate(body):
+        if _HEADING_LINE.match(line):
+            run += 1
+            continue
+        group = f"run{run}"
+        groups.setdefault(group, []).append(line)
+        if _MEMBER_LINE.match(line) and ((at + 1 < len(body) and _MEMBER_LINE.match(body[at + 1])) or (at > 0 and _MEMBER_LINE.match(body[at - 1]))):
+            if not (at > 0 and _MEMBER_LINE.match(body[at - 1])):
+                listing += 1
+            name = f"list{run}.{listing}"
+            groups.setdefault(name, []).append(line)
+            label, value = _named(line)
+            raws.append(_Raw(line.strip(), label, value, "member", f"{line} {lead} {about}", name))
+            continue
+        lead = line
+        for sentence in _SENTENCE_END.split(line):
+            number = _first_value(sentence)
+            if number:
+                raws.append(_Raw(sentence.strip(), " ".join(sentence.split()[:FIRST_WORDS]).rstrip(".:;,"), number, "sentence",
+                                 f"{sentence} {about}", group))
+    return raws, groups
+
+
+def candidates(units: Sequence[Unit], ws, ledger: Ledger, components: Sequence[Mapping], request: str = "") -> Offer:
+    """The candidates one requirements call is offered (round 18 U6, KTD2): for each anchor source — the source of a ledger item, and a
+    source the surviving units cite — the spans of its structure (``_raws``) that no unit gives (``_coverage``: attribution, value and
+    date) and no ledger item holds. A table is an anchor whole; the list or paragraph run of a passage only when one of its spans is
+    given or held (the siblings of what the answer draws on). The source must pass the checks the agent's items pass (``SupportScope``:
+    a returned source, a document the answer is about, an asked appraisal unit — a span of another unit of the file is never offered),
+    and a span is offered only when a content word of its own text stands in an asked component or the request (an assignment
+    could never be kept otherwise). At most ``CANDIDATES_PER_SOURCE`` per source in the source's order, ``CANDIDATE_SOURCES`` sources;
+    the counts left out are in the offer. No component is needed before the call."""
+    scope = SupportScope(ws, list(units))
+    asked = [c for c in components if c.get("kind") != "instruction"]
+    known = request_word_forms(" ".join([*(c.get("text") or "" for c in asked), request]))
+    held = list(ledger.items.values())
+    anchors: dict[str, None] = {}
+    for item in held:
+        if item.source in ws.sources:
+            anchors.setdefault(item.source)
+    for unit in units:
+        for sid, _ in _cited_sources(unit, ws):
+            anchors.setdefault(sid)
+    offered: list[Candidate] = []
+    left_out: dict[str, int] = {}
+    used = 0
+    sources_left = 0
+    for sid in anchors:
+        src = ws.sources[sid]
+        if src.is_listing or sid not in scope.readable or scope.place_problem(src):
+            continue
+        raws, groups = _raws(src)
+        if not raws:
+            continue
+        if used >= CANDIDATE_SOURCES:
+            sources_left += 1
+            continue
+        flats = [SupportScope.flat(r.quote) for r in raws]
+        spans = [Item("", r.label, sid, r.quote, r.value) for r in raws]
+        signatures = Counter(_signature(i) for i in spans)
+        touched: set[str] = set()
+        free: list[int] = []
+        for n, (raw, flat, span) in enumerate(zip(raws, flats, spans, strict=True)):
+            sig = _signature(span)
+            shared = bool(sig) and signatures[sig] > 1
+            if any(_holds(h, sid, ws, flat) for h in held) or _coverage(span, units, ws, shared).ok:
+                touched.add(raw.group)
+            else:
+                free.append(n)
+        mine = [SupportScope.flat(h.quote) for h in held if h.source == sid or src.same_as == h.source]
+        for name, lines in groups.items():
+            if any(q in _flat_text(line) for q in mine for line in lines):
+                touched.add(name)
+        found = [n for n in free if (raws[n].group == "table" or raws[n].group in touched)
+                 and not scope.source_problem(sid, flats[n]) and scope.verbatim(sid, src, flats[n])
+                 and shares_request_word(raws[n].own, known)]
+        if not found:
+            continue
+        used += 1
+        for n in found[:CANDIDATES_PER_SOURCE]:
+            raw = raws[n]
+            document_id, unit_id = _site_of(src)
+            offered.append(Candidate(ledger.candidate_id(sid, flats[n]), sid, raw.quote, raw.label, raw.value,
+                                     " ; ".join(sp.text for sp in condition_spans(src, raw.quote)), " ".join(raw.own.split()),
+                                     raw.kind, document_id, unit_id))
+        if len(found) > CANDIDATES_PER_SOURCE:
+            left_out[sid] = len(found) - CANDIDATES_PER_SOURCE
+    return Offer(offered, left_out, sources_left)
+
+
+def candidate_item(c: Candidate, component: str, ledger: Ledger) -> Item:
+    """The ledger item of a candidate a frozen component asks for: origin ``source`` and ``candidate``, its label, value and condition
+    as the server built them from the source (nothing the model wrote), state ``included`` so that ``Ledger.outcomes`` decides whether a
+    surviving unit gives it."""
+    item = Item(component, c.label, c.source, c.quote, c.value, c.condition, ITEM_INCLUDED, "", ORIGIN_SOURCE,
+                document_id=c.document_id, unit_id=c.unit_id, candidate=True)
+    item.id = ledger.id_for(item.key)
+    return item
+
+
 # --- coverage by attribution (R5) --------------------------------------------------------------------------------------------
 
 @functools.lru_cache(maxsize=512)
@@ -559,6 +777,11 @@ class Ledger:
         self.excluded: list[dict] = []
         self.misattributed: list[dict] = []
         self._ids: dict[tuple[str, str, str], str] = {}
+        self._candidate_ids: dict[tuple[str, str], str] = {}
+
+    def candidate_id(self, source: str, flat: str) -> str:
+        """The K# of a candidate (its source and verbatim quote): the same in every call of the turn."""
+        return self._candidate_ids.setdefault((source, flat), f"K{len(self._candidate_ids) + 1}")
 
     def id_for(self, key: tuple[str, str, str]) -> str:
         """The I# of a key: the same for the same key in every version."""
@@ -586,7 +809,7 @@ class Ledger:
                 old.label, old.value, old.condition = item.label or old.label, item.value or old.value, item.condition or old.condition
                 old.state, old.reason = item.state, item.reason
                 if old.origin == ORIGIN_SOURCE:
-                    old.origin = ORIGIN_AGENT
+                    old.origin, old.candidate = ORIGIN_AGENT, False
         self.excluded += [{"version": version, **e} for e in excluded]
         self.misattributed += [{"version": version, **m} for m in misattributed]
         return list(self.items.values())
@@ -599,7 +822,8 @@ class Ledger:
         out; ``condition_hint``: ``contradicted`` and/or ``other_item``;
         ``condition_spans``: its spans; ``condition_foreign``: the items whose condition the sentence states; ``condition_unit``:
         the unit checked). An origin ``source`` item no surviving unit gives is not an open item: the sentence that cited its span
-        is gone, so it is left out."""
+        is gone, so it is left out; a ``candidate`` item (round 18 U6) is the exception: a component asks for it, so it stays
+        open (``omitted``) until a sentence gives it."""
         out = []
         # each item's signature is computed once, and the items of a component that share one are counted: an item's condition is
         # asked when another item of its component has its signature (``_coverage``)
@@ -612,8 +836,8 @@ class Ledger:
             sig = signatures[id(item)]
             shared = bool(sig) and alike[(item.component, sig)] > 1
             got = _coverage(item, units, ws, shared) if item.state in (ITEM_INCLUDED, OMITTED) else None
-            if item.origin == ORIGIN_SOURCE and (got is None or not got.ok):
-                continue
+            if item.origin == ORIGIN_SOURCE and not item.candidate and (got is None or not got.ok):
+                continue  # (a candidate the call assigned to a component is an open item whatever sentence cited what: round 18 U6)
             rows.append((item, got, shared))
         # the units that give each covered item (the first is the covering unit above), and each item's own context text
         gave = {i.key: {u.index for u in units if not _unit_covers(i, u, ws, shared)} for i, g, shared in rows if g is not None and g.ok}
