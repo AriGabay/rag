@@ -308,6 +308,16 @@ def test_a_condition_the_repair_does_not_write_is_attached_by_the_server_with_it
     assert "הוסר" not in md and "לא נמצא" not in md, md
 
 
+def test_a_condition_left_out_entirely_is_completed_by_the_server_when_the_judge_says_nothing(client, office, monkeypatch):
+    """R1: the operator's class (only) and its operand are absent from the sentence: the server needs no judge outcome. The repair
+    does not write it, so the server attaches the verbatim span with its citation; the value stays."""
+    m = ask(client, office, monkeypatch, PLAN, read_table(PLAN["caption"]), PLAN_BARE, "מהו השטח הכולל לבנייה בנכס?",
+            "השטח הכולל לבנייה בנכס", repaired=PLAN_BARE, items=plan_items(), judge=lenient_judge)
+    line = line_with(m["answer"]["markdown"], "1,200")
+    assert f"(התנאי לפי המקור: {PLAN['rows'][0][2]})" in line and re.search(r"\[S\d+\]", line), m["answer"]["markdown"]
+    assert "הוסר" not in m["answer"]["markdown"]
+
+
 # --- 8. a note after a table that points back to it, then another table on the next page (AE7, U4) ----------------------
 
 NOTE = MANIFEST["deictic_note"]

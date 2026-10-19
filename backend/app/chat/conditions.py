@@ -11,6 +11,10 @@ module reads a condition and a sentence with a tokenizer that KEEPS the operator
 - ``HINT``: the sentence has the opposite polarity over most of the same operand ("not including X" in the source, "including X" in
   the answer; a negation in the source and none over the same words in the answer). It is only a hint: the requirements call
   confirms it with a quote, and an unconfirmed hint leaves the value as it was;
+- ``MISSING``: the clear case the server decides without a judge — a condition operator whose CLASS (negation, exclusivity,
+  exception, subjection, threshold; any polarity, any wording of the class: "רק" and "בלבד" are both exclusivity) the sentence does
+  not carry anywhere, over an operand none of whose words, numbers or dates the sentence states. The value is given without its
+  limit; the server completes it (never removes anything);
 - ``UNDECIDED``: everything else — another operator for the same idea ("excluding" and "without"), an operand match below most, a
   sentence that holds both polarities over the operand. The requirements call decides these.
 
@@ -29,7 +33,7 @@ from app.chat.verify import _MISSING_TOKEN, _QUALIFIER_PATTERN, _missing_forms, 
 from app.extraction.normalize_text import is_negation
 from app.platform import dates as shared_dates
 
-KEPT, HINT, UNDECIDED = "kept", "hint", "undecided"
+KEPT, HINT, UNDECIDED, MISSING = "kept", "hint", "undecided", "missing"
 
 # the operator classes (closed): the key of an operator is what two spellings of it share, its polarity the side it stands on
 NEGATION, EXCLUSIVITY, EXCEPTION, SUBJECTION, THRESHOLD = "negation", "exclusivity", "exception", "subjection", "threshold"
@@ -188,8 +192,21 @@ def _matches(need: Operand, words: frozenset[str], numbers: frozenset[str], date
 _Said = tuple[frozenset[str], frozenset[str], tuple[str, ...], bool]  # a clause: words, numbers, dates, holds a negative operator
 
 
-def _segment_outcome(seg: Segment, sentence: list[Segment], sentence_clauses: list[_Said]) -> str:
+def _absent(operand: Operand, words: frozenset[str], numbers: frozenset[str], dates: Iterable[str]) -> bool:
+    """Whether the sentence states nothing of the operand: none of its words (in any variant), numbers or dates. An empty operand is
+    never absent: nothing is known to be left out."""
+    if not operand:
+        return False
+    have = tuple(dates)
+    return (not any(g & words for g in operand.groups) and not operand.numbers & numbers
+            and not any(have_d.startswith(d) for d in operand.dates for have_d in have))
+
+
+def _segment_outcome(seg: Segment, sentence: list[Segment], sentence_clauses: list[_Said], classes: frozenset[str],
+                     stated: tuple[frozenset[str], frozenset[str], tuple[str, ...]]) -> str:
     """The outcome of one source operator against the sentence's segments and clauses (see the module docstring)."""
+    if seg.op.cls not in classes and _absent(seg.operand, *stated):
+        return MISSING  # the class is nowhere in the sentence and neither is its operand
     same = opposite = False
     for other in sentence:
         if other.op.key != seg.op.key:
@@ -218,18 +235,37 @@ def _sentence_clauses(sentence: str) -> list[_Said]:
     return out
 
 
-def outcome(condition: str, sentence: str) -> str:
-    """What the sentence does with one source condition: ``KEPT``, ``HINT`` or ``UNDECIDED`` (the module docstring). Several
-    operators give the worst of their outcomes (a hint over an undecided over a kept); a condition with no operator is kept when
-    the sentence holds most of its content words."""
+def _read(condition: str, sentence: str) -> tuple[str, str]:
+    """(outcome, quote) of one condition against a sentence: the quote is the clause of the condition that holds the first missing
+    operator, empty for any other outcome."""
     material = [s for s in segments(condition) if s.op.material]
     if not material:
         need = _operand(_tokens(condition))
         words, numbers, dates = _words_of(sentence)
-        return KEPT if _matches(need, words, numbers, dates) else UNDECIDED
+        return (KEPT if _matches(need, words, numbers, dates) else UNDECIDED), ""
     said, said_clauses = segments(sentence), _sentence_clauses(sentence)
-    found = [_segment_outcome(s, said, said_clauses) for s in material]
-    return HINT if HINT in found else UNDECIDED if UNDECIDED in found else KEPT
+    classes, stated = frozenset(s.op.cls for s in said), _words_of(sentence)
+    found = [_segment_outcome(s, said, said_clauses, classes, stated) for s in material]
+    if HINT in found:
+        return HINT, ""
+    if UNDECIDED in found:
+        return UNDECIDED, ""
+    if MISSING in found:
+        return MISSING, clauses(condition)[material[found.index(MISSING)].clause]
+    return KEPT, ""
+
+
+def outcome(condition: str, sentence: str) -> str:
+    """What the sentence does with one source condition: ``KEPT``, ``HINT``, ``MISSING`` or ``UNDECIDED`` (the module docstring).
+    Several operators give the worst of their outcomes (a hint over an undecided over a missing over a kept: a condition the
+    server cannot fully read is the judge's, not completed on a part of it); a condition with no operator is kept when the sentence
+    holds most of its content words, else undecided."""
+    return _read(condition, sentence)[0]
+
+
+def missing_quote(condition: str, sentence: str) -> str:
+    """The clause of ``condition`` the sentence leaves out when ``outcome`` is ``MISSING`` (verbatim from the condition), else ''."""
+    return _read(condition, sentence)[1]
 
 
 def operand_of(text: str) -> Operand:

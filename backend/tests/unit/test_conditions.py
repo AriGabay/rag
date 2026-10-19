@@ -48,9 +48,10 @@ def test_same_operator_same_polarity_and_most_of_the_operand_is_kept():
     assert conditions.outcome(condition, "השטח הוא 1,200 מ״ר ורק לפי תכנית שאושרה") == KEPT  # a spelling variant of the operand
 
 
-def test_ae1_a_value_stated_without_its_limit_is_undecided_not_kept():
+def test_ae1_a_value_stated_without_its_limit_is_missing_when_the_class_and_operand_are_absent_and_undecided_when_the_operand_is_stated():
     condition = "הזכויות חלות רק על פי תכנית מאושרת"
-    assert conditions.outcome(condition, "השטח הכולל לבנייה בנכס הוא 1,200 מ״ר [S1].") == UNDECIDED
+    assert conditions.outcome(condition, "השטח הכולל לבנייה בנכס הוא 1,200 מ״ר [S1].") == conditions.MISSING
+    assert conditions.outcome(condition, "השטח הכולל לבנייה בנכס הוא 1,200 מ״ר לפי תכנית [S1].") == UNDECIDED
 
 
 def test_ae2_another_operator_for_the_same_idea_is_left_to_the_requirements_call():
@@ -96,3 +97,43 @@ def test_a_condition_without_an_operator_is_kept_by_most_of_its_content_words():
 def test_a_condition_with_a_date_needs_that_date_stated():
     assert conditions.outcome("נכון ליום 31.12.2023", "השווי נכון ל-31/12/2023 הוא 9,000") == KEPT
     assert conditions.outcome("נכון ליום 31.12.2023", "השווי נכון ל-30.06.2024 הוא 9,000") == UNDECIDED
+
+
+# --- a condition the sentence plainly leaves out, decided without the requirements call (round 18 U5 follow-up; R1) ------------------
+
+PLAN_NOTE = "הזכויות חלות רק על פי תכנית מאושרת"
+
+
+def test_a_condition_whose_operator_class_and_operand_are_both_absent_from_the_sentence_is_missing_without_a_judge():
+    sentence = "השטח הכולל לבנייה בנכס הוא 1,200 מ״ר [S1]."
+    assert conditions.outcome(PLAN_NOTE, sentence) == conditions.MISSING
+    assert conditions.missing_quote(PLAN_NOTE, sentence) == PLAN_NOTE
+    # only the clause that holds the missing operator is the quote
+    assert conditions.missing_quote("השטח אינו כולל מרתף; הערה כללית על המדידה", "הוא 900 מ״ר") == "השטח אינו כולל מרתף"
+
+
+def test_another_word_of_the_same_class_is_never_missing():
+    # "בלבד" and "רק" are both exclusivity: the class is there, so the sentence is read as before (kept, or the judge decides)
+    assert conditions.outcome(PLAN_NOTE, "החלות היא על פי תכנית שאושרה בלבד [S1].") != conditions.MISSING
+    assert conditions.outcome(PLAN_NOTE, "הזכויות חלות בלבד לפי תוכנית שפורסמה [S1].") != conditions.MISSING
+    assert conditions.outcome("השטח אינו כולל מרתף", "השטח הוא 900 מ״ר ללא מרתף") != conditions.MISSING  # negation folds into the exception class
+    assert conditions.outcome("השטח אינו כולל מרתף", "השטח כולל חניה") != conditions.MISSING  # the class is there, on another operand
+
+
+def test_the_operand_stated_without_the_class_is_undecided_and_goes_to_the_judge():
+    assert conditions.outcome(PLAN_NOTE, "השטח הכולל לבנייה בנכס הוא 1,200 מ״ר לפי תכנית מאושרת [S1].") == UNDECIDED
+    assert conditions.outcome("עד 30 שנה", "הגיל הוא 30 שנה") == UNDECIDED  # the number and the word are there; the threshold is not
+
+
+def test_an_open_class_condition_with_no_operator_is_never_missing():
+    assert conditions.outcome("גישת היוון ההכנסות", "השווי הוא 9,384,615 ₪") == UNDECIDED
+    assert conditions.outcome("מצב תכנוני מוצע", "השטח הוא 900 מ״ר") == UNDECIDED
+
+
+def test_a_condition_with_one_missing_and_one_undecided_operator_goes_to_the_judge():
+    condition = "הזכויות חלות רק על פי תכנית מאושרת, בכפוף לאישור הוועדה"
+    assert conditions.outcome(condition, "הזכויות הן 1,200 מ״ר לפי אישור הוועדה") == UNDECIDED
+
+
+def test_a_condition_with_an_operator_and_no_operand_is_never_missing():
+    assert conditions.outcome("בלבד", "השטח הוא 900 מ״ר") != conditions.MISSING

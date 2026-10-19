@@ -581,8 +581,10 @@ def test_ae1_a_single_item_whose_row_says_approved_plan_only_is_undecided_when_t
     ws = _ws(PLAN_TABLE)
     item = _item(label="שטח כולל", quote=PLAN_QUOTE, value="1,200")
     got = _condition(ws, PLAN_BARE, item)
-    assert got["state"] == "covered" and got["condition_check"] == "undecided"  # covered by its value; the condition is not given
-    assert got["condition_spans"] == [{"place": "note", "text": PLAN_NOTE}]
+    assert got["state"] == "covered" and got["condition_check"] == "missing"  # covered by its value; the class and the operand are both absent
+    assert got["condition_quote"] == PLAN_NOTE and got["condition_spans"] == [{"place": "note", "text": PLAN_NOTE}]
+    partial = _condition(ws, "השטח הכולל לבנייה הוא 1,200 מ״ר לפי תכנית מאושרת [S1].", item)  # the operand without the class: the judge decides
+    assert partial["condition_check"] == "undecided" and partial["condition_quote"] == ""
     assert _condition(ws, f"השטח הכולל לבנייה הוא 1,200 מ״ר, {PLAN_NOTE} [S1].", item)["condition_check"] == "kept"
 
 

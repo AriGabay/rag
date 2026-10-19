@@ -34,8 +34,9 @@ similar items apart:
 - ``source_items`` builds an origin ``source`` item from a source span an answer sentence cites when the span carries such a
   condition and no item covers it, so the condition is checked on a turn whose agent declared nothing.
 - ``Ledger.outcomes`` gives every covered item a ``condition_check`` against the sentence that covers it (``conditions.outcome``):
-  ``kept``, ``undecided`` or ``hint``, apart from the coverage above. A condition is read only from the source's own spans; what
-  the server cannot decide goes to the requirements call (``verify._item_ledger_block``). A sentence that carries a condition of
+  ``kept``, ``missing`` (the clear case: the operator's class and its operand are both absent from the sentence, decided by the
+  server alone and never sent to the requirements call), ``undecided`` or ``hint``, apart from the coverage above. A condition is
+  read only from the source's own spans; what the server cannot decide goes to the requirements call (``verify._item_ledger_block``). A sentence that carries a condition of
   another item's span, and none of its own, is a ``hint`` from another item."""
 
 from __future__ import annotations
@@ -594,7 +595,8 @@ class Ledger:
         """Every item with its state against these surviving units: ``covered`` (a unit gives it), ``omitted`` (an included or
         judge-added item no unit gives), or the ``not_verifiable`` / ``not_applicable`` the agent declared with a reason. Round 18
         U5: a covered item also has its condition check against the unit that gives it (``condition_check``: "" without a
-        material condition, else ``kept``, ``undecided`` or ``hint``; ``condition_hint``: ``contradicted`` and/or ``other_item``;
+        material condition, else ``kept``, ``missing``, ``undecided`` or ``hint``; ``condition_quote``: for ``missing``, the clause of the span the unit leaves
+        out; ``condition_hint``: ``contradicted`` and/or ``other_item``;
         ``condition_spans``: its spans; ``condition_foreign``: the items whose condition the sentence states; ``condition_unit``:
         the unit checked). An origin ``source`` item no surviving unit gives is not an open item: the sentence that cited its span
         is gone, so it is left out."""
@@ -626,8 +628,9 @@ class Ledger:
 
 # --- the condition outcome of a covered item (round 18 U5) ---------------------------------------------------------------------
 
-_NO_CHECK = {"condition_check": "", "condition_hint": [], "condition_spans": [], "condition_foreign": [], "condition_unit": None}
-_RANK = {conditions.KEPT: 0, conditions.UNDECIDED: 1, conditions.HINT: 2}
+_NO_CHECK = {"condition_check": "", "condition_hint": [], "condition_spans": [], "condition_foreign": [], "condition_unit": None,
+             "condition_quote": ""}
+_RANK = {conditions.KEPT: 0, conditions.UNDECIDED: 1, conditions.MISSING: 2, conditions.HINT: 3}
 
 
 def _spans_of(ws, item: Item) -> list[Span]:
@@ -658,9 +661,12 @@ def _condition_check(item: Item, got: Coverage | None, spans: dict, gave: dict, 
         if foreign:
             hints.append("other_item")
         check = (conditions.HINT if hints else "" if not mine else
-                 conditions.UNDECIDED if conditions.UNDECIDED in results else conditions.KEPT)
+                 conditions.UNDECIDED if conditions.UNDECIDED in results else
+                 conditions.MISSING if conditions.MISSING in results else conditions.KEPT)
+        quote = conditions.missing_quote(mine[results.index(conditions.MISSING)].text, unit.text) \
+            if check == conditions.MISSING else ""
         row = {"condition_check": check, "condition_hint": hints, "condition_foreign": foreign,
-               "condition_spans": [sp.public() for sp in mine], "condition_unit": index}
+               "condition_spans": [sp.public() for sp in mine], "condition_unit": index, "condition_quote": quote}
         if best is None or _RANK.get(check, 0) < _RANK.get(best["condition_check"], 0):
             best = row
         if check in ("", conditions.KEPT):

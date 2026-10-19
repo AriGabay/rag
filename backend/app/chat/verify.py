@@ -4217,7 +4217,8 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
     R1-R4). Only a CONFIRMED contradiction can remove a statement; an undecided or hinted item the judge did not decide, and
     a ``kept`` one, change nothing, and a missing or misattributed condition never removes the value:
 
-    - ``missing`` (a quote in this item's span): a repair request that carries the source quote (``CONDITION_FOUND_CHECK``, tools
+    - ``missing`` (a quote in this item's span, from the judge, or decided by the server alone when the operator's class and operand
+      are both absent from the sentence: ``conditions.MISSING``, ``condition_quote``, no judge needed): a repair request that carries the source quote (``CONDITION_FOUND_CHECK``, tools
       off), and, beside it, the server's own note — the verbatim span with its citation, or a precise "not verified" note when no
       compact span exists — which the final text carries only if the repair did not write the condition (the next verification
       no longer finds it missing);
@@ -4232,8 +4233,14 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
     for st in names.values():
         verdict = said.get(st["id"])
         unit = units.get(st["condition_unit"])
-        if (verdict is None or verdict.outcome == "kept" or st["state"] != ITEM_COVERED
-                or st["condition_check"] not in ASKED_CHECKS or unit is None or unit.index in removed):
+        if st["condition_check"] == DECIDED_MISSING and st.get("condition_quote"):
+            # the server decided it alone (``conditions.MISSING``): the operator's class and its operand are both absent from the
+            # sentence; the judge was not asked, and the same completion path follows as for the judge's own ``missing``
+            verdict = ConditionVerdict(item=st["id"], outcome="missing", quote=st["condition_quote"])
+        elif st["condition_check"] not in ASKED_CHECKS:
+            continue
+        if (verdict is None or verdict.outcome == "kept" or st["state"] != ITEM_COVERED or unit is None
+                or unit.index in removed):
             continue
         name = _plain_label(st)
         source = ws.sources.get(st["source"])
@@ -6071,6 +6078,7 @@ class _Coverage:
         return list(out.values())
 
 
+DECIDED_MISSING = "missing"  # the condition check the server decides alone (``conditions.MISSING``): not asked, completed
 ASKED_CHECKS = ("undecided", "hint")  # the condition checks the requirements call is asked to decide (``Ledger.outcomes``)
 
 
