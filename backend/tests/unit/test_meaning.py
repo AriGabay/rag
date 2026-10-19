@@ -919,6 +919,17 @@ def test_a_source_holding_two_tables_gives_each_cell_its_own_headers_period():
     assert _periods(source, "480,000", "האורן 3 | 480,000") == {"year"}
 
 
+def test_a_header_row_joined_with_empty_edge_cells_keeps_them_so_the_period_reaches_the_first_amount_column():
+    # the rendered table text joins cells with " | ": an empty first or last cell leaves " | x | " (no outer pipes)
+    table = ("טבלה 4.1 — פירוט\n | הכנסה שנתית (₪) | \nרכיב | משרדים | מסחר\n"
+             "דמי שכירות | 1,240,000 | 860,000\nדמי ניהול | 96,000 | 64,000")
+    assert meaning._row_cells(" | הכנסה שנתית (₪) | ") == ["", "הכנסה שנתית (₪)", ""]
+    assert meaning._row_cells("| a | b |") == ["a", "b"]
+    assert _periods(table, "1,240,000", "דמי שכירות | 1,240,000 | 860,000") == {"year"}
+    assert _periods(table, "860,000", "דמי שכירות | 1,240,000 | 860,000") == {"year"}
+    assert _periods(table, "96,000", "דמי ניהול | 96,000 | 64,000") == {"year"}
+
+
 def test_a_header_row_with_one_cell_fewer_than_its_data_rows_aligns_by_its_non_empty_cells():
     table = "שכ\"ד לחודש (₪ למ\"ר) | שטח (מ\"ר)\nהדולב 4 | 71 | 100\nהדולב 6 | 64 | 90"
     assert _periods(table, "71", "הדולב 4 | 71 | 100") == {"month"}

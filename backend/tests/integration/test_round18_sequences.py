@@ -153,9 +153,6 @@ HEADER_ANSWER = ("ההכנסה השנתית מדמי שכירות במשרדים
                  "ההכנסה השנתית מדמי שכירות במסחר היא 860,000 ₪ [S1].")
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "U1: the page's first digit-free row ('רכיב | שטח (מ״ר)', of the areas table) is the header of the whole source: the"
-    " second table's upper header row, which carries 'שנתית', is not read, so 'השנתית' is edited out of both annual amounts"))
 def test_annual_amounts_under_a_header_row_that_carries_the_period_keep_it_when_another_table_shares_the_page(
         client, office, monkeypatch):
     m = ask(client, office, monkeypatch, HEADER, read_pages(1, 1), HEADER_ANSWER,

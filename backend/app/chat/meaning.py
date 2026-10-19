@@ -400,7 +400,15 @@ class Occurrence:
 
 
 def _row_cells(line: str) -> list[str]:
-    return [c.strip() for c in line.strip().strip("|").split("|")]
+    """The cells of a table row line. A markdown row ("| a | b |") has its outer pipes as delimiters, at the line's edge; a
+    row as the table text renders it (cells joined by " | ") has none, so an empty first or last cell leaves a pipe with
+    a space before it or after it (" | x | ") and stays a cell — dropping it shifts every later cell one column left."""
+    raw = line.rstrip() if line.startswith("|") else line
+    if raw.startswith("|"):
+        raw = raw[1:]
+    if raw.endswith("|"):
+        raw = raw[:-1]
+    return [c.strip() for c in raw.split("|")]
 
 
 # a per-area amount: its row or column says "למ״ר", "/מ״ר", "למטר", "לדונם"
