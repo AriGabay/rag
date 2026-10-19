@@ -225,6 +225,7 @@ What the evidence shows:
   - **Candidates are the anchor's structural siblings in sources the turn read:**
     - the other data rows of its table;
     - the other members of its enumerated list;
+    - the other value-bearing sentences of a cited passage, within its section's paragraph run (two thirds of the read-never-written items in the experiment sat inside a span the answer already cited);
     - its table's notes that stand as items of their own;
     - paragraphs attributed by KTD5 that state items of their own.
   - **Limits are conditions, not candidates:** a note, paragraph or heading that limits a value is that value's condition span under KTD1 and never a separate candidate.
