@@ -85,7 +85,9 @@ from app.chat.verify import (
     _cited_sources,
     _is_tabular,
     _value_forms,
+    asked_components,
     context_of_source,
+    is_server_item,
     request_word_forms,
     shares_request_word,
 )
@@ -248,7 +250,8 @@ def support_item(component: str, source: str, quote: str, ledger: Ledger, *, lab
 
 ROWS_PER_UNIT = 5  # the cited rows of one source a sentence builds items from, at most
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
-_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?%?")
+# a comma joins the digits of one number only in groups of three ("1,250,000"): "2018,2019,2021" is three years (``answering.verify._NUMBER``)
+_NUMBER = re.compile(r"(?:\d{1,3}(?:,\d{3})+(?!\d)|\d+)(?:\.\d+)?%?")
 
 
 class Span(NamedTuple):
@@ -347,21 +350,27 @@ def condition_spans(src, quote: str) -> list[Span]:
     return out
 
 
-def _contexts(src, quote: str) -> tuple[str, str]:
-    """(the text of the item's own context, the text of the other rows of its table): its quote and row, the paragraphs attributed
-    to the table and its headings; and, for a table, the rows beside it and the paragraphs not attributed to it."""
+def _own_context(src, quote: str) -> str:
+    """The text of the item's own context: its quote and row, the paragraphs attributed to the table and its headings."""
     parts, body = context_of_source(src)
     row = _row_of(body, SupportScope.flat(quote))
-    own = [quote, row or "", *(p.text for p in parts if not p.reason)]
-    other = [ln for ln in body if ln != row] + [p.text for p in parts if p.reason] if _is_tabular(src) else []
-    return "\n".join(own), "\n".join(other)
+    return "\n".join([quote, row or "", *(p.text for p in parts if not p.reason)])
+
+
+def _other_context(src, quote: str) -> str:
+    """The text of what stands beside the item's row in a table: the other rows and the paragraphs not attributed to the table ("" for
+    a source that is no table). Only ``_foreign_condition`` reads it."""
+    if not _is_tabular(src):
+        return ""
+    parts, body = context_of_source(src)
+    row = _row_of(body, SupportScope.flat(quote))
+    return "\n".join([ln for ln in body if ln != row] + [p.text for p in parts if p.reason])
 
 
 def _foreign_condition(condition: str, src, quote: str) -> bool:
     """Whether an agent-written condition stands only in another item's context: most of its words are not in the item's own
     context and are in a row beside it (R3)."""
-    own, other = _contexts(src, quote)
-    return not conditions.stated_in(condition, own) and conditions.stated_in(condition, other)
+    return not conditions.stated_in(condition, _own_context(src, quote)) and conditions.stated_in(condition, _other_context(src, quote))
 
 
 def _clip_row(line: str) -> str:
@@ -376,20 +385,50 @@ def _clip_row(line: str) -> str:
     return " | ".join(kept)
 
 
-def _cited_spans(src, wanted: set[str]) -> Iterable[tuple[str, str, str]]:
-    """(quote, label, value) of each table row of the source whose value cells state a number of ``wanted``, or each sentence of a
-    passage that does: the spans an answer sentence stating those numbers draws on."""
+class _SpanRow(NamedTuple):
+    """A table row of a source for ``_cited_spans``: the line, its first cell, its first value cell and the numbers its value cells state."""
+
+    line: str
+    label: str
+    value: str
+    numbers: frozenset[str]
+
+
+class _SpanSentence(NamedTuple):
+    """A sentence of a passage line for ``_cited_spans``: its text and, for each number it writes outside its dates, (as written, its numbers)."""
+
+    text: str
+    written: tuple[tuple[str, frozenset[str]], ...]
+
+
+def _span_index(src) -> list[_SpanRow | list[_SpanSentence]]:
+    """The body of a source parsed once for ``_cited_spans``, line by line: a table row (two cells or more) with a value cell that holds a
+    digit, else the sentences of a passage line. A row without a digit in its value cells has no entry."""
+    out: list[_SpanRow | list[_SpanSentence]] = []
     for line in context_of_source(src)[1]:
         cells = _row_cells(line) if "|" in line else []
         if len(cells) >= 2:
             values = [c for c in cells[1:] if re.search(r"\d", c)]
-            if values and wanted & numbers_in(_outside_dates(" ".join(values))):
-                yield _clip_row(line), cells[0], values[0]
+            if values:
+                out.append(_SpanRow(line, cells[0], values[0], frozenset(numbers_in(_outside_dates(" ".join(values))))))
             continue
-        for sentence in _SENTENCE_END.split(line):
-            hits = [m.group(0) for m in _NUMBER.finditer(_outside_dates(sentence)) if numbers_in(m.group(0)) & wanted]
+        out.append([_SpanSentence(s, tuple((m.group(0), frozenset(numbers_in(m.group(0))))
+                                           for m in _NUMBER.finditer(_outside_dates(s)))) for s in _SENTENCE_END.split(line)])
+    return out
+
+
+def _cited_spans(index: Sequence[_SpanRow | list[_SpanSentence]], wanted: set[str]) -> Iterable[tuple[str, str, str]]:
+    """(quote, label, value) of each table row of the source (parsed by ``_span_index``) whose value cells state a number of ``wanted``,
+    or each sentence of a passage that does: the spans an answer sentence stating those numbers draws on."""
+    for entry in index:
+        if isinstance(entry, _SpanRow):
+            if wanted & entry.numbers:
+                yield _clip_row(entry.line), entry.label, entry.value
+            continue
+        for sentence in entry:
+            hits = [written for written, numbers in sentence.written if numbers & wanted]
             if hits:
-                yield sentence.strip(), " ".join(sentence.split()[:6]), hits[0]
+                yield sentence.text.strip(), _first_words(sentence.text, trim=False), hits[0]
 
 
 def _component_of(asked: Sequence[Mapping], text: str) -> str:
@@ -401,13 +440,17 @@ def _component_of(asked: Sequence[Mapping], text: str) -> str:
     return max(asked, key=lambda c: len(claim_terms(c.get("text") or "")[1] & words))["id"]
 
 
+def _same_source(ws, a: str, b: str) -> bool:
+    """Whether the sources ``a`` and ``b`` are one text: the same S#, or one is the re-read of the other (``Source.same_as``)."""
+    first, second = ws.sources.get(a), ws.sources.get(b)
+    return a == b or (first is not None and first.same_as == b) or (second is not None and second.same_as == a)
+
+
 def _holds(item: Item, sid: str, ws, flat: str) -> bool:
     """Whether the ledger item already covers the span ``flat`` of source ``sid``: the same source (or its re-read) and a quote
     that holds or is held by the span."""
-    held = ws.sources.get(item.source)
-    same = item.source == sid or (held is not None and held.same_as == sid) or ws.sources[sid].same_as == item.source
-    mine = SupportScope.flat(item.quote)
-    return same and (mine in flat or flat in mine)
+    mine = _flat_text(item.quote)
+    return _same_source(ws, item.source, sid) and (mine in flat or flat in mine)
 
 
 def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledger: Ledger) -> list[Item]:
@@ -417,16 +460,19 @@ def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledge
     span with no condition makes none. The source must pass the checks the agent's items pass (``SupportScope``); at most
     ``ROWS_PER_UNIT`` rows of one source per unit."""
     scope = SupportScope(ws, list(units))
-    asked = [c for c in components if c.get("kind") != "instruction"]
+    asked = asked_components(components)
     held = list(ledger.items.values())
     built: list[Item] = []
+    indexes: dict[str, list] = {}  # each cited source parsed once, whatever the number of units that cite it
     for unit in units:
         wanted = numbers_in(_outside_dates(unit.text))
         if not wanted:
             continue
         for sid, src in _cited_sources(unit, ws):
             made = 0
-            for quote, label, value in _cited_spans(src, wanted):
+            if sid not in indexes:
+                indexes[sid] = _span_index(src)
+            for quote, label, value in _cited_spans(indexes[sid], wanted):
                 flat = SupportScope.flat(quote)
                 if (made >= ROWS_PER_UNIT or scope.source_problem(sid, flat) or scope.place_problem(src)
                         or any(_holds(i, sid, ws, flat) for i in [*held, *built])):
@@ -504,10 +550,17 @@ def _first_value(text: str) -> str:
     return next((m.group(0) for m in _NUMBER.finditer(_outside_dates(text)) if numbers_in(m.group(0))), "")
 
 
+def _first_words(text: str, *, trim: bool = True) -> str:
+    """The first ``FIRST_WORDS`` words of a sentence or list member, the label of a span with a value; ``trim``: without the punctuation
+    that closes them."""
+    words = " ".join(text.split()[:FIRST_WORDS])
+    return words.rstrip(".:;,") if trim else words
+
+
 def _named(text: str) -> tuple[str, str]:
     """(label, value) of a sentence or list member: its first words and its number; a span without a number is its own value."""
     number = _first_value(text)
-    return (" ".join(text.split()[:FIRST_WORDS]).rstrip(".:;,"), number) if number else ("", _MEMBER_LINE.sub("", text).strip())
+    return (_first_words(text), number) if number else ("", _MEMBER_LINE.sub("", text).strip())
 
 
 def _context_words(src, parts) -> str:
@@ -543,7 +596,7 @@ def _raws(src) -> tuple[list[_Raw], dict[str, list[str]]]:
                 for sentence in _SENTENCE_END.split(part.text):
                     number = _first_value(sentence)
                     if number and not conditions.material(sentence):  # a note that limits a value is that value's condition span
-                        raws.append(_Raw(sentence.strip(), " ".join(sentence.split()[:FIRST_WORDS]).rstrip(".:;,"), number, "note",
+                        raws.append(_Raw(sentence.strip(), _first_words(sentence), number, "note",
                                          f"{sentence} {about}", "table"))
         groups["table"] = list(body)
         return raws, groups
@@ -566,7 +619,7 @@ def _raws(src) -> tuple[list[_Raw], dict[str, list[str]]]:
         for sentence in _SENTENCE_END.split(line):
             number = _first_value(sentence)
             if number:
-                raws.append(_Raw(sentence.strip(), " ".join(sentence.split()[:FIRST_WORDS]).rstrip(".:;,"), number, "sentence",
+                raws.append(_Raw(sentence.strip(), _first_words(sentence), number, "sentence",
                                  f"{sentence} {about}", group))
     return raws, groups
 
@@ -581,7 +634,8 @@ def candidates(units: Sequence[Unit], ws, ledger: Ledger, components: Sequence[M
     could never be kept otherwise). At most ``CANDIDATES_PER_SOURCE`` per source in the source's order, ``CANDIDATE_SOURCES`` sources;
     the counts left out are in the offer. No component is needed before the call."""
     scope = SupportScope(ws, list(units))
-    asked = [c for c in components if c.get("kind") != "instruction"]
+    asked = asked_components(components)
+    leads = _leads(units)
     known = request_word_forms(" ".join([*(c.get("text") or "" for c in asked), request]))
     held = list(ledger.items.values())
     anchors: dict[str, None] = {}
@@ -613,11 +667,11 @@ def candidates(units: Sequence[Unit], ws, ledger: Ledger, components: Sequence[M
         for n, (raw, flat, span) in enumerate(zip(raws, flats, spans, strict=True)):
             sig = _signature(span)
             shared = bool(sig) and signatures[sig] > 1
-            if any(_holds(h, sid, ws, flat) for h in held) or _coverage(span, units, ws, shared).ok:
+            if any(_holds(h, sid, ws, flat) for h in held) or _coverage(span, units, ws, shared, leads).ok:
                 touched.add(raw.group)
             else:
                 free.append(n)
-        mine = [SupportScope.flat(h.quote) for h in held if h.source == sid or src.same_as == h.source]
+        mine = [SupportScope.flat(h.quote) for h in held if _same_source(ws, h.source, sid)]
         for name, lines in groups.items():
             if any(q in _flat_text(line) for q in mine for line in lines):
                 touched.add(name)
@@ -693,8 +747,7 @@ def _attributed(item: Item, unit: Unit, ws) -> bool:
             place = _place(ws, cid)
             if place is None or not _same_place(home, place):
                 continue
-            if cid == item.source or src.same_as == item.source or ws.sources[item.source].same_as == cid \
-                    or flat in _flat_text(src.text or ""):
+            if _same_source(ws, cid, item.source) or flat in _flat_text(src.text or ""):
                 return True
         elif cid in ws.values:
             v = ws.values[cid]
@@ -747,11 +800,13 @@ def _enough(wanted: str, have: frozenset[str]) -> bool:
     return not groups or sum(1 for g in groups if g & have) >= (len(groups) + 1) // 2
 
 
-def _number_forms(text: str) -> list[set[str]]:
+@functools.lru_cache(maxsize=1024)
+def _number_forms(text: str) -> tuple[frozenset[str], ...]:
     """The forms of each number ``text`` writes, outside its dates (``verify._value_forms``): a number written with a scale word has the
-    forms of its full value too, so "16.07 מיליון" and "16,070,000" are one number (round 18 U7, KTD6)."""
+    forms of its full value too, so "16.07 מיליון" and "16,070,000" are one number (round 18 U7, KTD6). A function of the text alone, kept
+    per text: the ledger reads the same sentence against every item."""
     blank = _outside_dates(text)
-    return [forms for m in _NUM_AT.finditer(blank) if (forms := _value_forms(blank, m))]
+    return tuple(frozenset(forms) for m in _NUM_AT.finditer(blank) if (forms := _value_forms(blank, m)))
 
 
 def _states_value(item: Item, text: str, words: frozenset[str]) -> bool:
@@ -801,6 +856,17 @@ def _unit_covers(item: Item, unit: Unit, ws, shared: bool, lead: str = "") -> st
     if shared and not _enough(item.condition or item.label, words):
         return "condition_not_stated"
     return ""
+
+
+def _coverage_all(item: Item, units: Sequence[Unit], ws, shared: bool, leads: Mapping[int, str]) -> tuple[Coverage, frozenset[int]]:
+    """``_coverage`` and, from the same pass over the units, every unit that gives the item (``Ledger.outcomes``): the coverage names
+    the first of them."""
+    checks = [(unit.index, _unit_covers(item, unit, ws, shared, leads.get(unit.index, ""))) for unit in units]
+    giving = [index for index, why in checks if not why]
+    if giving:
+        return Coverage(True, giving[0], ""), frozenset(giving)
+    furthest = max((_WHY_ORDER.index(why) for _, why in checks), default=-1)
+    return Coverage(False, None, _WHY_ORDER[furthest] if furthest >= 0 else "not_attributed"), frozenset()
 
 
 def _coverage(item: Item, units: Sequence[Unit], ws, shared: bool, leads: Mapping[int, str] | None = None) -> Coverage:
@@ -882,21 +948,24 @@ class Ledger:
         by_index = {u.index: u for u in units}
         leads = _leads(units)
         spans = {i.key: _spans_of(ws, i) for i in self.items.values()}
-        rows: list[tuple[Item, Coverage | None, bool]] = []
+        rows: list[tuple[Item, Coverage | None]] = []
+        gave: dict[tuple[str, str, str], frozenset[int]] = {}  # the units that give each covered item (the first is the covering unit)
         for item in self.items.values():
             sig = signatures[id(item)]
             shared = bool(sig) and alike[(item.component, sig)] > 1
-            got = _coverage(item, units, ws, shared, leads) if item.state in (ITEM_INCLUDED, OMITTED) else None
-            if item.origin == ORIGIN_SOURCE and not item.candidate and (got is None or not got.ok):
+            got = None
+            if item.state in (ITEM_INCLUDED, OMITTED):
+                got, covering = _coverage_all(item, units, ws, shared, leads)
+                if got.ok:
+                    gave[item.key] = covering
+            if is_server_item(item) and (got is None or not got.ok):
                 continue  # (a candidate the call assigned to a component is an open item whatever sentence cited what: round 18 U6)
-            rows.append((item, got, shared))
-        # the units that give each covered item (the first is the covering unit above), and each item's own context text
-        gave = {i.key: {u.index for u in units if not _unit_covers(i, u, ws, shared, leads[u.index])} for i, g, shared in rows
-                if g is not None and g.ok}
-        owns = {i.key: _own_text(ws, i) for i, _, _ in rows}
-        for item, got, _ in rows:
+            rows.append((item, got))
+        owns = {i.key: _own_text(ws, i) for i, _ in rows}  # each item's own context text
+        others = [i for i, _ in rows]
+        for item, got in rows:
             state = item.state if got is None else (COVERED if got.ok else OMITTED)
-            check = _condition_check(item, got, spans, gave, owns, by_index, [i for i, _, _ in rows])
+            check = _condition_check(item, got, spans, gave, owns, by_index, others)
             out.append({**item.public(), "state": state, "declared": item.state, "covered_by": got.unit if got else None,
                         "why": got.why if got else "", **check})
         return out
@@ -916,7 +985,7 @@ def _spans_of(ws, item: Item) -> list[Span]:
 
 def _own_text(ws, item: Item) -> str:
     src = ws.sources.get(item.source)
-    return _contexts(src, item.quote)[0] if src is not None else item.quote
+    return _own_context(src, item.quote) if src is not None else item.quote
 
 
 def _condition_check(item: Item, got: Coverage | None, spans: dict, gave: dict, owns: dict, by_index: dict[int, Unit],
@@ -931,7 +1000,8 @@ def _condition_check(item: Item, got: Coverage | None, spans: dict, gave: dict, 
     best = None
     for index in sorted(gave.get(item.key, {got.unit})):
         unit = by_index[index]
-        results = [conditions.outcome(sp.text, unit.text) for sp in mine]
+        read = [conditions.read(sp.text, unit.text) for sp in mine]  # (outcome, quote) of each span
+        results = [outcome for outcome, _ in read]
         hints = ["contradicted"] if conditions.HINT in results else []
         foreign = _foreign_items(item, unit, spans, gave, owns, others)
         if foreign:
@@ -939,8 +1009,7 @@ def _condition_check(item: Item, got: Coverage | None, spans: dict, gave: dict, 
         check = (conditions.HINT if hints else "" if not mine else
                  conditions.UNDECIDED if conditions.UNDECIDED in results else
                  conditions.MISSING if conditions.MISSING in results else conditions.KEPT)
-        quote = conditions.missing_quote(mine[results.index(conditions.MISSING)].text, unit.text) \
-            if check == conditions.MISSING else ""
+        quote = read[results.index(conditions.MISSING)][1] if check == conditions.MISSING else ""
         row = {"condition_check": check, "condition_hint": hints, "condition_foreign": foreign,
                "condition_spans": [sp.public() for sp in mine], "condition_unit": index, "condition_quote": quote}
         if best is None or _RANK.get(check, 0) < _RANK.get(best["condition_check"], 0):
@@ -948,6 +1017,13 @@ def _condition_check(item: Item, got: Coverage | None, spans: dict, gave: dict, 
         if check in ("", conditions.KEPT):
             break
     return best or dict(_NO_CHECK)
+
+
+@functools.lru_cache(maxsize=4096)
+def _span_kept(text: str, sentence: str) -> bool:
+    """Whether a span states an operator clause that limits and the sentence keeps it: a function of the span and the sentence alone, so
+    it is decided once per (span, sentence), whichever item asks."""
+    return bool(conditions.material_clauses(text)) and conditions.outcome(text, sentence) == conditions.KEPT
 
 
 def _foreign_items(item: Item, unit: Unit, spans: dict, gave: dict, owns: dict, others: list[Item]) -> list[str]:
@@ -958,8 +1034,7 @@ def _foreign_items(item: Item, unit: Unit, spans: dict, gave: dict, owns: dict, 
         if other.key == item.key or unit.index in gave.get(other.key, ()):
             continue
         for sp in spans[other.key]:
-            if (conditions.material_clauses(sp.text) and conditions.outcome(sp.text, unit.text) == conditions.KEPT
-                    and not conditions.stated_in(sp.text, owns[item.key])):
+            if _span_kept(sp.text, unit.text) and not conditions.stated_in(sp.text, owns[item.key]):
                 found.append(other.id)
                 break
     return found

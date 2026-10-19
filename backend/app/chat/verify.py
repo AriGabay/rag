@@ -197,7 +197,7 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol, get_args
@@ -211,6 +211,9 @@ from app.chat import dates as chat_dates
 from app.chat import meaning
 from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited, line_cut
 from app.chat.evidence import (
+    HINT,
+    KEPT,
+    MISSING,
     PART_REASON_MARKS,
     TABLE_AFTER,
     TABLE_BEFORE,
@@ -218,6 +221,7 @@ from app.chat.evidence import (
     TABLE_HEADING_LIKE,
     TABLE_PATH_PREFIX,
     TABLE_SIZE_PREFIX,
+    UNDECIDED,
     Segment,
     claim_terms,
     fit,
@@ -671,10 +675,10 @@ DEFECT_FAILURES = {"input": "wrong_calculation", "scenario": "wrong_calculation"
 # wrong input or on an assumption the user did not give is a wrong calculation (round 7 U7 adds these kinds); an
 # unmet instruction is a gap, never a removal
 KIND_FAILURES = {"input_choice": "wrong_calculation", "assumption": "wrong_calculation"}
-# how a repair of those kinds goes (KTD10): the stated amount, or the question the user must answer
 # how a repair of an unstated number goes (round 18 U2, KTD3): the citation it lacks is added, a valid one is never taken away
 UNSTATED_HINT = ("הוסף לטענה ציטוט של מקור שהמספר {numbers} כתוב בו, והשאר את הציטוטים התקפים שלה כפי שהם; "
                  "אם אין מקור כזה — השמט את הטענה")
+# how a repair of those kinds goes (KTD10): the stated amount, or the question the user must answer
 KIND_HINTS = {"input_choice": "קח את הסכום שהמקור מציין (take_value) וחשב ממנו מחדש ב-calculate",
               "assumption": "אל תניח את הפרט: הצג את הנתונים שנמצאו עם מראי המקום, נוסחה כללית בלי מספר ושאלה אחת "
                             "ממוקדת (status=clarification)"}
@@ -919,10 +923,11 @@ def _missing_words(text: str) -> list[str]:
 _FINAL_LETTERS = str.maketrans("ךםןףץ", "כמנפצ")
 
 
-def _loose_forms(word: str) -> set[str]:
+@functools.lru_cache(maxsize=4096)
+def _loose_forms(word: str) -> frozenset[str]:
     """``_missing_forms`` with the final letters read as their medial forms, so that the singular and plural of a noun meet
     ("תעריף" and "התעריפים"): how a candidate's request words are compared (round 18 U6)."""
-    return {f.translate(_FINAL_LETTERS) for f in _missing_forms(word)}
+    return frozenset(f.translate(_FINAL_LETTERS) for f in _missing_forms(word))
 
 
 def request_word_forms(text: str) -> set[str]:
@@ -2145,8 +2150,7 @@ class VerifyReport:
         units = [self._as_edited(u) for u in self.units if u.index in kept]
         # an origin ``source`` item exists only while a surviving unit gives it (the sentence that cited its span): otherwise it is no
         # open item and no line (round 18 U5); a candidate a component asks for is open until a unit gives it (round 18 U6)
-        states = [st for st in ledger.outcomes(units, self.item_ws)
-                  if st["origin"] != ORIGIN_SOURCE or st["candidate"] or st["state"] == ITEM_COVERED]
+        states = [st for st in ledger.outcomes(units, self.item_ws) if not is_server_item(st) or st["state"] == ITEM_COVERED]
         texts = texts if texts is not None else {r["id"]: r["text"] for r in self.requirements}
         for st in states:
             # the judge names a part by its quote alone: unit attribution is not enough for it, the round-16 presence test must
@@ -2392,7 +2396,7 @@ class VerifyReport:
         omitted_by: dict[str, list[dict]] = {}
         closed: set[tuple[str, str, str]] = set()
         for st in self.item_states(kept) if states is None else states:
-            if st["origin"] == ORIGIN_SOURCE and not st["candidate"]:
+            if is_server_item(st):
                 continue  # an item the server built from a cited span is given by the sentence that cites it: it never caps a component
                 # (a candidate a component asked for (round 18 U6) is an item of that component like an agent's: it caps it while omitted)
             if st["state"] == ITEM_OMITTED:
@@ -2402,7 +2406,7 @@ class VerifyReport:
         out: dict[str, dict] = {}
         for r in self.requirements:
             votes = self.requirement_votes.get(r["id"], [])
-            kind = r.get("kind") or ("calculation" if r.get("calculation") else "information")
+            kind = requirement_kind(r)
             offered = [v for v in votes if v.status in ("full", "partial")]
             live = {id(v): [i for i in v.units if i in kept and self.gives(v, i)] for v in votes}
             given = [v for v in offered if live[id(v)]]
@@ -2900,17 +2904,17 @@ def _citation_point(markdown: str, unit: Unit) -> int:
     stripped = span.rstrip()
     if unit.table_span is not None and stripped.endswith("|"):
         stripped = stripped[:-1].rstrip()
-    end = unit.start + len(stripped)
-    while end > unit.start and markdown[end - 1] in ".:;!?":
-        end -= 1
-    return end
+    return _before_closing_punctuation(markdown, unit.start, unit.start + len(stripped))
 
 
 def _phrase_end(markdown: str, unit: Unit) -> int:
     """Where a unit ends before its closing punctuation (``.:;!?``): after the citations it ends with, and after all its words."""
-    stripped = markdown[unit.start:unit.end].rstrip()
-    end = unit.start + len(stripped)
-    while end > unit.start and markdown[end - 1] in ".:;!?":
+    return _before_closing_punctuation(markdown, unit.start, unit.start + len(markdown[unit.start:unit.end].rstrip()))
+
+
+def _before_closing_punctuation(markdown: str, start: int, end: int) -> int:
+    """``end`` moved back over the closing punctuation (``.:;!?``) the text before it ends with, never past ``start``."""
+    while end > start and markdown[end - 1] in ".:;!?":
         end -= 1
     return end
 
@@ -3659,7 +3663,8 @@ def _all_numbers(ws: Workspace) -> set[str]:
     nums: set[str] = set()
     for s in ws.sources.values():
         if not s.is_listing:
-            nums |= numbers_in(without_part_tags(s.text), words=True) | scaled_numbers_in(without_part_tags(s.text))
+            text = without_part_tags(s.text)
+            nums |= numbers_in(text, words=True) | scaled_numbers_in(text)
     for m in ws.measurements.values():
         written = f"{m.row.value_text} {m.row.quote}"
         nums |= numbers_in(written, words=True) | scaled_numbers_in(written)
@@ -3696,10 +3701,27 @@ _NOT_A_PRICE_AFTER = re.compile(r"\s*(?:מ[\"״']?ר|מטר|דונם|שנ(?:ה|�
 
 
 # the words that open the name of a property, plot or building ("מגדל הים 7", "גוש 1234"): a short number after one is part of
-# the name, whatever VAT phrase follows it (round 18 U2, KTD3)
+# the name, whatever VAT phrase follows it (round 18 U2, KTD3). The identifier nouns may stand a word or two before the number; the
+# generic nouns ("שכר דירה 4500") only directly before it, and a number written with a thousands separator is an amount after them
 _NAME_BEFORE = re.compile(
-    r"(?<![א-ת])[בהולכמש]?(?:גוש|חלקה|תת[\s-]*חלקה|מגרש|דירה|דירת|יחידה|בניין|בנין|מבנה|מגדל|פרויקט|מתחם|רחוב|שדרות|"
-    r"שד[׳']|סמטת|בית|כניסה|קומה)\s+(?:[א-ת\"'׳״\-]+\s+){0,2}$")
+    r"(?<![א-ת])[בהולכמש]?(?:גוש|חלקה|תת[\s-]*חלקה|מגרש|יחידה|בניין|בנין|מגדל|פרויקט|מתחם|רחוב|שדרות|"
+    r"שד[׳']|סמטת|כניסה)\s+(?:[א-ת\"'׳״\-]+\s+){0,2}$")
+_GENERIC_NAME_BEFORE = re.compile(r"(?<![א-ת])[בהולכמש]?(?:דירה|דירת|בית|מבנה|קומה)\s+$")
+# a number followed (or, for a currency, preceded) by a currency word or a period word is a price, never a name's number
+_PRICE_AFTER = re.compile(r"\s*(?:₪|ש[\"״']?ח|שקל(?:ים)?|[לב]?(?:חודש|שנה|שבוע)|/\s?(?:חודש|שנה))(?![א-ת])")
+_CURRENCY_BEFORE = re.compile(r"(?:₪|ש[\"״']?ח|שקל(?:ים)?)\s*$")
+
+
+def _in_a_name(clause: str, m: re.Match) -> bool:
+    """Whether the short whole number ``m`` is a number in the name of a property, plot or building (``_NAME_BEFORE``): not a price, which
+    a currency sign or word, or a period word, makes it (``_PRICE_AFTER``, ``_CURRENCY_BEFORE``)."""
+    value = m.group(0).replace(",", "")
+    if not value.isdigit() or len(value) > 4 or "₪" in clause[max(0, m.start() - 2):m.end() + 3]:
+        return False
+    if _PRICE_AFTER.match(clause, m.end()) or _CURRENCY_BEFORE.search(clause[max(0, m.start() - 8):m.start()]):
+        return False
+    before = clause[max(0, m.start() - 40):m.start()]
+    return bool(_NAME_BEFORE.search(before) or ("," not in m.group(0) and _GENERIC_NAME_BEFORE.search(before)))
 
 
 def _vat_bearing(clause: str, m: re.Match, nested: bool = False) -> bool:
@@ -3714,8 +3736,7 @@ def _vat_bearing(clause: str, m: re.Match, nested: bool = False) -> bool:
         return False
     if _NOT_A_PRICE_AFTER.match(clause, m.end()):
         return False
-    if (value.isdigit() and len(value) <= 4 and "₪" not in clause[max(0, m.start() - 2):m.end() + 3]
-            and _NAME_BEFORE.search(clause[max(0, m.start() - 40):m.start()])):
+    if _in_a_name(clause, m):
         return False
     before = clause[:m.start()]
     return nested or before.count("(") <= before.count(")")
@@ -4141,7 +4162,7 @@ MSG_CONDITION_ADDED = "התנאי לפי המקור: {phrase}"
 MSG_CONDITION_UNVERIFIED = "התנאי של הערך אינו כתוב בתשובה ולא אומת ({sid}); אם התשובה לא תכלול אותו, ייכתב ליד הערך שהתנאי לא אומת"
 MSG_CONDITION_LIMIT = "התנאי של הערך במקור לא נכלל בתשובה ולא אומת; הערך נקרא ב-{where}"
 MSG_CONDITION_CONTRADICTS = "התנאי של הפריט «{name}» סותר את המקור: {where}"
-_CONDITION_RANK = {"contradicted": 0, "other_item": 1, "missing": 2, "kept": 3}
+_CONDITION_RANK = {"contradicted": 0, "other_item": 1, MISSING: 2, KEPT: 3}
 # why a paragraph beside a table is not attributed to it (``tools.TablePart.reasons``), the most telling first: the note names the
 # first that a source of the value has, and the message for it
 SCOPE_REASONS = ("not_adjacent", "no_reference", "between")
@@ -4310,7 +4331,7 @@ def _scope_standing(phrase: str, src: Source) -> str:
     found = [p for p in context_of_source(src)[0] if phrase in _norm(p.text)]
     if any(not p.reason for p in found):
         return "ok"
-    return min((p.reason for p in found), key=SCOPE_REASONS.index) if found else "absent"
+    return _reason_of({p.reason for p in found}) if found else "absent"
 
 
 def _read_in(sources: list[tuple[str, Source]]) -> str:
@@ -4337,7 +4358,7 @@ def scope_outcome(u: Unit, phrase: str, ws: Workspace, text: str | None = None) 
         return True, Problem(u, MSG_SCOPE_FOUND.format(sid=first, phrase=scope), kind="missing_qualifier", number=number,
                              annotation=scope, cite=first, defect="scope", check=SCOPE_CHECK)
     reasons = [x for x in standing if x in SCOPE_REASONS]
-    note = (SCOPE_LIMIT_NOTES[min(reasons, key=SCOPE_REASONS.index)] if reasons and "absent" not in standing
+    note = (SCOPE_LIMIT_NOTES[_reason_of(reasons)] if reasons and "absent" not in standing
             else MSG_SCOPE_LIMIT)
     return True, Problem(u, MSG_SCOPE_UNVERIFIED.format(sid=", ".join(k for k, _ in sources)), kind="missing_qualifier",
                          number=number, annotation=note.format(where=_read_in(sources)), defect="scope",
@@ -4358,7 +4379,7 @@ def _condition_verdicts(votes: Iterable[JudgeRequirement]) -> dict[str, Conditio
 def _condition_span(spans: list[str], quote: str) -> str:
     """The text the server writes for a missing condition: the span of the item's source that holds the judge's quote when it is
     compact (``items.SPAN_CHARS``), else the quote itself when it is; empty when neither is (a precise note says so instead)."""
-    flat = _flat_quote(_read_back(quote))
+    flat = _flat_quote(quote)
     holding = next((t for t in spans if flat in _flat_quote(t)), "")
     return next((t for t in (holding, quote.strip()) if t and len(_norm(t)) <= SPAN_CHARS), "")
 
@@ -4380,17 +4401,16 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
     said = _condition_verdicts(votes)
     units = {u.index: u for u in report.units}
     removed = report.removed_units()
-    names = {st["id"]: st for st in report.item_states()}
-    for st in names.values():
+    for st in report.item_states():
         verdict = said.get(st["id"])
         unit = units.get(st["condition_unit"])
         if st["condition_check"] == DECIDED_MISSING and st.get("condition_quote"):
             # the server decided it alone (``conditions.MISSING``): the operator's class and its operand are both absent from the
             # sentence; the judge was not asked, and the same completion path follows as for the judge's own ``missing``
-            verdict = ConditionVerdict(item=st["id"], outcome="missing", quote=st["condition_quote"])
+            verdict = ConditionVerdict(item=st["id"], outcome=MISSING, quote=st["condition_quote"])
         elif st["condition_check"] not in ASKED_CHECKS:
             continue
-        if (verdict is None or verdict.outcome == "kept" or st["state"] != ITEM_COVERED or unit is None
+        if (verdict is None or verdict.outcome == KEPT or st["state"] != ITEM_COVERED or unit is None
                 or unit.index in removed):
             continue
         name = _plain_label(st)
@@ -6123,7 +6143,7 @@ class _Coverage:
     def component_texts(self) -> list[str]:
         """What the passages are clipped against: the asked components, else (before they are derived) the request and the
         answer's declared parts."""
-        asked = [r["text"] for r in self.turn.items if r.get("kind") != "instruction"]
+        asked = [r["text"] for r in asked_components(self.turn.items)]
         return asked or [t for t in (self.request, *self.hints) if t and t.strip()]
 
     def render(self, passages: str = "") -> str:
@@ -6133,7 +6153,7 @@ class _Coverage:
                 return "".join(f"\n<requirement {_requirement_attrs(r)}>\n{prompt_text(r['text'])}\n</requirement>"
                                for r in items)
 
-            asked = [r for r in self.turn.items if r.get("kind") != "instruction"]
+            asked = asked_components(self.turn.items)
             instructions = [r for r in self.turn.items if r.get("kind") == "instruction"]
             out += "\n<requirements>" + listed(asked) + "\n</requirements>"
             if instructions:  # scored against the shown answer, never searched (KTD2)
@@ -6215,14 +6235,14 @@ class _Coverage:
         out: dict[str, ConditionVerdict] = {}
         for c in r.conditions:
             item = by_id.get(c.item.strip())
-            quote = _flat_quote(_read_back(c.quote.strip()))
+            quote = _flat_quote(c.quote.strip())
             if item is None or item.get("check") not in ASKED_CHECKS:
                 why = "not_asked"
             elif item["unit"] not in indexes:
                 why = "unit_not_shown"
             elif c.item.strip() in out:
                 why = "duplicate"
-            elif c.outcome == "kept":
+            elif c.outcome == KEPT:
                 why = None
             elif len(quote) < SUPPORT_QUOTE_MIN:
                 why = "too_short"
@@ -6247,9 +6267,8 @@ class _Coverage:
         ones. The server never keeps an assignment on the judge's word alone. The trace says why an assignment was dropped."""
         trace = trace or _VoteTrace(0, r.status, None)
         pool = {c["id"]: c for c in self.candidates}
-        kind = next((x.get("kind") or ("calculation" if x.get("calculation") else "information")
-                     for x in self.turn.items if x["id"] == r.id), "information")
-        known = [_loose_forms(w) for w in _missing_words(f"{texts.get(r.id, '')}\n{self.request}")]
+        kind = next((requirement_kind(x) for x in self.turn.items if x["id"] == r.id), "information")
+        known = frozenset().union(*(_loose_forms(w) for w in _missing_words(f"{texts.get(r.id, '')}\n{self.request}")))
         out: dict[str, CandidateAssignment] = {}
         for a in r.candidates:
             cid, part = a.candidate.strip(), _norm(a.words or "")
@@ -6263,19 +6282,19 @@ class _Coverage:
                 why = "not_a_datum"
             elif not words or len(part) > MISSING_PART_CHARS or is_request_clause(part):
                 why = "no_words"
-            elif not all(any(_loose_forms(w) & k for k in known) for w in words):
+            elif not all(_loose_forms(w) & known for w in words):
                 why = "words_not_in_request"
             else:
-                own = [_loose_forms(w) for w in _missing_words(c.get("own", ""))]
-                why = None if all(any(_loose_forms(w) & o for o in own) for w in words) else "words_not_in_candidate"
+                own = frozenset().union(*(_loose_forms(w) for w in _missing_words(c.get("own", ""))))
+                why = None if all(_loose_forms(w) & own for w in words) else "words_not_in_candidate"
             trace.candidates.append({"candidate": cid, "words": part[:TRACE_MISSING_CHARS], "accepted": why is None, "why": why or ""})
             if why is None:
                 out[cid] = CandidateAssignment(candidate=cid, words=part)
         return list(out.values())
 
 
-DECIDED_MISSING = "missing"  # the condition check the server decides alone (``conditions.MISSING``): not asked, completed
-ASKED_CHECKS = ("undecided", "hint")  # the condition checks the requirements call is asked to decide (``Ledger.outcomes``)
+DECIDED_MISSING = MISSING  # the condition check the server decides alone (``conditions.MISSING``): not asked, completed
+ASKED_CHECKS = (UNDECIDED, HINT)  # the condition checks the requirements call is asked to decide (``Ledger.outcomes``)
 
 
 def _span_flat(texts: Sequence[str]) -> list[str]:
@@ -6297,9 +6316,10 @@ def _item_ledger_block(items: list[dict]) -> str:
     (round 18 U6: an origin ``source`` item a component asked for) is rendered like an agent's: it is an open requirement of its component."""
     asked = {i["id"] for i in items if i.get("check") in ASKED_CHECKS}
     named = {x for i in items if i["id"] in asked for x in i.get("foreign", ())}
+    both = asked | named
     by_component: dict[str, list[dict]] = {}
     for i in items:
-        if i.get("origin") == ORIGIN_SOURCE and not i.get("candidate") and i["id"] not in asked | named:
+        if is_server_item(i) and i["id"] not in both:
             continue
         by_component.setdefault(i["component"], []).append(i)
     blocks = []
@@ -6317,7 +6337,7 @@ def _item_ledger_block(items: list[dict]) -> str:
             if i["id"] in asked:
                 hint = [h if h != "other_item" else "other_item:" + ",".join(i.get("foreign", ())) for h in i.get("hint", ())]
                 attrs += f' check="{i["check"]}" unit="{i["unit"]}"' + (f' hint="{prompt_attr(" ".join(hint))}"' if hint else "")
-            if i["id"] in asked | named and i.get("spans"):
+            if i["id"] in both and i.get("spans"):
                 attrs += f' span="{prompt_attr(" ; ".join(i["spans"])[:ITEM_SPAN_CHARS])}"'
             lines.append(f"<item {attrs}>{prompt_text(i['quote'][:ITEM_QUOTE_CHARS])}</item>")
         if len(mine) > len(shown):
@@ -6349,11 +6369,20 @@ def _candidates_block(candidates: list[dict], left_out: dict[str, int], sources_
     return "<candidates>\n" + "\n".join(lines) + "\n</candidates>"
 
 
+def requirement_kind(r: Mapping) -> str:
+    """The kind of a frozen requirement: the one it carries, else a calculation when it is flagged one, else information."""
+    return r.get("kind") or ("calculation" if r.get("calculation") else "information")
+
+
+def asked_components(components: Iterable[Mapping]) -> list[dict]:
+    """The components of a turn's frozen requirements that ask for something: all but its instructions."""
+    return [c for c in components if c.get("kind") != "instruction"]
+
+
 def _requirement_attrs(r: dict) -> str:
     """A frozen requirement's attributes for the judge: its id and kind, and its aspect, parent, condition and
     subject when it has them."""
-    kind = r.get("kind") or ("calculation" if r.get("calculation") else "information")
-    out = f'id="{prompt_attr(r["id"])}" kind="{kind}"'
+    out = f'id="{prompt_attr(r["id"])}" kind="{requirement_kind(r)}"'
     if r.get("aspect"):
         out += f' aspect="{prompt_attr(r["aspect"])}"'
     if r.get("parent"):
@@ -8127,6 +8156,14 @@ ITEM_OMITTED, ITEM_COVERED = "omitted", "covered"
 # checked on turns where the agent declared nothing). A source item is covered by the sentence that cites it: it is checked for its
 # condition only, and is never "read and not used" (``coverage.item_gap_lines``)
 ORIGIN_AGENT, ORIGIN_JUDGE_SUPPORT, ORIGIN_SOURCE = "agent", "judge_support", "source"
+
+
+def is_server_item(x) -> bool:
+    """Whether an item is one the server built from a span a sentence cites, which no component asked for: origin ``source`` and not
+    a ``candidate`` (round 18 U5, U6). ``x``: an ``items.Item`` or its state / listing dict."""
+    if isinstance(x, dict):
+        return x.get("origin") == ORIGIN_SOURCE and not x.get("candidate")
+    return x.origin == ORIGIN_SOURCE and not x.candidate
 # whether a score was cast by this round's call or carried from an earlier round of the turn (a score's ``_stamp["origin"]``)
 FRESH, CARRIED = "fresh", "carried"
 

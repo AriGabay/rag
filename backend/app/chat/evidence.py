@@ -28,6 +28,10 @@ from app.answering.verify import numbers_in
 from app.extraction.abbreviations import variants
 from app.extraction.normalize_text import query_tokens
 
+# what a source condition becomes against the sentence that gives its value (``conditions.outcome``; round 18 U5): the one place the four
+# words are written, shared by the reader (``conditions``) and the checks that route on them (``verify.ASKED_CHECKS``)
+KEPT, HINT, UNDECIDED, MISSING = "kept", "hint", "undecided", "missing"
+
 WHOLE_SOURCE_CHARS = 4000  # a source this short is given whole
 LONG_LINE = 400  # a longer line is split into sentences
 TOP_WORD_SEGMENTS = 3

@@ -1788,6 +1788,41 @@ def test_a_vat_phrase_after_a_property_name_that_holds_a_number_is_not_attached_
     assert pairs == {("58", "excluded")}
 
 
+@pytest.mark.parametrize("text", [
+    'שכר דירה 4,500 ש"ח לא כולל מע"מ',
+    'שכר דירה 4,500 ש״ח לא כולל מע"מ',
+    "שכר דירה 4500 שקלים ללא מע\"מ",
+    "שכר בית 3000 שקל ללא מע\"מ",
+    "דמי שימוש במבנה 800 לחודש ללא מע\"מ",
+    "שכר קומה 1200 בשנה ללא מע\"מ",
+    'שכר דירה בסך ש"ח 4,500 ללא מע"מ',
+    "שכר דירה 4,500 ללא מע\"מ",
+])
+def test_a_short_amount_after_a_generic_property_noun_still_carries_its_vat_status(text):
+    ((forms, polarity, _, _),) = list(verify._vat_phrases(text, True))
+    assert forms is not None and polarity in ("excluded", "included"), text
+    pairs, general = verify.vat_attachments(text)
+    assert pairs and not general
+
+
+@pytest.mark.parametrize("text", [
+    "דמי השכירות 58 ₪ לחודש בבניין מגדל הים 7 ללא מע\"מ",
+    "הנכס בגוש 1234 חלקה 56 ללא מע\"מ",
+    "הנכס ברחוב הצאלון 7 ללא מע\"מ",
+    "הנכס דירה 12 בקומה 3 ללא מע\"מ",
+])
+def test_a_number_in_the_name_of_a_property_or_a_plot_is_still_not_vat_bearing(text):
+    pairs, _ = verify.vat_attachments(text)
+    assert not any(f in ("7", "1234", "56", "12", "3") for f, _ in pairs), text
+
+
+def test_the_vat_of_a_rent_written_with_a_shekel_word_after_a_property_noun_is_checked_against_the_source():
+    source = 'שכר דירה 4,500 ש"ח, לא כולל מע"מ.'
+    assert _deterministic('שכר דירה 4,500 ש"ח לא כולל מע"מ [S1].', source) == []
+    (problem,) = [p for p in _deterministic('שכר דירה 4,500 ש"ח כולל מע"מ [S1].', source) if p.check == "vat"]
+    assert "4,500" in problem.reason or "4500" in problem.reason
+
+
 def test_a_vat_phrase_inside_the_parentheses_of_an_amount_belongs_to_that_amount():
     pairs, general = verify.vat_attachments("השווי 3,100,000 ₪ (מתוכם 2,450,000 ₪ ללא מע\"מ)")
     assert pairs == {(f, "excluded") for f in verify.numbers_in("2,450,000")} and not general

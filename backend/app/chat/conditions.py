@@ -24,16 +24,15 @@ sentence side — it is what "not including" is contradicted by — but never a 
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from functools import lru_cache
 from typing import NamedTuple
 
 from app.answering.verify import numbers_in
-from app.chat.evidence import claim_terms
+from app.chat.evidence import HINT, KEPT, MISSING, UNDECIDED, claim_terms
 from app.chat.verify import _MISSING_TOKEN, _QUALIFIER_PATTERN, _missing_forms, qualifier_words
 from app.extraction.normalize_text import is_negation
 from app.platform import dates as shared_dates
-
-KEPT, HINT, UNDECIDED, MISSING = "kept", "hint", "undecided", "missing"
 
 # the operator classes (closed): the key of an operator is what two spellings of it share, its polarity the side it stands on
 NEGATION, EXCLUSIVITY, EXCEPTION, SUBJECTION, THRESHOLD = "negation", "exclusivity", "exception", "subjection", "threshold"
@@ -79,7 +78,7 @@ class Operand(NamedTuple):
         return bool(self.groups or self.numbers or self.dates)
 
 
-class Segment(NamedTuple):
+class OperatorSpan(NamedTuple):
     op: Op
     operand: Operand
     clause: int
@@ -109,11 +108,15 @@ def _word_op(token: str) -> tuple[str, str, bool] | None:
     return (NEGATION, "negation", True) if is_negation(word) else None
 
 
-def _tokens(clause: str) -> list[str]:
-    return _MISSING_TOKEN.findall(clause)
+# The readers below are pure functions of their strings, and the item ledger reads the same spans and sentences again for every item,
+# unit and other item of a turn: each is kept per text. What is kept is immutable (tuples, frozensets, named tuples), so a cached result
+# cannot be changed by its caller; the public list-returning functions hand out a copy.
+@lru_cache(maxsize=4096)
+def _tokens(clause: str) -> tuple[str, ...]:
+    return tuple(_MISSING_TOKEN.findall(clause))
 
 
-def _ops(tokens: list[str]) -> list[Op]:
+def _ops(tokens: Sequence[str]) -> list[Op]:
     """The operators of a clause's tokens. A negation right before an including word or a threshold folds into it ("לא כולל" is
     an exclusion, "לא יותר" the negative side of a threshold) and is not an operator of its own."""
     out: list[Op] = []
@@ -135,15 +138,25 @@ def _ops(tokens: list[str]) -> list[Op]:
     return out
 
 
+@lru_cache(maxsize=4096)
+def _clauses(text: str) -> tuple[str, ...]:
+    return tuple(c.strip() for c in _CLAUSE_END.split(text or "") if c and c.strip())
+
+
 def clauses(text: str) -> list[str]:
     """The clauses of a text: split at a sentence end, a semicolon, a colon, a cell edge or a line, never at a comma (a list of
     exceptions is one clause) or inside a number."""
-    return [c.strip() for c in _CLAUSE_END.split(text or "") if c and c.strip()]
+    return list(_clauses(text))
+
+
+@lru_cache(maxsize=4096)
+def _operators(text: str) -> tuple[Op, ...]:
+    return tuple(op for c in _clauses(text) for op in _ops(_tokens(c)))
 
 
 def operators(text: str) -> list[Op]:
     """Every operator of a text, clause by clause (``Op.at`` indexes its clause's tokens)."""
-    return [op for c in clauses(text) for op in _ops(_tokens(c))]
+    return list(_operators(text))
 
 
 def _operand(tokens: Iterable[str]) -> Operand:
@@ -154,11 +167,10 @@ def _operand(tokens: Iterable[str]) -> Operand:
     return Operand(groups, frozenset(numbers_in(text)), dates)
 
 
-def segments(text: str) -> list[Segment]:
-    """The operators of a text with their operands: the tokens after an operator up to the next one, else (an operator that ends
-    its clause, "בלבד") the tokens before it back to the previous one."""
-    out: list[Segment] = []
-    for n, clause in enumerate(clauses(text)):
+@lru_cache(maxsize=4096)
+def _segments(text: str) -> tuple[OperatorSpan, ...]:
+    out: list[OperatorSpan] = []
+    for n, clause in enumerate(_clauses(text)):
         tokens = _tokens(clause)
         marks = _ops(tokens)
         for i, op in enumerate(marks):
@@ -167,10 +179,17 @@ def segments(text: str) -> list[Segment]:
             if not operand:
                 before_start = marks[i - 1].at + 1 if i else 0
                 operand = _operand(tokens[before_start:op.at])
-            out.append(Segment(op, operand, n))
-    return out
+            out.append(OperatorSpan(op, operand, n))
+    return tuple(out)
 
 
+def segments(text: str) -> list[OperatorSpan]:
+    """The operators of a text with their operands: the tokens after an operator up to the next one, else (an operator that ends
+    its clause, "בלבד") the tokens before it back to the previous one."""
+    return list(_segments(text))
+
+
+@lru_cache(maxsize=4096)
 def _words_of(text: str) -> tuple[frozenset[str], frozenset[str], tuple[str, ...]]:
     nums, words = claim_terms(text)
     return words, frozenset(nums | numbers_in(text)), tuple(p.iso for p in shared_dates.find_all(text))
@@ -202,7 +221,7 @@ def _absent(operand: Operand, words: frozenset[str], numbers: frozenset[str], da
             and not any(have_d.startswith(d) for d in operand.dates for have_d in have))
 
 
-def _segment_outcome(seg: Segment, sentence: list[Segment], sentence_clauses: list[_Said], classes: frozenset[str],
+def _segment_outcome(seg: OperatorSpan, sentence: Sequence[OperatorSpan], sentence_clauses: Sequence[_Said], classes: frozenset[str],
                      stated: tuple[frozenset[str], frozenset[str], tuple[str, ...]]) -> str:
     """The outcome of one source operator against the sentence's segments and clauses (see the module docstring)."""
     if seg.op.cls not in classes and _absent(seg.operand, *stated):
@@ -227,23 +246,25 @@ def _segment_outcome(seg: Segment, sentence: list[Segment], sentence_clauses: li
     return KEPT if same else HINT if opposite else UNDECIDED
 
 
-def _sentence_clauses(sentence: str) -> list[_Said]:
+@lru_cache(maxsize=4096)
+def _sentence_clauses(sentence: str) -> tuple[_Said, ...]:
     out = []
-    for c in clauses(sentence):
+    for c in _clauses(sentence):
         words, numbers, dates = _words_of(c)
         out.append((words, numbers, dates, any(op.negative for op in _ops(_tokens(c)))))
-    return out
+    return tuple(out)
 
 
-def _read(condition: str, sentence: str) -> tuple[str, str]:
+@lru_cache(maxsize=4096)
+def read(condition: str, sentence: str) -> tuple[str, str]:
     """(outcome, quote) of one condition against a sentence: the quote is the clause of the condition that holds the first missing
     operator, empty for any other outcome."""
-    material = [s for s in segments(condition) if s.op.material]
+    material = [s for s in _segments(condition) if s.op.material]
     if not material:
         need = _operand(_tokens(condition))
         words, numbers, dates = _words_of(sentence)
         return (KEPT if _matches(need, words, numbers, dates) else UNDECIDED), ""
-    said, said_clauses = segments(sentence), _sentence_clauses(sentence)
+    said, said_clauses = _segments(sentence), _sentence_clauses(sentence)
     classes, stated = frozenset(s.op.cls for s in said), _words_of(sentence)
     found = [_segment_outcome(s, said, said_clauses, classes, stated) for s in material]
     if HINT in found:
@@ -251,7 +272,7 @@ def _read(condition: str, sentence: str) -> tuple[str, str]:
     if UNDECIDED in found:
         return UNDECIDED, ""
     if MISSING in found:
-        return MISSING, clauses(condition)[material[found.index(MISSING)].clause]
+        return MISSING, _clauses(condition)[material[found.index(MISSING)].clause]
     return KEPT, ""
 
 
@@ -260,36 +281,44 @@ def outcome(condition: str, sentence: str) -> str:
     Several operators give the worst of their outcomes (a hint over an undecided over a missing over a kept: a condition the
     server cannot fully read is the judge's, not completed on a part of it); a condition with no operator is kept when the sentence
     holds most of its content words, else undecided."""
-    return _read(condition, sentence)[0]
+    return read(condition, sentence)[0]
 
 
 def missing_quote(condition: str, sentence: str) -> str:
     """The clause of ``condition`` the sentence leaves out when ``outcome`` is ``MISSING`` (verbatim from the condition), else ''."""
-    return _read(condition, sentence)[1]
+    return read(condition, sentence)[1]
 
 
+@lru_cache(maxsize=4096)
 def operand_of(text: str) -> Operand:
     """The content words, numbers and dates of a text, operators left out."""
     return _operand(_tokens(text))
 
 
+@lru_cache(maxsize=4096)
 def stated_in(condition: str, text: str) -> bool:
     """Whether most of the condition's operand (its words without the operators, every number and date) is written in ``text``,
     whatever the operator there: the test of where a condition stands, not of what it says."""
     words, numbers, dates = _words_of(text)
-    return _matches(_operand(_tokens(condition)), words, numbers, dates)
+    return _matches(operand_of(condition), words, numbers, dates)
 
 
+@lru_cache(maxsize=4096)
 def material(text: str) -> bool:
     """Whether a heading, a paragraph or a note limits the values it stands over: a closed-class operator, a status or a time
     (``verify.QUALIFIER_LEXICON``, a date), or a word for a method or a component. A plain "including" does not."""
-    if any(op.material for op in operators(text)):
+    if any(op.material for op in _operators(text)):
         return True
     words = [w for w in qualifier_words(text) if not _missing_forms(w) & _EXCEPT_IN]
     return bool(words or _QUALIFIER_PATTERN.search(text or "")
                 or any(_missing_forms(t) & _METHOD_HEADS for t in _tokens(text or "")))
 
 
+@lru_cache(maxsize=4096)
+def _material_clauses(text: str) -> tuple[str, ...]:
+    return tuple(c for c in _clauses(text) if any(op.material for op in _ops(_tokens(c))))
+
+
 def material_clauses(text: str) -> list[str]:
     """The clauses of a text that hold a closed-class operator that limits (the source side), in order."""
-    return [c for c in clauses(text) if any(op.material for op in _ops(_tokens(c)))]
+    return list(_material_clauses(text))

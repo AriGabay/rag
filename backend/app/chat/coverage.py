@@ -829,20 +829,21 @@ def item_line(ws: Workspace, state: dict, request: str = "") -> dict:
     row label, or its quote; ``items.source_name``), never by the agent's label; the agent's reason is shown only when every content
     word of it stands in the item's source context or in the ``request`` (``verify.words_stand_in``), else the state's own wording
     stands without it."""
-    from app.chat.items import _contexts, source_name
+    from app.chat.items import _own_context, source_name
     from app.chat.verify import ITEM_NOT_APPLICABLE, ITEM_NOT_VERIFIABLE, words_stand_in
 
     src = ws.sources.get(state["source"])
     title = (src.title if src is not None else "") or ""
     place = _read_at(title, src.location if src is not None else "", state["source"])
     name = "«" + _plain(source_name(src, state["quote"]), ITEM_NAME_CHARS) + "»"
-    own = _contexts(src, state["quote"])[0] if src is not None else state["quote"]
+    own = _own_context(src, state["quote"]) if src is not None else state["quote"]
     reason = _plain(state["reason"], ITEM_REASON_CHARS).rstrip(".")
     reason = reason if reason and words_stand_in(reason, own, request) else ""
+    tail = f": {reason}." if reason else "."
     if state["state"] == ITEM_NOT_VERIFIABLE:
-        text = f"{name}: נקרא {place}, אך לא ניתן לאמת אותו" + (f": {reason}." if reason else ".")
+        text = f"{name}: נקרא {place}, אך לא ניתן לאמת אותו" + tail
     elif state["state"] == ITEM_NOT_APPLICABLE:
-        text = f"{name}: נקרא {place}, ולא נכלל בתשובה כי הוא אינו חל על הבקשה" + (f": {reason}." if reason else ".")
+        text = f"{name}: נקרא {place}, ולא נכלל בתשובה כי הוא אינו חל על הבקשה" + tail
     else:
         text = f"{name}: נקרא {place}, ולא נעשה בו שימוש בתשובה."
     return {"id": state["id"], "state": state["state"], "text": text,
@@ -859,18 +860,17 @@ def item_gap_lines(ws: Workspace, report, outcomes: Sequence[dict]) -> list[dict
         ITEM_NOT_VERIFIABLE,
         ITEM_OMITTED,
         ORIGIN_JUDGE_SUPPORT,
-        ORIGIN_SOURCE,
+        is_server_item,
     )
 
     skip = {o["id"] for o in outcomes if o.get("status") == "not_relevant"}
     request = " ".join([report.request, *(f"{o.get('text') or ''} {o.get('subject') or ''}" for o in outcomes)])
-    # a part only the judge named is stated by its component's own line (round 16: ``read_not_used``), not twice; an item the server
-    # built from a span a sentence cites (round 18 U5) is covered by that sentence and is never "read and not used"; a candidate a
-    # component asked for (round 18 U6) is, once it stays omitted: its line is built from the source's label and quote (``item_line``)
-    # an item a sentence gives by attribution and value but not by its date is no item "read and not used" (round 18 U7, KTD6): the date is a
-    # note at most
+    # a line is written only for what a component asks for and the answer leaves open: a part only the judge named is stated by its
+    # component's own line (``read_not_used``), and an item the server built from a span a sentence cites is covered by that sentence;
+    # a candidate a component asked for is an item like an agent's (its line is built from the source's label and quote, ``item_line``);
+    # and an item a sentence gives by attribution and value but not by its date is no item "read and not used" (the date is a note at most)
     lines = [item_line(ws, st, request) for st in report.item_states()
-             if st["component"] not in skip and (st["origin"] != ORIGIN_SOURCE or st["candidate"])
+             if st["component"] not in skip and not is_server_item(st)
              and (st["state"] in (ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE)
                   or (st["state"] == ITEM_OMITTED and st["origin"] != ORIGIN_JUDGE_SUPPORT and st["why"] != "date_not_stated"))]
     if len(lines) <= ITEM_GAP_LINES:

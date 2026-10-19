@@ -994,3 +994,79 @@ def test_a_problem_names_the_occurrence_it_is_about():
     (p,) = _problems(answer, _ws("שטח 120 מ\"ר פלדלת."))
     assert p.kind == "basis" and p.number == "120"
     assert answer.index("120 מ\"ר") == p.at
+
+
+# --- review fixes: a negation governs only the period word near it; a large number is no duration; windowed helpers ---------------
+
+def test_a_negation_far_before_a_period_word_does_not_blank_it_but_one_next_to_it_still_does():
+    text = "הנכס לא הושכר בפועל ולכן הוערך לפי 5,000 ₪ לחודש"
+    assert meaning._all(text).keys("period") == {"month"}
+    ((_, _, q),), _ = meaning.attached(text)
+    assert q.found == {"period": {"month": "לחודש"}}
+    assert meaning._all("הנכס לא הושכר בפועל ולכן הוערך לפי 5,000 ₪ בשנה").keys("period") == {"year"}
+    # the negation governs the period word right after it, in any written form
+    assert meaning._all("הסכום 5,000 ₪ אינו מוצג כסכום חודשי").keys("period") == set()
+    assert meaning._all("הסכום 5,000 ₪ לא נקבע לשנה").keys("period") == set()
+    assert meaning._all("לא פחות מ-5,000 ₪ לחודש").keys("period") == {"month"}
+
+
+def test_a_negation_closed_by_a_comma_or_a_conjunction_clause_does_not_reach_a_later_period_word():
+    assert meaning._all("הנכס לא הושכר, 5,000 ₪ לחודש").keys("period") == {"month"}
+    assert meaning._all("הנכס לא הושכר אלא הוערך ב-5,000 ₪ לחודש").keys("period") == {"month"}
+
+
+@pytest.mark.parametrize("text", [
+    "דמי שכירות 5,000 חודשי",
+    "דמי שכירות 5,000.50 חודשיים",
+    "שכר דירה 1500 שנתי",
+])
+def test_a_large_number_before_a_period_adjective_is_an_amount_with_that_period_not_a_duration(text):
+    ((_, _, q),), _ = meaning.attached(text)
+    assert q.found.get("period"), text
+
+
+@pytest.mark.parametrize("text, kind", [
+    ("תקופת השכירות 36 חודשים", "duration"),
+    ("תקופת השכירות 36 חודשי שכירות", "duration"),
+    ("תקופת הגרייס 12 חודשים", "duration"),
+    ("תקופה של 2.5 שנים", "duration"),
+    ("תקופת השכירות 5,000 חודשים", ""),   # not a count of months
+    ("דמי שכירות 5,000 חודשי", ""),
+])
+def test_after_kind_reads_a_duration_only_after_a_small_number(text, kind):
+    end = len(re.match(r".*?\d[\d,.]*", text).group(0))
+    assert meaning.after_kind(text, end) == kind
+
+
+@pytest.mark.parametrize("filler", list(range(0, 40, 3)) + list(range(110, 140, 3)) + list(range(250, 270, 3)) + list(range(500, 530, 4)))
+def test_the_windowed_helpers_give_the_result_of_a_scan_of_the_whole_text_at_the_edges_of_their_windows(filler):
+    pad = "ב" * filler
+    cases = [
+        # (text before the word, the helper, the whole-text answer)
+        (f"{pad}, לא נקבע ", meaning._negated, lambda t: bool(
+            meaning._NEGATION.search(t, _negation_start(t), len(t)))),
+        (f"לא {pad} נקבע ", meaning._negated, lambda t: bool(meaning._NEGATION.search(t, _negation_start(t), len(t)))),
+        (f"{pad} 5,000 ₪ סכום 12 ", meaning._number_before, _number_written_before),
+        (f"{pad} {'1' * filler}", meaning._number_before, _number_written_before),
+        (f"{pad} 5,000-", meaning._number_before, _number_written_before),
+        (f"{pad}תקופה של ", meaning._after_duration_preposition, lambda t: bool(meaning._DURATION_PREPOSITION.search(t))),
+        (f"{pad} {' ' * filler}של ", meaning._after_duration_preposition, lambda t: bool(meaning._DURATION_PREPOSITION.search(t))),
+        (f"{pad}כ", meaning._after_duration_preposition, lambda t: bool(meaning._DURATION_PREPOSITION.search(t))),
+    ]
+    for head, helper, whole in cases:
+        text = head + "חודשי"
+        assert helper(text, len(head)) == whole(head), (helper.__name__, filler, head[-30:])
+
+
+def _number_written_before(head: str) -> str:
+    m = meaning._NUMBER_BEFORE.search(head)
+    return m.group(1) if m else ""
+
+
+def _negation_start(head: str) -> int:
+    """Where the negation of ``head`` may start, read on the whole text: the first of the last ``NEGATION_TOKENS`` blank-separated
+    words, and not before the last mark that closes a part of the clause."""
+    words = list(re.finditer(r"\S+", head))[-meaning.NEGATION_TOKENS:]
+    start = words[0].start() if words else len(head)
+    closings = list(meaning._NEGATION_END.finditer(head, start, len(head)))
+    return closings[-1].end() if closings else start

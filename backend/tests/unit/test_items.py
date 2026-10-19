@@ -824,3 +824,36 @@ def test_a_lead_in_that_is_not_the_sentences_own_does_not_lend_it_its_date():
     item = _item(label="שיעור ההיוון", quote=DATED, value="7.5%")
     far = "הנתונים נכון ליום 31.12.2023:\n\n- פריט אחר.\n\nפסקה חדשה.\n\nשיעור ההיוון הוא 7.5% [S1]."
     assert not _covered(ws, far, item).ok
+
+
+# --- a year in a comma-joined list is a number of its own, as in ``answering.verify._NUMBER`` (round 18 U2) -----------------------
+
+YEARS_PASSAGE = "הדגמים 2018,2019,2021 מאושרים רק לפי התוכנית המאושרת."
+
+
+def test_a_year_of_a_comma_joined_list_is_the_value_of_the_span_a_sentence_cites_and_the_item_is_covered():
+    ws = _ws(YEARS_PASSAGE, kind="section")
+    markdown = "הדגם הוא 2019 [S1]."
+    ledger = items.Ledger()
+    (built,) = items.source_items(_units(markdown), ws, COMPONENTS, ledger)
+    assert built.value == "2019"  # not the whole list: "2018,2019,2021" is three years, not one number
+    ledger.merge([built])
+    (out,) = ledger.outcomes(_units(markdown), ws)
+    assert out["state"] == items.COVERED
+
+
+# --- the re-read rule is symmetric for the siblings of a held item (review fix) -----------------------------------------------------
+
+def test_a_held_item_on_the_reread_touches_the_paragraph_of_the_cited_original_and_its_sentences_are_offered():
+    from dataclasses import replace
+
+    prose = "הנתונים מפורטים להלן. שיעור ההיוון למשרדים הוא 6.5%. שיעור ההיוון למסחר הוא 7.0%."
+    ask = [{"id": "N1", "text": "שיעורי ההיוון"}]
+    ws = _ws(prose, "טקסט אחר ללא קשר", kind="context")
+    reread = ws.adopt(replace(ws.sources["S1"], sid="", same_as="S1"))  # S3: the same text again, pointing at S1
+    assert reread.sid == "S3" and reread.same_as == "S1"
+    ledger = items.Ledger()
+    # the held item's quote is a line-part of the paragraph that is no value of its own (so only the paragraph rule can match it)
+    ledger.merge([_item(source="S3", label="", quote="הנתונים מפורטים להלן", value="הנתונים")])
+    offer = _offer(ws, "השווי נקבע לפי השוואה [S1].", ask, ledger=ledger)  # the answer cites the original S1 only
+    assert [c.value for c in offer.candidates if c.source == "S1"] == ["6.5%", "7.0%"]

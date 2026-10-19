@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from functools import cache, cached_property, lru_cache
 from typing import TYPE_CHECKING
 
@@ -65,6 +66,7 @@ from app.chat.evidence import _content_words
 from app.measurements.extract import (
     _MONTH_WORDS,
     _YEAR_WORDS,
+    PERIOD_ADJECTIVE_ENDINGS,
     PERIOD_ADJECTIVES,
     PERIOD_LABELS,
     PERIOD_NOUNS,
@@ -96,8 +98,9 @@ def _period_pattern(key: str, abbreviations: str = "") -> str:
     ``PERIOD_ADJECTIVES``): the noun after a prefix letter or a slash ("לחודש", "/חודש"), the adjective with its endings
     ("חודשי", "חודשית", "החודשיים", and the plural "חודשיים" that ``_period_word_ok`` reads only after a plural noun)."""
     noun, adj = PERIOD_NOUNS[key], PERIOD_ADJECTIVES[key]
+    endings = "|".join(PERIOD_ADJECTIVE_ENDINGS)
     return (rf"(?:(?<![א-ת])[לב]|/\s?){noun}(?![א-ת]){_NOT_A_PERIOD_AFTER}"
-            rf"|(?<![א-ת])(?:ו?ה?{adj}(?:ת|ים|ות)?{abbreviations})(?![א-ת])")
+            rf"|(?<![א-ת])(?:ו?ה?{adj}(?:{endings})?{abbreviations})(?![א-ת])")
 
 
 _PERIOD = [
@@ -194,14 +197,13 @@ _SPLIT_TAIL = re.compile(r"(?<![א-ת])([א-ת]{2,}) ([א-ת])(?![א-ת])")
 _SPLIT_HEAD = re.compile(r"(?<![א-ת])([א-ת]) ([א-ת]{2,})(?![א-ת])")
 
 
+def _join_time_form(m: re.Match) -> str:
+    """The two pieces of a split word as one word when the joined token is a period or time-unit word (the space moves behind it)."""
+    return f"{m.group(1)}{m.group(2)} " if _TIME_FORM.fullmatch(m.group(1) + m.group(2)) else m.group(0)
+
+
 def _rejoin(text: str) -> str:
-    def tail(m: re.Match) -> str:
-        return f"{m.group(1)}{m.group(2)} " if _TIME_FORM.fullmatch(m.group(1) + m.group(2)) else m.group(0)
-
-    def head(m: re.Match) -> str:
-        return f"{m.group(1)}{m.group(2)} " if _TIME_FORM.fullmatch(m.group(1) + m.group(2)) else m.group(0)
-
-    return _SPLIT_HEAD.sub(head, _SPLIT_TAIL.sub(tail, text))
+    return _SPLIT_HEAD.sub(_join_time_form, _SPLIT_TAIL.sub(_join_time_form, text))
 
 
 def _read(text: str) -> str:
@@ -210,21 +212,103 @@ def _read(text: str) -> str:
     return _rejoin(_norm(text))
 
 
-# a clause part with a negation before the period word: "אינו מוצג כסכום חודשי", "לא נקבע לשנה". Not a comparison ("לא פחות
-# מ-5,000 ₪ לחודש") nor "לא כולל מע״מ"; a comma, "אלא" and the end of the clause close the negation.
+# a negation that governs the period word: one of the ``NEGATION_TOKENS`` words before it, in the same part of the clause ("אינו מוצג
+# כסכום חודשי", "לא נקבע לשנה"). A negation further back negates something else ("לא הושכר בפועל ולכן הוערך לפי 5,000 ₪ לחודש"). Not
+# a comparison ("לא פחות מ-5,000 ₪ לחודש") nor "לא כולל מע״מ"; a comma, "אלא" and the end of the clause close the negation.
+NEGATION_TOKENS = 3
 _NEGATION = re.compile(r"(?<![א-ת])ו?(?:לא|אין|אינו|אינה|אינם|אינן)(?![א-ת])"
                        r"(?!\s+(?:פחות|יותר|כולל|כוללת|כוללים|נמוך|גבוה|עולה|עולים|מעל|מתחת|יעלה|יפחת|רק)(?![א-ת]))")
 _NEGATION_END = re.compile(r"(?<!\d),|,(?!\d)|[.;\n]|(?<![א-ת])אלא(?![א-ת])")
 _PLURAL_ENDING = re.compile(r"(?:ים|ות|מי)$")
 # a preposition of a duration right before the word ("תקופה של חודשיים", "למשך שנתיים")
 _DURATION_PREPOSITION = re.compile(r"(?<![א-ת])(?:של|למשך|במשך|תוך|עד|כ|מעל|בערך|כמעט)\s+$")
-_NUMBER_BEFORE = re.compile(r"\d[\d,.]*\s*[-־]?\s*$")
+_NUMBER_BEFORE = re.compile(r"(\d[\d,.]*)\s*[-־]?\s*$")
+_NOT_NUMBER_TAIL = re.compile(r"[^\d,.\s\-־]")  # a character a match of ``_NUMBER_BEFORE`` cannot hold
+DURATION_PREPOSITION_CHARS = 4  # the longest preposition of ``_DURATION_PREPOSITION``
 
 
+# The checks below read what stands BEFORE a word. They look at a window ending at the word and widen it (fourfold) only when the window
+# cannot decide the answer, so the result is the one a read of the whole text before the word gives, without copying and scanning it.
+# (``endpos`` cuts the text as a slice would, and a look-behind still sees the characters before the window.)
 def _negated(text: str, pos: int) -> bool:
-    """Whether a negation stands before ``pos`` in the same part of the clause."""
-    start = max([0, *(m.end() for m in _NEGATION_END.finditer(text, 0, pos))])
-    return bool(_NEGATION.search(text, start, pos))
+    """Whether a negation governs the word at ``pos``: it stands among the last ``NEGATION_TOKENS`` blank-separated words before ``pos`` and
+    after the last mark that closes a part (``_NEGATION_END``)."""
+    width = 64
+    while True:
+        lo = max(0, pos - width)
+        words = list(re.finditer(r"\S+", text[lo:pos]))
+        if lo == 0 or len(words) > NEGATION_TOKENS:  # the first word of a window that does not start the text may be cut: the others are whole
+            break
+        width *= 4
+    words = words[-NEGATION_TOKENS:]
+    if not words:
+        return False
+    start = lo + words[0].start()
+    closings = list(_NEGATION_END.finditer(text, start, pos))
+    return bool(_NEGATION.search(text, closings[-1].end() if closings else start, pos))
+
+
+def _number_before(text: str, pos: int) -> str:
+    """The number the text before ``pos`` ends with (``_NUMBER_BEFORE``) as written; an empty string when it ends with none. A match is made of
+    digits, separators and blanks only, so a window that holds any other character holds the whole of every match; one that starts at
+    the window's edge is read again in a wider window, so the number is returned whole (``_can_count_time`` reads its size)."""
+    width = 32
+    while True:
+        lo = max(0, pos - width)
+        m = _NUMBER_BEFORE.search(text, lo, pos)
+        if m and (lo == 0 or m.start(1) > lo):  # a match that starts at the window's edge may go on before it: widen
+            return m.group(1)
+        if not m and (lo == 0 or _NOT_NUMBER_TAIL.search(text, lo, pos)):
+            return ""
+        width *= 4
+
+
+# a count of months or years is small: a number of a thousand or more before "חודשי" / "חודשים" is an amount ("דמי שכירות 5,000 חודשי")
+DURATION_MAX = Decimal(1000)
+
+
+def _can_count_time(written: str) -> bool:
+    """Whether the number as written can be a count of months, years, weeks or days: below ``DURATION_MAX``."""
+    try:
+        return Decimal(written.rstrip(",.").replace(",", "")) < DURATION_MAX
+    except InvalidOperation:
+        return True  # no number read: the words after it decide, as before
+
+
+def _after_duration_preposition(text: str, pos: int) -> bool:
+    """Whether the text before ``pos`` ends with a preposition of a duration and the blanks after it (``_DURATION_PREPOSITION``). A match is
+    a word of at most ``DURATION_PREPOSITION_CHARS`` characters and blanks, so a window whose text up to its last blank holds that many
+    characters holds the whole of every match."""
+    width = 32
+    while True:
+        lo = max(0, pos - width)
+        if _DURATION_PREPOSITION.search(text, lo, pos):
+            return True
+        if lo == 0 or len(text[lo:pos].rstrip()) >= DURATION_PREPOSITION_CHARS:
+            return False
+        width *= 4
+
+
+def _words_before(text: str, pos: int, count: int) -> list[str]:
+    """The last ``count`` blank-separated words of the text before ``pos``."""
+    width = 16 * count
+    while True:
+        lo = max(0, pos - width)
+        words = text[lo:pos].split()
+        if lo == 0 or len(words) > count:  # the first word of a window that does not start the text may be cut: the others are whole
+            return words[-count:]
+        width *= 4
+
+
+def _words_after(text: str, pos: int, count: int) -> list[str]:
+    """The first ``count`` blank-separated words of the text from ``pos``."""
+    width = 16 * count
+    while True:
+        hi = min(len(text), pos + width)
+        words = text[pos:hi].split()
+        if hi == len(text) or len(words) > count:  # the last word of a window that does not end the text may be cut: the others are whole
+            return words[:count]
+        width *= 4
 
 
 def _after_plural_noun(text: str, pos: int) -> bool:
@@ -241,11 +325,10 @@ def _period_word_ok(text: str, m: re.Match) -> bool:
     word = m.group(0).lstrip("ו")
     if word[:1] in ("ל", "ב", "/"):  # a noun after its prefix or a slash, or an abbreviation
         return True
-    before = text[:m.start()]
-    if _NUMBER_BEFORE.search(before):
+    if (written := _number_before(text, m.start())) and _can_count_time(written):
         return False
     if word[:1] != "ה" and word.endswith(("ים", "ות")):
-        return not _DURATION_PREPOSITION.search(before) and _after_plural_noun(text, m.start())
+        return not _after_duration_preposition(text, m.start()) and _after_plural_noun(text, m.start())
     return True
 
 
@@ -259,8 +342,8 @@ AREA_WORD_WINDOW = (3, 2)  # words before and after the adjective in which the a
 def _basis_ok(text: str, key: str, m: re.Match) -> bool:
     if key not in _NEEDS_AREA_WORD or m.group(0).startswith(("מ\"ר", "שטח")):
         return True
-    before = text[:m.start()].split()[-AREA_WORD_WINDOW[0]:]
-    after = text[m.end():].split()[:AREA_WORD_WINDOW[1]]
+    before = _words_before(text, m.start(), AREA_WORD_WINDOW[0])
+    after = _words_after(text, m.end(), AREA_WORD_WINDOW[1])
     return any(_AREA_WORD_NEAR.search(w) for w in before + after)
 
 
@@ -300,9 +383,15 @@ _COUNT_AFTER = re.compile(
     r"(?![א-ת])")
 
 
+def _number_ending(text: str, end: int) -> str:
+    """The number that ends at ``end`` as written ("" when none does)."""
+    found = list(_NUM_AT.finditer(text, max(0, end - 32), end))
+    return found[-1].group(0) if found and found[-1].end() == end else ""
+
+
 def after_kind(text: str, end: int) -> str:
     """"duration" or "count" when the words right after the number that ends at ``end`` make it one; else an empty string."""
-    if _DURATION_AFTER.match(text, end):
+    if _DURATION_AFTER.match(text, end) and _can_count_time(_number_ending(text, end)):
         return "duration"
     return "count" if _COUNT_AFTER.match(text, end) else ""
 
