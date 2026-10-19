@@ -212,6 +212,8 @@ from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited, line_cut
 from app.chat.evidence import (
     TABLE_AFTER,
     TABLE_BEFORE,
+    TABLE_PATH_PREFIX,
+    TABLE_SIZE_PREFIX,
     Segment,
     claim_terms,
     fit,
@@ -274,7 +276,9 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # ``removed_before``); rule (31) reads them. 10 (round 15 U7, KTD7): the header of a passage in a unit the answer declared names
 # it by handle and structural title (``_declared_head``). 11 (round 16 U1, KTD1): the requirements call carries the passages the
 # turn read (``<read_passages>``) and the judge may name ``support`` (a read passage and a verbatim quote) for a part the answer omits.
-JUDGE_VERSION = 12
+# 13 (round 17 U5, KTD5): the verdict's ``defect`` gains ``scope`` and the verdict an optional ``scope`` phrase; rule (32) reads the
+# context parts a table read carries.
+JUDGE_VERSION = 13
 # the label of the facts the server holds about a cited source's unit and states beside its text (round 13 U9, KTD10, R13): the
 # stated valuation date of the unit that holds the passage, and why the server linked the appraisal to the property. Read
 # from the stored document, not from the passage: the judge takes them as evidence, never as a claim to check
@@ -344,8 +348,8 @@ JUDGE_POLICY = (
     "(11) defect: ל-partial ציין את הפגם הקונקרטי שתיקון של התשובה יכול לסלק — input (קלט שגוי לחישוב: נכס, שלב, "
     "תקופה או תרחיש אחרים), scenario (הנחה או תרחיש שלא הוצגו כמותנים, או לא כפי שהמשתמש ביקש), formula (פעולה, "
     "מכנה או בסיס אחוז שגויים), units (יחידה, תקופה או מע\"מ של התוצאה), framing (תוצאת חישוב שמוצגת כנתון מהמסמך "
-    "או כטענת צד), part (חלק מסוים של הטענה שהמקורות אינם תומכים בו — ציין אותו בסיבה), multiple_values (כלל 6); "
-    "none — כשאין פגם כזה (למשל המקור הוצג בקטעים בלבד, כלל 5). לכל verdict אחר — none. "
+    "או כטענת צד), part (חלק מסוים של הטענה שהמקורות אינם תומכים בו — ציין אותו בסיבה), multiple_values (כלל 6), scope (כלל 32); "
+    "none — כשאין פגם כזה (למשל המקור הוצג בקטעים בלבד, כלל 5). לכל verdict אחר — none, פרט ל-scope ב-supported (כלל 32). "
     "(12) ייחוס: ערך V# ונתון M# מציינים סעיף וייחוס — מי אמר את הערך, ואם הוא מסקנה שאומצה, טענה, הצעה או "
     "אומדן. יחידה שמציגה כקביעה, כהחלטה או כמסקנה שאומצה ערך שהראיה (הסעיף, הייחוס או הטקסט) מציגה כעמדת צד, "
     "טענה, הצעה או אומדן — unsupported; ערך של צד שמיוחס לאותו צד — supported. הופעת המספר במסמך ההחלטה אינה "
@@ -407,7 +411,16 @@ JUDGE_POLICY = (
     "שהשרת הסיר ממנו יחידות; ה-index של היחידות שהוסרו מצוינים ב-removed_before ונוסחן ב-<removed_units>. יחידה שמפנה "
     "לתוכן שאינו מופיע בטקסט שנשאר (\"לעיל\", \"כאמור\", \"הנ\"ל\", \"שני המקדמים\", \"שלושת הערכים\") ושהתוכן הזה "
     "הוסר ממנו — אינה עומדת בפני עצמה: ציין ב-depends_on את ה-index של היחידות שהוסרו שהיא מפנה אליהן. הפניה "
-    "שהתוכן שלה מופיע ב-<preceding> אינה תלות, ו-depends_on ריק."
+    "שהתוכן שלה מופיע ב-<preceding> אינה תלות, ו-depends_on ריק. "
+    "(32) היקף: מה שהמקור המצוטט אומר על הערך סביבו הוא חלק מהמקור — כותרות הסעיף, כותרת הטבלה והערותיה, ופסקאות לפני הטבלה "
+    "ואחריה (שורות שמתחילות ב-[לפני הטבלה …] או ב-[אחרי הטבלה …] ובמספר הבלוק שלהן), ופסקה אחרת של אותו קטע. הסתייגות "
+    "או היקף שהיחידה כותבת נתמכים כשההקשר הזה אומר אותם, גם כשאינם בשורת הערך עצמה. פסקה שמסומנת «בין שתי טבלאות» "
+    "משותפת לשתי טבלאות ואינה ראיה להיקף של אחת מהן. ערך שהיחידה מציגה רחב מההיקף שהמקור אומר לו (\"שווי הנכס\" או \"סך "
+    "הכול\" כשההקשר אומר שהטבלה מתייחסת לגישה אחת בלבד, \"לשנה\" כשההערה אומרת אחרת) — verdict supported (או partial אם יש "
+    "בה גם פגם אחר) עם defect scope, לעולם לא unsupported בגלל היקף בלבד; וב-scope כתוב את ביטוי ההיקף מילה במילה כפי "
+    "שהוא כתוב בהקשר של המקור שהיחידה מצטטת (עד כמה מילים, בלי מראי מקום), כדי שהשרת יוסיף אותו ליד הערך. אם אינך בטוח "
+    "שהמקור אומר היקף כזה, או שהביטוי אינו כתוב שם מילה במילה — scope ריק (השרת יכתוב שההיקף לא אומת). אל תחתוך ואל תבקש "
+    "להסיר את ההיקף שהיחידה כותבת כשההקשר אומר אותו."
 )
 
 
@@ -613,8 +626,11 @@ REMOVAL_SENTENCES = {
     "context_not_read": "הוסרה טענה שההקשר הדרוש לבדיקתה לא נקרא.",
 }
 # a judge's concrete defect of a partly supported unit, as a failure kind (for the repair prompt)
+# ``scope`` (round 17 U5, KTD5) maps to the one kind that removes nothing: the context that defines the value was not verified. The server
+# never fails a unit for it — it writes the validated scope or a limitation next to the value (``scope_outcome``)
 DEFECT_FAILURES = {"input": "wrong_calculation", "scenario": "wrong_calculation", "formula": "wrong_calculation",
-                   "framing": "wrong_calculation", "units": "wrong_unit", "part": "absent_from_source"}
+                   "framing": "wrong_calculation", "units": "wrong_unit", "part": "absent_from_source",
+                   "scope": "context_not_read"}
 # problem kinds that are not failure kinds, as the failure kind a removal of theirs has (KTD5): a calculation from the
 # wrong input or on an assumption the user did not give is a wrong calculation (round 7 U7 adds these kinds); an
 # unmet instruction is a gap, never a removal
@@ -734,7 +750,11 @@ class JudgeVerdict(_Strict):
     # them and cites them). A factory default: optional for a reply, still required by the strict schema.
     supported_by: list[str] = Field(default_factory=list)
     # for a partial verdict: the concrete defect a repair can remove, or "none" (only that costs a repair round)
-    defect: Literal["none", "input", "scenario", "formula", "units", "framing", "part", "multiple_values"] = "none"
+    # ``scope`` (round 17 U5, KTD5): the value is presented wider than the scope its source states; never a reason to remove
+    defect: Literal["none", "input", "scenario", "formula", "units", "framing", "part", "multiple_values", "scope"] = "none"
+    # for defect ``scope``: the scope phrase the unit omits, verbatim from the context of the source the unit cites (a context part, the
+    # caption, the notes or the heading of the value's own table or section); the server validates it (``scope_outcome``). Empty otherwise.
+    scope: str = ""
     # for an unsupported verdict: why (round 7 KTD5, R12); "none" for any other verdict, or a reply that leaves it out
     failure: JudgeFailure = "none"
     # the units of this call (removed ones included) whose claims this unit's conclusion rests on (KTD10, R15)
@@ -2441,7 +2461,7 @@ class VerifyReport:
         tagged: set[tuple[int, int]] = set()
         for p in notes:
             at = _after_number(p.unit, p.number or "") if p.number else None
-            if at is None and p.conditional:
+            if at is None and (p.conditional or p.check in SCOPE_CHECKS):
                 at = _citation_point(markdown, p.unit)
             if at is not None and not any(a <= at < b for a, b in blocked):
                 if p.conditional:
@@ -2452,7 +2472,12 @@ class VerifyReport:
                         tagged.add((at, p.unit.index))
                     continue
                 cite = f" [{p.cite}]" if p.uncited else ""
-                edits.append((at, at, f" ({p.annotation}, כפי שנכתב במקור{cite})", "qualifier", ()))
+                if p.check == SCOPE_LIMIT_CHECK:  # the scope was not verified: said, with where the value was read (R11)
+                    edits.append((at, at, f" ({p.annotation})", "scope_note", ()))
+                elif p.check == SCOPE_CHECK:  # the scope the source states, written next to the value with its citation (R10)
+                    edits.append((at, at, f" ({MSG_SCOPE_ADDED.format(phrase=p.annotation)}{cite})", "qualifier", ()))
+                else:
+                    edits.append((at, at, f" ({p.annotation}, כפי שנכתב במקור{cite})", "qualifier", ()))
         # evidence the server found in the same calculation is cited with the unit it supports
         for u, ids in _cites_by_unit(cites):
             at = _citation_point(markdown, u)
@@ -3637,7 +3662,7 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
     period the evidence does not give a number (``app.chat.meaning``, the blocking kind) — each problem with its
     failure kind and check (round 7 KTD5)."""
     if meanings is None:
-        meanings = {u.index: meaning.check(u, ws) for u in units}
+        meanings = {u.index: check_meaning(u, ws) for u in units}
     problems: list[Problem] = []
     question_numbers = numbers_in(question)
     everything = _all_numbers(ws)
@@ -3709,6 +3734,215 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
     return problems
 
 
+# --- the scope of a value (round 17 U5, KTD4, KTD5; R10-R13) ---------------------------------------------------------------
+#
+# A value is read with what surrounds it in its source: the heading path of its table, the paragraph before it, its caption and
+# notes, and the paragraphs after it (the context parts a table read carries, ``tools._table_context``). When the answer shows the
+# value wider than the scope those state ("the table refers to one valuation approach only"), the judge reports defect ``scope`` with
+# the phrase; the server validates that the phrase stands, verbatim, in the context of the value's OWN table or section, and writes it
+# next to the value with its citation (a ``missing_qualifier`` problem, the existing ``qualified`` path). A phrase it cannot
+# validate, or one from a paragraph that lies between two tables, is never asserted as the value's scope: the value stays with a note
+# that its scope was not verified and where it was read. A scope is never a reason to remove a sentence, and a qualifier word the
+# cited source states anywhere in its context is never cut from a sentence that keeps the value.
+
+SCOPE_CHECK = "scope"  # the check of a validated scope written next to a value
+SCOPE_LIMIT_CHECK = "scope_limit"  # ... and of the limitation note written when the scope could not be verified
+SCOPE_CHECKS = (SCOPE_CHECK, SCOPE_LIMIT_CHECK)
+BETWEEN_TABLES = "בין שתי טבלאות"  # the tag a context part has when it lies between two tables (``tools._BETWEEN_TABLES``)
+SCOPE_PHRASE_WORDS = (2, 16)  # the words a scope phrase has: a phrase, not one word and not a paragraph
+SCOPE_PHRASE_CHARS = 160
+MSG_SCOPE_ADDED = "היקף הערך לפי המקור: {phrase}"
+MSG_SCOPE_FOUND = "הערך מוצג בלי ההיקף ש-{sid} מציין לו («{phrase}»); ההיקף נכתב ליד הערך"
+MSG_SCOPE_LIMIT = "היקף הערך במקור לא אומת; הערך נקרא ב-{where}"
+MSG_SCOPE_LIMIT_BETWEEN = "היקף הערך במקור לא אומת (הפסקה שליד הטבלה משותפת לשתי טבלאות); הערך נקרא ב-{where}"
+MSG_SCOPE_UNVERIFIED = "הבדיקה סימנה שהערך מוצג רחב מההיקף שהמקור מציין לו, וההיקף לא אומת בהקשר של {sid}; ליד הערך נכתב שההיקף לא אומת"
+_PART_LINE = re.compile(rf"^\[(?P<side>{TABLE_BEFORE}|{TABLE_AFTER})(?P<mid>[^\]\n]*?) · בלוק\s*\d+\]\s*(?P<text>\S.*)$")
+_ROW_LINE = re.compile(r"\s\|\s|^\|")
+
+
+class ContextPart(NamedTuple):
+    """A place a source states the context of its values: ``place`` is ``heading`` (the heading path of the table, or the section of a
+    passage), ``before``/``after`` (a block before or after the table), ``caption`` or ``note`` (the table's own); ``between``: the block
+    lies between two tables, so it belongs to neither more than to the other."""
+
+    place: str
+    text: str
+    between: bool = False
+
+
+def source_context(text: str, tabular: bool) -> tuple[list[ContextPart], list[str]]:
+    """The context parts of a source's text and the lines left (its body: the rows of a table, the sentences of a passage). A table
+    read's text has the heading path line, the part lines (``[אחרי הטבלה · … · בלוק 12] text``), the caption lines before its rows and
+    the notes after them; a passage has none of these. Read by position and by the server's own labels, never by a phrase."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    rows = [i for i, ln in enumerate(lines) if _ROW_LINE.search(ln)]
+    first, last = (rows[0], rows[-1]) if rows else (-1, -1)
+    parts: list[ContextPart] = []
+    body: list[str] = []
+    for i, ln in enumerate(lines):
+        if ln.startswith(TABLE_PATH_PREFIX):
+            parts += [ContextPart("heading", h.strip()) for h in ln[len(TABLE_PATH_PREFIX):].split("›") if h.strip()]
+        elif m := _PART_LINE.match(ln):
+            parts.append(ContextPart("before" if m["side"] == TABLE_BEFORE else "after", m["text"].strip(),
+                                     BETWEEN_TABLES in m["mid"]))
+        elif ln.startswith((f"[{TABLE_BEFORE}", f"[{TABLE_AFTER}")):
+            continue  # a pointer to a part returned before, or the line that says what follows the table: no text of its own
+        elif tabular and ln.startswith(TABLE_SIZE_PREFIX):
+            continue  # the size line is the server's own: neither context nor a row
+        elif tabular and rows and (i < first or i > last):
+            parts.append(ContextPart("caption" if i < first else "note", ln))
+        else:
+            body.append(ln)
+    return parts, body
+
+
+def context_of_source(src: Source) -> tuple[list[ContextPart], list[str]]:
+    """``source_context`` of a source, with the section of a passage as its heading."""
+    text = src.text or ""
+    tabular = src.kind == "table" or any(ln.lstrip().startswith(TABLE_SIZE_PREFIX) for ln in text.splitlines())
+    parts, body = source_context(text, tabular)
+    section = _norm(src.section or "")
+    if section and not any(p.place == "heading" and p.text == section for p in parts):
+        parts.insert(0, ContextPart("heading", section))
+    return parts, body
+
+
+def _cited_sources(u: Unit, ws: Workspace) -> list[tuple[str, Source]]:
+    """The sources a unit cites (S#), and the source a cited value (V#) was registered from, each once, as (id, source)."""
+    out: dict[str, Source] = {}
+    for sid in u.ids:
+        key, src = sid, ws.sources.get(sid)
+        if src is None and sid in ws.values:
+            key = ws.values[sid].source_id
+            src = ws.sources.get(key)
+        if src is not None and not src.is_listing:
+            out.setdefault(key, src)
+    return list(out.items())
+
+
+def _body_numbers(src: Source) -> set[str]:
+    return numbers_in(without_part_tags("\n".join(context_of_source(src)[1])))
+
+
+def _value_sources(u: Unit, ws: Workspace) -> list[tuple[str, Source]]:
+    """The cited sources that state a number of the unit in their body (rows or sentences, not their context): the value's own
+    tables or sections (R12). A unit none of whose cited sources state a number keeps all of them."""
+    cited = _cited_sources(u, ws)
+    wanted = numbers_in(u.text)
+    return [(k, s) for k, s in cited if wanted & _body_numbers(s)] or cited
+
+
+def _value_number(u: Unit, sources: list[tuple[str, Source]]) -> str | None:
+    """The number of the unit a scope is written after: the last one the value's sources state in their body (the value, after the
+    labels and conditions that come before it in a sentence), as written."""
+    body: set[str] = set()
+    for _, s in sources:
+        body |= _body_numbers(s)
+    pick = None
+    for m in _NUM_AT.finditer(u.text):
+        if numbers_in(m.group(0)) & body and not not_an_amount(u.text, m.start(), m.end()):
+            pick = m.group(0)
+    return pick
+
+
+def _clean_scope(phrase: str) -> str:
+    """The judge's scope phrase as it can be compared: spaces normalised, citations and the punctuation around it taken off. Empty
+    when it is not a phrase (``SCOPE_PHRASE_WORDS``, ``SCOPE_PHRASE_CHARS``) or holds no letter."""
+    text = _norm(_IDS.sub("", phrase or "")).strip(" \t.,;:!?()[]\"'«»״׳")
+    words = len(text.split())
+    if not (SCOPE_PHRASE_WORDS[0] <= words <= SCOPE_PHRASE_WORDS[1]) or len(text) > SCOPE_PHRASE_CHARS \
+            or not re.search(r"[א-תA-Za-z]", text):
+        return ""
+    return text
+
+
+def _scope_standing(phrase: str, src: Source) -> str:
+    """Where a source's own context states the phrase, verbatim: ``ok`` (a heading, caption, note or a block beside its table),
+    ``between`` (only a block that lies between two tables) or ``absent``."""
+    found = [p for p in context_of_source(src)[0] if phrase in _norm(p.text)]
+    if any(not p.between for p in found):
+        return "ok"
+    return "between" if found else "absent"
+
+
+def _read_in(sources: list[tuple[str, Source]]) -> str:
+    return ", ".join(k + (f" ({s.location})" if s.location else "") for k, s in sources)
+
+
+def scope_outcome(u: Unit, phrase: str, ws: Workspace, text: str | None = None) -> tuple[bool, Problem | None]:
+    """What the server does with a judge's defect ``scope`` on ``u`` (KTD5): (``handled``, the problem to add). The phrase
+    is attached next to the value, with the citation, when it stands verbatim in the context of EVERY source that holds the
+    value (R12: the trailing note of one table is never applied to a value of another); otherwise the value stays with a note
+    that its scope was not verified and where it was read (R11) — also for a phrase found only in a block between two tables,
+    which is no scope of either. ``handled`` and no problem: the unit already states the phrase. Not handled: the unit cites no
+    source, so there is nowhere to say it was read. ``text``: the unit's words as saved when they are not its draft's."""
+    sources = _value_sources(u, ws)
+    if not sources:
+        return False, None
+    number = _value_number(u, sources)
+    scope = _clean_scope(phrase)
+    if scope and scope in _norm(_IDS.sub("", text if text is not None else u.text)):
+        return True, None
+    standing = [_scope_standing(scope, s) for _, s in sources] if scope else ["absent"]
+    first = sources[0][0]
+    if all(x == "ok" for x in standing):
+        return True, Problem(u, MSG_SCOPE_FOUND.format(sid=first, phrase=scope), kind="missing_qualifier", number=number,
+                             annotation=scope, cite=first, defect="scope", check=SCOPE_CHECK)
+    note = MSG_SCOPE_LIMIT_BETWEEN if "absent" not in standing and "between" in standing else MSG_SCOPE_LIMIT
+    return True, Problem(u, MSG_SCOPE_UNVERIFIED.format(sid=", ".join(k for k, _ in sources)), kind="missing_qualifier",
+                         number=number, annotation=note.format(where=_read_in(sources)), defect="scope",
+                         check=SCOPE_LIMIT_CHECK)
+
+
+def _scoped_verdicts(verdicts: dict[int, JudgeVerdict]) -> dict[int, JudgeVerdict]:
+    """A judge that names defect ``scope`` on an unsupported verdict (and splits no claim) found the value supported and presented
+    wider than its source's scope: partly supported, never removed for it (R10)."""
+    out = dict(verdicts)
+    for i, v in verdicts.items():
+        if v.defect == "scope" and v.verdict == "unsupported" and v.failure in ("none", "absent_from_source") \
+                and not v.claims:
+            out[i] = v.model_copy(update={"verdict": "partial", "failure": "none"})
+    return out
+
+
+def context_qualifiers(u: Unit, ws: Workspace) -> meaning.Qualifiers:
+    """The area bases and periods the cited sources state anywhere in their context — heading, caption, notes, the blocks beside a
+    table (those between two tables too: a qualifier is protected wherever the source says it, never asserted from there)."""
+    found = meaning.Qualifiers()
+    for _, s in _cited_sources(u, ws):
+        for p in context_of_source(s)[0]:
+            found.merge(meaning._all(meaning._norm(p.text), rates=False))
+    return found
+
+
+def _stated_in_context(u: Unit, ws: Workspace, problem: meaning.MeaningProblem) -> bool:
+    """Whether the basis or period a blocking meaning problem names is stated by the context of a cited source (``context_qualifiers``):
+    the answer then writes what the source says, and the qualifier is neither cut nor a reason to remove (R10)."""
+    if problem.kind not in ("basis", "period"):
+        return False
+    context = context_qualifiers(u, ws)
+    if not context.keys(problem.kind):
+        return False
+    text = meaning._norm(u.text)
+    entries, _ = meaning.attached(text)
+    for forms, pos, claimed in entries:
+        if not forms or _NUM_AT.match(text, pos).group(0) != problem.number:
+            continue
+        occurrences, general = meaning._evidence(u, ws, frozenset(forms))
+        attested = meaning.Qualifiers().merge(general)
+        for o in occurrences:
+            attested.merge(o.qualifiers).merge(meaning._all(o.context, rates=False))
+        extra = claimed.keys(problem.kind) - attested.keys(problem.kind)
+        return bool(extra) and extra <= context.keys(problem.kind)
+    return False
+
+
+def check_meaning(u: Unit, ws: Workspace, fetcher: meaning.Fetcher | None = None) -> list[meaning.MeaningProblem]:
+    """``meaning.check`` without the blocking problems of a basis or period the cited source's context states (``_stated_in_context``)."""
+    problems = meaning.check(u, ws, fetcher) if fetcher is not None else meaning.check(u, ws)
+    return [m for m in problems if not (m.blocking and _stated_in_context(u, ws, m))]
+
+
 # --- a qualifier the source does not state (round 12 U10, KTD10, R7) ----------------------------------------------------
 
 def _asked_about(kind: str, question: str) -> bool:
@@ -3775,6 +4009,7 @@ def _silent_qualifier_spans(u: Unit, ws: Workspace, text: str, entries: list, pr
         attested = meaning.Qualifiers().merge(general)
         for o in occurrences:
             attested.merge(o.qualifiers).merge(meaning._all(o.context, rates=False))
+        attested.merge(context_qualifiers(u, ws))  # what the source's heading, caption, notes and adjacent blocks state (R10)
         extra = sorted(claimed.keys(kind) - attested.keys(kind))
         if not extra:
             continue
@@ -5647,7 +5882,7 @@ def _judge_batch(provider: LLMProvider, batch: _Batch, ws: Workspace, usage: lis
         got, status, scores = judge(provider, batch, rendered, usage, deadline, coverage, label=label, policy=policy)
     if status != "ok":
         raise VerificationUnavailable(status)
-    return _shown_support(got, batch, ws), scores
+    return _scoped_verdicts(_shown_support(got, batch, ws)), scores
 
 
 def _shown_support(verdicts: dict[int, JudgeVerdict], batch: _Batch, ws: Workspace) -> dict[int, JudgeVerdict]:
@@ -5679,7 +5914,7 @@ def _named_support(unit: Unit, named: list[str], ws: Workspace, question: str) -
     against their full text): the judge's naming of a support is accepted only if the unit, cited so, passes them.
     None when it does; otherwise the problem, on the unit itself."""
     cited = dataclasses.replace(unit, ids=[*unit.ids, *named])
-    failed = [p for p in deterministic([cited], ws, question, {unit.index: meaning.check(cited, ws)})
+    failed = [p for p in deterministic([cited], ws, question, {unit.index: check_meaning(cited, ws)})
               if p.check != RECENCY_CHECK]
     if not failed:
         return None
@@ -5878,7 +6113,7 @@ def _expand_unstated(report: VerifyReport, units: list[Unit], meanings: dict, ws
         if new_sid is None:
             continue
         u.ids.append(new_sid)
-        meanings[u.index] = meaning.check(u, ws, meaning_fetcher)
+        meanings[u.index] = check_meaning(u, ws, meaning_fetcher)
         again = deterministic([u], ws, question, meanings)
         report.problems = [x for x in report.problems if x is not p] + again
         cites[u.index] = new_sid
@@ -5922,7 +6157,7 @@ def _cite_for_qualifiers(u: Unit, ws: Workspace, question: str, meanings: dict, 
     was — when it does not."""
     before = meanings.get(u.index, [])
     u.ids.append(src.sid)
-    meanings[u.index] = meaning.check(u, ws, meaning_fetcher)
+    meanings[u.index] = check_meaning(u, ws, meaning_fetcher)
     again = deterministic([u], ws, question, meanings)
     if any(p.check in QUALIFIER_CHECKS for p in again):
         u.ids.remove(src.sid)
@@ -6164,7 +6399,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     # the meaning check first: evidence it finds in the same calculation joins the unit's citations, so the number
     # check and the judge read the unit with it
     fetcher = meaning.Fetcher(ws)
-    meanings = {u.index: meaning.check(u, ws, fetcher) for u in units}
+    meanings = {u.index: check_meaning(u, ws, fetcher) for u in units}
     report.problems = deterministic(units, ws, question, meanings)
     found_in = _expand_unstated(report, units, meanings, ws, question, deadline, reread, fetcher) \
         if reread is not None else {}
@@ -6323,6 +6558,13 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 continue
             recs = report.claims[u.index]
             failing = [r for r in recs if not r.whole_unit and r.verdict in ("unsupported", "contradicts", "partial")]
+            # the value is shown wider than the scope its source states (round 17 U5, KTD5): the scope is written next to it, or
+            # its limitation is — the sentence is never removed for it (R10), and no repair round is spent
+            scoped = False
+            if v.defect == "scope" and v.verdict in ("supported", "partial"):
+                scoped, problem = scope_outcome(u, v.scope, ws)
+                if problem is not None:
+                    report.problems.append(problem)
             if v.verdict in ("not_factual", "navigation"):
                 if not _non_claim_accepted(u, v.verdict):
                     report.problems.append(Problem(u, NOT_CLASSIFIED, failure_kind="not_checked", check="judge",
@@ -6341,6 +6583,8 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 report.problems.append(Problem(u, reason, failure_kind=failure, check="judge",
                                                claim_id=next((r.id for r in recs if r.verdict in FAILING_VERDICTS),
                                                              recs[0].id)))
+            elif scoped and v.verdict == "partial" and not failing:
+                pass  # partly supported for its scope only: handled above
             elif v.verdict == "partial" or failing:
                 # a unit holding claims that differ: one problem per claim that fails, so each is linked to its claim
                 # by id (R5); the unit stays, marked, until the edit ladder cuts the claim (U4)

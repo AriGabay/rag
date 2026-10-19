@@ -18,7 +18,9 @@ The spans a kind covers:
   its ordinal in the final text; ``partial_mark``: " *(אומת חלקית)*" after a partly supported sentence — the one span
   that also carries its ordinal among the marks of the final text and the claim ids of the unit it marks (round 14 U7,
   KTD9: ids, never text), so the client links it to the diagnostics entries of those claims;
-  ``qualifier``: a qualifier written next to a number, or after a total row whose component went; ``citation``: a
+  ``qualifier``: a qualifier written next to a number, or after a total row whose component went — also the scope its source
+  states for a value the answer showed wider (round 17 U5, R10); ``scope_note``: the note next to a value that its scope in the
+  source was not verified, and where it was read (round 17 U5, R11); ``citation``: a
   ``[S#]`` inserted for support the server found;
 - ``removal_note``: the note that says how many claims were removed; ``replacement``: the sentence that replaces an
   answer nothing of which was supported; ``request_note``: the note that the datum is not the one requested;
@@ -46,7 +48,7 @@ if TYPE_CHECKING:
 
 SERVER_KINDS = ("marker", "partial_mark", "qualifier", "citation", "removal_note", "request_note", "gap_paragraph",
                 "limit_sentence", "coverage_note", "membership_note", "replacement", "unread_notice",
-                "conditional_note", "item_gap")
+                "conditional_note", "item_gap", "scope_note")
 # the marker a cut span leaves: an ordinal, so the log entry of the claim it replaced is found by it
 MARKER = "«[{n}: חלק שלא אומת הושמט]»"
 PARTIAL_MARK = " *(אומת חלקית)*"

@@ -13,7 +13,9 @@ import uuid
 import pytest
 
 from app.chat import coverage, final_check, verify
-from app.chat.verify import Expansion, TurnRequirements, verify_answer
+from app.chat.evidence import TABLE_AFTER, TABLE_BEFORE, TABLE_PATH_PREFIX
+from app.chat.tools import _BETWEEN_TABLES, Workspace
+from app.chat.verify import Expansion, TurnRequirements, split_units, verify_answer
 from app.providers.llm import Purpose
 from tests.support.scripted_provider import ScriptedProvider
 from tests.unit.test_verify_reread import FakeFetcher
@@ -549,3 +551,262 @@ def test_a_decimal_point_or_thousands_comma_does_not_end_the_clause():
     r = verify_answer(_claims_judge(lambda t: [(AREA, "supported"), (STUB, "unsupported")] if STUB in t else None), a,
                       _ws("0.8 1,200 " + REDUCTION_SOURCE), "?", [])
     assert r.edit(a).doc.text.startswith(f"{AREA}, {MARKER_1} [S1].")
+
+
+# --- the scope of a value: added from the source, never cut, never a reason to remove (round 17 U5, KTD5; R10-R13; AE5, AE6) ---------
+
+SCOPE = "גישת היוון ההכנסות בלבד"
+SCOPE_NOTE = f"הטבלה שלעיל מתייחסת ל{SCOPE}, ואינה משקפת את שווי הנכס בגישת ההשוואה."
+SCOPE_ROWS = "שיעור היוון | שווי הנכס (אלפי ₪)\n5.5% | 12,400\n6.0% | 11,800\n6.5% | 11,300"
+SCOPE_UNIT = "בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪ [S1]."
+SCOPE_ADDED = f"(היקף הערך לפי המקור: {SCOPE})"
+SCOPE_WHERE = "טבלה 5.1 בעמוד 12"
+
+
+def _table(*, heading: str = "5. ניתוח רגישות לשיעור ההיוון", before: str | None = "הטבלה שלהלן מציגה את שווי הנכס.",
+           caption: str = "רגישות השווי לשיעור ההיוון", rows: str = SCOPE_ROWS, notes: tuple = (),
+           after: str | None = SCOPE_NOTE, between: bool = False) -> str:
+    """A table read as the verifier holds it (round 17 U4): the heading path, the block before, the caption and size lines, the
+    rows, the table's notes, and the block after (tagged between tables when ``between``)."""
+    lines = [f"{TABLE_PATH_PREFIX} {heading}"] if heading else []
+    lines += [f"[{TABLE_BEFORE} · פסקה · בלוק 40] {before}"] if before else []
+    lines += [caption, "הטבלה: 3 שורות", rows, *notes]
+    mid = f" · {_BETWEEN_TABLES}" if between else ""
+    lines += [f"[{TABLE_AFTER}{mid} · פסקה · בלוק 47] {after}"] if after else []
+    return "\n".join(lines)
+
+
+def _tables(*texts: str) -> Workspace:
+    """S1, S2 ... : table reads of one invented document, each with its own location."""
+    ws = Workspace(ctx=None)
+    for text in texts:
+        ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="שומת הדגמה", section=None,
+                      location=SCOPE_WHERE, kind="table", text=text, table_index=0)
+    return ws
+
+
+def _scope_judge(scope: str = SCOPE, *, verdict: str = "supported", defect: str = "scope", seen: list | None = None):
+    """A judge that finds every unit presented wider than its source's scope (``defect``) and names ``scope`` as the omitted phrase."""
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        if seen is not None:
+            seen.append(input)
+        return {"verdicts": [{"index": int(i), "verdict": verdict, "reason": "בדיקה", "defect": defect, "scope": scope}
+                             for i in re.findall(r'<unit index="(\d+)"', input)]}
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    return p
+
+
+def _scoped(markdown: str, ws, judge, question: str = "?"):
+    a = _answer(markdown)
+    return a, verify_answer(judge, a, ws, question, [])
+
+
+def _span_kinds(edited) -> list[str]:
+    return [s.kind for s in edited.doc.spans()]
+
+
+def test_ae5_a_table_value_written_as_the_total_gets_the_scope_its_following_paragraph_states_with_its_citation():
+    a, r = _scoped(SCOPE_UNIT, _tables(_table()), _scope_judge())
+    assert r.removed_units() == set() and r.counts()["removed"] == 0 and r.ok  # no repair round, no removal
+    (p,) = [x for x in r.problems if x.check == verify.SCOPE_CHECK]
+    assert p.annotatable and p.cite == "S1" and p.annotation == SCOPE and p.number == "11,800" and not p.repairable
+    out = r.edit(a)
+    first = out.doc.text.split("\n")[0]
+    assert first == f"בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪ {SCOPE_ADDED} [S1]."  # the sentence stays; the value is unchanged
+    assert _span_kinds(out) == ["qualifier"]
+    assert r.counts()["annotated"] == 1 and [row.action for row in r.logged()] == ["qualified"]
+
+
+def test_the_scope_is_written_with_its_citation_when_the_sentence_cites_the_value_not_the_table():
+    ws = _tables(_table())
+    from decimal import Decimal
+
+    from app.chat import calc
+
+    ws.values["V1"] = calc.Value("V1", Decimal(11800), "11,800", "S1", uuid.uuid4(), uuid.uuid4(), None, "שומת הדגמה", "סעיף 5",
+                                 "שווי הנכס", "value", "ILS", "none", "not_stated", "", "נכס הדגמה", "appraiser_determination",
+                                 {"unit": "source", "vat": "source", "area_basis": "source", "period": "source"},
+                                 {"quote": "6.0% | 11,800"}, "6.0% | 11,800")
+    a, r = _scoped("שווי הנכס בשיעור היוון 6.0% הוא 11,800 אלפי ₪ [V1].", ws, _scope_judge())
+    assert r.removed_units() == set()
+    assert r.edit(a).doc.text.split("\n")[0] == f"שווי הנכס בשיעור היוון 6.0% הוא 11,800 אלפי ₪ {SCOPE_ADDED[:-1]} [S1]) [V1]."
+
+
+def test_the_answer_that_already_writes_the_scope_keeps_it_and_nothing_is_added():
+    unit = f"בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪ לפי {SCOPE} [S1]."
+    a, r = _scoped(unit, _tables(_table()), _scope_judge())
+    assert r.problems == [] and r.removed_units() == set()
+    assert r.apply(a).answer_markdown == unit
+
+
+def test_a_scope_in_the_section_heading_binds_to_a_value_of_a_table_under_it():
+    ws = _tables(_table(heading=f"5. ניתוח רגישות ב{SCOPE}", after=None, before=None))
+    a, r = _scoped(SCOPE_UNIT, ws, _scope_judge())
+    assert r.edit(a).doc.text.split("\n")[0].count(SCOPE_ADDED) == 1 and r.removed_units() == set()
+
+
+def test_a_scope_in_the_sentence_before_the_table_binds_to_the_table_it_precedes():
+    ws = _tables(_table(before=f"הנתונים שלהלן הם ב{SCOPE}.", after=None))
+    a, r = _scoped(SCOPE_UNIT, ws, _scope_judge())
+    assert r.edit(a).doc.text.split("\n")[0].count(SCOPE_ADDED) == 1 and r.removed_units() == set()
+
+
+@pytest.mark.parametrize("place", ["caption", "note"])
+def test_a_scope_in_the_tables_caption_or_notes_binds_to_its_values(place):
+    ws = _tables(_table(caption=f"רגישות השווי ב{SCOPE}", after=None, before=None) if place == "caption"
+                 else _table(notes=(f"הערה: הנתונים ב{SCOPE}.",), after=None, before=None))
+    a, r = _scoped(SCOPE_UNIT, ws, _scope_judge())
+    assert r.edit(a).doc.text.split("\n")[0].count(SCOPE_ADDED) == 1 and r.removed_units() == set()
+
+
+def test_a_scope_phrase_from_another_tables_note_is_rejected_and_the_value_keeps_a_limitation_note():
+    """R12: the trailing note of table A is never applied to a value cited from table B — also when it is offered for B."""
+    other = _table(heading="6. ניתוח רגישות לדמי השכירות", before=None, after="הנתונים בטבלה זו מתייחסים לכל שלבי הפרויקט.")
+    ws = _tables(_table(), other)
+    a, r = _scoped(SCOPE_UNIT.replace("[S1]", "[S2]"), ws, _scope_judge())
+    assert [p.check for p in r.problems] == [verify.SCOPE_LIMIT_CHECK] and r.removed_units() == set()
+    out = r.edit(a)
+    assert SCOPE not in out.doc.text and _span_kinds(out) == ["scope_note"]
+    assert f"(היקף הערך במקור לא אומת; הערך נקרא ב-S2 ({SCOPE_WHERE}))" in out.doc.text.split("\n")[0]
+    # the same offer for the table it belongs to is accepted
+    a1, r1 = _scoped(SCOPE_UNIT, ws, _scope_judge())
+    assert SCOPE_ADDED in r1.edit(a1).doc.text
+
+
+def test_a_value_whose_sources_do_not_all_state_the_scope_is_not_given_it():
+    """The sentence cites both tables and states a number both hold: the phrase must stand in each one's own context."""
+    ws = _tables(_table(), _table(after=None))
+    a, r = _scoped(SCOPE_UNIT.replace("[S1]", "[S1][S2]"), ws, _scope_judge())
+    assert [p.check for p in r.problems] == [verify.SCOPE_LIMIT_CHECK]
+    assert SCOPE not in r.edit(a).doc.text
+
+
+def test_ae6_a_scope_the_judge_names_that_no_context_part_states_keeps_the_value_with_a_limitation_note():
+    a, r = _scoped(SCOPE_UNIT, _tables(_table()), _scope_judge("רק במסגרת תרחיש הפיתוח המלא"))
+    assert r.removed_units() == set() and r.counts()["removed"] == 0
+    (p,) = r.problems
+    assert p.check == verify.SCOPE_LIMIT_CHECK and p.annotatable and not p.repairable
+    out = r.edit(a)
+    first = out.doc.text.split("\n")[0]
+    assert first == f"בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪ (היקף הערך במקור לא אומת; הערך נקרא ב-S1 ({SCOPE_WHERE})) [S1]."
+    assert _span_kinds(out) == ["scope_note"] and "תרחיש" not in first
+
+
+@pytest.mark.parametrize("phrase", ["", "בלבד", "גישה אחרת לגמרי שאין לה זכר במקור"])
+def test_a_judge_that_names_no_usable_phrase_gets_the_limitation_note_too(phrase):
+    a, r = _scoped(SCOPE_UNIT, _tables(_table()), _scope_judge(phrase))
+    assert [p.check for p in r.problems] == [verify.SCOPE_LIMIT_CHECK] and r.removed_units() == set()
+    assert "לא אומת" in r.edit(a).doc.text
+
+
+def test_a_phrase_that_stands_only_in_a_paragraph_between_two_tables_is_never_asserted_as_the_values_scope():
+    a, r = _scoped(SCOPE_UNIT, _tables(_table(between=True)), _scope_judge())
+    assert [p.check for p in r.problems] == [verify.SCOPE_LIMIT_CHECK] and r.removed_units() == set()
+    first = r.edit(a).doc.text.split("\n")[0]
+    assert SCOPE not in first and "משותפת לשתי טבלאות" in first and "הערך נקרא ב-S1" in first
+
+
+def test_a_phrase_from_a_between_tables_paragraph_loses_to_the_same_phrase_in_the_tables_own_note():
+    ws = _tables(_table(notes=(f"הערה: הנתונים ב{SCOPE}.",), between=True))
+    a, r = _scoped(SCOPE_UNIT, ws, _scope_judge())
+    assert [p.check for p in r.problems] == [verify.SCOPE_CHECK] and SCOPE_ADDED in r.edit(a).doc.text
+
+
+def test_a_judge_that_calls_the_unit_unsupported_for_its_scope_alone_does_not_remove_it():
+    a, r = _scoped(SCOPE_UNIT, _tables(_table()), _scope_judge(verdict="unsupported"))
+    assert r.removed_units() == set() and r.counts()["removed"] == 0 and r.verdicts == {0: "partial"}
+    assert SCOPE_ADDED in r.edit(a).doc.text
+
+
+def test_a_hebrew_scope_note_qualifies_its_own_tables_value_and_never_the_next_tables():
+    first = _table(after="הטבלה שלעיל מתייחסת לשנת 2024 בלבד.", before=None)
+    second = _table(heading="6. ניתוח רגישות לדמי השכירות", before=None, after="הנתונים בטבלה זו מתייחסים לשנת 2025 בלבד.")
+    ws = _tables(first, second)
+    a, r = _scoped(SCOPE_UNIT, ws, _scope_judge("לשנת 2024 בלבד"))
+    assert "(היקף הערך לפי המקור: לשנת 2024 בלבד)" in r.edit(a).doc.text
+    a, r = _scoped(SCOPE_UNIT.replace("[S1]", "[S2]"), ws, _scope_judge("לשנת 2024 בלבד"))
+    assert [p.check for p in r.problems] == [verify.SCOPE_LIMIT_CHECK] and "2024" not in r.edit(a).doc.text.split("\n")[0]
+
+
+def test_a_unit_that_cites_no_source_has_nowhere_to_say_where_the_value_was_read_and_is_not_given_a_note():
+    ws = _tables(_table())
+    unit = split_units("בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪.")[0]
+    assert verify.scope_outcome(unit, SCOPE, ws) == (False, None)
+
+
+def test_the_judge_policy_and_schema_carry_the_scope_defect():
+    assert "scope" in verify.JudgeVerdict.model_fields["defect"].annotation.__args__
+    assert verify.JudgeVerdict(index=0, verdict="supported", reason="x", defect="scope", scope=SCOPE).scope == SCOPE
+    assert "scope (כלל 32)" in verify.JUDGE_POLICY and "(32)" in verify.JUDGE_POLICY
+    assert verify.DEFECT_FAILURES["scope"] in verify.FAILURE_KINDS
+
+
+def test_the_between_tables_tag_is_the_one_the_table_read_writes():
+    assert verify.BETWEEN_TABLES == _BETWEEN_TABLES
+
+
+def test_the_context_of_a_table_read_is_parsed_by_position_and_by_the_servers_labels():
+    text = _table(notes=("הערה: אלפי ₪.",), between=True, before="פתיח לטבלה.")
+    parts, body = verify.source_context(text, True)
+    assert [(p.place, p.between) for p in parts] == [("heading", False), ("before", False), ("caption", False), ("note", False),
+                                                     ("after", True)]
+    assert parts[0].text == "5. ניתוח רגישות לשיעור ההיוון" and parts[1].text == "פתיח לטבלה." and parts[4].text == SCOPE_NOTE
+    assert body == [line for line in SCOPE_ROWS.splitlines()]  # the rows only: the size line is no context
+
+
+def test_a_pointer_to_a_part_returned_before_and_the_what_follows_line_hold_no_text_of_their_own():
+    text = "\n".join([f"[{TABLE_BEFORE} · פסקה · בלוק 40: כבר הוחזר ב-S3]", "כותרת", SCOPE_ROWS,
+                      "[אחרי הטבלה: פסקה (בלוק 48) — להמשך הקריאה מהקטע הבא: read(cursor=K1)]"])
+    parts, body = verify.source_context(text, True)
+    assert [p.place for p in parts] == ["caption"] and body == SCOPE_ROWS.splitlines()
+
+
+# --- a qualifier the source states anywhere in its context is never cut (R10); one it does not state is cut as before ----------------
+
+RENT_ROWS = "סוג | שכר דירה\nמשרדים | 5,000 ₪"
+RENT_UNIT = "שכר הדירה למשרדים הוא 5,000 ₪ לחודש [S1]."
+
+
+def _rent_ws(**kw) -> Workspace:
+    return _tables(_table(rows=RENT_ROWS, caption="שכר הדירה בנכס", **kw))
+
+
+@pytest.mark.parametrize("where", ["after", "before", "heading", "caption", "note"])
+def test_a_period_the_sources_context_states_is_never_cut_whichever_part_states_it(where):
+    stated = "כל הסכומים בטבלה הם לחודש"
+    # more than four lines around the rows (``meaning.TABLE_AROUND``) are no longer read as the table's own by the meaning check
+    kw = {"after": "הטבלה מסתיימת כאן.", "before": "הטבלה שלהלן מציגה את שכר הדירה.", "heading": "3. שכר הדירה"}
+    if where == "after":
+        kw["after"] = stated + "."
+    elif where == "before":
+        kw["before"] = stated + "."
+    elif where == "heading":
+        kw["heading"] = "3. שכר הדירה לחודש"
+    elif where == "caption":
+        kw["caption"] = "שכר הדירה לחודש בנכס"
+    else:
+        kw["notes"] = (f"הערה: {stated}.",)
+    a, r = _scoped(RENT_UNIT, _tables(_table(rows=RENT_ROWS, **{"caption": "שכר הדירה בנכס"} | kw)), _judge(lambda t: "supported"))
+    assert r.qualifier_edits == {} and not any(p.check in ("meaning", "vat") for p in r.problems)
+    assert r.removed_units() == set() and r.apply(a).answer_markdown == RENT_UNIT
+
+
+def test_a_period_the_context_does_not_state_is_still_edited_out_as_before():
+    a, r = _scoped(RENT_UNIT, _rent_ws(after="הערה כללית שאינה אומרת דבר על תקופה."), _judge(lambda t: "supported"))
+    assert [p.check for p in r.problems] == ["meaning"] and r.removed_units() == set()
+    assert r.edit(a).doc.text.startswith("שכר הדירה למשרדים הוא 5,000 ₪ [S1].")
+
+
+def test_a_period_the_context_states_as_another_one_keeps_the_removal_path():
+    a, r = _scoped(RENT_UNIT, _rent_ws(after="כל הסכומים בטבלה הם לשנה."), _judge(lambda t: "supported"))
+    assert r.removed_units() == {0} and r.counts()["edited"] == 0
+
+
+def test_a_basis_the_sources_context_states_is_never_cut():
+    unit = "דמי השכירות הם 96 ₪ למ\"ר ברוטו [S1]."
+    a, r = _scoped(unit, _tables(_table(rows="סוג | דמי שכירות\nמשרדים | 96 ₪ למ\"ר", caption="דמי שכירות", before=None,
+                                       after="השטחים בטבלה הם ברוטו.", heading="3. דמי השכירות")), _judge(lambda t: "supported"))
+    assert r.qualifier_edits == {} and r.removed_units() == set() and r.apply(a).answer_markdown == unit

@@ -78,6 +78,7 @@ from app.chat.verify import (
     has_qualifier,
     ids_in,
     rescued_expansions,
+    scope_outcome,
     split_units,
     unit_claims,
     unit_key,
@@ -455,6 +456,8 @@ class _Final:
             return
         claims = unit_claims(u, v, self.ws)
         failing = [c for c in claims if not c.whole_unit and c.verdict in ("unsupported", "contradicts", "partial")]
+        if v.defect == "scope" and v.verdict in ("supported", "partial") and not failing and self.scope(f, v, res):
+            return
         if v.verdict == "partial" and (failing or v.defect != "none") and not self.attribute_only(f, v, failing) or (
                 v.verdict == "supported" and any(c.verdict in ("unsupported", "contradicts") for c in claims)):
             res.failures.append(Failure(f.drafts, DEFECT_FAILURES.get(v.defect) or "absent_from_source",
@@ -479,13 +482,37 @@ class _Final:
                                                      cite=s, check="final"))
         self.accept(f, v.verdict)
 
+    def scope(self, f: FinalUnit, v: JudgeVerdict, res: Checked) -> bool:
+        """A sentence of the saved text shown wider than the scope its source states (defect ``scope``, round 17 U5, KTD5, R10, R11): it
+        is qualified, never removed. The scope phrase the judge named, when it stands in the context of the value's own table or
+        section, is written next to the value with the citation; else the value stays with the note that its scope was not
+        verified and where it was read. Both are problems of the draft's unit, which the composer turns into server spans, so the
+        saved text is a function of the final state. False: the unit cites no source (the caller marks it partly verified)."""
+        if len(f.drafts) != 1:
+            return False
+        d = self.drafts[f.drafts[0]]
+        handled, problem = scope_outcome(d, v.scope, self.ws, f.text)
+        if not handled:
+            return False
+        if problem is not None and not any(p.unit is d and p.kind == problem.kind and p.annotation == problem.annotation
+                                           for p in self.report.problems):
+            problem.claim_id = _primary_claim_id(self.report, d.index)
+            self.report.problems.append(problem)
+            res.mutated = True
+        self.accept(f, "partial")
+        return True
+
     def attribute_only(self, f: FinalUnit, v: JudgeVerdict, failing: list) -> bool:
         """Whether a partly supported verdict on a sentence verification already qualifier-edited (a VAT, basis, period or
         number edit cut the attribute's words) names only that kind of defect: no defect, or a unit/period/VAT defect, and
         no claim of it unsupported or contradicted for any other reason. A grounded number is never removed because of an
         attribute (round 13, settled decision: the supported parts stay, the sentence is marked partly verified); the
         server's own edit already said the attribute is not stated. Any other defect, or a claim found absent or
-        contradicted, keeps the removal."""
+        contradicted, keeps the removal. A scope the answer omits (defect ``scope``, round 17 U5) is never a reason to remove
+        either: the sentence stays, marked partly verified, when the server could not write the scope or its limitation
+        (``scope``), unless a claim of it is found absent or contradicted for another reason."""
+        if v.defect == "scope" and len(f.drafts) == 1:
+            return all(c.verdict == "partial" for c in failing)
         if len(f.drafts) != 1 or self.drafts[f.drafts[0]].index not in self.report.qualifier_edits:
             return False
         if v.defect not in ("none", "units"):

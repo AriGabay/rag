@@ -17,10 +17,11 @@ the marker when it lands (a strict xfail that starts passing fails the suite, so
    scripted final answers gain ``items`` (the three adjustments, the third declared ``included``) and the same
    outcomes hold.
 3. A scope qualifier that disappears (AE5, owned by U4 for the paths in which the table read lacks the paragraph and by U5 for
-   the value written without it). A sensitivity table is followed by a short paragraph saying
-   that it refers to one valuation approach only. Three paths of the observed failure: (a) the agent writes the value with
+   the value written without it, landed). A sensitivity table is followed by a short paragraph saying
+   that it refers to one valuation approach only. Paths of the observed failure: (a) the agent writes the value with
    no scope; (b) it writes the scope and the judge cuts it as unsupported (the table read never held the paragraph); (c) the
-   final check judges the cut sentence unsupported because it lacks the limitation and removes it. In each the final answer
+   final check judges the cut sentence unsupported because it lacks the limitation and removes it; (d) the same cut sentence is
+   judged wider than its scope with the omitted phrase named (U5). In each the final answer
    must keep the value with the scope phrase and a citation, and never show the value as the property's total.
 
 The two PDFs are the synthetic fixtures of ``tests/fixtures/round17`` (``scripts/generate_fixtures.py --only round17``);
@@ -56,9 +57,6 @@ pytestmark = pytest.mark.db
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 MANIFEST = json.loads((FIXTURES / "round17" / "manifest.json").read_text(encoding="utf-8"))["documents"]
 SENSITIVITY, ADJUSTMENTS = MANIFEST["sensitivity"], MANIFEST["adjustments"]
-
-# the owning unit removes its marker when it lands (strict: a test that starts passing with the marker left fails)
-U5 = pytest.mark.xfail(strict=True, reason="U5 not landed: a table value is written without the scope its paragraph states")
 
 
 @pytest.fixture
@@ -298,16 +296,20 @@ WITHOUT_SCOPE = f"{VALUE_CLAUSE} [S1]."
 WITH_SCOPE = f"{VALUE_CLAUSE} {SCOPE_CLAUSE} [S1]."
 
 
-def scope_judge(seen: list[str] | None = None, final_rejects: bool = False):
+def scope_judge(seen: list[str] | None = None, final_rejects: bool = False, blind: bool = False,
+                final_names_scope: bool = False):
     """A judge that holds the source to what it shows. A sentence that states the scope is supported when a shown source
     states it too; else its scope clause is the one unsupported span of a partly supported sentence (the cut). A sentence
     that carries the server's marker and states the value without the scope — the cut sentence, as the final check
-    sees it — is unsupported when ``final_rejects`` (the limitation is missing), else supported. Components are ``full``."""
+    sees it — is unsupported when ``final_rejects`` (the limitation is missing), partly supported with defect ``scope`` and
+    the omitted phrase when ``final_names_scope``, else supported. A sentence that states the value without the scope when a
+    shown source states it is supported with defect ``scope`` and the phrase (the judge reads the context: round 17 U5).
+    ``blind``: the judge is not shown the paragraph (the round-16 table read), whatever the call holds. Components are ``full``."""
     def judge(input: str) -> dict:
         if seen is not None:
             seen.append(input)
         units = units_of(input)
-        shown = _source_text(input)
+        shown = "" if blind else _source_text(input)
         verdicts = []
         for i, t in units.items():
             if VALUE not in t:
@@ -319,6 +321,10 @@ def scope_judge(seen: list[str] | None = None, final_rejects: bool = False):
                                       {"span": SCOPE_CLAUSE, "verdict": "unsupported", "failure": "absent_from_source"}]}
             elif SCOPE_PHRASE not in t and "<server>" in t and final_rejects:
                 verdict = {"verdict": "unsupported", "failure": "absent_from_source"}
+            elif SCOPE_PHRASE not in t and "<server>" in t and final_names_scope:
+                verdict = {"verdict": "partial", "defect": "scope", "scope": SCOPE_PHRASE}
+            elif SCOPE_PHRASE not in t and SCOPE_PHRASE in _source_text(input):
+                verdict = {"verdict": "supported", "defect": "scope", "scope": SCOPE_PHRASE}
             else:
                 verdict = {"verdict": "supported"}
             verdicts.append({"index": i, "reason": "בדיקה", "supported_by": []} | verdict)
@@ -364,16 +370,24 @@ def test_a_table_read_carries_the_short_paragraph_that_follows_it(client, office
 
 
 @pytest.mark.parametrize("path", [
-    pytest.param("a_agent_omits_the_scope", marks=U5),
-    pytest.param("b_judge_cuts_the_scope"),
-    pytest.param("c_final_check_removes_the_sentence")])
+    "a_agent_omits_the_scope",
+    "b_judge_cuts_the_scope",
+    "c_final_check_removes_the_sentence",
+    "d_the_cut_sentence_is_judged_wider_than_its_scope"])
 def test_a_value_of_a_table_keeps_the_scope_its_following_paragraph_states_with_its_citation(
         client, office, monkeypatch, path):
     first, judge = {"a_agent_omits_the_scope": (WITHOUT_SCOPE, scope_judge()),
                     "b_judge_cuts_the_scope": (WITH_SCOPE, scope_judge()),
-                    "c_final_check_removes_the_sentence": (WITH_SCOPE, scope_judge(final_rejects=True))}[path]
+                    "c_final_check_removes_the_sentence": (WITH_SCOPE, scope_judge(final_rejects=True)),
+                    # the draft judge did not see the paragraph and cut the scope clause; the final judge reads the cut
+                    # sentence as wider than its scope and names the phrase: it is qualified, never removed (D07 run 2)
+                    "d_the_cut_sentence_is_judged_wider_than_its_scope": (
+                        WITH_SCOPE, scope_judge(blind=True, final_names_scope=True))}[path]
     _, m = scope_turn(client, office, monkeypatch, first, judge)
     assert_value_keeps_its_scope(m)
+    if path == "a_agent_omits_the_scope":  # the sentence is the agent's own, with the scope written from the source (AE5)
+        (line,) = [ln for ln in m["answer"]["markdown"].splitlines() if VALUE in ln]
+        assert line.startswith(f"{VALUE_CLAUSE} (היקף הערך לפי המקור: {SCOPE_PHRASE})") and line.endswith("[S1].")
 
 
 def test_a_value_of_another_table_does_not_take_the_scope_of_the_table_before_it(client, office, monkeypatch):

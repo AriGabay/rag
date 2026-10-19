@@ -1502,3 +1502,96 @@ def test_the_final_check_without_time_to_judge_keeps_the_drafts_scores_even_when
     assert seen == []  # no allowance left: the draft's verdicts stand, nothing is withheld for a changed passage
     assert done.composition.answer.answer_markdown.startswith(tc.V1_MD)
     assert [o["status"] for o in report.requirement_outcomes()] == ["full", "full"]
+
+
+# --- a scope the sentence omits is added, never a reason to remove it (round 17 U5, KTD5, R10, R11; D07 run 2) ------------------------
+
+from tests.unit.test_verify_edit_ladder import (  # noqa: E402
+    SCOPE,
+    SCOPE_ADDED,
+    SCOPE_UNIT,
+    _table,
+)
+
+SCOPE_CUT = f"בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪, {CLAUSE} [S1]."  # the clause the source does not state is cut
+
+
+def _scope_rule(final_reply):
+    """The first verification cuts the clause the source does not state; the sentence as saved (the marker in it) is answered
+    ``final_reply`` — as the real judge answered the cut sentence for lacking the limitation (D07 run 2)."""
+
+    def rule(text, input, n):
+        if n == 1 and CLAUSE in text:
+            return {"verdict": "partial", "defect": "part", "claims": [
+                {"span": "בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪", "verdict": "supported"},
+                {"span": CLAUSE, "verdict": "unsupported", "failure": "absent_from_source"}]}
+        return final_reply if MARKER in text else "supported"
+
+    return rule
+
+
+def _scope_turn(offline, final_reply, source: str | None = None):
+    offline.texts = [source or _table()]
+    return _turn(ScriptedAgent([SEARCH, final(SCOPE_CUT), final(SCOPE_CUT), final(SCOPE_CUT)],
+                               judge=Judge(_scope_rule(final_reply))), "מהו שווי הנכס בשיעור היוון של 6.0%?")
+
+
+def test_a_cut_sentence_the_final_judge_finds_wider_than_its_scope_is_qualified_with_the_validated_phrase_not_removed(offline):
+    out = _scope_turn(offline, {"verdict": "partial", "defect": "scope", "scope": SCOPE})
+    md = out.answer.answer_markdown
+    first = md.split("\n")[0]
+    assert first.startswith(f"בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪ {SCOPE_ADDED}") and "[S1]" in first, md
+    assert MARKER in first and out.report.removals() == [] and "הוסרו" not in md
+    assert _kinds(out) == ["qualifier", "marker"], _kinds(out)
+    assert _purposes(out).count("verify_final") == 1 and out.final_check["passes"] == 2  # recomposed once, nothing judged again
+    assert out.final_digest == text_digest(md)  # (the fixed point is asserted by the check itself)
+    assert {r.post_check for r in out.report.claims[0] if r.verdict == "supported"} == {"partial"}
+
+
+def test_a_scope_the_final_judge_names_that_the_source_does_not_state_leaves_the_value_with_a_limitation_note(offline):
+    out = _scope_turn(offline, {"verdict": "partial", "defect": "scope", "scope": "רק בתרחיש הפיתוח המלא"})
+    md = out.answer.answer_markdown
+    first = md.split("\n")[0]
+    assert "11,800" in first and "(היקף הערך במקור לא אומת; הערך נקרא ב-S1 (סעיף \"סיכום\"))" in first, md  # the fixture's location
+    assert "תרחיש" not in md and out.report.removals() == [] and _kinds(out) == ["scope_note", "marker"]
+    assert out.final_digest == text_digest(md)
+
+
+def test_a_final_verdict_unsupported_for_the_scope_alone_is_taken_as_partly_supported_and_qualified(offline):
+    out = _scope_turn(offline, {"verdict": "unsupported", "failure": "absent_from_source", "defect": "scope", "scope": SCOPE})
+    md = out.answer.answer_markdown
+    assert SCOPE_ADDED in md and "11,800" in md and out.report.removals() == []
+
+
+def test_the_scope_is_not_added_twice_when_verification_already_wrote_it(offline):
+    """The first judge names the scope on the sentence as the model wrote it; the final judge names it again on the cut one."""
+
+    def rule(text, input, n):
+        if n == 1 and CLAUSE in text:
+            return {"verdict": "partial", "defect": "scope", "scope": SCOPE, "claims": [
+                {"span": "בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪", "verdict": "supported"},
+                {"span": CLAUSE, "verdict": "unsupported", "failure": "absent_from_source"}]}
+        return {"verdict": "partial", "defect": "scope", "scope": SCOPE} if MARKER in text else "supported"
+
+    offline.texts = [_table()]
+    out = _turn(ScriptedAgent([SEARCH, final(SCOPE_CUT), final(SCOPE_CUT), final(SCOPE_CUT)], judge=Judge(rule)),
+                "מהו שווי הנכס בשיעור היוון של 6.0%?")
+    assert out.answer.answer_markdown.count(SCOPE) == 1 and out.report.removals() == []
+
+
+def test_a_scope_defect_with_no_cited_source_marks_the_sentence_partly_verified_and_never_removes_it():
+    """``attribute_only``: a unit that cites no source has nowhere to say where it was read, so the server writes nothing; the
+    sentence is kept, marked."""
+    from types import SimpleNamespace
+
+    final = object.__new__(final_check._Final)
+    unit = SimpleNamespace(drafts=[0])
+    scope = verify.JudgeVerdict(index=0, verdict="partial", reason="x", defect="scope", scope=SCOPE)
+    assert final.attribute_only(unit, scope, []) is True
+    assert final.attribute_only(unit, scope, [SimpleNamespace(verdict="partial")]) is True
+    assert final.attribute_only(unit, scope, [SimpleNamespace(verdict="unsupported")]) is False  # another reason keeps the removal
+
+
+def test_a_scope_defect_never_maps_to_a_failure_that_removes():
+    assert final_check.DEFECT_FAILURES["scope"] == "context_not_read"
+    assert SCOPE_UNIT  # (the sentence the sequences use)

@@ -77,7 +77,7 @@ def test_the_ordinal_of_a_marker_follows_its_place_after_an_earlier_one_is_remov
 
 
 def test_every_server_kind_is_a_fixed_word_and_a_span_of_an_unknown_kind_is_refused():
-    assert len(set(SERVER_KINDS)) == len(SERVER_KINDS) == 14
+    assert len(set(SERVER_KINDS)) == len(SERVER_KINDS) == 15
     try:
         Doc("x").splice(0, 0, "y", "free text")
     except AssertionError:
