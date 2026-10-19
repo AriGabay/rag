@@ -482,7 +482,9 @@ def test_deadline_stops_new_calls_and_queues_the_rest(office):
 def test_long_document_outside_retrieved_passages_is_partial_scan(office, limits):
     limits(budget=2000)
     attr = make_attr(office, "שטח מחסן")
-    filler = [f"פסקה {i}: המחסן הצמוד לדירה משמש לאחסון כללי, ללא נתוני שטח מפורטים בסעיף זה." for i in range(40)]
+    # The fillers carry both words of the attribute ("שטח מחסן"), the datum only one, so on every retrieval signal
+    # (lexical terms, trigram similarity, embedding) the datum ranks last by design, not by the luck of a tie.
+    filler = [f"פסקה {i}: שטח מחסן הצמוד לדירה מוזכר בסעיף זה, ללא נתוני מדידה מפורטים." for i in range(40)]
     datum = "בקומת המרתף נמדד המחסן הצמוד בגודל 6 מ״ר."
     add_doc(office, office.default_group_id, "ארוך", [*filler[:20], datum, *filler[20:]])
 

@@ -183,8 +183,8 @@ def _lexical(conn: Connection, tokens: list[str], scope: _Sql | None = None, n: 
     score = " + ".join(f"CAST(:w{i} AS float8) * {m}::int" for i, m in enumerate(match))
     return list(conn.execute(
         text(f"SELECT c.id{scope.joins} CROSS JOIN (SELECT {parts}) AS q(query)"
-             f" WHERE {scope.where} AND c.tsv @@ q.query ORDER BY ({score}) DESC, ts_rank_cd(c.tsv, q.query) DESC"
-             " LIMIT :n"),
+             f" WHERE {scope.where} AND c.tsv @@ q.query ORDER BY ({score}) DESC, ts_rank_cd(c.tsv, q.query) DESC,"
+             " c.chunk_index, c.id LIMIT :n"),
         params | weights | scope.params | {"n": n},
     ).scalars())
 
@@ -195,13 +195,14 @@ def _trigram_statement(scope: _Sql, n: int = CANDIDATES) -> tuple[str, dict]:
     ids and similarity only; the ids are joined back to ``chunks``, ``document_versions`` and ``documents`` under row
     security for scope and order, so no chunk text is read outside it. Row-level security keeps the planner from using
     the index for ``<%`` on ``chunks`` itself, and made a plain join scan ``chunks`` once per version x document,
-    evaluating the predicate on each scan (10.8 s on the office; R16, KTD3)."""
+    evaluating the predicate on each scan (10.8 s on the office; R16, KTD3). Equal similarities order by chunk order,
+    then id, so tied passages come back the same on every run (round 17, KTD8)."""
     return (
         "WITH cand AS MATERIALIZED (SELECT t.chunk_id AS id, t.sim"
         " FROM trigram_candidates(:q, CAST(:tv AS uuid[]), CAST(:th AS real), :n_in) t)"
         " SELECT c.id FROM cand JOIN chunks c ON c.id = cand.id JOIN document_versions v ON v.id = c.version_id"
         " JOIN documents d ON d.id = c.document_id AND d.deleted_at IS NULL"
-        f" WHERE {scope.where} AND cand.sim > :th ORDER BY cand.sim DESC, c.id LIMIT :n",
+        f" WHERE {scope.where} AND cand.sim > :th ORDER BY cand.sim DESC, c.chunk_index, c.id LIMIT :n",
         scope.params | {"tv": list(scope.version_ids or []), "th": TRIGRAM_THRESHOLD, "n": n,
                         # the candidates are the best of the whole version, a unit's block range is cut afterwards:
                         # a unit scope asks for more of them

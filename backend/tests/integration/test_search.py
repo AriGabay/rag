@@ -856,6 +856,30 @@ def test_fused_order_is_the_order_the_legacy_trigram_gives(office, monkeypatch):
     assert now == before and all(now)
 
 
+def test_tied_passages_come_back_in_chunk_order_whatever_their_ids_are(office):
+    """41 passages of one text tie on every score. Two identical versions, whose chunks got different random ids,
+    must give the same order at the lexical and trigram stages and in the fused top-k: ties break on chunk order
+    (KTD8), not on the chunk id, so a small scope's read passages do not depend on chance."""
+    from app.platform.search import SearchScope, _lexical, _trigram, search_evidence
+
+    a, *_ = office
+    same = [f"{TEXTS[0]}"] * 41
+    versions = [add_chunks(a, a.default_group_id, same, f"{i}" * 64)[1] for i in (7, 8)]
+    queries = ["שיקולי השמאי היטל השבחה"]
+    runs = []
+    with tenant_tx(a.ctx()) as conn:
+        order = {r.id: r.chunk_index for r in conn.execute(text("SELECT id, chunk_index FROM chunks"))}
+        for ver in versions:
+            scope = _trigram_scope(conn, SearchScope(version_ids=(ver,)))
+            lexical = [order[i] for i in _lexical(conn, ["שיקולי", "השמאי", "השבחה"], scope, 41)]
+            trigram = [order[i] for i in _trigram(conn, "שיקולי השמאי היטל השבחה", scope, 41)]
+            fused = [order[h["chunk_id"]] for h in search_evidence(conn, queries, 12, scope=SearchScope(version_ids=(ver,))).hits]
+            runs.append((lexical, trigram, fused))
+    for lexical, trigram, _fused in runs:
+        assert lexical == trigram == list(range(41))
+    assert runs[0] == runs[1] and len(runs[0][2]) == 12
+
+
 def _plan_nodes(plan):
     yield plan
     for child in plan.get("Plans", []):
