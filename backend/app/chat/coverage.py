@@ -400,6 +400,11 @@ def _place(scope: str | None, name: str | None) -> tuple[str, str, str]:
     return f"בסעיף \"{name}\"", f"מהסעיף \"{name}\"", "הסעיף"
 
 
+def _read_at(document: str | None, detail: str, sid: str | None) -> str:
+    """Where a part was read, as the lines about a part read and not used word it: ב"document" (location) [S#]."""
+    return f'ב"{document}"' + (f" ({detail})" if detail else "") + (f" [{sid}]" if sid else "")
+
+
 def _label(text: str) -> str:
     return "**" + " ".join(re.sub(r"\*+", " ", text or "").split()) + "**"
 
@@ -435,8 +440,7 @@ def gap_sentence(reason: str, variant: str, texts: list[str], place: dict | None
         return f"{who}: נמצא ערך, אבל קריאתו או משמעותו אינן ודאיות, ולכן הוא לא הוצג כנתון מאומת."
     if reason == "not_verifiable" and variant == "read_not_used":
         # round 16 U2, R6: the part was read at a place and the answer does not give it - what the turn did, never "not found"
-        return (f"{who}: {'החלקים נקראו' if many else 'החלק נקרא'} ב\"{document}\"" + (f" ({detail})" if detail else "")
-                + (f" [{sid}]" if sid else "") + ", ולא נעשה בו שימוש בתשובה.")
+        return f"{who}: {'החלקים נקראו' if many else 'החלק נקרא'} {_read_at(document, detail, sid)}, ולא נעשה בו שימוש בתשובה."
     if reason == "not_verifiable" and variant == "undeterminable":
         return f"{who}: המסמכים אינם מספיקים כדי להכריע בכך."
     if reason == "not_verifiable":
@@ -796,14 +800,16 @@ def item_line(ws: Workspace, state: dict) -> dict:
     in the source it was read at (the document, the location, the S#) and the reason — still omitted: read there and not used,
     never "not found"; ``not_verifiable`` / ``not_applicable``: the reason the agent gave. {"id", "state", "text", "document_id",
     "title"}."""
+    from app.chat.verify import ITEM_NOT_APPLICABLE, ITEM_NOT_VERIFIABLE
+
     src = ws.sources.get(state["source"])
     title = (src.title if src is not None else "") or ""
-    place = f'ב"{title}"' + (f" ({src.location})" if src is not None and src.location else "") + f" [{state['source']}]"
+    place = _read_at(title, src.location if src is not None else "", state["source"])
     name = "«" + _plain(state["label"] or state["quote"], ITEM_NAME_CHARS) + "»"
     reason = _plain(state["reason"], ITEM_REASON_CHARS).rstrip(".")
-    if state["state"] == "not_verifiable":
+    if state["state"] == ITEM_NOT_VERIFIABLE:
         text = f"{name}: נקרא {place}, אך לא ניתן לאמת אותו: {reason}."
-    elif state["state"] == "not_applicable":
+    elif state["state"] == ITEM_NOT_APPLICABLE:
         text = f"{name}: נקרא {place}, ולא נכלל בתשובה כי הוא אינו חל על הבקשה: {reason}."
     else:
         text = f"{name}: נקרא {place}, ולא נעשה בו שימוש בתשובה."
@@ -816,11 +822,13 @@ def item_gap_lines(ws: Workspace, report, outcomes: Sequence[dict]) -> list[dict
     """The lines for the ledger's items that stand open in the saved answer: those the agent listed and no surviving unit gives
     (still omitted) and those declared ``not_verifiable`` or ``not_applicable`` with a reason (``item_line``), in the ledger's order, at most
     ``ITEM_GAP_LINES`` (one more line counts the rest). An item of a component the request made not relevant is not stated."""
+    from app.chat.verify import ITEM_NOT_APPLICABLE, ITEM_NOT_VERIFIABLE, ITEM_OMITTED, ORIGIN_JUDGE_SUPPORT
+
     skip = {o["id"] for o in outcomes if o.get("status") == "not_relevant"}
     # a part only the judge named is stated by its component's own line (round 16: ``read_not_used``), not twice
     lines = [item_line(ws, st) for st in report.item_states()
-             if st["component"] not in skip and (st["state"] in ("not_verifiable", "not_applicable")
-                                                 or (st["state"] == "omitted" and st["origin"] != "judge_support"))]
+             if st["component"] not in skip and (st["state"] in (ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE)
+                                                 or (st["state"] == ITEM_OMITTED and st["origin"] != ORIGIN_JUDGE_SUPPORT))]
     if len(lines) <= ITEM_GAP_LINES:
         return lines
     rest = len(lines) - ITEM_GAP_LINES
@@ -898,8 +906,8 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
         # a part a read passage states and the answer omits is stated too (round 16 U2, R6), never a conditional component
         o["stated"] = (o["status"] != "partial" or o["kind"] == "instruction" or bool(o["missing_part"])
                        or (o["variant"] == "read_not_used" and datum))
-        if o.get("omitted_items") and not o.get("judge_items"):
-            o["stated"] = False  # the agent's omitted items are stated one by one, in the item lines (``item_gap_lines``)
+        if o["status"] == "partial" and o.get("omitted_items") and not o.get("judge_items") and not o["missing_part"]:
+            o["stated"] = False  # a partly given component's omitted agent items are stated one by one, in the item lines (``item_gap_lines``)
         o["gap"] = gap_sentence(why["reason"], o["variant"], [gap_label(o)], o["place"], o["document"], o["detail"])
     return outcomes
 
@@ -1018,7 +1026,8 @@ def compose_components(ws: Workspace, answer: FinalAnswer, report,
     # the ledger's items the answer does not give, or that were declared not verifiable / not applicable, one line each (round 17
     # U3, R8): server text, a pure function of the final state like the gap paragraph. Whether the answer is partial follows the
     # components (an omitted item makes its component partial; an item declared with a reason does not)
-    report.item_gaps = item_lines = item_gap_lines(ws, report, outcomes) if outcomes else []
+    item_lines = item_gap_lines(ws, report, outcomes) if outcomes else []
+    report.item_gaps = item_lines
     if item_lines:
         doc.tidy_blank_lines()
         doc.append(("\n\n" if doc.text else "") + "\n".join(x["text"] for x in item_lines), "item_gap")

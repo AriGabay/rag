@@ -37,6 +37,7 @@ TABLE_SIZE_PREFIX = "הטבלה:"  # the size line a table source starts with (t
 TABLE_BEFORE = "לפני הטבלה"
 TABLE_AFTER = "אחרי הטבלה"
 TABLE_PATH_PREFIX = "כותרות מעל הטבלה:"
+TABLE_BETWEEN = "בין שתי טבלאות"  # the tag a context part has when it lies between two tables (``tools._part_line``)
 CONTEXT_MARKS = (f"[{TABLE_BEFORE}", f"[{TABLE_AFTER}", TABLE_PATH_PREFIX)
 
 _SENTENCE = re.compile(r"(?<=[.!?:;])\s+(?=\S)")
@@ -73,7 +74,7 @@ def segments_of(text: str, kind: str = "text") -> tuple[Segment, ...]:
     out: list[Segment] = []
     for i, ln in enumerate(lines):
         if ln.lstrip().startswith(CONTEXT_MARKS):  # a part is one bounded line: never split into sentences
-            out.append(Segment(ln, tabular, True))
+            out.append(Segment(ln, header=tabular, context=True))
             continue
         if tabular and first_row is not None:
             header = (i <= first_row or i > last_row or bool(_NOTE.match(ln))

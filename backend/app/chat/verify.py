@@ -197,6 +197,7 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol, get_args
@@ -212,6 +213,7 @@ from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited, line_cut
 from app.chat.evidence import (
     TABLE_AFTER,
     TABLE_BEFORE,
+    TABLE_BETWEEN,
     TABLE_PATH_PREFIX,
     TABLE_SIZE_PREFIX,
     Segment,
@@ -244,6 +246,7 @@ if TYPE_CHECKING:
 
     from app.chat.calc import Computation
     from app.chat.engine import FinalAnswer
+    from app.chat.items import Ledger
     from app.chat.tools import Source, Workspace
 
 logger = logging.getLogger(__name__)
@@ -1585,8 +1588,8 @@ class VerifyReport:
     # the item ledger of the turn (round 17 U3, KTD3: ``app.chat.items.Ledger``, shared by the turn's reports) and the workspace its
     # coverage is read from; None outside a turn that froze its components. ``item_gaps``: the server's item lines
     # (``coverage.item_gap_lines``), set once the final answer is stated
-    item_ledger: object | None = None
-    item_ws: object | None = None
+    item_ledger: Ledger | None = None
+    item_ws: Workspace | None = None
     item_gaps: list[dict] = field(default_factory=list)
     # calculation components waiting for a detail only the user can give (round 7 KTD9): id -> the parameters no
     # user assumption and no document rate of the turn fills (``unfilled_parameters``)
@@ -1908,7 +1911,10 @@ class VerifyReport:
                "partial": len({p.unit.index for p in self.partial_problems()} - errors),
                # a qualifier written from the source; a result the server marked conditional is counted apart
                "annotated": sum(1 for p in self.problems if p.annotatable and not p.conditional
-                                and p.unit.index not in errors),
+                                and p.check not in SCOPE_CHECKS and p.unit.index not in errors),
+               # a value's scope written next to it from the source, or the note that its scope was not verified (round 17 U5)
+               "scoped": sum(1 for p in self.problems if p.annotatable and not p.conditional
+                             and p.check in SCOPE_CHECKS and p.unit.index not in errors),
                "conditional": len(self.conditional_units()),
                # a qualifier the sources do not state, edited out of a number they back (round 12 U10): an edit, not a removal
                "edited": len(self.edits()),
@@ -1996,10 +2002,12 @@ class VerifyReport:
                         | ({"claim_id": ids[0], "claim_ids": list(ids)} if ids else {}))
         return rows
 
-    def item_states(self, kept: set[int] | None = None) -> list[dict]:
+    def item_states(self, kept: set[int] | None = None, texts: dict[str, str] | None = None) -> list[dict]:
         """Every item of the turn's ledger against the units that survive (``kept``: their indexes, else every unit not removed):
         ``Ledger.outcomes`` — ``covered``, ``omitted`` (included or judge-added and given by no surviving unit), or the
-        ``not_verifiable`` / ``not_applicable`` the agent declared with a reason. Empty without a ledger."""
+        ``not_verifiable`` / ``not_applicable`` the agent declared with a reason. Empty without a ledger. ``texts``: the
+        components' texts by id, when the report does not hold them yet (before the judge), so that the presence test of a
+        judge-added item reads the same words before and after the judge."""
         ledger = self.item_ledger
         if ledger is None or not ledger.items:
             return []
@@ -2008,14 +2016,14 @@ class VerifyReport:
             kept = {u.index for u in self.units if u.index not in gone}
         units = [self._as_edited(u) for u in self.units if u.index in kept]
         states = ledger.outcomes(units, self.item_ws)
-        texts = {r["id"]: r["text"] for r in self.requirements}
+        texts = texts if texts is not None else {r["id"]: r["text"] for r in self.requirements}
         for st in states:
             # the judge names a part by its quote alone: unit attribution is not enough for it, the round-16 presence test must
             # hold too (the quote's numbers with half of the words that name the item, not the component's own words), or a
             # sentence of the same table that shares the rate's words would close an omitted rate
-            if st["origin"] == "judge_support" and st["state"] == "covered" \
+            if st["origin"] == ORIGIN_JUDGE_SUPPORT and st["state"] == ITEM_COVERED \
                     and not _in_answer(st["quote"], units, texts.get(st["component"], "")):
-                st |= {"state": "omitted", "covered_by": None, "why": "value_not_stated"}
+                st |= {"state": ITEM_OMITTED, "covered_by": None, "why": "value_not_stated"}
         return states
 
     def _as_edited(self, u: Unit) -> Unit:
@@ -2038,11 +2046,11 @@ class VerifyReport:
         raw = "".join(kept)
         return dataclasses.replace(u, raw=raw, text=_IDS.sub("", raw).strip(), ids=ids_in(raw))
 
-    def item_listing(self, kept: set[int] | None = None) -> list[dict]:
+    def item_listing(self, kept: set[int] | None = None, texts: dict[str, str] | None = None) -> list[dict]:
         """The ledger as the requirements call is shown it (``_Coverage.items``): each item's id, component, label, source, quote,
-        value, condition and state (and the reason of a declared one)."""
+        value, condition and state (and the reason of a declared one). ``texts``: see ``item_states``."""
         return [{k: s[k] for k in ("id", "component", "label", "source", "quote", "value", "condition", "state", "reason")}
-                for s in self.item_states(kept)]
+                for s in self.item_states(kept, texts)]
 
     def add_support_items(self, support: dict[str, list[dict]]) -> None:
         """The judge's validated support (``validated_support``) enters the turn's ledger as items with origin ``judge_support`` and
@@ -2069,7 +2077,7 @@ class VerifyReport:
         """A score as the decisions and the history name it: the call (None: carried), its status, whether this round's call made
         it (``fresh``) or an earlier round did (``carried``) and the answer version it was cast on (None: built by hand)."""
         stamp, trace = v._stamp or {}, v._trace or {}
-        return {"call": trace.get("call"), "status": v.status, "origin": stamp.get("origin", "fresh"),
+        return {"call": trace.get("call"), "status": v.status, "origin": stamp.get("origin", FRESH),
                 "version": stamp.get("version"), "units": list(v.units)}
 
     @property
@@ -2091,7 +2099,7 @@ class VerifyReport:
             ids = [x for v in note["voters"] for x in (v._stamp or {}).get("ids", [])]
             ids += [x["id"] for x in o.get("support") or []]
             out[o["id"]] = {"id": o["id"], "status": o["status"], "version": self.version, "digest": self.digest,
-                            "reused": bool(rows) and all(r["origin"] == "carried" for r in rows), "rests_on": rows,
+                            "reused": bool(rows) and all(r["origin"] == CARRIED for r in rows), "rests_on": rows,
                             "caps": list(note["caps"]), "evidence": list(dict.fromkeys(ids))[:TRACE_PASSAGE_IDS],
                             "from_children": list(o["children"])}
         return out
@@ -2104,6 +2112,10 @@ class VerifyReport:
         changed), or overruled by the server's validated evidence of a missing part (R2). Diagnostics only."""
         notes: dict[str, dict] = {}
         self._resolve(None, notes)
+        return self._history(notes)
+
+    def _history(self, notes: dict[str, dict]) -> dict[str, list[dict]]:
+        """``requirement_history`` from the ``notes`` a ``_resolve`` of the present state filled."""
         out = {cid: [dict(row) for row in rows] for cid, rows in self.refused.items()}
         for cid, note in notes.items():
             out.setdefault(cid, []).extend(self._score_row(v) | {"why": why} for v, why in note["overruled"])
@@ -2123,17 +2135,17 @@ class VerifyReport:
         if not self.requirements:
             return []
         notes: dict[str, dict] = {}
-        outcomes = self._resolve(None, notes)
+        ledger_items = self.item_states()  # the units that stand are those ``_resolve`` reads: the ledger is read once
+        outcomes = self._resolve(None, notes, ledger_items)
         final = {o["id"]: o["status"] for o in outcomes}
         decisions = self._decisions(outcomes, notes)
-        history = self.requirement_history
-        ledger_items = self.item_states()
+        history = self._history(notes)
         out = []
         for r in self.requirements[:TRACE_COMPONENTS]:
             votes = []
             for v in self.requirement_votes.get(r["id"], [])[:TRACE_VOTES_PER_COMPONENT]:
                 t, stamp = v._trace, v._stamp or {}
-                tag = {"version": stamp.get("version"), "origin": stamp.get("origin", "fresh"),
+                tag = {"version": stamp.get("version"), "origin": stamp.get("origin", FRESH),
                        "call_units": stamp.get("call_units", [])}
                 if t is None:  # a score no judge call of this verification made (a hand-built report)
                     votes.append({"call": None, "reused": False, "status": v.status, "passages": None,
@@ -2181,9 +2193,11 @@ class VerifyReport:
         any score says. ``requirement_decisions`` is the same merge with the scores each decision rests on."""
         return self._resolve(applied, None)
 
-    def _resolve(self, applied: FinalAnswer | None, notes: dict[str, dict] | None) -> list[dict]:
+    def _resolve(self, applied: FinalAnswer | None, notes: dict[str, dict] | None,
+                 states: list[dict] | None = None) -> list[dict]:
         """``requirement_outcomes``; ``notes`` (when given) receives, per component, the scores its status rests on (``voters``), the
-        scores a cap overruled (``overruled``) and the caps that applied (``caps``)."""
+        scores a cap overruled (``overruled``) and the caps that applied (``caps``). ``states``: ``item_states()`` of the present
+        state, when the caller holds it already (the units that stand are then those it was read for)."""
         errors = self.removed_units()
         kept = {u.index for u in self.units if u.index not in errors}
         if applied is not None and errors and not _IDS.search(applied.answer_markdown):
@@ -2203,8 +2217,8 @@ class VerifyReport:
         # the ledger closed (covered, or declared not verifiable / not applicable with a reason)
         omitted_by: dict[str, list[dict]] = {}
         closed: set[tuple[str, str, str]] = set()
-        for st in self.item_states(kept):
-            if st["state"] == "omitted":
+        for st in self.item_states(kept) if states is None else states:
+            if st["state"] == ITEM_OMITTED:
                 omitted_by.setdefault(st["component"], []).append(st)
             else:
                 closed.add((st["component"], st["source"], SupportScope.flat(st["quote"])))
@@ -2242,10 +2256,10 @@ class VerifyReport:
             if omitted:
                 # the judge's items first (the component's own gap line names the place of the first part): the part the judge
                 # named is stated by that line, the agent's items one by one (``coverage.item_gap_lines``)
-                omitted = sorted(omitted, key=lambda i: i["origin"] != "judge_support")
+                omitted = sorted(omitted, key=lambda i: i["origin"] != ORIGIN_JUDGE_SUPPORT)
                 have = {(x["id"], SupportScope.flat(x["quote"])) for x in o["support"]}
                 o["omitted_items"] = [i["id"] for i in omitted]
-                o["judge_items"] = [i["id"] for i in omitted if i["origin"] == "judge_support"]
+                o["judge_items"] = [i["id"] for i in omitted if i["origin"] == ORIGIN_JUDGE_SUPPORT]
                 o["support"] += [{"id": i["source"], "quote": i["quote"]} for i in omitted
                                  if (i["source"], SupportScope.flat(i["quote"])) not in have]
             if kind == "instruction" and o["aspect"] == "citation":
@@ -2939,6 +2953,7 @@ def _declared_head(ws: Workspace, src) -> str:
 # ``[… · בלוק 47: כבר הוחזר ב-S3]`` to a part already returned) and the line that says what follows the table
 # (``[אחרי הטבלה: … read(cursor=K3)]``): server-written labels in the source's text whose digits (the block number, a handle) are
 # no number the source states. The part's own text after the tag is.
+_PART_OPENERS = (f"[{TABLE_BEFORE}", f"[{TABLE_AFTER}")  # every tag the pattern below finds starts with one of these
 _PART_TAG = re.compile(rf"\[(?:{TABLE_BEFORE}|{TABLE_AFTER})[^\]\n]*?בלוק\s*\d+(?::[^\]\n]*)?\]"
                        rf"|\[{TABLE_AFTER}:[^\]\n]*\]")
 
@@ -2946,7 +2961,9 @@ _PART_TAG = re.compile(rf"\[(?:{TABLE_BEFORE}|{TABLE_AFTER})[^\]\n]*?בלוק\s*
 def without_part_tags(text: str) -> str:
     """``text`` with the tags of a table read's context parts taken out (``_PART_TAG``): what the numbers of a source are read
     from, so that a block number never backs a number of the answer (round 17 U2). The judge reads the source with its tags."""
-    return _PART_TAG.sub(" ", text) if text else text
+    if not text or not any(opener in text for opener in _PART_OPENERS):  # no tag can start here: the regex has nothing to find
+        return text
+    return _PART_TAG.sub(" ", text)
 
 
 def _source_parts(ws: Workspace, sid: str, *, dated: bool = True) -> tuple[str, str, str] | None:
@@ -3748,7 +3765,6 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
 SCOPE_CHECK = "scope"  # the check of a validated scope written next to a value
 SCOPE_LIMIT_CHECK = "scope_limit"  # ... and of the limitation note written when the scope could not be verified
 SCOPE_CHECKS = (SCOPE_CHECK, SCOPE_LIMIT_CHECK)
-BETWEEN_TABLES = "בין שתי טבלאות"  # the tag a context part has when it lies between two tables (``tools._BETWEEN_TABLES``)
 SCOPE_PHRASE_WORDS = (2, 16)  # the words a scope phrase has: a phrase, not one word and not a paragraph
 SCOPE_PHRASE_CHARS = 160
 MSG_SCOPE_ADDED = "היקף הערך לפי המקור: {phrase}"
@@ -3773,7 +3789,14 @@ class ContextPart(NamedTuple):
 def source_context(text: str, tabular: bool) -> tuple[list[ContextPart], list[str]]:
     """The context parts of a source's text and the lines left (its body: the rows of a table, the sentences of a passage). A table
     read's text has the heading path line, the part lines (``[אחרי הטבלה · … · בלוק 12] text``), the caption lines before its rows and
-    the notes after them; a passage has none of these. Read by position and by the server's own labels, never by a phrase."""
+    the notes after them; a passage has none of these. Read by position and by the server's own labels, never by a phrase.
+    A function of its arguments alone, kept per text (``_source_context``); the lists are the caller's own."""
+    parts, body = _source_context(text, tabular)
+    return list(parts), list(body)
+
+
+@functools.lru_cache(maxsize=256)
+def _source_context(text: str, tabular: bool) -> tuple[tuple[ContextPart, ...], tuple[str, ...]]:
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
     rows = [i for i, ln in enumerate(lines) if _ROW_LINE.search(ln)]
     first, last = (rows[0], rows[-1]) if rows else (-1, -1)
@@ -3784,7 +3807,7 @@ def source_context(text: str, tabular: bool) -> tuple[list[ContextPart], list[st
             parts += [ContextPart("heading", h.strip()) for h in ln[len(TABLE_PATH_PREFIX):].split("›") if h.strip()]
         elif m := _PART_LINE.match(ln):
             parts.append(ContextPart("before" if m["side"] == TABLE_BEFORE else "after", m["text"].strip(),
-                                     BETWEEN_TABLES in m["mid"]))
+                                     TABLE_BETWEEN in m["mid"]))
         elif ln.startswith((f"[{TABLE_BEFORE}", f"[{TABLE_AFTER}")):
             continue  # a pointer to a part returned before, or the line that says what follows the table: no text of its own
         elif tabular and ln.startswith(TABLE_SIZE_PREFIX):
@@ -3793,14 +3816,17 @@ def source_context(text: str, tabular: bool) -> tuple[list[ContextPart], list[st
             parts.append(ContextPart("caption" if i < first else "note", ln))
         else:
             body.append(ln)
-    return parts, body
+    return tuple(parts), tuple(body)
+
+
+def _is_tabular(src: Source) -> bool:
+    return src.kind == "table" or any(ln.lstrip().startswith(TABLE_SIZE_PREFIX) for ln in (src.text or "").splitlines())
 
 
 def context_of_source(src: Source) -> tuple[list[ContextPart], list[str]]:
     """``source_context`` of a source, with the section of a passage as its heading."""
     text = src.text or ""
-    tabular = src.kind == "table" or any(ln.lstrip().startswith(TABLE_SIZE_PREFIX) for ln in text.splitlines())
-    parts, body = source_context(text, tabular)
+    parts, body = source_context(text, _is_tabular(src))
     section = _norm(src.section or "")
     if section and not any(p.place == "heading" and p.text == section for p in parts):
         parts.insert(0, ContextPart("heading", section))
@@ -3820,8 +3846,15 @@ def _cited_sources(u: Unit, ws: Workspace) -> list[tuple[str, Source]]:
     return list(out.items())
 
 
-def _body_numbers(src: Source) -> set[str]:
-    return numbers_in(without_part_tags("\n".join(context_of_source(src)[1])))
+def _body_numbers(src: Source) -> frozenset[str]:
+    return _text_body_numbers(src.text or "", _is_tabular(src))
+
+
+@functools.lru_cache(maxsize=256)
+def _text_body_numbers(text: str, tabular: bool) -> frozenset[str]:
+    """The numbers a source's body states (its rows or sentences, not its context): a function of its text and whether it is read as
+    tabular (the source's section never reaches the body), kept per text."""
+    return frozenset(numbers_in(without_part_tags("\n".join(_source_context(text, tabular)[1]))))
 
 
 def _value_sources(u: Unit, ws: Workspace) -> list[tuple[str, Source]]:
@@ -3915,9 +3948,20 @@ def context_qualifiers(u: Unit, ws: Workspace) -> meaning.Qualifiers:
     return found
 
 
+def _attested_qualifiers(u: Unit, ws: Workspace, forms: frozenset) -> tuple[list, meaning.Qualifiers]:
+    """The occurrences of the number (with the ``forms`` ``meaning.attached`` read for it) in the cited sources, and the
+    qualifiers those sources attest for it: what they state on the occurrences, in their words around them, and generally."""
+    occurrences, general = meaning._evidence(u, ws, forms)
+    attested = meaning.Qualifiers().merge(general)
+    for o in occurrences:
+        attested.merge(o.qualifiers).merge(meaning._all(o.context, rates=False))
+    return occurrences, attested
+
+
 def _stated_in_context(u: Unit, ws: Workspace, problem: meaning.MeaningProblem) -> bool:
     """Whether the basis or period a blocking meaning problem names is stated by the context of a cited source (``context_qualifiers``):
-    the answer then writes what the source says, and the qualifier is neither cut nor a reason to remove (R10)."""
+    the answer then writes what the source says, and the qualifier is neither cut nor a reason to remove (R10). Only when the number's
+    own evidence is silent on that kind: when it attests another value (a row per year, an answer per month) nothing is waived."""
     if problem.kind not in ("basis", "period"):
         return False
     context = context_qualifiers(u, ws)
@@ -3928,18 +3972,17 @@ def _stated_in_context(u: Unit, ws: Workspace, problem: meaning.MeaningProblem) 
     for forms, pos, claimed in entries:
         if not forms or _NUM_AT.match(text, pos).group(0) != problem.number:
             continue
-        occurrences, general = meaning._evidence(u, ws, frozenset(forms))
-        attested = meaning.Qualifiers().merge(general)
-        for o in occurrences:
-            attested.merge(o.qualifiers).merge(meaning._all(o.context, rates=False))
-        extra = claimed.keys(problem.kind) - attested.keys(problem.kind)
+        _, attested = _attested_qualifiers(u, ws, frozenset(forms))
+        if attested.keys(problem.kind):
+            return False  # the number's own evidence states another value of this kind: the context cannot waive it
+        extra = claimed.keys(problem.kind)
         return bool(extra) and extra <= context.keys(problem.kind)
     return False
 
 
 def check_meaning(u: Unit, ws: Workspace, fetcher: meaning.Fetcher | None = None) -> list[meaning.MeaningProblem]:
     """``meaning.check`` without the blocking problems of a basis or period the cited source's context states (``_stated_in_context``)."""
-    problems = meaning.check(u, ws, fetcher) if fetcher is not None else meaning.check(u, ws)
+    problems = meaning.check(u, ws, fetcher)
     return [m for m in problems if not (m.blocking and _stated_in_context(u, ws, m))]
 
 
@@ -3998,18 +4041,18 @@ def _silent_qualifier_spans(u: Unit, ws: Workspace, text: str, entries: list, pr
     when the source states a different one (the existing correction or removal path), or a span is not found."""
     out: list[tuple[int, int, str, str]] = []
     kind = problem.kind
+    context: meaning.Qualifiers | None = None  # what the cited sources' context states, read once and only when an entry needs it
     for forms, pos, claimed in entries:
         written = _NUM_AT.match(text, pos).group(0)
         if (written != problem.number or not forms or not_an_amount(text, pos, pos + len(written))
                 or any(a <= pos < b for a, b in absent)):
             continue
-        occurrences, general = meaning._evidence(u, ws, frozenset(forms))
+        occurrences, attested = _attested_qualifiers(u, ws, frozenset(forms))
         if not occurrences:
             continue
-        attested = meaning.Qualifiers().merge(general)
-        for o in occurrences:
-            attested.merge(o.qualifiers).merge(meaning._all(o.context, rates=False))
-        attested.merge(context_qualifiers(u, ws))  # what the source's heading, caption, notes and adjacent blocks state (R10)
+        if context is None:
+            context = context_qualifiers(u, ws)
+        attested.merge(context)  # what the source's heading, caption, notes and adjacent blocks state (R10)
         extra = sorted(claimed.keys(kind) - attested.keys(kind))
         if not extra:
             continue
@@ -5297,6 +5340,19 @@ def _relevance(wanted: list[str], segs: tuple[Segment, ...]) -> int:
     return best + 3 * len(seen_nums) + len(seen_words)
 
 
+def _passage_eligible(sid: str, src, asked: set, documents: set, professional: bool, opened: set,
+                      shown: Collection[str] = ()) -> bool:
+    """Whether a returned source may be a passage a requirements call is shown (``_read_passages``) or part of the evidence its
+    scores are stamped with (``_Evidence.pool``): a non-appraisal source only for a professional or mixed question, a source of
+    a file with unit marks only in an asked unit, and a source only found by a search also only in a document the answer is about
+    (an opened one as before; one the call cites -- ``shown`` -- is about the answer by being cited)."""
+    if src.source_kind != source_kinds.APPRAISAL and not professional:
+        return False
+    if src.unit is not None and src.unit.get("id") not in asked:
+        return False
+    return sid in opened or sid in shown or str(src.document_id) in documents
+
+
 def _read_passages(coverage: _Coverage, ws: Workspace, shown: dict[str, tuple[str, bool]]) -> str:
     """The ``<read_passages>`` block of a requirements call (round 16 U1, KTD1, R1, R3; follow-up): the text of the sources the
     turn returned to the agent in the asked units, cited or not and opened or only found by a search, so the judge scores a
@@ -5326,11 +5382,7 @@ def _read_passages(coverage: _Coverage, ws: Workspace, shown: dict[str, tuple[st
     seen: set[tuple[str, str]] = set()
     for sid in order:
         src = ws.sources[sid]
-        if src.source_kind != source_kinds.APPRAISAL and not professional:
-            continue
-        if src.unit is not None and src.unit.get("id") not in asked:
-            continue
-        if sid not in opened and sid not in shown and str(src.document_id) not in documents:
+        if not _passage_eligible(sid, src, asked, documents, professional, opened, shown):
             continue
         if src.text in whole or (str(src.version_id), src.text) in seen:
             continue
@@ -5420,7 +5472,7 @@ def _carried(votes: list[JudgeRequirement]) -> list[JudgeRequirement]:
         if v._trace is not None:
             c._trace = {**v._trace, "reused": True, "call": None, "support": [dict(e) for e in v._trace["support"]]}
         if v._stamp is not None:
-            c._stamp = {**v._stamp, "origin": "carried"}
+            c._stamp = {**v._stamp, "origin": CARRIED}
         out.append(c)
     return out
 
@@ -5433,12 +5485,19 @@ def refused_by_evidence(refused: list[tuple[JudgeRequirement, str]]) -> bool:
 def _answer_digest(units: list[Unit], keys: dict[int, str], coverage: _Coverage, ws: Workspace) -> str:
     """The answer version's digest (round 17 U1, KTD1): the ordered unit keys of the whole answer and the workspace signature of
     the read evidence (the workspace listing the calls are shown, and the content of every source the turn returned)."""
-    read = sorted((sid, _sha(ws.sources[sid].text)[:12]) for sid in returned_text_sources(ws))
+    read = sorted((sid, _text_digest(ws.sources[sid].text)) for sid in returned_text_sources(ws))
     return _sha([[keys[u.index] for u in units], _sha(coverage.workspace), read])
 
 
 def _sha(value) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, default=str).encode()).hexdigest()[:16]
+
+
+@functools.lru_cache(maxsize=512)
+def _text_digest(text: str | None) -> str:
+    """``_sha(text)[:12]``: the digest a source's text is signed by, kept per text (the texts of a turn's sources are hashed again
+    for every answer version and every component)."""
+    return _sha(text)[:12]
 
 
 class _Evidence:
@@ -5472,13 +5531,11 @@ class _Evidence:
             self._pool = []
             for sid in sorted(returned_text_sources(ws), key=_sid_no):
                 src = ws.sources[sid]
-                if (src.source_kind != source_kinds.APPRAISAL and not professional) or (
-                        src.unit is not None and src.unit.get("id") not in asked) or (
-                        sid not in opened and str(src.document_id) not in documents):
+                if not _passage_eligible(sid, src, asked, documents, professional, opened):
                     continue
                 parts = _source_parts(ws, sid)
                 if parts is not None:
-                    self._pool.append((sid, _sha(src.text)[:12], segments_of(parts[1], parts[2])))
+                    self._pool.append((sid, _text_digest(src.text), segments_of(parts[1], parts[2])))
         return self._pool
 
     def signature(self, cid: str, related: list[str] | tuple[str, ...] = ()) -> dict:
@@ -5491,13 +5548,13 @@ class _Evidence:
     def _sign(self, cid: str, related: list[str] | tuple[str, ...]) -> dict:
         text = self.texts.get(cid, "")
         seen = [(sid, digest) for sid, digest, segs in self.pool() if _relevance([text], segs) > 0]
-        named = [(x, _sha(self.ws.sources[x].text)[:12] if x in self.ws.sources else "") for x in dict.fromkeys(related)]
+        named = [(x, _text_digest(self.ws.sources[x].text) if x in self.ws.sources else "") for x in dict.fromkeys(related)]
         return {"passages": _sha([seen, named]), "items": _sha(sorted(self._items.get(cid, ()))),
                 "ids": [x for x, _ in [*seen, *named]][:TRACE_PASSAGE_IDS]}
 
     def stamp(self, vote: JudgeRequirement, version: int, digest: str) -> None:
         """Stamp a score this round's call made with the answer version it scored and what its call could see."""
-        vote._stamp = {**(vote._stamp or {}), "version": version, "digest": digest, "origin": "fresh",
+        vote._stamp = {**(vote._stamp or {}), "version": version, "digest": digest, "origin": FRESH,
                        **self.signature(vote.id, vote.related)}
 
     def refusal(self, vote: JudgeRequirement, *, items: bool = True) -> str | None:
@@ -5640,7 +5697,7 @@ def _item_ledger_block(items: list[dict]) -> str:
         by_component.setdefault(i["component"], []).append(i)
     blocks = []
     for cid, mine in by_component.items():
-        shown = {i["id"] for i in sorted(mine, key=lambda i: i["state"] == "covered")[:ITEMS_PER_COMPONENT]}
+        shown = {i["id"] for i in sorted(mine, key=lambda i: i["state"] == ITEM_COVERED)[:ITEMS_PER_COMPONENT]}
         lines = []
         for i in mine:
             if i["id"] not in shown:
@@ -6426,7 +6483,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         valid = item_ledger.validate(getattr(answer, "items", None) or [], ws, stand, requirements.items, ledger)
         ledger.merge(valid.kept, excluded=valid.excluded, version=item_version)
         report.item_ledger, report.item_ws = ledger, ws
-        coverage.items = report.item_listing({u.index for u in stand})
+        coverage.items = report.item_listing({u.index for u in stand}, {r["id"]: r["text"] for r in requirements.items})
     # a missing qualifier does not keep the unit from the judge: it is annotated only if the unit is supported
     for u in units:
         if u.index in failed:
@@ -6518,9 +6575,10 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         for v in votes:
             if v._stamp is None or "version" not in v._stamp:
                 evidence.stamp(v, report.version, report.digest)
+        component_ids = {r["id"] for r in requirements.items}
         for v, why in refused:
-            if v.id in {r["id"] for r in requirements.items}:
-                report.refused.setdefault(v.id, []).append(report._score_row(v) | {"origin": "carried", "why": why})
+            if v.id in component_ids:
+                report.refused.setdefault(v.id, []).append(report._score_row(v) | {"origin": CARRIED, "why": why})
     if cache is not None:
         cache.last = _Round([keys[u.index] for u in units], list(votes), signature)
     if to_judge:
@@ -7340,6 +7398,15 @@ def _in_answer(quote: str, units: list[Unit], component: str = "") -> bool:
     return any(nums <= n and len(words & w) >= need for n, w in map(claim_terms, [u.text for u in units]))
 
 
+# the states of a ledger item (``app.chat.items``): what the agent declares, and ``omitted`` / ``covered``, which the server assigns
+ITEM_INCLUDED, ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE = "included", "not_verifiable", "not_applicable"
+ITEM_OMITTED, ITEM_COVERED = "omitted", "covered"
+# who put an item in the ledger: the answering agent, or the server from the judge's validated support
+ORIGIN_AGENT, ORIGIN_JUDGE_SUPPORT = "agent", "judge_support"
+# whether a score was cast by this round's call or carried from an earlier round of the turn (a score's ``_stamp["origin"]``)
+FRESH, CARRIED = "fresh", "carried"
+
+
 class SupportScope:
     """Where a quoted part of a read passage may come from to count as evidence of a part the answer gives or omits (round 16 U2,
     KTD2): a source returned to the agent with text, a quote of a sensible length, a document the answer is about, a block in an
@@ -7357,7 +7424,7 @@ class SupportScope:
     @staticmethod
     def flat(quote: str) -> str:
         """A quote in the spelling of the verbatim test (the look-alike angle brackets read back, ``_flat_quote``)."""
-        return _flat_quote(_read_back(quote))
+        return _flat_quote(quote)
 
     def source_problem(self, sid: str, flat: str) -> str | None:
         """Why ``sid`` with the quote ``flat`` (``_flat_quote``) cannot be evidence, from what needs no reading of the source."""

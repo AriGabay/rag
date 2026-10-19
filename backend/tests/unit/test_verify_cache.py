@@ -341,7 +341,7 @@ def test_an_answer_whose_only_problem_is_a_missing_qualifier_gets_no_repair_roun
     out = _turn(agent, "מה השווי למ\"ר בצאלון 7?")
     assert len(agent.seen) == 2 and len(_verify_inputs(agent)) == 1
     assert "14,250 ₪ (מ״ר אקוו׳, כפי שנכתב במקור) [S1]" in out.answer.answer_markdown
-    assert out.report.counts()["annotated"] == 1
+    assert out.report.counts()["annotated"] == 1 and out.report.counts()["scoped"] == 0
 
 
 @pytest.mark.parametrize("defect, steps", [("none", 2), ("formula", 4)])  # 4: a repair, then a rewrite

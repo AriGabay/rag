@@ -285,7 +285,10 @@ def public_verification(v: dict) -> dict:
             "conditional": v.get("conditional", 0)} | (
         # the claims whose unsupported qualifier the server edited out of a number the sources back (round 13 U12, R17,
         # KTD14): an edit, not a removal; counts stored before it have none
-        {"edited": v["edited"]} if type(v.get("edited")) is int else {}) | {
+        {"edited": v["edited"]} if type(v.get("edited")) is int else {}) | (
+        # the values whose scope the server wrote next to them from the source, or whose scope it said was not verified (round 17
+        # U5): counted apart from ``annotated`` (a qualifier written as the source wrote it); none on older answers
+        {"scoped": v["scoped"]} if type(v.get("scoped")) is int else {}) | {
         # claim correctness and answer completeness, shown apart (answers stored before them have neither)
         k: v[k] for k in ("correctness", "completeness") if k in v} | (
         # each removal's kind, component and the server's fixed sentence, rebuilt here from the kind (KTD5)
@@ -1192,14 +1195,17 @@ def _diagnostics(outcome: engine.TurnOutcome, payload: dict, removals: _Removals
     # the timing, in the resolution's jsonb, served apart by ``get_diagnostics``; no key when no round scored a component
     trace = {"requirements_trace": outcome.requirements_trace} if outcome.requirements_trace else {}
     # the quote prefixes are document text: the documents they come from are behind the message too, as the removals' are
-    checked |= {str(src.document_id) for rnd in outcome.requirements_trace for c in rnd["components"] for v in c["votes"]
-                for x in v["support"] if (src := outcome.workspace.sources.get(x["id"])) is not None and src.document_id}
+    def documents_of(source_ids) -> set[str]:
+        return {str(src.document_id) for sid in source_ids
+                if (src := outcome.workspace.sources.get(sid)) is not None and src.document_id}
+
+    checked |= documents_of(x["id"] for rnd in outcome.requirements_trace for c in rnd["components"] for v in c["votes"]
+                            for x in v["support"])
     # the item ledger (round 17 U3): items and the quote prefixes of the ones validation excluded are document text too, so the
     # documents of both are behind the message like the support quotes' are
     item_ledger = {"item_ledger": outcome.item_ledger} if outcome.item_ledger else {}
     checked |= {str(i["document_id"]) for i in outcome.item_ledger.get("items", []) if i.get("document_id")}
-    checked |= {str(src.document_id) for e in outcome.item_ledger.get("excluded", [])
-                if (src := outcome.workspace.sources.get(e.get("source"))) is not None and src.document_id}
+    checked |= documents_of(e.get("source") for e in outcome.item_ledger.get("excluded", []))
     return {"rounds": outcome.rounds, "removed": removed,
             "resolution": (resolution or {}) | {"timing": timing} | registrations | trace | item_ledger,
             "document_ids": _answer_documents(payload) | found | checked,

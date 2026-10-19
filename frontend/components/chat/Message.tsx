@@ -1059,7 +1059,7 @@ function AnswerDetails({
   const verification = answer.verification;
   const actions = verification?.actions;
   const changed = verification
-    ? verification.removed + verification.partial + verification.annotated + (actions ? sum(actions) : 0)
+    ? verification.removed + verification.partial + verification.annotated + (verification.scoped ?? 0) + (actions ? sum(actions) : 0)
     : 0;
   const partials = useMemo(
     () => [...(verification?.partials ?? [])].sort((a, b) => a.ordinal - b.ordinal),
@@ -1176,6 +1176,9 @@ function AnswerDetails({
             )}
             {verification.annotated > 0 && (
               <li>ל-{verification.annotated} נתונים נוסף ליד המספר תיאור שנכתב במקור (מסומן «כפי שנכתב במקור»).</li>
+            )}
+            {(verification.scoped ?? 0) > 0 && (
+              <li>ל-{verification.scoped} נתונים נוסף ליד המספר היקף הערך לפי המקור, או הערה שההיקף לא אומת.</li>
             )}
           </ul>
           {((verification.removals && verification.removals.length > 0) ||

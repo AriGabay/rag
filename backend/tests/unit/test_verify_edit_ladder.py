@@ -13,8 +13,8 @@ import uuid
 import pytest
 
 from app.chat import coverage, final_check, verify
-from app.chat.evidence import TABLE_AFTER, TABLE_BEFORE, TABLE_PATH_PREFIX
-from app.chat.tools import _BETWEEN_TABLES, Workspace
+from app.chat.evidence import TABLE_AFTER, TABLE_BEFORE, TABLE_BETWEEN, TABLE_PATH_PREFIX
+from app.chat.tools import Workspace
 from app.chat.verify import Expansion, TurnRequirements, split_units, verify_answer
 from app.providers.llm import Purpose
 from tests.support.scripted_provider import ScriptedProvider
@@ -571,7 +571,7 @@ def _table(*, heading: str = "5. ניתוח רגישות לשיעור ההיוו
     lines = [f"{TABLE_PATH_PREFIX} {heading}"] if heading else []
     lines += [f"[{TABLE_BEFORE} · פסקה · בלוק 40] {before}"] if before else []
     lines += [caption, "הטבלה: 3 שורות", rows, *notes]
-    mid = f" · {_BETWEEN_TABLES}" if between else ""
+    mid = f" · {TABLE_BETWEEN}" if between else ""
     lines += [f"[{TABLE_AFTER}{mid} · פסקה · בלוק 47] {after}"] if after else []
     return "\n".join(lines)
 
@@ -617,7 +617,8 @@ def test_ae5_a_table_value_written_as_the_total_gets_the_scope_its_following_par
     first = out.doc.text.split("\n")[0]
     assert first == f"בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪ {SCOPE_ADDED} [S1]."  # the sentence stays; the value is unchanged
     assert _span_kinds(out) == ["qualifier"]
-    assert r.counts()["annotated"] == 1 and [row.action for row in r.logged()] == ["qualified"]
+    # a scope written from the source is counted in ``scoped``; ``annotated`` stays the qualifiers written as the source wrote them
+    assert r.counts()["annotated"] == 0 and r.counts()["scoped"] == 1 and [row.action for row in r.logged()] == ["qualified"]
 
 
 def test_the_scope_is_written_with_its_citation_when_the_sentence_cites_the_value_not_the_table():
@@ -671,6 +672,7 @@ def test_a_scope_phrase_from_another_tables_note_is_rejected_and_the_value_keeps
     out = r.edit(a)
     assert SCOPE not in out.doc.text and _span_kinds(out) == ["scope_note"]
     assert f"(היקף הערך במקור לא אומת; הערך נקרא ב-S2 ({SCOPE_WHERE}))" in out.doc.text.split("\n")[0]
+    assert r.counts()["annotated"] == 0 and r.counts()["scoped"] == 1  # the note that the scope was not verified is a scope count too
     # the same offer for the table it belongs to is accepted
     a1, r1 = _scoped(SCOPE_UNIT, ws, _scope_judge())
     assert SCOPE_ADDED in r1.edit(a1).doc.text
@@ -745,7 +747,7 @@ def test_the_judge_policy_and_schema_carry_the_scope_defect():
 
 
 def test_the_between_tables_tag_is_the_one_the_table_read_writes():
-    assert verify.BETWEEN_TABLES == _BETWEEN_TABLES
+    assert verify.TABLE_BETWEEN == TABLE_BETWEEN
 
 
 def test_the_context_of_a_table_read_is_parsed_by_position_and_by_the_servers_labels():
@@ -803,6 +805,19 @@ def test_a_period_the_context_does_not_state_is_still_edited_out_as_before():
 def test_a_period_the_context_states_as_another_one_keeps_the_removal_path():
     a, r = _scoped(RENT_UNIT, _rent_ws(after="כל הסכומים בטבלה הם לשנה."), _judge(lambda t: "supported"))
     assert r.removed_units() == {0} and r.counts()["edited"] == 0
+
+
+def test_a_period_the_number_own_row_states_as_another_one_is_not_waived_by_the_context_mentioning_the_claimed_one():
+    """The row says per year; a trailing paragraph mentions a monthly figure elsewhere. The answer's per-month claim for the
+    5,000 is contradicted by the number's own evidence, so the context must not waive it (it keeps the removal path)."""
+    rows = "סוג | שכר דירה\nמשרדים | 5,000 ₪ לשנה"
+    a, r = _scoped(RENT_UNIT, _tables(_table(rows=rows, caption="שכר הדירה בנכס",
+                                             after="שכר הדירה החודשי של יחידות אחרות נמוך יותר ומפורט בנספח ג.")),
+                   _judge(lambda t: "supported"))
+    assert r.removed_units() == {0} and r.qualifier_edits == {}
+    # the intended case stays waived: the row is silent on the period and the context states it
+    a, r = _scoped(RENT_UNIT, _rent_ws(after="כל הסכומים בטבלה הם לחודש."), _judge(lambda t: "supported"))
+    assert r.removed_units() == set() and r.qualifier_edits == {} and r.apply(a).answer_markdown == RENT_UNIT
 
 
 def test_a_basis_the_sources_context_states_is_never_cut():

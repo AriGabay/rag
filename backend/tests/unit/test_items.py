@@ -190,7 +190,18 @@ def test_a_source_given_as_a_value_or_a_table_handle_is_resolved_to_the_text_it_
 # --- coverage by attribution (R5) --------------------------------------------------------------------------------------------
 
 def _covered(ws: Workspace, markdown: str, item: items.Item | None = None, siblings=()) -> items.Coverage:
-    return items.covered(item or _item(), _units(markdown), ws, siblings=siblings)
+    """The coverage ``Ledger.outcomes`` (the path that ships) decides for ``item``, held by a ledger with its ``siblings``."""
+    item = item or _item()
+    ledger = items.Ledger()
+    ledger.merge([item, *(s for s in siblings if s.key != item.key)])
+    got = ledger.outcomes(_units(markdown), ws)[0]
+    return items.Coverage(got["state"] == items.COVERED, got["covered_by"], got["why"])
+
+
+def _open(ledger: items.Ledger, markdown: str, ws: Workspace) -> list[items.Item]:
+    """The items of the ledger still omitted against these surviving units."""
+    state = {o["id"]: o["state"] for o in ledger.outcomes(_units(markdown), ws)}
+    return [i for i in ledger.items.values() if state[i.id] == items.OMITTED]
 
 
 def test_an_item_stated_by_a_unit_citing_its_own_source_is_covered():
@@ -331,7 +342,7 @@ def test_a_judge_support_item_omitted_in_version_one_and_not_listed_in_version_t
     markdown = "ההתאמה לקומה היא 3% [S1]."
     v2 = ledger.merge(_validate(ws, markdown, agent, ledger=ledger).kept)
     assert len(v2) == 2 and len(ledger.items) == 2
-    open_items = ledger.open_items(_units(markdown), ws)
+    open_items = _open(ledger, markdown, ws)
     assert [i.origin for i in open_items] == ["judge_support"] and open_items[0].quote == "גיל הבניין | 2%"
 
 
@@ -339,8 +350,8 @@ def test_an_item_leaves_the_open_set_when_a_surviving_unit_covers_it():
     ws = _ws(ADJUSTMENTS)
     ledger = items.Ledger()
     ledger.merge([items.support_item("N1", "S1", "גיל הבניין | 2%", ledger, label="ההתאמה לגיל הבניין", value="2%")])
-    assert len(ledger.open_items(_units("ההתאמה לקומה היא 3% [S1]."), ws)) == 1
-    assert ledger.open_items(_units("ההתאמה לגיל הבניין היא 2% [S1]."), ws) == []
+    assert len(_open(ledger, "ההתאמה לקומה היא 3% [S1].", ws)) == 1
+    assert _open(ledger, "ההתאמה לגיל הבניין היא 2% [S1].", ws) == []
 
 
 def test_an_item_leaves_the_open_set_when_a_later_version_states_it_not_verifiable_with_a_reason():
@@ -349,11 +360,11 @@ def test_an_item_leaves_the_open_set_when_a_later_version_states_it_not_verifiab
     judged = items.support_item("N1", "S1", "גיל הבניין | 2%", ledger)
     ledger.merge([judged])
     markdown = "ההתאמה לקומה היא 3% [S1]."
-    assert len(ledger.open_items(_units(markdown), ws)) == 1
+    assert len(_open(ledger, markdown, ws)) == 1
     later = _validate(ws, markdown, _raw(state="not_verifiable", reason="המקור נקרא בקריאה לא ודאית"), ledger=ledger)
     ledger.merge(later.kept)
     assert len(ledger.items) == 1  # the same key (component, source, quote): one item, its state updated
-    assert ledger.open_items(_units(markdown), ws) == []
+    assert _open(ledger, markdown, ws) == []
     assert [o["state"] for o in ledger.outcomes(_units(markdown), ws)] == ["not_verifiable"]
 
 
@@ -364,7 +375,7 @@ def test_a_later_version_that_lists_the_item_without_a_reason_does_not_close_it(
     markdown = "ההתאמה לקומה היא 3% [S1]."
     bad = _validate(ws, markdown, _raw(state="not_applicable", reason=""), ledger=ledger)
     ledger.merge(bad.kept)
-    assert len(ledger.open_items(_units(markdown), ws)) == 1
+    assert len(_open(ledger, markdown, ws)) == 1
     assert [e["reason"] for e in bad.excluded] == ["no_reason"]
 
 
@@ -379,22 +390,21 @@ def test_an_included_item_no_surviving_unit_covers_is_reported_as_omitted_and_a_
     assert out["קומה | 3%"]["state"] == "covered" and out["קומה | 3%"]["covered_by"] == 0
 
 
-def test_the_ledger_records_what_was_excluded_in_its_diagnostics():
+def test_the_ledger_records_what_was_excluded():
     ws = _ws(ADJUSTMENTS)
     ledger = items.Ledger()
     res = _validate(ws, "ההתאמה לגיל הבניין היא 2% [S1].", _raw(), _raw(source="S9"), ledger=ledger)
     ledger.merge(res.kept, excluded=res.excluded, version=2)
-    diag = ledger.diagnostics()
-    assert [i["id"] for i in diag["items"]] == ["I1"]
-    assert diag["excluded"] == [{"version": 2, "component": "N1", "source": "S9", "quote": "גיל הבניין | 2%",
-                                 "state": "included", "reason": "not_returned_source"}]
+    assert [i.id for i in ledger.items.values()] == ["I1"]
+    assert ledger.excluded == [{"version": 2, "component": "N1", "source": "S9", "quote": "גיל הבניין | 2%",
+                                "state": "included", "reason": "not_returned_source"}]
 
 
 def test_an_empty_ledger_for_a_single_fact_component_changes_nothing():
     ws = _ws(ADJUSTMENTS)
     ledger = items.Ledger()
     assert items.validate([], ws, _units("השווי הוא 9,500 ₪ [S1]."), COMPONENTS, ledger=ledger).kept == []
-    assert ledger.merge([]) == [] and ledger.open_items(_units("השווי הוא 9,500 ₪ [S1]."), ws) == []
+    assert ledger.merge([]) == [] and _open(ledger, "השווי הוא 9,500 ₪ [S1].", ws) == []
     assert ledger.outcomes(_units("השווי הוא 9,500 ₪ [S1]."), ws) == []
 
 

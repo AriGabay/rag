@@ -189,6 +189,7 @@ class _Final:
                       "unjudged_kept": 0, "unavailable": False}
         self.drafts = {d.index: d for d in report.units}
         self.draft_starts = [d.start for d in report.units]
+        self._evidence: _Evidence | None = None
 
     # --- composing and splitting ------------------------------------------------------------------------------------
 
@@ -364,6 +365,13 @@ class _Final:
 
         return words("".join(left)) == words(f.text)
 
+    def evidence(self) -> _Evidence:
+        """What the requirements calls could see (``_Evidence``), built once for the whole check: the workspace's sources, the
+        components and the answer's ids do not change while the check runs, so the passages and the signatures stay what they were."""
+        if self._evidence is None:
+            self._evidence = _Evidence(self.ws, self.report.requirements, self.report.answer_ids)
+        return self._evidence
+
     def stale_units(self) -> set[int]:
         """The draft units that gave a score whose component's evidence changed since it was cast (round 17 U1, KTD1): the same
         admission rule the verification applies to a carried score. The final check compares the read passages (the ledger is
@@ -371,7 +379,7 @@ class _Final:
         again over its own units, as in ``VerdictCache.reuse``."""
         if not (self.turn.derived and self.report.requirements and self.report.requirement_votes):
             return set()
-        evidence = _Evidence(self.ws, self.report.requirements, self.report.answer_ids)
+        evidence = self.evidence()
         return {i for votes in self.report.requirement_votes.values() for v in votes
                 if evidence.refusal(v, items=False) for i in (*v.units, *v.absent)}
 
@@ -422,7 +430,7 @@ class _Final:
         mapped = [v.model_copy(update={"units": [to_draft[i] for i in v.units if to_draft.get(i, -1) >= 0],
                                        "absent": [to_draft[i] for i in v.absent if to_draft.get(i, -1) >= 0]})
                   for v in scored]
-        evidence = _Evidence(self.ws, self.report.requirements, self.report.answer_ids)
+        evidence = self.evidence()
         for v in mapped:  # cast on the saved text of this version: stamped as the verification stamps its own
             stamp = v._stamp or {}
             evidence.stamp(v, self.report.version, self.report.digest)

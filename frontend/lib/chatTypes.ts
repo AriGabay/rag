@@ -472,6 +472,8 @@ export interface ChatVerification {
   removed: number;
   partial: number;
   annotated: number;
+  /** Values that got their scope from the source next to the number, or a note that the scope was not verified (round 17). Absent on older answers. */
+  scoped?: number;
   request_mismatch?: boolean;
   /** Absent on answers stored before claim correctness and completeness were reported apart. */
   correctness?: ChatCorrectness;

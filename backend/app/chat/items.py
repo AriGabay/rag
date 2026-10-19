@@ -28,19 +28,31 @@ from __future__ import annotations
 
 import functools
 import re
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple
 
 from app.answering.verify import numbers_in
 from app.chat.evidence import claim_terms
-from app.chat.verify import SUPPORT_QUOTE_MAX, SupportScope, Unit
+from app.chat.verify import (
+    ITEM_COVERED,
+    ITEM_INCLUDED,
+    ITEM_NOT_APPLICABLE,
+    ITEM_NOT_VERIFIABLE,
+    ITEM_OMITTED,
+    ORIGIN_AGENT,
+    ORIGIN_JUDGE_SUPPORT,
+    SUPPORT_QUOTE_MAX,
+    SupportScope,
+    Unit,
+)
 from app.platform import dates as shared_dates
 
-STATES = ("included", "not_verifiable", "not_applicable")  # what the agent declares
-OMITTED = "omitted"  # what the server assigns: a member the judge's support adds, and an included item no surviving unit covers
-COVERED = "covered"
-NEEDS_REASON = ("not_verifiable", "not_applicable")
+STATES = (ITEM_INCLUDED, ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE)  # what the agent declares
+OMITTED = ITEM_OMITTED  # what the server assigns: a member the judge's support adds, and an included item no surviving unit covers
+COVERED = ITEM_COVERED
+NEEDS_REASON = (ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE)
 # the order of the coverage checks: a failure is reported by the furthest check a unit reached
 _WHY_ORDER = ("not_attributed", "value_not_stated", "date_not_stated", "condition_not_stated")
 
@@ -58,9 +70,9 @@ class Item:
     quote: str
     value: str = ""
     condition: str = ""
-    state: str = "included"
+    state: str = ITEM_INCLUDED
     reason: str = ""
-    origin: str = "agent"
+    origin: str = ORIGIN_AGENT
     id: str = ""
     document_id: str = ""
     unit_id: str | None = None
@@ -159,8 +171,9 @@ def validate(raw: Iterable[object], ws, units: Sequence[Unit], components: Seque
                 why = scope.place_problem(src) or (None if scope.verbatim(sid, src, flat) else "not_verbatim")
             if why is None:
                 seen.add(key)
+                document_id, unit_id = _site_of(src)
                 item = Item(component, f["label"], sid, f["quote"], f["value"], f["condition"], f["state"], f["reason"],
-                            document_id=str(src.document_id), unit_id=(src.unit or {}).get("id"))
+                            document_id=document_id, unit_id=unit_id)
                 item.id = ledger.id_for(item.key) if ledger is not None else f"I{next(numbers)}"
                 kept.append(item)
                 continue
@@ -173,9 +186,9 @@ def support_item(component: str, source: str, quote: str, ledger: Ledger, *, lab
                  condition: str = "", ws=None) -> Item:
     """An item the server adds from the judge's validated support (round 16 U2): a member the answer omits, state ``omitted``,
     origin ``judge_support``. Its identity is the ledger's, so the agent listing the same part later is the same item."""
-    item = Item(component, label, source, quote, value, condition, OMITTED, "", "judge_support")
+    item = Item(component, label, source, quote, value, condition, OMITTED, "", ORIGIN_JUDGE_SUPPORT)
     if ws is not None and (src := ws.sources.get(source)) is not None:
-        item.document_id, item.unit_id = str(src.document_id), (src.unit or {}).get("id")
+        item.document_id, item.unit_id = _site_of(src)
     item.id = ledger.id_for(item.key)
     return item
 
@@ -187,10 +200,15 @@ def _flat_text(text: str) -> str:
     return SupportScope.flat(text)
 
 
+def _site_of(src) -> tuple[str, str | None]:
+    """(document, appraisal unit id) of a source as the item records them; the unit is None in a file without unit marks."""
+    return str(src.document_id), (src.unit or {}).get("id")
+
+
 def _place(ws, sid: str) -> tuple[str, str | None] | None:
-    """(document, appraisal unit id) of a source; the unit is None in a file without unit marks."""
+    """``_site_of`` the source ``sid``; None for a source the turn does not hold or one without a document."""
     src = ws.sources.get(sid)
-    return None if src is None or src.document_id is None else (str(src.document_id), (src.unit or {}).get("id"))
+    return None if src is None or src.document_id is None else _site_of(src)
 
 
 def _value_place(v) -> tuple[str, str | None]:
@@ -302,11 +320,9 @@ def _unit_covers(item: Item, unit: Unit, ws, shared: bool) -> str:
     return ""
 
 
-def covered(item: Item, units: Sequence[Unit], ws, siblings: Iterable[Item] = ()) -> Coverage:
-    """Whether a surviving unit of the answer gives the item (R5; see the module docstring). ``siblings``: the other items of the
-    ledger; those of the item's component that share its value (or label) make its condition words (else its label's) needed."""
-    sig = _signature(item)
-    shared = bool(sig) and any(s.component == item.component and s.key != item.key and _signature(s) == sig for s in siblings)
+def _coverage(item: Item, units: Sequence[Unit], ws, shared: bool) -> Coverage:
+    """Whether a surviving unit of the answer gives the item (R5; see the module docstring). ``shared``: another item of the item's
+    component has its signature (its value, or its label), which makes its condition words (else its label's) needed."""
     furthest = -1
     for unit in units:
         why = _unit_covers(item, unit, ws, shared)
@@ -340,31 +356,25 @@ class Ledger:
             old = self.items.get(item.key)
             if old is None:
                 self.items[item.key] = item
-            elif item.origin == "agent":
+            elif item.origin == ORIGIN_AGENT:
                 old.label, old.value, old.condition = item.label or old.label, item.value or old.value, item.condition or old.condition
                 old.state, old.reason = item.state, item.reason
         self.excluded += [{"version": version, **e} for e in excluded]
         return list(self.items.values())
 
-    def _siblings(self, item: Item) -> list[Item]:
-        return [i for i in self.items.values() if i.component == item.component]
-
     def outcomes(self, units: Sequence[Unit], ws) -> list[dict]:
         """Every item with its state against these surviving units: ``covered`` (a unit gives it), ``omitted`` (an included or
         judge-added item no unit gives), or the ``not_verifiable`` / ``not_applicable`` the agent declared with a reason."""
         out = []
+        # each item's signature is computed once, and the items of a component that share one are counted: an item's condition is
+        # asked when another item of its component has its signature (``_coverage``)
+        signatures = {id(i): _signature(i) for i in self.items.values()}
+        alike = Counter((i.component, signatures[id(i)]) for i in self.items.values())
         for item in self.items.values():
-            got = covered(item, units, ws, self._siblings(item)) if item.state in ("included", OMITTED) else None
+            sig = signatures[id(item)]
+            got = (_coverage(item, units, ws, bool(sig) and alike[(item.component, sig)] > 1)
+                   if item.state in (ITEM_INCLUDED, OMITTED) else None)
             state = item.state if got is None else (COVERED if got.ok else OMITTED)
             out.append({**item.public(), "state": state, "declared": item.state, "covered_by": got.unit if got else None,
                         "why": got.why if got else ""})
         return out
-
-    def open_items(self, units: Sequence[Unit], ws) -> list[Item]:
-        """The items still open: included or omitted, and given by no surviving unit."""
-        by_key = {o["id"]: o for o in self.outcomes(units, ws)}
-        return [i for i in self.items.values() if by_key[i.id]["state"] == OMITTED]
-
-    def diagnostics(self) -> dict:
-        """The ledger and what was excluded, for the turn's trace."""
-        return {"items": [i.public() for i in self.items.values()], "excluded": list(self.excluded)}

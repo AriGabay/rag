@@ -664,6 +664,7 @@ def units_continuing(units: Sequence, subjects: Sequence[int]) -> dict[int, int]
     unit with no title at all is a continuation whatever its kind. A front matter part opens the next report and ends the
     chain."""
     from app.chat.contexts import NON_SUBJECT_KINDS
+    from app.chat.units import FRONT_MATTER
 
     wanted = set(subjects)
     out: dict[int, int] = {}
@@ -672,7 +673,7 @@ def units_continuing(units: Sequence, subjects: Sequence[int]) -> dict[int, int]
             continue
         for nxt in units[i + 1:]:
             has_own = bool(nxt.aliases) or bool((nxt.identifiers or {}).get("shown"))
-            if nxt.unit_no in wanted or nxt.kind == "front_matter" or has_own or (
+            if nxt.unit_no in wanted or nxt.kind == FRONT_MATTER or has_own or (
                     nxt.title and nxt.kind not in NON_SUBJECT_KINDS):
                 break
             out[nxt.unit_no] = u.unit_no

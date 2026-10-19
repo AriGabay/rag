@@ -176,7 +176,7 @@ from app.chat import dates as chat_dates
 from app.chat import units as unit_store
 from app.chat import unread as unread_text
 from app.chat.contexts import MSG_NO_TITLE
-from app.chat.evidence import TABLE_AFTER, TABLE_BEFORE, TABLE_PATH_PREFIX, TABLE_SIZE_PREFIX
+from app.chat.evidence import TABLE_AFTER, TABLE_BEFORE, TABLE_BETWEEN, TABLE_PATH_PREFIX, TABLE_SIZE_PREFIX
 from app.chat.intent import MIXED, PROFESSIONAL
 from app.chat.property import (
     REASON_ADDRESS_CITY,
@@ -837,15 +837,19 @@ def _location(section: str | None, kind: str, page_list, block_start, block_end,
     return ", ".join(parts) or "המסמך"
 
 
-def _block_info(conn: Connection, version_id: UUID, start: int | None, end: int | None) -> tuple:
+def _block_info(conn: Connection, version_id: UUID, start: int | None, end: int | None, *, with_text: bool = False) -> tuple:
+    """(the paragraph numbers the blocks ``start``..``end`` span, their picture media, the blocks themselves). ``with_text``: the
+    blocks also carry ``block_index``, ``kind``, ``status`` and ``text`` (``_register_shown`` reads them from this one query, not
+    its own); without it the third part is the blocks' bare ``paragraph_no`` and ``media``."""
     if start is None:
-        return (None, None), None
+        return (None, None), None, []
     rows = conn.execute(text(
-        "SELECT paragraph_no, media FROM document_blocks WHERE version_id = :v AND block_index BETWEEN :a AND :b"
+        "SELECT paragraph_no, media" + (", block_index, kind, status, text" if with_text else "")
+        + " FROM document_blocks WHERE version_id = :v AND block_index BETWEEN :a AND :b"
         " ORDER BY block_index"), {"v": version_id, "a": start, "b": end if end is not None else start}).all()
     nums = [r.paragraph_no for r in rows if r.paragraph_no]
     media = next((r.media for r in rows if r.media), None)
-    return ((min(nums), max(nums)) if nums else (None, None)), media
+    return ((min(nums), max(nums)) if nums else (None, None)), media, rows
 
 
 @dataclass(frozen=True)
@@ -1026,8 +1030,9 @@ def _render_sources(sources: list[Source]) -> list[str]:
         elif s.document_id not in done:
             done.add(s.document_id)
             shared = {}
+            envs = [dict(_envelope(x)) for x in group]
             for name in DOCUMENT_ATTRS:
-                seen = [dict(_envelope(x)).get(name) for x in group]
+                seen = [env.get(name) for env in envs]
                 if seen[0] is not None and all(v == seen[0] for v in seen):
                     shared[name] = seen[0]
             head = "".join(f' {k}="{v}"' for k, v in shared.items())
@@ -3192,7 +3197,8 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                     if passage is None:
                         continue
                 held = [n for n in held if n in kept] or held
-            paragraphs, media = _block_info(conn, h["version_id"], bs, be)
+            paragraphs, media, blocks = _block_info(conn, h["version_id"], bs, be,
+                                                    with_text=h["kind"] not in ("table", "table_row"))
             tags = {"document": ws.doc_handle(h["document_id"])}
             if h.get("table_index") is not None:  # a matched row opens its whole table
                 tags["table"] = _table_handle(ws, h["document_id"], h["version_id"],
@@ -3218,7 +3224,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
             if call is not None:  # a hit of a gathered appraisal other than the focus says why it is the property's (U12b)
                 src.link = call.link_of(h["version_id"], uv.unit_no)
             out.append(ws.once(src, ("chunk", h["chunk_id"])))
-            _register_shown(ws, conn, src, h["kind"], passage, shown)
+            _register_shown(ws, src, h["kind"], passage, shown, blocks)
             # the document as a whole: a datum not found may be in a part of it that was not read
             ws.touch(h["document_id"], h["title"], "retrieved", gaps.get(h["version_id"], whole).partial)
     _register_call(ws, call, out)
@@ -3232,17 +3238,18 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
     return "\n\n".join([*notes, *_render_sources(out), *hints])
 
 
-def _register_shown(ws: Workspace, conn: Connection, src: Source, kind: str, passage: str, shown: str) -> None:
+def _register_shown(ws: Workspace, src: Source, kind: str, passage: str, shown: str, blocks) -> None:
     """Record in ``ws.sent`` the blocks a search hit displayed whole, so a later read sends only the blocks the turn has not
     returned (KTD6 item 2). Only a hit of paragraph text whose passage was shown as it is — not cut by the scoped window or
     the passage cap, not a reference to an earlier hit (``same_as``) — and only the blocks whose full text is in what was
-    shown. A table or table-row hit registers nothing: its text is rows and a caption, not the table block."""
+    shown. A table or table-row hit registers nothing: its text is rows and a caption, not the table block. ``blocks``: the
+    blocks of the hit's range, as ``_block_info(with_text=True)`` read them (one window of them, as a read would send)."""
     if (kind in ("table", "table_row") or src.same_as or src.block_start is None or src.block_end is None
             or shown != passage):
         return
     flat = _flat(shown)
     registered = ws.sent.setdefault(str(src.version_id), {})
-    for r in reader.blocks_between(conn, src.version_id, src.block_start, src.block_end):
+    for r in blocks[:reader.WINDOW_MAX]:
         if r.kind in ("heading", "paragraph", "textbox") and r.status == "read" and r.text and _flat(r.text) in flat:
             registered.setdefault(r.block_index, src.sid)
 
@@ -3354,12 +3361,12 @@ TABLE_CONTEXT_SCAN = 12  # the blocks read after a table to find its parts and w
 TABLE_FOLLOWS = 4  # the blocks after the parts that the "what follows" line names
 _BLOCK_KINDS = {"paragraph": "פסקה", "textbox": "תיבת טקסט", "heading": "כותרת", "table": "טבלה", "image": "תמונה"}
 _UNREAD_REGION = "אזור שלא נקרא"
-_BETWEEN_TABLES = "בין שתי טבלאות"
 MSG_TABLE_PART = "[{side}{between} · {kind} · בלוק {block}] {text}"
 MSG_TABLE_PART_SENT = "[{side}{between} · {kind} · בלוק {block}: כבר הוחזר ב-{sid}]"
 MSG_TABLE_FOLLOWS = "[אחרי הטבלה: {kinds} — להמשך הקריאה מהקטע הבא: read(cursor={cursor})]"
 MSG_TABLE_FOLLOWS_UNPLACED = "[אחרי הטבלה: {kinds}]"
 MSG_TABLE_NOTHING_AFTER = "[אחרי הטבלה: אין עוד קטעים ביחידה]"
+MSG_TABLE_AFTER_NOT_READ = "[אחרי הטבלה: הבלוקים שאחריה לא נקראו כאן]"  # the scan stopped before the unit's end: unknown, not empty
 # the status of a table read speaks of the table: it says nothing of the section the table is in (KTD6 item 1)
 TABLE_STATUS_LABELS = {"complete": "הטבלה נקראה במלואה (כל שורותיה, כותרותיה והערותיה); הסעיף שהיא בו לא נקרא בקריאה הזו",
                        "clipped": "נקרא חלק מהטבלה; יש המשך", "uncertain_reading": "הטבלה נקראה בקריאה לא ודאית"}
@@ -3379,13 +3386,16 @@ class TablePart(NamedTuple):
 @dataclass
 class TableContext:
     """What surrounds a table: its heading path, its parts, the blocks that follow the parts (kind, block) and where they
-    can be read on from (a section target and position), and the blocks of the table itself."""
+    can be read on from (a section target and position), and the blocks of the table itself. ``ended``: the scan after the table
+    reached the end of its unit (or of the document), so an empty ``follows`` means that nothing follows; else the blocks after
+    the scanned window were not read."""
 
     path: tuple[str, ...] = ()
     parts: list[TablePart] = field(default_factory=list)
     follows: list[tuple[str, int]] = field(default_factory=list)
     resume: tuple[tuple, tuple[int, int]] | None = None
     table_blocks: list[int] = field(default_factory=list)
+    ended: bool = False
 
 
 def _flat(s: str | None) -> str:
@@ -3431,8 +3441,13 @@ def _table_context(ws: Workspace, conn: Connection, v: reader.Version, table_ind
         ctx.table_blocks.append(rows[lead].block_index)
         lead += 1
     run, end = [], None  # the paragraphs after the table, and the block that ends them
+    # the window was not filled, or no block (of this unit) lies beyond it: nothing was left unscanned
+    ctx.ended = bool(rows) and (rows[-1].block_index < first + TABLE_CONTEXT_SCAN or not any(
+        inside(r.block_index) for r in reader.blocks_between(conn, v.version_id, rows[-1].block_index + 1,
+                                                             rows[-1].block_index + 1, limit=1)))
     for r in rows[lead:]:
         if not inside(r.block_index):
+            ctx.ended = True  # a block of another unit follows: this unit ended
             break
         if r.status == "decorative":
             continue
@@ -3463,7 +3478,7 @@ def _part_line(p: TablePart, sent: dict[int, str] | None = None) -> str:
     """A part as one line, with its kind and block reference; as a pointer to the source that returned it when ``sent``
     (the blocks the turn returned whole) holds it."""
     fields = {"side": TABLE_BEFORE if p.side == "before" else TABLE_AFTER,
-              "between": f" · {_BETWEEN_TABLES}" if p.between else "", "kind": _BLOCK_KINDS.get(p.kind, "קטע"),
+              "between": f" · {TABLE_BETWEEN}" if p.between else "", "kind": _BLOCK_KINDS.get(p.kind, "קטע"),
               "block": p.block_index}
     if sent is not None and p.block_index in sent:
         return MSG_TABLE_PART_SENT.format(sid=sent[p.block_index], **fields)
@@ -3483,7 +3498,7 @@ def _table_context_lines(ctx: TableContext, sent: dict[int, str] | None = None, 
 def _follows_line(ws: Workspace, v: reader.Version, ctx: TableContext) -> str:
     """The "what follows" pointer of a table read: the kinds and blocks after its parts, and the cursor that reads on."""
     if not ctx.follows:
-        return MSG_TABLE_NOTHING_AFTER
+        return MSG_TABLE_NOTHING_AFTER if ctx.ended else MSG_TABLE_AFTER_NOT_READ
     kinds = ", ".join(f"{kind} (בלוק {index})" for kind, index in ctx.follows)
     if ctx.resume is None:
         return MSG_TABLE_FOLLOWS_UNPLACED.format(kinds=kinds)
@@ -3803,7 +3818,7 @@ def _unread_siblings(ws: Workspace, conn: Connection, v: reader.Version, cx, pat
     sibling is read once every one of its blocks that holds text was returned to the reader (``ws.sent``); one line, or
     none when nothing is left. In a file of several contexts only the siblings within the same context."""
     parent = tuple(path[:-1])
-    found, _ = reader.outline(conn, v.version_id, cx)
+    found, _ = reader.outline(conn, v.version_id, cx, tables=False)
     siblings = [e for e in found if len(e.path) == len(path) and tuple(e.path[:-1]) == parent
                 and tuple(e.path) != tuple(path) and (window is None or e.window == window)]
     if not siblings:
@@ -4613,11 +4628,18 @@ MSG_ONLY_COMPARABLE = ("בקובץ «{title}» המונחים מופיעים ר�
                        "עליו.")
 
 
+def _listed_handle(ws: Workspace, u: dict) -> str:
+    """The handle of a unit ``find_documents`` lists, noted as one the model was shown: it may be declared in a clarification
+    (round 15 U6)."""
+    h = unit_handle_of(ws, u["document_id"], u["version_id"], u["reading_id"], u["unit_no"], u.get("units_tag"))
+    ws.listed_units.add(h)
+    return h
+
+
 def _unit_detail(ws: Workspace, u: dict) -> str:
     """A unit found by ``find_documents``: handle, title (or that it has none), kind, pages, identifiers, and why it
     matched (a name the document states, or passages)."""
-    h = unit_handle_of(ws, u["document_id"], u["version_id"], u["reading_id"], u["unit_no"], u.get("units_tag"))
-    ws.listed_units.add(h)  # a unit the model was shown may be declared in a clarification (round 15 U6)
+    h = _listed_handle(ws, u)
     why = {"alias": "שם שכתוב במסמך", "file_title": "כותרת הקובץ"}.get(u["matched_by"], "קטעים ביחידה")
     return (f'  - {h} | «{_txt(u["title"]) if u["title"] else MSG_NO_TITLE}» | {UNIT_KIND_WORDS.get(u["kind"], u["kind"])}'
             f' | {_unit_pages(u["page_first"], u["page_last"])}' + (f' | {_txt(" · ".join(u["identifiers"]))}' if u["identifiers"] else "")
@@ -4632,8 +4654,7 @@ def _continuation_detail(ws: Workspace, u: dict, subject: str) -> str:
     """A unit that continues a subject unit ``find_documents`` listed (an appendix or an untitled part after it, round 17
     U6, KTD6 item 5): its handle, kind and pages, labelled as the continuation of ``subject`` and never as a subject. Its
     handle is a unit the model was shown, so it may be read, searched in and declared."""
-    h = unit_handle_of(ws, u["document_id"], u["version_id"], u["reading_id"], u["unit_no"], u.get("units_tag"))
-    ws.listed_units.add(h)
+    h = _listed_handle(ws, u)
     return (f'    ↳ {h} | «{_txt(u["title"]) if u["title"] else MSG_NO_TITLE}» | {UNIT_KIND_WORDS.get(u["kind"], u["kind"])}'
             f' | {_unit_pages(u["page_first"], u["page_last"])} | {MSG_CONTINUATION_OF.format(subject=subject)}')
 
@@ -5889,8 +5910,8 @@ def _rows_listed(rows: list[list[str]], at: list[int] | None = None) -> str:
     return "; ".join(f"שורה {i + 1} «{_clip(_row_name(rows[i]), 80)}»" for i in (list(range(len(rows))) if at is None else at)[:8])
 
 
-MSG_NO_ROW = "חסרה שורה (row: התווית, או row_number). השורות בטבלה: {rows}. למשל row_number={n}"
-MSG_NO_COLUMN = "חסרה עמודה (column: הכותרת, או column_number). העמודות בטבלה: {columns}. למשל column_number={n}"
+MSG_NO_ROW = "חסרה שורה (row: התווית, או row_number). השורות בטבלה: {rows}. למשל row_number=1"
+MSG_NO_COLUMN = "חסרה עמודה (column: הכותרת, או column_number). העמודות בטבלה: {columns}. למשל column_number=1"
 MSG_QUOTE_OF_ANOTHER_ROW = ("הציטוט אינו מהשורה שנבחרה. התא שנבחר ({where}) הוא «{cell}»{held}. הסר את quote, או בחר את "
                             "השורה שהציטוט שלה")
 MSG_QUOTE_HELD_BY = "; הציטוט הוא מ{rows}: row_number={row}, column_number={column}"
@@ -5956,15 +5977,30 @@ def _cell_facet_in(label: str, header: str, st: dict, cells: list) -> dict:
             "notes": [str(x) for x in st.get("notes") or [] if x]}
 
 
+def _row_shape(text_: str) -> str:
+    """A quote or a row in the spelling the quote of a row is compared in: by its letters and digits, the cell borders kept, so
+    "( *)" and "(*)" are one."""
+    return "|".join(_loose(part) for part in meaning._flat(text_).split("|"))
+
+
+def _quote_too_short(shaped: str) -> bool:
+    """A quote (``_row_shape``) with under three letters or digits: too short to say which row it is of."""
+    return len(shaped.replace("|", "")) < 3
+
+
+def _rows_holding(rows: list[list[str]], shaped: str) -> list[int]:
+    """The indexes of the rows whose cells hold the quote (``_row_shape``)."""
+    return [i for i, r in enumerate(rows) if shaped in _row_shape(" | ".join(r))]
+
+
 def _check_quote_of_row(quote: str, rows: list[list[str]], ri: int, ci: int, where: str, cell: str) -> None:
     """A quote given beside cell fields must be (part of) the row of the cell they name (round 17 U6, KTD6 item 6); the
     refusal names the cell found, and the row the quote is from. Compared as ``_row_quote_locator`` does, by letters and
     digits and the cell borders. A quote too short to compare (under three letters) checks nothing."""
-    shape = lambda text_: "|".join(_loose(part) for part in meaning._flat(text_).split("|"))  # noqa: E731
-    wanted = shape(quote)
-    if len(wanted.replace("|", "")) < 3 or wanted in shape(" | ".join(rows[ri])):
+    wanted = _row_shape(quote)
+    if _quote_too_short(wanted) or wanted in _row_shape(" | ".join(rows[ri])):
         return
-    held = [i for i, r in enumerate(rows) if wanted in shape(" | ".join(r))]
+    held = _rows_holding(rows, wanted)
     raise ToolError(MSG_QUOTE_OF_ANOTHER_ROW.format(
         where=where, cell=cell,
         held=(MSG_QUOTE_HELD_BY.format(rows=_rows_listed(rows, held[:1]), row=held[0] + 1, column=ci + 1) if held else "")),
@@ -6005,7 +6041,7 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
             raise ToolError(f"השורה «{loc['row']}» מתאימה לכמה שורות — {_rows_listed(rows, named)}; בחר לפי row_number")
         ri = named[0]
     else:
-        raise ToolError(MSG_NO_ROW.format(rows=_rows_listed(rows), n=1), "no_row")
+        raise ToolError(MSG_NO_ROW.format(rows=_rows_listed(rows)), "no_row")
     cells = rows[ri]
     if loc.get("column_number") is not None:
         ci = int(loc["column_number"]) - 1
@@ -6018,7 +6054,7 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
         if ci >= len(cells):
             raise ToolError(f"בשורה «{cells[0] if cells else ''}» אין תא בעמודה «{headers[ci]}»")
     else:
-        raise ToolError(MSG_NO_COLUMN.format(columns=_columns_listed(headers, max(len(cells), len(headers))), n=1),
+        raise ToolError(MSG_NO_COLUMN.format(columns=_columns_listed(headers, max(len(cells), len(headers)))),
                         "no_column")
     cell = cells[ci]
     header = headers[ci] if ci < len(headers) else ""
@@ -6249,11 +6285,10 @@ def _row_quote_locator(sid: str, st: dict, loc: dict) -> dict:
     if wanted is None:
         raise _not_one_number(loc["number"])
     rows = [list(r.get("cells") or []) for r in st.get("rows") or []]
-    shape = lambda text_: "|".join(_loose(part) for part in meaning._flat(text_).split("|"))  # noqa: E731
-    quote = shape(loc["quote"])
-    if len(quote.replace("|", "")) < 3:
+    quote = _row_shape(loc["quote"])
+    if _quote_too_short(quote):
         raise ToolError(f"הציטוט אינו מופיע כלשונו ב-{sid}: העתק את המשפט מהמקור בדיוק (או בחר תא בטבלה)")
-    held = [i for i, r in enumerate(rows) if quote in shape(" | ".join(r))]
+    held = _rows_holding(rows, quote)
     if not held:
         raise ToolError(f"הציטוט אינו שורה בטבלה של {sid}. השורות: " + _rows_listed(rows))
     places = [(i, ci) for i in held for ci, c in enumerate(rows[i])

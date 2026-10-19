@@ -289,11 +289,12 @@ def table_contexts(cx, st: dict, block_index: int | None, block_page: int | None
     return out
 
 
-def outline(conn: Connection, version_id: UUID, cx=None) -> tuple[list[Section], list[dict]]:
+def outline(conn: Connection, version_id: UUID, cx=None, tables: bool = True) -> tuple[list[Section], list[dict]]:
     """Every section (each prefix of a block's section path, sub-sections included, in reading order) with its
     size and its unread and uncertain regions, and every table with its caption, rows, page and section. ``cx``: the
     version's appraisal contexts (``app.chat.contexts``); in a file holding several, each context's sections are
-    its own (the same path in two contexts is two sections), and each table lists its rows by context."""
+    its own (the same path in two contexts is two sections), and each table lists its rows by context. ``tables=False``: the
+    sections only (the table list is empty and the stored table structures are not loaded)."""
     multi = cx is not None and cx.multi
     position = {id(s): n for n, s in enumerate(cx.segments)} if multi else {}  # a segment's place in ``segments``
     sections: dict[tuple, Section] = {}
@@ -321,14 +322,14 @@ def outline(conn: Connection, version_id: UUID, cx=None) -> tuple[list[Section],
                 s.pages.add(r.page)
         if r.table_index is not None and r.table_index not in table_at:
             table_at[r.table_index] = (r.block_index, r.page, path)
-    tables = []
-    for index, st in tables_of(conn, version_id).items():
+    listed = []
+    for index, st in tables_of(conn, version_id).items() if tables else ():
         block, page, path = table_at.get(index, (st.get("block_index"), st.get("page"), ()))
-        tables.append({"table_index": index, "caption": st.get("caption") or next(iter(st.get("title") or []), None),
+        listed.append({"table_index": index, "caption": st.get("caption") or next(iter(st.get("title") or []), None),
                        "rows": len(st.get("rows") or []), "block": block, "page": page,
                        "section": path[-1] if path else st.get("section"), "path": path,
                        "contexts": table_contexts(cx, st, block, page)})
-    return list(sections.values()), tables
+    return list(sections.values()), listed
 
 
 # --- parts -----------------------------------------------------------------------------------------------------

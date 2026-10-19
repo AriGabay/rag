@@ -2386,6 +2386,18 @@ def test_a_part_only_the_judge_named_is_stated_by_its_components_own_line_and_th
     assert "ההתאמה לגיל הבניין" in lines[1] and FOURTH_ADJ not in lines[1]  # one item line, for the agent's item only
 
 
+def test_a_not_answered_component_with_omitted_agent_items_keeps_its_own_gap_line():
+    """Round 17 review #2: only a partly given component hands its gap over to the item lines; a component the answer does not
+    give at all (status not_answered) stays stated by its own line, whatever agent items are omitted."""
+    ws = _adj_file()
+    r, turn, answer, _ = _ledger_check(ws, "הנתונים נבדקו ואין בהם התאמה כזו [S2].", _adj_items(), status="missing")
+    final, outcomes = _finish(ws, answer, r, turn)
+    (o,) = outcomes
+    assert o["status"] == "not_answered" and o["omitted_items"] and not o.get("judge_items")
+    assert o["stated"] is True
+    assert o["gap"] and o["gap"] in _gap(final, answer)
+
+
 def test_a_sentence_of_the_table_that_shares_the_words_of_a_judge_added_rate_does_not_close_it():
     ws = _rates_file()
     from app.chat import items as ledger_items
@@ -2404,6 +2416,27 @@ def test_a_sentence_of_the_table_that_shares_the_words_of_a_judge_added_rate_doe
     again = verify_answer(_judge(lambda f, u: [_req("", "full", list(u), id=f[0][0])]), _answer(markdown + " מחסנים: 9.1% [S2]."),
                           ws, "?", [], requirements=turn, ledger=ledger)
     assert again.requirement_outcomes()[0]["status"] == "full" and not _completions(again)
+
+
+def test_the_listing_the_judge_is_shown_uses_the_components_text_in_the_presence_test_of_a_judge_added_item():
+    """Round 17 review #7: a sentence with the item's number and only the words every rate of the list shares ("שיעור היוון") does not
+    close a judge-added item: the listing before the judge and the final resolution read the same presence test."""
+    from app.chat import items as ledger_items
+
+    ws = _rates_file()
+    turn = _turn({"id": "1", "text": ASK_RATES})
+    ledger = ledger_items.Ledger()
+    ledger.merge([ledger_items.support_item("N1", "S2", RATE_LINES[1], ledger, label="שיעור ההיוון למסחר", value="7.0%", ws=ws)])
+    markdown = "שיעור היוון למשרדים נקבע ב-6.5% [S2]. שיעור היוון נקבע גם ב-7.0% [S2]."  # the number and the shared words, not the item
+    seen: list[str] = []
+
+    def score(frozen, units):
+        return [_req("", "partial", list(units), id=frozen[0][0])]
+
+    r = verify_answer(_judge(score, seen=seen), _answer(markdown), ws, "?", [], requirements=turn, ledger=ledger)
+    block = re.search(r"<item_ledger>.*?</item_ledger>", seen[0], re.S).group()
+    assert 'state="omitted"' in block and 'state="covered"' not in block
+    assert [st["state"] for st in r.item_states()] == ["omitted"]  # what the final resolution reads
 
 
 def test_the_diagnostics_carry_the_ledger_and_the_documents_of_its_items_join_the_permission_set():

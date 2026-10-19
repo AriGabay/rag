@@ -624,6 +624,21 @@ def test_a_table_at_the_end_of_a_unit_takes_no_trailing_part_from_the_next_units
     assert "פסקת פתיחה" not in out and "אין עוד קטעים ביחידה" in out and "read(cursor=" not in out.split("מצב הטבלה")[1]
 
 
+def test_nothing_follows_is_said_only_when_the_scan_reached_the_end_of_the_unit(office):
+    """Round 17 review #9: a table whose own blocks fill the scan window leaves its tail unread, which is not the same as nothing
+    following it; a table at the end of the document does have nothing after it."""
+    blocks = [("table", PATH4, SENSITIVITY, 0)] + [("table", PATH4, f"שורה {n}", 0) for n in range(1, 13)]
+    doc, _ = add_laid_out(office, blocks + [("paragraph", PATH4, SCOPE_NOTE, None)], {0: _sensitivity(block_index=0)},
+                          sha="a" * 64)
+    ws = T.Workspace(ctx=office.ctx())
+    out = read_table(ws, doc)
+    assert "אין עוד קטעים ביחידה" not in out and T.MSG_TABLE_AFTER_NOT_READ in out
+    end, _ = add_laid_out(office, blocks, {0: _sensitivity(block_index=0)}, sha="b" * 64)
+    ws = T.Workspace(ctx=office.ctx())
+    out = read_table(ws, end)
+    assert "אין עוד קטעים ביחידה" in out and T.MSG_TABLE_AFTER_NOT_READ not in out
+
+
 def test_a_hebrew_note_with_quotation_marks_and_numbers_reaches_the_read_context_verbatim(office):
     note = "* לפי תקן 17 ״הערכת שווי״: השיעורים הם 7.5% ו-8.25% והסכומים באלפי ₪."
     doc, _ = add_laid_out(office, [("table", PATH4, SENSITIVITY, 0), ("paragraph", PATH4, note, None)],
